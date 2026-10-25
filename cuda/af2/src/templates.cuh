@@ -15,18 +15,30 @@ __global__ void templateFramesK(const float* __restrict__ tPos, const float* __r
   int r = blockIdx.x * blockDim.x + threadIdx.x;
   if (r >= L) return;
   const float* p = tPos + (size_t)r * 37 * 3;
-  bbMask[r] = tMask[(size_t)r * 37] * tMask[(size_t)r * 37 + 1] * tMask[(size_t)r * 37 + 2];
+  ptx_st_global_f32(bbMask + r, ptx_mul_f32(ptx_mul_f32(ptx_ldg_f32(tMask + (size_t)r * 37), ptx_ldg_f32(tMask + (size_t)r * 37 + 1)),
+                                            ptx_ldg_f32(tMask + (size_t)r * 37 + 2)));
   float e0[3], e1[3], *R = frames + (size_t)r * 12, *t = R + 9;
-  for (int k = 0; k < 3; ++k) { e0[k] = p[6 + k] - p[3 + k]; e1[k] = p[k] - p[3 + k]; t[k] = p[3 + k]; }
-  float n0 = rsqrtf(fmaxf(e0[0] * e0[0] + e0[1] * e0[1] + e0[2] * e0[2], 1e-12f));
-  for (int k = 0; k < 3; ++k) e0[k] *= n0;
-  float c = e1[0] * e0[0] + e1[1] * e0[1] + e1[2] * e0[2];
-  for (int k = 0; k < 3; ++k) e1[k] -= c * e0[k];
-  float n1 = rsqrtf(fmaxf(e1[0] * e1[0] + e1[1] * e1[1] + e1[2] * e1[2], 1e-12f));
-  for (int k = 0; k < 3; ++k) e1[k] *= n1;
-  float e2[3] = {e0[1] * e1[2] - e0[2] * e1[1], e0[2] * e1[0] - e0[0] * e1[2], e0[0] * e1[1] - e0[1] * e1[0]};
+  for (int k = 0; k < 3; ++k) {
+    float p0 = ptx_ldg_f32(p + k), p3 = ptx_ldg_f32(p + 3 + k), p6 = ptx_ldg_f32(p + 6 + k);
+    e0[k] = ptx_sub_f32(p6, p3); e1[k] = ptx_sub_f32(p0, p3); ptx_st_global_f32(t + k, p3);
+  }
+  float n0 = ptx_rsqrt_f32(ptx_max_f32(ptx_fma_f32(e0[0], e0[0], ptx_fma_f32(e0[1], e0[1], ptx_mul_f32(e0[2], e0[2]))), 1e-12f));
+  for (int k = 0; k < 3; ++k) e0[k] = ptx_mul_f32(e0[k], n0);
+  float c = ptx_fma_f32(e1[0], e0[0], ptx_fma_f32(e1[1], e0[1], ptx_mul_f32(e1[2], e0[2])));
+  for (int k = 0; k < 3; ++k) e1[k] = ptx_fma_f32(-c, e0[k], e1[k]);
+  float n1 = ptx_rsqrt_f32(ptx_max_f32(ptx_fma_f32(e1[0], e1[0], ptx_fma_f32(e1[1], e1[1], ptx_mul_f32(e1[2], e1[2]))), 1e-12f));
+  for (int k = 0; k < 3; ++k) e1[k] = ptx_mul_f32(e1[k], n1);
+  float e2[3] = {
+    ptx_fma_f32(e0[1], e1[2], -ptx_mul_f32(e0[2], e1[1])),
+    ptx_fma_f32(e0[2], e1[0], -ptx_mul_f32(e0[0], e1[2])),
+    ptx_fma_f32(e0[0], e1[1], -ptx_mul_f32(e0[1], e1[0]))
+  };
   // columns e0 e1 e2: R = [[e0x e1x e2x], [e0y e1y e2y], [e0z e1z e2z]]
-  for (int k = 0; k < 3; ++k) { R[k * 3] = e0[k]; R[k * 3 + 1] = e1[k]; R[k * 3 + 2] = e2[k]; }
+  for (int k = 0; k < 3; ++k) {
+    ptx_st_global_f32(R + k * 3, e0[k]);
+    ptx_st_global_f32(R + k * 3 + 1, e1[k]);
+    ptx_st_global_f32(R + k * 3 + 2, e2[k]);
+  }
 }
 __global__ void templatePairInputK(const int* __restrict__ tAatype, const float* __restrict__ tPos, const float* __restrict__ tMask,
                                    const float* __restrict__ frames, const float* __restrict__ bbMask,
@@ -37,55 +49,71 @@ __global__ void templatePairInputK(const int* __restrict__ tAatype, const float*
   __shared__ float sw[6][64];
   if (threadIdx.x < 64) {
     int c = threadIdx.x;
-    sw[0][c] = bsum[c]; sw[1][c] = w1[c]; sw[2][c] = w4[c];
-    sw[3][c] = w5[c]; sw[4][c] = w6[c]; sw[5][c] = w7[c];
+    ptx_st_shared_f32(&sw[0][c], ptx_ldg_f32(bsum + c));
+    ptx_st_shared_f32(&sw[1][c], ptx_ldg_f32(w1 + c));
+    ptx_st_shared_f32(&sw[2][c], ptx_ldg_f32(w4 + c));
+    ptx_st_shared_f32(&sw[3][c], ptx_ldg_f32(w5 + c));
+    ptx_st_shared_f32(&sw[4][c], ptx_ldg_f32(w6 + c));
+    ptx_st_shared_f32(&sw[5][c], ptx_ldg_f32(w7 + c));
   }
   __syncthreads();
   size_t ij = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
   int lane = threadIdx.x & 31;
   if (ij >= (size_t)L * L) return;
   int i = (int)(ij / L), j = (int)(ij % L);
-  int rawAi = tAatype[i], rawAj = tAatype[j];
+  int rawAi = ptx_ldg_s32(tAatype + i), rawAj = ptx_ldg_s32(tAatype + j);
   int pi = rawAi == 7 ? 1 : 3, pj = rawAj == 7 ? 1 : 3;
-  float pb2d = tMask[(size_t)i * 37 + pi] * tMask[(size_t)j * 37 + pj];
+  float pb2d = ptx_mul_f32(ptx_ldg_f32(tMask + (size_t)i * 37 + pi), ptx_ldg_f32(tMask + (size_t)j * 37 + pj));
   float d2 = 0.f;
-  for (int k = 0; k < 3; ++k) { float d = tPos[((size_t)i * 37 + pi) * 3 + k] - tPos[((size_t)j * 37 + pj) * 3 + k]; d2 += d * d; }
+  for (int k = 0; k < 3; ++k) {
+    float d = ptx_sub_f32(ptx_ldg_f32(tPos + ((size_t)i * 37 + pi) * 3 + k), ptx_ldg_f32(tPos + ((size_t)j * 37 + pj) * 3 + k));
+    d2 = ptx_fma_f32(d, d, d2);
+  }
   int dbin = -1;
   if (pb2d != 0.f) {
-    float lo0 = 3.25f + (50.75f - 3.25f) * lane / 38.f, hi0 = 3.25f + (50.75f - 3.25f) * (lane + 1) / 38.f;
-    uint32_t m0 = __ballot_sync(~0u, d2 > lo0 * lo0 && d2 < hi0 * hi0);
+    float lo0 = ptx_fma_f32((float)lane, (50.75f - 3.25f) / 38.f, 3.25f), hi0 = ptx_fma_f32((float)(lane + 1), (50.75f - 3.25f) / 38.f, 3.25f);
+    uint32_t m0 = ptx_ballot_sync(d2 > ptx_mul_f32(lo0, lo0) && d2 < ptx_mul_f32(hi0, hi0));
     int b1 = 32 + lane;
-    float lo1 = 3.25f + (50.75f - 3.25f) * b1 / 38.f, hi1 = 3.25f + (50.75f - 3.25f) * (b1 + 1) / 38.f;
-    uint32_t m1 = __ballot_sync(~0u, b1 < 39 && d2 > lo1 * lo1 && d2 < (b1 + 1 < 39 ? hi1 * hi1 : 1e8f));
-    if (m0) dbin = __ffs(m0) - 1;
-    else if (m1) dbin = 31 + __ffs(m1);
+    float lo1 = ptx_fma_f32((float)b1, (50.75f - 3.25f) / 38.f, 3.25f), hi1 = ptx_fma_f32((float)(b1 + 1), (50.75f - 3.25f) / 38.f, 3.25f);
+    uint32_t m1 = ptx_ballot_sync(b1 < 39 && d2 > ptx_mul_f32(lo1, lo1) && d2 < (b1 + 1 < 39 ? ptx_mul_f32(hi1, hi1) : 1e8f));
+    if (m0) dbin = ptx_ffs_u32(m0) - 1;
+    else if (m1) dbin = 31 + ptx_ffs_u32(m1);
   }
   const float *Ri = frames + (size_t)i * 12, *ti = Ri + 9, *tj = frames + (size_t)j * 12 + 9;
-  float d[3] = {tj[0] - ti[0], tj[1] - ti[1], tj[2] - ti[2]}, v[3];
-  for (int a = 0; a < 3; ++a) v[a] = Ri[a] * d[0] + Ri[3 + a] * d[1] + Ri[6 + a] * d[2];     // R_i^T (CA_j - CA_i)
-  float nv = rsqrtf(fmaxf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2], 1e-12f));
-  float bb = sqrtf(bbMask[i] * bbMask[j]);
-  float f1 = v[0] * nv * bb, f2 = v[1] * nv * bb, f3 = v[2] * nv * bb;
-  int ai = min(max(rawAi, 0), 21), aj = min(max(rawAj, 0), 21);
+  float d[3] = {
+    ptx_sub_f32(ptx_ldg_f32(tj + 0), ptx_ldg_f32(ti + 0)),
+    ptx_sub_f32(ptx_ldg_f32(tj + 1), ptx_ldg_f32(ti + 1)),
+    ptx_sub_f32(ptx_ldg_f32(tj + 2), ptx_ldg_f32(ti + 2))
+  }, v[3];
+  for (int a = 0; a < 3; ++a)
+    v[a] = ptx_fma_f32(ptx_ldg_f32(Ri + a), d[0], ptx_fma_f32(ptx_ldg_f32(Ri + 3 + a), d[1], ptx_mul_f32(ptx_ldg_f32(Ri + 6 + a), d[2])));
+  float nv = ptx_rsqrt_f32(ptx_max_f32(ptx_fma_f32(v[0], v[0], ptx_fma_f32(v[1], v[1], ptx_mul_f32(v[2], v[2]))), 1e-12f));
+  float bb = ptx_sqrt_f32(ptx_mul_f32(ptx_ldg_f32(bbMask + i), ptx_ldg_f32(bbMask + j)));
+  float nv_bb = ptx_mul_f32(nv, bb);
+  float f1 = ptx_mul_f32(v[0], nv_bb), f2 = ptx_mul_f32(v[1], nv_bb), f3 = ptx_mul_f32(v[2], nv_bb);
+  int ai = ptx_min_s32(ptx_max_s32(rawAi, 0), 21), aj = ptx_min_s32(ptx_max_s32(rawAj, 0), 21);
 #pragma unroll
   for (int k = 0; k < 2; ++k) {
     int c = lane + 32 * k;
-    float a = sw[0][c] + (dbin >= 0 ? pb2d * w0[dbin * C + c] : 0.f);
-    a += pb2d * sw[1][c];
-    a += w2[aj * C + c] + w3[ai * C + c];
-    a += f1 * sw[2][c] + f2 * sw[3][c] + f3 * sw[4][c] + bb * sw[5][c];
-    act[ij * C + c] = a + qterm[ij * C + c];
+    float a = ptx_add_f32(ptx_ld_shared_f32(&sw[0][c]), (dbin >= 0 ? ptx_mul_f32(pb2d, ptx_ldg_f32(w0 + dbin * C + c)) : 0.f));
+    a = ptx_fma_f32(pb2d, ptx_ld_shared_f32(&sw[1][c]), a);
+    a = ptx_add_f32(a, ptx_add_f32(ptx_ldg_f32(w2 + aj * C + c), ptx_ldg_f32(w3 + ai * C + c)));
+    a = ptx_fma_f32(f1, ptx_ld_shared_f32(&sw[2][c]), a);
+    a = ptx_fma_f32(f2, ptx_ld_shared_f32(&sw[3][c]), a);
+    a = ptx_fma_f32(f3, ptx_ld_shared_f32(&sw[4][c]), a);
+    a = ptx_fma_f32(bb, ptx_ld_shared_f32(&sw[5][c]), a);
+    ptx_st_global_f32(act + ij * C + c, ptx_add_f32(a, ptx_ldg_f32(qterm + ij * C + c)));
   }
 }
 __global__ void sumBiasesK(float* out, const float* const* bs, int n, int C) {
   int c = blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= C) return;
-  float s = 0; for (int k = 0; k < n; ++k) s += bs[k][c];
-  out[c] = s;
+  float s = 0.f; for (int k = 0; k < n; ++k) s = ptx_add_f32(s, ptx_ldg_f32(bs[k] + c));
+  ptx_st_global_f32(out + c, s);
 }
 __global__ void reluScaleK(float* x, float s, size_t n) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t < n) x[t] = fmaxf(x[t] * s, 0.f);
+  if (t < n) ptx_st_global_f32(x + t, ptx_relu_f32(ptx_mul_f32(ptx_ld_global_f32(x + t), s)));
 }
 
 // pair += TemplateEmbedding(pair, templates); T templates in t/aatype [T, L], t/positions, t/mask
@@ -184,34 +212,42 @@ __global__ void templatePairInputMonomerK(const int* __restrict__ tAatype, const
   __shared__ float sb[64], sw39[64], sw87[64];
   if (threadIdx.x < 64) {
     int c = threadIdx.x;
-    sb[c] = b[c]; sw39[c] = w[39 * C + c]; sw87[c] = w[87 * C + c];
+    ptx_st_shared_f32(sb + c, ptx_ldg_f32(b + c));
+    ptx_st_shared_f32(sw39 + c, ptx_ldg_f32(w + 39 * C + c));
+    ptx_st_shared_f32(sw87 + c, ptx_ldg_f32(w + 87 * C + c));
   }
   __syncthreads();
   size_t ij = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
   int lane = threadIdx.x & 31;
   if (ij >= (size_t)L * L) return;
   int i = (int)(ij / L), j = (int)(ij % L);
-  int rawAi = tAatype[i], rawAj = tAatype[j];
+  int rawAi = ptx_ldg_s32(tAatype + i), rawAj = ptx_ldg_s32(tAatype + j);
   int pi = rawAi == 7 ? 1 : 3, pj = rawAj == 7 ? 1 : 3;
-  float m2 = tMask[(size_t)i * 37 + pi] * tMask[(size_t)j * 37 + pj];
+  float m2 = ptx_mul_f32(ptx_ldg_f32(tMask + (size_t)i * 37 + pi), ptx_ldg_f32(tMask + (size_t)j * 37 + pj));
   float d2 = 0.f;
-  for (int k = 0; k < 3; ++k) { float d = tPos[((size_t)i * 37 + pi) * 3 + k] - tPos[((size_t)j * 37 + pj) * 3 + k]; d2 += d * d; }
-  float lo0 = 3.25f + (50.75f - 3.25f) * lane / 38.f, hi0 = 3.25f + (50.75f - 3.25f) * (lane + 1) / 38.f;
-  uint32_t m0 = __ballot_sync(~0u, d2 > lo0 * lo0 && d2 < hi0 * hi0);
+  for (int k = 0; k < 3; ++k) {
+    float d = ptx_sub_f32(ptx_ldg_f32(tPos + ((size_t)i * 37 + pi) * 3 + k), ptx_ldg_f32(tPos + ((size_t)j * 37 + pj) * 3 + k));
+    d2 = ptx_fma_f32(d, d, d2);
+  }
+  float lo0 = ptx_fma_f32((float)lane, (50.75f - 3.25f) / 38.f, 3.25f), hi0 = ptx_fma_f32((float)(lane + 1), (50.75f - 3.25f) / 38.f, 3.25f);
+  uint32_t m0 = ptx_ballot_sync(d2 > ptx_mul_f32(lo0, lo0) && d2 < ptx_mul_f32(hi0, hi0));
   int b1 = 32 + lane;
-  float lo1 = 3.25f + (50.75f - 3.25f) * b1 / 38.f, hi1 = 3.25f + (50.75f - 3.25f) * (b1 + 1) / 38.f;
-  uint32_t m1 = __ballot_sync(~0u, b1 < 39 && d2 > lo1 * lo1 && d2 < (b1 + 1 < 39 ? hi1 * hi1 : 1e8f));
-  int dbin = m0 ? (__ffs(m0) - 1) : (m1 ? (31 + __ffs(m1)) : -1);
-  auto bbm = [&](int r) { return tMask[(size_t)r * 37] * tMask[(size_t)r * 37 + 1] * tMask[(size_t)r * 37 + 2]; };
-  float bb = bbm(i) * bbm(j);
-  int ai = min(max(rawAi, 0), 21), aj = min(max(rawAj, 0), 21);
+  float lo1 = ptx_fma_f32((float)b1, (50.75f - 3.25f) / 38.f, 3.25f), hi1 = ptx_fma_f32((float)(b1 + 1), (50.75f - 3.25f) / 38.f, 3.25f);
+  uint32_t m1 = ptx_ballot_sync(b1 < 39 && d2 > ptx_mul_f32(lo1, lo1) && d2 < (b1 + 1 < 39 ? ptx_mul_f32(hi1, hi1) : 1e8f));
+  int dbin = m0 ? (ptx_ffs_u32(m0) - 1) : (m1 ? (31 + ptx_ffs_u32(m1)) : -1);
+  auto bbm = [&](int r) {
+    return ptx_mul_f32(ptx_mul_f32(ptx_ldg_f32(tMask + (size_t)r * 37), ptx_ldg_f32(tMask + (size_t)r * 37 + 1)),
+                       ptx_ldg_f32(tMask + (size_t)r * 37 + 2));
+  };
+  float bb = ptx_mul_f32(bbm(i), bbm(j));
+  int ai = ptx_min_s32(ptx_max_s32(rawAi, 0), 21), aj = ptx_min_s32(ptx_max_s32(rawAj, 0), 21);
 #pragma unroll
   for (int k = 0; k < 2; ++k) {
     int c = lane + 32 * k;
-    float a = (dbin >= 0 ? w[dbin * C + c] : 0.f) + m2 * sw39[c];
-    a += w[(40 + aj) * C + c] + w[(62 + ai) * C + c];
-    a += sw87[c];                             // the backbone mask itself (=1 where bb is, scaled below)
-    act[ij * C + c] = a * bb + sb[c];         // every input times the backbone mask, then the bias
+    float a = ptx_fma_f32(m2, ptx_ld_shared_f32(sw39 + c), (dbin >= 0 ? ptx_ldg_f32(w + dbin * C + c) : 0.f));
+    a = ptx_add_f32(a, ptx_add_f32(ptx_ldg_f32(w + (40 + aj) * C + c), ptx_ldg_f32(w + (62 + ai) * C + c)));
+    a = ptx_add_f32(a, ptx_ld_shared_f32(sw87 + c));
+    ptx_st_global_f32(act + ij * C + c, ptx_fma_f32(a, bb, ptx_ld_shared_f32(sb + c)));
   }
 }
 // the pointwise attention from the query pair over the templates: q [pairs, H*D] (scaled), k, v
@@ -224,27 +260,27 @@ __global__ void templatePointAttentionK(const float* q, const float* k, const fl
   if (D == 16 && ((p * W + h * 16) & 3) == 0) {
     size_t base = p * W + h * 16;
     const float4* q4 = reinterpret_cast<const float4*>(q + base);
-    float4 q0 = q4[0], q1 = q4[1], q2 = q4[2], q3 = q4[3];
+    float4 q0 = ptx_ldg_v4_f32(q4 + 0), q1 = ptx_ldg_v4_f32(q4 + 1), q2 = ptx_ldg_v4_f32(q4 + 2), q3 = ptx_ldg_v4_f32(q4 + 3);
     float logits[8]; float mx = -INFINITY;
 #pragma unroll
     for (int s = 0; s < 8; ++s) {
       if (s < T) {
         const float4* k4 = reinterpret_cast<const float4*>(k + (size_t)s * pairs * W + base);
-        float4 k0 = k4[0], k1 = k4[1], k2 = k4[2], k3 = k4[3];
-        float a = 0;
-        a += q0.x * k0.x; a += q0.y * k0.y; a += q0.z * k0.z; a += q0.w * k0.w;
-        a += q1.x * k1.x; a += q1.y * k1.y; a += q1.z * k1.z; a += q1.w * k1.w;
-        a += q2.x * k2.x; a += q2.y * k2.y; a += q2.z * k2.z; a += q2.w * k2.w;
-        a += q3.x * k3.x; a += q3.y * k3.y; a += q3.z * k3.z; a += q3.w * k3.w;
-        logits[s] = a; mx = fmaxf(mx, a);
+        float4 k0 = ptx_ldg_v4_f32(k4 + 0), k1 = ptx_ldg_v4_f32(k4 + 1), k2 = ptx_ldg_v4_f32(k4 + 2), k3 = ptx_ldg_v4_f32(k4 + 3);
+        float a = 0.f;
+        a = ptx_fma_f32(q0.x, k0.x, a); a = ptx_fma_f32(q0.y, k0.y, a); a = ptx_fma_f32(q0.z, k0.z, a); a = ptx_fma_f32(q0.w, k0.w, a);
+        a = ptx_fma_f32(q1.x, k1.x, a); a = ptx_fma_f32(q1.y, k1.y, a); a = ptx_fma_f32(q1.z, k1.z, a); a = ptx_fma_f32(q1.w, k1.w, a);
+        a = ptx_fma_f32(q2.x, k2.x, a); a = ptx_fma_f32(q2.y, k2.y, a); a = ptx_fma_f32(q2.z, k2.z, a); a = ptx_fma_f32(q2.w, k2.w, a);
+        a = ptx_fma_f32(q3.x, k3.x, a); a = ptx_fma_f32(q3.y, k3.y, a); a = ptx_fma_f32(q3.z, k3.z, a); a = ptx_fma_f32(q3.w, k3.w, a);
+        logits[s] = a; mx = ptx_max_f32(mx, a);
       } else {
         logits[s] = 0.f;
       }
     }
-    float sum = 0;
+    float sum = 0.f;
 #pragma unroll
     for (int s = 0; s < 8; ++s) {
-      if (s < T) { logits[s] = __expf(logits[s] - mx); sum += logits[s]; }
+      if (s < T) { logits[s] = ptx_exp_f32(ptx_sub_f32(logits[s], mx)); sum = ptx_add_f32(sum, logits[s]); }
     }
     float4 o0 = {0, 0, 0, 0}, o1 = {0, 0, 0, 0}, o2 = {0, 0, 0, 0}, o3 = {0, 0, 0, 0};
 #pragma unroll
@@ -252,39 +288,40 @@ __global__ void templatePointAttentionK(const float* q, const float* k, const fl
       if (s < T) {
         float w = logits[s];
         const float4* v4 = reinterpret_cast<const float4*>(v + (size_t)s * pairs * W + base);
-        float4 v0 = v4[0], v1 = v4[1], v2 = v4[2], v3 = v4[3];
-        o0.x += w * v0.x; o0.y += w * v0.y; o0.z += w * v0.z; o0.w += w * v0.w;
-        o1.x += w * v1.x; o1.y += w * v1.y; o1.z += w * v1.z; o1.w += w * v1.w;
-        o2.x += w * v2.x; o2.y += w * v2.y; o2.z += w * v2.z; o2.w += w * v2.w;
-        o3.x += w * v3.x; o3.y += w * v3.y; o3.z += w * v3.z; o3.w += w * v3.w;
+        float4 v0 = ptx_ldg_v4_f32(v4 + 0), v1 = ptx_ldg_v4_f32(v4 + 1), v2 = ptx_ldg_v4_f32(v4 + 2), v3 = ptx_ldg_v4_f32(v4 + 3);
+        o0.x = ptx_fma_f32(w, v0.x, o0.x); o0.y = ptx_fma_f32(w, v0.y, o0.y); o0.z = ptx_fma_f32(w, v0.z, o0.z); o0.w = ptx_fma_f32(w, v0.w, o0.w);
+        o1.x = ptx_fma_f32(w, v1.x, o1.x); o1.y = ptx_fma_f32(w, v1.y, o1.y); o1.z = ptx_fma_f32(w, v1.z, o1.z); o1.w = ptx_fma_f32(w, v1.w, o1.w);
+        o2.x = ptx_fma_f32(w, v2.x, o2.x); o2.y = ptx_fma_f32(w, v2.y, o2.y); o2.z = ptx_fma_f32(w, v2.z, o2.z); o2.w = ptx_fma_f32(w, v2.w, o2.w);
+        o3.x = ptx_fma_f32(w, v3.x, o3.x); o3.y = ptx_fma_f32(w, v3.y, o3.y); o3.z = ptx_fma_f32(w, v3.z, o3.z); o3.w = ptx_fma_f32(w, v3.w, o3.w);
       }
     }
+    float invSum = ptx_rcp_f32(sum);
     float4* out4 = reinterpret_cast<float4*>(out + base);
-    out4[0] = make_float4(o0.x / sum, o0.y / sum, o0.z / sum, o0.w / sum);
-    out4[1] = make_float4(o1.x / sum, o1.y / sum, o1.z / sum, o1.w / sum);
-    out4[2] = make_float4(o2.x / sum, o2.y / sum, o2.z / sum, o2.w / sum);
-    out4[3] = make_float4(o3.x / sum, o3.y / sum, o3.z / sum, o3.w / sum);
+    ptx_st_global_v4_f32(out4 + 0, make_float4(ptx_mul_f32(o0.x, invSum), ptx_mul_f32(o0.y, invSum), ptx_mul_f32(o0.z, invSum), ptx_mul_f32(o0.w, invSum)));
+    ptx_st_global_v4_f32(out4 + 1, make_float4(ptx_mul_f32(o1.x, invSum), ptx_mul_f32(o1.y, invSum), ptx_mul_f32(o1.z, invSum), ptx_mul_f32(o1.w, invSum)));
+    ptx_st_global_v4_f32(out4 + 2, make_float4(ptx_mul_f32(o2.x, invSum), ptx_mul_f32(o2.y, invSum), ptx_mul_f32(o2.z, invSum), ptx_mul_f32(o2.w, invSum)));
+    ptx_st_global_v4_f32(out4 + 3, make_float4(ptx_mul_f32(o3.x, invSum), ptx_mul_f32(o3.y, invSum), ptx_mul_f32(o3.z, invSum), ptx_mul_f32(o3.w, invSum)));
     return;
   }
   float logits[8]; float mx = -INFINITY;
 #pragma unroll
   for (int s = 0; s < 8; ++s) {
     if (s < T) {
-      float a = 0;
-      for (int d = 0; d < D; ++d) a += q[p * W + h * D + d] * k[((size_t)s * pairs + p) * W + h * D + d];
-      logits[s] = a; mx = fmaxf(mx, a);
+      float a = 0.f;
+      for (int d = 0; d < D; ++d) a = ptx_fma_f32(ptx_ldg_f32(q + p * W + h * D + d), ptx_ldg_f32(k + ((size_t)s * pairs + p) * W + h * D + d), a);
+      logits[s] = a; mx = ptx_max_f32(mx, a);
     } else {
       logits[s] = 0.f;
     }
   }
-  float sum = 0;
+  float sum = 0.f;
 #pragma unroll
-  for (int s = 0; s < 8; ++s) if (s < T) { logits[s] = __expf(logits[s] - mx); sum += logits[s]; }
+  for (int s = 0; s < 8; ++s) if (s < T) { logits[s] = ptx_exp_f32(ptx_sub_f32(logits[s], mx)); sum = ptx_add_f32(sum, logits[s]); }
   for (int d = 0; d < D; ++d) {
-    float a = 0;
+    float a = 0.f;
 #pragma unroll
-    for (int s = 0; s < 8; ++s) if (s < T) a += logits[s] * v[((size_t)s * pairs + p) * W + h * D + d];
-    out[p * W + h * D + d] = a / sum;
+    for (int s = 0; s < 8; ++s) if (s < T) a = ptx_fma_f32(logits[s], ptx_ldg_f32(v + ((size_t)s * pairs + p) * W + h * D + d), a);
+    ptx_st_global_f32(out + p * W + h * D + d, ptx_div_f32(a, sum));
   }
 }
 inline void templateEmbeddingMonomer(float* pair, const float* pairMask, int L, int T, bool pairOnes = false) {
@@ -349,63 +386,72 @@ inline void templateEmbeddingMonomer(float* pair, const float* pairMask, int L, 
 // ---------------------------------------------------------------- the templates' MSA rows
 #include "chi_tables.cuh"
 template <class T, size_t N> inline const T* symbolPtr(const T (&sym)[N]) { void* p; CK(cudaGetSymbolAddress(&p, sym)); return (const T*)p; }
-__device__ inline void sub3(const float* a, const float* b, float* o) { for (int k = 0; k < 3; ++k) o[k] = a[k] - b[k]; }
-__device__ inline float dot3(const float* a, const float* b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
+__device__ inline void sub3(const float* a, const float* b, float* o) { for (int k = 0; k < 3; ++k) o[k] = ptx_sub_f32(a[k], b[k]); }
+__device__ inline float dot3(const float* a, const float* b) { return ptx_fma_f32(a[0], b[0], ptx_fma_f32(a[1], b[1], ptx_mul_f32(a[2], b[2]))); }
 __device__ inline void cross3(const float* a, const float* b, float* o) {
-  o[0] = a[1] * b[2] - a[2] * b[1]; o[1] = a[2] * b[0] - a[0] * b[2]; o[2] = a[0] * b[1] - a[1] * b[0];
+  o[0] = ptx_fma_f32(a[1], b[2], -ptx_mul_f32(a[2], b[1]));
+  o[1] = ptx_fma_f32(a[2], b[0], -ptx_mul_f32(a[0], b[2]));
+  o[2] = ptx_fma_f32(a[0], b[1], -ptx_mul_f32(a[1], b[0]));
 }
 // monomer: aatype(22) | torsion sin,cos(14) | alt torsion sin,cos(14) | torsion mask(7) = 57, and the row's
 // mask (the psi torsion's) - all_atom.atom37_to_torsion_angles, placeholder off (zero_init)
 __global__ void templateTorsionFeatK(const int* tAatype, const float* tPos, const float* tMask, const int* chiIdx,
                                      const float* chiMaskT, const float* chiPi, float* feat, float* rowMask, int L) {
   __shared__ float zp[9];
-  if (threadIdx.x < 9) zp[threadIdx.x] = 0.f;
+  if (threadIdx.x < 9) ptx_st_shared_f32(zp + threadIdx.x, 0.f);
   __syncthreads();
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= L) return;
-  int aaRaw = tAatype[i], a = min(aaRaw, 20);
+  int aaRaw = ptx_ldg_s32(tAatype + i), a = ptx_min_s32(aaRaw, 20);
   const float* p = tPos + (size_t)i * 37 * 3; const float* m = tMask + (size_t)i * 37;
   const float* pp = i > 0 ? tPos + (size_t)(i - 1) * 37 * 3 : zp; const float* pm = i > 0 ? tMask + (size_t)(i - 1) * 37 : zp;
   const float* atoms[7][4]; float tm[7];
   atoms[0][0] = pp + 3; atoms[0][1] = pp + 6; atoms[0][2] = p; atoms[0][3] = p + 3;          // pre-omega
-  tm[0] = pm[1] * pm[2] * m[0] * m[1];
+  tm[0] = ptx_mul_f32(ptx_mul_f32(pm[1], pm[2]), ptx_mul_f32(ptx_ldg_f32(m + 0), ptx_ldg_f32(m + 1)));
   atoms[1][0] = pp + 6; atoms[1][1] = p; atoms[1][2] = p + 3; atoms[1][3] = p + 6;          // phi
-  tm[1] = pm[2] * m[0] * m[1] * m[2];
+  tm[1] = ptx_mul_f32(pm[2], ptx_mul_f32(ptx_mul_f32(ptx_ldg_f32(m + 0), ptx_ldg_f32(m + 1)), ptx_ldg_f32(m + 2)));
   atoms[2][0] = p; atoms[2][1] = p + 3; atoms[2][2] = p + 6; atoms[2][3] = p + 12;          // psi
-  tm[2] = m[0] * m[1] * m[2] * m[4];
+  tm[2] = ptx_mul_f32(ptx_mul_f32(ptx_ldg_f32(m + 0), ptx_ldg_f32(m + 1)), ptx_mul_f32(ptx_ldg_f32(m + 2), ptx_ldg_f32(m + 4)));
   for (int c = 0; c < 4; ++c) {
-    float mm = chiMaskT[a * 4 + c];
-    for (int k = 0; k < 4; ++k) { int at = chiIdx[(a * 4 + c) * 4 + k]; atoms[3 + c][k] = p + at * 3; mm *= m[at]; }
+    float mm = ptx_ldg_f32(chiMaskT + a * 4 + c);
+    for (int k = 0; k < 4; ++k) {
+      int at = ptx_ldg_s32(chiIdx + (a * 4 + c) * 4 + k);
+      atoms[3 + c][k] = p + at * 3;
+      mm = ptx_mul_f32(mm, ptx_ldg_f32(m + at));
+    }
     tm[3 + c] = mm;
   }
   float* f = feat + (size_t)i * 57;
-  for (int k = 0; k < 22; ++k) f[k] = (k == min(max(aaRaw, 0), 21)) ? 1.f : 0.f;
+  int aaClip = ptx_min_s32(ptx_max_s32(aaRaw, 0), 21);
+  for (int k = 0; k < 22; ++k) ptx_st_global_f32(f + k, (k == aaClip) ? 1.f : 0.f);
   for (int t = 0; t < 7; ++t) {
-    // frame: e0 = origin - neg_x, e1 = xy - origin (Gram-Schmidt), origin = atom 2; the fourth atom in it.
-    // In double: at residue 0 the previous atoms are zero padding and Gram-Schmidt cancels to a vector
-    // ~1e-14 of the backbone's, which the 1e-8 regulariser should leave near zero - in float the
-    // cancellation's rounding was amplified into an O(1) pre-omega (the reference's is exactly 0)
     double e0[3], e1[3], e2[3], d[3];
-    for (int k = 0; k < 3; ++k) { e0[k] = (double)atoms[t][2][k] - atoms[t][1][k]; e1[k] = (double)atoms[t][0][k] - atoms[t][2][k];
-                                  d[k] = (double)atoms[t][3][k] - atoms[t][2][k]; }
-    double n0 = sqrt(e0[0] * e0[0] + e0[1] * e0[1] + e0[2] * e0[2] + 1e-8); for (int k = 0; k < 3; ++k) e0[k] /= n0;
-    double c = e1[0] * e0[0] + e1[1] * e0[1] + e1[2] * e0[2]; for (int k = 0; k < 3; ++k) e1[k] -= c * e0[k];
-    double n1 = sqrt(e1[0] * e1[0] + e1[1] * e1[1] + e1[2] * e1[2] + 1e-8); for (int k = 0; k < 3; ++k) e1[k] /= n1;
-    e2[0] = e0[1] * e1[2] - e0[2] * e1[1]; e2[1] = e0[2] * e1[0] - e0[0] * e1[2]; e2[2] = e0[0] * e1[1] - e0[1] * e1[0];
-    double y = e1[0] * d[0] + e1[1] * d[1] + e1[2] * d[2], z = e2[0] * d[0] + e2[1] * d[1] + e2[2] * d[2];
-    double nn = sqrt(z * z + y * y + 1e-8);
-    float sn = (float)(z / nn), cs = (float)(y / nn);
-    // ...and the first residue's pre-omega is DEFINED as zero: its "previous" atoms are padding, the frame
-    // degenerate, and its exact value the regulariser's ~0 - the reference's float arithmetic happens to
-    // cancel to exactly 0 there, where any other rounding gives noise of either sign
+    for (int k = 0; k < 3; ++k) {
+      e0[k] = ptx_sub_f64((double)atoms[t][2][k], (double)atoms[t][1][k]);
+      e1[k] = ptx_sub_f64((double)atoms[t][0][k], (double)atoms[t][2][k]);
+      d[k] = ptx_sub_f64((double)atoms[t][3][k], (double)atoms[t][2][k]);
+    }
+    double n0 = ptx_sqrt_f64(ptx_fma_f64(e0[0], e0[0], ptx_fma_f64(e0[1], e0[1], ptx_fma_f64(e0[2], e0[2], 1e-8))));
+    for (int k = 0; k < 3; ++k) e0[k] = ptx_div_f64(e0[k], n0);
+    double c = ptx_fma_f64(e1[0], e0[0], ptx_fma_f64(e1[1], e0[1], ptx_mul_f64(e1[2], e0[2])));
+    for (int k = 0; k < 3; ++k) e1[k] = ptx_fma_f64(-c, e0[k], e1[k]);
+    double n1 = ptx_sqrt_f64(ptx_fma_f64(e1[0], e1[0], ptx_fma_f64(e1[1], e1[1], ptx_fma_f64(e1[2], e1[2], 1e-8))));
+    for (int k = 0; k < 3; ++k) e1[k] = ptx_div_f64(e1[k], n1);
+    e2[0] = ptx_fma_f64(e0[1], e1[2], -ptx_mul_f64(e0[2], e1[1]));
+    e2[1] = ptx_fma_f64(e0[2], e1[0], -ptx_mul_f64(e0[0], e1[2]));
+    e2[2] = ptx_fma_f64(e0[0], e1[1], -ptx_mul_f64(e0[1], e1[0]));
+    double y = ptx_fma_f64(e1[0], d[0], ptx_fma_f64(e1[1], d[1], ptx_mul_f64(e1[2], d[2])));
+    double z = ptx_fma_f64(e2[0], d[0], ptx_fma_f64(e2[1], d[1], ptx_mul_f64(e2[2], d[2])));
+    double nn = ptx_sqrt_f64(ptx_fma_f64(z, z, ptx_fma_f64(y, y, 1e-8)));
+    float sn = (float)ptx_div_f64(z, nn), cs = (float)ptx_div_f64(y, nn);
     if (t == 0 && i == 0) sn = cs = 0.f;
     if (t == 2) { sn = -sn; cs = -cs; }
-    float alt = t >= 3 ? 1.f - 2.f * chiPi[a * 4 + t - 3] : 1.f;
-    f[22 + t * 2] = sn; f[22 + t * 2 + 1] = cs;
-    f[36 + t * 2] = sn * alt; f[36 + t * 2 + 1] = cs * alt;
-    f[50 + t] = tm[t];
+    float alt = t >= 3 ? ptx_fma_f32(-2.f, ptx_ldg_f32(chiPi + a * 4 + t - 3), 1.f) : 1.f;
+    ptx_st_global_f32(f + 22 + t * 2, sn); ptx_st_global_f32(f + 22 + t * 2 + 1, cs);
+    ptx_st_global_f32(f + 36 + t * 2, ptx_mul_f32(sn, alt)); ptx_st_global_f32(f + 36 + t * 2 + 1, ptx_mul_f32(cs, alt));
+    ptx_st_global_f32(f + 50 + t, tm[t]);
   }
-  rowMask[i] = tm[2];
+  ptx_st_global_f32(rowMask + i, tm[2]);
 }
 // multimer (template_embedding_1d): aatype(22) | sin(chi) mask(4) | cos(chi) mask(4) | chi mask(4) = 34, the
 // row's mask chi 1's
@@ -413,20 +459,27 @@ __global__ void templateChiFeatK(const int* tAatype, const float* tPos, const fl
                                  const float* chiMaskT, float* feat, float* rowMask, int L) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= L) return;
-  int aaRaw = tAatype[i], a = min(max(aaRaw, 0), 20);
+  int aaRaw = ptx_ldg_s32(tAatype + i), a = ptx_min_s32(ptx_max_s32(aaRaw, 0), 20);
   const float* p = tPos + (size_t)i * 37 * 3; const float* m = tMask + (size_t)i * 37;
   float* f = feat + (size_t)i * 34;
-  for (int k = 0; k < 22; ++k) f[k] = (k == min(max(aaRaw, 0), 21)) ? 1.f : 0.f;
+  int aaClip = ptx_min_s32(ptx_max_s32(aaRaw, 0), 21);
+  for (int k = 0; k < 22; ++k) ptx_st_global_f32(f + k, (k == aaClip) ? 1.f : 0.f);
   for (int c = 0; c < 4; ++c) {
-    const float* x[4]; float mm = chiMaskT[a * 4 + c];
-    for (int k = 0; k < 4; ++k) { int at = chiIdx[(a * 4 + c) * 4 + k]; x[k] = p + at * 3; mm *= m[at]; }
+    const float* x[4]; float mm = ptx_ldg_f32(chiMaskT + a * 4 + c);
+    for (int k = 0; k < 4; ++k) {
+      int at = ptx_ldg_s32(chiIdx + (a * 4 + c) * 4 + k);
+      x[k] = p + at * 3;
+      mm = ptx_mul_f32(mm, ptx_ldg_f32(m + at));
+    }
     float v1[3], v2[3], v3[3], c1[3], c2[3], c3[3];
     sub3(x[0], x[1], v1); sub3(x[1], x[2], v2); sub3(x[3], x[2], v3);
     cross3(v1, v2, c1); cross3(v3, v2, c2); cross3(c2, c1, c3);
-    float v2m = sqrtf(fmaxf(dot3(v2, v2), 1e-12f));
-    float ang = atan2f(dot3(c3, v2), v2m * dot3(c1, c2));
-    f[22 + c] = sinf(ang) * mm; f[26 + c] = cosf(ang) * mm; f[30 + c] = mm;
-    if (c == 0) rowMask[i] = mm;
+    float v2m = ptx_sqrt_f32(ptx_max_f32(dot3(v2, v2), 1e-12f));
+    float ang = atan2f(dot3(c3, v2), ptx_mul_f32(v2m, dot3(c1, c2)));
+    ptx_st_global_f32(f + 22 + c, ptx_mul_f32(ptx_sin_f32(ang), mm));
+    ptx_st_global_f32(f + 26 + c, ptx_mul_f32(ptx_cos_f32(ang), mm));
+    ptx_st_global_f32(f + 30 + c, mm);
+    if (c == 0) ptx_st_global_f32(rowMask + i, mm);
   }
 }
 // rows [T, L, 256] of the MSA from the templates' single features; their masks into rowMask [T, L]

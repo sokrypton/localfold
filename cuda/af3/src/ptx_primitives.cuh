@@ -466,3 +466,72 @@ __device__ __forceinline__ float ptx_min_f32(float a, float b) {
   asm("min.ftz.f32 %0, %1, %2;" : "=f"(d) : "f"(a), "f"(b));
   return d;
 }
+__device__ __forceinline__ float ptx_sin_f32(float x) {
+  float d;
+  asm("sin.approx.ftz.f32 %0, %1;" : "=f"(d) : "f"(x));
+  return d;
+}
+__device__ __forceinline__ float ptx_cos_f32(float x) {
+  float d;
+  asm("cos.approx.ftz.f32 %0, %1;" : "=f"(d) : "f"(x));
+  return d;
+}
+__device__ __forceinline__ int ptx_min_s32(int a, int b) {
+  int d;
+  asm("min.s32 %0, %1, %2;" : "=r"(d) : "r"(a), "r"(b));
+  return d;
+}
+__device__ __forceinline__ int ptx_max_s32(int a, int b) {
+  int d;
+  asm("max.s32 %0, %1, %2;" : "=r"(d) : "r"(a), "r"(b));
+  return d;
+}
+__device__ __forceinline__ uint32_t ptx_ballot_sync(int pred, uint32_t mask = 0xffffffffu) {
+  uint32_t d;
+  asm("{\n\t"
+      ".reg .pred p;\n\t"
+      "setp.ne.b32 p, %1, 0;\n\t"
+      "vote.sync.ballot.b32 %0, p, %2;\n\t"
+      "}" : "=r"(d) : "r"(pred), "r"(mask));
+  return d;
+}
+__device__ __forceinline__ int ptx_ffs_u32(uint32_t x) {
+  int d;
+  asm("{\n\t"
+      ".reg .b32 r;\n\t"
+      "brev.b32 r, %1;\n\t"
+      "bfind.shiftamt.u32 r, r;\n\t"
+      "add.s32 %0, r, 1;\n\t"
+      "}" : "=r"(d) : "r"(x));
+  return x == 0 ? 0 : d;
+}
+__device__ __forceinline__ double ptx_add_f64(double a, double b) {
+  double d;
+  asm("add.rn.f64 %0, %1, %2;" : "=d"(d) : "d"(a), "d"(b));
+  return d;
+}
+__device__ __forceinline__ double ptx_sub_f64(double a, double b) {
+  double d;
+  asm("sub.rn.f64 %0, %1, %2;" : "=d"(d) : "d"(a), "d"(b));
+  return d;
+}
+__device__ __forceinline__ double ptx_mul_f64(double a, double b) {
+  double d;
+  asm("mul.rn.f64 %0, %1, %2;" : "=d"(d) : "d"(a), "d"(b));
+  return d;
+}
+__device__ __forceinline__ double ptx_fma_f64(double a, double b, double c) {
+  double d;
+  asm("fma.rn.f64 %0, %1, %2, %3;" : "=d"(d) : "d"(a), "d"(b), "d"(c));
+  return d;
+}
+__device__ __forceinline__ double ptx_div_f64(double a, double b) {
+  double d;
+  asm("div.rn.f64 %0, %1, %2;" : "=d"(d) : "d"(a), "d"(b));
+  return d;
+}
+__device__ __forceinline__ double ptx_sqrt_f64(double x) {
+  double d;
+  asm("sqrt.rn.f64 %0, %1;" : "=d"(d) : "d"(x));
+  return d;
+}

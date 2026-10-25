@@ -38,7 +38,7 @@ template <class M> inline const void* msaWeight(const half* w, size_t n) {
 }
 template <class M> __global__ void msa16ToF32K(const M* in, float* out, size_t n) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n) out[i] = toF(in[i]);
+  if (i < n) ptx_st_global_f32(out + i, toF(in[i]));
 }
 // a pair pointer `elems` elements on, in the pair's own storage: t.pair is a float* that holds bf16 under PAIR16, so a bare
 // `pair + n` lands 2n bf16 elements on - past 2,048 residues (a second chunk of the row attention's bias, 4M pairs a chunk)
@@ -53,22 +53,23 @@ __global__ void prevDgramK(const float* pos37, const int* aatype, float* out, in
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)L * L) return;
   int i = (int)(t / L), j = (int)(t % L);
-  auto pb = [&](int r, int k) { int a = aatype[r] == 7 ? 1 : 3; return pos37[((size_t)r * 37 + a) * 3 + k]; };
-  float d2 = 0;
-  for (int k = 0; k < 3; ++k) { float d = pb(i, k) - pb(j, k); d2 += d * d; }
+  auto pb = [&](int r, int k) { int a = ptx_ldg_s32(aatype + r) == 7 ? 1 : 3; return ptx_ldg_f32(pos37 + ((size_t)r * 37 + a) * 3 + k); };
+  float d2 = 0.f;
+  for (int k = 0; k < 3; ++k) { float d = ptx_sub_f32(pb(i, k), pb(j, k)); d2 = ptx_fma_f32(d, d, d2); }
   for (int b = 0; b < 15; ++b) {
-    float lo = 3.25f + (20.75f - 3.25f) * b / 14.f;
-    float lower = lo * lo;
-    float upper = b + 1 < 15 ? (3.25f + (20.75f - 3.25f) * (b + 1) / 14.f) * (3.25f + (20.75f - 3.25f) * (b + 1) / 14.f) : 1e8f;
-    out[t * 15 + b] = (d2 > lower && d2 < upper) ? 1.f : 0.f;
+    float lo = ptx_fma_f32((float)b, (20.75f - 3.25f) / 14.f, 3.25f);
+    float lower = ptx_mul_f32(lo, lo);
+    float hi = ptx_fma_f32((float)(b + 1), (20.75f - 3.25f) / 14.f, 3.25f);
+    float upper = b + 1 < 15 ? ptx_mul_f32(hi, hi) : 1e8f;
+    ptx_st_global_f32(out + t * 15 + b, (d2 > lower && d2 < upper) ? 1.f : 0.f);
   }
 }
 __global__ void targetFeatK(const int* aatype, float* tf, int L) {      // one-hot 20 (X as V), a zero 21st
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)L * 21) return;
   int i = (int)(t / 21), c = (int)(t % 21);
-  int a = min(max(aatype[i], 0), 19);
-  tf[t] = c == a ? 1.f : 0.f;
+  int a = ptx_min_s32(ptx_max_s32(ptx_ldg_s32(aatype + i), 0), 19);
+  ptx_st_global_f32(tf + t, c == a ? 1.f : 0.f);
 }
 inline size_t AF2_CHUNK = (size_t)64 << 20;     // elements a row-chunked tensor holds, on a card short of room
 // ---------------------------------------------------------------- the pair in bf16 (AF2_P16)
@@ -167,7 +168,7 @@ __global__ void pairOuterSumK(float* pair, const float* left, const float* right
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)L * L * C) return;
   int c = (int)(t % C); size_t ij = t / C; int i = (int)(ij / L), j = (int)(ij % L);
-  pairSt<PT>(pair, t, left[(size_t)i * C + c] + right[(size_t)j * C + c]);
+  pairSt<PT>(pair, t, ptx_add_f32(ptx_ldg_f32(left + (size_t)i * C + c), ptx_ldg_f32(right + (size_t)j * C + c)));
 }
 __global__ void msaEmbedAddK(float* __restrict__ msa, const float* __restrict__ bias, const int* __restrict__ aatype,
                              const float* __restrict__ wP1d, const float* __restrict__ bP1d,
@@ -175,11 +176,11 @@ __global__ void msaEmbedAddK(float* __restrict__ msa, const float* __restrict__ 
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= rows * C) return;
   int c = (int)(t % C), i = (int)(t / C % L);
-  int a = min(max(aatype[i], 0), 19);
-  float v = msa[t] + bias[c];
-  v += wP1d[a * C + c] + bP1d[c];
-  if (t < (size_t)L * C) v += prevRowLn[t];
-  msa[t] = v;
+  int a = ptx_min_s32(ptx_max_s32(ptx_ldg_s32(aatype + i), 0), 19);
+  float v = ptx_add_f32(ptx_ld_global_f32(msa + t), ptx_ldg_f32(bias + c));
+  v = ptx_add_f32(v, ptx_add_f32(ptx_ldg_f32(wP1d + a * C + c), ptx_ldg_f32(bP1d + c)));
+  if (t < (size_t)L * C) v = ptx_add_f32(v, ptx_ldg_f32(prevRowLn + t));
+  ptx_st_global_f32(msa + t, v);
 }
 template <class PT>
 __global__ void embedPairK(const float* __restrict__ wLeft, const float* __restrict__ bLeft,
@@ -194,37 +195,36 @@ __global__ void embedPairK(const float* __restrict__ wLeft, const float* __restr
   int lane = threadIdx.x & 31;
   if (ij >= (size_t)L * L) return;
   int i = (int)(ij / L), j = (int)(ij % L);
-  int ai = min(max(aatype[i], 0), 19), aj = min(max(aatype[j], 0), 19);
-  auto pb = [&](int r, int k) { int a = aatype[r] == 7 ? 1 : 3; return pos37[((size_t)r * 37 + a) * 3 + k]; };
+  int rawAi = ptx_ldg_s32(aatype + i), rawAj = ptx_ldg_s32(aatype + j);
+  int ai = ptx_min_s32(ptx_max_s32(rawAi, 0), 19), aj = ptx_min_s32(ptx_max_s32(rawAj, 0), 19);
+  int pi = rawAi == 7 ? 1 : 3, pj = rawAj == 7 ? 1 : 3;
   float d2 = 0.f;
-  for (int k = 0; k < 3; ++k) { float d = pb(i, k) - pb(j, k); d2 += d * d; }
-  int dgBin = -1;
-  for (int b = 0; b < 15; ++b) {
-    float lo = 3.25f + (20.75f - 3.25f) * b / 14.f;
-    float lower = lo * lo;
-    float upper = b + 1 < 15 ? (3.25f + (20.75f - 3.25f) * (b + 1) / 14.f) * (3.25f + (20.75f - 3.25f) * (b + 1) / 14.f) : 1e8f;
-    if (d2 > lower && d2 < upper) dgBin = b;
+  for (int k = 0; k < 3; ++k) {
+    float d = ptx_sub_f32(ptx_ldg_f32(pos37 + ((size_t)i * 37 + pi) * 3 + k),
+                          ptx_ldg_f32(pos37 + ((size_t)j * 37 + pj) * 3 + k));
+    d2 = ptx_fma_f32(d, d, d2);
   }
-  int off = ri[i] - ri[j];
-  int clipped = min(max(off + 32, 0), 64);
-  // relpos, _relative_encoding's 73 features: across chains the multimer's own row (65); a monomer's projection has
-  // only the 65 residue-offset rows (the rest zero, af2_weights.h), so there a cross-chain pair takes the end of the
-  // window by chain order, as ColabFold's monomer complexes and the +200 break do - the zero row gave every cross-chain
-  // pair no position at all: 12 copies of 6MRR pLDDT 70.5 against ColabFold's 80.7 on float32 weights
-  int r0 = asym[i] == asym[j] ? clipped : chainRows ? 65 : asym[i] > asym[j] ? 64 : 0;
-  bool sameEntity = entity[i] == entity[j];
-  int rc = min(max(sym[i] - sym[j] + 2, 0), 4);
+  float lo = ptx_fma_f32((float)lane, (20.75f - 3.25f) / 14.f, 3.25f);
+  float hi = ptx_fma_f32((float)(lane + 1), (20.75f - 3.25f) / 14.f, 3.25f);
+  uint32_t m0 = ptx_ballot_sync(lane < 15 && d2 > ptx_mul_f32(lo, lo) && d2 < (lane + 1 < 15 ? ptx_mul_f32(hi, hi) : 1e8f));
+  int dgBin = m0 ? (ptx_ffs_u32(m0) - 1) : -1;
+  int off = ptx_ldg_s32(ri + i) - ptx_ldg_s32(ri + j);
+  int clipped = ptx_min_s32(ptx_max_s32(off + 32, 0), 64);
+  int asymI = ptx_ldg_s32(asym + i), asymJ = ptx_ldg_s32(asym + j);
+  int r0 = asymI == asymJ ? clipped : chainRows ? 65 : asymI > asymJ ? 64 : 0;
+  bool sameEntity = ptx_ldg_s32(entity + i) == ptx_ldg_s32(entity + j);
+  int rc = ptx_min_s32(ptx_max_s32(ptx_ldg_s32(sym + i) - ptx_ldg_s32(sym + j) + 2, 0), 4);
   int r2 = 67 + (sameEntity ? rc : 5);
   const float* pr = prevPair + ij * 128;
   float pv[4], s = 0.f;
 #pragma unroll
-  for (int k = 0; k < 4; ++k) { pv[k] = pr[lane + 32 * k]; s += pv[k]; }
-  for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
-  float mean = s / 128.f, v = 0.f;
+  for (int k = 0; k < 4; ++k) { pv[k] = ptx_ldg_f32(pr + lane + 32 * k); s = ptx_add_f32(s, pv[k]); }
+  s = ptx_warp_sum_f32(s);
+  float mean = ptx_mul_f32(s, 1.f / 128.f), v = 0.f;
 #pragma unroll
-  for (int k = 0; k < 4; ++k) { float d = pv[k] - mean; v += d * d; }
-  for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
-  float inv = rsqrtf(v / 128.f + 1e-5f);
+  for (int k = 0; k < 4; ++k) { float d = ptx_sub_f32(pv[k], mean); v = ptx_fma_f32(d, d, v); }
+  v = ptx_warp_sum_f32(v);
+  float inv = ptx_rsqrt_f32(ptx_fma_f32(v, 1.f / 128.f, 1e-5f));
   auto step = [](float x) {
     if constexpr (std::is_same_v<PT, float>) return x;
     else return toF(fromF<PT>(x));
@@ -232,35 +232,37 @@ __global__ void embedPairK(const float* __restrict__ wLeft, const float* __restr
 #pragma unroll
   for (int k = 0; k < 4; ++k) {
     int c = lane + 32 * k;
-    float left = wLeft[ai * 128 + c] + bLeft[c];
-    float right = wRight[aj * 128 + c] + bRight[c];
-    float acc = step(left + right);
-    float dg = (dgBin >= 0 ? wDg[dgBin * 128 + c] : 0.f) + bDg[c];
-    acc = step(acc + dg);
-    float ln = (pv[k] - mean) * inv * lnScale[c] + lnOffset[c];
-    acc = step(acc + ln);
-    float rel = wRel[r0 * 128 + c] + (sameEntity ? wRel[66 * 128 + c] : 0.f) + wRel[r2 * 128 + c] + bRel[c];
-    pairSt<PT>(pair, ij * 128 + c, acc + rel);
+    float left = ptx_add_f32(ptx_ldg_f32(wLeft + ai * 128 + c), ptx_ldg_f32(bLeft + c));
+    float right = ptx_add_f32(ptx_ldg_f32(wRight + aj * 128 + c), ptx_ldg_f32(bRight + c));
+    float acc = step(ptx_add_f32(left, right));
+    float dg = ptx_add_f32(dgBin >= 0 ? ptx_ldg_f32(wDg + dgBin * 128 + c) : 0.f, ptx_ldg_f32(bDg + c));
+    acc = step(ptx_add_f32(acc, dg));
+    float ln = ptx_fma_f32(ptx_mul_f32(ptx_sub_f32(pv[k], mean), inv), ptx_ldg_f32(lnScale + c), ptx_ldg_f32(lnOffset + c));
+    acc = step(ptx_add_f32(acc, ln));
+    float rel = ptx_add_f32(ptx_add_f32(ptx_ldg_f32(wRel + r0 * 128 + c), sameEntity ? ptx_ldg_f32(wRel + 66 * 128 + c) : 0.f),
+                            ptx_add_f32(ptx_ldg_f32(wRel + r2 * 128 + c), ptx_ldg_f32(bRel + c)));
+    pairSt<PT>(pair, ij * 128 + c, ptx_add_f32(acc, rel));
   }
 }
 __global__ void extraEmbedK(const int* __restrict__ codes, const float* __restrict__ hasDel,
                             const float* __restrict__ delVal, const float* __restrict__ w,
                             const float* __restrict__ b, float* __restrict__ out, size_t rows) {
   __shared__ float sw[25 * 64], sb[64];
-  for (int i = threadIdx.x; i < 25 * 64; i += blockDim.x) sw[i] = w[i];
-  if (threadIdx.x < 64) sb[threadIdx.x] = b[threadIdx.x];
+  for (int i = threadIdx.x; i < 25 * 64; i += blockDim.x) ptx_st_shared_f32(sw + i, ptx_ldg_f32(w + i));
+  if (threadIdx.x < 64) ptx_st_shared_f32(sb + threadIdx.x, ptx_ldg_f32(b + threadIdx.x));
   __syncthreads();
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= rows * 64) return;
   size_t r = t >> 6; int c = (int)(t & 63);
-  int code = codes[r];
-  float v = (code >= 0 && code < 23) ? sw[code * 64 + c] : 0.f;
-  v += hasDel[r] * sw[23 * 64 + c] + delVal[r] * sw[24 * 64 + c];
-  out[t] = v + sb[c];
+  int code = ptx_ldg_s32(codes + r);
+  float v = (code >= 0 && code < 23) ? ptx_ld_shared_f32(sw + code * 64 + c) : 0.f;
+  v = ptx_fma_f32(ptx_ldg_f32(hasDel + r), ptx_ld_shared_f32(sw + 23 * 64 + c), v);
+  v = ptx_fma_f32(ptx_ldg_f32(delVal + r), ptx_ld_shared_f32(sw + 24 * 64 + c), v);
+  ptx_st_global_f32(out + t, ptx_add_f32(v, ptx_ld_shared_f32(sb + c)));
 }
 __global__ void pairMaskK(const float* seqMask, float* out, int L) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t < (size_t)L * L) out[t] = seqMask[t / L] * seqMask[t % L];
+  if (t < (size_t)L * L) ptx_st_global_f32(out + t, ptx_mul_f32(ptx_ldg_f32(seqMask + t / L), ptx_ldg_f32(seqMask + t % L)));
 }
 
 // a fold short of room (af2.cu): the chunked forms may engage, and no CUDA graph is captured, so a choice
@@ -333,7 +335,10 @@ __global__ void packBatched4K(const float* __restrict__ qw, const float* __restr
   if (t >= (size_t)nblk * slice) return;
   int b = (int)(t / slice); size_t s = t % slice;
   float* o = out + (size_t)b * 4 * slice;
-  o[s] = qw[t]; o[slice + s] = kw[t]; o[2 * slice + s] = vw[t]; o[3 * slice + s] = gw[t];
+  ptx_st_global_f32(o + s, ptx_ldg_f32(qw + t));
+  ptx_st_global_f32(o + slice + s, ptx_ldg_f32(kw + t));
+  ptx_st_global_f32(o + 2 * slice + s, ptx_ldg_f32(vw + t));
+  ptx_st_global_f32(o + 3 * slice + s, ptx_ldg_f32(gw + t));
 }
 // gated self-attention with its own q/k/v/gate/output weights, over [Bt, n, C] rows
 inline void gatedAttention(const float* xn, int Bt, int n, int C, const std::string& A, int blk, int H, int D,
@@ -373,11 +378,11 @@ __global__ void biasFromProjK(const float* proj, const float* pairMask, half* ou
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)L * L * H) return;
   int h = (int)(t % H); size_t ij = t / H; int i = (int)(ij / L), j = (int)(ij % L);
-  float v = proj[t] + (pairMask ? 1e9f * (pairMask[ij] - 1.f) : 0.f);
+  float v = ptx_add_f32(ptx_ldg_f32(proj + t), (pairMask ? ptx_mul_f32(1e9f, ptx_sub_f32(ptx_ldg_f32(pairMask + ij), 1.f)) : 0.f));
   // transposed: the ending node's bias, b[h][q][k] = proj[k][q] (it attends along the first axis)
   if (transposed) { int x = i; i = j; j = x; }
-  out[((size_t)h * L + i) * stride + j] = __float2half(fmaxf(v * LOG2E, -6e4f));
-  if (j == L - 1) for (int pad = L; pad < stride; ++pad) out[((size_t)h * L + i) * stride + pad] = __float2half(0.f);
+  ptx_st_global_u16(out + ((size_t)h * L + i) * stride + j, ptx_f32_to_f16_raw(ptx_max_f32(ptx_mul_f32(v, LOG2E), -6e4f)));
+  if (j == L - 1) for (int pad = L; pad < stride; ++pad) ptx_st_global_u16(out + ((size_t)h * L + i) * stride + pad, 0);
 }
 inline const half* zeroBias(int H, int n, int stride) {        // a bias-free attention's bias, once
   static half* z = nullptr; static size_t have = 0;
@@ -415,7 +420,8 @@ __global__ void swapAddRowsK(float* __restrict__ y, const float* __restrict__ x,
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= cnt * B * C) return;
   int c = (int)(t % C); size_t r = t / C; size_t db = r % cnt, q = r / cnt, b = b0 + db;
-  y[(q * A + b) * C + c] += __ldg(x + (db * B + q) * C + c);
+  size_t dst = (q * A + b) * C + c;
+  ptx_st_global_f32(y + dst, ptx_add_f32(ptx_ld_global_f32(y + dst), ptx_ldg_f32(x + (db * B + q) * C + c)));
 }
 inline void attentionCore(const half* xn, int Bt, int n, int C, const std::string& A, int blk, const float* keyMask,
                           const half* bias, float* residual, bool transposedBack) {
@@ -485,7 +491,8 @@ __global__ void pairBiasK(const float* proj, const float* pairMask, float* bias,
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)L * L * H) return;
   int h = (int)(t % H); size_t ij = t / H;
-  bias[(size_t)h * L * L + ij] = proj[t] + (pairMask ? 1e9f * (pairMask[ij] - 1.f) : 0.f);
+  ptx_st_global_f32(bias + (size_t)h * L * L + ij,
+                    ptx_add_f32(ptx_ldg_f32(proj + t), (pairMask ? ptx_mul_f32(1e9f, ptx_sub_f32(ptx_ldg_f32(pairMask + ij), 1.f)) : 0.f)));
 }
 
 // the bias from pair rows [r0, r0 + cnt) (biasFromProjK over a chunk)
@@ -494,17 +501,18 @@ __global__ void biasFromProjRowsK(const float* proj, half* out, int L, int H, in
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= cnt * H) return;
   int h = (int)(t % H); size_t ij = r0 + t / H; size_t i = ij / L, j = ij % L;
-  float v = proj[headMajor ? (size_t)h * cnt + t / H : t] + (pairMask ? 1e9f * (pairMask[ij] - 1.f) : 0.f);
+  float v = ptx_add_f32(ptx_ldg_f32(proj + (headMajor ? (size_t)h * cnt + t / H : t)),
+                        (pairMask ? ptx_mul_f32(1e9f, ptx_sub_f32(ptx_ldg_f32(pairMask + ij), 1.f)) : 0.f));
   if (transposed) { size_t x = i; i = j; j = x; }
-  out[((size_t)h * L + i) * stride + j] = __float2half(fmaxf(v * LOG2E, -6e4f));
-  if (j == (size_t)L - 1) for (int pad = L; pad < stride; ++pad) out[((size_t)h * L + i) * stride + pad] = __float2half(0.f);
+  ptx_st_global_u16(out + ((size_t)h * L + i) * stride + j, ptx_f32_to_f16_raw(ptx_max_f32(ptx_mul_f32(v, LOG2E), -6e4f)));
+  if (j == (size_t)L - 1) for (int pad = L; pad < stride; ++pad) ptx_st_global_u16(out + ((size_t)h * L + i) * stride + pad, 0);
 }
 // [C][H] f32 -> [C][16] f16, zero columns past H (gridInK's bias projection reads 16)
 __global__ void padHeadsK(const float* w, half* out, int C, int H) {
   int t = blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= C * 16) return;
   int k = t / 16, c = t % 16;
-  out[t] = __float2half(c < H ? w[k * H + c] : 0.f);
+  ptx_st_global_u16(out + t, c < H ? ptx_f32_to_f16_raw(ptx_ldg_f32(w + k * H + c)) : 0);
 }
 inline const half* paddedFeat2dWeight(const float* wf, int C, int H) {
   static std::map<const float*, half*> wbCache;
@@ -1616,14 +1624,15 @@ __global__ void gatherColumnsK(const float* pair, float* out, int L, int C, size
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= cnt * L * C) return;
   int c = (int)(t % C); size_t r = t / C; size_t q = r % L, b = b0 + r / L;
-  out[t] = pair[(q * L + b) * C + c];
+  ptx_st_global_f32(out + t, ptx_ldg_f32(pair + (q * L + b) * C + c));
 }
 // pair[q * L + b] += x[(b - b0) * L + q], the columns [b0, b0 + cnt)
 __global__ void addColumnsK(float* pair, const float* x, int L, int C, size_t b0, size_t cnt) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= cnt * L * C) return;
   int c = (int)(t % C); size_t r = t / C; size_t q = r % L, b = b0 + r / L;
-  pair[(q * L + b) * C + c] += x[t];
+  size_t dst = (q * L + b) * C + c;
+  ptx_st_global_f32(pair + dst, ptx_add_f32(ptx_ld_global_f32(pair + dst), ptx_ldg_f32(x + t)));
 }
 // The triangle attention on a card short of room (--fast), in chunks of attention rows: the bias from the
 // pair in chunks first, then per chunk its rows' LayerNorm, q/k/v/gate, the flash kernel and the output
