@@ -444,21 +444,19 @@ __global__ void __launch_bounds__(WARPS * 32) triInK(const float* __restrict__ p
   };
   issue(0, 0);
   lnRowsToShared<C, R, WARPS, PT>(pair, [&](int r) { return pairOf(row0 + r); }, lnScale, lnOffset, Xs, LDX, warp, lane);
+  cpWait<0>();
   __syncthreads();
   uint32_t xa[KS][4];
 #pragma unroll
   for (int ks = 0; ks < KS; ++ks) ldsm4(xa[ks], Xs + (warp * 16 + (lane & 15)) * LDX + ks * 16 + (lane >> 4) * 8);
+  if (1 < steps) issue(1, 1);
   int lr0 = warp * 16 + g, lr1 = lr0 + 8;                          // the thread's rows within the block
   size_t pr0 = pairOf(row0 + lr0), pr1 = pairOf(row0 + lr1);
   float m0 = pr0 != SIZE_MAX ? (mask ? ptx_ldg_f32(mask + pr0) : 1.f) : 0.f, m1 = pr1 != SIZE_MAX ? (mask ? ptx_ldg_f32(mask + pr1) : 1.f) : 0.f;
   const int ch0 = (int)threadIdx.x / (R / 8), r8 = ((int)threadIdx.x % (R / 8)) * 8;
   for (int j = 0; j < steps; ++j) {
     int st = j & 1;
-    cpWait<0>();
-    __syncthreads();
-    if (j + 1 < steps) issue(j + 1, st ^ 1);
     bool gating = j >= C / 16;
-    const half *w0 = W0(st), *w1 = W1(st);
     float2 bp[TI_NC / 8], bq[TI_NC / 8];
     if constexpr (BIAS) {
 #pragma unroll
@@ -469,11 +467,17 @@ __global__ void __launch_bounds__(WARPS * 32) triInK(const float* __restrict__ p
         bq[nt] = ptx_ldg_v2_f32(bias + qcol);
       }
     }
+    if (j > 0) {
+      cpWait<0>();
+      __syncthreads();
+    }
+    const half *w0 = W0(st), *w1 = W1(st);
     float p[TI_NC / 8][4] = {}, q[TI_NC / 8][4] = {};
     constexpr int N2 = TI_NC / 16, STEPS = KS * N2;
     const int kl = ((lane >> 3) & 1) * 8 + (lane & 7), cl = (lane >> 4) * 8;
     uint32_t f0[4], f1[4];
     ldsm4t(f0, w0 + tiSw(kl, cl));
+    if (j > 0 && j + 1 < steps) issue(j + 1, st ^ 1);
 #pragma unroll
     for (int s = 0; s < STEPS; ++s) {
       const int ks = s / N2, n2 = s % N2;
@@ -531,8 +535,10 @@ __global__ void __launch_bounds__(WARPS * 32) triInK(const float* __restrict__ p
           int ch = ch0 + it * (NTH / (R / 8));
           if ((16 * (R / 8)) % NTH != 0 && ch >= 16) break;
           size_t at = (size_t)(j * 16 + ch) * cs + row0 + r8;
-          ptx_st_global_v4_u32(a + at, ptx_ld_shared_v4_u32(Ta + ch * LDT + r8));
-          ptx_st_global_v4_u32(b + at, ptx_ld_shared_v4_u32(Tb + ch * LDT + r8));
+          uint4 va = ptx_ld_shared_v4_u32(Ta + ch * LDT + r8);
+          uint4 vb = ptx_ld_shared_v4_u32(Tb + ch * LDT + r8);
+          ptx_st_global_v4_u32(a + at, va);
+          ptx_st_global_v4_u32(b + at, vb);
         }
       }
     }

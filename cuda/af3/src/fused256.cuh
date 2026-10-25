@@ -401,7 +401,6 @@ triangleOutK(const TP* __restrict__ prod, const float* __restrict__ cnScale,
 #else
     cpWait<0>();
     __syncthreads();
-    if (n + 1 < chunks) issue(n + 1, st ^ 1);
 #endif
     const half* w = Ws(st);
     float acc[NC / 8][4] = {};
@@ -411,6 +410,9 @@ triangleOutK(const TP* __restrict__ prod, const float* __restrict__ cnScale,
       uint32_t f0, f1, f2, f3;
       uint32_t fb[4];
       ldsm4t(fb, w + stageSw<NC>(kl, cl));
+#if !LF_REG_STAGES
+      if (n + 1 < chunks) issue(n + 1, st ^ 1);
+#endif
       f0 = fb[0]; f1 = fb[1]; f2 = fb[2]; f3 = fb[3];
 #pragma unroll
       for (int ks = 0; ks < KS; ++ks) {
@@ -425,6 +427,9 @@ triangleOutK(const TP* __restrict__ prod, const float* __restrict__ cnScale,
     } else {
       uint32_t fb[2][4];
       ldsm4t(fb[0], w + stageSw<NC>(kl, cl));
+#if !LF_REG_STAGES
+      if (n + 1 < chunks) issue(n + 1, st ^ 1);
+#endif
 #pragma unroll
       for (int s = 0; s < STEPS; ++s) {
         const int cur = s & 1, ks = s / N2, n2 = s % N2;
@@ -443,6 +448,12 @@ triangleOutK(const TP* __restrict__ prod, const float* __restrict__ cnScale,
       ptx_st_shared_v2_f32(Os + (g + 8) * LDO + c, acc[nt][2], acc[nt][3]);
     }
     __syncwarp();
+    float4 oAll[PER];
+#pragma unroll
+    for (int i = 0; i < PER; ++i) {
+      int rl = i * LPR + lane / (NC / 4);
+      oAll[i] = ptx_ld_shared_v4_f32(Os + rl * LDO + q0_);
+    }
     int c = n * NC + q0_;
 #pragma unroll
     for (int i = 0; i < PER; ++i) {
@@ -455,8 +466,7 @@ triangleOutK(const TP* __restrict__ prod, const float* __restrict__ cnScale,
         pr = pairAt(row);
         if (pr == SIZE_MAX) continue;
       }
-      int rl = i * LPR + lane / (NC / 4);
-      float4 o = ptx_ld_shared_v4_f32(Os + rl * LDO + q0_);
+      float4 o = oAll[i];
       uint2 gw = C < 512 ? gv[i] : ptx_ld_global_v2_u32(t2 + paddedAt(row0 + warp * 16 + i * LPR + lane / (NC / 4)) * C + c);
       float2 g01 = ptx_f16x2_to_f32x2(gw.x), g23 = ptx_f16x2_to_f32x2(gw.y);
       float4 v = C < 512 ? pairUnpack4<PT>(pv[i]) : pairLd4<PT>(pair, pr * C + c);
@@ -492,8 +502,8 @@ template <class TA = half> constexpr size_t triIn256Smem(int C, int warps, int x
   size_t ab = (size_t)2 * 8 * (16 * warps * mt + 8) * sizeof(TA), t2s = (size_t)warps * 16 * 32 * 2;
   size_t tail = ab > t2s ? ab : t2s;
   if (mt > 1 && xrounds == mt) {
-    size_t pro = stage + rows, main = 2 * stage + tail;
-    return pro > main ? pro : main;
+    size_t main = 2 * stage + tail;
+    return rows > main ? rows : main;
   }
   size_t stages = 2 * stage + (xrounds > 1 && rows > tail ? rows : tail);
   return xrounds == 1 && rows > stages ? rows : stages;
@@ -553,7 +563,7 @@ triIn256K(const float* __restrict__ pair, const float* __restrict__ mask,
     unsigned u = q, iq = u / Jr; return (size_t)(u - iq * Jr) * (pp / Jr) + iq;
   };
   extern __shared__ __align__(16) unsigned char smem[];
-  half* Xs = XROUNDS == 1 ? (half*)smem : (MT > 1 && XROUNDS == MT) ? (half*)(smem + STAGE) : (half*)(smem + 2 * STAGE);
+  half* Xs = (XROUNDS == 1 || (MT > 1 && XROUNDS == MT)) ? (half*)smem : (half*)(smem + 2 * STAGE);
   auto W0 = [&](int s) { return (half*)(smem + s * STAGE); };
   auto W1 = [&](int s) { return W0(s) + C * LDW; };
   TA* Ta = (TA*)(smem + 2 * STAGE);
@@ -600,15 +610,15 @@ triIn256K(const float* __restrict__ pair, const float* __restrict__ mask,
     issue(stepOf(0), 0);
   } else if constexpr (MT > 1 && XROUNDS == MT) {
     constexpr int XR = 16 * WARPS;
-    issue(stepOf(0), 0);                // stage 0 sits at smem[0 .. STAGE); Xs sits at smem + STAGE (25.0 KB total at C=128)
 #pragma unroll
     for (int mt = 0; mt < MT; ++mt) {
       lnRowsToShared<C, XR, WARPS, PT>(pair, [&](int r) { return pairOf(row0 + ((r >> 4) * MT + mt) * 16 + (r & 15)); }, lnScale, lnOffset, Xs, LDX, warp, lane);
       __syncthreads();
 #pragma unroll
       for (int ks = 0; ks < KS; ++ks) ldsm4(xa[mt][ks], Xs + (warp * 16 + (lane & 15)) * LDX + ks * 16 + (lane >> 4) * 8);
-      __syncthreads();                  // the round's fragments are in registers: the next round or stage 1 takes Xs
+      __syncthreads();                  // the round's fragments are in registers: the next round or stage 0 takes Xs
     }
+    issue(stepOf(0), 0);
   } else {
     static_assert(R % XROUNDS == 0 && (R / XROUNDS) % 16 == 0 && (R / XROUNDS) % WARPS == 0, "whole warps' rows a round");
     constexpr int XR = R / XROUNDS;
@@ -702,12 +712,12 @@ triIn256K(const float* __restrict__ pair, const float* __restrict__ mask,
             ptx_st_shared_u32(Ys + (g + 8) * 32 + c8q, ptx_cvt_f16x2_f32(q[mt][nt][2], q[mt][nt][3]));
           }
           __syncwarp();
-#pragma unroll
-          for (int i = 0; i < 2; ++i) {
-            int r = i * 8 + g, c = tig * 8, csw = (tig ^ sw0) * 8;
-            unsigned qa = row0 + (warp * MT + mt) * 16 + r;
-            if (qa < pp) ptx_st_global_v4_u32(t2 + (size_t)qa * C + c0 + c, ptx_ld_shared_v4_u32(Ys + r * 32 + csw));
-          }
+          const int c = tig * 8, csw = (tig ^ sw0) * 8;
+          uint4 y0 = ptx_ld_shared_v4_u32(Ys + g * 32 + csw);
+          uint4 y1 = ptx_ld_shared_v4_u32(Ys + (g + 8) * 32 + csw);
+          unsigned qa0 = row0 + (warp * MT + mt) * 16 + g;
+          if (qa0 < pp) ptx_st_global_v4_u32(t2 + (size_t)qa0 * C + c0 + c, y0);
+          if (qa0 + 8 < pp) ptx_st_global_v4_u32(t2 + (size_t)(qa0 + 8) * C + c0 + c, y1);
           __syncwarp();
         }
       } else {
@@ -750,11 +760,15 @@ triIn256K(const float* __restrict__ pair, const float* __restrict__ mask,
         if (row < cs) {
           size_t at = (size_t)(j * CH + ch) * cs + row;
           if constexpr (sizeof(TA) == 1) {
-            if (a) ptx_st_global_v2_u32(a + at, ptx_ld_shared_v2_u32(Ta + ch * LDT + r8));
-            if (b) ptx_st_global_v2_u32(b + at, ptx_ld_shared_v2_u32(Tb + ch * LDT + r8));
+            uint2 va = a ? ptx_ld_shared_v2_u32(Ta + ch * LDT + r8) : make_uint2(0, 0);
+            uint2 vb = b ? ptx_ld_shared_v2_u32(Tb + ch * LDT + r8) : make_uint2(0, 0);
+            if (a) ptx_st_global_v2_u32(a + at, va);
+            if (b) ptx_st_global_v2_u32(b + at, vb);
           } else {
-            if (a) ptx_st_global_v4_u32(a + at, ptx_ld_shared_v4_u32(Ta + ch * LDT + r8));
-            if (b) ptx_st_global_v4_u32(b + at, ptx_ld_shared_v4_u32(Tb + ch * LDT + r8));
+            uint4 va = a ? ptx_ld_shared_v4_u32(Ta + ch * LDT + r8) : make_uint4(0, 0, 0, 0);
+            uint4 vb = b ? ptx_ld_shared_v4_u32(Tb + ch * LDT + r8) : make_uint4(0, 0, 0, 0);
+            if (a) ptx_st_global_v4_u32(a + at, va);
+            if (b) ptx_st_global_v4_u32(b + at, vb);
           }
         }
       }
