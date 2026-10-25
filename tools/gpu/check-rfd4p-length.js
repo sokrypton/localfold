@@ -134,9 +134,31 @@ export async function main(device, args = []) {
   const { batch } = buildBatch({ contig: `${length}-${length}` }, { seed });
 
   const wanted = arm === 'both' ? [true, false] : [arm === 'f16'];
+  // 🔴 `--chunk-bytes=` FORCES THE CHUNKED TRACK AT A SHORT LENGTH, which is how the sliced
+  // arm gets an end-to-end geometry check without a quarter-hour generation. The kernels a
+  // chunked pass runs are chosen by `chunkPlan`, not by n, so a 200-mer under a small bound
+  // takes exactly the path a 600-mer takes under the default one - at a tenth of the work.
+  // It is also the only way to run BOTH arms of that comparison inside the runner's
+  // deadline, and `tools/gpu/check-rfd4p-chunked.js` is the same question one pass deep.
+  //
+  // Measured, `--length=200 --chunk-bytes=38400000` (four equal chunks), f16, seed 42:
+  //
+  //    steps    median    least    worst    in band    chain
+  //        4     7.418    2.232   17.325      2/199       no
+  //       20     3.502    1.316    3.815     50/199       no
+  //       60     3.856    3.716    3.986    199/199      YES
+  //
+  // 🔴 AND THE STEP LADDER IS THE POINT, not just the last row. Two earlier attempts at
+  // this check were killed with the session (a login window, no reboot - WindowServer
+  // going down takes every user process with it), and the obvious reading was that the new
+  // chunked f16 path hangs the GPU. Run from 4 steps up on an idle machine, all three
+  // complete and the 60-step row is a textbook backbone, so that reading was wrong and the
+  // kills belong to whatever else the machine was doing. Climbing the ladder costs 100
+  // seconds and is how to tell a broken kernel from a busy laptop.
+  const chunkBytes = opt['chunk-bytes'] === undefined ? undefined : Number(opt['chunk-bytes']);
   const arms = {};
   for (const half of wanted) {
-    const gen = new Rfd4pGeneratorGpu(device, weights, config, { half });
+    const gen = new Rfd4pGeneratorGpu(device, weights, config, { half, ...(chunkBytes === undefined ? {} : { chunkBytes }) });
     const t0 = performance.now();
     const res = await gen.generate(batch, { nsteps, recycleSchedule: 'low', seed });
     arms[half ? 'f16' : 'f32'] = {

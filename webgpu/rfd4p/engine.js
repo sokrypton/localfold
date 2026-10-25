@@ -2324,7 +2324,9 @@ function mapSource(bindings, body) {
   const decls = bindings
     .map((b, at) => (b === null ? '' : `@group(0) @binding(${at + 1}) var<storage, ${b.write ? 'read_write' : 'read'}> b${at}: array<${b.type ?? 'f32'}>;`))
     .join('\n');
-  return `
+  // An f16-typed binding needs the extension declared; `enable` must precede everything.
+  const f16 = bindings.some((b) => b !== null && /f16/.test(b.type ?? ''));
+  return `${f16 ? 'enable f16;\n' : ''}
 struct P { count: u32, u: array<vec4<u32>, 4>, f: array<vec4<f32>, 4> };
 @group(0) @binding(0) var<uniform> p: P;
 ${decls}
@@ -2596,11 +2598,33 @@ export class Rfd4pEngine {
     return buffer;
   }
 
+  /**
+   * One dispatch. An entry of `buffers` is a `GPUBuffer`, or a VIEW of one -
+   * `{ buffer, offsetBytes, sizeBytes }` - which is how a chunked kernel reaches a window
+   * of a whole-tensor buffer while still indexing from zero.
+   *
+   * 🔴 THE VIEW IS WHAT LETS A CHUNK KEEP THE UNCHUNKED KERNEL. The alternative is a row
+   * offset in the uniform and `+ rowOff` in the hot epilogue, specialised per variant; a
+   * binding offset moves the window instead and the shader is untouched, so the single-
+   * chunk and chunked arms run the SAME text. WebGPU wants the offset on
+   * `minStorageBufferOffsetAlignment` (256 bytes), and every pair-row offset here is a
+   * multiple of 384 f32s (1536 bytes) or 192 words (768 bytes), so it always is - checked
+   * rather than assumed, because the failure is a validation error naming a binding.
+   */
   async step(key, source, groups, buffers, words, label) {
     const pipeline = await this.pipeline(key, source);
     const entries = [{ binding: 0, resource: { buffer: this.uniform(words) } }];
     buffers.forEach((b, at) => {
-      if (b) entries.push({ binding: at + 1, resource: { buffer: b } });
+      if (!b) return;
+      if (b.buffer === undefined) {
+        entries.push({ binding: at + 1, resource: { buffer: b } });
+        return;
+      }
+      const align = this.device.limits.minStorageBufferOffsetAlignment ?? 256;
+      if (b.offsetBytes % align !== 0) {
+        throw new Error(`${key}: binding ${at + 1} offset ${b.offsetBytes} is not a multiple of ${align}`);
+      }
+      entries.push({ binding: at + 1, resource: { buffer: b.buffer, offset: b.offsetBytes, size: b.sizeBytes } });
     });
     const bindGroup = this.device.createBindGroup({ label: `rfd4p.${key}`, layout: pipeline.getBindGroupLayout(0), entries });
     const [x, y] = fold2(groups);
@@ -3125,34 +3149,42 @@ export class Rfd4pEngine {
         label: label ?? `triProjG ${rows}x1408x384`,
       });
     }
+    // 🔴 THE CHUNKED FORM NARROWS TOO, and both of its outputs are written ELEMENTWISE
+    // rather than packed. `proj` is the gemm's own C, so `cF16` decides its type; `gz` is
+    // this epilogue's, and the gate that later reads it indexes per element and casts
+    // (`f32(gsc[...])`), so an `array<f16>` is exactly what it wants - the fused arm's
+    // `vec2<u32>` store is the same bytes seen four halves at a time, not another layout.
+    const projF16 = outF16 && this.hasF16;
+    const pt = projF16 ? 'f16' : 'f32';
+    const cast = projF16 ? 'f16' : '';
     return this.gemm({
-      m: rows, n: 1408, k: 384, a: x, b: w, c: proj, noSmall: true,
+      m: rows, n: 1408, k: 384, a: x, b: w, c: proj, noSmall: true, aF16, cF16: projF16,
       A: { off: 0, m: 384, k: 1 }, B: { off: 0, n: 384, k: 1 }, C: { off: 0, m: 512, n: 1 },
       pair: {
-        key: 'triprojg',
+        key: `triprojg${projF16 ? '-h' : ''}`,
         buffers: [gz],
-        decls: '@group(0) @binding(5) var<storage, read_write> gz: array<f32>;',
+        decls: `@group(0) @binding(5) var<storage, read_write> gz: array<${pt}>;`,
         body: `fn pairOutCol(m: u32, n0: u32, col: u32, v0: f32, v1: f32) {
   if (n0 < 1024u) {
-    c[m * 512u + (n0 / 2u) + col] = v0 / (1.0 + exp(-v1));
+    c[m * 512u + (n0 / 2u) + col] = ${cast}(v0 / (1.0 + exp(-v1)));
   } else {
     let base0 = m * 384u + (n0 - 1024u) + col;
-    gz[base0] = 1.0 / (1.0 + exp(-v0));
-    gz[base0 + 64u] = 1.0 / (1.0 + exp(-v1));
+    gz[base0] = ${cast}(1.0 / (1.0 + exp(-v0)));
+    gz[base0 + 64u] = ${cast}(1.0 / (1.0 + exp(-v1)));
   }
 }
 fn pairOut(m: u32, n0: u32, tn0: u32, r0: vec4<f32>, r1: vec4<f32>) {
   if (n0 < 1024u) {
     let y = r0 / (vec4<f32>(1.0) + exp(-r1));
     let base = m * 512u + (n0 / 2u) + tn0;
-    c[base] = y.x; c[base + 1u] = y.y; c[base + 2u] = y.z; c[base + 3u] = y.w;
+    c[base] = ${cast}(y.x); c[base + 1u] = ${cast}(y.y); c[base + 2u] = ${cast}(y.z); c[base + 3u] = ${cast}(y.w);
   } else {
     let g0 = vec4<f32>(1.0) / (vec4<f32>(1.0) + exp(-r0));
     let g1 = vec4<f32>(1.0) / (vec4<f32>(1.0) + exp(-r1));
     let base0 = m * 384u + (n0 - 1024u) + tn0;
     let base1 = base0 + 64u;
-    gz[base0] = g0.x; gz[base0 + 1u] = g0.y; gz[base0 + 2u] = g0.z; gz[base0 + 3u] = g0.w;
-    gz[base1] = g1.x; gz[base1 + 1u] = g1.y; gz[base1 + 2u] = g1.z; gz[base1 + 3u] = g1.w;
+    gz[base0] = ${cast}(g0.x); gz[base0 + 1u] = ${cast}(g0.y); gz[base0 + 2u] = ${cast}(g0.z); gz[base0 + 3u] = ${cast}(g0.w);
+    gz[base1] = ${cast}(g1.x); gz[base1 + 1u] = ${cast}(g1.y); gz[base1 + 2u] = ${cast}(g1.z); gz[base1 + 3u] = ${cast}(g1.w);
   }
 }`,
       },

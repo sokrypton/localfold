@@ -30,13 +30,25 @@ describe("the rfd4p trunk's pair-track chunk plan", () => {
     expect(chunkPlan(513 * 513, { wantF16: true }).chunks).toBeGreaterThan(1);
   });
 
-  it("gives up f16 exactly when it gives up the single chunk", () => {
-    // 🔴 THE CHUNKED KERNELS ARE f32 ONLY, so a plan that promised f16 on a sliced track
-    // would size buffers for one arithmetic and run the other.
+  it("keeps f16 when it gives up the single chunk, which it did not used to", () => {
+    // 🔴 THIS ASSERTION IS THE REVERSE OF THE ONE IT REPLACES, and deliberately. It used to
+    // read `expect(plan.triF16).toBe(plan.chunks === 1)`, because the chunked kernels were
+    // f32 only and a plan promising f16 on a sliced track would have sized buffers for one
+    // arithmetic and run the other. They read and write halves now, so the arithmetic is a
+    // property of the DEVICE and the request and the slicing is a property of the length -
+    // two independent questions that were one.
+    //
+    // What it cost to have them coupled, profiled at the residue where they met: crossing
+    // n = 512 to 513 widened the pair track back to f32 at the same moment the slicing
+    // changed, so memory rose 46% (2056 -> 3001 MiB) and the pass took 2.02x as long
+    // (2914 -> 5882 ms). A cliff of that size in one residue is what a coupling looks like
+    // from the outside.
     for (const n of [100, 200, 362, 400, 512, 513, 700, 1000]) {
-      const plan = chunkPlan(n * n, { wantF16: true });
-      expect(plan.triF16).toBe(plan.chunks === 1);
+      expect(chunkPlan(n * n, { wantF16: true }).triF16).toBe(true);
     }
+    // And the slicing still moves where it always did.
+    expect(chunkPlan(512 * 512, { wantF16: true }).chunks).toBe(1);
+    expect(chunkPlan(513 * 513, { wantF16: true }).chunks).toBeGreaterThan(1);
   });
 
   it("never asks f16 of a device that cannot do it", () => {
@@ -75,7 +87,8 @@ describe("the rfd4p trunk's pair-track chunk plan", () => {
     // boundary. Zero rows is not a plan and one row is a wrong one.
     const plan = chunkPlan(400 * 400, { wantF16: true, chunkBytes: 16 });
     expect(plan.R).toBe(4);
-    expect(plan.triF16).toBe(false);
+    // f16 survives a bound this small now: narrowing no longer depends on the slicing.
+    expect(plan.triF16).toBe(true);
     expect(plan.chunks).toBe(40000);
   });
 
@@ -98,12 +111,15 @@ describe("the rfd4p trunk's pair-track chunk plan", () => {
     }
   });
 
-  it("keeps the default plan's rows where they were, four-aligned already", () => {
-    // The bound the trunk ships with, stated so the alignment above is visibly free: this
-    // is the number every n > 512 design has been chunked at, and it was already aligned.
-    const { R } = chunkPlan(600 * 600, {});
-    expect(R).toBe(101944);
+  it("pins the default plan's rows, four-aligned", () => {
+    // The bound the trunk ships with, stated so a change to the row cost has to be
+    // deliberate. It was 101944 while gz was R-indexed and is 122332 now that gz is held
+    // whole - the bound describes the R-indexed scratch, so taking a buffer out of that set
+    // buys rows rather than bytes.
+    const { R, chunks } = chunkPlan(600 * 600, {});
+    expect(R).toBe(122332);
     expect(R % 4).toBe(0);
+    expect(chunks).toBe(3);
   });
 
   it("gives a bigger bound more rows, monotonically", () => {

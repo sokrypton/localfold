@@ -20,22 +20,24 @@
  *   x                        256 * nn      its contraction output
  *
  * `triF16` halves all six and the scratch with them, so f16 is the LENGTH lever and the
- * chunk plan is not. Which is also why the f32 fallback past the threshold is a memory
- * cliff and not just a speed one: the arithmetic changes at the same residue. Measured on
- * an Apple M5 (8-core GPU, 16 GB unified, 4 GB bindings), activations alone:
+ * chunk plan is not. Measured on an Apple M5 (8-core GPU, 16 GB unified, 4 GB bindings),
+ * activations alone, before and after the chunked track learned f16:
  *
- *     n     f16 arm   f32 arm   chunks
- *   400    1269 MiB      2201    1 / 2
- *   512    2056 MiB      3011    1 / 3
- *   513        3001      2996    3        <- triF16 off, +46% in ONE residue
- *   600        3769      3762    4
- *  1000        8840      8821   10
+ *     n    f16 was   f16 now   f32    chunks now
+ *   400       1269      1269  2436    1
+ *   512       2056      2056  3395    1
+ *   513       3001      2237  3381    2     <- was +46% in ONE residue, now +8.8%
+ *   600       3769      2719  4290    2
+ *  1000       8840      5918 10285    5
+ *  1200          -      8103 14403    6
  *
- * 🔴 NOTHING REFUSED UP TO n = 1000, so the ceiling here is the 16 GB this machine shares
- * with everything else, not a limit any buffer names - and past 513 THE TWO ARMS ARE THE
- * SAME, because the chunked path is f32-only and unfused. Giving it f16 is worth about 40%
- * of the memory at those lengths, which is sqrt(2) of the length in a fixed budget, and it
- * is the only thing that would remove the cliff rather than move it.
+ * 🔴 NOTHING REFUSES UP TO n = 1200, so the ceiling is the 16 GB this machine shares with
+ * everything else and not a limit any buffer names. The old f16 column IS the f32 column
+ * past 512, because `triF16` used to require one chunk: the arithmetic widened at the same
+ * residue the slicing changed, which is what made that row a cliff rather than a curve. At
+ * a 4 GB budget the reachable length goes from about 585 to about 798 - **1.36x**, the
+ * square root of what halving six n^2 buffers buys, less what `bias` and `pairF` keep in
+ * f32.
  */
 
 import {
