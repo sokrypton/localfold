@@ -663,7 +663,12 @@ function contigsFor(name, js) {
   // 🔴 AND ONE WITH THE PURE-EXPANDABLE RUN FIRST, which is the only shape that reaches the
   // queue-and-reorder: a leading run with no atoms cannot be placed until a later run brings
   // some, and is then moved back in front of it.
-  return [seg, `4-4,${seg}`, `${seg},3-3`, `${seg},/0,5-5P`, `5-5P,/0,${seg}`];
+  // 🔴 AND BOTH NUCLEIC SUFFIXES, BECAUSE ONLY `P` WAS EVER WRITTEN. `suffixChainType` maps
+  // `P`/`R`/`D` onto protein, RNA and DNA, and gcov says the `R` and `D` arms had never run -
+  // every contig in this corpus asked for a protein segment. A segment typed as the wrong
+  // molecule is not a refusal: it is a chain the model reads as the wrong polymer.
+  return [seg, `4-4,${seg}`, `${seg},3-3`, `${seg},/0,5-5P`, `5-5P,/0,${seg}`,
+          `${seg},/0,5-5R`, `${seg},/0,5-5D`];
 }
 
 /**
@@ -750,6 +755,16 @@ function conditionsFor(js) {
     ["crdgrp", { C_CRD: { true: [{ select: all }] }, C_CRDGRP: { 2: [{ select: few }] } }],
     ["secondary", { C_SEC: { HELIX: [{ select: few }] } }],
     ["cath", { C_CATH: { "3.40.50": [{ select: all }] } }],
+    // 🔴 THE `centroid` DTYPE, WHICH NOTHING HERE HAD EVER WRITTEN. gcov says its whole branch
+    // was uncovered: it is the only condition whose VALUE is three numbers rather than a flag
+    // or a name, so it is the only one where `splitTopLevel` runs over the value and a short
+    // list has to pad. A FOUR-component value is in the corpus because both sides ignore the
+    // extra one;
+    // a value with fewer than three is REFUSED by this port and lives in gate.py's refusals
+    // arm, because the reference stores a two-element entry in a column everything downstream
+    // reads as a point and says nothing.
+    ["centroid", { C_CENTROID: { "1.5,-2.25,3.75": [{ select: all }] } }],
+    ["centroid-long", { C_CENTROID: { "1,2,3,4": [{ select: few }] } }],
     // 🔴 AND THE CATH RULE IS NOT "PAD TO FOUR LEVELS", WHICH IS WHAT ONE CODE SUGGESTS. The
     // reference appends `.x` to anything not already ending in `.x`, so a COMPLETE four-level
     // code gains a fifth field: `3.40.50.20` is stored as `3.40.50.20.x`. Surprising, the

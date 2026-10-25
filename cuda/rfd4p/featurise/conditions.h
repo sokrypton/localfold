@@ -182,7 +182,25 @@ inline void applyConditions(atoms::AtomArray& a, const Spec& conditions,
           for (const string& p : selection::splitTopLevel(value, ',')) {
             parts.push_back(atof(selection::trim(p).c_str()));
           }
-          parts.resize(3, NAN);
+          // 🔴 FEWER THAN THREE NUMBERS IS REFUSED, WHICH IS A DELIBERATE DIVERGENCE. The
+          // reference stores `parts.slice(0, 3)` - so `"1.5,-2.25"` becomes a TWO-element
+          // entry in a column every stage after it reads as a point, and nothing says so.
+          // This port cannot represent that (the annotation is a flat `n * 3`) and would not
+          // want to: padding the third with NaN invents a coordinate, and a centroid with two
+          // numbers is a typo, not a request. Found by the condition corpus, which had never
+          // written a `centroid` value at all until gcov said the whole branch was dead.
+          // MORE than three is NOT refused - both sides truncate, and the corpus holds them
+          // to each other on a four-component value.
+          if (parts.size() < 3) {
+            fprintf(stderr,
+                    "condition '%s' names a centroid with %zu numbers, not three: '%s'\n",
+                    annotationName.c_str(), parts.size(), value.c_str());
+            exit(1);
+          }
+          // (No truncation needed: the refusal above makes `parts.size() >= 3` and the loop
+          // below reads only the first three. A `parts.resize(3, NAN)` stood here, mirroring
+          // the reference's `slice(0, 3)`; dropping it is 0 of 27 differing, measured - the
+          // reference needs it because it STORES the slice, and this port does not.)
           for (const int idx : indices) {
             for (int k = 0; k < 3; ++k) a.ann.floats[full][idx * 3 + k] = parts[k];
           }

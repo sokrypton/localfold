@@ -618,7 +618,41 @@ residues the cropped example does not contain, so building one from the spec fai
     coverage tells you where to look and is not itself the test.
 
     The corpus is **27 structures** now, twenty of them synthesised, and gcov is how the last
-    eight were chosen.
+    eight were chosen. Three more gaps it named and the corpus now covers: the contig
+    suffixes `R` and `D` (`suffixChainType` maps `P`/`R`/`D` onto protein, RNA and DNA, and
+    every contig ever written here asked for a protein - a segment typed as the wrong molecule
+    is not a refusal, it is a chain the model reads as the wrong polymer; **24 of 27** with
+    both arms returning protein), and the whole `centroid` condition dtype, the only one whose
+    value is three numbers rather than a flag or a name (**20 of 27** with the triple
+    reversed).
+
+    🔴 **AND THE `centroid` CASE FOUND A REAL DIVERGENCE, NOT JUST A GAP.** Given two numbers
+    the reference stores `parts.slice(0, 3)` - a TWO-element entry in a column every stage
+    after it reads as a point, silently. This port cannot represent that (its annotation is a
+    flat `n * 3`) and would not want to, because padding the third with NaN invents a
+    coordinate and a two-number centroid is a typo. It is **refused by name**, a stated
+    divergence beside the `sel(a),sel(b)` one; more than three is NOT refused, because both
+    sides ignore the extra and the corpus holds them to each other on a four-component value.
+    With the refusal in place `parts.resize(3, NAN)` provably cannot do anything, measured at
+    0 of 27, and is gone.
+
+    🔴 **AND THE GATE'S OWN `structure` FIXTURE WAS TESTING CONDITIONS IT COULD NOT APPLY.**
+    Without `specMode` a job's `input` is a STRUCTURE rather than a spec, so `applyContig` and
+    `applyConditions` are never called and the file's own annotations are kept instead - the
+    fold is **byte-identical with the fixture's two conditions deleted**. That drop is correct
+    and load-bearing rather than a bug: **eight of the ten shipped presets have exactly this
+    shape**, their `.cif.zst` already carrying the conditions as annotations, which is why
+    `input_as_annotated_cif` is true on that path and why refusing would break them. What was
+    wrong was the fixture, which copied a preset's shape and so read as though it tested
+    something. `gate-structure-contig.json` and `gate-crdgroups.json` set `specMode` and are
+    where a structure's conditions are actually gated.
+
+    🔴 **AND THE REFUSAL ARM FOR THE CENTROID NEEDED THREE THINGS AND MISSED TWO IN TURN.** On
+    a pure contig a centroid is ALREADY refused for needing a structure, so the first attempt
+    reported NOT REFUSED with the rule it was testing never reached - **two refusals on one
+    input test the first of them**. The second attempt gave it a structure and no `specMode`,
+    so the condition was dropped before it could be refused: the very trap the paragraph above
+    describes, walked into while writing that paragraph.
 
     🔴 **AND TWO OF `superpose.h`'s FIVE CONVENTIONS ARE NOT WHAT THE FILE SAID THEY WERE.**
     The header claimed three things were "the reference's and not the textbook's" and that a

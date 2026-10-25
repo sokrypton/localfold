@@ -411,6 +411,18 @@ def main() -> int:
             # reader, the contig, the conditions and the fourteen transform stages. One without a
             # contig (take the structure whole) and one with, because the contig is what makes
             # the conditions' residue numbers differ from the assembled ones.
+            #
+            # 🔴 AND `gate-structure.json` CARRIES NO CONDITIONS, BECAUSE THE ONES IT USED TO
+            # CARRY DID NOTHING. Without `specMode` a job's `input` is a STRUCTURE and not a
+            # spec, so `applyContig`/`applyConditions` are never called and the file's own
+            # annotations are kept instead - measured, the fold is BYTE-IDENTICAL with the two
+            # conditions deleted. That is correct and load-bearing rather than a bug: eight of
+            # the ten shipped presets have exactly this shape, their `.cif.zst` already carrying
+            # the conditions as annotations, which is why `input_as_annotated_cif` is true on
+            # that path and why refusing here would break them. What was wrong was the FIXTURE,
+            # which copied a preset's shape and so looked like it tested conditions on a
+            # structure. `gate-structure-contig.json` and `gate-crdgroups.json` set `specMode`
+            # and are where a structure's conditions are actually gated.
             for tag in ("structure", "structure-contig"):
                 spec = HERE / "featurise" / f"gate-{tag}.json"
                 cases.append((tag, [f"--spec={spec}"], [f"--spec={spec}"]))
@@ -459,6 +471,25 @@ def main() -> int:
                  "drops it silently"),
                 ('{"contig":"a1:5-5P","conditions":{"C_SEC":{"HELIX":[{"select":"sel(\'A/*/12/*\')"}]}}}',
                  "constrains a chain"),
+                # 🔴 A CENTROID WITH FEWER THAN THREE NUMBERS. A deliberate divergence: the
+                # reference stores `parts.slice(0, 3)`, so `"1.5,-2.25"` becomes a TWO-element
+                # entry in a column every stage after it reads as a point, silently. This port
+                # cannot represent that and would not want to - padding the third with NaN
+                # invents a coordinate. MORE than three is not refused, because both sides
+                # truncate and `check-cif.mjs` holds them to each other on a four-component
+                # value. Found because gcov said the whole `centroid` branch had never run.
+                #
+                # 🔴 AND IT NEEDS AN INPUT STRUCTURE **AND** `specMode`, both of which the
+                # first two attempts missed, each failing differently. On a pure contig a
+                # centroid is ALREADY refused for needing a structure, so that earlier refusal
+                # fired and this arm read NOT REFUSED with the rule it was testing never
+                # reached - two refusals on one input test the first of them. Then with an
+                # `input` and no `specMode` the job is a STRUCTURE rather than a spec, so
+                # `applyConditions` is never called and the condition is dropped before it can
+                # be refused - the exact trap the comment above the featurise arm describes,
+                # walked into while writing that comment.
+                ('{"input":"web/examples/ppi_pdl1.cif.zst","specMode":true,"conditions":'
+                 '{"C_CENTROID":{"1.5,-2.25":[{"select":"sel(\'B/*/*/*\')"}]}}}', "not three"),
             ]
             bad_refusals = []
             probe = HERE / "featurise" / "gate-refusal.json"
