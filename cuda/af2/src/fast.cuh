@@ -148,12 +148,11 @@ packQkvgWeightK(const float* __restrict__ q, const float* __restrict__ k, const 
     uint2 u2 = make_uint2(0, 0);
     if ((int)d < D) {
       const float* p = (role == 0 ? q : role == 1 ? k : role == 2 ? v : g) + ((size_t)c * H + h) * D + d;
-      float4 v4 = ((uintptr_t)p & 15) == 0 ? __ldg(reinterpret_cast<const float4*>(p))
-                                           : make_float4(__ldg(p), __ldg(p + 1), __ldg(p + 2), __ldg(p + 3));
-      half2 a = __floats2half2_rn(v4.x, v4.y), b = __floats2half2_rn(v4.z, v4.w);
-      u2 = make_uint2(*reinterpret_cast<unsigned*>(&a), *reinterpret_cast<unsigned*>(&b));
+      float4 v4 = ((uintptr_t)p & 15) == 0 ? ptx_ldg_v4_f32(p)
+                                           : make_float4(ptx_ldg_f32(p), ptx_ldg_f32(p + 1), ptx_ldg_f32(p + 2), ptx_ldg_f32(p + 3));
+      u2 = make_uint2(ptx_cvt_f16x2_f32(v4.x, v4.y), ptx_cvt_f16x2_f32(v4.z, v4.w));
     }
-    reinterpret_cast<uint2*>(out)[t] = u2;
+    ptx_st_global_v2_u32(reinterpret_cast<uint2*>(out) + t, u2);
     return;
   }
   if (t >= (size_t)C * 4 * Wp) return;
@@ -162,16 +161,16 @@ packQkvgWeightK(const float* __restrict__ q, const float* __restrict__ k, const 
   float val = 0;
   if (d < D) {
     const float* src = role == 0 ? q : role == 1 ? k : role == 2 ? v : g;
-    val = __ldg(src + (size_t)c * H * D + h * D + d);
+    val = ptx_ldg_f32(src + (size_t)c * H * D + h * D + d);
   }
-  out[t] = __float2half(val);
+  ptx_st_global_u16(out + t, ptx_f32_to_f16_raw(val));
 }
 __global__ void __launch_bounds__(256, 8)
 packGateBiasK(const float* __restrict__ gb, float* __restrict__ out, int H, int D, int Dp) {
   int t = blockIdx.x * blockDim.x + threadIdx.x, Wp = H * Dp;
   if (t >= 4 * Wp) return;
   int role = t / Wp, hd = t % Wp, h = hd / Dp, d = hd % Dp;
-  out[t] = (role == 3 && d < D) ? __ldg(gb + h * D + d) : 0.f;
+  ptx_st_global_f32(out + t, (role == 3 && d < D) ? ptx_ldg_f32(gb + h * D + d) : 0.f);
 }
 __global__ void __launch_bounds__(256, 8)
 packOutputWeightK(const float* __restrict__ o, half* __restrict__ out, int C, int H, int D, int Dp) {
@@ -184,17 +183,16 @@ packOutputWeightK(const float* __restrict__ o, half* __restrict__ out, int C, in
     uint2 u2 = make_uint2(0, 0);
     if ((int)d < D) {
       const float* p = o + ((size_t)h * D + d) * C + c;
-      float4 v4 = ((uintptr_t)p & 15) == 0 ? __ldg(reinterpret_cast<const float4*>(p))
-                                           : make_float4(__ldg(p), __ldg(p + 1), __ldg(p + 2), __ldg(p + 3));
-      half2 a = __floats2half2_rn(v4.x, v4.y), b = __floats2half2_rn(v4.z, v4.w);
-      u2 = make_uint2(*reinterpret_cast<unsigned*>(&a), *reinterpret_cast<unsigned*>(&b));
+      float4 v4 = ((uintptr_t)p & 15) == 0 ? ptx_ldg_v4_f32(p)
+                                           : make_float4(ptx_ldg_f32(p), ptx_ldg_f32(p + 1), ptx_ldg_f32(p + 2), ptx_ldg_f32(p + 3));
+      u2 = make_uint2(ptx_cvt_f16x2_f32(v4.x, v4.y), ptx_cvt_f16x2_f32(v4.z, v4.w));
     }
-    reinterpret_cast<uint2*>(out)[t] = u2;
+    ptx_st_global_v2_u32(reinterpret_cast<uint2*>(out) + t, u2);
     return;
   }
   if (t >= (size_t)H * Dp * C) return;
   int c = (int)(t % C); int hd = (int)(t / C), h = hd / Dp, d = hd % Dp;
-  out[t] = __float2half(d < D ? __ldg(o + ((size_t)h * D + d) * C + c) : 0.f);
+  ptx_st_global_u16(out + t, ptx_f32_to_f16_raw(d < D ? ptx_ldg_f32(o + ((size_t)h * D + d) * C + c) : 0.f));
 }
 struct AttnW { const half* qkvg; const float* qkvgBias; const half* out; int H, D, Dp; };
 // narrow: an 8-wide head left unpadded, for the flash kernel's D 8 form (flashNarrow); otherwise padded to 16
@@ -223,7 +221,7 @@ sliceVgWeightK(const half* __restrict__ qkvg, half* __restrict__ vg, int C, int 
   unsigned w4 = (unsigned)(Wp2 >> 2);
   if (t >= (size_t)C * w4) return;
   unsigned u = (unsigned)t, c = u / w4, col4 = u - c * w4;
-  reinterpret_cast<uint2*>(vg)[t] = __ldg(reinterpret_cast<const uint2*>(qkvg) + (size_t)c * 2 * w4 + w4 + col4);
+  ptx_st_global_v2_u32(reinterpret_cast<uint2*>(vg) + t, ptx_ldg_v2_u32(reinterpret_cast<const uint2*>(qkvg) + (size_t)c * 2 * w4 + w4 + col4));
 }
 inline const half* attnVgWeight(const AttnW& w, int C) {
   static std::map<const half*, half*> cache;
@@ -338,8 +336,8 @@ __global__ void __launch_bounds__(WARPS * 32) lnGemmK(const float* __restrict__ 
 #pragma unroll
   for (int mt = 0; mt < MT; ++mt) {
     size_t ra = row0 + (warp * MT + mt) * 16 + g, rb = ra + 8;
-    ma[mt] = mask && ra < rows ? __ldg(mask + ra) : 1.f;
-    mb[mt] = mask && rb < rows ? __ldg(mask + rb) : 1.f;
+    ma[mt] = mask && ra < rows ? ptx_ldg_f32(mask + ra) : 1.f;
+    mb[mt] = mask && rb < rows ? ptx_ldg_f32(mask + rb) : 1.f;
   }
   half* Ys = (half*)(smem + STAGE) + warp * (16 * MT) * NC;
   const int r_ep = lane >> 1, c_ep = (lane & 1) * 8;
@@ -367,25 +365,25 @@ __global__ void __launch_bounds__(WARPS * 32) lnGemmK(const float* __restrict__ 
 #pragma unroll
       for (int mt = 0; mt < MT; ++mt) { mma16816(acc[mt][0], xa[mt][ks], f[cur][0], f[cur][1]); mma16816(acc[mt][1], xa[mt][ks], f[cur][2], f[cur][3]); }
     }
-    auto pack = [&](float v0, float v1, float m) {
-      half2 h = __floats2half2_rn(v0, v1);
+    auto pack = [&](float v0, float v1, float m) -> uint32_t {
+      uint32_t h = ptx_cvt_f16x2_f32(v0, v1);
       if (!mask) return h;
-      float2 q = __half22float2(h);
-      return __floats2half2_rn(q.x * m, q.y * m);
+      float2 q = ptx_f16x2_to_f32x2(h);
+      return ptx_cvt_f16x2_f32(ptx_mul_f32(q.x, m), ptx_mul_f32(q.y, m));
     };
     float2 bf[2];
 #pragma unroll
     for (int nt = 0; nt < 2; ++nt) {
       int col = n * NC + nt * 8 + tig * 2;
-      bf[nt] = bias ? __ldg(reinterpret_cast<const float2*>(bias + col)) : make_float2(0.f, 0.f);
+      bf[nt] = bias ? ptx_ldg_v2_f32(bias + col) : make_float2(0.f, 0.f);
     }
 #pragma unroll
     for (int mt = 0; mt < MT; ++mt) {
 #pragma unroll
       for (int nt = 0; nt < 2; ++nt) {
         int c = nt * 8 + tig * 2;
-        *reinterpret_cast<half2*>(Ys + (mt * 16 + g) * NC + c) = pack(acc[mt][nt][0] + bf[nt].x, acc[mt][nt][1] + bf[nt].y, ma[mt]);
-        *reinterpret_cast<half2*>(Ys + (mt * 16 + g + 8) * NC + c) = pack(acc[mt][nt][2] + bf[nt].x, acc[mt][nt][3] + bf[nt].y, mb[mt]);
+        ptx_st_shared_u32(Ys + (mt * 16 + g) * NC + c, pack(ptx_add_f32(acc[mt][nt][0], bf[nt].x), ptx_add_f32(acc[mt][nt][1], bf[nt].y), ma[mt]));
+        ptx_st_shared_u32(Ys + (mt * 16 + g + 8) * NC + c, pack(ptx_add_f32(acc[mt][nt][2], bf[nt].x), ptx_add_f32(acc[mt][nt][3], bf[nt].y), mb[mt]));
       }
     }
     __syncwarp();
@@ -396,7 +394,7 @@ __global__ void __launch_bounds__(WARPS * 32) lnGemmK(const float* __restrict__ 
     for (int mt = 0; mt < MT; ++mt) {
       size_t row = row0 + (warp * MT + mt) * 16 + r_ep;
       if (row < rows)
-        *reinterpret_cast<uint4*>(o_base + row * ld) = *reinterpret_cast<const uint4*>(Ys + (mt * 16 + r_ep) * NC + c_ep);
+        ptx_st_global_v4_u32(o_base + row * ld, ptx_ld_shared_v4_u32(Ys + (mt * 16 + r_ep) * NC + c_ep));
     }
     __syncwarp();
 #if LF_REG_STAGES
@@ -535,7 +533,7 @@ inline TriFused triFusedWeights(const std::string& T, int blk, int C) {
 // ---------------------------------------------------------------- outer product mean, --fast
 __global__ void scaleRowsHK(half* x, const float* mask, size_t rows, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t < rows * C) x[t] = __float2half(__half2float(x[t]) * mask[t / C]);
+  if (t < rows * C) ptx_st_global_u16(x + t, ptx_f32_to_f16_raw(ptx_mul_f32(ptx_f16_raw_to_f32(ptx_ld_global_u16(x + t)), ptx_ldg_f32(mask + t / C))));
 }
 
 // ---------------------------------------------------------------- a bias carried by the product

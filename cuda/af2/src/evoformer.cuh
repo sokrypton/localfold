@@ -799,13 +799,14 @@ __global__ void opmLeftToICS(const half* lt, half* out, int S, int L, int O, flo
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)S * L * O) return;
   int s = (int)(t % S); size_t r = t / S; int c = (int)(r % O); int i = (int)(r / O);
-  out[t] = scale == 1.f ? lt[((size_t)s * L + i) * O + c] : __float2half(__half2float(lt[((size_t)s * L + i) * O + c]) * scale);
+  unsigned short h = ptx_ldg_u16(lt + ((size_t)s * L + i) * O + c);
+  ptx_st_global_u16(out + t, scale == 1.f ? h : ptx_f32_to_f16_raw(ptx_mul_f32(ptx_f16_raw_to_f32(h), scale)));
 }
 __global__ void opmLeftToICSF32K(const float* __restrict__ lt, float* __restrict__ out, int S, int L, int O) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)S * L * O) return;
   int s = (int)(t % S); size_t r = t / S; int c = (int)(r % O); int i = (int)(r / O);
-  out[t] = lt[((size_t)s * L + i) * O + c];
+  ptx_st_global_f32(out + t, ptx_ldg_f32(lt + ((size_t)s * L + i) * O + c));
 }
 // (the bias-augmented shallow OPM, sm_12x) Lt [L][K] -> [L][K+8], ones at columns K and K+1 and zeros after; and the GEMM's
 // weight grown by 8 rows - the tiled bias as two f16 rows at K and K+1, zeros after - so the bias rides the GEMM itself
@@ -813,20 +814,23 @@ __global__ void opmAugLeftK(const half* Lt, half* La, int L, int K) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)L * (K + 8)) return;
   size_t j = t / (K + 8); int k = (int)(t % (K + 8));
-  La[t] = k < K ? Lt[j * K + k] : __float2half(k == K || k == K + 1 ? 1.f : 0.f);
+  ptx_st_global_u16(La + t, k < K ? ptx_ldg_u16(Lt + j * K + k) : ptx_f32_to_f16_raw(k == K || k == K + 1 ? 1.f : 0.f));
 }
 // (two rows: the bias's f16 rounding and what that rounding left, so their f32 sum is the bias to ~2^-22)
 __global__ void opmAugBiasRowsK(const float* bt, half* tail, size_t n) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= 8 * n) return;
-  if (t < n) tail[t] = __float2half(bt[t]);
-  else if (t < 2 * n) { float b = bt[t - n]; tail[t] = __float2half(b - __half2float(__float2half(b))); }
-  else tail[t] = __float2half(0.f);
+  if (t < n) ptx_st_global_u16(tail + t, ptx_f32_to_f16_raw(ptx_ldg_f32(bt + t)));
+  else if (t < 2 * n) {
+    float b = ptx_ldg_f32(bt + t - n);
+    ptx_st_global_u16(tail + t, ptx_f32_to_f16_raw(ptx_sub_f32(b, ptx_f16_raw_to_f32(ptx_f32_to_f16_raw(b)))));
+  }
+  else ptx_st_global_u16(tail + t, (unsigned short)0);
 }
 // the output bias over a pair row's L positions, scaled: [L][C] of bias[c] * scale
 __global__ void tileBiasK(const float* bias, float* out, int L, int C, float scale) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t < (size_t)L * C) out[t] = bias[t % C] * scale;
+  if (t < (size_t)L * C) ptx_st_global_f32(out + t, ptx_mul_f32(ptx_ldg_f32(bias + t % C), scale));
 }
 __global__ void opmLeftToICSBf16K(const half* __restrict__ lt, __nv_bfloat16* __restrict__ La, int S, int L, int O, float scale) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -837,18 +841,16 @@ __global__ void opmLeftToICSBf16K(const half* __restrict__ lt, __nv_bfloat16* __
   __nv_bfloat16* row = La + (size_t)i * Ka;
   if (idx < K) {
     int s = idx % S, c = idx / S;
-    float v = __half2float(__float2half(__half2float(lt[((size_t)s * L + i) * O + c]) * scale));
-    __nv_bfloat16 l0 = __float2bfloat16(v);
-    __nv_bfloat16 l1 = __float2bfloat16(v - __bfloat162float(l0));
-    __nv_bfloat162 p = __halves2bfloat162(l0, l1);
-    uint32_t u = *reinterpret_cast<uint32_t*>(&p);
-    *reinterpret_cast<uint2*>(row + 4 * idx) = make_uint2(u, u);
+    float v = ptx_f16_raw_to_f32(ptx_f32_to_f16_raw(ptx_mul_f32(ptx_f16_raw_to_f32(ptx_ldg_u16(lt + ((size_t)s * L + i) * O + c)), scale)));
+    unsigned short l0 = ptx_f32_to_bf16_raw(v);
+    float l1 = ptx_sub_f32(v, ptx_bf16_raw_to_f32(l0));
+    uint32_t u = ptx_cvt_bf16x2_f32(ptx_bf16_raw_to_f32(l0), l1);
+    ptx_st_global_v2_u32(row + 4 * idx, make_uint2(u, u));
   } else if (idx == K) {
-    __nv_bfloat16 one = __float2bfloat16(1.f), zero = __float2bfloat16(0.f);
-    __nv_bfloat162 p0 = __halves2bfloat162(one, one), p1 = __halves2bfloat162(one, zero);
-    *reinterpret_cast<uint2*>(row + 4 * K) = make_uint2(*reinterpret_cast<uint32_t*>(&p0), *reinterpret_cast<uint32_t*>(&p1));
+    uint32_t p0 = ptx_cvt_bf16x2_f32(1.f, 1.f), p1 = ptx_cvt_bf16x2_f32(1.f, 0.f);
+    ptx_st_global_v2_u32(row + 4 * K, make_uint2(p0, p1));
   } else {
-    *reinterpret_cast<uint2*>(row + 4 * K + 4) = make_uint2(0, 0);
+    ptx_st_global_v2_u32(row + 4 * K + 4, make_uint2(0, 0));
   }
 }
 __global__ void opmPackTbfK(const half* __restrict__ T, const float* __restrict__ ob, float scale,
@@ -860,36 +862,37 @@ __global__ void opmPackTbfK(const half* __restrict__ T, const float* __restrict_
   int k = (int)(t / m4);
   size_t m = col4 << 2;
   if (k < K) {
-    uint2 h4 = __ldg(reinterpret_cast<const uint2*>(T + (size_t)k * M + m));
-    float2 f0 = __half22float2(*reinterpret_cast<const half2*>(&h4.x));
-    float2 f1 = __half22float2(*reinterpret_cast<const half2*>(&h4.y));
-    __nv_bfloat162 hi0 = __floats2bfloat162_rn(f0.x, f0.y), hi1 = __floats2bfloat162_rn(f1.x, f1.y);
-    float2 hi0f = __bfloat1622float2(hi0), hi1f = __bfloat1622float2(hi1);
-    __nv_bfloat162 lo0 = __floats2bfloat162_rn(f0.x - hi0f.x, f0.y - hi0f.y);
-    __nv_bfloat162 lo1 = __floats2bfloat162_rn(f1.x - hi1f.x, f1.y - hi1f.y);
-    uint2 uHi = make_uint2(*reinterpret_cast<uint32_t*>(&hi0), *reinterpret_cast<uint32_t*>(&hi1));
-    uint2 uLo = make_uint2(*reinterpret_cast<uint32_t*>(&lo0), *reinterpret_cast<uint32_t*>(&lo1));
+    uint2 h4 = ptx_ldg_v2_u32(T + (size_t)k * M + m);
+    float2 f0 = ptx_f16x2_to_f32x2(h4.x);
+    float2 f1 = ptx_f16x2_to_f32x2(h4.y);
+    uint32_t hi0 = ptx_cvt_bf16x2_f32(f0.x, f0.y), hi1 = ptx_cvt_bf16x2_f32(f1.x, f1.y);
+    float2 hi0f = ptx_bf16x2_to_f32x2(hi0), hi1f = ptx_bf16x2_to_f32x2(hi1);
+    uint32_t lo0 = ptx_cvt_bf16x2_f32(ptx_sub_f32(f0.x, hi0f.x), ptx_sub_f32(f0.y, hi0f.y));
+    uint32_t lo1 = ptx_cvt_bf16x2_f32(ptx_sub_f32(f1.x, hi1f.x), ptx_sub_f32(f1.y, hi1f.y));
+    uint2 uHi = make_uint2(hi0, hi1);
+    uint2 uLo = make_uint2(lo0, lo1);
     size_t r0 = (size_t)(4 * k) * m4 + col4;
-    reinterpret_cast<uint2*>(Tbf)[r0] = uHi;
-    reinterpret_cast<uint2*>(Tbf)[r0 + m4] = uHi;
-    reinterpret_cast<uint2*>(Tbf)[r0 + 2 * m4] = uLo;
-    reinterpret_cast<uint2*>(Tbf)[r0 + 3 * m4] = uLo;
+    ptx_st_global_v2_u32(reinterpret_cast<uint2*>(Tbf) + r0, uHi);
+    ptx_st_global_v2_u32(reinterpret_cast<uint2*>(Tbf) + r0 + m4, uHi);
+    ptx_st_global_v2_u32(reinterpret_cast<uint2*>(Tbf) + r0 + 2 * m4, uLo);
+    ptx_st_global_v2_u32(reinterpret_cast<uint2*>(Tbf) + r0 + 3 * m4, uLo);
   } else {
-    float4 b4 = __ldg(reinterpret_cast<const float4*>(ob + (m & 127)));
-    b4.x *= scale; b4.y *= scale; b4.z *= scale; b4.w *= scale;
-    __nv_bfloat162 b0_0 = __floats2bfloat162_rn(b4.x, b4.y), b0_1 = __floats2bfloat162_rn(b4.z, b4.w);
-    float2 f0_0 = __bfloat1622float2(b0_0), f0_1 = __bfloat1622float2(b0_1);
-    float4 r1 = make_float4(b4.x - f0_0.x, b4.y - f0_0.y, b4.z - f0_1.x, b4.w - f0_1.y);
-    __nv_bfloat162 b1_0 = __floats2bfloat162_rn(r1.x, r1.y), b1_1 = __floats2bfloat162_rn(r1.z, r1.w);
-    float2 f1_0 = __bfloat1622float2(b1_0), f1_1 = __bfloat1622float2(b1_1);
-    __nv_bfloat162 b2_0 = __floats2bfloat162_rn(r1.x - f1_0.x, r1.y - f1_0.y);
-    __nv_bfloat162 b2_1 = __floats2bfloat162_rn(r1.z - f1_1.x, r1.w - f1_1.y);
+    float4 b4 = ptx_ldg_v4_f32(ob + (m & 127));
+    b4.x = ptx_mul_f32(b4.x, scale); b4.y = ptx_mul_f32(b4.y, scale);
+    b4.z = ptx_mul_f32(b4.z, scale); b4.w = ptx_mul_f32(b4.w, scale);
+    uint32_t b0_0 = ptx_cvt_bf16x2_f32(b4.x, b4.y), b0_1 = ptx_cvt_bf16x2_f32(b4.z, b4.w);
+    float2 f0_0 = ptx_bf16x2_to_f32x2(b0_0), f0_1 = ptx_bf16x2_to_f32x2(b0_1);
+    float4 r1 = make_float4(ptx_sub_f32(b4.x, f0_0.x), ptx_sub_f32(b4.y, f0_0.y), ptx_sub_f32(b4.z, f0_1.x), ptx_sub_f32(b4.w, f0_1.y));
+    uint32_t b1_0 = ptx_cvt_bf16x2_f32(r1.x, r1.y), b1_1 = ptx_cvt_bf16x2_f32(r1.z, r1.w);
+    float2 f1_0 = ptx_bf16x2_to_f32x2(b1_0), f1_1 = ptx_bf16x2_to_f32x2(b1_1);
+    uint32_t b2_0 = ptx_cvt_bf16x2_f32(ptx_sub_f32(r1.x, f1_0.x), ptx_sub_f32(r1.y, f1_0.y));
+    uint32_t b2_1 = ptx_cvt_bf16x2_f32(ptx_sub_f32(r1.z, f1_1.x), ptx_sub_f32(r1.w, f1_1.y));
     size_t rb = (size_t)(4 * K) * m4 + col4;
-    reinterpret_cast<uint2*>(Tbf)[rb] = make_uint2(*reinterpret_cast<uint32_t*>(&b0_0), *reinterpret_cast<uint32_t*>(&b0_1));
-    reinterpret_cast<uint2*>(Tbf)[rb + m4] = make_uint2(*reinterpret_cast<uint32_t*>(&b1_0), *reinterpret_cast<uint32_t*>(&b1_1));
-    reinterpret_cast<uint2*>(Tbf)[rb + 2 * m4] = make_uint2(*reinterpret_cast<uint32_t*>(&b2_0), *reinterpret_cast<uint32_t*>(&b2_1));
+    ptx_st_global_v2_u32(reinterpret_cast<uint2*>(Tbf) + rb, make_uint2(b0_0, b0_1));
+    ptx_st_global_v2_u32(reinterpret_cast<uint2*>(Tbf) + rb + m4, make_uint2(b1_0, b1_1));
+    ptx_st_global_v2_u32(reinterpret_cast<uint2*>(Tbf) + rb + 2 * m4, make_uint2(b2_0, b2_1));
     uint2 z = make_uint2(0, 0);
-    for (int r = 3; r < 8; ++r) reinterpret_cast<uint2*>(Tbf)[rb + r * m4] = z;
+    for (int r = 3; r < 8; ++r) ptx_st_global_v2_u32(reinterpret_cast<uint2*>(Tbf) + rb + r * m4, z);
   }
 }
 // The outer product mean's SHALLOW form, for an alignment of few rows: the output projection folded into the
@@ -909,12 +912,12 @@ __global__ void opmToF8K(const half* in, __nv_fp8_e4m3* out, int rowsN, int Sp, 
   int c0 = blockIdx.x * 32, s0 = blockIdx.y * 32;
   for (int y = threadIdx.y; y < 32; y += 8) {
     int s = s0 + y, c = c0 + threadIdx.x;
-    tile[y][threadIdx.x] = s < rowsN && c < LO ? __half2float(in[(size_t)s * LO + c]) : 0.f;
+    ptx_st_shared_f32(&tile[y][threadIdx.x], s < rowsN && c < LO ? ptx_f16_raw_to_f32(ptx_ldg_u16(in + (size_t)s * LO + c)) : 0.f);
   }
   __syncthreads();
   for (int y = threadIdx.y; y < 32; y += 8) {
     int c = c0 + y, s = s0 + threadIdx.x;
-    if (c < LO && s < Sp) out[(size_t)c * Sp + s] = __nv_fp8_e4m3(tile[threadIdx.x][y]);
+    if (c < LO && s < Sp) out[(size_t)c * Sp + s] = __nv_fp8_e4m3(ptx_ld_shared_f32(&tile[threadIdx.x][y]));
   }
 }
 #include "../../af3/src/triingemm.cuh"
@@ -922,7 +925,7 @@ __global__ void opmToF8K(const half* in, __nv_fp8_e4m3* out, int rowsN, int Sp, 
 // 2^-k): a block is 128 flat (i, j) rows of the i-block, the k = (a, b) chunks a apart (tgMain's strides), and the epilogue adds
 // (bias + 2^k y) / (1e-3 + norm) into the pair - no permuted copy, no f32 product, no opmAddK
 template <class PT>
-__global__ void __launch_bounds__(128) opmOutK(const half* __restrict__ Pm, const half* __restrict__ W, const float* __restrict__ bias,
+__global__ void __launch_bounds__(128, 2) opmOutK(const half* __restrict__ Pm, const half* __restrict__ W, const float* __restrict__ bias,
     const float* __restrict__ norm, float* __restrict__ pair, int i0, int bi, int L, float up, float invNorm = 0.f) {
   extern __shared__ __align__(16) unsigned char smem[];
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3, wm = warp & 1, wn = warp >> 1;
@@ -933,30 +936,33 @@ __global__ void __launch_bounds__(128) opmOutK(const half* __restrict__ Pm, cons
   constexpr int LDY = 64 + 4;
   float* Ys = reinterpret_cast<float*>(smem) + warp * 16 * LDY;
   const int cl = (lane & 15) * 4, f = wn * 64 + cl;
-  const float4 b4 = *reinterpret_cast<const float4*>(bias + f);
+  const float4 b4 = ptx_ldg_v4_f32(bias + f);
   const bool full = row0 + 128 <= pp;
 #pragma unroll
   for (int mi = 0; mi < 4; ++mi) {
 #pragma unroll
     for (int t = 0; t < 8; ++t) {
       int c = t * 8 + 2 * tig;
-      *reinterpret_cast<float2*>(Ys + g * LDY + c) = make_float2(acc[mi][t][0], acc[mi][t][1]);
-      *reinterpret_cast<float2*>(Ys + (g + 8) * LDY + c) = make_float2(acc[mi][t][2], acc[mi][t][3]);
+      ptx_st_shared_v2_f32(Ys + g * LDY + c, acc[mi][t][0], acc[mi][t][1]);
+      ptx_st_shared_v2_f32(Ys + (g + 8) * LDY + c, acc[mi][t][2], acc[mi][t][3]);
     }
     __syncwarp();
     if (full && !norm) {
       const size_t ij0 = (size_t)i0 * L + row0 + wm * 64 + mi * 16 + (lane >> 4);
-      float4 a4[8], v[8];
+      PairRaw4<PT> pv[8];
 #pragma unroll
       for (int ep = 0; ep < 8; ++ep) {
-        a4[ep] = *reinterpret_cast<const float4*>(Ys + (ep * 2 + (lane >> 4)) * LDY + cl);
-        v[ep] = pairLd4<PT>(pair, (ij0 + ep * 2) * 128 + f);
+        pv[ep] = pairLdRaw4<PT>(pair, (ij0 + ep * 2) * 128 + f);
       }
 #pragma unroll
       for (int ep = 0; ep < 8; ++ep) {
-        v[ep].x += (b4.x + up * a4[ep].x) * invNorm; v[ep].y += (b4.y + up * a4[ep].y) * invNorm;
-        v[ep].z += (b4.z + up * a4[ep].z) * invNorm; v[ep].w += (b4.w + up * a4[ep].w) * invNorm;
-        pairSt4<PT>(pair, (ij0 + ep * 2) * 128 + f, v[ep]);
+        float4 a4 = ptx_ld_shared_v4_f32(Ys + (ep * 2 + (lane >> 4)) * LDY + cl);
+        float4 v = pairUnpack4<PT>(pv[ep]);
+        v.x = ptx_fma_f32(ptx_fma_f32(up, a4.x, b4.x), invNorm, v.x);
+        v.y = ptx_fma_f32(ptx_fma_f32(up, a4.y, b4.y), invNorm, v.y);
+        v.z = ptx_fma_f32(ptx_fma_f32(up, a4.z, b4.z), invNorm, v.z);
+        v.w = ptx_fma_f32(ptx_fma_f32(up, a4.w, b4.w), invNorm, v.w);
+        pairSt4<PT>(pair, (ij0 + ep * 2) * 128 + f, v);
       }
     } else {
 #pragma unroll
@@ -965,11 +971,13 @@ __global__ void __launch_bounds__(128) opmOutK(const half* __restrict__ Pm, cons
         size_t q = row0 + wm * 64 + mi * 16 + rl;
         if (q >= pp) continue;
         const size_t ij = (size_t)i0 * L + q;
-        const float d = norm ? 1.f / (1e-3f + norm[ij]) : invNorm;
-        float4 a4 = *reinterpret_cast<const float4*>(Ys + rl * LDY + cl);
+        const float d = norm ? ptx_rcp_f32(ptx_add_f32(1e-3f, ptx_ldg_f32(norm + ij))) : invNorm;
+        float4 a4 = ptx_ld_shared_v4_f32(Ys + rl * LDY + cl);
         float4 v = pairLd4<PT>(pair, ij * 128 + f);
-        v.x += (b4.x + up * a4.x) * d; v.y += (b4.y + up * a4.y) * d;
-        v.z += (b4.z + up * a4.z) * d; v.w += (b4.w + up * a4.w) * d;
+        v.x = ptx_fma_f32(ptx_fma_f32(up, a4.x, b4.x), d, v.x);
+        v.y = ptx_fma_f32(ptx_fma_f32(up, a4.y, b4.y), d, v.y);
+        v.z = ptx_fma_f32(ptx_fma_f32(up, a4.z, b4.z), d, v.z);
+        v.w = ptx_fma_f32(ptx_fma_f32(up, a4.w, b4.w), d, v.w);
         pairSt4<PT>(pair, ij * 128 + f, v);
       }
     }

@@ -39,17 +39,20 @@ lnPlaneK(const float* __restrict__ pair, half* __restrict__ out, int n, int np, 
       const PT* xp = reinterpret_cast<const PT*>(pair) + pr * C;
 #pragma unroll
       for (int kk = 0; kk < KK; ++kk) {
-        InVT w = *reinterpret_cast<const InVT*>(xp + (lane + 32 * kk) * VEC);
         if constexpr (std::is_same_v<PT, float>) {
+          float4 w = ptx_ld_global_v4_f32(xp + (lane + 32 * kk) * VEC);
           v[kk * 4 + 0] = w.x; v[kk * 4 + 1] = w.y; v[kk * 4 + 2] = w.z; v[kk * 4 + 3] = w.w;
-          s += w.x + w.y + w.z + w.w;
+          s = ptx_add_f32(s, ptx_add_f32(ptx_add_f32(w.x, w.y), ptx_add_f32(w.z, w.w)));
         } else {
+          InVT w;
+          if constexpr (VEC == 8) w = ptx_ld_global_v4_u32(xp + (lane + 32 * kk) * VEC);
+          else w = ptx_ld_global_v2_u32(xp + (lane + 32 * kk) * VEC);
           const PT* h = reinterpret_cast<const PT*>(&w);
 #pragma unroll
           for (int e = 0; e < VEC / 2; ++e) {
             float2 f = ld2f(h + 2 * e);
             v[kk * VEC + 2 * e] = f.x; v[kk * VEC + 2 * e + 1] = f.y;
-            s += f.x + f.y;
+            s = ptx_add_f32(s, ptx_add_f32(f.x, f.y));
           }
         }
       }
@@ -57,40 +60,44 @@ lnPlaneK(const float* __restrict__ pair, half* __restrict__ out, int n, int np, 
 #pragma unroll
       for (int k = 0; k < K; ++k) v[k] = 0.f;
     }
-    for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
-    float mean = s / C, qd = 0.f;
+    s = ptx_warp_sum_f32(s);
+    float mean = ptx_div_f32(s, (float)C), qd = 0.f;
 #pragma unroll
-    for (int k = 0; k < K; ++k) { float d = v[k] - mean; qd += d * d; }
-    for (int o = 16; o; o >>= 1) qd += __shfl_xor_sync(~0u, qd, o);
-    float inv = rsqrtf(qd / C + 1e-5f);
+    for (int k = 0; k < K; ++k) { float d = ptx_sub_f32(v[k], mean); qd = ptx_fma_f32(d, d, qd); }
+    qd = ptx_warp_sum_f32(qd);
+    float inv = ptx_rsqrt_f32(ptx_add_f32(ptx_div_f32(qd, (float)C), 1e-5f));
     half* yp = out + q * C;
 #pragma unroll
     for (int kk = 0; kk < KK; ++kk) {
       int ch = (lane + 32 * kk) * VEC;
-      OutVT o4; half2* oh = reinterpret_cast<half2*>(&o4);
+      OutVT o4; uint32_t* oh = reinterpret_cast<uint32_t*>(&o4);
 #pragma unroll
       for (int e = 0; e < VEC / 4; ++e) {
-        float4 sc4 = __ldg(reinterpret_cast<const float4*>(sc + ch + 4 * e));
-        float4 of4 = __ldg(reinterpret_cast<const float4*>(of + ch + 4 * e));
+        float4 sc4 = ptx_ldg_v4_f32(sc + ch + 4 * e);
+        float4 of4 = ptx_ldg_v4_f32(of + ch + 4 * e);
         int b = kk * VEC + 4 * e;
-        oh[2 * e]     = __floats2half2_rn((v[b] - mean) * inv * sc4.x + of4.x, (v[b + 1] - mean) * inv * sc4.y + of4.y);
-        oh[2 * e + 1] = __floats2half2_rn((v[b + 2] - mean) * inv * sc4.z + of4.z, (v[b + 3] - mean) * inv * sc4.w + of4.w);
+        oh[2 * e]     = ptx_cvt_f16x2_f32(ptx_fma_f32(ptx_mul_f32(ptx_sub_f32(v[b], mean), inv), sc4.x, of4.x),
+                                          ptx_fma_f32(ptx_mul_f32(ptx_sub_f32(v[b + 1], mean), inv), sc4.y, of4.y));
+        oh[2 * e + 1] = ptx_cvt_f16x2_f32(ptx_fma_f32(ptx_mul_f32(ptx_sub_f32(v[b + 2], mean), inv), sc4.z, of4.z),
+                                          ptx_fma_f32(ptx_mul_f32(ptx_sub_f32(v[b + 3], mean), inv), sc4.w, of4.w));
       }
-      *reinterpret_cast<OutVT*>(yp + ch) = o4;
+      if constexpr (VEC == 8) ptx_st_global_v4_u32(yp + ch, o4);
+      else ptx_st_global_v2_u32(yp + ch, o4);
     }
     return;
   }
   float v[K], s = 0.f;
 #pragma unroll
-  for (int k = 0; k < K; ++k) { v[k] = real ? pairLd<PT>(pair, pr * C + lane + 32 * k) : 0.f; s += v[k]; }
-  for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
-  float mean = s / C, qd = 0.f;
+  for (int k = 0; k < K; ++k) { v[k] = real ? pairLd<PT>(pair, pr * C + lane + 32 * k) : 0.f; s = ptx_add_f32(s, v[k]); }
+  s = ptx_warp_sum_f32(s);
+  float mean = ptx_div_f32(s, (float)C), qd = 0.f;
 #pragma unroll
-  for (int k = 0; k < K; ++k) { float d = v[k] - mean; qd += d * d; }
-  for (int o = 16; o; o >>= 1) qd += __shfl_xor_sync(~0u, qd, o);
-  float inv = rsqrtf(qd / C + 1e-5f);
+  for (int k = 0; k < K; ++k) { float d = ptx_sub_f32(v[k], mean); qd = ptx_fma_f32(d, d, qd); }
+  qd = ptx_warp_sum_f32(qd);
+  float inv = ptx_rsqrt_f32(ptx_add_f32(ptx_div_f32(qd, (float)C), 1e-5f));
 #pragma unroll
-  for (int k = 0; k < K; ++k) out[q * C + lane + 32 * k] = __float2half((v[k] - mean) * inv * sc[lane + 32 * k] + of[lane + 32 * k]);
+  for (int k = 0; k < K; ++k)
+    ptx_st_global_u16(out + q * C + lane + 32 * k, ptx_f32_to_f16_raw(ptx_fma_f32(ptx_mul_f32(ptx_sub_f32(v[k], mean), inv), ptx_ldg_f32(sc + lane + 32 * k), ptx_ldg_f32(of + lane + 32 * k))));
 }
 
 // shared layouts: the A stage [128 rows][32 k] halves, 64-byte rows, chunk ^ ((row >> 1) & 3); the B stage
@@ -211,7 +218,7 @@ __global__ void __launch_bounds__(128) triInGemmK(const half* __restrict__ X, co
       float v = 0.f;
       if (t < NAB && q < pp) {
         unsigned u = (unsigned)q, i = u / (unsigned)np, j = u - i * (unsigned)np;
-        if (i < (unsigned)n && j < (unsigned)n) v = mask ? mask[TR ? ((size_t)j * n + i) : ((size_t)i * n + j)] : 1.f;
+        if (i < (unsigned)n && j < (unsigned)n) v = mask ? ptx_ldg_f32(mask + (TR ? ((size_t)j * n + i) : ((size_t)i * n + j))) : 1.f;
       }
       msk[mi][h] = v;
     }
@@ -230,10 +237,10 @@ __global__ void __launch_bounds__(128) triInGemmK(const half* __restrict__ X, co
       for (int j = 0; j < 4; ++j) {
         int chl = j * 4 + tig;
         const float* p = acc[mi][j]; const float* q = acc[mi][j + 4];
-        Ta[chl * LDT + r0] = TA(p[0] * sigmH(q[0]) * m0);
-        Tb[chl * LDT + r0] = TA(p[1] * sigmH(q[1]) * m0);
-        Ta[chl * LDT + r0 + 8] = TA(p[2] * sigmH(q[2]) * m1);
-        Tb[chl * LDT + r0 + 8] = TA(p[3] * sigmH(q[3]) * m1);
+        Ta[chl * LDT + r0] = fromF<TA>(ptx_mul_f32(ptx_mul_f32(p[0], sigmH(q[0])), m0));
+        Tb[chl * LDT + r0] = fromF<TA>(ptx_mul_f32(ptx_mul_f32(p[1], sigmH(q[1])), m0));
+        Ta[chl * LDT + r0 + 8] = fromF<TA>(ptx_mul_f32(ptx_mul_f32(p[2], sigmH(q[2])), m1));
+        Tb[chl * LDT + r0 + 8] = fromF<TA>(ptx_mul_f32(ptx_mul_f32(p[3], sigmH(q[3])), m1));
       }
     }
     __syncwarp();
@@ -244,8 +251,8 @@ __global__ void __launch_bounds__(128) triInGemmK(const half* __restrict__ X, co
         size_t q = row0 + wm * 64 + r16;
         if (q < cs) {
           size_t at = (size_t)(t * 32 + wn * 16 + chl) * cs + q;
-          *reinterpret_cast<uint4*>(a + at) = *reinterpret_cast<const uint4*>(Ta + chl * LDT + r16);
-          *reinterpret_cast<uint4*>(b + at) = *reinterpret_cast<const uint4*>(Tb + chl * LDT + r16);
+          ptx_st_global_v4_u32(a + at, ptx_ld_shared_v4_u32(Ta + chl * LDT + r16));
+          ptx_st_global_v4_u32(b + at, ptx_ld_shared_v4_u32(Tb + chl * LDT + r16));
         }
       }
     } else {
@@ -255,8 +262,8 @@ __global__ void __launch_bounds__(128) triInGemmK(const half* __restrict__ X, co
         size_t q = row0 + wm * 64 + r8;
         if (q < cs) {
           size_t at = (size_t)(t * 32 + wn * 16 + chl) * cs + q;
-          *reinterpret_cast<uint4*>(a + at) = *reinterpret_cast<const uint4*>(Ta + chl * LDT + r8);
-          *reinterpret_cast<uint4*>(b + at) = *reinterpret_cast<const uint4*>(Tb + chl * LDT + r8);
+          ptx_st_global_v4_u32(a + at, ptx_ld_shared_v4_u32(Ta + chl * LDT + r8));
+          ptx_st_global_v4_u32(b + at, ptx_ld_shared_v4_u32(Tb + chl * LDT + r8));
         }
       }
     }
@@ -273,8 +280,8 @@ __global__ void __launch_bounds__(128) triInGemmK(const half* __restrict__ X, co
       size_t r0 = t2At(q0), r1 = t2At(q1);
 #pragma unroll
       for (int j = 0; j < 8; ++j) {
-        if (q0 < pp) *reinterpret_cast<half2*>(t2 + r0 * C + c0 + j * 8) = __floats2half2_rn(acc[mi][j][0], acc[mi][j][1]);
-        if (q1 < pp) *reinterpret_cast<half2*>(t2 + r1 * C + c0 + j * 8) = __floats2half2_rn(acc[mi][j][2], acc[mi][j][3]);
+        if (q0 < pp) ptx_st_global_u32(t2 + r0 * C + c0 + j * 8, ptx_cvt_f16x2_f32(acc[mi][j][0], acc[mi][j][1]));
+        if (q1 < pp) ptx_st_global_u32(t2 + r1 * C + c0 + j * 8, ptx_cvt_f16x2_f32(acc[mi][j][2], acc[mi][j][3]));
       }
     }
   }
@@ -287,15 +294,15 @@ __global__ void triInGemmPackK(const half* __restrict__ Wp, const half* __restri
   int NAB = C / 32, NT = NAB + C / 128;
   if (e >= (size_t)NT * C * 128) return;
   int cl = (int)(e % 128); size_t rest = e / 128; int k = (int)(rest % C), t = (int)(rest / C);
-  half v;
+  unsigned short v;
   if (t < NAB) {
     int seg = cl >> 5, i = cl & 31;
     int p = t * 64 + (seg >> 1) * 32 + i;                         // the projection column (seg 0, 2) or its gate's (1, 3)
-    v = (seg & 1 ? Wgate : Wp)[(size_t)k * 2 * C + p];
+    v = ptx_ldg_u16((seg & 1 ? Wgate : Wp) + (size_t)k * 2 * C + p);
   } else {
-    v = Wgl[(size_t)k * C + (t - NAB) * 128 + cl];
+    v = ptx_ldg_u16(Wgl + (size_t)k * C + (t - NAB) * 128 + cl);
   }
-  out[e] = v;
+  ptx_st_global_u16(out + e, v);
 }
 inline const half* triInGemmWeights(const std::string& pre, int C) {
   // (a derived weight: forgotten with the others - see Wbf in common.cuh for what a kept one cost)
