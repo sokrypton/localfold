@@ -120,26 +120,38 @@ addIntoPairK(float* __restrict__ pair, const TX* __restrict__ x, size_t n, const
   }
   size_t i = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) * 4;
   if (i + 3 < n) {
-    float4 p = pairLd4<PT>(pair, i);
-    float4 b = make_float4(0.f, 0.f, 0.f, 0.f);
-    if (bias128) {
-      b = ptx_ldg_v4_f32(bias128 + ((threadIdx.x & 31) << 2));
-      asm("mul.ftz.f32 %0, %0, %4;\n\t"
-          "mul.ftz.f32 %1, %1, %4;\n\t"
-          "mul.ftz.f32 %2, %2, %4;\n\t"
-          "mul.ftz.f32 %3, %3, %4;"
-          : "+f"(b.x), "+f"(b.y), "+f"(b.z), "+f"(b.w) : "f"(biasScale));
-    }
+    PairRaw4<PT> pr = pairLdRaw4<PT>(pair, i);
     if constexpr (std::is_same_v<TX, float>) {
       float4 v = ptx_ldg_v4_f32(x + i);
+      float4 b = make_float4(0.f, 0.f, 0.f, 0.f);
+      if (bias128) {
+        b = ptx_ldg_v4_f32(bias128 + ((threadIdx.x & 31) << 2));
+        asm("mul.ftz.f32 %0, %0, %4;\n\t"
+            "mul.ftz.f32 %1, %1, %4;\n\t"
+            "mul.ftz.f32 %2, %2, %4;\n\t"
+            "mul.ftz.f32 %3, %3, %4;"
+            : "+f"(b.x), "+f"(b.y), "+f"(b.z), "+f"(b.w) : "f"(biasScale));
+      }
+      float4 p = pairUnpack4<PT>(pr);
       p.x += v.x + b.x; p.y += v.y + b.y; p.z += v.z + b.z; p.w += v.w + b.w;
+      pairSt4<PT>(pair, i, p);
     } else {
       uint2 u = ptx_ldg_v2_u32(x + i);
+      float4 b = make_float4(0.f, 0.f, 0.f, 0.f);
+      if (bias128) {
+        b = ptx_ldg_v4_f32(bias128 + ((threadIdx.x & 31) << 2));
+        asm("mul.ftz.f32 %0, %0, %4;\n\t"
+            "mul.ftz.f32 %1, %1, %4;\n\t"
+            "mul.ftz.f32 %2, %2, %4;\n\t"
+            "mul.ftz.f32 %3, %3, %4;"
+            : "+f"(b.x), "+f"(b.y), "+f"(b.z), "+f"(b.w) : "f"(biasScale));
+      }
+      float4 p = pairUnpack4<PT>(pr);
       float2 a = ptx_f16x2_to_f32x2(u.x);
       float2 c = ptx_f16x2_to_f32x2(u.y);
       p.x += a.x + b.x; p.y += a.y + b.y; p.z += c.x + b.z; p.w += c.y + b.w;
+      pairSt4<PT>(pair, i, p);
     }
-    pairSt4<PT>(pair, i, p);
   } else {
     for (size_t k = i; k < n; ++k)
       pairSt<PT>(pair, k, pairLd<PT>(pair, k) + (toF(x[k]) + (bias128 ? ptx_ldg_f32(bias128 + (k & 127)) * biasScale : 0.f)));
@@ -302,6 +314,17 @@ embedPairK(const float* __restrict__ wLeft, const float* __restrict__ bLeft,
            const int* __restrict__ ri, const int* __restrict__ asym, const int* __restrict__ entity, const int* __restrict__ sym,
            const float* __restrict__ wRel, const float* __restrict__ bRel,
            float* __restrict__ pair, int L, bool chainRows) {
+  __shared__ __align__(16) float sb[6][128];
+  if (threadIdx.x < 32) {
+    int c4 = threadIdx.x << 2;
+    ptx_st_shared_v4_f32(&sb[0][c4], ptx_ldg_v4_f32(bLeft + c4));
+    ptx_st_shared_v4_f32(&sb[1][c4], ptx_ldg_v4_f32(bRight + c4));
+    ptx_st_shared_v4_f32(&sb[2][c4], ptx_ldg_v4_f32(bDg + c4));
+    ptx_st_shared_v4_f32(&sb[3][c4], ptx_ldg_v4_f32(lnScale + c4));
+    ptx_st_shared_v4_f32(&sb[4][c4], ptx_ldg_v4_f32(lnOffset + c4));
+    ptx_st_shared_v4_f32(&sb[5][c4], ptx_ldg_v4_f32(bRel + c4));
+  }
+  __syncthreads();
   size_t ij = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
   int lane = threadIdx.x & 31;
   if (ij >= (size_t)L * L) return;
@@ -340,19 +363,24 @@ embedPairK(const float* __restrict__ wLeft, const float* __restrict__ bLeft,
     if constexpr (std::is_same_v<PT, float>) return x;
     else return toF(fromF<PT>(x));
   };
+  float out[4];
 #pragma unroll
   for (int k = 0; k < 4; ++k) {
     int c = lane + 32 * k;
-    float left = ptx_add_f32(ptx_ldg_f32(wLeft + ai * 128 + c), ptx_ldg_f32(bLeft + c));
-    float right = ptx_add_f32(ptx_ldg_f32(wRight + aj * 128 + c), ptx_ldg_f32(bRight + c));
+    float left = ptx_add_f32(ptx_ldg_f32(wLeft + ai * 128 + c), ptx_ld_shared_f32(&sb[0][c]));
+    float right = ptx_add_f32(ptx_ldg_f32(wRight + aj * 128 + c), ptx_ld_shared_f32(&sb[1][c]));
     float acc = step(ptx_add_f32(left, right));
-    float dg = ptx_add_f32(dgBin >= 0 ? ptx_ldg_f32(wDg + dgBin * 128 + c) : 0.f, ptx_ldg_f32(bDg + c));
+    float dg = ptx_add_f32(dgBin >= 0 ? ptx_ldg_f32(wDg + dgBin * 128 + c) : 0.f, ptx_ld_shared_f32(&sb[2][c]));
     acc = step(ptx_add_f32(acc, dg));
-    float ln = ptx_fma_f32(ptx_mul_f32(ptx_sub_f32(pv[k], mean), inv), ptx_ldg_f32(lnScale + c), ptx_ldg_f32(lnOffset + c));
+    float ln = ptx_fma_f32(ptx_mul_f32(ptx_sub_f32(pv[k], mean), inv), ptx_ld_shared_f32(&sb[3][c]), ptx_ld_shared_f32(&sb[4][c]));
     acc = step(ptx_add_f32(acc, ln));
     float rel = ptx_add_f32(ptx_add_f32(ptx_ldg_f32(wRel + r0 * 128 + c), sameEntity ? ptx_ldg_f32(wRel + 66 * 128 + c) : 0.f),
-                            ptx_add_f32(ptx_ldg_f32(wRel + r2 * 128 + c), ptx_ldg_f32(bRel + c)));
-    pairSt<PT>(pair, ij * 128 + c, ptx_add_f32(acc, rel));
+                            ptx_add_f32(ptx_ldg_f32(wRel + r2 * 128 + c), ptx_ld_shared_f32(&sb[5][c])));
+    out[k] = ptx_add_f32(acc, rel);
+  }
+#pragma unroll
+  for (int k = 0; k < 4; ++k) {
+    pairSt<PT>(pair, ij * 128 + lane + 32 * k, out[k]);
   }
 }
 __global__ void __launch_bounds__(256, 6)
