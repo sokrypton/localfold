@@ -17,6 +17,7 @@ namespace {
 struct Opts {
   std::string dir, weights, oracle, out = "trunk.bin";
   int recycles = 0;  // 0 = whatever the input directory says
+  int repeat = 0;    // time the forward this many times after a warm-up
   bool insertion = true;
 };
 
@@ -97,6 +98,26 @@ int run(const Opts& o) {
     }
   }
   CK(cudaStreamSynchronize(STREAM));
+
+  // 🔴 TIME THE STEADY STATE, NOT THE FIRST PASS. The run above has already paid for the weights,
+  // every scratch buffer and cuBLAS's own first-call setup; a number that includes those describes
+  // starting the process, which is not what a sampler's sixtieth step costs.
+  if (o.repeat > 0) {
+    cudaEvent_t a, b;
+    CK(cudaEventCreate(&a));
+    CK(cudaEventCreate(&b));
+    CK(cudaEventRecord(a, STREAM));
+    for (int i = 0; i < o.repeat; ++i) {
+      rfd4p::forward(t, Fdev("in/seq"), Fdev("in/cond0"), Fdev("in/cond1"), Fdev("in/pair"),
+                     Fdev("in/pairCond"), nRecycle, o.insertion, nullptr);
+    }
+    CK(cudaEventRecord(b, STREAM));
+    CK(cudaEventSynchronize(b));
+    float ms = 0;
+    CK(cudaEventElapsedTime(&ms, a, b));
+    printf("trunk: %.3f ms a pass (%d tokens, %d recycle%s, %d passes)\n", ms / o.repeat, d.n,
+           nRecycle, nRecycle == 1 ? "" : "s", o.repeat);
+  }
   if (!o.oracle.empty()) {
     printf("worst stage %s at relRMS %.2e; %d stage%s past 1e-5\n",
            worstAt.empty() ? "(none)" : worstAt.c_str(), worst, bad, bad == 1 ? "" : "s");
@@ -114,6 +135,7 @@ int foldMain(int argc, char** argv) {
     else if (!f.compare(0, 9, "--oracle=")) o.oracle = value("oracle");
     else if (!f.compare(0, 6, "--out=")) o.out = value("out");
     else if (!f.compare(0, 11, "--recycles=")) o.recycles = atoi(f.c_str() + 11);
+    else if (!f.compare(0, 9, "--repeat=")) o.repeat = atoi(f.c_str() + 9);
     else if (f == "--no-insertion") o.insertion = false;
     else { fprintf(stderr, "unknown flag %s\n", argv[i]); return 1; }
   }
