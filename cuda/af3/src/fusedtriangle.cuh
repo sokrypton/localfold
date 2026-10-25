@@ -1003,7 +1003,7 @@ constexpr size_t gridInSmem(int warps, int nc = 64, int C = 128) {
   return st + (xr > st + ys ? xr : st + ys);
 }
 template <int C, int NQ, int WARPS, class PT = float, int NCI = 64, int MT = 1,
-          int MINB = (WARPS == 4 && (NCI == 64 && MT == 1 || NCI == 32 && MT == 2) && (C == 128 || C == 64)) ? 3
+          int MINB = (WARPS == 4 && (NCI == 64 && MT == 1 || NCI == 32 && MT == 2 || NCI == 64 && MT == 2 && C == 64) && (C == 128 || C == 64)) ? 3
                    : (WARPS == 8 && NCI == 64 && MT == 1 && (C == 128 || C == 64)) ? 2 : 1>
 __global__ void __launch_bounds__(WARPS * 32, fitBlocks(MINB, gridInSmem(WARPS, NCI, C))) gridInK(const float* __restrict__ pair, const float* __restrict__ lnScale,
     const float* __restrict__ lnOffset, const half* __restrict__ Wq, half* __restrict__ out, int n, size_t q0,
