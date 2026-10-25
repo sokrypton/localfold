@@ -288,6 +288,34 @@ __global__ void mulSigmoidAddGateK(const float* __restrict__ a, const T* __restr
   if (pairMask && pairMask[i / C] == 0.f) return;
   z[i] += a[i] * (1.f / (1.f + __expf(-(float)gate[i])));
 }
+template <class T>
+__global__ void mulSigmoidAddGate4K(const float4* __restrict__ a, const T* __restrict__ gate,
+                                    const float* __restrict__ pairMask, float4* __restrict__ z,
+                                    size_t rows, int C4) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= rows * (size_t)C4) return;
+  if (pairMask && pairMask[i / C4] == 0.f) return;
+  const float4 aa = a[i];
+  float4 zz = z[i];
+  float g[4];
+  #pragma unroll
+  for (int k = 0; k < 4; ++k) g[k] = (float)gate[4 * i + k];
+  zz.x += aa.x / (1.f + __expf(-g[0]));
+  zz.y += aa.y / (1.f + __expf(-g[1]));
+  zz.z += aa.z / (1.f + __expf(-g[2]));
+  zz.w += aa.w / (1.f + __expf(-g[3]));
+  z[i] = zz;
+}
+template <class T>
+inline void mulSigmoidAddGate(const float* a, const T* gate, const float* pairMask, float* z,
+                              size_t rows, int C) {
+  if ((C & 3) == 0 && ((((uintptr_t)a | (uintptr_t)z) & 15) == 0)) {
+    mulSigmoidAddGate4K<T><<<blocks(rows * (size_t)(C >> 2)), 256, 0, STREAM>>>(
+        (const float4*)a, gate, pairMask, (float4*)z, rows, C >> 2);
+  } else {
+    mulSigmoidAddGateK<T><<<blocks(rows * (size_t)C), 256, 0, STREAM>>>(a, gate, pairMask, z, rows, C);
+  }
+}
 
 // `x = relu(x + bias)` - the pair transition's up projection, whose bias was its own launch.
 template <class T>
@@ -297,6 +325,34 @@ __global__ void biasReluK(T* __restrict__ x, const float* __restrict__ bias, siz
   const float v = (float)x[i] + bias[i % C];
   x[i] = (T)(v < 0.f ? 0.f : v);
 }
+
+// 🔴 A SCALAR half KERNEL MOVES HALF THE BYTES IT COULD. One `half` a thread is a 2-byte access, and
+// these tensors are tens of megabytes: `biasReluK` on [pairs, 768] measured 2.1x off its own
+// bandwidth for no reason but the access width. A `half2` a thread fixes it, and the tail is handled
+// by only taking this path when the row length is even.
+__global__ void biasRelu2K(__half2* __restrict__ x, const float* __restrict__ bias, size_t pairs,
+                           int C2) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= pairs * (size_t)C2) return;
+  const int c = (int)(i % C2);
+  const float2 b = {bias[2 * c], bias[2 * c + 1]};
+  float2 v = __half22float2(x[i]);
+  v.x += b.x;
+  v.y += b.y;
+  x[i] = __floats2half2_rn(v.x < 0.f ? 0.f : v.x, v.y < 0.f ? 0.f : v.y);
+}
+
+template <class T>
+inline void biasRelu(T* x, const float* bias, size_t rows, int C) {
+  if constexpr (std::is_same_v<T, half>) {
+    if ((C & 1) == 0 && ((uintptr_t)x & 3) == 0) {
+      const size_t n2 = rows * (size_t)(C >> 1);
+      biasRelu2K<<<blocks(n2), 256, 0, STREAM>>>((__half2*)x, bias, rows, C >> 1);
+      return;
+    }
+  }
+  biasReluK<T><<<blocks(rows * (size_t)C), 256, 0, STREAM>>>(x, bias, rows, C);
+}
 // `z += x + bias` on the live pairs - the pair transition's down projection and its residual.
 __global__ void biasAddK(const float* __restrict__ x, const float* __restrict__ bias,
                          const float* __restrict__ pairMask, float* __restrict__ z, size_t rows, int C) {
@@ -304,6 +360,28 @@ __global__ void biasAddK(const float* __restrict__ x, const float* __restrict__ 
   if (i >= rows * (size_t)C) return;
   if (pairMask && pairMask[i / C] == 0.f) return;
   z[i] += x[i] + bias[i % C];
+}
+// Four at a time. The row length divides by four everywhere this runs, so a quad never straddles
+// two pairs and the mask is still one lookup a thread.
+__global__ void biasAdd4K(const float4* __restrict__ x, const float* __restrict__ bias,
+                          const float* __restrict__ pairMask, float4* __restrict__ z, size_t rows,
+                          int C4) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= rows * (size_t)C4) return;
+  if (pairMask && pairMask[i / C4] == 0.f) return;
+  const float4 bb = ((const float4*)bias)[i % C4], xx = x[i];
+  float4 zz = z[i];
+  zz.x += xx.x + bb.x; zz.y += xx.y + bb.y; zz.z += xx.z + bb.z; zz.w += xx.w + bb.w;
+  z[i] = zz;
+}
+inline void biasAdd(const float* x, const float* bias, const float* pairMask, float* z, size_t rows,
+                    int C) {
+  if ((C & 3) == 0 && ((((uintptr_t)x | (uintptr_t)z | (uintptr_t)bias) & 15) == 0)) {
+    biasAdd4K<<<blocks(rows * (size_t)(C >> 2)), 256, 0, STREAM>>>((const float4*)x, bias, pairMask,
+                                                                   (float4*)z, rows, C >> 2);
+  } else {
+    biasAddK<<<blocks(rows * (size_t)C), 256, 0, STREAM>>>(x, bias, pairMask, z, rows, C);
+  }
 }
 // Zero every row the mask clears; the reference zeroes a padded token's whole row at several seams.
 __global__ void maskRowsK(float* __restrict__ x, const float* __restrict__ mask, size_t rows, int C) {
@@ -353,6 +431,27 @@ __global__ void toPlanesK(const float* __restrict__ in, float* __restrict__ out,
 // The triangle's gating, in plane layout and in one launch: `a = aP * sigmoid(aG) * mask` and
 // `b = bP * sigmoid(bG) * mask`, reading the four quarters of one fused projection and writing over
 // the first and third. Replaces two sigmoid-multiplies, two mask passes and two transposes.
+// The same, for the triangle's gating: two adjacent PAIRS of one channel a thread.
+__global__ void gatePlanes2K(__half2* __restrict__ p, const float* __restrict__ pairMask,
+                             size_t pairs2, int cH) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= pairs2 * (size_t)cH) return;
+  const size_t within = i % pairs2;
+  float2 m = {1.f, 1.f};
+  if (pairMask) {
+    m.x = pairMask[2 * within];
+    m.y = pairMask[2 * within + 1];
+  }
+  __half2* aP = p;
+  const __half2* aG = p + pairs2 * (size_t)cH;
+  __half2* bP = p + 2 * pairs2 * (size_t)cH;
+  const __half2* bG = p + 3 * pairs2 * (size_t)cH;
+  const float2 ap = __half22float2(aP[i]), ag = __half22float2(aG[i]);
+  const float2 bp = __half22float2(bP[i]), bg = __half22float2(bG[i]);
+  aP[i] = __floats2half2_rn(m.x * ap.x / (1.f + __expf(-ag.x)), m.y * ap.y / (1.f + __expf(-ag.y)));
+  bP[i] = __floats2half2_rn(m.x * bp.x / (1.f + __expf(-bg.x)), m.y * bp.y / (1.f + __expf(-bg.y)));
+}
+
 template <class T>
 __global__ void gatePlanesK(T* __restrict__ p, const float* __restrict__ pairMask, size_t pairs,
                             int cH) {
@@ -367,6 +466,19 @@ __global__ void gatePlanesK(T* __restrict__ p, const float* __restrict__ pairMas
   const float b = m * (float)bP[i] / (1.f + __expf(-(float)bG[i]));
   aP[i] = (T)a;
   bP[i] = (T)b;
+}
+
+template <class T>
+inline void gatePlanes(T* p, const float* pairMask, size_t pairs, int cH) {
+  if constexpr (std::is_same_v<T, half>) {
+    // Two adjacent pairs share a thread, so the plane length must be even and the planes aligned.
+    if ((pairs & 1) == 0 && ((uintptr_t)p & 3) == 0) {
+      const size_t pairs2 = pairs >> 1;
+      gatePlanes2K<<<blocks(pairs2 * (size_t)cH), 256, 0, STREAM>>>((__half2*)p, pairMask, pairs2, cH);
+      return;
+    }
+  }
+  gatePlanesK<T><<<blocks(pairs * (size_t)cH), 256, 0, STREAM>>>(p, pairMask, pairs, cH);
 }
 
 __global__ void fromPlanesK(const float* __restrict__ in, float* __restrict__ out, size_t pairs, int C) {

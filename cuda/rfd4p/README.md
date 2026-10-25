@@ -38,10 +38,10 @@ input and their own 6 cycles, not something built here:
 | PyTorch compiled | 158.7 | | | f32 |
 | **PyTorch compiled, its own default precision** | **65.3** | 8.2 | **57.1** | bf16 matmuls |
 | cuda/rfd4p, exact | 157.8 | — | 157.8 | f32 |
-| **cuda/rfd4p, `--fast`** | **49.5** | — | **49.5** | TF32 + f16 |
+| **cuda/rfd4p, `--fast`** | **47.5** | — | **47.5** | TF32 + f16 |
 
-🔴 **THE HONEST NUMBER IS 1.15x, NOT 5x.** Against PyTorch's *production* path - compiled, at the
-precision upstream's own config selects - this port's network is 49.5 ms against 57.1. The 5.4x is
+🔴 **THE HONEST NUMBER IS 1.20x, NOT 5x.** Against PyTorch's *production* path - compiled, at the
+precision upstream's own config selects - this port's network is 47.5 ms against 57.1. The 5.4x is
 against `quickstart`, which turns compilation off and is upstream's first-run preset, not how anyone
 generates. A ratio quoted without naming the other side's configuration is not a measurement, and
 this file had it wrong for a while.
@@ -61,10 +61,10 @@ Both arms at 6 recycles, the `--length=N` unconditioned segment:
 
 | n | exact | `--fast` | ratio |
 |---:|---:|---:|---:|
-| 54 | 72.5 | 29.5 | 2.46 |
-| 100 | 157.4 | 50.0 | 3.15 |
-| 200 | 533.0 | 147.2 | 3.62 |
-| 400 | 2046.9 | 509.1 | 4.02 |
+| 54 | 73.5 | 28.8 | 2.55 |
+| 100 | 156.7 | 47.5 | 3.30 |
+| 200 | 528.1 | 136.9 | 3.86 |
+| 400 | 2028.4 | 468.8 | 4.33 |
 
 The reduced-precision arm pulls further ahead with length, which is what a pair track that grows as
 n^2 and contracts as n^3 should do: the longer the chain, the more of the pass is GEMM and the less
@@ -89,6 +89,7 @@ four oracle arms.
 | the pair transition's hidden in half | 49.5 | the largest buffer left in an update |
 | the pair bias fused into one kernel | 49.8 at n=100, **555.9 at n=400** | a wash on a short chain, 3.5% at a long one |
 | a long form past 40,000 pairs: the gate transposed and the contraction's output narrowed | **509.1 at n=400**, 50.0 unchanged at n=100 | both choices invert with length |
+| the elementwise kernels vectorised | **47.5 at n=100, 468.8 at n=400** | one `half` a thread is a 2-byte access |
 
 The GEMMs now run at ~144 TFLOP/s against this card's 156 TF32 ceiling, and the kernel total is
 within a few percent of the wall clock, so there is no idle to recover: what is left is bytes.

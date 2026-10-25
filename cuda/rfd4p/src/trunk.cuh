@@ -255,7 +255,7 @@ inline void triangleT(float* z, const float* pairMask, const Dims& d, bool outgo
                                      wn(pre + ".linear_g.weight")});
   TP* planes = scratch<TP>("rfd4p.tri.planes", (4 * (size_t)cH + cZ) * rows);
   linearPlanes<TP>(zNorm, planes, rows, cZ, 4 * cH + cZ, fused);
-  gatePlanesK<TP><<<blocks(rows * cH), 256, 0, STREAM>>>(planes, pairMask, rows, cH);
+  gatePlanes<TP>(planes, pairMask, rows, cH);
   const TP* aT = planes;
   const TP* bT = planes + 2 * rows * (size_t)cH;
   const TP* gPlanes = planes + 4 * rows * (size_t)cH;
@@ -294,7 +294,7 @@ inline void triangleT(float* z, const float* pairMask, const Dims& d, bool outgo
   if constexpr (LONG) {
     TP* gate = scratch<TP>("rfd4p.tri.gate", rows * cZ);
     fromPlanes<TP, TP>(gPlanes, gate, rows, cZ);
-    mulSigmoidAddGateK<TP><<<blocks(rows * cZ), 256, 0, STREAM>>>(xProj, gate, pairMask, z, rows, cZ);
+    mulSigmoidAddGate<TP>(xProj, gate, pairMask, z, rows, cZ);
   } else {
     mulSigmoidAddPlaneGateK<TP><<<blocks(rows * cZ), 256, 0, STREAM>>>(xProj, gPlanes, pairMask, z,
                                                                        rows, cZ);
@@ -346,6 +346,28 @@ __global__ void hadamardWriteK(const float* __restrict__ pij, const float* __res
   int row = (int)(pair / n), col = (int)(pair % n);
   z[i] += pij[(size_t)col * 2 * P + c] * pij[(size_t)row * 2 * P + P + c];
 }
+__global__ void hadamardWrite4K(const float4* __restrict__ pij, const float* __restrict__ pairMask,
+                                float4* __restrict__ z, int n, int P4) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= (size_t)n * n * P4) return;
+  size_t pair = i / P4;
+  int c = (int)(i - pair * P4);
+  if (pairMask && pairMask[pair] == 0.f) return;
+  int row = (int)(pair / n), col = (int)(pair % n);
+  const float4 pi = pij[(size_t)col * 2 * P4 + c];
+  const float4 pj = pij[(size_t)row * 2 * P4 + P4 + c];
+  float4 zz = z[i];
+  zz.x += pi.x * pj.x; zz.y += pi.y * pj.y; zz.z += pi.z * pj.z; zz.w += pi.w * pj.w;
+  z[i] = zz;
+}
+inline void hadamardWrite(const float* pij, const float* pairMask, float* z, int n, int P) {
+  if ((P & 3) == 0 && ((((uintptr_t)pij | (uintptr_t)z) & 15) == 0)) {
+    hadamardWrite4K<<<blocks((size_t)n * n * (P >> 2)), 256, 0, STREAM>>>(
+        (const float4*)pij, pairMask, (float4*)z, n, P >> 2);
+  } else {
+    hadamardWriteK<<<blocks((size_t)n * n * P), 256, 0, STREAM>>>(pij, pairMask, z, n, P);
+  }
+}
 
 inline void pairReprUpdate(const float* s, float* z, const float* mask, const float* pairMask,
                            const Dims& d, const std::string& pre) {
@@ -355,7 +377,7 @@ inline void pairReprUpdate(const float* s, float* z, const float* mask, const fl
   layerNorm(s, xNorm, n, D, W(wn(pre + ".layer_norm_in.weight")), W(wn(pre + ".layer_norm_in.bias")));
   float* pij = scratch<float>("rfd4p.pu.pij", (size_t)n * P * 2);
   linear<float, float>(xNorm, pij, n, D, P * 2, wn(pre + ".linear_x.weight"), true);
-  hadamardWriteK<<<blocks(rows * P), 256, 0, STREAM>>>(pij, pairMask, z, n, P);
+  hadamardWrite(pij, pairMask, z, n, P);
 
   if (d.useTriMult) {
     triangle(z, pairMask, d, true, pre + ".tri_mult_out");
@@ -373,19 +395,17 @@ inline void pairReprUpdate(const float* s, float* z, const float* mask, const fl
     half* h = scratch<half>("rfd4p.pu.h16", rows * (size_t)hidden);
     layerNorm<half>(z, zn, rows, P, W(wn(tr + ".layer_norm.weight")), W(wn(tr + ".layer_norm.bias")));
     linear<half, half>(zn, h, rows, P, hidden, wn(tr + ".linear_1.weight"), true);
-    biasReluK<half><<<blocks(rows * hidden), 256, 0, STREAM>>>(h, W(wn(tr + ".linear_1.bias")), rows,
-                                                               hidden);
+    biasRelu<half>(h, W(wn(tr + ".linear_1.bias")), rows, hidden);
     linear<half, float>(h, o, rows, hidden, P, wn(tr + ".linear_2.weight"), true);
   } else {
     float* zn = scratch<float>("rfd4p.pu.zn", rows * P);
     float* h = scratch<float>("rfd4p.pu.h", rows * (size_t)hidden);
     layerNorm(z, zn, rows, P, W(wn(tr + ".layer_norm.weight")), W(wn(tr + ".layer_norm.bias")));
     linear<float, float>(zn, h, rows, P, hidden, wn(tr + ".linear_1.weight"), true);
-    biasReluK<float><<<blocks(rows * hidden), 256, 0, STREAM>>>(h, W(wn(tr + ".linear_1.bias")), rows,
-                                                                hidden);
+    biasRelu<float>(h, W(wn(tr + ".linear_1.bias")), rows, hidden);
     linear<float, float>(h, o, rows, hidden, P, wn(tr + ".linear_2.weight"), true);
   }
-  biasAddK<<<blocks(rows * P), 256, 0, STREAM>>>(o, W(wn(tr + ".linear_2.bias")), pairMask, z, rows, P);
+  biasAdd(o, W(wn(tr + ".linear_2.bias")), pairMask, z, rows, P);
 }
 
 // ---------------------------------------------------------------- one token layer
