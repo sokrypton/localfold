@@ -70,6 +70,7 @@ rfbin="$here/rfd4p/featurise/rfd4p-featurise"
 # green or red for reasons nothing in the diff explains.
 rfstamp="$(cat "$here"/rfd4p/featurise/featurise.cpp "$here"/rfd4p/featurise/tables.inc \
   "$here"/rfd4p/featurise/assign-probe.cpp "$here"/rfd4p/src/assign.h \
+  "$here"/rfd4p/featurise/superpose-probe.cpp "$here"/rfd4p/src/superpose.h \
   "$here"/rfd4p/featurise/atoms.h "$here"/rfd4p/featurise/cif.h \
   "$here"/rfd4p/featurise/chirality.h \
   "$here"/rfd4p/src/schedule.h "$here"/featurise/jsmath.h "$here"/featurise/json.h \
@@ -80,6 +81,8 @@ if [ ! -x "$rfbin" ] || [ "$(cat "$rfbin.stamp" 2>/dev/null)" != "$rfstamp" ]; t
   # (and the assignment probe beside it, which the gate diffs against output.js's own solver)
   ( g++ -std=c++17 -O2 "$here/rfd4p/featurise/assign-probe.cpp" \
       -o "$here/rfd4p/featurise/assign-probe" >> "$log" 2>&1; \
+    g++ -std=c++17 -O2 "$here/rfd4p/featurise/superpose-probe.cpp" \
+      -o "$here/rfd4p/featurise/superpose-probe" >> "$log" 2>&1; \
     g++ -std=c++17 -O2 -ffp-contract=off "$here/rfd4p/featurise/featurise.cpp" -o "$rfbin.building" \
       >> "$log" 2>&1 \
     && g++ -std=c++17 -O2 -ffp-contract=off -DRFD4P_FEATURISE_NO_MAIN \

@@ -548,6 +548,35 @@ def main() -> int:
                       f"{'ok ' if not bad_assign else f'DIFFER {bad_assign}'}")
                 got["assign"] = {"cases": n_assign, "differing": bad_assign}
 
+            # 🔴 AND THE KABSCH SUPERPOSITION, which puts a generated structure back into the
+            # INPUT's frame. Without it a motif design is a correct structure in the wrong
+            # place, which superposes on nothing and which no bond length, clash score or chain
+            # check can see. Three of its conventions are the reference's own and not the
+            # textbook's, and a port that wrote the textbook version differed on more than half
+            # of a random sweep.
+            sprobe = HERE / "featurise" / "superpose-probe"
+            if sprobe.exists():
+                bad_sp, n_sp = 0, 0
+                for sd in (1, 2, 7, 13, 42):
+                    for pts in (1, 2, 3, 4, 8, 12, 40, 200):
+                        for noise in ("0", "0.5", "4"):
+                            # 🔴 AND A REFLECTED SET, because det(H) is otherwise always
+                            # positive and the sign that stops Kabsch returning an IMPROPER
+                            # rotation is never exercised.
+                            for refl in ("0", "1"):
+                                pa = [str(sd), str(pts), noise, refl]
+                                a = run([sprobe, *pa], cwd=REPO).stdout.strip()
+                                b = run(["node", HERE / "featurise" / "superpose-probe.mjs",
+                                         *pa], cwd=REPO).stdout.strip()
+                                n_sp += 1
+                                if a != b:
+                                    bad_sp += 1
+                if bad_sp:
+                    failed += 1
+                print(f"  {'superpose':10s} {n_sp} point sets against the reference Kabsch  "
+                      f"{'ok ' if not bad_sp else f'DIFFER {bad_sp}'}")
+                got["superpose"] = {"cases": n_sp, "differing": bad_sp}
+
             # 🔴 AND A JOB THAT NAMES AN INPUT STRUCTURE MUST FOLD, not merely featurise. Every
             # arm above is a contig - a pure design job where most of the structure pipeline is a
             # no-op - and this one runs the whole of it in the fold binary: the mmCIF reader, the
