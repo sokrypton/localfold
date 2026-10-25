@@ -309,12 +309,42 @@ inline AtomArray concat(const vector<AtomArray>& parts) {
 }
 
 /** Everything `parseCifToAtomArray` produces, in one object. */
-inline AtomArray fromCif(const string& text) {
+inline AtomArray fromCif(const string& text, bool asAnnotatedCif = true) {
   AtomArray a;
   const cif::Block block = cif::parseBlock(text);
   a.site = cif::readAtomSite(block);
   cif::deriveChemistry(a.site, block);
   a.ann = cif::readAnnotations(a.site, block, a.site.selected);
+  // 🔴 AN UNANNOTATED LOAD THROWS THE FILE'S ANNOTATIONS AWAY AND SWAPS TWO ARGININE NITROGENS.
+  // `input_as_annotated_cif` defaults to FALSE, so a job that names a structure gets neither
+  // the conditions the file happens to carry - it is an INPUT, not a spec - nor NH1/NH2 in the
+  // order the file wrote them: whichever is further from CD is NH1, because a deposited
+  // arginine is routinely labelled the other way and the model reads the labels.
+  if (!asAnnotatedCif) {
+    a.ann = cif::Annotations{};
+    const vector<int> starts = cif::residueSegments(a.site);
+    for (size_t r = 0; r + 1 < starts.size(); ++r) {
+      const int s = starts[r], e = starts[r + 1];
+      if (a.site.resName[s] != "ARG") continue;
+      int iCD = -1, iNH1 = -1, iNH2 = -1;
+      for (int i = s; i < e; ++i) {
+        if (a.site.atomName[i] == "CD") iCD = i;
+        else if (a.site.atomName[i] == "NH1") iNH1 = i;
+        else if (a.site.atomName[i] == "NH2") iNH2 = i;
+      }
+      if (iCD < 0 || iNH1 < 0 || iNH2 < 0) continue;
+      const double d1 = lf::jsmath::hypot(a.site.x[iCD] - a.site.x[iNH1],
+                                          a.site.y[iCD] - a.site.y[iNH1],
+                                          a.site.z[iCD] - a.site.z[iNH1]);
+      const double d2 = lf::jsmath::hypot(a.site.x[iCD] - a.site.x[iNH2],
+                                          a.site.y[iCD] - a.site.y[iNH2],
+                                          a.site.z[iCD] - a.site.z[iNH2]);
+      if (!std::isfinite(d1) || !std::isfinite(d2) || !(d1 > d2)) continue;
+      std::swap(a.site.x[iNH1], a.site.x[iNH2]);
+      std::swap(a.site.y[iNH1], a.site.y[iNH2]);
+      std::swap(a.site.z[iNH1], a.site.z[iNH2]);
+    }
+  }
   a.bonds = cif::buildBonds(a.site, block);
   a.ids = cif::computeIds(a.site, a.bonds);
   a.stereo = chirality::annotate(a.site, a.bonds, a.ann, {});

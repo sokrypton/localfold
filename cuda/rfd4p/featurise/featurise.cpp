@@ -1208,7 +1208,7 @@ int run(int argc, char** argv) {
   using rfd4p::recycleDepths;
   string out, specPath, weightsDir, configPath, int8Dir, dumpCif;
   int splitAt = 0;
-  bool realize = false, atomize = false;
+  bool realize = false, atomize = false, unannotated = false;
   string contigStr, selectStr, condJson;
   int seed = 0, step = 0, length = 0;
   bool generate = false;
@@ -1223,6 +1223,7 @@ int run(int argc, char** argv) {
     else if (!a.compare(0, 8, "--split=")) splitAt = atoi(a.c_str() + 8);
     else if (a == "--realize") realize = true;
     else if (a == "--atomize") { realize = true; atomize = true; }
+    else if (a == "--unannotated") unannotated = true;
     else if (!a.compare(0, 9, "--contig=")) contigStr = a.substr(9);
     else if (!a.compare(0, 9, "--select=")) selectStr = a.substr(9);
     else if (!a.compare(0, 13, "--conditions=")) condJson = a.substr(13);
@@ -1248,6 +1249,18 @@ int run(int argc, char** argv) {
     const rfd4p::cif::Block block = rfd4p::cif::parseBlock(text);
     rfd4p::cif::AtomSite a = rfd4p::cif::readAtomSite(block);
     rfd4p::cif::deriveChemistry(a, block);
+    if (unannotated) {
+      // `--unannotated` is the load a JOB does: `input_as_annotated_cif` defaults to false, so
+      // the file's own conditions are discarded and the arginines are re-labelled.
+      const rfd4p::atoms::AtomArray src = rfd4p::atoms::fromCif(text, false);
+      printf("unann\t%zu\t%zu\t%zu\t%zu\n", src.n(), src.ann.ints.size(),
+             src.ann.floats.size(), src.ann.strings.size());
+      for (size_t i = 0; i < src.n(); ++i) {
+        printf("ua\t%s\t%s\t%.17g\t%.17g\t%.17g\n", src.site.resName[i].c_str(),
+               src.site.atomName[i].c_str(), src.site.x[i], src.site.y[i], src.site.z[i]);
+      }
+      return 0;
+    }
     if (!selectStr.empty()) {
       // `--select=` evaluates one selection against the structure and dumps the mask, which is
       // the only way to hold the path language to the reference's without a whole job.

@@ -706,6 +706,16 @@ residues the cropped example does not contain, so building one from the spec fai
     reddens the swap on 2 structures, and dumping `res_id` reddens the restore on 8. Same root
     cause as the four above: **an input on which the thing under test cannot act**.
 
+    🔴 **AND THE LOAD A JOB DOES IS NOT THE ONE EVERY OTHER ARM USES.**
+    `input_as_annotated_cif` defaults to FALSE, so a spec that names a structure DISCARDS the
+    file's own conditions - it is an input, not a spec - and re-labels each arginine's NH1/NH2
+    by distance from CD, because a deposited arginine is routinely labelled the other way and
+    the model reads the labels. Keeping the annotations reddens 16 cases and inverting the
+    arginine rule reddens 8 - but DELETING the arginine fix reddens nothing, because on all
+    seven shipped structures they are already the right way round. `+swapped-arg` exchanges
+    every arginine's two nitrogen names so the fix must fire, and then deleting it reddens
+    exactly that case.
+
     🔴 **CHECK THE RNG ORDER BEFORE THE CHEMISTRY.** `materializeInternalCoords` draws
     `randomSO3` per internal-coordinate group and `unindexFlaggedTokens` takes a path a contig
     never reaches; this port has been bitten twice by a draw that happens where it looks as

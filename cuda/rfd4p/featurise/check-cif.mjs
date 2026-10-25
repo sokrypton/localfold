@@ -298,6 +298,40 @@ function withDuplicatedChain(text, newAsym = "Z") {
 }
 
 /**
+ * The same structure with every arginine's `NH1` and `NH2` names exchanged.
+ *
+ * 🔴 BECAUSE NO SHIPPED ARGININE NEEDS THE FIX. An unannotated load re-labels NH1/NH2 by
+ * distance from CD, and on all seven structures they are already the right way round, so
+ * deleting the fix changed nothing - only INVERTING it did. Exchanging the names makes every
+ * arginine need it, which is the case that says the fix fires and fires correctly.
+ */
+function withSwappedArginines(text) {
+  const lines = text.split("\n");
+  const head = lines.findIndex((l) => l.startsWith("_atom_site."));
+  let end = head;
+  while (lines[end]?.startsWith("_atom_site.")) end += 1;
+  const cols = lines.slice(head, end).map((l) => l.trim().slice("_atom_site.".length));
+  const tokenise = (l) => l.match(/"[^"]*"|'[^']*'|\S+/g) ?? [];
+  const comp = cols.indexOf("label_comp_id");
+  const atomCols = [cols.indexOf("label_atom_id"), cols.indexOf("auth_atom_id")]
+    .filter((k) => k >= 0);
+  let swapped = 0;
+  for (let i = end; i < lines.length; i += 1) {
+    if (!lines[i].trim() || lines[i].startsWith("#") || lines[i].startsWith("loop_")) break;
+    const tok = tokenise(lines[i]);
+    if (tok.length !== cols.length || tok[comp] !== "ARG") continue;
+    let hit = false;
+    for (const k of atomCols) {
+      if (tok[k] === "NH1") { tok[k] = "NH2"; hit = true; }
+      else if (tok[k] === "NH2") { tok[k] = "NH1"; hit = true; }
+    }
+    if (hit) { lines[i] = tok.join(" "); swapped += 1; }
+  }
+  if (!swapped) throw new Error("no arginine to swap");
+  return lines.join("\n");
+}
+
+/**
  * The same structure with a covalent bond DECLARED between a `C` and an `N` that are not
  * neighbours - a crosslink, in the single-value `_struct_conn` form `motif_idx_1prw` ships.
  *
@@ -384,6 +418,7 @@ cases.set("motif_idx_1prw+beside-expandable",
 // 🔴 THREE CHAINS, BECAUSE TWO CANNOT SEE THE DRAW ORDER. `convertToProteinaBatch` permutes
 // the chains and then the molecules from one stream; at one element each draws nothing, and at
 // two the two draws agree often enough that swapping them left all sixteen cases green.
+cases.set("ppi_pdl1+swapped-arg", withSwappedArginines(cases.get("ppi_pdl1")));
 cases.set("ppi_pdl1+threechains",
   withDuplicatedChain(withDuplicatedChain(cases.get("ppi_pdl1"), "Y"), "Z"));
 
@@ -1058,6 +1093,30 @@ for (const [name, text] of cases) {
     else {
       const bad = got.filter((v, i) => v !== want[i]).length;
       if (bad) wrong.push(`select ${sel} ${bad} of ${want.length}`);
+    }
+  }
+
+  // 🔴 THE LOAD A JOB ACTUALLY DOES, which is NOT the one every arm above uses.
+  // `input_as_annotated_cif` defaults to FALSE, so a spec that names a structure discards the
+  // file's own conditions - it is an INPUT, not a spec - and re-labels each arginine's NH1/NH2
+  // by distance from CD, because a deposited arginine is routinely labelled the other way and
+  // the model reads the labels.
+  {
+    const got = execFileSync(binary, ["x", `--dump-cif=${path}`, "--unannotated"],
+      { encoding: "utf8", maxBuffer: 1 << 28 }).split("\n");
+    const head = (got.find((l) => l.startsWith("unann\t")) ?? "").split("\t").slice(1).map(Number);
+    const ref = parseCifToAtomArray(text, { fixArginines: true });
+    ref.annotations = {};
+    const rows = got.filter((l) => l.startsWith("ua\t")).map((l) => l.split("\t").slice(1));
+    if (head[1] + head[2] + head[3] !== 0) {
+      wrong.push(`unannotated kept ${head[1] + head[2] + head[3]} annotations`);
+    }
+    if (rows.length !== ref.nAtoms) wrong.push(`unannotated ${rows.length} vs ${ref.nAtoms}`);
+    else {
+      const bad = rows.filter((r, i) => r[0] !== ref.res_name[i] || r[1] !== ref.atom_name[i]
+        || !eq(Number(r[2]), ref.coord[i][0]) || !eq(Number(r[3]), ref.coord[i][1])
+        || !eq(Number(r[4]), ref.coord[i][2])).length;
+      if (bad) wrong.push(`unannotated ${bad} atoms`);
     }
   }
 
