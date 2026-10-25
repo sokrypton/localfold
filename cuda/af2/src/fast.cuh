@@ -400,7 +400,6 @@ __global__ void __launch_bounds__(WARPS * 32, WARPS <= 4 ? 2 : 1) lnGemmK(const 
     if (n > 0) {
       cpWait<0>();
       __syncthreads();
-      if (n + 1 < tiles) issue(n + 1, st ^ 1);
     }
 #endif
     const half* w = Ws(st);
@@ -408,6 +407,9 @@ __global__ void __launch_bounds__(WARPS * 32, WARPS <= 4 ? 2 : 1) lnGemmK(const 
     const int kl = ((lane >> 3) & 1) * 8 + (lane & 7), cl = (lane >> 4) * 8;
     uint32_t f[2][4];
     ldsm4t(f[0], w + stageSw<NC>(kl, cl));
+#if !LF_REG_STAGES
+    if (n > 0 && n + 1 < tiles) issue(n + 1, st ^ 1);
+#endif
 #pragma unroll
     for (int ks = 0; ks < KS; ++ks) {
       const int cur = ks & 1;
@@ -431,6 +433,10 @@ __global__ void __launch_bounds__(WARPS * 32, WARPS <= 4 ? 2 : 1) lnGemmK(const 
       }
     }
     __syncwarp();
+    uint4 yv[MT];
+#pragma unroll
+    for (int mt = 0; mt < MT; ++mt)
+      yv[mt] = ptx_ld_shared_v4_u32(Ys + (mt * 16 + r_ep) * NC + c_ep);
     const int col0 = n * NC;
     half* o_base = (col0 < split ? out0 + col0 : out1 + (col0 - split)) + c_ep;
     const int ld = col0 < split ? split : N - split;
@@ -438,7 +444,7 @@ __global__ void __launch_bounds__(WARPS * 32, WARPS <= 4 ? 2 : 1) lnGemmK(const 
     for (int mt = 0; mt < MT; ++mt) {
       size_t row = row0 + (warp * MT + mt) * 16 + r_ep;
       if (row < rows)
-        ptx_st_global_v4_u32(o_base + row * ld, ptx_ld_shared_v4_u32(Ys + (mt * 16 + r_ep) * NC + c_ep));
+        ptx_st_global_v4_u32(o_base + row * ld, yv[mt]);
     }
 #if LF_REG_STAGES
     __syncwarp();

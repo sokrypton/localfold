@@ -160,12 +160,12 @@ opmAdd128K(float* __restrict__ pair, const TX* __restrict__ x, const float* __re
     if (t >= (size_t)Bi * L * 16) return;
     int f = (int)((t & 15) << 3);
     size_t p = i0 * L + (t >> 4);
-    float denom = 1e-3f + (norm ? ptx_ldg_f32(norm + p) : normVal);
+    PT* pp = reinterpret_cast<PT*>(pair) + (p << 7) + f;
     uint4 ux = ptx_ldg_v4_u32(x + (t << 3));
+    uint4 up = ptx_ld_global_v4_u32(pp);
     float4 b0 = ptx_ldg_v4_f32(bias + f);
     float4 b1 = ptx_ldg_v4_f32(bias + f + 4);
-    PT* pp = reinterpret_cast<PT*>(pair) + (p << 7) + f;
-    uint4 up = ptx_ld_global_v4_u32(pp);
+    float denom = 1e-3f + (norm ? ptx_ldg_f32(norm + p) : normVal);
     float2 a0 = ptx_f16x2_to_f32x2(ux.x), a1 = ptx_f16x2_to_f32x2(ux.y);
     float2 a2 = ptx_f16x2_to_f32x2(ux.z), a3 = ptx_f16x2_to_f32x2(ux.w);
     float2 q0 = std::is_same_v<PT, __nv_bfloat16> ? ptx_bf16x2_to_f32x2(up.x) : ptx_f16x2_to_f32x2(up.x);
@@ -206,7 +206,6 @@ opmAdd128K(float* __restrict__ pair, const TX* __restrict__ x, const float* __re
   if (t >= (size_t)Bi * L * 32) return;
   int f = (int)((t & 31) << 2);
   size_t p = i0 * L + (t >> 5);
-  float denom = 1e-3f + (norm ? ptx_ldg_f32(norm + p) : normVal);
   float4 x4;
   if constexpr (std::is_same_v<TX, float>) {
     x4 = ptx_ldg_v4_f32(x + (t << 2));
@@ -216,8 +215,9 @@ opmAdd128K(float* __restrict__ pair, const TX* __restrict__ x, const float* __re
     float2 c = ptx_f16x2_to_f32x2(u.y);
     x4 = make_float4(a.x, a.y, c.x, c.y);
   }
-  float4 b4 = ptx_ldg_v4_f32(bias + f);
   float4 p4 = pairLd4<PT>(pair, (p << 7) + f);
+  float4 b4 = ptx_ldg_v4_f32(bias + f);
+  float denom = 1e-3f + (norm ? ptx_ldg_f32(norm + p) : normVal);
   if constexpr (FAST_INV) {
     float inv = ptx_rcp_f32(denom);
     p4.x = ptx_fma_f32(ptx_fma_f32(xs, x4.x, b4.x), inv, p4.x);
@@ -1133,9 +1133,9 @@ __global__ void __launch_bounds__(128, 2) opmOutK(const half* __restrict__ Pm, c
         size_t q = row0 + wm * 64 + mi * 16 + rl;
         if (q >= pp) continue;
         const size_t ij = (size_t)i0 * L + q;
+        float4 v = pairLd4<PT>(pair, ij * 128 + f);
         const float d = norm ? ptx_rcp_f32(ptx_add_f32(1e-3f, ptx_ldg_f32(norm + ij))) : invNorm;
         float4 a4 = ptx_ld_shared_v4_f32(Ys + rl * LDY + cl);
-        float4 v = pairLd4<PT>(pair, ij * 128 + f);
         v.x = ptx_fma_f32(ptx_fma_f32(up, a4.x, b4.x), d, v.x);
         v.y = ptx_fma_f32(ptx_fma_f32(up, a4.y, b4.y), d, v.y);
         v.z = ptx_fma_f32(ptx_fma_f32(up, a4.z, b4.z), d, v.z);
