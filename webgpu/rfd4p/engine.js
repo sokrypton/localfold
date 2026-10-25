@@ -874,7 +874,7 @@ fn main(
         next_a = vec4<${stType}>(${stType}(a[aAddr]), ${stType}(a[aAddr + p.sAk]), ${stType}(a[aAddr + 2u * p.sAk]), ${stType}(a[aAddr + 3u * p.sAk]));
       } else {
         if (kA < p.k) { next_a.x = ${stType}(a[aRowBase + kA * p.sAk]); }
-        if (kA + 1u < p.k) { next_a.y = ${stType}(a[aRowBase + (k + 1u) * p.sAk]); }
+        if (kA + 1u < p.k) { next_a.y = ${stType}(a[aRowBase + (kA + 1u) * p.sAk]); }
         if (kA + 2u < p.k) { next_a.z = ${stType}(a[aRowBase + (kA + 2u) * p.sAk]); }
       }` : `if (fullK0 || kA + 1u < p.k) {
         let aAddr = aRowBase + kA * p.sAk;
