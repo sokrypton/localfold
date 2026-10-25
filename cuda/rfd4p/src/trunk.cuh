@@ -249,16 +249,25 @@ inline void triangleT(float* z, const float* pairMask, const Dims& d, bool outgo
   // single kernel in the profile at 14.8%, and it is now nothing at all.
   // a_p, a_g, b_p, b_g AND the output gate all read this same zNorm, so all five stack into one
   // [4 * cH + cZ, cZ] projection - one GEMM a triangle instead of five.
-  const std::string fused = stacked(wn(pre + ".abpgz~"),
-                                    {wn(pre + ".linear_a_p.weight"), wn(pre + ".linear_a_g.weight"),
-                                     wn(pre + ".linear_b_p.weight"), wn(pre + ".linear_b_g.weight"),
-                                     wn(pre + ".linear_g.weight")});
-  TP* planes = scratch<TP>("rfd4p.tri.planes", (4 * (size_t)cH + cZ) * rows);
-  linearPlanes<TP>(zNorm, planes, rows, cZ, 4 * cH + cZ, fused);
+  // 🔴 THE OUTPUT GATE JOINS THE FUSED PROJECTION ONLY ON A SHORT CHAIN. Channel-major it costs a
+  // strided read, and dodging that costs a transpose; on a long chain both are dearer than simply
+  // projecting it row-major on its own, which is also 384 fewer channels for the fused GEMM to
+  // write. Short: one GEMM, strided read. Long: two GEMMs, dense read, no transpose.
+  const int fusedOut = LONG ? 4 * cH : 4 * cH + cZ;
+  const std::string fused =
+      LONG ? stacked(wn(pre + ".abpg~"),
+                     {wn(pre + ".linear_a_p.weight"), wn(pre + ".linear_a_g.weight"),
+                      wn(pre + ".linear_b_p.weight"), wn(pre + ".linear_b_g.weight")})
+           : stacked(wn(pre + ".abpgz~"),
+                     {wn(pre + ".linear_a_p.weight"), wn(pre + ".linear_a_g.weight"),
+                      wn(pre + ".linear_b_p.weight"), wn(pre + ".linear_b_g.weight"),
+                      wn(pre + ".linear_g.weight")});
+  TP* planes = scratch<TP>("rfd4p.tri.planes", (size_t)fusedOut * rows);
+  linearPlanes<TP>(zNorm, planes, rows, cZ, fusedOut, fused);
   gatePlanes<TP>(planes, pairMask, rows, cH);
   const TP* aT = planes;
   const TP* bT = planes + 2 * rows * (size_t)cH;
-  const TP* gPlanes = planes + 4 * rows * (size_t)cH;
+  const TP* gPlanes = LONG ? nullptr : planes + 4 * rows * (size_t)cH;
 
   // One n x n plane a channel, contracted as a batch of GEMMs, then back. Outgoing and incoming
   // differ only in which operand is transposed.
@@ -293,7 +302,7 @@ inline void triangleT(float* z, const float* pairMask, const Dims& d, bool outgo
   // so the crossover is about 40,000 pairs and the rule is on `rows`, which is what sets the stride.
   if constexpr (LONG) {
     TP* gate = scratch<TP>("rfd4p.tri.gate", rows * cZ);
-    fromPlanes<TP, TP>(gPlanes, gate, rows, cZ);
+    linear<TP, TP>(zNorm, gate, rows, cZ, cZ, wn(pre + ".linear_g.weight"), true);
     mulSigmoidAddGate<TP>(xProj, gate, pairMask, z, rows, cZ);
   } else {
     mulSigmoidAddPlaneGateK<TP><<<blocks(rows * cZ), 256, 0, STREAM>>>(xProj, gPlanes, pairMask, z,

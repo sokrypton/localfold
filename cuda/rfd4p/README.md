@@ -61,10 +61,10 @@ Both arms at 6 recycles, the `--length=N` unconditioned segment:
 
 | n | exact | `--fast` | ratio |
 |---:|---:|---:|---:|
-| 54 | 73.5 | 28.8 | 2.55 |
-| 100 | 156.7 | 47.5 | 3.30 |
-| 200 | 528.1 | 136.9 | 3.86 |
-| 400 | 2028.4 | 468.8 | 4.33 |
+| 54 | 72.6 | 28.9 | 2.51 |
+| 100 | 156.4 | 47.5 | 3.29 |
+| 200 | 522.8 | 130.8 | 4.00 |
+| 400 | 1995.1 | 442.6 | 4.51 |
 
 The reduced-precision arm pulls further ahead with length, which is what a pair track that grows as
 n^2 and contracts as n^3 should do: the longer the chain, the more of the pass is GEMM and the less
@@ -90,6 +90,7 @@ four oracle arms.
 | the pair bias fused into one kernel | 49.8 at n=100, **555.9 at n=400** | a wash on a short chain, 3.5% at a long one |
 | a long form past 40,000 pairs: the gate transposed and the contraction's output narrowed | **509.1 at n=400**, 50.0 unchanged at n=100 | both choices invert with length |
 | the elementwise kernels vectorised | **47.5 at n=100, 468.8 at n=400** | one `half` a thread is a 2-byte access |
+| the long form's gate projected row-major instead of transposed | **442.6 at n=400**, 47.5 unchanged at n=100 | a second GEMM beats a transpose once the tensor is big |
 
 The GEMMs now run at ~144 TFLOP/s against this card's 156 TF32 ceiling, and the kernel total is
 within a few percent of the wall clock, so there is no idle to recover: what is left is bytes.
