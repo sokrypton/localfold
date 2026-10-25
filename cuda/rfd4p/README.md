@@ -539,10 +539,18 @@ residues the cropped example does not contain, so building one from the spec fai
     (`featurise/selection.h`): `sel('chain/res_name/res_id/atom_name')` with lists and ranges,
     which is what every structure preset writes and what the contig-only subset could not say.
     `applyConditions` writes those selections onto the atoms
-    (`featurise/conditions.h`), every dtype the presets use. What is left of the structure path
-    is wiring it into the JOB path - the stages all exist and are gated, but `--spec` still
-    refuses a structure input - plus `processSampleToAtoms`'s `inputAtoms` path and the
-    coordinate-group permutation. In the order they run, with what each needs:
+    (`featurise/conditions.h`), every dtype the presets use. **A job that names an input
+    structure featurises natively now**, byte-exact against `export_input.mjs` on both routes.
+    What is left is `processSampleToAtoms`'s `inputAtoms` path and the coordinate-group
+    permutation.
+
+    🔴 **AND A STRUCTURE IS THE JOB UNLESS THE SPEC SAYS OTHERWISE - THE TWO ROUTES DISAGREE BY
+    67 TOKENS ON ONE FILE.** Without `specMode`, `export_input.mjs` hands the CIF straight to
+    `buildBatch`: annotations KEPT, contig and conditions IGNORED, because a preset's contig is
+    written in the ORIGINAL entry's numbering and names residues the cropped example does not
+    contain. With `specMode: true` it is a spec - annotations discarded, arginines re-labelled,
+    contig and conditions applied. The port implemented the second as the default and gave 116
+    tokens where the exporter gives 183; the featuriser gate now drives both. In the order they run, with what each needs:
 
     | stage | `transforms.js` | what a structure makes live |
     |---|---|---|

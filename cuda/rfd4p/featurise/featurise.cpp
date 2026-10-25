@@ -1704,6 +1704,11 @@ int run(int argc, char** argv) {
   // The job. `--length=N` is one unconditioned segment, the shape the exporter's own flag makes.
   string contig;
   std::map<string, std::map<string, vector<string>>> conditions;
+  // The structure path's conditions keep their ORDER and their `group:` field, which the spec
+  // path's map-of-maps has nowhere to put.
+  rfd4p::conditions::Spec structureConditions;
+  string inputPath;
+  bool asAnnotatedCif = false, specMode = false;
   int nsteps = 60;
   if (length) {
     contig = "a1:" + std::to_string(length) + "-" + std::to_string(length) + "P";
@@ -1716,33 +1721,101 @@ int run(int argc, char** argv) {
     while ((got = fread(buf, 1, sizeof buf, f)) > 0) job.append(buf, got);
     fclose(f);
     const Json spec = parseJson(job);
-    if (Json::absent(spec.get("contig"))) {
+    const Json* inputKey = spec.get("input");
+    const bool hasInput = inputKey && inputKey->isString();
+    // 🔴 A CONTIG IS REQUIRED ONLY WITHOUT AN INPUT. A spec that names a structure and no
+    // contig means "take the whole structure"; the reference leaves `originalResId` as the
+    // input's own numbering and carries on. Demanding one here refused a job the reference
+    // accepts.
+    if (!hasInput && Json::absent(spec.get("contig"))) {
       fprintf(stderr, "%s has no contig\n", specPath.c_str());
       return 1;
     }
-    contig = spec.get("contig")->s;
+    if (!Json::absent(spec.get("contig"))) contig = spec.get("contig")->s;
     if (!Json::absent(spec.get("nsteps"))) nsteps = (int)spec.get("nsteps")->n;
     for (const char* k : {"recycleSchedule", "recycle_schedule"}) {
       if (!Json::absent(spec.get(k))) recycleSchedule = spec.get(k)->s;
     }
+    for (const char* k : {"input", "inputCif", "input_cif"}) {
+      const Json* v = spec.get(k);
+      if (v && v->isString()) inputPath = v->s;
+    }
+    {
+      const Json* sm = spec.get("specMode");
+      specMode = sm && !Json::absent(sm) ? (sm->kind == Json::Bool ? sm->b : sm->n != 0)
+                                         : !hasInput;
+    }
+    for (const char* k : {"input_as_annotated_cif", "inputAsAnnotatedCif"}) {
+      const Json* v = spec.get(k);
+      if (v && !Json::absent(v)) asAnnotatedCif = v->kind == Json::Bool ? v->b : v->n != 0;
+    }
     const Json* cond = spec.get("conditions");
     if (cond && cond->isObject()) {
       for (const auto& [key, arms] : cond->o) {
+        rfd4p::conditions::Arms ordered;
         for (const auto& [value, sels] : arms.o) {
           vector<string> list;
+          vector<rfd4p::conditions::Entry> entries;
           if (sels.isArray()) {
             for (const Json& e : sels.a) {
+              rfd4p::conditions::Entry entry;
               const Json* sel = e.get("select");
-              if (sel && sel->isString()) list.push_back(sel->s);
+              if (sel && sel->isString()) { entry.select = sel->s; list.push_back(sel->s); }
+              const Json* grp = e.get("group");
+              if (grp && !Json::absent(grp)) {
+                entry.hasGroup = true;
+                entry.group = grp->isString() ? grp->s : std::to_string((long long)grp->n);
+              }
+              entries.push_back(entry);
             }
           }
           conditions[key][value] = list;
+          ordered.push_back({value, entries});
         }
+        structureConditions.push_back({key, ordered});
       }
     }
   }
 
-  const Batch b = buildSpecBatch(parseContig(contig), conditions, seed);
+  // 🔴 TWO ROUTES TO ONE BATCH, AND THE SECOND IS THE WHOLE STRUCTURE PIPELINE.
+  // `buildSpecBatch` is the contig-only specialisation: every token is a `<M>` stub, so most of
+  // `convertToProteinaBatch` is a no-op and the batch is its initialisation values. A job that
+  // names an input runs the real thing - read, contig, conditions, then the fourteen stages -
+  // and they must not be allowed to drift apart, which is why the structure route calls
+  // `runValidationPipeline` rather than assembling a batch of its own.
+  Batch b;
+  if (inputPath.empty()) {
+    b = buildSpecBatch(parseContig(contig), conditions, seed);
+  } else {
+    bool opened = false;
+    const string cifText = lf::zstd::readTextOrCompressed(inputPath, &opened);
+    if (!opened) { fprintf(stderr, "no %s\n", inputPath.c_str()); return 1; }
+    // 🔴 A STRUCTURE IS THE JOB UNLESS THE SPEC SAYS OTHERWISE, and the two routes disagree by
+    // 67 tokens on the same file. Without `specMode`, `export_input.mjs` hands the CIF straight
+    // to `buildBatch` - annotations KEPT, contig and conditions IGNORED - because a preset's
+    // contig is written in the original entry's numbering and names residues the cropped
+    // example does not contain. With `specMode: true` it is a spec: the annotations are
+    // discarded, the arginines re-labelled, and the contig and conditions applied. Reading the
+    // first as the second gave 116 tokens where the exporter gives 183.
+    rfd4p::atoms::AtomArray src =
+        rfd4p::atoms::fromCif(cifText, specMode ? asAnnotatedCif : true);
+    vector<int> originalResId = src.site.resId;
+    if (specMode) {
+      if (!contig.empty()) {
+        const rfd4p::contig::Applied applied = rfd4p::contig::applyContig(src, contig);
+        src = applied.atomArray;
+        originalResId = applied.originalResId;
+      }
+      if (!structureConditions.empty()) {
+        rfd4p::conditions::applyConditions(src, structureConditions, originalResId);
+      }
+    }
+    // 🔴 ONE GENERATOR FOR THE WHOLE PIPELINE, SEEDED FROM THE JOB. Neither the contig nor the
+    // conditions draw; `runValidationPipeline` draws the segment lengths, the internal-coordinate
+    // rotations and the two permutations, in that order, from this one stream.
+    rfd4p::atoms::PipelineRng prng((uint32_t)seed);
+    b = runValidationPipeline(src, prng);
+  }
   const int n = b.n;
 
   // The sampler's first step, exactly as the exporter reaches it.

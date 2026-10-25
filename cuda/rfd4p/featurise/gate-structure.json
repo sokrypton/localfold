@@ -1,0 +1,8 @@
+{
+  "input": "web/examples/ppi_pdl1.cif.zst",
+  "conditions": {
+    "C_SEQ": { "true": [ { "select": "sel('B/*/*/*')" } ] },
+    "C_HOT": { "true": [ { "select": "sel('B/*/[12,14,20]/*')" } ] }
+  },
+  "nsteps": 60
+}

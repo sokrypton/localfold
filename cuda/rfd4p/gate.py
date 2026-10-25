@@ -400,6 +400,15 @@ def main() -> int:
             # one wrong integer a token, in a field no geometry check could see.
             mixed = HERE / "featurise" / "gate-mixed.json"
             cases.append(("mixed", [f"--spec={mixed}"], [f"--spec={mixed}"]))
+            # 🔴 AND TWO JOBS WITH A REAL INPUT STRUCTURE, which is a different pipeline from
+            # everything above it: `buildSpecBatch` is the contig-only specialisation where most
+            # of `convertToProteinaBatch` is a no-op, and a structure runs the whole of it - the
+            # reader, the contig, the conditions and the fourteen transform stages. One without a
+            # contig (take the structure whole) and one with, because the contig is what makes
+            # the conditions' residue numbers differ from the assembled ones.
+            for tag in ("structure", "structure-contig"):
+                spec = HERE / "featurise" / f"gate-{tag}.json"
+                cases.append((tag, [f"--spec={spec}"], [f"--spec={spec}"]))
             # 🔴 AND THE GENERATION DIRECTORY, NOT ONLY THE TRUNK'S INPUT. `--generate` writes the
             # per-step conditioning, the emit masks, the recycle depths and the NOISE - which the
             # C++ now draws rather than replays, so Box-Muller is compared here too. Without this

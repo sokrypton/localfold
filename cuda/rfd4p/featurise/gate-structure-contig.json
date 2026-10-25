@@ -1,0 +1,22 @@
+{
+  "input": "web/examples/ppi_pdl1.cif.zst",
+  "contig": "B2-40,/0,24-24",
+  "conditions": {
+    "C_CRD": {
+      "true": [
+        {
+          "select": "sel('B/*/*/*')"
+        }
+      ]
+    },
+    "C_SEQ": {
+      "true": [
+        {
+          "select": "sel('B/*/*/*')"
+        }
+      ]
+    }
+  },
+  "nsteps": 60,
+  "specMode": true
+}
