@@ -12,6 +12,7 @@
  */
 import { decodeTextOrZstd } from "../../../shared/rfd4p/pipeline/index.js";
 import { parseCifToAtomArray } from "../../../shared/rfd4p/pipeline/cif.js";
+import { ensureStereochemistryAnnotations } from "../../../shared/rfd4p/pipeline/chirality.js";
 import { execFileSync } from "node:child_process";
 import { readFileSync, readdirSync, writeFileSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -35,11 +36,16 @@ for (const name of readdirSync(`${repo}web/examples`).filter((f) => f.endsWith("
   const lines = execFileSync(binary, ["x", `--dump-cif=${path}`],
     { encoding: "utf8", maxBuffer: 1 << 28 }).trim().split("\n");
   const n = Number(lines[0].split(" ")[1]);
-  const rows = lines.slice(1).filter((l) => !/^(extra|bond|id|ann)\t/.test(l))
+  const rows = lines.slice(1).filter((l) => !/^(extra|bond|id|ann|chiral|stereobond)\t?/.test(l))
     .map((l) => l.split("\t"));
+  const named = (tag) => {
+    const l = lines.find((x) => x.startsWith(`${tag}\t`));
+    return l ? l.split("\t").slice(1).map(Number) : [];
+  };
   const bonds = lines.filter((l) => l.startsWith("bond\t"))
     .map((l) => l.split("\t").slice(1).map(Number));
   const ids = lines.filter((l) => l.startsWith("id\t")).map((l) => l.split("\t").slice(1));
+  ensureStereochemistryAnnotations(js);
   const ann = new Map();
   for (const l of lines.filter((x) => x.startsWith("ann\t"))) {
     const p = l.split("\t");
@@ -131,6 +137,17 @@ for (const name of readdirSync(`${repo}web/examples`).filter((f) => f.endsWith("
       }
       if (bad) wrong.push(`${name} ${bad}`);
     }
+  }
+
+  // The stereochemistry: which atoms are chiral centres and which double bonds are stereogenic.
+  for (const [label, got, want] of [
+    ["chiral_type", named("chiral"), js.chiral_type],
+    ["stereogenic_bond_atoms", named("stereobond"),
+     js.stereogenic_bond_atoms.map((v) => (v ? 1 : 0))],
+  ]) {
+    if (got.length !== want.length) { wrong.push(`${label} length`); continue; }
+    const bad = got.filter((v, i) => v !== want[i]).length;
+    if (bad) wrong.push(`${label} ${bad}`);
   }
 
   structures += 1;

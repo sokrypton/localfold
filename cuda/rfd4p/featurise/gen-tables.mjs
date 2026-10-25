@@ -20,6 +20,10 @@ import {
 } from "../../../shared/rfd4p/pipeline/cif.js";
 import { CONDITION_ENUMS, CONDITION_REGISTRY } from "../../../shared/rfd4p/pipeline/spec.js";
 import { parseCathCode } from "../../../shared/rfd4p/conditions.js";
+import {
+  IDEAL_POLYHEDRA, STEREOISOMER_TEMPLATES, DOUBLE_BOND_TEMPLATES, CHIRAL_TYPE,
+  MAX_OVERLAPPING_CENTERS,
+} from "../../../shared/rfd4p/pipeline/chirality.js";
 
 const str = (s) => JSON.stringify(s);
 const out = [];
@@ -231,6 +235,66 @@ w("// `_chem_comp_bond.value_order:pdbx_aromatic_flag` and `_struct_conn.pdbx_va
     w("");
   }
 }
+// 🔴 THE STEREOISOMER TEMPLATES ARE PRECOMPUTED, NOT BUILT AT START-UP. The reference enumerates
+// every permutation of each ideal polyhedron and keeps the ones no rotation can carry onto an
+// earlier one - up to 6! = 720 Kabsch fits per geometry, at module load. Generating them here
+// makes the native side's start-up free and, more to the point, makes the SET a fact in the
+// repository rather than something two implementations have to agree about.
+w(`constexpr int MAX_OVERLAPPING_CENTERS = ${MAX_OVERLAPPING_CENTERS};`);
+w("");
+const pts = (p) => `{${p.map((v) => v.toExponential(17)).join(", ")}}`;
+w("// `<geometry>:<n>` -> the distinct orderings of its first n ideal directions.");
+w("inline const std::unordered_map<std::string, std::vector<std::vector<std::array<double, 3>>>>");
+w("    STEREOISOMER_TEMPLATES = {");
+for (const [key, reps] of STEREOISOMER_TEMPLATES) {
+  w(`    {${str(key)}, {`);
+  for (const rep of reps) w(`        {${rep.map(pts).join(", ")}},`);
+  w("    }},");
+}
+w("};");
+w("");
+w("// `<side>:<nLeft>:<nRight>` -> the ideal planar arrangement of a stereogenic double bond.");
+w("inline const std::unordered_map<std::string, std::vector<std::array<double, 3>>>");
+w("    DOUBLE_BOND_TEMPLATES = {");
+for (const [key, tpl] of DOUBLE_BOND_TEMPLATES) w(`    {${str(key)}, {${tpl.map(pts).join(", ")}}},`);
+w("};");
+w("");
+w("inline const std::unordered_map<std::string, std::vector<std::array<double, 3>>>");
+w("    IDEAL_POLYHEDRA = {");
+for (const [geom, pointsList] of Object.entries(IDEAL_POLYHEDRA)) {
+  w(`    {${str(geom)}, {${pointsList.map(pts).join(", ")}}},`);
+}
+w("};");
+w("");
+// 🔴 NOT EXPORTED BY THE REFERENCE, so it is read out of the source. A copy typed by hand would
+// be a second place for a chiral centre to live, which is the one thing this generator exists to
+// prevent; parsing the literal keeps it derived.
+w("// A standard residue's own chiral centres: `<residue>:<atom>` -> the chiral type.");
+w("inline const std::unordered_map<std::string, int> STD_POLYMER_CHIRAL_CENTERS = {");
+{
+  const { readFileSync } = await import("node:fs");
+  const src = readFileSync(new URL("../../../shared/rfd4p/pipeline/chirality.js", import.meta.url),
+                           "utf8");
+  const start = src.indexOf("const STD_POLYMER_CHIRAL_CENTERS = {");
+  const body = src.slice(start, src.indexOf("\n};", start));
+  for (const line of body.split("\n").slice(1)) {
+    const m = line.match(/^\s*(\w+):\s*\{(.*)\},?\s*$/);
+    if (!m) continue;
+    // 🔴 A NUCLEOTIDE'S CENTRES ARE QUOTED ATOM NAMES - `"C1'"` and its neighbours - so the
+    // character class must admit the quote AND the apostrophe inside it. Without the double
+    // quote the generator silently kept the twenty amino acids and dropped every nucleotide,
+    // 21 entries where the source has 49.
+    for (const e of m[2].matchAll(/["']?([A-Za-z0-9']+)["']?:\s*(\d+)/g)) {
+      w(`    {${str(`${m[1]}:${e[1]}`)}, ${e[2]}},`);
+    }
+  }
+}
+w("};");
+w("");
+w("inline const std::unordered_map<std::string, int> CHIRAL_TYPE = {");
+for (const [k, v] of Object.entries(CHIRAL_TYPE)) w(`    {${str(k)}, ${v}},`);
+w("};");
+w("");
 w("}  // namespace tables");
 w("}  // namespace rfd4p");
 

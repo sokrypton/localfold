@@ -32,6 +32,7 @@
 #include "../../featurise/json.h"
 #include "../../featurise/jsmath.h"
 #include "../src/schedule.h"
+#include "chirality.h"
 #include "cif.h"
 #include "tables.inc"
 
@@ -954,6 +955,12 @@ int run(int argc, char** argv) {
       for (const auto& x : v) printf("\t%s", x.c_str());
       printf("\n");
     }
+    const rfd4p::chirality::Stereo st = rfd4p::chirality::annotate(a, bonds, ann, {});
+    printf("chiral");
+    for (int t : st.chiralType) printf("\t%d", t);
+    printf("\nstereobond");
+    for (uint8_t b : st.stereogenicBondAtoms) printf("\t%d", (int)b);
+    printf("\n");
     for (const auto& [name, values] : a.extra) printf("extra\t%s\n", name.c_str());
     return 0;
   }

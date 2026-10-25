@@ -507,11 +507,19 @@ residues the cropped example does not contain, so building one from the spec fai
     A first bond for a pair wins, so a declared link is not overwritten by the dictionary's idea
     of the same pair; and `_struct_conn`'s partner search keeps the LAST match rather than the
     first, which is the reference's loop and not a slip.
-  - **this is where the remaining work starts.** `pipeline/chirality.js`: `ensureStereochemistryAnnotations` and `computeChiralityFeatures`,
-    with `IDEAL_POLYHEDRA` (4 geometries, 19 unit vectors), `STEREOISOMER_TEMPLATES` (11 entries,
-    105 point sets, built at load by brute-force permutation - precompute them) and
-    `STD_POLYMER_CHIRAL_CENTERS` (~29 residues). 🔴 The port already has `properRotation` and the
-    4x4 Jacobi on the device (`src/chirality.cuh`); what is missing is the TEMPLATES, not the fit.
+  - ~~`ensureStereochemistryAnnotations`~~ **done** (`featurise/chirality.h`): the standard
+    residues looked up, everything else DETECTED - the sp3 test, the phosphate and metal false
+    positives, the Weisfeiler-Lehman distinctness of the neighbours, the planarity floor and the
+    signed volume that picks CW from CCW; and the stereogenic double bonds. Exact on all seven.
+    🔴 The WL colouring removes the CENTRE, because neighbours are only distinct in the graph
+    that does not contain the atom joining them. And `STD_POLYMER_CHIRAL_CENTERS` generated into
+    `tables.inc` was 21 entries where the source has 49 until the generator's character class
+    admitted a quoted atom name - it had silently kept the twenty amino acids and dropped every
+    nucleotide.
+  - **this is where the remaining work starts.** `computeChiralityFeatures`: the four tensors,
+    needing the Kabsch fit and `STEREOISOMER_TEMPLATES` - both already in `tables.inc` (the
+    templates precomputed rather than brute-forced at start-up), and `src/chirality.cuh` already
+    has `properRotation` and the 4x4 Jacobi.
   - the parts of `transforms.js` a contig skips: `buildAtom37Slots` returning real slots, so the
     per-atom loop of `convertToProteinaBatch` stops being a no-op, and `unindexFlaggedTokens`'
     body, `materializeInternalCoords`' rotations and `centerAndFeaturizeCentroid`' recentering.
