@@ -441,9 +441,29 @@ residues the cropped example does not contain, so building one from the spec fai
 
 ## What is not done
 
-- **A native featuriser for an input STRUCTURE.** The spec path is done (below); the seven
-  `web/examples/*.cif.zst` presets still go through `export_input.mjs`, because they need the
-  mmCIF reader, the CCD bond tables and the chirality templates.
+- **A native featuriser for an input STRUCTURE.** The spec path is done (above); the seven
+  `web/examples/*.cif.zst` presets still go through `export_input.mjs`. What that path needs, in
+  the order it runs - the map is worth having before anybody starts:
+  - `pipeline/zstd.js` + `vendor/fzstd.js` to decompress, and `pipeline/cif.js`'s tokeniser and
+    `parseCifToAtomArray` (1,195 lines, and the largest single piece).
+  - `buildBondsForAtomArray` with `STD_RESIDUE_BONDS` (28 residues of explicit bond lists),
+    `STD_RESIDUE_CHARGES`, `STD_RESIDUE_AROMATIC`, `ELEMENT_TO_ATOMIC_NUMBER` (94) and
+    `METAL_ELEMENTS` (61) - all generable into `tables.inc`.
+  - `pipeline/chirality.js`: `ensureStereochemistryAnnotations` and `computeChiralityFeatures`,
+    with `IDEAL_POLYHEDRA` (4 geometries, 19 unit vectors), `STEREOISOMER_TEMPLATES` (11 entries,
+    105 point sets, built at load by brute-force permutation - precompute them) and
+    `STD_POLYMER_CHIRAL_CENTERS` (~29 residues). 🔴 The port already has `properRotation` and the
+    4x4 Jacobi on the device (`src/chirality.cuh`); what is missing is the TEMPLATES, not the fit.
+  - the parts of `transforms.js` a contig skips: `buildAtom37Slots` returning real slots, so the
+    per-atom loop of `convertToProteinaBatch` stops being a no-op, and `unindexFlaggedTokens`'
+    body, `materializeInternalCoords`' rotations and `centerAndFeaturizeCentroid`' recentering.
+  - the selection language in full (`chain/res_name/res_id/atom_name`), which only has anything to
+    constrain once there are residues and atoms.
+
+  🔴 **AND THE THING TO CHECK FIRST IS THE RNG ORDER**, not the chemistry: `materializeInternalCoords`
+  draws `randomSO3` per internal-coordinate group and `unindexFlaggedTokens` takes its own path,
+  both of which a contig never reaches - and this port has already been bitten twice by a draw
+  that happens when it looks as though it should not.
 - **An input with COORDINATE GROUPS to permute.** It is the last thing `--generate` refuses: the
   group relabelling is a `randperm` draw a step, so it has to be replayed like the noise. No
   shipped preset has one.
