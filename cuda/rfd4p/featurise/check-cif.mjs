@@ -17,7 +17,7 @@ import {
 } from "../../../shared/rfd4p/pipeline/chirality.js";
 import { computeTokenBondFeatures } from "../../../shared/rfd4p/pipeline/bonds.js";
 import { STANDARD_POLYMER_RESIDUES } from "../../../shared/rfd4p/encoding.js";
-import { applyContig, evalSelection, applyConditions } from "../../../shared/rfd4p/pipeline/spec.js";
+import { applyContig, evalSelection, applyConditions, loadConditionSpecInput } from "../../../shared/rfd4p/pipeline/spec.js";
 import {
   ensureChemicalFlags, addSrcComponentAnnotation, computeWithinChainSourceResIdx,
   realizeExpandableSegments, createSeededRng, filterUnwantedAtoms,
@@ -302,7 +302,7 @@ function withStereogenicDoubleBond(text, twist = false) {
  * what said so rather than reading: each of the twenty-two structures carries
  * `_chem_comp_atom`, `_chem_comp` and `_entity_poly`, and "the file's own tables win" means
  * they win EVERY time - 913,128 hits on the `if` and **zero on the `else`**. Five rules live
- * in that else: `STD_RESIDUE_CHARGES`, `STD_RESIDUE_AROMATIC`, the OXT/OP3 leaving-atom rule,
+ * in that else: a charge table (since removed: upstream reads none), `STD_RESIDUE_AROMATIC`, the OXT/OP3 leaving-atom rule,
  * `chemCompType` from the residue tables, and the chain type from the residue NAME - the last
  * of which carries this port's 🔴 that `5-20` and `<M>` must come out POLYPEPTIDE or a
  * contig's own chain is typed NON-POLYMER. That note was written from reading the reference
@@ -310,12 +310,9 @@ function withStereogenicDoubleBond(text, twist = false) {
  */
 function withoutChemTables(text, blankFormalCharge = false) {
   if (blankFormalCharge) {
-    // 🔴 AND `STD_RESIDUE_CHARGES` NEEDS A THIRD THING, WHICH IS WHY STRIPPING THE TABLES LEFT
-    // IT GREEN. The fallback is under `if (a.charge[k] == 0)`, and every chargeable atom in
-    // this corpus carries `+1` in the file's OWN `pdbx_formal_charge` - measured: the guard is
-    // entered 913,128 times out of 926,116, and the ~12,988 that skip it are exactly those
-    // atoms. So the table can only be reached by a file that declares no formal charge AND has
-    // no `_chem_comp_atom`, and the three keys it holds are `ARG:NH2`, `HIS:ND1` and `LYS:NZ`.
+    // A file that declares no formal charge and carries no `_chem_comp_atom`: both readers must
+    // leave every charge at zero now. They used to fill ARG:NH2, HIS:ND1 and LYS:NZ from a table
+    // upstream's annotated reader does not have.
     const L = atomSiteLoop(text);
     const fc = L.cols.indexOf("pdbx_formal_charge");
     if (fc < 0) throw new Error("no formal charge column to blank");
@@ -668,6 +665,12 @@ const cases = new Map();
 for (const f of readdirSync(`${repo}web/examples`).filter((x) => x.endsWith(".cif.zst")).sort()) {
   cases.set(f.replace(".cif.zst", ""),
     decodeTextOrZstd(new Uint8Array(readFileSync(`${repo}web/examples/${f}`))));
+}
+// And five entries as RCSB deposits them: alternate locations, waters, ions and their metal
+// bonds, insertion-free CIF numbering, files with `_chem_comp_atom` tables that carry no flags.
+for (const f of readdirSync(`${repo}tools/fixtures/rcsb`).filter((x) => x.endsWith(".cif.zst")).sort()) {
+  cases.set(`rcsb_${f.replace(".cif.zst", "")}`,
+    decodeTextOrZstd(new Uint8Array(readFileSync(`${repo}tools/fixtures/rcsb/${f}`))));
 }
 cases.set("ppi_pdl1+OXT",
   withExtraAtom(cases.get("ppi_pdl1"), ["ALA", "GLY", "SER", "LEU", "VAL"], "OXT", "O"));
@@ -1474,21 +1477,31 @@ for (const [name, text] of cases) {
   }
 
   // 🔴 THE LOAD A JOB ACTUALLY DOES, which is NOT the one every arm above uses.
-  // `input_as_annotated_cif` defaults to FALSE, so a spec that names a structure discards the
-  // file's own conditions - it is an INPUT, not a spec - and re-labels each arginine's NH1/NH2
-  // by distance from CD, because a deposited arginine is routinely labelled the other way and
-  // the model reads the labels.
-  {
-    const got = execFileSync(binary, ["x", `--dump-cif=${path}`, "--unannotated"],
-      { encoding: "utf8", maxBuffer: 1 << 28 }).split("\n");
+  // `input_as_annotated_cif` defaults to FALSE, so a spec that names a structure reads it as a
+  // RAW structure - its conditions discarded, and PREPARED as upstream prepares one (fresh.js):
+  // conformers chosen, missing atoms added, waters gone, arginines re-labelled by distance from
+  // CD. An annotated file's expandable-segment sentinels are refused there, by both.
+  let unannotated = null;
+  try {
+    unannotated = execFileSync(binary, ["x", `--dump-cif=${path}`, "--unannotated"],
+      { encoding: "utf8", maxBuffer: 1 << 28, stdio: "pipe" }).split("\n");
+  } catch (err) {
+    let pageRefused = false;
+    try { loadConditionSpecInput(text, { asAnnotatedCif: false }); } catch { pageRefused = true; }
+    if (!pageRefused) wrong.push(`unannotated refused: ${String(err.stderr ?? err.message).trim().split("\n")[0]}`);
+  }
+  if (unannotated) {
+    const got = unannotated;
     const head = (got.find((l) => l.startsWith("unann\t")) ?? "").split("\t").slice(1).map(Number);
-    const ref = parseCifToAtomArray(text, { fixArginines: true });
-    ref.annotations = {};
+    let ref = null;
+    try { ref = loadConditionSpecInput(text, { asAnnotatedCif: false }); } catch (err) {
+      wrong.push(`unannotated loads natively where the page refuses: ${err.message}`);
+    }
     const rows = got.filter((l) => l.startsWith("ua\t")).map((l) => l.split("\t").slice(1));
     if (head[1] + head[2] + head[3] !== 0) {
       wrong.push(`unannotated kept ${head[1] + head[2] + head[3]} annotations`);
     }
-    if (rows.length !== ref.nAtoms) wrong.push(`unannotated ${rows.length} vs ${ref.nAtoms}`);
+    if (!ref) { /* reported above */ } else if (rows.length !== ref.nAtoms) wrong.push(`unannotated ${rows.length} vs ${ref.nAtoms}`);
     else {
       const bad = rows.filter((r, i) => r[0] !== ref.res_name[i] || r[1] !== ref.atom_name[i]
         || !eq(Number(r[2]), ref.coord[i][0]) || !eq(Number(r[3]), ref.coord[i][1])

@@ -1,1 +1,1 @@
-{"input": "web/examples/motif_idx_1prw.cif.zst", "nsteps": 8, "partialTrajectoryFractionSteps": 0.5, "input_as_annotated_cif": true}
+{"input": "../../../web/examples/motif_idx_1prw.cif.zst", "nsteps": 8, "partialTrajectoryFractionSteps": 0.5, "input_as_annotated_cif": true}

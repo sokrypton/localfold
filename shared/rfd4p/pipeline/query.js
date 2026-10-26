@@ -17,7 +17,7 @@
  */
 import { getTokenStarts } from './bonds.js';
 import {
-  CARBOHYDRATE_NAMES, CHAIN_TYPE, DNA_BACKBONE_ATOM_NAMES, MASKED, METAL_ELEMENTS,
+  CARBOHYDRATE_NAMES, CHAIN_TYPE, DNA_BACKBONE_ATOM_NAMES, MASKED,
   NON_POLYMER_CHAIN_TYPES, NUCLEIC_ACID_BACKBONE_ATOM_NAMES, NUCLEIC_CHAIN_TYPES,
   POLYMER_CHAIN_TYPES, PROTEIN_BACKBONE_ATOM_NAMES, PROTEIN_CHAIN_TYPES, PURINE_RESIDUES,
   PYRIMIDINE_RESIDUES, RNA_BACKBONE_ATOM_NAMES, STANDARD_AA, STANDARD_DNA, STANDARD_RNA,
@@ -442,7 +442,11 @@ function derived(atoms, name) {
     case 'is_pyrimidine': return named(PYRIMIDINE_RESIDUES);
     case 'is_purine': return named(PURINE_RESIDUES);
     case 'is_tip_atom': return an.map((a, i) => (TIP_ATOM_NAMES[rn[i]] ?? []).includes(a));
-    case 'is_metal': return named(METAL_ELEMENTS);
+    // 🔴 NEVER TRUE, BECAUSE UPSTREAM'S IS NEVER TRUE: atomworks computes it as
+    // `np.isin(res_name, METAL_ELEMENTS)` and METAL_ELEMENTS is a frozenset, which numpy takes as
+    // ONE object rather than a collection - so a calcium named `CA` is not a metal there, and a
+    // selection `... or is_metal` conditions nothing it would add. Measured on 1PRW's four Ca ions.
+    case 'is_metal': return new Array(n).fill(false);
     case 'is_carbohydrate': return named(CARBOHYDRATE_NAMES);
     case 'is_res_start': {
       const out = new Array(n).fill(false);

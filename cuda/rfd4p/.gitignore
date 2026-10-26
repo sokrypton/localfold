@@ -34,3 +34,5 @@ gate-writer-*
 featurise/gate-writer-*.json
 featurise/gate-nucleic-ss.cif
 featurise/gate-nucleic-ss.json
+featurise/gate-multi.json
+featurise/gate-multi-yz.cif

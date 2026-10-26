@@ -46,6 +46,27 @@ class FixedLengths:
         return n
 
 
+def _ccd_for(inputs: str) -> dict:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from rfd4p_ccd import ccd_entries
+
+    path = Path(inputs)
+    if path.suffix in (".yaml", ".yml", ".json"):
+        import yaml
+
+        spec = yaml.safe_load(path.read_text())
+        files = []
+        for k, ex in spec.items():
+            if k == "global_args" or not isinstance(ex, dict) or "input" not in ex:
+                continue
+            for p in ([ex["input"]] if isinstance(ex["input"], str) else ex["input"]):
+                q = Path(p) if Path(p).is_absolute() else path.parent / p
+                if q.suffix == ".cif" and q.exists():
+                    files.append(q)
+        return ccd_entries(files)
+    return ccd_entries([path]) if path.suffix == ".cif" and path.exists() else {}
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--case", required=True)
@@ -115,6 +136,9 @@ def main() -> None:
         "n_perms": len(perms),
         "batch_nontensor_keys": sorted(k for k, v in batch.items() if not isinstance(v, torch.Tensor)),
         "tensor_index": {k: {"shape": list(v.shape), "dtype": str(v.dtype)} for k, v in tensors.items()},
+        # The dictionary entries the page would fetch for the input's components (ccd.js), so a
+        # checker replays a raw structure's preparation with what upstream had.
+        "ccd": _ccd_for(args.inputs),
     }
     (out_dir / f"{args.case}.json").write_text(json.dumps(meta, indent=1, default=str))
 

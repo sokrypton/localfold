@@ -55,6 +55,39 @@ inline vector<int> defaultCoordinateGroups(const atoms::AtomArray& a) {
   return groups;
 }
 
+/**
+ * `separate_coordinate_groups` (spec.js): each input's internal-coordinate groups renumbered into
+ * one namespace, so two files' group 1 do not become one rigid group. In place.
+ */
+inline void separateCoordinateGroups(vector<atoms::AtomArray>& arrays) {
+  int next = 1;
+  for (atoms::AtomArray& a : arrays) {
+    const size_t n = a.n();
+    auto have = a.ann.ints.find("condition_CoordinateGroup_1_atom");
+    const vector<int> old = have != a.ann.ints.end() ? have->second : defaultCoordinateGroups(a);
+    vector<int> groups = old;
+    auto intcrd = a.ann.floats.find("condition_InternalCoordinate_1_atom");
+    if (intcrd != a.ann.floats.end() && intcrd->second.size() == n * 3) {
+      for (size_t i = 0; i < n; ++i) {
+        if (old[i] > 0) continue;
+        for (int c = 0; c < 3; ++c) {
+          if (std::isfinite(intcrd->second[i * 3 + c])) {
+            fprintf(stderr, "Internal coordinate targets exist outside internal coordinate groups.\n");
+            exit(1);
+          }
+        }
+      }
+    }
+    std::set<int> ids;
+    for (const int g : old) if (g > 0) ids.insert(g);
+    for (const int gid : ids) {
+      for (size_t i = 0; i < n; ++i) if (old[i] == gid) groups[i] = next;
+      ++next;
+    }
+    if (have != a.ann.ints.end()) have->second = groups;
+  }
+}
+
 // `set_cath_condition` (shared/rfd4p/conditions.js `normalizeCatLabel`): a C.A.T label from the
 // model's own vocabulary - `x.x.x`, `C.x.x`, `C.A.x` or `C.A.T` - with a fourth `.x` accepted and
 // dropped, stored with a trailing `.x`. This appended `.x` to anything, so `3.40.50.20` became a

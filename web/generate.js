@@ -26,6 +26,8 @@
  */
 import { getDevice } from "./model.js";
 import { buildBatch } from "../shared/rfd4p/pipeline/index.js";
+import { isAnnotatedCif } from "../shared/rfd4p/pipeline/spec.js";
+import { ccdBlocksForRawStructure } from "../shared/rfd4p/pipeline/ccd.js";
 import { fetchRfd4pConfig, fetchShardedWeights } from "../shared/rfd4p/safetensors.js";
 import { generateRfd4p } from "../webgpu/rfd4p/generate.js";
 import { processSampleToAtoms, toPdbString } from "../shared/rfd4p/output.js";
@@ -177,10 +179,22 @@ export async function generate(options) {
   // segment 'A52-71' matched no atoms". The contig in those presets is written
   // in the ORIGINAL 1PRW numbering and is a label, not an input. Running them
   // from the spec was wrong for every conditioned preset.
+  // 🔴 A STRUCTURE UNDER A USER-BUILT JOB IS READ AS UPSTREAM READS A SPEC'S `input:`. An
+  // annotated CIF (a condition spec's output, as the 1PRW examples are) keeps its conditions -
+  // upstream's `input_as_annotated_cif: true`, which a page decides from the file - and anything
+  // else is a raw structure, PREPARED (pipeline/fresh.js): missing atoms added, waters dropped,
+  // its non-standard components completed from dictionary entries fetched first. Upstream refuses
+  // the 1PRW crops as raw structures, for the expandable-segment sentinels inside their chains.
+  const annotated = inputCif !== undefined && isAnnotatedCif(inputCif);
+  const ccdBlocks = !fromAnnotations && inputCif !== undefined && !annotated
+    ? await ccdBlocksForRawStructure(inputCif) : undefined;
   const { batch, n } = fromAnnotations && inputCif !== undefined
     ? buildBatch(inputCif, { seed })
-    : buildBatch({ contig, ...(conditions === undefined ? {} : { conditions }) },
-      { seed, ...(inputCif === undefined ? {} : { inputCif }) });
+    : buildBatch({
+      contig,
+      ...(conditions === undefined ? {} : { conditions }),
+      ...(annotated ? { input_as_annotated_cif: true } : {}),
+    }, { seed, ...(inputCif === undefined ? {} : { inputCif, ccdBlocks }) });
 
   status(`generating ${n} tokens over ${steps} steps`);
   const result = await generateRfd4p(device, weights, cfg, batch, {

@@ -689,7 +689,9 @@ inline std::optional<vector<Q>> derived(const atoms::AtomArray& a, const string&
   if (name == "is_nucleic_acid_backbone") return backbone("is_nucleic_acid", Q_NUCLEIC_ACID_BACKBONE_ATOM_NAMES, true);
   if (name == "is_pyrimidine") return named({&Q_PYRIMIDINE_RESIDUES}, {}, -1);
   if (name == "is_purine") return named({&Q_PURINE_RESIDUES}, {}, -1);
-  if (name == "is_metal") return named({&Q_METAL_ELEMENTS}, {}, -1);
+  // Never true, because upstream's never is: `np.isin(res_name, METAL_ELEMENTS)` over a frozenset
+  // matches nothing (query.js has the measurement).
+  if (name == "is_metal") return vector<Q>(n, qb(false));
   if (name == "is_carbohydrate") return named({&Q_CARBOHYDRATE_NAMES}, {}, -1);
   if (name == "is_tip_atom") {
     vector<Q> out(n);

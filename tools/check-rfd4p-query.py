@@ -28,10 +28,14 @@ import sys
 import tempfile
 from pathlib import Path
 
+from rfd4p_ccd import ccd_entries
+
 REPO = Path(__file__).resolve().parent.parent
 
 STRUCTURES = ["5o45_cropped", "dna_7m5w", "motif_idx_1prw", "motif_unidx_1prw", "ppi_pdl1",
               "sm_sam", "uncond_short"]
+# Raw RCSB entries: ions, waters, DNA, modified residues - what the shipped examples lack.
+RAW = ["rcsb/1brs", "rcsb/1prw", "rcsb/5o45", "rcsb/7m5w"]
 
 DERIVED = [
     "is_protein", "is_nucleic_acid", "is_dna", "is_rna", "is_polymer", "is_ligand",
@@ -63,7 +67,8 @@ CORPUS = [
     "True", "False", "1", "0", "'A'", "''", "None", "[1, 2]",
     # The derived annotations, alone and in combination.
     *DERIVED,
-    "is_protein_backbone & sel('B')", "is_tip_atom | is_metal", "within_chain_res_idx < 3",
+    "is_protein_backbone & sel('B')", "is_tip_atom | is_metal", "res_name == 'CA'", "sel('*/CA')",
+    "is_ligand & ~is_metal", "res_name in ['HOH', 'CA', 'DA']", "within_chain_res_idx < 3",
     "res_min_occupancy < 1", "token_min_occupancy == 1", "token_id < 5",
     # Functions.
     "has_bonds()", "~has_bonds()", "has_nan_coord()", "~has_nan_coord()",
@@ -102,12 +107,13 @@ def upstream_masks(cifs: dict[str, Path]) -> dict:
 def js_masks(cifs: dict[str, Path]) -> dict:
     script = """
 import { readFileSync } from "node:fs";
-import { parseCifToAtomArray } from "./shared/rfd4p/pipeline/cif.js";
+import { parseCifBlock, parseCifToAtomArray } from "./shared/rfd4p/pipeline/cif.js";
 import { evalSelection } from "./shared/rfd4p/pipeline/spec.js";
-const { cifs, corpus } = JSON.parse(readFileSync(0, "utf8"));
+const { cifs, corpus, ccd } = JSON.parse(readFileSync(0, "utf8"));
+const ccdBlocks = new Map(Object.entries(ccd).map(([id, text]) => [id, parseCifBlock(text)]));
 const out = {};
 for (const [name, path] of Object.entries(cifs)) {
-  const atoms = parseCifToAtomArray(readFileSync(path, "utf8"));
+  const atoms = parseCifToAtomArray(readFileSync(path, "utf8"), { ccdBlocks });
   Object.assign(atoms, atoms.annotations);
   out[name] = {};
   for (const q of corpus) {
@@ -119,7 +125,7 @@ process.stdout.write(JSON.stringify(out));
 """
     r = subprocess.run(["node", "--input-type=module", "-e", script], cwd=REPO, capture_output=True,
                        text=True, input=json.dumps({"cifs": {k: str(v) for k, v in cifs.items()},
-                                                    "corpus": CORPUS}))
+                                                    "corpus": CORPUS, "ccd": ccd_entries(list(cifs.values()))}))
     if r.returncode != 0:
         sys.exit(f"node failed: {r.stderr[-2000:]}")
     return json.loads(r.stdout)
@@ -150,10 +156,11 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory() as tmp:
         cifs = {}
-        for name in STRUCTURES:
-            raw = (REPO / "web" / "examples" / f"{name}.cif.zst").read_bytes()
-            path = Path(tmp) / f"{name}.cif"
-            path.write_bytes(zstandard.ZstdDecompressor().decompressobj().decompress(raw))
+        for name in STRUCTURES + RAW:
+            src = (REPO / "tools" / "fixtures" / f"{name}.cif.zst") if name.startswith("rcsb/") else (
+                REPO / "web" / "examples" / f"{name}.cif.zst")
+            path = Path(tmp) / f"{name.replace('/', '_')}.cif"
+            path.write_bytes(zstandard.ZstdDecompressor().decompressobj().decompress(src.read_bytes()))
             cifs[name] = path
         up = upstream_masks(cifs)
         sides = {"page": js_masks(cifs)}
@@ -163,7 +170,7 @@ def main() -> int:
     bad = 0
     for side, masks in sides.items():
         wrong = []
-        for name in STRUCTURES:
+        for name in STRUCTURES + RAW:
             for q in CORPUS:
                 want, have = up[name][q], masks[name][q]
                 if want.startswith("raise") and have.startswith("raise"):
@@ -171,8 +178,8 @@ def main() -> int:
                 if want != have:
                     wrong.append((name, q, want, have))
         bad += len(wrong)
-        print(f"{side}: {len(STRUCTURES) * len(CORPUS) - len(wrong)} of "
-              f"{len(STRUCTURES) * len(CORPUS)} agree with upstream"
+        total = len(STRUCTURES + RAW) * len(CORPUS)
+        print(f"{side}: {total - len(wrong)} of {total} agree with upstream"
               f"{'' if not wrong else f', {len(wrong)} differ'}")
         seen = set()
         for name, q, want, have in wrong:

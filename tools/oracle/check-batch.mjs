@@ -13,6 +13,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { parseCifBlock } from '../../shared/rfd4p/pipeline/cif.js';
 import { buildBatch } from '../../shared/rfd4p/pipeline/index.js';
 import {
   pairCondFeatures,
@@ -99,6 +100,11 @@ function loadInputForMeta(meta) {
     input: readFileSync(inputPath),
     loadInput: null,
   };
+}
+
+/** The dictionary entries the dump says the page would have fetched (dump_batch_cpu.py `ccd`). */
+function ccdBlocksOf(meta) {
+  return new Map(Object.entries(meta.ccd ?? {}).map(([id, text]) => [id, parseCifBlock(text)]));
 }
 
 function compareBatchTensors(jsBatch, wantBatch) {
@@ -295,6 +301,7 @@ async function main() {
 
       const { batch: jsCpuBatch, n } = buildBatch(input, {
         loadInput,
+        ccdBlocks: ccdBlocksOf(cpuMeta),
         chainPerm,
         moleculePerm,
         oracleBatch: wantCpuBatch,

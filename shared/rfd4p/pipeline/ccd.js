@@ -1,10 +1,13 @@
 /**
- * Chemical Component Dictionary entries fetched per component from RCSB, for structures whose nonstandard
- * residues or ligands come without `_chem_comp_bond` (plain RCSB downloads). AtomWorks reads the same tables from
- * its bundled CCD; here only the components a structure uses are fetched (~2-20 KB each,
+ * Chemical Component Dictionary entries fetched per component from RCSB, for a raw structure's
+ * non-standard residues and ligands (plain RCSB downloads carry no usable `_chem_comp_atom`).
+ * AtomWorks reads the same tables from its bundled CCD; here only the components a structure uses
+ * are fetched (~2-20 KB each,
  * `files.rcsb.org/ligands/view/<ID>.cif`, served with `Access-Control-Allow-Origin: *`).
  */
-import { STD_RESIDUE_BONDS, catRows as rows, mergeCcdIntoBlock, parseCifBlock } from './cif.js';
+import { CCD_TEMPLATES, WATER_LIKE_CCDS } from './ccd-templates.js';
+import { mergeCcdIntoBlock, parseCifBlock } from './cif.js';
+import { decodeTextOrZstd } from './zstd.js';
 
 export { mergeCcdIntoBlock };
 
@@ -12,17 +15,18 @@ export const CCD_URL = (id) => `https://files.rcsb.org/ligands/view/${encodeURIC
 const CACHE_NAME = 'rfd4p-ccd-v1';
 const memory = new Map();
 
-/** Components in `resNames` with neither a built-in bond template nor `_chem_comp_bond` rows in `cifBlock`. */
-export function componentsNeedingCcd(resNames, cifBlock) {
-  const have = new Set(Object.keys(STD_RESIDUE_BONDS));
-  const ccb = rows(cifBlock?.chem_comp_bond);
-  for (let r = 0; r < ccb.n; r += 1) have.add(String(ccb.get('comp_id', r)));
+/**
+ * The components a RAW structure's preparation (fresh.js) needs a dictionary entry for: every
+ * residue it names outside the generated templates (ccd-templates.js) - the standard residues and
+ * the ions - that is not water. Upstream reads the whole CCD for these; the page fetches each.
+ */
+export function componentsNeedingCcd(resNames) {
   const out = new Set();
   for (const name of resNames) {
-    if (!name || have.has(name) || /^\d+-\d+$/.test(name) || name === '<M>' || name === 'UNK') continue;
+    if (!name || CCD_TEMPLATES[name] || WATER_LIKE_CCDS.includes(name)) continue;
     if (/^[A-Z0-9]{1,5}$/i.test(name)) out.add(name);
   }
-  return [...out];
+  return [...out].sort();
 }
 
 async function fetchText(id, fetchFn) {
@@ -66,5 +70,30 @@ export async function fetchCcdComponents(ids, { fetchFn = globalThis.fetch?.bind
       console.warn('CCD fetch failed:', err?.message ?? err);
     }
   }));
-  return { blocks, failed };
+  // In code order, not completion order: the entries are merged into the structure's own
+  // tables row by row, and the bonds they carry are read in that order.
+  const ordered = new Map([...blocks.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)));
+  return { blocks: ordered, failed: failed.sort() };
+}
+
+/**
+ * Every dictionary entry a raw structure's preparation needs (`componentsNeedingCcd`), fetched.
+ * 🔴 A COMPONENT THAT CANNOT BE FETCHED IS A REFUSAL, NOT A STRUCTURE PREPARED WITHOUT IT: its
+ * missing atoms, its charges and its atom order would all be silently wrong.
+ *
+ * @param {string|Uint8Array} input mmCIF text or bytes
+ * @returns {Promise<Map<string, object>>}
+ */
+export async function ccdBlocksForRawStructure(input, { fetchFn } = {}) {
+  const text = typeof input === 'string' ? input : decodeTextOrZstd(input);
+  const site = parseCifBlock(text).atom_site ?? {};
+  const names = [...(site.label_comp_id ?? site.auth_comp_id ?? [])];
+  const ids = componentsNeedingCcd(new Set(names));
+  if (!ids.length) return new Map();
+  const { blocks, failed } = await fetchCcdComponents(ids, fetchFn ? { fetchFn } : {});
+  if (failed.length) {
+    throw new Error(`could not fetch the Chemical Component Dictionary entr${failed.length === 1 ? 'y' : 'ies'} for `
+      + `${failed.join(', ')} from RCSB, which preparing this structure needs`);
+  }
+  return blocks;
 }

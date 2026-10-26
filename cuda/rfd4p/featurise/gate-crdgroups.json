@@ -1,5 +1,5 @@
 {
-  "input": "web/examples/ppi_pdl1.cif.zst",
+  "input": "../../../web/examples/ppi_pdl1.cif.zst",
   "specMode": true,
   "conditions": {
     "C_CRD": { "true": [ { "select": "sel('B/*/*/*')" } ] },

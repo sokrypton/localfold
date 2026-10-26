@@ -33,6 +33,7 @@
 #include "../../featurise/json.h"
 #include "../../featurise/jsmath.h"
 #include "../../featurise/zstd.h"
+#include "yaml.h"
 #include "contig.h"
 #include "selection.h"
 #include "conditions.h"
@@ -1275,7 +1276,7 @@ int run(int argc, char** argv) {
   using rfd4p::bbCaSchedule;
   using rfd4p::latentSchedule;
   using rfd4p::CENTERING_SCALE;
-  string out, specPath, weightsDir, configPath, int8Dir, dumpCif;
+  string out, specPath, weightsDir, configPath, int8Dir, dumpCif, exampleId, ccdFile;
   int splitAt = 0;
   bool realize = false, atomize = false, unannotated = false;
   string contigStr, selectStr, condJson;
@@ -1287,6 +1288,8 @@ int run(int argc, char** argv) {
     const string a = argv[i];
     if (a.rfind("--", 0) != 0) { out = a; continue; }
     if (!a.compare(0, 7, "--spec=")) specPath = a.substr(7);
+    else if (!a.compare(0, 10, "--example=")) exampleId = a.substr(10);
+    else if (!a.compare(0, 6, "--ccd=")) ccdFile = a.substr(6);
     else if (!a.compare(0, 10, "--weights=")) weightsDir = a.substr(10);
     else if (!a.compare(0, 7, "--int8=")) int8Dir = a.substr(7);
     else if (!a.compare(0, 11, "--dump-cif=")) dumpCif = a.substr(11);
@@ -1781,6 +1784,7 @@ int run(int argc, char** argv) {
   // token and per input atom - see `outputTables` below.
   std::map<string, vector<int>> outputInts;
   string inputPath;
+  vector<string> inputPaths;
   bool asAnnotatedCif = false, specMode = false;
   int nsteps = 60;
   if (length) {
@@ -1793,9 +1797,81 @@ int run(int argc, char** argv) {
     size_t got;
     while ((got = fread(buf, 1, sizeof buf, f)) > 0) job.append(buf, got);
     fclose(f);
-    const Json spec = parseJson(job);
-    const Json* inputKey = spec.get("input");
-    const bool hasInput = inputKey && inputKey->isString();
+    // YAML or JSON, as upstream's specs are written in either (yaml.h is the page's reader).
+    Json parsed;
+    try {
+      parsed = rfd4p::yaml::parseSpec(job);
+    } catch (const std::exception& e) {
+      fprintf(stderr, "%s: %s\n", specPath.c_str(), e.what());
+      return 1;
+    }
+    // 🔴 A SPEC FILE IS EXAMPLES BY NAME, AS UPSTREAM'S IS (`split_global_args`: `global_args`
+    // folded into each, an example's own value winning); this port's flat job - an `input` or a
+    // `contig` at the top - is the one-example case. Several need `--example=`.
+    const bool flat = parsed.isObject() && (parsed.get("input") || parsed.get("contig"));
+    Json spec;
+    {
+      if (!parsed.isObject()) { fprintf(stderr, "A condition spec must be a mapping.\n"); return 1; }
+      vector<std::pair<string, Json>> examples;
+      if (flat) {
+        examples.push_back({"job", parsed});
+      } else {
+        const Json* globals = parsed.get("global_args");
+        if (globals && !globals->isObject()) {
+          fprintf(stderr, "condition_spec `global_args` must be a mapping.\n");
+          return 1;
+        }
+        for (const auto& [k, v] : parsed.o) {
+          if (k == "global_args") continue;
+          if (!v.isObject()) {
+            fprintf(stderr, "condition_spec examples must be mappings; invalid entries: %s.\n", k.c_str());
+            return 1;
+          }
+          Json merged = globals ? *globals : Json{};
+          merged.kind = Json::Object;
+          for (const auto& [ek, ev] : v.o) rfd4p::yaml::put(merged, ek, ev);
+          examples.push_back({k, merged});
+        }
+      }
+      if (examples.empty()) { fprintf(stderr, "Condition spec contains no examples.\n"); return 1; }
+      string names;
+      for (const auto& [k, v] : examples) names += (names.empty() ? "" : ", ") + k;
+      const std::pair<string, Json>* chosen = nullptr;
+      for (const auto& e : examples) if (e.first == exampleId) chosen = &e;
+      if (!exampleId.empty() && !chosen) {
+        fprintf(stderr, "no example '%s' in %s; it has %s\n", exampleId.c_str(), specPath.c_str(), names.c_str());
+        return 1;
+      }
+      if (exampleId.empty() && examples.size() > 1) {
+        fprintf(stderr, "%s has %zu examples (%s); name one with --example=\n", specPath.c_str(), examples.size(), names.c_str());
+        return 1;
+      }
+      if (!chosen) chosen = &examples[0];
+      spec = chosen->second;
+      // Upstream's four fields and no others, for a spec in upstream's shape: a typo'd one applies
+      // nothing (`build_annotated_atom_array_from_condition_spec`).
+      if (!flat) {
+        vector<string> unknown;
+        for (const auto& [k, v] : spec.o) {
+          if (k != "input" && k != "input_as_annotated_cif" && k != "contig" && k != "conditions") unknown.push_back(k);
+        }
+        std::sort(unknown.begin(), unknown.end());
+        if (!unknown.empty()) {
+          string list;
+          for (const string& u : unknown) list += (list.empty() ? "\"" : ", \"") + u + "\"";
+          fprintf(stderr, "%s: unrecognized condition_spec field(s) [%s]. Recognized fields: "
+                          "[\"conditions\", \"contig\", \"input\", \"input_as_annotated_cif\"].\n",
+                  chosen->first.c_str(), list.c_str());
+          return 1;
+        }
+      }
+    }
+    const Json* inputKey = nullptr;
+    for (const char* k : {"input", "cifUrl", "inputCif", "input_cif"}) {
+      const Json* v = spec.get(k);
+      if (!inputKey && !Json::absent(v)) inputKey = v;
+    }
+    const bool hasInput = inputKey != nullptr;
     // 🔴 A CONTIG IS REQUIRED ONLY WITHOUT AN INPUT. A spec that names a structure and no
     // contig means "take the whole structure"; the reference leaves `originalResId` as the
     // input's own numbering and carries on. Demanding one here refused a job the reference
@@ -1809,9 +1885,14 @@ int run(int argc, char** argv) {
     for (const char* k : {"recycleSchedule", "recycle_schedule"}) {
       if (!Json::absent(spec.get(k))) recycleSchedule = spec.get(k)->s;
     }
-    for (const char* k : {"input", "inputCif", "input_cif"}) {
-      const Json* v = spec.get(k);
-      if (v && v->isString()) inputPath = v->s;
+    // `input` is a path or a list of them, and a relative one is the SPEC's (upstream's
+    // `_resolve_input_path`), not the working directory's.
+    if (inputKey) {
+      const string specDir = specPath.find('/') == string::npos ? string(".") : specPath.substr(0, specPath.rfind('/'));
+      auto resolved = [&](const string& p) { return !p.empty() && p[0] == '/' ? p : specDir + "/" + p; };
+      if (inputKey->isString()) inputPaths.push_back(resolved(inputKey->s));
+      else if (inputKey->isArray()) for (const Json& p : inputKey->a) if (p.isString()) inputPaths.push_back(resolved(p.s));
+      if (!inputPaths.empty()) inputPath = inputPaths[0];
     }
     // 🔴 A JOB IS A SPEC, AS UPSTREAM'S CONDITION SPEC IS, unless it says `specMode: false`.
     // This defaulted to "the structure is the job" whenever there was an input - the file's own
@@ -1896,16 +1977,47 @@ int run(int argc, char** argv) {
   Batch b;
   {
     rfd4p::atoms::AtomArray src;
-    if (!inputPath.empty()) {
-    bool opened = false;
-    const string cifText = lf::zstd::readTextOrCompressed(inputPath, &opened);
-    if (!opened) { fprintf(stderr, "no %s\n", inputPath.c_str()); return 1; }
-    // `specMode: false` is the structure as the job: annotations KEPT, contig and conditions
-    // IGNORED - which is how a page preset runs, its contig being written in the original
-    // entry's numbering. Otherwise it is a spec: the annotations kept only under
-    // `input_as_annotated_cif`, the arginines re-labelled without it, and the contig and
-    // conditions applied. Reading one as the other gave 116 tokens where the exporter gives 183.
-    src = rfd4p::atoms::fromCif(cifText, specMode ? asAnnotatedCif : true);
+    if (!inputPaths.empty()) {
+      // `specMode: false` is the structure as the job: annotations KEPT, contig and conditions
+      // IGNORED - which is how a page preset runs, its contig being written in the original
+      // entry's numbering. Otherwise it is a spec: the annotations kept only under
+      // `input_as_annotated_cif`, and without it the file is a RAW structure, prepared as upstream
+      // prepares one (fresh.h) with its non-standard components' dictionary entries fetched.
+      if (!specMode && inputPaths.size() > 1) {
+        fprintf(stderr, "specMode: false takes one structure as the job; this one names several\n");
+        return 1;
+      }
+      const bool annotated = specMode ? asAnnotatedCif : true;
+      vector<rfd4p::atoms::AtomArray> parts;
+      for (const string& path : inputPaths) {
+        bool opened = false;
+        const string cifText = lf::zstd::readTextOrCompressed(path, &opened);
+        if (!opened) { fprintf(stderr, "no %s\n", path.c_str()); return 1; }
+        const vector<rfd4p::cif::Block> ccdBlocks =
+            annotated ? vector<rfd4p::cif::Block>{} : rfd4p::fresh::ccdBlocksForRawStructure(cifText, ccdFile);
+        parts.push_back(rfd4p::atoms::fromCif(cifText, annotated, ccdBlocks));
+      }
+      if (parts.size() == 1) {
+        src = std::move(parts[0]);
+      } else {
+        // `load_condition_spec_inputs` over several files: one chain id may come from one file.
+        std::map<string, string> seen;
+        for (size_t k = 0; k < parts.size(); ++k) {
+          std::set<string> chains(parts[k].site.chainId.begin(), parts[k].site.chainId.end());
+          for (const string& c : chains) {
+            if (seen.count(c)) {
+              fprintf(stderr, "chain_id '%s' appears in both '%s' and '%s' -- condition_spec does not auto-rename "
+                              "colliding chain ids across input files; rename one of them so `contig` selections stay "
+                              "unambiguous.\n", c.c_str(), seen[c].c_str(), inputPaths[k].c_str());
+              return 1;
+            }
+            seen[c] = inputPaths[k];
+          }
+        }
+        rfd4p::conditions::separateCoordinateGroups(parts);
+        src = rfd4p::atoms::concat(parts);
+        src.ids = rfd4p::cif::computeIds(src.site, src.bonds);
+      }
     }
     vector<int> originalResId = src.site.resId;
     // Without an input the job IS its spec, whatever `specMode` says: an empty structure with

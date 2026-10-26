@@ -118,12 +118,6 @@ export const STD_RESIDUE_BONDS = {
   DT: [["C1'",'N1',1],['C2','N3',1],['C2','O2',2],["C2'","C1'",1],["C3'","C2'",1],["C3'","O3'",1],['C4','C5',1],['C4','O4',2],["C4'","C3'",1],["C4'","O4'",1],['C5','C6',2],['C5','C7',1],["C5'","C4'",1],['N1','C2',1],['N1','C6',1],['N3','C4',1],["O4'","C1'",1],["O5'","C5'",1],['OP3','P',1],['P',"O5'",1],['P','OP1',2],['P','OP2',1]],
 };
 
-export const STD_RESIDUE_CHARGES = {
-  ARG: { NH2: 1 },
-  HIS: { ND1: 1 },
-  LYS: { NZ: 1 },
-};
-
 export const STD_RESIDUE_AROMATIC = {
   HIS: new Set(['CG', 'ND1', 'CD2', 'CE1', 'NE2']),
   PHE: new Set(['CG', 'CD1', 'CD2', 'CE1', 'CE2', 'CZ']),
@@ -647,8 +641,10 @@ export function buildBondsForAtomArray(atoms, cifBlock = null, customBondDict = 
     const useTid = hasTid && sc.ptnr1_transformation_id && sc.ptnr2_transformation_id;
 
     for (let row = 0; row < nRows; row++) {
+      // `add_bond_types_from_struct_conn=("covale", "metalc")` in both of upstream's presets: a
+      // metal's coordination is a bond there (retyped to COORDINATION below), and was dropped here.
       const connType = sc.conn_type_id[row];
-      if (connType !== 'covale') continue;
+      if (connType !== 'covale' && connType !== 'metalc') continue;
       if (sc.ptnr1_symmetry && sc.ptnr1_symmetry[row] !== '1_555') continue;
       if (sc.ptnr2_symmetry && sc.ptnr2_symmetry[row] !== '1_555') continue;
 
@@ -906,12 +902,16 @@ export function mergeCcdIntoBlock(cifBlock, blocks) {
 }
 
 export function parseCifToAtomArray(cifInput, opts = {}) {
-  const rawText = decodeTextOrZstd(cifInput);
-  const cifText =
-    !rawText.includes('_atom_site.') && /(?:^|\n)(?:ATOM  |HETATM)/.test(rawText)
-      ? pdbTextToCifText(rawText)
-      : rawText;
-  const block = parseCifBlock(cifText);
+  // A parsed block is taken as it is (fresh.js hands one over); text or bytes are read here.
+  let block;
+  let fromPdb = false;
+  if (opts.block) {
+    block = opts.block;
+  } else {
+    const rawText = decodeTextOrZstd(cifInput);
+    fromPdb = !rawText.includes('_atom_site.') && /(?:^|\n)(?:ATOM  |HETATM)/.test(rawText);
+    block = parseCifBlock(fromPdb ? pdbTextToCifText(rawText) : rawText);
+  }
   // Fetched Chemical Component Dictionary entries (`ccd.js`) for components the file carries no tables for.
   if (opts.ccdBlocks?.size) mergeCcdIntoBlock(block, opts.ccdBlocks);
   const atomSite = block.atom_site;
@@ -921,21 +921,30 @@ export function parseCifToAtomArray(cifInput, opts = {}) {
 
   const nRows = (atomSite.label_atom_id || atomSite.auth_atom_id || []).length;
 
-  // Filter model=1 and altloc="first"
+  // The first model, and atomworks' `altloc="first"`: per chain, the alphabetically first
+  // alternate-location LETTER, with every atom that has none. An atom whose only conformer is
+  // another letter is dropped, and a non-letter location (`1`, `2`) is never chosen - both
+  // upstream's, where this kept the first conformer of each ATOM in file order.
   const modelNums = atomSite.pdbx_PDB_model_num;
   const firstModelNum = modelNums && modelNums.length > 0 ? modelNums[0] : null;
   const altIds = atomSite.label_alt_id;
-
+  const isDefaultAlt = (alt) => alt === undefined || alt === '.' || alt === '?' || alt === ' ' || alt === '';
+  const chainOf = (i) => atomSite.label_asym_id?.[i] || atomSite.auth_asym_id?.[i] || 'A';
+  const chosenAlt = new Map();
+  if (altIds) {
+    for (let i = 0; i < nRows; i++) {
+      if (firstModelNum !== null && modelNums[i] !== firstModelNum) continue;
+      const alt = altIds[i];
+      if (isDefaultAlt(alt) || !/^[A-Za-z]+$/.test(alt)) continue;
+      const cur = chosenAlt.get(chainOf(i));
+      if (cur === undefined || alt < cur) chosenAlt.set(chainOf(i), alt);
+    }
+  }
   const selectedRows = [];
-  const seenAltAtomKeys = new Set();
   for (let i = 0; i < nRows; i++) {
     if (firstModelNum !== null && modelNums[i] !== firstModelNum) continue;
     const alt = altIds ? altIds[i] : '.';
-    if (alt !== '.' && alt !== '?' && alt !== '') {
-      const key = `${atomSite.label_asym_id?.[i]}_${atomSite.label_seq_id?.[i]}_${atomSite.auth_seq_id?.[i]}_${atomSite.label_comp_id?.[i]}_${atomSite.label_atom_id?.[i]}`;
-      if (seenAltAtomKeys.has(key)) continue;
-      seenAltAtomKeys.add(key);
-    }
+    if (!isDefaultAlt(alt) && alt !== chosenAlt.get(chainOf(i))) continue;
     selectedRows.push(i);
   }
 
@@ -953,21 +962,21 @@ export function parseCifToAtomArray(cifInput, opts = {}) {
     }
   }
 
-  // Extract _chem_comp_atom metadata (charge, aromatic, leaving)
-  const ccaChargeMap = new Map();
+  // Extract _chem_comp_atom metadata (aromatic, leaving)
   const ccaAromMap = new Map();
   const ccaLeavingMap = new Map();
   if (block.chem_comp_atom && block.chem_comp_atom.comp_id) {
     const cids = block.chem_comp_atom.comp_id;
     const aids = block.chem_comp_atom.atom_id;
-    const chgs = block.chem_comp_atom.charge;
     const aroms = block.chem_comp_atom.pdbx_aromatic_flag;
     const leavs = block.chem_comp_atom.pdbx_leaving_atom_flag;
     for (let i = 0; i < cids.length; i++) {
       const key = `${cids[i]}:${aids[i]}`;
-      if (chgs) ccaChargeMap.set(key, safeInt(chgs[i], 0));
-      if (aroms) ccaAromMap.set(key, aroms[i] === 'Y');
-      if (leavs) ccaLeavingMap.set(key, leavs[i] === 'Y');
+      // An unset flag says nothing: a raw RCSB file's `_chem_comp_atom` has no flag columns, and a
+      // fetched entry merged into it pads them with '?' - which read as "not leaving" took every
+      // terminal OXT's flag away.
+      if (aroms && (aroms[i] === 'Y' || aroms[i] === 'N')) ccaAromMap.set(key, aroms[i] === 'Y');
+      if (leavs && (leavs[i] === 'Y' || leavs[i] === 'N')) ccaLeavingMap.set(key, leavs[i] === 'Y');
     }
   }
 
@@ -1036,7 +1045,9 @@ export function parseCifToAtomArray(cifInput, opts = {}) {
     atoms.chain_id[k] = atomSite.label_asym_id?.[r] || atomSite.auth_asym_id?.[r] || 'A';
     atoms.label_entity_id[k] = safeInt(atomSite.label_entity_id?.[r], 0);
     atoms.res_id[k] = safeInt(atomSite.label_seq_id?.[r], -1);
-    const ins = atomSite.pdbx_PDB_ins_code?.[r];
+    // atomworks reads no insertion code from an mmCIF (`ins_code[:] = ""`): a CIF numbers its
+    // residues uniquely in `label_seq_id`. A PDB file's is kept, since there it is the numbering.
+    const ins = fromPdb ? atomSite.pdbx_PDB_ins_code?.[r] : '';
     atoms.ins_code[k] = ins === '.' || ins === '?' || !ins ? '' : ins;
     atoms.auth_seq_id[k] = safeInt(atomSite.auth_seq_id?.[r], atoms.res_id[k]);
     atoms.atom_id[k] = safeInt(atomSite.id?.[r], k + 1);
@@ -1050,15 +1061,12 @@ export function parseCifToAtomArray(cifInput, opts = {}) {
     ];
 
     const ccaKey = `${atoms.res_name[k]}:${atoms.atom_name[k]}`;
-    let chg = safeInt(atomSite.pdbx_formal_charge?.[r], 0);
-    if (chg === 0) {
-      if (ccaChargeMap.has(ccaKey)) {
-        chg = ccaChargeMap.get(ccaKey);
-      } else if (STD_RESIDUE_CHARGES[atoms.res_name[k]]?.[atoms.atom_name[k]] !== undefined) {
-        chg = STD_RESIDUE_CHARGES[atoms.res_name[k]][atoms.atom_name[k]];
-      }
-    }
-    atoms.charge[k] = chg;
+    // 🔴 THE FILE'S CHARGE, AND NOTHING ELSE. This filled a blank one from the file's own
+    // `_chem_comp_atom` and then from a table of standard-residue charges (LYS NZ +1, HIS ND1
+    // +1, ...); upstream's annotated reader keeps the column as written, so a raw RCSB file read
+    // as annotated took 13-69 charges atomworks does not give it. A raw structure's charges are
+    // the dictionary's, and fresh.js writes them in explicitly.
+    atoms.charge[k] = safeInt(atomSite.pdbx_formal_charge?.[r], 0);
     atoms.is_aromatic[k] = ccaAromMap.has(ccaKey)
       ? ccaAromMap.get(ccaKey)
       : Boolean(STD_RESIDUE_AROMATIC[atoms.res_name[k]]?.has(atoms.atom_name[k]));

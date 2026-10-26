@@ -124,7 +124,10 @@ for port in "${ports[@]}"; do
   # (and the weight walks in cuda/featurise, which af3 and af2 include)
   # (msap is built on cuda/ef2's kernels, so their headers are its sources too; it links no featuriser)
   # (bioemu2 is built on them too, and links the featuriser: `localfold-bioemu2 --job=...`)
-  extra=(); link=("$sobj"); [ "$port" != msap ] || { extra=("$here"/ef2/src/*.cuh); link=(); }
+  # (the object a port links, and the stamp file that says it is the current one: the link waits
+  # for that stamp, so a featuriser compiling beside it is never linked half-built or stale)
+  extra=(); link=("$sobj"); linkstamp="$sobj.stamp"; linkwant="$fstamp"
+  [ "$port" != msap ] || { extra=("$here"/ef2/src/*.cuh); link=(); }
   [ "$port" != bioemu2 ] || extra=("$here"/ef2/src/*.cuh)
   # (rfd4p is built on cuda/ef2's ops and cuda/af3's flash, and links its OWN featuriser object -
   # cuda/rfd4p/featurise, whose pipeline shares nothing with AF3's - so `--job=<spec>` featurises
@@ -138,7 +141,7 @@ for port in "${ports[@]}"; do
   # in three more.
   [ "$port" != rfd4p ] || { extra=("$here"/ef2/src/*.cuh "$here"/rfd4p/featurise/*.cpp \
     "$here"/rfd4p/featurise/*.h "$here"/rfd4p/featurise/*.inc); \
-    link=("$here/rfd4p/featurise/featurise.o"); }
+    link=("$here/rfd4p/featurise/featurise.o"); linkstamp="$rfbin.stamp"; linkwant="$rfstamp"; }
   stamp="$arch ${LOCALFOLD_RPATH:-} $(cat "$here/$port"/src/*.cu* "${extra[@]}" "$here"/af3/src/*.cuh "$here"/plm/*.cuh "$here"/featurise/*.h "$here"/featurise/*.inc "$here"/featurise/*.cpp | sha256sum | cut -c1-16)"
   if [ -x "$out" ] && [ "$(cat "$out.arch" 2>/dev/null)" = "$stamp" ]; then continue; fi
   # (-O1: nvcc's -O is the HOST code's level - the device code is optimised either way, its SASS byte-identical
@@ -146,8 +149,10 @@ for port in "${ports[@]}"; do
   # (compiled to an object while standalone.o builds, then linked once it has)
   ( cd "$here/$port" && $prio nvcc -O1 -std=c++17 $archflags --split-compile 0 --default-stream per-thread $fast -c src/$port.cu \
       -o "$out.o" >> "$log" 2>&1 \
-    && until [ ${#link[@]} = 0 ] || [ "$(cat "$sobj.stamp" 2>/dev/null)" = "$fstamp" ]; do
-         [ "$(cat "$sobj.stamp" 2>/dev/null)" != failed ] || { echo "FAILED $port: no standalone object" >> "$log"; exit 1; }; sleep 1; done \
+    && until [ ${#link[@]} = 0 ] || [ "$(cat "$linkstamp" 2>/dev/null)" = "$linkwant" ]; do
+         [ "$(cat "$linkstamp" 2>/dev/null)" != failed ] || { echo "FAILED $port: no featuriser object" >> "$log"; exit 1; }
+         grep -q "FAILED rfd4p-featurise" "$log" 2>/dev/null && [ "$port" = rfd4p ] && { echo "FAILED $port: no featuriser object" >> "$log"; exit 1; }
+         sleep 1; done \
     && nvcc $archflags "$out.o" "${link[@]}" -lcublas -lcublasLt -ldl "${rpath[@]}" -o "$out.building" >> "$log" 2>&1 \
     && rm -f "$out.o" && mv "$out.building" "$out" && echo "$stamp" > "$out.arch" && echo "built $port for $arch" >> "$log" \
     || { echo "FAILED $port for $arch" >> "$log"; exit 1; } ) &

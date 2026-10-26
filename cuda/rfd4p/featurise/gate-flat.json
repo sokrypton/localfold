@@ -1,1 +1,1 @@
-{"input":"web/examples/ppi_pdl1.cif.zst","contig":"B2-40,/0,24-24","conditions":{"C_SEQ":{"true":[{"select":"sel('B/*/[2-10]/*')"}]}},"nsteps":4}
+{"input":"../../../web/examples/ppi_pdl1.cif.zst","contig":"B2-40,/0,24-24","conditions":{"C_SEQ":{"true":[{"select":"sel('B/*/[2-10]/*')"}]}},"nsteps":4}

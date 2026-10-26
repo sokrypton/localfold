@@ -25,7 +25,6 @@ export const MASKED = Object.freeze("<M>");
 export const PYRIMIDINE_RESIDUES = Object.freeze(["C","U","DC","DT"]);
 export const PURINE_RESIDUES = Object.freeze(["A","G","DA","DG"]);
 export const TIP_ATOM_NAMES = Object.freeze({"ALA":["CB"],"ARG":["NH1","NH2"],"ASN":["OD1","ND2"],"ASP":["OD1","OD2"],"CYS":["SG"],"GLN":["OE1","NE2"],"GLU":["OE1","OE2"],"GLY":["CA"],"HIS":["CE1","NE2"],"ILE":["CD1"],"LEU":["CD1","CD2"],"LYS":["NZ"],"MET":["CE"],"PHE":["CZ"],"PRO":["CD","CG"],"SER":["OG"],"THR":["OG1","CG2"],"TRP":["CH2"],"TYR":["OH"],"VAL":["CG1","CG2"]});
-export const METAL_ELEMENTS = Object.freeze(["AC","AG","AL","AM","AU","BA","BE","BI","BK","CA","CD","CE","CF","CM","CO","CR","CS","CU","DY","ER","ES","EU","FE","FM","FR","GA","GD","HF","HG","HO","IN","IR","K","LA","LI","LR","LU","MD","MG","MN","MO","NA","NB","ND","NI","NO","NP","OS","PA","PB","PD","PM","PR","PT","PU","RA","RB","RE","RH","RU","SC","SM","SN","SR","TA","TB","TC","TH","TI","TL","TM","U","V","W","Y","YB","ZN","ZR"]);
 export const CHAIN_TYPE = Object.freeze({"CYCLIC_PSEUDO_PEPTIDE":0,"OTHER_POLYMER":1,"PEPTIDE_NUCLEIC_ACID":2,"DNA":3,"DNA_RNA_HYBRID":4,"POLYPEPTIDE_D":5,"POLYPEPTIDE_L":6,"RNA":7,"BRANCHED":10,"MACROLIDE":11,"NON_POLYMER":8,"WATER":9});
 export const PROTEIN_CHAIN_TYPES = Object.freeze([0,5,6]);
 export const NUCLEIC_CHAIN_TYPES = Object.freeze([3,4,7]);

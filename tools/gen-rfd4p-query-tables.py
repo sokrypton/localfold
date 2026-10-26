@@ -53,7 +53,6 @@ def tables() -> dict:
         "PYRIMIDINE_RESIDUES": list(K.STANDARD_PYRIMIDINE_RESIDUES),
         "PURINE_RESIDUES": list(K.STANDARD_PURINE_RESIDUES),
         "TIP_ATOM_NAMES": {k: list(v) for k, v in K.STANDARD_AA_TIP_ATOM_NAMES.items()},
-        "METAL_ELEMENTS": sorted(K.METAL_ELEMENTS),
         "CHAIN_TYPE": {c.name: int(c.value) for c in ChainType},
         "PROTEIN_CHAIN_TYPES": sorted(int(c) for c in ChainType.get_proteins()),
         "NUCLEIC_CHAIN_TYPES": sorted(int(c) for c in ChainType.get_nucleic_acids()),

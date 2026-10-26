@@ -11,6 +11,7 @@
 #pragma once
 #include "chirality.h"
 #include "cif.h"
+#include "fresh.h"
 #include <type_traits>
 
 namespace rfd4p {
@@ -312,9 +313,50 @@ inline AtomArray concat(const vector<AtomArray>& parts) {
 }
 
 /** Everything `parseCifToAtomArray` produces, in one object. */
-inline AtomArray fromCif(const string& text, bool asAnnotatedCif = true) {
+/**
+ * `mergeCcdIntoBlock`: fetched dictionary entries' `_chem_comp_atom` and `_chem_comp_bond` rows
+ * appended to the structure's own, every column any of them has, `?` where one lacks it.
+ */
+inline void mergeCcdIntoBlock(cif::Block& block, const vector<cif::Block>& ccdBlocks) {
+  for (const char* cat : {"chem_comp_atom", "chem_comp_bond"}) {
+    vector<const std::map<string, vector<string>>*> parts;
+    for (const cif::Block& b : ccdBlocks) {
+      auto it = b.find(cat);
+      if (it != b.end() && !it->second.empty() && !it->second.begin()->second.empty()) parts.push_back(&it->second);
+    }
+    if (parts.empty()) continue;
+    std::map<string, vector<string>> base;
+    if (block.count(cat)) base = block[cat];
+    vector<const std::map<string, vector<string>>*> sources{&base};
+    sources.insert(sources.end(), parts.begin(), parts.end());
+    std::set<string> cols;
+    for (const auto* src : sources) for (const auto& [c, v] : *src) cols.insert(c);
+    std::map<string, vector<string>> out;
+    for (const string& c : cols) out[c];
+    for (const auto* src : sources) {
+      size_t rows = 0;
+      for (const auto& [c, v] : *src) rows = std::max(rows, v.size());
+      for (size_t r = 0; r < rows; ++r) {
+        for (const string& c : cols) {
+          auto it = src->find(c);
+          out[c].push_back(it != src->end() && r < it->second.size() ? it->second[r] : string("?"));
+        }
+      }
+    }
+    block[cat] = out;
+  }
+}
+
+/**
+ * `loadConditionSpecInput` for one file. With `asAnnotatedCif` the file is read as written; without,
+ * it is a RAW structure and is prepared as upstream prepares one (fresh.h) before it is read, its
+ * non-standard components completed from `ccdBlocks`.
+ */
+inline AtomArray fromCif(const string& text, bool asAnnotatedCif = true, const vector<cif::Block>& ccdBlocks = {}) {
   AtomArray a;
-  const cif::Block block = cif::parseBlock(text);
+  cif::Block block = cif::parseBlock(text);
+  if (!asAnnotatedCif) block = fresh::prepareFreshBlock(block, ccdBlocks);
+  mergeCcdIntoBlock(block, ccdBlocks);
   a.site = cif::readAtomSite(block);
   cif::deriveChemistry(a.site, block);
   a.ann = cif::readAnnotations(a.site, block, a.site.selected);

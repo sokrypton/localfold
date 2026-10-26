@@ -31,9 +31,12 @@
 // disagree - the duplicate cannot go stale in silence.
 import { readFileSync, writeFileSync, mkdirSync, openSync, writeSync, closeSync, renameSync } from "node:fs";
 import { buildBatch, decodeTextOrZstd } from "../../shared/rfd4p/pipeline/index.js";
+import { ccdBlocksForRawStructure } from "../../shared/rfd4p/pipeline/ccd.js";
+import { CONDITION_SPEC_EXAMPLE_KEYS, conditionSpecExamples } from "../../shared/rfd4p/pipeline/spec.js";
 import { getTokenStarts } from "../../shared/rfd4p/pipeline/bonds.js";
 import { getRfd4pPresetById } from "../../shared/rfd4p/presets.js";
 import { parseConditionSpecYaml } from "../../shared/rfd4p/pipeline/spec.js";
+import { dirname, isAbsolute, resolve } from "node:path";
 import {
   ALLOWED_RESIDUE_TYPES, ATOM37_NAMES, UNIFIED_ATOM37_ENCODING, UNIFIED_ATOM37_TOKENS,
   UNIFIED_RESTYPE_ATOM37_MASK,
@@ -89,19 +92,55 @@ const nn = cfg.nn;
 // step count) is driven by the file rather than by a name compiled into presets.js. Without it
 // this port could only ever run the ten examples.
 const specPath = option("spec", "");
+const exampleId = option("example", undefined);
 const preset = specPath
   ? (() => {
       const text = readFileSync(specPath, "utf8");
-      const job = text.trimStart().startsWith("{") ? JSON.parse(text) : parseConditionSpecYaml(text);
+      const parsed = text.trimStart().startsWith("{") ? JSON.parse(text) : parseConditionSpecYaml(text);
+      // 🔴 A SPEC FILE IS EXAMPLES BY NAME, AS UPSTREAM'S IS (`global_args` folded into each); this
+      // port's own flat job is the one-example case. Several examples need `--example=`.
+      let examples;
+      try {
+        examples = conditionSpecExamples(parsed);
+      } catch (err) {
+        console.error(`${specPath}: ${err.message}`);
+        process.exit(1);
+      }
+      const names = Object.keys(examples);
+      if (exampleId !== undefined && !examples[exampleId]) {
+        console.error(`no example '${exampleId}' in ${specPath}; it has ${names.join(", ")}`);
+        process.exit(1);
+      }
+      if (exampleId === undefined && names.length > 1) {
+        console.error(`${specPath} has ${names.length} examples (${names.join(", ")}); name one with --example=`);
+        process.exit(1);
+      }
+      const name = exampleId ?? names[0];
+      const job = examples[name];
+      // A spec in upstream's shape carries upstream's four fields and no others: a typo'd one
+      // applies nothing, so it is refused (`build_annotated_atom_array_from_condition_spec`).
+      const flat = "input" in parsed || "contig" in parsed;
+      const unknown = flat ? [] : Object.keys(job).filter((k) => !CONDITION_SPEC_EXAMPLE_KEYS.includes(k)).sort();
+      if (unknown.length) {
+        console.error(`${name}: unrecognized condition_spec field(s) ${JSON.stringify(unknown)}. `
+          + `Recognized fields: ${JSON.stringify([...CONDITION_SPEC_EXAMPLE_KEYS].sort())}.`);
+        process.exit(1);
+      }
       if (!job.contig && !job.input) {
         console.error(`${specPath} has neither a contig nor an input`);
         process.exit(1);
       }
+      // A relative `input` is the spec file's, as upstream resolves one (`_resolve_input_path`).
+      const specDir = dirname(resolve(specPath));
+      const listed = job.input ?? job.cifUrl ?? job.inputCif ?? job.input_cif;
+      const inputs = listed === undefined || listed === null ? null
+        : (Array.isArray(listed) ? listed : [listed]).map((p) => (isAbsolute(p) ? p : resolve(specDir, p)));
       return {
-        id: job.id ?? "job",
+        id: name === "job" ? (job.id ?? "job") : name,
         contig: job.contig,
         conditions: job.conditions,
-        cifUrl: job.cifUrl ?? job.input ?? null,
+        inputs,
+        cifUrl: inputs?.[0] ?? null,
         // A job is a spec unless it says `specMode: false` - see featurise.cpp's note; the
         // file's annotations are kept only under `input_as_annotated_cif`.
         specMode: job.specMode ?? true,
@@ -132,12 +171,14 @@ if (!preset) { console.error(`no preset ${presetId}`); process.exit(1); }
 // "Preserved segment 'A52-71' matched no atoms". The structure IS the job.
 const fromAnnotations = !length && preset.cifUrl !== null && preset.cifUrl !== undefined
   && (preset.fromJobFile ? preset.specMode === false : preset.specMode !== true);
-let inputCif;
-if (!length && preset.cifUrl) {
-  // An absolute path is the file; a relative one is the checkout's, as the page's preset URLs are.
-  const bytes = readFileSync(preset.cifUrl.startsWith("/") ? preset.cifUrl
-    : `${repo}${preset.cifUrl.replace(/^\.\//, "")}`);
-  inputCif = decodeTextOrZstd(new Uint8Array(bytes));
+// A preset names its structure in the checkout, as the page's preset URLs are; a job file names
+// its own, already resolved above.
+const inputPaths = length ? [] : (preset.inputs
+  ?? (preset.cifUrl ? [preset.cifUrl.startsWith("/") ? preset.cifUrl : `${repo}${preset.cifUrl.replace(/^\.\//, "")}`] : []));
+const inputCif = inputPaths.length ? decodeTextOrZstd(new Uint8Array(readFileSync(inputPaths[0]))) : undefined;
+if (fromAnnotations && inputPaths.length > 1) {
+  console.error("specMode: false takes one structure as the job; this one names several");
+  process.exit(1);
 }
 // `--length=N` is one unconditioned protein segment of N residues, for sizing and timing: the trunk's
 // cost is a function of the token count and nothing in the conditioning changes a single shape.
@@ -147,10 +188,19 @@ const spec = length
     contig: preset.contig,
     ...(preset.conditions === undefined ? {} : { conditions: preset.conditions }),
     ...(preset.inputAsAnnotatedCif ? { input_as_annotated_cif: true } : {}),
+    ...(inputPaths.length ? { input: inputPaths } : {}),
   };
+// A raw structure is PREPARED (pipeline/fresh.js), and its non-standard components need their
+// dictionary entries - fetched as the page fetches them.
+const ccdBlocks = new Map();
+if (!fromAnnotations && !preset.inputAsAnnotatedCif) {
+  for (const path of inputPaths) {
+    for (const [id, block] of await ccdBlocksForRawStructure(readFileSync(path))) ccdBlocks.set(id, block);
+  }
+}
 const built = fromAnnotations
   ? buildBatch(inputCif, { seed })
-  : buildBatch(spec, { seed, ...(inputCif === undefined ? {} : { inputCif }) });
+  : buildBatch(spec, { seed, ccdBlocks, loadInput: (path) => readFileSync(path) });
 const { batch, n } = built;
 // The per-token naming an input structure supplies, for the writer at the far end.
 const outNaming = (() => {

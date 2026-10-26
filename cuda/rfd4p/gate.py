@@ -149,6 +149,29 @@ def write_nucleic_ss_case(cif: Path, job: Path) -> None:
     job.write_text(json.dumps({"input": str(cif), "nsteps": 4, "input_as_annotated_cif": True}))
 
 
+def write_relabelled_case(src: Path, dst: Path, job: Path) -> None:
+    """A two-file job: 6MRR and a copy of it whose chains are Y and Z, so the multi-input path
+    (one chain id per file, coordinate groups renumbered, ids re-derived) has something to join."""
+    import zstandard
+
+    text = zstandard.ZstdDecompressor().decompressobj().decompress(src.read_bytes()).decode()
+    lines = text.split("\n")
+    heads = [ln.strip() for ln in lines if ln.startswith("_atom_site.")]
+    cols = [h.split(".", 1)[1] for h in heads]
+    swap = {"A": "Y", "B": "Z"}
+    out = []
+    for ln in lines:
+        if ln.startswith(("ATOM", "HETATM")):
+            f = ln.split()
+            for c in ("label_asym_id", "auth_asym_id"):
+                f[cols.index(c)] = swap.get(f[cols.index(c)], f[cols.index(c)])
+            ln = " ".join(f)
+        out.append(ln)
+    dst.write_text("\n".join(out))
+    job.write_text(json.dumps({"input": [str(src), str(dst)], "contig": "A1-68, /0, Y1-40",
+                               "conditions": {"C_CRD": {"true": [{"select": "sel('Y')"}]}}, "nsteps": 4}))
+
+
 def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
     return subprocess.run([str(c) for c in cmd], capture_output=True, text=True, **kw)
 
@@ -520,6 +543,24 @@ def main() -> int:
             nss = HERE / "featurise" / "gate-nucleic-ss.json"
             write_nucleic_ss_case(HERE / "featurise" / "gate-nucleic-ss.cif", nss)
             cases.append(("nucleic-ss", [f"--spec={nss}"], [f"--spec={nss}"]))
+            # 🔴 AND RAW STRUCTURES, PREPARED AS UPSTREAM PREPARES ONE (fresh.js / fresh.h): an RCSB
+            # entry as deposited - 92 alternate-location atoms (6MRR), unmodeled residues (1BRS),
+            # DNA with a calcium and waters (7M5W) - read without `input_as_annotated_cif`. Both
+            # ports used to read such a file as written; tools/check-rfd4p-load.py holds the page's
+            # preparation to atomworks, and this holds the native one to the page.
+            for tag in ("raw-6mrr", "raw-7m5w", "raw-1brs"):
+                spec = HERE / "featurise" / f"gate-{tag}.json"
+                cases.append((tag, [f"--spec={spec}"], [f"--spec={spec}"]))
+            # 🔴 AND UPSTREAM'S SPEC SHAPE: YAML, examples by name, `global_args`, an `input`
+            # relative to the spec file - and two files in one job.
+            examples = HERE / "featurise" / "gate-examples.yaml"
+            for ex in ("binder", "monomer"):
+                cases.append((f"examples-{ex}", [f"--spec={examples}", f"--example={ex}"],
+                              [f"--spec={examples}", f"--example={ex}"]))
+            multi = HERE / "featurise" / "gate-multi.json"
+            write_relabelled_case(REPO / "tools" / "fixtures" / "rcsb" / "6mrr.cif.zst",
+                                  HERE / "featurise" / "gate-multi-yz.cif", multi)
+            cases.append(("multi", [f"--spec={multi}"], [f"--spec={multi}"]))
             # 🔴 AND THE GENERATION DIRECTORY, NOT ONLY THE TRUNK'S INPUT. `--generate` writes the
             # per-step conditioning, the emit masks, the recycle depths and the NOISE - which the
             # C++ now draws rather than replays, so Box-Muller is compared here too. Without this
@@ -579,33 +620,44 @@ def main() -> int:
                 # `applyConditions` is never called and the condition is dropped before it can
                 # be refused - the exact trap the comment above the featurise arm describes,
                 # walked into while writing that comment.
-                ('{"input":"web/examples/ppi_pdl1.cif.zst","specMode":true,"conditions":'
+                ('{"input":"../../../web/examples/ppi_pdl1.cif.zst","specMode":true,"conditions":'
                  '{"C_CENTROID":{"1.5,-2.25":[{"select":"sel(\'B/*/*/*\')"}]}}}', "exactly 3 components"),
                 # 🔴 AND UPSTREAM'S OWN CONTIG CHECKS (`contig_spec.py`), which neither port had:
                 # each of these built a structure its author did not write, without a word.
-                ('{"input":"web/examples/ppi_pdl1.cif.zst","contig":"B2-10,B5-20"}', "overlap"),
-                ('{"input":"web/examples/ppi_pdl1.cif.zst","contig":"B2-400"}', "runs outside chain"),
+                ('{"input":"../../../web/examples/ppi_pdl1.cif.zst","contig":"B2-10,B5-20"}', "overlap"),
+                ('{"input":"../../../web/examples/ppi_pdl1.cif.zst","contig":"B2-400"}', "runs outside chain"),
                 ('{"contig":"a:5-5,a:6-6"}', "Duplicate expandable-segment name"),
-                ('{"input":"web/examples/ppi_pdl1.cif.zst","contig":"50-50"}', "no preserved segments"),
-                ('{"input":"web/examples/ppi_pdl1.cif.zst","contig":"B2-40,5-5D"}', "disagrees"),
+                ('{"input":"../../../web/examples/ppi_pdl1.cif.zst","contig":"50-50"}', "no preserved segments"),
+                ('{"input":"../../../web/examples/ppi_pdl1.cif.zst","contig":"B2-40,5-5D"}', "disagrees"),
                 # 🔴 AND UPSTREAM'S VALUE CHECKS (`condition_spec._apply_conditions`): each was a
                 # value this took and turned into something else.
-                ('{"input":"web/examples/ppi_pdl1.cif.zst","contig":"B2-40","conditions":'
+                ('{"input":"../../../web/examples/ppi_pdl1.cif.zst","contig":"B2-40","conditions":'
                  '{"C_SEQ":{"ALA":[{"select":"sel(\'B\')"}]}}}', "expected a boolean"),
-                ('{"input":"web/examples/ppi_pdl1.cif.zst","contig":"B2-40","conditions":'
+                ('{"input":"../../../web/examples/ppi_pdl1.cif.zst","contig":"B2-40","conditions":'
                  '{"C_CENTROID":{"1,2,3,4":[{"select":"sel(\'B\')"}]}}}', "exactly 3 components"),
-                ('{"input":"web/examples/ppi_pdl1.cif.zst","contig":"B2-40","conditions":'
+                ('{"input":"../../../web/examples/ppi_pdl1.cif.zst","contig":"B2-40","conditions":'
                  '{"C_CATH":{"3.40.50.20":[{"select":"sel(\'B\')"}]}}}', "Unknown CAT label"),
-                ('{"input":"web/examples/ppi_pdl1.cif.zst","contig":"B2-40","conditions":'
+                ('{"input":"../../../web/examples/ppi_pdl1.cif.zst","contig":"B2-40","conditions":'
                  '{"C_INTCRD":{"true":[{"select":"sel(\'B\')"}]}}}', "saved payload"),
-                ('{"input":"web/examples/ppi_pdl1.cif.zst","contig":"B2-40","conditions":'
+                ('{"input":"../../../web/examples/ppi_pdl1.cif.zst","contig":"B2-40","conditions":'
                  '{"C_CRDGRP":{"0":[{"select":"sel(\'B\')"}]}}}', "integer ID from 1"),
-                ('{"input":"web/examples/ppi_pdl1.cif.zst","contig":"B2-40","conditions":'
+                ('{"input":"../../../web/examples/ppi_pdl1.cif.zst","contig":"B2-40","conditions":'
                  '{"C_HOT":{"true":[{"select":"sel(\'B\')","group":"g"}]}}}', "only meaningful for C_IDX"),
-                ('{"input":"web/examples/ppi_pdl1.cif.zst","contig":"B2-40","conditions":'
+                ('{"input":"../../../web/examples/ppi_pdl1.cif.zst","contig":"B2-40","conditions":'
                  '{"C_SEC":{"7":[{"select":"sel(\'B\')"}]}}}', "Invalid enum value"),
-                ('{"input":"web/examples/ppi_pdl1.cif.zst","contig":"B2-40","conditions":'
+                ('{"input":"../../../web/examples/ppi_pdl1.cif.zst","contig":"B2-40","conditions":'
                  '{"C_BP":{"PAIR":[{"select":"sel(\'B\')"}]}}}', "2-body condition"),
+                # Upstream's spec shape, refused in upstream's words: an unnamed example of
+                # several, a typo'd field, two files sharing a chain id, and an annotated file's
+                # expandable-segment sentinel read as a raw structure.
+                ('{"a":{"input":"../../../tools/fixtures/rcsb/6mrr.cif.zst"},'
+                 '"b":{"input":"../../../tools/fixtures/rcsb/1brs.cif.zst"}}', "name one with --example="),
+                ('{"a":{"input":"../../../tools/fixtures/rcsb/6mrr.cif.zst","contigg":"A1-5"}}',
+                 "unrecognized condition_spec field"),
+                ('{"input":["../../../tools/fixtures/rcsb/6mrr.cif.zst","../../../tools/fixtures/rcsb/1brs.cif.zst"],'
+                 '"contig":"A1-5"}', "appears in both"),
+                ('{"input":"../../../web/examples/motif_idx_1prw.cif.zst","contig":"A1-5"}',
+                 "Unresolved link valence"),
             ]
             bad_refusals = []
             probe = HERE / "featurise" / "gate-refusal.json"
@@ -981,6 +1033,18 @@ def main() -> int:
                 print(f"  {'query':10s} {'; '.join(lines) or 'no result'}  {'ok ' if ok else 'DIFFERS'}")
             else:
                 print(f"  {'query':10s} skipped: no ~/venv_rfd4p to run atomworks")
+            # 🔴 AND THE LOADER, AGAINST ATOMWORKS: what `input:` becomes, annotated and raw, on the
+            # shipped examples and five deposited entries. The featurise arm holds the native load
+            # to the page's; this holds the page's to upstream's.
+            if venv.exists():
+                r = run([venv, REPO / "tools" / "check-rfd4p-load.py"], cwd=REPO)
+                m = re.search(r"(\d+) loads, (\d+) differing", r.stdout)
+                ok = r.returncode == 0 and m is not None
+                if not ok:
+                    failed += 1
+                    print(r.stdout[-1500:], r.stderr[-600:])
+                print(f"  {'load':10s} {m.group(1) if m else '?'} loads against atomworks, "
+                      f"{m.group(2) if m else '?'} differing  {'ok ' if ok else 'DIFFERS'}")
 
     name, case_dir, export_flags, fold_flags = SPEED
     if not args.only or args.only in name:

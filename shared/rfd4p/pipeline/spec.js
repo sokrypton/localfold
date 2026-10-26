@@ -7,14 +7,18 @@
  */
 
 import { normalizeCatLabel } from '../conditions.js';
+import { prepareFreshBlock } from './fresh.js';
 import { evalQuery, pathMask } from './query.js';
+import { decodeTextOrZstd } from './zstd.js';
 import {
   BOND_TYPE,
   CHAIN_TYPE,
   SCALAR_1BODY_ANNOTATIONS,
   NONSCALAR_1BODY_ANNOTATIONS,
   createEmptyAtomArray,
+  parseCifBlock,
   parseCifToAtomArray,
+  pdbTextToCifText,
   computeIdAndEntityAnnotations,
   getResidueSegments,
   getPolymerizationAtoms,
@@ -1507,47 +1511,160 @@ export function applyConditions(atoms, conditions, originalResId) {
  * @param {function(string): (string|Uint8Array)} [opts.loadInput] - Callback to load relative/absolute input path.
  * @param {string} [opts.exampleId] - Example key to select if `specOrText` has top-level example mappings.
  */
-export function buildAtomArrayFromConditionSpec(specOrText, opts = {}) {
-  let rawSpec = typeof specOrText === 'string' ? parseConditionSpecYaml(specOrText) : specOrText;
+/**
+ * `load_condition_spec_inputs` for one file: a condition spec's `input:` as upstream loads it.
+ * With `asAnnotatedCif` the file is read as written and its conditions kept (`ANNOTATED_CIF`);
+ * without, it is a raw structure and its conditions are discarded (`RCSB_WITH_METALS`).
+ * tools/check-rfd4p-load.py holds this to atomworks atom for atom.
+ *
+ * @param {string|Uint8Array} input mmCIF text or bytes (plain or Zstandard)
+ * @param {{asAnnotatedCif?: boolean, ccdBlocks?: Map<string, object>}} [opts] `ccdBlocks`: fetched
+ *   dictionary entries (ccd.js) for components outside the generated templates
+ */
+/**
+ * Whether a structure file is an ANNOTATED CIF - the output of a condition spec, carrying
+ * `condition_*` / `annotation_*` / `mask_*` columns - rather than a raw structure. Upstream is told
+ * which (`input_as_annotated_cif`); a page handed a file decides from what it carries.
+ */
+export function isAnnotatedCif(input) {
+  const text = decodeTextOrZstd(input);
+  return /(?:^|\n)\s*_atom_site\.(?:condition_|annotation_|mask_)/.test(text);
+}
 
-  // Check if rawSpec is a multi-example mapping (like `{ binder: { input: ..., contig: ..., conditions: ... } }`)
-  if (!('input' in rawSpec) && !('contig' in rawSpec)) {
-    const globalArgs = rawSpec.global_args || {};
-    const exampleKeys = Object.keys(rawSpec).filter((k) => k !== 'global_args');
-    if (exampleKeys.length === 0) {
-      throw new Error('Condition spec contains no examples.');
+export function loadConditionSpecInput(input, { asAnnotatedCif = false, ccdBlocks } = {}) {
+  let atoms;
+  if (asAnnotatedCif) {
+    atoms = parseCifToAtomArray(input, { ccdBlocks });
+  } else {
+    const text = decodeTextOrZstd(input);
+    const fromPdb = !text.includes('_atom_site.') && /(?:^|\n)(?:ATOM  |HETATM)/.test(text);
+    const block = prepareFreshBlock(parseCifBlock(fromPdb ? pdbTextToCifText(text) : text), { ccdBlocks });
+    atoms = parseCifToAtomArray(null, { block, fixArginines: true, ccdBlocks });
+    atoms.annotations = {};
+  }
+  computeIdAndEntityAnnotations(atoms);
+  return atoms;
+}
+
+/** The fields one condition-spec example may carry (`_CONDITION_SPEC_EXAMPLE_KEYS`). */
+export const CONDITION_SPEC_EXAMPLE_KEYS = Object.freeze(['input', 'input_as_annotated_cif', 'contig', 'conditions']);
+
+/**
+ * `split_global_args`: a spec FILE - examples by name, with `global_args` folded into each (an
+ * example's own value wins) - as `{name: example}`. A flat object (this port's own job shape, with
+ * an `input` or a `contig` at the top) is one example called `job`.
+ */
+export function conditionSpecExamples(spec) {
+  if (spec === null || typeof spec !== 'object' || Array.isArray(spec)) {
+    throw new Error('A condition spec must be a mapping.');
+  }
+  if ('input' in spec || 'contig' in spec) return { job: spec };
+  const globalArgs = spec.global_args ?? {};
+  if (globalArgs === null || typeof globalArgs !== 'object' || Array.isArray(globalArgs)) {
+    throw new Error(`condition_spec \`global_args\` must be a mapping, got ${Array.isArray(globalArgs) ? 'list' : typeof globalArgs}.`);
+  }
+  const invalid = Object.entries(spec)
+    .filter(([k, v]) => k !== 'global_args' && (v === null || typeof v !== 'object' || Array.isArray(v)))
+    .map(([k, v]) => `${k} (${Array.isArray(v) ? 'list' : v === null ? 'NoneType' : typeof v})`);
+  if (invalid.length) throw new Error(`condition_spec examples must be mappings; invalid entries: ${invalid.join(', ')}.`);
+  const out = {};
+  for (const [k, v] of Object.entries(spec)) if (k !== 'global_args') out[k] = { ...globalArgs, ...v };
+  if (!Object.keys(out).length) throw new Error('Condition spec contains no examples.');
+  return out;
+}
+
+/**
+ * `separate_coordinate_groups`: each input's internal-coordinate groups renumbered into one
+ * namespace, so two files' group 1 do not become one rigid group. In place.
+ */
+function separateCoordinateGroups(arrays) {
+  let next = 1;
+  for (const a of arrays) {
+    const groups = (a.annotations?.condition_CoordinateGroup_1_atom ?? getDefaultCoordinateGroups(a)).slice();
+    const old = groups.slice();
+    const intcrd = a.annotations?.condition_InternalCoordinate_1_atom;
+    if (intcrd && intcrd.some((c, i) => !(old[i] > 0) && c.some(Number.isFinite))) {
+      throw new Error('Internal coordinate targets exist outside internal coordinate groups.');
     }
-    const chosenKey = opts.exampleId && rawSpec[opts.exampleId] ? opts.exampleId : exampleKeys[0];
-    rawSpec = { ...globalArgs, ...rawSpec[chosenKey] };
+    for (const gid of [...new Set(old.filter((g) => g > 0))].sort((x, y) => x - y)) {
+      for (let i = 0; i < old.length; i += 1) if (old[i] === gid) groups[i] = next;
+      next += 1;
+    }
+    if (a.annotations?.condition_CoordinateGroup_1_atom) a.annotations.condition_CoordinateGroup_1_atom = groups;
+  }
+  return arrays;
+}
+
+/**
+ * Build an annotated AtomArray from a condition-spec object or YAML/JSON string.
+ *
+ * @param {object|string} specOrText - Condition spec object or YAML/JSON string.
+ * @param {object} [opts]
+ * @param {string|Uint8Array|object} [opts.inputCif] - Pre-loaded CIF content (or AtomArray) for `spec.input`.
+ * @param {function(string): (string|Uint8Array)} [opts.loadInput] - Callback to load relative/absolute input path.
+ * @param {string} [opts.exampleId] - The example to build, when the spec names more than one.
+ * @param {Map<string, object>} [opts.ccdBlocks] - Fetched dictionary entries (ccd.js) for a raw input's components.
+ */
+export function buildAtomArrayFromConditionSpec(specOrText, opts = {}) {
+  const parsed = typeof specOrText === 'string' ? parseConditionSpecYaml(specOrText) : specOrText;
+  const flat = parsed !== null && typeof parsed === 'object' && ('input' in parsed || 'contig' in parsed);
+  const examples = conditionSpecExamples(parsed);
+  const names = Object.keys(examples);
+  // 🔴 A FILE OF SEVERAL EXAMPLES NAMES WHICH ONE. This built the first and said nothing, so a
+  // spec upstream runs as five designs ran as one here.
+  if (opts.exampleId !== undefined && !examples[opts.exampleId]) {
+    throw new Error(`no example '${opts.exampleId}' in this condition spec; it has ${names.join(', ')}`);
+  }
+  if (opts.exampleId === undefined && names.length > 1) {
+    throw new Error(`this condition spec has ${names.length} examples (${names.join(', ')}); name one`);
+  }
+  const exampleId = opts.exampleId ?? names[0];
+  const rawSpec = examples[exampleId];
+  // Upstream's own vocabulary, for a spec in upstream's shape: a typo'd field applies nothing.
+  if (!flat) {
+    const unknown = Object.keys(rawSpec).filter((k) => !CONDITION_SPEC_EXAMPLE_KEYS.includes(k)).sort();
+    if (unknown.length) {
+      throw new Error(`${exampleId}: unrecognized condition_spec field(s) ${JSON.stringify(unknown)}. `
+        + `Recognized fields: ${JSON.stringify([...CONDITION_SPEC_EXAMPLE_KEYS].sort())}.`);
+    }
   }
 
   const asAnnotatedCif = Boolean(rawSpec.input_as_annotated_cif);
+  const load = (input) => loadConditionSpecInput(input, { asAnnotatedCif, ccdBlocks: opts.ccdBlocks });
   let atomArray;
 
   if (opts.inputAtomArray) {
     atomArray = opts.inputAtomArray;
   } else if (opts.inputCif) {
-    atomArray = parseCifToAtomArray(opts.inputCif, { fixArginines: !asAnnotatedCif });
+    atomArray = load(opts.inputCif);
   } else if (rawSpec.input) {
     const inputs = Array.isArray(rawSpec.input) ? rawSpec.input : [rawSpec.input];
     const loadedArrays = inputs.map((inp) => {
       if (typeof inp === 'object' && inp !== null && inp.nAtoms !== undefined) return inp;
-      if (typeof inp === 'string' && (inp.includes('_atom_site.') || inp.startsWith('data_'))) {
-        return parseCifToAtomArray(inp, { fixArginines: !asAnnotatedCif });
-      }
-      if (opts.loadInput) {
-        const bytesOrText = opts.loadInput(inp);
-        return parseCifToAtomArray(bytesOrText, { fixArginines: !asAnnotatedCif });
-      }
+      if (typeof inp === 'string' && (inp.includes('_atom_site.') || inp.startsWith('data_'))) return load(inp);
+      if (opts.loadInput) return load(opts.loadInput(inp));
       throw new Error(
         `Cannot load condition_spec input path '${inp}' without opts.inputCif or opts.loadInput(path).`
       );
     });
-    if (!asAnnotatedCif) {
-      for (const a of loadedArrays) a.annotations = {};
+    if (loadedArrays.length === 1) {
+      atomArray = loadedArrays[0];
+    } else {
+      // `load_condition_spec_inputs` over several files: one chain id may come from one file only.
+      const seen = new Map();
+      loadedArrays.forEach((a, k) => {
+        for (const c of [...new Set(a.chain_id)].sort()) {
+          if (seen.has(c)) {
+            throw new Error(`chain_id '${c}' appears in both '${seen.get(c)}' and '${typeof inputs[k] === 'string' ? inputs[k] : `input ${k}`}' -- `
+              + 'condition_spec does not auto-rename colliding chain ids across input files; rename one of them so '
+              + '`contig` selections stay unambiguous.');
+          }
+          seen.set(c, typeof inputs[k] === 'string' ? inputs[k] : `input ${k}`);
+        }
+      });
+      atomArray = concatAtomArrays(separateCoordinateGroups(loadedArrays));
+      computeIdAndEntityAnnotations(atomArray);
     }
-    atomArray = loadedArrays.length === 1 ? loadedArrays[0] : concatAtomArrays(loadedArrays);
-    computeIdAndEntityAnnotations(atomArray);
   } else {
     atomArray = createEmptyAtomArray();
   }

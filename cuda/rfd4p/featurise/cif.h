@@ -208,27 +208,19 @@ struct AtomSite {
  * `parseCifToAtomArray`'s derived half: the atomic number, the component type, the aromatic and
  * leaving-atom flags, the charge fallbacks and the per-chain type.
  *
- * 🔴 THE FILE'S OWN TABLES WIN OVER THE STANDARD ONES. `_chem_comp_atom` carries a charge, an
- * aromatic flag and a leaving flag per component atom, and a structure that has them means them -
- * the built-in tables are the fallback for a component the file says nothing about, not the other
- * way round.
+ * 🔴 THE FILE'S OWN TABLES WIN OVER THE STANDARD ONES. `_chem_comp_atom` carries an aromatic flag
+ * and a leaving flag per component atom, and a structure that has them means them - the built-in
+ * tables are the fallback for a component the file says nothing about. (Its charges are no longer
+ * read here: upstream's annotated reader keeps `pdbx_formal_charge` as written, and a raw
+ * structure's charges are the dictionary's, written in by fresh.h.)
  *
  * 🔴 AND "THE FILE'S OWN TABLES WIN" MEANT THEY WIN EVERY TIME: THE WHOLE FALLBACK HALF OF THIS
- * FUNCTION WAS DEAD. Found by gcov over the corpus rather than by reading - 913,128 hits on the
- * `if` and **zero on the `else`**, because every shipped structure carries `_chem_comp_atom`,
- * `_chem_comp` and `_entity_poly`. Five rules live in that else and none had ever run:
- * `STD_RESIDUE_CHARGES`, `STD_RESIDUE_AROMATIC`, the OXT/OP3 leaving-atom rule, `chemCompType`
- * from the residue tables, and the chain type from the residue NAME. `withoutChemTables` in
- * `check-cif.mjs` strips the tables, and each is now watched failing: the chain-type rule at 2
- * of 27, the leaving-atom rule 2, the aromatic table 2, `chemCompType` 1, the charge table 1.
- *
- * 🔴 AND TWO OF THE FIVE NEEDED MORE THAN THE STRIP, WHICH IS WHY THE FIRST ATTEMPT LEFT THEM
- * GREEN ON A BRANCH IT HAD JUST MADE REACHABLE. The leaving-atom rule needs a file that HAS an
- * OXT or an OP3, so stripping a fragment with neither reaches the line and cannot see it; and
- * `STD_RESIDUE_CHARGES` sits under `if (a.charge[k] == 0)`, which every chargeable atom here
- * fails because the file declares `+1` itself - it needs no `_chem_comp_atom`, no declared
- * formal charge, AND one of the three residues the table knows. Reaching a line is not
- * exercising the rule on it.
+ * FUNCTION WAS DEAD. Found by gcov over the corpus rather than by reading - zero hits on the
+ * fallback, because every shipped structure carries `_chem_comp_atom`, `_chem_comp` and
+ * `_entity_poly`. `withoutChemTables` in `check-cif.mjs` strips the tables, and each rule is
+ * watched failing: the chain-type rule, the leaving-atom rule, the aromatic table and
+ * `chemCompType`. The leaving-atom rule needs a file that HAS an OXT or an OP3 - reaching a line
+ * is not exercising the rule on it.
  *
  * 🔴 AND A NON-POLYMER CHAIN TAKES `auth_seq_id` AS ITS RESIDUE NUMBER (`update_nonpoly_seq_ids`),
  * which is not cosmetic: a ligand's `label_seq_id` is `.` and so -1 for every one of its atoms,
@@ -254,18 +246,18 @@ inline void deriveChemistry(AtomSite& a, const Block& block) {
     }
   }
   // `_chem_comp_atom`, by `<comp>:<atom>`.
-  std::map<string, int> ccaCharge;
   std::map<string, bool> ccaArom, ccaLeaving;
   if (const vector<string>* cids = table("chem_comp_atom", "comp_id")) {
     const vector<string>* aids = table("chem_comp_atom", "atom_id");
-    const vector<string>* chgs = table("chem_comp_atom", "charge");
     const vector<string>* aroms = table("chem_comp_atom", "pdbx_aromatic_flag");
     const vector<string>* leavs = table("chem_comp_atom", "pdbx_leaving_atom_flag");
     for (size_t i = 0; aids && i < cids->size() && i < aids->size(); ++i) {
       const string key = (*cids)[i] + ":" + (*aids)[i];
-      if (chgs && i < chgs->size()) ccaCharge[key] = safeInt((*chgs)[i], 0);
-      if (aroms && i < aroms->size()) ccaArom[key] = (*aroms)[i] == "Y";
-      if (leavs && i < leavs->size()) ccaLeaving[key] = (*leavs)[i] == "Y";
+      // An unset flag says nothing: a raw RCSB file's `_chem_comp_atom` has no flag columns, and
+      // a fetched entry merged into it pads them with '?'.
+      auto flag = [](const vector<string>* v, size_t i) { return v && i < v->size() && ((*v)[i] == "Y" || (*v)[i] == "N"); };
+      if (flag(aroms, i)) ccaArom[key] = (*aroms)[i] == "Y";
+      if (flag(leavs, i)) ccaLeaving[key] = (*leavs)[i] == "Y";
     }
   }
   // `_entity.type` and `_entity_poly`, which say what KIND of chain each one is.
@@ -310,14 +302,6 @@ inline void deriveChemistry(AtomSite& a, const Block& block) {
   a.isPolymer.assign(a.n, 0);
   for (size_t k = 0; k < a.n; ++k) {
     const string key = a.resName[k] + ":" + a.atomName[k];
-    if (a.charge[k] == 0) {
-      auto cc = ccaCharge.find(key);
-      if (cc != ccaCharge.end()) a.charge[k] = cc->second;
-      else {
-        auto sc = tables::STD_RESIDUE_CHARGES.find(key);
-        if (sc != tables::STD_RESIDUE_CHARGES.end()) a.charge[k] = sc->second;
-      }
-    }
     auto ar = ccaArom.find(key);
     a.isAromatic[k] = ar != ccaArom.end() ? (ar->second ? 1 : 0)
                                           : (tables::STD_RESIDUE_AROMATIC.count(key) ? 1 : 0);
@@ -406,32 +390,51 @@ inline AtomSite readAtomSite(const Block& block) {
   const vector<string>* authAtom = column("auth_atom_id");
   const size_t rows = labelAtom ? labelAtom->size() : (authAtom ? authAtom->size() : 0);
 
-  // 🔴 MODEL ONE AND THE FIRST ALTLOC, which is a FILTER and not a formality: a deposited entry
-  // with twenty NMR models would otherwise come through twenty times over, and a residue with two
-  // conformations twice. The altloc key is the reference's - `label_asym`, `label_seq`,
-  // `auth_seq`, `label_comp`, `label_atom` - and the FIRST row with a given key wins.
+  // 🔴 MODEL ONE AND ATOMWORKS' `altloc="first"`, which is a FILTER and not a formality: a
+  // deposited entry with twenty NMR models would otherwise come through twenty times over, and a
+  // residue with two conformations twice. Per CHAIN, the alphabetically first alternate-location
+  // LETTER is kept with every atom that has none - so an atom whose only conformer is another
+  // letter is dropped, and a non-letter location (`1`, `2`) is never chosen. This kept the first
+  // row of each ATOM, which agrees on every file whose letters run A, B in written order and on
+  // nothing else; tools/check-rfd4p-load.py holds the rule to atomworks.
   //
   // 🔴 AND NEITHER FILTER COULD FIRE ON ANYTHING THIS GATE READ. Scanned over the seven shipped
   // structures: every one is model 1 alone and every `label_alt_id` is `.`, so both were ported
   // from the reference and gated by nothing. `sm_sam+twomodels` and `motif_idx_1prw+altloc`
   // build a file that trips them, and each is watched failing: without the model filter the
-  // first is **132 atoms against 66**, without the altloc skip the second is **330 against
-  // 306**. The altloc case writes the DISPLACED conformation first, because a port that kept
-  // the last row rather than the first agrees whenever they happen to be in written order.
+  // first is **132 atoms against 66**, without the altloc filter the second is **330 against
+  // 306**.
   const vector<string>* modelNums = column("pdbx_PDB_model_num");
   const vector<string>* altIds = column("label_alt_id");
   const string firstModel = modelNums && !modelNums->empty() ? (*modelNums)[0] : string();
+  auto isDefaultAlt = [](const string& alt) { return alt.empty() || alt == "." || alt == "?" || alt == " "; };
+  auto isLetters = [](const string& alt) {
+    for (const char c : alt) if (!isalpha((unsigned char)c)) return false;
+    return !alt.empty();
+  };
+  auto chainOf = [&](size_t i) {
+    const string l = at(column("label_asym_id"), i);
+    if (!l.empty()) return l;
+    const string u = at(column("auth_asym_id"), i);
+    return u.empty() ? string("A") : u;
+  };
+  std::map<string, string> chosenAlt;
+  if (altIds) {
+    for (size_t i = 0; i < rows; ++i) {
+      if (modelNums && !modelNums->empty() && at(modelNums, i) != firstModel) continue;
+      const string alt = at(altIds, i);
+      if (isDefaultAlt(alt) || !isLetters(alt)) continue;
+      auto it = chosenAlt.find(chainOf(i));
+      if (it == chosenAlt.end() || alt < it->second) chosenAlt[chainOf(i)] = alt;
+    }
+  }
   std::vector<size_t> selected;
-  std::map<string, bool> seenAlt;
   for (size_t i = 0; i < rows; ++i) {
     if (modelNums && !modelNums->empty() && at(modelNums, i) != firstModel) continue;
     const string alt = altIds ? at(altIds, i) : ".";
-    if (!unset(alt)) {
-      const string key = at(column("label_asym_id"), i) + "_" + at(column("label_seq_id"), i) +
-                         "_" + at(column("auth_seq_id"), i) + "_" +
-                         at(column("label_comp_id"), i) + "_" + at(labelAtom, i);
-      if (seenAlt.count(key)) continue;
-      seenAlt[key] = true;
+    if (!isDefaultAlt(alt)) {
+      auto it = chosenAlt.find(chainOf(i));
+      if (it == chosenAlt.end() || it->second != alt) continue;
     }
     selected.push_back(i);
   }
@@ -468,8 +471,9 @@ inline AtomSite readAtomSite(const Block& block) {
     a.labelEntityId.push_back(safeInt(at(column("label_entity_id"), i), 0));
     const int resId = safeInt(at(column("label_seq_id"), i), -1);
     a.resId.push_back(resId);
-    const string ins = at(column("pdbx_PDB_ins_code"), i);
-    a.insCode.push_back(unset(ins) ? "" : ins);
+    // atomworks reads no insertion code from an mmCIF (`ins_code[:] = ""`): a CIF numbers its
+    // residues uniquely in `label_seq_id`.
+    a.insCode.push_back("");
     a.authSeqId.push_back(safeInt(at(column("auth_seq_id"), i), resId));
     a.atomId.push_back(safeInt(at(column("id"), i), (int)k + 1));
     a.bFactor.push_back(safeFloat(at(column("B_iso_or_equiv"), i)));
@@ -479,9 +483,8 @@ inline AtomSite readAtomSite(const Block& block) {
     a.x.push_back(safeFloat(at(column("Cartn_x"), i)));
     a.y.push_back(safeFloat(at(column("Cartn_y"), i)));
     a.z.push_back(safeFloat(at(column("Cartn_z"), i)));
-    // 🔴 THE FORMAL CHARGE ALONE. Where it is zero the reference falls back to the file's own
-    // `_chem_comp_atom` table and then to `STD_RESIDUE_CHARGES`, which is CHEMISTRY and belongs
-    // with the bonds - not here, and this reader does not pretend otherwise.
+    // 🔴 THE FILE'S FORMAL CHARGE, AND NOTHING ELSE: upstream's annotated reader keeps the column
+    // as written, and a raw structure's charges are the dictionary's, written in by fresh.h.
     a.charge.push_back(safeInt(at(column("pdbx_formal_charge"), i), 0));
   }
   static const char* KNOWN[] = {
@@ -747,7 +750,8 @@ inline vector<Bond> buildBonds(const AtomSite& a, const Block& block) {
   // 1. `_struct_conn`: the covalent links the file declares, at the identity symmetry only.
   if (const vector<string>* types = table("struct_conn", "conn_type_id")) {
     for (size_t row = 0; row < types->size(); ++row) {
-      if ((*types)[row] != "covale") continue;
+      // `add_bond_types_from_struct_conn=("covale", "metalc")` in both upstream presets.
+      if ((*types)[row] != "covale" && (*types)[row] != "metalc") continue;
       const vector<string>* s1 = table("struct_conn", "ptnr1_symmetry");
       const vector<string>* s2 = table("struct_conn", "ptnr2_symmetry");
       if (s1 && row < s1->size() && (*s1)[row] != "1_555") continue;

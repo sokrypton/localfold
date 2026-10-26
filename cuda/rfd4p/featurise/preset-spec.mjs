@@ -26,7 +26,9 @@ if (!preset) {
 // the file's annotations. Writing them out made a job that is not the preset.
 const asStructure = Boolean(preset.cifUrl) && preset.specMode !== true;
 process.stdout.write(JSON.stringify({
-  ...(preset.cifUrl ? { input: preset.cifUrl.replace(/^\.\//, "") } : {}),
+  // Absolute, because a spec's relative `input` is read against the SPEC's directory (upstream's
+  // `_resolve_input_path`) and this is written wherever the caller puts it.
+  ...(preset.cifUrl ? { input: new URL(`../../../${preset.cifUrl.replace(/^\.\//, "")}`, import.meta.url).pathname } : {}),
   ...(asStructure ? { input_as_annotated_cif: true }
     : { contig: preset.contig, conditions: preset.conditions }),
   nsteps: preset.nsteps,

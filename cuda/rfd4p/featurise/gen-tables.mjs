@@ -15,7 +15,7 @@ import {
   STANDARD_AA, STANDARD_RNA, STANDARD_DNA,
 } from "../../../shared/rfd4p/encoding.js";
 import {
-  CHAIN_TYPE, BOND_TYPE, ELEMENT_TO_ATOMIC_NUMBER, METAL_ELEMENTS, STD_RESIDUE_CHARGES,
+  CHAIN_TYPE, BOND_TYPE, ELEMENT_TO_ATOMIC_NUMBER, METAL_ELEMENTS,
   STD_RESIDUE_AROMATIC, AA_RESIDUES, RNA_RESIDUES, DNA_RESIDUES, SCALAR_1BODY_ANNOTATIONS,
   NONSCALAR_1BODY_ANNOTATIONS, STD_RESIDUE_BONDS,
 } from "../../../shared/rfd4p/pipeline/cif.js";
@@ -207,13 +207,7 @@ for (const [name, set] of [["AA_RESIDUES", AA_RESIDUES], ["RNA_RESIDUES", RNA_RE
   w("};");
   w("");
 }
-w("// `<residue>:<atom>` -> the charge or the aromatic flag a standard residue carries.");
-w("inline const std::unordered_map<std::string, int> STD_RESIDUE_CHARGES = {");
-for (const [res, atoms] of Object.entries(STD_RESIDUE_CHARGES)) {
-  for (const [atom, q] of Object.entries(atoms)) w(`    {${str(`${res}:${atom}`)}, ${q}},`);
-}
-w("};");
-w("");
+w("// `<residue>:<atom>` -> the aromatic flag a standard residue carries.");
 w("inline const std::unordered_set<std::string> STD_RESIDUE_AROMATIC = {");
 for (const [res, atoms] of Object.entries(STD_RESIDUE_AROMATIC)) {
   w("    " + [...atoms].map((a) => str(`${res}:${a}`)).join(", ") + ",");
@@ -413,7 +407,7 @@ w("// BSD notices). `selection.h` reads these and nothing typed.");
   };
   for (const name of ["PROTEIN_BACKBONE_ATOM_NAMES", "RNA_BACKBONE_ATOM_NAMES", "DNA_BACKBONE_ATOM_NAMES",
     "NUCLEIC_ACID_BACKBONE_ATOM_NAMES", "STANDARD_AA", "STANDARD_RNA", "STANDARD_DNA",
-    "PYRIMIDINE_RESIDUES", "PURINE_RESIDUES", "METAL_ELEMENTS", "CARBOHYDRATE_NAMES"]) set(name, [...Q[name]]);
+    "PYRIMIDINE_RESIDUES", "PURINE_RESIDUES", "CARBOHYDRATE_NAMES"]) set(name, [...Q[name]]);
   for (const name of ["UNKNOWN_AA", "UNKNOWN_RNA", "UNKNOWN_DNA", "MASKED"]) {
     w(`inline const std::string Q_${name} = ${str(Q[name])};`);
   }
@@ -424,6 +418,24 @@ w("// BSD notices). `selection.h` reads these and nothing typed.");
   w("inline const std::unordered_map<std::string, std::unordered_set<std::string>> Q_TIP_ATOM_NAMES = {");
   for (const [res, names] of Object.entries(Q.TIP_ATOM_NAMES)) w(`    {${str(res)}, {${names.map(str).join(", ")}}},`);
   w("};");
+}
+w("");
+w("// 🔴 THE CCD TEMPLATES A RAW STRUCTURE IS PREPARED FROM (fresh.h), through");
+w("// shared/rfd4p/pipeline/ccd-templates.js: the standard residues, their unknowns, MSE and the");
+w("// single-atom components, each atom [name, alternate name, element, charge, leaving, aromatic].");
+{
+  const { CCD_TEMPLATES, WATER_LIKE_CCDS } = await import("../../../shared/rfd4p/pipeline/ccd-templates.js");
+  const { CRYSTALLIZATION_AIDS } = await import("../../../shared/rfd4p/pipeline/fresh.js");
+  w("struct CcdAtom { const char* name; const char* alt; const char* element; int charge; bool leaving; bool aromatic; };");
+  w("struct CcdTemplate { const char* type; std::vector<CcdAtom> atoms; };");
+  w("inline const std::unordered_map<std::string, CcdTemplate> CCD_TEMPLATES = {");
+  for (const [code, t] of Object.entries(CCD_TEMPLATES)) {
+    const atoms = t.atoms.map(([n, a, e, c, l, r]) => `{${str(n)}, ${str(a)}, ${str(e)}, ${c}, ${l ? "true" : "false"}, ${r ? "true" : "false"}}`);
+    w(`    {${str(code)}, {${str(t.type)}, {${atoms.join(", ")}}}},`);
+  }
+  w("};");
+  w(`inline const std::vector<std::string> WATER_LIKE_CCDS = {${WATER_LIKE_CCDS.map(str).join(", ")}};`);
+  w(`inline const std::vector<std::string> CRYSTALLIZATION_AIDS = {${CRYSTALLIZATION_AIDS.map(str).join(", ")}};`);
 }
 w("}  // namespace tables");
 w("}  // namespace rfd4p");

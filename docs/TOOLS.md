@@ -11,7 +11,7 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-422 tools. `tools/fixtures/` is data and is not listed.
+425 tools. `tools/fixtures/` is data and is not listed.
 
 ## `tools/gpu/` - the WebGPU lane (215)
 
@@ -333,7 +333,7 @@ and turning it into a bundle.
 - **`safetensors_read.py`** - Read a .safetensors file into numpy arrays, without the safetensors package.
 - **`vector-quantise.py`** - Is a codebook worth a new decoder? Scalar codes against vector ones, at 2 bits.
 
-## `tools/` - everything else (120)
+## `tools/` - everything else (123)
 
 CPU checkers, the export and quantisation pipeline, the page drivers that
 go through CDP, and the deploy.
@@ -385,6 +385,7 @@ go through CDP, and the deploy.
 - **`check-native-worker.py`** - The native backend's worker (CUDA, or Metal on a Mac), folding for real: npm run test:native.
 - **`check-oracle-bonds.js`** - Does the REFERENCE put side chains where we do? AlphaFold 3's own output, scored by the same function.
 - **`check-portable-limits.mjs`** - Does every model fold on a device at the PORTABLE limit ceiling?
+- **`check-rfd4p-load.py`** - Hold the page's structure LOADER to upstream's, atom for atom: `load_condition_spec_inputs`.
 - **`check-rfd4p-manifest.py`** - Does our copy of RFD4-Proteina's tensor manifest still describe the shards being served?
 - **`check-rfd4p-query.py`** - Hold both ports' selection language to UPSTREAM's, atom for atom, on the shipped structures.
 - **`check-safari-syntax.mjs`** - Parse every module the site ships with this Mac's own JavaScriptCore, the engine of its Safari, so syntax that Safari cannot parse (regex lookbehind before 16.4, class static blocks, ...) fails here instead of in a visitor's browser, where one bad literal stops a whole module from loading. macOS only; skips elsewhere.
@@ -431,6 +432,7 @@ go through CDP, and the deploy.
 - **`gate-folds.mjs`** - The folds every whole-model gate runs, and how a gate reads one of them.
 - **`gen-native-featuriser-tables.mjs`** - Generate cuda/featurise/tables.inc, dialects.inc and bundles.inc - the data the native featuriser, weight walk and weight fetch read, from the JavaScript they mirror.
 - **`gen-rfd4p-cath-mapping.py`** - Generate shared/rfd4p/cath-mapping.js from RFD4-Proteina's own `data/cath_label_mapping.pkl`.
+- **`gen-rfd4p-ccd-templates.py`** - Generate shared/rfd4p/pipeline/ccd-templates.js from the Chemical Component Dictionary atomworks reads.
 - **`gen-rfd4p-query-tables.py`** - Generate shared/rfd4p/pipeline/query-tables.js from atomworks' and biotite's own constants.
 - **`gen-standard-components.mjs`** - Generate shared/af3/featurise/standard-components.js - the CCD entries of the 20 standard amino acids and the 8 standard nucleotides, cut down to what parseCcdComponent reads - from ccd/components.cif. Hydrogens are kept: rf3's declared-bond charge counts the bonds an atom still has, a hydrogen's among them.
 - **`gpu-chrome.mjs`** - Run a WebGPU module in headless Chrome and print what it returns.
@@ -448,6 +450,7 @@ go through CDP, and the deploy.
 - **`repack_shards.py`** - Lay an exported bundle into a few even shards instead of many uneven ones.
 - **`replay_alphafold_evoformer_block.py`** - Replay and stage-capture one official AlphaFold Evoformer block on CPU.
 - **`replay_alphafold_triangle_reference.py`** - Replay a captured bundle through the official AF2 Haiku operator on CPU.
+- **`rfd4p_ccd.py`** - The dictionary entries the RFD4 page would FETCH for a structure, written from the CCD atomworks reads.
 - **`score-bioemu2-samples.mjs`** - BioEmu2 samples, scored as BioEmu2 scores them: its physicality report and its steering potentials' energies.
 - **`score_fold.py`** - Score a fold from tools/gpu/fold.js against a reference structure.
 - **`serve.py`** - Serve the checkout with caching turned off.

@@ -543,9 +543,35 @@ pinned checkpoint revision) found, and this round fixed:
   rest. Both are now one engine (`shared/rfd4p/pipeline/query.js`, ported line for line to
   `featurise/selection.h`) over atomworks' own tables (`tools/gen-rfd4p-query-tables.py`, BSD-3),
   and `tools/check-rfd4p-query.py` - a `gate.py` arm wherever `~/venv_rfd4p` exists - holds both to
-  atomworks itself: 130 queries over the seven shipped structures, **910 of 910 agree on both
-  sides**, refusals included. The namespace is upstream's too: no `b_factor` where the file has no
-  B column, `altloc_id`, and no aromatic or leaving-atom flag.
+  atomworks itself: 134 queries over the seven shipped structures and four deposited entries,
+  **1474 of 1474 agree on both sides**, refusals included. The namespace is upstream's too: no
+  `b_factor` where the file has no B column, `altloc_id`, and no aromatic or leaving-atom flag -
+  and `is_metal` is never true, because upstream's isn't (`np.isin` over a frozenset matches
+  nothing), so `... or is_metal` conditions no calcium there and none here.
+- 🔴 **A raw structure was read as written, where upstream PREPARES it.** A spec's `input:` without
+  `input_as_annotated_cif` goes through atomworks' `RCSB_WITH_METALS`: one alternate conformer per
+  residue from a seeded clash-aware solver (Python's `random.Random(0)`, ported bit for bit),
+  waters, hydrogens and unbonded crystallization aids dropped, MSE as MET, every polymer completed
+  to its sequence - unmodeled residues and truncated side chains added without coordinates, a
+  terminal OXT/OP3 kept - each residue in its CCD atom order with CCD charges. Both ports read the
+  file as deposited: on 6MRR the batch lacked 23 heavy atoms and called eight partial residues
+  resolved, and 1BRS's chain A could not be named from residue 1 at all. `pipeline/fresh.js` and
+  `featurise/fresh.h` now rewrite the `_atom_site` rows and hand the block to the ordinary reader,
+  completing non-standard components from dictionary entries fetched as the page fetches them
+  (`--ccd=` reads a local CCD instead). `tools/check-rfd4p-load.py` (a `gate.py` arm) holds the
+  load to atomworks atom for atom over the shipped examples and five deposited entries in both
+  modes - **24 loads, all exact but one asserted difference** (5O45's macrocycle closes through a
+  residue whose link chemistry atomworks resolves with 1,247 lines of RDKit valence rules, moving
+  one formal charge; not ported) - and the whole batch of five raw-input jobs matches upstream's
+  `dump_batch_cpu.py` exactly. The annotated reader moved to upstream's rules too: the
+  alternate-location LETTER first in each chain (not each atom's first row), no insertion codes
+  from a CIF, no charge guessed from a table, `metalc` bonds kept, an unset `_chem_comp_atom` flag
+  not read as "no".
+- **Upstream's spec files**: YAML or JSON, examples by name with `global_args` folded in
+  (`--example=` names one; several unnamed are refused), an `input` that is a path or a list -
+  relative to the spec file, one chain id per file, coordinate groups renumbered across files -
+  and upstream's four example fields and no others. The page reads a file carrying condition
+  columns as annotated, since it cannot be told.
 
 ## What is not done
 
