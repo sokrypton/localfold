@@ -660,8 +660,11 @@ port's refold, which cuda/af3's gates hold to AlphaFold 3; and our AF3 names its
 by position where AlphaFold 3 keeps the job's ids, which the oracle reads back through the job's
 own order. Refused, by name, rather than approximated: a covalently attached modifier (upstream
 renames it for AF3), a non-standard polymer residue, two instances of one chain id, a ligand chain
-id that sorts before a polymer's (our AF3 puts polymers first), and the disco and developability
-metrics.
+id that sorts before a polymer's (our AF3 puts polymers first), and the developability criterion
+(it reads Rosetta's SAP score). `disco_refolding` is ported: `max_ligand_centroid_distance` (each
+ligand molecule's centroid, design against refold superposed on the backbone, a molecule being
+ligand chains joined by any bond, coordination included) and the `disco` pass criterion - gate job
+`gate-oracle-disco.json`, SAM in its binder, to upstream's float32 within 1e-4 A as an RMSD is.
 
 🔴 **`apo_refolding` FOLDS THE BINDER ALONE (`oracle_apo`, upstream's `ApoOnlyTransform`).** The
 chain of interest is cut out of the design and refolded by itself, filed under the transform's

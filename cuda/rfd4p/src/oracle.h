@@ -1159,6 +1159,52 @@ inline Values comparison(const Array& d, const std::vector<double>& gtCoord, con
   return {{"rmsd", r.rmsd}};
 }
 
+/**
+ * `LigandCentroidDistanceMetric` (aggregation `max`): the refold superposed on the design over the
+ * protein backbone, then each ligand molecule's centroid in the one against the other. A molecule is
+ * ligand chains joined by any bond, a coordination bond included (`exclude_bond_types=None`); two
+ * molecules of the same residue names are ambiguous, and the answer is NaN, as it is with no ligand.
+ */
+inline Values ligandCentroidDistance(const Array& d, const std::vector<double>& gt, const std::vector<double>& pred) {
+  const std::vector<uint8_t> backbone = mask(d, "is_protein_backbone", ""), ligand = mask(d, "is_ligand", "");
+  std::vector<int> align;
+  for (int i = 0; i < d.n; ++i) {
+    if (backbone[i] && symmetry::finiteAt(gt, i) && symmetry::finiteAt(pred, i)) align.push_back(i);
+  }
+  if (align.empty()) return {};
+  const metrics::FitMap fit = metrics::fitOnto(gt, pred, align, align);
+  // Molecules: union by chain, then by bond.
+  std::vector<int> parent(d.n);
+  for (int i = 0; i < d.n; ++i) parent[i] = i;
+  std::function<int(int)> root = [&](int i) { return parent[i] == i ? i : parent[i] = root(parent[i]); };
+  std::map<std::string, int> firstOfChain;
+  for (int i = 0; i < d.n; ++i) {
+    if (!ligand[i]) continue;
+    const auto [it, fresh] = firstOfChain.insert({d.chainIid[i], i});
+    if (!fresh) parent[root(i)] = root(it->second);
+  }
+  for (const auto& [i, j] : d.bonds) if (ligand[i] && ligand[j]) parent[root(i)] = root(j);
+  std::map<int, std::vector<int>> molecules;
+  for (int i = 0; i < d.n; ++i) if (ligand[i]) molecules[root(i)].push_back(i);
+  if (molecules.empty()) return {{"ligand_centroid_distance", NAN}};
+  std::set<std::set<std::string>> fingerprints;
+  double worst = -INFINITY;
+  for (const auto& [m, atoms] : molecules) {
+    std::set<std::string> names;
+    for (const int i : atoms) names.insert(d.resName[i]);
+    if (!fingerprints.insert(names).second) return {{"ligand_centroid_distance", NAN}};
+    double a[3] = {0, 0, 0}, b[3] = {0, 0, 0};
+    for (const int i : atoms) {
+      const auto v = fit(pred[(size_t)i * 3], pred[(size_t)i * 3 + 1], pred[(size_t)i * 3 + 2]);
+      for (int c = 0; c < 3; ++c) { a[c] += gt[(size_t)i * 3 + c]; b[c] += v[c]; }
+    }
+    double sq = 0;
+    for (int c = 0; c < 3; ++c) sq += (a[c] - b[c]) * (a[c] - b[c]) / ((double)atoms.size() * atoms.size());
+    worst = std::isnan(sq) || std::isnan(worst) ? NAN : std::max(worst, std::sqrt(sq));   // np.max keeps a NaN
+  }
+  return {{"ligand_centroid_distance", worst}};
+}
+
 /** One oracle's refold of one design (or of its transform's output): what the metrics read. */
 struct Refold {
   const Spec* spec;
@@ -1219,6 +1265,8 @@ inline Values refoldingMetrics(const Refold& r, const std::vector<std::string>& 
        }},
       {"refolded_backbone_aligned_ligand_rmsd", {{"sm_binder_refolding"}, {"is_refold:untransformed"}, {}},
        masked("is_protein_backbone", "is_ligand")},
+      {"max_ligand_centroid_distance", {{"disco_refolding"}, {"is_refold:untransformed"}, {}},
+       [&] { return ligandCentroidDistance(d, gt, pred); }},
       // Two refolds against each other: the apo one as the ground truth, the untransformed one as
       // the prediction, each selected over its own atoms. Where the apo refold is the whole design
       // the two have one atom set and symmetry is resolved; otherwise the selections are matched
@@ -1235,9 +1283,6 @@ inline Values refoldingMetrics(const Refold& r, const std::vector<std::string>& 
          return {{"rmsd", c.rmsd}};
        }},
   };
-  if (std::find(tags.begin(), tags.end(), "disco_refolding") != tags.end()) {
-    refuse("max_ligand_centroid_distance (disco_refolding) is not ported");
-  }
   Values out;
   for (const Entry& e : entries) {
     if (!metrics::applies(e.gate, tags)) continue;
@@ -1267,10 +1312,11 @@ inline Values passCriteria(const std::map<std::string, double>& m, const std::ve
        {{"oracle.min_ipae_coi", NAN, NAN, 1.5}, {"refolded_backbone_rmsd.rmsd", NAN, 2.0}, {"refolded_motif_allatom_rmsd.rmsd", NAN, 1.5},
         {"clash_metrics.frac_atoms_clashing_inter_residue_polymer_ligand_1p5A", NAN, 0}}},
       {"ame_no_ligand", {{"ame_refolding"}, {"no_ligand"}, {}}, {{"refolded_backbone_rmsd.rmsd", NAN, 2.0}, {"refolded_motif_allatom_rmsd.rmsd", NAN, 1.5}}},
+      {"disco", {{"disco_refolding"}, {}, {}},
+       {{"refolded_backbone_rmsd.rmsd", NAN, 2.0}, {"max_ligand_centroid_distance.ligand_centroid_distance", NAN, 2.0}}},
   };
-  if (std::find(tags.begin(), tags.end(), "disco_refolding") != tags.end() ||
-      std::find(tags.begin(), tags.end(), "developability") != tags.end()) {
-    refuse("the disco and developability pass criteria read metrics that are not ported");
+  if (std::find(tags.begin(), tags.end(), "developability") != tags.end()) {
+    refuse("the developability pass criterion reads Rosetta's SAP score, which is not ported");
   }
   Values out;
   for (const Criterion& c : criteria) {

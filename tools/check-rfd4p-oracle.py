@@ -425,7 +425,8 @@ def same(key: str, a, b) -> bool:
     a, b = float(a), float(b)
     if math.isnan(a) and math.isnan(b):
         return True
-    return abs(a - b) <= (1e-4 if key.endswith(".rmsd") else 1e-9)
+    # A length in Angstrom: upstream's coordinates and their means are float32, ours double.
+    return abs(a - b) <= (1e-4 if key.endswith((".rmsd", ".ligand_centroid_distance")) else 1e-9)
 
 
 def main() -> int:
