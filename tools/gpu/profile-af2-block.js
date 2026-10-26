@@ -254,9 +254,14 @@ export async function main(device, args) {
       for (const value of values) {
         setDeviceTuning(device, { [knob]: value });
         const run = await once();
-        const of = (label) => run.kernels.find((k) => k.label === label) ?? { ms: 0, dispatches: 0 };
+        // A chunked kernel is labelled per chunk (`msa-transition.first-8192`),
+        // so a watched label sums its chunks rather than reading 0.
+        const of = (label) => run.kernels
+          .filter((k) => k.label === label || (k.label.startsWith(`${label}-`)
+            && /^\d+$/.test(k.label.slice(label.length + 1))))
+          .reduce((sum, k) => sum + k.ms, 0);
         const row = { [knob]: value, blockMs: Number(run.blockMs.toFixed(2)) };
-        for (const label of watch) row[label] = of(label).ms;
+        for (const label of watch) row[label] = Number(of(label).toFixed(2));
         const key = JSON.stringify(value);
         const seen = best.get(key);
         if (seen === undefined || row.blockMs < seen.blockMs) best.set(key, row);
