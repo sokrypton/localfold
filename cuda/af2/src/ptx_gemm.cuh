@@ -545,7 +545,7 @@ inline void launchPtxGemm16(const TI* X, const TI* Wt, TO* Y, const float* bias,
   const size_t blocks128 = ((N + 127) / 128) * ((rows + 127) / 128);
   if (rows >= 96 && N % 128 == 0 && blocks128 >= 72) {
     constexpr int smem128 = 3 * (128 * 32 + 32 * 128) * 2;
-    static bool attr = false;
+    static LF_TLS bool attr = false;
     if (!attr) { smemAttr((ptxGemm128x128K<TI, TO, BIAS, RELU, BETA>), smem128); attr = true; }
     dim3 grid((unsigned)((N + 127) / 128), (unsigned)((rows + 127) / 128));
     ptxGemm128x128K<TI, TO, BIAS, RELU, BETA><<<grid, 256, smem128, STREAM>>>(X, Wt, Y, bias, rows, K, N, ldx, ldy);

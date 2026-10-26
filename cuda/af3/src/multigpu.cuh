@@ -27,7 +27,7 @@
 
 namespace mg {
 constexpr int MAX_RANKS = 16, MAX_SLOTS = 256;
-inline int RANK = 0, WORLD = 1;
+inline LF_TLS int RANK = 0, WORLD = 1;
 struct Slot { char name[48]; size_t bytes; cudaIpcMemHandle_t handle[MAX_RANKS]; };
 struct Shm {
   std::atomic<int> arrived, generation, abort, slots;
@@ -36,18 +36,18 @@ struct Shm {
   size_t value[MAX_RANKS];            // (minOverRanks)
   Slot slot[MAX_SLOTS];
 };
-inline Shm* SHM = nullptr;
+inline LF_TLS Shm* SHM = nullptr;
 // LOCALFOLD_MG_SIMULATE=1 with --gpus=N: no fork - this one process is rank 0 of N, every peer's buffer its own (a
 // peer copy becomes a copy on this card, a barrier nothing). The results are wrong; the TIMES are one rank's compute at
 // the real shapes and its real memory, which is what a box of N GPUs is short of when it is not N times faster - so
 // the per-rank work can be measured and tuned on one GPU. (The interconnect is the part it cannot see.)
-inline bool SIM = false;
+inline LF_TLS bool SIM = false;
 // ranks SHARING a GPU (LOCALFOLD_GPU_MAP=0,0 - how a one-GPU box checks a fold): their fences on the host, since a fence
 // waiting in a kernel holds the card while the peer it waits for needs it (two contexts on one card take turns by time
 // slice: a 3-rank trunk 14.4 s against 0.4); LOCALFOLD_MG_DEVICE_FENCES=1 keeps them on the device there
-inline bool SHARED_DEVICE = false;
-inline bool FINISHED = false;
-inline std::vector<pid_t> CHILDREN;
+inline LF_TLS bool SHARED_DEVICE = false;
+inline LF_TLS bool FINISHED = false;
+inline LF_TLS std::vector<pid_t> CHILDREN;
 
 inline void abortAll() { if (SHM) SHM->abort.store(1); }
 // (rank 0 reaps the ranks that left only as it exits itself: their CUDA teardown runs beside the rest of its fold)
@@ -65,7 +65,7 @@ inline void finish() { FINISHED = true; }
 // a peer gone without passing through exit (a signal, the OOM killer, an error): rank 0's watchdog reaps its children
 // (one that left with status 0 has finished its part); another rank sees rank 0 gone through its parent pid (and
 // PR_SET_PDEATHSIG kills it when rank 0 dies anyway)
-inline std::atomic<bool> CHILD_FAILED{false};
+inline LF_TLS std::atomic<bool> CHILD_FAILED{false};
 inline bool peerDied() { return RANK == 0 ? CHILD_FAILED.load() : getppid() != SHM->pid[0]; }
 // Every rank's watchdog thread: the fences are on the DEVICE (fence() below), so a rank waiting for a peer that died
 // sits in a kernel, not in a host loop that could notice - this thread notices instead and ends the process (a
@@ -188,15 +188,15 @@ struct Shared {
   int seg = -1;                        // (the segment it lies in, below)
   template <class T> T* at(int r) const { return (T*)peer[r]; }
 };
-inline std::map<std::string, Shared>& sharedBuffers() { static std::map<std::string, Shared> m; return m; }
+inline std::map<std::string, Shared>& sharedBuffers() { static LF_TLS std::map<std::string, Shared> m; return m; }
 // Shared buffers live in SEGMENTS - one device allocation a rank, every peer's opened once - several buffers to one where
 // they are small enough, and a buffer given back is kept, mapped, for the next of about its size (the pool): opening a
 // peer's allocation is ~3 ms of driver time with 8 ranks at once (1 with 2) whatever its size, closing one ~1.5, so a
 // buffer an allocation of its own, made and given back, cost every rank ~35 ms of a GPU left idle - ~1.6 s a fold at
 // 2,964 tokens on 8 x A100, a third of one at 988.
 struct Segment { void* local = nullptr; void* peer[MAX_RANKS] = {}; size_t size = 0, used = 0; int live = 0; bool dead = false; };
-inline std::vector<Segment>& segments() { static std::vector<Segment> v; return v; }
-inline std::vector<Shared>& sharedPool() { static std::vector<Shared> p; return p; }
+inline std::vector<Segment>& segments() { static LF_TLS std::vector<Segment> v; return v; }
+inline std::vector<Shared>& sharedPool() { static LF_TLS std::vector<Shared> p; return p; }
 // every segment holding nothing named given back - its kept buffers dropped from the pool, every rank's imports of its
 // peers' closed, then (after a barrier, so no peer still maps it) its own freed (collective)
 inline void freeIdle() {
@@ -409,8 +409,8 @@ __global__ void arriveAndWaitK(DevFlags f) {
   __threadfence_system();
 }
 inline DevFlags devFlags() {
-  static DevFlags f{};
-  static bool made = false;
+  static LF_TLS DevFlags f{};
+  static LF_TLS bool made = false;
   if (!made) {
     Shared& s = shared("mg.flags", MAX_RANKS * sizeof(int));
     CK(cudaMemset(s.local, 0, MAX_RANKS * sizeof(int)));
@@ -429,7 +429,7 @@ inline DevFlags devFlags() {
 }
 inline void hostFence();
 // (DIAG LOCALFOLD_MG_FENCE_TIMES=1: every rank's time inside its fences, reported at each tick - not under a capture)
-inline std::vector<std::pair<cudaEvent_t, cudaEvent_t>> FENCE_EV;
+inline LF_TLS std::vector<std::pair<cudaEvent_t, cudaEvent_t>> FENCE_EV;
 inline void fenceByStage(const char* name);
 inline void fence() {
   if (WORLD == 1 || SIM) return;
@@ -444,7 +444,7 @@ inline void fence() {
   CK(cudaGetLastError());
   if (a) { CK(cudaEventRecord(b, STREAM)); FENCE_EV.push_back({ a, b }); }
 }
-inline std::map<std::string, std::pair<double, int>> FENCE_BY_STAGE;
+inline LF_TLS std::map<std::string, std::pair<double, int>> FENCE_BY_STAGE;
 inline void fenceByStage(const char* name) {
   double tot = 0;
   for (auto& [a, b] : FENCE_EV) { float m = 0; CK(cudaEventElapsedTime(&m, a, b)); tot += m; CK(cudaEventDestroy(a)); CK(cudaEventDestroy(b)); }
@@ -454,7 +454,7 @@ inline void fenceByStage(const char* name) {
 // what this rank sent its peers, by kind: [0] on its own stream (the stream waits for it), [1] on a side stream beside
 // the work it overlaps - in bytes; reported with the fences under LOCALFOLD_MG_TIMES. The same in a simulated rank as on
 // a box, so a box's exposed time can be read off a simulation: bytes over the link's rate
-inline std::map<std::string, std::array<double, 2>> SENT;
+inline LF_TLS std::map<std::string, std::array<double, 2>> SENT;
 inline void sent(const char* kind, size_t bytes, bool side) { SENT[kind][side ? 1 : 0] += (double)bytes; }
 inline void sentReport(const char* what) {
   if (RANK != 0 || SENT.empty()) return;
@@ -491,7 +491,7 @@ inline void hostFence() {
 inline void tick(const char* what) {
   static const bool on = getenv("LOCALFOLD_MG_TIMES") != nullptr;
   if (!on) return;
-  static auto last = std::chrono::steady_clock::now();
+  static LF_TLS auto last = std::chrono::steady_clock::now();
   CK(cudaStreamSynchronize(STREAM));
   if (WORLD > 1) barrier();
   auto now = std::chrono::steady_clock::now();
@@ -543,7 +543,7 @@ inline double pushRate() {
 // its output blocks - rows (the triangle outgoing, row attention, the transition) or columns (the triangle incoming,
 // column attention) - and the other ranks' shares are then copied in. Only the trunk's own pair splits: the template
 // stack's and the confidence head's tensors are rank-local and run whole on every rank.
-inline Shared* SPLIT = nullptr;
+inline LF_TLS Shared* SPLIT = nullptr;
 inline bool splitting(const void* pair) { return WORLD > 1 && SPLIT && pair == SPLIT->local; }
 // rank r's share of [0, total), total a multiple of align, in whole units of align
 inline void shareOf(int total, int align, int r, int& lo, int& hi) {

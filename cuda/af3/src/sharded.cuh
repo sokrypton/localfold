@@ -15,9 +15,9 @@
 
 namespace sh {
 // (the default with several GPUs; LOCALFOLD_MG_SHARDED=0 keeps phase 1, the pair replicated and its updates' work split)
-inline bool ON = !getenv("LOCALFOLD_MG_SHARDED") || atoi(getenv("LOCALFOLD_MG_SHARDED"));
+inline LF_TLS bool ON = !getenv("LOCALFOLD_MG_SHARDED") || atoi(getenv("LOCALFOLD_MG_SHARDED"));
 // the diffusion's pair rows on this rank - the trunk's slab carried into it (DLO -1: the whole pair, one GPU)
-inline int DLO = -1, DROWS = 0;
+inline LF_TLS int DLO = -1, DROWS = 0;
 inline int padded(int n) { return (n + 15) / 16 * 16; }
 // rank r's rows of the pair: its share of the padded length, its stored (real) rows clipped to n
 inline void rowsOf(int n, int r, int& lo, int& hi) { mg::shareOf(padded(n), 16, r, lo, hi); }
@@ -94,9 +94,9 @@ template <class T, class G>
 // (channels [c0, c0 + cw) of each share alone - the shares are channel-major [C][rows][np], so a window is one run of
 // them; gemm sees the window's planes)
 inline void ringOver(const mg::Shared& bmine, int n, int np, int c0, int cw, T* const* stages, int nstage, G gemm) {
-  static cudaStream_t cs = [] { cudaStream_t s; CK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking)); return s; }();
-  static cudaEvent_t ready[2], used[2];
-  static bool made = false;
+  static LF_TLS cudaStream_t cs = [] { cudaStream_t s; CK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking)); return s; }();
+  static LF_TLS cudaEvent_t ready[2], used[2];
+  static LF_TLS bool made = false;
   if (!made) { for (int k = 0; k < 2; ++k) { CK(cudaEventCreateWithFlags(&ready[k], cudaEventDisableTiming)); CK(cudaEventCreateWithFlags(&used[k], cudaEventDisableTiming)); } made = true; }
   int lo, hi; rowsOf(n, mg::RANK, lo, hi);
   if (hi > lo) gemm(hi - lo, (const T*)bmine.local + (size_t)c0 * (hi - lo) * np, lo);
@@ -265,7 +265,7 @@ inline void triangleOn(const mg::Shared& z, const float* mask, int n, int C, con
   // two products, the product share - against what each has free. shortPair's rule, 18x an f32 pair a GPU, put a
   // simulated rank of 8 in rounds at 4,940 tokens with 30 GB to spare, where the input pass run a window at a time was
   // 41% of its GPU time)
-  static std::map<std::pair<int, int>, bool> roundsOf;
+  static LF_TLS std::map<std::pair<int, int>, bool> roundsOf;
   bool rounds = false;
   if (!F8 && !x8) {
     if (R_SET >= 0) rounds = R_SET > 0;
@@ -283,7 +283,7 @@ inline void triangleOn(const mg::Shared& z, const float* mask, int n, int C, con
   mg::Shared& pS = mg::shared("sh.tp" + std::to_string(C), mine * sizeof(B16));
   // ...and on a card shorter still (every rank asked, once a shape), windows and gate chunks of half that: C / 32 - at
   // 16,549 tokens on 8 x 40 GB the two 17.5 GB shares left 5 GB, where C / 16's windows, slots, product and gate are 5.5
-  static std::map<std::pair<int, int>, int> narrowOf;
+  static LF_TLS std::map<std::pair<int, int>, int> narrowOf;
   int div = C >= 256 ? 16 : 8;
   if (rounds && C >= 256) {
     auto it = narrowOf.find({ n, C });
@@ -337,8 +337,8 @@ inline void triangleOn(const mg::Shared& z, const float* mask, int n, int C, con
   pAll[0] = scratch<B16>("trib.pall0", (size_t)g * plane);
   // (a second product - one step's push beside the next one's GEMM - where it fits)
   if (!rounds || roomFor((size_t)g * plane * sizeof(B16))) pAll[1] = scratch<B16>("trib.pall1", (size_t)g * plane);
-  static cudaStream_t pushS = nullptr, xS = nullptr;
-  static cudaEvent_t gemmed[2], pushed[2], fenced, filled;
+  static LF_TLS cudaStream_t pushS = nullptr, xS = nullptr;
+  static LF_TLS cudaEvent_t gemmed[2], pushed[2], fenced, filled;
   if (!pushS) {
     CK(cudaStreamCreateWithFlags(&pushS, cudaStreamNonBlocking)); CK(cudaStreamCreateWithFlags(&xS, cudaStreamNonBlocking));
     for (int k = 0; k < 2; ++k) for (cudaEvent_t* e : { &gemmed[k], &pushed[k] }) CK(cudaEventCreateWithFlags(e, cudaEventDisableTiming));
@@ -365,7 +365,7 @@ inline void triangleOn(const mg::Shared& z, const float* mask, int n, int C, con
     wideWarps<CC>(C, [&](auto warps) {
       constexpr int WI = decltype(warps)::value;
       WITH_PAIR_T(
-        static bool attr = false, attr8 = false;
+        static LF_TLS bool attr = false, attr8 = false;
         constexpr auto kern = triIn256For<CC, WI, TQ, PT>();
         constexpr auto kern8 = triIn256For<CC, WI, __nv_fp8_e4m3, PT>();
         const unsigned grid = (unsigned)(((size_t)rows * np + triInRowsOf(WI) - 1) / triInRowsOf(WI));
@@ -381,7 +381,7 @@ inline void triangleOn(const mg::Shared& z, const float* mask, int n, int C, con
           if constexpr (WI == TRIIN_TWO_TILES) {
             if (!x8 && rounds) {
               constexpr auto kernW = triIn256For<CC, 8, TQ, PT>();
-              static bool attrW = false;
+              static LF_TLS bool attrW = false;
               if (!attrW) { smemAttr(kernW, (int)wideTriInSmemW(CC, 8)); attrW = true; }
               kernW<<<(unsigned)(((size_t)rows * np + triInRowsOf(8) - 1) / triInRowsOf(8)), 32 * 8, wideTriInSmemW(CC, 8), STREAM>>>(
                 base, mask, lnS, lnO, wt, (TQ*)aL - back, (TQ*)bL - back, gate, n, np, cs, nullptr, win);
@@ -400,7 +400,7 @@ inline void triangleOn(const mg::Shared& z, const float* mask, int n, int C, con
         };
         // (DIAG LOCALFOLD_MG_TRI_TIMES=1: the phases' GPU time on rank 0's stream, printed every 96 triangles)
         static const bool tt = getenv("LOCALFOLD_MG_TRI_TIMES") != nullptr;
-        static double acc[4] = {}; static int calls = 0;
+        static LF_TLS double acc[4] = {}; static LF_TLS int calls = 0;
         std::vector<cudaEvent_t> te;
         auto mark = [&]() { if (!tt) return; cudaEvent_t e; CK(cudaEventCreate(&e)); CK(cudaEventRecord(e, STREAM)); te.push_back(e); };
         mark();
@@ -525,8 +525,8 @@ inline void rowAttention(const mg::Shared& z, const float* mask, int n, int C, i
   // (a chunk a quarter-million pairs or more, up to four: at 988 tokens on 8 a rank's 124 rows in four chunks left
   // the attention and the transition a quarter-filled card, +14 ms of a 218 ms simulated pass; at 2,964 four cost nothing)
   const int chunks = (int)std::clamp<size_t>(pairsHere / 262144, 1, 4);
-  static cudaStream_t pushS = nullptr;
-  static std::vector<cudaEvent_t> evs;
+  static LF_TLS cudaStream_t pushS = nullptr;
+  static LF_TLS std::vector<cudaEvent_t> evs;
   auto ev = [&](size_t k) {
     while (evs.size() <= k) { cudaEvent_t e; CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming)); evs.push_back(e); }
     return evs[k];
@@ -534,8 +534,8 @@ inline void rowAttention(const mg::Shared& z, const float* mask, int n, int C, i
   const int vecs = (int)((size_t)C * elem() / 16);
   // z^T pushed a chunk of every rank's columns at a time, a fence each (the count alike on every rank: off the largest
   // share), chunk k + 1's pushes on a side stream beside chunk k's input pass where the form is folded
-  static cudaStream_t xS = nullptr;
-  static cudaEvent_t xFenced, xFilled;
+  static LF_TLS cudaStream_t xS = nullptr;
+  static LF_TLS cudaEvent_t xFenced, xFilled;
   if (from && !xS) {
     CK(cudaStreamCreateWithFlags(&xS, cudaStreamNonBlocking));
     CK(cudaEventCreateWithFlags(&xFenced, cudaEventDisableTiming)); CK(cudaEventCreateWithFlags(&xFilled, cudaEventDisableTiming));

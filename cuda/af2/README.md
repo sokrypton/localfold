@@ -583,6 +583,28 @@ Not wired: the page sends the five as five jobs and the broker takes one fold at
 take the sweep as one job (or fold models 2-5 ahead of their jobs and answer from that), MPS started where the card
 allows it, and Colab's availability of the daemon checked.
 
+**Module 9: the five models on threads of ONE process - Module 8's gain without MPS.** Separate processes are separate
+CUDA contexts, which the GPU time-slices; MPS was only ever a way to merge them. One process's streams overlap
+natively, and every AF2 thread already gets its own (`STREAM` is `cudaStreamPerThread`, built `--default-stream
+per-thread`). So `localfold-af2 --multi <args> :: <args> :: ...` runs each group's `foldMain` - its own bundle and
+delta, warm-up and `--serve` directory - on a thread of one process, and every mutable global and function-level
+static the AF2 build reads is `LF_TLS` (`thread_local` in this binary only: AF3's cuBLAS warm-up and weight-upload
+threads read them as the process's, so there it is nothing). A device-wide synchronisation on one thread while
+another captures its graph breaks the capture - the scratch-growth path's `cudaDeviceSynchronize` did, at 150
+residues - so the capture and every `cudaFree`, `cudaMalloc` and `cudaDeviceSynchronize` on this path hold one
+process-wide `CAPTURE_MU`. A100, models 1-5 (2-5 as their deltas) given one input at once, wall time a job:
+
+| five models, one input | 68 res | 150 res | 261 res |
+|---|---:|---:|---:|
+| one after another | 322 ms | 634 | 1571 |
+| five processes, MPS (Module 8) | 147 | 470 | 1360 |
+| **one process, five threads** | **150** | **451** | **1316** |
+
+**2.1x, 1.4x and 1.19x**, every thread's PDB byte-identical to that model folded alone, at all three lengths; a
+lone fold is unchanged (68 residues 57.7 ms, 261 294.5) and so are AF3 (6MRR 356 ms, 1TIM 1,662) and ESMFold2, and
+`gate.py` reads as before. Not wired: `serveJobs` points the process's stdout at the job's log (`dup2`), so threads'
+logs collide - the worker reads them - and the worker would hand an "All 5" sweep to one `--multi` server.
+
 ## A deep alignment's featurisation (2026-10-08)
 
 🔴 **SUPERSEDED THE SAME DAY: the featuriser is native now** (`cuda/featurise/af2-featurise`), its nearest-centre

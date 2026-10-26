@@ -7,7 +7,7 @@
 
 // --fast: TF32 GEMMs and the f16 tensor-core flash attention (cuda/af3/src/flash.cuh) where a head
 // is 16 or 32 wide; residual streams and everything else stay f32
-inline bool FAST = false;
+inline LF_TLS bool FAST = false;
 
 // ---------------------------------------------------------------- weights
 // A haiku parameter, "w/<module>/<param>"; `block` picks one slice of a layer-stacked one.

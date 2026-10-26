@@ -387,7 +387,7 @@ struct Trunk {
 inline bool sharded(const Trunk& t) { return t.shardLo >= 0; }
 // several GPUs on a sharded pair, short of room: this rank's share of the pair parked in host memory (PARK_HOST) and
 // its shared buffer given back - collective, every rank alike (the choice is the agreed room's) - and brought home
-inline size_t SHARE_PARKED = 0;          // (the shared buffer's bytes, while parked)
+inline LF_TLS size_t SHARE_PARKED = 0;          // (the shared buffer's bytes, while parked)
 inline void parkShare(Trunk& t) {
   const size_t used = (size_t)t.shardRows * t.n * t.C * 2;
   if (PARK_HAVE < used) {
@@ -2384,7 +2384,7 @@ void runTrunk(Trunk& t, const std::function<void(const char*, const float*, size
       : (size_t)t.n * t.n * t.C * 2 + (M.flag("trunk.dialect.groupedOuterProduct") ? zBytes : 0);
     zHost = !roomFor(zBytes + beside);
     if (zHost) {
-      static void* host = nullptr; static size_t have = 0;
+      static LF_TLS void* host = nullptr; static LF_TLS size_t have = 0;
       if (have < zBytes) {
         if (host) CK(cudaFreeHost(host));
         if (cudaMallocHost(&host, zBytes) != cudaSuccess) {
