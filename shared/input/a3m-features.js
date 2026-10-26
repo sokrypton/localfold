@@ -309,6 +309,8 @@ function planA3mFeatures(a3mText, tables, options) {
   const recycles = options.recycles ?? 3;
   const maxMsa = Math.min(options.maxMsaSequences ?? MAX_MSA_CLUSTERS, depth);
   const maxExtra = options.maxExtraSequences ?? MAX_EXTRA_SEQUENCES;
+  // AF2's masked_msa replace fraction (`--msa-mask`; RFD4-Proteina's oracle folds at 0, `pct_seq_mask`)
+  const maskFraction = options.maskFraction ?? 0.15;
   const plans = [];
   for (let recycle = 0; recycle <= recycles; recycle += 1) {
     mark = performance.now();
@@ -328,7 +330,7 @@ function planA3mFeatures(a3mText, tables, options) {
       centerCodes.set(encoded.subarray(centers[center] * length, (centers[center] + 1) * length), center * length);
     }
     for (let index = 0; index < centerCodes.length; index += 1) {
-      if (random() >= 0.15) continue;
+      if (random() >= maskFraction) continue;
       // 🔴 FOUR OUTCOMES, NOT THREE. This used to be 70% mask, 20% keep, 10%
       // uniform - the profile draw was missing and its share had been folded
       // into "keep", so a masked position was twice as likely to be left alone

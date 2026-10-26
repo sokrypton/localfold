@@ -17,7 +17,7 @@ inline const std::vector<std::string>& metricsTagNames() {
       "unconditional_refolding", "af3_refolding", "motif_scaffold_refolding", "internal_coordinate_motif_scaffold_refolding",
       "sm_binder_refolding", "ame_refolding", "ame_no_ligand_refolding", "ame_original_benchmark_refolding",
       "disco_refolding", "ppi_refolding", "antibody", "dna_refolding",
-      "apo_refolding", "developability"};
+      "apo_refolding", "developability", "af2_refolding"};
   return names;
 }
 

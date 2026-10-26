@@ -38,8 +38,8 @@ namespace {
 struct Opts {
   std::string dir, weights, oracle, gen, genOracle, enc, encOracle, int8, job, dumpSample, metrics,
       out = "design.pdb";
-  // `--refold[=<localfold-af3>]`: refold each design that passes the pre-oracle filters with our
-  // own AlphaFold 3, as upstream's oracle does with DeepMind's (src/oracle.h).
+  // `--refold[=af3|af2]`: refold each design that passes the pre-oracle filters with our own
+  // AlphaFold 3 (the default) or AlphaFold 2, as upstream's oracles do with DeepMind's (src/oracle.h).
   std::string refold;
   int seed = 0;      // a later design draws its own noise from seed + design
   int recycles = 0;  // 0 = whatever the input directory says
@@ -52,12 +52,13 @@ struct Opts {
 int generate(const Opts& o, const rfd4p::Dims& d, rfd4p::Trunk& t);
 
 /** cuda/af3/localfold-af3 beside this binary's cuda/rfd4p. */
-std::string defaultAf3() {
+// The checkout's own build of an oracle: cuda/<oracle>/localfold-<oracle>, beside this binary's directory.
+std::string oracleBinary(const std::string& oracle) {
   char self[4096];
   const ssize_t n = readlink("/proc/self/exe", self, sizeof self - 1);
   std::string dir = n > 0 ? std::string(self, (size_t)n) : std::string("./localfold-rfd4p");
   dir = dir.substr(0, dir.rfind('/'));
-  return dir + "/../af3/localfold-af3";
+  return dir + "/../" + oracle + "/localfold-" + oracle;
 }
 
 int run(const Opts& o) {
@@ -708,19 +709,20 @@ int generate(const Opts& o, const rfd4p::Dims& d, rfd4p::Trunk& t) {
         const std::string base = dot == std::string::npos || dot < path.rfind('/') + 1 ? path : path.substr(0, dot);
         const size_t slash = base.rfind('/');
         rfd4p::oracle::Run run;
-        run.binary = o.refold;
+        run.oracle = o.refold;
+        run.binary = oracleBinary(o.refold);
         run.dir = base + "_refold";
         run.name = slash == std::string::npos ? base : base.substr(slash + 1);
         run.seed = (uint32_t)(o.seed + design);
         run.components = rfd4p::oracle::readComponents(o.gen + "/input-components.cif");
+        run.keepRaw = !o.dumpSample.empty();   // a run dumped for a checker keeps what the checker reads
         try {
           const rfd4p::metrics::Array full = rfd4p::metrics::designArray(records, in);
           std::vector<double> cwi;
           if (!rfd4p::metrics::coordsWithInsertion(full, in, proposed, cwi)) cwi.clear();
-          std::string coi;
-          const rfd4p::metrics::Values v = rfd4p::oracle::refoldDesign(full, cwi, run, tags, r.metrics, coi);
-          if (!v.empty()) {
-            std::ofstream(base + ".refold.json") << rfd4p::oracle::toJson(v, coi) << "\n";
+          const rfd4p::oracle::Scores v = rfd4p::oracle::refoldDesign(full, cwi, run, tags, r.metrics);
+          if (!v.values.empty()) {
+            std::ofstream(base + ".refold.json") << rfd4p::oracle::toJson(v) << "\n";
             printf("  refolded -> %s.refold.json\n", base.c_str());
           }
         } catch (const std::exception& e) {
@@ -906,8 +908,8 @@ int foldMain(int argc, char** argv) {
     else if (f == "--no-insertion") o.insertion = false;
     else if (!f.compare(0, 14, "--dump-sample=")) o.dumpSample = f.substr(14);
     else if (!f.compare(0, 10, "--metrics=")) o.metrics = f.substr(10);
-    else if (f == "--refold") o.refold = defaultAf3();
-    else if (!f.compare(0, 9, "--refold=")) o.refold = f.substr(9);
+    else if (f == "--refold") o.refold = "af3";
+    else if (f == "--refold=af3" || f == "--refold=af2") o.refold = f.substr(9);
     else { fprintf(stderr, "unknown flag %s\n", argv[i]); return 1; }
   }
   if (o.weights.empty() && o.int8.empty()) {

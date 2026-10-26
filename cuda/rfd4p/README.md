@@ -619,16 +619,17 @@ residue's own bond the dictionary's type wins, where both ports let the link's w
 refusals word for word. With link chemistry switched off on the page, 21 of its 25 raw loads go red -
 the plain proteins too, because their `OXT` now leaves with the peptide bond rather than by a rule.
 
-## Each design refolded by our own AlphaFold 3, scored as upstream scores it
+## Each design refolded by our own AlphaFold 3 or 2, scored as upstream scores it
 
 Upstream's evaluation refolds every design that passes the pre-oracle filters - from its sequence
 alone - and scores the refold: the oracle's confidences (`oracle.overall_plddt`, `oracle_ppi.min_ipae_coi`,
 ...), the design-against-refold RMSDs (`refolded_backbone_rmsd`, `refolded_motif_allatom_rmsd`,
 ...) and the pass criteria (`ppi.pass`, `motif_scaffold.pass`, ...), each under the job's
 `metrics_tags` (`unconditional_refolding`, `ppi_refolding`, `dna_refolding`, `sm_binder_refolding`,
-`motif_scaffold_refolding`, ...). Upstream runs DeepMind's AlphaFold 3 in a container for that;
-`localfold-rfd4p --refold` runs ours (`cuda/af3/localfold-af3`, or `--refold=<binary>`), writing
-`<design>.refold.json` and, under `<design>_refold/`, the AF3 job, AF3's files and the refolded
+`motif_scaffold_refolding`, ...). Upstream runs DeepMind's AlphaFold 3 in a container for that
+(`refolding_oracles/af3.yaml`), or AlphaFold 2 (`af2.yaml`); `localfold-rfd4p --refold` runs ours
+(`cuda/af3/localfold-af3`) and `--refold=af2` ours of the other (`cuda/af2/localfold-af2`), writing
+`<design>.refold.json` and, under `<design>_refold/`, the job, the fold's files and the refolded
 structure (`src/oracle.h`).
 
 🔴 **IT WRITES THE JOB UPSTREAM'S ROUND TRIP PRODUCES, AND IS HELD TO IT THROUGH AlphaFold 3's
@@ -660,7 +661,31 @@ by position where AlphaFold 3 keeps the job's ids, which the oracle reads back t
 own order. Refused, by name, rather than approximated: a pre-oracle transform (`apo_refolding`), a
 covalently attached modifier (upstream renames it for AF3), a non-standard polymer residue, two
 instances of one chain id, a ligand chain id that sorts before a polymer's (our AF3 puts polymers
-first), and the disco and developability metrics. The AF2 oracle is not ported yet.
+first), and the disco and developability metrics.
+
+🔴 **AND THE AF2 ORACLE THE SAME WAY, ITS SUMMARY TO THE DIGIT.** `--refold=af2` folds each protein-only
+design with our AF2 as upstream's worker folds it with ColabFold's - `model_1_ptm` for a monomer,
+`model_1_multimer_v3` for a complex, the chains in the multimer assembly's order (identical
+sequences grouped), three recycles and the multimer's 0.5 A early stop, the template from the
+design's coordinates-with-insertion - and summarises the fold as upstream's `_chain_summary` does:
+per-chain pLDDT and PAE, and each chain's pTM and each pair's ipTM recomputed from the PAE logits
+(`localfold-af2 --raw-confidences`) with DeepMind's `predicted_tm_score`, in numpy's own float32
+summation order (a bucket-padded PAE is a strided view, which numpy sums 8192 elements of whole
+rows at a time) and rounding (`chain_pair_iptm` is a float32 array). `check-rfd4p-oracle.py
+--oracle=af2` holds our AF2's featurised input to upstream's own `build_raw_features_from_payload`
+(a ColabFold environment), our summary to upstream's `_chain_summary` run over our raw confidences
+padded to its bucket, and every score to upstream's managers: five designs (gate arm `upstream
+o2`), exact. Two featuriser parameters it needed, both defaulting to what the page does:
+
+- 🔴 **`--msa-mask=0`.** Our AF2 masks its alignment's centres as ColabFold does (BERT, 15%); the
+  oracle's `pct_seq_mask` is 0, and a single sequence masked is a different query.
+- 🔴 **`--template-pad=zero`.** A complex's chain with no template: ColabFold - and the page - give
+  it a mock template of gaps, AlphaFold-Multimer's own pipeline (`_pad_templates`) zeros, so restype
+  0, which the template stack reads unmasked. Upstream's worker is DeepMind's pipeline; the gate
+  found the binder chain's 68 residues reading 21 here and 0 there.
+
+A two-chain design under `motif_scaffold_refolding` is refused as upstream refuses it (`model_1_ptm`
+folds monomers).
 
 ## Every preset generates
 

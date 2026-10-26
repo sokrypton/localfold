@@ -11,7 +11,7 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-431 tools. `tools/fixtures/` is data and is not listed.
+432 tools. `tools/fixtures/` is data and is not listed.
 
 ## `tools/gpu/` - the WebGPU lane (215)
 
@@ -333,7 +333,7 @@ and turning it into a bundle.
 - **`safetensors_read.py`** - Read a .safetensors file into numpy arrays, without the safetensors package.
 - **`vector-quantise.py`** - Is a codebook worth a new decoder? Scalar codes against vector ones, at 2 bits.
 
-## `tools/` - everything else (129)
+## `tools/` - everything else (130)
 
 CPU checkers, the export and quantisation pipeline, the page drivers that
 go through CDP, and the deploy.
@@ -390,6 +390,7 @@ go through CDP, and the deploy.
 - **`check-rfd4p-load.py`** - Hold the page's structure LOADER to upstream's, atom for atom: `load_condition_spec_inputs`.
 - **`check-rfd4p-manifest.py`** - Does our copy of RFD4-Proteina's tensor manifest still describe the shards being served?
 - **`check-rfd4p-metrics.py`** - Hold the RFD4 design metrics to upstream's own metric manager, on the same sample.
+- **`check-rfd4p-oracle.py`** - Hold the RFD4 refolding oracle (cuda/rfd4p/src/oracle.h) to upstream's, on the same designs.
 - **`check-rfd4p-query.py`** - Hold both ports' selection language to UPSTREAM's, atom for atom, on the shipped structures.
 - **`check-rfd4p-sampler.py`** - Hold the RFD4 sampler's schedules and steps to upstream's own, in every mode it offers.
 - **`check-safari-syntax.mjs`** - Parse every module the site ships with this Mac's own JavaScriptCore, the engine of its Safari, so syntax that Safari cannot parse (regex lookbehind before 16.4, class static blocks, ...) fails here instead of in a visitor's browser, where one bad literal stops a whole module from loading. macOS only; skips elsewhere.

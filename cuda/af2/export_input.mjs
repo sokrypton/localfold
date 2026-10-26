@@ -3,8 +3,9 @@
 // model.idx/model.bin format.
 //
 //   node cuda/af2/export_input.mjs <out dir> --sequence=<SEQ> [--a3m=<path>] [--recycles=3]
-//        [--max-msa=512] [--max-extra=1024] [--seed=0] (--bundle=<page bundle dir> | --weights=<export dir>)
-//        [--search] [--template=<structure>:<chain>[@<query chain>][+...],...] [--job=<AF3 job.json>]
+//        [--max-msa=512] [--max-extra=1024] [--seed=0] [--msa-mask=0.15] (--bundle=<page bundle dir> | --weights=<export dir>)
+//        [--search] [--template=<structure>:<chain>[@<query chain>][+...],...] [--template-pad=gap|zero]
+//        [--job=<AF3 job.json>]
 //
 // Entries:  i aatype, residue_index, asym_id, entity_id, sym_id   t seq_mask      (per residue)
 //           t f<k>/msa_feat [N, L, 49], f<k>/msa_mask [N, L]                       (pass k)
@@ -67,11 +68,16 @@ let sequence = option("sequence", "").trim().toUpperCase();
 // --job=<AF3 job.json>: the page's own reader (web/job-json.js, web/entities.js), as cuda/af3's and
 // cuda/ef2's exporters read one. AlphaFold 2 folds protein chains and nothing else, so anything else
 // in the job is refused by name rather than dropped
+// The templates the job carries inline (a protein chain's `templates`, each with its mapping), lifted
+// out before the page's reader sees the job - which would otherwise carry them as nothing here
+const jobTemplates = [];
 if (option("job", "") !== "") {
   if (sequence !== "") throw new Error("--job and --sequence both name the input");
-  const { jobFromJson } = await import("../../web/job-json.js");
+  const { jobFromJson, liftJobTemplates } = await import("../../web/job-json.js");
   const { expandEntities } = await import("../../web/entities.js");
-  const job = jobFromJson(readFileSync(option("job", ""), "utf8"));
+  const raw = JSON.parse(readFileSync(option("job", ""), "utf8"));
+  jobTemplates.push(...liftJobTemplates(raw));
+  const job = jobFromJson(JSON.stringify(raw));
   for (const note of job.notes) console.log(`job: ${note}`);
   const request = expandEntities(job.entities);
   const other = request.chainKinds.filter((kind) => kind !== "protein");
@@ -134,6 +140,7 @@ const featureOptions = {
   maxMsaSequences: Number(option("max-msa", "512")),
   maxExtraSequences: Number(option("max-extra", "1024")),
   randomSeed: Number(option("seed", "0")),
+  maskFraction: Number(option("msa-mask", "0.15")),
   // AF-Multimer's cluster profile for multimer weights (shared/input/a3m-features.js; the page derives it in
   // webgpu/af2/multimer/model.js from the same fact)
   multimerClustering: isMultimer,
@@ -184,11 +191,19 @@ const templateSpecs = option("template", "").split(",").filter(Boolean);
 // --template-search-chains=<chains>: the page's "from the MSA search" template - each listed chain's BEST
 // hit from the same search, aligned and placed as any other part, all in the one slot AF2 takes
 const searchChains = option("template-search-chains", "").split(",").filter(Boolean).map(Number);
+const templatePad = option("template-pad", "gap");
+if (templatePad !== "gap" && templatePad !== "zero") throw new Error(`--template-pad is gap or zero, not ${templatePad}`);
 if (searchChains.length > 0 && searchedHits === null) throw new Error("--template-search-chains needs --search: the hits come from that search");
 if (templateSpecs.length > 1) {
   throw new Error("AlphaFold 2 takes one template slot: join its parts with '+'");
 }
-if (templateSpecs.length > 0 || searchChains.length > 0) {
+// A job's own templates are the one slot too: its first template of each chain, aligned by the job's
+// own mapping (AF3's queryIndices / templateIndices), never beside --template
+if (jobTemplates.length > 1) throw new Error("AlphaFold 2 takes one template a chain; the job gives a chain more than one");
+if (jobTemplates.length > 0 && (templateSpecs.length > 0 || searchChains.length > 0)) {
+  throw new Error("the job carries its templates; --template and --template-search-chains would add others to its slot");
+}
+if (templateSpecs.length > 0 || searchChains.length > 0 || jobTemplates.length > 0) {
   const { buildTemplate, mergeAtom37Templates } = await import("../../web/template-source.js");
   const chains = sequence.split(":").filter(Boolean);
   const offsets = chains.map((_, at) => chains.slice(0, at).reduce((n, c) => n + c.length, 0));
@@ -212,19 +227,27 @@ if (templateSpecs.length > 0 || searchChains.length > 0) {
       const [where, at] = part.split("@"); const cut = where.lastIndexOf(":");
       return { path: where.slice(0, cut), chain: where.slice(cut + 1) || undefined, at: Number(at) };
     }) : (chains0 ?? "").split("+").map((c, at) => ({ path: path0, chain: c || undefined, at }));
-    const all = [...parts.map((p) => ({ ...p, text: readFileSync(p.path, "utf8") })), ...searchParts];
+    const jobParts = (jobTemplates[0] ?? []).map((t) => ({ text: t.text, at: t.chain, mapping: t.mapping, label: t.label }));
+    const all = [...parts.map((p) => ({ ...p, text: readFileSync(p.path, "utf8") })), ...searchParts, ...jobParts];
     const taken = new Set();
-    const built = all.map(({ text, chain, at }) => {
+    const built = all.map(({ text, chain, at, mapping }) => {
       if (!isMultimer && at !== 0) throw new Error("AlphaFold 2's monomer takes a template on its one chain only");
       if (at >= chains.length) throw new Error(`template ${k}: no query chain ${at}`);
       if (taken.has(at)) throw new Error(`AlphaFold 2 takes one template a chain; chain ${at + 1} has two`);
       taken.add(at);
       return buildTemplate({ text, chain, query: isMultimer ? chains[at] : chains.join(""),
-                             offset: isMultimer ? offsets[at] : 0, tokens: L, minConfidence: 0, layout: "atom37" });
+                             offset: isMultimer ? offsets[at] : 0, tokens: L, minConfidence: 0, layout: "atom37",
+                             ...(mapping === undefined ? {} : { mapping }) });
     });
     const slot = (built.length === 1 ? built[0] : mergeAtom37Templates(built, L)).slot;
+    // --template-pad=zero: a chain the slot does not cover as AlphaFold-Multimer's own pipeline pads it
+    // (msa_pairing._pad_templates: zeros, so restype 0), where ColabFold's mock template - the default,
+    // the page's - is gaps
+    if (templatePad === "zero" && isMultimer) {
+      chains.forEach((c, at) => { if (!taken.has(at)) slot.aatype.fill(0, offsets[at], offsets[at] + c.length); });
+    }
     aat.set(slot.aatype, k * L); pos.set(slot.atomPositions, k * L * 37 * 3); msk.set(slot.atomMask, k * L * 37);
-    console.log(`template: ${[spec, ...searchParts.map((p) => `search hit ${p.label}`)].filter(Boolean).join(" + ")},`
+    console.log(`template: ${[spec, ...searchParts.map((p) => `search hit ${p.label}`), ...jobParts.map((p) => `${p.label} of chain ${p.at + 1}`)].filter(Boolean).join(" + ")},`
       + ` ${slot.covered} residues, ${slot.atoms} atoms`);
   });
   int("t/aatype", aat); flt("t/positions", pos); flt("t/mask", msk);

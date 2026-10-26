@@ -159,7 +159,7 @@ export const METRICS_TAGS = ['design', 'structure_prediction', 'small_molecule_o
   'unconditional_refolding', 'af3_refolding', 'motif_scaffold_refolding', 'internal_coordinate_motif_scaffold_refolding',
   'sm_binder_refolding', 'ame_refolding', 'ame_no_ligand_refolding', 'ame_original_benchmark_refolding',
   'disco_refolding', 'ppi_refolding', 'antibody', 'dna_refolding',
-  'apo_refolding', 'developability'];
+  'apo_refolding', 'developability', 'af2_refolding'];
 export function metricsTagBits(tags) {
   return METRICS_TAGS.reduce((bits, t, k) => (tags.includes(t) ? bits | (1 << k) : bits), 0);
 }

@@ -34,8 +34,11 @@ using metrics::Array;
 using metrics::Gate;
 using metrics::Values;
 
-/** One entry of `refolding_oracles/af3.yaml`: its config key, `oracle_name`, template query and tags. */
-struct Spec { std::string key, name, templateQuery; Gate gate; };
+/**
+ * One entry of `refolding_oracles/af3.yaml` or `af2.yaml`: its config key, `oracle_name`, template
+ * query and tags, and for AlphaFold 2 the `model_name` it folds with.
+ */
+struct Spec { std::string key, name, templateQuery; Gate gate; std::string model; };
 inline const std::vector<Spec>& af3Specs() {
   static const std::vector<Spec> specs = {
       {"oracle", "af3", "", {{"af3_refolding", "unconditional_refolding", "motif_scaffold_refolding",
@@ -43,6 +46,15 @@ inline const std::vector<Spec>& af3Specs() {
                                "ame_no_ligand_refolding", "ame_original_benchmark_refolding", "disco_refolding"}, {}, {}}},
       {"oracle_ppi", "af3_ppi", "(sa_mask('C_CRD') | sa_mask('C_INTCRD')) & is_protein", {{"ppi_refolding", "antibody"}, {}, {}}},
       {"oracle_dna", "af3_dna", "sa_mask('C_CRD') & ~is_nucleic_acid", {{"dna_refolding"}, {}, {}}},
+  };
+  return specs;
+}
+inline const std::vector<Spec>& af2Specs() {
+  static const std::vector<Spec> specs = {
+      {"oracle", "af2", "", {{"af2_refolding", "unconditional_refolding", "motif_scaffold_refolding",
+                               "internal_coordinate_motif_scaffold_refolding", "ame_no_ligand_refolding"}, {}, {}},
+       "model_1_ptm"},
+      {"oracle_ppi", "af2_ppi", "sa_mask('C_CRD')", {{"ppi_refolding", "antibody"}, {}, {}}, "model_1_multimer_v3"},
   };
   return specs;
 }
@@ -259,7 +271,7 @@ inline std::string userCcdBlock(const Array& a, const std::vector<int>& atoms) {
 
 /** A template chain as mmCIF: the residues' atoms, numbered in the chain's own order. */
 inline std::string templateCif(const Array& a, const std::vector<int>& chainAtoms, const std::string& chain,
-                               const std::vector<std::pair<int, int>>& spans) {
+                               const std::vector<std::pair<int, int>>& spans, const std::vector<double>& coord) {
   std::string s = "data_template_chain_" + chain + "\n#\n_pdbx_audit_revision_history.revision_date 1900-01-01\n#\n"
                   "loop_\n_entity_poly_seq.entity_id\n_entity_poly_seq.num\n_entity_poly_seq.mon_id\n"
                   "_entity_poly_seq.hetero\n";
@@ -278,8 +290,8 @@ inline std::string templateCif(const Array& a, const std::vector<int>& chainAtom
       const int i = chainAtoms[k];
       const std::string name = a.atomName[i].find('\'') != std::string::npos ? "\"" + a.atomName[i] + "\"" : a.atomName[i];
       s += "ATOM " + std::to_string(id++) + " " + a.element[i] + " " + name + " . " + a.resName[i] + " " + chain + " 1 " +
-           std::to_string(r + 1) + " ? " + fixed3(a.coord[(size_t)i * 3]) + " " + fixed3(a.coord[(size_t)i * 3 + 1]) +
-           " " + fixed3(a.coord[(size_t)i * 3 + 2]) + " 1.00 0.00 " + std::to_string(r + 1) + " " + chain + " 1\n";
+           std::to_string(r + 1) + " ? " + fixed3(coord[(size_t)i * 3]) + " " + fixed3(coord[(size_t)i * 3 + 1]) +
+           " " + fixed3(coord[(size_t)i * 3 + 2]) + " 1.00 0.00 " + std::to_string(r + 1) + " " + chain + " 1\n";
     }
   }
   return s + "#\n";
@@ -312,15 +324,16 @@ inline std::map<std::string, std::string> readComponents(const std::string& path
   return out;
 }
 
-/** What `fold` needs again once AF3 has run: the design as it was handed over, and how its chains were named. */
+/** What the scoring needs again once the oracle has run: the design as it was handed over, and how its chains were named. */
 struct Prepared {
-  Array design;                                  // the design, terminal oxygens removed
-  std::vector<std::string> af3Chain;             // per atom of `design`, the chain AF3 is handed
-  std::map<std::string, std::string> af3ToIid;   // AF3 chain -> the design's chain instance
-  std::string job;                               // the AF3 job (alphafold3 dialect)
-  // The job's chains in the order AF3 takes them; our AF3 names its output's chains by that
-  // position (A, B, ... - `positionalChain`), where AlphaFold 3 keeps the job's ids.
-  std::vector<std::string> af3Order;
+  Array design;                                   // the design, terminal oxygens removed
+  std::vector<std::string> foldChain;             // per atom of `design`, the chain the oracle is handed
+  std::map<std::string, std::string> foldToIid;   // the oracle's chain -> the design's chain instance
+  std::string job;                                // the job (alphafold3 dialect)
+  // The job's chains in the order the oracle takes them (AF3's by id, AF2's by its assembly); our
+  // folds name their output's chains by that position, where AlphaFold keeps the job's ids.
+  std::vector<std::string> foldOrder;
+  std::vector<int> foldLengths;                   // residues a chain, in that order (AF2)
 };
 
 /** `str_id_to_int_id`: an mmCIF chain id's place in AF3's chain order (A..Z, then AA, BA, ...). */
@@ -364,9 +377,9 @@ inline Prepared prepare(const Array& full, const Spec& spec, const std::string& 
   for (int i = 0; i < d.n; ++i) iids[d.chainId[i]].insert(d.chainIid[i]);
   for (const auto& [chain, set] : iids) {
     if (set.size() > 1) refuse("chain " + chain + " has several instances, whose renaming for AF3 is not ported");
-    p.af3ToIid[chain] = *set.begin();
+    p.foldToIid[chain] = *set.begin();
   }
-  p.af3Chain = d.chainId;
+  p.foldChain = d.chainId;
   // `_rename_covalent_modifiers_for_af3`: a non-polymer bonded to a standard amino acid.
   for (size_t k = 0; k < d.bonds.size(); ++k) {
     const int i = d.bonds[k].first, j = d.bonds[k].second;
@@ -401,7 +414,7 @@ inline Prepared prepare(const Array& full, const Spec& spec, const std::string& 
              "our AF3 (polymers first) would reorder");
     }
   }
-  p.af3Order = order;
+  p.foldOrder = order;
   std::string seqs;
   std::map<std::string, std::vector<int>> userComponents;   // first occurrence of each non-standard residue
   std::vector<std::string> userOrder;
@@ -450,7 +463,7 @@ inline Prepared prepare(const Array& full, const Spec& spec, const std::string& 
         if (!query.empty()) {
           std::string idx;
           for (size_t k = 0; k < query.size(); ++k) idx += (k ? ", " : "") + std::to_string(query[k]);
-          templates = "[{\"mmcif\": " + jsonString(templateCif(d, atoms, chain, spans)) + ", \"queryIndices\": [" + idx +
+          templates = "[{\"mmcif\": " + jsonString(templateCif(d, atoms, chain, spans, std::vector<double>(d.coord.begin(), d.coord.end()))) + ", \"queryIndices\": [" + idx +
                       "], \"templateIndices\": [" + idx + "]}]";
         }
       }
@@ -508,26 +521,40 @@ inline Prepared prepare(const Array& full, const Spec& spec, const std::string& 
  * numpy's float32 mean (`np.mean` of a float32 array): the pairwise sum numpy reduces with - eight
  * accumulators below its 128-element block, halves above - in float32, divided in float32.
  */
-inline float pairwiseSum32(const float* a, size_t n) {
+template <class T> inline T pairwiseSum(const T* a, size_t n) {
   if (n < 8) {
-    float r = 0.f;   // numpy starts the short sum at -0.0, which adds as 0
+    T r = 0;   // numpy starts the short sum at -0.0, which adds as 0
     for (size_t i = 0; i < n; ++i) r += a[i];
     return r;
   }
   if (n <= 128) {
-    float r[8];
+    T r[8];
     for (int k = 0; k < 8; ++k) r[k] = a[k];
     size_t i = 8;
     for (; i < n - (n % 8); i += 8) for (int k = 0; k < 8; ++k) r[k] += a[i + k];
-    float res = ((r[0] + r[1]) + (r[2] + r[3])) + ((r[4] + r[5]) + (r[6] + r[7]));
+    T res = ((r[0] + r[1]) + (r[2] + r[3])) + ((r[4] + r[5]) + (r[6] + r[7]));
     for (; i < n; ++i) res += a[i];
     return res;
   }
   size_t n2 = n / 2;
   n2 -= n2 % 8;
-  return pairwiseSum32(a, n2) + pairwiseSum32(a + n2, n - n2);
+  return pairwiseSum(a, n2) + pairwiseSum(a + n2, n - n2);
 }
+inline float pairwiseSum32(const float* a, size_t n) { return pairwiseSum(a, n); }
 inline float mean32(const std::vector<float>& v) { return pairwiseSum32(v.data(), v.size()) / (float)v.size(); }
+/**
+ * `np.mean` of the top-left `rows x rows` of a float32 array `stride` wide, held row-major in `m`:
+ * contiguous (rows == stride) it is the one pairwise sum; a strided view numpy reduces through its
+ * 8192-element buffer, a whole number of rows at a time, each buffer's pairwise sum added in turn.
+ */
+inline float meanCorner32(const std::vector<float>& m, size_t rows, size_t stride) {
+  if (rows == stride) return mean32(m);
+  const size_t step = (8192 / rows) * rows;
+  if (step == 0) refuse("a " + std::to_string(rows) + "-residue PAE is wider than numpy's reduction buffer, which is not ported");
+  float acc = 0.f;
+  for (size_t s = 0; s < m.size(); s += step) acc += pairwiseSum32(m.data() + s, std::min(step, m.size() - s));
+  return acc / (float)m.size();
+}
 
 /** Python's `round(x, 4)` (correctly rounded, as printf is). */
 inline double round4(double v) { char b[64]; snprintf(b, sizeof b, "%.4f", v); return strtod(b, nullptr); }
@@ -716,6 +743,273 @@ inline Values extractConfidenceMetrics(const Summary& s, const std::map<std::str
   return m;
 }
 
+// ------------------------------------------------------------------------------------------------
+// AlphaFold 2 (af2_oracle.py, af2/af2_runtime.py).
+
+/** `nearest_bucket`: the residue count AF2's features are padded to. */
+inline size_t af2Bucket(size_t residues) {
+  for (const size_t b : {64, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 2560, 3072}) if (residues <= b) return b;
+  refuse("Sequence has " + std::to_string(residues) + " residues, exceeding the largest AF2 bucket (3072)");
+}
+
+/**
+ * `AF2Oracle._build_manifest` + `build_raw_features_from_payload`: the job our AF2 folds for one
+ * design under one spec - protein chains only, each its single sequence, in the order AF2's
+ * multimer assembly takes them (`add_assembly_features`: chains grouped by sequence, the groups in
+ * order of first appearance) - and a template of the spec's residues at their coordinates-with-
+ * insertion (`_build_af2_template_dict`), the rest of the chain at the design's. `cwi` is per atom
+ * of the design with terminal oxygens removed, or empty.
+ */
+inline Prepared prepareAf2(const Array& full, const Spec& spec, const std::string& name, const std::vector<double>& cwi) {
+  Prepared p;
+  p.design = subset(full, withoutTerminalOxygens(full));
+  const Array& d = p.design;
+  for (int i = 0; i < d.n; ++i) {
+    if (d.resName[i] == "UNL") refuse("Input structure for '" + name + "' contains unsupported residue 'UNL'.");
+  }
+  std::set<std::string> other;
+  for (int i = 0; i < d.n; ++i) if (!d.isProtein[i]) other.insert(d.resName[i]);
+  if (!other.empty()) {
+    std::string list;
+    for (const std::string& r : other) list += (list.empty() ? "'" : " '") + r + "'";
+    refuse("AF2Oracle only supports proteins; '" + name + "' contains non-protein residues: [" + list + "].");
+  }
+  const auto [coi, unambiguous] = chainOfInterestOf(d);
+  const std::vector<uint8_t> templ = spec.templateQuery.empty() ? std::vector<uint8_t>(d.n, 0)
+                                                                : mask(d, spec.templateQuery, unambiguous ? coi : "");
+  std::map<std::string, std::set<std::string>> iids;
+  for (int i = 0; i < d.n; ++i) iids[d.chainId[i]].insert(d.chainIid[i]);
+  for (const auto& [chain, set] : iids) {
+    if (set.size() > 1) refuse("chain " + chain + " has several instances, whose renaming for AF2 is not ported");
+    p.foldToIid[chain] = *set.begin();
+  }
+  p.foldChain = d.chainId;
+  std::vector<std::string> order;
+  std::map<std::string, std::vector<int>> chainAtoms;
+  for (int i = 0; i < d.n; ++i) {
+    if (!finiteAt(d, i)) continue;   // what is handed over: the atoms with coordinates
+    if (!chainAtoms.count(d.chainId[i])) order.push_back(d.chainId[i]);
+    chainAtoms[d.chainId[i]].push_back(i);
+  }
+  if (order.empty()) refuse("AF2 input '" + name + "' has no atoms with finite coordinates.");
+  const bool multimer = spec.model.find("multimer") != std::string::npos;
+  if (!multimer && order.size() != 1) {
+    refuse("AF2 model '" + spec.model + "' requires a monomer input, got " + std::to_string(order.size()) + " chains.");
+  }
+  if (multimer && order.size() < 2) {
+    refuse("AF2 model '" + spec.model + "' requires a multimer input, got " + std::to_string(order.size()) + " chain.");
+  }
+  std::map<std::string, std::string> sequence;
+  for (const std::string& chain : order) {
+    for (const auto& [s, e] : residueSpans(d, chainAtoms[chain])) {
+      const std::string& r = d.resName[chainAtoms[chain][s]];
+      int k = 0;
+      while (k < 20 && r != metrics::STANDARD_AA[k]) ++k;
+      // `parse_protein_chains` would leave the residue out of the sequence, and the refold would no
+      // longer line up with the design
+      if (k == 20) refuse("a non-standard residue (" + r + "), which AF2's reader leaves out of the sequence");
+      sequence[chain] += "ARNDCQEGHILKMFPSTWYV"[k];
+    }
+  }
+  // `add_assembly_features`: identical sequences one entity, the entities in order of first appearance.
+  std::vector<std::string> entities;
+  for (const std::string& chain : order) {
+    if (std::find(entities.begin(), entities.end(), sequence[chain]) == entities.end()) entities.push_back(sequence[chain]);
+  }
+  for (const std::string& e : entities) for (const std::string& chain : order) if (sequence[chain] == e) p.foldOrder.push_back(chain);
+  std::string seqs;
+  for (const std::string& chain : p.foldOrder) {
+    const std::vector<int>& atoms = chainAtoms[chain];
+    const auto spans = residueSpans(d, atoms);
+    p.foldLengths.push_back((int)spans.size());
+    std::vector<int> query;
+    for (size_t r = 0; r < spans.size(); ++r) {
+      bool any = false;
+      for (int k = spans[r].first; k < spans[r].second; ++k) any = any || templ[atoms[k]];
+      if (any) query.push_back((int)r);
+    }
+    std::string templates = "[]";
+    if (!query.empty()) {
+      std::vector<double> coord(d.coord.begin(), d.coord.end());
+      for (const int i : atoms) {
+        if (!templ[i] || cwi.empty()) continue;
+        const double* c = &cwi[(size_t)i * 3];
+        if (std::isfinite(c[0]) && std::isfinite(c[1]) && std::isfinite(c[2])) std::copy(c, c + 3, coord.begin() + (size_t)i * 3);
+      }
+      std::string idx;
+      for (size_t k = 0; k < query.size(); ++k) idx += (k ? ", " : "") + std::to_string(query[k]);
+      templates = "[{\"mmcif\": " + jsonString(templateCif(d, atoms, chain, spans, coord)) + ", \"queryIndices\": [" + idx +
+                  "], \"templateIndices\": [" + idx + "]}]";
+    }
+    seqs += (seqs.empty() ? "" : ", ") + std::string("{\"protein\": {\"id\": ") + jsonString(chain) + ", \"sequence\": " +
+            jsonString(sequence[chain]) + ", \"modifications\": [], \"unpairedMsa\": \"\", \"pairedMsa\": \"\", \"templates\": " +
+            templates + "}}";
+  }
+  p.job = "{\"dialect\": \"alphafold3\", \"version\": 4, \"name\": " + jsonString(name) + ", \"sequences\": [" + seqs +
+          "], \"modelSeeds\": [0]}";
+  return p;
+}
+
+/** numpy's `np.round(x, 4)`: scaled, rounded half to even, scaled back - in the array's own precision. */
+inline double npRound4(double v) { return std::nearbyint(v * 10000.0) / 10000.0; }
+inline double npRound4f(float v) { return (double)(std::nearbyintf(v * 10000.0f) / 10000.0f); }
+
+/**
+ * DeepMind's `confidence.predicted_tm_score` over the residues `idx` of an `n x n x 64` PAE logit
+ * array, as numpy computes it: the softmax in float32, the TM terms and their weighting in float64,
+ * the alignment with the best score. `interface` weighs only the pairs across `asym`.
+ */
+inline double predictedTmScore(const std::vector<float>& logits, size_t n, const std::vector<int>& idx,
+                               const std::vector<int>* asym) {
+  const size_t m = idx.size();
+  const int clipped = std::max((int)m, 19);
+  const double d0 = 1.24 * std::pow((double)(clipped - 15), 1.0 / 3) - 1.8;
+  double tmPerBin[64];
+  for (int k = 0; k < 64; ++k) {
+    const float c = k < 63 ? 0.25f + 0.5f * (float)k : 31.75f;   // `_calculate_bin_centers` of linspace(0, 31, 63)
+    tmPerBin[k] = 1.0 / (1 + (double)(c * c) / (d0 * d0));
+  }
+  std::vector<double> term(m), weighted(m);
+  double best = -1;
+  size_t at = 0;
+  std::vector<double> perAlignment(m);
+  for (size_t r = 0; r < m; ++r) {
+    size_t count = 0;
+    for (size_t c = 0; c < m; ++c) count += !asym || (*asym)[r] != (*asym)[c];
+    const double normed = 1.0 / (1e-8 + (double)count);
+    for (size_t c = 0; c < m; ++c) {
+      const bool pair = !asym || (*asym)[r] != (*asym)[c];
+      const float* x = &logits[((size_t)idx[r] * n + (size_t)idx[c]) * 64];
+      float top = x[0];
+      for (int k = 1; k < 64; ++k) top = std::max(top, x[k]);
+      float e[64];
+      for (int k = 0; k < 64; ++k) e[k] = std::exp(x[k] - top);
+      const float sum = pairwiseSum(e, 64);
+      double t[64];
+      for (int k = 0; k < 64; ++k) t[k] = (double)(e[k] / sum) * tmPerBin[k];
+      term[c] = pairwiseSum(t, 64) * (pair ? 1.0 : 0.0);
+      weighted[c] = term[c] * (pair ? normed : 0.0);
+    }
+    perAlignment[r] = pairwiseSum(weighted.data(), m);
+    if (perAlignment[r] > best) { best = perAlignment[r]; at = r; }
+  }
+  return perAlignment[at];
+}
+
+/**
+ * `_chain_summary`: our AF2's raw confidences (`--raw-confidences`: per-residue pLDDT, the PAE, pTM
+ * and ipTM, and the PAE head's logits) summarised as upstream's AF2 worker summarises the model's,
+ * written beside them as its `<stem>_summary_confidences.json`. `chains` and `lengths` are the
+ * fold's order.
+ */
+inline Summary af2Summary(const std::string& base, const std::vector<std::string>& chains, const std::vector<int>& lengths,
+                          const std::string& model) {
+  const lf::Json raw = lf::parseJson(readText(base + "_model_raw_confidences.json"));
+  std::vector<float> plddt, pae;
+  for (const auto& v : raw.get("plddt")->a) plddt.push_back((float)v.n);
+  for (const auto& v : raw.get("pae")->a) pae.push_back((float)v.n);
+  const size_t n = plddt.size();
+  if (pae.size() != n * n) refuse(base + "_model_raw_confidences.json: the pae is not residues x residues");
+  size_t total = 0;
+  for (const int l : lengths) total += (size_t)l;
+  if (total != n) refuse("AF2 folded " + std::to_string(n) + " residues of the job's " + std::to_string(total));
+  std::vector<float> logits(n * n * 64);
+  {
+    FILE* f = fopen((base + "_model_pae_logits.f32").c_str(), "rb");
+    if (!f || fread(logits.data(), 4, logits.size(), f) != logits.size()) refuse("cannot read " + base + "_model_pae_logits.f32");
+    fclose(f);
+  }
+  const double ptm = raw.get("ptm")->n;
+  const lf::Json* iptmJ = raw.get("iptm");
+  const double iptm = lf::Json::absent(iptmJ) ? 0.0 : iptmJ->n;   // `prediction_result.get("iptm", 0.0)`
+  std::vector<int> chainIndex;
+  for (size_t c = 0; c < lengths.size(); ++c) chainIndex.insert(chainIndex.end(), (size_t)lengths[c], (int)c);
+  auto residues = [&](size_t c) { std::vector<int> r; for (size_t i = 0; i < n; ++i) if (chainIndex[i] == (int)c) r.push_back((int)i); return r; };
+  Summary s;
+  s.chains = chains;
+  const size_t nc = chains.size();
+  s.pairPae.assign(nc, std::vector<double>(nc));
+  s.pairPaeMin.assign(nc, std::vector<double>(nc));
+  s.pairIptm.assign(nc, std::vector<double>(nc));
+  std::vector<float> pairIptm32(nc * nc, 0.f);   // `chain_pair_iptm` is a float32 array
+  for (size_t a = 0; a < nc; ++a) {
+    const auto ra = residues(a);
+    std::vector<float> own;
+    for (const int i : ra) own.push_back(plddt[(size_t)i]);
+    s.chainPlddt.push_back(npRound4((double)mean32(own) / 100.0));
+    for (size_t b = 0; b < nc; ++b) {
+      const auto rb = residues(b);
+      std::vector<float> block;
+      for (const int i : ra) for (const int j : rb) block.push_back(pae[(size_t)i * n + (size_t)j]);
+      s.pairPae[a][b] = npRound4((double)mean32(block));
+      s.pairPaeMin[a][b] = npRound4((double)*std::min_element(block.begin(), block.end()));
+    }
+    s.chainPae.push_back(s.pairPae[a][a]);
+    const double own_ptm = predictedTmScore(logits, n, ra, nullptr);
+    s.chainPtm.push_back(npRound4(own_ptm));
+    for (size_t b = a; b < nc; ++b) {
+      std::vector<int> both, asym;
+      for (size_t i = 0; i < n; ++i) {
+        if (chainIndex[i] == (int)a || chainIndex[i] == (int)b) { both.push_back((int)i); asym.push_back(chainIndex[i]); }
+      }
+      const double score = predictedTmScore(logits, n, both, a != b ? &asym : nullptr);
+      pairIptm32[a * nc + b] = pairIptm32[b * nc + a] = (float)score;
+    }
+  }
+  for (size_t a = 0; a < nc; ++a) for (size_t b = 0; b < nc; ++b) s.pairIptm[a][b] = npRound4f(pairIptm32[a * nc + b]);
+  const size_t bucket = af2Bucket(n);
+  const double overallPlddt = (double)mean32(plddt) / 100.0;
+  const double ranking = nc > 1 ? 0.8 * iptm + 0.2 * ptm : overallPlddt;
+  s.scalars = {{"overall_plddt", round4(overallPlddt)}, {"overall_pae", round4((double)meanCorner32(pae, n, bucket))},
+               {"ptm", round4(ptm)}, {"iptm", round4(iptm)}, {"ranking_score", round4(ranking)}};
+  // as upstream's raw summary artifact holds it
+  auto list = [](const std::vector<double>& v) {
+    std::string o = "[";
+    for (size_t k = 0; k < v.size(); ++k) o += (k ? ", " : "") + jsNumber(v[k]);
+    return o + "]";
+  };
+  auto matrix = [&](const std::vector<std::vector<double>>& m) {
+    std::string o = "[";
+    for (size_t k = 0; k < m.size(); ++k) o += (k ? ", " : "") + list(m[k]);
+    return o + "]";
+  };
+  std::string j = "{";
+  for (const auto& [k, v] : s.scalars) j += jsonString(k) + ": " + jsNumber(v) + ", ";
+  std::string ids;
+  for (size_t k = 0; k < nc; ++k) ids += (k ? ", " : "") + jsonString(chains[k]);
+  j += "\"chain_ids\": [" + ids + "], \"chain_plddt\": " + list(s.chainPlddt) + ", \"chain_ptm\": " + list(s.chainPtm) +
+       ", \"chain_pae\": " + list(s.chainPae) + ", \"chain_pair_pae\": " + matrix(s.pairPae) + ", \"chain_pair_pae_min\": " +
+       matrix(s.pairPaeMin) + ", \"chain_pair_iptm\": " + matrix(s.pairIptm) + ", \"af2_model_name\": " + jsonString(model) + "}";
+  std::ofstream(base + "_summary_confidences.json") << j << "\n";
+  return s;
+}
+
+/** Our AF2's PDB as atoms; its chains, named by position, are the fold's `order` in turn. */
+inline std::vector<RefoldAtom> readAf2Pdb(const std::string& path, const std::vector<std::string>& order) {
+  std::ifstream f(path);
+  if (!f) refuse("cannot read " + path);
+  std::vector<RefoldAtom> atoms;
+  std::vector<char> seen;
+  std::string line;
+  auto trim = [](std::string t) {
+    t.erase(0, t.find_first_not_of(' '));
+    t.erase(t.find_last_not_of(' ') + 1);
+    return t;
+  };
+  while (std::getline(f, line)) {
+    if (line.compare(0, 4, "ATOM") != 0) continue;
+    const char chain = line[21];
+    if (std::find(seen.begin(), seen.end(), chain) == seen.end()) seen.push_back(chain);
+    const size_t k = (size_t)(std::find(seen.begin(), seen.end(), chain) - seen.begin());
+    if (k >= order.size()) refuse(path + " has more chains than the job");
+    atoms.push_back({order[k], trim(line.substr(17, 3)), trim(line.substr(12, 4)), atoi(line.substr(22, 4).c_str()),
+                     strtod(line.substr(30, 8).c_str(), nullptr), strtod(line.substr(38, 8).c_str(), nullptr),
+                     strtod(line.substr(46, 8).c_str(), nullptr), strtod(line.substr(60, 6).c_str(), nullptr)});
+  }
+  if (seen.size() != order.size()) refuse(path + " has " + std::to_string(seen.size()) + " chains, the job " + std::to_string(order.size()));
+  return atoms;
+}
+
 /**
  * `_finalize_af3_result`'s coordinate transfer: the refold's atoms onto the design's, residue by
  * residue and name by name, after AF3's added OXTs and filled-in side chains are trimmed away. A
@@ -737,10 +1031,10 @@ inline std::vector<double> transfer(const Prepared& p, const std::vector<RefoldA
   std::vector<double> coord(d.coord.begin(), d.coord.end());
   plddt.assign(d.n, 0.0);
   std::vector<std::string> chains;
-  for (int i = 0; i < d.n; ++i) if (!missing[i] && std::find(chains.begin(), chains.end(), p.af3Chain[i]) == chains.end()) chains.push_back(p.af3Chain[i]);
+  for (int i = 0; i < d.n; ++i) if (!missing[i] && std::find(chains.begin(), chains.end(), p.foldChain[i]) == chains.end()) chains.push_back(p.foldChain[i]);
   for (const std::string& chain : chains) {
     std::vector<int> inp;
-    for (int i = 0; i < d.n; ++i) if (!missing[i] && p.af3Chain[i] == chain) inp.push_back(i);
+    for (int i = 0; i < d.n; ++i) if (!missing[i] && p.foldChain[i] == chain) inp.push_back(i);
     std::vector<int> out;
     for (size_t k = 0; k < refold.size(); ++k) if (refold[k].chain == chain) out.push_back((int)k);
     // Residues of each: the design's by its own grouping, AF3's by chain, number and name.
@@ -971,30 +1265,42 @@ inline Values passCriteria(const std::map<std::string, double>& m, const std::ve
 
 /** Where the oracle's files go, and the folding binary. */
 struct Run {
-  std::string binary;    // cuda/af3/localfold-af3
+  std::string oracle;    // "af3" (refolding_oracles/af3.yaml) or "af2" (af2.yaml)
+  std::string binary;    // cuda/af3/localfold-af3 or cuda/af2/localfold-af2
   std::string dir;       // the design's oracle directory
   std::string name;      // the design's example id
   uint32_t seed = 0;
   std::map<std::string, std::string> components;   // the inputs' own component definitions
+  bool keepRaw = false;  // keep AF2's PAE logits (residues^2 x 64 floats), which a checker reads again
 };
 
 /** The `oracle_name` stem upstream files a refold under: `{example_id}_{oracle_name}`. */
 inline std::string stem(const Run& run, const Spec& spec) { return run.name + "_" + spec.name; }
+
+/** What a design's refolding scored: the metrics, the oracles' labels (`<key>.af2_model_name`), the chain of interest. */
+struct Scores {
+  Values values;
+  std::vector<std::pair<std::string, std::string>> labels;
+  std::string chainOfInterest;
+};
 
 /**
  * Refold one design with every oracle its tags admit and score it: the oracles' confidences
  * (`<key>.<metric>`), the refolding RMSDs and the pass criteria, merged as
  * `run_oracle_refolding_and_pass_criteria` returns them. `prior` is the design's own metrics.
  */
-inline Values refoldDesign(const Array& full, const std::vector<double>& fullCwi, const Run& run,
-                           const std::vector<std::string>& tags, const Values& prior, std::string& coiOut) {
+inline Scores refoldDesign(const Array& full, const std::vector<double>& fullCwi, const Run& run,
+                           const std::vector<std::string>& tags, const Values& prior) {
+  const bool af2 = run.oracle == "af2";
+  if (!af2 && run.oracle != "af3") refuse("no refolding oracle '" + run.oracle + "' (af3 or af2)");
   std::vector<const Spec*> active;
-  for (const Spec& s : af3Specs()) if (metrics::applies(s.gate, tags)) active.push_back(&s);
-  if (std::find(tags.begin(), tags.end(), "apo_refolding") != tags.end()) {
+  for (const Spec& s : af2 ? af2Specs() : af3Specs()) if (metrics::applies(s.gate, tags)) active.push_back(&s);
+  if (!af2 && std::find(tags.begin(), tags.end(), "apo_refolding") != tags.end()) {
     refuse("oracle_apo (apo_refolding) refolds through a pre-oracle transform, which is not ported");
   }
-  Values out;
-  if (active.empty()) return out;
+  Scores scores;
+  Values& out = scores.values;
+  if (active.empty()) return scores;
   mkdir(run.dir.c_str(), 0755);
   const std::vector<int> keep = withoutTerminalOxygens(full);
   std::vector<double> cwi;
@@ -1002,26 +1308,45 @@ inline Values refoldDesign(const Array& full, const std::vector<double>& fullCwi
   std::vector<Refold> refolds;
   Array design;
   for (const Spec* spec : active) {
-    const Prepared p = prepare(full, *spec, stem(run, *spec), run.seed, run.components);
+    const Prepared p = af2 ? prepareAf2(full, *spec, stem(run, *spec), cwi)
+                           : prepare(full, *spec, stem(run, *spec), run.seed, run.components);
     design = p.design;
     const std::string base = run.dir + "/" + stem(run, *spec);
     std::ofstream(base + "_job.json") << p.job << "\n";
-    const std::string cmd = "'" + run.binary + "' --job='" + base + "_job.json' --out='" + base + "_model.cif' --recycles=5 --steps=200 --seed=" +
-                            std::to_string(run.seed) + " > '" + base + "_af3.log' 2>&1";
-    if (std::system(cmd.c_str()) != 0) refuse("AF3 failed on " + stem(run, *spec) + " - see " + base + "_af3.log");
     const auto [coi, unambiguous] = chainOfInterestOf(p.design);
     Refold r{spec, {}, unambiguous ? coi : "", {}, {}};
-    // Our AF3 names its chains by position; the job's ids, in the order the job lists them, are what they are.
-    std::map<std::string, std::string> named;
-    for (size_t k = 0; k < p.af3Order.size(); ++k) named[positionalChain((int)k)] = p.af3Order[k];
-    r.confidences = extractConfidenceMetrics(
-        af3Summary(base + "_model_summary_confidences.json", base + "_model_confidences.json", named), p.af3ToIid,
-        r.chainOfInterest);
-    std::vector<RefoldAtom> atoms = readRefold(base + "_model.cif");
-    for (RefoldAtom& a : atoms) {
-      const auto it = named.find(a.chain);
-      if (it == named.end()) refuse("AF3's output names a chain " + a.chain + " the job does not have");
-      a.chain = it->second;
+    std::vector<RefoldAtom> atoms;
+    if (af2) {
+      // `load_model_runners` + `predict_and_write`: three recycles, the multimer's early stop
+      // (its config's 0.5 A), no BERT masking (`pct_seq_mask` 0), seed 0 (the payload's default),
+      // and a chain without a template padded as DeepMind's pipeline pads it (`_pad_templates`).
+      const bool multimer = spec->model.find("multimer") != std::string::npos;
+      const std::string cmd = "'" + run.binary + "' --job='" + base + "_job.json' --model=" + spec->model + " --out='" + base +
+                              "_model.pdb' --recycles=3 --tolerance=" + (multimer ? "0.5" : "0") +
+                              " --msa-mask=0 --template-pad=zero --seed=0 --fast --raw-confidences > '" + base + "_af2.log' 2>&1";
+      if (std::system(cmd.c_str()) != 0) refuse("AF2 failed on " + stem(run, *spec) + " - see " + base + "_af2.log");
+      r.confidences = extractConfidenceMetrics(af2Summary(base, p.foldOrder, p.foldLengths, spec->model), p.foldToIid,
+                                               r.chainOfInterest);
+      if (!run.keepRaw) std::remove((base + "_model_pae_logits.f32").c_str());   // read, and no artifact
+      atoms = readAf2Pdb(base + "_model.pdb", p.foldOrder);
+      scores.labels.push_back({spec->key + ".af2_model_name", spec->model});
+    } else {
+      const std::string cmd = "'" + run.binary + "' --job='" + base + "_job.json' --out='" + base +
+                              "_model.cif' --recycles=5 --steps=200 --seed=" + std::to_string(run.seed) + " > '" + base +
+                              "_af3.log' 2>&1";
+      if (std::system(cmd.c_str()) != 0) refuse("AF3 failed on " + stem(run, *spec) + " - see " + base + "_af3.log");
+      // Our AF3 names its chains by position; the job's ids, in the order the job lists them, are what they are.
+      std::map<std::string, std::string> named;
+      for (size_t k = 0; k < p.foldOrder.size(); ++k) named[positionalChain((int)k)] = p.foldOrder[k];
+      r.confidences = extractConfidenceMetrics(
+          af3Summary(base + "_model_summary_confidences.json", base + "_model_confidences.json", named), p.foldToIid,
+          r.chainOfInterest);
+      atoms = readRefold(base + "_model.cif");
+      for (RefoldAtom& a : atoms) {
+        const auto it = named.find(a.chain);
+        if (it == named.end()) refuse("AF3's output names a chain " + a.chain + " the job does not have");
+        a.chain = it->second;
+      }
     }
     r.coord = transfer(p, atoms, r.plddt);
     alignToInputFrame(p.design, cwi, r.coord);
@@ -1032,7 +1357,7 @@ inline Values refoldDesign(const Array& full, const std::vector<double>& fullCwi
     refolds.push_back(r);
   }
   const auto [coi, unambiguous] = chainOfInterestOf(design);
-  coiOut = unambiguous ? coi : "";
+  scores.chainOfInterest = unambiguous ? coi : "";
   // One refold per active oracle; the alias `untransformed` only where exactly one claims it.
   const bool alias = refolds.size() == 1;
   std::map<std::string, double> merged;
@@ -1051,15 +1376,19 @@ inline Values refoldDesign(const Array& full, const std::vector<double>& fullCwi
     }
   }
   for (const auto& kv : passCriteria(merged, tags)) out.push_back(kv);
-  return out;
+  return scores;
 }
 
 /** The scores as `<design>.refold.json` holds them: NaN as the string "NaN", as the metrics' file does. */
-inline std::string toJson(const Values& v, const std::string& coi) {
+inline std::string toJson(const Scores& scores) {
+  const Values& v = scores.values;
   std::string s = "{\"metrics\":{";
   for (size_t k = 0; k < v.size(); ++k) {
     s += (k ? "," : "") + jsonString(v[k].first) + ":" + (std::isnan(v[k].second) ? std::string("\"NaN\"") : jsNumber(v[k].second));
   }
+  size_t written = v.size();
+  for (const auto& [k, label] : scores.labels) s += (written++ ? "," : "") + jsonString(k) + ":" + jsonString(label);
+  const std::string& coi = scores.chainOfInterest;
   return s + "},\"chainOfInterest\":" + (coi.empty() ? std::string("null") : jsonString(coi)) + "}";
 }
 

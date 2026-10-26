@@ -302,6 +302,11 @@ inline void paeChunked(const float* pair, int L, const std::function<void(const 
     onChunk(lg, r0, r);
   }
 }
+// --raw-confidences: beside the PDB, the confidences at full precision - <stem>_raw_confidences.json (pLDDT a
+// residue, the expected PAE, pTM, ipTM) and <stem>_pae_logits.f32 (the PAE head's 64 logits a pair, L x L x 64) -
+// which upstream's AF2 oracle reduces per chain and per chain pair (cuda/rfd4p/src/oracle.h)
+static LF_TLS bool RAW_CONFIDENCES = false;
+
 // --tolerance=<A>: the page's early stop (shared/af2/model/recycle-convergence.js, ColabFold's compute_tol) -
 // after each pass from the second on, the RMS change of every C-alpha pair distance against the last pass,
 // over the sequence mask; the fold stops when it is strictly below this. 0 runs every pass.
@@ -719,6 +724,29 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
     ptm = tmFromTerms(tm, L, asym, false);
     iptm = chains ? tmFromTerms(tm, L, asym, true) : NAN;
   }
+  if (RAW_CONFIDENCES) {
+    if (AF2_TIGHT || paeLogits == nullptr) {
+      fprintf(stderr, "--raw-confidences needs the PAE head's logits whole, which a card this short of room never holds\n");
+      return 1;
+    }
+    const std::string stem = out.size() > 4 && out.substr(out.size() - 4) == ".pdb" ? out.substr(0, out.size() - 4) : out;
+    const std::vector<float> logits = download(paeLogits, pairs * 64);
+    FILE* lf = fopen((stem + "_pae_logits.f32").c_str(), "wb");
+    fwrite(logits.data(), 4, logits.size(), lf);
+    fclose(lf);
+    std::string j = "{\"plddt\": [";
+    char b[48];
+    for (int i = 0; i < L; ++i) { snprintf(b, sizeof b, "%s%.9g", i ? ", " : "", plddt[i]); j += b; }
+    j += "], \"pae\": [";
+    for (size_t k = 0; k < pairs; ++k) { snprintf(b, sizeof b, "%s%.9g", k ? ", " : "", pae[k]); j += b; }
+    snprintf(b, sizeof b, "%.9g", ptm);
+    j += "], \"ptm\": " + std::string(b) + ", \"iptm\": ";
+    snprintf(b, sizeof b, "%.9g", iptm);
+    j += (std::isfinite(iptm) ? std::string(b) : std::string("null")) + "}\n";
+    FILE* jf = fopen((stem + "_raw_confidences.json").c_str(), "w");
+    fwrite(j.data(), 1, j.size(), jf);
+    fclose(jf);
+  }
   double mean = 0; for (float v : plddt) mean += v; mean /= L;
   // the PDB
   std::vector<float> pos = download(so.pos37, (size_t)L * 37 * 3);
@@ -769,6 +797,7 @@ static int foldMain(int argc, char** argv) {
     else if (!strcmp(argv[i], "--fast")) FAST = true;
     else if (!strncmp(argv[i], "--tolerance=", 12)) TOLERANCE = atof(argv[i] + 12);
     else if (!strncmp(argv[i], "--frames=", 9)) FRAMES_DIR = argv[i] + 9;
+    else if (!strcmp(argv[i], "--raw-confidences")) RAW_CONFIDENCES = true;
     else if (!strcmp(argv[i], "--wait-input")) waitInput = true;     // start up while the input is still being exported
     else if (!strcmp(argv[i], "--wait-input=0")) waitInput = waitForever = true;   // ...with no timeout (the standalone mode: its own featuriser)
     else if (!strcmp(argv[i], "--detach-output")) DETACH = true;

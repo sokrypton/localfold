@@ -5,7 +5,7 @@
 //
 //   af2-featurise <out dir> (--bundle=<page bundle dir> | --weights=<export dir>) (--job=<AF3 job> | --sequence=A:B)
 //                 [--a3m=<one or one a chain> [--paired-a3m=...] | --search] [--recycles=3] [--max-msa=512]
-//                 [--max-extra=1024] [--seed=0] [--template=<file>:<chain>[@<chain>][+...]] [--template-search-chains=]
+//                 [--max-extra=1024] [--seed=0] [--msa-mask=0.15] [--template-pad=gap|zero] [--template=<file>:<chain>[@<chain>][+...]] [--template-search-chains=]
 #pragma once
 #include <array>
 #include <algorithm>
@@ -58,6 +58,7 @@ struct Af2Options {
   std::vector<std::string> chainSequences;
   int recycles = 3, maxMsa = 508, maxExtra = 1024;
   double seed = 0;
+  double maskFraction = 0.15;         // AF2's masked_msa replace fraction (a3m-features.js: maskFraction)
   bool multimerClustering = false;    // AF-Multimer's cluster profile: tied rows split, the centre weighed 1/L
 };
 
@@ -150,7 +151,7 @@ inline Af2Features makeA3mFeatures(const std::string& a3mText, const Af2Options&
     for (size_t c = 0; c < p.centers.size(); ++c)
       std::copy(encoded.begin() + (size_t)p.centers[c] * length, encoded.begin() + (size_t)(p.centers[c] + 1) * length, p.centerCodes.begin() + c * length);
     for (size_t index = 0; index < p.centerCodes.size(); ++index) {
-      if (random() >= 0.15) continue;
+      if (random() >= o.maskFraction) continue;
       uint8_t original = p.centerCodes[index];
       double draw = random();
       if (draw < 0.7) p.centerCodes[index] = 22;
@@ -314,9 +315,11 @@ inline Af2Export exportAf2(const Args& args) {
     isMultimer = readFile(weightsDir + "/model.idx").find("m meta/multimer 1") != std::string::npos;
   }
   std::string sequence = upper(trimWs(args.option("sequence")));
+  // the templates the job carries inline, each with its mapping, lifted out before the reader sees the job
+  std::vector<std::vector<JobTemplate>> jobTemplates;
   if (!args.option("job").empty()) {
     if (!sequence.empty()) throw std::runtime_error("--job and --sequence both name the input");
-    Job job = jobFromJson(readFile(args.option("job")));
+    Job job = jobFromJson(readFile(args.option("job")), &jobTemplates);
     for (auto& note : job.notes) out.said.push_back("job: " + note);
     Expanded request = expandEntities(job.entities);
     std::vector<std::string> other;
@@ -385,6 +388,7 @@ inline Af2Export exportAf2(const Args& args) {
   o.maxMsa = (int)jsNumberOf(args.option("max-msa", "512"));
   o.maxExtra = (int)jsNumberOf(args.option("max-extra", "1024"));
   o.seed = jsNumberOf(args.option("seed", "0"));
+  o.maskFraction = jsNumberOf(args.option("msa-mask", "0.15"));
   o.multimerClustering = isMultimer;    // (export_input.mjs: multimerClustering)
   Af2Features F = makeA3mFeatures(a3m, o);
   int L = F.length;
@@ -409,12 +413,19 @@ inline Af2Export exportAf2(const Args& args) {
   // best hit for each listed chain, in the same slot
   auto specs = splitNonEmpty(args.option("template"), ',');
   auto searchChains = splitNonEmpty(args.option("template-search-chains"), ',');
+  const std::string templatePad = args.option("template-pad", "gap");
+  if (templatePad != "gap" && templatePad != "zero") throw std::runtime_error("--template-pad is gap or zero, not " + templatePad);
   if (!searchChains.empty() && !searched) throw std::runtime_error("--template-search-chains needs --search: the hits come from that search");
   if (specs.size() > 1) throw std::runtime_error("AlphaFold 2 takes one template slot: join its parts with '+'");
-  if (!specs.empty() || !searchChains.empty()) {
+  // a job's own templates are the one slot too, aligned by the job's own mapping, never beside --template
+  if (jobTemplates.size() > 1) throw std::runtime_error("AlphaFold 2 takes one template a chain; the job gives a chain more than one");
+  if (!jobTemplates.empty() && (!specs.empty() || !searchChains.empty()))
+    throw std::runtime_error("the job carries its templates; --template and --template-search-chains would add others to its slot");
+  if (!specs.empty() || !searchChains.empty() || !jobTemplates.empty()) {
     std::vector<int> offsets;
     { int at = 0; for (auto& c : chains) { offsets.push_back(at); at += (int)c.size(); } }
-    struct Part { std::string text; bool hasChain; std::string chain; int at; std::string label; };
+    struct Part { std::string text; bool hasChain; std::string chain; int at; std::string label;
+                  const std::vector<std::pair<int, int>>* mapping = nullptr; };
     std::vector<Part> searchParts;
     for (auto& c : searchChains) {
       int at = (int)jsNumberOf(c);
@@ -447,6 +458,9 @@ inline Af2Export exportAf2(const Args& args) {
       }
     }
     for (auto& p : searchParts) parts.push_back(p);
+    if (!jobTemplates.empty()) {
+      for (auto& t : jobTemplates[0]) parts.push_back({t.text, false, "", t.chain, t.label, t.hasMapping ? &t.mapping : nullptr});
+    }
     std::set<int> taken;
     std::vector<Built> built;
     std::string joined;
@@ -463,11 +477,21 @@ inline Af2Export exportAf2(const Args& args) {
       bo.offset = isMultimer ? offsets[p.at] : 0;
       bo.tokens = L;
       bo.atom37 = true;
+      bo.mapping = p.mapping;
       built.push_back(buildTemplate(bo));
     }
     TemplateSlot slot = built.size() == 1 ? built[0].slot : mergeAtom37Templates(built, L);
+    // --template-pad=zero: a chain the slot does not cover as AlphaFold-Multimer's own pipeline pads it
+    // (msa_pairing._pad_templates: zeros, so restype 0), where ColabFold's mock template - the default, the page's - is gaps
+    if (templatePad == "zero" && isMultimer) {
+      for (size_t at = 0; at < chains.size(); ++at)
+        if (!taken.count((int)at)) std::fill(slot.aatype.begin() + offsets[at], slot.aatype.begin() + offsets[at] + (long)chains[at].size(), 0);
+    }
     std::string described = spec;
     for (auto& p : searchParts) described += (described.empty() ? "" : " + ") + ("search hit " + p.label);
+    if (!jobTemplates.empty()) {
+      for (auto& t : jobTemplates[0]) described += (described.empty() ? "" : " + ") + (t.label + " of chain " + std::to_string(t.chain + 1));
+    }
     out.said.push_back("template: " + described + ", " + std::to_string(slot.covered) + " residues, " + std::to_string(slot.atoms) + " atoms");
     E.i("t/aatype", slot.aatype);
     E.t("t/positions", slot.atomPositions);

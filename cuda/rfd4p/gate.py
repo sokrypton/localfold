@@ -1214,6 +1214,30 @@ def main() -> int:
                 print(f"  {'upstream o':10s} {m.group(1) if m else '?'} designs refolded against upstream's oracle, "
                       f"{m.group(2) if m else '?'} differing  {'ok ' if ok else 'DIFFERS'}")
 
+            # 🔴 AND THE SAME FOR AlphaFold 2 (`--refold=af2`, refolding_oracles/af2.yaml): the jobs
+            # whose tags call an AF2 oracle on a protein-only design, our AF2's input held to what
+            # upstream's own worker builds (a ColabFold environment), its raw confidences through
+            # upstream's `_chain_summary`, and the scores through upstream's managers.
+            af2 = HERE.parent / "af2" / "localfold-af2"
+            colabfold = Path.home() / ".venv-colabfold" / "bin" / "python"
+            if venv.exists() and af2.exists() and colabfold.exists():
+                cases = []
+                for name in ("uncond", "ppi", "motif", "groups", "binder"):
+                    job = HERE / "featurise" / f"gate-oracle-{name}.json"
+                    stem = HERE / f"gate-oracle-{name}-af2"
+                    run([BINARY, f"--job={job}", f"--int8={REPO / 'model-rfd4p-int8'}", f"--work-dir={stem}-work",
+                         f"--out={stem}.cif", "--seed=0", "--fast", f"--dump-sample={stem}-dump",
+                         f"--metrics={stem}.metrics.json", "--refold=af2"], cwd=REPO)
+                    cases.append(f"{job}:{stem}-dump:{stem}")
+                r = run([venv, REPO / "tools" / "check-rfd4p-oracle.py", "--oracle=af2", *cases], cwd=REPO)
+                m = re.search(r"(\d+) designs, (\d+) differing", r.stdout)
+                ok = r.returncode == 0 and m is not None
+                if not ok:
+                    failed += 1
+                    print(r.stdout[-1500:], r.stderr[-600:])
+                print(f"  {'upstream o2':10s} {m.group(1) if m else '?'} designs refolded against upstream's AF2 oracle, "
+                      f"{m.group(2) if m else '?'} differing  {'ok ' if ok else 'DIFFERS'}")
+
             # 🔴 AND THE SAMPLER, AGAINST UPSTREAM'S OWN `sample_schedule` AND `simulation_step`:
             # every mode a job's `sampling` may name (vf, sc, vf_tsr), the gt transforms and clamp,
             # the schedule shapes and re-centring. The sampler trajectory above holds the native

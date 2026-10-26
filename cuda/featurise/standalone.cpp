@@ -373,7 +373,7 @@ static const std::set<std::string>& readsInput(const std::string& port) {
   static const std::set<std::string> AF3 = {"job", "sequence", "a3m", "paired-a3m", "search", "search-templates", "template",
                                             "template-search-chains", "kinds", "ligands", "smiles", "modify", "max-msa", "no-span-chains", "ccd"};
   static const std::set<std::string> AF2 = {"job", "sequence", "a3m", "paired-a3m", "search", "template", "template-search-chains",
-                                            "max-msa", "max-extra"};
+                                            "max-msa", "max-extra", "msa-mask", "template-pad"};
   static const std::set<std::string> EF2 = {"job", "sequence", "a3m", "kinds", "ligands", "smiles", "modify", "ccd"};
   static const std::set<std::string> BIOEMU2 = {"job", "sequence", "a3m", "paired-a3m", "ccd"};
   return port == "af3" ? AF3 : port == "af2" ? AF2 : port == "bioemu2" ? BIOEMU2 : EF2;

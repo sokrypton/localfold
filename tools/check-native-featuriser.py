@@ -220,6 +220,8 @@ def cases():
                                             {"ligand": {"id": "C", "ccdCodes": ["GOL"]}}]), [f"--a3m={m6}"], AF3_FAMILIES),
     ]
     AF2 = ["monomer", "multimer"]
+    sample_template = {"mmcif": open(os.path.join(FIX, "bioemu2", "6mrr-sample.cif")).read(),
+                       "queryIndices": list(range(2, 42)), "templateIndices": list(range(0, 40))}
     out += [
         ("af2-6mrr", "af2", job("t", [protein("A", SEQ_6MRR)]), [], AF2),
         ("af2-6mrr-msa", "af2", job("t", [protein("A", SEQ_6MRR)]), [f"--a3m={m6}", "--seed=7", "--recycles=2"], AF2),
@@ -238,6 +240,13 @@ def cases():
         ("af2-1brs-template", "af2", job("t", [protein("A", brs_a), protein("D", brs_d)]),
          ["--template=@F/1brs-crystal.pdb:A@0+@F/1brs-crystal.pdb:D@1"], AF2),
         ("af2-ligand-refused", "af2", job("t", [protein("A", SEQ_6MRR), {"ligand": {"id": "B", "ccdCodes": ["GOL"]}}]), [], AF2),
+        # a job's own inline template, aligned by its mapping; one chain of two templated, the other padded as
+        # AlphaFold-Multimer's pipeline pads it (--template-pad=zero, RFD4's AF2 oracle); an alignment unmasked
+        # (--msa-mask=0, the oracle's pct_seq_mask)
+        ("af2-job-template", "af2", job("t", [protein("A", SEQ_6MRR, templates=[sample_template])]), [], AF2),
+        ("af2-job-template-pad", "af2", job("t", [protein("A", SEQ_6MRR, templates=[sample_template]), protein("B", brs_d)]),
+         ["--template-pad=zero"], ["multimer"]),
+        ("af2-6mrr-unmasked", "af2", job("t", [protein("A", SEQ_6MRR)]), [f"--a3m={m6}", "--msa-mask=0"], AF2),
     ]
     # ESMFold2 (cuda/ef2/export_input.mjs)
     EF = ["ef2"]
