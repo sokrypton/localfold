@@ -476,6 +476,31 @@ first fold at that shape, repeat = the median of the next three), PDBs byte-iden
 
 (Found on branch argon-ptx, Round 5 Module 6, and ported.)
 
+### What hand-written PTX taught (branch argon-ptx, 2026-10-25/26)
+
+Four rounds on branch argon-ptx rewrote the fold's kernels in inline PTX, tuned on an A10. On this A100 they bought 0-4%
+(261 residues 314 -> 301 ms, 5CAJ with its alignment level), and their tensor-core GEMM lost to cuBLASLt (its kernels'
+tensor pipe 51-55% busy against cuBLASLt's 75-78%, so on compute capability 8.0 that branch hands GEMMs back to
+cuBLASLt; on the A10 it had won). Five rounds of measurement, all on argon-ptx's cuda/af2/README.md:
+
+- **The ceiling is ~1.5x, and not reachable.** Nsight Compute over ~450 launches mid-fold: every kernel at 80% of its
+  busiest unit (tensor pipe, DRAM, shared memory, SFU) - more than cuBLASLt's own GEMMs reach - would make a fold 1.50x
+  faster at 522 residues and 1.48x at 5CAJ+MSA. The rest of the way to the FLOP floor (~3.6x) is softmax, LayerNorm
+  and memory passes: the computation's layout, not how its instructions are scheduled.
+- **The kernels are latency-bound, not throughput-bound.** They issue in 21-50% of cycles; the leading stall is `wait`
+  (a fixed-latency MMA dependency) at 2.5-3.9 warps a scheduler. ptxas allocates and schedules whatever PTX it is
+  handed, so PTX cannot reach that, and SASS could not either: the triangle attention's loop peaks at 127 live
+  registers, so four blocks an SM (128) spill five loop values reloaded at the top of each tile, 15% slower, and no
+  register is free to hoist them (CuAssembler round-trips the kernel, but mis-encodes every LDGSTS - reassemble
+  nothing whole).
+- **What paid was keeping the card fed** - the two sections below: graphs (~2 ms a pass) and five models at once.
+- **Measured and not taken:** smaller row tiles or split output columns for the pair kernels at short lengths (a
+  short call is a ~10-15 us chain whatever its blocks do); other tilings of the MSA row attention (the shipped one is
+  fastest); an INT8 triangle contraction (its per-row scales need a quantising pass costing what it saves).
+- **Two process lessons:** that branch broke the T4 build (sm_80-only PTX conversions) with every gate here green -
+  `npm run test:t4-build` now compiles each port for sm_75 - and its fastest round broke resident-server folds that
+  every per-process gate passed - `test:native` now folds jobs again on warm servers after other jobs.
+
 ### AlphaFold 2's five models at once, on threads of one process (2026-10-26)
 
 A short fold leaves most of the card idle: at 68 residues the pair kernels launch 73-81 blocks on an A100's 108 SMs,

@@ -1222,6 +1222,22 @@ Verified on the M2 that the guard is inert where nothing over-dispatches:
 
 ## The traps that repeat
 
+🔴 **A RESIDENT SERVER IS NOT A FRESH PROCESS, AND EVERY cuda/*/gate.py FOLDS IN A FRESH PROCESS.** Three bugs of one
+class in a week, all invisible to per-process gates: AF2 holding an emitted LayerNorm in a SHARED scratch slot across
+the pair stack (argon-ptx), BioEmu2 recognising its cached step conditioning by the buffer's ADDRESS (bed641ad: the
+next job is recomputed into the same address), and "All 5"'s first job (191197b3). Never key a cross-job cache on an
+address; forget it at the start of a job. `npm run test:native` folds a job AGAIN on a warm server after other jobs
+(AF3, AF2, ESMFold2, BioEmu2) and requires the same structure - add such a case with any new resident state.
+
+🔴 **INLINE PTX IS AN ARCHITECTURE CLAIM, AND THIS MACHINE ONLY EVER COMPILES sm_80.** argon-ptx's conversion helpers
+(`cvt.rn.f16x2.f32`, `max.f16x2`: sm_80 instructions) broke the T4 build of every port while every gate here passed.
+Guard each instruction by `__CUDA_ARCH__` with a fallback, and run `npm run test:t4-build`.
+
+🔴 **A HAND KERNEL'S WIN IS ONE CARD'S.** argon-ptx's tensor-core GEMM beat cuBLASLt on the A10 it was tuned on and lost
+to it on this A100 (51-55% of the tensor pipe against 75-78%). A/B a hand kernel against the library on each card it
+will run on, and keep the library where it wins (cuda/af2/README.md, "What hand-written PTX taught").
+
+
 🔴 **AND COLAB COMPILES THE NATIVE PORTS WITH CUDA 13; THIS BOX HAS 12.2.** A construct one accepts the other can
 misread without a word: an `else` followed directly by `#pragma unroll` compiled cleanly here and, built on a Colab
 T4, made an ablation arm read 6.8x faster than the kernel - past the T4's peak - until it was braced (cuda/af3's

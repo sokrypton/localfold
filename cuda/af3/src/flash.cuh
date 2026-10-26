@@ -238,6 +238,7 @@ template <int D, int WARPS, int BK = FA_BK> __host__ __device__ constexpr size_t
 // transposed for the column direction; -1e9 where it is zero. MASKED false: every key is real
 // (a protein with no padding - the mask is all ones), so no mask is loaded or added and only the
 // last tile masks the keys past n (3-7% of this kernel).
+// (two exponentials in f16 - ONE PTX instruction, TWO SFU ones on sm_80: MUFU.EX2.F16 on each half)
 __device__ __forceinline__ uint32_t ex2h2(uint32_t x) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750                     // (Volta: no f16 ex2 - two f32 ones)
   float2 v = __half22float2(*reinterpret_cast<__half2*>(&x));
@@ -636,9 +637,11 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) flashGridHalf(const half* __
           for (int et = 0; et < D / 8; ++et) { o[et][0] *= c0; o[et][1] *= c0; o[et][2] *= c1; o[et][3] *= c1; }
           lsum0 *= c0; lsum2 *= c1;
         }
-        // P = 2^(S - max), two at a time in f16 (ex2.approx.f16x2: half the SFU work, and the result
-        // is already the packed A fragment the PV product reads); its row sums on the tensor cores
-        // (P . ones), accumulated in f32 like O
+        // P = 2^(S - max), two at a time in f16 (ex2.approx.f16x2: the result is already the packed A
+        // fragment the PV product reads, so no pack - but NOT half the SFU work, as this said: on sm_80 it
+        // is two scalar MUFU.EX2.F16 in the SASS, 48 a warp's 48-key tile beside its 54 HMMA, each ~8 pipe
+        // cycles, so the SFU is as busy as the tensor pipe, ~40% each; cuda/af2/README.md, the SASS
+        // experiment); its row sums on the tensor cores (P . ones), accumulated in f32 like O
 #pragma unroll
         for (int t = 0; t < BK / 16; ++t) {
           uint32_t pa[4] = { ex2h2(pack2(sv[2 * t][0] - n0, sv[2 * t][1] - n0)), ex2h2(pack2(sv[2 * t][2] - n1, sv[2 * t][3] - n1)),
