@@ -409,6 +409,33 @@ export function deduplicateUnpairedAgainstPaired(unpairedA3m, pairedA3m) {
 }
 
 /**
+ * AlphaFold-Multimer's per-chain alignment budget (feature_processing.MSA_CROP_SIZE).
+ *
+ * 🔴 THE MULTIMER NEVER SEES A CHAIN'S WHOLE ALIGNMENT. `crop_chains` cuts each chain before the merge: its
+ * paired rows to the first msa_crop_size // 2 = 1024, and its unpaired rows to what is left of 2048 once the
+ * paired rows that are not all gap in this chain are counted. ColabFold runs exactly this
+ * (process_multimer_features). Without it a heterodimer's merged alignment was 15,830 rows where the
+ * multimer's own pipeline makes 3,072 - so its 508 centres were drawn from a pool in which the paired rows,
+ * the ones that carry the interface, were a third as common as the model was trained to see them.
+ */
+export const MULTIMER_MSA_CROP = 2048;
+
+/** The first `rows` rows of an A3M (its query among them), as written. */
+export function cropA3mRows(a3mText, rows) {
+  const alignment = parseA3m(a3mText);
+  const lines = [];
+  for (let row = 0; row < Math.min(rows, alignment.depth); row += 1) {
+    lines.push(`>${alignment.descriptions[row]}`, alignment.rawSequences[row]);
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+/** How many of an A3M's rows are not gap throughout (`num_non_gapped_pairs` in crop_chains). */
+export function nonGappedRows(a3mText) {
+  return parseA3m(a3mText).sequences.filter((sequence) => /[^-]/.test(sequence)).length;
+}
+
+/**
  * A job's own alignments - AlphaFold 3's `unpairedMsa` / `pairedMsa`, one per
  * physical polymer chain in fold order (null where the file gave none) - as the
  * featuriser takes them: each list merged row by row (mergeRowAlignedChainA3ms),

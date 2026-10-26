@@ -357,6 +357,22 @@ inline std::string deduplicateUnpairedAgainstPaired(const std::string& unpairedT
   return out + "\n";
 }
 
+// cropA3mRows / nonGappedRows / MULTIMER_MSA_CROP (shared/input/chains.js): AF-Multimer's crop_chains
+const int MULTIMER_MSA_CROP = 2048;
+inline std::string cropA3mRows(const std::string& text, int rows) {
+  A3m a = parseA3m(text);
+  std::string out;
+  for (size_t r = 0; r < std::min((size_t)std::max(rows, 0), a.raw.size()); ++r)
+    out += (out.empty() ? "" : "\n") + (">" + a.descriptions[r]) + "\n" + a.raw[r];
+  return out + "\n";
+}
+inline int nonGappedRows(const std::string& text) {
+  A3m a = parseA3m(text);
+  int n = 0;
+  for (auto& s : a.sequences) if (s.find_first_not_of('-') != std::string::npos) ++n;
+  return n;
+}
+
 // "monomer" (block-diagonal), "multimer" (dense within an entity), or an AF3 family (row by row)
 inline std::string mergeFor(const std::string& model, const std::vector<std::string>& texts) {
   if (model == "monomer") return mergeUnpairedChainA3ms(texts);
@@ -370,15 +386,22 @@ inline Merged mergeSearchedChains(const std::vector<std::string>& sequences, con
                                   const std::map<std::string, std::string>& pairedA3ms, const std::string& model) {
   Merged m;
   bool hasPairing = !pairedA3ms.empty() && model != "monomer";
+  const bool crop = model == "multimer";      // (the JavaScript's graphFamily(model) === "multimer")
+  auto pairedFor = [&](const std::string& s) {
+    return crop ? cropA3mRows(pairedA3ms.at(s), MULTIMER_MSA_CROP / 2) : pairedA3ms.at(s);
+  };
   if (hasPairing) {
     std::vector<std::string> list;
-    for (auto& s : sequences) list.push_back(pairedA3ms.at(s));
+    for (auto& s : sequences) list.push_back(pairedFor(s));
     m.paired = mergeRowAlignedChainA3ms(list);
     m.hasPaired = true;
   }
   m.unpairedProfile = mergeFor(model, chainA3ms);
   std::vector<std::string> dedup = chainA3ms;
   if (hasPairing) for (size_t c = 0; c < sequences.size(); ++c) dedup[c] = deduplicateUnpairedAgainstPaired(chainA3ms[c], pairedA3ms.at(sequences[c]));
+  if (crop)
+    for (size_t c = 0; c < sequences.size(); ++c)
+      dedup[c] = cropA3mRows(dedup[c], 1 + std::max(0, MULTIMER_MSA_CROP - (hasPairing ? nonGappedRows(pairedFor(sequences[c])) : 1)));
   m.unpaired = mergeFor(model, dedup);
   m.a3m = m.hasPaired ? concatenateA3mBlocks(m.paired, m.unpaired) : m.unpaired;
   return m;

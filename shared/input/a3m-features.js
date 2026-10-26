@@ -11,6 +11,8 @@ import { makeQueryOnlyFeatures } from "./query-only-features.js";
  * @property {number} [tolerance] recycle early-stop threshold in angstroms; consumed by the model
  *   Both defaults are explained at MAX_MSA_CLUSTERS below - the second is a
  *   deliberate reduction from AlphaFold's own model_1 value, not a copy of it.
+ * @property {boolean} [multimerClustering] AF-Multimer's cluster profile (tied rows split, the centre weighed 1/L)
+ *   for multimer WEIGHTS; the monomer's otherwise. webgpu/af2/multimer/model.js sets it from the regime.
  */
 
 const RESTYPES = "ARNDCQEGHILKMFPSTWYV";
@@ -158,11 +160,26 @@ export function paddedCodeWords(centerCodes, encoded, extras, centreCount, lengt
   };
 }
 
-function nearestCentres(centerCodes, encoded, extras, centreCount, length) {
+/**
+ * The answer of a nearest-centre search: `best[row]` is the first centre at the highest score, and with
+ * `splitTies`, `ties` holds every centre at that score, `tieWords` 32-bit words a row, bit `c % 32` of word
+ * `c >> 5` for centre c.
+ *
+ * 🔴 AF-MULTIMER SPLITS A TIE AND THE MONOMER DOES NOT. The monomer's pipeline assigns by argmax, which keeps
+ * the first centre; modules_multimer.nearest_neighbor_clusters assigns by `softmax(1e3 * agreement)`, and an
+ * agreement is a whole number of residues, so a row one residue nearer one centre goes to it alone and a row
+ * EXACTLY as near k centres goes 1/k to each. That is no corner case: on 1AY7's alignment 17% of the rows
+ * tie, and keeping the first centre for them put the cluster profile up to 0.997 from stock's
+ * (cuda/af2/parity/sampling_parity.py).
+ */
+function nearestCentres(centerCodes, encoded, extras, centreCount, length, splitTies = false) {
   const { centreWords, extraWords, words, rows } =
     paddedCodeWords(centerCodes, encoded, extras, centreCount, length);
 
   const assignments = new Uint16Array(rows);
+  const tieWords = splitTies ? Math.ceil(centreCount / 32) : 0;
+  const ties = splitTies ? new Uint32Array(rows * tieWords) : undefined;
+  const scores = splitTies ? new Int32Array(centreCount) : undefined;
   for (let index = 0; index < rows; index += 1) {
     const extraBase = index * words;
     let best = 0;
@@ -179,10 +196,16 @@ function nearestCentres(centerCodes, encoded, extras, centreCount, length) {
       // ...strictly greater, so a tie keeps the FIRST centre, as the scalar
       // loop did. The assignments feed the model.
       if (score > bestScore) { bestScore = score; best = centre; }
+      if (splitTies) scores[centre] = score;
     }
     assignments[index] = best;
+    if (splitTies) {
+      for (let centre = 0; centre < centreCount; centre += 1) {
+        if (scores[centre] === bestScore) ties[index * tieWords + (centre >>> 5)] |= 1 << (centre & 31);
+      }
+    }
   }
-  return assignments;
+  return { best: assignments, ties, tieWords };
 }
 
 /** CPU feature preprocessing for A3M text. Neural inference remains entirely on WebGPU. */
@@ -294,6 +317,12 @@ function planA3mFeatures(a3mText, tables, options) {
     const centers = [0, ...remainder.slice(0, Math.max(0, maxMsa - 1))];
     const extraPool = remainder.slice(Math.max(0, maxMsa - 1)); shuffle(extraPool, random);
     const extras = extraPool.slice(0, maxExtra);
+    // 🔴 THE CLUSTERS ARE BUILT OVER EVERY ROW THAT IS NOT A CENTRE, NOT OVER THE EXTRA STACK'S SHARE. Both of
+    // stock AF2's pipelines assign the whole remainder before cropping it: the monomer clusters
+    // (nearest_neighbor_clusters, summarize_clusters) and only then runs crop_extra_msa; the multimer's
+    // sample_msa puts the entire remainder in extra_msa and create_extra_msa_feature crops it last. Clustering
+    // over the kept 1024 built each centre's profile from a twelfth of a 15,000-row alignment.
+    const pool = extraPool;
     const centerCodes = new Uint8Array(centers.length * length);
     for (let center = 0; center < centers.length; center += 1) {
       centerCodes.set(encoded.subarray(centers[center] * length, (centers[center] + 1) * length), center * length);
@@ -312,7 +341,7 @@ function planA3mFeatures(a3mText, tables, options) {
       else centerCodes[index] = Math.floor(random() * 20);
     }
     featureStats.maskMs += performance.now() - mark; mark = performance.now();
-    plans.push({ centers, extras, centerCodes });
+    plans.push({ centers, extras, pool, centerCodes });
   }
   return { plans, context: { encoded, deletions, base, length, options } };
 }
@@ -323,22 +352,60 @@ function planA3mFeatures(a3mText, tables, options) {
  */
 function finishRecycle(plan, assignments, context) {
   const { encoded, deletions, base, length, options } = context;
-  const { centers, extras, centerCodes } = plan;
+  const { centers, extras, pool, centerCodes } = plan;
+  const multimer = options.multimerClustering === true;
   let mark = performance.now();
     const profile = new Float32Array(centers.length * length * 23);
     const deletionSums = new Float32Array(centers.length * length);
     const counts = new Float32Array(centers.length * length).fill(1 + 1e-6);
-    for (let center = 0; center < centers.length; center += 1) for (let residue = 0; residue < length; residue += 1) {
-      profile[(center * length + residue) * 23 + centerCodes[center * length + residue]] = 1;
-      deletionSums[center * length + residue] = deletions[centers[center] * length + residue];
+    // 🔴 TWO FORMULAS, ONE A MODEL. The monomer's summarize_clusters counts per POSITION:
+    // (sum of the members' one-hots + the centre's) / (1e-6 + 1 + members). AF-Multimer's
+    // nearest_neighbor_clusters multiplies each assignment by einsum('mr,nr->mn', msa_mask, extra_mask) - the
+    // number of positions the centre and the row are both unmasked, which is L for every unpadded row - so its
+    // profile is (L * sum of members + centre) / (L * members + 1): the centre's own row weighs about 1/L where
+    // the monomer gives it a full share. That is what the multimer's weights were trained on, and what it is
+    // given here; with members split over tied centres (nearestCentres) the sums are fractional.
+    // The fractional sums are float32 with one rounding a step, as the C++ twin (cuda/featurise/af2_export.h)
+    // keeps them, so the two stay byte-identical; the final ratio is taken in double on both sides.
+    const members = multimer ? new Float32Array(centers.length) : undefined;
+    if (!multimer) {
+      for (let center = 0; center < centers.length; center += 1) for (let residue = 0; residue < length; residue += 1) {
+        profile[(center * length + residue) * 23 + centerCodes[center * length + residue]] = 1;
+        deletionSums[center * length + residue] = deletions[centers[center] * length + residue];
+      }
     }
-    for (let extraIndex = 0; extraIndex < extras.length; extraIndex += 1) {
-      const row = extras[extraIndex]; const center = assignments[extraIndex];
-      for (let residue = 0; residue < length; residue += 1) {
-        const slot = center * length + residue; counts[slot] = counts[slot] + 1;
-        const profileSlot = slot * 23 + encoded[row * length + residue];
-        profile[profileSlot] = profile[profileSlot] + 1;
-        deletionSums[slot] = deletionSums[slot] + deletions[row * length + residue];
+    const { best, ties, tieWords } = assignments;
+    for (let poolIndex = 0; poolIndex < pool.length; poolIndex += 1) {
+      const row = pool[poolIndex];
+      if (!multimer) {
+        const center = best[poolIndex];
+        for (let residue = 0; residue < length; residue += 1) {
+          const slot = center * length + residue; counts[slot] = counts[slot] + 1;
+          const profileSlot = slot * 23 + encoded[row * length + residue];
+          profile[profileSlot] = profile[profileSlot] + 1;
+          deletionSums[slot] = deletionSums[slot] + deletions[row * length + residue];
+        }
+        continue;
+      }
+      let tied = 0;
+      for (let word = 0; word < tieWords; word += 1) {
+        let bits = ties[poolIndex * tieWords + word];
+        while (bits !== 0) { tied += 1; bits &= bits - 1; }
+      }
+      const weight = Math.fround(1 / tied);
+      for (let word = 0; word < tieWords; word += 1) {
+        let bits = ties[poolIndex * tieWords + word];
+        while (bits !== 0) {
+          const bit = 31 - Math.clz32(bits & -bits); bits &= bits - 1;
+          const center = word * 32 + bit;
+          members[center] = members[center] + weight;
+          for (let residue = 0; residue < length; residue += 1) {
+            const slot = center * length + residue;
+            const profileSlot = slot * 23 + encoded[row * length + residue];
+            profile[profileSlot] = profile[profileSlot] + weight;
+            deletionSums[slot] = deletionSums[slot] + Math.fround(weight * deletions[row * length + residue]);
+          }
+        }
       }
     }
     // 🔴 THE PROFILE STAYS ON FOR AN ALIGNMENT. ColabDesign2's make_msa_feats
@@ -356,7 +423,14 @@ function finishRecycle(plan, assignments, context) {
       msaFeatures[output + centerCodes[slot]] = 1;
       const deletion = deletions[centers[center] * length + residue];
       msaFeatures[output + 23] = Math.min(deletion, 1); msaFeatures[output + 24] = deletionValue(deletion);
-      if (useClusterProfile) {
+      if (useClusterProfile && multimer) {
+        const denominator = length * members[center] + 1;
+        for (let code = 0; code < 23; code += 1) {
+          msaFeatures[output + 25 + code] = (length * profile[slot * 23 + code]
+            + (code === centerCodes[slot] ? 1 : 0)) / denominator;
+        }
+        msaFeatures[output + 48] = deletionValue((length * deletionSums[slot] + deletion) / denominator);
+      } else if (useClusterProfile) {
         for (let code = 0; code < 23; code += 1) msaFeatures[output + 25 + code] = profile[slot * 23 + code] / counts[slot];
         msaFeatures[output + 48] = deletionValue(deletionSums[slot] / counts[slot]);
       } else {
@@ -417,14 +491,15 @@ export function makeA3mFeatureRecycle(a3mText, tables, options, index) {
  */
 export function planA3mRecycles(a3mText, tables, options = {}) { return planA3mFeatures(a3mText, tables, options); }
 export function searchA3mRecycle(plan, context) {
-  return nearestCentres(plan.centerCodes, context.encoded, plan.extras, plan.centers.length, context.length);
+  return nearestCentres(plan.centerCodes, context.encoded, plan.pool, plan.centers.length, context.length,
+    context.options.multimerClustering === true);
 }
 export function finishA3mRecycle(plan, assignments, context) { return finishRecycle(plan, assignments, context); }
 
 function hostRecycle(plan, context) {
   const mark = performance.now();
-  const assignments = nearestCentres(plan.centerCodes, context.encoded, plan.extras,
-    plan.centers.length, context.length);
+  const assignments = nearestCentres(plan.centerCodes, context.encoded, plan.pool,
+    plan.centers.length, context.length, context.options.multimerClustering === true);
   featureStats.nearestMs += performance.now() - mark;
   return finishRecycle(plan, assignments, context);
 }

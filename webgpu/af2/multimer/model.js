@@ -70,8 +70,13 @@ export class AlphaFoldUnifiedGpu {
     // is added; the extra feature-building keys predict() does not read are
     // harmless.
     // The nearest-centre search on the device; see the monomer's note.
+    // 🔴 THE MULTIMER'S CLUSTERING FOLLOWS ITS WEIGHTS. outerProductMeanFirst is set exactly when multimer
+    // weights run on this graph (the regime web/app.js and the tools pass), and those weights were trained on
+    // AF-Multimer's cluster profile - tied rows split, the centre weighed 1/L - where a monomer's are not;
+    // shared/input/a3m-features.js has both. Derived here, once, rather than added to every regime literal.
     const features = await makeA3mFeaturesFor(
-      this.device, a3mText, featureTables, options);
+      this.device, a3mText, featureTables,
+      { ...options, multimerClustering: options.multimerClustering ?? options.outerProductMeanFirst === true });
     return this.predict(features, weights, paeBreaks, onRecycle, onProgress, options);
   }
   /**

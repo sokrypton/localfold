@@ -32,12 +32,21 @@
  *     marks a zero byte's neighbour as well, so counting the marks overcounts.
  *     See the note on the host loop; it moved 1024 assignments' checksum.
  *
+ * 🔴 AND A MULTIMER SEARCH RETURNS EVERY TIED CENTRE, NOT ONLY THE FIRST. AF-Multimer splits a row exactly as
+ * near k centres 1/k to each (shared/input/a3m-features.js, nearestCentres), so a search with `tieWords` set
+ * keeps each centre's score in workgroup memory and, once the join has found the best, writes a bitmask of
+ * the centres that reach it - the host loop's `ties`, word for word. The first-centre answer is written either
+ * way, so the monomer's search is the kernel it was.
+ *
  * 🔴 EVERY RECYCLE IN ONE SUBMIT. A fold plans all of its recycles before it
  * needs any assignment, so the four searches go up as one dispatch and come
  * back in one map. At 825 residues that is four round trips saved out of four.
  */
 
 const WORKGROUP = 64;
+// The most centres a tie-splitting search holds scores for: 4 KiB of workgroup memory, far inside the 16 KiB
+// every WebGPU device offers, and twice the 508 clusters AF-Multimer samples.
+const MAX_TIE_CENTRES = 1024;
 
 const SHADER = `
 struct Parameters {
@@ -47,15 +56,17 @@ struct Parameters {
   row_offset: u32,
   centre_offset: u32,
   output_offset: u32,
-  pad_0: u32,
-  pad_1: u32,
+  tie_words: u32,
+  tie_offset: u32,
 };
 @group(0) @binding(0) var<storage, read> centre_words: array<u32>;
 @group(0) @binding(1) var<storage, read> extra_words: array<u32>;
 @group(0) @binding(2) var<uniform> p: Parameters;
 @group(0) @binding(3) var<storage, read_write> assignments: array<u32>;
+@group(0) @binding(4) var<storage, read_write> ties: array<u32>;
 
 var<workgroup> best: array<u32, ${WORKGROUP}>;
+var<workgroup> scores: array<u32, ${MAX_TIE_CENTRES}>;
 
 // The count of agreeing bytes in one 32-bit lane of the difference.
 fn agreeing(difference: u32) -> u32 {
@@ -82,6 +93,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     }
     let key = (score << 16u) | (0xffffu - centre);
     mine = max(mine, key);
+    if (p.tie_words > 0u) { scores[centre] = score; }
   }
   best[local.x] = mine;
   workgroupBarrier();
@@ -99,6 +111,16 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   workgroupBarrier();
   if (local.x == 0u) {
     assignments[p.output_offset + row] = 0xffffu - (best[0] & 0xffffu);
+  }
+  // every centre at the best score, a bit each (the last barrier above published both best[0] and scores)
+  let top = best[0] >> 16u;
+  for (var word = local.x; word < p.tie_words; word += ${WORKGROUP}u) {
+    var bits = 0u;
+    for (var bit = 0u; bit < 32u; bit += 1u) {
+      let centre = word * 32u + bit;
+      if (centre < p.centres && scores[centre] == top) { bits = bits | (1u << bit); }
+    }
+    ties[p.tie_offset + row * p.tie_words + word] = bits;
   }
 }`;
 
@@ -123,6 +145,7 @@ async function pipelineFor(device) {
       { binding: 2, visibility: GPUShaderStage.COMPUTE,
         buffer: { type: "uniform", hasDynamicOffset: true, minBindingSize: 32 } },
       { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+      { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
     ],
   });
   const pipeline = await device.createComputePipelineAsync({
@@ -139,17 +162,19 @@ async function pipelineFor(device) {
 /**
  * One search. `centreWords` and `extraWords` come from `paddedCodeWords`.
  *
+ * `splitTies` asks for every tied centre as well (AF-Multimer's clustering).
+ *
  * @typedef {{centreWords: Uint32Array, extraWords: Uint32Array,
- *            words: number, rows: number, centres: number}} Search
+ *            words: number, rows: number, centres: number, splitTies?: boolean}} Search
  */
 
 /**
- * Run every search in one submit and return one Uint16Array of assignments per
- * search, in the order given.
+ * Run every search in one submit and return each search's answer, in the order given, in the host loop's
+ * shape: `{best: Uint16Array, ties: Uint32Array | undefined, tieWords: number}`.
  *
  * @param {GPUDevice} device
  * @param {Search[]} searches
- * @returns {Promise<Uint16Array[]>}
+ * @returns {Promise<{best: Uint16Array, ties: (Uint32Array|undefined), tieWords: number}[]>}
  */
 export async function assignNearestCentres(device, searches) {
   if (searches.length === 0) return [];
@@ -157,6 +182,10 @@ export async function assignNearestCentres(device, searches) {
     if (search.centres > 0xffff) {
       throw new RangeError(`nearest-centre search has ${search.centres} centres, `
         + "past what the tie-breaking pack holds");
+    }
+    if (search.splitTies && search.centres > MAX_TIE_CENTRES) {
+      throw new RangeError(`a tie-splitting nearest-centre search has ${search.centres} centres, `
+        + `past the ${MAX_TIE_CENTRES} whose scores it holds`);
     }
     if (search.words * 4 > 0xffff) {
       throw new RangeError(`nearest-centre search has rows of ${search.words * 4} bytes, `
@@ -180,6 +209,9 @@ export async function assignNearestCentres(device, searches) {
   const centreTotal = centreLengths.reduce((sum, n) => sum + n, 0);
   const extraTotal = extraLengths.reduce((sum, n) => sum + n, 0);
   const outputTotal = searches.reduce((sum, s) => sum + s.rows, 0);
+  const tieWordsOf = (s) => (s.splitTies ? Math.ceil(s.centres / 32) : 0);
+  const tieAt = offsets(searches.map((s) => s.rows * tieWordsOf(s)));
+  const tieTotal = searches.reduce((sum, s) => sum + s.rows * tieWordsOf(s), 0);
 
   const centres = device.createBuffer({
     label: "features.centres", size: Math.max(4, centreTotal * 4),
@@ -193,8 +225,13 @@ export async function assignNearestCentres(device, searches) {
     label: "features.assignments", size: Math.max(4, outputTotal * 4),
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
   });
+  const tieBuffer = device.createBuffer({
+    label: "features.ties", size: Math.max(4, tieTotal * 4),
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+  });
+  // (one readback for both answers: the assignments, then the tie masks)
   const readback = device.createBuffer({
-    label: "features.assignments.read", size: Math.max(4, outputTotal * 4),
+    label: "features.assignments.read", size: Math.max(4, (outputTotal + tieTotal) * 4),
     usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
   });
   // 🔴 ONE UNIFORM BUFFER, BOUND AT A DYNAMIC OFFSET PER SEARCH, so a set of
@@ -212,7 +249,7 @@ export async function assignNearestCentres(device, searches) {
     device.queue.writeBuffer(extras, extraAt[index] * 4, search.extraWords);
     const block = new Uint32Array(8);
     block.set([search.rows, search.centres, search.words,
-      extraAt[index], centreAt[index], outputAt[index]]);
+      extraAt[index], centreAt[index], outputAt[index], tieWordsOf(search), tieAt[index]]);
     device.queue.writeBuffer(parameters, stride * index, block);
   }
 
@@ -223,6 +260,7 @@ export async function assignNearestCentres(device, searches) {
       { binding: 1, resource: { buffer: extras } },
       { binding: 2, resource: { buffer: parameters, size: 32 } },
       { binding: 3, resource: { buffer: output } },
+      { binding: 4, resource: { buffer: tieBuffer } },
     ],
   });
 
@@ -236,16 +274,20 @@ export async function assignNearestCentres(device, searches) {
   }
   pass.end();
   encoder.copyBufferToBuffer(output, 0, readback, 0, Math.max(4, outputTotal * 4));
+  if (tieTotal > 0) encoder.copyBufferToBuffer(tieBuffer, 0, readback, outputTotal * 4, tieTotal * 4);
   device.queue.submit([encoder.finish()]);
 
   await readback.mapAsync(GPUMapMode.READ);
   const all = new Uint32Array(readback.getMappedRange().slice(0));
   readback.unmap();
-  for (const buffer of [centres, extras, output, readback, parameters]) buffer.destroy();
+  for (const buffer of [centres, extras, output, tieBuffer, readback, parameters]) buffer.destroy();
 
   return searches.map((search, index) => {
-    const result = new Uint16Array(search.rows);
-    for (let row = 0; row < search.rows; row += 1) result[row] = all[outputAt[index] + row];
-    return result;
+    const best = new Uint16Array(search.rows);
+    for (let row = 0; row < search.rows; row += 1) best[row] = all[outputAt[index] + row];
+    const tieWords = tieWordsOf(search);
+    const ties = tieWords === 0 ? undefined
+      : all.slice(outputTotal + tieAt[index], outputTotal + tieAt[index] + search.rows * tieWords);
+    return { best, ties, tieWords };
   });
 }

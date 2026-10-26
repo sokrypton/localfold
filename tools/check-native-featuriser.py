@@ -202,6 +202,11 @@ def cases():
     pa, pd = synthetic_a3m("brs-pa", brs_a, 60, 3), synthetic_a3m("brs-pd", brs_d, 60, 4)
     m6 = synthetic_a3m("6mrr", SEQ_6MRR, 900, 5)
     deep = synthetic_a3m("deep-5caj", caj, 8000, 9)      # (past 1 MiB: the JavaScript exporter's worker-thread path)
+    # past AF-Multimer's crop (shared/input/chains.js MULTIMER_MSA_CROP): 1,500 paired rows a chain cut to 1,024, the
+    # unpaired to what is left of 2,048, and a homodimer's 2,600 to 2,048 - the fixtures above never reach either
+    ca, cd = synthetic_a3m("crop-a", brs_a, 2600, 11), synthetic_a3m("crop-d", brs_d, 2600, 12)
+    cpa, cpd = synthetic_a3m("crop-pa", brs_a, 1500, 13), synthetic_a3m("crop-pd", brs_d, 1500, 14)
+    c6 = synthetic_a3m("crop-6mrr", SEQ_6MRR, 2600, 15)
     # the self-MSA rule and the non-protein MSA (featurise.js dedupeSelfMsa, nativeNonproteinMsa): an alignment of the
     # query alone - one row for the families that dedupe, two for AlphaFold 3 and OpenBind-0 - and a protein's
     # alignment beside an RNA chain and a ligand (opendde and protenix2: the ligand UNK in every row and its profile,
@@ -226,6 +231,9 @@ def cases():
         ("af2-1brs-paired", "af2", job("t", [protein("A", brs_a), protein("D", brs_d)]),
          [f"--a3m={sa},{sd}", f"--paired-a3m={pa},{pd}"], AF2),
         ("af2-homodimer", "af2", job("t", [protein(["A", "B"], SEQ_6MRR)]), [f"--a3m={m6},{m6}"], AF2),
+        ("af2-1brs-crop", "af2", job("t", [protein("A", brs_a), protein("D", brs_d)]),
+         [f"--a3m={ca},{cd}", f"--paired-a3m={cpa},{cpd}", "--recycles=1"], AF2),
+        ("af2-homodimer-crop", "af2", job("t", [protein(["A", "B"], SEQ_6MRR)]), [f"--a3m={c6},{c6}", "--recycles=1"], AF2),
         ("af2-5caj-template", "af2", job("t", [protein("A", caj)]), ["--template=@F/5caj-crystal.pdb:A"], AF2),
         ("af2-1brs-template", "af2", job("t", [protein("A", brs_a), protein("D", brs_d)]),
          ["--template=@F/1brs-crystal.pdb:A@0+@F/1brs-crystal.pdb:D@1"], AF2),

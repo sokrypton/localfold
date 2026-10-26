@@ -58,6 +58,7 @@ struct Af2Options {
   std::vector<std::string> chainSequences;
   int recycles = 3, maxMsa = 508, maxExtra = 1024;
   double seed = 0;
+  bool multimerClustering = false;    // AF-Multimer's cluster profile: tied rows split, the centre weighed 1/L
 };
 
 inline Af2Features makeA3mFeatures(const std::string& a3mText, const Af2Options& o) {
@@ -126,7 +127,7 @@ inline Af2Features makeA3mFeatures(const std::string& a3mText, const Af2Options&
     return 20;
   };
   int maxMsa = std::min(o.maxMsa, depth);
-  struct Plan { std::vector<int> centers, extras; std::vector<uint8_t> centerCodes; };
+  struct Plan { std::vector<int> centers, extras, pool; std::vector<uint8_t> centerCodes; };
   std::vector<Plan> plans;
   for (int recycle = 0; recycle <= o.recycles; ++recycle) {
     uint32_t seed = (uint32_t)(int64_t)o.seed ^ (uint32_t)((uint64_t)(uint32_t)(recycle + 1) * 0x9e3779b9u);
@@ -144,6 +145,7 @@ inline Af2Features makeA3mFeatures(const std::string& a3mText, const Af2Options&
     std::vector<int> pool(remainder.begin() + std::min(take, (int)remainder.size()), remainder.end());
     shuffle(pool);
     p.extras.assign(pool.begin(), pool.begin() + std::min((int)pool.size(), o.maxExtra));
+    p.pool = pool;      // the clusters are built over every row that is not a centre, as stock AF2's are
     p.centerCodes.resize(p.centers.size() * length);
     for (size_t c = 0; c < p.centers.size(); ++c)
       std::copy(encoded.begin() + (size_t)p.centers[c] * length, encoded.begin() + (size_t)(p.centers[c] + 1) * length, p.centerCodes.begin() + c * length);
@@ -162,23 +164,28 @@ inline Af2Features makeA3mFeatures(const std::string& a3mText, const Af2Options&
   F.passes.resize(plans.size());
   auto finish = [&](size_t k) {
     const Plan& p = plans[k];
-    int centres = (int)p.centers.size(), extras = (int)p.extras.size();
+    int centres = (int)p.centers.size(), extras = (int)p.extras.size(), members = (int)p.pool.size();
+    const bool multimer = o.multimerClustering;
     // nearestCentres: the centre agreeing with the row at the most residues (a masked centre residue agrees with none)
     // (eight residues a 64-bit word, as paddedCodeWords lays them out: a centre's masked residue and its padding are
     // 255, a row's padding 254, so neither ever matches - and a word's matching bytes counted at once)
     int stride = (length + 7) / 8 * 8, words = stride / 8;
-    std::vector<uint64_t> centreWords((size_t)centres * words), extraWords((size_t)std::max(1, extras) * words);
+    std::vector<uint64_t> centreWords((size_t)centres * words), extraWords((size_t)std::max(1, members) * words);
     {
       std::vector<uint8_t> padded((size_t)centres * stride, 255);
       for (int c = 0; c < centres; ++c)
         for (int r = 0; r < length; ++r) { uint8_t code = p.centerCodes[(size_t)c * length + r]; if (code <= 20) padded[(size_t)c * stride + r] = code; }
       std::memcpy(centreWords.data(), padded.data(), padded.size());
-      std::vector<uint8_t> rows((size_t)extras * stride, 254);
-      for (int e = 0; e < extras; ++e) std::memcpy(&rows[(size_t)e * stride], &encoded[(size_t)p.extras[e] * length], length);
-      if (extras) std::memcpy(extraWords.data(), rows.data(), rows.size());
+      std::vector<uint8_t> rows((size_t)members * stride, 254);
+      for (int e = 0; e < members; ++e) std::memcpy(&rows[(size_t)e * stride], &encoded[(size_t)p.pool[e] * length], length);
+      if (members) std::memcpy(extraWords.data(), rows.data(), rows.size());
     }
-    std::vector<int> assignments(extras);
+    // (nearestCentres' `ties`: with multimer clustering, every centre at the best score, a bit each)
+    const int tieWords = multimer ? (centres + 31) / 32 : 0;
+    std::vector<int> assignments(members);
+    std::vector<uint32_t> ties((size_t)members * tieWords, 0u);
     auto assign = [&](int e0, int e1) {
+      std::vector<int> scores(multimer ? centres : 0);
       for (int e = e0; e < e1; ++e) {
         const uint64_t* row = &extraWords[(size_t)e * words];
         int best = 0, bestScore = -1;
@@ -191,33 +198,58 @@ inline Af2Features makeA3mFeatures(const std::string& a3mText, const Af2Options&
             score += __builtin_popcountll(zeros);
           }
           if (score > bestScore) { bestScore = score; best = c; }
+          if (multimer) scores[c] = score;
         }
         assignments[e] = best;
+        if (multimer)
+          for (int c = 0; c < centres; ++c) if (scores[c] == bestScore) ties[(size_t)e * tieWords + (c >> 5)] |= 1u << (c & 31);
       }
     };
     // (each row's centre its own: the rows split over this pass's share of the cores - 5,120 extra rows against 508
     // centres was most of a pass's 0.55 s at 394 residues, the passes four threads on a 30-core box)
     {
-      const int parts = std::max(1, std::min(extras / 256, (int)std::thread::hardware_concurrency() / (int)plans.size()));
+      const int parts = std::max(1, std::min(members / 256, (int)std::thread::hardware_concurrency() / (int)plans.size()));
       std::vector<std::thread> ts;
-      for (int q = 0; q < parts; ++q) ts.emplace_back(assign, (int)((long long)extras * q / parts), (int)((long long)extras * (q + 1) / parts));
+      for (int q = 0; q < parts; ++q) ts.emplace_back(assign, (int)((long long)members * q / parts), (int)((long long)members * (q + 1) / parts));
       for (auto& t : ts) t.join();
     }
     std::vector<float> profile((size_t)centres * length * 23, 0.0f), deletionSums((size_t)centres * length, 0.0f);
     std::vector<float> counts((size_t)centres * length, (float)(1 + 1e-6));
-    for (int c = 0; c < centres; ++c)
-      for (int r = 0; r < length; ++r) {
-        profile[((size_t)c * length + r) * 23 + p.centerCodes[(size_t)c * length + r]] = 1;
-        deletionSums[(size_t)c * length + r] = deletions[(size_t)p.centers[c] * length + r];
+    // finishRecycle's two formulas: the monomer's (sum + centre) / (1e-6 + 1 + members), a count a position; the
+    // multimer's (L * sum + centre) / (L * members + 1), its members' shares fractional over tied centres and every
+    // sum float32 with one rounding a step, as the JavaScript keeps them
+    std::vector<float> share(multimer ? centres : 0, 0.0f);
+    if (!multimer)
+      for (int c = 0; c < centres; ++c)
+        for (int r = 0; r < length; ++r) {
+          profile[((size_t)c * length + r) * 23 + p.centerCodes[(size_t)c * length + r]] = 1;
+          deletionSums[(size_t)c * length + r] = deletions[(size_t)p.centers[c] * length + r];
+        }
+    for (int e = 0; e < members; ++e) {
+      int row = p.pool[e];
+      if (!multimer) {
+        int c = assignments[e];
+        for (int r = 0; r < length; ++r) {
+          size_t slot = (size_t)c * length + r;
+          counts[slot] = counts[slot] + 1.0f;
+          size_t ps = slot * 23 + encoded[(size_t)row * length + r];
+          profile[ps] = profile[ps] + 1.0f;
+          deletionSums[slot] = deletionSums[slot] + deletions[(size_t)row * length + r];
+        }
+        continue;
       }
-    for (int e = 0; e < extras; ++e) {
-      int row = p.extras[e], c = assignments[e];
-      for (int r = 0; r < length; ++r) {
-        size_t slot = (size_t)c * length + r;
-        counts[slot] = counts[slot] + 1.0f;
-        size_t ps = slot * 23 + encoded[(size_t)row * length + r];
-        profile[ps] = profile[ps] + 1.0f;
-        deletionSums[slot] = deletionSums[slot] + deletions[(size_t)row * length + r];
+      int tied = 0;
+      for (int w = 0; w < tieWords; ++w) tied += __builtin_popcount(ties[(size_t)e * tieWords + w]);
+      const float weight = (float)(1.0 / tied);
+      for (int c = 0; c < centres; ++c) {
+        if (!((ties[(size_t)e * tieWords + (c >> 5)] >> (c & 31)) & 1u)) continue;
+        share[c] = share[c] + weight;
+        for (int r = 0; r < length; ++r) {
+          size_t slot = (size_t)c * length + r;
+          size_t ps = slot * 23 + encoded[(size_t)row * length + r];
+          profile[ps] = profile[ps] + weight;
+          deletionSums[slot] = deletionSums[slot] + weight * deletions[(size_t)row * length + r];
+        }
       }
     }
     Af2Pass& out = F.passes[k];
@@ -230,8 +262,16 @@ inline Af2Features makeA3mFeatures(const std::string& a3mText, const Af2Options&
         double deletion = deletions[(size_t)p.centers[c] * length + r];
         out.msaFeat[o49 + 23] = (float)std::min(deletion, 1.0);
         out.msaFeat[o49 + 24] = (float)deletionValue(deletion);
-        for (int code = 0; code < 23; ++code) out.msaFeat[o49 + 25 + code] = (float)((double)profile[slot * 23 + code] / counts[slot]);
-        out.msaFeat[o49 + 48] = (float)deletionValue((double)deletionSums[slot] / counts[slot]);
+        if (multimer) {
+          double denominator = (double)length * share[c] + 1;
+          for (int code = 0; code < 23; ++code)
+            out.msaFeat[o49 + 25 + code] = (float)(((double)length * profile[slot * 23 + code]
+                                                     + (code == p.centerCodes[slot] ? 1 : 0)) / denominator);
+          out.msaFeat[o49 + 48] = (float)deletionValue(((double)length * deletionSums[slot] + deletion) / denominator);
+        } else {
+          for (int code = 0; code < 23; ++code) out.msaFeat[o49 + 25 + code] = (float)((double)profile[slot * 23 + code] / counts[slot]);
+          out.msaFeat[o49 + 48] = (float)deletionValue((double)deletionSums[slot] / counts[slot]);
+        }
       }
     out.msaMask.assign((size_t)centres * length, 1.0f);
     int extraSequences = std::max(1, extras);
@@ -345,6 +385,7 @@ inline Af2Export exportAf2(const Args& args) {
   o.maxMsa = (int)jsNumberOf(args.option("max-msa", "512"));
   o.maxExtra = (int)jsNumberOf(args.option("max-extra", "1024"));
   o.seed = jsNumberOf(args.option("seed", "0"));
+  o.multimerClustering = isMultimer;    // (export_input.mjs: multimerClustering)
   Af2Features F = makeA3mFeatures(a3m, o);
   int L = F.length;
   Entries& E = out.entries;

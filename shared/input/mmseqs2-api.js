@@ -1,6 +1,6 @@
 import { parseA3m } from "./a3m.js";
 import { AF3_FAMILIES, MODEL_BUNDLES, graphFamily } from "../bundles/manifests/index.js";
-import { concatenateA3mBlocks, mergeChainA3ms, deduplicateUnpairedAgainstPaired, mergeRowAlignedChainA3ms, mergeUnpairedChainA3ms }
+import { concatenateA3mBlocks, cropA3mRows, mergeChainA3ms, deduplicateUnpairedAgainstPaired, mergeRowAlignedChainA3ms, mergeUnpairedChainA3ms, MULTIMER_MSA_CROP, nonGappedRows }
   from "./chains.js";
 
 /** How each model wants a complex's per-chain alignments merged. */
@@ -687,8 +687,14 @@ export function mergeSearchedChains({ sequences, chainA3ms, pairedA3ms, model })
     // chain input, so a row spanning two chains would claim their residues
     // coevolved. See CHAIN_MERGES.
     && graphFamily(model) !== "monomer";
+  // AF-Multimer's crop_chains (MULTIMER_MSA_CROP): each chain's paired rows to the first 1024, its unpaired ones
+  // - after the deduplication below, which AlphaFold's pair_and_merge also runs first - to what is left of 2048.
+  // The query is row 0 of both and counts in both, as it does there; the merge then skips each chain's own.
+  const crop = graphFamily(model) === "multimer";
+  const pairedFor = (sequence) => (crop ? cropA3mRows(pairedA3ms.get(sequence), MULTIMER_MSA_CROP / 2)
+    : pairedA3ms.get(sequence));
   const paired = !hasPairing ? undefined
-    : mergeRowAlignedChainA3ms(sequences.map((sequence) => pairedA3ms.get(sequence)));
+    : mergeRowAlignedChainA3ms(sequences.map(pairedFor));
 
   // 🔴 AND THE UNPAIRED BLOCK IS DEDUPLICATED AGAINST THE PAIRED ONE FIRST,
   // per chain, before the merge - which is why the merge happens here and not
@@ -701,7 +707,8 @@ export function mergeSearchedChains({ sequences, chainA3ms, pairedA3ms, model })
   const deduplicated = !hasPairing ? chainA3ms
     : sequences.map((sequence, chain) => deduplicateUnpairedAgainstPaired(
       chainA3ms[chain], pairedA3ms.get(sequence)));
-  const unpaired = merge(deduplicated);
+  const unpaired = merge(!crop ? deduplicated : deduplicated.map((text, chain) => cropA3mRows(text,
+    1 + Math.max(0, MULTIMER_MSA_CROP - (hasPairing ? nonGappedRows(pairedFor(sequences[chain])) : 1)))));
 
   // What a single-alignment consumer reads: paired rows above unpaired ones,
   // which is the order AlphaFold-Multimer's own merge produces and what

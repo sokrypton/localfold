@@ -16,9 +16,10 @@ export async function makeA3mFeaturesOnDevice(device, a3mText, tables, options =
   const { plans, context } = planA3mRecycles(a3mText, tables, options);
   const mark = performance.now();
   const searches = plans.map((plan) => ({
-    ...paddedCodeWords(plan.centerCodes, context.encoded, plan.extras,
+    ...paddedCodeWords(plan.centerCodes, context.encoded, plan.pool,
       plan.centers.length, context.length),
     centres: plan.centers.length,
+    splitTies: options.multimerClustering === true,
   }));
   const assignments = await assignNearestCentres(device, searches);
   featureStats.nearestMs += performance.now() - mark;

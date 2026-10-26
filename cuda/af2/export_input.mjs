@@ -134,6 +134,9 @@ const featureOptions = {
   maxMsaSequences: Number(option("max-msa", "512")),
   maxExtraSequences: Number(option("max-extra", "1024")),
   randomSeed: Number(option("seed", "0")),
+  // AF-Multimer's cluster profile for multimer weights (shared/input/a3m-features.js; the page derives it in
+  // webgpu/af2/multimer/model.js from the same fact)
+  multimerClustering: isMultimer,
 };
 // a deep alignment planned ONCE here - the parse, the encoding, the profile and every recycle's masking - and
 // each recycle's nearest-centre search and finishing in a worker of its own (no recycle depends on another's).

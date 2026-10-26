@@ -19,8 +19,11 @@ import { paddedCodeWords } from "../../shared/input/a3m-features.js";
 import { assignNearestCentres } from "../../webgpu/input/nearest-centres.js";
 
 /** The shipped host loop, copied. Keep this in step deliberately, never by import. */
-function hostAssign(centreWords, extraWords, words, centreCount, rows) {
+function hostAssign(centreWords, extraWords, words, centreCount, rows, splitTies = false) {
   const assignments = new Uint16Array(rows);
+  const tieWords = splitTies ? Math.ceil(centreCount / 32) : 0;
+  const ties = new Uint32Array(rows * tieWords);
+  const scores = new Int32Array(centreCount);
   for (let index = 0; index < rows; index += 1) {
     const extraBase = index * words;
     let best = 0;
@@ -35,10 +38,14 @@ function hostAssign(centreWords, extraWords, words, centreCount, rows) {
           + ((zeros >>> 23) & 1) + ((zeros >>> 31) & 1);
       }
       if (score > bestScore) { bestScore = score; best = centre; }
+      scores[centre] = score;
     }
     assignments[index] = best;
+    for (let centre = 0; centre < centreCount && splitTies; centre += 1) {
+      if (scores[centre] === bestScore) ties[index * tieWords + (centre >>> 5)] |= 1 << (centre & 31);
+    }
   }
-  return assignments;
+  return { best: assignments, ties, tieWords };
 }
 
 const option = (args, name, fallback) => {
@@ -91,15 +98,17 @@ export async function main(device, args = []) {
   const searches = [];
   const expected = [];
   const used = [];
-  for (const spec of cases) {
+  // 🔴 EVERY CASE TWICE: the first-centre answer the monomer reads, and AF-Multimer's every-tied-centre
+  // answer (a bitmask a row), which a multimer fold reads - held to the host loop word for word.
+  for (const splitTies of [false, true]) for (const spec of cases) {
     if (only !== "" && !spec.name.includes(only)) continue;
     const built = makeCase(spec);
     const padded = paddedCodeWords(built.centerCodes, built.encoded, built.extras,
       built.centres, built.length);
-    searches.push({ ...padded, centres: built.centres });
+    searches.push({ ...padded, centres: built.centres, splitTies });
     expected.push(hostAssign(padded.centreWords, padded.extraWords, padded.words,
-      built.centres, padded.rows));
-    used.push(spec);
+      built.centres, padded.rows, splitTies));
+    used.push({ ...spec, name: `${spec.name}${splitTies ? " (ties split)" : ""}`, splitTies });
   }
 
   // Every case in ONE submit, which is also the batching a fold's recycles use.
@@ -108,10 +117,15 @@ export async function main(device, args = []) {
   const results = [];
   let failed = 0;
   for (const [index, spec] of used.entries()) {
+    const want = expected[index]; const got = actual[index];
     let differing = 0;
     let firstAt = -1;
-    for (let row = 0; row < expected[index].length; row += 1) {
-      if (expected[index][row] !== actual[index][row]) {
+    for (let row = 0; row < want.best.length; row += 1) {
+      let same = want.best[row] === got.best[row];
+      for (let word = 0; word < want.tieWords && same; word += 1) {
+        same = want.ties[row * want.tieWords + word] === got.ties?.[row * want.tieWords + word];
+      }
+      if (!same) {
         differing += 1;
         if (firstAt < 0) firstAt = row;
       }
@@ -119,15 +133,27 @@ export async function main(device, args = []) {
     // 🔴 AND A CONTROL THAT THE CASE IS NOT TRIVIAL. An arm where every row
     // lands on centre 0 would agree perfectly and check nothing - unless zero
     // is the answer the case exists to demand, which `allZero` states.
-    const distinct = new Set(expected[index]).size;
-    const zeros = actual[index].every((centre) => centre === 0);
+    const distinct = new Set(want.best).size;
+    const zeros = got.best.every((centre) => centre === 0);
+    // ...and for the tie arm, that some row really did tie, or the masks were never exercised
+    let tiedRows = 0;
+    for (let row = 0; row < want.best.length && spec.splitTies; row += 1) {
+      let bits = 0;
+      for (let word = 0; word < want.tieWords; word += 1) {
+        let value = want.ties[row * want.tieWords + word];
+        while (value !== 0) { bits += 1; value &= value - 1; }
+      }
+      if (bits > 1) tiedRows += 1;
+    }
     const ok = differing === 0
-      && (spec.allZero === true ? zeros && distinct === 1 : distinct > 1);
+      && (spec.allZero === true ? zeros && distinct === 1 : distinct > 1)
+      && (!spec.splitTies || spec.duplicate === 0 || tiedRows > 0);
     if (!ok) failed += 1;
-    results.push({ case: spec.name, rows: expected[index].length, centres: spec.centres,
-                   differing, firstAt, distinctCentresChosen: distinct, ok });
+    results.push({ case: spec.name, rows: want.best.length, centres: spec.centres,
+                   differing, firstAt, distinctCentresChosen: distinct, tiedRows, ok });
     console.log(`${ok ? "ok  " : "FAIL"} ${spec.name}: ${differing} differing of `
-      + `${expected[index].length}, ${distinct} distinct centres chosen`
+      + `${want.best.length}, ${distinct} distinct centres chosen`
+      + (spec.splitTies ? `, ${tiedRows} rows tied` : "")
       + (firstAt < 0 ? "" : `, first at row ${firstAt}`));
   }
   if (failed > 0) throw new Error(`${failed} case(s) disagree with the host loop`);
