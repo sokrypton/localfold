@@ -39,6 +39,7 @@
 #include "conditions.h"
 #include "../src/schedule.h"
 #include "../src/metrics_tags.h"
+#include "invariants.h"
 #include "atoms.h"
 #include "chirality.h"
 #include "cif.h"
@@ -804,7 +805,8 @@ inline Batch buildStructureBatch(atoms::AtomArray& a, const atoms::Centroid& cen
                                  bool isInference);
 
 inline Batch runValidationPipeline(atoms::AtomArray& a, atoms::PipelineRng& prng,
-                                   int pathLengthCutoff = 64, bool isInference = true) {
+                                   int pathLengthCutoff = 64, bool isInference = true,
+                                   bool validateInvariants = true) {
   atoms::addSrcComponentAnnotation(a);
   if (isInference) atoms::realizeExpandableSegments(a, prng);
   atoms::filterUnwantedAtoms(a);
@@ -818,7 +820,10 @@ inline Batch runValidationPipeline(atoms::AtomArray& a, atoms::PipelineRng& prng
   atoms::unindexFlaggedTokens(a, isInference);
   const atoms::Centroid centroid = atoms::centerAndFeaturizeCentroid(a);
   atoms::addSupportsLocalLatentAnnotation(a);
-  return buildStructureBatch(a, centroid, prng, pathLengthCutoff, isInference);
+  Batch b = buildStructureBatch(a, centroid, prng, pathLengthCutoff, isInference);
+  // `ValidateBatchInvariants`: the batch upstream refuses is refused here (invariants.h).
+  if (validateInvariants) invariants::assertBatchInvariants(a, b);   // off for --dump-cif alone
+  return b;
 }
 
 inline Batch buildStructureBatch(atoms::AtomArray& a, const atoms::Centroid& centroid,
@@ -1604,7 +1609,7 @@ int run(int argc, char** argv) {
         // order - including the SECOND `addGlobalTokenIdAnnotation`, which a hand-written
         // sequence here dropped and the gate could not see, because the gate's JavaScript side
         // was sequenced by the same hand. Both sides drive their own driver now.
-        const rfd4p::featurise::Batch sb = rfd4p::featurise::runValidationPipeline(arr, prng);
+        const rfd4p::featurise::Batch sb = rfd4p::featurise::runValidationPipeline(arr, prng, 64, true, false);
         const rfd4p::atoms::Centroid centroid{{sb.centroidWithoutCond[0],
                                                sb.centroidWithoutCond[1],
                                                sb.centroidWithoutCond[2]}};
@@ -2204,6 +2209,10 @@ int run(int argc, char** argv) {
       if (!structureConditions.empty()) {
         rfd4p::conditions::applyConditions(src, structureConditions, originalResId);
       }
+      // `parse_atom_array(..., _FINALIZE_PREPARE_CONFIG)`: the built structure re-prepared, so a
+      // contig that joins two preserved segments bonds them (spec.js `addPolymerBonds`).
+      rfd4p::atoms::addPolymerBonds(src);
+      src.ids = rfd4p::cif::computeIds(src.site, src.bonds);
     }
     // 🔴 ONE GENERATOR FOR THE WHOLE PIPELINE, SEEDED FROM THE JOB. Neither the contig nor the
     // conditions draw; `runValidationPipeline` draws the segment lengths, the internal-coordinate

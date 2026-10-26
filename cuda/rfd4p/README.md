@@ -524,6 +524,37 @@ lone C_CRD ion no longer turns the design about itself. Its fallback anchor, the
 internal group, is not ported because it is the identity - that group's reference was fitted onto
 the design in the first place, so fitting the design back onto it moves nothing but rounding.
 
+## The batches upstream refuses
+
+Upstream ends every pipeline with `ValidateBatchInvariants` and RAISES on a violation, at
+inference as at training. 🔴 **NEITHER PORT HAD ANY OF ITS CHECKS**, so eight kinds of job
+upstream refuses folded here: a spec over a structure whose designed chain has no coordinates
+(`nan_in_valid_coords`), conditioning on an expandable segment, a centroid on one chain of two (or
+on part of a chain), an unindexed residue with nothing to place it by, sequence probabilities that
+sum past one, fall short of one when fully specified, or name another polymer's residues, and a
+contig that joins two preserved segments 23 A apart with a peptide bond (`bond_length`). Both ports
+now run the inference checks (`shared/rfd4p/pipeline/invariants.js`, `featurise/invariants.h`) and
+refuse in upstream's words, every check named.
+
+Two more refusals live earlier upstream and are ported beside them: a sequence probability that
+contradicts C_SEQ on the same residue (`CanonicalizeSequenceProbabilityConditions` refuses where
+both ports overwrote it), and a C_CRDGRP group over a C_CRD atom (above).
+
+🔴 **AND THE JOINED CONTIG WAS A FEATURISER DIFFERENCE, NOT ONLY A MISSING REFUSAL.** Upstream
+re-prepares the structure a condition spec built (`parse_atom_array(..., _FINALIZE_PREPARE_CONFIG)`),
+so `add_polymer_bonds` runs again over the renumbered contig and two segments placed side by side
+ARE bonded; both ports bonded only at load. They run it after the contig now (`addPolymerBonds`), and
+with upstream's own rule - skip a jump of MORE than one, so 52 to 52A (an insertion code) is bonded
+where `== 1` skipped it, and skip a pair an authored link already joins either way round.
+`tools/check-rfd4p-load.py` compares the loaded BONDS with atomworks' now, not only the atoms: 29
+loads exact but 5O45's link chemistry, which shows there as the carboxylate's bond order too.
+
+`tools/check-rfd4p-invariants.py` (`upstream i`) runs each job through upstream's pipeline, the
+page's and the native featuriser and requires the same verdict - built, or refused for the same
+checks, or with the same sentence: the gate's own jobs (all build) and thirteen made to trip one
+check each, 24 jobs, 0 differing. Removing the bond-length check natively, or the
+sequence-probability checks on the page, turns exactly their jobs red.
+
 ## Every preset generates
 
 All ten of RFD4-Proteina's shipped presets now run end to end: unconditional, fold-conditioned,

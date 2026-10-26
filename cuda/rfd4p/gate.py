@@ -1169,6 +1169,20 @@ def main() -> int:
                       f"atomworks, {m.group(2) if m else '?'} differing ({m.group(3) if m else '?'} past the "
                       f"1000 cap)  {'ok ' if ok else 'DIFFERS'}")
 
+            # 🔴 AND WHICH JOBS ARE REFUSED, AGAINST UPSTREAM'S OWN PIPELINE: `ValidateBatchInvariants`
+            # and the stages before it, over the gate's own jobs (which must build) and jobs made
+            # to trip one check each - page and native both, check by check.
+            if venv.exists():
+                r = run([venv, REPO / "tools" / "check-rfd4p-invariants.py"], cwd=REPO)
+                m = re.search(r"(\d+) jobs \((\d+) refused upstream\), (\d+) differing", r.stdout)
+                ok = r.returncode == 0 and m is not None
+                if not ok:
+                    failed += 1
+                    print(r.stdout[-1500:], r.stderr[-600:])
+                print(f"  {'upstream i':10s} {m.group(1) if m else '?'} jobs' verdicts against upstream "
+                      f"({m.group(2) if m else '?'} refused), {m.group(3) if m else '?'} differing  "
+                      f"{'ok ' if ok else 'DIFFERS'}")
+
             # 🔴 AND THE SAMPLER, AGAINST UPSTREAM'S OWN `sample_schedule` AND `simulation_step`:
             # every mode a job's `sampling` may name (vf, sc, vf_tsr), the gt transforms and clamp,
             # the schedule shapes and re-centring. The sampler trajectory above holds the native

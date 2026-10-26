@@ -837,6 +837,29 @@ inline void finalizeAndCanonicalizeSequenceConditioning(AtomArray& a) {
     if (any) for (int i = s; i < e; ++i) seqAtoms[i] = 1;
   }
 
+  // A probability that disagrees with C_SEQ is refused, not overwritten (transforms.js).
+  string conflicts;
+  for (const char* tok : tables::STANDARD_POLYMER_RESIDUES) {
+    auto it = a.ann.floats.find(string("condition_sequence-probability-") + tok + "_1_residue");
+    if (it == a.ann.floats.end() || it->second.size() != n) continue;
+    int residues = 0;
+    for (size_t r = 0; r + 1 < res.size(); ++r) {
+      bool conflict = false;
+      for (int i = res[r]; i < res[r + 1] && !conflict; ++i) {
+        const float p = (float)it->second[i];
+        if (!seqAtoms[i] || std::isnan(p)) continue;
+        const double expected = sequence[i] == tok ? 1.0 : 0.0;
+        conflict = !(std::fabs((double)p - expected) <= 1e-8 + 1e-5 * expected);
+      }
+      residues += conflict;
+    }
+    if (residues) conflicts += (conflicts.empty() ? "" : ", ") + string(tok) + ": " + std::to_string(residues) + " residue(s)";
+  }
+  if (!conflicts.empty()) {
+    fprintf(stderr, "Sequence-probability conditioning conflicts with C_SEQ exact identities: %s\n", conflicts.c_str());
+    exit(1);
+  }
+
   for (const char* tok : tables::STANDARD_POLYMER_RESIDUES) {
     const string key = string("condition_sequence-probability-") + tok + "_1_residue";
     auto it = a.ann.floats.find(key);
@@ -893,6 +916,19 @@ inline void featurizeExpandedSegments(AtomArray& a, bool isInference = true) {
   const vector<int>& seg = a.ann.ints["annotation_expsegmin_1_residue"];
   for (size_t i = 0; i < a.n(); ++i) {
     if (seg[i] != -1) { a.site.x[i] = 0.0; a.site.y[i] = 0.0; a.site.z[i] = 0.0; }
+  }
+}
+
+/** `addPolymerBonds` (cif.js): `add_polymer_bonds` over a finished array. */
+inline void addPolymerBonds(AtomArray& a) {
+  if (a.n() == 0 || a.site.chainType.size() != a.n()) return;
+  const vector<int> starts = cif::residueSegments(a.site);
+  vector<int> atomToRes(a.n(), 0);
+  for (size_t r = 0; r + 1 < starts.size(); ++r) {
+    for (int i = starts[r]; i < starts[r + 1]; ++i) atomToRes[i] = (int)r;
+  }
+  for (const auto& [u, v] : cif::polymerBondsToAdd(a.site, a.bonds, starts, atomToRes)) {
+    a.bonds.push_back({std::min(u, v), std::max(u, v), tables::BT_SINGLE});
   }
 }
 

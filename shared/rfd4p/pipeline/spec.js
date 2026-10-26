@@ -18,6 +18,7 @@ import {
   parseCifToAtomArray,
   readStructureBlock,
   computeIdAndEntityAnnotations,
+  addPolymerBonds,
   getResidueSegments,
   getPolymerizationAtoms,
 } from './cif.js';
@@ -1731,6 +1732,8 @@ export function buildAtomArrayFromConditionSpec(specOrText, opts = {}) {
     applyConditions(atomArray, rawSpec.conditions, originalResId);
   }
 
+  // `parse_atom_array(..., _FINALIZE_PREPARE_CONFIG)` re-prepares the built structure.
+  addPolymerBonds(atomArray);
   computeIdAndEntityAnnotations(atomArray);
   return atomArray;
 }

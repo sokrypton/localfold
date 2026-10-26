@@ -572,6 +572,71 @@ export function computeIdAndEntityAnnotations(atoms) {
 }
 
 /**
+ * atomworks' `add_polymer_bonds`: the backbone bond between consecutive residues of one chain
+ * instance, where neither site already reaches the other residue (an authored link, either way
+ * round) and the numbering does not jump - by MORE than one, so 52 to 52A (an insertion code,
+ * the same number) is bonded, which a `== 1` test here did not.
+ * @returns {number[][]} the `[out, in]` pairs to add, in residue order
+ */
+function polymerBondsToAdd(atoms, bonds, resStarts, atomToRes) {
+  const neighbours = new Map();
+  for (const [u, v, bt] of bonds) {
+    if (bt === BOND_TYPE.COORDINATION) continue;
+    if (!neighbours.has(u)) neighbours.set(u, []);
+    if (!neighbours.has(v)) neighbours.set(v, []);
+    neighbours.get(u).push(v);
+    neighbours.get(v).push(u);
+  }
+  const find = (s, e, name) => {
+    for (let i = s; i < e; i++) if (atoms.atom_name[i] === name) return i;
+    return -1;
+  };
+  const out = [];
+  for (let r = 0; r < resStarts.length - 2; r++) {
+    const s1 = resStarts[r];
+    const e1 = resStarts[r + 1];
+    const s2 = resStarts[r + 1];
+    const e2 = resStarts[r + 2];
+    if (atoms.chain_id[s1] !== atoms.chain_id[s2]) continue;
+    if (atoms.transformation_id && atoms.transformation_id[s1] !== atoms.transformation_id[s2]) continue;
+    if (atoms.res_id[s2] - atoms.res_id[s1] > 1) continue;
+    const atoms1 = getPolymerizationAtoms(atoms.res_name[s1], atoms.chain_type[s1]);
+    const atoms2 = getPolymerizationAtoms(atoms.res_name[s2], atoms.chain_type[s2]);
+    if (!atoms1[0] || !atoms2[1]) continue;
+    const idxIn = find(s2, e2, atoms2[1]);
+    const idxOut = find(s1, e1, atoms1[0]);
+    if (idxIn < 0 || idxOut < 0) continue;
+    // `_has_existing_polymer_attachment`: either site already bonded into the other residue.
+    if ((neighbours.get(idxOut) ?? []).some((x) => atomToRes[x] === r + 1)
+      || (neighbours.get(idxIn) ?? []).some((x) => atomToRes[x] === r)) continue;
+    // An explicit backbone link may run opposite to the numbering.
+    const reverseIn = atoms1[1] ? find(s1, e1, atoms1[1]) : -1;
+    const reverseOut = atoms2[0] ? find(s2, e2, atoms2[0]) : -1;
+    if (reverseIn >= 0 && reverseOut >= 0 && (neighbours.get(reverseIn) ?? []).includes(reverseOut)) continue;
+    out.push([idxOut, idxIn]);
+  }
+  return out;
+}
+
+/**
+ * `add_polymer_bonds` over a finished array, as upstream's `parse_atom_array` re-prepares the
+ * structure a condition spec built: two preserved segments a contig joins directly ARE bonded -
+ * and refused if the bond is impossible (`bond_length`), where this port left them unbonded.
+ */
+export function addPolymerBonds(atoms) {
+  if (!atoms.bonds || !atoms.chain_type || atoms.nAtoms === 0) return atoms;
+  const resStarts = getResidueSegments(atoms);
+  const atomToRes = new Int32Array(atoms.nAtoms);
+  for (let r = 0; r < resStarts.length - 1; r++) {
+    for (let i = resStarts[r]; i < resStarts[r + 1]; i++) atomToRes[i] = r;
+  }
+  for (const [u, v] of polymerBondsToAdd(atoms, atoms.bonds, resStarts, atomToRes)) {
+    atoms.bonds.push([Math.min(u, v), Math.max(u, v), BOND_TYPE.SINGLE]);
+  }
+  return atoms;
+}
+
+/**
  * Add intra-residue bonds, struct_conn bonds, polymer backbone bonds, and retype metal bonds.
  */
 export function buildBondsForAtomArray(atoms, cifBlock = null, customBondDict = null) {
@@ -713,45 +778,8 @@ export function buildBondsForAtomArray(atoms, cifBlock = null, customBondDict = 
   }
 
   // 3. Add inter-residue polymer bonds (add_polymer_bonds)
-  for (let r = 0; r < resStarts.length - 2; r++) {
-    const s1 = resStarts[r];
-    const e1 = resStarts[r + 1];
-    const s2 = resStarts[r + 1];
-    const e2 = resStarts[r + 2];
-    if (atoms.chain_id[s1] !== atoms.chain_id[s2]) continue;
-    if (atoms.transformation_id && atoms.transformation_id[s1] !== atoms.transformation_id[s2]) continue;
-    if (atoms.res_id[s2] - atoms.res_id[s1] !== 1) continue;
-
-    const [outName] = getPolymerizationAtoms(atoms.res_name[s1], atoms.chain_type[s1]);
-    const [, inName] = getPolymerizationAtoms(atoms.res_name[s2], atoms.chain_type[s2]);
-    if (!outName || !inName) continue;
-
-    let idxOut = -1;
-    let idxIn = -1;
-    for (let i = s1; i < e1; i++) {
-      if (atoms.atom_name[i] === outName) { idxOut = i; break; }
-    }
-    for (let i = s2; i < e2; i++) {
-      if (atoms.atom_name[i] === inName) { idxIn = i; break; }
-    }
-    if (idxOut < 0 || idxIn < 0) continue;
-
-    // Check if an existing non-coordination bond already links idxOut or idxIn to the adjacent residue
-    let alreadyLinked = false;
-    for (const [u, v, bt] of bondMap.values()) {
-      if (bt === BOND_TYPE.COORDINATION) continue;
-      if ((u === idxOut && atomToRes[v] === r + 1) || (v === idxOut && atomToRes[u] === r + 1)) {
-        alreadyLinked = true;
-        break;
-      }
-      if ((u === idxIn && atomToRes[v] === r) || (v === idxIn && atomToRes[u] === r)) {
-        alreadyLinked = true;
-        break;
-      }
-    }
-    if (!alreadyLinked) {
-      addBond(idxOut, idxIn, BOND_TYPE.SINGLE);
-    }
+  for (const [u, v] of polymerBondsToAdd(atoms, [...bondMap.values()], resStarts, atomToRes)) {
+    addBond(u, v, BOND_TYPE.SINGLE);
   }
 
   // 4. Retype any metal-incident bond to COORDINATION

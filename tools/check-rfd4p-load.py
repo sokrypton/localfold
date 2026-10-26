@@ -19,7 +19,8 @@ modified-residue macrocycle) in both modes, plus every `.cif` in `--structures`.
 🔴 ONE DIFFERENCE IS EXPECTED AND ASSERTED, NOT EXCUSED: 5O45's macrocycle closes through a
 non-standard residue (CCS CE - PHE N) whose dictionary entry has no leaving atom for that bond,
 and atomworks' link chemistry (`resolve_link_chemistry`, 1,247 lines of RDKit valence rules)
-lowers the carboxylate's double bond and puts -1 on OZ1. That is not ported; the entry below
+lowers the carboxylate's double bond and puts -1 on OZ1 - both of which this checks, bonds being
+compared now as well as atoms. That is not ported; the entry below
 requires EXACTLY that difference, so the day it is ported - or anything else moves - this fails.
 """
 from __future__ import annotations
@@ -40,7 +41,9 @@ EXAMPLES = ["5o45_cropped", "dna_7m5w", "motif_idx_1prw", "motif_unidx_1prw", "p
 FIELDS = ["chain_id", "res_id", "res_name", "ins_code", "atom_name", "element", "charge", "occupancy"]
 RAW = REPO / "tools" / "fixtures" / "rcsb"
 EXPECTED = {
-    "5o45 fresh": ["charge: 1 of 1171 (first #1162 B/CCS13/OZ1: upstream -1.0, page 0)"],
+    "5o45 fresh": ["charge: 1 of 1171 (first #1162 B/CCS13/OZ1: upstream -1.0, page 0)",
+                   "bonds: 1 only upstream [('B/CCS13/CE', 'B/CCS13/OZ1', 1)], "
+                   "1 only here [('B/CCS13/CE', 'B/CCS13/OZ1', 2)]"],
 }
 
 
@@ -56,6 +59,8 @@ def upstream_atoms(path: Path, annotated: bool) -> dict:
     out = {k: [str(v) if k in ("chain_id", "res_name", "ins_code", "atom_name", "element") else float(v)
                for v in getattr(a, k)] for k in FIELDS}
     out["coord"] = [[None if math.isnan(x) else round(float(x), 3) for x in c] for c in a.coord]
+    out["bonds"] = sorted([min(int(i), int(j)), max(int(i), int(j)), int(t)] for i, j, t in a.bonds.as_array()) \
+        if a.bonds is not None else []
     return out
 
 
@@ -77,6 +82,12 @@ for (const [key, path, annotated] of cases) {
       ins_code: pick("ins_code"), atom_name: pick("atom_name"), element: pick("element"),
       charge: pick("charge"), occupancy: pick("occupancy"),
       coord: keep.map((i) => a.coord[i].map((x) => (Number.isFinite(x) ? Math.round(x * 1000) / 1000 : null))),
+      bonds: (() => {
+        const at = new Map(keep.map((g, k) => [g, k]));
+        return (a.bonds ?? []).filter(([i, j]) => at.has(i) && at.has(j))
+          .map(([i, j, t]) => [Math.min(at.get(i), at.get(j)), Math.max(at.get(i), at.get(j)), t])
+          .sort((x, y) => x[0] - y[0] || x[1] - y[1] || x[2] - y[2]);
+      })(),
     };
   } catch (e) { out[key] = { raise: e.message }; }
 }
@@ -117,6 +128,16 @@ def differences(up: dict, page: dict) -> list[str]:
             i = bad[0]
             out.append(f"{k}: {len(bad)} of {nu} (first #{i} {up['chain_id'][i]}/{up['res_name'][i]}"
                        f"{up['res_id'][i]:g}/{up['atom_name'][i]}: upstream {up[k][i]!r}, page {page[k][i]!r})")
+    # 🔴 AND THE BONDS, which every featurised bond and path length is built from: compared as a
+    # set of (atom, atom, type). This checker compared atoms alone, so a polymer bond the page
+    # never made (52 to 52A, an insertion code) loaded "exact".
+    ub, pb = {tuple(b) for b in up["bonds"]}, {tuple(b) for b in page["bonds"]}
+    if ub != pb:
+        def name(i):
+            return f"{up['chain_id'][i]}/{up['res_name'][i]}{up['res_id'][i]:g}/{up['atom_name'][i]}"
+        only_up, only_page = sorted(ub - pb), sorted(pb - ub)
+        out.append(f"bonds: {len(only_up)} only upstream {[(name(b[0]), name(b[1]), b[2]) for b in only_up[:2]]}, "
+                   f"{len(only_page)} only here {[(name(b[0]), name(b[1]), b[2]) for b in only_page[:2]]}")
     bad = [i for i in range(nu) if any(
         (a is None) != (b is None) or (a is not None and abs(a - b) > 1.5e-3)
         for a, b in zip(up["coord"][i], page["coord"][i]))]

@@ -12,6 +12,7 @@
  * - `rfproteina/transforms/geometry.py` (`CenterOnCoordinateConditionedAtoms`)
  */
 
+import { assertBatchInvariants } from './invariants.js';
 import {
   TokenType,
   TOKEN_TYPE_IDS,
@@ -684,6 +685,30 @@ export function finalizeAndCanonicalizeSequenceConditioning(atoms) {
     if (anySeq) {
       for (let i = s; i < e; i++) seqAtoms[i] = true;
     }
+  }
+
+  // 🔴 C_SEQ IS AUTHORITATIVE, BUT A PROBABILITY THAT DISAGREES WITH IT IS REFUSED, not
+  // overwritten (`CanonicalizeSequenceProbabilityConditions`): `C_SEQ: true` beside
+  // `C_SEQ_PROB_ALA: 0.5` on the same residues is a job that asks for two things.
+  const conflicts = [];
+  for (const tok of STANDARD_POLYMER_RESIDUES) {
+    const given = ann[`condition_sequence-probability-${tok}_1_residue`];
+    if (!given) continue;
+    let residues = 0;
+    for (let r = 0; r < resBounds.length - 1; r++) {
+      let conflict = false;
+      for (let i = resBounds[r]; i < resBounds[r + 1] && !conflict; i++) {
+        const p = Math.fround(given[i]);
+        if (!seqAtoms[i] || Number.isNaN(p)) continue;
+        const expected = sequence[i] === tok ? 1 : 0;
+        conflict = !(Math.abs(p - expected) <= 1e-8 + 1e-5 * expected);
+      }
+      if (conflict) residues += 1;
+    }
+    if (residues) conflicts.push(`${tok}: ${residues} residue(s)`);
+  }
+  if (conflicts.length) {
+    throw new Error(`Sequence-probability conditioning conflicts with C_SEQ exact identities: ${conflicts.join(', ')}`);
   }
 
   for (const tok of STANDARD_POLYMER_RESIDUES) {
@@ -1672,6 +1697,7 @@ export function inferSegmentLengthsFromOracleBatch(oracleBatch) {
  */
 export function runValidationPipeline(atomsInput, opts = {}) {
   const {
+    validateInvariants = true,
     seed = 0,
     segmentLengths = null,
     chainPerm = null,
@@ -1714,6 +1740,10 @@ export function runValidationPipeline(atomsInput, opts = {}) {
     isInference,
     rng,
   });
+  // `ValidateBatchInvariants`: the batch upstream refuses is refused here (invariants.js). Off
+  // only for check-cif.mjs, which drives this over raw files (waters and all) to compare the two
+  // pipelines' arithmetic, not to build a job.
+  if (validateInvariants) assertBatchInvariants(atoms, batch);
 
   return { batch, n, atoms, inputAtomArray: atomsInput };
 }

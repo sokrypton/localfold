@@ -688,6 +688,53 @@ struct Bond {
 };
 
 /**
+ * `add_polymer_bonds` (cif.js `polymerBondsToAdd`): the backbone bond between consecutive residues
+ * of one chain, where neither site already reaches the other residue (an authored link, either
+ * way round) and the numbering jumps by no MORE than one - 52 to 52A is bonded.
+ */
+inline vector<std::pair<int, int>> polymerBondsToAdd(const AtomSite& a, const vector<Bond>& bonds,
+                                                     const vector<int>& starts, const vector<int>& atomToRes) {
+  std::map<int, vector<int>> neighbours;
+  for (const Bond& b : bonds) {
+    if (b.type == tables::BT_COORDINATION) continue;
+    neighbours[b.u].push_back(b.v);
+    neighbours[b.v].push_back(b.u);
+  }
+  auto find = [&](int s, int e, const string& name) {
+    for (int i = s; i < e; ++i) if (a.atomName[i] == name) return i;
+    return -1;
+  };
+  auto reaches = [&](int atom, int residue) {
+    const auto it = neighbours.find(atom);
+    if (it == neighbours.end()) return false;
+    for (const int x : it->second) if (atomToRes[x] == residue) return true;
+    return false;
+  };
+  vector<std::pair<int, int>> out;
+  for (size_t r = 0; r + 2 < starts.size(); ++r) {
+    const int s1 = starts[r], e1 = starts[r + 1], s2 = starts[r + 1], e2 = starts[r + 2];
+    if (a.chainId[s1] != a.chainId[s2]) continue;
+    if (a.resId[s2] - a.resId[s1] > 1) continue;
+    const std::pair<string, string> atoms1 = polymerizationAtoms(a.resName[s1], a.chainType[s1]);
+    const std::pair<string, string> atoms2 = polymerizationAtoms(a.resName[s2], a.chainType[s2]);
+    if (atoms1.first.empty() || atoms2.second.empty()) continue;
+    const int idxIn = find(s2, e2, atoms2.second), idxOut = find(s1, e1, atoms1.first);
+    if (idxIn < 0 || idxOut < 0) continue;
+    if (reaches(idxOut, (int)r + 1) || reaches(idxIn, (int)r)) continue;
+    const int reverseIn = atoms1.second.empty() ? -1 : find(s1, e1, atoms1.second);
+    const int reverseOut = atoms2.first.empty() ? -1 : find(s2, e2, atoms2.first);
+    if (reverseIn >= 0 && reverseOut >= 0) {
+      const auto it = neighbours.find(reverseIn);
+      if (it != neighbours.end() && std::find(it->second.begin(), it->second.end(), reverseOut) != it->second.end()) {
+        continue;
+      }
+    }
+    out.push_back({idxOut, idxIn});
+  }
+  return out;
+}
+
+/**
  * `buildBondsForAtomArray`: the declared links, then each residue's own, then the polymer
  * backbone, then a retype of everything incident on a metal.
  *
@@ -803,32 +850,8 @@ inline vector<Bond> buildBonds(const AtomSite& a, const Block& block) {
     }
   }
 
-  // 3. The polymer backbone, between consecutive residues of one chain - unless one of the two
-  //    atoms is already bonded to the other residue, which a declared link would have made.
-  for (size_t r = 0; r + 2 < starts.size(); ++r) {
-    const int s1 = starts[r], e1 = starts[r + 1], s2 = starts[r + 1], e2 = starts[r + 2];
-    if (a.chainId[s1] != a.chainId[s2]) continue;
-    if (a.resId[s2] - a.resId[s1] != 1) continue;
-    const string outName = polymerizationAtoms(a.resName[s1], a.chainType[s1]).first;
-    const string inName = polymerizationAtoms(a.resName[s2], a.chainType[s2]).second;
-    if (outName.empty() || inName.empty()) continue;
-    int idxOut = -1, idxIn = -1;
-    for (int i = s1; i < e1; ++i) if (a.atomName[i] == outName) { idxOut = i; break; }
-    for (int i = s2; i < e2; ++i) if (a.atomName[i] == inName) { idxIn = i; break; }
-    if (idxOut < 0 || idxIn < 0) continue;
-    bool linked = false;
-    for (const Bond& b : bonds) {
-      if (b.type == tables::BT_COORDINATION) continue;
-      if ((b.u == idxOut && atomToRes[b.v] == (int)r + 1) ||
-          (b.v == idxOut && atomToRes[b.u] == (int)r + 1) ||
-          (b.u == idxIn && atomToRes[b.v] == (int)r) ||
-          (b.v == idxIn && atomToRes[b.u] == (int)r)) {
-        linked = true;
-        break;
-      }
-    }
-    if (!linked) addBond(idxOut, idxIn, tables::BT_SINGLE);
-  }
+  // 3. The polymer backbone (`polymerBondsToAdd`).
+  for (const auto& [u, v] : polymerBondsToAdd(a, bonds, starts, atomToRes)) addBond(u, v, tables::BT_SINGLE);
 
   // 4. Anything touching a metal is a COORDINATION bond, whatever it was.
   for (Bond& b : bonds) {

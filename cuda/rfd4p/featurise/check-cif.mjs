@@ -1143,7 +1143,7 @@ for (const [name, text] of cases) {
     // agreed perfectly while BOTH were missing `runValidationPipeline`'s second
     // `addGlobalTokenIdAnnotation`. A gate that re-implements the thing it is checking is
     // checking its own reimplementation.
-    const ran = runValidationPipeline(js, { seed: 0 });
+    const ran = runValidationPipeline(js, { seed: 0, validateInvariants: false });
     const unindexed = ran.atoms;
     const centroidWithoutCond =
       ran.batch.centroid_of_atoms_without_coordinate_conditioning.data;
