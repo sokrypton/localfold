@@ -11,7 +11,7 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-430 tools. `tools/fixtures/` is data and is not listed.
+431 tools. `tools/fixtures/` is data and is not listed.
 
 ## `tools/gpu/` - the WebGPU lane (215)
 
@@ -333,7 +333,7 @@ and turning it into a bundle.
 - **`safetensors_read.py`** - Read a .safetensors file into numpy arrays, without the safetensors package.
 - **`vector-quantise.py`** - Is a codebook worth a new decoder? Scalar codes against vector ones, at 2 bits.
 
-## `tools/` - everything else (128)
+## `tools/` - everything else (129)
 
 CPU checkers, the export and quantisation pipeline, the page drivers that
 go through CDP, and the deploy.
@@ -438,6 +438,7 @@ go through CDP, and the deploy.
 - **`gen-rfd4p-cath-mapping.py`** - Generate shared/rfd4p/cath-mapping.js from RFD4-Proteina's own `data/cath_label_mapping.pkl`.
 - **`gen-rfd4p-ccd-templates.py`** - Generate shared/rfd4p/pipeline/ccd-templates.js from the Chemical Component Dictionary atomworks reads.
 - **`gen-rfd4p-query-tables.py`** - Generate shared/rfd4p/pipeline/query-tables.js from atomworks' and biotite's own constants.
+- **`gen-rfd4p-valence.py`** - Generate shared/rfd4p/pipeline/valence.js: RDKit's answer to atomworks' valence probe.
 - **`gen-standard-components.mjs`** - Generate shared/af3/featurise/standard-components.js - the CCD entries of the 20 standard amino acids and the 8 standard nucleotides, cut down to what parseCcdComponent reads - from ccd/components.cif. Hydrogens are kept: rf3's declared-bond charge counts the bonds an atom still has, a hydrogen's among them.
 - **`gpu-chrome.mjs`** - Run a WebGPU module in headless Chrome and print what it returns.
 - **`heatmap-panel.py`** - Do the heatmap panel's tabs appear, and does OUR map format reach them?

@@ -34,6 +34,7 @@ gate-writer-*
 gate-metrics-5o45*
 /gate-groups-5o45*
 /gate-partial-1brs*
+/gate-oracle-*
 featurise/gate-writer-*.json
 featurise/gate-nucleic-ss.cif
 featurise/gate-nucleic-ss.json

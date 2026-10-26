@@ -134,25 +134,8 @@ if (option("job", "") !== "") {
   // The TEMPLATES, every one of them: AF3's data pipeline writes up to twenty a chain into the job
   // and folds the first four, chain i's k-th in slot k, where the page's reader takes one a chain -
   // so they are lifted out here, per chain copy, and built below (jobTemplates)
-  let polymerCopy = 0;
-  for (const entry of jobs[0]?.sequences ?? []) {
-    const [kind, body] = Object.entries(entry)[0] ?? [];
-    if (!["protein", "rna", "dna"].includes(kind) || body === undefined) continue;
-    const copies = Array.isArray(body.id) ? body.id.length : 1;
-    for (let c = 0; c < copies; c += 1) {
-      for (const [k, t] of (Array.isArray(body.templates) ? body.templates : []).slice(0, 4).entries()) {
-        if (typeof t.mmcif !== "string") throw new Error(`template ${k} of chain ${polymerCopy}: give the mmCIF inline`);
-        const q = t.queryIndices, ti = t.templateIndices;
-        if ((q === undefined) !== (ti === undefined) || (q && (q.length !== ti.length))) {
-          throw new Error(`template ${k} of chain ${polymerCopy}: queryIndices and templateIndices are two lists of one length`);
-        }
-        (jobTemplates[k] ??= []).push({ text: t.mmcif, chain: polymerCopy, label: `job template ${k}`,
-                                        ...(q === undefined ? {} : { mapping: q.map((v, i) => [v, ti[i]]) }) });
-      }
-      polymerCopy += 1;
-    }
-    delete body.templates;
-  }
+  const { liftJobTemplates } = await import(`${repo}/web/job-json.js`);
+  jobTemplates.push(...liftJobTemplates(raw));
   const job = jobFromJson(JSON.stringify(raw));
   // every modelSeed, where the page folds the first: af3 runs each (src/af3.cu, --seeds)
   const seeds = [jobs[0]?.modelSeeds ?? []].flat().map(Number);

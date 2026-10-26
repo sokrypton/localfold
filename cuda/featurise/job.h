@@ -116,6 +116,8 @@ struct OptText { bool present = false; std::string text; };     // null / a stri
 struct EntityTemplate { std::string kind; std::string text; bool hasMapping = false; std::vector<std::pair<int, int>> mapping; };
 struct Entity {
   std::string type, value;
+  // a ligand's codes the job's userCCD defines, which need not look like the dictionary's (web/job-json.js)
+  std::vector<std::string> userCodes;
   double copies = 1;
   std::vector<Modification> modifications;
   std::vector<std::string> ids;
@@ -151,6 +153,30 @@ inline const std::vector<CommonModification>& commonModifications() {
     {"M3L", 'K'}, {"ALY", 'K'}, {"KCX", 'K'}, {"CSO", 'C'}, {"CME", 'C'}, {"OCS", 'C'}, {"SNC", 'C'}, {"NEP", 'H'},
     {"AGM", 'R'}, {"PCA", 'E'}};
   return m;
+}
+// shared/af3/featurise/ccd-component.js userCcdCodes: each data_ block's `_chem_comp.id`, upper-cased
+inline std::vector<std::string> userCcdCodes(const std::string& text) {
+  std::vector<size_t> starts;
+  for (size_t at = 0; at < text.size(); at = text.find('\n', at), at = at == std::string::npos ? text.size() : at + 1)
+    if (text.compare(at, 5, "data_") == 0) starts.push_back(at);
+  std::vector<std::string> out;
+  for (size_t i = 0; i < starts.size(); ++i) {
+    const std::string block = text.substr(starts[i], (i + 1 < starts.size() ? starts[i + 1] : text.size()) - starts[i]);
+    // /_chem_comp\.id\s+(\S+)/, its quotes stripped
+    for (size_t k = block.find("_chem_comp.id"); k != std::string::npos; k = block.find("_chem_comp.id", k + 1)) {
+      size_t v = k + 13;
+      if (v >= block.size() || !std::isspace((unsigned char)block[v])) continue;
+      while (v < block.size() && std::isspace((unsigned char)block[v])) ++v;
+      size_t w = v;
+      while (w < block.size() && !std::isspace((unsigned char)block[w])) ++w;
+      if (w == v) continue;
+      std::string code;
+      for (char c : block.substr(v, w - v)) if (c != '\'' && c != '"') code += c;
+      out.push_back(upper(code));
+      break;
+    }
+  }
+  return out;
 }
 inline bool ccdShaped(const std::string& code) {
   if (code.empty() || code.size() > 5) return false;
@@ -200,6 +226,8 @@ inline std::optional<std::string> entityProblem(const Entity& e) {
       std::string t = trimWs(c);
       bool ok = !t.empty() && t.size() <= 5;
       for (char ch : t) if (!std::isalnum((unsigned char)ch)) ok = false;
+      // a code the job's own userCCD defines is whatever that file calls it (AlphaFold 3's rule)
+      if (std::find(e.userCodes.begin(), e.userCodes.end(), upper(t)) != e.userCodes.end()) ok = true;
       if (!ok) return "A CCD code is 1-5 letters or digits, like HEM or ATP";
     }
     return std::nullopt;
@@ -393,6 +421,8 @@ inline Job jobFromJson(const std::string& text, std::vector<std::vector<JobTempl
   if (!Json::absent(job.get("userCCDPath")))
     refuse("userCCDPath points at a file beside the JSON, which this reader cannot open - inline it as userCCD");
   if (!Json::absent(job.get("userCCD")) && !job.get("userCCD")->isString()) refuse("userCCD is mmCIF text");
+  const std::vector<std::string> userCodes =
+      Json::absent(job.get("userCCD")) ? std::vector<std::string>() : userCcdCodes(job.get("userCCD")->s);
   const Json* dialectValue = job.get("dialect");
   std::string dialectText = Json::absent(dialectValue) ? "" : jsString(dialectValue);
   if (!Json::absent(dialectValue) && dialectText != "alphafoldserver" && dialectText != "alphafold3")
@@ -506,6 +536,13 @@ inline Job jobFromJson(const std::string& text, std::vector<std::vector<JobTempl
         code += (i ? "," : "") + c;
       }
       e.type = "ligand"; e.value = code;
+      // the codes the job's userCCD defines (web/job-json.js)
+      for (size_t s = 0, d;; s = d + 1) {
+        d = code.find(',', s);
+        const std::string one = code.substr(s, d == std::string::npos ? std::string::npos : d - s);
+        if (std::find(userCodes.begin(), userCodes.end(), one) != userCodes.end()) e.userCodes.push_back(one);
+        if (d == std::string::npos) break;
+      }
       out.entities.push_back(e);
       continue;
     }

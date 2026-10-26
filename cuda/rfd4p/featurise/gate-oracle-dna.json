@@ -1,0 +1,1 @@
+{"input": "../../../web/examples/dna_7m5w.cif.zst", "input_as_annotated_cif": true, "nsteps": 40, "recycleSchedule": "low", "metrics_tags": ["design", "dna_refolding"]}

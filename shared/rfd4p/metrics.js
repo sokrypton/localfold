@@ -148,13 +148,18 @@ export function conditioningMetricsTags(input) {
 }
 
 /**
- * Every tag a ported metric or filter gates on, in a fixed order: the native port carries a
+ * Every tag a ported metric, filter or oracle gates on, in a fixed order: the native port carries a
  * job's tags as these bits (a tag outside the list gates nothing here, so dropping it loses
  * nothing).
  */
 export const METRICS_TAGS = ['design', 'structure_prediction', 'small_molecule_only', 'hotspot_conditioning',
   'unindexed', 'partial_diffusion', 'insertion_rmsd_filter', 'motif_rmsd_filter', 'ligand_clash_filter',
-  'no_ligand', '3d_coordinate_conditioning', 'internal_coordinate_conditioning'];
+  'no_ligand', '3d_coordinate_conditioning', 'internal_coordinate_conditioning',
+  // the refolding oracle's, its refolding metrics' and its pass criteria's (cuda/rfd4p/src/oracle.h)
+  'unconditional_refolding', 'af3_refolding', 'motif_scaffold_refolding', 'internal_coordinate_motif_scaffold_refolding',
+  'sm_binder_refolding', 'ame_refolding', 'ame_no_ligand_refolding', 'ame_original_benchmark_refolding',
+  'disco_refolding', 'ppi_refolding', 'antibody', 'dna_refolding',
+  'apo_refolding', 'developability'];
 export function metricsTagBits(tags) {
   return METRICS_TAGS.reduce((bits, t, k) => (tags.includes(t) ? bits | (1 << k) : bits), 0);
 }

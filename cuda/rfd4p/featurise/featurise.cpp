@@ -1356,6 +1356,63 @@ inline std::map<string, vector<int>> outputTables(const rfd4p::atoms::AtomArray&
   return t;
 }
 
+/**
+ * The components `blocks` define (`_chem_comp_atom`, `_chem_comp_bond`, `_chem_comp`), one
+ * `data_<id>` block each, the first definition of a code kept: what atomworks' CCD registry holds
+ * for a structure it read, and what the refolding oracle writes into AF3's `userCCD`.
+ */
+string componentDefinitions(const vector<rfd4p::cif::Block>& blocks) {
+  auto quote = [](const string& v) {
+    if (v.empty()) return string("?");
+    if (v.find_first_of(" \t'\"") == string::npos && v[0] != '_' && v[0] != '#' && v[0] != ';' && v[0] != '$') return v;
+    return v.find('\'') == string::npos ? "'" + v + "'" : "\"" + v + "\"";
+  };
+  std::set<string> seen;
+  string out;
+  for (const rfd4p::cif::Block& block : blocks) {
+    const auto atoms = block.find("chem_comp_atom");
+    if (atoms == block.end() || !atoms->second.count("comp_id")) continue;
+    const vector<string>& ids = atoms->second.at("comp_id");
+    vector<string> order;
+    for (const string& id : ids) if (std::find(order.begin(), order.end(), id) == order.end()) order.push_back(id);
+    for (const string& id : order) {
+      if (!seen.insert(id).second) continue;
+      string text = "data_" + id + "\n#\n";
+      // `_chem_comp`'s row for the code, else its id alone
+      const auto comp = block.find("chem_comp");
+      bool wrote = false;
+      if (comp != block.end() && comp->second.count("id")) {
+        const vector<string>& cids = comp->second.at("id");
+        for (size_t r = 0; r < cids.size() && !wrote; ++r) {
+          if (cids[r] != id) continue;
+          for (const auto& [col, v] : comp->second) if (r < v.size()) text += "_chem_comp." + col + " " + quote(v[r]) + "\n";
+          wrote = true;
+        }
+      }
+      if (!wrote) text += "_chem_comp.id " + quote(id) + "\n";
+      text += "#\n";
+      for (const char* cat : {"chem_comp_atom", "chem_comp_bond"}) {
+        const auto c = block.find(cat);
+        if (c == block.end() || !c->second.count("comp_id")) continue;
+        const vector<string>& rows = c->second.at("comp_id");
+        string body;
+        for (size_t r = 0; r < rows.size(); ++r) {
+          if (rows[r] != id) continue;
+          string line;
+          for (const auto& [col, v] : c->second) line += (line.empty() ? "" : " ") + quote(r < v.size() ? v[r] : string("?"));
+          body += line + "\n";
+        }
+        if (body.empty()) continue;
+        text += "loop_\n";
+        for (const auto& [col, v] : c->second) text += "_" + string(cat) + "." + col + "\n";
+        text += body + "#\n";
+      }
+      out += text;
+    }
+  }
+  return out;
+}
+
 int run(int argc, char** argv) {
   using lf::Json;
   using lf::parseJson;
@@ -2139,6 +2196,9 @@ int run(int argc, char** argv) {
   // to the exporter on every pure-contig case the gate holds, and now it can take what the page
   // takes.
   Batch b;
+  // The components the inputs define themselves (`_chem_comp_atom` / `_chem_comp_bond`), which
+  // atomworks registers and the refolding oracle hands AF3 as their definition (src/oracle.h).
+  vector<rfd4p::cif::Block> inputBlocks;
   {
     rfd4p::atoms::AtomArray src;
     // Every fetched dictionary entry the inputs needed, which `addPolymerBonds` reads again.
@@ -2163,6 +2223,8 @@ int run(int argc, char** argv) {
             annotated ? vector<rfd4p::cif::Block>{} : rfd4p::fresh::ccdBlocksForRawStructure(cifText, ccdFile);
         parts.push_back(rfd4p::atoms::fromCif(cifText, annotated, ccdBlocks));
         allCcd.insert(allCcd.end(), ccdBlocks.begin(), ccdBlocks.end());
+        inputBlocks.push_back(rfd4p::bcif::parseStructure(cifText));
+        inputBlocks.insert(inputBlocks.end(), ccdBlocks.begin(), ccdBlocks.end());
         // A structure that IS the job is upstream's direct path: its biological assembly 1.
         if (!specMode) parts.back() = rfd4p::atoms::biologicalAssemblyOne(parts.back(), rfd4p::bcif::parseStructure(cifText));
       }
@@ -2733,6 +2795,14 @@ int run(int argc, char** argv) {
     g.tensor("g/coords", b.coords);
   }
   g.close();
+  {
+    const string components = componentDefinitions(inputBlocks);
+    if (!components.empty()) {
+      FILE* f = fopen((gen + "/input-components.cif").c_str(), "w");
+      fwrite(components.data(), 1, components.size(), f);
+      fclose(f);
+    }
+  }
   {
     FILE* f = fopen((gen + "/names.txt").c_str(), "w");
     for (int a = 0; a < 37; ++a) fprintf(f, a ? " %s" : "%s", tables::ATOM37_NAMES[a]);

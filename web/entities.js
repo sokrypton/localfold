@@ -372,7 +372,11 @@ export function entityProblem(entity) {
     // The same rule ccdUrl enforces, checked here so the message arrives while
     // the field is in front of the user rather than as a failed fetch later.
     // (several codes, comma-separated, are ONE chain of bonded components - a glycan)
-    if (!value.split(",").every((code) => /^[A-Za-z0-9]{1,5}$/.test(code.trim()))) {
+    // A code the job's own userCCD defines is whatever that file calls it (AlphaFold 3's rule):
+    // the reader lists those on the entity (job-json.js `userCodes`).
+    const defined = entity.userCodes ?? [];
+    if (!value.split(",").every((code) => defined.includes(code.trim().toUpperCase())
+      || /^[A-Za-z0-9]{1,5}$/.test(code.trim()))) {
       return "A CCD code is 1-5 letters or digits, like HEM or ATP";
     }
     return null;

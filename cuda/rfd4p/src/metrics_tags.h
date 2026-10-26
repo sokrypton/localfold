@@ -1,6 +1,6 @@
 #pragma once
 // A job's `metrics_tags` as bits, in shared/rfd4p/metrics.js's `METRICS_TAGS` order: every tag a
-// ported design metric or pre-oracle filter gates on. A tag outside the list gates nothing here,
+// ported design metric, pre-oracle filter or refolding oracle gates on. A tag outside the list gates nothing here,
 // so dropping it loses nothing.
 #include <algorithm>
 #include <string>
@@ -12,7 +12,12 @@ inline const std::vector<std::string>& metricsTagNames() {
   static const std::vector<std::string> names = {
       "design", "structure_prediction", "small_molecule_only", "hotspot_conditioning", "unindexed",
       "partial_diffusion", "insertion_rmsd_filter", "motif_rmsd_filter", "ligand_clash_filter",
-      "no_ligand", "3d_coordinate_conditioning", "internal_coordinate_conditioning"};
+      "no_ligand", "3d_coordinate_conditioning", "internal_coordinate_conditioning",
+      // the refolding oracle's, its refolding metrics' and its pass criteria's (oracle.h)
+      "unconditional_refolding", "af3_refolding", "motif_scaffold_refolding", "internal_coordinate_motif_scaffold_refolding",
+      "sm_binder_refolding", "ame_refolding", "ame_no_ligand_refolding", "ame_original_benchmark_refolding",
+      "disco_refolding", "ppi_refolding", "antibody", "dna_refolding",
+      "apo_refolding", "developability"};
   return names;
 }
 

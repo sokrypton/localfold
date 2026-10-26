@@ -1,0 +1,1 @@
+{"input": "../../../web/examples/uncond_short.cif.zst", "input_as_annotated_cif": true, "nsteps": 40, "recycleSchedule": "low", "metrics_tags": ["design", "unconditional_refolding"]}

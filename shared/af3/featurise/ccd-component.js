@@ -119,6 +119,20 @@ export function loopOf(text, prefix) {
  *            x: number, y: number, z: number}[],
  *           bonds: {from: number, to: number, order: number}[]}}
  */
+/**
+ * The components a job's `userCCD` defines (each `data_` block one, named by its
+ * `_chem_comp.id`, as parseCcdComponent reads it), upper-cased - the codes AlphaFold 3
+ * takes from it whatever their characters (RFD4's designs name a ligand `S;M`).
+ *
+ * @param {string} text
+ * @returns {string[]}
+ */
+export function userCcdCodes(text) {
+  return text.split(/^(?=data_)/m).filter((b) => b.trim().startsWith("data_"))
+    .map((block) => block.match(/_chem_comp\.id\s+(\S+)/)?.[1]?.replace(/['"]/g, ""))
+    .filter((code) => code !== undefined).map((code) => code.toUpperCase());
+}
+
 export function parseCcdComponent(text) {
   const code = text.match(/_chem_comp\.id\s+(\S+)/)?.[1]?.replace(/['"]/g, "");
   if (code === undefined) throw new Error("this mmCIF has no _chem_comp.id");

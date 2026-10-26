@@ -1,0 +1,1 @@
+{"input": "../../../web/examples/sm_sam.cif.zst", "input_as_annotated_cif": true, "nsteps": 40, "recycleSchedule": "low", "metrics_tags": ["design", "sm_binder_refolding"]}

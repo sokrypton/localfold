@@ -86,6 +86,7 @@ rfbin="$here/rfd4p/featurise/rfd4p-featurise"
 rfstamp="$(cat "$here"/rfd4p/featurise/*.cpp "$here"/rfd4p/featurise/*.h \
   "$here"/rfd4p/featurise/*.inc \
   "$here"/rfd4p/src/assign.h "$here"/rfd4p/src/superpose.h "$here"/rfd4p/src/schedule.h \
+  "$here"/rfd4p/src/metrics_tags.h \
   "$here"/featurise/*.h \
   | sha256sum | cut -c1-16)"
 if [ ! -x "$rfbin" ] || [ "$(cat "$rfbin.stamp" 2>/dev/null)" != "$rfstamp" ]; then
@@ -139,7 +140,8 @@ for port in "${ports[@]}"; do
   # through the standalone binary and refused through the fold one, with nothing in the diff to
   # explain it. Same shape as the stamp that hashed five files while the structure path lived
   # in three more.
-  [ "$port" != rfd4p ] || { extra=("$here"/ef2/src/*.cuh "$here"/rfd4p/featurise/*.cpp \
+  # (and its own .h headers - metrics.h, oracle.h, symmetry.h - which `src/*.cu*` does not match)
+  [ "$port" != rfd4p ] || { extra=("$here"/ef2/src/*.cuh "$here"/rfd4p/src/*.h "$here"/rfd4p/featurise/*.cpp \
     "$here"/rfd4p/featurise/*.h "$here"/rfd4p/featurise/*.inc); \
     link=("$here/rfd4p/featurise/featurise.o"); linkstamp="$rfbin.stamp"; linkwant="$rfstamp"; }
   stamp="$arch ${LOCALFOLD_RPATH:-} $(cat "$here/$port"/src/*.cu* "${extra[@]}" "$here"/af3/src/*.cuh "$here"/plm/*.cuh "$here"/featurise/*.h "$here"/featurise/*.inc "$here"/featurise/*.cpp | sha256sum | cut -c1-16)"

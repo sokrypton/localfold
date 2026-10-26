@@ -1,0 +1,1 @@
+{"input": "../../../web/examples/5o45_cropped.cif.zst", "contig": "70-70, /0, A17-131", "conditions": {"C_CRDGRP": {"1": [{"select": "sel('A/*/*/[N,CA,C,O]')"}]}, "C_SEQ": {"true": [{"select": "sel('A')"}]}}, "nsteps": 40, "recycleSchedule": "low", "metrics_tags": ["design", "ppi_refolding"]}

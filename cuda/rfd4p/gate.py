@@ -1190,6 +1190,30 @@ def main() -> int:
                       f"({m.group(2) if m else '?'} refused), {m.group(3) if m else '?'} differing  "
                       f"{'ok ' if ok else 'DIFFERS'}")
 
+            # 🔴 AND THE REFOLDING ORACLE, AGAINST UPSTREAM'S OWN (src/oracle.h): each
+            # `featurise/gate-oracle-*.json` designed and refolded with our own AF3, then the AF3
+            # job held to what upstream's `from_mmcif` round trip builds - both featurised by
+            # AlphaFold 3 itself - and the confidences, refolding RMSDs and pass criteria to
+            # upstream's own managers run over the same refold. Needs our AF3 and af3-any-model.
+            af3 = HERE.parent / "af3" / "localfold-af3"
+            jax_python = Path.home() / ".venv-lfjax" / "bin" / "python"
+            if venv.exists() and af3.exists() and jax_python.exists():
+                cases = []
+                for job in sorted((HERE / "featurise").glob("gate-oracle-*.json")):
+                    stem = HERE / job.stem
+                    run([BINARY, f"--job={job}", f"--int8={REPO / 'model-rfd4p-int8'}", f"--work-dir={stem}-work",
+                         f"--out={stem}.cif", "--seed=0", "--fast", f"--dump-sample={stem}-dump",
+                         f"--metrics={stem}.metrics.json", "--refold"], cwd=REPO)
+                    cases.append(f"{job}:{stem}-dump:{stem}")
+                r = run([venv, REPO / "tools" / "check-rfd4p-oracle.py", *cases], cwd=REPO)
+                m = re.search(r"(\d+) designs, (\d+) differing", r.stdout)
+                ok = r.returncode == 0 and m is not None
+                if not ok:
+                    failed += 1
+                    print(r.stdout[-1500:], r.stderr[-600:])
+                print(f"  {'upstream o':10s} {m.group(1) if m else '?'} designs refolded against upstream's oracle, "
+                      f"{m.group(2) if m else '?'} differing  {'ok ' if ok else 'DIFFERS'}")
+
             # 🔴 AND THE SAMPLER, AGAINST UPSTREAM'S OWN `sample_schedule` AND `simulation_step`:
             # every mode a job's `sampling` may name (vf, sc, vf_tsr), the gt transforms and clamp,
             # the schedule shapes and re-centring. The sampler trajectory above holds the native

@@ -49,6 +49,7 @@
  */
 import { parseSmiles } from "../shared/chem/smiles.js";
 import { NUCLEIC_TYPES, entitiesProblem, parseContact } from "./entities.js";
+import { userCcdCodes } from "../shared/af3/featurise/ccd-component.js";
 
 /**
  * The request that produced this fold, in the server's own dialect.
@@ -492,7 +493,10 @@ function readEntry(entry, index, state) {
     // together, comma-separated, and the featuriser builds the chain
     // (shared/af3/featurise/ccd-component.js, ligandChain).
     const code = list.map((one) => String(one).trim().toUpperCase().replace(/^CCD_/, "")).join(",");
-    return { type: "ligand", value: code, copies, modifications: [], ids: idsOf(body) };
+    // The codes the job's userCCD defines, which need not look like the dictionary's.
+    const userCodes = code.split(",").filter((one) => state.userCodes.includes(one));
+    return { type: "ligand", value: code, copies, modifications: [], ids: idsOf(body),
+             ...(userCodes.length ? { userCodes } : {}) };
   }
 
   const sequence = body.sequence;
@@ -561,6 +565,41 @@ function checkVersion(job, dialect) {
  *   `notes` are things the file said that this page answered differently and
  *   the reader should know about - never things it ignored.
  */
+/**
+ * The templates an AlphaFold 3 job carries inline (a protein chain's `templates`), lifted OUT of
+ * the parsed job - which the page's reader then reads without them - as `[slot k] -> [{text,
+ * chain, label, mapping?}]`: chain i's k-th template in slot k, up to four a chain, `chain` the
+ * polymer chain copy it belongs to. The native exporters build them (cuda/af3/export-model.mjs,
+ * cuda/af2/export_input.mjs); cuda/featurise/job.h `jobFromJson(..., &lifted)` is the twin.
+ *
+ * @param {object | object[]} raw the parsed job (or list of jobs, the first read), changed in place
+ * @returns {object[][]}
+ */
+export function liftJobTemplates(raw) {
+  const jobs = Array.isArray(raw) ? raw : [raw];
+  const lifted = [];
+  let polymerCopy = 0;
+  for (const entry of jobs[0]?.sequences ?? []) {
+    const [kind, body] = Object.entries(entry)[0] ?? [];
+    if (!["protein", "rna", "dna"].includes(kind) || body === undefined) continue;
+    const copies = Array.isArray(body.id) ? body.id.length : 1;
+    for (let c = 0; c < copies; c += 1) {
+      for (const [k, t] of (Array.isArray(body.templates) ? body.templates : []).slice(0, 4).entries()) {
+        if (typeof t.mmcif !== "string") throw new Error(`template ${k} of chain ${polymerCopy}: give the mmCIF inline`);
+        const q = t.queryIndices, ti = t.templateIndices;
+        if ((q === undefined) !== (ti === undefined) || (q && (q.length !== ti.length))) {
+          throw new Error(`template ${k} of chain ${polymerCopy}: queryIndices and templateIndices are two lists of one length`);
+        }
+        (lifted[k] ??= []).push({ text: t.mmcif, chain: polymerCopy, label: `job template ${k}`,
+                                  ...(q === undefined ? {} : { mapping: q.map((v, i) => [v, ti[i]]) }) });
+      }
+      polymerCopy += 1;
+    }
+    delete body.templates;
+  }
+  return lifted;
+}
+
 export function jobFromJson(text) {
   let parsed;
   try {
@@ -571,7 +610,6 @@ export function jobFromJson(text) {
   // Both dialects appear as a bare object and as a list of jobs in the wild.
   const jobs = Array.isArray(parsed) ? parsed : [parsed];
   if (jobs.length === 0) refuse("that file holds no jobs");
-  const state = { singleSequence: false, sawEmpty: false };
   const notes = [];
   if (jobs.length > 1) {
     // 🔴 SAID, NOT SILENTLY DROPPED. Folding the first of several jobs is one
@@ -591,6 +629,8 @@ export function jobFromJson(text) {
   if (job.userCCD !== undefined && job.userCCD !== null && typeof job.userCCD !== "string") {
     refuse("userCCD is mmCIF text");
   }
+  const state = { singleSequence: false, sawEmpty: false,
+                  userCodes: typeof job.userCCD === "string" ? userCcdCodes(job.userCCD) : [] };
   // 🔴 ABSENT MEANS THE SERVER'S, WHICH IS UPSTREAM'S RULE AND NOT AN OBVIOUS
   // ONE: a job with neither `dialect` nor `version` is read by folding_input.py
   // as `alphafoldserver` at version 1. Defaulting the other way put such a file

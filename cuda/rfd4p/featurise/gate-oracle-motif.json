@@ -1,0 +1,1 @@
+{"input": "../../../web/examples/motif_idx_1prw.cif.zst", "input_as_annotated_cif": true, "nsteps": 40, "recycleSchedule": "low", "metrics_tags": ["design", "3d_coordinate_conditioning", "motif_scaffold_refolding"]}

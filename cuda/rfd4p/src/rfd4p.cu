@@ -22,6 +22,7 @@
 #include "partial.cuh"
 #include "generate.cuh"
 #include "metrics.h"
+#include "oracle.h"
 #include "bundle.cuh"
 #include <fstream>
 #include <sys/stat.h>
@@ -37,6 +38,9 @@ namespace {
 struct Opts {
   std::string dir, weights, oracle, gen, genOracle, enc, encOracle, int8, job, dumpSample, metrics,
       out = "design.pdb";
+  // `--refold[=<localfold-af3>]`: refold each design that passes the pre-oracle filters with our
+  // own AlphaFold 3, as upstream's oracle does with DeepMind's (src/oracle.h).
+  std::string refold;
   int seed = 0;      // a later design draws its own noise from seed + design
   int recycles = 0;  // 0 = whatever the input directory says
   int repeat = 0;    // time the forward this many times after a warm-up
@@ -46,6 +50,15 @@ struct Opts {
 };
 
 int generate(const Opts& o, const rfd4p::Dims& d, rfd4p::Trunk& t);
+
+/** cuda/af3/localfold-af3 beside this binary's cuda/rfd4p. */
+std::string defaultAf3() {
+  char self[4096];
+  const ssize_t n = readlink("/proc/self/exe", self, sizeof self - 1);
+  std::string dir = n > 0 ? std::string(self, (size_t)n) : std::string("./localfold-rfd4p");
+  dir = dir.substr(0, dir.rfind('/'));
+  return dir + "/../af3/localfold-af3";
+}
 
 int run(const Opts& o) {
   if (!o.weights.empty()) M.load(o.weights);
@@ -687,6 +700,34 @@ int generate(const Opts& o, const rfd4p::Dims& d, rfd4p::Trunk& t) {
       }
       std::ofstream(mpath) << rfd4p::metrics::toJson(r) << "\n";
       printf("  metrics -> %s (%s the pre-oracle filters)\n", mpath.c_str(), r.pass ? "passes" : "fails");
+      // The oracle runs on what survives the pre-oracle filters, as upstream's does.
+      if (!o.refold.empty() && r.pass) {
+        const std::vector<std::string> tags = rfd4p::metricsTagsFromBits((int)M.meta("meta/metricsTags", 0));
+        // Named after the design it scores: `<design>.refold.json`, the folds under `<design>_refold/`.
+        const size_t dot = path.rfind('.');
+        const std::string base = dot == std::string::npos || dot < path.rfind('/') + 1 ? path : path.substr(0, dot);
+        const size_t slash = base.rfind('/');
+        rfd4p::oracle::Run run;
+        run.binary = o.refold;
+        run.dir = base + "_refold";
+        run.name = slash == std::string::npos ? base : base.substr(slash + 1);
+        run.seed = (uint32_t)(o.seed + design);
+        run.components = rfd4p::oracle::readComponents(o.gen + "/input-components.cif");
+        try {
+          const rfd4p::metrics::Array full = rfd4p::metrics::designArray(records, in);
+          std::vector<double> cwi;
+          if (!rfd4p::metrics::coordsWithInsertion(full, in, proposed, cwi)) cwi.clear();
+          std::string coi;
+          const rfd4p::metrics::Values v = rfd4p::oracle::refoldDesign(full, cwi, run, tags, r.metrics, coi);
+          if (!v.empty()) {
+            std::ofstream(base + ".refold.json") << rfd4p::oracle::toJson(v, coi) << "\n";
+            printf("  refolded -> %s.refold.json\n", base.c_str());
+          }
+        } catch (const std::exception& e) {
+          fprintf(stderr, "--refold: %s\n", e.what());
+          return 1;
+        }
+      }
     }
     // 🔴 COUNTED OVER WHAT IS WRITTEN, NOT OVER EVERY TOKEN. The unindexed tokens are grafted
     // rather than emitted, and counting them made this line disagree with its own file twice:
@@ -865,6 +906,8 @@ int foldMain(int argc, char** argv) {
     else if (f == "--no-insertion") o.insertion = false;
     else if (!f.compare(0, 14, "--dump-sample=")) o.dumpSample = f.substr(14);
     else if (!f.compare(0, 10, "--metrics=")) o.metrics = f.substr(10);
+    else if (f == "--refold") o.refold = defaultAf3();
+    else if (!f.compare(0, 9, "--refold=")) o.refold = f.substr(9);
     else { fprintf(stderr, "unknown flag %s\n", argv[i]); return 1; }
   }
   if (o.weights.empty() && o.int8.empty()) {

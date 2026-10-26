@@ -619,6 +619,49 @@ residue's own bond the dictionary's type wins, where both ports let the link's w
 refusals word for word. With link chemistry switched off on the page, 21 of its 25 raw loads go red -
 the plain proteins too, because their `OXT` now leaves with the peptide bond rather than by a rule.
 
+## Each design refolded by our own AlphaFold 3, scored as upstream scores it
+
+Upstream's evaluation refolds every design that passes the pre-oracle filters - from its sequence
+alone - and scores the refold: the oracle's confidences (`oracle.overall_plddt`, `oracle_ppi.min_ipae_coi`,
+...), the design-against-refold RMSDs (`refolded_backbone_rmsd`, `refolded_motif_allatom_rmsd`,
+...) and the pass criteria (`ppi.pass`, `motif_scaffold.pass`, ...), each under the job's
+`metrics_tags` (`unconditional_refolding`, `ppi_refolding`, `dna_refolding`, `sm_binder_refolding`,
+`motif_scaffold_refolding`, ...). Upstream runs DeepMind's AlphaFold 3 in a container for that;
+`localfold-rfd4p --refold` runs ours (`cuda/af3/localfold-af3`, or `--refold=<binary>`), writing
+`<design>.refold.json` and, under `<design>_refold/`, the AF3 job, AF3's files and the refolded
+structure (`src/oracle.h`).
+
+🔴 **IT WRITES THE JOB UPSTREAM'S ROUND TRIP PRODUCES, AND IS HELD TO IT THROUGH AlphaFold 3's
+OWN FEATURISER.** Upstream builds a refold's input by writing the design as mmCIF and reading that
+back with AF3's `Input.from_mmcif`; this writes the resulting job directly - chains in AF3's own
+order (by id: a binder designed as chain B beside a target A is A then B to the model), the
+template a residue range of the design's own coordinates, every non-standard component in
+`userCCD`. `tools/check-rfd4p-oracle.py` featurises both with AlphaFold 3 (af3-any-model,
+`~/.venv-lfjax`) and compares every field of the two batches, which is what the model reads; then
+it runs upstream's own oracle, refolding and pass-criteria managers - instantiated from their YAML -
+over the same refold (`_dispatch_fold` handed our AF3's files, upstream's worker's
+`_augment_summary_confidences` applied to them) and requires every value of ours. Eight designs
+(`featurise/gate-oracle-*.json`: unconditional, motif, internal coordinate groups, PPI, a binder
+designed as chain B, DNA, a small-molecule binder, two oracles on one design): every batch
+field and every score exact, an RMSD to 1e-4 A and a template's coordinates to one step of their
+third decimal. Two things it found on the way:
+
+- 🔴 **A LIGAND'S DEFINITION IS THE INPUT'S, NOT THE DESIGN'S.** atomworks registers the components
+  an annotated input defines (its `_chem_comp_atom`, hydrogens and all) and writes THAT into the
+  user CCD - with the input's coordinates as the ideal ones - so the conformer AF3 builds is the
+  input ligand's. Written from the design instead, `ref_pos` moved by 4 A. The featuriser now
+  writes those definitions to `input-components.cif` beside the generation tables.
+- 🔴 **THE ORACLE SEES THE DESIGN IN ITS INPUT'S FRAME**, because upstream aligns the generated
+  array in place when it saves it and hands the same array on; the template is cut from that.
+
+The scores read our AF3's output where upstream reads DeepMind's, so they are numbers about our
+port's refold, which cuda/af3's gates hold to AlphaFold 3; and our AF3 names its output's chains
+by position where AlphaFold 3 keeps the job's ids, which the oracle reads back through the job's
+own order. Refused, by name, rather than approximated: a pre-oracle transform (`apo_refolding`), a
+covalently attached modifier (upstream renames it for AF3), a non-standard polymer residue, two
+instances of one chain id, a ligand chain id that sorts before a polymer's (our AF3 puts polymers
+first), and the disco and developability metrics. The AF2 oracle is not ported yet.
+
 ## Every preset generates
 
 All ten of RFD4-Proteina's shipped presets now run end to end: unconditional, fold-conditioned,
