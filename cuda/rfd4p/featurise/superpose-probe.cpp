@@ -12,7 +12,8 @@ int main(int argc, char** argv) {
   if (argc < 4) { fprintf(stderr, "usage: superpose-probe seed n noise\n"); return 2; }
   const int seed = atoi(argv[1]), n = atoi(argv[2]);
   const double noise = atof(argv[3]);
-  // A reflected set, which is the only way det(H) goes negative.
+  // A reflected set, which is the only way det(H) goes negative - where a Kabsch that can
+  // return an improper rotation does.
   const double flip = (argc > 4 && argv[4][0] == '1') ? -1.0 : 1.0;
   uint32_t s = (uint32_t)seed;
   auto next = [&]() { s = s * 1664525u + 1013904223u; return (double)(s >> 8) / 16777216.0; };

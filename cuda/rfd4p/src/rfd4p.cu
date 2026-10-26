@@ -657,7 +657,13 @@ int generate(const Opts& o, const rfd4p::Dims& d, rfd4p::Trunk& t) {
       in.compType = ints("g/mCompType", (size_t)n * 8);
       in.seq = ints("g/mSeq", (size_t)n * 2);
       in.hot = ints("g/mHot", (size_t)n * 37);
-      if (M.has("g/mBonds") && M.len("g/mBonds") > 0) in.bonds = ints("g/mBonds", M.len("g/mBonds"));
+      in.pnUnit = ints("g/mPnUnit", (size_t)n * 4);
+      in.tokMol = ints("g/mTokMol", (size_t)n * 2);
+      in.inAtom = ints("g/mInAtom", M.len("g/mInAtom"));
+      if (M.len("g/mInBonds") > 0) in.inBonds = ints("g/mInBonds", M.len("g/mInBonds"));
+      in.condCoord = M.has("g/condCoord") ? M.f("g/condCoord") : nullptr;
+      in.condIntCrd = M.has("g/condIntCrd") ? M.f("g/condIntCrd") : nullptr;
+      in.coordGroup = M.has("g/coordGroup") ? M.i("g/coordGroup") : nullptr;
       in.resName = naming.in.resName;
       {
         const std::vector<int> bitsOf = ints("g/mSeqProb", (size_t)n * 28);
@@ -665,8 +671,14 @@ int generate(const Opts& o, const rfd4p::Dims& d, rfd4p::Trunk& t) {
         memcpy(in.seqProb.data(), bitsOf.data(), bitsOf.size() * 4);
       }
       in.condIndex = M.has("g/condIndex") ? M.i("g/condIndex") : nullptr;
-      const rfd4p::metrics::Result r = rfd4p::metrics::designMetrics(
-          records, in, proposed, rfd4p::metricsTagsFromBits((int)M.meta("meta/metricsTags", 0)));
+      rfd4p::metrics::Result r;
+      try {
+        r = rfd4p::metrics::designMetrics(records, in, proposed,
+                                          rfd4p::metricsTagsFromBits((int)M.meta("meta/metricsTags", 0)));
+      } catch (const std::exception& e) {
+        fprintf(stderr, "--metrics: %s\n", e.what());
+        return 1;
+      }
       std::string mpath = o.metrics;
       if (design > 0) {
         const size_t dot = mpath.rfind('.');

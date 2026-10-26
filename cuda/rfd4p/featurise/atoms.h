@@ -933,6 +933,44 @@ inline void materializeInternalCoords(AtomArray& a, PipelineRng& prng,
   }
   const vector<int>& groups = a.ann.ints["condition_CoordinateGroup_1_atom"];
   vector<double>& payload = a.ann.floats["condition_InternalCoordinate_1_atom"];
+  // 🔴 Upstream's five refusals, before anything is filled (transforms.js has the note).
+  auto stop = [](const std::string& why) {
+    fprintf(stderr, "%s\n", why.c_str());
+    exit(1);
+  };
+  auto finite3 = [](const double* v) { return std::isfinite(v[0]) && std::isfinite(v[1]) && std::isfinite(v[2]); };
+  auto unset3 = [](const double* v) { return std::isnan(v[0]) && std::isnan(v[1]) && std::isnan(v[2]); };
+  for (size_t i = 0; i < n; ++i) {
+    if (groups[i] < -1) {
+      stop("Coordinate groups must be -1 (unknown), 0 (absolute), or positive (internal).");
+    }
+  }
+  for (size_t i = 0; i < n; ++i) {
+    if (groups[i] > 32767) {
+      stop("Coordinate group IDs must not exceed 32767 (the int16 model limit).");
+    }
+  }
+  auto crdIt = a.ann.floats.find("condition_coordinate_1_atom");
+  const vector<double>* absolute =
+      crdIt != a.ann.floats.end() && crdIt->second.size() == n * 3 ? &crdIt->second : nullptr;
+  const double nan3[3] = {NAN, NAN, NAN};
+  auto absAt = [&](size_t i) { return absolute ? &(*absolute)[i * 3] : nan3; };
+  for (size_t i = 0; i < n; ++i) {
+    if (!finite3(absAt(i)) && !unset3(absAt(i))) {
+      stop(
+          "Absolute coordinate targets must be entirely finite or entirely unset (NaN) per atom.");
+    }
+  }
+  for (size_t i = 0; i < n; ++i) {
+    if (finite3(absAt(i)) != (groups[i] == 0)) {
+      stop("Absolute coordinate targets must exist exactly on coordinate group 0.");
+    }
+  }
+  for (size_t i = 0; i < n; ++i) {
+    if (!(groups[i] > 0) && !unset3(&payload[i * 3])) {
+      stop("Internal coordinate targets exist outside internal coordinate groups.");
+    }
+  }
 
   std::set<int> positive;
   for (size_t i = 0; i < n; ++i) if (groups[i] > 0) positive.insert(groups[i]);
@@ -940,16 +978,25 @@ inline void materializeInternalCoords(AtomArray& a, PipelineRng& prng,
 
   for (const int gid : positive) {
     vector<int> members;
-    bool allFinite = true;
+    bool allFinite = true, allUnset = true, liveFinite = true;
     for (size_t i = 0; i < n; ++i) {
       if (groups[i] != gid) continue;
       members.push_back((int)i);
-      if (!std::isfinite(payload[i * 3]) || !std::isfinite(payload[i * 3 + 1]) ||
-          !std::isfinite(payload[i * 3 + 2])) {
-        allFinite = false;
+      if (!finite3(&payload[i * 3])) allFinite = false;
+      if (!unset3(&payload[i * 3])) allUnset = false;
+      if (!std::isfinite(a.site.x[i]) || !std::isfinite(a.site.y[i]) || !std::isfinite(a.site.z[i])) {
+        liveFinite = false;
       }
     }
     if (allFinite || members.empty()) continue;
+    if (!allUnset) {
+      stop("Coordinate group " + std::to_string(gid) +
+                               " has incomplete or nonfinite saved internal coordinate targets.");
+    }
+    if (!liveFinite) {
+      stop("Coordinate group " + std::to_string(gid) +
+                               " needs finite live coordinates to materialize its targets.");
+    }
 
     double mx = 0, my = 0, mz = 0;
     for (const int i : members) { mx += a.site.x[i]; my += a.site.y[i]; mz += a.site.z[i]; }

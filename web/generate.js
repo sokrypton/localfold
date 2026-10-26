@@ -31,7 +31,7 @@ import { ccdBlocksForRawStructure } from "../shared/rfd4p/pipeline/ccd.js";
 import { fetchRfd4pConfig, fetchShardedWeights } from "../shared/rfd4p/safetensors.js";
 import { generateRfd4p } from "../webgpu/rfd4p/generate.js";
 import { processSampleToAtoms, toPdbString } from "../shared/rfd4p/output.js";
-import { designMetrics, jobMetricsTags } from "../shared/rfd4p/metrics.js";
+import { conditioningMetricsTags, designMetrics, jobMetricsTags } from "../shared/rfd4p/metrics.js";
 import { decompress } from "../shared/rfd4p/vendor/fzstd.js";
 
 /** How many flow-matching steps a generation takes when the caller does not say. */
@@ -105,8 +105,10 @@ async function templateCif(url, signal) {
  * @param {(step: object) => void} [options.onStep] called per flow step, for a
  *   trajectory the page can show
  * @param {AbortSignal} [options.signal]
- * @param {string[]} [options.metricsTags=["design"]] upstream's `metrics_tags`: which of its
- *   design metrics and pre-oracle filters apply (shared/rfd4p/metrics.js)
+ * @param {string[]} [options.metricsTags] upstream's `metrics_tags`: which of its design metrics
+ *   and pre-oracle filters apply (shared/rfd4p/metrics.js). Default: `design` and the tags
+ *   upstream's validation sets give this job's conditioning (`conditioningMetricsTags`), so a
+ *   motif's RMSD is reported where there is a motif
  * @returns {Promise<{pdb: string, cif: string, tokens: number, steps: number, seed: number,
  *   job: object, inputCif: (string|Uint8Array|undefined), metrics: object, preOracle: object}>}
  *   `job` is the job that ran as a job file (`input` naming the structure, `inputCif`, beside it)
@@ -115,7 +117,7 @@ export async function generate(options) {
   const {
     contig, conditions, cifUrl, inputCif: givenCif, fromAnnotations = false,
     steps = DEFAULT_STEPS, recycleSchedule, seed = 0,
-    partialTrajectoryFractionSteps, inverseFolding, metricsTags = ["design"],
+    partialTrajectoryFractionSteps, inverseFolding, metricsTags: givenTags,
     status = () => {}, progress = () => {}, onStep, frames = 0, signal,
   } = options;
 
@@ -294,6 +296,7 @@ export async function generate(options) {
   // design downloaded from this page can be made again without it. A preset driven by its
   // structure is that structure as the job (upstream's `{input, input_as_annotated_cif: true}`);
   // anything else is its contig and conditions over the structure it named.
+  const metricsTags = givenTags ?? ["design", ...conditioningMetricsTags(batch.__atoms)];
   const job = {
     ...(inputCif === undefined ? {} : { input: "input" }),
     ...(fromAnnotations && inputCif !== undefined
@@ -311,7 +314,8 @@ export async function generate(options) {
   };
   // 🔴 THE DESIGN'S METRICS, AS UPSTREAM'S EVALUATION COMPUTES THEM, under the tags the job
   // records - so `localfold-rfd4p --job=job.json --metrics=` reports the same numbers. Upstream's
-  // generator computes none unless asked; the page asks for `design`, its own inline set.
+  // generator computes none unless asked; the page asks for `design`, its own inline set, and the
+  // conditioning tags its validation sets would give this job.
   const { metrics, preOracle } = designMetrics(result.structure, batch.__atoms,
     { metricsTags: jobMetricsTags(job) });
   return {

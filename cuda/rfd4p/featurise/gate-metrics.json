@@ -9,4 +9,5 @@
              "SHEET": [{"select": "sel('*/s1/*/*')"}]},
    "C_SEQ_PROB_ALA": {"0": [{"select": "sel('*/x1/*/*')"}]},
    "C_SEQ_PROB_LEU": {"1": [{"select": "sel('*/y1/*/*')"}]}},
- "metrics_tags": ["design", "hotspot_conditioning"]}
+ "metrics_tags": ["design", "hotspot_conditioning", "3d_coordinate_conditioning",
+                  "internal_coordinate_conditioning"]}

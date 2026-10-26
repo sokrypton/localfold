@@ -15,12 +15,15 @@ side is cuda/rfd4p/design-metrics.mjs over the same dump. It requires:
   whenever a generated residue added atoms);
 - the batch is upstream's own pipeline's, handed the expandable-segment lengths this port
   realized (its draw is its own RNG's, as `dump_batch_cpu.py --seg-lengths` replays them);
-- every metric value (integers exactly, fractions to 1e-9) and the pre-oracle verdict, filter by
-  filter, with every tag that reaches one of the ported metrics switched on.
+- every metric value (integers exactly, fractions to 1e-9, RMSDs to 1e-4 A since upstream's
+  superposition is float32) and the pre-oracle verdict, filter by filter, under each job's own
+  `metrics_tags` (the page's `jobMetricsTags`).
 
 With no arguments it reads the dumps gate.py's writer and metrics arms leave
-(`cuda/rfd4p/gate-writer-*`, and `gate-metrics-5o45` from `featurise/gate-metrics.json`, the job
-built to reach hotspots, C_SEC and sequence probabilities, which no shipped preset does).
+(`cuda/rfd4p/gate-writer-*`; `gate-metrics-5o45` from `featurise/gate-metrics.json`, the job
+built to reach hotspots, C_SEC and sequence probabilities, which no shipped preset does; and
+`gate-groups-5o45` and `gate-partial-1brs`, which reach the motif RMSD over three coordinate
+groups and `ca_rmsd_to_input` on a design that keeps the input's CAs).
 """
 from __future__ import annotations
 
@@ -33,10 +36,10 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 UPSTREAM = Path.home() / "RFD4-Proteina"
-TAGS = ["design", "unindexed", "partial_diffusion", "hotspot_conditioning", "ligand_clash_filter"]
 METRICS = ["amino_acid_composition", "bond_length_metrics", "clash_metrics", "hotspot_obedience",
            "sequence_adherence", "sequence_probability_adherence", "sse_distribution", "sse_accuracy",
-           "unindexed_insertion_mapping", "sequence_similarity_to_input"]
+           "unindexed_insertion_mapping", "sequence_similarity_to_input", "design_motif_allatom_rmsd",
+           "design_unindexed_motif_allatom_rmsd", "ca_rmsd_to_input"]
 
 
 class FixedLengths:
@@ -52,7 +55,7 @@ class FixedLengths:
         return n
 
 
-def upstream(job: dict, spec_dir: Path, dump: Path, tmp: Path, segment_lengths: list[int]) -> dict:
+def upstream(job: dict, spec_dir: Path, dump: Path, tmp: Path, segment_lengths: list[int], tags: list[str]) -> dict:
     import lightning as L
     import numpy as np
     import torch
@@ -92,7 +95,7 @@ def upstream(job: dict, spec_dir: Path, dump: Path, tmp: Path, segment_lengths: 
     cfg = yaml.safe_load((UPSTREAM / "configs/metrics/inline_metrics/design_metrics.yaml").read_text())
     mm = MetricManager.instantiate_from_hydra({k: cfg[k] for k in METRICS})
     out = mm(network_input=None, network_output=None,
-             extra_info={"example_id": "x", "metrics_tags": TAGS,
+             extra_info={"example_id": "x", "metrics_tags": tags,
                          "full_array_with_unindexed": res.get("full_array_with_unindexed"),
                          "predicted_insertion_mapping": mapping},
              ground_truth_atom_array=res["input_atom_array"], predicted_atom_array=g)
@@ -100,8 +103,9 @@ def upstream(job: dict, spec_dir: Path, dump: Path, tmp: Path, segment_lengths: 
     fcfg = yaml.safe_load((UPSTREAM / "configs/metrics/pre_oracle_filters/all_pre_oracle_filters.yaml").read_text())
     verdict = MetricManager.instantiate_from_hydra(fcfg)(
         network_input=None, network_output=None,
-        extra_info={"example_id": "x", "metrics_tags": TAGS, "metrics": metrics})
-    bonds = sorted(tuple(sorted((int(i), int(j)))) for i, j, _ in g.bonds.as_array()) if g.bonds is not None else []
+        extra_info={"example_id": "x", "metrics_tags": tags, "metrics": metrics})
+    bonds = (sorted((*sorted((int(i), int(j))), int(t)) for i, j, t in g.bonds.as_array())
+             if g.bonds is not None else [])
     return {
         "metrics": {k: float(v) for k, v in metrics.items()},
         "filters": {k[:-5]: v for k, v in verdict.items() if k.endswith(".pass")},
@@ -112,8 +116,8 @@ def upstream(job: dict, spec_dir: Path, dump: Path, tmp: Path, segment_lengths: 
 
 
 def page(spec: Path, dump: Path) -> dict:
-    r = subprocess.run(["node", REPO / "cuda/rfd4p/design-metrics.mjs", f"--spec={spec}",
-                        f"--tags={','.join(TAGS)}", "--with-array", dump], cwd=REPO, capture_output=True, text=True)
+    r = subprocess.run(["node", REPO / "cuda/rfd4p/design-metrics.mjs", f"--spec={spec}", "--with-array", dump],
+                       cwd=REPO, capture_output=True, text=True)
     if r.returncode != 0:
         raise RuntimeError(r.stderr[-1500:])
     out = json.loads(r.stdout)
@@ -123,8 +127,11 @@ def page(spec: Path, dump: Path) -> dict:
     return out
 
 
-def same(a: float, b: float) -> bool:
-    return (math.isnan(a) and math.isnan(b)) or abs(a - b) <= 1e-9
+def same(key: str, a: float, b: float) -> bool:
+    # An RMSD is a superposition, which upstream solves in float32 (biotite's SVD) and this
+    # port in float64; every other value is counted or summed the same way on both sides.
+    tolerance = 1e-4 if key.endswith(".rmsd") else 1e-9
+    return (math.isnan(a) and math.isnan(b)) or abs(a - b) <= tolerance
 
 
 def main() -> int:
@@ -134,9 +141,11 @@ def main() -> int:
             job = REPO / "cuda/rfd4p/featurise" / f"{dump.name}.json"
             if dump.is_dir() and (dump / "coors.f32").exists() and job.exists():
                 pairs.append((str(job), str(dump)))
-        crafted = REPO / "cuda/rfd4p/gate-metrics-5o45"
-        if (crafted / "coors.f32").exists():
-            pairs.append((str(REPO / "cuda/rfd4p/featurise/gate-metrics.json"), str(crafted)))
+        for jname, dname in (("gate-metrics.json", "gate-metrics-5o45"), ("gate-groups-5o45.json", "gate-groups-5o45"),
+                             ("gate-partial-1brs.json", "gate-partial-1brs")):
+            crafted = REPO / "cuda/rfd4p" / dname
+            if (crafted / "coors.f32").exists():
+                pairs.append((str(REPO / "cuda/rfd4p/featurise" / jname), str(crafted)))
     bad = 0
     for spec, dump in pairs:
         spec, dump = Path(spec), Path(dump)
@@ -147,20 +156,21 @@ def main() -> int:
             continue
         got = page(spec, dump)
         with tempfile.TemporaryDirectory() as tmp:
-            up = upstream(json.loads(spec.read_text()), spec.resolve().parent, dump, Path(tmp), got["segmentLengths"])
+            up = upstream(json.loads(spec.read_text()), spec.resolve().parent, dump, Path(tmp), got["segmentLengths"],
+                          got["metricsTags"])
         problems = []
         if up["atoms"] != got["atoms"]:
             problems.append(f"atoms {len(up['atoms'])} against {len(got['atoms'])}")
         elif up["bonds"] != [tuple(b) for b in got["bonds"]]:
             only_up = sorted(set(up["bonds"]) - set(got["bonds"]))
             only_got = sorted(set(got["bonds"]) - set(up["bonds"]))
-            show = lambda b: [f"{up['atoms'][i][2]}{up['atoms'][i][1]}:{up['atoms'][i][3]}" for i in b]
+            show = lambda b: [f"{up['atoms'][i][2]}{up['atoms'][i][1]}:{up['atoms'][i][3]}" for i in b[:2]] + [b[2]]
             problems.append(f"bonds: {len(only_up)} only upstream {[show(b) for b in only_up[:3]]}, "
                             f"{len(only_got)} only here {[show(b) for b in only_got[:3]]}")
         for k in sorted(set(up["metrics"]) | set(got["metrics"])):
             if k not in up["metrics"] or k not in got["metrics"]:
                 problems.append(f"{k}: {'missing here' if k in up['metrics'] else 'not upstream'}")
-            elif not same(up["metrics"][k], got["metrics"][k]):
+            elif not same(k, up["metrics"][k], got["metrics"][k]):
                 problems.append(f"{k}: upstream {up['metrics'][k]!r}, here {got['metrics'][k]!r}")
         if up["filters"] != got["filters"]:
             problems.append(f"filters: upstream {up['filters']}, here {got['filters']}")

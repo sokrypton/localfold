@@ -69,7 +69,7 @@ export function getTokenStarts(atoms, addExclusiveStop = false) {
   return starts;
 }
 
-function getPolymerizationAtomNamesForToken(resName, tokenType, chainType) {
+export function getPolymerizationAtomNamesForToken(resName, tokenType, chainType) {
   let [leaving, entering] = getPolymerizationAtoms(resName, chainType);
   if (!leaving && !entering) {
     if (tokenType === TOKEN_TYPE.PROTEIN || tokenType === TOKEN_TYPE.NCAA) {

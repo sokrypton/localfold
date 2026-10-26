@@ -1234,7 +1234,7 @@ inline std::map<string, vector<int>> outputTables(const rfd4p::atoms::AtomArray&
   // hotspot flag; the input's bonds as (token * 37 + slot) pairs where both ends have a slot.
   vector<int>& hot = t["g/mHot"];
   hot.assign((size_t)nTok * 37, 0);
-  vector<int> slotOf(a.n(), -1);
+  vector<int> slotOf(a.n(), -1), tokenOf(a.n(), -1);
   auto intsOf = [&](const char* k) {
     const auto it = a.ann.ints.find(k);
     return it == a.ann.ints.end() ? nullptr : &it->second;
@@ -1248,6 +1248,11 @@ inline std::map<string, vector<int>> outputTables(const rfd4p::atoms::AtomArray&
     t["g/mTok"].push_back(a.isProtein.empty() ? 0 : a.isProtein[a0]);
     t["g/mTok"].push_back(secCol ? (*secCol)[a0] : 0);
     packString(a.ids.chainIid.empty() ? a.site.chainId[a0] : a.ids.chainIid[a0], 4, t["g/mChainIid"]);
+    packString(!a.ids.pnUnitIid.empty() ? a.ids.pnUnitIid[a0]
+               : a.ids.chainIid.empty() ? a.site.chainId[a0] : a.ids.chainIid[a0], 4, t["g/mPnUnit"]);
+    // The BATCH's molecule and entity ids (export_input.mjs has the note).
+    t["g/mTokMol"].push_back(b.moleculeIid[tk]);
+    t["g/mTokMol"].push_back(b.moleculeEntityId[tk]);
     string compType = a.site.chemCompType[a0];
     for (char& c : compType) c = (char)toupper((unsigned char)c);
     packString(compType, 8, t["g/mCompType"]);
@@ -1268,6 +1273,7 @@ inline std::map<string, vector<int>> outputTables(const rfd4p::atoms::AtomArray&
     const bool atomised = !a.atomize.empty() && a.atomize[a0];
     const int rt = tk < (int)b.residueType.size() ? b.residueType[tk] : -1;
     for (int ai = starts[tk]; ai < starts[tk + 1]; ++ai) {
+      tokenOf[ai] = tk;
       int slot = -1;
       if (atomised) {
         if (ai == a0) slot = 1;
@@ -1297,12 +1303,50 @@ inline std::map<string, vector<int>> outputTables(const rfd4p::atoms::AtomArray&
       occ[at * 2 + 1] = one[1];
     }
   }
-  vector<int>& bonds = t["g/mBonds"];
-  for (const auto& bd : a.bonds) {
-    if (slotOf[bd.u] >= 0 && slotOf[bd.v] >= 0) {
-      bonds.push_back(slotOf[bd.u]);
-      bonds.push_back(slotOf[bd.v]);
+  // Every input atom, `IN_ATOM_WORDS` each, and the bonds as triples (export_input.mjs has the
+  // layout).
+  const vector<int>* indexed = intsOf("condition_index_1_residue");
+  const vector<int>* groupCol = intsOf("condition_CoordinateGroup_1_atom");
+  const auto crdIt = a.ann.floats.find("condition_coordinate_1_atom");
+  const vector<double>* crdCol =
+      crdIt != a.ann.floats.end() && crdIt->second.size() == a.n() * 3 ? &crdIt->second : nullptr;
+  vector<int>& row = t["g/mInAtom"];
+  for (size_t ai = 0; ai < a.n(); ++ai) {
+    const bool crd = crdCol && std::isfinite((*crdCol)[ai * 3]) && std::isfinite((*crdCol)[ai * 3 + 1]) &&
+                     std::isfinite((*crdCol)[ai * 3 + 2]);
+    const bool internal = groupCol && (*groupCol)[ai] != -1 && (*groupCol)[ai] != 0;
+    const int flags = ((!indexed || (*indexed)[ai]) ? 1 : 0) | (!a.atomize.empty() && a.atomize[ai] ? 2 : 0) |
+                      (!a.isProtein.empty() && a.isProtein[ai] ? 4 : 0) | (a.site.isPolymer[ai] ? 8 : 0) |
+                      (crd || internal ? 16 : 0);
+    row.push_back(slotOf[ai]);
+    row.push_back(flags);
+    row.push_back(a.site.chainType.empty() ? -1 : a.site.chainType[ai]);
+    row.push_back(a.site.charge[ai]);
+    row.push_back(a.site.resId[ai]);
+    for (const double c : {a.site.x[ai], a.site.y[ai], a.site.z[ai]}) {
+      const float v = (float)c;
+      int32_t w;
+      memcpy(&w, &v, 4);
+      row.push_back(w);
     }
+    string element = a.site.element[ai];
+    for (char& c : element) c = (char)toupper((unsigned char)c);
+    const string& chainIid = a.ids.chainIid.empty() ? a.site.chainId[ai] : a.ids.chainIid[ai];
+    packString(a.site.atomName[ai], 1, row);
+    packString(a.site.resName[ai], 2, row);
+    packString(element, 1, row);
+    packString(a.site.chainId[ai], 1, row);
+    packString(a.site.insCode[ai], 1, row);
+    packString(chainIid, 4, row);
+    packString(a.ids.pnUnitIid.empty() ? chainIid : a.ids.pnUnitIid[ai], 4, row);
+    row.push_back(b.moleculeIid[tokenOf[ai]]);
+    row.push_back(b.moleculeEntityId[tokenOf[ai]]);
+  }
+  vector<int>& bonds = t["g/mInBonds"];
+  for (const auto& bd : a.bonds) {
+    bonds.push_back(bd.u);
+    bonds.push_back(bd.v);
+    bonds.push_back(bd.type);
   }
   return t;
 }

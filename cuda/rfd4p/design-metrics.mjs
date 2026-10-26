@@ -24,7 +24,7 @@ if (!dump || !specPath) {
 const { job, built, structure } = sampleFromDump(specPath, dump, Number(option("seed", "0")));
 const tags = option("tags", null);
 const metricsTags = tags !== null ? tags.split(",").filter(Boolean) : jobMetricsTags(job);
-const out = designMetrics(structure, built.atoms, { metricsTags });
+const out = { ...designMetrics(structure, built.atoms, { metricsTags }), metricsTags };
 if (args.includes("--with-array")) {
   const arr = designArray(structure, built.atoms);
   out.atoms = Array.from({ length: arr.n }, (_, i) => [arr.chainId[i], arr.resId[i], arr.resName[i], arr.atomName[i]]);

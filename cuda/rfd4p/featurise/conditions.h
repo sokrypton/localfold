@@ -55,6 +55,54 @@ inline vector<int> defaultCoordinateGroups(const atoms::AtomArray& a) {
   return groups;
 }
 
+/** `CoordinateGroup.set_annotation`'s checks, as spec.js's `assertCoordinateGroups` has them. */
+inline void assertCoordinateGroups(atoms::AtomArray& a, const vector<int>& groups,
+                                   const vector<int>& old, bool clear = false) {
+  const size_t n = a.n();
+  auto refuse = [](const char* why) {
+    fprintf(stderr, "%s\n", why);
+    exit(1);
+  };
+  auto it = a.ann.floats.find("condition_coordinate_1_atom");
+  const vector<double>* absolute = it != a.ann.floats.end() && it->second.size() == n * 3 ? &it->second : nullptr;
+  auto finite3 = [](const double* v) { return std::isfinite(v[0]) && std::isfinite(v[1]) && std::isfinite(v[2]); };
+  auto unset3 = [](const double* v) { return std::isnan(v[0]) && std::isnan(v[1]) && std::isnan(v[2]); };
+  for (size_t i = 0; i < n; ++i) {
+    if (absolute && !finite3(&(*absolute)[i * 3]) && !unset3(&(*absolute)[i * 3])) {
+      refuse("Absolute coordinate targets must be entirely finite or entirely unset (NaN) per atom.");
+    }
+  }
+  for (size_t i = 0; i < n; ++i) {
+    if ((absolute && finite3(&(*absolute)[i * 3])) != (groups[i] == 0)) {
+      refuse("Coordinate group 0 must match absolute coordinate conditioning; modify C_CRD first.");
+    }
+  }
+  auto pit = a.ann.floats.find("condition_InternalCoordinate_1_atom");
+  if (pit == a.ann.floats.end() || pit->second.size() != n * 3) return;
+  vector<uint8_t> preserved(n, 0);
+  std::set<int> ids;
+  for (const int g : groups) if (g > 0) ids.insert(g);
+  for (const int gid : ids) {
+    std::set<int> previous;
+    for (size_t i = 0; i < n; ++i) if (groups[i] == gid) previous.insert(old[i]);
+    if (previous.size() != 1 || *previous.begin() <= 0) continue;
+    const int p = *previous.begin();
+    bool same = true;
+    for (size_t i = 0; i < n && same; ++i) same = (groups[i] == gid) == (old[i] == p);
+    if (same) for (size_t i = 0; i < n; ++i) if (groups[i] == gid) preserved[i] = 1;
+  }
+  for (size_t i = 0; i < n; ++i) {
+    if (!preserved[i] && !unset3(&pit->second[i * 3])) {
+      if (clear) {
+        for (int c = 0; c < 3; ++c) pit->second[i * 3 + c] = NAN;
+      } else {
+        refuse("Coordinate group membership changes invalidate saved C_INTCRD targets; use "
+               "on_internal_coord_mismatch='clear' to discard affected targets.");
+      }
+    }
+  }
+}
+
 /**
  * `separate_coordinate_groups` (spec.js): each input's internal-coordinate groups renumbered into
  * one namespace, so two files' group 1 do not become one rigid group. In place.
@@ -220,6 +268,7 @@ inline void applyConditions(atoms::AtomArray& a, const Spec& conditions,
           }
         }
       }
+      assertCoordinateGroups(a, groups, a.ann.ints[full]);
       a.ann.ints[full] = groups;
       continue;
     }
@@ -266,9 +315,12 @@ inline void applyConditions(atoms::AtomArray& a, const Spec& conditions,
                                    ? a.ann.ints["condition_CoordinateGroup_1_atom"]
                                    : defaultCoordinateGroups(a);
           const vector<int> defGrp = defaultCoordinateGroups(a);
+          const vector<int> before = crdGrp;
           for (const int idx : indices) {
             if (active || crdGrp[idx] <= 0) crdGrp[idx] = defGrp[idx];
           }
+          // `set_absolute_coordinate_conditioning` (spec.js has the note).
+          assertCoordinateGroups(a, crdGrp, before, true);
           a.ann.ints["condition_CoordinateGroup_1_atom"] = crdGrp;
         } else if (dtype == "seq") {
           // 🔴 TRUE OR FALSE AND NOTHING ELSE: a sequence condition copies the residue's own

@@ -1287,6 +1287,52 @@ export function getDefaultIndexGroups(atoms) {
 }
 
 /**
+ * `CoordinateGroup.set_annotation`'s checks, in upstream's words, before new group ids are
+ * written: absolute targets are whole or unset per atom and sit exactly on group 0 (a C_CRD
+ * atom moved into an internal group is refused, not silently both), and a saved C_INTCRD
+ * payload survives only on a group whose member set is unchanged - any other is refused.
+ */
+function assertCoordinateGroups(atoms, groups, old, { clear = false } = {}) {
+  const n = atoms.nAtoms;
+  const finite = (v) => Array.isArray(v) && Number.isFinite(v[0]) && Number.isFinite(v[1]) && Number.isFinite(v[2]);
+  const unset = (v) => !Array.isArray(v) || (Number.isNaN(v[0]) && Number.isNaN(v[1]) && Number.isNaN(v[2]));
+  const absolute = atoms.annotations['condition_coordinate_1_atom'];
+  for (let i = 0; i < n; i++) {
+    if (!finite(absolute?.[i]) && !unset(absolute?.[i])) {
+      throw new Error('Absolute coordinate targets must be entirely finite or entirely unset (NaN) per atom.');
+    }
+  }
+  for (let i = 0; i < n; i++) {
+    if (finite(absolute?.[i]) !== (groups[i] === 0)) {
+      throw new Error('Coordinate group 0 must match absolute coordinate conditioning; modify C_CRD first.');
+    }
+  }
+  const payload = atoms.annotations['condition_InternalCoordinate_1_atom'];
+  if (!payload) return;
+  const preserved = new Array(n).fill(false);
+  for (const gid of new Set(groups.filter((g) => g > 0))) {
+    const previous = new Set();
+    for (let i = 0; i < n; i++) if (groups[i] === gid) previous.add(old[i]);
+    const [p] = previous;
+    if (previous.size !== 1 || !(p > 0)) continue;
+    let same = true;
+    for (let i = 0; i < n && same; i++) same = (groups[i] === gid) === (old[i] === p);
+    if (same) for (let i = 0; i < n; i++) if (groups[i] === gid) preserved[i] = true;
+  }
+  for (let i = 0; i < n; i++) {
+    if (!preserved[i] && !unset(payload[i])) {
+      // `on_internal_coord_mismatch="clear"`, which a C_CRD edit uses: the broken group's saved
+      // targets go, to be materialised again from live coordinates.
+      if (clear) payload[i] = [NaN, NaN, NaN];
+      else {
+        throw new Error('Coordinate group membership changes invalidate saved C_INTCRD targets; '
+          + "use on_internal_coord_mismatch='clear' to discard affected targets.");
+      }
+    }
+  }
+}
+
+/**
  * Apply the `conditions:` dictionary from a condition spec onto `atoms` in place.
  */
 export function applyConditions(atoms, conditions, originalResId) {
@@ -1353,6 +1399,7 @@ export function applyConditions(atoms, conditions, originalResId) {
             }
           }
         }
+        assertCoordinateGroups(atoms, groups, atoms.annotations[fullName]);
         atoms.annotations[fullName] = groups;
         continue;
       }
@@ -1391,9 +1438,13 @@ export function applyConditions(atoms, conditions, originalResId) {
                 ? atoms.annotations['condition_CoordinateGroup_1_atom'].slice()
                 : getDefaultCoordinateGroups(atoms);
               const defGrp = getDefaultCoordinateGroups(atoms);
+              const before = crdGrp.slice();
               for (const idx of indices) {
                 if (active || crdGrp[idx] <= 0) crdGrp[idx] = defGrp[idx];
               }
+              // `set_absolute_coordinate_conditioning`: the groups are set as `C_CRDGRP` sets them,
+              // clearing (not refusing) the saved targets of a group the edit broke up.
+              assertCoordinateGroups(atoms, crdGrp, before, { clear: true });
               atoms.annotations['condition_CoordinateGroup_1_atom'] = crdGrp;
             } else if (spec.dtype === 'seq') {
               if (!atoms.annotations[fullName]) {

@@ -6,8 +6,9 @@ let s = Number(seed) >>> 0;
 const next = () => { s = (Math.imul(s, 1664525) + 1013904223) >>> 0; return (s >>> 8) / 16777216; };
 const n = Number(nStr);
 const noise = Number(noiseStr);
-// 🔴 A REFLECTED SET IS THE ONLY WAY det(H) GOES NEGATIVE, and the sign of
-// det(H) is what stops Kabsch returning an improper rotation.
+// 🔴 A REFLECTED SET IS THE ONLY WAY det(H) GOES NEGATIVE, which is where a Kabsch that
+// can return an improper rotation does (test/rfd4p-superpose.test.js holds the page's to
+// Horn's quaternion method there; this probe holds the native one to the page's).
 const flip = reflectStr === '1' ? -1 : 1;
 const fixed = new Float64Array(n * 3);
 const mobile = new Float64Array(n * 3);

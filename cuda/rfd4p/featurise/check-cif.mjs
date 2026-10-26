@@ -32,13 +32,15 @@ import {
   runValidationPipeline,
 } from "../../../shared/rfd4p/pipeline/transforms.js";
 import { execFileSync } from "node:child_process";
-import { readFileSync, readdirSync, writeFileSync, mkdtempSync, existsSync } from "node:fs";
+import { readFileSync, readdirSync, writeFileSync, mkdtempSync, existsSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const repo = new URL("../../../", import.meta.url).pathname;
 const binary = `${repo}cuda/rfd4p/featurise/rfd4p-featurise`;
 const work = mkdtempSync(join(tmpdir(), "rfd4p-cif-"));
+// Its own scratch goes when it does, refusal or not - 300 of these were left behind, 700 MB.
+process.on("exit", () => rmSync(work, { recursive: true, force: true }));
 // 🔴 EXACT, NOT THROUGH `Math.fround`. Comparing the float32 of both sides is how a NARROWING
 // hides: the reader kept coordinates as float where the reference keeps doubles, every column
 // still "matched", and the difference only showed six stages later in the chirality fit.
@@ -680,7 +682,11 @@ cases.set("ppi_pdl1+crosslink", withDeclaredBond(cases.get("ppi_pdl1")));
 cases.set("ppi_pdl1+interchain",
   withDeclaredBond(withDuplicatedChain(cases.get("ppi_pdl1")), { crossChain: true }));
 cases.set("motif_idx_1prw+masked", withMaskedSequence(cases.get("motif_idx_1prw")));
-cases.set("motif_idx_1prw+coordgroups", withCoordinateGroups(cases.get("motif_idx_1prw")));
+// An internal group read from the file with no saved targets, so it is materialised from live
+// coordinates - on a structure with no absolute targets, since upstream refuses a group over a
+// C_CRD atom (motif_idx_1prw derives C_CRD on 303 of its 330 atoms) and over an atom with no
+// live coordinate (5o45_cropped has no side chains): sm_sam has neither.
+cases.set("sm_sam+coordgroups", withCoordinateGroups(cases.get("sm_sam")));
 cases.set("5o45_cropped+icgroups",
   withInternalCoords(withCoordinateGroups(cases.get("5o45_cropped"))));
 cases.set("ppi_pdl1+interior-unindexed", withInteriorUnindexed(cases.get("ppi_pdl1")));
@@ -861,7 +867,9 @@ function conditionsFor(js) {
     ["coord-off", { C_CRD: { true: [{ select: all }], false: [{ select: few }] } }],
     ["seq", { C_SEQ: { true: [{ select: all }] } }],
     ["hotspot", { C_HOT: { true: [{ select: few }] } }],
-    ["crdgrp", { C_CRD: { true: [{ select: all }] }, C_CRDGRP: { 2: [{ select: few }] } }],
+    // An internal group takes its atoms OUT of the absolute one first, as upstream requires
+    // ("Coordinate group 0 must match absolute coordinate conditioning; modify C_CRD first").
+    ["crdgrp", { C_CRD: { true: [{ select: all }], false: [{ select: few }] }, C_CRDGRP: { 2: [{ select: few }] } }],
     ["secondary", { C_SEC: { HELIX: [{ select: few }] } }],
     ["cath", { C_CATH: { "3.40.50": [{ select: all }] } }],
     // 🔴 THE `centroid` DTYPE, WHICH NOTHING HERE HAD EVER WRITTEN. gcov says its whole branch

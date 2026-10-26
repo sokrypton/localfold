@@ -271,9 +271,18 @@ function outputTables(atoms, starts) {
     // probabilities (as float bits); per input atom its hotspot flag; and the input's BONDS as
     // pairs of (token * 37 + slot), in the input's order, where both ends have a slot.
     "g/mTok": [], "g/mChainIid": [], "g/mCompType": [], "g/mSeq": [], "g/mSeqProb": [],
-    "g/mHot": new Int32Array(nTok * 37), "g/mBonds": [],
+    "g/mHot": new Int32Array(nTok * 37),
+    // ...and for the motif RMSDs: per token its pn_unit, molecule and molecule entity; every input
+    // atom in the input's order (`IN_ATOM_WORDS` each: its slot or -1, flags - indexed, atomised,
+    // protein, polymer, coordinate-conditioned - chain type, charge, residue id, coordinates as float bits, then atom,
+    // residue, element, chain, insertion code, chain instance and pn_unit as packed text, and its
+    // molecule and entity); and the input's bonds as (atom, atom, type) triples.
+    "g/mPnUnit": [], "g/mTokMol": [], "g/mInAtom": [], "g/mInBonds": [],
   };
   const slotOf = new Int32Array(nAtoms).fill(-1);
+  const tokenOf = new Int32Array(nAtoms).fill(-1);
+  const batchMol = batch.molecule_iid?.data ?? batch.molecule_iid;
+  const batchEntity = batch.molecule_entity_id?.data ?? batch.molecule_entity_id;
   const bits = new Int32Array(new Float32Array(1).buffer);
   const floatBits = (v) => { new Float32Array(bits.buffer)[0] = v; return bits[0]; };
   for (let tk = 0; tk < nTok; tk += 1) {
@@ -288,6 +297,9 @@ function outputTables(atoms, starts) {
     t["g/mTok"].push(atoms.is_polymer?.[a0] ? 1 : 0, atoms.is_protein?.[a0] ? 1 : 0,
       Number(atoms["condition_secondary-structure_1_residue"]?.[a0] ?? 0));
     packString(atoms.chain_iid?.[a0] ?? atoms.chain_id[a0], 4, t["g/mChainIid"]);
+    packString(atoms.pn_unit_iid?.[a0] ?? atoms.chain_iid?.[a0] ?? atoms.chain_id[a0], 4, t["g/mPnUnit"]);
+    // The BATCH's molecule and entity ids (dense, then permuted): what both featurisers agree on.
+    t["g/mTokMol"].push(Number(batchMol[tk]), Number(batchEntity[tk]));
     packString(String(atoms.chem_comp_type?.[a0] ?? "").toUpperCase(), 8, t["g/mCompType"]);
     packString(atoms.condition_sequence_1_residue?.[a0] ?? "<M>", 2, t["g/mSeq"]);
     for (const tok of SEQUENCE_PROBABILITY_TOKENS) {
@@ -297,6 +309,7 @@ function outputTables(atoms, starts) {
     const rt = residueType[tk];
     const layout = UNIFIED_ATOM37_ENCODING.token_atoms[UNIFIED_ATOM37_TOKENS[rt]] ?? [];
     for (let ai = starts[tk]; ai < (starts[tk + 1] ?? nAtoms); ai += 1) {
+      tokenOf[ai] = tk;
       let slot = -1;
       if (atomised) slot = ai === a0 ? 1 : -1;
       else slot = layout.indexOf(atoms.atom_name[ai]);
@@ -315,9 +328,28 @@ function outputTables(atoms, starts) {
       packDouble(Number(atoms.occupancy?.[ai]), t["g/inOcc"], at);
     }
   }
-  for (const [p, q] of atoms.bonds ?? []) {
-    if (slotOf[p] >= 0 && slotOf[q] >= 0) t["g/mBonds"].push(slotOf[p], slotOf[q]);
+  const indexed = atoms.condition_index_1_residue ?? atoms.annotations?.condition_index_1_residue;
+  for (let ai = 0; ai < nAtoms; ai += 1) {
+    const row = t["g/mInAtom"];
+    const crd = atoms.condition_coordinate_1_atom ?? atoms.annotations?.condition_coordinate_1_atom;
+    const group = (atoms.condition_CoordinateGroup_1_atom ?? atoms.annotations?.condition_CoordinateGroup_1_atom)?.[ai];
+    const conditioned = (Array.isArray(crd?.[ai]) && crd[ai].every(Number.isFinite))
+      || (group != null && group !== -1 && group !== 0);
+    const flags = ((indexed?.[ai] ?? true) ? 1 : 0) | (atoms.atomize?.[ai] ? 2 : 0)
+      | (atoms.is_protein?.[ai] ? 4 : 0) | (atoms.is_polymer?.[ai] ? 8 : 0) | (conditioned ? 16 : 0);
+    row.push(slotOf[ai], flags, Number(atoms.chain_type?.[ai] ?? -1), Number(atoms.charge?.[ai] ?? 0),
+      Number(atoms.res_id[ai]));
+    for (let c = 0; c < 3; c += 1) row.push(floatBits(Number(atoms.coord?.[ai]?.[c] ?? NaN)));
+    packString(atoms.atom_name[ai], 1, row);
+    packString(atoms.res_name[ai], 2, row);
+    packString(String(atoms.element?.[ai] ?? "").toUpperCase(), 1, row);
+    packString(atoms.chain_id[ai], 1, row);
+    packString(atoms.ins_code?.[ai] ?? "", 1, row);
+    packString(atoms.chain_iid?.[ai] ?? atoms.chain_id[ai], 4, row);
+    packString(atoms.pn_unit_iid?.[ai] ?? atoms.chain_iid?.[ai] ?? atoms.chain_id[ai], 4, row);
+    row.push(Number(batchMol[tokenOf[ai]]), Number(batchEntity[tokenOf[ai]]));
   }
+  for (const [p, q, type] of atoms.bonds ?? []) t["g/mInBonds"].push(p, q, type ?? 1);
   return Object.fromEntries(Object.entries(t).map(([k, v]) => [k, Int32Array.from(v)]));
 }
 

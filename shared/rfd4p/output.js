@@ -184,14 +184,18 @@ export function superimposeCoords3D(fixedCoords, mobileCoords) {
   U[1 * 3 + 2] = U[2 * 3 + 0] * U[0 * 3 + 1] - U[0 * 3 + 0] * U[2 * 3 + 1];
   U[2 * 3 + 2] = U[0 * 3 + 0] * U[1 * 3 + 1] - U[1 * 3 + 0] * U[0 * 3 + 1];
 
-  const sign = det3x3(h) >= 0 ? 1 : -1;
+  // 🔴 NO det(H) SIGN HERE: V is right-handed (`jacobiEigen3x3` makes it so) and U's third
+  // column is the cross product of its first two, so V U^T is already the best PROPER rotation -
+  // the Kabsch correction is built in. Flipping the third axis by det(H)'s sign, as this did,
+  // returned a REFLECTION exactly when the correction mattered (a design's motif fitted onto a
+  // mirror-like reference): det -1 and an RMSD below the best a rotation can reach.
   const R = new Float64Array(9);
   for (let r = 0; r < 3; r += 1) {
     for (let c = 0; c < 3; c += 1) {
       R[r * 3 + c] =
         V[r * 3 + 0] * U[c * 3 + 0] +
         V[r * 3 + 1] * U[c * 3 + 1] +
-        sign * V[r * 3 + 2] * U[c * 3 + 2];
+        V[r * 3 + 2] * U[c * 3 + 2];
     }
   }
 
@@ -676,7 +680,11 @@ export function insertInternalCoordConditionedGroups(atoms, cwiCoords) {
  * @param {number[]} anchorIndices Atom indices where `C_CRD` is finite
  */
 export function alignAtomsToInputFrame(atoms, cwiCoords, anchorIndices) {
-  if (!anchorIndices || anchorIndices.length === 0) return atoms;
+  // 🔴 THREE ANCHORS OR NONE, as upstream's `anchor_mask.sum() < 3` has it: one or two atoms
+  // (a lone ion under C_CRD) do not fix a frame, and this turned the design about them anyway.
+  // Upstream's fallback to the largest internal group is not here because it is the identity:
+  // that group's reference was itself fitted onto the design (see the README).
+  if (!anchorIndices || anchorIndices.length < 3) return atoms;
 
   const nAnchors = anchorIndices.length;
   const fixed = new Float32Array(nAnchors * 3);

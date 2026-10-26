@@ -225,8 +225,19 @@ def chain_steps(pdb: Path) -> list[float]:
 
 
 METRICS_TAGS = ["design", "structure_prediction", "small_molecule_only", "hotspot_conditioning",
-                "unindexed", "partial_diffusion", "insertion_rmsd_filter", "motif_rmsd_filter",
-                "ligand_clash_filter"]
+                "partial_diffusion", "insertion_rmsd_filter", "motif_rmsd_filter", "ligand_clash_filter"]
+# 🔴 AND THE TAGS THAT NAME A MOTIF ONLY WHERE THE PRESET HAS ONE, as upstream's own validation
+# sets tag their tasks (configs/datasets/val/motif_scaffolding): a motif RMSD on a design with no
+# coordinate-conditioned atom raises upstream ('coords-with-insertion' is never staged), and here.
+MOTIF_TAGS = {
+    "ppi_pdl1": ["3d_coordinate_conditioning"],
+    "motif_idx_1prw": ["3d_coordinate_conditioning"],
+    "motif_unidx_1prw": ["unindexed", "3d_coordinate_conditioning"],
+    "dna_7m5w": ["3d_coordinate_conditioning"],
+    "yaml_5o45_binder": ["3d_coordinate_conditioning", "internal_coordinate_conditioning"],
+    "partial_diffusion_1prw": ["3d_coordinate_conditioning"],
+    "inverse_folding_1prw": ["3d_coordinate_conditioning"],
+}
 
 
 def compare_metrics(job: Path, dump: Path, label: str) -> list[str]:
@@ -615,9 +626,10 @@ def main() -> int:
                 nat, js = HERE / f"gate-nat-{tag}", HERE / f"gate-js-{tag}"
                 run([binary, nat, f"--weights={args.weights}",
                      f"--config={REPO}/model-rfd4p-int8/config.json", *native_flags], cwd=REPO)
-                if not (js / "model.idx").exists():
-                    run(["node", "--max-old-space-size=12288", HERE / "export_input.mjs", js,
-                         *js_flags], cwd=REPO)
+                # 🔴 ALWAYS RE-EXPORTED: a cached page-side directory outlives the source it was
+                # written by, and this arm then holds new native bytes to old page bytes.
+                run(["node", "--max-old-space-size=12288", HERE / "export_input.mjs", js,
+                     *js_flags], cwd=REPO)
                 differ = compare_dirs(nat, js)
                 differ += [f"-gen {d}" for d in compare_dirs(
                     Path(str(nat) + "-gen"), Path(str(js) + "-gen"))]
@@ -702,6 +714,17 @@ def main() -> int:
                  '"contig":"A1-5"}', "appears in both"),
                 ('{"input":"../../../web/examples/motif_idx_1prw.cif.zst","contig":"A1-5"}',
                  "Unresolved link valence"),
+                # 🔴 AND UPSTREAM'S COORDINATE-GROUP CHECKS (`CoordinateGroup.set_annotation`,
+                # `materialize_internal_coords`), which both ports filled NaN through: a C_CRD atom
+                # moved into an internal group, and a group with no live coordinates to take its
+                # shape from - each became NaN internal coordinates and a model told nothing.
+                ('{"input":"../../../tools/fixtures/rcsb/6mrr.cif.zst","contig":"A1-20, 8-8, A29-68",'
+                 '"conditions":{"C_CRD":{"true":[{"select":"sel(\'A/*/[29-68]\')"}]},'
+                 '"C_CRDGRP":{"1":[{"select":"sel(\'A/*/[29-45]\')"}]}}}',
+                 "must match absolute coordinate conditioning"),
+                ('{"input":"../../../tools/fixtures/rcsb/6mrr.cif.zst","contig":"A1-20, 8-8, A29-68",'
+                 '"conditions":{"C_CRDGRP":{"1":[{"select":"sel(\'A/*/[29-45]\')"}]}}}',
+                 "needs finite live coordinates"),
             ]
             bad_refusals = []
             probe = HERE / "featurise" / "gate-refusal.json"
@@ -790,7 +813,7 @@ def main() -> int:
                     spec["nsteps"] = steps
                     # Every tag a ported metric gates on, so the metrics arm below computes all of
                     # them; the writer reads none of it.
-                    spec["metrics_tags"] = METRICS_TAGS
+                    spec["metrics_tags"] = METRICS_TAGS + MOTIF_TAGS.get(pid, [])
                     job = HERE / "featurise" / f"gate-writer-{pid}-{steps}.json"
                     job.write_text(json.dumps(spec))
                     dump = HERE / f"gate-writer-{pid}-{steps}"
@@ -813,17 +836,25 @@ def main() -> int:
                 # value and the pre-oracle verdict: the writer cases above with every tag on, and a
                 # job built to reach what they cannot - hotspots, C_SEC, sequence probabilities.
                 # tools/check-rfd4p-metrics.py (below) holds the page's to upstream's.
-                mjob = HERE / "featurise" / "gate-metrics.json"
-                mdump = HERE / "gate-metrics-5o45"
-                run([BINARY, f"--job={mjob}", f"--int8={bundle}", f"--work-dir={mdump}-work",
-                     f"--out={mdump}.cif", "--seed=0", "--fast", f"--dump-sample={mdump}",
-                     f"--metrics={mdump}.metrics.json"], cwd=REPO)
-                metrics_bad += compare_metrics(mjob, mdump, "metrics-5o45")
+                # 🔴 AND TWO MORE FOR THE MOTIF RMSDs, which no preset reaches: an absolute group
+                # beside two internal ones (5o45), and a partial diffusion whose design keeps every
+                # one of the input's CAs (1brs - 6mrr's and the cropped 5o45's inputs carry NaN
+                # side-chain atoms upstream encodes as NaN too, so neither can be this case).
+                crafted = [("gate-metrics.json", "gate-metrics-5o45"),
+                           ("gate-groups-5o45.json", "gate-groups-5o45"),
+                           ("gate-partial-1brs.json", "gate-partial-1brs")]
+                for jname, dname in crafted:
+                    mjob, mdump = HERE / "featurise" / jname, HERE / dname
+                    run([BINARY, f"--job={mjob}", f"--int8={bundle}", f"--work-dir={mdump}-work",
+                         f"--out={mdump}.cif", "--seed=0", "--fast", f"--dump-sample={mdump}",
+                         f"--metrics={mdump}.metrics.json"], cwd=REPO)
+                    metrics_bad += compare_metrics(mjob, mdump, dname)
                 if metrics_bad:
                     failed += 1
-                print(f"  {'metrics':10s} {len(writer_cases) + 1} designs against the page's metrics"
+                n_m = len(writer_cases) + len(crafted)
+                print(f"  {'metrics':10s} {n_m} designs against the page's metrics"
                       f"  {'ok ' if not metrics_bad else 'DIFFERS: ' + '; '.join(metrics_bad[:4])}")
-                got["metrics"] = {"designs": len(writer_cases) + 1, "differing": len(metrics_bad)}
+                got["metrics"] = {"designs": n_m, "differing": len(metrics_bad)}
 
             # 🔴 THE ASSIGNMENT SOLVER, ON ITS OWN. It decides which designed token an
             # unindexed motif is grafted onto, so a wrong answer is a plausible structure with
@@ -866,10 +897,13 @@ def main() -> int:
             # check can see. Four of its conventions are the reference's own and not the
             # textbook's, and this sweep is what prices them: mutated one at a time it is 114 of
             # 240 for forcing the eigenvectors right-handed, 99 for U's third column being a
-            # cross product, 90 for det(H)'s sign, and 29 - all of them n = 2, where the rotation
-            # is not determined by the data - for the partial Jacobi update. A fifth, clamping a
-            # negative eigenvalue, is 0 of 240; see the comment in src/superpose.h for why it
-            # cannot be anything else.
+            # cross product, and 29 - all of them n = 2, where the rotation is not determined by
+            # the data - for the partial Jacobi update. A fourth, clamping a negative eigenvalue,
+            # is 0 of 240; see the comment in src/superpose.h for why it cannot be anything else.
+            # 🔴 AND IT HOLDS NATIVE TO THE PAGE, SO A MISTAKE THEY SHARE PASSES: both took a
+            # det(H) sign that made every reflected set's fit a REFLECTION, found by the motif
+            # RMSD against upstream's biotite. test/rfd4p-superpose.test.js is the independent
+            # half (Horn's quaternion method).
             sprobe = HERE / "featurise" / "superpose-probe"
             if sprobe.exists():
                 bad_sp, n_sp = 0, 0
@@ -877,8 +911,8 @@ def main() -> int:
                     for pts in (1, 2, 3, 4, 8, 12, 40, 200):
                         for noise in ("0", "0.5", "4"):
                             # 🔴 AND A REFLECTED SET, because det(H) is otherwise always
-                            # positive and the sign that stops Kabsch returning an IMPROPER
-                            # rotation is never exercised.
+                            # positive, and a reflected set is where a Kabsch that can return
+                            # an IMPROPER rotation does.
                             for refl in ("0", "1"):
                                 pa = [str(sd), str(pts), noise, refl]
                                 a = run([sprobe, *pa], cwd=REPO).stdout.strip()
@@ -1120,6 +1154,20 @@ def main() -> int:
                     print(r.stdout[-1500:], r.stderr[-600:])
                 print(f"  {'upstream m':10s} {m.group(1) if m else '?'} designs against upstream's metrics, "
                       f"{m.group(2) if m else '?'} differing  {'ok ' if ok else 'DIFFERS'}")
+
+            # 🔴 AND WHICH ATOMS ARE EQUIVALENT, AGAINST ATOMWORKS' OWN AUTOMORPHISMS over the
+            # component dictionary: no gate design holds a coordinate-conditioned ligand, so the
+            # bond orders RDKit normalises (and `fix_mol`'s charge repair) are checked only here.
+            if venv.exists():
+                r = run([venv, REPO / "tools" / "check-rfd4p-automorphisms.py"], cwd=REPO)
+                m = re.search(r"(\d+) components, \d+ with a symmetry, (\d+) differing; (\d+) past", r.stdout)
+                ok = r.returncode == 0 and m is not None
+                if not ok:
+                    failed += 1
+                    print(r.stdout[-1500:], r.stderr[-600:])
+                print(f"  {'upstream a':10s} {m.group(1) if m else '?'} components' automorphisms against "
+                      f"atomworks, {m.group(2) if m else '?'} differing ({m.group(3) if m else '?'} past the "
+                      f"1000 cap)  {'ok ' if ok else 'DIFFERS'}")
 
             # 🔴 AND THE SAMPLER, AGAINST UPSTREAM'S OWN `sample_schedule` AND `simulation_step`:
             # every mode a job's `sampling` may name (vf, sc, vf_tsr), the gt transforms and clamp,

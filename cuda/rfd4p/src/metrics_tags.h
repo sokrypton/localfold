@@ -12,7 +12,7 @@ inline const std::vector<std::string>& metricsTagNames() {
   static const std::vector<std::string> names = {
       "design", "structure_prediction", "small_molecule_only", "hotspot_conditioning", "unindexed",
       "partial_diffusion", "insertion_rmsd_filter", "motif_rmsd_filter", "ligand_clash_filter",
-      "no_ligand"};
+      "no_ligand", "3d_coordinate_conditioning", "internal_coordinate_conditioning"};
   return names;
 }
 

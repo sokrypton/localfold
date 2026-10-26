@@ -11,7 +11,7 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-427 tools. `tools/fixtures/` is data and is not listed.
+429 tools. `tools/fixtures/` is data and is not listed.
 
 ## `tools/gpu/` - the WebGPU lane (215)
 
@@ -333,7 +333,7 @@ and turning it into a bundle.
 - **`safetensors_read.py`** - Read a .safetensors file into numpy arrays, without the safetensors package.
 - **`vector-quantise.py`** - Is a codebook worth a new decoder? Scalar codes against vector ones, at 2 bits.
 
-## `tools/` - everything else (125)
+## `tools/` - everything else (127)
 
 CPU checkers, the export and quantisation pipeline, the page drivers that
 go through CDP, and the deploy.
@@ -385,6 +385,7 @@ go through CDP, and the deploy.
 - **`check-native-worker.py`** - The native backend's worker (CUDA, or Metal on a Mac), folding for real: npm run test:native.
 - **`check-oracle-bonds.js`** - Does the REFERENCE put side chains where we do? AlphaFold 3's own output, scored by the same function.
 - **`check-portable-limits.mjs`** - Does every model fold on a device at the PORTABLE limit ceiling?
+- **`check-rfd4p-automorphisms.py`** - Hold shared/rfd4p/symmetry.js's automorphisms to atomworks' own, over the component dictionary.
 - **`check-rfd4p-load.py`** - Hold the page's structure LOADER to upstream's, atom for atom: `load_condition_spec_inputs`.
 - **`check-rfd4p-manifest.py`** - Does our copy of RFD4-Proteina's tensor manifest still describe the shards being served?
 - **`check-rfd4p-metrics.py`** - Hold the RFD4 design metrics to upstream's own metric manager, on the same sample.
@@ -452,6 +453,7 @@ go through CDP, and the deploy.
 - **`repack_shards.py`** - Lay an exported bundle into a few even shards instead of many uneven ones.
 - **`replay_alphafold_evoformer_block.py`** - Replay and stage-capture one official AlphaFold Evoformer block on CPU.
 - **`replay_alphafold_triangle_reference.py`** - Replay a captured bundle through the official AF2 Haiku operator on CPU.
+- **`rfd4p-automorphisms.mjs`** - shared/rfd4p/symmetry.js's automorphisms of each component on stdin, for tools/check-rfd4p-automorphisms.py.
 - **`rfd4p_ccd.py`** - The dictionary entries the RFD4 page would FETCH for a structure, written from the CCD atomworks reads.
 - **`score-bioemu2-samples.mjs`** - BioEmu2 samples, scored as BioEmu2 scores them: its physicality report and its steering potentials' energies.
 - **`score_fold.py`** - Score a fold from tools/gpu/fold.js against a reference structure.

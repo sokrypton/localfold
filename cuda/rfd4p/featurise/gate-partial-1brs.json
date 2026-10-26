@@ -1,0 +1,4 @@
+{"input": "../../../tools/fixtures/rcsb/1brs.cif.zst",
+ "contig": "A3-110",
+ "nsteps": 40, "recycleSchedule": "low", "partialTrajectoryFractionSteps": 0.5,
+ "metrics_tags": ["design"]}

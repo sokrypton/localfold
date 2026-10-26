@@ -14,11 +14,14 @@
  * composition and the unknown-residue filter and nothing else. That gate is reproduced
  * (`metricsTags`), not widened: a number upstream would not have reported is not reported.
  *
- * 🔴 AND THE MOTIF-RMSD FAMILY IS NOT HERE YET (`design_motif_allatom_rmsd`, its unindexed twin,
- * `ca_rmsd_to_input`): upstream resolves chemically equivalent atoms and subunits by permutation
- * before it superposes, and a port without that would report a flipped carboxylate as a motif
- * failure. The filters that read one (`motif_rmsd_filter`, `insertion_rmsd_filter`) name keys no
- * upstream metric produces either, so they are indeterminate on both sides.
+ * 🔴 AND THE MOTIF RMSDs (`design_motif_allatom_rmsd`, its unindexed twin, `ca_rmsd_to_input`)
+ * RESOLVE SYMMETRY FIRST, as upstream's `StructureComparisonMetric` does: identical subunits and
+ * chemically equivalent atoms (a carboxylate's oxygens, a ring's flip) are relabelled onto the
+ * design before the fit (shared/rfd4p/symmetry.js), so a flipped Asp is not a motif failure. The
+ * reference is upstream's `SA_CWI`, staged per coordinate group (`coordsWithInsertion`). The
+ * filters that read one (`motif_rmsd_filter`, `insertion_rmsd_filter`) name keys no upstream
+ * metric produces (`motif_rmsd.rmsd`, `unindexed_metrics.insertion_rmsd`), so they stay
+ * indeterminate on both sides.
  *
  * The array: `processSampleToAtoms`' atoms (which tools/check-rfd4p-metrics.py also holds to
  * upstream's, atom for atom), each reading the input's annotations through the input atom it
@@ -28,7 +31,9 @@
  * generated residue added atoms (`copy_generated_coordinates_to_input`).
  */
 
-import { STD_RESIDUE_BONDS } from './pipeline/cif.js';
+import { BOND_TYPE, CHAIN_TYPE, STD_RESIDUE_BONDS } from './pipeline/cif.js';
+import { superimposeCoords3D } from './output.js';
+import { permuteGtAtoms, permuteGtSubunits } from './symmetry.js';
 
 const MASKED = '<M>';
 const STANDARD_AA = ['ALA', 'ARG', 'ASN', 'ASP', 'CYS', 'GLN', 'GLU', 'GLY', 'HIS', 'ILE', 'LEU', 'LYS',
@@ -67,6 +72,9 @@ export const METRIC_GATES = {
   sse_accuracy: { any: ['design'], not: ['small_molecule_only', 'structure_prediction'] },
   unindexed_insertion_mapping: { all: ['unindexed'] },
   sequence_similarity_to_input: { any: ['partial_diffusion'] },
+  design_motif_allatom_rmsd: { any: ['3d_coordinate_conditioning', 'unindexed', 'internal_coordinate_conditioning'] },
+  design_unindexed_motif_allatom_rmsd: { all: ['unindexed'] },
+  ca_rmsd_to_input: { any: ['partial_diffusion'] },
 };
 
 /** all_pre_oracle_filters.yaml: each filter's gate and its thresholds (inclusive `max`). */
@@ -108,13 +116,45 @@ export function jobMetricsTags(job) {
 }
 
 /**
+ * The tags upstream's own validation sets give a task conditioned the way this one is
+ * (`configs/datasets/val/`: motif scaffolding is `3d_coordinate_conditioning`, with
+ * `internal_coordinate_conditioning` for internal groups and `unindexed` for an unindexed motif;
+ * PPI adds `hotspot_conditioning`) - read off the batch's input, so a motif's RMSD is reported
+ * where there is a motif and nowhere else (on a design with none, upstream's raises).
+ * @param {object} input the batch's input atom table
+ */
+export function conditioningMetricsTags(input) {
+  const n = input.atom_name.length;
+  const crd = input.condition_coordinate_1_atom;
+  const group = input.condition_CoordinateGroup_1_atom;
+  const idx = input.condition_index_1_residue;
+  const hot = input.condition_hotspot_1_atom;
+  let absolute = false;
+  let internal = false;
+  let unindexed = false;
+  let hotspot = false;
+  for (let i = 0; i < n; i += 1) {
+    absolute ||= Array.isArray(crd?.[i]) && crd[i].every(Number.isFinite);
+    internal ||= group?.[i] != null && group[i] !== -1 && group[i] !== 0;
+    unindexed ||= idx ? !idx[i] : false;
+    hotspot ||= Boolean(hot?.[i]);
+  }
+  return [
+    ...(absolute || internal ? ['3d_coordinate_conditioning'] : []),
+    ...(internal ? ['internal_coordinate_conditioning'] : []),
+    ...(unindexed ? ['unindexed'] : []),
+    ...(hotspot ? ['hotspot_conditioning'] : []),
+  ];
+}
+
+/**
  * Every tag a ported metric or filter gates on, in a fixed order: the native port carries a
  * job's tags as these bits (a tag outside the list gates nothing here, so dropping it loses
  * nothing).
  */
 export const METRICS_TAGS = ['design', 'structure_prediction', 'small_molecule_only', 'hotspot_conditioning',
   'unindexed', 'partial_diffusion', 'insertion_rmsd_filter', 'motif_rmsd_filter', 'ligand_clash_filter',
-  'no_ligand'];
+  'no_ligand', '3d_coordinate_conditioning', 'internal_coordinate_conditioning'];
 export function metricsTagBits(tags) {
   return METRICS_TAGS.reduce((bits, t, k) => (tags.includes(t) ? bits | (1 << k) : bits), 0);
 }
@@ -169,7 +209,8 @@ export function designArray(structure, input) {
   const arr = { n, coord: new Float32Array(n * 3) };
   const fields = ['resName', 'atomName', 'element', 'chainId', 'resId', 'insCode', 'transformationId',
     'tokenId', 'chainIid', 'isPolymer', 'isProtein', 'atomize', 'chemCompType', 'crd', 'internal', 'hot',
-    'cSeq', 'cSec', 'uii', 'inputIndex'];
+    'cSeq', 'cSec', 'uii', 'inputIndex', 'charge', 'coordGroup', 'crdsrc', 'pnUnit', 'molIid', 'molEntity',
+    'condSource', 'crdValue', 'intCrd'];
   for (const f of fields) arr[f] = new Array(n);
   arr.seqProb = SEQUENCE_PROBABILITY_TOKENS.map(() => new Float64Array(n));
   for (let i = 0; i < n; i += 1) {
@@ -206,6 +247,21 @@ export function designArray(structure, input) {
     });
     arr.uii[i] = Boolean(a.isUnindexedInsertion);
     arr.inputIndex[i] = a.inputIndex ?? -1;
+    arr.charge[i] = Number(a.charge ?? 0);
+    arr.coordGroup[i] = a.coordGroup ?? -1;
+    arr.condSource[i] = a.condSource ?? -1;
+    // float32, as upstream's annotations hold them and the native port's tables carry them.
+    arr.crdValue[i] = a.crd && finite3(a.crd) ? a.crd.map(Math.fround) : null;
+    arr.intCrd[i] = a.intCrd && finite3(a.intCrd) ? a.intCrd.map(Math.fround) : null;
+    // `SA_CRDSRC`: a grafted motif atom carries its unindexed token's source id, any other
+    // coordinate-conditioned atom (and a grafted one whose token had none) its own `SA_SRC`
+    // (`_merge_indexed_coord_conditioning_into_src`); "." is unconditioned.
+    const own = arr.crd[i] || arr.internal[i] ? (a.srcComponent ?? '.') : '.';
+    const grafted = a.crdSrcComponent ?? '.';
+    arr.crdsrc[i] = (grafted !== '.' && a.condSource != null ? grafted : own) !== '.';
+    arr.pnUnit[i] = String(col('pn_unit_iid', tok) ?? arr.chainIid[i]);
+    arr.molIid[i] = String(col('molecule_iid', tok) ?? arr.chainIid[i]);
+    arr.molEntity[i] = String(col('molecule_entity', tok) ?? '');
   }
   arr.hasSec = input['condition_secondary-structure_1_residue'] !== undefined;
   arr.bonds = designBonds(arr, input);
@@ -224,21 +280,23 @@ function linkType(arr, i) {
  */
 function designBonds(arr, input) {
   const n = arr.n;
-  const keys = new Set();
+  const keys = new Map();
   const out = [];
-  const add = (i, j) => {
+  // A bond both lists carry takes the second list's type (biotite's `BondList.merge`).
+  const add = (i, j, type) => {
     const [a, b] = i < j ? [i, j] : [j, i];
     const key = a * n + b;
-    if (a === b || keys.has(key)) return;
-    keys.add(key);
-    out.push([a, b]);
+    if (a === b) return;
+    if (keys.has(key)) { out[keys.get(key)][2] = type; return; }
+    keys.set(key, out.length);
+    out.push([a, b, type]);
   };
   const outOf = new Map();
   for (let i = 0; i < n; i += 1) if (arr.inputIndex[i] >= 0) outOf.set(arr.inputIndex[i], i);
-  for (const [p, q] of input.bonds ?? []) {
+  for (const [p, q, type] of input.bonds ?? []) {
     const i = outOf.get(p);
     const j = outOf.get(q);
-    if (i !== undefined && j !== undefined) add(i, j);
+    if (i !== undefined && j !== undefined) add(i, j, type ?? BOND_TYPE.SINGLE);
   }
   let inserted = false;
   for (let i = 0; i < n; i += 1) if (arr.inputIndex[i] < 0 && !arr.atomize[i]) inserted = true;
@@ -251,10 +309,10 @@ function designBonds(arr, input) {
   st.push(sub.length);
   for (let r = 0; r + 1 < st.length; r += 1) {
     const atomsIn = sub.slice(st[r], st[r + 1]);
-    for (const [p, q] of STD_RESIDUE_BONDS[arr.resName[atomsIn[0]]] ?? []) {
+    for (const [p, q, type] of STD_RESIDUE_BONDS[arr.resName[atomsIn[0]]] ?? []) {
       for (const i of atomsIn) {
         if (arr.atomName[i] !== p) continue;
-        for (const j of atomsIn) if (arr.atomName[j] === q) add(i, j);
+        for (const j of atomsIn) if (arr.atomName[j] === q) add(i, j, type);
       }
     }
   }
@@ -270,7 +328,7 @@ function designBonds(arr, input) {
     else continue;
     const i = sub.slice(st[r], st[r + 1]).find((k) => arr.atomName[k] === names[0]);
     const j = sub.slice(st[r + 1], st[r + 2]).find((k) => arr.atomName[k] === names[1]);
-    if (i !== undefined && j !== undefined) add(i, j);
+    if (i !== undefined && j !== undefined) add(i, j, BOND_TYPE.SINGLE);
   }
   return out;
 }
@@ -687,6 +745,233 @@ function sequenceSimilarityToInput(arr, input) {
   return { sequence_identity_to_input: generated.filter((r, k) => r === given[k]).length / generated.length };
 }
 
+const PROTEIN_CHAINS = new Set([CHAIN_TYPE.POLYPEPTIDE_D, CHAIN_TYPE.POLYPEPTIDE_L, CHAIN_TYPE.CYCLIC_PSEUDO_PEPTIDE]);
+const NUCLEIC_CHAINS = new Set([CHAIN_TYPE.DNA, CHAIN_TYPE.RNA, CHAIN_TYPE.DNA_RNA_HYBRID]);
+const isInternalGroup = (g) => g != null && g !== -1 && g !== 0;
+const finiteAt = (c, i) => Number.isFinite(c[i * 3]) && Number.isFinite(c[i * 3 + 1]) && Number.isFinite(c[i * 3 + 2]);
+
+/** biotite's `superimpose(fixed, mobile)` over `idx`, as a function of a whole coordinate set. */
+function fitOnto(fixed, mobile, fixedIdx, mobileIdx) {
+  const f = new Float64Array(fixedIdx.length * 3);
+  const m = new Float64Array(mobileIdx.length * 3);
+  fixedIdx.forEach((i, k) => { for (let c = 0; c < 3; c += 1) f[k * 3 + c] = fixed[i * 3 + c]; });
+  mobileIdx.forEach((i, k) => { for (let c = 0; c < 3; c += 1) m[k * 3 + c] = mobile[i * 3 + c]; });
+  const { rotation: R, fixedCenter: fc, mobileCenter: mc } = superimposeCoords3D(f, m);
+  return (x, y, z) => {
+    const a = x - mc[0];
+    const b = y - mc[1];
+    const c = z - mc[2];
+    return [a * R[0] + b * R[1] + c * R[2] + fc[0], a * R[3] + b * R[4] + c * R[5] + fc[1],
+      a * R[6] + b * R[7] + c * R[8] + fc[2]];
+  };
+}
+
+/** Fit `reference` (per-atom triples) onto the array's coordinates over `atoms`, into `cwi`. */
+function stageGroup(arr, cwi, atoms, reference) {
+  const ref = new Float64Array(arr.n * 3);
+  for (const i of atoms) for (let c = 0; c < 3; c += 1) ref[i * 3 + c] = reference(i)[c];
+  const fit = fitOnto(arr.coord, ref, atoms, atoms);
+  for (const i of atoms) {
+    const [x, y, z] = fit(ref[i * 3], ref[i * 3 + 1], ref[i * 3 + 2]);
+    cwi[i * 3] = x; cwi[i * 3 + 1] = y; cwi[i * 3 + 2] = z;
+  }
+}
+
+/**
+ * `SA_CWI` (`coords-with-insertion`), the motif RMSD's reference, staged as upstream stages it:
+ * `process_single_sample_to_atom_array` (the coordinates, overlaid with C_CRD, each internal
+ * group's C_INTCRD fitted onto the design) for an indexed motif, then `annotate_unindexed_insertion`
+ * for an unindexed one (a grafted atom's motif coordinates, every internal group re-fitted whole
+ * over its coordinate-conditioned atoms, and the grafted ones invalidated if not every motif atom
+ * was placed). `null` where upstream stages none - and its metric raises.
+ */
+function coordsWithInsertion(arr, input, structure) {
+  const n = arr.n;
+  const idx = input.condition_index_1_residue;
+  const unindexed = [];
+  if (idx) for (let i = 0; i < idx.length; i += 1) if (!idx[i]) unindexed.push(i);
+  const own = (i) => arr.condSource[i] < 0;
+  const ownCrd = (i) => own(i) && arr.crd[i];
+  const ownInternal = (i) => own(i) && arr.internal[i];
+  const indexed = [...Array(n).keys()].some((i) => ownCrd(i) || ownInternal(i));
+  if (!indexed && unindexed.length === 0) return null;
+  const cwi = new Float64Array(n * 3).fill(NaN);
+  if (indexed) {
+    for (let i = 0; i < n * 3; i += 1) cwi[i] = arr.coord[i];
+    for (let i = 0; i < n; i += 1) if (ownCrd(i)) for (let c = 0; c < 3; c += 1) cwi[i * 3 + c] = arr.crdValue[i][c];
+    const groups = new Map();
+    for (let i = 0; i < n; i += 1) {
+      if (!ownInternal(i)) continue;
+      if (!groups.has(arr.coordGroup[i])) groups.set(arr.coordGroup[i], []);
+      groups.get(arr.coordGroup[i]).push(i);
+    }
+    for (const atoms of [...groups.entries()].sort((a, b) => a[0] - b[0]).map(([, v]) => v)) {
+      if (atoms.some((i) => !arr.intCrd[i])) throw new Error(`NaN values detected in input or generated coords for coord group ${arr.coordGroup[atoms[0]]}.`);
+      stageGroup(arr, cwi, atoms, (i) => arr.intCrd[i]);
+    }
+  }
+  if (unindexed.length === 0) return cwi;
+  // A proposed mapping that could not be applied drops the unindexed region, and the staging
+  // above is all there is; an applied (or empty) one is staged in full.
+  const proposed = Object.keys(structure.predictedInsertionMapping ?? {}).length > 0;
+  if (proposed && !arr.uii.some(Boolean)) return cwi;
+  const motif = (i) => arr.condSource[i] >= 0 && (arr.crdValue[i] !== null
+    || isInternalGroup(input.condition_CoordinateGroup_1_atom?.[arr.condSource[i]]));
+  let placed = 0;
+  for (let i = 0; i < n; i += 1) {
+    if (!motif(i)) continue;
+    placed += 1;
+    if (arr.crdValue[i]) for (let c = 0; c < 3; c += 1) cwi[i * 3 + c] = arr.crdValue[i][c];
+  }
+  const groups = new Map();
+  for (let i = 0; i < n; i += 1) {
+    if (!arr.crdsrc[i] || !isInternalGroup(arr.coordGroup[i])) continue;
+    if (!groups.has(arr.coordGroup[i])) groups.set(arr.coordGroup[i], []);
+    groups.get(arr.coordGroup[i]).push(i);
+  }
+  for (const atoms of [...groups.entries()].sort((a, b) => a[0] - b[0]).map(([, v]) => v)) {
+    if (atoms.some((i) => !arr.intCrd[i])) continue;  // upstream skips such a group, with a warning
+    stageGroup(arr, cwi, atoms, (i) => arr.intCrd[i]);
+  }
+  const crd = input.condition_coordinate_1_atom;
+  const expected = unindexed.filter((i) => (Array.isArray(crd?.[i]) && crd[i].every(Number.isFinite))
+    || isInternalGroup(input.condition_CoordinateGroup_1_atom?.[i])).length;
+  if (expected > 0 && placed !== expected) {
+    for (let i = 0; i < n; i += 1) if (motif(i)) for (let c = 0; c < 3; c += 1) cwi[i * 3 + c] = NaN;
+  }
+  return cwi;
+}
+
+/** A sub-array's atoms, bonds re-indexed: what a symmetry search over a slice of `arr` reads. */
+function sliceView(arr, atoms) {
+  const local = new Map(atoms.map((g, k) => [g, k]));
+  const pick = (f) => atoms.map((g) => arr[f][g]);
+  const bonds = [];
+  for (const [i, j, t] of arr.bonds) if (local.has(i) && local.has(j)) bonds.push([local.get(i), local.get(j), t]);
+  return { n: atoms.length, element: pick('element'), charge: pick('charge'), isPolymer: pick('isPolymer'),
+    chainId: pick('chainId'), chainIid: pick('chainIid'), resId: pick('resId'), insCode: pick('insCode'),
+    resName: pick('resName'), atomName: pick('atomName'), pnUnit: pick('pnUnit'), molIid: pick('molIid'),
+    molEntity: pick('molEntity'), bonds };
+}
+
+/**
+ * `structure_comparison_metric`: fit the prediction onto the ground truth over the align masks
+ * (each side's own, finite coordinates only) and take the RMSD over the subset masks, pairing
+ * the two sides' selected atoms in order. `null` where upstream returns nothing: the two sides
+ * select different counts, or nothing to fit.
+ */
+function structureComparison(gt, pred, gtAlign, predAlign, gtSubset, predSubset) {
+  const pick = (c, mask) => mask.flatMap((m, i) => (m && finiteAt(c, i) ? [i] : []));
+  const ga = pick(gt, gtAlign);
+  const pa = pick(pred, predAlign);
+  if (ga.length !== pa.length || ga.length === 0) return null;
+  const fit = fitOnto(gt, pred, ga, pa);
+  const moved = new Float64Array(pred.length);
+  for (let i = 0; i < pred.length / 3; i += 1) {
+    const [x, y, z] = fit(pred[i * 3], pred[i * 3 + 1], pred[i * 3 + 2]);
+    moved[i * 3] = x; moved[i * 3 + 1] = y; moved[i * 3 + 2] = z;
+  }
+  const gs = pick(gt, gtSubset);
+  const ps = pick(moved, predSubset);
+  if (gs.length !== ps.length) return null;
+  if (gs.length === 0) return { rmsd: NaN, n: 0 };
+  let sq = 0;
+  gs.forEach((g, k) => {
+    const p = ps[k];
+    for (let c = 0; c < 3; c += 1) {
+      const d = gt[g * 3 + c] - moved[p * 3 + c];
+      sq += d * d;
+    }
+  });
+  return { rmsd: Math.sqrt(sq / gs.length), n: gs.length };
+}
+
+/** `StructureComparisonMetric._atom_classes`: -1 outside the subset, when anything is. */
+const atomClasses = (subset) => (subset.every(Boolean) ? null : subset.map((m) => (m ? 0 : -1)));
+
+/**
+ * `design_motif_allatom_rmsd` and its unindexed twin: per `CoordinateGroup`, the motif atoms'
+ * ground truth (`SA_CWI`) resolved for identical subunits and equivalent atoms in the group's own
+ * frame, fitted and scored; the groups' RMSDs pooled atom-weighted.
+ */
+function motifRmsd(arr, cwi, selected) {
+  const values = [...new Set(arr.coordGroup)].sort((a, b) => a - b);
+  let total = 0;
+  let weighted = 0;
+  for (const value of values) {
+    const atoms = [];
+    for (let i = 0; i < arr.n; i += 1) if (arr.coordGroup[i] === value) atoms.push(i);
+    const view = sliceView(arr, atoms);
+    const pred = new Float64Array(atoms.length * 3);
+    let gt = new Float64Array(atoms.length * 3);
+    atoms.forEach((g, k) => {
+      for (let c = 0; c < 3; c += 1) { pred[k * 3 + c] = arr.coord[g * 3 + c]; gt[k * 3 + c] = cwi[g * 3 + c]; }
+    });
+    const mask = atoms.map((g) => selected(g));
+    gt = permuteGtSubunits(pred, gt, view, { frameMask: mask, scoreMask: mask, align: true });
+    gt = permuteGtAtoms(pred, gt, view, { atomClasses: atomClasses(mask), frameMask: mask });
+    const r = structureComparison(gt, pred, mask, mask, mask, mask);
+    if (!r || r.n === 0) continue;
+    total += r.n;
+    weighted += r.rmsd * r.rmsd * r.n;
+  }
+  return total > 0 ? { rmsd: Math.sqrt(weighted / total) } : {};
+}
+
+/**
+ * The array upstream hands a metric as its ground truth (`input_atom_array`): the input's
+ * indexed atoms, its multi-residue polymers' terminal OXT/OP3 dropped.
+ */
+function inputView(input) {
+  const total = input.atom_name.length;
+  const idx = input.condition_index_1_residue;
+  const kept = [];
+  for (let i = 0; i < total; i += 1) if (!idx || idx[i]) kept.push(i);
+  const chainOf = (i) => String(input.chain_iid?.[i] ?? input.chain_id[i]);
+  const residues = new Map();
+  kept.forEach((i, k) => {
+    const prev = kept[k - 1];
+    if (k === 0 || input.chain_id[i] !== input.chain_id[prev] || input.res_id[i] !== input.res_id[prev]
+      || (input.ins_code?.[i] ?? '') !== (input.ins_code?.[prev] ?? '')) {
+      residues.set(chainOf(i), (residues.get(chainOf(i)) ?? 0) + 1);
+    }
+  });
+  const atoms = kept.filter((i) => {
+    const terminal = (input.atom_name[i] === 'OXT' && PROTEIN_CHAINS.has(input.chain_type?.[i]))
+      || (input.atom_name[i] === 'OP3' && NUCLEIC_CHAINS.has(input.chain_type?.[i]));
+    return !(terminal && residues.get(chainOf(i)) > 1 && !input.atomize?.[i]);
+  });
+  const local = new Map(atoms.map((g, k) => [g, k]));
+  const bonds = [];
+  for (const [i, j, t] of input.bonds ?? []) {
+    if (local.has(i) && local.has(j)) bonds.push([local.get(i), local.get(j), t ?? BOND_TYPE.SINGLE]);
+  }
+  const pick = (f, d) => atoms.map((g) => input[f]?.[g] ?? d);
+  const coord = new Float64Array(atoms.length * 3);
+  atoms.forEach((g, k) => { for (let c = 0; c < 3; c += 1) coord[k * 3 + c] = Math.fround(Number(input.coord[g]?.[c] ?? NaN)); });
+  return { n: atoms.length, coord, element: pick('element', '').map((e) => String(e).toUpperCase()),
+    charge: pick('charge', 0).map(Number), isPolymer: pick('is_polymer', false).map(Boolean),
+    isProtein: pick('is_protein', false).map(Boolean), chainId: pick('chain_id', ''),
+    chainIid: atoms.map(chainOf), resId: pick('res_id', 0), insCode: pick('ins_code', ''),
+    resName: pick('res_name', ''), atomName: pick('atom_name', ''), pnUnit: pick('pn_unit_iid', '').map(String),
+    molIid: pick('molecule_iid', '').map(String), molEntity: pick('molecule_entity', '').map(String), bonds };
+}
+
+/** `ca_rmsd_to_input`: the design's protein CAs against the input's, after one fit. */
+function caRmsdToInput(arr, input) {
+  const gtView = inputView(input);
+  const gtCa = gtView.atomName.map((nm, i) => gtView.isProtein[i] && nm === 'CA');
+  const predCa = arr.atomName.map((nm, i) => arr.isProtein[i] && nm === 'CA');
+  const pred = Float64Array.from(arr.coord);
+  let gt = gtView.coord;
+  if (gtView.n === arr.n) {
+    gt = permuteGtSubunits(pred, gt, gtView, { frameMask: gtCa, scoreMask: gtCa, align: true });
+    gt = permuteGtAtoms(pred, gt, gtView, { atomClasses: atomClasses(gtCa), frameMask: gtCa });
+  }
+  const r = structureComparison(gt, pred, gtCa, predCa, gtCa, predCa);
+  return r ? { rmsd: r.rmsd } : {};
+}
+
 /**
  * Every metric this job's tags admit, keyed `<metric>.<value>` as upstream keys them, and the
  * pre-oracle filters over them.
@@ -699,6 +984,16 @@ export function designMetrics(structure, input, { metricsTags = [] } = {}) {
   const want = (name) => appliesToTags(METRIC_GATES[name], metricsTags);
   let ss = null;
   const sse = () => (ss ??= secondaryStructure(arr));
+  let cwi;
+  const motifReference = () => {
+    cwi ??= coordsWithInsertion(arr, input, structure);
+    if (cwi === null) {
+      throw new Error("a motif RMSD needs the design's coordinate-conditioned atoms, and this job has none: "
+        + "upstream raises here too ('coords-with-insertion' is never staged), so its "
+        + "'3d_coordinate_conditioning' / 'internal_coordinate_conditioning' / 'unindexed' tag does not apply");
+    }
+    return cwi;
+  };
   const compute = {
     amino_acid_composition: () => aminoAcidComposition(arr),
     bond_length_metrics: () => bondLengthMetrics(arr),
@@ -710,6 +1005,9 @@ export function designMetrics(structure, input, { metricsTags = [] } = {}) {
     sse_accuracy: () => sseAccuracy(arr, sse()),
     unindexed_insertion_mapping: () => unindexedInsertionMapping(arr, input, structure.predictedInsertionMapping),
     sequence_similarity_to_input: () => sequenceSimilarityToInput(arr, input),
+    design_motif_allatom_rmsd: () => motifRmsd(arr, motifReference(), (i) => arr.crdsrc[i]),
+    design_unindexed_motif_allatom_rmsd: () => motifRmsd(arr, motifReference(), (i) => arr.crdsrc[i] && arr.uii[i]),
+    ca_rmsd_to_input: () => caRmsdToInput(arr, input),
   };
   const metrics = {};
   for (const [name, fn] of Object.entries(compute)) {

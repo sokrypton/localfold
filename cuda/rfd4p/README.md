@@ -441,15 +441,18 @@ structure and its accuracy against `C_SEC`, the unindexed insertion mapping and 
 to the input - each under its own tag gate from `design_metrics.yaml`, keyed off the job's
 `metrics_tags` (plus the `partial_diffusion` upstream's generator adds to a run that starts from
 the input). 🔴 **UPSTREAM'S `rfd4-generate` COMPUTES NONE OF THIS UNLESS GIVEN A `metrics`
-CONFIG**, and an untagged job gets the composition and the unknown-residue filter alone; the page
-records `metrics_tags: ["design"]` in the job it saves, so the archive reproduces what it shows.
+CONFIG**, and an untagged job gets the composition and the unknown-residue filter alone. The page
+tags a design as upstream's own validation sets tag the task (`configs/datasets/val/`): `design`,
+plus `3d_coordinate_conditioning`, `internal_coordinate_conditioning`, `unindexed` and
+`hotspot_conditioning` where the job carries that conditioning (`conditioningMetricsTags`), and
+records them in the job it saves, so the archive reproduces what it shows.
 
 Held three ways. `tools/check-rfd4p-metrics.py` builds upstream's own batch for each dumped
 sample (handed the segment lengths this port realized), runs upstream's
 `process_single_sample_to_atom_array`, `annotate_unindexed_insertion` and its metric manager
 instantiated from its own YAML, and requires the same atoms, the same BONDS (the input's plus
 biotite's `connect_via_residue_names` when a generated residue added atoms - which the clash and
-bond metrics read), every value and the verdict: 11 designs, 0 differing, falsified by dropping
+bond metrics read, with their types), every value and the verdict: 14 designs, 0 differing, falsified by dropping
 the peptide links, the helix extension and a hotspot radius. gate.py's `metrics` arm holds the
 native file to the page's on the same samples, value for value; `featurise/gate-metrics.json` is
 the job built to reach hotspots, C_SEC and sequence probabilities, which no preset does.
@@ -461,10 +464,65 @@ per chain (the README section on the input structure has the details). And the n
 featuriser did not know upstream's `C_SEQ_PROB_<token>` condition names, then filled a fresh
 probability column with 0 instead of NaN, which constrains every residue.
 
-Not ported: the motif-RMSD family (`design_motif_allatom_rmsd`, its unindexed twin,
-`ca_rmsd_to_input`), which resolves chemically equivalent atoms and subunits by permutation
-before superposing - and `motif_rmsd_filter` and `insertion_rmsd_filter` read keys no upstream
-metric produces, so they are indeterminate on both sides.
+### The motif RMSDs, symmetry resolved first
+
+`design_motif_allatom_rmsd`, its unindexed twin and `ca_rmsd_to_input` are upstream's
+`StructureComparisonMetric`: per coordinate group, the motif's reference (`SA_CWI` - C_CRD for an
+absolute group, each internal group's C_INTCRD fitted onto the design, a grafted unindexed motif's
+own coordinates) is relabelled for identical subunits and for CHEMICALLY EQUIVALENT ATOMS before
+the fit, so an Asp whose oxygens came out swapped is not a motif failure; the groups' RMSDs are
+pooled atom-weighted. Which atoms are equivalent is atomworks' answer: the bond graph's
+automorphisms, unit by unit (a polymer residue, a non-polymer `pn_unit` whole), nodes coloured by
+element and heavy-atom degree, edges by a bond order RDKit normalises for resonance
+(shared/rfd4p/symmetry.js, `src/symmetry.h`).
+
+🔴 **RDKit's PART IS PORTED AS ITS RULES, AND HELD TO ATOMWORKS OVER THE DICTIONARY.** atomworks
+sanitises each unit in RDKit and equalises every aromatic and conjugated bond, then a centre's
+bonds to terminal same-element neighbours. The conjugation is RDKit's `markConjAtomBonds` on the
+Kekulé bonds with RDKit's implicit hydrogens - a unit is cut out of its chain and the cut filled -
+and one more rule mattered: an atom past every valence it is allowed fails sanitisation, and
+atomworks' `fix_mol` charges it (valence minus default valence) and keeps that only if every atom
+is then legal, else uses the molecule unsanitised with NOTHING conjugated. A four-bonded nitrogen
+becomes N+ and conjugates; a BODIPY's four-bonded neutral boron does not, and porting the first
+half alone took 4 of 3000 components the wrong way. `tools/check-rfd4p-automorphisms.py`
+(`upstream a` in the gate): **9,100 components over three seeded samples, 0 differing**; the 25
+with more than 1000 automorphisms keep 1000 on both sides but not the same thousand, which is
+networkx's VF2 order down to Python's set iteration and decides only an exact tie.
+
+Held to upstream on 14 designs (`upstream m`) and native to the page bit for bit (`metrics`):
+the presets, `gate-metrics.json`, `gate-groups-5o45.json` (an absolute group beside two internal
+ones) and `gate-partial-1brs.json` (`ca_rmsd_to_input`, on a design that keeps every input CA).
+Falsified by dropping the atom permutation (DNA and inverse folding move by 0.004-0.008 A) and the
+fit (0.586 A becomes 50 A). Two paths no gate design reaches: the pooled-versus-per-group split is
+a no-op whenever every group's reference sits in its own best frame (each is fitted there, so the
+pooled fit is the identity - measured equal to 1e-15), and the invalidation of a partially placed
+unindexed motif needs a design that grafts some of its motif tokens and not others.
+
+🔴 **IT FOUND THREE MORE DEFECTS.** The shared Kabsch (`superimposeCoords3D`, `src/superpose.h`)
+returned a REFLECTION whenever the best fit needed Kabsch's correction - see the superpose note
+above; 16.85 A where upstream's biotite fit gives 18.06 on the same 460 atoms. Both featurisers
+filled NaN internal coordinates through two job errors upstream refuses in its own words (a C_CRD
+atom moved into an internal group; a group with no live coordinates to take its shape from) -
+both are refusals now, in the gate's list. And a raw structure's partial diffusion can hand the
+encoder NaN side-chain coordinates under a set atom mask (6MRR, the cropped 5O45): upstream's
+batch has the same NaNs, so that is the input's, not the port's - which is why the gate's partial
+case is 1BRS.
+
+`motif_rmsd_filter` and `insertion_rmsd_filter` read keys no upstream metric produces, so they are
+indeterminate on both sides.
+
+**The coordinate-group rules upstream enforces, both ports now.** A C_CRDGRP group may not cover
+a C_CRD atom ("Coordinate group 0 must match absolute coordinate conditioning; modify C_CRD
+first"), a group needs live coordinates to take its shape from, and a C_CRD edit that breaks a
+saved group CLEARS its targets (`on_internal_coord_mismatch="clear"`) where a C_CRDGRP edit
+refuses. Three of the gate's own cases were jobs upstream refuses - `gate-crdgroups.json` and two
+synthetic CIFs in `check-cif.mjs` - held only to each other; each is rewritten into one upstream
+accepts, and the two refusals are in the gate's list.
+
+**The output frame takes three anchors or none**, as `align_atom_array_to_input_frame` does: a
+lone C_CRD ion no longer turns the design about itself. Its fallback anchor, the largest
+internal group, is not ported because it is the identity - that group's reference was fitted onto
+the design in the first place, so fitting the design back onto it moves nothing but rounding.
 
 ## Every preset generates
 
@@ -879,7 +937,7 @@ pinned checkpoint revision) found, and this round fixed:
     |---|---:|---:|---|
     | the eigenvectors not forced right-handed | **114** | 1.94 | every n |
     | U's third column as a third singular vector | **99** | 1.92 | every n |
-    | `det(H)`'s sign ignored | **90** | 1.92 | every n |
+    | `det(H)`'s sign ignored (🔴 the CORRECT one: see below) | **90** | 1.92 | every n |
     | the textbook Jacobi (two full matrix products) | **29** | 0.97 | **n = 2 only** |
     | a negative eigenvalue not clamped to zero | **0** | - | nowhere |
     | ...and the `sqrt`-site guard removed as well | **0** | - | nowhere |
@@ -895,6 +953,16 @@ pinned checkpoint revision) found, and this round fixed:
     connected and the second kills the first - and in slot 1 four times, where the clamped 0
     and the unclamped NaN both fail `sigma > 1e-9` and take the same complement branch. Three
     of the five are load-bearing at every point count; the file now says which.
+
+    🔴 **AND THE `det(H)` ONE WAS A BUG, THE SAME IN BOTH PORTS, SO THIS SWEEP PASSED IT.** With
+    V forced right-handed and U's third column a cross product, V U^T is already the best
+    PROPER rotation; flipping the third axis by `det(H)`'s sign made every reflected set's fit a
+    REFLECTION (det -1, an RMSD below what any rotation reaches). The sweep holds native to the
+    page, and both had the line. The motif RMSD found it - 16.85 where upstream's biotite fit
+    gives 18.06 on the same 460 atoms - and `test/rfd4p-superpose.test.js` now holds the page's
+    Kabsch to Horn's quaternion method, which shares none of its code. It reaches a design
+    wherever a fit is poor: the internal-coordinate group's reference and the input-frame
+    alignment of a design whose motif came out mirror-like.
 
     🔴 **AND THE WRITER EMITTED THE UNINDEXED TOKENS, 40 OF THEM AS `UNK`.** They are
     in-context conditioning that the sampler never generates, and the reference writes only the

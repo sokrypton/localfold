@@ -773,26 +773,48 @@ export function materializeInternalCoords(atoms, { internalCoordRotations = null
 
   const groups = ann['condition_CoordinateGroup_1_atom'];
   const payload = ann['condition_InternalCoordinate_1_atom'];
+  // 🔴 UPSTREAM'S `materialize_internal_coords` REFUSES FIVE THINGS BEFORE IT FILLS A GROUP, and
+  // this filled NaN through every one of them: a C_CRD target on an internal group's atom, a
+  // group with no live coordinates to take its shape from. Each is the reference's sentence.
+  const finite = (v) => Array.isArray(v) && Number.isFinite(v[0]) && Number.isFinite(v[1]) && Number.isFinite(v[2]);
+  const unset = (v) => !Array.isArray(v) || (Number.isNaN(v[0]) && Number.isNaN(v[1]) && Number.isNaN(v[2]));
+  if (groups.some((g) => g < -1)) {
+    throw new Error('Coordinate groups must be -1 (unknown), 0 (absolute), or positive (internal).');
+  }
+  if (groups.some((g) => g > 32767)) {
+    throw new Error('Coordinate group IDs must not exceed 32767 (the int16 model limit).');
+  }
+  const absolute = ann['condition_coordinate_1_atom'];
+  for (let i = 0; i < n; i++) {
+    const v = absolute?.[i];
+    if (!finite(v) && !unset(v)) {
+      throw new Error('Absolute coordinate targets must be entirely finite or entirely unset (NaN) per atom.');
+    }
+  }
+  for (let i = 0; i < n; i++) {
+    if (finite(absolute?.[i]) !== (groups[i] === 0)) {
+      throw new Error('Absolute coordinate targets must exist exactly on coordinate group 0.');
+    }
+  }
+  for (let i = 0; i < n; i++) {
+    if (!(groups[i] > 0) && !unset(payload[i])) {
+      throw new Error('Internal coordinate targets exist outside internal coordinate groups.');
+    }
+  }
   const internalGroupIds = [...new Set(groups.filter((g) => g > 0))].sort((a, b) => a - b);
   if (internalGroupIds.length === 0) return atoms;
 
   const prng = rng || createSeededRng(0);
   for (const gid of internalGroupIds) {
     const members = [];
-    let allFinite = true;
-    for (let i = 0; i < n; i++) {
-      if (groups[i] === gid) {
-        members.push(i);
-        if (
-          !Number.isFinite(payload[i][0]) ||
-          !Number.isFinite(payload[i][1]) ||
-          !Number.isFinite(payload[i][2])
-        ) {
-          allFinite = false;
-        }
-      }
+    for (let i = 0; i < n; i++) if (groups[i] === gid) members.push(i);
+    if (members.every((i) => finite(payload[i]))) continue;
+    if (!members.every((i) => unset(payload[i]))) {
+      throw new Error(`Coordinate group ${gid} has incomplete or nonfinite saved internal coordinate targets.`);
     }
-    if (allFinite || members.length === 0) continue;
+    if (!members.every((i) => finite(atoms.coord[i]))) {
+      throw new Error(`Coordinate group ${gid} needs finite live coordinates to materialize its targets.`);
+    }
 
     let mx = 0, my = 0, mz = 0;
     for (const i of members) {

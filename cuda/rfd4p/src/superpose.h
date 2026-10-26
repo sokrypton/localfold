@@ -110,16 +110,19 @@ inline double det3(const double m[9]) {
 /**
  * `superimposeCoords3D`: the rotation and the two centroids that put `mobile` onto `fixed`.
  *
- * 🔴 THE THIRD COLUMN OF U IS A CROSS PRODUCT, NOT A THIRD SINGULAR VECTOR, and the reflection
- * is fixed by the SIGN OF det(H) applied to V's third column. Building all three from the
- * eigendecomposition and then "fixing the determinant" is the usual recipe and is NOT this one:
- * where the smallest singular value is near zero its vector is numerical noise, and the cross
- * product is defined there while the eigenvector is not.
+ * 🔴 THE THIRD COLUMN OF U IS A CROSS PRODUCT, NOT A THIRD SINGULAR VECTOR, and with V forced
+ * right-handed that makes V U^T a PROPER rotation by construction - the Kabsch correction is the
+ * cross product. Building all three from the eigendecomposition and then "fixing the
+ * determinant" is the usual recipe and is NOT this one: where the smallest singular value is
+ * near zero its vector is numerical noise, and the cross product is defined there while the
+ * eigenvector is not. The third singular vector in place of the cross product is **99 of the
+ * gate's 240 point sets differing**, moving a rotation element by up to 1.92.
  *
- * Both halves measured one at a time on the gate's 240 point sets, at every point count from 2
- * to 200: the third singular vector in place of the cross product is **99 differing**, and
- * taking det(H)'s sign as always positive is **90**, each moving a rotation element by up to
- * 1.92. These two are load-bearing where two of jacobiEigen's three are not.
+ * 🔴 AND THERE IS NO det(H) SIGN. This applied one to V's third column, as output.js did, and
+ * on every reflected set it returned a REFLECTION (det -1, an RMSD below what any rotation
+ * reaches): the motif RMSD found it, at 16.85 where upstream's biotite fit gives 18.06 on the
+ * same points. The sweep could not, holding this to the page's identical line;
+ * test/rfd4p-superpose.test.js holds the page's to Horn's quaternion method instead.
  */
 inline Fit superimpose(const vector<double>& fixed, const vector<double>& mobile) {
   Fit out;
@@ -178,11 +181,14 @@ inline Fit superimpose(const vector<double>& fixed, const vector<double>& mobile
   U[1 * 3 + 2] = U[2 * 3 + 0] * U[0 * 3 + 1] - U[0 * 3 + 0] * U[2 * 3 + 1];
   U[2 * 3 + 2] = U[0 * 3 + 0] * U[1 * 3 + 1] - U[1 * 3 + 0] * U[0 * 3 + 1];
 
-  const double sign = det3(h) >= 0 ? 1.0 : -1.0;
+  // 🔴 NO det(H) SIGN: V is right-handed and U's third column is a cross product, so V U^T is
+  // the best PROPER rotation already. The sign this took from det(H) made it a reflection exactly
+  // when Kabsch's correction mattered - and the page's had the same line, so the sweep holding
+  // the two to each other could not see it (output.js, `superimposeCoords3D`).
   for (int r = 0; r < 3; ++r) {
     for (int c = 0; c < 3; ++c) {
       out.R[r * 3 + c] = V[r * 3 + 0] * U[c * 3 + 0] + V[r * 3 + 1] * U[c * 3 + 1] +
-                         sign * V[r * 3 + 2] * U[c * 3 + 2];
+                         V[r * 3 + 2] * U[c * 3 + 2];
     }
   }
   out.ok = true;

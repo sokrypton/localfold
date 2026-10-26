@@ -1184,6 +1184,11 @@ function metricsSummary(c) {
   if (sse !== null) parts.push(`secondary structure as asked ${sse}`);
   const hot = pct(m["hotspot_obedience.hotspot_obedience"]);
   if (hot !== null) parts.push(`hotspots contacted ${hot}`);
+  const angstrom = (v) => (Number.isFinite(v) ? `${v.toFixed(2)} Å` : null);
+  const motif = angstrom(m["design_motif_allatom_rmsd.rmsd"]);
+  if (motif !== null) parts.push(`motif RMSD ${motif}`);
+  const toInput = angstrom(m["ca_rmsd_to_input.rmsd"]);
+  if (toInput !== null) parts.push(`CA RMSD to the input ${toInput}`);
   return parts.join(" · ");
 }
 // tools/check-design-page.py reads the members it would download and folds the job natively.

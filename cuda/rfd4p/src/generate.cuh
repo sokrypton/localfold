@@ -538,7 +538,8 @@ inline void alignToInputFrame(GenOut& g, int n, const float* condCoord, const fl
       }
     }
   }
-  if (anchors.empty()) return;
+  // Three anchors or none, as upstream's `anchor_mask.sum() < 3` (output.js has the note).
+  if (anchors.size() < 3) return;
   std::vector<double> fixed, mobile;
   for (const int s : anchors) {
     for (int k = 0; k < 3; ++k) {
@@ -587,6 +588,12 @@ struct AtomRecord {
   // its residue-level ones come from, and its coordinate conditioning.
   int token = -1, inAt = -1, condAt = -1, resTok = -1;
   bool atomized = false, crd = false, internal = false;
+  // ...and for the motif RMSDs: whether the atom was grafted, its live coordinate group, the
+  // input atoms its C_CRD and C_INTCRD values come from (-1 for none), and its own residue's
+  // source component (`srcComp` above is the coordinate-conditioned region's, a grafted motif's).
+  bool grafted = false;
+  int group = -1, crdAt = -1, intAt = -1;
+  std::string ownSrc = ".";
 };
 
 inline std::vector<AtomRecord> buildRecords(const GenOut& g, int n, const std::vector<int>& chainOf,
@@ -641,6 +648,10 @@ inline std::vector<AtomRecord> buildRecords(const GenOut& g, int n, const std::v
       r.atomized = true;
       r.crd = finite3(condCoord, at);
       r.internal = group((int)at) != -1 && group((int)at) != 0;
+      r.group = group((int)at);
+      r.crdAt = finite3(condCoord, at) ? (int)at : -1;
+      r.intAt = finite3(condIntCrd, at) ? (int)at : -1;
+      r.ownSrc = srcCompOf(i);
       place(r, 1);
       out.push_back(r);
       continue;
@@ -685,6 +696,11 @@ inline std::vector<AtomRecord> buildRecords(const GenOut& g, int n, const std::v
       r.crd = (is >= 0 && finite3(condCoord, ia)) || (from >= 0 && finite3(condCoord, from));
       const int cg = from >= 0 && group(from) != -1 ? group(from) : group(r.inAt);
       r.internal = cg != -1 && cg != 0;
+      r.grafted = from >= 0;
+      r.group = cg;
+      r.crdAt = from >= 0 && finite3(condCoord, from) ? from : (is >= 0 && finite3(condCoord, ia) ? (int)ia : -1);
+      r.intAt = from >= 0 && finite3(condIntCrd, from) ? from : (is >= 0 && finite3(condIntCrd, ia) ? (int)ia : -1);
+      r.ownSrc = srcResidue;
       place(r, slot);
       out.push_back(r);
     }

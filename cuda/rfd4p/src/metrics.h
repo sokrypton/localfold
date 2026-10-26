@@ -11,8 +11,13 @@
  */
 #include "generate.cuh"
 #include "metrics_tags.h"
+#include "superpose.h"
+#include "symmetry.h"
 #include "../../featurise/jsmath.h"
+#include <array>
+#include <cstring>
 #include <functional>
+#include <stdexcept>
 #include <map>
 #include <memory>
 #include <set>
@@ -28,11 +33,18 @@ struct Inputs {
   std::vector<int> seq;        // 2 words a token
   std::vector<float> seqProb;  // 28 a token
   std::vector<int> hot;        // a token x 37
-  std::vector<int> bonds;      // (token * 37 + slot) pairs
   std::vector<int> resName;    // 2 words a token, the input's residue name
   const int* condIndex = nullptr;   // a token x 37
   int nTokens = 0;
+  // For the motif RMSDs: per token its pn_unit (4 words) and molecule and entity (2); every input
+  // atom (`IN_ATOM_WORDS` each, export_input.mjs has the layout); the input's bonds as (atom,
+  // atom, type); and the conditioning a token x 37: C_CRD, C_INTCRD and the coordinate group.
+  std::vector<int> pnUnit, tokMol, inAtom, inBonds;
+  const float* condCoord = nullptr;
+  const float* condIntCrd = nullptr;
+  const int* coordGroup = nullptr;
 };
+constexpr int IN_ATOM_WORDS = 24;
 
 static const char* MASKED = "<M>";
 static const char* STANDARD_AA[] = {"ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE",
@@ -73,6 +85,14 @@ struct Array {
   std::vector<uint8_t> isPolymer, isProtein, atomize, crd, internal, hot, uii, hasInput;
   std::vector<std::array<float, 28>> seqProb;
   std::vector<std::pair<int, int>> bonds;
+  std::vector<int> bondType;   // beside `bonds`
+  // The motif RMSDs' (metrics.js has each): charge, live coordinate group, `SA_CRDSRC`, the
+  // pn_unit / molecule / entity, whether grafted (and from which input atom), and the C_CRD and
+  // C_INTCRD values (NaN where none).
+  std::vector<int> charge, coordGroup, molIid, molEntity, condAt;
+  std::vector<uint8_t> crdsrc, grafted;
+  std::vector<std::string> pnUnit;
+  std::vector<std::array<double, 3>> crdValue, intCrd;
 };
 
 inline float dist32(const std::vector<float>& c, int i, int j) {
@@ -107,17 +127,25 @@ inline std::string linkType(const Array& a, int i) {
 
 /** The array's bonds: the input's between surviving atoms, plus biotite's residue bonds and links. */
 inline void designBonds(Array& a, const std::vector<AtomRecord>& rec, const Inputs& in) {
-  std::set<std::pair<int, int>> seen;
-  auto add = [&](int i, int j) {
+  std::map<std::pair<int, int>, size_t> seen;
+  // A bond both lists carry takes the second list's type (biotite's `BondList.merge`).
+  auto add = [&](int i, int j, int type) {
     if (i == j) return;
     const std::pair<int, int> key = i < j ? std::make_pair(i, j) : std::make_pair(j, i);
-    if (seen.insert(key).second) a.bonds.push_back(key);
+    const auto it = seen.find(key);
+    if (it != seen.end()) { a.bondType[it->second] = type; return; }
+    seen[key] = a.bonds.size();
+    a.bonds.push_back(key);
+    a.bondType.push_back(type);
   };
   std::map<int, int> outOf;
   for (int i = 0; i < a.n; ++i) if (rec[i].inAt >= 0) outOf[rec[i].inAt] = i;
-  for (size_t k = 0; k + 1 < in.bonds.size(); k += 2) {
-    const auto p = outOf.find(in.bonds[k]), q = outOf.find(in.bonds[k + 1]);
-    if (p != outOf.end() && q != outOf.end()) add(p->second, q->second);
+  for (size_t k = 0; k + 2 < in.inBonds.size(); k += 3) {
+    const int sp = in.inAtom[(size_t)in.inBonds[k] * IN_ATOM_WORDS];
+    const int sq = in.inAtom[(size_t)in.inBonds[k + 1] * IN_ATOM_WORDS];
+    if (sp < 0 || sq < 0) continue;
+    const auto p = outOf.find(sp), q = outOf.find(sq);
+    if (p != outOf.end() && q != outOf.end()) add(p->second, q->second, in.inBonds[k + 2]);
   }
   bool inserted = false;
   for (int i = 0; i < a.n; ++i) if (rec[i].inAt < 0 && !a.atomize[i]) inserted = true;
@@ -137,12 +165,11 @@ inline void designBonds(Array& a, const std::vector<AtomRecord>& rec, const Inpu
     const auto it = tables::STD_RESIDUE_BONDS.find(a.resName[sub[st[r]]]);
     if (it == tables::STD_RESIDUE_BONDS.end()) continue;
     for (const auto& [pair, type] : it->second) {
-      (void)type;
       const size_t colon = pair.find(':');
       const std::string p = pair.substr(0, colon), q = pair.substr(colon + 1);
       for (int x = st[r]; x < st[r + 1]; ++x) {
         if (a.atomName[sub[x]] != p) continue;
-        for (int y = st[r]; y < st[r + 1]; ++y) if (a.atomName[sub[y]] == q) add(sub[x], sub[y]);
+        for (int y = st[r]; y < st[r + 1]; ++y) if (a.atomName[sub[y]] == q) add(sub[x], sub[y], type);
       }
     }
   }
@@ -157,7 +184,7 @@ inline void designBonds(Array& a, const std::vector<AtomRecord>& rec, const Inpu
     int i = -1, j = -1;
     for (int x = st[r]; x < st[r + 1] && i < 0; ++x) if (a.atomName[sub[x]] == c) i = sub[x];
     for (int x = st[r + 1]; x < st[r + 2] && j < 0; ++x) if (a.atomName[sub[x]] == nn) j = sub[x];
-    if (i >= 0 && j >= 0) add(i, j);
+    if (i >= 0 && j >= 0) add(i, j, 1);
   }
 }
 
@@ -195,6 +222,23 @@ inline Array designArray(const std::vector<AtomRecord>& rec, const Inputs& in) {
     a.seqProb.push_back(p);
     a.uii.push_back(r.unindexedInsertion);
     a.hasInput.push_back(r.inAt >= 0);
+    a.charge.push_back(r.charge);
+    a.coordGroup.push_back(r.group);
+    a.grafted.push_back(r.grafted);
+    a.condAt.push_back(r.condAt);
+    // `SA_CRDSRC` (metrics.js): a grafted motif atom's region, else its own residue's component
+    // where it is coordinate-conditioned.
+    const std::string region = r.grafted && r.srcComp != "." ? r.srcComp : (r.crd || r.internal ? r.ownSrc : ".");
+    a.crdsrc.push_back(region != ".");
+    a.pnUnit.push_back(in.pnUnit.empty() ? a.chainIid.back() : unpackString(&in.pnUnit[(size_t)r.token * 4], 4));
+    a.molIid.push_back(in.tokMol.empty() ? 0 : in.tokMol[(size_t)r.token * 2]);
+    a.molEntity.push_back(in.tokMol.empty() ? 0 : in.tokMol[(size_t)r.token * 2 + 1]);
+    auto value = [&](const float* t, int at) {
+      if (!t || at < 0) return std::array<double, 3>{NAN, NAN, NAN};
+      return std::array<double, 3>{(double)t[(size_t)at * 3], (double)t[(size_t)at * 3 + 1], (double)t[(size_t)at * 3 + 2]};
+    };
+    a.crdValue.push_back(value(in.condCoord, r.crdAt));
+    a.intCrd.push_back(value(in.condIntCrd, r.intAt));
   }
   designBonds(a, rec, in);
   return a;
@@ -619,6 +663,293 @@ inline Values sequenceSimilarityToInput(const Array& a, const Inputs& in) {
   return {{"sequence_identity_to_input", (double)same / generated.size()}};
 }
 
+// ---- The motif RMSDs (metrics.js has every note) ----------------------------------------------
+
+inline bool internalGroup(int g) { return g != -1 && g != 0; }
+inline bool finite3d(const std::array<double, 3>& v) {
+  return std::isfinite(v[0]) && std::isfinite(v[1]) && std::isfinite(v[2]);
+}
+
+/** `fitOnto`: biotite's `superimpose(fixed, mobile)` over two index lists, as a map. */
+struct FitMap {
+  superpose::Fit f;
+  std::array<double, 3> operator()(double x, double y, double z) const {
+    const double a = x - f.mobileCenter[0], b = y - f.mobileCenter[1], c = z - f.mobileCenter[2];
+    const double* R = f.R;
+    return {a * R[0] + b * R[1] + c * R[2] + f.fixedCenter[0], a * R[3] + b * R[4] + c * R[5] + f.fixedCenter[1],
+            a * R[6] + b * R[7] + c * R[8] + f.fixedCenter[2]};
+  }
+};
+inline FitMap fitOnto(const std::vector<double>& fixed, const std::vector<double>& mobile,
+                      const std::vector<int>& fixedIdx, const std::vector<int>& mobileIdx) {
+  std::vector<double> f, m;
+  for (const int i : fixedIdx) for (int c = 0; c < 3; ++c) f.push_back(fixed[(size_t)i * 3 + c]);
+  for (const int i : mobileIdx) for (int c = 0; c < 3; ++c) m.push_back(mobile[(size_t)i * 3 + c]);
+  return FitMap{superpose::superimpose(f, m)};
+}
+
+inline void stageGroup(const Array& a, std::vector<double>& cwi, const std::vector<int>& atoms) {
+  std::vector<double> coord(a.coord.begin(), a.coord.end());
+  std::vector<double> ref((size_t)a.n * 3, 0.0);
+  for (const int i : atoms) for (int c = 0; c < 3; ++c) ref[(size_t)i * 3 + c] = a.intCrd[i][c];
+  const FitMap fit = fitOnto(coord, ref, atoms, atoms);
+  for (const int i : atoms) {
+    const auto v = fit(ref[(size_t)i * 3], ref[(size_t)i * 3 + 1], ref[(size_t)i * 3 + 2]);
+    for (int c = 0; c < 3; ++c) cwi[(size_t)i * 3 + c] = v[c];
+  }
+}
+
+template <class Pred>
+inline std::vector<std::vector<int>> groupsBy(const Array& a, Pred keep) {
+  std::map<int, std::vector<int>> groups;
+  for (int i = 0; i < a.n; ++i) if (keep(i)) groups[a.coordGroup[i]].push_back(i);
+  std::vector<std::vector<int>> out;
+  for (auto& [g, v] : groups) { (void)g; out.push_back(v); }
+  return out;
+}
+
+/** `coordsWithInsertion`: `SA_CWI`, or nothing where upstream stages none. */
+inline bool coordsWithInsertion(const Array& a, const Inputs& in, const Insertion& proposed,
+                                std::vector<double>& cwi) {
+  const int n = a.n;
+  // The input's unindexed atoms, and how many of them carry a coordinate (flag bits 1 and 16).
+  int unindexedAtoms = 0, expected = 0;
+  for (size_t i = 0; i < in.inAtom.size() / IN_ATOM_WORDS; ++i) {
+    const int flags = in.inAtom[i * IN_ATOM_WORDS + 1];
+    if (flags & 1) continue;
+    ++unindexedAtoms;
+    if (flags & 16) ++expected;
+  }
+  auto ownCrd = [&](int i) { return !a.grafted[i] && a.crd[i]; };
+  auto ownInternal = [&](int i) { return !a.grafted[i] && a.internal[i]; };
+  bool indexed = false;
+  for (int i = 0; i < n; ++i) indexed = indexed || ownCrd(i) || ownInternal(i);
+  if (!indexed && unindexedAtoms == 0) return false;
+  cwi.assign((size_t)n * 3, NAN);
+  if (indexed) {
+    for (int i = 0; i < n * 3; ++i) cwi[i] = a.coord[i];
+    for (int i = 0; i < n; ++i) if (ownCrd(i)) for (int c = 0; c < 3; ++c) cwi[(size_t)i * 3 + c] = a.crdValue[i][c];
+    for (const auto& atoms : groupsBy(a, ownInternal)) {
+      for (const int i : atoms) {
+        if (!finite3d(a.intCrd[i])) {
+          throw std::runtime_error("NaN values detected in input or generated coords for coord group " +
+                                   std::to_string(a.coordGroup[atoms[0]]) + ".");
+        }
+      }
+      stageGroup(a, cwi, atoms);
+    }
+  }
+  if (unindexedAtoms == 0) return true;
+  bool anyUii = false, anyProposed = false;
+  for (int i = 0; i < n; ++i) anyUii = anyUii || a.uii[i];
+  for (const int t : proposed.target) anyProposed = anyProposed || t >= 0;
+  if (anyProposed && !anyUii) return true;
+  auto motif = [&](int i) {
+    return a.grafted[i] && (finite3d(a.crdValue[i]) || (in.coordGroup && internalGroup(in.coordGroup[a.condAt[i]])));
+  };
+  int placed = 0;
+  for (int i = 0; i < n; ++i) {
+    if (!motif(i)) continue;
+    ++placed;
+    if (finite3d(a.crdValue[i])) for (int c = 0; c < 3; ++c) cwi[(size_t)i * 3 + c] = a.crdValue[i][c];
+  }
+  for (const auto& atoms : groupsBy(a, [&](int i) { return a.crdsrc[i] && internalGroup(a.coordGroup[i]); })) {
+    bool complete = true;
+    for (const int i : atoms) complete = complete && finite3d(a.intCrd[i]);
+    if (!complete) continue;
+    stageGroup(a, cwi, atoms);
+  }
+  if (expected > 0 && placed != expected) {
+    for (int i = 0; i < n; ++i) if (motif(i)) for (int c = 0; c < 3; ++c) cwi[(size_t)i * 3 + c] = NAN;
+  }
+  return true;
+}
+
+/** `sliceView`. */
+inline symmetry::View sliceView(const Array& a, const std::vector<int>& atoms) {
+  symmetry::View v;
+  v.n = (int)atoms.size();
+  std::map<int, int> local;
+  for (size_t k = 0; k < atoms.size(); ++k) local[atoms[k]] = (int)k;
+  for (const int g : atoms) {
+    v.element.push_back(a.element[g]);
+    v.charge.push_back(a.charge[g]);
+    v.isPolymer.push_back(a.isPolymer[g]);
+    v.chainId.push_back(a.chainId[g]);
+    v.chainIid.push_back(a.chainIid[g]);
+    v.resId.push_back(a.resId[g]);
+    v.insCode.push_back(a.insCode[g]);
+    v.resName.push_back(a.resName[g]);
+    v.atomName.push_back(a.atomName[g]);
+    v.pnUnit.push_back(a.pnUnit[g]);
+    v.molIid.push_back(a.molIid[g]);
+    v.molEntity.push_back(a.molEntity[g]);
+  }
+  for (size_t k = 0; k < a.bonds.size(); ++k) {
+    const auto p = local.find(a.bonds[k].first), q = local.find(a.bonds[k].second);
+    if (p != local.end() && q != local.end()) v.bonds.push_back({p->second, q->second, a.bondType[k]});
+  }
+  return v;
+}
+
+struct Comparison { bool ok = false; double rmsd = NAN; int n = 0; };
+
+/** `structureComparison`. */
+inline Comparison structureComparison(const std::vector<double>& gt, const std::vector<double>& pred,
+                                      const std::vector<uint8_t>& gtAlign, const std::vector<uint8_t>& predAlign,
+                                      const std::vector<uint8_t>& gtSubset, const std::vector<uint8_t>& predSubset) {
+  auto pick = [](const std::vector<double>& c, const std::vector<uint8_t>& mask) {
+    std::vector<int> out;
+    for (size_t i = 0; i < mask.size(); ++i) if (mask[i] && symmetry::finiteAt(c, (int)i)) out.push_back((int)i);
+    return out;
+  };
+  Comparison r;
+  const std::vector<int> ga = pick(gt, gtAlign), pa = pick(pred, predAlign);
+  if (ga.size() != pa.size() || ga.empty()) return r;
+  const FitMap fit = fitOnto(gt, pred, ga, pa);
+  std::vector<double> moved(pred.size());
+  for (size_t i = 0; i < pred.size() / 3; ++i) {
+    const auto v = fit(pred[i * 3], pred[i * 3 + 1], pred[i * 3 + 2]);
+    for (int c = 0; c < 3; ++c) moved[i * 3 + c] = v[c];
+  }
+  const std::vector<int> gs = pick(gt, gtSubset), ps = pick(moved, predSubset);
+  if (gs.size() != ps.size()) return r;
+  r.ok = true;
+  if (gs.empty()) return r;
+  double sq = 0;
+  for (size_t k = 0; k < gs.size(); ++k) {
+    for (int c = 0; c < 3; ++c) {
+      const double d = gt[(size_t)gs[k] * 3 + c] - moved[(size_t)ps[k] * 3 + c];
+      sq += d * d;
+    }
+  }
+  r.rmsd = std::sqrt(sq / gs.size());
+  r.n = (int)gs.size();
+  return r;
+}
+
+inline std::vector<int> classesOf(const std::vector<uint8_t>& subset) {
+  bool all = true;
+  for (const uint8_t m : subset) all = all && m;
+  if (all) return {};
+  std::vector<int> c(subset.size());
+  for (size_t i = 0; i < subset.size(); ++i) c[i] = subset[i] ? 0 : -1;
+  return c;
+}
+
+/** `motifRmsd`. */
+template <class Sel>
+inline Values motifRmsd(const Array& a, const std::vector<double>& cwi, Sel selected) {
+  std::set<int> values(a.coordGroup.begin(), a.coordGroup.end());
+  int total = 0;
+  double weighted = 0;
+  for (const int value : values) {
+    std::vector<int> atoms;
+    for (int i = 0; i < a.n; ++i) if (a.coordGroup[i] == value) atoms.push_back(i);
+    const symmetry::View view = sliceView(a, atoms);
+    std::vector<double> pred(atoms.size() * 3), gt(atoms.size() * 3);
+    std::vector<uint8_t> mask(atoms.size());
+    for (size_t k = 0; k < atoms.size(); ++k) {
+      for (int c = 0; c < 3; ++c) {
+        pred[k * 3 + c] = a.coord[(size_t)atoms[k] * 3 + c];
+        gt[k * 3 + c] = cwi[(size_t)atoms[k] * 3 + c];
+      }
+      mask[k] = selected(atoms[k]);
+    }
+    gt = symmetry::permuteGtSubunits(pred, gt, view, mask, mask, true);
+    const std::vector<int> classes = classesOf(mask);
+    gt = symmetry::permuteGtAtoms(pred, gt, view, classes.empty() ? nullptr : &classes, &mask);
+    const Comparison r = structureComparison(gt, pred, mask, mask, mask, mask);
+    if (!r.ok || r.n == 0) continue;
+    total += r.n;
+    weighted += r.rmsd * r.rmsd * r.n;
+  }
+  if (total == 0) return {};
+  return {{"rmsd", std::sqrt(weighted / total)}};
+}
+
+/** `inputView`: the input's indexed atoms, multi-residue polymers' terminal OXT/OP3 dropped. */
+inline symmetry::View inputView(const Inputs& in, std::vector<double>& coord, std::vector<uint8_t>& isProtein) {
+  const int total = (int)(in.inAtom.size() / IN_ATOM_WORDS);
+  auto row = [&](int i) { return &in.inAtom[(size_t)i * IN_ATOM_WORDS]; };
+  auto text = [&](int i, int at, int words) { return unpackString(row(i) + at, words); };
+  std::vector<int> kept;
+  for (int i = 0; i < total; ++i) if (row(i)[1] & 1) kept.push_back(i);
+  // Words: 0 slot, 1 flags, 2 chain type, 3 charge, 4 residue id, 5-7 coordinates, 8 atom name,
+  // 9-10 residue name, 11 element, 12 chain, 13 insertion code, 14-17 chain instance,
+  // 18-21 pn_unit, 22 molecule, 23 entity.
+  std::map<std::string, int> residues;
+  for (size_t k = 0; k < kept.size(); ++k) {
+    const int i = kept[k];
+    if (k == 0 || text(i, 12, 1) != text(kept[k - 1], 12, 1) || row(i)[4] != row(kept[k - 1])[4] ||
+        text(i, 13, 1) != text(kept[k - 1], 13, 1)) {
+      ++residues[text(i, 14, 4)];
+    }
+  }
+  auto protein = [](int t) { return t == 5 || t == 6 || t == 0; };
+  auto nucleic = [](int t) { return t == 3 || t == 7 || t == 4; };
+  std::vector<int> atoms;
+  for (const int i : kept) {
+    const std::string name = text(i, 8, 1);
+    const int type = row(i)[2];
+    const bool terminal = (name == "OXT" && protein(type)) || (name == "OP3" && nucleic(type));
+    if (terminal && residues[text(i, 14, 4)] > 1 && !(row(i)[1] & 2)) continue;
+    atoms.push_back(i);
+  }
+  symmetry::View v;
+  v.n = (int)atoms.size();
+  std::map<int, int> local;
+  coord.assign(atoms.size() * 3, NAN);
+  isProtein.assign(atoms.size(), 0);
+  for (size_t k = 0; k < atoms.size(); ++k) {
+    const int i = atoms[k];
+    const int* r = row(i);
+    local[i] = (int)k;
+    for (int c = 0; c < 3; ++c) {
+      float f;
+      memcpy(&f, &r[5 + c], 4);
+      coord[k * 3 + c] = f;
+    }
+    isProtein[k] = (r[1] & 4) != 0;
+    v.element.push_back(text(i, 11, 1));
+    v.charge.push_back(r[3]);
+    v.isPolymer.push_back((r[1] & 8) != 0);
+    v.chainId.push_back(text(i, 12, 1));
+    v.chainIid.push_back(text(i, 14, 4));
+    v.resId.push_back(r[4]);
+    v.insCode.push_back(text(i, 13, 1));
+    v.resName.push_back(text(i, 9, 2));
+    v.atomName.push_back(text(i, 8, 1));
+    v.pnUnit.push_back(text(i, 18, 4));
+    v.molIid.push_back(r[22]);
+    v.molEntity.push_back(r[23]);
+  }
+  for (size_t k = 0; k + 2 < in.inBonds.size(); k += 3) {
+    const auto p = local.find(in.inBonds[k]), q = local.find(in.inBonds[k + 1]);
+    if (p != local.end() && q != local.end()) v.bonds.push_back({p->second, q->second, in.inBonds[k + 2]});
+  }
+  return v;
+}
+
+/** `ca_rmsd_to_input`. */
+inline Values caRmsdToInput(const Array& a, const Inputs& in) {
+  std::vector<double> gt;
+  std::vector<uint8_t> gtProtein;
+  const symmetry::View gtView = inputView(in, gt, gtProtein);
+  std::vector<uint8_t> gtCa(gtView.n), predCa(a.n);
+  for (int i = 0; i < gtView.n; ++i) gtCa[i] = gtProtein[i] && gtView.atomName[i] == "CA";
+  for (int i = 0; i < a.n; ++i) predCa[i] = a.isProtein[i] && a.atomName[i] == "CA";
+  const std::vector<double> pred(a.coord.begin(), a.coord.end());
+  if (gtView.n == a.n) {
+    gt = symmetry::permuteGtSubunits(pred, gt, gtView, gtCa, gtCa, true);
+    const std::vector<int> classes = classesOf(gtCa);
+    gt = symmetry::permuteGtAtoms(pred, gt, gtView, classes.empty() ? nullptr : &classes, &gtCa);
+  }
+  const Comparison r = structureComparison(gt, pred, gtCa, predCa, gtCa, predCa);
+  if (!r.ok) return {};
+  return {{"rmsd", r.rmsd}};
+}
+
 struct Gate { std::vector<std::string> any, all, no; };
 inline bool applies(const Gate& g, const std::vector<std::string>& tags) {
   auto has = [&](const std::string& t) { return std::find(tags.begin(), tags.end(), t) != tags.end(); };
@@ -647,6 +978,20 @@ inline Result designMetrics(const std::vector<AtomRecord>& rec, const Inputs& in
   Result out;
   std::unique_ptr<Secondary> ss;
   auto sse = [&]() -> const Secondary& { if (!ss) ss.reset(new Secondary(secondaryStructure(a))); return *ss; };
+  std::vector<double> cwi;
+  bool staged = false;
+  auto motifReference = [&]() -> const std::vector<double>& {
+    if (!staged) {
+      if (!coordsWithInsertion(a, in, proposed, cwi)) {
+        throw std::runtime_error(
+            "a motif RMSD needs the design's coordinate-conditioned atoms, and this job has none: upstream "
+            "raises here too ('coords-with-insertion' is never staged), so its '3d_coordinate_conditioning' / "
+            "'internal_coordinate_conditioning' / 'unindexed' tag does not apply");
+      }
+      staged = true;
+    }
+    return cwi;
+  };
   struct Entry { const char* name; Gate gate; std::function<Values()> fn; };
   const std::vector<Entry> entries = {
       {"amino_acid_composition", {}, [&] { return aminoAcidComposition(a); }},
@@ -659,6 +1004,11 @@ inline Result designMetrics(const std::vector<AtomRecord>& rec, const Inputs& in
       {"sse_accuracy", {{"design"}, {}, {"small_molecule_only", "structure_prediction"}}, [&] { return sseAccuracy(a, sse()); }},
       {"unindexed_insertion_mapping", {{}, {"unindexed"}, {}}, [&] { return unindexedInsertionMapping(a, in, proposed); }},
       {"sequence_similarity_to_input", {{"partial_diffusion"}, {}, {}}, [&] { return sequenceSimilarityToInput(a, in); }},
+      {"design_motif_allatom_rmsd", {{"3d_coordinate_conditioning", "unindexed", "internal_coordinate_conditioning"}, {}, {}},
+       [&] { return motifRmsd(a, motifReference(), [&](int i) { return a.crdsrc[i] != 0; }); }},
+      {"design_unindexed_motif_allatom_rmsd", {{}, {"unindexed"}, {}},
+       [&] { return motifRmsd(a, motifReference(), [&](int i) { return a.crdsrc[i] && a.uii[i]; }); }},
+      {"ca_rmsd_to_input", {{"partial_diffusion"}, {}, {}}, [&] { return caRmsdToInput(a, in); }},
   };
   for (const Entry& e : entries) {
     if (!applies(e.gate, tags)) continue;
