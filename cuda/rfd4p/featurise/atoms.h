@@ -919,6 +919,143 @@ inline void featurizeExpandedSegments(AtomArray& a, bool isInference = true) {
   }
 }
 
+/** biotite's `_parse_operation_expression` (spec.js `parseOperationExpression`). */
+inline vector<vector<string>> parseOperationExpression(const string& expression) {
+  vector<string> groups;
+  if (expression.find('(') != string::npos) {
+    size_t at = 0;
+    while ((at = expression.find('(', at)) != string::npos) {
+      const size_t close = expression.find(')', at);
+      groups.push_back(expression.substr(at + 1, close - at - 1));
+      at = close;
+    }
+  } else {
+    groups.push_back(expression);
+  }
+  vector<vector<string>> ops = {{}};
+  for (const string& g : groups) {
+    vector<string> items;
+    size_t from = 0;
+    while (true) {
+      const size_t comma = g.find(',', from);
+      string item = g.substr(from, comma == string::npos ? string::npos : comma - from);
+      while (!item.empty() && isspace((unsigned char)item.front())) item.erase(item.begin());
+      while (!item.empty() && isspace((unsigned char)item.back())) item.pop_back();
+      const size_t dash = item.find('-');
+      bool range = dash != string::npos && dash > 0 && dash + 1 < item.size();
+      for (size_t k = 0; range && k < item.size(); ++k) range = k == dash || isdigit((unsigned char)item[k]);
+      if (range) {
+        for (int v = atoi(item.substr(0, dash).c_str()); v <= atoi(item.substr(dash + 1).c_str()); ++v) {
+          items.push_back(std::to_string(v));
+        }
+      } else {
+        items.push_back(item);
+      }
+      if (comma == string::npos) break;
+      from = comma + 1;
+    }
+    vector<vector<string>> next;
+    for (const auto& op : ops) {
+      for (const string& it : items) {
+        vector<string> o = op;
+        o.push_back(it);
+        next.push_back(o);
+      }
+    }
+    ops = next;
+  }
+  return ops;
+}
+
+/** `biologicalAssemblyOne` (spec.js has the note): a direct CIF as its assembly 1. */
+inline AtomArray biologicalAssemblyOne(const AtomArray& a, const cif::Block& block) {
+  auto col = [&](const char* cat, const string& name) -> const vector<string>* {
+    auto c = block.find(cat);
+    if (c == block.end()) return nullptr;
+    auto it = c->second.find(name);
+    return it == c->second.end() ? nullptr : &it->second;
+  };
+  const vector<string>* ids = col("pdbx_struct_assembly_gen", "assembly_id");
+  if (!ids) return a;
+  const vector<string>* exprs = col("pdbx_struct_assembly_gen", "oper_expression");
+  const vector<string>* asyms = col("pdbx_struct_assembly_gen", "asym_id_list");
+  auto stop = [](const string& why) {
+    fprintf(stderr, "%s\n", why.c_str());
+    exit(1);
+  };
+  std::map<string, std::array<double, 12>> transform;
+  if (const vector<string>* opIds = col("pdbx_struct_oper_list", "id")) {
+    for (size_t r = 0; r < opIds->size(); ++r) {
+      std::array<double, 12> m{};
+      for (int i = 1; i <= 3; ++i) {
+        for (int j = 1; j <= 3; ++j) {
+          const vector<string>* v = col("pdbx_struct_oper_list", "matrix[" + std::to_string(i) + "][" + std::to_string(j) + "]");
+          m[(i - 1) * 3 + (j - 1)] = v && r < v->size() ? atof((*v)[r].c_str()) : NAN;
+        }
+        const vector<string>* t = col("pdbx_struct_oper_list", "vector[" + std::to_string(i) + "]");
+        m[9 + i - 1] = t && r < t->size() ? atof((*t)[r].c_str()) : NAN;
+      }
+      transform[(*opIds)[r]] = m;
+    }
+  }
+  vector<int> indices;
+  vector<std::array<double, 3>> moved;
+  bool any = false;
+  string available;
+  for (size_t r = 0; r < ids->size(); ++r) {
+    available += (r ? ", '" : "'") + (*ids)[r] + "'";
+    if ((*ids)[r] != "1") continue;
+    any = true;
+    const string expr = exprs && r < exprs->size() ? (*exprs)[r] : "1";
+    const string list = asyms && r < asyms->size() ? (*asyms)[r] : "";
+    const vector<vector<string>> ops = parseOperationExpression(expr);
+    if (ops.size() != 1) {
+      stop("assembly 1 makes " + std::to_string(ops.size()) + " copies of chains " + list + " (operators " + expr +
+           "); this port takes one copy of each chain - write the copies out as chains of their own");
+    }
+    string name;
+    for (const string& step : ops[0]) name += step;
+    if (name != "1") {
+      stop("assembly 1 places chains " + list + " by operator " + expr + "; this port takes chains under "
+           "transformation 1 only");
+    }
+    std::set<string> chains;
+    size_t from = 0;
+    while (true) {
+      const size_t comma = list.find(',', from);
+      chains.insert(list.substr(from, comma == string::npos ? string::npos : comma - from));
+      if (comma == string::npos) break;
+      from = comma + 1;
+    }
+    for (size_t i = 0; i < a.n(); ++i) {
+      if (!chains.count(a.site.chainId[i])) continue;
+      std::array<double, 3> c = {a.site.x[i], a.site.y[i], a.site.z[i]};
+      for (const string& step : ops[0]) {
+        const auto it = transform.find(step);
+        if (it == transform.end()) stop("assembly 1 names operator " + step + ", which pdbx_struct_oper_list does not define");
+        const std::array<double, 12>& m = it->second;
+        std::array<double, 3> d;
+        for (int k = 0; k < 3; ++k) d[k] = m[k * 3] * c[0] + m[k * 3 + 1] * c[1] + m[k * 3 + 2] * c[2] + m[9 + k];
+        c = d;
+      }
+      indices.push_back((int)i);
+      moved.push_back(c);
+    }
+  }
+  if (!any) stop("Invalid assembly ID(s) provided: ['1']. Available assembly IDs: [" + available + "]");
+  if (std::set<int>(indices.begin(), indices.end()).size() != indices.size()) {
+    stop("assembly 1 lists a chain twice; this port takes one copy of each chain");
+  }
+  AtomArray out = slice(a, indices);
+  for (size_t k = 0; k < moved.size(); ++k) {
+    out.site.x[k] = moved[k][0];
+    out.site.y[k] = moved[k][1];
+    out.site.z[k] = moved[k][2];
+  }
+  out.ids = cif::computeIds(out.site, out.bonds);
+  return out;
+}
+
 /** `addPolymerBonds` (cif.js): `add_polymer_bonds` over a finished array. */
 inline void addPolymerBonds(AtomArray& a) {
   if (a.n() == 0 || a.site.chainType.size() != a.n()) return;

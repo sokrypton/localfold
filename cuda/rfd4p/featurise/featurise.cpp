@@ -2154,6 +2154,8 @@ int run(int argc, char** argv) {
         const vector<rfd4p::cif::Block> ccdBlocks =
             annotated ? vector<rfd4p::cif::Block>{} : rfd4p::fresh::ccdBlocksForRawStructure(cifText, ccdFile);
         parts.push_back(rfd4p::atoms::fromCif(cifText, annotated, ccdBlocks));
+        // A structure that IS the job is upstream's direct path: its biological assembly 1.
+        if (!specMode) parts.back() = rfd4p::atoms::biologicalAssemblyOne(parts.back(), rfd4p::bcif::parseStructure(cifText));
       }
       if (parts.size() == 1) {
         src = std::move(parts[0]);

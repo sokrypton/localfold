@@ -47,12 +47,18 @@ EXPECTED = {
 }
 
 
-def upstream_atoms(path: Path, annotated: bool) -> dict:
+def upstream_atoms(path: Path, annotated: bool | str) -> dict:
+    """`annotated`: True / False for a condition spec's `input:`, "direct" for a CIF handed to the
+    generator itself (`DesignProblemDataset`, which takes the file's biological assembly 1)."""
     import numpy as np
     from rfproteina.inference_utils.condition_spec import load_condition_spec_inputs
+    from rfproteina.inference_utils.datasets import DesignProblemDataset
 
     try:
-        a = load_condition_spec_inputs([str(path)], as_annotated_cif=annotated)
+        if annotated == "direct":
+            a = DesignProblemDataset._load_from_path(None, path)["atom_array"]
+        else:
+            a = load_condition_spec_inputs([str(path)], as_annotated_cif=annotated)
     except Exception as e:  # noqa: BLE001 - a refusal is an answer
         return {"raise": f"{type(e).__name__}: {e}"}
     a = a[a.element != "H"]
@@ -67,14 +73,16 @@ def upstream_atoms(path: Path, annotated: bool) -> dict:
 def page_atoms(cases: list[tuple[str, Path, bool]], ccd: dict[str, str]) -> dict:
     script = """
 import { readFileSync } from "node:fs";
-import { parseCifBlock } from "./shared/rfd4p/pipeline/cif.js";
-import { loadConditionSpecInput } from "./shared/rfd4p/pipeline/spec.js";
+import { parseCifBlock, parseCifToAtomArray } from "./shared/rfd4p/pipeline/cif.js";
+import { loadConditionSpecInput, loadDirectInput } from "./shared/rfd4p/pipeline/spec.js";
 const { cases, ccd } = JSON.parse(readFileSync(0, "utf8"));
 const ccdBlocks = new Map(Object.entries(ccd).map(([id, text]) => [id, parseCifBlock(text)]));
 const out = {};
 for (const [key, path, annotated] of cases) {
   try {
-    const a = loadConditionSpecInput(readFileSync(path), { asAnnotatedCif: annotated, ccdBlocks });
+    const a = annotated === "direct"
+      ? loadDirectInput(readFileSync(path), { ccdBlocks })
+      : loadConditionSpecInput(readFileSync(path), { asAnnotatedCif: annotated, ccdBlocks });
     const keep = [...Array(a.nAtoms).keys()].filter((i) => a.element[i] !== "H");
     const pick = (k) => keep.map((i) => a[k][i]);
     out[key] = {
@@ -161,14 +169,16 @@ def main() -> int:
             raw = (REPO / "web" / "examples" / f"{name}.cif.zst").read_bytes()
             path = Path(tmp) / f"{name}.cif"
             path.write_bytes(zstandard.ZstdDecompressor().decompressobj().decompress(raw))
-            cases += [(f"{name} annotated", path, True), (f"{name} fresh", path, False)]
+            cases += [(f"{name} annotated", path, True), (f"{name} fresh", path, False),
+                      (f"{name} direct", path, "direct")]
         import gzip
 
         for packed in sorted(RAW.glob("*.cif.zst")):
             path = Path(tmp) / packed.name.removesuffix(".zst")
             path.write_bytes(zstandard.ZstdDecompressor().decompressobj().decompress(packed.read_bytes()))
             cases += [(f"{path.name.removesuffix('.cif')} annotated", path, True),
-                      (f"{path.name.removesuffix('.cif')} fresh", path, False)]
+                      (f"{path.name.removesuffix('.cif')} fresh", path, False),
+                      (f"{path.name.removesuffix('.cif')} direct", path, "direct")]
         # The other formats upstream takes: gzip, and RCSB's own BinaryCIF (its encoder, not one
         # written here) - each must load exactly as the mmCIF does on both sides.
         gz = Path(tmp) / "1brs.cif.gz"

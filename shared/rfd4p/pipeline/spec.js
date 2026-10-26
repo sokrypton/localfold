@@ -506,6 +506,98 @@ export function sliceAtomArray(atoms, indices) {
   return out;
 }
 
+/** biotite's `_parse_operation_expression`: "1", "1,2", "(1-3)", "(X0)(1-5)" -> operations. */
+function parseOperationExpression(expression) {
+  const groups = expression.includes('(')
+    ? [...expression.matchAll(/\(([^)]*)\)/g)].map((m) => m[1])
+    : [expression];
+  const expand = (group) => group.split(',').flatMap((item) => {
+    const range = /^(\d+)-(\d+)$/.exec(item.trim());
+    if (!range) return [item.trim()];
+    const out = [];
+    for (let k = Number(range[1]); k <= Number(range[2]); k++) out.push(String(k));
+    return out;
+  });
+  let operations = [[]];
+  for (const group of groups) {
+    const items = expand(group);
+    operations = operations.flatMap((op) => items.map((item) => [...op, item]));
+  }
+  return operations;
+}
+
+/**
+ * Biological assembly "1", as atomworks builds it for a CIF handed to the generator directly
+ * (`DesignProblemDataset`: `parse(path)["assemblies"]["1"]`, where a condition spec's `input:`
+ * takes the asymmetric unit): `pdbx_struct_assembly_gen`'s chains for assembly 1, row by row,
+ * each moved by its operator (`pdbx_struct_oper_list`), `transformation_id` the operator's name.
+ * A file with no assembly categories is its own assembly 1. 🔴 A ROW THAT MAKES SEVERAL COPIES
+ * of its chains (a symmetric homo-oligomer generated from one chain), or places them by an
+ * operator other than "1", is REFUSED: every stage here names a chain by its id and its instance
+ * as `<chain>_1`, and two copies of chain A would be one chain to all of them.
+ */
+export function biologicalAssemblyOne(atoms, block) {
+  const gen = block?.pdbx_struct_assembly_gen;
+  if (!gen?.assembly_id) return atoms;
+  const opers = block.pdbx_struct_oper_list ?? {};
+  const transform = new Map();
+  (opers.id ?? []).forEach((id, r) => {
+    const m = (i, j) => Number(opers[`matrix[${i}][${j}]`]?.[r]);
+    const v = (i) => Number(opers[`vector[${i}]`]?.[r]);
+    transform.set(id, { R: [1, 2, 3].map((i) => [1, 2, 3].map((j) => m(i, j))), t: [1, 2, 3].map(v) });
+  });
+  const rows = gen.assembly_id.flatMap((id, r) => (id === '1' ? [r] : []));
+  if (!rows.length) {
+    throw new Error(`Invalid assembly ID(s) provided: ['1']. Available assembly IDs: [${gen.assembly_id.map((x) => `'${x}'`).join(', ')}]`);
+  }
+  const indices = [];
+  const tid = [];
+  const moved = [];
+  for (const r of rows) {
+    const operations = parseOperationExpression(String(gen.oper_expression[r]));
+    if (operations.length !== 1) {
+      throw new Error(`assembly 1 makes ${operations.length} copies of chains ${gen.asym_id_list[r]} (operators `
+        + `${gen.oper_expression[r]}); this port takes one copy of each chain - write the copies out as chains of their own`);
+    }
+    const [operation] = operations;
+    // Every id here is the asymmetric unit's own (`chain_iid` is `<chain>_1`), so a chain moved
+    // by another operator would carry an instance id nothing downstream writes.
+    if (operation.join('') !== '1') {
+      throw new Error(`assembly 1 places chains ${gen.asym_id_list[r]} by operator ${gen.oper_expression[r]}; this `
+        + 'port takes chains under transformation 1 only');
+    }
+    const chains = new Set(String(gen.asym_id_list[r]).split(','));
+    for (let i = 0; i < atoms.nAtoms; i++) {
+      if (!chains.has(atoms.chain_id[i])) continue;
+      let c = atoms.coord[i].slice();
+      for (const step of operation) {
+        const { R, t } = transform.get(step) ?? (() => { throw new Error(`assembly 1 names operator ${step}, which pdbx_struct_oper_list does not define`); })();
+        c = [0, 1, 2].map((k) => R[k][0] * c[0] + R[k][1] * c[1] + R[k][2] * c[2] + t[k]);
+      }
+      indices.push(i);
+      tid.push(operation.join(''));
+      moved.push(c);
+    }
+  }
+  if (new Set(indices).size !== indices.length) {
+    throw new Error('assembly 1 lists a chain twice; this port takes one copy of each chain');
+  }
+  const out = sliceAtomArray(atoms, indices);
+  out.coord = moved;
+  out.transformation_id = tid;
+  computeIdAndEntityAnnotations(out);
+  return out;
+}
+
+/**
+ * A CIF handed to the generator directly (`DesignProblemDataset._load_from_path`): read as an
+ * annotated file and taken as its biological assembly 1.
+ */
+export function loadDirectInput(input, cifOptions = {}) {
+  const { block } = readStructureBlock(input);
+  return biologicalAssemblyOne(parseCifToAtomArray(null, { ...cifOptions, block }), block);
+}
+
 export function concatAtomArrays(arrays) {
   if (arrays.length === 0) throw new Error('Cannot concatenate empty list of AtomArrays');
   if (arrays.length === 1) return sliceAtomArray(arrays[0], Array.from({ length: arrays[0].nAtoms }, (_, i) => i));

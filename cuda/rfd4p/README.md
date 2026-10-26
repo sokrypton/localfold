@@ -568,6 +568,21 @@ each object's key order beside it) and the YAML reader records the same; `applyC
 over overlapping residues; upstream puts residue 70 in group 1 and residue 27 at ALA 0, and both
 ports do.
 
+## A structure handed over by itself is its biological assembly 1
+
+Upstream has two ways in. A condition spec's `input:` is read as the asymmetric unit
+(`build_assembly=None`); a CIF given to the generator itself (`DesignProblemDataset`, this port's
+`specMode: false`) is read with assemblies built and assembly "1" taken. 🔴 **BOTH PORTS READ THE
+SECOND AS THE ASYMMETRIC UNIT**, which for a deposited entry is not what upstream designs against:
+1BRS's assembly 1 is chains A and D with their waters, 1,779 heavy atoms, where the asymmetric unit
+is three copies of the complex, 5,151. `loadDirectInput` / `atoms::biologicalAssemblyOne` build
+it - `pdbx_struct_assembly_gen`'s chains for assembly 1 row by row, moved by their operator - and
+`tools/check-rfd4p-load.py` holds that to `DesignProblemDataset._load_from_path` on every shipped
+example and fixture: 12 direct loads exact, bonds included. A file without the categories is its
+own assembly 1, as upstream's identity assembly makes it. Refused, by name: an assembly that makes
+several copies of a chain, or places one by an operator other than "1" - every id here is the
+asymmetric unit's (`<chain>_1`), and two copies of chain A would be one chain to all of them.
+
 ## Every preset generates
 
 All ten of RFD4-Proteina's shipped presets now run end to end: unconditional, fold-conditioned,

@@ -29,6 +29,7 @@ import {
   buildAtomArrayFromConditionSpec,
   getDefaultIndexGroups,
   sliceAtomArray,
+  loadDirectInput,
   concatAtomArrays,
 } from './spec.js';
 import {
@@ -96,12 +97,13 @@ function parseInputToAtomArray(input, opts = {}) {
   if (isAtomArrayObject(input)) {
     return input;
   }
+  // A structure handed over by itself is upstream's direct path: its biological assembly 1.
   if (input instanceof ArrayBuffer || ArrayBuffer.isView(input)) {
-    return parseCifToAtomArray(input, opts.cifOptions);
+    return loadDirectInput(input, opts.cifOptions);
   }
   if (typeof input === 'string') {
     if (isCifString(input)) {
-      return parseCifToAtomArray(input, opts.cifOptions);
+      return loadDirectInput(input, opts.cifOptions);
     }
     const spec = input.trimStart().startsWith('{')
       ? parseJsonOrdered(input)

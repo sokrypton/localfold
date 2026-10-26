@@ -58,6 +58,10 @@ def crafted() -> dict[str, dict]:
             "C_CRD": {"true": sel("A")}, "C_CRDGRP": {"1": sel("A/*/[5-9]")}}},
         "sidechain-crd-adds-seq": {"input": ppi, "contig": "B2-40", "conditions": {"C_CRD": {"true": sel("B")}}},
         "two-segments-1brs": {"input": brs, "contig": "A3-110, /0, D1-89"},
+        # A structure handed over by itself (`specMode: false`, upstream's direct path): its
+        # biological assembly 1 - 1BRS's is chains A, D and their waters, not all six chains.
+        "direct-1brs": {"input": brs, "specMode": False},
+        "direct-ppi": {"input": ppi, "specMode": False},
     }
 
 
@@ -81,7 +85,15 @@ def upstream(spec: dict) -> str:
 
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "spec.json"
-        path.write_text(json.dumps({"design": spec}))
+        if spec.get("specMode") is False:
+            # The CIF itself is the input (`DesignProblemDataset`), uncompressed as upstream reads it.
+            import zstandard
+            raw = Path(spec["input"]).read_bytes()
+            path = Path(tmp) / "design.cif"
+            path.write_bytes(zstandard.ZstdDecompressor().decompressobj().decompress(raw)
+                             if spec["input"].endswith(".zst") else raw)
+        else:
+            path.write_text(json.dumps({"design": spec}))
         L.seed_everything(0, verbose=False)
         pipe = build_design_validation_pipeline(metrics_tags=[], path_length_search_cutoff=64)
         try:
@@ -110,7 +122,8 @@ for (const [name, j] of Object.entries(jobs)) {
   try {
     // Bytes, as given: the reader tells mmCIF from BinaryCIF, plain from compressed.
     const inputCif = new Uint8Array(readFileSync(j.input));
-    buildBatch({ contig: j.contig, ...(j.conditions ? { conditions: j.conditions } : {}) }, { seed: 0, inputCif });
+    if (j.specMode === false) buildBatch(inputCif, { seed: 0 });
+    else buildBatch({ contig: j.contig, ...(j.conditions ? { conditions: j.conditions } : {}) }, { seed: 0, inputCif });
     out[name] = null;
   } catch (e) { out[name] = String(e.message); }
 }
