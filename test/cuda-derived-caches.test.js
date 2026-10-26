@@ -40,7 +40,7 @@ const NOT_A_HOOK = new Map([
   ["SCRATCH", "scratch, rewritten every use, not a weight"], ["IDEV", "the input's own device views"],
   ["AS_BF16", "cuda/af3's pairformer bench, not a port"], ["W", "cuda/af3's pairformer bench, not a port"],
 ]);
-const MAP = /^\s*(?:inline|static)\s+std::(?:unordered_)?map<(.*)>\s+(\w+)\s*;/;
+const MAP = /^\s*(?:inline|static)\s+(?:LF_TLS\s+)?std::(?:unordered_)?map<(.*)>\s+(\w+)\s*;/;     // (LF_TLS: cuda/af2 --multi's thread_local)
 
 it("every device-weight cache registers a forget hook", () => {
   const offenders = [];

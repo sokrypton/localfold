@@ -1622,7 +1622,7 @@ inline unsigned blocks(size_t n, int t = 256) { return (unsigned)((n + t - 1) / 
 // from the finished copy on their next use. A port's own caches of derived weights register here.
 // (Not for cuda/af3 as it stands: TCACHE folds its conditioning weights once per process and keeps
 // the names, and OpenDDE's structural.cuh registers VIEWS into a file's copy, which this would free.)
-inline std::vector<std::function<void()>> FORGET_HOOKS;
+inline LF_TLS std::vector<std::function<void()>> FORGET_HOOKS;   // (each --multi thread's hooks clear its own caches)
 inline LF_TLS std::map<std::string, float*> WF;
 inline LF_TLS std::map<std::string, half*> WH;
 inline LF_TLS std::map<std::string, size_t> WLEN;
