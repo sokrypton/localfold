@@ -29,6 +29,7 @@ is - NATIVE below. An installed wheel (`localfold serve`, python/localfold/serve
 featurisers and the weights at its own files through LOCALFOLD_BIN_DIR, LOCALFOLD_FEATURISE_DIR and
 LOCALFOLD_WEIGHTS_DIR.
 """
+import hashlib
 import json
 import os
 import re
@@ -452,6 +453,103 @@ class Server:
                 self.proc.kill()
 
 
+class MultiServer(Server):
+    """AlphaFold 2's five models in ONE process (cuda/af2 --multi: a thread a model, each its own stream, every global
+    of the binary thread-local): a short fold fills a fifth of the card, and five folding at once share it - "All 5"
+    over 68 residues 322 -> 150 ms on an A100, 150 residues 634 -> 451, 261 1571 -> 1316, each model's structure
+    byte-identical to its own server's (cuda/af2/README.md, Round 5 Modules 8-9). `lanes` is each model's argument
+    list as Server would run it (its binary, bundle, delta and warm-up); each lane serves its own directory."""
+
+    def __init__(self, key, lanes):
+        self.key = key
+        self.dir = os.path.join(WORK + "-serve", "-".join(str(k) for k in key))
+        shutil.rmtree(self.dir, ignore_errors=True)
+        os.makedirs(self.dir)
+        self.lanes = [os.path.join(self.dir, f"lane{i}") for i in range(len(lanes))]
+        command = [lanes[0][0], "--multi"]
+        for i, (lane, where) in enumerate(zip(lanes, self.lanes)):
+            os.makedirs(where)
+            command += (["::"] if i else []) + [*lane[1:], f"--serve={where}"]
+        self.log = open(os.path.join(self.dir, "server.log"), "w")
+        env = {**os.environ, "AF2_STARTUP": "1"}
+        self.started = time.time()
+        self.ready = None
+        self.reported = False
+        self.proc = subprocess.Popen(command, cwd=REPO, stdout=self.log, stderr=subprocess.STDOUT,
+                                     preexec_fn=die_with_parent, env=env)
+        self.count = 0
+
+    def fold_all(self, inputs, flags, live=None, on_file=None):
+        """The same input through every lane at once (flags[i]: lane i's, its --out among them); lane `live`'s
+        streamed files handed to on_file as they land, every lane's kept (--frames) when on_file is given, so a
+        later job can replay them. Returns [(said, frames dir or None, error or None)] a lane."""
+        self.count += 1
+        jobs = []
+        for i, where in enumerate(self.lanes):
+            base = os.path.join(where, f"{self.count:06d}")
+            frames = base + ".frames" if on_file is not None else None
+            lane_flags = [*flags[i], f"--frames={frames}"] if frames else list(flags[i])
+            if frames:
+                os.makedirs(frames, exist_ok=True)
+            with open(base + ".tmp", "w") as handle:
+                handle.write("\n".join([inputs, *lane_flags]) + "\n")
+            jobs.append((base, frames))
+        for base, _ in jobs:
+            os.rename(base + ".tmp", base + ".job")
+        seen = set()
+
+        def collect():
+            frames = jobs[live][1] if live is not None else None
+            if frames is None:
+                return
+            for name in sorted(os.listdir(frames)):
+                if name not in seen and not name.endswith(".tmp"):
+                    seen.add(name)
+                    on_file(name, os.path.join(frames, name))
+        while not all(os.path.exists(base + ".done") for base, _ in jobs):
+            if self.ready is None and open(self.log.name).read().count("serving") >= len(self.lanes):
+                self.ready = time.time()
+            if self.proc.poll() is not None:
+                raise RuntimeError(f"the {self.key[0]} server exited: " + open(self.log.name).read()[-400:])
+            collect()
+            time.sleep(0.005)
+        collect()
+        if self.ready is None:
+            self.ready = time.time()
+        out = []
+        for base, frames in jobs:
+            said = open(base + ".log").read()
+            error = None
+            if int(open(base + ".done").read().strip() or 1) != 0:
+                thrown = [line for line in said.strip().splitlines() if line.strip()]
+                sentence = next((line[7:] for line in thrown if line.startswith("Error: ")), None)
+                error = Refused(sentence) if sentence is not None else RuntimeError("the fold failed: " + "\n".join(thrown[-4:]))
+            out.append((said, frames, error))
+        return out
+
+    def close(self):
+        if self.proc.poll() is None:
+            for where in self.lanes:                  # (each lane's thread ends at its own quit; the process when all have)
+                with open(os.path.join(where, "quit.tmp"), "w") as handle:
+                    handle.write("quit\n")
+                os.rename(os.path.join(where, "quit.tmp"), os.path.join(where, "~quit.job"))
+            try:
+                self.proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+
+
+# "All 5": the sweep's other models, folded beside the one asked for and answered from here when their jobs come
+# (the page sends the five as five jobs, one after another - web/app.js's af2Sweep - identical but for the family)
+SWEEP_MAX_RESIDUES = 400     # (past this a fold fills the card alone: 1.19x at 261 residues, and five pairs' memory)
+
+
+def sweep_key(job):
+    """What makes two of a sweep's jobs the same fold but for the model: everything the page sent but the family."""
+    picked = {k: v for k, v in job.items() if k != "family"}
+    return hashlib.sha256(json.dumps(picked, sort_keys=True, default=str).encode()).hexdigest()
+
+
 def featurise(cmd, what, log, on_line=None):
     """A native featuriser's run (cuda/featurise): its output kept, and each line handed to `on_line` as it comes (the
     MMseqs2 search says `search: queued` / `search: running` while it waits); a refusal - the page's own sentence,
@@ -490,6 +588,7 @@ class Worker:
     def __init__(self):
         self.device = device_name()
         self.servers = {}                # key -> Server, least recently used first
+        self.sweep = None                # "All 5": {"key", "results": {model: result}, "frames": {model: dir}}
 
     def evict(self, keep, everything=False):
         """Idle servers stopped, least recently used first: all of them (`everything`), or until the card is
@@ -501,8 +600,9 @@ class Worker:
                     return
             self.servers.pop(key).close()
 
-    def server_for(self, key, command, residues):
-        """The model's server - kept, or started - moved to the most recently used end."""
+    def server_for(self, key, command, residues, make=None):
+        """The model's server - kept, or started - moved to the most recently used end (`make`: how to start one,
+        Server(key, command) unless given)."""
         self.evict(key, everything=residues > self.LARGE)
         server = self.servers.pop(key, None)
         if server is not None and server.proc.poll() is not None:
@@ -510,7 +610,7 @@ class Worker:
         if server is None:
             emit("status", f"{key[1]} on {NATIVE_NAME} ({self.device}) · loading the weights onto the "
                  + ("GPU" if NATIVE == "metal" else "card"))
-            server = Server(key, command)
+            server = make() if make else Server(key, command)
         self.servers[key] = server
         return server
 
@@ -545,6 +645,8 @@ class Worker:
         if controls.get("af3-mode", "diffusion") != "diffusion":
             raise Refused("Flow was removed - every fold samples with diffusion now (docs/AF3.md, \"Flow removed\")")
         emit("status", f"{family} on {NATIVE_NAME} ({self.device}) · reading the job")
+        if port == "af2" and self.sweep and self.sweep["key"] == sweep_key(job) and af2_model in self.sweep["results"]:
+            return self.replay(job, family, port, af2_model)
         emit("progress", 0.02)
         started = time.time()
         JOB_STARTED[0] = started
@@ -664,15 +766,26 @@ class Worker:
             if templates and family == "monomer" and af2_model > 2:
                 raise Refused(f"AlphaFold 2's model {af2_model} has no template embedder (models 3, 4 and 5 are"
                               " template-free) - pick model 1 or 2, or drop the template")
-            model = f"model_{af2_model}_ptm" if family == "monomer" else f"model_{af2_model}_multimer_v3"
+            name = (lambda n: f"model_{n}_ptm") if family == "monomer" else (lambda n: f"model_{n}_multimer_v3")
+            # "All 5" (the page's Model # row): every model at once on one --multi server, the others' results kept for
+            # their jobs - on CUDA, short enough that one fold leaves the card mostly idle, and with no template (models
+            # 3-5 have no template embedder: those jobs are refused one by one, as before)
+            sweep = (NATIVE == "cuda" and str(controls.get("af2Model")) == "all" and residues <= SWEEP_MAX_RESIDUES
+                     and not templates)
             at = time.time()
-            weights = model_weights(model, log)       # (models 2-5: model 1's bundle and their delta on it)
+            lanes = []
+            for n in (range(1, 6) if sweep else [af2_model]):
+                weights = model_weights(name(n), log)       # (models 2-5: model 1's bundle and their delta on it)
+                bundle, delta = weights[0], (weights[1] if len(weights) > 1 else None)
+                lanes.append([binary("af2"), "-", f"--bundle={bundle}", "--fast",
+                              *([f"--delta={delta}"] if delta else []), "--warm=64,8,8,0"])
             dev("the weights on disk (fetched if missing)", (time.time() - at) * 1000, begin=at)
-            bundle, delta = weights[0], (weights[1] if len(weights) > 1 else None)
-            key = ("af2", family, af2_model)
-            server = self.server_for(key, [binary("af2"), "-", f"--bundle={bundle}",
-                                           "--fast",
-                                           *([f"--delta={delta}"] if delta else []), "--warm=64,8,8,0"], residues)
+            if sweep:
+                key = ("af2", family, "all")
+                server = self.server_for(key, None, residues, make=lambda: MultiServer(key, lanes))
+            else:
+                key = ("af2", family, af2_model)
+                server = self.server_for(key, lanes[0], residues)
             export = [featuriser("af2-featurise"), inputs, f"--bundle={bundle}", f"--job={job_path}",
                       f"--max-msa={508 if requested == 512 else requested}", f"--max-extra={extra}", f"--seed={seed}", *flags]
             if recycles not in (None, ""):
@@ -738,33 +851,29 @@ class Worker:
             # the AF3 lineage's trunk contacts and sampler frames, AF2's passes (structure, pLDDT, pTM/ipTM,
             # PAE, contacts), ESMFold2's trunk contacts and sampler frames - as the binary's tap writes them
             def on_file(name, path):
-                tag = re.search(r"(\d+)-of-(\d+)", name)
-                if name.startswith("pass-") and name.endswith(".pdb"):
-                    index, passes = int(tag.group(1)), int(tag.group(2))
-                    emit("frame", open(path).read())
-                    emit_scores(json.load(open(path[:-4] + ".json")), os.path.join(os.path.dirname(path), f"pae-{tag.group(0)}.u8"), passes)
-                    emit("progress", 0.15 + 0.85 * (index + 1) / passes)
-                    emit("status", f"{family} on {NATIVE_NAME} ({self.device}) · pass {index + 1}/{passes}")
-                elif name.startswith("contacts-"):
-                    index, passes = int(tag.group(1)), int(tag.group(2))
-                    emit_contacts(path, index, passes)
-                    if port != "af2":
-                        emit("progress", 0.15 + 0.15 * (index + 1) / passes)
-                        emit("status", f"{family} on {NATIVE_NAME} ({self.device}) · trunk pass {index + 1}/{passes}")
-                elif name.startswith("frame-"):
-                    # frame-SSSS.pdb (af3, its step count the job's) or frame-SSSS-NNNN.pdb (ef2)
-                    step = int(name[6:10])
-                    steps = int(name[11:15]) if name[10] == "-" else total
-                    # 🔴 THE JOB'S STEP COUNT IS A LOWER BOUND, NOT THE COUNT: a model's schedule tail can add a step
-                    # (IntelliFold-2's scheduleTail 3, AF3's levels then a 0 - cuda/af3/src/sampler.cuh), so its 26th
-                    # frame of 25 steps read 1.028 and the bar went backwards to the result's 1.0
-                    steps = max(steps, step) if steps else steps
-                    emit("frame", open(path).read())     # (superposed onto the first by the binary's writer)
-                    if steps:
-                        emit("progress", 0.3 + 0.7 * step / steps)
-                        emit("status", f"{family} on {NATIVE_NAME} ({self.device}) · diffusion {step}/{steps}")
+                self.stream(name, path, family, port, total)
         submitted = time.time()
-        said = server.fold(inputs, fold, on_file)
+        swept = None
+        if isinstance(server, MultiServer):
+            sweep_dir = WORK + "-sweep"
+            if self.sweep:                    # (the last sweep's kept passes, given back)
+                for kept in self.sweep["frames"].values():
+                    if kept:
+                        shutil.rmtree(kept, ignore_errors=True)
+            self.sweep = None
+            shutil.rmtree(sweep_dir, ignore_errors=True)
+            outs = [os.path.join(sweep_dir, f"m{n}", "fold.pdb") for n in range(1, 6)]
+            for path in outs:
+                os.makedirs(os.path.dirname(path))
+            lane_flags = [[f"--out={path}", *fold[1:]] for path in outs]     # (fold[0] is this job's --out)
+            swept = server.fold_all(inputs, lane_flags, live=af2_model - 1,
+                                    on_file=on_file if on_file is not None else None)
+            said, _, error = swept[af2_model - 1]
+            if error is not None:
+                raise error
+            out_pdb = outs[af2_model - 1]
+        else:
+            said = server.fold(inputs, fold, on_file)
         done = time.time()
         log.append(said)
         # the model's load, once (it ran beside the featuriser), any wait for it, and the fold with its stages
@@ -808,6 +917,63 @@ class Worker:
         if converged:
             # ...worded as the WebGPU fold words it
             result["status"] += f" · converged at {converged.group(1)} Å after {converged.group(2)} passes"
+        if swept is not None:
+            kept = {"key": sweep_key(job), "results": {}, "frames": {}}
+            for n, (lane_said, frames, error) in enumerate(swept, start=1):
+                if n == af2_model or error is not None:
+                    continue
+                other = self.collect(outs[n - 1], family, port, job, time.time() - started)
+                other["a3m"], other["templates"] = result["a3m"], []
+                lane_converged = re.search(r"converged at ([0-9.]+) A after (\d+) passes", lane_said)
+                if lane_converged:
+                    other["status"] += f" · converged at {lane_converged.group(1)} Å after {lane_converged.group(2)} passes"
+                other["status"] += " · folded beside model " + str(af2_model) + " (All 5)"
+                kept["results"][n], kept["frames"][n] = other, frames
+            result["status"] += " · all 5 models folded at once"
+            self.sweep = kept
+        return result
+
+    def stream(self, name, path, family, port, total):
+        """One streamed result of a fold, as it lands (or replayed from the sweep): its events to the page."""
+        tag = re.search(r"(\d+)-of-(\d+)", name)
+        if name.startswith("pass-") and name.endswith(".pdb"):
+            index, passes = int(tag.group(1)), int(tag.group(2))
+            emit("frame", open(path).read())
+            emit_scores(json.load(open(path[:-4] + ".json")), os.path.join(os.path.dirname(path), f"pae-{tag.group(0)}.u8"), passes)
+            emit("progress", 0.15 + 0.85 * (index + 1) / passes)
+            emit("status", f"{family} on {NATIVE_NAME} ({self.device}) · pass {index + 1}/{passes}")
+        elif name.startswith("contacts-"):
+            index, passes = int(tag.group(1)), int(tag.group(2))
+            emit_contacts(path, index, passes)
+            if port != "af2":
+                emit("progress", 0.15 + 0.15 * (index + 1) / passes)
+                emit("status", f"{family} on {NATIVE_NAME} ({self.device}) · trunk pass {index + 1}/{passes}")
+        elif name.startswith("frame-"):
+            # frame-SSSS.pdb (af3, its step count the job's) or frame-SSSS-NNNN.pdb (ef2)
+            step = int(name[6:10])
+            steps = int(name[11:15]) if name[10] == "-" else total
+            # 🔴 THE JOB'S STEP COUNT IS A LOWER BOUND, NOT THE COUNT: a model's schedule tail can add a step
+            # (IntelliFold-2's scheduleTail 3, AF3's levels then a 0 - cuda/af3/src/sampler.cuh), so its 26th
+            # frame of 25 steps read 1.028 and the bar went backwards to the result's 1.0
+            steps = max(steps, step) if steps else steps
+            emit("frame", open(path).read())     # (superposed onto the first by the binary's writer)
+            if steps:
+                emit("progress", 0.3 + 0.7 * step / steps)
+                emit("status", f"{family} on {NATIVE_NAME} ({self.device}) · diffusion {step}/{steps}")
+
+    def replay(self, job, family, port, model):
+        """A sweep's model answered from what was folded beside the first: its passes streamed as they were, its result."""
+        at = time.time()
+        emit("progress", 0.15)
+        frames = self.sweep["frames"].get(model)
+        if frames and streaming(job) and os.path.isdir(frames):
+            for name in sorted(os.listdir(frames)):
+                if not name.endswith(".tmp"):
+                    self.stream(name, os.path.join(frames, name), family, port, 0)
+        emit("progress", 1.0)
+        dev("folded beside the sweep's first model (All 5): answered from it", (time.time() - at) * 1000, begin=at)
+        result = json.loads(json.dumps({k: v for k, v in self.sweep["results"][model].items() if k != "_raw"}))
+        result["_raw"] = self.sweep["results"][model].get("_raw")
         return result
 
     def bioemu2(self, job, controls, flags, job_path, residues, seed, recycles, log, live):
