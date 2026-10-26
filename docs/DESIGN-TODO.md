@@ -199,7 +199,23 @@ constraint at all, which decides whether this is plumbing or a port.
   the validity column carries the sentence, and the status line repeats it.
 - **Modality parity with RFD4-Proteina** is a standing goal, measured in
   `docs/DESIGN.md` §6 and not closed.
-- **Residue picking in the viewer** — picking spans by clicking rather than
-  typing. py2Dmol supports it partially (`docs/DESIGN-PY2DMOL.md`): picking and
-  selection exist, the change event carries no detail, so a page reads
-  `v.selection` and translates indices itself.
+- **Residue picking in the viewer** — **done for conditions** (2026-10-26), not
+  yet for spans. A loaded structure is drawn in the viewer, residues are picked
+  with py2Dmol's own click-to-select (`renderer.residueSelection`; the event's
+  missing detail did not matter with one viewer on the page), and
+  `web/condition-editor.js` sets them as any of the fifteen conditions AtomWorks
+  Studio's editor offers - hotspot, coordinates, sequence, secondary structure,
+  RASA, H-bond, salt bridge, metal coordination, pi stack, pi-cation,
+  hydrophobic, coordinate group, unindexed motif, chain centroid, CATH -
+  narrowed to atom names where the condition is per atom. It writes the job's
+  `conditions` spec, merged after a preset's and the spans' (the last arm wins),
+  so job.json and `localfold-rfd4p --job=` read what the page ran. The viewer
+  draws a PDB written from the parsed array, so a click maps to the selection
+  language's own chain ids and `res_id`, not an author numbering.
+  `test/condition-editor.test.js` holds an editor-built spec to the batch a
+  hand-written one builds; `tools/check-rfd4p-batch.py` holds those conditions'
+  batch to upstream's; `tools/check-design-page.py` clicks a residue for real
+  (and with `--generate` generates from it). Picking a SPAN's residues the same
+  way is the open half.
+- **AtomWorks Studio's generation options** — **done** (2026-10-26): Thinking,
+  Backbone K, Latents K and Partial % on the page, recorded in job.json.

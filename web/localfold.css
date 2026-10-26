@@ -1438,6 +1438,15 @@
 #designOptions .fetch-option-group.unavailable input { opacity: .45; cursor: not-allowed; }
 .unavailable-reason { font-style: italic; }
 
+/* THE CONDITION EDITOR under the viewer (web/condition-editor.js): one strip of controls, the rows
+   as the selections they write, each with its own remove button. Wraps on a phone. */
+.condition-editor .condition-controls { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 4px; }
+.condition-editor .condition-controls [hidden] { display: none; }
+.condition-editor .condition-controls :disabled { opacity: .45; cursor: not-allowed; }
+.condition-rows { list-style: none; margin: 6px 0 0; padding: 0; font-size: 13px; }
+.condition-rows li { padding: 2px 0; overflow-wrap: anywhere; }
+.condition-drop { border: none; background: none; color: #6b7280; cursor: pointer; font-size: 15px; padding: 0 4px; }
+
 /* What a control says underneath itself. */
 .option-note {
   font-size: 12px;

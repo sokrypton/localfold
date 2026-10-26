@@ -956,6 +956,109 @@ def main():
             bad.append(f"the secondary structures were not restored: {cath['structures']}")
         if cath["problems"] != "":
             bad.append(f"the labelled preset reported a problem: {cath['problems']!r}")
+
+        # 🔴 AND THE CONDITION EDITOR, WITH A REAL CLICK. Raw 1PRW is opened from the file control,
+        # which must draw it; a pixel over a residue is found with py2Dmol's own picker and CLICKED
+        # through CDP's input events - not `setResidueSelection`, which would test an API the reader
+        # never touches - and the row added must name that residue in the selection language's own
+        # numbering, narrowed to the atoms typed. Last, because it leaves a structure loaded.
+        cdp.evaluate(ws, """(async () => {
+          const pick = document.getElementById('preset');
+          pick.value = ''; pick.dispatchEvent(new Event('change'));
+          const m = document.getElementById('method'); m.value = 'rfd4p'; m.dispatchEvent(new Event('change'));
+          const bytes = await (await fetch('/tools/fixtures/rcsb/1prw.cif.zst')).arrayBuffer();
+          const dt = new DataTransfer(); dt.items.add(new File([bytes], '1prw.cif.zst'));
+          const input = document.getElementById('structure-file'); input.files = dt.files;
+          input.dispatchEvent(new Event('change'));
+          return 1;
+        })()""")
+        cdp.wait_for(ws, "(() => { const e = Object.values(window.py2dmol_viewers ?? {})[0];"
+                         " return ((e?.renderer ?? e)?.chains?.length ?? 0) > 100; })()", 30, "1PRW drawn")
+        time.sleep(1.0)
+        target = json.loads(cdp.evaluate(ws, """(() => {
+          const entry = Object.values(window.py2dmol_viewers ?? {})[0];
+          const r = entry?.renderer ?? entry;
+          const box = document.querySelector('#viewer-container canvas').getBoundingClientRect();
+          for (let y = box.top + box.height * 0.3; y < box.bottom - 30; y += 4)
+            for (let x = box.left + box.width * 0.3; x < box.right - 10; x += 4) {
+              const hit = r.pickResidueAt(x, y);
+              if (hit >= 0 && r.positionTypes?.[hit] === 'P')
+                return JSON.stringify({ x, y, chain: r.chains[hit], num: r.residueNumbers[hit] });
+            }
+          return 'null';
+        })()"""))
+        editor = None
+        if target is None:
+            bad.append("no residue of 1PRW could be found under the pointer to click")
+        else:
+            for kind in ("mousePressed", "mouseReleased"):
+                ws.call("Input.dispatchMouseEvent", type=kind, x=target["x"], y=target["y"],
+                        button="left", clickCount=1)
+                time.sleep(0.05)
+            time.sleep(0.4)
+            editor = json.loads(cdp.evaluate(ws, """(() => {
+              const kind = document.getElementById('condition-kind');
+              kind.value = 'C_MCOORD'; kind.dispatchEvent(new Event('change'));
+              document.getElementById('condition-value').value = 'COORDINATING';
+              document.getElementById('condition-atoms').value = 'od1,OD2';
+              document.getElementById('condition-add').click();
+              const added = window.__designConditions();
+              const entry = Object.values(window.py2dmol_viewers ?? {})[0];
+              (entry?.renderer ?? entry).clearResidueSelection();
+              document.getElementById('condition-add').click();
+              const empty = document.getElementById('condition-note').textContent;
+              const m = document.getElementById('method'); m.value = 'hunter'; m.dispatchEvent(new Event('change'));
+              const greyed = document.getElementById('condition-add').disabled;
+              m.value = 'rfd4p'; m.dispatchEvent(new Event('change'));
+              return JSON.stringify({ added, empty, greyed, shown: document.getElementById('condition-host').style.display,
+                rows: [...document.querySelectorAll('#condition-rows li')].length,
+                regreyed: document.getElementById('condition-add').disabled });
+            })()"""))
+            print(f"  condition editor: clicked {target['chain']}{target['num']} -> {editor}")
+            want = {"C_MCOORD": {"COORDINATING": [
+                {"select": f"sel('{target['chain']}/*/[{target['num']}]/[OD1,OD2]')"}]}}
+            # The spans the CATH example left still carry their C_SEC labels, and those are still
+            # the job: the editor's row is merged AFTER them, never in their place.
+            added = editor["added"] or {}
+            if added.get("C_MCOORD") != want["C_MCOORD"] or list(added)[-1:] != ["C_MCOORD"] \
+                    or "C_SEC" not in added:
+                bad.append(f"the clicked residue became {added}, expected the spans' C_SEC then {want}")
+            if editor["rows"] != 1 or editor["shown"] != "":
+                bad.append(f"the editor shows {editor['rows']} rows (display {editor['shown']!r}), expected 1")
+            if editor["empty"] != "pick residues in the viewer first":
+                bad.append(f"adding with nothing picked was not refused: {editor['empty']!r}")
+            if not editor["greyed"] or editor["regreyed"]:
+                bad.append("the editor is not greyed under Protein Hunter and live again under RFD4-Proteina")
+            # ...and, with --generate, a real generation from it: the archived job must carry the
+            # row, merged into the conditions the engine was handed, and the run must finish.
+            if "--generate" in sys.argv:
+                cdp.evaluate(ws, """(() => {
+                  window.__designSpans.set([{ kind: 'generated', min: 6, max: 6 },
+                    { kind: 'segment', chain: 'A', first: 60, last: 80 }, { kind: 'generated', min: 6, max: 6 }]);
+                  document.getElementById('steps').value = '8';
+                  document.getElementById('beam').value = '1';
+                  document.getElementById('validate').value = '';
+                  document.getElementById('hunt').click();
+                  return 1;
+                })()""")
+                deadline = time.time() + 1200
+                state = {}
+                while time.time() < deadline:
+                    state = json.loads(cdp.evaluate(ws, """JSON.stringify({
+                      status: document.getElementById('status-message').textContent,
+                      failed: document.getElementById('status-message').classList.contains('error') })"""))
+                    if state["failed"] or state["status"].startswith("done"):
+                        break
+                    time.sleep(3)
+                print(f"  conditioned generation: {state.get('status')}")
+                if state.get("failed") or not state.get("status", "").startswith("done"):
+                    bad.append(f"a generation with an editor condition did not finish: {state}")
+                else:
+                    job = json.loads(dict(json.loads(cdp.evaluate(ws,
+                        "JSON.stringify(window.__designArchive().map(([n, c]) => [n, typeof c === 'string' ? c : null]))")))
+                        ["job.json"])
+                    if job.get("conditions", {}).get("C_MCOORD") != want["C_MCOORD"]:
+                        bad.append(f"the archived job lost the editor's row: {job.get('conditions')}")
     finally:
         proc.terminate()
         server.terminate()

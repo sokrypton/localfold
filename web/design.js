@@ -17,8 +17,8 @@
  * See docs/DESIGN.md for the plan this page is step one of.
  */
 import {
-  chainColour, chainOfSpans, chainsOf, conditionsOf, contigOf, createContigList, hotspotsOf,
-  drawLengths, LIGAND_COLOUR, shade, spansFromContig,
+  chainColour, chainOfSpans, chainsOf, CONDITION_COLOURS, conditionsOf, contigOf, createContigList,
+  drawLengths, hotspotsOf, INPUT_COLOUR, LIGAND_COLOUR, shade, spansFromContig,
 } from "./contig-ui.js";
 import { DEFAULT_STEPS, generate } from "./generate.js";
 import { writeZip } from "./zip.js";
@@ -32,6 +32,7 @@ import { CHAIN_IDS, MAX_ALANINE } from "../webgpu/design/hunter-loop.js";
 
 import { hunt } from "./hunt.js";
 import { createStructureViewer } from "./viewer.js";
+import { createConditionEditor, inputResidueMap, inputStructurePdb, picksOf } from "./condition-editor.js";
 import { alignToReference } from "../cpu/design/align.js";
 import { translateSpans } from "../cpu/design/source-numbering.js";
 import { HUNTER_CANNOT, presetSuits } from "../cpu/design/preset-methods.js";
@@ -104,6 +105,9 @@ const presetNote = element("preset-note");
 // being declared below the callback that reads them. The rule that actually
 // holds is: shared state at the top, helpers as function DECLARATIONS.
 let running = null;
+// 🔴 DECLARED HERE, MADE BELOW: `paintMethod` runs at load, before the viewer the editor reads
+// exists, and a `const` it reached first would throw - this page's fifth binding of that kind.
+let conditionEditor = null;
 let loaded = null;
 // 🔴 THE FIRST CYCLE OF THE RUN, KEPT AS THE FRAME EVERY LATER ONE IS FITTED
 // ONTO, and the designed chain's held positions, kept so the viewer can paint
@@ -373,6 +377,7 @@ folders.addEventListener("change", () => paintMethod());
  * because RFD4 generates structure directly rather than folding and redesigning
  * in a loop - so there is no cycle, no designer, and no folding model.
  */
+const HUNTER_NO_CONDITIONS = "Protein Hunter folds sequences; these conditions are RFD4-Proteina's.";
 const UNUSED_BY = {
   hunter: {
     thinkingGroup: "Protein Hunter folds with a diffusion model; Thinking is RFD4-Proteina's recycle budget.",
@@ -451,6 +456,7 @@ const paintMethod = () => {
   // greyed WITH ITS REASON and never removed - a control that vanishes when the
   // method changes teaches nothing and makes the reader hunt for it again.
   const unusable = UNUSED_BY[method.value] ?? {};
+  conditionEditor?.disable(hunter ? HUNTER_NO_CONDITIONS : null);
   for (const id of new Set([...Object.keys(UNUSED_BY.hunter), ...Object.keys(UNUSED_BY.rfd4p)])) {
     const group = document.getElementById(id);
     if (group === null) continue;
@@ -629,6 +635,65 @@ const viewer = createStructureViewer({
   onFail: (message) => say(`the viewer could not start: ${message}`, true),
 });
 
+// ---- the condition editor ----------------------------------------------------------------------
+// 🔴 THE VIEWER SHOWS THE LOADED STRUCTURE UNTIL A RUN TAKES IT, and only then can a click name one
+// of its residues: a design's positions are not the input's. `inputView` is set while it does.
+let inputView = null;
+const conditionHost = element("condition-host");
+
+/** Paint the drawn input: grey, with each condition row's residues in its own colour. */
+const paintInput = () => {
+  if (inputView === null || viewer.renderer === undefined) return;
+  viewer.colourChains(Object.fromEntries([...inputView.chainOf.keys()].map((letter) => [letter, INPUT_COLOUR])));
+  const map = inputResidueMap(viewer.renderer, inputView.chainOf);
+  conditionEditor.rows.forEach((row, index) => {
+    const wanted = new Set(row.picks.map((pick) => `${pick.chain}:${pick.resId}`));
+    const positions = map.flatMap((residue, i) => (wanted.has(`${residue.chain}:${residue.resId}`) ? [i] : []));
+    viewer.colourResidues(positions, CONDITION_COLOURS[index % CONDITION_COLOURS.length]);
+  });
+};
+
+/** Draw the loaded structure in the viewer, for picking. */
+function showInput() {
+  if (loaded === null || running !== null) return;
+  const { pdb, chainOf } = inputStructurePdb(loaded.atoms);
+  viewer.cancelAnimations();
+  viewer.reset();
+  viewer.forgetCamera();
+  viewerBox.style.display = "";
+  inputView = { chainOf };
+  viewer.push(pdb, (built) => { if (built) viewer.orient(); });
+  conditionHost.style.display = "";
+  paintInput();
+}
+
+conditionEditor = createConditionEditor(conditionHost, {
+  picks: () => {
+    if (inputView === null || viewer.renderer === undefined) {
+      showInput();
+      throw new Error("the viewer was showing a design - the structure is drawn again; pick its residues");
+    }
+    const selected = viewer.renderer.residueSelection;
+    return picksOf(selected instanceof Set ? [...selected] : [],
+      inputResidueMap(viewer.renderer, inputView.chainOf));
+  },
+  onChange: () => { paintInput(); paintJob(); },
+});
+conditionEditor.disable(method.value === "hunter" ? HUNTER_NO_CONDITIONS : null);
+/**
+ * The conditions a generation is handed: a preset's, then the spans' hotspots over them (what the
+ * user just typed wins), then the editor's rows appended after both - upstream applies arms in
+ * order and the last wins an atom two of them select, so what was set by hand is set last.
+ */
+function runConditions(spans) {
+  const fromSpans = conditionsOf(spans);
+  const base = fromSpans === undefined ? presetExtras.conditions : { ...presetExtras.conditions, ...fromSpans };
+  return conditionEditor.rows.length === 0 ? base : conditionEditor.conditions(base);
+}
+// A driver's door, as `__designSpans` is: the conditions a generation would be handed now.
+window.__designConditions = () => runConditions(spanList.read()) ?? null;
+window.__designShowInput = showInput;
+
 const startHunt = async () => {
   const spans = spanList.read();
   // 🔴 THE SPANS ARE THE JOB; `chainsOf` is how Hunter reads them. It also says
@@ -649,6 +714,7 @@ const startHunt = async () => {
   // length, so frames cannot be shared with the last one.
   viewer.cancelAnimations();
   viewer.reset();
+  inputView = null;
   // A new run is a new frame of reference and a new held set.
   reference = null;
   held = hold;
@@ -1028,6 +1094,9 @@ const takeStructure = (data, name, offerChain = true) => {
   if (chains.size === 0) throw new Error("no atoms in that file");
   loaded = { data, name, atoms, chains };
   describeStructure();
+  // A new structure's residues are new names: rows that named the old one would select nothing.
+  if (conditionEditor.rows.length > 0) conditionEditor.set([]);
+  showInput();
   // Offer its first chain as a span, since that is almost always the next move.
   // 🔴 NOT WHEN A PRESET LOADED IT. The preset has just written the spans it
   // means, and a preset with no `From structure` span - an unconditional
@@ -1291,8 +1360,16 @@ const startGenerate = async () => {
     say(error.message, true);
     return;
   }
+  // 🔴 AN EXAMPLE DRIVEN BY ITS STRUCTURE'S OWN ANNOTATIONS READS NO SPEC, so rows added here would
+  // be dropped without a word (generate()'s `fromAnnotations`). Refused instead, with the way out.
+  if (conditionEditor.rows.length > 0 && presetExtras.fromAnnotations) {
+    say("this example is driven by its structure's own annotations, which take no added conditions"
+      + " - clear the example (or load the structure yourself) to add them", true);
+    return;
+  }
   const controller = new AbortController();
   running = controller;
+  inputView = null;
   huntLabel.textContent = "Stop";
   resultsBody.replaceChildren();
   track.replaceChildren();
@@ -1326,11 +1403,7 @@ const startGenerate = async () => {
     const result = await generate({
       contig,
       ...presetExtras,
-      // 🔴 HOTSPOTS NAMED IN THE SPANS WIN OVER A PRESET'S, because they are
-      // what the user just typed. A preset's other conditions stay.
-      ...(conditionsOf(spans) === undefined ? {} : {
-        conditions: { ...presetExtras.conditions, ...conditionsOf(spans) },
-      }),
+      ...(runConditions(spans) === undefined ? {} : { conditions: runConditions(spans) }),
       // A structure the user loaded is the one they mean, over a preset's.
       ...(loaded === null ? {} : { inputCif: loaded.data }),
       steps: number("steps", RFD4_STEPS),

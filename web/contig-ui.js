@@ -76,6 +76,14 @@ export const CHAIN_COLOURS = ["#2563eb", "#16a34a", "#d946ef", "#ea580c", "#0891
 /** A ligand belongs to no chain, so it takes the one neutral in the set. */
 export const LIGAND_COLOUR = "#78716c";
 
+/**
+ * The loaded structure while residues are picked from it for conditions (web/condition-editor.js):
+ * drawn pale, each condition row's residues in one of these. Hues the chain palette does not use,
+ * because the view is about which residue carries which condition and not about chains.
+ */
+export const INPUT_COLOUR = "#cbd5e1";
+export const CONDITION_COLOURS = ["#e11d48", "#f59e0b", "#7c3aed", "#0ea5e9", "#84cc16", "#be185d", "#1e293b"];
+
 /** The colour of the nth chain, wrapping rather than running out. */
 export function chainColour(index) {
   return CHAIN_COLOURS[((index % CHAIN_COLOURS.length) + CHAIN_COLOURS.length) % CHAIN_COLOURS.length];
