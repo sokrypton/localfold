@@ -478,9 +478,28 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
     }
   };
   cudaGraphExec_t graph = nullptr;
-  // capturing costs about half a replayed pass and a replay saves a few percent of one (59 residues:
-  // 100 against 107 ms), so only a long recycle run gains - as cuda/af3's trunk graph rule
-  bool graphs = !warm && !getenv("AF2_NO_GRAPHS") && oracle.empty() && (passes >= 8 || getenv("AF2_GRAPHS"));
+  // every pass after the first replays one graph of the pass's ~1,500-1,700 kernels: a replay closes the gaps between
+  // launches, ~2 ms a pass at any length (A100: 68 residues 63.8 -> 57.7 ms over 4 passes, 261 301.5 -> 294.3). The
+  // graph is captured right after pass 0 is LAUNCHED, while the GPU runs it - capturing is ~5 ms of host time and
+  // instantiating ~2.3, which at pass 1 (the old place) sat on the critical path whenever anything waited on pass 0:
+  // the early stop syncs after every pass, and the page's default (0.1 A) turns it on. The warm-up fold captures and
+  // drops one graph, so a served process's first fold does not pay the driver's first instantiate (~7.6 ms).
+  // A fold at a shape the process has not folded runs pass 0 slowly on the host (its scratch grows, synchronously), so
+  // nothing hides a capture there: such a fold runs pass 1 too and captures while the GPU runs THAT, one replay fewer.
+  // (Was: 8 passes and up, a capture at pass 1 measured against a cold fold.) AF2_NO_GRAPHS: none
+  bool graphs = !getenv("AF2_NO_GRAPHS") && oracle.empty() && (passes >= 2 || warm);
+  static std::array<int, 6> lastShape{};
+  const std::array<int, 6> shape{ t.L, t.N, t.E, t.T, templates, (int)multimer };
+  const int capturePass = warm || shape == lastShape ? 0 : 1;
+  if (!warm) lastShape = shape;
+  auto capture = [&] {
+    cudaGraph_t g;
+    CK(cudaStreamBeginCapture(STREAM, cudaStreamCaptureModeThreadLocal));
+    rest(false, 1);
+    CK(cudaStreamEndCapture(STREAM, &g));
+    CK(cudaGraphInstantiate(&graph, g, 0));
+    CK(cudaGraphDestroy(g));
+  };
   std::vector<float> previous37, seqMask;
   double converged = -1; int ran = passes;
   if (TOLERANCE > 0 && !warm) seqMask = std::vector<float>(M.f("seq_mask"), M.f("seq_mask") + L);
@@ -596,8 +615,9 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
     embed(t, pass, prevRow, prevPair, prevPos);
     // (the embedding's own buffers, on a card short of room - not its two masks, which the stacks read)
     if (tight) releaseScratch({ "emb.dgram", "emb.dgl", "emb.prevln", "emb.rel", "emb.rell", "emb.tmp", "emb.extraFeat" });
-    if (!graphs || tight || pass == 0) {
+    if (!graphs || tight || pass <= capturePass) {
       rest(check, pass);
+      if (graphs && !tight && pass == capturePass && pass + 1 < std::max(passes, 2) && !graph) capture();   // (while the GPU runs it)
       if (getenv("AF2_PASS_TIMES")) {
         CK(cudaStreamSynchronize(STREAM));
         printf("  pass %d done at %.1f ms\n", pass, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tf).count());
@@ -605,14 +625,6 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
       tapPass(pass);
       if (settled(pass)) break;
       continue;
-    }
-    if (!graph) {
-      cudaGraph_t g;
-      CK(cudaStreamBeginCapture(STREAM, cudaStreamCaptureModeThreadLocal));
-      rest(false, pass);
-      CK(cudaStreamEndCapture(STREAM, &g));
-      CK(cudaGraphInstantiate(&graph, g, 0));
-      CK(cudaGraphDestroy(g));
     }
     CK(cudaGraphLaunch(graph, STREAM));
     if (getenv("AF2_PASS_TIMES")) {

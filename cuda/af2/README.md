@@ -219,7 +219,7 @@ Every intermediate seam is 1e-8 to 5e-7 in float32 (the monomer template's torsi
   contraction.
 - The MSA transition's second bias carried by the product, through a ones column.
 - Masks skipped when they are all ones.
-- CUDA graphs from 8 passes up (below that, capture costs more than it saves).
+- CUDA graphs from 2 passes up, captured while the GPU runs the pass before (below).
 
 On the A100, 5CAJ (261 residues, 512 + 1024 rows):
 
@@ -456,6 +456,25 @@ five were; `triIn256K` -11%, ~1% of a fold). Summing in another order is ~1e-7 a
 pTM lower on 10 of 12 seeds (mean -0.017) - unexplained, so not worth 1%. Nor the same LN vectorised four channels a
 lane (1%, within the drift), nor 48-key tiles for the MSA row attention where 64 pad more (261 residues: no change -
 its rate there is not the padding).
+
+### CUDA graphs from two passes, captured behind the pass before (2026-10-26)
+
+Every pass after the first replays one graph of its ~1,500-1,700 kernels, which closes the gaps between launches - ~2 ms
+a pass at any length. The old rule (8 passes) captured at pass 1, on the critical path whenever anything waited on pass
+0, and the page's early stop (0.1 A, on by default) syncs after every pass. The capture (~5 ms of host time, ~2.3 to
+instantiate) now runs right after pass 0 is launched, while the GPU runs it; a shape the process has not folded runs
+pass 0 slowly on the host (its scratch grows), so it captures during pass 1 instead, one replay fewer. The warm-up fold
+captures and drops one graph. A100, resident server, 4 passes at 508:1024, two interleaved rounds (new = the process's
+first fold at that shape, repeat = the median of the next three), PDBs byte-identical to `AF2_NO_GRAPHS`:
+
+| | 68 res | 261 res | 522 res | 261 + 7,907-row MSA |
+|---|---:|---:|---:|---:|
+| repeat, no graphs | 64.7 ms | 313.7 | 1103.7 | 1087.3 |
+| **repeat, graphs** | **58.4** | **307.4** | 1100.8 | 1082.8 |
+| ...early stop 0.1 A, no graphs / graphs | 65.3 / **59.2** | 316.9 / **310.1** | | |
+| new shape, no graphs / graphs | 69.6 / 70.2 | 332.1 / **325.9** | 1116.1 / 1113.6 | 1088.2 / 1085.7 |
+
+(Found on branch argon-ptx, Round 5 Module 6, and ported.)
 
 ## A deep alignment's featurisation (2026-10-08)
 
