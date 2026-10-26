@@ -373,7 +373,10 @@ async function main() {
   const profile = ANDROID ? null
     : join(process.env.TMPDIR ?? "/tmp", `gpu-chrome-${process.pid}-${Date.now()}`);
   const chrome = ANDROID ? null : spawn(CHROME, [
-    ...(process.platform === "linux" && !LINUX_HEADLESS ? [] : ["--headless=new"]),
+    // LOCALFOLD_HEADED=1 opens a visible window instead (macOS): a visitor's page competes with the compositor at
+    // their device pixel ratio, which headless does not, and a change can measure 1.06x visible where it measured
+    // 1.02x headless (docs/RFD4P-FROM-LOCALDESIGN.md section 5).
+    ...((process.platform === "linux" && !LINUX_HEADLESS) || process.env.LOCALFOLD_HEADED === "1" ? [] : ["--headless=new"]),
     ...(STOCK_FLAGS ? [] : ["--enable-unsafe-webgpu"]), "--disable-gpu-sandbox",
     ...PLATFORM_FLAGS,
     // performance.memory rounds to 100 KiB without this, which is too coarse to

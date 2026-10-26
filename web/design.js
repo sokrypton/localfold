@@ -468,7 +468,7 @@ paintMethod();
 // worst time to find out.
 const gpuSummary = element("gpu-summary");
 if (navigator.gpu === undefined) {
-  gpuSummary.textContent = "WebGPU unavailable — this page needs Chrome or Edge with WebGPU to fold.";
+  gpuSummary.textContent = "WebGPU unavailable — this page needs Chrome or Edge 113+, or Safari 26+, to fold.";
   gpuSummary.classList.add("warn");
 } else {
   navigator.gpu.requestAdapter().then((adapter) => {
