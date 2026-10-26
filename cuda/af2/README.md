@@ -549,6 +549,20 @@ instead, one replay fewer. A100, resident server, PDBs byte-identical to `AF2_NO
 
 A served process folds AF2's five models at one length in a row, so all but the first are the repeated row.
 
+**Module 7: short sequences, not taken.** With graphs every pass now runs at the GPU's kernel time (68 residues: 57.8
+ms of kernels, 57.8 of wall; 261: 295.8 and 294.5), so what is left is inside the kernels. At 68 residues the five
+fused pair kernels (`triInK`, `gridInK`, `fusedTransitionK`, `triangleOutK`, `gridOutK`; 48% of the fold) launch
+73-81 blocks on 108 SMs - a quarter of a wave, the SMs 7-15% busy. Two ways to more blocks, both measured:
+
+- *Smaller row tiles* (`MIN_BLOCKS` 54 -> 108 / 216, fewer warps a block): 68 residues 57.7 -> 58.7 / 58.7 ms, 100
+  76.3 -> 77.2 / 80.5, 150 117.2 -> 117.3 / 121.5. AF3's sweep's answer holds for AF2.
+- *Splitting `gridInK`'s 512 output columns across 2 or 4 blocks of the same rows* (each its own run of the weight's
+  chunks, the LayerNorm prologue recomputed, the bias projection the last split's; PDBs bit-identical): 68 residues
+  58.2 -> 57.6 / 57.5 ms, 100 level, 150 117.9 -> 121.3 / 125.2, 261 294.6 -> 301.7 / 317.1. 1.7 us of a 15.6 us call
+  at 68 residues: a short call is a fixed chain - the prologue, the staged weight loads, the barriers, the epilogue -
+  of ~10-15 us whatever its blocks do. At 68 residues a fold is ~6,000 such calls; fewer of them (modules fused
+  across their boundaries) is the lever there, not a better tile.
+
 ## A deep alignment's featurisation (2026-10-08)
 
 🔴 **SUPERSEDED THE SAME DAY: the featuriser is native now** (`cuda/featurise/af2-featurise`), its nearest-centre
