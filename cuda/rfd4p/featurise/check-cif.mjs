@@ -788,8 +788,9 @@ function selectionsFor(js) {
     `sel('${cid}/*/*/${atom}')`,
     `sel('*/${js.res_name[0]}/*/*')`,
     `sel('${cid}/*/[${pick[0]}]/*')|sel('${cid}/*/[${pick[2]}]/*')`,
-    // A BARE residue number and a bare hyphenated one: the second is the single value `ids[1]`,
-    // not the range it looks like.
+    // A BARE residue number and a bare hyphenated one: the second is REFUSED, as atomworks
+    // refuses it ("ranges must be wrapped in brackets") - it read as the single value `ids[1]`
+    // here once, which was neither the range it looks like nor upstream's answer.
     `sel('${cid}/*/${ids[1]}/*')`,
     `sel('${cid}/*/${ids[1]}-${ids[4]}/*')`,
     `sel('${cid}/*/[${padded}]/*')`,
@@ -820,9 +821,9 @@ function selectionsFor(js) {
  * double-quoted for exactly that reason. So selecting a nucleic atom by name is the ordinary
  * case that needs the machinery, and nothing had asked for one. Measured against the
  * reference: a double-quoted path ending in `C1'` is 9 atoms and the bracketed two-name list
- * is 18, while the SQL-style doubled-quote form inside single quotes silently matches NOTHING
- * - which is the reference's answer and so must be this port's, and is in the corpus for that
- * reason rather than because anybody would write it.
+ * is 18, while the SQL-style doubled-quote form inside single quotes is a Python syntax error
+ * (the string closes at the prime and `')` never does) - refused by atomworks, and so by both
+ * ports, and in the corpus for that reason rather than because anybody would write it.
  */
 function primedSelections(cid, names) {
   const primed = names.filter((n) => n.includes("'")).sort();
@@ -1448,13 +1449,23 @@ for (const [name, text] of cases) {
     let line;
     try {
       line = execFileSync(binary, ["x", `--dump-cif=${path}`, `--select=${sel}`],
-        { encoding: "utf8", maxBuffer: 1 << 28 }).trim();
+        { encoding: "utf8", maxBuffer: 1 << 28, stdio: "pipe" }).trim();
     } catch (err) {
-      wrong.push(`select ${sel} refused: ${String(err.stderr ?? err.message).trim().split("\n")[0]}`);
+      // A refusal is an answer, and it must be both sides': atomworks raises on a bare range,
+      // an unterminated string and a name that is not one.
+      let pageRefused = false;
+      try { evalSelection(js, sel); } catch { pageRefused = true; }
+      if (!pageRefused) wrong.push(`select ${sel} refused: ${String(err.stderr ?? err.message).trim().split("\n")[0]}`);
       continue;
     }
     const got = line.split("\t").slice(2).map(Number);
-    const want = evalSelection(js, sel).map((v) => (v ? 1 : 0));
+    let want;
+    try {
+      want = evalSelection(js, sel).map((v) => (v ? 1 : 0));
+    } catch (err) {
+      wrong.push(`select ${sel} accepted where the page refuses: ${err.message}`);
+      continue;
+    }
     if (got.length !== want.length) wrong.push(`select ${sel} length ${got.length}`);
     else {
       const bad = got.filter((v, i) => v !== want[i]).length;

@@ -965,6 +965,23 @@ def main() -> int:
             got["cif"] = {"structures": int(m.group(1)) if m else 0,
                           "differing": int(m.group(2)) if m else -1}
 
+            # 🔴 AND THE SELECTION LANGUAGE, AGAINST ATOMWORKS ITSELF rather than against the
+            # page: every condition's `select:` goes through it, and the evaluator both ports had
+            # was a reading of the language that atomworks disagreed with on precedence, chained
+            # comparisons and names. Skipped, and said so, on a box without upstream's venv.
+            venv = Path.home() / "venv_rfd4p" / "bin" / "python"
+            if venv.exists():
+                r = run([venv, REPO / "tools" / "check-rfd4p-query.py", f"--binary={HERE / 'featurise' / 'rfd4p-featurise'}"],
+                        cwd=REPO)
+                lines = [ln for ln in r.stdout.splitlines() if " agree with upstream" in ln]
+                ok = r.returncode == 0 and len(lines) == 2
+                if not ok:
+                    failed += 1
+                    print(r.stdout[-1500:], r.stderr[-600:])
+                print(f"  {'query':10s} {'; '.join(lines) or 'no result'}  {'ok ' if ok else 'DIFFERS'}")
+            else:
+                print(f"  {'query':10s} skipped: no ~/venv_rfd4p to run atomworks")
+
     name, case_dir, export_flags, fold_flags = SPEED
     if not args.only or args.only in name:
         ensure_inputs(case_dir, None, export_flags)

@@ -298,6 +298,9 @@ inline AtomArray concat(const vector<AtomArray>& parts) {
   for (const AtomArray& p : parts) total += p.n();
   out.site.n = total;
   out.ann = std::move(joined);
+  // Biotite keeps only the categories every part has, so one part without a B column is enough
+  // (`concatAtoms`); `slice` keeps the flag by copying the site.
+  for (const AtomArray& p : parts) out.site.noBFactorColumn |= p.site.noBFactorColumn;
 
   out.bonds.clear();
   int offset = 0;

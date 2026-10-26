@@ -1,6 +1,7 @@
 /**
- * RFD4-Proteina Condition definitions, enums, CATH fold mappings, and
- * `sel('<chain>/<resname>/<resid>/<atom>')` selection expression evaluator.
+ * RFD4-Proteina Condition definitions, enums and CATH fold mappings. Selections are
+ * evaluated by pipeline/query.js, upstream's language - this file once carried a second
+ * evaluator nothing called, which disagreed with upstream on ranges and precedence.
  *
  * Matches `rfproteina/conditions.py`, `rfproteina/utils/mask_spec.py`, and
  * `rfproteina/inference_utils/condition_spec.py`.
@@ -269,125 +270,6 @@ export function parseCathCode(codeStr) {
     CATH_ARCHITECTURE_MAP_[cathCodeByLevel(code, 'A')] ?? -1,
     CATH_TOPOLOGY_MAP_[cathCodeByLevel(code, 'T')] ?? -1,
   ];
-}
-
-function matchFieldSpec(value, specStr, isNumeric = false) {
-  if (!specStr || specStr === "*") return true;
-  const trimmed = specStr.trim();
-  let items = [trimmed];
-  if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
-    items = trimmed
-      .slice(1, -1)
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean);
-  } else if (trimmed.includes(",")) {
-    items = trimmed.split(",").map((s) => s.trim()).filter(Boolean);
-  }
-  for (const item of items) {
-    if (item === "*") return true;
-    if (isNumeric) {
-      const numVal = Number(value);
-      const dashIdx = item.indexOf("-", item.startsWith("-") ? 1 : 0);
-      if (dashIdx > 0) {
-        const lo = Number(item.slice(0, dashIdx));
-        const hi = Number(item.slice(dashIdx + 1));
-        if (numVal >= lo && numVal <= hi) return true;
-      } else if (numVal === Number(item)) {
-        return true;
-      }
-    } else if (String(value) === item) {
-      return true;
-    }
-  }
-  return false;
-}
-
-/**
- * Evaluate a single `sel('<chain>/<resname>/<resid>/<atom>')` path or predicate against an atom list.
- * Returns a `Uint8Array(atoms.length)` boolean mask (1 = selected, 0 = not selected).
- */
-export function evaluateSelection(atoms, expr) {
-  const n = atoms.length;
-  const mask = new Uint8Array(n);
-  if (!expr) return mask;
-  const s = String(expr).trim();
-
-  // Handle compound `|`, `&`, `~`, `and`, `or`, `not`
-  if (s.includes(" | ") || s.includes(" or ")) {
-    const parts = s.split(/\s+(?:\||or)\s+/);
-    for (const part of parts) {
-      const sub = evaluateSelection(atoms, part);
-      for (let i = 0; i < n; i++) mask[i] |= sub[i];
-    }
-    return mask;
-  }
-  if (s.includes(" & ") || s.includes(" and ")) {
-    const parts = s.split(/\s+(?:&|and)\s+/);
-    mask.fill(1);
-    for (const part of parts) {
-      const sub = evaluateSelection(atoms, part);
-      for (let i = 0; i < n; i++) mask[i] &= sub[i];
-    }
-    return mask;
-  }
-  if (s.startsWith("~") || s.startsWith("not ")) {
-    const rest = s.startsWith("~") ? s.slice(1).trim() : s.slice(4).trim();
-    const sub = evaluateSelection(atoms, rest);
-    for (let i = 0; i < n; i++) mask[i] = sub[i] ? 0 : 1;
-    return mask;
-  }
-
-  if (s === "has_nan_coord()") {
-    for (let i = 0; i < n; i++) {
-      const c = atoms[i].coord;
-      mask[i] = !c || !Number.isFinite(c[0]) || !Number.isFinite(c[1]) || !Number.isFinite(c[2]) ? 1 : 0;
-    }
-    return mask;
-  }
-  if (s === "is_ligand") {
-    for (let i = 0; i < n; i++) mask[i] = atoms[i].is_ligand ? 1 : 0;
-    return mask;
-  }
-  if (s === "is_polymer") {
-    for (let i = 0; i < n; i++) mask[i] = atoms[i].is_polymer ? 1 : 0;
-    return mask;
-  }
-  if (s === "is_protein") {
-    for (let i = 0; i < n; i++) mask[i] = atoms[i].is_protein ? 1 : 0;
-    return mask;
-  }
-  if (s === "all" || s === "*") {
-    mask.fill(1);
-    return mask;
-  }
-
-  // Parse `sel('...')` or direct `'chain/resname/resid/atom'`
-  let pathStr = s;
-  const selMatch = s.match(/^sel\(\s*['"]([^'"]*)['"]\s*\)$/);
-  if (selMatch) {
-    pathStr = selMatch[1];
-  }
-
-  const fields = pathStr.split("/");
-  const chainSpec = fields[0] ?? "*";
-  const resNameSpec = fields[1] ?? "*";
-  const resIdSpec = fields[2] ?? "*";
-  const atomNameSpec = fields[3] ?? "*";
-
-  for (let i = 0; i < n; i++) {
-    const a = atoms[i];
-    if (!matchFieldSpec(a.chain_id, chainSpec, false)) continue;
-    const matchResName =
-      matchFieldSpec(a.res_name, resNameSpec, false) ||
-      (a.segment_name && matchFieldSpec(a.segment_name, resNameSpec, false));
-    if (!matchResName) continue;
-    const resIdToCheck = a.original_res_id !== undefined && a.original_res_id > -1000000 ? a.original_res_id : a.res_id;
-    if (!matchFieldSpec(resIdToCheck, resIdSpec, true) && !matchFieldSpec(a.res_id, resIdSpec, true)) continue;
-    if (!matchFieldSpec(a.atom_name, atomNameSpec, false)) continue;
-    mask[i] = 1;
-  }
-  return mask;
 }
 
 export const HBondConditioningEnum = HBondEnum;

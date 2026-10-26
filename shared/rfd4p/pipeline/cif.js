@@ -1022,6 +1022,9 @@ export function parseCifToAtomArray(cifInput, opts = {}) {
     is_leaving_atom: new Array(nAtoms),
     bonds: [],
     annotations: {},
+    // Upstream's selection namespace has no `b_factor` when the file had no B column; this
+    // reader fills NaN either way, so the absence is recorded rather than inferred.
+    noBFactorColumn: !atomSite.B_iso_or_equiv,
   };
 
   for (let k = 0; k < nAtoms; k++) {

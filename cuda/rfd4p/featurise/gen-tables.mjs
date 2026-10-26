@@ -154,11 +154,21 @@ for (const [name, members] of Object.entries(CONDITION_ENUMS)) {
 w("};");
 w("");
 w("// The 1-body condition registry: a spec key to its batch key, its dtype and its enum.");
-w("struct ConditionSpec { const char* fullName; const char* dtype; const char* enumName; };");
+// The default is what `sa_mask(...)` compares a value against: a number (a boolean as 0/1), a
+// string, or neither (a coordinate's triple, whose mask has its own rule).
+w("struct ConditionSpec {");
+w("  const char* fullName; const char* dtype; const char* enumName;");
+w("  bool defaultIsNum; double defaultNum; bool defaultIsStr; const char* defaultStr;");
+w("};");
 w("inline const std::unordered_map<std::string, ConditionSpec> CONDITION_REGISTRY = {");
 const enumName = (e) => Object.entries(CONDITION_ENUMS).find(([, v]) => v === e)?.[0] ?? "";
+const cNum = (v) => (Number.isNaN(v) ? "NAN" : String(v));
 for (const [key, spec] of Object.entries(CONDITION_REGISTRY)) {
-  w(`    {${str(key)}, {${str(spec.fullName)}, ${str(spec.dtype)}, ${str(enumName(spec.enum))}}},`);
+  const d = spec.default;
+  const isNum = typeof d === "number" || typeof d === "boolean";
+  const isStr = typeof d === "string";
+  w(`    {${str(key)}, {${str(spec.fullName)}, ${str(spec.dtype)}, ${str(enumName(spec.enum))}, ` +
+    `${isNum}, ${isNum ? cNum(Number(d)) : "NAN"}, ${isStr}, ${str(isStr ? d : "")}}},`);
 }
 w("};");
 w("");
@@ -390,6 +400,31 @@ w("// `ATOMIC_NUMBER_BY_ELEMENT`'s symbols (encoding.js), which `inferElementSym
 w("inline const std::unordered_set<std::string> INFER_ELEMENTS = {");
 w("    " + Object.keys(ATOMIC_NUMBER_BY_ELEMENT).map(str).join(", ") + ",");
 w("};");
+w("");
+w("// 🔴 THE TABLES UPSTREAM'S SELECTION LANGUAGE DERIVES ITS ANNOTATIONS FROM (atomworks' and");
+w("// biotite's constants, through shared/rfd4p/pipeline/query-tables.js - see that file for their");
+w("// BSD notices). `selection.h` reads these and nothing typed.");
+{
+  const Q = await import("../../../shared/rfd4p/pipeline/query-tables.js");
+  const set = (name, values) => {
+    w(`inline const std::unordered_set<std::string> Q_${name} = {`);
+    for (let i = 0; i < values.length; i += 12) w("    " + values.slice(i, i + 12).map(str).join(", ") + ",");
+    w("};");
+  };
+  for (const name of ["PROTEIN_BACKBONE_ATOM_NAMES", "RNA_BACKBONE_ATOM_NAMES", "DNA_BACKBONE_ATOM_NAMES",
+    "NUCLEIC_ACID_BACKBONE_ATOM_NAMES", "STANDARD_AA", "STANDARD_RNA", "STANDARD_DNA",
+    "PYRIMIDINE_RESIDUES", "PURINE_RESIDUES", "METAL_ELEMENTS", "CARBOHYDRATE_NAMES"]) set(name, [...Q[name]]);
+  for (const name of ["UNKNOWN_AA", "UNKNOWN_RNA", "UNKNOWN_DNA", "MASKED"]) {
+    w(`inline const std::string Q_${name} = ${str(Q[name])};`);
+  }
+  for (const name of ["PROTEIN_CHAIN_TYPES", "NUCLEIC_CHAIN_TYPES", "POLYMER_CHAIN_TYPES", "NON_POLYMER_CHAIN_TYPES"]) {
+    w(`inline const std::unordered_set<int> Q_${name} = {${Q[name].join(", ")}};`);
+  }
+  for (const name of ["DNA", "RNA", "POLYPEPTIDE_L"]) w(`inline const int Q_CHAIN_${name} = ${Q.CHAIN_TYPE[name]};`);
+  w("inline const std::unordered_map<std::string, std::unordered_set<std::string>> Q_TIP_ATOM_NAMES = {");
+  for (const [res, names] of Object.entries(Q.TIP_ATOM_NAMES)) w(`    {${str(res)}, {${names.map(str).join(", ")}}},`);
+  w("};");
+}
 w("}  // namespace tables");
 w("}  // namespace rfd4p");
 

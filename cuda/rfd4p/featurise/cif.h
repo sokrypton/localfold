@@ -188,6 +188,9 @@ struct AtomSite {
   // three decimals needs double - what needs it is agreeing with the reference bit for bit.
   vector<double> x, y, z, bFactor, occupancy;
   vector<uint8_t> hetero;
+  // Upstream's selection namespace has no `b_factor` when the file had no B column; `bFactor` is
+  // NaN either way, so the absence is recorded rather than inferred (cif.js `noBFactorColumn`).
+  bool noBFactorColumn = false;
   // Every `_atom_site.<name>` this reader does not have a field for, kept by name: the annotation
   // columns are exactly these, and a job's conditioning lives in them.
   std::map<string, vector<string>> extra;
@@ -447,6 +450,7 @@ inline AtomSite readAtomSite(const Block& block) {
   // produces a REFUSAL, which reads as a malformed job rather than as a reader bug.
   AtomSite a;
   a.n = selected.size();
+  a.noBFactorColumn = column("B_iso_or_equiv") == nullptr;
   for (size_t k = 0; k < a.n; ++k) {
     const size_t i = selected[k];
     auto pick = [&](const char* first, const char* second, const char* fallback) {

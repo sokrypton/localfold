@@ -533,6 +533,19 @@ pinned checkpoint revision) found, and this round fixed:
   coordinate group outside 1..32767, a `group:` anywhere but `C_IDX: false`, an enum integer that
   is no member, a two-body condition. `C_NTR`/`C_CTR` and the `mask_*` aliases are recognised; the
   pipeline's own annotations (`SA_CWI`, `S_ATM`, ...) are refused by name rather than written.
+- 🔴 **A condition's `select:` meant something else in both ports.** Upstream evaluates it as a
+  PYTHON expression with numpy's semantics (`atomworks`' `QueryExpression`), and the page's
+  evaluator was a reading of that: `res_id >= 2 & chain_id == 'A'` parsed the way it looks rather
+  than as Python does (`&` binds tighter, so it is a chained comparison and all false), `2 <= res_id
+  <= 60` matched nothing, trailing text was ignored, a bare chain id was a mask where upstream
+  raises NameError, a bare `sel('A/*/1-4/*')` meant residue 1 where upstream refuses it, and five of
+  the forty derived annotations existed. The native one took a union of `sel(...)` and refused the
+  rest. Both are now one engine (`shared/rfd4p/pipeline/query.js`, ported line for line to
+  `featurise/selection.h`) over atomworks' own tables (`tools/gen-rfd4p-query-tables.py`, BSD-3),
+  and `tools/check-rfd4p-query.py` - a `gate.py` arm wherever `~/venv_rfd4p` exists - holds both to
+  atomworks itself: 130 queries over the seven shipped structures, **910 of 910 agree on both
+  sides**, refusals included. The namespace is upstream's too: no `b_factor` where the file has no
+  B column, `altloc_id`, and no aromatic or leaving-atom flag.
 
 ## What is not done
 

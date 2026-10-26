@@ -151,7 +151,8 @@ export function sliceAtoms(atoms, indicesOrStart, stop = undefined) {
   const oldToNew = new Map();
   for (let i = 0; i < nAtoms; i++) oldToNew.set(indices[i], i);
 
-  const out = { nAtoms, bonds: [], annotations: {} };
+  // A missing B column is a property of the array, as an absent annotation category is upstream.
+  const out = { nAtoms, bonds: [], annotations: {}, ...(atoms.noBFactorColumn ? { noBFactorColumn: true } : {}) };
   for (const [k, v] of Object.entries(atoms)) {
     if (k === 'nAtoms' || k === 'bonds' || k === 'annotations') continue;
     if (Array.isArray(v) && v.length === nOrig) {
@@ -202,6 +203,8 @@ export function concatAtoms(arrays) {
   }
 
   const out = { nAtoms: totalAtoms, bonds: [], annotations: {} };
+  // Biotite keeps only the categories every part has, so one part without a B column is enough.
+  if (arrays.some((a) => a.noBFactorColumn)) out.noBFactorColumn = true;
   for (const key of topKeys) {
     out[key] = [];
     for (const a of arrays) {
