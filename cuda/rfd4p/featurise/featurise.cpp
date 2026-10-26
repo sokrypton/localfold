@@ -38,6 +38,7 @@
 #include "selection.h"
 #include "conditions.h"
 #include "../src/schedule.h"
+#include "../src/metrics_tags.h"
 #include "atoms.h"
 #include "chirality.h"
 #include "cif.h"
@@ -1227,8 +1228,37 @@ inline std::map<string, vector<int>> outputTables(const rfd4p::atoms::AtomArray&
   chg.assign((size_t)nTok * 37, 0);
   bfac.assign((size_t)nTok * 37 * 2, 0);
   occ.assign((size_t)nTok * 37 * 2, 0);
+  // What shared/rfd4p/metrics.js reads off the input, for the native metrics (export_input.mjs's
+  // `outputTables` has the same keys): per token its polymer and protein flags, C_SEC, chain
+  // instance, CCD type, C_SEQ and the 28 sequence probabilities as float bits; per input atom its
+  // hotspot flag; the input's bonds as (token * 37 + slot) pairs where both ends have a slot.
+  vector<int>& hot = t["g/mHot"];
+  hot.assign((size_t)nTok * 37, 0);
+  vector<int> slotOf(a.n(), -1);
+  auto intsOf = [&](const char* k) {
+    const auto it = a.ann.ints.find(k);
+    return it == a.ann.ints.end() ? nullptr : &it->second;
+  };
+  const vector<int>* secCol = intsOf("condition_secondary-structure_1_residue");
+  const vector<int>* hotCol = intsOf("condition_hotspot_1_atom");
+  const auto seqIt = a.ann.strings.find("condition_sequence_1_residue");
   for (int tk = 0; tk < nTok; ++tk) {
     const int a0 = starts[tk];
+    t["g/mTok"].push_back(a.site.isPolymer[a0] ? 1 : 0);
+    t["g/mTok"].push_back(a.isProtein.empty() ? 0 : a.isProtein[a0]);
+    t["g/mTok"].push_back(secCol ? (*secCol)[a0] : 0);
+    packString(a.ids.chainIid.empty() ? a.site.chainId[a0] : a.ids.chainIid[a0], 4, t["g/mChainIid"]);
+    string compType = a.site.chemCompType[a0];
+    for (char& c : compType) c = (char)toupper((unsigned char)c);
+    packString(compType, 8, t["g/mCompType"]);
+    packString(seqIt == a.ann.strings.end() ? "<M>" : seqIt->second[a0], 2, t["g/mSeq"]);
+    for (const char* tok : tables::STANDARD_POLYMER_RESIDUES) {
+      const auto it = a.ann.floats.find(string("condition_sequence-probability-") + tok + "_1_residue");
+      const float v = it == a.ann.floats.end() ? NAN : (float)it->second[a0];
+      int32_t w;
+      memcpy(&w, &v, 4);
+      t["g/mSeqProb"].push_back(w);
+    }
     t["g/outAtomize"].push_back(a.atomize.empty() ? 0 : a.atomize[a0]);
     t["g/outHetero"].push_back(a.site.hetero[a0]);
     t["g/outEntity"].push_back(a.site.labelEntityId.empty() ? 0 : a.site.labelEntityId[a0]);
@@ -1248,6 +1278,8 @@ inline std::map<string, vector<int>> outputTables(const rfd4p::atoms::AtomArray&
       }
       if (slot < 0) continue;
       const size_t at = (size_t)tk * 37 + slot;
+      slotOf[ai] = (int)at;
+      hot[at] = hotCol && (*hotCol)[ai] ? 1 : 0;
       vector<int> one;
       packString(a.site.atomName[ai], 1, one);
       name[at] = one[0];
@@ -1263,6 +1295,13 @@ inline std::map<string, vector<int>> outputTables(const rfd4p::atoms::AtomArray&
       packDouble(a.site.occupancy[ai], one);
       occ[at * 2] = one[0];
       occ[at * 2 + 1] = one[1];
+    }
+  }
+  vector<int>& bonds = t["g/mBonds"];
+  for (const auto& bd : a.bonds) {
+    if (slotOf[bd.u] >= 0 && slotOf[bd.v] >= 0) {
+      bonds.push_back(slotOf[bd.u]);
+      bonds.push_back(slotOf[bd.v]);
     }
   }
   return t;
@@ -1284,6 +1323,7 @@ int run(int argc, char** argv) {
   bool generate = false;
   string recycleSchedule = tables::DEFAULT_RECYCLE_SCHEDULE;
   rfd4p::PartialRequest partialReq;
+  vector<string> metricsTags;
   rfd4p::SamplerCfg sampler = rfd4p::defaultSampler();
   for (int i = 1; i < argc; ++i) {
     const string a = argv[i];
@@ -1939,6 +1979,14 @@ int run(int argc, char** argv) {
         if (v && v->isString()) partialReq.inverseFoldingMethod = v->s;
       }
     }
+    // The job's `metrics_tags` (upstream's), which decide the design metrics `--metrics=` computes.
+    if (const Json* mt = spec.get("metrics_tags"); mt && !Json::absent(mt)) {
+      if (!mt->isArray()) { fprintf(stderr, "metrics_tags must be a list\n"); return 1; }
+      for (const Json& v : mt->a) {
+        if (!v.isString()) { fprintf(stderr, "metrics_tags must be a list of strings\n"); return 1; }
+        metricsTags.push_back(v.s);
+      }
+    }
     // The sampler: upstream's config shape over the released defaults (flow.js `resolveSampling`).
     if (const Json* sj = spec.get("sampling"); sj && !Json::absent(sj)) {
       if (!sj->isObject()) { fprintf(stderr, "sampling must be a mapping\n"); return 1; }
@@ -2495,6 +2543,17 @@ int run(int argc, char** argv) {
   g.meta("distDim", cfg.xtPairDistDim);
   g.meta("distMin", cfg.xtPairDistMin);
   g.meta("distMax", cfg.xtPairDistMax);
+  // The job's `metrics_tags` as shared/rfd4p/metrics.js's bits (`metricsTagBits`), with the
+  // `partial_diffusion` upstream's generator adds itself to a run that starts from the input.
+  {
+    vector<string> tags = metricsTags;
+    const bool partialRun = partialReq.inverseFolding || !std::isnan(partialReq.fraction) ||
+                            !std::isnan(partialReq.tBackbone) || !std::isnan(partialReq.tLatent);
+    if (partialRun && std::find(tags.begin(), tags.end(), "partial_diffusion") == tags.end()) {
+      tags.push_back("partial_diffusion");
+    }
+    g.meta("metricsTags", rfd4p::metricsTagBits(tags));
+  }
   // The sampler, for the fold to rebuild its schedules from (flow.js `samplingMeta`, same keys).
   for (int dm = 0; dm < 2; ++dm) {
     const rfd4p::ModalityCfg& m = sampler.m[dm];

@@ -15,9 +15,8 @@
  * input. Every geometry check passed, because none of that is geometry.
  */
 import { readFileSync } from "node:fs";
-import { buildBatch, decodeTextOrZstd } from "../../shared/rfd4p/pipeline/index.js";
-import { parseConditionSpecYaml } from "../../shared/rfd4p/pipeline/spec.js";
-import { processSampleToAtoms, toCifString, toPdbString } from "../../shared/rfd4p/output.js";
+import { toCifString, toPdbString } from "../../shared/rfd4p/output.js";
+import { sampleFromDump } from "./sample-from-dump.mjs";
 
 const args = process.argv.slice(2);
 const option = (name, fallback) =>
@@ -28,45 +27,8 @@ if (!dump || !nativePath || !specPath) {
   console.error("usage: check-writer.mjs --spec=<job.json> [--seed=N] <dump dir> <native file>");
   process.exit(2);
 }
-const seed = Number(option("seed", "0"));
-const repo = new URL("../..", import.meta.url).pathname;
-
-// The batch, built as `export_input.mjs --spec=` builds it.
-const text = readFileSync(specPath, "utf8");
-const job = text.trimStart().startsWith("{") ? JSON.parse(text) : parseConditionSpecYaml(text);
-const cifUrl = job.cifUrl ?? job.input ?? null;
-// A job is a spec unless it says `specMode: false` (featurise.cpp's note).
-const specMode = job.specMode ?? true;
-const inputCif = cifUrl
-  ? decodeTextOrZstd(new Uint8Array(readFileSync(cifUrl.startsWith("/") ? cifUrl
-    : `${repo}${cifUrl.replace(/^\.\//, "")}`)))
-  : undefined;
-const spec = {
-  contig: job.contig,
-  ...(job.conditions === undefined ? {} : { conditions: job.conditions }),
-  ...(job.input_as_annotated_cif ?? job.inputAsAnnotatedCif ? { input_as_annotated_cif: true } : {}),
-};
-const built = !specMode && inputCif !== undefined
-  ? buildBatch(inputCif, { seed })
-  : buildBatch(spec, { seed, ...(inputCif === undefined ? {} : { inputCif }) });
-
-const read = (name, Type) => {
-  try {
-    const b = readFileSync(`${dump}/${name}`);
-    return new Type(b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength));
-  } catch {
-    return null;
-  }
-};
-const structure = processSampleToAtoms({
-  coors: read("coors.f32", Float32Array),
-  atomMask: read("atomMask.u8", Uint8Array),
-  residueType: read("residueType.i32", Int32Array),
-  paddingMask: read("pad.f32", Float32Array),
-  insertionLogits: read("insertion.f32", Float32Array),
-  inputAtoms: built.atoms,
-  batch: built.batch,
-});
+// The batch built as `export_input.mjs --spec=` builds it, and the page's writer over the dump.
+const { structure } = sampleFromDump(specPath, dump, Number(option("seed", "0")));
 const want = nativePath.endsWith(".cif") ? toCifString(structure) : toPdbString(structure);
 if (option("write-page", "")) (await import("node:fs")).writeFileSync(option("write-page", ""), want);
 const have = readFileSync(nativePath, "utf8");

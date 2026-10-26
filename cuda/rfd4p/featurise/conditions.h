@@ -180,14 +180,27 @@ inline void applyConditions(atoms::AtomArray& a, const Spec& conditions,
   vector<std::pair<string, vector<int>>> pendingIndexGroups;
 
   for (const auto& [annotationName, values] : conditions) {
-    auto specIt = tables::CONDITION_REGISTRY.find(annotationName);
-    if (specIt == tables::CONDITION_REGISTRY.end()) {
+    // The registry, then the open-ended `C_SEQ_PROB_<token>` family (`resolveConditionSpec`):
+    // upstream registers one sequence-probability condition per standard residue, under names
+    // a fixed table does not hold.
+    string full, dtype;
+    double resolvedDefault = 0;
+    try {
+      const selection::query::Resolved r = selection::query::resolve(annotationName);
+      full = r.fullName;
+      dtype = r.dtype;
+      if (r.def.t == selection::query::Q::NUM) resolvedDefault = r.def.d;
+    } catch (const std::exception&) {
       fprintf(stderr, "condition '%s' is not in the registry\n", annotationName.c_str());
       exit(1);
     }
-    const string full = specIt->second.fullName, dtype = specIt->second.dtype;
+    const auto specIt = tables::CONDITION_REGISTRY.find(annotationName);
+    const string enumName = specIt == tables::CONDITION_REGISTRY.end() ? "" : specIt->second.enumName;
     auto annSpec = tables::ANNOTATIONS_1BODY.find(full);
-    const double fallback = annSpec == tables::ANNOTATIONS_1BODY.end() ? 0 : annSpec->second.fallback;
+    // A column the table does not describe takes the condition's own default: NaN for a
+    // sequence probability, which is "unspecified" - a 0 there would constrain every residue.
+    const double fallback =
+        annSpec == tables::ANNOTATIONS_1BODY.end() ? resolvedDefault : annSpec->second.fallback;
     const string fallbackText =
         annSpec == tables::ANNOTATIONS_1BODY.end() ? string() : string(annSpec->second.text);
 
@@ -279,7 +292,7 @@ inline void applyConditions(atoms::AtomArray& a, const Spec& conditions,
           if (numeric) {
             // `coerce_enum_value`: an integer must BE a member's value.
             enumVal = atoi(value.c_str());
-            auto members = tables::CONDITION_ENUMS.find(specIt->second.enumName);
+            auto members = tables::CONDITION_ENUMS.find(enumName);
             bool member = false;
             if (members != tables::CONDITION_ENUMS.end()) {
               for (const auto& [name, v] : members->second) member = member || v == enumVal;
@@ -290,10 +303,10 @@ inline void applyConditions(atoms::AtomArray& a, const Spec& conditions,
               exit(1);
             }
           } else {
-            auto members = tables::CONDITION_ENUMS.find(specIt->second.enumName);
+            auto members = tables::CONDITION_ENUMS.find(enumName);
             if (members == tables::CONDITION_ENUMS.end()) {
               fprintf(stderr, "condition '%s' names enum '%s', which is not a table here\n",
-                      annotationName.c_str(), specIt->second.enumName);
+                      annotationName.c_str(), enumName.c_str());
               exit(1);
             }
             auto hit = members->second.find(value);

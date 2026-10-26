@@ -211,64 +211,13 @@ inline std::string chainFromCode(int code) {
  * 🔴 AN UNINDEXED MOTIF IS NEVER EMITTED, SO IT HAS TO BE PUT SOMEWHERE. It is in-context
  * conditioning - the sampler does not write it - so the design comes out without it, and the
  * motif's conditioned coordinates reach the output only by being TRANSFERRED onto a generated
- * token. Which token is a Hungarian assignment, and a wrong one is a plausible structure with
- * the motif in the wrong place.
- *
- * 🔴 AND THE SCORE IS NEGATIVE SQUARED DISTANCE WITH A 1e4 PENALTY FOR A RESIDUE MISMATCH, so
- * an identity disagreement costs more than any distance a structure can produce - the mapping
- * prefers a far ALA to a near GLY, which is the point: it is placing a known motif, not finding
- * the nearest atom.
+ * token. Which token is the insertion head's Hungarian assignment, and a wrong one is a
+ * plausible structure with the motif in the wrong place.
  */
 struct Insertion {
   std::vector<int> target;   // per unindexed token, the generated token it maps onto, or -1
   std::vector<int> source;   // the unindexed tokens, in order
 };
-
-inline Insertion geometricInsertionMapping(const GenOut& g, int n, const int* condIndex,
-                                           const int* resType, const float* coords,
-                                           const float* condCoord, const float* condIntCrd,
-                                           const std::vector<uint8_t>& emitted) {
-  Insertion out;
-  std::vector<int> unidx, idx;
-  for (int tk = 0; tk < n; ++tk) {
-    // A token is unindexed when its live slots are; `condition_index` is per atom and uniform
-    // over a token, so slot 1 (the CA, always present) decides.
-    const bool indexed = condIndex ? condIndex[(size_t)tk * 37 + 1] != 0 : true;
-    if (!indexed) unidx.push_back(tk);
-    else if (emitted.empty() || emitted[tk]) idx.push_back(tk);
-  }
-  if (unidx.empty() || idx.empty()) return out;
-
-  std::vector<double> score((size_t)unidx.size() * idx.size());
-  for (size_t r = 0; r < unidx.size(); ++r) {
-    const int u = unidx[r];
-    const size_t ca = (size_t)u * 37 + 1;
-    // 🔴 THE REFERENCE COORDINATE FALLS BACK IN A FIXED ORDER: `coord_to_be_noised`, then the
-    // conditioned coordinate, then the internal one, then the origin. Each is a different
-    // frame, and taking whichever is finite FIRST is what the reference does.
-    double ref[3] = {0, 0, 0};
-    const float* src = nullptr;
-    if (coords && std::isfinite(coords[ca * 3])) src = coords;
-    else if (condCoord && std::isfinite(condCoord[ca * 3])) src = condCoord;
-    else if (condIntCrd && std::isfinite(condIntCrd[ca * 3])) src = condIntCrd;
-    if (src) for (int k = 0; k < 3; ++k) ref[k] = (double)src[ca * 3 + k];
-    const int uType = resType ? resType[u] : -1;
-    for (size_t c = 0; c < idx.size(); ++c) {
-      const int i = idx[c];
-      const float* gca = &g.coors[(size_t)i * 111 + 1 * 3];
-      double d2 = 0;
-      for (int k = 0; k < 3; ++k) { const double dd = ref[k] - (double)gca[k]; d2 += dd * dd; }
-      const int iType = g.residueType[i];
-      const double penalty = (uType >= 0 && uType == iType) ? 0.0 : 1e4;
-      score[r * idx.size() + c] = -(d2 + penalty);
-    }
-  }
-  const assign::Assignment a = assign::maximize(score, (int)unidx.size(), (int)idx.size());
-  out.source = unidx;
-  out.target.assign(unidx.size(), -1);
-  for (size_t k = 0; k < a.row.size(); ++k) out.target[a.row[k]] = idx[a.col[k]];
-  return out;
-}
 
 /**
  * `_get_target_indices_corresponding_to_inserted`: the motif's atoms onto the target's.
@@ -352,16 +301,16 @@ inline bool matchInsertedAtoms(const std::vector<std::string>& srcName,
 /**
  * `buildPredictedInsertionMapping`: the model's own answer, from the insertion head.
  *
- * 🔴 THE HEAD IS ASKED ONLY ON THE LAST STEP, and that is the one whose logits mean anything -
- * the reference's note is that a mapping captured at t = 0 is noise, and the fallback exists
- * for exactly that case. `trunk.cuh` already passes `s == steps - 1`.
+ * 🔴 THE HEAD IS ASKED ONLY ON THE LAST STEP, and that is the one whose logits mean anything:
+ * a mapping captured at t = 0 is noise. `trunk.cuh` already passes `s == steps - 1`.
  *
  * 🔴 AND THE SCORE IS READ AT THE TOKEN'S OWN INDEX IN AN n x n MATRIX, not at its position in
  * the unindexed list: row `uPos`, column `iPos`, both absolute. Compacting either axis first
  * gives a matrix of the right shape and the wrong entries.
  */
 inline Insertion predictedInsertionMapping(int n, const float* logits, const int* condIndex,
-                                           const std::vector<uint8_t>& emitted) {
+                                           const std::vector<uint8_t>& emitted,
+                                           const std::vector<int>& chain) {
   Insertion out;
   if (!logits || !condIndex) return out;
   std::vector<int> unidx, idx;
@@ -371,16 +320,32 @@ inline Insertion predictedInsertionMapping(int n, const float* logits, const int
     else if (emitted.empty() || emitted[tk]) idx.push_back(tk);
   }
   if (unidx.empty() || idx.empty()) return out;
-  std::vector<double> score((size_t)unidx.size() * idx.size());
-  for (size_t r = 0; r < unidx.size(); ++r) {
-    for (size_t c = 0; c < idx.size(); ++c) {
-      score[r * idx.size() + c] = (double)logits[(size_t)unidx[r] * n + idx[c]];
-    }
-  }
-  const assign::Assignment a = assign::maximize(score, (int)unidx.size(), (int)idx.size());
   out.source = unidx;
   out.target.assign(unidx.size(), -1);
-  for (size_t k = 0; k < a.row.size(); ++k) out.target[a.row[k]] = idx[a.col[k]];
+  // 🔴 ONE ASSIGNMENT PER CHAIN, as upstream solves it: an unindexed token maps onto a distinct
+  // generated token of its OWN chain, never across chains - chains in sorted order, and one
+  // with no generated token left unmapped.
+  auto chainOf = [&](int tk) {
+    return tk < (int)chain.size() ? chainFromCode(chain[tk]) : std::string();
+  };
+  std::vector<std::string> chains;
+  for (int tk : unidx) chains.push_back(chainOf(tk));
+  std::sort(chains.begin(), chains.end());
+  chains.erase(std::unique(chains.begin(), chains.end()), chains.end());
+  for (const std::string& c : chains) {
+    std::vector<int> rows, cols;   // rows index `unidx`, cols are tokens
+    for (size_t r = 0; r < unidx.size(); ++r) if (chainOf(unidx[r]) == c) rows.push_back((int)r);
+    for (int tk : idx) if (chainOf(tk) == c) cols.push_back(tk);
+    if (cols.empty()) continue;
+    std::vector<double> score(rows.size() * cols.size());
+    for (size_t r = 0; r < rows.size(); ++r) {
+      for (size_t k = 0; k < cols.size(); ++k) {
+        score[r * cols.size() + k] = (double)logits[(size_t)unidx[rows[r]] * n + cols[k]];
+      }
+    }
+    const assign::Assignment a = assign::maximize(score, (int)rows.size(), (int)cols.size());
+    for (size_t k = 0; k < a.row.size(); ++k) out.target[rows[a.row[k]]] = cols[a.col[k]];
+  }
   return out;
 }
 
@@ -396,9 +361,11 @@ inline void applyInsertion(const GenOut& g, int n, const Insertion& ins, const O
                            const int* resType, const float* coords, float* condCoord,
                            float* condIntCrd, int* coordGroup,
                            std::vector<uint8_t>& isInsertion, std::vector<int>* crdSource = nullptr,
-                           bool dryRun = false, bool* allMatched = nullptr) {
+                           bool dryRun = false, bool* allMatched = nullptr,
+                           std::vector<int>* srcAt = nullptr) {
   if (!dryRun) isInsertion.assign((size_t)n * 37, 0);
   if (crdSource && !dryRun) crdSource->assign((size_t)n * 37, -1);
+  if (srcAt && !dryRun) srcAt->assign((size_t)n * 37, -1);
   if (allMatched) *allMatched = true;
   if (ins.source.empty()) {
     if (allMatched) *allMatched = false;
@@ -489,55 +456,34 @@ inline void applyInsertion(const GenOut& g, int n, const Insertion& ins, const O
       if (crd) for (int c = 0; c < 3; ++c) condCoord[to * 3 + c] = condCoord[from * 3 + c];
       if (intCrd) for (int c = 0; c < 3; ++c) condIntCrd[to * 3 + c] = condIntCrd[from * 3 + c];
       if (crdSource && (crd || intCrd)) (*crdSource)[to] = u;
+      if (srcAt) (*srcAt)[to] = (int)from;
     }
   }
 }
 
 /**
- * The model's mapping if every pair of it can be grafted, otherwise the geometric one.
+ * The model's mapping, if every pair of it can be grafted; otherwise none.
  *
- * 🔴 THE PREDICTED ONE IS TRIED FIRST AND VALIDATED BEFORE ANYTHING IS WRITTEN. The reference
- * builds it, checks that every unindexed token's atoms can be matched onto its target's, and
- * only then applies it - falling back to the geometric mapping if any pair fails. Applying
- * first and repairing afterwards would leave a motif grafted by one rule and the rest by
- * another.
- *
- * 🔴 AND THE VALIDATION IS NOT FALSIFIABLE ON THE ONE SHIPPED UNINDEXED CASE. On
- * `motif_unidx_1prw` the head's mapping is fully matchable, so applying it UNCHECKED gives the
- * same answer and the gate stays green - and the two mappings agree there atom for atom, which
- * is itself worth knowing. What would exercise it is an input whose unindexed motif cannot be
- * grafted onto the token the head picks; the corpus has none, and this is recorded rather than
- * left looking checked.
+ * 🔴 ALL OR NOTHING, AND NOTHING IN ITS PLACE. Upstream builds the head's mapping, and
+ * `annotate_unindexed_insertion` either applies all of it or - one pair whose atoms cannot be
+ * matched - none, warning and writing the design without the motif's annotations. Both ports
+ * used to substitute a GEOMETRIC mapping of their own at that point, which upstream has never
+ * had: a structure upstream writes without a grafted motif came out here with one, from a rule
+ * nobody had checked against anything. Validated before anything is written, so a motif is
+ * never grafted half by one pass and half by another.
  */
 inline Insertion resolveInsertion(const GenOut& g, int n, const float* insertionLogits,
                                   const int* condIndex, const int* resType, const float* coords,
                                   const float* condCoord, const float* condIntCrd,
-                                  const std::vector<uint8_t>& emitted,
-                                  const OutNaming& naming, bool* usedPredicted) {
+                                  const std::vector<uint8_t>& emitted, const OutNaming& naming) {
   std::vector<uint8_t> scratchFlags;
-  auto usable = [&](const Insertion& ins) {
-    if (ins.source.empty()) return false;
-    bool ok = false;
-    applyInsertion(g, n, ins, naming, resType, coords, const_cast<float*>(condCoord),
-                   const_cast<float*>(condIntCrd), nullptr, scratchFlags, nullptr, true, &ok);
-    return ok;
-  };
   const Insertion predicted =
-      predictedInsertionMapping(n, insertionLogits, condIndex, emitted);
-  if (usable(predicted)) {
-    if (usedPredicted) *usedPredicted = true;
-    return predicted;
-  }
-  if (usedPredicted) *usedPredicted = false;
-  // 🔴 AND THE FALLBACK IS HELD TO THE SAME RULE: ALL OR NOTHING. The reference applies the
-  // geometric mapping only `if (canApplyMapping(...))` - one pair that cannot be grafted and NO
-  // motif is grafted. This applied it pair by pair, so where some pairs failed it grafted the
-  // rest, anchored the alignment on them and wrote a different structure from the page's. It
-  // takes an unconverged design to see (residue types the motif cannot be matched onto), which
-  // is what cuda/rfd4p/check-writer.mjs found at six steps.
-  const Insertion geometric = geometricInsertionMapping(g, n, condIndex, resType, coords,
-                                                        condCoord, condIntCrd, emitted);
-  return usable(geometric) ? geometric : Insertion{};
+      predictedInsertionMapping(n, insertionLogits, condIndex, emitted, naming.chain);
+  if (predicted.source.empty()) return predicted;
+  bool ok = false;
+  applyInsertion(g, n, predicted, naming, resType, coords, const_cast<float*>(condCoord),
+                 const_cast<float*>(condIntCrd), nullptr, scratchFlags, nullptr, true, &ok);
+  return ok ? predicted : Insertion{};
 }
 
 inline void alignToInputFrame(GenOut& g, int n, const float* condCoord, const float* condIntCrd,
@@ -634,14 +580,24 @@ struct AtomRecord {
   int resId = 1, entity = 0, charge = 0;
   double b = NAN, occ = 1.0;
   float x = 0, y = 0, z = 0;
+  // What the design metrics read the input through (metrics.h; `inputIndex`, `condSource` and
+  // `tokenInputIndex` in shared/rfd4p/output.js): the token, the input atom this one is (token *
+  // 37 + its input slot, or -1 where the generated residue added it), the input atom its 1-body
+  // conditions come from (the motif atom a grafted one was grafted from, else `inAt`), the token
+  // its residue-level ones come from, and its coordinate conditioning.
+  int token = -1, inAt = -1, condAt = -1, resTok = -1;
+  bool atomized = false, crd = false, internal = false;
 };
 
 inline std::vector<AtomRecord> buildRecords(const GenOut& g, int n, const std::vector<int>& chainOf,
                                             const OutNaming& naming, const float* condCoord,
                                             const float* condIntCrd,
                                             const std::vector<uint8_t>& isInsertion,
-                                            const std::vector<int>& crdSource) {
+                                            const std::vector<int>& crdSource,
+                                            const std::vector<int>& srcAt = {},
+                                            const int* coordGroup = nullptr) {
   const OutTables& in = naming.in;
+  auto group = [&](int at) { return coordGroup && at >= 0 ? coordGroup[at] : -1; };
   std::vector<AtomRecord> out;
   auto finite3 = [](const float* p, size_t at) {
     return p && std::isfinite(p[at * 3]) && std::isfinite(p[at * 3 + 1]) && std::isfinite(p[at * 3 + 2]);
@@ -680,6 +636,11 @@ inline std::vector<AtomRecord> buildRecords(const GenOut& g, int n, const std::v
       r.occ = 1.0;
       r.charge = in.inCharge[at];
       if (finite3(condCoord, at) || finite3(condIntCrd, at)) r.srcComp = srcCompOf(i);
+      r.token = r.resTok = i;
+      r.inAt = r.condAt = (int)at;
+      r.atomized = true;
+      r.crd = finite3(condCoord, at);
+      r.internal = group((int)at) != -1 && group((int)at) != 0;
       place(r, 1);
       out.push_back(r);
       continue;
@@ -716,6 +677,14 @@ inline std::vector<AtomRecord> buildRecords(const GenOut& g, int n, const std::v
       if (crd) r.srcComp = srcResidue;
       // A grafted motif atom names the motif it came from.
       if (!crdSource.empty() && crdSource[at] >= 0) r.srcComp = srcCompOf(crdSource[at]);
+      const int from = srcAt.empty() ? -1 : srcAt[at];
+      r.token = i;
+      r.inAt = is >= 0 ? (int)ia : -1;
+      r.condAt = from >= 0 ? from : r.inAt;
+      r.resTok = from >= 0 ? from / 37 : i;
+      r.crd = (is >= 0 && finite3(condCoord, ia)) || (from >= 0 && finite3(condCoord, from));
+      const int cg = from >= 0 && group(from) != -1 ? group(from) : group(r.inAt);
+      r.internal = cg != -1 && cg != 0;
       place(r, slot);
       out.push_back(r);
     }

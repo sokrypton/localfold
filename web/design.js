@@ -1156,8 +1156,35 @@ function archiveEntries() {
   for (const c of generatedRun) {
     entries.push([`candidate-${c.candidate + 1}.pdb`, c.pdb]);
     entries.push([`candidate-${c.candidate + 1}.cif`, c.cif]);
+    // Upstream's design metrics and pre-oracle verdict, keyed as upstream keys them (NaN, which
+    // JSON has no number for, as null).
+    entries.push([`candidate-${c.candidate + 1}.metrics.json`,
+      `${JSON.stringify({ metrics: c.metrics, pre_oracle: c.preOracle }, null, 2)}\n`]);
   }
   return entries;
+}
+
+/**
+ * One line of what upstream's evaluation would say about a design: the pre-oracle verdict (a
+ * failed filter by name), and the metrics a reader acts on, where the job's tags computed them.
+ */
+function metricsSummary(c) {
+  const m = c.metrics ?? {};
+  const failed = Object.entries(c.preOracle?.filters ?? {}).filter(([, f]) => !f.pass).map(([k]) => k);
+  const pct = (v) => (Number.isFinite(v) ? `${(100 * v).toFixed(1)}%` : null);
+  const parts = [failed.length === 0 ? "passes the pre-oracle filters" : `fails ${failed.join(", ")}`];
+  const clash = pct(m["clash_metrics.frac_atoms_clashing_1p5A"]);
+  if (clash !== null) parts.push(`clashing atoms ${clash}`);
+  const bonds = pct(m["bond_length_metrics.bond_length.frac_unreasonable"]);
+  if (bonds !== null) parts.push(`long bonds ${bonds}`);
+  const helix = pct(m["sse_distribution.helix_fraction"]);
+  const sheet = pct(m["sse_distribution.sheet_fraction"]);
+  if (helix !== null && sheet !== null) parts.push(`helix ${helix}, sheet ${sheet}`);
+  const sse = pct(m["sse_accuracy.overall_accuracy"]);
+  if (sse !== null) parts.push(`secondary structure as asked ${sse}`);
+  const hot = pct(m["hotspot_obedience.hotspot_obedience"]);
+  if (hot !== null) parts.push(`hotspots contacted ${hot}`);
+  return parts.join(" · ");
 }
 // tools/check-design-page.py reads the members it would download and folds the job natively.
 window.__designArchive = archiveEntries;
@@ -1190,6 +1217,10 @@ function paintDownloads() {
       button("PDB", () => saveFile(`candidate-${c.candidate + 1}.pdb`, c.pdb, "chemical/x-pdb")),
       " ",
       button("mmCIF", () => saveFile(`candidate-${c.candidate + 1}.cif`, c.cif, "chemical/x-cif")));
+    const metrics = document.createElement("div");
+    metrics.className = "design-metrics";
+    metrics.textContent = metricsSummary(c);
+    row.append(metrics);
     downloadsBox.append(row);
   }
   downloadsBox.append(button("All, with the job (.zip)", () => { saveArchive(); }));

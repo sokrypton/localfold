@@ -585,6 +585,8 @@ def main():
                 # same token count - a job file that is only decorative is the same bug again.
                 archive = json.loads(cdp.evaluate(ws, """JSON.stringify({
                   rows: document.querySelectorAll('#downloads > div').length,
+                  metricLines: [...document.querySelectorAll('#downloads .design-metrics')]
+                    .map((e) => e.textContent),
                   members: window.__designArchive().map(([name, content]) =>
                     [name, typeof content === 'string' ? content : null]),
                 })"""))
@@ -592,9 +594,27 @@ def main():
                 if archive["rows"] != 2:
                     bad.append(f"the downloads list {archive['rows']} candidates, expected 2")
                 for want in ("job.json", "README.txt", "candidate-1.pdb", "candidate-1.cif",
-                             "candidate-2.pdb", "candidate-2.cif"):
+                             "candidate-2.pdb", "candidate-2.cif", "candidate-1.metrics.json"):
                     if want not in names:
                         bad.append(f"the archive has no {want}: {names}")
+                # 🔴 AND EACH DESIGN CARRIES UPSTREAM'S METRICS, under the `design` tag the job
+                # records: the composition and clash keys present, the verdict beside them, and
+                # the line on the page saying it. tools/check-rfd4p-metrics.py holds the values.
+                if "candidate-1.metrics.json" in names:
+                    m = json.loads(dict(archive["members"])["candidate-1.metrics.json"])
+                    for key in ("amino_acid_composition.n_generated_unknown_residues",
+                                "clash_metrics.frac_atoms_clashing_1p5A",
+                                "sse_distribution.helix_fraction"):
+                        if key not in m.get("metrics", {}):
+                            bad.append(f"the design's metrics have no {key}: {sorted(m.get('metrics', {}))[:6]}")
+                    if "pass" not in m.get("pre_oracle", {}):
+                        bad.append(f"the design's metrics carry no pre-oracle verdict: {m.get('pre_oracle')}")
+                    if '"metrics_tags"' not in dict(archive["members"])["job.json"]:
+                        bad.append("the archived job does not record the metrics tags it was scored under")
+                if len(archive["metricLines"]) != 2 or not all("pre-oracle" in t for t in archive["metricLines"]):
+                    bad.append(f"the downloads do not show each design's metrics: {archive['metricLines']}")
+                else:
+                    print(f"            candidate 1: {archive['metricLines'][0]}")
                 featuriser = Path(ROOT) / "cuda" / "rfd4p" / "featurise" / "rfd4p-featurise"
                 if featuriser.exists() and "job.json" in names:
                     with tempfile.TemporaryDirectory() as tmp:

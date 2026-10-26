@@ -61,6 +61,7 @@ import {
   aeMasks, decodeLatentsCpu, decoderPostprocess, decoderSeqFeatures, sequenceForDecoder,
 } from "../../cpu/rfd4p/decoder.js";
 import { generateRfd4pCpu } from "../../cpu/rfd4p/reference.js";
+import { SEQUENCE_PROBABILITY_TOKENS, jobMetricsTags, metricsTagBits } from "../../shared/rfd4p/metrics.js";
 import { encodeLatentsCpu, encoderSeqFeatures } from "../../cpu/rfd4p/encoder.js";
 
 const args = process.argv.slice(2);
@@ -157,6 +158,7 @@ const preset = specPath
         partialTLatent: job.partialTLatent ?? job.partial_t_latent,
         couplePartialT: job.couplePartialT ?? job.couple_partial_t,
         sampling: job.sampling,
+        metrics_tags: job.metrics_tags,
       };
     })()
   : getRfd4pPresetById(presetId);
@@ -264,7 +266,16 @@ function outputTables(atoms, starts) {
     "g/inCharge": new Int32Array(nTok * 37),
     "g/outAtomize": [], "g/outHetero": [], "g/outEntity": [], "g/outInsCode": [],
     "g/outResName": [], "g/outSrcComp": [],
+    // What shared/rfd4p/metrics.js reads off the input, for the native metrics: per token its
+    // polymer and protein flags, C_SEC, chain instance, CCD type, C_SEQ and the 28 sequence
+    // probabilities (as float bits); per input atom its hotspot flag; and the input's BONDS as
+    // pairs of (token * 37 + slot), in the input's order, where both ends have a slot.
+    "g/mTok": [], "g/mChainIid": [], "g/mCompType": [], "g/mSeq": [], "g/mSeqProb": [],
+    "g/mHot": new Int32Array(nTok * 37), "g/mBonds": [],
   };
+  const slotOf = new Int32Array(nAtoms).fill(-1);
+  const bits = new Int32Array(new Float32Array(1).buffer);
+  const floatBits = (v) => { new Float32Array(bits.buffer)[0] = v; return bits[0]; };
   for (let tk = 0; tk < nTok; tk += 1) {
     const a0 = starts[tk];
     const atomised = Boolean(atoms.atomize?.[a0]);
@@ -274,6 +285,15 @@ function outputTables(atoms, starts) {
     packString(atoms.ins_code?.[a0] ?? "", 1, t["g/outInsCode"]);
     packString(atoms.res_name[a0], 2, t["g/outResName"]);
     packString(src?.[a0] ?? ".", 4, t["g/outSrcComp"]);
+    t["g/mTok"].push(atoms.is_polymer?.[a0] ? 1 : 0, atoms.is_protein?.[a0] ? 1 : 0,
+      Number(atoms["condition_secondary-structure_1_residue"]?.[a0] ?? 0));
+    packString(atoms.chain_iid?.[a0] ?? atoms.chain_id[a0], 4, t["g/mChainIid"]);
+    packString(String(atoms.chem_comp_type?.[a0] ?? "").toUpperCase(), 8, t["g/mCompType"]);
+    packString(atoms.condition_sequence_1_residue?.[a0] ?? "<M>", 2, t["g/mSeq"]);
+    for (const tok of SEQUENCE_PROBABILITY_TOKENS) {
+      const v = atoms[`condition_sequence-probability-${tok}_1_residue`]?.[a0];
+      t["g/mSeqProb"].push(floatBits(v == null ? NaN : Number(v)));
+    }
     const rt = residueType[tk];
     const layout = UNIFIED_ATOM37_ENCODING.token_atoms[UNIFIED_ATOM37_TOKENS[rt]] ?? [];
     for (let ai = starts[tk]; ai < (starts[tk + 1] ?? nAtoms); ai += 1) {
@@ -282,6 +302,8 @@ function outputTables(atoms, starts) {
       else slot = layout.indexOf(atoms.atom_name[ai]);
       if (slot < 0) continue;
       const at = tk * 37 + slot;
+      slotOf[ai] = at;
+      t["g/mHot"][at] = atoms.condition_hotspot_1_atom?.[ai] ? 1 : 0;
       const one = [];
       packString(atoms.atom_name[ai], 1, one);
       t["g/inName"][at] = one[0];
@@ -292,6 +314,9 @@ function outputTables(atoms, starts) {
       packDouble(Number(atoms.b_factor?.[ai]), t["g/inB"], at);
       packDouble(Number(atoms.occupancy?.[ai]), t["g/inOcc"], at);
     }
+  }
+  for (const [p, q] of atoms.bonds ?? []) {
+    if (slotOf[p] >= 0 && slotOf[q] >= 0) t["g/mBonds"].push(slotOf[p], slotOf[q]);
   }
   return Object.fromEntries(Object.entries(t).map(([k, v]) => [k, Int32Array.from(v)]));
 }
@@ -659,6 +684,9 @@ if (generate) {
     distMin: nn.xt_pair_dist_min,
     distMax: nn.xt_pair_dist_max,
     ...samplingMeta(SAMPLING),
+    // The job's `metrics_tags`, as shared/rfd4p/metrics.js's bits: which design metrics the
+    // native `--metrics=` computes.
+    metricsTags: metricsTagBits(jobMetricsTags(preset)),
   }, {
     "g/depths": Int32Array.from(depths),
     "g/stochastic": Int32Array.from(stepNoise),

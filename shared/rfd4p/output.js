@@ -442,12 +442,14 @@ function resolveTokenMeta(nValid, tokenMeta) {
     const count = nValid != null ? Math.min(nValid, tokenStarts.length) : tokenStarts.length;
     const tokenIds = new Int32Array(count);
     const hasIndex = new Uint8Array(count);
+    const chains = new Array(count);
     for (let t = 0; t < count; t += 1) {
       const a0 = tokenStarts[t];
       tokenIds[t] = atomTokenIds[a0];
       hasIndex[t] = atomHasIdx ? (atomHasIdx[a0] ? 1 : 0) : 1;
+      chains[t] = tokenMeta.chain_id?.[a0] ?? '';
     }
-    return { nValid: count, tokenIds, hasIndex };
+    return { nValid: count, tokenIds, hasIndex, chains };
   }
 
   // Case 2: `{ hasIndex, tokenIds }`
@@ -517,72 +519,25 @@ export function buildPredictedInsertionMapping(insertionLogits, nValid, tokenMet
     return {};
   }
 
-  const nRows = unindexedPositions.length;
-  const nCols = indexedPositions.length;
-  const scoreMatrix = new Float64Array(nRows * nCols);
-  for (let r = 0; r < nRows; r += 1) {
-    const uPos = unindexedPositions[r];
-    for (let c = 0; c < nCols; c += 1) {
-      const iPos = indexedPositions[c];
-      scoreMatrix[r * nCols + c] = insertionLogits[uPos * stride + iPos];
-    }
-  }
-
-  const { rowInd, colInd } = linearSumAssignmentMaximize(scoreMatrix, nRows, nCols);
+  // 🔴 ONE ASSIGNMENT PER CHAIN, as upstream solves it: an unindexed token maps onto a distinct
+  // generated token of its OWN chain, never across chains (chains in sorted order, one with no
+  // generated token left unmapped).
+  const chainOf = (p) => meta.chains?.[p] ?? '';
   const mapping = {};
-  for (let k = 0; k < rowInd.length; k += 1) {
-    const uTokId = meta.tokenIds[unindexedPositions[rowInd[k]]];
-    const iTokId = meta.tokenIds[indexedPositions[colInd[k]]];
-    mapping[uTokId] = iTokId;
-  }
-  return mapping;
-}
-
-/**
- * Fallback Hungarian assignment using negative squared CA distance between unindexed
- * tokens' reference coordinates (`coord_to_be_noised` / `condition_coordinate_1_atom` / `condition_InternalCoordinate_1_atom`)
- * and generated tokens' CA coordinates (`coors[:, 1, :]`).
- *
- * Used when `insertionLogits` is omitted or was captured at `t=0` (step 0 noise) rather than `t=1`.
- */
-function buildGeometricInsertionMapping(coors, residueType, tokenMap, idxTids, unidxTids, inputAtoms) {
-  const nRows = unidxTids.length;
-  const nCols = idxTids.length;
-  if (nRows === 0 || nCols === 0) return {};
-
-  const scoreMatrix = new Float64Array(nRows * nCols);
-  for (let r = 0; r < nRows; r += 1) {
-    const uTid = unidxTids[r];
-    const uAtoms = tokenMap.get(uTid);
-    const caAtom = uAtoms.find((ai) => inputAtoms.atom_name[ai] === 'CA') ?? uAtoms[0];
-    const uResName = inputAtoms.res_name[caAtom];
-    const refCoord =
-      (inputAtoms.coord_to_be_noised && inputAtoms.coord_to_be_noised[caAtom]) ||
-      (inputAtoms.condition_coordinate_1_atom && inputAtoms.condition_coordinate_1_atom[caAtom]) ||
-      (inputAtoms.condition_InternalCoordinate_1_atom && inputAtoms.condition_InternalCoordinate_1_atom[caAtom]) ||
-      [0, 0, 0];
-    const ux = Number(refCoord[0]);
-    const uy = Number(refCoord[1]);
-    const uz = Number(refCoord[2]);
-
-    for (let c = 0; c < nCols; c += 1) {
-      const iTid = idxTids[c];
-      const rt = residueType[iTid];
-      const iResName = rt >= 0 ? UNIFIED_ATOM37_TOKENS[rt] : '<A>';
-      const base = (iTid * 37 + 1) * 3;
-      const dx = ux - coors[base + 0];
-      const dy = uy - coors[base + 1];
-      const dz = uz - coors[base + 2];
-      const distSq = dx * dx + dy * dy + dz * dz;
-      const resPenalty = uResName === iResName ? 0.0 : 1e4;
-      scoreMatrix[r * nCols + c] = -(distSq + resPenalty);
+  for (const chain of [...new Set(unindexedPositions.map(chainOf))].sort()) {
+    const rows = unindexedPositions.filter((p) => chainOf(p) === chain);
+    const cols = indexedPositions.filter((p) => chainOf(p) === chain);
+    if (cols.length === 0) continue;
+    const scoreMatrix = new Float64Array(rows.length * cols.length);
+    for (let r = 0; r < rows.length; r += 1) {
+      for (let c = 0; c < cols.length; c += 1) {
+        scoreMatrix[r * cols.length + c] = insertionLogits[rows[r] * stride + cols[c]];
+      }
     }
-  }
-
-  const { rowInd, colInd } = linearSumAssignmentMaximize(scoreMatrix, nRows, nCols);
-  const mapping = {};
-  for (let k = 0; k < rowInd.length; k += 1) {
-    mapping[unidxTids[rowInd[k]]] = idxTids[colInd[k]];
+    const { rowInd, colInd } = linearSumAssignmentMaximize(scoreMatrix, rows.length, cols.length);
+    for (let k = 0; k < rowInd.length; k += 1) {
+      mapping[meta.tokenIds[rows[rowInd[k]]]] = meta.tokenIds[cols[colInd[k]]];
+    }
   }
   return mapping;
 }
@@ -933,6 +888,8 @@ export function processSampleToAtoms({
         entityId: inputAtoms.label_entity_id?.[a0] != null ? Number(inputAtoms.label_entity_id[a0]) : 0,
         authSeqId: Number(inputAtoms.res_id[a0]),
         tokenId: tid,
+        inputIndex: a0,
+        tokenInputIndex: a0,
         isUnindexedInsertion: false,
         crdSrcComponent: hasCrd || hasIntCrd ? srcComp : '.',
         srcComponent: srcComp,
@@ -1002,6 +959,10 @@ export function processSampleToAtoms({
           entityId: inputAtoms.label_entity_id?.[a0] != null ? Number(inputAtoms.label_entity_id[a0]) : 0,
           authSeqId: Number(inputAtoms.res_id[a0]),
           tokenId: tid,
+          // The input atom this one IS (-1 where the generated residue added it), and the
+          // token's first: what a metric reads the input's annotations through.
+          inputIndex: ai ?? -1,
+          tokenInputIndex: a0,
           isUnindexedInsertion: false,
           crdSrcComponent: hasCrd || hasIntCrd ? srcCompResidue : '.',
           srcComponent: srcCompResidue,
@@ -1051,17 +1012,6 @@ export function processSampleToAtoms({
       return true;
     };
 
-    if (!canApplyMapping(predictedInsertionMapping)) {
-      predictedInsertionMapping = buildGeometricInsertionMapping(
-        coors,
-        residueType,
-        tokenMap,
-        idxTids,
-        unidxTids,
-        inputAtoms
-      );
-    }
-
     // Apply `annotate_unindexed_insertion`: transfer conditions and reference coords onto mapped target tokens
     if (canApplyMapping(predictedInsertionMapping)) {
       for (const [uStr, tTid] of Object.entries(predictedInsertionMapping)) {
@@ -1099,6 +1049,8 @@ export function processSampleToAtoms({
           const hasIntCrd = Array.isArray(intCrdRaw) && intCrdRaw[0] !== null && Number.isFinite(intCrdRaw[0]);
           const srcGrp = inputAtoms.condition_CoordinateGroup_1_atom?.[ai] ?? -1;
 
+          // Every 1-body condition is the SOURCE's on a grafted atom (`annotate_unindexed_insertion`)
+          tgtRec.condSource = ai;
           if (srcGrp !== -1) {
             tgtRec.coordGroup = srcGrp;
           }

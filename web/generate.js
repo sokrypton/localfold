@@ -31,6 +31,7 @@ import { ccdBlocksForRawStructure } from "../shared/rfd4p/pipeline/ccd.js";
 import { fetchRfd4pConfig, fetchShardedWeights } from "../shared/rfd4p/safetensors.js";
 import { generateRfd4p } from "../webgpu/rfd4p/generate.js";
 import { processSampleToAtoms, toPdbString } from "../shared/rfd4p/output.js";
+import { designMetrics, jobMetricsTags } from "../shared/rfd4p/metrics.js";
 import { decompress } from "../shared/rfd4p/vendor/fzstd.js";
 
 /** How many flow-matching steps a generation takes when the caller does not say. */
@@ -104,15 +105,17 @@ async function templateCif(url, signal) {
  * @param {(step: object) => void} [options.onStep] called per flow step, for a
  *   trajectory the page can show
  * @param {AbortSignal} [options.signal]
+ * @param {string[]} [options.metricsTags=["design"]] upstream's `metrics_tags`: which of its
+ *   design metrics and pre-oracle filters apply (shared/rfd4p/metrics.js)
  * @returns {Promise<{pdb: string, cif: string, tokens: number, steps: number, seed: number,
- *   job: object, inputCif: (string|Uint8Array|undefined)}>} `job` is the job that ran as a job
- *   file (`input` naming the structure, `inputCif`, beside it)
+ *   job: object, inputCif: (string|Uint8Array|undefined), metrics: object, preOracle: object}>}
+ *   `job` is the job that ran as a job file (`input` naming the structure, `inputCif`, beside it)
  */
 export async function generate(options) {
   const {
     contig, conditions, cifUrl, inputCif: givenCif, fromAnnotations = false,
     steps = DEFAULT_STEPS, recycleSchedule, seed = 0,
-    partialTrajectoryFractionSteps, inverseFolding,
+    partialTrajectoryFractionSteps, inverseFolding, metricsTags = ["design"],
     status = () => {}, progress = () => {}, onStep, frames = 0, signal,
   } = options;
 
@@ -304,8 +307,15 @@ export async function generate(options) {
     ...(recycleSchedule === undefined ? {} : { recycleSchedule }),
     ...(partialTrajectoryFractionSteps === undefined ? {} : { partialTrajectoryFractionSteps }),
     ...(inverseFolding === true ? { inverseFolding: true } : {}),
+    ...(metricsTags.length === 0 ? {} : { metrics_tags: metricsTags }),
   };
+  // 🔴 THE DESIGN'S METRICS, AS UPSTREAM'S EVALUATION COMPUTES THEM, under the tags the job
+  // records - so `localfold-rfd4p --job=job.json --metrics=` reports the same numbers. Upstream's
+  // generator computes none unless asked; the page asks for `design`, its own inline set.
+  const { metrics, preOracle } = designMetrics(result.structure, batch.__atoms,
+    { metricsTags: jobMetricsTags(job) });
   return {
     pdb: result.pdb, cif: result.cif, tokens: n, steps: result.stepsRun ?? steps, seed, job, inputCif,
+    metrics, preOracle,
   };
 }

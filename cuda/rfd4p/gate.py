@@ -224,6 +224,28 @@ def chain_steps(pdb: Path) -> list[float]:
             for i in range(len(ca) - 1)]
 
 
+METRICS_TAGS = ["design", "structure_prediction", "small_molecule_only", "hotspot_conditioning",
+                "unindexed", "partial_diffusion", "insertion_rmsd_filter", "motif_rmsd_filter",
+                "ligand_clash_filter"]
+
+
+def compare_metrics(job: Path, dump: Path, label: str) -> list[str]:
+    """The native `--metrics=` file against design-metrics.mjs on the same dump: every value."""
+    native = Path(f"{dump}.metrics.json")
+    if not native.exists():
+        return [f"{label}: no native metrics"]
+    r = run(["node", HERE / "design-metrics.mjs", f"--spec={job}", dump], cwd=REPO)
+    if r.returncode != 0:
+        return [f"{label}: {r.stderr.strip()[-200:]}"]
+    a, b = json.loads(native.read_text()), json.loads(r.stdout)
+    bad = [k for k in sorted(set(a["metrics"]) | set(b["metrics"]))
+           if a["metrics"].get(k) != b["metrics"].get(k)]
+    out = [f"{label}: {k} native {a['metrics'].get(k)} page {b['metrics'].get(k)}" for k in bad]
+    if a["preOracle"] != b["preOracle"]:
+        out.append(f"{label}: the pre-oracle verdict differs")
+    return out
+
+
 def compare_dirs(native: Path, js: Path) -> list[str]:
     """Every tensor the NATIVE directory writes, against the JavaScript's, as bytes.
 
@@ -757,7 +779,7 @@ def main() -> int:
                 # takes; check-writer.mjs runs the page's writer on it and requires the SAME TEXT,
                 # every preset in both formats, and the unindexed one converged as well, because
                 # at six steps no mapping can be grafted and the predicted one goes unexercised.
-                writer_bad = []
+                writer_bad, metrics_bad = [], []
                 writer_cases = [(pid, 6) for pid in (
                     "uncond_short", "ppi_pdl1", "motif_idx_1prw", "motif_unidx_1prw", "sm_sam",
                     "dna_7m5w", "yaml_5o45_binder", "partial_diffusion_1prw",
@@ -766,6 +788,9 @@ def main() -> int:
                     r = run(["node", HERE / "featurise" / "preset-spec.mjs", pid], cwd=REPO)
                     spec = json.loads(r.stdout)
                     spec["nsteps"] = steps
+                    # Every tag a ported metric gates on, so the metrics arm below computes all of
+                    # them; the writer reads none of it.
+                    spec["metrics_tags"] = METRICS_TAGS
                     job = HERE / "featurise" / f"gate-writer-{pid}-{steps}.json"
                     job.write_text(json.dumps(spec))
                     dump = HERE / f"gate-writer-{pid}-{steps}"
@@ -773,16 +798,32 @@ def main() -> int:
                         outf = HERE / f"gate-writer-{pid}-{steps}.{ext}"
                         run([BINARY, f"--job={job}", f"--int8={bundle}",
                              f"--work-dir={dump}-work", f"--out={outf}", "--seed=0", "--fast",
-                             f"--dump-sample={dump}"], cwd=REPO)
+                             f"--dump-sample={dump}", f"--metrics={dump}.metrics.json"], cwd=REPO)
                         r = run(["node", HERE / "check-writer.mjs", f"--spec={job}", dump, outf],
                                 cwd=REPO)
                         if r.returncode != 0:
                             writer_bad.append(f"{pid}@{steps}.{ext}")
+                    metrics_bad += compare_metrics(job, dump, f"{pid}@{steps}")
                 if writer_bad:
                     failed += 1
                 print(f"  {'writer':10s} {len(writer_cases) * 2} files against the page's writer"
                       f"  {'ok ' if not writer_bad else 'DIFFERS: ' + ', '.join(writer_bad)}")
                 got["writer"] = {"files": len(writer_cases) * 2, "differing": len(writer_bad)}
+                # 🔴 AND THE DESIGN METRICS, NATIVE AGAINST THE PAGE'S ON THE SAME SAMPLE, every
+                # value and the pre-oracle verdict: the writer cases above with every tag on, and a
+                # job built to reach what they cannot - hotspots, C_SEC, sequence probabilities.
+                # tools/check-rfd4p-metrics.py (below) holds the page's to upstream's.
+                mjob = HERE / "featurise" / "gate-metrics.json"
+                mdump = HERE / "gate-metrics-5o45"
+                run([BINARY, f"--job={mjob}", f"--int8={bundle}", f"--work-dir={mdump}-work",
+                     f"--out={mdump}.cif", "--seed=0", "--fast", f"--dump-sample={mdump}",
+                     f"--metrics={mdump}.metrics.json"], cwd=REPO)
+                metrics_bad += compare_metrics(mjob, mdump, "metrics-5o45")
+                if metrics_bad:
+                    failed += 1
+                print(f"  {'metrics':10s} {len(writer_cases) + 1} designs against the page's metrics"
+                      f"  {'ok ' if not metrics_bad else 'DIFFERS: ' + '; '.join(metrics_bad[:4])}")
+                got["metrics"] = {"designs": len(writer_cases) + 1, "differing": len(metrics_bad)}
 
             # 🔴 THE ASSIGNMENT SOLVER, ON ITS OWN. It decides which designed token an
             # unindexed motif is grafted onto, so a wrong answer is a plausible structure with
@@ -1066,6 +1107,18 @@ def main() -> int:
                     failed += 1
                     print(r.stdout[-1500:], r.stderr[-600:])
                 print(f"  {'load':10s} {m.group(1) if m else '?'} loads against atomworks, "
+                      f"{m.group(2) if m else '?'} differing  {'ok ' if ok else 'DIFFERS'}")
+
+            # 🔴 AND THE DESIGN METRICS, AGAINST UPSTREAM'S OWN METRIC MANAGER on the dumps the
+            # writer arm left: the atom array, its bonds, every value and the pre-oracle verdict.
+            if venv.exists():
+                r = run([venv, REPO / "tools" / "check-rfd4p-metrics.py"], cwd=REPO)
+                m = re.search(r"(\d+) designs, (\d+) differing", r.stdout)
+                ok = r.returncode == 0 and m is not None
+                if not ok:
+                    failed += 1
+                    print(r.stdout[-1500:], r.stderr[-600:])
+                print(f"  {'upstream m':10s} {m.group(1) if m else '?'} designs against upstream's metrics, "
                       f"{m.group(2) if m else '?'} differing  {'ok ' if ok else 'DIFFERS'}")
 
             # 🔴 AND THE SAMPLER, AGAINST UPSTREAM'S OWN `sample_schedule` AND `simulation_step`:

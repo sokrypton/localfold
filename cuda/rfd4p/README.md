@@ -429,6 +429,43 @@ never silently dropped. (Upstream cannot be asked: it requires an input.)
 layouts, the condition registry and its enums, the CATH maps), and
 `test/rfd4p-native-tables.test.js` fails when it is stale.
 
+## A design's metrics, as upstream's evaluation computes them
+
+`localfold-rfd4p --job=<job> --metrics=<file.json>` writes upstream's inline design metrics for
+the design it just wrote, keyed as upstream keys them (`clash_metrics.frac_atoms_clashing_1p5A`,
+`sse_accuracy.overall_accuracy`, ...), and the pre-oracle verdict filter by filter; the design
+page computes the same (shared/rfd4p/metrics.js), shows a line of it under each candidate and
+puts `candidate-N.metrics.json` in the archive. Ported: amino-acid composition, bond lengths,
+clashes, hotspot obedience, sequence and sequence-probability adherence, P-SEA secondary
+structure and its accuracy against `C_SEC`, the unindexed insertion mapping and sequence identity
+to the input - each under its own tag gate from `design_metrics.yaml`, keyed off the job's
+`metrics_tags` (plus the `partial_diffusion` upstream's generator adds to a run that starts from
+the input). 🔴 **UPSTREAM'S `rfd4-generate` COMPUTES NONE OF THIS UNLESS GIVEN A `metrics`
+CONFIG**, and an untagged job gets the composition and the unknown-residue filter alone; the page
+records `metrics_tags: ["design"]` in the job it saves, so the archive reproduces what it shows.
+
+Held three ways. `tools/check-rfd4p-metrics.py` builds upstream's own batch for each dumped
+sample (handed the segment lengths this port realized), runs upstream's
+`process_single_sample_to_atom_array`, `annotate_unindexed_insertion` and its metric manager
+instantiated from its own YAML, and requires the same atoms, the same BONDS (the input's plus
+biotite's `connect_via_residue_names` when a generated residue added atoms - which the clash and
+bond metrics read), every value and the verdict: 11 designs, 0 differing, falsified by dropping
+the peptide links, the helix extension and a hotspot radius. gate.py's `metrics` arm holds the
+native file to the page's on the same samples, value for value; `featurise/gate-metrics.json` is
+the job built to reach hotspots, C_SEC and sequence probabilities, which no preset does.
+
+🔴 **IT FOUND THREE DEFECTS OUTSIDE THE METRICS.** Both ports fell back to a GEOMETRIC insertion
+mapping of their own where the head's could not be grafted - upstream has none, and leaves such a
+design's motif unannotated - and solved the assignment across chains where upstream solves one
+per chain (the README section on the input structure has the details). And the native
+featuriser did not know upstream's `C_SEQ_PROB_<token>` condition names, then filled a fresh
+probability column with 0 instead of NaN, which constrains every residue.
+
+Not ported: the motif-RMSD family (`design_motif_allatom_rmsd`, its unindexed twin,
+`ca_rmsd_to_input`), which resolves chemically equivalent atoms and subunits by permutation
+before superposing - and `motif_rmsd_filter` and `insertion_rmsd_filter` read keys no upstream
+metric produces, so they are indeterminate on both sides.
+
 ## Every preset generates
 
 All ten of RFD4-Proteina's shipped presets now run end to end: unconditional, fold-conditioned,
@@ -678,12 +715,14 @@ pinned checkpoint revision) found, and this round fixed:
     Its output carries the INPUT's own residue numbering and chain letters, so a motif still
     superposes on the target it was built against, and is aligned onto the conditioned frame
     (`src/superpose.h`) - a **0.12 A** refinement, measured, not the rescue it looks like. An unindexed motif is grafted onto a
-    generated token (`geometricInsertionMapping` and `matchInsertedAtoms`, on `src/assign.h`)
+    generated token (`predictedInsertionMapping` and `matchInsertedAtoms`, on `src/assign.h`)
     and its conditioned coordinates transferred, which is how it reaches the output at all.
-    The mapping is the trunk's OWN - `predictedInsertionMapping` off the insertion head's
-    logits, validated pair by pair and falling back to the geometric one if any pair cannot be
-    grafted. On `motif_unidx_1prw` the head's answer is used and agrees with the geometric one
-    atom for atom. The coordinate-group permutation is
+    The mapping is the trunk's OWN, off the insertion head's logits, one Hungarian assignment
+    per chain as upstream solves it, applied all or nothing. 🔴 **BOTH PORTS USED TO FALL BACK
+    TO A GEOMETRIC MAPPING OF THEIR OWN** where the head's could not be grafted; upstream has
+    none and writes such a design without the motif's annotations, so they do too now
+    (tools/check-rfd4p-metrics.py found it: upstream counted the motif's tokens unmapped where
+    this port had grafted them). The coordinate-group permutation is
     implemented on both sides, which was the last item: **the structure path is complete.**
 
     🔴 **IT WAS A SILENT WRONG ANSWER ON ONE SIDE AND A REFUSAL ON THE OTHER.**
@@ -1139,7 +1178,7 @@ pinned checkpoint revision) found, and this round fixed:
   `randperm` draw at the top of every step and is replayed like the noise. No shipped preset has
   one, so `gate-crdgroups.json` builds a three-group case.
 - ~~**Mapping an insertion back onto the input structure**~~ **done**: the trunk's own insertion
-  head with a geometric CA-distance fallback (`src/assign.h`, `resolveInsertion`), and the output
+  head, per chain and all or nothing (`src/assign.h`, `resolveInsertion`), and the output
   aligned onto the conditioned frame.
 - ~~**The selection language in full**~~ **done** (`featurise/selection.h`), as a stated SUBSET -
   a union of `sel(...)` joined by `|`, in EITHER quote - a nucleic atom's name carries a

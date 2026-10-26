@@ -21,6 +21,7 @@
 #include "chirality.cuh"
 #include "partial.cuh"
 #include "generate.cuh"
+#include "metrics.h"
 #include "bundle.cuh"
 #include <fstream>
 #include <sys/stat.h>
@@ -34,7 +35,7 @@ namespace rfd4p { namespace featurise { int run(int argc, char** argv); } }
 namespace {
 
 struct Opts {
-  std::string dir, weights, oracle, gen, genOracle, enc, encOracle, int8, job, dumpSample,
+  std::string dir, weights, oracle, gen, genOracle, enc, encOracle, int8, job, dumpSample, metrics,
       out = "design.pdb";
   int seed = 0;      // a later design draws its own noise from seed + design
   int recycles = 0;  // 0 = whatever the input directory says
@@ -575,7 +576,8 @@ int generate(const Opts& o, const rfd4p::Dims& d, rfd4p::Trunk& t) {
       naming.emit.assign((size_t)n, 1);
       for (int i = 0; i < n; ++i) naming.emit[i] = ci[(size_t)i * 37 + 1] != 0;
     }
-    std::vector<int> crdSource;
+    std::vector<int> crdSource, srcAt;
+    rfd4p::Insertion proposed;   // the head's mapping as proposed, which the metrics count against
     // 🔴 THE UNINDEXED MOTIFS FIRST, BECAUSE THEY SUPPLY ANCHORS THE ALIGNMENT THEN USES. An
     // unindexed token is in-context conditioning and is never emitted, so its conditioned
     // coordinates reach the output only by being grafted onto a token that was.
@@ -594,33 +596,34 @@ int generate(const Opts& o, const rfd4p::Dims& d, rfd4p::Trunk& t) {
       if (M.has("g/condIndex")) {
         std::vector<uint8_t> emitted((size_t)n, 1);
         // The insertion head's own logits from the LAST step, which is the only pass that
-        // asked for them; the geometric mapping is the fallback when they cannot be grafted.
+        // asked for them.
         const std::vector<float> insLogits =
             t.insertion ? download(t.insertion, (size_t)n * n) : std::vector<float>();
-        bool usedPredicted = false;
+        proposed = rfd4p::predictedInsertionMapping(
+            n, insLogits.empty() ? nullptr : insLogits.data(), M.i("g/condIndex"), emitted,
+            naming.chain);
         const rfd4p::Insertion ins = rfd4p::resolveInsertion(
             g, n, insLogits.empty() ? nullptr : insLogits.data(), M.i("g/condIndex"),
             M.has("g/resType") ? M.i("g/resType") : nullptr,
             M.has("g/coords") ? M.f("g/coords") : nullptr, condCoordRW.data(),
-            condIntCrdRW.empty() ? nullptr : condIntCrdRW.data(), emitted, naming,
-            &usedPredicted);
+            condIntCrdRW.empty() ? nullptr : condIntCrdRW.data(), emitted, naming);
         if (!ins.source.empty()) {
-          printf("  %zu unindexed token%s grafted by the %s mapping\n", ins.source.size(),
-                 ins.source.size() == 1 ? "" : "s", usedPredicted ? "predicted" : "geometric");
-        } else if (M.has("g/condIndex")) {
+          printf("  %zu unindexed token%s grafted by the insertion head's mapping\n",
+                 ins.source.size(), ins.source.size() == 1 ? "" : "s");
+        } else {
           // Upstream warns and writes the design without the motif's annotations; so does this.
           bool anyUnindexed = false;
           for (int i = 0; i < n; ++i) anyUnindexed |= M.i("g/condIndex")[(size_t)i * 37 + 1] == 0;
           if (anyUnindexed) {
-            printf("  WARNING: the unindexed motif could not be grafted onto this design by either "
-                   "mapping; it is written without it\n");
+            printf("  WARNING: the insertion head's mapping could not be applied to this design; "
+                   "the unindexed motif is written without its annotations\n");
           }
         }
         rfd4p::applyInsertion(g, n, ins, naming, M.has("g/resType") ? M.i("g/resType") : nullptr,
                               M.has("g/coords") ? M.f("g/coords") : nullptr, condCoordRW.data(),
                               condIntCrdRW.empty() ? nullptr : condIntCrdRW.data(),
                               coordGroupRW.empty() ? nullptr : coordGroupRW.data(), isInsertion,
-                              &crdSource);
+                              &crdSource, false, nullptr, &srcAt);
       }
     }
     // 🔴 INTO THE INPUT'S FRAME BEFORE ANYTHING IS WRITTEN. A contig has no conditioned
@@ -634,8 +637,45 @@ int generate(const Opts& o, const rfd4p::Dims& d, rfd4p::Trunk& t) {
     // input, and the grafted ones are named by `crdSource`.
     const std::vector<rfd4p::AtomRecord> records = rfd4p::buildRecords(
         g, n, chainOf, naming, M.has("g/condCoord") ? M.f("g/condCoord") : nullptr,
-        M.has("g/condIntCrd") ? M.f("g/condIntCrd") : nullptr, isInsertion, crdSource);
+        M.has("g/condIntCrd") ? M.f("g/condIntCrd") : nullptr, isInsertion, crdSource, srcAt,
+        M.has("g/coordGroup") ? M.i("g/coordGroup") : nullptr);
     std::ofstream(path) << (wantCif ? rfd4p::toCif(records) : rfd4p::toPdb(records));
+    // 🔴 AND WHAT UPSTREAM'S EVALUATION WOULD SAY ABOUT IT (src/metrics.h): its design metrics
+    // under the job's `metrics_tags`, and the pre-oracle verdict - over the records just written.
+    if (!o.metrics.empty()) {
+      if (!M.has("g/mTok")) {
+        fprintf(stderr, "--metrics needs a work directory featurised with the metric tables\n");
+        return 1;
+      }
+      rfd4p::metrics::Inputs in;
+      in.nTokens = n;
+      auto ints = [&](const char* key, size_t count) {
+        return std::vector<int>(M.i(key), M.i(key) + count);
+      };
+      in.tok = ints("g/mTok", (size_t)n * 3);
+      in.chainIid = ints("g/mChainIid", (size_t)n * 4);
+      in.compType = ints("g/mCompType", (size_t)n * 8);
+      in.seq = ints("g/mSeq", (size_t)n * 2);
+      in.hot = ints("g/mHot", (size_t)n * 37);
+      if (M.has("g/mBonds") && M.len("g/mBonds") > 0) in.bonds = ints("g/mBonds", M.len("g/mBonds"));
+      in.resName = naming.in.resName;
+      {
+        const std::vector<int> bitsOf = ints("g/mSeqProb", (size_t)n * 28);
+        in.seqProb.resize(bitsOf.size());
+        memcpy(in.seqProb.data(), bitsOf.data(), bitsOf.size() * 4);
+      }
+      in.condIndex = M.has("g/condIndex") ? M.i("g/condIndex") : nullptr;
+      const rfd4p::metrics::Result r = rfd4p::metrics::designMetrics(
+          records, in, proposed, rfd4p::metricsTagsFromBits((int)M.meta("meta/metricsTags", 0)));
+      std::string mpath = o.metrics;
+      if (design > 0) {
+        const size_t dot = mpath.rfind('.');
+        mpath = (dot == std::string::npos ? mpath : mpath.substr(0, dot)) + "_" +
+                std::to_string(design + 1) + (dot == std::string::npos ? "" : mpath.substr(dot));
+      }
+      std::ofstream(mpath) << rfd4p::metrics::toJson(r) << "\n";
+      printf("  metrics -> %s (%s the pre-oracle filters)\n", mpath.c_str(), r.pass ? "passes" : "fails");
+    }
     // 🔴 COUNTED OVER WHAT IS WRITTEN, NOT OVER EVERY TOKEN. The unindexed tokens are grafted
     // rather than emitted, and counting them made this line disagree with its own file twice:
     // "72 residues" over 112, then "602 atoms" over 562. A count that does not match the
@@ -812,6 +852,7 @@ int foldMain(int argc, char** argv) {
     else if (f == "--fast") o.fast = true;
     else if (f == "--no-insertion") o.insertion = false;
     else if (!f.compare(0, 14, "--dump-sample=")) o.dumpSample = f.substr(14);
+    else if (!f.compare(0, 10, "--metrics=")) o.metrics = f.substr(10);
     else { fprintf(stderr, "unknown flag %s\n", argv[i]); return 1; }
   }
   if (o.weights.empty() && o.int8.empty()) {
