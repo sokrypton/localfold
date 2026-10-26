@@ -1,1 +1,1 @@
-{"input":"web/examples/motif_idx_1prw.cif.zst","nsteps":6,"partial_t_backbone":0.5,"partial_t_latent":0.3}
+{"input": "web/examples/motif_idx_1prw.cif.zst", "nsteps": 6, "partial_t_backbone": 0.5, "partial_t_latent": 0.3, "input_as_annotated_cif": true}

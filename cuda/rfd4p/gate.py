@@ -146,7 +146,7 @@ def write_nucleic_ss_case(cif: Path, job: Path) -> None:
     out.append("#")
     rest = lines[end + 1:] if end < len(lines) and lines[end].startswith("#") else lines[end:]
     cif.write_text("\n".join(out + rest) + "\n")
-    job.write_text(json.dumps({"input": str(cif), "nsteps": 4}))
+    job.write_text(json.dumps({"input": str(cif), "nsteps": 4, "input_as_annotated_cif": True}))
 
 
 def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
@@ -511,6 +511,12 @@ def main() -> int:
             # matches its own tokeniser on `data/benchmarks/rna/pseudoknot/W05`: 90 tokens, 74
             # directed pairs, 16 loop tokens, every array exact; that file is upstream's and is
             # not copied here.)
+            # 🔴 AND A FLAT JOB WITH NO `specMode`, WHICH IS UPSTREAM'S OWN SHAPE. Both sides used to
+            # read `{input, contig, conditions}` as "the structure is the job" and IGNORE the
+            # contig and conditions, silently; upstream applies them. 24 tokens added to a 39-
+            # residue chain B, and a sequence condition on part of it.
+            flat = HERE / "featurise" / "gate-flat.json"
+            cases.append(("flat", [f"--spec={flat}"], [f"--spec={flat}"]))
             nss = HERE / "featurise" / "gate-nucleic-ss.json"
             write_nucleic_ss_case(HERE / "featurise" / "gate-nucleic-ss.cif", nss)
             cases.append(("nucleic-ss", [f"--spec={nss}"], [f"--spec={nss}"]))

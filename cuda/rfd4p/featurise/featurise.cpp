@@ -1809,10 +1809,17 @@ int run(int argc, char** argv) {
       const Json* v = spec.get(k);
       if (v && v->isString()) inputPath = v->s;
     }
+    // 🔴 A JOB IS A SPEC, AS UPSTREAM'S CONDITION SPEC IS, unless it says `specMode: false`.
+    // This defaulted to "the structure is the job" whenever there was an input - the file's own
+    // annotations kept and the job's contig and conditions IGNORED, silently - which is the shape
+    // eight of the page's ten presets have and NOT what upstream does with
+    // `{input, contig, conditions}`: it applies them, and keeps the file's annotations only under
+    // `input_as_annotated_cif: true`. "The structure is the job" is upstream's
+    // `{input, input_as_annotated_cif: true}` with no contig, and `specMode: false` stays as this
+    // port's own spelling of it.
     {
       const Json* sm = spec.get("specMode");
-      specMode = sm && !Json::absent(sm) ? (sm->kind == Json::Bool ? sm->b : sm->n != 0)
-                                         : !hasInput;
+      specMode = sm && !Json::absent(sm) ? (sm->kind == Json::Bool ? sm->b : sm->n != 0) : true;
     }
     for (const char* k : {"input_as_annotated_cif", "inputAsAnnotatedCif"}) {
       const Json* v = spec.get(k);
@@ -1888,13 +1895,11 @@ int run(int argc, char** argv) {
     bool opened = false;
     const string cifText = lf::zstd::readTextOrCompressed(inputPath, &opened);
     if (!opened) { fprintf(stderr, "no %s\n", inputPath.c_str()); return 1; }
-    // 🔴 A STRUCTURE IS THE JOB UNLESS THE SPEC SAYS OTHERWISE, and the two routes disagree by
-    // 67 tokens on the same file. Without `specMode`, `export_input.mjs` hands the CIF straight
-    // to `buildBatch` - annotations KEPT, contig and conditions IGNORED - because a preset's
-    // contig is written in the original entry's numbering and names residues the cropped
-    // example does not contain. With `specMode: true` it is a spec: the annotations are
-    // discarded, the arginines re-labelled, and the contig and conditions applied. Reading the
-    // first as the second gave 116 tokens where the exporter gives 183.
+    // `specMode: false` is the structure as the job: annotations KEPT, contig and conditions
+    // IGNORED - which is how a page preset runs, its contig being written in the original
+    // entry's numbering. Otherwise it is a spec: the annotations kept only under
+    // `input_as_annotated_cif`, the arginines re-labelled without it, and the contig and
+    // conditions applied. Reading one as the other gave 116 tokens where the exporter gives 183.
     src = rfd4p::atoms::fromCif(cifText, specMode ? asAnnotatedCif : true);
     }
     vector<int> originalResId = src.site.resId;

@@ -102,7 +102,11 @@ const preset = specPath
         contig: job.contig,
         conditions: job.conditions,
         cifUrl: job.cifUrl ?? job.input ?? null,
-        specMode: job.specMode ?? (job.cifUrl === undefined && job.input === undefined),
+        // A job is a spec unless it says `specMode: false` - see featurise.cpp's note; the
+        // file's annotations are kept only under `input_as_annotated_cif`.
+        specMode: job.specMode ?? true,
+        fromJobFile: true,
+        inputAsAnnotatedCif: Boolean(job.input_as_annotated_cif ?? job.inputAsAnnotatedCif ?? false),
         nsteps: job.nsteps,
         recycleSchedule: job.recycleSchedule ?? job.recycle_schedule,
         partialTrajectoryFractionSteps:
@@ -126,8 +130,8 @@ if (!preset) { console.error(`no preset ${presetId}`); process.exit(1); }
 // web/generate.js has the note: those contigs are written in the ORIGINAL entry's numbering and
 // name residues the cropped example does not contain, so building one from the spec fails with
 // "Preserved segment 'A52-71' matched no atoms". The structure IS the job.
-const fromAnnotations = !length && preset.specMode !== true
-  && preset.cifUrl !== null && preset.cifUrl !== undefined;
+const fromAnnotations = !length && preset.cifUrl !== null && preset.cifUrl !== undefined
+  && (preset.fromJobFile ? preset.specMode === false : preset.specMode !== true);
 let inputCif;
 if (!length && preset.cifUrl) {
   // An absolute path is the file; a relative one is the checkout's, as the page's preset URLs are.
@@ -139,7 +143,11 @@ if (!length && preset.cifUrl) {
 // cost is a function of the token count and nothing in the conditioning changes a single shape.
 const spec = length
   ? { contig: `a1:${length}-${length}P` }
-  : { contig: preset.contig, ...(preset.conditions === undefined ? {} : { conditions: preset.conditions }) };
+  : {
+    contig: preset.contig,
+    ...(preset.conditions === undefined ? {} : { conditions: preset.conditions }),
+    ...(preset.inputAsAnnotatedCif ? { input_as_annotated_cif: true } : {}),
+  };
 const built = fromAnnotations
   ? buildBatch(inputCif, { seed })
   : buildBatch(spec, { seed, ...(inputCif === undefined ? {} : { inputCif }) });

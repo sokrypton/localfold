@@ -19,11 +19,16 @@ if (!preset) {
 // The WHOLE job, structure and run mode included: a preset with a `cifUrl` is a job on that
 // structure, and partial diffusion and inverse folding are fields of the job like any other. This
 // wrote the contig and conditions alone, so a structure preset came out as a different job.
+//
+// 🔴 AND A PRESET WITHOUT `specMode` IS ITS STRUCTURE, which upstream writes
+// `{input, input_as_annotated_cif: true}` with no contig: its contig is in the original entry's
+// numbering and names residues the cropped example does not have, and its conditions are already
+// the file's annotations. Writing them out made a job that is not the preset.
+const asStructure = Boolean(preset.cifUrl) && preset.specMode !== true;
 process.stdout.write(JSON.stringify({
   ...(preset.cifUrl ? { input: preset.cifUrl.replace(/^\.\//, "") } : {}),
-  ...(preset.specMode === undefined ? {} : { specMode: preset.specMode }),
-  contig: preset.contig,
-  conditions: preset.conditions,
+  ...(asStructure ? { input_as_annotated_cif: true }
+    : { contig: preset.contig, conditions: preset.conditions }),
   nsteps: preset.nsteps,
   recycleSchedule: preset.recycleSchedule,
   partialTrajectoryFractionSteps: preset.partialTrajectoryFractionSteps,

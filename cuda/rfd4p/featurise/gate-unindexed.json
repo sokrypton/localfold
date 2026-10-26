@@ -1,1 +1,1 @@
-{"input": "web/examples/motif_unidx_1prw.cif.zst", "nsteps": 60}
+{"input": "web/examples/motif_unidx_1prw.cif.zst", "nsteps": 60, "input_as_annotated_cif": true}

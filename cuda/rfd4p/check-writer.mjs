@@ -35,12 +35,17 @@ const repo = new URL("../..", import.meta.url).pathname;
 const text = readFileSync(specPath, "utf8");
 const job = text.trimStart().startsWith("{") ? JSON.parse(text) : parseConditionSpecYaml(text);
 const cifUrl = job.cifUrl ?? job.input ?? null;
-const specMode = job.specMode ?? (job.cifUrl === undefined && job.input === undefined);
+// A job is a spec unless it says `specMode: false` (featurise.cpp's note).
+const specMode = job.specMode ?? true;
 const inputCif = cifUrl
   ? decodeTextOrZstd(new Uint8Array(readFileSync(cifUrl.startsWith("/") ? cifUrl
     : `${repo}${cifUrl.replace(/^\.\//, "")}`)))
   : undefined;
-const spec = { contig: job.contig, ...(job.conditions === undefined ? {} : { conditions: job.conditions }) };
+const spec = {
+  contig: job.contig,
+  ...(job.conditions === undefined ? {} : { conditions: job.conditions }),
+  ...(job.input_as_annotated_cif ?? job.inputAsAnnotatedCif ? { input_as_annotated_cif: true } : {}),
+};
 const built = !specMode && inputCif !== undefined
   ? buildBatch(inputCif, { seed })
   : buildBatch(spec, { seed, ...(inputCif === undefined ? {} : { inputCif }) });
