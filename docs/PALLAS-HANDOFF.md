@@ -54,8 +54,8 @@ and `cuda_legacy` below, `--use-fast-kernels` requires bfloat16 (the default), a
 
 ## The numbers to beat
 
-Settings for every row: `model_1_ptm`, 3 recycles (4 passes), early stop OFF, MSA 512:1024 (LocalFold and
-NVFold at 508:1024 clusters - the same effective depth, because AF2 reduces clusters by the template count),
+Settings for every row: `model_1_ptm`, 3 recycles (4 passes), early stop OFF, MSA 512:1024 (LocalFold at
+508:1024 clusters - the same effective depth, because AF2 reduces clusters by the template count),
 bfloat16, warm (second fold of the same shape in one process). Cases: 6MRR (68 aa), 5CAJ chain A (261),
 5CAJ x2 (522), x4 (1044), single sequence; and 5CAJ with a 7,907-row alignment (261 + MSA).
 
@@ -77,8 +77,6 @@ bfloat16, warm (second fold of the same shape in one process). Cases: 6MRR (68 a
 | ColabFold + kernels 0.8.0 | 0.068 | 0.228 | 0.756 | 3.44 | 0.816 |
 
 So the A100 gap is the interesting one, and the MSA case and the small case are where it is widest.
-NVFold (NVIDIA's AF2, evaluation build) was also measured; its numbers are under an evaluation licence that
-forbids disclosure, so they are not repeated here - it sits between the two rows above on the A100.
 
 ## The harness: `~/af2bench`
 

@@ -1,7 +1,7 @@
 // AF2's MSAColumnGlobalAttention on the extra MSA, fused: four kernels on the MSA in its own [N][L][C] layout,
 // where the unfused form transposed it to [L][N][C] (and back), LayerNormed, projected and gated in f32 passes
 // of their own - eleven passes over a 5,120-row extra MSA, 7.9 ms a call at 261 residues on an A100, 8% of a
-// fold (nvfold's: ~0.7 ms). C = 64, eight heads of eight (the extra stack's shape).
+// fold. C = 64, eight heads of eight (the extra stack's shape).
 //
 //   gaInK:    LN(row) on the way in (four lanes... two a row: 32 channels a lane), then on the tensor cores
 //             [k | v | gate] = LN(row) [Wk | Wv | Wg]: k, v to kv [L][N][16] (f32, a column's keys contiguous),
