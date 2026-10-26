@@ -305,16 +305,53 @@ def main():
             # very note once.
             bad.append(f"the method note is wrong or carries a source marker: {switched['note']!r}")
 
+        # 🔴 AND AtomWorks Studio's GENERATION OPTIONS: Thinking, the two K and Partial %, live
+        # under RFD4-Proteina, filled by a preset that declares them, and an out-of-range K refused
+        # by name BEFORE a generation starts (no weights are touched by this arm).
+        sampler = json.loads(cdp.evaluate(ws, """(() => {
+          const ids = ["thinkingGroup", "backboneKGroup", "latentKGroup", "partialGroup"];
+          const live = ids.filter((id) => [...document.getElementById(id).querySelectorAll("select, input")]
+            .every((c) => !c.disabled));
+          const preset = document.getElementById("preset");
+          preset.value = "partial_diffusion_1prw";
+          preset.dispatchEvent(new Event("change"));
+          const filled = { thinking: document.getElementById("thinking").value,
+                           partial: document.getElementById("partial").value };
+          preset.value = "";
+          preset.dispatchEvent(new Event("change"));
+          document.getElementById("backbone-k").value = "25";
+          document.getElementById("hunt").click();
+          const refused = document.getElementById("status-message").textContent;
+          document.getElementById("backbone-k").value = "16";
+          return JSON.stringify({ live, filled, refused,
+            more: document.getElementById("show-advanced").textContent.trim() });
+        })()"""))
+        print(f"  sampler controls: {sampler}")
+        if len(sampler["live"]) != 4:
+            bad.append(f"under RFD4-Proteina only {sampler['live']} of the sampler controls are live")
+        if sampler["filled"] != {"thinking": "low", "partial": "50"}:
+            bad.append(f"the partial-diffusion preset did not fill Thinking/Partial %: {sampler['filled']}")
+        if "Backbone K takes 1 to 20" not in sampler["refused"]:
+            bad.append(f"Backbone K 25 was not refused by name: {sampler['refused']!r}")
+        if sampler["more"] != "9 more":
+            bad.append(f"the advanced toggle reads {sampler['more']!r}, expected '9 more'")
+
         # ...and switching back must re-enable them, or the page is a one-way door.
         back = json.loads(cdp.evaluate(ws, """(() => {
           const pick = document.getElementById("method");
           pick.value = "hunter";
           pick.dispatchEvent(new Event("change"));
           return JSON.stringify({ enabled: [...document.querySelectorAll(
-            "#designerGroup select, #folderGroup select, #scheduleGroup input")].every((c) => !c.disabled) });
+            "#designerGroup select, #folderGroup select, #scheduleGroup input")].every((c) => !c.disabled),
+            samplerGreyed: [...document.querySelectorAll(
+            "#thinkingGroup select, #backboneKGroup input, #latentKGroup input, #partialGroup input")]
+            .every((c) => c.disabled),
+            unused: document.getElementById("unused-note")?.textContent ?? "" });
         })()"""))
         if not back["enabled"]:
             bad.append("switching back to Protein Hunter left controls disabled")
+        if not back["samplerGreyed"] or "backbone k" not in back["unused"].lower():
+            bad.append(f"under Protein Hunter the RFD4 sampler is not greyed with a reason: {back['unused']!r}")
 
         # 🔴 AND A REAL HUNT, END TO END: two models' weights, a fold, an MPNN
         # redesign, three more folds with the model rotating under the sequence,
@@ -511,6 +548,10 @@ def main():
               // runs the same straight line the page ran before the control was
               // honoured at all.
               document.getElementById('beam').value = '2';
+              // and Studio's sampler, off its defaults, so the archived job has to carry them
+              document.getElementById('thinking').value = 'high';
+              document.getElementById('backbone-k').value = '10';
+              document.getElementById('latent-k').value = '3';
               document.getElementById('hunt').click();
               return 1;
             })()""")
@@ -617,6 +658,27 @@ def main():
                     bad.append(f"the downloads do not show each design's metrics: {archive['metricLines']}")
                 else:
                     print(f"            candidate 1: {archive['metricLines'][0]}")
+                if "job.json" in names:
+                    ran = json.loads(dict(archive["members"])["job.json"])
+                    want = {"recycleSchedule": "thinking_high",
+                            "sampling": {"bb_ca": {"simulation_step_params": {"tsr_k": 10}},
+                                         "local_latents": {"simulation_step_params": {"tsr_k": 3}}}}
+                    got = {k: ran.get(k) for k in want}
+                    if got != want:
+                        bad.append(f"the archived job does not record the sampler that ran: {got}")
+                # 🔴 AND K REACHES THE ENGINE, not only the job file: the same seed at two K must be
+                # two structures, and at one K twice the same one (the flow is deterministic).
+                kdiff = json.loads(cdp.evaluate(ws, """(async () => {
+                  const { generate } = await import('/web/generate.js');
+                  const run = (k) => generate({ contig: '40-40', steps: 6, seed: 3,
+                    ...(k === undefined ? {} : { sampling: { bb_ca: { simulation_step_params: { tsr_k: k } } } }) })
+                    .then((r) => r.pdb);
+                  const a = await run(undefined), b = await run(4), c = await run(4);
+                  return JSON.stringify({ kMoves: a !== b, repeatable: b === c });
+                })()"""))
+                print(f"            backbone K at the engine: {kdiff}")
+                if not kdiff["kMoves"] or not kdiff["repeatable"]:
+                    bad.append(f"Backbone K does not reach the engine as a setting: {kdiff}")
                 featuriser = Path(ROOT) / "cuda" / "rfd4p" / "featurise" / "rfd4p-featurise"
                 if featuriser.exists() and "job.json" in names:
                     with tempfile.TemporaryDirectory() as tmp:

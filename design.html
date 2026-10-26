@@ -263,6 +263,42 @@ web/localfold.css. Not web/style.css, the dark theme the withheld pages used.
                             title="A given job, setting and seed give the same result every time.">
                     </div>
 
+                    <!-- 🔴 AtomWorks Studio's GENERATION OPTIONS, which the engine and
+                         the native port always took and this page never offered:
+                         the recycle budget ("Thinking", upstream's thinking_*
+                         schedules), the two samplers' tsr_k ("Backbone K" and
+                         "Latents K", lower is a hotter sample), and partial
+                         diffusion as a percentage of the trajectory. A preset sets
+                         what it declares; whatever is in the box is what runs, and
+                         the saved job.json records it. -->
+                    <div class="fetch-option-group advanced" id="thinkingGroup">
+                        <span class="fetch-option-title">Thinking</span>
+                        <select id="thinking"
+                            title="How many recycles each flow step spends, front-loaded: upstream's thinking_low/medium/high. Medium is its default.">
+                            <option value="low">low</option>
+                            <option value="medium" selected>medium</option>
+                            <option value="high">high</option>
+                        </select>
+                    </div>
+
+                    <div class="fetch-option-group advanced" id="backboneKGroup">
+                        <span class="fetch-option-title">Backbone K</span>
+                        <input type="number" id="backbone-k" min="1" max="20" step="0.1" value="16"
+                            title="The backbone sampler's tsr_k (1-20). Lower samples more freely; 16 is the released setting.">
+                    </div>
+
+                    <div class="fetch-option-group advanced" id="latentKGroup">
+                        <span class="fetch-option-title">Latents K</span>
+                        <input type="number" id="latent-k" min="1" max="6" step="0.1" value="4"
+                            title="The latent (sequence) sampler's tsr_k (1-6). Lower samples more freely; 4 is the released setting.">
+                    </div>
+
+                    <div class="fetch-option-group advanced" id="partialGroup">
+                        <span class="fetch-option-title">Partial %</span>
+                        <input type="number" id="partial" min="1" max="100" step="1" placeholder="off"
+                            title="Partial diffusion: re-denoise this percentage of the trajectory starting from the loaded structure instead of from noise. Empty is off.">
+                    </div>
+
                     <!-- 🔴 THE STRUCTURE HALF THE MODALITIES ARE CONDITIONED ON. A
                          span taken From structure names residues of THIS; partial
                          diffusion starts the flow from it; inverse folding holds
@@ -290,8 +326,8 @@ web/localfold.css. Not web/style.css, the dark theme the withheld pages used.
                         <span class="fetch-option-title">&nbsp;</span>
                         <button type="button" id="show-advanced" class="btn btn-grey btn-small"
                             aria-expanded="false"
-                            title="Runs, sampling steps, temperature, omitted letters and the seed.">
-                            5 more
+                            title="Runs, sampling steps, temperature, omitted letters, the seed, and RFD4-Proteina's sampler.">
+                            more
                         </button>
                     </div>
 

@@ -33,6 +33,7 @@ import { generateRfd4p } from "../webgpu/rfd4p/generate.js";
 import { processSampleToAtoms, toPdbString } from "../shared/rfd4p/output.js";
 import { conditioningMetricsTags, designMetrics, jobMetricsTags } from "../shared/rfd4p/metrics.js";
 import { decompress } from "../shared/rfd4p/vendor/fzstd.js";
+import { resolveSampling } from "../shared/rfd4p/flow.js";
 
 /** How many flow-matching steps a generation takes when the caller does not say. */
 export const DEFAULT_STEPS = 60;
@@ -94,6 +95,9 @@ async function templateCif(url, signal) {
  *   user loaded rather than one a preset points at. Wins over `cifUrl`.
  * @param {number} [options.steps]
  * @param {string} [options.recycleSchedule]
+ * @param {object} [options.sampling] the samplers over the released ones, in upstream's config
+ *   shape (`bb_ca` / `local_latents`, each `simulation_step_params`, `schedule`, `gt`) - what
+ *   a job's `sampling` is (shared/rfd4p/flow.js `resolveSampling`)
  * @param {number} [options.partialTrajectoryFractionSteps] partial diffusion:
  *   start the flow partway along, from the input structure rather than from
  *   noise, and re-denoise the rest. 0.5 is the preset's.
@@ -116,7 +120,7 @@ async function templateCif(url, signal) {
 export async function generate(options) {
   const {
     contig, conditions, cifUrl, inputCif: givenCif, fromAnnotations = false,
-    steps = DEFAULT_STEPS, recycleSchedule, seed = 0,
+    steps = DEFAULT_STEPS, recycleSchedule, sampling, seed = 0,
     partialTrajectoryFractionSteps, inverseFolding, metricsTags: givenTags,
     status = () => {}, progress = () => {}, onStep, frames = 0, signal,
   } = options;
@@ -160,6 +164,9 @@ export async function generate(options) {
     throw new Error(`the contig "${contig.trim()}" names a segment of an existing structure,`
       + " so it needs one to take it from - load an example or add a structure");
   }
+
+  // Resolved before any work, so a bad setting is refused in upstream's words, not minutes later.
+  const resolvedSampling = sampling === undefined ? undefined : resolveSampling(sampling);
 
   const device = await getDevice(signal);
   // Weight loading owns the first 70% of the bar: it is minutes on a cold
@@ -241,6 +248,7 @@ export async function generate(options) {
     // 4-chunk f16 path on stock flags, n = 200 at 60 steps: median CA-CA 3.864 A,
     // 199 of 199 bonds in band.
     half: true,
+    ...(resolvedSampling === undefined ? {} : { sampling: resolvedSampling }),
     ...(recycleSchedule === undefined ? {} : { recycleSchedule }),
     ...(partialTrajectoryFractionSteps === undefined
       ? {} : { partialTrajectoryFractionSteps }),
@@ -308,6 +316,7 @@ export async function generate(options) {
       }),
     nsteps: steps,
     ...(recycleSchedule === undefined ? {} : { recycleSchedule }),
+    ...(sampling === undefined ? {} : { sampling }),
     ...(partialTrajectoryFractionSteps === undefined ? {} : { partialTrajectoryFractionSteps }),
     ...(inverseFolding === true ? { inverseFolding: true } : {}),
     ...(metricsTags.length === 0 ? {} : { metrics_tags: metricsTags }),

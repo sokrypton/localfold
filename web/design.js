@@ -374,8 +374,12 @@ folders.addEventListener("change", () => paintMethod());
  * in a loop - so there is no cycle, no designer, and no folding model.
  */
 const UNUSED_BY = {
-  // Nothing: every control on the strip means something to a hunt.
-  hunter: {},
+  hunter: {
+    thinkingGroup: "Protein Hunter folds with a diffusion model; Thinking is RFD4-Proteina's recycle budget.",
+    backboneKGroup: "Backbone K is RFD4-Proteina's sampler; a hunt's fold has no such setting.",
+    latentKGroup: "Latents K is RFD4-Proteina's sampler; a hunt's fold has no such setting.",
+    partialGroup: "Partial diffusion re-denoises a structure with RFD4-Proteina; a hunt starts from a sequence.",
+  },
   rfd4p: {
     folderGroup: "RFD4-Proteina generates structure directly, so nothing folds it in a loop.",
     cyclesGroup: "RFD4-Proteina has no fold-and-redesign cycle to repeat.",
@@ -406,10 +410,12 @@ const RESTING = {
  */
 function paintAdvanced() {
   const open = advancedButton.getAttribute("aria-expanded") === "true";
-  for (const group of document.querySelectorAll("#designOptions .advanced")) {
+  const groups = document.querySelectorAll("#designOptions .advanced");
+  for (const group of groups) {
     group.hidden = !open;
   }
-  advancedButton.textContent = open ? "fewer" : "5 more";
+  // Counted, not typed: the label said "5 more" for five, and nine are behind it now.
+  advancedButton.textContent = open ? "fewer" : `${groups.length} more`;
 }
 
 advancedButton.addEventListener("click", () => {
@@ -788,6 +794,11 @@ presetSelect.addEventListener("change", () => {
   const preset = RFD4P_PRESETS.find((entry) => entry.id === presetSelect.value);
   if (preset === undefined) {
     presetExtras = {};
+    // 🔴 AND THE EXAMPLE'S SAMPLER GOES WITH IT, back to upstream's defaults: a Partial % left
+    // from the partial-diffusion example turned the next job into partial diffusion, which is what
+    // dropping `presetExtras` did for these two before they were controls.
+    element("thinking").value = "medium";
+    element("partial").value = "";
     presetNote.textContent = "";
     presetNote.classList.remove("warn");
     return;
@@ -820,13 +831,18 @@ presetSelect.addEventListener("change", () => {
     // example, so running it from the spec fails outright.
     fromAnnotations: preset.specMode !== true && preset.cifUrl !== null
       && preset.cifUrl !== undefined,
-    partialTrajectoryFractionSteps: preset.partialTrajectoryFractionSteps,
     inverseFolding: preset.inverseFolding,
-    // 🔴 THE PRESET'S RECYCLE BUDGET, which every preset declares and this
-    // object never carried - so the page ran `medium` under a preset that says
-    // `low`, and the same preset through the native port ran `low`.
-    recycleSchedule: preset.recycleSchedule,
   };
+  // 🔴 THE PRESET'S RECYCLE BUDGET AND PARTIAL FRACTION GO INTO THE CONTROLS,
+  // not into this object: the budget was carried here once and never shown (the
+  // page ran `medium` under a preset that says `low` before that), and a value
+  // kept beside a control that shows another is two answers to one question. A
+  // bare budget and `thinking_<budget>` are one schedule (shared/rfd4p/flow.js).
+  if (preset.recycleSchedule !== undefined) {
+    element("thinking").value = String(preset.recycleSchedule).replace(/^thinking_/, "");
+  }
+  element("partial").value = preset.partialTrajectoryFractionSteps === undefined
+    ? "" : String(Math.round(preset.partialTrajectoryFractionSteps * 100));
   if (preset.nsteps !== undefined) element("steps").value = String(preset.nsteps);
   spanList.set(spans);
 
@@ -1231,12 +1247,48 @@ function paintDownloads() {
   downloadsBox.append(button("All, with the job (.zip)", () => { saveArchive(); }));
 }
 
+/**
+ * RFD4-Proteina's sampler, as AtomWorks Studio exposes it: the recycle budget, the two
+ * samplers' `tsr_k`, and partial diffusion as a percentage of the trajectory.
+ *
+ * Returned as `generate()`'s options, which write the same fields into the saved job, so
+ * `localfold-rfd4p --job=` runs what the page ran. A K at its released value is left out
+ * rather than restated, so a job that never touched it reads as one that did not. Out of
+ * Studio's own ranges is refused by name; an empty Partial % is off.
+ */
+const SAMPLER_DEFAULT_K = { bb_ca: 16, local_latents: 4 };
+const rfd4Sampler = () => {
+  const out = { recycleSchedule: `thinking_${element("thinking").value}` };
+  const sampling = {};
+  for (const [id, modality, max, label] of [["backbone-k", "bb_ca", 20, "Backbone K"],
+    ["latent-k", "local_latents", 6, "Latents K"]]) {
+    const k = Number(element(id).value);
+    if (!(k >= 1 && k <= max)) throw new Error(`${label} takes 1 to ${max}, not "${element(id).value}"`);
+    if (k !== SAMPLER_DEFAULT_K[modality]) sampling[modality] = { simulation_step_params: { tsr_k: k } };
+  }
+  if (Object.keys(sampling).length > 0) out.sampling = sampling;
+  const partial = element("partial").value.trim();
+  if (partial !== "") {
+    const pct = Number(partial);
+    if (!(pct >= 1 && pct <= 100)) throw new Error(`Partial % takes 1 to 100, not "${partial}"`);
+    out.partialTrajectoryFractionSteps = pct / 100;
+  }
+  return out;
+};
+
 /** RFD4-Proteina: one generation, straight into the viewer. */
 const startGenerate = async () => {
   const spans = spanList.read();
   const { contig, problems } = contigOf(spans, "rfd4p");
   if (problems.length > 0) {
     say(problems.join(" · "), true);
+    return;
+  }
+  let sampler;
+  try {
+    sampler = rfd4Sampler();
+  } catch (error) {
+    say(error.message, true);
     return;
   }
   const controller = new AbortController();
@@ -1282,6 +1334,7 @@ const startGenerate = async () => {
       // A structure the user loaded is the one they mean, over a preset's.
       ...(loaded === null ? {} : { inputCif: loaded.data }),
       steps: number("steps", RFD4_STEPS),
+      ...sampler,
       // 🔴 A GENERATION IS A TRAJECTORY AND WAS DRAWN AS ONE PICTURE. The flow
       // runs 60 steps and the page pushed only the finished structure, so the
       // play bar - which hides itself below two frames - never appeared and
