@@ -53,6 +53,7 @@ import { featureStats, resetFeatureStats } from "../../shared/input/a3m-features
 import { chainResidues, identityMap, templateSlotAtom37 }
   from "../../shared/af3/featurise/template-input.js";
 import { superpose } from "./superpose.js";
+import { predictionToPdb } from "../../web/prediction-results.js";
 import { DeltaTensorStore } from "../../shared/bundles/delta-tensor-store.js";
 import { MODEL_BUNDLES, graphFamily } from "../../shared/bundles/manifests/index.js";
 
@@ -585,7 +586,12 @@ export async function main(device, args) {
   }
 
   const round = (value, places = 4) => Number(value.toFixed(places));
+  // `--pdb`: the structure as the page writes it (web/prediction-results.js), for a scorer outside this
+  // process - cuda/af2/parity scores this arm with DockQ against ColabFold's and the CUDA port's
+  const pdb = args.includes("--pdb")
+    ? predictionToPdb(sequence, final.structure, final.confidence.plddt, chains) : undefined;
   return {
+    pdb,
     sequence: sequence.length > 24 ? `${sequence.slice(0, 24)}...(${length})` : sequence,
     family: graph === family ? family : `${family} (${graph} graph)`,
     chains, length, rows, extraRows, recycles, seed,

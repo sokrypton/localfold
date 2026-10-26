@@ -32,7 +32,10 @@ def read_native(path):
         if not parts:
             continue
         if parts[0] == "m":
-            entries[parts[1]] = float(parts[2])
+            try:
+                entries[parts[1]] = float(parts[2])
+            except ValueError:          # a name, not a number (meta/model)
+                entries[parts[1]] = parts[2]
             continue
         kind, name, offset, length = parts[0], parts[1], int(parts[2]), int(parts[3])
         dtype = np.int32 if kind == "i" else np.float32
