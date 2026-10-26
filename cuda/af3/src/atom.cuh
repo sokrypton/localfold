@@ -13,7 +13,7 @@
 // kernels compiled and moved its folds - so each mode is its own instantiation and AF3's is the code it was)
 #define ADA(s) (RAW ? (s) : sigm(s))
 #define ADA_EPS (RAW ? 0.1f : 1e-5f)
-inline bool ADA_RAW = false;
+inline LF_TLS bool ADA_RAW = false;
 inline void setAdaMode(bool chai) { ADA_RAW = chai; }
 struct Gather { const int* idx; const float* mask; int count; };
 inline Gather gatherOf(const std::string& name) {
@@ -22,7 +22,7 @@ inline Gather gatherOf(const std::string& name) {
 // Diffusion samples in flight through the denoiser's per-step path: every per-sample tensor is
 // NS copies, sample-major, and what the samples share (the conditioning, masks, the attention
 // biases, the adaptive LayerNorms' scales) is read at (row % one sample's rows).
-inline int NS = 1;
+inline LF_TLS int NS = 1;
 // out[index] = mask ? source[indices[index]] : 0; over `ns` samples, sample k reading source rows
 // offset by k * srcRows
 __global__ void convertK(const int* idx, const float* mask, const float* src, float* out, int count, int C,
@@ -851,12 +851,12 @@ __global__ void __launch_bounds__(256, 8) atomKqNormK(T* __restrict__ qg, T* __r
 }
 __global__ void fillOnesK(float* x, size_t n) { size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; if (i < n) x[i] = 1.f; }
 inline const float* ones(size_t n) {           // a device vector of ones, at least n long
-  static float* o = nullptr; static size_t have = 0;
+  static LF_TLS float* o = nullptr; static LF_TLS size_t have = 0;
   if (n > have) { if (o) CK(cudaFree(o)); o = dalloc(n); fillOnesK<<<blocks(n), 256, 0, STREAM>>>(o, n); CK(cudaStreamSynchronize(STREAM)); have = n; }
   return o;
 }
 inline const float* zeros(size_t n) {          // a device vector of zeros, at least n long
-  static float* z = nullptr; static size_t have = 0;
+  static LF_TLS float* z = nullptr; static LF_TLS size_t have = 0;
   if (n > have) { if (z) CK(cudaFree(z)); z = dalloc(n); CK(cudaMemset(z, 0, n * 4)); have = n; }
   return z;
 }
@@ -868,7 +868,7 @@ __global__ void castScaleK(const T* x, TO* y, float a, size_t n) {
 // T is the GEMM inputs' type (f16 on the fast path); the residual stream stays f32.
 // several GPUs, the diffusion's tokens split (one sample): the atom blocks on subsets [ATOM_S0, ATOM_S1) only - a
 // rank's own atoms and a halo (atomRangeFor); ATOM_S1 0: every subset
-inline int ATOM_S0 = 0, ATOM_S1 = 0;
+inline LF_TLS int ATOM_S0 = 0, ATOM_S1 = 0;
 template <class T>
 void crossAttentionBlockT(float* actAll, const AtomStep& st, const AtomBlockCache& bc, const AtomShape& sh,
                           int C, int heads, int D, const std::string& B, const float* prevGateAll = nullptr,
@@ -985,7 +985,7 @@ void crossAttentionBlockT(float* actAll, const AtomStep& st, const AtomBlockCach
     else addSigmoidGated<T>(act, projected, tg, R * C, q1 * C, postMask, C);
   }
 }
-inline bool ATOM_HALF = false;        // the atom blocks' GEMMs in f16 (set by --fast)
+inline LF_TLS bool ATOM_HALF = false;        // the atom blocks' GEMMs in f16 (set by --fast)
 inline void crossAttentionBlock(float* act, const AtomStep& st, const AtomBlockCache& bc, const AtomShape& sh,
                                 int C, int heads, int D, const std::string& B, const float* prevGate = nullptr,
                                 const float* prevMask = nullptr, bool deferAdd = false, const float* postMask = nullptr,
@@ -1397,8 +1397,8 @@ struct EncoderOut {
 };
 
 // trunkSingle [tokens][Cs] and trunkPair [tokens^2][Cz] may be null (target_feat).
-inline float* ENC_TP_GIVEN = nullptr;
-inline TokenPairRows ENC_TP_ROWS;       // (several GPUs: every rank's rows of it, prepareDiffusion's)
+inline LF_TLS float* ENC_TP_GIVEN = nullptr;
+inline LF_TLS TokenPairRows ENC_TP_ROWS;       // (several GPUs: every rank's rows of it, prepareDiffusion's)
 inline EncoderOut prepareEncoder(const std::string& E, const std::string& refPrefix, const float* trunkSingle,
                                  const float* trunkPair) {
   AtomShape sh = atomShape();
@@ -1579,7 +1579,7 @@ __global__ void __launch_bounds__(128, 8) chiralGradK(const float* __restrict__ 
   if (a < 3) grads[(k * atoms + atom) * 3 + a] = (float)g;
 }
 struct Chirality { int *centers, *offsets, *entries, *active; float* angles; size_t atoms, activeCount; int ns; };
-inline Chirality CHIRALITY{};                               // reset with each input of a batch
+inline LF_TLS Chirality CHIRALITY{};                               // reset with each input of a batch
 inline const Chirality& chirality(size_t atoms) {           // the inverted index, once per input
   Chirality& c = CHIRALITY;
   if (!c.centers) {
@@ -1769,7 +1769,7 @@ __global__ void concatColsK(const float* a, const float* b, float* out, size_t r
   size_t r = t / (Ca + Cb); int c = (int)(t % (Ca + Cb));
   out[t] = c < Ca ? a[r * Ca + c] : b[r * Cb + c - Ca];
 }
-inline float* TARGET_FEAT_STRUCTURE = nullptr;     // chai-1's second projection: the diffusion module's target_feat
+inline LF_TLS float* TARGET_FEAT_STRUCTURE = nullptr;     // chai-1's second projection: the diffusion module's target_feat
 __global__ void gatherEsmRowsK(const float* rows, const int* tokenRow, float* out, int tokens, int E) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)tokens * E) return;
@@ -1827,7 +1827,7 @@ inline float* buildTargetFeat() {
     float* tf = scratch<float>("targetFeat", (size_t)tokens * out);
     linear<float, float>(cat, tf, tokens, Cp + C, out, P + "singleProjInTrunk");
     {   // kept past the phases' scratch releases: the diffusion reads it after the trunk
-      static size_t have = 0;
+      static LF_TLS size_t have = 0;
       size_t need = (size_t)tokens * out;
       if (need > have) { if (TARGET_FEAT_STRUCTURE) CK(cudaFree(TARGET_FEAT_STRUCTURE)); TARGET_FEAT_STRUCTURE = dalloc(need); have = need; }
     }

@@ -65,15 +65,15 @@ inline void plainTransition(float* x, size_t rows, int C, int factor, const std:
   }
 }
 
-inline bool DIFF_HALF = false;     // the denoiser's transformer in f16 (set by --fast)
+inline LF_TLS bool DIFF_HALF = false;     // the denoiser's transformer in f16 (set by --fast)
 struct Conditioning { float *single, *pair; };
 // Everything in the conditioning but the noise term is the same at every step; the pair is
 // computed once and the single's noise-free part kept, so a step adds one projection.
 struct DiffusionCache { bool ready = false; float *pair, *singleBase; };
-inline DiffusionCache DCACHE;
+inline LF_TLS DiffusionCache DCACHE;
 
 // The step's noise level lives in device memory, so a captured step reads the current one.
-inline float* noiseParams = nullptr;
+inline LF_TLS float* noiseParams = nullptr;
 __global__ void fourierK(const float* params, const float* w, const float* b, float* out, int nc) {
   int k = blockIdx.x * blockDim.x + threadIdx.x; if (k >= nc) return;
   float tr = 0.25f * logf(params[0] / 16.f);
@@ -105,7 +105,7 @@ __global__ void baseplusK(const float* __restrict__ base, const float* __restric
   out[t] = base[(size_t)i * C + c] + v[(size_t)s * C + c];
 }
 inline void setNoise(float noiseLevel) {
-  static float* pinned = nullptr;
+  static LF_TLS float* pinned = nullptr;
   if (!noiseParams) { noiseParams = dalloc(4); CK(cudaMallocHost(&pinned, 16)); }
   pinned[0] = noiseLevel;
   CK(cudaMemcpyAsync(noiseParams, pinned, 4, cudaMemcpyHostToDevice, STREAM));
@@ -184,7 +184,7 @@ __global__ void chaiStructurePairK(const float* __restrict__ trunkPair, int Czt,
 }
 // a dense rank of a per-token id (torch.unique(..., return_inverse=True)), uploaded once per input
 inline const int* denseRank(const std::string& key) {
-  static std::map<std::string, std::pair<const int*, int*>> cache;
+  static LF_TLS std::map<std::string, std::pair<const int*, int*>> cache;
   const int* host = M.i(key); size_t n = M.len(key);
   auto it = cache.find(key);
   if (it != cache.end() && it->second.first == host) return it->second.second;
@@ -398,7 +398,7 @@ layerNormPlainK(const float* __restrict__ in, TO* __restrict__ out, size_t rows,
 inline size_t padRows16(size_t M) { return (M + 15) / 16 * 16; }
 // a scratch buffer's padding rows zeroed when first seen (finite values in, finite out)
 inline void zeroOnce(void* p, size_t bytes) {
-  static std::map<void*, size_t> seen;
+  static LF_TLS std::map<void*, size_t> seen;
   auto it = seen.find(p);
   if (it != seen.end() && it->second >= bytes) return;
   CK(cudaMemsetAsync(p, 0, bytes, STREAM)); seen[p] = bytes;
@@ -925,7 +925,7 @@ layerNormSlowHalfK(const float* __restrict__ in, half* __restrict__ out, size_t 
   float inv = rsqrtf(v / C + 1e-5f);
   for (int c = lane; c < C; c += 32) out[row * C + c] = __float2half((__ldg(x + c) - mean) * inv * __ldg(scale + c));
 }
-inline half* PN16_GIVEN = nullptr;     // a streamed preparation's LayerNorm'd pair (prepareTransformer)
+inline LF_TLS half* PN16_GIVEN = nullptr;     // a streamed preparation's LayerNorm'd pair (prepareTransformer)
 inline void refreshSuperBlockBias(int sb, int n);
 inline void refreshBlockBias(int b, int n);
 struct TransformerCache {
@@ -941,7 +941,7 @@ struct TransformerCache {
   std::string wNorm, wRaw;             // synthetic weight names
   float *bNorm, *bRaw;                 // the matching biases (zero where none)
 };
-inline TransformerCache TCACHE;
+inline LF_TLS TransformerCache TCACHE;
 
 inline void prepareTransformer(const float* pairCond, int n) {
   const std::string T = "diffusion.transformer";
@@ -957,7 +957,7 @@ inline void prepareTransformer(const float* pairCond, int n) {
     for (int k = 0; k < perSuper; ++k) names.push_back(T + ".superBlocks." + std::to_string(sb) + ".blocks." + std::to_string(k));
   tc.nblocks = (int)names.size();
   if (tc.wNorm.empty() || (!DIFF_HALF && !WF.count(tc.wNorm)) || (DIFF_HALF && !WH.count(tc.wNorm) && !WF.count(tc.wNorm))) {
-    static bool hooked = false;
+    static LF_TLS bool hooked = false;
     if (!hooked) { FORGET_HOOKS.push_back([] { TCACHE.wNorm.clear(); TCACHE.wRaw.clear(); }); hooked = true; }
     // the folded weights, once per process, built on the device from its copy of the weights (on
     // the host this was 250 ms of every first fold): rows are the conditioning's Cc channels, then
@@ -1074,7 +1074,7 @@ inline void prepareTransformer(const float* pairCond, int n) {
           SuperBias sp{};
           for (int k = 0; k < perSuper; ++k) sp.p[k] = sb * perSuper + k < tc.nblocks ? tc.biasHalf[sb * perSuper + k] : nullptr;
           const int smem = 32 * (perSuper * heads + 1) * 4;
-          static int granted = 0;
+          static LF_TLS int granted = 0;
           if (smem > 48 * 1024 && smem > granted) { smemAttr(flatToBiasSuperK, smem); granted = smem; }
           flatToBiasSuperK<<<dim3((unsigned)((tc.stride + 31) / 32), (unsigned)n), 256, smem, STREAM>>>(flat, sp, perSuper, heads, n, tc.stride, 0);
         }
@@ -1208,7 +1208,7 @@ inline void refreshSuperBlockBias(int sb, int n) {
     linear<half, float>(tc.pn16 + (size_t)i0 * n * Cz, flatc, rows, Cz, ps * heads, w);
     // (a last super block short of ps blocks: its missing blocks' heads are computed and not stored)
     const int smem = 32 * (ps * heads + 1) * 4;
-    static int granted = 0;
+    static LF_TLS int granted = 0;
     if (smem > 48 * 1024 && smem > granted) { smemAttr(flatToBiasSuperK, smem); granted = smem; }
     flatToBiasSuperK<<<dim3((unsigned)((tc.stride + 31) / 32), (unsigned)r), 256, smem, STREAM>>>(flatc, sp, ps, heads, n, tc.stride, i0,
                                                                                                rowsB);
@@ -1754,7 +1754,7 @@ struct DiffusionFold {
   // sampling (precomputeConditioning) - a step only copies its slices in
   std::vector<float> preLevels; float *preSingle = nullptr, *preSnProj = nullptr; bool usePre = false;
 };
-inline bool GRAPHS = true;
+inline LF_TLS bool GRAPHS = true;
 // the denoiser's seams against a stage oracle (oracle.stages.stages.<name>), when one was exported
 inline void dtap(const char* name, const float* d, size_t n) {
   if (!d) return;                 // (a tensor given back: the conditioning pair of a large fold)
@@ -1883,7 +1883,7 @@ inline AtomRange atomRangeFor(int tlo, int thi) {
   long qmin = -1, qmax = -1;
   for (size_t q = 0; q < q1; ++q)
     if (t2qm[q] != 0 && t2q[q] >= tlo * sh.dense && t2q[q] < thi * sh.dense) { if (qmin < 0) qmin = (long)q; qmax = (long)q; }
-  static int reach = -1;
+  static LF_TLS int reach = -1;
   if (reach < 0) {
     const int* q2k = M.i("batch.queriesToKeys.indices"); const float* q2km = M.f("batch.queriesToKeys.mask");
     reach = 0;

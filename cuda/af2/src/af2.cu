@@ -7,9 +7,48 @@
 //
 // With --oracle (cuda/af2/oracle.py's dump of the reference on this same input), pass 0 is checked
 // against it stage by stage.
+#define LF_TLS thread_local      // every mutable global a thread's own: --multi (see multiMain)
+// ...and its output: stdout, stderr and printf through the thread's job log when --multi's serveJobs has set one
+// (lfio::log, cuda/af3/src/common.cuh), the process's otherwise - every system header that names them first
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cstdarg>
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <vector>
+#include <map>
+#include <set>
+#include <thread>
+#include <mutex>
+#include <functional>
+#include <chrono>
+#include <cmath>
+#include <algorithm>
+#include <array>
+#include <deque>
+#include <condition_variable>
+#include <unistd.h>
+#include <fcntl.h>
+#include <dirent.h>
+#include <sys/stat.h>
+#define LF_LOG_DECLARED
+namespace lfio {
+inline thread_local FILE* log = nullptr; inline thread_local bool perThread = false;
+inline FILE* processOut() { return stdout; }
+inline FILE* processErr() { return stderr; }
+}
+#undef stdout
+#undef stderr
+#define stdout (::lfio::log ? ::lfio::log : ::lfio::processOut())
+#define stderr (::lfio::log ? ::lfio::log : ::lfio::processErr())
+#define printf(...) std::fprintf(stdout, __VA_ARGS__)
 #include "../../featurise/standalone_api.h"
 #include <sys/stat.h>
 #include <unistd.h>
+#include <thread>
 #include <cerrno>
 #include "templates.cuh"
 #include "structure.cuh"
@@ -97,7 +136,7 @@ static float tmFromTerms(const std::vector<double>& tm, int L, const std::vector
 // a synthetic input of the given shapes (what export_input.mjs writes, its values arbitrary), in
 // /dev/shm, for --warm: folding it loads what the real input's fold will need while that is exported
 static std::string writeWarmInput(int L, int N, int E, int T) {
-  std::string dir = "/dev/shm/af2-warm-" + std::to_string(getpid());
+  std::string dir = "/dev/shm/af2-warm-" + std::to_string(getpid()) + "-" + std::to_string(std::hash<std::thread::id>{}(std::this_thread::get_id()) % 1000000);
   if (mkdir(dir.c_str(), 0755) && errno != EEXIST) { fprintf(stderr, "cannot make %s\n", dir.c_str()); exit(1); }
   FILE* bin = fopen((dir + "/model.bin").c_str(), "wb");
   std::string idx; size_t offset = 0;
@@ -191,7 +230,7 @@ void writeConfidences(const std::string& pdb, const float* pair, int L, const fl
 // common.cuh's AsyncTap, so the fold does not wait for them: pass-PP-of-NN.pdb / .json, pae-PP-of-NN.u8
 // (PAE / 0.125, a byte a pair), contacts-PP-of-NN.u8 (probability * 255; where the weights carry the
 // distogram head)
-static std::string FRAMES_DIR;
+static LF_TLS std::string FRAMES_DIR;
 // a pair's expected PAE and its pTM term (confidence.compute_tm's), from its 64 logits - reduced on the
 // device, because the logits are 64 floats a pair (17 MB a pass at 261 residues) and these are two
 __global__ void paeTmK(const float* logits, size_t pairs, float d0, float* pae, float* tm) {
@@ -266,7 +305,7 @@ inline void paeChunked(const float* pair, int L, const std::function<void(const 
 // --tolerance=<A>: the page's early stop (shared/af2/model/recycle-convergence.js, ColabFold's compute_tol) -
 // after each pass from the second on, the RMS change of every C-alpha pair distance against the last pass,
 // over the sequence mask; the fold stops when it is strictly below this. 0 runs every pass.
-static double TOLERANCE = 0;
+static LF_TLS double TOLERANCE = 0;
 static double caPairChange(const std::vector<float>& a, const std::vector<float>& b, const std::vector<float>& mask, int L) {
   double sum = 0, weights = 0;
   for (int i = 0; i < L; ++i)
@@ -488,15 +527,18 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
   // nothing hides a capture there: such a fold runs pass 1 too and captures while the GPU runs THAT, one replay fewer.
   // (Was: 8 passes and up, a capture at pass 1 measured against a cold fold.) AF2_NO_GRAPHS: none
   bool graphs = !getenv("AF2_NO_GRAPHS") && oracle.empty() && (passes >= 2 || warm);
-  static std::array<int, 6> lastShape{};
+  static LF_TLS std::array<int, 6> lastShape{};
   const std::array<int, 6> shape{ t.L, t.N, t.E, t.T, templates, (int)multimer };
   const int capturePass = warm || shape == lastShape ? 0 : 1;
   if (!warm) lastShape = shape;
   auto capture = [&] {
     cudaGraph_t g;
-    CK(cudaStreamBeginCapture(STREAM, cudaStreamCaptureModeThreadLocal));
-    rest(false, 1);
-    CK(cudaStreamEndCapture(STREAM, &g));
+    {
+      std::lock_guard<std::recursive_mutex> held(CAPTURE_MU);     // (no other thread's device-wide sync mid-capture)
+      CK(cudaStreamBeginCapture(STREAM, cudaStreamCaptureModeThreadLocal));
+      rest(false, 1);
+      CK(cudaStreamEndCapture(STREAM, &g));
+    }
     CK(cudaGraphInstantiate(&graph, g, 0));
     CK(cudaGraphDestroy(g));
   };
@@ -639,7 +681,7 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
   if (tapPasses) TAP().shrink((size_t)64 << 20);   // (every pass's line and files out before the fold says it is done)
   // the fold's own buffers (scratch is kept for the next fold, by name): a served process folds many
   auto release = [&] {
-    for (float* p : {t.msa, t.extra, t.pair, t.pairMask, prevRow, prevPair, prevPos, single}) CK(cudaFree(p));
+    for (float* p : {t.msa, t.extra, t.pair, t.pairMask, prevRow, prevPair, prevPos, single}) CK(lfFree(p));
     if (graph) CK(cudaGraphExecDestroy(graph));
   };
   if (warm) {
@@ -711,7 +753,8 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
 
 // --detach-output: on success the last line is "af2: done" and stdout closes, so a caller reading it to
 // its end returns while the driver releases this process's device (0.16 s of exit; cuda/af2/fold does)
-static bool DETACH = false;
+static LF_TLS bool DETACH = false;
+static LF_TLS bool IN_MULTI = false;     // a thread of --multi: serving ends by returning, not by ending the process
 static int foldMain(int argc, char** argv) {
   if (argc < 2) { fprintf(stderr, "usage: af2 <input dir> (--bundle=<dir> [--delta=<dir>] | --weights=<dir>) [--oracle=<dir>] [--out=fold.pdb] [--recycles=N]\n"); return 1; }
   std::string weights, bundleDir, deltaDir, oracle, out = "fold.pdb", warmShape, serveDir; int recycles = -1; bool profile = false, waitInput = false, waitForever = false;
@@ -813,6 +856,7 @@ static int foldMain(int argc, char** argv) {
       forgetEntries(M.unload(seg));
       return code;
     });
+    if (IN_MULTI) return 0;
     finish(0);
   }
   if (waitInput) {          // the exporter writes model.idx last, by a rename
@@ -833,7 +877,26 @@ static int foldMain(int argc, char** argv) {
 // `af2 --job=<job.json> --out=<pdb>` (any first argument that is a flag): the whole protocol in this one process -
 // the weights fetched, the input featurised in-process while the device starts, the fold (cuda/featurise/standalone.h);
 // `af2 <featurised dir> ...` and `af2 - --serve=<dir>` as before
+// --multi <args> :: <args> :: ...: each group foldMain on a thread of its own, one process - its globals are thread_local,
+// its stream cudaStreamPerThread, so the groups' kernels share the device as one context's streams (several models'
+// servers whose short folds fill the card together, with no MPS)
+static int multiMain(int argc, char** argv) {
+  std::vector<std::vector<std::string>> groups(1);
+  for (int i = 2; i < argc; ++i) { if (!strcmp(argv[i], "::")) groups.emplace_back(); else groups.back().push_back(argv[i]); }
+  std::vector<std::thread> threads; std::vector<int> codes(groups.size(), 0);
+  for (size_t g = 0; g < groups.size(); ++g)
+    threads.emplace_back([&, g] {
+      IN_MULTI = true; lfio::perThread = true;
+      std::vector<char*> a{ argv[0] };
+      for (auto& s : groups[g]) a.push_back(const_cast<char*>(s.c_str()));
+      codes[g] = foldMain((int)a.size(), a.data());
+    });
+  for (auto& t : threads) t.join();
+  for (int c : codes) if (c) finish(c);
+  finish(0);
+}
 int main(int argc, char** argv) {
+  if (argc > 1 && !strcmp(argv[1], "--multi")) return multiMain(argc, argv);
   if (argc < 2 || !strncmp(argv[1], "--", 2) || !strcmp(argv[1], "-h")) return lf::standalone::main("af2", argc, argv, foldMain);
   return foldMain(argc, argv);
 }

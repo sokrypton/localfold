@@ -543,7 +543,7 @@ inline StructureOut structureModule(const float* single, const float* pair, int 
   float* vs = qs + (size_t)2 * L * Ws;
   int ipaWork = std::max(3 * Ws, Hh * (2 * Pq + Pv));
   struct IpaW { const float* w; const float* b; };
-  static std::map<const float*, IpaW> ipaCache;
+  static LF_TLS std::map<const float*, IpaW> ipaCache;
   const float* qsw = P(I + "q_scalar_projection/weights");
   auto ipaIt = ipaCache.find(qsw);
   if (ipaIt == ipaCache.end()) {

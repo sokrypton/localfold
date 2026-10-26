@@ -7,11 +7,11 @@
 
 // ---------------------------------------------------------------- cuBLASLt, row-major
 // Y[rows, out] (f32 or f16) = X[rows, in] (f16) W[in, out] (f16) (+ bias[out] f32) (ReLU) (+ beta Y)
-inline cublasLtHandle_t LT = nullptr;
+inline LF_TLS cublasLtHandle_t LT = nullptr;
 // weights re-laid for --fast (one set a block) live for the process: carved out of 64 MiB chunks rather
 // than a cudaMalloc each - hundreds of them, each a host round trip, were most of a first pass's warm-up
 template <class T> T* wpool(size_t n) {
-  static char* chunk = nullptr; static size_t used = 0, have = 0;
+  static LF_TLS char* chunk = nullptr; static LF_TLS size_t used = 0, have = 0;
   size_t bytes = (n * sizeof(T) + 255) / 256 * 256;
   if (used + bytes > have) {
     have = std::max<size_t>(bytes, (size_t)160 << 20);
@@ -22,7 +22,7 @@ template <class T> T* wpool(size_t n) {
 struct LtPlan { cublasLtMatmulDesc_t op; cublasLtMatrixLayout_t a, b, c; cublasLtMatmulAlgo_t algo; bool ok; };
 inline const void* biasFor(const float* bias, int n, bool asHalf) {
   if (!bias || !asHalf) return bias;
-  static std::map<const float*, half*> copies;
+  static LF_TLS std::map<const float*, half*> copies;
   auto it = copies.find(bias);
   if (it != copies.end()) return it->second;
   half* h = wpool<half>(n);
@@ -36,7 +36,7 @@ __global__ void toBf16FK(const float* x, __nv_bfloat16* y, size_t n) {
 // bf16: X, Wt and Y all bf16 (cuBLASLt takes no f16-in, bf16-out GEMM) - the bf16 MSA's (MSA16); the bias a bf16 copy
 inline const void* biasForBf16(const float* bias, int n) {
   if (!bias) return nullptr;
-  static std::map<const float*, __nv_bfloat16*> copies;
+  static LF_TLS std::map<const float*, __nv_bfloat16*> copies;
   auto it = copies.find(bias);
   if (it != copies.end()) return it->second;
   __nv_bfloat16* h = wpool<__nv_bfloat16>(n);
@@ -50,10 +50,10 @@ inline void ltGemm(const void* X, const void* Wt, void* Y, bool yHalf, size_t ro
   if (!LT) CB(cublasLtCreate(&LT));
   const void* bias = bf16 ? biasForBf16(biasF, out) : biasFor(biasF, out, yHalf);
   if (getenv("AF2_LT_SHAPES") && beta != 0.f && biasF) {
-    static std::map<std::tuple<size_t, int, int>, int> seen;
+    static LF_TLS std::map<std::tuple<size_t, int, int>, int> seen;
     if (seen[std::make_tuple(rows, in, out)]++ == 0) fprintf(stderr, "beta+bias GEMM %zu x %d x %d\n", rows, in, out);
   }
-  static std::map<std::tuple<size_t, int, int, bool, int, bool, int, int, bool>, LtPlan> plans;
+  static LF_TLS std::map<std::tuple<size_t, int, int, bool, int, bool, int, int, bool>, LtPlan> plans;
   int epi = bias ? (relu ? 2 : 1) : (relu ? 3 : 0);
   auto key = std::make_tuple(rows, in, out, yHalf, epi, beta != 0.f, ldx, ldy, bf16);
   auto it = plans.find(key);
@@ -96,8 +96,8 @@ inline void ltGemm(const void* X, const void* Wt, void* Y, bool yHalf, size_t ro
   // AF2_GEMM_TIMES: every call timed by events, summed by shape and printed at exit (an analysis aid:
   // the events serialise nothing but cost a little)
   struct Timed { std::tuple<size_t, int, int, bool, int> key; cudaEvent_t a, b; };
-  static std::vector<Timed>* timed = nullptr;
-  static bool timing = getenv("AF2_GEMM_TIMES") != nullptr;
+  static LF_TLS std::vector<Timed>* timed = nullptr;
+  static LF_TLS bool timing = getenv("AF2_GEMM_TIMES") != nullptr;
   cudaEvent_t ea = nullptr, eb = nullptr;
   if (timing) {
     if (!timed) {
@@ -199,7 +199,7 @@ packOutputWeightK(const float* __restrict__ o, half* __restrict__ out, int C, in
 struct AttnW { const half* qkvg; const float* qkvgBias; const half* out; int H, D, Dp; };
 // narrow: an 8-wide head left unpadded, for the flash kernel's D 8 form (flashNarrow); otherwise padded to 16
 inline AttnW attnWeights(const std::string& A, int blk, int C, bool narrow = false) {
-  static std::map<std::tuple<std::string, int, bool>, AttnW> cache;
+  static LF_TLS std::map<std::tuple<std::string, int, bool>, AttnW> cache;
   auto it = cache.find({A, blk, narrow});
   if (it != cache.end()) return it->second;
   int H = (int)dimW(A + "/query_w", blk < 0 ? 1 : 2), D = (int)dimW(A + "/query_w", blk < 0 ? 2 : 3);
@@ -226,7 +226,7 @@ sliceVgWeightK(const half* __restrict__ qkvg, half* __restrict__ vg, int C, int 
   reinterpret_cast<uint2*>(vg)[t] = __ldg(reinterpret_cast<const uint2*>(qkvg) + (size_t)c * 2 * w4 + w4 + col4);
 }
 inline const half* attnVgWeight(const AttnW& w, int C) {
-  static std::map<const half*, half*> cache;
+  static LF_TLS std::map<const half*, half*> cache;
   auto it = cache.find(w.qkvg);
   if (it != cache.end()) return it->second;
   int Wp2 = 2 * w.H * w.Dp;
@@ -416,7 +416,7 @@ inline void lnGemm(const float* x, size_t rows, const float* lnS, const float* l
   auto at = [&](auto mt) {
     constexpr int MT = decltype(mt)::value, R = 16 * WARPS * MT;
     constexpr size_t smem = (size_t)R * (C + 8) * 2 + (size_t)C * 16 * 2;
-    static bool attr = false;
+    static LF_TLS bool attr = false;
     if (!attr) { smemAttr((lnGemmK<C, WARPS, MT, PT>), (int)smem); attr = true; }
     lnGemmK<C, WARPS, MT, PT><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(x, rows, lnS, lnO, Wt, bias, N, split, out0, out1, mask);
   };
@@ -452,7 +452,7 @@ __global__ void concat3BiasK(const float* a, const float* b, const float* c, flo
 }
 struct TriW { const half* w5; const float* b5; const half* out; };
 inline TriW triWeights(const std::string& T, int blk, int C) {
-  static std::map<std::pair<std::string, int>, TriW> cache;
+  static LF_TLS std::map<std::pair<std::string, int>, TriW> cache;
   auto it = cache.find({T, blk});
   if (it != cache.end()) return it->second;
   half* w = wpool<half>((size_t)C * 5 * C);
@@ -514,7 +514,7 @@ __global__ void interleaveTriK(const float* proj, const float* gate, const float
 }
 struct TriFused { const half* wpg; const float* bias; const half* wt; const half* wout; };
 inline TriFused triFusedWeights(const std::string& T, int blk, int C) {
-  static std::map<std::pair<std::string, int>, TriFused> cache;
+  static LF_TLS std::map<std::pair<std::string, int>, TriFused> cache;
   auto it = cache.find({T, blk});
   if (it != cache.end()) return it->second;
   half* w = wpool<half>((size_t)C * 4 * C); float* b = wpool<float>((size_t)5 * C);
@@ -543,7 +543,7 @@ __global__ void augmentWeightK(const half* w, const float* b, half* out, int K, 
   out[t] = r < K ? w[(size_t)r * N + c] : r == K ? __float2half(b[c]) : __float2half(0.f);
 }
 inline const half* augmentedWeight(const std::string& name, int blk, const float* bias, int K, int N) {
-  static std::map<std::pair<std::string, int>, half*> cache;
+  static LF_TLS std::map<std::pair<std::string, int>, half*> cache;
   auto it = cache.find({name, blk});
   if (it != cache.end()) return it->second;
   half* w = wpool<half>((size_t)(K + 8) * N);
@@ -576,7 +576,7 @@ __global__ void halfToBf16K(const half* in, __nv_bfloat16* out, size_t n) {
   if (i < n) out[i] = __float2bfloat16(__half2float(in[i]));
 }
 inline const __nv_bfloat16* bf16Of(const half* w, size_t n) {
-  static std::map<const half*, __nv_bfloat16*> copies;
+  static LF_TLS std::map<const half*, __nv_bfloat16*> copies;
   auto it = copies.find(w);
   if (it != copies.end()) return it->second;
   __nv_bfloat16* b = wpool<__nv_bfloat16>(n);
@@ -591,10 +591,10 @@ __global__ void onesColumnBf16K(__nv_bfloat16* x, size_t rows, int K) {     // a
   *reinterpret_cast<uint4*>(x + r * (K + 8) + K) = u;
 }
 inline __nv_bfloat16* augmentedInputBf16(const std::string& name, size_t rows, int K) {
-  static std::map<std::string, std::pair<__nv_bfloat16*, size_t>> bufs;
+  static LF_TLS std::map<std::string, std::pair<__nv_bfloat16*, size_t>> bufs;
   auto& [p, have] = bufs[name];
   if (have < rows) {
-    if (p) CK(cudaFree(p));
+    if (p) CK(lfFree(p));
     p = dallocT<__nv_bfloat16>(rows * (K + 8));
     onesColumnBf16K<<<blocks(rows), 256, 0, STREAM>>>(p, rows, K);
     have = rows;
@@ -602,10 +602,10 @@ inline __nv_bfloat16* augmentedInputBf16(const std::string& name, size_t rows, i
   return p;
 }
 inline half* augmentedInput(const std::string& name, size_t rows, int K) {
-  static std::map<std::string, std::pair<half*, size_t>> bufs;
+  static LF_TLS std::map<std::string, std::pair<half*, size_t>> bufs;
   auto& [p, have] = bufs[name];
   if (have < rows) {
-    if (p) CK(cudaFree(p));
+    if (p) CK(lfFree(p));
     p = dallocT<half>(rows * (K + 8));
     onesColumnK<<<blocks(rows), 256, 0, STREAM>>>(p, rows, K);
     have = rows;

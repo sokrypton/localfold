@@ -9,7 +9,7 @@ template <int D, int WARPS, bool MASKED, bool REG, int BK = FA_BK>
 void flashStridedRun(const half* qkvg, const half* bias, int stride, const float* mask, half* out, int n, int heads,
                      size_t rows, float scale, size_t rowStride, size_t posStride, size_t outRowStride, size_t outPosStride) {
   const int bytes = (REG ? 1 : 2) * faStage<D, WARPS, BK>();
-  static bool attr = false;
+  static LF_TLS bool attr = false;
   if (!attr) {
     smemAttr((flashGridHalf<D, WARPS, MASKED, BK, REG, 1, true>), bytes);
     attr = true;

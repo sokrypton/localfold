@@ -158,7 +158,7 @@ constexpr size_t transitionUpSmem() {
 // device where three do (Nsight Compute, ESMFold2 at 262 tokens).
 template <int C, int WARPS, int NC = 32, int XROUNDS = 1>
 size_t transitionUpWaveRows(size_t smem) {
-  static size_t rows = [smem] {
+  static LF_TLS size_t rows = [smem] {
     smemAttr((transitionUpK<C, WARPS, NC, XROUNDS>), (int)smem);
     int perSm = 0, dev = 0, sms = 0;
     CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&perSm, transitionUpK<C, WARPS, NC, XROUNDS>, 32 * WARPS, smem));
@@ -738,9 +738,9 @@ triIn256K(const float* __restrict__ pair, const float* __restrict__ mask,
 }
 
 inline const half* triangleOutTiles(const half* Wout, int C, int NC) {
-  static std::map<std::pair<const half*, int>, half*> tiles;
-  static std::vector<half*> chunks; static size_t used = 0, have = 0;
-  static bool hooked = false;
+  static LF_TLS std::map<std::pair<const half*, int>, half*> tiles;
+  static LF_TLS std::vector<half*> chunks; static LF_TLS size_t used = 0, have = 0;
+  static LF_TLS bool hooked = false;
   if (!hooked) {
     FORGET_HOOKS.push_back([] { for (half* p : chunks) CK(cudaFreeAsync(p, STREAM)); chunks.clear(); tiles.clear(); used = have = 0; });
     hooked = true;
@@ -770,7 +770,7 @@ void triangleOutRun(const TP* prod, const float* sc, const float* of, const half
     if (f32 && !ob) {
       constexpr size_t smem = triangleOutSmem<C, WARPS, float, 32>();
       WITH_PAIR_T(
-        static bool attr = false;
+        static LF_TLS bool attr = false;
         if (!attr) { smemAttr((triangleOutK<C, WARPS, float, 32, TP, false, PT>), (int)smem); attr = true; }
         triangleOutK<C, WARPS, float, 32, TP, false, PT><<<(unsigned)((P + R - 1) / R), 32 * WARPS, smem, STREAM>>>(prod, sc, of, wt, t2, pair, L, Lp));
       return;
@@ -783,7 +783,7 @@ void triangleOutRun(const TP* prod, const float* sc, const float* of, const half
       if constexpr (sizeof(TP) == 4) {
         constexpr size_t smem = triangleOutSmem<C, WARPS, float, 32, TP>();
         WITH_PAIR_T(
-          static bool attr = false;
+          static LF_TLS bool attr = false;
           if (!attr) { smemAttr((triangleOutK<C, WARPS, float, 32, TP, true, PT>), (int)smem); attr = true; }
           triangleOutK<C, WARPS, float, 32, TP, true, PT><<<(unsigned)((P + R - 1) / R), 32 * WARPS, smem, STREAM>>>(
             prod, sc, of, wt, t2, pair, L, Lp, ob));
@@ -794,7 +794,7 @@ void triangleOutRun(const TP* prod, const float* sc, const float* of, const half
         constexpr bool vec = sizeof(TP) == 2;
         size_t rows = rm.J ? rm.size : vec ? (size_t)Lp * Lp : P;
         WITH_PAIR_T(
-          static bool attr = false;
+          static LF_TLS bool attr = false;
           if (!attr) { smemAttr((triangleOutK<C, WARPS, __nv_bfloat16, 16, TP, true, PT>), (int)smem); attr = true; }
           triangleOutK<C, WARPS, __nv_bfloat16, 16, TP, true, PT><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(
             prod, sc, of, wt, t2, pair, L, Lp, ob, rm));
@@ -807,7 +807,7 @@ void triangleOutRun(const TP* prod, const float* sc, const float* of, const half
     constexpr bool vec = sizeof(TP) == 2;                       // the padded rows (triangleOutK's VEC)
     size_t rows = rm.J ? rm.size : vec ? (size_t)Lp * Lp : P;
     WITH_PAIR_T(
-      static bool attr = false;
+      static LF_TLS bool attr = false;
       if (!attr) { smemAttr((triangleOutK<C, WARPS, __nv_bfloat16, 16, TP, false, PT>), (int)smem); attr = true; }
       triangleOutK<C, WARPS, __nv_bfloat16, 16, TP, false, PT><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(prod, sc, of, wt, t2, pair, L, Lp, nullptr, rm));
   }

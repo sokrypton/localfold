@@ -9,11 +9,11 @@
 // block (trunk.cuh's parallelPairUpdates), the block's running sum - so an update reads the pair ENTERING the
 // block and adds into another buffer, with no copy of it. Every residual add of the three updates below
 // goes through into(); a kernel that adds in place without it would write the block's input.
-inline float* RESIDUAL_INTO = nullptr;
+inline LF_TLS float* RESIDUAL_INTO = nullptr;
 inline float* into(float* x) { return RESIDUAL_INTO ? RESIDUAL_INTO : x; }
 // ...and chai's ending-node attention adds its difference TRANSPOSED (AF3's at (j, i) is chai's at (i, j)), which
 // is the column pass's own residual without its transpose
-inline bool RESIDUAL_UNTRANSPOSED = false;
+inline LF_TLS bool RESIDUAL_UNTRANSPOSED = false;
 
 // ---------------------------------------------------------------- elementwise kernels
 // LayerNorm over the last axis with AF3's fast variance E[x^2] - E[x]^2. One warp a row.
@@ -570,7 +570,7 @@ inline void launchCenterNorm(const float* prod, TO* out, size_t r0, size_t rows,
   int smem = C * 33 * 4;
   auto run = [&](auto ctag) {
     constexpr int CC = decltype(ctag)::value;
-    static int granted = 0;
+    static LF_TLS int granted = 0;
     if (smem > granted) { smemAttr((centerNormK<TO, CC>), smem); granted = smem; }
     centerNormK<TO, CC><<<nb, dim3(32, 8), smem, STREAM>>>(prod, out, r0, rows, C, pairs, scale, offset, n, np);
   };
@@ -613,11 +613,11 @@ __global__ void centerNormStreamK(const float* prod, TO* out, size_t r0, size_t 
   }
 }
 
-inline bool TIGHT_STACK = false;          // the template stack on a trunk short of room (triangle, templateEmbedding)
-inline bool FUSED_GRID = true;
-inline bool TRI_BF16 = true;
-inline int TRI_PAD = 8;           // the triangle's padded size is a multiple of this (0: none)
-inline size_t CHUNK = (size_t)64 << 20;   // elements in a chunk tensor
+inline LF_TLS bool TIGHT_STACK = false;          // the template stack on a trunk short of room (triangle, templateEmbedding)
+inline LF_TLS bool FUSED_GRID = true;
+inline LF_TLS bool TRI_BF16 = true;
+inline LF_TLS int TRI_PAD = 8;           // the triangle's padded size is a multiple of this (0: none)
+inline LF_TLS size_t CHUNK = (size_t)64 << 20;   // elements in a chunk tensor
 #include "fusedtriangle.cuh"
 #include "fused256.cuh"
 template <class T, class PT = float>
@@ -704,8 +704,8 @@ inline void linearIntoPairRows(const T* X, float* pair, size_t r0, size_t rows, 
 // a whole output tile or weight on the chip, which at 256 is past the registers and shared memory a block
 // gets; these stream their weights in narrower steps, two blocks an SM. Below ~80 tokens their tiles leave
 // the device idle (ESMFold2's measurement), and a T4's 64 KB fits none of them.
-inline bool FUSED_WIDE = true;
-inline int FUSED_WIDE_MIN_TOKENS = getenv("LOCALFOLD_WIDE_MIN") ? atoi(getenv("LOCALFOLD_WIDE_MIN")) : 80;
+inline LF_TLS bool FUSED_WIDE = true;
+inline LF_TLS int FUSED_WIDE_MIN_TOKENS = getenv("LOCALFOLD_WIDE_MIN") ? atoi(getenv("LOCALFOLD_WIDE_MIN")) : 80;
 // ...and at OpenDDE's 384 and IntelliFold-2's 512 too, now (LOCALFOLD_NO_WIDER=1: the unfused paths there). They fit
 // one block an SM there and once lost to the unfused path (262 tokens: trunk 2160 against 1925 ms, 3360 against 2821);
 // re-measured 2026-10-07 on the kernels as they stand, each wins on its own - see README, "The wider pair tracks"
@@ -805,7 +805,7 @@ template <int CC, int WI, class TA, class PT = float> constexpr auto triIn256For
   else return triIn256K<CC, WI, TA, 1, false, PT>;
 }
 inline bool bf16Tensor() {         // bf16 MMA: Ampere on (a T4's contraction stays f16 into f32)
-  static int major = ccMajor();
+  static LF_TLS int major = ccMajor();
   return major >= 8;
 }
 
@@ -960,7 +960,7 @@ inline void triangleBlockedTN(float* pair, const float* mask, int n, int C, cons
     wideWarps<CC>(C, [&](auto warps) {
       constexpr int WI = decltype(warps)::value;
       WITH_PAIR_T(
-        static bool attr = false;
+        static LF_TLS bool attr = false;
         constexpr auto kern = triIn256For<CC, WI, TQ, PT>();
         if (!attr) { smemAttr(kern, (int)wideTriInSmemW(CC, WI)); attr = true; }
         auto in = [&](RectMap rm, size_t rows, TQ* ao, TQ* bo, half* t2o) {
@@ -1033,7 +1033,7 @@ inline void triangleBlockedFused(float* pair, const float* mask, int n, int C, c
     wideWarps<CC>(C, [&](auto warps) {
       constexpr int WI = decltype(warps)::value;
       WITH_PAIR_T(
-        static bool attr = false;
+        static LF_TLS bool attr = false;
         constexpr auto kern = triIn256For<CC, WI, B16, PT>();
         if (!attr) { smemAttr(kern, (int)wideTriInSmemW(CC, WI)); attr = true; }
         auto in = [&](RectMap rm, size_t rows, B16* ao, B16* bo, half* t2o) {
@@ -1214,7 +1214,7 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
             wideWarps<CC>(C, [&](auto warps) {
               constexpr int WI = decltype(warps)::value;
               WITH_PAIR_T(
-                static bool attr = false;
+                static LF_TLS bool attr = false;
                 constexpr auto kern = triIn256For<CC, WI, F8, PT>();
                 if (!attr) { smemAttr(kern, (int)wideTriInSmemW(CC, WI)); attr = true; }
                 kern<<<(unsigned)((cs8 + triInRowsOf(WI) - 1) / triInRowsOf(WI)), 32 * triInWarpsOf(WI), wideTriInSmemW(CC, WI), STREAM>>>(
@@ -1245,7 +1245,7 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
             wideWarps<CC>(C, [&](auto warps) {
               constexpr int WI = decltype(warps)::value;
               WITH_PAIR_T(
-                static bool attr = false;
+                static LF_TLS bool attr = false;
                 constexpr auto kern = triIn256For<CC, WI, __nv_bfloat16, PT>();
                 if (!attr) { smemAttr(kern, (int)wideTriInSmemW(CC, WI)); attr = true; }
                 kern<<<(unsigned)((cs + triInRowsOf(WI) - 1) / triInRowsOf(WI)), 32 * triInWarpsOf(WI), wideTriInSmemW(CC, WI), STREAM>>>(
@@ -1265,7 +1265,7 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
         wideWarps<CC>(C, [&](auto warps) {
           constexpr int WI = decltype(warps)::value;
           WITH_PAIR_T(
-            static bool attr = false;
+            static LF_TLS bool attr = false;
             constexpr auto kern = triIn256For<CC, WI, half, PT>();
             if (!attr) { smemAttr(kern, (int)wideTriInSmemW(CC, WI)); attr = true; }
             kern<<<(unsigned)((cs + triInRowsOf(WI) - 1) / triInRowsOf(WI)), 32 * triInWarpsOf(WI), wideTriInSmemW(CC, WI), STREAM>>>(
@@ -1375,7 +1375,7 @@ void transition(float* x, size_t rows, int C, int factor, const std::string& pre
             // pair - no f16 product and add pass
             using B16 = __nv_bfloat16;
             B16* gated = scratch<B16>("tr.gatedbf", std::min(rowsPer, rows) * I);
-            static bool attr = false;
+            static LF_TLS bool attr = false;
             if (!attr) { smemAttr((transitionUpK<CC, WU, NC, XR, B16, B16>), (int)smem); attr = true; }
             for (size_t r0 = 0; r0 < rows; r0 += rowsPer) {
               size_t r = std::min(rowsPer, rows - r0);
@@ -1386,7 +1386,7 @@ void transition(float* x, size_t rows, int C, int factor, const std::string& pre
             return;
           }
           half* gated = scratch<half>("tr.gated", std::min(rowsPer, rows) * I);
-          static bool attr = false;
+          static LF_TLS bool attr = false;
           if (!attr) { smemAttr((transitionUpK<CC, WU, NC, XR>), (int)smem); attr = true; }
           for (size_t r0 = 0; r0 < rows; r0 += rowsPer) {
             size_t r = std::min(rowsPer, rows - r0);
@@ -1757,7 +1757,7 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) lnNormHeadsK(const float* __
 template <int C> constexpr size_t lnNormHeadsSmem(int warps) { return (size_t)16 * warps * C * 2 + (size_t)C * 16 * 2; }
 // norm + head-major raw bias for C 64/256/384/512 (false: not this width, or the device's shared memory); ntr > 0: the
 // norm written transposed over an ntr x ntr grid (the column direction's rows, which a gather pass otherwise makes)
-inline bool LN_NORM_HEADS = true;
+inline LF_TLS bool LN_NORM_HEADS = true;
 inline bool lnNormHeads(const float* pair, half* norm, float* raw, size_t rows, int C, int heads,
                         const std::string& scaleName, const std::string& offsetName, const std::string& projName, int ntr = 0) {
   if (!LN_NORM_HEADS || heads > 16) return false;
@@ -1768,7 +1768,7 @@ inline bool lnNormHeads(const float* pair, half* norm, float* raw, size_t rows, 
     std::string wb = heads == 16 ? projName
                                  : concatColumns(projName + "~pad16", CC, {{projName, heads, false}, {"", 16 - heads, false}});
     WITH_PAIR_T(
-      static bool attr = false;
+      static LF_TLS bool attr = false;
       if (!attr) { smemAttr((lnNormHeadsK<CC, WARPS, PT>), (int)smem); attr = true; }
       lnNormHeadsK<CC, WARPS, PT><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(
         pair, W(scaleName), W(offsetName), Wh(wb), norm, raw, rows, heads, ntr));
@@ -1792,7 +1792,7 @@ inline bool lnNormHeads(const float* pair, half* norm, float* raw, size_t rows, 
 }
 // the pair's row `row` (of C channels) as a float* base in whichever storage PAIR16 says it has
 // the unfused column direction's two GEMMs strided in place (LOCALFOLD_GRID_STRIDED=0: gathered and scattered)
-inline bool GRID_STRIDED = true;
+inline LF_TLS bool GRID_STRIDED = true;
 // Grid attention over the pair, rows (tr = false) or columns (tr = true), residual added.
 template <class T>
 void gridAttention(float* pair, const float* mask, int n, int C, int heads, int D,

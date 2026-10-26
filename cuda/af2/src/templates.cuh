@@ -98,7 +98,7 @@ inline void templateEmbedding(float* pair, const float* pairMask, int L, bool pa
   int T = (int)M.meta("meta/templates", 0);
   const int* tAatype; const float* tPos; const float* tMask;
   if (T == 0) {
-    static int* zi = nullptr; static float* zp = nullptr; static float* zm = nullptr; static int zl = 0;
+    static LF_TLS int* zi = nullptr; static LF_TLS float* zp = nullptr; static LF_TLS float* zm = nullptr; static LF_TLS int zl = 0;
     if (zl < L) {
       zi = dallocT<int>(L); zp = dalloc((size_t)L * 37 * 3); zm = dalloc((size_t)L * 37);
       CK(cudaMemset(zi, 0, L * 4)); CK(cudaMemset(zp, 0, (size_t)L * 37 * 3 * 4)); CK(cudaMemset(zm, 0, (size_t)L * 37 * 4));
@@ -119,7 +119,7 @@ inline void templateEmbedding(float* pair, const float* pairMask, int L, bool pa
     gemm(qn, P(S + "template_pair_embedding_8/weights"), qterm, pairs, Cz, C);
   }
   // the nine linears' biases, summed once
-  static float* bsum = nullptr;
+  static LF_TLS float* bsum = nullptr;
   if (!bsum) {
     bsum = dalloc(C);
     std::vector<const float*> bs;

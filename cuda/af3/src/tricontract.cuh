@@ -8,7 +8,7 @@
 // and up, where the default takes it itself; below ~192 the default wins. So there, cuBLASLt with
 // the heuristic list's first 128x128 candidate: a fixed rule, never a timing, so the choice (and
 // the output) is the same every run.
-inline bool TRI_LT_TILE = true;
+inline LF_TLS bool TRI_LT_TILE = true;
 // planAll (ESMFold2, whose single trunk pass has no CUDA graph to hide host time): a cached cuBLASLt plan
 // at every np - cuBLASLt's own first candidate outside the 128x128 window - because cuBLAS's per-call
 // choice for a bf16 batched GEMM cost ~60 us of host a call (ESMFold2 at 261 tokens: 11.5 ms of idle GPU)
@@ -24,8 +24,8 @@ inline void bf16Gemms(cublasOperation_t ta, cublasOperation_t tb, int m, int nn,
   const float zero = 0.f;
   if ((double)m * nn * k >= 1e10) {
     struct Plan { cublasLtMatmulDesc_t op; cublasLtMatrixLayout_t la, lb, lc; cublasLtMatmulAlgo_t algo; bool ok; };
-    static cublasLtHandle_t lt = nullptr;
-    static std::map<std::tuple<int, int, int, int, int, int, int, int, long long, long long, long long, int>, Plan> plans;
+    static LF_TLS cublasLtHandle_t lt = nullptr;
+    static LF_TLS std::map<std::tuple<int, int, int, int, int, int, int, int, long long, long long, long long, int>, Plan> plans;
     if (!lt) CB(cublasLtCreate(&lt));
     auto key = std::make_tuple((int)ta, (int)tb, m, nn, k, lda, ldb, ldc, sA, sB, sC, batch);
     auto it = plans.find(key);
@@ -79,8 +79,8 @@ inline void bf16Gemms(cublasOperation_t ta, cublasOperation_t tb, int m, int nn,
 inline void fp8GemmTN(int m, int n, int k, float alpha, const void* A, int lda, long long sA, const void* B, int ldb,
                       long long sB, void* Cm, int ldc, long long sC, int batch, cudaDataType ct = CUDA_R_16BF) {
   struct Plan { cublasLtMatmulDesc_t op; cublasLtMatrixLayout_t la, lb, lc; cublasLtMatmulAlgo_t algo; size_t ws; };
-  static cublasLtHandle_t lt = nullptr;
-  static std::map<std::tuple<int, int, int, int, long long, int, long long, int, long long, int, int>, Plan> plans;
+  static LF_TLS cublasLtHandle_t lt = nullptr;
+  static LF_TLS std::map<std::tuple<int, int, int, int, long long, int, long long, int, long long, int, int>, Plan> plans;
   if (!lt) CB(cublasLtCreate(&lt));
   auto key = std::make_tuple(m, n, k, lda, sA, ldb, sB, ldc, sC, batch, (int)ct);
   auto it = plans.find(key);
@@ -128,8 +128,8 @@ inline void triContractBf16(bool outgoing, int np, size_t cs, int C, float alpha
   const bool window = TRI_LT_TILE && np >= 200 && np <= 352;
   if (window || (planAll && (double)np * np * np < 1e10)) {
     struct Plan { cublasLtMatmulDesc_t op; cublasLtMatrixLayout_t l; cublasLtMatmulAlgo_t algo; bool ok; };
-    static cublasLtHandle_t lt = nullptr;
-    static std::map<std::tuple<int, bool, int, size_t>, Plan> plans;     // the plan holds the batch and its stride
+    static LF_TLS cublasLtHandle_t lt = nullptr;
+    static LF_TLS std::map<std::tuple<int, bool, int, size_t>, Plan> plans;     // the plan holds the batch and its stride
     if (!lt) CB(cublasLtCreate(&lt));
     auto it = plans.find({np, outgoing, C, cs});
     if (it == plans.end()) {

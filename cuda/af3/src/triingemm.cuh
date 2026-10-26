@@ -299,8 +299,8 @@ __global__ void triInGemmPackK(const half* __restrict__ Wp, const half* __restri
 }
 inline const half* triInGemmWeights(const std::string& pre, int C) {
   // (a derived weight: forgotten with the others - see Wbf in common.cuh for what a kept one cost)
-  static std::map<std::string, half*> cache;
-  static bool hooked = false;
+  static LF_TLS std::map<std::string, half*> cache;
+  static LF_TLS bool hooked = false;
   if (!hooked) { FORGET_HOOKS.push_back([] { for (auto& [k, p] : cache) CK(cudaFreeAsync(p, STREAM)); cache.clear(); }); hooked = true; }
   auto it = cache.find(pre);
   if (it != cache.end()) return it->second;
@@ -327,12 +327,12 @@ inline bool triInGemm(const float* pair, const float* mask, const float* sc, con
   dim3 grid = rowTiles <= 65535 ? dim3(NT, (unsigned)rowTiles) : dim3((unsigned)(rowTiles * NT), 1);
   if (tr) {
     WITH_PAIR_T(lnPlaneK<C, PT, true><<<(unsigned)((pp + 7) / 8), 256, 0, STREAM>>>(pair, X, n, np, sc, of));
-    static bool attrT = false;
+    static LF_TLS bool attrT = false;
     if (!attrT) { smemAttr((triInGemmK<C, TA, true>), (int)smem); attrT = true; }
     triInGemmK<C, TA, true><<<grid, 128, smem, STREAM>>>(X, pair, mask, Wg, a, b, t2, n, np, cs);
   } else {
     WITH_PAIR_T(lnPlaneK<C, PT, false><<<(unsigned)((pp + 7) / 8), 256, 0, STREAM>>>(pair, X, n, np, sc, of));
-    static bool attr = false;
+    static LF_TLS bool attr = false;
     if (!attr) { smemAttr((triInGemmK<C, TA, false>), (int)smem); attr = true; }
     triInGemmK<C, TA, false><<<grid, 128, smem, STREAM>>>(X, pair, mask, Wg, a, b, t2, n, np, cs);
   }

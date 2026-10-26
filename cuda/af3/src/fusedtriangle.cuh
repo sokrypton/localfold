@@ -23,7 +23,7 @@
 // says the buffer behind a `float* pair` holds bf16 now, and these kernels read it through PT (their pair element
 // type, picked at launch by WITH_PAIR_T). A path that has no bf16 form asks needF32Pair, which refuses rather
 // than read bf16 as f32.
-inline bool PAIR16 = false;
+inline LF_TLS bool PAIR16 = false;
 inline void needF32Pair(const char* where) {
   if (PAIR16) { fprintf(stderr, "%s has no bf16-pair form: the stack should have kept the pair f32\n", where); exit(1); }
 }
@@ -250,9 +250,9 @@ __global__ void tileTriIn3K(const half* __restrict__ Wp, const half* __restrict_
   *reinterpret_cast<uint4*>(out + e) = *reinterpret_cast<const uint4*>(src);
 }
 inline const half* triInTiles(const half* Wp, const half* Wgate, const half* Wg, int C, int NC = 16) {
-  static std::map<std::pair<const half*, int>, half*> tiles;
-  static std::vector<half*> chunks; static size_t used = 0, have = 0;
-  static bool hooked = false;
+  static LF_TLS std::map<std::pair<const half*, int>, half*> tiles;
+  static LF_TLS std::vector<half*> chunks; static LF_TLS size_t used = 0, have = 0;
+  static LF_TLS bool hooked = false;
   if (!hooked) {
     FORGET_HOOKS.push_back([] { for (half* p : chunks) CK(cudaFreeAsync(p, STREAM)); chunks.clear(); tiles.clear(); used = have = 0; });
     hooked = true;
@@ -665,11 +665,11 @@ __global__ void __launch_bounds__(WARPS * 32) triOutPK(const TP* __restrict__ pr
   }
 }
 
-inline bool FUSED_TRIANGLE = true;
+inline LF_TLS bool FUSED_TRIANGLE = true;
 constexpr int TI_WARPS = 8, TO_WARPS = 8;    // triInK: 8 warps fit two blocks an SM (1044 tokens: 828 -> 748 ms against 16)
 // rows a block, by size: a small input in the large tiles left most of the device idle (68 tokens:
 // 36 blocks of 256 rows on 108 SMs); the warps are the largest that still give two blocks an SM
-inline size_t MIN_BLOCKS = 54;      // swept: 68 tokens 89.3 -> 75.8 ms of trunk at 54, 150 tokens flat (108 and 216 slower there)
+inline LF_TLS size_t MIN_BLOCKS = 54;      // swept: 68 tokens 89.3 -> 75.8 ms of trunk at 54, 150 tokens flat (108 and 216 slower there)
 inline int warpsFor(size_t rows, std::initializer_list<int> options) {
   int last = 0;
   for (int w : options) { last = w; if ((rows + 16 * w - 1) / (16 * w) >= MIN_BLOCKS) return w; }
@@ -690,7 +690,7 @@ void triInLaunch(const float* pair, const float* mask, const float* lnScale, con
   size_t pp = (size_t)np * np;
   size_t smem = (size_t)R * (C + 8) * 2 + 2 * tiStage(C);
   WITH_PAIR_T(
-    static bool attr = false;
+    static LF_TLS bool attr = false;
     if (!attr) { smemAttr((triInK<C, WARPS, TA, BIAS, PT>), (int)smem); attr = true; }
     triInK<C, WARPS, TA, BIAS, PT><<<(unsigned)((pp + R - 1) / R), 32 * WARPS, smem, STREAM>>>(
       pair, mask, lnScale, lnOffset, Wpg, Wg, a, b, t2, n, np, cs, bias));
@@ -710,7 +710,7 @@ void triIn128(const float* pair, const float* mask, const std::string& pre, cons
   triInRaw<TA>(pair, mask, W(pre + ".leftNormInputScale"), W(pre + ".leftNormInputOffset"), Wh(pg), Wh(pre + ".gatingLinear"),
                nullptr, a, b, t2, n, np, cs);
 }
-inline bool TRI_OUT_PERSISTENT = true;
+inline LF_TLS bool TRI_OUT_PERSISTENT = true;
 template <class TP> constexpr size_t triOutPSmem(int warps = TO_WARPS) {
   return (size_t)128 * 136 * 2 + (size_t)16 * warps * 136 * 2 + (size_t)2 * 128 * (16 * warps + 16 / sizeof(TP)) * sizeof(TP)
          + 2 * 128 * sizeof(float);
@@ -732,7 +732,7 @@ void triOutLaunch(const TP* prod, const float* cnScale, const float* cnOffset, c
     size_t smem = triOutPSmem<TP>(WARPS);
     size_t tiles = (pp + R - 1) / R;
     WITH_PAIR_T(
-      static int grid = 0;
+      static LF_TLS int grid = 0;
       if (!grid) {
         smemAttr((triOutPK<C, WARPS, TP, BIAS, PT>), (int)smem);
         int perSm = 0, sms = 0;
@@ -746,7 +746,7 @@ void triOutLaunch(const TP* prod, const float* cnScale, const float* cnOffset, c
   }
   size_t smem = (size_t)C * (C + 8) * 2 + (size_t)R * (C + 8) * 2 + (size_t)C * (R + 16 / sizeof(TP)) * sizeof(TP);
   WITH_PAIR_T(
-    static bool attr = false;
+    static LF_TLS bool attr = false;
     if (!attr) { smemAttr((triOutK<C, WARPS, TP, BIAS, PT>), (int)smem); attr = true; }
     triOutK<C, WARPS, TP, BIAS, PT><<<(unsigned)((pp + R - 1) / R), 32 * WARPS, smem, STREAM>>>(
       prod, cnScale, cnOffset, Wout, t2, pair, n, np, cs, bias));
@@ -852,7 +852,7 @@ inline void lnHeadsRaw(const float* x, const float* scale, const float* offset, 
   constexpr int WARPS = 8, R = 16 * WARPS;      // (raw pointers: AF2's pair-bias pass)
   size_t smem = (size_t)R * (C + 8) * 2 + (size_t)C * (N + 8) * 2;
   WITH_PAIR_T(
-    static bool attr = false;
+    static LF_TLS bool attr = false;
     if (!attr) { smemAttr((lnHeadsK<C, N, WARPS, PT>), (int)smem); attr = true; }
     lnHeadsK<C, N, WARPS, PT><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(
       x, scale, offset, w, out, rows, biasOut, L, H, stride, tr, r0, pairMask, rowBias));
@@ -1312,7 +1312,7 @@ void gridInAt(const float* pair, const float* lnScale, const float* lnOffset, co
   constexpr int NQ = 4 * C, R = 16 * WARPS * MT;
   size_t smem = gridInSmem(WARPS, NCI, C);
   WITH_PAIR_T(
-    static bool attr = false;
+    static LF_TLS bool attr = false;
     if (!attr) { smemAttr((gridInK<C, NQ, WARPS, PT, NCI, MT>), (int)smem); attr = true; }
     gridInK<C, NQ, WARPS, PT, NCI, MT><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(
       pair, lnScale, lnOffset, Wq, out, n, q0, rows, tr, Wb, bias, heads, stride, swap, qb, kv8, vt8));
@@ -1357,7 +1357,7 @@ void gridOutAt(const half* gathered, const half* Wout, const float* ob, float* p
   constexpr int WD = C, R = 16 * WARPS;
   size_t smem = (size_t)WD / WQ * (C + 8) * 2 + (size_t)R * (WD + 8) * 2;
   WITH_PAIR_T(
-    static bool attr = false;
+    static LF_TLS bool attr = false;
     if (!attr) { smemAttr((gridOutK<C, WD, WARPS, PT, WQ>), (int)smem); attr = true; }
     gridOutK<C, WD, WARPS, PT, WQ><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(gathered, Wout, pair, n, q0, rows, tr, ob));
 }

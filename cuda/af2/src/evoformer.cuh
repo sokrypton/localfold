@@ -25,12 +25,12 @@ struct Trunk {
 // and the transition's second layer, bf16 GEMMs accumulating in place - read and write half; converted in before the
 // blocks and out after them (af2.cu). Set where every block's MSA path has a bf16 form: --fast, every MSA row live,
 // no template rows, 8 heads of 32 on an Ampere part
-inline bool MSA16 = false;
+inline LF_TLS bool MSA16 = false;
 // ...and in f16 where there is no bf16 tensor core (a T4: sm_75). AF2's MSA stays below ~1,000 in magnitude (5CAJ with its
 // alignment 700, single-sequence 493, barnase-barstar 937, a 1,000-residue deep fold 518 - f16's range is 65,504), and
 // f16 holds three more mantissa bits than bf16. The bf16-only fusions (sm_12x's split transition; outln.cuh, which
 // takes f16 too and was measured slower on a T4) are skipped there
-inline bool MSA16_HALF = false;
+inline LF_TLS bool MSA16_HALF = false;
 template <class F> inline void withMsa16(F&& f) { if (MSA16_HALF) f(half{}); else f(__nv_bfloat16{}); }
 // a weight as the MSA16 GEMMs take it: a bf16 copy, or the f16 weight itself
 template <class M> inline const void* msaWeight(const half* w, size_t n) {
@@ -70,14 +70,14 @@ __global__ void targetFeatK(const int* aatype, float* tf, int L) {      // one-h
   int a = min(max(aatype[i], 0), 19);
   tf[t] = c == a ? 1.f : 0.f;
 }
-inline size_t AF2_CHUNK = (size_t)64 << 20;     // elements a row-chunked tensor holds, on a card short of room
+inline LF_TLS size_t AF2_CHUNK = (size_t)64 << 20;     // elements a row-chunked tensor holds, on a card short of room
 // ---------------------------------------------------------------- the pair in bf16 (AF2_P16)
 // Where every update the stacks run has a bf16-pair form (af2Pair16Ok), the pair is held in bf16 from the embedder
 // to the end of the Evoformer: the stacks' pair kernels take it through cuda/af3's PAIR16 (set around them in
 // evoformerBlock), the embedder and the templates add into it here, and after the stacks it is converted once into
 // the recycled pair (f32), which the structure module, the heads and the next pass's embedder read.
 // LOCALFOLD_PAIR_F32=1 keeps the f32 pair.
-inline bool AF2_P16 = false;
+inline LF_TLS bool AF2_P16 = false;
 template <class PT, class TX>
 __global__ void addIntoPairK(float* __restrict__ pair, const TX* __restrict__ x, size_t n, const float* __restrict__ bias128 = nullptr, float biasScale = 1.f) {
   __shared__ float sb[128];
@@ -265,7 +265,7 @@ __global__ void pairMaskK(const float* seqMask, float* out, int L) {
 
 // a fold short of room (af2.cu): the chunked forms may engage, and no CUDA graph is captured, so a choice
 // made from the free memory cannot differ between a pass and its capture
-inline bool AF2_TIGHT = false;
+inline LF_TLS bool AF2_TIGHT = false;
 // prev: prevMsaRow [L, 256], prevPair [L, L, 128] (null: the pair itself, re-embedded in place), prevPos [L, 37, 3]
 inline void embed(Trunk& t, int pass, const float* prevMsaRow, const float* prevPair, const float* prevPos) {
   const std::string E = "evoformer/";
@@ -341,7 +341,7 @@ inline void gatedAttention(const float* xn, int Bt, int n, int C, const std::str
                            float* addInto = nullptr, int swapA = 0, int swapB = 0) {
   size_t rows = (size_t)Bt * n; int Wd = H * D;
   size_t wSlice = (size_t)C * Wd, oSlice = rows * (size_t)Wd;
-  static std::map<const float*, const float*> qkvgWCache;
+  static LF_TLS std::map<const float*, const float*> qkvgWCache;
   int b0 = blk < 0 ? -1 : 0;
   const float* qw0 = P(A + "/query_w", b0);
   auto it = qkvgWCache.find(qw0);
@@ -380,10 +380,10 @@ __global__ void biasFromProjK(const float* proj, const float* pairMask, half* ou
   if (j == L - 1) for (int pad = L; pad < stride; ++pad) out[((size_t)h * L + i) * stride + pad] = __float2half(0.f);
 }
 inline const half* zeroBias(int H, int n, int stride) {        // a bias-free attention's bias, once
-  static half* z = nullptr; static size_t have = 0;
+  static LF_TLS half* z = nullptr; static LF_TLS size_t have = 0;
   size_t need = (size_t)H * n * stride;
   if (need > have) {
-    if (z) CK(cudaFree(z));
+    if (z) CK(lfFree(z));
     z = dallocT<half>(need); CK(cudaMemset(z, 0, need * 2)); have = need;
   }
   return z;
@@ -467,7 +467,7 @@ inline void attentionCoreAcross(const half* xn, int Bt, int n, int C, const std:
 inline const half* pairBiasFast(const half* pn, int L, int C, int H, const float* w, const float* pairMask, bool transposed = false) {
   size_t pairs = (size_t)L * L; int stride = (L + 7) / 8 * 8;
   float* proj = scratch<float>("fbias.proj", pairs * H);
-  static std::map<const float*, half*> wh;
+  static LF_TLS std::map<const float*, half*> wh;
   auto it = wh.find(w);
   if (it == wh.end()) {
     half* h = wpool<half>((size_t)C * H);
@@ -507,7 +507,7 @@ __global__ void padHeadsK(const float* w, half* out, int C, int H) {
   out[t] = __float2half(c < H ? w[k * H + c] : 0.f);
 }
 inline const half* paddedFeat2dWeight(const float* wf, int C, int H) {
-  static std::map<const float*, half*> wbCache;
+  static LF_TLS std::map<const float*, half*> wbCache;
   auto it = wbCache.find(wf);
   if (it == wbCache.end()) {
     half* h = wpool<half>((size_t)C * 16);
@@ -708,7 +708,7 @@ inline void msaColumnGlobalAttention(Trunk& t, const std::string& S, int blk, fl
   float* avg = scratch<float>("gcol.avg", (size_t)L * Wd);
   size_t smem = (size_t)(C + Wd + H * rowsN + 2 * rowsN * D) * 4;
   if (fitsSmem(smem) || H != 8 || D != 8) {
-    static bool attr = false;
+    static LF_TLS bool attr = false;
     if (!attr) { smemAttr((globalAttentionK), std::min<size_t>(160 * 1024, smemLimit())); attr = true; }
     if (!fitsSmem(smem) || smem > 160 * 1024) { fprintf(stderr, "global attention: %d sequences do not fit one block\n", rowsN); exit(1); }
     globalAttentionK<<<L, 256, smem, STREAM>>>(xn, mt, P(A + "/attention/query_w", blk), P(A + "/attention/key_w", blk),
@@ -978,7 +978,7 @@ __global__ void __launch_bounds__(128) opmOutK(const half* __restrict__ Pm, cons
 }
 inline std::pair<const half*, const float*> opmWeights(const std::string& Op, int blk, int C, int O = 32) {
   struct OpmW { const half* wt; const float* bias; };
-  static std::map<std::pair<std::string, int>, OpmW> opmCache;
+  static LF_TLS std::map<std::pair<std::string, int>, OpmW> opmCache;
   auto it = opmCache.find({Op, blk});
   if (it == opmCache.end()) {
     half* wt = wpool<half>((size_t)C * 2 * O);
@@ -1298,7 +1298,7 @@ __global__ void operand2K(const float* proj, const float* gate, const float* pb,
 }
 inline void triangleBlocked2(float* pair, const float* mask, int L, int C, const std::string& T, int blk, bool outgoing) {
   struct Op { half* w; float* b; };
-  static std::map<std::tuple<std::string, int, int>, Op> ops;
+  static LF_TLS std::map<std::tuple<std::string, int, int>, Op> ops;
   auto opOf = [&](int side) {
     auto key = std::make_tuple(T, blk, side);
     auto it = ops.find(key);
@@ -1347,7 +1347,7 @@ inline void triangleBlockedFused2(float* pair, const float* mask, int L, int C, 
   half* t2 = scratch<half>("trib.t2", (size_t)width * Lp * C);
   const size_t smem = triIn256Smem<B16>(128, 8);
   WITH_PAIR_T(
-    static bool attr = false;
+    static LF_TLS bool attr = false;
     if (!attr) { smemAttr((triIn256K<128, 4, B16, 1, true, PT, 2>), (int)smem); attr = true; }
     auto in = [&](RectMap rm, size_t rows, B16* ao, B16* bo, half* t2o) {
       triIn256K<128, 4, B16, 1, true, PT, 2><<<(unsigned)((rows + 127) / 128), 128, smem, STREAM>>>(
@@ -1412,7 +1412,7 @@ inline void triangleMultiplication(float* pair, const float* pairMask, int L, in
       RectMap rm; rm.T = !outgoing;
       const size_t smem = triIn256Smem<F8>(128, 8);
       WITH_PAIR_T(
-        static bool attr = false;
+        static LF_TLS bool attr = false;
         if (!attr) { smemAttr((triIn256K<128, 4, F8, 1, true, PT, 2>), (int)smem); attr = true; }
         triIn256K<128, 4, F8, 1, true, PT, 2><<<(unsigned)((cs8 + 127) / 128), 128, smem, STREAM>>>(
           pair, maskIn, P(T + "/left_norm_input/scale", blk), P(T + "/left_norm_input/offset", blk), wt, a8, b8, t2, L, np8, cs8, w.bias, rm));
@@ -1426,7 +1426,7 @@ inline void triangleMultiplication(float* pair, const float* pairMask, int L, in
     half* t2 = scratch<half>("ftri.t2", plane * C);
     const size_t smem = triIn256Smem<__nv_bfloat16>(128, 8);
     WITH_PAIR_T(
-      static bool attr = false;
+      static LF_TLS bool attr = false;
       if (!attr) { smemAttr((triIn256K<128, 4, __nv_bfloat16, 1, true, PT, 2>), (int)smem); attr = true; }
       triIn256K<128, 4, __nv_bfloat16, 1, true, PT, 2><<<(unsigned)((plane + 127) / 128), 128, smem, STREAM>>>(
         pair, maskIn, P(T + "/left_norm_input/scale", blk), P(T + "/left_norm_input/offset", blk), wt, a, b, t2, L, Lp, plane, w.bias));
@@ -1443,7 +1443,7 @@ inline void triangleMultiplication(float* pair, const float* pairMask, int L, in
     half* t2 = scratch<half>("ftri.t2", plane * C);
     const size_t smem = triIn256Smem<half>(64, 8);
     WITH_PAIR_T(
-      static bool attr = false;
+      static LF_TLS bool attr = false;
       if (!attr) { smemAttr((triIn256K<64, 4, half, 1, true, PT, 2>), (int)smem); attr = true; }
       triIn256K<64, 4, half, 1, true, PT, 2><<<(unsigned)((plane + 127) / 128), 128, smem, STREAM>>>(
         pair, maskIn, P(T + "/left_norm_input/scale", blk), P(T + "/left_norm_input/offset", blk), w.wt, a, b, t2, L, Lp, plane, w.bias));
@@ -1507,7 +1507,7 @@ inline void triangleMultiplication(float* pair, const float* pairMask, int L, in
     half* t2 = scratch<half>("ftri.t2", plane * C);
     const size_t smem = triIn256Smem<half>(128, 4, 2, 2);
     WITH_PAIR_T(
-      static bool attr = false;
+      static LF_TLS bool attr = false;
       if (!attr) { smemAttr((triIn256K<128, 4, half, 2, true, PT, 2>), (int)smem); attr = true; }
       triIn256K<128, 4, half, 2, true, PT, 2><<<(unsigned)((plane + 127) / 128), 128, smem, STREAM>>>(
         pair, maskIn, P(T + "/left_norm_input/scale", blk), P(T + "/left_norm_input/offset", blk), wt, a, b, t2, L, Lp, plane, w.bias));
@@ -1563,7 +1563,7 @@ inline void triangleMultiplication(float* pair, const float* pairMask, int L, in
   float* xn = scratch<float>("tri.xn", pairs * C);
   layerNorm(pair, xn, pairs, C, T + "/left_norm_input", blk);
   size_t wSlice = (size_t)C * 2 * C, oSlice = pairs * (size_t)2 * C;
-  static std::map<const float*, const float*> pgWCache;
+  static LF_TLS std::map<const float*, const float*> pgWCache;
   int b0 = blk < 0 ? -1 : 0;
   const float* pw0 = P(T + "/projection/weights", b0);
   auto it = pgWCache.find(pw0);
@@ -1625,7 +1625,7 @@ inline void triangleAttentionChunked(float* pair, const float* pairMask, int L, 
   size_t pairs = (size_t)L * L;
   AttnW w = attnWeights(A + "/attention", blk, C);
   int H = w.H, Wp = w.H * w.Dp, stride = (L + 7) / 8 * 8;
-  static std::map<const float*, half*> whCache;
+  static LF_TLS std::map<const float*, half*> whCache;
   const float* wf = P(A + "/feat_2d_weights", blk);
   auto it = whCache.find(wf);
   if (it == whCache.end()) {
@@ -1666,7 +1666,7 @@ inline void triangleAttentionChunked(float* pair, const float* pairMask, int L, 
     }
   }
 }
-inline bool FUSED_GRID_AF2 = !getenv("LOCALFOLD_AF2_UNFUSED_GRID");
+inline LF_TLS bool FUSED_GRID_AF2 = !getenv("LOCALFOLD_AF2_UNFUSED_GRID");
 // The triangle attention on cuda/af3's fused grid kernels: LN + q/k/v/gate (+ the gate bias) + the pair
 // bias projection in one kernel reading the ending node's rows transposed where they lie, the flash
 // kernel, and the output projection (+ its bias) added into the pair - transposed in place for the ending
@@ -1685,7 +1685,7 @@ inline void triangleAttentionGrid(float* pair, const float* pairMask, int L, con
   const half* Wb = paddedFeat2dWeight(P(A + "/feat_2d_weights", blk), C, H);
   size_t biasN = (size_t)H * L * stride;
   half* bias = scratch<half>("fbias.bias", biasN);
-  static half* zeroedBias = nullptr; static size_t zeroedBiasN = 0;
+  static LF_TLS half* zeroedBias = nullptr; static LF_TLS size_t zeroedBiasN = 0;
   if (stride != L && (bias != zeroedBias || biasN > zeroedBiasN)) {
     CK(cudaMemsetAsync(bias, 0, biasN * 2, STREAM));                // the padding columns (once per buffer)
     zeroedBias = bias; zeroedBiasN = biasN;

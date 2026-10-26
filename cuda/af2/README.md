@@ -476,6 +476,44 @@ first fold at that shape, repeat = the median of the next three), PDBs byte-iden
 
 (Found on branch argon-ptx, Round 5 Module 6, and ported.)
 
+### AlphaFold 2's five models at once, on threads of one process (2026-10-26)
+
+A short fold leaves most of the card idle: at 68 residues the pair kernels launch 73-81 blocks on an A100's 108 SMs,
+and a call is a fixed ~10-15 us chain whatever its blocks do. The page's "All 5" folds one input through five models,
+one job after another. Separate processes are separate CUDA contexts, which the GPU time-slices (five at once, no
+MPS: slower than in turn); one process's streams overlap, and every AF2 thread already has its own
+(`STREAM` is `cudaStreamPerThread`, built `--default-stream per-thread`). So:
+
+- `localfold-af2 --multi <args> :: <args> :: ...` runs each group's `foldMain` on a thread - its own bundle and
+  delta, warm-up and `--serve` directory. Every mutable global and function-level static the AF2 build reads is
+  `LF_TLS` (`thread_local` in this binary only: AF3's cuBLAS warm-up and weight-upload threads read them as the
+  process's, so there it is nothing).
+- A device-wide synchronisation on one thread while another captures its graph breaks the capture, so the capture
+  and every `cudaFree`, `cudaMalloc`, `cudaMallocHost`, `cudaFreeHost` and `cudaDeviceSynchronize` on this path hold
+  one process-wide `CAPTURE_MU` (`lfFree`, `lfMalloc`, ...).
+- Each thread writes its own job's log: `serveJobs` sets `lfio::log` instead of `dup2` on the process's stdout and
+  stderr (the AF2 build reads stdout, stderr and printf through it), syncs its own stream rather than the device
+  after a job, and the frame tap's thread takes the offering fold's log for its pass lines.
+
+python/localfold/worker.py runs "All 5" on one `--multi` server (`MultiServer`) when its first job comes - on CUDA, at
+most 400 residues (`SWEEP_MAX_RESIDUES`), with no template (models 3-5 have no template embedder) - streams that job's
+passes live, and answers the other four jobs from the results and frames it kept (`sweep_key`: the job but its
+family). A100:
+
+| five models, one input | 68 res | 150 res | 261 res |
+|---|---:|---:|---:|
+| one after another (5x one fold) | ~325 ms | ~640 | ~1570 |
+| **`--multi`, five threads** | **154** | **458** | **1347** |
+
+| through the worker, five jobs | 6MRR warm | 6MRR cold | 1BRS A+D cold |
+|---|---:|---:|---:|
+| one model a job | 708 ms | 3,079 | 4,398 |
+| **"All 5"** | **287** | **984** | **1,628** |
+
+Every model's structure byte-identical to its job folded alone, at every length and through the worker; a lone fold
+is unchanged (68 residues 58.3 ms, 261 306.6); the early stop per model; a changed job refolds; 522 residues folds one
+model a job. (Found on branch argon-ptx, Round 5 Modules 8-10, and ported.)
+
 ## A deep alignment's featurisation (2026-10-08)
 
 🔴 **SUPERSEDED THE SAME DAY: the featuriser is native now** (`cuda/featurise/af2-featurise`), its nearest-centre

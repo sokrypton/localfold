@@ -14,7 +14,7 @@
 constexpr float LOG2E = 1.4426950408889634f;
 // every token real (the batch's sequence mask all ones), so attention masks are all ones too and
 // the flash kernels can skip them; set from the batch
-inline bool MASK_ALL_ONES = false;
+inline LF_TLS bool MASK_ALL_ONES = false;
 
 // Turing (sm_75, a T4) has no m16n8k16 and no cp.async: there the MMA is two m16n8k8 over the same
 // fragments (a0 a1 / b0 the first eight k, a2 a3 / b1 the second - the accumulation order the k16
@@ -1020,12 +1020,12 @@ void flashSplitHalfAt(const half* qkvg, const half* bias, int stride, const floa
                       int n, int heads, size_t r0, size_t rows, bool tr, float scale, const float* qBias) {
   size_t smem = std::max((size_t)KS * 2 * fsStage<D>(), (size_t)KS * 16 * (D + 6) * 4);
   if (mask) {
-    static bool done = false;
+    static LF_TLS bool done = false;
     if (!done) { smemAttr((flashSplitHalf<D, KS, true>), (int)smem); done = true; }
     flashSplitHalf<D, KS, true><<<dim3((n + 15) / 16, (unsigned)(rows * heads)), 32 * KS, smem, STREAM>>>(
       qkvg, bias, stride, mask, out, n, heads, r0, tr, scale, qBias);
   } else {
-    static bool done = false;
+    static LF_TLS bool done = false;
     if (!done) { smemAttr((flashSplitHalf<D, KS, false>), (int)smem); done = true; }
     flashSplitHalf<D, KS, false><<<dim3((n + 15) / 16, (unsigned)(rows * heads)), 32 * KS, smem, STREAM>>>(
       qkvg, bias, stride, mask, out, n, heads, r0, tr, scale, qBias);
@@ -1573,14 +1573,14 @@ __global__ void __launch_bounds__(WARPS * RR * 32, (!ONE && WARPS * RR == 4 && D
 // tokens with 32-key tiles (the occupancy the 48-key form keeps with two stages), and 5.77 -> 7.58 at 48
 // keys where the third stage costs a block an SM - three warps a scheduler already overlap one warp's
 // softmax with another's MMAs.
-inline bool FLASH_2R = !getenv("LOCALFOLD_FLASH_2R") || atoi(getenv("LOCALFOLD_FLASH_2R"));
+inline LF_TLS bool FLASH_2R = !getenv("LOCALFOLD_FLASH_2R") || atoi(getenv("LOCALFOLD_FLASH_2R"));
 // the blocks' order (flashGrid2R's sw): four row groups a query tile once a head's bias (n^2 halves) is past ~24 MB of
 // L2 - --bench-grid at 256 rows 75.6 -> 72.3 ms at 8,000 tokens, 42.5 -> 40.3 at 6,000, level at 3,000 and ~1% behind
 // at 1,000; byte-identical (the same blocks, another order). LOCALFOLD_GRID_SWIZZLE=<sw> forces one, 0 off
 // (three warps a block - 96 queries, K and V a third less L2 traffic a score, still 12 warps an SM - measured level at
 // 6,000 tokens and 12% behind at 1,000: past the L2 (66% busy in Nsight Compute) the kernel is latency-bound at 168
 // registers a thread, three blocks an SM; key tiles of 32, 64 or 80 are 2-5% behind 48 at 6,000 too)
-inline int GRID_SWIZZLE = getenv("LOCALFOLD_GRID_SWIZZLE") ? atoi(getenv("LOCALFOLD_GRID_SWIZZLE")) : -1;
+inline LF_TLS int GRID_SWIZZLE = getenv("LOCALFOLD_GRID_SWIZZLE") ? atoi(getenv("LOCALFOLD_GRID_SWIZZLE")) : -1;
 template <int D, int WARPS, int BK, int MT = 2, int RR = 1, bool NB = false, bool ONE = false, class OT = half, bool SPEC = false>
 void flashGrid2RRun(const half* qkvg, const half* bias, int stride, OT* out, int n, int heads, size_t rows, float scale,
                     const float* qBias, size_t rowStride = 0, size_t posStride = 0, size_t outRowStride = 0,
@@ -1591,7 +1591,7 @@ void flashGrid2RRun(const half* qkvg, const half* bias, int stride, OT* out, int
   // (the output is staged in the stages' memory, and one stage (ONE) can be smaller than its tiles' staging - four
   // tiles a warp overflowed it, an illegal access)
   const int bytes = std::max((ONE ? 1 : 2) * (int)fa2Stage<D, WARPS, BK, MT, RR>(), WARPS * RR * 16 * MT * (D + 8) * 2);
-  static bool attr = false;
+  static LF_TLS bool attr = false;
   if (!attr) { smemAttr((flashGrid2R<D, WARPS, BK, MT, RR, NB, ONE, OT, SPEC>), bytes); attr = true; }
   dim3 grid((n + BQ - 1) / BQ, (unsigned)((rows + RR - 1) / RR * heads));
   flashGrid2R<D, WARPS, BK, MT, RR, NB, ONE, OT, SPEC><<<grid, 32 * WARPS * RR, bytes, STREAM>>>(qkvg, bias, stride, out, n, heads, scale, qBias, rows,
@@ -1608,7 +1608,7 @@ void flashGrid2RRun(const half* qkvg, const half* bias, int stride, OT* out, int
 // each; 5CAJ self-templated 0.005 A from the plain softmax. The 48-key form too (a 100 KB-an-SM card's - an A6000, or an
 // L4 with FP8 off): on a Colab L4 17.4-17.9 against 19.1-19.3 ms at 2,048 tokens, level at 512 (three alternations each;
 // 256 rows); on the A100 9.65 against 10.19 at 3,072. LOCALFOLD_FLASH_SPEC=0 turns it off
-inline bool FLASH_SPEC = !getenv("LOCALFOLD_FLASH_SPEC") || atoi(getenv("LOCALFOLD_FLASH_SPEC"));
+inline LF_TLS bool FLASH_SPEC = !getenv("LOCALFOLD_FLASH_SPEC") || atoi(getenv("LOCALFOLD_FLASH_SPEC"));
 inline bool flash2RWideKeys() {
   static const bool v = [] {
     if (const char* e = getenv("LOCALFOLD_FLASH_2R_BK")) return atoi(e) == 64;
@@ -1662,7 +1662,7 @@ bool flash2R1Strided(const half* qkvg, const half* bias, int stride, half* out, 
 }
 template <int D, int WARPS, bool MASKED, int BK = FA_BK, bool REG = false,
           int MINB = (D == 48 && WARPS == 4 && BK == 48 && !REG) ? 4 : 1, bool F16S = false> void setFlashSmem() {
-  static bool done = false;
+  static LF_TLS bool done = false;
   if (!done) {
     smemAttr((flashGridHalf<D, WARPS, MASKED, BK, REG, MINB, false, F16S>), (int)((REG ? 1 : 2) * faStage<D, WARPS, BK>()));
     done = true;
@@ -1944,7 +1944,7 @@ inline bool fp8Attn() {
   }();
   return on;
 }
-inline int FP8_SWIZZLE = getenv("LOCALFOLD_FP8_SWIZZLE") ? atoi(getenv("LOCALFOLD_FP8_SWIZZLE")) : -1;
+inline LF_TLS int FP8_SWIZZLE = getenv("LOCALFOLD_FP8_SWIZZLE") ? atoi(getenv("LOCALFOLD_FP8_SWIZZLE")) : -1;
 // flash8's speculative softmax (flashGrid2R's SPEC) from 1,024 tokens: on a Colab L4 (--bench-grid, 256 rows) 20% slower
 // at 512 (3.47 against 2.88 ms), 2.6% faster at 1,024 (20.70 / 21.26) and 3.2% at 2,048 (126.2 / 130.5); 6MRR, 5CAJ
 // and 1TIM self-templated 0.014 A from the folds without it, every crystal RMSD within 0.006 A of its own.
@@ -1961,17 +1961,17 @@ inline void flash8Run(const half* qkvg, const uint8_t* K8, const uint8_t* V8, co
   const uint8_t* Vt8 = V8;
   if (!vtDone) {
     uint8_t* vt = scratch<uint8_t>("attn.vt8", rows * (size_t)W * NK);
-    static int vtAttr = 0;
+    static LF_TLS int vtAttr = 0;
     if (65 * W > vtAttr) { smemAttr(fp8VtK, 65 * W); vtAttr = 65 * W; }
     fp8VtK<<<dim3(NK / 64, (unsigned)rows), 256, 65 * W, STREAM>>>(V8, vt, n, NK, W);
     Vt8 = vt;
   }
   const int bytes = 2 * (RR * (BK * 32 + 32 * BK) + BQ * (BK + 8) * 2);
-  static bool attr = false;
+  static LF_TLS bool attr = false;
   dim3 grid((n + BQ - 1) / BQ, (unsigned)((rows + RR - 1) / RR * heads));
   const int sw = FP8_SWIZZLE >= 0 ? FP8_SWIZZLE : n >= 3500 ? 4 : 0;
   if (spec > 0 || (spec < 0 && n >= 1024)) {
-    static bool attrS = false;
+    static LF_TLS bool attrS = false;
     if (!attrS) { smemAttr((flash8<WARPS, BK, MT, RR, true>), bytes); attrS = true; }
     flash8<WARPS, BK, MT, RR, true><<<grid, 32 * WARPS * RR, bytes, STREAM>>>(qkvg, K8, Vt8, bias, stride, out, n, NK, heads, rows, scale, qBias, sw);
     return;
@@ -1979,14 +1979,14 @@ inline void flash8Run(const half* qkvg, const uint8_t* K8, const uint8_t* V8, co
   if (!attr) { smemAttr((flash8<WARPS, BK, MT, RR>), bytes); attr = true; }
   flash8<WARPS, BK, MT, RR><<<grid, 32 * WARPS * RR, bytes, STREAM>>>(qkvg, K8, Vt8, bias, stride, out, n, NK, heads, rows, scale, qBias, sw);
 }
-inline int FLASH_WARPS_OVERRIDE = 0;
+inline LF_TLS int FLASH_WARPS_OVERRIDE = 0;
 // F16S (flashGridHalf): the unmasked kernel's scores in f16 - LOCALFOLD_FLASH_F16S=1 (being measured)
-inline bool FLASH_F16S = getenv("LOCALFOLD_FLASH_F16S") && atoi(getenv("LOCALFOLD_FLASH_F16S"));
-inline bool FLASH_SPLIT = true;
+inline LF_TLS bool FLASH_F16S = getenv("LOCALFOLD_FLASH_F16S") && atoi(getenv("LOCALFOLD_FLASH_F16S"));
+inline LF_TLS bool FLASH_SPLIT = true;
 // the register-staged form (see flashGridHalf's REG) where the device has no cp.async - before Ampere, a
 // T4 - unless LOCALFOLD_FLASH_REG says otherwise (0 or 1: to measure either form on any device)
 inline bool flashRegStaged() {
-  static int v = [] {
+  static LF_TLS int v = [] {
     if (const char* e = getenv("LOCALFOLD_FLASH_REG")) return atoi(e);
     return ccMajor() < 8 ? 1 : 0;
   }();
@@ -1994,7 +1994,7 @@ inline bool flashRegStaged() {
 }
 // several GPUs on a sharded pair (the diffusion transformer's token attention): this rank's queries [FLASH_QLO,
 // FLASH_QHI), its bias planes FLASH_BIAS_ROWS rows from query FLASH_QLO; 0 - every query, the whole bias
-inline int FLASH_QLO = 0, FLASH_QHI = 0, FLASH_BIAS_ROWS = 0;
+inline LF_TLS int FLASH_QLO = 0, FLASH_QHI = 0, FLASH_BIAS_ROWS = 0;
 template <int D, int WARPS, int BK = FA_BK, bool REG = false,
           int MINB = (D == 48 && WARPS == 4 && BK == 48 && !REG) ? 4 : 1>
 void flashGridHalfRun(const half* qkvg, const half* bias, int stride, const float* mask, half* out,

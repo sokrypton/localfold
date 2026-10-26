@@ -32,9 +32,9 @@ __device__ __forceinline__ int w2Sw(int k, int c) {
 // of a 68-token AF3 fold's 117. Forgotten with the derived weights (FORGET_HOOKS), which rebuild W1 itself.
 template <bool RELU>
 inline const half* transitionW1Tiles(const half* W1, int C, int I, int NC) {
-  static std::map<std::pair<const half*, int>, half*> tiles;
-  static std::vector<half*> chunks; static size_t used = 0, have = 0;
-  static bool hooked = false;
+  static LF_TLS std::map<std::pair<const half*, int>, half*> tiles;
+  static LF_TLS std::vector<half*> chunks; static LF_TLS size_t used = 0, have = 0;
+  static LF_TLS bool hooked = false;
   if (!hooked) {
     FORGET_HOOKS.push_back([] { for (half* p : chunks) CK(cudaFreeAsync(p, STREAM)); chunks.clear(); tiles.clear(); used = have = 0; });
     hooked = true;
@@ -407,7 +407,7 @@ inline bool fusedTransitionSplit256(float* x, size_t rows, int I, const float* l
   if (I % FTS_NC || !fitsSmem(smem)) return false;
   using PT = __nv_bfloat16;
   const half* w1t = transitionW1Tiles<true>(W1, C, I, FTS_NC);
-  static bool attr = false;
+  static LF_TLS bool attr = false;
   if (!attr) { smemAttr((fusedTransitionSplitK<C, WM, PT>), (int)smem); attr = true; }
   fusedTransitionSplitK<C, WM, PT><<<(unsigned)((rows + R - 1) / R), 64 * WM, smem, STREAM>>>(x, lnScale, lnOffset, w1t, W2, rows, I, b1, b2);
   return true;
@@ -421,17 +421,17 @@ void fusedTransitionAt(float* x, size_t rows, int I, const float* lnScale, const
   size_t smem = (size_t)R * (C + 8) * 2 + NST * ftStage<C, NC, RELU>();
   const half* w1t = transitionW1Tiles<RELU>(W1, C, I, NC);
   WITH_PAIR_T(
-    static bool attr = false;
+    static LF_TLS bool attr = false;
     if (!attr) { smemAttr((fusedTransitionK<C, WARPS, RELU, MT, NC, PT, NST>), (int)smem); attr = true; }
     fusedTransitionK<C, WARPS, RELU, MT, NC, PT, NST><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(
       x, lnScale, lnOffset, w1t, W2, rows, I, b1, b2));
 }
-inline bool FUSED_TRANSITION = true;
+inline LF_TLS bool FUSED_TRANSITION = true;
 #ifndef FT_ONE_STAGE
 #define FT_ONE_STAGE 1
 #endif
-inline int FT_WARPS = 8;
-inline bool FT_TWO_TILES = !getenv("LOCALFOLD_FT_ONE_TILE");
+inline LF_TLS int FT_WARPS = 8;
+inline LF_TLS bool FT_TWO_TILES = !getenv("LOCALFOLD_FT_ONE_TILE");
 // x += transition(x) for C = 128, f16 weights, on raw pointers (AlphaFold 2 calls it with RELU and its
 // biases); false if the shape is not this kernel's or the device cannot hold its blocks
 // whether fusedTransitionRaw has a form for this shape on this device (the two-tile form, else the one-tile at 4 warps)

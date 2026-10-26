@@ -14,13 +14,13 @@ inline CUptiResult (*getNextRecord)(uint8_t*, size_t, CUpti_Activity**) = nullpt
 inline CUptiResult (*registerCallbacks)(CUpti_BuffersCallbackRequestFunc, CUpti_BuffersCallbackCompleteFunc) = nullptr;
 inline CUptiResult (*enable)(CUpti_ActivityKind) = nullptr;
 inline CUptiResult (*flushAll)(uint32_t) = nullptr;
-inline std::map<std::string, std::pair<double, int>> byName;   // name -> (ns, calls)
-inline uint64_t first = UINT64_MAX, last = 0; inline double busy = 0, copyNs = 0;
-inline bool on = false;
+inline LF_TLS std::map<std::string, std::pair<double, int>> byName;   // name -> (ns, calls)
+inline LF_TLS uint64_t first = UINT64_MAX, last = 0; inline LF_TLS double busy = 0, copyNs = 0;
+inline LF_TLS bool on = false;
 // LOCALFOLD_PROF_GAPS=<n>: every kernel's span kept too, and the n longest stretches the device sat idle printed with
 // the kernels either side - where a wall clock's time goes that no kernel's does (host work, a synchronisation)
 struct Span { uint64_t start, end; std::string name; };
-inline std::vector<Span> spans;
+inline LF_TLS std::vector<Span> spans;
 inline const int GAPS = getenv("LOCALFOLD_PROF_GAPS") ? atoi(getenv("LOCALFOLD_PROF_GAPS")) : 0;
 inline void CUPTIAPI bufferRequested(uint8_t** buffer, size_t* size, size_t* maxRecords) {
   *size = 8 << 20; *buffer = (uint8_t*)aligned_alloc(8, *size); *maxRecords = 0;

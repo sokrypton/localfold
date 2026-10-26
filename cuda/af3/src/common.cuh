@@ -28,6 +28,11 @@
 #include <sstream>
 #include <thread>
 #include <mutex>
+// LF_TLS: thread_local in a binary that runs several folds on threads of one process (cuda/af2's --multi, which
+// defines it before including this), nothing anywhere else - AF3's helper threads read these as the process's
+#ifndef LF_TLS
+#define LF_TLS
+#endif
 #include <condition_variable>
 #include <string>
 #include <type_traits>
@@ -39,8 +44,23 @@
   fprintf(stderr, "cuBLAS %d at %s:%d\n", (int)s_, __FILE__, __LINE__); exit(1); } } while (0)
 
 using half = __half;
-inline cublasHandle_t H;
-inline cudaStream_t STREAM = cudaStreamPerThread;
+inline LF_TLS cublasHandle_t H;
+inline LF_TLS cudaStream_t STREAM = cudaStreamPerThread;
+// process-wide, NOT thread_local: cuda/af2's --multi folds several models on threads of one process, and a device-wide
+// synchronisation (cudaDeviceSynchronize, cudaFree, cudaMalloc) on one thread while another captures a graph breaks
+// the capture ("operation not permitted when stream is capturing"). A capture holds this; so does every such call
+inline std::recursive_mutex CAPTURE_MU;
+inline cudaError_t lfFree(void* p) { std::lock_guard<std::recursive_mutex> l(CAPTURE_MU); return cudaFree(p); }
+inline cudaError_t lfDeviceSynchronize() { std::lock_guard<std::recursive_mutex> l(CAPTURE_MU); return cudaDeviceSynchronize(); }
+template <class T> inline cudaError_t lfMalloc(T** p, size_t n) { std::lock_guard<std::recursive_mutex> l(CAPTURE_MU); return cudaMalloc(p, n); }
+template <class T> inline cudaError_t lfMallocHost(T** p, size_t n) { std::lock_guard<std::recursive_mutex> l(CAPTURE_MU); return cudaMallocHost(p, n); }
+inline cudaError_t lfFreeHost(void* p) { std::lock_guard<std::recursive_mutex> l(CAPTURE_MU); return cudaFreeHost(p); }
+// ...and each thread's job log: serveJobs points a job's output at its log by dup2 on the process's stdout and stderr,
+// which threads cannot share; under --multi it sets lfio::log instead, and the AF2 build reads stdout, stderr and
+// printf through it (cuda/af2/src/af2.cu). Elsewhere nothing reads it
+#ifndef LF_LOG_DECLARED
+namespace lfio { inline LF_TLS FILE* log = nullptr; inline LF_TLS bool perThread = false; }
+#endif
 // The named scratch comes from one stream-ordered pool that keeps what it is given back (release threshold: never):
 // a large input gives each stage's scratch back for the next, and a fresh cudaMalloc of a big buffer is not cheap
 // here - 0.9 ms at 1 GB, 37 at 2, 145 at 4 - while the pool hands the same pages to the next stage's buffers, of
@@ -48,7 +68,7 @@ inline cudaStream_t STREAM = cudaStreamPerThread;
 // every question asked of the card (deviceMemInfo), and a plain allocation refused while it holds some trims it
 // and asks again (devMalloc).
 inline cudaMemPool_t scratchPool() {
-  static cudaMemPool_t pool = [] {
+  static LF_TLS cudaMemPool_t pool = [] {
     cudaMemPoolProps props = {};
     props.allocType = cudaMemAllocationTypePinned;
     props.location.type = cudaMemLocationTypeDevice;
@@ -62,7 +82,7 @@ inline cudaMemPool_t scratchPool() {
 inline size_t poolIdle() {
   // (a pool may not be asked while a stream captures - a recycle pass asks roomFor as it is captured - so there the
   // last answer, which the eager pass it repeats was given)
-  static size_t last = 0;
+  static LF_TLS size_t last = 0;
   cudaStreamCaptureStatus capturing; CK(cudaStreamIsCapturing(STREAM, &capturing));
   if (capturing != cudaStreamCaptureStatusNone) return last;
   uint64_t reserved = 0, used = 0;
@@ -70,13 +90,13 @@ inline size_t poolIdle() {
   CK(cudaMemPoolGetAttribute(scratchPool(), cudaMemPoolAttrUsedMemCurrent, &used));
   return last = reserved > used ? reserved - used : 0;
 }
-inline uint64_t MEM_GEN = 1;
+inline LF_TLS uint64_t MEM_GEN = 1;
 inline void deviceMemInfo(size_t* f, size_t* t) { CK(cudaMemGetInfo(f, t)); *f += poolIdle(); }
-inline void trimPool() { ++MEM_GEN; CK(cudaDeviceSynchronize()); CK(cudaMemPoolTrimTo(scratchPool(), 0)); }
+inline void trimPool() { ++MEM_GEN; CK(lfDeviceSynchronize()); CK(cudaMemPoolTrimTo(scratchPool(), 0)); }
 template <class P> cudaError_t devMalloc(P** p, size_t bytes) {
   ++MEM_GEN;
-  cudaError_t e = cudaMalloc((void**)p, bytes);
-  if (e == cudaErrorMemoryAllocation && poolIdle()) { cudaGetLastError(); trimPool(); e = cudaMalloc((void**)p, bytes); }
+  cudaError_t e = lfMalloc((void**)p, bytes);
+  if (e == cudaErrorMemoryAllocation && poolIdle()) { cudaGetLastError(); trimPool(); e = lfMalloc((void**)p, bytes); }
   return e;
 }
 
@@ -751,8 +771,8 @@ struct Model {
     // and 0.16 to free for 256 MB shards - more than the whole read (AF3's cold start 1.7 -> 1.25 s, Chai-1's
     // 2.8 -> 1.8) - and 16 MB of pieces cost ~13 ms once
     constexpr size_t PIECE = (size_t)4 << 20; constexpr int NP = 4;
-    static unsigned char* ring[NP]; static cudaEvent_t freed[NP];
-    static std::mutex ringMu; std::lock_guard<std::mutex> ringHeld(ringMu);   // (uploadAsync: a thread a segment)
+    static LF_TLS unsigned char* ring[NP]; static LF_TLS cudaEvent_t freed[NP];
+    static LF_TLS std::mutex ringMu; std::lock_guard<std::mutex> ringHeld(ringMu);   // (uploadAsync: a thread a segment)
     if (!ring[0])
       for (int b = 0; b < NP; ++b)
         if (cudaHostAlloc(&ring[b], PIECE, cudaHostAllocDefault) != cudaSuccess ||
@@ -853,8 +873,8 @@ struct Model {
       if (b.kind == 8 && cudaMemcpyAsync(s.device + b.dst, s.consts[b.byteOffset].data(), b.elements * 4,
                                          cudaMemcpyHostToDevice, st) != cudaSuccess) return false;
     bool ok = cudaStreamSynchronize(st) == cudaSuccess && cudaGetLastError() == cudaSuccess;
-    cudaFree(pt); cudaFree(scratch); cudaFree(sdt[0]); cudaFree(sdt[1]);
-    for (int k = 0; k < 2; ++k) { cudaFree(raw[k]); cudaFree(dt[k]); cudaEventDestroy(done[k]); }
+    lfFree(pt); lfFree(scratch); lfFree(sdt[0]); lfFree(sdt[1]);
+    for (int k = 0; k < 2; ++k) { lfFree(raw[k]); lfFree(dt[k]); cudaEventDestroy(done[k]); }
     cudaStreamDestroy(st);
     return ok;
   }
@@ -952,8 +972,8 @@ struct Model {
       else ++it;
     }
     Segment& s = segs[seg];
-    if (s.device) { cudaDeviceSynchronize(); cudaFree(s.device); s.device = nullptr; }
-    for (auto& [g, h] : s.halfMirrors) cudaFree(h);
+    if (s.device) { lfDeviceSynchronize(); lfFree(s.device); s.device = nullptr; }
+    for (auto& [g, h] : s.halfMirrors) lfFree(h);
     s.halfMirrors.clear();
     if (s.data) { munmap((void*)s.data, std::max<size_t>(s.bytes, 1)); s.data = nullptr; }
     if (s.fd >= 0) { close(s.fd); s.fd = -1; }
@@ -1007,7 +1027,7 @@ struct Model {
     float* fresh; CK(devMalloc(&fresh, std::max<size_t>(at, 1) * 4));
     for (auto& m : moves) CK(cudaMemcpyAsync(fresh + m[1], s.device + m[0], m[2] * 4, cudaMemcpyDeviceToDevice, STREAM));
     CK(cudaStreamSynchronize(STREAM));
-    CK(cudaFree(s.device)); ++MEM_GEN;
+    CK(lfFree(s.device)); ++MEM_GEN;
     size_t freed = s.deviceBytes - at * 4;
     s.device = fresh; s.deviceBytes = at * 4;
     for (Entry* e : dropped) e->devOffset = DROPPED;
@@ -1071,7 +1091,7 @@ struct Model {
       if (const char* d = getenv("LOCALFOLD_SLOW_UPLOAD_MS")) usleep((useconds_t)atoi(d) * 1000);   // (as in bundleUp)
     }
     bool ok = cudaStreamSynchronize(st) == cudaSuccess;
-    for (int b = 0; b < NB; ++b) { cudaFreeHost(stage[b]); cudaEventDestroy(ev[b]); }
+    for (int b = 0; b < NB; ++b) { lfFreeHost(stage[b]); cudaEventDestroy(ev[b]); }
     cudaStreamDestroy(st);
     return ok;
   }
@@ -1094,7 +1114,7 @@ struct Model {
   // bundleUp copied, a tensor at a time through one pinned buffer
   size_t parkResident() {
     size_t freed = 0;
-    for (auto& s : segs) if (s.resident) { CK(cudaFree(s.resident)); s.resident = nullptr; freed += s.residentBytes; ++MEM_GEN; }
+    for (auto& s : segs) if (s.resident) { CK(lfFree(s.resident)); s.resident = nullptr; freed += s.residentBytes; ++MEM_GEN; }
     return freed;
   }
   bool residentParked() const { for (auto& s : segs) if (s.residentBytes && !s.resident) return true; return false; }
@@ -1121,7 +1141,7 @@ struct Model {
         CK(cudaMemcpy(s.resident + r.scales, pin + cbytes, sbytes, cudaMemcpyHostToDevice));
       }
       if (fd >= 0) close(fd);
-      CK(cudaFreeHost(pin));
+      CK(lfFreeHost(pin));
     }
   }
   bool isResident(const std::string& k) const { auto it = index.find(k); return it != index.end() && it->second.kind == 'q'; }
@@ -1160,7 +1180,7 @@ struct Model {
   const int* i(const std::string& k) const { return (const int*)f(k); }
   size_t len(const std::string& k) const { return at(k).length; }
 };
-inline Model M;
+inline LF_TLS Model M;
 
 // The weight tensors a fold never read, digits collapsed: a convention the checkpoint carries and
 // this port does not apply shows up here instead of as a quietly wrong structure (rf3's atom q/k
@@ -1204,14 +1224,14 @@ template <class T> T* upload(const T* h, size_t n) {
   T* p = dallocT<T>(n); CK(cudaMemcpy(p, h, n * sizeof(T), cudaMemcpyHostToDevice)); return p;
 }
 // Named scratch, kept for the process and grown when asked for more.
-inline std::map<std::string, std::pair<void*, size_t>> SCRATCH;
+inline LF_TLS std::map<std::string, std::pair<void*, size_t>> SCRATCH;
 // Every scratch buffer given back: between the trunk, the denoiser and the confidence head of a
 // large input, so each phase has the whole card (every phase asks for its buffers again).
-inline uint64_t SCRATCH_RELEASES = 0;   // bumped by every give-back: a buffer asked for again may come back at the SAME
+inline LF_TLS uint64_t SCRATCH_RELEASES = 0;   // bumped by every give-back: a buffer asked for again may come back at the SAME
                                         // address holding another stage's data, so "same pointer" is not "same contents"
 inline void releaseScratch() {
   ++SCRATCH_RELEASES; ++MEM_GEN;
-  CK(cudaDeviceSynchronize());
+  CK(lfDeviceSynchronize());
   for (auto& [name, slot] : SCRATCH) { if (slot.first) CK(cudaFreeAsync(slot.first, STREAM)); slot = {nullptr, 0}; }
 }
 // A large input's pair is over 128 MB (512 tokens at 128 channels): there each phase gets the card
@@ -1229,16 +1249,16 @@ inline bool tightPair(size_t pairs, int C) { return pairs * C * 4 > ((size_t)128
 // 646 with the card two-thirds empty - 55.2 against 31.8 s a fold at 2000 tokens, OpenDDE's trunk 17.8 against
 // 12.8 s at 765. AF2 and ESMFold2 (0) keep the 64th until measured. Under it the trunk gives each stage's scratch
 // back between stages, which costs the recycles their graph and a reallocation a pass.
-inline double SHORT_PAIR_TIMES = 0;
+inline LF_TLS double SHORT_PAIR_TIMES = 0;
 // several GPUs: the room every rank decides by, the least of theirs taken at one point of the fold (af3.cu) - each
 // measuring its own at its own first ask, 10,127 tokens on 8 x A100 had rank 0 at 26.1 GB and the rest at 29.3, and a
 // rank that alone takes the short-of-room paths (the trunk not captured, its exchange buffers given back - collective)
 // leaves the others waiting at a meeting it never comes to
-inline size_t SHORT_PAIR_ROOM = 0;
+inline LF_TLS size_t SHORT_PAIR_ROOM = 0;
 // ...and the share of the pair a rank holds (af3.cu: the GPU count while the pair is sharded, 1 otherwise): a rank's
 // working set is its share's, so asked of the whole pair a 2,964-token fold on 4 x 48 GB took every short-of-room path
 // (the triangle in rounds, the stacks' buffers given back each pass, no graph): 43.0 against 40.5 s
-inline int SHORT_PAIR_SHARE = 1;
+inline LF_TLS int SHORT_PAIR_SHARE = 1;
 inline size_t shortPairRoomHere() {
   size_t f, t; deviceMemInfo(&f, &t);
   for (auto& [name, slot] : SCRATCH) f += slot.second;
@@ -1247,7 +1267,7 @@ inline size_t shortPairRoomHere() {
 inline bool shortPair(size_t pairs, int C) {
   if (BIG_FORCED) return true;
   if (SHORT_PAIR_TIMES > 0) {
-    static size_t own = 0;
+    static LF_TLS size_t own = 0;
     if (!SHORT_PAIR_ROOM && !own) {
       own = shortPairRoomHere();
       if (getenv("LOCALFOLD_MEM")) fprintf(stderr, "  memory room for the ordinary paths %.2f GB (a pair up to %.2f GB)\n",
@@ -1264,8 +1284,8 @@ inline bool shortPair(size_t pairs, int C) {
 // (a buffer aliased to a shared slot - SHARED_SLOT, below - is held as "slot.<k>", and naming it frees its slot; but a
 // slot handed out inside a graph capture is freed only when the release names EVERY buffer it holds: the others may be
 // in the graph a later pass replays - AF2's stacks from pass 1 on, an illegal address)
-inline std::map<std::string, int> SHARED_SLOT;                 // a buffer's name -> its slot
-inline std::set<int> SLOT_CAPTURED;                           // slots handed out while a stream captured
+inline LF_TLS std::map<std::string, int> SHARED_SLOT;                 // a buffer's name -> its slot
+inline LF_TLS std::set<int> SLOT_CAPTURED;                           // slots handed out while a stream captured
 inline bool scratchNameMatches(const std::string& name, std::initializer_list<const char*> names) {
   for (const char* p : names) {
     size_t len = strlen(p);
@@ -1288,7 +1308,7 @@ inline void releaseScratch(std::initializer_list<const char*> names) {
   for (auto& [name, slot] : SCRATCH) {
     if (!slot.first) continue;
     if (!scratchNameMatches(name, names) && !slots.count(name)) continue;
-    if (!synced) { CK(cudaDeviceSynchronize()); synced = true; ++SCRATCH_RELEASES; ++MEM_GEN; }
+    if (!synced) { CK(lfDeviceSynchronize()); synced = true; ++SCRATCH_RELEASES; ++MEM_GEN; }
     CK(cudaFreeAsync(slot.first, STREAM)); slot = {nullptr, 0};
   }
 }
@@ -1308,8 +1328,8 @@ inline bool roomFor(size_t bytes, std::initializer_list<const char*> held = {}) 
     if (nSeen < 16) seen[nSeen++] = ptr;
     bytes -= std::min(bytes, it->second.second);
   }
-  static size_t f = 0, t = 0;
-  static uint64_t gen = 0;
+  static LF_TLS size_t f = 0, t = 0;
+  static LF_TLS uint64_t gen = 0;
   if (gen != MEM_GEN) { deviceMemInfo(&f, &t); gen = MEM_GEN; }
   return f > bytes + t / 8;
 }
@@ -1329,15 +1349,15 @@ inline void scratchReportOOM(const char* what, size_t bytes) {
 // stack's blocks and the diffusion sampler leave the trunk's pair alone - on a card short of room. One
 // pinned buffer for the process, grown as needed; parking frees the device copy and unparking makes a new
 // one (callers take the new pointer).
-inline float* PARK_HOST = nullptr; inline size_t PARK_HAVE = 0;
+inline LF_TLS float* PARK_HOST = nullptr; inline LF_TLS size_t PARK_HAVE = 0;
 // the trunk's pair kept in bf16 past the trunk (af3.cu, a card short of room): wherever it is - on the device or
 // parked - its readers take bf16 rows, so the f32 pair (51 GB at 10,000 tokens) never exists
-inline bool TRUNK_PAIR16 = false;
+inline LF_TLS bool TRUNK_PAIR16 = false;
 inline bool parkWorthIt(size_t bytes) { return !roomFor(bytes); }
 inline void parkToHost(float*& dev, size_t bytes) {
   if (PARK_HAVE < bytes) {
-    if (PARK_HOST) CK(cudaFreeHost(PARK_HOST));
-    if (cudaMallocHost(&PARK_HOST, bytes) != cudaSuccess) {
+    if (PARK_HOST) CK(lfFreeHost(PARK_HOST));
+    if (lfMallocHost(&PARK_HOST, bytes) != cudaSuccess) {
       fprintf(stderr, "cannot pin %.2f GB of host memory to park the pair: this input needs more host RAM\n", bytes / 1e9);
       exit(1);
     }
@@ -1345,7 +1365,7 @@ inline void parkToHost(float*& dev, size_t bytes) {
   }
   CK(cudaMemcpyAsync(PARK_HOST, dev, bytes, cudaMemcpyDeviceToHost, STREAM));
   CK(cudaStreamSynchronize(STREAM));
-  CK(cudaFree(dev)); dev = nullptr; ++MEM_GEN;
+  CK(lfFree(dev)); dev = nullptr; ++MEM_GEN;
 }
 inline void unparkFromHost(float*& dev, size_t bytes) {
   dev = dallocT<float>(bytes / 4);
@@ -1387,8 +1407,8 @@ template <class T> T* scratchNamed(const std::string& name, size_t n, bool fatal
               name.c_str(), have, bytes);
       fflush(stderr); _exit(1);
     }
-    if (p) { CK(cudaDeviceSynchronize()); CK(cudaFreeAsync(p, STREAM)); p = nullptr; }
-    cudaError_t e = capturing != cudaStreamCaptureStatusNone ? cudaMalloc(&p, bytes)
+    if (p) { CK(lfDeviceSynchronize()); CK(cudaFreeAsync(p, STREAM)); p = nullptr; }
+    cudaError_t e = capturing != cudaStreamCaptureStatusNone ? lfMalloc(&p, bytes)
                                                              : cudaMallocFromPoolAsync(&p, bytes, scratchPool(), STREAM);
     if (e != cudaSuccess && capturing == cudaStreamCaptureStatusNone) {     // (fragmented idle pages: trimmed, asked again)
       cudaGetLastError(); trimPool(); e = cudaMallocFromPoolAsync(&p, bytes, scratchPool(), STREAM);
@@ -1436,17 +1456,17 @@ template <class T> T* scratchNamed(const std::string& name, size_t n, bool fatal
 // cuda/af3/src/common.cuh); it was taken out with its env knobs, so put it back to prove a change.
 // The families are each PORT's (its main sets them, none by default): AF2 and ESMFold2 compile this file and use the
 // same prefixes with other lifetimes, so a port shares only what its own scribbled folds have proved.
-inline std::vector<std::string> SHARED_FAMILIES;
+inline LF_TLS std::vector<std::string> SHARED_FAMILIES;
 // ...and (outer, inner): a family whose buffers stay live AROUND another's turns never shares a slot with it - AF3's
 // template stack holds tmpl.* while its blocks run the triangle, attention and transition modules (a fold that moved)
-inline std::vector<std::pair<std::string, std::string>> SHARED_NESTED;
+inline LF_TLS std::vector<std::pair<std::string, std::string>> SHARED_NESTED;
 inline bool nested(const std::string& a, const std::string& b) {
   for (auto& [o, i] : SHARED_NESTED) if ((a == o && b == i) || (a == i && b == o)) return true;
   return false;
 }
 inline const size_t SHARED_MIN = (size_t)32 << 20;
-inline std::vector<std::vector<std::string>> SLOT_FAMILIES;   // the families holding each slot
-inline std::vector<size_t> SLOT_MOST;                         // the most each slot has been asked for
+inline LF_TLS std::vector<std::vector<std::string>> SLOT_FAMILIES;   // the families holding each slot
+inline LF_TLS std::vector<size_t> SLOT_MOST;                         // the most each slot has been asked for
 inline const char* sharedFamily(const std::string& name, size_t bytes) {
   for (const std::string& f : SHARED_FAMILIES)
     if (!name.compare(0, f.size(), f)) return SHARED_SLOT.count(name) || bytes >= SHARED_MIN ? f.c_str() : nullptr;
@@ -1525,11 +1545,19 @@ inline void serveJobs(const std::string& dir, const char* name,
     job.close(); unlink((base + ".job").c_str());
     if (input == "quit") { printf("%s: stopped\n", name); return; }
     fflush(stdout); fflush(stderr);
-    int saved = dup(1), savedErr = dup(2), log = open((base + ".log").c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    dup2(log, 1); dup2(log, 2); close(log);
-    int code = fold(input, flags);
-    fflush(stdout); fflush(stderr); dup2(saved, 1); dup2(savedErr, 2); close(saved); close(savedErr);
-    CK(cudaDeviceSynchronize());
+    int code;
+    if (lfio::perThread) {             // (--multi: this thread's lines to its job's log; the others' stay theirs)
+      lfio::log = fopen((base + ".log").c_str(), "w");
+      code = fold(input, flags);
+      fclose(lfio::log); lfio::log = nullptr;
+      CK(cudaStreamSynchronize(STREAM));    // (its own stream: a device-wide sync would wait on the other threads' folds)
+    } else {
+      int saved = dup(1), savedErr = dup(2), log = open((base + ".log").c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+      dup2(log, 1); dup2(log, 2); close(log);
+      code = fold(input, flags);
+      fflush(stdout); fflush(stderr); dup2(saved, 1); dup2(savedErr, 2); close(saved); close(savedErr);
+      CK(lfDeviceSynchronize());
+    }
     FILE* df = fopen((base + ".done.tmp").c_str(), "w"); fprintf(df, "%d\n", code); fclose(df);
     rename((base + ".done.tmp").c_str(), (base + ".done").c_str());
   }
@@ -1540,7 +1568,7 @@ inline void memReport(const char* at) {
   cudaStreamCaptureStatus capturing;                 // (a recycle pass being captured: no sync there)
   CK(cudaStreamIsCapturing(STREAM, &capturing));
   if (capturing != cudaStreamCaptureStatusNone) return;
-  CK(cudaDeviceSynchronize()); size_t fr, tot; deviceMemInfo(&fr, &tot);     // (the pool's idle pages not "in use")
+  CK(lfDeviceSynchronize()); size_t fr, tot; deviceMemInfo(&fr, &tot);     // (the pool's idle pages not "in use")
   size_t held = 0; std::vector<std::pair<size_t, std::string>> big;
   for (auto& [k, v] : SCRATCH) { held += v.second; if (v.second) big.push_back({v.second, k}); }
   std::sort(big.rbegin(), big.rend());
@@ -1552,7 +1580,7 @@ inline void memReport(const char* at) {
 // lowered by LOCALFOLD_SMEM_LIMIT to rehearse a smaller device here. A fused path that would need more
 // asks fitsSmem() and takes its unfused path; smemAttr() refuses, naming the kernel, rather than
 // letting a launch fail with "invalid argument".
-inline size_t SMEM_LIMIT = 0;
+inline LF_TLS size_t SMEM_LIMIT = 0;
 inline size_t smemLimit() {
   if (!SMEM_LIMIT) {
     int dev = 0, v = 0; CK(cudaGetDevice(&dev));
@@ -1595,9 +1623,9 @@ inline unsigned blocks(size_t n, int t = 256) { return (unsigned)((n + t - 1) / 
 // (Not for cuda/af3 as it stands: TCACHE folds its conditioning weights once per process and keeps
 // the names, and OpenDDE's structural.cuh registers VIEWS into a file's copy, which this would free.)
 inline std::vector<std::function<void()>> FORGET_HOOKS;
-inline std::map<std::string, float*> WF;
-inline std::map<std::string, half*> WH;
-inline std::map<std::string, size_t> WLEN;
+inline LF_TLS std::map<std::string, float*> WF;
+inline LF_TLS std::map<std::string, half*> WH;
+inline LF_TLS std::map<std::string, size_t> WLEN;
 // a weight built on the device (the folded conditioning projections), under a name W() serves
 inline void deviceWeight(const std::string& k, float* p, size_t n);
 inline bool hasW(const std::string& k) { return M.has(k) || WLEN.count(k); }
@@ -1610,14 +1638,14 @@ inline size_t lenW(const std::string& k) {
 struct Part { std::string name; int width; bool transposed; };
 // ...and how each was built, so its f32 copy can be given back once its f16 one exists (Wh) and built
 // again, exactly, by a later W() - the fast path reads only the f16 one
-inline std::map<std::string, std::pair<int, std::vector<Part>>> CONCAT;
-inline std::vector<float*> CONCAT_FREE;
-inline std::set<float*> CONCAT_POOL;
+inline LF_TLS std::map<std::string, std::pair<int, std::vector<Part>>> CONCAT;
+inline LF_TLS std::vector<float*> CONCAT_FREE;
+inline LF_TLS std::set<float*> CONCAT_POOL;
 // the f32 copies Wh() queued, given back (one drain for all of them; at a phase boundary)
 inline void releaseConcatCopies() {
   if (CONCAT_FREE.empty()) return;
-  CK(cudaDeviceSynchronize());
-  for (float* p : CONCAT_FREE) CK(cudaFree(p));
+  CK(lfDeviceSynchronize());
+  for (float* p : CONCAT_FREE) CK(lfFree(p));
   CONCAT_FREE.clear(); ++MEM_GEN;
 }
 inline void buildConcat(const std::string& key);
@@ -1780,7 +1808,7 @@ concatIntoK(ConcatSpec<T> s, T* __restrict__ dst) {
     }
   }
 }
-inline std::set<half*> WH_POOL;
+inline LF_TLS std::set<half*> WH_POOL;
 inline const half* Wh(const std::string& k);
 inline std::string concatColumns(const std::string& key, int C, const std::vector<Part>& parts) {
   if (!CONCAT.count(key)) {
@@ -1892,7 +1920,7 @@ inline half* buildConcatHalf(const std::string& key) {
       if (!p.name.empty() && CONCAT.count(p.name)) {
         half* hp = const_cast<half*>(spec.src[i]);
         if (WH_POOL.erase(hp)) CK(cudaFreeAsync(hp, STREAM));
-        else CK(cudaFree(hp));
+        else CK(lfFree(hp));
         WH.erase(p.name);
       }
     }
@@ -1913,7 +1941,7 @@ inline half* buildConcatHalf(const std::string& key) {
       if (CONCAT.count(p.name)) {
         half* hp = const_cast<half*>(wp);
         if (WH_POOL.erase(hp)) CK(cudaFreeAsync(hp, STREAM));
-        else CK(cudaFree(hp));
+        else CK(lfFree(hp));
         WH.erase(p.name);
       }
     }
@@ -1922,14 +1950,14 @@ inline half* buildConcatHalf(const std::string& key) {
   WLEN[key] = (size_t)C * total;
   return WH[key] = d;
 }
-inline std::set<std::string> WH_MIRROR;     // the f16 views into a file's mirror (freed with it)
+inline LF_TLS std::set<std::string> WH_MIRROR;     // the f16 views into a file's mirror (freed with it)
 // a file's f16 copy, made once per GROUP - the first f16 read of any of its weights converts every
 // float tensor of that group in ONE launch (it was ~800 allocations and conversions, one a weight, in
 // the first fold); each tensor starts on 16 bytes, as its own allocation did, for the vector loads.
 // A group is a name's first '/'-separated part ("" without one): cuda/ef2's file holds the folding
 // bundle (f/) and ESM-C (c/), which reads only its f32 copy - mirroring it too was 1.2 GB never read
 inline std::string halfGroup(const std::string& k) { size_t at = k.find('/'); return at == std::string::npos ? "" : k.substr(0, at); }
-inline std::map<std::string, half*> WH_AT;
+inline LF_TLS std::map<std::string, half*> WH_AT;
 __global__ void __launch_bounds__(256, 8)
 convertTableK(const float* __restrict__ src, half* __restrict__ dst, const size_t* __restrict__ from,
               const size_t* __restrict__ to, const size_t* __restrict__ len) {
@@ -2018,12 +2046,12 @@ inline const __nv_bfloat16* Wbf(const std::string& k) {
   // bf16-pair trunk (every input past 80 tokens) reads each block's transition through this. Kept, a copy made from
   // a half-uploaded block was that block's for good - 1BRS through ESMFold2 at pLDDT 28.6 and 13.2 A where it is 94.1
   // and 0.58, and the 600M model's 5CAJ 90.7 -> 63.6, whenever the upload was slow (a cold page cache)
-  static std::map<std::string, __nv_bfloat16*> cache;
-  static std::set<__nv_bfloat16*> pooled;
-  static bool hooked = false;
+  static LF_TLS std::map<std::string, __nv_bfloat16*> cache;
+  static LF_TLS std::set<__nv_bfloat16*> pooled;
+  static LF_TLS bool hooked = false;
   if (!hooked) {
     FORGET_HOOKS.push_back([] {
-      for (auto& [n, p] : cache) { if (pooled.erase(p)) CK(cudaFreeAsync(p, STREAM)); else CK(cudaFree(p)); }
+      for (auto& [n, p] : cache) { if (pooled.erase(p)) CK(cudaFreeAsync(p, STREAM)); else CK(lfFree(p)); }
       cache.clear(); pooled.clear();
     });
     hooked = true;
@@ -2076,19 +2104,19 @@ inline size_t compactWeights(int seg, const std::function<bool(const std::string
 }
 inline void forgetDerivedWeights() {
   ++MEM_GEN;
-  CK(cudaDeviceSynchronize());
-  for (auto& [k, h] : WH) if (!WH_MIRROR.count(k)) { if (WH_POOL.erase(h)) CK(cudaFreeAsync(h, STREAM)); else CK(cudaFree(h)); }
+  CK(lfDeviceSynchronize());
+  for (auto& [k, h] : WH) if (!WH_MIRROR.count(k)) { if (WH_POOL.erase(h)) CK(cudaFreeAsync(h, STREAM)); else CK(lfFree(h)); }
   WH.clear(); WH_MIRROR.clear(); WH_AT.clear(); WH_POOL.clear();
-  for (auto& s : M.segs) { for (auto& [g, h] : s.halfMirrors) CK(cudaFree(h)); s.halfMirrors.clear(); }
+  for (auto& s : M.segs) { for (auto& [g, h] : s.halfMirrors) CK(lfFree(h)); s.halfMirrors.clear(); }
   for (auto it = WF.begin(); it != WF.end();) {
     if (M.has(it->first) && it->second == M.dev(it->first)) { ++it; continue; }
     if (CONCAT_POOL.erase(it->second)) CK(cudaFreeAsync(it->second, STREAM));
-    else CK(cudaFree(it->second));
+    else CK(lfFree(it->second));
     WLEN.erase(it->first); it = WF.erase(it);
   }
   for (auto& f : FORGET_HOOKS) f();
 }
-inline std::map<std::string, int*> IDEV;
+inline LF_TLS std::map<std::string, int*> IDEV;
 inline const int* Idev(const std::string& k) {
   auto it = IDEV.find(k);
   if (it != IDEV.end()) return it->second;
@@ -2099,7 +2127,7 @@ inline void forgetEntries(const std::vector<std::string>& names) {
   for (auto& k : names) {
     auto h = WH.find(k);
     if (h != WH.end()) {
-      if (!WH_MIRROR.erase(k)) { if (WH_POOL.erase(h->second)) CK(cudaFreeAsync(h->second, STREAM)); else cudaFree(h->second); }
+      if (!WH_MIRROR.erase(k)) { if (WH_POOL.erase(h->second)) CK(cudaFreeAsync(h->second, STREAM)); else lfFree(h->second); }
       WH.erase(h);
     }
     WF.erase(k); WLEN.erase(k); IDEV.erase(k); WH_AT.erase(k);
@@ -2146,7 +2174,7 @@ __device__ __forceinline__ float sigmH(float x) {
 
 // The fast path's remaining f32 GEMMs (the conditioning, the atom blocks' aggregation and
 // broadcast projections, ...) on the tensor cores in TF32 - a 10-bit mantissa, as f16 has
-inline bool F32_TF32 = false;
+inline LF_TLS bool F32_TF32 = false;
 // Row-major Y[rows x out] = X[rows x in] W + beta Y, W (in,out) or (out,in) if transposed.
 // X and W in T (W's f16 copy for half); Y in TY; f32 accumulation always.
 template <class T, class TY>
@@ -2163,9 +2191,9 @@ void linear(const T* X, TY* Y, size_t rows, int in, int out, const std::string& 
   bool tf32 = std::is_same_v<T, float> && F32_TF32;
   // LOCALFOLD_GEMM_TIMES: every call timed by events, summed by weight and shape, printed at exit (an
   // analysis aid; not under graph capture)
-  static bool timing = getenv("LOCALFOLD_GEMM_TIMES") != nullptr;
+  static LF_TLS bool timing = getenv("LOCALFOLD_GEMM_TIMES") != nullptr;
   struct Timed { std::string key; double flop; cudaEvent_t a, b; };
-  static std::vector<Timed>* timed = nullptr;
+  static LF_TLS std::vector<Timed>* timed = nullptr;
   cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
   if (timing) cudaStreamIsCapturing(STREAM, &cap);
   bool timeThis = timing && cap == cudaStreamCaptureStatusNone;
@@ -2265,7 +2293,7 @@ inline void bestRotation(const std::vector<double>& moving, const std::vector<do
 // intermediate result is a picture, and the fold never waits for one.
 struct AsyncTap {
   struct Slot { char* dev = nullptr; char* host = nullptr; size_t cap = 0; cudaEvent_t ready{}, copied{}; bool busy = false; };
-  struct Job { int slot; std::vector<size_t> offsets; std::function<void(const char*, const std::vector<size_t>&)> done; };
+  struct Job { int slot; std::vector<size_t> offsets; std::function<void(const char*, const std::vector<size_t>&)> done; FILE* log = nullptr; };
   std::vector<Slot> slots; cudaStream_t copy = nullptr;
   std::mutex mu; std::condition_variable cv; std::deque<Job> queue; bool stopping = false; int pending = 0;
   std::thread writer; int dropped = 0;
@@ -2278,11 +2306,11 @@ struct AsyncTap {
     }
     drain();
     for (auto& sl : slots) if (sl.cap < bytes) {
-      CK(cudaFree(sl.dev)); CK(cudaFreeHost(sl.host));
-      CK(devMalloc(&sl.dev, bytes)); CK(cudaMallocHost(&sl.host, bytes)); sl.cap = bytes;
+      CK(lfFree(sl.dev)); CK(lfFreeHost(sl.host));
+      CK(devMalloc(&sl.dev, bytes)); CK(lfMallocHost(&sl.host, bytes)); sl.cap = bytes;
     }
     while ((int)slots.size() < count) {
-      Slot sl; CK(devMalloc(&sl.dev, bytes)); CK(cudaMallocHost(&sl.host, bytes)); sl.cap = bytes;
+      Slot sl; CK(devMalloc(&sl.dev, bytes)); CK(lfMallocHost(&sl.host, bytes)); sl.cap = bytes;
       CK(cudaEventCreateWithFlags(&sl.ready, cudaEventDisableTiming)); CK(cudaEventCreateWithFlags(&sl.copied, cudaEventDisableTiming));
       slots.push_back(sl);
     }
@@ -2302,7 +2330,7 @@ struct AsyncTap {
     CK(cudaStreamWaitEvent(copy, sl.ready, 0));
     CK(cudaMemcpyAsync(sl.host, sl.dev, total, cudaMemcpyDeviceToHost, copy));
     CK(cudaEventRecord(sl.copied, copy));
-    { std::lock_guard<std::mutex> lock(mu); queue.push_back({k, offsets, std::move(done)}); }
+    { std::lock_guard<std::mutex> lock(mu); queue.push_back({k, offsets, std::move(done), lfio::log}); }   // (the offering thread's log)
     cv.notify_one();
     return true;
   }
@@ -2314,7 +2342,7 @@ struct AsyncTap {
     size_t held = 0; for (auto& sl : slots) held += sl.cap;
     if (held <= keep) return;
     for (auto& sl : slots) {
-      CK(cudaFree(sl.dev)); CK(cudaFreeHost(sl.host)); CK(cudaEventDestroy(sl.ready)); CK(cudaEventDestroy(sl.copied));
+      CK(lfFree(sl.dev)); CK(lfFreeHost(sl.host)); CK(cudaEventDestroy(sl.ready)); CK(cudaEventDestroy(sl.copied));
     }
     slots.clear();
   }
@@ -2330,13 +2358,15 @@ struct AsyncTap {
         if (queue.empty()) return; job = std::move(queue.front()); queue.pop_front(); }
       Slot& sl = slots[job.slot];
       CK(cudaEventSynchronize(sl.copied));                // (this thread waits; the fold does not)
+      lfio::log = job.log;                                 // (its lines in the job's log: --multi's threads each have one)
       job.done(sl.host, job.offsets);
+      lfio::log = nullptr;
       { std::lock_guard<std::mutex> lock(mu); sl.busy = false; --pending; }
       cv.notify_all();
     }
   }
 };
-inline AsyncTap& TAP() { static AsyncTap* tap = new AsyncTap(); return *tap; }   // (never destroyed: its thread lives with the process)
+inline AsyncTap& TAP() { static LF_TLS AsyncTap* tap = new AsyncTap(); return *tap; }   // (never destroyed: its thread lives with the process)
 // a probability or a distance as one byte a pair, on the device, before it is tapped: x / scale, clamped
 __global__ void quantiseK(const float* in, unsigned char* out, size_t n, float scale) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -2377,11 +2407,11 @@ inline void check(const char* label, const float* d, size_t n, const std::string
   auto h = download(d, n);
   printf("  %-24s relRMS %.3e\n", label, relRms(h.data(), M.f(oracle), n));
 }
-inline bool STAGES = false;
-inline std::map<std::string, double> STAGE_MS;
+inline LF_TLS bool STAGES = false;
+inline LF_TLS std::map<std::string, double> STAGE_MS;
 inline void (*STAGE_HOOK)(const char*) = nullptr;   // (DIAG: multigpu.cuh's fence waits by stage)
 inline void stage(const char* name) {
-  static auto last = std::chrono::steady_clock::now();
+  static LF_TLS auto last = std::chrono::steady_clock::now();
   // a launch that never ran (too much shared memory, a bad grid) reports nothing by itself: ask at
   // every stage boundary, which costs no synchronisation (IntelliFold-2's centre norm was silently
   // skipped this way)

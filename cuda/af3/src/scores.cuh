@@ -298,10 +298,10 @@ inline double fractionDisordered(const std::vector<ScoreAtom>& atoms, const std:
 // the input's atoms and chains, built once a fold rather than once a sample: they are the input's, not the
 // coordinates', and reading them re-parsed template.pdb (af3.cu bumps the generation at each fold - a serve
 // job's input directory is reused with new contents)
-inline int SCORE_ATOMS_GEN = 0;
+inline LF_TLS int SCORE_ATOMS_GEN = 0;
 struct FoldAtoms { std::vector<ScoreAtom> atoms; std::vector<ScoreChain> chains; };
 inline const FoldAtoms& foldAtoms() {
-  static FoldAtoms cached; static int gen = -1; static std::string dir;
+  static LF_TLS FoldAtoms cached; static LF_TLS int gen = -1; static LF_TLS std::string dir;
   if (gen != SCORE_ATOMS_GEN || dir != DATA_DIR) {
     cached.atoms = scoreAtoms(DATA_DIR); cached.chains = scoreChains(cached.atoms); gen = SCORE_ATOMS_GEN; dir = DATA_DIR;
   }

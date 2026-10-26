@@ -159,7 +159,7 @@ __global__ void expectationK(const float* logits, float* out, const float* mask,
   if (out2) out2[r] = weighted2 / total * scale;
 }
 
-inline bool CONF_HALF = false;   // the head's four pairformer blocks in f16
+inline LF_TLS bool CONF_HALF = false;   // the head's four pairformer blocks in f16
 // rf3's parameter-free LayerNorm over a WHOLE tensor, real rows only (mask per row), the mean
 // and variance over `vendorWidth` columns (wider than C: the extra ones zero, each adding mean^2).
 // Deterministic: per-block partials, then one block sums them in order.
@@ -478,7 +478,7 @@ __global__ void addInPlaceK(float* a, const float* b, size_t n) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; if (i < n) a[i] += b[i];
 }
 inline void foldDualOutputs() {
-  static bool done = false;
+  static LF_TLS bool done = false;
   if (done) return;
   done = true;
   bool any = false;

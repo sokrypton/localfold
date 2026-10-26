@@ -318,13 +318,13 @@ inline void outLn256(const TI* O, const TI* W, const float* bias, M* msa,
     outLn16K<M, TO, TI, VG><<<(unsigned)((rows + 15) / 16), 128, smem16, STREAM>>>(O, W, bias, msa, lnS, lnO, xn, rows);
     return;
   }
-  static bool attr = false;
+  static LF_TLS bool attr = false;
   if (!attr) { smemAttr((outLnK<M, TO, TI, VG>), (int)oln::SMEM); attr = true; }
   outLnK<M, TO, TI, VG><<<(unsigned)((rows + oln::R - 1) / oln::R), oln::NTH, oln::SMEM, STREAM>>>(O, W, bias, msa, lnS, lnO, xn, rows);
 }
 // the LN'd rows a projection emitted for the next module: that module's LN prefix, its block, the MSA it normalised
 struct EmittedLn { std::string ln; int blk = -1; const void* msa = nullptr; void* xn = nullptr; size_t rows = 0; };
-inline EmittedLn EMITTED_LN;
+inline LF_TLS EmittedLn EMITTED_LN;
 // the next module's: its rows if they were emitted for exactly this LN of exactly this MSA, else null (and forgotten)
 inline void* takeEmittedLn(const std::string& ln, int blk, const void* msa, size_t rows) {
   EmittedLn e = EMITTED_LN; EMITTED_LN = EmittedLn{};

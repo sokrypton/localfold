@@ -180,7 +180,7 @@ __global__ void multistepK(float* x, const float* noisy, const float* denoised, 
 }
 // --sigma-max=X: where the diffusion schedule starts, in sigma_data units (AF3's own is 160); 0 is the model's
 // own. A probe's knob - the page's short schedule that used it is gone (docs/AF3.md, "The default sampler").
-inline double SAMPLER_SIGMA_MAX = 0;
+inline LF_TLS double SAMPLER_SIGMA_MAX = 0;
 // what a sampler step's prediction is handed to (FrameStreamer, below): the denoised positions on the device
 // and the step, called on the host between steps - it must not wait on the GPU
 inline std::function<void(const float*, int, int)> FRAME_HOOK;
@@ -221,7 +221,7 @@ __global__ void expHeun2K(float* x, const float* noisy, const float* d1, const f
 // the same bond geometry on protein, glycerol, ATP, a phosphoserine and DNA - for half the diffusion
 // (5CAJ, 5 x 200: 1805 -> 917 ms) - and at equal calls one-call 50 beats two-call 25 (backbone bonds 0.042
 // against 0.054 A). --chai-second-order is chai-lab's sampler as written.
-inline bool CHAI_SECOND_ORDER = false;
+inline LF_TLS bool CHAI_SECOND_ORDER = false;
 // 🔴 AND ITS DEFAULT STEP IS THE EXPONENTIAL ONE (2026-10-17): x' = r^S noisy + (1 - r^S) D, r = sigma / tHat, S = 2 - its
 // one-call step above is Euler at that scale (x = noisy + 2 dt g1) - on its own schedule. Measured with the AF3 lineage's
 // decision run (seven systems x two seeds of bonds, six crystal targets x three seeds) at the page's 25 steps: mainchain
@@ -491,7 +491,7 @@ inline std::vector<float> sample(int steps, const std::vector<uint64_t>& seeds, 
 
 // The PDB: through the exporter's template.pdb when there is one (the page's own records, the
 // slot in the x column), else one residue per token named here. `bfactors` per atom slot.
-inline std::string DATA_DIR;
+inline LF_TLS std::string DATA_DIR;
 // how far a template record's slot (its x column) runs past the column's 8 characters: past 99,999 - 4,167 tokens at
 // 24 slots a token - the slot is wider and pushes the rest of the record right, so its tail is read that far along
 inline size_t templateSpill(const std::string& line) {

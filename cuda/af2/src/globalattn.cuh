@@ -355,7 +355,7 @@ inline void lnQkvg64(const float* x, const float* lnS, const float* lnO, const h
                      size_t q0, size_t rows) {
   constexpr int C = 64, NQ = 256, WARPS = 8, NC = 64, R = 16 * WARPS;
   const size_t smem = (size_t)R * (C + 8) * 2 + (size_t)2 * C * (NC + 8) * 2 + (size_t)C * 24 * 2;
-  static bool attr = false;
+  static LF_TLS bool attr = false;
   if (!attr) { smemAttr((gridInK<C, NQ, WARPS, float, NC>), (int)smem); attr = true; }
   gridInK<C, NQ, WARPS, float, NC><<<(unsigned)((rows + R - 1) / R), 32 * WARPS, smem, STREAM>>>(
       x, lnS, lnO, W, out, 1, q0, rows, false, nullptr, nullptr, 0, 0, false, qb);
