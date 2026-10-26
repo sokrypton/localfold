@@ -856,28 +856,23 @@ function conditionsFor(js) {
     ["coord", { C_CRD: { true: [{ select: all }] } }],
     ["coord-off", { C_CRD: { true: [{ select: all }], false: [{ select: few }] } }],
     ["seq", { C_SEQ: { true: [{ select: all }] } }],
-    ["seq-name", { C_SEQ: { ALA: [{ select: few }] } }],
     ["hotspot", { C_HOT: { true: [{ select: few }] } }],
     ["crdgrp", { C_CRD: { true: [{ select: all }] }, C_CRDGRP: { 2: [{ select: few }] } }],
     ["secondary", { C_SEC: { HELIX: [{ select: few }] } }],
     ["cath", { C_CATH: { "3.40.50": [{ select: all }] } }],
     // 🔴 THE `centroid` DTYPE, WHICH NOTHING HERE HAD EVER WRITTEN. gcov says its whole branch
     // was uncovered: it is the only condition whose VALUE is three numbers rather than a flag
-    // or a name, so it is the only one where `splitTopLevel` runs over the value and a short
-    // list has to pad. A FOUR-component value is in the corpus because both sides ignore the
-    // extra one;
-    // a value with fewer than three is REFUSED by this port and lives in gate.py's refusals
-    // arm, because the reference stores a two-element entry in a column everything downstream
-    // reads as a point and says nothing.
+    // or a name. Exactly three, as upstream's `parse_centroid_value` requires - any other count
+    // is refused on both sides now, and those live in gate.py's refusals arm.
     ["centroid", { C_CENTROID: { "1.5,-2.25,3.75": [{ select: all }] } }],
-    ["centroid-long", { C_CENTROID: { "1,2,3,4": [{ select: few }] } }],
-    // 🔴 AND THE CATH RULE IS NOT "PAD TO FOUR LEVELS", WHICH IS WHAT ONE CODE SUGGESTS. The
-    // reference appends `.x` to anything not already ending in `.x`, so a COMPLETE four-level
-    // code gains a fifth field: `3.40.50.20` is stored as `3.40.50.20.x`. Surprising, the
-    // reference's own, and untestable on the three-level code alone.
-    ["cath-4", { C_CATH: { "3.40.50.20": [{ select: all }] } }],
+    // 🔴 AND EVERY C.A.T LABEL SHAPE UPSTREAM TAKES (`set_cath_condition`): a topology, a
+    // topology with its fourth `.x`, an architecture, a class, and the cleared label. A
+    // four-level code and a bare class are REFUSED upstream, and now here - they used to be
+    // stored as `3.40.50.20.x` and `3.x`, labels nothing maps.
     ["cath-x", { C_CATH: { "3.40.50.x": [{ select: all }] } }],
-    ["cath-1", { C_CATH: { 3: [{ select: few }] } }],
+    ["cath-arch", { C_CATH: { "3.40.x": [{ select: all }] } }],
+    ["cath-class", { C_CATH: { "3.x.x": [{ select: few }] } }],
+    ["cath-clear", { C_CATH: { "x.x.x": [{ select: few }] } }],
     ["unindexed", { C_IDX: { false: [{ select: few, group: "m1" }] } }],
     ["two-groups", { C_IDX: { false: [
       { select: `sel('${cid}/*/[${ids[1]}]/*')`, group: "m1" },

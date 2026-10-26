@@ -206,89 +206,69 @@ export function getCondTensor(batch, condObj) {
   return undefined;
 }
 
+// 🔴 THE CATH LABEL -> EMBEDDING-ROW MAPPING IS UPSTREAM'S, GENERATED, NOT A HAND-PICKED LIST.
+// These were 5 classes, 32 architectures and 12 topologies typed in as "common presets", and 26
+// of the 32 architecture rows and all 12 topology rows disagreed with the pickle the checkpoint
+// was trained with - `3.40.50` went in as topology 890 where the model reads 1056. The model
+// embeds whatever index it is handed, so every CATH condition the page ever applied was a
+// DIFFERENT fold label. See tools/gen-rfd4p-cath-mapping.py.
+export { CATH_CLASS_MAP, CATH_ARCHITECTURE_MAP, CATH_TOPOLOGY_MAP } from './cath-mapping.js';
+import {
+  CATH_CLASS_MAP as CATH_CLASS_MAP_,
+  CATH_ARCHITECTURE_MAP as CATH_ARCHITECTURE_MAP_,
+  CATH_TOPOLOGY_MAP as CATH_TOPOLOGY_MAP_,
+} from './cath-mapping.js';
+
 /**
- * Common CATH C/A/T index presets matching the checkpoint's
- * `embedding_C` (6), `embedding_A` (44), `embedding_T` (1473) tables.
- * Remember `FoldEmbeddingSeqFeat` adds +1 to stored indices (where -1 is null -> index 0).
+ * A CATH label's code at one level, as upstream's `extract_cath_code_by_level` cuts it: a
+ * right-split, so a stored `C.A.T.x` gives `C.A.T`, `C.A` and `C`.
  */
-export const CATH_CLASS_MAP = Object.freeze({
-  "1": 0, // Mainly Alpha
-  "2": 1, // Mainly Beta
-  "3": 2, // Alpha Beta
-  "4": 3, // Few Secondary Structures
-  "6": 4, // Special
-});
+function cathCodeByLevel(code, level) {
+  const k = { H: 0, T: 1, A: 2, C: 3 }[level];
+  const parts = String(code).split('.');
+  const cut = Math.min(k, parts.length - 1);
+  return parts.slice(0, parts.length - cut).join('.');
+}
 
-export const CATH_ARCHITECTURE_MAP = Object.freeze({
-  "1.10": 0, // Orthogonal Bundle
-  "1.20": 1, // Up-down Bundle
-  "1.25": 2, // Alpha Horseshoe
-  "1.40": 3, // Alpha solenoid
-  "1.50": 4, // Alpha/alpha barrel
-  "2.10": 5, // Ribbon
-  "2.20": 6, // Single Sheet
-  "2.30": 7, // Roll
-  "2.40": 8, // Beta Barrel
-  "2.60": 9, // Sandwich (Immunoglobulin-like)
-  "2.70": 10, // Distorted Sandwich
-  "2.80": 11, // Trefoil
-  "2.100": 12, // Aligned Prism
-  "2.110": 13, // 4-Bladed Beta-Propeller
-  "2.115": 14, // 5-Bladed Beta-Propeller
-  "2.120": 15, // 6-Bladed Beta-Propeller
-  "2.130": 16, // 7-Bladed Beta-Propeller
-  "2.140": 17, // 8-Bladed Beta-Propeller
-  "2.160": 18, // 3 Solenoid
-  "2.170": 19, // Beta Complex
-  "3.10": 20, // Roll (Alpha-Beta)
-  "3.20": 21, // Alpha-Beta Barrel (TIM Barrel)
-  "3.30": 22, // 2-Layer Sandwich
-  "3.40": 23, // 3-Layer (aba) Sandwich (Rossmann)
-  "3.50": 24, // 3-Layer (bba) Sandwich
-  "3.55": 25, // 3-Layer (bab) Sandwich
-  "3.60": 26, // 4-Layer Sandwich
-  "3.65": 27, // Alpha-beta prism
-  "3.70": 28, // Box
-  "3.75": 29, // 5-stranded Propeller
-  "3.80": 30, // Alpha-Beta Horseshoe
-  "3.90": 31, // Alpha-Beta Complex
-});
-
-export const CATH_TOPOLOGY_MAP = Object.freeze({
-  "1.10.8": 12,
-  "1.10.10": 15,
-  "1.20.5": 88,
-  "1.20.120": 110, // Four-helix up-down bundle
-  "1.25.40": 142, // TPR-like repeat
-  "2.40.50": 295, // OB-fold beta barrel
-  "2.40.128": 325, // Lipocalin / GFP beta barrel
-  "2.60.40": 395, // Immunoglobulin-like beta-sandwich
-  "2.130.10": 480, // 7-bladed beta-propeller
-  "3.20.20": 620, // TIM barrel
-  "3.30.70": 710, // Ferredoxin-like 2-layer sandwich
-  "3.40.50": 890, // Rossmann fold
-});
+/**
+ * The C.A.T labels a job may name (`set_cath_condition`): `x.x.x`, `C.x.x`, `C.A.x` and `C.A.T`
+ * from the model's own vocabulary. A fourth `.x` level is accepted and dropped.
+ */
+export function normalizeCatLabel(value) {
+  if (typeof value !== 'string') {
+    throw new Error("CAT must be a quoted C.A.T label, e.g. '1.x.x' or '2.60.40'; only C/A/T are supported.");
+  }
+  let label = value;
+  if (label.split('.').length === 4 && label.endsWith('.x')) label = label.slice(0, -2);
+  const parts = label.split('.');
+  const valid = label === 'x.x.x'
+    || (parts.length === 3 && parts[1] === 'x' && parts[2] === 'x' && parts[0] in CATH_CLASS_MAP_)
+    || (parts.length === 3 && parts[2] === 'x' && `${parts[0]}.${parts[1]}` in CATH_ARCHITECTURE_MAP_)
+    || (parts.length === 3 && label in CATH_TOPOLOGY_MAP_);
+  if (!valid) {
+    throw new Error(
+      `Unknown CAT label '${value}'; choose a C/A/T label from the model vocabulary, or 'x.x.x' to clear.`
+    );
+  }
+  return `${label}.x`;
+}
 
 /**
  * Parse a CATH string (e.g. `"2.60.40"`, `"1.20"`, `"1"`, or `"x.x.x.x"`) into `[c, a, t]`
  * integer indices where `-1` denotes unconditioned.
  */
 export function parseCathCode(codeStr) {
-  if (!codeStr || codeStr === "x.x.x.x" || codeStr === "null") {
-    return [-1, -1, -1];
-  }
   if (Array.isArray(codeStr) && codeStr.length === 3) {
     return [Number(codeStr[0]), Number(codeStr[1]), Number(codeStr[2])];
   }
-  const parts = String(codeStr).trim().split(".");
-  const cKey = parts[0] && parts[0] !== "x" ? parts[0] : null;
-  const aKey = cKey && parts[1] && parts[1] !== "x" ? `${cKey}.${parts[1]}` : null;
-  const tKey = aKey && parts[2] && parts[2] !== "x" ? `${aKey}.${parts[2]}` : null;
-
-  const cIdx = cKey ? (CATH_CLASS_MAP[cKey] ?? -1) : -1;
-  const aIdx = aKey ? (CATH_ARCHITECTURE_MAP[aKey] ?? -1) : -1;
-  const tIdx = tKey ? (CATH_TOPOLOGY_MAP[tKey] ?? -1) : -1;
-  return [cIdx, aIdx, tIdx];
+  // Upstream's own conversion (`datapipes/pipeline.py`): each level cut by
+  // `extract_cath_code_by_level` and looked up, -1 where the map has no such code.
+  const code = codeStr === null || codeStr === undefined ? 'x.x.x.x' : String(codeStr);
+  return [
+    CATH_CLASS_MAP_[cathCodeByLevel(code, 'C')] ?? -1,
+    CATH_ARCHITECTURE_MAP_[cathCodeByLevel(code, 'A')] ?? -1,
+    CATH_TOPOLOGY_MAP_[cathCodeByLevel(code, 'T')] ?? -1,
+  ];
 }
 
 function matchFieldSpec(value, specStr, isNumeric = false) {

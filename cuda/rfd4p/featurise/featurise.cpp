@@ -766,6 +766,20 @@ using PipelineRng = atoms::PipelineRng;
  * always carries the atomic number; `element` carries -1 wherever the residue is masked, so the
  * model is not handed the composition of a residue it is being asked to design.
  */
+
+// `extract_cath_code_by_level`: `code.rsplit(".", cut)[0]`.
+inline string cathLevel(const string& code, int cut) {
+  vector<size_t> dots;
+  for (size_t k = 0; k < code.size(); ++k) if (code[k] == '.') dots.push_back(k);
+  if (cut <= 0 || dots.empty()) return code;
+  const size_t take = std::min((size_t)cut, dots.size());
+  return code.substr(0, dots[dots.size() - take]);
+}
+inline int cathAt(const std::unordered_map<string, int>& m, const string& key) {
+  const auto it = m.find(key);
+  return it == m.end() ? -1 : it->second;
+}
+
 /**
  * `runValidationPipeline`: the fourteen stages in the reference's own order, then the batch.
  *
@@ -963,26 +977,15 @@ inline Batch buildStructureBatch(atoms::AtomArray& a, const atoms::Centroid& cen
     b.secondaryStructure[t] = cSec ? (*cSec)[i] : 0;
     b.indexGroup[t] = (*cGrp)[i];
     if (cCath) {
-      // `parseCathCode`: the LONGEST progressive key the maps can spell wins, and a part
-      // that is `x` stops the walk - so `3.x.50` is the class alone, not the class and the
-      // topology. `CATH_CODES` already holds each key's whole triple.
+      // Upstream's conversion (`datapipes/pipeline.py`, shared/rfd4p/conditions.js
+      // `parseCathCode`): each level cut by `extract_cath_code_by_level` - a right-split, so a
+      // stored `C.A.T.x` gives `C.A.T`, `C.A` and `C` - and looked up on its own, -1 where the
+      // map has no such code.
       const string& code = (*cCath)[i];
-      if (!code.empty() && code != "x.x.x.x" && code != "null") {
-        string key;
-        size_t pos = 0;
-        for (int part = 0; part < 3; ++part) {
-          const size_t dot = code.find('.', pos);
-          const string piece = code.substr(pos, dot == string::npos ? string::npos : dot - pos);
-          if (piece.empty() || piece == "x") break;
-          const string next = key.empty() ? piece : key + "." + piece;
-          auto hit = tables::CATH_CODES.find(next);
-          if (hit == tables::CATH_CODES.end()) break;
-          key = next;
-          for (int k = 0; k < 3; ++k) b.cathLabel[(size_t)t * 3 + k] = hit->second[k];
-          if (dot == string::npos) break;
-          pos = dot + 1;
-        }
-      }
+      const int idx[3] = {cathAt(tables::CATH_C, cathLevel(code, 3)),
+                          cathAt(tables::CATH_A, cathLevel(code, 2)),
+                          cathAt(tables::CATH_T, cathLevel(code, 1))};
+      for (int k = 0; k < 3; ++k) b.cathLabel[(size_t)t * 3 + k] = idx[k];
     }
     if (cCen) {
       for (int k = 0; k < 3; ++k) b.chainCentroid[(size_t)t * 3 + k] = (float)(*cCen)[i * 3 + k];
@@ -1358,6 +1361,7 @@ int run(int argc, char** argv) {
             if (sels.isArray()) {
               for (const Json& e : sels.a) {
                 rfd4p::conditions::Entry entry;
+                entry.keys = e.isObject() ? e.o.size() : 0;
                 const Json* sel = e.get("select");
                 if (sel && sel->isString()) entry.select = sel->s;
                 const Json* grp = e.get("group");
@@ -1862,6 +1866,7 @@ int run(int argc, char** argv) {
           if (sels.isArray()) {
             for (const Json& e : sels.a) {
               rfd4p::conditions::Entry entry;
+              entry.keys = e.isObject() ? e.o.size() : 0;
               const Json* sel = e.get("select");
               if (sel && sel->isString()) entry.select = sel->s;
               const Json* grp = e.get("group");

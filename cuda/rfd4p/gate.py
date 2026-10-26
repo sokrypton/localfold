@@ -580,7 +580,32 @@ def main() -> int:
                 # be refused - the exact trap the comment above the featurise arm describes,
                 # walked into while writing that comment.
                 ('{"input":"web/examples/ppi_pdl1.cif.zst","specMode":true,"conditions":'
-                 '{"C_CENTROID":{"1.5,-2.25":[{"select":"sel(\'B/*/*/*\')"}]}}}', "not three"),
+                 '{"C_CENTROID":{"1.5,-2.25":[{"select":"sel(\'B/*/*/*\')"}]}}}', "exactly 3 components"),
+                # 🔴 AND UPSTREAM'S OWN CONTIG CHECKS (`contig_spec.py`), which neither port had:
+                # each of these built a structure its author did not write, without a word.
+                ('{"input":"web/examples/ppi_pdl1.cif.zst","contig":"B2-10,B5-20"}', "overlap"),
+                ('{"input":"web/examples/ppi_pdl1.cif.zst","contig":"B2-400"}', "runs outside chain"),
+                ('{"contig":"a:5-5,a:6-6"}', "Duplicate expandable-segment name"),
+                ('{"input":"web/examples/ppi_pdl1.cif.zst","contig":"50-50"}', "no preserved segments"),
+                ('{"input":"web/examples/ppi_pdl1.cif.zst","contig":"B2-40,5-5D"}', "disagrees"),
+                # 🔴 AND UPSTREAM'S VALUE CHECKS (`condition_spec._apply_conditions`): each was a
+                # value this took and turned into something else.
+                ('{"input":"web/examples/ppi_pdl1.cif.zst","contig":"B2-40","conditions":'
+                 '{"C_SEQ":{"ALA":[{"select":"sel(\'B\')"}]}}}', "expected a boolean"),
+                ('{"input":"web/examples/ppi_pdl1.cif.zst","contig":"B2-40","conditions":'
+                 '{"C_CENTROID":{"1,2,3,4":[{"select":"sel(\'B\')"}]}}}', "exactly 3 components"),
+                ('{"input":"web/examples/ppi_pdl1.cif.zst","contig":"B2-40","conditions":'
+                 '{"C_CATH":{"3.40.50.20":[{"select":"sel(\'B\')"}]}}}', "Unknown CAT label"),
+                ('{"input":"web/examples/ppi_pdl1.cif.zst","contig":"B2-40","conditions":'
+                 '{"C_INTCRD":{"true":[{"select":"sel(\'B\')"}]}}}', "saved payload"),
+                ('{"input":"web/examples/ppi_pdl1.cif.zst","contig":"B2-40","conditions":'
+                 '{"C_CRDGRP":{"0":[{"select":"sel(\'B\')"}]}}}', "integer ID from 1"),
+                ('{"input":"web/examples/ppi_pdl1.cif.zst","contig":"B2-40","conditions":'
+                 '{"C_HOT":{"true":[{"select":"sel(\'B\')","group":"g"}]}}}', "only meaningful for C_IDX"),
+                ('{"input":"web/examples/ppi_pdl1.cif.zst","contig":"B2-40","conditions":'
+                 '{"C_SEC":{"7":[{"select":"sel(\'B\')"}]}}}', "Invalid enum value"),
+                ('{"input":"web/examples/ppi_pdl1.cif.zst","contig":"B2-40","conditions":'
+                 '{"C_BP":{"PAIR":[{"select":"sel(\'B\')"}]}}}', "2-body condition"),
             ]
             bad_refusals = []
             probe = HERE / "featurise" / "gate-refusal.json"

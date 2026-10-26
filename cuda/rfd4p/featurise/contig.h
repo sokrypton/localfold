@@ -437,6 +437,47 @@ inline Applied applyContig(const atoms::AtomArray& in, const string& contigStr) 
     fprintf(stderr, "Contig string produced no chain runs.\n");
     exit(1);
   }
+  // 🔴 UPSTREAM'S CHECKS, IN UPSTREAM'S WORDS (`contig_spec.py`; spec.js `applyContig` has the
+  // same): a duplicated segment name, overlapping preserved segments, a range past its chain, a
+  // suffix disagreeing with its anchor, and an input with nothing to preserve.
+  {
+    std::map<string, int> seenNames;
+    std::set<string> dupes;
+    for (const Token& t : tokens) {
+      if (t.kind == Token::EXPANDABLE && !t.name.empty() && seenNames[t.name]++) dupes.insert(t.name);
+    }
+    if (!dupes.empty()) {
+      string list;
+      for (const string& d : dupes) list += (list.empty() ? "" : ",") + ("\"" + d + "\"");
+      fprintf(stderr, "Duplicate expandable-segment name(s) in contig: [%s]\n", list.c_str());
+      exit(1);
+    }
+    std::map<string, vector<const Token*>> byChain;
+    for (const auto& run : nonEmpty) {
+      for (const Token& t : run) if (t.kind == Token::PRESERVED) byChain[t.chainId].push_back(&t);
+    }
+    for (auto& [chainId, segs] : byChain) {
+      std::stable_sort(segs.begin(), segs.end(),
+                       [](const Token* a, const Token* b) { return a->start < b->start; });
+      for (size_t k = 1; k < segs.size(); ++k) {
+        if (segs[k]->start <= segs[k - 1]->end) {
+          fprintf(stderr, "Preserved segments on chain '%s' overlap: %s%d-%d and %s%d-%d both "
+                          "reference some of the same residues.\n", chainId.c_str(),
+                  chainId.c_str(), segs[k - 1]->start, segs[k - 1]->end, chainId.c_str(),
+                  segs[k]->start, segs[k]->end);
+          exit(1);
+        }
+      }
+    }
+    // Upstream requires an input; with none this port realises the contig into an empty
+    // structure, so only an input with nothing preserved is refused.
+    if (in.n() > 0 && byChain.empty()) {
+      fprintf(stderr, "Contig has no preserved segments -- condition_spec's `input` structure "
+                      "exists only to be referenced by preserved segments, so a contig that "
+                      "generates everything from scratch doesn't need an `input` file at all.\n");
+      exit(1);
+    }
+  }
 
   std::set<string> claimed;
   for (const auto& run : nonEmpty) {
@@ -506,6 +547,18 @@ inline Applied applyContig(const atoms::AtomArray& in, const string& contigStr) 
                 tok.start, tok.end);
         exit(1);
       }
+      int chainMin = INT32_MAX, chainMax = INT32_MIN;
+      for (size_t i = 0; i < in.n(); ++i) {
+        if (in.site.chainId[i] != tok.chainId) continue;
+        chainMin = std::min(chainMin, in.site.resId[i]);
+        chainMax = std::max(chainMax, in.site.resId[i]);
+      }
+      if (tok.start < chainMin || tok.end > chainMax) {
+        fprintf(stderr, "Preserved segment '%s%d-%d' runs outside chain %s, whose residues are "
+                        "%d-%d.\n", tok.chainId.c_str(), tok.start, tok.end, tok.chainId.c_str(),
+                chainMin, chainMax);
+        exit(1);
+      }
       atoms::AtomArray segment = atoms::slice(in, selected);
       const vector<int> rb = cif::residueSegments(segment.site);
       for (size_t r = 0; r + 1 < rb.size(); ++r) {
@@ -525,9 +578,18 @@ inline Applied applyContig(const atoms::AtomArray& in, const string& contigStr) 
     int anchor = -1;
     for (const Token& t : run.tokens) {
       if (t.kind != Token::PRESERVED) continue;
+      std::set<int> types;
       for (size_t i = 0; i < in.n(); ++i) {
-        if (in.site.chainId[i] == t.chainId) { anchor = in.site.chainType[i]; break; }
+        if (in.site.chainId[i] == t.chainId) types.insert(in.site.chainType[i]);
       }
+      if (types.size() > 1) {
+        fprintf(stderr, "Input chain '%s' contains multiple ChainTypes -- a contig run anchored on "
+                        "this chain can't unambiguously default an unsuffixed expandable segment's "
+                        "type. Split this chain into separately-named chains upstream.\n",
+                t.chainId.c_str());
+        exit(1);
+      }
+      if (types.size() == 1) anchor = *types.begin();
       break;
     }
     std::set<int> requested;
@@ -539,7 +601,13 @@ inline Applied applyContig(const atoms::AtomArray& in, const string& contigStr) 
       exit(1);
     }
     if (requested.empty()) return anchor >= 0 ? anchor : (int)tables::CT_POLYPEPTIDE_L;
-    return *requested.begin();
+    const int chainType = *requested.begin();
+    if (anchor >= 0 && chainType != anchor) {
+      fprintf(stderr, "An expandable segment explicitly specifies chain type %d, which disagrees "
+                      "with its run's anchor chain type %d.\n", chainType, anchor);
+      exit(1);
+    }
+    return chainType;
   };
 
   bool haveAssembled = false;

@@ -166,6 +166,8 @@ export const SCALAR_1BODY_ANNOTATIONS = {
   // inputs carry and the model reads as `na_ss_state` - and which this table did not list, so the
   // reader never kept it and the batch wrote zeros whatever the file said.
   'condition_na-ss-state_1_residue': { type: 'int', default: 0 },
+  'condition_n-terminus_1_residue': { type: 'bool', default: false },
+  'condition_c-terminus_1_residue': { type: 'bool', default: false },
   // 🔴 AND THE BASE PAIRS, a TWO-body annotation (`_condition_basepair_2_residue`, an atom pair
   // a row), carried as two per-atom columns so that every slice, concatenation and insertion
   // keeps them without learning about pairs: each atom's index in the file it was read from, and

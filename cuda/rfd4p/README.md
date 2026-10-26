@@ -514,6 +514,25 @@ pinned checkpoint revision) found, and this round fixed:
   in both formats.
 - `C_SEC: {SHEET: ...}` - upstream's spelling (`SSEnum`: NONE, HELIX, SHEET, LOOP) - was refused;
   this said STRAND, which stays as an alias.
+- 🔴 **Every CATH condition went into the wrong embedding rows.** The label -> index tables were a
+  hand-written subset (5 classes, 32 architectures, 12 topologies) and 26 of the 32 architecture
+  rows and all 12 topology rows disagreed with `data/cath_label_mapping.pkl`, which the checkpoint
+  was trained with: the fold-conditioned preset's `3.40.50` was [2, 23, 890] where the model reads
+  [2, 31, 1056]. The whole mapping (5 / 43 / 1472) is generated from the pickle now
+  (`tools/gen-rfd4p-cath-mapping.py`, BSD-3, with upstream's notice), converted level by level as
+  upstream's `extract_cath_code_by_level` cuts it, and a label must be one upstream's
+  `set_cath_condition` takes - so the "pad to four levels" note below, which recorded the page
+  turning `3.40.50.20` into a five-field code, describes a label that is refused now.
+- 🔴 **A job was a structure by default**: `{input, contig, conditions}` with no `specMode` kept
+  the file's annotations and IGNORED its contig and conditions. Upstream applies them; so do both
+  ports now, and "the structure is the job" is written `{input, input_as_annotated_cif: true}`.
+- **Upstream's input checks, in its words, on both sides**: a duplicated segment name, overlapping
+  preserved segments, a range past its chain, a suffix disagreeing with its anchor, an input with
+  nothing preserved; a non-boolean sequence condition (this took `C_SEQ: {ALA: ...}`), a centroid
+  of other than three numbers, a CATH label outside the vocabulary, a direct `C_INTCRD`, a
+  coordinate group outside 1..32767, a `group:` anywhere but `C_IDX: false`, an enum integer that
+  is no member, a two-body condition. `C_NTR`/`C_CTR` and the `mask_*` aliases are recognised; the
+  pipeline's own annotations (`SA_CWI`, `S_ATM`, ...) are refused by name rather than written.
 
 ## What is not done
 

@@ -6,6 +6,7 @@
  * `rfproteina.utils.mask_spec`, and `atomworks.io.utils.query`.
  */
 
+import { normalizeCatLabel } from '../conditions.js';
 import {
   BOND_TYPE,
   CHAIN_TYPE,
@@ -41,6 +42,9 @@ export const CONDITION_ENUMS = {
   SSEnum: { NONE: 0, HELIX: 1, SHEET: 2, STRAND: 2, LOOP: 3 },
   BasePairEnum: { UNSPECIFIED: 0, PAIR: 1, LOOP: 2 },
 };
+
+// `CoordinateGroup.MAX_GROUP_ID`: model batches store group ids as int16.
+const CRDGRP_MAX_GROUP_ID = 32767;
 
 // Registry of 1-body conditions and standard annotations
 export const CONDITION_REGISTRY = {
@@ -115,6 +119,30 @@ export const CONDITION_REGISTRY = {
   C_NA_SS_STATE: { fullName: 'condition_na-ss-state_1_residue', dtype: 'enum', enum: CONDITION_ENUMS.BasePairEnum, default: 0 },
   'na-ss-state': { fullName: 'condition_na-ss-state_1_residue', dtype: 'enum', enum: CONDITION_ENUMS.BasePairEnum, default: 0 },
   'condition_na-ss-state_1_residue': { fullName: 'condition_na-ss-state_1_residue', dtype: 'enum', enum: CONDITION_ENUMS.BasePairEnum, default: 0 },
+
+  // 🔴 NAMES UPSTREAM RESOLVES THAT THIS DID NOT: the chain-end flags, the legacy `mask_*`
+  // aliases of three boolean conditions, the base pairs (TWO-body, which a condition spec cannot
+  // set - refused in upstream's words), and the pipeline's own annotations, which are refused
+  // by name rather than written, since nothing here reads them back as a condition.
+  C_NTR: { fullName: 'condition_n-terminus_1_residue', dtype: 'bool', default: false },
+  'n-terminus': { fullName: 'condition_n-terminus_1_residue', dtype: 'bool', default: false },
+  'condition_n-terminus_1_residue': { fullName: 'condition_n-terminus_1_residue', dtype: 'bool', default: false },
+  C_CTR: { fullName: 'condition_c-terminus_1_residue', dtype: 'bool', default: false },
+  'c-terminus': { fullName: 'condition_c-terminus_1_residue', dtype: 'bool', default: false },
+  'condition_c-terminus_1_residue': { fullName: 'condition_c-terminus_1_residue', dtype: 'bool', default: false },
+  mask_hotspot_1_atom: { fullName: 'condition_hotspot_1_atom', dtype: 'bool', default: false },
+  mask_pistack_1_atom: { fullName: 'condition_pistack_1_atom', dtype: 'bool', default: false },
+  mask_hydrophobic_1_atom: { fullName: 'condition_hydrophobic_1_atom', dtype: 'bool', default: false },
+  C_BP: { fullName: 'condition_basepair_2_residue', dtype: 'twobody', default: 0 },
+  basepair: { fullName: 'condition_basepair_2_residue', dtype: 'twobody', default: 0 },
+  condition_basepair_2_residue: { fullName: 'condition_basepair_2_residue', dtype: 'twobody', default: 0 },
+  SA_CRDSRC: { fullName: 'annotation_src-coordinate-conditioned-region_1_atom', dtype: 'internal', default: '' },
+  SA_IDXGRPSRC: { fullName: 'annotation_src-index-group_1_atom', dtype: 'internal', default: 0 },
+  SA_UII: { fullName: 'is_unindexed_insertion', dtype: 'internal', default: false },
+  SA_CWI: { fullName: 'annotation_coords-with-insertion_1_atom', dtype: 'internal', default: 0 },
+  S_SEGMIN: { fullName: 'annotation_expsegmin_1_residue', dtype: 'internal', default: -1 },
+  S_SEGMAX: { fullName: 'annotation_expsegmax_1_residue', dtype: 'internal', default: -1 },
+  S_ATM: { fullName: 'atomize', dtype: 'internal', default: false },
 
   SA_SRC: { fullName: 'annotation_src-component_1_atom', dtype: 'str', default: '.' },
   'src-component': { fullName: 'annotation_src-component_1_atom', dtype: 'str', default: '.' },
@@ -1133,6 +1161,16 @@ function parseContigToken(rawToken) {
  */
 export function applyContig(atomArrayIn, contig) {
   const tokens = contig.split(',').map(parseContigToken);
+  // 🔴 UPSTREAM'S CHECKS, IN UPSTREAM'S WORDS (`inference_utils/contig_spec.py`), which this port
+  // did not have: a duplicated segment name, two preserved segments sharing residues (which
+  // duplicates them, contiguously renumbered), a range running past its chain, a suffix that
+  // disagrees with the chain it is anchored on, and an input with nothing to preserve. Each was a
+  // job built silently into something its author did not write.
+  const names = tokens.filter((t) => t.kind === 'expandable' && t.name !== null).map((t) => t.name);
+  const dupes = [...new Set(names.filter((n, i) => names.indexOf(n) !== i))].sort();
+  if (dupes.length > 0) {
+    throw new Error(`Duplicate expandable-segment name(s) in contig: ${JSON.stringify(dupes)}`);
+  }
   const runs = [[]];
   for (const tok of tokens) {
     if (tok.kind === 'chainbreak') runs.push([]);
@@ -1141,6 +1179,37 @@ export function applyContig(atomArrayIn, contig) {
   const nonEmptyRuns = runs.filter((r) => r.length > 0);
   if (nonEmptyRuns.length === 0) {
     throw new Error('Contig string produced no chain runs.');
+  }
+  const byChain = new Map();
+  for (const run of nonEmptyRuns) {
+    for (const tok of run) {
+      if (tok.kind !== 'preserved') continue;
+      if (!byChain.has(tok.chainId)) byChain.set(tok.chainId, []);
+      byChain.get(tok.chainId).push(tok);
+    }
+  }
+  for (const [chainId, segs] of byChain) {
+    const sorted = segs.slice().sort((a, b) => a.start - b.start);
+    for (let k = 1; k < sorted.length; k++) {
+      const prev = sorted[k - 1];
+      const curr = sorted[k];
+      if (curr.start <= prev.end) {
+        throw new Error(
+          `Preserved segments on chain '${chainId}' overlap: ${chainId}${prev.start}-${prev.end} and ` +
+            `${chainId}${curr.start}-${curr.end} both reference some of the same residues.`
+        );
+      }
+    }
+  }
+  // Upstream requires an input, so a contig with nothing to preserve is refused there. With NO
+  // input this port realises it into an empty structure (its pure-contig jobs), so only an input
+  // with nothing preserved is refused.
+  if ((atomArrayIn?.nAtoms ?? 0) > 0 && byChain.size === 0) {
+    throw new Error(
+      "Contig has no preserved segments -- condition_spec's `input` structure exists only to be " +
+        'referenced by preserved segments, so a contig that generates everything from scratch ' +
+        "doesn't need an `input` file at all."
+    );
   }
 
   const claimedChainIds = new Set();
@@ -1191,6 +1260,19 @@ export function applyContig(atomArrayIn, contig) {
       if (selected.length === 0) {
         throw new Error(`Preserved segment '${tok.chainId}${tok.start}-${tok.end}' matched no atoms.`);
       }
+      let chainMin = Infinity;
+      let chainMax = -Infinity;
+      for (let i = 0; i < atomArrayIn.nAtoms; i++) {
+        if (atomArrayIn.chain_id[i] !== tok.chainId) continue;
+        chainMin = Math.min(chainMin, atomArrayIn.res_id[i]);
+        chainMax = Math.max(chainMax, atomArrayIn.res_id[i]);
+      }
+      if (tok.start < chainMin || tok.end > chainMax) {
+        throw new Error(
+          `Preserved segment '${tok.chainId}${tok.start}-${tok.end}' runs outside chain ${tok.chainId}, ` +
+            `whose residues are ${chainMin}-${chainMax}.`
+        );
+      }
       const segment = sliceAtomArray(atomArrayIn, selected);
       const resStarts = getResidueSegments(segment);
       for (let r = 0; r < resStarts.length - 1; r++) {
@@ -1214,15 +1296,32 @@ export function applyContig(atomArrayIn, contig) {
     const preserved = run.tokens.find((t) => t.kind === 'preserved');
     let anchorType = null;
     if (preserved) {
-      const idx = atomArrayIn.chain_id.indexOf(preserved.chainId);
-      if (idx >= 0) anchorType = atomArrayIn.chain_type[idx];
+      const types = new Set();
+      for (let i = 0; i < atomArrayIn.nAtoms; i++) {
+        if (atomArrayIn.chain_id[i] === preserved.chainId) types.add(atomArrayIn.chain_type[i]);
+      }
+      if (types.size > 1) {
+        throw new Error(
+          `Input chain '${preserved.chainId}' contains multiple ChainTypes -- a contig run anchored on ` +
+            "this chain can't unambiguously default an unsuffixed expandable segment's type. Split this " +
+            'chain into separately-named chains upstream.'
+        );
+      }
+      if (types.size === 1) anchorType = [...types][0];
     }
     const requested = new Set(
       run.tokens.filter((t) => t.kind === 'expandable' && t.chainType !== null).map((t) => t.chainType)
     );
     if (requested.size > 1) throw new Error('Chain run requests conflicting chain types.');
     if (requested.size === 0) return anchorType !== null ? anchorType : CHAIN_TYPE.POLYPEPTIDE_L;
-    return Array.from(requested)[0];
+    const chainType = Array.from(requested)[0];
+    if (anchorType !== null && chainType !== anchorType) {
+      throw new Error(
+        `An expandable segment explicitly specifies chain type ${chainType}, which disagrees with its ` +
+          `run's anchor chain type ${anchorType}.`
+      );
+    }
+    return chainType;
   };
 
   const processRun = (run, runPreservedAtoms, runOriginalResId, tokenOffsets, assembled, originalResId) => {
@@ -1456,6 +1555,42 @@ export function applyConditions(atoms, conditions, originalResId) {
 
   const pendingIndexGroups = new Map();
 
+  // 🔴 UPSTREAM'S CHECKS BEFORE ANYTHING IS WRITTEN (`condition_spec._apply_conditions`), in its
+  // words. Each was a value this took and turned into something else: `C_CRDGRP: {abc: ...}`
+  // became a NaN group and `{0: ...}` claimed the reserved absolute group, a direct `C_INTCRD`
+  // wrote a payload upstream derives, and a two-body name has no selection-pair grammar here.
+  for (const [annotationName, values] of Object.entries(conditions || {})) {
+    const spec = resolveConditionSpec(annotationName);
+    if (spec.dtype === 'intcrd') throw new Error('C_INTCRD is a saved payload; edit C_CRDGRP instead.');
+    if (spec.dtype === 'twobody') {
+      throw new Error(
+        `'${annotationName}' resolves to 'basepair', a 2-body condition -- condition_spec has no ` +
+          'selection-pair grammar, so only 1-body conditions (per-atom or per-residue) can be set here.'
+      );
+    }
+    if (spec.dtype === 'internal') {
+      throw new Error(
+        `'${annotationName}' names ${spec.fullName}, which the pipeline writes itself; this port does not ` +
+          'take it from a job.'
+      );
+    }
+    if (spec.dtype === 'crdgrp') {
+      for (const [value, entries] of Object.entries(values)) {
+        if (value !== 'null') {
+          if (!/^\d+$/.test(value) || !(Number(value) > 0 && Number(value) <= CRDGRP_MAX_GROUP_ID)) {
+            throw new Error(
+              `C_CRDGRP requires an integer ID from 1 to ${CRDGRP_MAX_GROUP_ID}; reserved IDs are not editable.`
+            );
+          }
+        }
+        if (!Array.isArray(entries) || entries.some((e) => !e || typeof e !== 'object'
+          || Object.keys(e).length !== 1 || !('select' in e))) {
+          throw new Error('C_CRDGRP entries must contain only select; the value is the group ID.');
+        }
+      }
+    }
+  }
+
   try {
     for (const [annotationName, values] of Object.entries(conditions || {})) {
       const spec = resolveConditionSpec(annotationName);
@@ -1489,6 +1624,11 @@ export function applyConditions(atoms, conditions, originalResId) {
           for (let i = 0; i < n; i++) if (mask[i]) indices.push(i);
 
           const isUnindexedGroup = fullName === 'condition_index_1_residue' && !coerceBool(value);
+          if (!isUnindexedGroup && entry.group !== undefined && entry.group !== null) {
+            throw new Error(
+              `${annotationName}: \`group:\` is only meaningful for C_IDX (value false), not ${JSON.stringify(value)}.`
+            );
+          }
           if (isUnindexedGroup) {
             if (entry.group === undefined || entry.group === null) {
               throw new Error(`${annotationName}: value ${value} requires a 'group:' field alongside 'select:'`);
@@ -1519,17 +1659,11 @@ export function applyConditions(atoms, conditions, originalResId) {
                 atoms.annotations[fullName] = new Array(n).fill('<M>');
               }
               const seq = atoms.annotations[fullName];
-              let isBool = false;
-              let boolVal = false;
-              try {
-                boolVal = coerceBool(value);
-                isBool = true;
-              } catch {
-                isBool = false;
-              }
-              for (const idx of indices) {
-                seq[idx] = isBool ? (boolVal ? atoms.res_name[idx] : '<M>') : String(value);
-              }
+              // 🔴 TRUE OR FALSE AND NOTHING ELSE: a sequence condition copies the residue's own
+              // identity (upstream's `ground_truth_value`) or masks it. This also took a literal
+              // residue name - `C_SEQ: {ALA: ...}` - which upstream refuses as not a boolean.
+              const boolVal = coerceBool(value);
+              for (const idx of indices) seq[idx] = boolVal ? atoms.res_name[idx] : '<M>';
             } else if (spec.dtype === 'bool') {
               if (!atoms.annotations[fullName]) {
                 atoms.annotations[fullName] = new Array(n).fill(spec.default);
@@ -1540,11 +1674,10 @@ export function applyConditions(atoms, conditions, originalResId) {
               if (!atoms.annotations[fullName]) {
                 atoms.annotations[fullName] = new Array(n).fill(spec.default);
               }
-              const enumVal =
-                typeof value === 'number' || /^-?\d+$/.test(String(value))
-                  ? parseInt(value, 10)
-                  : spec.enum[String(value)];
-              if (enumVal === undefined) {
+              // `coerce_enum_value`: a member's name, or an integer that IS a member's value.
+              const numeric = typeof value === 'number' || /^-?\d+$/.test(String(value));
+              const enumVal = numeric ? parseInt(value, 10) : spec.enum[String(value)];
+              if (enumVal === undefined || (numeric && !Object.values(spec.enum).includes(enumVal))) {
                 throw new Error(`Invalid enum value ${value} for ${annotationName}`);
               }
               for (const idx of indices) atoms.annotations[fullName][idx] = enumVal;
@@ -1552,22 +1685,39 @@ export function applyConditions(atoms, conditions, originalResId) {
               if (!atoms.annotations[fullName]) {
                 atoms.annotations[fullName] = Array.from({ length: n }, () => [NaN, NaN, NaN]);
               }
+              // 🔴 EXACTLY THREE (`parse_centroid_value`): this stored `slice(0, 3)` of however many
+              // it was given, so two numbers became a two-element "point" and four were truncated.
               const parts = Array.isArray(value) ? value.map(Number) : String(value).split(',').map(Number);
-              for (const idx of indices) atoms.annotations[fullName][idx] = parts.slice(0, 3);
+              if (parts.length !== 3 || parts.some((v) => !Number.isFinite(v))) {
+                throw new Error(
+                  `ChainCentroid value must have exactly 3 components (x, y, z), got ${JSON.stringify(value)}.`
+                );
+              }
+              for (const idx of indices) atoms.annotations[fullName][idx] = parts.slice();
             } else if (spec.dtype === 'cath') {
               if (!atoms.annotations[fullName]) {
                 atoms.annotations[fullName] = new Array(n).fill('x.x.x.x');
               }
-              let cathStr = String(value);
-              if (!cathStr.endsWith('.x')) cathStr += '.x';
+              // `set_cath_condition`: a C.A.T label from the model's own vocabulary, stored with a
+              // trailing `.x`. This appended `.x` to anything, so `3.40.50.20` became a five-field
+              // code and a typo became a label nothing maps.
+              const cathStr = normalizeCatLabel(value);
               for (const idx of indices) atoms.annotations[fullName][idx] = cathStr;
             } else if (spec.dtype === 'float') {
               if (!atoms.annotations[fullName]) {
                 atoms.annotations[fullName] = new Array(n).fill(spec.default);
               }
+              // A number, which a boolean is not and NaN is not either - `Number('abc')` wrote NaN,
+              // which for a sequence probability means "unspecified", silently.
               const fVal = Number(value);
+              if (typeof value === 'boolean' || /^\s*(true|false)?\s*$/i.test(String(value)) || !Number.isFinite(fVal)) {
+                throw new Error(`${annotationName} writes a number, so it cannot take ${JSON.stringify(value)}.`);
+              }
               for (const idx of indices) atoms.annotations[fullName][idx] = fVal;
             } else {
+              if (typeof value === 'boolean' || /^(true|false)$/i.test(String(value))) {
+                throw new Error(`${spec.fullName} writes a value, so it cannot take ${JSON.stringify(value)}.`);
+              }
               if (!atoms.annotations[fullName]) {
                 atoms.annotations[fullName] = new Array(n).fill(spec.default);
               }

@@ -20,6 +20,7 @@ struct Entry {
   string select;
   string group;
   bool hasGroup = false;
+  size_t keys = 0;   // how many fields the entry named, which `C_CRDGRP` holds to `select` alone
 };
 // 🔴 INSERTION ORDER, NOT SORTED. Two arms of one condition can touch the same atoms - a
 // `C_CRD` with a `true` arm over a chain and a `false` arm over two of its residues is exactly
@@ -54,9 +55,92 @@ inline vector<int> defaultCoordinateGroups(const atoms::AtomArray& a) {
   return groups;
 }
 
+// `set_cath_condition` (shared/rfd4p/conditions.js `normalizeCatLabel`): a C.A.T label from the
+// model's own vocabulary - `x.x.x`, `C.x.x`, `C.A.x` or `C.A.T` - with a fourth `.x` accepted and
+// dropped, stored with a trailing `.x`. This appended `.x` to anything, so `3.40.50.20` became a
+// five-field code and a typo became a label nothing maps.
+inline string normalizeCatLabel(const string& value) {
+  string label = value;
+  vector<string> parts;
+  {
+    size_t at = 0;
+    while (true) {
+      const size_t dot = label.find('.', at);
+      parts.push_back(label.substr(at, dot == string::npos ? string::npos : dot - at));
+      if (dot == string::npos) break;
+      at = dot + 1;
+    }
+  }
+  if (parts.size() == 4 && parts[3] == "x") {
+    label = label.substr(0, label.size() - 2);
+    parts.pop_back();
+  }
+  const bool valid =
+      label == "x.x.x" ||
+      (parts.size() == 3 && parts[1] == "x" && parts[2] == "x" && tables::CATH_C.count(parts[0])) ||
+      (parts.size() == 3 && parts[2] == "x" && tables::CATH_A.count(parts[0] + "." + parts[1])) ||
+      (parts.size() == 3 && tables::CATH_T.count(label));
+  if (!valid) {
+    fprintf(stderr, "Unknown CAT label '%s'; choose a C/A/T label from the model vocabulary, or "
+                    "'x.x.x' to clear.\n", value.c_str());
+    exit(1);
+  }
+  return label + ".x";
+}
+
+inline bool isBooleanText(const string& v) {
+  string low = v;
+  for (char& c : low) c = (char)tolower((unsigned char)c);
+  return low == "true" || low == "false";
+}
+
 inline void applyConditions(atoms::AtomArray& a, const Spec& conditions,
                             const vector<int>& originalResId) {
   const size_t n = a.n();
+  // 🔴 UPSTREAM'S CHECKS BEFORE ANYTHING IS WRITTEN (`condition_spec._apply_conditions`; spec.js
+  // has the same), in its words: a direct `C_INTCRD`, a two-body name, a pipeline annotation, and
+  // a `C_CRDGRP` value that is not a positive group id or entries naming more than `select`.
+  for (const auto& [annotationName, values] : conditions) {
+    auto it = tables::CONDITION_REGISTRY.find(annotationName);
+    if (it == tables::CONDITION_REGISTRY.end()) continue;   // refused by name below
+    const string dtype = it->second.dtype;
+    if (dtype == "intcrd") {
+      fprintf(stderr, "C_INTCRD is a saved payload; edit C_CRDGRP instead.\n");
+      exit(1);
+    }
+    if (dtype == "twobody") {
+      fprintf(stderr, "'%s' resolves to 'basepair', a 2-body condition -- condition_spec has no "
+                      "selection-pair grammar, so only 1-body conditions (per-atom or per-residue) "
+                      "can be set here.\n", annotationName.c_str());
+      exit(1);
+    }
+    if (dtype == "internal") {
+      fprintf(stderr, "'%s' names %s, which the pipeline writes itself; this port does not take "
+                      "it from a job.\n", annotationName.c_str(), it->second.fullName);
+      exit(1);
+    }
+    if (dtype == "crdgrp") {
+      for (const auto& [value, entries] : values) {
+        if (value != "null" && !value.empty()) {
+          bool digits = true;
+          for (char c : value) digits = digits && isdigit((unsigned char)c);
+          const long v = digits && value.size() < 9 ? atol(value.c_str()) : -1;
+          if (!digits || !(v > 0 && v <= 32767)) {
+            fprintf(stderr, "C_CRDGRP requires an integer ID from 1 to 32767; reserved IDs are not "
+                            "editable.\n");
+            exit(1);
+          }
+        }
+        for (const Entry& e : entries) {
+          if (e.keys != 1 || e.select.empty()) {
+            fprintf(stderr, "C_CRDGRP entries must contain only select; the value is the group "
+                            "ID.\n");
+            exit(1);
+          }
+        }
+      }
+    }
+  }
   const vector<int> realResId = a.site.resId;
   if (originalResId.size() == n) a.site.resId = originalResId;
   // 🔴 ORDERED, because a later group's id depends on how many came before it.
@@ -103,6 +187,11 @@ inline void applyConditions(atoms::AtomArray& a, const Spec& conditions,
 
         const bool unindexedGroup =
             full == "condition_index_1_residue" && !coerceBool(value, annotationName.c_str());
+        if (!unindexedGroup && e.hasGroup) {
+          fprintf(stderr, "%s: `group:` is only meaningful for C_IDX (value false), not \"%s\".\n",
+                  annotationName.c_str(), value.c_str());
+          exit(1);
+        }
         if (unindexedGroup) {
           if (!e.hasGroup) {
             fprintf(stderr, "%s: value %s requires a 'group:' field alongside 'select:'\n",
@@ -136,17 +225,13 @@ inline void applyConditions(atoms::AtomArray& a, const Spec& conditions,
           }
           a.ann.ints["condition_CoordinateGroup_1_atom"] = crdGrp;
         } else if (dtype == "seq") {
-          // 🔴 `true` MEANS "THE RESIDUE'S OWN NAME", not the string "true". A sequence
-          // condition is either a boolean - lock this residue to what it is, or mask it - or a
-          // literal residue name to force.
+          // 🔴 TRUE OR FALSE AND NOTHING ELSE: a sequence condition copies the residue's own
+          // identity (upstream's `ground_truth_value`) or masks it. This also took a literal
+          // residue name - `C_SEQ: {ALA: ...}` - which upstream refuses as not a boolean.
           if (!a.ann.strings.count(full)) a.ann.strings[full].assign(n, "<M>");
           vector<string>& seq = a.ann.strings[full];
-          string low = value;
-          for (char& c : low) c = (char)tolower((unsigned char)c);
-          const bool isBool = low == "true" || low == "false";
-          for (const int idx : indices) {
-            seq[idx] = isBool ? (low == "true" ? a.site.resName[idx] : string("<M>")) : value;
-          }
+          const bool on = coerceBool(value, annotationName.c_str());
+          for (const int idx : indices) seq[idx] = on ? a.site.resName[idx] : string("<M>");
         } else if (dtype == "bool") {
           if (!a.ann.ints.count(full)) a.ann.ints[full].assign(n, (int)fallback);
           const bool b = coerceBool(value, annotationName.c_str());
@@ -159,7 +244,18 @@ inline void applyConditions(atoms::AtomArray& a, const Spec& conditions,
             if (!isdigit((unsigned char)value[k])) { numeric = false; break; }
           }
           if (numeric) {
+            // `coerce_enum_value`: an integer must BE a member's value.
             enumVal = atoi(value.c_str());
+            auto members = tables::CONDITION_ENUMS.find(specIt->second.enumName);
+            bool member = false;
+            if (members != tables::CONDITION_ENUMS.end()) {
+              for (const auto& [name, v] : members->second) member = member || v == enumVal;
+            }
+            if (!member) {
+              fprintf(stderr, "Invalid enum value %s for %s\n", value.c_str(),
+                      annotationName.c_str());
+              exit(1);
+            }
           } else {
             auto members = tables::CONDITION_ENUMS.find(specIt->second.enumName);
             if (members == tables::CONDITION_ENUMS.end()) {
@@ -182,47 +278,47 @@ inline void applyConditions(atoms::AtomArray& a, const Spec& conditions,
           for (const string& p : selection::splitTopLevel(value, ',')) {
             parts.push_back(atof(selection::trim(p).c_str()));
           }
-          // 🔴 FEWER THAN THREE NUMBERS IS REFUSED, WHICH IS A DELIBERATE DIVERGENCE. The
-          // reference stores `parts.slice(0, 3)` - so `"1.5,-2.25"` becomes a TWO-element
-          // entry in a column every stage after it reads as a point, and nothing says so.
-          // This port cannot represent that (the annotation is a flat `n * 3`) and would not
-          // want to: padding the third with NaN invents a coordinate, and a centroid with two
-          // numbers is a typo, not a request. Found by the condition corpus, which had never
-          // written a `centroid` value at all until gcov said the whole branch was dead.
-          // MORE than three is NOT refused - both sides truncate, and the corpus holds them
-          // to each other on a four-component value.
-          if (parts.size() < 3) {
-            fprintf(stderr,
-                    "condition '%s' names a centroid with %zu numbers, not three: '%s'\n",
-                    annotationName.c_str(), parts.size(), value.c_str());
+          // 🔴 EXACTLY THREE, AS UPSTREAM'S `parse_centroid_value` REQUIRES. Fewer was refused
+          // here as a deliberate divergence from the page, which stored `slice(0, 3)` - two
+          // numbers as a two-element "point" - and more were truncated on both sides. Upstream
+          // refuses anything but three, and now so do both ports.
+          bool finite = true;
+          for (const double v : parts) finite = finite && std::isfinite(v);
+          if (parts.size() != 3 || !finite) {
+            fprintf(stderr, "ChainCentroid value must have exactly 3 components (x, y, z), got "
+                            "'%s'.\n", value.c_str());
             exit(1);
           }
-          // (No truncation needed: the refusal above makes `parts.size() >= 3` and the loop
-          // below reads only the first three. A `parts.resize(3, NAN)` stood here, mirroring
-          // the reference's `slice(0, 3)`; dropping it is 0 of 27 differing, measured - the
-          // reference needs it because it STORES the slice, and this port does not.)
           for (const int idx : indices) {
             for (int k = 0; k < 3; ++k) a.ann.floats[full][idx * 3 + k] = parts[k];
           }
         } else if (dtype == "cath") {
-          // 🔴 A CATH CODE GAINS A TRAILING `.x` IF IT HAS NONE, so `3.40.50` is stored as
-          // `3.40.50.x` - the fourth level is the homologous superfamily and a spec that does
-          // not name it is saying "any", not "level four is missing".
-          //
-          // 🔴 AND THE RULE IS NOT "PAD TO FOUR LEVELS", WHICH IS WHAT THAT ONE EXAMPLE READS
-          // LIKE. It is the reference's own `if (!cathStr.endsWith('.x')) cathStr += '.x'`, so
-          // a COMPLETE code gains a FIFTH field - `3.40.50.20` is stored as `3.40.50.20.x` -
-          // and a one-level `3` becomes `3.x`, not `3.x.x.x`. Checked on all four shapes; a
-          // port that padded to four levels agrees on `3.40.50` and on nothing else.
+          // `set_cath_condition`: a label from the model's vocabulary, see `normalizeCatLabel`.
+          // (This appended `.x` to whatever it was given, as the page did - so `3.40.50.20`
+          // became a five-field code and a one-level `3` became `3.x`, both labels upstream
+          // refuses and nothing maps.)
           if (!a.ann.strings.count(full)) a.ann.strings[full].assign(n, "x.x.x.x");
-          string cath = value;
-          if (cath.size() < 2 || cath.compare(cath.size() - 2, 2, ".x") != 0) cath += ".x";
+          const string cath = normalizeCatLabel(value);
           for (const int idx : indices) a.ann.strings[full][idx] = cath;
         } else if (dtype == "float") {
+          // A number, which a boolean is not and NaN is not either (`Number('abc')` wrote NaN,
+          // which for a sequence probability means "unspecified", silently).
+          const string num = selection::trim(value);   // `Number()` ignores surrounding space
+          char* end = nullptr;
+          const double f = strtod(num.c_str(), &end);
+          if (isBooleanText(num) || num.empty() || (end && *end) || !std::isfinite(f)) {
+            fprintf(stderr, "%s writes a number, so it cannot take \"%s\".\n",
+                    annotationName.c_str(), value.c_str());
+            exit(1);
+          }
           if (!a.ann.floats.count(full)) a.ann.floats[full].assign(n, fallback);
-          const double f = atof(value.c_str());
           for (const int idx : indices) a.ann.floats[full][idx] = f;
         } else {
+          if (isBooleanText(value)) {
+            fprintf(stderr, "%s writes a value, so it cannot take \"%s\".\n", full.c_str(),
+                    value.c_str());
+            exit(1);
+          }
           if (!a.ann.strings.count(full)) a.ann.strings[full].assign(n, fallbackText);
           for (const int idx : indices) a.ann.strings[full][idx] = value;
         }

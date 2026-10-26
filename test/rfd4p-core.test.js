@@ -77,12 +77,12 @@ test('Pipeline contig parser, selection DSL, and CATH code parser match RFD4-Pro
   const maskRna = evalSelection(atoms, 'is_rna');
   assert.equal(maskRna.filter(Boolean).length, 6);
 
-  const [cIdx, aIdx, tIdx] = parseCathCode('3.40.50');
-  assert.ok(cIdx >= 0 && aIdx >= 0 && tIdx >= 0);
-  const [cWild, aWild, tWild] = parseCathCode('3.x.x');
-  assert.ok(cWild >= 0);
-  assert.equal(aWild, -1);
-  assert.equal(tWild, -1);
+  // A STORED label - `set_cath_condition` appends `.x` - converted as upstream's pipeline does,
+  // into the rows of the checkpoint's own embedding tables (`data/cath_label_mapping.pkl`).
+  // `3.40.50` is [2, 31, 1056]; the hand-written tables this replaced said [2, 23, 890].
+  assert.deepEqual(parseCathCode('3.40.50.x'), [2, 31, 1056]);
+  assert.deepEqual(parseCathCode('3.x.x.x'), [2, -1, -1]);
+  assert.deepEqual(parseCathCode('x.x.x.x'), [-1, -1, -1]);
 });
 
 test('buildBatch builds all 10 interactive presets (.cif.zst and specMode) and populates 80 batch keys', () => {
