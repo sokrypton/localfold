@@ -113,17 +113,26 @@ def verdict(message: str) -> str:
 
 
 def page(jobs: dict[str, dict]) -> dict[str, str]:
+    # 🔴 A RAW STRUCTURE'S NON-STANDARD COMPONENTS ARE FETCHED BY THE PAGE (1PRW's ACE cap and M3L),
+    # so they are handed over here as atomworks' own dictionary has them - without, the page side
+    # refused what the page itself builds.
+    from rfd4p_ccd import ccd_entries
+    jobs = {k: {**j, "ccd": ccd_entries([Path(j["input"])])} if j.get("input") else j for k, j in jobs.items()}
     script = """
 import { readFileSync } from "node:fs";
 import { buildBatch } from "./shared/rfd4p/pipeline/index.js";
+import { parseCifBlock } from "./shared/rfd4p/pipeline/cif.js";
 const jobs = JSON.parse(readFileSync(0, "utf8"));
 const out = {};
 for (const [name, j] of Object.entries(jobs)) {
   try {
     // Bytes, as given: the reader tells mmCIF from BinaryCIF, plain from compressed.
     const inputCif = new Uint8Array(readFileSync(j.input));
+    // the dictionary entries the page would fetch for a raw structure's components (ccd.js)
+    const ccdBlocks = new Map(Object.entries(j.ccd ?? {}).map(([id, text]) => [id, parseCifBlock(text)]));
     if (j.specMode === false) buildBatch(inputCif, { seed: 0 });
-    else buildBatch({ contig: j.contig, ...(j.conditions ? { conditions: j.conditions } : {}) }, { seed: 0, inputCif });
+    else buildBatch({ contig: j.contig, ...(j.conditions ? { conditions: j.conditions } : {}) },
+      { seed: 0, inputCif, ccdBlocks });
     out[name] = null;
   } catch (e) { out[name] = String(e.message); }
 }
