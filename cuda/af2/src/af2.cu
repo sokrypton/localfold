@@ -8,6 +8,43 @@
 // With --oracle (cuda/af2/oracle.py's dump of the reference on this same input), pass 0 is checked
 // against it stage by stage.
 #define LF_TLS thread_local      // every mutable global a thread's own: --multi (see multiMain)
+// ...and its output: stdout, stderr and printf through the thread's job log when --multi's serveJobs has set one
+// (lfio::log, cuda/af3/src/common.cuh), the process's otherwise - every system header that names them first
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cstdarg>
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <vector>
+#include <map>
+#include <set>
+#include <thread>
+#include <mutex>
+#include <functional>
+#include <chrono>
+#include <cmath>
+#include <algorithm>
+#include <array>
+#include <deque>
+#include <condition_variable>
+#include <unistd.h>
+#include <fcntl.h>
+#include <dirent.h>
+#include <sys/stat.h>
+#define LF_LOG_DECLARED
+namespace lfio {
+inline thread_local FILE* log = nullptr; inline thread_local bool perThread = false;
+inline FILE* processOut() { return stdout; }
+inline FILE* processErr() { return stderr; }
+}
+#undef stdout
+#undef stderr
+#define stdout (::lfio::log ? ::lfio::log : ::lfio::processOut())
+#define stderr (::lfio::log ? ::lfio::log : ::lfio::processErr())
+#define printf(...) std::fprintf(stdout, __VA_ARGS__)
 #include "../../featurise/standalone_api.h"
 #include <sys/stat.h>
 #include <unistd.h>
@@ -866,7 +903,7 @@ static int multiMain(int argc, char** argv) {
   std::vector<std::thread> threads; std::vector<int> codes(groups.size(), 0);
   for (size_t g = 0; g < groups.size(); ++g)
     threads.emplace_back([&, g] {
-      IN_MULTI = true;
+      IN_MULTI = true; lfio::perThread = true;
       std::vector<char*> a{ argv[0] };
       for (auto& s : groups[g]) a.push_back(const_cast<char*>(s.c_str()));
       codes[g] = foldMain((int)a.size(), a.data());

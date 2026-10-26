@@ -605,6 +605,26 @@ lone fold is unchanged (68 residues 57.7 ms, 261 294.5) and so are AF3 (6MRR 356
 `gate.py` reads as before. Not wired: `serveJobs` points the process's stdout at the job's log (`dup2`), so threads'
 logs collide - the worker reads them - and the worker would hand an "All 5" sweep to one `--multi` server.
 
+**Module 10: "All 5" through the worker.** The page's Model # row at "All 5" sends the five models as five jobs, one
+after another (web/app.js, `af2Sweep`), identical but for the family. python/localfold/worker.py now folds all five at
+once on one `--multi` server (`MultiServer`) when the first comes - on CUDA, at most 400 residues
+(`SWEEP_MAX_RESIDUES`), and with no template (models 3-5 have no template embedder) - streams that job's passes
+live, and keeps the other four's results and pass frames for their jobs, which it answers at once (`sweep_key`:
+the job but its family). Each `--multi` thread writes its own job's log (`lfio::log`: stdout, stderr and printf
+through it in the AF2 build; `serveJobs` sets it instead of `dup2` on the process's descriptors, and syncs its own
+stream rather than the device), and the frame tap's thread borrows the fold's log for its pass lines. Through the
+worker's own protocol on the A100, 68 residues, five jobs:
+
+| | one model a job | "All 5" |
+|---|---:|---:|
+| warm (servers up) | 707 ms | **288** |
+| cold (first fold) | 3,088 | **975** |
+
+Each model's PDB identical to its job folded alone, monomer (6MRR) and multimer (1BRS A+D, 3,977 -> 1,644 ms cold);
+the early stop per model; a changed job refolds; 522 residues takes the one-at-a-time path. And a fix on the way:
+model 1's job in "All 5" reads `af2Model: "all"`, which `int()` refused - **the sweep's first job failed on every
+native backend** (since 0fd562f4, 2026-10-09).
+
 ## A deep alignment's featurisation (2026-10-08)
 
 🔴 **SUPERSEDED THE SAME DAY: the featuriser is native now** (`cuda/featurise/af2-featurise`), its nearest-centre

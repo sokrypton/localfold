@@ -53,6 +53,14 @@ inline std::recursive_mutex CAPTURE_MU;
 inline cudaError_t lfFree(void* p) { std::lock_guard<std::recursive_mutex> l(CAPTURE_MU); return cudaFree(p); }
 inline cudaError_t lfDeviceSynchronize() { std::lock_guard<std::recursive_mutex> l(CAPTURE_MU); return cudaDeviceSynchronize(); }
 template <class T> inline cudaError_t lfMalloc(T** p, size_t n) { std::lock_guard<std::recursive_mutex> l(CAPTURE_MU); return cudaMalloc(p, n); }
+template <class T> inline cudaError_t lfMallocHost(T** p, size_t n) { std::lock_guard<std::recursive_mutex> l(CAPTURE_MU); return cudaMallocHost(p, n); }
+inline cudaError_t lfFreeHost(void* p) { std::lock_guard<std::recursive_mutex> l(CAPTURE_MU); return cudaFreeHost(p); }
+// ...and each thread's job log: serveJobs points a job's output at its log by dup2 on the process's stdout and stderr,
+// which threads cannot share; under --multi it sets lfio::log instead, and the AF2 build reads stdout, stderr and
+// printf through it (cuda/af2/src/af2.cu). Elsewhere nothing reads it
+#ifndef LF_LOG_DECLARED
+namespace lfio { inline LF_TLS FILE* log = nullptr; inline LF_TLS bool perThread = false; }
+#endif
 // The named scratch comes from one stream-ordered pool that keeps what it is given back (release threshold: never):
 // a large input gives each stage's scratch back for the next, and a fresh cudaMalloc of a big buffer is not cheap
 // here - 0.9 ms at 1 GB, 37 at 2, 145 at 4 - while the pool hands the same pages to the next stage's buffers, of
@@ -1083,7 +1091,7 @@ struct Model {
       if (const char* d = getenv("LOCALFOLD_SLOW_UPLOAD_MS")) usleep((useconds_t)atoi(d) * 1000);   // (as in bundleUp)
     }
     bool ok = cudaStreamSynchronize(st) == cudaSuccess;
-    for (int b = 0; b < NB; ++b) { cudaFreeHost(stage[b]); cudaEventDestroy(ev[b]); }
+    for (int b = 0; b < NB; ++b) { lfFreeHost(stage[b]); cudaEventDestroy(ev[b]); }
     cudaStreamDestroy(st);
     return ok;
   }
@@ -1133,7 +1141,7 @@ struct Model {
         CK(cudaMemcpy(s.resident + r.scales, pin + cbytes, sbytes, cudaMemcpyHostToDevice));
       }
       if (fd >= 0) close(fd);
-      CK(cudaFreeHost(pin));
+      CK(lfFreeHost(pin));
     }
   }
   bool isResident(const std::string& k) const { auto it = index.find(k); return it != index.end() && it->second.kind == 'q'; }
@@ -1348,8 +1356,8 @@ inline LF_TLS bool TRUNK_PAIR16 = false;
 inline bool parkWorthIt(size_t bytes) { return !roomFor(bytes); }
 inline void parkToHost(float*& dev, size_t bytes) {
   if (PARK_HAVE < bytes) {
-    if (PARK_HOST) CK(cudaFreeHost(PARK_HOST));
-    if (cudaMallocHost(&PARK_HOST, bytes) != cudaSuccess) {
+    if (PARK_HOST) CK(lfFreeHost(PARK_HOST));
+    if (lfMallocHost(&PARK_HOST, bytes) != cudaSuccess) {
       fprintf(stderr, "cannot pin %.2f GB of host memory to park the pair: this input needs more host RAM\n", bytes / 1e9);
       exit(1);
     }
@@ -1537,11 +1545,19 @@ inline void serveJobs(const std::string& dir, const char* name,
     job.close(); unlink((base + ".job").c_str());
     if (input == "quit") { printf("%s: stopped\n", name); return; }
     fflush(stdout); fflush(stderr);
-    int saved = dup(1), savedErr = dup(2), log = open((base + ".log").c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    dup2(log, 1); dup2(log, 2); close(log);
-    int code = fold(input, flags);
-    fflush(stdout); fflush(stderr); dup2(saved, 1); dup2(savedErr, 2); close(saved); close(savedErr);
-    CK(lfDeviceSynchronize());
+    int code;
+    if (lfio::perThread) {             // (--multi: this thread's lines to its job's log; the others' stay theirs)
+      lfio::log = fopen((base + ".log").c_str(), "w");
+      code = fold(input, flags);
+      fclose(lfio::log); lfio::log = nullptr;
+      CK(cudaStreamSynchronize(STREAM));    // (its own stream: a device-wide sync would wait on the other threads' folds)
+    } else {
+      int saved = dup(1), savedErr = dup(2), log = open((base + ".log").c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+      dup2(log, 1); dup2(log, 2); close(log);
+      code = fold(input, flags);
+      fflush(stdout); fflush(stderr); dup2(saved, 1); dup2(savedErr, 2); close(saved); close(savedErr);
+      CK(lfDeviceSynchronize());
+    }
     FILE* df = fopen((base + ".done.tmp").c_str(), "w"); fprintf(df, "%d\n", code); fclose(df);
     rename((base + ".done.tmp").c_str(), (base + ".done").c_str());
   }
@@ -2284,7 +2300,7 @@ inline void bestRotation(const std::vector<double>& moving, const std::vector<do
 // intermediate result is a picture, and the fold never waits for one.
 struct AsyncTap {
   struct Slot { char* dev = nullptr; char* host = nullptr; size_t cap = 0; cudaEvent_t ready{}, copied{}; bool busy = false; };
-  struct Job { int slot; std::vector<size_t> offsets; std::function<void(const char*, const std::vector<size_t>&)> done; };
+  struct Job { int slot; std::vector<size_t> offsets; std::function<void(const char*, const std::vector<size_t>&)> done; FILE* log = nullptr; };
   std::vector<Slot> slots; cudaStream_t copy = nullptr;
   std::mutex mu; std::condition_variable cv; std::deque<Job> queue; bool stopping = false; int pending = 0;
   std::thread writer; int dropped = 0;
@@ -2297,11 +2313,11 @@ struct AsyncTap {
     }
     drain();
     for (auto& sl : slots) if (sl.cap < bytes) {
-      CK(lfFree(sl.dev)); CK(cudaFreeHost(sl.host));
-      CK(devMalloc(&sl.dev, bytes)); CK(cudaMallocHost(&sl.host, bytes)); sl.cap = bytes;
+      CK(lfFree(sl.dev)); CK(lfFreeHost(sl.host));
+      CK(devMalloc(&sl.dev, bytes)); CK(lfMallocHost(&sl.host, bytes)); sl.cap = bytes;
     }
     while ((int)slots.size() < count) {
-      Slot sl; CK(devMalloc(&sl.dev, bytes)); CK(cudaMallocHost(&sl.host, bytes)); sl.cap = bytes;
+      Slot sl; CK(devMalloc(&sl.dev, bytes)); CK(lfMallocHost(&sl.host, bytes)); sl.cap = bytes;
       CK(cudaEventCreateWithFlags(&sl.ready, cudaEventDisableTiming)); CK(cudaEventCreateWithFlags(&sl.copied, cudaEventDisableTiming));
       slots.push_back(sl);
     }
@@ -2321,7 +2337,7 @@ struct AsyncTap {
     CK(cudaStreamWaitEvent(copy, sl.ready, 0));
     CK(cudaMemcpyAsync(sl.host, sl.dev, total, cudaMemcpyDeviceToHost, copy));
     CK(cudaEventRecord(sl.copied, copy));
-    { std::lock_guard<std::mutex> lock(mu); queue.push_back({k, offsets, std::move(done)}); }
+    { std::lock_guard<std::mutex> lock(mu); queue.push_back({k, offsets, std::move(done), lfio::log}); }   // (the offering thread's log)
     cv.notify_one();
     return true;
   }
@@ -2333,7 +2349,7 @@ struct AsyncTap {
     size_t held = 0; for (auto& sl : slots) held += sl.cap;
     if (held <= keep) return;
     for (auto& sl : slots) {
-      CK(lfFree(sl.dev)); CK(cudaFreeHost(sl.host)); CK(cudaEventDestroy(sl.ready)); CK(cudaEventDestroy(sl.copied));
+      CK(lfFree(sl.dev)); CK(lfFreeHost(sl.host)); CK(cudaEventDestroy(sl.ready)); CK(cudaEventDestroy(sl.copied));
     }
     slots.clear();
   }
@@ -2349,7 +2365,9 @@ struct AsyncTap {
         if (queue.empty()) return; job = std::move(queue.front()); queue.pop_front(); }
       Slot& sl = slots[job.slot];
       CK(cudaEventSynchronize(sl.copied));                // (this thread waits; the fold does not)
+      lfio::log = job.log;                                 // (its lines in the job's log: --multi's threads each have one)
       job.done(sl.host, job.offsets);
+      lfio::log = nullptr;
       { std::lock_guard<std::mutex> lock(mu); sl.busy = false; --pending; }
       cv.notify_all();
     }
