@@ -276,6 +276,7 @@ static double checkRealAtoms(const char* label, const float* d, const std::strin
   return r;
 }
 static int foldInput(const Opts& o) {
+  SAMPLER_COND.forget();       // (a fold's conditioning is its own: sampler.cuh)
   GEMM_HALF = false;
   auto t0 = std::chrono::steady_clock::now();
   const int T = (int)M.meta("meta/tokens"), N = (int)M.meta("meta/atoms"), S = (int)M.meta("meta/msa_rows");

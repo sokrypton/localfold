@@ -343,6 +343,17 @@ be2RigidAlignEulerK(float* __restrict__ xAll, const float* __restrict__ targetAl
 // what each step's predictions are handed to (--frames): (particle, step, steps, the denoised estimate on the host)
 inline std::function<void(int, int, int, const std::vector<float>&)> FRAME_HOOK;
 
+// The step conditioning sample() computed last, kept for the next call of the SAME fold (a propagation's steps and a
+// steered sampler's rounds condition every call alike). 🔴 FORGOTTEN AT EVERY FOLD (foldInput): it is recognised by
+// the conditioning's ADDRESS, and the next fold's - another job, another mode - is recomputed into the same scratch,
+// so a resident server's equilibrium job handed its conditioning to the structure job after it, and three structure
+// jobs in a row came back with the third's samples 19 A from the first's (tools/check-native-worker.py, "bioemu2 6mrr
+// again (the resident server, warm)")
+struct SamplerCondCache {
+  const float* sc0 = nullptr; int T = 0, layers = 0; float dynGate = -1.f; std::vector<float> tEmb;
+  void forget() { *this = SamplerCondCache{}; }
+};
+inline SamplerCondCache SAMPLER_COND;
 // n particles from noise (companions: one centred conditioning frame each, or empty); returns their final states
 inline std::vector<std::vector<float>> sample(const Denoiser& d, const SamplerSettings& s, uint64_t seed, int n,
                                               std::vector<std::vector<float>> companions = {},
@@ -359,12 +370,9 @@ inline std::vector<std::vector<float>> sample(const Denoiser& d, const SamplerSe
     const double t = sigma * (1 + gamma);
     hTEmb[i] = 0.25f * logf((float)t / SIGMA_DATA);
   }
-  static const float* cachedSc0 = nullptr;
-  static int cachedT = 0, cachedLayers = 0;
-  static float cachedDynGate = -1.f;
-  static std::vector<float> cachedTEmb;
-  const bool sameCond = (steps > 0 && cachedSc0 == d.sc0 && cachedT == d.T &&
-                         cachedLayers == d.layers && cachedDynGate == d.dynGate && cachedTEmb == hTEmb);
+  SamplerCondCache& cached = SAMPLER_COND;
+  const bool sameCond = (steps > 0 && cached.sc0 == d.sc0 && cached.T == d.T &&
+                         cached.layers == d.layers && cached.dynGate == d.dynGate && cached.tEmb == hTEmb);
   float* cndAll = sameCond ? scratch<float>("be2.sc.cndAll", (size_t)steps * (d.T + 1) * 768)
                            : precomputeAllSingleCond(d, hTEmb);
   const int Ca = 128, Dt = 768, Dc = Dt + Ca;
@@ -388,11 +396,11 @@ inline std::vector<std::vector<float>> sample(const Denoiser& d, const SamplerSe
     curCondB = std::min(condBatch, steps);
     computeStepCondBatch(d, cndAll, curCondB, condAAll, condTAll, cqcAll, cscAll);
     if (condBatch == steps) {
-      cachedSc0 = d.sc0;
-      cachedT = d.T;
-      cachedLayers = d.layers;
-      cachedDynGate = d.dynGate;
-      cachedTEmb = hTEmb;
+      cached.sc0 = d.sc0;
+      cached.T = d.T;
+      cached.layers = d.layers;
+      cached.dynGate = d.dynGate;
+      cached.tEmb = hTEmb;
     }
   }
   const bool comp = !companions.empty();
