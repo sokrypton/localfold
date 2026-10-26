@@ -104,7 +104,9 @@ async function templateCif(url, signal) {
  * @param {(step: object) => void} [options.onStep] called per flow step, for a
  *   trajectory the page can show
  * @param {AbortSignal} [options.signal]
- * @returns {Promise<{pdb: string, cif: string, tokens: number, steps: number}>}
+ * @returns {Promise<{pdb: string, cif: string, tokens: number, steps: number, seed: number,
+ *   job: object, inputCif: (string|Uint8Array|undefined)}>} `job` is the job that ran as a job
+ *   file (`input` naming the structure, `inputCif`, beside it)
  */
 export async function generate(options) {
   const {
@@ -285,5 +287,25 @@ export async function generate(options) {
   });
 
   progress(1);
-  return { pdb: result.pdb, cif: result.cif, tokens: n, steps: result.stepsRun ?? steps };
+  // 🔴 THE JOB THAT RAN, AS A JOB FILE THE NATIVE PORT TAKES (`localfold-rfd4p --job=`), so a
+  // design downloaded from this page can be made again without it. A preset driven by its
+  // structure is that structure as the job (upstream's `{input, input_as_annotated_cif: true}`);
+  // anything else is its contig and conditions over the structure it named.
+  const job = {
+    ...(inputCif === undefined ? {} : { input: "input" }),
+    ...(fromAnnotations && inputCif !== undefined
+      ? { input_as_annotated_cif: true }
+      : {
+        contig,
+        ...(conditions === undefined ? {} : { conditions }),
+        ...(annotated ? { input_as_annotated_cif: true } : {}),
+      }),
+    nsteps: steps,
+    ...(recycleSchedule === undefined ? {} : { recycleSchedule }),
+    ...(partialTrajectoryFractionSteps === undefined ? {} : { partialTrajectoryFractionSteps }),
+    ...(inverseFolding === true ? { inverseFolding: true } : {}),
+  };
+  return {
+    pdb: result.pdb, cif: result.cif, tokens: n, steps: result.stepsRun ?? steps, seed, job, inputCif,
+  };
 }

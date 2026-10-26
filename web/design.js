@@ -21,6 +21,7 @@ import {
   drawLengths, LIGAND_COLOUR, shade, spansFromContig,
 } from "./contig-ui.js";
 import { DEFAULT_STEPS, generate } from "./generate.js";
+import { writeZip } from "./zip.js";
 import { validateDesign } from "./validate-design.js";
 import { getDevice } from "./model.js";
 import { RFD4P_PRESETS } from "../shared/rfd4p/presets.js";
@@ -1110,6 +1111,90 @@ function drawGenerated(candidate, total) {
   resultsBody.append(row);
 }
 
+/**
+ * THE GENERATIONS OF THE LAST RUN, AS FILES. `generate` returned each design's PDB and mmCIF and
+ * nothing offered them, so a design could be looked at and not kept. Each candidate gets its two
+ * files, and one archive holds them all with the job that made them - the structure it named
+ * beside it - so `localfold-rfd4p --job=job.json` makes the same design again.
+ */
+const downloadsBox = element("downloads");
+let generatedRun = [];
+
+function saveFile(name, content, type) {
+  const url = URL.createObjectURL(new Blob([content], { type }));
+  const link = Object.assign(document.createElement("a"), { href: url, download: name });
+  document.body.append(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
+/** The input structure's file name in the archive, by what its bytes are. */
+function inputFileName(data) {
+  if (typeof data === "string") return "input.cif";
+  if (data[0] === 0x28 && data[1] === 0xb5 && data[2] === 0x2f && data[3] === 0xfd) return "input.cif.zst";
+  if (data[0] === 0x1f && data[1] === 0x8b) return "input.cif.gz";
+  if ((data[0] >= 0x80 && data[0] <= 0x8f) || data[0] === 0xde || data[0] === 0xdf) return "input.bcif";
+  return "input.cif";
+}
+
+/** The archive's members: the input, the job, a README and each candidate's two files. */
+function archiveEntries() {
+  const first = generatedRun[0];
+  const entries = [];
+  const job = { ...first.job };
+  if (first.inputCif !== undefined) {
+    job.input = inputFileName(first.inputCif);
+    entries.push([job.input, first.inputCif]);
+  }
+  entries.push(["job.json", `${JSON.stringify(job, null, 2)}\n`]);
+  entries.push(["README.txt", "RFD4-Proteina designs from the LocalFold design page.\n\n"
+    + "To make one again with the native port (seed as listed):\n"
+    + "  localfold-rfd4p --job=job.json --int8=<bundle> --seed=<seed> --out=design.pdb\n\n"
+    + generatedRun.map((c) => `candidate ${c.candidate + 1}: seed ${c.seed}`
+      + (c.validation?.described ? ` - ${c.validation.described}` : "")).join("\n") + "\n"]);
+  for (const c of generatedRun) {
+    entries.push([`candidate-${c.candidate + 1}.pdb`, c.pdb]);
+    entries.push([`candidate-${c.candidate + 1}.cif`, c.cif]);
+  }
+  return entries;
+}
+// tools/check-design-page.py reads the members it would download and folds the job natively.
+window.__designArchive = archiveEntries;
+
+async function saveArchive() {
+  const seeds = generatedRun.map((c) => c.seed);
+  saveFile(`rfd4p-design-seed${Math.min(...seeds)}.zip`, await writeZip(archiveEntries()), "application/zip");
+}
+
+function paintDownloads() {
+  downloadsBox.replaceChildren();
+  if (generatedRun.length === 0) {
+    downloadsBox.style.display = "none";
+    return;
+  }
+  downloadsBox.style.display = "";
+  const heading = document.createElement("h3");
+  heading.textContent = "Downloads";
+  downloadsBox.append(heading);
+  const button = (label, onClick) => {
+    const b = document.createElement("button");
+    b.className = "btn btn-grey btn-small";
+    b.textContent = label;
+    b.addEventListener("click", onClick);
+    return b;
+  };
+  for (const c of generatedRun) {
+    const row = document.createElement("div");
+    row.append(`candidate ${c.candidate + 1} (seed ${c.seed}) `,
+      button("PDB", () => saveFile(`candidate-${c.candidate + 1}.pdb`, c.pdb, "chemical/x-pdb")),
+      " ",
+      button("mmCIF", () => saveFile(`candidate-${c.candidate + 1}.cif`, c.cif, "chemical/x-cif")));
+    downloadsBox.append(row);
+  }
+  downloadsBox.append(button("All, with the job (.zip)", () => { saveArchive(); }));
+}
+
 /** RFD4-Proteina: one generation, straight into the viewer. */
 const startGenerate = async () => {
   const spans = spanList.read();
@@ -1141,6 +1226,8 @@ const startGenerate = async () => {
   const candidates = Math.max(1, Math.floor(number("beam", 1)));
   const wanted = validateSelect.value;
   let best = null;
+  generatedRun = [];
+  paintDownloads();
 
   try {
     for (let candidate = 0; candidate < candidates; candidate += 1) {
@@ -1214,6 +1301,8 @@ const startGenerate = async () => {
     const scored = { ...result, validation, candidate };
     if (best === null || rankOf(scored) > rankOf(best)) best = scored;
     drawGenerated(scored, candidates);
+    generatedRun.push(scored);
+    paintDownloads();
     }
 
     if (best === null) throw new Error("no candidate completed");

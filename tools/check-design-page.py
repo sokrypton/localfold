@@ -44,7 +44,9 @@ import os
 import socket
 import subprocess
 import sys
+import tempfile
 import time
+from pathlib import Path
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
@@ -168,6 +170,13 @@ def main():
             print(f"FAIL: web/design.js did not run:\n{threw}")
             return 1
 
+        # The GPU line is filled when `requestAdapter()` answers, which is after the module ran;
+        # read it then, or an adapter slow to answer reads as a page that says nothing.
+        try:
+            cdp.wait_for(ws, "document.getElementById('gpu-summary')?.textContent.length > 0", 30,
+                         "the WebGPU line")
+        except RuntimeError:
+            pass
         page = json.loads(cdp.evaluate(ws, READ_PAGE))
         for key, value in page.items():
             print(f"  {key}: {value}")
@@ -570,6 +579,34 @@ def main():
                 if len(set(generated["verdicts"])) < 2:
                     bad.append("the beam's candidates are identical, so the seed is not"
                                f" reaching the engine: {generated['verdicts']}")
+                # 🔴 AND THE DESIGNS CAN BE TAKEN AWAY, AS THE JOB THAT MADE THEM. Nothing
+                # offered a generated structure for download; now each candidate has its files
+                # and the archive carries the job, which must be one the native port runs to the
+                # same token count - a job file that is only decorative is the same bug again.
+                archive = json.loads(cdp.evaluate(ws, """JSON.stringify({
+                  rows: document.querySelectorAll('#downloads > div').length,
+                  members: window.__designArchive().map(([name, content]) =>
+                    [name, typeof content === 'string' ? content : null]),
+                })"""))
+                names = [n for n, _ in archive["members"]]
+                if archive["rows"] != 2:
+                    bad.append(f"the downloads list {archive['rows']} candidates, expected 2")
+                for want in ("job.json", "README.txt", "candidate-1.pdb", "candidate-1.cif",
+                             "candidate-2.pdb", "candidate-2.cif"):
+                    if want not in names:
+                        bad.append(f"the archive has no {want}: {names}")
+                featuriser = Path(ROOT) / "cuda" / "rfd4p" / "featurise" / "rfd4p-featurise"
+                if featuriser.exists() and "job.json" in names:
+                    with tempfile.TemporaryDirectory() as tmp:
+                        job = Path(tmp) / "job.json"
+                        job.write_text(dict(archive["members"])["job.json"])
+                        r = subprocess.run([str(featuriser), str(Path(tmp) / "f"), f"--spec={job}",
+                                            f"--int8={Path(ROOT) / 'model-rfd4p-int8'}"], capture_output=True, text=True)
+                        if "100 tokens" not in r.stdout:
+                            bad.append(f"the archived job does not featurise natively to 100 tokens: "
+                                       f"{(r.stdout + r.stderr)[-300:]}")
+                        else:
+                            print("            the archived job featurises natively: 100 tokens")
 
         # 🔴 THE CONTACT VETO, PROVED BY ASKING FOR AN EPITOPE THAT CANNOT BE
         # TOUCHED. A filter that never fires is indistinguishable from no filter,
@@ -831,7 +868,7 @@ def main():
             bad.append(f"the labelled preset did not round-trip: {cath['contig']!r}")
         if cath["rows"] != 6:
             bad.append(f"the labelled preset filled {cath['rows']} rows, expected 6")
-        if cath["structures"] != ["HELIX", "LOOP", "STRAND", "LOOP", "HELIX", "STRAND"]:
+        if cath["structures"] != ["HELIX", "LOOP", "SHEET", "LOOP", "HELIX", "SHEET"]:
             bad.append(f"the secondary structures were not restored: {cath['structures']}")
         if cath["problems"] != "":
             bad.append(f"the labelled preset reported a problem: {cath['problems']!r}")
