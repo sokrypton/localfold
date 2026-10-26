@@ -219,7 +219,7 @@ Every intermediate seam is 1e-8 to 5e-7 in float32 (the monomer template's torsi
   contraction.
 - The MSA transition's second bias carried by the product, through a ones column.
 - Masks skipped when they are all ones.
-- CUDA graphs from 8 passes up (below that, capture costs more than it saves).
+- CUDA graphs from 2 passes up, captured while the GPU runs the pass before (see the PTX section's Module 6).
 
 On the A100, 5CAJ (261 residues, 512 + 1024 rows):
 
@@ -530,10 +530,24 @@ this kernel, ~1.5% of a fold.
   contraction row is written by many blocks of the input kernel, so it costs a quantising pass over a and b (~0.14
   ms a call at 522 residues) against ~0.13 ms saved on the 0.26 ms contraction. FP8, which needs no scales, bought
   2-7% on the cards that have it.
-- *CUDA graphs below eight passes* (`AF2_GRAPHS`): the same-shape job repeated, 68 residues 63.8 -> 57.8 ms and 261
-  301.5 -> 294.6, level at 522 and with an alignment, output identical. But the first fold in a process pays ~9 ms
-  more, and 68 residues folded after a 261-residue job gains nothing (63.5 against 64.4). Open - not a default
-  until that order dependence is understood.
+- *CUDA graphs below eight passes*: the same-shape job repeated, 68 residues 63.8 -> 57.8 ms and 261 301.5 -> 294.6,
+  output identical. The order dependence seen once (no gain at 68 after a 261-residue job) did not reproduce in four
+  runs - another process on the card. **Taken in Module 6**, below.
+
+**Module 6: graphs from two passes.** Every pass after the first replays one graph of its ~1,500-1,700 kernels, which
+closes the gaps between launches - ~2 ms a pass at any length. The old rule (8 passes) captured at pass 1, on the
+critical path whenever anything waits on pass 0, and the page's early stop (0.1 A, on by default) syncs after every
+pass. The capture (~5 ms of host time, ~2.3 to instantiate) now runs right after pass 0 is launched, while the GPU runs
+it; a shape the process has not folded runs pass 0 slowly on the host (its scratch grows), so it captures during pass 1
+instead, one replay fewer. A100, resident server, PDBs byte-identical to `AF2_NO_GRAPHS` in every arm:
+
+| | 68 res | 261 res | 522 res | 261 + MSA |
+|---|---:|---:|---:|---:|
+| a repeated shape | 63.9 -> **57.8 ms** | 301.2 -> **294.5** | 1077 -> 1074 | 1042 -> **1037** |
+| ...with the early stop at 0.1 A | 64.3 -> **58.3** | 303.9 -> **296.9** | 1089 -> **1084** | 1047 -> **1041** |
+| a new shape (the process's first at it) | 68.9 -> 70.2 | 319.8 -> **313.5** | 1089 -> 1087 | 1042 -> 1040 |
+
+A served process folds AF2's five models at one length in a row, so all but the first are the repeated row.
 
 ## A deep alignment's featurisation (2026-10-08)
 
