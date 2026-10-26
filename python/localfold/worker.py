@@ -523,7 +523,10 @@ class Worker:
         base, _, number = family.partition("-")
         af2_model = 1
         if base in ("monomer", "multimer"):
-            af2_model = int(number) if number.isdigit() else int(controls.get("af2Model") or 1)
+            # (the family names models 2-5; model 1's is the bare family, and its af2Model may read "all" - the page's
+            # "All 5" sends `monomer` for model 1 with the row's own value, which int() refused: the sweep's first job failed)
+            chosen = str(controls.get("af2Model") or "1")
+            af2_model = int(number) if number.isdigit() else int(chosen) if chosen.isdigit() else 1
             if not 1 <= af2_model <= 5:
                 raise Refused(f"AlphaFold 2 has models 1 to 5, not {af2_model}")
             family = base
