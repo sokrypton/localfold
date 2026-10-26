@@ -1,0 +1,1 @@
+{"input": "../../../tools/fixtures/rcsb/7m5w.cif.zst", "contig": "B1-18, /0, C1-18, /0, D101, /0, 50-50", "conditions": {"C_CRD": {"true": [{"select": "sel('B') or sel('C') or sel('D')"}]}}, "nsteps": 4}

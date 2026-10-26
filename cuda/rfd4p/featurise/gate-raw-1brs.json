@@ -1,0 +1,1 @@
+{"input": "../../../tools/fixtures/rcsb/1brs.cif.zst", "contig": "A1-110, /0, D1-89", "conditions": {"C_CRD": {"true": [{"select": "sel('A')"}]}, "C_SEQ": {"true": [{"select": "sel('A') or sel('D')"}]}}, "nsteps": 4}

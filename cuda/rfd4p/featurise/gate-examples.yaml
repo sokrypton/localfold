@@ -1,0 +1,16 @@
+# Upstream's spec shape: examples by name, `global_args` folded into each, a relative `input`
+# read against THIS file's directory. Both ports must take `--example=` and agree on it.
+global_args:
+  input: ../../../tools/fixtures/rcsb/6mrr.cif.zst   # a raw structure: prepared, not read as written
+binder:
+  contig: "A1-68, /0, 20-20"
+  conditions:
+    C_CRD:
+      true:
+        - select: "sel('A/*/[1-30]') and not has_nan_coord()"
+    C_HOT:
+      true:
+        - select: "sel('A/*/[10,14]/[CB]')"
+monomer:
+  input: ../../../tools/fixtures/rcsb/1brs.cif.zst
+  contig: "D1-89"

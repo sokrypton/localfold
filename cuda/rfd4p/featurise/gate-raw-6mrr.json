@@ -1,0 +1,1 @@
+{"input": "../../../tools/fixtures/rcsb/6mrr.cif.zst", "contig": "A1-68", "conditions": {"C_CRD": {"true": [{"select": "sel('A/*/[1-30]')"}]}, "C_SEQ": {"true": [{"select": "sel('A')"}]}}, "nsteps": 4}
