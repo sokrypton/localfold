@@ -1284,6 +1284,7 @@ int run(int argc, char** argv) {
   bool generate = false;
   string recycleSchedule = tables::DEFAULT_RECYCLE_SCHEDULE;
   rfd4p::PartialRequest partialReq;
+  rfd4p::SamplerCfg sampler = rfd4p::defaultSampler();
   for (int i = 1; i < argc; ++i) {
     const string a = argv[i];
     if (a.rfind("--", 0) != 0) { out = a; continue; }
@@ -1938,6 +1939,66 @@ int run(int argc, char** argv) {
         if (v && v->isString()) partialReq.inverseFoldingMethod = v->s;
       }
     }
+    // The sampler: upstream's config shape over the released defaults (flow.js `resolveSampling`).
+    if (const Json* sj = spec.get("sampling"); sj && !Json::absent(sj)) {
+      if (!sj->isObject()) { fprintf(stderr, "sampling must be a mapping\n"); return 1; }
+      for (const auto& [k, v] : sj->o) {
+        if (k != "bb_ca" && k != "local_latents" && k != "guidance_w") {
+          fprintf(stderr, "sampling has no setting '%s'; it takes bb_ca, local_latents and guidance_w\n", k.c_str());
+          return 1;
+        }
+      }
+      if (const Json* gw = sj->get("guidance_w"); gw && !Json::absent(gw) && gw->n != 1.0) {
+        fprintf(stderr, "Only support CFG when cath_code or x_motif is provided: an RFD4-Proteina batch has "
+                        "neither, so guidance_w %g cannot run (upstream asserts the same)\n", gw->n);
+        return 1;
+      }
+      for (int dm = 0; dm < 2; ++dm) {
+        const Json* mj = sj->get(dm == 0 ? "bb_ca" : "local_latents");
+        if (!mj || Json::absent(mj)) continue;
+        rfd4p::ModalityCfg& m = sampler.m[dm];
+        auto str = [&](const Json* o, const char* k, std::string& into) {
+          if (const Json* v = o ? o->get(k) : nullptr; v && v->isString()) into = v->s;
+        };
+        auto num = [&](const Json* o, const char* k, double& into) {
+          if (const Json* v = o ? o->get(k) : nullptr; v && v->isNumber()) into = v->n;
+        };
+        const Json* sc = mj->get("schedule");
+        str(sc, "mode", m.schedule.mode);
+        num(sc, "p", m.schedule.p);
+        double tail = m.schedule.tailSteps, mult = m.schedule.tailMult;
+        num(sc, "tail_steps", tail);
+        num(sc, "tail_step_multiplier", mult);
+        if (tail != 0 && (mult != std::floor(mult) || mult < 2)) {
+          fprintf(stderr, "tail_step_multiplier must be an integer >= 2\n");
+          return 1;
+        }
+        if (tail != 0 && !(tail >= 1)) { fprintf(stderr, "tail_steps must be positive\n"); return 1; }
+        m.schedule.tailSteps = (int)tail;
+        m.schedule.tailMult = (int)mult;
+        const Json* gt = mj->get("gt");
+        str(gt, "mode", m.gt.mode);
+        num(gt, "p", m.gt.p);
+        if (const Json* cv = gt ? gt->get("clamp_val") : nullptr; cv && cv->isNumber()) {
+          m.gt.clamp = true;
+          m.gt.clampVal = cv->n;
+        } else if (cv && cv->kind == Json::Null) {
+          m.gt.clamp = false;
+        }
+        const Json* st = mj->get("simulation_step_params");
+        if (!st) st = mj->get("step");
+        str(st, "sampling_mode", m.step.mode);
+        num(st, "sc_scale_noise", m.step.scScaleNoise);
+        num(st, "t_lim_ode", m.step.tLimOde);
+        num(st, "t_lim_ode_below", m.step.tLimOdeBelow);
+        num(st, "tsr_k", m.step.tsrK);
+        num(st, "tsr_sigma", m.step.tsrSigma);
+        if (const Json* c = st ? st->get("center_every_step") : nullptr; c && !Json::absent(c)) {
+          m.step.center = c->kind == Json::Bool ? c->b : c->n != 0;
+        }
+      }
+      rfd4p::validateSampler(sampler);
+    }
     const Json* cond = spec.get("conditions");
     if (cond && cond->isObject()) {
       for (const auto& [key, arms] : cond->o) {
@@ -2089,7 +2150,8 @@ int run(int argc, char** argv) {
   const int n = b.n;
 
   // The sampler's first step, exactly as the exporter reaches it.
-  const Schedule schedBb = bbCaSchedule(nsteps), schedLl = latentSchedule(nsteps);
+  const Schedule schedBb = rfd4p::buildSchedule(sampler.m[0], nsteps),
+                 schedLl = rfd4p::buildSchedule(sampler.m[1], nsteps);
   const double tBb = (float)schedBb.ts[step], tLl = (float)schedLl.ts[step];
   Rng rng((uint64_t)seed);
   const Emit emit = emitMasks(b);
@@ -2187,7 +2249,7 @@ int run(int argc, char** argv) {
       for (int dm = 0; dm < 2; ++dm) {
         const Schedule& sc = dm ? schedLl : schedBb;
         const double t2 = dm ? (float)schedLl.ts[s2] : (float)schedBb.ts[s2];
-        if (t2 != 0 && !(t2 > sc.step.tLimOde || t2 < sc.step.tLimOdeBelow)) {
+        if (rfd4p::isStochastic(t2, sc.step)) {
           vector<float> tmp((size_t)n * (dm ? 32 : 3));
           gp.randn(tmp.data(), tmp.size());
         }
@@ -2261,7 +2323,7 @@ int run(int argc, char** argv) {
   // nsteps)` steps off the TAIL of the full schedule; explicit start times expand a schedule
   // until its tail starts there; inverse folding runs the whole schedule from t = 0 against a
   // backbone resampled at every step. The depths are always the tail of the BASE run's.
-  const rfd4p::PartialT partialT = rfd4p::resolvePartialT(partialReq, nsteps);
+  const rfd4p::PartialT partialT = rfd4p::resolvePartialT(partialReq, nsteps, sampler);
   const bool isPartial = partialT.set, inverseFolding = partialReq.inverseFolding;
   const bool partialFrac = isPartial && !inverseFolding && !std::isnan(partialReq.fraction);
   if (isPartial && inputPath.empty()) {
@@ -2335,10 +2397,10 @@ int run(int argc, char** argv) {
   const int steps = partialFrac ? rfd4p::partialStepCount(partialReq.fraction, baseNsteps) : baseNsteps;
   const int fullNsteps = partialFrac ? baseNsteps : 0;
   const vector<int> depths = recycleDepths(recycleSchedule, steps, baseNsteps);
-  const Schedule genBb = isPartial ? rfd4p::partialSchedule(0, partialT.bbCa, steps, fullNsteps)
-                                   : bbCaSchedule(steps);
-  const Schedule genLl = isPartial ? rfd4p::partialSchedule(1, partialT.localLatents, steps, fullNsteps)
-                                   : latentSchedule(steps);
+  const Schedule genBb = isPartial ? rfd4p::partialSchedule(0, partialT.bbCa, steps, fullNsteps, sampler)
+                                   : rfd4p::buildSchedule(sampler.m[0], steps);
+  const Schedule genLl = isPartial ? rfd4p::partialSchedule(1, partialT.localLatents, steps, fullNsteps, sampler)
+                                   : rfd4p::buildSchedule(sampler.m[1], steps);
 
   int pairNoDistDim = 0;
   const vector<float> pairNoDist = pairFeatures(b, cfg, xBb, true, pairNoDistDim);
@@ -2356,8 +2418,7 @@ int run(int argc, char** argv) {
     for (int dm = 0; dm < 2; ++dm) {
       const Schedule& sc = dm ? genLl : genBb;
       const double t2 = dm ? t2Ll : t2Bb;
-      stochastic.push_back(
-          (t2 != 0 && !(t2 > sc.step.tLimOde || t2 < sc.step.tLimOdeBelow)) ? 1 : 0);
+      stochastic.push_back(rfd4p::isStochastic(t2, sc.step) ? 1 : 0);
     }
   }
 
@@ -2434,6 +2495,31 @@ int run(int argc, char** argv) {
   g.meta("distDim", cfg.xtPairDistDim);
   g.meta("distMin", cfg.xtPairDistMin);
   g.meta("distMax", cfg.xtPairDistMax);
+  // The sampler, for the fold to rebuild its schedules from (flow.js `samplingMeta`, same keys).
+  for (int dm = 0; dm < 2; ++dm) {
+    const rfd4p::ModalityCfg& m = sampler.m[dm];
+    const std::string tag = dm ? "sampLl" : "sampBb";
+    auto index = [](const std::string& v, std::initializer_list<const char*> names) {
+      int k = 0;
+      for (const char* nm : names) { if (v == nm) return k; ++k; }
+      return -1;
+    };
+    g.meta(tag + "Mode", index(m.step.mode, {"vf_tsr", "vf", "sc"}));
+    g.meta(tag + "Sched", index(m.schedule.mode, {"uniform", "power", "log"}));
+    g.meta(tag + "P", m.schedule.p);
+    g.meta(tag + "Tail", m.schedule.tailSteps);
+    g.meta(tag + "TailMult", m.schedule.tailMult);
+    g.meta(tag + "Gt", index(m.gt.mode, {"1/t", "1-t/t", "tan", "ode"}));
+    g.meta(tag + "GtP", m.gt.p);
+    g.meta(tag + "HasClamp", m.gt.clamp ? 1 : 0);
+    g.meta(tag + "Clamp", m.gt.clamp ? m.gt.clampVal : 0.0);
+    g.meta(tag + "Noise", m.step.scScaleNoise);
+    g.meta(tag + "Ode", m.step.tLimOde);
+    g.meta(tag + "OdeBelow", m.step.tLimOdeBelow);
+    g.meta(tag + "TsrK", m.step.tsrK);
+    g.meta(tag + "TsrSigma", m.step.tsrSigma);
+    g.meta(tag + "Center", m.step.center ? 1 : 0);
+  }
   // 🔴 THE CHIRALITY FRAMES, WHICH THIS WROTE AS ABSENT FOR EVERY JOB. A contig has none, and the
   // comment here said "a structure input will" - but nothing did, so a small molecule through
   // `--job` sampled with its chirality feature FROZEN at the clean structure's frame, the one

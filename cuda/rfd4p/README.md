@@ -298,6 +298,30 @@ export) and would have been the standalone form's first bug.
 `sum(depths)` JS trunk passes at about a minute each, so the preset's 60 steps is an afternoon.
 `--gen-oracle` is opt-in on the exporter for that reason.
 
+### Every sampler upstream offers, not only the released one
+
+A job may carry `sampling: {bb_ca: {...}, local_latents: {...}}` in upstream's own config shape
+(`schedule`, `gt`, `simulation_step_params`), and both ports run it: `sampling_mode` `vf_tsr` (the
+released sampler, the default), `vf` (the flow's ODE) and `sc` (the SDE, stochastic inside
+`[t_lim_ode_below, t_lim_ode]` and a 1.5x score on the ODE tail outside it); every schedule shape
+with its tail; `gt`'s power and `clamp_val`; `center_every_step`. `shared/rfd4p/flow.js`'s
+`resolveSampling` validates with upstream's own messages, the featuriser writes the resolved
+configuration into the gen meta as `samp*` keys, and `rfd4p.cu` reads it back - so the trajectory
+arm `sampler` (`featurise/gate-sampling.json`: `sc` re-centred on the backbone, `vf` over a log
+schedule on the latents, a gt power and clamp) holds the native loop to `generateRfd4pCpu` over
+it, and `tools/check-rfd4p-sampler.py` holds flow.js to upstream's `sample_schedule` and
+`RDNFlowMatcher.simulation_step` over seven configurations (bounds 2e-5 / 1e-4; a wrong formula
+reads 1e-2 or worse). The page refuses `center_every_step` by name; its WGSL step takes the other
+modes.
+
+🔴 **TWO THINGS UPSTREAM OFFERS ARE REFUSED, AND WHY.** Classifier-free guidance (`guidance_w !=
+1`) cannot run in upstream on an RFD4 batch at all - its unconditional pass asserts `cath_code`
+and `x_motif`, which RFD4 batches do not carry - so there is no reference to hold a port to, and
+the job is refused by name rather than run as something unverifiable. The guidance MODEL
+(`contract_ca` and its kin) is a differentiable-metric test configuration that needs a backward
+pass through the decoder at every step; neither port has a backward and it is not part of the
+released sampler, so it is declined, not deferred.
+
 ## The featuriser in C++, held to the JavaScript's BYTES
 
 `cuda/rfd4p/featurise/rfd4p-featurise` takes a condition spec and writes the port's input

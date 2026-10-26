@@ -76,6 +76,12 @@ TRAJECTORIES = [
      True),
     ("smallmol", HERE / "data-smg",
      ["--preset=sm_sam", "--generate", "--gen-oracle", "--steps=2"], False),
+    # 🔴 AND UPSTREAM'S OTHER SAMPLERS, which neither port ran: the backbone on the SDE (`sc`)
+    # re-centred every step with a `gt` power and clamp, the latents on the plain ODE (`vf`) over
+    # another schedule - a job's `sampling`, in upstream's config shape.
+    # tools/check-rfd4p-sampler.py holds the schedules and steps to upstream's own.
+    ("sampler", HERE / "data-samp",
+     [f"--spec={HERE / 'featurise' / 'gate-sampling.json'}", "--generate", "--gen-oracle", "--steps=2"], False),
 ]
 # 🔴 THE NATIVE FEATURISER IS HELD TO BYTES, NOT TO A TOLERANCE. `export_input.mjs` drives the
 # page's own shared/rfd4p/ and stays as the reference; `rfd4p-featurise` writes the same
@@ -572,6 +578,11 @@ def main() -> int:
             write_relabelled_case(REPO / "tools" / "fixtures" / "rcsb" / "6mrr.cif.zst",
                                   HERE / "featurise" / "gate-multi-yz.cif", multi)
             cases.append(("multi", [f"--spec={multi}"], [f"--spec={multi}"]))
+            # 🔴 AND A JOB'S `sampling`, in upstream's config shape: the SDE re-centred each step
+            # on the backbone, the plain ODE on the latents, a gt power and clamp - every key lands
+            # in the gen meta the native sampler reads.
+            sampling = HERE / "featurise" / "gate-sampling.json"
+            cases.append(("sampling", [f"--spec={sampling}"], [f"--spec={sampling}"]))
             # 🔴 AND THE GENERATION DIRECTORY, NOT ONLY THE TRUNK'S INPUT. `--generate` writes the
             # per-step conditioning, the emit masks, the recycle depths and the NOISE - which the
             # C++ now draws rather than replays, so Box-Muller is compared here too. Without this
@@ -1055,6 +1066,20 @@ def main() -> int:
                     failed += 1
                     print(r.stdout[-1500:], r.stderr[-600:])
                 print(f"  {'load':10s} {m.group(1) if m else '?'} loads against atomworks, "
+                      f"{m.group(2) if m else '?'} differing  {'ok ' if ok else 'DIFFERS'}")
+
+            # 🔴 AND THE SAMPLER, AGAINST UPSTREAM'S OWN `sample_schedule` AND `simulation_step`:
+            # every mode a job's `sampling` may name (vf, sc, vf_tsr), the gt transforms and clamp,
+            # the schedule shapes and re-centring. The sampler trajectory above holds the native
+            # loop to flow.js; this holds flow.js to upstream.
+            if venv.exists():
+                r = run([venv, REPO / "tools" / "check-rfd4p-sampler.py"], cwd=REPO)
+                m = re.search(r"(\d+) configurations, (\d+) differing", r.stdout)
+                ok = r.returncode == 0 and m is not None
+                if not ok:
+                    failed += 1
+                    print(r.stdout[-1500:], r.stderr[-600:])
+                print(f"  {'sampling':10s} {m.group(1) if m else '?'} configurations against upstream, "
                       f"{m.group(2) if m else '?'} differing  {'ok ' if ok else 'DIFFERS'}")
 
     name, case_dir, export_flags, fold_flags = SPEED

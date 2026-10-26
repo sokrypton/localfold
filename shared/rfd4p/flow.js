@@ -15,12 +15,12 @@ export const DEFAULT_SAMPLING = {
   bb_ca: {
     schedule: { mode: 'log', p: 2.0, tail_steps: 10, tail_step_multiplier: 2 },
     gt: { mode: '1/t', p: 1.0, clamp_val: null },
-    step: { sampling_mode: 'vf_tsr', sc_scale_noise: 1.0, t_lim_ode: 0.95, t_lim_ode_below: 0.02, tsr_k: 16.0, tsr_sigma: 3.0 },
+    step: { sampling_mode: 'vf_tsr', sc_scale_noise: 1.0, t_lim_ode: 0.95, t_lim_ode_below: 0.02, center_every_step: false, tsr_k: 16.0, tsr_sigma: 3.0 },
   },
   local_latents: {
     schedule: { mode: 'power', p: 2.0, tail_steps: 10, tail_step_multiplier: 2 },
     gt: { mode: 'tan', p: 1.0, clamp_val: null },
-    step: { sampling_mode: 'vf_tsr', sc_scale_noise: 1.0, t_lim_ode: 0.95, t_lim_ode_below: 0.02, tsr_k: 4.0, tsr_sigma: 12.0 },
+    step: { sampling_mode: 'vf_tsr', sc_scale_noise: 1.0, t_lim_ode: 0.95, t_lim_ode_below: 0.02, center_every_step: false, tsr_k: 4.0, tsr_sigma: 12.0 },
   },
   /** `product_flowmatcher.bb_ca` stochastic centering (bundle config). */
   centering: { scale: 0.2 },
@@ -115,19 +115,52 @@ function baseScheduleTsrSafe(mode, nsteps, p, eps = 1e-3) {
   throw new Error(`schedule mode ${mode} not supported`);
 }
 
-/** `get_schedule_tsr_safe` with `_schedule_with_tail_multiplier`. */
-export function scheduleTsrSafe({ mode, p, tail_steps = 0, tail_step_multiplier = 1 }, nsteps) {
+/**
+ * `get_schedule` (no tail) - the `vf` and `sc` modes' schedule, which starts AT t = 0 where the
+ * `vf_tsr` one starts at eps (`get_schedule_tsr_safe`), the score being undefined there under TSR.
+ */
+function baseSchedule(mode, nsteps, p) {
+  if (mode === 'uniform') return linspace(0, 1, nsteps + 1);
+  if (mode === 'power') return linspace(0, 1, nsteps + 1).map((v) => v ** p);
+  if (mode === 'log') {
+    if (!(p > 0)) throw new Error(`p1 must be >0 for the log schedule, got ${p}`);
+    const e = linspace(-p, 0, nsteps + 1);
+    const t = new Float64Array(nsteps + 1);
+    for (let i = 0; i <= nsteps; i += 1) t[i] = 1 - 10 ** e[nsteps - i];
+    let mn = Infinity;
+    for (const v of t) mn = Math.min(mn, v);
+    for (let i = 0; i <= nsteps; i += 1) t[i] -= mn;
+    let mx = -Infinity;
+    for (const v of t) mx = Math.max(mx, v);
+    for (let i = 0; i <= nsteps; i += 1) t[i] /= mx;
+    return t;
+  }
+  throw new Error(`Schedule mode not recognized ${mode}`);
+}
+
+/** `_schedule_with_tail_multiplier` over either base schedule. */
+function withTail(base, { mode, p, tail_steps = 0, tail_step_multiplier = 1 }, nsteps) {
   const m = tail_step_multiplier;
   const tsSteps = nsteps >= tail_steps * m ? tail_steps : Math.floor(nsteps / (2 * Math.max(1, m)));
-  if (!tsSteps) return baseScheduleTsrSafe(mode, nsteps, p);
-  const base = nsteps - (m - 1) * tsSteps;
-  const fine = base * m;
-  const tailStart = (base - tsSteps) * m;
-  const full = baseScheduleTsrSafe(mode, fine, p);
+  if (!tsSteps) return base(mode, nsteps, p);
+  const baseSteps = nsteps - (m - 1) * tsSteps;
+  const fine = baseSteps * m;
+  const tailStart = (baseSteps - tsSteps) * m;
+  const full = base(mode, fine, p);
   const idx = [];
   for (let i = 0; i < tailStart; i += m) idx.push(i);
   for (let i = tailStart; i <= fine; i += 1) idx.push(i);
   return Float64Array.from(idx, (i) => full[i]);
+}
+
+/** `get_schedule_tsr_safe` with `_schedule_with_tail_multiplier`. */
+export function scheduleTsrSafe(schedule, nsteps) {
+  return withTail(baseScheduleTsrSafe, schedule, nsteps);
+}
+
+/** `get_schedule` with `_schedule_with_tail_multiplier`: the schedule of the `vf` and `sc` modes. */
+export function scheduleFull(schedule, nsteps) {
+  return withTail(baseSchedule, schedule, nsteps);
 }
 
 /** `compute_tsr_ratio`. */
@@ -136,18 +169,32 @@ export function tsrRatio(t, k, sigma) {
   return (snr * sigma * sigma + 1) / ((snr * sigma * sigma) / k + 1);
 }
 
-/** `get_gt` (f_pow 1, eps 1e-2), divided by tsr_ratio^2 for `vf_tsr`. */
-export function noiseSchedule(ts, { mode, p, clamp_val }, step) {
-  if (p !== 1) throw new Error('gt transform p != 1 not implemented');
+/**
+ * `get_gt` (eps 1e-2), divided by tsr_ratio^2 for `vf_tsr`. `p` is `transform_gt`'s power: the
+ * schedule's logs centred, squashed by a sigmoid, raised to `p` and unsquashed (`logit`, eps 1e-6);
+ * `clamp_val` caps it (and `torch.clamp` floors it at 0).
+ */
+export function noiseSchedule(ts, { mode, p = 1, clamp_val }, step) {
   const g = new Float64Array(ts.length - 1);
+  if (mode === 'ode') return g;
   for (let i = 0; i < g.length; i += 1) {
     const t = Math.min(Math.max(ts[i], 0), 1 - 1e-5);
-    let v;
-    if (mode === '1/t') v = 1 / (t + 1e-2);
-    else if (mode === '1-t/t') v = (1 - t) / (t + 1e-2);
-    else if (mode === 'tan') v = ((Math.PI / 2) * Math.sin(((1 - t) * Math.PI) / 2)) / (Math.cos(((1 - t) * Math.PI) / 2) + 1e-2);
-    else if (mode === 'ode') v = 0;
-    else throw new Error(`gt mode ${mode} not implemented`);
+    if (mode === '1/t') g[i] = 1 / (t + 1e-2);
+    else if (mode === '1-t/t') g[i] = (1 - t) / (t + 1e-2);
+    else if (mode === 'tan') g[i] = ((Math.PI / 2) * Math.sin(((1 - t) * Math.PI) / 2)) / (Math.cos(((1 - t) * Math.PI) / 2) + 1e-2);
+    else throw new Error(`gt not implemented ${mode}`);
+  }
+  if (p !== 1) {
+    const logs = Array.from(g, Math.log);
+    const mean = logs.reduce((a, b) => a + b, 0) / logs.length;
+    for (let i = 0; i < g.length; i += 1) {
+      const sig = 1 / (1 + Math.exp(-(logs[i] - mean)));
+      const q = Math.min(Math.max(sig ** p, 1e-6), 1 - 1e-6);
+      g[i] = Math.exp(Math.log(q / (1 - q)) + mean);
+    }
+  }
+  for (let i = 0; i < g.length; i += 1) {
+    let v = Math.max(g[i], 0);
     if (clamp_val != null) v = Math.min(v, clamp_val);
     if (step.sampling_mode === 'vf_tsr') v /= tsrRatio(ts[i], step.tsr_k ?? 1, step.tsr_sigma ?? 1) ** 2;
     g[i] = v;
@@ -155,13 +202,94 @@ export function noiseSchedule(ts, { mode, p, clamp_val }, step) {
   return g;
 }
 
+const SAMPLING_MODES = ['vf', 'sc', 'vf_tsr'];
+
+/**
+ * A job's `sampling` over the released defaults, in upstream's own config shape (`model.bb_ca` /
+ * `model.local_latents`, each `schedule`, `gt`, `simulation_step_params`), validated as upstream
+ * asserts it. `guidance_w` must be 1: upstream's unconditional pass asserts the batch carries a
+ * `cath_code` or `x_motif`, and an RFD4-Proteina batch carries neither, so any other weight raises
+ * there for every job - refused here in its words rather than run as something it is not.
+ */
+export function resolveSampling(override = {}) {
+  const out = { ...DEFAULT_SAMPLING };
+  if (override.guidance_w !== undefined && override.guidance_w !== 1) {
+    throw new Error('Only support CFG when cath_code or x_motif is provided: an RFD4-Proteina batch has '
+      + `neither, so guidance_w ${override.guidance_w} cannot run (upstream asserts the same)`);
+  }
+  for (const dm of ['bb_ca', 'local_latents']) {
+    const o = override[dm] ?? {};
+    const base = DEFAULT_SAMPLING[dm];
+    const step = { ...base.step, ...(o.simulation_step_params ?? o.step ?? {}) };
+    const sched = { ...base.schedule, ...(o.schedule ?? {}) };
+    const gt = { ...base.gt, ...(o.gt ?? {}) };
+    if (!SAMPLING_MODES.includes(step.sampling_mode)) {
+      throw new Error(`Invalid sampling mode ${step.sampling_mode}, should be \`vf\`, \`sc\`, or \`vf_tsr\``);
+    }
+    if (!(step.sc_scale_noise >= 0)) throw new Error(`Scale noise for sampling should be >= 0, got ${step.sc_scale_noise}`);
+    if (!['uniform', 'power', 'log'].includes(sched.mode)) {
+      throw new Error(`Schedule mode not recognized ${sched.mode}`);
+    }
+    if (sched.tail_steps) {
+      if (!(sched.tail_steps >= 1)) throw new Error('tail_steps must be positive');
+      if (!Number.isInteger(sched.tail_step_multiplier) || sched.tail_step_multiplier < 2) {
+        throw new Error('tail_step_multiplier must be an integer >= 2');
+      }
+    }
+    if (!['1/t', '1-t/t', 'tan', 'ode'].includes(gt.mode)) throw new Error(`gt not implemented ${gt.mode}`);
+    out[dm] = { schedule: sched, gt, step };
+  }
+  for (const k of Object.keys(override)) {
+    if (!['bb_ca', 'local_latents', 'guidance_w'].includes(k)) {
+      throw new Error(`sampling has no setting '${k}'; it takes bb_ca, local_latents and guidance_w`);
+    }
+  }
+  return out;
+}
+
+/**
+ * The sampler, as the numbers a generation directory carries for the native fold to rebuild its
+ * schedules from (cuda/rfd4p's `samplerFromMeta`): per modality, every setting by code.
+ */
+export function samplingMeta(sampling) {
+  const out = {};
+  for (const [dm, tag] of [['bb_ca', 'Bb'], ['local_latents', 'Ll']]) {
+    const { schedule, gt, step } = sampling[dm];
+    Object.assign(out, {
+      [`samp${tag}Mode`]: ['vf_tsr', 'vf', 'sc'].indexOf(step.sampling_mode),
+      [`samp${tag}Sched`]: ['uniform', 'power', 'log'].indexOf(schedule.mode),
+      [`samp${tag}P`]: schedule.p,
+      [`samp${tag}Tail`]: schedule.tail_steps ?? 0,
+      [`samp${tag}TailMult`]: schedule.tail_step_multiplier ?? 1,
+      [`samp${tag}Gt`]: ['1/t', '1-t/t', 'tan', 'ode'].indexOf(gt.mode),
+      [`samp${tag}GtP`]: gt.p ?? 1,
+      [`samp${tag}HasClamp`]: gt.clamp_val == null ? 0 : 1,
+      [`samp${tag}Clamp`]: gt.clamp_val ?? 0,
+      [`samp${tag}Noise`]: step.sc_scale_noise,
+      [`samp${tag}Ode`]: step.t_lim_ode,
+      [`samp${tag}OdeBelow`]: step.t_lim_ode_below,
+      [`samp${tag}TsrK`]: step.tsr_k,
+      [`samp${tag}TsrSigma`]: step.tsr_sigma,
+      [`samp${tag}Center`]: step.center_every_step ? 1 : 0,
+    });
+  }
+  return out;
+}
+
+/** Whether a step of this modality draws noise - upstream's branches, per mode. */
+export function isStochasticStep(t, step) {
+  if (step.sampling_mode === 'vf') return false;
+  if (step.sampling_mode === 'sc') return !(t > step.t_lim_ode);
+  return t !== 0 && !(t > step.t_lim_ode || t < step.t_lim_ode_below);
+}
+
 /** Per-modality time and noise schedules (`ProductSpaceFlowMatcher.sample_schedule`). */
 export function sampleSchedule(sampling = DEFAULT_SAMPLING) {
   const out = {};
   for (const dm of ['bb_ca', 'local_latents']) {
     const a = sampling[dm];
-    if (a.step.sampling_mode !== 'vf_tsr') throw new Error('only vf_tsr sampling is ported');
-    const ts = scheduleTsrSafe(a.schedule, sampling.nsteps);
+    const ts = a.step.sampling_mode === 'vf_tsr' ? scheduleTsrSafe(a.schedule, sampling.nsteps)
+      : scheduleFull(a.schedule, sampling.nsteps);
     out[dm] = { ts, gt: noiseSchedule(ts, a.gt, a.step), step: a.step };
   }
   return out;
@@ -228,28 +356,53 @@ export function sampleInitialNoise({ n, emit, coordCondMask, moleculeIid, rng, c
 }
 
 /**
- * One `vf_tsr` Euler(-Maruyama) step for one modality (`simulation_step`), in place.
- * Noise is drawn only inside the stochastic window, as upstream does.
+ * One Euler(-Maruyama) step for one modality (`simulation_step`), in place, in any of upstream's
+ * three modes: `vf` (the flow's ODE), `sc` (the SDE with the score, a low-temperature ODE past
+ * `t_lim_ode`) and `vf_tsr` (the released one: the score time-scale-rescaled, stochastic only
+ * between `t_lim_ode_below` and `t_lim_ode`). Noise is drawn only on a stochastic step, as upstream
+ * does; `center_every_step` re-centres the emitted tokens after the mask.
  * @returns {Float32Array} the clean-sample estimate x1 = x_t + (1 - t) v (emit-masked)
  */
 export function simulationStep({ x, v, t, dt, gt, emit, dim, step, rng }) {
-  const { tsr_k: k, tsr_sigma: sigma, t_lim_ode: hi, t_lim_ode_below: lo, sc_scale_noise: scn } = step;
-  const n = emit.length;
+  const { sampling_mode: mode = 'vf_tsr', tsr_k: k, tsr_sigma: sigma, sc_scale_noise: scn } = step;
   const x1 = new Float32Array(x.length);
   for (let i = 0; i < x.length; i += 1) x1[i] = emit[(i / dim) | 0] ? f32(x[i] + f32((1 - t) * v[i])) : 0;
-  if (t === 0) return x1; // v_scaled = 0
-  const r = tsrRatio(t, k, sigma);
-  const stochastic = !(t > hi || t < lo);
+  if (mode === 'vf_tsr' && t === 0) return x1; // v_scaled = 0
+  const stochastic = isStochasticStep(t, step);
   const eps = stochastic ? rng.randn(x.length) : null;
   const std = stochastic ? Math.sqrt(2 * gt * scn * dt) : 0;
+  // `vf_tsr` rescales the score by the tsr ratio; `sc` by 1.5 on its ODE tail (`endpoint_score_scale`).
+  const r = mode === 'vf_tsr' ? tsrRatio(t, k, sigma) : 1.5;
   for (let i = 0; i < x.length; i += 1) {
-    const score = (t * v[i] - x[i]) / (1 - t);
-    const ss = score * r;
-    const vs = (x[i] + (1 - t) * ss) / t;
-    const delta = stochastic ? (vs + gt * ss) * dt + std * eps[i] : vs * dt;
+    let delta;
+    if (mode === 'vf') {
+      delta = v[i] * dt;
+    } else {
+      const score = (t * v[i] - x[i]) / (1 - t);
+      if (mode === 'sc' && stochastic) {
+        delta = (v[i] + gt * score) * dt + std * eps[i];
+      } else {
+        const ss = score * r;
+        const vs = (x[i] + (1 - t) * ss) / t;
+        delta = stochastic ? (vs + gt * ss) * dt + std * eps[i] : vs * dt;
+      }
+    }
     x[i] = emit[(i / dim) | 0] ? f32(x[i] + delta) : 0;
   }
-  void n;
+  if (step.center_every_step) {
+    // `_force_zero_com`: (x - mean_w_mask(x, emit)) * emit.
+    const mean = new Float64Array(dim);
+    let count = 0;
+    for (let tok = 0; tok * dim < x.length; tok += 1) {
+      if (!emit[tok]) continue;
+      count += 1;
+      for (let d = 0; d < dim; d += 1) mean[d] += x[tok * dim + d];
+    }
+    for (let d = 0; d < dim; d += 1) mean[d] = f32(mean[d] / Math.max(count, 1));
+    for (let tok = 0; tok * dim < x.length; tok += 1) {
+      for (let d = 0; d < dim; d += 1) x[tok * dim + d] = emit[tok] ? f32(x[tok * dim + d] - mean[d]) : 0;
+    }
+  }
   return x1;
 }
 

@@ -530,11 +530,18 @@ export class Rfd4pTrunkGpu {
     let v_i = b1[i];
     x1 = x_i + (1.0 - t) * v_i;
     let eps_i = b2[16u + i];
+    // Slots 12/13: the modality's mode - 0 vf_tsr, 1 vf (the flow's ODE), 2 sc (the SDE).
+    let mode = b2[select(13u, 12u, isBb)];
     let score = (t * v_i - x_i) / (1.0 - t);
     let ss = score * r;
     let vs = (x_i + (1.0 - t) * ss) / t;
-    let delta = select(vs * dt, (vs + gt * ss) * dt + sd * eps_i, stoch != 0.0);
-    x_next = select(x_i + delta, x_i, t == 0.0);
+    var delta = select(vs * dt, (vs + gt * ss) * dt + sd * eps_i, stoch != 0.0);
+    if (mode == 1.0) {
+      delta = v_i * dt;
+    } else if (mode == 2.0 && stoch != 0.0) {
+      delta = (v_i + gt * score) * dt + sd * eps_i;
+    }
+    x_next = select(x_i + delta, x_i, t == 0.0 && mode == 0.0);
   }
   b0[seqIdx] = x_next;
   b1[i] = x_next;

@@ -19,6 +19,7 @@ import { pairCondFeatures, pairFeatures, trunkCondFeatures, trunkSeqFeatures } f
 import {
   DEFAULT_SAMPLING,
   flowEmitMasks,
+  isStochasticStep,
   DEFAULT_RECYCLE_SCHEDULE,
   recycleDepths,
   sampleInitialNoise,
@@ -145,6 +146,13 @@ export class Rfd4pGeneratorGpu {
     const pad = tensorData(batch, 'padding_mask');
     const n = batch.padding_mask?.shape ? batch.padding_mask.shape.at(-1) : pad.length;
     const sampling = opts.sampling ?? DEFAULT_SAMPLING;
+    // 🔴 RE-CENTRING EVERY STEP IS A REDUCTION THIS ENGINE'S STEP DOES NOT HAVE, so it is refused by
+    // name rather than skipped: the native port and the CPU reference run it.
+    for (const dm of ['bb_ca', 'local_latents']) {
+      if (sampling[dm]?.step?.center_every_step) {
+        throw new Error(`center_every_step (${dm}) is not implemented on WebGPU; the native port runs it`);
+      }
+    }
     const baseNsteps = opts.nsteps ?? sampling.nsteps;
     const rng = opts.rng ?? seededRng(opts.seed ?? 0);
     const decodeEvery = opts.decodeEvery ?? 0;
@@ -301,9 +309,12 @@ export class Rfd4pGeneratorGpu {
           const dt = ts[s + 1] - ts[s];
           const gt = sched[dm].gt[s];
           const stepCfg = sched[dm].step;
-          const r = t === 0 ? 0 : tsrRatio(t, stepCfg.tsr_k, stepCfg.tsr_sigma);
-          const stochastic = t !== 0 && !(t > stepCfg.t_lim_ode || t < stepCfg.t_lim_ode_below);
+          const mode = ['vf_tsr', 'vf', 'sc'].indexOf(stepCfg.sampling_mode);
+          // The score's rescaling: the tsr ratio for vf_tsr, 1.5 on sc's ODE tail (flow.js).
+          const r = mode === 0 ? (t === 0 ? 0 : tsrRatio(t, stepCfg.tsr_k, stepCfg.tsr_sigma)) : 1.5;
+          const stochastic = isStochasticStep(t, stepCfg);
           const std = stochastic ? Math.sqrt(2 * gt * stepCfg.sc_scale_noise * dt) : 0;
+          simBuf[dm === 'bb_ca' ? 12 : 13] = mode;
           const len = dm === 'bb_ca' ? n * 3 : n * 32;
           simBuf[pOff] = t;
           simBuf[pOff + 1] = dt;

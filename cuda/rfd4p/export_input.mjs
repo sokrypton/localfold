@@ -47,7 +47,8 @@ import {
   pairCondFeatures, pairFeatures, trunkCondFeatures, trunkSeqFeatures,
 } from "../../shared/rfd4p/features.js";
 import {
-  DEFAULT_RECYCLE_SCHEDULE, DEFAULT_SAMPLING, flowEmitMasks, recycleDepths, sampleInitialNoise, sampleSchedule, seededRng,
+  DEFAULT_RECYCLE_SCHEDULE, DEFAULT_SAMPLING, flowEmitMasks, isStochasticStep, recycleDepths, resolveSampling,
+  sampleInitialNoise, sampleSchedule, samplingMeta, seededRng,
 } from "../../shared/rfd4p/flow.js";
 import {
   buildPartialSchedule, partialStepCount, resolvePartialT,
@@ -155,10 +156,19 @@ const preset = specPath
         partialTBackbone: job.partialTBackbone ?? job.partial_t_backbone,
         partialTLatent: job.partialTLatent ?? job.partial_t_latent,
         couplePartialT: job.couplePartialT ?? job.couple_partial_t,
+        sampling: job.sampling,
       };
     })()
   : getRfd4pPresetById(presetId);
 if (!preset) { console.error(`no preset ${presetId}`); process.exit(1); }
+// The sampler: the released one, or the job's `sampling` over it (upstream's config shape).
+let SAMPLING;
+try {
+  SAMPLING = resolveSampling(preset.sampling ?? {});
+} catch (err) {
+  console.error(err.message);
+  process.exit(1);
+}
 // 🔴 A PRESET'S STRUCTURE IS A FILE IN THIS CHECKOUT, NOT A FETCH. This used to refuse every
 // conditioned preset with "only the pure-spec presets export offline", which was never true: the
 // seven examples the page names are `web/examples/*.cif.zst`, shipped here, and the page fetches
@@ -299,7 +309,7 @@ const emit = flowEmitMasks({
   is_in_context_conditioning: field("is_in_context_conditioning"),
   supports_local_latent: field("supports_local_latent"),
 }, n);
-const sched = sampleSchedule({ ...DEFAULT_SAMPLING, nsteps: preset.nsteps ?? DEFAULT_SAMPLING.nsteps });
+const sched = sampleSchedule({ ...SAMPLING, nsteps: preset.nsteps ?? DEFAULT_SAMPLING.nsteps });
 const x = sampleInitialNoise({
   n, emit, coordCondMask: field("coord_cond_mask"), moleculeIid: field("molecule_iid"),
   rng, centeringScale: DEFAULT_SAMPLING.centering?.scale ?? 0.2,
@@ -512,7 +522,7 @@ if (generate) {
     ...(preset.partialTLatent != null ? { partialTLatent: preset.partialTLatent } : {}),
     ...(preset.couplePartialT != null ? { couplePartialT: preset.couplePartialT } : {}),
   };
-  const partialTDict = resolvePartialT(partialOpts, DEFAULT_SAMPLING);
+  const partialTDict = resolvePartialT(partialOpts, SAMPLING);
   const isPartial = Object.keys(partialTDict).length > 0;
   const steps = isPartial && frac != null ? partialStepCount(frac, baseNsteps) : baseNsteps;
   // 🔴 `fullNsteps` IS baseNsteps ALWAYS, not only when partial - that is what `generateRfd4pCpu`
@@ -520,9 +530,9 @@ if (generate) {
   const depths = recycleDepths(recycleOverride || preset.recycleSchedule || DEFAULT_RECYCLE_SCHEDULE, steps,
     baseNsteps);
   const genSched = isPartial
-    ? buildPartialSchedule(partialTDict, steps, DEFAULT_SAMPLING,
+    ? buildPartialSchedule(partialTDict, steps, SAMPLING,
       { fullNsteps: frac != null ? baseNsteps : null })
-    : sampleSchedule({ ...DEFAULT_SAMPLING, nsteps: steps });
+    : sampleSchedule({ ...SAMPLING, nsteps: steps });
   const pairNoDist = pairFeatures(batch, {
     n, caNm: x.bb_ca, feats: nn.feats_pair_repr,
     dist: { dim: nn.xt_pair_dist_dim, min: nn.xt_pair_dist_min, max: nn.xt_pair_dist_max },
@@ -591,8 +601,7 @@ if (generate) {
     crdPerm.push(...rng2.randperm(crdUniqAll.length));
     for (const dm of ["bb_ca", "local_latents"]) {
       const t2 = Math.fround(genSched[dm].ts[s2]);
-      const cfg2 = genSched[dm].step;
-      const stochastic = t2 !== 0 && !(t2 > cfg2.t_lim_ode || t2 < cfg2.t_lim_ode_below);
+      const stochastic = isStochasticStep(t2, genSched[dm].step);
       stepNoise.push(stochastic ? 1 : 0);
       if (stochastic) take(n * (dm === "bb_ca" ? 3 : latentDim));
     }
@@ -649,6 +658,7 @@ if (generate) {
     distDim: nn.xt_pair_dist_dim,
     distMin: nn.xt_pair_dist_min,
     distMax: nn.xt_pair_dist_max,
+    ...samplingMeta(SAMPLING),
   }, {
     "g/depths": Int32Array.from(depths),
     "g/stochastic": Int32Array.from(stepNoise),
@@ -702,6 +712,8 @@ if (generate) {
     const gen = await generateRfd4pCpu(batch, weights, cfg, {
       ...partialOpts,
       seed,
+      // The job's sampler, which the port is handed through `-gen`'s meta.
+      sampling: SAMPLING,
       // 🔴 THE SAME RECYCLE SCHEDULE THE PORT IS HANDED, SAID OUT LOUD. `generateRfd4pCpu`
       // defaults to `medium` and the exporter writes `g/depths` from the PRESET's, so leaving it
       // off ran the reference at six recycles against the port's four - the two sides doing

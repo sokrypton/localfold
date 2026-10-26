@@ -257,8 +257,40 @@ int run(const Opts& o) {
 //
 // The flow loop: sixty steps of trunk, each advancing x by one Euler-Maruyama step, then one
 // decode of the finished state into atoms.
+// The sampler the featuriser resolved from the job (flow.js `samplingMeta`), or the released one
+// for a directory written before it carried one.
+static rfd4p::SamplerCfg samplerFromMeta() {
+  rfd4p::SamplerCfg sampler = rfd4p::defaultSampler();
+  if (!M.has("meta/sampBbMode")) return sampler;
+  static const char* MODES[] = {"vf_tsr", "vf", "sc"};
+  static const char* SCHEDS[] = {"uniform", "power", "log"};
+  static const char* GTS[] = {"1/t", "1-t/t", "tan", "ode"};
+  for (int dm = 0; dm < 2; ++dm) {
+    const std::string tag = dm ? "meta/sampLl" : "meta/sampBb";
+    auto get = [&](const char* k) { return M.meta(tag + k, 0); };
+    rfd4p::ModalityCfg& m = sampler.m[dm];
+    m.step.mode = MODES[(int)get("Mode")];
+    m.schedule.mode = SCHEDS[(int)get("Sched")];
+    m.schedule.p = get("P");
+    m.schedule.tailSteps = (int)get("Tail");
+    m.schedule.tailMult = (int)get("TailMult");
+    m.gt.mode = GTS[(int)get("Gt")];
+    m.gt.p = get("GtP");
+    m.gt.clamp = get("HasClamp") != 0;
+    m.gt.clampVal = get("Clamp");
+    m.step.scScaleNoise = get("Noise");
+    m.step.tLimOde = get("Ode");
+    m.step.tLimOdeBelow = get("OdeBelow");
+    m.step.tsrK = get("TsrK");
+    m.step.tsrSigma = get("TsrSigma");
+    m.step.center = get("Center") != 0;
+  }
+  return sampler;
+}
+
 int generate(const Opts& o, const rfd4p::Dims& d, rfd4p::Trunk& t) {
   const int n = d.n;
+  const rfd4p::SamplerCfg sampler = samplerFromMeta();
   const int steps = (int)M.meta("meta/steps");
   const int condDim = d.condF, pairDim = d.pairF;
   const std::vector<float> emitBb = download(Fdev("g/emitBb"), n);
@@ -342,7 +374,8 @@ int generate(const Opts& o, const rfd4p::Dims& d, rfd4p::Trunk& t) {
         if (!emitBb[i]) targetBb[i * 3] = targetBb[i * 3 + 1] = targetBb[i * 3 + 2] = 0.f;
       }
       bb = rfd4p::noisedTargetBackbone(targetBb, rfd4p::partialSchedule(0, pt.bbCa, steps,
-                                                                        (int)M.meta("meta/fullNsteps", 0)).ts[0],
+                                                                        (int)M.meta("meta/fullNsteps", 0),
+                                                                        sampler).ts[0],
                                        n, emitBb.data(), coordCond, moleculeIid, groups,
                                        noise.data(), at, scale);
     }
@@ -650,11 +683,11 @@ int generate(const Opts& o, const rfd4p::Dims& d, rfd4p::Trunk& t) {
   // 🔴 A PARTIAL RUN'S SCHEDULE IS NOT THE ORDINARY ONE WITH ITS HEAD CUT OFF - see partial.cuh.
   const int fullNsteps = (int)M.meta("meta/fullNsteps", 0);
   const rfd4p::Schedule schedBb =
-      partial ? rfd4p::partialSchedule(0, M.meta("meta/partialTBb", 0), steps, fullNsteps)
-              : rfd4p::bbCaSchedule(steps);
+      partial ? rfd4p::partialSchedule(0, M.meta("meta/partialTBb", 0), steps, fullNsteps, sampler)
+              : rfd4p::buildSchedule(sampler.m[0], steps);
   const rfd4p::Schedule schedLl =
-      partial ? rfd4p::partialSchedule(1, M.meta("meta/partialTLl", 0), steps, fullNsteps)
-              : rfd4p::latentSchedule(steps);
+      partial ? rfd4p::partialSchedule(1, M.meta("meta/partialTLl", 0), steps, fullNsteps, sampler)
+              : rfd4p::buildSchedule(sampler.m[1], steps);
 
   const float* emitBbDev = Fdev("g/emitBb");
   const float* emitLlDev = Fdev("g/emitLl");
