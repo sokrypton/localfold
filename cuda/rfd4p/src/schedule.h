@@ -1,5 +1,5 @@
-// The sampler's HOST half: the random source, the time and noise schedules, and the recycle
-// depths. Pure C++ over <cmath> and jsmath, with no CUDA in it, because two things need it - the
+// The sampler's HOST half: the random source, the time and noise schedules, and a partial run's
+// start times and schedule. (The recycle depths are the featuriser's - featurise.cpp.) Pure C++ over <cmath> and jsmath, with no CUDA in it, because two things need it - the
 // port's own sampler (src/sampler.cuh) and the native featuriser (featurise/featurise.cpp), which
 // is compiled by g++ with the featuriser's own flags and never sees nvcc.
 //
@@ -183,30 +183,174 @@ inline Schedule latentSchedule(int nsteps) {
   return s;
 }
 
-// `[width, depth]` bands over the steps, one depth a step (`Proteina.recycle_depths`).
+// ---------------------------------------------------------------- partial runs
 //
-// 🔴 A SHORTER RUN RESAMPLES THE BANDS, IT DOES NOT TAKE THEIR TAIL. The bands always expand to
-// SIXTY entries whatever `nsteps` is, and `recycleDepths` then reads them at `i * 60 / nsteps` -
-// so two steps of `low` are its FIRST and THIRTY-FIRST entries, [4, 1], where a tail would give
-// [1, 1]. Taking the tail runs the whole short schedule at the cheapest depth the long one ever
-// reaches, which is a different model, not a cheaper one.
-inline std::vector<int> recycleDepths(const std::string& name, int nsteps) {
-  std::vector<std::pair<int, int>> bands;
-  if (name == "none") bands = {{60, 1}};
-  else if (name == "low") bands = {{10, 4}, {10, 3}, {10, 2}, {30, 1}};
-  else if (name == "medium") bands = {{5, 6}, {10, 5}, {5, 4}, {10, 3}, {20, 2}, {10, 1}};
-  else if (name == "high") bands = {{15, 6}, {15, 5}, {15, 4}, {15, 3}};
-  else { fprintf(stderr, "recycle schedule %s not known\n", name.c_str()); exit(1); }
-  std::vector<int> full;
-  for (const auto& [width, depth] : bands) {
-    for (int i = 0; i < width; ++i) full.push_back(depth);
+// Partial diffusion and inverse folding start the flow part-way along it (partial.cuh says what
+// each is). Ported from `shared/rfd4p/partial.js`, upstream's `search/vanilla.py`.
+
+// Python's round-half-to-even, which decides the step count on an exact half (0.5 of 5 steps).
+inline int pyRound(double x) {
+  const double fl = std::floor(x);
+  const double diff = x - fl;
+  if (std::fabs(diff - 0.5) < 1e-12) return (int)(std::fmod(fl, 2.0) == 0 ? fl : fl + 1);
+  return (int)std::floor(x + 0.5);
+}
+
+inline int partialStepCount(double frac, int nsteps) { return pyRound(frac * nsteps); }
+
+struct Modality {
+  Schedule (*build)(int);
+  const char* name;
+};
+inline Modality modalities(int i) {
+  return i == 0 ? Modality{bbCaSchedule, "bb_ca"} : Modality{latentSchedule, "local_latents"};
+}
+
+struct PartialT {
+  bool set = false;
+  double bbCa = 0.0, localLatents = 0.0;
+};
+
+// What a job asks for, unresolved: the five fields `resolve_partial_t` reads. A field the job
+// does not name stays NaN (or false), which is "absent" - never zero, since 0 is a real start time.
+struct PartialRequest {
+  bool inverseFolding = false;
+  std::string inverseFoldingMethod = "resampled_forward_marginal";
+  double fraction = NAN, tBackbone = NAN, tLatent = NAN;
+  bool couple = false;
+};
+
+/**
+ * `resolve_partial_t`, every form: inverse folding (both times 0), a fraction of the trajectory,
+ * both start times given, or one given and the other COUPLED through the default schedules - and
+ * the same mutual exclusions upstream raises on, refused with its words.
+ *
+ * 🔴 THIS TOOK TWO OF THE FIVE UNTIL NOW, and the native featuriser took none: a job naming a
+ * partial run was featurised as an ordinary one and generated from noise with exit status 0.
+ */
+inline PartialT resolvePartialT(const PartialRequest& r, int nsteps) {
+  PartialT out;
+  const bool hasFrac = !std::isnan(r.fraction), hasBb = !std::isnan(r.tBackbone),
+             hasLl = !std::isnan(r.tLatent);
+  auto refuse = [](const char* msg) { fprintf(stderr, "%s\n", msg); exit(1); };
+  auto validate = [&](PartialT p) {
+    if (p.bbCa >= 1.0 || p.localLatents >= 1.0) {
+      refuse("partial-diffusion start time must be < 1 (t = 1 is the clean state, and the score "
+             "conversion divides by 1 - t)");
+    }
+    return p;
+  };
+  if (r.inverseFolding) {
+    if (r.inverseFoldingMethod != "resampled_forward_marginal") {
+      fprintf(stderr, "inverse_folding_method must be one of resampled_forward_marginal, got %s\n",
+              r.inverseFoldingMethod.c_str());
+      exit(1);
+    }
+    if (hasBb || hasLl || r.couple || hasFrac) {
+      refuse("inverse_folding is mutually exclusive with partial_t_backbone, partial_t_latent, "
+             "couple_partial_t, and partial_trajectory_fraction_steps.");
+    }
+    out.set = true;
+    return out;                      // bb_ca = local_latents = 0
   }
-  if ((int)full.size() == nsteps) return full;
-  std::vector<int> depths(nsteps);
-  for (int i = 0; i < nsteps; ++i) {
-    depths[i] = full[std::min((int)full.size() - 1, (int)((long long)i * full.size() / nsteps))];
+  if (hasFrac) {
+    if (hasBb || hasLl || r.couple) {
+      refuse("partial_trajectory_fraction_steps is mutually exclusive with partial_t_backbone, "
+             "partial_t_latent, and couple_partial_t.");
+    }
+    if (!(r.fraction > 0.0 && r.fraction <= 1.0)) {
+      fprintf(stderr, "partial_trajectory_fraction_steps must be in (0, 1], got %g\n", r.fraction);
+      exit(1);
+    }
+    const int remaining = partialStepCount(r.fraction, nsteps);
+    if (remaining < 1) {
+      fprintf(stderr, "partial_trajectory_fraction_steps=%g with nsteps=%d rounds to zero "
+                      "denoising steps.\n", r.fraction, nsteps);
+      exit(1);
+    }
+    const int k = nsteps - remaining;
+    out.set = true;
+    out.bbCa = (float)bbCaSchedule(nsteps).ts[k];
+    out.localLatents = (float)latentSchedule(nsteps).ts[k];
+    return validate(out);
   }
-  return depths;
+  const int nSet = (hasBb ? 1 : 0) + (hasLl ? 1 : 0);
+  if (nSet == 0) return out;
+  if (nSet == 2) {
+    if (r.couple) {
+      refuse("couple_partial_t=true requires exactly one of partial_t_backbone or "
+             "partial_t_latent; got both.");
+    }
+    out.set = true;
+    out.bbCa = r.tBackbone;
+    out.localLatents = r.tLatent;
+    return validate(out);
+  }
+  if (!r.couple) {
+    fprintf(stderr, "Only %s is set. Either provide both partial_t_backbone and partial_t_latent, "
+                    "or set couple_partial_t=true.\n",
+            hasBb ? "partial_t_backbone" : "partial_t_latent");
+    exit(1);
+  }
+  // Coupled: the other modality's time is the one at the same STEP of a dense reference schedule.
+  const int refN = 10000;
+  const Schedule bb = bbCaSchedule(refN), ll = latentSchedule(refN);
+  const std::vector<double>& refTs = hasBb ? bb.ts : ll.ts;
+  const double refVal = hasBb ? r.tBackbone : r.tLatent;
+  int k = refN;
+  for (int i = 0; i <= refN; ++i) {
+    if ((float)refTs[i] >= refVal - 1e-6) { k = i; break; }
+  }
+  out.set = true;
+  out.bbCa = (float)bb.ts[k];
+  out.localLatents = (float)ll.ts[k];
+  return validate(out);
+}
+
+/**
+ * `build_partial_schedule`. With `fullNsteps` the tail of the FULL schedule is taken and checked to
+ * start at the corruption time; without it the schedule is expanded until its tail does.
+ *
+ * 🔴 THE SCHEDULE IS NOT THE ORDINARY ONE WITH ITS HEAD CUT OFF. Expanding until a tail of
+ * `nsteps + 1` points starts at the corruption time is a different step count and therefore
+ * different points; slicing the ordinary schedule gives the right endpoints and the wrong spacing
+ * everywhere between.
+ */
+inline Schedule partialSchedule(int which, double partialT, int nsteps, int fullNsteps) {
+  const Modality m = modalities(which);
+  if (fullNsteps > 0) {
+    if (nsteps < 1 || nsteps > fullNsteps) {
+      fprintf(stderr, "partial step count must be in [1, %d], got %d\n", fullNsteps, nsteps);
+      exit(1);
+    }
+    const Schedule full = m.build(fullNsteps);
+    Schedule out;
+    out.step = full.step;
+    out.ts.assign(full.ts.end() - (nsteps + 1), full.ts.end());
+    out.gt.assign(full.gt.end() - nsteps, full.gt.end());
+    if (std::fabs((float)out.ts[0] - (float)partialT) > 1e-6) {
+      fprintf(stderr, "%s: partial corruption time must match the full schedule's tail\n", m.name);
+      exit(1);
+    }
+    return out;
+  }
+  // 🔴 THE DENSE SEARCH IS WHAT SETS THE EXPANDED STEP COUNT, and it is not `nsteps / fraction`:
+  // the schedules are non-linear, so how many of a dense schedule's points lie above the
+  // corruption time is the only thing that says how long a schedule has `nsteps` of them there.
+  const int dense = std::max(nsteps * 100, 1000);
+  const Schedule d = m.build(dense);
+  int iStart = dense;
+  for (int i = 0; i <= dense; ++i) {
+    if ((float)d.ts[i] >= partialT - 1e-6) { iStart = i; break; }
+  }
+  const int above = std::max(dense - iStart, 1);
+  const int expanded = pyRound((double)nsteps * dense / above);
+  const Schedule full = m.build(expanded);
+  Schedule out;
+  out.step = full.step;
+  out.ts.assign(full.ts.end() - (nsteps + 1), full.ts.end());
+  out.gt.assign(full.gt.end() - nsteps, full.gt.end());
+  return out;
 }
 
 }  // namespace rfd4p

@@ -340,10 +340,10 @@ describe("the design job as a list of spans", () => {
     const ROSSMANN = [
       { kind: "generated", min: 16, max: 16, name: "h1", secondary: "HELIX" },
       { kind: "generated", min: 4, max: 4, name: "l1", secondary: "LOOP" },
-      { kind: "generated", min: 8, max: 8, name: "s1", secondary: "STRAND" },
+      { kind: "generated", min: 8, max: 8, name: "s1", secondary: "SHEET" },
       { kind: "generated", min: 4, max: 4, name: "l2", secondary: "LOOP" },
       { kind: "generated", min: 14, max: 14, name: "h2", secondary: "HELIX" },
-      { kind: "generated", min: 8, max: 8, name: "s2", secondary: "STRAND" },
+      { kind: "generated", min: 8, max: 8, name: "s2", secondary: "SHEET" },
     ];
 
     it("builds custom_cath_monomer's contig and its C_SEC exactly", () => {

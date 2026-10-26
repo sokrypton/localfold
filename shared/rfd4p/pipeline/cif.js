@@ -162,6 +162,17 @@ export const SCALAR_1BODY_ANNOTATIONS = {
   'condition_metal-coord_1_atom': { type: 'int', default: 0 },
   'condition_CoordinateGroup_1_atom': { type: 'int', default: -1 },
   'condition_secondary-structure_1_residue': { type: 'int', default: 0 },
+  // 🔴 THE NUCLEIC STATE (BasePairEnum: UNSPECIFIED, PAIR, LOOP), which upstream's annotated
+  // inputs carry and the model reads as `na_ss_state` - and which this table did not list, so the
+  // reader never kept it and the batch wrote zeros whatever the file said.
+  'condition_na-ss-state_1_residue': { type: 'int', default: 0 },
+  // 🔴 AND THE BASE PAIRS, a TWO-body annotation (`_condition_basepair_2_residue`, an atom pair
+  // a row), carried as two per-atom columns so that every slice, concatenation and insertion
+  // keeps them without learning about pairs: each atom's index in the file it was read from, and
+  // the file indices of its partners, comma-joined. `convertToProteinaBatch` resolves them to
+  // tokens as upstream's tokeniser does.
+  'annotation_src-atom-index_1_atom': { type: 'int', default: -1 },
+  'condition_basepair-partners_1_atom': { type: 'str', default: '' },
   'mask_sequence_1_residue': { type: 'bool', default: false },
   'mask_coordinate_1_atom': { type: 'bool', default: false },
   'mask_index_1_residue': { type: 'bool', default: true },
@@ -1163,6 +1174,23 @@ export function parseCifToAtomArray(cifInput, opts = {}) {
       arr[atomIdx] = rowVals;
     }
     atoms.annotations[catName] = arr;
+  }
+
+  // The base pairs: `_condition_basepair_2_residue`, atom indices `idx0`/`idx1` and a value. The
+  // condition is SYMMETRIC, and upstream's reader stores each row in both directions (W05: 37
+  // rows, 74 pairs), so each atom lists the other.
+  const bp = block['condition_basepair_2_residue'];
+  if (bp && bp.idx0 && bp.idx1) {
+    const partners = Array.from({ length: nAtoms }, () => []);
+    for (let r = 0; r < bp.idx0.length; r++) {
+      const i = safeInt(bp.idx0[r], -1);
+      const j = safeInt(bp.idx1[r], -1);
+      if (i < 0 || j < 0 || i >= nAtoms || j >= nAtoms) continue;
+      partners[i].push(j);
+      partners[j].push(i);
+    }
+    atoms.annotations['annotation_src-atom-index_1_atom'] = Array.from({ length: nAtoms }, (_, k) => k);
+    atoms.annotations['condition_basepair-partners_1_atom'] = partners.map((list) => list.join(','));
   }
 
   // Handle legacy masks (mask_sequence_1_residue, mask_coordinate_1_atom, mask_index_1_residue)

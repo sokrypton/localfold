@@ -19,6 +19,7 @@ import { pairCondFeatures, pairFeatures, trunkCondFeatures, trunkSeqFeatures } f
 import {
   DEFAULT_SAMPLING,
   flowEmitMasks,
+  DEFAULT_RECYCLE_SCHEDULE,
   recycleDepths,
   sampleInitialNoise,
   sampleSchedule,
@@ -165,7 +166,7 @@ export class Rfd4pGeneratorGpu {
     const isPartial = Object.keys(partialTDict).length > 0;
     const frac = opts.partialTrajectoryFractionSteps ?? opts.partial_trajectory_fraction_steps ?? null;
     const nsteps = isPartial && frac != null ? partialStepCount(frac, baseNsteps) : baseNsteps;
-    const depths = recycleDepths(opts.recycleSchedule ?? 'medium', nsteps, opts.fullNsteps ?? baseNsteps);
+    const depths = recycleDepths(opts.recycleSchedule ?? DEFAULT_RECYCLE_SCHEDULE, nsteps, opts.fullNsteps ?? baseNsteps);
 
     let sched;
     let x;

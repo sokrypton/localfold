@@ -20,6 +20,7 @@
 // input STRUCTURE (the seven `web/examples/*.cif.zst` presets) still goes through the exporter,
 // because it needs the mmCIF reader, the CCD bond tables and the chirality templates.
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -297,63 +298,48 @@ inline Weights readWeights(const string& dir, const std::set<string>& wanted) {
   return w;
 }
 
-// ---------------------------------------------------------------- the spec
+// `recycleDepths` (shared/rfd4p/flow.js): `[width, depth]` bands over the steps, one depth a step,
+// named by `tables::RECYCLE_SCHEDULES()` (generated from the JS table, never typed), or a bare
+// number for one depth at every step.
 //
-// A contig is comma-separated tokens; the shape this covers is `name:min-maxP` - a NAMED
-// expandable polymer segment, which is what `custom_cath_monomer` and `--length=N` are made of.
-// A preserved segment (`A16-35`) names residues of an input structure and needs the mmCIF reader.
-struct Segment {
-  string name;
-  int minLen = 0, maxLen = 0;
-  bool chainBreak = false;      // the `/0` token: what follows is a new chain
-  int tokenType = tables::TT_PROTEIN;
-};
-
-inline vector<Segment> parseContig(const string& contig) {
-  vector<Segment> out;
-  size_t at = 0;
-  while (at <= contig.size()) {
-    const size_t comma = contig.find(',', at);
-    string tok = contig.substr(at, comma == string::npos ? string::npos : comma - at);
-    at = comma == string::npos ? contig.size() + 1 : comma + 1;
-    // trim
-    while (!tok.empty() && isspace((unsigned char)tok.front())) tok.erase(tok.begin());
-    while (!tok.empty() && isspace((unsigned char)tok.back())) tok.pop_back();
-    if (tok.empty()) continue;
-    if (tok == "/0") { out.push_back(Segment{"", 0, 0, true}); continue; }
-    const size_t colon = tok.find(':');
-    if (colon == string::npos) {
-      fprintf(stderr, "contig token '%s' is not a named expandable segment; this featuriser does "
-                      "not yet take a preserved segment, which needs the input structure\n",
-              tok.c_str());
-      exit(1);
-    }
-    Segment seg;
-    seg.name = tok.substr(0, colon);
-    string rest = tok.substr(colon + 1);
-    // The chain-type suffix. For a contig every token is a `<M>` stub whatever the chain is, so
-    // the suffix reaches the batch as `token_type` and nothing else - but that is what the model
-    // reads to know it is folding a nucleic chain.
-    if (!rest.empty() && isalpha((unsigned char)rest.back())) {
-      switch (rest.back()) {
-        case 'P': seg.tokenType = tables::TT_PROTEIN; break;
-        case 'R': seg.tokenType = tables::TT_RNA; break;
-        case 'D': seg.tokenType = tables::TT_DNA; break;
-        default:
-          fprintf(stderr, "contig segment '%s' has chain type '%c', which is not P, R or D\n",
-                  tok.c_str(), rest.back());
-          exit(1);
-      }
-      rest.pop_back();
-    }
-    const size_t dash = rest.find('-');
-    seg.minLen = atoi(rest.substr(0, dash).c_str());
-    seg.maxLen = dash == string::npos ? seg.minLen : atoi(rest.substr(dash + 1).c_str());
-    out.push_back(seg);
+// 🔴 A SHORTER RUN RESAMPLES THE BANDS, IT DOES NOT TAKE THEIR TAIL. The bands always expand to
+// SIXTY entries whatever `nsteps` is, and are then read at `i * 60 / nsteps` - so two steps of `low`
+// are its FIRST and THIRTY-FIRST entries, [4, 1], where a tail would give [1, 1]. Taking the tail
+// runs the whole short schedule at the cheapest depth the long one ever reaches, which is a
+// different model, not a cheaper one.
+//
+// 🔴 AND A PARTIAL RUN TAKES THE TAIL: `fullNsteps` is the run's whole length, the bands are laid
+// over THAT, and the last `nsteps` depths are this run's - upstream's `recycle_depths`.
+inline vector<int> recycleDepths(const string& name, int nsteps, int fullNsteps = -1) {
+  if (fullNsteps < 0) fullNsteps = nsteps;
+  if (!name.empty() && std::all_of(name.begin(), name.end(), [](char c) { return isdigit((unsigned char)c); })) {
+    return vector<int>(nsteps, std::max(1, atoi(name.c_str())));
   }
-  return out;
+  const vector<std::pair<int, int>>* bands = nullptr;
+  for (const auto& [n, b] : tables::RECYCLE_SCHEDULES()) {
+    if (n == name) bands = &b;
+  }
+  if (!bands) {
+    fprintf(stderr, "unknown recycle schedule %s\n", name.c_str());
+    exit(1);
+  }
+  vector<int> full;
+  for (const auto& [width, depth] : *bands) {
+    for (int i = 0; i < width; ++i) full.push_back(depth);
+  }
+  if ((int)full.size() != fullNsteps) {
+    vector<int> resampled(fullNsteps);
+    for (int i = 0; i < fullNsteps; ++i) {
+      resampled[i] = full[std::min((int)full.size() - 1, (int)((long long)i * full.size() / fullNsteps))];
+    }
+    full = resampled;
+  }
+  if (fullNsteps < nsteps) {
+    fprintf(stderr, "recycle schedule expands to %d, want %d\n", fullNsteps, nsteps);
+    exit(1);
+  }
+  return vector<int>(full.end() - nsteps, full.end());
 }
-
 
 // ---------------------------------------------------------------- the four feature blocks
 //
@@ -367,6 +353,134 @@ inline void embedRow(const float* table, int dim, int idx, float* dst) {
 constexpr int TOKEN_TYPE_ATOMIZED = 3;
 
 /** `trunkSeqFeatures` (`nn.init_repr_factory`): `[n, 897]` for the shipped checkpoint. */
+
+// One sequence feature's width, which is all the row layout needs and what an offset into it
+// (`chirOff`, the chirality block the sampler rewrites every step) is summed from.
+inline int seqFeatureDim(const string& f) {
+  if (f == "xt_bb_ca") return 3;
+  if (f == "xt_local_latents") return 32;
+  if (f == "token_type") return 32;
+  if (f == "sequence_probabilities") return 2 * 28;
+  if (f == "cond_a37coors_nm" || f == "cond_a37coors_internal_nm") return 148;
+  if (f == "rasa_binned") return 37;
+  if (f == "secondary_structure") return 16;
+  if (f == "hbond_modernized" || f == "pication") return 74;
+  if (f == "pistack" || f == "saltbridge" || f == "hydrophobic" || f == "metal_coord" ||
+      f == "hotspot" || f == "coord_group_seq") return 37;
+  if (f == "na_ss_state") return 2;
+  if (f == "atom_charge" || f == "atomic_element") return 16;
+  if (f == "chirality") return 18;
+  if (f == "chain_centroid_xyz") return 3;
+  fprintf(stderr, "sequence feature '%s' not implemented\n", f.c_str());
+  exit(1);
+}
+
+// `properRotation` and `jacobiEigen4` (shared/rfd4p/features.js): the rotation that best carries a
+// chiral frame's stored directions onto the observed ones, through the 4x4 quaternion matrix's
+// largest eigenvector. Doubles throughout, as the reference's are; src/chirality.cuh is the
+// device twin the sampler runs every step.
+inline std::array<double, 9> properRotation(const double* C) {
+  const double Sxx = C[0], Sxy = C[1], Sxz = C[2], Syx = C[3], Syy = C[4], Syz = C[5], Szx = C[6],
+               Szy = C[7], Szz = C[8];
+  double A[4][4] = {{Sxx + Syy + Szz, Syz - Szy, Szx - Sxz, Sxy - Syx},
+                    {Syz - Szy, Sxx - Syy - Szz, Sxy + Syx, Szx + Sxz},
+                    {Szx - Sxz, Sxy + Syx, -Sxx + Syy - Szz, Syz + Szy},
+                    {Sxy - Syx, Szx + Sxz, Syz + Szy, -Sxx - Syy + Szz}};
+  double V[4][4] = {{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}, {0, 0, 0, 1}};
+  for (int sweep = 0; sweep < 50; ++sweep) {
+    double off = 0;
+    for (int p = 0; p < 4; ++p) for (int q = p + 1; q < 4; ++q) off += A[p][q] * A[p][q];
+    if (off < 1e-30) break;
+    for (int p = 0; p < 4; ++p) {
+      for (int q = p + 1; q < 4; ++q) {
+        if (std::fabs(A[p][q]) < 1e-300) continue;
+        const double theta = (A[q][q] - A[p][p]) / (2 * A[p][q]);
+        // `Math.sign(theta || 1)`: a zero theta takes the positive branch.
+        const double sgn = theta == 0 ? 1.0 : (theta > 0 ? 1.0 : -1.0);
+        const double t = sgn / (std::fabs(theta) + std::sqrt(theta * theta + 1));
+        const double c = 1 / std::sqrt(t * t + 1);
+        const double sn = t * c;
+        for (int k = 0; k < 4; ++k) {
+          const double akp = A[k][p], akq = A[k][q];
+          A[k][p] = c * akp - sn * akq;
+          A[k][q] = sn * akp + c * akq;
+        }
+        for (int k = 0; k < 4; ++k) {
+          const double apk = A[p][k], aqk = A[q][k];
+          A[p][k] = c * apk - sn * aqk;
+          A[q][k] = sn * apk + c * aqk;
+        }
+        for (int k = 0; k < 4; ++k) {
+          const double vkp = V[k][p], vkq = V[k][q];
+          V[k][p] = c * vkp - sn * vkq;
+          V[k][q] = sn * vkp + c * vkq;
+        }
+      }
+    }
+  }
+  int best = 0;
+  for (int i = 1; i < 4; ++i) if (A[i][i] > A[best][best]) best = i;
+  const double w = V[0][best], x = V[1][best], y = V[2][best], z = V[3][best];
+  const double Q[3][3] = {{w * w + x * x - y * y - z * z, 2 * (x * y - w * z), 2 * (x * z + w * y)},
+                          {2 * (x * y + w * z), w * w - x * x + y * y - z * z, 2 * (y * z - w * x)},
+                          {2 * (x * z - w * y), 2 * (y * z + w * x), w * w - x * x - y * y + z * z}};
+  return {Q[0][0], Q[1][0], Q[2][0], Q[0][1], Q[1][1], Q[2][1], Q[0][2], Q[1][2], Q[2][2]};
+}
+
+// `alignChirality` (rotate only, the released config): each chiral frame's packed vectors rotated
+// onto the directions of its neighbours in the noisy CA state - the STEP-0 value of a feature the
+// sampler refits every step. 🔴 THIS COPIED THE CLEAN VECTORS, so a structure with a chiral
+// centre featurised 252 values away from the page on its first step.
+inline vector<float> alignedChirality(const Batch& b, const vector<float>& xBb) {
+  const int n = b.n, S = 6;
+  const int F = n ? (int)(b.chiralFrameAtoms.size() / ((size_t)n * S)) : 0, K = F - 2;
+  vector<float> out(b.chirality.begin(), b.chirality.end());
+  std::map<int, std::array<double, 9>> rotations;
+  for (int ci = 0; ci < n; ++ci) {
+    if (!b.paddingMask[ci]) continue;
+    for (int sl = 0; sl < S; ++sl) {
+      const size_t fr = ((size_t)ci * S + sl) * F;
+      if (b.chiralFrameAtoms[fr] < 0) continue;
+      const int o0 = b.chiralFrameAtoms[fr], o1 = b.chiralFrameAtoms[fr + 1];
+      const double ox = ((double)xBb[o0 * 3] + xBb[o1 * 3]) / 2;
+      const double oy = ((double)xBb[o0 * 3 + 1] + xBb[o1 * 3 + 1]) / 2;
+      const double oz = ((double)xBb[o0 * 3 + 2] + xBb[o1 * 3 + 2]) / 2;
+      double C[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+      for (int k = 0; k < K; ++k) {
+        const int nb = b.chiralFrameAtoms[fr + 2 + k];
+        if (nb < 0) continue;
+        const double sv[3] = {b.chirality[(size_t)nb * 18 + sl * 3],
+                              b.chirality[(size_t)nb * 18 + sl * 3 + 1],
+                              b.chirality[(size_t)nb * 18 + sl * 3 + 2]};
+        double tx = xBb[nb * 3] - ox, ty = xBb[nb * 3 + 1] - oy, tz = xBb[nb * 3 + 2] - oz;
+        const double norm = std::max(lf::jsmath::hypot({tx, ty, tz}), 1e-8);
+        tx /= norm;
+        ty /= norm;
+        tz /= norm;
+        const double tv[3] = {tx, ty, tz};
+        for (int i = 0; i < 3; ++i) for (int j = 0; j < 3; ++j) C[i * 3 + j] += sv[i] * tv[j];
+      }
+      rotations[ci * S + sl] = properRotation(C);
+    }
+  }
+  for (int i = 0; i < n; ++i) {
+    for (int sl = 0; sl < S; ++sl) {
+      const int owner = b.chiralSlotOwner[(size_t)i * S + sl];
+      if (owner < 0) continue;
+      const auto it = rotations.find(owner);
+      if (it == rotations.end()) continue;
+      const auto& R = it->second;
+      const size_t o = (size_t)i * 18 + sl * 3;
+      const double v[3] = {b.chirality[o], b.chirality[o + 1], b.chirality[o + 2]};
+      for (int j = 0; j < 3; ++j) out[o + j] = (float)(v[0] * R[j] + v[1] * R[3 + j] + v[2] * R[6 + j]);
+    }
+  }
+  for (int i = 0; i < n; ++i) {
+    if (!b.paddingMask[i]) std::fill(out.begin() + (size_t)i * 18, out.begin() + (size_t)i * 18 + 18, 0.f);
+  }
+  return out;
+}
+
 inline vector<float> seqFeatures(const Batch& b, const Config& cfg, const Weights& w,
                                  const vector<float>& xBb, const vector<float>& xLl, int& dimOut,
                                  const vector<int>& crdUniq = {},
@@ -376,23 +490,7 @@ inline vector<float> seqFeatures(const Batch& b, const Config& cfg, const Weight
   vector<std::pair<string, int>> blocks;
   for (size_t idx = 0; idx < cfg.featsSeq.size(); ++idx) {
     const string& f = cfg.featsSeq[idx];
-    int d = -1;
-    if (f == "xt_bb_ca") d = 3;
-    else if (f == "xt_local_latents") d = 32;
-    else if (f == "token_type") d = 32;
-    else if (f == "sequence_probabilities") d = 2 * 28;
-    else if (f == "cond_a37coors_nm" || f == "cond_a37coors_internal_nm") d = 148;
-    else if (f == "rasa_binned") d = 37;
-    else if (f == "secondary_structure") d = 16;
-    else if (f == "hbond_modernized" || f == "pication") d = 74;
-    else if (f == "pistack" || f == "saltbridge" || f == "hydrophobic" || f == "metal_coord" ||
-             f == "hotspot" || f == "coord_group_seq") d = 37;
-    else if (f == "na_ss_state") d = 2;
-    else if (f == "atom_charge" || f == "atomic_element") d = 16;
-    else if (f == "chirality") d = 18;
-    else if (f == "chain_centroid_xyz") d = 3;
-    else { fprintf(stderr, "sequence feature '%s' not implemented\n", f.c_str()); exit(1); }
-    blocks.push_back({f, d});
+    blocks.push_back({f, seqFeatureDim(f)});
   }
   int dim = 0;
   for (const auto& [f, d] : blocks) dim += d;
@@ -400,6 +498,10 @@ inline vector<float> seqFeatures(const Batch& b, const Config& cfg, const Weight
   vector<float> data((size_t)n * dim, 0.f);
 
   const string pre = "w/nn.init_repr_factory.feat_creators.";
+  const bool wantsChirality =
+      std::find(cfg.featsSeq.begin(), cfg.featsSeq.end(), "chirality") != cfg.featsSeq.end();
+  const vector<float> chir =
+      wantsChirality && cfg.noiseAlignChirality ? alignedChirality(b, xBb) : b.chirality;
   for (int i = 0; i < n; ++i) {
     if (!b.paddingMask[i]) continue;
     size_t off = (size_t)i * dim;
@@ -495,7 +597,7 @@ inline vector<float> seqFeatures(const Batch& b, const Config& cfg, const Weight
           d[k] = (float)mapped;
         }
       } else if (f == "chirality") {
-        for (int k = 0; k < 18; ++k) d[k] = b.chirality[(size_t)i * 18 + k];
+        for (int k = 0; k < 18; ++k) d[k] = chir[(size_t)i * 18 + k];
       } else if (f == "chain_centroid_xyz") {
         bool ok = true;
         for (int k = 0; k < 3; ++k) ok = ok && std::isfinite(b.chainCentroid[(size_t)i * 3 + k]);
@@ -632,116 +734,6 @@ inline vector<float> pairCondFeatures(const Config& cfg, double tBb, double tLl)
   return out;
 }
 
-// ---------------------------------------------------------------- the selection language
-//
-// 🔴 A SUBSET, AND IT SAYS SO RATHER THAN GUESSING. The reference's `evalSelection` is a small
-// expression language over `chain/res_name/res_id/atom_name`; a pure contig has no residue numbers
-// and no atoms, so what a spec job can actually say is a union of `sel('*/<segment>/*/*')` and
-// `sel('*')`. Anything else is REFUSED by name, because a selection this does not understand must
-// not quietly match nothing - that is a condition the model is told is absent.
-inline vector<uint8_t> evalSelection(const string& expr, const vector<string>& owner) {
-  const int n = (int)owner.size();
-  vector<uint8_t> out(n, 0);
-  size_t at = 0;
-  while (at < expr.size()) {
-    const size_t open = expr.find("sel('", at);
-    if (open == string::npos) break;
-    const size_t close = expr.find("')", open);
-    if (close == string::npos) {
-      fprintf(stderr, "selection '%s' has an unterminated sel(...)\n", expr.c_str());
-      exit(1);
-    }
-    const string path = expr.substr(open + 5, close - open - 5);
-    at = close + 2;
-    // `chain/res_name/res_id/atom_name`, with a missing tail meaning `*`.
-    vector<string> parts;
-    size_t from = 0;
-    while (true) {
-      const size_t slash = path.find('/', from);
-      parts.push_back(path.substr(from, slash == string::npos ? string::npos : slash - from));
-      if (slash == string::npos) break;
-      from = slash + 1;
-    }
-    while (parts.size() < 4) parts.push_back("*");
-    for (size_t k = 0; k < 4; ++k) {
-      if (k == 1) continue;
-      if (parts[k] != "*") {
-        fprintf(stderr, "selection '%s' constrains %s, which needs an input structure; this "
-                        "featuriser takes a union of sel('*/<segment>/*/*')\n",
-                path.c_str(), k == 0 ? "a chain" : (k == 2 ? "a residue number" : "an atom name"));
-        exit(1);
-      }
-    }
-    for (int i = 0; i < n; ++i) {
-      if (parts[1] == "*" || parts[1] == owner[i]) out[i] = 1;
-    }
-  }
-  // Whatever separates the terms, a `sel(...)` not matched above has already been taken as a union
-  // member; `&` and `~` would change that, so they are refused.
-  if (expr.find('&') != string::npos || expr.find('~') != string::npos) {
-    fprintf(stderr, "selection '%s' uses & or ~; only | is covered\n", expr.c_str());
-    exit(1);
-  }
-  return out;
-}
-
-// `applyConditions` for the two a pure spec can carry: an enum over tokens (secondary structure)
-// and a CATH label. Anything else is refused rather than dropped.
-inline void applyConditions(Batch& b,
-                            const std::map<string, std::map<string, vector<string>>>& conditions,
-                            const vector<string>& owner) {
-  for (const auto& [key, arms] : conditions) {
-    auto spec = tables::CONDITION_REGISTRY.find(key);
-    if (spec == tables::CONDITION_REGISTRY.end()) {
-      fprintf(stderr, "condition '%s' is not in the registry\n", key.c_str());
-      exit(1);
-    }
-    const string full = spec->second.fullName, dtype = spec->second.dtype;
-    for (const auto& [value, selections] : arms) {
-      vector<uint8_t> hit(b.n, 0);
-      for (const string& sel : selections) {
-        const vector<uint8_t> m = evalSelection(sel, owner);
-        for (int i = 0; i < b.n; ++i) hit[i] |= m[i];
-      }
-      if (dtype == "enum") {
-        const auto& members = tables::CONDITION_ENUMS.at(spec->second.enumName);
-        auto it = members.find(value);
-        if (it == members.end()) {
-          fprintf(stderr, "'%s' is not a member of %s\n", value.c_str(), spec->second.enumName);
-          exit(1);
-        }
-        if (full != "condition_secondary-structure_1_residue") {
-          fprintf(stderr, "condition '%s' needs a per-ATOM write, which a contig has no atoms "
-                          "for\n", full.c_str());
-          exit(1);
-        }
-        for (int i = 0; i < b.n; ++i) if (hit[i]) b.secondaryStructure[i] = it->second;
-      } else if (dtype == "cath") {
-        auto code = tables::CATH_CODES.find(value);
-        if (code == tables::CATH_CODES.end()) {
-          fprintf(stderr, "CATH code '%s' is not one the maps can spell\n", value.c_str());
-          exit(1);
-        }
-        for (int i = 0; i < b.n; ++i) {
-          if (!hit[i]) continue;
-          for (int k = 0; k < 3; ++k) b.cathLabel[(size_t)i * 3 + k] = code->second[k];
-        }
-      } else {
-        // 🔴 REFUSED, WHERE THE REFERENCE SILENTLY IGNORES IT. `C_SEQ` on a pure contig reaches
-        // `finalizeAndCanonicalizeSequenceConditioning`, which rewrites every stub back to `<M>`,
-        // so the page folds such a job with the condition having done NOTHING - measured. A job
-        // whose conditioning is quietly dropped is worse than one that will not start, so this
-        // says so; what it costs is a job the page accepts and this does not.
-        fprintf(stderr, "condition '%s' has dtype %s, which needs an input structure - on a pure "
-                        "contig the reference drops it silently, so this refuses rather than "
-                        "fold as though it had been applied\n",
-                key.c_str(), dtype.c_str());
-        exit(1);
-      }
-    }
-  }
-}
-
 // ---------------------------------------------------------------- the pipeline's own RNG
 //
 // 🔴 TWO SEPARATE RANDOM SOURCES, AND THEY ARE NOT THE SAME ONE. The SAMPLER's is xorshift128+
@@ -756,19 +748,8 @@ inline void applyConditions(Batch& b,
 // one of them.
 using PipelineRng = atoms::PipelineRng;
 
-// ---------------------------------------------------------------- spec -> batch
-//
-// 🔴 FOR A SPEC INPUT ALMOST EVERY FIELD IS ITS INITIALISATION VALUE, and that is not laziness in
-// the reference: every token realised from a contig is a `<M>` stub with no atoms, so
-// `buildAtom37Slots` returns -1 for all 37 slots and the whole per-atom loop of
-// `convertToProteinaBatch` is a no-op. `element` is -1 and `condition_index` is 1 because nothing
-// overwrites the fill, and a port that "helpfully" computed them would disagree with the reference.
-//
-// What is actually computed is the chain: `token_bond_path_length[i][j] = |i - j|` over the single
-// bonded run, and `canonical_polymer_ordering` is -1 at the next residue and +1 at the previous.
 /**
- * `convertToProteinaBatch` with real atoms - the general case `buildSpecBatch` below is the
- * contig-shaped specialisation of.
+ * `convertToProteinaBatch` - for a structure, and for a pure contig realised into an empty one.
  *
  * 🔴 IT OPENS WITH TWO DRAWS AND THEY ARE THE FIRST THING TO GET RIGHT: the chain permutation
  * then the molecule permutation, from the SAME stream the segment realisation and the internal
@@ -1073,69 +1054,52 @@ inline Batch buildStructureBatch(atoms::AtomArray& a, const atoms::Centroid& cen
               : std::nanf("");
     }
   }
-  return b;
-}
 
-inline Batch buildSpecBatch(const vector<Segment>& segments,
-                            const std::map<string, std::map<string, vector<string>>>& conditions,
-                            int seed) {
-  // 🔴 A RANGED SEGMENT'S LENGTH IS A DRAW, AND THE ORDER IS THE SPECIFICATION.
-  // `realizeExpandableSegments` takes `nextInt(min, max + 1)` once per segment in CONTIG order and
-  // nothing else on this path touches that stream, so the whole of the pipeline's randomness is
-  // these few integers. (`convertToProteinaBatch` asks for `permutation(1)` twice, whose
-  // Fisher-Yates loop runs zero times and draws nothing.)
-  PipelineRng prng((uint32_t)seed);
-  vector<int> lengths, chainOf, typeOf;
-  int n = 0, chains = 0;
-  for (const Segment& s : segments) {
-    if (s.chainBreak) { ++chains; lengths.push_back(0); continue; }
-    // 🔴 THE DRAW HAPPENS EVEN WHEN min == max, and skipping it is not an optimisation: it moves
-    // every later draw up one, so the CHAIN and MOLECULE permutations come out different. A
-    // one-chain job hides it (those permutations are over one element and draw nothing) and a
-    // two-chain one hid it by coincidence; three chains is where it showed.
-    const int len = prng.nextInt(s.minLen, s.maxLen + 1);
-    lengths.push_back(len);
-    for (int k = 0; k < len; ++k) { chainOf.push_back(chains); typeOf.push_back(s.tokenType); }
-    n += len;
-  }
-  ++chains;
-  Batch b;
-  b.resize(n);
-  // 🔴 A CHAIN BREAK BREAKS THE BONDED RUN, so the path length across it is ZERO rather than a
-  // large number - there is no path, and the reference leaves the entry at its fill. The
-  // canonical ordering stops at the boundary for the same reason.
-  for (int i = 0; i < n; ++i) {
-    for (int j = 0; j < n; ++j) {
-      if (chainOf[i] != chainOf[j]) continue;
-      b.tokenBondPathLength[(size_t)i * n + j] = std::abs(i - j);
-      b.canonicalPolymerOrdering[(size_t)i * n + j] = j == i + 1 ? -1 : (j == i - 1 ? 1 : 0);
-    }
-  }
-  // 🔴 THE CHAIN AND MOLECULE IDS ARE PERMUTED, AND THE DRAWS COME AFTER THE SEGMENT LENGTHS.
-  // `convertToProteinaBatch` asks the pipeline's rng for a permutation of the chains and then one
-  // of the molecules; with a single chain each is `permutation(1)`, whose Fisher-Yates loop runs
-  // zero times and draws nothing, which is why a one-chain job is seed-independent past its
-  // lengths. With two it is two draws, and getting their ORDER wrong relabels the chains.
-  const vector<int> chainPerm = prng.permutation(chains);
-  const vector<int> molPerm = prng.permutation(chains);   // one molecule a chain for a pure contig
-  for (int i = 0; i < n; ++i) {
-    b.tokenType[i] = typeOf[i];
-    b.chainIid[i] = chainPerm[chainOf[i]];
-    b.moleculeIid[i] = molPerm[chainOf[i]];
-    b.indexGroup[i] = chainOf[i];
-    // `molecule_entity_id` at inference: every chain whose sequence is all `<M>` - which is every
-    // chain of a contig - takes a FRESH entity after the ones the input had, in chain order.
-    b.moleculeEntityId[i] = chains + chainOf[i];
-  }
-  // Which segment each token came from, so a `sel('*/<name>/*/*')` can select it.
-  vector<string> owner(n);
+  // 🔴 THE NUCLEIC SECONDARY STRUCTURE (upstream `datapipes/pipeline.py`; shared/rfd4p/pipeline/
+  // transforms.js `nucleicSecondaryStructure`): the per-residue state at each token's first atom,
+  // a base pair between two tokens' first atoms in both directions, and a LOOP token's row and
+  // column marked specified. These were zeros whatever the input said.
   {
-    int at = 0;
-    for (size_t si = 0; si < segments.size(); ++si) {
-      for (int k = 0; k < lengths[si]; ++k) owner[at++] = segments[si].name;
+    const auto stateIt = a.ann.ints.find("condition_na-ss-state_1_residue");
+    if (stateIt != a.ann.ints.end() && stateIt->second.size() == nAtoms) {
+      for (int t = 0; t < nTokens; ++t) {
+        b.naSsState[t] = stateIt->second[tokStarts[t]];
+        b.naSsStateMask[t] = b.naSsState[t] != 0 ? 1 : 0;
+      }
+    }
+    const auto srcIt = a.ann.ints.find("annotation_src-atom-index_1_atom");
+    const auto partIt = a.ann.strings.find("condition_basepair-partners_1_atom");
+    if (srcIt != a.ann.ints.end() && partIt != a.ann.strings.end() &&
+        srcIt->second.size() == nAtoms && partIt->second.size() == nAtoms) {
+      // Only a token's FIRST atom stands for it: `atom_to_token[token_starts] = arange(n_tokens)`.
+      std::map<int, int> tokenOfSrc;
+      for (int t = 0; t < nTokens; ++t) {
+        const int src = srcIt->second[tokStarts[t]];
+        if (src >= 0) tokenOfSrc[src] = t;
+      }
+      for (int t = 0; t < nTokens; ++t) {
+        const string& list = partIt->second[tokStarts[t]];
+        size_t at = 0;
+        while (at < list.size()) {
+          const size_t comma = list.find(',', at);
+          const string tok = list.substr(at, comma == string::npos ? string::npos : comma - at);
+          at = comma == string::npos ? list.size() : comma + 1;
+          if (tok.empty()) continue;
+          const auto u = tokenOfSrc.find(atoi(tok.c_str()));
+          if (u == tokenOfSrc.end()) continue;
+          b.naSsPair[(size_t)t * nTokens + u->second] = 1;
+          b.naSsPairMask[(size_t)t * nTokens + u->second] = 1;
+        }
+      }
+    }
+    for (int t = 0; t < nTokens; ++t) {
+      if (b.naSsState[t] != 2) continue;   // BasePairEnum.LOOP
+      for (int u = 0; u < nTokens; ++u) {
+        b.naSsPairMask[(size_t)t * nTokens + u] = 1;
+        b.naSsPairMask[(size_t)u * nTokens + t] = 1;
+      }
     }
   }
-  applyConditions(b, conditions, owner);
   return b;
 }
 
@@ -1210,6 +1174,96 @@ inline Emit emitMasks(const Batch& b) {
 // links this object and featurises in its OWN process before the fold, which is what every other
 // port here does (`lf::standalone::main`) - the alternative is a second process and a directory
 // on disk between them.
+// A string as little-endian bytes in `words` ints, zero-padded - how a name crosses into the
+// generation directory, whose tensors are numbers. `unpackString` in src/generate.cuh reverses it.
+inline void packString(const string& v, int words, vector<int>& into) {
+  for (int w = 0; w < words; ++w) {
+    uint32_t packed = 0;
+    for (int k = 0; k < 4; ++k) {
+      const size_t at = (size_t)w * 4 + k;
+      if (at < v.size()) packed |= (uint32_t)(unsigned char)v[at] << (8 * k);
+    }
+    into.push_back((int)packed);
+  }
+}
+
+// A double as its two 32-bit halves, so the writer can print the value the INPUT held - the page
+// prints `String(b_factor)` of the double it parsed, and a float would round it first.
+inline void packDouble(double v, vector<int>& into) {
+  uint64_t bits;
+  memcpy(&bits, &v, 8);
+  into.push_back((int)(uint32_t)(bits & 0xffffffffu));
+  into.push_back((int)(uint32_t)(bits >> 32));
+}
+
+/**
+ * What `processSampleToAtoms` reads off the INPUT atoms to write each record, carried to the
+ * native writer. Per token, from its first atom: whether it is atomised, its HETATM flag, entity,
+ * insertion code, residue name and source component. Per input atom, keyed by its slot in the
+ * token's OWN atom37 layout (slot 1 for an atomised token's one atom): name, element, B-factor,
+ * occupancy and formal charge - the writer finds an output atom's by NAME, as the page does.
+ *
+ * 🔴 THE NATIVE WRITER HAD NONE OF THIS. It wrote a ligand atom as `UNK CA`, element C, `ATOM`,
+ * and every atom with B nan, occupancy 1, no charge and entity 0, where the page writes what the
+ * input file said - and it named a nucleotide's atoms by the PROTEIN layout. Nothing compared the
+ * two writers until cuda/rfd4p/check-writer.mjs, which requires the same text.
+ */
+inline std::map<string, vector<int>> outputTables(const rfd4p::atoms::AtomArray& a,
+                                                   const vector<int>& starts, const Batch& b) {
+  std::map<string, vector<int>> t;
+  const auto srcIt = a.ann.strings.find("annotation_src-component_1_atom");
+  const int nTok = (int)starts.size() - 1;
+  vector<int>& name = t["g/inName"];
+  vector<int>& elem = t["g/inElem"];
+  vector<int>& bfac = t["g/inB"];
+  vector<int>& occ = t["g/inOcc"];
+  vector<int>& chg = t["g/inCharge"];
+  name.assign((size_t)nTok * 37, 0);
+  elem.assign((size_t)nTok * 37, 0);
+  chg.assign((size_t)nTok * 37, 0);
+  bfac.assign((size_t)nTok * 37 * 2, 0);
+  occ.assign((size_t)nTok * 37 * 2, 0);
+  for (int tk = 0; tk < nTok; ++tk) {
+    const int a0 = starts[tk];
+    t["g/outAtomize"].push_back(a.atomize.empty() ? 0 : a.atomize[a0]);
+    t["g/outHetero"].push_back(a.site.hetero[a0]);
+    t["g/outEntity"].push_back(a.site.labelEntityId.empty() ? 0 : a.site.labelEntityId[a0]);
+    packString(a.site.insCode[a0], 1, t["g/outInsCode"]);
+    packString(a.site.resName[a0], 2, t["g/outResName"]);
+    packString(srcIt == a.ann.strings.end() ? "." : srcIt->second[a0], 4, t["g/outSrcComp"]);
+    const bool atomised = !a.atomize.empty() && a.atomize[a0];
+    const int rt = tk < (int)b.residueType.size() ? b.residueType[tk] : -1;
+    for (int ai = starts[tk]; ai < starts[tk + 1]; ++ai) {
+      int slot = -1;
+      if (atomised) {
+        if (ai == a0) slot = 1;
+      } else if (rt >= 0 && rt < tables::N_TOKENS) {
+        for (int s2 = 0; s2 < 37; ++s2) {
+          if (a.site.atomName[ai] == tables::TOKEN_ATOMS[rt][s2]) { slot = s2; break; }
+        }
+      }
+      if (slot < 0) continue;
+      const size_t at = (size_t)tk * 37 + slot;
+      vector<int> one;
+      packString(a.site.atomName[ai], 1, one);
+      name[at] = one[0];
+      one.clear();
+      packString(a.site.element[ai], 1, one);
+      elem[at] = one[0];
+      chg[at] = a.site.charge[ai];
+      one.clear();
+      packDouble(a.site.bFactor[ai], one);
+      bfac[at * 2] = one[0];
+      bfac[at * 2 + 1] = one[1];
+      one.clear();
+      packDouble(a.site.occupancy[ai], one);
+      occ[at * 2] = one[0];
+      occ[at * 2 + 1] = one[1];
+    }
+  }
+  return t;
+}
+
 int run(int argc, char** argv) {
   using lf::Json;
   using lf::parseJson;
@@ -1218,14 +1272,14 @@ int run(int argc, char** argv) {
   using rfd4p::bbCaSchedule;
   using rfd4p::latentSchedule;
   using rfd4p::CENTERING_SCALE;
-  using rfd4p::recycleDepths;
   string out, specPath, weightsDir, configPath, int8Dir, dumpCif;
   int splitAt = 0;
   bool realize = false, atomize = false, unannotated = false;
   string contigStr, selectStr, condJson;
   int seed = 0, step = 0, length = 0;
   bool generate = false;
-  string recycleSchedule = "none";
+  string recycleSchedule = tables::DEFAULT_RECYCLE_SCHEDULE;
+  rfd4p::PartialRequest partialReq;
   for (int i = 1; i < argc; ++i) {
     const string a = argv[i];
     if (a.rfind("--", 0) != 0) { out = a; continue; }
@@ -1716,11 +1770,12 @@ int run(int argc, char** argv) {
 
   // The job. `--length=N` is one unconditioned segment, the shape the exporter's own flag makes.
   string contig;
-  std::map<string, std::map<string, vector<string>>> conditions;
-  // The structure path's conditions keep their ORDER and their `group:` field, which the spec
-  // path's map-of-maps has nowhere to put.
+  // The conditions, in their ORDER and with their `group:` field.
   rfd4p::conditions::Spec structureConditions;
   vector<int> outputResId, outputChain;
+  // The rest of what the page's writer reads off the input atoms (`processSampleToAtoms`), per
+  // token and per input atom - see `outputTables` below.
+  std::map<string, vector<int>> outputInts;
   string inputPath;
   bool asAnnotatedCif = false, specMode = false;
   int nsteps = 60;
@@ -1763,18 +1818,45 @@ int run(int argc, char** argv) {
       const Json* v = spec.get(k);
       if (v && !Json::absent(v)) asAnnotatedCif = v->kind == Json::Bool ? v->b : v->n != 0;
     }
+    // 🔴 A PARTIAL RUN IS NAMED BY THE JOB, AND THIS PARSER DID NOT READ ONE. Every field below
+    // was dropped, so a job asking for partial diffusion or inverse folding was featurised - and
+    // generated, with exit status 0 - as an ordinary design from noise. Camel and snake case both,
+    // as `resolvePartialT` in shared/rfd4p/partial.js reads them.
+    {
+      auto number = [&](const char* camel, const char* snake, double& into) {
+        for (const char* k : {camel, snake}) {
+          const Json* v = spec.get(k);
+          if (v && !Json::absent(v)) into = v->n;
+        }
+      };
+      auto flag = [&](const char* camel, const char* snake, bool& into) {
+        for (const char* k : {camel, snake}) {
+          const Json* v = spec.get(k);
+          if (v && !Json::absent(v)) into = v->kind == Json::Bool ? v->b : v->n != 0;
+        }
+      };
+      number("partialTrajectoryFractionSteps", "partial_trajectory_fraction_steps",
+             partialReq.fraction);
+      number("partialTBackbone", "partial_t_backbone", partialReq.tBackbone);
+      number("partialTLatent", "partial_t_latent", partialReq.tLatent);
+      flag("couplePartialT", "couple_partial_t", partialReq.couple);
+      flag("inverseFolding", "inverse_folding", partialReq.inverseFolding);
+      for (const char* k : {"inverseFoldingMethod", "inverse_folding_method"}) {
+        const Json* v = spec.get(k);
+        if (v && v->isString()) partialReq.inverseFoldingMethod = v->s;
+      }
+    }
     const Json* cond = spec.get("conditions");
     if (cond && cond->isObject()) {
       for (const auto& [key, arms] : cond->o) {
         rfd4p::conditions::Arms ordered;
         for (const auto& [value, sels] : arms.o) {
-          vector<string> list;
           vector<rfd4p::conditions::Entry> entries;
           if (sels.isArray()) {
             for (const Json& e : sels.a) {
               rfd4p::conditions::Entry entry;
               const Json* sel = e.get("select");
-              if (sel && sel->isString()) { entry.select = sel->s; list.push_back(sel->s); }
+              if (sel && sel->isString()) entry.select = sel->s;
               const Json* grp = e.get("group");
               if (grp && !Json::absent(grp)) {
                 entry.hasGroup = true;
@@ -1783,7 +1865,6 @@ int run(int argc, char** argv) {
               entries.push_back(entry);
             }
           }
-          conditions[key][value] = list;
           ordered.push_back({value, entries});
         }
         structureConditions.push_back({key, ordered});
@@ -1791,16 +1872,19 @@ int run(int argc, char** argv) {
     }
   }
 
-  // 🔴 TWO ROUTES TO ONE BATCH, AND THE SECOND IS THE WHOLE STRUCTURE PIPELINE.
-  // `buildSpecBatch` is the contig-only specialisation: every token is a `<M>` stub, so most of
-  // `convertToProteinaBatch` is a no-op and the batch is its initialisation values. A job that
-  // names an input runs the real thing - read, contig, conditions, then the fourteen stages -
-  // and they must not be allowed to drift apart, which is why the structure route calls
-  // `runValidationPipeline` rather than assembling a batch of its own.
+  // 🔴 ONE ROUTE TO THE BATCH, AS THE REFERENCE HAS ONE. A pure contig is realised into an EMPTY
+  // structure (`buildAtomArrayFromConditionSpec` starts from `createEmptyAtomArray()`) and runs
+  // the same reader-less pipeline as a job with an input: contig, conditions, the fourteen
+  // stages. It used to have a specialisation of its own - every token a `<M>` stub, so most of
+  // `convertToProteinaBatch` was a no-op - and that second route was a SUBSET: it refused an
+  // unnamed segment (`"50-50"`), any selection but `sel('*/<segment>/*/*')`, and every condition
+  // but secondary structure and CATH, and it had no atoms to name a design from. Byte-identical
+  // to the exporter on every pure-contig case the gate holds, and now it can take what the page
+  // takes.
   Batch b;
-  if (inputPath.empty()) {
-    b = buildSpecBatch(parseContig(contig), conditions, seed);
-  } else {
+  {
+    rfd4p::atoms::AtomArray src;
+    if (!inputPath.empty()) {
     bool opened = false;
     const string cifText = lf::zstd::readTextOrCompressed(inputPath, &opened);
     if (!opened) { fprintf(stderr, "no %s\n", inputPath.c_str()); return 1; }
@@ -1811,10 +1895,32 @@ int run(int argc, char** argv) {
     // example does not contain. With `specMode: true` it is a spec: the annotations are
     // discarded, the arginines re-labelled, and the contig and conditions applied. Reading the
     // first as the second gave 116 tokens where the exporter gives 183.
-    rfd4p::atoms::AtomArray src =
-        rfd4p::atoms::fromCif(cifText, specMode ? asAnnotatedCif : true);
+    src = rfd4p::atoms::fromCif(cifText, specMode ? asAnnotatedCif : true);
+    }
     vector<int> originalResId = src.site.resId;
-    if (specMode) {
+    // Without an input the job IS its spec, whatever `specMode` says: an empty structure with
+    // the contig realised into it, as `buildAtomArrayFromConditionSpec` starts from
+    // `createEmptyAtomArray()`.
+    // 🔴 REFUSED, WHERE THE REFERENCE SILENTLY IGNORES IT. A sequence condition on a pure contig
+    // reaches `finalizeAndCanonicalizeSequenceConditioning`, which rewrites every stub back to
+    // `<M>`, so the page folds such a job with the condition having done NOTHING - measured. A job
+    // whose conditioning is quietly dropped is worse than one that will not start; what it costs
+    // is a job the page accepts and this does not. (Upstream cannot be asked: it requires an
+    // input.) Every other condition on a pure contig is featurised as the reference does - this
+    // is now the same pipeline, so it no longer has a subset of its own to refuse.
+    if (inputPath.empty()) {
+      for (const auto& [key, arms] : structureConditions) {
+        const auto it = tables::CONDITION_REGISTRY.find(key);
+        if (it != tables::CONDITION_REGISTRY.end() &&
+            string(it->second.fullName) == "condition_sequence_1_residue") {
+          fprintf(stderr, "condition '%s' conditions the SEQUENCE of a pure contig, which the "
+                          "reference drops silently, so this refuses rather than fold as though it "
+                          "had been applied\n", key.c_str());
+          return 1;
+        }
+      }
+    }
+    if (specMode || inputPath.empty()) {
       if (!contig.empty()) {
         const rfd4p::contig::Applied applied = rfd4p::contig::applyContig(src, contig);
         src = applied.atomArray;
@@ -1855,6 +1961,7 @@ int run(int argc, char** argv) {
       }
       outputResId = outResId;
       outputChain = outChain;
+      outputInts = outputTables(src, starts, b);
     }
   }
   const int n = b.n;
@@ -2027,15 +2134,96 @@ int run(int argc, char** argv) {
   if (!generate) return 0;
   const string gen = out + "-gen";
   Dir g(gen);
-  const int steps = nsteps;
-  const vector<int> depths = recycleDepths(recycleSchedule, steps);
+  // 🔴 A PARTIAL RUN'S STEP COUNT, SCHEDULE AND RECYCLE DEPTHS ARE ALL DIFFERENT, derived exactly
+  // as `export_input.mjs` and `generateRfd4pCpu` derive them. A fraction runs `round(frac *
+  // nsteps)` steps off the TAIL of the full schedule; explicit start times expand a schedule
+  // until its tail starts there; inverse folding runs the whole schedule from t = 0 against a
+  // backbone resampled at every step. The depths are always the tail of the BASE run's.
+  const rfd4p::PartialT partialT = rfd4p::resolvePartialT(partialReq, nsteps);
+  const bool isPartial = partialT.set, inverseFolding = partialReq.inverseFolding;
+  const bool partialFrac = isPartial && !inverseFolding && !std::isnan(partialReq.fraction);
+  if (isPartial && inputPath.empty()) {
+    fprintf(stderr, "partial diffusion and inverse folding start from a structure, and this job "
+                    "names no input\n");
+    return 1;
+  }
+  // 🔴 AND THE ENCODER'S INPUTS, BECAUSE A PARTIAL RUN'S CLEAN LATENTS ARE THE ENCODER'S OUTPUT.
+  // Only `export_input.mjs --encoder` wrote these, so partial diffusion and inverse folding needed
+  // Node however the rest of the job was featurised. The same tensors and the same offsets,
+  // derived from the encoder's own `feats_seq` rather than typed in.
+  if (isPartial) {
+    const Json* enc = nnAe ? nnAe->get("encoder") : nullptr;
+    if (!enc) { fprintf(stderr, "%s has no encoder config\n", configPath.c_str()); return 1; }
+    const int ttDim = (int)decNum(enc, "token_type_emb_dim", 32);
+    const int chargeDim = (int)decNum(enc, "charge_emb_dim", 16);
+    std::map<string, int> offset, creator;
+    int width = 0, idx = 0;
+    const Json* feats = enc->get("feats_seq");
+    for (const Json& fj : feats ? feats->a : vector<Json>{}) {
+      const string& f = fj.s;
+      int d = -1;
+      if (f == "token_type") d = ttDim;
+      else if (f == "x1_a37coors_nm" || f == "x1_a37coors_nm_rel") d = 37 * 4;
+      else if (f == "chain_idx_seq") d = 1;
+      else if (f == "incident_bond_type_counts") d = 37 * 10;
+      else if (f == "atom37_element_charge_embedding") d = 37 * (8 + chargeDim);
+      else { fprintf(stderr, "encoder feature '%s' not implemented\n", f.c_str()); return 1; }
+      offset[f] = width;
+      creator[f] = idx++;
+      width += d;
+    }
+    auto at = [](const std::map<string, int>& m, const char* k) {
+      const auto it = m.find(k);
+      return it == m.end() ? -1 : it->second;
+    };
+    Dir e(out + "-enc");
+    vector<float> atomMask(b.atom37Mask.size()), chainIid(n), bondCounts(b.incidentBondTypeCounts.size()),
+        aeEmit(n);
+    for (size_t i = 0; i < atomMask.size(); ++i) atomMask[i] = b.atom37Mask[i] ? 1.f : 0.f;
+    for (int i = 0; i < n; ++i) chainIid[i] = (float)b.chainIid[i];
+    for (size_t i = 0; i < bondCounts.size(); ++i) bondCounts[i] = (float)b.incidentBondTypeCounts[i];
+    for (int i = 0; i < n; ++i) {
+      aeEmit[i] = b.paddingMask[i] && !b.isInContextConditioning[i] && b.supportsLocalLatent[i] ? 1.f : 0.f;
+    }
+    e.tensor("e/coorsNm", b.coordsNm);
+    e.tensor("e/atomMask", atomMask);
+    e.tensor("e/chainIid", chainIid);
+    e.tensor("e/bondCounts", bondCounts);
+    e.tensor("e/emit", aeEmit);
+    e.meta("encLayers", decNum(enc, "nlayers", 0));
+    e.meta("encTokenDim", decNum(enc, "token_dim", 0));
+    e.meta("encCondDim", decNum(enc, "dim_cond", 0));
+    e.meta("encHeads", decNum(enc, "nheads", 0));
+    e.meta("encFeatDim", width);
+    e.meta("encTtDim", ttDim);
+    e.meta("encChargeDim", chargeDim);
+    e.meta("encOffAbs", at(offset, "x1_a37coors_nm"));
+    e.meta("encOffRel", at(offset, "x1_a37coors_nm_rel"));
+    e.meta("encOffChain", at(offset, "chain_idx_seq"));
+    e.meta("encOffBonds", at(offset, "incident_bond_type_counts"));
+    e.meta("encOffElCh", at(offset, "atom37_element_charge_embedding"));
+    e.meta("encTtCreator", at(creator, "token_type"));
+    e.meta("encElChCreator", at(creator, "atom37_element_charge_embedding"));
+    e.ints("e/element", b.groundTruthElement);
+    e.ints("e/charge", b.charge);
+    e.close();
+    printf("%s-enc: %d encoder columns\n", out.c_str(), width);
+  }
+  const int baseNsteps = nsteps;
+  const int steps = partialFrac ? rfd4p::partialStepCount(partialReq.fraction, baseNsteps) : baseNsteps;
+  const int fullNsteps = partialFrac ? baseNsteps : 0;
+  const vector<int> depths = recycleDepths(recycleSchedule, steps, baseNsteps);
+  const Schedule genBb = isPartial ? rfd4p::partialSchedule(0, partialT.bbCa, steps, fullNsteps)
+                                   : bbCaSchedule(steps);
+  const Schedule genLl = isPartial ? rfd4p::partialSchedule(1, partialT.localLatents, steps, fullNsteps)
+                                   : latentSchedule(steps);
 
   int pairNoDistDim = 0;
   const vector<float> pairNoDist = pairFeatures(b, cfg, xBb, true, pairNoDistDim);
   vector<float> condAll, cond1All, pairCondAll;
   vector<int> stochastic;
   for (int s2 = 0; s2 < steps; ++s2) {
-    const double t2Bb = (float)schedBb.ts[s2], t2Ll = (float)schedLl.ts[s2];
+    const double t2Bb = (float)genBb.ts[s2], t2Ll = (float)genLl.ts[s2];
     int d0 = 0, d1 = 0;
     const vector<float> c0 = condFeatures(b, cfg, w, t2Bb, t2Ll, -1, d0);
     const vector<float> c1 = condFeatures(b, cfg, w, t2Bb, t2Ll, 1, d1);
@@ -2044,7 +2232,7 @@ int run(int argc, char** argv) {
     cond1All.insert(cond1All.end(), c1.begin(), c1.end());
     pairCondAll.insert(pairCondAll.end(), pc.begin(), pc.end());
     for (int dm = 0; dm < 2; ++dm) {
-      const Schedule& sc = dm ? schedLl : schedBb;
+      const Schedule& sc = dm ? genLl : genBb;
       const double t2 = dm ? t2Ll : t2Bb;
       stochastic.push_back(
           (t2 != 0 && !(t2 > sc.step.tLimOde || t2 < sc.step.tLimOdeBelow)) ? 1 : 0);
@@ -2055,6 +2243,7 @@ int run(int argc, char** argv) {
   // the page's to the bit. The ORDER is `sample_noise`'s - the backbone, its per-molecule offsets,
   // then the latents - and then a draw a step wherever the step is stochastic.
   vector<float> noise;
+  vector<int> genPerm;
   {
     Rng g2((uint64_t)seed);
     auto take = [&](size_t count) {
@@ -2062,7 +2251,6 @@ int run(int argc, char** argv) {
       noise.resize(at + count);
       g2.randn(noise.data() + at, count);
     };
-    take((size_t)n * 3);
     vector<int> groups;
     for (int i = 0; i < n; ++i) {
       if (emit.bb[i] && !b.coordCondMask[i] &&
@@ -2071,22 +2259,49 @@ int run(int argc, char** argv) {
       }
     }
     std::sort(groups.begin(), groups.end());
-    for (size_t k = 0; k < groups.size(); ++k) take(3);
-    take((size_t)n * 32);
+    // 🔴 THE DRAW ORDER IS THE SPECIFICATION, AND A PARTIAL RUN'S IS NOT THE ORDINARY ONE.
+    // `corrupt_batch` draws the backbone's noise, then the latents', then the per-molecule
+    // offsets - where `sample_noise` draws the backbone, the offsets, then the latents - and the
+    // encoder's reparameterisation comes first of all, because the generator hands it the rng
+    // before `corrupt_batch` touches it.
+    if (isPartial) {
+      take((size_t)n * 32);              // encodeLatentsCpu's reparameterisation
+      take((size_t)n * 3);               // corrupt_batch: zero-COM backbone noise
+      take((size_t)n * 32);              // corrupt_batch: latent noise
+      for (size_t k = 0; k < groups.size(); ++k) take(3);
+      if (inverseFolding) {
+        take((size_t)n * 3);             // the target backbone at ts[0]
+        for (size_t k = 0; k < groups.size(); ++k) take(3);
+      }
+    } else {
+      take((size_t)n * 3);
+      for (size_t k = 0; k < groups.size(); ++k) take(3);
+      take((size_t)n * 32);
+    }
     // 🔴 THE LABEL PERMUTATION IS DRAWN AT THE TOP OF EACH STEP, BEFORE THAT STEP'S NOISE.
     // `trunkSeqFeatures` is built before the forward and before the modality updates, so its
     // `randperm` comes first in the stream; putting it after the noise would give the same
     // permutations and a different trajectory.
     for (int s2 = 0; s2 < steps; ++s2) {
-      // The same draw the hoisted block above made, in the same place in the stream.
-      g2.randperm((int)crdUniq.size());
+      // The same draw the hoisted block above made, in the same place in the stream - for an
+      // ordinary run. 🔴 A PARTIAL RUN'S PERMUTATIONS ARE ITS OWN: its stream opens with the
+      // encoder and the corruption rather than `sample_noise`, and it runs fewer steps, so the
+      // hoisted list (the step-0 features', drawn in the ordinary order) is the wrong one here.
+      const vector<int> perm = g2.randperm((int)crdUniq.size());
+      genPerm.insert(genPerm.end(), perm.begin(), perm.end());
       for (int dm = 0; dm < 2; ++dm) {
         if (stochastic[s2 * 2 + dm]) take((size_t)n * (dm ? 32 : 3));
+      }
+      // The resampled target comes AFTER both modalities have stepped, and not after the last
+      // step, where the clean target is used as it is.
+      if (inverseFolding && s2 < steps - 1) {
+        take((size_t)n * 3);
+        for (size_t k = 0; k < groups.size(); ++k) take(3);
       }
     }
     if (!crdUniq.empty()) {
       g.ints("g/crdUniq", crdUniq);
-      g.ints("g/crdPerm", crdPerm);
+      g.ints("g/crdPerm", genPerm);
     }
     g.meta("nGroups", (double)groups.size());
     g.meta("nCrdGroups", (double)crdUniq.size());
@@ -2097,15 +2312,44 @@ int run(int argc, char** argv) {
   g.meta("distDim", cfg.xtPairDistDim);
   g.meta("distMin", cfg.xtPairDistMin);
   g.meta("distMax", cfg.xtPairDistMax);
-  g.meta("alignChirality", 0);       // a contig has no chiral frames; a structure input will
-  g.meta("chirOff", -1);
-  g.meta("chiralFrameWidth", 0);
-  g.meta("partial", 0);
-  g.meta("inverseFolding", 0);
-  g.meta("partialTBb", 0);
-  g.meta("partialTLl", 0);
-  g.meta("baseNsteps", steps);
-  g.meta("fullNsteps", 0);
+  // 🔴 THE CHIRALITY FRAMES, WHICH THIS WROTE AS ABSENT FOR EVERY JOB. A contig has none, and the
+  // comment here said "a structure input will" - but nothing did, so a small molecule through
+  // `--job` sampled with its chirality feature FROZEN at the clean structure's frame, the one
+  // thing this port's rule says never to do with a per-step feature. The port refits each frame
+  // against the noisy CA every step (src/chirality.cuh) once these say there is one to fit.
+  int chirOff = -1;
+  {
+    int off = 0;
+    for (const string& f : cfg.featsSeq) {
+      if (f == "chirality") chirOff = off;
+      off += seqFeatureDim(f);
+    }
+  }
+  const int frameWidth = n ? (int)(b.chiralFrameAtoms.size() / ((size_t)n * 6)) : 0;
+  int activeFrames = 0;
+  if (cfg.noiseAlignChirality && chirOff >= 0 && frameWidth > 0) {
+    for (int ci = 0; ci < n; ++ci) {
+      if (!b.paddingMask[ci]) continue;
+      for (int s3 = 0; s3 < 6; ++s3) {
+        if (b.chiralFrameAtoms[((size_t)ci * 6 + s3) * frameWidth] >= 0) ++activeFrames;
+      }
+    }
+  }
+  const bool alignsChirality = activeFrames > 0;
+  g.meta("alignChirality", alignsChirality ? 1 : 0);
+  g.meta("chirOff", alignsChirality ? chirOff : -1);
+  g.meta("chiralFrameWidth", alignsChirality ? frameWidth : 0);
+  g.meta("partial", isPartial ? 1 : 0);
+  g.meta("inverseFolding", inverseFolding ? 1 : 0);
+  g.meta("partialTBb", partialT.bbCa);
+  g.meta("partialTLl", partialT.localLatents);
+  g.meta("baseNsteps", baseNsteps);
+  g.meta("fullNsteps", fullNsteps);
+  if (alignsChirality) {
+    g.tensor("g/chir", b.chirality);
+    g.ints("g/chiralFrames", b.chiralFrameAtoms);
+    g.ints("g/chiralOwners", b.chiralSlotOwner);
+  }
   g.tensor("g/pairNoDist", pairNoDist);
   g.tensor("g/cond", condAll);
   g.tensor("g/cond1", cond1All);
@@ -2132,6 +2376,7 @@ int run(int argc, char** argv) {
     if (!outputResId.empty()) {
       g.ints("g/outResId", outputResId);
       g.ints("g/outChain", outputChain);
+      for (const auto& [key, v] : outputInts) g.ints(key, v);
     }
     g.ints("g/condSeq", cs);
     vector<int> allowed(tables::ALLOWED_RESIDUE_TYPES.begin(), tables::ALLOWED_RESIDUE_TYPES.end());

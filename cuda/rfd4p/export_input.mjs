@@ -35,7 +35,8 @@ import { getTokenStarts } from "../../shared/rfd4p/pipeline/bonds.js";
 import { getRfd4pPresetById } from "../../shared/rfd4p/presets.js";
 import { parseConditionSpecYaml } from "../../shared/rfd4p/pipeline/spec.js";
 import {
-  ALLOWED_RESIDUE_TYPES, ATOM37_NAMES, UNIFIED_ATOM37_TOKENS, UNIFIED_RESTYPE_ATOM37_MASK,
+  ALLOWED_RESIDUE_TYPES, ATOM37_NAMES, UNIFIED_ATOM37_ENCODING, UNIFIED_ATOM37_TOKENS,
+  UNIFIED_RESTYPE_ATOM37_MASK,
 } from "../../shared/rfd4p/encoding.js";
 import { COND } from "../../shared/rfd4p/features.js";
 import { parseSafetensors } from "../../shared/rfd4p/safetensors.js";
@@ -43,7 +44,7 @@ import {
   pairCondFeatures, pairFeatures, trunkCondFeatures, trunkSeqFeatures,
 } from "../../shared/rfd4p/features.js";
 import {
-  DEFAULT_SAMPLING, flowEmitMasks, recycleDepths, sampleInitialNoise, sampleSchedule, seededRng,
+  DEFAULT_RECYCLE_SCHEDULE, DEFAULT_SAMPLING, flowEmitMasks, recycleDepths, sampleInitialNoise, sampleSchedule, seededRng,
 } from "../../shared/rfd4p/flow.js";
 import {
   buildPartialSchedule, partialStepCount, resolvePartialT,
@@ -107,6 +108,10 @@ const preset = specPath
         partialTrajectoryFractionSteps:
           job.partialTrajectoryFractionSteps ?? job.partial_trajectory_fraction_steps,
         inverseFolding: job.inverseFolding ?? job.inverse_folding,
+        inverseFoldingMethod: job.inverseFoldingMethod ?? job.inverse_folding_method,
+        partialTBackbone: job.partialTBackbone ?? job.partial_t_backbone,
+        partialTLatent: job.partialTLatent ?? job.partial_t_latent,
+        couplePartialT: job.couplePartialT ?? job.couple_partial_t,
       };
     })()
   : getRfd4pPresetById(presetId);
@@ -125,7 +130,9 @@ const fromAnnotations = !length && preset.specMode !== true
   && preset.cifUrl !== null && preset.cifUrl !== undefined;
 let inputCif;
 if (!length && preset.cifUrl) {
-  const bytes = readFileSync(`${repo}${preset.cifUrl.replace(/^\.\//, "")}`);
+  // An absolute path is the file; a relative one is the checkout's, as the page's preset URLs are.
+  const bytes = readFileSync(preset.cifUrl.startsWith("/") ? preset.cifUrl
+    : `${repo}${preset.cifUrl.replace(/^\.\//, "")}`);
   inputCif = decodeTextOrZstd(new Uint8Array(bytes));
 }
 // `--length=N` is one unconditioned protein segment of N residues, for sizing and timing: the trunk's
@@ -140,7 +147,9 @@ const { batch, n } = built;
 // The per-token naming an input structure supplies, for the writer at the far end.
 const outNaming = (() => {
   const atoms = built.atoms;
-  if (!atoms || inputCif === undefined) return null;
+  // A pure contig has atoms too - `<M>` stubs in the chains and numbering the contig gave them -
+  // and the page's writer names a design from them, so they cross for every job.
+  if (!atoms) return null;
   const starts = getTokenStarts(atoms, false);
   return {
     resId: starts.map((a) => Number(atoms.res_id[a])),
@@ -150,8 +159,73 @@ const outNaming = (() => {
       for (let k = 0; k < cid.length && k < 2; k += 1) packed |= cid.charCodeAt(k) << (8 * k);
       return packed;
     }),
+    tables: outputTables(atoms, starts),
   };
 })();
+
+// 🔴 WHAT THE PAGE'S WRITER READS OFF THE INPUT ATOMS, carried to the native one - the featuriser's
+// `outputTables` writes the same keys and the featurise gate holds them to these bytes. Per token
+// from its first atom; per input atom keyed by its slot in the token's OWN atom37 layout (slot 1
+// for an atomised token's one atom), because the writer finds an output atom's by NAME.
+function outputTables(atoms, starts) {
+  const packString = (v, words, into) => {
+    const s2 = String(v ?? "");
+    for (let w = 0; w < words; w += 1) {
+      let packed = 0;
+      for (let k = 0; k < 4; k += 1) {
+        const at = w * 4 + k;
+        if (at < s2.length) packed |= s2.charCodeAt(at) << (8 * k);
+      }
+      into.push(packed | 0);
+    }
+  };
+  const packDouble = (v, into, at) => {
+    const i32 = new Int32Array(new Float64Array([v]).buffer);
+    into[at * 2] = i32[0];
+    into[at * 2 + 1] = i32[1];
+  };
+  // `getTokenStarts` returns the starts alone, without the end the native one appends.
+  const nTok = starts.length;
+  const nAtoms = atoms.atom_name.length;
+  const residueType = batch.residue_type?.data ?? batch.residue_type;
+  const src = atoms["annotation_src-component_1_atom"];
+  const t = {
+    "g/inName": new Int32Array(nTok * 37), "g/inElem": new Int32Array(nTok * 37),
+    "g/inB": new Int32Array(nTok * 37 * 2), "g/inOcc": new Int32Array(nTok * 37 * 2),
+    "g/inCharge": new Int32Array(nTok * 37),
+    "g/outAtomize": [], "g/outHetero": [], "g/outEntity": [], "g/outInsCode": [],
+    "g/outResName": [], "g/outSrcComp": [],
+  };
+  for (let tk = 0; tk < nTok; tk += 1) {
+    const a0 = starts[tk];
+    const atomised = Boolean(atoms.atomize?.[a0]);
+    t["g/outAtomize"].push(atomised ? 1 : 0);
+    t["g/outHetero"].push(atoms.hetero?.[a0] ? 1 : 0);
+    t["g/outEntity"].push(atoms.label_entity_id?.[a0] != null ? Number(atoms.label_entity_id[a0]) : 0);
+    packString(atoms.ins_code?.[a0] ?? "", 1, t["g/outInsCode"]);
+    packString(atoms.res_name[a0], 2, t["g/outResName"]);
+    packString(src?.[a0] ?? ".", 4, t["g/outSrcComp"]);
+    const rt = residueType[tk];
+    const layout = UNIFIED_ATOM37_ENCODING.token_atoms[UNIFIED_ATOM37_TOKENS[rt]] ?? [];
+    for (let ai = starts[tk]; ai < (starts[tk + 1] ?? nAtoms); ai += 1) {
+      let slot = -1;
+      if (atomised) slot = ai === a0 ? 1 : -1;
+      else slot = layout.indexOf(atoms.atom_name[ai]);
+      if (slot < 0) continue;
+      const at = tk * 37 + slot;
+      const one = [];
+      packString(atoms.atom_name[ai], 1, one);
+      t["g/inName"][at] = one[0];
+      one.length = 0;
+      packString(atoms.element?.[ai] ?? "", 1, one);
+      t["g/inElem"][at] = one[0];
+      t["g/inCharge"][at] = Number(atoms.charge?.[ai] ?? 0);
+      packDouble(Number(atoms.b_factor?.[ai]), t["g/inB"], at);
+      packDouble(Number(atoms.occupancy?.[ai]), t["g/inOcc"], at);
+    }
+  }
+  return Object.fromEntries(Object.entries(t).map(([k, v]) => [k, Int32Array.from(v)]));
+}
 
 const raw = readFileSync(checkpoint);
 const parsedWeights = parseSafetensors(raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength));
@@ -366,18 +440,25 @@ if (generate) {
   // from its forward marginal at every step.
   const baseNsteps = stepsOverride || preset.nsteps || DEFAULT_SAMPLING.nsteps;
   const inverseFolding = preset.inverseFolding === true;
-  const frac = inverseFolding ? null : (preset.partialTrajectoryFractionSteps ?? null);
+  const frac = preset.partialTrajectoryFractionSteps ?? null;
+  // 🔴 EVERY FORM `resolve_partial_t` TAKES, not only a fraction: explicit start times and a
+  // coupled one are upstream's "advanced interface", and a job naming them was run as an
+  // ordinary design here as it was natively.
   const partialOpts = {
     nsteps: baseNsteps,
     ...(inverseFolding ? { inverseFolding: true } : {}),
+    ...(preset.inverseFoldingMethod != null ? { inverseFoldingMethod: preset.inverseFoldingMethod } : {}),
     ...(frac != null ? { partialTrajectoryFractionSteps: frac } : {}),
+    ...(preset.partialTBackbone != null ? { partialTBackbone: preset.partialTBackbone } : {}),
+    ...(preset.partialTLatent != null ? { partialTLatent: preset.partialTLatent } : {}),
+    ...(preset.couplePartialT != null ? { couplePartialT: preset.couplePartialT } : {}),
   };
   const partialTDict = resolvePartialT(partialOpts, DEFAULT_SAMPLING);
   const isPartial = Object.keys(partialTDict).length > 0;
   const steps = isPartial && frac != null ? partialStepCount(frac, baseNsteps) : baseNsteps;
   // 🔴 `fullNsteps` IS baseNsteps ALWAYS, not only when partial - that is what `generateRfd4pCpu`
   // passes, and with it `recycleDepths` takes the schedule's TAIL rather than resampling it.
-  const depths = recycleDepths(recycleOverride || preset.recycleSchedule || "none", steps,
+  const depths = recycleDepths(recycleOverride || preset.recycleSchedule || DEFAULT_RECYCLE_SCHEDULE, steps,
     baseNsteps);
   const genSched = isPartial
     ? buildPartialSchedule(partialTDict, steps, DEFAULT_SAMPLING,
@@ -526,6 +607,7 @@ if (generate) {
     ...(outNaming === null ? {} : {
       "g/outResId": Int32Array.from(outNaming.resId),
       "g/outChain": Int32Array.from(outNaming.chain),
+      ...outNaming.tables,
     }),
     "g/allowedTypes": Int32Array.from(ALLOWED_RESIDUE_TYPES.flatMap((r) => Array.from(r, (v) => (v ? 1 : 0)))),
     "g/atom37Legal": Int32Array.from(UNIFIED_RESTYPE_ATOM37_MASK.flatMap((r) => Array.from(r, (v) => (v ? 1 : 0)))),
@@ -559,16 +641,14 @@ if (generate) {
     // record is what separates "the loop is wired wrong" from "the loop amplifies".
     const perStep = {};
     const gen = await generateRfd4pCpu(batch, weights, cfg, {
-      nsteps: baseNsteps,
+      ...partialOpts,
       seed,
-      ...(inverseFolding ? { inverseFolding: true } : {}),
-      ...(frac != null ? { partialTrajectoryFractionSteps: frac } : {}),
       // 🔴 THE SAME RECYCLE SCHEDULE THE PORT IS HANDED, SAID OUT LOUD. `generateRfd4pCpu`
       // defaults to `medium` and the exporter writes `g/depths` from the PRESET's, so leaving it
       // off ran the reference at six recycles against the port's four - the two sides doing
       // different amounts of work on identical inputs. It read as a wrong trajectory: the noise
       // and the step-0 features were exact to the last bit and the velocity was 8e-2 out.
-      recycleSchedule: recycleOverride || preset.recycleSchedule || "none",
+      recycleSchedule: recycleOverride || preset.recycleSchedule || DEFAULT_RECYCLE_SCHEDULE,
       onStep: ({ step: s2, x1, xt }) => {
         perStep[`gen/s${s2}Bb`] = Float32Array.from(xt.bb_ca);
         perStep[`gen/s${s2}Ll`] = Float32Array.from(xt.local_latents);

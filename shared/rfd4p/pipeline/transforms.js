@@ -1497,6 +1497,13 @@ export function convertToProteinaBatch(
   const coord_mask = new Uint8Array(atom37_mask);
   const padding_mask = new Uint8Array(nTokens).fill(1);
 
+  // 🔴 THE NUCLEIC SECONDARY STRUCTURE, as upstream's tokeniser assembles it
+  // (`datapipes/pipeline.py`): the per-residue state at each token's first atom, present where it
+  // is not UNSPECIFIED; a base pair between two tokens' first atoms in both directions; and a LOOP
+  // token's whole row and column marked as specified-unpaired. All three were zeros here whatever
+  // the input said - the model reads `na_ss_state` and `na_ss_pair` and was told nothing.
+  const naSs = nucleicSecondaryStructure(ann, tokenStarts, nAtoms);
+
   const batch = {
     centroid_of_atoms_without_coordinate_conditioning: {
       data: centroidWithoutCond,
@@ -1518,8 +1525,8 @@ export function convertToProteinaBatch(
     coord_cond_mask: { data: coord_cond_mask, shape: [1, nTokens], dtype: 'U8' },
     'condition_secondary-structure_1_residue': { data: cond_sec, shape: [1, nTokens], dtype: 'I16' },
     'condition_index-group_1_token': { data: cond_idxgrp, shape: [1, nTokens], dtype: 'I16' },
-    na_ss_state: { data: new Int16Array(nTokens), shape: [1, nTokens], dtype: 'I16' },
-    na_ss_state_mask: { data: new Uint8Array(nTokens), shape: [1, nTokens], dtype: 'U8' },
+    na_ss_state: { data: naSs.state, shape: [1, nTokens], dtype: 'I16' },
+    na_ss_state_mask: { data: naSs.stateMask, shape: [1, nTokens], dtype: 'U8' },
     padding_mask: { data: padding_mask, shape: [1, nTokens], dtype: 'U8' },
     'condition_cath-label_1_residue': { data: cond_cath, shape: [1, nTokens, 3], dtype: 'I32' },
     condition_ChainCentroid_1_atom: { data: cond_centroid, shape: [1, nTokens, 3], dtype: 'F32' },
@@ -1571,12 +1578,12 @@ export function convertToProteinaBatch(
       dtype: 'U8',
     },
     na_ss_pair: {
-      data: new Int16Array(nTokens * nTokens),
+      data: naSs.pair,
       shape: [1, nTokens, nTokens],
       dtype: 'I16',
     },
     na_ss_pair_mask: {
-      data: new Uint8Array(nTokens * nTokens),
+      data: naSs.pairMask,
       shape: [1, nTokens, nTokens],
       dtype: 'U8',
     },
@@ -1684,4 +1691,50 @@ export function runValidationPipeline(atomsInput, opts = {}) {
   });
 
   return { batch, n, atoms, inputAtomArray: atomsInput };
+}
+
+/** `na_ss_state`, `na_ss_pair` and their masks (upstream `datapipes/pipeline.py`). */
+function nucleicSecondaryStructure(ann, tokenStarts, nAtoms) {
+  const nTokens = tokenStarts.length;
+  const state = new Int16Array(nTokens);
+  const stateMask = new Uint8Array(nTokens);
+  const pair = new Int16Array(nTokens * nTokens);
+  const pairMask = new Uint8Array(nTokens * nTokens);
+  const stateAnn = ann?.['condition_na-ss-state_1_residue'];
+  if (stateAnn) {
+    for (let t = 0; t < nTokens; t++) {
+      state[t] = Number(stateAnn[tokenStarts[t]] ?? 0);
+      stateMask[t] = state[t] !== 0 ? 1 : 0;
+    }
+  }
+  const srcIdx = ann?.['annotation_src-atom-index_1_atom'];
+  const partners = ann?.['condition_basepair-partners_1_atom'];
+  if (srcIdx && partners) {
+    // Only a token's FIRST atom stands for it: `atom_to_token[token_starts] = arange(n_tokens)`.
+    const tokenOfSrc = new Map();
+    for (let t = 0; t < nTokens; t++) {
+      const src = srcIdx[tokenStarts[t]];
+      if (src != null && src >= 0) tokenOfSrc.set(src, t);
+    }
+    for (let t = 0; t < nTokens; t++) {
+      const list = partners[tokenStarts[t]];
+      if (!list) continue;
+      for (const raw of String(list).split(',')) {
+        if (raw === '') continue;
+        const u = tokenOfSrc.get(Number(raw));
+        if (u === undefined) continue;
+        pair[t * nTokens + u] = 1;
+        pairMask[t * nTokens + u] = 1;
+      }
+    }
+  }
+  // BasePairEnum.LOOP = 2: an explicitly unpaired token's row and column are SPECIFIED.
+  for (let t = 0; t < nTokens; t++) {
+    if (state[t] !== 2) continue;
+    for (let u = 0; u < nTokens; u++) {
+      pairMask[t * nTokens + u] = 1;
+      pairMask[u * nTokens + t] = 1;
+    }
+  }
+  return { state, stateMask, pair, pairMask };
 }

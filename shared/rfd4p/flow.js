@@ -27,15 +27,41 @@ export const DEFAULT_SAMPLING = {
 };
 
 /**
- * Recycle ("thinking") schedules, `configs/recycle_strategy/<budget>/front_loaded.yaml`:
+ * Recycle ("thinking") schedules, every `configs/recycle_strategy/<budget>/<shape>.yaml`:
  * `[width, depth]` bands over the 60 steps. Depth is the total number of trunk passes per step.
+ * A bare budget (`low`, `medium`, `high`) and `thinking_<budget>` are `front_loaded`, as upstream's
+ * `thinking_*.yaml` say; `thinking_medium` is upstream's default (`configs/inference.yaml`).
+ *
+ * 🔴 `high` WAS `[[15,6],[15,5],[15,4],[15,3]]` HERE AND IN cuda/rfd4p, which is no upstream file:
+ * 270 passes at depths 3-6 where upstream's is 300 at 2-9. `low` and `medium` were right and every
+ * preset names `low`, so nothing that ran could see it. The table is now every file, transcribed.
  */
-export const RECYCLE_SCHEDULES = {
-  none: [[60, 1]],
-  low: [[10, 4], [10, 3], [10, 2], [30, 1]],
-  medium: [[5, 6], [10, 5], [5, 4], [10, 3], [20, 2], [10, 1]],
-  high: [[15, 6], [15, 5], [15, 4], [15, 3]],
+const RECYCLE_BANDS = {
+  low: {
+    flat: [[60, 2]],
+    front_loaded: [[10, 4], [10, 3], [10, 2], [30, 1]],
+    midpeak: [[10, 1], [5, 2], [5, 3], [10, 4], [5, 3], [5, 2], [20, 1]],
+  },
+  medium: {
+    flat: [[60, 3]],
+    front_loaded: [[5, 6], [10, 5], [5, 4], [10, 3], [20, 2], [10, 1]],
+    midpeak: [[5, 1], [5, 2], [5, 2], [5, 4], [10, 5], [5, 4], [5, 2], [5, 2], [15, 1]],
+  },
+  high: {
+    flat: [[60, 5]],
+    front_loaded: [[10, 9], [10, 8], [10, 5], [20, 3], [10, 2]],
+    midpeak: [[5, 1], [5, 2], [5, 3], [5, 5], [10, 6], [5, 5], [5, 3], [5, 2], [15, 1]],
+  },
 };
+export const RECYCLE_SCHEDULES = { none: [[60, 1]] };
+for (const [budget, shapes] of Object.entries(RECYCLE_BANDS)) {
+  RECYCLE_SCHEDULES[budget] = shapes.front_loaded;
+  RECYCLE_SCHEDULES[`thinking_${budget}`] = shapes.front_loaded;
+  for (const [shape, bands] of Object.entries(shapes)) RECYCLE_SCHEDULES[`${budget}/${shape}`] = bands;
+}
+
+/** Upstream's default recycle strategy (`configs/inference.yaml`: `thinking_medium`). */
+export const DEFAULT_RECYCLE_SCHEDULE = 'medium';
 
 /** Expand `[width, depth]` bands into one depth per step (`Proteina.recycle_depths`). */
 export function recycleDepths(schedule, nsteps, fullNsteps = nsteps) {

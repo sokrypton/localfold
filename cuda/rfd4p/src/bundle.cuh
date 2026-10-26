@@ -102,10 +102,9 @@ inline void loadInt8Bundle(const std::string& dir, const std::string& shardDir) 
   // One shard at a time, so the host never holds more than the largest of them.
   //
   // 🔴 THE ENCODER'S FIVE SHARDS ARE SKIPPED WHEN THEY ARE NOT THERE, and that is the published
-  // bundle's own split: 331 MB of `core` and 138 MB of `encoder`, the latter fetched only for
-  // partial diffusion and inverse folding. This port does neither, so a bundle without them is
-  // complete rather than broken - but a tensor the trunk or the decoder actually wants must still
-  // be present, which `W()` enforces by name at first use.
+  // bundle's own split: 331 MB of `core` and 138 MB of `encoder`, the latter read only for partial
+  // diffusion and inverse folding. A bundle without them is complete for every other job; one of
+  // those two asks for an encoder tensor, and `W()` refuses it by name at first use.
   std::map<std::string, std::vector<std::pair<std::string, const Json*>>> byShard;
   for (const auto& [name, rec] : tensors->obj) {
     const Json* file = rec.get("file");
@@ -192,7 +191,7 @@ inline void loadInt8Bundle(const std::string& dir, const std::string& shardDir) 
   CK(cudaFree(devShard));
   printf("int8 bundle: %zu tensors (%zu coded, %zu float32), %.1f MB read", coded + plain, coded,
          plain, bytes / 1e6);
-  if (skipped) printf("; %zu absent (the encoder's shards, which nothing here reads)", skipped);
+  if (skipped) printf("; %zu absent (the encoder's shards, read only by partial diffusion and inverse folding)", skipped);
   printf("\n");
 }
 

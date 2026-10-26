@@ -585,6 +585,32 @@ inline Annotations readAnnotations(const AtomSite& a, const Block& block,
       }
     }
   }
+  // 🔴 THE BASE PAIRS, a TWO-body annotation (`_condition_basepair_2_residue`, atom indices
+  // `idx0`/`idx1`), carried as two per-atom columns every slice and concatenation keeps: the
+  // atom's index in this file, and its partners' (comma-joined). The condition is SYMMETRIC and
+  // upstream's reader stores each row both ways, so each atom lists the other.
+  {
+    auto c = block.find("condition_basepair_2_residue");
+    if (c != block.end() && c->second.count("idx0") && c->second.count("idx1")) {
+      const vector<string>& i0 = c->second.at("idx0");
+      const vector<string>& i1 = c->second.at("idx1");
+      vector<string> partners(a.n);
+      auto add = [&](int at, int other) {
+        if (!partners[at].empty()) partners[at] += ",";
+        partners[at] += std::to_string(other);
+      };
+      for (size_t r = 0; r < i0.size() && r < i1.size(); ++r) {
+        const int i = safeInt(i0[r], -1), j = safeInt(i1[r], -1);
+        if (i < 0 || j < 0 || i >= (int)a.n || j >= (int)a.n) continue;
+        add(i, j);
+        add(j, i);
+      }
+      vector<int>& src = out.ints["annotation_src-atom-index_1_atom"];
+      src.resize(a.n);
+      for (size_t k = 0; k < a.n; ++k) src[k] = (int)k;
+      out.strings["condition_basepair-partners_1_atom"] = partners;
+    }
+  }
   // The legacy masks, which REPLACE the condition columns they shadow.
   if (out.ints.count("mask_index_1_residue")) {
     out.ints["condition_index_1_residue"] = out.ints["mask_index_1_residue"];

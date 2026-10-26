@@ -173,7 +173,7 @@ export const RFD4P_PRESETS = Object.freeze([
       C_SEC: {
         HELIX: [{ select: "sel('*/h1/*/*') | sel('*/h2/*/*')" }],
         LOOP: [{ select: "sel('*/l1/*/*') | sel('*/l2/*/*')" }],
-        STRAND: [{ select: "sel('*/s1/*/*') | sel('*/s2/*/*')" }],
+        SHEET: [{ select: "sel('*/s1/*/*') | sel('*/s2/*/*')" }],
       },
     },
   },

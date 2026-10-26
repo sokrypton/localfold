@@ -97,6 +97,58 @@ TOL_RES = 2.0   # a stage may drift this many times its recorded residual before
 TOL_MS = 0.25   # a timing is noisy and machine-specific; 25% is a regression worth printing
 
 
+def write_nucleic_ss_case(cif: Path, job: Path) -> None:
+    """The DNA example with a nucleic state on every residue and base pairs across its strands.
+
+    `condition_na-ss-state_1_residue` cycles PAIR, PAIR, LOOP, UNSPECIFIED down each strand, and
+    `_condition_basepair_2_residue` pairs strand A's residue i with strand B's residue n-1-i on
+    each residue's first atom - one row a pair, as upstream writes it, which its reader expands
+    both ways.
+    """
+    import zstandard
+
+    text = zstandard.ZstdDecompressor().decompressobj().decompress(
+        (REPO / "web" / "examples" / "dna_7m5w.cif.zst").read_bytes()).decode()
+    lines = text.splitlines()
+    cols, first = [], None
+    for i, ln in enumerate(lines):
+        if ln.startswith("_atom_site."):
+            first = i if first is None else first
+            cols.append(ln.split(".", 1)[1].strip())
+    body = first + len(cols)
+    end = body
+    while end < len(lines) and not lines[end].startswith(("#", "loop_", "_")):
+        end += 1
+    rows = [ln.split() for ln in lines[body:end]]
+    ci, si = cols.index("label_asym_id"), cols.index("label_seq_id")
+    residues: dict[str, list[tuple[str, int]]] = {}
+    first_atom: dict[tuple[str, str], int] = {}
+    for k, f in enumerate(rows):
+        key = (f[ci], f[si])
+        if key not in first_atom:
+            first_atom[key] = k
+            residues.setdefault(f[ci], []).append(key)
+    cycle = [1, 1, 2, 0]
+    state = {}
+    for chain in ("A", "B"):
+        for r, key in enumerate(residues.get(chain, [])):
+            state[key] = cycle[r % 4]
+    out = lines[:body - 0]
+    out.insert(first + len(cols), "_atom_site.condition_na-ss-state_1_residue")
+    for f in rows:
+        out.append(" ".join(f) + f" {state.get((f[ci], f[si]), 0)}")
+    out.extend(lines[end:end + 1] if end < len(lines) and lines[end].startswith("#") else ["#"])
+    out += ["loop_", "_condition_basepair_2_residue.idx0", "_condition_basepair_2_residue.idx1",
+            "_condition_basepair_2_residue.val0"]
+    a, b = residues.get("A", []), residues.get("B", [])
+    for i in range(min(len(a), len(b))):
+        out.append(f"{first_atom[a[i]]} {first_atom[b[len(b) - 1 - i]]} 1")
+    out.append("#")
+    rest = lines[end + 1:] if end < len(lines) and lines[end].startswith("#") else lines[end:]
+    cif.write_text("\n".join(out + rest) + "\n")
+    job.write_text(json.dumps({"input": str(cif), "nsteps": 4}))
+
+
 def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
     return subprocess.run([str(c) for c in cmd], capture_output=True, text=True, **kw)
 
@@ -434,6 +486,34 @@ def main() -> int:
             # `export_input.mjs` refused it outright and this side wrote frozen labels.
             crdgrp = HERE / "featurise" / "gate-crdgroups.json"
             cases.append(("crdgroups", [f"--spec={crdgrp}"], [f"--spec={crdgrp}"]))
+            # 🔴 AND THE RUNS THAT DO NOT START FROM NOISE, WHICH THE NATIVE FEATURISER DROPPED.
+            # A job naming partial diffusion or inverse folding was featurised as an ordinary
+            # design and generated from noise with exit status 0: the spec reader had no field
+            # for either and wrote `partial = 0` as a constant. Every form `resolve_partial_t`
+            # takes - a fraction, both start times, one COUPLED through the schedules, inverse
+            # folding - and the encoder's inputs (`-enc`), which only the exporter wrote, so
+            # those two runs needed Node however the rest of a job was featurised.
+            for tag in ("partial", "inverse", "partial-t", "partial-couple"):
+                spec = HERE / "featurise" / f"gate-{tag}.json"
+                cases.append((tag, [f"--spec={spec}"], [f"--spec={spec}", "--encoder"]))
+            # 🔴 AND A CHIRAL CENTRE, WHOSE FRAMES THE NATIVE FEATURISER NEVER WROTE. Its comment
+            # said "a contig has no chiral frames; a structure input will", and nothing did - so
+            # a small molecule through `--job` sampled with its chirality feature FROZEN at the
+            # clean frame, and the step-0 features copied the clean vectors where the page
+            # rotates them onto the noisy CA (252 values on `sm_sam`).
+            chiral = HERE / "featurise" / "gate-chirality.json"
+            cases.append(("chirality", [f"--spec={chiral}"], [f"--spec={chiral}"]))
+            # 🔴 AND NUCLEIC SECONDARY STRUCTURE, WHICH BOTH PORTS WROTE AS ZEROS. The model reads
+            # `na_ss_state` and `na_ss_pair`; the reader did not keep the state column and nothing
+            # read the base-pair loop. No shipped example carries either, so one is SYNTHESISED
+            # from the DNA example - a state a residue and pairs across the two strands - and the
+            # two ports are held to each other on it. (Against upstream itself the page's batch
+            # matches its own tokeniser on `data/benchmarks/rna/pseudoknot/W05`: 90 tokens, 74
+            # directed pairs, 16 loop tokens, every array exact; that file is upstream's and is
+            # not copied here.)
+            nss = HERE / "featurise" / "gate-nucleic-ss.json"
+            write_nucleic_ss_case(HERE / "featurise" / "gate-nucleic-ss.cif", nss)
+            cases.append(("nucleic-ss", [f"--spec={nss}"], [f"--spec={nss}"]))
             # 🔴 AND THE GENERATION DIRECTORY, NOT ONLY THE TRUNK'S INPUT. `--generate` writes the
             # per-step conditioning, the emit masks, the recycle depths and the NOISE - which the
             # C++ now draws rather than replays, so Box-Muller is compared here too. Without this
@@ -450,6 +530,9 @@ def main() -> int:
                 differ = compare_dirs(nat, js)
                 differ += [f"-gen {d}" for d in compare_dirs(
                     Path(str(nat) + "-gen"), Path(str(js) + "-gen"))]
+                if (Path(str(nat) + "-enc") / "model.idx").exists():
+                    differ += [f"-enc {d}" for d in compare_dirs(
+                        Path(str(nat) + "-enc"), Path(str(js) + "-enc"))]
                 if differ:
                     bad_fields += len(differ)
                     first = first or f"{tag}: {differ[0]}"
@@ -464,13 +547,15 @@ def main() -> int:
             # subset at the moment it is handed something outside it - a condition quietly matched
             # to nothing is a condition the model is told is absent, which is a different job
             # folded under the right name. Each of these must name the thing it cannot take.
+            # 🔴 A PURE CONTIG RUNS THE STRUCTURE PIPELINE NOW, from an empty structure as the
+            # reference does, so the refusals that were this port's SUBSET are gone - a selection
+            # that constrains a chain is evaluated, an unnamed segment is taken - and the two
+            # contig refusals are the reference's own, in its own words.
             refusals = [
-                ('{"contig":"a1:5-5P,A16-35"}', "preserved segment"),
-                ('{"contig":"a1:5-5X"}', "chain type"),
+                ('{"contig":"a1:5-5P,A16-35"}', "matched no atoms"),
+                ('{"contig":"a1:5-5X"}', "Malformed expandable-segment token"),
                 ('{"contig":"a1:5-5P","conditions":{"C_SEQ":{"ALA":[{"select":"sel(\'*/a1/*/*\')"}]}}}',
-                 "drops it silently"),
-                ('{"contig":"a1:5-5P","conditions":{"C_SEC":{"HELIX":[{"select":"sel(\'A/*/12/*\')"}]}}}',
-                 "constrains a chain"),
+                 "drops silently"),
                 # 🔴 A CENTROID WITH FEWER THAN THREE NUMBERS. A deliberate divergence: the
                 # reference stores `parts.slice(0, 3)`, so `"1.5,-2.25"` becomes a TWO-element
                 # entry in a column every stage after it reads as a point, silently. This port
@@ -556,6 +641,43 @@ def main() -> int:
                       f"{sum(caca) / len(caca):.3f} A  {'ok ' if ok else 'NOT A CHAIN'}"
                       if caca else f"  {'int8 job':10s} no structure  FAILED")
                 got["int8_job"] = {"caca_mean": round(sum(caca) / len(caca), 3) if caca else None}
+
+                # 🔴 AND THE WRITER, AGAINST THE PAGE'S, ON THE SAME SAMPLE. Every arm above
+                # scores a structure as GEOMETRY, and the native writer was wrong everywhere
+                # geometry cannot look: a nucleotide's atoms named by the protein layout (P as
+                # `N`, C1' as `CA`), a ligand atom written `UNK CA`, element C, `ATOM`, no
+                # B-factor, occupancy, charge or entity from the input, an unindexed motif grafted
+                # pair by pair where the page grafts all or nothing, and its never-written tokens
+                # used as alignment anchors. `--dump-sample=` writes what `processSampleToAtoms`
+                # takes; check-writer.mjs runs the page's writer on it and requires the SAME TEXT,
+                # every preset in both formats, and the unindexed one converged as well, because
+                # at six steps no mapping can be grafted and the predicted one goes unexercised.
+                writer_bad = []
+                writer_cases = [(pid, 6) for pid in (
+                    "uncond_short", "ppi_pdl1", "motif_idx_1prw", "motif_unidx_1prw", "sm_sam",
+                    "dna_7m5w", "yaml_5o45_binder", "partial_diffusion_1prw",
+                    "inverse_folding_1prw", "custom_cath_monomer")] + [("motif_unidx_1prw", 60)]
+                for pid, steps in writer_cases:
+                    r = run(["node", HERE / "featurise" / "preset-spec.mjs", pid], cwd=REPO)
+                    spec = json.loads(r.stdout)
+                    spec["nsteps"] = steps
+                    job = HERE / "featurise" / f"gate-writer-{pid}-{steps}.json"
+                    job.write_text(json.dumps(spec))
+                    dump = HERE / f"gate-writer-{pid}-{steps}"
+                    for ext in ("cif", "pdb"):
+                        outf = HERE / f"gate-writer-{pid}-{steps}.{ext}"
+                        run([BINARY, f"--job={job}", f"--int8={bundle}",
+                             f"--work-dir={dump}-work", f"--out={outf}", "--seed=0", "--fast",
+                             f"--dump-sample={dump}"], cwd=REPO)
+                        r = run(["node", HERE / "check-writer.mjs", f"--spec={job}", dump, outf],
+                                cwd=REPO)
+                        if r.returncode != 0:
+                            writer_bad.append(f"{pid}@{steps}.{ext}")
+                if writer_bad:
+                    failed += 1
+                print(f"  {'writer':10s} {len(writer_cases) * 2} files against the page's writer"
+                      f"  {'ok ' if not writer_bad else 'DIFFERS: ' + ', '.join(writer_bad)}")
+                got["writer"] = {"files": len(writer_cases) * 2, "differing": len(writer_bad)}
 
             # 🔴 THE ASSIGNMENT SOLVER, ON ITS OWN. It decides which designed token an
             # unindexed motif is grafted onto, so a wrong answer is a plausible structure with

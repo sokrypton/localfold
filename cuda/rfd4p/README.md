@@ -265,10 +265,11 @@ bundle's quantisation and upstream's decision rather than this port's arithmetic
 generates is **0.15 A of mean CA from the float one at the same seed**, with identical CA-CA and
 radius of gyration. The gate runs it as its own arm wherever the shards are on disk.
 
-🔴 **AND THE ENCODER'S FIVE SHARDS ARE NOT FETCHED.** The bundle splits 331 MB of `core` from 138 MB
-of `encoder`, the latter read only for partial diffusion and inverse folding, which this port does
-not do. A bundle without them is complete rather than broken, and a tensor the trunk or decoder
-actually wants is still caught by name at first use.
+🔴 **AND THE ENCODER'S FIVE SHARDS ARE READ ONLY BY PARTIAL DIFFUSION AND INVERSE FOLDING.** The
+bundle splits 331 MB of `core` from 138 MB of `encoder`; a bundle without the second is complete
+for every other job, and one of those two runs asks for an encoder tensor that `W()` refuses by
+name. They are `weights/int8/encoder_shard_00{0..4}.bin` beside the core shards on the published
+port's Pages URL. (This paragraph said "which this port does not do" long after it did.)
 
 ## The sampling loop, against the reference's own
 
@@ -384,18 +385,21 @@ overwrites the fill. A port that helpfully computed them would disagree. What is
 is the chain - `token_bond_path_length[i][j] = |i - j|` and `canonical_polymer_ordering` at the
 neighbours - and the conditions.
 
-The selection language is a SUBSET and says so: a union of `sel('*/<segment>/*/*')`, which is what
-a contig with no residue numbers and no atoms can express. Anything else is refused BY NAME, never
-quietly matched to nothing - a condition silently dropped is a condition the model is told is
-absent, which is a different job folded under the right name. The gate has an arm for the
-refusals: a preserved segment, an unknown chain type, a condition that needs atoms, a selection
-that constrains a chain, and a centroid given fewer than three numbers.
+🔴 **A PURE CONTIG RUNS THE STRUCTURE PIPELINE, FROM AN EMPTY STRUCTURE, AS THE REFERENCE DOES**
+(`buildAtomArrayFromConditionSpec` starts from `createEmptyAtomArray()`). It used to have a route
+of its own - `buildSpecBatch`, every token a `<M>` stub - and that route was a SUBSET: it refused an
+unnamed segment (`"50-50"`, the most ordinary contig there is), any selection but
+`sel('*/<segment>/*/*')`, and every condition but secondary structure and CATH, and it had no atoms
+to name a design from, so the writer could not agree with the page's either. Deleted; the one
+pipeline is byte-identical to the exporter on every pure-contig case the gate holds. The refusals
+left are the reference's own, in its own words (a preserved segment that matches nothing, a
+malformed segment token), plus one stated divergence:
 
-🔴 **AND ONE OF THOSE REFUSALS IS STRICTER THAN THE REFERENCE.** `C_SEQ` on a pure contig reaches
-`finalizeAndCanonicalizeSequenceConditioning`, which rewrites every stub back to `<M>`, so the
-page folds such a job with the condition having done **nothing** - measured. This refuses instead.
-What it costs is a job the page accepts and this does not; what it buys is that a conditioning
-this cannot apply is never silently dropped.
+🔴 **A SEQUENCE CONDITION ON A PURE CONTIG IS REFUSED, WHERE THE REFERENCE SILENTLY IGNORES IT.**
+It reaches `finalizeAndCanonicalizeSequenceConditioning`, which rewrites every stub back to `<M>`,
+so the page folds such a job with the condition having done **nothing** - measured. What it costs is
+a job the page accepts and this does not; what it buys is that a conditioning nobody can apply is
+never silently dropped. (Upstream cannot be asked: it requires an input.)
 
 `featurise/tables.inc` is generated from `shared/rfd4p/` (the 147-token vocabulary and its atom37
 layouts, the condition registry and its enums, the CATH maps), and
@@ -472,6 +476,44 @@ small-molecule, DNA and partial-diffusion cases exportable.
 🔴 **A PRESET WITHOUT `specMode` IS BUILT FROM ITS STRUCTURE'S ANNOTATIONS, NOT ITS CONTIG** -
 web/generate.js has the note. Those contigs are written in the original entry's numbering and name
 residues the cropped example does not contain, so building one from the spec fails outright.
+
+## Against upstream itself, not only the page
+
+Every gate above holds this port to `cpu/rfd4p/` and `shared/rfd4p/` - the page's own reference -
+and that left a blind spot: anything the PAGE got wrong, or never implemented, this port inherited
+in the same place and agreed with perfectly. An audit against `~/RFD4-Proteina` (the Python, at the
+pinned checkpoint revision) found, and this round fixed:
+
+- 🔴 **The `high` recycle budget was no upstream file**: `[[15,6],[15,5],[15,4],[15,3]]` - 270
+  passes at depths 3-6 - where `recycle_strategy/high/front_loaded.yaml` is
+  `[[10,9],[10,8],[10,5],[20,3],[10,2]]`, 300 at 2-9. Identical in both ports, so nothing could see
+  it, and every preset names `low`. The table is now every upstream file (`flat`, `front_loaded`,
+  `midpeak` at each budget, and `thinking_*`), generated into `tables.inc` rather than copied, and
+  the native default with no schedule is upstream's `thinking_medium` where it was `none`.
+- 🔴 **A job naming partial diffusion or inverse folding ran as an ordinary design**, exit status
+  0: the native spec reader had no field for either and wrote `partial = 0` as a constant. All five
+  of `resolve_partial_t`'s forms now (a fraction, both start times, one coupled, inverse folding)
+  on both sides, the encoder's inputs written natively, and `--job` hands the fold `--encoder=`
+  itself. Folded from the published bundle alone: inverse folding holds the input backbone to
+  **0.0005 A**.
+- 🔴 **A small molecule through `--job` sampled with its chirality FROZEN** - the native featuriser
+  wrote `alignChirality = 0` for every job ("a structure input will", said its comment) - and its
+  step-0 features copied the clean vectors where the page rotates them (252 values on `sm_sam`).
+- 🔴 **Nucleic-acid secondary structure was zeros in both ports.** The model reads `na_ss_state` and
+  `na_ss_pair`; the reader did not keep `condition_na-ss-state_1_residue` and nothing read the
+  two-body `_condition_basepair_2_residue` loop. Carried now as two per-atom columns every slice
+  keeps (the atom's file index and its partners'), resolved to tokens as upstream's tokeniser does,
+  and the page's batch matches upstream's on its own `W05` benchmark: 90 tokens, 74 directed pairs,
+  16 loop tokens, every array exact.
+- 🔴 **The native WRITER disagreed with the page's on most structures**, invisibly to every geometry
+  arm: a nucleotide's atoms named by the PROTEIN layout (P as `N`, C1' as `CA`), a ligand atom as
+  `UNK CA`, element C, `ATOM`, no B-factor, occupancy, charge or entity, an unindexed motif grafted
+  pair by pair where the page grafts all or nothing, its never-written tokens used as alignment
+  anchors, and `%.3f` where the page prints `toFixed(3)` (a tie goes UP, and `-0.000` keeps its
+  sign). `--dump-sample=` and `check-writer.mjs` now hold the two to the same TEXT on every preset
+  in both formats.
+- `C_SEC: {SHEET: ...}` - upstream's spelling (`SSEnum`: NONE, HELIX, SHEET, LOOP) - was refused;
+  this said STRAND, which stays as an alias.
 
 ## What is not done
 

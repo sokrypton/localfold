@@ -23,4 +23,14 @@ gate-pair.pdb
 gate-pair.cif
 gate-campaign/
 gate-campaign*.pdb
-data-*-gate2.pdb
+data-*-gate*.pdb
+# Every gate run rewrites these; they are outputs, and several were committed by accident.
+gate-*-gen/
+gate-structure-fold*/
+gate-structure-fold*.pdb
+gate-unindexed/
+gate-unindexed.pdb
+gate-writer-*
+featurise/gate-writer-*.json
+featurise/gate-nucleic-ss.cif
+featurise/gate-nucleic-ss.json

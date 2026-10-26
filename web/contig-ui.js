@@ -42,8 +42,11 @@ export const SPAN_KINDS = ["generated", "sequence", "segment", "ligand", "break"
 /** What a contig calls each polymer, from SUFFIX_TO_CHAIN_TYPE in the pipeline. */
 export const SPAN_POLYMER_SUFFIX = { protein: "P", rna: "R", dna: "D" };
 
-/** The secondary structures a named span can ask for, as C_SEC's own keys. */
-export const SPAN_STRUCTURES = { "": "any", HELIX: "helix", LOOP: "loop", STRAND: "strand" };
+/**
+ * The secondary structures a named span can ask for, as C_SEC's own keys - upstream's `SSEnum`
+ * says SHEET, and a span written STRAND was a job upstream refuses. The label stays "strand".
+ */
+export const SPAN_STRUCTURES = { "": "any", HELIX: "helix", LOOP: "loop", SHEET: "strand" };
 
 /** The chain letters the loop and the fold agree on, mirroring hunter-loop's. */
 export const CHAIN_IDS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";

@@ -16,9 +16,16 @@ if (!preset) {
   console.error(`no preset ${id}`);
   process.exit(1);
 }
+// The WHOLE job, structure and run mode included: a preset with a `cifUrl` is a job on that
+// structure, and partial diffusion and inverse folding are fields of the job like any other. This
+// wrote the contig and conditions alone, so a structure preset came out as a different job.
 process.stdout.write(JSON.stringify({
+  ...(preset.cifUrl ? { input: preset.cifUrl.replace(/^\.\//, "") } : {}),
+  ...(preset.specMode === undefined ? {} : { specMode: preset.specMode }),
   contig: preset.contig,
   conditions: preset.conditions,
   nsteps: preset.nsteps,
   recycleSchedule: preset.recycleSchedule,
+  partialTrajectoryFractionSteps: preset.partialTrajectoryFractionSteps,
+  inverseFolding: preset.inverseFolding,
 }) + "\n");

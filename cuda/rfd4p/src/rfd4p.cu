@@ -23,6 +23,7 @@
 #include "generate.cuh"
 #include "bundle.cuh"
 #include <fstream>
+#include <sys/stat.h>
 #include <chrono>
 
 // 🔴 OUTSIDE THE ANONYMOUS NAMESPACE. Declared inside it this is `<unnamed>::rfd4p`, which
@@ -33,7 +34,7 @@ namespace rfd4p { namespace featurise { int run(int argc, char** argv); } }
 namespace {
 
 struct Opts {
-  std::string dir, weights, oracle, gen, genOracle, enc, encOracle, int8, job,
+  std::string dir, weights, oracle, gen, genOracle, enc, encOracle, int8, job, dumpSample,
       out = "design.pdb";
   int seed = 0;      // a later design draws its own noise from seed + design
   int recycles = 0;  // 0 = whatever the input directory says
@@ -457,6 +458,28 @@ int generate(const Opts& o, const rfd4p::Dims& d, rfd4p::Trunk& t) {
         std::vector<int>(M.i("g/atom37Legal"), M.i("g/atom37Legal") + (size_t)nTypes * 37), emitLl,
         download(t.mask, n));
 
+    // 🔴 THE SAMPLE, BEFORE ANY OF THE WRITER'S OWN STEPS, so the writer can be held to the page's.
+    // `processSampleToAtoms` takes exactly these - the decoded coordinates, the atom mask, the
+    // residue types, the padding and the insertion head's logits - and does the grafting, the
+    // alignment and the naming itself; cuda/rfd4p/check-writer.mjs runs it on this dump and
+    // requires the SAME TEXT as the file written below.
+    if (!o.dumpSample.empty() && design == 0) {
+      mkdir(o.dumpSample.c_str(), 0755);
+      auto raw = [&](const char* name, const void* p, size_t bytes) {
+        FILE* f = fopen((o.dumpSample + "/" + name).c_str(), "wb");
+        fwrite(p, 1, bytes, f);
+        fclose(f);
+      };
+      raw("coors.f32", g.coors.data(), g.coors.size() * 4);
+      raw("atomMask.u8", g.atomMask.data(), g.atomMask.size());
+      raw("residueType.i32", g.residueType.data(), g.residueType.size() * 4);
+      const std::vector<float> padHost = download(t.mask, n);
+      raw("pad.f32", padHost.data(), padHost.size() * 4);
+      if (t.insertion) {
+        const std::vector<float> ins = download(t.insertion, (size_t)n * n);
+        raw("insertion.f32", ins.data(), ins.size() * 4);
+      }
+    }
     // The atom and residue names, written beside the tensors by the exporter: the page's own tables.
     std::vector<std::string> atomNames, resNames;
     {
@@ -488,6 +511,38 @@ int generate(const Opts& o, const rfd4p::Dims& d, rfd4p::Trunk& t) {
       const std::string ext = dot == std::string::npos ? "" : path.substr(dot);
       path = stem + "_" + std::to_string(design + 1) + ext;
     }
+    // The input's own numbering and chain letters where a job named a structure; absent for a
+    // contig, where the token index IS the residue number. And what the page's writer reads off
+    // the input atoms (`outputTables` in the featuriser), which the grafting needs too.
+    rfd4p::OutNaming naming;
+    if (M.has("g/outResId") && M.has("g/outChain")) {
+      naming.resId.assign(M.i("g/outResId"), M.i("g/outResId") + n);
+      naming.chain.assign(M.i("g/outChain"), M.i("g/outChain") + n);
+    }
+    if (M.has("g/inName")) {
+      auto ints = [&](const char* key, size_t count, std::vector<int>& into) {
+        into.assign(M.i(key), M.i(key) + count);
+      };
+      const size_t slots = (size_t)n * 37;
+      ints("g/outAtomize", n, naming.in.atomize);
+      ints("g/outHetero", n, naming.in.hetero);
+      ints("g/outEntity", n, naming.in.entity);
+      ints("g/outInsCode", n, naming.in.insCode);
+      ints("g/outResName", (size_t)n * 2, naming.in.resName);
+      ints("g/outSrcComp", (size_t)n * 4, naming.in.srcComp);
+      ints("g/inName", slots, naming.in.inName);
+      ints("g/inElem", slots, naming.in.inElem);
+      ints("g/inCharge", slots, naming.in.inCharge);
+      ints("g/inB", slots * 2, naming.in.inB);
+      ints("g/inOcc", slots * 2, naming.in.inOcc);
+    }
+    // Only the INDEXED tokens are written; an unindexed motif was grafted onto one of them.
+    if (M.has("g/condIndex")) {
+      const int* ci = M.i("g/condIndex");
+      naming.emit.assign((size_t)n, 1);
+      for (int i = 0; i < n; ++i) naming.emit[i] = ci[(size_t)i * 37 + 1] != 0;
+    }
+    std::vector<int> crdSource;
     // 🔴 THE UNINDEXED MOTIFS FIRST, BECAUSE THEY SUPPLY ANCHORS THE ALIGNMENT THEN USES. An
     // unindexed token is in-context conditioning and is never emitted, so its conditioned
     // coordinates reach the output only by being grafted onto a token that was.
@@ -514,15 +569,25 @@ int generate(const Opts& o, const rfd4p::Dims& d, rfd4p::Trunk& t) {
             g, n, insLogits.empty() ? nullptr : insLogits.data(), M.i("g/condIndex"),
             M.has("g/resType") ? M.i("g/resType") : nullptr,
             M.has("g/coords") ? M.f("g/coords") : nullptr, condCoordRW.data(),
-            condIntCrdRW.empty() ? nullptr : condIntCrdRW.data(), emitted, atomNames,
+            condIntCrdRW.empty() ? nullptr : condIntCrdRW.data(), emitted, naming,
             &usedPredicted);
         if (!ins.source.empty()) {
           printf("  %zu unindexed token%s grafted by the %s mapping\n", ins.source.size(),
                  ins.source.size() == 1 ? "" : "s", usedPredicted ? "predicted" : "geometric");
+        } else if (M.has("g/condIndex")) {
+          // Upstream warns and writes the design without the motif's annotations; so does this.
+          bool anyUnindexed = false;
+          for (int i = 0; i < n; ++i) anyUnindexed |= M.i("g/condIndex")[(size_t)i * 37 + 1] == 0;
+          if (anyUnindexed) {
+            printf("  WARNING: the unindexed motif could not be grafted onto this design by either "
+                   "mapping; it is written without it\n");
+          }
         }
-        rfd4p::applyInsertion(g, n, ins, atomNames, condCoordRW.data(),
+        rfd4p::applyInsertion(g, n, ins, naming, M.has("g/resType") ? M.i("g/resType") : nullptr,
+                              M.has("g/coords") ? M.f("g/coords") : nullptr, condCoordRW.data(),
                               condIntCrdRW.empty() ? nullptr : condIntCrdRW.data(),
-                              coordGroupRW.empty() ? nullptr : coordGroupRW.data(), isInsertion);
+                              coordGroupRW.empty() ? nullptr : coordGroupRW.data(), isInsertion,
+                              &crdSource);
       }
     }
     // 🔴 INTO THE INPUT'S FRAME BEFORE ANYTHING IS WRITTEN. A contig has no conditioned
@@ -530,31 +595,22 @@ int generate(const Opts& o, const rfd4p::Dims& d, rfd4p::Trunk& t) {
     // sampler's centred frame and superposes on nothing.
     rfd4p::alignToInputFrame(g, n, condCoordRW.empty() ? nullptr : condCoordRW.data(),
                              condIntCrdRW.empty() ? nullptr : condIntCrdRW.data(),
-                             coordGroupRW.empty() ? nullptr : coordGroupRW.data());
-    // The input's own numbering and chain letters where a job named a structure; absent for a
-    // contig, where the token index IS the residue number.
-    rfd4p::OutNaming naming;
-    if (M.has("g/outResId") && M.has("g/outChain")) {
-      naming.resId.assign(M.i("g/outResId"), M.i("g/outResId") + n);
-      naming.chain.assign(M.i("g/outChain"), M.i("g/outChain") + n);
-    }
-    // Only the INDEXED tokens are written; an unindexed motif was grafted onto one of them.
-    if (M.has("g/condIndex")) {
-      const int* ci = M.i("g/condIndex");
-      naming.emit.assign((size_t)n, 1);
-      for (int i = 0; i < n; ++i) naming.emit[i] = ci[(size_t)i * 37 + 1] != 0;
-    }
-    std::ofstream(path) << (wantCif ? rfd4p::toCif(g, n, atomNames, resNames, chainOf, naming)
-                                    : rfd4p::toPdb(g, n, atomNames, resNames, chainOf, naming));
+                             coordGroupRW.empty() ? nullptr : coordGroupRW.data(), naming);
+    // The records the page's `processSampleToAtoms` builds, from the INPUT's conditioning as it
+    // was before any grafting - which atom carried a conditioned coordinate is a fact about the
+    // input, and the grafted ones are named by `crdSource`.
+    const std::vector<rfd4p::AtomRecord> records = rfd4p::buildRecords(
+        g, n, chainOf, naming, M.has("g/condCoord") ? M.f("g/condCoord") : nullptr,
+        M.has("g/condIntCrd") ? M.f("g/condIntCrd") : nullptr, isInsertion, crdSource);
+    std::ofstream(path) << (wantCif ? rfd4p::toCif(records) : rfd4p::toPdb(records));
     // 🔴 COUNTED OVER WHAT IS WRITTEN, NOT OVER EVERY TOKEN. The unindexed tokens are grafted
     // rather than emitted, and counting them made this line disagree with its own file twice:
     // "72 residues" over 112, then "602 atoms" over 562. A count that does not match the
     // output is worse than no count - it is what made the residue bug look like a non-issue.
-    int atoms = 0, residues = 0;
+    int atoms = (int)records.size(), residues = 0;
     for (int i = 0; i < n; ++i) {
       if (naming.skip(i)) continue;
       if (g.residueType[i] >= 0) ++residues;
-      for (int a = 0; a < 37; ++a) atoms += g.atomMask[(size_t)i * 37 + a];
     }
     printf("generated %d residues, %d atoms over %d steps (%d trunk passes) -> %s\n", residues, atoms,
            steps, passes, path.c_str());
@@ -722,6 +778,7 @@ int foldMain(int argc, char** argv) {
     else if (!f.compare(0, 10, "--designs=")) o.designs = atoi(f.c_str() + 10);
     else if (f == "--fast") o.fast = true;
     else if (f == "--no-insertion") o.insertion = false;
+    else if (!f.compare(0, 14, "--dump-sample=")) o.dumpSample = f.substr(14);
     else { fprintf(stderr, "unknown flag %s\n", argv[i]); return 1; }
   }
   if (o.weights.empty() && o.int8.empty()) {
@@ -770,6 +827,25 @@ int jobMain(int argc, char** argv) {
   // named here; everything else goes to the fold, so a new fold flag needs no change.
   static const char* FEATURISER_ONLY[] = {"--config=", "--spec=", "--length=", "--step="};
   std::vector<std::string> own = {argv[0], outDir, "--generate=" + outDir + "-gen"};
+  // 🔴 A PARTIAL RUN NEEDS THE ENCODER'S INPUTS, AND ONLY A PARTIAL RUN. The featuriser writes
+  // `<work>-enc` for one and says so in the generation's meta; handing `--encoder=` to an ordinary
+  // run would encode a stale directory a previous job left in the same work dir.
+  {
+    std::ifstream idx(outDir + "-gen/model.idx");
+    std::string kind, name;
+    double value = 0;
+    bool partial = false;
+    while (idx >> kind >> name) {
+      if (kind == "m") {
+        idx >> value;
+        if (name == "meta/partial") partial = value != 0;
+      } else {
+        std::string rest;
+        std::getline(idx, rest);
+      }
+    }
+    if (partial) own.push_back("--encoder=" + outDir + "-enc");
+  }
   for (const std::string& f : keep) {
     if (f.compare(0, 2, "--") != 0) continue;
     bool theirs = false;

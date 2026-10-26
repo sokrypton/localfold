@@ -20,7 +20,7 @@ import {
   chainColour, chainOfSpans, chainsOf, conditionsOf, contigOf, createContigList, hotspotsOf,
   drawLengths, LIGAND_COLOUR, shade, spansFromContig,
 } from "./contig-ui.js";
-import { generate } from "./generate.js";
+import { DEFAULT_STEPS, generate } from "./generate.js";
 import { validateDesign } from "./validate-design.js";
 import { getDevice } from "./model.js";
 import { RFD4P_PRESETS } from "../shared/rfd4p/presets.js";
@@ -84,6 +84,9 @@ const resultsBody = element("results-body");
 const track = element("cycle-track");
 const advancedButton = element("show-advanced");
 const stepsTitle = element("steps-title");
+// The two methods' step defaults: a hunt's fold diffusion and RFD4's flow.
+const HUNTER_STEPS = 25;
+const RFD4_STEPS = DEFAULT_STEPS;
 const unusedNote = element("unused-note");
 const roleList = element("role-list");
 // 🔴 HOISTED HERE WITH THE REST, and not left beside the preset code, because
@@ -421,6 +424,15 @@ const paintMethod = () => {
   // a structure over steps; a hunt's are the fold's diffusion steps and RFD4's
   // are its flow steps.
   stepsTitle.textContent = hunter ? "Diffusion steps" : "Flow steps";
+  // 🔴 AND ONE DEFAULT EACH. The box said 25 for both, which is the fold's
+  // diffusion count and NOT RFD4-Proteina's: upstream samples 60 flow steps
+  // (`configs/generation/inference_base.yaml`), and the native port records 25
+  // as under-converged - one seed in three came out at CA-CA 4.50 A. A value the
+  // user typed is theirs; only the other method's untouched default is swapped.
+  const steps = element("steps");
+  const mine = hunter ? HUNTER_STEPS : RFD4_STEPS;
+  const theirs = hunter ? RFD4_STEPS : HUNTER_STEPS;
+  if (Number(steps.value) === theirs) steps.value = String(mine);
   if (running === null) say(RESTING[method.value] ?? "");
   // 🔴 THE BUTTON SAYS WHICH MACHINE IT STARTS. "Hunt" is the loop; RFD4
   // generates in one pass and calling that a hunt would misdescribe it.
@@ -669,7 +681,7 @@ const startHunt = async () => {
       validate: validateSelect.value,
       // 🔴 THE FOLD'S DIFFUSION STEPS, which ran at the sampler's default and
       // were not reachable from this page at all.
-      steps: number("steps", 25),
+      steps: number("steps", HUNTER_STEPS),
       length,
       temperature: number("temperature", 0.1),
       omit: element("omit").value,
@@ -810,6 +822,10 @@ presetSelect.addEventListener("change", () => {
       && preset.cifUrl !== undefined,
     partialTrajectoryFractionSteps: preset.partialTrajectoryFractionSteps,
     inverseFolding: preset.inverseFolding,
+    // 🔴 THE PRESET'S RECYCLE BUDGET, which every preset declares and this
+    // object never carried - so the page ran `medium` under a preset that says
+    // `low`, and the same preset through the native port ran `low`.
+    recycleSchedule: preset.recycleSchedule,
   };
   if (preset.nsteps !== undefined) element("steps").value = String(preset.nsteps);
   spanList.set(spans);
@@ -1145,7 +1161,7 @@ const startGenerate = async () => {
       }),
       // A structure the user loaded is the one they mean, over a preset's.
       ...(loaded === null ? {} : { inputCif: loaded.text }),
-      steps: number("steps", 60),
+      steps: number("steps", RFD4_STEPS),
       // 🔴 A GENERATION IS A TRAJECTORY AND WAS DRAWN AS ONE PICTURE. The flow
       // runs 60 steps and the page pushed only the finished structure, so the
       // play bar - which hides itself below two frames - never appeared and
@@ -1189,7 +1205,10 @@ const startGenerate = async () => {
       model: wanted,
       device: await getDevice(),
       seed: number("seed", 0) + candidate,
-      steps: number("steps", 60),
+      // 🔴 NO `steps`: this is the REFOLD's diffusion count, and the box beside
+      // RFD4 holds RFD4's FLOW steps - two different samplers' budgets. Handing
+      // one to the other ran AlphaFold 3 at 60 because RFD4 runs 60. The
+      // validator takes the fold page's own default.
       status: (text) => say(candidates === 1 ? text
         : `candidate ${candidate + 1}/${candidates} · ${text}`),
       signal: controller.signal,

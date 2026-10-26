@@ -21,6 +21,9 @@ import {
 } from "../../../shared/rfd4p/pipeline/cif.js";
 import { CONDITION_ENUMS, CONDITION_REGISTRY } from "../../../shared/rfd4p/pipeline/spec.js";
 import { parseCathCode } from "../../../shared/rfd4p/conditions.js";
+import { RECYCLE_SCHEDULES, DEFAULT_RECYCLE_SCHEDULE } from "../../../shared/rfd4p/flow.js";
+import { ATOMIC_NUMBER_BY_ELEMENT } from "../../../shared/rfd4p/encoding.js";
+import { getOrderedAtomNamesForResidue } from "../../../shared/rfd4p/output.js";
 import {
   IDEAL_POLYHEDRA, STEREOISOMER_TEMPLATES, DOUBLE_BOND_TEMPLATES, CHIRAL_TYPE,
   MAX_OVERLAPPING_CENTERS,
@@ -357,6 +360,37 @@ for (const [name, members] of [["STANDARD_AA", STANDARD_AA], ["STANDARD_RNA", ST
   w("");
 }
 
+// The recycle ("thinking") schedules, every name `recycleDepths` takes. They lived as a hand copy
+// in src/schedule.h and its `high` was no upstream file - the second place for a convention.
+w("// [width, depth] bands by name (shared/rfd4p/flow.js RECYCLE_SCHEDULES).");
+w("inline const std::vector<std::pair<std::string, std::vector<std::pair<int, int>>>>& RECYCLE_SCHEDULES() {");
+w("  static const std::vector<std::pair<std::string, std::vector<std::pair<int, int>>>> t = {");
+for (const [name, bands] of Object.entries(RECYCLE_SCHEDULES)) {
+  w(`      {${str(name)}, {${bands.map(([a, b]) => `{${a}, ${b}}`).join(", ")}}},`);
+}
+w("  };");
+w("  return t;");
+w("}");
+w(`inline const char* DEFAULT_RECYCLE_SCHEDULE = ${str(DEFAULT_RECYCLE_SCHEDULE)};`);
+w("");
+// The WRITER's tables (shared/rfd4p/output.js): the order a residue's atoms are written in, as
+// slots of its own atom37 layout, and the element symbols `inferElementSymbol` recognises - its
+// own table (encoding.js), which is NOT cif.js's `ELEMENT_TO_ATOMIC_NUMBER` (62 against 94).
+w("// `getOrderedAtomNamesForResidue`, as slots of each token's own layout: the write order.");
+w(`inline const std::array<std::vector<int>, ${nTok}>& TOKEN_ATOM_ORDER() {`);
+w(`  static const std::array<std::vector<int>, ${nTok}> t = {{`);
+for (const tok of UNIFIED_ATOM37_TOKENS) {
+  const slots = UNIFIED_ATOM37_ENCODING.token_slot_map[tok] ?? {};
+  const order = getOrderedAtomNamesForResidue(tok).map((nm) => slots[nm]).filter((s) => s !== undefined);
+  w(`      {${order.join(", ")}},`);
+}
+w("  }};");
+w("  return t;");
+w("}");
+w("// `ATOMIC_NUMBER_BY_ELEMENT`'s symbols (encoding.js), which `inferElementSymbol` tests against.");
+w("inline const std::unordered_set<std::string> INFER_ELEMENTS = {");
+w("    " + Object.keys(ATOMIC_NUMBER_BY_ELEMENT).map(str).join(", ") + ",");
+w("};");
 w("}  // namespace tables");
 w("}  // namespace rfd4p");
 

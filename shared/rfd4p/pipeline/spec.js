@@ -33,7 +33,12 @@ export const CONDITION_ENUMS = {
   PiCationEnum: { NONE: 0, AROMATIC: 1, CATION: 2, BOTH: 3 },
   SaltBridgeEnum: { NONE: 0, POSITIVE: 1, NEGATIVE: 2 },
   MetalCoordEnum: { NONE: 0, METAL: 1, COORDINATING: 2 },
-  SSEnum: { NONE: 0, HELIX: 1, STRAND: 2, LOOP: 3 },
+  // 🔴 UPSTREAM'S NAME IS SHEET (atomworks `SSEnum`: NONE, HELIX, SHEET, LOOP, NON_PROTEIN), and
+  // this table said STRAND alone, so `C_SEC: {SHEET: ...}` - the spelling every upstream spec uses -
+  // was refused as an invalid enum value. STRAND stays as an alias of the same 2. NON_PROTEIN (4) is
+  // not here on purpose: upstream accepts the name and then refuses it at the model, whose
+  // embedding is four wide ("expected 0-3"), so taking it would only move the refusal later.
+  SSEnum: { NONE: 0, HELIX: 1, SHEET: 2, STRAND: 2, LOOP: 3 },
   BasePairEnum: { UNSPECIFIED: 0, PAIR: 1, LOOP: 2 },
 };
 
