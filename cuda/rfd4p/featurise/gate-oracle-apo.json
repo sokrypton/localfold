@@ -1,0 +1,1 @@
+{"input": "../../../web/examples/ppi_pdl1.cif.zst", "input_as_annotated_cif": true, "nsteps": 40, "recycleSchedule": "low", "metrics_tags": ["design", "ppi_refolding", "apo_refolding"]}

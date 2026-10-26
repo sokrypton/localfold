@@ -658,10 +658,23 @@ third decimal. Two things it found on the way:
 The scores read our AF3's output where upstream reads DeepMind's, so they are numbers about our
 port's refold, which cuda/af3's gates hold to AlphaFold 3; and our AF3 names its output's chains
 by position where AlphaFold 3 keeps the job's ids, which the oracle reads back through the job's
-own order. Refused, by name, rather than approximated: a pre-oracle transform (`apo_refolding`), a
-covalently attached modifier (upstream renames it for AF3), a non-standard polymer residue, two
-instances of one chain id, a ligand chain id that sorts before a polymer's (our AF3 puts polymers
-first), and the disco and developability metrics.
+own order. Refused, by name, rather than approximated: a covalently attached modifier (upstream
+renames it for AF3), a non-standard polymer residue, two instances of one chain id, a ligand chain
+id that sorts before a polymer's (our AF3 puts polymers first), and the disco and developability
+metrics.
+
+🔴 **`apo_refolding` FOLDS THE BINDER ALONE (`oracle_apo`, upstream's `ApoOnlyTransform`).** The
+chain of interest is cut out of the design and refolded by itself, filed under the transform's
+save_id (`<design>_apo_af3_apo_*`) and scored as `oracle_apo.apo.*`; `refolded_apo_holo_rmsd.apo.rmsd`
+then compares that refold with the untransformed one - two refolds, not a design and its refold -
+over each one's own `is_protein_backbone & ~sa_mask('C_CRD')`. Where the two hold the same atoms (a
+one-chain design) symmetry is resolved as for any comparison; where they do not, the two selections
+are matched in order and a count that differs is no metric, as upstream's is. So a target that is
+an internal coordinate group (5O45's binder job), not `C_CRD`, gives none: its backbone is selected
+in the holo refold and absent from the apo one. Refolds are addressed as upstream addresses them,
+`refold.{oracle_key}[.{save_id}]` and by kind (`untransformed`, `apo`) where exactly one refold is
+of that kind. Two gate jobs (`gate-oracle-apo*.json`): PD-L1, whose `C_CRD` target leaves the two
+selections equal (16.8 A apart), and a monomer, where the apo refold is the whole design.
 
 🔴 **AND THE AF2 ORACLE THE SAME WAY, ITS SUMMARY TO THE DIGIT.** `--refold=af2` folds each protein-only
 design with our AF2 as upstream's worker folds it with ColabFold's - `model_1_ptm` for a monomer,

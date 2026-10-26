@@ -159,8 +159,8 @@ def managers(tags: list[str], oracle: str = "af3"):
     def load(rel):
         return yaml.safe_load((UPSTREAM / "configs/metrics" / rel).read_text())
     oracles = load(f"refolding_oracles/{oracle}.yaml")
-    # The entries this port runs; AF3's `oracle_apo` (a pre-oracle transform) is refused by the port.
-    keys = ("oracle", "oracle_ppi", "oracle_dna") if oracle == "af3" else ("oracle", "oracle_ppi")
+    # Every entry the config runs (the off-target and crop transforms are commented out upstream).
+    keys = ("oracle", "oracle_ppi", "oracle_dna", "oracle_apo") if oracle == "af3" else ("oracle", "oracle_ppi")
     oracle_mm = MetricManager.instantiate_from_hydra({k: oracles[k] for k in keys})
     refold_mm = MetricManager.instantiate_from_hydra(load("refolding_metrics/all_refolding_metrics.yaml"))
     pass_cfg = load("pass_criteria/all_pass_criteria.yaml")
@@ -183,11 +183,12 @@ def upstream_scores(g, example_id: str, folds: Path, tags: list[str], prior: dic
 
     def dispatch(self, manifest_path, daemon_rank, n_designs):
         for entry in json.loads(Path(manifest_path).read_text()):
-            # Our AF3 ran on `<example>_<oracle_name>`; upstream names the job `<example>`.
-            ours = folds / f"{example_id}_{self.oracle_name}"
+            # Our AF3 ran on `<example>[_<save_id>]_<oracle_name>` (upstream's `output_stem`);
+            # upstream names the job `<example>[_<save_id>]`.
+            name = entry["name"]
+            ours = folds / f"{name}_{self.oracle_name}"
             out = Path(entry["output_dir"])
             out.mkdir(parents=True, exist_ok=True)
-            name = entry["name"]
             # Our AF3 names its chains by position (A, B, ...) where AlphaFold 3 keeps the job's
             # ids: read back as the job's, as the port's oracle reads them (oracle.h `positionalChain`).
             job = json.loads(Path(f"{ours}_job.json").read_text())
@@ -451,7 +452,7 @@ def main() -> int:
             else:
                 result, manifests = upstream_scores(g, stem.name, Path(f"{stem}_refold"), tags, prior, Path(tmp))
             for oracle_name, entry in (manifests.items() if oracle == "af3" else ()):
-                for line in featurised_difference(Path(f"{stem}_refold") / f"{stem.name}_{oracle_name}_job.json",
+                for line in featurised_difference(Path(f"{stem}_refold") / f"{entry['name']}_{oracle_name}_job.json",
                                                   entry, Path(tmp)):
                     problems.append(f"{oracle_name} input: {line}")
         up = {k: v for k, v in result.items()

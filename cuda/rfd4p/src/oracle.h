@@ -12,9 +12,10 @@
  * that round trip by featurising both with AlphaFold 3's own featuriser, and the scores to
  * upstream's oracle, refolding and pass-criteria managers run over the same refold.
  *
- * What is not ported is refused by name rather than approximated: a pre-oracle transform
- * (`oracle_apo`), a covalently attached modifier (`_rename_covalent_modifiers_for_af3`), a
- * non-standard polymer residue and a chain id two chain instances share.
+ * `oracle_apo` folds the design's chain of interest alone (`ApoOnlyTransform`), filed and scored
+ * under its save_id `apo`. What is not ported is refused by name rather than approximated: a
+ * covalently attached modifier (`_rename_covalent_modifiers_for_af3`), a non-standard polymer
+ * residue and a chain id two chain instances share.
  */
 #include "metrics.h"
 #include "../featurise/cif.h"
@@ -36,9 +37,10 @@ using metrics::Values;
 
 /**
  * One entry of `refolding_oracles/af3.yaml` or `af2.yaml`: its config key, `oracle_name`, template
- * query and tags, and for AlphaFold 2 the `model_name` it folds with.
+ * query and tags, for AlphaFold 2 the `model_name` it folds with, and the save_id of its
+ * pre-oracle transform where it has one (`apo`: `ApoOnlyTransform`, the chain of interest alone).
  */
-struct Spec { std::string key, name, templateQuery; Gate gate; std::string model; };
+struct Spec { std::string key, name, templateQuery; Gate gate; std::string model, saveId; };
 inline const std::vector<Spec>& af3Specs() {
   static const std::vector<Spec> specs = {
       {"oracle", "af3", "", {{"af3_refolding", "unconditional_refolding", "motif_scaffold_refolding",
@@ -46,6 +48,7 @@ inline const std::vector<Spec>& af3Specs() {
                                "ame_no_ligand_refolding", "ame_original_benchmark_refolding", "disco_refolding"}, {}, {}}},
       {"oracle_ppi", "af3_ppi", "(sa_mask('C_CRD') | sa_mask('C_INTCRD')) & is_protein", {{"ppi_refolding", "antibody"}, {}, {}}},
       {"oracle_dna", "af3_dna", "sa_mask('C_CRD') & ~is_nucleic_acid", {{"dna_refolding"}, {}, {}}},
+      {"oracle_apo", "af3_apo", "", {{"apo_refolding"}, {}, {}}, "", "apo"},
   };
   return specs;
 }
@@ -1156,21 +1159,30 @@ inline Values comparison(const Array& d, const std::vector<double>& gtCoord, con
   return {{"rmsd", r.rmsd}};
 }
 
-/** One oracle's refold of one design: what the metrics read. */
+/** One oracle's refold of one design (or of its transform's output): what the metrics read. */
 struct Refold {
   const Spec* spec;
+  Array design;                       // what was handed over: the design, or the chain of interest alone
+  std::vector<double> cwi;            // its coordinates-with-insertion, where it has them
   Values confidences;                 // the oracle's own keys, unprefixed
   std::string chainOfInterest;
-  std::vector<double> coord, plddt;   // per atom of the design as handed over
+  std::vector<double> coord, plddt;   // per atom of `design`
+  /** Its address by origin, `refold.{oracle_key}` or `refold.{oracle_key}.{save_id}`. */
+  std::string label() const { return spec->saveId.empty() ? spec->key : spec->key + "." + spec->saveId; }
+  /** Its kind, the alias `refold.untransformed` or `refold.{save_id}` where only it claims it. */
+  std::string kind() const { return spec->saveId.empty() ? "untransformed" : spec->saveId; }
 };
 
 /**
- * `all_refolding_metrics.yaml` over one refold: the design is the ground truth, the refold the
- * prediction; `tags` are the job's plus the refold addresses (`is_refold:...`, `exists_refold:...`)
- * and `oracle:<name>` run_oracle_and_refolding_metrics injects.
+ * `all_refolding_metrics.yaml` over one refold: what it was handed is the ground truth, the refold
+ * the prediction; `tags` are the job's plus the refold addresses (`is_refold:...`,
+ * `exists_refold:...`) and `oracle:<name>` run_oracle_and_refolding_metrics injects, and `refolds`
+ * every refold of the design by those addresses, for a metric that compares two of them.
  */
-inline Values refoldingMetrics(const Array& d, const std::vector<double>& cwi, const Refold& r,
-                               const std::vector<std::string>& tags) {
+inline Values refoldingMetrics(const Refold& r, const std::vector<std::string>& tags,
+                               const std::map<std::string, const Refold*>& refolds) {
+  const Array& d = r.design;
+  const std::vector<double>& cwi = r.cwi;
   const auto [coi, unambiguous] = chainOfInterestOf(d);
   const std::string c = unambiguous ? coi : "";
   const std::vector<double> gt(d.coord.begin(), d.coord.end());
@@ -1207,6 +1219,21 @@ inline Values refoldingMetrics(const Array& d, const std::vector<double>& cwi, c
        }},
       {"refolded_backbone_aligned_ligand_rmsd", {{"sm_binder_refolding"}, {"is_refold:untransformed"}, {}},
        masked("is_protein_backbone", "is_ligand")},
+      // Two refolds against each other: the apo one as the ground truth, the untransformed one as
+      // the prediction, each selected over its own atoms. Where the apo refold is the whole design
+      // the two have one atom set and symmetry is resolved; otherwise the selections are matched
+      // in order, and a count that differs is no metric.
+      {"refolded_apo_holo_rmsd", {{}, {"is_refold:apo", "exists_refold:untransformed"}, {}},
+       [&]() -> Values {
+         const Refold& apo = *refolds.at("apo");
+         const Refold& holo = *refolds.at("untransformed");
+         const char* q = "is_protein_backbone & ~sa_mask('C_CRD')";
+         const std::vector<uint8_t> ga = mask(apo.design, q, ""), pa = mask(holo.design, q, "");
+         if (apo.design.n == holo.design.n) return comparison(holo.design, apo.coord, holo.coord, ga, ga);
+         const metrics::Comparison c = metrics::structureComparison(apo.coord, holo.coord, ga, pa, ga, pa);
+         if (!c.ok) return {};
+         return {{"rmsd", c.rmsd}};
+       }},
   };
   if (std::find(tags.begin(), tags.end(), "disco_refolding") != tags.end()) {
     refuse("max_ligand_centroid_distance (disco_refolding) is not ported");
@@ -1274,8 +1301,10 @@ struct Run {
   bool keepRaw = false;  // keep AF2's PAE logits (residues^2 x 64 floats), which a checker reads again
 };
 
-/** The `oracle_name` stem upstream files a refold under: `{example_id}_{oracle_name}`. */
-inline std::string stem(const Run& run, const Spec& spec) { return run.name + "_" + spec.name; }
+/** The stem upstream files a refold under (`output_stem`): `{example_id}[_{save_id}]_{oracle_name}`. */
+inline std::string stem(const Run& run, const Spec& spec) {
+  return run.name + (spec.saveId.empty() ? "" : "_" + spec.saveId) + "_" + spec.name;
+}
 
 /** What a design's refolding scored: the metrics, the oracles' labels (`<key>.af2_model_name`), the chain of interest. */
 struct Scores {
@@ -1295,26 +1324,43 @@ inline Scores refoldDesign(const Array& full, const std::vector<double>& fullCwi
   if (!af2 && run.oracle != "af3") refuse("no refolding oracle '" + run.oracle + "' (af3 or af2)");
   std::vector<const Spec*> active;
   for (const Spec& s : af2 ? af2Specs() : af3Specs()) if (metrics::applies(s.gate, tags)) active.push_back(&s);
-  if (!af2 && std::find(tags.begin(), tags.end(), "apo_refolding") != tags.end()) {
-    refuse("oracle_apo (apo_refolding) refolds through a pre-oracle transform, which is not ported");
-  }
   Scores scores;
   Values& out = scores.values;
   if (active.empty()) return scores;
   mkdir(run.dir.c_str(), 0755);
+  // The design as the oracle is handed it (`remove_terminal_oxygen_atoms`), its coordinates-with-insertion beside it.
   const std::vector<int> keep = withoutTerminalOxygens(full);
+  const Array design = subset(full, keep);
   std::vector<double> cwi;
   if (!fullCwi.empty()) for (const int i : keep) for (int c = 0; c < 3; ++c) cwi.push_back(fullCwi[(size_t)i * 3 + c]);
+  const auto [coi, unambiguous] = chainOfInterestOf(design);
+  scores.chainOfInterest = unambiguous ? coi : "";
   std::vector<Refold> refolds;
-  Array design;
   for (const Spec* spec : active) {
-    const Prepared p = af2 ? prepareAf2(full, *spec, stem(run, *spec), cwi)
-                           : prepare(full, *spec, stem(run, *spec), run.seed, run.components);
-    design = p.design;
+    // `ApoOnlyTransform`: the chain of interest alone, which the transform names (even when ambiguous).
+    Array input = design;
+    std::vector<double> inputCwi = cwi;
+    std::string chainOfInterest = scores.chainOfInterest;
+    if (spec->saveId == "apo") {
+      if (coi.empty()) refuse("Could not determine a chain of interest for the input structure (no protein chains).");
+      std::vector<int> kept;
+      for (int i = 0; i < design.n; ++i) if (design.chainIid[i] == coi) kept.push_back(i);
+      input = subset(design, kept);
+      inputCwi.clear();
+      if (!cwi.empty()) for (const int i : kept) for (int c = 0; c < 3; ++c) inputCwi.push_back(cwi[(size_t)i * 3 + c]);
+      chainOfInterest = coi;
+    } else if (!spec->saveId.empty()) {
+      refuse("no pre-oracle transform with save_id '" + spec->saveId + "'");
+    }
+    const Prepared p = af2 ? prepareAf2(input, *spec, stem(run, *spec), inputCwi)
+                           : prepare(input, *spec, stem(run, *spec), run.seed, run.components);
     const std::string base = run.dir + "/" + stem(run, *spec);
     std::ofstream(base + "_job.json") << p.job << "\n";
-    const auto [coi, unambiguous] = chainOfInterestOf(p.design);
-    Refold r{spec, {}, unambiguous ? coi : "", {}, {}};
+    if (spec->saveId.empty()) {
+      const auto [c, u] = chainOfInterestOf(p.design);
+      chainOfInterest = u ? c : "";
+    }
+    Refold r{spec, p.design, inputCwi, {}, chainOfInterest, {}, {}};
     std::vector<RefoldAtom> atoms;
     if (af2) {
       // `load_model_runners` + `predict_and_write`: three recycles, the multimer's early stop
@@ -1329,7 +1375,7 @@ inline Scores refoldDesign(const Array& full, const std::vector<double>& fullCwi
                                                r.chainOfInterest);
       if (!run.keepRaw) std::remove((base + "_model_pae_logits.f32").c_str());   // read, and no artifact
       atoms = readAf2Pdb(base + "_model.pdb", p.foldOrder);
-      scores.labels.push_back({spec->key + ".af2_model_name", spec->model});
+      scores.labels.push_back({r.label() + ".af2_model_name", spec->model});
     } else {
       const std::string cmd = "'" + run.binary + "' --job='" + base + "_job.json' --out='" + base +
                               "_model.cif' --recycles=5 --steps=200 --seed=" + std::to_string(run.seed) + " > '" + base +
@@ -1349,30 +1395,33 @@ inline Scores refoldDesign(const Array& full, const std::vector<double>& fullCwi
       }
     }
     r.coord = transfer(p, atoms, r.plddt);
-    alignToInputFrame(p.design, cwi, r.coord);
+    alignToInputFrame(p.design, inputCwi, r.coord);
     // As the refolded mmCIF stores it, which is what upstream's refolding metrics read back.
     for (double& v : r.coord) if (std::isfinite(v)) v = strtod(fixed3(v).c_str(), nullptr);
     std::ofstream(base + "_refolded.cif") << refoldCif(p.design, r.coord, r.plddt);
-    for (const auto& [k, v] : r.confidences) out.push_back({spec->key + "." + k, v});
-    refolds.push_back(r);
+    for (const auto& [k, v] : r.confidences) out.push_back({r.label() + "." + k, v});
+    refolds.push_back(std::move(r));
   }
-  const auto [coi, unambiguous] = chainOfInterestOf(design);
-  scores.chainOfInterest = unambiguous ? coi : "";
-  // One refold per active oracle; the alias `untransformed` only where exactly one claims it.
-  const bool alias = refolds.size() == 1;
+  // Every refold by origin, and by kind where exactly one refold is of that kind.
+  std::map<std::string, const Refold*> byAddress;
+  std::map<std::string, int> ofKind;
+  for (const Refold& r : refolds) { byAddress[r.label()] = &r; ++ofKind[r.kind()]; }
+  for (const Refold& r : refolds) if (ofKind[r.kind()] == 1 && !byAddress.count(r.kind())) byAddress[r.kind()] = &r;
   std::map<std::string, double> merged;
   for (const auto& [k, v] : prior) merged[k] = v;
   for (const auto& [k, v] : out) merged[k] = v;
   for (const Refold& r : refolds) {
     std::vector<std::string> t = tags;
-    for (const Refold& other : refolds) t.push_back("exists_refold:" + other.spec->key);
-    t.push_back("is_refold:" + r.spec->key);
+    for (const auto& [address, other] : byAddress) t.push_back("exists_refold:" + address);
+    for (const auto& [address, other] : byAddress) if (other == &r) t.push_back("is_refold:" + address);
     t.push_back("oracle:" + r.spec->name);
-    if (alias) { t.push_back("exists_refold:untransformed"); t.push_back("is_refold:untransformed"); }
-    for (const auto& kv : refoldingMetrics(design, cwi, r, t)) {
-      auto it = std::find_if(out.begin(), out.end(), [&](const auto& o) { return o.first == kv.first; });
-      if (it != out.end()) it->second = kv.second; else out.push_back(kv);
-      merged[kv.first] = kv.second;
+    // A transformed refold's metrics carry its save_id after the metric's name.
+    for (const auto& [metric, v] : refoldingMetrics(r, t, byAddress)) {
+      std::string k = metric;
+      if (!r.spec->saveId.empty()) { const size_t dot = k.find('.'); k = k.substr(0, dot) + "." + r.spec->saveId + k.substr(dot); }
+      auto it = std::find_if(out.begin(), out.end(), [&](const auto& o) { return o.first == k; });
+      if (it != out.end()) it->second = v; else out.push_back({k, v});
+      merged[k] = v;
     }
   }
   for (const auto& kv : passCriteria(merged, tags)) out.push_back(kv);
