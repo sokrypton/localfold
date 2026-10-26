@@ -969,6 +969,12 @@
   #plmGroup,
   #toleranceGroup,
   #msaModeGroup, #maxMsaGroup { flex: 1 1 calc(50% - 7px); }
+  /* 🔴 STEPS LOST ITS PARTNER WHEN FLOW WENT (2026-10-16). It was the second half of
+     Sampler/Steps; alone, its half left room for MSA beside it and Max MSA wrapped
+     onto a line by itself - the split pair this block exists to prevent. So with the
+     MSA pair shown after it Steps takes its line, and with it hidden (a PLM model)
+     Steps stays a half and PLM is its other half, as before. */
+  #af3CountGroup:has(~ #msaModeGroup:not([hidden])) { flex-basis: 100%; }
   #foldOptions > .fetch-option-group + .fetch-option-group,
   #plmGroup,
   #msaModeGroup {

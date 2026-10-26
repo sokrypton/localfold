@@ -187,8 +187,16 @@ MEASURE = r"""(() => {
                   share: sbox ? +(box(sbox).height / innerHeight).toFixed(2) : 0}
              : null;
 
-  const rh = document.querySelector('#canvasContainer .resize-handle');
-  R.resizeHandle = rh ? getComputedStyle(rh).display : 'absent';
+  // 🔴 THE HANDLE IS THE SLOT'S KNOB NOW. py2Dmol's slot layout wraps the canvas
+  // in a slot whose BODY is the resizable box, with its own `.py2dmol-slot-knob`,
+  // and its stylesheet hides the old `.resize-handle` everywhere - so reading that
+  // read "none" on the desktop too and reported a rule leaking wide that was in
+  // fact a retired element. The knob and the body's `resize` are what a reader gets.
+  const canvasBox = document.getElementById('canvasContainer');
+  const slotBody = canvasBox && canvasBox.closest('.py2dmol-slot-body');
+  const knob = slotBody && slotBody.querySelector(':scope > .py2dmol-slot-knob');
+  R.resizeHandle = knob ? getComputedStyle(knob).display : 'absent';
+  R.resizable = slotBody ? getComputedStyle(slotBody).resize : 'absent';
 
   // ...and the panel column, which is 340px of fixed card beside a 600px
   // canvas: on a phone it has to become the page's width like everything else.
@@ -590,12 +598,17 @@ def main():
         # model number AND Early Stop - so Recycles joins line one rather than
         # stranding itself, which is why it is a third and not a half.
         options = R["rows"]["options"]
+        # 🔴 AND STEPS IS ALONE SINCE FLOW WENT (2026-10-16): the Sampler half of
+        # its line is gone, so it takes the line rather than lending its other
+        # half to MSA and stranding Max MSA. This named the removed group for ten
+        # days and failed on every run - read as noise, which is how the stranded
+        # Max MSA it would have caught went unseen.
         want = [["modelGroup", "seedGroup", "recyclesGroup"],
-                ["af3ModeGroup", "af3CountGroup"],
+                ["af3CountGroup"],
                 ["msaModeGroup", "maxMsaGroup"]]
         if options != want:
             bad.append("%s: the fold options should be Model/Seed/Recycles, then"
-                       " Sampler/Steps, then MSA/Max MSA; got %s" % (name, options))
+                       " Steps, then MSA/Max MSA; got %s" % (name, options))
         for what, m in R["overflowing"].items():
             if m and m["over"] > 1:
                 bad.append("%s: %s overflows its own box by %dpx - the label wrapped"
@@ -613,10 +626,10 @@ def main():
             bad.append("%s: the sequence strip is %dpx, %d%% of the viewport - the"
                        " structure it belongs to is what the reader came for"
                        % (name, R["strip"]["boxH"], round(R["strip"]["share"] * 100)))
-        if R["resizeHandle"] != "none":
-            bad.append("%s: the canvas resize handle is showing (display: %s). It is"
-                       " revealed on :hover, which a touch screen has not got, and the"
-                       " box is resize:none here anyway" % (name, R["resizeHandle"]))
+        if R["resizeHandle"] != "none" or R["resizable"] != "none":
+            bad.append("%s: the structure's resize knob is showing (display: %s, resize:"
+                       " %s). It is a drag, which a touch screen has not got, and the box"
+                       " is resize:none here" % (name, R["resizeHandle"], R["resizable"]))
         play = R["rows"]["play"]
         if play and len(play) != 1:
             bad.append("%s: the play bar broke across %d lines: %s"
@@ -684,9 +697,9 @@ def main():
                    " 1px border)" % D["content"])
     if D["titleOverlap"]:
         bad.append("the desktop title and the fold actions overlap")
-    if D["resizeHandle"] == "none":
-        bad.append("the desktop canvas resize handle was hidden too - that rule is"
-                   " meant to be narrow-only")
+    if D["resizeHandle"] in ("none", "absent") or D["resizable"] != "both":
+        bad.append("the desktop structure cannot be resized (knob %s, resize %s) - the"
+                   " narrow rule must not reach it" % (D["resizeHandle"], D["resizable"]))
     if D["rows"]["options"] is not None and len(D["rows"]["options"]) != 1:
         bad.append("the desktop fold options broke across %d lines - they are one row"
                    " there and the narrow grouping must not reach them"
