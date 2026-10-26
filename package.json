@@ -90,6 +90,7 @@
     "//test:bridge": "The Colab bridge, with no GPU and no weights: python/localfold/server.py with tools/stub_worker.py standing in for python/localfold/worker.py, every route driven from the reader's side and through a real reader's page. It starts a Chrome, so it is not in the node lane.",
     "test:bridge": "python3 tools/check-native-bridge.py",
     "test:native": "python3 tools/check-native-worker.py",
+    "test:t4-build": "python3 tools/check-t4-build.py",
     "test:featurise": "bash cuda/build.sh featurise && python3 tools/check-native-featuriser.py",
     "//test:standalone": "One process must fold what two did: cuda/<port>/localfold-<port> --job=... (weights fetched, the input featurised in-process, the fold) against the featuriser binary then the port over its directory, held to the same PDB bytes - plus refusals, --frames, --weights-dir, --ccd, a slow weight upload. Watched failing with ESMFold2's --seed dropped from the fold.",
     "test:standalone": "bash cuda/build.sh && python3 tools/check-standalone.py",

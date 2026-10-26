@@ -119,6 +119,13 @@ def cases(offline):
         ("af3 6mrr + GOL + SEP3", {"family": "af3", "controls": controls(),
          "entities": [protein(S6), {"type": "ligand", "value": "GOL", "copies": 1}],
          "job": job([S6], ["GOL"], {0: [("SEP", 3)]})}, (f"{FIX}/6mrr-crystal.pdb", "A"), 2.5, 68 + 9 + 6, None),
+        # 🔴 THE SAME JOB AGAIN ON THE SAME WARM SERVER, after other shapes and kinds of job, must come back the SAME: a
+        # resident server keeps scratch, caches and graphs between jobs, and three bugs of that one class reached a
+        # branch - AF2's shared scratch slot holding an emitted LayerNorm across the pair stack (argon-ptx), BioEmu2's
+        # step conditioning recognised by its address (bed641ad), "All 5"'s first job (191197b3). A fresh process a
+        # case (cuda/*/gate.py) cannot see any of them
+        ("af3 6mrr again (the resident server, after other jobs)", {"family": "af3", "controls": controls(),
+         "entities": [protein(S6)], "job": job([S6]), "samePdbAs": "af3 6mrr"}, (f"{FIX}/6mrr-crystal.pdb", "A"), 1.0, 68, None),
         ("af2 monomer 6mrr", {"family": "monomer", "controls": controls(**{"model-family": "monomer", "af2Model": "1"}),
          "entities": [protein(S6)], "job": job([S6])}, (f"{FIX}/6mrr-crystal.pdb", "A"), 2.5, 68, None),
         ("af2 monomer 6mrr, stopping early at 0.5 A", {"family": "monomer",
@@ -128,6 +135,9 @@ def cases(offline):
          "controls": controls(**{"model-family": "monomer", "af2Model": "1", "recycles": "0"}),
          "entities": [protein(s5, {"kind": "upload", "text": caj, "source": "A", "filename": "5caj.pdb"})],
          "job": job([s5])}, (f"{FIX}/5caj-crystal.pdb", "A"), 1.0, None, None),
+        ("af2 monomer 6mrr again (the resident server, after a templated 261-residue job)", {"family": "monomer",
+         "controls": controls(**{"model-family": "monomer", "af2Model": "1"}), "entities": [protein(S6)], "job": job([S6]),
+         "samePdbAs": "af2 monomer 6mrr"}, (f"{FIX}/6mrr-crystal.pdb", "A"), 2.5, 68, None),
         ("af2 multimer 1brs, both chains templated", {"family": "multimer",
          "controls": controls(**{"model-family": "multimer", "af2Model": "1"}),
          "entities": [protein(sa, {"kind": "upload", "text": brs, "source": "A", "filename": "1brs.pdb"}),
@@ -156,6 +166,9 @@ def cases(offline):
         ("esmfold2 6mrr + GOL", {"family": "ef2-fast-600m", "controls": controls(**{"model-family": "ef2"}),
          "entities": [protein(S6), {"type": "ligand", "value": "GOL", "copies": 1}],
          "job": job([S6], ["GOL"]), "ligandBonds": 5}, (f"{FIX}/6mrr-crystal.pdb", "A"), 2.5, 68 + 6, None),
+        ("esmfold2 6mrr again (the resident server, after other jobs)", {"family": "ef2-fast-600m",
+         "controls": controls(**{"model-family": "ef2"}), "entities": [protein(S6)], "job": job([S6]),
+         "samePdbAs": "esmfold2 6mrr"}, (f"{FIX}/6mrr-crystal.pdb", "A"), 2.0, 68, None),
         ("esmfold2 300M 6mrr", {"family": "ef2-fast-300m", "controls": controls(**{"model-family": "ef2"}),
          "entities": [protein(S6)], "job": job([S6])}, (f"{FIX}/6mrr-crystal.pdb", "A"), 2.5, 68, None),
         # the page's steps (web/app.js samplerPlan), which the page resolves and sends: an empty step dial is
@@ -182,6 +195,15 @@ def cases(offline):
         ("af2 monomer model 3 (a delta on model 1) 6mrr", {"family": "monomer-3",
          "controls": controls(**{"model-family": "monomer"}), "entities": [protein(S6)], "job": job([S6])},
          (f"{FIX}/6mrr-crystal.pdb", "A"), 2.5, 68, None),
+        # "All 5" (the page's Model # row): the five models folded at once on one --multi server when model 1's job
+        # comes, the others answered from it - each the same structure as its own job (python/localfold/worker.py,
+        # MultiServer). Model 1's job carries af2Model "all", which once failed outright (191197b3)
+        ("af2 All 5, model 1 (folds all five)", {"family": "monomer",
+         "controls": controls(**{"model-family": "monomer", "af2Model": "all"}), "entities": [protein(S6)], "job": job([S6]),
+         "samePdbAs": "af2 monomer 6mrr"}, (f"{FIX}/6mrr-crystal.pdb", "A"), 2.5, 68, None),
+        ("af2 All 5, model 3 (answered from the sweep)", {"family": "monomer-3",
+         "controls": controls(**{"model-family": "monomer", "af2Model": "all"}), "entities": [protein(S6)], "job": job([S6]),
+         "samePdbAs": "af2 monomer model 3 (a delta on model 1) 6mrr"}, (f"{FIX}/6mrr-crystal.pdb", "A"), 2.5, 68, None),
         ("af2 multimer model 2 (a delta) 1brs, templated", {"family": "multimer-2",
          "controls": controls(**{"model-family": "multimer"}),
          "entities": [protein(sa, {"kind": "upload", "text": brs, "source": "A", "filename": "1brs.pdb"}),
