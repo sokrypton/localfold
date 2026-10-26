@@ -32,7 +32,9 @@ import { CHAIN_IDS, MAX_ALANINE } from "../webgpu/design/hunter-loop.js";
 
 import { hunt } from "./hunt.js";
 import { createStructureViewer } from "./viewer.js";
-import { createConditionEditor, inputResidueMap, inputStructurePdb, picksOf } from "./condition-editor.js";
+import {
+  createConditionEditor, inputResidueMap, inputStructurePdb, picksOf, segmentsOf,
+} from "./condition-editor.js";
 import { alignToReference } from "../cpu/design/align.js";
 import { translateSpans } from "../cpu/design/source-numbering.js";
 import { HUNTER_CANNOT, presetSuits } from "../cpu/design/preset-methods.js";
@@ -664,8 +666,54 @@ function showInput() {
   inputView = { chainOf };
   viewer.push(pdb, (built) => { if (built) viewer.orient(); });
   conditionHost.style.display = "";
+  sequenceBox.style.display = "";
   paintInput();
+  window.SEQ?.clear?.();
+  window.SEQ?.buildView?.();
 }
+
+// 🔴 THE FOLD PAGE'S SEQUENCE STRIP, REUSED AS IT IS. py2Dmol's panel finds its renderer through
+// these callbacks, and the full bundle's own app set them to a viewer this page does not have. It is
+// handed this page's viewer only while the INPUT is drawn: a design's positions are not the input's
+// residues, and a strip that answered for a design would let a drag pick residues no condition can
+// name. Its selection is the viewer's `residueSelection`, so the editor reads strip and clicks alike.
+const sequenceBox = element("sequence-viewer-container");
+window.SEQ?.setCallbacks?.({
+  getRenderer: () => (inputView === null ? null : viewer.renderer ?? null),
+  getObjectSelect: () => null,
+  applySelection: () => {},
+});
+document.addEventListener("py2dmol-residue-selection-change", () => {
+  if (inputView !== null) window.SEQ?.updateSelection?.();
+});
+/** Hide the strip while a run owns the viewer. */
+const hideSequence = () => { sequenceBox.style.display = "none"; window.SEQ?.clear?.(); };
+// The strip's three buttons are wired by py2Dmol's own app, which this page does not run; the
+// renderer's selection API does the same three things.
+const allPositions = () => Array.from(viewer.renderer?.chains ?? [], (_, i) => i);
+element("selectAllResidues").addEventListener("click", () => {
+  viewer.renderer?.setResidueSelection(new Set(allPositions()));
+});
+element("clearAllResidues").addEventListener("click", () => viewer.renderer?.clearResidueSelection());
+// 🔴 A MOTIF DRAGGED OUT OF THE SEQUENCE, not typed: the selection's contiguous runs appended to the
+// job as `From structure` spans, in the structure's own numbering, which is what a contig names.
+element("selectionToSpans").addEventListener("click", () => {
+  let picks;
+  try {
+    picks = conditionEditor.picksNow();
+  } catch (error) {
+    say(error.message, true);
+    return;
+  }
+  if (picks.length === 0) { say("select residues first - drag along the sequence or click them", true); return; }
+  const added = segmentsOf(picks);
+  spanList.set([...spanList.read(), ...added]);
+  say(`added ${added.filter((span) => span.kind === "segment").length} span(s) from the selection`);
+});
+element("invertSelection").addEventListener("click", () => {
+  const now = viewer.renderer?.residueSelection ?? new Set();
+  viewer.renderer?.setResidueSelection(new Set(allPositions().filter((i) => !now.has(i))));
+});
 
 conditionEditor = createConditionEditor(conditionHost, {
   picks: () => {
@@ -715,6 +763,7 @@ const startHunt = async () => {
   viewer.cancelAnimations();
   viewer.reset();
   inputView = null;
+  hideSequence();
   // A new run is a new frame of reference and a new held set.
   reference = null;
   held = hold;
@@ -1370,6 +1419,7 @@ const startGenerate = async () => {
   const controller = new AbortController();
   running = controller;
   inputView = null;
+  hideSequence();
   huntLabel.textContent = "Stop";
   resultsBody.replaceChildren();
   track.replaceChildren();

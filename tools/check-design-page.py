@@ -1029,6 +1029,46 @@ def main():
                 bad.append(f"adding with nothing picked was not refused: {editor['empty']!r}")
             if not editor["greyed"] or editor["regreyed"]:
                 bad.append("the editor is not greyed under Protein Hunter and live again under RFD4-Proteina")
+            # 🔴 AND THE FOLD PAGE'S SEQUENCE STRIP, REUSED: a real DRAG along it selects a run (the
+            # same `residueSelection` a click sets), and "Add as spans" appends that run to the job as a
+            # From structure span in the structure's own numbering.
+            strip = json.loads(cdp.evaluate(ws, """(() => {
+              const c = document.querySelector('#sequenceView canvas');
+              if (!c) return 'null';
+              c.scrollIntoView({ block: 'center' });
+              const b = c.getBoundingClientRect();
+              return JSON.stringify({ x: b.left, y: b.top });
+            })()"""))
+            if strip is None:
+                bad.append("the sequence strip did not draw the loaded structure")
+            else:
+                y = strip["y"] + 30
+                xs = [strip["x"] + 60 + i * 8 for i in range(12)]
+                ws.call("Input.dispatchMouseEvent", type="mouseMoved", x=xs[0], y=y)
+                ws.call("Input.dispatchMouseEvent", type="mousePressed", x=xs[0], y=y, button="left", clickCount=1)
+                for x in xs[1:]:
+                    ws.call("Input.dispatchMouseEvent", type="mouseMoved", x=x, y=y, button="left", buttons=1)
+                    time.sleep(0.02)
+                ws.call("Input.dispatchMouseEvent", type="mouseReleased", x=xs[-1], y=y, button="left", clickCount=1)
+                time.sleep(0.4)
+                dragged = json.loads(cdp.evaluate(ws, """(() => {
+                  const entry = Object.values(window.py2dmol_viewers ?? {})[0];
+                  const r = entry?.renderer ?? entry;
+                  const sel = [...(r.residueSelection ?? [])].sort((a, b) => a - b);
+                  const before = window.__designSpans.read().length;
+                  document.getElementById('selectionToSpans').click();
+                  const spans = window.__designSpans.read();
+                  return JSON.stringify({ chains: [...new Set(sel.map((i) => r.chains[i]))],
+                    nums: sel.map((i) => r.residueNumbers[i]), added: spans.slice(before) });
+                })()"""))
+                print(f"  sequence strip: dragged {dragged['chains']} {dragged['nums'][:1]}..{dragged['nums'][-1:]}"
+                      f" -> {dragged['added']}")
+                nums = dragged["nums"]
+                if len(nums) < 4 or nums != list(range(nums[0], nums[0] + len(nums))):
+                    bad.append(f"a drag along the strip did not select a run: {nums}")
+                elif dragged["added"] != [{"kind": "segment", "chain": dragged["chains"][0], "first": nums[0],
+                                           "last": nums[-1], "hotspots": ""}]:
+                    bad.append(f"Add as spans appended {dragged['added']}, expected the dragged run")
             # ...and, with --generate, a real generation from it: the archived job must carry the
             # row, merged into the conditions the engine was handed, and the run must finish.
             if "--generate" in sys.argv:
@@ -1051,6 +1091,9 @@ def main():
                         break
                     time.sleep(3)
                 print(f"  conditioned generation: {state.get('status')}")
+                hidden = cdp.evaluate(ws, "document.getElementById('sequence-viewer-container').style.display")
+                if hidden != "none":
+                    bad.append(f"the sequence strip stayed up over a design ({hidden!r}): its residues are not the input's")
                 if state.get("failed") or not state.get("status", "").startswith("done"):
                     bad.append(f"a generation with an editor condition did not finish: {state}")
                 else:

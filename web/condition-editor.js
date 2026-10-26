@@ -178,6 +178,30 @@ export function inputResidueMap(renderer, chainOf) {
   }));
 }
 
+/**
+ * Picked residues as the span editor's `From structure` rows: one segment a contiguous run, chains
+ * in the order first picked, a chain break between two chains. What a motif scaffolding job is
+ * built from, so a motif can be dragged out of the sequence strip rather than typed.
+ *
+ * @param {{chain: string, resId: number}[]} picks
+ */
+export function segmentsOf(picks) {
+  const byChain = new Map();
+  for (const { chain, resId } of picks) {
+    if (!byChain.has(chain)) byChain.set(chain, []);
+    byChain.get(chain).push(resId);
+  }
+  const spans = [];
+  for (const [chain, residues] of byChain) {
+    if (spans.length > 0) spans.push({ kind: "break" });
+    for (const run of residueRanges(residues).split(",")) {
+      const [first, last = first] = run.split(/(?<=\d)-/).map(Number);
+      spans.push({ kind: "segment", chain, first, last, hotspots: "" });
+    }
+  }
+  return spans;
+}
+
 /** Distinct residues out of drawn positions (a ligand is one position an atom). */
 export function picksOf(positions, map) {
   const seen = new Map();
@@ -286,12 +310,15 @@ export function createConditionEditor(host, { picks, onChange }) {
   title.textContent = "Conditions";
   const hint = document.createElement("div");
   hint.className = "option-note";
-  hint.textContent = "Click residues of the loaded structure in the viewer, then add them as a condition.";
+  hint.textContent = "Pick residues of the loaded structure - click them in the viewer or drag along"
+    + " the sequence - then add them as a condition.";
   panel.append(title, controls, hint, note, list);
   host.append(panel);
 
   return {
     get rows() { return rows.map((row) => ({ ...row, picks: [...row.picks] })); },
+    /** The residues picked right now, through the page's hook (which may refuse). */
+    picksNow() { return picks(); },
     set(next) { rows = next.map((row) => ({ ...row, picks: [...row.picks] })); paintRows(); onChange(); },
     /** The rows over `base`, as the job's `conditions`. */
     conditions(base) { return mergeConditions(base, rows); },

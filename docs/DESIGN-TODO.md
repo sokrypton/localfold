@@ -215,7 +215,16 @@ constraint at all, which decides whether this is plumbing or a port.
   `test/condition-editor.test.js` holds an editor-built spec to the batch a
   hand-written one builds; `tools/check-rfd4p-batch.py` holds those conditions'
   batch to upstream's; `tools/check-design-page.py` clicks a residue for real
-  (and with `--generate` generates from it). Picking a SPAN's residues the same
-  way is the open half.
+  (and with `--generate` generates from it).
+- **Spans picked from the structure** — **done** (2026-10-26). The fold page's
+  own sequence strip (py2Dmol's `window.SEQ` panel) is reused unchanged: the
+  design page points its callbacks at its viewer while the loaded structure is
+  drawn (and at nothing over a design, whose positions are not the input's), so
+  a drag along the sequence sets the same `residueSelection` a click does.
+  "Add as spans" appends the selection's contiguous runs as `From structure`
+  spans; the condition editor reads the same selection. Select all / Unselect /
+  Invert are wired through the renderer's selection API, since py2Dmol's own
+  app (which wires them on index.html) does not run here.
+  `tools/check-design-page.py` drags along the strip for real.
 - **AtomWorks Studio's generation options** — **done** (2026-10-26): Thinking,
   Backbone K, Latents K and Partial % on the page, recorded in job.json.

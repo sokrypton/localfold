@@ -366,6 +366,30 @@ web/localfold.css. Not web/style.css, the dark theme the withheld pages used.
              afterwards. -->
         <div id="viewer-container" class="py2dmol-viewer-instance" style="display: none;"></div>
 
+        <!-- 🔴 py2Dmol's SEQUENCE STRIP, the fold page's own, reused: its panel (window.SEQ) reads
+             the viewer through callbacks web/design.js points at this page's viewer, and it edits the
+             same `residueSelection` a click in the viewer does - so a run of residues is picked by
+             dragging along the sequence and the condition editor below reads it either way. Shown
+             while the loaded structure is drawn; the ids are the ones the panel looks up. -->
+        <div id="sequence-viewer-container" class="container-box sequence-section-container page-width"
+            style="display: none;">
+            <div id="sequenceHeader" class="sequence-header">
+                <div class="sequence-actions" style="margin-left: auto; display: flex;">
+                    <span id="selectionGlobalTools" class="selection-global-tools">
+                        <button id="selectAllResidues" class="btn btn-grey btn-small" type="button"
+                            title="Select every residue">Select all</button>
+                        <button id="clearAllResidues" class="btn btn-grey btn-small" type="button"
+                            title="Clear the selection">Unselect</button>
+                        <button id="invertSelection" class="btn btn-grey btn-small" type="button"
+                            title="Select everything that is not selected now">Invert</button>
+                        <button id="selectionToSpans" class="btn btn-grey btn-small" type="button"
+                            title="Append the selected residues to the job as From structure spans, one a contiguous run">Add as spans</button>
+                    </span>
+                </div>
+            </div>
+            <div id="sequenceView" class="sequence-content"></div>
+        </div>
+
         <!-- 🔴 THE CONDITION EDITOR, AtomWorks Studio's: residues of the loaded structure picked in
              the viewer above and set as any RFD4-Proteina condition (web/condition-editor.js). Shown
              once a structure is loaded, since a condition names the structure's residues. -->

@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "./harness.js";
 import {
-  armOf, CONDITION_KINDS, inputStructurePdb, mergeConditions, residueRanges, selectionOf,
+  armOf, CONDITION_KINDS, inputStructurePdb, mergeConditions, residueRanges, segmentsOf, selectionOf,
 } from "../web/condition-editor.js";
 import { buildBatch } from "../shared/rfd4p/pipeline/index.js";
 import { parseCifToAtomArray } from "../shared/rfd4p/pipeline/cif.js";
@@ -36,6 +36,17 @@ describe("the condition editor", () => {
     expect(refusal({ key: "C_HOT", value: "true", picks: [] })).toBe("pick residues in the viewer first");
     // every enum it offers is upstream's spelling, which the pipeline accepts (below, by building)
     expect(CONDITION_KINDS.length).toBe(15);
+  });
+
+  it("turns picked residues into From structure spans, one a run, a break between chains", () => {
+    expect(JSON.stringify(segmentsOf([...picks("A", [18, 16, 17, 30]), ...picks("B", [377]), ...picks("A", [-3, -2])])))
+      .toBe(JSON.stringify([
+        { kind: "segment", chain: "A", first: -3, last: -2, hotspots: "" },
+        { kind: "segment", chain: "A", first: 16, last: 18, hotspots: "" },
+        { kind: "segment", chain: "A", first: 30, last: 30, hotspots: "" },
+        { kind: "break" },
+        { kind: "segment", chain: "B", first: 377, last: 377, hotspots: "" },
+      ]));
   });
 
   it("appends its rows after a preset's, in order, so the last set wins", () => {
