@@ -593,12 +593,14 @@ def main():
                 # This asked for one frame, which a page that pushes only the
                 # finished structure satisfies - and that is exactly what it
                 # did, so RFD4 looked static beside a hunt that animates while
-                # the gate stayed green. The flow decodes a bounded number of
-                # live frames now, so several is the right answer; the play bar
-                # hides itself below two.
-                if generated["frames"] < 3:
-                    bad.append(f"the generation drew {generated['frames']} frames,"
-                               " expected a trajectory")
+                # the gate stayed green. 🔴 AND EVERY STEP: a budget of 16 frames
+                # drew one step in four of a 60-step run, which a user saw as
+                # frames missing. The run here is 30 steps: 30 frames, and the
+                # finished design after them (which grafts an unindexed motif the
+                # live frames do not).
+                if generated["frames"] != 31:
+                    bad.append(f"the generation drew {generated['frames']} frames for its"
+                               " 30 steps, expected one a step and the finished design")
                 if generated["frames"] < 1:
                     bad.append("the generation drew no structure")
                 if generated["progress"] != 1:

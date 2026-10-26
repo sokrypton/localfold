@@ -115,10 +115,9 @@ let loaded = null;
 // ONTO, and the designed chain's held positions, kept so the viewer can paint
 // them. Both belong to a RUN rather than to a record, so `drawCycle` - which
 // sees one record at a time - cannot derive either.
-// 🔴 HOW MANY TRAJECTORY FRAMES A GENERATION IS WATCHED IN. Each one costs an
-// all-atom decoder pass, so this is a budget rather than a resolution: enough
-// to read as motion, few enough that watching is not most of the run.
-const TRAJECTORY_FRAMES = 16;
+// 🔴 EVERY FLOW STEP IS A FRAME. It was a budget of 16, so a 60-step run drew one step in
+// four and the play bar skipped most of the trajectory; each frame is an all-atom decoder
+// pass, which is the price of seeing all of it.
 
 let reference = null;
 let held = [];
@@ -1456,7 +1455,7 @@ const startGenerate = async () => {
       // COUNT rather than a cadence is what keeps the cost bounded: each frame
       // is an all-atom decoder pass on top of the flow, so this is ~16 decodes
       // whether the run is 20 steps or 200.
-      frames: TRAJECTORY_FRAMES,
+      frames: number("steps", RFD4_STEPS),
       onStep: (step) => {
         if (step.pdb === undefined) return;
         viewerBox.style.display = "";
