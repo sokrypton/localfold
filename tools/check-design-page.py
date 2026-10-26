@@ -41,6 +41,7 @@ a GPU beyond asking whether an adapter answers.
 """
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -150,7 +151,8 @@ def main():
     port = free_port()
     server = subprocess.Popen([sys.executable, os.path.join(ROOT, "tools/serve.py"), str(port)],
                               cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    proc, ws = cdp.launch(free_port(), f"/tmp/localfold-design-{os.getpid()}")
+    profile = f"/tmp/localfold-design-{os.getpid()}"
+    proc, ws = cdp.launch(free_port(), profile)
     bad = []
     try:
         ws.call("Page.enable")
@@ -895,6 +897,9 @@ def main():
     finally:
         proc.terminate()
         server.terminate()
+        proc.wait(timeout=30)
+        # The browser's profile goes with it: a run leaves 1-2 GB of cache and weights behind.
+        shutil.rmtree(profile, ignore_errors=True)
 
     print("FAIL: " + "; ".join(bad) if bad else "design.html: ok")
     return 1 if bad else 0

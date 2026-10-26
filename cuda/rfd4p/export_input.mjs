@@ -98,7 +98,7 @@ const exampleId = option("example", undefined);
 const preset = specPath
   ? (() => {
       const text = readFileSync(specPath, "utf8");
-      const parsed = text.trimStart().startsWith("{") ? JSON.parse(text) : parseConditionSpecYaml(text);
+      const parsed = parseConditionSpecYaml(text);   // JSON or YAML, key order kept
       // 🔴 A SPEC FILE IS EXAMPLES BY NAME, AS UPSTREAM'S IS (`global_args` folded into each); this
       // port's own flat job is the one-example case. Several examples need `--example=`.
       let examples;

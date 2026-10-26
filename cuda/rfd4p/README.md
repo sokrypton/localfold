@@ -555,6 +555,19 @@ checks, or with the same sentence: the gate's own jobs (all build) and thirteen 
 check each, 24 jobs, 0 differing. Removing the bond-length check natively, or the
 sequence-probability checks on the page, turns exactly their jobs red.
 
+## A condition's arms apply in the order the job wrote them
+
+Upstream walks `conditions:` as a Python dict, in the file's order, and the LAST arm wins an atom
+two arms select. 🔴 **THE PAGE'S `JSON.parse` CANNOT KEEP THAT ORDER FOR AN INTEGER-LIKE KEY** -
+JavaScript enumerates `"1"`, `"2"` first and ascending, whatever the file said - so a coordinate
+group, an enum written as a number or a sequence probability (`"0"`, `"1"`) came out the other way
+round wherever two of its arms overlapped. The native reader keeps source order and so did not.
+Job files are now read by `parseJsonOrdered` (`shared/rfd4p/pipeline/ordered.js`, which records
+each object's key order beside it) and the YAML reader records the same; `applyConditions` walks
+`orderedEntries`. `featurise/gate-order.json` writes groups 2 then 1 and ALA probabilities 1 then 0
+over overlapping residues; upstream puts residue 70 in group 1 and residue 27 at ALA 0, and both
+ports do.
+
 ## Every preset generates
 
 All ten of RFD4-Proteina's shipped presets now run end to end: unconditional, fold-conditioned,

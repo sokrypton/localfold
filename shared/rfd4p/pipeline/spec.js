@@ -22,6 +22,7 @@ import {
   getResidueSegments,
   getPolymerizationAtoms,
 } from './cif.js';
+import { orderedEntries, parseJsonOrdered, withKeyOrder } from './ordered.js';
 
 export const EXPANDABLE_SEGMENT_RES_ID_SENTINEL = -(2 ** 31);
 
@@ -275,7 +276,8 @@ function parseFlowValue(str) {
   if (s.startsWith('{') && s.endsWith('}')) {
     const inner = s.slice(1, -1).trim();
     const obj = {};
-    if (!inner) return obj;
+    const keys = [];
+    if (!inner) return withKeyOrder(obj, keys);
     for (const part of splitTopLevel(inner, ',')) {
       const p = part.trim();
       if (!p) continue;
@@ -284,9 +286,10 @@ function parseFlowValue(str) {
       const kRaw = p.slice(0, colonIdx).trim();
       const vRaw = p.slice(colonIdx + 1).trim();
       const key = String(parseYamlScalar(kRaw));
+      if (!Object.hasOwn(obj, key)) keys.push(key);
       obj[key] = parseFlowValue(vRaw);
     }
-    return obj;
+    return withKeyOrder(obj, keys);
   }
   if (s.startsWith('[') && s.endsWith(']')) {
     const inner = s.slice(1, -1).trim();
@@ -309,7 +312,7 @@ export function parseConditionSpecYaml(text) {
   const trimmed = text.trim();
   if (trimmed.startsWith('{')) {
     try {
-      return JSON.parse(trimmed);
+      return parseJsonOrdered(trimmed);
     } catch {
       return parseFlowValue(trimmed);
     }
@@ -395,6 +398,7 @@ export function parseConditionSpecYaml(text) {
     }
 
     const obj = {};
+    const keys = [];
     const mapIndent = lines[pos].indent;
     while (pos < lines.length && lines[pos].indent === mapIndent && !lines[pos].content.startsWith('-')) {
       const line = lines[pos].content;
@@ -403,13 +407,14 @@ export function parseConditionSpecYaml(text) {
       const k = String(parseYamlScalar(line.slice(0, colonIdx)));
       const vStr = line.slice(colonIdx + 1).trim();
       pos++;
+      if (!Object.hasOwn(obj, k)) keys.push(k);
       if (vStr) {
         obj[k] = vStr.startsWith('{') || vStr.startsWith('[') ? parseFlowValue(vStr) : parseYamlScalar(vStr);
       } else {
         obj[k] = parseBlock(mapIndent + 1);
       }
     }
-    return obj;
+    return withKeyOrder(obj, keys);
   }
 
   return parseBlock(0) || {};
@@ -1347,7 +1352,7 @@ export function applyConditions(atoms, conditions, originalResId) {
   // words. Each was a value this took and turned into something else: `C_CRDGRP: {abc: ...}`
   // became a NaN group and `{0: ...}` claimed the reserved absolute group, a direct `C_INTCRD`
   // wrote a payload upstream derives, and a two-body name has no selection-pair grammar here.
-  for (const [annotationName, values] of Object.entries(conditions || {})) {
+  for (const [annotationName, values] of orderedEntries(conditions || {})) {
     const spec = resolveConditionSpec(annotationName);
     if (spec.dtype === 'intcrd') throw new Error('C_INTCRD is a saved payload; edit C_CRDGRP instead.');
     if (spec.dtype === 'twobody') {
@@ -1363,7 +1368,7 @@ export function applyConditions(atoms, conditions, originalResId) {
       );
     }
     if (spec.dtype === 'crdgrp') {
-      for (const [value, entries] of Object.entries(values)) {
+      for (const [value, entries] of orderedEntries(values)) {
         if (value !== 'null') {
           if (!/^\d+$/.test(value) || !(Number(value) > 0 && Number(value) <= CRDGRP_MAX_GROUP_ID)) {
             throw new Error(
@@ -1380,7 +1385,7 @@ export function applyConditions(atoms, conditions, originalResId) {
   }
 
   try {
-    for (const [annotationName, values] of Object.entries(conditions || {})) {
+    for (const [annotationName, values] of orderedEntries(conditions || {})) {
       const spec = resolveConditionSpec(annotationName);
       const fullName = spec.fullName;
 
@@ -1390,7 +1395,7 @@ export function applyConditions(atoms, conditions, originalResId) {
         }
         const groups = atoms.annotations[fullName].slice();
         const defaults = getDefaultCoordinateGroups(atoms);
-        for (const [value, entries] of Object.entries(values)) {
+        for (const [value, entries] of orderedEntries(values)) {
           for (const entry of entries) {
             const mask = evalSelection(atoms, entry.select);
             for (let i = 0; i < n; i++) {
@@ -1405,7 +1410,7 @@ export function applyConditions(atoms, conditions, originalResId) {
         continue;
       }
 
-      for (const [value, entries] of Object.entries(values)) {
+      for (const [value, entries] of orderedEntries(values)) {
         const groupedIndices = new Map();
         for (const entry of entries) {
           const mask = evalSelection(atoms, entry.select);

@@ -7,6 +7,7 @@
  * and the RFD4-Proteina trunk/decoder/encoder.
  */
 
+import { parseJsonOrdered } from './ordered.js';
 import { isZstdBytes, decompressZstd, decodeTextOrZstd } from './zstd.js';
 import {
   CHAIN_TYPE,
@@ -103,7 +104,7 @@ function parseInputToAtomArray(input, opts = {}) {
       return parseCifToAtomArray(input, opts.cifOptions);
     }
     const spec = input.trimStart().startsWith('{')
-      ? JSON.parse(input)
+      ? parseJsonOrdered(input)
       : parseConditionSpecYaml(input);
     return buildAtomArrayFromConditionSpec(spec, opts);
   }

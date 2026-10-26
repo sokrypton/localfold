@@ -14,7 +14,7 @@ const repo = new URL("../..", import.meta.url).pathname;
 
 export function readJob(specPath) {
   const text = readFileSync(specPath, "utf8");
-  return text.trimStart().startsWith("{") ? JSON.parse(text) : parseConditionSpecYaml(text);
+  return parseConditionSpecYaml(text);   // JSON or YAML, key order kept
 }
 
 export function sampleFromDump(specPath, dump, seed = 0) {

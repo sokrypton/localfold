@@ -616,6 +616,13 @@ def main() -> int:
             # in the gen meta the native sampler reads.
             sampling = HERE / "featurise" / "gate-sampling.json"
             cases.append(("sampling", [f"--spec={sampling}"], [f"--spec={sampling}"]))
+            # 🔴 AND A CONDITION'S ARMS IN THE ORDER THE FILE WROTE THEM. JavaScript enumerates an
+            # integer-like key ("1", "2") first and in numeric order, where upstream's dict keeps
+            # the file's - and the last arm wins an atom two of them select. Groups 2 then 1 and
+            # ALA probabilities 1 then 0 over overlapping residues: the page's `JSON.parse` turned
+            # both round (in/seq, g/coordGroup, g/mSeqProb differed) until it kept the order.
+            order = HERE / "featurise" / "gate-order.json"
+            cases.append(("order", [f"--spec={order}"], [f"--spec={order}"]))
             # 🔴 AND THE GENERATION DIRECTORY, NOT ONLY THE TRUNK'S INPUT. `--generate` writes the
             # per-step conditioning, the emit masks, the recycle depths and the NOISE - which the
             # C++ now draws rather than replays, so Box-Muller is compared here too. Without this

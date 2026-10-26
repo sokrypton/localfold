@@ -1,0 +1,8 @@
+{"input": "../../../web/examples/5o45_cropped.cif.zst",
+ "contig": "A17-131",
+ "nsteps": 4,
+ "conditions": {
+   "C_CRDGRP": {"2": [{"select": "sel('A/*/[41-80]/[N,CA,C,O]')"}],
+                "1": [{"select": "sel('A/*/[61-100]/[N,CA,C,O]')"}]},
+   "C_SEQ_PROB_ALA": {"1": [{"select": "sel('A/*/[20-30]')"}],
+                      "0": [{"select": "sel('A/*/[25-35]')"}]}}}
