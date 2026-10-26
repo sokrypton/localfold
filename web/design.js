@@ -688,13 +688,8 @@ document.addEventListener("py2dmol-residue-selection-change", () => {
 });
 /** Hide the strip while a run owns the viewer. */
 const hideSequence = () => { sequenceBox.style.display = "none"; window.SEQ?.clear?.(); };
-// The strip's three buttons are wired by py2Dmol's own app, which this page does not run; the
-// renderer's selection API does the same three things.
-const allPositions = () => Array.from(viewer.renderer?.chains ?? [], (_, i) => i);
-element("selectAllResidues").addEventListener("click", () => {
-  viewer.renderer?.setResidueSelection(new Set(allPositions()));
-});
-element("clearAllResidues").addEventListener("click", () => viewer.renderer?.clearResidueSelection());
+// The strip wires its own Select all / Unselect / Invert (py2Dmol's panels/seq.js, since
+// sokrypton/py2Dmol#32), against the renderer `getRenderer` above names.
 // 🔴 A MOTIF DRAGGED OUT OF THE SEQUENCE, not typed: the selection's contiguous runs appended to the
 // job as `From structure` spans, in the structure's own numbering, which is what a contig names.
 element("selectionToSpans").addEventListener("click", () => {
@@ -709,10 +704,6 @@ element("selectionToSpans").addEventListener("click", () => {
   const added = segmentsOf(picks);
   spanList.set([...spanList.read(), ...added]);
   say(`added ${added.filter((span) => span.kind === "segment").length} span(s) from the selection`);
-});
-element("invertSelection").addEventListener("click", () => {
-  const now = viewer.renderer?.residueSelection ?? new Set();
-  viewer.renderer?.setResidueSelection(new Set(allPositions().filter((i) => !now.has(i))));
 });
 
 conditionEditor = createConditionEditor(conditionHost, {

@@ -1058,8 +1058,17 @@ def main():
                   const before = window.__designSpans.read().length;
                   document.getElementById('selectionToSpans').click();
                   const spans = window.__designSpans.read();
+                  // the strip's own buttons, wired by py2Dmol's panel (sokrypton/py2Dmol#32), not here
+                  const size = () => (r.residueSelection ? r.residueSelection.size : 0);
+                  document.getElementById('selectAllResidues').click();
+                  const all = size();
+                  document.getElementById('invertSelection').click();
+                  const inverted = size();
+                  document.getElementById('selectAllResidues').click();
+                  document.getElementById('clearAllResidues').click();
                   return JSON.stringify({ chains: [...new Set(sel.map((i) => r.chains[i]))],
-                    nums: sel.map((i) => r.residueNumbers[i]), added: spans.slice(before) });
+                    nums: sel.map((i) => r.residueNumbers[i]), added: spans.slice(before),
+                    buttons: { n: r.coords.length, all, inverted, cleared: size() } });
                 })()"""))
                 print(f"  sequence strip: dragged {dragged['chains']} {dragged['nums'][:1]}..{dragged['nums'][-1:]}"
                       f" -> {dragged['added']}")
@@ -1069,6 +1078,10 @@ def main():
                 elif dragged["added"] != [{"kind": "segment", "chain": dragged["chains"][0], "first": nums[0],
                                            "last": nums[-1], "hotspots": ""}]:
                     bad.append(f"Add as spans appended {dragged['added']}, expected the dragged run")
+                b = dragged["buttons"]
+                print(f"  strip buttons: {b}")
+                if (b["all"], b["inverted"], b["cleared"]) != (b["n"], 0, 0):
+                    bad.append(f"the strip's Select all / Invert / Unselect do not act on the input: {b}")
             # ...and, with --generate, a real generation from it: the archived job must carry the
             # row, merged into the conditions the engine was handed, and the run must finish.
             if "--generate" in sys.argv:
