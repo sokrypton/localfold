@@ -11,6 +11,7 @@
 #pragma once
 #include "chirality.h"
 #include "cif.h"
+#include "bcif.h"
 #include "fresh.h"
 #include <type_traits>
 
@@ -354,7 +355,7 @@ inline void mergeCcdIntoBlock(cif::Block& block, const vector<cif::Block>& ccdBl
  */
 inline AtomArray fromCif(const string& text, bool asAnnotatedCif = true, const vector<cif::Block>& ccdBlocks = {}) {
   AtomArray a;
-  cif::Block block = cif::parseBlock(text);
+  cif::Block block = bcif::parseStructure(text);
   if (!asAnnotatedCif) block = fresh::prepareFreshBlock(block, ccdBlocks);
   mergeCcdIntoBlock(block, ccdBlocks);
   a.site = cif::readAtomSite(block);

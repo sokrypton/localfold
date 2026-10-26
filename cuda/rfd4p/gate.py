@@ -548,9 +548,20 @@ def main() -> int:
             # DNA with a calcium and waters (7M5W) - read without `input_as_annotated_cif`. Both
             # ports used to read such a file as written; tools/check-rfd4p-load.py holds the page's
             # preparation to atomworks, and this holds the native one to the page.
-            for tag in ("raw-6mrr", "raw-7m5w", "raw-1brs"):
+            for tag in ("raw-6mrr", "raw-7m5w", "raw-1brs", "raw-bcif"):
                 spec = HERE / "featurise" / f"gate-{tag}.json"
                 cases.append((tag, [f"--spec={spec}"], [f"--spec={spec}"]))
+            # ...in the other two forms upstream takes: RCSB's own BinaryCIF (above, 7M5W), and
+            # gzip (a gzipped 1BRS written here, read by inflate.js on one side and `gzip -dc` on
+            # the other).
+            import gzip as _gzip
+            import zstandard as _zstd
+            gzcif = HERE / "featurise" / "gate-raw-gz.cif.gz"
+            gzcif.write_bytes(_gzip.compress(_zstd.ZstdDecompressor().decompressobj().decompress(
+                (REPO / "tools" / "fixtures" / "rcsb" / "1brs.cif.zst").read_bytes())))
+            gzjob = HERE / "featurise" / "gate-raw-gz.json"
+            gzjob.write_text(json.dumps({"input": gzcif.name, "contig": "A1-110, /0, D1-89", "nsteps": 4}))
+            cases.append(("raw-gz", [f"--spec={gzjob}"], [f"--spec={gzjob}"]))
             # 🔴 AND UPSTREAM'S SPEC SHAPE: YAML, examples by name, `global_args`, an `input`
             # relative to the spec file - and two files in one job.
             examples = HERE / "featurise" / "gate-examples.yaml"

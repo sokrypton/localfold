@@ -141,11 +141,23 @@ def main() -> int:
             path = Path(tmp) / f"{name}.cif"
             path.write_bytes(zstandard.ZstdDecompressor().decompressobj().decompress(raw))
             cases += [(f"{name} annotated", path, True), (f"{name} fresh", path, False)]
+        import gzip
+
         for packed in sorted(RAW.glob("*.cif.zst")):
             path = Path(tmp) / packed.name.removesuffix(".zst")
             path.write_bytes(zstandard.ZstdDecompressor().decompressobj().decompress(packed.read_bytes()))
             cases += [(f"{path.name.removesuffix('.cif')} annotated", path, True),
                       (f"{path.name.removesuffix('.cif')} fresh", path, False)]
+        # The other formats upstream takes: gzip, and RCSB's own BinaryCIF (its encoder, not one
+        # written here) - each must load exactly as the mmCIF does on both sides.
+        gz = Path(tmp) / "1brs.cif.gz"
+        gz.write_bytes(gzip.compress((Path(tmp) / "1brs.cif").read_bytes()))
+        cases += [("1brs gzip fresh", gz, False)]
+        for packed in sorted(RAW.glob("*.bcif.zst")):
+            path = Path(tmp) / packed.name.removesuffix(".zst")
+            path.write_bytes(zstandard.ZstdDecompressor().decompressobj().decompress(packed.read_bytes()))
+            stem = path.name.removesuffix(".bcif")
+            cases += [(f"{stem} bcif annotated", path, True), (f"{stem} bcif fresh", path, False)]
         if args.structures:
             for path in sorted(Path(args.structures).glob("*.cif")):
                 cases += [(f"{path.stem} annotated", path, True), (f"{path.stem} fresh", path, False)]

@@ -1315,11 +1315,11 @@ int run(int argc, char** argv) {
   // than landing unmeasured and being trusted because it compiles.
   if (!dumpCif.empty()) {
     bool opened = false;
-    const string text = lf::zstd::readTextOrCompressed(dumpCif, &opened);
+    const string text = rfd4p::bcif::readStructureFile(dumpCif, &opened);
     if (!opened) { fprintf(stderr, "no %s\n", dumpCif.c_str()); return 1; }
     // `--contig=` runs `applyContig` over the structure and dumps what it assembled, which is
     // the one stage between the reader and the transforms.
-    const rfd4p::cif::Block block = rfd4p::cif::parseBlock(text);
+    const rfd4p::cif::Block block = rfd4p::bcif::parseStructure(text);
     rfd4p::cif::AtomSite a = rfd4p::cif::readAtomSite(block);
     rfd4p::cif::deriveChemistry(a, block);
     if (unannotated) {
@@ -1991,7 +1991,7 @@ int run(int argc, char** argv) {
       vector<rfd4p::atoms::AtomArray> parts;
       for (const string& path : inputPaths) {
         bool opened = false;
-        const string cifText = lf::zstd::readTextOrCompressed(path, &opened);
+        const string cifText = rfd4p::bcif::readStructureFile(path, &opened);
         if (!opened) { fprintf(stderr, "no %s\n", path.c_str()); return 1; }
         const vector<rfd4p::cif::Block> ccdBlocks =
             annotated ? vector<rfd4p::cif::Block>{} : rfd4p::fresh::ccdBlocksForRawStructure(cifText, ccdFile);

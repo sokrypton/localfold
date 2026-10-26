@@ -9,16 +9,14 @@
 import { normalizeCatLabel } from '../conditions.js';
 import { prepareFreshBlock } from './fresh.js';
 import { evalQuery, pathMask } from './query.js';
-import { decodeTextOrZstd } from './zstd.js';
 import {
   BOND_TYPE,
   CHAIN_TYPE,
   SCALAR_1BODY_ANNOTATIONS,
   NONSCALAR_1BODY_ANNOTATIONS,
   createEmptyAtomArray,
-  parseCifBlock,
   parseCifToAtomArray,
-  pdbTextToCifText,
+  readStructureBlock,
   computeIdAndEntityAnnotations,
   getResidueSegments,
   getPolymerizationAtoms,
@@ -1527,8 +1525,8 @@ export function applyConditions(atoms, conditions, originalResId) {
  * which (`input_as_annotated_cif`); a page handed a file decides from what it carries.
  */
 export function isAnnotatedCif(input) {
-  const text = decodeTextOrZstd(input);
-  return /(?:^|\n)\s*_atom_site\.(?:condition_|annotation_|mask_)/.test(text);
+  const columns = Object.keys(readStructureBlock(input).block.atom_site ?? {});
+  return columns.some((c) => /^(?:condition_|annotation_|mask_)/.test(c));
 }
 
 export function loadConditionSpecInput(input, { asAnnotatedCif = false, ccdBlocks } = {}) {
@@ -1536,9 +1534,7 @@ export function loadConditionSpecInput(input, { asAnnotatedCif = false, ccdBlock
   if (asAnnotatedCif) {
     atoms = parseCifToAtomArray(input, { ccdBlocks });
   } else {
-    const text = decodeTextOrZstd(input);
-    const fromPdb = !text.includes('_atom_site.') && /(?:^|\n)(?:ATOM  |HETATM)/.test(text);
-    const block = prepareFreshBlock(parseCifBlock(fromPdb ? pdbTextToCifText(text) : text), { ccdBlocks });
+    const block = prepareFreshBlock(readStructureBlock(input).block, { ccdBlocks });
     atoms = parseCifToAtomArray(null, { block, fixArginines: true, ccdBlocks });
     atoms.annotations = {};
   }

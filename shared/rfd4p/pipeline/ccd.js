@@ -6,8 +6,7 @@
  * `files.rcsb.org/ligands/view/<ID>.cif`, served with `Access-Control-Allow-Origin: *`).
  */
 import { CCD_TEMPLATES, WATER_LIKE_CCDS } from './ccd-templates.js';
-import { mergeCcdIntoBlock, parseCifBlock } from './cif.js';
-import { decodeTextOrZstd } from './zstd.js';
+import { mergeCcdIntoBlock, parseCifBlock, readStructureBlock } from './cif.js';
 
 export { mergeCcdIntoBlock };
 
@@ -85,8 +84,7 @@ export async function fetchCcdComponents(ids, { fetchFn = globalThis.fetch?.bind
  * @returns {Promise<Map<string, object>>}
  */
 export async function ccdBlocksForRawStructure(input, { fetchFn } = {}) {
-  const text = typeof input === 'string' ? input : decodeTextOrZstd(input);
-  const site = parseCifBlock(text).atom_site ?? {};
+  const site = readStructureBlock(input).block.atom_site ?? {};
   const names = [...(site.label_comp_id ?? site.auth_comp_id ?? [])];
   const ids = componentsNeedingCcd(new Set(names));
   if (!ids.length) return new Map();

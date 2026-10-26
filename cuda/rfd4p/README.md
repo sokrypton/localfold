@@ -567,6 +567,13 @@ pinned checkpoint revision) found, and this round fixed:
   alternate-location LETTER first in each chain (not each atom's first row), no insertion codes
   from a CIF, no charge guessed from a table, `metalc` bonds kept, an unset `_chem_comp_atom` flag
   not read as "no".
+- **gzip and BinaryCIF inputs**, which upstream takes ("CIF or BinaryCIF, plain, gzip or Zstandard")
+  and both ports refused - `.cif.gz` with a misleading error. `pipeline/inflate.js` is a
+  synchronous DEFLATE (the structure path cannot await `DecompressionStream`), native runs `gzip -dc`
+  as `cuda/featurise` does, and `bcif.js`/`bcif.h` read MessagePack and the seven column encodings
+  into the same block the text reader returns. RCSB's own BinaryCIF of 6MRR and 7M5W loads exactly as
+  atomworks loads it, in both modes, and a BinaryCIF job featurises byte-identically to the same job
+  from the mmCIF; the page takes them from its file picker as bytes.
 - **Upstream's spec files**: YAML or JSON, examples by name with `global_args` folded in
   (`--example=` names one; several unnamed are refused), an `input` that is a path or a list -
   relative to the spec file, one chain id per file, coordinate groups renumbered across files -

@@ -26,7 +26,6 @@ import { getDevice } from "./model.js";
 import { RFD4P_PRESETS } from "../shared/rfd4p/presets.js";
 import { parseCifToAtomArray } from "../shared/rfd4p/pipeline/cif.js";
 import { THREE_TO_ONE } from "../cpu/design/mpnn/constants.js";
-import { decompress } from "../shared/rfd4p/vendor/fzstd.js";
 import { chooseDesigner, DESIGNERS } from "../cpu/design/designers.js";
 import { CHAIN_IDS, MAX_ALANINE } from "../webgpu/design/hunter-loop.js";
 
@@ -860,9 +859,8 @@ presetSelect.addEventListener("change", () => {
     describeStructure();
     fetch(preset.cifUrl).then(async (response) => {
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      // The shipped examples are zstd, which the reader unwraps like any other.
       const bytes = new Uint8Array(await response.arrayBuffer());
-      // The shipped examples are zstd; a plain .cif is taken as it is.
-      const zstd = bytes[0] === 0x28 && bytes[1] === 0xb5 && bytes[2] === 0x2f;
       // 🔴 THE PRESET MAY HAVE CHANGED WHILE THIS WAS IN FLIGHT. A fetch that
       // lands after the reader has picked something else would take THIS
       // structure and apply it to THOSE spans - which is not a hypothetical:
@@ -870,8 +868,7 @@ presetSelect.addEventListener("change", () => {
       // preset's contig against another's crop, producing `A17-131`, a range
       // that matched no atoms and still looked like a plausible answer.
       if (presetSelect.value !== chosen) return;
-      takeStructure(new TextDecoder().decode(zstd ? decompress(bytes) : bytes),
-        preset.cifUrl, false);
+      takeStructure(bytes, preset.cifUrl, false);
       // 🔴 AND THE CONTIG IS PUT INTO THE CROP'S OWN NUMBERING. A shipped
       // example is a CROP, and its contig is written in the numbering of the
       // entry it was cut from - `A16-35` against a file whose chain A runs
@@ -1003,14 +1000,16 @@ const chainRanges = (atoms) => {
   return chains;
 };
 
-const takeStructure = (text, name, offerChain = true) => {
+const takeStructure = (data, name, offerChain = true) => {
   // 🔴 PARSED ON LOAD, NOT ON RUN. A file that is not mmCIF, or an entry with no
   // atom records, is a thing to say now - while the user is looking at the
   // control they just used - rather than minutes later inside a generation.
-  const atoms = parseCifToAtomArray(text);
+  // `data` is text or the file's BYTES - mmCIF or BinaryCIF, plain, gzip or
+  // Zstandard, as upstream takes a structure - and it is handed on as given.
+  const atoms = parseCifToAtomArray(data);
   const chains = chainRanges(atoms);
   if (chains.size === 0) throw new Error("no atoms in that file");
-  loaded = { text, name, atoms, chains };
+  loaded = { data, name, atoms, chains };
   describeStructure();
   // Offer its first chain as a span, since that is almost always the next move.
   // 🔴 NOT WHEN A PRESET LOADED IT. The preset has just written the spans it
@@ -1049,9 +1048,7 @@ element("structure-file").addEventListener("change", async (event) => {
   const file = event.target.files?.[0];
   if (file === undefined) return;
   try {
-    const bytes = new Uint8Array(await file.arrayBuffer());
-    const zstd = bytes[0] === 0x28 && bytes[1] === 0xb5 && bytes[2] === 0x2f && bytes[3] === 0xfd;
-    takeStructure(new TextDecoder().decode(zstd ? decompress(bytes) : bytes), file.name);
+    takeStructure(new Uint8Array(await file.arrayBuffer()), file.name);
   } catch (error) {
     structureNote.textContent = `could not read ${file.name}: ${error.message}`;
     structureNote.classList.add("warn");
@@ -1160,7 +1157,7 @@ const startGenerate = async () => {
         conditions: { ...presetExtras.conditions, ...conditionsOf(spans) },
       }),
       // A structure the user loaded is the one they mean, over a preset's.
-      ...(loaded === null ? {} : { inputCif: loaded.text }),
+      ...(loaded === null ? {} : { inputCif: loaded.data }),
       steps: number("steps", RFD4_STEPS),
       // 🔴 A GENERATION IS A TRAJECTORY AND WAS DRAWN AS ONE PICTURE. The flow
       // runs 60 steps and the page pushed only the finished structure, so the

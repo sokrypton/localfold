@@ -26,7 +26,11 @@ def ccd_entries(paths: list[Path]) -> dict[str, str]:
     have = set(re.findall(r'^  "([^"]+)":', (REPO / "shared/rfd4p/pipeline/ccd-templates.js").read_text(), re.M))
     names = set()
     for path in paths:
-        names |= set(re.findall(r"^(?:ATOM|HETATM)\s+\S+\s+\S+\s+\S+\s+\S+\s+(\S+)", path.read_text(), re.M))
+        try:
+            text = path.read_text()
+        except UnicodeDecodeError:   # gzip or BinaryCIF: their components are their mmCIF twin's
+            continue
+        names |= set(re.findall(r"^(?:ATOM|HETATM)\s+\S+\s+\S+\s+\S+\s+\S+\s+(\S+)", text, re.M))
     ccd = get_ccd()
     comp = ccd["chem_comp"]
     comp_type = dict(zip(comp["id"].as_array(str), comp["type"].as_array(str), strict=True))

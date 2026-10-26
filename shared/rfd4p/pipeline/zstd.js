@@ -1,5 +1,6 @@
-// Zstandard helpers for `.cif.zst` inputs, on top of the vendored fzstd decoder.
+// Zstandard (and gzip) helpers for `.cif.zst` / `.cif.gz` inputs, on top of the vendored fzstd decoder.
 import { decompress, Decompress, ZstdErrorCode } from '../vendor/fzstd.js';
+import { gunzip, isGzipBytes } from './inflate.js';
 
 export { decompress, Decompress, ZstdErrorCode };
 
@@ -21,14 +22,20 @@ export function decompressZstd(input) {
     return decompress(u);
 }
 
+/** Bytes with any Zstandard or gzip wrapping undone - upstream reads a structure plain, gzip or Zstandard. */
+export function unwrapBytes(input) {
+    const u = input instanceof Uint8Array
+        ? input
+        : new Uint8Array(input.buffer || input, input.byteOffset || 0, input.byteLength ?? input.length);
+    if (isZstdBytes(u)) return decompress(u);
+    if (isGzipBytes(u)) return gunzip(u);
+    return u;
+}
+
 export function decodeTextOrZstd(input) {
     if (typeof input === 'string') return input;
     if (input instanceof Uint8Array || input instanceof ArrayBuffer || ArrayBuffer.isView(input)) {
-        const u = input instanceof Uint8Array
-            ? input
-            : new Uint8Array(input.buffer || input, input.byteOffset || 0, input.byteLength ?? input.length);
-        const raw = isZstdBytes(u) ? decompress(u) : u;
-        return new TextDecoder('utf-8').decode(raw);
+        return new TextDecoder('utf-8').decode(unwrapBytes(input));
     }
     throw new TypeError('Expected string, Uint8Array, or ArrayBuffer');
 }

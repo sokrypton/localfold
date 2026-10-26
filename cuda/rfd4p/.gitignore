@@ -36,3 +36,5 @@ featurise/gate-nucleic-ss.cif
 featurise/gate-nucleic-ss.json
 featurise/gate-multi.json
 featurise/gate-multi-yz.cif
+featurise/gate-raw-gz.cif.gz
+featurise/gate-raw-gz.json

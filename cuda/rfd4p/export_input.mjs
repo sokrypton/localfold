@@ -175,7 +175,8 @@ const fromAnnotations = !length && preset.cifUrl !== null && preset.cifUrl !== u
 // its own, already resolved above.
 const inputPaths = length ? [] : (preset.inputs
   ?? (preset.cifUrl ? [preset.cifUrl.startsWith("/") ? preset.cifUrl : `${repo}${preset.cifUrl.replace(/^\.\//, "")}`] : []));
-const inputCif = inputPaths.length ? decodeTextOrZstd(new Uint8Array(readFileSync(inputPaths[0]))) : undefined;
+// Bytes, as given: mmCIF or BinaryCIF, plain, gzip or Zstandard - the reader tells them apart.
+const inputCif = inputPaths.length ? new Uint8Array(readFileSync(inputPaths[0])) : undefined;
 if (fromAnnotations && inputPaths.length > 1) {
   console.error("specMode: false takes one structure as the job; this one names several");
   process.exit(1);

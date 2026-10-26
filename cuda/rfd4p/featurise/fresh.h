@@ -11,6 +11,7 @@
 // page byte for byte.
 #pragma once
 #include "cif.h"
+#include "bcif.h"
 #include "../../featurise/ccd.h"
 #include <charconv>
 #include <cstdint>
@@ -636,7 +637,7 @@ inline cif::Block prepareFreshBlock(const cif::Block& block, const vector<cif::B
  * that cannot be had is a refusal, never a structure prepared without it.
  */
 inline vector<cif::Block> ccdBlocksForRawStructure(const string& text, const string& ccdFile) {
-  const cif::Block b = cif::parseBlock(text);
+  const cif::Block b = bcif::parseStructure(text);
   const vector<string>* names = col(b, "atom_site", "label_comp_id");
   if (!names) names = col(b, "atom_site", "auth_comp_id");
   std::set<string> ids;

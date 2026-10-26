@@ -1,7 +1,8 @@
 // Pure ES module mmCIF & Annotated-CIF parser for RFD4-Proteina pipeline.
 // Mirrors atomworks.io.parse(..., config=ANNOTATED_CIF / RCSB_WITH_METALS).
 
-import { decodeTextOrZstd } from './zstd.js';
+import { isBinaryCif, parseBinaryCifBlock } from './bcif.js';
+import { decodeTextOrZstd, unwrapBytes } from './zstd.js';
 
 export const BOND_TYPE = {
   ANY: 0,
@@ -901,17 +902,25 @@ export function mergeCcdIntoBlock(cifBlock, blocks) {
   return cifBlock;
 }
 
+/**
+ * A structure file as a parsed block: mmCIF text, BinaryCIF, or a PDB file converted - plain, gzip
+ * or Zstandard, as upstream takes one. `fromPdb` says it was a PDB file, whose insertion codes are
+ * its numbering.
+ * @returns {{block: object, fromPdb: boolean}}
+ */
+export function readStructureBlock(input) {
+  if (typeof input !== 'string') {
+    const bytes = unwrapBytes(input);
+    if (isBinaryCif(bytes)) return { block: parseBinaryCifBlock(bytes), fromPdb: false };
+    input = new TextDecoder('utf-8').decode(bytes);
+  }
+  const fromPdb = !input.includes('_atom_site.') && /(?:^|\n)(?:ATOM  |HETATM)/.test(input);
+  return { block: parseCifBlock(fromPdb ? pdbTextToCifText(input) : input), fromPdb };
+}
+
 export function parseCifToAtomArray(cifInput, opts = {}) {
   // A parsed block is taken as it is (fresh.js hands one over); text or bytes are read here.
-  let block;
-  let fromPdb = false;
-  if (opts.block) {
-    block = opts.block;
-  } else {
-    const rawText = decodeTextOrZstd(cifInput);
-    fromPdb = !rawText.includes('_atom_site.') && /(?:^|\n)(?:ATOM  |HETATM)/.test(rawText);
-    block = parseCifBlock(fromPdb ? pdbTextToCifText(rawText) : rawText);
-  }
+  const { block, fromPdb } = opts.block ? { block: opts.block, fromPdb: false } : readStructureBlock(cifInput);
   // Fetched Chemical Component Dictionary entries (`ccd.js`) for components the file carries no tables for.
   if (opts.ccdBlocks?.size) mergeCcdIntoBlock(block, opts.ccdBlocks);
   const atomSite = block.atom_site;
