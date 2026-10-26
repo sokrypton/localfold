@@ -3,6 +3,10 @@
 
 import { isBinaryCif, parseBinaryCifBlock } from './bcif.js';
 import { decodeTextOrZstd, unwrapBytes } from './zstd.js';
+import { CCD_TEMPLATES } from './ccd-templates.js';
+import {
+  BondRows, inferLinkOrder, linkDictionary, resolveLinkChemistry, validateInferredPolymerBond,
+} from './links.js';
 
 export const BOND_TYPE = {
   ANY: 0,
@@ -578,7 +582,10 @@ export function computeIdAndEntityAnnotations(atoms) {
  * the same number) is bonded, which a `== 1` test here did not.
  * @returns {number[][]} the `[out, in]` pairs to add, in residue order
  */
-function polymerBondsToAdd(atoms, bonds, resStarts, atomToRes) {
+function polymerBondsToAdd(atoms, bonds, resStarts, atomToRes, dict) {
+  // `_validate_inferred_polymer_bond` reads the degree before any backbone bond is added.
+  const degree = new BondRows(bonds).degrees(atoms.nAtoms);
+  const isH = (i) => ['H', 'H2', 'D', 'T'].includes(atoms.element[i]);
   const neighbours = new Map();
   for (const [u, v, bt] of bonds) {
     if (bt === BOND_TYPE.COORDINATION) continue;
@@ -613,6 +620,7 @@ function polymerBondsToAdd(atoms, bonds, resStarts, atomToRes) {
     const reverseIn = atoms1[1] ? find(s1, e1, atoms1[1]) : -1;
     const reverseOut = atoms2[0] ? find(s2, e2, atoms2[0]) : -1;
     if (reverseIn >= 0 && reverseOut >= 0 && (neighbours.get(reverseIn) ?? []).includes(reverseOut)) continue;
+    validateInferredPolymerBond(atoms, idxOut, idxIn, degree, (i) => (neighbours.get(i) ?? []).some(isH), dict);
     out.push([idxOut, idxIn]);
   }
   return out;
@@ -623,43 +631,50 @@ function polymerBondsToAdd(atoms, bonds, resStarts, atomToRes) {
  * structure a condition spec built: two preserved segments a contig joins directly ARE bonded -
  * and refused if the bond is impossible (`bond_length`), where this port left them unbonded.
  */
-export function addPolymerBonds(atoms) {
+export function addPolymerBonds(atoms, { ccdBlocks = null } = {}) {
   if (!atoms.bonds || !atoms.chain_type || atoms.nAtoms === 0) return atoms;
+  const dict = linkDictionary(ccdBlocks, getPolymerizationAtoms);
   const resStarts = getResidueSegments(atoms);
   const atomToRes = new Int32Array(atoms.nAtoms);
   for (let r = 0; r < resStarts.length - 1; r++) {
     for (let i = resStarts[r]; i < resStarts[r + 1]; i++) atomToRes[i] = r;
   }
-  for (const [u, v] of polymerBondsToAdd(atoms, atoms.bonds, resStarts, atomToRes)) {
+  for (const [u, v] of polymerBondsToAdd(atoms, atoms.bonds, resStarts, atomToRes, dict)) {
     atoms.bonds.push([Math.min(u, v), Math.max(u, v), BOND_TYPE.SINGLE]);
   }
   return atoms;
 }
 
 /**
- * Add intra-residue bonds, struct_conn bonds, polymer backbone bonds, and retype metal bonds.
+ * Add intra-residue bonds, struct_conn bonds, polymer backbone bonds, and retype metal bonds -
+ * atomworks' `_add_bonds`, in its order. With `sanitize` (a raw structure being prepared,
+ * upstream's `add_missing_atoms`) the authored links' products are then built (links.js), and
+ * the hydrogens that held them are dropped.
+ *
+ * 🔴 THE BONDS ARE KEPT IN biotite's ROW ORDER, because link chemistry takes the first match in
+ * several places: `merge` puts the INCOMING list first, so the backbone bonds come first, then each
+ * residue's dictionary bonds, then the `struct_conn` links they do not repeat - and where a link
+ * repeats a residue's own bond (1FYL's BRU C5-BR), the dictionary's order wins.
+ *
+ * @param {object} atoms
+ * @param {object|null} cifBlock
+ * @param {object|null} customBondDict
+ * @param {{sanitize?: boolean, ccdBlocks?: Map<string, object>}} [opts]
  */
-export function buildBondsForAtomArray(atoms, cifBlock = null, customBondDict = null) {
+export function buildBondsForAtomArray(atoms, cifBlock = null, customBondDict = null, opts = {}) {
   const n = atoms.nAtoms;
-  const bondMap = new Map(); // key `${min}_${max}` -> [u, v, type]
+  const sanitize = Boolean(opts.sanitize);
+  const dict = linkDictionary(opts.ccdBlocks ?? null, getPolymerizationAtoms);
 
-  function addBond(u, v, type) {
-    if (u === v || u < 0 || v < 0 || u >= n || v >= n) return;
-    const a = u < v ? u : v;
-    const b = u < v ? v : u;
-    const key = `${a}_${b}`;
-    if (!bondMap.has(key)) {
-      bondMap.set(key, [a, b, type]);
-    }
-  }
-
-  // Build residue bond dictionary: start from STD_RESIDUE_BONDS, overlay customBondDict and _chem_comp_bond
+  // Each residue's bonds: the dictionary's (hydrogens too), overlaid by a custom dictionary and the
+  // file's own `_chem_comp_bond`.
   const resBondLookup = new Map();
-  for (const [res, pairs] of Object.entries(STD_RESIDUE_BONDS)) {
+  for (const [res, t] of Object.entries(CCD_TEMPLATES)) {
     const m = new Map();
-    for (const [a1, a2, bt] of pairs) {
-      const k = a1 < a2 ? `${a1}:${a2}` : `${a2}:${a1}`;
-      m.set(k, bt);
+    for (const [i, j, bt] of t.bonds) {
+      const a1 = t.atoms[i][0];
+      const a2 = t.atoms[j][0];
+      m.set(a1 < a2 ? `${a1}:${a2}` : `${a2}:${a1}`, bt);
     }
     resBondLookup.set(res, m);
   }
@@ -699,7 +714,10 @@ export function buildBondsForAtomArray(atoms, cifBlock = null, customBondDict = 
     for (let i = resStarts[r]; i < resStarts[r + 1]; i++) atomToRes[i] = r;
   }
 
-  // 1. Add _struct_conn bonds if present in cifBlock
+  // 1. `add_bonds_from_struct_conn`: covalent links and metal coordination, an unset order inferred
+  // from the two reactants (`infer_link_order`; a component the dictionary lacks keeps an unknown
+  // order when the structure is not being prepared, and is refused when it is).
+  const linkRows = [];
   if (cifBlock && cifBlock.struct_conn) {
     const sc = cifBlock.struct_conn;
     const nRows = (sc.conn_type_id || []).length;
@@ -743,58 +761,82 @@ export function buildBondsForAtomArray(atoms, cifBlock = null, customBondDict = 
       const idx1 = findPartner(1);
       const idx2 = findPartner(2);
       if (idx1 >= 0 && idx2 >= 0 && idx1 !== idx2) {
-        const ordStr = (sc.pdbx_value_order?.[row] || 'sing').toLowerCase();
-        const bt = STRUCT_CONN_ORDER_TO_TYPE[ordStr] ?? BOND_TYPE.SINGLE;
-        addBond(idx1, idx2, bt);
+        let bt;
+        if (connType === 'metalc') bt = BOND_TYPE.COORDINATION;
+        else {
+          // The order as written: upstream matches the mmCIF vocabulary exactly (lower case).
+          const order = sc.pdbx_value_order?.[row] ?? '?';
+          if (Object.hasOwn(STRUCT_CONN_ORDER_TO_TYPE, order)) bt = STRUCT_CONN_ORDER_TO_TYPE[order];
+          else if (order === '?' || order === '.' || order === '') {
+            bt = inferLinkOrder(atoms, idx1, idx2, dict, { allowMissingTemplates: !sanitize });
+          } else throw new Error(`Unsupported struct_conn bond order: '${order}'`);
+        }
+        // Chemical preparation needs concrete orders.
+        if (sanitize && bt === BOND_TYPE.ANY) bt = BOND_TYPE.SINGLE;
+        linkRows.push([idx1, idx2, bt]);
       }
     }
   }
 
-  // Preserve any pre-existing bonds on atoms
-  if (Array.isArray(atoms.bonds)) {
-    for (const [u, v, bt] of atoms.bonds) {
-      addBond(u, v, bt);
-    }
-  }
-
-  // 2. Add intra-residue bonds from resBondLookup
+  // 2. Each residue's own bonds, merged over the links (the dictionary's type wins a repeat).
+  const residueRows = [];
   for (let r = 0; r < resStarts.length - 1; r++) {
     const s = resStarts[r];
     const e = resStarts[r + 1];
-    const resName = atoms.res_name[s];
-    const m = resBondLookup.get(resName);
+    const m = resBondLookup.get(atoms.res_name[s]);
     if (!m) continue;
     for (let i = s; i < e; i++) {
       const ai = atoms.atom_name[i];
       for (let j = i + 1; j < e; j++) {
         const aj = atoms.atom_name[j];
-        const k = ai < aj ? `${ai}:${aj}` : `${aj}:${ai}`;
-        const bt = m.get(k);
-        if (bt !== undefined) {
-          addBond(i, j, bt);
-        }
+        const bt = m.get(ai < aj ? `${ai}:${aj}` : `${aj}:${ai}`);
+        if (bt !== undefined) residueRows.push([i, j, bt]);
       }
     }
   }
+  let bonds = new BondRows([...residueRows, ...(atoms.bonds ?? []), ...linkRows.filter(([u, v]) => !residueRows.some(
+    ([a, b]) => (a === Math.min(u, v) && b === Math.max(u, v))))]);
 
-  // 3. Add inter-residue polymer bonds (add_polymer_bonds)
-  for (const [u, v] of polymerBondsToAdd(atoms, [...bondMap.values()], resStarts, atomToRes)) {
-    addBond(u, v, BOND_TYPE.SINGLE);
+  // 3. `add_polymer_bonds`, merged in front.
+  const current = bonds.list().map(([u, v, bt]) => [u, v, bt]);
+  const polymer = polymerBondsToAdd(atoms, current, resStarts, atomToRes, dict);
+  bonds = new BondRows([...polymer.map(([u, v]) => [u, v, BOND_TYPE.SINGLE]), ...current]);
+  atoms.bonds = bonds.list().map(([u, v, bt]) => [u, v, bt]);
+
+  // 4. The authored links' products (`resolve_link_chemistry`), then the hydrogens go.
+  let out = atoms;
+  if (sanitize) {
+    out = resolveLinkChemistry(atoms, dict, keepAtoms);
+    out = keepAtoms(out, out.element.map((e) => !HYDROGEN_ELEMENTS.has(e)));
   }
 
-  // 4. Retype any metal-incident bond to COORDINATION
-  const bonds = [];
-  for (const [u, v, bt] of bondMap.values()) {
-    const eu = (atoms.element[u] || '').toUpperCase();
-    const ev = (atoms.element[v] || '').toUpperCase();
-    if (METAL_ELEMENTS.has(eu) || METAL_ELEMENTS.has(ev)) {
-      bonds.push([u, v, BOND_TYPE.COORDINATION]);
-    } else {
-      bonds.push([u, v, bt]);
-    }
-  }
+  // 5. Retype any metal-incident bond to COORDINATION.
+  out.bonds = out.bonds.map(([u, v, bt]) => {
+    const eu = (out.element[u] || '').toUpperCase();
+    const ev = (out.element[v] || '').toUpperCase();
+    return METAL_ELEMENTS.has(eu) || METAL_ELEMENTS.has(ev) ? [u, v, BOND_TYPE.COORDINATION] : [u, v, bt];
+  });
+  return out;
+}
 
-  atoms.bonds = bonds;
+const HYDROGEN_ELEMENTS = new Set(['H', 'H2', 'D', 'T']);
+
+/** The array without the atoms `keep` is false for: every per-atom field and the bonds, reindexed. */
+function keepAtoms(atoms, keep) {
+  if (keep.every(Boolean)) return atoms;
+  const n = atoms.nAtoms;
+  const index = new Int32Array(n).fill(-1);
+  let k = 0;
+  for (let i = 0; i < n; i++) if (keep[i]) index[i] = k++;
+  const pick = (arr) => arr.filter((_, i) => keep[i]);
+  for (const [key, v] of Object.entries(atoms)) {
+    if (key !== 'bonds' && Array.isArray(v) && v.length === n) atoms[key] = pick(v);
+  }
+  for (const [key, v] of Object.entries(atoms.annotations ?? {})) {
+    if (Array.isArray(v) && v.length === n) atoms.annotations[key] = pick(v);
+  }
+  atoms.bonds = (atoms.bonds ?? []).filter(([u, v]) => keep[u] && keep[v]).map(([u, v, bt]) => [index[u], index[v], bt]);
+  atoms.nAtoms = k;
   return atoms;
 }
 
@@ -1266,8 +1308,8 @@ export function parseCifToAtomArray(cifInput, opts = {}) {
     delete atoms.annotations['mask_coordinate_1_atom'];
   }
 
-  buildBondsForAtomArray(atoms, block);
-  computeIdAndEntityAnnotations(atoms);
+  const built = buildBondsForAtomArray(atoms, block, null, { sanitize: opts.sanitize, ccdBlocks: opts.ccdBlocks });
+  computeIdAndEntityAnnotations(built);
 
-  return atoms;
+  return built;
 }

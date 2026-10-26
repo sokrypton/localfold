@@ -43,7 +43,6 @@ function templateLookup(block, ccdBlocks) {
       const id = ids[r];
       if (CCD_TEMPLATES[id] || taken.has(id)) continue;
       const element = String(col(cat, 'type_symbol')[r] ?? '').toUpperCase();
-      if (element === 'H' || element === 'D') continue;
       if (!fromCat.has(id)) fromCat.set(id, { type: '', atoms: [] });
       const charge = col(cat, 'charge')[r];
       fromCat.get(id).atoms.push([
@@ -326,8 +325,8 @@ export function prepareFreshBlock(block, { ccdBlocks } = {}) {
     });
   }
   if (col(site, 'label_alt_id').length) rows = selectAltlocsClashAware(rows, block, lookup);
-  // Hydrogens never reach the batch; dropped once the conformers are chosen, which used them.
-  rows = rows.filter((r) => r.element !== 'H' && r.element !== 'D');
+  // Hydrogens stay until the link products are built (links.js), which count them, as upstream's
+  // do (`hydrogen_policy="keep"`); the reader drops them after that.
   rows = rows.filter((r) => !WATER_LIKE_CCDS.includes(r.comp));
 
   // Which chains are polymers, and of what kind (`build_chain_info`).
@@ -353,10 +352,6 @@ export function prepareFreshBlock(block, { ccdBlocks } = {}) {
     const polyType = entityPolyType.get(entity) ?? '';
     const isPolymer = entityPolyType.has(entity) || entityType.get(entity) === 'polymer'
       || (!entityType.has(entity) && list[0].labelled);
-    const isProtein = /polypeptide|peptide/.test(polyType)
-      || (!polyType && isPolymer && /PEPTIDE/.test(lookup(list[0].comp)?.type ?? ''));
-    const isNucleic = /nucleotide/.test(polyType)
-      || (!polyType && isPolymer && /DNA|RNA/.test(lookup(list[0].comp)?.type ?? ''));
 
     // Residues as they are modeled, in file order.
     const residues = [];
@@ -382,8 +377,8 @@ export function prepareFreshBlock(block, { ccdBlocks } = {}) {
       const template = lookup(comp);
       const hasPrev = isPolymer && k > 0;
       const hasNext = isPolymer && k < sequence.length - 1;
-      // Leaving atoms at a polymer bond to a neighbour go with the bond.
-      const leaves = (name) => (isProtein && hasNext && name === 'OXT') || (isNucleic && hasPrev && name === 'OP3');
+      // A leaving atom at a polymer bond to a neighbour (an OXT, an OP3, the H2 they take with
+      // them) is added like any other and leaves with the bond, when links.js builds it.
       const resId = res ? res.seq : s.num;
       const auth = res ? res.auth : String(s.num);
       const group = res ? (res.comp === 'MSE' ? 'ATOM' : res.group) : 'ATOM';
@@ -402,7 +397,6 @@ export function prepareFreshBlock(block, { ccdBlocks } = {}) {
       if (!template) {
         if (!res) return;
         for (const a of res.atoms) {
-          if (leaves(a.atom)) continue;
           emit(a.atom, a.element, a.xyz, a.occupancy, a.b, unset(a.charge) ? '0' : a.charge, a);
         }
         return;
@@ -418,7 +412,6 @@ export function prepareFreshBlock(block, { ccdBlocks } = {}) {
         if (t) { if (!byName.has(t[0])) byName.set(t[0], a); } else extra.push(a);
       }
       for (const [name, , element, charge] of template.atoms) {
-        if (leaves(name)) continue;
         const a = byName.get(name);
         if (a) {
           const el = res.comp === 'MSE' && a.atom === 'SE' ? 'S' : a.element;
@@ -428,7 +421,6 @@ export function prepareFreshBlock(block, { ccdBlocks } = {}) {
         }
       }
       for (const a of extra) {
-        if (leaves(a.atom)) continue;
         emit(a.atom, a.element, a.xyz, a.occupancy, a.b, unset(a.charge) ? '0' : a.charge, a);
       }
     });

@@ -391,7 +391,9 @@ inline AtomArray fromCif(const string& text, bool asAnnotatedCif = true, const v
       std::swap(a.site.z[iNH1], a.site.z[iNH2]);
     }
   }
-  a.bonds = cif::buildBonds(a.site, block);
+  // A raw structure's links are built into products (links.h), which drops atoms - after the
+  // annotations are read, which an unannotated load throws away anyway.
+  a.bonds = cif::buildBonds(a.site, block, &ccdBlocks, !asAnnotatedCif);
   a.ids = cif::computeIds(a.site, a.bonds);
   a.stereo = chirality::annotate(a.site, a.bonds, a.ann, {});
   return a;
@@ -1057,14 +1059,15 @@ inline AtomArray biologicalAssemblyOne(const AtomArray& a, const cif::Block& blo
 }
 
 /** `addPolymerBonds` (cif.js): `add_polymer_bonds` over a finished array. */
-inline void addPolymerBonds(AtomArray& a) {
+inline void addPolymerBonds(AtomArray& a, const vector<cif::Block>& ccdBlocks = {}) {
   if (a.n() == 0 || a.site.chainType.size() != a.n()) return;
+  links::Dictionary<cif::Block> dict = cif::linkDictionary(&ccdBlocks);
   const vector<int> starts = cif::residueSegments(a.site);
   vector<int> atomToRes(a.n(), 0);
   for (size_t r = 0; r + 1 < starts.size(); ++r) {
     for (int i = starts[r]; i < starts[r + 1]; ++i) atomToRes[i] = (int)r;
   }
-  for (const auto& [u, v] : cif::polymerBondsToAdd(a.site, a.bonds, starts, atomToRes)) {
+  for (const auto& [u, v] : cif::polymerBondsToAdd(a.site, a.bonds, starts, atomToRes, dict)) {
     a.bonds.push_back({std::min(u, v), std::max(u, v), tables::BT_SINGLE});
   }
 }

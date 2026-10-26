@@ -122,7 +122,6 @@ struct Lookup {
       const string& id = (*ids)[r];
       if (tables::CCD_TEMPLATES.count(id) || taken.count(id)) continue;
       const string element = upperOf(cell(col(b, "chem_comp_atom", "type_symbol"), r));
-      if (element == "H" || element == "D") continue;
       Template& t = fromCat[id];
       const string atom = cell(col(b, "chem_comp_atom", "atom_id"), r);
       const vector<string>* alts = col(b, "chem_comp_atom", "alt_atom_id");
@@ -433,7 +432,7 @@ inline cif::Block prepareFreshBlock(const cif::Block& block, const vector<cif::B
   {
     vector<Row> kept;
     for (const Row& w : rows) {
-      if (w.element == "H" || w.element == "D") continue;
+      // Hydrogens stay until the link products are built (links.h), which count them.
       if (std::find(tables::WATER_LIKE_CCDS.begin(), tables::WATER_LIKE_CCDS.end(), w.comp) != tables::WATER_LIKE_CCDS.end()) continue;
       kept.push_back(w);
     }
@@ -473,15 +472,8 @@ inline cif::Block prepareFreshBlock(const cif::Block& block, const vector<cif::B
   for (const string& chain : chainOrder) {
     const vector<Row>& list = chainRows[chain];
     const string entity = list[0].entity;
-    const string polyType = entityPolyType.count(entity) ? entityPolyType[entity] : string();
     const bool isPolymer = entityPolyType.count(entity) || (entityType.count(entity) && entityType[entity] == "polymer") ||
                            (!entityType.count(entity) && list[0].labelled);
-    auto firstType = [&]() { auto t = lookup(list[0].comp); return t ? t->type : string(); };
-    const bool isProtein = polyType.find("peptide") != string::npos ||
-                           (polyType.empty() && isPolymer && firstType().find("PEPTIDE") != string::npos);
-    const bool isNucleic = polyType.find("nucleotide") != string::npos ||
-                           (polyType.empty() && isPolymer &&
-                            (firstType().find("DNA") != string::npos || firstType().find("RNA") != string::npos));
     vector<Residue> residues;
     for (const Row& w : list) {
       if (!residues.empty() && residues.back().seq == w.seq && residues.back().comp == w.comp) residues.back().atoms.push_back(w);
@@ -507,7 +499,8 @@ inline cif::Block prepareFreshBlock(const cif::Block& block, const vector<cif::B
       const auto tmpl = lookup(comp);
       const bool hasPrev = isPolymer && k > 0;
       const bool hasNext = isPolymer && k + 1 < sequence.size();
-      auto leaves = [&](const string& name) { return (isProtein && hasNext && name == "OXT") || (isNucleic && hasPrev && name == "OP3"); };
+      // A leaving atom at a polymer bond (an OXT, an OP3, the H2 they take with them) is added like
+      // any other and leaves with the bond, when links.h builds it.
       const int resId = res ? res->seq : sequence[k].num;
       const string auth = res ? res->auth : std::to_string(sequence[k].num);
       const string group = res ? (res->comp == "MSE" ? string("ATOM") : res->group) : string("ATOM");
@@ -527,7 +520,6 @@ inline cif::Block prepareFreshBlock(const cif::Block& block, const vector<cif::B
       if (!tmpl) {
         if (!res) continue;
         for (const Row& a : res->atoms) {
-          if (leaves(a.atom)) continue;
           emit(a.atom, a.element, a.xyz, a.occupancy, a.b, unsetValue(a.charge) ? "0" : a.charge);
         }
         continue;
@@ -546,7 +538,6 @@ inline cif::Block prepareFreshBlock(const cif::Block& block, const vector<cif::B
       }
       const double none[3] = {NAN, NAN, NAN};
       for (const TAtom& t : tmpl->atoms) {
-        if (leaves(t.name)) continue;
         auto it = byName.find(t.name);
         if (it != byName.end()) {
           const Row& a = *it->second;
@@ -557,7 +548,6 @@ inline cif::Block prepareFreshBlock(const cif::Block& block, const vector<cif::B
         }
       }
       for (const Row* a : extra) {
-        if (leaves(a->atom)) continue;
         emit(a->atom, a->element, a->xyz, a->occupancy, a->b, unsetValue(a->charge) ? "0" : a->charge);
       }
     }

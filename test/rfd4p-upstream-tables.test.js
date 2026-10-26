@@ -6,7 +6,8 @@ import { describe, expect, it } from "./harness.js";
 /**
  * shared/rfd4p/pipeline/query-tables.js and ccd-templates.js are GENERATED from atomworks' and
  * biotite's own data - the tables upstream's selection language derives `is_protein_backbone`,
- * `is_tip_atom` and the rest from, and the CCD templates a raw structure is prepared from. Checked
+ * `is_tip_atom` and the rest from, and the CCD templates a raw structure is prepared from - and
+ * valence.js from RDKit, the one atomworks' link chemistry asks. Checked
  * against them where upstream's venv is on the box, skipped where not; tools/check-rfd4p-query.py
  * and tools/check-rfd4p-load.py (cuda/rfd4p/gate.py arms) hold the language and the loader to
  * atomworks itself.
@@ -25,5 +26,12 @@ describe("the tables generated from upstream's own", () => {
     const run = spawnSync(python, [`${repo}tools/gen-rfd4p-ccd-templates.py`, "--check"], { encoding: "utf8" });
     const out = `${run.stdout}${run.stderr}`.split("\n").filter((l) => l.includes("ccd-templates.js")).join("");
     expect(`${run.status} ${out}`.trim()).toBe("0 shared/rfd4p/pipeline/ccd-templates.js is current");
+  });
+  // RDKit's answers to the valence probe link chemistry asks (pipeline/links.js).
+  it.skipIf(!existsSync(python))("the valence table is RDKit's, byte for byte", () => {
+    const repo = new URL("..", import.meta.url).pathname;
+    const run = spawnSync(python, [`${repo}tools/gen-rfd4p-valence.py`, "--check"], { encoding: "utf8" });
+    const out = `${run.stdout}${run.stderr}`.split("\n").filter((l) => l.includes("valence.js")).join("");
+    expect(`${run.status} ${out}`.trim()).toBe("0 shared/rfd4p/pipeline/valence.js is current");
   });
 });

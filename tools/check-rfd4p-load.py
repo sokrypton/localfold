@@ -16,12 +16,15 @@ upstream has none), over the shipped examples and five raw RCSB entries (tools/f
 missing residues, truncated side chains, 603 alternate-location atoms, waters, ions, DNA, a
 modified-residue macrocycle) in both modes, plus every `.cif` in `--structures`.
 
-🔴 ONE DIFFERENCE IS EXPECTED AND ASSERTED, NOT EXCUSED: 5O45's macrocycle closes through a
-non-standard residue (CCS CE - PHE N) whose dictionary entry has no leaving atom for that bond,
-and atomworks' link chemistry (`resolve_link_chemistry`, 1,247 lines of RDKit valence rules)
-lowers the carboxylate's double bond and puts -1 on OZ1 - both of which this checks, bonds being
-compared now as well as atoms. That is not ported; the entry below
-requires EXACTLY that difference, so the day it is ported - or anything else moves - this fails.
+🔴 AND THE AUTHORED LINKS' PRODUCTS: 5O45's macrocycle closes through a non-standard residue
+(CCS CE - PHE N) whose dictionary entry has no leaving atom for that bond, and atomworks' link
+chemistry (`resolve_link_chemistry`) lowers the carboxylate's double bond and puts -1 on OZ1 -
+which this port did not do until links.js, and which only a comparison of bonds as well as atoms
+could see. tools/fixtures/rcsb-links holds ten of upstream's own link examples (the PDB entries
+link_chemistry.py cites: a restored P=O, a lowered C=C, a moved C=O, a neutralised amide, a
+carbonyl addition, an oxo lowered on S, a dropped terminal N, a selenolate, and two products with
+no legal valence that both sides refuse), read raw - and a raw load is held to upstream on the
+native featuriser too (`--unannotated`), the one load that builds link products.
 """
 from __future__ import annotations
 
@@ -40,11 +43,11 @@ EXAMPLES = ["5o45_cropped", "dna_7m5w", "motif_idx_1prw", "motif_unidx_1prw", "p
             "uncond_short"]
 FIELDS = ["chain_id", "res_id", "res_name", "ins_code", "atom_name", "element", "charge", "occupancy"]
 RAW = REPO / "tools" / "fixtures" / "rcsb"
-EXPECTED = {
-    "5o45 fresh": ["charge: 1 of 1171 (first #1162 B/CCS13/OZ1: upstream -1.0, page 0)",
-                   "bonds: 1 only upstream [('B/CCS13/CE', 'B/CCS13/OZ1', 1)], "
-                   "1 only here [('B/CCS13/CE', 'B/CCS13/OZ1', 2)]"],
-}
+NATIVE = REPO / "cuda" / "rfd4p" / "featurise" / "rfd4p-featurise"
+# Upstream's own link examples (the PDB entries link_chemistry.py cites), one per repair the port
+# makes and two it refuses: read raw only, the one load that builds link products.
+LINKS = REPO / "tools" / "fixtures" / "rcsb-links"
+EXPECTED: dict[str, list[str]] = {}
 
 
 def upstream_atoms(path: Path, annotated: bool | str) -> dict:
@@ -108,6 +111,25 @@ process.stdout.write(JSON.stringify(out));
     return json.loads(r.stdout)
 
 
+def native_atoms(path: Path, ccd_file: Path) -> dict:
+    """The native featuriser's load of a RAW structure (`--unannotated`, a job's load), its
+    dictionary entries the same ones the page is handed."""
+    r = subprocess.run([NATIVE, "x", f"--dump-cif={path}", "--unannotated", f"--ccd={ccd_file}"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        return {"raise": r.stderr.strip().splitlines()[-1] if r.stderr.strip() else "refused"}
+    rows = [line.split("\t")[1:] for line in r.stdout.splitlines() if line.startswith("ua\t")]
+    bonds = [[int(x) for x in line.split("\t")[1:]] for line in r.stdout.splitlines() if line.startswith("ub\t")]
+    num = lambda v: None if v in ("nan", "-nan") else round(float(v), 3)
+    return {
+        "res_name": [w[0] for w in rows], "atom_name": [w[1] for w in rows],
+        "coord": [[num(w[2]), num(w[3]), num(w[4])] for w in rows],
+        "chain_id": [w[5] for w in rows], "element": [w[6] for w in rows], "charge": [int(w[7]) for w in rows],
+        "res_id": [int(w[8]) for w in rows], "ins_code": [w[9] for w in rows], "occupancy": [float(w[10]) for w in rows],
+        "bonds": sorted([min(i, j), max(i, j), t] for i, j, t in bonds),
+    }
+
+
 def differences(up: dict, page: dict) -> list[str]:
     if "raise" in up or "raise" in page:
         if "raise" in up and "raise" in page:
@@ -160,6 +182,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--structures", help="a directory of raw .cif files to load in both modes")
     ap.add_argument("--only")
+    ap.add_argument("--no-native", action="store_true", help="the page alone")
     args = ap.parse_args()
     import zstandard
 
@@ -189,21 +212,39 @@ def main() -> int:
             path.write_bytes(zstandard.ZstdDecompressor().decompressobj().decompress(packed.read_bytes()))
             stem = path.name.removesuffix(".bcif")
             cases += [(f"{stem} bcif annotated", path, True), (f"{stem} bcif fresh", path, False)]
+        for packed in sorted(LINKS.glob("*.cif.zst")):
+            path = Path(tmp) / f"link-{packed.name.removesuffix('.zst')}"
+            path.write_bytes(zstandard.ZstdDecompressor().decompressobj().decompress(packed.read_bytes()))
+            cases += [(f"{packed.name.removesuffix('.cif.zst')} link fresh", path, False)]
         if args.structures:
             for path in sorted(Path(args.structures).glob("*.cif")):
                 cases += [(f"{path.stem} annotated", path, True), (f"{path.stem} fresh", path, False)]
         if args.only:
             cases = [c for c in cases if args.only in c[0]]
-        page = page_atoms(cases, ccd_entries(sorted({p for _, p, _ in cases})))
+        ccd = ccd_entries(sorted({p for _, p, _ in cases}))
+        page = page_atoms(cases, ccd)
+        # The native featuriser reads the same entries, as one dictionary file.
+        ccd_file = Path(tmp) / "ccd.cif"
+        ccd_file.write_text("".join(ccd.values()))
+        with_native = NATIVE.exists() and not args.no_native
         bad = 0
         for key, path, annotated in cases:
-            d = differences(upstream_atoms(path, annotated), page[key])
-            expected = EXPECTED.get(key, [])
-            ok = d == expected
-            bad += not ok
-            print(f"  {key:32s} {('exact' if not d else 'the expected difference') if ok else 'DIFFERS'}")
-            for line in d:
-                print(f"      {line}")
+            up = upstream_atoms(path, annotated)
+            sides = {"page": page[key]}
+            # A raw structure's load is the one that builds link products; the native port's
+            # annotated and direct loads are held to the page by gate.py's `cif` arm.
+            if with_native and annotated is False:
+                sides["native"] = native_atoms(path, ccd_file)
+            wrong = {}
+            for side, got in sides.items():
+                d = differences(up, got)
+                if d != EXPECTED.get(key, []):
+                    wrong[side] = d
+            bad += bool(wrong)
+            print(f"  {key:32s} {'exact' if not wrong else 'DIFFERS'}")
+            for side, d in wrong.items():
+                for line in d:
+                    print(f"      {side}: {line}")
     print(f"{len(cases)} loads, {bad} differing")
     return 1 if bad else 0
 

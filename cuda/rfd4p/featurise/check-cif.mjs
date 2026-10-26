@@ -11,7 +11,8 @@
  *     node cuda/rfd4p/featurise/check-cif.mjs
  */
 import { decodeTextOrZstd } from "../../../shared/rfd4p/pipeline/index.js";
-import { parseCifToAtomArray } from "../../../shared/rfd4p/pipeline/cif.js";
+import { parseCifBlock, parseCifToAtomArray } from "../../../shared/rfd4p/pipeline/cif.js";
+import { componentsNeedingCcd } from "../../../shared/rfd4p/pipeline/ccd.js";
 import {
   ensureStereochemistryAnnotations, computeChiralityFeatures,
 } from "../../../shared/rfd4p/pipeline/chirality.js";
@@ -33,7 +34,7 @@ import {
 } from "../../../shared/rfd4p/pipeline/transforms.js";
 import { execFileSync } from "node:child_process";
 import { readFileSync, readdirSync, writeFileSync, mkdtempSync, existsSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
 const repo = new URL("../../../", import.meta.url).pathname;
@@ -1489,20 +1490,29 @@ for (const [name, text] of cases) {
   // RAW structure - its conditions discarded, and PREPARED as upstream prepares one (fresh.js):
   // conformers chosen, missing atoms added, waters gone, arginines re-labelled by distance from
   // CD. An annotated file's expandable-segment sentinels are refused there, by both.
+  // Both loads need the dictionary entries of the components the templates lack (link chemistry
+  // reads their leaving groups): the native one fetches them into the shared cache, and the page
+  // is handed the same files from it, as it would fetch them.
   let unannotated = null;
+  const rawCcd = () => {
+    const dir = process.env.LOCALFOLD_CCD_DIR ?? `${homedir()}/.cache/localfold/ccd`;
+    const names = parseCifToAtomArray(text).res_name;
+    return new Map(componentsNeedingCcd(names).filter((id) => existsSync(`${dir}/${id}.cif`))
+      .map((id) => [id, parseCifBlock(readFileSync(`${dir}/${id}.cif`, "utf8"))]));
+  };
   try {
     unannotated = execFileSync(binary, ["x", `--dump-cif=${path}`, "--unannotated"],
       { encoding: "utf8", maxBuffer: 1 << 28, stdio: "pipe" }).split("\n");
   } catch (err) {
     let pageRefused = false;
-    try { loadConditionSpecInput(text, { asAnnotatedCif: false }); } catch { pageRefused = true; }
+    try { loadConditionSpecInput(text, { asAnnotatedCif: false, ccdBlocks: rawCcd() }); } catch { pageRefused = true; }
     if (!pageRefused) wrong.push(`unannotated refused: ${String(err.stderr ?? err.message).trim().split("\n")[0]}`);
   }
   if (unannotated) {
     const got = unannotated;
     const head = (got.find((l) => l.startsWith("unann\t")) ?? "").split("\t").slice(1).map(Number);
     let ref = null;
-    try { ref = loadConditionSpecInput(text, { asAnnotatedCif: false }); } catch (err) {
+    try { ref = loadConditionSpecInput(text, { asAnnotatedCif: false, ccdBlocks: rawCcd() }); } catch (err) {
       wrong.push(`unannotated loads natively where the page refuses: ${err.message}`);
     }
     const rows = got.filter((l) => l.startsWith("ua\t")).map((l) => l.split("\t").slice(1));

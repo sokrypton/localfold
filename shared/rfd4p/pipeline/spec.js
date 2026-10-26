@@ -1684,7 +1684,7 @@ export function loadConditionSpecInput(input, { asAnnotatedCif = false, ccdBlock
     atoms = parseCifToAtomArray(input, { ccdBlocks });
   } else {
     const block = prepareFreshBlock(readStructureBlock(input).block, { ccdBlocks });
-    atoms = parseCifToAtomArray(null, { block, fixArginines: true, ccdBlocks });
+    atoms = parseCifToAtomArray(null, { block, fixArginines: true, ccdBlocks, sanitize: true });
     atoms.annotations = {};
   }
   computeIdAndEntityAnnotations(atoms);
@@ -1830,7 +1830,7 @@ export function buildAtomArrayFromConditionSpec(specOrText, opts = {}) {
   }
 
   // `parse_atom_array(..., _FINALIZE_PREPARE_CONFIG)` re-prepares the built structure.
-  addPolymerBonds(atomArray);
+  addPolymerBonds(atomArray, { ccdBlocks: opts.ccdBlocks });
   computeIdAndEntityAnnotations(atomArray);
   return atomArray;
 }

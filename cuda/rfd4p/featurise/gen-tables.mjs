@@ -422,20 +422,42 @@ w("// BSD notices). `selection.h` reads these and nothing typed.");
 w("");
 w("// 🔴 THE CCD TEMPLATES A RAW STRUCTURE IS PREPARED FROM (fresh.h), through");
 w("// shared/rfd4p/pipeline/ccd-templates.js: the standard residues, their unknowns, MSE and the");
-w("// single-atom components, each atom [name, alternate name, element, charge, leaving, aromatic].");
+w("// single-atom components, each atom [name, alternate name, element, charge, leaving, aromatic] -");
+w("// hydrogens included, which link chemistry counts - and its bonds as [atom, atom, biotite type].");
 {
   const { CCD_TEMPLATES, WATER_LIKE_CCDS } = await import("../../../shared/rfd4p/pipeline/ccd-templates.js");
   const { CRYSTALLIZATION_AIDS } = await import("../../../shared/rfd4p/pipeline/fresh.js");
   w("struct CcdAtom { const char* name; const char* alt; const char* element; int charge; bool leaving; bool aromatic; };");
-  w("struct CcdTemplate { const char* type; std::vector<CcdAtom> atoms; };");
+  w("struct CcdTemplate { const char* type; std::vector<CcdAtom> atoms; std::vector<std::array<int, 3>> bonds; };");
   w("inline const std::unordered_map<std::string, CcdTemplate> CCD_TEMPLATES = {");
   for (const [code, t] of Object.entries(CCD_TEMPLATES)) {
     const atoms = t.atoms.map(([n, a, e, c, l, r]) => `{${str(n)}, ${str(a)}, ${str(e)}, ${c}, ${l ? "true" : "false"}, ${r ? "true" : "false"}}`);
-    w(`    {${str(code)}, {${str(t.type)}, {${atoms.join(", ")}}}},`);
+    const bonds = t.bonds.map(([i, j, b]) => `{${i}, ${j}, ${b}}`);
+    w(`    {${str(code)}, {${str(t.type)}, {${atoms.join(", ")}}, {${bonds.join(", ")}}}},`);
   }
   w("};");
   w(`inline const std::vector<std::string> WATER_LIKE_CCDS = {${WATER_LIKE_CCDS.map(str).join(", ")}};`);
   w(`inline const std::vector<std::string> CRYSTALLIZATION_AIDS = {${CRYSTALLIZATION_AIDS.map(str).join(", ")}};`);
+}
+w("");
+w("// 🔴 RDKit'S ANSWER TO atomworks' VALENCE PROBE (`_is_valid_rdkit_valence`), through");
+w("// shared/rfd4p/pipeline/valence.js: per element, per charge -4..4, a bit per valence 0..16 RDKit");
+w("// accepts, and `GetDefaultValence` (-1 where RDKit gives none). links.h reads it.");
+{
+  const { RDKIT_VALENCE, RDKIT_DEFAULT_VALENCE } = await import("../../../shared/rfd4p/pipeline/valence.js");
+  w("inline const std::unordered_map<std::string, std::array<uint32_t, 9>> RDKIT_VALENCE = {");
+  for (const [el, per] of Object.entries(RDKIT_VALENCE)) {
+    const masks = [];
+    for (let c = -4; c <= 4; c++) {
+      const ok = per[String(c)];
+      masks.push(ok === "any" ? 0x1ffff : Array.isArray(ok) ? ok.reduce((m, v) => m | (1 << v), 0) : 0);
+    }
+    w(`    {${str(el)}, {${masks.map((m) => `0x${m.toString(16)}u`).join(", ")}}},`);
+  }
+  w("};");
+  w("inline const std::unordered_map<std::string, int> RDKIT_DEFAULT_VALENCE = {");
+  for (const [el, v] of Object.entries(RDKIT_DEFAULT_VALENCE)) w(`    {${str(el)}, ${v}},`);
+  w("};");
 }
 w("}  // namespace tables");
 w("}  // namespace rfd4p");

@@ -1415,13 +1415,19 @@ int run(int argc, char** argv) {
     if (unannotated) {
       // `--unannotated` is the load a JOB does: `input_as_annotated_cif` defaults to false, so
       // the file's own conditions are discarded and the arginines are re-labelled.
-      const rfd4p::atoms::AtomArray src = rfd4p::atoms::fromCif(text, false);
+      // Its dictionary entries as a job's (`--ccd=`, else RCSB), and the chemistry the link
+      // products change - charge, element and every bond - beside each atom.
+      const rfd4p::atoms::AtomArray src =
+          rfd4p::atoms::fromCif(text, false, rfd4p::fresh::ccdBlocksForRawStructure(text, ccdFile));
       printf("unann\t%zu\t%zu\t%zu\t%zu\n", src.n(), src.ann.ints.size(),
              src.ann.floats.size(), src.ann.strings.size());
       for (size_t i = 0; i < src.n(); ++i) {
-        printf("ua\t%s\t%s\t%.17g\t%.17g\t%.17g\n", src.site.resName[i].c_str(),
-               src.site.atomName[i].c_str(), src.site.x[i], src.site.y[i], src.site.z[i]);
+        printf("ua\t%s\t%s\t%.17g\t%.17g\t%.17g\t%s\t%s\t%d\t%d\t%s\t%.17g\n", src.site.resName[i].c_str(),
+               src.site.atomName[i].c_str(), src.site.x[i], src.site.y[i], src.site.z[i],
+               src.site.chainId[i].c_str(), src.site.element[i].c_str(), src.site.charge[i], src.site.resId[i],
+               src.site.insCode[i].c_str(), src.site.occupancy[i]);
       }
+      for (const rfd4p::cif::Bond& b : src.bonds) printf("ub\t%d\t%d\t%d\n", b.u, b.v, b.type);
       return 0;
     }
     if (!selectStr.empty()) {
@@ -2135,6 +2141,8 @@ int run(int argc, char** argv) {
   Batch b;
   {
     rfd4p::atoms::AtomArray src;
+    // Every fetched dictionary entry the inputs needed, which `addPolymerBonds` reads again.
+    vector<rfd4p::cif::Block> allCcd;
     if (!inputPaths.empty()) {
       // `specMode: false` is the structure as the job: annotations KEPT, contig and conditions
       // IGNORED - which is how a page preset runs, its contig being written in the original
@@ -2154,6 +2162,7 @@ int run(int argc, char** argv) {
         const vector<rfd4p::cif::Block> ccdBlocks =
             annotated ? vector<rfd4p::cif::Block>{} : rfd4p::fresh::ccdBlocksForRawStructure(cifText, ccdFile);
         parts.push_back(rfd4p::atoms::fromCif(cifText, annotated, ccdBlocks));
+        allCcd.insert(allCcd.end(), ccdBlocks.begin(), ccdBlocks.end());
         // A structure that IS the job is upstream's direct path: its biological assembly 1.
         if (!specMode) parts.back() = rfd4p::atoms::biologicalAssemblyOne(parts.back(), rfd4p::bcif::parseStructure(cifText));
       }
@@ -2213,7 +2222,7 @@ int run(int argc, char** argv) {
       }
       // `parse_atom_array(..., _FINALIZE_PREPARE_CONFIG)`: the built structure re-prepared, so a
       // contig that joins two preserved segments bonds them (spec.js `addPolymerBonds`).
-      rfd4p::atoms::addPolymerBonds(src);
+      rfd4p::atoms::addPolymerBonds(src, allCcd);
       src.ids = rfd4p::cif::computeIds(src.site, src.bonds);
     }
     // 🔴 ONE GENERATOR FOR THE WHOLE PIPELINE, SEEDED FROM THE JOB. Neither the contig nor the

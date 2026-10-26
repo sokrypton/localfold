@@ -21,6 +21,7 @@
 #include <string>
 #include <vector>
 #include "tables.inc"
+#include "links.h"
 
 namespace rfd4p {
 namespace cif {
@@ -692,8 +693,15 @@ struct Bond {
  * of one chain, where neither site already reaches the other residue (an authored link, either
  * way round) and the numbering jumps by no MORE than one - 52 to 52A is bonded.
  */
-inline vector<std::pair<int, int>> polymerBondsToAdd(const AtomSite& a, const vector<Bond>& bonds,
-                                                     const vector<int>& starts, const vector<int>& atomToRes) {
+template <class Dict>
+vector<std::pair<int, int>> polymerBondsToAdd(const AtomSite& a, const vector<Bond>& bonds, const vector<int>& starts,
+                                              const vector<int>& atomToRes, Dict& dict) {
+  // `_validate_inferred_polymer_bond` reads the degree before any backbone bond is added.
+  vector<double> degree(a.n, 0.0);
+  for (const Bond& b : bonds) {
+    degree[b.u] += links::degreeWeight(b.type);
+    degree[b.v] += links::degreeWeight(b.type);
+  }
   std::map<int, vector<int>> neighbours;
   for (const Bond& b : bonds) {
     if (b.type == tables::BT_COORDINATION) continue;
@@ -729,35 +737,58 @@ inline vector<std::pair<int, int>> polymerBondsToAdd(const AtomSite& a, const ve
         continue;
       }
     }
+    links::validateInferredPolymerBond(a, idxOut, idxIn, degree, [&](int i) {
+      const auto it = neighbours.find(i);
+      if (it == neighbours.end()) return false;
+      for (const int x : it->second) if (links::isHydrogen(a.element[x])) return true;
+      return false;
+    }, dict);
     out.push_back({idxOut, idxIn});
   }
   return out;
 }
 
-/**
- * `buildBondsForAtomArray`: the declared links, then each residue's own, then the polymer
- * backbone, then a retype of everything incident on a metal.
- *
- * 🔴 THE ORDER OF THE RESULT IS INSERTION ORDER, NOT SORTED. The reference accumulates into a
- * JavaScript `Map`, which preserves it, and the bond LIST is what later stages index - so a
- * `std::map` here would reorder every bond and move every index that names one.
- *
- * 🔴 AND A FIRST BOND FOR A PAIR WINS. `addBond` only inserts where the key is absent, so a
- * `_struct_conn` covalent link is NOT overwritten by the residue dictionary's idea of the same
- * pair - which is the whole point of reading `struct_conn` first.
- */
-inline vector<Bond> buildBonds(const AtomSite& a, const Block& block) {
-  vector<Bond> bonds;
-  std::map<long long, size_t> seen;
-  const int n = (int)a.n;
-  auto addBond = [&](int u, int v, int type) {
-    if (u == v || u < 0 || v < 0 || u >= n || v >= n) return;
-    const int lo = std::min(u, v), hi = std::max(u, v);
-    const long long key = (long long)lo * n + hi;
-    if (seen.count(key)) return;
-    seen[key] = bonds.size();
-    bonds.push_back({lo, hi, type});
+/** The link dictionary over this reader's blocks (links.js `linkDictionary`). */
+inline links::Dictionary<Block> linkDictionary(const vector<Block>* ccdBlocks) {
+  links::Dictionary<Block> d;
+  d.ccdBlocks = ccdBlocks;
+  d.polymerizationAtoms = polymerizationAtoms;
+  return d;
+}
+
+/** The site without the atoms `keep` is false for (cif.js `keepAtoms`). */
+inline void keepSite(AtomSite& a, const vector<bool>& keep) {
+  auto pick = [&](auto& v) {
+    if (v.size() != a.n) return;
+    size_t k = 0;
+    for (size_t i = 0; i < a.n; ++i) if (keep[i]) v[k++] = v[i];
+    v.resize(k);
   };
+  pick(a.element); pick(a.atomName); pick(a.resName); pick(a.chainId); pick(a.insCode); pick(a.labelAltId);
+  pick(a.labelEntityId); pick(a.resId); pick(a.authSeqId); pick(a.atomId); pick(a.charge);
+  pick(a.x); pick(a.y); pick(a.z); pick(a.bFactor); pick(a.occupancy); pick(a.hetero);
+  pick(a.selected); pick(a.atomicNumber); pick(a.chainType); pick(a.isPolymer); pick(a.isAromatic);
+  pick(a.isLeavingAtom); pick(a.chemCompType);
+  for (auto& [name, v] : a.extra) pick(v);
+  size_t k = 0;
+  for (size_t i = 0; i < a.n; ++i) k += keep[i] ? 1 : 0;
+  a.n = k;
+}
+
+/**
+ * `buildBondsForAtomArray` (cif.js): atomworks' `_add_bonds`, in its order. With `sanitize` (a raw
+ * structure being prepared) the authored links' products are built (links.h) and the hydrogens
+ * that held them dropped - from `a` itself, which is why it is not const.
+ *
+ * 🔴 THE BONDS ARE IN biotite's ROW ORDER, because link chemistry takes the first match in several
+ * places and later stages index the list: `merge` puts the INCOMING list first, so the backbone
+ * bonds come first, then each residue's dictionary bonds, then the `struct_conn` links they do not
+ * repeat - where a link repeats a residue's own bond, the dictionary's type wins.
+ */
+inline vector<Bond> buildBonds(AtomSite& a, const Block& block, const vector<Block>* ccdBlocks = nullptr,
+                               bool sanitize = false) {
+  const int n = (int)a.n;
+  links::Dictionary<Block> dict = linkDictionary(ccdBlocks);
   auto table = [&](const char* cat, const char* col) -> const vector<string>* {
     auto c = block.find(cat);
     if (c == block.end()) return nullptr;
@@ -765,10 +796,13 @@ inline vector<Bond> buildBonds(const AtomSite& a, const Block& block) {
     return it == c->second.end() ? nullptr : &it->second;
   };
 
-  // The residue dictionary: the built-in tables, overlaid by the file's own `_chem_comp_bond`.
+  // Each residue's bonds: the dictionary's (hydrogens too), overlaid by the file's `_chem_comp_bond`.
   std::map<string, std::map<string, int>> resBonds;
-  for (const auto& [res, pairs] : tables::STD_RESIDUE_BONDS) {
-    for (const auto& [key, bt] : pairs) resBonds[res][key] = bt;
+  for (const auto& [res, t] : tables::CCD_TEMPLATES) {
+    for (const auto& b : t.bonds) {
+      const string x = t.atoms[b[0]].name, y = t.atoms[b[1]].name;
+      resBonds[res][x < y ? x + ":" + y : y + ":" + x] = b[2];
+    }
   }
   if (const vector<string>* comps = table("chem_comp_bond", "comp_id")) {
     const vector<string>* a1s = table("chem_comp_bond", "atom_id_1");
@@ -794,7 +828,9 @@ inline vector<Bond> buildBonds(const AtomSite& a, const Block& block) {
     for (int i = starts[r]; i < starts[r + 1]; ++i) atomToRes[i] = (int)r;
   }
 
-  // 1. `_struct_conn`: the covalent links the file declares, at the identity symmetry only.
+  // 1. `_struct_conn`: covalent links and metal coordination at the identity symmetry, an unset
+  // order inferred from the two reactants (`infer_link_order`).
+  vector<Bond> linkRows;
   if (const vector<string>* types = table("struct_conn", "conn_type_id")) {
     for (size_t row = 0; row < types->size(); ++row) {
       // `add_bond_types_from_struct_conn=("covale", "metalc")` in both upstream presets.
@@ -825,17 +861,27 @@ inline vector<Bond> buildBonds(const AtomSite& a, const Block& block) {
         }
       }
       if (found[0] >= 0 && found[1] >= 0 && found[0] != found[1]) {
-        const vector<string>* ord = table("struct_conn", "pdbx_value_order");
-        string o = ord && row < ord->size() && !(*ord)[row].empty() ? (*ord)[row] : "sing";
-        for (char& ch : o) ch = (char)tolower((unsigned char)ch);
-        auto it = tables::STRUCT_CONN_ORDER_TO_TYPE.find(o);
-        addBond(found[0], found[1],
-                it == tables::STRUCT_CONN_ORDER_TO_TYPE.end() ? tables::BT_SINGLE : it->second);
+        int bt;
+        if ((*types)[row] == "metalc") bt = tables::BT_COORDINATION;
+        else {
+          // The order as written: upstream matches the mmCIF vocabulary exactly (lower case).
+          const vector<string>* ord = table("struct_conn", "pdbx_value_order");
+          const string o = ord && row < ord->size() ? (*ord)[row] : string("?");
+          auto it = tables::STRUCT_CONN_ORDER_TO_TYPE.find(o);
+          if (it != tables::STRUCT_CONN_ORDER_TO_TYPE.end()) bt = it->second;
+          else if (o == "?" || o == "." || o.empty()) bt = links::inferLinkOrder(a, found[0], found[1], dict, !sanitize);
+          else links::refuse("Unsupported struct_conn bond order: '" + o + "'");
+        }
+        // Chemical preparation needs concrete orders.
+        if (sanitize && bt == tables::BT_ANY) bt = tables::BT_SINGLE;
+        linkRows.push_back({std::min(found[0], found[1]), std::max(found[0], found[1]), bt});
       }
     }
   }
 
-  // 2. Each residue's own bonds, from the dictionary.
+  // 2. Each residue's own bonds, from the dictionary, merged over the links.
+  vector<Bond> residueRows;
+  std::set<long long> residuePairs;
   for (size_t r = 0; r + 1 < starts.size(); ++r) {
     const int s = starts[r], e = starts[r + 1];
     auto m = resBonds.find(a.resName[s]);
@@ -845,15 +891,44 @@ inline vector<Bond> buildBonds(const AtomSite& a, const Block& block) {
         const string& x = a.atomName[i];
         const string& y = a.atomName[j];
         auto bt = m->second.find(x < y ? x + ":" + y : y + ":" + x);
-        if (bt != m->second.end()) addBond(i, j, bt->second);
+        if (bt == m->second.end()) continue;
+        residueRows.push_back({i, j, bt->second});
+        residuePairs.insert((long long)i * n + j);
       }
     }
   }
+  links::BondRows merged(n);
+  for (const Bond& b : residueRows) merged.add(b.u, b.v, b.type);
+  for (const Bond& b : linkRows) if (!residuePairs.count((long long)b.u * n + b.v)) merged.add(b.u, b.v, b.type);
+  vector<Bond> current;
+  for (const auto& r : merged.list()) current.push_back({r.i, r.j, r.t});
 
-  // 3. The polymer backbone (`polymerBondsToAdd`).
-  for (const auto& [u, v] : polymerBondsToAdd(a, bonds, starts, atomToRes)) addBond(u, v, tables::BT_SINGLE);
+  // 3. `add_polymer_bonds`, merged in front.
+  links::BondRows rows(n);
+  for (const auto& [u, v] : polymerBondsToAdd(a, current, starts, atomToRes, dict)) rows.add(u, v, tables::BT_SINGLE);
+  for (const Bond& b : current) rows.add(b.u, b.v, b.type);
+  vector<Bond> bonds;
+  for (const auto& r : rows.list()) bonds.push_back({r.i, r.j, r.t});
 
-  // 4. Anything touching a metal is a COORDINATION bond, whatever it was.
+  // 4. The authored links' products (`resolve_link_chemistry`), then the hydrogens go.
+  if (sanitize) {
+    vector<std::array<int, 3>> in;
+    for (const Bond& b : bonds) in.push_back({b.u, b.v, b.type});
+    const links::Product product = links::resolveLinkChemistry(a, dict, in);
+    a.charge = product.charge;
+    vector<bool> keep(a.n);
+    for (size_t i = 0; i < a.n; ++i) keep[i] = product.alive[i] && !links::isHydrogen(a.element[i]);
+    vector<int> index(a.n, -1);
+    int k = 0;
+    for (size_t i = 0; i < a.n; ++i) if (keep[i]) index[i] = k++;
+    bonds.clear();
+    for (const auto& b : product.bonds) {
+      if (keep[b[0]] && keep[b[1]]) bonds.push_back({index[b[0]], index[b[1]], b[2]});
+    }
+    keepSite(a, keep);
+  }
+
+  // 5. Anything touching a metal is a COORDINATION bond, whatever it was.
   for (Bond& b : bonds) {
     string eu = a.element[b.u], ev = a.element[b.v];
     for (char& ch : eu) ch = (char)toupper((unsigned char)ch);

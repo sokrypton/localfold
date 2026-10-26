@@ -546,8 +546,8 @@ so `add_polymer_bonds` runs again over the renumbered contig and two segments pl
 ARE bonded; both ports bonded only at load. They run it after the contig now (`addPolymerBonds`), and
 with upstream's own rule - skip a jump of MORE than one, so 52 to 52A (an insertion code) is bonded
 where `== 1` skipped it, and skip a pair an authored link already joins either way round.
-`tools/check-rfd4p-load.py` compares the loaded BONDS with atomworks' now, not only the atoms: 29
-loads exact but 5O45's link chemistry, which shows there as the carboxylate's bond order too.
+`tools/check-rfd4p-load.py` compares the loaded BONDS with atomworks' now, not only the atoms - which
+is what showed 5O45's link chemistry as the carboxylate's bond order too (ported since, below).
 
 `tools/check-rfd4p-invariants.py` (`upstream i`) runs each job through upstream's pipeline, the
 page's and the native featuriser and requires the same verdict - built, or refused for the same
@@ -582,6 +582,42 @@ example and fixture: 12 direct loads exact, bonds included. A file without the c
 own assembly 1, as upstream's identity assembly makes it. Refused, by name: an assembly that makes
 several copies of a chain, or places one by an operator other than "1" - every id here is the
 asymmetric unit's (`<chain>_1`), and two copies of chain A would be one chain to all of them.
+
+## An authored link is a product, built and checked
+
+Preparing a raw structure, upstream runs atomworks' link chemistry (`resolve_link_chemistry`,
+`add_missing_atoms` only - an annotated CIF is read as written): each inter-residue bond turns two
+dictionary reactants into one product. The leaving groups it displaces go (`OXT` and `HXT` at a
+peptide bond, an `OP3` at a phosphodiester, and the hydrogens either takes with it), a bond order a
+leaving group took is restored on a sibling, an overvalent atom is repaired, the charges the product
+implies are set and every affected atom must then have a valence RDKit accepts - or the structure is
+refused. 🔴 **NEITHER PORT DID ANY OF IT.** 5O45's macrocycle closes through CCS CE, whose
+dictionary entry has no leaving atom there, so upstream turns its C=O into C-O(-) - the one
+asserted difference `check-rfd4p-load.py` carried. Against the PDB entries `link_chemistry.py`
+itself cites the gap was fourteen of sixteen: TAF's P=O moved onto OP1 (1DPN), a thymine dimer's
+C5=C6 lowered (1N4E), a linked glutamate's C=O moved to its sibling (1PPV), a lysine amide
+neutralised (1QFE), a missing terminal amide N removed (6N0A), a selenolate charged (7ZCY) - and
+four products upstream refuses for want of a legal valence (1CUL, 1U9X, 2ZZ6, 8QIA) and one whose
+partner the dictionary lacks (8CUY's UNL), all of which both ports loaded as untouched reactants.
+
+`shared/rfd4p/pipeline/links.js` and `featurise/links.h` port it function for function. What it
+needs that neither port had: the hydrogens - upstream holds every dictionary hydrogen at this point
+(`hydrogen_policy="keep"`), so the prepared structure now carries them through the bonds and drops
+them after; the CCD templates with hydrogens and BONDS (`tools/gen-rfd4p-ccd-templates.py`, through
+atomworks' own `atom_array_from_ccd_code`), from which the leaving groups are derived as upstream
+derives them, by topology; an unset `struct_conn` order INFERRED (`infer_link_order`) rather than
+read as single; `add_polymer_bonds`' capacity check; and RDKit's valence probe, which is three small
+integers and so a table (`tools/gen-rfd4p-valence.py`, RDKit's own answers) rather than a port of
+RDKit. 🔴 **AND THE BOND LIST IS IN biotite's ROW ORDER NOW**, because link chemistry takes the first
+match in several places: `merge` puts the incoming list first, so the backbone bonds lead, then each
+residue's dictionary bonds, then the `struct_conn` links they do not repeat - where a link repeats a
+residue's own bond the dictionary's type wins, where both ports let the link's win.
+
+`tools/fixtures/rcsb-links` carries ten of those entries, one per repair and two refusals, and
+`check-rfd4p-load.py` reads them raw and holds the page AND the native featuriser
+(`--unannotated`, which now prints charges and bonds) to atomworks: 51 loads, 0 differing, the
+refusals word for word. With link chemistry switched off on the page, 21 of its 25 raw loads go red -
+the plain proteins too, because their `OXT` now leaves with the peptide bond rather than by a rule.
 
 ## Every preset generates
 
@@ -738,9 +774,8 @@ pinned checkpoint revision) found, and this round fixed:
   completing non-standard components from dictionary entries fetched as the page fetches them
   (`--ccd=` reads a local CCD instead). `tools/check-rfd4p-load.py` (a `gate.py` arm) holds the
   load to atomworks atom for atom over the shipped examples and five deposited entries in both
-  modes - **24 loads, all exact but one asserted difference** (5O45's macrocycle closes through a
-  residue whose link chemistry atomworks resolves with 1,247 lines of RDKit valence rules, moving
-  one formal charge; not ported) - and the whole batch of five raw-input jobs matches upstream's
+  modes - **24 loads, all exact but one asserted difference** (5O45's link chemistry, ported since:
+  see "An authored link is a product, built and checked") - and the whole batch of five raw-input jobs matches upstream's
   `dump_batch_cpu.py` exactly. The annotated reader moved to upstream's rules too: the
   alternate-location LETTER first in each chain (not each atom's first row), no insertion codes
   from a CIF, no charge guessed from a table, `metalc` bonds kept, an unset `_chem_comp_atom` flag
