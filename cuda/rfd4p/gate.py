@@ -623,6 +623,14 @@ def main() -> int:
             # both round (in/seq, g/coordGroup, g/mSeqProb differed) until it kept the order.
             order = HERE / "featurise" / "gate-order.json"
             cases.append(("order", [f"--spec={order}"], [f"--spec={order}"]))
+            # 🔴 AND THE CONDITIONS AtomWorks Studio's editor offers that no preset sets - metal
+            # coordination over raw 1PRW's calcium ions, RASA, salt bridge, H-bond, pi-stack,
+            # pi-cation, hydrophobic, a chain centroid, CATH on a structure, index groups and the
+            # terminus flags. tools/check-rfd4p-batch.py (`upstream b`) holds the page's batch to
+            # upstream's on the same three jobs.
+            for tag in ("conditions", "conditions-termini", "conditions-interactions"):
+                spec = HERE / "featurise" / f"gate-{tag}.json"
+                cases.append((tag, [f"--spec={spec}"], [f"--spec={spec}"]))
             # 🔴 AND THE GENERATION DIRECTORY, NOT ONLY THE TRUNK'S INPUT. `--generate` writes the
             # per-step conditioning, the emit masks, the recycle depths and the NOISE - which the
             # C++ now draws rather than replays, so Box-Muller is compared here too. Without this
@@ -1189,6 +1197,19 @@ def main() -> int:
                 print(f"  {'upstream i':10s} {m.group(1) if m else '?'} jobs' verdicts against upstream "
                       f"({m.group(2) if m else '?'} refused), {m.group(3) if m else '?'} differing  "
                       f"{'ok ' if ok else 'DIFFERS'}")
+
+            # 🔴 AND THE BATCH ITSELF, AGAINST UPSTREAM'S PIPELINE, on the jobs that set the
+            # conditions no preset does (featurise/gate-conditions*.json): every tensor the model
+            # reads, integers exactly. The featurise arm holds the native batch to the page's.
+            if venv.exists() and (Path.home() / "RFD4-Proteina").exists():
+                r = run([venv, REPO / "tools" / "check-rfd4p-batch.py"], cwd=REPO)
+                m = re.search(r"(\d+) jobs against upstream's batch, (\d+) differing", r.stdout)
+                ok = r.returncode == 0 and m is not None
+                if not ok:
+                    failed += 1
+                    print(r.stdout[-1500:], r.stderr[-600:])
+                print(f"  {'upstream b':10s} {m.group(1) if m else '?'} condition jobs' batches against "
+                      f"upstream's, {m.group(2) if m else '?'} differing  {'ok ' if ok else 'DIFFERS'}")
 
             # 🔴 AND THE REFOLDING ORACLE, AGAINST UPSTREAM'S OWN (src/oracle.h): each
             # `featurise/gate-oracle-*.json` designed and refolded with our own AF3, then the AF3

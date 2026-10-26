@@ -1,0 +1,16 @@
+{"input": "../../../tools/fixtures/rcsb/1prw.cif.zst",
+ "contig": "5-10, A16-35, 8-12, A52-71, 5-10, /0, B377, /0, C378",
+ "conditions": {
+   "C_CRD": {"true": [{"select": "sel('A/*/[16-35,52-71]') or sel('B') or sel('C')"}]},
+   "C_SEQ": {"true": [{"select": "sel('A/*/[16-35,52-71]')"}]},
+   "C_MCOORD": {"METAL": [{"select": "sel('B') or sel('C')"}],
+                "COORDINATING": [{"select": "sel('A/*/[21,23,25,27,32]/[OD1,OD2,OE1,OE2,O]')"},
+                                 {"select": "sel('A/*/[57,59,61,63,68]/[OD1,OD2,OE1,OE2,O]')"}]},
+   "C_RAS": {"BURIED": [{"select": "sel('A/*/[18-20]')"}], "EXPOSED": [{"select": "sel('A/*/[30-33]')"}]},
+   "C_SALT": {"POSITIVE": [{"select": "sel('A/LYS/*/NZ')"}], "NEGATIVE": [{"select": "sel('A/GLU/*/[OE1,OE2]')"}]},
+   "C_NTR": {"true": [{"select": "sel('A/*/16')"}]},
+   "C_CTR": {"true": [{"select": "sel('A/*/71')"}]},
+   "C_IDX": {"false": [{"select": "sel('A/*/[16-35]')", "group": "loop1"},
+                       {"select": "sel('A/*/[52-71]')", "group": "loop2"}]}
+ },
+ "nsteps": 4}

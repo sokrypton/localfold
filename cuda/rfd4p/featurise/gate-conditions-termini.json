@@ -1,0 +1,11 @@
+{"input": "../../../tools/fixtures/rcsb/1prw.cif.zst",
+ "contig": "A10-40, 6-9, A50-75, /0, B377",
+ "conditions": {
+   "C_CRD": {"true": [{"select": "sel('A/*/[10-40,50-75]') or sel('B')"}]},
+   "C_SEQ": {"true": [{"select": "sel('A/*/[10-40]')"}]},
+   "C_NTR": {"true": [{"select": "sel('A/*/10')"}]},
+   "C_CTR": {"true": [{"select": "sel('A/*/75')"}]},
+   "C_MCOORD": {"METAL": [{"select": "sel('B')"}],
+                "COORDINATING": [{"select": "sel('A/*/[21,23,25,27,32]/[OD1,OD2,OE1,OE2,O]')"}]}
+ },
+ "nsteps": 4}

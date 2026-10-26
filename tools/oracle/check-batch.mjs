@@ -8,6 +8,8 @@
  * Usage:
  *   node tools/oracle/check-batch.mjs            # runs all 6 benchmark CIF cases + binder_spec
  *   node tools/oracle/check-batch.mjs sm_sam     # runs a single case
+ *   node tools/oracle/check-batch.mjs --cpu-dir=<dir> <case>   # a batch-only dump written elsewhere
+ *                                                              # (tools/check-rfd4p-batch.py)
  */
 
 import { existsSync, readFileSync } from 'node:fs';
@@ -26,7 +28,8 @@ import { compare, loadOracle, readSafetensors, releasedWeightsPath } from './ora
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = resolve(__dirname, '../..');
 const ORACLE_DIR = join(ROOT_DIR, 'oracle-dumps');
-const ORACLE_CPU_DIR = join(ORACLE_DIR, 'cpu');
+const CPU_DIR_ARG = process.argv.find((a) => a.startsWith('--cpu-dir='));
+const ORACLE_CPU_DIR = CPU_DIR_ARG ? resolve(CPU_DIR_ARG.slice('--cpu-dir='.length)) : join(ORACLE_DIR, 'cpu');
 const RFD4_REPO_DIR = '/home/ubuntu/RFD4-Proteina';
 
 const ALL_CASES = [
@@ -267,7 +270,7 @@ function checkDownstreamFeatures(jsBatch, n, tensors, meta, cfg, weights) {
 }
 
 async function main() {
-  const arg = process.argv[2];
+  const arg = process.argv.slice(2).find((a) => !a.startsWith('--'));
   const casesToRun = !arg || arg === 'all' ? ALL_CASES : [arg];
 
   let cfg = null;
@@ -305,6 +308,7 @@ async function main() {
         chainPerm,
         moleculePerm,
         oracleBatch: wantCpuBatch,
+        segmentLengths: cpuMeta.seg_lengths ?? undefined,
         pathLengthCutoff: cpuMeta.path_length_search_cutoff ?? 64,
       });
 

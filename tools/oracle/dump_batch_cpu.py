@@ -61,10 +61,10 @@ def _ccd_for(inputs: str) -> dict:
                 continue
             for p in ([ex["input"]] if isinstance(ex["input"], str) else ex["input"]):
                 q = Path(p) if Path(p).is_absolute() else path.parent / p
-                if q.suffix == ".cif" and q.exists():
+                if q.name.endswith((".cif", ".cif.zst")) and q.exists():
                     files.append(q)
         return ccd_entries(files)
-    return ccd_entries([path]) if path.suffix == ".cif" and path.exists() else {}
+    return ccd_entries([path]) if path.name.endswith((".cif", ".cif.zst")) and path.exists() else {}
 
 
 def main() -> None:
@@ -133,6 +133,9 @@ def main() -> None:
         "inputs": args.inputs,
         "seed": args.seed,
         "path_length_search_cutoff": args.cutoff,
+        # the realized lengths when they were given, which a checker hands the page as they are:
+        # inferring them from the batch reads tokens in order, and an unindexed motif moves its own
+        "seg_lengths": [int(x) for x in args.seg_lengths.split(",")] if args.seg_lengths else None,
         "n_perms": len(perms),
         "batch_nontensor_keys": sorted(k for k, v in batch.items() if not isinstance(v, torch.Tensor)),
         "tensor_index": {k: {"shape": list(v.shape), "dtype": str(v.dtype)} for k, v in tensors.items()},

@@ -27,7 +27,11 @@ def ccd_entries(paths: list[Path]) -> dict[str, str]:
     names = set()
     for path in paths:
         try:
-            text = path.read_text()
+            if path.suffix == ".zst":   # the fixtures' Zstandard mmCIF
+                import subprocess
+                text = subprocess.run(["zstd", "-dc", str(path)], check=True, capture_output=True).stdout.decode()
+            else:
+                text = path.read_text()
         except UnicodeDecodeError:   # gzip or BinaryCIF: their components are their mmCIF twin's
             continue
         names |= set(re.findall(r"^(?:ATOM|HETATM)\s+\S+\s+\S+\s+\S+\s+\S+\s+(\S+)", text, re.M))

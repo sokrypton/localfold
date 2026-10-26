@@ -555,6 +555,27 @@ checks, or with the same sentence: the gate's own jobs (all build) and thirteen 
 check each, 24 jobs, 0 differing. Removing the bond-length check natively, or the
 sequence-probability checks on the page, turns exactly their jobs red.
 
+## Every condition Studio's editor offers, held to upstream's batch
+
+No shipped preset sets metal coordination, RASA, a salt bridge, an H-bond, a pi-stack or
+pi-cation, a hydrophobic contact, a chain centroid, CATH on a structure, index groups or the
+terminus flags, so until now the batch carrying them was compared only port against port. The
+three `featurise/gate-conditions*.json` jobs set all of them on raw 1PRW (calmodulin, its four
+calcium ions and their `metalc` bonds), and `tools/check-rfd4p-batch.py` (`upstream b`) builds
+upstream's batch for each with `tools/oracle/dump_batch_cpu.py` and holds the page's `buildBatch`
+to it: every integer exactly, every float to 1e-4. All three are exact, and each condition was
+watched failing: a metal relabelled, a RASA bin, a salt-bridge charge, an index group merged, a
+centroid moved 0.5 A, a pi-cation side, a CATH level cleared, a hydrophobic residue, an H-bond role.
+The featurise arm holds the native featuriser to the page on the same jobs, and a relabelled metal,
+RASA bin or salt-bridge charge moves 2-33 of its 55,614 sequence-feature values.
+
+🔴 **THE TERMINUS FLAGS REACH NOTHING THIS CHECKPOINT READS.** Upstream lists `C_NTR`/`C_CTR`
+among its token annotations, and its batch carries neither, nor does the page's; moving either
+flag changes no tensor on either side (`gate-conditions-termini.json`), and in an unindexed motif
+upstream clears them anyway. 🔴 **AND THE LENGTHS ARE GIVEN, NOT INFERRED** (`dump_batch_cpu.py
+--seg-lengths`, read back by `check-batch.mjs`): inferring them from runs of unresolved tokens
+breaks on an unindexed motif, which moves its own tokens.
+
 ## A condition's arms apply in the order the job wrote them
 
 Upstream walks `conditions:` as a Python dict, in the file's order, and the LAST arm wins an atom
