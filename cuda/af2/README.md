@@ -563,6 +563,26 @@ fused pair kernels (`triInK`, `gridInK`, `fusedTransitionK`, `triangleOutK`, `gr
   of ~10-15 us whatever its blocks do. At 68 residues a fold is ~6,000 such calls; fewer of them (modules fused
   across their boundaries) is the lever there, not a better tile.
 
+**Module 8: AlphaFold 2's five models at once, through MPS.** A short fold cannot fill the card from one process
+(Module 7), and the page's "All 5" folds the same input through five models, one job after another - each on its
+own resident server already (python/localfold/worker.py keeps them while the card is under half full). With NVIDIA
+MPS (`nvidia-cuda-mps-control -d`, a private `CUDA_MPS_PIPE_DIRECTORY`) the five servers' kernels run side by side.
+A100, five servers given the same input at once, each job's wall time (the job file to its outputs, so ~6 ms more
+than the fold's own clock), median of jobs 4-10:
+
+| | 68 res | 150 res | 261 res |
+|---|---:|---:|---:|
+| one fold, no MPS | 64.3 ms | 126.8 | 314.1 |
+| five, one after another (5x) | 322 | 634 | 1571 |
+| five at once, no MPS (time-sliced) | 344 | 688 | 1711 |
+| **five at once, MPS** | **147** | **470** | **1360** |
+| one fold under MPS | 66.4 | 132.9 | 319.2 |
+
+All five models in **2.2x** less time at 68 residues, 1.35x at 150, 1.16x at 261; a lone fold under MPS pays 2-5%.
+Not wired: the page sends the five as five jobs and the broker takes one fold at a time, so it needs the worker to
+take the sweep as one job (or fold models 2-5 ahead of their jobs and answer from that), MPS started where the card
+allows it, and Colab's availability of the daemon checked.
+
 ## A deep alignment's featurisation (2026-10-08)
 
 🔴 **SUPERSEDED THE SAME DAY: the featuriser is native now** (`cuda/featurise/af2-featurise`), its nearest-centre
