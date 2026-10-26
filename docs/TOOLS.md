@@ -11,7 +11,7 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-432 tools. `tools/fixtures/` is data and is not listed.
+434 tools. `tools/fixtures/` is data and is not listed.
 
 ## `tools/gpu/` - the WebGPU lane (215)
 
@@ -234,12 +234,13 @@ Each exports `async function main(device, args)` and is run as
 - **`trunk-opendde.js`** - OpenDDE's trunk, sequence in and contact map out.
 - **`trunk-oracle.js`** - af3-any-model's own trunk seams, compared against ours on the same batch.
 
-## `tools/oracle/` - the reference side (65)
+## `tools/oracle/` - the reference side (66)
 
 These run against a checkout of the reference implementation, not against
 this port. They need its Python environment; see CLAUDE.md.
 
 - **`af3-bundle.js`** - Reading an AF3 export and an oracle dump, for the block checkers.
+- **`alphafold2_confidence.py`** - DeepMind's `predicted_tm_score`, the one RFD4-Proteina's AF2 worker scores a chain and a chain pair with.
 - **`bench_af3_native.py`** - Native AlphaFold 3 on this box, at settings LocalFold can actually match.
 - **`check-batch.mjs`** - Verify the JS input pipeline (`shared/rfd4p/pipeline/index.js` -> `buildBatch`) against the Python RFD4-Proteina oracle dumps (`oracle-dumps/*.safetensors` and `oracle-dumps/cpu/*.safetensors`), and verify downstream feature construction (`trunkSeqFeatures`, `trunkCondFeatures`, `pairFeatures`, `pairCondFeatures`)
 - **`check-cpu-trunk.mjs`** - Stage-wise check of the CPU reference against a PyTorch oracle, using the released weights.
@@ -333,7 +334,7 @@ and turning it into a bundle.
 - **`safetensors_read.py`** - Read a .safetensors file into numpy arrays, without the safetensors package.
 - **`vector-quantise.py`** - Is a codebook worth a new decoder? Scalar codes against vector ones, at 2 bits.
 
-## `tools/` - everything else (130)
+## `tools/` - everything else (131)
 
 CPU checkers, the export and quantisation pipeline, the page drivers that
 go through CDP, and the deploy.
@@ -386,6 +387,7 @@ go through CDP, and the deploy.
 - **`check-oracle-bonds.js`** - Does the REFERENCE put side chains where we do? AlphaFold 3's own output, scored by the same function.
 - **`check-portable-limits.mjs`** - Does every model fold on a device at the PORTABLE limit ceiling?
 - **`check-rfd4p-automorphisms.py`** - Hold shared/rfd4p/symmetry.js's automorphisms to atomworks' own, over the component dictionary.
+- **`check-rfd4p-batch.py`** - Hold the page's RFD4 batch to upstream's own pipeline on the jobs that set every condition Studio edits.
 - **`check-rfd4p-invariants.py`** - Hold the RFD4 featurisers' refusals to upstream's: which jobs a batch is refused for, and why.
 - **`check-rfd4p-load.py`** - Hold the page's structure LOADER to upstream's, atom for atom: `load_condition_spec_inputs`.
 - **`check-rfd4p-manifest.py`** - Does our copy of RFD4-Proteina's tensor manifest still describe the shards being served?
