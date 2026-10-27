@@ -491,7 +491,8 @@ export async function foldAf3(options) {
   // this before doing anything, not after.
   let budget = null;
   const plan = () => (budget ??= foldPlan({
-    tokens: batch.tokens, rows: rows.depth, passes, calls, atoms: batch.atomCount,
+    // (the rows a trunk pass reads - drawn from the pool each pass - not the pool: shared/af3/msa-draw.js)
+    tokens: batch.tokens, rows: Math.min(rows.depth, batch.numMsa ?? 1024), passes, calls, atoms: batch.atomCount,
   }));
   /**
    * The status line: what is running, and how far in.

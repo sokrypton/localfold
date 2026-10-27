@@ -112,31 +112,43 @@ kernel void af3_scale_rows_h(LF_ARGS(ScaleRowsHArgs)) {
     uint C4 = a.C >> 2;
     if (t >= a.rows * C4) return;
     float m = a.mask[lf_udiv((uint)t, C4)];
-    ((device half4*)a.x)[t] = half4(float4(((device const half4*)a.x)[t]) * m);
+    const float sx = a.downShift ? ldexp(1.f, -(int)a.downShift) : 1.f;
+    ((device half4*)a.x)[t] = half4(float4(((device const half4*)a.x)[t]) * (m * sx));
     if (a.y) ((device half4*)a.y)[t] = half4(float4(((device const half4*)a.y)[t]) * m);
     return;
   }
   if (t >= a.rows * a.C) return;
   float m = a.mask[lf_udiv((uint)t, a.C)];
-  a.x[t] = (half)((float)a.x[t] * m);
+  const float sx = a.downShift ? ldexp(1.f, -(int)a.downShift) : 1.f;
+  a.x[t] = (half)((float)a.x[t] * (m * sx));
   if (a.y) a.y[t] = (half)((float)a.y[t] * m);
 }
 
 // ---------------------------------------------------------------- the embedder
+static inline uint af3_mix32(uint x) {     // lowbias32, as shared/af3/msa-draw.js
+  x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; x ^= x >> 16;
+  return x;
+}
+static inline float af3_drop(constant OuterSumArgs& a, uint ij, uint c) {
+  return af3_mix32(af3_mix32(a.dropKey ^ ij) + c) >= a.dropThreshold ? a.dropScale : 0.f;
+}
 kernel void af3_outer_sum(LF_ARGS(OuterSumArgs)) {
   ulong t = LF_INDEX;
   if ((a.C & 3) == 0) {
     uint C4 = a.C >> 2;
     if (t >= (ulong)a.n * a.n * C4) return;
     uint ij = lf_udiv((uint)t, C4), c4 = (uint)t - ij * C4, i = lf_udiv(ij, a.n), j = ij - i * a.n;
+    float4 add = a.add ? ((device const float4*)a.add)[a.addRow ? c4 : t] : float4(0.f);
+    if (a.dropOn) add *= float4(af3_drop(a, ij, 4 * c4), af3_drop(a, ij, 4 * c4 + 1), af3_drop(a, ij, 4 * c4 + 2), af3_drop(a, ij, 4 * c4 + 3));
     ((device float4*)a.pair)[t] = ((device const float4*)a.left)[i * C4 + c4] +
-                                  ((device const float4*)a.right)[j * C4 + c4] +
-                                  (a.add ? ((device const float4*)a.add)[a.addRow ? c4 : t] : float4(0.f));
+                                  ((device const float4*)a.right)[j * C4 + c4] + add;
     return;
   }
   if (t >= (ulong)a.n * a.n * a.C) return;
   uint ij = lf_udiv((uint)t, a.C), c = (uint)t - ij * a.C, i = lf_udiv(ij, a.n), j = ij - i * a.n;
-  a.pair[t] = a.left[i * a.C + c] + a.right[j * a.C + c] + (a.add ? a.add[a.addRow ? c : t] : 0.f);
+  float add = a.add ? a.add[a.addRow ? c : t] : 0.f;
+  if (a.dropOn) add *= af3_drop(a, ij, c);
+  a.pair[t] = a.left[i * a.C + c] + a.right[j * a.C + c] + add;
 }
 // AF3's relative encoding (139 one-hot columns: residue offset 66, token offset 66, same entity 1, chain offset 6)
 kernel void af3_relenc(LF_ARGS(RelEncArgs)) {

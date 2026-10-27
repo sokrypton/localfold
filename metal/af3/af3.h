@@ -122,8 +122,18 @@ struct Trunk {
   bool pairHalfExact = false;             // the last pass's pair came out of the half stack: exact in half
   Masks masks;
   int pass = 0;
+  // the per-pass MSA draw (drawMsa, shared/af3/msa-draw.js): S of the pool's P rows, drawn afresh each pass
+  int P = 0; bool drawn = false, queryDrawn = true; std::string drawMode; uint64_t drawSeed = 0;
+  // protenix's (msaNativeSample, cuda/af3's trunk.cuh): a row COUNT from [1, P] each pass - S changes, the buffers hold
+  // Smax - and its MC dropout on the recycled pair's projection (mcOn: decided once a seed by the fold)
+  int Smax = 0; bool native = false, mcOn = false; uint32_t mcThreshold = 0; float mcScale = 1.f;
 };
+// --msa-draw=pass|once|prefix: which rows a trunk pass reads (shared/af3/msa-draw.js); "pass" is AF3's
+extern std::string MSA_DRAW;
 Trunk makeTrunk(const float* targetFeat, int msaCap);
+// this pass's MSA rows (t.pass's draw), gathered from the pool into the trunk's own; before each runTrunk
+void drawMsa(Trunk& t);
+void fillMsaRows(Trunk& t, const std::vector<int>& chosen);
 void freeTrunk(Trunk& t);
 void runTrunk(Trunk& t);
 // the distogram's logits [n * n * bins] (symmetrised), and the page's contact map [n * n] on the host

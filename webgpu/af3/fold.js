@@ -227,6 +227,8 @@ export async function buildTargetFeat(batch, weights, device) {
 }
 
 import { uniformFrom, normalFrom } from "../../shared/af3/random.js";
+import { msaDrawRows, msaNativeRows, gatherRows, mcDropoutApplies, mcDropoutKey, mcDropoutThreshold }
+  from "../../shared/af3/msa-draw.js";
 export { uniformFrom, normalFrom } from "../../shared/af3/random.js";
 
 /**
@@ -668,7 +670,8 @@ async function foldHolding(device, batch, weights, options, held) {
   // Af3TrunkGpu.warm. Only where a trunk will actually run.
   if (options.reuse?.trunk === undefined) {
     new Af3TrunkGpu(device, precision).warm(
-      { tokens, sequences: batch.sequences, templates: options.templates ?? 4 },
+      { tokens, sequences: Math.min(batch.sequences, options.numMsa ?? 1024, batch.numMsa ?? Infinity),
+        templates: options.templates ?? 4 },
       weights.trunk, weights.trunk.dialect).catch(() => {});
   }
   const reused = options.reuse;
@@ -711,23 +714,49 @@ async function foldHolding(device, batch, weights, options, held) {
   // rows the model was trained to take: a different model, 3.2 GiB of
   // `af3-msa.msa-scratch`, and 1.5 s of a 3.3 s trunk.
   //
-  // 🔴 AND THE FIRST num_msa ROWS ARE NOT AF3's num_msa ROWS. AF3 gumbel-
-  // shuffles first, so which rows survive is a draw from a PRNG this port
-  // cannot reproduce - and on a deep alignment the query itself survives only
-  // with probability num_msa/depth. Taking the prefix keeps the query (it is
-  // row 0 of an a3m) and keeps the alignment's own order, which is
-  // `subsample_msa_keep_query`'s rule rather than `shuffle_msa`'s. It is a
-  // coverage limit, named here rather than left as a silent depth difference,
-  // and `AF3_DETERMINISTIC_MSA=1` on the oracle side is how the two are
-  // compared.
-  const msaCap = options.numMsa ?? 1024;
-  if (batch.sequences > msaCap) {
-    batch = { ...batch, sequences: msaCap,
-              msa: batch.msa.subarray(0, msaCap * tokens),
-              msaMask: batch.msaMask.subarray(0, msaCap * tokens),
-              deletionMatrix: batch.deletionMatrix.subarray(0, msaCap * tokens) };
-  }
-  await stage("msa-depth", { sequences: batch.sequences, tokens });
+  // 🔴 AND THE ROWS ARE DRAWN AFRESH EVERY PASS, AS AF3 DRAWS THEM. The batch
+  // carries AF3's whole pool (up to 16384 rows) and each pass reads its own
+  // `num_msa` of them - `msaDrawRows` in shared/af3/msa-draw.js, the draw
+  // cuda/af3 and metal/af3 make too. One draw for the whole fold was 8S83's
+  // whole gap to stock AF3: 6 seeds of 20 docked against 13, and stock with its
+  // shuffle frozen to one draw docked 6. A batch read from an AF3 dump (no
+  // `numMsa`) and chai-1 (which does not shuffle) keep the first rows, as do
+  // `msaDraw: "prefix"`; `"once"` is the old single draw, the control arm.
+  const msaPool = batch.sequences;
+  const msaCap = Math.min(options.numMsa ?? 1024, batch.numMsa ?? Infinity);
+  const msaDrawMode = batch.numMsa === undefined || weights.trunk.dialect.chaiMsaFeatures === true
+    ? "prefix" : (options.msaDraw ?? "pass");
+  // (the pool is held at a byte a cell, as AF3 holds it - featurise.js; the rows a pass reads are widened to what the
+  // trunk uploads, int32 codes and float32 deletions and mask)
+  //
+  // 🔴 AND PROTENIX's IS ITS OWN: a pass reads a row COUNT drawn from 1 to the whole pool, with no num_msa cap
+  // (`msaNativeSample`; msa-draw.js msaNativeRows). Its rows are padded up to a power of two with MASKED rows, which
+  // add nothing to the pair - a pipeline is compiled per row count, and the buckets keep that to ~14 shapes rather
+  // than one a pass.
+  const nativeMsa = weights.trunk.dialect.msaNativeSample === true && batch.numMsa !== undefined
+    && options.msaDraw !== "prefix";
+  const msaRowsOf = (pass) => {
+    const seed = options.seed ?? 20260831;
+    const chosen = nativeMsa ? msaNativeRows(seed, options.msaDraw === "once" ? 0 : pass, msaPool)
+      : msaDrawRows(msaDrawMode, seed, pass, msaPool, msaCap);
+    const rows = nativeMsa ? Math.min(msaPool, 2 ** Math.ceil(Math.log2(chosen.length))) : chosen.length;
+    const widen = (array, Type, pad) => {
+      const out = new Type(rows * tokens).fill(pad);
+      out.set(gatherRows(array, tokens, chosen));
+      return out;
+    };
+    return { sequences: rows, msa: widen(batch.msa, Int32Array, 21), msaMask: widen(batch.msaMask, Float32Array, 0),
+             deletionMatrix: widen(batch.deletionMatrix, Float32Array, 0), queryDrawn: chosen[0] === 0 };
+  };
+  // ...and protenix's MC dropout on the recycled pair's projection: decided once a seed, a fresh mask every pass
+  const dropoutRate = weights.trunk.dialect.recycleMcDropout ?? 0;
+  const dropoutOn = dropoutRate > 0
+    && mcDropoutApplies(options.seed ?? 20260831, weights.trunk.dialect.recycleMcDropoutOdds ?? 0);
+  const recycleDropoutOf = (pass) => (!dropoutOn ? undefined
+    : { key: mcDropoutKey(options.seed ?? 20260831, pass), threshold: mcDropoutThreshold(dropoutRate),
+        scale: 1 / (1 - dropoutRate) });
+  const msaDepth = Math.min(msaPool, msaCap);
+  await stage("msa-depth", { sequences: msaDepth, pool: msaPool, tokens });
   // 🔴 A RECYCLE'S STATE IS THE TRUNK ITSELF, which is what makes asking for
   // more of them cheap. The loop feeds `previousPair`/`previousSingle` back in,
   // and those ARE the previous pass's `trunk.pair`/`trunk.single` - so a cached
@@ -949,8 +978,9 @@ async function foldHolding(device, batch, weights, options, held) {
     const lastPass = pass === recycles;
     const readAll = lastPass || readEveryPass;
     const recycledFrom = previousBuffers;
+    const passMsa = msaRowsOf(pass);
     trunk = await trunkGpu.run({
-      tokens, sequences: batch.sequences,
+      tokens, sequences: passMsa.sequences,
       ...(recycledFrom === undefined ? {} : {
         previousPairBuffer: recycledFrom.pair.buffer,
         previousSingleBuffer: recycledFrom.single.buffer,
@@ -961,9 +991,11 @@ async function foldHolding(device, batch, weights, options, held) {
       templates: options.templates ?? 4,
       targetFeat,
       features: batch.features,
-      msaRows: batch.msa,
-      deletionMatrix: batch.deletionMatrix,
-      msaMask: batch.msaMask,
+      msaRows: passMsa.msa,
+      deletionMatrix: passMsa.deletionMatrix,
+      msaMask: passMsa.msaMask,
+      msaQueryDrawn: passMsa.queryDrawn,
+      recycleDropout: recycleDropoutOf(pass),
       // (and which tokens are DNA: boltz2's DN row is added where a DNA column reads class 30 - embedder.js)
       isDna: batch.isDna,
       // 🔴 NAMED, BECAUSE THIS OBJECT IS BUILT FIELD BY FIELD. A key the batch

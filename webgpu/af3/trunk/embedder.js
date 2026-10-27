@@ -244,7 +244,19 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 @group(0) @binding(4) var<storage, read> weights: array<f32>;
 @group(0) @binding(5) var<storage, read> bonds: array<f32>;
 @group(0) @binding(6) var<storage, read_write> pair: array<f32>;
-
+${shape.recycleDropout === true ? `// protenix's MC dropout on the recycled term (shared/af3/msa-draw.js mcDropoutKeep): this pass's key, the keep
+// threshold, and 1 / (1 - rate) as bits - a buffer, not a constant, or every pass would compile its own kernel
+@group(0) @binding(7) var<storage, read> drop: array<u32>;
+fn mix32(v: u32) -> u32 {
+  var x = v;
+  x = x ^ (x >> 16u); x = x * 0x7feb352du; x = x ^ (x >> 15u); x = x * 0x846ca68bu; x = x ^ (x >> 16u);
+  return x;
+}
+fn drop_factor(row: u32, c: u32) -> f32 {
+  if (mix32(mix32(drop[0] ^ row) + c) >= drop[1]) { return bitcast<f32>(drop[2]); }
+  return 0.0;
+}
+` : ""}
 // features is five rows of TOKENS: residueIndex, tokenIndex, asymId, entityId, symId.
 fn residue_index(t: u32) -> i32 { return features[t]; }
 fn token_index(t: u32) -> i32 { return features[TOKENS + t]; }
@@ -363,7 +375,7 @@ ${overPairThread((b) => `  {
     let c = local + ${b * 64}u;
     let relative_total = weights[row_a + c] + weights[row_b + c]
       + entity_flag * weights[row_entity + c] + weights[row_c + c];
-    pair[base + c] = left[i * C_Z + c] + right[j * C_Z + c] + recycled_${b} + relative_total
+    pair[base + c] = left[i * C_Z + c] + right[j * C_Z + c] + recycled_${b}${shape.recycleDropout === true ? " * drop_factor(row, c)" : ""} + relative_total
       + bond_val * weights[W_BOND + c]
 ${offsets.tokenBondsTypeEmbed === undefined ? "" : `      + weights[bond_type_row + c]
       + weights[W_CONTACT_UNSPECIFIED + c]`};
@@ -394,7 +406,7 @@ ${offsets.tokenBondsTypeEmbed === undefined ? "" : `      + weights[bond_type_ro
     // ALWAYS bound rather than branched on. Same reasoning as the recycled
     // term above: a "nothing to add yet" fast path is how a real term goes
     // missing, and here it went missing for every ligand ever folded.
-    pair[base + c] = left[i * C_Z + c] + right[j * C_Z + c] + recycled + relative_total
+    pair[base + c] = left[i * C_Z + c] + right[j * C_Z + c] + recycled${shape.recycleDropout === true ? " * drop_factor(row, c)" : ""} + relative_total
       + bonds[row] * weights[W_BOND + c]
 ${offsets.tokenBondsTypeEmbed === undefined ? "" : `      + weights[W_BOND_TYPE
           + u32(clamp(i32(bonds[PAIRS + row]), 0, 6)) * C_Z + c]
@@ -594,8 +606,13 @@ export class Af3EmbedderGpu {
                     msaChannels, pairInitFromSingle,
                     msaFeatureWidth: weights.msaActivations.length / msaChannels,
                     // (rf3: the query row is paired once an alignment adds a row - msaPairedQueryRowAligned)
-                    msaPairedQueryRow: weights.dialect.msaPairedQueryRow
-                      || (weights.dialect.msaPairedQueryRowAligned === true && sequences > 1) };
+                    // ...and only on a pass whose MSA draw kept the query as its row 0 (shared/af3/msa-draw.js:
+                    // af3-any-model's flag is on the row whose ORIGIN is the query, and a draw can leave it out)
+                    msaPairedQueryRow: (weights.dialect.msaPairedQueryRow
+                      || (weights.dialect.msaPairedQueryRowAligned === true && sequences > 1))
+                      && input.msaQueryDrawn !== false,
+                    // (protenix's MC dropout on the recycled term, this pass: {key, threshold, scale} - fold.js)
+                    recycleDropout: input.recycleDropout !== undefined };
     const sources = createEmbedderShaders(shape, packed.offsets, epsilon, variance,
                                           options.relative ?? "gather");
     const key = `af3-embed:${tokens}:${sequences}:${featureWidth}:${pairChannels}`
@@ -607,7 +624,9 @@ export class Af3EmbedderGpu {
       // ...and the paired column's VALUE, which is a term in the source.
       + `:pq${shape.msaPairedQueryRow}`
       // ...and boltz2's DN row, a term in the source likewise
-      + `:dn${hasDnRow(weights)}`;
+      + `:dn${hasDnRow(weights)}`
+      // ...and protenix's MC dropout, which binds an eighth buffer and multiplies the recycled term
+      + `:md${shape.recycleDropout}`;
     // Compiled together, not one after another: the browser builds them in
     // parallel, and a serial loop put every one of them on a cold fold's path.
     const compiled = Object.fromEntries(await Promise.all(Object.entries(sources).map(
@@ -753,8 +772,14 @@ export class Af3EmbedderGpu {
           [targetFeat, weightBuffer, left, right, msaFromTarget, pairSource],
           ...spread(Math.ceil(tokens * Math.max(pairChannels, msaChannels) / 64)));
       const perPair = spread(pairs);
+      const dropBuffers = [];
+      if (input.recycleDropout !== undefined) {
+        const { key, threshold, scale } = input.recycleDropout;
+        const words = Uint32Array.of(key, threshold, new Uint32Array(Float32Array.of(scale).buffer)[0], 0);
+        dropBuffers.push(keep(this.allocator.upload("af3-embed.drop", words, storage)));
+      }
       run("embed.assemble-pair", compiled.assemblePair,
-          [left, right, previousPair, features, weightBuffer, bondMatrix, pair],
+          [left, right, previousPair, features, weightBuffer, bondMatrix, pair, ...dropBuffers],
           perPair[0], perPair[1]);
       const perRow = spread(Math.ceil(rows / 64));
       run("embed.assemble-msa", compiled.assembleMsa,

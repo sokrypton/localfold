@@ -8,7 +8,6 @@
 import { af3MsaFromA3m } from "./msa-features.js";
 import { featuriseProtein } from "./featurise.js";
 import { applyChaiMsa } from "./chai-msa.js";
-import { uniformFrom } from "../random.js";
 
 /**
  * A sequence plus an A3M, as the batch AF3's graph is actually fed.
@@ -22,7 +21,8 @@ import { uniformFrom } from "../random.js";
  *     different feature, not a different sample of one, and it fed `target_feat`
  *     as well as the profile itself.
  *   - the CLI never seeded the row subsample, so it took the alignment's PREFIX
- *     where the page takes a seeded random subset of the whole file.
+ *     where the page took a seeded random subset of the whole file. (The draw
+ *     is the trunk's now, every pass: shared/af3/msa-draw.js.)
  *
  * So every `--a3m` gate was measuring a fold the site does not run, and the one
  * bug that only the page had - boltz2's trunk truncated to 48 of its 64 blocks
@@ -33,19 +33,17 @@ import { uniformFrom } from "../random.js";
  * @param {string} sequence chains joined by ":"
  * @param {?(string|{paired?: ?string, unpaired?: ?string, unpairedProfile?: ?string})} alignment
  *   null for a single-sequence fold, which is what AF3 itself does with none.
- * @param {{maxSequences?: number, seed?: number, prefixRows?: boolean,
+ * @param {{maxSequences?: number, seed?: number,
  *          ligands?: Array, modifications?: Array, symmetriseBonds?: boolean,
  *          chainKinds?: string[]}} [options]
- *   `prefixRows` is the control arm: the deterministic prefix the CLI used to
- *   take, for comparing against a recorded baseline. It is not a fold the page
- *   can produce.
+ *   `maxSequences` is the trunk's rows a pass (`batch.numMsa`, default AF3's
+ *   1024); `seed` moves only OpenDDE's and protenix's conformer translation.
  * @returns {{batch: object, rows: object}}
  */
 export function af3BatchFromA3m(sequence, alignment, options = {}) {
   const rows = alignment === null || alignment === undefined
     ? { msa: [], deletionMatrix: [], depth: 1, unpairedFrom: 0 }
     : af3MsaFromA3m(alignment, {
-      maxSequences: options.maxSequences,
       // an alignment over nucleic chains too: each column's alphabet (see af3MsaFromA3m)
       ...(options.msaColumnKinds === undefined ? {} : { columnKinds: options.msaColumnKinds }),
       // openbind0's main-MSA cap (msa-features.js capMainMsa), each column's chain from the polymer chains' lengths
@@ -58,11 +56,6 @@ export function af3BatchFromA3m(sequence, alignment, options = {}) {
           && options.if2ProfileMsa !== true ? {} : {
         chainOfColumn: sequence.split(":").flatMap((chain, index) => Array(chain.length).fill(index)),
       }),
-      // 🔴 SEEDED FROM THE FOLD'S OWN SEED, so a subsample is part of what a
-      // seed names. AF3 draws its shuffle from the same key that drives the
-      // rest of the model; here two seeds are two alignments as well as two
-      // starting draws, and one seed is reproducible.
-      ...(options.prefixRows ? {} : { random: uniformFrom(options.seed ?? 0) }),
     });
   const batch = featuriseProtein(sequence, {
     ...(options.ligands === undefined ? {} : { ligands: options.ligands }),
@@ -183,5 +176,8 @@ export function af3BatchFromA3m(sequence, alignment, options = {}) {
       batch.msaMask.fill(0); batch.profile.fill(0); batch.deletionMean.fill(0);
     }
   }
+  // 🔴 HOW MANY ROWS A TRUNK PASS READS (AF3's num_msa), drawn afresh each pass from the pool above by the trunk
+  // (shared/af3/msa-draw.js). The pool no longer depends on the seed or on this number; the trunk's draw does.
+  batch.numMsa = options.maxSequences ?? 1024;
   return { batch, rows };
 }

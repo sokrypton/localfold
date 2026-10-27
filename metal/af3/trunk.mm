@@ -2,6 +2,7 @@
 // is the reading). The pair, single and MSA stay float32; every GEMM is half with float accumulation.
 #include "af3.h"
 #include <cmath>
+#include "msa_draw.h"
 
 static const int* Ib(const std::string& k) { return M.i(k); }
 static const float* Fb(const std::string& k) { return M.f(k); }
@@ -15,7 +16,22 @@ Trunk makeTrunk(const float* targetFeat, int msaCap) {
   t.n = (int)M.meta("batch.tokens");
   t.C = metaI("trunk.embedder.pairChannels"); t.Cs = metaI("trunk.embedder.singleChannels");
   t.Cm = metaI("trunk.embedder.msaChannels"); t.F = metaI("trunk.embedder.targetFeatWidth");
-  t.S = std::min((int)M.meta("batch.sequences"), msaCap);
+  // S of the pool's P rows a pass: --msa=, and the featuriser's own batch.numMsa (AF3's num_msa, the page's depth)
+  t.P = (int)M.meta("batch.sequences");
+  t.S = std::min(t.P, msaCap);
+  if (M.has("batch.numMsa")) t.S = std::min(t.S, (int)M.meta("batch.numMsa"));
+  // 🔴 A FRESH DRAW OF THOSE S EVERY PASS (AF3's shuffle_msa in each pass; cuda/af3 trunk.cuh drawMsa) - not for
+  // chai-1, which does not shuffle, nor a batch read from an AF3 dump (no batch.numMsa): those keep the first S rows
+  t.drawMode = MSA_DRAW;
+  t.drawn = t.P > t.S && M.has("batch.numMsa") && !flag("trunk.dialect.chaiMsaFeatures") && t.drawMode != "prefix";
+  // ...and protenix's own: a random COUNT of the whole pool every pass, no num_msa cap (shared/af3/msa-draw.js)
+  t.native = flag("trunk.dialect.msaNativeSample") && M.has("batch.numMsa") && t.drawMode != "prefix";
+  if (t.native) { t.S = t.P; t.drawn = t.P > 1; }
+  t.Smax = t.S;
+  if (M.meta("trunk.dialect.recycleMcDropout", 0) > 0) {
+    const double rate = M.meta("trunk.dialect.recycleMcDropout");
+    t.mcThreshold = lf::mcDropoutThreshold(rate); t.mcScale = (float)(1.0 / (1.0 - rate));
+  }
   size_t pairs = (size_t)t.n * t.n;
   size_t np = t.n <= 128 ? (size_t)((t.n + 15) & ~15) : (t.n <= 256 ? (size_t)((t.n + 31) & ~31) : (size_t)t.n);
   t.pair = allocT<float>(pairs * t.C); t.single = allocT<float>(np * t.Cs);
@@ -29,12 +45,33 @@ Trunk makeTrunk(const float* targetFeat, int msaCap) {
   bool ones = true;
   for (int i = 0; i < t.n; ++i) { ones &= seq[i] > 0; for (int j = 0; j < t.n; ++j) pm[(size_t)i * t.n + j] = seq[i] * seq[j]; }
   t.seqMask = uploadNew(seq.data(), t.n); t.pairMask = uploadNew(pm.data(), pairs);
-  size_t rows = (size_t)t.S * t.n;           // the first S rows (AF3 keeps the first num_msa after its identity shuffle)
-  t.msaRows = uploadNew(M.hostI("batch.msa"), rows);
-  t.deletion = uploadNew(M.hostF("batch.deletionMatrix"), rows);
-  t.msaMask = uploadNew(M.hostF("batch.msaMask"), rows);
+  // the trunk's own S rows, widened from the pool (batch.msaPacked, msa_draw.h): the first S here, a pass's own draw
+  // from drawMsa where the rows are drawn
+  size_t rows = (size_t)t.S * t.n;
+  t.msaRows = allocT<int>(rows); t.deletion = allocT<float>(rows); t.msaMask = allocT<float>(rows);
   t.masks = {t.pairMask, t.seqMask, ones};
+  std::vector<int> first(t.S);
+  for (int k = 0; k < t.S; ++k) first[k] = k;
+  fillMsaRows(t, first);
   return t;
+}
+std::string MSA_DRAW = "pass";
+// the trunk's S rows from these pool rows (upload is in stream order: the last pass has read its rows before these land)
+void fillMsaRows(Trunk& t, const std::vector<int>& chosen) {
+  lf::MsaPoolView pool;
+  if (M.has("batch.msaPacked")) pool.packed = M.hostI("batch.msaPacked");
+  else { pool.codes = M.hostI("batch.msa"); pool.deletion = M.hostF("batch.deletionMatrix"); pool.mask = M.hostF("batch.msaMask"); }
+  t.S = (int)chosen.size();          // (protenix's count changes pass to pass; every other draw is S rows)
+  const size_t n = (size_t)t.n, rows = (size_t)t.S * n;
+  std::vector<int> codes(rows); std::vector<float> del(rows), mask(rows);
+  for (int k = 0; k < t.S; ++k) lf::unpackMsaRow(pool, (size_t)chosen[k], n, codes.data() + k * n, del.data() + k * n, mask.data() + k * n);
+  upload(t.msaRows, codes.data(), rows * 4); upload(t.deletion, del.data(), rows * 4); upload(t.msaMask, mask.data(), rows * 4);
+  t.queryDrawn = chosen[0] == 0;
+}
+void drawMsa(Trunk& t) {
+  if (!t.drawn) return;
+  fillMsaRows(t, t.native ? lf::msaNativeRows(t.drawSeed, t.drawMode == "once" ? 0 : t.pass, t.P)
+                          : lf::msaDrawRows(t.drawMode, t.drawSeed, t.pass, t.P, t.S));
 }
 void freeTrunk(Trunk& t) {
   for (const void* p : {(const void*)t.pair, (const void*)t.single, (const void*)t.msa, (const void*)t.targetFeat, (const void*)t.pairMask,
@@ -155,6 +192,8 @@ static void embed(Trunk& t) {
   // pair = left[i] + right[j] + prevEmbedding(LN(prev pair)) - not zero on the first pass. chai-1's first pass recycles
   // z_init itself (left + right + its relative encoding)
   const bool chai = flag("trunk.dialect.recycleFromInit");
+  // (protenix's MC dropout on the recycled term, element by element inside af3_outer_sum: this pass's key)
+  const uint dropKey = t.mcOn ? lf::mcDropoutKey(t.drawSeed, t.pass) : 0u;
   auto chaiRelEnc = [&]() {
     run1d("af3_chai_relenc", (C & 3) ? pairs * C : pairs * (C >> 2),
           ChaiRelEncArgs{relIdx(), W(E + "positionActivations"), W(E + "positionActivationsBias"),
@@ -176,14 +215,16 @@ static void embed(Trunk& t) {
     fill(z0, 0, (size_t)16 * C * 4);
     ln(z0, pn0, 16, C, E + "prevEmbeddingNormScale", E + "prevEmbeddingNormOffset");
     lin(pn0, E + "prevEmbedding", prev0, 16, C, C);
-    run1d("af3_outer_sum", (C & 3) ? pairs * C : pairs * (C >> 2), OuterSumArgs{left, right, prev0, t.pair, (uint)n, (uint)C, 1u, 0});
+    run1d("af3_outer_sum", (C & 3) ? pairs * C : pairs * (C >> 2), OuterSumArgs{left, right, prev0, t.pair, (uint)n, (uint)C, 1u, 0,
+                                                                                dropKey, t.mcThreshold, t.mcScale, t.mcOn ? 1u : 0u});
   } else {
     // (the recycled pair is t.pair itself: its term projected back over it - a row reads only
     // its own normalised row - and the outer sum added in place; a copy of it and an f32 term were two pairs more)
     half* pn = scratch<half>("emb.prevln", pairs * C);
     ln(t.pair, pn, pairs, C, E + "prevEmbeddingNormScale", E + "prevEmbeddingNormOffset");
     lin(pn, E + "prevEmbedding", t.pair, pairs, C, C);
-    run1d("af3_outer_sum", (C & 3) ? pairs * C : pairs * (C >> 2), OuterSumArgs{left, right, t.pair, t.pair, (uint)n, (uint)C, 0, 0});
+    run1d("af3_outer_sum", (C & 3) ? pairs * C : pairs * (C >> 2), OuterSumArgs{left, right, t.pair, t.pair, (uint)n, (uint)C, 0, 0,
+                                                                                dropKey, t.mcThreshold, t.mcScale, t.mcOn ? 1u : 0u});
   }
   if (chai) { if (t.pass > 0) chaiRelEnc(); }      // (the first pass added it before the recycle term)
   else run1d("af3_relenc", (C & 3) ? pairs * C : pairs * (C >> 2), RelEncArgs{relIdx(), W(E + "positionActivations"), t.pair, (uint)n, (uint)C});
@@ -219,7 +260,7 @@ static void embed(Trunk& t) {
       }
     } else lin(sln, E + "prevSingleEmbedding", t.single, np, t.Cs, t.Cs, 1.f);
   };
-  if (!t.msa) t.msa = allocT<float>((size_t)t.S * n * t.Cm);
+  if (!t.msa) t.msa = allocT<float>((size_t)t.Smax * n * t.Cm);     // (the most rows any pass reads: protenix's vary)
   if (flag("trunk.dialect.chaiMsaFeatures")) {
     // chai-1: the single first, then the MSA's 41 features through a biased linear plus the single's projection
     buildSingle();
@@ -251,8 +292,8 @@ static void embed(Trunk& t) {
                        hasW(E + "boltz2DnMsa") ? W(E + "boltz2DnMsa") : nullptr,
                        M.has("batch.isDna") ? M.i("batch.isDna") : nullptr, rows, (uint)n,
                        (uint)t.Cm, (uint)msaWidth,
-                       flag("trunk.dialect.msaPairedQueryRow")
-                         || (flag("trunk.dialect.msaPairedQueryRowAligned") && t.S > 1) ? 1u : 0u});
+                       (flag("trunk.dialect.msaPairedQueryRow")
+                         || (flag("trunk.dialect.msaPairedQueryRowAligned") && t.S > 1)) && t.queryDrawn ? 1u : 0u});
     buildSingle();
   }
   if (t.pass == 0) seam("z_init_generic", t.pair, pairs * C);
@@ -283,7 +324,12 @@ static void outerProductMean(Trunk& t, const std::string& pre, const std::string
   half* lt = scratch<half>("opm.left", rows * O); half* rt = scratch<half>("opm.right", rows * O);
   linH(xn, pre + ".leftProjection", lt, rows, Cm, O, Wopt(pre + ".leftProjectionBias"));      // (rf3's biases, before the mask)
   linH(xn, pre + ".rightProjection", rt, rows, Cm, O, Wopt(pre + ".rightProjectionBias"));
-  run1d("af3_scale_rows_h", (O & 3) ? rows * O : rows * (O >> 2), ScaleRowsHArgs{lt, rt, t.msaMask, rows, (uint)O, 0});
+  // 🔴 PAST 1024 ROWS THE SUM BELOW IS HELD AT 1024 ROWS' MAGNITUDE (cuda/af3's outerProductMean, where protenix2's
+  // 128-channel MSA overflowed float16 at ~4,700 rows of 8S83 - one token's sums inf, its pair row NaN): the left operand
+  // scaled down by a power of two, the projection's alpha back up. Exact, and nothing at or under 1024 rows moves.
+  const int shift = S > 1024 ? (int)std::ceil(std::log2((double)S / 1024)) : 0;
+  const float up = std::ldexp(1.f, shift);
+  run1d("af3_scale_rows_h", (O & 3) ? rows * O : rows * (O >> 2), ScaleRowsHArgs{lt, rt, t.msaMask, rows, (uint)O, (uint)shift});
   float* norm = scratch<float>("mnorm.opm", pairs);
   if (computeMaskNorm) run1d("af3_mask_norm", pairs, MaskNormArgs{t.msaMask, norm, (uint)S, (uint)L});
   const half* Wout = Wh(pre + ".outputW");          // [O * O][C]
@@ -336,7 +382,10 @@ static void outerProductMean(Trunk& t, const std::string& pre, const std::string
   // between k = 0 and a small k is the overflow's mark: boltz2 on tools/fixtures/test.a3m at all 8,076 rows, and at 16,151
   // (the alignment doubled, every row sum twice as large), reads byte for byte the same at k = 0, 1, 2 and 3; protenix2
   // too at 8,076. AF2's own k (~rows / 64, 7 there) instead MOVED the fold - small entries pushed into float16's
-  // subnormals - so the AF2 fix copied here would cost precision for nothing
+  // subnormals - so the AF2 fix copied here would cost precision for nothing.
+  // 🔴 ...BUT THAT WAS ONE 59-RESIDUE ALIGNMENT, AND 8S83 OVERFLOWED: cuda/af3's protenix2 went NaN at ~4,700 rows there
+  // (2026-10-27), once protenix's native draw read past 1024 rows. So past 1024 rows only, and by 2^k with k at most 4 -
+  // the k = 1-3 that read byte for byte the same above - the sum is held at 1024 rows' magnitude (the shift above).
   size_t per = (size_t)L * O * O;
   int Bi = (int)std::max<size_t>(1, std::min<size_t>(L, ((size_t)64 << 20) / per));
   half* X = scratch<half>("opm.X", (size_t)Bi * per);
@@ -355,13 +404,13 @@ static void outerProductMean(Trunk& t, const std::string& pre, const std::string
     half* lnChunk2 = lnOut2 ? lnOut2 + (size_t)i0 * L * C : nullptr;
     if (C % 128 == 0 && C <= 512 &&
         gemmOpmOut(X, Wout, t.pair + (size_t)i0 * L * C, W(pre + ".outputB"),
-                   norm + (size_t)i0 * L, (size_t)bi * L, O * O, C, 1.f, lnChunk, lnScale, lnOffset, 1e-5f,
+                   norm + (size_t)i0 * L, (size_t)bi * L, O * O, C, up, lnChunk, lnScale, lnOffset, 1e-5f,
                    lnChunk2, lnScale2, lnOffset2, after != 0, C)) {
       continue;
     }
     allEmitted = false;
     if (!Y) Y = scratch<float>("opm.Y", (size_t)Bi * L * C);
-    { Gemm g{}; g.X = X; g.tx = F16; g.W = Wout; g.tw = F16; g.Y = Y; g.rows = (size_t)bi * L; g.in = O * O; g.out = C; g.label = "opm output"; gemm(g); }
+    { Gemm g{}; g.X = X; g.tx = F16; g.W = Wout; g.tw = F16; g.Y = Y; g.rows = (size_t)bi * L; g.in = O * O; g.out = C; g.alpha = up; g.label = "opm output"; gemm(g); }
     run1d("af3_opm_add", (size_t)bi * L * C, OpmAddArgs{t.pair, Y, W(pre + ".outputB"), norm, (u64)i0, (uint)bi, (uint)L, (uint)C, after});
   }
   if (allEmitted) {

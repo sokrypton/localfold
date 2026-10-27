@@ -4124,6 +4124,10 @@ order, which is `subsample_msa_keep_query`'s rule rather than `shuffle_msa`'s.
 A coverage limit, named; `DETERMINISTIC_MSA=1` on the oracle side makes the two
 comparable.
 
+🔴 **SUPERSEDED (2026-10-27): THE ROWS ARE DRAWN AFRESH EVERY TRUNK PASS NOW, AS AF3 DRAWS THEM** - see "AF3's MSA
+draw, every pass" at the end of this file. The "coverage limit" named here was 8S83's whole gap to stock AF3. A batch
+read from an AF3 dump still takes the prefix, so the oracle comparison above is unchanged.
+
 ### What is still open
 
 - The bundles are LOCAL. `model-boltz2-f32` was corrected in place by
@@ -6834,3 +6838,94 @@ level and the rest below it. With multistep below 4 A, against the exponential 2
 - So the default stays: 20% fewer calls is not worth a consistent 0.1 A on a dimer, and the exponential 25 is close
   to the balance of the two halves. The flags stay for measuring; `/tmp/claude-1000/sch/sp*.txt` and
   `/tmp/claude-1000/big/big2.txt`, `big3.txt` on the A100 box (not kept).
+
+## 🔴 AF3's MSA draw, every pass (2026-10-27)
+
+**AF3 draws `num_msa` (1024) of its alignment rows afresh on EVERY trunk pass, and this port drew them once per
+fold.** `_embed_process_msa` runs `shuffle_msa` (a Gumbel argsort over all of the batch's up to 16384 rows, query
+included, with that pass's key) and `truncate_msa_batch` inside each of the 11 passes. The featuriser here drew 1024
+rows once and every pass read the same ones - the "coverage limit" of "The MSA is capped at num_msa now" above.
+
+**It is what separated this port from stock AF3 on 8S83** - a complex whose small chain has ~10 rows in a 5630-row
+alignment, so one draw holds 1-4 of them and eleven see nearly all. Stock AF3 run with its shuffle FROZEN to one draw
+(`stock_fixed.py`, `~/af3_dockq_bench`) falls to exactly this port's rate. DockQ >= 0.23 counts a seed as docked:
+
+| 8S83, AF3 weights, 10 recycles, 5 samples, 200 Euler/Karras steps | docked | mean DockQ |
+|---|---|---|
+| stock AF3, seeds 1-60 | 40 of 60 | 0.49 |
+| stock AF3, its shuffle frozen to one draw, seeds 1-20 | 6 of 20 | 0.26 |
+| this port, one draw (before; `--msa-draw=once`), seeds 1-60 | 17 of 60 | 0.22 |
+| this port, a draw every pass (now), seeds 1-60 | 27 of 60 | 0.35 |
+
+2OOB, with the 16384-row crop (below) and the draw every pass: 19 of 20 docked, against 4 of 20 before either.
+
+🔴 **AND IT DOES NOT CLOSE 8S83's GAP ALONE: 27 of 60 against stock's 40 (Fisher p = 0.027).** Scored over all five
+samples of every seed, the rest is in two places and neither is the MSA. Stock's samples dock 130 of 300 and this
+port's 86 (seeds with any docked sample 41 against 33) - the trunk or the sampler - and stock's ranking picks a docked
+sample in 40 of the 41 seeds that have one where this port's picks one in 27 of 33 - the confidence head or the
+ranking score. Open; `~/af3_dockq_bench/8S83` holds both arms' samples.
+
+**What changed, in each place:**
+
+- **The featuriser exports AF3's whole pool**, not a draw from it: the paired block to `msa_size // 2`, the unpaired
+  block to what it leaves, 16384 rows at most (shared/af3/featurise/msa-features.js, cuda/featurise/msa.h). Drawn from
+  ALL of a deep alignment instead of AF3's crop, 2OOB's 44-residue chain docked 4 seeds of 20 where AF3's crop gives
+  12; the profile and deletion mean are still over every row, as AF3 computes them before its crop. `batch.numMsa`
+  carries the rows a pass reads (`--max-msa`, the page's depth; AF3's 1024).
+- **Every trunk draws its pass's rows before the MSA embedding** - `msaDrawRows` in shared/af3/msa-draw.js (the page),
+  its twin cuda/featurise/msa_draw.h (cuda/af3 `drawMsa`, metal/af3 `drawMsa`): one integer hash, so a seed names the
+  same rows on all three, pinned by test/msa-draw.test.js. On CUDA the draw is gathered on the host OUTSIDE the
+  captured recycle graph (a captured copy would replay one pass's rows for ever), and boltz2's and rf3's is_paired flag
+  reads whether the query was drawn from the device for the same reason.
+- **The query is drawn like any other row**, as AF3's Gumbel shuffle draws it (logit 0 for every unmasked row), so on
+  8S83 it is absent from ~80% of passes; the sequence still reaches every row through target_feat. A draw is sorted,
+  so the query is row 0 exactly when drawn, and is_paired follows it.
+- **Not drawn: chai-1** (af3-any-model's `if not chai1`, it takes the first rows) **and a batch read from an AF3 dump**
+  (no `numMsa`): their oracles were taken on the prefix (`AF3_DETERMINISTIC_MSA`), so they keep it and every oracle
+  gate is unchanged. `--msa-draw=pass|once|prefix` on cuda/af3, metal/af3 and `tools/gpu/fold.js` (`msaDraw` on
+  `foldBatch`); `once` is the old behaviour, the control arm.
+- **A trunk a seed** where the rows are drawn (`seedGroups` in cuda/af3/src/af3.cu and metal/af3/main.mm): stock AF3
+  runs its whole model once a seed, and one trunk for a `--seeds` job (or a job's `modelSeeds`) was the first seed's
+  draws under every seed. `--seeds=1,2` in one process now writes, sample for sample, the atoms `--seed=1` and
+  `--seed=2` write alone (8S83, all ten samples), and its best and its confidences carry their own trunk's contact map.
+  Where nothing is drawn every seed's trunk is the same trunk and it runs once, as before (the kitchen sink's two
+  seeds, within its baseline). Several GPUs keep one trunk and say so: their ranks are dealt out of it.
+
+**What it costs.** Nothing in the fold: the trunk is 1710 ms with a draw every pass and 1711 with one (8S83, 11
+passes), and the device holds the 1024 rows a pass reads as before - the pool never goes to the device. The pool is
+held as AF3 holds it, a byte a code, a byte a deletion count and a byte of mask (int8 / bool / int8 in features.py),
+and exported packed, an int32 a cell (`batch.msaPacked`, `packMsa`); before that it was 12 bytes a cell and 8S83's
+input 15 MB against 3.2. Now 5.4 MB, 2OOB's 7.6, and the featuriser's peak memory within 10% of a single draw's.
+
+🔴 **AND AF3 CLIPS A DELETION COUNT AT 127**, which this port did not: `safe_cast_int8` on `deletion_matrix`, after
+`deletion_mean` is computed from the true counts. Clipped here the same way, the profile's rows unclipped. A count
+past 127 reaches the model as `atan(d/3) * 2/pi`, 0.985 at 127 against 0.994 at 300, so it was small.
+
+### 🔴 ...and protenix2's trunk is random however shallow the alignment (2026-10-27)
+
+**Every other family's trunk is deterministic below 1024 rows** - AF3's shuffle then only reorders the rows, and the
+MSA stack is row-permutation-equivariant - but af3-any-model replays native Protenix's own inference randomness for
+protenix2 by default (model_registry `native_rng`, pipeline/protenix_rng.py), and this port ran the AF3 path instead:
+
+- **every pass reads a row COUNT drawn uniformly from 1 to the whole pool**, then that many rows - no `num_msa` cap
+  (the reference skips its shuffle-and-truncate: native's "test cutoff is 16384"). So a 50-row alignment differs pass
+  to pass, and a deep one reads half the pool on average;
+- **once a seed, at odds 0.4, MC dropout at 0.4 on the recycled pair's projection** (`Linear(LN(z_prev))` before it is
+  added), a fresh mask every pass.
+
+Now `msaNativeSample`, `recycleMcDropout` and `recycleMcDropoutOdds` in dialect.js, protenix2 alone: `msaNativeRows`
+and `mcDropout*` in shared/af3/msa-draw.js, twins in cuda/featurise/msa_draw.h (test/msa-draw.test.js pins both).
+CUDA and Metal read exactly the drawn rows, their MSA buffers sized for the whole pool and the recycle graph off for
+these folds; the page pads a pass up to a power of two with masked rows (a pipeline a row count, ~14 shapes rather than
+one a pass). The dropout is one integer hash of (pass key, pair row, channel) on every backend - CUDA's `mcDropoutK`,
+Metal's `af3_outer_sum`, the page's embedder - and a seed decides it, so protenix2 runs a trunk a seed always. Native's
+stream is Philox on the CUDA generator laid out by the SM count: its DRAWS cannot be replayed on a second backend; this
+is its distribution. Cost on 8S83 (5,590 rows): 4.4 s a trunk against AF3's 1.7 at 1024 rows - the uncapped rows.
+
+🔴 **AND IT FOUND A LATENT FLOAT16 OVERFLOW IN THE OUTER PRODUCT MEAN.** The sum over rows `P = L^T R` is held in T
+before the normaliser divides it; past ~4,700 rows of protenix2's 128-channel MSA on 8S83 one token's sums passed 65504,
+its pair row went NaN, and every row's attention to it NaN in the next block (bisected with the f32 path folding the
+same input). Unreachable while every trunk read 1024 rows. CUDA and Metal now hold that sum at 1024 rows' magnitude past
+1024 rows - the contraction scaled by 2^-k, the f32 projection by 2^k, k <= 4 - which is exact and moves nothing at or
+under 1024 rows (4,096 rows: pLDDT 68.99 before and after). The page sums a k step in f16 and accumulates in f32, with
+the count applied before its f16 output GEMM, so it has no such sum to overflow.

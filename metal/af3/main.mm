@@ -10,6 +10,7 @@
 #include "host.h"
 #include "output.h"
 #include "standalone_api.h"
+#include "msa_draw.h"
 #include <unistd.h>
 #include <cmath>
 #include <cstring>
@@ -149,7 +150,9 @@ int foldInput(const std::string& dir, Options o) {
   {   // the fit check (core.h foldFits): what is held now - the weights and the input - and the trunk's f32 pair and MSA,
       // times factors measured at 522 and 1044 tokens (metal/README.md)
     double pair = (double)n * n * metaI("trunk.embedder.pairChannels") * 4;
-    double msa = (double)std::min((int)M.meta("batch.sequences"), o.msaCap) * n * metaI("trunk.embedder.msaChannels") * 4;
+    double msa = (double)std::min({(int)M.meta("batch.sequences"), o.msaCap,
+                                   M.has("batch.numMsa") ? (int)M.meta("batch.numMsa") : o.msaCap})
+                 * n * metaI("trunk.embedder.msaChannels") * 4;
     double peak = (double)allocated() + af3PairFactor() * pair + AF3_MSA_FACTOR * msa;
     // OpenDDE folds past its trunk on its structural tokens, and that is its peak - the refiner and then the confidence
     // head on the structural f32 pair, with the trunk's given back - so it is asked too, before the trunk runs (cuda/af3's
@@ -179,17 +182,48 @@ int foldInput(const std::string& dir, Options o) {
   int F = metaI("trunk.embedder.targetFeatWidth");
   saveSeam("target_feat", tf, (size_t)n * F);
   Trunk t = makeTrunk(tf, o.msaCap);
-  releaseScratch({"targetFeat"});
-  // --frames: each pass's contact map too (the page shows the trunk's after every recycle), a byte a pair;
-  // --recycle-tolerance: stop once two consecutive passes moved the distogram's predicted distances less than it (the
-  // page's rule, shared/af3/feature-convergence.js: one crossing is not enough)
+  // 🔴 A TRUNK A SEED, WHERE THE TRUNK DEPENDS ON THE SEED (cuda/af3's seedGroups): AlphaFold 3 runs its whole model
+  // once a seed, so each seed's trunk draws its own MSA rows every pass (msa_draw.h). Where nothing is drawn every
+  // seed's trunk is the same trunk, and it runs once for all of them.
+  std::vector<std::vector<uint64_t>> seedGroups;
+  // (protenix's MC dropout is decided once a seed - mcDropoutApplies - so its trunk is the seed's own too)
+  const double mcOdds = M.meta("trunk.dialect.recycleMcDropoutOdds", 0);
+  const bool mcPossible = t.mcThreshold > 0 && mcOdds > 0;
+  if (t.drawn || mcPossible) for (uint64_t s : seeds) seedGroups.push_back({s});
+  else seedGroups.push_back(seeds);
+  const int G = (int)seedGroups.size();
+  if (t.native && t.drawn) printf("trunk: protenix's MSA draw - a count of 1 to %d rows %s%s\n", t.P,
+                                  t.drawMode == "once" ? "once, for every pass" : "afresh each pass",
+                                  G > 1 ? (", a trunk for each of " + std::to_string(G) + " seeds").c_str() : "");
+  else if (t.drawn) printf("trunk: %d MSA rows drawn from %d %s%s\n", t.S, t.P, t.drawMode == "once" ? "once, for every pass" : "afresh each pass",
+                           G > 1 ? (", a trunk for each of " + std::to_string(G) + " seeds").c_str() : "");
   // chai-1 counts its recycles as TOTAL passes (chai-lab's num_trunk_recycles), where AlphaFold 3's are passes after the
   // first: the page's 3 is chai-lab's own default of 3 passes
   const int lastPass = flag("trunk.dialect.recycleFromInit") ? std::max(1, o.recycles) - 1 : o.recycles;
   int passesRun = lastPass + 1;
+  const bool structural = flag("trunk.dialect.structuralTokens");
+  std::vector<int> resAsym(M.hostI("batch.asymId"), M.hostI("batch.asymId") + n);
+  bool many = seeds.size() * (size_t)o.samples > 1;
+  std::string ext = o.out.size() > 4 && o.out.substr(o.out.size() - 4) == ".cif" ? ".cif" : ".pdb";
+  std::string stem = o.out.size() > 4 && o.out.substr(o.out.size() - 4) == ext ? o.out.substr(0, o.out.size() - 4) : o.out;
+  double trunkMs = 0, diffMs = 0, confMs = 0, bestScore = -1e30;
+  ConfidenceOut best; std::vector<float> bestX, bestContact; Scores bestS{false, 0}; uint64_t bestSeed = 0; int bestSample = 0;
+  std::vector<std::string> ranking;
+  int runsAll = 0;
+  for (int gi = 0; gi < G; ++gi) {
+  double g0 = gi == 0 ? f0 : now();
+  if (gi > 0) t = makeTrunk(tf, o.msaCap);          // (the last seed's was freed with its fold)
+  t.drawSeed = seedGroups[gi][0];
+  t.mcOn = mcPossible && lf::mcDropoutApplies(t.drawSeed, mcOdds);
+  if (t.mcOn) printf("trunk: protenix's MC dropout on the recycled pair (seed %llu)\n", (unsigned long long)t.drawSeed);
+  if (gi + 1 == G) releaseScratch({"targetFeat"});
+  // --frames: each pass's contact map too (the page shows the trunk's after every recycle), a byte a pair;
+  // --recycle-tolerance: stop once two consecutive passes moved the distogram's predicted distances less than it (the
+  // page's rule, shared/af3/feature-convergence.js: one crossing is not enough)
   std::vector<float> lastDistances; std::vector<double> changes;
   for (int pass = 0; pass <= lastPass; ++pass) {
     if (pass == 0 && profiling()) profileStart();
+    drawMsa(t);
     runTrunk(t);
     if (pass == 0) {
       saveSeam("trunk_out_pair", t.pair, (size_t)n * n * t.C);
@@ -229,13 +263,11 @@ int foldInput(const std::string& dir, Options o) {
   for (float** p : {&t.msa, &t.prevSingle, &t.msaMask, &t.deletion}) if (*p) { release(*p); *p = nullptr; }
   if (t.msaRows) { release(t.msaRows); t.msaRows = nullptr; }
   mt::sync();
-  double trunkMs = ms(f0);
+  trunkMs += ms(g0);
   // OpenDDE: the expander and refiner, then the diffusion and its confidence head on the structural tokens (the
   // structural batch swapped in for them, and back out for the files)
-  const bool structural = flag("trunk.dialect.structuralTokens");
   Structural st{};
   int nD = n;
-  std::vector<int> resAsym(M.hostI("batch.asymId"), M.hostI("batch.asymId") + n);
   if (structural) { st = expandStructural(t); M.swapPrefix("batch.", "sbatch."); nD = st.n; }
   // the diffusion: every (seed, sample) through the denoiser together, up to ten a batch
   double d0 = now();
@@ -245,14 +277,9 @@ int foldInput(const std::string& dir, Options o) {
   std::vector<int> pbIdx(M.hostI("batch.tokenAtomsToPseudoBeta.indices"), M.hostI("batch.tokenAtomsToPseudoBeta.indices") + nD);
   std::vector<float> pbMask(M.hostF("batch.tokenAtomsToPseudoBeta.mask"), M.hostF("batch.tokenAtomsToPseudoBeta.mask") + nD);
   std::vector<std::pair<uint64_t, int>> runs;
-  for (uint64_t s : seeds) for (int k = 0; k < o.samples; ++k) runs.push_back({s, k});
+  for (uint64_t s : seedGroups[gi]) for (int k = 0; k < o.samples; ++k) runs.push_back({s, k});
+  runsAll += (int)runs.size();
   const size_t perBatch = std::max<size_t>(o.samples, 10);
-  bool many = runs.size() > 1;
-  std::string ext = o.out.size() > 4 && o.out.substr(o.out.size() - 4) == ".cif" ? ".cif" : ".pdb";
-  std::string stem = o.out.size() > 4 && o.out.substr(o.out.size() - 4) == ext ? o.out.substr(0, o.out.size() - 4) : o.out;
-  double diffMs = 0, confMs = 0, bestScore = -1e30;
-  ConfidenceOut best; std::vector<float> bestX; Scores bestS{false, 0}; uint64_t bestSeed = 0; int bestSample = 0;
-  std::vector<std::string> ranking;
   size_t atoms3 = mask.size() * 3;
   for (size_t c0 = 0; c0 < runs.size(); c0 += perBatch) {
     size_t cn = std::min(perBatch, runs.size() - c0);
@@ -262,7 +289,7 @@ int foldInput(const std::string& dir, Options o) {
     if (profiling()) profileStart();
     if (structural && c0 > 0) M.swapPrefix("batch.", "sbatch.");      // (the structural tokens again, for this batch)
     FrameWriter frames;
-    if (!o.frames.empty() && c0 == 0) frames.start(dir, o.frames, o.steps, structural ? M.hostI("structural.residueAtomGather") : nullptr);     // (the first batch's first sample)
+    if (!o.frames.empty() && c0 == 0 && gi == 0) frames.start(dir, o.frames, o.steps, structural ? M.hostI("structural.residueAtomGather") : nullptr);     // (the first batch's first sample)
     std::vector<float> xs = sample(o.steps, batch, mask, [&](const float* d, int step, int) { frames.offer(d, step); });
     if (structural) M.swapPrefix("batch.", "sbatch.");                 // (back to the residues, for the files)
     if (profiling()) profileReport("diffusion", getenv("AF3_PROFILE_TOP") ? atoi(getenv("AF3_PROFILE_TOP")) : 30);
@@ -300,8 +327,16 @@ int foldInput(const std::string& dir, Options o) {
       }
       if (!std::isfinite(score) || !std::isfinite(ck.meanPlddt) || ck.ptm < -1)
         die("sample %d: the fold is not finite (pLDDT %f, pTM %f) - a NaN upstream", sk, ck.meanPlddt, ck.ptm);
-      if (score > bestScore) { bestScore = score; best = std::move(ck); bestX = std::move(xk); bestS = ss; bestSeed = sd; bestSample = sk; }
+      if (score > bestScore) {
+        bestScore = score; best = std::move(ck); bestX = std::move(xk); bestS = ss; bestSeed = sd; bestSample = sk;
+        bestContact = contact;           // (its own trunk's: one a seed)
+      }
     }
+  }
+  (void)d0;
+  freeDiffusion();
+  if (structural) freeStructural(st);
+  freeTrunk(t);
   }
   if (many && o.out != "/dev/null") {
     FILE* rf = fopen((stem + "_ranking_scores.csv").c_str(), "w");
@@ -311,11 +346,10 @@ int foldInput(const std::string& dir, Options o) {
     printf("  best: seed %llu sample %d\n", (unsigned long long)bestSeed, bestSample);
   }
   auto order = writeStructure(o.out, bestX, best.plddt.data());
-  if (o.out != "/dev/null") writeConfidenceFiles(o.out, order, n, dense, best, contact, bestScore, bestS);
+  if (o.out != "/dev/null") writeConfidenceFiles(o.out, order, n, dense, best, bestContact, bestScore, bestS);
   printf("mean pLDDT %.2f  pTM %.4f  ipTM %.4f  -> %s\n", best.meanPlddt, best.ptm, best.iptm, o.out.c_str());
   printf("fold: trunk %.1f ms (%d passes), diffusion %.1f ms (%d steps x %d), confidence %.1f ms, total %.1f ms\n", trunkMs,
-         passesRun, diffMs, o.steps, (int)runs.size(), confMs, ms(t0));
-  (void)d0;
+         passesRun, diffMs, o.steps, runsAll, confMs, ms(t0));
   mt::sync();
   if (getenv("AF3_MEM")) {
     auto v = scratchList();
@@ -325,9 +359,6 @@ int foldInput(const std::string& dir, Options o) {
     for (size_t k = 0; k < v.size() && k < 16; ++k) printf(" %s %.0f", v[k].first.c_str(), v[k].second / 1e6);
     printf("\n");
   }
-  freeDiffusion();
-  if (structural) freeStructural(st);
-  freeTrunk(t);
   releaseScratch();
   M.unloadInput();
   return 0;
@@ -350,6 +381,10 @@ int foldMain(int argc, char** argv) {
     else if (!strncmp(a, "--recycles=", 11)) { o.recycles = atoi(a + 11); setR = true; }
     else if (!strncmp(a, "--samples=", 10)) { o.samples = atoi(a + 10); setS = true; }
     else if (!strncmp(a, "--msa=", 6)) o.msaCap = atoi(a + 6);
+    else if (!strncmp(a, "--msa-draw=", 11)) {     // which rows a pass reads: pass (AF3's), once, prefix
+      MSA_DRAW = a + 11;
+      if (MSA_DRAW != "pass" && MSA_DRAW != "once" && MSA_DRAW != "prefix") die("--msa-draw=%s: not pass, once or prefix", MSA_DRAW.c_str());
+    }
     else if (!strncmp(a, "--seed=", 7)) { o.seed = strtoull(a + 7, nullptr, 10); o.seedGiven = true; }
     else if (!strncmp(a, "--seeds=", 8)) o.seedsArg = a + 8;
     else if (!strncmp(a, "--frames=", 9)) o.frames = a + 9;

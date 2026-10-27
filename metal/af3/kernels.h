@@ -19,13 +19,17 @@ struct TriGateWArgs { CP(half) proj; CP(half) gate; DP(half) out; u64 pad0; uint
 // x[r][c] (*)= scale
 struct ScaleArgs { DP(float) x; DP(half) outH; u64 n; float s; uint relu; };
 struct ScaleRowsArgs { DP(float) x; CP(float) mask; DP(half) outH; CP(float) resY; CP(float) resGate; u64 pad0, rows; uint C, period; };      // x[r] *= mask[r % period]
-struct ScaleRowsHArgs { DP(half) x; DP(half) y; CP(float) mask; u64 rows; uint C, pad; };
+// (`downShift`: x - the outer product's left operand - scaled by 2^-downShift too, past 1024 rows: trunk.mm outerProductMean)
+struct ScaleRowsHArgs { DP(half) x; DP(half) y; CP(float) mask; u64 rows; uint C, downShift; };
 struct CastArgs { CP(float) x; DP(half) y; u64 n; };
 
 // ---------------------------------------------------------------- the embedder
 struct RelIdx { CP(int) ri; CP(int) ti; CP(int) asym; CP(int) ent; CP(int) sym; };
 // pair[i][j] = left[i] + right[j] (+ add[ij] or add[0])
-struct OuterSumArgs { CP(float) left; CP(float) right; CP(float) add; DP(float) pair; uint n, C, addRow, pad; };
+// (dropOn: protenix's MC dropout on `add`, the recycled term - element (ij, c) kept where its hash of dropKey reaches
+// dropThreshold, scaled by dropScale: shared/af3/msa-draw.js mcDropoutKeep)
+struct OuterSumArgs { CP(float) left; CP(float) right; CP(float) add; DP(float) pair; uint n, C, addRow, pad;
+                      uint dropKey, dropThreshold; float dropScale; uint dropOn; };
 // pair += the 139 relative-encoding rows a pair's one-hot selects
 struct RelEncArgs { RelIdx r; CP(float) W; DP(float) pair; uint n, C; };
 // pair += bonds[ij] w + (boltz2) table[order[ij]] + unspecified

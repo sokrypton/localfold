@@ -1145,9 +1145,13 @@ export function featuriseProtein(sequence, options = {}) {
   // `deduplicateUnpairedAgainstPaired` already removes.
   const duplicateQuery = extra.length === 0 && options.duplicateQueryRow === true;
   let sequences = 1 + extra.length + (duplicateQuery ? 1 : 0);
-  let msa = new Int32Array(sequences * tokens);
-  let msaMask = new Float32Array(sequences * tokens).fill(1);
-  let deletionMatrix = new Float32Array(sequences * tokens);
+  // 🔴 THREE BYTES A CELL, AS AF3 STORES THEM (int8 rows, bool mask, int8 deletions - features.py), because the batch
+  // carries AF3's whole pool now - up to 16384 rows, drawn from afresh every trunk pass (shared/af3/msa-draw.js) - and
+  // at 12 bytes a cell a deep 2000-token alignment was 390 MB of a page's memory. A deletion count is clipped at 127
+  // on the way in, which is AF3's cast; a backend widens the rows a pass reads.
+  let msa = new Int8Array(sequences * tokens);
+  let msaMask = new Uint8Array(sequences * tokens).fill(1);
+  let deletionMatrix = new Uint8Array(sequences * tokens);
   // 🔴 A LIGAND TOKEN IS A GAP IN THE MSA, NOT AN UNKNOWN RESIDUE. Its aatype
   // is UNK (20) but AF3 writes MSA_GAP (21) in the alignment and in the
   // profile - an alignment has nothing to say about an atom. Copying aatype
@@ -1260,7 +1264,7 @@ export function featuriseProtein(sequence, options = {}) {
       msa[base + token] = unknownEverywhere[token] ? queryRow[token]
         : column < 0 ? MSA_GAP : (extra[row][column] ?? MSA_GAP);
       if (deletions !== undefined) {
-        deletionMatrix[base + token] = column < 0 ? 0 : (deletions[column] ?? 0);
+        deletionMatrix[base + token] = column < 0 ? 0 : Math.min(deletions[column] ?? 0, 127);
       }
     }
   }

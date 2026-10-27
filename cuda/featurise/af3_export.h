@@ -536,13 +536,12 @@ inline Af3Export exportAf3(const Args& args) {
   }
   if (!kinds.empty()) o.chainKinds = splitOn(kinds, ',');
 
-  // af3BatchFromA3m: the rows (seeded from --seed), then featuriseProtein with the dialect's conventions
+  // af3BatchFromA3m: the rows (AF3's whole pool: the trunk draws a pass's own - msa_draw.h), then featuriseProtein with
+  // the dialect's conventions
   if (alignment.present) {
-    Uniform random(jsParseFloat(args.option("seed", "20260831")));
     std::vector<int> chainOfColumn;                // (each column's polymer chain: openbind0's main-MSA cap)
     { int chain = 0; for (char c : sequence) { if (c == ':') ++chain; else chainOfColumn.push_back(chain); } }
-    MsaRows rows = af3MsaFromA3m(alignment, (int)jsParseFloat(args.option("max-msa", "1024")),
-                                 msaColumnKinds.empty() ? nullptr : &msaColumnKinds, &random, D.mainMsaCap, &chainOfColumn,
+    MsaRows rows = af3MsaFromA3m(alignment, msaColumnKinds.empty() ? nullptr : &msaColumnKinds, D.mainMsaCap, &chainOfColumn,
                                  D.protenixUnpairedMsa, D.rf3ProfileMsa, D.if2ProfileMsa);
     o.msa = rows.msa; o.deletionMatrix = rows.deletionMatrix;
     o.profileMsa = rows.profileMsa; o.profileDeletionMatrix = rows.profileDeletionMatrix;
@@ -592,6 +591,7 @@ inline Af3Export exportAf3(const Args& args) {
       std::fill(batch.deletionMean.begin(), batch.deletionMean.end(), 0.0f);
     }
   }
+  batch.numMsa = jsParseFloat(args.option("max-msa", "1024"));   // the trunk's rows a pass, drawn afresh each (msa_draw.h)
   addBatch(E, batch, !D.chaiTokenEmbedding);
   if (D.chaiTokenEmbedding) addEsm2Inputs(E, batch);
   E.i("batch.contactClasses", af3ContactClasses(batch));

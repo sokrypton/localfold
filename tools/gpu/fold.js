@@ -178,8 +178,9 @@ export async function main(device, args) {
   // "a fold run here is the fold the page runs" and for two features it was
   // not: it passed no profile rows (profiling the CROPPED msa where the page
   // profiles the whole file) and no seeded row choice (taking the alignment's
-  // prefix where the page takes a seeded subset). `--prefix-rows` restores the
-  // second for comparing against a baseline recorded before this.
+  // prefix where the page took a seeded subset). The row choice is the trunk's
+  // now, every pass (shared/af3/msa-draw.js): `--msa-draw=prefix` is the old
+  // prefix and `--msa-draw=once` the old single draw.
   // 🔴 THE DIALECT BEFORE THE STORE, because the batch is built here and the
   // weights are not loaded until later - and `weights?.trunk?.dialect?...`
   // written at this line would be `undefined` forever, which is a convention
@@ -200,7 +201,6 @@ export async function main(device, args) {
     // The padded template slot count; see webgpu/af3/fold.js.
     ...(option(args, "templates", "") === "" ? {}
       : { templates: Number(option(args, "templates", "")) }),
-      prefixRows: args.includes("--prefix-rows"),
       // Every featuriser convention the dialect names, forwarded as one - see
       // `featuriserDialect`. Listing them here is how the atomised-token four
       // would have reached the checker and not the fold.
@@ -637,6 +637,8 @@ export async function main(device, args) {
     leanPair: { on: true, off: false }[option(args, "lean-pair", "")],
     steps, stopAfter: Number(option(args, "truncate", String(steps))),
     seed: Number(option(args, "seed", "20260831")),
+    // which MSA rows each trunk pass reads: pass (AF3's, the default), once, prefix
+    ...(option(args, "msa-draw", "") === "" ? {} : { msaDraw: option(args, "msa-draw", "") }),
     // The trunk's intermediate seams, compared as they are produced.
     ...(trunkOracle === null ? {} : {
       onSeam: (name, value) => compareToOracle(name, value),

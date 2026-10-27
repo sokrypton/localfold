@@ -101,6 +101,10 @@ static int foldMain(int argc, char** argv) {
     else if (!strcmp(argv[i], "--stages")) STAGES = true;
     else if (!strncmp(argv[i], "--repeat=", 9)) repeat = atoi(argv[i] + 9);
     else if (!strncmp(argv[i], "--msa=", 6)) msaCap = atoi(argv[i] + 6);
+    else if (!strncmp(argv[i], "--msa-draw=", 11)) {     // which rows a pass reads: pass (AF3's), once, prefix
+      MSA_DRAW = argv[i] + 11;
+      if (MSA_DRAW != "pass" && MSA_DRAW != "once" && MSA_DRAW != "prefix") { fprintf(stderr, "--msa-draw=%s: not pass, once or prefix\n", MSA_DRAW.c_str()); return 1; }
+    }
     else if (!strcmp(argv[i], "--fold")) doFold = true;
     else if (!strcmp(argv[i], "--no-graphs")) { GRAPHS = false; noGraphs = true; }
     else if (!strcmp(argv[i], "--profile")) profile = true;
@@ -244,8 +248,8 @@ static int foldMain(int argc, char** argv) {
     for (size_t i = 0; i < k; ++i) if (!(sm[i] > 0)) MASK_ALL_ONES = false; }
   seed = !seedGiven && M.has("job.seed") ? (uint64_t)M.meta("job.seed") : seedArg;   // the job's own modelSeeds[0]
   // --seeds=a,b,c, else the job's modelSeeds, else the one seed: AlphaFold 3 runs every seed, each
-  // with its samples, and ranks them all (one trunk serves every seed - the features do not depend
-  // on it - so each seed costs a diffusion and a confidence)
+  // with its samples, and ranks them all (each seed its own trunk where its MSA rows are drawn - an alignment deeper
+  // than a pass reads: seedGroups below - else one trunk serves every seed and a seed costs a diffusion and a confidence)
   seedList.clear();
   if (!seedsArg.empty()) {
     for (size_t p = 0; p < seedsArg.size();) {
@@ -443,6 +447,8 @@ static int foldMain(int argc, char** argv) {
   }
   if (mg::WORLD > 1 && sh::ON) SHORT_PAIR_SHARE = mg::WORLD;      // (a rank holds its rows of the pair from here)
   t = makeTrunk(nullptr, msaCap, doFold && fast, oracleTargetFeat ? Fdev("oracle.trunk.stages.target_feat") : tfDev);
+  // (each pass's MSA rows are drawn from a seed's stream: the fold below runs a trunk a seed where they are - seedGroups)
+  t.drawSeed = seedList[0];
   // (its atom encoder's scratch given back at once where the pair is large - nothing reads it once target_feat is
   // built, and held into the template stack it was 3.4 GB of a simulated rank of 4's out-of-memory at 10,868 tokens)
   if (tightPair((size_t)tokens * tokens, (int)M.meta("trunk.embedder.pairChannels")))
@@ -474,11 +480,46 @@ static int foldMain(int argc, char** argv) {
   memReport("trunk built");
   printf("trunk: %d tokens, %d MSA rows, pair %d, single %d, msa %d; %s path\n", t.n, t.S, t.C, t.Cs, t.Cm,
          fast ? "f16" : "f32");
+  if (t.native && t.drawn) printf("trunk: protenix's MSA draw - a count of 1 to %d rows %s\n", t.P, t.drawMode == "once" ? "once, for every pass" : "afresh each pass");
+  else if (t.drawn) printf("trunk: the %d MSA rows drawn from %d %s\n", t.S, t.P, t.drawMode == "once" ? "once, for every pass" : "afresh each pass");
+  // (protenix's MC dropout on the recycled pair: decided once a seed - mcDropoutApplies - so its trunk is the seed's own)
+  const double mcOdds = M.meta("trunk.dialect.recycleMcDropoutOdds", 0);
+  const bool mcPossible = t.mcThreshold > 0 && mcOdds > 0;
   // the fold's pair in bf16 where every stack takes it (pair16Eligible; LOCALFOLD_PAIR_F32=1 keeps f32)
   const bool want16 = doFold && fast && pair16Eligible(t);
   if (doFold && want16) printf("trunk: the pair in bf16\n");
-  for (int fi = 0; doFold && fi < folds; ++fi) {
-    if (fi > 0 || t.p16 != want16) {   // a fresh fold: the trunk restarts from zero recycled state
+  // 🔴 A TRUNK A SEED, WHERE THE TRUNK DEPENDS ON THE SEED. AlphaFold 3 runs its whole model once a seed, so every
+  // seed's trunk draws its own MSA rows each pass (shared/af3/msa-draw.js); one trunk for every seed was the first
+  // seed's draws under all of them. Where nothing is drawn - an alignment no deeper than the rows a pass reads, chai-1,
+  // an AF3 dump - every seed's trunk is the same trunk, and it is run once for all of them as before.
+  std::vector<std::vector<uint64_t>> seedGroups;
+  // (several GPUs keep one trunk: their ranks are dealt out of the trunk's pair once it is done - not yet a trunk a seed)
+  if ((t.drawn || mcPossible) && mg::WORLD == 1) for (uint64_t s : seedList) seedGroups.push_back({ s });
+  else seedGroups.push_back(seedList);
+  const int G = (int)seedGroups.size();
+  if (G > 1) printf("trunk: one a seed (%d seeds), each drawing its own MSA rows\n", G);
+  else if ((t.drawn || mcPossible) && seedList.size() > 1)
+    printf("trunk: one for every seed on several GPUs, its MSA rows drawn from seed %llu's stream\n", (unsigned long long)seedList[0]);
+  auto foldStart = std::chrono::steady_clock::now();
+  // what a fold's seed groups add up to: the ranking, the best sample (and its trunk's contact map), the times
+  double diffMs = 0, confMs = 0, bestScore = -1e30, trunkMs = 0; int best = 0; uint64_t bestSeed = seedList[0];
+  StructureScores bestSS{ false, 0.0 };
+  ConfidenceOut conf;
+  std::vector<float> x, bestContact;
+  std::vector<std::string> ranking;
+  FrameStreamer frames;
+  for (int step = 0; doFold && step < folds * G; ++step) {
+    const int fi = step / G, gi = step % G;
+    const bool lastGroup = gi + 1 == G;
+    t.drawSeed = seedGroups[gi][0];
+    t.mcOn = mcPossible && lf::mcDropoutApplies(t.drawSeed, mcOdds);
+    if (t.mcOn) printf("trunk: protenix's MC dropout on the recycled pair (seed %llu)\n", (unsigned long long)t.drawSeed);
+    if (gi == 0) {
+      foldStart = std::chrono::steady_clock::now();
+      diffMs = confMs = trunkMs = 0; bestScore = -1e30; best = 0; bestSeed = seedList[0]; bestSS = StructureScores{ false, 0.0 };
+      conf = ConfidenceOut{}; x.clear(); bestContact.clear(); ranking.clear();
+    }
+    if (step > 0 || t.p16 != want16) {   // a fresh fold (or seed): the trunk restarts from zero recycled state
       size_t pp = (size_t)t.n * t.n * t.C;
       if (!t.pair && !want16) t.pair = dalloc(pp);     // (left parked by the last fold)
       usePair16(t, want16);   // (in place, the pair is the recycled one; zeroed)
@@ -490,7 +531,7 @@ static int foldMain(int argc, char** argv) {
     auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
     size_t pairs = (size_t)t.n * t.n;
     bool profiling = profile && fi + 1 == folds;      // the last (warm) fold
-    if (profiling) prof::start();
+    if (profiling && gi == 0) prof::start();
     ++SCORE_ATOMS_GEN;                                // (this fold's input: its atoms are read once, scores.cuh)
     auto f0 = clock();
     // A recycle pass is ~1000 launches with identical shapes and pointers, so from the second pass on
@@ -540,6 +581,7 @@ static int foldMain(int argc, char** argv) {
       return true;
     };
     for (int pass = 0; pass <= lastPass; ++pass) {
+      drawMsa(t);                   // (this pass's MSA rows, before - never inside - the captured graph)
       if (pass == 0) {
         if (fast) runTrunk<half>(t, none); else runTrunk<float>(t, none);
         afterPass(pass); if (converged(pass)) break; continue;
@@ -552,7 +594,8 @@ static int foldMain(int argc, char** argv) {
       // (several GPUs on a sharded pair: the pass captured too - its fences count their generations on the device - where
       // the ranks have a GPU each; a rank's kernels are an eighth as long, so the launches are a larger share)
       const bool shardGraph = sharded(t) && !noGraphs && !mg::SHARED_DEVICE;
-      if (!(GRAPHS || shardGraph) || STAGES || !(lastPass >= 7 || t.n >= 200) || shortPair((size_t)t.n * t.n, t.C)) {
+      // (nor protenix's: its MSA's row count and its dropout's key change pass to pass, which a replayed graph would fix)
+      if (!(GRAPHS || shardGraph) || STAGES || !(lastPass >= 7 || t.n >= 200) || shortPair((size_t)t.n * t.n, t.C) || t.native || t.mcOn) {
         recyclePass(); afterPass(pass); if (converged(pass)) break; continue;
       }
       if (!trunkGraph) {
@@ -730,21 +773,15 @@ static int foldMain(int argc, char** argv) {
     // batch through the denoiser, sample k of seed s seeded sampleSeed(s, k); the best of them all is
     // written to --out, every one to <out>_sample<k>.pdb (<out>_seed<s>_sample<k>.pdb with several
     // seeds), and the scores to <out>_ranking_scores.csv.
-    double diffMs = 0, confMs = 0, bestScore = -1e30; int best = 0; uint64_t bestSeed = seedList[0];
-    StructureScores bestSS{ false, 0.0 };
-    ConfidenceOut conf;
-    std::vector<float> x;
     std::string ext = cifPath(out) ? ".cif" : ".pdb";     // --out=*.cif: mmCIF, as AlphaFold 3 writes
     std::string stem = out.size() > 4 && out.substr(out.size() - 4) == ext ? out.substr(0, out.size() - 4) : out;
     bool many = seedList.size() > 1 || samples > 1;
-    std::vector<std::string> ranking;
     // every (seed, sample) through the denoiser together, up to ten a batch: a batch's GEMMs cost far
     // less than its rows (five samples' diffusion is 1.6x one's at 68 tokens)
     std::vector<std::pair<uint64_t, int>> runs;
-    for (uint64_t s : seedList) for (int k = 0; k < samples; ++k) runs.push_back({ s, k });
+    for (uint64_t s : seedGroups[gi]) for (int k = 0; k < samples; ++k) runs.push_back({ s, k });
     const size_t perBatch = std::max<size_t>(samples, 10);
     if (sharded(t) && runs.size() > 10) { fprintf(stderr, "a sharded pair: ten seed x sample runs at most yet\n"); return 1; }
-    FrameStreamer frames;
     for (size_t c0 = 0; c0 < runs.size(); c0 += perBatch) {
     const size_t cn = std::min(perBatch, runs.size() - c0);
     if (structural && c0 > 0) swapBatch();     // the structural tokens again, for this batch's diffusion
@@ -752,7 +789,7 @@ static int foldMain(int argc, char** argv) {
     NS = (int)cn;
     std::vector<uint64_t> seeds;
     for (size_t k = 0; k < cn; ++k) seeds.push_back(sampleSeed(runs[c0 + k].first, runs[c0 + k].second));
-    if (!framesDir.empty() && c0 == 0) {          // (the first batch's first sample)
+    if (!framesDir.empty() && c0 == 0 && gi == 0) {          // (the first seed's first batch's first sample)
       TAP().reserve(FrameStreamer::planned(steps), mask.size() * 3 * 4);
       frames.start(framesDir, mask.size() * 3, steps, structural ? M.i("structural.residueAtomGather") : nullptr);
     }
@@ -1026,14 +1063,16 @@ static int foldMain(int argc, char** argv) {
       if (!std::isfinite(dp->score) && !mg::SIM) { fprintf(stderr, "sample %d: ranking score %f is not finite\n", dp->k, dp->score); exit(1); }
       if (dp->score > bestScore || x.empty()) {
         bestScore = dp->score; best = dp->sk; bestSeed = dp->sd; conf = std::move(dp->ck); x = std::move(dp->xk); bestSS = dp->ss;
+        bestContact = contact;           // (its own trunk's: one a seed)
       }
     }
     }
-    if (!framesDir.empty()) {
+    trunkMs += ms(f0, f1);
+    if (lastGroup && !framesDir.empty()) {
       frames.finish();
       printf("frames: %d written, %d dropped\n", frames.written, TAP().dropped);
     }
-    if (many && out != "/dev/null") {        // AlphaFold 3's ranking_scores.csv
+    if (lastGroup && many && out != "/dev/null") {        // AlphaFold 3's ranking_scores.csv
       FILE* rf = fopen((stem + "_ranking_scores.csv").c_str(), "w");
       fprintf(rf, "seed,sample,ranking_score\n");
       for (auto& r : ranking) fprintf(rf, "%s\n", r.c_str());
@@ -1044,8 +1083,9 @@ static int foldMain(int argc, char** argv) {
     }
     auto f2 = clock();
     auto f3 = f2;
+    if (lastGroup) {      // (the fold's outputs, once its every seed has run)
     auto order = writeStructure(out, x, conf.plddt.data());     // per-atom pLDDT in the B-factor column
-    if (out != "/dev/null") writeConfidences(out, order, t.n, dense, conf.plddt, conf.pae, conf.tmTerm, contact, conf.ptm,
+    if (out != "/dev/null") writeConfidences(out, order, t.n, dense, conf.plddt, conf.pae, conf.tmTerm, bestContact, conf.ptm,
                                              conf.iptm, bestScore, conf.meanPlddt, bestSS.clash, bestSS.disordered);
     if (many) printf("  best: seed %llu sample %d\n", (unsigned long long)bestSeed, best);
     if (const char* pp = getenv("AF3_PAE_OUT")) {   // the raw PAE/PDE/pLDDT, for comparing two arms
@@ -1058,15 +1098,16 @@ static int foldMain(int argc, char** argv) {
       for (auto& [k, v] : STAGE_MS) printf("  %-16s %9.1f ms  %4.1f%%\n", k.c_str(), v, 100 * v / total);
     }
     printf("mean pLDDT %.2f  pTM %.4f  ipTM %.4f  -> %s\n", conf.meanPlddt, conf.ptm, conf.iptm, out.c_str());
-    printf("fold %d: trunk %.1f ms (%d passes), diffusion %.1f ms (%d steps x %d%s), confidence %.1f ms, total %.1f ms\n",
-           fi + 1, ms(f0, f1), passesRun, diffMs, steps, samples,
-           seedList.size() > 1 ? (" x " + std::to_string(seedList.size()) + " seeds").c_str() : "", confMs, ms(f0, f3));
+    printf("fold %d: trunk %.1f ms (%d passes%s), diffusion %.1f ms (%d steps x %d%s), confidence %.1f ms, total %.1f ms\n",
+           fi + 1, trunkMs, passesRun, G > 1 ? (" x " + std::to_string(G) + " trunks").c_str() : "", diffMs, steps, samples,
+           seedList.size() > 1 ? (" x " + std::to_string(seedList.size()) + " seeds").c_str() : "", confMs, ms(foldStart, f3));
     if (profiling) prof::stop(40);
     if (fi == 0 && which == 0 && serveDir.empty() && getenv("LOCALFOLD_UNREAD")) unreadWeights();
+    }
     if (df.graph) CK(cudaGraphExecDestroy(df.graph));
     df.preSingle = df.preSnProj = nullptr;
     if (tight) releaseScratch();      // the next fold's trunk starts from the card it had
-    if (fi + 1 == folds) return 0;
+    if (lastGroup && fi + 1 == folds) return 0;
   }
   std::function<void(const char*, const float*, size_t)> seam = [&](const char* name, const float* d, size_t n) {
     std::string tap = std::string("oracle.trunk.stages.tap.") + name;
@@ -1081,6 +1122,7 @@ static int foldMain(int argc, char** argv) {
     if (it == 1) STAGE_MS.clear();
     auto s = std::chrono::steady_clock::now();
     stage(nullptr);
+    drawMsa(t);
     if (fast) runTrunk<half>(t, it == 0 ? seam : quiet);
     else runTrunk<float>(t, it == 0 ? seam : quiet);
     CK(cudaDeviceSynchronize());

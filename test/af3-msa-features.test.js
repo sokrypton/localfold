@@ -12,7 +12,7 @@
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 
-import { af3MsaFromA3m, AF3_MSA_CODES, AF3_MSA_GAP } from "../shared/af3/featurise/msa-features.js";
+import { af3MsaFromA3m, AF3_MSA_CODES, AF3_MSA_GAP, AF3_MSA_SIZE } from "../shared/af3/featurise/msa-features.js";
 
 const QUERY = "ACDEFGHIKL";
 const a3m = (...rows) => rows.map((row, index) => `>seq${index}\n${row}`).join("\n") + "\n";
@@ -36,6 +36,13 @@ describe("af3MsaFromA3m", () => {
     assert.equal(rows.depth, 3, "and a third row prepended downstream");
     assert.deepEqual(Array.from(rows.msa[0]), Array.from(rows.msa[0]).map((_, index) =>
       AF3_MSA_CODES[QUERY[index]]));
+  });
+
+  it("clips a row's deletion count at 127, AF3's int8 - and the profile's rows keep the true count", () => {
+    // features.py casts `deletion_matrix` with safe_cast_int8 after computing deletion_mean from the true counts
+    const { deletionMatrix, profileDeletionMatrix } = af3MsaFromA3m(a3m(QUERY, "AC" + "q".repeat(300) + "DEFGHIKL"));
+    assert.equal(deletionMatrix[1][2], 127);
+    assert.equal(profileDeletionMatrix[1][2], 300);
   });
 
   it("counts deletions raw, not squashed", () => {
@@ -63,15 +70,13 @@ describe("af3MsaFromA3m", () => {
     assert.equal(AF3_MSA_CODES.O, AF3_MSA_CODES.X);
   });
 
-  it("caps the depth at what the model will read, counting the query", () => {
-    // maxSequences is the model's num_msa, so the rows returned are one fewer:
-    // featuriseProtein contributes the first. Off by one here is a silently
-    // deeper or shallower MSA than the caller asked for.
+  it("returns every row, not a draw: the trunk draws num_msa of them afresh each pass", () => {
+    // AF3's featuriser keeps up to 16384 rows and its trunk shuffles and truncates to num_msa inside every pass
+    // (shared/af3/msa-draw.js); one draw here, for the whole fold, was 8S83's gap to stock AF3. The rows returned
+    // are one fewer than the depth: featuriseProtein contributes the first.
     const text = a3m(QUERY, ...Array.from({ length: 20 }, () => "AC--FGHIKL"));
-    assert.equal(af3MsaFromA3m(text, { maxSequences: 5 }).msa.length, 4);
-    assert.equal(af3MsaFromA3m(text, { maxSequences: 5 }).depth, 5);
-    // An alignment shallower than the cap is not padded up to it.
-    assert.equal(af3MsaFromA3m(text, { maxSequences: 500 }).depth, 22);
+    assert.equal(af3MsaFromA3m(text).msa.length, 21);
+    assert.equal(af3MsaFromA3m(text).depth, 22);
   });
 
   it("puts the paired block first and the unpaired block after it", () => {
@@ -105,104 +110,59 @@ describe("af3MsaFromA3m", () => {
     assert.equal(rows.unpairedFrom, 0, "row zero, the query itself");
   });
 
-  it("gives the paired block at most half the budget, and the rest to unpaired", () => {
-    // 🔴 THE REGRESSION THIS FILE EXISTED WITHOUT. AF3 sets
-    // max_paired_sequences = msa_size // 2 and then fills the remainder from the
-    // unpaired block. Letting the paired block take the whole cap is the natural
-    // way to write the loop, and it only shows on a HOMO-OLIGOMER: a monomer has
-    // no paired block, so every single-chain check passes while a dimer folds
-    // against a paired block that has eaten the entire budget, no unpaired rows
-    // at all, and a profile with nothing left to average.
-    const deep = (residue) => a3m(QUERY, ...Array.from({ length: 40 }, () => residue.repeat(10)));
-    const rows = af3MsaFromA3m({ paired: deep("A"), unpaired: deep("C") },
-                               { maxSequences: 10 });
-    assert.equal(rows.depth, 10, "the cap is still the cap");
-    // The paired crop is 5 - half of 10 - of which row zero is the query
-    // featuriseProtein writes, so four rows come from here. The unpaired crop
-    // is the remaining 5, and it spends all five on HOMOLOGS: its own query row
-    // is the duplicate AF3's deduplication removes, and the crop counts rows,
-    // so skipping it moves the end rather than costing a row.
-    assert.equal(rows.unpairedFrom, 5);
-    assert.deepEqual(rows.msa.map((row) => row[0]), [
-      ...Array(4).fill(AF3_MSA_CODES.A),
-      ...Array(5).fill(AF3_MSA_CODES.C),
-    ]);
-    // ...so the profile sees five rows, not zero, which is the actual failure.
-    assert.equal(rows.depth - rows.unpairedFrom, 5);
+  it("gives the paired block at most half of AF3's 16384 rows, and the rest to unpaired", () => {
+    // 🔴 THE REGRESSION THIS FILE EXISTED WITHOUT. AF3 sets max_paired_sequences = msa_size // 2 and then fills the
+    // remainder from the unpaired block. Letting the paired block take the whole crop is the natural way to write the
+    // loop, and it only shows on a HOMO-OLIGOMER: a monomer has no paired block, so every single-chain check passes
+    // while a dimer folds against a paired block that has eaten everything, no unpaired rows at all, and a profile
+    // with nothing left to average.
+    const deep = (residue, count) => a3m(QUERY, ...Array.from({ length: count }, () => residue.repeat(10)));
+    const rows = af3MsaFromA3m({ paired: deep("A", 9000), unpaired: deep("C", 10000) });
+    // The paired block (its A3M's 9001 rows, plus the query row featuriseProtein writes) is cropped to 8192, so
+    // 8191 rows come from here. The unpaired crop is the remaining 8192, and it spends 8191 of them on HOMOLOGS: its
+    // own query row is the duplicate AF3's deduplication removes.
+    assert.equal(rows.depth, AF3_MSA_SIZE - 1);
+    assert.equal(rows.unpairedFrom, 8192);
+    assert.equal(rows.msa.filter((row) => row[0] === AF3_MSA_CODES.A).length, 8191);
+    assert.equal(rows.msa.filter((row) => row[0] === AF3_MSA_CODES.C).length, 8191);
+    // ...and the order is file order: every paired row before every unpaired one
+    assert.equal(rows.msa[8190][0], AF3_MSA_CODES.A);
+    assert.equal(rows.msa[8191][0], AF3_MSA_CODES.C);
   });
 
   it("gives the unpaired block everything when there is no paired one", () => {
     const deep = a3m(QUERY, ...Array.from({ length: 40 }, () => "CCCCCCCCCC"));
-    const rows = af3MsaFromA3m({ paired: null, unpaired: deep }, { maxSequences: 10 });
-    assert.equal(rows.depth, 10);
+    const rows = af3MsaFromA3m({ paired: null, unpaired: deep });
+    assert.equal(rows.depth, 42);
     assert.equal(rows.unpairedFrom, 1, "straight after the query row");
   });
 
-  it("takes the first rows rather than sampling them", () => {
-    // AF3's truncate_msa_batch is jnp.arange(num_msa). MMseqs2 returns hits in
-    // decreasing similarity, so the first N are the N most similar; a shuffle
-    // would be a different model input, not a fairer sample.
+  it("keeps the alignment's own order, and nothing depends on a seed", () => {
     const text = a3m(QUERY, "AAAAAAAAAA", "CCCCCCCCCC", "DDDDDDDDDD");
-    const { msa } = af3MsaFromA3m(text, { maxSequences: 3 });
-    assert.deepEqual(Array.from(msa[1]).slice(0, 2), [AF3_MSA_CODES.A, AF3_MSA_CODES.A]);
+    const { msa } = af3MsaFromA3m(text);
+    assert.deepEqual(msa.map((row) => row[0]), [AF3_MSA_CODES.A, AF3_MSA_CODES.A, AF3_MSA_CODES.C, AF3_MSA_CODES.D]);
   });
 });
 
-describe("subsampling a deeper alignment than the budget", () => {
-  // 🔴 A PREFIX IS THE CLOSEST HOMOLOGS. An A3M arrives sorted by how well each
-  // hit matched, so taking the first N takes the rows that agree with the query
-  // and with each other, and drops the distant ones carrying most of the
-  // covariation. AlphaFold 3 shuffles and then truncates to num_msa, so what
-  // reaches its model is a random subset.
-  const deep = a3m(QUERY, ...Array.from({ length: 40 },
-    (_, index) => "ACDEFGHIK" + "LMNPQRSTVWY"[index % 11]));
-  const uniform = (seed) => {
-    let state = seed >>> 0;
-    return () => {
-      state = (state * 1664525 + 1013904223) >>> 0;
-      return (state + 1) / 4294967297;
-    };
-  };
-  const lastColumn = (rows) => rows.msa.map((row) => row[9]).join(",");
-
-  it("takes the prefix when no generator is given", () => {
-    // The old behaviour, kept for anything that wants a fixed alignment.
-    const rows = af3MsaFromA3m({ unpaired: deep }, { maxSequences: 8 });
-    assert.equal(lastColumn(rows), lastColumn(af3MsaFromA3m({ unpaired: deep },
-      { maxSequences: 8 })));
-  });
-
-  it("takes a different subset with a generator, and the same one twice", () => {
-    const one = af3MsaFromA3m({ unpaired: deep }, { maxSequences: 8, random: uniform(1) });
-    const two = af3MsaFromA3m({ unpaired: deep }, { maxSequences: 8, random: uniform(2) });
-    const again = af3MsaFromA3m({ unpaired: deep }, { maxSequences: 8, random: uniform(1) });
-    const prefix = af3MsaFromA3m({ unpaired: deep }, { maxSequences: 8 });
-    assert.notEqual(lastColumn(one), lastColumn(prefix), "a sample, not the prefix");
-    assert.notEqual(lastColumn(one), lastColumn(two), "two seeds are two alignments");
-    assert.equal(lastColumn(one), lastColumn(again), "one seed is reproducible");
-  });
-
-  it("keeps the depth the budget asked for", () => {
-    for (const seed of [1, 2, 3]) {
-      const rows = af3MsaFromA3m({ unpaired: deep }, { maxSequences: 8, random: uniform(seed) });
-      assert.equal(rows.depth, 8, `seed ${seed}`);
-    }
-  });
-
-  it("returns the chosen rows in file order, because only the SET matters", () => {
-    // The MSA stack is permutation-equivariant across rows - the outer product
-    // mean sums over them, the row attention treats each independently - so
-    // shuffling the order would change nothing and cost legibility.
-    const rows = af3MsaFromA3m({ unpaired: deep }, { maxSequences: 8, random: uniform(4) });
-    const codes = rows.msa.map((row) => row[9]);
-    assert.equal(codes.length, 7);
-  });
-
+describe("the pool a deeper alignment gives", () => {
   it("leaves the profile alone, which is over the whole alignment", () => {
-    // The profile is computed before any crop, so a subsample must not move it.
-    const sampled = af3MsaFromA3m({ unpaired: deep }, { maxSequences: 8, random: uniform(5) });
-    const whole = af3MsaFromA3m({ unpaired: deep }, { maxSequences: Infinity });
-    assert.equal(sampled.profileMsa.length, whole.profileMsa.length);
-    assert.equal(sampled.profileMsa.length, 41, "the query and all 40 hits");
+    const deep = a3m(QUERY, ...Array.from({ length: 40 },
+      (_, index) => "ACDEFGHIK" + "LMNPQRSTVWY"[index % 11]));
+    const rows = af3MsaFromA3m({ unpaired: deep });
+    assert.equal(rows.profileMsa.length, 41, "the query and all 40 hits");
+  });
+
+  it("is AF3's 16384-row MSA, not past it - and the profile is over them all", () => {
+    // features.py crops each chain to msa_size rows (less the paired block) before the model draws num_msa; rows
+    // past that are never drawn. Rows from 16382 on are W here, so a W in the pool is a row AF3 never holds.
+    const rows = ["CCCCCCCCCC"];
+    for (let row = 1; row < 20000; row += 1) rows.push(row < AF3_MSA_SIZE - 2 ? "CCCCCCCCCC" : "WWWWWWWWWW");
+    rows[0] = QUERY;
+    const out = af3MsaFromA3m({ paired: a3m(QUERY), unpaired: a3m(...rows) });
+    assert.equal(AF3_MSA_SIZE, 16384);
+    assert.ok(out.msa.every((codes) => codes[0] !== AF3_MSA_CODES.W), "a row past AF3's crop is in the pool");
+    // (the pool is 16384 less the paired block of two rows: rows 0..16381, so 16381 is in and 16382 out)
+    assert.equal(out.msa.filter((codes) => codes[0] === AF3_MSA_CODES.C).length, AF3_MSA_SIZE - 3);
+    assert.equal(out.profileMsa.length, 20000, "the profile is over the uncropped block");
   });
 });

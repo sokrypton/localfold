@@ -426,7 +426,7 @@ for (const target of Object.keys(TARGETS)) {
   if (dump === null) { missing += 1; console.log(`${model.padEnd(14)} no dump`); continue; }
   const dialect = dialectFor(model);
   const batch = af3BatchFromA3m(dump.sequence, TARGETS[target].alignment?.() ?? null,
-                                { ...batchFor(dialect, target), prefixRows: true }).batch;
+                                batchFor(dialect, target)).batch;
 
   const bad = [];
   const floor = [];   // deliberate deviations: reported every run, never failed

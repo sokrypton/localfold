@@ -266,7 +266,16 @@ if (sequence !== "") {
 // chai1_structure_bond into the diffusion's. The bond matrix the featuriser builds holds every ligand bond and must
 // not reach either.
 if (dialect?.chaiTokenEmbedding === true) delete batch.bondMatrix;
-add("batch", batch);
+// ...and the MSA pool packed, an int32 a cell where `msa`, `msaMask` and `deletionMatrix` stood (msa-draw.js packMsa)
+{
+  const { packMsa } = await import(`${repo}/shared/af3/msa-draw.js`);
+  const exported = {};
+  for (const key in batch) {
+    if (key === "msa") exported.msaPacked = packMsa(batch.msa, batch.msaMask, batch.deletionMatrix);
+    else if (key !== "msaMask" && key !== "deletionMatrix") exported[key] = batch[key];
+  }
+  add("batch", exported);
+}
 // chai1's tokens read ESM2 3B, which native runs (cuda/plm/esm2.cuh, --esm-bundle): each protein chain's token ids and
 // every token's row (shared/af3/featurise/esm2-input.js) - unless the batch already carries the embeddings (a dump's)
 if (dialect?.chaiTokenEmbedding === true && batch.esmEmbeddings === undefined) {

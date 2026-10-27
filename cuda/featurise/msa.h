@@ -210,8 +210,8 @@ struct Alignment {
 };
 
 struct MsaRows {
-  std::vector<std::vector<int>> msa;
-  std::vector<std::vector<float>> deletionMatrix;
+  std::vector<std::vector<int8_t>> msa;
+  std::vector<std::vector<uint8_t>> deletionMatrix;
   std::vector<std::vector<int>> profileMsa;
   std::vector<std::vector<float>> profileDeletionMatrix;
   bool hasProfile = false;
@@ -315,8 +315,8 @@ inline A3m pairedIntoUnpaired(const A3m* unpaired, const A3m* paired, const std:
   return out;
 }
 
-inline MsaRows af3MsaFromA3m(const Alignment& alignment, int maxSequences, const std::vector<std::string>* columnKinds,
-                             Uniform* random, int mainMsaCap = 0, const std::vector<int>* chainOfColumn = nullptr,
+inline MsaRows af3MsaFromA3m(const Alignment& alignment, const std::vector<std::string>* columnKinds,
+                             int mainMsaCap = 0, const std::vector<int>* chainOfColumn = nullptr,
                              bool protenixUnpairedMsa = false, bool rf3ProfileMsa = false, bool if2ProfileMsa = false) {
   auto codeOf = [&](const std::string& aligned, int column) {
     char ch = aligned[column];
@@ -361,36 +361,30 @@ inline MsaRows af3MsaFromA3m(const Alignment& alignment, int maxSequences, const
     profileBlock.ok = true;
   }
   const Parsed& unpairedProfile = profileBlock.ok ? profileBlock : unpaired;
+  // (msa-features.js: the rows are AF3's whole 16384-row MSA - features.py's crop, paired to half - and the trunk
+  // draws num_msa of them afresh every pass, shared/af3/msa-draw.js and msa_draw.h)
   int pairedBlock = !paired.ok ? 1 : paired.a.depth + 1;
-  int pairedCrop = std::min(pairedBlock, std::max(1, maxSequences / 2));
-  int unpairedCrop = !unpaired.ok ? 0 : std::min(unpaired.a.depth, maxSequences - pairedCrop);
-  auto chooseRows = [&](std::vector<int> available, int count) {
-    if (count >= (int)available.size()) return available;
-    if (random == nullptr) { available.resize(std::max(0, count)); return available; }
-    for (int index = (int)available.size() - 1; index > 0; --index) {
-      int swap = (int)std::floor((*random)() * (index + 1));
-      std::swap(available[index], available[swap]);
-    }
-    available.resize(std::max(0, count));
-    std::sort(available.begin(), available.end());
-    return available;
-  };
+  const int msaSize = 16384;
+  int pairedPool = !paired.ok ? 0 : std::min(paired.a.depth, std::min(pairedBlock, msaSize / 2) - 1);
+  int unpairedPool = !unpaired.ok ? 0 : std::min(unpaired.a.depth, msaSize - std::min(pairedBlock, msaSize / 2));
   MsaRows out;
   auto append = [&](const Parsed& p, int from, int upTo) {
     if (!p.ok) return;
-    std::vector<int> span;
-    for (int row = from; row < p.a.depth; ++row) span.push_back(row);
-    for (int row : chooseRows(span, upTo - from)) {
-      std::vector<int> codes(p.a.length);
-      for (int c = 0; c < p.a.length; ++c) codes[c] = codeOf(p.a.sequences[row], c);
-      out.msa.push_back(codes);
-      out.deletionMatrix.emplace_back(p.a.deletions[row].begin(), p.a.deletions[row].end());
+    for (int row = from; row < upTo; ++row) {
+      std::vector<int8_t> codes(p.a.length);
+      for (int c = 0; c < p.a.length; ++c) codes[c] = (int8_t)codeOf(p.a.sequences[row], c);
+      out.msa.push_back(std::move(codes));
+      // (a deletion count is AF3's int8, clipped at 127 - msa-features.js; the profile's rows keep the true count)
+      std::vector<uint8_t> del(p.a.deletions[row].size());
+      for (size_t c = 0; c < del.size(); ++c) del[c] = (uint8_t)std::min((float)p.a.deletions[row][c], 127.f);
+      out.deletionMatrix.push_back(std::move(del));
     }
   };
-  append(paired, 0, pairedCrop - 1);
+  append(paired, 0, pairedPool);
   int unpairedFrom = (int)out.msa.size() + 1;
   int unpairedStart = !paired.ok ? 0 : 1;
-  append(unpaired, unpairedStart, !unpaired.ok ? 0 : std::min(unpaired.a.depth, unpairedCrop + unpairedStart));
+  append(unpaired, unpairedStart, unpairedPool);
+  int unpairedRows = (int)out.msa.size() + 1 - unpairedFrom;
   if (unpairedProfile.ok) {
     for (int row = 0; row < unpairedProfile.a.depth; ++row) {
       std::vector<int> codes(unpairedProfile.a.length);
@@ -400,7 +394,7 @@ inline MsaRows af3MsaFromA3m(const Alignment& alignment, int maxSequences, const
     }
   }
   out.hasProfile = true;
-  out.unpairedFrom = unpairedCrop == 0 ? 0 : unpairedFrom;
+  out.unpairedFrom = unpairedRows == 0 ? 0 : unpairedFrom;
   return out;
 }
 

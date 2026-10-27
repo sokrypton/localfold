@@ -5,6 +5,7 @@
 // strings skipped, an object's keys in their insertion order). The index goes last and atomically, since a binary
 // may be waiting for it.
 #pragma once
+#include <algorithm>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -93,7 +94,12 @@ inline void addBatch(Entries& e, const Batch& b, bool withBondMatrix = true) {
   e.m(p + "shape.tokens", b.tokens); e.m(p + "shape.dense", b.dense); e.m(p + "shape.subsets", b.subsets);
   e.m(p + "shape.queries", QUERIES); e.m(p + "shape.keys", b.keys);
   e.i(p + "aatype", b.aatype); e.t(p + "profile", b.profile); e.t(p + "deletionMean", b.deletionMean);
-  e.i(p + "msa", b.msa); e.t(p + "msaMask", b.msaMask); e.t(p + "deletionMatrix", b.deletionMatrix);
+  {   // the MSA pool packed, an int32 a cell: code | deletion << 8 | mask << 16 (shared/af3/msa-draw.js packMsa)
+    std::vector<int> packed(b.msa.size());
+    for (size_t k = 0; k < packed.size(); ++k)
+      packed[k] = (b.msa[k] & 0xff) | ((int)b.deletionMatrix[k] << 8) | ((b.msaMask[k] != 0 ? 1 : 0) << 16);
+    e.i(p + "msaPacked", std::move(packed));
+  }
   e.i(p + "residueIndex", b.residueIndex); e.i(p + "tokenIndex", b.tokenIndex); e.i(p + "asymId", b.asymId);
   e.i(p + "entityId", b.entityId); e.i(p + "symId", b.symId); e.t(p + "seqMask", b.seqMask);
   e.t(p + "refPos", b.refPos); e.t(p + "refMask", b.refMask); e.i(p + "refElement", b.refElement);
@@ -141,6 +147,7 @@ inline void addBatch(Entries& e, const Batch& b, bool withBondMatrix = true) {
   e.i(p + "features.residueIndex", b.residueIndex); e.i(p + "features.tokenIndex", b.tokenIndex);
   e.i(p + "features.asymId", b.asymId); e.i(p + "features.entityId", b.entityId); e.i(p + "features.symId", b.symId);
   if (!b.msaSource.empty()) e.i(p + "msaSource", b.msaSource);   // (chai1: applyChaiMsa adds it last)
+  if (b.numMsa > 0) e.m(p + "numMsa", b.numMsa);                    // (af3BatchFromA3m sets it after that)
 }
 
 }  // namespace lf

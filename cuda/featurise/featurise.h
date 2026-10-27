@@ -64,9 +64,9 @@ struct FeaturiseOptions {
   int atomizedUnknownRestype = 0;                 // 0 false, 1 an amino acid's, 2 "nucleic" (a base's too), 3 "chai" (a base's 30), 4 "aatype" (2 on the restype alone)
   int atomizedBackboneBonds = 0;                  // 0 none, 1 to every neighbour, 2 between two atomised residues alone
   bool modifiedAsOneToken = false;
-  // the alignment's rows (msa-features.js)
-  std::vector<std::vector<int>> msa;
-  std::vector<std::vector<float>> deletionMatrix;
+  // the alignment's rows (msa-features.js): a byte a code and a byte a deletion count (<= 127), as AF3 holds them
+  std::vector<std::vector<int8_t>> msa;
+  std::vector<std::vector<uint8_t>> deletionMatrix;
   bool hasUnpairedFrom = false; int unpairedFrom = 0;
   std::vector<std::vector<int>> profileMsa;
   std::vector<std::vector<float>> profileDeletionMatrix;
@@ -79,7 +79,9 @@ struct Batch {
   int tokens = 0, dense = DENSE, subsets = 0, atomCount = 0, sequences = 0, keys = 0;
   int pairedRows = 0;                              // the paired block's row count (chai-1's IsPairedMSA)
   std::vector<int> aatype; std::vector<float> profile, deletionMean;
-  std::vector<int> msa; std::vector<float> msaMask, deletionMatrix;
+  // the MSA pool, three bytes a cell as AF3 holds it (int8 codes, a 0/1 mask, int8 deletion counts): it is up to
+  // 16384 rows, drawn from afresh every trunk pass (msa_draw.h), and a backend widens the rows a pass reads
+  std::vector<int8_t> msa; std::vector<uint8_t> msaMask, deletionMatrix;
   std::vector<int> residueIndex, tokenIndex, asymId, entityId, symId; std::vector<float> seqMask;
   std::vector<float> refPos, refMask, predDenseAtomMask; std::vector<int> refElement; std::vector<float> refCharge;
   std::vector<int> refAtomNameChars, refSpaceUid, displayAtomNameChars;
@@ -89,6 +91,7 @@ struct Batch {
   std::vector<int> residueOfToken; std::vector<float> chainOfResidue;
   std::vector<int> isDna, isRna, isLigand, isModified;
   std::vector<int> msaSource;                     // chai1's per-row database (chai_msa.h); empty for the rest
+  double numMsa = 0;                              // the trunk's rows a pass (af3BatchFromA3m's batch.numMsa); 0 unset
   Gather tokenAtomsToQueries, queriesToKeys, queriesToTokenAtoms, tokensToQueries, tokensToKeys, tokenAtomsToPseudoBeta;
 };
 
@@ -863,14 +866,14 @@ inline Batch featuriseProtein(const std::string& sequence, const FeaturiseOption
   int nucleicRow = unpairedFrom;
   for (int row = 0; row < (int)extra.size(); ++row) {
     size_t base = (size_t)(row + 1) * tokens;
-    const std::vector<float>* deletions = row < (int)o.deletionMatrix.size() ? &o.deletionMatrix[row] : nullptr;
+    const std::vector<uint8_t>* deletions = row < (int)o.deletionMatrix.size() ? &o.deletionMatrix[row] : nullptr;
     bool own = row + 1 == nucleicRow;
     for (int t = 0; t < tokens; ++t) {
       int column = msaColumnOfToken[t];
       if (column < 0 && nucleicToken[t]) { b.msa[base + t] = own ? b.aatype[t] : MSA_GAP; continue; }
       b.msa[base + t] = unknownEverywhere[t] ? queryRow[t]
                       : column < 0 ? MSA_GAP : (column < (int)extra[row].size() ? extra[row][column] : MSA_GAP);
-      if (deletions) b.deletionMatrix[base + t] = column < 0 ? 0 : (column < (int)deletions->size() ? (*deletions)[column] : 0);
+      if (deletions) b.deletionMatrix[base + t] = column < 0 ? 0 : std::min<int>(column < (int)deletions->size() ? (*deletions)[column] : 0, 127);   // (AF3's int8)
     }
   }
   // boltz2's and rf3's alignment is the protein chains' (featurise.js proteinOnlyMsa): a nucleic chain gap past the
