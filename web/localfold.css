@@ -1434,6 +1434,11 @@
    as the selections they write, each with its own remove button. Wraps on a phone. */
 .condition-editor .condition-controls { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 4px; }
 .condition-editor .condition-controls [hidden] { display: none; }
+.condition-field { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: #6b7280; }
+.condition-more .condition-controls { align-items: flex-end; margin-top: 8px; }
+.condition-more select, .condition-more input[type="text"] { box-sizing: border-box; height: 34px; padding: 0 8px;
+  border: 1px solid #d1d5db; border-radius: 8px; background: #fff; color: #111827; font-size: 13px; }
+.condition-more summary { cursor: pointer; color: #2563eb; font-size: 13px; margin-top: 8px; }
 .condition-editor .condition-controls :disabled { opacity: .45; cursor: not-allowed; }
 .condition-rows { list-style: none; margin: 6px 0 0; padding: 0; font-size: 13px; }
 .condition-rows li { padding: 2px 0; overflow-wrap: anywhere; }
@@ -1528,6 +1533,36 @@
 .viewer-bar { display: flex; align-items: center; gap: 10px; min-height: 26px; }
 .viewer-bar [hidden] { display: none !important; }
 .viewer-bar #show-job { margin-left: auto; }
+
+/* 🔴 THE STEPS NUMBER THEMSELVES: the Selection step is hidden until a structure is loaded, and a
+   typed "5" after "3" read as a step the reader had missed. */
+.design-steps { counter-reset: design-step; }
+.design-step:not([hidden]) { counter-increment: design-step; }
+.design-step .step-number { font-size: 0; }
+.design-step .step-number::before { content: counter(design-step); font-size: 12px; }
+
+/* 🔴 ONE LOOK FOR EVERY FIELD ON THE PAGE: the Run settings and the structure box were bare browser
+   inputs under py2Dmol's uppercase captions, beside rounded, sentence-case cards. */
+#step-run .fetch-options { gap: 10px 16px; padding: 0; background: none; border: 0; }
+#step-run .fetch-option-group + .fetch-option-group { border-left: 0; padding-left: 0; margin-left: 0; }
+#step-run .fetch-option-title { font-size: 12px; font-weight: 400; letter-spacing: 0; text-transform: none; color: #6b7280; }
+#step-run input[type="number"], #step-run input[type="text"], #step-run select,
+.design-structure #structure-id {
+  box-sizing: border-box; height: 34px; padding: 0 8px; border: 1px solid #d1d5db; border-radius: 8px;
+  background: #fff; color: #111827; font-size: 13px; }
+#step-run input[type="number"], #step-run input[type="text"] { width: 9ch; }
+#step-run select { min-width: 7rem; }
+#step-run .seed-field input { width: 10ch; }
+#step-run .seed-field .btn { height: 34px; }
+.run-advanced { margin-top: 10px; padding: 10px 12px; border: 1px solid #e5e7eb; border-radius: 8px; background: #f9fafb; }
+.run-advanced[hidden] { display: none; }
+.run-advanced-title { margin: 0 0 8px; font-size: 13px; font-weight: 600; color: #374151; }
+.run-advanced .design-notes { padding: 8px 0 0; }
+
+/* a chain break says what it does, small, beside its picker */
+.contig-head .contig-break { font-style: normal; font-size: 12px; color: #6b7280; }
+/* a CCD code is upper case; its example is not shouted */
+.contig-code::placeholder { text-transform: none; }
 .viewer-bar #show-job[hidden] + .run-button { margin-left: auto; }
 .viewer-bar .run-button { flex: 0 0 auto; }
 .run-where { font-size: 12px; color: #9ca3af; }

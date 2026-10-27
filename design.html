@@ -165,6 +165,31 @@ The style IS index.html's: py2Dmol's light application CSS plus web/localfold.cs
                                 title="How many fold-then-redesign rounds each run does.">
                         </div>
 
+                        <!-- The automatic designer is right in every measured case (docs/DESIGN.md
+                             section 6); the select stays at "auto" for web/hunt.js and a driver. -->
+                        <div class="fetch-option-group" id="designerGroup" hidden>
+                            <span class="fetch-option-title">Designer</span>
+                            <select id="designer" aria-label="Designer">
+                                <option value="auto" selected>Auto</option>
+                                <option value="soluble">SolubleMPNN</option>
+                                <option value="protein">ProteinMPNN</option>
+                                <option value="ligand">LigandMPNN</option>
+                                <option value="na">NA-MPNN</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="run-row">
+                        <button type="button" id="show-advanced" class="btn btn-grey btn-small"
+                            aria-expanded="false" aria-controls="advancedOptions"
+                            title="Sampling steps and the method's own sampler settings.">
+                            Advanced
+                        </button>
+                    </div>
+                    <!-- 🔴 ADVANCED IS ITS OWN BOX, under its own heading: mixed into the main row, the
+                         knobs nobody changes on a first run read as part of the job. -->
+                    <div id="advancedOptions" class="run-advanced" hidden>
+                        <h3 class="run-advanced-title">Advanced</h3>
+                        <div class="fetch-options">
                         <div class="fetch-option-group advanced" id="stepsGroup">
                             <label class="fetch-option-title" id="steps-title" for="steps">Flow steps</label>
                             <input type="number" id="steps" min="4" max="400" value="60"
@@ -213,32 +238,14 @@ The style IS index.html's: py2Dmol's light application CSS plus web/localfold.cs
                             <input type="text" id="omit" value="C" maxlength="20"
                                 title="Amino acids the designer may never write. Cysteine by default.">
                         </div>
-                        <!-- The automatic designer is right in every measured case (docs/DESIGN.md
-                             section 6); the select stays at "auto" for web/hunt.js and a driver. -->
-                        <div class="fetch-option-group" id="designerGroup" hidden>
-                            <span class="fetch-option-title">Designer</span>
-                            <select id="designer" aria-label="Designer">
-                                <option value="auto" selected>Auto</option>
-                                <option value="soluble">SolubleMPNN</option>
-                                <option value="protein">ProteinMPNN</option>
-                                <option value="ligand">LigandMPNN</option>
-                                <option value="na">NA-MPNN</option>
-                            </select>
                         </div>
-                    </div>
-                    <div class="run-row">
-                        <button type="button" id="show-advanced" class="btn btn-grey btn-small"
-                            aria-expanded="false" aria-controls="designOptions"
-                            title="Sampling steps, seed and the method's own sampler settings.">
-                            Advanced
-                        </button>
-                    </div>
-                    <!-- Only Protein Hunter's notes, and only inside Advanced: which designer it
-                         chose and what a run costs in folds. -->
-                    <div class="design-notes">
-                        <div id="unused-note" class="option-note" hidden></div>
-                        <div id="designer-note" class="option-note"></div>
-                        <div id="folder-note" class="option-note"></div>
+                        <!-- Only Protein Hunter's notes: which designer it chose and what a run
+                             costs in folds. -->
+                        <div class="design-notes">
+                            <div id="unused-note" class="option-note" hidden></div>
+                            <div id="designer-note" class="option-note"></div>
+                            <div id="folder-note" class="option-note"></div>
+                        </div>
                     </div>
                 </section>
             </div>

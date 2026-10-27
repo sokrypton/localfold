@@ -977,7 +977,7 @@ export function createContigList(rowsContainer, addControl, options = {}) {
       head.append(picker);
       if (where) head.append(element("span", "contig-chain-tag", where));
       // a break has nothing to fill in: its card is one line saying what it does
-      if (span.kind === "break") head.append(element("span", "contig-break", "a new chain starts below"));
+      if (span.kind === "break") head.append(element("span", "contig-break", "the next segment starts a new chain"));
       const remove = element("button", "btn btn-grey btn-small entity-remove");
       remove.type = "button";
       remove.innerHTML = '<i class="fa-solid fa-xmark" aria-hidden="true"></i>';
@@ -1092,7 +1092,7 @@ export function createContigList(rowsContainer, addControl, options = {}) {
           controls.push(use);
         }
         line("Hotspots", controls, { className: "contig-hot",
-          hint: `Residues the design should touch - the site to bind - ${what}.` });
+          hint: `Where the design should bind, ${what}.` });
       };
 
       if (span.kind === "generated") {
@@ -1200,6 +1200,11 @@ export function createContigList(rowsContainer, addControl, options = {}) {
     const choice = ADD_CHOICES.find(([value]) => value === addControl.value);
     addControl.value = "";
     if (choice === undefined) return;
+    // 🔴 A SEQUENCE OR A LIGAND ADDED IS A CHAIN OF ITS OWN, so it comes with the break before it:
+    // appended to the last chain, a DNA strand made "a chain part protein and part nucleic".
+    const own = ["protein", "dna", "rna", "ligand"].includes(choice[0]);
+    const last = spans[spans.length - 1];
+    if (own && last !== undefined && last.kind !== "break") spans.push(emptySpan("break"));
     spans.push(choice[2]());
     selected = spans.length - 1;
     changed();

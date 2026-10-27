@@ -352,7 +352,9 @@ export function createConditionEditor(host, { picks, peek = () => null, colourOf
   summary.textContent = "More constraints\u2026";
   const kind = document.createElement("select");
   kind.id = "condition-kind";
-  for (const k of CONDITION_KINDS) kind.append(new Option(k.label, k.key));
+  // 🔴 NOT HOTSPOT: a hotspot is a segment's, set on its card or by "Mark as hotspot" - a second way
+  // here wrote a row the reader then could not find on the segment it belongs to.
+  for (const k of CONDITION_KINDS) if (k.key !== "C_HOT") kind.append(new Option(k.label, k.key));
   const valueSelect = document.createElement("select");
   valueSelect.id = "condition-value";
   const valueText = document.createElement("input");
@@ -368,7 +370,17 @@ export function createConditionEditor(host, { picks, peek = () => null, colourOf
   const addButton = button("Add", "Set the chosen condition on the selected residues.", "condition-add");
   const controls = document.createElement("div");
   controls.className = "condition-controls";
-  controls.append(kind, valueSelect, valueText, atoms, addButton);
+  // each control under its name, as every other field on the page is
+  const labelled = (text, ...inputs) => {
+    const field = document.createElement("label");
+    field.className = "condition-field";
+    const name = document.createElement("span");
+    name.textContent = text;
+    field.append(name, ...inputs);
+    return field;
+  };
+  controls.append(labelled("Constraint", kind), labelled("Value", valueSelect, valueText),
+    labelled("Atoms", atoms), addButton);
   more.append(summary, controls);
 
   const paintKind = () => {

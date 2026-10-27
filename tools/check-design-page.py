@@ -386,6 +386,7 @@ def main():
           const spans = window.__designSpans.read();
           const last = document.querySelector('#contig-rows .contig-row:last-child');
           const out = { kinds, grew: spans.length - before, last: spans.at(-1), reset: add.value,
+            breakBefore: spans.at(-2)?.kind === 'break',
             focused: last.contains(document.activeElement),
             card: [...last.querySelectorAll('label')].map((l) => l.textContent.trim()) };
           window.__designSpans.set(spans.slice(0, before));
@@ -404,9 +405,10 @@ def main():
         print(f"  add a segment: {added}")
         if added["kinds"] != ["generated", "protein", "dna", "rna", "segment", "ligand", "break"]:
             bad.append(f"Add a segment offers {added['kinds']}")
-        if added["grew"] != 1 or added["last"].get("kind") != "sequence" or added["last"].get("polymer") != "dna" \
-                or added["reset"] != "" or not added["focused"]:
-            bad.append(f"adding a DNA sequence did not add one DNA card and focus it: {added}")
+        # a sequence is a chain of its own, so it arrives with the break before it
+        if added["grew"] != 2 or not added["breakBefore"] or added["last"].get("kind") != "sequence" \
+                or added["last"].get("polymer") != "dna" or added["reset"] != "" or not added["focused"]:
+            bad.append(f"adding a DNA sequence did not add a break and one DNA card, focused: {added}")
         if added["used"] != "10-12":
             bad.append(f"Use selection on the target's card set its hotspots to {added['used']!r}, expected 10-12")
         cdp.evaluate(ws, choose % "")

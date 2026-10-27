@@ -342,3 +342,15 @@ constraint at all, which decides whether this is plumbing or a port.
   binder under both methods, Add a segment, Use selection, and the strip during
   and after a real hunt. With `--presets` it runs every example as a generation
   and every Hunter one as a one-cycle hunt: all 18 finished (2026-10-27).
+
+### Third pass over the options (2026-10-27) - done
+
+- Steps number themselves (a CSS counter), so a hidden Selection step no longer leaves "3, 5".
+- Run: sentence-case labels and the page's own field style; Advanced is its own titled box under the
+  main settings, holding the method's sampler knobs and Protein Hunter's designer/fold notes.
+- Adding a protein/DNA/RNA sequence or a ligand adds the chain break before it.
+- More constraints: each control labelled (Constraint, Value, Atoms); Hotspot is no longer offered
+  there - it is a segment's, set on its card or by "Mark as hotspot".
+- Shorter hotspot help; a chain break's card says "the next segment starts a new chain"; a
+  ligand-only chain is described as "ligand SAM", not "chain B 1-1".
+- Verified: check-design-page default and --generate ok, npm test 1584 pass, no overflow at 390 px.

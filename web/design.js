@@ -473,7 +473,7 @@ const UNUSED_BY = {
  * do, and one fewer block of prose in the panel.
  */
 const RESTING = {
-  hunter: "Ready. Press Design to hunt, or pick an example first.",
+  hunter: "Ready. Press Design to start the hunt.",
   rfd4p: "Ready. The first run downloads about 420 MB of model weights.",
 };
 
@@ -485,13 +485,10 @@ const RESTING = {
  */
 function paintAdvanced() {
   const open = advancedButton.getAttribute("aria-expanded") === "true";
-  const groups = document.querySelectorAll("#designOptions .advanced");
-  for (const group of groups) {
-    group.hidden = !open;
-  }
+  element("advancedOptions").hidden = !open;
   advancedButton.textContent = open ? "Hide advanced" : "Advanced";
   // Protein Hunter's two notes are about its settings, so they live with them.
-  for (const id of ["designer-note", "folder-note"]) element(id).hidden = !open || method.value !== "hunter";
+  for (const id of ["designer-note", "folder-note"]) element(id).hidden = method.value !== "hunter";
 }
 
 advancedButton.addEventListener("click", () => {
@@ -1483,11 +1480,31 @@ const describeStructure = () => {
     }
     for (const chain of real) placeholders.delete(chain);
   }
-  const parts = [...loaded.chains.entries()].filter(([chain]) => !placeholders.has(chain))
+  // 🔴 AND A CHAIN THAT IS ONLY A LIGAND IS NAMED AS ONE: "chain B 1-1" for SAM read as a broken file.
+  const ligandOf = (chain) => {
+    const names = new Set();
+    const atoms = loaded.atoms;
+    for (let index = 0; index < atoms.chain_id.length; index += 1) {
+      if (String(atoms.chain_id[index]) !== chain) continue;
+      const name = String(atoms.res_name[index]).trim().toUpperCase();
+      if (THREE_TO_ONE[name] !== undefined || NUCLEOTIDE[name] !== undefined) return null;
+      names.add(name);
+    }
+    return [...names].join(" ");
+  };
+  const chains = [...loaded.chains.entries()].filter(([chain]) => !placeholders.has(chain));
+  const parts = chains.filter(([chain]) => ligandOf(chain) === null)
     .map(([chain, range]) => `${chain} ${range.first}\u2013${range.last}`);
+  // A file's own name for its ligand may be no CCD code (the SAM example's is `S;M`); the segment's is.
+  const codes = (spanList?.read() ?? []).filter((span) => span.kind === "ligand").map((span) => span.code);
+  const ligands = chains.map(([chain]) => ligandOf(chain)).filter((name) => name !== null && name !== "")
+    .map((name) => (/^[A-Z0-9]{1,5}$/.test(name) || codes.length === 0 ? name : codes.shift()));
   // The entry or file's name, not the path an example is served from.
   const name = String(loaded.name).split("/").pop().replace(/\.(b?cif|mmcif)(\.(zst|gz))?$/i, "");
-  structureNote.textContent = `${name} \u00b7 chain${parts.length === 1 ? "" : "s"} ${parts.join(", ")}`;
+  const pieces = [];
+  if (parts.length > 0) pieces.push(`chain${parts.length === 1 ? "" : "s"} ${parts.join(", ")}`);
+  if (ligands.length > 0) pieces.push(`ligand${ligands.length === 1 ? "" : "s"} ${ligands.join(", ")}`);
+  structureNote.textContent = [name, ...pieces].join(" \u00b7 ");
   structureNote.classList.remove("warn");
 };
 
