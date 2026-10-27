@@ -921,7 +921,7 @@ def main():
                         else:
                             print("            the archived job featurises natively: 100 tokens")
                 # 🔴 THE REFOLD, ASKED FOR (step 6): candidate 2 refolded with AF3 and drawn over
-                # itself. The picture holds both (two chains for a one-chain design), the verdict
+                # itself. The picture holds both as two objects drawn together, the verdict
                 # lands in step 6 and in that candidate's row, the legend says what the grey and the
                 # red mean, and Show the run gives the whole trajectory back.
                 cdp.evaluate(ws, """(() => {
@@ -934,7 +934,8 @@ def main():
                   const entry = Object.values(window.py2dmol_viewers ?? {})[0];
                   const renderer = entry?.renderer ?? entry;
                   const frames = renderer?.objectsData?.[renderer?.currentObjectName]?.frames ?? [];
-                  return { frames: frames.length, chains: [...new Set(frames[0]?.chains ?? [])].length };
+                  return { drawn: renderer?.drawnObjects?.().length ?? 0, frames: frames.length,
+                           chains: [...new Set(frames[0]?.chains ?? [])].length };
                 })()"""
                 refoldDeadline = time.time() + 900
                 refold = {}
@@ -956,13 +957,13 @@ def main():
                 if (refold.get("failed") or "af3: " not in refold.get("note", "") or "RMSD" not in refold.get("note", "")
                         or refold.get("cell") not in refold.get("note", "") or "refold" not in refold.get("legend", "")
                         or not refold.get("saved") or not refold.get("back")
-                        or refold.get("picture") != {"frames": 1, "chains": 2}):
+                        or refold.get("picture") != {"drawn": 2, "frames": 1, "chains": 1}):
                     bad.append(f"the refold did not land as a picture and a verdict: {refold}")
                 cdp.evaluate(ws, "(() => { document.getElementById('show-run').click(); return 1; })()")
                 time.sleep(1)
                 run = json.loads(cdp.evaluate(ws, "JSON.stringify(%s)" % frameOf))
                 print(f"            show the run: {run}")
-                if run != {"frames": 31, "chains": 1}:
+                if run != {"drawn": 1, "frames": 31, "chains": 1}:
                     bad.append(f"Show the run did not give the trajectory back: {run}")
 
         # 🔴 THE CONTACT VETO, PROVED BY ASKING FOR AN EPITOPE THAT CANNOT BE

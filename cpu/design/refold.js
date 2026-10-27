@@ -1,7 +1,7 @@
 /**
  * refold.js
  * ---------
- * A finished design, read back as a fold's input, and the refold of it laid over it.
+ * A finished design, read back as a fold's input, and the refold of it fitted onto it.
  *
  * 🔴 READ OFF THE STRUCTURE, NOT TRACKED ALONGSIDE IT. RFD4-Proteina produces coordinates and its
  * residue identities come out of its decoder, so the structure is the only place a generation's
@@ -22,7 +22,9 @@ const RNA = { A: "A", C: "C", G: "G", U: "U" };
 const WATER = new Set(["HOH", "WAT", "DOD"]);
 // a residue's position: CA for an amino acid, C1' for a nucleotide
 const ANCHORS = ["CA", "C1'"];
-const ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+
+// a fold's template slots (webgpu/af3/fold.js pads to four)
+const TEMPLATE_SLOTS = 4;
 
 const isRecord = (line) => line.startsWith("ATOM  ") || line.startsWith("HETATM");
 
@@ -89,6 +91,33 @@ export function foldInputFromPdb(pdb) {
   };
 }
 
+/**
+ * The design's kept protein chains as templates for its refold, one slot a chain.
+ *
+ * 🔴 A REFOLD FROM THE SEQUENCE ALONE MISFOLDS A NATURAL TARGET: AF3 put 5O45's PD-L1 8.3 A from its
+ * crystal, so the check of the binder was a check of a target nobody designed. Templating what the
+ * job KEPT holds the target to the structure the design was made against, and leaves the designed
+ * chains to the model.
+ *
+ * 🔴 ONE SLOT A CHAIN, NEVER ONE SPANNING THEM (`spanChains` off): a slot over the complex would
+ * hand the model where the binder sits, and where it sits is what the refold is asked.
+ *
+ * @param {string} pdb
+ * @param {string|string[]} [designed] the designed chain(s), which are not templated
+ * @returns {{text: string, chainId: string, chain: number}[]} as foldAf3's `templates` takes them:
+ *   `chain` is the chain's place among the polymers foldInputFromPdb hands over
+ */
+export function keptTemplates(pdb, designed) {
+  const held = designed === undefined ? [] : Array.isArray(designed) ? designed : [designed];
+  const polymers = chainsOf(pdb).filter((chain) => chain.polymer);
+  const kept = polymers.map((chain, at) => ({ chain, at }))
+    .filter(({ chain }) => !held.includes(chain.letter) && polymerOf(chain).kind === "protein");
+  if (kept.length > TEMPLATE_SLOTS) {
+    throw new Error(`the design keeps ${kept.length} protein chains and a fold takes ${TEMPLATE_SLOTS} templates`);
+  }
+  return kept.map(({ chain, at }) => ({ text: pdb, chainId: chain.letter, chain: at }));
+}
+
 /** Rewrite every record's chain letter through `rename`, and renumber the atom serials from `first`. */
 function relabel(pdb, rename, first = 1) {
   let serial = first;
@@ -104,7 +133,8 @@ function relabel(pdb, rename, first = 1) {
 }
 
 /**
- * The refold fitted onto the design, and the two together as one structure to draw.
+ * The refold fitted onto the design, in the design's chain letters, and how far each of its
+ * residues sits from the design's.
  *
  * 🔴 THE REFOLD'S CHAINS ARE MATCHED BY ORDER, NOT BY LETTER. A fold letters its chains A, B, ...
  * in the order it was handed them, and RFD4-Proteina letters its own way (the 5O45 binder is
@@ -115,14 +145,18 @@ function relabel(pdb, rename, first = 1) {
  * binder that lands elsewhere on its target shows as moved rather than being fitted away; with
  * nothing else, on itself.
  *
+ * 🔴 ITS OWN STRUCTURE, NOT CHAINS ADDED TO THE DESIGN'S (2026-10-27). The refold was first drawn
+ * as the design plus the refold under spare letters, one structure of twice the chains; the page
+ * draws it as a second viewer object over the design's now, so it keeps the design's letters.
+ *
  * @param {string} designPdb
  * @param {string} refoldPdb
  * @param {string|string[]} [designed] the design's designed chain(s), held out of the fit
- * @returns {{refold: string, pdb: string, chains: Map<string, string>,
- *            deviations: {index: number, distance: number}[]}}
- *   `refold` in the design's letters and frame; `pdb` the design followed by the refold under
- *   letters of its own (`chains`: design letter to overlay letter); `deviations` each refold
- *   residue's anchor distance from the design's, by its index among the overlay's residues
+ * @returns {{refold: string, deviations: {index: number, chain: string, residue: number,
+ *            distance: number}[]}} `refold` in the design's letters and frame; `deviations` each
+ *   refold residue's anchor distance from the design's, by its index in file order and by its chain
+ *   and residue number - 🔴 the second is what a viewer can address, since py2Dmol does not keep
+ *   a file's chain order (a design written B then A is drawn A then B)
  */
 export function refoldOverlay(designPdb, refoldPdb, designed) {
   const design = chainsOf(designPdb);
@@ -137,32 +171,22 @@ export function refoldOverlay(designPdb, refoldPdb, designed) {
     }
     theirs.forEach((chain, at) => rename.set(chain.letter, ours[at].letter));
   }
-  const inOurLetters = `${relabel(refoldPdb, rename).join("\n")}\nEND\n`;
-  const fitted = alignToReference(inOurLetters, designPdb, designed);
-
-  // the overlay's own letters for the refold: the first the design does not use
-  const used = new Set(design.map((chain) => chain.letter));
-  const free = [...ALPHABET].filter((letter) => !used.has(letter));
-  if (free.length < design.length) throw new Error("no chain letters left to draw the refold under");
-  const overlayLetter = new Map(design.map((chain, at) => [chain.letter, free[at]]));
-
-  const designLines = designPdb.split("\n").filter(isRecord);
-  const refoldLines = relabel(fitted, overlayLetter, designLines.length + 1);
-  const pdb = `${[...designLines, "TER", ...refoldLines].join("\n")}\nEND\n`;
+  const fitted = alignToReference(`${relabel(refoldPdb, rename).join("\n")}\nEND\n`, designPdb, designed);
 
   // each refold residue against the design's residue in the same place of the same chain
-  const placed = new Map(chainsOf(fitted).map((chain) => [chain.letter, chain]));
-  let index = design.reduce((sum, chain) => sum + chain.residues.length, 0);
+  const ours = new Map(design.map((chain) => [chain.letter, chain]));
+  let index = 0;
   const deviations = [];
-  for (const chain of chainsOf(pdb).slice(design.length)) {
-    const ours = design.find((one) => overlayLetter.get(one.letter) === chain.letter);
-    const moved = placed.get(ours.letter);
-    chain.residues.forEach((_, at) => {
-      const a = ours.residues[at]?.anchor;
-      const b = moved.residues[at]?.anchor;
-      if (a && b) deviations.push({ index, distance: Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]) });
+  for (const chain of chainsOf(fitted)) {
+    chain.residues.forEach((residue, at) => {
+      const a = ours.get(chain.letter).residues[at]?.anchor;
+      const b = residue.anchor;
+      if (a && b) {
+        deviations.push({ index, chain: chain.letter, residue: Number(residue.number),
+          distance: Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]) });
+      }
       index += 1;
     });
   }
-  return { refold: fitted, pdb, chains: overlayLetter, deviations };
+  return { refold: fitted, deviations };
 }

@@ -143,12 +143,13 @@ export function createStructureViewer(options) {
      * first, or whichever ran last silently wins.
      *
      * @param {Record<string, string>} colours chain id to CSS colour
+     * @param {string} [object] which object (see addObject); the one shown last by default
      */
-    colourChains(colours) {
+    colourChains(colours, object) {
       if (renderer === undefined) return;
       for (const [chain, colour] of Object.entries(colours)) {
         try {
-          renderer.setColor(colour, { chain });
+          renderer.setColor(colour, object === undefined ? { chain } : { chain, object });
         } catch {
           /* a chain the structure does not have is not an error worth stopping a hunt for */
         }
@@ -289,6 +290,48 @@ export function createStructureViewer(options) {
         if (frames === 0) fail(error instanceof Error ? error.message : String(error));
         return { built: false, frames };
       }
+    },
+
+    /**
+     * Colour residues named by chain and residue NUMBER (the file's), in one object.
+     *
+     * 🔴 BY NUMBER, NOT POSITION, where the caller counted residues itself: py2Dmol does not keep
+     * a file's chain order, so a count made over the file lands on the wrong chain.
+     *
+     * @param {string} object
+     * @param {string} chain
+     * @param {number[]} residues
+     * @param {string} colour
+     */
+    colourNumbered(object, chain, residues, colour) {
+      if (renderer === undefined || residues.length === 0) return;
+      renderer.setColor(colour, { object, chain, residues });
+    },
+
+    /**
+     * A second structure in the same viewer, as its own object, for drawing over the first
+     * (showObjects). The viewer must already be built by `push`.
+     *
+     * 🔴 IT BECOMES THE OBJECT BEING EDITED (py2Dmol's addObject switches to it), so a colour meant
+     * for the first one is set before this or names it.
+     *
+     * @param {string} name
+     * @param {string} pdb
+     */
+    addObject(name, pdb) {
+      if (renderer === undefined) throw new Error("the viewer has no structure to add an object beside");
+      renderer.addObject(name);
+      renderer.addFrame(window.py2Dmol.frameFromText(pdb), name);
+      try {
+        if (wantsSidechains) renderer.showSidechains();
+        else renderer.hideSidechains();
+      } catch { /* backbone-only structure: nothing to show or hide */ }
+    },
+
+    /** Draw these objects together, overlaid; `null` goes back to one at a time. */
+    showObjects(names) {
+      if (renderer === undefined) return;
+      renderer.setShownObjects(names);
     },
 
     /**

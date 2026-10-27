@@ -416,6 +416,14 @@ Found on the way: "Folds with" offered Boltz-2 and Protenix-2 and `hunt` threw o
 boltz2") - they were missing from `FOLDERS`; `test/design-validate-options.test.js` now holds both
 pickers to it. Verified: `--generate` refolds candidate 2 with AF3 (two chains drawn, verdict in the
 row, Show the run back to 31 frames); 5O45 at 60 steps and a 2-cycle hunt refolded and screenshot.
-Open: a single-sequence refold misfolds a natural target - 5O45's PD-L1 comes back 8.3 A from its
-crystal - so a binder's check is dominated by the target; giving the refold the kept chains as a
-template is the fix the field uses.
+A single-sequence refold misfolded the natural target - 5O45's PD-L1 came back 8.3 A from its
+crystal, so the binder's check was dominated by the target. **Done (2026-10-27): the refold
+templates every kept protein chain off the design itself** (`keptTemplates`, one slot a chain, never
+spanning, so where the binder sits is still the model's answer; more than four kept chains is
+refused; the verdict names the templated chains, and a slot that did not arrive throws). 5O45 at 60
+steps with AF3: pLDDT 49.1 / ipTM 0.099 -> **88.9 / 0.826**, binder RMSD 1.01 -> 0.72 A, and the
+target drawn grey on its crystal. **And the refold is its own viewer object** (2026-10-27, the
+user's ask): the design and the refold are two py2Dmol objects shown together, the refold in the
+design's letters, where it had been one structure with the refold under spare letters C, D. Its
+shading is addressed by chain and residue NUMBER, because py2Dmol does not keep a file's chain
+order - counted by position, the 5O45 binder's red landed on the target.

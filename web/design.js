@@ -161,6 +161,8 @@ let refoldShown = false;
 const REFOLD_NEAR = "#94a3b8";
 const REFOLD_FAR = "#dc2626";
 const REFOLD_FAR_AT = 4;
+// the refold's viewer object, drawn over the design's (drawRefold)
+const REFOLD_OBJECT = "refold";
 // 🔴 A FUNCTION DECLARATION, called while the span list constructs.
 function BLANK_JOB() { return [{ kind: "generated", min: 100, max: 100, name: "", secondary: "", polymer: "protein" }]; }
 
@@ -1769,8 +1771,14 @@ function showRun() {
 }
 
 /**
- * The design and its refold, as one picture: the design in the run's colours, the refold over it in
- * grey that turns red where it has moved - so a misfold shows where it happens, not only as an RMSD.
+ * The design and its refold, overlaid: two viewer objects drawn together, the design in the run's
+ * colours and the refold over it in grey that turns red where it has moved - so a misfold shows
+ * where it happens, not only as an RMSD.
+ *
+ * 🔴 TWO OBJECTS, NOT ONE OF TWICE THE CHAINS. It was drawn as one structure with the refold under
+ * spare chain letters, which put chains C and D on the strip for molecules that are A and B;
+ * as its own object the refold keeps the design's letters, and the viewer's object list can switch
+ * either off.
  */
 function drawRefold(design, result) {
   viewer.cancelAnimations();
@@ -1779,18 +1787,27 @@ function drawRefold(design, result) {
   refoldShown = true;
   showViewer();
   showRunSequence();
-  sequenceHint.textContent = `The design, then its ${result.model} refold.`;
-  viewer.push(result.overlay, (built) => { if (built) viewer.orient(); });
+  sequenceHint.textContent = `The design and its ${result.model} refold, overlaid.`;
+  viewer.push(design.pdb);
   design.paint();
-  viewer.colourChains(Object.fromEntries([...result.chains.values()].map((letter) => [letter, REFOLD_NEAR])));
+  const designObject = viewer.object;
+  viewer.addObject(REFOLD_OBJECT, result.refold);
+  viewer.showObjects([designObject, REFOLD_OBJECT]);
+  const letters = new Set(result.refold.split("\n").filter((line) => line.startsWith("ATOM") || line.startsWith("HETATM"))
+    .map((line) => line[21]));
+  viewer.colourChains(Object.fromEntries([...letters].map((letter) => [letter, REFOLD_NEAR])), REFOLD_OBJECT);
   // five steps from "agrees" (1 A or less) to "moved" (REFOLD_FAR_AT or more)
   const steps = new Map();
-  for (const { index, distance } of result.deviations) {
+  for (const { chain, residue, distance } of result.deviations) {
     const step = Math.round(5 * Math.min(1, Math.max(0, (distance - 1) / (REFOLD_FAR_AT - 1))));
     if (step === 0) continue;
-    steps.set(step, [...(steps.get(step) ?? []), index]);
+    const key = `${step}:${chain}`;
+    if (!steps.has(key)) steps.set(key, { step, chain, residues: [] });
+    steps.get(key).residues.push(residue);
   }
-  for (const [step, positions] of steps) viewer.colourResidues(positions, shade(REFOLD_NEAR, REFOLD_FAR, step / 5));
+  for (const { step, chain, residues } of steps.values()) {
+    viewer.colourNumbered(REFOLD_OBJECT, chain, residues, shade(REFOLD_NEAR, REFOLD_FAR, step / 5));
+  }
   viewer.orient();
   followSequence();
   paintViewerBar();

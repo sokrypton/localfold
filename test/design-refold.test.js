@@ -1,5 +1,5 @@
 import { describe, expect, it } from "./harness.js";
-import { foldInputFromPdb, refoldOverlay } from "../cpu/design/refold.js";
+import { foldInputFromPdb, keptTemplates, refoldOverlay } from "../cpu/design/refold.js";
 
 /** One PDB atom record. */
 function atom(record, serial, name, residue, chain, number, x, y, z) {
@@ -35,14 +35,14 @@ describe("refolding a design", () => {
     binder[3] = atom("ATOM", 4, "CA", "ALA", "A", 4, 3 * 3.8 + 20, 1.5, 5);
     const refold = [...binder, ...chain("B", ["SER", "THR", "VAL", "LEU", "ILE"], [20, 10, 0])].join("\n");
     const out = refoldOverlay(design, refold, "B");
-    expect(out.chains.get("B")).toBe("C");
-    expect(out.chains.get("A")).toBe("D");
+    // in the design's letters: the binder is B again
+    expect(out.refold.split("\n").filter((line) => line.startsWith("ATOM")).map((line) => line[21]).join(""))
+      .toBe("BBBBAAAAA");
     expect(out.deviations.length).toBe(9);
     const far = out.deviations.filter((d) => d.distance > 1);
     // fitted on the target, so only the binder's moved residue is off - by its 5 A
-    expect(far.map((d) => d.index)).toEqual([12]);
+    expect(far.map((d) => d.index)).toEqual([3]);
     expect(Math.abs(far[0].distance - 5) < 1e-2).toBe(true);
-    expect(out.pdb.split("\n").filter((line) => line.startsWith("ATOM")).length).toBe(18);
   });
 
   it("refuses a refold with a different chain count", () => {
@@ -61,5 +61,21 @@ describe("refolding a design of two new chains", () => {
     const out = refoldOverlay(design, refold, ["A", "B"]);
     const moved = out.deviations.filter((d) => d.distance > 1).map((d) => Math.round(d.distance));
     expect(moved).toEqual([6, 6, 6, 6, 6, 6]);
+  });
+});
+
+describe("templating a refold on what the job kept", () => {
+  it("templates each kept protein chain and none of the designed ones", () => {
+    const design = [...chain("B", ["MET", "LYS", "GLY"]), ...chain("A", ["SER", "THR", "VAL"], [0, 10, 0]),
+      ...chain("C", ["DA", "DC"], [0, 20, 0], "ATOM", "C1'"), ...chain("D", ["SAM"], [0, 0, 9], "HETATM", "C1")].join("\n");
+    // B is designed; A is the target (polymer 1); the DNA and the ligand are not templates
+    expect(keptTemplates(design, "B").map(({ chainId, chain: at }) => [chainId, at])).toEqual([["A", 1]]);
+    expect(keptTemplates(design, ["A", "B"])).toEqual([]);
+  });
+
+  it("refuses more kept chains than a fold has slots", () => {
+    const design = ["A", "B", "C", "D", "E", "F"].map((letter, at) => chain(letter, ["MET", "LYS"], [0, at * 9, 0]))
+      .flat().join("\n");
+    expect(() => keptTemplates(design, "A")).toThrow(/keeps 5 protein chains/);
   });
 });

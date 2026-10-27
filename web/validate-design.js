@@ -18,7 +18,7 @@
  */
 import { AF3_COUNTS, foldAf3, loadAf3Weights } from "./af3-model.js";
 import { describeValidation, selfConsistency } from "../cpu/design/validate.js";
-import { foldInputFromPdb, refoldOverlay } from "../cpu/design/refold.js";
+import { foldInputFromPdb, keptTemplates, refoldOverlay } from "../cpu/design/refold.js";
 
 /**
  * The folding models a design can be refolded with, and a hunt can fold with: the AF3-graph
@@ -41,8 +41,8 @@ export const FOLDERS = { af3: "af3", boltz2: "boltz2", protenix2: "protenix2", o
  * @param {(text: string) => void} [options.status]
  * @param {AbortSignal} [options.signal]
  * @returns {Promise<object>} the refold's confidence, its RMSD to the design, the refold in the
- *   design's frame (`refold`) and the two as one structure (`overlay`, `chains`, `deviations` -
- *   see refoldOverlay)
+ *   design's frame and letters (`refold`) and how far each residue moved (`deviations` - see
+ *   refoldOverlay)
  */
 export async function refoldDesign(options) {
   const { pdb, chain, model, device, seed = 0, signal } = options;
@@ -51,10 +51,12 @@ export async function refoldDesign(options) {
     throw new Error(`no folding model ${model} (have ${Object.keys(FOLDERS).join(", ")})`);
   }
   const input = foldInputFromPdb(pdb);
+  const templates = keptTemplates(pdb, chain);
   status(`refolding with ${model}`);
   const weights = await loadAf3Weights(() => {}, FOLDERS[model]);
   const refolded = await foldAf3({
     ...input,
+    templates,
     weights,
     device,
     signal,
@@ -63,12 +65,20 @@ export async function refoldDesign(options) {
     onStatus: (text) => status(`refolding with ${model} · ${text}`),
     onProgress: () => {},
   });
-  const overlay = refoldOverlay(pdb, refolded.pdb, chain);
-  const { rmsd, comparable, residues } = selfConsistency(pdb, overlay.refold,
+  // 🔴 A TEMPLATE THAT DID NOT ARRIVE FOLDS AND SCORES ALL THE SAME, so ask the fold what it covered
+  if ((refolded.templateCoverage ?? []).length !== templates.length) {
+    throw new Error(`${templates.length} kept chains were templated and the fold took`
+      + ` ${(refolded.templateCoverage ?? []).length}`);
+  }
+  const fitted = refoldOverlay(pdb, refolded.pdb, chain);
+  const { rmsd, comparable, residues } = selfConsistency(pdb, fitted.refold,
     Array.isArray(chain) ? (chain.length === 1 ? chain[0] : undefined) : chain);
   const result = {
     model, confidence: refolded.confidence ?? {}, rmsd, comparable, residues,
-    refold: overlay.refold, overlay: overlay.pdb, chains: overlay.chains, deviations: overlay.deviations,
+    templated: templates.map((template) => template.chainId),
+    refold: fitted.refold, deviations: fitted.deviations,
   };
-  return { ...result, described: describeValidation(result) };
+  const templated = result.templated.length === 0 ? ""
+    : ` (chain${result.templated.length === 1 ? "" : "s"} ${result.templated.join(", ")} templated)`;
+  return { ...result, described: `${describeValidation(result)}${templated}` };
 }
