@@ -1,7 +1,7 @@
 /**
  * validate-design.js
  * ------------------
- * Fold a finished design with a model that had no hand in making it.
+ * Fold a finished design again with a model of the reader's choosing, and lay the result over it.
  *
  * 🔴 THE ONLY NUMBER A DESIGN RUN PRODUCES THAT IS NOT SELF-REPORTED. Protein
  * Hunter optimises a folding model's opinion of its own design - the objective
@@ -11,102 +11,64 @@
  * confidence nothing was optimised against and an RMSD to the backbone the
  * design is supposed to be.
  *
- * 🔴 AND IT IS ONE PATH FOR BOTH METHODS. This was inside `hunt()`, so the
- * generate path had a `Validate with` control that silently did nothing - which
- * this repository holds to be worse than an absent one. The only thing the two
- * methods disagree about is where the sequence comes from, so that is the
- * argument and everything else is shared.
+ * 🔴 ASKED FOR, NOT RUN BY EVERY DESIGN (2026-10-27). It ran after each run with a model picked in
+ * step 1, which made a run slower whether or not anyone wanted the check and made the picture of
+ * it a line of text. It is the page's Refold step now: a design, a model, a button - and the
+ * refold drawn over the design.
  */
 import { AF3_COUNTS, foldAf3, loadAf3Weights } from "./af3-model.js";
 import { describeValidation, selfConsistency } from "../cpu/design/validate.js";
-import { THREE_TO_ONE } from "../cpu/design/mpnn/constants.js";
-
-/** The folding models a design can be checked against. */
-export const FOLDERS = { af3: "af3", openbind0: "openbind0", opendde: "opendde" };
+import { foldInputFromPdb, refoldOverlay } from "../cpu/design/refold.js";
 
 /**
- * The sequence a structure actually contains, chains joined the way a fold
- * wants them.
- *
- * 🔴 READ OFF THE STRUCTURE RATHER THAN TRACKED ALONGSIDE IT. A generation
- * never had a sequence to begin with - RFD4 produces coordinates and the
- * residue identities come out of its decoder - so the structure is the only
- * place the answer exists. Reading it here also means the validation fold is
- * checking what was actually produced rather than what the page believes was.
- *
- * @param {string} pdb
- * @returns {string} chains joined by ":", which is how this page's folders read
- *   a complex
+ * The folding models a design can be refolded with, and a hunt can fold with: the AF3-graph
+ * families, which share `foldAf3`. 🔴 design.html's two pickers offer exactly these keys
+ * (test/design-validate-options.test.js) - an option outside them throws.
  */
-export function sequenceFromPdb(pdb) {
-  const chains = new Map();
-  let previous = null;
-  for (const line of pdb.split("\n")) {
-    if (!line.startsWith("ATOM")) continue;
-    // Chain, residue number and insertion code together identify a residue; a
-    // HETATM is a ligand and has no place in a sequence.
-    const key = line.slice(21, 27);
-    if (key === previous) continue;
-    previous = key;
-    const chain = line[21];
-    const letter = THREE_TO_ONE[line.slice(17, 20).trim()] ?? "X";
-    chains.set(chain, (chains.get(chain) ?? "") + letter);
-  }
-  return [...chains.values()].join(":");
-}
+export const FOLDERS = { af3: "af3", boltz2: "boltz2", protenix2: "protenix2", openbind0: "openbind0",
+  opendde: "opendde" };
 
 /**
- * Re-fold a design and say how far the result sits from it.
+ * Refold a design and say how far the result sits from it.
  *
  * @param {object} options
  * @param {string} options.pdb the design
- * @param {string} [options.sequence] what to fold; read from `pdb` when absent
- * @param {string} [options.chain] the designed chain, scored on its own
+ * @param {string|string[]} [options.chain] the designed chain(s): held out of the fit, and the
+ *   RMSD taken over a single one on its own
  * @param {string} options.model a key of FOLDERS
  * @param {object} options.device
  * @param {number} [options.seed]
- * @param {number} [options.steps]
  * @param {(text: string) => void} [options.status]
  * @param {AbortSignal} [options.signal]
- * @returns {Promise<object|null>} null when no model was asked for
+ * @returns {Promise<object>} the refold's confidence, its RMSD to the design, the refold in the
+ *   design's frame (`refold`) and the two as one structure (`overlay`, `chains`, `deviations` -
+ *   see refoldOverlay)
  */
-export async function validateDesign(options) {
-  const { pdb, chain, model, device, seed = 0, steps, signal } = options;
+export async function refoldDesign(options) {
+  const { pdb, chain, model, device, seed = 0, signal } = options;
   const status = options.status ?? (() => {});
-  if (model === undefined || model === "" || FOLDERS[model] === undefined) return null;
-
-  const sequence = options.sequence ?? sequenceFromPdb(pdb);
-  if (sequence.replace(/[:X]/g, "").length === 0) {
-    return { model, failed: "the design has no sequence to re-fold" };
+  if (FOLDERS[model] === undefined) {
+    throw new Error(`no folding model ${model} (have ${Object.keys(FOLDERS).join(", ")})`);
   }
-
-  try {
-    status(`validating with ${model}`);
-    const weights = await loadAf3Weights(() => {}, FOLDERS[model]);
-    const refolded = await foldAf3({
-      sequence,
-      weights,
-      device,
-      signal,
-      // 🔴 A DIFFERENT SEED FROM THE RUN'S. Re-folding with the same one invites
-      // the two to share whatever the seed decided, which is the opposite of an
-      // independent check.
-      seed: seed + 1,
-      calls: steps ?? AF3_COUNTS.diffusion.preferred,
-      onStatus: (text) => status(`validating with ${model} · ${text}`),
-      onProgress: () => {},
-    });
-    const { rmsd, comparable, residues } = selfConsistency(pdb, refolded.pdb, chain);
-    const validation = {
-      model, confidence: refolded.confidence ?? {}, rmsd, comparable, residues,
-      pdb: refolded.pdb,
-    };
-    return { ...validation, described: describeValidation(validation) };
-  } catch (error) {
-    // 🔴 A FAILED VALIDATION DOES NOT FAIL THE RUN. The design is already made;
-    // what is missing is the check, and saying so beats throwing the result
-    // away.
-    const message = error instanceof Error ? error.message : String(error);
-    return { model, failed: message, described: `could not validate with ${model}: ${message}` };
-  }
+  const input = foldInputFromPdb(pdb);
+  status(`refolding with ${model}`);
+  const weights = await loadAf3Weights(() => {}, FOLDERS[model]);
+  const refolded = await foldAf3({
+    ...input,
+    weights,
+    device,
+    signal,
+    seed,
+    calls: AF3_COUNTS.diffusion.preferred,
+    onStatus: (text) => status(`refolding with ${model} · ${text}`),
+    onProgress: () => {},
+  });
+  const overlay = refoldOverlay(pdb, refolded.pdb, chain);
+  const { rmsd, comparable, residues } = selfConsistency(pdb, overlay.refold,
+    Array.isArray(chain) ? (chain.length === 1 ? chain[0] : undefined) : chain);
+  const result = {
+    model, confidence: refolded.confidence ?? {}, rmsd, comparable, residues,
+    refold: overlay.refold, overlay: overlay.pdb, chains: overlay.chains, deviations: overlay.deviations,
+  };
+  return { ...result, described: describeValidation(result) };
 }

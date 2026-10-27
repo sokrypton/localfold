@@ -19,7 +19,7 @@ import {
 } from "./contig-ui.js";
 import { DEFAULT_STEPS, generate } from "./generate.js";
 import { writeZip } from "./zip.js";
-import { validateDesign } from "./validate-design.js";
+import { refoldDesign } from "./validate-design.js";
 import { getDevice } from "./model.js";
 import { RFD4P_PRESETS } from "../shared/rfd4p/presets.js";
 import { parseCifToAtomArray } from "../shared/rfd4p/pipeline/cif.js";
@@ -109,7 +109,7 @@ const methodNote = element("method-note");
 /** Results' columns, by method: a hunt's cycles, or a generation's designs. */
 function paintResultsHead() {
   const names = method.value === "hunter" ? ["Run", "Cycle", "Folded by", "Objective", "Validity"]
-    : ["Design", "Seed", "Size", "Check"];
+    : ["Design", "Seed", "Size", "Refold"];
   element("results-head").replaceChildren(...names.map((name) => {
     const th = document.createElement("th");
     th.textContent = name;
@@ -149,6 +149,18 @@ let inputView = null;
 // the viewer is made, and a redraw it asked for then would read a `const` still in its dead zone.
 let viewerReady = false;
 let jobRedraw = 0;
+// 🔴 THE RUN'S PICTURE, KEPT so the refold can take the viewer and give it back: every frame pushed
+// (`pushRunFrame`), and the paint of the last. `designs` are the finished ones the Refold step
+// offers; `refolding` is a refold in flight, and `refoldShown` says the viewer holds one.
+let runFrames = [];
+let runPaint = () => {};
+let designs = [];
+let refolding = null;
+let refoldShown = false;
+// a refold residue where it sits on the design, and where it has moved REFOLD_FAR_AT or more
+const REFOLD_NEAR = "#94a3b8";
+const REFOLD_FAR = "#dc2626";
+const REFOLD_FAR_AT = 4;
 // 🔴 A FUNCTION DECLARATION, called while the span list constructs.
 function BLANK_JOB() { return [{ kind: "generated", min: 100, max: 100, name: "", secondary: "", polymer: "protein" }]; }
 
@@ -241,7 +253,6 @@ const paintDesignerNote = (spans) => {
 const folders = element("folders");
 const folderNote = element("folder-note");
 const beam = element("beam");
-const validateSelect = element("validate");
 
 /**
  * What the schedule will actually cost, in folds.
@@ -666,39 +677,45 @@ const drawCycle = (record) => {
   const placed = reference === record.pdb ? record.pdb
     : alignToReference(record.pdb, reference, record.chain);
 
-  showViewer();
-  viewer.push(placed, (built) => { if (built) viewer.orient(); });
-  followSequence();
-  // 🔴 COLOURED BY ROLE, NOT BY CONFIDENCE. The page's job is saying what is
-  // being DECIDED, and pLDDT answers a different question - so the designed
-  // chain takes the "free" colour and everything else the "target" one, the
-  // same two swatches the legend names. These are the only two roles a Hunter
-  // run has today; fixed, tied and motif arrive with the RunSpec's positions
-  // reaching the page.
-  // 🔴 HUE IS THE CHAIN, TREATMENT IS THE ROLE. A reader needs both answers -
-  // which chain is this, and is it being decided - and there is one set of
-  // pixels to give them in. Colouring by role alone, which this page did first,
-  // cannot say which chain a held motif belongs to; colouring by chain alone
-  // cannot say what is being designed. So every chain keeps its own colour, the
-  // one being designed at full strength and the rest faded toward the
-  // background - and the fade is a BLEND rather than a swap, so a recessive
-  // chain is still the colour of its row.
-  const designed = CHAIN_IDS.indexOf(record.chain);
-  viewer.colourChains({
-    [record.chain]: chainColour(designed),
-    ...Object.fromEntries(CHAIN_IDS.split("").map((id, at) => [id, at])
-      .filter(([id]) => id !== record.chain)
-      .map(([id, at]) => [id, shade(chainColour(at), "#ffffff", 0.62)])),
-  });
-  // 🔴 AND THE HELD RESIDUES OVER THE TOP, which is what makes the picture
-  // answer "which parts are kept": a scaffolded motif is held residues inside
-  // a designed chain, so colouring by chain alone paints the motif as though
-  // the designer were free to rewrite it. The legend has named `held` since the
-  // page was built and nothing painted it until now.
-  // ...and the held residues darker rather than grey, so they still read as
-  // part of their own chain while saying they are not being rewritten.
-  viewer.colourResidues(globalResidues(placed, record.chain, held),
-    shade(chainColour(designed), "#374151", 0.55));
+  const paint = () => {
+    // 🔴 COLOURED BY ROLE, NOT BY CONFIDENCE. The page's job is saying what is
+    // being DECIDED, and pLDDT answers a different question - so the designed
+    // chain takes the "free" colour and everything else the "target" one, the
+    // same two swatches the legend names. These are the only two roles a Hunter
+    // run has today; fixed, tied and motif arrive with the RunSpec's positions
+    // reaching the page.
+    // 🔴 HUE IS THE CHAIN, TREATMENT IS THE ROLE. A reader needs both answers -
+    // which chain is this, and is it being decided - and there is one set of
+    // pixels to give them in. Colouring by role alone, which this page did first,
+    // cannot say which chain a held motif belongs to; colouring by chain alone
+    // cannot say what is being designed. So every chain keeps its own colour, the
+    // one being designed at full strength and the rest faded toward the
+    // background - and the fade is a BLEND rather than a swap, so a recessive
+    // chain is still the colour of its row.
+    const designed = CHAIN_IDS.indexOf(record.chain);
+    viewer.colourChains({
+      [record.chain]: chainColour(designed),
+      ...Object.fromEntries(CHAIN_IDS.split("").map((id, at) => [id, at])
+        .filter(([id]) => id !== record.chain)
+        .map(([id, at]) => [id, shade(chainColour(at), "#ffffff", 0.62)])),
+    });
+    // 🔴 AND THE HELD RESIDUES OVER THE TOP, which is what makes the picture
+    // answer "which parts are kept": a scaffolded motif is held residues inside
+    // a designed chain, so colouring by chain alone paints the motif as though
+    // the designer were free to rewrite it. The legend has named `held` since the
+    // page was built and nothing painted it until now.
+    // ...and the held residues darker rather than grey, so they still read as
+    // part of their own chain while saying they are not being rewritten.
+    viewer.colourResidues(globalResidues(placed, record.chain, held),
+      shade(chainColour(designed), "#374151", 0.55));
+  };
+  pushRunFrame(placed, paint);
+  // a cycle a refold can check: scored, and not vetoed
+  if (record.cycle > 0 && !vetoed) {
+    designs.push({ label: `Run ${record.run + 1} · cycle ${record.cycle}`, pdb: placed, chain: record.chain,
+      record, paint });
+    paintRefoldStep();
+  }
 
   const line = document.createElement("div");
   line.textContent = `${record.cycle}  ${record.sequence}`;
@@ -894,10 +911,12 @@ function unusedInput(spans) {
 function paintViewerBar() {
   if (!viewerReady) return;
   const showJob = element("show-job");
-  showJob.hidden = !(inputView === null && viewer.built && running === null);
+  const idle = running === null && refolding === null;
+  showJob.hidden = !(inputView === null && viewer.built && idle);
+  // the way back to the run from a refold, or from the job drawn after it
+  element("show-run").hidden = !(runFrames.length > 0 && (refoldShown || inputView !== null) && idle);
   const legend = element("viewer-legend");
   legend.replaceChildren();
-  if (inputView === null) return;
   const key = (colour, text, className = "") => {
     const item = document.createElement("span");
     item.className = `viewer-key ${className}`.trim();
@@ -906,6 +925,12 @@ function paintViewerBar() {
     item.append(swatch, text);
     legend.append(item);
   };
+  if (inputView === null && refoldShown) {
+    key(REFOLD_NEAR, "refold, where it agrees with the design");
+    key(REFOLD_FAR, `where it moved ${REFOLD_FAR_AT} Å or more`);
+    return;
+  }
+  if (inputView === null) return;
   const spans = spanList.read();
   const chainOf = chainOfSpans(spans);
   const first = (kind) => spans.findIndex((span, i) => span.kind === kind && chainOf[i] !== null);
@@ -962,6 +987,8 @@ function beginRunPicture() {
   viewer.cancelAnimations();
   viewer.reset();
   inputView = null;
+  runFrames = [];
+  refoldShown = false;
   showRunSequence();
 }
 
@@ -1091,6 +1118,9 @@ conditionEditor = createConditionEditor(conditionHost, {
 conditionEditor.disable(method.value === "hunter" ? HUNTER_NO_CONDITIONS : null);
 // The viewer and the editor exist: the job can be drawn, and is, from arrival.
 viewerReady = true;
+element("refold-button").addEventListener("click", () => { startRefold(); });
+element("refold-design").addEventListener("change", (event) => { event.target.dataset.chosen = "1"; });
+element("show-run").addEventListener("click", () => showRun());
 element("show-job").addEventListener("click", () => { inputView = null; viewer.forgetCamera(); showInput(); });
 showInput();
 /**
@@ -1129,6 +1159,8 @@ const startHunt = async () => {
   huntLabel.textContent = "Stop";
   resultsBody.replaceChildren();
   track.replaceChildren();
+  designs = [];
+  paintRefoldStep();
   // 🔴 THE JOB STAYS ON SCREEN UNTIL THE FIRST CYCLE REPLACES IT (`beginRunPicture`): loading the
   // folding model and the first fold take seconds to minutes, and wiping the viewer and the strip
   // at the click left two empty boxes for all of it.
@@ -1170,7 +1202,6 @@ const startHunt = async () => {
       runs: number("runs", 1),
       cycles: number("cycles", 5),
       beam: number("beam", 1),
-      validate: validateSelect.value,
       // 🔴 THE FOLD'S DIFFUSION STEPS, which ran at the sampler's default and
       // were not reachable from this page at all.
       steps: number("steps", HUNTER_STEPS),
@@ -1201,7 +1232,7 @@ const startHunt = async () => {
         : `no cycle was eligible — ${reasons.join("; ")}`);
     } else {
       say(`done · best run ${best.run + 1} cycle ${best.cycle},`
-        + ` objective ${best.score.toFixed(3)}`);
+        + ` objective ${best.score.toFixed(3)} · refold it in step 6 to check it`);
     }
     progress.dataset.state = "done";
   } catch (error) {
@@ -1215,6 +1246,7 @@ const startHunt = async () => {
   } finally {
     running = null;
     paintViewerBar();
+    paintRefoldStep();
     huntLabel.textContent = "Design";
   }
 };
@@ -1678,64 +1710,173 @@ element("structure-file").addEventListener("change", async (event) => {
   }
 });
 
-/**
- * How good a generated candidate is, for picking between them.
- *
- * 🔴 A GENERATION SCORES NOTHING OF ITS OWN, which is the whole difficulty: the
- * flow produces coordinates and no opinion about them. So the ranking is the
- * VALIDATION fold's - the confidence a model that did not make it assigns, and
- * whether it reproduces the backbone - and without a validation model there is
- * nothing to rank by and the first candidate stands.
- *
- * 🔴 AND RMSD IS A PENALTY, NOT THE SCORE. A design the validator folds
- * confidently but somewhere else is not the design that was asked for; 2 A is
- * the threshold the field holds a self-consistent design to, so beyond it the
- * confidence is discounted rather than trusted.
- */
-function rankOf(candidate) {
-  const validation = candidate.validation;
-  if (validation == null || validation.failed !== undefined) return 0;
-  const confidence = validation.confidence ?? {};
-  const base = confidence.iptm ?? (confidence.meanPlddt ?? 0) / 100;
-  if (validation.comparable !== true || !Number.isFinite(validation.rmsd)) return base;
-  return base - Math.max(0, validation.rmsd - 2) * 0.1;
-}
-
 /** One finished candidate, as a row and as the structure on screen. */
-function drawGenerated(candidate, total) {
+function drawGenerated(candidate, total, designed) {
   resultsBox.style.display = "";
   if (reference === null) beginRunPicture();
-  showViewer();
   // The finished structure is the last frame, in the same frame of reference as
   // the trajectory that led to it.
-  viewer.push(reference === null ? candidate.pdb
-    : alignToReference(candidate.pdb, reference, undefined),
-  (built) => { if (built) viewer.orient(); });
-  paintGenerated(candidate.pdb);
-  followSequence();
+  const placed = reference === null ? candidate.pdb : alignToReference(candidate.pdb, reference, undefined);
+  const paint = () => paintGenerated(placed);
+  pushRunFrame(placed, paint);
   // 🔴 AND FRAMED ON THE FINISHED DESIGN: the viewer oriented on the trajectory's FIRST frame, which
   // is close to noise at another scale, so the design came out zoomed far into one corner.
   viewer.orient();
 
+  // 🔴 NO "best" ROW: a generation scores nothing of its own, so with the automatic check gone there
+  // is nothing to rank candidates by - the Refold step is how one is judged, and its verdict lands
+  // in this row's last cell.
   const row = document.createElement("tr");
-  // 🔴 ONE "best" MARKER, CLEARED FIRST - the same rule the hunt table has, and
-  // for the same reason: the leader changes as candidates arrive and every row
-  // that was ever the leader would otherwise keep the marker.
-  for (const marked of resultsBody.querySelectorAll("tr.best")) marked.classList.remove("best");
-  row.className = "best";
-  const validation = candidate.validation;
-  for (const [text, className] of [
-    [total === 1 ? "1" : `${candidate.candidate + 1} of ${total}`, ""],
-    [String(candidate.seed), ""],
-    [`${candidate.tokens} tokens`, ""],
-    [validation?.described ?? "not checked", "validity"],
-  ]) {
+  const refoldCell = document.createElement("td");
+  refoldCell.className = "validity";
+  refoldCell.textContent = "not refolded";
+  for (const text of [total === 1 ? "1" : `${candidate.candidate + 1} of ${total}`,
+    String(candidate.seed), `${candidate.tokens} tokens`]) {
     const cell = document.createElement("td");
     cell.textContent = text;
-    if (className) cell.className = className;
     row.append(cell);
   }
+  row.append(refoldCell);
   resultsBody.append(row);
+  designs.push({ label: `Design ${candidate.candidate + 1} · seed ${candidate.seed}`, pdb: placed,
+    chain: designed, paint, candidate, cell: refoldCell });
+  paintRefoldStep();
+}
+
+/** A run's frame: pushed, painted, and kept so the run can be drawn again after a refold. */
+function pushRunFrame(pdb, paint) {
+  showViewer();
+  runFrames.push(pdb);
+  runPaint = paint;
+  viewer.push(pdb, (built) => { if (built) viewer.orient(); });
+  paint();
+  followSequence();
+}
+
+/** The run again, in place of a refold or the job: every kept frame, painted as the last was. */
+function showRun() {
+  viewer.cancelAnimations();
+  viewer.reset();
+  inputView = null;
+  refoldShown = false;
+  showViewer();
+  showRunSequence();
+  for (const pdb of runFrames) viewer.push(pdb);
+  runPaint();
+  viewer.orient();
+  followSequence();
+  paintViewerBar();
+}
+
+/**
+ * The design and its refold, as one picture: the design in the run's colours, the refold over it in
+ * grey that turns red where it has moved - so a misfold shows where it happens, not only as an RMSD.
+ */
+function drawRefold(design, result) {
+  viewer.cancelAnimations();
+  viewer.reset();
+  inputView = null;
+  refoldShown = true;
+  showViewer();
+  showRunSequence();
+  sequenceHint.textContent = `The design, then its ${result.model} refold.`;
+  viewer.push(result.overlay, (built) => { if (built) viewer.orient(); });
+  design.paint();
+  viewer.colourChains(Object.fromEntries([...result.chains.values()].map((letter) => [letter, REFOLD_NEAR])));
+  // five steps from "agrees" (1 A or less) to "moved" (REFOLD_FAR_AT or more)
+  const steps = new Map();
+  for (const { index, distance } of result.deviations) {
+    const step = Math.round(5 * Math.min(1, Math.max(0, (distance - 1) / (REFOLD_FAR_AT - 1))));
+    if (step === 0) continue;
+    steps.set(step, [...(steps.get(step) ?? []), index]);
+  }
+  for (const [step, positions] of steps) viewer.colourResidues(positions, shade(REFOLD_NEAR, REFOLD_FAR, step / 5));
+  viewer.orient();
+  followSequence();
+  paintViewerBar();
+}
+
+/** Step 6: the finished designs to choose from, and whether a refold can start now. */
+function paintRefoldStep() {
+  const select = element("refold-design");
+  const button = element("refold-button");
+  // the reader's pick stays; until there is one, the pick follows the best design (a hunt's best
+  // cycle moves as cycles arrive), else the latest
+  if (designs.length === 0) delete select.dataset.chosen;
+  const kept = select.dataset.chosen === undefined ? undefined
+    : select.selectedOptions[0]?.textContent.replace(/ \(best\)$/, "");
+  select.replaceChildren(...designs.map((design, at) => new Option(
+    `${design.label}${design.record?.best === true ? " (best)" : ""}`, String(at))));
+  const again = designs.findIndex((design) => design.label === kept);
+  const best = designs.findIndex((design) => design.record?.best === true);
+  select.value = String(again >= 0 ? again : best >= 0 ? best : designs.length - 1);
+  const busy = running !== null;
+  select.disabled = designs.length === 0 || busy || refolding !== null;
+  element("refold-model").disabled = refolding !== null;
+  button.textContent = refolding === null ? "Refold" : "Stop";
+  button.disabled = refolding === null && (designs.length === 0 || busy);
+  if (designs.length === 0) {
+    element("refold-note").textContent = "Design something first; each finished design can then be refolded here.";
+    element("refold-save").hidden = true;
+  }
+}
+
+/** Refold the chosen design with the chosen model, and draw the two together. */
+async function startRefold() {
+  if (refolding !== null) {
+    refolding.abort();
+    return;
+  }
+  const design = designs[Number(element("refold-design").value)];
+  const model = element("refold-model").value;
+  const note = element("refold-note");
+  const controller = new AbortController();
+  refolding = controller;
+  paintRefoldStep();
+  paintViewerBar();
+  note.textContent = `Refolding ${design.label} with ${model}…`;
+  element("refold-save").hidden = true;
+  progress.value = 0;
+  progress.dataset.state = "running";
+  try {
+    const result = await refoldDesign({
+      pdb: design.pdb,
+      chain: design.chain,
+      model,
+      device: await getDevice(),
+      // 🔴 NOT THE RUN'S SEED: refolding with the one that made the design invites the two to share
+      // whatever the seed decided, the opposite of an independent check.
+      seed: number("seed", 0) + 1,
+      status: (text) => say(text),
+      signal: controller.signal,
+    });
+    design.refold = result;
+    if (design.candidate !== undefined) design.candidate.refold = result;
+    if (design.cell !== undefined) design.cell.textContent = result.described;
+    drawRefold(design, result);
+    note.textContent = `${design.label}: ${result.described}`;
+    say(`refolded · ${result.described}`);
+    const save = element("refold-save");
+    save.hidden = false;
+    save.onclick = () => saveFile(`${design.label.replace(/[^A-Za-z0-9]+/g, "-").toLowerCase()}-refold-${model}.pdb`,
+      result.refold, "chemical/x-pdb");
+    progress.value = 1;
+    progress.dataset.state = "done";
+  } catch (error) {
+    if (controller.signal.aborted) {
+      say("refold stopped");
+      note.textContent = "Refold stopped.";
+      progress.dataset.state = "idle";
+    } else {
+      say(error.message, true);
+      note.textContent = `Could not refold: ${error.message}`;
+      progress.dataset.state = "error";
+    }
+  } finally {
+    refolding = null;
+    paintRefoldStep();
+    paintViewerBar();
+  }
 }
 
 /**
@@ -1779,7 +1920,7 @@ function archiveEntries() {
     + "To make one again with the native port (seed as listed):\n"
     + "  localfold-rfd4p --job=job.json --int8=<bundle> --seed=<seed> --out=design.pdb\n\n"
     + generatedRun.map((c) => `candidate ${c.candidate + 1}: seed ${c.seed}`
-      + (c.validation?.described ? ` - ${c.validation.described}` : "")).join("\n") + "\n"]);
+      + (c.refold?.described ? ` - refolded, ${c.refold.described}` : "")).join("\n") + "\n"]);
   for (const c of generatedRun) {
     entries.push([`candidate-${c.candidate + 1}.pdb`, c.pdb]);
     entries.push([`candidate-${c.candidate + 1}.cif`, c.cif]);
@@ -1915,6 +2056,8 @@ const startGenerate = async () => {
   huntLabel.textContent = "Stop";
   resultsBody.replaceChildren();
   track.replaceChildren();
+  designs = [];
+  paintRefoldStep();
   // A generation is one frame, so there is nothing to fit it onto and nothing
   // held: RFD4 conditions on given coordinates rather than holding a sequence.
   reference = null;
@@ -1925,12 +2068,17 @@ const startGenerate = async () => {
 
   // 🔴 THE BEAM IS CANDIDATES, NOT CYCLES. A generation is one pass, so there
   // is nothing to carry forward the way a hunt carries a sequence between
-  // cycles - drawing N of them and keeping the best is the only thing "try more
-  // than one" can mean here. Each is a whole generation, so the cost is linear
-  // and the control says so by being the same control Hunter labels Sequences.
+  // cycles - drawing N of them is the only thing "try more than one" can mean
+  // here, and the Refold step is how one is told from another. Each is a whole
+  // generation, so the cost is linear and the control says so by being the
+  // same control Hunter labels Sequences.
   const candidates = Math.max(1, Math.floor(number("beam", 1)));
-  const wanted = validateSelect.value;
-  let best = null;
+  // the chains RFD4 writes for what it generates, held out when a refold is fitted onto the design -
+  // so the refold is laid on what was kept, and a binder that lands elsewhere shows as moved
+  const runLetters = chainLetters(spans, "rfd4p", ligandChains(spans));
+  const chainOfRun = chainOfSpans(spans);
+  const designedLetters = [...new Set(spans.map((span, at) => (span.kind === "generated" && chainOfRun[at] !== null
+    ? runLetters[chainOfRun[at]] : null)).filter((letter) => letter != null))];
   generatedRun = [];
   paintDownloads();
 
@@ -1966,9 +2114,7 @@ const startGenerate = async () => {
         if (reference === null) { beginRunPicture(); reference = step.pdb; }
         const placed = reference === step.pdb ? step.pdb
           : alignToReference(step.pdb, reference, undefined);
-        viewer.push(placed, (built) => { if (built) viewer.orient(); });
-        paintGenerated(placed);
-        followSequence();
+        pushRunFrame(placed, () => paintGenerated(placed));
       },
       // 🔴 A DIFFERENT SEED A CANDIDATE, or the beam draws the same structure
       // N times: the flow is deterministic given its seed, so N identical
@@ -1982,39 +2128,16 @@ const startGenerate = async () => {
       },
     });
 
-    // 🔴 THE CHECK THE GENERATE PATH DID NOT HAVE. `Validate with` was on this
-    // page for both methods and only the hunt honoured it - a control that
-    // silently does nothing, which is worse than an absent one. It matters MORE
-    // here than in a hunt: a hunt at least optimises a folding model's opinion,
-    // where a generation scores nothing at all, so this is the only number the
-    // run produces.
-    const validation = await validateDesign({
-      pdb: result.pdb,
-      model: wanted,
-      device: await getDevice(),
-      seed: number("seed", 0) + candidate,
-      // 🔴 NO `steps`: this is the REFOLD's diffusion count, and the box beside
-      // RFD4 holds RFD4's FLOW steps - two different samplers' budgets. Handing
-      // one to the other ran AlphaFold 3 at 60 because RFD4 runs 60. The
-      // validator takes the fold page's own default.
-      status: (text) => say(candidates === 1 ? text
-        : `candidate ${candidate + 1}/${candidates} · ${text}`),
-      signal: controller.signal,
-    });
-
-    const scored = { ...result, validation, candidate };
-    if (best === null || rankOf(scored) > rankOf(best)) best = scored;
-    drawGenerated(scored, candidates);
-    generatedRun.push(scored);
+    const made = { ...result, candidate };
+    drawGenerated(made, candidates, designedLetters);
+    generatedRun.push(made);
     paintDownloads();
     }
 
-    if (best === null) throw new Error("no candidate completed");
-    const result = best;
-    say(`done · ${result.tokens} tokens over ${result.steps} steps`
-      + (candidates === 1 ? "" : `, best of ${candidates}`)
-      + (result.validation?.described === undefined ? ""
-        : ` · ${result.validation.described}`));
+    if (generatedRun.length === 0) throw new Error("no candidate completed");
+    const last = generatedRun[generatedRun.length - 1];
+    say(`done · ${last.tokens} tokens over ${last.steps} steps`
+      + (candidates === 1 ? "" : `, ${generatedRun.length} designs`) + " · refold one in step 6 to check it");
     progress.value = 1;
     progress.dataset.state = "done";
   } catch (error) {
@@ -2028,6 +2151,7 @@ const startGenerate = async () => {
   } finally {
     running = null;
     paintViewerBar();
+    paintRefoldStep();
     huntLabel.textContent = "Design";
   }
 };
@@ -2035,6 +2159,10 @@ const startGenerate = async () => {
 huntButton.addEventListener("click", () => {
   if (running !== null) {
     running.abort();
+    return;
+  }
+  if (refolding !== null) {
+    say("a refold is running - stop it in step 6 first", true);
     return;
   }
   if (method.value === "hunter") startHunt();

@@ -51,7 +51,7 @@ The style IS index.html's: py2Dmol's light application CSS plus web/localfold.cs
             <!-- THE JOB, IN THE ORDER IT IS DECIDED. -->
             <div class="design-steps">
 
-                <!-- 🔴 THE MODELS FIRST: which method designs, and which models fold and check. -->
+                <!-- 🔴 THE MODELS FIRST: which method designs, and which model folds each cycle. -->
                 <section class="design-step" id="step-method" aria-labelledby="step-method-title">
                     <h2 id="step-method-title"><span class="step-number">1</span>Method</h2>
                     <div class="model-row">
@@ -70,19 +70,6 @@ The style IS index.html's: py2Dmol's light application CSS plus web/localfold.cs
                                 <option value="af3" selected>AF3</option>
                                 <option value="boltz2">Boltz-2</option>
                                 <option value="protenix2">Protenix-2</option>
-                                <option value="opendde">OpenDDE</option>
-                            </select>
-                        </div>
-                        <!-- The independent check: fold the finished design with a model that did
-                             not make it. Its options are exactly web/validate-design.js's `FOLDERS`
-                             (test/design-validate-options.test.js holds the two together). -->
-                        <div class="model-field" id="validateGroup">
-                            <label for="validate">Check with</label>
-                            <select id="validate" class="entity-picker"
-                                title="Fold each finished design again with a model that did not make it, and report its confidence and how far it moved.">
-                                <option value="">nothing</option>
-                                <option value="af3" selected>AF3</option>
-                                <option value="openbind0">OpenBind-0</option>
                                 <option value="opendde">OpenDDE</option>
                             </select>
                         </div>
@@ -248,6 +235,36 @@ The style IS index.html's: py2Dmol's light application CSS plus web/localfold.cs
                         </div>
                     </div>
                 </section>
+
+                <!-- 🔴 THE REFOLD IS ASKED FOR, NOT RUN BY EVERY DESIGN: a finished design, a model that
+                     did not make it, and the refold drawn over the design. Its own model picker -
+                     the options are web/validate-design.js's FOLDERS (test/design-validate-options.test.js). -->
+                <section class="design-step" id="step-refold" aria-labelledby="step-refold-title">
+                    <h2 id="step-refold-title"><span class="step-number">6</span>Refold<span class="step-optional">optional</span></h2>
+                    <p class="step-hint">Fold a finished design again with a model that did not make it, and see whether it lands where the design is.</p>
+                    <div class="model-row">
+                        <div class="model-field refold-design-field">
+                            <label for="refold-design">Design</label>
+                            <select id="refold-design" class="entity-picker" disabled
+                                title="Which finished design to refold."></select>
+                        </div>
+                        <div class="model-field">
+                            <label for="refold-model">Fold with</label>
+                            <select id="refold-model" class="entity-picker"
+                                title="The model that refolds the design. One that did not make it is the independent check.">
+                                <option value="af3" selected>AF3</option>
+                                <option value="boltz2">Boltz-2</option>
+                                <option value="protenix2">Protenix-2</option>
+                                <option value="openbind0">OpenBind-0</option>
+                                <option value="opendde">OpenDDE</option>
+                            </select>
+                        </div>
+                        <button type="button" id="refold-button" class="btn btn-grey btn-small refold-button" disabled>Refold</button>
+                        <button type="button" id="refold-save" class="btn btn-grey btn-small" hidden
+                            title="The refold, in the design's frame">Refold PDB</button>
+                    </div>
+                    <p id="refold-note" class="option-note">Design something first; each finished design can then be refolded here.</p>
+                </section>
             </div>
 
             <!-- THE PICTURE: where residues are picked and a design is watched arriving. -->
@@ -264,6 +281,8 @@ The style IS index.html's: py2Dmol's light application CSS plus web/localfold.cs
                      fold of every laptop screen, and this bar is always in view. -->
                 <div class="viewer-bar">
                     <div id="viewer-legend" class="viewer-legend"></div>
+                    <button id="show-run" class="btn btn-grey btn-small" type="button" hidden
+                        title="Draw the run again, in place of the refold">Show the run</button>
                     <button id="show-job" class="btn btn-grey btn-small" type="button" hidden
                         title="Draw the job again: the structure and a sketch of what is to be designed">Show the job</button>
                     <button type="button" id="hunt" class="btn btn-primary run-button">

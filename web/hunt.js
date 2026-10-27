@@ -24,7 +24,7 @@ import { CHAIN_IDS, runDesign } from "../webgpu/design/hunter-loop.js";
 import { designChain, loadDesigner } from "../cpu/design/mpnn-bridge.js";
 import { chooseDesigner } from "../cpu/design/designers.js";
 import { contactProblem } from "../cpu/design/contact.js";
-import { FOLDERS, validateDesign } from "./validate-design.js";
+import { FOLDERS } from "./validate-design.js";
 
 /** The folding models this driver can actually run, and what each is in af3-model's terms. */
 export { FOLDERS } from "./validate-design.js";
@@ -57,9 +57,6 @@ export { FOLDERS } from "./validate-design.js";
  * @param {number} [options.cycles=5]
  * @param {number} [options.length=75] the designed chain's length
  * @param {number} [options.beam=1] how many sequences each cycle tries
- * @param {string} [options.validate] a folding model to re-fold the finished
- *   design with, for a confidence nothing was optimised against and an RMSD to
- *   the design it should reproduce
  * @param {Iterable<number>} [options.hold] positions within the designed chain
  *   to keep as they are - a framework, a motif - every cycle
  * @param {Record<string, number[]>} [options.hotspots] per chain, residues the
@@ -75,8 +72,8 @@ export async function hunt(options) {
   const {
     chains, chainKinds, ligandCodes, modifications, chainIndex = 0, folders = ["af3"],
     designer = "auto", contents = {},
-    runs = 1, cycles = 5, length = 75, beam = 1, validate, report,
-    status = () => {}, progress = () => {}, progressNote = () => {}, signal,
+    runs = 1, cycles = 5, length = 75, beam = 1, report,
+    status = () => {}, progress = () => {}, signal,
   } = options;
 
   if (typeof report !== "function") throw new TypeError("hunt needs a report callback");
@@ -271,29 +268,7 @@ export async function hunt(options) {
     if (record.best === true && (best === null || record.score > best.score)) best = record;
   }
 
-  // 🔴 AND THEN THE ONE NUMBER NOTHING WAS OPTIMISED AGAINST. The objective is
-  // the folding model's opinion of its own design; folding the finished sequence
-  // with a model that had no hand in making it is the only independent thing a
-  // run produces. See cpu/design/validate.js.
-  let validation = null;
-  if (best !== null) {
-    // One path for both methods - see web/validate-design.js, which is where
-    // this lived until the generate path needed the same check.
-    validation = await validateDesign({
-      pdb: best.pdb,
-      sequence: best.complex ?? best.sequence,
-      chain: CHAIN_IDS[chainIndex],
-      model: validate,
-      device,
-      seed: options.seed ?? 0,
-      steps: options.steps,
-      status,
-      signal,
-    });
-    if (validation?.described !== undefined) progressNote(validation.described);
-  }
-
   toBar(1);
   status(best === null ? "no cycle completed" : `best ${best.score.toFixed(3)}`);
-  return { best, cycles: all, validation };
+  return { best, cycles: all };
 }

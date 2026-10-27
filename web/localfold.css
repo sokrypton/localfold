@@ -1742,3 +1742,8 @@
 
 
 }
+
+/* 🔴 STEP 6, THE REFOLD: a design, a model of its own, the button - one row that wraps. */
+#step-refold .refold-design-field select { min-width: 11rem; }
+#step-refold .model-row .btn { height: 34px; }
+#step-refold .option-note { margin-top: 8px; }

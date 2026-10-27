@@ -27,7 +27,7 @@ import { alphaCarbons, coordinateAtoms, rewriteCoordinates } from "../../shared/
  *
  * @param {string} pdb the cycle to move
  * @param {string} reference the cycle to move it onto - the first, normally
- * @param {string} [designed] the chain being designed, which is NOT used to fit
+ * @param {string|string[]} [designed] the chain(s) being designed, which are NOT used to fit
  * @returns {string} the same PDB with every coordinate rewritten, or the input
  *   unchanged when there is nothing to fit on
  */
@@ -36,7 +36,8 @@ export function alignToReference(pdb, reference, designed) {
   const fixed = coordinateAtoms(reference);
 
   // The chains both structures have, minus the one being designed.
-  const onto = (chain) => chain !== designed;
+  const held = Array.isArray(designed) ? designed : [designed];
+  const onto = (chain) => !held.includes(chain);
   let movingIndices = alphaCarbons(moving, onto);
   let fixedIndices = alphaCarbons(fixed, onto);
 

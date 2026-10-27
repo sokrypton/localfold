@@ -758,8 +758,8 @@ def main():
               window.__designSpans.set([{ kind: 'generated', min: 100, max: 100 }]);
               document.getElementById('steps').value = '30';
               // 🔴 A BEAM OF TWO, because one exercises none of the loop. The
-              // candidate loop, the per-candidate seed, the ranking and the
-              // single-best marker all only exist above one, and a beam of 1
+              // candidate loop and the per-candidate seed only exist above
+              // one, and a beam of 1
               // runs the same straight line the page ran before the control was
               // honoured at all.
               document.getElementById('beam').value = '2';
@@ -836,25 +836,14 @@ def main():
                 print(f"  show the job: {back}")
                 if not back["offered"] or not back["kept"] or back["drawn"] is None or not back["hidden"]:
                     bad.append(f"after a generation, Show the job did not bring the job back: {back}")
-                # Both candidates are drawn, and exactly one of them is marked -
-                # the same rule the hunt table has, because the leader changes
-                # as candidates arrive.
+                # Both candidates are drawn, and none is marked best: a generation scores nothing of
+                # its own, and the refold that used to rank them is asked for now (step 6).
                 if generated["rows"] != 2:
                     bad.append(f"a beam of 2 drew {generated['rows']} rows, expected 2")
-                if generated["best"] != 1:
-                    bad.append(f"{generated['best']} rows marked best, expected exactly 1")
-                if "best of 2" not in generated["status"]:
-                    bad.append("the status does not say the beam was ranked: "
-                               f"{generated['status']!r}")
-                # 🔴 AND THE TWO CANDIDATES MUST ACTUALLY DIFFER. The flow is
-                # deterministic given its seed, so if the per-candidate seed did
-                # not reach the engine the beam would draw ONE structure twice,
-                # rank it against itself, and satisfy every assertion above - N
-                # times the cost for one answer, silently. Two identical
-                # verdicts is what that looks like from here.
-                if len(set(generated["verdicts"])) < 2:
-                    bad.append("the beam's candidates are identical, so the seed is not"
-                               f" reaching the engine: {generated['verdicts']}")
+                if generated["best"] != 0:
+                    bad.append(f"{generated['best']} rows marked best, and nothing ranks them now")
+                if "2 designs" not in generated["status"]:
+                    bad.append(f"the status does not say the beam made two: {generated['status']!r}")
                 # 🔴 AND THE DESIGNS CAN BE TAKEN AWAY, AS THE JOB THAT MADE THEM. Nothing
                 # offered a generated structure for download; now each candidate has its files
                 # and the archive carries the job, which must be one the native port runs to the
@@ -867,6 +856,13 @@ def main():
                     [name, typeof content === 'string' ? content : null]),
                 })"""))
                 names = [n for n, _ in archive["members"]]
+                # 🔴 AND THE TWO CANDIDATES MUST ACTUALLY DIFFER. The flow is deterministic given its
+                # seed, so if the per-candidate seed did not reach the engine the beam would draw ONE
+                # structure twice and satisfy every assertion above - N times the cost for one
+                # answer, silently.
+                pdbs = dict(archive["members"])
+                if pdbs.get("candidate-1.pdb") == pdbs.get("candidate-2.pdb"):
+                    bad.append("the beam's candidates are identical, so the seed is not reaching the engine")
                 if archive["rows"] != 2:
                     bad.append(f"the downloads list {archive['rows']} candidates, expected 2")
                 for want in ("job.json", "README.txt", "candidate-1.pdb", "candidate-1.cif",
@@ -924,6 +920,50 @@ def main():
                                        f"{(r.stdout + r.stderr)[-300:]}")
                         else:
                             print("            the archived job featurises natively: 100 tokens")
+                # 🔴 THE REFOLD, ASKED FOR (step 6): candidate 2 refolded with AF3 and drawn over
+                # itself. The picture holds both (two chains for a one-chain design), the verdict
+                # lands in step 6 and in that candidate's row, the legend says what the grey and the
+                # red mean, and Show the run gives the whole trajectory back.
+                cdp.evaluate(ws, """(() => {
+                  document.getElementById('refold-design').value = '1';
+                  document.getElementById('refold-model').value = 'af3';
+                  document.getElementById('refold-button').click();
+                  return 1;
+                })()""")
+                frameOf = """(() => {
+                  const entry = Object.values(window.py2dmol_viewers ?? {})[0];
+                  const renderer = entry?.renderer ?? entry;
+                  const frames = renderer?.objectsData?.[renderer?.currentObjectName]?.frames ?? [];
+                  return { frames: frames.length, chains: [...new Set(frames[0]?.chains ?? [])].length };
+                })()"""
+                refoldDeadline = time.time() + 900
+                refold = {}
+                while time.time() < refoldDeadline:
+                    refold = json.loads(cdp.evaluate(ws, """JSON.stringify({
+                      button: document.getElementById('refold-button').textContent.trim(),
+                      note: document.getElementById('refold-note').textContent,
+                      failed: document.getElementById('status-message').classList.contains('error'),
+                      cell: document.querySelectorAll('#results-body tr')[1]?.lastElementChild?.textContent ?? '',
+                      legend: document.getElementById('viewer-legend').textContent,
+                      saved: !document.getElementById('refold-save').hidden,
+                      back: !document.getElementById('show-run').hidden,
+                      picture: %s,
+                    })""" % frameOf))
+                    if refold["failed"] or (refold["button"] == "Refold" and not refold["note"].startswith("Refolding")):
+                        break
+                    time.sleep(2)
+                print(f"  refold: {refold.get('note')}")
+                if (refold.get("failed") or "af3: " not in refold.get("note", "") or "RMSD" not in refold.get("note", "")
+                        or refold.get("cell") not in refold.get("note", "") or "refold" not in refold.get("legend", "")
+                        or not refold.get("saved") or not refold.get("back")
+                        or refold.get("picture") != {"frames": 1, "chains": 2}):
+                    bad.append(f"the refold did not land as a picture and a verdict: {refold}")
+                cdp.evaluate(ws, "(() => { document.getElementById('show-run').click(); return 1; })()")
+                time.sleep(1)
+                run = json.loads(cdp.evaluate(ws, "JSON.stringify(%s)" % frameOf))
+                print(f"            show the run: {run}")
+                if run != {"frames": 31, "chains": 1}:
+                    bad.append(f"Show the run did not give the trajectory back: {run}")
 
         # 🔴 THE CONTACT VETO, PROVED BY ASKING FOR AN EPITOPE THAT CANNOT BE
         # TOUCHED. A filter that never fires is indistinguishable from no filter,
@@ -1379,7 +1419,6 @@ def main():
                     { kind: 'segment', chain: 'A', first: 60, last: 80 }, { kind: 'generated', min: 6, max: 6 }]);
                   document.getElementById('steps').value = '8';
                   document.getElementById('beam').value = '1';
-                  document.getElementById('validate').value = '';
                   document.getElementById('hunt').click();
                   return 1;
                 })()""")

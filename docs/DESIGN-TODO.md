@@ -392,3 +392,30 @@ one rule - Hunter's job order, or RFD4's - for the cards' "→ chain X", the dia
 and the colour of every RFD4 frame; a chain RFD4 writes that the rule did not predict is an error.
 Verified: all ten RFD4 examples ran through `--presets` with the check live (no error, results
 unchanged), and 5O45 / PD-L1 / DNA screenshot before and after a run in the same colours.
+
+
+### Refold, as its own step (2026-10-27) - done
+
+Asked for: a validate button that predicts and shows the (mis)alignment, separate from the run so the
+reader decides, with its own model picker. 🔴 The check used to run after EVERY run with a model picked
+in step 1 ("Check with"), cost every run a fold, and showed only a line of text - the refolded
+structure was computed and never drawn. Now:
+- step 6, **Refold**: a finished design (an RFD4 candidate, or a hunt's scored cycle - its best by
+  default), a model of its own (AF3, Boltz-2, Protenix-2, OpenBind-0, OpenDDE), a Refold button, the
+  verdict, and the refold as a PDB in the design's frame;
+- the viewer draws the design in the run's colours with the refold over it, grey where it agrees and
+  red where it moved (1 A to 4 A and up), fitted the way the run is - on what was kept, the designed
+  chains held out - so a binder that lands elsewhere shows as moved; "Show the run" gives the
+  trajectory back;
+- the refold reads every chain off the design (protein, DNA/RNA, ligands - `cpu/design/refold.js`),
+  pairs chains by order not letter (RFD4 letters the 5O45 binder design B / target A), and refuses a
+  residue it cannot name (a modified one) rather than refolding an X;
+- an RFD4 beam no longer ranks or marks a best candidate: nothing scores one until it is refolded,
+  and the verdict lands in its row.
+Found on the way: "Folds with" offered Boltz-2 and Protenix-2 and `hunt` threw on both ("no folder
+boltz2") - they were missing from `FOLDERS`; `test/design-validate-options.test.js` now holds both
+pickers to it. Verified: `--generate` refolds candidate 2 with AF3 (two chains drawn, verdict in the
+row, Show the run back to 31 frames); 5O45 at 60 steps and a 2-cycle hunt refolded and screenshot.
+Open: a single-sequence refold misfolds a natural target - 5O45's PD-L1 comes back 8.3 A from its
+crystal - so a binder's check is dominated by the target; giving the refold the kept chains as a
+template is the fix the field uses.

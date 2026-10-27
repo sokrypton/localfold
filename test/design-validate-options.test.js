@@ -5,29 +5,30 @@ import { FOLDERS } from "../web/validate-design.js";
 
 const read = (name) => readFileSync(fileURLToPath(new URL(name, import.meta.url)), "utf8");
 
-describe("the validation model picker", () => {
-  // 🔴 AN OPTION THAT IS NOT IN `FOLDERS` VALIDATES NOTHING, SILENTLY.
-  // `validateDesign` returns null for a model it does not know, so the run
-  // finishes with no number and no complaint - and the page had two such
-  // options, Boltz-2 and Protenix-2, for as long as the control existed. A
-  // control that silently does nothing is worse than an absent one.
-  it("offers exactly the models that can validate", () => {
-    const html = read("../design.html");
-    const block = html.slice(html.indexOf('<select id="validate"'));
-    const options = [...block.slice(0, block.indexOf("</select>"))
-      .matchAll(/<option value="([^"]*)"/g)].map(([, value]) => value);
-    // "" is "nothing", which is a real choice rather than a model.
-    expect(options[0]).toBe("");
-    expect(options.slice(1).sort()).toEqual(Object.keys(FOLDERS).sort());
+/** A select's option values and its selected one, from design.html. */
+function picker(id) {
+  const html = read("../design.html");
+  const block = html.slice(html.indexOf(`<select id="${id}"`));
+  const body = block.slice(0, block.indexOf("</select>"));
+  return {
+    options: [...body.matchAll(/<option value="([^"]*)"/g)].map(([, value]) => value),
+    chosen: /<option value="([^"]*)"[^>]*\bselected\b/.exec(body)?.[1],
+  };
+}
+
+describe("the design page's model pickers", () => {
+  // 🔴 AN OPTION THAT IS NOT IN `FOLDERS` CANNOT FOLD. The refold picker had two such options,
+  // Boltz-2 and Protenix-2, for as long as it existed and they validated nothing; the hunt's "Folds
+  // with" offered the same two and `hunt` threw "no folder boltz2" on them.
+  it("the refold offers exactly the models that can refold", () => {
+    const { options, chosen } = picker("refold-model");
+    expect(options.slice().sort()).toEqual(Object.keys(FOLDERS).sort());
+    expect(Object.keys(FOLDERS).includes(chosen)).toBe(true);
   });
 
-  // A default nobody can honour would be the same bug on first load.
-  it("defaults to a model that can validate", () => {
-    const html = read("../design.html");
-    const block = html.slice(html.indexOf('<select id="validate"'));
-    const chosen = /<option value="([^"]*)"[^>]*\bselected\b/.exec(
-      block.slice(0, block.indexOf("</select>")));
-    expect(chosen !== null).toBe(true);
-    expect(Object.keys(FOLDERS).includes(chosen[1])).toBe(true);
+  it("the hunt folds only with models it has", () => {
+    const { options, chosen } = picker("folders");
+    expect(options.every((value) => FOLDERS[value] !== undefined)).toBe(true);
+    expect(FOLDERS[chosen] !== undefined).toBe(true);
   });
 });
