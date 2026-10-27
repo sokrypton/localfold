@@ -630,6 +630,7 @@ if (navigator.gpu === undefined) {
  */
 const drawCycle = (record) => {
   resultsBox.style.display = "";
+  sizeStage();
 
   const row = document.createElement("tr");
   // 🔴 THE PREVIOUS BEST ROW HAS TO BE UN-MARKED, because the loop decides
@@ -954,6 +955,18 @@ function paintViewerBar() {
 const sequenceBox = element("sequence-viewer-container");
 const sequenceHint = element("sequence-hint");
 const stage = document.querySelector(".design-stage");
+/**
+ * 🔴 THE PICTURE CANNOT BE SCROLLED AWAY (2026-10-27). The stage used to scroll as a whole once a
+ * run's table and downloads made it taller than the window - and scrolled back up, the canvas
+ * reached the pointer and took the wheel as a zoom, so the viewer could not be scrolled back into
+ * view. The table and downloads scroll in their own box under it now, and while either is up the
+ * viewer gives that box a share of the window. Looked up here rather than through the constants
+ * above, which a run's first row can be drawn before.
+ */
+function sizeStage() {
+  const shown = (id) => document.getElementById(id)?.style.display !== "none";
+  document.querySelector(".design-stage")?.classList.toggle("has-results", shown("results") || shown("downloads"));
+}
 /**
  * Show or hide the strip. 🔴 THE VIEWER GIVES IT ROOM: the viewer is as tall as the window, and the
  * strip under it was below the fold of a laptop screen - present, and invisible, through every run.
@@ -1715,6 +1728,7 @@ element("structure-file").addEventListener("change", async (event) => {
 /** One finished candidate, as a row and as the structure on screen. */
 function drawGenerated(candidate, total, designed) {
   resultsBox.style.display = "";
+  sizeStage();
   if (reference === null) beginRunPicture();
   // The finished structure is the last frame, in the same frame of reference as
   // the trajectory that led to it.
@@ -1988,9 +2002,11 @@ function paintDownloads() {
   downloadsBox.replaceChildren();
   if (generatedRun.length === 0) {
     downloadsBox.style.display = "none";
+    sizeStage();
     return;
   }
   downloadsBox.style.display = "";
+  sizeStage();
   const heading = document.createElement("h3");
   heading.textContent = "Downloads";
   downloadsBox.append(heading);

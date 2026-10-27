@@ -1455,10 +1455,16 @@
 .design-layout { display: grid; grid-template-columns: minmax(360px, 420px) minmax(0, 1fr); gap: 16px; align-items: start;
   --viewer-height: max(420px, calc(100vh - 210px)); }
 .design-steps { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
-/* 🔴 THE PICTURE STAYS IN VIEW while the steps scroll past it: the stage sticks to the top and
-   scrolls on its own when a run's table and downloads make it taller than the window. */
+/* 🔴 THE PICTURE STAYS IN VIEW while the steps scroll past it: the stage sticks to the top, and a
+   run's table and downloads scroll in their own box under the viewer (.design-below) - the stage
+   scrolling as a whole let the viewer be scrolled away, and the canvas then took the wheel back as
+   a zoom. The stage itself scrolls only on a window too short for the viewer's minimum. */
 .design-stage { display: flex; flex-direction: column; gap: 8px; min-width: 0;
   position: sticky; top: 8px; max-height: calc(100vh - 16px); overflow-y: auto; }
+.design-stage > * { flex: 0 0 auto; }
+.design-stage > .design-below { flex: 1 1 auto; min-height: 0; overflow-y: auto;
+  display: flex; flex-direction: column; gap: 8px; }
+.design-stage.has-results > .design-below { min-height: 120px; }
 .design-step { background: #fff; border: 1px solid #e5e7eb; border-radius: 10px; padding: 12px 14px; }
 .design-step[hidden] { display: none; }
 .design-step h2 { display: flex; align-items: center; gap: 8px; margin: 0 0 8px; font-size: 15px; font-weight: 600; color: #111827; }
@@ -1528,6 +1534,9 @@
 .design-stage.has-sequence { --viewer-height: max(320px, calc(100vh - 360px)); }
 .design-stage #sequence-viewer-container { flex: 0 0 auto; }
 .design-stage #sequenceView { max-height: 104px; overflow-y: auto; }
+/* ...and shorter again while a run's table is up, leaving that box about a third of the window */
+.design-stage.has-results { --viewer-height: max(260px, calc(70vh - 110px)); }
+.design-stage.has-sequence.has-results { --viewer-height: max(240px, calc(70vh - 250px)); }
 .seed-field { display: inline-flex; align-items: center; gap: 4px; }
 .seed-field input { width: 9ch; }
 .viewer-bar { display: flex; align-items: center; gap: 10px; min-height: 26px; }
@@ -1605,6 +1614,8 @@
      right after the goal, so choosing one shows the job (and Generate) without scrolling past
      every step. The steps' box dissolves so its sections can be ordered around the stage. */
   .design-stage { position: static; max-height: none; overflow: visible; order: 2; }
+  .design-stage > .design-below, .design-stage.has-results > .design-below { min-height: 0; overflow: visible; }
+  .design-stage.has-results, .design-stage.has-sequence.has-results { --viewer-height: min(60vh, 100vw); }
   .design-steps { display: contents; }
   .design-step { order: 3; }
   #step-method { order: 0; }
