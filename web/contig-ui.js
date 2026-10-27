@@ -144,12 +144,14 @@ export function chainOfSpans(spans) {
   return out;
 }
 
+// 🔴 NAMED FOR WHAT A NEWCOMER WANTS DONE TO THE PIECE (2026-10-27): "From structure" and
+// "New chain" described where a span comes from and what follows it, not what it is.
 export const SPAN_LABELS = {
-  generated: "Design",
-  sequence: "Given sequence",
-  segment: "From structure",
+  generated: "Design new",
+  sequence: "Known sequence",
+  segment: "Keep from structure",
   ligand: "Ligand",
-  break: "New chain",
+  break: "Chain break",
 };
 
 /** What each kind is, shown as the picker's title. */
@@ -157,7 +159,7 @@ export const SPAN_NOTES = {
   generated: "Residues to design. Give one length, or a range for the method to choose from."
     + " Name it to ask for a secondary structure.",
   sequence: "A chain you know the sequence of - protein, DNA or RNA. Protein Hunter folds it;"
-    + " RFD4-Proteina needs its coordinates, so use \u201cFrom structure\u201d there.",
+    + " RFD4-Proteina needs its coordinates, so use \u201cKeep from structure\u201d there.",
   segment: "Residues taken from a loaded structure, held as they are.",
   ligand: "A small molecule by its CCD code, as context to design against.",
   break: "Everything after this is a separate chain.",
@@ -205,7 +207,7 @@ export const METHOD_LIMITS = {
     // hold fixed - where Hunter, which reaches structure by folding, takes
     // exactly that.
     sequence: "RFD4-Proteina conditions on coordinates, not on a sequence — load the structure"
-      + " and use \u201cFrom structure\u201d.",
+      + " and use \u201cKeep from structure\u201d.",
   },
 };
 
@@ -658,7 +660,7 @@ export function chainsOf(spans, options = {}) {
       }
     } else {
       if (sequenceOf === undefined) {
-        problems.push("Protein Hunter folds sequences, so a \u201cFrom structure\u201d span needs"
+        problems.push("Protein Hunter folds sequences, so a \u201cKeep from structure\u201d span needs"
           + " the structure loaded to read its sequence from");
         continue;
       }
@@ -725,6 +727,80 @@ export function chainsOf(spans, options = {}) {
  * @returns {{read: () => object[], set: (spans: object[]) => void,
  *            contig: () => object}}
  */
+/**
+ * The job at a glance: a row per chain, a block per span - kept from the structure (solid, in the
+ * chain's colour), designed (striped), a known sequence (outlined) - and ligands as chips beside
+ * them. A block's width follows its residue count (a designed range by its middle), so a 20-residue
+ * motif inside a 100-residue design looks it. `onPick(index)` is called with the clicked span.
+ *
+ * @param {HTMLElement} container
+ * @param {object[]} spans
+ * @param {{ onPick?: (index: number) => void, selected?: number }} [options]
+ */
+export function drawChainDiagram(container, spans, { onPick = () => {}, selected = -1 } = {}) {
+  const chainOf = chainOfSpans(spans);
+  const rows = new Map();
+  const ligands = [];
+  const sizeOf = (span) => {
+    if (span.kind === "generated") return (number(span.min, 1) + number(span.max, number(span.min, 1))) / 2;
+    if (span.kind === "segment") return Math.max(1, number(span.last, 1) - number(span.first, 1) + 1);
+    if (span.kind === "sequence") return Math.max(1, String(span.value ?? "").length);
+    return 0;
+  };
+  const labelOf = (span) => {
+    if (span.kind === "generated") {
+      const min = number(span.min, 0);
+      const max = number(span.max, min);
+      // the stripes say "designed"; the block says how many
+      return min === max ? `${min}` : `${min}\u2013${max}`;
+    }
+    if (span.kind === "segment") return `${span.chain ?? "?"}${span.first ?? ""}\u2013${span.last ?? ""}`;
+    if (span.kind === "sequence") return `sequence (${String(span.value ?? "").length})`;
+    return "";
+  };
+  spans.forEach((span, index) => {
+    if (span.kind === "ligand") { ligands.push(index); return; }
+    const chain = chainOf[index];
+    if (chain === null) return;
+    if (!rows.has(chain)) rows.set(chain, []);
+    rows.get(chain).push(index);
+  });
+  const out = [];
+  for (const [chain, indices] of rows) {
+    const row = element("div", "chain-row");
+    row.style.setProperty("--chain-colour", chainColour(chain));
+    row.append(element("span", "chain-name", CHAIN_IDS[chain] ?? "?"));
+    const track = element("div", "chain-track");
+    for (const index of indices) {
+      const span = spans[index];
+      const block = element("button", `chain-block chain-block-${span.kind}`, labelOf(span));
+      block.type = "button";
+      block.style.flexGrow = String(sizeOf(span));
+      block.title = `${SPAN_LABELS[span.kind]}: ${labelOf(span)} - click to edit`;
+      if (index === selected) block.classList.add("selected");
+      block.addEventListener("click", () => onPick(index));
+      track.append(block);
+    }
+    row.append(track);
+    out.push(row);
+  }
+  if (ligands.length > 0) {
+    const row = element("div", "chain-row chain-row-ligands");
+    row.append(element("span", "chain-name", ""));
+    const track = element("div", "chain-track");
+    for (const index of ligands) {
+      const block = element("button", "chain-block chain-block-ligand", String(spans[index].code ?? "").trim() || "ligand");
+      block.type = "button";
+      block.title = "Ligand - click to edit";
+      block.addEventListener("click", () => onPick(index));
+      track.append(block);
+    }
+    row.append(track);
+    out.push(row);
+  }
+  container.replaceChildren(...out);
+}
+
 export function createContigList(rowsContainer, addButton, options = {}) {
   const notify = options.onChange ?? (() => {});
   const methodOf = options.method ?? (() => "rfd4p");
@@ -995,5 +1071,16 @@ export function createContigList(rowsContainer, addButton, options = {}) {
     },
     contig() { return contigOf(read(), methodOf()); },
     repaint: draw,
+    /** Open a span's row and bring it into view, for the chain diagram's blocks. */
+    reveal(index) {
+      if (index < 0 || index >= spans.length) return;
+      open.add(index);
+      draw();
+      const row = rowsContainer.children[index];
+      if (row === undefined) return;
+      row.classList.add("contig-row-flash");
+      row.scrollIntoView?.({ block: "nearest", behavior: "smooth" });
+      setTimeout(() => row.classList.remove("contig-row-flash"), 1200);
+    },
   };
 }

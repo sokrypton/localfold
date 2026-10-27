@@ -100,6 +100,13 @@ MODALITIES = [
      "SolubleMPNN", FRAME_LEFT + "|" + FRAME_RIGHT),
 ]
 
+# The page's default job until 2026-10-27 - a target sequence and a binder - which the Hunter arm
+# still describes, now set by hand since the page opens on a blank RFD4-Proteina design.
+OLD_DEFAULT = [{"kind": "sequence",
+                "value": "FTVTVPKDLYVVEYGSNMTIECKFPVEKQLDLAALIVYWEMEDKNIIQFVHGEEDLKVQHSSYRQRARLLKDQLSLGNAALQITDVKLQDAGVYRCMISYGGADYKRITVKVNA"},
+               {"kind": "break"},
+               {"kind": "generated", "min": 75, "max": 75}]
+
 # The target and binder a hunt runs on, as spans.
 HUNT_SPANS = [{"kind": "sequence", "value": "GWSTELEKHREELKEFLKKEGITNVEIRIDN"},
               {"kind": "break"},
@@ -134,7 +141,9 @@ READ_PAGE = """(() => {
       .filter((o) => !o.disabled && o.value).length,
     presetsRefused: [...document.querySelectorAll("#preset option")]
       .filter((o) => o.disabled).map((o) => o.textContent),
-    presetInHead: document.querySelector(".fold-actions #preset") !== null,
+    goalsDisabled: [...document.querySelectorAll("#goals .goal-card:disabled")].map((c) => c.dataset.goal),
+    goalReasons: [...document.querySelectorAll("#goals .goal-card:disabled")].map((c) => c.title.length > 0),
+    constraintsHidden: document.getElementById("step-constraints").hidden,
     columns: n("#results-table thead th"),
     hunt: document.getElementById("hunt")?.textContent?.trim(),
   });
@@ -158,11 +167,10 @@ def main():
         ws.call("Page.enable")
         ws.call("Runtime.enable")
         ws.call("Page.navigate", url=f"http://127.0.0.1:{port}/design.html")
-        # 🔴 THE MODULE RAN IFF IT WROTE THE DESIGNER'S REASON. There is no
-        # window marker to wait on, and `readyState === "complete"` is true of a
-        # page whose module threw.
+        # 🔴 THE MODULE RAN IFF IT DREW THE GOAL CARDS. There is no window marker to wait on, and
+        # `readyState === "complete"` is true of a page whose module threw.
         try:
-            cdp.wait_for(ws, "document.getElementById('designer-note')?.textContent.length > 0",
+            cdp.wait_for(ws, "document.querySelectorAll('#goals .goal-card').length > 0",
                          60, "web/design.js to run")
         except RuntimeError:
             threw = cdp.evaluate(ws, """(async () => {
@@ -172,66 +180,142 @@ def main():
             print(f"FAIL: web/design.js did not run:\n{threw}")
             return 1
 
-        # The GPU line is filled when `requestAdapter()` answers, which is after the module ran;
-        # read it then, or an adapter slow to answer reads as a page that says nothing.
+        # The GPU line is filled when `requestAdapter()` answers, which is after the module ran.
         try:
             cdp.wait_for(ws, "document.getElementById('gpu-summary')?.textContent.length > 0", 30,
                          "the WebGPU line")
         except RuntimeError:
             pass
+
+        # 🔴 WHAT A NEWCOMER SEES FIRST (2026-10-27): the goals, a blank 100-residue design under
+        # RFD4-Proteina, the job drawn as a chain, and no prose - no greyed controls of the other
+        # method, no note explaining them, no designer note. Each was a reason the old page read
+        # as a form for someone who already knew it.
+        first = json.loads(cdp.evaluate(ws, """(() => {
+          const visible = (el) => el !== null && el.offsetParent !== null;
+          return JSON.stringify({
+            goals: [...document.querySelectorAll('#goals .goal-card')].map((c) => c.dataset.goal),
+            chosen: document.querySelector('#goals [aria-checked="true"]')?.dataset.goal ?? null,
+            method: document.getElementById('method').value,
+            rows: document.querySelectorAll('#contig-rows > *').length,
+            blocks: [...document.querySelectorAll('#chain-diagram .chain-block')].map((b) => b.textContent),
+            contig: document.getElementById('contig-line').textContent,
+            columns: document.querySelectorAll('#results-table thead th').length,
+            otherMethodShown: ['folderGroup', 'cyclesGroup', 'runsGroup', 'temperatureGroup', 'omitGroup']
+              .filter((id) => !document.getElementById(id).classList.contains('not-this-method')),
+            notes: [...document.querySelectorAll('.design-notes .option-note, #preset-note')]
+              .filter(visible).map((n) => n.textContent.trim()).filter(Boolean),
+            placeholder: visible(document.getElementById('viewer-empty')),
+            constraints: visible(document.getElementById('step-constraints')),
+            hunt: document.getElementById('hunt').textContent.trim(),
+            gpu: document.getElementById('gpu-summary').textContent.trim(),
+          });
+        })()"""))
+        print(f"  on arrival: {first}")
+        if len(first["goals"]) != 8 or first["chosen"] != "blank":
+            bad.append(f"the goals are {first['goals']} with {first['chosen']!r} chosen; expected 8, New protein")
+        if first["method"] != "rfd4p" or first["hunt"] != "Generate":
+            bad.append(f"the page opens on {first['method']!r} / {first['hunt']!r}, expected RFD4-Proteina and Generate")
+        if first["rows"] != 1 or first["blocks"] != ["100"] or first["contig"] != "100 residues":
+            bad.append(f"the blank job is {first['rows']} rows, blocks {first['blocks']}, {first['contig']!r};"
+                       " expected one designed 100-residue chain")
+        if first["columns"] != 4:
+            bad.append(f"{first['columns']} result columns under RFD4-Proteina, expected 4")
+        if first["otherMethodShown"]:
+            bad.append(f"Protein Hunter's controls are on screen under RFD4-Proteina: {first['otherMethodShown']}")
+        if first["notes"]:
+            bad.append(f"the page explains itself before anything happened: {first['notes']}")
+        if not first["placeholder"] or not first["constraints"]:
+            bad.append("the viewer's placeholder or the constraints step is missing on arrival")
+        if first["gpu"] == "":
+            bad.append("the page did not say whether WebGPU is available")
+
+        # 🔴 A GOAL CARD LOADS ITS EXAMPLE, AND NEW PROTEIN TAKES IT AWAY AGAIN: the motif card picks
+        # the 1PRW example, which draws its structure in the viewer, lays out five pieces and names
+        # the file without its path; editing that example's pieces says they are not used (it runs
+        # from its structure's annotations); and New protein drops the structure and the pieces.
+        cdp.evaluate(ws, "(() => { document.querySelector('[data-goal=motif_idx_1prw]').click(); return 1; })()")
+        cdp.wait_for(ws, "(() => { const e = Object.values(window.py2dmol_viewers ?? {})[0];"
+                         " return ((e?.renderer ?? e)?.chains?.length ?? 0) > 10; })()", 30, "the motif's structure")
+        motif = json.loads(cdp.evaluate(ws, """(() => {
+          const out = { preset: document.getElementById('preset').value,
+            chosen: document.querySelector('#goals [aria-checked="true"]')?.dataset.goal,
+            blocks: [...document.querySelectorAll('#chain-diagram .chain-block')].map((b) => b.textContent),
+            structure: document.getElementById('structure-note').textContent,
+            placeholder: !document.getElementById('viewer-empty').hidden,
+            noteBefore: document.getElementById('preset-note').textContent };
+          const spans = window.__designSpans.read();
+          spans[0] = { ...spans[0], min: 7, max: 7 };
+          window.__designSpans.set(spans);
+          const note = document.getElementById('preset-note');
+          out.edited = { text: note.textContent, warn: note.classList.contains('warn') };
+          document.querySelector('[data-goal=blank]').click();
+          out.blank = { rows: document.querySelectorAll('#contig-rows > *').length,
+            structure: document.getElementById('structure-note').textContent,
+            placeholder: !document.getElementById('viewer-empty').hidden,
+            preset: document.getElementById('preset').value };
+          return JSON.stringify(out);
+        })()"""))
+        print(f"  motif card: {motif}")
+        if motif["preset"] != "motif_idx_1prw" or motif["chosen"] != "motif_idx_1prw":
+            bad.append(f"the motif card did not load its example: {motif}")
+        if motif["blocks"] != ["5–20", "A1–20", "10–25", "A22–41", "5–20"]:
+            bad.append(f"the motif example is drawn as {motif['blocks']}")
+        if motif["structure"] != "motif_idx_1prw · chain A 0–42" or motif["placeholder"]:
+            bad.append(f"the motif's structure is not shown and named: {motif['structure']!r}")
+        if not motif["edited"]["warn"] or "not used" not in motif["edited"]["text"]:
+            bad.append(f"an edit to an annotation-driven example is not said to be unused: {motif['edited']}")
+        if motif["blank"] != {"rows": 1, "structure": "", "placeholder": True, "preset": ""}:
+            bad.append(f"New protein did not clear the example: {motif['blank']}")
+
+        # 🔴 PROTEIN HUNTER IS AN ADVANCED CHOICE NOW, and under it the page is the one it was: its own
+        # controls, its notes, its examples - and the old default job, set here, is described to it.
+        cdp.evaluate(ws, """(() => {
+          const pick = document.getElementById('method');
+          pick.value = 'hunter';
+          pick.dispatchEvent(new Event('change'));
+          window.__designSpans.set(__OLD_DEFAULT__);
+          return 1;
+        })()""".replace("__OLD_DEFAULT__", json.dumps(OLD_DEFAULT)))
         page = json.loads(cdp.evaluate(ws, READ_PAGE))
         for key, value in page.items():
             print(f"  {key}: {value}")
         if "because" not in (page["designer"] or ""):
             bad.append(f"the designer note does not say why: {page['designer']!r}")
-        # The default job is a given target, a break, and a designed binder - so
-        # two chains, and the designed one has to be named as such or the reader
-        # cannot tell which colour is the thing being made.
+        # Two chains, and the designed one named as such.
         if len(page["legend"]) != 2:
             bad.append(f"the legend has {page['legend']}, expected one entry a chain")
         if not any("designed" in entry for entry in page["legend"]):
             bad.append(f"the legend does not say which chain is designed: {page['legend']}")
-        # 🔴 THE SWATCH AND THE ROW BAR MUST BE THE SAME COLOUR. They come from
-        # two different walks of the same spans, and a disagreement between them
-        # is an indicator that points at the wrong chain - which reads as an
-        # answer rather than as a bug.
+        # 🔴 THE SWATCH AND THE ROW BAR MUST BE THE SAME COLOUR.
         rowsByChain = [c for c in page["rowColours"] if c]
         if sorted(set(rowsByChain)) != sorted(set(page["legendColours"])):
             bad.append("row bars and legend swatches disagree: "
                        f"{sorted(set(rowsByChain))} against {sorted(set(page['legendColours']))}")
-        # ...and the break row belongs to no chain, so it carries no bar.
         if len(rowsByChain) != 2:
             bad.append(f"expected two chained rows, got {page['rowColours']}")
-        # The default method is Protein Hunter, which takes six of the ten.
+        # Protein Hunter takes six of the ten examples, and four goals are disabled with a reason.
         if page["presetsOffered"] != 6:
-            bad.append(f"{page['presetsOffered']} examples offered under Hunter,"
-                       " expected 6")
-        # 🔴 AND EACH REFUSAL SAYS WHY. A greyed row with no reason is a
-        # dead end a reader cannot act on.
+            bad.append(f"{page['presetsOffered']} examples offered under Hunter, expected 6")
         if len(page["presetsRefused"]) != 4:
             bad.append(f"{len(page['presetsRefused'])} examples refused, expected 4")
         for text in page["presetsRefused"]:
-            if "\u2014" not in text:
+            if "—" not in text:
                 bad.append(f"an unavailable example gives no reason: {text!r}")
-        if not page["presetInHead"]:
-            bad.append("the example picker is not beside the method it belongs to")
+        if sorted(page["goalsDisabled"]) != ["custom_cath_monomer", "dna_7m5w", "ppi_pdl1", "sm_sam"] \
+                or not all(page["goalReasons"]):
+            bad.append(f"under Hunter the goals disabled are {page['goalsDisabled']}, each with its reason")
         if page["spanRows"] != 3:
             bad.append(f"the span editor drew {page['spanRows']} rows, expected 3")
-        # 🔴 THE LINE DESCRIBES WHAT THE SELECTED METHOD WILL ACTUALLY BE
-        # ASKED, which differs by method and must. The page opens on Protein
-        # Hunter, whose input is chains - so it reads "given 114 · design 75"
-        # for the default job. A contig would be actively wrong here: a given
-        # SEQUENCE has no contig notation, so the line read "/0,75-75" for a job
-        # whose target is 114 residues long. The RFD4 form is checked below,
-        # through a preset.
+        # 🔴 THE LINE DESCRIBES WHAT THE SELECTED METHOD WILL ACTUALLY BE ASKED: chains for Hunter.
         if "given 114" not in (page["contig"] or "") or "design 75" not in (page["contig"] or ""):
-            bad.append(f"the line does not describe the default job to Hunter: {page['contig']!r}")
+            bad.append(f"the line does not describe the job to Hunter: {page['contig']!r}")
         if page["presets"] < 11:
             bad.append(f"the preset picker lists {page['presets']} entries, expected 10 plus the blank")
         if page["columns"] != 5:
-            bad.append(f"{page['columns']} result columns, expected 5")
-        if (page["gpu"] or "") == "":
-            bad.append("the page did not say whether WebGPU is available")
+            bad.append(f"{page['columns']} result columns under Hunter, expected 5")
+        if page["constraintsHidden"] is not True:
+            bad.append("the constraints step is on screen under Protein Hunter, which takes none")
 
         # ...and that the automatic choice is wired to the target, not printed.
         cdp.evaluate(ws, f"""(() => {{ window.__designSpans.set({json.dumps(WITH_LIGAND)}); return 1; }})()""")
@@ -241,77 +325,36 @@ def main():
         if "LigandMPNN" not in withLigand:
             bad.append(f"a ligand did not move the automatic designer: {withLigand!r}")
 
-        # ...and that switching method disables exactly the controls the other
-        # method cannot honour, WITH their reasons - greyed and explained, never
-        # removed, which is the page's own rule.
+        # ...and that switching method shows exactly the method's controls: the other's are hidden
+        # (still in the page, so a driver and the job read them), and nothing explains the absence.
         switched = json.loads(cdp.evaluate(ws, """(() => {
           const pick = document.getElementById("method");
           pick.value = "rfd4p";
           pick.dispatchEvent(new Event("change"));
-          // 🔴 NOT designerGroup: it is hidden now, since the automatic rule is
-          // right in every measured case and a picker whose answer is already
-          // correct is a question nobody needs asked. Its NOTE is still checked
-          // above - the answer stays even though the control went.
           const groups = ["folderGroup", "cyclesGroup", "runsGroup"];
           return JSON.stringify({
-            // 🔴 THE METHOD'S DESCRIPTION IS THE RESTING STATUS LINE NOW, as
-            // index.html does with "Ready. Paste a sequence and press Fold." -
-            // one fewer block of prose in the panel, and the one place a reader
-            // already looks for what the page is about to do.
             note: document.getElementById("status-message")?.textContent?.trim() ?? "",
-            disabled: groups.filter((id) => {
-              const g = document.getElementById(id);
-              return g !== null && [...g.querySelectorAll("select, input")].every((c) => c.disabled);
-            }),
-            // 🔴 ONE LINE NAMING ALL OF THEM, NOT A SENTENCE PER GROUP. Six
-            // italic reasons threaded between the controls is the ragged-
-            // paragraph problem the notes column exists to fix, and the first
-            // version of this put it straight back. The greyed control says
-            // THAT it cannot be used; this line says which and why.
-            unused: document.getElementById("unused-note")?.textContent ?? "",
-            // 🔴 STILL IN THE PAGE, NOT NECESSARILY ON SCREEN - and `hidden`
-            // cannot tell the two apart. `runsGroup` lives in the advanced
-            // strip, which is COLLAPSED by default, so it is legitimately
-            // hidden and `offsetParent` is null for a control that is present
-            // and correct. What must never happen is a control being REMOVED on
-            // a method switch: a disabled control explains itself, a vanished
-            // one does not, and taking a control away does not change its value
-            // either. So this asks whether the element is in the document, and
-            // reports separately whether it is hidden for a reason other than
-            // the strip being shut.
+            hidden: groups.filter((id) => document.getElementById(id)?.classList.contains("not-this-method")),
             stillThere: groups.filter((id) => document.getElementById(id) !== null),
-            wronglyHidden: groups.filter((id) => {
-              const g = document.getElementById(id);
-              return g !== null && g.hasAttribute("hidden") && !g.classList.contains("advanced");
-            }),
+            unused: document.getElementById("unused-note")?.textContent ?? "",
           });
         })()"""))
         print(f"  on RFD4-Proteina: {switched}")
-        for key in ("disabled", "stillThere"):
+        for key in ("hidden", "stillThere"):
             if len(switched[key]) != 3:
                 bad.append(f"switching method: {key} covered {switched[key]}, expected all three groups")
-        # The one line has to NAME every greyed control, or a reader is left with
-        # three dead inputs and no account of why.
-        if switched["wronglyHidden"]:
-            bad.append("a method switch hid a control that is not advanced: "
-                       f"{switched['wronglyHidden']}")
-        missing = [word for word in ("folds with", "cycles", "runs")
-                   if word not in switched["unused"].lower()]
-        if missing:
-            bad.append(f"the unused-control line does not name {missing}: {switched['unused']!r}")
-        if "one pass" not in switched["note"] or "🔴" in switched["note"]:
-            # 🔴 AND THE REPO'S COMMENT MARKER MUST NOT REACH THE PAGE. It is a
-            # convention for source, not a thing to show a reader; it leaked into this
-            # very note once.
-            bad.append(f"the method note is wrong or carries a source marker: {switched['note']!r}")
+        if switched["unused"]:
+            bad.append(f"the page explains a hidden control: {switched['unused']!r}")
+        if "420 MB" not in switched["note"] or "🔴" in switched["note"]:
+            # 🔴 AND THE REPO'S COMMENT MARKER MUST NOT REACH THE PAGE.
+            bad.append(f"the resting line is wrong or carries a source marker: {switched['note']!r}")
 
-        # 🔴 AND AtomWorks Studio's GENERATION OPTIONS: Thinking, the two K and Partial %, live
-        # under RFD4-Proteina, filled by a preset that declares them, and an out-of-range K refused
-        # by name BEFORE a generation starts (no weights are touched by this arm).
+        # 🔴 AND AtomWorks Studio's GENERATION OPTIONS: Thinking, the two K and Partial %, under
+        # RFD4-Proteina, filled by a preset that declares them, and an out-of-range K refused by name
+        # BEFORE a generation starts (no weights are touched by this arm).
         sampler = json.loads(cdp.evaluate(ws, """(() => {
           const ids = ["thinkingGroup", "backboneKGroup", "latentKGroup", "partialGroup"];
-          const live = ids.filter((id) => [...document.getElementById(id).querySelectorAll("select, input")]
-            .every((c) => !c.disabled));
+          const live = ids.filter((id) => !document.getElementById(id).classList.contains("not-this-method"));
           const preset = document.getElementById("preset");
           preset.value = "partial_diffusion_1prw";
           preset.dispatchEvent(new Event("change"));
@@ -328,30 +371,25 @@ def main():
         })()"""))
         print(f"  sampler controls: {sampler}")
         if len(sampler["live"]) != 4:
-            bad.append(f"under RFD4-Proteina only {sampler['live']} of the sampler controls are live")
+            bad.append(f"under RFD4-Proteina only {sampler['live']} of the sampler controls are shown")
         if sampler["filled"] != {"thinking": "low", "partial": "50"}:
             bad.append(f"the partial-diffusion preset did not fill Thinking/Partial %: {sampler['filled']}")
         if "Backbone K takes 1 to 20" not in sampler["refused"]:
             bad.append(f"Backbone K 25 was not refused by name: {sampler['refused']!r}")
-        if sampler["more"] != "9 more":
-            bad.append(f"the advanced toggle reads {sampler['more']!r}, expected '9 more'")
+        if sampler["more"] != "Advanced":
+            bad.append(f"the advanced toggle reads {sampler['more']!r}, expected 'Advanced'")
 
-        # ...and switching back must re-enable them, or the page is a one-way door.
+        # ...and switching back shows Hunter's and hides the sampler's, or the page is a one-way door.
         back = json.loads(cdp.evaluate(ws, """(() => {
           const pick = document.getElementById("method");
           pick.value = "hunter";
           pick.dispatchEvent(new Event("change"));
-          return JSON.stringify({ enabled: [...document.querySelectorAll(
-            "#designerGroup select, #folderGroup select, #scheduleGroup input")].every((c) => !c.disabled),
-            samplerGreyed: [...document.querySelectorAll(
-            "#thinkingGroup select, #backboneKGroup input, #latentKGroup input, #partialGroup input")]
-            .every((c) => c.disabled),
-            unused: document.getElementById("unused-note")?.textContent ?? "" });
+          const shown = (id) => !document.getElementById(id).classList.contains("not-this-method");
+          return JSON.stringify({ hunter: ["folderGroup", "cyclesGroup"].every(shown),
+            samplerHidden: ["thinkingGroup", "backboneKGroup", "latentKGroup", "partialGroup"].every((id) => !shown(id)) });
         })()"""))
-        if not back["enabled"]:
-            bad.append("switching back to Protein Hunter left controls disabled")
-        if not back["samplerGreyed"] or "backbone k" not in back["unused"].lower():
-            bad.append(f"under Protein Hunter the RFD4 sampler is not greyed with a reason: {back['unused']!r}")
+        if not back["hunter"] or not back["samplerHidden"]:
+            bad.append(f"switching back to Protein Hunter did not swap the controls: {back}")
 
         # 🔴 AND A REAL HUNT, END TO END: two models' weights, a fold, an MPNN
         # redesign, three more folds with the model rotating under the sequence,
@@ -877,7 +915,7 @@ def main():
           pick.dispatchEvent(new Event('change'));
           return JSON.stringify({
             method: document.getElementById('method').value,
-            contig: document.getElementById('contig-line').textContent.trim(),
+            contig: document.getElementById('contig-line').title.trim(),
             problems: document.getElementById('contig-problems').textContent.trim(),
             rows: document.querySelectorAll('#contig-rows > *').length,
             button: document.getElementById('hunt').textContent.trim(),
@@ -894,7 +932,7 @@ def main():
             time.sleep(1)
             loaded = json.loads(cdp.evaluate(ws, "JSON.stringify({"
                 "method: document.getElementById('method').value,"
-                "contig: document.getElementById('contig-line').textContent.trim(),"
+                "contig: document.getElementById('contig-line').title.trim(),"
                 "problems: document.getElementById('contig-problems').textContent.trim(),"
                 "rows: document.querySelectorAll('#contig-rows > *').length,"
                 "button: document.getElementById('hunt').textContent.trim()})"))
@@ -935,7 +973,7 @@ def main():
           pick.value = 'custom_cath_monomer';
           pick.dispatchEvent(new Event('change'));
           return JSON.stringify({
-            contig: document.getElementById('contig-line').textContent.trim(),
+            contig: document.getElementById('contig-line').title.trim(),
             problems: document.getElementById('contig-problems').textContent.trim(),
             note: document.getElementById('preset-note').textContent.trim(),
             rows: document.querySelectorAll('#contig-rows > *').length,
@@ -980,11 +1018,20 @@ def main():
         target = json.loads(cdp.evaluate(ws, """(() => {
           const entry = Object.values(window.py2dmol_viewers ?? {})[0];
           const r = entry?.renderer ?? entry;
-          const box = document.querySelector('#viewer-container canvas').getBoundingClientRect();
-          for (let y = box.top + box.height * 0.3; y < box.bottom - 30; y += 4)
-            for (let x = box.left + box.width * 0.3; x < box.right - 10; x += 4) {
+          // 🔴 ON SCREEN FIRST: a click outside the window reaches nothing, and the earlier arms
+          // leave the page scrolled - the picker still answers there, so the miss is silent.
+          const canvas = document.querySelector('#viewer-container canvas');
+          canvas.scrollIntoView({ block: 'center' });
+          const box = canvas.getBoundingClientRect();
+          // 🔴 WHOLE PIXELS, AND THE SAME RESIDUE AROUND IT: a mouse event's coordinates are integers
+          // where this search's were fractional, so a hit found on a residue's EDGE was a miss by the
+          // time the click arrived - py2Dmol read it as the background and cleared the selection.
+          const steady = (x, y, hit) => [[-2, 0], [2, 0], [0, -2], [0, 2]]
+            .every(([dx, dy]) => r.pickResidueAt(x + dx, y + dy) === hit);
+          for (let y = Math.ceil(box.top + box.height * 0.3); y < box.bottom - 30; y += 4)
+            for (let x = Math.ceil(box.left + box.width * 0.3); x < box.right - 10; x += 4) {
               const hit = r.pickResidueAt(x, y);
-              if (hit >= 0 && r.positionTypes?.[hit] === 'P')
+              if (hit >= 0 && r.positionTypes?.[hit] === 'P' && steady(x, y, hit))
                 return JSON.stringify({ x, y, chain: r.chains[hit], num: r.residueNumbers[hit] });
             }
           return 'null';
@@ -1006,15 +1053,17 @@ def main():
               document.getElementById('condition-add').click();
               const added = window.__designConditions();
               const entry = Object.values(window.py2dmol_viewers ?? {})[0];
+              const chip = document.querySelector('#condition-rows li')?.textContent ?? '';
               (entry?.renderer ?? entry).clearResidueSelection();
-              document.getElementById('condition-add').click();
-              const empty = document.getElementById('condition-note').textContent;
+              // nothing selected: the actions are disabled, which is the refusal
+              const empty = document.getElementById('condition-add').disabled
+                && [...document.querySelectorAll('.condition-quick button')].every((b) => b.disabled);
               const m = document.getElementById('method'); m.value = 'hunter'; m.dispatchEvent(new Event('change'));
-              const greyed = document.getElementById('condition-add').disabled;
+              const greyed = document.getElementById('step-constraints').hidden;
               m.value = 'rfd4p'; m.dispatchEvent(new Event('change'));
-              return JSON.stringify({ added, empty, greyed, shown: document.getElementById('condition-host').style.display,
+              return JSON.stringify({ added, empty, greyed, chip,
                 rows: [...document.querySelectorAll('#condition-rows li')].length,
-                regreyed: document.getElementById('condition-add').disabled });
+                regreyed: document.getElementById('step-constraints').hidden });
             })()"""))
             print(f"  condition editor: clicked {target['chain']}{target['num']} -> {editor}")
             want = {"C_MCOORD": {"COORDINATING": [
@@ -1025,12 +1074,15 @@ def main():
             if added.get("C_MCOORD") != want["C_MCOORD"] or list(added)[-1:] != ["C_MCOORD"] \
                     or "C_SEC" not in added:
                 bad.append(f"the clicked residue became {added}, expected the spans' C_SEC then {want}")
-            if editor["rows"] != 1 or editor["shown"] != "":
-                bad.append(f"the editor shows {editor['rows']} rows (display {editor['shown']!r}), expected 1")
-            if editor["empty"] != "pick residues in the viewer first":
-                bad.append(f"adding with nothing picked was not refused: {editor['empty']!r}")
+            if editor["rows"] != 1:
+                bad.append(f"the editor shows {editor['rows']} rows, expected 1")
+            # 🔴 THE CHIP NAMES THE RESIDUE AS A READER WOULD, not as the selection syntax does.
+            if editor["chip"] != f"Metal coordination coordinating \u00b7 {target['chain']}{target['num']} (OD1,OD2)\u00d7":
+                bad.append(f"the constraint chip reads {editor['chip']!r}")
+            if editor["empty"] is not True:
+                bad.append("with nothing selected the constraint actions are still live")
             if not editor["greyed"] or editor["regreyed"]:
-                bad.append("the editor is not greyed under Protein Hunter and live again under RFD4-Proteina")
+                bad.append("the constraints step is not hidden under Protein Hunter and back under RFD4-Proteina")
             # 🔴 AND THE FOLD PAGE'S SEQUENCE STRIP, REUSED: a real DRAG along it selects a run (the
             # same `residueSelection` a click sets), and "Add as spans" appends that run to the job as a
             # From structure span in the structure's own numbering.
@@ -1060,6 +1112,13 @@ def main():
                   const before = window.__designSpans.read().length;
                   document.getElementById('selectionToSpans').click();
                   const spans = window.__designSpans.read();
+                  // the quick action: one press, the selection becomes a named chip
+                  document.querySelector('.condition-quick [data-condition=C_HOT]').click();
+                  const chips = [...document.querySelectorAll('#condition-rows li')].map((li) => li.textContent);
+                  // and a block of the diagram opens its own row
+                  const blocks = document.querySelectorAll('#chain-diagram .chain-block');
+                  blocks[blocks.length - 1].click();
+                  const opened = document.querySelectorAll('#contig-rows .contig-more').length;
                   // the strip's own buttons, wired by py2Dmol's panel (sokrypton/py2Dmol#32), not here
                   const size = () => (r.residueSelection ? r.residueSelection.size : 0);
                   document.getElementById('selectAllResidues').click();
@@ -1069,7 +1128,7 @@ def main():
                   document.getElementById('selectAllResidues').click();
                   document.getElementById('clearAllResidues').click();
                   return JSON.stringify({ chains: [...new Set(sel.map((i) => r.chains[i]))],
-                    nums: sel.map((i) => r.residueNumbers[i]), added: spans.slice(before),
+                    nums: sel.map((i) => r.residueNumbers[i]), added: spans.slice(before), chips, opened,
                     buttons: { n: r.coords.length, all, inverted, cleared: size() } });
                 })()"""))
                 print(f"  sequence strip: dragged {dragged['chains']} {dragged['nums'][:1]}..{dragged['nums'][-1:]}"
@@ -1080,6 +1139,11 @@ def main():
                 elif dragged["added"] != [{"kind": "segment", "chain": dragged["chains"][0], "first": nums[0],
                                            "last": nums[-1], "hotspots": ""}]:
                     bad.append(f"Add as spans appended {dragged['added']}, expected the dragged run")
+                run = f"{dragged['chains'][0]}{nums[0]}\u2013{nums[-1]}" if nums else "?"
+                if not any(c.startswith(f"Hotspot \u00b7 {run}") for c in dragged["chips"]):
+                    bad.append(f"the quick Hotspot action did not chip {run}: {dragged['chips']}")
+                if dragged["opened"] < 1:
+                    bad.append("clicking a block of the chain diagram did not open its row")
                 b = dragged["buttons"]
                 print(f"  strip buttons: {b}")
                 if (b["all"], b["inverted"], b["cleared"]) != (b["n"], 0, 0):

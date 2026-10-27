@@ -18,7 +18,7 @@
  */
 import {
   chainColour, chainOfSpans, chainsOf, CONDITION_COLOURS, conditionsOf, contigOf, createContigList,
-  drawLengths, hotspotsOf, INPUT_COLOUR, LIGAND_COLOUR, shade, spansFromContig,
+  drawChainDiagram, drawLengths, hotspotsOf, INPUT_COLOUR, LIGAND_COLOUR, shade, spansFromContig,
 } from "./contig-ui.js";
 import { DEFAULT_STEPS, generate } from "./generate.js";
 import { writeZip } from "./zip.js";
@@ -99,6 +99,62 @@ const roleList = element("role-list");
 // fifth time this file has been bitten by exactly that.
 const presetSelect = element("preset");
 const presetNote = element("preset-note");
+const goalGrid = element("goals");
+
+/**
+ * 🔴 WHAT A NEWCOMER CAME TO MAKE, AS THE FIRST QUESTION (2026-10-27). Each card loads the worked
+ * example that is that goal - or, for a new protein, the blank job - and so picks the method that
+ * runs it; the method itself is an Advanced setting. Every example is still in "More examples".
+ * A function declaration, because `paintMethod` reaches it while the module constructs.
+ */
+function goals() {
+  return [
+    { id: "blank", icon: "fa-wand-magic-sparkles", title: "New protein", text: "From scratch, any length" },
+    { id: "ppi_pdl1", icon: "fa-link", title: "Binder", text: "Bind a protein target (PD-L1)" },
+    { id: "motif_idx_1prw", icon: "fa-puzzle-piece", title: "Scaffold a motif", text: "Keep a site, build around it" },
+    { id: "sm_sam", icon: "fa-flask", title: "Ligand pocket", text: "Hold a small molecule (SAM)" },
+    { id: "dna_7m5w", icon: "fa-dna", title: "DNA binder", text: "Bind double-stranded DNA" },
+    { id: "custom_cath_monomer", icon: "fa-shapes", title: "A given fold", text: "CATH class and helices, strands" },
+    { id: "partial_diffusion_1prw", icon: "fa-shuffle", title: "Diversify", text: "Variants of an existing protein" },
+    { id: "inverse_folding_1prw", icon: "fa-font", title: "New sequence", text: "Redesign a backbone's sequence" },
+  ];
+}
+let goalChosen = "blank";
+
+/** The cards, marked with the one chosen; a card the method cannot run is disabled with its reason. */
+function paintGoals() {
+  goalGrid.replaceChildren(...goals().map((goal) => {
+    const card = document.createElement("button");
+    card.type = "button";
+    card.className = "goal-card";
+    card.dataset.goal = goal.id;
+    card.setAttribute("role", "radio");
+    card.setAttribute("aria-checked", goal.id === goalChosen ? "true" : "false");
+    const suits = goal.id === "blank" || presetSuits(goal.id, method.value);
+    card.disabled = !suits;
+    card.title = suits ? goal.text : `${HUNTER_CANNOT[goal.id]} (switch the method in Advanced)`;
+    const icon = document.createElement("i");
+    icon.className = `fa-solid ${goal.icon}`;
+    const title = document.createElement("strong");
+    title.textContent = goal.title;
+    const text = document.createElement("span");
+    text.textContent = goal.text;
+    card.append(icon, title, text);
+    card.addEventListener("click", () => chooseGoal(goal.id));
+    return card;
+  }));
+}
+
+/** Results' columns, by method: a hunt's cycles, or a generation's designs. */
+function paintResultsHead() {
+  const names = method.value === "hunter" ? ["Run", "Cycle", "Folded by", "Objective", "Validity"]
+    : ["Design", "Seed", "Size", "Check"];
+  element("results-head").replaceChildren(...names.map((name) => {
+    const th = document.createElement("th");
+    th.textContent = name;
+    return th;
+  }));
+}
 
 // 🔴 EVERY PIECE OF MUTABLE STATE A PAINT FUNCTION READS LIVES HERE TOO, for the
 // same reason as the lookups above: `paintJob` runs while the span list is still
@@ -121,6 +177,15 @@ let loaded = null;
 
 let reference = null;
 let held = [];
+// What a loaded example carries beyond its contig (its conditions, structure and modality), and
+// the spans it set as JSON - what `warnIgnoredEdit` compares an edit against.
+let presetExtras = {};
+let presetSpans = null;
+// 🔴 THE VIEWER SHOWS THE LOADED STRUCTURE UNTIL A RUN TAKES IT, and only then can a click name one
+// of its residues: a design's positions are not the input's. Set while it does.
+let inputView = null;
+// 🔴 A FUNCTION DECLARATION, called while the span list constructs.
+function BLANK_JOB() { return [{ kind: "generated", min: 100, max: 100, name: "", secondary: "", polymer: "protein" }]; }
 
 /**
  * A chain's own residue numbering, as py2Dmol's global residue indices.
@@ -179,6 +244,7 @@ const designerNote = element("designer-note");
  */
 const paintDesignerNote = (spans) => {
   const contents = contentsOf(spans);
+  if (method.value !== "hunter") { designerNote.textContent = ""; return; }
   if (designerSelect.value === "auto") {
     const { name, why } = chooseDesigner(contents);
     // 🔴 THE ANSWER, NOT THE MECHANISM. With the picker hidden there is no
@@ -248,14 +314,9 @@ const paintCost = () => {
 // which is how this was found when the list was an entity list.
 let spanList;
 spanList = createContigList(element("contig-rows"), element("add-span"), {
-  // Something runnable on arrival: a target to design against and a binder,
-  // which is Protein Hunter's default case and the page's default method.
-  initial: [
-    { kind: "sequence",
-      value: "FTVTVPKDLYVVEYGSNMTIECKFPVEKQLDLAALIVYWEMEDKNIIQFVHGEEDLKVQHSSYRQRARLLKDQLSLGNAALQITDVKLQDAGVYRCMISYGGADYKRITVKVNA" },
-    { kind: "break" },
-    { kind: "generated", min: 75, max: 75 },
-  ],
+  // 🔴 THE BLANK JOB ON ARRIVAL: a new 100-residue protein, which a newcomer can read at a glance
+  // and run as it is. It was a 114-residue target sequence nobody recognised and a binder.
+  initial: BLANK_JOB(),
   method: () => method.value,
   onChange: () => paintJob(),
 });
@@ -308,6 +369,7 @@ function paintLegend(spans) {
 const paintJob = () => {
   const spans = spanList?.read() ?? [];
   paintLegend(spans);
+  drawChainDiagram(element("chain-diagram"), spans, { onPick: (index) => spanList.reveal(index) });
   const hunter = method.value === "hunter";
   const { contig, problems, tokens } = contigOf(spans, method.value);
   const span = tokens.min === tokens.max ? `${tokens.min}` : `${tokens.min}\u2013${tokens.max}`;
@@ -348,13 +410,17 @@ const paintJob = () => {
     }).join("  ·  ");
     contigLine.textContent = chains.length === 0 ? "" : described;
   } else {
-    contigLine.textContent = contig.length === 0 ? "" : `${contig}    (${span} tokens)`;
+    // The contig is the expert's view; the count is what a newcomer reads.
+    contigLine.textContent = contig.length === 0 ? "" : `${span} residues`;
+    contigLine.title = contig;
   }
 
   const theirs = hunter ? chainsOf(spans, { sequenceOf: resolver() }).problems : problems;
   contigProblems.textContent = theirs.join(" · ");
   contigProblems.classList.toggle("warn", theirs.length > 0);
   paintDesignerNote(spans);
+  warnIgnoredEdit(spans);
+  if (inputView !== null) paintInput();
 };
 
 window.__designSpans = spanList;
@@ -371,12 +437,10 @@ folders.addEventListener("change", () => paintMethod());
 /**
  * WHICH CONTROLS THE CHOSEN METHOD ACTUALLY HONOURS.
  *
- * 🔴 DISABLED WITH A REASON, NEVER REMOVED. A control that vanishes when the
- * method changes teaches the reader nothing and makes them hunt for it again;
- * one that greys out and says why teaches them what the two methods are. Each
- * entry below is a control Protein Hunter uses and RFD4-Proteina does not,
- * because RFD4 generates structure directly rather than folding and redesigning
- * in a loop - so there is no cycle, no designer, and no folding model.
+ * 🔴 HIDDEN NOW, NOT GREYED WITH A REASON (2026-10-27). Greying every control the other method
+ * uses, with a sentence saying why, was meant to teach what the two methods are; to a newcomer it
+ * read as half the page being broken. The method is an Advanced choice now, so the controls follow
+ * it and nothing explains an absence. The reasons stay as each group's tooltip.
  */
 const HUNTER_NO_CONDITIONS = "Protein Hunter folds sequences; these conditions are RFD4-Proteina's.";
 const UNUSED_BY = {
@@ -402,10 +466,8 @@ const UNUSED_BY = {
  * do, and one fewer block of prose in the panel.
  */
 const RESTING = {
-  hunter: "Folds a mostly-X sequence, redesigns it on the hallucinated backbone, and folds again."
-    + " Press Hunt.",
-  rfd4p: "Generates all-atom structure in one pass. The first run downloads ~420 MB of weights."
-    + " Press Generate.",
+  hunter: "Ready. Protein Hunter folds, redesigns and folds again, cycle by cycle.",
+  rfd4p: "Ready. The first run downloads about 420 MB of model weights.",
 };
 
 /**
@@ -420,8 +482,9 @@ function paintAdvanced() {
   for (const group of groups) {
     group.hidden = !open;
   }
-  // Counted, not typed: the label said "5 more" for five, and nine are behind it now.
-  advancedButton.textContent = open ? "fewer" : `${groups.length} more`;
+  advancedButton.textContent = open ? "Hide advanced" : "Advanced";
+  // Protein Hunter's two notes are about its settings, so they live with them.
+  for (const id of ["designer-note", "folder-note"]) element(id).hidden = !open || method.value !== "hunter";
 }
 
 advancedButton.addEventListener("click", () => {
@@ -462,27 +525,17 @@ const paintMethod = () => {
     const group = document.getElementById(id);
     if (group === null) continue;
     const why = unusable[id];
-    group.classList.toggle("unavailable", why !== undefined);
-    for (const control of group.querySelectorAll("select, input, button")) {
-      control.disabled = why !== undefined;
-    }
-    for (const chip of group.querySelectorAll(".design-chip")) {
-      chip.disabled = why !== undefined;
-    }
-    // 🔴 THE REASON DOES NOT GO ON THE GROUP. Six italic sentences threaded
-    // between the controls is the ragged-paragraph problem the notes column was
-    // made to fix, and switching to RFD4 reintroduced it in one step. The greyed
-    // control says THAT it cannot be used; one line below says what and why.
-    group.querySelector(".unavailable-reason")?.remove();
+    group.classList.toggle("not-this-method", why !== undefined);
+    if (why !== undefined) group.dataset.why = why;
   }
-
-  const names = Object.keys(unusable)
-    .map((id) => document.getElementById(id)?.querySelector(".fetch-option-title")?.textContent)
-    .filter((name) => name !== undefined && name.trim().length > 0)
-    .map((name) => name.toLowerCase());
-  unusedNote.textContent = names.length === 0 ? ""
-    : `${hunter ? "Protein Hunter" : "RFD4-Proteina"} does not use ${names.length === 1
-      ? names[0] : `${names.slice(0, -1).join(", ")} or ${names[names.length - 1]}`}.`;
+  unusedNote.textContent = "";
+  // Constraints are RFD4-Proteina's; Protein Hunter takes hotspots on its spans.
+  element("step-constraints").hidden = hunter;
+  // The Designs count is a hunt's sequences a cycle.
+  element("beam-title").textContent = hunter ? "Sequences" : "Designs";
+  paintResultsHead();
+  paintGoals();
+  paintAdvanced();
 };
 
 method.addEventListener("change", paintMethod);
@@ -565,7 +618,7 @@ const drawCycle = (record) => {
   const placed = reference === record.pdb ? record.pdb
     : alignToReference(record.pdb, reference, record.chain);
 
-  viewerBox.style.display = "";
+  showViewer();
   viewer.push(placed, (built) => { if (built) viewer.orient(); });
   // 🔴 COLOURED BY ROLE, NOT BY CONFIDENCE. The page's job is saying what is
   // being DECIDED, and pLDDT answers a different question - so the designed
@@ -617,6 +670,11 @@ const drawCycle = (record) => {
 // deliberately owns nothing about the prediction. (It was written for the two
 // withheld pages and nothing has loaded it since; this is the first page to.)
 const viewerBox = element("viewer-container");
+/** The viewer replaces its placeholder the first time anything is drawn. */
+function showViewer() {
+  viewerBox.style.display = "";
+  element("viewer-empty").hidden = true;
+}
 const viewer = createStructureViewer({
   container: viewerBox,
   frameLabel: "cycle",
@@ -639,20 +697,29 @@ const viewer = createStructureViewer({
 // ---- the condition editor ----------------------------------------------------------------------
 // 🔴 THE VIEWER SHOWS THE LOADED STRUCTURE UNTIL A RUN TAKES IT, and only then can a click name one
 // of its residues: a design's positions are not the input's. `inputView` is set while it does.
-let inputView = null;
 const conditionHost = element("condition-host");
 
 /** Paint the drawn input: grey, with each condition row's residues in its own colour. */
-const paintInput = () => {
+function paintInput() {
   if (inputView === null || viewer.renderer === undefined) return;
   viewer.colourChains(Object.fromEntries([...inputView.chainOf.keys()].map((letter) => [letter, INPUT_COLOUR])));
   const map = inputResidueMap(viewer.renderer, inputView.chainOf);
+  // 🔴 WHAT STEP 3 KEEPS, IN ITS CHAIN'S COLOUR, so the picture says which residues of the structure
+  // are in the design (the same colour as the piece's block and row); constraints paint over it.
+  const spans = spanList.read();
+  const chainOf = chainOfSpans(spans);
+  spans.forEach((span, index) => {
+    if (span.kind !== "segment" || chainOf[index] === null) return;
+    const positions = map.flatMap((residue, i) => (residue.chain === String(span.chain).trim()
+      && residue.resId >= Number(span.first) && residue.resId <= Number(span.last) ? [i] : []));
+    viewer.colourResidues(positions, chainColour(chainOf[index]));
+  });
   conditionEditor.rows.forEach((row, index) => {
     const wanted = new Set(row.picks.map((pick) => `${pick.chain}:${pick.resId}`));
     const positions = map.flatMap((residue, i) => (wanted.has(`${residue.chain}:${residue.resId}`) ? [i] : []));
     viewer.colourResidues(positions, CONDITION_COLOURS[index % CONDITION_COLOURS.length]);
   });
-};
+}
 
 /** Draw the loaded structure in the viewer, for picking. */
 function showInput() {
@@ -661,7 +728,7 @@ function showInput() {
   viewer.cancelAnimations();
   viewer.reset();
   viewer.forgetCamera();
-  viewerBox.style.display = "";
+  showViewer();
   inputView = { chainOf };
   viewer.push(pdb, (built) => { if (built) viewer.orient(); });
   conditionHost.style.display = "";
@@ -669,6 +736,7 @@ function showInput() {
   paintInput();
   window.SEQ?.clear?.();
   window.SEQ?.buildView?.();
+  conditionEditor?.refreshSelection();
 }
 
 // 🔴 THE FOLD PAGE'S SEQUENCE STRIP, REUSED AS IT IS. py2Dmol's panel finds its renderer through
@@ -684,14 +752,19 @@ window.SEQ?.setCallbacks?.({
 });
 document.addEventListener("py2dmol-residue-selection-change", () => {
   if (inputView !== null) window.SEQ?.updateSelection?.();
+  conditionEditor?.refreshSelection();
 });
 /** Hide the strip while a run owns the viewer. */
-const hideSequence = () => { sequenceBox.style.display = "none"; window.SEQ?.clear?.(); };
+const hideSequence = () => {
+  sequenceBox.style.display = "none";
+  window.SEQ?.clear?.();
+  conditionEditor?.refreshSelection();
+};
 // The strip wires its own Select all / Unselect / Invert (py2Dmol's panels/seq.js, since
 // sokrypton/py2Dmol#32), against the renderer `getRenderer` above names.
 // 🔴 A MOTIF DRAGGED OUT OF THE SEQUENCE, not typed: the selection's contiguous runs appended to the
-// job as `From structure` spans, in the structure's own numbering, which is what a contig names.
-element("selectionToSpans").addEventListener("click", () => {
+// job as `Keep from structure` spans, in the structure's own numbering, which is what a contig names.
+function keepSelection() {
   let picks;
   try {
     picks = conditionEditor.picksNow();
@@ -702,10 +775,18 @@ element("selectionToSpans").addEventListener("click", () => {
   if (picks.length === 0) { say("select residues first - drag along the sequence or click them", true); return; }
   const added = segmentsOf(picks);
   spanList.set([...spanList.read(), ...added]);
-  say(`added ${added.filter((span) => span.kind === "segment").length} span(s) from the selection`);
-});
+  say(`kept ${added.filter((span) => span.kind === "segment").length} piece(s) of the structure in the design`);
+}
 
 conditionEditor = createConditionEditor(conditionHost, {
+  peek: () => {
+    if (loaded === null) return null;
+    if (inputView === null || viewer.renderer === undefined) return [];
+    const selected = viewer.renderer.residueSelection;
+    return picksOf(selected instanceof Set ? [...selected] : [], inputResidueMap(viewer.renderer, inputView.chainOf));
+  },
+  colourOf: (index) => CONDITION_COLOURS[index % CONDITION_COLOURS.length],
+  onKeep: () => keepSelection(),
   picks: () => {
     if (inputView === null || viewer.renderer === undefined) {
       showInput();
@@ -893,12 +974,15 @@ paintPresets();
 // What a preset carries beyond its contig: the conditions, the template
 // structure, and the per-modality options that make partial diffusion and
 // inverse folding what they are.
-let presetExtras = {};
+// (presetExtras and presetSpans are declared with the shared state at the top.)
 
 presetSelect.addEventListener("change", () => {
   const preset = RFD4P_PRESETS.find((entry) => entry.id === presetSelect.value);
+  goalChosen = goals().some((goal) => goal.id === presetSelect.value) ? presetSelect.value
+    : presetSelect.value === "" ? goalChosen : "";
   if (preset === undefined) {
     presetExtras = {};
+    presetSpans = null;
     // 🔴 AND THE EXAMPLE'S SAMPLER GOES WITH IT, back to upstream's defaults: a Partial % left
     // from the partial-diffusion example turned the next job into partial diffusion, which is what
     // dropping `presetExtras` did for these two before they were controls.
@@ -968,6 +1052,7 @@ presetSelect.addEventListener("change", () => {
   if (preset.cifUrl !== undefined && preset.cifUrl !== null && loaded?.name === preset.cifUrl) {
     const { spans: moved, translated } = translateSpans(spans, loaded.atoms);
     if (translated > 0) spanList.set(moved);
+    presetSpans = JSON.stringify(spanList.read());
   } else if (preset.cifUrl !== null && preset.cifUrl !== undefined) {
     // 🔴 THE OLD STRUCTURE GOES FIRST, SYNCHRONOUSLY. `startGenerate` prefers a
     // loaded structure over the preset's own `cifUrl` - a user's file is the
@@ -1003,6 +1088,7 @@ presetSelect.addEventListener("change", () => {
       // is in the editor now, for the same reason.
       const { spans: moved, translated } = translateSpans(spans, loaded.atoms);
       if (translated > 0) spanList.set(moved);
+      presetSpans = JSON.stringify(spanList.read());
       paintJob();
     }).catch((error) => {
       // Not fatal: RFD4 fetches it again inside the run, and only Hunter needs
@@ -1018,14 +1104,62 @@ presetSelect.addEventListener("change", () => {
   // them switches to the contig path, where the numbering has to match the
   // structure - and for the 1PRW examples it does not. Said plainly rather than
   // letting an edit fail with "matched no atoms".
-  presetNote.textContent = (preset.description ?? "")
-    + (presetExtras.fromAnnotations
-      ? "  \u2014 this preset is driven by its structure's own annotations;"
-        + " the spans show what it asks for, and editing them switches to the contig,"
-        + " whose numbering may not match the example."
-      : "");
+  // 🔴 THE EXAMPLE'S OWN ONE-LINE DESCRIPTION, NOTHING MORE. The warning that rode on it is said
+  // when it applies - when the reader EDITS an example that runs from its structure's annotations
+  // (`warnIgnoredEdit`) - and it said the wrong thing: such an example's edits are not used at all
+  // (generate()'s `fromAnnotations` builds the batch from the structure alone).
+  presetNote.textContent = preset.description ?? "";
   presetNote.classList.remove("warn");
+  presetSpans = JSON.stringify(spanList.read());
+  paintGoals();
 });
+
+/**
+ * 🔴 SAID WHEN IT APPLIES: an example that runs from its structure's own annotations ignores the
+ * spans, so an edit to them changes nothing that runs. Compared against the spans the example set
+ * (and translated), so the example's own loading is not mistaken for an edit.
+ */
+function warnIgnoredEdit(spans) {
+  if (!presetExtras.fromAnnotations || presetSpans === null) return;
+  const edited = JSON.stringify(spans) !== presetSpans;
+  presetNote.classList.toggle("warn", edited);
+  const preset = RFD4P_PRESETS.find((entry) => entry.id === presetSelect.value);
+  presetNote.textContent = edited
+    ? "This example runs from its structure's own annotations, so edits here are not used."
+      + " Choose New protein, or load a structure in step 2, to build your own."
+    : preset?.description ?? "";
+}
+
+/** A goal card: its example, or the blank job (which also drops a loaded structure). */
+function chooseGoal(id) {
+  goalChosen = id;
+  if (id === "blank") {
+    presetSelect.value = "";
+    presetSelect.dispatchEvent(new Event("change"));
+    clearStructure();
+    spanList.set(BLANK_JOB());
+    method.value = "rfd4p";
+    paintMethod();
+  } else {
+    presetSelect.value = id;
+    presetSelect.dispatchEvent(new Event("change"));
+  }
+  paintGoals();
+}
+
+/** Forget the loaded structure: the viewer goes back to its placeholder. */
+function clearStructure() {
+  if (running !== null) return;
+  loaded = null;
+  describeStructure();
+  inputView = null;
+  viewer.cancelAnimations();
+  viewer.reset();
+  viewerBox.style.display = "none";
+  element("viewer-empty").hidden = false;
+  hideSequence();
+  if (conditionEditor.rows.length > 0) conditionEditor.set([]);
+}
 
 /**
  * THE LOADED STRUCTURE, which half the modalities are conditioned on.
@@ -1101,7 +1235,9 @@ const describeStructure = () => {
   }
   const parts = [...loaded.chains.entries()]
     .map(([chain, range]) => `${chain} ${range.first}\u2013${range.last}`);
-  structureNote.textContent = `${loaded.name}: ${parts.join(", ")}`;
+  // The entry or file's name, not the path an example is served from.
+  const name = String(loaded.name).split("/").pop().replace(/\.(b?cif|mmcif)(\.(zst|gz))?$/i, "");
+  structureNote.textContent = `${name} \u00b7 chain${parts.length === 1 ? "" : "s"} ${parts.join(", ")}`;
   structureNote.classList.remove("warn");
 };
 
@@ -1206,12 +1342,15 @@ function rankOf(candidate) {
 /** One finished candidate, as a row and as the structure on screen. */
 function drawGenerated(candidate, total) {
   resultsBox.style.display = "";
-  viewerBox.style.display = "";
+  showViewer();
   // The finished structure is the last frame, in the same frame of reference as
   // the trajectory that led to it.
   viewer.push(reference === null ? candidate.pdb
     : alignToReference(candidate.pdb, reference, undefined),
   (built) => { if (built) viewer.orient(); });
+  // 🔴 AND FRAMED ON THE FINISHED DESIGN: the viewer oriented on the trajectory's FIRST frame, which
+  // is close to noise at another scale, so the design came out zoomed far into one corner.
+  viewer.orient();
 
   const row = document.createElement("tr");
   // 🔴 ONE "best" MARKER, CLEARED FIRST - the same rule the hunt table has, and
@@ -1221,11 +1360,10 @@ function drawGenerated(candidate, total) {
   row.className = "best";
   const validation = candidate.validation;
   for (const [text, className] of [
-    [String(candidate.candidate + 1), ""],
-    [total === 1 ? "\u2014" : `of ${total}`, ""],
-    ["rfd4-proteina", ""],
+    [total === 1 ? "1" : `${candidate.candidate + 1} of ${total}`, ""],
+    [String(candidate.seed), ""],
     [`${candidate.tokens} tokens`, ""],
-    [validation?.described ?? `${candidate.steps} steps`, "validity"],
+    [validation?.described ?? "not checked", "validity"],
   ]) {
     const cell = document.createElement("td");
     cell.textContent = text;
@@ -1342,7 +1480,7 @@ function paintDownloads() {
   };
   for (const c of generatedRun) {
     const row = document.createElement("div");
-    row.append(`candidate ${c.candidate + 1} (seed ${c.seed}) `,
+    row.append(`Design ${c.candidate + 1} \u00b7 seed ${c.seed}`,
       button("PDB", () => saveFile(`candidate-${c.candidate + 1}.pdb`, c.pdb, "chemical/x-pdb")),
       " ",
       button("mmCIF", () => saveFile(`candidate-${c.candidate + 1}.cif`, c.cif, "chemical/x-cif")));
@@ -1458,7 +1596,7 @@ const startGenerate = async () => {
       frames: number("steps", RFD4_STEPS),
       onStep: (step) => {
         if (step.pdb === undefined) return;
-        viewerBox.style.display = "";
+        showViewer();
         // 🔴 FITTED ONTO THE FIRST FRAME, for the reason a hunt is: a flow step
         // moves the molecule as well as folding it, so played back raw the
         // trajectory tumbles. There is no designed chain to exclude here - the

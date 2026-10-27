@@ -228,3 +228,19 @@ constraint at all, which decides whether this is plumbing or a port.
   `tools/check-design-page.py` drags along the strip for real.
 - **AtomWorks Studio's generation options** — **done** (2026-10-26): Thinking,
   Backbone K, Latents K and Partial % on the page, recorded in job.json.
+- **Laid out for a newcomer** — **done** (2026-10-27). Five steps on the left in
+  the order a first visit decides them (what to design, the starting structure,
+  what gets built, constraints, generate), the viewer, sequence strip and results
+  on the right; one column on a phone. Eight goal cards replace the method picker
+  as the first question (each loads its example, New protein is a blank 100-mer);
+  the method is an Advanced setting and the other method's controls are hidden
+  rather than greyed with a sentence; notes appear only when something needs
+  doing. The job is drawn as a chain diagram (a block per piece, click to edit),
+  pieces are named for what is done to them ("Design new", "Keep from
+  structure"), kept pieces are painted on the structure in their chain's colour,
+  and the constraints step answers "what can I do with this selection" with quick
+  actions and chips. 🔴 It found a wrong note: an example that runs from its
+  structure's annotations IGNORES edits to its pieces, where the page said edits
+  "switch to the contig"; it now says the edits are not used, when one is made.
+  `tools/check-design-page.py` holds the new defaults, the goal cards, the
+  diagram (watched failing with the block click unwired) and the quick actions.

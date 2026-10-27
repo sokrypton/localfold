@@ -179,7 +179,7 @@ describe("the design job as a list of spans", () => {
       const spans = [{ kind: "segment", chain: "A", first: 10, last: 14 },
         { kind: "break" }, { kind: "generated", min: 8, max: 8 }];
       expect(chainsOf(spans).problems).toContain("Protein Hunter folds sequences, so a"
-        + " \u201cFrom structure\u201d span needs the structure loaded to read its sequence from");
+        + " \u201cKeep from structure\u201d span needs the structure loaded to read its sequence from");
 
       const sequenceOf = (chain, first, last) => (chain === "A" && first === 10 && last === 14
         ? "MKVLA" : null);

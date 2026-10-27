@@ -1453,6 +1453,118 @@
 .condition-rows li { padding: 2px 0; overflow-wrap: anywhere; }
 .condition-drop { border: none; background: none; color: #6b7280; cursor: pointer; font-size: 15px; padding: 0 4px; }
 
+/* ============================================================================
+   THE DESIGN PAGE'S LAYOUT (design.html, 2026-10-27): five steps on the left in the order a
+   newcomer decides them, the picture on the right. One column below 980px, in step order.
+   ============================================================================ */
+.design-page { max-width: 1200px; margin: 0 auto; }
+.design-head { margin-bottom: 12px; }
+.design-head h1 { margin: 0; }
+.design-tagline { margin: 2px 0 0; color: #6b7280; font-size: 14px; }
+.design-layout { display: grid; grid-template-columns: minmax(360px, 440px) minmax(0, 1fr); gap: 16px; align-items: start; }
+.design-steps { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.design-stage { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.design-step { background: #fff; border: 1px solid #e5e7eb; border-radius: 10px; padding: 12px 14px; }
+.design-step[hidden] { display: none; }
+.design-step h2 { display: flex; align-items: center; gap: 8px; margin: 0 0 8px; font-size: 15px; font-weight: 600; color: #111827; }
+.step-number { display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px;
+  border-radius: 50%; background: #2563eb; color: #fff; font-size: 12px; font-weight: 700; flex: 0 0 auto; }
+.step-optional { margin-left: auto; font-size: 11px; font-weight: 500; color: #9ca3af; text-transform: uppercase; letter-spacing: .04em; }
+.step-hint { margin: -4px 0 8px; font-size: 13px; color: #6b7280; }
+.step-more { display: flex; align-items: center; gap: 8px; margin-top: 10px; font-size: 13px; color: #6b7280; }
+.step-more select { flex: 1 1 auto; min-width: 0; }
+.design-step .option-note:empty { display: none; }
+
+/* the goals: a card each, the chosen one outlined */
+.goal-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
+.goal-card { display: grid; grid-template-columns: 20px 1fr; grid-template-rows: auto auto; column-gap: 8px;
+  text-align: left; padding: 8px 10px; border: 1px solid #e5e7eb; border-radius: 8px; background: #f9fafb;
+  cursor: pointer; font: inherit; color: inherit; }
+.goal-card i { grid-row: 1 / span 2; align-self: center; color: #2563eb; }
+.goal-card strong { font-size: 13px; }
+.goal-card span { font-size: 12px; color: #6b7280; }
+.goal-card:hover:not(:disabled) { border-color: #93c5fd; background: #eff6ff; }
+.goal-card[aria-checked="true"] { border-color: #2563eb; background: #eff6ff; box-shadow: 0 0 0 1px #2563eb inset; }
+.goal-card:disabled { opacity: .45; cursor: not-allowed; }
+
+.design-step .design-structure { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.design-step .design-structure input[type="text"] { flex: 1 1 140px; min-width: 0; }
+
+/* the job at a glance: a row per chain, a block per piece */
+.chain-diagram { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
+.chain-diagram:empty { display: none; }
+.chain-row { display: flex; align-items: center; gap: 8px; }
+.chain-name { width: 14px; font-size: 12px; font-weight: 700; color: var(--chain-colour, #6b7280); }
+.chain-track { display: flex; flex: 1 1 auto; gap: 2px; min-width: 0; }
+.chain-block { flex-basis: 0; min-width: 44px; height: 28px; border-radius: 5px; border: 1px solid var(--chain-colour, #6b7280);
+  font: 11px/1 system-ui, sans-serif; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding: 0 6px;
+  cursor: pointer; color: #111827; background: #fff; }
+.chain-block-segment { background: var(--chain-colour, #6b7280); color: #fff; }
+.chain-block-generated { background: repeating-linear-gradient(135deg,
+  color-mix(in srgb, var(--chain-colour, #6b7280) 22%, #fff) 0 6px, #fff 6px 12px); }
+.chain-block-sequence { border-style: dashed; }
+.chain-block-ligand { flex: 0 0 auto; border-color: #78716c; border-radius: 14px; background: #f5f5f4; }
+.chain-block.selected, .chain-block:focus-visible { outline: 2px solid #111827; outline-offset: 1px; }
+.contig-row-flash { animation: contig-flash 1.2s ease-out; }
+/* A span row in the steps column is a phone's at every width: the column is ~410px, which is the
+   width the stacked row was made for (kind and buttons on line one, the fields below). */
+#step-build .contig-row { grid-template-columns: minmax(0, 1fr) auto; row-gap: 6px; }
+#step-build .contig-row > .entity-picker { grid-column: 1; grid-row: 1; min-width: 0; }
+#step-build .contig-row > .contig-fields:last-of-type { grid-column: 2; grid-row: 1; }
+#step-build .contig-fields:not(:last-of-type) { grid-column: 1 / -1; grid-row: 2; flex-wrap: wrap; }
+#step-build .contig-more { grid-column: 1 / -1; }
+#step-build .contig-sequence { flex: 1 1 100%; }
+#step-build .contig-fields input { flex: 0 0 auto; }
+@keyframes contig-flash { from { background: #dbeafe; } to { background: transparent; } }
+.design-step .design-summary { display: flex; align-items: center; gap: 10px; margin-top: 6px; }
+.design-step .design-summary code { font-size: 12px; color: #6b7280; background: none; border: 0; }
+
+/* the run: the settings, then Advanced and the one button */
+.design-step .fetch-options { margin: 0; }
+.not-this-method { display: none !important; }
+.run-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 10px; }
+.run-button { padding: 8px 22px; font-size: 15px; }
+
+/* the picture: py2Dmol sizes its viewer for its own page (948px, a 600px canvas beside a 340px
+   panel); here it is the column's width. */
+.design-stage .py2dmol-viewer-instance { width: 100%; }
+/* ...and the canvas follows #canvasContainer (py2Dmol's viewport watches it), which show() fixes
+   inline at the width it was built at - so a window resized after the first frame kept it. */
+.design-stage #viewerWrapper, .design-stage #canvasContainer { width: 100% !important; }
+.viewer-empty { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px;
+  aspect-ratio: 1 / 1; max-height: 560px; border: 1px dashed #d1d5db; border-radius: 10px; background: #fff;
+  color: #9ca3af; text-align: center; padding: 16px; }
+.viewer-empty[hidden] { display: none; }
+.viewer-empty i { font-size: 32px; }
+.viewer-empty p { margin: 0; font-size: 14px; max-width: 260px; }
+.sequence-hint { font-size: 12px; color: #9ca3af; }
+/* the designs' files: a row each (its name and buttons, its metrics under them), the archive last.
+   #downloads is the fold page's 340px flex row, which this is not. */
+.design-stage #downloads { width: auto; display: flex; flex-direction: column; align-items: stretch; gap: 8px; padding: 10px 14px; }
+.design-stage #downloads h3 { margin: 0; font-size: 14px; }
+.design-stage #downloads > div { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 13px; }
+.design-stage #downloads button { flex: 0 0 auto; }
+.design-stage #downloads .design-metrics { flex: 1 1 100%; font-size: 12px; color: #6b7280; }
+.design-stage #downloads > button { align-self: flex-start; }
+.design-foot { margin-top: 16px; text-align: center; }
+.design-foot .option-note { max-width: none; }
+
+/* the constraints: what is selected, what to do with it, and the chips */
+.condition-selection { font-size: 13px; color: #6b7280; }
+.condition-selection.has-selection { color: #111827; font-weight: 500; }
+.condition-quick { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.condition-quick button:disabled, .condition-controls button:disabled { opacity: .45; cursor: not-allowed; }
+.condition-more { margin-top: 8px; font-size: 13px; }
+.condition-quick[hidden], .condition-more[hidden] { display: none; }
+.condition-more summary { cursor: pointer; color: #2563eb; }
+.condition-chip { display: flex; align-items: center; gap: 6px; }
+.condition-rows .role-swatch { flex: 0 0 auto; }
+
+@media (max-width: 980px) {
+  .design-layout { grid-template-columns: minmax(0, 1fr); }
+  .viewer-empty { aspect-ratio: auto; min-height: 120px; }
+}
+
 /* What a control says underneath itself. */
 .option-note {
   font-size: 12px;

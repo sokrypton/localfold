@@ -213,20 +213,116 @@ export function picksOf(positions, map) {
   return [...seen.values()];
 }
 
+/** Picked residues as a reader names them: `A86–95, A101` (chain and residue numbers). */
+export function describePicks(picks) {
+  const byChain = new Map();
+  for (const { chain, resId } of picks) {
+    if (!byChain.has(chain)) byChain.set(chain, []);
+    byChain.get(chain).push(resId);
+  }
+  return [...byChain.entries()]
+    .map(([chain, residues]) => residueRanges(residues).split(",").map((r) => `${chain}${r.replace(/(?<=\d)-/, "\u2013")}`).join(", "))
+    .join(", ");
+}
+
+/** The constraints a selection is most often given, one press each: [key, value, label]. */
+const QUICK = [
+  ["C_HOT", "true", "Hotspot"],
+  ["C_CRD", "true", "Fix coordinates"],
+  ["C_SEQ", "true", "Fix sequence"],
+];
+
 /**
  * The editor panel. It holds rows; the page owns the viewer, and hands the current picks in.
  *
+ * 🔴 SELECTION FIRST, FORM SECOND. A newcomer selects residues and then asks "what can I do with
+ * these?", so the panel answers that: what is selected, the three things most often done with a
+ * selection (and keeping it in the design, which is the page's), and every other condition behind
+ * "More constraints". Each constraint is a chip in the colour the viewer paints it, named as the
+ * reader would name it; the selection syntax it writes is its tooltip and the saved job.
+ *
  * @param {HTMLElement} host
  * @param {object} hooks
- * @param {() => {chain: string, resId: number}[]} hooks.picks the residues selected in the viewer
+ * @param {() => {chain: string, resId: number}[]} hooks.picks the residues selected (may refuse)
+ * @param {() => {chain: string, resId: number}[] | null} [hooks.peek] the same without side effects,
+ *   null when there is no structure to pick from
+ * @param {(index: number) => string} [hooks.colourOf] a row's colour in the viewer
+ * @param {() => void} [hooks.onKeep] "Keep in the design": the page turns the selection into spans
  * @param {() => void} hooks.onChange the rows changed (repaint, re-describe the job)
  */
-export function createConditionEditor(host, { picks, onChange }) {
+export function createConditionEditor(host, { picks, peek = () => null, colourOf = () => "#64748b", onKeep, onChange }) {
   let rows = [];
   const panel = document.createElement("div");
   panel.className = "condition-editor";
   panel.id = "condition-editor";
+  const button = (label, title, id) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "btn btn-grey btn-small";
+    b.textContent = label;
+    b.title = title;
+    if (id) b.id = id;
+    return b;
+  };
 
+  const selection = document.createElement("div");
+  selection.className = "condition-selection";
+  selection.id = "condition-selection";
+  const quick = document.createElement("div");
+  quick.className = "condition-quick";
+  const note = document.createElement("div");
+  note.className = "option-note";
+  note.id = "condition-note";
+  const list = document.createElement("ul");
+  list.id = "condition-rows";
+  list.className = "condition-rows";
+
+  const add = (row) => {
+    try {
+      armOf(row);
+    } catch (error) {
+      note.textContent = error.message;
+      note.classList.add("warn");
+      return false;
+    }
+    note.textContent = "";
+    note.classList.remove("warn");
+    rows.push(row);
+    paintRows();
+    onChange();
+    return true;
+  };
+  const tryPicks = () => {
+    try {
+      return picks();
+    } catch (error) {
+      note.textContent = error.message;
+      note.classList.add("warn");
+      return null;
+    }
+  };
+
+  if (onKeep) {
+    const keep = button("Keep in the design", "Add the selected residues to step 3 as pieces kept from the structure.",
+      "selectionToSpans");
+    keep.addEventListener("click", () => onKeep());
+    quick.append(keep);
+  }
+  for (const [key, value, label] of QUICK) {
+    const b = button(label, `Mark the selected residues: ${KIND.get(key).label.toLowerCase()}.`);
+    b.dataset.condition = key;
+    b.addEventListener("click", () => {
+      const p = tryPicks();
+      if (p !== null) add({ key, value, picks: p, atoms: "" });
+    });
+    quick.append(b);
+  }
+
+  // Every condition, behind one disclosure.
+  const more = document.createElement("details");
+  more.className = "condition-more";
+  const summary = document.createElement("summary");
+  summary.textContent = "More constraints\u2026";
   const kind = document.createElement("select");
   kind.id = "condition-kind";
   for (const k of CONDITION_KINDS) kind.append(new Option(k.label, k.key));
@@ -242,17 +338,11 @@ export function createConditionEditor(host, { picks, onChange }) {
   atoms.size = 10;
   atoms.placeholder = "all atoms";
   atoms.title = "Atom names to narrow the condition to, e.g. OD1,OD2 or NZ. Empty is every atom of each residue.";
-  const add = document.createElement("button");
-  add.type = "button";
-  add.id = "condition-add";
-  add.className = "btn btn-grey btn-small";
-  add.textContent = "Add selection";
-  const note = document.createElement("div");
-  note.className = "option-note";
-  note.id = "condition-note";
-  const list = document.createElement("ul");
-  list.id = "condition-rows";
-  list.className = "condition-rows";
+  const addButton = button("Add", "Set the chosen condition on the selected residues.", "condition-add");
+  const controls = document.createElement("div");
+  controls.className = "condition-controls";
+  controls.append(kind, valueSelect, valueText, atoms, addButton);
+  more.append(summary, controls);
 
   const paintKind = () => {
     const k = KIND.get(kind.value);
@@ -266,67 +356,73 @@ export function createConditionEditor(host, { picks, onChange }) {
   };
   kind.addEventListener("change", paintKind);
   paintKind();
+  addButton.addEventListener("click", () => {
+    const k = KIND.get(kind.value);
+    const p = tryPicks();
+    if (p === null) return;
+    add({ key: k.key, value: Array.isArray(k.values) ? valueSelect.value : valueText.value.trim(), picks: p,
+      atoms: atoms.value });
+  });
 
   const paintRows = () => {
     list.replaceChildren(...rows.map((row, index) => {
       const k = KIND.get(row.key);
       const item = document.createElement("li");
+      item.className = "condition-chip";
       const { arm } = armOf(row);
-      item.append(`${k.label} = ${row.value} · ${arm.select}`);
+      item.title = arm.select;
+      const swatch = document.createElement("span");
+      swatch.className = "role-swatch";
+      swatch.style.setProperty("--chain-colour", colourOf(index));
+      const value = Array.isArray(k.values) && k.values.length === 1 ? "" : ` ${row.value.toLowerCase()}`;
+      const narrowed = row.atoms ? ` (${row.atoms.toUpperCase()})` : "";
+      item.append(swatch, `${k.label}${value} \u00b7 ${describePicks(row.picks)}${narrowed}`);
       const drop = document.createElement("button");
       drop.type = "button";
       drop.className = "condition-drop";
       drop.setAttribute("aria-label", `remove ${k.label}`);
-      drop.textContent = "×";
+      drop.textContent = "\u00d7";
       drop.addEventListener("click", () => { rows.splice(index, 1); paintRows(); onChange(); });
-      item.append(" ", drop);
+      item.append(drop);
       return item;
     }));
   };
 
-  add.addEventListener("click", () => {
-    const k = KIND.get(kind.value);
-    const row = { key: k.key, value: Array.isArray(k.values) ? valueSelect.value : valueText.value.trim(),
-      picks: picks(), atoms: atoms.value };
-    try {
-      armOf(row);
-    } catch (error) {
-      note.textContent = error.message;
-      note.classList.add("warn");
-      return;
-    }
-    note.textContent = "";
-    note.classList.remove("warn");
-    rows.push(row);
-    paintRows();
-    onChange();
-  });
+  /** What is selected now, said once, with the actions live only when there is something to act on. */
+  const paintSelection = () => {
+    const now = peek();
+    const any = Array.isArray(now) && now.length > 0;
+    selection.textContent = now === null ? "Load a structure in step 2, then select residues to constrain."
+      : any ? `Selected: ${describePicks(now)} (${now.length} residue${now.length === 1 ? "" : "s"})`
+        : "Select residues: click them in the viewer or drag along the sequence.";
+    selection.classList.toggle("has-selection", any);
+    // Nothing to pick from yet: the actions would be four dead buttons.
+    quick.hidden = now === null;
+    more.hidden = now === null;
+    for (const b of quick.querySelectorAll("button")) b.disabled = !any || panel.dataset.off === "1";
+    addButton.disabled = !any || panel.dataset.off === "1";
+  };
 
-  const controls = document.createElement("div");
-  controls.className = "condition-controls";
-  controls.append(kind, valueSelect, valueText, atoms, add);
-  const title = document.createElement("span");
-  title.className = "fetch-option-title";
-  title.textContent = "Conditions";
-  const hint = document.createElement("div");
-  hint.className = "option-note";
-  hint.textContent = "Pick residues of the loaded structure - click them in the viewer or drag along"
-    + " the sequence - then add them as a condition.";
-  panel.append(title, controls, hint, note, list);
+  panel.append(selection, quick, more, note, list);
   host.append(panel);
+  paintSelection();
 
   return {
     get rows() { return rows.map((row) => ({ ...row, picks: [...row.picks] })); },
+    set(next) { rows = next.map((row) => ({ ...row, picks: [...row.picks] })); paintRows(); onChange(); },
     /** The residues picked right now, through the page's hook (which may refuse). */
     picksNow() { return picks(); },
-    set(next) { rows = next.map((row) => ({ ...row, picks: [...row.picks] })); paintRows(); onChange(); },
     /** The rows over `base`, as the job's `conditions`. */
     conditions(base) { return mergeConditions(base, rows); },
+    /** Re-read the selection (the page calls this when the viewer's changes). */
+    refreshSelection: paintSelection,
     /** Grey the whole panel with a reason, or bring it back with `null`. */
     disable(reason) {
-      for (const c of panel.querySelectorAll("select, input, button")) c.disabled = reason !== null;
+      panel.dataset.off = reason === null ? "" : "1";
+      for (const c of panel.querySelectorAll("select, input")) c.disabled = reason !== null;
       if (reason === null) paintKind();
       panel.title = reason ?? "";
+      paintSelection();
     },
   };
 }
