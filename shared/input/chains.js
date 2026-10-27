@@ -436,6 +436,109 @@ export function nonGappedRows(a3mText) {
 }
 
 /**
+ * The species a UniProtKB description names - AF3's ExtractSpeciesIds (msa_features_pybind.cc): the first word
+ * must be `sp|ID|NAME_SPECIES` or `tr|...`, an isoform ID (`O88974-2`) or a fourth field names none, and a
+ * jackhmmer range after `/` is cut. "" for anything else - UniRef100 headers, ColabFold's, a query's.
+ */
+export function uniprotSpecies(description) {
+  const part = description.trim().split(" ")[0];
+  if (!(part.startsWith("sp|") || part.startsWith("tr|"))) return "";
+  const fields = part.split("|");
+  if (fields.length > 3 || fields[1].includes("-") || fields.length < 3) return "";
+  const name = fields[2];
+  const underscore = name.indexOf("_");
+  if (underscore < 0) return "";
+  const species = name.slice(underscore + 1).split("_")[0];
+  const slash = species.indexOf("/");
+  return slash < 0 ? species : species.slice(0, slash);
+}
+
+/** AF3's `max_paired_sequence_per_species` (pipeline.py) and half its 16384-row MSA (features.py). */
+export const AF3_MAX_HITS_PER_SPECIES = 600;
+export const AF3_MAX_PAIRED_ROWS = 8192;
+
+/**
+ * Per-chain paired A3Ms whose rows carry UniProt species, paired as AF3 pairs them (msa_pairing.py
+ * create_paired_features): the query row, then a row per species hit shared by the most chains first, each
+ * species' k-th hit in one chain beside its k-th in another (`min` hits across the chains holding it, at most 600),
+ * a block sorted by the sum of log row indices, gaps where a chain lacks the species. Null when no chain names a
+ * species - ColabFold's pairedMsa is already row-aligned and carries none, and is merged row by row instead.
+ *
+ * 🔴 ROW i IS NOT ROW i: AF3's pipeline writes each chain's pairedMsa from its own search, at its own depth, and
+ * leaves the pairing to the featuriser. Merged row by row, a 757-row chain lined up against a 30,137-row one pairs
+ * sequences from unrelated species.
+ *
+ * Within a species this keeps the file's order, which is what AF3's docstring states; its numpy argsort is not a
+ * stable sort, so on a deep alignment AF3 itself may pair a species' hits in another order.
+ *
+ * @param {readonly string[]} a3mTexts one A3M per chain (a chain with none is its query row alone)
+ * @param {{anyLetter?: boolean, pairable?: readonly boolean[]}} [options] pairable: false for a chain AF3 does not
+ *   pair (anything but protein), which takes the query row and gaps
+ * @returns {?string}
+ */
+export function pairA3msBySpecies(a3mTexts, { anyLetter = false, pairable = undefined } = {}) {
+  const alignments = a3mTexts.map((text) => parseA3m(text, { anyLetter }));
+  const speciesRows = alignments.map((alignment, chain) => {
+    const rows = new Map();
+    if (pairable && !pairable[chain]) return rows;
+    alignment.descriptions.forEach((description, row) => {
+      const species = uniprotSpecies(description);
+      if (species === "") return;
+      if (!rows.has(species)) rows.set(species, []);
+      rows.get(species).push(row);
+    });
+    return rows;
+  });
+  if (speciesRows.every((rows) => rows.size === 0)) return null;
+
+  // species in AF3's dict order: chain by chain, each chain's in sorted order (np.unique)
+  const chainsOf = new Map();
+  const minHits = new Map();
+  for (const rows of speciesRows) {
+    for (const species of [...rows.keys()].sort()) {
+      chainsOf.set(species, (chainsOf.get(species) ?? 0) + 1);
+      minHits.set(species, Math.min(minHits.get(species) ?? AF3_MAX_HITS_PER_SPECIES, rows.get(species).length));
+    }
+  }
+  const byCount = new Map();
+  for (const [species, count] of chainsOf) {
+    if (count <= 1) continue;
+    if (!byCount.has(count)) byCount.set(count, []);
+    byCount.get(count).push(species);
+  }
+  const selected = [alignments.map(() => 0)];
+  let seen = 0;
+  for (const count of [...byCount.keys()].sort((a, b) => b - a)) {
+    const block = [];
+    for (const species of byCount.get(count)) {
+      const hits = minHits.get(species);
+      for (let k = 0; k < hits; k += 1) {
+        block.push(speciesRows.map((rows) => (rows.has(species) ? rows.get(species)[k] : -1)));
+      }
+    }
+    // AF3's sum of log |index| as the product it orders the same as - a missing chain (-1) is a factor of one, the
+    // query row (0) sorts first - because a product is IEEE-exact on both sides and V8's log and glibc's are not
+    const rank = (row) => row.reduce((product, index) => product * Math.abs(index), 1);
+    const keyed = block.map((row, at) => ({ row, at, key: rank(row) }));
+    keyed.sort((a, b) => (a.key - b.key) || (a.at - b.at));
+    for (const { row } of keyed) selected.push(row);
+    seen += block.length;
+    if (seen >= AF3_MAX_PAIRED_ROWS) break;
+  }
+  const lines = [];
+  for (const row of selected.slice(0, AF3_MAX_PAIRED_ROWS)) {
+    const parts = row.map((index, chain) => (
+      index < 0 ? "-".repeat(alignments[chain].length) : alignments[chain].rawSequences[index]));
+    // remove_all_gapped_rows_from_all_seqs
+    if (lines.length > 0 && !/[A-Z]/.test(parts.join(""))) continue;
+    const label = lines.length === 0 ? "query" : row
+      .map((index, chain) => `${chain + 1}:${index < 0 ? "-" : alignments[chain].descriptions[index]}`).join(" ");
+    lines.push(`>${label}`, parts.join(""));
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+/**
  * A job's own alignments - AlphaFold 3's `unpairedMsa` / `pairedMsa`, one per
  * physical polymer chain in fold order (null where the file gave none) - as the
  * featuriser takes them: each list merged row by row (mergeRowAlignedChainA3ms),
@@ -464,8 +567,19 @@ export function mergeJobAlignments(perChain, chains, chainKinds) {
   const merged = (list) => (list.some(Boolean)
     ? (list.length === 1 ? fill(list)[0] : mergeRowAlignedChainA3ms(fill(list), { anyLetter }))
     : null);
+  // a pairedMsa whose rows name UniProt species (AF3's own pipeline) is paired by species, as AF3 pairs it;
+  // one without (ColabFold's, row-aligned already) row by row
+  const paired = () => {
+    if (!perChain.paired.some(Boolean)) return null;
+    if (perChain.paired.length > 1) {
+      const bySpecies = pairA3msBySpecies(fill(perChain.paired),
+        { anyLetter, pairable: chainKinds.map((kind) => kind === "protein") });
+      if (bySpecies !== null) return bySpecies;
+    }
+    return merged(perChain.paired);
+  };
   return {
-    alignment: { unpaired: merged(perChain.unpaired), paired: merged(perChain.paired) },
+    alignment: { unpaired: merged(perChain.unpaired), paired: paired() },
     msaColumnKinds: chainKinds.flatMap((kind, i) => Array(chains[i].length).fill(kind)),
   };
 }

@@ -17,6 +17,16 @@ const ALIGNED_CODE = (() => {
   return table;
 })();
 
+// The ambiguity codes a protein alignment from a real search carries (UniRef has B, Z, U, J, O), resolved as AF2's
+// HHBLITS_AA_TO_ID and AF3's msa_features char_map both resolve them: B and Z to the acid, U (selenocysteine) to
+// cysteine, J and O to unknown. Rewritten here, so every reader downstream sees one of the 21.
+const AMBIGUOUS = { B: "D", Z: "E", U: "C", J: "X", O: "X" };
+const RESOLVED = (() => {
+  const table = new Uint8Array(128);
+  for (const [from, to] of Object.entries(AMBIGUOUS)) table[from.charCodeAt(0)] = to.charCodeAt(0);
+  return table;
+})();
+
 const LOWER_A = "a".charCodeAt(0);
 const LOWER_Z = "z".charCodeAt(0);
 
@@ -80,12 +90,17 @@ export function parseA3m(text, { anyLetter = false } = {}) {
     const codes = new Uint16Array(raw.length);
     let alignedLength = 0;
     let insertionCount = 0;
+    let resolved = false;
     const deletions = [];
     for (let at = 0; at < raw.length; at += 1) {
-      const code = raw.charCodeAt(at);
+      let code = raw.charCodeAt(at);
       if (code >= LOWER_A && code <= LOWER_Z) {
         insertionCount += 1;
         continue;
+      }
+      if (!anyLetter && code < 128 && RESOLVED[code] !== 0) {
+        code = RESOLVED[code];
+        resolved = true;
       }
       if (code > 127 || allowed[code] === 0) {
         throw new Error(`A3M sequence ${descriptions[row]} contains invalid residue `
@@ -96,6 +111,7 @@ export function parseA3m(text, { anyLetter = false } = {}) {
       deletions.push(insertionCount);
       insertionCount = 0;
     }
+    if (resolved) rawSequences[row] = raw.replace(/[BZUJO]/g, (letter) => AMBIGUOUS[letter]);
     sequences.push(stringOfCodes(codes, alignedLength));
     deletionMatrix.push(deletions);
   }

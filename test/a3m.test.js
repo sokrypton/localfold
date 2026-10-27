@@ -57,6 +57,17 @@ describe("A3M parser", () => {
     expect(() => parseA3m(">query\nACDE\n>bad\nAC\u00c5E\n"))
       .toThrow(/invalid residue/);
   });
+
+  it("resolves UniRef's ambiguity letters as AF2 and AF3 do, in the raw row too", () => {
+    // B and Z to the acid, U to cysteine, J and O to unknown - a real UniRef90 search carries them, and AF3's own
+    // pipeline jobs were refused on a "B"
+    const alignment = parseA3m(">query\nACDEFG\n>hit\nBZUJOa-\n");
+    expect(alignment.sequences[1]).toEqual("DECXX-");
+    expect(alignment.rawSequences[1]).toEqual("DECXXa-");
+    expect(alignment.deletionMatrix[1]).toEqual([0, 0, 0, 0, 0, 1]);
+    // a nucleic alignment's letters are its caller's to read
+    expect(parseA3m(">q\nACGU\n>r\nBCGU\n", { anyLetter: true }).sequences[1]).toEqual("BCGU");
+  });
 });
 
 describe("an alignment with one chain's columns blanked", () => {

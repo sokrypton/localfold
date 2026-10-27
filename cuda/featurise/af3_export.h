@@ -419,6 +419,17 @@ inline Af3Export exportAf3(const Args& args) {
       alignment.blocks = true;
       merged(job.unpaired, alignment.hasUnpaired, alignment.unpaired);
       merged(job.paired, alignment.hasPaired, alignment.paired);
+      // a pairedMsa naming UniProt species (AF3's own pipeline) is paired by species (pairA3msBySpecies)
+      if (alignment.hasPaired && job.paired.size() > 1) {
+        std::vector<std::string> filled;
+        std::vector<bool> pairable;
+        for (size_t i = 0; i < job.paired.size(); ++i) {
+          filled.push_back(job.paired[i].present && !job.paired[i].text.empty() ? job.paired[i].text : ">query\n" + request.chains[i] + "\n");
+          pairable.push_back(request.chainKinds[i] == "protein");
+        }
+        std::string bySpecies;
+        if (pairA3msBySpecies(filled, anyLetter, pairable, bySpecies)) alignment.paired = bySpecies;
+      }
       for (size_t i = 0; i < request.chains.size(); ++i)
         for (size_t r = 0; r < request.chains[i].size(); ++r) msaColumnKinds.push_back(request.chainKinds[i]);
       jobAlignment = true;

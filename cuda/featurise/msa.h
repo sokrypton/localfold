@@ -72,6 +72,10 @@ inline A3m parseA3m(const std::string& text, bool anyLetter = false) {
     for (size_t i = 0; i < r.size(); ++i) {
       unsigned char c = (unsigned char)r[i];
       if (c >= 'a' && c <= 'z') { ++insertions; continue; }
+      if (!anyLetter) {   // a3m.js AMBIGUOUS: B, Z to the acid, U to cysteine, J, O to unknown (AF2's and AF3's maps)
+        unsigned char to = c == 'B' ? 'D' : c == 'Z' ? 'E' : c == 'U' ? 'C' : (c == 'J' || c == 'O') ? 'X' : 0;
+        if (to) { c = to; a.raw[row][i] = (char)to; }
+      }
       if (c > 127 || !allowed(c)) {
         throw std::runtime_error("A3M sequence " + a.descriptions[row] + " contains invalid residue \"" + std::string(1, (char)c) + "\"");
       }
@@ -110,6 +114,90 @@ inline std::string mergeRowAlignedChainA3ms(const std::vector<std::string>& text
     out += ">" + (row == 0 ? std::string("query") : label) + "\n" + parts + "\n";
   }
   return out;
+}
+
+// chains.js uniprotSpecies: AF3's ExtractSpeciesIds - `sp|ID|NAME_SPECIES` / `tr|...`, "" for anything else
+inline std::string uniprotSpecies(const std::string& description) {
+  std::string part = trimWs(description);
+  part = part.substr(0, part.find(' '));
+  if (part.rfind("sp|", 0) != 0 && part.rfind("tr|", 0) != 0) return "";
+  std::vector<std::string> fields;
+  for (size_t at = 0;;) {
+    size_t bar = part.find('|', at);
+    fields.push_back(part.substr(at, bar == std::string::npos ? std::string::npos : bar - at));
+    if (bar == std::string::npos) break;
+    at = bar + 1;
+  }
+  if (fields.size() != 3 || fields[1].find('-') != std::string::npos) return "";
+  size_t underscore = fields[2].find('_');
+  if (underscore == std::string::npos) return "";
+  std::string species = fields[2].substr(underscore + 1);
+  species = species.substr(0, species.find('_'));
+  return species.substr(0, species.find('/'));
+}
+
+// chains.js pairA3msBySpecies: AF3's create_paired_features over per-chain paired A3Ms; empty (no value) when no
+// chain names a species
+inline bool pairA3msBySpecies(const std::vector<std::string>& texts, bool anyLetter, const std::vector<bool>& pairable,
+                              std::string& out) {
+  const int maxHits = 600, maxRows = 8192;
+  std::vector<A3m> al;
+  for (auto& t : texts) al.push_back(parseA3m(t, anyLetter));
+  std::vector<std::map<std::string, std::vector<int>>> speciesRows(al.size());
+  bool any = false;
+  for (size_t c = 0; c < al.size(); ++c) {
+    if (!pairable.empty() && !pairable[c]) continue;
+    for (int row = 0; row < al[c].depth; ++row) {
+      std::string sp = uniprotSpecies(al[c].descriptions[row]);
+      if (sp.empty()) continue;
+      speciesRows[c][sp].push_back(row);
+      any = true;
+    }
+  }
+  if (!any) return false;
+  std::vector<std::string> order;   // chain by chain, each chain's species sorted (the JS Map's insertion order)
+  std::map<std::string, int> chainsOf, minHits;
+  for (auto& rows : speciesRows)
+    for (auto& [sp, list] : rows) {
+      if (!chainsOf.count(sp)) { order.push_back(sp); chainsOf[sp] = 0; minHits[sp] = maxHits; }
+      chainsOf[sp] += 1;
+      minHits[sp] = std::min(minHits[sp], (int)list.size());
+    }
+  std::map<int, std::vector<std::string>, std::greater<int>> byCount;
+  for (auto& sp : order) if (chainsOf[sp] > 1) byCount[chainsOf[sp]].push_back(sp);
+  std::vector<std::vector<int>> selected{std::vector<int>(al.size(), 0)};
+  int seen = 0;
+  for (auto& [count, list] : byCount) {
+    std::vector<std::vector<int>> block;
+    for (auto& sp : list)
+      for (int k = 0; k < minHits[sp]; ++k) {
+        std::vector<int> row;
+        for (auto& rows : speciesRows) { auto f = rows.find(sp); row.push_back(f == rows.end() ? -1 : f->second[k]); }
+        block.push_back(row);
+      }
+    std::vector<double> key;
+    for (auto& row : block) { double p = 1; for (int i : row) p = p * (double)std::abs(i); key.push_back(p); }
+    std::vector<int> at(block.size());
+    for (size_t i = 0; i < at.size(); ++i) at[i] = (int)i;
+    std::stable_sort(at.begin(), at.end(), [&](int a, int b) { return key[a] < key[b]; });
+    for (int i : at) selected.push_back(block[i]);
+    seen += (int)block.size();
+    if (seen >= maxRows) break;
+  }
+  if ((int)selected.size() > maxRows) selected.resize(maxRows);
+  out.clear();
+  bool first = true;
+  for (auto& row : selected) {
+    std::string parts, label;
+    for (size_t c = 0; c < al.size(); ++c) {
+      parts += row[c] < 0 ? std::string(al[c].length, '-') : al[c].raw[row[c]];
+      label += (c ? " " : "") + std::to_string(c + 1) + ":" + (row[c] < 0 ? std::string("-") : al[c].descriptions[row[c]]);
+    }
+    if (!first && std::none_of(parts.begin(), parts.end(), [](char ch) { return ch >= 'A' && ch <= 'Z'; })) continue;
+    out += ">" + (first ? std::string("query") : label) + "\n" + parts + "\n";
+    first = false;
+  }
+  return true;
 }
 
 // The alignment af3MsaFromA3m reads: one text, or a paired and an unpaired block (each may be absent)

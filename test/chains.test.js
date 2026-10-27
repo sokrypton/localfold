@@ -1,7 +1,8 @@
 import { describe, expect, it } from "./harness.js";
 import {
   chainIdentity, deduplicateUnpairedAgainstPaired,
-  mergeChainA3ms, mergeRowAlignedChainA3ms, mergeUnpairedChainA3ms,
+  mergeChainA3ms, mergeJobAlignments, mergeRowAlignedChainA3ms, mergeUnpairedChainA3ms, pairA3msBySpecies,
+  uniprotSpecies,
   residueIndexWithChainBreaks,
   splitComplexA3mByChain,
   validatedChainLengths,
@@ -216,5 +217,42 @@ describe("a chain folded from its query alone, beside one that is aligned", () =
   it("is the whole alignment when every chain is turned off", () => {
     const rows = rowsOf(mergeRowAlignedChainA3ms([">101\nGWST\n", ">101\nPIAQ\n"]));
     expect(rows).toEqual(["GWSTPIAQ"]);
+  });
+});
+
+describe("a job's pairedMsa from AF3's own pipeline", () => {
+  const rowsOf = (text) => text.trim().split("\n").filter((_, i) => i % 2 === 1);
+  const A = ">query\nPREACHINGS\n>tr|Q1|Q1_MOUSE/2-9\nPREBCHINGS\n>sp|P2|X_HUMAN\n--EACHINGS\n"
+    + ">sp|P3-2|Y_HUMAN\nPREACHINGZ\n>tr|Q4|Q4_YEAST\nPRUACHINGS\n>tr|Q5|Q5_HUMAN\nPREACHIJGS\n";
+  const B = ">query\nLITERALLY\n>tr|R1|R1_HUMAN\nLITERALLB\n>tr|R2|R2_YEAST\nLITER-LLY\n>tr|R3|R3_HUMAN\nLITEaRALLY\n";
+  const C = ">query\nMKTAYIAK\n>tr|S1|S1_MOUSE\nMKTAYZAK\n>tr|S2|S2_HUMAN\nMKTAY-AK\n";
+
+  it("reads a species as AF3's ExtractSpeciesIds does", () => {
+    expect(["sp|P0C2L1|A3X1_LOXLA", "tr|A0A146SKV9|A0A146SKV9_FUNHE/3-40 desc", "sp|O88974-2|SETB1_MOUSE",
+      "UniRef100_A0A0B4", "query"].map(uniprotSpecies)).toEqual(["LOXLA", "FUNHE", "", "", ""]);
+  });
+
+  it("pairs by species, not by row - AF3's create_paired_features (checked against it, stable sorts)", () => {
+    // HUMAN is in all three chains (one hit in C, so one row), then the two-chain species MOUSE (A, C) and YEAST
+    // (A, B) ordered by the product of their row indices; A's isoform names no species and is left out
+    expect(rowsOf(pairA3msBySpecies([A, B, C]))).toEqual([
+      "PREACHINGSLITERALLYMKTAYIAK",
+      "--EACHINGSLITERALLDMKTAY-AK",
+      "PREDCHINGS---------MKTAYEAK",
+      "PRCACHINGSLITER-LLY--------",
+    ]);
+  });
+
+  it("merges ColabFold's species-less pairedMsa row by row, as before", () => {
+    const pa = ">query\nGWST\n>UniRef100_X\nGWSA\n", pb = ">query\nPIAQ\n>UniRef100_Y\nPIAC\n";
+    expect(pairA3msBySpecies([pa, pb])).toEqual(null);
+    const merged = mergeJobAlignments({ unpaired: [null, null], paired: [pa, pb] }, ["GWST", "PIAQ"], ["protein", "protein"]);
+    expect(rowsOf(merged.alignment.paired)).toEqual(["GWSTPIAQ", "GWSAPIAC"]);
+  });
+
+  it("is the path a job's alignments take", () => {
+    const merged = mergeJobAlignments({ unpaired: [null, null, null], paired: [A, B, C] },
+      ["PREACHINGS", "LITERALLY", "MKTAYIAK"], ["protein", "protein", "protein"]);
+    expect(rowsOf(merged.alignment.paired).length).toEqual(4);
   });
 });

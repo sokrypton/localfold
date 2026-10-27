@@ -151,6 +151,17 @@ def cases():
                     unpairedMsa=">query\nPREACHINGS\n>u1\nPREA--INGS\n>u2\nPREAcCHINGS\n"),
             protein("B", "LITERALLY", pairedMsa=">query\nLITERALLY\n>s1\nLITER-LLY\n>s2\n---------\n",
                     unpairedMsa=">query\nLITERALLY\n")]), [], AF3_FAMILIES),
+        # (AF3's own pipeline: each chain's pairedMsa from its own search, UniProt headers, different depths - paired
+        # by species (chains.js pairA3msBySpecies), a species two chains share ahead of one all three do not, an
+        # isoform that names none, a chain missing a species gapped; and UniRef's ambiguity letters B Z U J O)
+        ("paired-by-species", "af3", job("t", [
+            protein("A", "PREACHINGS", pairedMsa=">query\nPREACHINGS\n>tr|Q1|Q1_MOUSE/2-9\nPREBCHINGS\n"
+                    ">sp|P2|X_HUMAN\n--EACHINGS\n>sp|P3-2|Y_HUMAN\nPREACHINGZ\n>tr|Q4|Q4_YEAST\nPRUACHINGS\n"
+                    ">tr|Q5|Q5_HUMAN\nPREACHIJGS\n", unpairedMsa=">query\nPREACHINGS\n>u1\nPREAcCHINOS\n"),
+            protein("B", "LITERALLY", pairedMsa=">query\nLITERALLY\n>tr|R1|R1_HUMAN\nLITERALLB\n>tr|R2|R2_YEAST\n"
+                    "LITER-LLY\n>tr|R3|R3_HUMAN\nLITEaRALLY\n", unpairedMsa=""),
+            protein("C", "MKTAYIAK", pairedMsa=">query\nMKTAYIAK\n>tr|S1|S1_MOUSE\nMKTAYZAK\n>tr|S2|S2_HUMAN\nMKTAY-AK\n",
+                    unpairedMsa="")]), [], AF3_FAMILIES),
         # (a template holding a phosphoserine and altlocs, 5K9P chain A: every family's template policy - the parent,
         # an UNK with its N, an UNK with N/CA/C/CB, the hit dropped, the first altloc - and AF3's arginine fix)
         ("template-modified", "af3", json.load(open(os.path.join(REPO, "tools", "fixtures", "template-5k9p-sep.json"))),
