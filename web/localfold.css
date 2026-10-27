@@ -1457,13 +1457,17 @@
    THE DESIGN PAGE'S LAYOUT (design.html, 2026-10-27): five steps on the left in the order a
    newcomer decides them, the picture on the right. One column below 980px, in step order.
    ============================================================================ */
-.design-page { max-width: 1200px; margin: 0 auto; }
+.design-page { max-width: 1760px; margin: 0 auto; }
 .design-head { margin-bottom: 12px; }
 .design-head h1 { margin: 0; }
 .design-tagline { margin: 2px 0 0; color: #6b7280; font-size: 14px; }
-.design-layout { display: grid; grid-template-columns: minmax(360px, 440px) minmax(0, 1fr); gap: 16px; align-items: start; }
+.design-layout { display: grid; grid-template-columns: minmax(360px, 420px) minmax(0, 1fr); gap: 16px; align-items: start;
+  --viewer-height: max(420px, calc(100vh - 210px)); }
 .design-steps { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
-.design-stage { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+/* 🔴 THE PICTURE STAYS IN VIEW while the steps scroll past it: the stage sticks to the top and
+   scrolls on its own when a run's table and downloads make it taller than the window. */
+.design-stage { display: flex; flex-direction: column; gap: 8px; min-width: 0;
+  position: sticky; top: 8px; max-height: calc(100vh - 16px); overflow-y: auto; }
 .design-step { background: #fff; border: 1px solid #e5e7eb; border-radius: 10px; padding: 12px 14px; }
 .design-step[hidden] { display: none; }
 .design-step h2 { display: flex; align-items: center; gap: 8px; margin: 0 0 8px; font-size: 15px; font-weight: 600; color: #111827; }
@@ -1493,7 +1497,8 @@
 /* the job at a glance: a row per chain, a block per piece */
 .chain-diagram { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
 .chain-diagram:empty { display: none; }
-.hotspot-line { display: flex; flex-wrap: wrap; align-items: center; gap: 0 6px; margin: -2px 0 10px; font-size: 13px; }
+.hotspot-line { margin: -2px 0 10px; font-size: 13px; line-height: 1.45; }
+.hotspot-line .role-swatch { display: inline-block; vertical-align: -1px; margin-right: 6px; }
 .hotspot-line[hidden] { display: none; }
 .chain-block-hot { display: inline-block; padding: 1px 5px; border-radius: 8px; background: #f59e0b; color: #111827; font-weight: 600; }
 .hotspot-line .hotspot-what { color: #6b7280; }
@@ -1535,8 +1540,19 @@
 /* ...and the canvas follows #canvasContainer (py2Dmol's viewport watches it), which show() fixes
    inline at the width it was built at - so a window resized after the first frame kept it. */
 .design-stage #viewerWrapper, .design-stage #canvasContainer { width: 100% !important; }
+/* ...and as tall as the window leaves, which py2Dmol's observer follows the same way. */
+.design-stage #canvasContainer { height: var(--viewer-height) !important; }
+.viewer-bar { display: flex; align-items: center; gap: 10px; min-height: 26px; }
+.viewer-bar [hidden] { display: none !important; }
+.viewer-bar #show-job { margin-left: auto; }
+.viewer-bar #show-job[hidden] + .run-button { margin-left: auto; }
+.viewer-bar .run-button { flex: 0 0 auto; }
+.run-where { font-size: 12px; color: #9ca3af; }
+.viewer-legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; color: #4b5563; }
+.viewer-key { display: inline-flex; align-items: center; gap: 5px; }
+.viewer-key i { width: 12px; height: 12px; border-radius: 3px; background: var(--key-colour); }
 .viewer-empty { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px;
-  aspect-ratio: 1 / 1; max-height: 560px; border: 1px dashed #d1d5db; border-radius: 10px; background: #fff;
+  height: var(--viewer-height); border: 1px dashed #d1d5db; border-radius: 10px; background: #fff;
   color: #9ca3af; text-align: center; padding: 16px; }
 .viewer-empty[hidden] { display: none; }
 .viewer-empty i { font-size: 32px; }
@@ -1565,8 +1581,15 @@
 .condition-rows .role-swatch { flex: 0 0 auto; }
 
 @media (max-width: 980px) {
-  .design-layout { grid-template-columns: minmax(0, 1fr); }
-  .viewer-empty { aspect-ratio: auto; min-height: 120px; }
+  .design-layout { grid-template-columns: minmax(0, 1fr); --viewer-height: min(70vh, 100vw); }
+  /* one column: the picture is a section in the page's flow, not a pane beside it - and it comes
+     right after the goal, so choosing one shows the job (and Generate) without scrolling past
+     every step. The steps' box dissolves so its sections can be ordered around the stage. */
+  .design-stage { position: static; max-height: none; overflow: visible; order: 2; }
+  .design-steps { display: contents; }
+  .design-step { order: 3; }
+  #step-goal { order: 1; }
+  .viewer-empty { min-height: 120px; }
 }
 
 /* What a control says underneath itself. */

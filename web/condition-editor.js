@@ -143,6 +143,12 @@ export function mergeConditions(base, rows) {
  *   structure's chain id
  */
 export function inputStructurePdb(atoms) {
+  const { atoms: out, chainOf } = inputStructureAtoms(atoms);
+  return { pdb: toPdbString(out, { title: "input structure" }), chainOf };
+}
+
+/** `inputStructurePdb`'s atoms before they are written, for a page that adds to them. */
+export function inputStructureAtoms(atoms) {
   const letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
   const letterOf = new Map();
   const chainOf = new Map();
@@ -163,17 +169,19 @@ export function inputStructurePdb(atoms) {
     out.push({ chainId: letterOf.get(chain), resId: atoms.res_id[i], resName: atoms.res_name[i],
       atomName: atoms.atom_name[i], element: atoms.element[i], x, y, z, isHetero: atoms.hetero[i] });
   }
-  return { pdb: toPdbString(out, { title: "input structure" }), chainOf };
+  return { atoms: out, chainOf };
 }
 
 /**
  * For each drawn position of a py2Dmol renderer, the input residue it is: `{chain, resId}` in the
  * structure's own names, through the letters `inputStructurePdb` wrote.
  */
-export function inputResidueMap(renderer, chainOf) {
+export function inputResidueMap(renderer, chainOf, ghosts = new Map()) {
   const chains = renderer?.chains ?? [];
   const numbers = renderer?.residueNumbers ?? [];
-  return Array.from(chains, (letter, i) => ({
+  // 🔴 A SKETCHED PIECE IS NO RESIDUE OF THE STRUCTURE (web/job-sketch.js): undefined, which
+  // `picksOf` skips, so dragging over a ghost picks nothing a condition could name.
+  return Array.from(chains, (letter, i) => (ghosts.has(String(letter)) ? undefined : {
     chain: chainOf.get(String(letter)) ?? String(letter), resId: Number(numbers[i]),
   }));
 }

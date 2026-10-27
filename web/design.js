@@ -33,8 +33,10 @@ import { CHAIN_IDS, MAX_ALANINE } from "../webgpu/design/hunter-loop.js";
 import { hunt } from "./hunt.js";
 import { createStructureViewer } from "./viewer.js";
 import {
-  createConditionEditor, describePicks, inputResidueMap, inputStructurePdb, picksOf, segmentsOf,
+  createConditionEditor, describePicks, inputResidueMap, inputStructureAtoms, picksOf, segmentsOf,
 } from "./condition-editor.js";
+import { sketchJob } from "./job-sketch.js";
+import { toPdbString } from "../shared/rfd4p/output.js";
 import { alignToReference } from "../cpu/design/align.js";
 import { translateSpans } from "../cpu/design/source-numbering.js";
 import { HUNTER_CANNOT, presetSuits } from "../cpu/design/preset-methods.js";
@@ -184,6 +186,10 @@ let presetSpans = null;
 // 🔴 THE VIEWER SHOWS THE LOADED STRUCTURE UNTIL A RUN TAKES IT, and only then can a click name one
 // of its residues: a design's positions are not the input's. Set while it does.
 let inputView = null;
+// 🔴 FALSE UNTIL THE VIEWER EXISTS: `paintJob` runs while the span list constructs, which is before
+// the viewer is made, and a redraw it asked for then would read a `const` still in its dead zone.
+let viewerReady = false;
+let jobRedraw = 0;
 // 🔴 A FUNCTION DECLARATION, called while the span list constructs.
 function BLANK_JOB() { return [{ kind: "generated", min: 100, max: 100, name: "", secondary: "", polymer: "protein" }]; }
 
@@ -405,8 +411,12 @@ function hotspotResidues(spans) {
 function paintHotspotLine(spans) {
   const line = element("hotspot-line");
   const hot = hotspotResidues(spans);
-  const kept = spans.some((span) => span.kind === "segment" || span.kind === "sequence");
-  line.hidden = hot.length === 0 && !kept;
+  // ...and the "none yet" hint only where there is a TARGET - a chain nothing in which is designed:
+  // a motif scaffold keeps pieces of its own chain, and has nothing to touch
+  const chainOf = chainOfSpans(spans);
+  const designed = new Set(spans.flatMap((span, i) => (span.kind === "generated" ? [chainOf[i]] : [])));
+  const target = spans.some((span, i) => span.kind === "segment" && !designed.has(chainOf[i]));
+  line.hidden = hot.length === 0 && !target;
   line.replaceChildren();
   const swatch = document.createElement("span");
   swatch.className = "role-swatch";
@@ -487,7 +497,7 @@ const paintJob = () => {
   contigProblems.classList.toggle("warn", theirs.length > 0);
   paintDesignerNote(spans);
   warnIgnoredEdit(spans);
-  if (inputView !== null) paintInput();
+  scheduleJobView();
 };
 
 window.__designSpans = spanList;
@@ -736,14 +746,21 @@ const drawCycle = (record) => {
 // appending the rest, and keeping the camera across rebuilds, and it
 // deliberately owns nothing about the prediction. (It was written for the two
 // withheld pages and nothing has loaded it since; this is the first page to.)
-const viewerBox = element("viewer-container");
+// 🔴 NOT `#viewer-container`: py2Dmol's website app (the full bundle's main.js) starts itself on any page
+// that has one, and took this page's box for its own viewer - writing a 600px size into it and
+// throwing on the controls it looked for next, on every load.
+const viewerBox = element("design-viewer");
 /** The viewer replaces its placeholder the first time anything is drawn. */
 function showViewer() {
   viewerBox.style.display = "";
   element("viewer-empty").hidden = true;
+  paintViewerBar();
 }
 const viewer = createStructureViewer({
   container: viewerBox,
+  // the stylesheet sizes the box to the window (--viewer-height) and py2Dmol follows it; this is
+  // only the first frame's size, asked near it so the first mesh is not built twice
+  canvasHeight: Math.max(420, Math.round(window.innerHeight - 220)),
   frameLabel: "cycle",
   // 🔴 NO SIDECHAINS, AND NO pLDDT RAMP. The default paint colours sidechains by
   // hydrophobicity, which is right for ONE finished structure and wrong for
@@ -774,45 +791,128 @@ function constraintColour(index, row) {
 
 function paintInput() {
   if (inputView === null || viewer.renderer === undefined) return;
+  const renderer = viewer.renderer;
   viewer.colourChains(Object.fromEntries([...inputView.chainOf.keys()].map((letter) => [letter, INPUT_COLOUR])));
-  const map = inputResidueMap(viewer.renderer, inputView.chainOf);
+  const map = inputResidueMap(renderer, inputView.chainOf, inputView.ghosts);
+  const where = (test) => map.flatMap((residue, i) => (residue !== undefined && test(residue) ? [i] : []));
   // 🔴 WHAT STEP 3 KEEPS, IN ITS CHAIN'S COLOUR, so the picture says which residues of the structure
   // are in the design (the same colour as the piece's block and row); constraints paint over it.
   const spans = spanList.read();
   const chainOf = chainOfSpans(spans);
   spans.forEach((span, index) => {
     if (span.kind !== "segment" || chainOf[index] === null) return;
-    const positions = map.flatMap((residue, i) => (residue.chain === String(span.chain).trim()
-      && residue.resId >= Number(span.first) && residue.resId <= Number(span.last) ? [i] : []));
-    viewer.colourResidues(positions, chainColour(chainOf[index]));
+    viewer.colourResidues(where((residue) => residue.chain === String(span.chain).trim()
+      && residue.resId >= Number(span.first) && residue.resId <= Number(span.last)), chainColour(chainOf[index]));
   });
+  // ...and every piece still to be designed, in its chain's colour and faded: a sketch, not atoms.
+  const letters = Array.from(renderer.chains ?? [], String);
+  for (const [letter, { chain }] of inputView.ghosts) {
+    const positions = letters.flatMap((l, i) => (l === letter ? [i] : []));
+    // 🔴 PALE AS WELL AS TRANSLUCENT: py2Dmol's 2D painter (the one a browser without WebGL2 gets)
+    // lays every piece down opaque, so the fade alone would leave the sketch solid there.
+    viewer.colourResidues(positions, ghostColour(chain));
+    try { renderer.setOpacity({ positions }, GHOST_OPACITY); } catch { /* an older py2Dmol: drawn solid */ }
+  }
   conditionEditor.rows.forEach((row, index) => {
     const wanted = new Set(row.picks.map((pick) => `${pick.chain}:${pick.resId}`));
-    const positions = map.flatMap((residue, i) => (wanted.has(`${residue.chain}:${residue.resId}`) ? [i] : []));
-    viewer.colourResidues(positions, constraintColour(index, row));
+    viewer.colourResidues(where((residue) => wanted.has(`${residue.chain}:${residue.resId}`)), constraintColour(index, row));
   });
   // ...and every hotspot last, in its own colour, whichever of the three places set it.
   const hot = new Set(hotspotResidues(spans).map((h) => `${h.chain}:${h.resId}`));
-  viewer.colourResidues(map.flatMap((residue, i) => (hot.has(`${residue.chain}:${residue.resId}`) ? [i] : [])),
-    HOTSPOT_COLOUR);
+  viewer.colourResidues(where((residue) => hot.has(`${residue.chain}:${residue.resId}`)), HOTSPOT_COLOUR);
+  renderer.render?.("job");
+  paintViewerBar();
 }
 
-/** Draw the loaded structure in the viewer, for picking. */
+const GHOST_OPACITY = 0.5;
+/** A sketched piece's colour: its chain's, most of the way to white. */
+function ghostColour(chain) { return shade(chainColour(chain), "#ffffff", 0.55); }
+
+/** The job as the viewer draws it: the structure's atoms, then a sketch of each designed piece. */
+function jobDrawing(spans) {
+  const { atoms, chainOf } = loaded === null ? { atoms: [], chainOf: new Map() } : inputStructureAtoms(loaded.atoms);
+  const sketch = sketchJob(atoms, chainOf, spans, { hotspots: hotspotResidues(spans) });
+  return { pdb: sketch.atoms.length === 0 ? null : toPdbString(sketch.atoms, { title: "the job" }),
+    chainOf, ghosts: sketch.ghosts };
+}
+
+/**
+ * Draw the job in the viewer: the loaded structure, and a faded sketch of every piece to be designed.
+ *
+ * 🔴 DRAWN FROM THE MOMENT THERE IS A JOB, not from the moment a structure is loaded: the blank job
+ * is a 100-residue sketch on arrival, and every edit in step 3 redraws it. The camera is kept across
+ * an edit of the same structure, so lengthening a linker does not throw the view away, and the
+ * selection is kept with it - the structure's residues come first, so their positions do not move.
+ */
 function showInput() {
-  if (loaded === null || running !== null) return;
-  const { pdb, chainOf } = inputStructurePdb(loaded.atoms);
+  if (running !== null || !viewerReady) return;
+  const drawing = jobDrawing(spanList.read());
+  const same = inputView !== null && inputView.loaded === loaded && loaded !== null;
+  if (same && drawing.pdb === inputView.pdb) { paintInput(); return; }
+  const selected = same && viewer.renderer?.residueSelection instanceof Set ? [...viewer.renderer.residueSelection] : [];
   viewer.cancelAnimations();
   viewer.reset();
-  viewer.forgetCamera();
+  if (!same) viewer.forgetCamera();
+  if (drawing.pdb === null) {
+    inputView = null;
+    viewerBox.style.display = "none";
+    element("viewer-empty").hidden = false;
+    hideSequence();
+    paintViewerBar();
+    return;
+  }
   showViewer();
-  inputView = { chainOf };
-  viewer.push(pdb, (built) => { if (built) viewer.orient(); });
+  inputView = { chainOf: drawing.chainOf, ghosts: drawing.ghosts, pdb: drawing.pdb, loaded };
+  viewer.push(drawing.pdb, (built) => { if (built && !same) viewer.orient(); });
+  if (selected.length > 0) {
+    const real = new Set(inputResidueMap(viewer.renderer, inputView.chainOf, inputView.ghosts)
+      .flatMap((residue, i) => (residue === undefined ? [] : [i])));
+    viewer.renderer?.setResidueSelection?.(new Set(selected.filter((i) => real.has(i))));
+  }
   conditionHost.style.display = "";
-  sequenceBox.style.display = "";
+  // the strip is for picking the STRUCTURE's residues, so it is shown only when there is one
+  if (loaded === null) hideSequence();
+  else sequenceBox.style.display = "";
   paintInput();
   window.SEQ?.clear?.();
-  window.SEQ?.buildView?.();
+  if (loaded !== null) window.SEQ?.buildView?.();
   conditionEditor?.refreshSelection();
+}
+
+/** A redraw for an edit, once the edits of one moment have landed. */
+function scheduleJobView() {
+  if (!viewerReady || running !== null) return;
+  // a design on screen is not taken away by an edit; "Show the job" brings the job back
+  if (inputView === null && viewer.built) { paintViewerBar(); return; }
+  const ticket = ++jobRedraw;
+  setTimeout(() => { if (ticket === jobRedraw) showInput(); }, 120);
+}
+
+/** The line over the viewer: what its colours mean, and the way back to the job from a design. */
+function paintViewerBar() {
+  if (!viewerReady) return;
+  const showJob = element("show-job");
+  showJob.hidden = !(inputView === null && viewer.built && running === null);
+  const legend = element("viewer-legend");
+  legend.replaceChildren();
+  if (inputView === null) return;
+  const key = (colour, text, className = "") => {
+    const item = document.createElement("span");
+    item.className = `viewer-key ${className}`.trim();
+    const swatch = document.createElement("i");
+    swatch.style.setProperty("--key-colour", colour);
+    item.append(swatch, text);
+    legend.append(item);
+  };
+  const spans = spanList.read();
+  const chainOf = chainOfSpans(spans);
+  const first = (kind) => spans.findIndex((span, i) => span.kind === kind && chainOf[i] !== null);
+  if (inputView.ghosts.size > 0) {
+    key(ghostColour([...inputView.ghosts.values()][0].chain), "to be designed (a sketch of its length)");
+  }
+  if (first("segment") >= 0) key(chainColour(chainOf[first("segment")]), "kept from the structure");
+  if (loaded !== null) key(INPUT_COLOUR, "not used");
+  if (hotspotResidues(spans).length > 0) key(HOTSPOT_COLOUR, "hotspot");
 }
 
 // 🔴 THE FOLD PAGE'S SEQUENCE STRIP, REUSED AS IT IS. py2Dmol's panel finds its renderer through
@@ -827,9 +927,29 @@ window.SEQ?.setCallbacks?.({
   applySelection: () => {},
 });
 document.addEventListener("py2dmol-residue-selection-change", () => {
+  if (inputView !== null && takeGhostPick()) return;
   if (inputView !== null) window.SEQ?.updateSelection?.();
   conditionEditor?.refreshSelection();
 });
+/**
+ * A click on a sketched piece opens its row in step 3, rather than selecting it: a sketch is no
+ * residue a constraint could name, and its row is where its length is changed.
+ */
+function takeGhostPick() {
+  const renderer = viewer.renderer;
+  const selected = renderer?.residueSelection;
+  if (!(selected instanceof Set) || selected.size === 0) return false;
+  const letters = renderer.chains ?? [];
+  const ghost = [...selected].find((i) => inputView.ghosts.has(String(letters[i])));
+  if (ghost === undefined) return false;
+  // a click on the sketch alone; Select all and a drag keep only what they took of the structure
+  if ([...selected].every((i) => inputView.ghosts.has(String(letters[i])))) {
+    spanList.reveal(inputView.ghosts.get(String(letters[ghost])).span);
+  }
+  // the event this raises lands here again, with nothing sketched left in it
+  renderer.setResidueSelection(new Set([...selected].filter((i) => !inputView.ghosts.has(String(letters[i])))));
+  return true;
+}
 /** Hide the strip while a run owns the viewer. */
 const hideSequence = () => {
   sequenceBox.style.display = "none";
@@ -859,7 +979,7 @@ conditionEditor = createConditionEditor(conditionHost, {
     if (loaded === null) return null;
     if (inputView === null || viewer.renderer === undefined) return [];
     const selected = viewer.renderer.residueSelection;
-    return picksOf(selected instanceof Set ? [...selected] : [], inputResidueMap(viewer.renderer, inputView.chainOf));
+    return picksOf(selected instanceof Set ? [...selected] : [], inputResidueMap(viewer.renderer, inputView.chainOf, inputView.ghosts));
   },
   colourOf: (index, row) => constraintColour(index, row),
   onKeep: () => keepSelection(),
@@ -870,11 +990,15 @@ conditionEditor = createConditionEditor(conditionHost, {
     }
     const selected = viewer.renderer.residueSelection;
     return picksOf(selected instanceof Set ? [...selected] : [],
-      inputResidueMap(viewer.renderer, inputView.chainOf));
+      inputResidueMap(viewer.renderer, inputView.chainOf, inputView.ghosts));
   },
   onChange: () => { paintInput(); paintJob(); },
 });
 conditionEditor.disable(method.value === "hunter" ? HUNTER_NO_CONDITIONS : null);
+// The viewer and the editor exist: the job can be drawn, and is, from arrival.
+viewerReady = true;
+element("show-job").addEventListener("click", () => { inputView = null; viewer.forgetCamera(); showInput(); });
+showInput();
 /**
  * The conditions a generation is handed: a preset's, then the spans' hotspots over them (what the
  * user just typed wins), then the editor's rows appended after both - upstream applies arms in
@@ -888,6 +1012,12 @@ function runConditions(spans) {
 // A driver's door, as `__designSpans` is: the conditions a generation would be handed now.
 window.__designConditions = () => runConditions(spanList.read()) ?? null;
 window.__designShowInput = showInput;
+// ...and what the viewer is drawing: the structure's name and the sketch's chain letters, or null
+// while a design is on screen.
+window.__designDrawn = () => (inputView === null ? null : {
+  structure: inputView.loaded?.name ?? null, ghosts: [...inputView.ghosts.keys()],
+  positions: viewer.renderer?.chains?.length ?? 0,
+});
 
 const startHunt = async () => {
   const spans = spanList.read();
@@ -990,6 +1120,7 @@ const startHunt = async () => {
     }
   } finally {
     running = null;
+    paintViewerBar();
     huntLabel.textContent = method.value === "hunter" ? "Hunt" : "Generate";
   }
 };
@@ -1241,12 +1372,10 @@ function clearStructure() {
   loaded = null;
   describeStructure();
   inputView = null;
-  viewer.cancelAnimations();
-  viewer.reset();
-  viewerBox.style.display = "none";
-  element("viewer-empty").hidden = false;
   hideSequence();
   if (conditionEditor.rows.length > 0) conditionEditor.set([]);
+  // ...and the job is drawn again without it: what is left to design, sketched
+  showInput();
 }
 
 /**
@@ -1751,6 +1880,7 @@ const startGenerate = async () => {
     }
   } finally {
     running = null;
+    paintViewerBar();
     huntLabel.textContent = method.value === "hunter" ? "Hunt" : "Generate";
   }
 };

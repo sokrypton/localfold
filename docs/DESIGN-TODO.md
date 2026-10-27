@@ -244,3 +244,30 @@ constraint at all, which decides whether this is plumbing or a port.
   "switch to the contig"; it now says the edits are not used, when one is made.
   `tools/check-design-page.py` holds the new defaults, the goal cards, the
   diagram (watched failing with the block click unwired) and the quick actions.
+- **The job drawn before it runs, and the picture made the page** — **done**
+  (2026-10-27). The viewer was empty until a structure was loaded and then drew
+  only that structure. It now draws the JOB from arrival (`web/job-sketch.js`):
+  the structure's real atoms, and every piece still to be designed as a C-alpha
+  trace of its length (a range at its midpoint), pale and translucent - a
+  circular arc of even 3.8 A steps between the two kept pieces a linker joins, a
+  protein-sized wire globe on a piece with one neighbour or none, set beside the
+  target's hotspots for a binder and round the ligand for a pocket. Every edit in
+  step 3 redraws it, keeping the camera and the selection. A click on a sketched
+  piece opens its row; a sketch is no residue a constraint can name, so picks and
+  Select all skip it. A legend above the viewer says what each colour is and
+  that the faded part is a sketch, not a prediction. A design on screen stays
+  until "Show the job" is pressed. The stage is as tall as the window and sticks
+  beside the steps; Generate moved into its bar, in view on arrival (it was below
+  the fold at the end of step 5); on a phone the picture comes right after step
+  1. `tools/check-design-page.py` holds the arrival sketch, the motif's three
+  sketched pieces, the sketch click (watched failing with the handler off) and
+  Show the job after a generation; `test/job-sketch.test.js` holds the geometry.
+  🔴 Found on the way: the design page's box was `#viewer-container`, the id
+  py2Dmol's website app starts itself on, so every load threw inside py2Dmol and
+  wrote a 600 px size into this page's viewer - renamed `#design-viewer`. And
+  py2Dmol's full-screen button drew an empty box on Linux (U+26F6 is in few
+  fonts): an inline SVG now, on sokrypton/py2Dmol#32's branch and re-vendored.
+  **Open**: the 2D painter (a browser without WebGL2) lays every piece down
+  opaque, so the sketch is only pale there, not translucent; and the sequence
+  strip draws a sketch as a row of G, since the strip has no way to leave a chain
+  out.

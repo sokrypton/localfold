@@ -11,6 +11,10 @@ five steps on the left - what to design, what it is built on, what gets built, a
 constraints, and run - and the picture on the right, where picking residues and watching
 a design arrive both happen. The method is an Advanced setting: a goal picks it.
 
+🔴 AND THE PICTURE IS THE JOB BEFORE IT IS A RESULT: from arrival it draws the structure and a
+faded sketch of every piece to be designed (web/job-sketch.js), redrawn on each edit; it is as tall
+as the window and stays beside the steps, and Generate is in its bar.
+
 🔴 THE PAGE IS NOT LINKED FROM index.html. It is in tools/build_site.py's OPTIONAL list,
 so a checkout without it still builds, and it IS copied when present - unlinked is not
 hidden.
@@ -111,7 +115,7 @@ The style IS index.html's: py2Dmol's light application CSS plus web/localfold.cs
                 </section>
 
                 <section class="design-step" id="step-run">
-                    <h2><span class="step-number">5</span>Generate</h2>
+                    <h2><span class="step-number">5</span>How many, and how to check them</h2>
                     <div class="fetch-options" id="designOptions">
 
                         <div class="fetch-option-group" id="beamGroup">
@@ -233,10 +237,7 @@ The style IS index.html's: py2Dmol's light application CSS plus web/localfold.cs
                             aria-expanded="false" title="The method, sampling steps, seed and sampler settings.">
                             Advanced
                         </button>
-                        <button type="button" id="hunt" class="btn btn-primary run-button">
-                            <i class="fa-solid fa-dna"></i>
-                            <span>Generate</span>
-                        </button>
+                        <span class="run-where">Generate is with the picture.</span>
                     </div>
                     <!-- Only Protein Hunter's notes, and only inside Advanced: which designer it
                          chose and what a run costs in folds. -->
@@ -257,11 +258,25 @@ The style IS index.html's: py2Dmol's light application CSS plus web/localfold.cs
                     <progress id="progress" max="1" value="0" data-state="idle"></progress>
                 </div>
 
-                <div id="viewer-empty" class="viewer-empty">
-                    <i class="fa-solid fa-cube"></i>
-                    <p>The structure appears here: load one in step 2, or press Generate.</p>
+                <!-- What the viewer's colours mean, and the way back to the job from a design. -->
+                <!-- 🔴 GENERATE LIVES HERE, beside what it will make: at the end of step 5 it was below the
+                     fold of every laptop screen, and this bar is always in view. -->
+                <div class="viewer-bar">
+                    <div id="viewer-legend" class="viewer-legend"></div>
+                    <button id="show-job" class="btn btn-grey btn-small" type="button" hidden
+                        title="Draw the job again: the structure and a sketch of what is to be designed">Show the job</button>
+                    <button type="button" id="hunt" class="btn btn-primary run-button">
+                        <i class="fa-solid fa-dna"></i>
+                        <span>Generate</span>
+                    </button>
                 </div>
-                <div id="viewer-container" class="py2dmol-viewer-instance" style="display: none;"></div>
+                <div id="viewer-empty" class="viewer-empty" hidden>
+                    <i class="fa-solid fa-cube"></i>
+                    <p>Add a piece in step 3 and the job is drawn here.</p>
+                </div>
+                <!-- 🔴 THE JOB IS DRAWN FROM ARRIVAL (web/job-sketch.js): the structure, and each piece
+                     still to be designed sketched faded at its length, redrawn on every edit. -->
+                <div id="design-viewer" class="py2dmol-viewer-instance" style="display: none;"></div>
 
                 <!-- py2Dmol's sequence strip, the fold page's own (window.SEQ): dragging along it
                      selects residues, as clicking them in the viewer does. Shown while the

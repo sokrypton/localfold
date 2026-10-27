@@ -206,8 +206,11 @@ def main():
             notes: [...document.querySelectorAll('.design-notes .option-note, #preset-note')]
               .filter(visible).map((n) => n.textContent.trim()).filter(Boolean),
             placeholder: visible(document.getElementById('viewer-empty')),
+            drawn: window.__designDrawn(),
             constraints: visible(document.getElementById('step-constraints')),
             hunt: document.getElementById('hunt').textContent.trim(),
+            huntInView: (() => { const b = document.getElementById('hunt').getBoundingClientRect();
+              return b.top >= 0 && b.bottom <= innerHeight && b.width > 0; })(),
             gpu: document.getElementById('gpu-summary').textContent.trim(),
           });
         })()"""))
@@ -225,8 +228,17 @@ def main():
             bad.append(f"Protein Hunter's controls are on screen under RFD4-Proteina: {first['otherMethodShown']}")
         if first["notes"]:
             bad.append(f"the page explains itself before anything happened: {first['notes']}")
-        if not first["placeholder"] or not first["constraints"]:
-            bad.append("the viewer's placeholder or the constraints step is missing on arrival")
+        # 🔴 THE JOB IS DRAWN FROM ARRIVAL (web/job-sketch.js): the blank job is one sketched chain of
+        # 100 positions and no structure, so there is no empty placeholder to read - and Generate is
+        # beside it, in view, rather than at the end of step 5.
+        if first["placeholder"] or first["drawn"] is None or first["drawn"]["structure"] is not None \
+                or len(first["drawn"]["ghosts"]) != 1 or first["drawn"]["positions"] != 100:
+            bad.append(f"the blank job is not drawn as one 100-residue sketch on arrival: {first['drawn']},"
+                       f" placeholder {first['placeholder']}")
+        if not first["constraints"]:
+            bad.append("the constraints step is missing on arrival")
+        if not first["huntInView"]:
+            bad.append("Generate is not in view on arrival")
         if first["gpu"] == "":
             bad.append("the page did not say whether WebGPU is available")
 
@@ -235,14 +247,51 @@ def main():
         # the file without its path; editing that example's pieces says they are not used (it runs
         # from its structure's annotations); and New protein drops the structure and the pieces.
         cdp.evaluate(ws, "(() => { document.querySelector('[data-goal=motif_idx_1prw]').click(); return 1; })()")
-        cdp.wait_for(ws, "(() => { const e = Object.values(window.py2dmol_viewers ?? {})[0];"
-                         " return ((e?.renderer ?? e)?.chains?.length ?? 0) > 10; })()", 30, "the motif's structure")
+        # 🔴 ON THE STRUCTURE AND ITS PIECES, not on "a viewer exists": the blank job's sketch is one
+        # already, so that returned before the example had loaded anything.
+        cdp.wait_for(ws, "(() => { const d = window.__designDrawn?.(); return d !== null && d.structure !== null"
+                         " && d.ghosts.length === 3; })()", 30, "the motif's structure and its three sketched pieces")
+        # 🔴 A CLICK ON A SKETCHED PIECE OPENS ITS ROW in step 3 - where its length is changed - and
+        # selects nothing: a sketch is no residue a constraint can name. A real click, as below.
+        time.sleep(0.5)
+        ghost = json.loads(cdp.evaluate(ws, """(() => {
+          const entry = Object.values(window.py2dmol_viewers ?? {}).at(-1);
+          const r = entry?.renderer ?? entry;
+          const canvas = document.querySelector('#design-viewer canvas');
+          canvas.scrollIntoView({ block: 'center' });
+          const box = canvas.getBoundingClientRect();
+          const sketched = new Set(window.__designDrawn().ghosts);
+          const steady = (x, y, hit) => [[-2, 0], [2, 0], [0, -2], [0, 2]]
+            .every(([dx, dy]) => r.pickResidueAt(x + dx, y + dy) === hit);
+          for (let y = Math.ceil(box.top + 20); y < box.bottom - 30; y += 3)
+            for (let x = Math.ceil(box.left + 20); x < box.right - 20; x += 3) {
+              const hit = r.pickResidueAt(x, y);
+              if (hit >= 0 && sketched.has(r.chains[hit]) && steady(x, y, hit))
+                return JSON.stringify({ x, y, opened: document.querySelectorAll('#contig-rows .contig-more').length });
+            }
+          return 'null';
+        })()"""))
+        if ghost is None:
+            bad.append("no sketched piece of the motif job could be found under the pointer")
+        else:
+            for kind in ("mousePressed", "mouseReleased"):
+                ws.call("Input.dispatchMouseEvent", type=kind, x=ghost["x"], y=ghost["y"], button="left", clickCount=1)
+                time.sleep(0.05)
+            time.sleep(0.4)
+            after = json.loads(cdp.evaluate(ws, """JSON.stringify({
+              opened: document.querySelectorAll('#contig-rows .contig-more').length,
+              selected: (() => { const e = Object.values(window.py2dmol_viewers ?? {}).at(-1);
+                return (e?.renderer ?? e).residueSelection?.size ?? 0; })() })"""))
+            print(f"  sketch click: {ghost} -> {after}")
+            if after["opened"] <= ghost["opened"] or after["selected"] != 0:
+                bad.append(f"a click on a sketched piece did not open its row and select nothing: {after}")
         motif = json.loads(cdp.evaluate(ws, """(() => {
           const out = { preset: document.getElementById('preset').value,
             chosen: document.querySelector('#goals [aria-checked="true"]')?.dataset.goal,
             blocks: [...document.querySelectorAll('#chain-diagram .chain-block')].map((b) => b.textContent),
             structure: document.getElementById('structure-note').textContent,
             placeholder: !document.getElementById('viewer-empty').hidden,
+            drawn: window.__designDrawn(),
             noteBefore: document.getElementById('preset-note').textContent };
           const spans = window.__designSpans.read();
           spans[0] = { ...spans[0], min: 7, max: 7 };
@@ -265,7 +314,7 @@ def main():
             bad.append(f"the motif's structure is not shown and named: {motif['structure']!r}")
         if not motif["edited"]["warn"] or "not used" not in motif["edited"]["text"]:
             bad.append(f"an edit to an annotation-driven example is not said to be unused: {motif['edited']}")
-        if motif["blank"] != {"rows": 1, "structure": "", "placeholder": True, "preset": ""}:
+        if motif["blank"] != {"rows": 1, "structure": "", "placeholder": False, "preset": ""}:
             bad.append(f"New protein did not clear the example: {motif['blank']}")
 
         # 🔴 AND HOTSPOTS ARE NAMED WHEREVER THEY WERE SET. The binder example carries its epitope in
@@ -465,7 +514,7 @@ def main():
                 const name = renderer?.currentObjectName;
                 return renderer?.objectsData?.[name]?.frames?.length ?? 0;
               })(),
-              viewerShown: document.getElementById('viewer-container').offsetParent !== null,
+              viewerShown: document.getElementById('design-viewer').offsetParent !== null,
             })"""))
             if hunted["failed"]:
                 break
@@ -665,6 +714,22 @@ def main():
                     bad.append("the generation drew no structure")
                 if generated["progress"] != 1:
                     bad.append(f"the bar ended at {generated['progress']}, not 1")
+                # 🔴 THE DESIGN STAYS UNTIL ASKED: an edit does not take it off screen, and "Show the
+                # job" - offered only while a design is drawn - puts the job's sketch back.
+                back = json.loads(cdp.evaluate(ws, """(() => {
+                  const button = document.getElementById('show-job');
+                  const offered = !button.hidden && button.offsetParent !== null;
+                  const spans = window.__designSpans.read();
+                  window.__designSpans.set(spans);
+                  return new Promise((done) => setTimeout(() => {
+                    const kept = window.__designDrawn() === null;
+                    button.click();
+                    done(JSON.stringify({ offered, kept, drawn: window.__designDrawn(), hidden: button.hidden }));
+                  }, 400));
+                })()"""))
+                print(f"  show the job: {back}")
+                if not back["offered"] or not back["kept"] or back["drawn"] is None or not back["hidden"]:
+                    bad.append(f"after a generation, Show the job did not bring the job back: {back}")
                 # Both candidates are drawn, and exactly one of them is marked -
                 # the same rule the hunt table has, because the leader changes
                 # as candidates arrive.
@@ -1042,7 +1107,7 @@ def main():
           const r = entry?.renderer ?? entry;
           // 🔴 ON SCREEN FIRST: a click outside the window reaches nothing, and the earlier arms
           // leave the page scrolled - the picker still answers there, so the miss is silent.
-          const canvas = document.querySelector('#viewer-container canvas');
+          const canvas = document.querySelector('#design-viewer canvas');
           canvas.scrollIntoView({ block: 'center' });
           const box = canvas.getBoundingClientRect();
           // 🔴 WHOLE PIXELS, AND THE SAME RESIDUE AROUND IT: a mouse event's coordinates are integers
@@ -1050,10 +1115,12 @@ def main():
           // time the click arrived - py2Dmol read it as the background and cleared the selection.
           const steady = (x, y, hit) => [[-2, 0], [2, 0], [0, -2], [0, 2]]
             .every(([dx, dy]) => r.pickResidueAt(x + dx, y + dy) === hit);
+          // ...and a residue of the STRUCTURE: the job's sketched pieces are drawn too, and pick
+          const sketched = new Set(window.__designDrawn()?.ghosts ?? []);
           for (let y = Math.ceil(box.top + box.height * 0.3); y < box.bottom - 30; y += 4)
             for (let x = Math.ceil(box.left + box.width * 0.3); x < box.right - 10; x += 4) {
               const hit = r.pickResidueAt(x, y);
-              if (hit >= 0 && r.positionTypes?.[hit] === 'P' && steady(x, y, hit))
+              if (hit >= 0 && r.positionTypes?.[hit] === 'P' && !sketched.has(r.chains[hit]) && steady(x, y, hit))
                 return JSON.stringify({ x, y, chain: r.chains[hit], num: r.residueNumbers[hit] });
             }
           return 'null';
@@ -1151,7 +1218,9 @@ def main():
                   document.getElementById('clearAllResidues').click();
                   return JSON.stringify({ chains: [...new Set(sel.map((i) => r.chains[i]))],
                     nums: sel.map((i) => r.residueNumbers[i]), added: spans.slice(before), chips, opened,
-                    buttons: { n: r.coords.length, all, inverted, cleared: size() } });
+                    // the structure's positions: Select all takes no sketched piece
+                    buttons: { n: r.chains.filter((c) => !(window.__designDrawn()?.ghosts ?? []).includes(c)).length,
+                      all, inverted, cleared: size() } });
                 })()"""))
                 print(f"  sequence strip: dragged {dragged['chains']} {dragged['nums'][:1]}..{dragged['nums'][-1:]}"
                       f" -> {dragged['added']}")
