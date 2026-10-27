@@ -361,3 +361,21 @@ constraint at all, which decides whether this is plumbing or a port.
   no dictionary entry. A RAW structure would: `componentsNeedingCcd` fetches RCSB's entry for any
   CCD-shaped name, which is a reason upstream's `S;M` may have been deliberate. Not checked against
   the upstream oracle: `oracle-dumps/` holds no sm_sam dump on this box.
+
+### Every example, checked (2026-10-27) - done
+
+All eleven entries under both methods, loaded and screenshot, then `--presets` run: RFD4 on all ten,
+a 1-cycle hunt on the six Protein Hunter takes - 16 of 16 finished. Fixed on the way:
+- 🔴 an example sharing its file with the one before (the three 1PRW ones) said "edits here are not
+  used" with no edit: its loading was compared against the previous example's segments;
+- the unconditional example's file holds only the design's placeholder, and the page offered a
+  Selection step and an empty strip for it - it now says "only a placeholder, nothing to keep";
+- the legend's "not used" appeared whenever a structure was loaded, now only when part of it is
+  left out of the job;
+- a "Keep" card's chain tag reads "→ chain B" (the chain it becomes), since "chain B" beside a field
+  saying chain A of the structure (the 5O45 binder) read as a contradiction;
+- under Protein Hunter, an example it cannot run now greys out Design with the reason, as the note
+  already said.
+Open: at the check's speed settings (20 steps, 1 cycle) uncond_short and the 5O45 binder hunts end
+"no cycle was eligible" (the alanine ceiling) - known from the earlier sweep, not a page fault.
+

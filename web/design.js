@@ -801,14 +801,14 @@ function showInput() {
   }
   conditionHost.style.display = "";
   // the strip is for picking the STRUCTURE's residues, so it is shown only when there is one
-  if (loaded === null) hideSequence();
+  if (!hasPickable()) hideSequence();
   else {
     showSequenceBox(true);
     sequenceHint.textContent = "Drag along the sequence to select residues.";
   }
   paintInput();
   window.SEQ?.clear?.();
-  if (loaded !== null) window.SEQ?.buildView?.();
+  if (hasPickable()) window.SEQ?.buildView?.();
   conditionEditor?.refreshSelection();
 }
 
@@ -819,6 +819,33 @@ function scheduleJobView() {
   if (inputView === null && viewer.built) { paintViewerBar(); return; }
   const ticket = ++jobRedraw;
   setTimeout(() => { if (ticket === jobRedraw) showInput(); }, 120);
+}
+
+/**
+ * Whether any of the loaded structure is left out of the job - a residue no "Keep" segment covers,
+ * or a ligand no ligand segment names - which is what the legend's "not used" grey means. 🔴 Keyed
+ * on a structure being loaded, it named a colour nothing on screen had (SAM's pocket, the
+ * unconditional example's placeholder).
+ */
+function unusedInput(spans) {
+  if (loaded === null) return false;
+  const placeholders = placeholderChains();
+  const codes = new Set(spans.filter((span) => span.kind === "ligand").map((span) => String(span.code).toUpperCase()));
+  const atoms = loaded.atoms;
+  for (let i = 0; i < atoms.chain_id.length; i += 1) {
+    const chain = String(atoms.chain_id[i]);
+    if (placeholders.has(chain)) continue;
+    const name = String(atoms.res_name[i]).trim().toUpperCase();
+    if (THREE_TO_ONE[name] === undefined && NUCLEOTIDE[name] === undefined) {
+      if (!codes.has(name)) return true;
+      continue;
+    }
+    const residue = Number(atoms.res_id[i]);
+    const kept = spans.some((span) => span.kind === "segment" && String(span.chain).trim() === chain
+      && residue >= Number(span.first) && residue <= Number(span.last));
+    if (!kept) return true;
+  }
+  return false;
 }
 
 /** The line over the viewer: what its colours mean, and the way back to the job from a design. */
@@ -844,7 +871,7 @@ function paintViewerBar() {
     key(ghostColour([...inputView.ghosts.values()][0].chain), "to be designed (a sketch of its length)");
   }
   if (first("segment") >= 0) key(chainColour(chainOf[first("segment")]), "kept from the structure");
-  if (loaded !== null) key(INPUT_COLOUR, "not used");
+  if (unusedInput(spans)) key(INPUT_COLOUR, "not used");
   if (hotspotResidues(spans).length > 0) key(HOTSPOT_COLOUR, "hotspot");
 }
 
@@ -995,7 +1022,7 @@ function selectedWithin(span) {
 
 /** The selection step is about a structure's residues, so it is shown while there is one. */
 function paintSelectionStep() {
-  element("step-constraints").hidden = loaded === null && (conditionEditor?.rows.length ?? 0) === 0;
+  element("step-constraints").hidden = !hasPickable() && (conditionEditor?.rows.length ?? 0) === 0;
 }
 
 conditionEditor = createConditionEditor(conditionHost, {
@@ -1233,6 +1260,12 @@ function paintPresetNote() {
       + " RFD4-Proteina, or pick another."
     : said ?? preset?.description ?? "";
   presetNote.classList.toggle("warn", cannot);
+  // 🔴 AND DESIGN SAYS SO TOO: a note reading "cannot run" over a button that runs anyway is two
+  // answers. Never while running, where the button is Stop.
+  if (running === null) {
+    huntButton.disabled = cannot;
+    huntButton.title = cannot ? `Protein Hunter cannot run this example: ${HUNTER_CANNOT[preset.id]}.` : "";
+  }
 }
 
 // What a preset carries beyond its contig: the conditions, the template structure, and the
@@ -1292,6 +1325,7 @@ function chooseExample(id) {
   element("partial").value = preset.partialTrajectoryFractionSteps === undefined
     ? "" : String(Math.round(preset.partialTrajectoryFractionSteps * 100));
   if (preset.nsteps !== undefined && method.value === "rfd4p") element("steps").value = String(preset.nsteps);
+  presetSpans = null;
   spanList.set(spans);
   presetSpans = JSON.stringify(spanList.read());
   paintPresetNote();
@@ -1334,8 +1368,12 @@ function chooseExample(id) {
  */
 function examplePieces(preset) {
   const spans = exampleSpans(preset, loaded.atoms);
+  // 🔴 NOT COMPARED WHILE IT LOADS: against the last example's spans, an example sharing its file
+  // (the three 1PRW ones) read its own loading as an edit and said so.
+  presetSpans = null;
   if (spans !== null) spanList.set(spans);
   presetSpans = JSON.stringify(spanList.read());
+  warnIgnoredEdit(spanList.read());
 }
 
 /**
@@ -1459,6 +1497,33 @@ function polymerOf(chain) {
   return "protein";
 }
 
+/**
+ * 🔴 A CHAIN THAT IS ONLY AN EXAMPLE'S PLACEHOLDER FOR WHAT IS DESIGNED (an expandable segment,
+ * one residue in the file) is not "chain A 1-1": it is where the design goes, and nothing in it can
+ * be kept, picked or aimed at.
+ */
+function placeholderChains() {
+  const placeholders = new Set();
+  if (loaded === null) return placeholders;
+  const ann = loaded.atoms?.annotations ?? {};
+  const sentinel = ann.annotation_expsegmin_1_residue ?? loaded.atoms?.annotation_expsegmin_1_residue;
+  if (!sentinel) return placeholders;
+  const real = new Set();
+  for (let i = 0; i < loaded.atoms.chain_id.length; i += 1) {
+    const chain = String(loaded.atoms.chain_id[i]);
+    if (Number(sentinel[i]) >= 0) placeholders.add(chain); else real.add(chain);
+  }
+  for (const chain of real) placeholders.delete(chain);
+  return placeholders;
+}
+
+/** Whether the loaded structure has anything to pick: a chain or ligand that is not a placeholder. */
+function hasPickable() {
+  if (loaded === null) return false;
+  const placeholders = placeholderChains();
+  return [...loaded.chains.keys()].some((chain) => !placeholders.has(chain));
+}
+
 const describeStructure = () => {
   element("clear-structure").hidden = loaded === null;
   paintSelectionStep();
@@ -1467,19 +1532,7 @@ const describeStructure = () => {
     structureNote.classList.remove("warn");
     return;
   }
-  // 🔴 A CHAIN THAT IS ONLY AN EXAMPLE'S PLACEHOLDER FOR WHAT IS DESIGNED (an expandable segment,
-  // one residue in the file) is not "chain A 1-1": it is where the design goes.
-  const ann = loaded.atoms?.annotations ?? {};
-  const sentinel = ann.annotation_expsegmin_1_residue ?? loaded.atoms?.annotation_expsegmin_1_residue;
-  const placeholders = new Set();
-  if (sentinel) {
-    const real = new Set();
-    for (let i = 0; i < loaded.atoms.chain_id.length; i += 1) {
-      const chain = String(loaded.atoms.chain_id[i]);
-      if (Number(sentinel[i]) >= 0) placeholders.add(chain); else real.add(chain);
-    }
-    for (const chain of real) placeholders.delete(chain);
-  }
+  const placeholders = placeholderChains();
   // 🔴 AND A CHAIN THAT IS ONLY A LIGAND IS NAMED AS ONE: "chain B 1-1" for SAM read as a broken file.
   const ligandOf = (chain) => {
     const names = new Set();
@@ -1501,6 +1554,7 @@ const describeStructure = () => {
   const pieces = [];
   if (parts.length > 0) pieces.push(`chain${parts.length === 1 ? "" : "s"} ${parts.join(", ")}`);
   if (ligands.length > 0) pieces.push(`ligand${ligands.length === 1 ? "" : "s"} ${ligands.join(", ")}`);
+  if (pieces.length === 0) pieces.push("only a placeholder for the design, nothing to keep");
   structureNote.textContent = [name, ...pieces].join(" \u00b7 ");
   structureNote.classList.remove("warn");
 };

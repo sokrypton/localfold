@@ -975,7 +975,13 @@ export function createContigList(rowsContainer, addControl, options = {}) {
         changed();
       });
       head.append(picker);
-      if (where) head.append(element("span", "contig-chain-tag", where));
+      // 🔴 THE CHAIN THIS SEGMENT BECOMES IN THE DESIGN, said as that: a "Keep" card reading "chain B"
+      // beside its own field "Chain A of the loaded structure" (the 5O45 binder) read as a contradiction.
+      if (where) {
+        const tag = element("span", "contig-chain-tag", chain !== null ? `\u2192 ${where}` : where);
+        if (chain !== null) tag.title = `Becomes ${where} of the design`;
+        head.append(tag);
+      }
       // a break has nothing to fill in: its card is one line saying what it does
       if (span.kind === "break") head.append(element("span", "contig-break", "the next segment starts a new chain"));
       const remove = element("button", "btn btn-grey btn-small entity-remove");
