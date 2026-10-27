@@ -425,6 +425,14 @@ const paintJob = () => {
 window.__designSpans = spanList;
 
 designerSelect.addEventListener("change", () => paintDesignerNote(spanList.read()));
+// A random seed, drawn on request rather than behind the reader's back: the box shows it, so the
+// same design can be made again.
+element("random-seed").addEventListener("click", () => {
+  const draw = new Uint32Array(1);
+  crypto.getRandomValues(draw);
+  element("seed").value = String(draw[0] % 1000000);
+  say(`seed ${element("seed").value} - press Design for a new design`);
+});
 for (const id of ["beam", "cycles", "runs"]) element(id).addEventListener("input", paintCost);
 paintCost();
 paintAdvanced();
@@ -615,12 +623,13 @@ const drawCycle = (record) => {
   // thing that changed - a loop closing, a helix straightening - is invisible
   // underneath the tumbling. `alignToReference` holds the chains the design is
   // NOT, so the designed chain is the only thing that moves.
-  if (reference === null) reference = record.pdb;
+  if (reference === null) { beginRunPicture(); reference = record.pdb; }
   const placed = reference === record.pdb ? record.pdb
     : alignToReference(record.pdb, reference, record.chain);
 
   showViewer();
   viewer.push(placed, (built) => { if (built) viewer.orient(); });
+  followSequence();
   // 🔴 COLOURED BY ROLE, NOT BY CONFIDENCE. The page's job is saying what is
   // being DECIDED, and pLDDT answers a different question - so the designed
   // chain takes the "free" colour and everything else the "target" one, the
@@ -797,7 +806,7 @@ function showInput() {
   // the strip is for picking the STRUCTURE's residues, so it is shown only when there is one
   if (loaded === null) hideSequence();
   else {
-    sequenceBox.style.display = "";
+    showSequenceBox(true);
     sequenceHint.textContent = "Drag along the sequence to select residues.";
   }
   paintInput();
@@ -851,6 +860,16 @@ function paintViewerBar() {
 // rebuilds on py2Dmol's frame change. It used to be hidden the moment a run began.
 const sequenceBox = element("sequence-viewer-container");
 const sequenceHint = element("sequence-hint");
+const stage = document.querySelector(".design-stage");
+/**
+ * Show or hide the strip. 🔴 THE VIEWER GIVES IT ROOM: the viewer is as tall as the window, and the
+ * strip under it was below the fold of a laptop screen - present, and invisible, through every run.
+ * The stage's class shortens the viewer by the strip's height (web/localfold.css).
+ */
+function showSequenceBox(on) {
+  sequenceBox.style.display = on ? "" : "none";
+  stage.classList.toggle("has-sequence", on);
+}
 window.SEQ?.setCallbacks?.({
   getRenderer: () => (sequenceBox.style.display === "none" ? null : viewer.renderer ?? null),
   getObjectSelect: () => null,
@@ -864,12 +883,33 @@ document.addEventListener("py2dmol-residue-selection-change", () => {
   if (sequenceBox.style.display !== "none") window.SEQ?.updateSelection?.();
   conditionEditor?.refreshSelection();
 });
+// ...synchronously: the deferred build waits for the next animation frame, so the strip trailed the
+// picture by a frame, and through a fast flow by several.
 document.addEventListener("py2dmol-frame-change", () => {
-  if (sequenceBox.style.display !== "none") window.SEQ?.buildViewDeferred?.();
+  if (sequenceBox.style.display !== "none") window.SEQ?.buildView?.();
 });
+/**
+ * A run's first frame takes the viewer: the job's drawing goes (a new object - a design's atom count
+ * is not the job's), and the strip turns to the design's sequence.
+ */
+function beginRunPicture() {
+  viewer.cancelAnimations();
+  viewer.reset();
+  inputView = null;
+  showRunSequence();
+}
+
+/**
+ * The strip, rebuilt for the frame just pushed. A frame that BUILDS the viewer (a run's first) raises
+ * no frame change, so without this the strip stayed empty through a hunt's whole first cycle.
+ */
+function followSequence() {
+  if (sequenceBox.style.display !== "none") window.SEQ?.buildView?.();
+}
+
 /** The strip over a design: its sequence, rebuilt as frames arrive (`py2dmol-frame-change`). */
 function showRunSequence() {
-  sequenceBox.style.display = "";
+  showSequenceBox(true);
   sequenceHint.textContent = "The design's sequence, as it changes.";
   window.SEQ?.clear?.();
   window.SEQ?.buildViewDeferred?.();
@@ -895,7 +935,7 @@ function takeGhostPick() {
 }
 /** Hide the strip: nothing with a sequence is drawn. */
 const hideSequence = () => {
-  sequenceBox.style.display = "none";
+  showSequenceBox(false);
   window.SEQ?.clear?.();
   conditionEditor?.refreshSelection();
 };
@@ -1023,12 +1063,9 @@ const startHunt = async () => {
   huntLabel.textContent = "Stop";
   resultsBody.replaceChildren();
   track.replaceChildren();
-  // A new hunt is a new object: the atom count changes with the binder's
-  // length, so frames cannot be shared with the last one.
-  viewer.cancelAnimations();
-  viewer.reset();
-  inputView = null;
-  showRunSequence();
+  // 🔴 THE JOB STAYS ON SCREEN UNTIL THE FIRST CYCLE REPLACES IT (`beginRunPicture`): loading the
+  // folding model and the first fold take seconds to minutes, and wiping the viewer and the strip
+  // at the click left two empty boxes for all of it.
   // A new run is a new frame of reference and a new held set.
   reference = null;
   held = hold;
@@ -1041,8 +1078,11 @@ const startHunt = async () => {
       // 🔴 RE-READ PER RUN, so a length RANGE becomes a search over lengths
       // rather than a notation the hunt ignores. `drawLengths` is deterministic
       // in the seed and the run, so the same hunt twice is the same hunt.
-      job: (run) => chainsOf(drawLengths(spans, { run, seed: number("seed", 0) }),
-        readers()),
+      job: (run) => {
+        const drawn = drawLengths(spans, { run, seed: number("seed", 0) });
+        // ...and its hotspots in that run's fold numbering (a drawn length moves what follows it)
+        return { ...chainsOf(drawn, readers()), hotspots: window.__designHotspots ?? hotspotsOf(drawn) };
+      },
       chains,
       chainKinds,
       ligandCodes,
@@ -1055,7 +1095,7 @@ const startHunt = async () => {
       // hotspots normally come from a `From structure` span, which needs a
       // structure loaded, and tools/check-design-page.py has to be able to force
       // an epitope that cannot be satisfied to prove the veto fires.
-      hotspots: window.__designHotspots ?? hotspotsOf(spans),
+      hotspots: window.__designHotspots ?? hotspotsOf(drawLengths(spans, { run: 0, seed: number("seed", 0) })),
       // 🔴 STILL A LIST, because web/hunt.js rotates one per cycle and that
       // capability is intact; the page asks for one.
       folders: [folders.value],
@@ -1554,12 +1594,14 @@ function rankOf(candidate) {
 /** One finished candidate, as a row and as the structure on screen. */
 function drawGenerated(candidate, total) {
   resultsBox.style.display = "";
+  if (reference === null) beginRunPicture();
   showViewer();
   // The finished structure is the last frame, in the same frame of reference as
   // the trajectory that led to it.
   viewer.push(reference === null ? candidate.pdb
     : alignToReference(candidate.pdb, reference, undefined),
   (built) => { if (built) viewer.orient(); });
+  followSequence();
   // 🔴 AND FRAMED ON THE FINISHED DESIGN: the viewer oriented on the trajectory's FIRST frame, which
   // is close to noise at another scale, so the design came out zoomed far into one corner.
   viewer.orient();
@@ -1758,13 +1800,10 @@ const startGenerate = async () => {
   }
   const controller = new AbortController();
   running = controller;
-  inputView = null;
-  showRunSequence();
+  // (the job stays drawn until the flow's first frame replaces it - see `beginRunPicture`)
   huntLabel.textContent = "Stop";
   resultsBody.replaceChildren();
   track.replaceChildren();
-  viewer.cancelAnimations();
-  viewer.reset();
   // A generation is one frame, so there is nothing to fit it onto and nothing
   // held: RFD4 conditions on given coordinates rather than holding a sequence.
   reference = null;
@@ -1789,7 +1828,7 @@ const startGenerate = async () => {
     if (controller.signal.aborted) break;
     // Each candidate is its own trajectory, so it gets its own frame of
     // reference and its own run of the viewer.
-    if (candidate > 0) { viewer.cancelAnimations(); viewer.reset(); reference = null; }
+    if (candidate > 0) reference = null;
     const result = await generate({
       contig,
       ...presetExtras,
@@ -1813,10 +1852,11 @@ const startGenerate = async () => {
         // moves the molecule as well as folding it, so played back raw the
         // trajectory tumbles. There is no designed chain to exclude here - the
         // whole thing is being generated - so the fit is over everything.
-        if (reference === null) reference = step.pdb;
+        if (reference === null) { beginRunPicture(); reference = step.pdb; }
         const placed = reference === step.pdb ? step.pdb
           : alignToReference(step.pdb, reference, undefined);
         viewer.push(placed, (built) => { if (built) viewer.orient(); });
+        followSequence();
       },
       // 🔴 A DIFFERENT SEED A CANDIDATE, or the beam draws the same structure
       // N times: the flow is deterministic given its seed, so N identical

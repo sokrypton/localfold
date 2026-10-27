@@ -49,7 +49,8 @@ export { FOLDERS } from "./validate-design.js";
  * @param {{ligands?: number, nucleic?: number}} [options.contents] what the
  *   target carries, for the automatic designer
  * @param {number} [options.runs=1]
- * @param {(run: number) => {chains: string[], length: number, hold: number[]}} [options.job]
+ * @param {(run: number) => {chains: string[], length: number, hold: number[],
+ *   hotspots?: Record<string, number[]>}} [options.job]
  *   re-read the job for this run, so a contig carrying a length RANGE draws a
  *   different length each time. Omitted means the fixed `chains` are used for
  *   every run, which is right whenever nothing is ranged.
@@ -183,7 +184,9 @@ export async function hunt(options) {
       // confident about a chain that is nowhere near.
       veto: ({ pdb }) => contactProblem(pdb, {
         chain: CHAIN_IDS[chainIndex],
-        ...(options.hotspots === undefined ? {} : { residues: options.hotspots }),
+        // a run's own, where its job carries them: a drawn length moves the residues after it
+        ...((drawn?.hotspots ?? options.hotspots) === undefined ? {}
+          : { residues: drawn?.hotspots ?? options.hotspots }),
         ...(options.hotspotsNeeded === undefined ? {} : { minimum: options.hotspotsNeeded }),
       }),
       percentX: options.percentX,

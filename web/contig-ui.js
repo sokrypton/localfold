@@ -366,31 +366,51 @@ export function modificationsOf(spans) {
   return out;
 }
 
+/** A hotspot field's residues, ranges expanded: `40 60-62` is 40, 60, 61, 62. */
+export function hotspotNumbers(text) {
+  return String(text ?? "").split(/[^0-9-]+/).filter(Boolean).flatMap((piece) => {
+    const [first, last = first] = piece.split(/(?<=\d)-/).map(Number);
+    return Array.from({ length: Math.max(0, last - first + 1) }, (_, k) => first + k);
+  });
+}
+
 /**
- * The hotspots a span list names, per chain, as plain numbers.
+ * The hotspots a span list names, as Protein Hunter's fold numbers them: per fold chain letter, by
+ * position along that chain from 1.
  *
- * 🔴 THE SAME FIELD FEEDS BOTH METHODS BY DIFFERENT ROUTES: RFD4 turns these
- * into a `C_HOT` condition and generates against them; Protein Hunter has no
- * conditioning, so it folds and then REJECTS a cycle whose binder is not
- * touching them. One thing asked for, two mechanisms, and the page says which.
+ * 🔴 THE FOLD'S NUMBERING, NOT THE STRUCTURE'S. Hunter folds the job and checks the design touches
+ * these residues in THAT prediction, whose chains are lettered by job order (CHAIN_IDS, as `chainsOf`
+ * builds them) and numbered from 1. This returned the structure's chain id and residue numbers, which
+ * agree only when the target is the job's chain of that letter and numbered from 1 - true of the
+ * PD-L1 example and nothing else: a target kept as B5-50 behind a designed chain was asked for B10,
+ * the fold's B10 being the structure's B14. A kept segment's residue r sits at its chain's running
+ * length plus r - first + 1; a sequence's hotspots are already positions along it.
  *
- * @param {object[]} spans
+ * (RFD4-Proteina reads the structure's own numbering, through `conditionsOf`.)
+ *
+ * @param {object[]} spans with any length ranges already drawn (`drawLengths`): a designed range
+ *   before a hotspot in the same chain moves it
  * @returns {Record<string, number[]>|undefined}
  */
 export function hotspotsOf(spans) {
+  const chainOf = chainOfSpans(spans);
+  const running = new Map();
   const hot = new Map();
-  for (const span of spans) {
-    if (span.kind !== "segment") continue;
-    const chain = String(span.chain ?? "").trim();
-    // 🔴 A RANGE IS EVERY RESIDUE IN IT: `60-64` split on non-digits was 60 and 64 alone, so a hunt
-    // was aimed at the two ends of the site the card names.
-    const residues = String(span.hotspots ?? "").split(/[^0-9-]+/).filter(Boolean).flatMap((piece) => {
-      const [first, last = first] = piece.split(/(?<=\d)-/).map(Number);
-      return Array.from({ length: Math.max(0, last - first + 1) }, (_, k) => first + k);
-    });
-    if (chain.length === 0 || residues.length === 0) continue;
-    hot.set(chain, [...(hot.get(chain) ?? []), ...residues]);
-  }
+  spans.forEach((span, index) => {
+    const chain = chainOf[index];
+    if (chain === null) return;
+    const before = running.get(chain) ?? 0;
+    const length = span.kind === "generated" ? number(span.min, 0)
+      : span.kind === "sequence" ? String(span.value ?? "").trim().length
+        : span.kind === "segment" ? Math.max(0, number(span.last, 0) - number(span.first, 0) + 1) : 0;
+    running.set(chain, before + length);
+    if (span.kind !== "segment" && span.kind !== "sequence") return;
+    const at = hotspotNumbers(span.hotspots).map((r) => (span.kind === "segment" ? r - number(span.first, 0) + 1 : r))
+      .filter((p) => p >= 1 && p <= length).map((p) => before + p);
+    if (at.length === 0) return;
+    const letter = CHAIN_IDS[chain];
+    hot.set(letter, [...(hot.get(letter) ?? []), ...at]);
+  });
   return hot.size === 0 ? undefined : Object.fromEntries(hot);
 }
 
@@ -889,8 +909,8 @@ export const ADD_CHOICES = [
  * "⋯" button - a binder's hotspots among them - so the thing that makes a binder a binder was one
  * click away from where its target was named, and the page drew a separate hotspot line to make up
  * for it. Each card now shows what that segment is: a length, a chain and its residues and the
- * hotspots on them, a sequence and what it is made of, a ligand's code. Only the rare settings
- * (modified residues, a span's label) are under "More".
+ * hotspots on them, a sequence and what it is made of, a ligand's code - as a two-column form, a
+ * label beside each control, one setting a line.
  *
  * 🔴 AND A CONTROL THE METHOD CANNOT USE IS NOT DRAWN. Secondary structure and a designed span's
  * polymer are RFD4-Proteina's; under Protein Hunter they are absent, and a value an example set is
@@ -911,9 +931,8 @@ export function createContigList(rowsContainer, addControl, options = {}) {
   const notify = options.onChange ?? (() => {});
   const methodOf = options.method ?? (() => "rfd4p");
   let spans = (options.initial ?? [emptySpan("generated")]).map((span) => ({ ...span }));
-  // Which cards have "More" open, and which one a click elsewhere (the diagram, the viewer) pointed
-  // at. Kept outside `spans`: they are about looking, not about the job.
-  const open = new Set();
+  // Which card a click elsewhere (the diagram, the viewer) pointed at. Kept outside `spans`: it is
+  // about looking, not about the job.
   let selected = -1;
   let uid = 0;
 
@@ -968,26 +987,35 @@ export function createContigList(rowsContainer, addControl, options = {}) {
       remove.disabled = spans.length === 1;
       remove.addEventListener("click", () => {
         spans.splice(index, 1);
-        open.clear();
         selected = -1;
         changed();
       });
       head.append(remove);
       row.append(head);
 
-      // ---- the fields ---------------------------------------------------------------------------
+      // ---- the fields: a two-column form, one setting a line ----------------------------------
+      // 🔴 LABEL LEFT, CONTROL RIGHT, ONE LINE EACH (2026-10-27, third pass). The fields flowed and
+      // wrapped where they happened to fit, with a "More" disclosure pushing more of them into the same
+      // flow - so a label could sit at the end of one line and its box at the start of the next, and a
+      // card read as a jumble. A grid keeps every label beside its control at any width.
       const fields = element("div", "contig-fields");
-      const more = element("div", "contig-more-fields");
       const notes = [];
       const id = () => `contig-${index}-${uid += 1}`;
-      /** A labelled control: the label is a real <label>, so a screen reader and a click both find it. */
-      const field = (labelText, control, className = "") => {
-        const wrap = element("div", `contig-field ${className}`.trim());
-        control.id = control.id || id();
+      /** One line of the form: its label, and the control(s) it names. */
+      const line = (labelText, controls, { className = "", hint } = {}) => {
         const label = element("label", "contig-label", labelText);
-        label.htmlFor = control.id;
-        wrap.append(label, control);
-        return wrap;
+        const first = controls.find((c) => c instanceof HTMLInputElement || c instanceof HTMLSelectElement
+          || c instanceof HTMLTextAreaElement);
+        if (first) {
+          first.id = first.id || id();
+          label.htmlFor = first.id;
+        }
+        if (className === "contig-hot") label.classList.add("contig-label-hot");
+        const cell = element("div", `contig-control ${className}`.trim());
+        cell.append(...controls);
+        if (hint) cell.append(element("div", "contig-hint", hint));
+        fields.append(label, cell);
+        return cell;
       };
       const bind = (input, key, transform = (value) => value) => {
         input.addEventListener("input", () => {
@@ -1029,7 +1057,6 @@ export function createContigList(rowsContainer, addControl, options = {}) {
         return control;
       };
       const tick = (labelText, title, key) => {
-        const wrap = element("label", "contig-redesign");
         const box = element("input");
         box.type = "checkbox";
         box.checked = span[key] === true;
@@ -1038,87 +1065,16 @@ export function createContigList(rowsContainer, addControl, options = {}) {
           spans[index] = { ...spans[index], [key]: box.checked };
           changed();
         });
-        wrap.append(box, element("span", undefined, labelText));
-        return wrap;
+        return line(labelText, [box, element("span", "contig-unit", title)], { className: "contig-redesign" });
       };
-      const range = (labelText, a, b) => {
-        const wrap = element("div", "contig-field contig-range");
-        a.id = id();
-        const label = element("label", "contig-label", labelText);
-        label.htmlFor = a.id;
-        wrap.append(label, a, element("span", "contig-label", "to"), b);
-        return wrap;
-      };
-
-      if (span.kind === "generated") {
-        fields.append(range("Length",
-          numberBox(span.min ?? 75, "How many residues to design - the shortest, if you give a range.", "min"),
-          numberBox(span.max ?? span.min ?? 75, "The longest. Leave it equal to design exactly one length.",
-            "max", "longest length")),
-        element("span", "contig-unit", "residues"));
-        if (rfd4) {
-          const secondary = element("select", "entity-picker");
-          secondary.title = "Ask for this segment's secondary structure.";
-          for (const [v, label] of Object.entries(SPAN_STRUCTURES)) {
-            const option = element("option", undefined, label);
-            option.value = v;
-            option.selected = v === (span.secondary ?? "");
-            secondary.append(option);
-          }
-          secondary.addEventListener("change", () => {
-            // 🔴 A SECONDARY STRUCTURE NEEDS A LABEL TO BE ASKED FOR (C_SEC selects a span by the name
-            // the contig gives it), so one is made here rather than left for the reader to discover.
-            let name = String(spans[index].name ?? "").trim();
-            if (secondary.value !== "" && name === "") {
-              const taken = new Set(spans.map((other) => String(other.name ?? "").trim()));
-              const letter = { HELIX: "h", SHEET: "s", LOOP: "l" }[secondary.value] ?? "x";
-              let n = 1;
-              while (taken.has(`${letter}${n}`)) n += 1;
-              name = `${letter}${n}`;
-            }
-            spans[index] = { ...spans[index], secondary: secondary.value, name };
-            changed();
-          });
-          fields.append(field("Secondary structure", secondary));
-          fields.append(field("Made of", pick("What this segment is made of.",
-            [["protein", "protein"], ["rna", "RNA"], ["dna", "DNA"]], "polymer", span.polymer ?? "protein")));
-          more.append(field("Label", text("contig-name", span.name, "h1",
-            "A label, so a condition can name this segment. Letters and digits.", "name", (v) => v.trim())));
-        }
-        if (number(span.max, 0) !== number(span.min, 0) && limits.range !== undefined) notes.push(limits.range);
-        if ((String(span.name ?? "").trim() || String(span.secondary ?? "").trim()) && limits.labelled !== undefined) {
-          notes.push(limits.labelled);
-        }
-      } else if (span.kind === "sequence") {
-        fields.append(field("Made of", pick("What this chain is. A nucleic chain folds one token per base.",
-          [["protein", "protein"], ["dna", "DNA"], ["rna", "RNA"]], "polymer", span.polymer ?? "protein")));
-        const value = element("textarea", "entity-value contig-sequence");
-        value.value = String(span.value ?? "");
-        value.rows = 2;
-        value.spellcheck = false;
-        value.placeholder = span.polymer === "dna" ? "e.g. ATGCATGC" : span.polymer === "rna" ? "e.g. AUGCAUGC"
-          : "one-letter sequence, e.g. MKTAYIAK";
-        value.title = "A chain whose sequence you know.";
-        bind(value, "value", (raw) => raw.replace(/\s+/g, "").toUpperCase());
-        fields.append(field("Sequence", value, "contig-field-wide"),
-          tick("Redesign these residues", "Keep their place and number, but let the designer rewrite them.", "redesign"));
-        if (limits.sequence !== undefined) notes.push(limits.sequence);
-      } else if (span.kind === "segment") {
-        const chainBox = text("contig-chain", span.chain ?? "A", undefined,
-          "Which chain of the loaded structure.", "chain", (v) => v.trim());
-        chainBox.maxLength = 4;
-        fields.append(field("Chain", chainBox),
-          range("Residues",
-            numberBox(span.first ?? 1, "First residue, by the structure's own numbering.", "first"),
-            numberBox(span.last ?? 100, "Last residue, inclusive.", "last", "last residue")));
-        // 🔴 THE HOTSPOTS ARE THIS SEGMENT'S, SO THEY ARE ON ITS CARD: the residues of this piece the
-        // design should touch - the site a binder is aimed at - for both methods (RFD4 conditions on
-        // them; Protein Hunter rejects a cycle whose design does not touch them).
+      const word = (t) => element("span", "contig-unit", t);
+      /** A segment's hotspots: a box, Use selection, and what a hotspot is - the same on both given kinds. */
+      const hotspots = (what) => {
         const hot = text("contig-hotspots", span.hotspots, "e.g. 54 56 60-64",
-          "Hotspots: residues of this segment the design should touch (the site to bind), by the"
-          + " structure's numbering.", "hotspots", (v) => v.trim());
-        const hotField = field("Hotspots", hot, "contig-field-hot");
-        if (options.hotspotsFromSelection) {
+          `Hotspots: residues of this segment the design should touch (the site to bind), ${what}.`,
+          "hotspots", (v) => v.trim());
+        const controls = [hot];
+        if (options.hotspotsFromSelection && span.kind === "segment") {
           const use = element("button", "btn btn-grey btn-small contig-use-selection", "Use selection");
           use.type = "button";
           use.title = "Set this segment's hotspots to the residues selected in the viewer or the sequence.";
@@ -1133,41 +1089,97 @@ export function createContigList(rowsContainer, addControl, options = {}) {
               row.append(note);
             }
           });
-          hotField.append(use);
+          controls.push(use);
         }
-        fields.append(hotField,
-          tick("Redesign these residues", "Keep their place and number, but let the designer rewrite them.", "redesign"));
+        line("Hotspots", controls, { className: "contig-hot",
+          hint: `Residues the design should touch - the site to bind - ${what}.` });
+      };
+
+      if (span.kind === "generated") {
+        line("Length", [
+          numberBox(span.min ?? 75, "How many residues to design - the shortest, if you give a range.", "min"),
+          word("to"),
+          numberBox(span.max ?? span.min ?? 75, "The longest. Leave it equal to design exactly one length.",
+            "max", "longest length"),
+          word("residues")]);
+        if (rfd4) {
+          const secondary = element("select", "entity-picker");
+          secondary.title = "Ask for this segment's secondary structure.";
+          for (const [v, label] of Object.entries(SPAN_STRUCTURES)) {
+            const option = element("option", undefined, label);
+            option.value = v;
+            option.selected = v === (span.secondary ?? "");
+            secondary.append(option);
+          }
+          secondary.addEventListener("change", () => {
+            // 🔴 A SECONDARY STRUCTURE NEEDS A LABEL TO BE ASKED FOR (C_SEC selects a segment by the name
+            // the contig gives it), so one is made here rather than left for the reader to find.
+            let name = String(spans[index].name ?? "").trim();
+            if (secondary.value !== "" && name === "") {
+              const taken = new Set(spans.map((other) => String(other.name ?? "").trim()));
+              const letter = { HELIX: "h", SHEET: "s", LOOP: "l" }[secondary.value] ?? "x";
+              let n = 1;
+              while (taken.has(`${letter}${n}`)) n += 1;
+              name = `${letter}${n}`;
+            }
+            spans[index] = { ...spans[index], secondary: secondary.value, name };
+            changed();
+          });
+          line("Structure", [secondary]);
+          line("Made of", [pick("What this segment is made of.",
+            [["protein", "protein"], ["rna", "RNA"], ["dna", "DNA"]], "polymer", span.polymer ?? "protein")]);
+        }
+        if (number(span.max, 0) !== number(span.min, 0) && limits.range !== undefined) notes.push(limits.range);
+        if ((String(span.name ?? "").trim() || String(span.secondary ?? "").trim()) && limits.labelled !== undefined) {
+          notes.push(limits.labelled);
+        }
+      } else if (span.kind === "sequence") {
+        line("Made of", [pick("What this chain is. A nucleic chain folds one token per base.",
+          [["protein", "protein"], ["dna", "DNA"], ["rna", "RNA"]], "polymer", span.polymer ?? "protein")]);
+        const value = element("textarea", "entity-value contig-sequence");
+        value.value = String(span.value ?? "");
+        value.rows = 2;
+        value.spellcheck = false;
+        value.placeholder = span.polymer === "dna" ? "e.g. ATGCATGC" : span.polymer === "rna" ? "e.g. AUGCAUGC"
+          : "one-letter sequence, e.g. MKTAYIAK";
+        value.title = "A chain whose sequence you know.";
+        bind(value, "value", (raw) => raw.replace(/\s+/g, "").toUpperCase());
+        line("Sequence", [value]);
+        // A target given by its sequence can be aimed at too, under Protein Hunter (RFD4 needs coordinates).
+        if ((span.polymer ?? "protein") === "protein" && !rfd4) hotspots("numbered from 1 along this sequence");
+        tick("Redesign", "let the designer rewrite these residues", "redesign");
+        line("Modified", [text("contig-modified", span.modifications, "e.g. 16:SEP",
+          "Modified residues, as position:CCD code. Positions are 1-based within the segment.",
+          "modifications", (v) => v.trim())]);
+        if (limits.sequence !== undefined) notes.push(limits.sequence);
+      } else if (span.kind === "segment") {
+        const chainBox = text("contig-chain", span.chain ?? "A", undefined,
+          "Which chain of the loaded structure.", "chain", (v) => v.trim());
+        chainBox.maxLength = 4;
+        line("Chain", [chainBox, word("of the loaded structure")]);
+        line("Residues", [
+          numberBox(span.first ?? 1, "First residue, by the structure's own numbering.", "first"),
+          word("to"),
+          numberBox(span.last ?? 100, "Last residue, inclusive.", "last", "last residue")]);
+        // 🔴 THE HOTSPOTS ARE THIS SEGMENT'S, SO THEY ARE ON ITS CARD, for both methods (RFD4 conditions
+        // on them; Protein Hunter rejects a cycle whose design does not touch them).
+        hotspots("by the structure's numbering");
+        tick("Redesign", "let the designer rewrite these residues", "redesign");
+        line("Modified", [text("contig-modified", span.modifications, "e.g. 16:SEP",
+          "Modified residues, as position:CCD code. Positions are 1-based within the segment.",
+          "modifications", (v) => v.trim())]);
         if (String(span.hotspots ?? "").trim().length > 0 && limits.hotspots !== undefined) notes.push(limits.hotspots);
       } else if (span.kind === "ligand") {
         const code = text("contig-code", span.code, "e.g. SAM",
           "The ligand's CCD code, as the PDB names it.", "code", (v) => v.trim().toUpperCase());
         code.maxLength = 5;
-        fields.append(field("CCD code", code));
+        line("CCD code", [code]);
         if (limits.ligand !== undefined) notes.push(limits.ligand);
-      }
-
-      // Modified residues, for the two given kinds: rare, so under "More".
-      if (span.kind === "sequence" || span.kind === "segment") {
-        more.append(field("Modified residues", text("contig-modified", span.modifications, "e.g. 16:SEP",
-          "Modified residues, as position:CCD code. Positions are 1-based within the segment.",
-          "modifications", (v) => v.trim())));
       }
       if (fields.childElementCount > 0) row.append(fields);
       for (const reason of notes) {
         row.classList.add("contig-row-unavailable");
         row.append(element("div", "option-note warn contig-reason", reason));
-      }
-      if (more.childElementCount > 0) {
-        // 🔴 SAYS WHEN SOMETHING BEHIND IT IS SET, so a closed card still admits to a modification.
-        const details = element("details", "contig-more");
-        details.open = open.has(index);
-        const set = [span.modifications, rfd4 ? span.name : ""].some((v) => String(v ?? "").trim().length > 0);
-        const summary = element("summary", undefined, set ? "More (set)" : "More");
-        details.append(summary, more);
-        details.addEventListener("toggle", () => {
-          if (details.open) open.add(index); else open.delete(index);
-        });
-        row.append(details);
       }
       row.addEventListener("focusin", () => {
         if (selected === index) return;
@@ -1201,7 +1213,6 @@ export function createContigList(rowsContainer, addControl, options = {}) {
     set(next) {
       spans = (next ?? []).map((span) => ({ ...span }));
       if (spans.length === 0) spans = [emptySpan("generated")];
-      open.clear();
       selected = -1;
       changed();
     },

@@ -1288,13 +1288,14 @@
 .contig-head .contig-break { min-width: 0; }
 .contig-chain-tag { font-size: 12px; font-weight: 600; color: var(--chain-colour, #6b7280); white-space: nowrap; }
 .contig-head .entity-remove { margin-left: auto; }
-.contig-field { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; min-width: 0; }
-.contig-field-wide { flex: 1 1 100%; flex-direction: column; align-items: stretch; gap: 3px; }
-.contig-field-hot { flex: 1 1 100%; }
-.contig-field-hot .contig-hotspots { flex: 1 1 8ch; width: auto; min-width: 8ch; }
+.contig-control { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; min-width: 0; }
 .contig-unit { font-size: 12px; color: #6b7280; }
-.contig-more > summary { cursor: pointer; font-size: 12px; color: #6b7280; width: fit-content; }
-.contig-more-fields { display: flex; flex-wrap: wrap; gap: 6px 12px; padding-top: 6px; }
+.contig-hint { flex: 1 1 100%; font-size: 12px; color: #6b7280; line-height: 1.35; }
+/* the hotspots line is the one a binder is made of, so it is marked in the hotspot colour */
+.contig-hot { padding: 6px 8px; border-left: 3px solid #f59e0b; background: #fffbeb; border-radius: 0 6px 6px 0; }
+.contig-label-hot { font-weight: 600; color: #b45309; }
+.contig-hot .contig-hotspots { flex: 1 1 10ch; width: auto; min-width: 10ch; }
+.contig-redesign { color: #374151; }
 
 /* WHICH CHAIN THIS BLOCK IS, as the colour it will be in the viewer. The bar is
    a ::before rather than a grid child because this is a three-track grid whose
@@ -1319,12 +1320,13 @@
 /* One line, and it stays one line: the fields of a kind are few enough to fit,
    and the two that are not - a sequence and its extras - get the row below. */
 .contig-fields {
-  display: flex;
+  display: grid;
+  grid-template-columns: 5.5rem minmax(0, 1fr);
   align-items: center;
-  flex-wrap: wrap;
-  gap: 8px 14px;
+  gap: 8px 10px;
   min-width: 0;
 }
+.contig-fields > .contig-label { align-self: center; }
 
 /* The words between the controls. They carry the row's grammar: "residues 5 to
    20" reads, three bare number boxes do not. */
@@ -1343,7 +1345,7 @@
 .contig-code { width: 6ch; padding: 6px 8px; text-transform: uppercase; }
 .contig-name { width: 5ch; padding: 6px 8px; }
 .contig-hotspots { width: 9ch; padding: 6px 8px; }
-.contig-modified { width: 9ch; padding: 6px 8px; }
+.contig-modified { width: 14ch; padding: 6px 8px; }
 
 /* A sequence is the one field that wants the room, so it takes what is left. */
 .contig-sequence {
@@ -1366,14 +1368,6 @@
 .contig-row-unavailable .entity-picker { border-color: #fbbf24; }
 .contig-reason { flex: 1 1 100%; }
 
-.contig-redesign {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  font-size: 12px;
-  color: #374151;
-  white-space: nowrap;
-}
 
 /* WHAT THE SPANS AMOUNT TO, between the list and the settings: the notation the
    chosen method is actually asked in, and anything wrong with the job. */
@@ -1524,6 +1518,13 @@
 .design-stage #viewerWrapper, .design-stage #canvasContainer { width: 100% !important; }
 /* ...and as tall as the window leaves, which py2Dmol's observer follows the same way. */
 .design-stage #canvasContainer { height: var(--viewer-height) !important; }
+/* 🔴 AND SHORTER BY THE STRIP WHEN THE STRIP IS UP, so both are on screen: a window-tall viewer put the
+   strip below the fold, where through a run it read as gone. A long sequence scrolls inside its box. */
+.design-stage.has-sequence { --viewer-height: max(320px, calc(100vh - 360px)); }
+.design-stage #sequence-viewer-container { flex: 0 0 auto; }
+.design-stage #sequenceView { max-height: 104px; overflow-y: auto; }
+.seed-field { display: inline-flex; align-items: center; gap: 4px; }
+.seed-field input { width: 9ch; }
 .viewer-bar { display: flex; align-items: center; gap: 10px; min-height: 26px; }
 .viewer-bar [hidden] { display: none !important; }
 .viewer-bar #show-job { margin-left: auto; }
@@ -1564,6 +1565,7 @@
 
 @media (max-width: 980px) {
   .design-layout { grid-template-columns: minmax(0, 1fr); --viewer-height: min(70vh, 100vw); }
+  .design-stage.has-sequence { --viewer-height: min(60vh, 100vw); }
   /* one column: the picture is a section in the page's flow, not a pane beside it - and it comes
      right after the goal, so choosing one shows the job (and Generate) without scrolling past
      every step. The steps' box dissolves so its sections can be ordered around the stage. */

@@ -146,6 +146,19 @@ The style IS index.html's: py2Dmol's light application CSS plus web/localfold.cs
                             <input type="number" id="beam" min="1" max="16" value="1"
                                 title="How many designs to make, each from its own seed. The best is marked.">
                         </div>
+                        <!-- 🔴 THE SEED IS A MAIN SETTING, with a die beside it: a new seed is a new design,
+                             and the same seed is the same design again - which is what a reader wants to know
+                             before pressing Design twice. -->
+                        <div class="fetch-option-group" id="seedGroup">
+                            <label class="fetch-option-title" for="seed">Seed</label>
+                            <span class="seed-field">
+                                <input type="number" id="seed" min="0" value="0"
+                                    title="The same job, settings and seed give the same design. A new seed is a new design.">
+                                <button type="button" id="random-seed" class="btn btn-grey btn-small"
+                                    title="Draw a random seed" aria-label="Draw a random seed">
+                                    <i class="fa-solid fa-dice" aria-hidden="true"></i></button>
+                            </span>
+                        </div>
                         <div class="fetch-option-group" id="cyclesGroup">
                             <label class="fetch-option-title" for="cycles">Cycles</label>
                             <input type="number" id="cycles" min="1" max="50" value="5"
@@ -156,11 +169,6 @@ The style IS index.html's: py2Dmol's light application CSS plus web/localfold.cs
                             <label class="fetch-option-title" id="steps-title" for="steps">Flow steps</label>
                             <input type="number" id="steps" min="4" max="400" value="60"
                                 title="How many sampling steps each structure takes.">
-                        </div>
-                        <div class="fetch-option-group advanced" id="seedGroup">
-                            <label class="fetch-option-title" for="seed">Seed</label>
-                            <input type="number" id="seed" min="0" value="0"
-                                title="The same job, settings and seed give the same result.">
                         </div>
 
                         <!-- RFD4-Proteina's sampler, as AtomWorks Studio offers it. -->

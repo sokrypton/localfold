@@ -313,6 +313,31 @@ constraint at all, which decides whether this is plumbing or a port.
   - the SAM example's own file names its ligand `S;M`, which is now shown as the
     contig's `SAM`.
 
+  **Second round, same day** (from a reader's report: the sequence "not changing"
+  and its box "disappearing" during a design, hotspots hard to find, and the cards
+  hard to read):
+  - **The strip was below the fold.** The viewer was as tall as the window, so the
+    strip under it was off screen on a laptop through every run. The stage now
+    shortens the viewer while the strip is up (`has-sequence`).
+  - **Pressing Design blanked the picture.** It wiped the viewer and the strip for
+    the whole model load and first fold. The job now stays drawn until the run's
+    first frame (`beginRunPicture`).
+  - **The strip trailed the picture.** It waited a frame to rebuild, and stayed
+    empty through a hunt's first cycle because building the viewer raises no
+    frame change. It now follows every frame as it lands.
+  - **Cards are a two-column form,** label beside control, one setting a line, with
+    no "More". The hotspots line is marked in the hotspot colour and says what a
+    hotspot is. A protein-sequence target takes hotspots too, under Protein Hunter.
+  - **Seed** is a main Run setting with a die beside it.
+  - 🔴 **Protein Hunter was checking hotspots in the wrong numbering.** It was given
+    the structure's chain letter and residue numbers; it checks its own fold, whose
+    chains are lettered by job order and numbered from 1. The two agree only for
+    the PD-L1 example: a target kept as B5-50 was asked for the fold's B14 when the
+    reader meant B10. `hotspotsOf` now numbers them as the fold does, per run
+    (`test/contig-ui.test.js`).
+  - Not a bug: RFD4-Proteina at 20 steps designs a 100-mer as poly-alanine (seed 0),
+    and the strip shows it. At the page's 60 it does not.
+
   `tools/check-design-page.py` holds the new order, labels on every control, the
   binder under both methods, Add a segment, Use selection, and the strip during
   and after a real hunt. With `--presets` it runs every example as a generation

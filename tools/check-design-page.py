@@ -411,6 +411,19 @@ def main():
             bad.append(f"Use selection on the target's card set its hotspots to {added['used']!r}, expected 10-12")
         cdp.evaluate(ws, choose % "")
 
+        # 🔴 THE SEED IS A MAIN SETTING, beside a die that draws a new one - in view, not in Advanced.
+        seed = json.loads(cdp.evaluate(ws, """(() => {
+          const box = document.getElementById('seed');
+          const shown = box.offsetParent !== null;
+          const die = document.getElementById('random-seed');
+          die.click(); const a = box.value; die.click(); const b = box.value;
+          box.value = '0';
+          return JSON.stringify({ shown, a, b, said: document.getElementById('status-message').textContent });
+        })()"""))
+        print(f"  seed: {seed}")
+        if not seed["shown"] or not seed["a"].isdigit() or seed["a"] == seed["b"] or "seed" not in seed["said"]:
+            bad.append(f"the seed is not a visible setting with a die that draws a new one: {seed}")
+
         # 🔴 UNDER PROTEIN HUNTER, THE DEFAULT: its own controls, its notes, its examples - and the
         # page's old default job, set here, described to it.
         cdp.evaluate(ws, """(() => {

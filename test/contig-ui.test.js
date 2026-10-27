@@ -417,6 +417,24 @@ describe("the design job as a list of spans", () => {
       expect(hotspotsOf(spans)).toEqual({ A: [12, 14] });
       expect(hotspotsOf([{ kind: "generated", min: 9, max: 9 }])).toBe(undefined);
     });
+
+    // 🔴 HUNTER CHECKS THEM IN ITS OWN FOLD, whose chains are lettered by job order and numbered from 1
+    // - which agrees with the structure's numbering only by coincidence.
+    it("numbers hotspots as Protein Hunter's fold does", () => {
+      // a target kept as B5-50 behind the designed chain is the fold's chain B, its B14 the fold's B10
+      expect(hotspotsOf([{ kind: "generated", min: 60, max: 60 }, { kind: "break" },
+        { kind: "segment", chain: "B", first: 5, last: 50, hotspots: "14 20-21" }]))
+        .toEqual({ B: [10, 16, 17] });
+      // structure chain A kept as the job's SECOND chain is the fold's B
+      expect(hotspotsOf([{ kind: "generated", min: 30, max: 30 }, { kind: "break" },
+        { kind: "segment", chain: "A", first: 1, last: 40, hotspots: "12" }])).toEqual({ B: [12] });
+      // a kept piece after designed residues in one chain is offset by them
+      expect(hotspotsOf([{ kind: "generated", min: 7, max: 7 },
+        { kind: "segment", chain: "A", first: 101, last: 120, hotspots: "101" }])).toEqual({ A: [8] });
+      // a target given by its sequence, positions along it; one outside the segment is dropped
+      expect(hotspotsOf([{ kind: "sequence", value: "ACDEFGHIKL", hotspots: "3 4 99" }, { kind: "break" },
+        { kind: "generated", min: 20, max: 20 }])).toEqual({ A: [3, 4] });
+    });
   });
 });
 describe("an annotated example's pieces, read off its file", () => {
