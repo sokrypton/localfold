@@ -1493,6 +1493,10 @@
 /* the job at a glance: a row per chain, a block per piece */
 .chain-diagram { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
 .chain-diagram:empty { display: none; }
+.hotspot-line { display: flex; flex-wrap: wrap; align-items: center; gap: 0 6px; margin: -2px 0 10px; font-size: 13px; }
+.hotspot-line[hidden] { display: none; }
+.chain-block-hot { display: inline-block; padding: 1px 5px; border-radius: 8px; background: #f59e0b; color: #111827; font-weight: 600; }
+.hotspot-line .hotspot-what { color: #6b7280; }
 .chain-row { display: flex; align-items: center; gap: 8px; }
 .chain-name { width: 14px; font-size: 12px; font-weight: 700; color: var(--chain-colour, #6b7280); }
 .chain-track { display: flex; flex: 1 1 auto; gap: 2px; min-width: 0; }

@@ -419,3 +419,28 @@ describe("the design job as a list of spans", () => {
     });
   });
 });
+describe("an annotated example's pieces, read off its file", () => {
+  // 🔴 THE FILE IS THE JOB FOR THESE EXAMPLES, NOT THEIR CONTIG: the binder's contig says "keep
+  // A18-132, design 76", while what runs designs chain A at 50-120 against chain B 1-115.
+  it("reads every shipped example as what it runs", async () => {
+    const { readFileSync } = await import("node:fs");
+    const { decompress } = await import("../shared/rfd4p/vendor/fzstd.js");
+    const { parseCifToAtomArray } = await import("../shared/rfd4p/pipeline/cif.js");
+    const { spansFromAnnotatedAtoms } = await import("../web/contig-ui.js");
+    const show = (spans) => spans && spans.map((s) => (s.kind === "generated" ? `${s.min}-${s.max}`
+      : s.kind === "segment" ? `${s.chain}${s.first}-${s.last}` : s.kind === "ligand" ? `lig ${s.code}` : "/")).join(" ");
+    const want = {
+      ppi_pdl1: "50-120 / B1-115",
+      motif_idx_1prw: "5-20 A1-20 10-25 A22-41 5-20",
+      motif_unidx_1prw: "60-105 A1-40",
+      sm_sam: "lig S;M / 120-165",
+      dna_7m5w: "A1-9 / B1-10 / 120-150",
+      uncond_short: "100-100",
+      "5o45_cropped": null,
+    };
+    for (const [name, expected] of Object.entries(want)) {
+      const atoms = parseCifToAtomArray(decompress(new Uint8Array(readFileSync(new URL(`../web/examples/${name}.cif.zst`, import.meta.url)))));
+      expect(`${name}: ${show(spansFromAnnotatedAtoms(atoms))}`).toBe(`${name}: ${expected}`);
+    }
+  });
+});

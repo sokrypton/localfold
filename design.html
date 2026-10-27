@@ -83,6 +83,10 @@ The style IS index.html's: py2Dmol's light application CSS plus web/localfold.cs
                          structure (solid), designed (striped), a ligand (chip). Clicking a block
                          opens its row below. -->
                     <div id="chain-diagram" class="chain-diagram" aria-label="The design, chain by chain"></div>
+                    <!-- 🔴 HOTSPOTS, NAMED AND DEFINED IN ONE PLACE: wherever they were set - the
+                         example's structure, a kept piece's settings, a constraint - this says which
+                         residues they are and what they mean, and the viewer paints them amber. -->
+                    <div id="hotspot-line" class="hotspot-line" hidden></div>
                     <div class="fetch-row" id="design-input-container">
                         <div class="entity-list">
                             <div id="contig-rows"></div>

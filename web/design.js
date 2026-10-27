@@ -18,7 +18,7 @@
  */
 import {
   chainColour, chainOfSpans, chainsOf, CONDITION_COLOURS, conditionsOf, contigOf, createContigList,
-  drawChainDiagram, drawLengths, hotspotsOf, INPUT_COLOUR, LIGAND_COLOUR, shade, spansFromContig,
+  drawChainDiagram, drawLengths, HOTSPOT_COLOUR, spansFromAnnotatedAtoms, hotspotsOf, INPUT_COLOUR, LIGAND_COLOUR, shade, spansFromContig,
 } from "./contig-ui.js";
 import { DEFAULT_STEPS, generate } from "./generate.js";
 import { writeZip } from "./zip.js";
@@ -33,7 +33,7 @@ import { CHAIN_IDS, MAX_ALANINE } from "../webgpu/design/hunter-loop.js";
 import { hunt } from "./hunt.js";
 import { createStructureViewer } from "./viewer.js";
 import {
-  createConditionEditor, inputResidueMap, inputStructurePdb, picksOf, segmentsOf,
+  createConditionEditor, describePicks, inputResidueMap, inputStructurePdb, picksOf, segmentsOf,
 } from "./condition-editor.js";
 import { alignToReference } from "../cpu/design/align.js";
 import { translateSpans } from "../cpu/design/source-numbering.js";
@@ -366,10 +366,77 @@ function paintLegend(spans) {
   roleList.replaceChildren(...items);
 }
 
+/**
+ * 🔴 EVERY HOTSPOT THE JOB HAS, WHEREVER IT WAS SET: the loaded structure's own annotation (how the
+ * binder example carries its epitope - in the crop's numbering, which is why the example's spec
+ * names other residues), a kept piece's hotspot field, and the constraints marked Hotspot. A
+ * hotspot set in any of them was invisible on the page, and the example's were never shown at all.
+ * @returns {{chain: string, resId: number, from: string}[]}
+ */
+function hotspotResidues(spans) {
+  const out = new Map();
+  const add = (chain, resId, from) => {
+    const key = `${chain}:${resId}`;
+    if (!out.has(key)) out.set(key, { chain, resId, from });
+  };
+  const atoms = loaded?.atoms;
+  const column = atoms?.condition_hotspot_1_atom ?? atoms?.annotations?.condition_hotspot_1_atom;
+  if (column) {
+    for (let i = 0; i < column.length; i += 1) {
+      if (column[i]) add(String(atoms.chain_id[i]), Number(atoms.res_id[i]), "structure");
+    }
+  }
+  for (const span of spans) {
+    if (span.kind !== "segment") continue;
+    const chain = String(span.chain ?? "").trim();
+    for (const piece of String(span.hotspots ?? "").split(/[^0-9-]+/).filter(Boolean)) {
+      const [first, last = first] = piece.split(/(?<=\d)-/).map(Number);
+      for (let r = first; r <= last; r += 1) add(chain, r, "piece");
+    }
+  }
+  for (const row of conditionEditor?.rows ?? []) {
+    if (row.key !== "C_HOT" || row.value !== "true") continue;
+    for (const pick of row.picks) add(pick.chain, pick.resId, "constraint");
+  }
+  return [...out.values()];
+}
+
+/** The hotspot line under the diagram: which residues, and what a hotspot is. */
+function paintHotspotLine(spans) {
+  const line = element("hotspot-line");
+  const hot = hotspotResidues(spans);
+  const kept = spans.some((span) => span.kind === "segment" || span.kind === "sequence");
+  line.hidden = hot.length === 0 && !kept;
+  line.replaceChildren();
+  const swatch = document.createElement("span");
+  swatch.className = "role-swatch";
+  swatch.style.setProperty("--chain-colour", HOTSPOT_COLOUR);
+  const strong = document.createElement("strong");
+  strong.textContent = "Hotspots";
+  const what = document.createElement("span");
+  what.className = "hotspot-what";
+  what.textContent = " \u2014 residues of the target the design should touch.";
+  if (hot.length > 0) {
+    const fromFile = hot.some((h) => h.from === "structure");
+    line.append(swatch, strong, ` ${describePicks(hot)}`, what,
+      ...(fromFile ? [Object.assign(document.createElement("span"), { className: "hotspot-what",
+        textContent: " Set by the example's structure." })] : []));
+  } else {
+    line.append(swatch, strong, ": none.", what, Object.assign(document.createElement("span"), {
+      className: "hotspot-what",
+      textContent: method.value === "hunter"
+        ? " Add residue numbers in a kept piece's \u22ef settings to aim the design at a site."
+        : " To aim the design at a site, select target residues and press Mark as hotspot in step 4.",
+    }));
+  }
+}
+
 const paintJob = () => {
   const spans = spanList?.read() ?? [];
   paintLegend(spans);
-  drawChainDiagram(element("chain-diagram"), spans, { onPick: (index) => spanList.reveal(index) });
+  drawChainDiagram(element("chain-diagram"), spans, { onPick: (index) => spanList.reveal(index),
+    hotspots: hotspotResidues(spans) });
+  paintHotspotLine(spans);
   const hunter = method.value === "hunter";
   const { contig, problems, tokens } = contigOf(spans, method.value);
   const span = tokens.min === tokens.max ? `${tokens.min}` : `${tokens.min}\u2013${tokens.max}`;
@@ -700,6 +767,11 @@ const viewer = createStructureViewer({
 const conditionHost = element("condition-host");
 
 /** Paint the drawn input: grey, with each condition row's residues in its own colour. */
+/** A constraint's colour: hotspots their own, every other row the next of the palette. */
+function constraintColour(index, row) {
+  return row?.key === "C_HOT" ? HOTSPOT_COLOUR : CONDITION_COLOURS[index % CONDITION_COLOURS.length];
+}
+
 function paintInput() {
   if (inputView === null || viewer.renderer === undefined) return;
   viewer.colourChains(Object.fromEntries([...inputView.chainOf.keys()].map((letter) => [letter, INPUT_COLOUR])));
@@ -717,8 +789,12 @@ function paintInput() {
   conditionEditor.rows.forEach((row, index) => {
     const wanted = new Set(row.picks.map((pick) => `${pick.chain}:${pick.resId}`));
     const positions = map.flatMap((residue, i) => (wanted.has(`${residue.chain}:${residue.resId}`) ? [i] : []));
-    viewer.colourResidues(positions, CONDITION_COLOURS[index % CONDITION_COLOURS.length]);
+    viewer.colourResidues(positions, constraintColour(index, row));
   });
+  // ...and every hotspot last, in its own colour, whichever of the three places set it.
+  const hot = new Set(hotspotResidues(spans).map((h) => `${h.chain}:${h.resId}`));
+  viewer.colourResidues(map.flatMap((residue, i) => (hot.has(`${residue.chain}:${residue.resId}`) ? [i] : [])),
+    HOTSPOT_COLOUR);
 }
 
 /** Draw the loaded structure in the viewer, for picking. */
@@ -785,7 +861,7 @@ conditionEditor = createConditionEditor(conditionHost, {
     const selected = viewer.renderer.residueSelection;
     return picksOf(selected instanceof Set ? [...selected] : [], inputResidueMap(viewer.renderer, inputView.chainOf));
   },
-  colourOf: (index) => CONDITION_COLOURS[index % CONDITION_COLOURS.length],
+  colourOf: (index, row) => constraintColour(index, row),
   onKeep: () => keepSelection(),
   picks: () => {
     if (inputView === null || viewer.renderer === undefined) {
@@ -1050,9 +1126,7 @@ presetSelect.addEventListener("change", () => {
   // naming residues the loaded file does not contain, which is the exact state
   // this whole path exists to prevent.
   if (preset.cifUrl !== undefined && preset.cifUrl !== null && loaded?.name === preset.cifUrl) {
-    const { spans: moved, translated } = translateSpans(spans, loaded.atoms);
-    if (translated > 0) spanList.set(moved);
-    presetSpans = JSON.stringify(spanList.read());
+    examplePieces(spans);
   } else if (preset.cifUrl !== null && preset.cifUrl !== undefined) {
     // 🔴 THE OLD STRUCTURE GOES FIRST, SYNCHRONOUSLY. `startGenerate` prefers a
     // loaded structure over the preset's own `cifUrl` - a user's file is the
@@ -1086,9 +1160,7 @@ presetSelect.addEventListener("change", () => {
       // is a lookup rather than an alignment - see cpu/design/source-numbering.js.
       // ...and the spans translated are the ones this PRESET set, not whatever
       // is in the editor now, for the same reason.
-      const { spans: moved, translated } = translateSpans(spans, loaded.atoms);
-      if (translated > 0) spanList.set(moved);
-      presetSpans = JSON.stringify(spanList.read());
+      examplePieces(spans);
       paintJob();
     }).catch((error) => {
       // Not fatal: RFD4 fetches it again inside the run, and only Hunter needs
@@ -1113,6 +1185,22 @@ presetSelect.addEventListener("change", () => {
   presetSpans = JSON.stringify(spanList.read());
   paintGoals();
 });
+
+/**
+ * An example's pieces once its structure is here. One that runs from its file's annotations is
+ * shown as the FILE describes it (`spansFromAnnotatedAtoms`) - its contig is a label in the source
+ * entry's numbering, and drawing it showed a job that never runs; any other has its contig moved
+ * into the crop's own numbering (cpu/design/source-numbering.js).
+ */
+function examplePieces(spans) {
+  const fromFile = presetExtras.fromAnnotations ? spansFromAnnotatedAtoms(loaded.atoms) : null;
+  if (fromFile !== null) spanList.set(fromFile);
+  else {
+    const { spans: moved, translated } = translateSpans(spans, loaded.atoms);
+    if (translated > 0) spanList.set(moved);
+  }
+  presetSpans = JSON.stringify(spanList.read());
+}
 
 /**
  * 🔴 SAID WHEN IT APPLIES: an example that runs from its structure's own annotations ignores the

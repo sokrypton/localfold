@@ -227,9 +227,9 @@ export function describePicks(picks) {
 
 /** The constraints a selection is most often given, one press each: [key, value, label]. */
 const QUICK = [
-  ["C_HOT", "true", "Hotspot"],
-  ["C_CRD", "true", "Fix coordinates"],
-  ["C_SEQ", "true", "Fix sequence"],
+  ["C_HOT", "true", "Mark as hotspot", "A hotspot is a residue of the target the design should touch: the site to bind."],
+  ["C_CRD", "true", "Fix coordinates", "Hold these residues exactly where they are."],
+  ["C_SEQ", "true", "Fix sequence", "Keep these residues' amino acids."],
 ];
 
 /**
@@ -246,7 +246,7 @@ const QUICK = [
  * @param {() => {chain: string, resId: number}[]} hooks.picks the residues selected (may refuse)
  * @param {() => {chain: string, resId: number}[] | null} [hooks.peek] the same without side effects,
  *   null when there is no structure to pick from
- * @param {(index: number) => string} [hooks.colourOf] a row's colour in the viewer
+ * @param {(index: number, row: object) => string} [hooks.colourOf] a row's colour in the viewer
  * @param {() => void} [hooks.onKeep] "Keep in the design": the page turns the selection into spans
  * @param {() => void} hooks.onChange the rows changed (repaint, re-describe the job)
  */
@@ -308,8 +308,8 @@ export function createConditionEditor(host, { picks, peek = () => null, colourOf
     keep.addEventListener("click", () => onKeep());
     quick.append(keep);
   }
-  for (const [key, value, label] of QUICK) {
-    const b = button(label, `Mark the selected residues: ${KIND.get(key).label.toLowerCase()}.`);
+  for (const [key, value, label, title] of QUICK) {
+    const b = button(label, title);
     b.dataset.condition = key;
     b.addEventListener("click", () => {
       const p = tryPicks();
@@ -373,7 +373,7 @@ export function createConditionEditor(host, { picks, peek = () => null, colourOf
       item.title = arm.select;
       const swatch = document.createElement("span");
       swatch.className = "role-swatch";
-      swatch.style.setProperty("--chain-colour", colourOf(index));
+      swatch.style.setProperty("--chain-colour", colourOf(index, row));
       const value = Array.isArray(k.values) && k.values.length === 1 ? "" : ` ${row.value.toLowerCase()}`;
       const narrowed = row.atoms ? ` (${row.atoms.toUpperCase()})` : "";
       item.append(swatch, `${k.label}${value} \u00b7 ${describePicks(row.picks)}${narrowed}`);

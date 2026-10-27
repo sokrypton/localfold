@@ -268,6 +268,28 @@ def main():
         if motif["blank"] != {"rows": 1, "structure": "", "placeholder": True, "preset": ""}:
             bad.append(f"New protein did not clear the example: {motif['blank']}")
 
+        # 🔴 AND HOTSPOTS ARE NAMED WHEREVER THEY WERE SET. The binder example carries its epitope in
+        # its FILE (B40, B99, B107, in the crop's numbering) and runs from that file, so its pieces
+        # are the file's - a designed chain A of 50-120 against chain B 1-115 - and B's block counts
+        # the hotspots on it. The page used to draw the example's contig (keep A18-132, design 76),
+        # a job that never runs, and to show its hotspots nowhere.
+        cdp.evaluate(ws, "(() => { document.querySelector('[data-goal=ppi_pdl1]').click(); return 1; })()")
+        try:
+            cdp.wait_for(ws, "document.querySelector('#chain-diagram .chain-block-hot') !== null", 30,
+                         "the binder's hotspots")
+        except RuntimeError:
+            pass   # reported below, from what IS drawn
+        binder = json.loads(cdp.evaluate(ws, """(() => JSON.stringify({
+          blocks: [...document.querySelectorAll('#chain-diagram .chain-block')].map((b) => b.textContent),
+          line: document.getElementById('hotspot-line').textContent,
+        }))()"""))
+        print(f"  binder card: {binder}")
+        if binder["blocks"] != ["50\u2013120", "B1\u2013115 \u00b7 3 hotspots"]:
+            bad.append(f"the binder example is drawn as {binder['blocks']}, not as its file runs")
+        if "B40, B99, B107" not in binder["line"] or "should touch" not in binder["line"]:
+            bad.append(f"the binder's hotspots are not named and defined: {binder['line']!r}")
+        cdp.evaluate(ws, "(() => { document.querySelector('[data-goal=blank]').click(); return 1; })()")
+
         # 🔴 PROTEIN HUNTER IS AN ADVANCED CHOICE NOW, and under it the page is the one it was: its own
         # controls, its notes, its examples - and the old default job, set here, is described to it.
         cdp.evaluate(ws, """(() => {

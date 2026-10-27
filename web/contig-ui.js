@@ -82,7 +82,9 @@ export const LIGAND_COLOUR = "#78716c";
  * because the view is about which residue carries which condition and not about chains.
  */
 export const INPUT_COLOUR = "#cbd5e1";
-export const CONDITION_COLOURS = ["#e11d48", "#f59e0b", "#7c3aed", "#0ea5e9", "#84cc16", "#be185d", "#1e293b"];
+export const CONDITION_COLOURS = ["#e11d48", "#7c3aed", "#0ea5e9", "#84cc16", "#be185d", "#1e293b"];
+/** Hotspots have one colour of their own, wherever they were set: on the structure, in a chip, in the line. */
+export const HOTSPOT_COLOUR = "#f59e0b";
 
 /** The colour of the nth chain, wrapping rather than running out. */
 export function chainColour(index) {
@@ -728,6 +730,50 @@ export function chainsOf(spans, options = {}) {
  *            contig: () => object}}
  */
 /**
+ * The pieces an ANNOTATED structure is, read off it - for the examples that run from their file's
+ * own annotations rather than from their contig.
+ *
+ * 🔴 THE CONTIG THOSE EXAMPLES CARRY IS A LABEL IN ANOTHER NUMBERING. The binder example's says
+ * "keep A18-132, design 76" while its file - which is what runs - designs chain A at 50-120 residues
+ * against chain B 1-115, and its hotspots are on B; the page drew the label as the job. Here every
+ * run of residues is a piece in file order: an expandable-segment sentinel (`annotation_expsegmin`/
+ * `max`) a designed span of that length range, polymer residues a kept span per contiguous run, a
+ * non-polymer residue a ligand, and a chain change a break.
+ *
+ * @param {object} atoms `parseCifToAtomArray`'s array
+ * @returns {object[] | null} the spans, or null when the file carries no expandable segments
+ */
+export function spansFromAnnotatedAtoms(atoms) {
+  const ann = atoms?.annotations ?? {};
+  const min = ann.annotation_expsegmin_1_residue ?? atoms?.annotation_expsegmin_1_residue;
+  const max = ann.annotation_expsegmax_1_residue ?? atoms?.annotation_expsegmax_1_residue;
+  if (!min || !max) return null;
+  const n = atoms.chain_id.length;
+  const spans = [];
+  let chain = null;
+  let last = null;     // the residue the current span ended on, "chain:res"
+  for (let i = 0; i < n; i += 1) {
+    const c = String(atoms.chain_id[i]);
+    const r = Number(atoms.res_id[i]);
+    if (last === `${c}:${r}`) continue;
+    if (chain !== null && c !== chain) spans.push({ kind: "break" });
+    const previous = spans[spans.length - 1];
+    if (Number(min[i]) >= 0) {
+      spans.push({ kind: "generated", min: Number(min[i]), max: Number(max[i]), name: "", secondary: "", polymer: "protein" });
+    } else if (atoms.is_polymer?.[i] === false || (atoms.is_polymer === undefined && atoms.hetero?.[i])) {
+      spans.push({ kind: "ligand", code: String(atoms.res_name[i]).trim() });
+    } else if (previous?.kind === "segment" && previous.chain === c && r === previous.last + 1) {
+      previous.last = r;
+    } else {
+      spans.push({ kind: "segment", chain: c, first: r, last: r, hotspots: "" });
+    }
+    chain = c;
+    last = `${c}:${r}`;
+  }
+  return spans.some((span) => span.kind === "generated") ? spans : null;
+}
+
+/**
  * The job at a glance: a row per chain, a block per span - kept from the structure (solid, in the
  * chain's colour), designed (striped), a known sequence (outlined) - and ligands as chips beside
  * them. A block's width follows its residue count (a designed range by its middle), so a 20-residue
@@ -735,9 +781,11 @@ export function chainsOf(spans, options = {}) {
  *
  * @param {HTMLElement} container
  * @param {object[]} spans
- * @param {{ onPick?: (index: number) => void, selected?: number }} [options]
+ * @param {{ onPick?: (index: number) => void, selected?: number,
+ *   hotspots?: {chain: string, resId: number}[] }} [options] `hotspots` are counted on the kept
+ *   piece that holds them, so the block says where the design is aimed
  */
-export function drawChainDiagram(container, spans, { onPick = () => {}, selected = -1 } = {}) {
+export function drawChainDiagram(container, spans, { onPick = () => {}, selected = -1, hotspots = [] } = {}) {
   const chainOf = chainOfSpans(spans);
   const rows = new Map();
   const ligands = [];
@@ -777,6 +825,15 @@ export function drawChainDiagram(container, spans, { onPick = () => {}, selected
       block.type = "button";
       block.style.flexGrow = String(sizeOf(span));
       block.title = `${SPAN_LABELS[span.kind]}: ${labelOf(span)} - click to edit`;
+      if (span.kind === "segment") {
+        const held = hotspots.filter((h) => h.chain === String(span.chain).trim()
+          && h.resId >= Number(span.first) && h.resId <= Number(span.last)).length;
+        if (held > 0) {
+          const mark = element("span", "chain-block-hot", `${held} hotspot${held === 1 ? "" : "s"}`);
+          block.append(" \u00b7 ", mark);
+          block.title += ` - ${held} hotspot${held === 1 ? "" : "s"} on it`;
+        }
+      }
       if (index === selected) block.classList.add("selected");
       block.addEventListener("click", () => onPick(index));
       track.append(block);
@@ -949,7 +1006,8 @@ export function createContigList(rowsContainer, addButton, options = {}) {
           element("span", "contig-label", "residues"), first,
           element("span", "contig-label", "to"), last);
         const hotspots = text("contig-hotspots", span.hotspots, "54 56",
-          "Residues of this chain the design should sit against - an epitope.",
+          "Hotspots: residues of this piece the design should touch (the site to bind), by the"
+          + " structure's numbering - e.g. 54 56, or 60-64.",
           "hotspots", (value) => value.trim());
         extras.append(element("span", "contig-label", "hotspots"), hotspots);
         if (String(span.hotspots ?? "").trim().length > 0 && limits.hotspots !== undefined) {
