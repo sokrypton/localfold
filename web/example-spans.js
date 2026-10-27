@@ -49,11 +49,6 @@ export function exampleSpans(preset, atoms) {
     if (parsed === null) return null;
     spans = translateSpans(parsed, atoms).spans;
   }
-  // 🔴 A LIGAND IS NAMED BY ITS CCD CODE. The SAM example's own file calls it `S;M` - which the
-  // engine reads and a reader takes for a typo - so a name that is no CCD code takes the contig's.
-  const codes = (parsed ?? []).filter((span) => span.kind === "ligand").map((span) => span.code);
-  spans = spans.map((span) => (span.kind === "ligand" && !/^[A-Z0-9]{1,5}$/.test(String(span.code))
-    && codes.length > 0 ? { ...span, code: codes.shift() } : span));
   const hot = annotatedHotspots(atoms);
   return spans.map((span) => {
     if (span.kind !== "segment") return span;

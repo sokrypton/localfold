@@ -37,7 +37,7 @@ describe("what a design job asks for, read off a structure", () => {
     },
     motif_unidx_1prw: { key: "motif", contig: "60-105/[A1-40]", roles: [["A", "motif", 60, 105]] },
     // a ligand is a span with no residues of its own
-    sm_sam: { key: "sm_binder", contig: "120-165 + S;M", roles: [["B", "ligand", 0, 0], ["A", "new", 120, 165]] },
+    sm_sam: { key: "sm_binder", contig: "120-165 + SAM", roles: [["B", "ligand", 0, 0], ["A", "new", 120, 165]] },
     // two given nucleic chains and a generated protein
     dna_7m5w: {
       key: "binder", contig: "A1-9/0 B1-10/0 120-150",

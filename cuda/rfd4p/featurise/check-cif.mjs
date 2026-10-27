@@ -288,10 +288,10 @@ function withStereogenicDoubleBond(text, twist = false) {
   // rows, and promote the one bond that is left between the two carbons.
   out = out.split("\n").filter((line) => {
     const tok = line.trim().split(/\s+/);
-    if (tok.length >= 3 && tok[0] === "S;M" && (gone.has(tok[1]) || gone.has(tok[2]))) return false;
-    if (tok.length >= 3 && tok[0] === "S;M" && gone.has(tok[1])) return false;
+    if (tok.length >= 3 && tok[0] === "SAM" && (gone.has(tok[1]) || gone.has(tok[2]))) return false;
+    if (tok.length >= 3 && tok[0] === "SAM" && gone.has(tok[1])) return false;
     return true;
-  }).map((line) => (line.trimStart().startsWith("S;M C2  C3  SING")
+  }).map((line) => (line.trimStart().startsWith("SAM C2  C3  SING")
     ? line.replace("SING", "DOUB") : line)).join("\n");
   if (!out.includes("C2  C3  DOUB")) throw new Error("the C2-C3 bond was not promoted");
   return out;

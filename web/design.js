@@ -1495,10 +1495,7 @@ const describeStructure = () => {
   const chains = [...loaded.chains.entries()].filter(([chain]) => !placeholders.has(chain));
   const parts = chains.filter(([chain]) => ligandOf(chain) === null)
     .map(([chain, range]) => `${chain} ${range.first}\u2013${range.last}`);
-  // A file's own name for its ligand may be no CCD code (the SAM example's is `S;M`); the segment's is.
-  const codes = (spanList?.read() ?? []).filter((span) => span.kind === "ligand").map((span) => span.code);
-  const ligands = chains.map(([chain]) => ligandOf(chain)).filter((name) => name !== null && name !== "")
-    .map((name) => (/^[A-Z0-9]{1,5}$/.test(name) || codes.length === 0 ? name : codes.shift()));
+  const ligands = chains.map(([chain]) => ligandOf(chain)).filter((name) => name !== null && name !== "");
   // The entry or file's name, not the path an example is served from.
   const name = String(loaded.name).split("/").pop().replace(/\.(b?cif|mmcif)(\.(zst|gz))?$/i, "");
   const pieces = [];

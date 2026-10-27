@@ -310,8 +310,8 @@ constraint at all, which decides whether this is plumbing or a port.
   🔴 Found on the way:
   - `hotspotsOf` read `60-64` as 60 and 64, so a hunt was aimed at the two ends of
     the site;
-  - the SAM example's own file names its ligand `S;M`, which is now shown as the
-    contig's `SAM`.
+  - the SAM example's own file named its ligand `S;M`; the file now says `SAM`
+    (see the third pass).
 
   **Second round, same day** (from a reader's report: the sequence "not changing"
   and its box "disappearing" during a design, hotspots hard to find, and the cards
@@ -354,3 +354,10 @@ constraint at all, which decides whether this is plumbing or a port.
 - Shorter hotspot help; a chain break's card says "the next segment starts a new chain"; a
   ligand-only chain is described as "ligand SAM", not "chain B 1-1".
 - Verified: check-design-page default and --generate ok, npm test 1584 pass, no overflow at 390 px.
+- `web/examples/sm_sam.cif.zst` renamed its ligand `S;M` -> `SAM` in every table (atom_site,
+  chem_comp, bonds), so the strip and card read SAM and the two display workarounds are gone. 🔴 The
+  featurised batch is IDENTICAL from both files - all 80 fields, seeds 0 and 7, a comparison that
+  catches one atom moved 0.7 A - because no RFD4 table knows SAM and an annotated example fetches
+  no dictionary entry. A RAW structure would: `componentsNeedingCcd` fetches RCSB's entry for any
+  CCD-shaped name, which is a reason upstream's `S;M` may have been deliberate. Not checked against
+  the upstream oracle: `oracle-dumps/` holds no sm_sam dump on this box.

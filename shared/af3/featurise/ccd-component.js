@@ -122,7 +122,7 @@ export function loopOf(text, prefix) {
 /**
  * The components a job's `userCCD` defines (each `data_` block one, named by its
  * `_chem_comp.id`, as parseCcdComponent reads it), upper-cased - the codes AlphaFold 3
- * takes from it whatever their characters (RFD4's designs name a ligand `S;M`).
+ * takes from it whatever their characters.
  *
  * @param {string} text
  * @returns {string[]}

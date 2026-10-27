@@ -255,7 +255,7 @@ Its seven example structures are the proof the abstraction holds, and are now a 
 | `ppi_pdl1` | binder | `50-120/0 B1-115` |
 | `motif_idx_1prw` | motif | `5-20/A1-20/10-25/A22-41/5-20` |
 | `motif_unidx_1prw` | motif | `60-105/[A1-40]` |
-| `sm_sam` | small-molecule binder | `120-165 + S;M` |
+| `sm_sam` | small-molecule binder | `120-165 + SAM` |
 | `dna_7m5w` | binder | `A1-9/0 B1-10/0 120-150` |
 | `5o45_cropped` | redesign all | `115` |
 

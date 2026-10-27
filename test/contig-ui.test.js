@@ -451,7 +451,7 @@ describe("an annotated example's pieces, read off its file", () => {
       ppi_pdl1: "50-120 / B1-115",
       motif_idx_1prw: "5-20 A1-20 10-25 A22-41 5-20",
       motif_unidx_1prw: "60-105 A1-40",
-      sm_sam: "lig S;M / 120-165",
+      sm_sam: "lig SAM / 120-165",
       dna_7m5w: "A1-9 / B1-10 / 120-150",
       uncond_short: "100-100",
       "5o45_cropped": null,
