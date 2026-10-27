@@ -38,15 +38,17 @@ export const HUNTER_CANNOT = {
   // Labelled spans ask for a secondary structure, which Hunter cannot be told:
   // it folds whatever the sequence gives.
   custom_cath_monomer: "Protein Hunter cannot be asked for a secondary structure",
-  // 🔴 NOT A METHOD LIMIT - A DISCREPANCY IN THE EXAMPLE. Its crop records
-  // residues A17-A131 and its contig asks for A18-132: the same count, offset
-  // by one, so the last residue has no source and the range cannot be moved
-  // onto the file. RFD4 never notices because it runs from the structure's
-  // annotations rather than its contig.
-  ppi_pdl1: "this example's contig and its structure disagree by one residue",
-  // The same shape: the contig asks for B1-16 where the crop's chain B holds
-  // ten residues.
-  dna_7m5w: "this example's contig asks for more residues than its structure has",
+  // 🔴 BUILDABLE, AND STILL NOT OFFERED: what these two examples ARE is RFD4-Proteina's - partial
+  // diffusion from the structure, inverse folding of its backbone - and their segments are only the
+  // motif example's. Under Protein Hunter each ran as exactly that motif scaffold (the same hunt,
+  // objective for objective, in check-design-page.py --presets), under a name promising otherwise.
+  partial_diffusion_1prw: "partial diffusion is RFD4-Proteina's; here it would be the motif example again",
+  inverse_folding_1prw: "this inverse folding is RFD4-Proteina's; here it would be the motif example again",
+  // 🔴 THE BINDER AND THE DNA BINDER ARE NOT HERE ANY MORE (2026-10-27). Both were excluded for a
+  // discrepancy between their contig and the crop they ship with - the contig is a label in the
+  // source entry's numbering - and both run from their FILE's annotations, which is what the page
+  // now loads them as (web/example-spans.js): a designed chain against the file's target, with the
+  // file's hotspots on it, and a kept DNA strand folded as DNA.
 };
 
 /**
@@ -56,6 +58,8 @@ export const HUNTER_CANNOT = {
  * @param {string} method "hunter" or "rfd4p"
  * @returns {boolean}
  */
+export const HUNTER_WOULD_DIFFER = new Set(["partial_diffusion_1prw", "inverse_folding_1prw"]);
+
 export function presetSuits(id, method) {
   // Every example is RFD4's own, so that method takes all of them.
   if (method !== "hunter") return true;

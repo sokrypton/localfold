@@ -141,9 +141,7 @@ READ_PAGE = """(() => {
       .filter((o) => !o.disabled && o.value).length,
     presetsRefused: [...document.querySelectorAll("#preset option")]
       .filter((o) => o.disabled).map((o) => o.textContent),
-    goalsDisabled: [...document.querySelectorAll("#goals .goal-card:disabled")].map((c) => c.dataset.goal),
-    goalReasons: [...document.querySelectorAll("#goals .goal-card:disabled")].map((c) => c.title.length > 0),
-    constraintsHidden: document.getElementById("step-constraints").hidden,
+    conditionsShown: !document.getElementById("condition-rows").hidden,
     columns: n("#results-table thead th"),
     hunt: document.getElementById("hunt")?.textContent?.trim(),
   });
@@ -167,10 +165,10 @@ def main():
         ws.call("Page.enable")
         ws.call("Runtime.enable")
         ws.call("Page.navigate", url=f"http://127.0.0.1:{port}/design.html")
-        # 🔴 THE MODULE RAN IFF IT DREW THE GOAL CARDS. There is no window marker to wait on, and
+        # 🔴 THE MODULE RAN IFF IT FILLED THE EXAMPLES. There is no window marker to wait on, and
         # `readyState === "complete"` is true of a page whose module threw.
         try:
-            cdp.wait_for(ws, "document.querySelectorAll('#goals .goal-card').length > 0",
+            cdp.wait_for(ws, "document.querySelectorAll('#preset optgroup').length > 0",
                          60, "web/design.js to run")
         except RuntimeError:
             threw = cdp.evaluate(ws, """(async () => {
@@ -187,72 +185,89 @@ def main():
         except RuntimeError:
             pass
 
-        # 🔴 WHAT A NEWCOMER SEES FIRST (2026-10-27): the goals, a blank 100-residue design under
-        # RFD4-Proteina, the job drawn as a chain, and no prose - no greyed controls of the other
-        # method, no note explaining them, no designer note. Each was a reason the old page read
-        # as a form for someone who already knew it.
+        # 🔴 WHAT A NEWCOMER SEES FIRST (2026-10-27, second pass): the method at the top, Protein Hunter
+        # chosen; the examples as one dropdown on a new protein; a blank 100-residue design as one
+        # card, drawn as a sketch; no selection step (no structure to select from); Design in view.
         first = json.loads(cdp.evaluate(ws, """(() => {
           const visible = (el) => el !== null && el.offsetParent !== null;
+          const top = (id) => document.getElementById(id).getBoundingClientRect().top;
           return JSON.stringify({
-            goals: [...document.querySelectorAll('#goals .goal-card')].map((c) => c.dataset.goal),
-            chosen: document.querySelector('#goals [aria-checked="true"]')?.dataset.goal ?? null,
+            steps: [...document.querySelectorAll('.design-step')].map((s) => s.id),
+            methodFirst: top('method') < top('preset') && top('preset') < top('contig-rows'),
+            example: document.getElementById('preset').value,
+            groups: [...document.querySelectorAll('#preset optgroup')].map((g) => g.label),
             method: document.getElementById('method').value,
             rows: document.querySelectorAll('#contig-rows > *').length,
             blocks: [...document.querySelectorAll('#chain-diagram .chain-block')].map((b) => b.textContent),
             contig: document.getElementById('contig-line').textContent,
             columns: document.querySelectorAll('#results-table thead th').length,
-            otherMethodShown: ['folderGroup', 'cyclesGroup', 'runsGroup', 'temperatureGroup', 'omitGroup']
+            otherMethodShown: ['thinkingGroup', 'backboneKGroup', 'latentKGroup', 'partialGroup']
               .filter((id) => !document.getElementById(id).classList.contains('not-this-method')),
-            notes: [...document.querySelectorAll('.design-notes .option-note, #preset-note')]
+            hunterShown: ['folderGroup', 'cyclesGroup'].filter((id) => visible(document.getElementById(id))),
+            notes: [...document.querySelectorAll('.design-notes .option-note')]
               .filter(visible).map((n) => n.textContent.trim()).filter(Boolean),
+            exampleNote: document.getElementById('preset-note').textContent.trim(),
+            methodNote: document.getElementById('method-note').textContent.trim(),
             placeholder: visible(document.getElementById('viewer-empty')),
             drawn: window.__designDrawn(),
-            constraints: visible(document.getElementById('step-constraints')),
+            selection: visible(document.getElementById('step-constraints')),
             hunt: document.getElementById('hunt').textContent.trim(),
             huntInView: (() => { const b = document.getElementById('hunt').getBoundingClientRect();
               return b.top >= 0 && b.bottom <= innerHeight && b.width > 0; })(),
+            // 🔴 EVERY CONTROL IS NAMED: an input or select with no label is one a screen reader reads
+            // as "edit text", and one a reader cannot click the name of
+            unlabelled: [...document.querySelectorAll('input:not([type=hidden]):not([type=file]), select, textarea')]
+              .filter((c) => visible(c) && !c.labels?.length && !c.getAttribute('aria-label'))
+              .map((c) => c.id || c.className),
             gpu: document.getElementById('gpu-summary').textContent.trim(),
           });
         })()"""))
         print(f"  on arrival: {first}")
-        if len(first["goals"]) != 8 or first["chosen"] != "blank":
-            bad.append(f"the goals are {first['goals']} with {first['chosen']!r} chosen; expected 8, New protein")
-        if first["method"] != "rfd4p" or first["hunt"] != "Generate":
-            bad.append(f"the page opens on {first['method']!r} / {first['hunt']!r}, expected RFD4-Proteina and Generate")
-        if first["rows"] != 1 or first["blocks"] != ["100"] or first["contig"] != "100 residues":
+        if not first["methodFirst"] or first["steps"][:3] != ["step-method", "step-goal", "step-build"]:
+            bad.append(f"the page does not open with the method, then the example, then the segments: {first['steps']}")
+        if first["method"] != "hunter" or first["hunt"] != "Design":
+            bad.append(f"the page opens on {first['method']!r} / {first['hunt']!r}, expected Protein Hunter and Design")
+        if first["example"] != "" or len(first["groups"]) < 5:
+            bad.append(f"the examples are not one grouped dropdown on a new protein: {first['example']!r} {first['groups']}")
+        if first["rows"] != 1 or first["blocks"] != ["100"] or first["contig"] != "design 100":
             bad.append(f"the blank job is {first['rows']} rows, blocks {first['blocks']}, {first['contig']!r};"
                        " expected one designed 100-residue chain")
-        if first["columns"] != 4:
-            bad.append(f"{first['columns']} result columns under RFD4-Proteina, expected 4")
-        if first["otherMethodShown"]:
-            bad.append(f"Protein Hunter's controls are on screen under RFD4-Proteina: {first['otherMethodShown']}")
+        if first["columns"] != 5:
+            bad.append(f"{first['columns']} result columns under Protein Hunter, expected 5")
+        if first["otherMethodShown"] or first["hunterShown"] != ["folderGroup", "cyclesGroup"]:
+            bad.append(f"the controls on screen are not Protein Hunter's: RFD4's {first['otherMethodShown']},"
+                       f" Hunter's {first['hunterShown']}")
         if first["notes"]:
-            bad.append(f"the page explains itself before anything happened: {first['notes']}")
-        # 🔴 THE JOB IS DRAWN FROM ARRIVAL (web/job-sketch.js): the blank job is one sketched chain of
-        # 100 positions and no structure, so there is no empty placeholder to read - and Generate is
-        # beside it, in view, rather than at the end of step 5.
+            bad.append(f"the page explains its settings before anything happened: {first['notes']}")
+        if not first["exampleNote"] or not first["methodNote"]:
+            bad.append(f"the example or the method is not said in a line: {first['exampleNote']!r} {first['methodNote']!r}")
         if first["placeholder"] or first["drawn"] is None or first["drawn"]["structure"] is not None \
                 or len(first["drawn"]["ghosts"]) != 1 or first["drawn"]["positions"] != 100:
             bad.append(f"the blank job is not drawn as one 100-residue sketch on arrival: {first['drawn']},"
                        f" placeholder {first['placeholder']}")
-        if not first["constraints"]:
-            bad.append("the constraints step is missing on arrival")
+        if first["selection"]:
+            bad.append("the selection step is on screen with no structure to select from")
         if not first["huntInView"]:
-            bad.append("Generate is not in view on arrival")
+            bad.append("Design is not in view on arrival")
+        if first["unlabelled"]:
+            bad.append(f"controls with no label: {first['unlabelled']}")
         if first["gpu"] == "":
             bad.append("the page did not say whether WebGPU is available")
 
-        # 🔴 A GOAL CARD LOADS ITS EXAMPLE, AND NEW PROTEIN TAKES IT AWAY AGAIN: the motif card picks
-        # the 1PRW example, which draws its structure in the viewer, lays out five pieces and names
-        # the file without its path; editing that example's pieces says they are not used (it runs
-        # from its structure's annotations); and New protein drops the structure and the pieces.
-        cdp.evaluate(ws, "(() => { document.querySelector('[data-goal=motif_idx_1prw]').click(); return 1; })()")
+        # 🔴 AN EXAMPLE FILLS IN EVERYTHING, AND "A NEW PROTEIN" TAKES IT AWAY AGAIN: the motif example
+        # loads the 1PRW crop, draws it, lays out five segments and names the file; under RFD4-Proteina
+        # an edit to that example's segments is said to be unused (it runs from its structure's
+        # annotations) and under Protein Hunter, which reads the segments, it is not; and the blank
+        # job drops the structure and the segments.
+        choose = """(() => { const p = document.getElementById('preset'); p.value = '%s';
+          p.dispatchEvent(new Event('change')); return 1; })()"""
+        cdp.evaluate(ws, choose % "motif_idx_1prw")
         # 🔴 ON THE STRUCTURE AND ITS PIECES, not on "a viewer exists": the blank job's sketch is one
         # already, so that returned before the example had loaded anything.
         cdp.wait_for(ws, "(() => { const d = window.__designDrawn?.(); return d !== null && d.structure !== null"
                          " && d.ghosts.length === 3; })()", 30, "the motif's structure and its three sketched pieces")
-        # 🔴 A CLICK ON A SKETCHED PIECE OPENS ITS ROW in step 3 - where its length is changed - and
-        # selects nothing: a sketch is no residue a constraint can name. A real click, as below.
+        # 🔴 A CLICK ON A SKETCHED PIECE MARKS ITS CARD - where its length is changed - and selects
+        # nothing: a sketch is no residue a constraint can name. A real click, as below.
         time.sleep(0.5)
         ghost = json.loads(cdp.evaluate(ws, """(() => {
           const entry = Object.values(window.py2dmol_viewers ?? {}).at(-1);
@@ -267,7 +282,7 @@ def main():
             for (let x = Math.ceil(box.left + 20); x < box.right - 20; x += 3) {
               const hit = r.pickResidueAt(x, y);
               if (hit >= 0 && sketched.has(r.chains[hit]) && steady(x, y, hit))
-                return JSON.stringify({ x, y, opened: document.querySelectorAll('#contig-rows .contig-more').length });
+                return JSON.stringify({ x, y, marked: document.querySelectorAll('#contig-rows .contig-row.selected').length });
             }
           return 'null';
         })()"""))
@@ -279,68 +294,125 @@ def main():
                 time.sleep(0.05)
             time.sleep(0.4)
             after = json.loads(cdp.evaluate(ws, """JSON.stringify({
-              opened: document.querySelectorAll('#contig-rows .contig-more').length,
+              marked: [...document.querySelectorAll('#contig-rows .contig-row.selected')].map((r) => r.className),
               selected: (() => { const e = Object.values(window.py2dmol_viewers ?? {}).at(-1);
                 return (e?.renderer ?? e).residueSelection?.size ?? 0; })() })"""))
             print(f"  sketch click: {ghost} -> {after}")
-            if after["opened"] <= ghost["opened"] or after["selected"] != 0:
-                bad.append(f"a click on a sketched piece did not open its row and select nothing: {after}")
+            if ghost["marked"] != 0 or len(after["marked"]) != 1 or "contig-row-generated" not in after["marked"][0] \
+                    or after["selected"] != 0:
+                bad.append(f"a click on a sketched piece did not mark its card and select nothing: {after}")
         motif = json.loads(cdp.evaluate(ws, """(() => {
           const out = { preset: document.getElementById('preset').value,
-            chosen: document.querySelector('#goals [aria-checked="true"]')?.dataset.goal,
+            method: document.getElementById('method').value,
             blocks: [...document.querySelectorAll('#chain-diagram .chain-block')].map((b) => b.textContent),
             structure: document.getElementById('structure-note').textContent,
             placeholder: !document.getElementById('viewer-empty').hidden,
-            drawn: window.__designDrawn(),
-            noteBefore: document.getElementById('preset-note').textContent };
+            selection: document.getElementById('step-constraints').offsetParent !== null,
+            drawn: window.__designDrawn() };
+          const note = document.getElementById('preset-note');
           const spans = window.__designSpans.read();
           spans[0] = { ...spans[0], min: 7, max: 7 };
           window.__designSpans.set(spans);
-          const note = document.getElementById('preset-note');
+          out.editedHunter = note.classList.contains('warn');
+          const m = document.getElementById('method'); m.value = 'rfd4p'; m.dispatchEvent(new Event('change'));
           out.edited = { text: note.textContent, warn: note.classList.contains('warn') };
-          document.querySelector('[data-goal=blank]').click();
+          m.value = 'hunter'; m.dispatchEvent(new Event('change'));
+          const p = document.getElementById('preset'); p.value = ''; p.dispatchEvent(new Event('change'));
           out.blank = { rows: document.querySelectorAll('#contig-rows > *').length,
             structure: document.getElementById('structure-note').textContent,
             placeholder: !document.getElementById('viewer-empty').hidden,
+            selection: document.getElementById('step-constraints').offsetParent !== null,
             preset: document.getElementById('preset').value };
           return JSON.stringify(out);
         })()"""))
-        print(f"  motif card: {motif}")
-        if motif["preset"] != "motif_idx_1prw" or motif["chosen"] != "motif_idx_1prw":
-            bad.append(f"the motif card did not load its example: {motif}")
+        print(f"  motif example: {motif}")
+        if motif["preset"] != "motif_idx_1prw" or motif["method"] != "hunter":
+            bad.append(f"the motif example did not load under the method chosen: {motif}")
         if motif["blocks"] != ["5–20", "A1–20", "10–25", "A22–41", "5–20"]:
             bad.append(f"the motif example is drawn as {motif['blocks']}")
-        if motif["structure"] != "motif_idx_1prw · chain A 0–42" or motif["placeholder"]:
-            bad.append(f"the motif's structure is not shown and named: {motif['structure']!r}")
+        if motif["structure"] != "motif_idx_1prw · chain A 0–42" or motif["placeholder"] or not motif["selection"]:
+            bad.append(f"the motif's structure is not shown, named and selectable: {motif['structure']!r}")
+        if motif["editedHunter"]:
+            bad.append("an edit under Protein Hunter, which reads the segments, is said to be unused")
         if not motif["edited"]["warn"] or "not used" not in motif["edited"]["text"]:
-            bad.append(f"an edit to an annotation-driven example is not said to be unused: {motif['edited']}")
-        if motif["blank"] != {"rows": 1, "structure": "", "placeholder": False, "preset": ""}:
-            bad.append(f"New protein did not clear the example: {motif['blank']}")
+            bad.append(f"under RFD4-Proteina an edit to an annotation-driven example is not said to be unused: {motif['edited']}")
+        if motif["blank"] != {"rows": 1, "structure": "", "placeholder": False, "selection": False, "preset": ""}:
+            bad.append(f"A new protein did not clear the example: {motif['blank']}")
 
-        # 🔴 AND HOTSPOTS ARE NAMED WHEREVER THEY WERE SET. The binder example carries its epitope in
-        # its FILE (B40, B99, B107, in the crop's numbering) and runs from that file, so its pieces
-        # are the file's - a designed chain A of 50-120 against chain B 1-115 - and B's block counts
-        # the hotspots on it. The page used to draw the example's contig (keep A18-132, design 76),
-        # a job that never runs, and to show its hotspots nowhere.
-        cdp.evaluate(ws, "(() => { document.querySelector('[data-goal=ppi_pdl1]').click(); return 1; })()")
+        # 🔴 AND THE BINDER RUNS UNDER BOTH METHODS, ITS HOTSPOTS ON ITS TARGET'S CARD. The example
+        # carries its epitope in its FILE (B40, B99, B107, in the crop's numbering) and is laid out as
+        # the file runs - a designed chain A of 50-120 against chain B 1-115 - with those three in B's
+        # hotspot field, where Protein Hunter reads them and the reader edits them.
+        cdp.evaluate(ws, choose % "ppi_pdl1")
         try:
             cdp.wait_for(ws, "document.querySelector('#chain-diagram .chain-block-hot') !== null", 30,
                          "the binder's hotspots")
         except RuntimeError:
             pass   # reported below, from what IS drawn
-        binder = json.loads(cdp.evaluate(ws, """(() => JSON.stringify({
-          blocks: [...document.querySelectorAll('#chain-diagram .chain-block')].map((b) => b.textContent),
-          line: document.getElementById('hotspot-line').textContent,
-        }))()"""))
-        print(f"  binder card: {binder}")
-        if binder["blocks"] != ["50\u2013120", "B1\u2013115 \u00b7 3 hotspots"]:
-            bad.append(f"the binder example is drawn as {binder['blocks']}, not as its file runs")
-        if "B40, B99, B107" not in binder["line"] or "should touch" not in binder["line"]:
-            bad.append(f"the binder's hotspots are not named and defined: {binder['line']!r}")
-        cdp.evaluate(ws, "(() => { document.querySelector('[data-goal=blank]').click(); return 1; })()")
+        binder = json.loads(cdp.evaluate(ws, """(() => {
+          const read = () => ({
+            blocks: [...document.querySelectorAll('#chain-diagram .chain-block')].map((b) => b.textContent),
+            hotspots: [...document.querySelectorAll('#contig-rows .contig-hotspots')].map((i) => i.value),
+            problems: document.getElementById('contig-problems').textContent.trim(),
+            contig: document.getElementById('contig-line').textContent.trim(),
+            structure: document.getElementById('structure-note').textContent.trim(),
+            offered: !document.querySelector('#preset option[value=ppi_pdl1]').disabled,
+            painted: window.__designDrawn() !== null,
+          });
+          const hunter = read();
+          const m = document.getElementById('method'); m.value = 'rfd4p'; m.dispatchEvent(new Event('change'));
+          const rfd4 = read();
+          m.value = 'hunter'; m.dispatchEvent(new Event('change'));
+          return JSON.stringify({ hunter, rfd4 });
+        })()"""))
+        print(f"  binder example: {binder}")
+        for name, side in binder.items():
+            if side["blocks"] != ["50–120", "B1–115 · 3 hotspots"] or side["hotspots"] != ["40 99 107"]:
+                bad.append(f"under {name} the binder is drawn as {side['blocks']} with hotspots {side['hotspots']}")
+            if side["problems"] or not side["offered"]:
+                bad.append(f"under {name} the binder example cannot run: {side['problems']!r}")
+        if binder["hunter"]["contig"] != "design 50–120  ·  given 115":
+            bad.append(f"the binder is not described to Protein Hunter: {binder['hunter']['contig']!r}")
+        if binder["hunter"]["structure"] != "ppi_pdl1 · chain B 1–115":
+            bad.append(f"the binder's structure line names its placeholder chain: {binder['hunter']['structure']!r}")
 
-        # 🔴 PROTEIN HUNTER IS AN ADVANCED CHOICE NOW, and under it the page is the one it was: its own
-        # controls, its notes, its examples - and the old default job, set here, is described to it.
+        # 🔴 A SEGMENT IS ADDED BY WHAT IT IS - a DNA strand, a ligand - from one picker, and lands as
+        # its own card with its own settings; Use selection on a target's card sets its hotspots.
+        added = json.loads(cdp.evaluate(ws, """(() => {
+          const add = document.getElementById('add-span');
+          const kinds = [...add.options].map((o) => o.value).filter(Boolean);
+          const before = window.__designSpans.read().length;
+          add.value = 'dna'; add.dispatchEvent(new Event('change'));
+          const spans = window.__designSpans.read();
+          const last = document.querySelector('#contig-rows .contig-row:last-child');
+          const out = { kinds, grew: spans.length - before, last: spans.at(-1), reset: add.value,
+            focused: last.contains(document.activeElement),
+            card: [...last.querySelectorAll('label')].map((l) => l.textContent.trim()) };
+          window.__designSpans.set(spans.slice(0, before));
+          // Use selection, with residues of B selected and one of the binder's own sketch
+          const entry = Object.values(window.py2dmol_viewers ?? {}).at(-1);
+          const r = entry?.renderer ?? entry;
+          const pick = [];
+          r.chains.forEach((c, i) => { if (c === 'B' && [10, 11, 12].includes(Number(r.residueNumbers[i]))) pick.push(i); });
+          r.setResidueSelection(new Set(pick));
+          const use = [...document.querySelectorAll('#contig-rows .contig-use-selection')];
+          use[0]?.click();
+          out.used = window.__designSpans.read().find((s) => s.kind === 'segment')?.hotspots;
+          r.clearResidueSelection();
+          return JSON.stringify(out);
+        })()"""))
+        print(f"  add a segment: {added}")
+        if added["kinds"] != ["generated", "protein", "dna", "rna", "segment", "ligand", "break"]:
+            bad.append(f"Add a segment offers {added['kinds']}")
+        if added["grew"] != 1 or added["last"].get("kind") != "sequence" or added["last"].get("polymer") != "dna" \
+                or added["reset"] != "" or not added["focused"]:
+            bad.append(f"adding a DNA sequence did not add one DNA card and focus it: {added}")
+        if added["used"] != "10-12":
+            bad.append(f"Use selection on the target's card set its hotspots to {added['used']!r}, expected 10-12")
+        cdp.evaluate(ws, choose % "")
+
+        # 🔴 UNDER PROTEIN HUNTER, THE DEFAULT: its own controls, its notes, its examples - and the
+        # page's old default job, set here, described to it.
         cdp.evaluate(ws, """(() => {
           const pick = document.getElementById('method');
           pick.value = 'hunter';
@@ -365,7 +437,7 @@ def main():
                        f"{sorted(set(rowsByChain))} against {sorted(set(page['legendColours']))}")
         if len(rowsByChain) != 2:
             bad.append(f"expected two chained rows, got {page['rowColours']}")
-        # Protein Hunter takes six of the ten examples, and four goals are disabled with a reason.
+        # Protein Hunter takes six of the ten examples; the other four are listed with their reason.
         if page["presetsOffered"] != 6:
             bad.append(f"{page['presetsOffered']} examples offered under Hunter, expected 6")
         if len(page["presetsRefused"]) != 4:
@@ -373,9 +445,6 @@ def main():
         for text in page["presetsRefused"]:
             if "—" not in text:
                 bad.append(f"an unavailable example gives no reason: {text!r}")
-        if sorted(page["goalsDisabled"]) != ["custom_cath_monomer", "dna_7m5w", "ppi_pdl1", "sm_sam"] \
-                or not all(page["goalReasons"]):
-            bad.append(f"under Hunter the goals disabled are {page['goalsDisabled']}, each with its reason")
         if page["spanRows"] != 3:
             bad.append(f"the span editor drew {page['spanRows']} rows, expected 3")
         # 🔴 THE LINE DESCRIBES WHAT THE SELECTED METHOD WILL ACTUALLY BE ASKED: chains for Hunter.
@@ -385,8 +454,8 @@ def main():
             bad.append(f"the preset picker lists {page['presets']} entries, expected 10 plus the blank")
         if page["columns"] != 5:
             bad.append(f"{page['columns']} result columns under Hunter, expected 5")
-        if page["constraintsHidden"] is not True:
-            bad.append("the constraints step is on screen under Protein Hunter, which takes none")
+        if page["conditionsShown"]:
+            bad.append("RFD4-Proteina's constraints are on screen under Protein Hunter, which takes none")
 
         # ...and that the automatic choice is wired to the target, not printed.
         cdp.evaluate(ws, f"""(() => {{ window.__designSpans.set({json.dumps(WITH_LIGAND)}); return 1; }})()""")
@@ -518,7 +587,7 @@ def main():
             })"""))
             if hunted["failed"]:
                 break
-            if hunted["button"] == "Hunt" and hunted["rows"] > 0:
+            if hunted["button"] == "Design" and hunted["rows"] > 0:
                 break
             time.sleep(2)
 
@@ -569,6 +638,28 @@ def main():
             # deceptively well.
             if hunted["cycle0Best"]:
                 bad.append("cycle 0 was marked best; it is the starting draw and cannot win")
+            # 🔴 THE SEQUENCE STAYS THROUGH THE RUN AND IS THE DESIGN'S: the strip lists the designed
+            # chain's letters as the last cycle wrote them, and stepping back to cycle 0 - the
+            # mostly-X draw the hunt started from - changes what it shows.
+            seq = json.loads(cdp.evaluate(ws, """(async () => {
+              const box = document.getElementById('sequence-viewer-container');
+              const letters = () => (window.SEQ.layout()?.residuePositions ?? [])
+                .filter((p) => p.residueData?.chain === 'B').map((p) => p.residueData.letter).join('');
+              const lastLine = [...document.querySelectorAll('#cycle-track > *')].at(-1)?.textContent.trim().split(/\\s+/)[1] ?? '';
+              const shown = box.style.display !== 'none' && box.offsetParent !== null;
+              const last = letters();
+              const entry = Object.values(window.py2dmol_viewers ?? {})[0];
+              (entry?.renderer ?? entry).setFrame(0);
+              await new Promise((done) => setTimeout(done, 400));
+              const first = letters();
+              return JSON.stringify({ shown, last, lastLine, first,
+                hint: document.getElementById('sequence-hint').textContent });
+            })()"""))
+            print(f"        strip: {seq}")
+            if not seq["shown"] or seq["last"] != seq["lastLine"] or not seq["last"]:
+                bad.append(f"after a hunt the strip does not show the design's sequence: {seq}")
+            if seq["first"] == seq["last"]:
+                bad.append(f"the strip did not follow the play bar back to cycle 0: {seq}")
 
         # 🔴 A STRUCTURE SEGMENT WITHOUT A STRUCTURE MUST BE REFUSED, on both
         # methods and for different reasons - Hunter needs the sequence to fold,
@@ -855,7 +946,7 @@ def main():
                     .map((n) => n.textContent).join(' | '),
                   button: document.getElementById('hunt').textContent.trim(),
                 })"""))
-                if veto["button"] == "Hunt" and veto["rows"] > 0:
+                if veto["button"] == "Design" and veto["rows"] > 0:
                     break
                 time.sleep(2)
             print(f"  contact veto: rejected={veto['rejected']} | {veto['status'][:70]}")
@@ -911,7 +1002,7 @@ def main():
                       last: [...document.querySelectorAll('#cycle-track > *')]
                         .map((n) => n.textContent.trim().split(/\s+/)[1] ?? '').pop() ?? '',
                     })"""))
-                    if case["failed"] or (case["button"] == "Hunt" and case["rows"] > 0):
+                    if case["failed"] or (case["button"] == "Design" and case["rows"] > 0):
                         break
                     time.sleep(2)
                 print(f"  {label}: rows={case['rows']} | {case['status'][:60]}")
@@ -935,16 +1026,33 @@ def main():
         # `specMode` is driven by its structure's ANNOTATIONS and its contig is
         # written in the original entry's numbering. Only a generation says so.
         if "--presets" in sys.argv:
-            for preset in PRESET_TOKENS:
+            # 🔴 AND UNDER PROTEIN HUNTER TOO, every example it is offered: a one-cycle hunt each, which is
+            # what says the binder (and the DNA binder) run under both methods - not that they load.
+            offered = set(json.loads(cdp.evaluate(ws, """JSON.stringify((() => {
+              const m = document.getElementById('method'); m.value = 'hunter'; m.dispatchEvent(new Event('change'));
+              return [...document.querySelectorAll('#preset option')].filter((o) => o.value && !o.disabled).map((o) => o.value);
+            })())""")))
+            runs = [("rfd4p", preset) for preset in PRESET_TOKENS] \
+                + [("hunter", preset) for preset in PRESET_TOKENS if preset in offered]
+            for method, preset in runs:
                 cdp.evaluate(ws, """(() => {
+                  const m = document.getElementById('method'); m.value = '%s'; m.dispatchEvent(new Event('change'));
                   const pick = document.getElementById('preset');
                   pick.value = '%s';
                   pick.dispatchEvent(new Event('change'));
-                  document.getElementById('steps').value = '20';
-                  document.getElementById('results-body').replaceChildren();
-                  document.getElementById('hunt').click();
+                  if (m.value === 'rfd4p') document.getElementById('steps').value = '20';
+                  document.getElementById('cycles').value = '1';
                   return 1;
-                })()""" % preset)
+                })()""" % (method, preset))
+                # Protein Hunter reads a kept segment's sequence out of the structure, so the run waits
+                # for the example's file to land and its segments to be laid out on it.
+                try:
+                    cdp.wait_for(ws, "document.getElementById('contig-problems').textContent.trim() === ''"
+                                 " && window.__designDrawn() !== null", 30, f"{preset} to load")
+                except RuntimeError:
+                    pass
+                cdp.evaluate(ws, """(() => { document.getElementById('results-body').replaceChildren();
+                  document.getElementById('hunt').click(); return 1; })()""")
                 presetDeadline = time.time() + 2400
                 ran = None
                 while time.time() < presetDeadline:
@@ -953,22 +1061,21 @@ def main():
                       failed: document.getElementById('status-message')
                         .classList.contains('error'),
                       rows: document.querySelectorAll('#results-body tr').length,
-                  best: document.querySelectorAll('#results-body tr.best').length,
-                  // The validity cell carries each candidate's own validation
-                  // sentence, which is the only per-candidate number the table
-                  // shows.
-                  verdicts: [...document.querySelectorAll('#results-body tr')]
-                    .map((tr) => tr.lastElementChild?.textContent ?? ''),
                       button: document.getElementById('hunt').textContent.trim(),
+                      strip: (window.SEQ.layout()?.residuePositions ?? []).length,
                     })"""))
-                    if ran["failed"] or (ran["button"] == "Generate" and ran["rows"] > 0):
+                    if ran["failed"] or (ran["button"] == "Design" and ran["rows"] > 0):
                         break
                     time.sleep(3)
-                print(f"  {preset}: {ran['status'][:72]}")
+                print(f"  {method} {preset}: rows={ran['rows']} strip={ran['strip']} | {ran['status'][:72]}")
                 if ran["failed"]:
-                    bad.append(f"preset {preset} failed to generate: {ran['status']}")
-                elif "tokens" not in ran["status"]:
-                    bad.append(f"preset {preset} did not report its tokens: {ran['status']!r}")
+                    bad.append(f"{method}: example {preset} failed: {ran['status']}")
+                elif method == "rfd4p" and "tokens" not in ran["status"]:
+                    bad.append(f"rfd4p: example {preset} did not report its tokens: {ran['status']!r}")
+                elif method == "hunter" and not ran["status"].startswith(("done", "no cycle was eligible")):
+                    bad.append(f"hunter: example {preset} did not finish: {ran['status']!r}")
+                if not ran["failed"] and ran["strip"] == 0:
+                    bad.append(f"{method}: example {preset} finished with no sequence in the strip")
 
         # Pressing Hunt must explain itself rather than throw or do nothing.
         # 🔴 ON RFD4, A GIVEN SEQUENCE MUST BE REFUSED FOR THE RIGHT REASON.
@@ -998,6 +1105,7 @@ def main():
         # spans, picks RFD4, and leaves no problem to report.
         loaded = json.loads(cdp.evaluate(ws, """(() => {
           const pick = document.getElementById('preset');
+          // (still RFD4-Proteina, from the arm above: an example keeps the method it was chosen under)
           pick.value = 'motif_idx_1prw';
           pick.dispatchEvent(new Event('change'));
           return JSON.stringify({
@@ -1045,11 +1153,11 @@ def main():
         if loaded["rows"] != 5:
             bad.append(f"the preset filled {loaded['rows']} rows, expected 5")
         if loaded["method"] != "rfd4p":
-            bad.append("loading an RFD4 preset did not select RFD4")
+            bad.append("loading an example changed the method it was chosen under")
         if loaded["problems"] != "":
             bad.append(f"the preset reported a problem: {loaded['problems']!r}")
-        if loaded["button"] != "Generate":
-            bad.append(f"the button says {loaded['button']!r} on RFD4, expected Generate")
+        if loaded["button"] != "Design":
+            bad.append(f"the button says {loaded['button']!r} on RFD4, expected Design")
 
         # 🔴 AND THE FOLD-CONDITIONED PRESET, which the editor could not express
         # at all until labelled spans existed - it used to refuse to load it
@@ -1147,22 +1255,26 @@ def main():
               // nothing selected: the actions are disabled, which is the refusal
               const empty = document.getElementById('condition-add').disabled
                 && [...document.querySelectorAll('.condition-quick button')].every((b) => b.disabled);
+              // under Protein Hunter the constraints go and the selection's two actions stay
               const m = document.getElementById('method'); m.value = 'hunter'; m.dispatchEvent(new Event('change'));
-              const greyed = document.getElementById('step-constraints').hidden;
+              const shown = (el) => el !== null && !el.hidden && el.offsetParent !== null;
+              const quick = (key) => shown(document.querySelector(`.condition-quick [data-condition=${key}]`));
+              const greyed = !shown(document.getElementById('condition-rows')) && !quick('C_CRD')
+                && quick('C_HOT') && shown(document.getElementById('selectionToSpans'))
+                && document.getElementById('constraints-title').textContent === 'Selection';
               m.value = 'rfd4p'; m.dispatchEvent(new Event('change'));
               return JSON.stringify({ added, empty, greyed, chip,
                 rows: [...document.querySelectorAll('#condition-rows li')].length,
-                regreyed: document.getElementById('step-constraints').hidden });
+                regreyed: !shown(document.getElementById('condition-rows')) || !quick('C_CRD') });
             })()"""))
             print(f"  condition editor: clicked {target['chain']}{target['num']} -> {editor}")
             want = {"C_MCOORD": {"COORDINATING": [
                 {"select": f"sel('{target['chain']}/*/[{target['num']}]/[OD1,OD2]')"}]}}
-            # The spans the CATH example left still carry their C_SEC labels, and those are still
-            # the job: the editor's row is merged AFTER them, never in their place.
+            # "A new protein" took the CATH example's labelled segments away, so the editor's row is
+            # the whole of the conditions (test/condition-editor.test.js holds the merge order).
             added = editor["added"] or {}
-            if added.get("C_MCOORD") != want["C_MCOORD"] or list(added)[-1:] != ["C_MCOORD"] \
-                    or "C_SEC" not in added:
-                bad.append(f"the clicked residue became {added}, expected the spans' C_SEC then {want}")
+            if added != want:
+                bad.append(f"the clicked residue became {added}, expected {want}")
             if editor["rows"] != 1:
                 bad.append(f"the editor shows {editor['rows']} rows, expected 1")
             # 🔴 THE CHIP NAMES THE RESIDUE AS A READER WOULD, not as the selection syntax does.
@@ -1171,7 +1283,8 @@ def main():
             if editor["empty"] is not True:
                 bad.append("with nothing selected the constraint actions are still live")
             if not editor["greyed"] or editor["regreyed"]:
-                bad.append("the constraints step is not hidden under Protein Hunter and back under RFD4-Proteina")
+                bad.append("the constraints are not taken away under Protein Hunter (keeping the selection's"
+                           " Keep and Mark as hotspot) and brought back under RFD4-Proteina")
             # 🔴 AND THE FOLD PAGE'S SEQUENCE STRIP, REUSED: a real DRAG along it selects a run (the
             # same `residueSelection` a click sets), and "Add as spans" appends that run to the job as a
             # From structure span in the structure's own numbering.
@@ -1201,13 +1314,13 @@ def main():
                   const before = window.__designSpans.read().length;
                   document.getElementById('selectionToSpans').click();
                   const spans = window.__designSpans.read();
-                  // the quick action: one press, the selection becomes a named chip
+                  // the quick action: one press, and the selection is the kept segment's hotspots
                   document.querySelector('.condition-quick [data-condition=C_HOT]').click();
-                  const chips = [...document.querySelectorAll('#condition-rows li')].map((li) => li.textContent);
-                  // and a block of the diagram opens its own row
+                  const marked = window.__designSpans.read().filter((s) => s.kind === 'segment').at(-1)?.hotspots ?? '';
+                  // and a block of the diagram marks its own card
                   const blocks = document.querySelectorAll('#chain-diagram .chain-block');
                   blocks[blocks.length - 1].click();
-                  const opened = document.querySelectorAll('#contig-rows .contig-more').length;
+                  const opened = document.querySelectorAll('#contig-rows .contig-row.selected').length;
                   // the strip's own buttons, wired by py2Dmol's panel (sokrypton/py2Dmol#32), not here
                   const size = () => (r.residueSelection ? r.residueSelection.size : 0);
                   document.getElementById('selectAllResidues').click();
@@ -1217,10 +1330,14 @@ def main():
                   document.getElementById('selectAllResidues').click();
                   document.getElementById('clearAllResidues').click();
                   return JSON.stringify({ chains: [...new Set(sel.map((i) => r.chains[i]))],
-                    nums: sel.map((i) => r.residueNumbers[i]), added: spans.slice(before), chips, opened,
+                    nums: sel.map((i) => r.residueNumbers[i]), added: spans.slice(before), marked, opened,
                     // the structure's positions: Select all takes no sketched piece
                     buttons: { n: r.chains.filter((c) => !(window.__designDrawn()?.ghosts ?? []).includes(c)).length,
-                      all, inverted, cleared: size() } });
+                      all, inverted, cleared: size(),
+                      // ...and the strip lists no sketched piece (py2Dmol's listsChain)
+                      strip: (window.SEQ.layout()?.residuePositions ?? []).length,
+                      stripSketched: (window.SEQ.layout()?.residuePositions ?? [])
+                        .filter((p) => (window.__designDrawn()?.ghosts ?? []).includes(p.residueData?.chain)).length } });
                 })()"""))
                 print(f"  sequence strip: dragged {dragged['chains']} {dragged['nums'][:1]}..{dragged['nums'][-1:]}"
                       f" -> {dragged['added']}")
@@ -1230,14 +1347,14 @@ def main():
                 elif dragged["added"] != [{"kind": "segment", "chain": dragged["chains"][0], "first": nums[0],
                                            "last": nums[-1], "hotspots": ""}]:
                     bad.append(f"Add as spans appended {dragged['added']}, expected the dragged run")
-                run = f"{dragged['chains'][0]}{nums[0]}\u2013{nums[-1]}" if nums else "?"
-                if not any(c.startswith(f"Hotspot \u00b7 {run}") for c in dragged["chips"]):
-                    bad.append(f"the quick Hotspot action did not chip {run}: {dragged['chips']}")
-                if dragged["opened"] < 1:
-                    bad.append("clicking a block of the chain diagram did not open its row")
+                run = f"{nums[0]}-{nums[-1]}" if nums else "?"
+                if dragged["marked"] != run:
+                    bad.append(f"Mark as hotspot did not put {run} on the kept segment: {dragged['marked']!r}")
+                if dragged["opened"] != 1:
+                    bad.append("clicking a block of the chain diagram did not mark its card")
                 b = dragged["buttons"]
                 print(f"  strip buttons: {b}")
-                if (b["all"], b["inverted"], b["cleared"]) != (b["n"], 0, 0):
+                if (b["all"], b["inverted"], b["cleared"], b["stripSketched"]) != (b["n"], 0, 0, 0) or b["strip"] < 100:
                     bad.append(f"the strip's Select all / Invert / Unselect do not act on the input: {b}")
             # ...and, with --generate, a real generation from it: the archived job must carry the
             # row, merged into the conditions the engine was handed, and the run must finish.
@@ -1261,9 +1378,17 @@ def main():
                         break
                     time.sleep(3)
                 print(f"  conditioned generation: {state.get('status')}")
-                hidden = cdp.evaluate(ws, "document.getElementById('sequence-viewer-container').style.display")
-                if hidden != "none":
-                    bad.append(f"the sequence strip stayed up over a design ({hidden!r}): its residues are not the input's")
+                # 🔴 THE STRIP STAYS OVER THE DESIGN, showing its sequence (it used to be hidden, which
+                # took the sequence away just as it was being designed) - and picks nothing a condition
+                # could name, because only the input's residues can be picked.
+                strip = json.loads(cdp.evaluate(ws, """JSON.stringify({
+                  display: document.getElementById('sequence-viewer-container').style.display,
+                  cells: (window.SEQ.layout()?.residuePositions ?? []).length,
+                  hint: document.getElementById('sequence-hint').textContent })"""))
+                tokens = int((state.get("status", "").split(" tokens")[0].split()[-1:] or ["0"])[0] or 0) \
+                    if " tokens" in state.get("status", "") else 0
+                if strip["display"] == "none" or strip["cells"] != tokens or "design" not in strip["hint"]:
+                    bad.append(f"the sequence strip does not show the design's sequence after a generation: {strip}")
                 if state.get("failed") or not state.get("status", "").startswith("done"):
                     bad.append(f"a generation with an editor condition did not finish: {state}")
                 else:

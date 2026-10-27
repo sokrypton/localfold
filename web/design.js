@@ -1,13 +1,10 @@
 /**
  * design.js
  * ---------
- * AI Context: THE PROTEIN HUNTER PAGE'S CONTROLS
+ * AI Context: THE DESIGN PAGE - Protein Hunter's loop (the default) and RFD4-Proteina's generation
  *
- * 🔴 THE LOOP IS NOT WIRED. This module makes the controls real and says so
- * when Hunt is pressed. What IS real here is everything that can be real
- * without a GPU run: the target list, the designer's automatic choice (through
- * `chooseDesigner`, the same rule the loop will use), the folder count advice,
- * and whether this browser can run a hunt at all.
+ * The page's five steps, in design.html's order: the method and its models, an example to start
+ * from, the segments (one card each, web/contig-ui.js), what is selected in the viewer, and the run.
  *
  * 🔴 WHY THE AUTOMATIC DESIGNER WRITES ITS REASON OUT. A picker that silently
  * changes its own value is worse than one that cannot - `cpu/design/designers.js`
@@ -18,7 +15,7 @@
  */
 import {
   chainColour, chainOfSpans, chainsOf, CONDITION_COLOURS, conditionsOf, contigOf, createContigList,
-  drawChainDiagram, drawLengths, HOTSPOT_COLOUR, spansFromAnnotatedAtoms, hotspotsOf, INPUT_COLOUR, LIGAND_COLOUR, shade, spansFromContig,
+  drawChainDiagram, drawLengths, HOTSPOT_COLOUR, hotspotsOf, INPUT_COLOUR, LIGAND_COLOUR, shade,
 } from "./contig-ui.js";
 import { DEFAULT_STEPS, generate } from "./generate.js";
 import { writeZip } from "./zip.js";
@@ -33,12 +30,12 @@ import { CHAIN_IDS, MAX_ALANINE } from "../webgpu/design/hunter-loop.js";
 import { hunt } from "./hunt.js";
 import { createStructureViewer } from "./viewer.js";
 import {
-  createConditionEditor, describePicks, inputResidueMap, inputStructureAtoms, picksOf, segmentsOf,
+  createConditionEditor, inputResidueMap, inputStructureAtoms, picksOf, residueRanges, segmentsOf,
 } from "./condition-editor.js";
 import { sketchJob } from "./job-sketch.js";
+import { exampleSpans } from "./example-spans.js";
 import { toPdbString } from "../shared/rfd4p/output.js";
 import { alignToReference } from "../cpu/design/align.js";
-import { translateSpans } from "../cpu/design/source-numbering.js";
 import { HUNTER_CANNOT, presetSuits } from "../cpu/design/preset-methods.js";
 
 const element = (id) => {
@@ -56,12 +53,18 @@ const element = (id) => {
  * `cpu/design/designers.js` owns it.
  */
 const NUCLEIC = new Set(["dna", "rna"]);
+/** Deoxy- and ribonucleotides by their base, and which polymer each is. */
+const NUCLEOTIDE = { DA: "A", DC: "C", DG: "G", DT: "T", A: "A", C: "C", G: "G", U: "U" };
+const DEOXY = new Set(["DA", "DC", "DG", "DT"]);
 
-const contentsOf = (spans) => ({
-  ligands: spans.filter((span) => span.kind === "ligand").length,
-  nucleic: spans.filter((span) => span.kind === "sequence" && NUCLEIC.has(span.polymer ?? ""))
-    .length,
-});
+function contentsOf(spans) {
+  return {
+    ligands: spans.filter((span) => span.kind === "ligand").length,
+    // a kept strand of a loaded structure is nucleic too (the DNA-binder example's two)
+    nucleic: spans.filter((span) => (span.kind === "sequence" && NUCLEIC.has(span.polymer ?? ""))
+      || (span.kind === "segment" && NUCLEIC.has(polymerOf(String(span.chain ?? ""))))).length,
+  };
+}
 
 // 🔴 THE METHOD PICKER IS LOOKED UP FIRST, before anything that reads it. The
 // span list calls its `method` callback while drawing its initial rows inside
@@ -101,51 +104,7 @@ const roleList = element("role-list");
 // fifth time this file has been bitten by exactly that.
 const presetSelect = element("preset");
 const presetNote = element("preset-note");
-const goalGrid = element("goals");
-
-/**
- * 🔴 WHAT A NEWCOMER CAME TO MAKE, AS THE FIRST QUESTION (2026-10-27). Each card loads the worked
- * example that is that goal - or, for a new protein, the blank job - and so picks the method that
- * runs it; the method itself is an Advanced setting. Every example is still in "More examples".
- * A function declaration, because `paintMethod` reaches it while the module constructs.
- */
-function goals() {
-  return [
-    { id: "blank", icon: "fa-wand-magic-sparkles", title: "New protein", text: "From scratch, any length" },
-    { id: "ppi_pdl1", icon: "fa-link", title: "Binder", text: "Bind a protein target (PD-L1)" },
-    { id: "motif_idx_1prw", icon: "fa-puzzle-piece", title: "Scaffold a motif", text: "Keep a site, build around it" },
-    { id: "sm_sam", icon: "fa-flask", title: "Ligand pocket", text: "Hold a small molecule (SAM)" },
-    { id: "dna_7m5w", icon: "fa-dna", title: "DNA binder", text: "Bind double-stranded DNA" },
-    { id: "custom_cath_monomer", icon: "fa-shapes", title: "A given fold", text: "CATH class and helices, strands" },
-    { id: "partial_diffusion_1prw", icon: "fa-shuffle", title: "Diversify", text: "Variants of an existing protein" },
-    { id: "inverse_folding_1prw", icon: "fa-font", title: "New sequence", text: "Redesign a backbone's sequence" },
-  ];
-}
-let goalChosen = "blank";
-
-/** The cards, marked with the one chosen; a card the method cannot run is disabled with its reason. */
-function paintGoals() {
-  goalGrid.replaceChildren(...goals().map((goal) => {
-    const card = document.createElement("button");
-    card.type = "button";
-    card.className = "goal-card";
-    card.dataset.goal = goal.id;
-    card.setAttribute("role", "radio");
-    card.setAttribute("aria-checked", goal.id === goalChosen ? "true" : "false");
-    const suits = goal.id === "blank" || presetSuits(goal.id, method.value);
-    card.disabled = !suits;
-    card.title = suits ? goal.text : `${HUNTER_CANNOT[goal.id]} (switch the method in Advanced)`;
-    const icon = document.createElement("i");
-    icon.className = `fa-solid ${goal.icon}`;
-    const title = document.createElement("strong");
-    title.textContent = goal.title;
-    const text = document.createElement("span");
-    text.textContent = goal.text;
-    card.append(icon, title, text);
-    card.addEventListener("click", () => chooseGoal(goal.id));
-    return card;
-  }));
-}
+const methodNote = element("method-note");
 
 /** Results' columns, by method: a hunt's cycles, or a generation's designs. */
 function paintResultsHead() {
@@ -325,6 +284,7 @@ spanList = createContigList(element("contig-rows"), element("add-span"), {
   initial: BLANK_JOB(),
   method: () => method.value,
   onChange: () => paintJob(),
+  hotspotsFromSelection: (span) => selectedWithin(span),
 });
 
 const contigLine = element("contig-line");
@@ -351,7 +311,7 @@ const contigProblems = element("contig-problems");
 function paintLegend(spans) {
   const chains = [...new Set(chainOfSpans(spans).filter((at) => at !== null))]
     .sort((a, b) => a - b);
-  const { chainIndex } = chainsOf(spans, { sequenceOf: resolver() });
+  const { chainIndex } = chainsOf(spans, readers());
   const entry = (colour, text) => {
     const item = document.createElement("li");
     const swatch = document.createElement("span");
@@ -373,10 +333,9 @@ function paintLegend(spans) {
 }
 
 /**
- * 🔴 EVERY HOTSPOT THE JOB HAS, WHEREVER IT WAS SET: the loaded structure's own annotation (how the
- * binder example carries its epitope - in the crop's numbering, which is why the example's spec
- * names other residues), a kept piece's hotspot field, and the constraints marked Hotspot. A
- * hotspot set in any of them was invisible on the page, and the example's were never shown at all.
+ * 🔴 EVERY HOTSPOT THE JOB HAS: a kept segment's hotspot field - where an example's file puts its own
+ * (web/example-spans.js), and where Mark as hotspot writes - and any Hotspot condition row added under
+ * More constraints. One place to read them, so the viewer, the diagram and the run agree.
  * @returns {{chain: string, resId: number, from: string}[]}
  */
 function hotspotResidues(spans) {
@@ -385,19 +344,12 @@ function hotspotResidues(spans) {
     const key = `${chain}:${resId}`;
     if (!out.has(key)) out.set(key, { chain, resId, from });
   };
-  const atoms = loaded?.atoms;
-  const column = atoms?.condition_hotspot_1_atom ?? atoms?.annotations?.condition_hotspot_1_atom;
-  if (column) {
-    for (let i = 0; i < column.length; i += 1) {
-      if (column[i]) add(String(atoms.chain_id[i]), Number(atoms.res_id[i]), "structure");
-    }
-  }
   for (const span of spans) {
     if (span.kind !== "segment") continue;
     const chain = String(span.chain ?? "").trim();
     for (const piece of String(span.hotspots ?? "").split(/[^0-9-]+/).filter(Boolean)) {
       const [first, last = first] = piece.split(/(?<=\d)-/).map(Number);
-      for (let r = first; r <= last; r += 1) add(chain, r, "piece");
+      for (let r = first; r <= last; r += 1) add(chain, r, "segment");
     }
   }
   for (const row of conditionEditor?.rows ?? []) {
@@ -407,46 +359,16 @@ function hotspotResidues(spans) {
   return [...out.values()];
 }
 
-/** The hotspot line under the diagram: which residues, and what a hotspot is. */
-function paintHotspotLine(spans) {
-  const line = element("hotspot-line");
-  const hot = hotspotResidues(spans);
-  // ...and the "none yet" hint only where there is a TARGET - a chain nothing in which is designed:
-  // a motif scaffold keeps pieces of its own chain, and has nothing to touch
-  const chainOf = chainOfSpans(spans);
-  const designed = new Set(spans.flatMap((span, i) => (span.kind === "generated" ? [chainOf[i]] : [])));
-  const target = spans.some((span, i) => span.kind === "segment" && !designed.has(chainOf[i]));
-  line.hidden = hot.length === 0 && !target;
-  line.replaceChildren();
-  const swatch = document.createElement("span");
-  swatch.className = "role-swatch";
-  swatch.style.setProperty("--chain-colour", HOTSPOT_COLOUR);
-  const strong = document.createElement("strong");
-  strong.textContent = "Hotspots";
-  const what = document.createElement("span");
-  what.className = "hotspot-what";
-  what.textContent = " \u2014 residues of the target the design should touch.";
-  if (hot.length > 0) {
-    const fromFile = hot.some((h) => h.from === "structure");
-    line.append(swatch, strong, ` ${describePicks(hot)}`, what,
-      ...(fromFile ? [Object.assign(document.createElement("span"), { className: "hotspot-what",
-        textContent: " Set by the example's structure." })] : []));
-  } else {
-    line.append(swatch, strong, ": none.", what, Object.assign(document.createElement("span"), {
-      className: "hotspot-what",
-      textContent: method.value === "hunter"
-        ? " Add residue numbers in a kept piece's \u22ef settings to aim the design at a site."
-        : " To aim the design at a site, select target residues and press Mark as hotspot in step 4.",
-    }));
-  }
+/** What chainsOf reads off the loaded structure: a segment's sequence, and what its chain is made of. */
+function readers() {
+  return { sequenceOf: resolver(), polymerOf };
 }
 
 const paintJob = () => {
   const spans = spanList?.read() ?? [];
   paintLegend(spans);
   drawChainDiagram(element("chain-diagram"), spans, { onPick: (index) => spanList.reveal(index),
-    hotspots: hotspotResidues(spans) });
-  paintHotspotLine(spans);
+    hotspots: hotspotResidues(spans), selected: spanList?.selected ?? -1 });
   const hunter = method.value === "hunter";
   const { contig, problems, tokens } = contigOf(spans, method.value);
   const span = tokens.min === tokens.max ? `${tokens.min}` : `${tokens.min}\u2013${tokens.max}`;
@@ -456,15 +378,15 @@ const paintJob = () => {
   // no contig notation, so the line read "/0,75-75" for a job whose target is
   // 114 residues long. Hunter is told about its chains instead.
   if (hunter) {
-    const { chains, chainIndex, length } = chainsOf(spans, { sequenceOf: resolver() });
-    const { hold } = chainsOf(spans, { sequenceOf: resolver() });
+    const { chains, chainIndex, length } = chainsOf(spans, readers());
+    const { hold } = chainsOf(spans, readers());
     // 🔴 A RANGE IS REPORTED AS A RANGE. Hunter resolves one length per run now,
     // and `chainsOf` takes the minimum - so a contig asking for 5-20 residues
     // described itself as "design 5", which is one draw out of sixteen and not
     // what the job says. Both ends are taken by pinning the spans each way.
     const pinned = (end) => chainsOf(spans.map((span) => (span.kind === "generated"
       ? { ...span, min: span[end], max: span[end] } : span)),
-    { sequenceOf: resolver() }).length;
+    readers()).length;
     const shortest = pinned("min");
     const longest = pinned("max");
     const described = chains.map((chain, index) => {
@@ -492,7 +414,7 @@ const paintJob = () => {
     contigLine.title = contig;
   }
 
-  const theirs = hunter ? chainsOf(spans, { sequenceOf: resolver() }).problems : problems;
+  const theirs = hunter ? chainsOf(spans, readers()).problems : problems;
   contigProblems.textContent = theirs.join(" · ");
   contigProblems.classList.toggle("warn", theirs.length > 0);
   paintDesignerNote(spans);
@@ -543,7 +465,7 @@ const UNUSED_BY = {
  * do, and one fewer block of prose in the panel.
  */
 const RESTING = {
-  hunter: "Ready. Protein Hunter folds, redesigns and folds again, cycle by cycle.",
+  hunter: "Ready. Press Design to hunt, or pick an example first.",
   rfd4p: "Ready. The first run downloads about 420 MB of model weights.",
 };
 
@@ -570,32 +492,34 @@ advancedButton.addEventListener("click", () => {
   paintAdvanced();
 });
 
-const paintMethod = () => {
+/** What each method is, in one sentence under the picker. */
+const METHOD_NOTES = {
+  hunter: "Folds a sequence, redesigns it and folds it again, cycle by cycle - you watch the design"
+    + " converge. The folding model's confidence is what it optimises.",
+  rfd4p: "Generates the structure directly, conditioned on what you keep and constrain."
+    + " The first run downloads about 420 MB of weights.",
+};
+
+function paintMethod() {
   const hunter = method.value === "hunter";
-  // 🔴 ONE CONTROL, TWO MEANINGS, AND THE LABEL SAYS WHICH. Both methods sample
-  // a structure over steps; a hunt's are the fold's diffusion steps and RFD4's
-  // are its flow steps.
+  // 🔴 ONE CONTROL, TWO MEANINGS, AND THE LABEL SAYS WHICH. Both methods sample a structure over
+  // steps; a hunt's are the fold's diffusion steps and RFD4's are its flow steps.
   stepsTitle.textContent = hunter ? "Diffusion steps" : "Flow steps";
-  // 🔴 AND ONE DEFAULT EACH. The box said 25 for both, which is the fold's
-  // diffusion count and NOT RFD4-Proteina's: upstream samples 60 flow steps
-  // (`configs/generation/inference_base.yaml`), and the native port records 25
-  // as under-converged - one seed in three came out at CA-CA 4.50 A. A value the
-  // user typed is theirs; only the other method's untouched default is swapped.
+  // 🔴 AND ONE DEFAULT EACH: upstream samples 60 flow steps, the fold 25. A value the user typed is
+  // theirs; only the other method's untouched default is swapped.
   const steps = element("steps");
   const mine = hunter ? HUNTER_STEPS : RFD4_STEPS;
   const theirs = hunter ? RFD4_STEPS : HUNTER_STEPS;
   if (Number(steps.value) === theirs) steps.value = String(mine);
+  methodNote.textContent = METHOD_NOTES[method.value] ?? "";
   if (running === null) say(RESTING[method.value] ?? "");
-  // 🔴 THE BUTTON SAYS WHICH MACHINE IT STARTS. "Hunt" is the loop; RFD4
-  // generates in one pass and calling that a hunt would misdescribe it.
-  if (running === null) huntLabel.textContent = hunter ? "Hunt" : "Generate";
   // The examples are the method's: four of the ten are RFD4-only.
   paintPresets();
+  // the cards draw only the controls the method uses (secondary structure is RFD4-Proteina's)
+  spanList.repaint();
   paintJob();
   paintCost();
-  // 🔴 BOTH DIRECTIONS, from one map. Every group either method cannot use is
-  // greyed WITH ITS REASON and never removed - a control that vanishes when the
-  // method changes teaches nothing and makes the reader hunt for it again.
+  // 🔴 HIDDEN, FROM ONE MAP: every group the method cannot use, and nothing explains the absence.
   const unusable = UNUSED_BY[method.value] ?? {};
   conditionEditor?.disable(hunter ? HUNTER_NO_CONDITIONS : null);
   for (const id of new Set([...Object.keys(UNUSED_BY.hunter), ...Object.keys(UNUSED_BY.rfd4p)])) {
@@ -606,14 +530,14 @@ const paintMethod = () => {
     if (why !== undefined) group.dataset.why = why;
   }
   unusedNote.textContent = "";
-  // Constraints are RFD4-Proteina's; Protein Hunter takes hotspots on its spans.
-  element("step-constraints").hidden = hunter;
+  // The selection step: keep and aim under either method, and constrain under RFD4-Proteina.
+  element("constraints-title").textContent = hunter ? "Selection" : "Selection and constraints";
   // The Designs count is a hunt's sequences a cycle.
   element("beam-title").textContent = hunter ? "Sequences" : "Designs";
   paintResultsHead();
-  paintGoals();
   paintAdvanced();
-};
+  paintSelectionStep();
+}
 
 method.addEventListener("change", paintMethod);
 paintMethod();
@@ -808,10 +732,10 @@ function paintInput() {
   const letters = Array.from(renderer.chains ?? [], String);
   for (const [letter, { chain }] of inputView.ghosts) {
     const positions = letters.flatMap((l, i) => (l === letter ? [i] : []));
-    // 🔴 PALE AS WELL AS TRANSLUCENT: py2Dmol's 2D painter (the one a browser without WebGL2 gets)
-    // lays every piece down opaque, so the fade alone would leave the sketch solid there.
-    viewer.colourResidues(positions, ghostColour(chain));
-    try { renderer.setOpacity({ positions }, GHOST_OPACITY); } catch { /* an older py2Dmol: drawn solid */ }
+    // both of py2Dmol's painters see through a faded piece (the 2D one since sokrypton/py2Dmol#33),
+    // so the structure behind a sketch stays readable and the sketch keeps its chain's own colour
+    viewer.colourResidues(positions, chainColour(chain));
+    renderer.setOpacity({ positions }, GHOST_OPACITY);
   }
   conditionEditor.rows.forEach((row, index) => {
     const wanted = new Set(row.picks.map((pick) => `${pick.chain}:${pick.resId}`));
@@ -824,9 +748,9 @@ function paintInput() {
   paintViewerBar();
 }
 
-const GHOST_OPACITY = 0.5;
-/** A sketched piece's colour: its chain's, most of the way to white. */
-function ghostColour(chain) { return shade(chainColour(chain), "#ffffff", 0.55); }
+const GHOST_OPACITY = 0.45;
+/** A sketched piece's colour as it reads on paper - its chain's, faded - for the legend's swatch. */
+function ghostColour(chain) { return shade(chainColour(chain), "#ffffff", 1 - GHOST_OPACITY); }
 
 /** The job as the viewer draws it: the structure's atoms, then a sketch of each designed piece. */
 function jobDrawing(spans) {
@@ -872,7 +796,10 @@ function showInput() {
   conditionHost.style.display = "";
   // the strip is for picking the STRUCTURE's residues, so it is shown only when there is one
   if (loaded === null) hideSequence();
-  else sequenceBox.style.display = "";
+  else {
+    sequenceBox.style.display = "";
+    sequenceHint.textContent = "Drag along the sequence to select residues.";
+  }
   paintInput();
   window.SEQ?.clear?.();
   if (loaded !== null) window.SEQ?.buildView?.();
@@ -916,21 +843,37 @@ function paintViewerBar() {
 }
 
 // 🔴 THE FOLD PAGE'S SEQUENCE STRIP, REUSED AS IT IS. py2Dmol's panel finds its renderer through
-// these callbacks, and the full bundle's own app set them to a viewer this page does not have. It is
-// handed this page's viewer only while the INPUT is drawn: a design's positions are not the input's
-// residues, and a strip that answered for a design would let a drag pick residues no condition can
-// name. Its selection is the viewer's `residueSelection`, so the editor reads strip and clicks alike.
+// these callbacks, and the full bundle's own app set them to a viewer this page does not have. Its
+// selection is the viewer's `residueSelection`, so the editor reads strip and clicks alike - and
+// only while the INPUT is drawn can a pick name a residue (`inputView`, read by the editor's hooks).
+// 🔴 AND IT STAYS THROUGH A RUN (2026-10-27), showing the design's sequence and changing with it:
+// each cycle of a hunt, each frame of a generation, is a frame of the viewer, and the strip
+// rebuilds on py2Dmol's frame change. It used to be hidden the moment a run began.
 const sequenceBox = element("sequence-viewer-container");
+const sequenceHint = element("sequence-hint");
 window.SEQ?.setCallbacks?.({
-  getRenderer: () => (inputView === null ? null : viewer.renderer ?? null),
+  getRenderer: () => (sequenceBox.style.display === "none" ? null : viewer.renderer ?? null),
   getObjectSelect: () => null,
   applySelection: () => {},
+  // a sketched piece is no sequence, so the strip leaves its chain out (and its Select all and
+  // Invert with it); showInput clears the strip whenever the sketch changes, which re-asks this
+  listsChain: (name, chain) => inputView === null || !inputView.ghosts.has(String(chain)),
 });
 document.addEventListener("py2dmol-residue-selection-change", () => {
   if (inputView !== null && takeGhostPick()) return;
-  if (inputView !== null) window.SEQ?.updateSelection?.();
+  if (sequenceBox.style.display !== "none") window.SEQ?.updateSelection?.();
   conditionEditor?.refreshSelection();
 });
+document.addEventListener("py2dmol-frame-change", () => {
+  if (sequenceBox.style.display !== "none") window.SEQ?.buildViewDeferred?.();
+});
+/** The strip over a design: its sequence, rebuilt as frames arrive (`py2dmol-frame-change`). */
+function showRunSequence() {
+  sequenceBox.style.display = "";
+  sequenceHint.textContent = "The design's sequence, as it changes.";
+  window.SEQ?.clear?.();
+  window.SEQ?.buildViewDeferred?.();
+}
 /**
  * A click on a sketched piece opens its row in step 3, rather than selecting it: a sketch is no
  * residue a constraint could name, and its row is where its length is changed.
@@ -942,7 +885,7 @@ function takeGhostPick() {
   const letters = renderer.chains ?? [];
   const ghost = [...selected].find((i) => inputView.ghosts.has(String(letters[i])));
   if (ghost === undefined) return false;
-  // a click on the sketch alone; Select all and a drag keep only what they took of the structure
+  // a click on the sketch alone; a drag across both keeps only what it took of the structure
   if ([...selected].every((i) => inputView.ghosts.has(String(letters[i])))) {
     spanList.reveal(inputView.ghosts.get(String(letters[ghost])).span);
   }
@@ -950,7 +893,7 @@ function takeGhostPick() {
   renderer.setResidueSelection(new Set([...selected].filter((i) => !inputView.ghosts.has(String(letters[i])))));
   return true;
 }
-/** Hide the strip while a run owns the viewer. */
+/** Hide the strip: nothing with a sequence is drawn. */
 const hideSequence = () => {
   sequenceBox.style.display = "none";
   window.SEQ?.clear?.();
@@ -974,6 +917,50 @@ function keepSelection() {
   say(`kept ${added.filter((span) => span.kind === "segment").length} piece(s) of the structure in the design`);
 }
 
+/**
+ * 🔴 MARK AS HOTSPOT WRITES ONTO THE SEGMENTS, for either method: each picked residue joins the
+ * hotspots of the kept segment that holds it, so the card shows it, both methods read it, and the
+ * reader edits it there. A residue in no kept segment is said, not dropped in silence.
+ */
+function markHotspots(picks) {
+  if (picks.length === 0) throw new Error("select residues first - click them in the viewer or drag along the sequence");
+  const spans = spanList.read();
+  const placed = new Set();
+  const next = spans.map((span) => {
+    if (span.kind !== "segment") return span;
+    const chain = String(span.chain ?? "").trim();
+    const inside = picks.filter((p) => p.chain === chain && p.resId >= Number(span.first) && p.resId <= Number(span.last));
+    if (inside.length === 0) return span;
+    for (const p of inside) placed.add(`${p.chain}:${p.resId}`);
+    const own = hotspotResidues([span]).map((h) => h.resId);
+    return { ...span, hotspots: residueRanges([...own, ...inside.map((p) => p.resId)]).replaceAll(",", " ") };
+  });
+  if (placed.size === 0) {
+    throw new Error("those residues are in no kept segment - keep them in the design first, then mark them");
+  }
+  spanList.set(next);
+  const missed = picks.length - placed.size;
+  say(`marked ${placed.size} hotspot${placed.size === 1 ? "" : "s"}`
+    + (missed > 0 ? `; ${missed} selected residue${missed === 1 ? " is" : "s are"} in no kept segment` : ""));
+}
+
+/** A segment card's "Use selection": the selected residues inside that segment, as its hotspot field. */
+function selectedWithin(span) {
+  const chain = String(span.chain ?? "").trim();
+  const inside = conditionEditor.picksNow()
+    .filter((p) => p.chain === chain && p.resId >= Number(span.first) && p.resId <= Number(span.last));
+  if (inside.length === 0) {
+    throw new Error(`select residues of chain ${chain} ${span.first}\u2013${span.last} first,`
+      + " in the viewer or along the sequence");
+  }
+  return residueRanges(inside.map((p) => p.resId)).replaceAll(",", " ");
+}
+
+/** The selection step is about a structure's residues, so it is shown while there is one. */
+function paintSelectionStep() {
+  element("step-constraints").hidden = loaded === null && (conditionEditor?.rows.length ?? 0) === 0;
+}
+
 conditionEditor = createConditionEditor(conditionHost, {
   peek: () => {
     if (loaded === null) return null;
@@ -983,6 +970,7 @@ conditionEditor = createConditionEditor(conditionHost, {
   },
   colourOf: (index, row) => constraintColour(index, row),
   onKeep: () => keepSelection(),
+  onHotspot: (picks) => markHotspots(picks),
   picks: () => {
     if (inputView === null || viewer.renderer === undefined) {
       showInput();
@@ -1025,7 +1013,7 @@ const startHunt = async () => {
   // what Hunter cannot express - a motif inside a designed chain, two designed
   // chains - and a hunt that cannot express the job must not start.
   const { chains, chainKinds, ligandCodes, modifications, chainIndex, length, hold, problems }
-    = chainsOf(spans, { sequenceOf: resolver() });
+    = chainsOf(spans, readers());
   if (problems.length > 0) {
     say(problems.join(" · "), true);
     return;
@@ -1040,7 +1028,7 @@ const startHunt = async () => {
   viewer.cancelAnimations();
   viewer.reset();
   inputView = null;
-  hideSequence();
+  showRunSequence();
   // A new run is a new frame of reference and a new held set.
   reference = null;
   held = hold;
@@ -1054,7 +1042,7 @@ const startHunt = async () => {
       // rather than a notation the hunt ignores. `drawLengths` is deterministic
       // in the seed and the run, so the same hunt twice is the same hunt.
       job: (run) => chainsOf(drawLengths(spans, { run, seed: number("seed", 0) }),
-        { sequenceOf: resolver() }),
+        readers()),
       chains,
       chainKinds,
       ligandCodes,
@@ -1121,94 +1109,127 @@ const startHunt = async () => {
   } finally {
     running = null;
     paintViewerBar();
-    huntLabel.textContent = method.value === "hunter" ? "Hunt" : "Generate";
+    huntLabel.textContent = "Design";
   }
 };
 
 /**
- * Load one of the engine's worked examples into the spans.
- *
- * 🔴 INTO THE ROWS, NOT INTO A HIDDEN FIELD. A preset is a starting point to
- * edit, so loading one has to leave the user looking at something they can
- * change - which means parsing its contig back into spans. Anything the parser
- * cannot read is reported rather than dropped, because a preset that loaded
- * "most of" its contig would run a different job from the one it names.
+ * 🔴 THE EXAMPLES, AS ONE DROPDOWN (2026-10-27), grouped by what they make and named as a reader
+ * would ask for them; the engine's own title is each option's tooltip. It was eight goal cards and a
+ * second "More examples" picker beside them - two controls for one choice. Each one fills in every
+ * setting below it: the segments, the structure (drawn in the viewer), and its sampler settings.
+ * A function declaration, because `paintMethod` reaches it while the module constructs.
  */
+function exampleGroups() {
+  // [id, what it is called here, what it does - in the words of someone choosing it]
+  return [
+    ["Start from scratch", [
+      ["", "A new protein (100 residues)", "One chain of 100 residues, designed from nothing. Change its length in its card."],
+      ["uncond_short", "Unconditional monomer", "One chain of 100 residues from the RFD4-Proteina example file."]]],
+    ["Binders", [
+      ["ppi_pdl1", "Binder to PD-L1, at its hotspots",
+        "A new chain of 50\u2013120 residues against PD-L1 (chain B), aimed at the three hotspots on B's card."],
+      ["yaml_5o45_binder", "Binder to a 5O45 domain", "A new 70-residue chain against chain A of 5O45."]]],
+    ["Motifs", [
+      ["motif_idx_1prw", "Scaffold an EF-hand motif (1PRW)",
+        "Keeps two calcium-binding loops of 1PRW where they are and designs the protein around them."],
+      ["motif_unidx_1prw", "Scaffold a motif, order free (1PRW)",
+        "The same two loops, which the design may place anywhere in its chain."]]],
+    ["Ligands and nucleic acids", [
+      ["sm_sam", "A pocket for SAM", "A protein that holds S-adenosylmethionine, designed around the ligand."],
+      ["dna_7m5w", "Bind double-stranded DNA", "A new chain against the two DNA strands of 7M5W."]]],
+    ["A given fold", [
+      ["custom_cath_monomer", "A Rossmann fold, helix by strand",
+        "Six segments, each asked for a helix, a loop or a strand, in a Rossmann (CATH 3.40.50) order."]]],
+    ["An existing protein", [
+      ["partial_diffusion_1prw", "Diversify 1PRW", "Variants of 1PRW: half of the way back from its own structure."],
+      ["inverse_folding_1prw", "New sequence for 1PRW's backbone", "A new sequence for 1PRW's backbone, the backbone held."]]],
+  ];
+}
 
 /**
- * The examples the selected method can actually run.
- *
- * 🔴 OFFERING ONE THE METHOD WILL REFUSE IS A CONTROL THAT DOES NOTHING. The
- * examples are RFD4-Proteina's and Protein Hunter can take six of the ten, so
- * under Hunter the other four are listed as unavailable WITH their reason
- * rather than silently dropped - a reader who came for the ligand-pocket
- * example needs to know it is the method and not the page.
- *
- * 🔴 AND A LOADED EXAMPLE THE NEW METHOD CANNOT RUN IS CLEARED, because
- * changing the method would otherwise leave the rows describing a job the
- * button refuses, with the picker still naming it.
+ * The examples dropdown, under the selected method. 🔴 ONE THE METHOD CANNOT RUN STAYS IN THE LIST,
+ * disabled WITH its reason: a reader who came for the ligand pocket needs to know it is the method
+ * and not the page. One already loaded keeps its place, and its card says why it will not run.
  */
 function paintPresets() {
-  const hunter = method.value === "hunter";
-  // 🔴 READ THE SELECTION BEFORE CLEARING IT. `replaceChildren` removes the
-  // options, and a select with no options reports "" - so comparing against
-  // `presetSelect.value` further down compares against nothing and the loaded
-  // example loses its place in the picker on every method change.
   const wasChosen = presetSelect.value;
   presetSelect.replaceChildren();
-  const blank = document.createElement("option");
-  blank.value = "";
-  blank.textContent = "Start from\u2026";
-  presetSelect.append(blank);
-  for (const preset of RFD4P_PRESETS) {
-    const suits = presetSuits(preset.id, method.value);
-    const option = document.createElement("option");
-    option.value = preset.id;
-    option.textContent = suits ? (preset.title ?? preset.id)
-      : `${preset.title ?? preset.id} — ${HUNTER_CANNOT[preset.id]}`;
-    option.disabled = !suits;
-    option.selected = preset.id === wasChosen && suits;
-    presetSelect.append(option);
+  const listed = new Set();
+  for (const [label, entries] of exampleGroups()) {
+    const group = document.createElement("optgroup");
+    group.label = label;
+    for (const [id, text] of entries) {
+      const preset = RFD4P_PRESETS.find((entry) => entry.id === id);
+      if (id !== "" && preset === undefined) continue;
+      listed.add(id);
+      const suits = id === "" || presetSuits(id, method.value);
+      const option = new Option(suits ? text : `${text} — ${HUNTER_CANNOT[id]}`, id);
+      option.title = preset?.title ?? "A designed chain of 100 residues, nothing else";
+      option.disabled = !suits && id !== wasChosen;
+      group.append(option);
+    }
+    presetSelect.append(group);
   }
-  if (!hunter) return;
-  // ...and if the example already loaded is one Hunter cannot run, it goes.
-  const chosen = RFD4P_PRESETS.find((entry) => entry.id === wasChosen);
-  if (chosen !== undefined && !presetSuits(chosen.id, "hunter")) presetSelect.value = "";
+  // ...and any example the groups above do not name, so a new one is never unreachable
+  const rest = RFD4P_PRESETS.filter((preset) => !listed.has(preset.id));
+  if (rest.length > 0) {
+    const group = document.createElement("optgroup");
+    group.label = "More";
+    for (const preset of rest) group.append(new Option(preset.title ?? preset.id, preset.id));
+    presetSelect.append(group);
+  }
+  presetSelect.value = wasChosen;
+  paintPresetNote();
 }
-paintPresets();
 
-
-// What a preset carries beyond its contig: the conditions, the template
-// structure, and the per-modality options that make partial diffusion and
-// inverse folding what they are.
-// (presetExtras and presetSpans are declared with the shared state at the top.)
-
-presetSelect.addEventListener("change", () => {
+/**
+ * The chosen example's one-line description - in the page's words, the engine's own being the
+ * option's tooltip - or why the method cannot run it.
+ */
+function paintPresetNote() {
   const preset = RFD4P_PRESETS.find((entry) => entry.id === presetSelect.value);
-  goalChosen = goals().some((goal) => goal.id === presetSelect.value) ? presetSelect.value
-    : presetSelect.value === "" ? goalChosen : "";
+  const cannot = preset !== undefined && !presetSuits(preset.id, method.value);
+  const said = exampleGroups().flatMap(([, entries]) => entries).find(([id]) => id === presetSelect.value)?.[2];
+  presetNote.textContent = cannot
+    ? `Protein Hunter cannot run this example: ${HUNTER_CANNOT[preset.id]}. Switch the method to`
+      + " RFD4-Proteina, or pick another."
+    : said ?? preset?.description ?? "";
+  presetNote.classList.toggle("warn", cannot);
+}
+
+// What a preset carries beyond its contig: the conditions, the template structure, and the
+// per-modality options (presetExtras and presetSpans are declared with the shared state at the top).
+presetSelect.addEventListener("change", () => chooseExample(presetSelect.value));
+
+/**
+ * Load an example: its segments, its structure, its settings. "" is the blank job, which also drops a
+ * loaded structure.
+ */
+function chooseExample(id) {
+  presetSelect.value = id;
+  const preset = RFD4P_PRESETS.find((entry) => entry.id === id);
+  // 🔴 AND THE LAST EXAMPLE'S SAMPLER GOES WITH IT, back to upstream's defaults: a Partial % left
+  // from the partial-diffusion example turned the next job into partial diffusion.
+  element("thinking").value = "medium";
+  element("partial").value = "";
   if (preset === undefined) {
     presetExtras = {};
     presetSpans = null;
-    // 🔴 AND THE EXAMPLE'S SAMPLER GOES WITH IT, back to upstream's defaults: a Partial % left
-    // from the partial-diffusion example turned the next job into partial diffusion, which is what
-    // dropping `presetExtras` did for these two before they were controls.
-    element("thinking").value = "medium";
-    element("partial").value = "";
-    presetNote.textContent = "";
-    presetNote.classList.remove("warn");
+    clearStructure();
+    spanList.set(BLANK_JOB());
+    paintPresetNote();
     return;
   }
-  const spans = spansFromContig(preset.contig);
+  const spans = exampleSpans(preset, null);
   if (spans === null) {
     presetNote.textContent = `${preset.title} uses labelled spans this editor has no row for yet`
       + ` (${preset.contig}) — it would run a different job from the one it names.`;
     presetNote.classList.add("warn");
     return;
   }
-  // 🔴 AND THE SECONDARY STRUCTURE IS PUT BACK ON THE SPANS, so a loaded preset
-  // shows what it asks for instead of an unexplained label. C_SEC's arms name
-  // the spans by `sel('*/h1/*/*')`, which is where these come from.
+  // 🔴 AND THE SECONDARY STRUCTURE IS PUT BACK ON THE SPANS, so a loaded preset shows what it asks
+  // for instead of an unexplained label. C_SEC's arms name the spans by `sel('*/h1/*/*')`.
   for (const [wanted, arms] of Object.entries(preset.conditions?.C_SEC ?? {})) {
     for (const arm of arms) {
       for (const match of String(arm.select ?? "").matchAll(/sel\('\*\/([A-Za-z0-9]+)\//g)) {
@@ -1221,115 +1242,62 @@ presetSelect.addEventListener("change", () => {
   presetExtras = {
     conditions: preset.conditions,
     cifUrl: preset.cifUrl,
-    // 🔴 A PRESET WITHOUT `specMode` IS DRIVEN BY ITS STRUCTURE'S ANNOTATIONS,
-    // not by its contig - see the note in web/generate.js. Its contig string is
-    // written in the original entry's numbering and does not match the cropped
-    // example, so running it from the spec fails outright.
-    fromAnnotations: preset.specMode !== true && preset.cifUrl !== null
-      && preset.cifUrl !== undefined,
+    // 🔴 A PRESET WITHOUT `specMode` IS DRIVEN BY ITS STRUCTURE'S ANNOTATIONS, not by its contig -
+    // see the note in web/generate.js.
+    fromAnnotations: preset.specMode !== true && preset.cifUrl !== null && preset.cifUrl !== undefined,
     inverseFolding: preset.inverseFolding,
   };
-  // 🔴 THE PRESET'S RECYCLE BUDGET AND PARTIAL FRACTION GO INTO THE CONTROLS,
-  // not into this object: the budget was carried here once and never shown (the
-  // page ran `medium` under a preset that says `low` before that), and a value
-  // kept beside a control that shows another is two answers to one question. A
-  // bare budget and `thinking_<budget>` are one schedule (shared/rfd4p/flow.js).
+  // 🔴 THE PRESET'S RECYCLE BUDGET AND PARTIAL FRACTION GO INTO THE CONTROLS, not into this object:
+  // a value kept beside a control that shows another is two answers to one question.
   if (preset.recycleSchedule !== undefined) {
     element("thinking").value = String(preset.recycleSchedule).replace(/^thinking_/, "");
   }
   element("partial").value = preset.partialTrajectoryFractionSteps === undefined
     ? "" : String(Math.round(preset.partialTrajectoryFractionSteps * 100));
-  if (preset.nsteps !== undefined) element("steps").value = String(preset.nsteps);
+  if (preset.nsteps !== undefined && method.value === "rfd4p") element("steps").value = String(preset.nsteps);
   spanList.set(spans);
-
-  // 🔴 AND THE PRESET'S STRUCTURE IS LOADED, NOT JUST NAMED. `cifUrl` was
-  // handed to the generation and never fetched by the page, so the structure
-  // existed only inside a run - which is fine for RFD4, whose engine fetches it
-  // itself, and leaves PROTEIN HUNTER with nothing: Hunter reaches a structure
-  // by folding a SEQUENCE, so a `From structure` span needs the file here to
-  // read its residues from. Without this, switching a motif preset to Hunter
-  // refused with "needs the structure loaded" for a structure the preset had
-  // already named.
-  const chosen = presetSelect.value;
-  // 🔴 ALREADY LOADED IS NOT ALREADY TRANSLATED. The spans were just re-set from
-  // the preset, in the ENTRY's numbering, so skipping the fetch must not also
-  // skip the move onto the structure - re-picking a preset left its contig
-  // naming residues the loaded file does not contain, which is the exact state
-  // this whole path exists to prevent.
-  if (preset.cifUrl !== undefined && preset.cifUrl !== null && loaded?.name === preset.cifUrl) {
-    examplePieces(spans);
-  } else if (preset.cifUrl !== null && preset.cifUrl !== undefined) {
-    // 🔴 THE OLD STRUCTURE GOES FIRST, SYNCHRONOUSLY. `startGenerate` prefers a
-    // loaded structure over the preset's own `cifUrl` - a user's file is the
-    // one they mean - and the fetch below takes a moment, so a Generate pressed
-    // in that window would run THIS preset's contig against the PREVIOUS
-    // preset's structure. It is not hypothetical: it shifted every result in
-    // the preset sweep by one, each preset silently generating the job before
-    // it, with no error anywhere. Cleared, the engine falls back to the
-    // preset's own cifUrl, which is the right answer for the whole window.
-    loaded = null;
-    describeStructure();
-    fetch(preset.cifUrl).then(async (response) => {
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      // The shipped examples are zstd, which the reader unwraps like any other.
-      const bytes = new Uint8Array(await response.arrayBuffer());
-      // 🔴 THE PRESET MAY HAVE CHANGED WHILE THIS WAS IN FLIGHT. A fetch that
-      // lands after the reader has picked something else would take THIS
-      // structure and apply it to THOSE spans - which is not a hypothetical:
-      // it shifted every result in the preset sweep by one and translated one
-      // preset's contig against another's crop, producing `A17-131`, a range
-      // that matched no atoms and still looked like a plausible answer.
-      if (presetSelect.value !== chosen) return;
-      takeStructure(bytes, preset.cifUrl, false);
-      // 🔴 AND THE CONTIG IS PUT INTO THE CROP'S OWN NUMBERING. A shipped
-      // example is a CROP, and its contig is written in the numbering of the
-      // entry it was cut from - `A16-35` against a file whose chain A runs
-      // 0-42. RFD4 never notices, because a preset without `specMode` runs from
-      // its structure's annotations rather than its contig; Protein Hunter
-      // reads the contig literally and refused, correctly, for a structure the
-      // preset had already named. Each atom records where it came from, so this
-      // is a lookup rather than an alignment - see cpu/design/source-numbering.js.
-      // ...and the spans translated are the ones this PRESET set, not whatever
-      // is in the editor now, for the same reason.
-      examplePieces(spans);
-      paintJob();
-    }).catch((error) => {
-      // Not fatal: RFD4 fetches it again inside the run, and only Hunter needs
-      // it here - so this says so rather than refusing the preset.
-      structureNote.textContent = `could not load this example's structure: ${error.message}`;
-    });
-  }
-  // 🔴 A PRESET IS RFD4's, so loading one picks that method rather than leaving
-  // a contig the selected method cannot run.
-  method.value = "rfd4p";
-  paintMethod();
-  // 🔴 AND THE ROWS ARE A VIEW OF IT, NOT THE INPUT, for those presets. Editing
-  // them switches to the contig path, where the numbering has to match the
-  // structure - and for the 1PRW examples it does not. Said plainly rather than
-  // letting an edit fail with "matched no atoms".
-  // 🔴 THE EXAMPLE'S OWN ONE-LINE DESCRIPTION, NOTHING MORE. The warning that rode on it is said
-  // when it applies - when the reader EDITS an example that runs from its structure's annotations
-  // (`warnIgnoredEdit`) - and it said the wrong thing: such an example's edits are not used at all
-  // (generate()'s `fromAnnotations` builds the batch from the structure alone).
-  presetNote.textContent = preset.description ?? "";
-  presetNote.classList.remove("warn");
   presetSpans = JSON.stringify(spanList.read());
-  paintGoals();
-});
+  paintPresetNote();
+
+  // 🔴 AND THE PRESET'S STRUCTURE IS LOADED AND DRAWN, NOT JUST NAMED: Protein Hunter reads a kept
+  // segment's sequence out of it, and the reader sees what the example is about.
+  if (preset.cifUrl === undefined || preset.cifUrl === null) {
+    clearStructure();
+    return;
+  }
+  if (loaded?.name === preset.cifUrl) {
+    examplePieces(preset);
+    return;
+  }
+  // 🔴 THE OLD STRUCTURE GOES FIRST, SYNCHRONOUSLY. `startGenerate` prefers a loaded structure over
+  // the preset's own `cifUrl`, and a run started while this fetch is in flight would otherwise run
+  // THIS preset's contig against the PREVIOUS preset's structure - which shifted every result in the
+  // preset sweep by one, with no error anywhere.
+  loaded = null;
+  describeStructure();
+  fetch(preset.cifUrl).then(async (response) => {
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    // 🔴 THE PRESET MAY HAVE CHANGED WHILE THIS WAS IN FLIGHT.
+    if (presetSelect.value !== id) return;
+    takeStructure(bytes, preset.cifUrl, false);
+    examplePieces(preset);
+    paintJob();
+  }).catch((error) => {
+    // Not fatal: RFD4 fetches it again inside the run; only Hunter needs it here.
+    structureNote.textContent = `could not load this example's structure: ${error.message}`;
+    structureNote.classList.add("warn");
+  });
+}
 
 /**
- * An example's pieces once its structure is here. One that runs from its file's annotations is
- * shown as the FILE describes it (`spansFromAnnotatedAtoms`) - its contig is a label in the source
- * entry's numbering, and drawing it showed a job that never runs; any other has its contig moved
- * into the crop's own numbering (cpu/design/source-numbering.js).
+ * An example's segments once its structure is here (web/example-spans.js): an annotation-driven one
+ * as its FILE describes it, hotspots and all; any other with its contig moved into the crop's own
+ * numbering. Its sampler settings and its note were set when it was chosen.
  */
-function examplePieces(spans) {
-  const fromFile = presetExtras.fromAnnotations ? spansFromAnnotatedAtoms(loaded.atoms) : null;
-  if (fromFile !== null) spanList.set(fromFile);
-  else {
-    const { spans: moved, translated } = translateSpans(spans, loaded.atoms);
-    if (translated > 0) spanList.set(moved);
-  }
+function examplePieces(preset) {
+  const spans = exampleSpans(preset, loaded.atoms);
+  if (spans !== null) spanList.set(spans);
   presetSpans = JSON.stringify(spanList.read());
 }
 
@@ -1339,31 +1307,13 @@ function examplePieces(spans) {
  * (and translated), so the example's own loading is not mistaken for an edit.
  */
 function warnIgnoredEdit(spans) {
-  if (!presetExtras.fromAnnotations || presetSpans === null) return;
+  // Protein Hunter reads the segments as they are, so only RFD4-Proteina's edits can go unused.
+  if (method.value !== "rfd4p" || !presetExtras.fromAnnotations || presetSpans === null) return;
   const edited = JSON.stringify(spans) !== presetSpans;
   presetNote.classList.toggle("warn", edited);
-  const preset = RFD4P_PRESETS.find((entry) => entry.id === presetSelect.value);
-  presetNote.textContent = edited
-    ? "This example runs from its structure's own annotations, so edits here are not used."
-      + " Choose New protein, or load a structure in step 2, to build your own."
-    : preset?.description ?? "";
-}
-
-/** A goal card: its example, or the blank job (which also drops a loaded structure). */
-function chooseGoal(id) {
-  goalChosen = id;
-  if (id === "blank") {
-    presetSelect.value = "";
-    presetSelect.dispatchEvent(new Event("change"));
-    clearStructure();
-    spanList.set(BLANK_JOB());
-    method.value = "rfd4p";
-    paintMethod();
-  } else {
-    presetSelect.value = id;
-    presetSelect.dispatchEvent(new Event("change"));
-  }
-  paintGoals();
+  if (!edited) { paintPresetNote(); return; }
+  presetNote.textContent = "This example runs from its structure's own annotations, so edits here are not used"
+    + " by RFD4-Proteina. Choose \u201cA new protein\u201d, or load a structure, to build your own.";
 }
 
 /** Forget the loaded structure: the viewer goes back to its placeholder. */
@@ -1440,17 +1390,60 @@ function sequenceOf(chain, first, last) {
   return [...seen.entries()].sort((a, b) => a[0] - b[0])
     // 🔴 AN UNKNOWN RESIDUE BECOMES X RATHER THAN DISAPPEARING. Dropping it
     // would shift every residue number after it, and the span's own numbering is
-    // what the user typed.
-    .map(([, name]) => THREE_TO_ONE[name] ?? "X").join("");
+    // what the user typed. A nucleotide is its base's letter: DG is G.
+    .map(([, name]) => THREE_TO_ONE[name] ?? NUCLEOTIDE[name] ?? "X").join("");
+}
+
+/**
+ * What a loaded chain is made of, from its residue names: "dna", "rna" or "protein". A chain mostly
+ * of deoxynucleotides is DNA, of ribonucleotides RNA - so the DNA-binder example's kept strands fold
+ * as DNA under Protein Hunter, and pick NA-MPNN, rather than as a protein of unknowns.
+ */
+function polymerOf(chain) {
+  if (loaded === null) return "protein";
+  const atoms = loaded.atoms;
+  const count = atoms?.nAtoms ?? atoms?.chain_id?.length ?? 0;
+  let deoxy = 0;
+  let ribo = 0;
+  let other = 0;
+  let last = null;
+  for (let index = 0; index < count; index += 1) {
+    if (String(atoms.chain_id[index]) !== chain) continue;
+    const residue = Number(atoms.res_id[index]);
+    if (residue === last) continue;
+    last = residue;
+    const name = String(atoms.res_name[index]).trim().toUpperCase();
+    if (DEOXY.has(name)) deoxy += 1;
+    else if (NUCLEOTIDE[name] !== undefined) ribo += 1;
+    else other += 1;
+  }
+  if (deoxy > other && deoxy >= ribo) return "dna";
+  if (ribo > other) return "rna";
+  return "protein";
 }
 
 const describeStructure = () => {
+  element("clear-structure").hidden = loaded === null;
+  paintSelectionStep();
   if (loaded === null) {
     structureNote.textContent = "";
     structureNote.classList.remove("warn");
     return;
   }
-  const parts = [...loaded.chains.entries()]
+  // 🔴 A CHAIN THAT IS ONLY AN EXAMPLE'S PLACEHOLDER FOR WHAT IS DESIGNED (an expandable segment,
+  // one residue in the file) is not "chain A 1-1": it is where the design goes.
+  const ann = loaded.atoms?.annotations ?? {};
+  const sentinel = ann.annotation_expsegmin_1_residue ?? loaded.atoms?.annotation_expsegmin_1_residue;
+  const placeholders = new Set();
+  if (sentinel) {
+    const real = new Set();
+    for (let i = 0; i < loaded.atoms.chain_id.length; i += 1) {
+      const chain = String(loaded.atoms.chain_id[i]);
+      if (Number(sentinel[i]) >= 0) placeholders.add(chain); else real.add(chain);
+    }
+    for (const chain of real) placeholders.delete(chain);
+  }
+  const parts = [...loaded.chains.entries()].filter(([chain]) => !placeholders.has(chain))
     .map(([chain, range]) => `${chain} ${range.first}\u2013${range.last}`);
   // The entry or file's name, not the path an example is served from.
   const name = String(loaded.name).split("/").pop().replace(/\.(b?cif|mmcif)(\.(zst|gz))?$/i, "");
@@ -1502,6 +1495,8 @@ const takeStructure = (data, name, offerChain = true) => {
   }
   paintJob();
 };
+
+element("clear-structure").addEventListener("click", () => { clearStructure(); paintJob(); });
 
 element("load-structure").addEventListener("click", async () => {
   const id = element("structure-id").value.trim();
@@ -1764,7 +1759,7 @@ const startGenerate = async () => {
   const controller = new AbortController();
   running = controller;
   inputView = null;
-  hideSequence();
+  showRunSequence();
   huntLabel.textContent = "Stop";
   resultsBody.replaceChildren();
   track.replaceChildren();
@@ -1881,7 +1876,7 @@ const startGenerate = async () => {
   } finally {
     running = null;
     paintViewerBar();
-    huntLabel.textContent = method.value === "hunter" ? "Hunt" : "Generate";
+    huntLabel.textContent = "Design";
   }
 };
 

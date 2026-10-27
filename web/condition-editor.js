@@ -256,9 +256,13 @@ const QUICK = [
  *   null when there is no structure to pick from
  * @param {(index: number, row: object) => string} [hooks.colourOf] a row's colour in the viewer
  * @param {() => void} [hooks.onKeep] "Keep in the design": the page turns the selection into spans
+ * @param {(picks: {chain: string, resId: number}[]) => void} [hooks.onHotspot] "Mark as hotspot": the
+ *   page writes them onto the segments that hold them. 🔴 A HOTSPOT IS A SEGMENT'S, so it is not a
+ *   condition row here: both methods read it off the segment, and the reader edits it there.
  * @param {() => void} hooks.onChange the rows changed (repaint, re-describe the job)
  */
-export function createConditionEditor(host, { picks, peek = () => null, colourOf = () => "#64748b", onKeep, onChange }) {
+export function createConditionEditor(host, { picks, peek = () => null, colourOf = () => "#64748b", onKeep, onHotspot,
+  onChange }) {
   let rows = [];
   const panel = document.createElement("div");
   panel.className = "condition-editor";
@@ -319,16 +323,31 @@ export function createConditionEditor(host, { picks, peek = () => null, colourOf
   for (const [key, value, label, title] of QUICK) {
     const b = button(label, title);
     b.dataset.condition = key;
+    // what only RFD4-Proteina can take; a hotspot handed to the page is the segments', either method's
+    const segmentHotspot = key === "C_HOT" && onHotspot !== undefined;
+    if (!segmentHotspot) b.classList.add("condition-only");
     b.addEventListener("click", () => {
       const p = tryPicks();
-      if (p !== null) add({ key, value, picks: p, atoms: "" });
+      if (p === null) return;
+      if (segmentHotspot) {
+        try {
+          onHotspot(p);
+          note.textContent = "";
+          note.classList.remove("warn");
+        } catch (error) {
+          note.textContent = error.message;
+          note.classList.add("warn");
+        }
+        return;
+      }
+      add({ key, value, picks: p, atoms: "" });
     });
     quick.append(b);
   }
 
   // Every condition, behind one disclosure.
   const more = document.createElement("details");
-  more.className = "condition-more";
+  more.className = "condition-more condition-only";
   const summary = document.createElement("summary");
   summary.textContent = "More constraints\u2026";
   const kind = document.createElement("select");
@@ -400,15 +419,18 @@ export function createConditionEditor(host, { picks, peek = () => null, colourOf
   const paintSelection = () => {
     const now = peek();
     const any = Array.isArray(now) && now.length > 0;
-    selection.textContent = now === null ? "Load a structure in step 2, then select residues to constrain."
+    selection.textContent = now === null ? "Load a structure, then select its residues."
       : any ? `Selected: ${describePicks(now)} (${now.length} residue${now.length === 1 ? "" : "s"})`
         : "Select residues: click them in the viewer or drag along the sequence.";
     selection.classList.toggle("has-selection", any);
     // Nothing to pick from yet: the actions would be four dead buttons.
     quick.hidden = now === null;
-    more.hidden = now === null;
-    for (const b of quick.querySelectorAll("button")) b.disabled = !any || panel.dataset.off === "1";
-    addButton.disabled = !any || panel.dataset.off === "1";
+    more.hidden = now === null || panel.dataset.off === "1";
+    for (const b of quick.querySelectorAll("button")) {
+      b.disabled = !any;
+      if (b.classList.contains("condition-only")) b.hidden = panel.dataset.off === "1";
+    }
+    addButton.disabled = !any;
   };
 
   panel.append(selection, quick, more, note, list);
@@ -424,12 +446,15 @@ export function createConditionEditor(host, { picks, peek = () => null, colourOf
     conditions(base) { return mergeConditions(base, rows); },
     /** Re-read the selection (the page calls this when the viewer's changes). */
     refreshSelection: paintSelection,
-    /** Grey the whole panel with a reason, or bring it back with `null`. */
+    /**
+     * Take the conditions away (a method that has none), or bring them back with `null`. What stays
+     * is what either method uses: the selection, Keep in the design and Mark as hotspot. Hidden,
+     * not greyed: a newcomer reads a greyed control as a broken one.
+     */
     disable(reason) {
       panel.dataset.off = reason === null ? "" : "1";
-      for (const c of panel.querySelectorAll("select, input")) c.disabled = reason !== null;
+      list.hidden = reason !== null;
       if (reason === null) paintKind();
-      panel.title = reason ?? "";
       paintSelection();
     },
   };

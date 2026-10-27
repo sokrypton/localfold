@@ -267,7 +267,53 @@ constraint at all, which decides whether this is plumbing or a port.
   wrote a 600 px size into this page's viewer - renamed `#design-viewer`. And
   py2Dmol's full-screen button drew an empty box on Linux (U+26F6 is in few
   fonts): an inline SVG now, on sokrypton/py2Dmol#32's branch and re-vendored.
-  **Open**: the 2D painter (a browser without WebGL2) lays every piece down
-  opaque, so the sketch is only pale there, not translucent; and the sequence
-  strip draws a sketch as a row of G, since the strip has no way to leave a chain
-  out.
+  **Closed since** (sokrypton/py2Dmol#33, vendored): the sketch is see-through on
+  py2Dmol's 2D painter too - which is the painter EVERY browser gets here, not only
+  one without WebGL2 as this entry said: the full bundle carries both painters and
+  takes the GPU one only when a page asks (`rendering.gpu`), and this page never
+  did. The 2D painter now draws a faded selection as two whole frames crossfaded,
+  exact to 8-bit rounding (py2Dmol's `tests/opacity_2d.py`). And the strip leaves
+  the sketch out (`listsChain`), so it no longer reads as a row of G.
+
+- **The page reorganised around the method, an example, and segments** — **done**
+  (2026-10-27). Protein Hunter is the default method, and the method and its
+  models ("Folds with", "Check with") are step 1. The examples are one grouped
+  dropdown (step 2), named as a reader asks for them with a one-line note in the
+  page's words; choosing one fills in the segments, loads and draws its
+  structure, and sets its sampler. It keeps the method it was chosen under, and
+  one the method cannot run is listed disabled with its reason. The eight goal
+  cards and the second "More examples" picker are gone. Each segment is a card
+  carrying every setting it has (step 3):
+  - a designed segment's length, and its secondary structure (which labels itself)
+    and polymer under RFD4-Proteina;
+  - a kept segment's chain, residues and **hotspots**, with "Use selection";
+  - a sequence's polymer and letters;
+  - a ligand's code.
+
+  Modified residues and a label sit under "More". "Add a segment" names what is
+  added (a DNA sequence, a ligand, a chain break). Hotspots live on the segment for
+  both methods: an example's file hotspots are written onto its target's card
+  (`web/example-spans.js`), and Mark as hotspot writes there too. The separate
+  hotspot line is gone. Step 4 is the selection, shown while a structure is loaded:
+  Keep in the design and Mark as hotspot under either method, and RFD4-Proteina's
+  constraints only under it. The sequence strip stays through a run, showing the
+  design's sequence and following the play bar.
+
+  **The binder and the DNA binder now run under Protein Hunter**: they load as
+  their files describe them (`test/design-preset-methods.test.js` measures it
+  through the same module). Partial diffusion and inverse folding of 1PRW are
+  withheld from Hunter: their segments are the motif example's, and `--presets`
+  showed each running as that same hunt. That leaves Hunter 6 of 10. A
+  kept DNA strand folds as DNA (`polymerOf`); it folded as a protein of unknowns
+  before.
+
+  🔴 Found on the way:
+  - `hotspotsOf` read `60-64` as 60 and 64, so a hunt was aimed at the two ends of
+    the site;
+  - the SAM example's own file names its ligand `S;M`, which is now shown as the
+    contig's `SAM`.
+
+  `tools/check-design-page.py` holds the new order, labels on every control, the
+  binder under both methods, Add a segment, Use selection, and the strip during
+  and after a real hunt. With `--presets` it runs every example as a generation
+  and every Hunter one as a one-cycle hunt: all 18 finished (2026-10-27).

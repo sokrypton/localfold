@@ -1,9 +1,9 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "./harness.js";
-import { HUNTER_CANNOT, presetSuits } from "../cpu/design/preset-methods.js";
-import { translateSpans } from "../cpu/design/source-numbering.js";
-import { chainsOf, contigOf, drawLengths, spansFromContig } from "../web/contig-ui.js";
+import { HUNTER_CANNOT, HUNTER_WOULD_DIFFER, presetSuits } from "../cpu/design/preset-methods.js";
+import { chainsOf, contigOf, drawLengths } from "../web/contig-ui.js";
+import { exampleSpans } from "../web/example-spans.js";
 import { parseCifToAtomArray } from "../shared/rfd4p/pipeline/cif.js";
 import { decompress } from "../shared/rfd4p/vendor/fzstd.js";
 import { RFD4P_PRESETS } from "../shared/rfd4p/presets.js";
@@ -43,10 +43,11 @@ const sequenceFrom = (atoms) => (chain, first, last) => {
 
 /** What Protein Hunter says about an example, the way the page builds it. */
 const hunterProblems = (preset) => {
-  const parsed = spansFromContig(preset.contig);
-  if (parsed === null) return ["the editor cannot parse this contig"];
+  // 🔴 THE PAGE'S OWN RULE (web/example-spans.js), so what this measures is what the page loads:
+  // an annotation-driven example as its file describes it, any other as its contig moved onto it
   const atoms = structureOf(preset);
-  const { spans } = atoms === null ? { spans: parsed } : translateSpans(parsed, atoms);
+  const spans = exampleSpans(preset, atoms);
+  if (spans === null) return ["the editor cannot parse this contig"];
   return [...new Set([
     ...contigOf(spans, "hunter").problems,
     ...chainsOf(drawLengths(spans, { run: 0, seed: 0 }),
@@ -64,8 +65,12 @@ describe("which examples each method can run", () => {
     for (const preset of RFD4P_PRESETS) {
       const problems = hunterProblems(preset);
       const declared = presetSuits(preset.id, "hunter");
+      // ...except the two that build and are withheld because they would MEAN something else there,
+      // which must still build (or the reason given is the wrong one)
+      const withheld = HUNTER_WOULD_DIFFER.has(preset.id);
       expect(`${preset.id}: ${declared ? "offered" : "hidden"}`)
-        .toBe(`${preset.id}: ${problems.length === 0 ? "offered" : "hidden"}`);
+        .toBe(`${preset.id}: ${problems.length === 0 && !withheld ? "offered" : "hidden"}`);
+      if (withheld) expect(`${preset.id}: ${problems.join("; ")}`).toBe(`${preset.id}: `);
     }
   });
 
@@ -82,7 +87,8 @@ describe("which examples each method can run", () => {
   });
 
   // The count is asserted so that a change to it is a decision rather than a
-  // drift - six of ten, where two worked before the contigs were translated.
+  // drift - six of ten: the binder and the DNA binder joined when the examples loaded as their files
+  // describe them, and partial diffusion and inverse folding left as meaning something else there.
   it("leaves Protein Hunter six of the ten", () => {
     const offered = RFD4P_PRESETS.filter((preset) => presetSuits(preset.id, "hunter"));
     expect(offered.length).toBe(6);

@@ -1,19 +1,18 @@
 <!--
 design.html
 -----------
-AI Context: THE DESIGN PAGE (RFD4-Proteina generation, and the Protein Hunter loop)
+AI Context: THE DESIGN PAGE (the Protein Hunter loop, and RFD4-Proteina generation)
 
-🔴 LAID OUT IN THE ORDER A NEWCOMER ASKS THEIR QUESTIONS (2026-10-27). The page was a
-form: a method picker first, a job written as span rows and a contig, a settings strip
-holding both methods' controls (greyed where one could not use them), and four lines of
-explanation under it - with the structure the job is about below the fold. It is now
-five steps on the left - what to design, what it is built on, what gets built, any
-constraints, and run - and the picture on the right, where picking residues and watching
-a design arrive both happen. The method is an Advanced setting: a goal picks it.
+🔴 LAID OUT IN THE ORDER THE JOB IS DECIDED (2026-10-27, second pass). The method and the models
+first - Protein Hunter is the default, as the simplest to reason about: it folds a sequence,
+redesigns it, folds again. Then where to start (an example, from a dropdown, which fills in every
+setting below it), then the segments - one card each, every setting of a segment on its card, a
+binder's hotspots among them - then what is selected in the viewer, then how many to make.
 
 🔴 AND THE PICTURE IS THE JOB BEFORE IT IS A RESULT: from arrival it draws the structure and a
 faded sketch of every piece to be designed (web/job-sketch.js), redrawn on each edit; it is as tall
-as the window and stays beside the steps, and Generate is in its bar.
+as the window and stays beside the steps, Design is in its bar, and the sequence strip under it
+stays through a run, following the design as its sequence changes.
 
 🔴 THE PAGE IS NOT LINKED FROM index.html. It is in tools/build_site.py's OPTIONAL list,
 so a checkout without it still builds, and it IS copied when present - unlinked is not
@@ -34,7 +33,7 @@ The style IS index.html's: py2Dmol's light application CSS plus web/localfold.cs
     <link rel="stylesheet" href="./web/localfold.css">
     <!-- The app writes this on load and on every clear; py2Dmol's default names controls
          this page does not have. -->
-    <script>window.py2dmolReadyMessage = "Ready. Pick what to design.";</script>
+    <script>window.py2dmolReadyMessage = "Ready. Pick an example, or press Design.";</script>
 </head>
 
 <body class="bg-gray-50 text-gray-800 font-sans p-4">
@@ -43,8 +42,8 @@ The style IS index.html's: py2Dmol's light application CSS plus web/localfold.cs
 
         <header class="design-head">
             <h1>LocalDesign</h1>
-            <p class="design-tagline">Design a protein in your browser: pick a goal, adjust it, press
-                Generate.</p>
+            <p class="design-tagline">Design a protein in your browser: pick a method and an example,
+                adjust the segments, press Design.</p>
         </header>
 
         <div class="design-layout">
@@ -52,96 +51,21 @@ The style IS index.html's: py2Dmol's light application CSS plus web/localfold.cs
             <!-- THE JOB, IN THE ORDER IT IS DECIDED. -->
             <div class="design-steps">
 
-                <section class="design-step" id="step-goal">
-                    <h2><span class="step-number">1</span>What do you want to design?</h2>
-                    <!-- Built by web/design.js from GOALS: each card loads a worked example
-                         (or the blank job) and picks the method that runs it. -->
-                    <div id="goals" class="goal-grid" role="radiogroup" aria-label="Goal"></div>
-                    <div class="step-more">
-                        <label for="preset">More examples</label>
-                        <select id="preset" class="entity-picker"
-                            title="Every worked example, including the ones the cards above do not show.">
-                            <option value="">Start from…</option>
-                        </select>
-                    </div>
-                    <div id="preset-note" class="option-note"></div>
-                </section>
-
-                <section class="design-step" id="step-structure">
-                    <h2><span class="step-number">2</span>Starting structure <span class="step-optional">optional</span></h2>
-                    <p class="step-hint">A target to bind, a motif to keep, or a protein to diversify.</p>
-                    <div id="structureGroup" class="design-structure">
-                        <input type="text" id="structure-id" placeholder="PDB id, e.g. 1PRW"
-                            title="A PDB entry, fetched as mmCIF from RCSB.">
-                        <button type="button" id="load-structure" class="btn btn-grey btn-small">Load</button>
-                        <input type="file" id="structure-file" accept=".cif,.mmcif,.cif.zst,.cif.gz,.bcif,.bcif.zst,.bcif.gz">
-                        <label for="structure-file" class="btn btn-grey btn-small"
-                            title="Open an mmCIF from this computer.">Open file</label>
-                    </div>
-                    <div id="structure-note" class="option-note"></div>
-                </section>
-
-                <section class="design-step" id="step-build">
-                    <h2><span class="step-number">3</span>What gets built</h2>
-                    <!-- The job at a glance: a row per chain, a block per span - kept from the
-                         structure (solid), designed (striped), a ligand (chip). Clicking a block
-                         opens its row below. -->
-                    <div id="chain-diagram" class="chain-diagram" aria-label="The design, chain by chain"></div>
-                    <!-- 🔴 HOTSPOTS, NAMED AND DEFINED IN ONE PLACE: wherever they were set - the
-                         example's structure, a kept piece's settings, a constraint - this says which
-                         residues they are and what they mean, and the viewer paints them amber. -->
-                    <div id="hotspot-line" class="hotspot-line" hidden></div>
-                    <div class="fetch-row" id="design-input-container">
-                        <div class="entity-list">
-                            <div id="contig-rows"></div>
-                        </div>
-                    </div>
-                    <div class="design-summary">
-                        <button type="button" id="add-span" class="btn btn-grey btn-small"
-                            title="Add a piece: residues to design, part of the loaded structure, a known sequence, a ligand, or a chain break.">
-                            <i class="fa-solid fa-plus"></i>
-                            <span>Add a piece</span>
-                        </button>
-                        <code id="contig-line"></code>
-                    </div>
-                    <div id="contig-problems" class="option-note"></div>
-                </section>
-
-                <section class="design-step" id="step-constraints">
-                    <h2><span class="step-number">4</span>Constraints <span class="step-optional">optional</span></h2>
-                    <!-- web/condition-editor.js: the residues selected in the viewer or the
-                         sequence strip, set as any RFD4-Proteina condition. -->
-                    <div id="condition-host"></div>
-                </section>
-
-                <section class="design-step" id="step-run">
-                    <h2><span class="step-number">5</span>How many, and how to check them</h2>
-                    <div class="fetch-options" id="designOptions">
-
-                        <div class="fetch-option-group" id="beamGroup">
-                            <span class="fetch-option-title" id="beam-title">Designs</span>
-                            <input type="number" id="beam" min="1" max="16" value="1"
-                                title="How many designs to make, each from its own seed. The best is marked.">
-                        </div>
-
-                        <!-- The independent check: fold the finished design with a model that did
-                             not make it. Its options are exactly web/validate-design.js's `FOLDERS`
-                             (test/design-validate-options.test.js holds the two together). -->
-                        <div class="fetch-option-group" id="validateGroup">
-                            <span class="fetch-option-title">Check with</span>
-                            <select id="validate"
-                                title="Fold each finished design again with a model that did not make it, and report its confidence and how far it moved.">
-                                <option value="">nothing</option>
-                                <option value="af3" selected>AF3</option>
-                                <option value="openbind0">OpenBind-0</option>
-                                <option value="opendde">OpenDDE</option>
+                <!-- 🔴 THE MODELS FIRST: which method designs, and which models fold and check. -->
+                <section class="design-step" id="step-method" aria-labelledby="step-method-title">
+                    <h2 id="step-method-title"><span class="step-number">1</span>Method</h2>
+                    <div class="model-row">
+                        <div class="model-field" id="methodGroup">
+                            <label for="method">Design with</label>
+                            <select id="method" class="entity-picker">
+                                <option value="hunter" selected>Protein Hunter</option>
+                                <option value="rfd4p">RFD4-Proteina</option>
                             </select>
                         </div>
-
-                        <!-- Protein Hunter's: shown only when it is the method. -->
-                        <div class="fetch-option-group" id="folderGroup">
-                            <span class="fetch-option-title">Folds with</span>
-                            <select id="folders"
+                        <!-- Protein Hunter's: the model that folds each cycle. Hidden under RFD4. -->
+                        <div class="model-field" id="folderGroup">
+                            <label for="folders">Folds with</label>
+                            <select id="folders" class="entity-picker"
                                 title="Which model folds the sequence each cycle. Its confidence is the objective.">
                                 <option value="af3" selected>AF3</option>
                                 <option value="boltz2">Boltz-2</option>
@@ -149,37 +73,99 @@ The style IS index.html's: py2Dmol's light application CSS plus web/localfold.cs
                                 <option value="opendde">OpenDDE</option>
                             </select>
                         </div>
+                        <!-- The independent check: fold the finished design with a model that did
+                             not make it. Its options are exactly web/validate-design.js's `FOLDERS`
+                             (test/design-validate-options.test.js holds the two together). -->
+                        <div class="model-field" id="validateGroup">
+                            <label for="validate">Check with</label>
+                            <select id="validate" class="entity-picker"
+                                title="Fold each finished design again with a model that did not make it, and report its confidence and how far it moved.">
+                                <option value="">nothing</option>
+                                <option value="af3" selected>AF3</option>
+                                <option value="openbind0">OpenBind-0</option>
+                                <option value="opendde">OpenDDE</option>
+                            </select>
+                        </div>
+                    </div>
+                    <p id="method-note" class="step-hint"></p>
+                </section>
+
+                <section class="design-step" id="step-goal" aria-labelledby="step-goal-title">
+                    <h2 id="step-goal-title"><span class="step-number">2</span>Start from</h2>
+                    <!-- Built by web/design.js: a blank protein, and every worked example, grouped. Choosing
+                         one fills in the segments, the structure and the settings below. -->
+                    <label for="preset" class="visually-hidden">Example</label>
+                    <select id="preset" class="entity-picker example-picker"></select>
+                    <div id="preset-note" class="option-note"></div>
+                </section>
+
+                <section class="design-step" id="step-build" aria-labelledby="step-build-title">
+                    <h2 id="step-build-title"><span class="step-number">3</span>Segments</h2>
+                    <!-- The structure the segments name: a target to bind, a motif to keep, a protein to
+                         diversify. Optional. -->
+                    <div id="structureGroup" class="design-structure">
+                        <label for="structure-id" class="contig-label">Structure</label>
+                        <input type="text" id="structure-id" placeholder="PDB id, e.g. 1PRW"
+                            title="A PDB entry, fetched as mmCIF from RCSB." autocomplete="off">
+                        <button type="button" id="load-structure" class="btn btn-grey btn-small">Load</button>
+                        <input type="file" id="structure-file" accept=".cif,.mmcif,.cif.zst,.cif.gz,.bcif,.bcif.zst,.bcif.gz">
+                        <label for="structure-file" class="btn btn-grey btn-small"
+                            title="Open an mmCIF from this computer.">Open file</label>
+                    </div>
+                    <div class="structure-line">
+                        <div id="structure-note" class="option-note"></div>
+                        <button type="button" id="clear-structure" class="btn btn-grey btn-small" hidden
+                            title="Forget the loaded structure">Remove</button>
+                    </div>
+                    <!-- The job at a glance: a row per chain, a block per segment - kept from the
+                         structure (solid), designed (striped), a ligand (chip). A block opens its card. -->
+                    <div id="chain-diagram" class="chain-diagram" aria-label="The design, chain by chain"></div>
+                    <div id="contig-rows" class="contig-cards"></div>
+                    <div class="design-summary">
+                        <label for="add-span" class="visually-hidden">Add a segment</label>
+                        <select id="add-span" class="entity-picker add-segment"
+                            title="Add a segment: residues to design, a known protein, DNA or RNA sequence, part of the loaded structure, a ligand, or a chain break."></select>
+                        <code id="contig-line"></code>
+                    </div>
+                    <div id="contig-problems" class="option-note" role="status"></div>
+                </section>
+
+                <!-- What is selected in the viewer, and what to do with it: keep it, aim at it, and (under
+                     RFD4-Proteina) constrain it. Shown while a structure is loaded. -->
+                <section class="design-step" id="step-constraints" aria-labelledby="step-constraints-title">
+                    <h2 id="step-constraints-title"><span class="step-number">4</span><span id="constraints-title">Selection</span></h2>
+                    <div id="condition-host"></div>
+                </section>
+
+                <section class="design-step" id="step-run" aria-labelledby="step-run-title">
+                    <h2 id="step-run-title"><span class="step-number">5</span>Run</h2>
+                    <div class="fetch-options" id="designOptions">
+
+                        <div class="fetch-option-group" id="beamGroup">
+                            <label class="fetch-option-title" id="beam-title" for="beam">Designs</label>
+                            <input type="number" id="beam" min="1" max="16" value="1"
+                                title="How many designs to make, each from its own seed. The best is marked.">
+                        </div>
                         <div class="fetch-option-group" id="cyclesGroup">
-                            <span class="fetch-option-title">Cycles</span>
+                            <label class="fetch-option-title" for="cycles">Cycles</label>
                             <input type="number" id="cycles" min="1" max="50" value="5"
                                 title="How many fold-then-redesign rounds each run does.">
                         </div>
 
-                        <!-- 🔴 THE METHOD IS ADVANCED NOW. A goal picks it; this is for someone who
-                             wants the other one. -->
-                        <div class="fetch-option-group advanced" id="methodGroup">
-                            <span class="fetch-option-title">Method</span>
-                            <select id="method"
-                                title="RFD4-Proteina generates structure directly. Protein Hunter folds and redesigns in a loop.">
-                                <option value="rfd4p" selected>RFD4-Proteina</option>
-                                <option value="hunter">Protein Hunter</option>
-                            </select>
-                        </div>
-
                         <div class="fetch-option-group advanced" id="stepsGroup">
-                            <span class="fetch-option-title" id="steps-title">Flow steps</span>
+                            <label class="fetch-option-title" id="steps-title" for="steps">Flow steps</label>
                             <input type="number" id="steps" min="4" max="400" value="60"
                                 title="How many sampling steps each structure takes.">
                         </div>
                         <div class="fetch-option-group advanced" id="seedGroup">
-                            <span class="fetch-option-title">Seed</span>
+                            <label class="fetch-option-title" for="seed">Seed</label>
                             <input type="number" id="seed" min="0" value="0"
                                 title="The same job, settings and seed give the same result.">
                         </div>
 
                         <!-- RFD4-Proteina's sampler, as AtomWorks Studio offers it. -->
                         <div class="fetch-option-group advanced" id="thinkingGroup">
-                            <span class="fetch-option-title">Thinking</span>
+                            <label class="fetch-option-title" for="thinking">Thinking</label>
                             <select id="thinking"
                                 title="How many recycles each flow step spends (upstream's thinking_low/medium/high).">
                                 <option value="low">low</option>
@@ -188,34 +174,34 @@ The style IS index.html's: py2Dmol's light application CSS plus web/localfold.cs
                             </select>
                         </div>
                         <div class="fetch-option-group advanced" id="backboneKGroup">
-                            <span class="fetch-option-title">Backbone K</span>
+                            <label class="fetch-option-title" for="backbone-k">Backbone K</label>
                             <input type="number" id="backbone-k" min="1" max="20" step="0.1" value="16"
                                 title="The backbone sampler's tsr_k (1-20). Lower samples more freely; 16 is the released setting.">
                         </div>
                         <div class="fetch-option-group advanced" id="latentKGroup">
-                            <span class="fetch-option-title">Latents K</span>
+                            <label class="fetch-option-title" for="latent-k">Latents K</label>
                             <input type="number" id="latent-k" min="1" max="6" step="0.1" value="4"
                                 title="The sequence sampler's tsr_k (1-6). Lower samples more freely; 4 is the released setting.">
                         </div>
                         <div class="fetch-option-group advanced" id="partialGroup">
-                            <span class="fetch-option-title">Partial %</span>
+                            <label class="fetch-option-title" for="partial">Partial %</label>
                             <input type="number" id="partial" min="1" max="100" step="1" placeholder="off"
                                 title="Re-denoise this percentage of the trajectory starting from the loaded structure. Empty is off.">
                         </div>
 
                         <!-- Protein Hunter's advanced settings. -->
                         <div class="fetch-option-group advanced" id="runsGroup">
-                            <span class="fetch-option-title">Runs</span>
+                            <label class="fetch-option-title" for="runs">Runs</label>
                             <input type="number" id="runs" min="1" max="100" value="1"
-                                title="How many independent hunts, each from its own seed.">
+                                title="How many independent hunts, each from its own seed. A length range draws a new length each run.">
                         </div>
                         <div class="fetch-option-group advanced" id="temperatureGroup">
-                            <span class="fetch-option-title">Temperature</span>
+                            <label class="fetch-option-title" for="temperature">Temperature</label>
                             <input type="number" id="temperature" min="0.01" max="2" step="0.01" value="0.1"
                                 title="How sharply the designer samples. Low is conservative.">
                         </div>
                         <div class="fetch-option-group advanced" id="omitGroup">
-                            <span class="fetch-option-title">Omit</span>
+                            <label class="fetch-option-title" for="omit">Omit</label>
                             <input type="text" id="omit" value="C" maxlength="20"
                                 title="Amino acids the designer may never write. Cysteine by default.">
                         </div>
@@ -223,7 +209,7 @@ The style IS index.html's: py2Dmol's light application CSS plus web/localfold.cs
                              section 6); the select stays at "auto" for web/hunt.js and a driver. -->
                         <div class="fetch-option-group" id="designerGroup" hidden>
                             <span class="fetch-option-title">Designer</span>
-                            <select id="designer">
+                            <select id="designer" aria-label="Designer">
                                 <option value="auto" selected>Auto</option>
                                 <option value="soluble">SolubleMPNN</option>
                                 <option value="protein">ProteinMPNN</option>
@@ -234,10 +220,10 @@ The style IS index.html's: py2Dmol's light application CSS plus web/localfold.cs
                     </div>
                     <div class="run-row">
                         <button type="button" id="show-advanced" class="btn btn-grey btn-small"
-                            aria-expanded="false" title="The method, sampling steps, seed and sampler settings.">
+                            aria-expanded="false" aria-controls="designOptions"
+                            title="Sampling steps, seed and the method's own sampler settings.">
                             Advanced
                         </button>
-                        <span class="run-where">Generate is with the picture.</span>
                     </div>
                     <!-- Only Protein Hunter's notes, and only inside Advanced: which designer it
                          chose and what a run costs in folds. -->
@@ -253,38 +239,38 @@ The style IS index.html's: py2Dmol's light application CSS plus web/localfold.cs
             <div class="design-stage">
                 <div id="status-row">
                     <div id="status-line">
-                        <div id="status-message"></div>
+                        <div id="status-message" role="status" aria-live="polite"></div>
                     </div>
-                    <progress id="progress" max="1" value="0" data-state="idle"></progress>
+                    <progress id="progress" max="1" value="0" data-state="idle" aria-label="Progress"></progress>
                 </div>
 
                 <!-- What the viewer's colours mean, and the way back to the job from a design. -->
-                <!-- 🔴 GENERATE LIVES HERE, beside what it will make: at the end of step 5 it was below the
+                <!-- 🔴 DESIGN LIVES HERE, beside what it will make: at the end of step 5 it was below the
                      fold of every laptop screen, and this bar is always in view. -->
                 <div class="viewer-bar">
                     <div id="viewer-legend" class="viewer-legend"></div>
                     <button id="show-job" class="btn btn-grey btn-small" type="button" hidden
                         title="Draw the job again: the structure and a sketch of what is to be designed">Show the job</button>
                     <button type="button" id="hunt" class="btn btn-primary run-button">
-                        <i class="fa-solid fa-dna"></i>
-                        <span>Generate</span>
+                        <i class="fa-solid fa-dna" aria-hidden="true"></i>
+                        <span>Design</span>
                     </button>
                 </div>
                 <div id="viewer-empty" class="viewer-empty" hidden>
                     <i class="fa-solid fa-cube"></i>
-                    <p>Add a piece in step 3 and the job is drawn here.</p>
+                    <p>Add a segment and the job is drawn here.</p>
                 </div>
                 <!-- 🔴 THE JOB IS DRAWN FROM ARRIVAL (web/job-sketch.js): the structure, and each piece
                      still to be designed sketched faded at its length, redrawn on every edit. -->
                 <div id="design-viewer" class="py2dmol-viewer-instance" style="display: none;"></div>
 
                 <!-- py2Dmol's sequence strip, the fold page's own (window.SEQ): dragging along it
-                     selects residues, as clicking them in the viewer does. Shown while the
-                     loaded structure is drawn. -->
+                     selects residues, as clicking them in the viewer does. Shown while a structure is
+                     drawn, and through a run, where it follows the design's sequence. -->
                 <div id="sequence-viewer-container" class="container-box sequence-section-container"
                     style="display: none;">
                     <div id="sequenceHeader" class="sequence-header">
-                        <span class="sequence-hint">Drag along the sequence to select residues.</span>
+                        <span class="sequence-hint" id="sequence-hint">Drag along the sequence to select residues.</span>
                         <div class="sequence-actions" style="margin-left: auto;">
                             <span id="selectionGlobalTools" class="selection-global-tools">
                                 <button id="selectAllResidues" class="btn btn-grey btn-small" type="button"

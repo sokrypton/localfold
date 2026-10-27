@@ -1267,13 +1267,34 @@
    wrapped one changes the height of the whole head. */
 .fold-actions .btn { white-space: nowrap; }
 
+/* 🔴 A SEGMENT IS A CARD (2026-10-27): its type, chain and remove on top, then every setting it
+   has, wrapping, then a "More" for the rare ones. Not a three-track grid any more - that grid kept a
+   segment's hotspots behind a disclosure because they did not fit on its one line. */
+.contig-cards { display: flex; flex-direction: column; gap: 8px; }
 .contig-row {
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
-  align-items: center;
+  display: flex;
+  flex-direction: column;
   gap: 8px;
   position: relative;
+  padding: 8px 10px;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  background: #fff;
 }
+.contig-row.selected { border-color: #93c5fd; box-shadow: 0 0 0 1px #93c5fd inset; }
+.contig-row-break { padding-top: 4px; padding-bottom: 4px; background: #f9fafb; border-style: dashed; }
+.contig-head { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.contig-head .contig-kind { flex: 0 0 auto; font-weight: 600; }
+.contig-head .contig-break { min-width: 0; }
+.contig-chain-tag { font-size: 12px; font-weight: 600; color: var(--chain-colour, #6b7280); white-space: nowrap; }
+.contig-head .entity-remove { margin-left: auto; }
+.contig-field { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; min-width: 0; }
+.contig-field-wide { flex: 1 1 100%; flex-direction: column; align-items: stretch; gap: 3px; }
+.contig-field-hot { flex: 1 1 100%; }
+.contig-field-hot .contig-hotspots { flex: 1 1 8ch; width: auto; min-width: 8ch; }
+.contig-unit { font-size: 12px; color: #6b7280; }
+.contig-more > summary { cursor: pointer; font-size: 12px; color: #6b7280; width: fit-content; }
+.contig-more-fields { display: flex; flex-wrap: wrap; gap: 6px 12px; padding-top: 6px; }
 
 /* WHICH CHAIN THIS BLOCK IS, as the colour it will be in the viewer. The bar is
    a ::before rather than a grid child because this is a three-track grid whose
@@ -1282,16 +1303,16 @@
 
    Rows in the same chain carry the same bar, so a chain break is visible as the
    colour changing rather than only as the "New chain" row that causes it. */
-.contig-row-chained { padding-left: 12px; }
+.contig-row-chained { padding-left: 14px; }
 
 .contig-row-chained::before {
   content: "";
   position: absolute;
   left: 0;
-  top: 2px;
-  bottom: 2px;
-  width: 4px;
-  border-radius: 2px;
+  top: 0;
+  bottom: 0;
+  width: 5px;
+  border-radius: 8px 0 0 8px;
   background: var(--chain-colour, transparent);
 }
 
@@ -1300,7 +1321,8 @@
 .contig-fields {
   display: flex;
   align-items: center;
-  gap: 6px;
+  flex-wrap: wrap;
+  gap: 8px 14px;
   min-width: 0;
 }
 
@@ -1325,48 +1347,18 @@
 
 /* A sequence is the one field that wants the room, so it takes what is left. */
 .contig-sequence {
-  flex: 1 1 auto;
+  width: 100%;
   min-width: 0;
-  height: 34px;
+  min-height: 34px;
   padding: 7px 10px;
   resize: vertical;
-  white-space: nowrap;
-  overflow-x: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  word-break: break-all;
 }
 
 /* A break has nothing to fill in, so its row says what it does instead. */
 .contig-break { font-style: italic; color: #9ca3af; }
-
-/* 🔴 THE EXTRAS ARE A SECOND LINE, REVEALED, NOT A WIDER ROW. A given span can
-   carry a polymer, modified residues, hotspots and a redesign toggle; inline
-   they pushed the sequence box down to five characters. Folded away, a row is
-   one line and the reader opens the one row they care about - which is the same
-   trick .entity-row plays with its own ⋮ popup. */
-.contig-more {
-  grid-column: 2;
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 6px 10px;
-  padding-top: 2px;
-}
-
-/* The disclosure and the remove button are index.html's own, so a row's two
-   quietest controls look the way the fold page's do. */
-.contig-disclose { width: 34px; position: relative; }
-.contig-disclose[aria-expanded="true"] { color: #111827; box-shadow: inset 0 0 0 1px #d1d5db; }
-
-/* ...with a dot when something behind it is set, so a closed row still says it
-   carries a modification or a hotspot. The same signal .entity-options uses. */
-.contig-disclose[data-set]::after {
-  content: "";
-  position: absolute;
-  width: 5px;
-  height: 5px;
-  margin: -10px 0 0 7px;
-  border-radius: 50%;
-  background: #3b82f6;
-}
 
 /* A span the chosen method cannot honour: marked, still present, carrying its
    reason. Never display:none - a control that vanishes teaches nothing. */
@@ -1480,16 +1472,19 @@
 .design-step .option-note:empty { display: none; }
 
 /* the goals: a card each, the chosen one outlined */
-.goal-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
-.goal-card { display: grid; grid-template-columns: 20px 1fr; grid-template-rows: auto auto; column-gap: 8px;
-  text-align: left; padding: 8px 10px; border: 1px solid #e5e7eb; border-radius: 8px; background: #f9fafb;
-  cursor: pointer; font: inherit; color: inherit; }
-.goal-card i { grid-row: 1 / span 2; align-self: center; color: #2563eb; }
-.goal-card strong { font-size: 13px; }
-.goal-card span { font-size: 12px; color: #6b7280; }
-.goal-card:hover:not(:disabled) { border-color: #93c5fd; background: #eff6ff; }
-.goal-card[aria-checked="true"] { border-color: #2563eb; background: #eff6ff; box-shadow: 0 0 0 1px #2563eb inset; }
-.goal-card:disabled { opacity: .45; cursor: not-allowed; }
+/* the method and its models: three labelled pickers that wrap */
+.model-row { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: flex-end; }
+.model-field { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.model-field label { font-size: 12px; color: #6b7280; }
+.model-field select { min-width: 7.5rem; }
+#step-method .step-hint { margin: 8px 0 0; }
+.example-picker { width: 100%; }
+#preset-note { margin-top: 6px; }
+.structure-line { display: flex; align-items: center; gap: 8px; margin: 4px 0 8px; }
+.structure-line .option-note:empty + #clear-structure { display: none; }
+.add-segment { flex: 0 1 auto; min-width: 12rem; }
+.visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden;
+  clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
 
 .design-step .design-structure { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
 .design-step .design-structure input[type="text"] { flex: 1 1 140px; min-width: 0; }
@@ -1497,11 +1492,7 @@
 /* the job at a glance: a row per chain, a block per piece */
 .chain-diagram { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
 .chain-diagram:empty { display: none; }
-.hotspot-line { margin: -2px 0 10px; font-size: 13px; line-height: 1.45; }
-.hotspot-line .role-swatch { display: inline-block; vertical-align: -1px; margin-right: 6px; }
-.hotspot-line[hidden] { display: none; }
 .chain-block-hot { display: inline-block; padding: 1px 5px; border-radius: 8px; background: #f59e0b; color: #111827; font-weight: 600; }
-.hotspot-line .hotspot-what { color: #6b7280; }
 .chain-row { display: flex; align-items: center; gap: 8px; }
 .chain-name { width: 14px; font-size: 12px; font-weight: 700; color: var(--chain-colour, #6b7280); }
 .chain-track { display: flex; flex: 1 1 auto; gap: 2px; min-width: 0; }
@@ -1515,15 +1506,6 @@
 .chain-block-ligand { flex: 0 0 auto; border-color: #78716c; border-radius: 14px; background: #f5f5f4; }
 .chain-block.selected, .chain-block:focus-visible { outline: 2px solid #111827; outline-offset: 1px; }
 .contig-row-flash { animation: contig-flash 1.2s ease-out; }
-/* A span row in the steps column is a phone's at every width: the column is ~410px, which is the
-   width the stacked row was made for (kind and buttons on line one, the fields below). */
-#step-build .contig-row { grid-template-columns: minmax(0, 1fr) auto; row-gap: 6px; }
-#step-build .contig-row > .entity-picker { grid-column: 1; grid-row: 1; min-width: 0; }
-#step-build .contig-row > .contig-fields:last-of-type { grid-column: 2; grid-row: 1; }
-#step-build .contig-fields:not(:last-of-type) { grid-column: 1 / -1; grid-row: 2; flex-wrap: wrap; }
-#step-build .contig-more { grid-column: 1 / -1; }
-#step-build .contig-sequence { flex: 1 1 100%; }
-#step-build .contig-fields input { flex: 0 0 auto; }
 @keyframes contig-flash { from { background: #dbeafe; } to { background: transparent; } }
 .design-step .design-summary { display: flex; align-items: center; gap: 10px; margin-top: 6px; }
 .design-step .design-summary code { font-size: 12px; color: #6b7280; background: none; border: 0; }
@@ -1588,6 +1570,7 @@
   .design-stage { position: static; max-height: none; overflow: visible; order: 2; }
   .design-steps { display: contents; }
   .design-step { order: 3; }
+  #step-method { order: 0; }
   #step-goal { order: 1; }
   .viewer-empty { min-height: 120px; }
 }
@@ -1720,23 +1703,5 @@
 
 
 
-/* 🔴 A SPAN ROW STACKS ON A PHONE, because its first track is a select naming a
-   kind - "Given sequence" is 290px of a 390px screen, and at that width the
-   fields were squeezed to nothing and the two buttons overflowed the panel
-   entirely. The kind and the row's buttons keep line one; the fields take line
-   two, full width, which is the only place they fit. */
-@media (max-width: 640px) {
-  .contig-row {
-    grid-template-columns: minmax(0, 1fr) auto;
-    row-gap: 6px;
-  }
 
-  .contig-row > .entity-picker { grid-column: 1; grid-row: 1; min-width: 0; }
-  .contig-row > .contig-fields:last-of-type { grid-column: 2; grid-row: 1; }
-
-  /* The fields, and the extras when they are open, span the row below. */
-  .contig-fields:not(:last-of-type) { grid-column: 1 / -1; grid-row: 2; flex-wrap: wrap; }
-  .contig-more { grid-column: 1 / -1; }
-
-  .contig-sequence { flex: 1 1 100%; }
 }
