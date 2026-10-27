@@ -379,3 +379,16 @@ a 1-cycle hunt on the six Protein Hunter takes - 16 of 16 finished. Fixed on the
 Open: at the check's speed settings (20 steps, 1 cycle) uncond_short and the 5O45 binder hunts end
 "no cycle was eligible" (the alanine ceiling) - known from the earlier sweep, not a page fault.
 
+
+### Chain colours during a generation (2026-10-27) - done
+
+Reported: chain colours mismatched during generation. 🔴 RFD4-Proteina's frames were never coloured by
+the page - py2Dmol's palette goes by the output's own letters - and RFD4 letters chains its own way:
+a kept chain keeps the structure's letter, new chains take the first free one
+(`createChainIdGenerator(claimedChainIds)`). So the 5O45 binder, design first and target from chain A,
+came out target A / design B, and was drawn with each in the other's colour; the cards and diagram
+said A / B the other way round. `chainLetters(spans, method, claimed)` (web/contig-ui.js) is now the
+one rule - Hunter's job order, or RFD4's - for the cards' "→ chain X", the diagram, the results legend
+and the colour of every RFD4 frame; a chain RFD4 writes that the rule did not predict is an error.
+Verified: all ten RFD4 examples ran through `--presets` with the check live (no error, results
+unchanged), and 5O45 / PD-L1 / DNA screenshot before and after a run in the same colours.

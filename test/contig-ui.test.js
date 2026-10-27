@@ -1,5 +1,5 @@
 import { describe, expect, it } from "./harness.js";
-import { METHOD_LIMITS, SPAN_KINDS, chainsOf, conditionsOf, contigOf, emptySpan, hotspotsOf,
+import { METHOD_LIMITS, SPAN_KINDS, chainLetters, chainsOf, conditionsOf, contigOf, emptySpan, hotspotsOf,
   modificationsOf, spanToContig } from "../web/contig-ui.js";
 import { RFD4P_PRESETS } from "../shared/rfd4p/presets.js";
 
@@ -416,6 +416,26 @@ describe("the design job as a list of spans", () => {
       // ...and Hunter as plain numbers to measure against
       expect(hotspotsOf(spans)).toEqual({ A: [12, 14] });
       expect(hotspotsOf([{ kind: "generated", min: 9, max: 9 }])).toBe(undefined);
+    });
+
+    // 🔴 THE TWO METHODS LETTER CHAINS DIFFERENTLY - the 5O45 binder's design is A under Hunter and B
+    // under RFD4, whose kept chain keeps its letter (A) and whose new chains take what is left. The
+    // run is coloured by these letters, so a wrong one paints a chain in another's colour.
+    it("letters chains as each method writes them", () => {
+      const binder = [{ kind: "generated", min: 70, max: 70 }, { kind: "break" },
+        { kind: "segment", chain: "A", first: 17, last: 131 }];
+      expect(chainLetters(binder, "hunter")).toEqual(["A", "B"]);
+      expect(chainLetters(binder, "rfd4p")).toEqual(["B", "A"]);
+      const dna = [{ kind: "segment", chain: "A", first: 1, last: 9 }, { kind: "break" },
+        { kind: "segment", chain: "B", first: 1, last: 10 }, { kind: "break" }, { kind: "generated", min: 120, max: 150 }];
+      expect(chainLetters(dna, "rfd4p")).toEqual(["A", "B", "C"]);
+      const motif = [{ kind: "generated", min: 5, max: 20 }, { kind: "segment", chain: "A", first: 1, last: 20 },
+        { kind: "generated", min: 5, max: 20 }];
+      expect(chainLetters(motif, "rfd4p")).toEqual(["A"]);
+      // a ligand from chain A of the structure keeps A, so the design beside it is B
+      const pocket = [{ kind: "ligand", code: "SAM" }, { kind: "break" }, { kind: "generated", min: 120, max: 165 }];
+      expect(chainLetters(pocket, "rfd4p", ["A"])).toEqual(["B"]);
+      expect(chainLetters(pocket, "rfd4p", ["B"])).toEqual(["A"]);
     });
 
     // 🔴 HUNTER CHECKS THEM IN ITS OWN FOLD, whose chains are lettered by job order and numbered from 1

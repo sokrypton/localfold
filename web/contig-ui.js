@@ -146,6 +146,34 @@ export function chainOfSpans(spans) {
   return out;
 }
 
+/**
+ * The letter each chain of the job has in the METHOD'S OUTPUT, by `chainOfSpans` index.
+ *
+ * 🔴 THE TWO METHODS LETTER CHAINS DIFFERENTLY, and the page drew both with Protein Hunter's.
+ * Protein Hunter folds the chains in job order, A, B, C. RFD4-Proteina keeps a kept chain's letter
+ * from the structure and gives a new chain the first letter nothing kept has taken
+ * (shared/rfd4p/pipeline/spec.js, `createChainIdGenerator(claimedChainIds)`) - so the 5O45 binder,
+ * the design first and its target from chain A, comes out with the target as A and the design as B,
+ * and a run painted by job order coloured each chain as the other.
+ *
+ * @param {object[]} spans
+ * @param {string} method "hunter" or "rfd4p"
+ * @param {string[]} [claimed] other letters RFD4 keeps: the structure chains a ligand comes from
+ * @returns {string[]}
+ */
+export function chainLetters(spans, method, claimed = []) {
+  const chainOf = chainOfSpans(spans);
+  const count = Math.max(-1, ...chainOf.filter((c) => c !== null)) + 1;
+  if (method !== "rfd4p") return Array.from({ length: count }, (_, c) => CHAIN_IDS[c]);
+  const kept = Array.from({ length: count }, () => null);
+  spans.forEach((span, i) => {
+    if (span.kind === "segment" && chainOf[i] !== null) kept[chainOf[i]] ??= String(span.chain ?? "").trim();
+  });
+  const taken = new Set([...kept.filter(Boolean), ...claimed]);
+  const free = CHAIN_IDS.split("").filter((letter) => !taken.has(letter));
+  return kept.map((letter) => letter || free.shift());
+}
+
 // 🔴 NAMED FOR WHAT A NEWCOMER WANTS DONE TO THE PIECE (2026-10-27): "From structure" and
 // "New chain" described where a span comes from and what follows it, not what it is.
 export const SPAN_LABELS = {
@@ -755,6 +783,8 @@ export function chainsOf(spans, options = {}) {
  * @param {() => string} [options.method] which method is selected, read when
  *   the list repaints - so changing method re-marks the rows
  * @param {(spans: object[]) => void} [options.onChange]
+ * @param {(spans: object[]) => string[]} [options.claimed] the structure chains the job's ligands come
+ *   from, which RFD4-Proteina keeps the letters of (`chainLetters`)
  * @returns {{read: () => object[], set: (spans: object[]) => void,
  *            contig: () => object}}
  */
@@ -814,7 +844,8 @@ export function spansFromAnnotatedAtoms(atoms) {
  *   hotspots?: {chain: string, resId: number}[] }} [options] `hotspots` are counted on the kept
  *   piece that holds them, so the block says where the design is aimed
  */
-export function drawChainDiagram(container, spans, { onPick = () => {}, selected = -1, hotspots = [] } = {}) {
+export function drawChainDiagram(container, spans, { onPick = () => {}, selected = -1, hotspots = [],
+  letters = chainLetters(spans, "hunter") } = {}) {
   const chainOf = chainOfSpans(spans);
   const rows = new Map();
   const ligands = [];
@@ -846,7 +877,7 @@ export function drawChainDiagram(container, spans, { onPick = () => {}, selected
   for (const [chain, indices] of rows) {
     const row = element("div", "chain-row");
     row.style.setProperty("--chain-colour", chainColour(chain));
-    row.append(element("span", "chain-name", CHAIN_IDS[chain] ?? "?"));
+    row.append(element("span", "chain-name", letters[chain] ?? "?"));
     const track = element("div", "chain-track");
     for (const index of indices) {
       const span = spans[index];
@@ -942,6 +973,7 @@ export function createContigList(rowsContainer, addControl, options = {}) {
     const rfd4 = method === "rfd4p";
     rowsContainer.replaceChildren();
     const chainOf = chainOfSpans(spans);
+    const letters = chainLetters(spans, method, options.claimed?.(spans) ?? []);
 
     for (const [index, span] of spans.entries()) {
       const row = element("div", `contig-row contig-row-${span.kind}`);
@@ -955,7 +987,7 @@ export function createContigList(rowsContainer, addControl, options = {}) {
         row.style.setProperty("--chain-colour", LIGAND_COLOUR);
         row.classList.add("contig-row-chained");
       }
-      const where = chain !== null ? `chain ${CHAIN_IDS[chain] ?? "?"}` : span.kind === "ligand" ? "ligand" : "";
+      const where = chain !== null ? `chain ${letters[chain] ?? "?"}` : span.kind === "ligand" ? "ligand" : "";
       row.setAttribute("aria-label", `Segment ${index + 1}: ${SPAN_LABELS[span.kind]}${where ? `, ${where}` : ""}`);
 
       // ---- the head: what the segment is, which chain, remove -------------------------------

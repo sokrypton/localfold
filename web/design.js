@@ -14,7 +14,7 @@
  * See docs/DESIGN.md for the plan this page is step one of.
  */
 import {
-  chainColour, chainOfSpans, chainsOf, CONDITION_COLOURS, conditionsOf, contigOf, createContigList,
+  chainColour, chainLetters, chainOfSpans, chainsOf, CONDITION_COLOURS, conditionsOf, contigOf, createContigList,
   drawChainDiagram, drawLengths, HOTSPOT_COLOUR, hotspotsOf, INPUT_COLOUR, LIGAND_COLOUR, shade,
 } from "./contig-ui.js";
 import { DEFAULT_STEPS, generate } from "./generate.js";
@@ -285,6 +285,7 @@ spanList = createContigList(element("contig-rows"), element("add-span"), {
   method: () => method.value,
   onChange: () => paintJob(),
   hotspotsFromSelection: (span) => selectedWithin(span),
+  claimed: (spans) => ligandChains(spans),
 });
 
 const contigLine = element("contig-line");
@@ -320,8 +321,10 @@ function paintLegend(spans) {
     item.append(swatch, text);
     return item;
   };
+  // the letters the chosen method's output has (chainLetters), as the cards and the diagram say
+  const letters = chainLetters(spans, method.value, ligandChains(spans));
   const items = chains.map((at) => entry(chainColour(at),
-    `chain ${CHAIN_IDS[at] ?? "?"}${at === chainIndex ? " — designed" : ""}`));
+    `chain ${letters[at] ?? "?"}${at === chainIndex ? " — designed" : ""}`));
   // Only worth a line when there is something held to explain.
   if (held.length > 0 && chainIndex >= 0) {
     items.push(entry(shade(chainColour(chainIndex), "#374151", 0.55), "held"));
@@ -359,6 +362,44 @@ function hotspotResidues(spans) {
   return [...out.values()];
 }
 
+/**
+ * The loaded structure's chains that hold one of the job's ligands - letters RFD4-Proteina keeps.
+ * 🔴 A FUNCTION DECLARATION, read while the span list constructs.
+ */
+function ligandChains(spans) {
+  if (loaded === null) return [];
+  const codes = new Set(spans.filter((span) => span.kind === "ligand").map((span) => String(span.code).toUpperCase()));
+  const out = new Set();
+  for (let i = 0; i < loaded.atoms.chain_id.length; i += 1) {
+    if (codes.has(String(loaded.atoms.res_name[i]).trim().toUpperCase())) out.add(String(loaded.atoms.chain_id[i]));
+  }
+  return [...out];
+}
+
+/**
+ * A generation's frame in the job's colours: each chain the colour its card and the sketch gave it.
+ *
+ * 🔴 IT WAS LEFT TO py2Dmol, whose palette goes by the output's own letters - and RFD4-Proteina
+ * letters chains its own way (`chainLetters`), so the 5O45 binder's design was drawn in its target's
+ * colour and the target in the design's. 🔴 AND A CHAIN THE RULE DID NOT PREDICT IS AN ERROR, not
+ * a colour guessed: it means the page's account of the output is wrong.
+ */
+function paintGenerated(pdb) {
+  const spans = spanList.read();
+  const claimed = ligandChains(spans);
+  const letters = chainLetters(spans, "rfd4p", claimed);
+  const polymer = new Set();
+  for (const line of pdb.split("\n")) {
+    if (line.startsWith("ATOM  ")) polymer.add(line.slice(21, 22).trim());
+  }
+  const unknown = [...polymer].filter((letter) => !letters.includes(letter) && !claimed.includes(letter));
+  if (unknown.length > 0) {
+    throw new Error(`RFD4-Proteina wrote chain ${unknown.join(", ")}, which the job's lettering`
+      + ` (${letters.join(", ")}) does not have`);
+  }
+  viewer.colourChains(Object.fromEntries(letters.map((letter, at) => [letter, chainColour(at)])));
+}
+
 /** What chainsOf reads off the loaded structure: a segment's sequence, and what its chain is made of. */
 function readers() {
   return { sequenceOf: resolver(), polymerOf };
@@ -368,7 +409,8 @@ const paintJob = () => {
   const spans = spanList?.read() ?? [];
   paintLegend(spans);
   drawChainDiagram(element("chain-diagram"), spans, { onPick: (index) => spanList.reveal(index),
-    hotspots: hotspotResidues(spans), selected: spanList?.selected ?? -1 });
+    hotspots: hotspotResidues(spans), selected: spanList?.selected ?? -1,
+    letters: chainLetters(spans, method.value, ligandChains(spans)) });
   const hunter = method.value === "hunter";
   const { contig, problems, tokens } = contigOf(spans, method.value);
   const span = tokens.min === tokens.max ? `${tokens.min}` : `${tokens.min}\u2013${tokens.max}`;
@@ -1669,6 +1711,7 @@ function drawGenerated(candidate, total) {
   viewer.push(reference === null ? candidate.pdb
     : alignToReference(candidate.pdb, reference, undefined),
   (built) => { if (built) viewer.orient(); });
+  paintGenerated(candidate.pdb);
   followSequence();
   // 🔴 AND FRAMED ON THE FINISHED DESIGN: the viewer oriented on the trajectory's FIRST frame, which
   // is close to noise at another scale, so the design came out zoomed far into one corner.
@@ -1924,6 +1967,7 @@ const startGenerate = async () => {
         const placed = reference === step.pdb ? step.pdb
           : alignToReference(step.pdb, reference, undefined);
         viewer.push(placed, (built) => { if (built) viewer.orient(); });
+        paintGenerated(placed);
         followSequence();
       },
       // 🔴 A DIFFERENT SEED A CANDIDATE, or the beam draws the same structure
