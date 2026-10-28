@@ -937,10 +937,13 @@ function paintViewerBar() {
   const spans = spanList.read();
   const chainOf = chainOfSpans(spans);
   const first = (kind) => spans.findIndex((span, i) => span.kind === kind && chainOf[i] !== null);
-  if (inputView.ghosts.size > 0) {
-    key(ghostColour([...inputView.ghosts.values()][0].chain), "to be designed (a sketch of its length)");
+  // 🔴 IN THE SEGMENTS' OWN NAMES (2026-10-28) - Designed, Sequence, Structure - and a sketch is
+  // either of the first two, so each kind that is sketched gets its own key
+  for (const [kind, name] of [["generated", "designed"], ["sequence", "sequence"]]) {
+    const ghost = [...inputView.ghosts.values()].find((g) => spans[g.span]?.kind === kind);
+    if (ghost !== undefined) key(ghostColour(ghost.chain), `${name} (a sketch of its length)`);
   }
-  if (first("segment") >= 0) key(chainColour(chainOf[first("segment")]), "kept from the structure");
+  if (first("segment") >= 0) key(chainColour(chainOf[first("segment")]), "structure");
   if (unusedInput(spans)) key(INPUT_COLOUR, "not used");
   if (hotspotResidues(spans).length > 0) key(HOTSPOT_COLOUR, "hotspot");
 }
