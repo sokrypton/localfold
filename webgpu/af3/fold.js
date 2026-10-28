@@ -1230,7 +1230,13 @@ async function foldHolding(device, batch, weights, options, held) {
       + " (docs/AF3.md, \"Flow removed\")");
   }
   stage("sample-start", { steps: options.steps });
+  // 🔴 A WARM START IS IN RESIDUE TOKENS, and OpenDDE samples in its structural tokens: refused there
+  // rather than mapped, until something needs it (diffusion-sampler.js, `start`)
+  if (options.start !== undefined && structural !== undefined) {
+    throw new Error("a warm start is not mapped to OpenDDE's structural tokens");
+  }
   const sampled = await sampleOnGpu(device, headInput, weights.diffusion, {
+    ...(options.start === undefined ? {} : { start: options.start }),
     steps, stopAfter: options.stopAfter, head,
     normal: normalFrom(options.seed ?? 20260831),
     onStep,

@@ -458,3 +458,44 @@ capicua's HMG domain (pLDDT 42 for the native complex) and scores the base-less 
 best (ipTM 0.353 against the native strand's 0.089) - so the loop's own selection works against it.
 A nucleic design wants an objective that sees pairing (pLDDT, or base-pair geometry as a veto) and a
 target that folds (an MSA or a template), neither of which is wired.
+
+### Protein Hunter with history: Stay within and Warm start (2026-10-28) - done, measured on one target
+
+Nothing carried a cycle's structure to the next but the backbone MPNN read, so a run drifted. Two
+remedies, both off by default (the reference's method):
+
+- **Stay within (A)** (`accept` in webgpu/design/hunter-loop.js): up to Sequences designs a cycle,
+  one at a time, keeping the first whose designed chain moved less than this from the previous
+  cycle (C-alpha RMSD on itself), else the closest; from cycle 2.
+- **Warm start (A)** (`warm` in web/hunt.js): each cycle's AF3 diffusion starts from the previous
+  cycle's structure this far down the noise schedule and runs only the steps left - partial
+  diffusion (`start` in webgpu/af3/diffusion/diffusion-sampler.js). The previous PDB is laid out for
+  the new sequence by `startFromPdb` (shared/af3/structure/warm-start.js): an unchanged residue
+  copies every atom, a mutated one its backbone and CB, every other atom on its C-alpha. On 6MRR a
+  four-mutation variant folded 1.5 A from the previous fold warm at 10 A against 2.3-2.5 cold.
+
+The results table's **Moved** column shows each cycle's drift either way.
+
+5O45 binder, AF3, 6 cycles, three seeds, the best design refolded by Protenix-2 (chain B templated):
+
+| seed | arm | moved, cycles 3-6 | best objective | refold ipTM, RMSD |
+|---|---|---|---|---|
+| 0 | reference | 2.3 / 1.0 / 2.1 / 2.7 | 0.134 | 0.285, 1.32 |
+| 0 | warm 10 | 2.0 / 1.8 / 1.6 / 1.7 | 0.155 | 0.307, 1.73 |
+| 0 | stay 2 | 1.4 / 0.8 / 0.7 / 0.6 | 0.146 | 0.342, 1.14 |
+| 0 | both | = warm 10 (every first try was within) | 0.155 | 0.307, 1.73 |
+| 1 | reference | 3.5 / 5.1 / 7.2 / 3.7 | 0.192 | 0.359, 2.05 |
+| 1 | warm 10 | 2.9 / 2.5 / 1.0 / 1.5 | 0.223 | 0.610, 1.84 |
+| 1 | stay 2 | none within, 4.4-7.7 | 0.355 | 0.599, 8.77 |
+| 1 | both | 2.5 / 2.3 / 1.5 / 1.6 | 0.210 | 0.308, 7.32 |
+| 2 | reference | 6.3 / 8.4 / 13.2 / 7.8 | 0.351 | 0.603, 6.80 |
+| 2 | warm 10 | 3.7 / 2.5 / 2.0 / 1.6 | 0.545 | 0.708, 6.41 |
+| 2 | stay 2 | none within, 5.3-17 | 0.283 | 0.325, 12.6 |
+| 2 | both | 3.3 / 1.1 / 1.8 / 1.9 | 0.527 | 0.683, 9.01 |
+
+🔴 **The warm start is what stabilises a run**: it settles to ~1.5-2 A on every seed where the
+reference keeps jumping 3-13 A, and beats the reference's best objective and refold ipTM on all
+three. **Stay within alone is a filter, not a force**: where no candidate comes near (seeds 1 and
+2) every cycle falls back to "closest" and its best design fails the refold badly. Stabler is not
+the same as right - seed 2's refold disagrees in every arm. One target, three seeds; a
+monomer and a second binder are the next measurements.

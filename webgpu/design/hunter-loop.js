@@ -113,7 +113,8 @@ export function withChain(chains, index, sequence) {
  * @param {object} options
  * @param {(sequence: string, context: object) => Promise<object>} options.fold
  *   given the colon-joined complex, resolves to `foldAf3`'s result - it needs
- *   `pdb` and `confidence`
+ *   `pdb` and `confidence`. Its context carries `previous`, the previous cycle's PDB (undefined on
+ *   cycle 0), so a fold can start from it - see web/hunt.js `warm`
  * @param {(pdb: string, context: object) => Promise<object>|object}
  *   options.design given the prediction, resolves to `{sequence}` for the
  *   designed chain. See designChain() in ./mpnn-bridge.js.
@@ -277,7 +278,7 @@ export async function* runDesign(options) {
       for (let draw = 0; draw < accept.tries; draw += 1) {
         const candidate = await designOne(draw);
         const attempt = await fold(withChain(chains, chainIndex, candidate.sequence),
-          { cycle, run, draw, draws: accept.tries, signal });
+          { cycle, run, draw, draws: accept.tries, signal, previous: previous.pdb });
         throwIfAborted(signal);
         const moved = options.drift(previous.pdb, attempt.pdb);
         drawn.push(candidate);
@@ -292,12 +293,12 @@ export async function* runDesign(options) {
     } else if (drawn.length <= 1) {
       sequence = drawn.length === 1 ? drawn[0].sequence : sequence;
       designScore = drawn[0]?.score;
-      folded = await fold(withChain(chains, chainIndex, sequence), { cycle, run, signal });
+      folded = await fold(withChain(chains, chainIndex, sequence), { cycle, run, signal, previous: previous?.pdb });
       throwIfAborted(signal);
     } else {
       for (const [draw, candidate] of drawn.entries()) {
         const attempt = await fold(withChain(chains, chainIndex, candidate.sequence),
-          { cycle, run, draw, draws: drawn.length, signal });
+          { cycle, run, draw, draws: drawn.length, signal, previous: previous?.pdb });
         throwIfAborted(signal);
         const score = objectiveOf(attempt.confidence ?? {}, chainIndex);
         if (picked === null || score > picked.score) {

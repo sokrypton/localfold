@@ -224,3 +224,21 @@ function pdbTemplate(batch) {
   PDB_TEMPLATES.set(batch, template);
   return template;
 }
+
+/**
+ * Every atom `toPdb` writes for a batch: its dense slot and what the file calls it - atom name,
+ * residue name, chain and residue number, read off the very records `toPdb` emits, so a reader
+ * matching a previous fold's PDB against a new batch names atoms exactly as that PDB did.
+ *
+ * @param {object} batch
+ * @returns {{slot: number, atomName: string, resName: string, chain: string, resSeq: number}[]}
+ */
+export function pdbSlots(batch) {
+  return pdbTemplate(batch).records.filter((record) => record !== "TER").map(({ slot, head }) => ({
+    slot,
+    atomName: head.slice(12, 16).trim(),
+    resName: head.slice(17, 20).trim(),
+    chain: head[21],
+    resSeq: Number(head.slice(22, 26)),
+  }));
+}

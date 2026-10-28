@@ -60,6 +60,10 @@ export { FOLDERS } from "./validate-design.js";
  * @param {number} [options.beam=1] how many sequences each cycle tries
  * @param {{within: number, tries: number, from?: number}} [options.accept] hold each cycle
  *   to the previous one's fold: see runDesign. Its `tries` is the budget `beam` would be.
+ * @param {{level: number, from?: number}} [options.warm] start each cycle's diffusion from the
+ *   previous cycle's structure, `level` angstroms of noise down the schedule, from cycle `from` (2:
+ *   cycle 1 folds its first design, which should not be held to cycle 0's mostly-X guess). See
+ *   shared/af3/structure/warm-start.js.
  * @param {Iterable<number>} [options.hold] positions within the designed chain
  *   to keep as they are - a framework, a motif - every cycle
  * @param {Record<string, number[]>} [options.hotspots] per chain, residues the
@@ -224,8 +228,13 @@ export async function hunt(options) {
         // (docs/DESIGN.md 3C, her stack, not reproduced here).
         const folder = folders[(context.run * (cycles + 1) + context.cycle) % folders.length];
         foldedBy = folder;
+        // 🔴 HISTORY IN THE FOLD ITSELF: the diffusion joins part-way down, from the last cycle's
+        // structure, instead of from noise (shared/af3/structure/warm-start.js)
+        const warm = options.warm !== undefined && context.previous !== undefined
+          && context.cycle >= (options.warm.from ?? 2);
         return foldAf3({
           sequence, weights: loaded.get(folder), device, signal,
+          ...(warm ? { start: { pdb: context.previous, level: options.warm.level } } : {}),
           // A ligand and a nucleic chain change the FOLD as well as the
           // designer: the featuriser gives each ligand a chain of its own and
           // reads a nucleic chain one token per base.

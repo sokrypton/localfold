@@ -22,7 +22,11 @@ import { Af3DiffusionHeadGpu } from "./diffusion-head.js";
  * @param {{steps: number, normal: () => number, onStep?: Function,
  *          stopAfter?: number, gamma0?: number, gammaMin?: number,
  *          noiseScale?: number, stepScale?: number, schedule?: "karras"|"geometric",
- *          update?: "euler"|"exponential", churn?: boolean}} options
+ *          update?: "euler"|"exponential", churn?: boolean,
+ *          start?: {positions: Float32Array, level: number}}} options
+ *   `start` begins the walk part-way down: at the first scheduled level at or below `level`
+ *   (angstroms), from `positions` (the dense layout) plus that much noise, running only the steps
+ *   left. RFdiffusion's partial diffusion, on AF3's schedule.
  */
 export async function sampleOnGpu(device, input, weights, options) {
   const { steps, normal } = options;
@@ -57,14 +61,30 @@ export async function sampleOnGpu(device, input, weights, options) {
   const borrowed = options.head;
   const head = borrowed ?? new Af3DiffusionHeadGpu(device);
 
+  // 🔴 A WARM START SKIPS THE LARGE NOISE, IT DOES NOT RESCALE THE SCHEDULE (2026-10-28). The walk
+  // joins the same levels a cold fold visits at the first one at or below `start.level`, so the
+  // last steps - where side chains and bonds resolve - are exactly a cold fold's, and the steps
+  // above are simply not taken: fewer denoiser calls, not the same number squeezed lower.
+  let first = 0;
+  if (options.start !== undefined) {
+    const { positions: from, level } = options.start;
+    if (!(from instanceof Float32Array) || from.length !== atoms * 3) {
+      throw new Error(`a warm start needs ${atoms * 3} coordinates, got ${from?.length}`);
+    }
+    if (!(level > 0)) throw new Error(`a warm start needs a noise level in angstroms, not ${level}`);
+    first = levels.findIndex((sigma) => sigma <= level);
+    if (first < 0 || first >= levels.length - 1) {
+      throw new Error(`no step of this schedule is at or below ${level} A but above its last`);
+    }
+  }
   let positions = new Float32Array(atoms * 3);
   for (let index = 0; index < positions.length; index += 1) {
-    positions[index] = normal() * levels[0];
+    positions[index] = (options.start?.positions[index] ?? 0) + normal() * levels[first];
   }
-  let previous = levels[0];
+  let previous = levels[first];
 
   try {
-  for (let step = 1; step <= stopAfter; step += 1) {
+  for (let step = first + 1; step <= stopAfter; step += 1) {
     const level = levels[step];
     positions = randomAugmentation(positions, input.atomMask, atoms, normal);
 

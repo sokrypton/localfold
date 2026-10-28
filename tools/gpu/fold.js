@@ -13,6 +13,7 @@
  * against the dump, and the geometry report. The pipeline itself is shared with
  * the page, because the page has to run what was measured.
  */
+import { startFromPdb } from "../../shared/af3/structure/warm-start.js";
 import { memorySnapshot, setMemoryBudget } from "../../webgpu/runtime/device-memory.js";
 import { ccdUrl, parseCcdComponent } from "../../shared/af3/featurise/ccd-component.js";
 import { nameSmilesLigands, smilesComponent } from "../../shared/chem/component.js";
@@ -605,7 +606,16 @@ export async function main(device, args) {
   trajectory.length = 0;
   lastDenoised = null;
 
+  // 🔴 --start=<served path of a previous fold's PDB> --start-level=<A>: AF3's diffusion joined
+  // part-way down from that structure (shared/af3/structure/warm-start.js) - Protein Hunter's history,
+  // measurable alone here
+  const startPath = option(args, "start", "");
+  const start = startPath === "" ? undefined : {
+    positions: startFromPdb(batch, await (await fetch(startPath)).text()).positions,
+    level: Number(option(args, "start-level", "10")),
+  };
   result = await foldBatch(device, batch, weights, {
+    ...(start === undefined ? {} : { start }),
     // Omitted, each defaults to what the device supports. See docs/AF3.md.
     stagedPrecision: option(args, "staged", undefined),
     weightPrecision: option(args, "weights", undefined),

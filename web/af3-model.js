@@ -14,6 +14,7 @@
  * no alignment the MSA is the query alone, which is what AF3 itself produces
  * for a single-sequence input rather than a stub.
  */
+import { startFromPdb } from "../shared/af3/structure/warm-start.js";
 import { ccdUrl, parseCcdComponent, ligandChain } from "../shared/af3/featurise/ccd-component.js";
 import { smilesComponent } from "../shared/chem/component.js";
 import { af3BatchFromA3m } from "../shared/af3/featurise/batch.js";
@@ -610,10 +611,15 @@ export async function foldAf3(options) {
   // the live map is collapsed the same way the final one is.
   options.onBatch?.(batch);
 
+  // 🔴 A WARM START IS A PREVIOUS FOLD'S PDB, laid out for THIS batch here - the one place both exist
+  // (shared/af3/structure/warm-start.js) - and handed to the sampler as dense coordinates
+  const start = options.start === undefined ? undefined
+    : { positions: startFromPdb(batch, options.start.pdb).positions, level: options.start.level };
   const result = await foldBatch(device, batch, options.weights, {
     steps: calls, recycles, seed, reuse: options.reuse, templateSlots,
     // ...forwarded for probes that move the noise schedule
     schedule: options.schedule,
+    ...(start === undefined ? {} : { start }),
     onStage: async (name, detail) => {
       throwIfAborted(signal);
       if (name === "recycle-done" && detail.trunk?.contactProbs !== undefined) {

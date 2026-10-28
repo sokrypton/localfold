@@ -260,14 +260,16 @@ const folders = element("folders");
 const folderNote = element("folder-note");
 const beam = element("beam");
 
-/** The "Stay within" distance, or null when it is blank - the reference's method. */
-function stayWithin() {
-  const text = document.getElementById("stay-within")?.value.trim() ?? "";
+/** A distance setting in angstroms, or null when it is blank - the reference's method. */
+function angstromsOf(id, label) {
+  const text = document.getElementById(id)?.value.trim() ?? "";
   if (text === "") return null;
-  const within = Number(text);
-  if (!(within > 0)) throw new Error(`Stay within must be a distance in angstroms, not ${text}`);
-  return within;
+  const value = Number(text);
+  if (!(value > 0)) throw new Error(`${label} must be a distance in angstroms, not ${text}`);
+  return value;
 }
+/** The "Stay within" distance, or null. */
+function stayWithin() { return angstromsOf("stay-within", "Stay within"); }
 
 /**
  * What the schedule will actually cost, in folds.
@@ -533,6 +535,7 @@ const UNUSED_BY = {
     folderGroup: "RFD4-Proteina generates structure directly, so nothing folds it in a loop.",
     cyclesGroup: "RFD4-Proteina has no fold-and-redesign cycle to repeat.",
     stayGroup: "RFD4-Proteina has no cycle to hold to the one before.",
+    warmGroup: "RFD4-Proteina has no previous cycle to start a fold from.",
     runsGroup: "RFD4-Proteina generates once; run it again for another sample.",
     temperatureGroup: "RFD4-Proteina does not sample a sequence with a temperature.",
     omitGroup: "RFD4-Proteina has no designer to forbid letters to.",
@@ -1252,6 +1255,9 @@ const startHunt = async () => {
       // time, the first that keeps its fold near the cycle before winning - not the best of all.
       ...(stayWithin() === null ? { beam: number("beam", 1) }
         : { beam: 1, accept: { within: stayWithin(), tries: Math.max(1, number("beam", 1)) } }),
+      // 🔴 "WARM START" STARTS EACH CYCLE'S DIFFUSION FROM THE CYCLE BEFORE (shared/af3/structure/warm-start.js)
+      ...(angstromsOf("warm-start", "Warm start") === null ? {}
+        : { warm: { level: angstromsOf("warm-start", "Warm start") } }),
       // 🔴 THE FOLD'S DIFFUSION STEPS, which ran at the sampler's default and
       // were not reachable from this page at all.
       steps: number("steps", HUNTER_STEPS),
