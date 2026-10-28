@@ -568,8 +568,8 @@ ipTM / RMSD, seeds 0-2:
 "none": no cycle was eligible - every design missed all 3 of PD-L1's hotspots, 7 runs of 12 here
 against 0 of 9 at 25 steps. 🔴 **THE BINDER MOVES MORE WITH MORE STEPS**: warm 10 held 5O45 at
 2-4.5 A a cycle at 25 and lets it move 6-18 at 200 (seeds 1, 2), the reference 10-54. The likely
-cause, not yet tested: the sampler's churn (gamma 0.8 above sigma 1, webgpu/af3/diffusion/diffusion-
-sampler.js) re-noises EVERY step to 1.8x its level, so a warm walk from 10 A takes more fresh noise
+cause, not yet tested: the sampler's churn (gamma 0.8 above sigma 1,
+webgpu/af3/diffusion/diffusion-sampler.js) re-noises EVERY step to 1.8x its level, so a warm walk from 10 A takes more fresh noise
 the more steps it is cut into. The monomer converges either way. 25 steps stays the default.
 
 **PD-L1 again with no hotspots required (2026-10-28)**, so every run has a best design to refold
