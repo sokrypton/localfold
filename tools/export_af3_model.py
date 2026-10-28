@@ -41,6 +41,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import struct
 import sys
 from pathlib import Path
@@ -162,6 +163,25 @@ BLOBS = {
 # (including the atom transformer encoder, which produces 384 of target_feat's
 # 447 columns), and the distogram head that reads the pair out.
 TRUNK = ("diffuser/evoformer", "diffuser/distogram_head")
+
+# Per model: matrices a quantised bundle must still carry as float32, because
+# the activations they multiply are large enough that a few percent of weight
+# error swamps the signal. They reach tools/quantize_af3.py as `float32Tensors`.
+#
+# 🔴 Mol-1's trunk single transition2. Its trained weights hold six trunk single
+# channels at ~3e5 on every token (af3-any-model's FP32_TRUNK_SINGLE), and the
+# gated activation transition2 multiplies reaches 6.6e4. At int5 g32 the error
+# that lands in every output channel is thousands: the channels inside the
+# confidence head's +/-512 clamp, which carry the per-token signal it reads,
+# came out wrong in sign and size (channel 72: 4478 against -397), and pLDDT
+# went flat - 87.8 on a random 80-mer, 84.3 on poly-G, 87.8 on ubiquitin,
+# against 74 / 78 / 92 from the float32 bundle. With these two tensors (28 M
+# parameters, +88 MiB) float32 the int5 bundle reads 73.8 / 77.4 / 92.5. int7
+# for the whole transition is not enough (88.5), and transition1 alone at
+# float32 does nothing (87.8).
+MODEL_FLOAT32 = {
+    "mol1": re.compile(r"/single_transition/transition2/weights$"),
+}
 
 # 🔴 SIZED IN FLOAT32 BYTES, FOR AN INT8 RESULT, exactly as the multimer export
 # is: quantize_model.py maps shard to shard, so a 48 MiB float32 shard lands at
@@ -373,6 +393,7 @@ def export(blob_path: str, out_dir: Path, include: tuple[str, ...],
     # manifest are checked at build time; a layout that depended on dict order
     # would fail that check for no reason.
     keep_float32 = []
+    model_float32 = MODEL_FLOAT32.get(model)
     for scope, name, array in sorted(wanted):
         tensor = f"{scope}/{name}"
         writer.add(tensor, array)
@@ -384,7 +405,8 @@ def export(blob_path: str, out_dir: Path, include: tuple[str, ...],
         # ...and the Fourier embedding, which is 512 numbers and a RANDOM
         # PROJECTION: quantising it would perturb the very thing whose spread
         # makes the embedding informative, to save half a kilobyte.
-        if name in ("offset", "scale", "bias") or name in FOURIER_LEAVES:
+        if (name in ("offset", "scale", "bias") or name in FOURIER_LEAVES
+                or (model_float32 is not None and model_float32.search(tensor))):
             keep_float32.append(tensor)
     writer.close()
 
