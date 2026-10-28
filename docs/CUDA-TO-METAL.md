@@ -110,9 +110,18 @@ product, `silu(a) b` and the second GEMM float), and the Protenix scores and reb
 scores.cuh as CUDA has them. 6MRR from its sequence: **1.579 A, pLDDT 87.95, pTM 0.8941**, ipTM 0, ranking 0.18; the
 float-pair control 1.579 A / 88.12. 🔴 Without `transitionF32` one pass folds (1.609 A) and four are NaN, as item 4
 said: lf_gemm's SwiGLU store converts to half unclamped, so the 6.6e4 is an infinity. `metal/af3/gate.py`: all 19
-cases ok against the M2's baseline, `mol1-6mrr` recorded. **Not checked against the oracles below**: they are on the
-A100 and not on this Mac, and the trunk's `trunk_in_pair`/`trunk_out_pair` seams are not tapped for the narrow pair
-(`main.mm`'s `saveSeam("trunk_out_pair")` still saves the full one) - wire those before an oracle run reads them.
+cases ok against the M2's baseline, `mol1-6mrr` recorded.
+
+**Against the trunk oracle below** (exported on the A100 with `export-model.mjs --oracles=trunk`, folded here with
+`--recycles=0` and `LOCALFOLD_SAVE_SEAMS`; the narrow pair is tapped as `trunk_in_pair`/`trunk_out_pair`, the full one
+after the adapter as `pair`), relRMS, the half pair / the float pair: target_feat 2.5e-5, z_init 8.5e-5, template
+9.3e-5, MSA stack 3.3e-4, narrow pair in 8.6e-4 / 4.6e-4, trunk_in_single 2.4e-4, narrow pair out **6.4e-3 / 4.9e-3**,
+final pair **4.5e-3 / 3.7e-3**, single 4.6e-4. 🔴 **THE CONTROL SAYS THAT IS METAL'S BAND, NOT MOL-1'S**: Protenix-2 -
+its parent, 48 pairformer blocks - through the same procedure against a trunk oracle dumped the same way (its int8 blob,
+af3-any-model's mol1-port checkout) reads target_feat 6.8e-5, MSA stack 3.4e-4, trunk_out_pair **4.5e-3 / 3.4e-3**,
+single 1.5e-3. Half GEMMs everywhere (CUDA's f32 path reads 1e-6 on the same oracle): the pairformer accumulates ~1e-2
+of drift in f16 arithmetic, whichever model. The denoise and confidence oracles were not run: Mol-1 shares Protenix-2's
+code for both.
 
 The note as written before it was done:
 

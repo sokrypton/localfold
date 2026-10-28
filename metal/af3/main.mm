@@ -226,7 +226,8 @@ int foldInput(const std::string& dir, Options o) {
     drawMsa(t);
     runTrunk(t);
     if (pass == 0) {
-      saveSeam("trunk_out_pair", t.pair, (size_t)n * n * t.C);
+      // (Mol-1's trunk_out_pair is its narrow pair, saved inside the trunk: the full one after the adapter is "pair")
+      saveSeam(M.has("trunk.pairMixerBlocks.0.singleChannels") ? "pair" : "trunk_out_pair", t.pair, (size_t)n * n * t.C);
       saveSeam("single", t.single, (size_t)n * t.Cs);
       if (profiling()) profileReport("trunk pass", getenv("AF3_PROFILE_TOP") ? atoi(getenv("AF3_PROFILE_TOP")) : 30);
     }

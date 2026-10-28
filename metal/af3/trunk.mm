@@ -559,6 +559,15 @@ static void msaBlock(Trunk& t, int k, int msaBlocks) {
               (k + 1 < msaBlocks && updateFirst) ? "trunk.msaBlocks." + num(k + 1) + ".msaAttention1.pairNorm" : "");
 }
 
+// a half tensor's seam (LOCALFOLD_SAVE_SEAMS): through a float copy, only when one is taken
+static void seamHalf(const char* name, const half* h, size_t n) {
+  if (!SEAM) return;
+  float* f = allocT<float>(n);
+  toFloat(h, f, n);
+  seam(name, f, n);
+  release(f);
+}
+
 // ---------------------------------------------------------------- one pass
 void runTrunk(Trunk& t) {
   size_t pairs = (size_t)t.n * t.n;
@@ -607,8 +616,9 @@ void runTrunk(Trunk& t) {
     half* nz = scratch<half>("trunk.narrow", pairs * Cn);
     linH(zh, "trunk.trunkPairIn", nz, pairs, t.C, Cn);
     if (reclaim) releaseScratch({"trunk.zh", "pr.", "grid.", "tr.", "st.", "par.", "trunk.sn"});
-    if (t.pass == 1) seam("trunk_in_single", t.single, (size_t)t.n * t.Cs);
+    if (t.pass == 1) { seamHalf("trunk_in_pair", nz, pairs * Cn); seam("trunk_in_single", t.single, (size_t)t.n * t.Cs); }
     stack(nz, Cn, "trunk.pairformerBlocks.", blocks);
+    if (t.pass == 1) seamHalf("trunk_out_pair", nz, pairs * Cn);
     if (reclaim) {
       releaseScratch({"pr.", "grid.", "tr.", "st.", "par.", "trunk.sn"});
       t.pair = allocT<float>(pairs * t.C);
@@ -619,8 +629,9 @@ void runTrunk(Trunk& t) {
     stack(t.pair, t.C, "trunk.pairMixerBlocks.", mixer);
     float* nz = scratch<float>("trunk.narrow", pairs * Cn);
     lin(t.pair, "trunk.trunkPairIn", nz, pairs, t.C, Cn);
-    if (t.pass == 1) seam("trunk_in_single", t.single, (size_t)t.n * t.Cs);
+    if (t.pass == 1) { seam("trunk_in_pair", nz, pairs * Cn); seam("trunk_in_single", t.single, (size_t)t.n * t.Cs); }
     stack(nz, Cn, "trunk.pairformerBlocks.", blocks);
+    if (t.pass == 1) seam("trunk_out_pair", nz, pairs * Cn);
     lin(nz, "trunk.trunkPairOut", t.pair, pairs, Cn, t.C);
     if (reclaim) releaseScratch({"trunk.narrow"});
   } else if (halfWanted && t.C % 8 == 0) {
