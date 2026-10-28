@@ -505,3 +505,23 @@ stays off - alone it failed two seeds of three. Blank either for the reference's
 the start is gathered onto its structural tokens (`residueToStructural`, the inverse of the table
 that scatters its answer back). 5O45 with OpenDDE, 5 cycles, seed 0: moved 9.6-11.6 A a cycle cold,
 4.1-5.6 warm; best objective 0.516 -> 0.549; the AF3 refold disagrees with both (12-14 A).
+
+**Measured again in the target's frame (2026-10-28), and the first table above is about SHAPE.**
+The Moved column and Stay within superposed the binder on ITSELF, so a binder that slid across its
+target read 1-2 A while the viewer - fitted on the target - showed it wandering (the user's report).
+`designedDrift` (cpu/design/align.js) fits on everything but the designed chain and takes the
+binder's RMSD unrefitted; a monomer is still measured on itself. Same job, seeds 0-2, moved per
+cycle 1-6 (A), best objective, Protenix-2 refold ipTM / RMSD:
+
+| seed | reference | warm 10 | warm 5 | warm 3 |
+|---|---|---|---|---|
+| 0 | 36/42/34/2.8/29/21 · 0.134 · 0.285/1.32 | 36/3.0/3.7/2.5/2.7/2.6 · 0.155 · 0.307/1.73 | 36/2.1/2.0/1.7/1.1/1.3 · 0.165 · 0.201/11.2 | 36/1.2/1.1/1.2/1.0/1.3 · 0.229 · 0.265/12.9 |
+| 1 | 6.2/5.6/5.0/10.7/9.8/5.1 · 0.192 · 0.359/2.05 | 6.2/4.2/4.6/3.2/2.2/3.0 · 0.223 · 0.610/1.84 | 6.2/2.4/2.0/1.6/1.3/1.7 · 0.225 · 0.505/11.8 | 6.2/1.3/1.2/0.9/1.0/1.1 · 0.191 · 0.380/15.0 |
+| 2 | 20/27/12/9.9/20/23 · 0.351 · 0.603/6.80 | 20/3.9/4.4/3.3/2.6/2.1 · 0.545 · 0.708/6.41 | 20/2.1/1.8/1.5/1.1/1.2 · 0.479 · 0.695/6.51 | 20/1.4/1.2/1.1/1.0/1.2 · 0.349 · 0.578/12.9 |
+
+🔴 The reference's binder JUMPS SITES (10-42 A a cycle); warm 10 holds it at 2-4.5. The big first
+number is cycle 1, which folds cold by design (it leaves cycle 0's mostly-X guess). 🔴 **HOLDING
+TIGHTER OVERFITS**: at 5 and 3 A the run barely moves and the independent refold rejects most of its
+designs (11-15 A) - the sequence is tuned to a structure AF3 was held at, not one it finds. 10 A is
+the only level whose refold agrees on seeds 0 and 1, so it stays the default. Warm 5 + Stay within
+3 = warm 5 on every seed (every first try was within).

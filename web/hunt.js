@@ -24,7 +24,7 @@ import { CHAIN_IDS, runDesign } from "../webgpu/design/hunter-loop.js";
 import { designChain, loadDesigner } from "../cpu/design/mpnn-bridge.js";
 import { chooseDesigner, DESIGNERS, NUCLEIC_KINDS } from "../cpu/design/designers.js";
 import { contactProblem } from "../cpu/design/contact.js";
-import { selfConsistency } from "../cpu/design/validate.js";
+import { designedDrift } from "../cpu/design/align.js";
 import { FOLDERS } from "./validate-design.js";
 
 /** The folding models this driver can actually run, and what each is in af3-model's terms. */
@@ -189,14 +189,10 @@ export async function hunt(options) {
       hold: runHold,
       beam,
       kind,
-      // 🔴 HOW FAR A CYCLE'S DESIGNED CHAIN MOVED: its C-alphas against the previous cycle's,
-      // superposed on itself - the fold's shape, wherever the target put it. Every cycle of a run
-      // is one length, so a mismatch is a bug and refused, never a large number.
-      drift: (previous, folded) => {
-        const { rmsd, comparable } = selfConsistency(previous, folded, CHAIN_IDS[chainIndex]);
-        if (!comparable) throw new Error("two cycles of one run folded different lengths");
-        return rmsd;
-      },
+      // 🔴 HOW FAR A CYCLE'S DESIGNED CHAIN MOVED, IN THE TARGET'S FRAME (designedDrift): fitted on
+      // everything else, so a binder sliding round its target counts - superposed on itself it read
+      // 1-2 A while the viewer showed it wandering. A monomer is measured on itself.
+      drift: (previous, folded) => designedDrift(previous, folded, CHAIN_IDS[chainIndex]),
       ...(options.accept === undefined ? {} : { accept: options.accept }),
 
       // 🔴 THE CONTACT CHECK, WHICH IS HOW AN EPITOPE REACHES PROTEIN HUNTER AT

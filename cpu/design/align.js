@@ -86,3 +86,45 @@ export function alignToReference(pdb, reference, designed) {
 
   return rewriteCoordinates(moving, moved);
 }
+
+/**
+ * How far the designed chain moved between two cycles, IN THE TARGET'S FRAME: the C-alpha RMSD after
+ * `alignToReference` has fitted everything but it - so a binder that kept its shape and slid round
+ * its target counts the slide.
+ *
+ * 🔴 THE FIRST MEASURE SUPERPOSED THE BINDER ON ITSELF (2026-10-28), which measures its SHAPE only:
+ * the viewer, fitted on the target, showed a binder wandering across its target while the Moved
+ * column read 1-2 A. A monomer has nothing else to fit on and is measured on itself, as the viewer
+ * fits it.
+ *
+ * @param {string} previous the cycle before
+ * @param {string} pdb this cycle
+ * @param {string} designed the designed chain
+ * @returns {number} angstroms
+ */
+export function designedDrift(previous, pdb, designed) {
+  const placed = coordinateAtoms(alignToReference(pdb, previous, designed));
+  const fixed = coordinateAtoms(previous);
+  // (the designed chain by its C-alphas, or a designed strand by its C4's)
+  const traced = (atoms) => atoms.names.flatMap((name, index) =>
+    ((name === "CA" || name === "C4'") && atoms.chains[index] === designed ? [index] : []));
+  const others = alphaCarbons(fixed, (chain) => chain !== designed).length > 0;
+  const a = traced(placed);
+  const b = traced(fixed);
+  if (a.length !== b.length || a.length === 0) {
+    throw new Error(`chain ${designed} has ${b.length} residues in the cycle before and ${a.length} in this one`);
+  }
+  if (!others) {
+    // ...a monomer: on itself, which alignToReference has already done
+    const moving = new Float32Array(a.flatMap((i) => placed.points[i]));
+    const still = new Float32Array(b.flatMap((i) => fixed.points[i]));
+    return superimposeCoords3D(still, moving).rmsd;
+  }
+  let sum = 0;
+  for (let k = 0; k < a.length; k += 1) {
+    const p = placed.points[a[k]];
+    const q = fixed.points[b[k]];
+    sum += (p[0] - q[0]) ** 2 + (p[1] - q[1]) ** 2 + (p[2] - q[2]) ** 2;
+  }
+  return Math.sqrt(sum / a.length);
+}
