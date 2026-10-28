@@ -291,12 +291,16 @@ const paintCost = () => {
     return;
   }
   const within = stayWithin();
-  folderNote.textContent = within !== null
+  const warm = angstromsOf("warm-start", "Warm start");
+  // 🔴 "THE REFERENCE'S METHOD" ONLY WHEN IT IS ONE: a warm start (on by default) is not
+  const reference = warm === null && within === null;
+  folderNote.textContent = (within !== null
     ? `Up to ${folds} folds: up to ${sequences} sequences a cycle, keeping the first that stays within`
       + ` ${within} Å of the cycle before - it stops sooner when one does.`
     : sequences === 1
-      ? `${folds} folds: one sequence a cycle, the reference's method.`
-      : `${folds} folds: ${sequences} sequences a cycle, and the best carries forward.`;
+      ? `${folds} folds: one sequence a cycle${reference ? ", the reference's method" : ""}.`
+      : `${folds} folds: ${sequences} sequences a cycle, and the best carries forward.`)
+    + (warm === null ? "" : ` Each fold starts from the cycle before, ${warm} Å of noise down.`);
   folderNote.classList.toggle("warn", folds > 40);
 };
 
@@ -507,7 +511,7 @@ element("random-seed").addEventListener("click", () => {
   element("seed").value = String(draw[0] % 1000000);
   say(`seed ${element("seed").value} - press Design for a new design`);
 });
-for (const id of ["beam", "cycles", "runs", "stay-within"]) element(id).addEventListener("input", paintCost);
+for (const id of ["beam", "cycles", "runs", "stay-within", "warm-start"]) element(id).addEventListener("input", paintCost);
 paintCost();
 paintAdvanced();
 // 🔴 AN ARROW, NOT THE FUNCTION ITSELF: `paintMethod` is declared below this
