@@ -29,11 +29,17 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 # Anything a fold streams rather than something a developer edits.
 CACHEABLE = (".bin", ".safetensors", ".zst", ".gz")
+# 🔴 ...EXCEPT THE DESIGN PAGE'S EXAMPLES, WHICH ARE .zst AND ARE EDITED. sm_sam.cif.zst renamed its
+# ligand S;M -> SAM on 2026-10-27, and a browser that had loaded it before kept the S;M copy for a
+# year under "immutable" - the stale-file trap this server exists to prevent, on a file it
+# exempted. A weight blob is content-addressed; an example structure is not.
+EDITED = ("/web/examples/",)
 
 
 class Handler(http.server.SimpleHTTPRequestHandler):
     def end_headers(self):
-        if self.path.split("?")[0].endswith(CACHEABLE):
+        path = self.path.split("?")[0]
+        if path.endswith(CACHEABLE) and not path.startswith(EDITED):
             self.send_header("Cache-Control", "public, max-age=31536000, immutable")
         else:
             self.send_header("Cache-Control", "no-store, must-revalidate")
