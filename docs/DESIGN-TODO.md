@@ -525,3 +525,28 @@ TIGHTER OVERFITS**: at 5 and 3 A the run barely moves and the independent refold
 designs (11-15 A) - the sequence is tuned to a structure AF3 was held at, not one it finds. 10 A is
 the only level whose refold agrees on seeds 0 and 1, so it stays the default. Warm 5 + Stay within
 3 = warm 5 on every seed (every first try was within).
+
+**A second binder, a monomer, and warming cycle 1 too (2026-10-28).** Same harness (the page, 6
+cycles, seeds 0-2, best design refolded by Protenix-2); "from 1" starts cycle 1 from cycle 0's fold
+of the mostly-X guess (`warm.from = 1`, injected for the measurement - not a page setting). Moved
+per cycle 1-6 (A) · best objective · refold ipTM / RMSD (the monomer has no ipTM):
+
+| target | seed | reference | warm 10 | warm 10 from 1 |
+|---|---|---|---|---|
+| 5O45 | 0 | 36/42/34/2.8/29/21 · 0.134 · 0.285/1.32 | 36/3.0/3.7/2.5/2.7/2.6 · 0.155 · 0.307/1.73 | 3.9/4.6/4.5/3.8/3.4/2.8 · 0.181 · 0.178/15.7 |
+| 5O45 | 1 | 6.2/5.6/5.0/10.7/9.8/5.1 · 0.192 · 0.359/2.05 | 6.2/4.2/4.6/3.2/2.2/3.0 · 0.223 · 0.610/1.84 | 5.6/3.0/3.7/2.8/2.2/3.6 · 0.237 · 0.532/3.65 |
+| 5O45 | 2 | 20/27/12/9.9/20/23 · 0.351 · 0.603/6.80 | 20/3.9/4.4/3.3/2.6/2.1 · 0.545 · 0.708/6.41 | 4.6/4.3/3.9/3.5/4.4/3.1 · 0.362 · 0.524/16.6 |
+| PD-L1 | 0 | 25/9.2/22/5.5/7.2/23 · 0.272 · 0.528/8.66 | 25/4.9/2.7/4.5/2.8/2.9 · 0.198 · 0.532/11.0 | 6.3/5.7/5.6/3.7/3.6/2.1 · 0.186 · 0.290/13.9 |
+| PD-L1 | 1 | 22/25/32/41/50/31 · 0.142 · 0.174/19.1 | 22/5.6/4.5/4.2/4.4/3.7 · 0.156 · 0.190/18.9 | 6.6/4.7/5.0/3.6/3.5/4.0 · 0.192 · 0.275/12.1 |
+| PD-L1 | 2 | 18/36/24/42/39/47 · 0.083 · 0.199/17.3 | 18/5.3/5.1/3.3/2.9/4.7 · 0.113 · 0.163/11.5 | 5.6/5.8/4.1/3.5/5.6/4.6 · 0.242 · 0.158/12.1 |
+| monomer 100 | 0 | 9.5/4.7/2.9/0.6/0.8/0.8 · 0.870 · 1.44 | 9.5/2.0/1.2/1.8/1.6/1.3 · 0.830 · 1.22 | 3.8/2.6/2.2/2.4/1.8/1.9 · 0.597 · 9.69 |
+| monomer 100 | 1 | 10.7/1.1/1.2/0.6/0.5/0.4 · 0.835 · 0.49 | 10.7/1.4/1.0/1.3/1.0/1.0 · 0.799 · 1.03 | 3.3/3.1/3.0/1.7/2.0/0.9 · 0.757 · 0.82 |
+| monomer 100 | 2 | 12.4/3.4/8.0/3.4/1.3/0.9 · 0.914 · 1.85 | 12.4/1.7/1.5/0.9/1.0/0.7 · 0.791 · 0.93 | 2.4/1.6/2.2/1.7/0.9/0.5 · 0.809 · 0.49 |
+
+🔴 **WARMING CYCLE 1 IS WORSE, so it stays cold**: it fails the refold on 5O45 seeds 0 and 2 (15.7,
+16.6 A) and the monomer's seed 0 (9.7) - cycle 0's fold of an all-X chain is a poor place to be held
+near. 🔴 **PD-L1 HOPS SITES TOO (18-50 A a cycle) AND WARM 10 HOLDS IT AT 3-6, BUT NOTHING PASSES
+ITS REFOLD** (8.7-19 A in every arm, ipTM <= 0.53): six cycles is too few for that target, so it says
+the drift fix is general and nothing about design quality. **A monomer converges by itself** (under
+1 A by cycle 4 cold); warm 10 costs it a little objective (0.87/0.84/0.91 -> 0.83/0.80/0.79) and its
+refolds all pass (0.9-1.2 A against cold's 0.5-1.9). Warm 10 from cycle 2 stays the default.
