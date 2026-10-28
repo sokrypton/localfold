@@ -2063,10 +2063,13 @@ void pairUpdates(float* pair, const float* mask, int n, int C, const std::string
   triangle<T>(pair, mask, n, C, pre + ".triangleMultiplicationOutgoing", true, divide); stage("tri.out");
   triangle<T>(pair, mask, n, C, pre + ".triangleMultiplicationIncoming", false, divide); stage("tri.in");
   if (releaseBetween) releaseScratch({ "tri.", "trib." });
-  int heads = (int)M.meta(pre + ".pairAttention1.heads"), D = (int)M.meta(pre + ".pairAttention1.dimension");
-  gridAttention<T>(pair, mask, n, C, heads, D, pre + ".pairAttention1", false, swap); stage("grid.row");
-  gridAttention<T>(pair, mask, n, C, heads, D, pre + ".pairAttention2", true, swap); stage("grid.col");
-  if (releaseBetween) releaseScratch({ "grid." });
+  // (Mol-1's PairMixer blocks carry no triangle attention, and run without it)
+  if (M.has(pre + ".pairAttention1.heads")) {
+    int heads = (int)M.meta(pre + ".pairAttention1.heads"), D = (int)M.meta(pre + ".pairAttention1.dimension");
+    gridAttention<T>(pair, mask, n, C, heads, D, pre + ".pairAttention1", false, swap); stage("grid.row");
+    gridAttention<T>(pair, mask, n, C, heads, D, pre + ".pairAttention2", true, swap); stage("grid.col");
+    if (releaseBetween) releaseScratch({ "grid." });
+  }
   if (mg::splitting(pair)) {       // (multi-GPU: this rank's rows, then the others')
     int lo, hi; mg::myShare(pair, n, 1, lo, hi);
     transition<T>(pairRow(pair, (size_t)lo * n, C), (size_t)(hi - lo) * n, C, transitionFactor, pre + ".pairTransition");

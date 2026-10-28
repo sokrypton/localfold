@@ -66,6 +66,8 @@ inline const std::vector<BlobEntry>& blobTable() {
     {"rosettafold3", "rosettafold3/rosettafold3.int8.bin.zst", rf3Absent},   // (its absent s_inputs rows)
     {"openbind0", "openfold3/openbind0.int8.bin.zst", r2},
     {"opendde", "opendde/opendde.int8.bin.zst", r2},
+    // Mol-1 (Molence Bio, Apache-2.0): int8 at the commit that published it
+    {"mol1", "mol1/mol1.int8.bin.zst", "1b41e3337b861081c321420c3f4a40ff9e2a6044"},
     {"esm2", "lm/esm2.bin.zst", r2},                // (chai-1's ESM2 3B: int8 as published, its only form)
     // BioEmu2 (microsoft/bioemu2-preview, MIT; cuda/bioemu2): int8 at the commit that published it
     {"bioemu2", "bioemu2/bioemu2.int8.bin.zst", "cd1c01aa9a963a5e4e45782f456680b299c63fcb"},
@@ -314,11 +316,11 @@ inline std::string ccd(const std::string& root) {
 // their deltas on it; ESMFold2 a trunk and its ESM-C tower; the released ESMFold2 checkpoints only as local exports.
 struct ModelWeights { std::string port; std::vector<std::string> dirs; };
 inline const std::vector<std::string>& af3Models() {
-  static const std::vector<std::string> m = {"af3", "boltz2", "chai1", "protenix2", "intellifold2", "rosettafold3", "opendde", "openbind0"};
+  static const std::vector<std::string> m = {"af3", "boltz2", "chai1", "protenix2", "intellifold2", "rosettafold3", "opendde", "openbind0", "mol1"};
   return m;
 }
 inline std::string modelNames() {
-  return "af3, boltz2, chai1, protenix2, intellifold2, rosettafold3, opendde, openbind0 (af3); model_1_ptm ... model_5_ptm, "
+  return "af3, boltz2, chai1, protenix2, intellifold2, rosettafold3, opendde, openbind0, mol1 (af3); model_1_ptm ... model_5_ptm, "
          "model_1_multimer_v3 ... model_5_multimer_v3 (af2); ef2-fast-600m, ef2-fast-300m, ef2-fast, ef2 (ef2); bioemu2 (bioemu2)";
 }
 // which binary folds a model, by name alone - nothing fetched (a binary asks this before downloading anything)

@@ -107,6 +107,10 @@ struct Walk {
 const std::string EVO = "diffuser/evoformer";
 const std::string MSA_STACK = EVO + "/__layer_stack_no_per_layer/msa_stack";
 const std::string PAIRFORMER = EVO + "/__layer_stack_no_per_layer_1/trunk_pairformer";
+// Mol-1's split trunk (af3-any-model's mol1 graph): eight PairMixer blocks - pairformer blocks with no triangle
+// attention, at the full pair width - take haiku's second layer stack, and the narrower pairformer the third
+const std::string PAIRMIXER = EVO + "/__layer_stack_no_per_layer_1/trunk_pairmixer";
+const std::string PAIRFORMER_AFTER_MIXER = EVO + "/__layer_stack_no_per_layer_2/trunk_pairformer";
 const std::string TEMPLATE = EVO + "/template_embedding";
 const std::string TEMPLATE_SINGLE = TEMPLATE + "/single_template_embedding";
 const std::string CONFIDENCE = "diffuser/confidence_head";
@@ -128,8 +132,6 @@ const std::string OPENDDE_CONFIDENCE_STACK = CONFIDENCE + "/pairformer_stack/tru
 // ---------------------------------------------------------------- weights.js
 inline void pairTrack(Walk& w, const std::string& p, const std::string& root, long long index) {
   auto at = [&](const std::string& path, const std::string& leaf) { w.stacked(p + path, root + "/" + leaf, index); };
-  const auto& q = w.S.dims(root + "/pair_attention1/q_projection/weights");
-  long long gridHeads = q[1], gridDimension = q[2];
   for (std::string direction : {"outgoing", "incoming"}) {
     std::string t = std::string(".triangleMultiplication") + (direction == "outgoing" ? "Outgoing" : "Incoming") + ".";
     std::string s = "triangle_multiplication_" + direction + "/";
@@ -142,7 +144,12 @@ inline void pairTrack(Walk& w, const std::string& p, const std::string& root, lo
     at(t + "outputProjection", s + "output_projection/weights");
     at(t + "gatingLinear", s + "gating_linear/weights");
   }
+  // (a PairMixer block has no triangle attention: no pairAttention weights, and the block runs without it)
+  const bool attention = w.S.has(root + "/pair_attention1/q_projection/weights");
+  const auto q = attention ? w.S.dims(root + "/pair_attention1/q_projection/weights") : std::vector<long long>{};
   for (std::string which : {"1", "2"}) {
+    if (!attention) break;
+    long long gridHeads = q[1], gridDimension = q[2];
     std::string g = ".pairAttention" + which + ".", s = "pair_attention" + which + "/";
     w.num(p + g + "heads", gridHeads);
     w.num(p + g + "dimension", gridDimension);
@@ -307,14 +314,29 @@ inline void distogramWeights(Walk& w, const std::string& p, const Dialect& d) {
 }
 
 inline void trunkWeights(Walk& w, const Dialect& d, bool& dialectWritten) {
-  long long pairformerBlocks = w.S.dims(PAIRFORMER + "/single_attention_q_projection/bias")[0];
+  // Mol-1: the PairMixer stack before the pairformer, and the pairformer at its own width between two bias-free
+  // adapters (trunk_pair_in, trunk_pair_out) - stated by the dialect and checked against the tensors
+  const bool hasMixer = w.S.has(PAIRMIXER + "/single_attention_q_projection/bias");
+  if (!d.defined("pairMixer")) throw std::runtime_error("dialect.pairMixer has no default: Mol-1 runs a PairMixer stack and a narrower trunk, no other model does");
+  if (hasMixer != d.is("pairMixer"))
+    throw std::runtime_error(std::string("this bundle ") + (hasMixer ? "carries" : "does not carry") + " a PairMixer stack (trunk_pairmixer) and its dialect says otherwise");
+  const std::string PF = hasMixer ? PAIRFORMER_AFTER_MIXER : PAIRFORMER;
+  long long pairformerBlocks = w.S.dims(PF + "/single_attention_q_projection/bias")[0];
   long long msaBlocks = w.S.dims(MSA_STACK + "/outer_product_mean/output_b")[0];
   for (auto& [k, v] : d.t->walk) w.raw(std::string("m trunk.dialect.") + k + " " + v);
   dialectWritten = true;
   embedderWeights(w, "trunk.embedder");
   templateWeights(w, "trunk.template", d);
   for (long long i = 0; i < msaBlocks; ++i) msaBlockWeights(w, "trunk.msaBlocks." + std::to_string(i), i);
-  for (long long i = 0; i < pairformerBlocks; ++i) pairformerBlockWeights(w, "trunk.pairformerBlocks." + std::to_string(i), i, PAIRFORMER);
+  if (hasMixer) {
+    long long mixerBlocks = w.S.dims(PAIRMIXER + "/single_attention_q_projection/bias")[0];
+    for (long long i = 0; i < mixerBlocks; ++i) pairformerBlockWeights(w, "trunk.pairMixerBlocks." + std::to_string(i), i, PAIRMIXER);
+    const auto& in = w.S.dims(EVO + "/trunk_pair_in/weights");
+    w.num("trunk.trunkPairChannels", in[1]);
+    w.whole("trunk.trunkPairIn", EVO + "/trunk_pair_in/weights");
+    w.whole("trunk.trunkPairOut", EVO + "/trunk_pair_out/weights");
+  }
+  for (long long i = 0; i < pairformerBlocks; ++i) pairformerBlockWeights(w, "trunk.pairformerBlocks." + std::to_string(i), i, PF);
   distogramWeights(w, "trunk.distogram", d);
 }
 

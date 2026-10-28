@@ -35,7 +35,7 @@ cuBLAS), `g++`, and `curl` and `gzip` at run time (the weight download and the M
 
 ### Models
 
-`--model=` picks the checkpoint. All eight run through this one binary on af3-any-model's published int8
+`--model=` picks the checkpoint. All nine run through this one binary on af3-any-model's published int8
 weights (huggingface.co/sokrypton/af3-any-model), each with its own conventions (shared/af3/dialect.js).
 
 | `--model=` | | download |
@@ -48,6 +48,7 @@ weights (huggingface.co/sokrypton/af3-any-model), each with its own conventions 
 | `rosettafold3` | RoseTTAFold3 (diffusion sampler only) | 352 MB |
 | `opendde` | OpenDDE | 541 MB |
 | `openbind0` | OpenBind-0 | 351 MB |
+| `mol1` | Mol-1 (Molence Bio) - Protenix-2's model at c_z 448 with a PairMixer stack and a 320-wide trunk | 503 MB |
 
 Every set of weights carries its authors' licence; check it before use beyond research.
 
@@ -250,6 +251,16 @@ Where this port leaves af3-any-model for chai-lab, measured each time:
   zero. A declared one (`bondedAtomPairs`, a glycan) is the featuriser's `declaredBondMatrix` - every declared
   bond, [from][to] in the job's direction - through both halves of chai's bond projection (blob revision 3's
   `chai1_bond_trunk` into the trunk pair, `chai1_structure_bond` into the diffusion's).
+
+**Mol-1** (`--family=mol1`, Molence Bio, Apache-2.0; af3-any-model's `mol1-port` branch) is Protenix-2's model and
+featuriser with its own trunk: eight PairMixer blocks (pairformer blocks without triangle attention) at the full 448-wide
+pair, then the 40 pairformer blocks at 320 between two bias-free adapters (`trunk_pair_in`/`trunk_pair_out`, the second
+replacing the pair), the `pairMixer` flag in shared/af3/dialect.js, the widths the blob's. Against af3-any-model at f32 on
+6MRR, every trunk seam is 5.7e-8 to 1.3e-6 (the narrow pair in and out 2.4e-7 / 1.3e-6), denoise 1.4e-6 (every stage of
+it 9e-8 to 1.6e-6), confidence pLDDT 7.7e-7, PAE 1.2e-7, PDE 1.6e-7. 🔴 **ITS SINGLE OUTGROWS f16**: it reaches 3.0e5 by
+the trunk's last block, and the single transition's widening, run in f16, overflowed to inf on the second pass - one
+pass folded, two were NaN. Mol-1 itself runs its trunk in bf16 (f32's exponent range); `singleTransitionF32` runs that
+transition in f32 here, n rows. 6MRR from its sequence: 1.45-1.53 A over five seeds, pLDDT ~88, 0.5 s.
 
 **Blob revision 3** (af3-any-model 1f9b3cf; Hugging Face e9da26e6, `cuda/featurise/fetch.h` - a cached blob
 remembers its commit in `.source`, and r2's is refetched) adds three rows revision 2 left out, read as zero

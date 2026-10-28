@@ -38,8 +38,8 @@ while [ $# -gt 0 ]; do
   shift
 done
 repo="$(cd "$here/../.." && pwd)"
-case "$model" in af3|openbind0|opendde|boltz2|protenix2|intellifold2|rosettafold3|chai1) ;;
-  *) echo "no model $model (af3, openbind0, opendde, boltz2, protenix2, intellifold2, rosettafold3, chai1)" >&2; exit 1 ;; esac
+case "$model" in af3|openbind0|opendde|boltz2|protenix2|intellifold2|rosettafold3|chai1|mol1) ;;
+  *) echo "no model $model (af3, openbind0, opendde, boltz2, protenix2, intellifold2, rosettafold3, chai1, mol1)" >&2; exit 1 ;; esac
 [ -x "$repo/cuda/featurise/featurise" ] || bash "$repo/cuda/build.sh" featurise
 if [ -z "$batch" ] && [ -z "$serve" ] && ! { [ -f "/tmp/af3-serve-$model-$(id -u)/pid" ] && kill -0 "$(cat "/tmp/af3-serve-$model-$(id -u)/pid")" 2>/dev/null; }; then
   [ -x "$here/localfold-af3" ] || bash "$repo/cuda/build.sh" af3 >&2

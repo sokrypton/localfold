@@ -2094,6 +2094,8 @@ void singleTrack(float* single, const float* pair, const float* seqMask, int n, 
   const float gateBias = parallel ? 1.f : 0.f;
   T* trn = parallel ? scratch<T>("st.trn", (size_t)n * Cs) : nullptr;
   auto singleTransition = [&]() {
+    // (Mol-1's single outgrows f16 - 3e5 on 6MRR - and its transition's f16 widening overflows: dialect.js)
+    if (!trn && M.flag("trunk.dialect.singleTransitionF32")) { transition<float>(single, n, Cs, 4, B + ".singleTransition"); return; }
     transition<T>(single, n, Cs, 4, B + ".singleTransition", trn);
   };
   size_t pairs = (size_t)n * n;
@@ -2257,6 +2259,32 @@ void pairformerBlock(Trunk& t, int k) {
   }
   pairformerBlockAt<T>(t.pair, t.single, t.pairMask, t.seqMask, t.n, t.C, t.Cs,
                        "trunk.pairformerBlocks." + std::to_string(k), t.swap, t.divide);
+}
+
+// Mol-1's width adapters (PairformerWidthAdapter): pair rows through a bias-free linear into a pair of another width
+// - not added, the output IS the new pair - in row chunks, at the pair's storage (bf16 under t.p16) on both sides
+template <class PT, class T>
+__global__ void pairRowsToK(const float* pair, size_t at, T* out, size_t n) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) out[i] = fromF<T>(pairLd<PT>(pair, at + i));
+}
+template <class PT>
+__global__ void pairRowsFromK(const float* x, float* pair, size_t at, size_t n) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) pairSt<PT>(pair, at + i, x[i]);
+}
+template <class T>
+inline void pairWidthLinear(const float* src, float* dst, bool p16, size_t rows, int in, int out, const std::string& w) {
+  if constexpr (std::is_same_v<T, float>) if (!p16) { linear<float, float>(src, dst, rows, in, out, w); return; }
+  const size_t per = std::max<size_t>(1, std::min(rows, CHUNK / std::max(in, out)));
+  T* x = scratch<T>("pw.x", per * in);
+  float* y = scratch<float>("pw.y", per * out);
+  for (size_t a = 0; a < rows; a += per) {
+    const size_t r = std::min(per, rows - a);
+    WITH_PT(p16, pairRowsToK<PT, T><<<blocks(r * in), 256, 0, STREAM>>>(src, a * in, x, r * in));
+    linear<T, float>(x, y, r, in, out, w);
+    WITH_PT(p16, pairRowsFromK<PT><<<blocks(r * out), 256, 0, STREAM>>>(y, dst, a * out, r * out));
+  }
 }
 
 // ---------------------------------------------------------------- distogram
@@ -2527,9 +2555,36 @@ void runTrunk(Trunk& t, const std::function<void(const char*, const float*, size
   memReport("  trunk: MSA stack");
   if (tight) releaseScratch({ "msaatt.", "opm.", "trunk.zBeforeMsa", "trib." });
   onSeam("z_after_msa", t.pair, pairs * t.C);
-  onSeam("trunk_in_single", t.single, (size_t)t.n * t.Cs);
   int blocks_ = 0; while (M.has("trunk.pairformerBlocks." + std::to_string(blocks_) + ".singleChannels")) ++blocks_;
+  int mixer = 0; while (M.has("trunk.pairMixerBlocks." + std::to_string(mixer) + ".singleChannels")) ++mixer;
+  if (!mixer) onSeam("trunk_in_single", t.single, (size_t)t.n * t.Cs);    // (Mol-1's is after its PairMixer, as the reference taps it)
   PAIR16 = t.p16;                // (the pair's storage is bf16 for the whole fold: t.p16)
+  if (mixer) {
+    // Mol-1: eight PairMixer blocks at the pair's width, then the pairformer at its own narrower one between two
+    // bias-free adapters - the narrow pair a buffer of its own, the full pair rewritten from it after
+    if (sharded(t)) { fprintf(stderr, "Mol-1's split trunk has no several-GPU form yet\n"); exit(1); }
+    for (int k = 0; k < mixer; ++k)
+      pairformerBlockAt<T>(t.pair, t.single, t.pairMask, t.seqMask, t.n, t.C, t.Cs,
+                           "trunk.pairMixerBlocks." + std::to_string(k), t.swap, t.divide);
+    memReport("  trunk: PairMixer");
+    const int Cn = (int)M.meta("trunk.trunkPairChannels");
+    float* narrow = scratch<float>("trunk.narrowPair", (pairs * Cn * (t.p16 ? 2 : 4) + 3) / 4);
+    pairWidthLinear<T>(t.pair, narrow, t.p16, pairs, t.C, Cn, "trunk.trunkPairIn");
+    onSeam("trunk_in_pair", narrow, pairs * Cn);
+    onSeam("trunk_in_single", t.single, (size_t)t.n * t.Cs);
+    for (int k = 0; k < blocks_; ++k)
+      pairformerBlockAt<T>(narrow, t.single, t.pairMask, t.seqMask, t.n, Cn, t.Cs,
+                           "trunk.pairformerBlocks." + std::to_string(k), t.swap, t.divide);
+    onSeam("trunk_out_pair", narrow, pairs * Cn);
+    pairWidthLinear<T>(narrow, t.pair, t.p16, pairs, Cn, t.C, "trunk.trunkPairOut");
+    PAIR16 = false;
+    memReport("  trunk: pairformer");
+    // (given back only where a pass gives its stages' scratch back: a recycle pass may be a captured graph)
+    if (tight) releaseScratch({ "trunk.narrowPair", "pw.", "tri.", "trib.", "grid.", "tr.", "st." });
+    onSeam("pair", t.pair, pairs * t.C);
+    onSeam("single", t.single, (size_t)t.n * t.Cs);
+    return;
+  }
   for (int k = 0; k < blocks_; ++k) pairformerBlock<T>(t, k);
   PAIR16 = false;
   memReport("  trunk: pairformer");

@@ -312,6 +312,8 @@ export const ALPHAFOLD3 = Object.freeze({
   // than in the contraction.
   triangleMulDivideByLength: false,
   structuralTokens: false,
+  pairMixer: false,
+  singleTransitionF32: false,
   chaiAtomStack: false,
   chaiTokenEmbedding: false,
   parallelPairformer: false,
@@ -462,6 +464,8 @@ export const OPENBIND0 = Object.freeze({
   maskAtomActPerBlock: false,
   triangleMulDivideByLength: false,
   structuralTokens: false,
+  pairMixer: false,
+  singleTransitionF32: false,
   chaiAtomStack: false,
   chaiTokenEmbedding: false,
   parallelPairformer: false,
@@ -679,6 +683,8 @@ export const OPENDDE = Object.freeze({
   maskAtomActPerBlock: false,
   triangleMulDivideByLength: false,
   structuralTokens: true,
+  pairMixer: false,
+  singleTransitionF32: false,
   chaiAtomStack: false,
   chaiTokenEmbedding: false,
   parallelPairformer: false,
@@ -895,6 +901,8 @@ export const PROTENIX2 = Object.freeze({
   // concatenation. See docs/AF3.md for the feature order, which has a trap in
   // it worth reading before implementing.
   fusedTemplateEmbedder: true,
+  pairMixer: false,
+  singleTransitionF32: false,
   chaiAtomStack: false,
   chaiTokenEmbedding: false,
   parallelPairformer: false,
@@ -1130,6 +1138,8 @@ export const BOLTZ2 = Object.freeze({
   // activation starts as a copy of the conditioning - and boltz2, rosettafold3
   // and chai1 need them split: q reads `a`, c reads `a + token_to_atom(s_trunk)`.
   preTrunkQuery: true,
+  pairMixer: false,
+  singleTransitionF32: false,
   chaiAtomStack: false,
   chaiTokenEmbedding: false,
   parallelPairformer: false,
@@ -1273,6 +1283,8 @@ export const INTELLIFOLD2 = Object.freeze({
   maskAtomActPerBlock: true,
   triangleMulDivideByLength: false,
   structuralTokens: false,
+  pairMixer: false,
+  singleTransitionF32: false,
   chaiAtomStack: false,
   chaiTokenEmbedding: false,
   parallelPairformer: false,
@@ -1498,6 +1510,8 @@ export const ROSETTAFOLD3 = Object.freeze({
   maskAtomActPerBlock: false,
   triangleMulDivideByLength: true,
   structuralTokens: false,
+  pairMixer: false,
+  singleTransitionF32: false,
   chaiAtomStack: false,
   chaiTokenEmbedding: false,
   parallelPairformer: false,
@@ -1615,6 +1629,8 @@ export const CHAI1 = Object.freeze({
   maskAtomActPerBlock: true,
   triangleMulDivideByLength: false,
   structuralTokens: false,
+  pairMixer: false,
+  singleTransitionF32: false,
   chaiAtomStack: true,
   chaiTokenEmbedding: true,
   parallelPairformer: true,
@@ -1628,6 +1644,33 @@ export const CHAI1 = Object.freeze({
   mlpDistogram: true,
 });
 
+/**
+ * Mol-1 (Molence Bio, github.com/molence/Mol-1, Apache 2.0), as af3-any-model maps it onto AlphaFold 3's scopes
+ * (its mol1-port branch: converters/mol1.py, MOL1_SETTINGS).
+ *
+ * A fork of Protenix at bd54a05 - v2.0.0's model code - so every Protenix-2 convention is its own and its featuriser
+ * is Protenix-2's (af3-any-model's PROTENIX_FAMILY). What it adds is the trunk, and the tensors state all of it:
+ * c_z 448 and c_m 192 where protenix2 is 256 and 64; eight "PairMixer" blocks - pairformer blocks with NO triangle
+ * attention - at 448 before the trunk, inside the recycle loop; then the 40 pairformer blocks at 320 between two
+ * bias-free linears (`trunk_pair_in` 448 -> 320, `trunk_pair_out` 320 -> 448: no LayerNorm, and the second REPLACES the
+ * pair rather than adding to it). Recycling, the MSA stack, the template term and every head stay at 448.
+ *
+ * `pairMixer` is the one flag; the widths and block counts are the tensors'. Its inference also never applies MC
+ * dropout (configs `mc_dropout_apply_rate` 0.0, where Protenix's is 0.4), and its own default is 20 recycles.
+ */
+export const MOL1 = Object.freeze({
+  ...PROTENIX2,
+  recycleMcDropout: null,
+  recycleMcDropoutOdds: null,
+  pairMixer: true,
+  // 🔴 ITS SINGLE OUTGROWS f16: 6MRR's reaches 3.0e5 by the trunk's last block (af3-any-model's own f32 trunk: rms
+  // 6.0e4), and the single transition's widening and SwiGLU, run in f16, overflow to inf on the SECOND pass - one pass
+  // folds, two are NaN everywhere. Mol-1 itself never meets it: its trunk runs under bf16 autocast (batch_inference.py
+  // --dtype bf16, f32's exponent range) and its diffusion and confidence head in fp32 (inference.py skip_amp, below 2560
+  // tokens), and nothing in it clamps the single. Every 16-bit path here runs that transition in f32: it is n rows, free.
+  singleTransitionF32: true,
+});
+
 export const DIALECTS = Object.freeze({
   protenix2: PROTENIX2,
   boltz2: BOLTZ2,
@@ -1637,6 +1680,7 @@ export const DIALECTS = Object.freeze({
   intellifold2: INTELLIFOLD2,
   rosettafold3: ROSETTAFOLD3,
   chai1: CHAI1,
+  mol1: MOL1,
 });
 
 /**
@@ -1748,6 +1792,7 @@ export const DIALECT_ALIASES = Object.freeze({
   intellifold: "intellifold2",
   rf3: "rosettafold3",
   chai: "chai1",
+  "mol-1": "mol1",
 });
 
 /**

@@ -3247,6 +3247,7 @@ inline const std::vector<FamilyFlags>& familyFlags() {
     {"intellifold2", true, false, false, true, 1, 1, false, 0, false, 0, false, false, 0, 0, false, false, false, -1, false, false, false, false, false, false, 1, {}, false, 0, false, false, 0, false, false, false, false, false, true, false, false, true, true, false, false, true, false, false, false, false, false, false, true, 0, false},
     {"rosettafold3", true, false, true, false, 1, 1, true, 2, true, 1, false, false, 0, 0, false, true, true, -1, false, false, false, false, false, true, 1, {}, false, 3, false, false, 0, false, false, false, false, true, true, false, false, false, false, false, true, true, false, false, false, true, true, true, false, 0, true},
     {"chai1", false, false, true, false, 1, 0, false, 3, true, 0, false, true, 0, 0, false, false, false, -1, false, true, false, true, false, false, 1, {}, false, 0, false, false, 0, true, true, false, false, false, true, false, false, true, false, true, false, false, false, false, false, false, false, false, false, 2, false},
+    {"mol1", true, true, true, false, 0, 1, false, 0, false, 0, false, false, 39, 32, false, false, false, 21, false, false, false, false, false, false, 2, {71, 103}, false, 2, false, false, 0, false, false, true, true, true, true, false, false, false, false, false, false, false, false, false, true, false, false, false, false, 1, false},
   };
   return table;
 }
@@ -3324,4 +3325,4 @@ inline const std::vector<RawConformer>& chai1Conformers() {
 }
 
 // shared/af3/dialect.js DIALECT_ALIASES
-inline const std::vector<std::pair<std::string, std::string>>& familyAliases() { static const std::vector<std::pair<std::string, std::string>> a = {{"af3", "alphafold3"}, {"openbind", "openbind0"}, {"if2", "intellifold2"}, {"intellifold", "intellifold2"}, {"rf3", "rosettafold3"}, {"chai", "chai1"}}; return a; }
+inline const std::vector<std::pair<std::string, std::string>>& familyAliases() { static const std::vector<std::pair<std::string, std::string>> a = {{"af3", "alphafold3"}, {"openbind", "openbind0"}, {"if2", "intellifold2"}, {"intellifold", "intellifold2"}, {"rf3", "rosettafold3"}, {"chai", "chai1"}, {"mol-1", "mol1"}}; return a; }

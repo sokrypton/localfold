@@ -99,7 +99,7 @@ def clear_stale_work():
             shutil.rmtree(path, ignore_errors=True)
         except PermissionError:
             pass
-AF3_FAMILIES = ("af3", "openbind0", "opendde", "boltz2", "protenix2", "intellifold2", "rosettafold3", "chai1")
+AF3_FAMILIES = ("af3", "openbind0", "opendde", "boltz2", "protenix2", "intellifold2", "rosettafold3", "chai1", "mol1")
 FEATURISE = os.environ.get("LOCALFOLD_FEATURISE_DIR") or os.path.join(CUDA, "featurise")
 OUT = sys.stdout
 

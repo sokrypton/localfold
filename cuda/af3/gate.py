@@ -45,7 +45,7 @@ def cases():
     crystal_5caj = os.path.join(FIX, "5caj-crystal.pdb")
     crystal_1brs = os.path.join(FIX, "1brs-crystal.pdb")
     out = []
-    for model in ["af3", "protenix2", "boltz2", "intellifold2", "rosettafold3", "openbind0", "opendde"]:
+    for model in ["af3", "protenix2", "boltz2", "intellifold2", "rosettafold3", "openbind0", "opendde", "mol1"]:
         out.append((f"{model}-6mrr", model, [f"--sequence={SEQ_6MRR}"], [],
                     [os.path.join(FIX, "6mrr-crystal.pdb")]))
     # the paths a plain protein never reaches: a ligand and an atomised modified residue, and a DNA
