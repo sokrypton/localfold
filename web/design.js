@@ -1050,7 +1050,7 @@ const hideSequence = () => {
 // The strip wires its own Select all / Unselect / Invert (py2Dmol's panels/seq.js, since
 // sokrypton/py2Dmol#32), against the renderer `getRenderer` above names.
 // 🔴 A MOTIF DRAGGED OUT OF THE SEQUENCE, not typed: the selection's contiguous runs appended to the
-// job as `Keep from structure` spans, in the structure's own numbering, which is what a contig names.
+// job as `Structure` spans, in the structure's own numbering, which is what a contig names.
 function keepSelection() {
   let picks;
   try {

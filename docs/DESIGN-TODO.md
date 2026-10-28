@@ -236,8 +236,9 @@ constraint at all, which decides whether this is plumbing or a port.
   the method is an Advanced setting and the other method's controls are hidden
   rather than greyed with a sentence; notes appear only when something needs
   doing. The job is drawn as a chain diagram (a block per piece, click to edit),
-  pieces are named for what is done to them ("Design new", "Keep from
-  structure"), kept pieces are painted on the structure in their chain's colour,
+  pieces are named for what they are ("Designed", "Structure", "Sequence";
+  2026-10-28 - they were "Design new", "Keep from structure", "Known sequence"),
+  kept pieces are painted on the structure in their chain's colour,
   and the constraints step answers "what can I do with this selection" with quick
   actions and chips. 🔴 It found a wrong note: an example that runs from its
   structure's annotations IGNORES edits to its pieces, where the page said edits

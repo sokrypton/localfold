@@ -174,12 +174,14 @@ export function chainLetters(spans, method, claimed = []) {
   return kept.map((letter) => letter || free.shift());
 }
 
-// 🔴 NAMED FOR WHAT A NEWCOMER WANTS DONE TO THE PIECE (2026-10-27): "From structure" and
-// "New chain" described where a span comes from and what follows it, not what it is.
+// 🔴 NAMED FOR WHAT THE PIECE IS (2026-10-28): Designed, Structure, Sequence. "From structure" and
+// "New chain" described where a span comes from and what follows it; "Design new", "Keep from
+// structure" and "Known sequence" that came after were instructions, three different grammars in one
+// menu. And "Designed" rather than "Design", which would read as the Design button.
 export const SPAN_LABELS = {
-  generated: "Design new",
-  sequence: "Known sequence",
-  segment: "Keep from structure",
+  generated: "Designed",
+  sequence: "Sequence",
+  segment: "Structure",
   ligand: "Ligand",
   break: "Chain break",
 };
@@ -189,7 +191,7 @@ export const SPAN_NOTES = {
   generated: "Residues to design. Give one length, or a range for the method to choose from."
     + " Name it to ask for a secondary structure.",
   sequence: "A chain you know the sequence of - protein, DNA or RNA. Protein Hunter folds it;"
-    + " RFD4-Proteina needs its coordinates, so use \u201cKeep from structure\u201d there.",
+    + " RFD4-Proteina needs its coordinates, so use \u201cStructure\u201d there.",
   segment: "Residues taken from a loaded structure, held as they are.",
   ligand: "A small molecule by its CCD code, as context to design against.",
   break: "Everything after this is a separate chain.",
@@ -237,7 +239,7 @@ export const METHOD_LIMITS = {
     // hold fixed - where Hunter, which reaches structure by folding, takes
     // exactly that.
     sequence: "RFD4-Proteina conditions on coordinates, not on a sequence — load the structure"
-      + " and use \u201cKeep from structure\u201d.",
+      + " and use \u201cStructure\u201d.",
   },
 };
 
@@ -719,7 +721,7 @@ export function chainsOf(spans, options = {}) {
       if (text.length === 0) problems.push("a given sequence is empty");
     } else {
       if (sequenceOf === undefined) {
-        problems.push("Protein Hunter folds sequences, so a \u201cKeep from structure\u201d span needs"
+        problems.push("Protein Hunter folds sequences, so a \u201cStructure\u201d span needs"
           + " the structure loaded to read its sequence from");
         continue;
       }
@@ -924,11 +926,11 @@ export function drawChainDiagram(container, spans, { onPick = () => {}, selected
  * sequence" and then finds the polymer.
  */
 export const ADD_CHOICES = [
-  ["generated", "Design new residues", () => emptySpan("generated")],
+  ["generated", "Designed residues", () => emptySpan("generated")],
   ["protein", "Protein sequence", () => ({ ...emptySpan("sequence"), polymer: "protein" })],
   ["dna", "DNA sequence", () => ({ ...emptySpan("sequence"), polymer: "dna" })],
   ["rna", "RNA sequence", () => ({ ...emptySpan("sequence"), polymer: "rna" })],
-  ["segment", "Keep from the structure", () => emptySpan("segment")],
+  ["segment", "Structure", () => emptySpan("segment")],
   ["ligand", "Ligand", () => emptySpan("ligand")],
   ["break", "Chain break", () => emptySpan("break")],
 ];

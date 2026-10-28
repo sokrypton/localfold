@@ -3,8 +3,8 @@
  *
  * The viewer used to stay empty until a structure was loaded, and then drew only that structure -
  * so a newcomer saw nothing of what step 3 says will be built. It now draws the job: the loaded
- * structure's real atoms, and for every piece still to be designed (a `Design new` or `Known
- * sequence` span) a C-alpha trace of its length, faded, joining the pieces it sits between.
+ * structure's real atoms, and for every piece still to be designed (a `Designed` or `Sequence`
+ * span) a C-alpha trace of its length, faded, joining the pieces it sits between.
  *
  * 🔴 A SKETCH, NOT A PREDICTION, and drawn so it cannot be read as one: its geometry is a curve or a
  * ball of the right number of 3.8 A steps, nothing a model computed, and the page fades it and says
