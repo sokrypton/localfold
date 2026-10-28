@@ -571,3 +571,18 @@ against 0 of 9 at 25 steps. 🔴 **THE BINDER MOVES MORE WITH MORE STEPS**: warm
 cause, not yet tested: the sampler's churn (gamma 0.8 above sigma 1, webgpu/af3/diffusion/diffusion-
 sampler.js) re-noises EVERY step to 1.8x its level, so a warm walk from 10 A takes more fresh noise
 the more steps it is cut into. The monomer converges either way. 25 steps stays the default.
+
+**PD-L1 again with no hotspots required (2026-10-28)**, so every run has a best design to refold
+(`window.__designHotspots = {}`; an empty set used to be read as "touch none of the target" and
+refused every cycle - fixed in cpu/design/contact.js). Refold ipTM / RMSD, seeds 0-2:
+
+| steps | reference | warm 10 |
+|---|---|---|
+| 25 | 0.528/8.66 · 0.444/37.4 · 0.182/9.54 | 0.532/11.0 · 0.190/18.9 · 0.250/3.99 |
+| 100 | **0.680/1.36** · 0.302/5.82 · **0.400/0.93** | 0.719/2.83 · 0.467/4.24 · 0.182/9.17 |
+| 200 | **0.710/0.59** · 0.473/11.5 · 0.588/2.56 | **0.885/0.91** · drifted off (touches nothing) · 0.228/5.97 |
+
+🔴 **ON PD-L1 MORE STEPS HELPS, THE OPPOSITE OF 5O45**: 0 of 6 refolds pass at 25 steps, 2 of 6 at
+100 and 2 of 6 at 200 (plus a 2.56), and the best design measured anywhere here is warm 10 at 200
+(ipTM 0.885, 0.91 A). Warm start does not help this target's refold - reference 4 passes, warm 1. Three
+seeds a cell, and the two binders disagree, so no default moves on this.
