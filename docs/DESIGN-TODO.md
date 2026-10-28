@@ -605,3 +605,9 @@ objective, then the Protenix-2 refold's ipTM / RMSD:
 (3 of 3). The objective is not comparable across the arms anyway - with the pocket it is boltz2's ipTM
 after being TOLD where the binder goes. Three seeds a cell; it stays on, as upstream has it, until a
 larger set says otherwise.
+
+**...and the hotspots are a PRIOR there, not a filter (2026-10-28)**: a cycle a pocket-reading folder
+folded is no longer rejected for missing a hotspot, only for touching nothing; other folders keep the
+filter. Re-run on the same six cells, every best and every refold came out IDENTICAL to the pocket arm
+above - so with the pocket no cycle had been missing its hotspots, and every rejection there was the
+alanine ceiling. The pocket does put the binder on the epitope; what it does not yet do is refold better.

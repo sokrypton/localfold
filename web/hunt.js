@@ -68,8 +68,9 @@ export { FOLDERS } from "./validate-design.js";
  * @param {Iterable<number>} [options.hold] positions within the designed chain
  *   to keep as they are - a framework, a motif - every cycle
  * @param {Record<string, number[]>} [options.hotspots] per chain, residues the
- *   design must touch. A cycle that does not is rejected with the distance, and a
- *   folder trained on pocket constraints (boltz2) is also handed them as one.
+ *   design must touch. A folder trained on pocket constraints (boltz2) is handed
+ *   them as one, a prior; any other folder's cycle that misses them is rejected
+ *   with the distance.
  * @param {number} [options.hotspotsNeeded] how many of them must be touched
  * @param {(record: object) => void} options.report called once per cycle
  * @param {(text: string) => void} [options.status]
@@ -170,6 +171,9 @@ export async function hunt(options) {
   // Which folder the cycle currently being yielded was folded by. The loop
   // calls `fold` and then yields, so this is set before the record exists.
   let foldedBy = folders[0];
+  // Which folder folds a run's cycle - the fold and its veto must agree on it
+  const folderOf = (run, cycle) => folders[(run * (cycles + 1) + cycle) % folders.length];
+  const readsPocket = (folder) => CONSTRAINT_FAMILIES[FOLDERS[folder]] !== undefined;
 
   for (let run = 0; run < runs; run += 1) {
     // 🔴 THE JOB IS RE-READ PER RUN, because a contig may carry a length RANGE
@@ -207,12 +211,20 @@ export async function hunt(options) {
       // else. With no hotspots named it still refuses a binder that drifted off
       // the target entirely, which ipTM alone will not catch - the model can be
       // confident about a chain that is nowhere near.
-      veto: ({ pdb }) => contactProblem(pdb, {
-        chain: CHAIN_IDS[chainIndex],
-        // a run's own, where its job carries them: a drawn length moves the residues after it
-        ...(runHotspots === undefined ? {} : { residues: runHotspots }),
-        ...(options.hotspotsNeeded === undefined ? {} : { minimum: options.hotspotsNeeded }),
-      }),
+      //
+      // 🔴 AND FOR A FOLDER THAT TOOK THE HOTSPOTS AS A POCKET THEY ARE A PRIOR, NOT A FILTER
+      // (2026-10-28): the fold was asked to put the binder there, so its cycle is not rejected for
+      // missing one - only for touching nothing at all. A folder that cannot read a pocket keeps
+      // the hotspot filter, which is the only way it is aimed.
+      veto: ({ pdb, cycle }) => {
+        const prior = pocket.length > 0 && readsPocket(folderOf(run, cycle));
+        return contactProblem(pdb, {
+          chain: CHAIN_IDS[chainIndex],
+          // a run's own, where its job carries them: a drawn length moves the residues after it
+          ...(runHotspots === undefined || prior ? {} : { residues: runHotspots }),
+          ...(options.hotspotsNeeded === undefined || prior ? {} : { minimum: options.hotspotsNeeded }),
+        });
+      },
       percentX: options.percentX,
       alanineBias: options.alanineBias,
       seed: (options.seed ?? 0) + run,
@@ -227,7 +239,7 @@ export async function hunt(options) {
         // model and overfit each of them separately. Yehlin measured two or
         // three beating one and five or six doing worse than two
         // (docs/DESIGN.md 3C, her stack, not reproduced here).
-        const folder = folders[(context.run * (cycles + 1) + context.cycle) % folders.length];
+        const folder = folderOf(context.run, context.cycle);
         foldedBy = folder;
         // 🔴 HISTORY IN THE FOLD ITSELF: the diffusion joins part-way down, from the last cycle's
         // structure, instead of from noise (shared/af3/structure/warm-start.js)
@@ -245,8 +257,7 @@ export async function hunt(options) {
           // the fold fetches it and the token count does not change.
           ...(modifications === undefined || modifications.length === 0
             ? {} : { modifications }),
-          ...(pocket.length > 0 && CONSTRAINT_FAMILIES[FOLDERS[folder]] !== undefined
-            ? { constraints: pocket } : {}),
+          ...(pocket.length > 0 && readsPocket(folder) ? { constraints: pocket } : {}),
           seed: (options.seed ?? 0) + context.run,
           recycles: options.recycles,
           // 🔴 foldAf3 HAS NO DEFAULT FOR `calls` - it destructures it and the
