@@ -314,6 +314,8 @@ export const ALPHAFOLD3 = Object.freeze({
   structuralTokens: false,
   pairMixer: false,
   singleTransitionF32: false,
+  protenixScores: false,
+  rebuildCterminalOxygens: false,
   chaiAtomStack: false,
   chaiTokenEmbedding: false,
   parallelPairformer: false,
@@ -466,6 +468,8 @@ export const OPENBIND0 = Object.freeze({
   structuralTokens: false,
   pairMixer: false,
   singleTransitionF32: false,
+  protenixScores: false,
+  rebuildCterminalOxygens: false,
   chaiAtomStack: false,
   chaiTokenEmbedding: false,
   parallelPairformer: false,
@@ -685,6 +689,8 @@ export const OPENDDE = Object.freeze({
   structuralTokens: true,
   pairMixer: false,
   singleTransitionF32: false,
+  protenixScores: false,
+  rebuildCterminalOxygens: false,
   chaiAtomStack: false,
   chaiTokenEmbedding: false,
   parallelPairformer: false,
@@ -903,6 +909,12 @@ export const PROTENIX2 = Object.freeze({
   fusedTemplateEmbedder: true,
   pairMixer: false,
   singleTransitionF32: false,
+  // 🔴 ITS OWN SUMMARY SCORES, NOT AlphaFold 3's (protenix/model/sample_confidence.py; af3-any-model 5d02965): a
+  // single chain's ipTM is 0, the ranking 0.8 ipTM + 0.2 pTM - 100 has_clash with no disorder term, and has_clash over
+  // polymer chain PAIRS (more than 100 atom pairs within 1.1 A, or half the smaller chain). 7r6r ranked 0.97 under
+  // AF3's formula where native Protenix says 0.915. cuda/af3/src/scores.cuh
+  protenixScores: true,
+  rebuildCterminalOxygens: false,
   chaiAtomStack: false,
   chaiTokenEmbedding: false,
   parallelPairformer: false,
@@ -1140,6 +1152,8 @@ export const BOLTZ2 = Object.freeze({
   preTrunkQuery: true,
   pairMixer: false,
   singleTransitionF32: false,
+  protenixScores: false,
+  rebuildCterminalOxygens: false,
   chaiAtomStack: false,
   chaiTokenEmbedding: false,
   parallelPairformer: false,
@@ -1285,6 +1299,8 @@ export const INTELLIFOLD2 = Object.freeze({
   structuralTokens: false,
   pairMixer: false,
   singleTransitionF32: false,
+  protenixScores: false,
+  rebuildCterminalOxygens: false,
   chaiAtomStack: false,
   chaiTokenEmbedding: false,
   parallelPairformer: false,
@@ -1512,6 +1528,8 @@ export const ROSETTAFOLD3 = Object.freeze({
   structuralTokens: false,
   pairMixer: false,
   singleTransitionF32: false,
+  protenixScores: false,
+  rebuildCterminalOxygens: false,
   chaiAtomStack: false,
   chaiTokenEmbedding: false,
   parallelPairformer: false,
@@ -1631,6 +1649,8 @@ export const CHAI1 = Object.freeze({
   structuralTokens: false,
   pairMixer: false,
   singleTransitionF32: false,
+  protenixScores: false,
+  rebuildCterminalOxygens: false,
   chaiAtomStack: true,
   chaiTokenEmbedding: true,
   parallelPairformer: true,
@@ -1669,6 +1689,9 @@ export const MOL1 = Object.freeze({
   // --dtype bf16, f32's exponent range) and its diffusion and confidence head in fp32 (inference.py skip_amp, below 2560
   // tokens), and nothing in it clamps the single. Every 16-bit path here runs that transition in f32: it is n rows, free.
   singleTransitionF32: true,
+  // ...and it writes each chain's C-terminal O and OXT REBUILT: the oxygen nearer C kept as O, OXT its reflection
+  // across the C->CA axis (mol/runner/inference.py fix_cterminal_carboxyl_oxygens), after the confidences
+  rebuildCterminalOxygens: true,
 });
 
 export const DIALECTS = Object.freeze({

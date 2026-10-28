@@ -308,14 +308,73 @@ inline const FoldAtoms& foldAtoms() {
   return cached;
 }
 
+// The Protenix family's own summary scores (dialect protenixScores: protenix2, mol1 - protenix/model/sample_confidence.py,
+// af3-any-model 5d02965): a single chain's ipTM is 0 where AF3's is undefined, the ranking 0.8 ipTM + 0.2 pTM - 100
+// has_clash with no disorder term, and the clash test over polymer chain PAIRS below
+inline bool protenixScores() { return M.flag("trunk.dialect.protenixScores"); }
+inline double familyIptm(double iptm) { return protenixScores() && std::isnan(iptm) ? 0.0 : iptm; }
+// Protenix's clash test (af3-any-model has_clash_helixfold3, HelixFold3's get_has_clash): over polymer atoms only, a
+// pair of chains clashes when more than 100 atom PAIRS sit closer than 1.1 A, or more than half the smaller chain's
+// atom count; one polymer chain never clashes
+inline bool hasClashChainPairs(const std::vector<ScoreAtom>& atoms, const std::vector<ScoreChain>& chains, const float* x) {
+  std::vector<std::vector<std::array<float, 3>>> poly;
+  for (auto& c : chains) {
+    if (!c.polymer) continue;
+    poly.emplace_back();
+    for (auto& r : c.residues) for (size_t i : r.atoms) {
+      const size_t sl = atoms[i].slot;
+      poly.back().push_back({ pdbRound(x[sl * 3]), pdbRound(x[sl * 3 + 1]), pdbRound(x[sl * 3 + 2]) });
+    }
+  }
+  for (size_t a = 0; a + 1 < poly.size(); ++a)
+    for (size_t b = a + 1; b < poly.size(); ++b) {
+      double close = 0;
+      for (auto& p : poly[a]) for (auto& q : poly[b]) {
+        const double dx = (double)p[0] - q[0], dy = (double)p[1] - q[1], dz = (double)p[2] - q[2];
+        if (dx * dx + dy * dy + dz * dz < 1.1 * 1.1) close += 1;
+      }
+      if (close > 100 || close / (double)std::min(poly[a].size(), poly[b].size()) > 0.5) return true;
+    }
+  return false;
+}
 struct StructureScores { bool clash; double disordered; };
 inline StructureScores structureScores(const std::vector<float>& x) {
   const FoldAtoms& fa = foldAtoms();
-  return { hasClash(fa.atoms, fa.chains, x.data()), fractionDisordered(fa.atoms, fa.chains, x.data()) };
+  return { protenixScores() ? hasClashChainPairs(fa.atoms, fa.chains, x.data()) : hasClash(fa.atoms, fa.chains, x.data()),
+           fractionDisordered(fa.atoms, fa.chains, x.data()) };
 }
 inline double rankingScore(double ptm, double iptm, const StructureScores& s) {
+  if (protenixScores()) return 0.8 * familyIptm(iptm) + 0.2 * ptm - 100.0 * (s.clash ? 1 : 0);
   double base = std::isnan(iptm) ? ptm : 0.8 * iptm + 0.2 * ptm;
   return base + 0.5 * s.disordered - 100.0 * (s.clash ? 1 : 0);
+}
+
+// Mol-1's written C-termini (dialect rebuildCterminalOxygens; mol/runner/inference.py fix_cterminal_carboxyl_oxygens,
+// af3-any-model mol1_rebuild_cterminal_oxygens): each chain's LAST residue with C, CA, O and OXT keeps the oxygen nearer
+// C as O, and OXT becomes its reflection across the C->CA axis - after the confidences, on the coordinates written
+inline std::vector<float> writtenCoordinates(const std::vector<float>& x) {
+  if (!M.flag("trunk.dialect.rebuildCterminalOxygens")) return x;
+  std::vector<float> y = x;
+  const FoldAtoms& fa = foldAtoms();
+  for (auto& c : fa.chains) {
+    if (c.residues.empty()) continue;
+    std::map<std::string, size_t> at;
+    for (size_t i : c.residues.back().atoms) at.emplace(fa.atoms[i].name, fa.atoms[i].slot);
+    if (!at.count("C") || !at.count("CA") || !at.count("O") || !at.count("OXT")) continue;
+    auto P = [&](const char* n) { const size_t sl = at[n]; return std::array<double, 3>{ x[sl * 3], x[sl * 3 + 1], x[sl * 3 + 2] }; };
+    auto a = P("C"), ca = P("CA"), o = P("O"), oxt = P("OXT");
+    auto dist = [](const std::array<double, 3>& p, const std::array<double, 3>& q) {
+      return std::sqrt((p[0] - q[0]) * (p[0] - q[0]) + (p[1] - q[1]) * (p[1] - q[1]) + (p[2] - q[2]) * (p[2] - q[2])); };
+    const auto b = dist(o, a) <= dist(oxt, a) ? o : oxt;
+    const double len = std::max(dist(ca, a), 1e-8);
+    std::array<double, 3> u, v; double vu = 0;
+    for (int k = 0; k < 3; ++k) { u[k] = (ca[k] - a[k]) / len; v[k] = b[k] - a[k]; vu += v[k] * u[k]; }
+    for (int k = 0; k < 3; ++k) {
+      y[at["O"] * 3 + k] = (float)b[k];
+      y[at["OXT"] * 3 + k] = (float)(a[k] + 2.0 * vu * u[k] - v[k]);
+    }
+  }
+  return y;
 }
 
 // af3 --score-pdb=FILE: the two terms for any PDB (the oracle's input, without a fold)
@@ -408,5 +467,6 @@ inline std::vector<size_t> writeStructure(const std::string& path, const std::ve
     fprintf(stderr, "the structure to write has %zu coordinates where %zu atom slots want %zu\n", x.size(), slots, slots * 3);
     exit(1);
   }
-  return cifPath(path) ? writeCif(path, x, bfactors) : writePdb(path, x, bfactors);
+  const std::vector<float> written = writtenCoordinates(x);
+  return cifPath(path) ? writeCif(path, written, bfactors) : writePdb(path, written, bfactors);
 }

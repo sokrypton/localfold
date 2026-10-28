@@ -260,7 +260,11 @@ replacing the pair), the `pairMixer` flag in shared/af3/dialect.js, the widths t
 it 9e-8 to 1.6e-6), confidence pLDDT 7.7e-7, PAE 1.2e-7, PDE 1.6e-7. 🔴 **ITS SINGLE OUTGROWS f16**: it reaches 3.0e5 by
 the trunk's last block, and the single transition's widening, run in f16, overflowed to inf on the second pass - one
 pass folded, two were NaN. Mol-1 itself runs its trunk in bf16 (f32's exponent range); `singleTransitionF32` runs that
-transition in f32 here, n rows. 6MRR from its sequence: 1.45-1.53 A over five seeds, pLDDT ~88, 0.5 s.
+transition in f32 here, n rows. 6MRR from its sequence: 1.45-1.53 A over five seeds, pLDDT ~88, 0.5 s. Its summary
+scores are the Protenix family's own (`protenixScores`, protenix2 too: a single chain's ipTM 0, ranking 0.8 ipTM + 0.2
+pTM - 100 has_clash, the clash test over polymer chain pairs), and it writes each chain's C-terminal O/OXT rebuilt
+(`rebuildCterminalOxygens`): af3-any-model's own function moves a written Mol-1 structure by 4.75e-4 A, the mmCIF's
+rounding. Not yet: AF3's frame mask on pTM's anchors (an ion or a two-atom ligand has no frame), in no family here.
 
 **Blob revision 3** (af3-any-model 1f9b3cf; Hugging Face e9da26e6, `cuda/featurise/fetch.h` - a cached blob
 remembers its commit in `.source`, and r2's is refetched) adds three rows revision 2 left out, read as zero

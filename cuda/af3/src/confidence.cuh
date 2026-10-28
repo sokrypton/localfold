@@ -517,7 +517,7 @@ inline void confidenceTm(ConfidenceOut& out, std::vector<float> term, const floa
     }
     return any ? best : NAN;
   };
-  out.ptm = reduce(false); out.iptm = reduce(true);
+  out.ptm = reduce(false); out.iptm = familyIptm(reduce(true));     // (protenix's: one chain's ipTM is 0, scores.cuh)
   out.tmTerm = std::move(term);
 }
 // pLDDT off the head's single (and its mean over real atoms); headNorm the head's LayerNorm-or-none

@@ -1016,7 +1016,7 @@ static int foldMain(int argc, char** argv) {
           }
           return any ? bestTm : NAN;
         };
-        ck.ptm = reduce(false); ck.iptm = reduce(true);
+        ck.ptm = reduce(false); ck.iptm = familyIptm(reduce(true));
         ck.tmTerm = term;
         const float* am = M.f("batch.predDenseAtomMask");
         double sum = 0, count = 0;
