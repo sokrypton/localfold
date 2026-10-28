@@ -13,6 +13,7 @@
  */
 import { noiseLevels, randomAugmentation, samplerStep } from "../../../cpu/af3/diffusion/diffusion-sampler.js";
 import { weightedRigidAlign } from "../../../cpu/af3/diffusion/rigid-align.js";
+import { steerDenoised } from "../../../cpu/af3/diffusion/steering.js";
 import { Af3DiffusionHeadGpu } from "./diffusion-head.js";
 
 /**
@@ -23,10 +24,13 @@ import { Af3DiffusionHeadGpu } from "./diffusion-head.js";
  *          stopAfter?: number, gamma0?: number, gammaMin?: number,
  *          noiseScale?: number, stepScale?: number, schedule?: "karras"|"geometric",
  *          update?: "euler"|"exponential", churn?: boolean,
- *          start?: {positions: Float32Array, level: number}}} options
+ *          start?: {positions: Float32Array, level: number},
+ *          steer?: {binder: number[], pocket: number[], weight: number, cutoff?: number}}} options
  *   `start` begins the walk part-way down: at the first scheduled level at or below `level`
  *   (angstroms), from `positions` (the dense layout) plus that much noise, running only the steps
  *   left. RFdiffusion's partial diffusion, on AF3's schedule.
+ *   `steer` pulls the `binder` tokens toward the `pocket` tokens: each denoised prediction takes one
+ *   descent step on a contact restraint before the update reads it (cpu/af3/diffusion/steering.js).
  */
 export async function sampleOnGpu(device, input, weights, options) {
   const { steps, normal } = options;
@@ -96,12 +100,16 @@ export async function sampleOnGpu(device, input, weights, options) {
       noisy[index] = positions[index] + injected * normal();
     }
 
-    const denoised = await head.run({ ...input, noiseLevel: tHat, positionsNoisy: noisy },
-                                    weights);
+    const raw = await head.run({ ...input, noiseLevel: tHat, positionsNoisy: noisy },
+                               weights);
+    // 🔴 STEERING DISPLACES THE PREDICTION, NOT THE WALK: the update moves toward what it is handed,
+    // so the restraint's descent step goes in here and the denoiser itself is untouched
+    const denoised = options.steer === undefined ? raw.positions
+      : steerDenoised(raw.positions, input.atomMask, input.shape.dense, options.steer, tHat, levels[0]);
     // (boltz2 rigid-aligns the noisy copy onto the answer before the step: dialect.realignSampler)
     const aligned = input.dialect?.realignSampler === true
-      ? weightedRigidAlign(noisy, denoised.positions, input.atomMask, atoms) : noisy;
-    positions = samplerStep(aligned, denoised.positions, tHat, level, { stepScale, update: options.update });
+      ? weightedRigidAlign(noisy, denoised, input.atomMask, atoms) : noisy;
+    positions = samplerStep(aligned, denoised, tHat, level, { stepScale, update: options.update });
     previous = level;
 
     // 🔴 `denoised` IS THE FRAME WORTH WATCHING and neither is in a stable
@@ -110,7 +118,7 @@ export async function sampleOnGpu(device, input, weights, options) {
     await options.onStep?.({
       step, steps, noiseLevel: level, tHat,
       positions: Float32Array.from(positions),
-      denoised: Float32Array.from(denoised.positions),
+      denoised: Float32Array.from(denoised),
     });
   }
   return positions;

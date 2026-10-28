@@ -268,6 +268,14 @@ function angstromsOf(id, label) {
   if (!(value > 0)) throw new Error(`${label} must be a distance in angstroms, not ${text}`);
   return value;
 }
+/** The "Steer to hotspots" strength, or null. */
+function steerWeight() {
+  const text = document.getElementById("steer")?.value.trim() ?? "";
+  if (text === "") return null;
+  const value = Number(text);
+  if (!(value > 0)) throw new Error(`Steer to hotspots must be a positive strength, not ${text}`);
+  return value;
+}
 /** The "Stay within" distance, or null. */
 function stayWithin() { return angstromsOf("stay-within", "Stay within"); }
 
@@ -540,6 +548,7 @@ const UNUSED_BY = {
     cyclesGroup: "RFD4-Proteina has no fold-and-redesign cycle to repeat.",
     stayGroup: "RFD4-Proteina has no cycle to hold to the one before.",
     warmGroup: "RFD4-Proteina has no previous cycle to start a fold from.",
+    steerGroup: "RFD4-Proteina conditions on hotspots itself.",
     runsGroup: "RFD4-Proteina generates once; run it again for another sample.",
     temperatureGroup: "RFD4-Proteina does not sample a sequence with a temperature.",
     omitGroup: "RFD4-Proteina has no designer to forbid letters to.",
@@ -1262,6 +1271,8 @@ const startHunt = async () => {
       // 🔴 "WARM START" STARTS EACH CYCLE'S DIFFUSION FROM THE CYCLE BEFORE (shared/af3/structure/warm-start.js)
       ...(angstromsOf("warm-start", "Warm start") === null ? {}
         : { warm: { level: angstromsOf("warm-start", "Warm start") } }),
+      // 🔴 "STEER TO HOTSPOTS" PULLS EVERY FOLD TOWARD THEM (cpu/af3/diffusion/steering.js)
+      ...(steerWeight() === null ? {} : { steer: { weight: steerWeight() } }),
       // 🔴 THE FOLD'S DIFFUSION STEPS, which ran at the sampler's default and
       // were not reachable from this page at all.
       steps: number("steps", HUNTER_STEPS),

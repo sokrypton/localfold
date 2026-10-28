@@ -611,3 +611,23 @@ folded is no longer rejected for missing a hotspot, only for touching nothing; o
 filter. Re-run on the same six cells, every best and every refold came out IDENTICAL to the pocket arm
 above - so with the pocket no cycle had been missing its hotspots, and every rejection there was the
 alanine ceiling. The pocket does put the binder on the epitope; what it does not yet do is refold better.
+
+**Steering toward the hotspots, for any model (2026-10-28)**: cpu/af3/diffusion/steering.js, ProteinHunter2's
+ph2/steering.py reimplemented - each denoised prediction takes one descent step on relu(softmin over binder
+token centroids of the distance to each hotspot - 8 A)^2, scaled by tHat/sigmaMax - and "Steer to hotspots"
+under Advanced (off by default). A steered cycle treats the hotspots as a prior: rejected only for touching
+nothing. OpenDDE (structural tokens) refuses it. PD-L1 with AF3, 3 hotspots, 5 cycles, seeds 0-2; cycles
+1-5 touching a hotspot (CA within 8 A), then the Protenix-2 refold of the best, ipTM / RMSD:
+
+| steps | filter (today) | steer 1 | steer 3 |
+|---|---|---|---|
+| 25 | 5/5 0.53/11.0 · 5/5 0.18/15.7 · 3/5 0.16/11.5 | 5/5 0.19/9.5 · 5/5 0.32/19.5 · 2/5 0.13/8.5 | 5/5 0.53/11.4 · 5/5 0.19/16.1 · 1/5 0.14/8.9 |
+| 100 | 5/5 **0.72/2.83** · 0/5 none · 0/5 none | 4/5 0.35/7.8 · 5/5 0.70/13.8 · 0/5 0.37/0.72 | 5/5 0.47/10.7 · 5/5 **0.63/3.13** · 0/5 0.38/0.90 |
+
+🔴 **IT RESCUES THE RUNS THE FILTER LOSES, AND NOT YET THE REFOLD.** At 100 steps two of three filter runs
+ended with no eligible cycle; steering at 3 put seed 1 on the epitope every cycle (nearest 3.9-4.7 A
+against 10.4-15.6) and moved seed 2 from 12.7-17.8 A to 8.9-10.1 - closer, not touching. At 25 steps the
+filter already hits and steering changes little. Refolds pass nowhere on the epitope; the two that pass
+(0.72, 0.90, seed 2 at 100) are binders that never reached it, eligible only because a steered cycle is
+not filtered. Weight 1 is v2's and too weak here: the term is zero inside 8 A between centroids, so it
+stops pulling at about the filter's own edge. Three seeds a cell; off by default.

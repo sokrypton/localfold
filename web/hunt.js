@@ -70,7 +70,10 @@ export { FOLDERS } from "./validate-design.js";
  * @param {Record<string, number[]>} [options.hotspots] per chain, residues the
  *   design must touch. A folder trained on pocket constraints (boltz2) is handed
  *   them as one, a prior; any other folder's cycle that misses them is rejected
- *   with the distance.
+ *   with the distance, unless `steer` aims it.
+ * @param {{weight: number, cutoff?: number}} [options.steer] pull the designed chain
+ *   toward the hotspots during every fold's diffusion (cpu/af3/diffusion/steering.js),
+ *   which makes them a prior for every folder rather than a filter
  * @param {number} [options.hotspotsNeeded] how many of them must be touched
  * @param {(record: object) => void} options.report called once per cycle
  * @param {(text: string) => void} [options.status]
@@ -191,6 +194,9 @@ export async function hunt(options) {
     // 🔴 THE HOTSPOTS AS A POCKET, for the folders that read one (cpu/design/contact.js hotspotPocket);
     // the rest of a rotation gets the check alone, as ProteinHunter's other models do
     const pocket = hotspotPocket(runHotspots, chainIndex, CHAIN_IDS);
+    // 🔴 ...AND STEERED TOWARD BY ANY FOLDER, when asked: the same chains and residues, pulled on
+    // during the diffusion instead of read by the network
+    const steering = options.steer !== undefined && pocket.length > 0;
 
     const stream = runDesign({
       chains: runChains.slice(), chainIndex, cycles, length: runLength, run, signal,
@@ -217,7 +223,7 @@ export async function hunt(options) {
       // missing one - only for touching nothing at all. A folder that cannot read a pocket keeps
       // the hotspot filter, which is the only way it is aimed.
       veto: ({ pdb, cycle }) => {
-        const prior = pocket.length > 0 && readsPocket(folderOf(run, cycle));
+        const prior = pocket.length > 0 && (steering || readsPocket(folderOf(run, cycle)));
         return contactProblem(pdb, {
           chain: CHAIN_IDS[chainIndex],
           // a run's own, where its job carries them: a drawn length moves the residues after it
@@ -258,6 +264,7 @@ export async function hunt(options) {
           ...(modifications === undefined || modifications.length === 0
             ? {} : { modifications }),
           ...(pocket.length > 0 && readsPocket(folder) ? { constraints: pocket } : {}),
+          ...(steering ? { steer: { binder: chainIndex, contacts: pocket[0].contacts, ...options.steer } } : {}),
           seed: (options.seed ?? 0) + context.run,
           recycles: options.recycles,
           // 🔴 foldAf3 HAS NO DEFAULT FOR `calls` - it destructures it and the

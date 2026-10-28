@@ -623,8 +623,13 @@ export async function foldAf3(options) {
   // (shared/af3/structure/warm-start.js) - and handed to the sampler as dense coordinates
   const start = options.start === undefined ? undefined
     : { positions: startFromPdb(batch, options.start.pdb).positions, level: options.start.level };
+  // 🔴 STEERING IS NAMED BY CHAIN AND RESIDUE and the sampler pulls TOKENS, resolved here against the
+  // batch, the one place both exist (cpu/af3/diffusion/steering.js). `binder` and each contact's `asym`
+  // are the featuriser's 0-based chain order, as a constraint's are.
+  const steer = options.steer === undefined ? undefined : steerTokens(batch, options.steer);
   const result = await foldBatch(device, batch, options.weights, {
     steps: calls, recycles, seed, reuse: options.reuse, templateSlots,
+    ...(steer === undefined ? {} : { steer }),
     // ...forwarded for probes that move the noise schedule
     schedule: options.schedule,
     ...(start === undefined ? {} : { start }),
@@ -846,4 +851,28 @@ export async function foldAf3(options) {
       predictedAlignedError: result.scores.pae,
     },
   };
+}
+
+/**
+ * A steering request's chains and residues as the batch's token indices.
+ *
+ * @param {object} batch
+ * @param {{binder: number, contacts: {asym: number, residue: number}[], weight: number, cutoff?: number}} steer
+ * @returns {{binder: number[], pocket: number[], weight: number, cutoff?: number}}
+ */
+export function steerTokens(batch, steer) {
+  const binder = [];
+  const pocket = [];
+  for (let token = 0; token < batch.asymId.length; token += 1) {
+    const asym = batch.asymId[token] - 1;
+    if (asym === steer.binder) binder.push(token);
+    if (steer.contacts.some((c) => c.asym === asym && c.residue === batch.residueIndex[token])) pocket.push(token);
+  }
+  for (const c of steer.contacts) {
+    const found = pocket.some((token) => batch.asymId[token] - 1 === c.asym && batch.residueIndex[token] === c.residue);
+    if (!found) throw new Error(`steering names chain ${c.asym} residue ${c.residue}, which is no token of the input`);
+  }
+  if (binder.length === 0) throw new Error(`steering names chain ${steer.binder} as the binder, which has no tokens`);
+  const { binder: _b, contacts: _c, ...rest } = steer;
+  return { binder, pocket, ...rest };
 }

@@ -1238,8 +1238,14 @@ async function foldHolding(device, batch, weights, options, held) {
   const start = options.start === undefined || structural === undefined ? options.start
     : { ...options.start,
       positions: residueToStructural(options.start.positions, structural.layout, tokens, dense) };
+  // 🔴 STEERING NAMES RESIDUE TOKENS, and OpenDDE samples in its structural ones: refused there rather
+  // than pulling whatever structural token happens to share an index
+  if (options.steer !== undefined && structural !== undefined) {
+    throw new Error("steering is not wired for a model that samples in structural tokens (OpenDDE)");
+  }
   const sampled = await sampleOnGpu(device, headInput, weights.diffusion, {
     ...(start === undefined ? {} : { start }),
+    ...(options.steer === undefined ? {} : { steer: options.steer }),
     steps, stopAfter: options.stopAfter, head,
     normal: normalFrom(options.seed ?? 20260831),
     onStep,
