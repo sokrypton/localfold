@@ -56,6 +56,7 @@ static void blockWeights(const std::string& pre, bool foldParallel) {
   }
   for (const char* a : {".pairAttention1", ".pairAttention2"}) {
     std::string A = pre + a;
+    if (!hasW(A + ".vProjection")) continue;      // (Mol-1's PairMixer blocks carry no triangle attention)
     int Wd = (int)(lenW(A + ".vProjection") / C);
     const half* qw = qkvgWeight(A, C, Wd, true);
     retire({A + ".qProjection", A + ".kProjection", A + ".vProjection", A + ".gatingQuery"});
@@ -107,7 +108,7 @@ static void atomBlocks(const std::string& E) {
 void prepareWeights() {
   const bool parallel = flag("trunk.dialect.parallelPairformer") &&
                         (!getenv("LOCALFOLD_FOLD_NORM") || atoi(getenv("LOCALFOLD_FOLD_NORM")) != 0);
-  for (const char* stack : {"trunk.pairformerBlocks.", "trunk.msaBlocks.", "trunk.template.blocks.", "confidence.blocks.",
+  for (const char* stack : {"trunk.pairformerBlocks.", "trunk.pairMixerBlocks.", "trunk.msaBlocks.", "trunk.template.blocks.", "confidence.blocks.",
                             "refiner.blocks.", "ddeConfidence.blocks."}) {
     const bool foldStack = parallel && strcmp(stack, "trunk.template.blocks.") != 0;
     for (int k = 0; M.has(stack + num(k) + ".triangleMultiplicationOutgoing.projection"); ++k)

@@ -241,8 +241,10 @@ static void embed(Trunk& t) {
     half* sln = scratch<half>("emb.prevsln", np * t.Cs);
     if (np > (size_t)n) fill(sln + (size_t)n * t.Cs, 0, (np - n) * t.Cs * sizeof(half));
     ln(chai && t.pass == 0 ? t.single : t.prevSingle, sln, n, t.Cs, E + "prevSingleEmbeddingNormScale", E + "prevSingleEmbeddingNormOffset");
-    const std::string sn1 = "trunk.pairformerBlocks.0.singleAttention.layerNorm";
-    const std::string sn2 = flag("trunk.dialect.parallelPairformer") ? "trunk.pairformerBlocks.0.singleTransition.inputLayerNorm" : "";
+    // (the first block's norms: Mol-1's first is its PairMixer's)
+    const std::string B0 = M.has("trunk.pairMixerBlocks.0.singleChannels") ? "trunk.pairMixerBlocks.0" : "trunk.pairformerBlocks.0";
+    const std::string sn1 = B0 + ".singleAttention.layerNorm";
+    const std::string sn2 = flag("trunk.dialect.parallelPairformer") ? B0 + ".singleTransition.inputLayerNorm" : "";
     if (canEmitPairLn(t.Cs, n) && hasW(sn1 + "Scale") && lenW(E + "prevSingleEmbedding") == (size_t)t.Cs * t.Cs) {
       half* nrm = scratch<half>("trunk.sn1", np * t.Cs);
       half* txn = (!sn2.empty() && hasW(sn2 + "Scale")) ? scratch<half>("trunk.sn2", np * t.Cs) : nullptr;
@@ -573,7 +575,9 @@ void runTrunk(Trunk& t) {
   }
   for (int k = 0; k < msaBlocks; ++k) msaBlock(t, k, msaBlocks);
   if (zIn) add(t.pair, zIn, pairs * t.C);
-  if (t.pass == 1) { seam("z_after_msa", t.pair, pairs * t.C); seam("trunk_in_single", t.single, (size_t)t.n * t.Cs); }
+  int mixer = 0; while (M.has("trunk.pairMixerBlocks." + num(mixer) + ".singleChannels")) ++mixer;
+  // (Mol-1's trunk_in_single is after its PairMixer, where the reference taps it)
+  if (t.pass == 1) { seam("z_after_msa", t.pair, pairs * t.C); if (!mixer) seam("trunk_in_single", t.single, (size_t)t.n * t.Cs); }
   // (and the MSA stack's pair-track scratch and MSA tensor: the stack's half pair is made beside the f32 one before its blocks make theirs)
   if (reclaim) {
     if (t.msa) { release(t.msa); t.msa = nullptr; }
@@ -588,7 +592,38 @@ void runTrunk(Trunk& t) {
   // (the f32 pair given back while the stack runs on the half one, and made again once the pair track's scratch is:
   // the trunk's top stage, 1044 tokens 4.30 -> 3.74 GB)
   t.pairHalfExact = false;
-  if (halfWanted && t.C % 8 == 0) {
+  auto stack = [&](auto* z, int C, const std::string& S, int count) {
+    for (int k = 0; k < count; ++k)
+      pairformerBlock(z, t.single, t.masks, t.n, C, t.Cs, S + num(k), nullptr, k + 1 < count ? S + num(k + 1) : "");
+  };
+  const int Cn = mixer ? metaI("trunk.trunkPairChannels") : 0;
+  if (mixer && halfWanted && t.C % 8 == 0 && Cn % 8 == 0) {
+    // Mol-1: eight PairMixer blocks at the pair's width, then the pairformer on a narrower pair between two bias-free
+    // adapters (trunk_pair_in, trunk_pair_out) - the narrow pair a buffer of its own, the full pair rewritten from it
+    half* zh = scratch<half>("trunk.zh", pairs * t.C);
+    toHalf(t.pair, zh, pairs * t.C);
+    if (reclaim) { release(t.pair); t.pair = nullptr; }
+    stack(zh, t.C, "trunk.pairMixerBlocks.", mixer);
+    half* nz = scratch<half>("trunk.narrow", pairs * Cn);
+    linH(zh, "trunk.trunkPairIn", nz, pairs, t.C, Cn);
+    if (reclaim) releaseScratch({"trunk.zh", "pr.", "grid.", "tr.", "st.", "par.", "trunk.sn"});
+    if (t.pass == 1) seam("trunk_in_single", t.single, (size_t)t.n * t.Cs);
+    stack(nz, Cn, "trunk.pairformerBlocks.", blocks);
+    if (reclaim) {
+      releaseScratch({"pr.", "grid.", "tr.", "st.", "par.", "trunk.sn"});
+      t.pair = allocT<float>(pairs * t.C);
+    }
+    lin(nz, "trunk.trunkPairOut", t.pair, pairs, Cn, t.C);
+    if (reclaim) releaseScratch({"trunk.narrow"});
+  } else if (mixer) {      // (the control: LOCALFOLD_HALF_PAIR=0, every pair in float)
+    stack(t.pair, t.C, "trunk.pairMixerBlocks.", mixer);
+    float* nz = scratch<float>("trunk.narrow", pairs * Cn);
+    lin(t.pair, "trunk.trunkPairIn", nz, pairs, t.C, Cn);
+    if (t.pass == 1) seam("trunk_in_single", t.single, (size_t)t.n * t.Cs);
+    stack(nz, Cn, "trunk.pairformerBlocks.", blocks);
+    lin(nz, "trunk.trunkPairOut", t.pair, pairs, Cn, t.C);
+    if (reclaim) releaseScratch({"trunk.narrow"});
+  } else if (halfWanted && t.C % 8 == 0) {
     half* zh = scratch<half>("trunk.zh", pairs * t.C);
     toHalf(t.pair, zh, pairs * t.C);
     if (reclaim) { release(t.pair); t.pair = nullptr; }

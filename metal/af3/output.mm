@@ -20,10 +20,14 @@ struct HostModel {        // what scores.cuh reads off `M`: the input's bytes on
   const int* i(const std::string& k) const { return mt::M.hostI(k); }
   const float* f(const std::string& k) const { return mt::M.hostF(k); }
   double meta(const std::string& k) const { return mt::M.meta(k); }
+  bool flag(const std::string& k) const { return mt::M.meta(k, 0) != 0; }
 };
 HostModel M;
 std::string DATA_DIR;
 std::vector<size_t> writePdb(const std::string& path, const std::vector<float>& x, const float* bfactors);
+#ifndef LF_TLS
+#define LF_TLS        // (cuda/af2's per-thread globals: one fold a process here)
+#endif
 #include "../../cuda/af3/src/scores.cuh"
 
 // The PDB: through the featuriser's template.pdb (the page's own records, the slot in the x column), else one residue a
@@ -233,5 +237,6 @@ Scores structureScores(const std::vector<float>& x) {
   af3out::StructureScores s = af3out::structureScores(x);
   return {s.clash, s.disordered};
 }
+double familyIptm(double iptm) { return af3out::familyIptm(iptm); }
 double rankingScore(double ptm, double iptm, const Scores& s) { return af3out::rankingScore(ptm, iptm, {s.clash, s.disordered}); }
 int scorePdbMain(const std::string& path) { return af3out::scorePdbMain(path); }

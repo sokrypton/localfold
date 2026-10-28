@@ -314,15 +314,38 @@ void transition(half* x, size_t rows, int C, const std::string& pre, half* into,
   transitionT(x, rows, C, pre, into, next1, next2, scratchPrefix);
 }
 
+// Mol-1's single transition in float (dialect singleTransitionF32): its single reaches 3e5 on 6MRR and the gated
+// activation 6.6e4, past half's 65504 - gemmSwiglu stores it in half, an infinity on the second pass and NaN after.
+// The LN'd input stays half; the product, the gate and the second GEMM are float
+static void transitionF32(float* x, size_t rows, int C, const std::string& pre) {
+  int I = (int)(lenW(pre + ".transition1") / (2 * (size_t)C));
+  if (I % 8) die("%s: a hidden width of %d is not a multiple of 8", pre.c_str(), I);
+  half* xn = scratch<half>("st32.xn", rows * C);
+  float* ab = scratch<float>("st32.ab", rows * 2 * I);
+  float* g = scratch<float>("st32.g", rows * I);
+  ln(x, xn, rows, C, pre + ".inputLayerNormScale", pre + ".inputLayerNormOffset");
+  linW(xn, swigluPairs(pre + ".transition1", C, I), ab, rows, C, 2 * I, 0.f, nullptr, 1.f, "single transition1, float");
+  run1d("af3_swiglu_f32", rows * I, SwigluF32Args{ab, g, (uint)(rows * I), (uint)I});
+  if (lenW(pre + ".transition2") != (size_t)I * C) die("%s.transition2 has %zu elements", pre.c_str(), lenW(pre + ".transition2"));
+  Gemm G{}; G.X = g; G.tx = F32; G.W = Wh(pre + ".transition2"); G.tw = F16; G.Y = x; G.rows = rows; G.in = I; G.out = C;
+  G.beta = 1.f; G.label = "single transition2, float";
+  gemm(G);
+}
+
 // the five pair updates of a pairformer / MSA / template block, in AF3's order
 template <class T>
 static void pairUpdatesT(T* pair, const Masks& m, int n, int C, const std::string& pre, const std::string& next1,
                          const std::string& next2) {
   bool swap = flag("trunk.dialect.swapTransposedBias"), divide = flag("trunk.dialect.triangleMulDivideByLength");
   triangle(pair, m, n, C, pre + ".triangleMultiplicationOutgoing", true, divide, nullptr, pre + ".triangleMultiplicationIncoming.leftNormInput");
-  triangle(pair, m, n, C, pre + ".triangleMultiplicationIncoming", false, divide, nullptr, pre + ".pairAttention1.actNorm");
-  gridAttention(pair, m, n, C, pre + ".pairAttention1", false, swap, nullptr, false, pre + ".pairAttention2.actNorm");
-  gridAttention(pair, m, n, C, pre + ".pairAttention2", true, swap, nullptr, false, pre + ".pairTransition.inputLayerNorm");
+  // (Mol-1's PairMixer blocks carry no triangle attention: the incoming triangle emits the transition's norm)
+  const bool grid = M.has(pre + ".pairAttention1.heads");
+  triangle(pair, m, n, C, pre + ".triangleMultiplicationIncoming", false, divide, nullptr,
+           grid ? pre + ".pairAttention1.actNorm" : pre + ".pairTransition.inputLayerNorm");
+  if (grid) {
+    gridAttention(pair, m, n, C, pre + ".pairAttention1", false, swap, nullptr, false, pre + ".pairAttention2.actNorm");
+    gridAttention(pair, m, n, C, pre + ".pairAttention2", true, swap, nullptr, false, pre + ".pairTransition.inputLayerNorm");
+  }
   transition(pair, (size_t)n * n, C, pre + ".pairTransition", nullptr, next1, next2);
 }
 void pairUpdates(float* pair, const Masks& m, int n, int C, const std::string& pre, const std::string& next1,
@@ -455,7 +478,8 @@ static void singleTrackT(float* single, const T* pair, const Masks& m, int n, in
   } else lin(o, A + ".outputProjection", single, np, Wd, Cs, 1.f);
   const std::string nextSn1 = nextB.empty() ? "" : nextB + ".singleAttention.layerNorm";
   const std::string nextSn2 = (parallel && !nextB.empty()) ? nextB + ".singleTransition.inputLayerNorm" : "";
-  transition(single, n, Cs, B + ".singleTransition", nullptr, nextSn1, nextSn2, "st.");
+  if (flag("trunk.dialect.singleTransitionF32")) transitionF32(single, n, Cs, B + ".singleTransition");
+  else transition(single, n, Cs, B + ".singleTransition", nullptr, nextSn1, nextSn2, "st.");
 }
 void singleTrack(float* single, const float* pair, const Masks& m, int n, int C, int Cs, const std::string& B,
                  const float* extraBias) {

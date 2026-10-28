@@ -2186,6 +2186,13 @@ kernel void af3_silu(LF_ARGS(SiluInPlaceArgs)) {
   if (a.outH) a.outH[t] = (half)v;
   else a.x[t] = v;
 }
+kernel void af3_swiglu_f32(LF_ARGS(SwigluF32Args)) {
+  uint t = (uint)LF_INDEX;
+  if (t >= a.n) return;
+  uint r = lf_udiv(t, a.I), j = t - r * a.I;
+  ulong at = (ulong)r * 2 * a.I + (j >> 3) * 16 + (j & 7);
+  a.g[t] = lf_silu(a.ab[at]) * a.ab[at + 8];
+}
 kernel void af3_single_struct(LF_ARGS(SingleStructArgs)) {
   ulong t = LF_INDEX;
   if (t >= (ulong)a.n * a.C) return;

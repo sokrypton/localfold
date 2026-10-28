@@ -1,6 +1,6 @@
 # LocalFold on Metal
 
-The Apple-native port: **AlphaFold 3's lineage (all eight models, chai-1 with its ESM2 3B), AlphaFold 2 (monomer and multimer, models 1-5) and
+The Apple-native port: **AlphaFold 3's lineage (all nine models, chai-1 with its ESM2 3B and Mol-1 with its split trunk), AlphaFold 2 (monomer and multimer, models 1-5) and
 ESMFold2, written for Metal** - no CUDA translation, no patches. Each port reads the same featurised input as
 `cuda/<port>` (`cuda/featurise`, linked in) and the same published weights, and folds to the same structures; the
 arithmetic is chosen for Apple's GPUs (8 x 8 simdgroup matrices, unified memory, no integer divider).
@@ -63,7 +63,7 @@ The CUDA gates' cases, scored against crystals, with this Mac's baseline in `met
 (0.05 A and 0.5 pLDDT) and the A100's printed beside each case:
 
 ```
-python3 metal/af3/gate.py [--write] [--only=<case or model>]   # 16: eight models, ligand + phosphoserine, DNA,
+python3 metal/af3/gate.py [--write] [--only=<case or model>]   # 19: nine models, ligand + phosphoserine, DNA,
 python3 metal/af2/gate.py [--write]                             #   methylated DNA, kitchen sink, glycan, templates
 python3 metal/ef2/gate.py [--write]                             # AF2 5, ESMFold2 8
 python3 metal/bench/gate.py [--write]                           # lf_gemm's SPEED, this chip's own times (below)

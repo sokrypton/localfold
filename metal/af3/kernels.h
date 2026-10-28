@@ -180,6 +180,8 @@ struct ApplyNormArgs { DP(float) x; CP(float) stat; u64 n; };
 // out[i] = src[parent[i]] (+ roleEmb[role[i]])
 struct GatherParentArgs { CP(float) src; CP(int) parent; CP(int) role; CP(float) roleEmb; DP(float) out; uint n, C; };
 struct SiluInPlaceArgs { DP(float) x; DP(half) outH; u64 n; };
+// silu(a) b in float, off a product in gemmSwiglu's interleaving ([rows][2I] in blocks of 8: a_0..a_7 b_0..b_7 a_8..)
+struct SwigluF32Args { CP(float) ab; DP(float) g; uint n, I; };
 struct SingleStructArgs { DP(float) out; CP(float) a; CP(float) b; CP(int) role; CP(float) roleEmb; uint n, C; };
 // the residue pair under each structural pair, in matrix-group order (half: the GEMMs' input)
 struct GatherPairSortedArgs { CP(float) pair; CP(int) order; CP(int) parent; DP(half) out; u64 rows; uint n, nRes, C, pad; };

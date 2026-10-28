@@ -101,7 +101,21 @@ LN + q/k/v/gate is one pass too (`gridInK` at 64 channels), and its output proje
 (`projAdd64K`) where a GEMM with an f32 output ran an epilogue pass over the whole MSA. Together ~7% of a 261-residue
 fold on the A100.
 
-## 8. Mol-1: a ninth AF3-lineage model, and NOT YET ON metal (2026-10-28)
+## 8. Mol-1: a ninth AF3-lineage model - ON metal since 2026-10-27
+
+**Done on the M2**, items 1-5 below: the PairMixer stack in `prepareWeights` (a block's grid attention skipped when absent), the
+incoming triangle emitting the transition's norm when the block has none, the split trunk in `runTrunk` (both the half
+pair and the `LOCALFOLD_HALF_PAIR=0` control), `transitionF32` for the single transition (the LN'd input half; the
+product, `silu(a) b` and the second GEMM float), and the Protenix scores and rebuilt C-terminal oxygens through
+scores.cuh as CUDA has them. 6MRR from its sequence: **1.579 A, pLDDT 87.95, pTM 0.8941**, ipTM 0, ranking 0.18; the
+float-pair control 1.579 A / 88.12. 🔴 Without `transitionF32` one pass folds (1.609 A) and four are NaN, as item 4
+said: lf_gemm's SwiGLU store converts to half unclamped, so the 6.6e4 is an infinity. `metal/af3/gate.py`: all 19
+cases ok against the M2's baseline, `mol1-6mrr` recorded. **Not checked against the oracles below**: they are on the
+A100 and not on this Mac, and the trunk's `trunk_in_pair`/`trunk_out_pair` seams are not tapped for the narrow pair
+(`main.mm`'s `saveSeam("trunk_out_pair")` still saves the full one) - wire those before an oracle run reads them.
+
+The note as written before it was done:
+
 
 Mol-1 (Molence Bio, `--family=mol1`; af3-any-model's `mol1-port` branch, blob `mol1/mol1.int8.bin.zst` at HF
 1b41e333) folds natively in CUDA (3b98f446, a85cb169) and on the page (b0743630). metal/af3 does not have it: written

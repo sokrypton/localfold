@@ -12,4 +12,6 @@ void writeConfidenceFiles(const std::string& path, const std::vector<size_t>& or
                           const std::vector<float>& contact, double ranking, const Scores& s);
 Scores structureScores(const std::vector<float>& x);
 double rankingScore(double ptm, double iptm, const Scores& s);
+// the family's ipTM: protenix's (protenix2, mol1) is 0 for one chain where AF3's is undefined (scores.cuh)
+double familyIptm(double iptm);
 int scorePdbMain(const std::string& path);

@@ -1,6 +1,7 @@
 // The confidence head: the trunk's pair and single re-embedded with the sample's pseudo-beta distances, four
 // pairformer blocks, then pLDDT, PAE, PDE and the TM terms (cuda/af3/src/confidence.cuh is the reading).
 #include "af3.h"
+#include "output.h"
 #include <cmath>
 #include <cstring>
 
@@ -240,7 +241,7 @@ ConfidenceOut confidenceHead(Trunk& t, const float* pseudoBeta, bool lastSample)
       }
       return any ? best : NAN;
     };
-    out.ptm = reduce(false); out.iptm = reduce(true);
+    out.ptm = reduce(false); out.iptm = familyIptm(reduce(true));     // (protenix's: one chain's ipTM is 0)
     out.tmTerm = std::move(term);
   }
   const int PB = 50;

@@ -123,7 +123,7 @@ ConfidenceOut structuralConfidence(Structural& st, const float* coords, std::vec
     }
     return any ? bestTm : NAN;
   };
-  ck.ptm = reduce(false); ck.iptm = reduce(true);
+  ck.ptm = reduce(false); ck.iptm = familyIptm(reduce(true));
   ck.tmTerm = term;
   const float* am = M.hostF("batch.predDenseAtomMask");
   double sum = 0, count = 0;
