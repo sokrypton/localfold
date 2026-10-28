@@ -23,7 +23,8 @@ import { AF3_COUNTS, af3SequenceProblem, foldAf3, loadAf3Weights } from "./af3-m
 import { CHAIN_IDS, runDesign } from "../webgpu/design/hunter-loop.js";
 import { designChain, loadDesigner } from "../cpu/design/mpnn-bridge.js";
 import { chooseDesigner, DESIGNERS, NUCLEIC_KINDS } from "../cpu/design/designers.js";
-import { contactProblem } from "../cpu/design/contact.js";
+import { contactProblem, hotspotPocket } from "../cpu/design/contact.js";
+import { CONSTRAINT_FAMILIES } from "../shared/af3/featurise/constraints.js";
 import { designedDrift } from "../cpu/design/align.js";
 import { FOLDERS } from "./validate-design.js";
 
@@ -67,7 +68,8 @@ export { FOLDERS } from "./validate-design.js";
  * @param {Iterable<number>} [options.hold] positions within the designed chain
  *   to keep as they are - a framework, a motif - every cycle
  * @param {Record<string, number[]>} [options.hotspots] per chain, residues the
- *   design must touch. A cycle that does not is rejected with the distance.
+ *   design must touch. A cycle that does not is rejected with the distance, and a
+ *   folder trained on pocket constraints (boltz2) is also handed them as one.
  * @param {number} [options.hotspotsNeeded] how many of them must be touched
  * @param {(record: object) => void} options.report called once per cycle
  * @param {(text: string) => void} [options.status]
@@ -181,6 +183,10 @@ export async function hunt(options) {
     const runChains = drawn?.chains ?? chains;
     const runLength = drawn?.length ?? length;
     const runHold = drawn?.hold ?? options.hold;
+    const runHotspots = drawn?.hotspots ?? options.hotspots;
+    // 🔴 THE HOTSPOTS AS A POCKET, for the folders that read one (cpu/design/contact.js hotspotPocket);
+    // the rest of a rotation gets the check alone, as ProteinHunter's other models do
+    const pocket = hotspotPocket(runHotspots, chainIndex, CHAIN_IDS);
 
     const stream = runDesign({
       chains: runChains.slice(), chainIndex, cycles, length: runLength, run, signal,
@@ -204,8 +210,7 @@ export async function hunt(options) {
       veto: ({ pdb }) => contactProblem(pdb, {
         chain: CHAIN_IDS[chainIndex],
         // a run's own, where its job carries them: a drawn length moves the residues after it
-        ...((drawn?.hotspots ?? options.hotspots) === undefined ? {}
-          : { residues: drawn?.hotspots ?? options.hotspots }),
+        ...(runHotspots === undefined ? {} : { residues: runHotspots }),
         ...(options.hotspotsNeeded === undefined ? {} : { minimum: options.hotspotsNeeded }),
       }),
       percentX: options.percentX,
@@ -240,6 +245,8 @@ export async function hunt(options) {
           // the fold fetches it and the token count does not change.
           ...(modifications === undefined || modifications.length === 0
             ? {} : { modifications }),
+          ...(pocket.length > 0 && CONSTRAINT_FAMILIES[FOLDERS[folder]] !== undefined
+            ? { constraints: pocket } : {}),
           seed: (options.seed ?? 0) + context.run,
           recycles: options.recycles,
           // 🔴 foldAf3 HAS NO DEFAULT FOR `calls` - it destructures it and the

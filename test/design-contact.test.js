@@ -1,5 +1,9 @@
 import { describe, expect, it } from "./harness.js";
-import { CONTACT_ANGSTROMS, contactOf, contactProblem } from "../cpu/design/contact.js";
+import { CONTACT_ANGSTROMS, POCKET_ANGSTROMS, contactOf, contactProblem, hotspotPocket } from "../cpu/design/contact.js";
+import { af3BatchFromA3m } from "../shared/af3/featurise/batch.js";
+import { dialectFor, featuriserDialect } from "../shared/af3/dialect.js";
+import { CONTACT_CLASSES } from "../shared/af3/featurise/constraints.js";
+import { CHAIN_IDS } from "../webgpu/design/hunter-loop.js";
 
 /** A backbone at `x`, for one residue of `chain` numbered `residue`. */
 const residue = (chain, number, x) => [
@@ -80,5 +84,38 @@ describe("is the designed chain touching what it was designed against", () => {
     const alone = pdb(residue("A", 1, 0), residue("A", 2, 4));
     expect(contactProblem(alone, { chain: "A" })).toBe(null);
     expect(contactOf(alone, { chain: "A" }).nearest).toBe(Infinity);
+  });
+});
+
+describe("hotspots as a pocket constraint", () => {
+  // 🔴 ProteinHunter hands its hotspots to boltz2 as a pocket, conditioning the fold rather than
+  // only rejecting it afterwards; the same here, for a folder that reads one
+  it("names the designed chain the binder and each hotspot a contact", () => {
+    expect(hotspotPocket(undefined, 0, CHAIN_IDS)).toEqual([]);
+    expect(hotspotPocket({ B: [] }, 0, CHAIN_IDS)).toEqual([]);
+    expect(hotspotPocket({ B: [2, 4], C: [1] }, 0, CHAIN_IDS)).toEqual([{ kind: "pocket", binder: 0,
+      contacts: [{ asym: 1, residue: 2 }, { asym: 1, residue: 4 }, { asym: 2, residue: 1 }],
+      maxDistance: POCKET_ANGSTROMS }]);
+    expect(() => hotspotPocket({ A: [1] }, 0, CHAIN_IDS)).toThrow(/is the designed chain/);
+    expect(() => hotspotPocket({ "?": [1] }, 0, CHAIN_IDS)).toThrow(/not a chain/);
+  });
+
+  it("reaches boltz2's features on exactly the binder x hotspot pairs", () => {
+    const { batch } = af3BatchFromA3m("XXXX:ACDEFG", null, {
+      ...featuriserDialect(dialectFor("boltz2")), modelName: "boltz2",
+      constraints: hotspotPocket({ B: [2, 5] }, 0, CHAIN_IDS),
+    });
+    const n = batch.asymId.length;
+    const at = (i, j) => batch.contactConditioning[i * n + j];
+    // binder tokens 0..3, chain B residue 2 is token 5 and residue 5 is token 8
+    expect(at(0, 5)).toBe(CONTACT_CLASSES["BINDER>POCKET"]);
+    expect(at(8, 3)).toBe(CONTACT_CLASSES["POCKET>BINDER"]);
+    expect(at(0, 6)).toBe(CONTACT_CLASSES.UNSELECTED);
+    expect(batch.contactThreshold[0 * n + 5]).toBe(POCKET_ANGSTROMS);
+    // a hotspot past the chain's end is refused, not dropped
+    expect(() => af3BatchFromA3m("XXXX:ACDEFG", null, {
+      ...featuriserDialect(dialectFor("boltz2")), modelName: "boltz2",
+      constraints: hotspotPocket({ B: [9] }, 0, CHAIN_IDS),
+    })).toThrow(/names no token/);
   });
 });

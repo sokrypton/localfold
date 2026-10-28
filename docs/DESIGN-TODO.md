@@ -586,3 +586,22 @@ refused every cycle - fixed in cpu/design/contact.js). Refold ipTM / RMSD, seeds
 100 and 2 of 6 at 200 (plus a 2.56), and the best design measured anywhere here is warm 10 at 200
 (ipTM 0.885, 0.91 A). Warm start does not help this target's refold - reference 4 passes, warm 1. Three
 seeds a cell, and the two binders disagree, so no default moves on this.
+
+**Hotspots as boltz2's pocket constraint (2026-10-28)**, as ProteinHunter v1 (`{"pocket": ...}` in the
+Boltz job) and v2 (ph2/hotspots.py; it reports ipTM 0.276 -> 0.610 on PD-L1) both do by default:
+`hotspotPocket` in cpu/design/contact.js, handed by web/hunt.js to any folder in `CONSTRAINT_FAMILIES`
+(boltz2 here; chai-1 is not a Hunter folder), at boltz's 6 A. The contact check still runs on top, and
+the other folders of a rotation get the check alone. PD-L1, its 3 hotspots required, Boltz-2 folding,
+5 cycles, seeds 0-2; the off arm strips the constraint from a served copy of hunt.js. Best boltz2
+objective, then the Protenix-2 refold's ipTM / RMSD:
+
+| steps | pocket | no pocket |
+|---|---|---|
+| 25 | 0.771: 0.531/5.68 · 0.584: 0.523/**0.96** · 0.181: 0.546/9.82 | 0.649: 0.458/9.10 · 0.393: 0.741/**0.59** · 0.306: 0.559/11.8 |
+| 100 | 0.731: 0.551/6.39 · 0.271: 0.644/10.3 · 0.615: 0.287/14.2 | 0.790: 0.433/9.74 · 0.384: 0.726/2.18 · 0.855: 0.380/**0.63** |
+
+🔴 **NOT THE WIN v2 REPORTS, ON THIS MEASUREMENT**: refolds pass 1 of 6 with the pocket and 2 of 6
+(plus a 2.18) without, and the boltz2 objective is higher with it at 25 steps (2 of 3) and lower at 100
+(3 of 3). The objective is not comparable across the arms anyway - with the pocket it is boltz2's ipTM
+after being TOLD where the binder goes. Three seeds a cell; it stays on, as upstream has it, until a
+larger set says otherwise.

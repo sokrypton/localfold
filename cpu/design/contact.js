@@ -151,3 +151,32 @@ export function contactProblem(pdb, options) {
   }
   return null;
 }
+
+/** boltz's own default distance for a pocket constraint, which ProteinHunter2 also takes. */
+export const POCKET_ANGSTROMS = 6;
+
+/**
+ * The hotspots as a pocket CONSTRAINT, for a folder trained to read one.
+ *
+ * 🔴 CONDITIONING, NOT A FILTER (2026-10-28). The check above can only reject a fold that missed; boltz2
+ * was TRAINED with a pocket input (binder x pocket pairs labelled, every other pair UNSELECTED) and reads
+ * it into z-init, so the fold itself is asked to put the binder there. This is ProteinHunter v1's
+ * `{"pocket": {"binder": "A", "contacts": ...}}` and v2's ph2/hotspots.py, both on by default whenever
+ * hotspots are named; v2 reports ipTM 0.276 -> 0.610 on PD-L1 from it. The check still runs on top.
+ *
+ * @param {Record<string, number[]>|undefined} residues per chain letter, the hotspot residue numbers
+ * @param {number} chainIndex the designed chain's position, which is its asym number
+ * @param {string} letters chain letters in asym order (hunter-loop's CHAIN_IDS)
+ * @returns {object[]} `[]` when no hotspot is named, else one resolved pocket constraint
+ *   (shared/af3/featurise/constraints.js)
+ */
+export function hotspotPocket(residues, chainIndex, letters) {
+  const contacts = Object.entries(residues ?? {}).flatMap(([letter, list]) => {
+    const asym = letters.indexOf(letter);
+    if (asym < 0) throw new Error(`hotspot chain ${letter} is not a chain of the job`);
+    if (asym === chainIndex) throw new Error(`hotspot chain ${letter} is the designed chain`);
+    return list.map((residue) => ({ asym, residue }));
+  });
+  return contacts.length === 0 ? []
+    : [{ kind: "pocket", binder: chainIndex, contacts, maxDistance: POCKET_ANGSTROMS }];
+}
