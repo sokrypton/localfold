@@ -383,7 +383,10 @@ export class Af3PairformerStackGpu {
     }
 
     const heads = blocks[0].singleAttention.heads;
-    const gridHeads = blocks[0].pairAttention1.heads;
+    // 🔴 Mol-1's PairMixer blocks carry no triangle attention (shared/af3/weights/weights.js): the pair track runs
+    // without its two grid attentions, as ESMFold2's does (compilePairTrack's gridAttention)
+    const gridAttention = blocks[0].pairAttention1 !== undefined;
+    const gridHeads = gridAttention ? blocks[0].pairAttention1.heads : 0;
     const storage = GPUBufferUsage.STORAGE;
     const allocations = [];
     const keep = (allocation) => { allocations.push(allocation); return allocation; };
@@ -400,7 +403,7 @@ export class Af3PairformerStackGpu {
     // agree on 12.
     const base = `af3-block:${n}:${pairChannels}:${singleChannels}`
       + `:${heads}x${blocks[0].singleAttention.dimension}`
-      + `:${gridHeads}x${blocks[0].pairAttention1.dimension}`
+      + (gridAttention ? `:${gridHeads}x${blocks[0].pairAttention1.dimension}` : ":nogrid")
       + `:${epsilon}:${variance}:${dialect.swapTransposedBias}`
       + `:${extraPairBiasData === undefined ? "nobias" : "bias"}`;
     const hasF16 = halfPrecisionAvailable(this.device);
@@ -487,8 +490,9 @@ export class Af3PairformerStackGpu {
       // ...and q, k and v handed to the half-tiled attend in f16, which it rounds them to anyway (`gridAttendQkvHalf:
       // false` the control): bit-identical, half the staging's bytes
       attendQkvHalf: deviceTuning(this.device).gridAttendQkvHalf !== false,
-      attendMatrix: pairMatrixKernels && resolveGridAttendMatrix(
+      attendMatrix: gridAttention && pairMatrixKernels && resolveGridAttendMatrix(
         this.device, blocks[0].pairAttention1.dimension, deviceTuning(this.device)),
+      gridAttention,
       // 🔴 THE SPLIT TRANSITION'S VALUE IS THIS BUNDLE'S CHANNEL WIDTH. AF3's
       // 128 gets 1.13x and OpenDDE's 384 gets 3.71x from the same knob, because
       // the fused kernel's row tile halves as the widened row grows. See
@@ -669,7 +673,7 @@ export class Af3PairformerStackGpu {
       const extraPairBias = extraPairBiasData === undefined ? undefined
         : keep(this.allocator.upload("af3-block.extra-pair-bias", extraPairBiasData, storage));
       const biasBuffer = keep(this.allocator.allocate(
-        "af3-block.bias", (pipelines.gridBiasElements ?? gridHeads * pairs) * 4, storage));
+        "af3-block.bias", Math.max(1, pipelines.gridBiasElements ?? gridHeads * pairs) * 4, storage));   // (no grid: unbound)
       const reuseScratch = (slot, bytes, label) => (slot !== undefined && slot.byteLength >= bytes
         ? { buffer: slot.buffer, byteOffset: slot.byteOffset ?? 0, byteSize: bytes }
         : keep(this.allocator.allocate(label, bytes, storage)));
@@ -733,7 +737,7 @@ export class Af3PairformerStackGpu {
         validation.begin();
         const encodeStart = performance.now();
         await this.#encodeBlock({
-          block: blocks[index], n, pairs, heads, gridHeads, pipelines, storage, keep, pending,
+          block: blocks[index], n, pairs, heads, gridHeads, gridAttention, pipelines, storage, keep, pending,
           pairChannels, singleChannels, extraPairBias,
           weightPrecision, pairWeightPrecision,
           pair, single, pairMask, seqMask, scratch, biasBuffer, pairLogits, singleScratch,
@@ -910,7 +914,7 @@ export class Af3PairformerStackGpu {
     let packGrids = true;
     const abLayout = context.projectMatrix === undefined ? "blocked" : "interleaved";
     const packedFor = () => (packedPair ??= packPairTrackWeights(
-      block, pairChannels, context.pairWeightPrecision, true, abLayout,
+      block, pairChannels, context.pairWeightPrecision, context.gridAttention, abLayout,
       { transition: packTransition, triangles: packTriangles, grids: packGrids }));
     // 🔴 UPLOADED ONCE PER BLOCK, EVER, LIKE THE PACKING ABOVE. The packing was
     // already cached and the WRITE was not: eight buffers a block, 48 blocks, on
@@ -985,8 +989,10 @@ export class Af3PairformerStackGpu {
         ?? resident("w.tri.out", () => packedFor().outgoing, context.pairWeightPrecision),
       incoming: onDevice.buffers.incoming
         ?? resident("w.tri.in", () => packedFor().incoming, context.pairWeightPrecision),
-      grid1: onDevice.buffers.grid1 ?? resident("w.grid1", () => packedFor().grid1),
-      grid2: onDevice.buffers.grid2 ?? resident("w.grid2", () => packedFor().grid2),
+      ...(context.gridAttention ? {
+        grid1: onDevice.buffers.grid1 ?? resident("w.grid1", () => packedFor().grid1),
+        grid2: onDevice.buffers.grid2 ?? resident("w.grid2", () => packedFor().grid2),
+      } : {}),
       transition: pairTransitionOnDevice !== undefined
         ? { buffer: pairTransitionOnDevice }
         : resident("w.pair-transition", () => packedFor().transition,
@@ -1089,7 +1095,7 @@ export class Af3PairformerStackGpu {
     const ceil = (value, divisor) => Math.ceil(value / divisor);
 
     encodePairTrack({
-      run, pipelines, n, channels: pairChannels, gridHeads, pair, pairMask,
+      run, pipelines, n, channels: pairChannels, gridHeads, pair, pairMask, gridAttention: context.gridAttention,
       scratch, biasBuffer, transitionSplit, projectMatrix, gridProjectMatrix,
       weights: pairTrackWeights,
     });

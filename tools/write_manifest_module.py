@@ -172,6 +172,12 @@ BUNDLES = {
         "module": "shared/bundles/manifests/protenix2.js",
         "model": "protenix2",
     },
+    # Mol-1, whole, at int5 group 32: 415 MiB.
+    "mol1": {
+        "export": "model-mol1-int5",
+        "module": "shared/bundles/manifests/mol1.js",
+        "model": "mol1",
+    },
     # IntelliFold-2, whole, at int5 group 32. 612 MiB in twelve shards.
     #
     # 🔴 THE SMALLEST DIALECT IN THE FAMILY AND THE WIDEST BUNDLE. Its module

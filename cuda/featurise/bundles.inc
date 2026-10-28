@@ -18,6 +18,7 @@ inline const std::vector<BundleEntry>& bundleTable() {
     {"opendde", "model-opendde-int5", "https://huggingface.co/sokrypton/localfold/resolve/068c905dfb0f8cf9b9432eef80d2220ef3ff697f/opendde-int5/"},
     {"boltz2", "model-boltz2-int5", "https://huggingface.co/sokrypton/localfold/resolve/4c892464e84d5294081164d4a0854037de5dbbde/boltz2-int5/"},
     {"protenix2", "model-protenix2-int5", "https://huggingface.co/sokrypton/localfold/resolve/068c905dfb0f8cf9b9432eef80d2220ef3ff697f/protenix2-int5/"},
+    {"mol1", "model-mol1-int5", ""},
     {"intellifold2", "model-intellifold2-int5", "https://huggingface.co/sokrypton/localfold/resolve/6634c1398a781455e5be3b06573179f896ae8ad8/intellifold2-int5/"},
     {"rosettafold3", "model-rosettafold3-int5", "https://huggingface.co/sokrypton/localfold/resolve/5e5d2948570094af971c3164710cf32b7c06a085/rosettafold3-int5/"},
     {"bioemu2", "model-bioemu2-int5", "https://huggingface.co/sokrypton/localfold/resolve/22aeab93c72c8fae24604221d351e6513162a28e/bioemu2-int5/"},

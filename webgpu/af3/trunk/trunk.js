@@ -32,6 +32,7 @@ import { Af3EmbedderGpu } from "./embedder.js";
 import { Af3MsaStackGpu } from "./msa-stack.js";
 import { Af3PairformerStackGpu } from "./pairformer-block.js";
 import { Af3TemplateEmbedderGpu } from "./template.js";
+import { createPairWidthShader, pairWidthDispatch } from "./pair-width.js";
 import { GRID_WIDTH, PAIR_CHANNELS, createAddShader } from "./pair-track.js";
 import { DeferredValidation } from "../../runtime/validation.js";
 import { af3ContactBins } from "../../../shared/af3/featurise/contact-classes.js";
@@ -152,6 +153,26 @@ export class Af3TrunkGpu {
    * @param {{onStage?: (name: string, elapsed: number) => void,
    *          onPairformerBlock?: (index: number, total: number) => void}} options
    */
+  /** Mol-1's width adapter: `to` = `from` W, every pair row (webgpu/af3/trunk/pair-width.js). */
+  async #pairWidth(from, to, rows, inputs, outputs, weights, name, validation, owned) {
+    const pipeline = await this.pipelines.get(`af3-trunk:pair-width:${rows}:${inputs}:${outputs}`,
+                                              createPairWidthShader(rows, inputs, outputs));
+    const matrix = this.allocator.upload(`af3-trunk.${name}`, Float32Array.from(weights[name]), GPUBufferUsage.STORAGE);
+    owned.push(matrix);
+    validation.begin();
+    const encoder = this.device.createCommandEncoder({ label: `af3-trunk.${name}` });
+    const pass = encoder.beginComputePass({ label: `trunk.${name}` });
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, this.device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [from, matrix, to].map((allocation, binding) => ({ binding, resource: { buffer: allocation.buffer } })),
+    }));
+    pass.dispatchWorkgroups(...pairWidthDispatch(rows, outputs));
+    pass.end();
+    this.device.queue.submit([encoder.finish()]);
+    validation.end(`pair width ${name}`);
+  }
+
   /**
    * 🔴 THE EMBEDDER, TEMPLATE AND MSA STACKS' PIPELINES, ASKED FOR TOGETHER
    * BEFORE THE TRUNK RUNS. Each stage compiled when the trunk reached it, one
@@ -271,8 +292,11 @@ export class Af3TrunkGpu {
       // The difference taken afterwards against the live pair would be the
       // tensor minus itself - it read rms 0.0000 once, on the host path.
       const zInitSnapshot = await readSeam("tap.z_init_generic", pair, pairElements);
-      await readSeam("tap.trunk_in_single", embedded.singleAllocation,
-                     tokens * weights.embedder.singleChannels);
+      // (Mol-1's is after its PairMixer, as the reference taps it)
+      if ((weights.pairMixerBlocks ?? []).length === 0) {
+        await readSeam("tap.trunk_in_single", embedded.singleAllocation,
+                       tokens * weights.embedder.singleChannels);
+      }
 
       // 🔴 ON THE PART-BUILT PAIR - see the note at the top.
       // 🔴 THE FOUR PINS AlphaFold 3's CONFIDENCE HEAD CARRIES, AND FOR THE SAME
@@ -399,11 +423,30 @@ export class Af3TrunkGpu {
       const head = await this.#prepareDistogram(input.pairMask, tokens,
                                                 weights.distogram, input.contactClasses);
       owned.push(...head.allocations);
+      // 🔴 Mol-1: its PairMixer blocks at the pair's width, then the pairformer on a NARROWER pair of its own between
+      // two bias-free adapters, the full pair rewritten from it after (shared/af3/dialect.js MOL1)
+      const mixer = weights.pairMixerBlocks ?? [];
+      let trunkPair = pair;
+      if (mixer.length > 0) {
+        await stage("pairmixer", () => new Af3PairformerStackGpu(this.device, trackOptions).run(
+          { pairMask: input.pairMask, seqMask: input.seqMask, tokens }, mixer, dialect, {
+            ...options, scratchAllocator, onBlock: undefined, onBlockDone: undefined,
+            pairBuffer: pair.buffer, singleBuffer: embedded.singleAllocation.buffer, deferReadback: true, validation,
+          }));
+        const narrowElements = pairs * weights.pairWidth.trunkChannels;
+        trunkPair = this.allocator.allocate("af3-trunk.narrow-pair", narrowElements * 4,
+          GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST);
+        owned.push(trunkPair);
+        await this.#pairWidth(pair, trunkPair, pairs, pairChannels, weights.pairWidth.trunkChannels,
+                              weights.pairWidth, "trunkPairIn", validation, owned);
+        await readSeam("tap.trunk_in_pair", trunkPair, narrowElements);
+        await readSeam("tap.trunk_in_single", embedded.singleAllocation, tokens * weights.embedder.singleChannels);
+      }
       const pairformer = await stage("pairformer", () => new Af3PairformerStackGpu(this.device, trackOptions).run(
         { pairMask: input.pairMask, seqMask: input.seqMask, tokens },
         weights.pairformerBlocks, dialect, {
           ...options, scratchAllocator,
-          pairBuffer: pair.buffer, singleBuffer: embedded.singleAllocation.buffer,
+          pairBuffer: trunkPair.buffer, singleBuffer: embedded.singleAllocation.buffer,
           deferReadback: true, validation,
           onBlock: options.onPairformerBlock === undefined ? undefined
             : (index) => options.onPairformerBlock(index, weights.pairformerBlocks.length),
@@ -420,6 +463,11 @@ export class Af3TrunkGpu {
       // keeps the destroy behind the blocks still in flight.
       scratchAllocator.destroyPooled();
       await settleReleasedMemory(this.device);
+      if (trunkPair !== pair) {
+        await readSeam("tap.trunk_out_pair", trunkPair, pairs * weights.pairWidth.trunkChannels);
+        await this.#pairWidth(trunkPair, pair, pairs, weights.pairWidth.trunkChannels, pairChannels,
+                              weights.pairWidth, "trunkPairOut", validation, owned);
+      }
       // The pairformer's own encode/wait split, carried out so a bench can report
       // where the stack's wall time went without re-instrumenting it.
       this.lastPairformerSplit = pairformer.split;
@@ -443,7 +491,7 @@ export class Af3TrunkGpu {
       // Every scope collected above was submitted ahead of that readback, which
       // has completed, so these resolve without waiting.
       await validation.settle();
-      seam("tap.trunk_out_pair", out.pair);
+      seam(trunkPair !== pair ? "pair" : "tap.trunk_out_pair", out.pair);
 
       // ...and the pair and single themselves, for a caller that recycles them
       // on the device. It owns them and releases them.

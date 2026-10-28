@@ -152,6 +152,10 @@ BLOBS = {
     # it onto AlphaFold 3's scopes. Its tokens also read ESM2 3B (lm/esm2.bin.zst, a separate bundle).
     #     curl -sSLO https://huggingface.co/sokrypton/af3-any-model/resolve/main/chai1/chai1.bin.zst
     "chai1": "~/af3_ported/ref/weights/chai1/chai1.bin.zst",
+    # Mol-1 (Molence Bio, Apache 2.0): Protenix-2's model with a PairMixer stack and a 320-wide trunk (af3-any-model's
+    # mol1-port branch, converters/mol1.py).
+    #     curl -sSLO https://huggingface.co/sokrypton/af3-any-model/resolve/1b41e3337b861081c321420c3f4a40ff9e2a6044/mol1/mol1.bin.zst
+    "mol1": "~/af3_ported/mol1.bin.zst",
 }
 
 # The trunk: the evoformer stacks, the conditioning that builds their inputs

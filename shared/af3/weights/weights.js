@@ -14,6 +14,10 @@ export const MANIFEST = "/model-af3-full-f32/manifest.json";
 const EVO = "diffuser/evoformer";
 const MSA_STACK = `${EVO}/__layer_stack_no_per_layer/msa_stack`;
 const PAIRFORMER = `${EVO}/__layer_stack_no_per_layer_1/trunk_pairformer`;
+// Mol-1's split trunk: eight PairMixer blocks (pairformer blocks with no triangle attention, at the full pair width)
+// take haiku's second layer stack, and the narrower pairformer the third
+const PAIRMIXER = `${EVO}/__layer_stack_no_per_layer_1/trunk_pairmixer`;
+const PAIRFORMER_AFTER_MIXER = `${EVO}/__layer_stack_no_per_layer_2/trunk_pairformer`;
 const TEMPLATE = `${EVO}/template_embedding`;
 const TEMPLATE_SINGLE = `${TEMPLATE}/single_template_embedding`;
 const CONFIDENCE = "diffuser/confidence_head";
@@ -397,7 +401,9 @@ function singleAttentionDims(store, root) {
  */
 function pairTrack(store, root, index) {
   const at = (leaf) => stacked(store, `${root}/${leaf}`, index);
-  const [, gridHeads, gridDimension] = dims(store, `${root}/pair_attention1/q_projection/weights`);
+  // (a PairMixer block has no triangle attention: no pairAttention fields, and the block runs without it)
+  const attention = has(store, `${root}/pair_attention1/q_projection/weights`);
+  const [, gridHeads, gridDimension] = attention ? dims(store, `${root}/pair_attention1/q_projection/weights`) : [];
   const triangle = (direction) => ({
     leftNormInputScale: at(`triangle_multiplication_${direction}/left_norm_input/scale`),
     leftNormInputOffset: at(`triangle_multiplication_${direction}/left_norm_input/offset`),
@@ -437,8 +443,7 @@ function pairTrack(store, root, index) {
   return {
     triangleMultiplicationOutgoing: triangle("outgoing"),
     triangleMultiplicationIncoming: triangle("incoming"),
-    pairAttention1: grid(1),
-    pairAttention2: grid(2),
+    ...(attention ? { pairAttention1: grid(1), pairAttention2: grid(2) } : {}),
     pairTransition: {
       inputLayerNormScale: at("pair_transition/input_layer_norm/scale"),
       inputLayerNormOffset: at("pair_transition/input_layer_norm/offset"),
@@ -1051,9 +1056,11 @@ export async function structuralRefinerWeights(store, blocks = 4) {
  * stack's own leading axis; a caller may still override to bisect.
  */
 export function trunkDepths(store) {
+  const mixer = has(store, `${PAIRMIXER}/single_attention_q_projection/bias`);
   return {
-    pairformerBlocks: dims(store, `${PAIRFORMER}/single_attention_q_projection/bias`)[0],
+    pairformerBlocks: dims(store, `${mixer ? PAIRFORMER_AFTER_MIXER : PAIRFORMER}/single_attention_q_projection/bias`)[0],
     msaBlocks: dims(store, `${MSA_STACK}/outer_product_mean/output_b`)[0],
+    pairMixerBlocks: mixer ? dims(store, `${PAIRMIXER}/single_attention_q_projection/bias`)[0] : 0,
   };
 }
 
@@ -1085,22 +1092,43 @@ export async function trunkWeights(store, pairformerBlocks, msaBlocks, options =
   msaBlocks = msaBlocks ?? bundle.msaBlocks;
   const msa = [];
   for (let index = 0; index < msaBlocks; index += 1) msa.push(await msaBlockWeights(store, index));
+  // Mol-1: its PairMixer stack, and the pairformer at its own width between two bias-free adapters - stated by the
+  // dialect and checked against the tensors, as the native walk does
+  const dialect = af3Dialect(store);
+  if (dialect.pairMixer === undefined) {
+    throw new Error("dialect.pairMixer has no default: Mol-1 runs a PairMixer stack and a narrower trunk, no other model does");
+  }
+  if ((bundle.pairMixerBlocks > 0) !== dialect.pairMixer) {
+    throw new Error(`this bundle ${bundle.pairMixerBlocks > 0 ? "carries" : "does not carry"} a PairMixer stack`
+      + " (trunk_pairmixer) and its dialect says otherwise");
+  }
   const pairformer = [];
   for (let index = 0; index < pairformerBlocks; index += 1) {
-    pairformer.push(await pairformerBlockWeights(store, index));
+    pairformer.push(await pairformerBlockWeights(store, index,
+      bundle.pairMixerBlocks > 0 ? PAIRFORMER_AFTER_MIXER : PAIRFORMER));
   }
+  const pairMixer = [];
+  for (let index = 0; index < bundle.pairMixerBlocks; index += 1) {
+    pairMixer.push(await pairformerBlockWeights(store, index, PAIRMIXER));
+  }
+  const pairWidth = pairMixer.length === 0 ? null : {
+    trunkChannels: dims(store, `${EVO}/trunk_pair_in/weights`)[1],
+    trunkPairIn: await store.tensor(`${EVO}/trunk_pair_in/weights`),
+    trunkPairOut: await store.tensor(`${EVO}/trunk_pair_out/weights`),
+  };
   // 🔴 THE DIALECT IS STAMPED ON THE EMBEDDER TOO, because the embedder is
   // where it decides something: OpenDDE builds the pair from `s_init` and stock
   // AF3 from `target_feat`, and the reference and the shader both read it off
   // the weights they were handed rather than from a caller who might not pass
   // one. Deriving it once here keeps a single source.
-  const dialect = af3Dialect(store);
   return {
     dialect,
     embedder: { ...await embedderWeights(store), dialect },
     template: await templateWeights(store, dialect),
     msaBlocks: msa,
     pairformerBlocks: pairformer,
+    pairMixerBlocks: pairMixer,
+    pairWidth,
     distogram: await distogramWeights(store, dialect),
   };
 }

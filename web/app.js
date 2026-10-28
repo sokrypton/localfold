@@ -350,7 +350,7 @@ const MODEL_ALIASES = { openbind: "openbind0", ob: "openbind0", ob0: "openbind0"
                         // family name resolves to the release this page
                         // actually carries rather than standing for whatever
                         // the name means next.
-                        boltz: "boltz2", protenix: "protenix2" };
+                        boltz: "boltz2", protenix: "protenix2", "mol-1": "mol1" };
 
 function applyModelFromUrl() {
   let asked;
@@ -632,6 +632,7 @@ const MODEL_STEMS = {
   opendde: "opendde",
   boltz2: "boltz2",
   protenix2: "protenix2",
+  mol1: "mol1",
   intellifold2: "intellifold2",
   rosettafold3: "rosettafold3",
   monomer: "af2",
@@ -686,6 +687,7 @@ const MODEL_LABELS = {
   // that has more than one member.
   boltz2: "Boltz-2",
   protenix2: "Protenix-v2",
+  mol1: "Mol-1",
   intellifold2: "IntelliFold-2",
   rosettafold3: "RoseTTAFold3",
   monomer: "AlphaFold 2",

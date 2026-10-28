@@ -301,6 +301,19 @@ export const MODEL_BUNDLES = {
     variable: "LOCALFOLD_INCLUDE_PROTENIX2_MODEL",
     load: () => import("./protenix2.js"),
   },
+  // Mol-1 (Molence Bio, Apache 2.0): Protenix-2's model at a 448-channel pair, with eight PairMixer blocks and a
+  // 320-channel trunk between two width adapters (shared/af3/dialect.js MOL1).
+  //
+  // 441 tensors at int5 group 32, 415 MiB. 🔴 NOT PUBLISHED YET: `remote` is null, so the site build drops the option
+  // and a checkout with the local export folds with it.
+  mol1: {
+    model: "mol1",
+    directory: "./model-mol1-int5/",
+    remote: null,
+    release: "mol1-int5",
+    variable: "LOCALFOLD_INCLUDE_MOL1_MODEL",
+    load: () => import("./mol1.js"),
+  },
   // IntelliFold-2 (intelligenAI, Apache 2.0) - the smallest dialect in the
   // family and the widest bundle.
   //
@@ -446,7 +459,7 @@ export const FOLDING_FAMILIES = Object.entries(MODEL_BUNDLES)
  * is the same mistake one model later.
  */
 export const ALL_ATOM_FAMILIES = ["af3", "openbind0", "opendde", "boltz2",
-                                  "protenix2", "intellifold2", "rosettafold3",
+                                  "protenix2", "intellifold2", "rosettafold3", "mol1",
                                   "ef2-fast-600m", "ef2-fast-300m", "bioemu2"];
 
 /**
@@ -481,7 +494,7 @@ export const SINGLE_SEQUENCE_FAMILIES = ["ef2-fast-600m", "ef2-fast-300m"];
  * itself.
  */
 export const AF3_FAMILIES = ["af3", "openbind0", "opendde", "boltz2", "protenix2",
-                             "intellifold2", "rosettafold3"];
+                             "intellifold2", "rosettafold3", "mol1"];
 
 /** @typedef {keyof typeof MODEL_BUNDLES} ModelFamily */
 
