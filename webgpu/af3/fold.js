@@ -44,7 +44,7 @@ import { Af3TemplateEmbedderGpu } from "./trunk/template.js";
 import { Af3StructuralExpanderGpu } from "./structure/structural-expander.js";
 import { structuralAttentionBias, structuralPairFeatures }
   from "../../cpu/af3/structure/structural-expander.js";
-import { structuralBatch, structuralLayout, structuralToResidue }
+import { structuralBatch, structuralLayout, structuralToResidue, residueToStructural }
   from "../../shared/af3/featurise/structural-tokens.js";
 import { Af3DiffusionConditioningGpu } from "./diffusion/diffusion-conditioning.js";
 import { openddeConfidence } from "./confidence/opendde-confidence.js";
@@ -1230,13 +1230,13 @@ async function foldHolding(device, batch, weights, options, held) {
       + " (docs/AF3.md, \"Flow removed\")");
   }
   stage("sample-start", { steps: options.steps });
-  // 🔴 A WARM START IS IN RESIDUE TOKENS, and OpenDDE samples in its structural tokens: refused there
-  // rather than mapped, until something needs it (diffusion-sampler.js, `start`)
-  if (options.start !== undefined && structural !== undefined) {
-    throw new Error("a warm start is not mapped to OpenDDE's structural tokens");
-  }
+  // 🔴 A WARM START IS IN RESIDUE TOKENS, and OpenDDE samples in its structural tokens - so it is
+  // gathered onto them through the table that scatters the answer back (residueToStructural)
+  const start = options.start === undefined || structural === undefined ? options.start
+    : { ...options.start,
+      positions: residueToStructural(options.start.positions, structural.layout, tokens, dense) };
   const sampled = await sampleOnGpu(device, headInput, weights.diffusion, {
-    ...(options.start === undefined ? {} : { start: options.start }),
+    ...(start === undefined ? {} : { start }),
     steps, stopAfter: options.stopAfter, head,
     normal: normalFrom(options.seed ?? 20260831),
     onStep,

@@ -156,13 +156,15 @@ The style IS index.html's: py2Dmol's light application CSS plus web/localfold.cs
                         <!-- 🔴 HISTORY (2026-10-28): blank is the reference's method. Set, each cycle draws up
                              to "Sequences" designs one at a time and keeps the first whose fold stays this
                              close to the cycle before (web/hunt.js, `accept`). -->
-                        <!-- 🔴 HISTORY IN THE FOLD (2026-10-28): blank folds every cycle from noise, the
-                             reference's method. Set, each cycle's diffusion starts from the cycle before's
-                             structure this many angstroms of noise down (web/hunt.js, `warm`). -->
+                        <!-- 🔴 HISTORY IN THE FOLD (2026-10-28): each cycle's diffusion starts from the cycle
+                             before's structure this many angstroms of noise down (web/hunt.js, `warm`). ON BY
+                             DEFAULT at 10: on the 5O45 binder over three seeds it settled every run where the
+                             reference kept jumping, and beat it on objective and refold (docs/DESIGN-TODO.md).
+                             Blank is the reference's method. -->
                         <div class="fetch-option-group" id="warmGroup">
                             <label class="fetch-option-title" for="warm-start">Warm start (Å)</label>
-                            <input type="number" id="warm-start" min="1" max="80" step="1" placeholder="off"
-                                title="Start each cycle's fold from the cycle before's structure instead of from noise: the diffusion joins this many angstroms of noise down and runs only the steps left. Lower holds closer. Blank: the reference's method.">
+                            <input type="number" id="warm-start" min="1" max="80" step="1" value="10" placeholder="off"
+                                title="Start each cycle's fold from the cycle before's structure instead of from noise: the diffusion joins this many angstroms of noise down and runs only the steps left. Lower holds closer. Blank: the reference's method, every cycle from noise.">
                         </div>
                         <div class="fetch-option-group" id="stayGroup">
                             <label class="fetch-option-title" for="stay-within">Stay within (Å)</label>

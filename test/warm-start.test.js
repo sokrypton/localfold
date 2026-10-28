@@ -47,3 +47,19 @@ describe("a warm start from the previous cycle", () => {
     expect(() => startFromPdb(featuriseProtein("AGKVLA"), pdb)).toThrow(/no residue 6 of chain A/);
   });
 });
+
+describe("a warm start in OpenDDE's structural tokens", () => {
+  it("is gathered through the table that scatters the answer back, and round-trips", async () => {
+    const { structuralLayout, structuralToResidue, residueToStructural } =
+      await import("../shared/af3/featurise/structural-tokens.js");
+    const batch = featuriseProtein("AGKVL");
+    const layout = structuralLayout(batch);
+    const residue = new Float32Array(batch.tokens * batch.dense * 3);
+    for (let slot = 0; slot < batch.tokens * batch.dense; slot += 1) {
+      if (layout.residueAtomGather[slot] >= 0) residue.set([slot, -slot, 2 * slot], slot * 3);
+    }
+    const structural = residueToStructural(residue, layout, batch.tokens, batch.dense);
+    expect(layout.tokens > batch.tokens).toBe(true);
+    expect([...structuralToResidue(structural, layout, batch.tokens, batch.dense)]).toEqual([...residue]);
+  });
+});

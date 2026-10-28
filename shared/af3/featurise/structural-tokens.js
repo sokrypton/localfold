@@ -269,6 +269,23 @@ export function structuralToResidue(positions, layout, residueTokens, dense) {
 }
 
 /**
+ * The residue layout's coordinates, gathered onto the structural one - `structuralToResidue`
+ * backwards, through the same table: a warm start (webgpu/af3/diffusion/diffusion-sampler.js) is a
+ * previous fold, which is written in residues, and OpenDDE samples in structural tokens.
+ */
+export function residueToStructural(positions, layout, residueTokens, dense) {
+  const out = new Float32Array(layout.tokens * dense * 3);
+  for (let index = 0; index < residueTokens * dense; index += 1) {
+    const to = layout.residueAtomGather[index];
+    if (to < 0) continue;
+    out[to * 3] = positions[index * 3];
+    out[to * 3 + 1] = positions[index * 3 + 1];
+    out[to * 3 + 2] = positions[index * 3 + 2];
+  }
+  return out;
+}
+
+/**
  * A batch over OpenDDE's structural tokens, from AlphaFold 3's residue batch.
  *
  * Shaped exactly like `featuriseProtein`'s output, because the diffusion head,

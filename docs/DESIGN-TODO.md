@@ -499,3 +499,9 @@ three. **Stay within alone is a filter, not a force**: where no candidate comes 
 2) every cycle falls back to "closest" and its best design fails the refold badly. Stabler is not
 the same as right - seed 2's refold disagrees in every arm. One target, three seeds; a
 monomer and a second binder are the next measurements.
+
+**Warm start is ON by default at 10 A** (2026-10-28, the user's call on these numbers); Stay within
+stays off - alone it failed two seeds of three. Blank either for the reference's method. OpenDDE takes it too:
+the start is gathered onto its structural tokens (`residueToStructural`, the inverse of the table
+that scatters its answer back). 5O45 with OpenDDE, 5 cycles, seed 0: moved 9.6-11.6 A a cycle cold,
+4.1-5.6 warm; best objective 0.516 -> 0.549; the AF3 refold disagrees with both (12-14 A).
