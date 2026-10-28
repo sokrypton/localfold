@@ -184,10 +184,12 @@ TRUNK = ("diffuser/evoformer", "diffuser/distogram_head")
 # Fourier projection of its distance (17 k parameters each, +130 KiB). Read on the host into a table of a few rows
 # (shared/af3/featurise/constraints.js), so the cost is bytes alone; at int5 g32 the term came out 1.3-5.6% from
 # float32's (the confidence site's 12 A contact the worst), where the rest of the pair is held to its own int5 error.
+# And its two class constants (128 floats each): with any constraint every pair it does not mark is UNSELECTED - 99% of
+# them on the harness cases - and at int5 that class's shift from unspecified came out 17-22% from float32's.
 MODEL_FLOAT32 = {
     "mol1": re.compile(r"/single_transition/transition2/weights$"),
     # (and its DN rows - Boltz's DNA unknown, three vectors - which the published bundle has always carried as float32)
-    "boltz2": re.compile(r"/contact_(encoder|fourier)/weights$|/boltz2_dn_"),
+    "boltz2": re.compile(r"/contact_(encoder|fourier)/weights$|/contact_encoding_(unspecified|unselected)$|/boltz2_dn_"),
 }
 
 # 🔴 SIZED IN FLOAT32 BYTES, FOR AN INT8 RESULT, exactly as the multimer export
