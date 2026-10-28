@@ -394,6 +394,7 @@ round trip.
 | protein binder | ✅ objective 0.589, two folders rotating | ✅ 183 tokens (`ppi_pdl1`) |
 | ligand target | ✅ runs, LigandMPNN chosen automatically | ✅ 165 tokens (`sm_sam`) |
 | nucleic target | ✅ runs, NA-MPNN chosen automatically | ✅ 147 tokens (`dna_7m5w`) |
+| a designed DNA / RNA chain | ✅ runs (2026-10-28), NA-MPNN designs it; recovers a duplex partner, the objective does not yet see pairing (DESIGN-TODO.md) | — |
 | from a structure | ✅ its sequence is read out | ✅ its coordinates are conditioned on |
 | motif, indexed | ✅ objective 0.835, the motif survives exactly | ✅ 67 tokens |
 | motif, unindexed | ❌ Hunter cannot choose where the motif sits | ✅ 112 tokens |

@@ -22,13 +22,27 @@
  * prediction carries for a residue whose identity is still changing. So this is
  * the convention applied to the atoms available, not a tighter claim.
  */
-import { CONTACT_ANGSTROMS } from "../../shared/heads/contact-threshold.js";
+import { CONTACT_ANGSTROMS, CONTACT_ANGSTROMS_BY_KIND } from "../../shared/heads/contact-threshold.js";
 import { structureFromText } from "./mpnn/pdb.js";
+import { POLYTYPE } from "./mpnn/na.js";
 
 export { CONTACT_ANGSTROMS };
 
-/** CA is index 1 of the N, CA, C, O backbone `structureFromText` returns. */
+/**
+ * CA is index 1 of the N, CA, C, O backbone `structureFromText` returns - and a nucleotide's C1'
+ * sits in that slot under `nucleicAsResidues` (NUCLEIC_TRACE in ./mpnn/pdb.js).
+ */
 const CA = 1;
+
+/**
+ * 🔴 DNA AND RNA ARE IN THE PARSE (2026-10-28). A protein-only parse drops every nucleic chain, so a
+ * binder designed against DNA alone had nothing to touch and the check returned "no opinion" on
+ * every cycle, and a designed DNA strand was not in the structure at all. Each pair is held to its
+ * kinds' calibrated cutoff (`CONTACT_ANGSTROMS_BY_KIND`: 8 A protein-protein, 10 nucleic-protein,
+ * 9 nucleic-nucleic), measured on representative atoms as this is on CA and C1'.
+ */
+const kindOf = (polytype) => (polytype === POLYTYPE.DNA || polytype === POLYTYPE.RNA ? "nucleic" : "protein");
+const cutoffOf = (a, b) => CONTACT_ANGSTROMS_BY_KIND[[a, b].sort().join("-")];
 
 /**
  * How close the designed chain comes to the rest, and to named residues of it.
@@ -38,16 +52,15 @@ const CA = 1;
  * @param {string} options.chain the designed chain's id
  * @param {Record<string, number[]>} [options.residues] per chain, the residue
  *   numbers that must be touched - an epitope. Absent means "touch anything".
- * @param {number} [options.angstroms] the cutoff, defaulting to the convention
- * @returns {{contacts: number, nearest: number, wanted: number, touched: number[],
+ * @param {number} [options.angstroms] one cutoff for every pair; absent, each pair takes its kinds'
+ * @returns {{contacts: number, nearest: number, nearestCutoff: number, wanted: number, touched: number[],
  *            missing: number[], chains: string[]}}
  *   `nearest` is Infinity when there is nothing to touch at all.
  */
 export function contactOf(pdb, options) {
-  const { chain, residues, angstroms = CONTACT_ANGSTROMS } = options;
-  const structure = structureFromText(pdb, {});
+  const { chain, residues, angstroms } = options;
+  const structure = structureFromText(pdb, { nucleicAsResidues: true });
   const chains = structure.chainList;
-  const cutoff = angstroms * angstroms;
 
   const mine = [];
   const theirs = [];
@@ -55,8 +68,9 @@ export function contactOf(pdb, options) {
     if (structure.mask[index] !== 1) continue;
     const at = [structure.X[index * 12 + CA * 3], structure.X[index * 12 + CA * 3 + 1],
       structure.X[index * 12 + CA * 3 + 2]];
-    if (structure.chainIds[index] === chain) mine.push(at);
-    else theirs.push({ at, chain: structure.chainIds[index], residue: structure.resSeq[index] });
+    const kind = kindOf(structure.polytype[index]);
+    if (structure.chainIds[index] === chain) mine.push({ at, kind });
+    else theirs.push({ at, kind, chain: structure.chainIds[index], residue: structure.resSeq[index] });
   }
 
   // 🔴 WANTED RESIDUES ARE FILTERED FROM WHAT IS THERE, not assumed present. A
@@ -69,15 +83,18 @@ export function contactOf(pdb, options) {
 
   let contacts = 0;
   let nearestSquared = Infinity;
+  // ...and the cutoff the nearest pair is held to, which is what a refusal quotes
+  let nearestCutoff = angstroms ?? CONTACT_ANGSTROMS;
   const touched = new Set();
   for (const a of mine) {
     for (const b of targets) {
-      const dx = a[0] - b.at[0];
-      const dy = a[1] - b.at[1];
-      const dz = a[2] - b.at[2];
+      const dx = a.at[0] - b.at[0];
+      const dy = a.at[1] - b.at[1];
+      const dz = a.at[2] - b.at[2];
       const squared = dx * dx + dy * dy + dz * dz;
-      if (squared < nearestSquared) nearestSquared = squared;
-      if (squared <= cutoff) {
+      const cutoff = angstroms ?? cutoffOf(a.kind, b.kind);
+      if (squared < nearestSquared) { nearestSquared = squared; nearestCutoff = cutoff; }
+      if (squared <= cutoff * cutoff) {
         contacts += 1;
         touched.add(`${b.chain}:${b.residue}`);
       }
@@ -88,6 +105,7 @@ export function contactOf(pdb, options) {
   return {
     contacts,
     nearest: nearestSquared === Infinity ? Infinity : Math.sqrt(nearestSquared),
+    nearestCutoff,
     wanted: wantedKeys.length,
     touched: [...touched],
     missing: wantedKeys.filter((key) => !touched.has(key)),
@@ -108,7 +126,7 @@ export function contactOf(pdb, options) {
  */
 export function contactProblem(pdb, options) {
   const result = contactOf(pdb, options);
-  const { angstroms = CONTACT_ANGSTROMS } = options;
+  const angstroms = result.nearestCutoff;
   // Nothing to touch: a monomer design, which this check has no opinion about.
   if (result.chains.length < 2) return null;
 

@@ -14,10 +14,10 @@
  * work, the model that knows the chain is a chain is the better answer, and
  * the picker still offers LigandMPNN to anyone who disagrees.
  *
- * 🔴 AND EVERY FAMILY HERE DESIGNS A PROTEIN CHAIN. A ligand and a nucleic
- * chain are CONTEXT the designed chain is read against, never the thing being
- * designed - which is what makes NA-MPNN's 33-letter alphabet safe to use for
- * a protein binder. See designBias() in sample-sequence.js.
+ * 🔴 A DESIGNED CHAIN IS PROTEIN UNLESS THE JOB SAYS DNA OR RNA (2026-10-28), and then only
+ * NA-MPNN can design it: the other three have no nucleotide in their alphabet. Otherwise a ligand
+ * and a nucleic chain are CONTEXT the designed chain is read against, and NA-MPNN's 33-letter
+ * alphabet is held to its amino acids. See designBias() in sample-sequence.js.
  */
 
 /**
@@ -51,14 +51,18 @@ export const DESIGNERS = {
   },
 };
 
+/** What a designed chain may be made of besides protein - and then NA-MPNN is the one designer. */
+export const NUCLEIC_KINDS = new Set(["dna", "rna"]);
+
 /** The order the picker lists them in. */
 export const DESIGNER_NAMES = ["soluble", "protein", "ligand", "na"];
 
 /**
  * The family to use for a job, given what is in the complex besides protein.
  *
- * @param {{ligands?: number, nucleic?: number}} input how many ligands and how
- *   many DNA or RNA chains the fold carries
+ * @param {{ligands?: number, nucleic?: number, designs?: string}} input how many ligands and how
+ *   many DNA or RNA chains the fold carries, and what the designed chain is made of
+ *   (`"protein"`, the default, `"dna"` or `"rna"`)
  * @returns {{name: keyof typeof DESIGNERS, why: string}} `why` is shown on the
  *   page, because a picker that silently changes its own value is worse than
  *   one that cannot.
@@ -66,6 +70,13 @@ export const DESIGNER_NAMES = ["soluble", "protein", "ligand", "na"];
 export function chooseDesigner(input = {}) {
   const ligands = input.ligands ?? 0;
   const nucleic = input.nucleic ?? 0;
+  if (NUCLEIC_KINDS.has(input.designs ?? "protein")) {
+    return {
+      name: "na",
+      why: `the designed chain is ${input.designs === "dna" ? "DNA" : "RNA"}, which only NA-MPNN designs`
+        + (ligands > 0 ? " (it does not see the ligand)" : ""),
+    };
+  }
   // 🔴 NUCLEIC FIRST, AND THE ORDER MATTERS FOR A COMPLEX CARRYING BOTH.
   // NA-MPNN has no atom context, so a DNA chain AND a ligand together is the
   // one case where each choice loses something real: NA-MPNN drops the

@@ -24,11 +24,11 @@
  */
 import { ALPHABET } from "./mpnn/constants.js";
 import { Model, sequenceToString } from "./mpnn/model.js";
-import { NA_ALPHABET, naDisplaySequence } from "./mpnn/na.js";
+import { NA_ALPHABET, NA_RESTYPES, NA_UNKNOWN, naDisplaySequence } from "./mpnn/na.js";
 import { structureFromText } from "./mpnn/pdb.js";
 import { Weights } from "./mpnn/weights.js";
 import { enableAcceleration } from "./mpnn/accel.js";
-import { DESIGNERS } from "./designers.js";
+import { DESIGNERS, NUCLEIC_KINDS } from "./designers.js";
 import { designBias } from "./sample-sequence.js";
 
 /** Where the page serves the mirror from. */
@@ -115,6 +115,8 @@ export function chainMaskFor(structure, chain) {
  *   0-based, to keep as they are. The designer conditions on them and does not
  *   rewrite them - which is what an antibody's framework, a scaffolded motif and
  *   inverse folding's fixed residues all are.
+ * @param {"protein"|"dna"|"rna"} [options.kind="protein"] what the designed chain is made of. A
+ *   DNA or RNA chain needs NA-MPNN, and comes back in AF3's letters (ACGT, ACGU, N for unknown).
  * @returns {{sequence: string, full: string, score: number,
  *            designed: number, structure: object}} `sequence` is the designed
  *   chain alone, which is what goes back into the fold; `full` is every chain,
@@ -139,6 +141,9 @@ export function designChain(model, options) {
     ligands: model.isLigand, nucleicAsResidues: model.isNA,
   });
   const alphabet = model.isNA ? NA_ALPHABET : ALPHABET;
+  const kind = options.kind ?? "protein";
+  const nucleic = NUCLEIC_KINDS.has(kind);
+  if (nucleic && !model.isNA) throw new Error(`only NA-MPNN designs a ${kind.toUpperCase()} chain`);
   const chainMask = chainMaskFor(structure, options.chain);
   let designed = 0;
   for (const value of chainMask) designed += value;
@@ -211,6 +216,7 @@ export function designChain(model, options) {
     chainMask,
     bias: designBias(structure.chainIds.length, {
       omit: options.omit, alanineBias: options.alanineBias, alphabet,
+      ...(nucleic ? { designs: "nucleic" } : {}),
     }),
   });
 
@@ -230,7 +236,13 @@ export function designChain(model, options) {
     : sequenceToString(result.S[0]))];
   const chainLetters = [];
   for (let index = 0; index < inChain.length; index += 1) {
-    if (inChain[index] === 1) chainLetters.push(letters[index]);
+    if (inChain[index] === 1) {
+      // (a position NA-MPNN could not read as a polymer - a 5' base without its phosphate - is
+      // masked and never sampled: it keeps its base, or the strand's N where the parse had none)
+      const token = result.S[0][index];
+      chainLetters.push(!nucleic ? letters[index]
+        : structure.mask[index] === 0 && token === NA_UNKNOWN.PP ? "N" : baseLetter(token, kind));
+    }
   }
   // 🔴 THE CHAINS COME BACK IN THE STRUCTURE'S ORDER, NOT THE REQUEST'S. The
   // reference splits its designer's output on ":" and indexes it by a chain
@@ -255,6 +267,27 @@ export function designChain(model, options) {
     tokens: result.S[0],
     alphabet,
   };
+}
+
+/**
+ * A designed nucleic position's token as the letter AF3 folds.
+ *
+ * 🔴 BY THE TOKEN'S RESIDUE NAME, NOT BY NA-MPNN'S DISPLAY LETTER. Its alphabet writes DNA as
+ * `acgt` and RNA as the legacy `bdhu`, neither of which a fold reads, and shared tokens store an
+ * RNA base as the DNA one - so DT is U in an RNA chain. DX/RX (an unknown base, which a held
+ * position may be) is N; anything else in a nucleic chain is a token the bias should have made
+ * impossible, and is refused rather than folded.
+ *
+ * @param {number} token
+ * @param {"dna"|"rna"} kind
+ * @returns {string}
+ */
+export function baseLetter(token, kind) {
+  const name = NA_RESTYPES[token];
+  const base = { DA: "A", DC: "C", DG: "G", DT: kind === "rna" ? "U" : "T", A: "A", C: "C", G: "G", U: "U",
+    DX: "N", RX: "N" }[name];
+  if (base === undefined) throw new Error(`NA-MPNN put ${name ?? token} in a ${kind.toUpperCase()} chain`);
+  return base;
 }
 
 /** MPNN's alphabet, re-exported so callers need not reach into the mirror. */

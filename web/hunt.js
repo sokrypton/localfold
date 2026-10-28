@@ -22,7 +22,7 @@ import { getDevice } from "./model.js";
 import { AF3_COUNTS, af3SequenceProblem, foldAf3, loadAf3Weights } from "./af3-model.js";
 import { CHAIN_IDS, runDesign } from "../webgpu/design/hunter-loop.js";
 import { designChain, loadDesigner } from "../cpu/design/mpnn-bridge.js";
-import { chooseDesigner } from "../cpu/design/designers.js";
+import { chooseDesigner, DESIGNERS, NUCLEIC_KINDS } from "../cpu/design/designers.js";
 import { contactProblem } from "../cpu/design/contact.js";
 import { FOLDERS } from "./validate-design.js";
 
@@ -100,7 +100,14 @@ export async function hunt(options) {
     if (problem !== null) throw new Error(`chain ${index + 1}: ${problem}`);
   }
 
-  const chosen = designer === "auto" ? chooseDesigner(contents).name : designer;
+  // 🔴 WHAT THE DESIGNED CHAIN IS DECIDES WHO CAN DESIGN IT: a DNA or RNA chain has NA-MPNN alone,
+  // and an explicit pick of another family is refused here, before any weights are fetched.
+  const kind = chainKinds?.[chainIndex] ?? "protein";
+  const chosen = designer === "auto" ? chooseDesigner({ ...contents, designs: kind }).name : designer;
+  if (NUCLEIC_KINDS.has(kind) && chosen !== "na") {
+    throw new Error(`${DESIGNERS[chosen]?.label ?? chosen} cannot design a ${kind.toUpperCase()} chain;`
+      + " only NA-MPNN can");
+  }
 
   // 🔴 TWO DIFFERENT `onProgress` CONTRACTS, SAME NAME. `foldAf3` calls its one
   // with a FRACTION; the weight loaders call theirs with an OBJECT
@@ -172,6 +179,7 @@ export async function hunt(options) {
       omit: options.omit,
       hold: runHold,
       beam,
+      kind,
 
       // 🔴 THE CONTACT CHECK, WHICH IS HOW AN EPITOPE REACHES PROTEIN HUNTER AT
       // ALL. It cannot condition on hotspots the way RFD4 does, so the only way
@@ -238,6 +246,7 @@ export async function hunt(options) {
           alanineBias: context.alanineBias,
           random: context.random,
           hold: context.hold,
+          kind: context.kind,
         });
       },
     });

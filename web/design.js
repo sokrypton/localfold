@@ -58,7 +58,11 @@ const NUCLEOTIDE = { DA: "A", DC: "C", DG: "G", DT: "T", A: "A", C: "C", G: "G",
 const DEOXY = new Set(["DA", "DC", "DG", "DT"]);
 
 function contentsOf(spans) {
+  // what the designed chain is made of: a Designed segment's own, or a given one marked Redesign
+  const designed = spans.find((span) => span.kind === "generated" || span.redesign === true);
   return {
+    designs: designed === undefined ? "protein" : designed.kind === "segment"
+      ? polymerOf(String(designed.chain ?? "")) : designed.polymer ?? "protein",
     ligands: spans.filter((span) => span.kind === "ligand").length,
     // a kept strand of a loaded structure is nucleic too (the DNA-binder example's two)
     nucleic: spans.filter((span) => (span.kind === "sequence" && NUCLEIC.has(span.polymer ?? ""))
@@ -647,8 +651,13 @@ const drawCycle = (record) => {
   // exists so far - the loop's alanine ceiling, which is why a cycle can be
   // ineligible - so that is what it reports, as the fraction it actually is.
   // Ring closure and base pairing are step 4 of docs/DESIGN.md.
-  const alanine = `${(record.alanine * 100).toFixed(0)}% Ala`;
-  const overAlanine = record.cycle > 0 && record.alanine > MAX_ALANINE;
+  // ...and for a DNA or RNA chain, which has no alanine ceiling (webgpu/design/hunter-loop.js), its GC
+  // share - a number about the strand rather than an alanine count of its adenines
+  const alanine = record.alanine === null
+    ? `${Math.round(100 * [...record.sequence].filter((base) => base === "G" || base === "C").length
+      / Math.max(1, record.sequence.length))}% GC`
+    : `${(record.alanine * 100).toFixed(0)}% Ala`;
+  const overAlanine = record.cycle > 0 && record.alanine !== null && record.alanine > MAX_ALANINE;
   // 🔴 THE VETO'S OWN WORDS, WHICH ALREADY CARRY ITS MEASUREMENT - "touches 0/4
   // hotspots (nearest 23.7 A, needs 8 A)". Re-describing it here would be a
   // second place for the number to go stale.
@@ -1239,7 +1248,7 @@ const startHunt = async () => {
     if (best === null) {
       const reasons = [...new Set(cycles.filter((record) => record.cycle > 0)
         .map((record) => record.vetoed
-          ?? (record.alanine > MAX_ALANINE
+          ?? (record.alanine !== null && record.alanine > MAX_ALANINE
             ? `over the ${Math.round(MAX_ALANINE * 100)}% alanine ceiling` : "not scored")))];
       // 🔴 NOT MARKED AS AN ERROR, because the run COMPLETED - it just has no
       // candidate, which is a result and sometimes the right one (a 24-mer

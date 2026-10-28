@@ -428,3 +428,33 @@ user's ask): the design and the refold are two py2Dmol objects shown together, t
 design's letters, where it had been one structure with the refold under spare letters C, D. Its
 shading is addressed by chain and residue NUMBER, because py2Dmol does not keep a file's chain
 order - counted by position, the 5O45 binder's red landed on the target.
+
+### Protein Hunter designs a DNA or RNA chain (2026-10-28) - done, the score is the open part
+
+A Designed segment "Made of" DNA or RNA now stays nucleic under Hunter (it was forced to protein),
+starts as mostly `N` - AF3's base-less nucleotide, as `X` is its unknown amino acid - and is
+designed by NA-MPNN alone (`chooseDesigner({designs})`; an explicit pick of another family is
+refused). The sampler opens only NA-MPNN's four DNA tokens (`designBias(..., {designs: "nucleic"})`;
+shared tokens store an RNA base as the DNA one) and the bridge reads them back in AF3's letters by
+residue name (`baseLetter`: DT is U in an RNA chain). The alanine ceiling is a protein rule and does
+not apply - the results table shows the strand's GC share instead. Two fixes it needed: NA-MPNN's
+parser did not know AF3's `DN`/`N`, so a strand of unknowns came back one letter long (hand-applied
+to the mirror, which had already diverged, and committed on a local branch of sokrypton/mpnn - see
+cpu/design/mpnn/SOURCE.md); and the contact veto parsed protein only, so a nucleic chain was
+invisible to it - a binder against DNA alone had nothing to touch and was never checked. It reads
+DNA and RNA now, each pair at its calibrated cutoff (10 A nucleic-protein, 9 nucleic-nucleic).
+
+Measured, AF3, one run of 5 cycles, single sequence:
+
+| job | converged strand | against the native | objective |
+|---|---|---|---|
+| `dna_7m5w`, strand A kept, strand B (10) designed | `GATTCATAAC` (cycle 3) | contains A's reverse complement exactly, 9/9, with a 5' G overhang (native: a 3' C) | ipTM 0.003 -> 0.010; pLDDT 63 (all N) -> 87, native 89 |
+| full 7M5W, protein A and strand B kept, strand C (18) designed | `GAGCTTTTTCATTTCATA` | the complement shifted by 2 - it pairs with B out of register | ipTM **fell**, 0.499 at cycle 0 -> 0.358 |
+
+🔴 **THE OBJECTIVE IS THE OPEN QUESTION, AS EXPECTED.** On the bare duplex ipTM is ~0.01 for every
+strand (a 19-nt complex is too short for a TM-based score to mean much), so it orders cycles but its
+value says nothing; pLDDT tracks the pairing. With the protein, single-sequence AF3 does not fold
+capicua's HMG domain (pLDDT 42 for the native complex) and scores the base-less starting strand
+best (ipTM 0.353 against the native strand's 0.089) - so the loop's own selection works against it.
+A nucleic design wants an objective that sees pairing (pLDDT, or base-pair geometry as a veto) and a
+target that folds (an MSA or a template), neither of which is wired.

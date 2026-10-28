@@ -59,6 +59,11 @@ const NUCLEIC = new Set([
   "RA", "RC", "RG", "RU",
   "DA3", "DA5", "DC3", "DC5", "DG3", "DG5", "DT3", "DT5",
   "A3", "A5", "C3", "C5", "G3", "G5", "U3", "U5",
+  // An unknown nucleotide as AlphaFold 3 writes one - its backbone and no base, DNA's "DN" and RNA's
+  // "N" - which reads as NA-MPNN's unknown DX or RX, the way "UNK" reads as protein's X. Without
+  // these a strand being designed from unknowns was dropped from the structure but for the bases
+  // it already had.
+  "DN", "N",
 ]);
 
 /** Guess an element symbol from a PDB atom name when the column is blank. */

@@ -26,12 +26,15 @@ import { ALPHABET } from "./mpnn/constants.js";
  */
 const POOL_WITHOUT_PROLINE = "ACDEFGHIKLMNQRSTVWY";
 
+/** The four bases of each nucleic kind, as AF3 writes them. */
+export const BASES = { dna: "ACGT", rna: "ACGU" };
+
 /**
  * A starting sequence: `percentX` of the positions unknown, the rest drawn
  * uniformly, then shuffled.
  *
  * @param {number} length
- * @param {{percentX?: number, excludeP?: boolean,
+ * @param {{percentX?: number, excludeP?: boolean, kind?: "protein"|"dna"|"rna",
  *          random?: () => number}} [options] `random` returns [0, 1); pass
  *   `uniformFrom(seed)` from webgpu/af3/fold.js to make a run reproducible.
  * @returns {string}
@@ -39,13 +42,19 @@ const POOL_WITHOUT_PROLINE = "ACDEFGHIKLMNQRSTVWY";
 export function sampleSequence(length, options = {}) {
   const random = options.random ?? Math.random;
   const percentX = options.percentX ?? 90;
-  const pool = options.excludeP === true
-    ? POOL_WITHOUT_PROLINE : `${POOL_WITHOUT_PROLINE}P`;
+  // 🔴 A NUCLEIC CHAIN STARTS THE SAME WAY, IN ITS OWN LETTERS (2026-10-28): mostly N - AF3's
+  // base-less nucleotide, as X is its unknown amino acid - and the rest drawn from the four bases.
+  // The reference has no such case; this is the protein schedule carried over unchanged.
+  const kind = options.kind ?? "protein";
+  const pool = kind !== "protein" ? BASES[kind]
+    : options.excludeP === true ? POOL_WITHOUT_PROLINE : `${POOL_WITHOUT_PROLINE}P`;
+  if (pool === undefined) throw new Error(`no starting pool for a ${kind} chain`);
+  const unknownLetter = kind === "protein" ? "X" : "N";
   // ...`round`, not `floor`: the reference's `round(length * frac_X)`, so 90%
   // of 15 is 14 rather than 13.
   const unknown = Math.round(length * (percentX / 100));
   const letters = [];
-  for (let index = 0; index < unknown; index += 1) letters.push("X");
+  for (let index = 0; index < unknown; index += 1) letters.push(unknownLetter);
   for (let index = unknown; index < length; index += 1) {
     letters.push(pool[Math.floor(random() * pool.length)]);
   }
@@ -144,9 +153,15 @@ const PROTEIN_LETTERS = 21;
  * with a nucleotide. Both alphabets put their 21 protein letters first, so
  * one boundary serves.
  *
+ * 🔴 AND A NUCLEIC DESIGN IS THE OPPOSITE MASK (`designs: "nucleic"`, 2026-10-28): everything
+ * omitted but NA-MPNN's four DNA tokens `acgt`. Its shared tokens store an RNA base as the DNA one
+ * (cpu/design/mpnn/na.js), so the same four serve an RNA chain, and the bridge reads them back in
+ * the chain's own letters. The standing omissions (`C`, the first cycle's `P`) are amino acids and
+ * reach nothing here.
+ *
  * @param {number} length residues in the structure, not in the designed chain
  * @param {{omit?: string, alanineBias?: number, alphabet?: string,
- *          proteinOnly?: boolean}} [options]
+ *          proteinOnly?: boolean, designs?: "protein"|"nucleic"}} [options]
  * @returns {Float32Array} length * alphabet.length
  */
 export function designBias(length, options = {}) {
@@ -156,6 +171,13 @@ export function designBias(length, options = {}) {
   // X is position 20 and is never a design choice: the loop puts X into the
   // sequence AF3 folds, and reads letters back out of MPNN.
   row[alphabet.indexOf("X")] = OMIT;
+  if (options.designs === "nucleic") {
+    if (alphabet.length <= PROTEIN_LETTERS) throw new Error("only NA-MPNN's alphabet has nucleotides to design");
+    row.fill(OMIT);
+    for (const letter of "acgt") row[alphabet.indexOf(letter)] = 0;
+    for (let position = 0; position < length; position += 1) bias.set(row, position * alphabet.length);
+    return bias;
+  }
   // ...and under a wider alphabet, everything past the twenty amino acids and
   // X. `proteinOnly` defaults on because a designed chain here is a protein.
   for (let index = PROTEIN_LETTERS; options.proteinOnly !== false

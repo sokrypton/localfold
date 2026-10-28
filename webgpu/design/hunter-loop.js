@@ -145,6 +145,8 @@ export function withChain(chains, index, sequence) {
  *   The reason lands on the record as `vetoed`.
  * @param {number} [options.beam=1] how many sequences to sample per cycle. Each
  *   is folded and the best carries forward, so this multiplies the folds.
+ * @param {"protein"|"dna"|"rna"} [options.kind="protein"] what the designed chain is made of: its
+ *   starting letters, and whether the alanine ceiling applies (a protein's alone - see below)
  * @param {number} [options.seed=0]
  * @param {number} [options.run=0] carried onto every record, for the table
  * @param {AbortSignal} [options.signal]
@@ -171,6 +173,7 @@ export async function* runDesign(options) {
   const temperature = options.temperature ?? 0.1;
   const beam = Math.max(1, Math.floor(options.beam ?? 1));
   const standingOmit = options.omit ?? "C";
+  const kind = options.kind ?? "protein";
 
   let sequence = chains[chainIndex] ?? "";
   if (sequence.length === 0) {
@@ -181,6 +184,7 @@ export async function* runDesign(options) {
     sequence = sampleSequence(length, {
       percentX: options.percentX ?? 90,
       excludeP: options.excludeP ?? false,
+      kind,
       random,
     });
   }
@@ -217,7 +221,7 @@ export async function* runDesign(options) {
       for (let draw = 0; draw < beam; draw += 1) {
         const designed = await design(previous.pdb, {
           chain: chainLetter, temperature, omit, alanineBias: bias, random, signal,
-          cycle, run, draw,
+          cycle, run, draw, kind,
           // 🔴 PASSED STRAIGHT THROUGH, because WHICH positions are held is the
           // caller's question and not the loop's: a framework, a motif, or
           // nothing. The loop's only stake is that it is the same every cycle -
@@ -259,7 +263,11 @@ export async function* runDesign(options) {
 
     const confidence = folded.confidence ?? {};
     const { value, objective } = objectiveOf(confidence, chainIndex);
-    const alanine = alanineFraction(sequence);
+    // 🔴 A PROTEIN'S RULE, AND AN A IN DNA IS ADENINE (2026-10-28). Poly-alanine is MPNN's answer to
+    // a backbone it cannot read; NA-MPNN's failure modes on a nucleic chain are not measured here,
+    // so a DNA or RNA chain has no composition ceiling rather than one borrowed from protein - and
+    // `alanine` is null on its records, not a fraction of adenines.
+    const alanine = kind === "protein" ? alanineFraction(sequence) : null;
     // 🔴 THE GUARD IS ON WINNING, NOT ON CONTINUING. A cycle over the alanine
     // ceiling still runs and is still designed off; it just cannot be the
     // answer. Skipping it instead would end the run at its worst cycle.
@@ -285,9 +293,9 @@ export async function* runDesign(options) {
     if (cycle > 0 && typeof options.veto === "function") {
       vetoed = (await options.veto({ pdb: folded.pdb, confidence, sequence, cycle, run })) ?? null;
     }
-    const eligible = cycle > 0 && alanine <= MAX_ALANINE && vetoed === null;
+    const eligible = cycle > 0 && (alanine === null || alanine <= MAX_ALANINE) && vetoed === null;
     const record = {
-      run, cycle, sequence, alanine, objective, score: value, designScore, vetoed,
+      run, cycle, sequence, kind, alanine, objective, score: value, designScore, vetoed,
       // How many sequences this cycle tried, so a table can say what it cost.
       drawn: drawn.length,
       omit, alanineBias: bias, chainIndex, chain: chainLetter,

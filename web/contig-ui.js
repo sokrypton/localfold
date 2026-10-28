@@ -681,7 +681,9 @@ export function chainsOf(spans, options = {}) {
     // and draw a random mostly-X chain of the same length instead.
     const wholly = current.designed && held.length === 0 && !current.given;
     chains.push(wholly ? "" : text);
-    kinds.push(current.designed ? "protein" : current.polymer);
+    // 🔴 A DESIGNED CHAIN IS WHAT ITS SEGMENTS ARE MADE OF (2026-10-28): it was always protein here,
+    // whatever "Made of" said. A DNA or RNA one is designed by NA-MPNN (cpu/design/designers.js).
+    kinds.push(current.polymer);
     if (current.designed) {
       if (designedIndex >= 0) problems.push("Protein Hunter designs one chain at a time");
       designedIndex = index;
@@ -699,13 +701,20 @@ export function chainsOf(spans, options = {}) {
       continue;
     }
     if (span.kind === "generated") {
+      const polymer = span.polymer ?? "protein";
+      if (current.parts.length === 0) current.polymer = polymer;
+      else if (polymer !== current.polymer) {
+        problems.push("a chain cannot be part protein and part nucleic;"
+          + " put a chain break between them");
+      }
       current.designed = true;
       const length = number(span.min, 0);
       current.length += length;
       // 🔴 X IS WHAT THE LOOP FOLDS AND WHAT MPNN REWRITES. A designed span is
       // that many unknowns in the starting sequence; the loop only draws its own
       // when the whole chain is empty, so a mixed chain arrives already shaped.
-      current.parts.push({ text: "X".repeat(length), held: false });
+      // A nucleic chain's unknown is N, AF3's base-less nucleotide.
+      current.parts.push({ text: (polymer === "protein" ? "X" : "N").repeat(length), held: false });
       continue;
     }
     // ...a given span: its residues, held unless the user asked for them back
@@ -1166,9 +1175,10 @@ export function createContigList(rowsContainer, addControl, options = {}) {
             changed();
           });
           line("Structure", [secondary]);
-          line("Made of", [pick("What this segment is made of.",
-            [["protein", "protein"], ["rna", "RNA"], ["dna", "DNA"]], "polymer", span.polymer ?? "protein")]);
         }
+        // ...under both methods: Protein Hunter designs a DNA or RNA chain with NA-MPNN
+        line("Made of", [pick("What this segment is made of.",
+          [["protein", "protein"], ["rna", "RNA"], ["dna", "DNA"]], "polymer", span.polymer ?? "protein")]);
         if (number(span.max, 0) !== number(span.min, 0) && limits.range !== undefined) notes.push(limits.range);
         if ((String(span.name ?? "").trim() || String(span.secondary ?? "").trim()) && limits.labelled !== undefined) {
           notes.push(limits.labelled);

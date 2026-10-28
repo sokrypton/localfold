@@ -25,3 +25,11 @@ the Potts and trMRF features and are not mirrored.
 - `ops.js` — `e6dba9b79b1907f7`
 - `pdb.js` — `272fd67263d50a55`
 - `weights.js` — `0f92ee6e89b65966`
+
+## Local changes not in the upstream commit above
+
+🔴 The mirror had already drifted from `a80942f` before this note: `constants.js` re-exports `ATOM37`
+from `shared/af3/featurise/template-features.js` (a LocalFold path, so it cannot go upstream),
+`model.js` rewords a comment, and `pdb.js` carries `labelSeq`. A plain `sync-mpnn.py` would undo all
+three. One more, made here and on a local branch of sokrypton/mpnn on 2026-10-28 (not yet pushed):
+`pdb.js`'s `NUCLEIC` names AF3's unknown nucleotides `DN` and `N`.
