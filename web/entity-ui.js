@@ -667,7 +667,7 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
     // textarea would give a bond three rows of empty box in the middle of the
     // list.
     const oneLine = entity.type === "ligand" || entity.type === "smiles"
-      || entity.type === "bond" || entity.type === "pocket" || entity.type === "contact";
+      || entity.type === "bond" || entity.type === "crosslink" || entity.type === "pocket" || entity.type === "contact";
     const value = oneLine
       ? document.createElement("input")
       : document.createElement("textarea");
@@ -685,6 +685,11 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
       value.type = "text";
       value.placeholder = "A12:SG - B1:C25";
       value.setAttribute("aria-label", "Bond between two residues");
+    } else if (entity.type === "crosslink") {
+      // a crosslinker bonded to two residues as a ligand (af3x's crosslinks; shared/chem/crosslinkers.js)
+      value.type = "text";
+      value.placeholder = "DSSO: A2 - B30";
+      value.setAttribute("aria-label", "Crosslink: a crosslinker and the two residues it joined");
     } else if (entity.type === "pocket") {
       // a binder chain within a distance of listed residues (shared/af3/featurise/constraints.js): boltz2 and chai-1
       value.type = "text";
@@ -775,7 +780,8 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
         // so it no longer parsed. Both happened the moment the reader clicked
         // away from the box, silently rewriting what they had typed.
         entity.value = value.value.trim();
-      } else if (entity.type === "bond" || entity.type === "pocket" || entity.type === "contact") {
+      } else if (entity.type === "bond" || entity.type === "crosslink" || entity.type === "pocket"
+                 || entity.type === "contact") {
         // 🔴 TRIMMED AND NOTHING ELSE, FOR THE THIRD TIME AT THIS SEAM. (A constraint row too: the same spec syntax.) The
         // `else` below is `cleanSequence`, which keeps only amino-acid letters:
         // a contact typed as `A12:SG - B1:C25` came back `A:SGB:C` the moment

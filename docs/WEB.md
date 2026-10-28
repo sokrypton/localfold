@@ -3107,6 +3107,26 @@ uppercase a contact on screen the way it would a SMILES.
 which expands to the linker as a LIGAND plus two bonds - fits this row exactly
 (`DSSO A53 - C66`), and the parser leaves room for it, but it needs a table of
 linker codes and the atoms each attaches by. That is the next piece.
+## `crosslink`: a crosslinker as a bonded ligand row
+
+[af3x](https://github.com/KosinskiLab/af3x)'s idea, taken as af3-any-model takes it: a crosslinking mass-spec
+result folded as the crosslinker itself, covalently bonded to the two residues it joined, not as a distance.
+
+```
+Protein          AQVINTFDGV...
+Protein          KKAVINGEQI...
+Crosslink        DSSO: A27 - B21
+Crosslink        sulfo-SDA: A49 - B35
+```
+
+One row per pair. `expandEntities` turns each into a ligand - the crosslinker's reacted bridge, a built-in component
+(`shared/chem/crosslinkers.js`, generated from af3-any-model, so nothing is fetched and no `userCCD` is involved) -
+appended after every other ligand, and two `bond`s: an NHS-ester end to LYS NZ, SER OG, THR OG1, TYR OH or residue
+1's N, a diazirine end (the SDA family's second residue) to the residue's last side-chain atom. A residue carries
+one crosslink: two rows on one residue are refused, and a job file's later pair is dropped with a note, as af3x does.
+The job JSON is af3x's `crosslinks`, written back in the open dialect. Only the AlphaFold 3-lineage path reads
+bonds, so another model refuses the rows rather than fold a free-floating bridge.
+
 ## A second backend on the Colab runtime: JAX (af3-any-model), and the TPU it reaches
 
 The notebook's `jax_backend` box installs ColabFold2's JAX implementation beside

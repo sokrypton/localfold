@@ -14,6 +14,7 @@
 
 #include "ccd.h"
 #include "constraints.h"
+#include "crosslinks.h"
 #include "chem.h"
 #include "json.h"
 #include "jsnum.h"
@@ -201,8 +202,8 @@ inline std::optional<std::string> modificationProblem(const Modification& m, con
 // a SMILES ligand's heavy-atom count, or a refusal in the parser's words (set by the SMILES module)
 inline int SMILES_ATOM_COUNT(const std::string& smiles) { return (int)chem::parseSmiles(smiles).atoms.size(); }
 inline std::optional<std::string> entityProblem(const Entity& e) {
-  static const std::vector<std::string> types = {"protein", "dna", "rna", "ligand", "smiles", "bond", "pocket",
-                                                  "contact"};
+  static const std::vector<std::string> types = {"protein", "dna", "rna", "ligand", "smiles", "bond", "crosslink",
+                                                  "pocket", "contact"};
   if (std::find(types.begin(), types.end(), e.type) == types.end()) return "Unknown entity type " + e.type;
   if (e.type == "pocket") {
     if (!parsePocket(e.value))
@@ -211,10 +212,22 @@ inline std::optional<std::string> entityProblem(const Entity& e) {
   }
   if (e.type == "contact") {
     auto parsed = parseContact(e.value);
-    if (!parsed) return std::string("A distance is two residues and a bound, as A10 - B44 @ 8 (a ligand atom as B1:PG)");
+    if (!parsed) return std::string("A contact is two residues and a bound, as A10 - B44 @ 8 (a ligand atom as B1:PG)");
     if (parsed->token1.chain == parsed->token2.chain && parsed->token1.residue == parsed->token2.residue
         && parsed->token1.atom == parsed->token2.atom)
       return std::string("A contact joins two different tokens");
+    return std::nullopt;
+  }
+  if (e.type == "crosslink") {
+    auto parsed = parseCrosslink(e.value);
+    if (!parsed) return std::string("A crosslink is a crosslinker and two residues, as DSSO: A2 - B30");
+    if (crosslinker(parsed->name) == nullptr) {
+      std::string known;
+      for (auto& x : crosslinkerTable()) known += (known.empty() ? "" : ", ") + x.name;
+      return "Unknown crosslinker " + parsed->name + "; known: " + known;
+    }
+    if (parsed->from.chain == parsed->to.chain && parsed->from.residue == parsed->to.residue)
+      return std::string("A crosslink joins two different residues");
     return std::nullopt;
   }
   if (e.type == "bond") {
@@ -287,6 +300,17 @@ inline std::optional<std::string> entitiesProblem(const std::vector<Entity>& ent
     if (!p) continue;
     return entities.size() == 1 ? *p : "Entity " + std::to_string(i + 1) + ": " + *p;
   }
+  // a residue carries one crosslink (web/entities.js)
+  std::set<std::string> crosslinked;
+  for (auto& e : entities) {
+    if (e.type != "crosslink") continue;
+    auto parsed = parseCrosslink(e.value);
+    for (auto* end : {&parsed->from, &parsed->to}) {
+      std::string key = end->chain + std::to_string(end->residue);
+      if (crosslinked.count(key)) return "Residue " + key + " carries two crosslinks";
+      crosslinked.insert(key);
+    }
+  }
   return std::nullopt;
 }
 
@@ -319,7 +343,7 @@ inline Expanded expandEntities(const std::vector<Entity>& entities) {
   Expanded x;
   std::vector<std::pair<std::string, std::string>> smilesCodes;
   for (auto& e : entities) {
-    if (e.type == "bond" || e.type == "pocket" || e.type == "contact") continue;
+    if (e.type == "bond" || e.type == "crosslink" || e.type == "pocket" || e.type == "contact") continue;
     for (int copy = 0; copy < (int)e.copies; ++copy) {
       if (e.type == "protein" || e.type == "dna" || e.type == "rna") {
         for (auto& m : e.modifications) x.modifications.push_back({(int)x.chains.size(), m.position, upper(trimWs(m.code))});
@@ -358,12 +382,53 @@ inline Expanded expandEntities(const std::vector<Entity>& entities) {
     auto end = [&](const BondRowEnd& side) { return BondEnd{asymOf(side.chain), side.residue, side.hasAtom, side.atom}; };
     x.bonds.push_back({end(parsed->first), end(parsed->second)});
   }
-  // ...and the constraints, in row order (web/entities.js)
   auto letterAsym = [](const std::string& letters) {
     int total = 0;
     for (char c : letters) total = total * 26 + (c - 64);
     return total - 1;
   };
+  // the crosslinks after every other ligand, each bonded to its two residues (web/entities.js)
+  static const std::map<char, std::string> three = {
+      {'A', "ALA"}, {'R', "ARG"}, {'N', "ASN"}, {'D', "ASP"}, {'C', "CYS"}, {'Q', "GLN"}, {'E', "GLU"}, {'G', "GLY"},
+      {'H', "HIS"}, {'I', "ILE"}, {'L', "LEU"}, {'K', "LYS"}, {'M', "MET"}, {'F', "PHE"}, {'P', "PRO"}, {'S', "SER"},
+      {'T', "THR"}, {'W', "TRP"}, {'Y', "TYR"}, {'V', "VAL"}};
+  for (auto& e : entities) {
+    if (e.type != "crosslink") continue;
+    auto parsed = parseCrosslink(e.value);
+    const CrosslinkerEntry* xl = crosslinker(parsed->name);
+    int ligandAsym = (int)(x.chains.size() + x.ligands.size());
+    std::vector<BondEnd> ends;
+    int k = 0;
+    for (auto* side : {&parsed->from, &parsed->to}) {
+      int asym = letterAsym(side->chain);
+      std::string where = "crosslink " + parsed->name + ": " + side->chain + std::to_string(side->residue);
+      if (asym >= (int)x.chains.size() || x.chainKinds[asym] != "protein") throw Refusal(where + " is not a protein residue");
+      if (side->residue < 1 || side->residue > (int)x.chains[asym].size()) throw Refusal(where + " is past the chain's end");
+      std::string restype;
+      for (auto& m : x.modifications) if (m.chain == asym && m.position == side->residue) { restype = m.code; break; }
+      if (restype.empty()) {
+        auto it = three.find(x.chains[asym][side->residue - 1]);
+        restype = it == three.end() ? "UNK" : it->second;
+      }
+      std::string atom;
+      if ((k == 0 ? xl->end1 : xl->end2) == "nhs") {
+        if (auto* a = crosslinkLookup(crosslinkNhsAtoms(), restype)) atom = *a;
+        else if (side->residue == 1) atom = "N";
+        else throw Refusal(where + ": an NHS ester reacts with K, S, T, Y or the N-terminus, not " + restype);
+      } else {
+        auto* a = crosslinkLookup(crosslinkDiazirineAtoms(), restype);
+        if (a == nullptr) throw Refusal(where + ": no side-chain atom known for " + restype);
+        atom = *a;
+      }
+      ends.push_back(BondEnd{asym, side->residue, true, atom});
+      ++k;
+    }
+    LigandRef r; r.kind = LigandRef::Code; r.code = xl->code;
+    x.ligands.push_back(r);
+    x.bonds.push_back({ends[0], BondEnd{ligandAsym, 1, true, xl->attach1}});
+    x.bonds.push_back({ends[1], BondEnd{ligandAsym, 1, true, xl->attach2}});
+  }
+  // ...and the constraints, in row order (web/entities.js)
   auto resolved = [&](const ConstraintEnd& e) { return ResolvedEnd{letterAsym(e.chain), e.residue, e.hasAtom, e.atom}; };
   for (auto& e : entities) {
     if (e.type == "pocket") {
@@ -783,9 +848,7 @@ inline Job jobFromJson(const std::string& text, std::vector<std::vector<JobTempl
       if (!body.isObject()) refuse(where + ": expected {\"pocket\": {...}} or {\"contact\": {...}}");
       std::vector<std::string> allowed = kind == "pocket" ? std::vector<std::string>{"binder", "contacts", "maxDistance", "force"}
                                                           : std::vector<std::string>{"token1", "token2", "maxDistance", "force"};
-      for (auto& [k, v] : body.o)
-        if (std::find(allowed.begin(), allowed.end(), k) == allowed.end())
-          refuse(where + ": " + k + " is not a field of this entry");
+      checkKeys(body, allowed, where);
       const Json* d = body.get("maxDistance");
       if (Json::absent(d) || !d->isNumber() || !(d->n > 0)) refuse(where + ": maxDistance must be a positive number of Angstrom");
       if (const Json* f = body.get("force"); !Json::absent(f) && f->kind == Json::Bool && f->b)
@@ -809,6 +872,56 @@ inline Job jobFromJson(const std::string& text, std::vector<std::vector<JobTempl
         c.value = endText(*t1, where + " token1") + " - " + endText(*t2, where + " token2") + " @ " + jsNumber(d->n);
       }
       out.entities.push_back(c);
+    }
+  }
+  // ...and the crosslinks, af3x's `crosslinks`, one row per pair; a pair on a residue already crosslinked is dropped,
+  // and said (web/job-json.js)
+  if (const Json* list = job.get("crosslinks"); !Json::absent(list)) {
+    if (!list->isArray()) refuse("crosslinks: a list of {name, residue_pairs}");
+    std::set<std::string> used;
+    std::vector<std::string> dropped;
+    for (size_t index = 0; index < list->a.size(); ++index) {
+      std::string where = "crosslinks[" + std::to_string(index) + "]";
+      const Json& raw = list->a[index];
+      if (!raw.isObject()) refuse(where + ": expected {name, residue_pairs}");
+      checkKeys(raw, {"name", "residue_pairs"}, where);
+      const Json* name = raw.get("name");
+      if (Json::absent(name) || !name->isString()) refuse(where + ": name is the crosslinker's name");
+      if (crosslinker(name->s) == nullptr) refuse(where + ": unknown crosslinker " + name->s);
+      const Json* pairs = raw.get("residue_pairs");
+      if (Json::absent(pairs) || !pairs->isArray())
+        refuse(where + ": residue_pairs is a list of [[chain, residue], [chain, residue]]");
+      for (size_t p = 0; p < pairs->a.size(); ++p) {
+        std::string at = where + ".residue_pairs[" + std::to_string(p) + "]";
+        const Json& pair = pairs->a[p];
+        if (!pair.isArray() || pair.a.size() != 2) refuse(at + ": expected [[chain, residue], [chain, residue]]");
+        std::vector<std::string> ends;
+        for (auto& end : pair.a) {
+          if (!end.isArray() || end.a.size() != 2 || !end.a[1].isNumber() || !jsIsInteger(end.a[1].n) || end.a[1].n < 1)
+            refuse(at + ": expected [[chain, residue], [chain, residue]]");
+          std::string chain = jsString(&end.a[0]);
+          int asym = -1;
+          for (auto& [kk, v] : asymOfId) if (kk == chain) asym = v;
+          if (asym < 0) refuse(at + ": no chain \"" + chain + "\" in this job");
+          ends.push_back(pageLabel(asym) + jsNumber(end.a[1].n));
+        }
+        if (used.count(ends[0]) || used.count(ends[1])) {
+          dropped.push_back(name->s + " " + ends[0] + "-" + ends[1]);
+          continue;
+        }
+        used.insert(ends[0]);
+        used.insert(ends[1]);
+        Entity c;
+        c.type = "crosslink";
+        c.value = name->s + ": " + ends[0] + " - " + ends[1];
+        out.entities.push_back(c);
+      }
+    }
+    if (!dropped.empty()) {
+      std::string listed;
+      for (auto& d : dropped) listed += (listed.empty() ? "" : ", ") + d;
+      out.notes.push_back("dropped " + std::to_string(dropped.size()) + " crosslink" + (dropped.size() == 1 ? "" : "s")
+                          + " on a residue already crosslinked (" + listed + ")");
     }
   }
   if (const Json* n = job.get("name"); n != nullptr && n->isString()) out.name = n->s;

@@ -166,9 +166,11 @@ function pdbTemplate(batch) {
         (ligandCode === undefined ? "ATOM  " : "HETATM")
         + String(serial % 100000).padStart(5) + " "
         + (name.length < 4 ? ` ${name}`.padEnd(4) : name.slice(0, 4)) + " "
+        // (a residue name is three columns: a longer code - a crosslinker's XL-DSSO, a userCCD's own - is cut to
+        // them, or every column after it shifts and the record names the wrong chain)
         + (ligandCode
           ?? nucleicName(residueOf(token))?.padStart(3)
-          ?? THREE_LETTER[sequence[residueOf(token)]] ?? "UNK").padEnd(3)
+          ?? THREE_LETTER[sequence[residueOf(token)]] ?? "UNK").padEnd(3).slice(0, 3)
         + " " + chainLetter(token)
         // 🔴 residue_index IS ALREADY 1-BASED. Adding one here shifted the whole
         // chain by a residue, which against a helical protein reads as a 3.7 A

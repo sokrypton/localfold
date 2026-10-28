@@ -17,6 +17,7 @@
 import { startFromPdb } from "../shared/af3/structure/warm-start.js";
 import { ccdUrl, parseCcdComponent, ligandChain } from "../shared/af3/featurise/ccd-component.js";
 import { smilesComponent } from "../shared/chem/component.js";
+import { CROSSLINKER_COMPONENTS } from "../shared/chem/crosslinkers.js";
 import { af3BatchFromA3m } from "../shared/af3/featurise/batch.js";
 import { featuriserDialect, templatePolicyFor } from "../shared/af3/dialect.js";
 import { foldBatch, toPdb, atomName, warmTrunkPipelines }
@@ -383,6 +384,10 @@ export async function foldAf3(options) {
   // stay baked in reference-conformers.js, because every fold needs those.
   const componentCache = new Map();
   const component = async (code, what) => {
+    // a crosslinker's bridge is built in (shared/chem/crosslinkers.js), not a PDB entry
+    if (!componentCache.has(code) && CROSSLINKER_COMPONENTS[code] !== undefined) {
+      componentCache.set(code, parseCcdComponent(CROSSLINKER_COMPONENTS[code]));
+    }
     if (!componentCache.has(code)) {
       onStatus(`Fetching ${what} ${code}`);
       let response;

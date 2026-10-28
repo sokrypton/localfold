@@ -130,6 +130,19 @@ def cases():
                                        {"dna": {"id": "C", "sequence": "ACGTTGCA"}}, {"rna": {"id": "D", "sequence": "ACGUU"}}]),
          [], AF3_FAMILIES),
         ("msa-test", "af3", job("t", [protein("A", TEST_QUERY)]), ["--a3m=@test.a3m"], AF3_FAMILIES),
+        # af3x's crosslinks (shared/chem/crosslinkers.js): each pair a built-in bridge ligand bonded to its residues -
+        # NHS ends on K and the N-terminus, a diazirine end on a glycine, CDI's one carbon bonded twice, and a pair on
+        # an already crosslinked residue dropped with a note
+        ("crosslinks", "af3", job("t", [protein("A", "MKTAYIAKQRQISFVKSHFSRQ"), protein("B", "GSKELAAKLGKEAYEK"),
+                                        {"ligand": {"id": "C", "ccdCodes": ["GOL"]}}],
+                                  crosslinks=[{"name": "DSSO", "residue_pairs": [[["A", 2], ["B", 3]], [["A", 2], ["B", 8]]]},
+                                              {"name": "sulfo-SDA", "residue_pairs": [[["A", 1], ["B", 10]]]},
+                                              {"name": "CDI", "residue_pairs": [[["A", 8], ["B", 11]]]}]), [], AF3_FAMILIES),
+        ("crosslink-not-acylated", "af3", job("t", [protein("A", "MKTAYIAKQR"), protein("B", "GSKELAAK")],
+                                              crosslinks=[{"name": "DSS", "residue_pairs": [[["A", 4], ["B", 3]]]}]),
+         [], ["af3"]),
+        ("crosslink-unknown", "af3", job("t", [protein("A", "MKTAYIAKQR")],
+                                         crosslinks=[{"name": "EDC", "residue_pairs": [[["A", 2], ["A", 8]]]}]), [], ["af3"]),
         # (modified nucleotides at a chain's 5' end and side by side - openbind0 drops their leaving atoms at the ends
         # too and links only two atomised residues - and a standalone glycan, whose O1 AF3's rule drops)
         ("modified-ends", "af3", job("t", [protein("A", "MKTAYIAKQR"),

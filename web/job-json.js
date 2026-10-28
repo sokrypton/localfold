@@ -48,7 +48,9 @@
  * error names the field, because "unsupported job" sends the reader looking.
  */
 import { parseSmiles } from "../shared/chem/smiles.js";
-import { CONSTRAINT_TYPES, NUCLEIC_TYPES, entitiesProblem, parseBond, parsePocket, parseContact } from "./entities.js";
+import { CONSTRAINT_TYPES, NUCLEIC_TYPES, entitiesProblem, parseBond, parseCrosslink, parsePocket, parseContact }
+  from "./entities.js";
+import { crosslinker } from "../shared/chem/crosslinkers.js";
 import { userCcdCodes } from "../shared/af3/featurise/ccd-component.js";
 
 /**
@@ -72,7 +74,7 @@ export function jobRequestJson({ name, seed, entities }) {
   // ...and so does a ligand of several components, which the server's single
   // `ligand` code cannot hold.
   if ((entities ?? []).some((entity) => (entity.type === "smiles" || entity.type === "bond"
-    || CONSTRAINT_TYPES.includes(entity.type)
+    || entity.type === "crosslink" || CONSTRAINT_TYPES.includes(entity.type)
     || (entity.type === "ligand" && (entity.value ?? "").includes(",")))
     && (entity.value ?? "").trim() !== "")) {
     return openDialectJson({ name, seed, entities });
@@ -172,8 +174,9 @@ function openDialectJson({ name, seed, entities }) {
   for (const entity of entities ?? []) {
     const value = (entity.value ?? "").trim();
     if (value === "") continue;
-    // A bond is not a chain; it is written as `bondedAtomPairs`. A constraint is written as `constraints`.
-    if (entity.type === "bond" || CONSTRAINT_TYPES.includes(entity.type)) continue;
+    // A bond is not a chain; it is written as `bondedAtomPairs`. A constraint is written as `constraints`, a
+    // crosslink as `crosslinks`.
+    if (entity.type === "bond" || entity.type === "crosslink" || CONSTRAINT_TYPES.includes(entity.type)) continue;
     const id = idsFor(Math.max(1, Number(entity.copies) || 1));
     if (entity.type === "protein") {
       const modifications = (entity.modifications ?? [])
@@ -232,6 +235,16 @@ function openDialectJson({ name, seed, entities }) {
       }
     }
   }
+  // ...and the crosslinks, af3x's `crosslinks`: one entry per crosslinker, its pairs in row order
+  const crosslinks = [];
+  for (const entity of entities ?? []) {
+    if (entity.type !== "crosslink") continue;
+    const parsed = parseCrosslink(entity.value);
+    if (parsed === null) continue;
+    let entry = crosslinks.find((c) => c.name === parsed.name);
+    if (entry === undefined) crosslinks.push(entry = { name: parsed.name, residue_pairs: [] });
+    entry.residue_pairs.push([[parsed.from.chain, parsed.from.residue], [parsed.to.chain, parsed.to.residue]]);
+  }
   return `${JSON.stringify([{
     name,
     // 🔴 INTEGERS HERE WHERE THE SERVER DIALECT WANTS STRINGS.
@@ -239,6 +252,7 @@ function openDialectJson({ name, seed, entities }) {
     sequences,
     ...(bondedAtomPairs.length === 0 ? {} : { bondedAtomPairs }),
     ...(constraints.length === 0 ? {} : { constraints }),
+    ...(crosslinks.length === 0 ? {} : { crosslinks }),
     // 🔴 AND THE DIALECT IS NAMED EXPLICITLY, THOUGH THE HEADER ABOVE SAYS THE
     // OPEN ONE HAS NO `dialect` KEY. Upstream's rule - which `checkVersion`
     // implements - is that a job carries BOTH `dialect` and `version` or
@@ -852,6 +866,44 @@ export function jobFromJson(text) {
       entities.push({ type: "contact", copies: 1, modifications: [],
                       value: `${constraintEnd(body.token1, `${where} token1`)}`
                         + ` - ${constraintEnd(body.token2, `${where} token2`)} @ ${d}` });
+    }
+  }
+  // 🔴 AND THE CROSSLINKS, af3x's `crosslinks`, one row per pair with the page's letters. A residue carries one: as
+  // af3x (and af3-any-model's --remove_overlapping_crosslinks, its default) does, a pair touching a residue an
+  // earlier pair used is dropped - and said, here, rather than in a log nobody reads.
+  if (job.crosslinks !== undefined && job.crosslinks !== null) {
+    if (!Array.isArray(job.crosslinks)) refuse("crosslinks: a list of {name, residue_pairs}");
+    const used = new Set();
+    const dropped = [];
+    for (const [index, raw] of job.crosslinks.entries()) {
+      const where = `crosslinks[${index}]`;
+      if (raw === null || typeof raw !== "object") refuse(`${where}: expected {name, residue_pairs}`);
+      checkKeys(raw, ["name", "residue_pairs"], where);
+      if (typeof raw.name !== "string") refuse(`${where}: name is the crosslinker's name`);
+      if (crosslinker(raw.name) === null) refuse(`${where}: unknown crosslinker ${raw.name}`);
+      if (!Array.isArray(raw.residue_pairs)) refuse(`${where}: residue_pairs is a list of [[chain, residue], [chain, residue]]`);
+      for (const [p, pair] of raw.residue_pairs.entries()) {
+        const at = `${where}.residue_pairs[${p}]`;
+        if (!Array.isArray(pair) || pair.length !== 2) refuse(`${at}: expected [[chain, residue], [chain, residue]]`);
+        const ends = pair.map((end) => {
+          if (!Array.isArray(end) || end.length !== 2 || !Number.isInteger(end[1]) || end[1] < 1) {
+            refuse(`${at}: expected [[chain, residue], [chain, residue]]`);
+          }
+          const asym = asymOfId.get(String(end[0]));
+          if (asym === undefined) refuse(`${at}: no chain "${end[0]}" in this job`);
+          return `${letterOf.get(asym)}${end[1]}`;
+        });
+        if (ends.some((end) => used.has(end))) {
+          dropped.push(`${raw.name} ${ends.join("-")}`);
+          continue;
+        }
+        ends.forEach((end) => used.add(end));
+        entities.push({ type: "crosslink", value: `${raw.name}: ${ends[0]} - ${ends[1]}`, copies: 1, modifications: [] });
+      }
+    }
+    if (dropped.length > 0) {
+      notes.push(`dropped ${dropped.length} crosslink${dropped.length === 1 ? "" : "s"} on a residue already`
+        + ` crosslinked (${dropped.join(", ")})`);
     }
   }
   // ...and the letters go no further.

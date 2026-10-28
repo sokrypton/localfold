@@ -66,6 +66,9 @@ diffusion structure pair (diffusion.mm). Written on a Linux box with no Mac, so 
 then fold `tools/fixtures/constraints/contact.json` with `--model=boltz2` and with `--model=chai1` against the CUDA
 port's numbers before trusting it.
 
+A job's `crosslinks` (cuda/af3/README.md, Input) need nothing Metal-specific: the shared featuriser turns each into a
+built-in bridge ligand and two declared bonds, which the existing kernels already fold.
+
 ## Is it right? The gates
 
 The CUDA gates' cases, scored against crystals, with this Mac's baseline in `metal/<port>/gate-baseline.<chip>.json`

@@ -219,8 +219,11 @@ if (sequence !== "") {
     }
     console.log(`job: userCCD defines ${[...userComponents.keys()].join(", ")}`);
   }
+  const { CROSSLINKER_COMPONENTS } = await import(`${repo}/shared/chem/crosslinkers.js`);
   const ccd = async (code) => {
     if (userComponents.has(code.toUpperCase())) return userComponents.get(code.toUpperCase());
+    // a crosslinker's bridge is built in (web/af3-model.js)
+    if (CROSSLINKER_COMPONENTS[code] !== undefined) return parseCcdComponent(CROSSLINKER_COMPONENTS[code]);
     const response = await fetch(ccdUrl(code));
     if (!response.ok) throw new Error(`could not fetch ${code}: ${response.status}`);
     return parseCcdComponent(await response.text());

@@ -1,0 +1,64 @@
+{
+ "name": "barnase_barstar_crosslinks",
+ "modelSeeds": [
+  1
+ ],
+ "dialect": "alphafold3",
+ "version": 4,
+ "sequences": [
+  {
+   "protein": {
+    "id": "A",
+    "sequence": "AQVINTFDGVADYLQTYHKLPDNYITKSEAQALGWVASKGNLADVAPGKSIGGDIFSNREGKLPGKSGRTWREADINYTSGFRNSDRILYSSDWLIYKTTDHYQTFTKIR"
+   }
+  },
+  {
+   "protein": {
+    "id": "B",
+    "sequence": "KKAVINGEQIRSISDLHQTLKKELALPEYYGENLDALWDCLTGWVEYPLVLEWRQFEQSKQLTENGAESVLQVFREAKAEGCDITIILS"
+   }
+  }
+ ],
+ "crosslinks": [
+  {
+   "name": "DSSO",
+   "residue_pairs": [
+    [
+     [
+      "A",
+      27
+     ],
+     [
+      "B",
+      21
+     ]
+    ],
+    [
+     [
+      "A",
+      62
+     ],
+     [
+      "B",
+      1
+     ]
+    ]
+   ]
+  },
+  {
+   "name": "sulfo-SDA",
+   "residue_pairs": [
+    [
+     [
+      "A",
+      49
+     ],
+     [
+      "B",
+      35
+     ]
+    ]
+   ]
+  }
+ ]
+}

@@ -24,6 +24,8 @@
  */
 import { parseSmiles } from "../shared/chem/smiles.js";
 import { ligandName } from "../shared/chem/component.js";
+import { CROSSLINKERS, DIAZIRINE_ATOMS, NHS_ATOMS, crosslinker } from "../shared/chem/crosslinkers.js";
+import { THREE_LETTER } from "../shared/af3/structure/pdb.js";
 import { cleanSequence, nucleicProblem, sequenceProblem } from "./sequence.js";
 
 /** The entity types this page can actually fold. */
@@ -36,7 +38,7 @@ import { cleanSequence, nucleicProblem, sequenceProblem } from "./sequence.js";
  * looks like a three-letter code, so the row says.
  */
 export const ENTITY_TYPES = ["protein", "dna", "rna", "ligand", "smiles",
-                            "bond", "pocket", "contact"];
+                            "bond", "crosslink", "pocket", "contact"];
 
 /**
  * The row types that CONSTRAIN the fold rather than describe the molecule: a `pocket` (a binder chain to sit within a
@@ -151,10 +153,25 @@ export function parseContact(value) {
   return { token1, token2, maxDistance: parts.maxDistance };
 }
 
+/**
+ * A crosslink row's text, parsed - or null. af3x's `crosslinks` (a crosslinker bonded to the two residues it
+ * joined, as a ligand: shared/chem/crosslinkers.js), one pair per row:
+ *
+ *     DSSO: A2 - B30           an NHS ester at each end
+ *     sulfo-SDA: A16 - B20     the first residue the NHS end, the second the diazirine's
+ */
+export function parseCrosslink(value) {
+  const match = /^\s*([^:]+?)\s*:\s*([A-Za-z]+)\s*(\d+)\s*-\s*([A-Za-z]+)\s*(\d+)\s*$/.exec(String(value ?? ""));
+  if (match === null) return null;
+  return { name: match[1],
+           from: { chain: match[2].toUpperCase(), residue: Number(match[3]) },
+           to: { chain: match[4].toUpperCase(), residue: Number(match[5]) } };
+}
+
 /** How they are labelled, in the order the menu offers them. */
 export const ENTITY_LABELS = {
   protein: "Protein", dna: "DNA", rna: "RNA", ligand: "Ligand (CCD)",
-  smiles: "Ligand (SMILES)", bond: "Bond",
+  smiles: "Ligand (SMILES)", bond: "Bond", crosslink: "Crosslink",
   pocket: "Pocket (constraint)", contact: "Contact (constraint)",
 };
 
@@ -417,10 +434,21 @@ export function entityProblem(entity) {
   }
   if (entity.type === "contact") {
     const parsed = parseContact(entity.value);
-    if (parsed === null) return "A distance is two residues and a bound, as A10 - B44 @ 8 (a ligand atom as B1:PG)";
+    if (parsed === null) return "A contact is two residues and a bound, as A10 - B44 @ 8 (a ligand atom as B1:PG)";
     if (parsed.token1.chain === parsed.token2.chain && parsed.token1.residue === parsed.token2.residue
         && parsed.token1.atom === parsed.token2.atom) {
       return "A contact joins two different tokens";
+    }
+    return null;
+  }
+  if (entity.type === "crosslink") {
+    const parsed = parseCrosslink(entity.value);
+    if (parsed === null) return "A crosslink is a crosslinker and two residues, as DSSO: A2 - B30";
+    if (crosslinker(parsed.name) === null) {
+      return `Unknown crosslinker ${parsed.name}; known: ${Object.keys(CROSSLINKERS).join(", ")}`;
+    }
+    if (parsed.from.chain === parsed.to.chain && parsed.from.residue === parsed.to.residue) {
+      return "A crosslink joins two different residues";
     }
     return null;
   }
@@ -531,6 +559,18 @@ export function entitiesProblem(entities) {
     if (problem === null) continue;
     return entities.length === 1 ? problem : `Entity ${index + 1}: ${problem}`;
   }
+  // a residue carries one crosslink: a second would bond the same atom twice (af3x drops it; a job read from a file
+  // here has it dropped, with a note, and a row typed in is refused)
+  const crosslinked = new Set();
+  for (const entity of entities) {
+    if (entity.type !== "crosslink") continue;
+    const parsed = parseCrosslink(entity.value);
+    for (const end of [parsed.from, parsed.to]) {
+      const key = `${end.chain}${end.residue}`;
+      if (crosslinked.has(key)) return `Residue ${key} carries two crosslinks`;
+      crosslinked.add(key);
+    }
+  }
   // 🔴 A LIGAND ON ITS OWN IS A FOLD, and this used to refuse one. AF3 accepts
   // a ligand-only job and so does the featuriser: the chain identity helpers
   // reject a zero-length sequence, rightly, but they are only read inside the
@@ -574,7 +614,7 @@ export function expandEntities(entities) {
   for (const entity of entities) {
     // 🔴 A CONTACT IS NOT A CHAIN, and the `else` below would make it a LIGAND.
     // Handled after the loop, once the chains it names exist. Nor is a constraint.
-    if (entity.type === "bond" || CONSTRAINT_TYPES.includes(entity.type)) continue;
+    if (entity.type === "bond" || entity.type === "crosslink" || CONSTRAINT_TYPES.includes(entity.type)) continue;
     for (let copy = 0; copy < entity.copies; copy += 1) {
       if (POLYMER_TYPES.includes(entity.type)) {
         for (const modification of entity.modifications ?? []) {
@@ -653,10 +693,41 @@ export function expandEntities(entities) {
     });
     bonds.push({ from: end(parsed.from), to: end(parsed.to) });
   }
-  // ...and the constraints, resolved to the same asym numbers (shared/af3/featurise/constraints.js), in row order:
-  // boltz2 writes its pockets before its contacts and later writes win, which the featuriser keeps.
   const letterAsym = (letter) => letter.split("").reduce(
     (total, character) => total * 26 + (character.charCodeAt(0) - 64), 0) - 1;
+  // 🔴 THE CROSSLINKS AFTER EVERY OTHER LIGAND, one ligand chain per row (af3-any-model appends them to the job's
+  // sequences the same way), each bonded to its two residues: an NHS-ester end to K NZ / S OG / T OG1 / Y OH or
+  // residue 1's N, a diazirine end to the residue's last side-chain atom (shared/chem/crosslinkers.js).
+  for (const entity of entities) {
+    if (entity.type !== "crosslink") continue;
+    const parsed = parseCrosslink(entity.value);
+    const xl = crosslinker(parsed.name);
+    const ligandAsym = chains.length + ligandCodes.length;
+    const ends = [parsed.from, parsed.to].map((side, k) => {
+      const asym = letterAsym(side.chain);
+      const where = `crosslink ${parsed.name}: ${side.chain}${side.residue}`;
+      if (asym >= chains.length || chainKinds[asym] !== "protein") throw new Error(`${where} is not a protein residue`);
+      if (side.residue < 1 || side.residue > chains[asym].length) throw new Error(`${where} is past the chain's end`);
+      const modified = modifications.find((m) => m.chain === asym && m.position === side.residue);
+      const restype = modified?.code ?? THREE_LETTER[chains[asym][side.residue - 1]] ?? "UNK";
+      let atom;
+      if (xl.ends[k] === "nhs") {
+        atom = NHS_ATOMS[restype] ?? (side.residue === 1 ? "N" : undefined);
+        if (atom === undefined) {
+          throw new Error(`${where}: an NHS ester reacts with K, S, T, Y or the N-terminus, not ${restype}`);
+        }
+      } else {
+        atom = DIAZIRINE_ATOMS[restype];
+        if (atom === undefined) throw new Error(`${where}: no side-chain atom known for ${restype}`);
+      }
+      return { asym, residue: side.residue, atom };
+    });
+    ligandCodes.push(xl.code);
+    ends.forEach((residueEnd, k) => bonds.push({ from: residueEnd,
+                                                 to: { asym: ligandAsym, residue: 1, atom: xl.attach[k] } }));
+  }
+  // ...and the constraints, resolved to the same asym numbers (shared/af3/featurise/constraints.js), in row order:
+  // boltz2 writes its pockets before its contacts and later writes win, which the featuriser keeps.
   const constraintEndOf = (end) => ({ asym: letterAsym(end.chain), residue: end.residue,
                                       ...(end.atom === null ? {} : { atom: end.atom }) });
   const constraints = [];

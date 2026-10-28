@@ -58,8 +58,8 @@ inline std::vector<std::string> splitNonEmpty(const std::string& s, char sep) { 
   return out;
 }
 
-// the job's userCCD (each data_ block a component), then a local CCD when one is named (--ccd), else the RCSB
-// through the cache
+// the job's userCCD (each data_ block a component), then a built-in crosslinker bridge, then a local CCD when one is
+// named (--ccd), else the RCSB through the cache
 struct ComponentSource {
   std::map<std::string, Component> user;
   std::string file;                  // --ccd=<components.cif[.gz]>
@@ -78,6 +78,7 @@ struct ComponentSource {
   Component get(const std::string& code) const {
     auto it = user.find(upper(code));
     if (it != user.end()) return it->second;
+    if (const std::string* block = crosslinkerComponent(code)) return parseCcdComponent(*block);   // crosslinks.h
     return parseCcdComponent(file.empty() ? ccdText(code) : ccdFileText(file, code));
   }
 };

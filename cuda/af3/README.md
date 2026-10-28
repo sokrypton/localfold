@@ -79,8 +79,28 @@ depends on a pair's class and distance alone, so it is a table of a few rows the
 weights, added on the device after the kernels that build the pair (`cuda/af3/src/constraints.cuh`) - a job without
 constraints folds exactly as before. Measured on af3-any-model's four constraint cases
 (`tools/fixtures/constraints/`): the features identical to its own, and each site's term against its own at
-1e-7 to 1.3e-6 (the f32 path, `LOCALFOLD_SAVE_SEAMS`). On the page they are the **Pocket** and **Distance** rows
+1e-7 to 1.3e-6 (the f32 path, `LOCALFOLD_SAVE_SEAMS`). On the page they are the **Pocket** and **Contact** rows
 (`B: A9, A12, A16 @ 6`, `A41 - B1:PG @ 8`).
+
+**Crosslinks** - [af3x](https://github.com/KosinskiLab/af3x)'s `crosslinks`, as af3-any-model takes them: each pair
+becomes the crosslinker itself, a ligand covalently bonded to the two residues it joined, rather than a distance:
+
+```json
+"crosslinks": [{"name": "DSSO", "residue_pairs": [[["A", 27], ["B", 21]]]}, {"name": "sulfo-SDA", "residue_pairs": [[["A", 49], ["B", 35]]]}]
+```
+
+An NHS-ester end bonds LYS NZ, SER OG, THR OG1, TYR OH or residue 1's N; a diazirine end (the SDA family, a pair's
+second residue) the residue's last side-chain atom. The bridges are built in (`shared/chem/crosslinkers.js`,
+generated from af3-any-model's definitions, which are written from each crosslinker's public structure, not af3x's
+files; `cuda/featurise/crosslinkers.inc` is generated from it), so a job needs no `userCCD`. A residue carries one: a
+pair on a residue already crosslinked is dropped, with a note, as af3x's default does. Nothing is model-specific -
+each crosslinker is a ligand plus two `bondedAtomPairs`, appended after the job's own ligands, and featurised byte
+for byte as the page does (`tools/check-native-featuriser.py`, the `crosslinks` cases) and as af3-any-model does
+(the same tokens and bonded token pairs). On the page it is the **Crosslink** row (`DSSO: A27 - B21`).
+Folded (`tools/fixtures/crosslinks/barnase_barstar.json`, Boltz-2, no MSA, one sample): the crosslinked residues'
+CA-CA go from 12.4 / 45.6 / 33.1 A unlinked to 18.5 / 14.9 / 14.6 A, ipTM from 0.09 to 0.22, but only 3 of the 6
+residue-bridge bonds close under 2 A (WebGPU's int5 fold alike, `tools/gpu/fold-crosslinks.js`). A bond is a
+declared feature, not a hard constraint: as af3x notes, crosslinks the model cannot satisfy together get broken.
 
 **Or flags**, for the common cases:
 

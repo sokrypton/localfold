@@ -4744,7 +4744,13 @@ async function fold(event) {
     // never looks at the rows, so this is the one place that can say so before any download.
     if ((request.constraints ?? []).length > 0 && family !== "boltz2" && family !== "chai1") {
       throw new Error(`${MODEL_LABELS[family] ?? family} was not trained with pocket or contact constraints;`
-        + " choose Boltz-2 or Chai-1, or remove the pocket and distance rows");
+        + " choose Boltz-2 or Chai-1, or remove the pocket and contact rows");
+    }
+    // ...and a crosslink is a ligand BONDED to two residues: only the AlphaFold 3-lineage path reads the bonds, so
+    // elsewhere it would fold a free-floating bridge
+    if (entities.some((entity) => entity.type === "crosslink") && !isAf3Family(family)) {
+      throw new Error(`${MODEL_LABELS[family] ?? family} does not take covalent bonds, which a crosslink is;`
+        + " choose an AlphaFold 3-lineage model, or remove the crosslink rows");
     }
     // 🔴 THE TERMS ARE ASKED BEFORE THE DOWNLOAD, NOT BEFORE THE PAGE. AF3's
     // parameters carry DeepMind's own terms, and the moment they apply is the
