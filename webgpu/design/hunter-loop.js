@@ -145,6 +145,16 @@ export function withChain(chains, index, sequence) {
  *   The reason lands on the record as `vetoed`.
  * @param {number} [options.beam=1] how many sequences to sample per cycle. Each
  *   is folded and the best carries forward, so this multiplies the folds.
+ * @param {(previous: string, folded: string) => number} [options.drift] how far a
+ *   cycle's fold has moved from the previous cycle's, in angstroms - the caller's,
+ *   as `veto` is, since the loop parses no structures. Recorded on every design
+ *   cycle as `drift` when given.
+ * @param {{within: number, tries: number, from?: number}} [options.accept] hold
+ *   the run to its own history: draw up to `tries` sequences one at a time and
+ *   keep the FIRST whose fold is within `within` angstroms of the previous
+ *   cycle's (by `drift`), or the closest of them if none is. Applies from cycle
+ *   `from` (2: cycle 1 designs off cycle 0's mostly-X guess, which it should
+ *   leave). Replaces `beam`'s best-of-N rather than combining with it.
  * @param {"protein"|"dna"|"rna"} [options.kind="protein"] what the designed chain is made of: its
  *   starting letters, and whether the alanine ceiling applies (a protein's alone - see below)
  * @param {number} [options.seed=0]
@@ -173,6 +183,19 @@ export async function* runDesign(options) {
   const temperature = options.temperature ?? 0.1;
   const beam = Math.max(1, Math.floor(options.beam ?? 1));
   const standingOmit = options.omit ?? "C";
+  // 🔴 HISTORY, AS AN ACCEPTANCE TEST (2026-10-28). Nothing tied a cycle to the one before it but
+  // the backbone MPNN read, so a redesign could fold to a different structure and, scoring better,
+  // carry the run off - drift the sequence alone cannot resist. `accept` asks each candidate's fold
+  // to stay near the previous cycle's, and the beam becomes the budget for finding one that does.
+  const accept = options.accept ?? null;
+  if (accept !== null) {
+    if (typeof options.drift !== "function") throw new TypeError("accept needs a drift function");
+    if (!(accept.within > 0) || !(accept.tries >= 1)) {
+      throw new RangeError(`accept wants within > 0 and tries >= 1 (got ${accept.within}, ${accept.tries})`);
+    }
+    if ((options.beam ?? 1) > 1) throw new Error("accept replaces beam; pass one or the other");
+  }
+  const acceptFrom = accept?.from ?? 2;
   const kind = options.kind ?? "protein";
 
   let sequence = chains[chainIndex] ?? "";
@@ -197,6 +220,22 @@ export async function* runDesign(options) {
     throwIfAborted(signal);
 
     // Cycle 0 folds the starting sequence; every later cycle designs first.
+    const accepting = accept !== null && cycle >= acceptFrom;
+    // One sequence off the previous cycle's structure.
+    const designOne = async (draw) => {
+      const designed = await design(previous.pdb, {
+        chain: chainLetter, temperature, omit, alanineBias: bias, random, signal,
+        cycle, run, draw, kind,
+        // 🔴 PASSED STRAIGHT THROUGH, because WHICH positions are held is the
+        // caller's question and not the loop's: a framework, a motif, or
+        // nothing. The loop's only stake is that it is the same every cycle -
+        // held residues that moved between cycles would make the trajectory
+        // meaningless.
+        hold: options.hold,
+      });
+      throwIfAborted(signal);
+      return designed;
+    };
     let designScore;
     let bias;
     let omit;
@@ -218,19 +257,8 @@ export async function* runDesign(options) {
       // different sequences for the SAME backbone, which is the thing worth
       // searching over. The reference's method is a beam of one.
       const candidates = [];
-      for (let draw = 0; draw < beam; draw += 1) {
-        const designed = await design(previous.pdb, {
-          chain: chainLetter, temperature, omit, alanineBias: bias, random, signal,
-          cycle, run, draw, kind,
-          // 🔴 PASSED STRAIGHT THROUGH, because WHICH positions are held is the
-          // caller's question and not the loop's: a framework, a motif, or
-          // nothing. The loop's only stake is that it is the same every cycle -
-          // held residues that moved between cycles would make the trajectory
-          // meaningless.
-          hold: options.hold,
-        });
-        throwIfAborted(signal);
-        candidates.push(designed);
+      if (!accepting) {
+        for (let draw = 0; draw < beam; draw += 1) candidates.push(await designOne(draw));
       }
       drawn = candidates;
     }
@@ -241,7 +269,27 @@ export async function* runDesign(options) {
     // likes is not the same as a sequence that folds to the target.
     let folded;
     let picked = null;
-    if (drawn.length <= 1) {
+    let drift;
+    let accepted = null;
+    if (accepting) {
+      // ...one at a time, so a run stops drawing the moment a candidate stays put
+      let closest = null;
+      for (let draw = 0; draw < accept.tries; draw += 1) {
+        const candidate = await designOne(draw);
+        const attempt = await fold(withChain(chains, chainIndex, candidate.sequence),
+          { cycle, run, draw, draws: accept.tries, signal });
+        throwIfAborted(signal);
+        const moved = options.drift(previous.pdb, attempt.pdb);
+        drawn.push(candidate);
+        if (closest === null || moved < closest.moved) closest = { moved, candidate, attempt };
+        if (moved <= accept.within) break;
+      }
+      sequence = closest.candidate.sequence;
+      designScore = closest.candidate.score;
+      folded = closest.attempt;
+      drift = closest.moved;
+      accepted = drift <= accept.within;
+    } else if (drawn.length <= 1) {
       sequence = drawn.length === 1 ? drawn[0].sequence : sequence;
       designScore = drawn[0]?.score;
       folded = await fold(withChain(chains, chainIndex, sequence), { cycle, run, signal });
@@ -261,6 +309,10 @@ export async function* runDesign(options) {
       folded = picked.attempt;
     }
 
+    // ...and how far it moved, measured for every design cycle the caller can measure
+    if (drift === undefined && cycle > 0 && typeof options.drift === "function") {
+      drift = options.drift(previous.pdb, folded.pdb);
+    }
     const confidence = folded.confidence ?? {};
     const { value, objective } = objectiveOf(confidence, chainIndex);
     // 🔴 A PROTEIN'S RULE, AND AN A IN DNA IS ADENINE (2026-10-28). Poly-alanine is MPNN's answer to
@@ -298,6 +350,9 @@ export async function* runDesign(options) {
       run, cycle, sequence, kind, alanine, objective, score: value, designScore, vetoed,
       // How many sequences this cycle tried, so a table can say what it cost.
       drawn: drawn.length,
+      // How far its fold moved from the previous cycle's, and whether that was within `accept`
+      // (null where no acceptance test applied).
+      drift, accepted,
       omit, alanineBias: bias, chainIndex, chain: chainLetter,
       complex: withChain(chains, chainIndex, sequence),
       pdb: folded.pdb,

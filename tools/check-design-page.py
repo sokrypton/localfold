@@ -232,8 +232,9 @@ def main():
         if first["rows"] != 1 or first["blocks"] != ["100"] or first["contig"] != "design 100":
             bad.append(f"the blank job is {first['rows']} rows, blocks {first['blocks']}, {first['contig']!r};"
                        " expected one designed 100-residue chain")
-        if first["columns"] != 5:
-            bad.append(f"{first['columns']} result columns under Protein Hunter, expected 5")
+        # Run, Cycle, Folded by, Objective, Moved, Validity
+        if first["columns"] != 6:
+            bad.append(f"{first['columns']} result columns under Protein Hunter, expected 6")
         if first["otherMethodShown"] or first["hunterShown"] != ["folderGroup", "cyclesGroup"]:
             bad.append(f"the controls on screen are not Protein Hunter's: RFD4's {first['otherMethodShown']},"
                        f" Hunter's {first['hunterShown']}")
@@ -467,8 +468,8 @@ def main():
             bad.append(f"the line does not describe the job to Hunter: {page['contig']!r}")
         if page["presets"] < 11:
             bad.append(f"the preset picker lists {page['presets']} entries, expected 10 plus the blank")
-        if page["columns"] != 5:
-            bad.append(f"{page['columns']} result columns under Hunter, expected 5")
+        if page["columns"] != 6:
+            bad.append(f"{page['columns']} result columns under Hunter, expected 6")
         if page["conditionsShown"]:
             bad.append("RFD4-Proteina's constraints are on screen under Protein Hunter, which takes none")
 
@@ -644,8 +645,8 @@ def main():
             # 🔴 EXACTLY ONE BEST ROW, five cells wide. "At least one" passed
             # happily while three rows carried the marker, because each had been
             # the leader when it was drawn.
-            if len(hunted["best"]) != 5:
-                bad.append(f"expected exactly one best row of 5 cells, got {len(hunted['best'])} cells:"
+            if len(hunted["best"]) != 6:
+                bad.append(f"expected exactly one best row of 6 cells, got {len(hunted['best'])} cells:"
                            f" {hunted['best']}")
             # 🔴 THE LOOP'S OWN RULE, CHECKED THROUGH THE PAGE: cycle 0 is the
             # mostly-X draw the run STARTED from, so it must never be the best

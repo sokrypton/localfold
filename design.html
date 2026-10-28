@@ -153,6 +153,14 @@ The style IS index.html's: py2Dmol's light application CSS plus web/localfold.cs
                             <input type="number" id="cycles" min="1" max="50" value="5"
                                 title="How many fold-then-redesign rounds each run does.">
                         </div>
+                        <!-- 🔴 HISTORY (2026-10-28): blank is the reference's method. Set, each cycle draws up
+                             to "Sequences" designs one at a time and keeps the first whose fold stays this
+                             close to the cycle before (web/hunt.js, `accept`). -->
+                        <div class="fetch-option-group" id="stayGroup">
+                            <label class="fetch-option-title" for="stay-within">Stay within (Å)</label>
+                            <input type="number" id="stay-within" min="0.5" max="20" step="0.5" placeholder="off"
+                                title="Hold each cycle near the one before: try up to Sequences designs and keep the first whose fold moved less than this many angstroms (or the closest). Blank: the reference's method, one design a cycle, free to drift.">
+                        </div>
 
                         <!-- The automatic designer is right in every measured case (docs/DESIGN.md
                              section 6); the select stays at "auto" for web/hunt.js and a driver. -->

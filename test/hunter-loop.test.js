@@ -1,3 +1,4 @@
+import assert from "node:assert/strict";
 import { describe, expect, it } from "./harness.js";
 import { MAX_ALANINE, objectiveOf, runDesign, withChain } from "../webgpu/design/hunter-loop.js";
 
@@ -245,5 +246,43 @@ describe("objectiveOf", () => {
   it("falls back to pLDDT when there is no interface at all", () => {
     expect(objectiveOf({ meanPlddt: 82, iptm: Number.NaN, chainPairIptm: {} }, 0))
       .toEqual({ value: 0.82, objective: "plddt" });
+  });
+});
+
+describe("runDesign holding a run to its own history (accept)", () => {
+  // fold n returns PDB-n; drift reads the distance this table gives each fold
+  const run = async (moves, extra = {}) => {
+    const s = stubs({ sequences: moves.map((_, i) => `SEQ${i}`) });
+    const records = await collect({
+      ...twoChains(), cycles: 3, fold: s.fold, design: s.design,
+      drift: (_previous, folded) => moves[Number(folded.slice(4))] ?? 0,
+      ...extra,
+    });
+    return { s, records };
+  };
+
+  it("keeps the first candidate that stays within, and draws no more", async () => {
+    // folds: 0 cycle 0 | 1 cycle 1 (exempt) | 2,3 cycle 2 (5 A, then 1 A) | 4 cycle 3 (0.5 A)
+    const { s, records } = await run([0, 9, 5, 1, 0.5], { accept: { within: 2, tries: 3 } });
+    expect(s.folds.map((f) => f.cycle)).toEqual([0, 1, 2, 2, 3]);
+    expect(records[1].accepted).toBe(null);
+    expect(records[1].drift).toBe(9);
+    expect([records[2].drawn, records[2].drift, records[2].accepted]).toEqual([2, 1, true]);
+    expect(records[2].sequence).toBe("SEQ2");
+    expect([records[3].drawn, records[3].accepted]).toEqual([1, true]);
+  });
+
+  it("keeps the closest when no candidate stays within", async () => {
+    const { records } = await run([0, 0, 7, 4, 6, 0], { accept: { within: 2, tries: 3 } });
+    expect([records[2].drawn, records[2].drift, records[2].accepted]).toEqual([3, 4, false]);
+    expect(records[2].sequence).toBe("SEQ2");
+  });
+
+  it("measures drift without holding to it, and refuses a beam beside it", async () => {
+    const { records } = await run([0, 3, 4, 5]);
+    expect(records.map((r) => r.drift)).toEqual([undefined, 3, 4, 5]);
+    expect(records.every((r) => r.accepted === null)).toBe(true);
+    await assert.rejects(run([0], { accept: { within: 2, tries: 2 }, beam: 2 }), /accept replaces beam/);
+    await assert.rejects(run([0], { accept: { within: 2, tries: 2 }, drift: undefined }), /needs a drift/);
   });
 });

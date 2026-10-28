@@ -24,6 +24,7 @@ import { CHAIN_IDS, runDesign } from "../webgpu/design/hunter-loop.js";
 import { designChain, loadDesigner } from "../cpu/design/mpnn-bridge.js";
 import { chooseDesigner, DESIGNERS, NUCLEIC_KINDS } from "../cpu/design/designers.js";
 import { contactProblem } from "../cpu/design/contact.js";
+import { selfConsistency } from "../cpu/design/validate.js";
 import { FOLDERS } from "./validate-design.js";
 
 /** The folding models this driver can actually run, and what each is in af3-model's terms. */
@@ -57,6 +58,8 @@ export { FOLDERS } from "./validate-design.js";
  * @param {number} [options.cycles=5]
  * @param {number} [options.length=75] the designed chain's length
  * @param {number} [options.beam=1] how many sequences each cycle tries
+ * @param {{within: number, tries: number, from?: number}} [options.accept] hold each cycle
+ *   to the previous one's fold: see runDesign. Its `tries` is the budget `beam` would be.
  * @param {Iterable<number>} [options.hold] positions within the designed chain
  *   to keep as they are - a framework, a motif - every cycle
  * @param {Record<string, number[]>} [options.hotspots] per chain, residues the
@@ -151,7 +154,9 @@ export async function hunt(options) {
   // 🔴 THE BEAM MULTIPLIES THE WORK, so the bar has to count the folds and not
   // the cycles: at four sequences a cycle a bar counting cycles sits still for
   // four folds and then jumps.
-  const total = runs * (1 + cycles * beam);
+  // ...and under `accept` the most a cycle can draw is its tries (it usually stops sooner)
+  const perCycle = options.accept === undefined ? beam : options.accept.tries;
+  const total = runs * (1 + cycles * perCycle);
   const spanOf = (done, fraction) => 0.1 + 0.9 * ((done + fractionOf(fraction)) / total);
 
   const all = [];
@@ -180,6 +185,15 @@ export async function hunt(options) {
       hold: runHold,
       beam,
       kind,
+      // 🔴 HOW FAR A CYCLE'S DESIGNED CHAIN MOVED: its C-alphas against the previous cycle's,
+      // superposed on itself - the fold's shape, wherever the target put it. Every cycle of a run
+      // is one length, so a mismatch is a bug and refused, never a large number.
+      drift: (previous, folded) => {
+        const { rmsd, comparable } = selfConsistency(previous, folded, CHAIN_IDS[chainIndex]);
+        if (!comparable) throw new Error("two cycles of one run folded different lengths");
+        return rmsd;
+      },
+      ...(options.accept === undefined ? {} : { accept: options.accept }),
 
       // 🔴 THE CONTACT CHECK, WHICH IS HOW AN EPITOPE REACHES PROTEIN HUNTER AT
       // ALL. It cannot condition on hotspots the way RFD4 does, so the only way
@@ -199,8 +213,8 @@ export async function hunt(options) {
       seed: (options.seed ?? 0) + run,
 
       fold: async (sequence, context) => {
-        const cycleStart = context.cycle === 0 ? 0 : 1 + (context.cycle - 1) * beam;
-        const done = context.run * (1 + cycles * beam) + cycleStart + (context.draw ?? 0);
+        const cycleStart = context.cycle === 0 ? 0 : 1 + (context.cycle - 1) * perCycle;
+        const done = context.run * (1 + cycles * perCycle) + cycleStart + (context.draw ?? 0);
         // 🔴 WHICH MODEL FOLDS THIS CYCLE, AND WHY IT ROTATES BY CYCLE RATHER
         // THAN BY RUN. A design has to satisfy several models instead of
         // overfitting one, which only happens if the model CHANGES UNDER the

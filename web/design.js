@@ -112,7 +112,7 @@ const methodNote = element("method-note");
 
 /** Results' columns, by method: a hunt's cycles, or a generation's designs. */
 function paintResultsHead() {
-  const names = method.value === "hunter" ? ["Run", "Cycle", "Folded by", "Objective", "Validity"]
+  const names = method.value === "hunter" ? ["Run", "Cycle", "Folded by", "Objective", "Moved", "Validity"]
     : ["Design", "Seed", "Size", "Refold"];
   element("results-head").replaceChildren(...names.map((name) => {
     const th = document.createElement("th");
@@ -260,6 +260,15 @@ const folders = element("folders");
 const folderNote = element("folder-note");
 const beam = element("beam");
 
+/** The "Stay within" distance, or null when it is blank - the reference's method. */
+function stayWithin() {
+  const text = document.getElementById("stay-within")?.value.trim() ?? "";
+  if (text === "") return null;
+  const within = Number(text);
+  if (!(within > 0)) throw new Error(`Stay within must be a distance in angstroms, not ${text}`);
+  return within;
+}
+
 /**
  * What the schedule will actually cost, in folds.
  *
@@ -279,9 +288,13 @@ const paintCost = () => {
     folderNote.classList.remove("warn");
     return;
   }
-  folderNote.textContent = sequences === 1
-    ? `${folds} folds: one sequence a cycle, the reference's method.`
-    : `${folds} folds: ${sequences} sequences a cycle, and the best carries forward.`;
+  const within = stayWithin();
+  folderNote.textContent = within !== null
+    ? `Up to ${folds} folds: up to ${sequences} sequences a cycle, keeping the first that stays within`
+      + ` ${within} Å of the cycle before - it stops sooner when one does.`
+    : sequences === 1
+      ? `${folds} folds: one sequence a cycle, the reference's method.`
+      : `${folds} folds: ${sequences} sequences a cycle, and the best carries forward.`;
   folderNote.classList.toggle("warn", folds > 40);
 };
 
@@ -492,7 +505,7 @@ element("random-seed").addEventListener("click", () => {
   element("seed").value = String(draw[0] % 1000000);
   say(`seed ${element("seed").value} - press Design for a new design`);
 });
-for (const id of ["beam", "cycles", "runs"]) element(id).addEventListener("input", paintCost);
+for (const id of ["beam", "cycles", "runs", "stay-within"]) element(id).addEventListener("input", paintCost);
 paintCost();
 paintAdvanced();
 // 🔴 AN ARROW, NOT THE FUNCTION ITSELF: `paintMethod` is declared below this
@@ -519,6 +532,7 @@ const UNUSED_BY = {
   rfd4p: {
     folderGroup: "RFD4-Proteina generates structure directly, so nothing folds it in a loop.",
     cyclesGroup: "RFD4-Proteina has no fold-and-redesign cycle to repeat.",
+    stayGroup: "RFD4-Proteina has no cycle to hold to the one before.",
     runsGroup: "RFD4-Proteina generates once; run it again for another sample.",
     temperatureGroup: "RFD4-Proteina does not sample a sequence with a temperature.",
     omitGroup: "RFD4-Proteina has no designer to forbid letters to.",
@@ -663,9 +677,15 @@ const drawCycle = (record) => {
   // second place for the number to go stale.
   const vetoed = overAlanine || typeof record.vetoed === "string";
   if (vetoed) row.classList.add("rejected");
+  // How far the cycle's designed chain moved from the previous cycle's, and - holding a run to its
+  // history - how many sequences it took and whether any stayed within (web/hunt.js `accept`)
+  const moved = !Number.isFinite(record.drift) ? "—"
+    : `${record.drift.toFixed(1)} Å`
+      + (record.drawn > 1 ? ` · ${record.drawn} tries` : "")
+      + (record.accepted === false ? " · none within" : "");
   for (const [text, className] of [
     [String(record.run + 1), ""], [String(record.cycle), ""],
-    [record.folder ?? "—", ""], [objective, ""],
+    [record.folder ?? "—", ""], [objective, ""], [moved, ""],
     [overAlanine ? `${alanine} — over the ${Math.round(MAX_ALANINE * 100)}% ceiling`
       : (record.vetoed ?? alanine), "validity"],
   ]) {
@@ -1228,7 +1248,10 @@ const startHunt = async () => {
       contents: contentsOf(spans),
       runs: number("runs", 1),
       cycles: number("cycles", 5),
-      beam: number("beam", 1),
+      // 🔴 "STAY WITHIN" TURNS THE SEQUENCES COUNT INTO A BUDGET: up to that many a cycle, one at a
+      // time, the first that keeps its fold near the cycle before winning - not the best of all.
+      ...(stayWithin() === null ? { beam: number("beam", 1) }
+        : { beam: 1, accept: { within: stayWithin(), tries: Math.max(1, number("beam", 1)) } }),
       // 🔴 THE FOLD'S DIFFUSION STEPS, which ran at the sampler's default and
       // were not reachable from this page at all.
       steps: number("steps", HUNTER_STEPS),
