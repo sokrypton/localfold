@@ -1455,6 +1455,8 @@
 .design-layout { display: grid; grid-template-columns: minmax(360px, 420px) minmax(0, 1fr); gap: 16px; align-items: start;
   --viewer-height: max(420px, calc(100vh - 210px)); }
 .design-steps { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+/* full screen is the two columns (design.html): the page's background, and the steps scroll in it */
+.design-layout:fullscreen { background: #f9fafb; padding: 8px 16px; overflow-y: auto; }
 /* 🔴 THE PICTURE STAYS IN VIEW while the steps scroll past it: the stage sticks to the top, and a
    run's table and downloads scroll in their own box under the viewer (.design-below) - the stage
    scrolling as a whole let the viewer be scrolled away, and the canvas then took the wheel back as
