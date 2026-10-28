@@ -101,6 +101,41 @@ LN + q/k/v/gate is one pass too (`gridInK` at 64 channels), and its output proje
 (`projAdd64K`) where a GEMM with an f32 output ran an epilogue pass over the whole MSA. Together ~7% of a 261-residue
 fold on the A100.
 
+## 8. Mol-1: a ninth AF3-lineage model, and NOT YET ON metal (2026-10-28)
+
+Mol-1 (Molence Bio, `--family=mol1`; af3-any-model's `mol1-port` branch, blob `mol1/mol1.int8.bin.zst` at HF
+1b41e333) folds natively in CUDA (3b98f446, a85cb169) and on the page (b0743630). metal/af3 does not have it: written
+on Linux, untestable there, and a blind edit to the emitted-norm chain would break eight models on the Mac to add one.
+What metal needs, each with its CUDA twin:
+
+1. **The weight walk is already done** - cuda/featurise/af3_weights.h is shared, and with `--family=mol1` it emits
+   `trunk.pairMixerBlocks.k.*` (pairformer blocks with NO `pairAttention1/2`), `trunk.pairformerBlocks.k.*` at the narrow
+   width, `trunk.trunkPairChannels` (320) and `trunk.trunkPairIn` / `trunk.trunkPairOut` (448x320, 320x448, no bias).
+   Add `"trunk.pairMixerBlocks."` to `prepareWeights`' stack list (weights.mm) so its blocks get `blockWeights`.
+2. **A block with no grid attention** (pairtrack.mm `pairUpdatesT`): skip both `gridAttention` calls when
+   `M.has(pre + ".pairAttention1.heads")` is false, and point the incoming triangle's emitted norm at
+   `pre + ".pairTransition.inputLayerNorm"` instead of `pairAttention1.actNorm` (cuda: pairtrack.cuh `pairUpdates`).
+3. **The split trunk** (trunk.mm `runTrunk`, cuda: trunk.cuh `runTrunk`): after the MSA stack, the PairMixer blocks on the
+   448 pair; then `narrow = pair W_in` (every pair row, written not added), the 40 pairformer blocks on `narrow` at
+   C = 320, then `pair = narrow W_out`. Seams: `trunk_in_pair` / `trunk_out_pair` are the NARROW pair, and
+   `trunk_in_single` is taken AFTER the PairMixer (that is where the reference taps them). The half-pair stack works as
+   it does for every other model - both widths are multiples of 8.
+4. 🔴 **THE SINGLE TRANSITION'S GATED ACTIVATION OVERFLOWS f16** (`singleTransitionF32` in dialect.js). Measured on
+   CUDA's f32 path, 6MRR: in pairformer block 35 the widening peaks at 273 but `silu(a) * b` reaches **6.43e4 on the
+   first pass and 6.61e4 on the second** - so in f16 one pass folds and every pass after is NaN everywhere. metal's
+   `transitionT` stores `g` in half (`gemmSwiglu`), so it WILL hit this. Only `g` needs headroom: either a float `g`
+   for this flag, or `g` stored scaled (x 1/4 in the SwiGLU epilogue, `alpha` 4 on transition2). CUDA runs the whole
+   transition in f32 (n rows). Mol-1 itself runs its trunk in bf16 autocast, which never meets it.
+5. **Its scores** (`protenixScores`, protenix2 too; `rebuildCterminalOxygens`, mol1): a single chain's ipTM 0, the ranking
+   0.8 ipTM + 0.2 pTM - 100 has_clash with no disorder term, has_clash over polymer chain PAIRS, and each chain's last
+   O/OXT rebuilt on the written coordinates (cuda/af3/src/scores.cuh `hasClashChainPairs`, `writtenCoordinates`).
+
+To check it, with the CUDA port's oracles (made on the A100: af3-any-model at f32 on the int8 blob, 6MRR on its own
+batch): `oracle-dumps/af3-batch-mol1-6mrr.json`, `af3-oracle-{trunk,denoise,stages,confidence}-mol1.json` - copy them
+over, `node cuda/af3/export-model.mjs <dir> --no-weights --family=mol1 --oracle-model=mol1`, and the metal binary on that
+directory. CUDA's numbers there: every trunk seam 5.7e-8 to 1.3e-6, denoise 1.4e-6, confidence 1e-7 to 8e-7; 6MRR from
+its sequence 1.45-1.53 A over five seeds, pLDDT ~88.
+
 ## What did not transfer from `metal` to CUDA (measured on the A100)
 
 | `metal` idea | CUDA |
