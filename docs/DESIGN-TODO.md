@@ -550,3 +550,24 @@ ITS REFOLD** (8.7-19 A in every arm, ipTM <= 0.53): six cycles is too few for th
 the drift fix is general and nothing about design quality. **A monomer converges by itself** (under
 1 A by cycle 4 cold); warm 10 costs it a little objective (0.87/0.84/0.91 -> 0.83/0.80/0.79) and its
 refolds all pass (0.9-1.2 A against cold's 0.5-1.9). Warm 10 from cycle 2 stays the default.
+
+**More diffusion steps (2026-10-28) make it worse, not better.** The same three targets and seeds at
+100 and 200 steps against 25 (the page's Diffusion steps, Advanced), the reference and warm 10. Refold
+ipTM / RMSD, seeds 0-2:
+
+| target | steps | reference | warm 10 |
+|---|---|---|---|
+| 5O45 | 25 | 0.285/1.32 · 0.359/2.05 · 0.603/6.80 | 0.307/1.73 · 0.610/1.84 · 0.708/6.41 |
+| 5O45 | 100 | 0.582/12.6 · 0.172/14.4 · 0.421/18.4 | 0.540/19.1 · 0.282/11.3 · 0.650/17.4 |
+| 5O45 | 200 | 0.212/6.82 · 0.388/6.91 · 0.172/2.41 | 0.427/7.10 · 0.141/13.9 · 0.264/1.08 |
+| PD-L1 | 100 | 0.680/1.36 · none · none | 0.719/2.83 · none · none |
+| PD-L1 | 200 | none · 0.473/11.5 · 0.588/2.56 | none · none · 0.168/13.0 |
+| monomer | 100 | 2.17 · 0.85 · 0.93 | 0.91 · 8.14 · 1.59 |
+| monomer | 200 | 0.37 · 0.41 · 0.83 | 1.32 · 2.74 · 0.46 |
+
+"none": no cycle was eligible - every design missed all 3 of PD-L1's hotspots, 7 runs of 12 here
+against 0 of 9 at 25 steps. 🔴 **THE BINDER MOVES MORE WITH MORE STEPS**: warm 10 held 5O45 at
+2-4.5 A a cycle at 25 and lets it move 6-18 at 200 (seeds 1, 2), the reference 10-54. The likely
+cause, not yet tested: the sampler's churn (gamma 0.8 above sigma 1, webgpu/af3/diffusion/diffusion-
+sampler.js) re-noises EVERY step to 1.8x its level, so a warm walk from 10 A takes more fresh noise
+the more steps it is cut into. The monomer converges either way. 25 steps stays the default.
