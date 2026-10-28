@@ -304,12 +304,11 @@ export const MODEL_BUNDLES = {
   // Mol-1 (Molence Bio, Apache 2.0): Protenix-2's model at a 448-channel pair, with eight PairMixer blocks and a
   // 320-channel trunk between two width adapters (shared/af3/dialect.js MOL1).
   //
-  // 441 tensors at int5 group 32, 415 MiB. 🔴 NOT PUBLISHED YET: `remote` is null, so the site build drops the option
-  // and a checkout with the local export folds with it.
+  // 441 tensors at int5 group 32 in 24 shards, 415 MiB.
   mol1: {
     model: "mol1",
     directory: "./model-mol1-int5/",
-    remote: null,
+    remote: "https://huggingface.co/sokrypton/localfold/resolve/ea83c1a888b61216b353186a324b21422f62abf0/mol1-int5/",
     release: "mol1-int5",
     variable: "LOCALFOLD_INCLUDE_MOL1_MODEL",
     load: () => import("./mol1.js"),
