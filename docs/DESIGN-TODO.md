@@ -439,7 +439,7 @@ shared tokens store an RNA base as the DNA one) and the bridge reads them back i
 residue name (`baseLetter`: DT is U in an RNA chain). The alanine ceiling is a protein rule and does
 not apply - the results table shows the strand's GC share instead. Two fixes it needed: NA-MPNN's
 parser did not know AF3's `DN`/`N`, so a strand of unknowns came back one letter long (hand-applied
-to the mirror, which had already diverged, and committed on a local branch of sokrypton/mpnn - see
+to the mirror, which had already diverged, and sokrypton/mpnn#4 upstream - see
 cpu/design/mpnn/SOURCE.md); and the contact veto parsed protein only, so a nucleic chain was
 invisible to it - a binder against DNA alone had nothing to touch and was never checked. It reads
 DNA and RNA now, each pair at its calibrated cutoff (10 A nucleic-protein, 9 nucleic-nucleic).
