@@ -39,6 +39,7 @@ import { DeferredValidation } from "../../runtime/validation.js";
 /** The same values as a Float32Array, without copying one that already is. */
 const asFloats = (values) =>
   (values instanceof Float32Array ? values : Float32Array.from(values));
+import { boltz2ContactTable } from "../../../shared/af3/featurise/constraints.js";
 import { tmPerBinFor, tmScoreD0 } from "../../../shared/heads/tm-score.js";
 // 🔴 THE ONE THING THIS FILE SHARES WITH THE CPU REFERENCE, and it is a
 // STATISTIC rather than a kernel: rf3's confidence inputs are normalised on the
@@ -591,6 +592,8 @@ const W_RELPOS: u32 = ${reembedOffsets.relPosProject}u;
 const W_BOND: u32 = ${reembedOffsets.tokenBondsProject}u;
 const W_BOND_TYPE: u32 = ${reembedOffsets.tokenBondsTypeEmbed}u;
 const W_CONTACT: u32 = ${reembedOffsets.contactEncodingUnspecified}u;
+${shape.contactTable === true ? `const CONTACT_INDEX: u32 = ${2 * tokens * tokens}u;
+const CONTACT_TABLE: u32 = ${3 * tokens * tokens}u;` : ""}
 const W_PROD_OUT: u32 = ${reembedOffsets.sToZProdOut}u;
 const W_DGRAM: u32 = ${reembedOffsets.distogramFeatProject}u;
 const MAX_RELATIVE_IDX: i32 = ${MAX_RELATIVE_IDX};
@@ -716,7 +719,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
       + weights[W_RELPOS + row_c * C_Z + c]
       + bond * weights[W_BOND + c]
       + weights[W_BOND_TYPE + bond_row * C_Z + c]
-      + weights[W_CONTACT + c]
+      + ${shape.contactTable === true ? "bonds[CONTACT_TABLE + u32(bonds[CONTACT_INDEX + row]) * C_Z + c]" : "weights[W_CONTACT + c]"}
       + right_at(i, c) + left_at(j, c)
       + keep * weights[W_DGRAM + dbin * C_Z + c];
     if (same_entity) { value += weights[W_RELPOS + row_entity * C_Z + c]; }
@@ -736,7 +739,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
       + weights[W_RELPOS + row_c * C_Z + c]
       + bond * weights[W_BOND + c]
       + weights[W_BOND_TYPE + bond_row * C_Z + c]
-      + weights[W_CONTACT + c]
+      + ${shape.contactTable === true ? "bonds[CONTACT_TABLE + u32(bonds[CONTACT_INDEX + row]) * C_Z + c]" : "weights[W_CONTACT + c]"}
       + right_at(i, c) + left_at(j, c)
       + keep * weights[W_DGRAM + dbin * C_Z + c];
     if (same_entity) { value += weights[W_RELPOS + row_entity * C_Z + c]; }
@@ -1189,7 +1192,10 @@ export class Af3ConfidenceHeadGpu {
                     preSymmetrisedPde: dialect?.preSymmetrisedPde === true,
                     // rf3's 40-bin CA-CA embedding; see caDistogramFeatures.
                     confidenceCaDgram: dialect?.confidenceCaDgram === true,
-                    absentTerms: absent !== null && weights.reembed === undefined };
+                    absentTerms: absent !== null && weights.reembed === undefined,
+                    // (boltz2's pocket and contact constraints: the re-embed's contact term from a table, as the
+                    // trunk embedder's - constraints.js boltz2ContactTable, with this site's own weights)
+                    contactTable: reembedding && input.contactConditioning !== undefined };
     const sources = createConfidenceShaders(
       shape, reembedding ? {} : embedPacked.offsets, headPacked.offsets, epsilon, variance,
       reembedding ? embedPacked.offsets : null);
@@ -1204,7 +1210,8 @@ export class Af3ConfidenceHeadGpu {
       + `:cz${pairChannels}:cs${singleChannels}:tf${targetFeatWidth}`
       + `:re${reembedding}:hn${headPacked.offsets.logitsLnScale !== undefined}`
       + `:sh${headPacked.offsets.interHalfDistanceLogits !== undefined}`
-      + `:ps${shape.preSymmetrisedPde}:cd${shape.confidenceCaDgram}:ab${shape.absentTerms}`;
+      + `:ps${shape.preSymmetrisedPde}:cd${shape.confidenceCaDgram}:ab${shape.absentTerms}`
+      + `:ct${shape.contactTable}`;
     // Compiled together, not one after another: the browser builds them in
     // parallel, and a serial loop put every one of them on a cold fold's path.
     const compiled = Object.fromEntries(await Promise.all(Object.entries(sources).map(
@@ -1302,9 +1309,20 @@ export class Af3ConfidenceHeadGpu {
         const features = keep(this.allocator.upload("af3-conf.features", featureData, storage));
         // Two planes: the contact flag, then the bond ORDER - the same layout
         // the embedder's binding uses.
-        const bondData = new Float32Array(pairs * 2);
+        // ...and with a constraint, each pair's table row and the table (see the trunk embedder's binding)
+        const r = weights.reembed;
+        const table = shape.contactTable ? boltz2ContactTable(input.contactConditioning, input.contactThreshold, {
+          fourierWeights: r.contactFourierWeights, fourierBias: r.contactFourierBias,
+          encoderWeights: r.contactEncoderWeights, encoderBias: r.contactEncoderBias,
+          unspecified: r.contactEncodingUnspecified, unselected: r.contactEncodingUnselected,
+        }) : null;
+        const bondData = new Float32Array(pairs * (table === null ? 2 : 3) + (table?.table.length ?? 0));
         if (input.bondMatrix !== undefined) bondData.set(input.bondMatrix, 0);
         if (input.bondOrderMatrix !== undefined) bondData.set(input.bondOrderMatrix, pairs);
+        if (table !== null) {
+          bondData.set(table.index, 2 * pairs);
+          bondData.set(table.table, 3 * pairs);
+        }
         const bonds = keep(this.allocator.upload("af3-conf.bonds", bondData, storage));
         const rebuiltPair = keep(this.allocator.allocate(
           "af3-conf.re-pair", pairs * pairChannels * 4,

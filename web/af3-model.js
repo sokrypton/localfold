@@ -453,6 +453,9 @@ export async function foldAf3(options) {
     // different answer, and this literal is exactly the kind that loses a key.
     ...(options.bonds === undefined || options.bonds.length === 0
       ? {} : { bonds: options.bonds }),
+    // ...and its pocket and contact constraints (expandEntities' `constraints`), read by boltz2 and chai-1 alone
+    ...(options.constraints === undefined || options.constraints.length === 0
+      ? {} : { constraints: options.constraints, modelName: options.weights.trunk.dialect.name ?? "this model" }),
     // 🔴 THE BOND MATRIX IS PART OF THE MODEL, NOT OF THE MOLECULE. AF3 sets
     // contact[i][j] from the CCD's bond table alone; the OpenFold3 lineage was
     // trained with both directions set, and a ring ligand folded through the

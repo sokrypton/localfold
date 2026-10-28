@@ -1,0 +1,58 @@
+{
+ "name": "contact",
+ "modelSeeds": [
+  1
+ ],
+ "sequences": [
+  {
+   "protein": {
+    "id": "A",
+    "sequence": "GSWKELAAKLAKEAAEKGDPEVAKRALELAKKAAEEGDPELAKKAAELAKKA",
+    "modifications": [],
+    "unpairedMsa": ">q\nGSWKELAAKLAKEAAEKGDPEVAKRALELAKKAAEEGDPELAKKAAELAKKA\n",
+    "pairedMsa": "",
+    "templates": []
+   }
+  },
+  {
+   "protein": {
+    "id": "B",
+    "sequence": "MQIFVKTLTGKTITLEVEPSDTIENVKAKIQDKEGIPPDQQRLIFAGKQLEDGRTLSDYNIQKESTLHLVLRLRGG",
+    "modifications": [],
+    "unpairedMsa": ">q\nMQIFVKTLTGKTITLEVEPSDTIENVKAKIQDKEGIPPDQQRLIFAGKQLEDGRTLSDYNIQKESTLHLVLRLRGG\n",
+    "pairedMsa": "",
+    "templates": []
+   }
+  }
+ ],
+ "dialect": "alphafold3",
+ "version": 3,
+ "constraints": [
+  {
+   "contact": {
+    "token1": [
+     "A",
+     10
+    ],
+    "token2": [
+     "B",
+     44
+    ],
+    "maxDistance": 8.0
+   }
+  },
+  {
+   "contact": {
+    "token1": [
+     "A",
+     30
+    ],
+    "token2": [
+     "B",
+     8
+    ],
+    "maxDistance": 12.0
+   }
+  }
+ ]
+}

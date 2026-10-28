@@ -3,6 +3,7 @@
 // depend on the noise level is prepared once a fold; a denoiser call runs every in-flight sample (NS) as one batch.
 #include "../../cuda/af3/src/rigid.cuh"   // rigidAlign (plain C++), boltz2's realign
 #include "af3.h"
+#include "constraint_tables.h"
 #include <cmath>
 #include <algorithm>
 #include <map>
@@ -89,6 +90,8 @@ static void prepareConditioning(const float* trunkSingle, const float* trunkPair
                                entityRank, symRank, W(P + ".structurePairWeights"), W(P + ".structurePairBias"),
                                M.has("batch.declaredBondMatrix") ? M.f("batch.declaredBondMatrix") : nullptr, W(P + ".structureBondWeights"), f2, p0, r,
                                (uint)n, (uint)Czt, (uint)Cz, 0});
+      // ...and a job's pocket and contact constraints, through the structure half's restraint rows 149..162
+      addChai1Constraints(f2, r, p0, Cz, width, Czt, "chai.structure", P + ".structurePairWeights", 149);
     } else if (!split && !relpe) {
       run1d("af3_pair_features", r * width, PairFeatArgs{trunkPair, relIdx(), f2, p0, r, (uint)n, (uint)Czt});
     } else {

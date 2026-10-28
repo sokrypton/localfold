@@ -181,6 +181,13 @@ kernel void af3_relenc(LF_ARGS(RelEncArgs)) {
   if (sameEntity) v += a.W[(positionBins * 2) * a.C + c];
   a.pair[t] += v;
 }
+// a job's pocket and contact constraints: each row's term from a table of a few (metal/af3/constraints.h)
+kernel void af3_add_table(LF_ARGS(AddTableArgs)) {
+  ulong t = LF_INDEX;
+  if (t >= a.rows * a.C) return;
+  ulong row = t / a.C; uint c = (uint)(t - row * a.C);
+  a.out[row * a.stride + a.offset + c] += a.table[(ulong)a.index[a.p0 + row] * a.C + c];
+}
 kernel void af3_bond_embed(LF_ARGS(BondEmbedArgs)) {
   ulong t = LF_INDEX;
   if ((a.C & 3) == 0) {

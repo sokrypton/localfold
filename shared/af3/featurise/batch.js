@@ -8,6 +8,7 @@
 import { af3MsaFromA3m } from "./msa-features.js";
 import { featuriseProtein } from "./featurise.js";
 import { applyChaiMsa } from "./chai-msa.js";
+import { applyConstraints } from "./constraints.js";
 
 /**
  * A sequence plus an A3M, as the batch AF3's graph is actually fed.
@@ -176,6 +177,9 @@ export function af3BatchFromA3m(sequence, alignment, options = {}) {
       batch.msaMask.fill(0); batch.profile.fill(0); batch.deletionMean.fill(0);
     }
   }
+  // 🔴 THE JOB'S POCKET AND CONTACT CONSTRAINTS, built on the finished batch as the family's own featuriser builds them,
+  // or refused by a family trained on neither (constraints.js). `constraints` are resolved: asym numbers, not letters.
+  applyConstraints(batch, options.constraints, options.constraintFamily ?? null, options.modelName);
   // 🔴 HOW MANY ROWS A TRUNK PASS READS (AF3's num_msa), drawn afresh each pass from the pool above by the trunk
   // (shared/af3/msa-draw.js). The pool no longer depends on the seed or on this number; the trunk's draw does.
   batch.numMsa = options.maxSequences ?? 1024;

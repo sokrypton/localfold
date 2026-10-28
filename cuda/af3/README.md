@@ -60,6 +60,28 @@ components), modified residues and bases, declared covalent bonds (`bondedAtomPa
 templates carried inline, `userCCD`, and `modelSeeds` (every seed is folded). All fourteen of AlphaFold 3's own
 example jobs fold (`tools/fixtures/af3-jobs/`).
 
+**Pocket and contact constraints** - af3-any-model's `constraints` (its docs/input.md), read by the two models trained
+on them, Boltz-2 and chai-1; every other model refuses a job that carries one:
+
+```json
+"constraints": [
+  {"pocket": {"binder": "B", "contacts": [["A", 9], ["A", 12], ["A", 16]], "maxDistance": 6.0}},
+  {"contact": {"token1": ["A", 41], "token2": ["B", 1, "PG"], "maxDistance": 8.0}}
+]
+```
+
+A pocket asks the binder chain to sit within `maxDistance` of each listed residue; a contact asks two tokens to
+(a residue, or a ligand's atom - Boltz-2 only). `force` (Boltz's sampler steering) is refused. The features are
+af3-any-model's `_boltz2_constraints` / `_chai1_constraints`, built on the finished batch
+(`cuda/featurise/constraints.h`, the twin of `shared/af3/featurise/constraints.js`): Boltz-2's contact conditioning
+at its trunk and confidence sites, chai-1's two distance restraints at its trunk and diffusion pair. Each site's term
+depends on a pair's class and distance alone, so it is a table of a few rows the host builds from the site's own
+weights, added on the device after the kernels that build the pair (`cuda/af3/src/constraints.cuh`) - a job without
+constraints folds exactly as before. Measured on af3-any-model's four constraint cases
+(`tools/fixtures/constraints/`): the features identical to its own, and each site's term against its own at
+1e-7 to 1.3e-6 (the f32 path, `LOCALFOLD_SAVE_SEAMS`). On the page they are the **Pocket** and **Distance** rows
+(`B: A9, A12, A16 @ 6`, `A41 - B1:PG @ 8`).
+
 **Or flags**, for the common cases:
 
 | flag | |

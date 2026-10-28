@@ -35,6 +35,7 @@ import { GpuBufferAllocator } from "../../runtime/allocator.js";
 import { deviceTuning } from "../../runtime/device-profile.js";
 import { pipelineCacheForDevice } from "../../runtime/pipeline-cache.js";
 import { SOURCES, carriesTensor } from "../../../shared/weights/weight-sources.js";
+import { boltz2ContactTable } from "../../../shared/af3/featurise/constraints.js";
 
 const GRID_WIDTH = 32_768;
 const MAX_RELATIVE_IDX = 32;
@@ -148,6 +149,8 @@ const W_PREV_SINGLE: u32 = ${offsets.prevSingleEmbedding}u;
 const W_BOND: u32 = ${offsets.bondEmbedding}u;
 ${offsets.tokenBondsTypeEmbed === undefined ? "" : `const W_BOND_TYPE: u32 = ${offsets.tokenBondsTypeEmbed}u;
 const W_CONTACT_UNSPECIFIED: u32 = ${offsets.contactEncodingUnspecified}u;`}
+${shape.contactTable === true ? `const CONTACT_INDEX: u32 = ${2 * tokens * tokens}u;
+const CONTACT_TABLE: u32 = ${3 * tokens * tokens}u;` : ""}
 ${offsets.boltz2DnMsa === undefined ? "" : `const W_DN_MSA: u32 = ${offsets.boltz2DnMsa}u;`}
 
 fn clamp_bin(value: i32, high: i32) -> i32 { return min(max(value, 0), high); }
@@ -378,7 +381,7 @@ ${overPairThread((b) => `  {
     pair[base + c] = left[i * C_Z + c] + right[j * C_Z + c] + recycled_${b}${shape.recycleDropout === true ? " * drop_factor(row, c)" : ""} + relative_total
       + bond_val * weights[W_BOND + c]
 ${offsets.tokenBondsTypeEmbed === undefined ? "" : `      + weights[bond_type_row + c]
-      + weights[W_CONTACT_UNSPECIFIED + c]`};
+      + ${shape.contactTable === true ? "bonds[CONTACT_TABLE + u32(bonds[CONTACT_INDEX + row]) * C_Z + c]" : "weights[W_CONTACT_UNSPECIFIED + c]"}`};
   }`)}` : `  for (var c = local; c < C_Z; c += 64u) {
     var recycled = 0.0;
     for (var k = 0u; k < C_Z; k += 1u) {
@@ -410,7 +413,7 @@ ${offsets.tokenBondsTypeEmbed === undefined ? "" : `      + weights[bond_type_ro
       + bonds[row] * weights[W_BOND + c]
 ${offsets.tokenBondsTypeEmbed === undefined ? "" : `      + weights[W_BOND_TYPE
           + u32(clamp(i32(bonds[PAIRS + row]), 0, 6)) * C_Z + c]
-      + weights[W_CONTACT_UNSPECIFIED + c]`};
+      + ${shape.contactTable === true ? "bonds[CONTACT_TABLE + u32(bonds[CONTACT_INDEX + row]) * C_Z + c]" : "weights[W_CONTACT_UNSPECIFIED + c]"}`};
   }`}
 }`;
 
@@ -612,7 +615,9 @@ export class Af3EmbedderGpu {
                       || (weights.dialect.msaPairedQueryRowAligned === true && sequences > 1))
                       && input.msaQueryDrawn !== false,
                     // (protenix's MC dropout on the recycled term, this pass: {key, threshold, scale} - fold.js)
-                    recycleDropout: input.recycleDropout !== undefined };
+                    recycleDropout: input.recycleDropout !== undefined,
+                    // (boltz2's pocket and contact constraints: the per-pair term read from a table - see below)
+                    contactTable: hasBondTypes(weights) && input.contactConditioning !== undefined };
     const sources = createEmbedderShaders(shape, packed.offsets, epsilon, variance,
                                           options.relative ?? "gather");
     const key = `af3-embed:${tokens}:${sequences}:${featureWidth}:${pairChannels}`
@@ -626,7 +631,9 @@ export class Af3EmbedderGpu {
       // ...and boltz2's DN row, a term in the source likewise
       + `:dn${hasDnRow(weights)}`
       // ...and protenix's MC dropout, which binds an eighth buffer and multiplies the recycled term
-      + `:md${shape.recycleDropout}`;
+      + `:md${shape.recycleDropout}`
+      // ...and boltz2's constraint table, which replaces the unspecified constant's read in the source
+      + `:ct${shape.contactTable}`;
     // Compiled together, not one after another: the browser builds them in
     // parallel, and a serial loop put every one of them on a cold fold's path.
     const compiled = Object.fromEntries(await Promise.all(Object.entries(sources).map(
@@ -689,12 +696,25 @@ export class Af3EmbedderGpu {
       // exist for one dialect - and the second plane is PAIRS floats, which is
       // the same upload the first already is.
       const bondTypes = hasBondTypes(weights);
+      // 🔴 AND, WITH A POCKET OR CONTACT CONSTRAINT, TWO MORE: each pair's row of the constraint table, then the
+      // table - boltz2's contact conditioning, whose term depends on a pair's (class, distance) alone, so the few
+      // distinct ones are computed on the host from this site's weights (constraints.js boltz2ContactTable). The
+      // table's rows are WHOLE terms: they replace the unspecified constant, which is row 0 of an unconstrained one.
       const bondMatrix = keep(this.allocator.upload("af3-embed.bonds", (() => {
         const contact = input.bondMatrix ?? new Float32Array(pairs);
         if (!bondTypes) return contact;
-        const packed = new Float32Array(pairs * 2);
+        const table = shape.contactTable ? boltz2ContactTable(input.contactConditioning, input.contactThreshold, {
+          fourierWeights: weights.contactFourierWeights, fourierBias: weights.contactFourierBias,
+          encoderWeights: weights.contactEncoderWeights, encoderBias: weights.contactEncoderBias,
+          unspecified: weights.contactEncodingUnspecified, unselected: weights.contactEncodingUnselected,
+        }) : null;
+        const packed = new Float32Array(pairs * (table === null ? 2 : 3) + (table?.table.length ?? 0));
         packed.set(contact, 0);
         if (input.bondOrderMatrix !== undefined) packed.set(input.bondOrderMatrix, pairs);
+        if (table !== null) {
+          packed.set(table.index, 2 * pairs);
+          packed.set(table.table, 3 * pairs);
+        }
         return packed;
       })(), storage));
       const previousSingle = recycled(input.previousSingleBuffer, input.previousSingle,

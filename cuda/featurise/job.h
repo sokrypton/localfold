@@ -1,5 +1,5 @@
 // An AlphaFold 3 job, read as the page reads one: web/job-json.js jobFromJson (both dialects, every refusal in
-// its own words), web/entities.js entitiesProblem / expandEntities / parseContact, web/sequence.js cleanSequence.
+// its own words), web/entities.js entitiesProblem / expandEntities / parseBond, web/sequence.js cleanSequence.
 #pragma once
 #include <algorithm>
 #include <cmath>
@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "ccd.h"
+#include "constraints.h"
 #include "chem.h"
 #include "json.h"
 #include "jsnum.h"
@@ -126,8 +127,8 @@ struct Entity {
   std::optional<EntityTemplate> templ;
 };
 
-struct ContactEnd { std::string chain; int residue; bool hasAtom; std::string atom; };
-inline std::optional<std::pair<ContactEnd, ContactEnd>> parseContact(const std::string& value) {
+struct BondRowEnd { std::string chain; int residue; bool hasAtom; std::string atom; };
+inline std::optional<std::pair<BondRowEnd, BondRowEnd>> parseBond(const std::string& value) {
   std::string text = trimWs(value);
   if (text.empty()) return std::nullopt;
   std::vector<std::string> sides;
@@ -136,10 +137,10 @@ inline std::optional<std::pair<ContactEnd, ContactEnd>> parseContact(const std::
   sides.push_back(text.substr(s));
   if (sides.size() != 2) return std::nullopt;
   static const std::regex end(R"(^\s*([A-Za-z]+)\s*(\d+)\s*(?::\s*([A-Za-z0-9']+)\s*)?$)");
-  auto one = [&](const std::string& side) -> std::optional<ContactEnd> {
+  auto one = [&](const std::string& side) -> std::optional<BondRowEnd> {
     std::smatch m;
     if (!std::regex_match(side, m, end)) return std::nullopt;
-    ContactEnd e{upper(m[1]), std::stoi(m[2]), m[3].matched, m[3].matched ? upper(m[3]) : ""};
+    BondRowEnd e{upper(m[1]), std::stoi(m[2]), m[3].matched, m[3].matched ? upper(m[3]) : ""};
     return e;
   };
   auto from = one(sides[0]), to = one(sides[1]);
@@ -200,13 +201,27 @@ inline std::optional<std::string> modificationProblem(const Modification& m, con
 // a SMILES ligand's heavy-atom count, or a refusal in the parser's words (set by the SMILES module)
 inline int SMILES_ATOM_COUNT(const std::string& smiles) { return (int)chem::parseSmiles(smiles).atoms.size(); }
 inline std::optional<std::string> entityProblem(const Entity& e) {
-  static const std::vector<std::string> types = {"protein", "dna", "rna", "ligand", "smiles", "contact"};
+  static const std::vector<std::string> types = {"protein", "dna", "rna", "ligand", "smiles", "bond", "pocket",
+                                                  "contact"};
   if (std::find(types.begin(), types.end(), e.type) == types.end()) return "Unknown entity type " + e.type;
+  if (e.type == "pocket") {
+    if (!parsePocket(e.value))
+      return std::string("A pocket is a binder chain and the residues it sits by, as B: A9, A12, A16 @ 6 (Angstrom)");
+    return std::nullopt;
+  }
   if (e.type == "contact") {
     auto parsed = parseContact(e.value);
-    if (!parsed) return "A contact is two residues, as A12:SG - B1:C25 (the atoms optional)";
+    if (!parsed) return std::string("A distance is two residues and a bound, as A10 - B44 @ 8 (a ligand atom as B1:PG)");
+    if (parsed->token1.chain == parsed->token2.chain && parsed->token1.residue == parsed->token2.residue
+        && parsed->token1.atom == parsed->token2.atom)
+      return std::string("A contact joins two different tokens");
+    return std::nullopt;
+  }
+  if (e.type == "bond") {
+    auto parsed = parseBond(e.value);
+    if (!parsed) return "A bond is two residues, as A12:SG - B1:C25 (the atoms optional)";
     if (parsed->first.chain == parsed->second.chain && parsed->first.residue == parsed->second.residue)
-      return "A contact joins two different residues";
+      return "A bond joins two different residues";
     return std::nullopt;
   }
   if (!jsIsInteger(e.copies) || e.copies < 1) return "Copies must be a whole number, at least 1";
@@ -295,6 +310,7 @@ struct Expanded {
   std::vector<ChainModification> modifications;
   std::vector<std::pair<int, EntityTemplate>> templates;
   std::vector<DeclaredBond> bonds;
+  std::vector<Constraint> constraints;    // the pocket and contact rows, resolved (constraints.h)
   std::string sequence;
 };
 
@@ -303,7 +319,7 @@ inline Expanded expandEntities(const std::vector<Entity>& entities) {
   Expanded x;
   std::vector<std::pair<std::string, std::string>> smilesCodes;
   for (auto& e : entities) {
-    if (e.type == "contact") continue;
+    if (e.type == "bond" || e.type == "pocket" || e.type == "contact") continue;
     for (int copy = 0; copy < (int)e.copies; ++copy) {
       if (e.type == "protein" || e.type == "dna" || e.type == "rna") {
         for (auto& m : e.modifications) x.modifications.push_back({(int)x.chains.size(), m.position, upper(trimWs(m.code))});
@@ -331,16 +347,38 @@ inline Expanded expandEntities(const std::vector<Entity>& entities) {
     }
   }
   for (auto& e : entities) {
-    if (e.type != "contact") continue;
-    auto parsed = parseContact(e.value);
+    if (e.type != "bond") continue;
+    auto parsed = parseBond(e.value);
     if (!parsed) continue;
     auto asymOf = [](const std::string& letters) {
       int total = 0;
       for (char c : letters) total = total * 26 + (c - 64);
       return total - 1;
     };
-    auto end = [&](const ContactEnd& side) { return BondEnd{asymOf(side.chain), side.residue, side.hasAtom, side.atom}; };
+    auto end = [&](const BondRowEnd& side) { return BondEnd{asymOf(side.chain), side.residue, side.hasAtom, side.atom}; };
     x.bonds.push_back({end(parsed->first), end(parsed->second)});
+  }
+  // ...and the constraints, in row order (web/entities.js)
+  auto letterAsym = [](const std::string& letters) {
+    int total = 0;
+    for (char c : letters) total = total * 26 + (c - 64);
+    return total - 1;
+  };
+  auto resolved = [&](const ConstraintEnd& e) { return ResolvedEnd{letterAsym(e.chain), e.residue, e.hasAtom, e.atom}; };
+  for (auto& e : entities) {
+    if (e.type == "pocket") {
+      if (auto p = parsePocket(e.value)) {
+        Constraint c; c.kind = Constraint::Pocket; c.binder = letterAsym(p->binder); c.maxDistance = p->maxDistance;
+        for (auto& end : p->contacts) c.contacts.push_back(resolved(end));
+        x.constraints.push_back(c);
+      }
+    } else if (e.type == "contact") {
+      if (auto r = parseContact(e.value)) {
+        Constraint c; c.kind = Constraint::Contact; c.token1 = resolved(r->token1); c.token2 = resolved(r->token2);
+        c.maxDistance = r->maxDistance;
+        x.constraints.push_back(c);
+      }
+    }
   }
   for (size_t i = 0; i < x.chains.size(); ++i) x.sequence += (i ? ":" : "") + x.chains[i];
   return x;
@@ -662,7 +700,7 @@ inline Job jobFromJson(const std::string& text, std::vector<std::vector<JobTempl
   }
   std::set<int> ligandAsyms;
   for (auto& [k, v] : asymOfId) if (v >= polymerChains) ligandAsyms.insert(v);
-  // every bond a contact row: the featuriser applies the family's rule for a polymer-polymer one (web/job-json.js)
+  // every bond a bond row: the featuriser applies the family's rule for a polymer-polymer one (web/job-json.js)
   std::vector<Pair> reaching = bonds;
   size_t polymerPolymer = 0;
   for (auto& b : bonds) if (!ligandAsyms.count(b.fromAsym) && !ligandAsyms.count(b.toAsym)) ++polymerPolymer;
@@ -714,9 +752,64 @@ inline Job jobFromJson(const std::string& text, std::vector<std::vector<JobTempl
       return pageLabel(asym) + std::to_string(residue) + (atom.empty() ? std::string() : ":" + atom);
     };
     Entity c;
-    c.type = "contact";
+    c.type = "bond";
     c.value = side(b.fromAsym, b.fromResidue, b.fromAtom) + " - " + side(b.toAsym, b.toResidue, b.toAtom);
     out.entities.push_back(c);
+  }
+  // the constraints as rows with the page's letters (web/job-json.js; af3-any-model folding_input.py _parse_constraint)
+  if (const Json* list = job.get("constraints"); !Json::absent(list)) {
+    if (!list->isArray()) refuse("constraints: a list of {\"pocket\": ...} and {\"contact\": ...}");
+    auto asymOfChain = [&](const Json* id, const std::string& where) {
+      std::string chain = jsString(id);
+      for (auto& [k, v] : asymOfId) if (k == chain) return v;
+      refuse(where + ": no chain \"" + chain + "\" in this job");
+      return -1;
+    };
+    auto endText = [&](const Json& raw, const std::string& where) {
+      if (!raw.isArray() || (raw.a.size() != 2 && raw.a.size() != 3))
+        refuse(where + ": a token is [chain, residue] or [chain, residue, atom]");
+      int asym = asymOfChain(&raw.a[0], where);
+      const Json& r = raw.a[1];
+      if (!r.isNumber() || !jsIsInteger(r.n) || r.n < 1) refuse(where + ": residue " + jsString(&r) + " is not a position");
+      return pageLabel(asym) + jsNumber(r.n) + (raw.a.size() == 3 ? ":" + jsString(&raw.a[2]) : std::string());
+    };
+    for (size_t index = 0; index < list->a.size(); ++index) {
+      std::string where = "constraints[" + std::to_string(index) + "]";
+      const Json& raw = list->a[index];
+      if (!raw.isObject() || raw.o.size() != 1 || (raw.o[0].first != "pocket" && raw.o[0].first != "contact"))
+        refuse(where + ": expected {\"pocket\": {...}} or {\"contact\": {...}}");
+      const std::string kind = raw.o[0].first;
+      const Json& body = raw.o[0].second;
+      if (!body.isObject()) refuse(where + ": expected {\"pocket\": {...}} or {\"contact\": {...}}");
+      std::vector<std::string> allowed = kind == "pocket" ? std::vector<std::string>{"binder", "contacts", "maxDistance", "force"}
+                                                          : std::vector<std::string>{"token1", "token2", "maxDistance", "force"};
+      for (auto& [k, v] : body.o)
+        if (std::find(allowed.begin(), allowed.end(), k) == allowed.end())
+          refuse(where + ": " + k + " is not a field of this entry");
+      const Json* d = body.get("maxDistance");
+      if (Json::absent(d) || !d->isNumber() || !(d->n > 0)) refuse(where + ": maxDistance must be a positive number of Angstrom");
+      if (const Json* f = body.get("force"); !Json::absent(f) && f->kind == Json::Bool && f->b)
+        refuse(where + ": force (steering the sampler toward the constraint) is not implemented here");
+      Entity c;
+      if (kind == "pocket") {
+        int binder = asymOfChain(body.get("binder"), where);
+        const Json* contacts = body.get("contacts");
+        if (Json::absent(contacts) || !contacts->isArray() || contacts->a.empty())
+          refuse(where + ": a pocket needs at least one contact residue");
+        std::string listed;
+        for (size_t k = 0; k < contacts->a.size(); ++k)
+          listed += (k ? ", " : "") + endText(contacts->a[k], where + " contacts[" + std::to_string(k) + "]");
+        c.type = "pocket";
+        c.value = pageLabel(binder) + ": " + listed + " @ " + jsNumber(d->n);
+      } else {
+        const Json* t1 = body.get("token1");
+        const Json* t2 = body.get("token2");
+        if (Json::absent(t1) || Json::absent(t2)) refuse(where + ": a contact needs token1 and token2");
+        c.type = "contact";
+        c.value = endText(*t1, where + " token1") + " - " + endText(*t2, where + " token2") + " @ " + jsNumber(d->n);
+      }
+      out.entities.push_back(c);
+    }
   }
   if (const Json* n = job.get("name"); n != nullptr && n->isString()) out.name = n->s;
   if (const Json* u = job.get("userCCD"); u != nullptr && u->isString() && !trimWs(u->s).empty()) out.userCcd = u->s;

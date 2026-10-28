@@ -87,6 +87,9 @@ struct Batch {
   std::vector<int> refAtomNameChars, refSpaceUid, displayAtomNameChars;
   bool hasBonds = false; std::vector<float> bondMatrix, bondOrderMatrix;
   std::vector<float> declaredBondMatrix;           // chai1's declared-bond feature, empty when there is none
+  // a job's pocket and contact constraints (constraints.h), empty when it has none: boltz2's contact conditioning
+  // (classes, as floats) and threshold, chai-1's two distance restraints (-1 where none); each tokens x tokens
+  std::vector<float> contactConditioning, contactThreshold, tokenDistanceRestraint, tokenPairPocketRestraint;
   std::vector<LigandSpan> ligandSpans; std::vector<ModifiedSpan> modifiedSpans;
   std::vector<int> residueOfToken; std::vector<float> chainOfResidue;
   std::vector<int> isDna, isRna, isLigand, isModified;

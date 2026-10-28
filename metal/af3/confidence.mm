@@ -2,6 +2,7 @@
 // pairformer blocks, then pLDDT, PAE, PDE and the TM terms (cuda/af3/src/confidence.cuh is the reading).
 #include "af3.h"
 #include "output.h"
+#include "constraint_tables.h"
 #include <cmath>
 #include <cstring>
 
@@ -34,6 +35,7 @@ static void boltz2Reembed(float* pair, float* single, const Trunk& t, const floa
         ReembedPairArgs{pair, left, right, bins, t.pairMask, W(R + "distogramFeatProject"), M.has("batch.bondMatrix") ? M.f("batch.bondMatrix") : nullptr,
                         M.has("batch.bondOrderMatrix") ? M.f("batch.bondOrderMatrix") : nullptr, W(R + "tokenBondsProject"),
                         W(R + "tokenBondsTypeEmbed"), W(R + "contactEncodingUnspecified"), (uint)n, (uint)C});
+  addBoltz2Constraints(pair, pairs, C, R);   // (a job's constraints: constraint_tables.h)
   int rowsPer = std::max<int>(1, (int)(((size_t)16 << 20) / ((size_t)n * C)));
   half* prod = scratch<half>("conf.prod", (size_t)std::min(rowsPer, n) * n * C);
   for (int i0 = 0; i0 < n; i0 += rowsPer) {

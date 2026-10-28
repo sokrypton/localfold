@@ -189,11 +189,17 @@ inline void embedderWeights(Walk& w, const std::string& p) {
   // chai1's blob revision 3: RelativeChain/RelativeEntity rows and the trunk half of the declared-bond projection
   w.wholeIfPresent(p + ".chaiChainEntity", EVO + "/chai1_chain_entity");
   w.wholeIfPresent(p + ".chaiBondTrunk", EVO + "/chai1_bond_trunk/weights");
+  // ...and the trunk half of its restraint columns (af3-any-model's converter; the blob after 409646df): a job's pocket
+  // and contact constraints read through it as a table (constraints.h chai1RestraintTable)
+  w.wholeIfPresent(p + ".chaiRestraintTrunk", EVO + "/chai1_restraint_trunk/weights");
   w.wholeIfPresent(p + ".boltz2DnMsa", EVO + "/boltz2_dn_msa");     // boltz2's DN row (af3-any-model's converter)
   if (w.S.has(EVO + "/token_bonds_type_embed/weights")) {
     T(".tokenBondsTypeEmbed", "token_bonds_type_embed/weights");
     T(".contactEncodingUnspecified", "contact_encoding_unspecified");
     T(".contactEncodingUnselected", "contact_encoding_unselected");
+    // ...and the encoder a pocket or contact constraint runs through (constraints.h boltz2ContactTable)
+    T(".contactFourierWeights", "contact_fourier/weights"); T(".contactFourierBias", "contact_fourier/bias");
+    T(".contactEncoderWeights", "contact_encoder/weights"); T(".contactEncoderBias", "contact_encoder/bias");
   }
   T(".msaActivations", "msa_activations/weights"); T(".extraMsaTargetFeat", "extra_msa_target_feat/weights");
   T(".singleActivations", "single_activations/weights");
@@ -359,6 +365,10 @@ inline void confidenceWeights(Walk& w, const std::string& p) {
       T(r + path, "~_boltz2_reembed/" + name);
     T(r + "contactEncodingUnspecified", "contact_encoding_unspecified");
     T(r + "contactEncodingUnselected", "contact_encoding_unselected");
+    for (auto& [path, name] : std::vector<std::pair<std::string, std::string>>{
+           {"contactFourierWeights", "contact_fourier/weights"}, {"contactFourierBias", "contact_fourier/bias"},
+           {"contactEncoderWeights", "contact_encoder/weights"}, {"contactEncoderBias", "contact_encoder/bias"}})
+      T(r + path, "~_boltz2_reembed/" + name);
     for (auto& [path, name] : std::vector<std::pair<std::string, std::string>>{
            {"leftTargetFeatProject", "left_target_feat_project/weights"}, {"rightTargetFeatProject", "right_target_feat_project/weights"},
            {"sToZProdIn1", "s_to_z_prod_in1/weights"}, {"sToZProdIn2", "s_to_z_prod_in2/weights"}, {"sToZProdOut", "s_to_z_prod_out/weights"},

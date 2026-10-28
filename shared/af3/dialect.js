@@ -314,6 +314,9 @@ export const ALPHAFOLD3 = Object.freeze({
   structuralTokens: false,
   pairMixer: false,
   singleTransitionF32: false,
+  // 🔴 WHICH CONSTRAINT FEATURES IT READS (shared/af3/featurise/constraints.js): a pocket and a contact as its own
+  // featuriser writes them, or null for a model trained with neither, which refuses a job that carries one
+  constraintFamily: null,
   protenixScores: false,
   rebuildCterminalOxygens: false,
   chaiAtomStack: false,
@@ -468,6 +471,7 @@ export const OPENBIND0 = Object.freeze({
   structuralTokens: false,
   pairMixer: false,
   singleTransitionF32: false,
+  constraintFamily: null,
   protenixScores: false,
   rebuildCterminalOxygens: false,
   chaiAtomStack: false,
@@ -689,6 +693,7 @@ export const OPENDDE = Object.freeze({
   structuralTokens: true,
   pairMixer: false,
   singleTransitionF32: false,
+  constraintFamily: null,
   protenixScores: false,
   rebuildCterminalOxygens: false,
   chaiAtomStack: false,
@@ -909,6 +914,7 @@ export const PROTENIX2 = Object.freeze({
   fusedTemplateEmbedder: true,
   pairMixer: false,
   singleTransitionF32: false,
+  constraintFamily: null,
   // 🔴 ITS OWN SUMMARY SCORES, NOT AlphaFold 3's (protenix/model/sample_confidence.py; af3-any-model 5d02965): a
   // single chain's ipTM is 0, the ranking 0.8 ipTM + 0.2 pTM - 100 has_clash with no disorder term, and has_clash over
   // polymer chain PAIRS (more than 100 atom pairs within 1.1 A, or half the smaller chain). 7r6r ranked 0.97 under
@@ -1152,6 +1158,7 @@ export const BOLTZ2 = Object.freeze({
   preTrunkQuery: true,
   pairMixer: false,
   singleTransitionF32: false,
+  constraintFamily: "boltz2",
   protenixScores: false,
   rebuildCterminalOxygens: false,
   chaiAtomStack: false,
@@ -1299,6 +1306,7 @@ export const INTELLIFOLD2 = Object.freeze({
   structuralTokens: false,
   pairMixer: false,
   singleTransitionF32: false,
+  constraintFamily: null,
   protenixScores: false,
   rebuildCterminalOxygens: false,
   chaiAtomStack: false,
@@ -1528,6 +1536,7 @@ export const ROSETTAFOLD3 = Object.freeze({
   structuralTokens: false,
   pairMixer: false,
   singleTransitionF32: false,
+  constraintFamily: null,
   protenixScores: false,
   rebuildCterminalOxygens: false,
   chaiAtomStack: false,
@@ -1649,6 +1658,7 @@ export const CHAI1 = Object.freeze({
   structuralTokens: false,
   pairMixer: false,
   singleTransitionF32: false,
+  constraintFamily: "chai1",
   protenixScores: false,
   rebuildCterminalOxygens: false,
   chaiAtomStack: true,
@@ -1802,6 +1812,7 @@ export function featuriserDialect(dialect) {
     atomizedBackboneBonds: dialect.atomizedBackboneBonds,
     modifiedAsOneToken: dialect.modifiedAsOneToken,
     chaiMsaFeatures: dialect.chaiMsaFeatures,
+    constraintFamily: dialect.constraintFamily,
   };
 }
 

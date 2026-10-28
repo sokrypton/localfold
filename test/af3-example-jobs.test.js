@@ -59,12 +59,12 @@ const EXPECTED = {
   // below rather than just the rows: a job that folds the protein and the
   // ligand side by side with no bond between them is a different answer.
   // 🔴 AND THE BOND IS A ROW, NOT A HIDDEN FIELD. `bondedAtomPairs` becomes a
-  // `contact` entity beside the protein and the ligand, so it is visible in the
+  // `bond` entity beside the protein and the ligand, so it is visible in the
   // list, editable, and deleted when the reader deletes it - where the first
   // version kept it in a page variable nobody could see, which is what the job
   // NAME was built and then removed for.
   "kras_g12c_sotorasib.json": { loads: ["protein:189x1", "ligand:MOVx1",
-                                        "contact:A12:SG - B1:C25x1"] },
+                                        "bond:A12:SG - B1:C25x1"] },
   // ...and the four this page does not fold, each naming its own reason.
   // 🔴 THIS ONE MOVED ITS REASON RATHER THAN LOSING IT: it carried
   // `bondedAtomPairs` AND a five-component glycan in one ligand entry, and
@@ -74,9 +74,9 @@ const EXPECTED = {
   // its glycosidic bonds and the Asn34 link contacts beside it - exact against
   // AF3's own batch (tools/check-batch-fields.js --target=glycan).
   "rnaseb_glycosylated.json": { loads: ["protein:124x1", "ligand:NAG,NAG,BMA,MAN,MANx1",
-                                        "contact:A34:ND2 - B1:C1x1", "contact:B1:O4 - B2:C1x1",
-                                        "contact:B2:O4 - B3:C1x1", "contact:B3:O3 - B4:C1x1",
-                                        "contact:B3:O6 - B5:C1x1"] },
+                                        "bond:A34:ND2 - B1:C1x1", "bond:B1:O4 - B2:C1x1",
+                                        "bond:B2:O4 - B3:C1x1", "bond:B3:O3 - B4:C1x1",
+                                        "bond:B3:O6 - B5:C1x1"] },
   // 🔴 MODIFIED BASES LOAD NOW: the featuriser takes a base's parent from its
   // chain's alphabet and the CCD (AF3's own batch is matched field for field on
   // both - tools/check-batch-fields.js, dna-5cm and rna-mods).
@@ -95,7 +95,7 @@ const EXPECTED = {
     // (the SMILES ligand last, as the file lists it and AF3 orders it)
     loads: ["protein:10x1", "protein:7x1", "dna:7x1", "dna:7x1", "rna:4x1",
             "ligand:ATPx1", "ligand:HEMx2", "ligand:MGx2", "ligand:NAG,FUCx1", "ligand:NAx3", "smiles:1x1",
-            "contact:A1:CA - B1:CAx1", "contact:A1:CA - G1:CHAx1", "contact:K1:O6 - K2:C1x1"],
+            "bond:A1:CA - B1:CAx1", "bond:A1:CA - G1:CHAx1", "bond:K1:O6 - K2:C1x1"],
     seed: 10, alignedChains: 2,
   },
 };
@@ -104,7 +104,7 @@ const shape = (entities) => entities.map((entity) =>
   // A SMILES row is summarised by its ATOM COUNT rather than its text, which
   // would make the expectation above a second copy of the input string. A
   // CONTACT is shown whole, because its text is the whole of what it says.
-  `${entity.type}:${entity.type === "ligand" || entity.type === "contact" ? entity.value
+  `${entity.type}:${entity.type === "ligand" || entity.type === "bond" ? entity.value
     : entity.type === "smiles" ? 1 : entity.value.length}`
   + `x${entity.copies}`);
 

@@ -48,7 +48,7 @@
  * error names the field, because "unsupported job" sends the reader looking.
  */
 import { parseSmiles } from "../shared/chem/smiles.js";
-import { NUCLEIC_TYPES, entitiesProblem, parseContact } from "./entities.js";
+import { CONSTRAINT_TYPES, NUCLEIC_TYPES, entitiesProblem, parseBond, parsePocket, parseContact } from "./entities.js";
 import { userCcdCodes } from "../shared/af3/featurise/ccd-component.js";
 
 /**
@@ -71,7 +71,8 @@ export function jobRequestJson({ name, seed, entities }) {
   // archive describing a different fold.
   // ...and so does a ligand of several components, which the server's single
   // `ligand` code cannot hold.
-  if ((entities ?? []).some((entity) => (entity.type === "smiles" || entity.type === "contact"
+  if ((entities ?? []).some((entity) => (entity.type === "smiles" || entity.type === "bond"
+    || CONSTRAINT_TYPES.includes(entity.type)
     || (entity.type === "ligand" && (entity.value ?? "").includes(",")))
     && (entity.value ?? "").trim() !== "")) {
     return openDialectJson({ name, seed, entities });
@@ -80,8 +81,8 @@ export function jobRequestJson({ name, seed, entities }) {
   for (const entity of entities ?? []) {
     const value = (entity.value ?? "").trim();
     if (value === "") continue;
-    // A contact is a BOND, not a chain; it is written as `bondedAtomPairs`.
-    if (entity.type === "contact") continue;
+    // A bond is not a chain; it is written as `bondedAtomPairs`.
+    if (entity.type === "bond") continue;
     const count = Math.max(1, Number(entity.copies) || 1);
     if (entity.type === "protein") {
       // 🔴 A MODIFIED RESIDUE IS PART OF THE JOB, NOT A RENDERING OF IT. The
@@ -171,8 +172,8 @@ function openDialectJson({ name, seed, entities }) {
   for (const entity of entities ?? []) {
     const value = (entity.value ?? "").trim();
     if (value === "") continue;
-    // A contact is a BOND, not a chain; it is written as `bondedAtomPairs`.
-    if (entity.type === "contact") continue;
+    // A bond is not a chain; it is written as `bondedAtomPairs`. A constraint is written as `constraints`.
+    if (entity.type === "bond" || CONSTRAINT_TYPES.includes(entity.type)) continue;
     const id = idsFor(Math.max(1, Number(entity.copies) || 1));
     if (entity.type === "protein") {
       const modifications = (entity.modifications ?? [])
@@ -207,11 +208,29 @@ function openDialectJson({ name, seed, entities }) {
   // `expandEntities` numbers them in.
   const bondedAtomPairs = [];
   for (const entity of entities ?? []) {
-    if (entity.type !== "contact") continue;
-    const parsed = parseContact(entity.value);
+    if (entity.type !== "bond") continue;
+    const parsed = parseBond(entity.value);
     if (parsed === null) continue;
     const side = (end) => [end.chain, end.residue, end.atom ?? ""];
     bondedAtomPairs.push([side(parsed.from), side(parsed.to)]);
+  }
+  // ...and the constraints, af3-any-model's `constraints` (docs/input.md there), with the same letters
+  const constraints = [];
+  const token = (end) => (end.atom === null ? [end.chain, end.residue] : [end.chain, end.residue, end.atom]);
+  for (const entity of entities ?? []) {
+    if (entity.type === "pocket") {
+      const parsed = parsePocket(entity.value);
+      if (parsed !== null) {
+        constraints.push({ pocket: { binder: parsed.binder, contacts: parsed.contacts.map(token),
+                                     maxDistance: parsed.maxDistance } });
+      }
+    } else if (entity.type === "contact") {
+      const parsed = parseContact(entity.value);
+      if (parsed !== null) {
+        constraints.push({ contact: { token1: token(parsed.token1), token2: token(parsed.token2),
+                                      maxDistance: parsed.maxDistance } });
+      }
+    }
   }
   return `${JSON.stringify([{
     name,
@@ -219,6 +238,7 @@ function openDialectJson({ name, seed, entities }) {
     modelSeeds: [Number(seed ?? 0)],
     sequences,
     ...(bondedAtomPairs.length === 0 ? {} : { bondedAtomPairs }),
+    ...(constraints.length === 0 ? {} : { constraints }),
     // 🔴 AND THE DIALECT IS NAMED EXPLICITLY, THOUGH THE HEADER ABOVE SAYS THE
     // OPEN ONE HAS NO `dialect` KEY. Upstream's rule - which `checkVersion`
     // implements - is that a job carries BOTH `dialect` and `version` or
@@ -709,7 +729,7 @@ export function jobFromJson(text) {
   // 🔴 A POLYMER-TO-POLYMER BOND IS EACH MODEL'S OWN RULE, AND SAYING SO IS THE POINT. AlphaFold 3 extracts token
   // bonds only where one side is a ligand (`get_polymer_ligand_and_ligand_ligand_bonds`), so a disulfide between two
   // cysteines is absent from its `token_bonds`; Boltz-2 reads every declared bond, Protenix and OpenDDE those between
-  // residues not adjacent (af3-any-model 964990e). So every bond becomes a contact row, the featuriser applies the
+  // residues not adjacent (af3-any-model 964990e). So every bond becomes a bond row, the featuriser applies the
   // family's rule (`declaredPolymerBonds`), and the load says which models will not read a polymer-polymer one.
   const ligandAsyms = new Set([...asymOfId.entries()]
     .filter(([, asym]) => asym >= polymerChains).map(([, asym]) => asym));
@@ -770,7 +790,7 @@ export function jobFromJson(text) {
   // 🔴 A BOND BECOMES A ROW, NOT A HIDDEN FIELD. The first version returned
   // `bonds` beside the entities and the page kept them in a variable - state
   // nobody could see, which is what the job NAME was built and then removed
-  // for. A `contact` row sits in the list with the chains it names, so it is
+  // for. A `bond` row sits in the list with the chains it names, so it is
   // visible, editable and deleted when the reader deletes it, and
   // `expandEntities` resolves the letters at fold time.
   //
@@ -790,8 +810,49 @@ export function jobFromJson(text) {
   for (const bond of reaching) {
     const side = (end) => `${letterOf.get(end.asym) ?? "?"}${end.residue}`
       + (end.atom === undefined || end.atom === "" ? "" : `:${end.atom}`);
-    entities.push({ type: "contact", value: `${side(bond.from)} - ${side(bond.to)}`,
+    entities.push({ type: "bond", value: `${side(bond.from)} - ${side(bond.to)}`,
                     copies: 1, modifications: [] });
+  }
+  // 🔴 THE CONSTRAINTS BECOME ROWS TOO, for the same reasons a bond does, with the page's letters. af3-any-model's
+  // `constraints` (folding_input.py _parse_constraint): a pocket or a contact, each with a positive maxDistance;
+  // `force` is boltz's sampler steering, which nothing here implements, so it is refused rather than dropped.
+  const constraintEnd = (raw, where) => {
+    if (!Array.isArray(raw) || (raw.length !== 2 && raw.length !== 3)) {
+      refuse(`${where}: a token is [chain, residue] or [chain, residue, atom]`);
+    }
+    const asym = asymOfId.get(String(raw[0]));
+    if (asym === undefined) refuse(`${where}: no chain "${raw[0]}" in this job`);
+    if (!Number.isInteger(raw[1]) || raw[1] < 1) refuse(`${where}: residue ${raw[1]} is not a position`);
+    return `${letterOf.get(asym)}${raw[1]}${raw.length === 3 ? `:${String(raw[2])}` : ""}`;
+  };
+  for (const [index, raw] of (job.constraints ?? []).entries()) {
+    const where = `constraints[${index}]`;
+    const kind = raw !== null && typeof raw === "object" ? Object.keys(raw) : [];
+    if (kind.length !== 1 || (kind[0] !== "pocket" && kind[0] !== "contact")) {
+      refuse(`${where}: expected {"pocket": {...}} or {"contact": {...}}`);
+    }
+    const body = raw[kind[0]] ?? {};
+    checkKeys(body, kind[0] === "pocket" ? ["binder", "contacts", "maxDistance", "force"]
+      : ["token1", "token2", "maxDistance", "force"], where);
+    const d = body.maxDistance;
+    if (typeof d !== "number" || !(d > 0)) refuse(`${where}: maxDistance must be a positive number of Angstrom`);
+    if (body.force === true) {
+      refuse(`${where}: force (steering the sampler toward the constraint) is not implemented here`);
+    }
+    if (kind[0] === "pocket") {
+      const binder = asymOfId.get(String(body.binder));
+      if (binder === undefined) refuse(`${where}: no binder chain "${body.binder}" in this job`);
+      if (!Array.isArray(body.contacts) || body.contacts.length === 0) {
+        refuse(`${where}: a pocket needs at least one contact residue`);
+      }
+      const contacts = body.contacts.map((end, k) => constraintEnd(end, `${where} contacts[${k}]`));
+      entities.push({ type: "pocket", value: `${letterOf.get(binder)}: ${contacts.join(", ")} @ ${d}`,
+                      copies: 1, modifications: [] });
+    } else {
+      entities.push({ type: "contact", copies: 1, modifications: [],
+                      value: `${constraintEnd(body.token1, `${where} token1`)}`
+                        + ` - ${constraintEnd(body.token2, `${where} token2`)} @ ${d}` });
+    }
   }
   // ...and the letters go no further.
   for (const entity of entities) delete entity.ids;

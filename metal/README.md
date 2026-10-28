@@ -57,6 +57,15 @@ CUDA backend's gate - 21 folds over every family but AlphaFold 3 itself (whose w
 refusals, and a real page folding three families through the server - passes on the M2, one bar at Metal's own
 number (protenix2 6MRR, 1.6 A). A warm fold on the page: AF2 6MRR 2.0 s click to result, ESMFold2 7.2, protenix2 4.9.
 
+## Pocket and contact constraints: written, not yet built here
+
+A job's `constraints` (cuda/af3/README.md, Input) reach Metal as they reach CUDA: the featuriser is the shared
+cuda/featurise one, and `constraint_tables.h` adds each site's term from its table with `af3_add_table` after the
+kernels that build the pair - Boltz-2's z-init (trunk.mm) and confidence re-embed (confidence.mm), chai-1's z-init and
+diffusion structure pair (diffusion.mm). Written on a Linux box with no Mac, so it has not been compiled or run: build,
+then fold `tools/fixtures/constraints/contact.json` with `--model=boltz2` and with `--model=chai1` against the CUDA
+port's numbers before trusting it.
+
 ## Is it right? The gates
 
 The CUDA gates' cases, scored against crystals, with this Mac's baseline in `metal/<port>/gate-baseline.<chip>.json`

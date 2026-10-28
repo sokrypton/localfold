@@ -1,0 +1,56 @@
+{
+ "name": "pocket",
+ "modelSeeds": [
+  1
+ ],
+ "sequences": [
+  {
+   "protein": {
+    "id": "A",
+    "sequence": "GSWKELAAKLAKEAAEKGDPEVAKRALELAKKAAEEGDPELAKKAAELAKKA",
+    "modifications": [],
+    "unpairedMsa": ">q\nGSWKELAAKLAKEAAEKGDPEVAKRALELAKKAAEEGDPELAKKAAELAKKA\n",
+    "pairedMsa": "",
+    "templates": []
+   }
+  },
+  {
+   "ligand": {
+    "id": "B",
+    "smiles": "CC(C)Cc1ccc(cc1)[C@@H](C)C(=O)O"
+   }
+  }
+ ],
+ "dialect": "alphafold3",
+ "version": 3,
+ "constraints": [
+  {
+   "pocket": {
+    "binder": "B",
+    "contacts": [
+     [
+      "A",
+      9
+     ],
+     [
+      "A",
+      12
+     ],
+     [
+      "A",
+      13
+     ],
+     [
+      "A",
+      16
+     ],
+     [
+      "A",
+      30
+     ]
+    ],
+    "maxDistance": 6.0
+   }
+  }
+ ]
+}

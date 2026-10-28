@@ -179,8 +179,15 @@ TRUNK = ("diffuser/evoformer", "diffuser/distogram_head")
 # parameters, +88 MiB) float32 the int5 bundle reads 73.8 / 77.4 / 92.5. int7
 # for the whole transition is not enough (88.5), and transition1 alone at
 # float32 does nothing (87.8).
+#
+# 🔴 boltz2's contact conditioning, at both of its sites: the encoder a pocket or contact constraint runs through and the
+# Fourier projection of its distance (17 k parameters each, +130 KiB). Read on the host into a table of a few rows
+# (shared/af3/featurise/constraints.js), so the cost is bytes alone; at int5 g32 the term came out 1.3-5.6% from
+# float32's (the confidence site's 12 A contact the worst), where the rest of the pair is held to its own int5 error.
 MODEL_FLOAT32 = {
     "mol1": re.compile(r"/single_transition/transition2/weights$"),
+    # (and its DN rows - Boltz's DNA unknown, three vectors - which the published bundle has always carried as float32)
+    "boltz2": re.compile(r"/contact_(encoder|fourier)/weights$|/boltz2_dn_"),
 }
 
 # 🔴 SIZED IN FLOAT32 BYTES, FOR AN INT8 RESULT, exactly as the multimer export

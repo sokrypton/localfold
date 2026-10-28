@@ -3031,7 +3031,7 @@ stayed enabled on a page whose runtime had been stopped. It is derived from
 that is also something to READ, and a disabled textarea cannot be selected in
 every browser, so taking it away would destroy what a reader came back for.
 
-## `contact`: a bond as a ROW, not as hidden state
+## `bond`: a bond as a ROW, not as hidden state
 
 `bondedAtomPairs` landed first as a job-level field the page kept in a variable
 - set when a job loaded, invisible thereafter, and silently invalidated by any
@@ -3039,12 +3039,13 @@ edit to the chains it named. That is precisely what the job NAME was built and
 then removed for, and the same objection applies harder here, because a bond
 that has quietly stopped applying changes the STRUCTURE rather than a label.
 
-A `contact` row sits in the entity list beside the chains it names:
+A `bond` row (called `contact` until pocket and contact constraints took that
+word for a distance) sits in the entity list beside the chains it names:
 
 ```
 Protein          GWCTELEKH...
 Ligand (CCD)     MOV
-Contact (bond)   A12:SG - B1:C25
+Bond             A12:SG - B1:C25
 ```
 
 Visible, editable, and deleted when the reader deletes it. The spec reads the
@@ -3057,14 +3058,14 @@ Folded from the row, on AlphaFold 3's own KRAS/sotorasib example:
 
 | | SG(CYS 12) - C25 |
 |---|---:|
-| the contact row | **1.62 A** |
+| the bond row | **1.62 A** |
 | the same job, bond deleted | **6.25 A** |
 
 and the archive writes it back as `bondedAtomPairs` in the open dialect - which
 it must, because the server dialect has no field for one, the same reason a
 SMILES ligand forces that branch.
 
-🔴 **A CONTACT IS NOT A CHAIN, AND `expandEntities` WOULD HAVE MADE IT A
+🔴 **A BOND IS NOT A CHAIN, AND `expandEntities` WOULD HAVE MADE IT A
 LIGAND.** That loop is `if polymer ... else if smiles ... else LIGAND`, so a row
 type it has not heard of becomes a ligand - silently, with a chain in the fold
 nobody asked for. It is the same shape as `setChains` deleting a SMILES row by

@@ -8,7 +8,7 @@
  */
 import { describe, expect, it } from "./harness.js";
 import {
-  entitiesFromText, entitiesProblem, entityProblem, expandEntities, newEntity, parseContact, templateAsked, templateKind, templateProblem,
+  entitiesFromText, entitiesProblem, entityProblem, expandEntities, newEntity, parseBond, templateAsked, templateKind, templateProblem,
 } from "../web/entities.js";
 
 const protein = (value, copies = 1) => ({ type: "protein", value, copies });
@@ -368,10 +368,10 @@ describe("mixed ligands in one job", () => {
 });
 
 /**
- * 🔴 A `contact` ROW IS A BOND, AND THE POINT IS THAT IT IS A ROW. AlphaFold 3's
+ * 🔴 A `bond` ROW IS A BOND, AND THE POINT IS THAT IT IS A ROW. AlphaFold 3's
  * `bondedAtomPairs` was read into a page variable first - state nobody could
  * see, invalidated by any edit to the chains it named, which is exactly what
- * the job NAME was built and then removed for. A contact sits in the entity
+ * the job NAME was built and then removed for. A bond sits in the entity
  * list with those chains: visible, editable, and gone when the reader deletes
  * it.
  *
@@ -379,24 +379,24 @@ describe("mixed ligands in one job", () => {
  * declares the covalent bond to cysteine 12: SG-C25 is **1.62 A** folded from
  * the row and **6.25 A** with the bond removed. See docs/WEB.md.
  */
-describe("a contact row", () => {
-  const contact = (value) => ({ type: "contact", value, copies: 1, modifications: [] });
+describe("a bond row", () => {
+  const bond = (value) => ({ type: "bond", value, copies: 1, modifications: [] });
 
   it("reads chains, residues and optional atoms", () => {
-    expect(parseContact("A12:SG - B1:C25")).toEqual({
+    expect(parseBond("A12:SG - B1:C25")).toEqual({
       from: { chain: "A", residue: 12, atom: "SG" },
       to: { chain: "B", residue: 1, atom: "C25" },
     });
-    expect(parseContact("A12 - B30")).toEqual({
+    expect(parseBond("A12 - B30")).toEqual({
       from: { chain: "A", residue: 12, atom: null },
       to: { chain: "B", residue: 30, atom: null },
     });
   });
 
-  it("refuses what is not a contact, by message", () => {
-    expect(entityProblem(contact("nonsense"))).toMatch(/two residues/);
-    expect(entityProblem(contact("A12 - A12"))).toMatch(/two different residues/);
-    expect(entityProblem(contact("A12:SG - B1:C25"))).toBe(null);
+  it("refuses what is not a bond, by message", () => {
+    expect(entityProblem(bond("nonsense"))).toMatch(/two residues/);
+    expect(entityProblem(bond("A12 - A12"))).toMatch(/two different residues/);
+    expect(entityProblem(bond("A12:SG - B1:C25"))).toBe(null);
   });
 
   /**
@@ -409,7 +409,7 @@ describe("a contact row", () => {
   it("adds no chain and no ligand", () => {
     const out = expandEntities([
       { type: "protein", value: "GWCTELEKH", copies: 1, modifications: [] },
-      contact("A3:SG - A7:SG"),
+      bond("A3:SG - A7:SG"),
     ]);
     expect(out.chains).toHaveLength(1);
     expect(out.ligandCodes).toHaveLength(0);
@@ -424,7 +424,7 @@ describe("a contact row", () => {
     const out = expandEntities([
       { type: "protein", value: "GWCTELEKH", copies: 1, modifications: [] },
       { type: "ligand", value: "GOL", copies: 1, modifications: [] },
-      contact("A3:SG - B1:C1"),
+      bond("A3:SG - B1:C1"),
     ]);
     expect(out.bonds).toEqual([{
       from: { asym: 0, residue: 3, atom: "SG" },

@@ -503,6 +503,12 @@ export async function embedderWeights(store) {
       tokenBondsTypeEmbed: await T("token_bonds_type_embed/weights"),
       contactEncodingUnspecified: await T("contact_encoding_unspecified"),
       contactEncodingUnselected: await T("contact_encoding_unselected"),
+      // ...and the encoder a pocket or contact constraint runs through (shared/af3/featurise/constraints.js
+      // boltz2ContactTable): read on the host into a table of a few rows, never packed for the device
+      contactFourierWeights: await T("contact_fourier/weights"),
+      contactFourierBias: await T("contact_fourier/bias"),
+      contactEncoderWeights: await T("contact_encoder/weights"),
+      contactEncoderBias: await T("contact_encoder/bias"),
     }),
     msaActivations: await T("msa_activations/weights"),
     extraMsaTargetFeat: await T("extra_msa_target_feat/weights"),
@@ -844,6 +850,10 @@ export async function confidenceWeights(store) {
         tokenBondsTypeEmbed: await T("~_boltz2_reembed/token_bonds_type_embed/weights"),
         contactEncodingUnspecified: await T("contact_encoding_unspecified"),
         contactEncodingUnselected: await T("contact_encoding_unselected"),
+        contactFourierWeights: await T("~_boltz2_reembed/contact_fourier/weights"),
+        contactFourierBias: await T("~_boltz2_reembed/contact_fourier/bias"),
+        contactEncoderWeights: await T("~_boltz2_reembed/contact_encoder/weights"),
+        contactEncoderBias: await T("~_boltz2_reembed/contact_encoder/bias"),
         leftTargetFeatProject: await T("~_boltz2_reembed/left_target_feat_project/weights"),
         rightTargetFeatProject: await T("~_boltz2_reembed/right_target_feat_project/weights"),
         sToZProdIn1: await T("~_boltz2_reembed/s_to_z_prod_in1/weights"),

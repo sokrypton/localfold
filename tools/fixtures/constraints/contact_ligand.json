@@ -1,0 +1,44 @@
+{
+ "name": "contact_ligand",
+ "modelSeeds": [
+  1
+ ],
+ "sequences": [
+  {
+   "protein": {
+    "id": "A",
+    "sequence": "GSWKELAAKLAKEAAEKGDPEVAKRALELAKKAAEEGDPELAKKAAELAKKA",
+    "modifications": [],
+    "unpairedMsa": ">q\nGSWKELAAKLAKEAAEKGDPEVAKRALELAKKAAEEGDPELAKKAAELAKKA\n",
+    "pairedMsa": "",
+    "templates": []
+   }
+  },
+  {
+   "ligand": {
+    "id": "B",
+    "ccdCodes": [
+     "ATP"
+    ]
+   }
+  }
+ ],
+ "dialect": "alphafold3",
+ "version": 3,
+ "constraints": [
+  {
+   "contact": {
+    "token1": [
+     "A",
+     41
+    ],
+    "token2": [
+     "B",
+     1,
+     "PG"
+    ],
+    "maxDistance": 8.0
+   }
+  }
+ ]
+}

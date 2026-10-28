@@ -56,10 +56,13 @@ struct BlobEntry { std::string name, file, commit; };
 inline const std::vector<BlobEntry>& blobTable() {
   static const std::string r2 = AF3_ANY_MODEL_R2, r3 = "e9da26e648c80d7127d4fe31cd41deb288eb2c3a",
                            boltzDn = "ba282d31e471ec044458e8653dcbbe22150ff346",
+                           // chai1 with the trunk half of its restraint columns, for a job's pocket and contact
+                           // constraints (af3-any-model PR #11; every r3 tensor unchanged, cuda/af3/src/constraints.cuh)
+                           chaiRestraints = "409646dfb573f2b008a2c96537cf2d5aca82908a",
                            rf3Absent = "535beb5f1c0f3849d23dcdc9c28a3d2338173266";
   static const std::vector<BlobEntry> t = {
     {"af3", "alphafold3/af3.int8.bin.zst", r2},     // (Google DeepMind's: academic, non-commercial use, terms first)
-    {"chai1", "chai1/chai1.int8.bin.zst", r3},
+    {"chai1", "chai1/chai1.int8.bin.zst", chaiRestraints},
     {"boltz2", "boltz2/boltz2.int8.bin.zst", boltzDn},       // (Boltz's DN rows, the DNA unknown)
     {"protenix2", "protenix/protenix2.int8.bin.zst", r2},
     {"intellifold2", "intellifold2/intellifold2.int8.bin.zst", r2},

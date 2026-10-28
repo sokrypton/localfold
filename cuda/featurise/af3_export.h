@@ -591,6 +591,21 @@ inline Af3Export exportAf3(const Args& args) {
       std::fill(batch.deletionMean.begin(), batch.deletionMean.end(), 0.0f);
     }
   }
+  // the job's pocket and contact constraints, built on the finished batch as the family's own featuriser builds them
+  // (constraints.h; shared/af3/featurise/batch.js applyConstraints), or refused by a family trained on neither
+  if (haveJob && !request.constraints.empty()) {
+    const std::string family = D.constraintFamily;
+    checkConstraints(request.constraints, family, familyName);
+    ConstraintTokens t = constraintTokens(batch.tokens, batch.dense, batch.asymId, batch.residueIndex, batch.refMask,
+                                          batch.refAtomNameChars, batch.chains, batch.chainKinds);
+    if (family == "boltz2") {
+      std::vector<int> classes;
+      boltz2ConstraintFeatures(t, request.constraints, classes, batch.contactThreshold);
+      batch.contactConditioning.assign(classes.begin(), classes.end());
+    } else {
+      chai1ConstraintFeatures(t, request.constraints, batch.tokenDistanceRestraint, batch.tokenPairPocketRestraint);
+    }
+  }
   batch.numMsa = jsParseFloat(args.option("max-msa", "1024"));   // the trunk's rows a pass, drawn afresh each (msa_draw.h)
   addBatch(E, batch, !D.chaiTokenEmbedding);
   if (D.chaiTokenEmbedding) addEsm2Inputs(E, batch);

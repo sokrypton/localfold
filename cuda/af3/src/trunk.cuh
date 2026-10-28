@@ -3,6 +3,7 @@
 #pragma once
 #include "pairtrack.cuh"
 #include "sharded.cuh"
+#include "constraints.cuh"
 #include "../../featurise/msa_draw.h"
 
 // --msa-draw=pass|once|prefix: which rows a trunk pass reads (shared/af3/msa-draw.js); "pass" is AF3's
@@ -694,6 +695,9 @@ inline void bondTypeEmbed(float* pair, size_t pairs, int C, const std::string& p
   size_t elems = (pairs - first) * C;
   WITH_PT(p16, bondTypeEmbedK<PT><<<blocks((C & 3) == 0 ? (elems >> 2) : elems), 256, 0, STREAM>>>(pair, M.has("batch.bondOrderMatrix") ? Fdev("batch.bondOrderMatrix") : nullptr,
     W(pre + "tokenBondsTypeEmbed"), W(pre + "contactEncodingUnspecified"), pairs, C, first * C));
+  // ...and a job's pocket and contact constraints: each pair's term less the unspecified constant just added
+  ConstraintTable ct = boltz2ConstraintTable(pre, C);
+  WITH_PT(p16, addConstraintTable<PT>(pair, ct, first, pairs, C));
 }
 // ---------------------------------------------------------------- the trunk's pair in bf16 (t.p16)
 // Outside the pair-track updates (which read PAIR16) the trunk's own reads and writes of its pair go through
@@ -773,12 +777,16 @@ void embed(Trunk& t, const std::function<void(const char*, const float*, size_t)
       hasW(E + "chaiChainEntity") ? W(E + "chaiChainEntity") : nullptr,
       M.has("batch.declaredBondMatrix") ? Fdev("batch.declaredBondMatrix") ? Fdev("batch.declaredBondMatrix") : nullptr : nullptr,
       hasW(E + "chaiBondTrunk") ? W(E + "chaiBondTrunk") : nullptr, t.pair, n, C));
+    // ...and a job's pocket and contact constraints, through the trunk half of chai's restraint columns
+    ConstraintTable ct = chai1ConstraintTable("chai.trunk", E + "chaiRestraintTrunk", 0, C);
+    WITH_PT(t.p16, addConstraintTable<PT>(t.pair, ct, 0, pairs, C));
   };
   if (chai && t.pass == 0) {
     // chai's first pass recycles z_init itself (chai1.py seeds the carry with the initial representation):
     // z = z_init + prev_embedding(LN(z_init)), z_init = left + right + the relative encoding - row by row in place
     WITH_PT(t.p16, outerSumK<PT><<<blocks((C & 3) == 0 ? (pairs * (C >> 2)) : (pairs * C)), 256, 0, STREAM>>>(left, right, t.pair, n, C));
     chaiRelEnc();
+    onSeam("chai_z_init", t.pair, pairs * C);    // (af3-any-model's tap of the same name: z_init before its recycle)
     size_t per = std::max<size_t>(1, std::min(pairs, CHUNK / C));
     // (sized for the recycle passes, which take the branch below - whole where the card has the room: the trunk graph
     // is captured on the first of them, and a buffer growing inside a capture killed Chai-1 at 988 tokens)

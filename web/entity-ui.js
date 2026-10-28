@@ -663,11 +663,11 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
       mirror.setAttribute("aria-hidden", "true");
     }
 
-    // 🔴 A CONTACT IS ONE LINE TOO. It is a short spec, not a sequence, and a
+    // 🔴 A BOND IS ONE LINE TOO. It is a short spec, not a sequence, and a
     // textarea would give a bond three rows of empty box in the middle of the
     // list.
     const oneLine = entity.type === "ligand" || entity.type === "smiles"
-      || entity.type === "contact";
+      || entity.type === "bond" || entity.type === "pocket" || entity.type === "contact";
     const value = oneLine
       ? document.createElement("input")
       : document.createElement("textarea");
@@ -677,14 +677,23 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
       value.type = "text";
       value.placeholder = "CCD code, e.g. HEM";
       value.setAttribute("aria-label", "Ligand CCD code");
-    } else if (entity.type === "contact") {
+    } else if (entity.type === "bond") {
       // 🔴 A BOND BETWEEN TWO RESIDUES, WRITTEN AS A READER WOULD SAY IT.
       // Chains are the letters the viewer and the PDB use; the atoms are
       // optional, because `token_bonds` is token x token and a standard
-      // residue has one token whichever atom is named. See parseContact.
+      // residue has one token whichever atom is named. See parseBond.
       value.type = "text";
       value.placeholder = "A12:SG - B1:C25";
-      value.setAttribute("aria-label", "Contact between two residues");
+      value.setAttribute("aria-label", "Bond between two residues");
+    } else if (entity.type === "pocket") {
+      // a binder chain within a distance of listed residues (shared/af3/featurise/constraints.js): boltz2 and chai-1
+      value.type = "text";
+      value.placeholder = "B: A9, A12, A16 @ 6";
+      value.setAttribute("aria-label", "Pocket: a binder chain, the residues it sits by, and a distance in Angstrom");
+    } else if (entity.type === "contact") {
+      value.type = "text";
+      value.placeholder = "A10 - B44 @ 8";
+      value.setAttribute("aria-label", "Contact constraint: two residues within a distance, in Angstrom");
     } else if (entity.type === "smiles") {
       // 🔴 ITS OWN CLASS, BECAUSE `.entity-value-ligand` IS UPPERCASED IN CSS.
       // Borrowing the ligand's styling would DISPLAY a SMILES upper case -
@@ -766,8 +775,8 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
         // so it no longer parsed. Both happened the moment the reader clicked
         // away from the box, silently rewriting what they had typed.
         entity.value = value.value.trim();
-      } else if (entity.type === "contact") {
-        // 🔴 TRIMMED AND NOTHING ELSE, FOR THE THIRD TIME AT THIS SEAM. The
+      } else if (entity.type === "bond" || entity.type === "pocket" || entity.type === "contact") {
+        // 🔴 TRIMMED AND NOTHING ELSE, FOR THE THIRD TIME AT THIS SEAM. (A constraint row too: the same spec syntax.) The
         // `else` below is `cleanSequence`, which keeps only amino-acid letters:
         // a contact typed as `A12:SG - B1:C25` came back `A:SGB:C` the moment
         // the reader clicked away - the residue numbers, the spaces and the
@@ -775,7 +784,7 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
         // is the same branch that turned benzene into hexane, and the comment
         // above it did not stop a third row type walking into it.
         //
-        // 🔴 AND NOT UPPER-CASED HERE EITHER. `parseContact` upper-cases the
+        // 🔴 AND NOT UPPER-CASED HERE EITHER. `parseBond` upper-cases the
         // chain letter and the atom name when it reads them, which is where
         // that belongs; doing it here would also upper-case whatever a reader
         // is halfway through typing.

@@ -526,7 +526,12 @@ static int foldMain(int argc, char** argv) {
       CK(cudaMemsetAsync(t.prevSingle, 0, (size_t)t.n * t.Cs * 4, STREAM));
       t.pass = 0;
     }
-    std::function<void(const char*, const float*, size_t)> none = [](const char*, const float*, size_t) {};
+    // LOCALFOLD_SAVE_SEAMS=<dir> in a fold too: each seam the trunk reports as <dir>/<name>.npy, its last pass's
+    // (the f32 path, --recycles=0: a pass replayed as a CUDA graph reports none, and the f16 path's pair is bf16)
+    std::function<void(const char*, const float*, size_t)> none = [&](const char* name, const float* d, size_t n) {
+      if (const char* dir = getenv("LOCALFOLD_SAVE_SEAMS"); dir != nullptr && !t.p16)
+        writeNpy(std::string(dir) + "/" + name + ".npy", download(d, n), { n });
+    };
     auto clock = [] { return std::chrono::steady_clock::now(); };
     auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
     size_t pairs = (size_t)t.n * t.n;

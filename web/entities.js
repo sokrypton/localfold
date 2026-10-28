@@ -36,10 +36,20 @@ import { cleanSequence, nucleicProblem, sequenceProblem } from "./sequence.js";
  * looks like a three-letter code, so the row says.
  */
 export const ENTITY_TYPES = ["protein", "dna", "rna", "ligand", "smiles",
-                            "contact"];
+                            "bond", "pocket", "contact"];
 
 /**
- * The row types that become a CHAIN. A `contact` does not - it describes a bond
+ * The row types that CONSTRAIN the fold rather than describe the molecule: a `pocket` (a binder chain to sit within a
+ * distance of listed residues) and a `contact` (two tokens within a distance). af3-any-model's `constraints` input,
+ * read by boltz2 and chai-1 alone (shared/af3/featurise/constraints.js); every other model refuses a job with one.
+ *
+ * 🔴 A `contact` is a DISTANCE, the job JSON's own word for it. The covalent link is the `bond` row (`bondedAtomPairs`),
+ * which the page called `contact` until constraints arrived; no saved job carries row types, so nothing reads the old name.
+ */
+export const CONSTRAINT_TYPES = ["pocket", "contact"];
+
+/**
+ * The row types that become a CHAIN. A `bond` does not - it describes a bond
  * between two chains that already exist.
  *
  * 🔴 ASKED AS ONE QUESTION, BECAUSE THE ALTERNATIVE IS A LIST PER CALL SITE.
@@ -55,7 +65,7 @@ export const CHAIN_TYPES = ["protein", "dna", "rna", "ligand", "smiles"];
 export const isChainEntity = (entity) => CHAIN_TYPES.includes(entity.type);
 
 /**
- * A contact row's text, parsed - or null if it is not one.
+ * A bond row's text, parsed - or null if it is not one.
  *
  * The spec is written the way a reader would say it out loud:
  *
@@ -69,7 +79,7 @@ export const isChainEntity = (entity) => CHAIN_TYPES.includes(entity.type);
  * underneath it, which is why the row sits with them rather than in a second
  * list somewhere else.
  */
-export function parseContact(value) {
+export function parseBond(value) {
   const text = String(value ?? "").trim();
   if (text === "") return null;
   const sides = text.split("-");
@@ -86,10 +96,66 @@ export function parseContact(value) {
   return { from, to };
 }
 
+/** One end of a constraint: `A12`, or a ligand atom `B1:PG`. */
+const CONSTRAINT_END = /^\s*([A-Za-z]+)\s*(\d+)\s*(?::\s*([A-Za-z0-9']+)\s*)?$/;
+const constraintEnd = (text) => {
+  const match = CONSTRAINT_END.exec(text);
+  if (match === null) return null;
+  return { chain: match[1].toUpperCase(), residue: Number(match[2]),
+           atom: match[3] === undefined ? null : match[3].toUpperCase() };
+};
+/** The `@ 6` that ends a constraint row: its distance in Angstrom, 6 when absent. */
+const constraintDistance = (text) => {
+  const at = text.lastIndexOf("@");
+  if (at < 0) return { body: text, maxDistance: DEFAULT_CONSTRAINT_DISTANCE };
+  const value = Number(text.slice(at + 1).trim());
+  return Number.isFinite(value) && value > 0 ? { body: text.slice(0, at), maxDistance: value } : null;
+};
+/** A constraint row's distance when it names none: boltz's own pocket default. */
+export const DEFAULT_CONSTRAINT_DISTANCE = 6;
+
+/**
+ * A pocket row's text, parsed - or null.
+ *
+ *     B: A9, A12, A16 @ 6      chain B sits within 6 A of residues A9, A12 and A16
+ *
+ * The binder is a whole chain; each listed end a residue, or a ligand atom (`C1:O1`).
+ */
+export function parsePocket(value) {
+  const parts = constraintDistance(String(value ?? "").trim());
+  if (parts === null) return null;
+  const colon = parts.body.indexOf(":");
+  if (colon < 0) return null;
+  const binder = parts.body.slice(0, colon).trim().toUpperCase();
+  if (!/^[A-Z]+$/.test(binder)) return null;
+  const contacts = parts.body.slice(colon + 1).split(",").map((one) => one.trim()).filter(Boolean)
+    .map(constraintEnd);
+  if (contacts.length === 0 || contacts.some((end) => end === null)) return null;
+  return { binder, contacts, maxDistance: parts.maxDistance };
+}
+
+/**
+ * A contact row's text (a distance constraint), parsed - or null.
+ *
+ *     A10 - B44 @ 8            residue A10 within 8 A of residue B44
+ *     A41 - B1:PG @ 8          ...or of a ligand's atom
+ */
+export function parseContact(value) {
+  const parts = constraintDistance(String(value ?? "").trim());
+  if (parts === null) return null;
+  const sides = parts.body.split("-");
+  if (sides.length !== 2) return null;
+  const token1 = constraintEnd(sides[0]);
+  const token2 = constraintEnd(sides[1]);
+  if (token1 === null || token2 === null) return null;
+  return { token1, token2, maxDistance: parts.maxDistance };
+}
+
 /** How they are labelled, in the order the menu offers them. */
 export const ENTITY_LABELS = {
   protein: "Protein", dna: "DNA", rna: "RNA", ligand: "Ligand (CCD)",
-  smiles: "Ligand (SMILES)", contact: "Contact (bond)",
+  smiles: "Ligand (SMILES)", bond: "Bond",
+  pocket: "Pocket (constraint)", contact: "Contact (constraint)",
 };
 
 /**
@@ -345,14 +411,27 @@ export function modificationProblem(modification, sequence) {
  */
 export function entityProblem(entity) {
   if (!ENTITY_TYPES.includes(entity.type)) return `Unknown entity type ${entity.type}`;
+  if (entity.type === "pocket") {
+    return parsePocket(entity.value) === null
+      ? "A pocket is a binder chain and the residues it sits by, as B: A9, A12, A16 @ 6 (Angstrom)" : null;
+  }
   if (entity.type === "contact") {
     const parsed = parseContact(entity.value);
+    if (parsed === null) return "A distance is two residues and a bound, as A10 - B44 @ 8 (a ligand atom as B1:PG)";
+    if (parsed.token1.chain === parsed.token2.chain && parsed.token1.residue === parsed.token2.residue
+        && parsed.token1.atom === parsed.token2.atom) {
+      return "A contact joins two different tokens";
+    }
+    return null;
+  }
+  if (entity.type === "bond") {
+    const parsed = parseBond(entity.value);
     if (parsed === null) {
-      return "A contact is two residues, as A12:SG - B1:C25 (the atoms optional)";
+      return "A bond is two residues, as A12:SG - B1:C25 (the atoms optional)";
     }
     if (parsed.from.chain === parsed.to.chain
         && parsed.from.residue === parsed.to.residue) {
-      return "A contact joins two different residues";
+      return "A bond joins two different residues";
     }
     return null;
   }
@@ -494,8 +573,8 @@ export function expandEntities(entities) {
   const smilesCodes = new Map();
   for (const entity of entities) {
     // 🔴 A CONTACT IS NOT A CHAIN, and the `else` below would make it a LIGAND.
-    // Handled after the loop, once the chains it names exist.
-    if (entity.type === "contact") continue;
+    // Handled after the loop, once the chains it names exist. Nor is a constraint.
+    if (entity.type === "bond" || CONSTRAINT_TYPES.includes(entity.type)) continue;
     for (let copy = 0; copy < entity.copies; copy += 1) {
       if (POLYMER_TYPES.includes(entity.type)) {
         for (const modification of entity.modifications ?? []) {
@@ -556,8 +635,8 @@ export function expandEntities(entities) {
   // convention is invented on the way.
   const bonds = [];
   for (const entity of entities) {
-    if (entity.type !== "contact") continue;
-    const parsed = parseContact(entity.value);
+    if (entity.type !== "bond") continue;
+    const parsed = parseBond(entity.value);
     if (parsed === null) continue;
     const asymOf = (letter) => {
       const at = letter.split("").reduce(
@@ -574,9 +653,32 @@ export function expandEntities(entities) {
     });
     bonds.push({ from: end(parsed.from), to: end(parsed.to) });
   }
+  // ...and the constraints, resolved to the same asym numbers (shared/af3/featurise/constraints.js), in row order:
+  // boltz2 writes its pockets before its contacts and later writes win, which the featuriser keeps.
+  const letterAsym = (letter) => letter.split("").reduce(
+    (total, character) => total * 26 + (character.charCodeAt(0) - 64), 0) - 1;
+  const constraintEndOf = (end) => ({ asym: letterAsym(end.chain), residue: end.residue,
+                                      ...(end.atom === null ? {} : { atom: end.atom }) });
+  const constraints = [];
+  for (const entity of entities) {
+    if (entity.type === "pocket") {
+      const parsed = parsePocket(entity.value);
+      if (parsed !== null) {
+        constraints.push({ kind: "pocket", binder: letterAsym(parsed.binder),
+                           contacts: parsed.contacts.map(constraintEndOf), maxDistance: parsed.maxDistance });
+      }
+    } else if (entity.type === "contact") {
+      const parsed = parseContact(entity.value);
+      if (parsed !== null) {
+        constraints.push({ kind: "contact", token1: constraintEndOf(parsed.token1),
+                           token2: constraintEndOf(parsed.token2), maxDistance: parsed.maxDistance });
+      }
+    }
+  }
   return {
     chains, chainKinds, chainMsa, ligandCodes, modifications, templates,
     ...(bonds.length === 0 ? {} : { bonds }),
+    ...(constraints.length === 0 ? {} : { constraints }),
     sequence: chains.join(":"),
   };
 }

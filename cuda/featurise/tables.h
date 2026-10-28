@@ -52,6 +52,7 @@ struct FamilyFlags {
   bool if2ProfileMsa;               // intellifold2: the profile over each chain's own sequences (msa-features.js)
   int templateModified;             // a template's modified residue: 0 parent, 1 unk_n, 2 drop_hit, 3 unk_restype
   bool templateAltlocFirst;         // boltz2, rf3: a template residue's first altloc
+  const char* constraintFamily;     // constraints.h: "boltz2", "chai1", or "" for a family trained on neither
 };
 // shared/af3/featurise/boltz2-conformers.js: a residue's stored atoms in Boltz-2's raw frame
 struct RawAtom { const char* name; double x, y, z; };

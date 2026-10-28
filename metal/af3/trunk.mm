@@ -3,6 +3,7 @@
 #include "af3.h"
 #include <cmath>
 #include "msa_draw.h"
+#include "constraint_tables.h"
 
 static const int* Ib(const std::string& k) { return M.i(k); }
 static const float* Fb(const std::string& k) { return M.f(k); }
@@ -200,6 +201,8 @@ static void embed(Trunk& t) {
                          hasW(E + "chaiChainEntity") ? W(E + "chaiChainEntity") : nullptr,
                          M.has("batch.declaredBondMatrix") ? M.f("batch.declaredBondMatrix") : nullptr,
                          hasW(E + "chaiBondTrunk") ? W(E + "chaiBondTrunk") : nullptr, t.pair, (uint)n, (uint)C});
+    // ...and a job's pocket and contact constraints, through the trunk half of chai's restraint columns
+    addChai1Constraints(t.pair, pairs, 0, C, C, 0, "chai.trunk", E + "chaiRestraintTrunk", 0);
   };
   if (chai && t.pass == 0) {
     half* pn = scratch<half>("emb.prevln", pairs * C);
@@ -235,6 +238,8 @@ static void embed(Trunk& t) {
                         types && M.has("batch.bondOrderMatrix") ? Fb("batch.bondOrderMatrix") : nullptr,
                         types ? W(E + "tokenBondsTypeEmbed") : nullptr, types ? W(E + "contactEncodingUnspecified") : nullptr,
                         pairs, (uint)C, 0});
+  // ...and boltz2's: a job's pocket and contact constraints, each pair's term less the unspecified constant just added
+  if (types) addBoltz2Constraints(t.pair, pairs, C, E);
   releaseScratch({"emb.prevln"});
   auto buildSingle = [&]() {      // the single: target_feat projected, plus the recycled single's (chai's first: s_init's)
     if (!flag("trunk.dialect.pairInitFromSingle")) lin(tfh, E + "singleActivations", t.single, np, t.F, t.Cs);

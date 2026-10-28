@@ -32,6 +32,8 @@ struct OuterSumArgs { CP(float) left; CP(float) right; CP(float) add; DP(float) 
                       uint dropKey, dropThreshold; float dropScale; uint dropOn; };
 // pair += the 139 relative-encoding rows a pair's one-hot selects
 struct RelEncArgs { RelIdx r; CP(float) W; DP(float) pair; uint n, C; };
+// out[row][offset + c] += table[index[p0 + row]][c]: a job's pocket and contact constraints (constraints.h)
+struct AddTableArgs { DP(float) out; CP(float) index; CP(float) table; u64 rows, p0; uint C, stride, offset, pad; };
 // pair += bonds[ij] w + (boltz2) table[order[ij]] + unspecified
 struct BondEmbedArgs { DP(float) pair; CP(float) bonds; CP(float) w; CP(float) orders; CP(float) table; CP(float) unspecified;
                        u64 pairs; uint C, pad; };

@@ -380,6 +380,10 @@ inline void boltz2Reembed(float* pair, float* single, const float* trunkPair, co
     M.has("batch.bondMatrix") ? Fdev("batch.bondMatrix") : nullptr,
     M.has("batch.bondOrderMatrix") ? Fdev("batch.bondOrderMatrix") : nullptr,
     W(R + "tokenBondsProject"), W(R + "tokenBondsTypeEmbed"), W(R + "contactEncodingUnspecified"), n, C));
+  {   // a job's pocket and contact constraints (constraints.cuh), less the unspecified constant just added
+    ConstraintTable ct = boltz2ConstraintTable(R, C);
+    WITH_PT(p16, addConstraintTable<PT>(pair, ct, 0, pairs, C, "conf_contact"));
+  }
   // the outer product of the two s_inputs projections through sToZProdOut, in row chunks
   int rowsPer = std::max<int>(1, (int)(CHUNK / ((size_t)n * C)));
   float* prod = scratch<float>("conf.prod", (size_t)std::min(rowsPer, n) * n * C);
@@ -431,6 +435,7 @@ inline void boltz2ReembedRows(float* base, float* single, const void* trunkRows,
     M.has("batch.bondMatrix") ? Fdev("batch.bondMatrix") : nullptr,
     M.has("batch.bondOrderMatrix") ? Fdev("batch.bondOrderMatrix") : nullptr,
     W(R + "tokenBondsProject"), W(R + "tokenBondsTypeEmbed"), W(R + "contactEncodingUnspecified"), n, C, hf * C, (hf + hp) * C);
+  addConstraintTable<B16>(base, boltz2ConstraintTable(R, C), hf, hf + hp, C);   // (a job's constraints: constraints.cuh)
   const int rowsPer = std::max<int>(1, std::min<int>(rows, (int)(CHUNK / ((size_t)n * C))));
   float* prod = scratch<float>("conf.prod", (size_t)rowsPer * n * C);
   float* out = scratch<float>("conf.prodOut", (size_t)rowsPer * n * C);

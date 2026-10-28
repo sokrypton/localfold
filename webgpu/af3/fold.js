@@ -1013,6 +1013,9 @@ async function foldHolding(device, batch, weights, options, held) {
       // fixing that alone changed the fold by exactly nothing - the second
       // plane was still arriving as zeros from HERE.
       bondOrderMatrix: batch.bondOrderMatrix,
+      // ...and boltz2's pocket and contact constraints (shared/af3/featurise/constraints.js), when the job has any
+      ...(batch.contactConditioning === undefined ? {}
+        : { contactConditioning: batch.contactConditioning, contactThreshold: batch.contactThreshold }),
       // ...and the chain ids, which the template embedder masks its geometry
       // by. See the note at its call site in trunk.js.
       asymId: batch.asymId,
@@ -1318,6 +1321,8 @@ async function foldHolding(device, batch, weights, options, held) {
       // them and the field is simply absent there.
       features: batch.features, bondMatrix: batch.bondMatrix,
       bondOrderMatrix: batch.bondOrderMatrix,
+      ...(batch.contactConditioning === undefined ? {}
+        : { contactConditioning: batch.contactConditioning, contactThreshold: batch.contactThreshold }),
       // 🔴 THE TRUNK'S DIALECT, BECAUSE `weights.confidence.dialect` DOES NOT
       // EXIST. `confidenceWeights` never set one, so this argument has been
       // `undefined` for every model since the head was written - and every

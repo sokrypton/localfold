@@ -273,6 +273,13 @@ inline Conditioning diffusionConditioning(const float* trunkSingle, const float*
           Idev("batch.features.tokenIndex"), Idev("batch.features.asymId"), denseRank("batch.features.entityId"),
           denseRank("batch.features.symId"), W(P + ".structurePairWeights"), W(P + ".structurePairBias"),
           M.has("batch.declaredBondMatrix") ? Fdev("batch.declaredBondMatrix") : nullptr, W(P + ".structureBondWeights"), f2, n, Cz, p0, r);
+        // ...and a job's pocket and contact constraints, through the structure half's restraint rows 149..162
+        ConstraintTable ct = chai1ConstraintTable("chai.structure", P + ".structurePairWeights", 149, Cz);
+        if (ct.table != nullptr) {
+          if (p0 == 0) constraintSeam("chai_structure_pair_before", f2, r * width);
+          addConstraintRowsK<<<blocks(r * Cz), 256, 0, STREAM>>>(f2, ct.index, ct.table, p0, r, width, Czt, Cz);
+          if (p0 == 0) constraintSeam("chai_structure_pair_after", f2, r * width);
+        }
       } else if (!split && !relpe) features(f2, Czt);
       else {
         float* relRows = scratch<float>("dc.rel", per * rel);

@@ -111,6 +111,13 @@ inline void addBatch(Entries& e, const Batch& b, bool withBondMatrix = true) {
     e.t(p + "bondOrderMatrix", b.bondOrderMatrix);
   }
   if (!b.declaredBondMatrix.empty()) e.t(p + "declaredBondMatrix", b.declaredBondMatrix);
+  if (!b.contactConditioning.empty()) {
+    e.t(p + "contactConditioning", b.contactConditioning); e.t(p + "contactThreshold", b.contactThreshold);
+  }
+  if (!b.tokenDistanceRestraint.empty()) {
+    e.t(p + "tokenDistanceRestraint", b.tokenDistanceRestraint);
+    e.t(p + "tokenPairPocketRestraint", b.tokenPairPocketRestraint);
+  }
   if (b.ligandSpans.empty()) e.empty(p + "ligandSpans");
   for (size_t k = 0; k < b.ligandSpans.size(); ++k) {
     const auto& s = b.ligandSpans[k];

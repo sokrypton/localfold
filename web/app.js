@@ -2959,6 +2959,8 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
     // not this fold's - the `chainKinds` rule beside it. Off `foldContext`,
     // because this function is handed chains and ligands and never the rows.
     bonds: foldContext.bonds ?? [],
+    // ...and so does a constraint
+    constraints: foldContext.constraints ?? [],
     alignment: alignmentBlocks === null ? null : cheapHash(JSON.stringify(alignmentBlocks)),
   });
   const cached = trunkCache?.key === trunkKey ? trunkCache.reusable : undefined;
@@ -3075,7 +3077,7 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   const result = await foldAf3({
     sequence, calls, recycles, weights, device, signal,
     alignment: alignmentBlocks, maxMsaSequences, ligandCodes, modifications,
-    chainKinds, reuse, bonds: foldContext.bonds,
+    chainKinds, reuse, bonds: foldContext.bonds, constraints: foldContext.constraints,
     ...(msaColumnKinds === undefined ? {} : { msaColumnKinds }),
     // 🔴 WHICH TOKENS THE VIEWER DRAWS, and the reason every matrix below goes
     // through it: a modified residue is one POSITION and ten TOKENS, so its
@@ -4726,7 +4728,7 @@ async function fold(event) {
     // 🔴 THE BONDS COME OFF THE ROWS, NOT OUT OF A VARIABLE. They were held in
     // `jobBonds`, set when a job loaded and invisible thereafter - the same
     // shape as the job NAME that was built and then removed for being state
-    // nobody could see. A `contact` row sits in the entity list with the chains
+    // nobody could see. A `bond` row sits in the entity list with the chains
     // it names, so editing the rows edits the bonds, and `expandEntities`
     // resolves the letters against the chain order the fold will actually see.
     const bonds = request.bonds ?? [];
@@ -4737,6 +4739,13 @@ async function fold(event) {
     const nucleicCount = chainKinds.filter((kind) => kind !== "protein").length;
     let family = modelFamily(ligandCodes.length, modifications.length, nucleicCount,
                              (request.templates ?? []).length);
+    // 🔴 A CONSTRAINT IS REFUSED BY A MODEL THAT CANNOT READ IT, NOT FOLDED AS IF IT WERE NOT THERE. Boltz-2 and
+    // chai-1 were trained on pockets and contacts (shared/af3/featurise/constraints.js); every other family's path
+    // never looks at the rows, so this is the one place that can say so before any download.
+    if ((request.constraints ?? []).length > 0 && family !== "boltz2" && family !== "chai1") {
+      throw new Error(`${MODEL_LABELS[family] ?? family} was not trained with pocket or contact constraints;`
+        + " choose Boltz-2 or Chai-1, or remove the pocket and distance rows");
+    }
     // 🔴 THE TERMS ARE ASKED BEFORE THE DOWNLOAD, NOT BEFORE THE PAGE. AF3's
     // parameters carry DeepMind's own terms, and the moment they apply is the
     // moment the bytes are fetched - which is the next line. Asking on page
@@ -4988,6 +4997,8 @@ async function fold(event) {
     foldContext = {
       entities,
       bonds,
+      // ...and the pocket and contact constraints, off the rows the same way (read by boltz2 and chai-1 alone)
+      constraints: request.constraints ?? [],
       // 🔴 THE FORM AS IT IS RIGHT NOW, which is what makes a restored fold
       // continuable: it rides into every prediction through the spread of
       // this object and into the session through jobMeta. Read HERE, at the
@@ -5944,7 +5955,7 @@ function applyJob(job) {
     modeSelect.value = modeBeforeJob;
     syncMode();
   }
-  // 🔴 CHAINS, NOT ROWS. A contact row is a bond between two chains and a
+  // 🔴 CHAINS, NOT ROWS. A bond row is a bond between two chains and a
   // ligand is not a chain either, so counting rows reported "2 chains + 1
   // ligand" for a protein, a ligand and the bond between them.
   const chains = job.entities.reduce((total, entity) =>
