@@ -100,7 +100,11 @@ for byte as the page does (`tools/check-native-featuriser.py`, the `crosslinks` 
 Folded (`tools/fixtures/crosslinks/barnase_barstar.json`, Boltz-2, no MSA, one sample): the crosslinked residues'
 CA-CA go from 12.4 / 45.6 / 33.1 A unlinked to 18.5 / 14.9 / 14.6 A, ipTM from 0.09 to 0.22, but only 3 of the 6
 residue-bridge bonds close under 2 A (WebGPU's int5 fold alike, `tools/gpu/fold-crosslinks.js`). A bond is a
-declared feature, not a hard constraint: as af3x notes, crosslinks the model cannot satisfy together get broken.
+declared feature, not a hard constraint: as af3x notes, crosslinks the model cannot satisfy together get broken -
+and here they cannot, since no lysine pair across the confident complex's interface is within DSSO's ~10 A. Two
+satisfiable ones (DSSO A19-A49 and A66-A108, folded on the page with an MSA): AlphaFold 3 closes all four bonds
+(1.17-1.25 A), Boltz-2 two of them (1.47, 1.64 A; the others 2.75, 3.76 A) - how hard a model holds a declared bond
+is the model's own.
 
 **Or flags**, for the common cases:
 
