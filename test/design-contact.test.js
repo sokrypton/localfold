@@ -54,6 +54,9 @@ describe("is the designed chain touching what it was designed against", () => {
     expect(problem).toContain("0/1 hotspots");
     // and residue 10 it does touch
     expect(contactProblem(wrongFace, { chain: "A", residues: { B: [10] } })).toBe(null);
+    // 🔴 and naming none is no hotspots, not "touch nothing"
+    expect(contactProblem(wrongFace, { chain: "A", residues: {} })).toBe(null);
+    expect(contactProblem(wrongFace, { chain: "A", residues: { B: [] } })).toBe(null);
   });
 
   // 🔴 A HOTSPOT THE PREDICTION DOES NOT HAVE IS REPORTED, NOT DROPPED. Asking

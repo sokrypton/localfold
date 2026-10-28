@@ -76,8 +76,11 @@ export function contactOf(pdb, options) {
   // 🔴 WANTED RESIDUES ARE FILTERED FROM WHAT IS THERE, not assumed present. A
   // hotspot naming a residue the prediction does not have is a thing to report -
   // "0 of 4 touched" is honest, silently asking for 3 is not.
-  const asked = residues === undefined ? null : new Set(
-    Object.entries(residues).flatMap(([id, list]) => list.map((residue) => `${id}:${residue}`)));
+  // 🔴 AND AN EMPTY SET NAMES NO HOTSPOTS: read as a set to touch it left no target residue at all,
+  // so every cycle was refused as touching nothing
+  const named = residues === undefined ? []
+    : Object.entries(residues).flatMap(([id, list]) => list.map((residue) => `${id}:${residue}`));
+  const asked = named.length === 0 ? null : new Set(named);
   const targets = asked === null ? theirs
     : theirs.filter((entry) => asked.has(`${entry.chain}:${entry.residue}`));
 
