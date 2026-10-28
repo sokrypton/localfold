@@ -97,3 +97,19 @@ test("a pocket's design chain is drawn round its ligand", () => {
   const centre = points.reduce((s, p) => [s[0] + p[0], s[1] + p[1], s[2] + p[2]], [0, 0, 0]).map((v) => v / points.length);
   assert.ok(dist(centre, [52.5, 20, -10]) < 3, `centre ${centre}`);
 });
+
+// 🔴 A DNA OR RNA PIECE IS SKETCHED AS NUCLEOTIDES, which py2Dmol draws as nucleic: it was GLY
+// C-alphas, a protein trace, whatever "Made of" said. A designed piece has no letters yet and is the
+// dictionary's unknown nucleotide - "D" alone, which `"ACGT".includes("")` once gave it, is no residue.
+test("a nucleic piece is a strand of C4's, named by its bases", () => {
+  const spans = [{ kind: "generated", min: 4, max: 4, polymer: "dna" }, { kind: "break" },
+    { kind: "sequence", value: "ACGU", polymer: "rna" }, { kind: "break" }, { kind: "generated", min: 3, max: 3 }];
+  const { atoms, ghosts } = sketchJob([], new Map(), spans);
+  const [dna, rna, protein] = [...ghosts.keys()].map((letter) => atoms.filter((a) => a.chainId === letter));
+  assert.deepEqual(dna.map((a) => `${a.resName}:${a.atomName}`), Array(4).fill("DN:C4'"));
+  assert.deepEqual(rna.map((a) => a.resName), ["A", "C", "G", "U"]);
+  assert.deepEqual(protein.map((a) => `${a.resName}:${a.atomName}`), Array(3).fill("GLY:CA"));
+  // ...a strand's step, not a C-alpha's (6.5 A along the ball's arc, so a little less as a chord)
+  const step = dist(xyz(dna[0]), xyz(dna[1]));
+  assert.ok(step > 5.5 && step <= 6.5, `step ${step}`);
+});

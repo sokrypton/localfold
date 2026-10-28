@@ -4,7 +4,8 @@
  * The viewer used to stay empty until a structure was loaded, and then drew only that structure -
  * so a newcomer saw nothing of what step 3 says will be built. It now draws the job: the loaded
  * structure's real atoms, and for every piece still to be designed (a `Designed` or `Sequence`
- * span) a C-alpha trace of its length, faded, joining the pieces it sits between.
+ * span) a trace of its length - C-alphas, or C4's for DNA and RNA - faded, joining the pieces it sits
+ * between.
  *
  * 🔴 A SKETCH, NOT A PREDICTION, and drawn so it cannot be read as one: its geometry is a curve or a
  * ball of the right number of 3.8 A steps, nothing a model computed, and the page fades it and says
@@ -18,6 +19,16 @@
 import { chainOfSpans } from "./contig-ui.js";
 
 const STEP = 3.8;   // A, C-alpha to C-alpha
+// 🔴 A DNA OR RNA PIECE IS SKETCHED AS NUCLEOTIDES (2026-10-28): it was GLY C-alphas whatever it was
+// made of, so py2Dmol drew a nucleic piece as protein. Each residue is one C4' - the atom py2Dmol
+// traces a nucleic chain through - a B-DNA step apart, named by its base (DA..DT, A..U) or, still
+// to be designed, as the dictionary's unknown nucleotide (DN, N).
+const NUCLEIC_STEP = 6.5;   // A, C4' to C4' along a strand
+// (one letter, tested as one: "ACGT".includes("") is true, which named a designed piece "D")
+const NUCLEIC_NAME = {
+  dna: (letter) => (letter.length === 1 && "ACGT".includes(letter) ? `D${letter}` : "DN"),
+  rna: (letter) => (letter.length === 1 && "ACGU".includes(letter) ? letter : "N"),
+};
 
 const sub = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
 const add = (a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
@@ -51,8 +62,8 @@ export function pieceLength(span) {
  * which is what leaves room between the turns for the sketch to read as a wire globe rather than
  * a helical spring.
  */
-export function ballRadius(n) {
-  return Math.max(STEP, 1.6 * STEP * Math.sqrt(n / (4 * Math.PI)));
+export function ballRadius(n, step = STEP) {
+  return Math.max(step, 1.6 * step * Math.sqrt(n / (4 * Math.PI)));
 }
 
 /** Rotate `p` by the rotation that takes unit vector `from` onto unit vector `to`. */
@@ -75,8 +86,8 @@ function rotateOnto(p, from, to) {
  */
 const PROLATE = 1.25;
 
-export function ball(n, centre, pole, radius = ballRadius(n)) {
-  const want = Math.max(0, n - 1) * STEP;
+export function ball(n, centre, pole, radius = ballRadius(n), step = STEP) {
+  const want = Math.max(0, n - 1) * step;
   const CAP = 0.45;   // rad kept clear at each pole
   const SAMPLES = 2048;
   // ...a little longer along its axis than across, so the viewer's best view looks at it from the
@@ -117,7 +128,7 @@ export function ball(n, centre, pole, radius = ballRadius(n)) {
     const p = at(c, s / SAMPLES);
     travelled += norm(sub(p, last));
     last = p;
-    if (travelled >= local.length * STEP) local.push(p);
+    if (travelled >= local.length * step) local.push(p);
   }
   while (local.length < n) local.push(at(c, 1));
   // turned so the first point sits on the pole axis, where the neighbour is
@@ -134,12 +145,12 @@ export function ball(n, centre, pole, radius = ballRadius(n)) {
  * is constant, and a long linker over a short gap is a tight bow - a parabola's apex put 2.4 A
  * steps there. A circle of the right size takes any length, up to nearly a full loop.
  */
-export function bridge(n, from, to, outward) {
+export function bridge(n, from, to, outward, step = STEP) {
   const chord = sub(to, from);
   const gap = norm(chord);
   const along = unit(chord);
   const steps = n + 1;
-  if (gap >= steps * STEP || gap < 1e-6) {
+  if (gap >= steps * step || gap < 1e-6) {
     return Array.from({ length: n }, (_, k) => add(from, scale(chord, (k + 1) / steps)));
   }
   let bow = sub(outward, scale(along, dot(outward, along)));
@@ -151,10 +162,10 @@ export function bridge(n, from, to, outward) {
   let hi = 2 * Math.PI - 1e-9;
   for (let i = 0; i < 60; i += 1) {
     const mid = (lo + hi) / 2;
-    if (ratio(mid) > gap / STEP) lo = mid; else hi = mid;
+    if (ratio(mid) > gap / step) lo = mid; else hi = mid;
   }
   const theta = (lo + hi) / 2;
-  const radius = STEP / (2 * Math.sin(theta / (2 * steps)));
+  const radius = step / (2 * Math.sin(theta / (2 * steps)));
   const centre = add(scale(add(from, to), 0.5), scale(bow, -radius * Math.cos(theta / 2)));
   const start = Math.PI / 2 + theta / 2;
   return Array.from({ length: n }, (_, k) => {
@@ -233,22 +244,25 @@ export function sketchJob(structure, chainOf, spans, { hotspots = [] } = {}) {
       }
       const n = pieceLength(span);
       if (n === 0) return;
+      const polymer = span.polymer ?? "protein";
+      const nucleic = NUCLEIC_NAME[polymer];
+      const step = nucleic === undefined ? STEP : NUCLEIC_STEP;
       const nextSpan = spans[indices[at + 1]];
       const next = nextSpan?.kind === "segment" ? ends(nextSpan)[0] ?? null : null;
       let points;
       if (previous !== null && next !== null) {
-        points = bridge(n, previous, next, sub(scale(add(previous, next), 0.5), centroid));
+        points = bridge(n, previous, next, sub(scale(add(previous, next), 0.5), centroid), step);
       } else if (previous !== null || next !== null) {
         // one neighbour: a ball touching it, on the side away from the structure
         const anchor = previous ?? next;
         const out = unit(sub(anchor, centroid));
-        const radius = ballRadius(n);
-        points = ball(n, add(anchor, scale(out, radius + STEP)), scale(out, -1));
+        const radius = ballRadius(n, step);
+        points = ball(n, add(anchor, scale(out, radius + step)), scale(out, -1), radius, step);
         if (previous === null) points.reverse();   // ...ending at the piece after it
       } else {
         // a chain of its own: beside the hotspots if there are any, round the ligand of a pocket
         // job, else beside the structure
-        let radius = ballRadius(n);
+        let radius = ballRadius(n, step);
         let centre;
         if (hotCentre === null && pocket && free === 0) {
           radius = Math.max(radius, ligandExtent + 5);
@@ -261,14 +275,17 @@ export function sketchJob(structure, chainOf, spans, { hotspots = [] } = {}) {
         } else {
           centre = add(centroid, [extent + radius + 8 + free * 2 * (radius + 6), 0, 0]);
         }
-        points = ball(n, centre, [0, 0, 1], radius);
+        points = ball(n, centre, [0, 0, 1], radius, step);
         free += 1;
       }
       const letter = nextLetter();
       ghosts.set(letter, { span: index, chain });
+      // a Sequence piece's own letters; a Designed one has none yet
+      const letters = span.kind === "sequence" ? String(span.value ?? "").replace(/[^A-Za-z]/g, "").toUpperCase() : "";
       points.forEach(([x, y, z], k) => {
-        atoms.push({ chainId: letter, resId: k + 1, resName: "GLY", atomName: "CA", element: "C",
-          x, y, z, isHetero: false });
+        atoms.push({ chainId: letter, resId: k + 1, x, y, z, isHetero: false, element: "C",
+          ...(nucleic === undefined ? { resName: "GLY", atomName: "CA" }
+            : { resName: nucleic(letters[k] ?? ""), atomName: "C4'" }) });
       });
       previous = points[points.length - 1];
     });
