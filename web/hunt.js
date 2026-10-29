@@ -19,7 +19,7 @@
  * and the rest are not in FOLDERS yet.
  */
 import { getDevice } from "./model.js";
-import { AF3_COUNTS, af3SequenceProblem, foldAf3, loadAf3Weights } from "./af3-model.js";
+import { AF3_COUNTS, af3SequenceProblem, foldAf3, foldTogether, loadAf3Weights } from "./af3-model.js";
 import { CHAIN_IDS, runDesign } from "../webgpu/design/hunter-loop.js";
 import { designChain, loadDesigner } from "../cpu/design/mpnn-bridge.js";
 import { chooseDesigner, DESIGNERS, NUCLEIC_KINDS } from "../cpu/design/designers.js";
@@ -47,6 +47,8 @@ export { FOLDERS } from "./validate-design.js";
  *   code at one position of one chain
  * @param {number} [options.chainIndex=0] which chain is designed
  * @param {string[]} [options.folders=["af3"]] which models fold, rotating one per cycle
+ * @param {boolean} [options.together] fold every cycle with ALL the folders at once, averaging their
+ *   denoisers each step (foldTogether), the rotation choosing which one leads
  * @param {string} [options.designer="auto"] a key of DESIGNERS, or "auto"
  * @param {{ligands?: number, nucleic?: number}} [options.contents] what the
  *   target carries, for the automatic designer
@@ -251,9 +253,9 @@ export async function hunt(options) {
         // structure, instead of from noise (shared/af3/structure/warm-start.js)
         const warm = options.warm !== undefined && context.previous !== undefined
           && context.cycle >= (options.warm.from ?? 2);
-        return foldAf3({
-          sequence, weights: loaded.get(folder), device, signal,
-          ...(warm ? { start: { pdb: context.previous, level: options.warm.level } } : {}),
+        const optionsFor = (model) => ({
+          sequence, weights: loaded.get(model), device, signal,
+          ...(warm && model === folder ? { start: { pdb: context.previous, level: options.warm.level } } : {}),
           // A ligand and a nucleic chain change the FOLD as well as the
           // designer: the featuriser gives each ligand a chain of its own and
           // reads a nucleic chain one token per base.
@@ -263,8 +265,8 @@ export async function hunt(options) {
           // the fold fetches it and the token count does not change.
           ...(modifications === undefined || modifications.length === 0
             ? {} : { modifications }),
-          ...(pocket.length > 0 && readsPocket(folder) ? { constraints: pocket } : {}),
-          ...(steering ? { steer: { binder: chainIndex, contacts: pocket[0].contacts, ...options.steer } } : {}),
+          ...(pocket.length > 0 && readsPocket(model) ? { constraints: pocket } : {}),
+          ...(steering && model === folder ? { steer: { binder: chainIndex, contacts: pocket[0].contacts, ...options.steer } } : {}),
           seed: (options.seed ?? 0) + context.run,
           recycles: options.recycles,
           // 🔴 foldAf3 HAS NO DEFAULT FOR `calls` - it destructures it and the
@@ -272,12 +274,20 @@ export async function hunt(options) {
           // "Folding 16/undefined" into the status line. The sampler's own
           // preferred count is the right default here.
           calls: options.steps ?? AF3_COUNTS.diffusion.preferred,
-          onStatus: (text) => status(
+          onStatus: model !== folder ? () => {} : (text) => status(
             `run ${context.run + 1}/${runs} · cycle ${context.cycle}/${cycles}`
             + (context.draws > 1 ? ` · sequence ${(context.draw ?? 0) + 1}/${context.draws}` : "")
-            + `${folders.length > 1 ? ` · ${folder}` : ""} · ${text}`),
-          onProgress: (fraction) => toBar(spanOf(done, fraction)),
+            + `${folders.length > 1 ? ` · ${options.together ? folders.join("+") : folder}` : ""} · ${text}`),
+          onProgress: model !== folder ? () => {} : (fraction) => toBar(spanOf(done, fraction)),
         });
+        // 🔴 FOLDED TOGETHER (2026-10-29): every folder denoises every step of one walk, this cycle's
+        // leading it (web/af3-model.js foldTogether) - so the design is one all of them lean toward,
+        // not one each in turn accepts or refuses
+        if (options.together && folders.length > 1) {
+          const [led] = await foldTogether([folder, ...folders.filter((name) => name !== folder)].map(optionsFor));
+          return led;
+        }
+        return foldAf3(optionsFor(folder));
       },
 
       design: async (pdb, context) => {

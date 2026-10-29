@@ -1243,9 +1243,15 @@ async function foldHolding(device, batch, weights, options, held) {
   if (options.steer !== undefined && structural !== undefined) {
     throw new Error("steering is not wired for a model that samples in structural tokens (OpenDDE)");
   }
+  // 🔴 ...AND SO DOES FOLDING TOGETHER, whose denoisers average atom slot by atom slot
+  if ((options.partners !== undefined || options.lend !== undefined) && structural !== undefined) {
+    throw new Error("folding together is not wired for a model that samples in structural tokens (OpenDDE)");
+  }
   const sampled = await sampleOnGpu(device, headInput, weights.diffusion, {
     ...(start === undefined ? {} : { start }),
     ...(options.steer === undefined ? {} : { steer: options.steer }),
+    ...(options.partners === undefined ? {} : { partners: options.partners }),
+    ...(options.lend === undefined ? {} : { lend: options.lend }),
     steps, stopAfter: options.stopAfter, head,
     normal: normalFrom(options.seed ?? 20260831),
     onStep,

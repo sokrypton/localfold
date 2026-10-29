@@ -14,6 +14,7 @@
 import { noiseLevels, randomAugmentation, samplerStep } from "../../../cpu/af3/diffusion/diffusion-sampler.js";
 import { weightedRigidAlign } from "../../../cpu/af3/diffusion/rigid-align.js";
 import { steerDenoised } from "../../../cpu/af3/diffusion/steering.js";
+import { meanOfDenoisers } from "../../../cpu/af3/diffusion/together.js";
 import { Af3DiffusionHeadGpu } from "./diffusion-head.js";
 
 /**
@@ -25,12 +26,18 @@ import { Af3DiffusionHeadGpu } from "./diffusion-head.js";
  *          noiseScale?: number, stepScale?: number, schedule?: "karras"|"geometric",
  *          update?: "euler"|"exponential", churn?: boolean,
  *          start?: {positions: Float32Array, level: number},
- *          steer?: {binder: number[], pocket: number[], weight: number, cutoff?: number}}} options
+ *          steer?: {binder: number[], pocket: number[], weight: number, cutoff?: number},
+ *          partners?: {denoise: Function, done: Function}[],
+ *          lend?: (denoise: Function) => Promise<{positions: Float32Array, atomMask: ArrayLike<number>}>}} options
  *   `start` begins the walk part-way down: at the first scheduled level at or below `level`
  *   (angstroms), from `positions` (the dense layout) plus that much noise, running only the steps
  *   left. RFdiffusion's partial diffusion, on AF3's schedule.
  *   `steer` pulls the `binder` tokens toward the `pocket` tokens: each denoised prediction has its
  *   binder translated down a contact restraint before the update reads it (cpu/af3/diffusion/steering.js).
+ *   `partners` are other models' denoisers, lent by their own folds of the same structure: each step
+ *   every one denoises the same noisy positions, and the walk steps toward the mean of the answers.
+ *   `lend` is the other side - a fold that hands its denoiser to such a walk instead of walking, and
+ *   returns the structure that walk ends at.
  */
 export async function sampleOnGpu(device, input, weights, options) {
   const { steps, normal } = options;
@@ -69,6 +76,32 @@ export async function sampleOnGpu(device, input, weights, options) {
   // joins the same levels a cold fold visits at the first one at or below `start.level`, so the
   // last steps - where side chains and bonds resolve - are exactly a cold fold's, and the steps
   // above are simply not taken: fewer denoiser calls, not the same number squeezed lower.
+  // 🔴 A LENT DENOISER WALKS NOTHING ITSELF (2026-10-29): it answers another fold's sampler, on
+  // that walk's noisy positions, until the walk ends - and its own fold carries on from the end,
+  // so its confidence head scores the structure both models made
+  if (options.lend !== undefined) {
+    try {
+      const ended = await options.lend(async (noisy, tHat) => ({
+        positions: (await head.run({ ...input, noiseLevel: tHat, positionsNoisy: noisy }, weights)).positions,
+        atomMask: input.atomMask,
+      }));
+      if (ended.positions.length !== atoms * 3) {
+        throw new Error(`a lent denoiser's walk ended at ${ended.positions.length / 3} atom slots, not ${atoms}`);
+      }
+      // ...and an atom this model keeps that the walk's leader dropped was never walked
+      for (let atom = 0; atom < atoms; atom += 1) {
+        if (input.atomMask[atom] && !ended.atomMask[atom]) {
+          throw new Error(`atom slot ${atom} is live in a lent model and not in the model that led the walk`
+            + " - lead with the model that keeps more atoms");
+        }
+      }
+      return ended.positions;
+    } finally {
+      if (borrowed === undefined) head.dispose();
+    }
+  }
+  const partners = options.partners ?? [];
+
   let first = 0;
   if (options.start !== undefined) {
     const { positions: from, level } = options.start;
@@ -100,8 +133,11 @@ export async function sampleOnGpu(device, input, weights, options) {
       noisy[index] = positions[index] + injected * normal();
     }
 
-    const raw = await head.run({ ...input, noiseLevel: tHat, positionsNoisy: noisy },
+    const own = await head.run({ ...input, noiseLevel: tHat, positionsNoisy: noisy },
                                weights);
+    const raw = partners.length === 0 ? own
+      : { positions: meanOfDenoisers(own.positions, input.atomMask, atoms,
+                                     await Promise.all(partners.map((partner) => partner.denoise(noisy, tHat)))) };
     // 🔴 STEERING DISPLACES THE PREDICTION, NOT THE WALK: the update moves toward what it is handed,
     // so the restraint's descent step goes in here and the denoiser itself is untouched
     const denoised = options.steer === undefined ? raw.positions
@@ -122,6 +158,7 @@ export async function sampleOnGpu(device, input, weights, options) {
       denoised: Float32Array.from(denoised),
     });
   }
+  for (const partner of partners) partner.done({ positions, atomMask: input.atomMask });
   return positions;
   } finally {
     // 🔴 THE HEAD HOLDS ~25 MB OF DEVICE MEMORY BETWEEN CALLS, deliberately -
@@ -129,3 +166,4 @@ export async function sampleOnGpu(device, input, weights, options) {
     if (borrowed === undefined) head.dispose();
   }
 }
+
