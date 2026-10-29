@@ -75,6 +75,9 @@ export { FOLDERS } from "./validate-design.js";
  *   toward the hotspots during every fold's diffusion (cpu/af3/diffusion/steering.js),
  *   which makes them a prior for every folder rather than a filter
  * @param {number} [options.hotspotsNeeded] how many of them must be touched
+ * @param {{text: string, chainId: string, chain: number}[]} [options.templates] structures for
+ *   the KEPT chains, as foldAf3 takes them, handed to every fold - a target folded from its
+ *   sequence alone is a target nobody designed against
  * @param {(record: object) => void} options.report called once per cycle
  * @param {(text: string) => void} [options.status]
  * @param {(fraction: number) => void} [options.progress]
@@ -253,6 +256,10 @@ export async function hunt(options) {
           && context.cycle >= (options.warm.from ?? 2);
         return foldAf3({
           sequence, weights: loaded.get(folder), device, signal,
+          // 🔴 THE TARGET AS ITS OWN TEMPLATE, as the refold (validate-design.js) and RFD4-Proteina's
+          // AF3 benchmark both fold it (2026-10-29): designing against a target AF3 refolds elsewhere
+          // optimises a complex nobody will score
+          ...(options.templates === undefined ? {} : { templates: options.templates }),
           ...(warm ? { start: { pdb: context.previous, level: options.warm.level } } : {}),
           // A ligand and a nucleic chain change the FOLD as well as the
           // designer: the featuriser gives each ligand a chain of its own and
