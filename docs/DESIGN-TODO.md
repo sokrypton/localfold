@@ -751,8 +751,9 @@ PD-L1 56/35.5, Tie2 50/3.
   targets got none (CD45, BBF14, CrSAS6, DerF7, CbAgo, HER2-AAV, IL17A, TNFa, IL2Ra).
 - **Throughput is far behind**: ~39 attempts per GPU-hour, evaluation included (five browsers on one A100,
   464 s an attempt each), against their 986 designs per GPU-hour before evaluation.
-- **The evaluator is not the paper's AF3 binary**: both of ours are AF3-lineage ports (int5 and int8). They agree
-  on 13 of the first 72 designs' verdicts and differ on 6.
+- **The evaluator is not the paper's AF3 binary**: both of ours are AF3-lineage ports (int5 and int8). Over the
+  214 designs they agree on 197 verdicts (42 pass both) and differ on 17 - 7 pass only the page's, 10 only the
+  native one.
 
 **What moved it, measured on the way** (same 24 targets, 1-2 attempts each, page evaluator):
 - the baseline loop (5 cycles, the target templated, the winner by the benchmark's terms): 4.2%, the original
