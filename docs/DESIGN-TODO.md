@@ -631,3 +631,19 @@ filter already hits and steering changes little. Refolds pass nowhere on the epi
 (0.72, 0.90, seed 2 at 100) are binders that never reached it, eligible only because a steered cycle is
 not filtered. Weight 1 is v2's and too weak here: the term is zero inside 8 A between centroids, so it
 stops pulling at about the filter's own edge. Three seeds a cell; off by default.
+
+**Steering, six seeds (2026-10-29).** The three-seed table above flattered it. PD-L1, AF3, 100 steps,
+5 cycles, seeds 0-5; each cell is cycles 1-5 touching a hotspot, then the Protenix-2 refold ipTM/RMSD:
+
+| arm | s0 | s1 | s2 | s3 | s4 | s5 | cycles on |
+|---|---|---|---|---|---|---|---|
+| filter | 5 0.72/2.8 | 0 none | 0 none | 5 0.22/14.2 | 3 0.14/8.4 | 5 0.60/5.5 | 18/30 |
+| steer 3 | 5 0.47/10.7 | 5 0.63/3.1 | 0 0.38/0.9 | 0 0.21/3.3 | 0 0.44/11.1 | 0 0.23/11.2 | 10/30 |
+| steer 10 | 5 0.47/9.5 | 5 0.68/12.2 | 0 0.17/14.3 | 2 0.31/10.5 | 0 0.29/18.2 | 0 0.12/8.2 | 12/30 |
+| steer 3, cutoff 6 | 5 0.63/7.1 | 0 0.20/12.9 | 0 0.41/8.3 | 2 0.61/10.7 | 5 0.73/5.5 | 5 0.14/11.9 | 17/30 |
+
+Keeping the hotspot filter beside steering changes no trajectory (the veto picks what may win, not
+what the next cycle starts from); it only turns the off-epitope refolds into "none". Steering puts the
+binder on the epitope LESS often than the unsteered fold (10-12 of 30 against 18), a stronger pull
+does not help, a 6 A cutoff draws even, and no arm refolds under 2 A on the epitope. It stays off by
+default; not worth more tuning until a target shows it winning.
