@@ -9,6 +9,22 @@ window.__bench = async (cfg) => {
   const t = cfg.target;
   const templates = t.sequences.map((_, i) => ({ text: t.pdb, chainId: "BCDEFG"[i], chain: i + 1 }));
   const records = [];
+  // 🔴 cfg.hotspots: the benchmark's hotspots in the fold's numbering (each target chain's residues in order),
+  // which a pocket-reading folder (boltz2) takes as a pocket - the original Protein Hunter's use of them
+  const hotspots = {};
+  if (cfg.hotspots) {
+    const order = {};
+    for (const line of t.pdb.split("\n")) {
+      if (!line.startsWith("ATOM")) continue;
+      const list = (order[line[21]] ??= []);
+      const residue = Number(line.slice(22, 26));
+      if (list[list.length - 1] !== residue) list.push(residue);
+    }
+    for (const [letter, residue] of t.hotspots) {
+      const at = (order[letter] ?? []).indexOf(residue);
+      if (at >= 0) (hotspots[letter] ??= []).push(at + 1);
+    }
+  }
 
   // the benchmark's two confidence terms, for any fold of [binder, ...target]
   const confidenceTerms = (fold) => {
@@ -57,9 +73,12 @@ window.__bench = async (cfg) => {
   // 🔴 THE BENCHMARK'S CHECK, as one function: the final evaluation and (cfg.check) the pipeline's own
   // internal filter run exactly this, with different seeds
   const weights = await loadAf3Weights(() => {}, "af3");
-  const assess = async (binder, designPdb, seed) => {
+  // 🔴 cfg.checkModel: the internal check may fold with another model (the final evaluation is always AF3)
+  const checkWeights = cfg.checkModel === undefined || cfg.checkModel === "af3" ? weights
+    : await loadAf3Weights(() => {}, cfg.checkModel);
+  const assess = async (binder, designPdb, seed, model = weights) => {
     const r = await foldAf3({
-      sequence: [binder, ...t.sequences].join(":"), templates, weights, device: await getDevice(),
+      sequence: [binder, ...t.sequences].join(":"), templates, weights: model, device: await getDevice(),
       seed, recycles: 5, calls: cfg.evalSteps ?? 200, onStatus: () => {}, onProgress: () => {},
     });
     const terms = confidenceTerms(r);
@@ -68,6 +87,17 @@ window.__bench = async (cfg) => {
       chainPtm: r.confidence.chainPtm, iptm: r.confidence.iptm, ptm: r.confidence.ptm, refoldPdb: r.pdb };
   };
 
+  // 🔴 cfg.targetMsas: each target chain's own MSA, laid into every design fold's alignment (the original
+  // Protein Hunter's input); the internal check and the evaluation stay single sequence + template
+  let alignmentOf;
+  if (cfg.targetMsas !== undefined) {
+    const { mergeJobAlignments } = await import("/shared/input/chains.js");
+    alignmentOf = (sequence) => {
+      const chains = sequence.split(":");
+      return mergeJobAlignments({ unpaired: [null, ...cfg.targetMsas], paired: chains.map(() => null) },
+        chains, chains.map(() => "protein")).alignment;
+    };
+  }
   const started = performance.now();
   const eligible = [];
   const checked = [];
@@ -86,6 +116,8 @@ window.__bench = async (cfg) => {
         folders: cfg.folders ?? ["af3"], steps: cfg.steps, recycles: cfg.recycles, seed: cfg.seed + 101 * restart,
         templates: cfg.templateDesign === false ? undefined : templates,
         signal: controller.signal,
+        ...(Object.keys(hotspots).length > 0 ? { hotspots } : {}),
+        ...(alignmentOf === undefined ? {} : { alignmentOf }),
         ...(cfg.hunt ?? {}),
         report: (record) => {
           const terms = record.folded?.confidence === undefined ? {} : confidenceTerms(record.folded);
@@ -114,7 +146,7 @@ window.__bench = async (cfg) => {
         .sort((a, b) => a.ipae - b.ipae).slice(0, cfg.check.top);
       for (const entry of promising) {
         const t2 = performance.now();
-        const result = await assess(entry.sequence, entry.pdb, cfg.seed * 7 + entry.cycle + 1000 * restart);
+        const result = await assess(entry.sequence, entry.pdb, cfg.seed * 7 + entry.cycle + 1000 * restart, checkWeights);
         checkSeconds += (performance.now() - t2) / 1000;
         checked.push({ entry, result });
         if (result.pass) break;
@@ -133,7 +165,9 @@ window.__bench = async (cfg) => {
   const chosen = checked.length > 0 ? checked.reduce((a, b) => (margin(b) < margin(a) ? b : a)) : null;
   // 🔴 cfg.submitChecked: the design submitted is the pipeline's own CHECKED structure (5 recycles, 200 steps)
   // rather than the design cycle's fold (fewer recycles and steps) - its final prediction, as BindCraft's is
-  const best = chosen !== null
+  // cfg.select === "iptm": the original Protein Hunter's choice, the eligible cycle with the best ipTM
+  const best = cfg.select === "iptm" ? (eligible.length > 0 ? eligible.reduce((a, b) => (b.score > a.score ? b : a)) : null)
+    : chosen !== null
     ? (cfg.submitChecked ? { ...chosen.entry, pdb: chosen.result.refoldPdb } : chosen.entry)
     : confident.length > 0 ? confident.reduce((a, b) => (b.ipae < a.ipae ? b : a))
     : eligible.length > 0 ? eligible.reduce((a, b) => (b.binderPtm > a.binderPtm ? b : a)) : null;

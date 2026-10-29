@@ -40,6 +40,10 @@ try:
         cfg = dict(config, target=t, length=rng.randint(lo, hi), seed=1000 * attempt + 7,
                    evalSeed=rng.randint(1, 2**30))
         cfg.pop("tag", None); cfg.pop("lengthSpan", None)
+        if cfg.pop("msaDir", None) is not None:
+            import hashlib
+            cfg["targetMsas"] = [open(os.path.join(config["msaDir"], hashlib.sha1(s.encode()).hexdigest()[:12] + ".a3m")).read()
+                                 for s in t["sequences"]]
         t0 = time.time()
         error = None
         try:

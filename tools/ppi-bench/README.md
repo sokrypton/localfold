@@ -17,4 +17,11 @@ Results and method: docs/DESIGN-TODO.md, "RFD4-Proteina's binder benchmark".
 5. `rescore.py out.jsonl native.jsonl` re-evaluates every design with the native CUDA AF3 (cuda/af3, af3-any-model's
    int8 weights) - an evaluator independent of the page's int5 WebGPU fold.
 
+6. `run-native.sh <jobs-prefix> config-N*.json out.jsonl 0 1 ...` - the same attempt with every fold on the native CUDA
+   port: `native-bench.mjs` runs the page's design loop, MPNN and contact check under Node and hands each fold to a
+   resident server (`cuda/af3/fold --serve [--model=boltz2|chai1]`, started first), ~5x the browser's folds an hour.
+   Its evaluation is the native AF3. `folder` picks the design engine (af3, boltz2, chai1), `checkModel` the internal
+   check's, `hotspots` hands Boltz-2 and Chai-1 the benchmark's hotspots as a pocket, `msaDir` gives each target
+   chain its MSA instead of the template (one `<sha1[:12]>.a3m` a chain, from the ColabFold server).
+
 `results-C-2026-10-29.jsonl` is the overnight run: 214 attempts, each design's sequence and both evaluators' terms.
