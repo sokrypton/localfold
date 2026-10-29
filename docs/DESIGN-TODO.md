@@ -783,8 +783,8 @@ browser). The evaluation is the native AF3 (int8) with the benchmark's criteria.
 | NH | Boltz-2 + hotspot pocket (template), original-style: 7 cycles, 200 steps, best ipTM | none | 240 | 9.2% (6.2-12.5) | 11 |
 | NHM | the same with the target MSA - the published Protein Hunter's own input | none | 240 | 6.7% (4.2-9.6) | 8 |
 | NG | Boltz-2 + pocket (template) | Boltz-2 | 54 | 4.9% (0-9.0) | 3 |
-| NX | Chai-1 + pocket (template) | Chai-1 | 81 | 4.3% (1.0-7.9) | 3 |
-| NXH | Chai-1 + pocket (template), original-style: 5 cycles, 200 steps | none | 112 | 2.9% (0-6.0) | 3 |
+| NX | Chai-1 + pocket (template) | Chai-1 | 121 | 3.0% (0.7-5.7) | 3 |
+| NXH | Chai-1 + pocket (template), original-style: 5 cycles, 200 steps | none | 120 | 2.6% (0-5.3) | 3 |
 | *RFD4-Proteina high (paper)* | | | *200 a target* | *19.3%* | *22* |
 
 - **The reproduction holds**: NHM - Boltz-2, the target's MSA, no check - is 6.7%, RFD4-Proteina's 6.9% for the
@@ -818,5 +818,18 @@ browser). The evaluation is the native AF3 (int8) with the benchmark's criteria.
 - ESMFold2 rejects nearly everything because it refolds the natural target from its sequence alone, so its
   target-aligned RMSD tests the target as much as the binder.
 
-Queued: the warm start's own A/B (C's recipe with and without it, same lengths and seeds, in the browser - the native
-port has no warm start, so NC against C cannot answer it).
+**The warm start's own A/B** (W0/W1: C's recipe without and with the 10 A warm start from cycle 2, in the browser -
+the native port has no warm start, so NC against C could not answer it; same lengths and evaluation seeds per attempt
+through `pair`, attempts 30 and 31 on all 24 targets, page-AF3-evaluated, no errors):
+
+| arm | attempts | pass rate | targets with a pass | median hunt |
+|---|---|---|---|---|
+| W0, no warm start | 48 | 20.8% (14.6-27.1) | 7 | 493 s |
+| W1, warm start 10 A from cycle 2 | 48 | 16.7% (10.4-22.9) | 6 | 447 s |
+
+- **It does not help.** Paired by target and attempt: 5 pass in both arms, 5 only without it, 3 only with it. Seven
+  of eight discordant pairs would be needed to call it either way, so it is a null at this size, and the margins lean
+  the same way: median W1 - W0 interface PAE +0.65, binder RMSD +0.35 A, binder pTM +0.006.
+- It is ~10% faster per attempt, which is not enough to matter.
+- So the winning recipe's lift over the original Protein Hunter is the template, AF3 as engine, restarts and the
+  internal check - not the warm start. It stays in C as recorded; dropping it would not cost anything measurable.
