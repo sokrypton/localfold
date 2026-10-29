@@ -630,9 +630,6 @@ export async function foldAf3(options) {
   const result = await foldBatch(device, batch, options.weights, {
     steps: calls, recycles, seed, reuse: options.reuse, templateSlots,
     ...(steer === undefined ? {} : { steer }),
-    // ...and other models' denoisers, or this one's lent to another fold (foldTogether)
-    ...(options.partners === undefined ? {} : { partners: options.partners }),
-    ...(options.lend === undefined ? {} : { lend: options.lend }),
     // ...forwarded for probes that move the noise schedule
     schedule: options.schedule,
     ...(start === undefined ? {} : { start }),
@@ -878,49 +875,4 @@ export function steerTokens(batch, steer) {
   if (binder.length === 0) throw new Error(`steering names chain ${steer.binder} as the binder, which has no tokens`);
   const { binder: _b, contacts: _c, ...rest } = steer;
   return { binder, pocket, ...rest };
-}
-
-/**
- * Folds one structure with several models at once: every diffusion step, each model denoises the
- * same noisy positions and the walk steps toward the mean (webgpu/af3/diffusion/diffusion-sampler.js
- * meanOfDenoisers). The first leads - its noise, its schedule, its frames; the others run their own
- * trunks and lend their denoisers, then score the finished structure with their own confidence heads.
- *
- * 🔴 WHY (2026-10-29): a design one model folds and another refolds elsewhere is the failure Protein
- * Hunter keeps meeting on PD-L1 - AF3's binders, steered or not, came back from Protenix-2 at 5-30 A.
- * A structure every model denoised together has to be one they all lean toward while it forms.
- *
- * @param {object[]} each foldAf3's options, one per model, the leader first
- * @returns {Promise<object[]>} each model's result, in the same order, over the one structure
- */
-export async function foldTogether(each) {
-  if (each.length < 2) throw new Error("folding together needs at least two models");
-  const ends = [];
-  const lent = [];
-  const followers = each.slice(1).map((options) => {
-    let give;
-    const denoiser = new Promise((resolve) => { give = resolve; });
-    let end;
-    const ended = new Promise((resolve, reject) => { end = { resolve, reject }; });
-    ends.push(end);
-    const result = foldAf3({ ...options, lend: (denoise) => { give(denoise); return ended; } });
-    // 🔴 A FOLLOWER THAT DIES BEFORE IT LENDS MUST NOT LEAVE THE LEADER WAITING FOR EVER
-    lent.push(Promise.race([denoiser, result.then(() => {
-      throw new Error("a model folding together finished without lending its denoiser");
-    })]));
-    return result;
-  });
-  // the followers' trunks run first, one at a time as the device takes them; then the leader's walk
-  let leader;
-  try {
-    const denoisers = [];
-    for (const waiting of lent) denoisers.push(await waiting);
-    leader = await foldAf3({ ...each[0],
-      partners: denoisers.map((denoise, index) => ({ denoise, done: ends[index].resolve })) });
-  } catch (error) {
-    for (const end of ends) end.reject(error);
-    await Promise.allSettled(followers);
-    throw error;
-  }
-  return [leader, ...await Promise.all(followers)];
 }

@@ -680,3 +680,20 @@ winner's refold ipTM/RMSD: 3 A releasing 1 - 0.21/16.9, 0.31/18.2, none, 0.73/17
 off (5 of 12 runs leave nothing); where it stays, Protenix-2 does not agree on the pose (ipTM up to
 0.73 at 17 A). The limit on this target is the refold agreeing at all - the filter alone passes
 nothing either and its best is 2.8 A - not where the binder is aimed.
+
+**Folding with two models at once (2026-10-29): worse, reverted.** Built in `8906518a` and reverted
+after: every diffusion step AF3 and Protenix-2 denoise the same noisy structure, the partner fitted
+onto the leader and averaged, the step taken toward the mean; each model's confidence head then
+scores the one structure. PD-L1, 100 steps, 5 cycles, seeds 0-5, refolded with OpenBind-0 (neither
+designer), best design's ipTM/RMSD then cycles 1-5 on a hotspot:
+
+| arm | s0 | s1 | s2 | s3 | s4 | s5 |
+|---|---|---|---|---|---|---|
+| AF3 alone | 0.77/2.2 · 5 | none · 0 | none · 0 | 0.23/18.9 · 5 | 0.09/6.1 · 3 | 0.61/3.1 · 5 |
+| AF3+Protenix-2 rotating per cycle | 0.49/2.7 · 5 | 0.11/15.4 · 3 | 0.12/3.9 · 2 | none · 0 | 0.09/7.2 · 1 | none · 0 |
+| AF3+Protenix-2 together | 0.44/11.9 · 5 | 0.12/11.2 · 3 | none · 5 | none · 2 | 0.64/12.2 · 2 | 0.34/12.0 · 4 |
+
+Every together design refolds at 11-12 A, two seeds lost every cycle to the 20% alanine ceiling
+(a mean of two predictions is a smoother backbone, which MPNN reads as helix and fills with
+alanine), and a cycle costs 1.5x. The untried variant is ALTERNATING models step by step, which
+takes no mean and so cannot blur.
