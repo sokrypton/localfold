@@ -693,7 +693,13 @@ designer), best design's ipTM/RMSD then cycles 1-5 on a hotspot:
 | AF3+Protenix-2 rotating per cycle | 0.49/2.7 · 5 | 0.11/15.4 · 3 | 0.12/3.9 · 2 | none · 0 | 0.09/7.2 · 1 | none · 0 |
 | AF3+Protenix-2 together | 0.44/11.9 · 5 | 0.12/11.2 · 3 | none · 5 | none · 2 | 0.64/12.2 · 2 | 0.34/12.0 · 4 |
 
-Every together design refolds at 11-12 A, two seeds lost every cycle to the 20% alanine ceiling
-(a mean of two predictions is a smoother backbone, which MPNN reads as helix and fills with
-alanine), and a cycle costs 1.5x. The untried variant is ALTERNATING models step by step, which
-takes no mean and so cannot blur.
+Every together design refolds at 11-12 A, two seeds lost every cycle to the 20% alanine ceiling,
+and a cycle costs 1.5x.
+
+**...and taking turns instead (2026-10-29): no better, not kept.** The same machinery with the
+diffusion's steps going to AF3 and Protenix-2 alternately, one model's answer taken whole a step,
+so no mean and no blur. Same six seeds: 0.14/6.4 · 1, 0.20/10.1 · 1, none (every cycle 30-46%
+alanine), 0.48/4.0 · 4, 0.36/11.7 · 4, 0.75/13.8 · 5 - better than AF3 alone on seed 3 and worse on
+0, 4 and 5. 🔴 AND THE ALANINE IS NOT BLUR: cycles over the 20% ceiling are 3/30 for AF3 alone and
+for the rotation, 12/30 averaged and 6/30 alternating - mixing models inside one walk raises it
+either way, so "a mean is a smoother backbone" was a guess the alternating arm falsifies.
