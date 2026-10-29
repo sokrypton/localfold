@@ -631,8 +631,11 @@ export function drawLengths(spans, options = {}) {
  *   ("protein" | "dna" | "rna"); a kept DNA strand folds as DNA, not as a protein of unknowns
  * @returns {{chains: string[], chainKinds: string[], ligandCodes: string[],
  *            chainIndex: number, length: number, hold: number[],
+ *            fromStructure: {index: number, chain: string, first: number, last: number}[],
  *            problems: string[]}} `hold` is positions within the designed chain
- *   the designer must not rewrite - see designChain() in cpu/design/mpnn-bridge.js
+ *   the designer must not rewrite - see designChain() in cpu/design/mpnn-bridge.js.
+ *   `fromStructure` names each kept protein chain made wholly of one loaded chain's residues, so the
+ *   fold can template it
  */
 export function chainsOf(spans, options = {}) {
   const sequenceOf = options.sequenceOf;
@@ -645,7 +648,8 @@ export function chainsOf(spans, options = {}) {
   let hold = [];
   let designedIndex = -1;
   let designedLength = 0;
-  let current = { parts: [], polymer: "protein", designed: false, length: 0, given: false };
+  let current = { parts: [], polymer: "protein", designed: false, length: 0, given: false, sources: [] };
+  const fromStructure = [];
 
   const finish = () => {
     if (current.parts.length === 0) return;
@@ -684,13 +688,23 @@ export function chainsOf(spans, options = {}) {
     // 🔴 A DESIGNED CHAIN IS WHAT ITS SEGMENTS ARE MADE OF (2026-10-28): it was always protein here,
     // whatever "Made of" said. A DNA or RNA one is designed by NA-MPNN (cpu/design/designers.js).
     kinds.push(current.polymer);
+    // 🔴 A KEPT CHAIN COPIED FROM ONE LOADED CHAIN CAN BE TEMPLATED (2026-10-29): folded from its sequence
+    // alone, a natural target lands where nobody will score it - RFD4-Proteina's benchmark and the
+    // page's own refold both template it. Only whole, unredesigned, protein, single-source chains.
+    const sourceChains = new Set(current.sources.map((source) => source.chain));
+    if (!current.designed && current.polymer === "protein" && current.sources.length > 0
+        && current.sources.length === current.parts.length && sourceChains.size === 1) {
+      fromStructure.push({ index, chain: [...sourceChains][0],
+        first: Math.min(...current.sources.map((source) => source.first)),
+        last: Math.max(...current.sources.map((source) => source.last)) });
+    }
     if (current.designed) {
       if (designedIndex >= 0) problems.push("Protein Hunter designs one chain at a time");
       designedIndex = index;
       designedLength = current.length;
       hold = held;
     }
-    current = { parts: [], polymer: "protein", designed: false, length: 0, given: false };
+    current = { parts: [], polymer: "protein", designed: false, length: 0, given: false, sources: [] };
   };
 
   for (const span of spans) {
@@ -740,6 +754,7 @@ export function chainsOf(spans, options = {}) {
         continue;
       }
       text = found;
+      current.sources.push({ chain: String(span.chain ?? ""), first: number(span.first, 0), last: number(span.last, 0) });
     }
     // 🔴 `redesign` IS THE SEQUENCE AXIS, MADE EDITABLE. A given span is held by
     // default; asked to be redesigned it keeps its place and its length and lets
@@ -779,7 +794,7 @@ export function chainsOf(spans, options = {}) {
 
   return {
     chains, chainKinds: kinds, ligandCodes: ligands, chainIndex: designedIndex,
-    length: designedLength, hold, modifications: placed,
+    length: designedLength, hold, modifications: placed, fromStructure,
     problems: [...new Set(problems)],
   };
 }

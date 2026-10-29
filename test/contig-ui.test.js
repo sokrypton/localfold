@@ -457,6 +457,24 @@ describe("the design job as a list of spans", () => {
     });
   });
 });
+describe("which kept chains Protein Hunter templates", () => {
+  // 🔴 A KEPT CHAIN COPIED FROM ONE LOADED CHAIN IS TEMPLATED (2026-10-29); one built any other way is not
+  const sequenceOf = (chain, first, last) => "ACDEFGHIKL".slice(first - 1, last);
+  const read = (spans) => chainsOf(spans, { sequenceOf }).fromStructure;
+  it("names a whole kept chain, merging its segments", () => {
+    expect(read([{ kind: "segment", chain: "B", first: 1, last: 3 }, { kind: "segment", chain: "B", first: 6, last: 9 },
+      { kind: "break" }, { kind: "generated", min: 5, max: 5 }])).toEqual([{ index: 0, chain: "B", first: 1, last: 9 }]);
+  });
+  it("leaves out a chain that is designed, redesigned, mixed with typed sequence or from two loaded chains", () => {
+    expect(read([{ kind: "segment", chain: "B", first: 1, last: 3 }, { kind: "generated", min: 4, max: 4 }])).toEqual([]);
+    expect(read([{ kind: "segment", chain: "B", first: 1, last: 3, redesign: true }])).toEqual([]);
+    expect(read([{ kind: "segment", chain: "B", first: 1, last: 3 }, { kind: "sequence", value: "AAA" },
+      { kind: "break" }, { kind: "generated", min: 5, max: 5 }])).toEqual([]);
+    expect(read([{ kind: "segment", chain: "B", first: 1, last: 3 }, { kind: "segment", chain: "C", first: 1, last: 3 },
+      { kind: "break" }, { kind: "generated", min: 5, max: 5 }])).toEqual([]);
+  });
+});
+
 describe("an annotated example's pieces, read off its file", () => {
   // 🔴 THE FILE IS THE JOB FOR THESE EXAMPLES, NOT THEIR CONTIG: the binder's contig says "keep
   // A18-132, design 76", while what runs designs chain A at 50-120 against chain B 1-115.

@@ -130,7 +130,11 @@ window.__bench = async (cfg) => {
   // else, by the design folds' own terms, lowest interface PAE at binder pTM >= 0.8, else highest pTM
   const margin = (c) => Math.max(c.result.ipae / 1.5, c.result.rmsd / 2.5, 0.8 / Math.max(c.result.binderPtm, 1e-3));
   const confident = eligible.filter((e) => e.binderPtm >= 0.8);
-  const best = checked.length > 0 ? checked.reduce((a, b) => (margin(b) < margin(a) ? b : a)).entry
+  const chosen = checked.length > 0 ? checked.reduce((a, b) => (margin(b) < margin(a) ? b : a)) : null;
+  // 🔴 cfg.submitChecked: the design submitted is the pipeline's own CHECKED structure (5 recycles, 200 steps)
+  // rather than the design cycle's fold (fewer recycles and steps) - its final prediction, as BindCraft's is
+  const best = chosen !== null
+    ? (cfg.submitChecked ? { ...chosen.entry, pdb: chosen.result.refoldPdb } : chosen.entry)
     : confident.length > 0 ? confident.reduce((a, b) => (b.ipae < a.ipae ? b : a))
     : eligible.length > 0 ? eligible.reduce((a, b) => (b.binderPtm > a.binderPtm ? b : a)) : null;
   const summary = { huntSeconds, checkSeconds, records, runs, checks: checked.map((c) => ({ restart: c.entry.restart,

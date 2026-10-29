@@ -1,0 +1,5 @@
+targets.json
+rfd4-paper-data.json
+*.jobs*
+*.log*
+rescore-*/

@@ -1211,7 +1211,7 @@ const startHunt = async () => {
   // 🔴 THE SPANS ARE THE JOB; `chainsOf` is how Hunter reads them. It also says
   // what Hunter cannot express - a motif inside a designed chain, two designed
   // chains - and a hunt that cannot express the job must not start.
-  const { chains, chainKinds, ligandCodes, modifications, chainIndex, length, hold, problems }
+  const { chains, chainKinds, ligandCodes, modifications, chainIndex, length, hold, fromStructure, problems }
     = chainsOf(spans, readers());
   if (problems.length > 0) {
     say(problems.join(" · "), true);
@@ -1250,6 +1250,11 @@ const startHunt = async () => {
       modifications,
       chainIndex,
       hold,
+      // 🔴 EVERY KEPT CHAIN COPIED FROM THE LOADED STRUCTURE IS TEMPLATED BY IT (2026-10-29): the refold
+      // templates it and so does RFD4-Proteina's benchmark, and a target folded from its sequence alone
+      // is not the target the design is scored against (docs/DESIGN-TODO.md, the binder benchmark)
+      templates: fromStructure.map(({ index, chain, first, last }) =>
+        ({ text: structurePdb(chain, first, last), chainId: "A", chain: index })),
       // 🔴 THE SAME HOTSPOTS RFD4 CONDITIONS ON, used the only way Hunter can:
       // fold, then reject a cycle whose binder is not touching them.
       // 🔴 `window.__designHotspots` IS A DRIVER'S DOOR, as __designSpans is:
@@ -1595,6 +1600,30 @@ function resolver() {
 // hoisted AND initialised, so the whole class of bug cannot happen to it.
 // Anything a callback might reach during construction should be declared this
 // way rather than hoisted by hand one at a time.
+/**
+ * One loaded chain's residues `first`-`last`, as a PDB with chain letter A: a template for the chain the
+ * job keeps from it. A function DECLARATION, as `sequenceOf` below is.
+ */
+function structurePdb(chain, first, last) {
+  const atoms = loaded.atoms;
+  const lines = [];
+  for (let index = 0; index < atoms.chain_id.length; index += 1) {
+    if (String(atoms.chain_id[index]) !== chain) continue;
+    const residue = Number(atoms.res_id[index]);
+    if (residue < first || residue > last || atoms.coord[index] === undefined) continue;
+    const [x, y, z] = atoms.coord[index];
+    if (![x, y, z].every(Number.isFinite)) continue;
+    const name = String(atoms.atom_name[index]);
+    const element = String(atoms.element[index] ?? "").toUpperCase();
+    lines.push(`ATOM  ${String(lines.length + 1).padStart(5)} ${(name.length === 4 ? name : ` ${name}`).padEnd(4)}`
+      + ` ${String(atoms.res_name[index]).padStart(3)} A${String(residue).padStart(4)}    `
+      + `${x.toFixed(3).padStart(8)}${y.toFixed(3).padStart(8)}${z.toFixed(3).padStart(8)}  1.00  0.00`
+      + `          ${element.padStart(2)}`);
+  }
+  if (lines.length === 0) throw new Error(`chain ${chain} ${first}-${last} has no coordinates to template`);
+  return `${lines.join("\n")}\nEND\n`;
+}
+
 function sequenceOf(chain, first, last) {
   if (loaded === null) return null;
   const atoms = loaded.atoms;
