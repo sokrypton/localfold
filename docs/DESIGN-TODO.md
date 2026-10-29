@@ -703,3 +703,66 @@ alanine), 0.48/4.0 · 4, 0.36/11.7 · 4, 0.75/13.8 · 5 - better than AF3 alone 
 0, 4 and 5. 🔴 AND THE ALANINE IS NOT BLUR: cycles over the 20% ceiling are 3/30 for AF3 alone and
 for the rotation, 12/30 averaged and 6/30 alternating - mixing models inside one walk raises it
 either way, so "a mean is a smoother backbone" was a guess the alternating arm falsifies.
+
+## RFD4-Proteina's binder benchmark, run through Protein Hunter (2026-10-29, overnight)
+
+**The benchmark** (RFD4-Proteina preprint Fig. 2 and S8; their repo's `configs/metrics`): 24 PPI targets, the
+union of Proteina-Complexa's and RFdiffusion3's sets, binder lengths as each target specifies. A design passes when
+AF3 refolds it - single sequence, the target templated with its own coordinates, 5 recycles, one sample, a random
+seed - at binder-chain pTM >= 0.80, minimum interface PAE <= 1.5 A (`chain_pair_pae_min`, both directions averaged,
+min over partners) and target-aligned binder backbone RMSD <= 2.5 A. Their per-target rows are the site's
+`benchmarks/data.json`, 200 attempts a target. Harness, configuration and per-attempt results: `tools/ppi-bench/`.
+
+**Ours**: the page's own Protein Hunter (`web/hunt.js`) driven in headless Chrome, AF3 int5 on WebGPU, with:
+- the target templated in every design fold (`3084bc37`; the benchmark's evaluator templates it, and folding it
+  from its sequence alone designs against a target nobody scores);
+- 6 cycles, 100 steps, 3 recycles, warm start from cycle 2 at 10 A; a run stops early at binder pTM >= 0.85 and
+  interface PAE <= 1.2 A, and an attempt restarts from a new seed up to 3 runs;
+- 🔴 **an internal check**: each run's two most promising cycles (design-fold binder pTM >= 0.8, interface PAE
+  <= 2.5 A) are refolded under the benchmark's own settings with a seed of the pipeline's, and the first that
+  passes is the design (else the checked one closest to passing). This is AF3 feedback inside the loop: the rules
+  allow it (internal folding and selection count as generation cost; BindCraft does the same with AF2), but
+  RFD4-Proteina uses none, and the internal check and the evaluator are the same model.
+
+Each attempt submits one design. 214 attempts, 8-10 a target. Evaluated twice: by the page's AF3 (int5, WebGPU) and
+by the native CUDA AF3 (cuda/af3, af3-any-model's int8 weights), which share no weights file or kernel:
+
+| mean over the 24 targets | pass rate | 95% CI (bootstrap over attempts) | clustered | targets with a pass |
+|---|---|---|---|---|
+| **Protein Hunter + internal check, native AF3** | **24.1%** | 19.7-28.7% | 23.2% | 15/24 |
+| Protein Hunter + internal check, page AF3 | 22.3% | 18.1-26.8% | 20.9% | 17/24 |
+| RFD4-Proteina, high thinking (paper) | 19.3% | | 10.6% | 22/24 |
+| BindCraft, single backbone (paper) | 9.9% | | 5.9% | 19/24 |
+| Protein-Hunter, original (paper) | 6.9% | | 4.1% | |
+
+Per target (native, ours / RFD4 high): PD1 22/14, IFNAR2 33/0, CD45 0/1.5, Claudin1 40/10, BBF14 0/12.5, CrSAS6
+0/14.5, DerF7 0/29, DerF21 60/34.5, BetV1 10/3.5, SpCas9 56/43, CbAgo 0/5, HER2-AAV 0/0.5, BHRF1 89/71, SC2RBD
+10/14.5, TrkA 38/33.5, H1 25/21, VEGFA 11/17, IL17A 0/9, TNFa 0/0, IL2Ra 0/14.5, IL7Ra 12.5/27, InsulinR 67/49,
+PD-L1 56/35.5, Tie2 50/3.
+
+🔴 **What this does and does not show:**
+- The mean pass rate is ahead under both evaluators; under the native one the CI clears RFD4's 19.3%, under the
+  page's it does not. With 8-10 attempts a target against their 200, it is a lead, not a settled one.
+- **The clustered number is not comparable yet.** Clusters are counted among passing designs, and at 8-10 attempts
+  a target almost nothing can share a cluster, where their 200 attempts merge about half. `tools/ppi-bench/cluster.py`
+  is a small TM-align on CA traces standing in for Foldseek (TM 0.5, merging on the shorter chain's TM-score,
+  the generous side) because Foldseek could not be installed here.
+- **Coverage is behind**: 15-17 targets with a pass against their 22, from a twentieth of their attempts; nine
+  targets got none (CD45, BBF14, CrSAS6, DerF7, CbAgo, HER2-AAV, IL17A, TNFa, IL2Ra).
+- **Throughput is far behind**: ~39 attempts per GPU-hour, evaluation included (five browsers on one A100,
+  464 s an attempt each), against their 986 designs per GPU-hour before evaluation.
+- **The evaluator is not the paper's AF3 binary**: both of ours are AF3-lineage ports (int5 and int8). They agree
+  on 13 of the first 72 designs' verdicts and differ on 6.
+
+**What moved it, measured on the way** (same 24 targets, 1-2 attempts each, page evaluator):
+- the baseline loop (5 cycles, the target templated, the winner by the benchmark's terms): 4.2%, the original
+  Protein-Hunter's level. The binder becomes confident on its own and never docks: design folds sat at interface
+  PAE 15-25 A for whole runs, and where a design fold did dock the evaluator agreed.
+- restarts, early stop and warm start: 1/10, with many near misses at interface PAE 1.8-2.3 A - the design folds
+  (3 recycles, 100 steps) read ~0.5 A lower than the evaluation (5 recycles, 200 steps).
+- **the internal check: 18.8-22%** - the step that turned near misses into choices.
+- not taken: three sequences a cycle at 50 steps (0/6, twice the time); giving up on a run not docked by cycle 2
+  with five restarts (0/10 - docking often comes late).
+
+Open: wire the target template into the design page itself (the hunt takes `templates`; design.html does not yet
+pass them); more attempts for a settled comparison and a real clustered rate; the nine targets with no pass.

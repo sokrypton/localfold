@@ -11,9 +11,9 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-434 tools. `tools/fixtures/` is data and is not listed.
+437 tools. `tools/fixtures/` is data and is not listed.
 
-## `tools/gpu/` - the WebGPU lane (215)
+## `tools/gpu/` - the WebGPU lane (217)
 
 Each exports `async function main(device, args)` and is run as
 `node tools/gpu-chrome.mjs tools/gpu/<module>.js [--flags]`.
@@ -87,6 +87,7 @@ Each exports `async function main(device, args)` and is run as
 - **`check-block-upload.js`** - Does a whole diffusion transformer block decode the same on the GPU?
 - **`check-bundle-device-decode.js`** - A REAL bundle's tensors, decoded on the host and on the device, compared bit for bit.
 - **`check-chiral-gradient.js`** - RoseTTAFold3's chirality gradient: the GPU kernel against the CPU reference.
+- **`check-constraints.js`** - Pocket and contact constraints on the GPU: boltz2's contact term at both of its sites, against the table the host builds from the same weights (shared/af3/featurise/constraints.js boltz2ContactTable).
 - **`check-decoder.js`** - GPU autoencoder decoder (`webgpu/rfd4p/decoder.js`) vs the PyTorch oracle across all 6 cases.
 - **`check-delta-upload.js`** - Does the SHIPPED uploader ADD a delta to weights that are already resident?
 - **`check-difftx-batched.js`** - Does the batched path compute the same thing S times?
@@ -144,6 +145,7 @@ Each exports `async function main(device, args)` and is run as
 - **`fold-af2.js`** - An AlphaFold 2 monomer fold, end to end, so a kernel change can be compared against the tree before it.
 - **`fold-bioemu2.js`** - A whole BioEmu2 fold on the GPU: an AlphaFold 3 job in, samples out.
 - **`fold-complex.js`** - Fold a MULTI-CHAIN target and score every chain in ONE frame.
+- **`fold-crosslinks.js`** - Crosslinks folded: the page's path for a `crosslink` row (web/entities.js expandEntities: a built-in bridge ligand bonded to its two residues) end to end on WebGPU, and whether the fold honours it.
 - **`fold-esmfold2.js`** - A whole ESMFold2 fold on the GPU: a sequence in, a structure out.
 - **`fold-opendde.js`** - OpenDDE, sequence in and a structure out.
 - **`fold.js`** - Fold a protein with AF3 on the GPU, end to end, and write a PDB.
@@ -334,7 +336,7 @@ and turning it into a bundle.
 - **`safetensors_read.py`** - Read a .safetensors file into numpy arrays, without the safetensors package.
 - **`vector-quantise.py`** - Is a codebook worth a new decoder? Scalar codes against vector ones, at 2 bits.
 
-## `tools/` - everything else (131)
+## `tools/` - everything else (132)
 
 CPU checkers, the export and quantisation pipeline, the page drivers that
 go through CDP, and the deploy.
@@ -437,6 +439,7 @@ go through CDP, and the deploy.
 - **`fold-esmfold2.js`** - A whole ESMFold2 fold on the CPU: features in, a structure out.
 - **`fold-in-page.py`** - Drive a REAL fold in the real page, and report what the frames carry.
 - **`gate-folds.mjs`** - The folds every whole-model gate runs, and how a gate reads one of them.
+- **`gen-crosslinkers.mjs`** - Generate shared/chem/crosslinkers.js - the crosslinkers a `crosslinks` job names - from af3-any-model's export:
 - **`gen-native-featuriser-tables.mjs`** - Generate cuda/featurise/tables.inc, dialects.inc and bundles.inc - the data the native featuriser, weight walk and weight fetch read, from the JavaScript they mirror.
 - **`gen-rfd4p-cath-mapping.py`** - Generate shared/rfd4p/cath-mapping.js from RFD4-Proteina's own `data/cath_label_mapping.pkl`.
 - **`gen-rfd4p-ccd-templates.py`** - Generate shared/rfd4p/pipeline/ccd-templates.js from the Chemical Component Dictionary atomworks reads.
