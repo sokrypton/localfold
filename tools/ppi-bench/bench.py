@@ -34,12 +34,13 @@ try:
         attempt = int(attempt)
         if (name, attempt) in done: continue
         t = targets[name]
-        rng = random.Random(f"{config['tag']}:{name}:{attempt}")
+        # `pair`: arms of one A/B draw the same lengths and evaluation seeds
+        rng = random.Random(f"{config.get('pair', config['tag'])}:{name}:{attempt}")
         lo, hi = t["binder"]
         hi = min(hi, lo + config.get("lengthSpan", 10**9))
         cfg = dict(config, target=t, length=rng.randint(lo, hi), seed=1000 * attempt + 7,
                    evalSeed=rng.randint(1, 2**30))
-        cfg.pop("tag", None); cfg.pop("lengthSpan", None)
+        cfg.pop("tag", None); cfg.pop("lengthSpan", None); cfg.pop("pair", None)
         if cfg.pop("msaDir", None) is not None:
             import hashlib
             cfg["targetMsas"] = [open(os.path.join(config["msaDir"], hashlib.sha1(s.encode()).hexdigest()[:12] + ".a3m")).read()

@@ -9,6 +9,8 @@ for r in ref["rows"]:
 def key(name):
     return name if name in paper else "rfd3_" + name
 rows = [json.loads(l) for f in sys.argv[1:] for l in open(f)]
+# an attempt that died on the machine (out of memory, a server gone) is no design and no failure: it is re-run
+rows = [d for d in rows if not d.get("error")]
 by = collections.defaultdict(list)
 for d in rows: by[d["target"]].append(d)
 def passes(d):

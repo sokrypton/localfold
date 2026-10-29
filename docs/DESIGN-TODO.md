@@ -767,3 +767,56 @@ PD-L1 56/35.5, Tie2 50/3.
 
 Open: wire the target template into the design page itself (the hunt takes `templates`; design.html does not yet
 pass them); more attempts for a settled comparison and a real clustered rate; the nine targets with no pass.
+
+### Engines, target input and a cross-evaluation (2026-10-29, the day after)
+
+Every fold on the native CUDA port now (`tools/ppi-bench/native-bench.mjs`: the page's `runDesign`, MPNN and contact
+check under Node, each fold handed to a resident `cuda/af3/fold --serve`; ~2 s a fold against 10-15 s in the
+browser). The evaluation is the native AF3 (int8) with the benchmark's criteria. Mean over the 24 targets, bootstrap
+95% CI over attempts:
+
+| run | design engine (target input) | internal check | attempts | pass rate | targets with a pass |
+|---|---|---|---|---|---|
+| **NC** | AF3 (template) | AF3 | 240 | **37.5%** (33.3-42.1) | 19 |
+| NM1 | AF3 (target MSA) | AF3 | 336 | 22.9% (19.3-26.5) | 17 |
+| C (browser, overnight) | AF3 int5 (template) | AF3 int5 | 214 | 24.1% (19.5-28.7) | 15 |
+| NH | Boltz-2 + hotspot pocket (template), original-style: 7 cycles, 200 steps, best ipTM | none | 240 | 9.2% (6.2-12.5) | 11 |
+| NHM | the same with the target MSA - the published Protein Hunter's own input | none | 240 | 6.7% (4.2-9.6) | 8 |
+| NG | Boltz-2 + pocket (template) | Boltz-2 | 54 | 4.9% (0-9.0) | 3 |
+| NX | Chai-1 + pocket (template) | Chai-1 | 81 | 4.3% (1.0-7.9) | 3 |
+| NXH | Chai-1 + pocket (template), original-style: 5 cycles, 200 steps | none | 112 | 2.9% (0-6.0) | 3 |
+| *RFD4-Proteina high (paper)* | | | *200 a target* | *19.3%* | *22* |
+
+- **The reproduction holds**: NHM - Boltz-2, the target's MSA, no check - is 6.7%, RFD4-Proteina's 6.9% for the
+  original. Templating the target instead lifts the same loop to 9.2%.
+- **The template beats the MSA for both engines** (AF3 37.5 against 22.9; Boltz-2 9.2 against 6.7).
+- **An internal check helps only with the evaluator's model**: Boltz-2 checking Boltz-2's designs (NG, 4.9%) is below
+  not checking at all (NH, 9.2%) - it accepts what Boltz-2 likes and AF3 rejects, and the early stop ends runs on it.
+- **AF3 is the engine**, against the preprint's ranking (Boltz-2 first there, AF3 last): with the target templated and
+  an AF3 check it is the only engine above RFD4-Proteina; Chai-1 is the weakest here.
+- 🔴 **NC IS AN UPPER BOUND**: its design, check and evaluation are the same int8 weights. C - designed with the
+  page's int5 copy - is the fairer AF3-evaluated number.
+- 🔴 **AND 444 ATTEMPTS WERE LOST TO THE MACHINE FIRST**: three resident servers (AF3, Boltz-2, Chai-1) and the MSA
+  folds ran the 40 GB card out of device and pinned host memory, and the failed attempts were scored as failed designs
+  for an afternoon. Re-run one server at a time (`phase.sh`); `score.py` skips error rows now.
+
+**Cross-evaluation** - "AF3 designed, AF3 checked, AF3 scored" asked of models that took no part
+(`tools/ppi-bench/xeval.py`: the same criteria, target templated, single sequence, 5 recycles, 200 steps; ESMFold2-fast
+600M with Synthyra's head takes no template and reports no chain pTM, so it is judged on interface PAE and RMSD alone):
+
+| designs | AF3 | Boltz-2 | Chai-1 | Protenix-2 | ESMFold2 (iPAE+RMSD) |
+|---|---|---|---|---|---|
+| NC (AF3-designed) | 37.5% | **23.8%** | **26.7%** | **25.1%** | 6.3% |
+| C (AF3 int5-designed) | 24.1% | 17.2% | 21.6% | 18.5% | 8.3% |
+| NH (Boltz-2-designed) | 9.2% | 19.1% | 16.1% | 11.5% | 3.5% |
+
+- AF3's designs are not AF3 agreeing with itself: three models that did not design them pass 24-27% of NC's,
+  and **Boltz-2 passes AF3's designs more often than its own** (23.8 against 19.1).
+- Every engine favours its own: NH's Boltz-2 designs pass Boltz-2 at 19.1% and AF3 at 9.2%.
+- 🔴 It is not yet a like-for-like win over RFD4-Proteina, whose designs were only ever scored by AF3; re-scoring
+  theirs (the paper's archive) the same way is what would make it one.
+- ESMFold2 rejects nearly everything because it refolds the natural target from its sequence alone, so its
+  target-aligned RMSD tests the target as much as the binder.
+
+Queued: the warm start's own A/B (C's recipe with and without it, same lengths and seeds, in the browser - the native
+port has no warm start, so NC against C cannot answer it).

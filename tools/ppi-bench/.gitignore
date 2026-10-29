@@ -4,3 +4,4 @@ rfd4-paper-data.json
 *.log*
 rescore-*/
 __pycache__/
+xeval-*/
