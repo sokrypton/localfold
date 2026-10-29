@@ -671,3 +671,12 @@ It does its job now - the binder sits on the epitope in 28 of 30 cycles, every s
 filter lost included - and the designs do not survive a refold: not one under 2 A, and the best
 (3.0 A) is weaker than the filter's 2.8. A steered pose is one AF3 holds only while pulled; the
 sequence MPNN writes for it does not carry it. Off by default still.
+
+**Steering, then folding unpulled (2026-10-29): no better.** The last 1 or 2 cycles folded without
+the pull, filtered on the hotspots, and only those could win (tried, not kept). Same six seeds,
+winner's refold ipTM/RMSD: 3 A releasing 1 - 0.21/16.9, 0.31/18.2, none, 0.73/17.7, 0.18/4.2,
+0.22/16.9; 3 A releasing 2 - none, none, none, 0.73/17.7, 0.24/7.7, 0.26/16.6; 10 A releasing 2 -
+0.57/6.5, none, 0.40/16.5, 0.18/16.2, 0.41/8.8, 0.13/12.2. Released at 3 A the binder often walks
+off (5 of 12 runs leave nothing); where it stays, Protenix-2 does not agree on the pose (ipTM up to
+0.73 at 17 A). The limit on this target is the refold agreeing at all - the filter alone passes
+nothing either and its best is 2.8 A - not where the binder is aimed.
