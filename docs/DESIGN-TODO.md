@@ -647,3 +647,27 @@ what the next cycle starts from); it only turns the off-epitope refolds into "no
 binder on the epitope LESS often than the unsteered fold (10-12 of 30 against 18), a stronger pull
 does not help, a 6 A cutoff draws even, and no arm refolds under 2 A on the epitope. It stays off by
 default; not worth more tuning until a target shows it winning.
+
+**Steering was broken, and fixed (2026-10-29).** The table above measured a bug. The first version
+(ProteinHunter2's planned ph2/steering.py: squared violation, one plain gradient step on every
+centroid) moved the three or four NEAREST residues of each side alone by twice the violation - a
+binder 20 A off had three residues thrown ~20 A out of its chain at weight 1, 70 and 240 A at 3 and
+10, with the energy RISING - and the denoiser put them back, so cycle 0 came out within 0.1 A of the
+unsteered fold at every weight. It also scaled by tHat/sigmaMax, which is ~6% at the 10 A warm start
+every later cycle joins at. The original Protein Hunter never steered at all: its Boltz pocket has no
+`force`, so Boltz's contact potential gets no atom pairs. Now (cpu/af3/diffusion/steering.js): a
+LINEAR restraint, the binder translated as one body, at most `weight` angstroms a step and never past
+the largest violation, on Boltz's 1 / 0.5 / 0 schedule over the steps actually walked. Same six seeds
+(cycles 1-5 on a hotspot, refold ipTM/RMSD):
+
+| arm | s0 | s1 | s2 | s3 | s4 | s5 | cycles on |
+|---|---|---|---|---|---|---|---|
+| filter | 5 0.72/2.8 | 0 none | 0 none | 5 0.22/14.2 | 3 0.14/8.4 | 5 0.59/5.5 | 18/30 |
+| steer 1 A | 4 0.20/16.0 | 2 0.26/5.0 | 5 0.24/30.6 | 5 0.31/14.4 | 5 0.15/15.5 | 4 0.47/3.0 | 25/30 |
+| steer 3 A | 5 0.25/11.8 | 5 0.48/18.6 | 4 0.70/5.8 | 5 0.71/18.1 | 4 0.24/15.5 | 5 0.21/16.5 | 28/30 |
+| steer 10 A | 5 0.56/9.6 | 5 0.16/13.1 | 4 0.21/15.6 | 5 0.22/16.5 | 5 0.41/8.7 | 4 0.38/16.4 | 28/30 |
+
+It does its job now - the binder sits on the epitope in 28 of 30 cycles, every seed, the two the
+filter lost included - and the designs do not survive a refold: not one under 2 A, and the best
+(3.0 A) is weaker than the filter's 2.8. A steered pose is one AF3 holds only while pulled; the
+sequence MPNN writes for it does not carry it. Off by default still.

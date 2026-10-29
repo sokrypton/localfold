@@ -226,9 +226,9 @@ The style IS index.html's: py2Dmol's light application CSS plus web/localfold.cs
                              (cpu/af3/diffusion/steering.js), so they are a prior for any model rather than a
                              filter. OFF BY DEFAULT until measured (docs/DESIGN-TODO.md). -->
                         <div class="fetch-option-group advanced" id="steerGroup">
-                            <label class="fetch-option-title" for="steer">Steer to hotspots</label>
+                            <label class="fetch-option-title" for="steer">Steer to hotspots (Å)</label>
                             <input type="number" id="steer" min="0.01" max="10" step="0.1" placeholder="off"
-                                title="Pull the design toward its hotspots during every fold's diffusion, with this strength (ProteinHunter2 uses 1). A steered cycle is not rejected for missing a hotspot, only for touching nothing. Blank: off - hotspots filter instead, except Boltz-2's, which it reads as a pocket.">
+                                title="Move the design toward its hotspots during every fold's diffusion, as one body, by at most this many angstroms a step. A steered cycle is not rejected for missing a hotspot, only for touching nothing. Blank: off - hotspots filter instead, except Boltz-2's, which it reads as a pocket.">
                         </div>
                         <div class="fetch-option-group advanced" id="stayGroup">
                             <label class="fetch-option-title" for="stay-within">Stay within (Å)</label>

@@ -29,8 +29,8 @@ import { Af3DiffusionHeadGpu } from "./diffusion-head.js";
  *   `start` begins the walk part-way down: at the first scheduled level at or below `level`
  *   (angstroms), from `positions` (the dense layout) plus that much noise, running only the steps
  *   left. RFdiffusion's partial diffusion, on AF3's schedule.
- *   `steer` pulls the `binder` tokens toward the `pocket` tokens: each denoised prediction takes one
- *   descent step on a contact restraint before the update reads it (cpu/af3/diffusion/steering.js).
+ *   `steer` pulls the `binder` tokens toward the `pocket` tokens: each denoised prediction has its
+ *   binder translated down a contact restraint before the update reads it (cpu/af3/diffusion/steering.js).
  */
 export async function sampleOnGpu(device, input, weights, options) {
   const { steps, normal } = options;
@@ -105,7 +105,8 @@ export async function sampleOnGpu(device, input, weights, options) {
     // 🔴 STEERING DISPLACES THE PREDICTION, NOT THE WALK: the update moves toward what it is handed,
     // so the restraint's descent step goes in here and the denoiser itself is untouched
     const denoised = options.steer === undefined ? raw.positions
-      : steerDenoised(raw.positions, input.atomMask, input.shape.dense, options.steer, tHat, levels[0]);
+      : steerDenoised(raw.positions, input.atomMask, input.shape.dense, options.steer,
+                      (step - first - 1) / (levels.length - 1 - first));
     // (boltz2 rigid-aligns the noisy copy onto the answer before the step: dialect.realignSampler)
     const aligned = input.dialect?.realignSampler === true
       ? weightedRigidAlign(noisy, denoised, input.atomMask, atoms) : noisy;
