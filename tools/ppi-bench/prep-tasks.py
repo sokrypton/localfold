@@ -60,6 +60,25 @@ for pdb in ("7m5w", "7n5u", "7rte"):
             chains.setdefault(r[c["label_asym_id"]], {})[int(r[c["label_seq_id"]])] = DNA[comp]
     tasks[pdb] = {"task": "dna", "binder": binder_range(c, rows),
                   "chains": [{"kind": "dna", "sequence": "".join(s[k] for k in sorted(s))} for s in chains.values()]}
+    # "F-<pdb>": the paper's "dna_fixed" - the same duplex from *_structure_context, its coordinates given: every heavy
+    # atom as [chain index, residue (1-based within the chain), atom name, x, y, z], for the design folds to hold
+    f = os.path.join(d, f"{pdb}_structure_context.cif.zst")
+    c, rows = table(f, "_atom_site.")
+    order, atoms, chains = [], [], {}
+    for r in rows:
+        comp = r[c["label_comp_id"]]
+        if comp not in DNA or r[c["type_symbol"]] == "H": continue
+        asym = r[c["label_asym_id"]]
+        if asym not in order: order.append(asym)
+        seq = int(r[c["label_seq_id"]])
+        chains.setdefault(asym, {})[seq] = DNA[comp]
+        atoms.append([order.index(asym), seq, r[c["label_atom_id"]],
+                      float(r[c["Cartn_x"]]), float(r[c["Cartn_y"]]), float(r[c["Cartn_z"]])])
+    first = {a: min(chains[a]) for a in order}
+    tasks["F-" + pdb] = {"task": "dna", "binder": binder_range(c, rows),
+                         "chains": [{"kind": "dna", "sequence": "".join(chains[a][k] for k in sorted(chains[a]))} for a in order],
+                         "dnaAtoms": [[i, seq - first[order[i]] + 1, n, x, y, z] for i, seq, n, x, y, z in atoms]}
+    assert tasks["F-" + pdb]["chains"] == tasks[pdb]["chains"], pdb
 
 d = os.path.join(SRC, "data/benchmarks/small_molecule_binder/disco_figure_2c")
 cfg = open(os.path.join(SRC, "configs/datasets/val/small_molecule_binder/disco_figure_2c.yaml")).read()
@@ -106,9 +125,11 @@ for key in keys:
 #      code with its conditioned atoms, and the scaffold length. Every conditioned atom is one absolute group, so the
 #      motif RMSD is one superposition over all of them (configs/metrics/refolding_metrics, refolded_motif_allatom_rmsd)
 #   🔴 inter-ligand bonds (M0110's FAD-PER-DAL) are not carried: each ligand chain is folded as its own molecule
-d = os.path.join(SRC, "data/benchmarks/mcsa/mcsa_37_fixed_ligand")
-for f in sorted(os.listdir(d)):
-    key = f.split(".")[0]
+#   ...and "U-<key>": the same 37 from mcsa_37 (the paper's "mcsa_unfixed"), where the ligands' atoms are NOT
+#   coordinate-conditioned - only the motif's tips are, so only those are inpainted
+for d, prefix in ((os.path.join(SRC, "data/benchmarks/mcsa/mcsa_37_fixed_ligand"), ""), (os.path.join(SRC, "data/benchmarks/mcsa/mcsa_37"), "U-")):
+  for f in sorted(os.listdir(d)):
+    key = prefix + f.split(".")[0]
     c, rows = table(os.path.join(d, f), "_atom_site.")
     cc, crow = table(os.path.join(d, f), "_condition_coordinate_1_atom.")
     conditioned = {int(r[0]) for r in crow if r[1] != "nan"}

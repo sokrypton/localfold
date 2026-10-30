@@ -389,6 +389,17 @@ async function attempt(name, index) {
         ...t.motif.flatMap((m, k) => m.atoms.map(([a, x, y, z]) => `${positions[k]} ${a} ${x} ${y} ${z}`)),
         ...t.chains.flatMap((c, i) => (c.conditioned ?? []).filter(([a]) => built[i].has(a)).map(([a, x, y, z]) => `${-(i + 2)} ${a} ${x} ${y} ${z}`)),
       ].join("\n") + "\n");
+    } else if (t.task === "dna" && t.dnaAtoms !== undefined) {
+      // DNA FIXED (the paper's dna_fixed, an "F-" target): the given duplex inpainted into every design fold, token by
+      // token - only the atoms AF3 builds (the stub fold's names; a 5' phosphate may be absent); the check and the
+      // evaluation fold it free, as for the unfixed set
+      const offsets = [length];
+      for (const c of t.chains) offsets.push(offsets.at(-1) + c.sequence.length);
+      const builtDna = new Set((await dnaFrame(name, t)).map((a) => `${a.chain}:${a.residue}:${a.atom}`));
+      const kept = t.dnaAtoms.filter(([i, r, n]) => builtDna.has(`${i}:${r}:${n}`));
+      unguided = t.dnaAtoms.length - kept.length;
+      motif = path.join(work, `motif-${process.pid}-${name}-${index}-${restart}.txt`);
+      fs.writeFileSync(motif, kept.map(([i, r, n, x, y, z]) => `${offsets[i] + r - 1} ${n} ${x} ${y} ${z}`).join("\n") + "\n");
     } else if (t.task === "dna" && cfg.dnaFrame) {
       // 🔴 THE DUPLEX HELD IN ITS OWN FOLDED SHAPE: every design fold inpaints it (cuda/af3 --motif), each nucleotide a
       // token after the binder's `length`, so the binder is designed against B-form DNA rather than whatever duplex
