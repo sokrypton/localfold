@@ -338,6 +338,13 @@ struct DiffusionOptions {
   double stepScale = 0;        // --step-scale=S: the step's scale (0: the model's own - AF3's 1.5, chai-1's 2)
   bool scheduleGiven = false;  // --schedule= said (chai-1's default schedule is its own, not the geometric one)
   bool given = false;          // a flag set one
+  // 🔴 MOTIF INPAINTING ON THE ANSWER (--motif=<file>, 2026-10-30): each step's denoised estimate has the listed atoms
+  // replaced by their target coordinates, the target rigidly fitted onto the estimate's own atoms first (so the motif
+  // keeps its internal geometry and the fold chooses where it sits); the noisy walk then steps toward that. Lines of
+  // the file are "<token> <atom name> <x> <y> <z>", resolved to dense slots by the caller (motifSlots/motifXyz).
+  // --motif-until=<A>: only while the step's noise level is above A, so the last steps are the model's own
+  std::string motifFile; double motifUntil = 0;
+  std::vector<int> motifSlots; std::vector<float> motifXyz;
 };
 // a DiffusionOptions flag, read into `o`; false for any other flag (an unknown value is refused by name)
 inline bool diffusionFlag(const char* f, DiffusionOptions& o) {
@@ -357,6 +364,8 @@ inline bool diffusionFlag(const char* f, DiffusionOptions& o) {
     if (o.stepScale <= 0) { fprintf(stderr, "--step-scale takes a positive number, not %s\n", f + 13); exit(1); }
     o.given = true; return true;
   }
+  if (!strncmp(f, "--motif=", 8)) { o.motifFile = f + 8; return true; }
+  if (!strncmp(f, "--motif-until=", 14)) { o.motifUntil = atof(f + 14); return true; }
   if (!strncmp(f, "--multistep-below=", 18)) { o.multistepBelow = atof(f + 18); o.given = true; return true; }
   if (!strncmp(f, "--schedule-split=", 17)) {
     if (sscanf(f + 17, "%lf:%d", &o.splitAt, &o.splitAbove) != 2 || o.splitAt <= 0 || o.splitAbove < 1) {
@@ -365,6 +374,27 @@ inline bool diffusionFlag(const char* f, DiffusionOptions& o) {
     o.geometric = true; o.given = true; return true;
   }
   return false;
+}
+// The denoised estimate with the motif's atoms replaced (DiffusionOptions::motifFile): per sample, the target fitted
+// onto the estimate's own motif atoms (Kabsch, rigid.cuh) and written over them. A copy - `d` is the denoiser's.
+inline const float* inpaintMotif(const float* d, const DiffusionOptions& opt, size_t atoms) {
+  const size_t k = opt.motifSlots.size(), all3 = atoms * 3 * NS;
+  float* g = scratch<float>("sample.inpainted", all3);
+  CK(cudaMemcpyAsync(g, d, all3 * 4, cudaMemcpyDeviceToDevice, STREAM));
+  std::vector<float> host(all3);
+  CK(cudaMemcpyAsync(host.data(), g, all3 * 4, cudaMemcpyDeviceToHost, STREAM));
+  CK(cudaStreamSynchronize(STREAM));
+  std::vector<float> pred(k * 3), fit(k * 3), w(k, 1.f);
+  for (int s = 0; s < NS; ++s) {
+    float* x = host.data() + (size_t)s * atoms * 3;
+    for (size_t a = 0; a < k; ++a) for (int c = 0; c < 3; ++c) pred[a * 3 + c] = x[(size_t)opt.motifSlots[a] * 3 + c];
+    fit = opt.motifXyz;
+    rigidAlign(fit.data(), pred.data(), w.data(), (int)k);
+    for (size_t a = 0; a < k; ++a) for (int c = 0; c < 3; ++c) x[(size_t)opt.motifSlots[a] * 3 + c] = fit[a * 3 + c];
+  }
+  CK(cudaMemcpyAsync(g, host.data(), all3 * 4, cudaMemcpyHostToDevice, STREAM));
+  CK(cudaStreamSynchronize(STREAM));
+  return g;
 }
 // Returns every sample's positions, sample-major [ns][atoms][3].
 inline std::vector<float> sample(int steps, const std::vector<uint64_t>& seeds, const std::vector<float>& mask,
@@ -467,6 +497,7 @@ inline std::vector<float> sample(int steps, const std::vector<uint64_t>& seeds, 
                                                    dSeeds, (uint32_t)step, (float)injected, atoms);
     const float* d = denoiseFn(dNoisy, (float)tHat, dLevels + step - 1);
     if (step == 1 && STAGES) { CK(cudaStreamSynchronize(STREAM)); STAGE_MS.clear(); }
+    if (!opt.motifSlots.empty() && tHat > opt.motifUntil) d = inpaintMotif(d, opt, atoms);
     if (FRAME_HOOK) FRAME_HOOK(d, step, steps);
     // (boltz2: the noisy copy rigid-aligned onto the answer, each sample, before the step - rigid.cuh)
     if (realign) rigidAlignK<<<ns, 256, 0, STREAM>>>(dNoisy, d, dMask, (int)atoms);

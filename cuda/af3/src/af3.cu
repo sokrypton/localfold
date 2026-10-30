@@ -809,9 +809,39 @@ static int foldMain(int argc, char** argv) {
     std::vector<uint64_t> mySeeds;
     for (size_t k = 0; k < cn; ++k) if (!dealt || (int)(k % mg::WORLD) == mg::RANK) mySeeds.push_back(seeds[k]);
     NS = (int)mySeeds.size();
+    // --motif=<file>: "<token> <atom> <x> <y> <z>" lines, each named atom of that token found among its dense slots
+    DiffusionOptions dopt = diffusion;
+    if (!dopt.motifFile.empty()) {
+      if (structural) { fprintf(stderr, "--motif: not on a model with structural tokens\n"); return 1; }
+      std::ifstream mf(dopt.motifFile);
+      if (!mf) { fprintf(stderr, "--motif=%s: cannot read it\n", dopt.motifFile.c_str()); return 1; }
+      const int tokens = (int)M.meta("batch.tokens"), dense = (int)M.meta("batch.dense");
+      const int* names = M.i("batch.refAtomNameChars"); const float* live = M.f("batch.predDenseAtomMask");
+      const int* asym = M.i("batch.asymId");
+      int token; std::string atom; float x, y, z;
+      while (mf >> token >> atom >> x >> y >> z) {
+        // (a negative token is a whole chain, asymId -token: a ligand's atoms are a token each, so they are found by
+        // name across the chain - and refused when the name is not exactly one atom of it)
+        if (token >= tokens) { fprintf(stderr, "--motif: token %d of %d\n", token, tokens); return 1; }
+        int found = -1, matches = 0;
+        for (int tk = token >= 0 ? token : 0; tk < (token >= 0 ? token + 1 : tokens); ++tk) {
+          if (token < 0 && asym[tk] != -token) continue;
+          for (int a = 0; a < dense; ++a) {
+            const size_t i = (size_t)tk * dense + a;
+            if (!live[i]) continue;
+            std::string name;
+            for (int c = 0; c < 4; ++c) if (names[i * 4 + c] > 0) name += (char)(names[i * 4 + c] + 32);
+            if (name == atom) { found = (int)i; ++matches; }
+          }
+        }
+        if (matches != 1) { fprintf(stderr, "--motif: %s %d has %d atoms named %s\n", token >= 0 ? "token" : "chain", token >= 0 ? token : -token, matches, atom.c_str()); return 1; }
+        dopt.motifSlots.push_back(found); dopt.motifXyz.insert(dopt.motifXyz.end(), {x, y, z});
+      }
+      if (dopt.motifSlots.size() < 3) { fprintf(stderr, "--motif=%s: %zu atoms, a fit needs 3\n", dopt.motifFile.c_str(), dopt.motifSlots.size()); return 1; }
+    }
     std::vector<float> xs = NS ? sample(steps, mySeeds, mask, [&](const float* noisy, float tHat, const float* dLevel) {
       return (const float*)denoiseStep(df, noisy, tHat, dLevel);
-    }, 0.8, 1.0, 1.003, 1.5, [&](const std::vector<float>& levels) { precomputeConditioning(df, levels); }, diffusion) : std::vector<float>();
+    }, 0.8, 1.0, 1.003, 1.5, [&](const std::vector<float>& levels) { precomputeConditioning(df, levels); }, dopt) : std::vector<float>();
     if (dealt) {
       const size_t per = mask.size() * 3;
       mg::Shared& xS = mg::shared("sh.xs", perBatch * per * 4);

@@ -3,7 +3,7 @@
 import json, os, sys, collections, random
 HERE = os.path.dirname(os.path.abspath(__file__))
 ref = json.load(open(os.path.join(HERE, "rfd4-paper-data.json")))
-CRIT = {"dna": "dna", "sm": "sm_binder"}
+CRIT = {"dna": "dna", "sm": "sm_binder", "ame": "ame"}
 paper = collections.defaultdict(lambda: collections.defaultdict(dict))
 for r in ref["rows"]:
     if r.get("figure2") and r["criterion"] in CRIT.values():

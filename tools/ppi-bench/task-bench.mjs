@@ -34,7 +34,7 @@ const done = new Set(fs.existsSync(out)
   : []);
 const bytes = (file) => { const b = fs.readFileSync(file); return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength); };
 if ((await enableAcceleration(bytes(`${ROOT}/web/vendor/mpnn/kernels.wasm`))) === null) throw new Error("MPNN's accelerator did not load");
-const checkpoint = { dna: "na_mpnn_design.mpnn", sm: "ligandmpnn_v_32_020_25.mpnn" };
+const checkpoint = { dna: "na_mpnn_design.mpnn", sm: "ligandmpnn_v_32_020_25.mpnn", ame: "ligandmpnn_v_32_020_25.mpnn" };
 const mpnns = {};
 const mpnnFor = (task) => (mpnns[task] ??= new Model(Weights.fromArrayBuffer(bytes(`${ROOT}/web/public/mpnn/${config.mpnn?.[task] ?? checkpoint[task]}`))));
 const work = fs.mkdtempSync(path.join(os.tmpdir(), "task-native-"));
@@ -47,7 +47,7 @@ const seedOf = (text) => createHash("sha1").update(text).digest().readUInt32LE(0
 const LETTERS = "ABCDEFGHIJ";
 
 /** One native fold of [binder, ...the task's chains] from an AF3 job; the structure and the paper's terms. */
-async function fold(t, binder, { steps, recycles, seed }) {
+async function fold(t, binder, { steps, recycles, seed, motif }) {
   const file = path.join(work, `f${process.pid}-${Date.now()}.pdb`);
   const job = file.replace(".pdb", ".json");
   const sequences = [{ protein: { id: "A", sequence: binder } }, ...t.chains.map((c, i) => {
@@ -56,7 +56,9 @@ async function fold(t, binder, { steps, recycles, seed }) {
     return { ligand: c.ccd !== undefined ? { id, ccdCodes: [c.ccd] } : { id, smiles: c.smiles } };
   })];
   fs.writeFileSync(job, JSON.stringify({ dialect: "alphafold3", version: 2, name: "j", modelSeeds: [seed], sequences }));
-  await run(`${ROOT}/cuda/af3/fold`, [file, `--job=${job}`, "--", `--steps=${steps}`, `--recycles=${recycles}`, `--seed=${seed}`],
+  // `motif`: a design fold inpainted with the task's catalytic motif (cuda/af3 --motif; never a check or the evaluation)
+  const guide = motif === undefined ? [] : [`--motif=${motif}`, ...(config.motifUntil === undefined ? [] : [`--motif-until=${config.motifUntil}`])];
+  await run(`${ROOT}/cuda/af3/fold`, [file, `--job=${job}`, "--", `--steps=${steps}`, `--recycles=${recycles}`, `--seed=${seed}`, ...guide],
     { maxBuffer: 1 << 26 });
   const pdb = fs.readFileSync(file, "utf8");
   const s = JSON.parse(fs.readFileSync(file.replace(".pdb", "_summary_confidences.json"), "utf8"));
@@ -119,8 +121,50 @@ function fittedRmsd(fitD, fitR, measureD, measureR) {
   for (let i = fk.length; i < n; i += 1) for (let a = 0; a < 3; a += 1) sum += (fitted[i * 3 + a] - y[i * 3 + a]) ** 2;
   return Math.sqrt(sum / mk.length);
 }
-function verdict(task, designPdb, r) {
+/** Every heavy atom of the binder by residue number and name, and the other chains' heavy atoms. */
+function allAtoms(pdb) {
+  const binder = new Map(), other = [];
+  for (const line of pdb.split("\n")) {
+    if (!line.startsWith("ATOM") && !line.startsWith("HETATM")) continue;
+    if (line.slice(76, 78).trim() === "H") continue;
+    const xyz = [+line.slice(30, 38), +line.slice(38, 46), +line.slice(46, 54)];
+    if (line[21] === "A") binder.set(`${+line.slice(22, 26)}:${line.slice(12, 16).trim()}`, xyz); else other.push(xyz);
+  }
+  return { binder, other };
+}
+/** RMSD of two equal-length point lists after superposing the first onto the second. */
+function selfRmsd(a, b) {
+  const n = a.length, x = new Float32Array(n * 3), y = new Float32Array(n * 3), w = new Float32Array(n).fill(1);
+  a.forEach((p, i) => x.set(p, i * 3)); b.forEach((p, i) => y.set(p, i * 3));
+  const fitted = weightedRigidAlign(x, y, w, n);
+  let sum = 0;
+  for (let i = 0; i < n * 3; i += 1) sum += (fitted[i] - y[i]) ** 2;
+  return Math.sqrt(sum / n);
+}
+/** The AME terms (the paper's `ame` criterion): the refold's motif atoms at the design's positions against the task's
+ * conditioned coordinates, one superposition over all of them; and polymer-ligand pairs under 1.5 A in the DESIGN
+ * (its clash metric is on the generated structure). */
+function motifTerms(t, positions, designPdb, refoldPdb) {
+  const f = allAtoms(refoldPdb), want = [], got = [];
+  t.motif.forEach((m, k) => {
+    for (const [name, x, y, z] of m.atoms) {
+      const at = f.binder.get(`${positions[k] + 1}:${name}`);
+      if (at === undefined) throw new Error(`refold has no ${m.res} ${name} at residue ${positions[k] + 1}`);
+      want.push([x, y, z]); got.push(at);
+    }
+  });
+  const d = allAtoms(designPdb);
+  let clashes = 0;
+  for (const p of d.binder.values()) for (const q of d.other) if ((p[0] - q[0]) ** 2 + (p[1] - q[1]) ** 2 + (p[2] - q[2]) ** 2 < 2.25) clashes += 1;
+  return { motifRmsd: selfRmsd(got, want), clashes };
+}
+function verdict(task, designPdb, r, t, positions) {
   const d = atoms(designPdb), f = atoms(r.pdb);
+  if (task === "ame") {
+    const rmsd = fittedRmsd(d.binder, f.binder, d.binder, f.binder);
+    const m = motifTerms(t, positions, designPdb, r.pdb);
+    return { rmsd, ...m, pass: r.ipae < 1.5 && rmsd <= 2 && m.motifRmsd <= 1.5 && m.clashes === 0 };
+  }
   if (task === "dna") {
     const rmsd = fittedRmsd(d.rest, f.rest, d.binder, f.binder);
     return { rmsd, pass: r.ipae <= 1.5 && rmsd <= 8 };
@@ -150,6 +194,22 @@ function footprintProblem(pdb) {
   return touched >= config.minFootprint ? null : `footprint ${touched} residues, needs ${config.minFootprint}`;
 }
 
+/** `dnaFrame`: the duplex as AF3 folds it from its sequence (beside a 5-residue stub, the binder slot filled), once a
+ * target - nothing the benchmark's "unfixed" input does not give - every heavy atom by chain, residue and name. */
+const dnaFrames = {};
+async function dnaFrame(name, t) {
+  if (dnaFrames[name] !== undefined) return dnaFrames[name];
+  const r = await fold(t, "GGGGG", { steps: 200, recycles: 5, seed: 11 });
+  const atomsOf = [];
+  for (const line of r.pdb.split("\n")) {
+    if (!line.startsWith("ATOM") && !line.startsWith("HETATM")) continue;
+    if (line[21] === "A" || line.slice(76, 78).trim() === "H") continue;
+    atomsOf.push({ chain: "BCDEFGHIJ".indexOf(line[21]), residue: +line.slice(22, 26), atom: line.slice(12, 16).trim(),
+      xyz: [+line.slice(30, 38), +line.slice(38, 46), +line.slice(46, 54)] });
+  }
+  return (dnaFrames[name] = atomsOf);
+}
+
 async function attempt(name, index) {
   const t = tasks[name];
   const cfg = config;
@@ -162,9 +222,9 @@ async function attempt(name, index) {
   const evalSeed = 1 + Math.floor(rng() * 2 ** 30);
   const seed = 1000 * index + 7;
   const mpnn = mpnnFor(t.task);
-  const assess = async (binder, designPdb, foldSeed) => {
+  const assess = async (binder, designPdb, foldSeed, positions) => {
     const r = await fold(t, binder, { steps: 200, recycles: 5, seed: foldSeed });
-    return { ...r, ...verdict(t.task, designPdb, r) };
+    return { ...r, ...verdict(t.task, designPdb, r, t, positions) };
   };
   // `check.seeds`: a candidate passes the internal check only if it passes at that many seeds (the first that
   // fails ends it) - a small molecule's interface PAE sits on the 1.5 line, and one passing seed is 64% likely to
@@ -172,17 +232,18 @@ async function attempt(name, index) {
   const checkAt = async (entry, s0) => {
     let result;
     for (let k = 0; k < (cfg.check?.seeds ?? 1); k += 1) {
-      result = await assess(entry.sequence, entry.pdb, s0 + 104729 * k);
+      result = await assess(entry.sequence, entry.pdb, s0 + 104729 * k, entry.positions);
       result.seedsPassed = k + (result.pass ? 1 : 0);
       if (!result.pass) break;
     }
     return result;
   };
   // the design-time stop: confident about the terms the task is judged on
-  const looksDone = (e) => cfg.stop !== undefined && e.ipae <= cfg.stop.ipae && (t.task === "dna" || e.iptm >= cfg.stop.iptm);
+  const confidenceOnly = t.task === "dna" || t.task === "ame";     // (neither criterion reads ipTM)
+  const looksDone = (e) => cfg.stop !== undefined && e.ipae <= cfg.stop.ipae && (confidenceOnly || e.iptm >= cfg.stop.iptm);
   // 🔴 THE FOOTPRINT SCREENS WHAT IS CHECKED, NOT WHAT THE LOOP DESIGNS FROM: as a per-cycle veto it failed most
   // docked folds, and a docked cycle was followed by a docked one 2 times in 68 against 92 in 290 without it
-  const promisingOf = (e) => e.ipae <= cfg.check.ipae && (t.task === "dna" || e.iptm >= cfg.check.iptm) && footprintProblem(e.pdb) === null;
+  const promisingOf = (e) => e.ipae <= cfg.check.ipae && (confidenceOnly || e.iptm >= cfg.check.iptm) && footprintProblem(e.pdb) === null;
   const records = [], eligible = [], checked = [];
   let runs = 0, foldSeconds = 0;
   const started = Date.now();
@@ -190,10 +251,41 @@ async function attempt(name, index) {
     runs += 1;
     const controller = new AbortController();
     const mine = [];
+    // AME: the motif's residues at `motifGap`-spaced random positions (unindexed - the designer places them), held
+    // through every MPNN draw, and every design fold inpainted with the motif and the ligands' conditioned atoms
+    let positions, motif, start = "";
+    if (t.task === "ame") {
+      const gap = cfg.motifGap ?? 4, edge = cfg.motifEdge ?? 8;
+      for (let tries = 0; ; tries += 1) {
+        if (tries > 10000) throw new Error(`no placement of ${t.motif.length} residues ${gap} apart in ${length}`);
+        positions = t.motif.map(() => edge + Math.floor(rng() * (length - 2 * edge)));
+        const sorted = [...positions].sort((a, b) => a - b);
+        if (sorted.every((p, i) => i === 0 || p - sorted[i - 1] >= gap)) break;
+      }
+      const one = { ALA: "A", ARG: "R", ASN: "N", ASP: "D", CYS: "C", GLN: "Q", GLU: "E", GLY: "G", HIS: "H", ILE: "I",
+        LEU: "L", LYS: "K", MET: "M", PHE: "F", PRO: "P", SER: "S", THR: "T", TRP: "W", TYR: "Y", VAL: "V" };
+      const letters = Array(length).fill("X");
+      t.motif.forEach((m, k) => { letters[positions[k]] = one[m.res]; });
+      start = letters.join("");
+      motif = path.join(work, `motif-${process.pid}-${name}-${index}-${restart}.txt`);
+      fs.writeFileSync(motif, [
+        ...t.motif.flatMap((m, k) => m.atoms.map(([a, x, y, z]) => `${positions[k]} ${a} ${x} ${y} ${z}`)),
+        ...t.chains.flatMap((c, i) => (c.conditioned ?? []).map(([a, x, y, z]) => `${-(i + 2)} ${a} ${x} ${y} ${z}`)),
+      ].join("\n") + "\n");
+    } else if (t.task === "dna" && cfg.dnaFrame) {
+      // 🔴 THE DUPLEX HELD IN ITS OWN FOLDED SHAPE: every design fold inpaints it (cuda/af3 --motif), each nucleotide a
+      // token after the binder's `length`, so the binder is designed against B-form DNA rather than whatever duplex
+      // this fold's noise made; the check and the evaluation fold it free
+      const offsets = [length];
+      for (const c of t.chains) offsets.push(offsets.at(-1) + c.sequence.length);
+      motif = path.join(work, `motif-${process.pid}-${name}-${index}-${restart}.txt`);
+      fs.writeFileSync(motif, (await dnaFrame(name, t)).map((a) => `${offsets[a.chain] + a.residue - 1} ${a.atom} ${a.xyz.join(" ")}`).join("\n") + "\n");
+    }
     let lastDocked = null, undockedRun = 0;
     try {
       const stream = runDesign({
-        chains: [""], chainIndex: 0, cycles: cfg.cycles, length, run: restart,
+        chains: [start], chainIndex: 0, cycles: cfg.cycles, length, run: restart,
+        ...(positions === undefined ? {} : { hold: positions }),
         seed: seed + 101 * restart, signal: controller.signal, kind: "protein", beam: cfg.beam ?? 1,
         ...(cfg.temperature === undefined ? {} : { temperature: cfg.temperature }),
         // `omit`: letters MPNN may never write, per task (a DNA binder without D/E is basic) - the loop's own default is "C"
@@ -211,7 +303,7 @@ async function attempt(name, index) {
             // where AF3 docks ~5%, and AF3 then refines a docked start into one AF3 believes
             const ef2 = cfg.designEngine === "ef2" || (cfg.ef2Cycles !== undefined && context.cycle < cfg.ef2Cycles);
             r = ef2 ? await foldEf2(t, sequence, { seed: s })
-              : await fold(t, sequence, { steps: cfg.steps, recycles: cfg.recycles, seed: s });
+              : await fold(t, sequence, { steps: cfg.steps, recycles: cfg.recycles, seed: s, motif });
             if (contactProblem(r.pdb, { chain: "A" }) === null) { docked = true; break; }
           }
           foldSeconds += (Date.now() - t0) / 1000;
@@ -241,7 +333,7 @@ async function attempt(name, index) {
         // a restart that has not found the interface by `giveUp.cycle` is abandoned for a fresh one
         if (cfg.giveUp !== undefined && record.cycle >= cfg.giveUp.cycle && terms.ipae > cfg.giveUp.ipae) controller.abort();
         if (record.cycle > 0 && record.alanine <= 0.2 && (record.vetoed ?? null) === null) {
-          const entry = { ...terms, restart, cycle: record.cycle, sequence: record.sequence, pdb: record.pdb, score: record.score };
+          const entry = { ...terms, restart, cycle: record.cycle, sequence: record.sequence, pdb: record.pdb, score: record.score, positions };
           eligible.push(entry); mine.push(entry);
           if (looksDone(entry)) controller.abort();
         }
@@ -264,7 +356,9 @@ async function attempt(name, index) {
   // `polish`: when no restart produced a passing check, redesign around the NEAREST misses instead of from scratch -
   // `draws` MPNN sequences on each of the `from` closest checked candidates' design backbones, each folded at the
   // design settings, and the best `top` of them (by design iPAE, under the check's thresholds) checked in turn
-  const margin = (r) => Math.max(r.ipae / 1.5, t.task === "dna" ? r.rmsd / 8 : Math.max(r.rmsd / 1.5, r.ligandRmsd / 5, 0.8 / Math.max(r.iptm, 1e-3)));
+  const margin = (r) => Math.max(r.ipae / 1.5, t.task === "dna" ? r.rmsd / 8
+    : t.task === "ame" ? Math.max(r.rmsd / 2, r.motifRmsd / 1.5, r.clashes > 0 ? 2 : 0)
+    : Math.max(r.rmsd / 1.5, r.ligandRmsd / 5, 0.8 / Math.max(r.iptm, 1e-3)));
   let polished = 0;
   if (cfg.polish !== undefined && !checked.some((c) => c.result.pass)) {
     const near = [...checked].sort((a, b) => margin(a.result) - margin(b.result)).slice(0, cfg.polish.from);
@@ -273,12 +367,12 @@ async function attempt(name, index) {
       for (let k = 0; k < cfg.polish.draws; k += 1) {
         const random = mulberry(seedOf(`polish:${name}:${index}:${n}:${k}`));
         const designed = designChain(mpnn, { pdb: c.entry.pdb, chain: "A", temperature: cfg.polish.temperature ?? 0.1,
-          omit: cfg.omit?.[t.task] ?? "C", random, kind: "protein" });
+          omit: cfg.omit?.[t.task] ?? "C", random, kind: "protein", hold: c.entry.positions });
         const r = await fold(t, designed.sequence, { steps: cfg.steps, recycles: cfg.recycles, seed: seed + 50000 + 97 * n + k });
         polished += 1;
         records.push({ restart: -1, cycle: n, polish: k, ipae: r.ipae, iptm: r.iptm, binderPtm: r.binderPtm });
         const alanine = [...designed.sequence].filter((x) => x === "A").length / designed.sequence.length;
-        if (alanine <= 0.2 && (contactProblem(r.pdb, { chain: "A" }) ?? footprintProblem(r.pdb)) === null) pool.push({ ipae: r.ipae, iptm: r.iptm, binderPtm: r.binderPtm, restart: -1, cycle: n, sequence: designed.sequence, pdb: r.pdb });
+        if (alanine <= 0.2 && (contactProblem(r.pdb, { chain: "A" }) ?? footprintProblem(r.pdb)) === null) pool.push({ ipae: r.ipae, iptm: r.iptm, binderPtm: r.binderPtm, restart: -1, cycle: n, sequence: designed.sequence, pdb: r.pdb, positions: c.entry.positions });
       }
     }
     for (const entry of pool.filter(promisingOf).sort((a, b) => a.ipae - b.ipae).slice(0, cfg.polish.top)) {
@@ -293,12 +387,14 @@ async function attempt(name, index) {
     : eligible.length > 0 ? eligible.reduce((a, b) => (b.ipae < a.ipae ? b : a)) : null;
   const row = { target: name, task: t.task, attempt: index, length, config: cfg.tag, runs, polished, records, foldSeconds,
     checks: checked.map((c) => ({ restart: c.entry.restart, cycle: c.entry.cycle, ipae: c.result.ipae, iptm: c.result.iptm,
-      rmsd: c.result.rmsd, ligandRmsd: c.result.ligandRmsd, pass: c.result.pass, seedsPassed: c.result.seedsPassed })) };
+      rmsd: c.result.rmsd, ligandRmsd: c.result.ligandRmsd, motifRmsd: c.result.motifRmsd, clashes: c.result.clashes,
+      pass: c.result.pass, seedsPassed: c.result.seedsPassed })) };
   if (best !== null) {
     // 🔴 THE EVALUATION IS ALWAYS THE NATIVE AF3 at the benchmark's settings, with its own seed
-    const final = await assess(best.sequence, best.pdb, evalSeed);
+    const final = await assess(best.sequence, best.pdb, evalSeed, best.positions);
     Object.assign(row, { binder: best.sequence, bestCycle: best.cycle, bestRestart: best.restart,
       binderPtm: final.binderPtm, ipae: final.ipae, iptm: final.iptm, rmsd: final.rmsd, ligandRmsd: final.ligandRmsd,
+      motifRmsd: final.motifRmsd, clashes: final.clashes, positions: best.positions,
       pass: final.pass, designPdb: best.pdb, refoldPdb: final.pdb });
   } else {
     row.pass = false;

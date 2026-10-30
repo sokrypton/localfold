@@ -100,6 +100,37 @@ for key in keys:
         chains.append({"kind": "ligand", "smiles": smiles, "atoms": len(atoms)})
     tasks[key] = {"task": "sm", "binder": binder_range(c, rows), "chains": chains}
 
+# ame: data/benchmarks/mcsa/mcsa_37_fixed_ligand (the paper's "mcsa_fixed"), unindexed catalytic motifs: each motif
+#      residue's type and its COORDINATE-CONDITIONED atoms (the non-NaN rows of _condition_coordinate_1_atom - the
+#      tips; the backbone atoms recovered from the PDB entry are sequence-conditioned only), each ligand chain by CCD
+#      code with its conditioned atoms, and the scaffold length. Every conditioned atom is one absolute group, so the
+#      motif RMSD is one superposition over all of them (configs/metrics/refolding_metrics, refolded_motif_allatom_rmsd)
+#   🔴 inter-ligand bonds (M0110's FAD-PER-DAL) are not carried: each ligand chain is folded as its own molecule
+d = os.path.join(SRC, "data/benchmarks/mcsa/mcsa_37_fixed_ligand")
+for f in sorted(os.listdir(d)):
+    key = f.split(".")[0]
+    c, rows = table(os.path.join(d, f), "_atom_site.")
+    cc, crow = table(os.path.join(d, f), "_condition_coordinate_1_atom.")
+    conditioned = {int(r[0]) for r in crow if r[1] != "nan"}
+    motif, ligands = {}, {}
+    for r in rows:
+        if r[c["type_symbol"]] in ("X", "H"): continue
+        on = int(r[c["atom_array_index"]]) in conditioned
+        xyz = [float(r[c["Cartn_x"]]), float(r[c["Cartn_y"]]), float(r[c["Cartn_z"]])]
+        if r[c["group_PDB"]] == "ATOM":
+            m = motif.setdefault(int(r[c["label_seq_id"]]), {"res": r[c["label_comp_id"]], "atoms": []})
+            if on: m["atoms"].append([r[c["label_atom_id"]], *xyz])
+        else:
+            lig = ligands.setdefault(r[c["label_asym_id"]], {"comps": [], "atoms": []})
+            if r[c["label_comp_id"]] not in lig["comps"]: lig["comps"].append(r[c["label_comp_id"]])
+            if on: lig["atoms"].append([r[c["label_atom_id"]], *xyz])
+    assert all(len(l["comps"]) == 1 for l in ligands.values()), (key, ligands)
+    tasks[key] = {"task": "ame", "binder": binder_range(c, rows),
+                  "chains": [{"kind": "ligand", "ccd": l["comps"][0], "atoms": len(l["atoms"]), "conditioned": l["atoms"]}
+                             for _, l in sorted(ligands.items())],
+                  "motif": [motif[k] for k in sorted(motif)]}
+
 json.dump(tasks, open(os.path.join(HERE, "tasks.json"), "w"))
 for k, t in tasks.items():
-    print(k, t["task"], t["binder"], [ch.get("sequence") or ch.get("smiles") or ch["ccd"] for ch in t["chains"]])
+    print(k, t["task"], t["binder"], [ch.get("sequence") or ch.get("smiles") or ch["ccd"] for ch in t["chains"]],
+          *([[m["res"], len(m["atoms"])] for m in t["motif"]] if "motif" in t else []))
