@@ -941,7 +941,7 @@ active sites, MCSA) - all defined in their `configs/metrics/pass_criteria/all_pa
 | small molecules | `sm_binder` (above) | 34.3% | 62.3% (TS7) | ahead |
 | small molecules | `disco`: backbone RMSD <= 2, ligand centroid <= 2 A | 64.7% | **74.7% (TS7, CI 70.8-78.6)** | ahead |
 | DNA | min iPAE <= 1.5, binder RMSD <= 8 after DNA alignment | 3.5% | 8.3% (TD15), 6.7% (TD9) | ahead, on 4-5 passes |
-| enzyme active sites | `ame` (below) | 14.7% | - | **not run until now** |
+| enzyme active sites | `ame` (below) | 14.7% | **22.1% (TA6, 34 of 37 targets, CI 17.6-26.5; RFD4 14.9% on the same 34)** | ahead; >= 20.3% over all 37 even if the 3 reruns fail |
 
 - **`disco` rescored, nothing refolded** (`disco-score.py`): from each row's own design and refold PDBs, the binder's
   backbone fitted, the largest ligand-chain centroid distance. The paper groups a ligand by connectivity including
@@ -1004,7 +1004,17 @@ them - every conditioned atom is coordinate group 0), and no polymer-ligand pair
   cycle's backbone at temperature 0.3, the motif held - handed to AF3 as the binder's unpaired MSA in every guided
   design fold, its depth falling linearly to none at the last cycle so the run ends single-sequence, as it is
   judged. Probes, checks and the evaluation stay single-sequence. Run in RFD4-Proteina's per-target order, best
-  first. Results: (running)
+  first. Results (partial, strongest targets first): 7 of 12 passed, 58.3% against RFD4-Proteina's 32.2% on those
+  12 - including M0097 and M0738, which TA6 missed on both attempts.
+- **TA6, 2 attempts on each target (TA6 + TA6b): 22.1% (CI 17.6-26.5) over 34 targets, a pass on 10**, against
+  RFD4-Proteina high's 14.9% on the same 34. Ours both times: M0129 (theirs 63%), M0710 (37%), M0110 (13%), M0717
+  (8%), M0096 (1.5%); once: M0630, M0636, M0209, M0739, M0664. Missed where theirs is high: M0097 (47%), M0738 (43%),
+  M0555 (26.5%), M0157, M0500. The probe and the matching carry it; the climb rescues no large motif.
+- 🔴 M0365, M0663 and M0907 errored on the first design fold: their input conditions a ligand atom AF3's CCD
+  component does not build (FBP, RIB and CAP's O1, leaving atoms) and `--motif` refuses an atom it cannot find.
+  The harness now folds a stub once a target and guides only the ligand atoms AF3 builds (e3d2219a; only the
+  PROTEIN motif atoms are scored, so this changes nothing judged); the six attempts are being re-run. Even at 0 of 6
+  the 37-target mean is 20.3%.
 
 **DNA held in a fixed frame, TD17.** The DNA benchmark gives the duplex as SEQUENCE only (`*_sequence_context`,
 coordinates zero; `*_structure_context` is the fixed variant only BoltzGen and RFD3 ran, at 0.8%), so every design
