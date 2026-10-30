@@ -208,6 +208,32 @@ function motifMatch(t, pdb) {
   dfs(0);
   return best;
 }
+/** The largest ligand-chain centroid distance, design to refold, after fitting the binder's backbone (the `disco` term). */
+function ligandCentroid(designPdb, refoldPdb) {
+  const parse = (pdb) => {
+    const bb = new Map(), lig = new Map();
+    for (const line of pdb.split("\n")) {
+      if (!line.startsWith("ATOM") && !line.startsWith("HETATM")) continue;
+      const name = line.slice(12, 16).trim(), chain = line[21];
+      const xyz = [+line.slice(30, 38), +line.slice(38, 46), +line.slice(46, 54)];
+      if (chain === "A") { if (["N", "CA", "C", "O"].includes(name)) bb.set(`${line.slice(22, 26).trim()}:${name}`, xyz); }
+      else if (line.slice(76, 78).trim() !== "H") { if (!lig.has(chain)) lig.set(chain, []); lig.get(chain).push(xyz); }
+    }
+    return { bb, lig };
+  };
+  const d = parse(designPdb), f = parse(refoldPdb);
+  const keys = [...d.bb.keys()].filter((k) => f.bb.has(k));
+  const chains = [...d.lig.keys()];
+  const n = keys.length + chains.length;
+  const x = new Float32Array(n * 3), y = new Float32Array(n * 3), w = new Float32Array(n);
+  const mean = (ps) => [0, 1, 2].map((c) => ps.reduce((s, p) => s + p[c], 0) / ps.length);
+  keys.forEach((k, i) => { x.set(f.bb.get(k), i * 3); y.set(d.bb.get(k), i * 3); w[i] = 1; });
+  chains.forEach((c, j) => { x.set(mean(f.lig.get(c)), (keys.length + j) * 3); y.set(mean(d.lig.get(c)), (keys.length + j) * 3); });
+  const fitted = weightedRigidAlign(x, y, w, n);
+  let worst = 0;
+  for (let j = keys.length; j < n; j += 1) worst = Math.max(worst, Math.hypot(fitted[j * 3] - y[j * 3], fitted[j * 3 + 1] - y[j * 3 + 1], fitted[j * 3 + 2] - y[j * 3 + 2]));
+  return worst;
+}
 function verdict(task, designPdb, r, t, positions) {
   const d = atoms(designPdb), f = atoms(r.pdb);
   if (task === "ame") {
@@ -221,7 +247,12 @@ function verdict(task, designPdb, r, t, positions) {
   }
   const rmsd = fittedRmsd(d.binder, f.binder, d.binder, f.binder);
   const ligandRmsd = fittedRmsd(d.binder, f.binder, d.rest, f.rest);
-  return { rmsd, ligandRmsd, pass: r.iptm >= 0.8 && r.ipae <= 1.5 && rmsd <= 1.5 && ligandRmsd <= 5 };
+  // `criterion: "disco"`: the paper's other small-molecule criterion judges the attempt - binder backbone RMSD <= 2 A and
+  // every ligand chain's centroid within 2 A of the design's after the backbone fit (disco-score.py's terms); no confidence
+  const centroid = ligandCentroid(designPdb, r.pdb);
+  const disco = rmsd <= 2 && centroid <= 2;
+  return { rmsd, ligandRmsd, centroid, disco,
+    pass: config.criterion === "disco" ? disco : r.iptm >= 0.8 && r.ipae <= 1.5 && rmsd <= 1.5 && ligandRmsd <= 5 };
 }
 
 /** `minFootprint`: a design must touch at least that many residues of the other chains (heavy atoms within 4.5 A) -

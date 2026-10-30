@@ -937,12 +937,31 @@ active sites, MCSA) - all defined in their `configs/metrics/pass_criteria/all_pa
 
 | task | criterion | RFD4-Proteina high | ours, best | status |
 |---|---|---|---|---|
-| protein binders | ipTM >= 0.8, min iPAE <= 1.5, binder RMSD <= 2.5 | 19.3% | 24.1% (NC) | ahead |
+| protein binders | ipTM >= 0.8, min iPAE <= 1.5, binder RMSD <= 2.5 | 19.3% | 37.9% (NC, native, each attempt at its own seed; 24.1% was the page's recipe C) | ahead |
 | small molecules | `sm_binder` (above) | 34.3% | 62.3% (TS7) | ahead |
 | small molecules | `disco`: backbone RMSD <= 2, ligand centroid <= 2 A | 64.7% | **74.7% (TS7, CI 70.8-78.6)** | ahead |
 | DNA | min iPAE <= 1.5, binder RMSD <= 8 after DNA alignment | 3.5% | 8.3% (TD15), 6.7% (TD9) | ahead, on 4-5 passes |
 | enzyme active sites | `ame` (below) | 14.7% | **21.6% (TA6, all 37 targets, 74 attempts, CI 17.6-25.7), a pass on 11** | ahead |
 
+**Against RFD4-Proteina's SEARCH pipeline too.** One attempt in all three is "do what you like, submit one design":
+their one-shot "high" generates once, their "Search" scores several candidates with AF2-multimer (PPI) or OF3 (the
+rest) and keeps the best, and ours runs restarts, polish/climb and an internal AF3 check - search, with the
+EVALUATOR's model as the scorer (a different seed), which favours us. So Search is the like-for-like column:
+
+| task | ours | RFD4 high | RFD4 + Search |
+|---|---|---|---|
+| protein binders | 37.9% | 19.3% | 28.1% |
+| small molecules | 62.3% | 34.3% | 46.6% |
+| small molecules, `disco` | 74.7% (CI 70.8-78.6) | 64.7% | **76.4%** - level, inside our CI |
+| DNA | 6.7-8.3% | 3.5% | 4.8% |
+| AME | 21.6% | 14.7% | 18.7% |
+
+Not run here: the variants with a FIXED target (small molecules 15.9 / 22.9%, disco 45.3 / 52.7%, DNA 2.2 / 4.5%),
+AME with the ligand unfixed (15.2 / 19.6%), PPI all-atom (16.9%). Per GPU-hour RFD4-Proteina leads on small
+molecules (~5x) and is level on protein binders.
+- **TS9 = TS7 with its internal check on the `disco` criterion** (`criterion: "disco"`: backbone RMSD <= 2 A and every
+  ligand centroid within 2 A, the attempt judged the same way): each criterion is its own benchmark, and TS7 was
+  selecting for the stricter sm_binder one. Results: (running, 154)
 - **`disco` rescored, nothing refolded** (`disco-score.py`): from each row's own design and refold PDBs, the binder's
   backbone fitted, the largest ligand-chain centroid distance. The paper groups a ligand by connectivity including
   coordination bonds (FE2 + AKG is one molecule there, two chains here); the max over two centroids is never smaller
