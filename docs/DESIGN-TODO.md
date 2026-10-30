@@ -859,7 +859,9 @@ Small molecules, 2 attempts a target (theirs 200), the same attempts in every ar
 | T | recipe C, the file's 100-155 lengths, 3 restarts, check top 2 | 26.6% (22.1-31.2) | 32 |
 | TS1 | the paper's 150/200/250 lengths | 22.4% at 67 attempts (served seed), stopped | 15 |
 | **TS2** | **6 restarts, check top 3** | **36.4% (31.2-41.6)** | **43** |
-| TS3 | 10 restarts, check top 3 (101 of 154 attempts, then stopped) | 48.1% | 41 |
+| TS3 | 10 restarts, check top 3 (served seed; 101 of 154 re-evaluated) | 48.1% | 41 |
+| TS3f | 10 restarts, check top 3 - on the fixed server, every fold at its own seed | 48.1% (43.5-52.6) | 51 |
+| **TS4** | **TS3f with a 2-seed internal check: a candidate passes only if it passes at two seeds** | **51.9% (47.4-56.5)** | **53** |
 | *RFD4-Proteina high (paper)* | | *34.3%* | *77* |
 | *original Protein Hunter / BoltzGen / DISCO (paper)* | | *0.8% / 4.0% / 2.6%* | |
 
@@ -873,7 +875,11 @@ Small molecules, 2 attempts a target (theirs 200), the same attempts in every ar
   interface PAE sits on the 1.5 line and does.
 - **TS2 is level with RFD4-Proteina** (36.4 against 34.3%), and 10 restarts (TS3, partial) points higher.
 - An internal check that passes is 64% likely to pass the evaluation at another seed (TS2: 56 of 87); the losses
-  are interface PAE moving across 1.5.
+  are interface PAE moving across 1.5. **Checking at two seeds** (TS4, `check.seeds`) lifts that to 78% (70 of 90,
+  against TS3f's 67 of 103) and the paired pass count 74 -> 80 of 154, for 13% more GPU a attempt (18.1 s against
+  16.0) - flat per GPU-hour (104 against 108 pooled).
+- **Ten restarts on the fixed server, honest: 48-52% against RFD4-Proteina's 34.3%,** a pass on 51-53 of 77 targets
+  at two attempts a target. Per GPU-hour it is ~5x behind (104-108 against their 559, A100 against H200).
 - Bigger binders hurt (TS1: 15 passes against T's 19 on the same 67 attempts).
 - 🔴 Caveats, as for PPI: the internal check is the evaluator's model; 2 attempts a target cannot give a clustered rate
   (theirs 200); their AF3 read each ligand from the input file's chemistry and ours from SMILES or a CCD code; and

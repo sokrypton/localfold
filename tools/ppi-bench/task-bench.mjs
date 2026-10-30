@@ -140,9 +140,23 @@ async function attempt(name, index) {
     const r = await fold(t, binder, { steps: 200, recycles: 5, seed: foldSeed });
     return { ...r, ...verdict(t.task, designPdb, r) };
   };
+  // `check.seeds`: a candidate passes the internal check only if it passes at that many seeds (the first that
+  // fails ends it) - a small molecule's interface PAE sits on the 1.5 line, and one passing seed is 64% likely to
+  // mean a passing evaluation
+  const checkAt = async (entry, s0) => {
+    let result;
+    for (let k = 0; k < (cfg.check?.seeds ?? 1); k += 1) {
+      result = await assess(entry.sequence, entry.pdb, s0 + 104729 * k);
+      result.seedsPassed = k + (result.pass ? 1 : 0);
+      if (!result.pass) break;
+    }
+    return result;
+  };
   // the design-time stop: confident about the terms the task is judged on
   const looksDone = (e) => cfg.stop !== undefined && e.ipae <= cfg.stop.ipae && (t.task === "dna" || e.iptm >= cfg.stop.iptm);
-  const promisingOf = (e) => e.ipae <= cfg.check.ipae && (t.task === "dna" || e.iptm >= cfg.check.iptm);
+  // 🔴 THE FOOTPRINT SCREENS WHAT IS CHECKED, NOT WHAT THE LOOP DESIGNS FROM: as a per-cycle veto it failed most
+  // docked folds, and a docked cycle was followed by a docked one 2 times in 68 against 92 in 290 without it
+  const promisingOf = (e) => e.ipae <= cfg.check.ipae && (t.task === "dna" || e.iptm >= cfg.check.iptm) && footprintProblem(e.pdb) === null;
   const records = [], eligible = [], checked = [];
   let runs = 0, foldSeconds = 0;
   const started = Date.now();
@@ -150,23 +164,32 @@ async function attempt(name, index) {
     runs += 1;
     const controller = new AbortController();
     const mine = [];
+    let lastDocked = null;
     try {
       const stream = runDesign({
         chains: [""], chainIndex: 0, cycles: cfg.cycles, length, run: restart,
         seed: seed + 101 * restart, signal: controller.signal, kind: "protein", beam: cfg.beam ?? 1,
+        ...(cfg.temperature === undefined ? {} : { temperature: cfg.temperature }),
         // `omit`: letters MPNN may never write, per task (a DNA binder without D/E is basic) - the loop's own default is "C"
         ...(cfg.omit?.[t.task] === undefined ? {} : { omit: cfg.omit[t.task] }),
-        veto: ({ pdb }) => contactProblem(pdb, { chain: "A" }) ?? footprintProblem(pdb),
+        veto: ({ pdb }) => contactProblem(pdb, { chain: "A" }),
         fold: async (sequence, context) => {
           const t0 = Date.now();
           // `contactTries`: a fold that leaves the binder off the target is folded again with the next seed, up to
           // that many times - so MPNN designs from a docked backbone rather than from a binder floating free
-          let r;
+          let r, docked = false;
           for (let k = 0; k < (cfg.contactTries ?? 1); k += 1) {
             r = await fold(t, sequence, { steps: cfg.steps, recycles: cfg.recycles, seed: seed + 101 * restart + 13 * context.cycle + 7919 * k });
-            if ((contactProblem(r.pdb, { chain: "A" }) ?? footprintProblem(r.pdb)) === null) break;
+            if (contactProblem(r.pdb, { chain: "A" }) === null) { docked = true; break; }
           }
           foldSeconds += (Date.now() - t0) / 1000;
+          // `stick`: a cycle that will not dock hands the NEXT design the restart's last docked structure instead of
+          // its own - MPNN redesigning an undocked binder writes a soluble protein that never comes back. The cycle
+          // itself can never be chosen (its terms are infinite; its structure is not its sequence's)
+          if (docked) lastDocked = r;
+          else if (cfg.stick && lastDocked !== null) {
+            return { pdb: lastDocked.pdb, confidence: lastDocked.confidence, terms: { binderPtm: 0, ipae: Infinity, iptm: 0, stuck: true } };
+          }
           return { pdb: r.pdb, confidence: r.confidence, terms: { binderPtm: r.binderPtm, ipae: r.ipae, iptm: r.iptm } };
         },
         design: (pdb, context) => designChain(mpnn, { pdb, chain: context.chain, temperature: context.temperature,
@@ -190,7 +213,7 @@ async function attempt(name, index) {
     if (cfg.check !== undefined) {
       const promising = mine.filter(promisingOf).sort((a, b) => a.ipae - b.ipae).slice(0, cfg.check.top);
       for (const entry of promising) {
-        const result = await assess(entry.sequence, entry.pdb, seed * 7 + entry.cycle + 1000 * restart);
+        const result = await checkAt(entry, seed * 7 + entry.cycle + 1000 * restart);
         checked.push({ entry, result });
         if (result.pass) break;
       }
@@ -220,7 +243,7 @@ async function attempt(name, index) {
       }
     }
     for (const entry of pool.filter(promisingOf).sort((a, b) => a.ipae - b.ipae).slice(0, cfg.polish.top)) {
-      const result = await assess(entry.sequence, entry.pdb, seed * 7 + 777 + checked.length);
+      const result = await checkAt(entry, seed * 7 + 777 + checked.length);
       checked.push({ entry, result });
       eligible.push(entry);
       if (result.pass) break;
@@ -231,7 +254,7 @@ async function attempt(name, index) {
     : eligible.length > 0 ? eligible.reduce((a, b) => (b.ipae < a.ipae ? b : a)) : null;
   const row = { target: name, task: t.task, attempt: index, length, config: cfg.tag, runs, polished, records, foldSeconds,
     checks: checked.map((c) => ({ restart: c.entry.restart, cycle: c.entry.cycle, ipae: c.result.ipae, iptm: c.result.iptm,
-      rmsd: c.result.rmsd, ligandRmsd: c.result.ligandRmsd, pass: c.result.pass })) };
+      rmsd: c.result.rmsd, ligandRmsd: c.result.ligandRmsd, pass: c.result.pass, seedsPassed: c.result.seedsPassed })) };
   if (best !== null) {
     // 🔴 THE EVALUATION IS ALWAYS THE NATIVE AF3 at the benchmark's settings, with its own seed
     const final = await assess(best.sequence, best.pdb, evalSeed);
