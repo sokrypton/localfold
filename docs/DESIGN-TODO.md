@@ -928,3 +928,57 @@ counted, as their CPU MPNN is not.
   A100-to-H200 gap is perhaps 2x: RFD4-Proteina's attempt is 2.2 GPU-seconds, ours 11. (Re-evaluated passes.)
 - Against every other baseline in the paper, including the original Protein Hunter, it is ahead on both by one to
   two orders of magnitude.
+
+### Toward every reported number (2026-10-30, afternoon)
+
+The goal: at or above RFD4-Proteina high on every task the paper reports. The paper's `rfd4-paper-data.json` has
+FIVE criteria, not three - `ppi`, `sm_binder`, `disco` (a second small-molecule criterion), `dna`, and `ame` (enzyme
+active sites, MCSA) - all defined in their `configs/metrics/pass_criteria/all_pass_criteria.yaml`.
+
+| task | criterion | RFD4-Proteina high | ours, best | status |
+|---|---|---|---|---|
+| protein binders | ipTM >= 0.8, min iPAE <= 1.5, binder RMSD <= 2.5 | 19.3% | 24.1% (NC) | ahead |
+| small molecules | `sm_binder` (above) | 34.3% | 62.3% (TS7) | ahead |
+| small molecules | `disco`: backbone RMSD <= 2, ligand centroid <= 2 A | 64.7% | **74.7% (TS7, CI 70.8-78.6)** | ahead |
+| DNA | min iPAE <= 1.5, binder RMSD <= 8 after DNA alignment | 3.5% | 8.3% (TD15), 6.7% (TD9) | ahead, on 4-5 passes |
+| enzyme active sites | `ame` (below) | 14.7% | - | **not run until now** |
+
+- **`disco` rescored, nothing refolded** (`disco-score.py`): from each row's own design and refold PDBs, the binder's
+  backbone fitted, the largest ligand-chain centroid distance. The paper groups a ligand by connectivity including
+  coordination bonds (FE2 + AKG is one molecule there, two chains here); the max over two centroids is never smaller
+  than over their union's, so ours can only be stricter. TP2 (74 attempts) 67.0%, TS7 74.7%, TB1 (67) 80.6%.
+- **TB1** (TP2 + beam 3, the beam fixed in 8bca8fa0): level with TS7 on the same 61 attempts, 44 against 44 (10 won
+  by each alone), for ~3x the design folds. Stopped at 67 to free the GPU.
+- **TD15** (TD9 + polish), finished: 5/60, 8.3% (CI 1.7-15.0) against TD9's 4 on the same 60 (one more, from
+  polish). 7n5u still 0 - no arm has passed it.
+- **TD16** (TD9 + beam 3): 0 of 14 (TD9 1 of the same 14), still running.
+
+**Motif inpainting in the native sampler (`cuda/af3 --motif=<file>`, 7cc0de8a).** At every diffusion step the listed
+atoms' target coordinates are Kabsch-fitted onto the denoised estimate's own copies of those atoms and written over
+them; the noisy walk then steps toward the edited estimate. The target keeps its internal geometry; the fold
+chooses where it sits. Lines are `<token> <atom> x y z`; a negative token is a whole chain (asymId), for a ligand's
+one-atom tokens. `--motif-until=<A>` stops guiding below a noise level. Checked on M0050 (6 motif residues + U5P):
+motif RMSD 0.0007 A guided, 6.26 A unguided, same seed. Only DESIGN folds are guided; the internal check and the
+evaluation fold free, as the paper's oracle does.
+
+**AME (enzyme active sites), first arm TA1.** The 37 `mcsa_37_fixed_ligand` targets (the paper's `mcsa_fixed`):
+1-7 catalytic residues each, given as their COORDINATE-CONDITIONED atoms only (the non-NaN rows of
+`_condition_coordinate_1_atom` - side-chain tips; the backbone atoms their README says were recovered from the PDB
+entry are not conditioned, and we do not use them), 1-3 ligands by CCD code with their conditioned atoms, a
+180-residue scaffold, the motif UNINDEXED (the designer places it). Pass (`ame`): min interface PAE < 1.5, backbone
+RMSD <= 2 A design to refold, the refold's motif atoms within 1.5 A of the input's (one superposition over all of
+them - every conditioned atom is coordinate group 0), and no polymer-ligand pair under 1.5 A in the design.
+- Recipe: TP2's loop (6 cycles, 10 restarts, top-3 check, polish), the motif residues at random positions >= 4
+  apart and >= 8 from either end (a new placement each restart), held through every LigandMPNN draw; every design
+  fold inpainted with the motif tips AND the ligands' conditioned atoms as one rigid body.
+- 🔴 Not carried: M0110's inter-ligand bonds (FAD-PER-DAL fold as three molecules).
+- Results: (running, 37 targets x 1 attempt)
+
+**DNA held in a fixed frame, TD17.** The DNA benchmark gives the duplex as SEQUENCE only (`*_sequence_context`,
+coordinates zero; `*_structure_context` is the fixed variant only BoltzGen and RFD3 ran, at 0.8%), so every design
+fold made its own duplex and MPNN designed against a different one each cycle. TD17 = TD9 + `dnaFrame`: the duplex
+folded once per target from its sequence alone (beside a 5-residue stub; no information the unfixed input lacks),
+then inpainted into every design fold token by token. Checks and evaluation fold free. Same 60 attempts as TD9.
+- Results: (running)
+- Next if it helps: `--motif-until` (release the frame for the last steps, so the design agrees better with a free
+  refold), a partial pull, and holding only the part of the target the binder does not touch.
