@@ -260,6 +260,22 @@ async function dnaFrame(name, t) {
   return (dnaFrames[name] = atomsOf);
 }
 
+/** AME: each ligand chain's atom names as AF3 builds it (a stub fold, once a target) - the input conditions atoms
+ * AF3's CCD component may not have (FBP's O1, a leaving atom), and those cannot be guided. Only the PROTEIN motif atoms
+ * are scored, so a ligand atom left out weakens the guide and changes nothing judged; the count is on the row. */
+const ligandNames = {};
+async function ligandAtomNames(name, t) {
+  if (ligandNames[name] !== undefined) return ligandNames[name];
+  const r = await fold(t, "GGGGG", { steps: 10, recycles: 0, seed: 11 });
+  const names = t.chains.map(() => new Set());
+  for (const line of r.pdb.split("\n")) {
+    if (!line.startsWith("ATOM") && !line.startsWith("HETATM")) continue;
+    const k = "BCDEFGHIJ".indexOf(line[21]);
+    if (k >= 0) names[k].add(line.slice(12, 16).trim());
+  }
+  return (ligandNames[name] = names);
+}
+
 async function attempt(name, index) {
   const t = tasks[name];
   const cfg = config;
@@ -298,6 +314,7 @@ async function attempt(name, index) {
   const promisingOf = (e) => !e.guided && e.ipae <= cfg.check.ipae && (confidenceOnly || e.iptm >= cfg.check.iptm) && footprintProblem(e.pdb) === null
     && motifOk(e, cfg.check.motif);
   const records = [], eligible = [], checked = [];
+  let unguided = 0;     // (AME: conditioned ligand atoms AF3 does not build, left out of the guide)
   let runs = 0, foldSeconds = 0;
   const started = Date.now();
   for (let restart = 0; restart < (cfg.restarts ?? 1); restart += 1) {
@@ -335,9 +352,11 @@ async function attempt(name, index) {
       t.motif.forEach((m, k) => { letters[positions[k]] = one[m.res]; });
       start = letters.join("");
       motif = path.join(work, `motif-${process.pid}-${name}-${index}-${restart}.txt`);
+      const built = await ligandAtomNames(name, t);
+      unguided = t.chains.reduce((n, c, i) => n + (c.conditioned ?? []).filter(([a]) => !built[i].has(a)).length, 0);
       fs.writeFileSync(motif, [
         ...t.motif.flatMap((m, k) => m.atoms.map(([a, x, y, z]) => `${positions[k]} ${a} ${x} ${y} ${z}`)),
-        ...t.chains.flatMap((c, i) => (c.conditioned ?? []).map(([a, x, y, z]) => `${-(i + 2)} ${a} ${x} ${y} ${z}`)),
+        ...t.chains.flatMap((c, i) => (c.conditioned ?? []).filter(([a]) => built[i].has(a)).map(([a, x, y, z]) => `${-(i + 2)} ${a} ${x} ${y} ${z}`)),
       ].join("\n") + "\n");
     } else if (t.task === "dna" && cfg.dnaFrame) {
       // 🔴 THE DUPLEX HELD IN ITS OWN FOLDED SHAPE: every design fold inpaints it (cuda/af3 --motif), each nucleotide a
@@ -519,7 +538,7 @@ async function attempt(name, index) {
     : e.guided ? Infinity : (e.motifRmsd ?? 99) / 1.5 + (e.clashes > 0 ? 5 : 0) + Math.max(0, e.ipae - 1.5);
   const best = chosen !== null ? chosen.entry
     : eligible.length > 0 ? eligible.reduce((a, b) => (fallbackKey(b) < fallbackKey(a) ? b : a)) : null;
-  const row = { target: name, task: t.task, attempt: index, length, config: cfg.tag, runs, polished, climbed, records, foldSeconds,
+  const row = { target: name, task: t.task, attempt: index, length, config: cfg.tag, runs, polished, climbed, unguided, records, foldSeconds,
     checks: checked.map((c) => ({ restart: c.entry.restart, cycle: c.entry.cycle, ipae: c.result.ipae, iptm: c.result.iptm,
       rmsd: c.result.rmsd, ligandRmsd: c.result.ligandRmsd, motifRmsd: c.result.motifRmsd, clashes: c.result.clashes,
       pass: c.result.pass, seedsPassed: c.result.seedsPassed })) };
