@@ -63,12 +63,15 @@ inline void shardedParcaeEf2(int T, int C, int loops, uint64_t seed) {
   B16* zl = (B16*)mg::sharedBuffers().at("sh.z").local;
   if (held) truncNormalK<B16><<<blocks(held * C), 256, 0, STREAM>>>(zl, held * C, sqrtf(2.f / (5.f * C)), seed ^ 0x5eedull, off);
   const int bi = lmPairBlock(T, C);
-  float* lm = scratch<float>("zi.lmRows", (size_t)bi * T * C);
   const size_t chunk = std::min<size_t>(std::max<size_t>(held, 1), ((size_t)64 << 20) / (4 * (size_t)C));
   float* xn = scratch<float>("trunk.xn", chunk * C); float* y = scratch<float>("trunk.y", chunk * C);
   for (int loop = 0; loop < loops; ++loop) {
     mg::Shared& iS = mg::shared("sh.inj", shareBytes);
     B16* il = (B16*)iS.local;
+    // 🔴 ASKED FOR EVERY PASS, NEVER HELD ACROSS THE BLOCKS: zi. is a shared scratch family, so its slot is the other
+    // modules' too, and one of them growing it frees these bytes - a pointer kept from the pass before writes into
+    // whatever the pool gave them next (a cached bf16 weight: 1BRS on 2 ranks folded to NaN)
+    float* lm = scratch<float>("zi.lmRows", (size_t)bi * T * C);
     for (int i0 = lo; i0 < lo + rows; i0 += bi) {      // the injection's rows: the language model's pair, dropped out
       const int b = std::min(bi, lo + rows - i0); const size_t cells = (size_t)b * T, at = (size_t)(i0 - lo) * T * C;
       lmPairRows(zs.s, T, C, i0, b, lm);
@@ -128,7 +131,6 @@ inline float* shardedTrunkEf2(int T, int C, int loops, uint64_t seed = 0) {
   float* xn = scratch<float>("trunk.xn", chunk * C); float* zc = scratch<float>("trunk.zc", chunk * C);
   const ZInitStream& zs = ZINIT_STREAM;
   const int bi = lmPairBlock(T, zs.P);
-  float* lm = scratch<float>("zi.lmRows", (size_t)bi * T * zs.P);
   const int blocksN = (int)M.meta("meta/blocks");
   if (parcaeRecycle()) {                       // (the released models' own loop: sh.z may be made anew in it)
     shardedParcaeEf2(T, C, loops, seed);
@@ -146,7 +148,9 @@ inline float* shardedTrunkEf2(int T, int C, int loops, uint64_t seed = 0) {
       gemm(xn, F("recycle/projection"), zc, r, C, C);
       ef2ToBf16K<<<blocks(r * C), 256, 0, STREAM>>>(zc, zl + r0 * C, r * C);
     }
-    // z_init on this rank's token rows (zInitAddStreamed's, the language model's pair made a block of rows at a time)
+    // z_init on this rank's token rows (zInitAddStreamed's, the language model's pair made a block of rows at a time;
+    // its rows asked for every pass, as the parcae loop's above: zi. shares a slot with the blocks' scratch)
+    float* lm = scratch<float>("zi.lmRows", (size_t)bi * T * zs.P);
     for (int i0 = lo; i0 < lo + rows; i0 += bi) {
       int b = std::min(bi, lo + rows - i0); size_t cells = (size_t)b * T;
       lmPairRows(zs.s, T, zs.P, i0, b, lm);

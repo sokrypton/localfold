@@ -66,6 +66,11 @@ def fold_cases():
         ("rna-hairpin", ["--sequence=GGCGCUUCGGCGCC", "--kinds=rna"], None, "A,C,G,U"),
         # AlphaFold 3's own covalent-inhibitor job: sotorasib bonded to Cys12 (a declared bond)
         ("kras-sotorasib", [f"--job={os.path.join(FIX, 'af3-jobs', 'kras_g12c_sotorasib.json')}"], None, "MOV"),
+        # the pair sharded over two ranks, held to the one-rank fold's own baseline: the sharded trunk kept its
+        # z_init scratch across the blocks, whose shared slot they grew, and folded this to NaN for a week unseen.
+        # On a one-GPU box both ranks share it (LOCALFOLD_GPU_MAP=0,0)
+        ("1brs-complex-2ranks", [f"--sequence={chain_sequence(c1brs, 'A')}:{chain_sequence(c1brs, 'D')}", "--gpus=2"],
+         [c1brs, "A,D"], None, "1brs-complex"),
     ]
 
 
@@ -74,7 +79,10 @@ def run_fold(name, inputs, ref, codes=None):
     pdb = os.path.join(TMP, name + ".pdb")
     if os.path.exists(pdb):
         os.remove(pdb)
-    p = subprocess.run([os.path.join(HERE, "fold"), pdb, *inputs], capture_output=True, text=True)
+    env = dict(os.environ)
+    if "--gpus=2" in inputs and subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True).stdout.count("GPU ") < 2:
+        env["LOCALFOLD_GPU_MAP"] = "0,0"
+    p = subprocess.run([os.path.join(HERE, "fold"), pdb, *inputs], capture_output=True, text=True, env=env)
     text = p.stdout + p.stderr
     m = re.search(r"mean pLDDT ([\d.]+)\s+pTM ([\d.nan]+)", text)
     if p.returncode or not m or not os.path.exists(pdb):
@@ -134,9 +142,10 @@ def main():
         for case in fold_cases():
             name, inputs, ref = case[:3]
             codes = case[3] if len(case) > 3 else None
+            heldTo = case[4] if len(case) > 4 else None         # another case's baseline, never one of its own
             if only and "folds" not in only and name not in only:
                 continue
-            got, want = run_fold(name, inputs, ref, codes), base.get(name)
+            got, want = run_fold(name, inputs, ref, codes), base.get(heldTo or name)
             verdict = "recorded" if write else "NEW (no baseline)"
             if "error" in got:
                 verdict, failed = "FAILED: " + got["error"], failed + 1
@@ -149,7 +158,7 @@ def main():
                 if "covalent" in want: ok = ok and got.get("covalent", 99) < 2.2     # bonded, not merely near
                 verdict = ("ok" if ok else "MOVED") + f" (baseline {json.dumps(want)})"
                 failed += not ok
-            if write and "error" not in got:
+            if write and not heldTo and "error" not in got:
                 base[name] = {k: got[k] for k in ("rmsd", "plddt", "ptm", "ligand", "nucleic", "covalent") if k in got}
             extra = "".join(f"{k} {got[k]:.3f}  " for k in ("ligand", "nucleic", "covalent") if k in got)
             rmsd = f"RMSD {got['rmsd']:.3f} A  " if got.get("rmsd") is not None else "RMSD   -      "
