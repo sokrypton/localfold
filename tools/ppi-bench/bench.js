@@ -75,7 +75,7 @@ window.__bench = async (cfg) => {
   // 🔴 cfg.bundle (a diagnostic, this page only): AF3's registry entry pointed at another bundle directory - its own
   // manifest.json - before anything loads, so the design loop, the check and the evaluation all fold with it (the
   // page's int5 against the float32 export, docs/DESIGN-TODO.md "the page against native")
-  if (cfg.bundle !== undefined) {
+  if (cfg.bundle !== undefined && (await import("/shared/bundles/manifests/index.js")).MODEL_BUNDLES.af3.directory !== cfg.bundle) {
     const { MODEL_BUNDLES } = await import("/shared/bundles/manifests/index.js");
     const { af3LoadMilliseconds } = await import("/web/af3-model.js");
     if (Object.keys(af3LoadMilliseconds).length > 0) throw new Error("cfg.bundle: AF3's weights were loading before the override");
