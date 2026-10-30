@@ -382,6 +382,16 @@ async function attempt(name, index) {
             }
           }
           own = t.task === "ame" ? { ...own, positions: [...positions] } : own;
+          // `probe` (AME): every guided design fold's sequence folded again FREE at the design settings, the motif
+          // matched unindexed in it - the probe's interface, motif, positions and structure are what is judged and
+          // checked; MPNN still designs from the guided backbone
+          if (t.task === "ame" && cfg.probe && guidedAt(context.cycle)) {
+            const q = await fold(t, sequence, { steps: cfg.steps, recycles: cfg.recycles, seed: seed + 101 * restart + 13 * context.cycle + 4999 });
+            const m = motifMatch(t, q.pdb);
+            const at = m !== null ? m.positions : [...positions];
+            own = { ...motifTerms(t, at, q.pdb, q.pdb), positions: at, probePdb: q.pdb, probed: true };
+            return { pdb: r.pdb, confidence: r.confidence, terms: { binderPtm: q.binderPtm, ipae: q.ipae, iptm: q.iptm, ...own } };
+          }
           return { pdb: r.pdb, confidence: r.confidence, terms: { binderPtm: r.binderPtm, ipae: r.ipae, iptm: r.iptm, ...own } };
         },
         design: (pdb, context) => designChain(mpnn, { pdb, chain: context.chain, temperature: context.temperature,
@@ -392,7 +402,7 @@ async function attempt(name, index) {
       for await (const record of stream) {
         const terms = record.folded.terms;
         records.push({ restart, cycle: record.cycle, score: record.score, vetoed: record.vetoed ?? null,
-          alanine: record.alanine, ...terms });
+          alanine: record.alanine, ...terms, probePdb: undefined });
         // `giveUpStuck`: a restart whose last N design cycles all failed to dock is abandoned for a fresh one -
         // on DNA most restarts undock after cycle 0 and never come back, and each stuck cycle still costs its
         // `contactTries` folds
@@ -401,9 +411,9 @@ async function attempt(name, index) {
         // a restart that has not found the interface by `giveUp.cycle` is abandoned for a fresh one
         if (cfg.giveUp !== undefined && record.cycle >= cfg.giveUp.cycle && terms.ipae > cfg.giveUp.ipae) controller.abort();
         if (record.cycle > 0 && record.alanine <= 0.2 && (record.vetoed ?? null) === null) {
-          const entry = { ...terms, restart, cycle: record.cycle, sequence: record.sequence, pdb: record.pdb, score: record.score,
+          const entry = { ...terms, restart, cycle: record.cycle, sequence: record.sequence, pdb: terms.probePdb ?? record.pdb, score: record.score,
             positions: terms.positions ?? positions,
-            guided: motif !== undefined && guidedAt(record.cycle) && cfg.guideCycles !== undefined };
+            guided: !terms.probed && motif !== undefined && guidedAt(record.cycle) && cfg.guideCycles !== undefined };
           eligible.push(entry); mine.push(entry);
           if (looksDone(entry)) controller.abort();
         }
@@ -421,6 +431,43 @@ async function attempt(name, index) {
       if (checked.some((c) => c.result.pass)) break;
     } else if (eligible.some(looksDone)) {
       break;
+    }
+  }
+  // `climb` (AME): when no restart produced a passing check, hill-climb on the graded quantity itself - from the
+  // `from` free (probe) structures nearest the motif, `gens` generations of `draws` MPNN sequences (the matched
+  // residues held), each folded FREE and the motif matched again; a generation's best (motif RMSD, then interface
+  // PAE) replaces the current one when it is closer. Every structure reached is a candidate for the check.
+  let climbed = 0;
+  if (t.task === "ame" && cfg.climb !== undefined && !checked.some((c) => c.result.pass)) {
+    const score = (e) => e.motifRmsd + (e.clashes > 0 ? 5 : 0) + Math.max(0, e.ipae - 1.5);
+    const starts = eligible.filter((e) => !e.guided && e.motifRmsd !== undefined).sort((a, b) => score(a) - score(b)).slice(0, cfg.climb.from);
+    for (const [n, start] of starts.entries()) {
+      let current = start;
+      for (let g = 0; g < cfg.climb.gens; g += 1) {
+        let bestDraw = null;
+        for (let k = 0; k < cfg.climb.draws; k += 1) {
+          const random = mulberry(seedOf(`climb:${name}:${index}:${n}:${g}:${k}`));
+          const designed = designChain(mpnn, { pdb: current.pdb, chain: "A", temperature: cfg.climb.temperature ?? 0.1,
+            omit: cfg.omit?.[t.task] ?? "C", random, kind: "protein", hold: current.positions });
+          const r = await fold(t, designed.sequence, { steps: cfg.steps, recycles: cfg.recycles, seed: seed + 70000 + 1000 * n + 37 * g + k });
+          climbed += 1;
+          const m = motifMatch(t, r.pdb);
+          const at = m !== null && m.rmsd < motifTerms(t, current.positions, r.pdb, r.pdb).motifRmsd ? m.positions : current.positions;
+          const e = { ipae: r.ipae, iptm: r.iptm, binderPtm: r.binderPtm, restart: -2, cycle: 10 * n + g, sequence: designed.sequence,
+            pdb: r.pdb, positions: [...at], ...motifTerms(t, at, r.pdb, r.pdb) };
+          records.push({ restart: -2, cycle: e.cycle, climb: k, ipae: e.ipae, motifRmsd: e.motifRmsd, clashes: e.clashes });
+          const alanine = [...designed.sequence].filter((x) => x === "A").length / designed.sequence.length;
+          if (alanine > 0.2 || contactProblem(r.pdb, { chain: "A" }) !== null) continue;
+          eligible.push(e);
+          if (bestDraw === null || score(e) < score(bestDraw)) bestDraw = e;
+        }
+        if (bestDraw !== null && score(bestDraw) < score(current)) current = bestDraw;
+      }
+    }
+    for (const entry of eligible.filter((e) => e.restart === -2 && promisingOf(e)).sort((a, b) => score(a) - score(b)).slice(0, cfg.climb.top ?? 3)) {
+      const result = await checkAt(entry, seed * 7 + 555 + checked.length);
+      checked.push({ entry, result });
+      if (result.pass) break;
     }
   }
   // `polish`: when no restart produced a passing check, redesign around the NEAREST misses instead of from scratch -
@@ -454,9 +501,12 @@ async function attempt(name, index) {
     }
   }
   const chosen = checked.find((c) => c.result.pass) ?? null;
+  // (no passing check: the lowest interface PAE - for AME the nearest to passing, a guided design never)
+  const fallbackKey = (e) => t.task !== "ame" ? e.ipae
+    : e.guided ? Infinity : (e.motifRmsd ?? 99) / 1.5 + (e.clashes > 0 ? 5 : 0) + Math.max(0, e.ipae - 1.5);
   const best = chosen !== null ? chosen.entry
-    : eligible.length > 0 ? eligible.reduce((a, b) => (b.ipae < a.ipae ? b : a)) : null;
-  const row = { target: name, task: t.task, attempt: index, length, config: cfg.tag, runs, polished, records, foldSeconds,
+    : eligible.length > 0 ? eligible.reduce((a, b) => (fallbackKey(b) < fallbackKey(a) ? b : a)) : null;
+  const row = { target: name, task: t.task, attempt: index, length, config: cfg.tag, runs, polished, climbed, records, foldSeconds,
     checks: checked.map((c) => ({ restart: c.entry.restart, cycle: c.entry.cycle, ipae: c.result.ipae, iptm: c.result.iptm,
       rmsd: c.result.rmsd, ligandRmsd: c.result.ligandRmsd, motifRmsd: c.result.motifRmsd, clashes: c.result.clashes,
       pass: c.result.pass, seedsPassed: c.result.seedsPassed })) };

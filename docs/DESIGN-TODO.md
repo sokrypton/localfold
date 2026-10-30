@@ -985,7 +985,19 @@ them - every conditioned atom is coordinate group 0), and no polymer-ligand pair
 - **TA4 = TA3 + `motifMatch`**: on each free fold, the motif re-found UNINDEXED among the fold's residues of the right
   types near a ligand (depth-first over assignments, pruned by pairwise tip-centroid distances within 3 A, the full
   RMSD at each leaf), and the held positions moved there. Smoke test M0040: free-cycle motif 2.1-2.3 A where the
-  held positions read 11-15. Results: (running, 37 x 1)
+  held positions read 11-15. **0 of 6, stopped** (free-cycle motif best 1.48 A on M0040, 9.8 on M0050).
+- **Where RFD4-Proteina's 14.7% comes from:** metal and small sites - M0129 (Fe/aKG, 4 residues) 63%, M0097 (Zn) 47%,
+  M0630 (1 residue) 46%, M0738 43%, M0710 37% - against 0-2% on most 5-7-residue motifs. So the strong targets
+  are tested first.
+- **TA5 (`probe`): every cycle guided, AND the same sequence folded again FREE at the design settings, the motif
+  matched unindexed in it; the probe's interface, motif, positions and structure are what is judged, checked and
+  submitted; MPNN designs from the guided backbone.** On RFD4's eight best targets: **M0630 and M0097 PASS** (the
+  first AME passes), M0129 not (one probe in 70 under 1.5 A; the evaluation 17 A).
+- **TA6 = TA5 + `climb`** (instead of polish): from the 3 free structures nearest the motif, 6 generations of 6
+  MPNN draws with the matched residues held, each folded free and matched again, the best kept when closer
+  (motif RMSD, then interface PAE); every structure reached is a check candidate. Smoke test M0097: 3.5 -> 1.28 A in
+  two generations. With no passing check the submitted design is now the nearest to passing, never a guided one.
+  Results: (running, 37 x 1)
 
 **DNA held in a fixed frame, TD17.** The DNA benchmark gives the duplex as SEQUENCE only (`*_sequence_context`,
 coordinates zero; `*_structure_context` is the fixed variant only BoltzGen and RFD3 ran, at 0.8%), so every design
