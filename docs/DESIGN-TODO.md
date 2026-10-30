@@ -833,3 +833,47 @@ through `pair`, attempts 30 and 31 on all 24 targets, page-AF3-evaluated, no err
 - It is ~10% faster per attempt, which is not enough to matter.
 - So the winning recipe's lift over the original Protein Hunter is the template, AF3 as engine, restarts and the
   internal check - not the warm start. It stays in C as recorded; dropping it would not cost anything measurable.
+
+### RFD4-Proteina's small-molecule- and DNA-binder benchmarks (2026-10-30)
+
+The paper's other two binder tasks, on the native CUDA AF3 port: `tools/ppi-bench/prep-tasks.py` turns their repo's
+targets into AF3 jobs (`tasks.json`), `task-bench.mjs` is native-bench.mjs's loop over them, `task-score.py` scores
+against the paper's per-target rates (`rfd4-paper-data.json`).
+
+- **Small molecules**: the 77 DISCO Figure 2c targets (`disco_figure_2c.yaml`). Each ligand chain is written as SMILES
+  from the file's own atoms, bonds and formal charges (RDKit); a metal complex as its CCD code (HEM, B12, SF4, FES,
+  FE2+AKG, the ions), since RDKit writes coordination as dative bonds. Unfixed ligand, as theirs. Pass (S8.2):
+  protein-ligand ipTM >= 0.80, min interface PAE <= 1.5, protein backbone RMSD <= 1.5 A, ligand RMSD <= 5 A after
+  protein-backbone alignment, design against refold. MPNN is LigandMPNN (it sees the ligand's atoms).
+- **DNA**: the three RFD3 targets, sequence context (the paper's "unfixed": the duplex is given as sequence and
+  co-folded), binder 120-150. Pass: min interface PAE <= 1.5 and binder backbone RMSD <= 8 A after aligning all DNA
+  atoms. MPNN is NA-MPNN.
+- The interface terms are the paper's oracle's (`oracle_metric.py`): chain_pair_* averaged both ways, min for PAE and
+  mean for ipTM over the binder's partners. The evaluation is the native AF3, 200 steps, 5 recycles, one sample, its
+  own seed; the design loop is recipe C's (AF3, 6 cycles, 100 steps, 3 recycles, internal AF3 check), no template.
+
+Small molecules, 2 attempts a target (theirs 200), the same attempts in every arm:
+
+| run | change | pass rate (95% CI) | targets with a pass |
+|---|---|---|---|
+| T | recipe C, the file's 100-155 lengths, 3 restarts, check top 2 | 33.1% (28.6-37.7) | 40 |
+| TS1 | the paper's 150/200/250 lengths | 22.4% at 67 attempts, stopped | 15 |
+| **TS2** | **6 restarts, check top 3** | **56.5% (51.3-61.7)** | **60** |
+| *RFD4-Proteina high (paper)* | | *34.3%* | *77* |
+| *original Protein Hunter / BoltzGen / DISCO (paper)* | | *0.8% / 4.0% / 2.6%* | |
+
+- **TS2 beats RFD4-Proteina by 22 points.** Paired, TS2 passes every attempt T passes and 36 more (51 -> 87): its
+  first three restarts are T's. It costs 75 s an attempt against 44 (median).
+- Interface PAE is what fails: 27 of TS2's 67 failures miss on it alone, and it is in 59 of the 67.
+- Bigger binders hurt (TS1: 15 passes against T's 19 on the same 67 attempts).
+- 🔴 Caveats, as for PPI: the internal check is the evaluator's model; 2 attempts a target cannot give a clustered rate
+  (theirs 200); their AF3 read each ligand from the input file's chemistry and ours from SMILES or a CCD code; and
+  their 100% target coverage at 200 attempts is not comparable with 60 of 77 at 2.
+
+DNA: **no pass yet** in any arm (theirs 3.5%, original Protein Hunter 0.3%).
+- T (30 attempts): 21 never produced a candidate - the binder drifted 20-40 A off the 10-bp duplex every cycle.
+- TD1 (beam 3, 6 restarts, give up an undocked restart at cycle 2) and TD2 (a fold that leaves the binder undocked is
+  refolded with up to 5 seeds, `contactTries`): 0%, and the designs were ACIDIC - D/E ~25% against K/R 16-21% -
+  because MPNN was designing a soluble protein that never touched the DNA.
+- TD3 (no C/D/E, `omit`, plus `contactTries` 5): still 0/30, but the designs dock: final interface PAE mostly 1.5-2.5
+  (one 1.53 at 7.6 A), and a few within the 8 A RMSD. TD4 adds TS2's 6 restarts and top-3 check.
