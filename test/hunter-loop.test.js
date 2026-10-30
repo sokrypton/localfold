@@ -48,6 +48,15 @@ const twoChains = (extra = {}) => ({
 });
 
 describe("runDesign", () => {
+  it("keeps the beam's best-scoring draw, not its first", async () => {
+    // cycle 0, then cycle 1's three draws scoring 0.2, 0.9, 0.4
+    const stub = stubs({ scores: [0.5, 0.2, 0.9, 0.4], sequences: ["AAAAA", "CCCCC", "DDDDD"] });
+    const records = await collect({ ...twoChains(), cycles: 1, beam: 3, ...stub });
+    expect(stub.folds).toHaveLength(4);
+    expect(records[1].sequence).toBe("CCCCC");
+    expect(records[1].pdb).toBe("PDB-2");
+  });
+
   it("folds once more than it designs: cycle 0 has no design step", async () => {
     const stub = stubs();
     const records = await collect({ ...twoChains(), cycles: 3, ...stub });

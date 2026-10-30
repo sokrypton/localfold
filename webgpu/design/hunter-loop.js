@@ -300,7 +300,9 @@ export async function* runDesign(options) {
         const attempt = await fold(withChain(chains, chainIndex, candidate.sequence),
           { cycle, run, draw, draws: drawn.length, signal, previous: previous?.pdb });
         throwIfAborted(signal);
-        const score = objectiveOf(attempt.confidence ?? {}, chainIndex);
+        // 🔴 THE VALUE, NOT THE RECORD: objectiveOf returns {value, objective}, and one object `>` another is
+        // false - so the beam folded every draw and kept the first, a beam of one at the price of N (2026-10-30)
+        const score = objectiveOf(attempt.confidence ?? {}, chainIndex).value;
         if (picked === null || score > picked.score) {
           picked = { score, candidate, attempt };
         }
