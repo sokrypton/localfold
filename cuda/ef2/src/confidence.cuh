@@ -304,7 +304,9 @@ __global__ void tmRowsK(const float* tm, const int* asym, double* rows, int T) {
   if (threadIdx.x == 0) { rows[2 * i] = s[0][0] / (T + 1e-8); rows[2 * i + 1] = s[1][0] / (c[0] + 1e-8); }
 }
 
-struct Confidence { std::vector<float> plddtAtom, plddtToken, pae; double ptm, iptm, meanPlddt; };
+// `tm`: the per-pair TM term [T][T] the pTM is a max-of-means over - the chain-level fields are read off it, and a path
+// that does not download it (the sharded head) writes none of them. `atomToken`/`atomMask`: for each chain's mean pLDDT
+struct Confidence { std::vector<float> plddtAtom, plddtToken, pae, tm, atomMask; std::vector<int> atomToken; double ptm, iptm, meanPlddt; };
 
 // consume: the trunk's z is read by nothing after this call - on a card short of room the head then works in it
 inline Confidence confidenceHead(int T, int A, const float* zTrunk, const float* sInputs, int Si, const float* xDevice,
@@ -515,6 +517,8 @@ inline Confidence confidenceHead(int T, int A, const float* zTrunk, const float*
   paeK<<<blocks(P), 256, 0, STREAM>>>(paeL, paeD, tmD, P, pb, width, d0);
   tmRowsK<<<T, 256, 0, STREAM>>>(tmD, Idev("asym_id"), rowsD, T);
   out.pae = download(paeD, P);
+  out.tm = download(tmD, P);
+  out.atomToken = a2t; out.atomMask = mask_;
   std::vector<double> rows(2 * T);
   CK(cudaMemcpy(rows.data(), rowsD, rows.size() * 8, cudaMemcpyDeviceToHost));
   double ptm = -1e30, iptm = -1e30;
@@ -559,8 +563,86 @@ inline void writeConfidences(const std::string& pdb, int T, const Confidence& co
   for (int i = 0; i < T; ++i) fprintf(f, "%s%d", i ? ", " : "", res[i] + 1);
   fprintf(f, "]}\n");
   fclose(f);
+  // 🔴 THE CHAIN-LEVEL FIELDS, AS cuda/af3's writeConfidences DEFINES THEM (sampler.cuh) - every chain's pTM and ipTM and
+  // every pair's ipTM a max over anchors of the mean TM term over the tokens it selects, the pair's PAE minimum over
+  // ordered pairs, the chain's mean atom pLDDT. They were computed (the TM matrix is the pTM's) and reduced to two
+  // global numbers, so a binder's own pTM and its interface ipTM were not in the file (2026-10-30)
+  std::vector<int> ids;
+  for (int i = 0; i < T; ++i) if (std::find(ids.begin(), ids.end(), asym[i]) == ids.end()) ids.push_back(asym[i]);
+  std::sort(ids.begin(), ids.end());
+  const int nc = (int)ids.size();
+  std::vector<int> chainOf(T);
+  for (int i = 0; i < T; ++i) chainOf[i] = (int)(std::find(ids.begin(), ids.end(), asym[i]) - ids.begin());
+  std::vector<int> chainCount(nc, 0);
+  for (int i = 0; i < T; ++i) chainCount[chainOf[i]]++;
+  const bool haveTm = conf.tm.size() == (size_t)T * T;
+  std::vector<double> rowSum(haveTm ? (size_t)T * nc : 0, 0.0);
+  if (haveTm)
+    for (int i = 0; i < T; ++i) for (int j = 0; j < T; ++j) rowSum[(size_t)i * nc + chainOf[j]] += conf.tm[(size_t)i * T + j];
+  auto best = [&](int from, bool others, int to, bool notTo) {
+    double top = -1e30; bool any = false;
+    for (int i = 0; i < T; ++i) {
+      if (others ? chainOf[i] == from : chainOf[i] != from) continue;
+      const double* r = rowSum.data() + (size_t)i * nc;
+      double total = 0; int count = 0;
+      if (notTo) { for (int b = 0; b < nc; ++b) if (b != to) { total += r[b]; count += chainCount[b]; } }
+      else { total = r[to]; count = chainCount[to]; }
+      if (count) { any = true; top = std::max(top, total / count); }
+    }
+    return any ? top : NAN;
+  };
+  auto maxNan = [](double x, double y) { return std::isnan(x) ? y : std::isnan(y) ? x : std::max(x, y); };
+  auto num = [](FILE* g, double v) { if (std::isfinite(v)) fprintf(g, "%.4f", v); else fprintf(g, "null"); };
+  auto list = [&](FILE* g, const char* key, const std::vector<double>& v) {
+    fprintf(g, "\"%s\": [", key);
+    for (int a = 0; a < (int)v.size(); ++a) { if (a) fprintf(g, ", "); num(g, v[a]); }
+    fprintf(g, "], ");
+  };
   f = fopen((stem + "_summary_confidences.json").c_str(), "w");
-  if (chains) fprintf(f, "{\"ptm\": %.4f, \"iptm\": %.4f, \"mean_plddt\": %.2f}\n", conf.ptm, conf.iptm, 100 * conf.meanPlddt);
-  else fprintf(f, "{\"ptm\": %.4f, \"iptm\": null, \"mean_plddt\": %.2f}\n", conf.ptm, 100 * conf.meanPlddt);
+  fprintf(f, "{");
+  if (haveTm) {
+    std::vector<double> chainPtm(nc), chainIptm(nc);
+    for (int a = 0; a < nc; ++a) {
+      chainPtm[a] = best(a, false, a, false);
+      chainIptm[a] = maxNan(best(a, false, a, true), best(a, true, a, false));
+    }
+    list(f, "chain_ptm", chainPtm);
+    if (nc > 1) list(f, "chain_iptm", chainIptm);
+    fprintf(f, "\"chain_pair_iptm\": [");
+    for (int a = 0; a < nc; ++a) {
+      fprintf(f, "%s[", a ? ", " : "");
+      for (int b = 0; b < nc; ++b) {
+        if (b) fprintf(f, ", ");
+        num(f, a == b ? chainPtm[a] : maxNan(best(a, false, b, false), best(b, false, a, false)));
+      }
+      fprintf(f, "]");
+    }
+    fprintf(f, "], ");
+  }
+  {
+    std::vector<double> mn((size_t)nc * nc, INFINITY);
+    for (int i = 0; i < T; ++i) for (int j = 0; j < T; ++j) {
+      double& m = mn[(size_t)chainOf[i] * nc + chainOf[j]];
+      m = std::min(m, (double)conf.pae[(size_t)i * T + j]);
+    }
+    fprintf(f, "\"chain_pair_pae_min\": [");
+    for (int a = 0; a < nc; ++a) {
+      fprintf(f, "%s[", a ? ", " : "");
+      for (int b = 0; b < nc; ++b) { if (b) fprintf(f, ", "); num(f, mn[(size_t)a * nc + b]); }
+      fprintf(f, "]");
+    }
+    fprintf(f, "], ");
+  }
+  if (conf.atomToken.size() == conf.plddtAtom.size()) {
+    std::vector<double> sum(nc, 0), cnt(nc, 0), plddt(nc, NAN);
+    for (size_t a = 0; a < conf.atomToken.size(); ++a) {
+      int c = chainOf[conf.atomToken[a]];
+      sum[c] += 100.0 * conf.plddtAtom[a] * conf.atomMask[a]; cnt[c] += conf.atomMask[a];
+    }
+    for (int c = 0; c < nc; ++c) if (cnt[c] > 0) plddt[c] = sum[c] / cnt[c];
+    list(f, "chain_plddt", plddt);
+  }
+  if (chains) fprintf(f, "\"ptm\": %.4f, \"iptm\": %.4f, \"mean_plddt\": %.2f}\n", conf.ptm, conf.iptm, 100 * conf.meanPlddt);
+  else fprintf(f, "\"ptm\": %.4f, \"iptm\": null, \"mean_plddt\": %.2f}\n", conf.ptm, 100 * conf.meanPlddt);
   fclose(f);
 }

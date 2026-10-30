@@ -398,6 +398,7 @@ inline Confidence confidenceHeadSharded(int T, int A, const float* sInputs, int 
   }
   for (int t = 0; t < T; ++t) out.plddtToken[t] /= std::max(cnt[t], 1e-6f);
   out.meanPlddt = wsum / (wtot + 1e-8);
+  out.atomToken = a2t; out.atomMask = mask_;
   out.pae.resize(P);
   CK(cudaMemcpy2D(out.pae.data(), (size_t)T * 4, paeAll, (size_t)Tp * 4, (size_t)T * 4, T, cudaMemcpyDeviceToHost));
   std::vector<double> rowsH(2 * (size_t)T);

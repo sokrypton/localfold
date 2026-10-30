@@ -70,6 +70,32 @@ async function fold(t, binder, { steps, recycles, seed }) {
   return { pdb, binderPtm: s.chain_ptm[0], ipae, iptm, confidence: { iptm: s.iptm, ptm: s.ptm, meanPlddt: s.mean_plddt, chainPairIptm } };
 }
 
+/** One ESMFold2 fold (cuda/ef2, a fresh process - 1.2 s with its start-up, so no second resident server) of the same
+ * job, its terms read as AF3's are: the binder's chain pTM, ipTM and interface PAE from the chain-level summary
+ * cuda/ef2 writes since 2026-10-30. */
+async function foldEf2(t, binder, { seed }) {
+  const file = path.join(work, `e${process.pid}-${Date.now()}.pdb`);
+  const job = file.replace(".pdb", ".json");
+  const sequences = [{ protein: { id: "A", sequence: binder } }, ...t.chains.map((c, i) => {
+    const id = LETTERS[i + 1];
+    if (c.kind === "dna") return { dna: { id, sequence: c.sequence } };
+    return { ligand: c.ccd !== undefined ? { id, ccdCodes: [c.ccd] } : { id, smiles: c.smiles } };
+  })];
+  fs.writeFileSync(job, JSON.stringify({ dialect: "alphafold3", version: 2, name: "j", modelSeeds: [seed], sequences }));
+  await run(`${ROOT}/cuda/ef2/fold`, [file, `--job=${job}`, "--", `--seed=${seed}`], { maxBuffer: 1 << 26 });
+  const pdb = fs.readFileSync(file, "utf8");
+  const s = JSON.parse(fs.readFileSync(file.replace(".pdb", "_summary_confidences.json"), "utf8"));
+  for (const f of fs.readdirSync(work)) if (f.startsWith(path.basename(file, ".pdb"))) fs.rmSync(path.join(work, f));
+  if (s.chain_pair_iptm === undefined) throw new Error("cuda/ef2 wrote no chain-level summary - rebuild it");
+  const k = s.chain_pair_pae_min.length;
+  const both = (m, j) => (m[0][j] + m[j][0]) / 2;
+  let ipae = Infinity, iptm = 0;
+  for (let j = 1; j < k; j += 1) { ipae = Math.min(ipae, both(s.chain_pair_pae_min, j)); iptm += both(s.chain_pair_iptm, j) / (k - 1); }
+  const chainPairIptm = {};
+  for (let i = 0; i < k; i += 1) for (let j = i + 1; j < k; j += 1) chainPairIptm[`${i + 1}|${j + 1}`] = Math.max(s.chain_pair_iptm[i][j], s.chain_pair_iptm[j][i]);
+  return { pdb, binderPtm: s.chain_ptm[0], ipae, iptm, confidence: { iptm: s.iptm, ptm: s.ptm, meanPlddt: s.mean_plddt, chainPairIptm } };
+}
+
 /** Atoms by chain:residue:name: the binder's backbone, and every atom of the other chains. */
 function atoms(pdb) {
   const binder = new Map(), rest = new Map();
@@ -164,7 +190,7 @@ async function attempt(name, index) {
     runs += 1;
     const controller = new AbortController();
     const mine = [];
-    let lastDocked = null;
+    let lastDocked = null, undockedRun = 0;
     try {
       const stream = runDesign({
         chains: [""], chainIndex: 0, cycles: cfg.cycles, length, run: restart,
@@ -179,7 +205,13 @@ async function attempt(name, index) {
           // that many times - so MPNN designs from a docked backbone rather than from a binder floating free
           let r, docked = false;
           for (let k = 0; k < (cfg.contactTries ?? 1); k += 1) {
-            r = await fold(t, sequence, { steps: cfg.steps, recycles: cfg.recycles, seed: seed + 101 * restart + 13 * context.cycle + 7919 * k });
+            const s = seed + 101 * restart + 13 * context.cycle + 7919 * k;
+            // `designEngine`: "ef2" designs with ESMFold2 (the check and the evaluation stay AF3)
+            // `ef2Cycles`: ESMFold2 for cycles before that one, AF3 after - ESMFold2 docks a DNA binder on every cycle
+            // where AF3 docks ~5%, and AF3 then refines a docked start into one AF3 believes
+            const ef2 = cfg.designEngine === "ef2" || (cfg.ef2Cycles !== undefined && context.cycle < cfg.ef2Cycles);
+            r = ef2 ? await foldEf2(t, sequence, { seed: s })
+              : await fold(t, sequence, { steps: cfg.steps, recycles: cfg.recycles, seed: s });
             if (contactProblem(r.pdb, { chain: "A" }) === null) { docked = true; break; }
           }
           foldSeconds += (Date.now() - t0) / 1000;
@@ -201,6 +233,11 @@ async function attempt(name, index) {
         const terms = record.folded.terms;
         records.push({ restart, cycle: record.cycle, score: record.score, vetoed: record.vetoed ?? null,
           alanine: record.alanine, ...terms });
+        // `giveUpStuck`: a restart whose last N design cycles all failed to dock is abandoned for a fresh one -
+        // on DNA most restarts undock after cycle 0 and never come back, and each stuck cycle still costs its
+        // `contactTries` folds
+        if (record.cycle > 0) undockedRun = (record.vetoed ?? null) !== null || terms.stuck ? undockedRun + 1 : 0;
+        if (cfg.giveUpStuck !== undefined && undockedRun >= cfg.giveUpStuck) controller.abort();
         // a restart that has not found the interface by `giveUp.cycle` is abandoned for a fresh one
         if (cfg.giveUp !== undefined && record.cycle >= cfg.giveUp.cycle && terms.ipae > cfg.giveUp.ipae) controller.abort();
         if (record.cycle > 0 && record.alanine <= 0.2 && (record.vetoed ?? null) === null) {
