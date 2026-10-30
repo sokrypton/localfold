@@ -972,7 +972,20 @@ them - every conditioned atom is coordinate group 0), and no polymer-ligand pair
   apart and >= 8 from either end (a new placement each restart), held through every LigandMPNN draw; every design
   fold inpainted with the motif tips AND the ligands' conditioned atoms as one rigid body.
 - 🔴 Not carried: M0110's inter-ligand bonds (FAD-PER-DAL fold as three molecules).
-- Results: (running, 37 targets x 1 attempt)
+- **TA1 (guided every step, every cycle): 0 of 8, stopped.** Confident designs (refold ipTM ~0.9, iPAE 0.9-1.5,
+  backbone 0.4-2.6 A) whose free refold puts the motif 2.7-14.6 A off, and many designs clash (polymer-ligand pairs
+  under 1.5 A: the rigid motif-plus-ligand body forced into the chain). A design guided to the end holds the motif
+  exactly, so nothing selected for one the sequence carries.
+- **TA2 (`motifUntil` 1 A - the last ~40 of 100 steps free - and checks gated on the design's own motif <= 1.5 A,
+  unclashed): 0 of 2, stopped.** The design folds now vary (motif 0.8-2.6 A; 24 of 70 under 1.5 on M0040), but the free
+  check refolds still put it 4.7-15 A off.
+- **TA3 (guided cycles 0-2, then 6 cycles folding free; only a free cycle is checked):** smoke test on M0040 - the
+  first free cycle loses the motif (1.2 -> 11.3 A) while the interface improves (iPAE 4.8 -> 1.2). AF3 binds the
+  ligand from residues of its own choosing, not the held ones. Replaced by TA4 before it finished.
+- **TA4 = TA3 + `motifMatch`**: on each free fold, the motif re-found UNINDEXED among the fold's residues of the right
+  types near a ligand (depth-first over assignments, pruned by pairwise tip-centroid distances within 3 A, the full
+  RMSD at each leaf), and the held positions moved there. Smoke test M0040: free-cycle motif 2.1-2.3 A where the
+  held positions read 11-15. Results: (running, 37 x 1)
 
 **DNA held in a fixed frame, TD17.** The DNA benchmark gives the duplex as SEQUENCE only (`*_sequence_context`,
 coordinates zero; `*_structure_context` is the fixed variant only BoltzGen and RFD3 ran, at 0.8%), so every design

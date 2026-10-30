@@ -158,6 +158,54 @@ function motifTerms(t, positions, designPdb, refoldPdb) {
   for (const p of d.binder.values()) for (const q of d.other) if ((p[0] - q[0]) ** 2 + (p[1] - q[1]) ** 2 + (p[2] - q[2]) ** 2 < 2.25) clashes += 1;
   return { motifRmsd: selfRmsd(got, want), clashes };
 }
+/** AME, unindexed: the assignment of the motif's residues to the fold's residues of the same types (within 12 A of a
+ * ligand) whose atoms best fit the motif - a depth-first search pruned by each pair's tip-centroid distance (within
+ * 3 A of the motif's), the full RMSD at each leaf. Null when no residue of some type is near a ligand. */
+function motifMatch(t, pdb) {
+  const res = new Map(), lig = [];
+  for (const line of pdb.split("\n")) {
+    if (!line.startsWith("ATOM") && !line.startsWith("HETATM")) continue;
+    if (line.slice(76, 78).trim() === "H") continue;
+    const xyz = [+line.slice(30, 38), +line.slice(38, 46), +line.slice(46, 54)];
+    if (line[21] !== "A") { lig.push(xyz); continue; }
+    const n = +line.slice(22, 26);
+    if (!res.has(n)) res.set(n, { name: line.slice(17, 20), atoms: new Map() });
+    res.get(n).atoms.set(line.slice(12, 16).trim(), xyz);
+  }
+  const d2 = (a, b) => (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2;
+  const mean = (ps) => [0, 1, 2].map((c) => ps.reduce((s, p) => s + p[c], 0) / ps.length);
+  const want = t.motif.map((m) => mean(m.atoms.map(([, x, y, z]) => [x, y, z])));
+  const cands = t.motif.map((m) => {
+    const out = [];
+    for (const [n, r] of res) {
+      if (r.name !== m.res || !m.atoms.every(([a]) => r.atoms.has(a))) continue;
+      const tip = m.atoms.map(([a]) => r.atoms.get(a));
+      if (!tip.some((p) => lig.some((q) => d2(p, q) < 144))) continue;
+      out.push({ position: n - 1, tip, centre: mean(tip) });
+    }
+    return out;
+  });
+  if (cands.some((c) => c.length === 0)) return null;
+  let best = null, leaves = 0;
+  const chosen = [];
+  const dfs = (k) => {
+    if (leaves > 20000) return;
+    if (k === t.motif.length) {
+      leaves += 1;
+      const got = chosen.flatMap((c) => c.tip), want2 = t.motif.flatMap((m) => m.atoms.map(([, x, y, z]) => [x, y, z]));
+      const rmsd = selfRmsd(got, want2);
+      if (best === null || rmsd < best.rmsd) best = { rmsd, positions: chosen.map((c) => c.position) };
+      return;
+    }
+    for (const c of cands[k]) {
+      if (chosen.some((o) => o.position === c.position)) continue;
+      if (chosen.some((o, j) => Math.abs(Math.sqrt(d2(o.centre, c.centre)) - Math.sqrt(d2(want[j], want[k]))) > 3)) continue;
+      chosen.push(c); dfs(k + 1); chosen.pop();
+    }
+  };
+  dfs(0);
+  return best;
+}
 function verdict(task, designPdb, r, t, positions) {
   const d = atoms(designPdb), f = atoms(r.pdb);
   if (task === "ame") {
@@ -240,10 +288,13 @@ async function attempt(name, index) {
   };
   // the design-time stop: confident about the terms the task is judged on
   const confidenceOnly = t.task === "dna" || t.task === "ame";     // (neither criterion reads ipTM)
-  const looksDone = (e) => cfg.stop !== undefined && e.ipae <= cfg.stop.ipae && (confidenceOnly || e.iptm >= cfg.stop.iptm);
+  // (AME: and the design's own motif within `stop.motif`, unclashed)
+  const motifOk = (e, bound) => t.task !== "ame" || bound === undefined || (e.motifRmsd <= bound && e.clashes === 0);
+  const looksDone = (e) => cfg.stop !== undefined && !e.guided && e.ipae <= cfg.stop.ipae && (confidenceOnly || e.iptm >= cfg.stop.iptm) && motifOk(e, cfg.stop.motif);
   // 🔴 THE FOOTPRINT SCREENS WHAT IS CHECKED, NOT WHAT THE LOOP DESIGNS FROM: as a per-cycle veto it failed most
   // docked folds, and a docked cycle was followed by a docked one 2 times in 68 against 92 in 290 without it
-  const promisingOf = (e) => e.ipae <= cfg.check.ipae && (confidenceOnly || e.iptm >= cfg.check.iptm) && footprintProblem(e.pdb) === null;
+  const promisingOf = (e) => !e.guided && e.ipae <= cfg.check.ipae && (confidenceOnly || e.iptm >= cfg.check.iptm) && footprintProblem(e.pdb) === null
+    && motifOk(e, cfg.check.motif);
   const records = [], eligible = [], checked = [];
   let runs = 0, foldSeconds = 0;
   const started = Date.now();
@@ -254,6 +305,9 @@ async function attempt(name, index) {
     // AME: the motif's residues at `motifGap`-spaced random positions (unindexed - the designer places them), held
     // through every MPNN draw, and every design fold inpainted with the motif and the ligands' conditioned atoms
     let positions, motif, start = "";
+    // `guideCycles`: only cycles before it are inpainted; the rest fold free, and only a free cycle can be checked -
+    // a guided fold's motif agreement is the guide's, not the sequence's
+    const guidedAt = (cycle) => cfg.guideCycles === undefined || cycle < cfg.guideCycles;
     if (t.task === "ame") {
       const gap = cfg.motifGap ?? 4, edge = cfg.motifEdge ?? 8;
       for (let tries = 0; ; tries += 1) {
@@ -303,7 +357,8 @@ async function attempt(name, index) {
             // where AF3 docks ~5%, and AF3 then refines a docked start into one AF3 believes
             const ef2 = cfg.designEngine === "ef2" || (cfg.ef2Cycles !== undefined && context.cycle < cfg.ef2Cycles);
             r = ef2 ? await foldEf2(t, sequence, { seed: s })
-              : await fold(t, sequence, { steps: cfg.steps, recycles: cfg.recycles, seed: s, motif });
+              : await fold(t, sequence, { steps: cfg.steps, recycles: cfg.recycles, seed: s,
+                motif: guidedAt(context.cycle) ? motif : undefined });
             if (contactProblem(r.pdb, { chain: "A" }) === null) { docked = true; break; }
           }
           foldSeconds += (Date.now() - t0) / 1000;
@@ -314,7 +369,20 @@ async function attempt(name, index) {
           else if (cfg.stick && lastDocked !== null) {
             return { pdb: lastDocked.pdb, confidence: lastDocked.confidence, terms: { binderPtm: 0, ipae: Infinity, iptm: 0, stuck: true } };
           }
-          return { pdb: r.pdb, confidence: r.confidence, terms: { binderPtm: r.binderPtm, ipae: r.ipae, iptm: r.iptm } };
+          // AME: the design fold's own motif agreement and clashes (meaningful once `motifUntil` releases the guide for
+          // the last steps - a fold guided to the end holds the motif exactly), which choose what is checked
+          let own = t.task === "ame" ? motifTerms(t, positions, r.pdb, r.pdb) : {};
+          // `motifMatch` (free cycles): the motif re-found among the fold's own residues, and the held positions moved
+          // there - AF3 builds the pocket from whichever residues it likes, and those are the ones to keep
+          if (t.task === "ame" && cfg.motifMatch && !guidedAt(context.cycle)) {
+            const m = motifMatch(t, r.pdb);
+            if (m !== null && m.rmsd < own.motifRmsd) {
+              positions.splice(0, positions.length, ...m.positions);
+              own = motifTerms(t, positions, r.pdb, r.pdb);
+            }
+          }
+          own = t.task === "ame" ? { ...own, positions: [...positions] } : own;
+          return { pdb: r.pdb, confidence: r.confidence, terms: { binderPtm: r.binderPtm, ipae: r.ipae, iptm: r.iptm, ...own } };
         },
         design: (pdb, context) => designChain(mpnn, { pdb, chain: context.chain, temperature: context.temperature,
           omit: context.omit, alanineBias: context.alanineBias, random: context.random, hold: context.hold, kind: context.kind,
@@ -333,7 +401,9 @@ async function attempt(name, index) {
         // a restart that has not found the interface by `giveUp.cycle` is abandoned for a fresh one
         if (cfg.giveUp !== undefined && record.cycle >= cfg.giveUp.cycle && terms.ipae > cfg.giveUp.ipae) controller.abort();
         if (record.cycle > 0 && record.alanine <= 0.2 && (record.vetoed ?? null) === null) {
-          const entry = { ...terms, restart, cycle: record.cycle, sequence: record.sequence, pdb: record.pdb, score: record.score, positions };
+          const entry = { ...terms, restart, cycle: record.cycle, sequence: record.sequence, pdb: record.pdb, score: record.score,
+            positions: terms.positions ?? positions,
+            guided: motif !== undefined && guidedAt(record.cycle) && cfg.guideCycles !== undefined };
           eligible.push(entry); mine.push(entry);
           if (looksDone(entry)) controller.abort();
         }
@@ -372,7 +442,8 @@ async function attempt(name, index) {
         polished += 1;
         records.push({ restart: -1, cycle: n, polish: k, ipae: r.ipae, iptm: r.iptm, binderPtm: r.binderPtm });
         const alanine = [...designed.sequence].filter((x) => x === "A").length / designed.sequence.length;
-        if (alanine <= 0.2 && (contactProblem(r.pdb, { chain: "A" }) ?? footprintProblem(r.pdb)) === null) pool.push({ ipae: r.ipae, iptm: r.iptm, binderPtm: r.binderPtm, restart: -1, cycle: n, sequence: designed.sequence, pdb: r.pdb, positions: c.entry.positions });
+        if (alanine <= 0.2 && (contactProblem(r.pdb, { chain: "A" }) ?? footprintProblem(r.pdb)) === null) pool.push({ ipae: r.ipae, iptm: r.iptm, binderPtm: r.binderPtm, restart: -1, cycle: n, sequence: designed.sequence, pdb: r.pdb, positions: c.entry.positions,
+          ...(t.task === "ame" ? motifTerms(t, c.entry.positions, r.pdb, r.pdb) : {}) });
       }
     }
     for (const entry of pool.filter(promisingOf).sort((a, b) => a.ipae - b.ipae).slice(0, cfg.polish.top)) {
