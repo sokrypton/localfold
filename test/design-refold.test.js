@@ -78,4 +78,17 @@ describe("templating a refold on what the job kept", () => {
       .flat().join("\n");
     expect(() => keptTemplates(design, "A")).toThrow(/keeps 5 protein chains/);
   });
+
+  // An antibody whose CDR loops were redesigned: H is designed, but its framework was kept.
+  it("templates a designed chain on its kept residues only, when asked", () => {
+    const design = [...chain("H", ["GLU", "VAL", "GLY", "GLY", "LEU", "SER"]), ...chain("T", ["SER", "THR", "VAL"], [0, 10, 0])]
+      .join("\n");
+    const templates = keptTemplates(design, "H", [{ chain: "H", residues: [0, 1, 4, 5, 9, -1, 1] }]);
+    expect(templates.map(({ chainId, chain: at, mapping }) => [chainId, at, mapping ?? null])).toEqual([
+      ["T", 1, null],
+      ["H", 0, [[0, 0], [1, 1], [4, 4], [5, 5]]],
+    ]);
+    // a kept chain is already whole, and partial positions for it are ignored
+    expect(keptTemplates(design, "H", [{ chain: "T", residues: [0] }]).length).toBe(1);
+  });
 });

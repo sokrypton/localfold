@@ -102,20 +102,46 @@ export function foldInputFromPdb(pdb) {
  * 🔴 ONE SLOT A CHAIN, NEVER ONE SPANNING THEM (`spanChains` off): a slot over the complex would
  * hand the model where the binder sits, and where it sits is what the refold is asked.
  *
+ * 🔴 AND PART OF A DESIGNED CHAIN, WHEN THE JOB KEPT PART OF IT (`partial`). An antibody whose CDR loops
+ * were redesigned keeps its framework; folding that framework from sequence tests whether a framework
+ * folds, which nobody designed. A partial template covers the kept residues only - every other
+ * position is AF3's gap token - so the loops, and where the chain docks, are still the model's.
+ * Which residues count as kept, and when a chain is worth a partial template at all, is the caller's
+ * call: templating a small motif would hand the model the answer a motif-scaffolding refold asks for.
+ *
  * @param {string} pdb
  * @param {string|string[]} [designed] the designed chain(s), which are not templated
- * @returns {{text: string, chainId: string, chain: number}[]} as foldAf3's `templates` takes them:
- *   `chain` is the chain's place among the polymers foldInputFromPdb hands over
+ * @param {{chain: string, residues: number[]}[]} [partial] designed chains to template in part: each
+ *   kept residue as its 0-based place among the chain's residues
+ * @returns {{text: string, chainId: string, chain: number, mapping?: [number, number][]}[]} as
+ *   foldAf3's `templates` takes them: `chain` is the chain's place among the polymers
+ *   foldInputFromPdb hands over, and `mapping` (partial only) pairs each kept residue with itself
  */
-export function keptTemplates(pdb, designed) {
+export function keptTemplates(pdb, designed, partial = []) {
   const held = designed === undefined ? [] : Array.isArray(designed) ? designed : [designed];
   const polymers = chainsOf(pdb).filter((chain) => chain.polymer);
   const kept = polymers.map((chain, at) => ({ chain, at }))
     .filter(({ chain }) => !held.includes(chain.letter) && polymerOf(chain).kind === "protein");
-  if (kept.length > TEMPLATE_SLOTS) {
-    throw new Error(`the design keeps ${kept.length} protein chains and a fold takes ${TEMPLATE_SLOTS} templates`);
+  const parts = [];
+  for (const { chain: letter, residues } of partial) {
+    const at = polymers.findIndex((chain) => chain.letter === letter);
+    // a kept chain is already templated whole, and a chain that is not here has nothing to give
+    if (at < 0 || !held.includes(letter) || polymerOf(polymers[at]).kind !== "protein") continue;
+    const length = polymers[at].residues.length;
+    const positions = [...new Set(residues)].filter((index) => Number.isInteger(index) && index >= 0 && index < length)
+      .sort((a, b) => a - b);
+    if (positions.length > 0) parts.push({ chain: polymers[at], at, positions });
   }
-  return kept.map(({ chain, at }) => ({ text: pdb, chainId: chain.letter, chain: at }));
+  if (kept.length + parts.length > TEMPLATE_SLOTS) {
+    throw new Error(`the design keeps ${kept.length + parts.length} protein chains and a fold takes`
+      + ` ${TEMPLATE_SLOTS} templates`);
+  }
+  return [
+    ...kept.map(({ chain, at }) => ({ text: pdb, chainId: chain.letter, chain: at })),
+    ...parts.map(({ chain, at, positions }) => ({
+      text: pdb, chainId: chain.letter, chain: at, mapping: positions.map((index) => [index, index]),
+    })),
+  ];
 }
 
 /** Rewrite every record's chain letter through `rename`, and renumber the atom serials from `first`. */

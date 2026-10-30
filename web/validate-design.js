@@ -36,6 +36,8 @@ export const FOLDERS = { af3: "af3", boltz2: "boltz2", protenix2: "protenix2", o
  * @param {string|string[]} [options.chain] the designed chain(s): held out of the fit, and the
  *   RMSD taken over a single one on its own
  * @param {string} options.model a key of FOLDERS
+ * @param {{chain: string, residues: number[]}[]} [options.partial] designed chains to template on their
+ *   kept residues only (an antibody's framework around redesigned loops); see keptTemplates
  * @param {object} options.device
  * @param {number} [options.seed]
  * @param {(text: string) => void} [options.status]
@@ -51,7 +53,7 @@ export async function refoldDesign(options) {
     throw new Error(`no folding model ${model} (have ${Object.keys(FOLDERS).join(", ")})`);
   }
   const input = foldInputFromPdb(pdb);
-  const templates = keptTemplates(pdb, chain);
+  const templates = keptTemplates(pdb, chain, options.partial ?? []);
   status(`refolding with ${model}`);
   const weights = await loadAf3Weights(() => {}, FOLDERS[model]);
   const refolded = await foldAf3({
@@ -76,6 +78,9 @@ export async function refoldDesign(options) {
   const result = {
     model, confidence: refolded.confidence ?? {}, rmsd, comparable, residues,
     templated: templates.map((template) => template.chainId),
+    // the designed chains templated in part, with how much of each
+    partial: templates.filter((template) => template.mapping !== undefined)
+      .map((template) => ({ chain: template.chainId, residues: template.mapping.length })),
     refold: fitted.refold, deviations: fitted.deviations,
   };
   const templated = result.templated.length === 0 ? ""
