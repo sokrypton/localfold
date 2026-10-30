@@ -408,6 +408,7 @@ async function attempt(name, index) {
         ...t.chains.flatMap((c, i) => (c.conditioned ?? []).filter(([a]) => built[i].has(a)).map(([a, x, y, z]) => `${-(i + 2)} ${a} ${x} ${y} ${z}`)),
       ].join("\n") + "\n");
     } else if (fixedLigand) {
+      unguided = 0;
       // the conformer by token: a SMILES chain's atoms are its tokens in SMILES order, checked element by element
       // against what AF3 built (a mismatch is refused, never guessed past); a CCD chain's by atom name
       const built = await ligandAtomsInOrder(name, t);
@@ -419,14 +420,16 @@ async function attempt(name, index) {
           c.conformer.forEach(([, x, y, z], k) => lines.push(`${-(i + 2)} ${built[i][k].name} ${x} ${y} ${z}`));
         } else {
           const names = new Set(built[i].map((a) => a.name)), used = new Set();
-          for (const [n, x, y, z] of c.conformerNames ?? []) if (names.has(n) && !used.has(n)) { used.add(n); lines.push(`${-(i + 2)} ${n} ${x} ${y} ${z}`); }
+          for (const [n, x, y, z] of c.conformerNames ?? []) {
+            if (names.has(n) && !used.has(n)) { used.add(n); lines.push(`${-(i + 2)} ${n} ${x} ${y} ${z}`); } else unguided += 1;
+          }
         }
       });
       // (under three atoms - an ion, two coppers - there is no shape to hold, and a fit needs three: unguided)
       if (lines.length >= 3) {
         motif = path.join(work, `motif-${process.pid}-${name}-${index}-${restart}.txt`);
         fs.writeFileSync(motif, lines.join("\n") + "\n");
-      } else unguided = lines.length;
+      } else unguided += lines.length;
     } else if (t.task === "dna" && t.dnaAtoms !== undefined) {
       // DNA FIXED (the paper's dna_fixed, an "F-" target): the given duplex inpainted into every design fold, token by
       // token - only the atoms AF3 builds (the stub fold's names; a 5' phosphate may be absent); the check and the

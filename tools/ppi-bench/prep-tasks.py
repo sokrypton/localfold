@@ -15,7 +15,8 @@ ORDER = {"SING": Chem.BondType.SINGLE, "DOUB": Chem.BondType.DOUBLE, "TRIP": Che
 
 def loops(path):
     """Every mmCIF loop as (columns, rows); quoted tokens kept whole."""
-    text = subprocess.run(["zstd", "-dc", path], capture_output=True, text=True, check=True).stdout.split("\n")
+    text = (subprocess.run(["zstd", "-dc", path], capture_output=True, text=True, check=True).stdout if path.endswith(".zst")
+            else open(path).read()).split("\n")
     out, i = [], 0
     while i < len(text):
         if text[i].startswith("loop_"):
@@ -48,6 +49,33 @@ CCD = {HEME: ["HEM"], "[Cu+2]": ["CU"], "[Zn+2]": ["ZN"], "[Mn+2]": ["MN"], "[Ni
        "O=C(O)CCC1=[O]->[Fe]<-[O]=C1O": ["FE2", "AKG"],
        "CC1=C2C(CCC(N)=O)C(C)(C)C3=CC4=[N]5->[Co+2]6([N]32)<-[N]2=C1C(C)(CCC(=O)NCC(C)OP(=O)(O)OC1C(CO)OC(n3cnc7cc(C)c(C)"
        "cc73)C1O)C(CC(N)=O)C2C1(C)[N]->6=C(C(C)=C5C(C)(CC(N)=O)C4CCC(N)=O)C(CCC(N)=O)C1(C)CC(N)=O": ["B12"]}
+CCD_DIR = os.path.expanduser("~/.cache/localfold/ccd")      # the native featuriser's own CCD cache, one file a code
+
+def graph(elements, bonds):
+    """A molecule of elements and plain single bonds - what a match on connectivity alone compares."""
+    g = Chem.RWMol()
+    for e in elements: g.AddAtom(Chem.Atom(e))
+    for i, j in bonds: g.AddBond(i, j, Chem.BondType.SINGLE)
+    return g.GetMol()
+
+def ccd_match(m, code, used):
+    """`code`'s heavy atoms (names) and, in order, the indices of the file molecule `m`'s atoms they are."""
+    c, rows = table(os.path.join(CCD_DIR, f"{code}.cif"), "_chem_comp_atom.", optional=True)
+    if not rows:    # (a one-atom component - an ion - writes its atom as key-value lines, not a loop)
+        kv = dict(re.findall(r"^_chem_comp_atom\.(\w+)\s+(\S+)", open(os.path.join(CCD_DIR, f"{code}.cif")).read(), re.M))
+        c, rows = {"atom_id": 0, "type_symbol": 1}, [[kv["atom_id"].strip('"'), kv["type_symbol"]]]
+    heavy = [r for r in rows if r[c["type_symbol"]].upper() != "H"]
+    names = [r[c["atom_id"]] for r in heavy]
+    at = {n: i for i, n in enumerate(names)}
+    bc, brows = table(os.path.join(CCD_DIR, f"{code}.cif"), "_chem_comp_bond.", optional=True)
+    bonds = [(at[b[bc["atom_id_1"]]], at[b[bc["atom_id_2"]]]) for b in brows
+             if b[bc["atom_id_1"]] in at and b[bc["atom_id_2"]] in at]
+    query = graph([r[c["type_symbol"]].capitalize() for r in heavy], bonds)
+    target = graph([a.GetSymbol() for a in m.GetAtoms()], [(b.GetBeginAtomIdx(), b.GetEndAtomIdx()) for b in m.GetBonds()])
+    for match in target.GetSubstructMatches(query, uniquify=False, maxMatches=1000):
+        if not used & set(match): return names, list(match)
+    raise ValueError(f"{code}: its heavy-atom graph is not in the file's molecule")
+
 tasks = {}
 d = os.path.join(SRC, "data/benchmarks/dna_binder/dna_binder_denovo_val")
 for pdb in ("7m5w", "7n5u", "7rte"):
@@ -115,9 +143,15 @@ for key in keys:
         metals = {a.GetSymbol() for a in m.GetAtoms()} & {"Fe", "Co", "Cu", "Zn", "Mn", "Ni"}
         if metals:
             codes = CCD[smiles]
-            # (the file's conformer by atom NAME: the harness gives each name to the code's chain that builds it)
-            named = [[a[c["label_atom_id"]], *p] for a, p in zip(atoms, xyz)]
-            chains.extend({"kind": "ligand", "ccd": code, "atoms": len(atoms), "conformerNames": named} for code in codes)
+            # (the file's conformer under the CCD's OWN atom names - the file names its atoms C0, C1, FE0..., so each
+            # code's heavy-atom graph is matched into the file's, elements and connectivity only; an atom is one
+            # code's at most)
+            used = set()
+            for code in codes:
+                names, match = ccd_match(m, code, used)
+                used |= set(match)
+                chains.append({"kind": "ligand", "ccd": code, "atoms": len(atoms),
+                               "conformerNames": [[n, *xyz[k]] for n, k in zip(names, match)]})
             continue
         # `conformer`: the file's coordinates in the SMILES's own atom order (RDKit's _smilesAtomOutputOrder), which
         # is the order a SMILES ligand's atoms become tokens - each with its element, which the harness checks
