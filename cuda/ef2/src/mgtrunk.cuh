@@ -346,6 +346,13 @@ inline Confidence confidenceHeadSharded(int T, int A, const float* sInputs, int 
   mg::Shared& tmS = mg::shared("ef2.cf.tmrows", (size_t)T * 2 * 8);
   mg::Shared& paeS = mg::shared("ef2.cf.pae", (size_t)T * Tp * 4);
   float* pooled = (float*)pooledS.local; double* rowsD = (double*)tmS.local; float* paeAll = (float*)paeS.local;
+  // ...and each anchor's TM terms summed per chain, for the chain-level pTM and ipTM (tmChainRowsK)
+  std::vector<int> asymH(T), chainOf;
+  CK(cudaMemcpy(asymH.data(), Idev("asym_id"), T * 4, cudaMemcpyDeviceToHost));
+  const int nc = (int)chainOrder(asymH, chainOf).size();
+  mg::Shared& chainS = mg::shared("ef2.cf.tmchain", (size_t)T * nc * 8);
+  double* chainRows = (double*)chainS.local;
+  int* dChainOf = upload(chainOf.data(), T);
   const double width = 32.0 / pb, d0 = 1.24 * cbrt(std::max(T, 19) - 15.0) - 1.8;
   {
     float* zc = scratch<float>("cf.zc", per * C); float* xn = scratch<float>("cf.xn", per * C);
@@ -367,6 +374,7 @@ inline Confidence confidenceHeadSharded(int T, int A, const float* sInputs, int 
       } else gemm(zc, F("confidence/pae"), paeL, n, C, pb);
       paeK<<<blocks(n), 256, 0, STREAM>>>(paeL, paeD, tmD, n, pb, width, d0);
       tmRowsAtK<<<(unsigned)b, 256, 0, STREAM>>>(tmD, Idev("asym_id"), rowsD, T, i0);
+      tmChainRowsK<<<(unsigned)b, 256, nc * sizeof(double), STREAM>>>(tmD, dChainOf, chainRows, T, nc, i0);
       CK(cudaMemcpy2DAsync(paeAll + (size_t)i0 * Tp, (size_t)Tp * 4, paeD, (size_t)T * 4, (size_t)T * 4, b, cudaMemcpyDeviceToDevice, STREAM));
     }
     releaseScratch({ "cf.zc", "cf.xn", "cf.scoreRows", "cf.paeRows", "cf.paeOutRows", "cf.tmRows1", "cf.residRows" });
@@ -374,6 +382,8 @@ inline Confidence confidenceHeadSharded(int T, int A, const float* sInputs, int 
   }
   mg::allGather(pooledS, (size_t)lo * C * 4, (size_t)rows * C * 4);
   mg::allGather(tmS, (size_t)lo * 16, (size_t)rows * 16);
+  mg::allGather(chainS, (size_t)lo * nc * 8, (size_t)rows * nc * 8);
+  CK(cudaFree(dChainOf));
   mg::allGather(paeS, (size_t)lo * Tp * 4, (size_t)rows * Tp * 4);
   // the single and the per-atom pLDDT (confidenceHead's, on the gathered pooling) - every rank alike
   float* single = scratch<float>("cf.single", (size_t)T * Cs);
@@ -399,6 +409,8 @@ inline Confidence confidenceHeadSharded(int T, int A, const float* sInputs, int 
   for (int t = 0; t < T; ++t) out.plddtToken[t] /= std::max(cnt[t], 1e-6f);
   out.meanPlddt = wsum / (wtot + 1e-8);
   out.atomToken = a2t; out.atomMask = mask_;
+  out.tmChainRows.resize((size_t)T * nc);
+  CK(cudaMemcpy(out.tmChainRows.data(), chainRows, out.tmChainRows.size() * 8, cudaMemcpyDeviceToHost));
   out.pae.resize(P);
   CK(cudaMemcpy2D(out.pae.data(), (size_t)T * 4, paeAll, (size_t)Tp * 4, (size_t)T * 4, T, cudaMemcpyDeviceToHost));
   std::vector<double> rowsH(2 * (size_t)T);

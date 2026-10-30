@@ -303,10 +303,31 @@ __global__ void tmRowsK(const float* tm, const int* asym, double* rows, int T) {
   }
   if (threadIdx.x == 0) { rows[2 * i] = s[0][0] / (T + 1e-8); rows[2 * i + 1] = s[1][0] / (c[0] + 1e-8); }
 }
+// each anchor row's TM terms summed per chain - out [i0 + row][nc] - which is all the chain-level pTM and ipTM read:
+// T x nc numbers where the matrix is T x T, so the sharded head can all-gather them at any size (rows: block's rows)
+__global__ void tmChainRowsK(const float* tm, const int* chainOf, double* out, int T, int nc, int i0) {
+  extern __shared__ double acc[];
+  const int r = blockIdx.x;
+  for (int k = threadIdx.x; k < nc; k += blockDim.x) acc[k] = 0;
+  __syncthreads();
+  for (int j = threadIdx.x; j < T; j += blockDim.x) atomicAdd(&acc[chainOf[j]], (double)tm[(size_t)r * T + j]);
+  __syncthreads();
+  for (int k = threadIdx.x; k < nc; k += blockDim.x) out[(size_t)(i0 + r) * nc + k] = acc[k];
+}
+// the chains by asym id, sorted, and each token's index among them - the writer's order, and the kernel's
+inline std::vector<int> chainOrder(const std::vector<int>& asym, std::vector<int>& chainOf) {
+  std::vector<int> ids;
+  for (int a : asym) if (std::find(ids.begin(), ids.end(), a) == ids.end()) ids.push_back(a);
+  std::sort(ids.begin(), ids.end());
+  if (ids.size() * sizeof(double) > 48 * 1024) throw std::runtime_error("the confidence head's per-chain TM sums hold 6144 chains at most");
+  chainOf.resize(asym.size());
+  for (size_t i = 0; i < asym.size(); ++i) chainOf[i] = (int)(std::find(ids.begin(), ids.end(), asym[i]) - ids.begin());
+  return ids;
+}
 
-// `tm`: the per-pair TM term [T][T] the pTM is a max-of-means over - the chain-level fields are read off it, and a path
-// that does not download it (the sharded head) writes none of them. `atomToken`/`atomMask`: for each chain's mean pLDDT
-struct Confidence { std::vector<float> plddtAtom, plddtToken, pae, tm, atomMask; std::vector<int> atomToken; double ptm, iptm, meanPlddt; };
+// `tmChainRows`: [T][chains] - each anchor's TM terms summed over each chain (tmChainRowsK), which every chain-level pTM
+// and ipTM is a max-of-means over. `atomToken`/`atomMask`: for each chain's mean pLDDT
+struct Confidence { std::vector<float> plddtAtom, plddtToken, pae, atomMask; std::vector<double> tmChainRows; std::vector<int> atomToken; double ptm, iptm, meanPlddt; };
 
 // consume: the trunk's z is read by nothing after this call - on a card short of room the head then works in it
 inline Confidence confidenceHead(int T, int A, const float* zTrunk, const float* sInputs, int Si, const float* xDevice,
@@ -517,7 +538,15 @@ inline Confidence confidenceHead(int T, int A, const float* zTrunk, const float*
   paeK<<<blocks(P), 256, 0, STREAM>>>(paeL, paeD, tmD, P, pb, width, d0);
   tmRowsK<<<T, 256, 0, STREAM>>>(tmD, Idev("asym_id"), rowsD, T);
   out.pae = download(paeD, P);
-  out.tm = download(tmD, P);
+  {
+    std::vector<int> chainOf; const int nc = (int)chainOrder(asym, chainOf).size();
+    int* dChainOf = upload(chainOf.data(), T);
+    double* dRows = scratch<double>("cf.tmChainRows", (size_t)T * nc);
+    tmChainRowsK<<<T, 256, nc * sizeof(double), STREAM>>>(tmD, dChainOf, dRows, T, nc, 0);
+    out.tmChainRows.resize((size_t)T * nc);
+    CK(cudaMemcpy(out.tmChainRows.data(), dRows, out.tmChainRows.size() * 8, cudaMemcpyDeviceToHost));
+    CK(cudaFree(dChainOf));
+  }
   out.atomToken = a2t; out.atomMask = mask_;
   std::vector<double> rows(2 * T);
   CK(cudaMemcpy(rows.data(), rowsD, rows.size() * 8, cudaMemcpyDeviceToHost));
@@ -567,18 +596,12 @@ inline void writeConfidences(const std::string& pdb, int T, const Confidence& co
   // every pair's ipTM a max over anchors of the mean TM term over the tokens it selects, the pair's PAE minimum over
   // ordered pairs, the chain's mean atom pLDDT. They were computed (the TM matrix is the pTM's) and reduced to two
   // global numbers, so a binder's own pTM and its interface ipTM were not in the file (2026-10-30)
-  std::vector<int> ids;
-  for (int i = 0; i < T; ++i) if (std::find(ids.begin(), ids.end(), asym[i]) == ids.end()) ids.push_back(asym[i]);
-  std::sort(ids.begin(), ids.end());
-  const int nc = (int)ids.size();
-  std::vector<int> chainOf(T);
-  for (int i = 0; i < T; ++i) chainOf[i] = (int)(std::find(ids.begin(), ids.end(), asym[i]) - ids.begin());
+  std::vector<int> chainOf;
+  const int nc = (int)chainOrder(asym, chainOf).size();
   std::vector<int> chainCount(nc, 0);
   for (int i = 0; i < T; ++i) chainCount[chainOf[i]]++;
-  const bool haveTm = conf.tm.size() == (size_t)T * T;
-  std::vector<double> rowSum(haveTm ? (size_t)T * nc : 0, 0.0);
-  if (haveTm)
-    for (int i = 0; i < T; ++i) for (int j = 0; j < T; ++j) rowSum[(size_t)i * nc + chainOf[j]] += conf.tm[(size_t)i * T + j];
+  if (conf.tmChainRows.size() != (size_t)T * nc) throw std::runtime_error("the confidence head returned no per-chain TM sums");
+  const std::vector<double>& rowSum = conf.tmChainRows;
   auto best = [&](int from, bool others, int to, bool notTo) {
     double top = -1e30; bool any = false;
     for (int i = 0; i < T; ++i) {
@@ -600,7 +623,7 @@ inline void writeConfidences(const std::string& pdb, int T, const Confidence& co
   };
   f = fopen((stem + "_summary_confidences.json").c_str(), "w");
   fprintf(f, "{");
-  if (haveTm) {
+  {
     std::vector<double> chainPtm(nc), chainIptm(nc);
     for (int a = 0; a < nc; ++a) {
       chainPtm[a] = best(a, false, a, false);
