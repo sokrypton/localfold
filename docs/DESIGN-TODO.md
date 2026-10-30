@@ -1045,3 +1045,28 @@ then inpainted into every design fold token by token. Checks and evaluation fold
 - **TD16 (TD9 + beam 3): 0 of 18, stopped** (TD9 2 of the same 18).
 - Not tried, if DNA is revisited: `--motif-until` (release the frame for the last steps, so the design agrees better with a free
   refold), a partial pull, and holding only the part of the target the binder does not touch.
+
+### The page against native: why recipe C scored 24.1% and NC 37.9% (2026-10-30, night)
+
+The same Protein Hunter recipe (6 cycles x 100 steps x 3 recycles, 3 restarts, target templated, internal AF3 check
+of the top 2) scores 24.1% through the page (`bench.js`, C) and 37.9% natively (`native-bench.mjs`, NC). Narrowed:
+- **Not the evaluation.** The page's AF3 scores NC's own designs at 37.5% against native's 37.9%, agreeing on 223
+  of 240 attempts (`R-NC.jsonl`'s page columns).
+- **Not the internal check.** A passing page check passes the evaluation 44 times in 50.
+- **Not the loop.** `hunt()` and `native-bench.mjs` call the same `runDesign`, SolubleMPNN both (the page's "auto"
+  picks it for protein-only), the same contact veto (no hotspots in either config), the same check and submission
+  rule. Lengths vary per attempt in both.
+- **Not the seed.** `hunt()` folds every cycle of a run at ONE diffusion seed where `native-bench.mjs` varies it per
+  cycle - but NC's design folds ran on the resident server before the served-seed fix, which ignored every job's seed,
+  so NC was one-seed too and still 37.9%. (`sameSeed` is in `native-bench.mjs` as the control, not run.)
+- **Not the folding engine on finished designs** (`engine-probe.py`): NC's submitted binders, attempts 0-2 on every
+  target, two seeds, at the DESIGN settings - check-worthy (pTM >= 0.8, iPAE <= 2.5) native 74 / page int5 71 / page
+  float32 76 of 144, agreeing with native on 137 and 140; median iPAE 1.76 / 2.32 / 1.82.
+- **Where it diverges: the design trajectories.** The page vetoes 4-10% of design cycles for touching nothing (native
+  ~1%), and its cycle-by-cycle iPAE falls more slowly (cycle 6 median 10-12 against 7.3): 5.6% of page design cycles
+  are check-worthy against 10.9%, so fewer attempts reach a passing check (23% against 38%). The warm start is not it
+  (W0, no warm start, 20.8%). What is left is the page's int5 weights on weak, early-cycle sequences - a 0.5 A worse
+  median iPAE on finished designs that agree, and possibly more on the X-rich ones a run starts from.
+- **The test running: PI/PF**, the page's own loop on its int5 bundle against the float32 export (`cfg.bundle`, a
+  `bench.js`-only override of AF3's registry entry), no warm start, attempts 40-41 on all 24 targets, paired; NCn is
+  native on the same attempts. Results: (running)

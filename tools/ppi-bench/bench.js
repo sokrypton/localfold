@@ -72,6 +72,16 @@ window.__bench = async (cfg) => {
   };
   // 🔴 THE BENCHMARK'S CHECK, as one function: the final evaluation and (cfg.check) the pipeline's own
   // internal filter run exactly this, with different seeds
+  // 🔴 cfg.bundle (a diagnostic, this page only): AF3's registry entry pointed at another bundle directory - its own
+  // manifest.json - before anything loads, so the design loop, the check and the evaluation all fold with it (the
+  // page's int5 against the float32 export, docs/DESIGN-TODO.md "the page against native")
+  if (cfg.bundle !== undefined) {
+    const { MODEL_BUNDLES } = await import("/shared/bundles/manifests/index.js");
+    const { af3LoadMilliseconds } = await import("/web/af3-model.js");
+    if (Object.keys(af3LoadMilliseconds).length > 0) throw new Error("cfg.bundle: AF3's weights were loading before the override");
+    const manifest = await (await fetch(`${cfg.bundle}manifest.json`)).json();
+    Object.assign(MODEL_BUNDLES.af3, { directory: cfg.bundle, remote: null, load: async () => ({ MANIFEST: manifest }) });
+  }
   const weights = await loadAf3Weights(() => {}, "af3");
   // 🔴 cfg.checkModel: the internal check may fold with another model (the final evaluation is always AF3)
   const checkWeights = cfg.checkModel === undefined || cfg.checkModel === "af3" ? weights

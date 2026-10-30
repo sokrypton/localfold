@@ -105,7 +105,8 @@ function binderRmsd(designPdb, refoldPdb) {
 async function attempt(name, index) {
   const t = targets[name];
   const cfg = config;
-  const rng = mulberry(seedOf(`${cfg.tag}:${name}:${index}`));
+  // `pair`: arms of one A/B draw the same lengths and evaluation seeds
+  const rng = mulberry(seedOf(`${cfg.pair ?? cfg.tag}:${name}:${index}`));
   const [lo, hi0] = t.binder;
   const hi = Math.min(hi0, lo + (cfg.lengthSpan ?? 1e9));
   const length = lo + Math.floor(rng() * (hi - lo + 1));
@@ -154,7 +155,8 @@ async function attempt(name, index) {
         fold: async (sequence, context) => {
           const t0 = Date.now();
           const r = await fold(t, templateFile, sequence, { model: designModel, steps: cfg.steps, recycles: cfg.recycles,
-            seed: seed + 101 * restart + 13 * context.cycle, pocket, msas: targetMsas });
+            // `sameSeed`: every cycle of a run folds at ONE diffusion seed, as web/hunt.js does (a control for the page)
+            seed: seed + 101 * restart + (cfg.sameSeed ? 0 : 13 * context.cycle), pocket, msas: targetMsas });
           foldSeconds += (Date.now() - t0) / 1000;
           return { pdb: r.pdb, confidence: r.confidence, terms: { binderPtm: r.binderPtm, ipae: r.ipae } };
         },
