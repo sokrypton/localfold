@@ -877,3 +877,27 @@ DNA: **no pass yet** in any arm (theirs 3.5%, original Protein Hunter 0.3%).
   because MPNN was designing a soluble protein that never touched the DNA.
 - TD3 (no C/D/E, `omit`, plus `contactTries` 5): still 0/30, but the designs dock: final interface PAE mostly 1.5-2.5
   (one 1.53 at 7.6 A), and a few within the 8 A RMSD. TD4 adds TS2's 6 restarts and top-3 check.
+
+**Passes per GPU-hour against theirs** - the paper's own measure: passes over (generation + AF3 evaluation) GPU-hours,
+theirs on H200s, ours on this A100. Ours is estimated, not metered: each attempt's folds counted from its records
+(design folds at 100 steps x 3 recycles, checks and the evaluation at 200 x 5) times the resident server's own
+per-fold GPU time at 179 tokens (0.34 s and 0.59 s), scaled linearly by the attempt's token count - which UNDER-states
+the larger PPI complexes, whose trunk grows faster than linearly. MPNN and featurisation run on the CPU and are not
+counted, as their CPU MPNN is not.
+
+| task | run | GPU s an attempt | passes / GPU-hour (pooled, mean over targets) |
+|---|---|---|---|
+| small molecules | T (3 restarts) | 7.0 | 171, 212 |
+| small molecules | TS2 (6 restarts) | 11.1 | 183, 265 |
+| small molecules | *RFD4-Proteina high (H200)* | *2.2* | *559, 570* |
+| small molecules | *BoltzGen / original Protein Hunter / DISCO* | *3.2 / 58 / 79* | *46 / 0 / 1* |
+| protein binders | NC | 11.2 | 120, 153 |
+| protein binders | *RFD4-Proteina high (H200)* | *6.5* | *106, 126* |
+| protein binders | *BoltzGen / original Protein Hunter / BindCraft* | *6.3 / 81 / 156* | *28 / 3 / 2* |
+
+- On protein binders Protein Hunter is level with RFD4-Proteina per GPU-hour on a SLOWER card, and ahead per attempt.
+- On small molecules it is ahead per attempt (56.5 against 34.3%) and behind per GPU-hour by ~2-3x, roughly the
+  A100-to-H200 gap: RFD4-Proteina's attempt is 2.2 GPU-seconds, ours 11. More restarts buy pass rate at nearly flat
+  yield (171 -> 183 pooled).
+- Against every other baseline in the paper, including the original Protein Hunter, it is ahead on both by one to
+  two orders of magnitude.
