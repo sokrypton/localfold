@@ -856,15 +856,24 @@ Small molecules, 2 attempts a target (theirs 200), the same attempts in every ar
 
 | run | change | pass rate (95% CI) | targets with a pass |
 |---|---|---|---|
-| T | recipe C, the file's 100-155 lengths, 3 restarts, check top 2 | 33.1% (28.6-37.7) | 40 |
-| TS1 | the paper's 150/200/250 lengths | 22.4% at 67 attempts, stopped | 15 |
-| **TS2** | **6 restarts, check top 3** | **56.5% (51.3-61.7)** | **60** |
+| T | recipe C, the file's 100-155 lengths, 3 restarts, check top 2 | 26.6% (22.1-31.2) | 32 |
+| TS1 | the paper's 150/200/250 lengths | 22.4% at 67 attempts (served seed), stopped | 15 |
+| **TS2** | **6 restarts, check top 3** | **36.4% (31.2-41.6)** | **43** |
+| TS3 | 10 restarts, check top 3 (101 of 154 attempts, then stopped) | 48.1% | 41 |
 | *RFD4-Proteina high (paper)* | | *34.3%* | *77* |
 | *original Protein Hunter / BoltzGen / DISCO (paper)* | | *0.8% / 4.0% / 2.6%* | |
 
-- **TS2 beats RFD4-Proteina by 22 points.** Paired, TS2 passes every attempt T passes and 36 more (51 -> 87): its
-  first three restarts are T's. It costs 75 s an attempt against 44 (median).
-- Interface PAE is what fails: 27 of TS2's 67 failures miss on it alone, and it is in 59 of the 67.
+- 🔴 **CORRECTED 2026-10-30, 04:30: THESE WERE 33.1% AND 56.5% AND BOTH WERE WRONG.** Every fold went to a resident
+  `cuda/af3/fold --serve`, which parsed each job's `--seed` and folded at its own start-up seed (fixed in 5a2e9484).
+  The internal check and the evaluation run at the same settings, so the evaluation of a checked design WAS its
+  check, byte for byte - and a check that passes is selected to pass. Re-evaluated at each attempt's own seed
+  (`task-bench.mjs --rescore`): T 51 -> 41 passes, TS2 87 -> 56, TS3 71 -> 49. The table is the re-evaluation.
+  The protein-binder NC barely moves under the same correction (37.5 -> 37.9%, `rescore.py`, batch mode, which
+  always honoured the seed): with the target templated the fold hardly depends on the seed; a small molecule's
+  interface PAE sits on the 1.5 line and does.
+- **TS2 is level with RFD4-Proteina** (36.4 against 34.3%), and 10 restarts (TS3, partial) points higher.
+- An internal check that passes is 64% likely to pass the evaluation at another seed (TS2: 56 of 87); the losses
+  are interface PAE moving across 1.5.
 - Bigger binders hurt (TS1: 15 passes against T's 19 on the same 67 attempts).
 - 🔴 Caveats, as for PPI: the internal check is the evaluator's model; 2 attempts a target cannot give a clustered rate
   (theirs 200); their AF3 read each ligand from the input file's chemistry and ours from SMILES or a CCD code; and
@@ -887,8 +896,8 @@ counted, as their CPU MPNN is not.
 
 | task | run | GPU s an attempt | passes / GPU-hour (pooled, mean over targets) |
 |---|---|---|---|
-| small molecules | T (3 restarts) | 7.0 | 171, 212 |
-| small molecules | TS2 (6 restarts) | 11.1 | 183, 265 |
+| small molecules | T (3 restarts) | 7.0 | 137, 164 |
+| small molecules | TS2 (6 restarts) | 11.1 | 118, 172 |
 | small molecules | *RFD4-Proteina high (H200)* | *2.2* | *559, 570* |
 | small molecules | *BoltzGen / original Protein Hunter / DISCO* | *3.2 / 58 / 79* | *46 / 0 / 1* |
 | protein binders | NC | 11.2 | 120, 153 |
@@ -896,8 +905,7 @@ counted, as their CPU MPNN is not.
 | protein binders | *BoltzGen / original Protein Hunter / BindCraft* | *6.3 / 81 / 156* | *28 / 3 / 2* |
 
 - On protein binders Protein Hunter is level with RFD4-Proteina per GPU-hour on a SLOWER card, and ahead per attempt.
-- On small molecules it is ahead per attempt (56.5 against 34.3%) and behind per GPU-hour by ~2-3x, roughly the
-  A100-to-H200 gap: RFD4-Proteina's attempt is 2.2 GPU-seconds, ours 11. More restarts buy pass rate at nearly flat
-  yield (171 -> 183 pooled).
+- On small molecules it is level per attempt (36.4 against 34.3%) and behind per GPU-hour by ~3-4x, of which the
+  A100-to-H200 gap is perhaps 2x: RFD4-Proteina's attempt is 2.2 GPU-seconds, ours 11. (Re-evaluated passes.)
 - Against every other baseline in the paper, including the original Protein Hunter, it is ahead on both by one to
   two orders of magnitude.
