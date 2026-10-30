@@ -864,6 +864,7 @@ Small molecules, 2 attempts a target (theirs 200), the same attempts in every ar
 | TS4 | TS3f with a 2-seed internal check: a candidate passes only if it passes at two seeds | 51.9% (47.4-56.5) | 53 |
 | TS6 | TS4 with LigandMPNN at temperature 0.2 (0.1) | 53.2% (48.7-57.8) - a null, 82 against 80 paired | 55 |
 | **TS4 + polish** | **TS4, and where no restart passed: 8 MPNN draws on each of the 2 nearest misses' backbones, the best 3 checked (`polish`)** | **62.3% (57.8-66.9)** | **60** |
+| TS7 | TS4 + polish at MPNN temperature 0.2 | 62.3% (57.8-67.5) - level with TS4 + polish; temperature a null again | 62 |
 | *RFD4-Proteina high (paper)* | | *34.3%* | *77* |
 | *original Protein Hunter / BoltzGen / DISCO (paper)* | | *0.8% / 4.0% / 2.6%* | |
 
@@ -890,7 +891,14 @@ Small molecules, 2 attempts a target (theirs 200), the same attempts in every ar
   (theirs 200); their AF3 read each ligand from the input file's chemistry and ours from SMILES or a CCD code; and
   their 100% target coverage at 200 attempts is not comparable with 60 of 77 at 2.
 
-DNA: **no pass yet** in any arm (theirs 3.5%, original Protein Hunter 0.3%).
+DNA: **TD9 is ahead of RFD4-Proteina, on few passes: 7.1% (CI 1.8-14.2), 4 of 56 attempts** (theirs 3.5%,
+original Protein Hunter 0.3%) - `config-TD9.json`: LigandMPNN for the binder (not NA-MPNN), no C/D/E, 10 restarts,
+`contactTries` 5, `stick`, `minFootprint` 8 screening the checks only. By target 7m5w 3/19, 7rte 1/18, 7n5u 0/19.
+- Designs dock on only 4-9% of design cycles; near-misses slide along the duplex with binder and DNA each rigid.
+- TD12 (TD9 with a K/R logit bias of 0.3, `residueBias`): 0/32, stopped. At +1 the designs were 45% K/R and none docked.
+- TD14 (TD9 with ESMFold2 designing cycles 0-2, AF3 after): 0/42, stopped. Pure EF2 design docks every cycle and
+  AF3 then reads interface PAE ~23 - ESMFold2's dock is not one AF3 agrees with.
+- Earlier, before TD9:
 - T (30 attempts): 21 never produced a candidate - the binder drifted 20-40 A off the 10-bp duplex every cycle.
 - TD1 (beam 3, 6 restarts, give up an undocked restart at cycle 2) and TD2 (a fold that leaves the binder undocked is
   refolded with up to 5 seeds, `contactTries`): 0%, and the designs were ACIDIC - D/E ~25% against K/R 16-21% -
