@@ -25,3 +25,25 @@ Results and method: docs/DESIGN-TODO.md, "RFD4-Proteina's binder benchmark".
    chain its MSA instead of the template (one `<sha1[:12]>.a3m` a chain, from the ColabFold server).
 
 `results-C-2026-10-29.jsonl` is the overnight run: 214 attempts, each design's sequence and both evaluators' terms.
+
+7. The small-molecule- and DNA-binder benchmarks: `~/.venv-rdkit/bin/python prep-tasks.py <clone>` writes
+   `tasks.json` (77 DISCO small-molecule targets, ligands as SMILES or CCD codes; 3 DNA duplexes as sequence), then
+   `run-tasks.sh config-T*.json out.jsonl <workers> <target:attempt> ...` (`task-bench.mjs`, the same loop with
+   LigandMPNN / NA-MPNN and each task's pass criteria) against one resident `cuda/af3/fold --serve`, and
+   `task-score.py out.jsonl`. Results: docs/DESIGN-TODO.md, "RFD4-Proteina's small-molecule- and DNA-binder
+   benchmarks".
+
+## The best settings so far, per task
+
+All on the native port, evaluation always the native AF3 at the benchmark's settings; mean over targets.
+The internal check is the evaluator's own model in every row - stated beside every number.
+
+| task | config | what it is | pass rate | RFD4-Proteina high |
+|---|---|---|---|---|
+| protein binders (24) | `config-NC.json` | AF3 designs with the target templated, 6 cycles x 100 steps x 3 recycles, 3 restarts, early stop at pTM >= 0.85 and iPAE <= 1.2, internal AF3 check of the top 2 | 37.5% | 19.3% |
+| small-molecule binders (77) | `config-TS2.json` | the same loop with LigandMPNN, no template, the file's 100-155 lengths, **6 restarts, check top 3** | 56.5% | 34.3% |
+| DNA binders (3) | none passes yet | best so far `config-TD3.json`: NA-MPNN, no C/D/E (`omit`), an undocked fold refolded up to 5 seeds (`contactTries`) - docks, does not pass | 0% | 3.5% |
+
+What did not help, measured: the warm start (W0/W1, a null), the target's MSA in place of its template (NM1), Boltz-2
+or Chai-1 as design engine (NH, NG, NX), bigger small-molecule binders (TS1), and on DNA a beam of 3 with a give-up
+(TD1). Untested: 6 restarts on the protein binders, which is what lifted small molecules from 33 to 56.
