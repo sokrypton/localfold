@@ -1072,3 +1072,25 @@ of the top 2) scores 24.1% through the page (`bench.js`, C) and 37.9% natively (
 - **The test running: PI/PF**, the page's own loop on its int5 bundle against the float32 export (`cfg.bundle`, a
   `bench.js`-only override of AF3's registry entry), no warm start, attempts 40-41 on all 24 targets, paired; NCn is
   native on the same attempts. Results: (running)
+
+### The other datasets the paper reports (2026-10-30, night) - running
+
+Besides each benchmark's figure-2 set, `rfd4-paper-data.json` reports a FIXED-target variant (the ligand's or the
+duplex's coordinates given) and, for AME, an UNFIXED-ligand one. RFD4-Proteina high / + Search:
+
+| variant | ours | RFD4 high | + Search | how |
+|---|---|---|---|---|
+| AME, ligand unfixed (`mcsa_37`, "U-" targets) | (running, TA6U) | 15.2% | 19.6% | TA6's recipe; only the atoms that file conditions are inpainted (the tips, and a few ligand atoms) |
+| DNA fixed (`*_structure_context`, "F-") | (running, TD9F) | 2.2% | 4.5% | TD9's recipe; the given duplex inpainted token by token into every design fold |
+| small molecules, ligand fixed ("F-") | (next) | 15.9% | 22.9% | the file's conformer inpainted: a SMILES chain by token, in RDKit's `_smilesAtomOutputOrder`, checked element by element against what AF3 builds; a CCD chain by atom name; fewer than 3 atoms (an ion) unguided |
+| `disco`, ligand fixed | (next) | 45.3% | 52.7% | the same rows, `disco-score.py` |
+| PPI all-atom | - | 16.9% | - | same targets and criterion as `ppi_backbone`; NC's 37.9% is not re-run |
+
+In every variant only the DESIGN folds are guided; the internal check and the evaluation fold free, and the
+criterion is the task's own. `task-score.py` reports each variant against its own dataset and against Search.
+
+- 🔴 **THE DISK FILLED (497 GB, 4.5 MB free)** while the page A/B's browsers each cached the 1.4 GB float32 bundle:
+  native folds failed in the `fold` wrapper (`exit: : numeric argument required` - its `.done` file could not be
+  read), and three result files got truncated lines. Error and truncated rows were dropped and re-run; `~/.cache`
+  was cleared (the user's call; the CCD cache kept, the featuriser reads it every fold) for 33 GB.
+- The page A/B (PI/PF/NCn) was restarted lean, attempts 40-41.

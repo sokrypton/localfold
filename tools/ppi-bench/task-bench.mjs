@@ -307,8 +307,26 @@ async function ligandAtomNames(name, t) {
   return (ligandNames[name] = names);
 }
 
+/** Each ligand chain's atoms in token order, as AF3 builds them: [{name, element}] (the stub fold's PDB, in order). */
+const ligandOrder = {};
+async function ligandAtomsInOrder(name, t) {
+  if (ligandOrder[name] !== undefined) return ligandOrder[name];
+  const r = await fold(t, "GGGGG", { steps: 10, recycles: 0, seed: 11 });
+  const chains = t.chains.map(() => []);
+  for (const line of r.pdb.split("\n")) {
+    if (!line.startsWith("ATOM") && !line.startsWith("HETATM")) continue;
+    const k = "BCDEFGHIJ".indexOf(line[21]);
+    if (k >= 0 && line.slice(76, 78).trim() !== "H") chains[k].push({ name: line.slice(12, 16).trim(), element: line.slice(76, 78).trim() });
+  }
+  return (ligandOrder[name] = chains);
+}
+
 async function attempt(name, index) {
-  const t = tasks[name];
+  // "F-<key>": a small-molecule target with its ligand FIXED (the paper's studio_figure_2c_fixed) - the same task,
+  // the file's conformer inpainted into every design fold
+  const t = tasks[name] ?? (name.startsWith("F-") && tasks[name.slice(2)]?.task === "sm" ? tasks[name.slice(2)] : undefined);
+  if (t === undefined) throw new Error(`no task ${name}`);
+  const fixedLigand = name.startsWith("F-") && t.task === "sm";
   const cfg = config;
   const rng = mulberry(seedOf(`${cfg.pair ?? cfg.tag}:${name}:${index}`));
   // `lengths`: one of a list (the paper's 150/200/250 for a small molecule); `length`: a range; else the file's range
@@ -389,6 +407,26 @@ async function attempt(name, index) {
         ...t.motif.flatMap((m, k) => m.atoms.map(([a, x, y, z]) => `${positions[k]} ${a} ${x} ${y} ${z}`)),
         ...t.chains.flatMap((c, i) => (c.conditioned ?? []).filter(([a]) => built[i].has(a)).map(([a, x, y, z]) => `${-(i + 2)} ${a} ${x} ${y} ${z}`)),
       ].join("\n") + "\n");
+    } else if (fixedLigand) {
+      // the conformer by token: a SMILES chain's atoms are its tokens in SMILES order, checked element by element
+      // against what AF3 built (a mismatch is refused, never guessed past); a CCD chain's by atom name
+      const built = await ligandAtomsInOrder(name, t);
+      const lines = [];
+      t.chains.forEach((c, i) => {
+        if (c.conformer !== undefined) {
+          const got = built[i].map((a) => a.element.toUpperCase()).join(" "), want = c.conformer.map(([e]) => e.toUpperCase()).join(" ");
+          if (got !== want) throw new Error(`${name} chain ${i}: AF3 built ${got} where the conformer is ${want}`);
+          c.conformer.forEach(([, x, y, z], k) => lines.push(`${-(i + 2)} ${built[i][k].name} ${x} ${y} ${z}`));
+        } else {
+          const names = new Set(built[i].map((a) => a.name)), used = new Set();
+          for (const [n, x, y, z] of c.conformerNames ?? []) if (names.has(n) && !used.has(n)) { used.add(n); lines.push(`${-(i + 2)} ${n} ${x} ${y} ${z}`); }
+        }
+      });
+      // (under three atoms - an ion, two coppers - there is no shape to hold, and a fit needs three: unguided)
+      if (lines.length >= 3) {
+        motif = path.join(work, `motif-${process.pid}-${name}-${index}-${restart}.txt`);
+        fs.writeFileSync(motif, lines.join("\n") + "\n");
+      } else unguided = lines.length;
     } else if (t.task === "dna" && t.dnaAtoms !== undefined) {
       // DNA FIXED (the paper's dna_fixed, an "F-" target): the given duplex inpainted into every design fold, token by
       // token - only the atoms AF3 builds (the stub fold's names; a 5' phosphate may be absent); the check and the

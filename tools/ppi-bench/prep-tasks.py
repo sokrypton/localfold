@@ -111,12 +111,19 @@ for key in keys:
         smiles = Chem.MolToSmiles(m)
         # 🔴 A METAL COMPLEX IS GIVEN BY ITS CCD CODE: RDKit writes its coordination as dative bonds, which a SMILES
         # reader need not take, and the dictionary has every one of them
+        xyz = [[float(a[c["Cartn_x"]]), float(a[c["Cartn_y"]]), float(a[c["Cartn_z"]])] for a in atoms]
         metals = {a.GetSymbol() for a in m.GetAtoms()} & {"Fe", "Co", "Cu", "Zn", "Mn", "Ni"}
         if metals:
             codes = CCD[smiles]
-            chains.extend({"kind": "ligand", "ccd": code, "atoms": len(atoms)} for code in codes)
+            # (the file's conformer by atom NAME: the harness gives each name to the code's chain that builds it)
+            named = [[a[c["label_atom_id"]], *p] for a, p in zip(atoms, xyz)]
+            chains.extend({"kind": "ligand", "ccd": code, "atoms": len(atoms), "conformerNames": named} for code in codes)
             continue
-        chains.append({"kind": "ligand", "smiles": smiles, "atoms": len(atoms)})
+        # `conformer`: the file's coordinates in the SMILES's own atom order (RDKit's _smilesAtomOutputOrder), which
+        # is the order a SMILES ligand's atoms become tokens - each with its element, which the harness checks
+        out = json.loads(m.GetProp("_smilesAtomOutputOrder").replace(",]", "]"))
+        chains.append({"kind": "ligand", "smiles": smiles, "atoms": len(atoms),
+                       "conformer": [[m.GetAtomWithIdx(k).GetSymbol(), *xyz[k]] for k in out]})
     tasks[key] = {"task": "sm", "binder": binder_range(c, rows), "chains": chains}
 
 # ame: data/benchmarks/mcsa/mcsa_37_fixed_ligand (the paper's "mcsa_fixed"), unindexed catalytic motifs: each motif
