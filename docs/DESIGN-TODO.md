@@ -939,7 +939,7 @@ active sites, MCSA) - all defined in their `configs/metrics/pass_criteria/all_pa
 |---|---|---|---|---|
 | protein binders | ipTM >= 0.8, min iPAE <= 1.5, binder RMSD <= 2.5 | 19.3% | 37.9% (NC, native, each attempt at its own seed; 24.1% was the page's recipe C) | ahead |
 | small molecules | `sm_binder` (above) | 34.3% | 62.3% (TS7) | ahead |
-| small molecules | `disco`: backbone RMSD <= 2, ligand centroid <= 2 A | 64.7% | **74.7% (TS7, CI 70.8-78.6)** | ahead |
+| small molecules | `disco`: backbone RMSD <= 2, ligand centroid <= 2 A | 64.7% | **81.2% (TS9, CI 76.6-85.1)**; 74.7% (TS7) | ahead |
 | DNA | min iPAE <= 1.5, binder RMSD <= 8 after DNA alignment | 3.5% | 8.3% (TD15), 6.7% (TD9) | ahead, on 4-5 passes |
 | enzyme active sites | `ame` (below) | 14.7% | **21.6% (TA6, all 37 targets, 74 attempts, CI 17.6-25.7), a pass on 11** | ahead |
 
@@ -952,7 +952,7 @@ EVALUATOR's model as the scorer (a different seed), which favours us. So Search 
 |---|---|---|---|
 | protein binders | 37.9% | 19.3% | 28.1% |
 | small molecules | 62.3% | 34.3% | 46.6% |
-| small molecules, `disco` | 74.7% (CI 70.8-78.6) | 64.7% | **76.4%** - level, inside our CI |
+| small molecules, `disco` | **81.2% (TS9, CI 76.6-85.1)** | 64.7% | 76.4% |
 | DNA | 6.7-8.3% | 3.5% | 4.8% |
 | AME | 21.6% | 14.7% | 18.7% |
 
@@ -961,7 +961,9 @@ AME with the ligand unfixed (15.2 / 19.6%), PPI all-atom (16.9%). Per GPU-hour R
 molecules (~5x) and is level on protein binders.
 - **TS9 = TS7 with its internal check on the `disco` criterion** (`criterion: "disco"`: backbone RMSD <= 2 A and every
   ligand centroid within 2 A, the attempt judged the same way): each criterion is its own benchmark, and TS7 was
-  selecting for the stricter sm_binder one. Results: (running, 154)
+  selecting for the stricter sm_binder one. **81.2% (CI 76.6-85.1) over all 77 targets, a pass on 74** (150 of 154
+  attempts; 4 lost to a full disk, re-run); the harness's verdict and `disco-score.py`'s rescoring from the PDBs agree
+  to the digit. Against TS7's 74.7%: selecting on the criterion that is judged is worth ~6 points.
 - **`disco` rescored, nothing refolded** (`disco-score.py`): from each row's own design and refold PDBs, the binder's
   backbone fitted, the largest ligand-chain centroid distance. The paper groups a ligand by connectivity including
   coordination bonds (FE2 + AKG is one molecule there, two chains here); the max over two centroids is never smaller
