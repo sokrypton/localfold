@@ -193,7 +193,9 @@ async function attempt(name, index) {
           return { pdb: r.pdb, confidence: r.confidence, terms: { binderPtm: r.binderPtm, ipae: r.ipae, iptm: r.iptm } };
         },
         design: (pdb, context) => designChain(mpnn, { pdb, chain: context.chain, temperature: context.temperature,
-          omit: context.omit, alanineBias: context.alanineBias, random: context.random, hold: context.hold, kind: context.kind }),
+          omit: context.omit, alanineBias: context.alanineBias, random: context.random, hold: context.hold, kind: context.kind,
+          // `residueBias`: per task, MPNN logits added per letter (a DNA binder pushed toward K/R)
+          ...(cfg.residueBias?.[t.task] === undefined ? {} : { residueBias: cfg.residueBias[t.task] }) }),
       });
       for await (const record of stream) {
         const terms = record.folded.terms;

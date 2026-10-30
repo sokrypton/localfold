@@ -215,7 +215,7 @@ export function designChain(model, options) {
     S: Int32Array.from(structure.S),
     chainMask,
     bias: designBias(structure.chainIds.length, {
-      omit: options.omit, alanineBias: options.alanineBias, alphabet,
+      omit: options.omit, alanineBias: options.alanineBias, residueBias: options.residueBias, alphabet,
       ...(nucleic ? { designs: "nucleic" } : {}),
     }),
   });

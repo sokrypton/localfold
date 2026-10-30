@@ -194,6 +194,13 @@ export function designBias(length, options = {}) {
     // compose, and an omitted A stays omitted whatever the ramp says.
     row[alanine] += options.alanineBias;
   }
+  // `residueBias`: a logit added per letter, e.g. {K: 1, R: 1} for a binder that should come out basic - added,
+  // like the alanine ramp, so an omitted letter stays omitted
+  for (const [letter, value] of Object.entries(options.residueBias ?? {})) {
+    const index = alphabet.indexOf(letter);
+    if (index < 0) throw new Error(`residueBias names ${letter}, which this alphabet does not have`);
+    row[index] += value;
+  }
   for (let position = 0; position < length; position += 1) {
     bias.set(row, position * alphabet.length);
   }
