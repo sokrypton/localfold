@@ -861,7 +861,9 @@ Small molecules, 2 attempts a target (theirs 200), the same attempts in every ar
 | **TS2** | **6 restarts, check top 3** | **36.4% (31.2-41.6)** | **43** |
 | TS3 | 10 restarts, check top 3 (served seed; 101 of 154 re-evaluated) | 48.1% | 41 |
 | TS3f | 10 restarts, check top 3 - on the fixed server, every fold at its own seed | 48.1% (43.5-52.6) | 51 |
-| **TS4** | **TS3f with a 2-seed internal check: a candidate passes only if it passes at two seeds** | **51.9% (47.4-56.5)** | **53** |
+| TS4 | TS3f with a 2-seed internal check: a candidate passes only if it passes at two seeds | 51.9% (47.4-56.5) | 53 |
+| TS6 | TS4 with LigandMPNN at temperature 0.2 (0.1) | 53.2% (48.7-57.8) - a null, 82 against 80 paired | 55 |
+| **TS4 + polish** | **TS4, and where no restart passed: 8 MPNN draws on each of the 2 nearest misses' backbones, the best 3 checked (`polish`)** | **62.3% (57.8-66.9)** | **60** |
 | *RFD4-Proteina high (paper)* | | *34.3%* | *77* |
 | *original Protein Hunter / BoltzGen / DISCO (paper)* | | *0.8% / 4.0% / 2.6%* | |
 
@@ -878,6 +880,9 @@ Small molecules, 2 attempts a target (theirs 200), the same attempts in every ar
   are interface PAE moving across 1.5. **Checking at two seeds** (TS4, `check.seeds`) lifts that to 78% (70 of 90,
   against TS3f's 67 of 103) and the paired pass count 74 -> 80 of 154, for 13% more GPU a attempt (18.1 s against
   16.0) - flat per GPU-hour (104 against 108 pooled).
+- **Polish is the largest single gain after restarts:** run on TS4's 74 failures it rescued 16 (80 -> 96 of 154),
+  at ~11 extra design folds where it ran. Its restarts reproduce TS4's records exactly (seeded, and the fixed server
+  is deterministic at a seed), so TS4 + polish is TS4's passes plus polish's. MPNN temperature 0.2 moved nothing.
 - **Ten restarts on the fixed server, honest: 48-52% against RFD4-Proteina's 34.3%,** a pass on 51-53 of 77 targets
   at two attempts a target. Per GPU-hour it is ~5x behind (104-108 against their 559, A100 against H200).
 - Bigger binders hurt (TS1: 15 passes against T's 19 on the same 67 attempts).

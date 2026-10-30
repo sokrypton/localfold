@@ -41,7 +41,7 @@ The internal check is the evaluator's own model in every row - stated beside eve
 | task | config | what it is | pass rate | RFD4-Proteina high |
 |---|---|---|---|---|
 | protein binders (24) | `config-NC.json` | AF3 designs with the target templated, 6 cycles x 100 steps x 3 recycles, 3 restarts, early stop at pTM >= 0.85 and iPAE <= 1.2, internal AF3 check of the top 2 | 37.5% | 19.3% |
-| small-molecule binders (77) | `config-TS4.json` | the same loop with LigandMPNN, no template, the file's 100-155 lengths, **10 restarts, check the top 3 at two seeds each** | 51.9% (TS2's 6 restarts: 36.4%) | 34.3% |
+| small-molecule binders (77) | `config-TP2.json` | the same loop with LigandMPNN, no template, the file's 100-155 lengths, **10 restarts, check the top 3 at two seeds each, then `polish` the nearest misses** | 62.3% (without polish 51.9%) | 34.3% |
 | DNA binders (3) | none passes yet | best so far `config-TD3.json`: NA-MPNN, no C/D/E (`omit`), an undocked fold refolded up to 5 seeds (`contactTries`) - docks, does not pass | 0% | 3.5% |
 
 What did not help, measured: the warm start (W0/W1, a null), the target's MSA in place of its template (NM1), Boltz-2
