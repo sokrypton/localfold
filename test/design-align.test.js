@@ -90,3 +90,23 @@ describe("putting every cycle of a run in the same place", () => {
     expect(alignToReference(tiny, first, "A")).toBe(tiny);
   });
 });
+
+describe("a small-molecule binder's refold", () => {
+  // SAM's methionine half has an atom named CA. As the design's only "other chain" it offered one alpha carbon, the
+  // fit was skipped, and the refold was drawn in the fold's own frame.
+  const sam = (x) => {
+    const at = (value) => value.toFixed(3).padStart(8);
+    return [
+      `HETATM   90  CA  SAM B   1    ${at(x)}${at(3)}${at(0)}  1.00 80.00           C`,
+      `HETATM   91  SD  SAM B   1    ${at(x + 1.8)}${at(3)}${at(0)}  1.00 80.00           S`,
+    ].join("\n");
+  };
+  const design = pdb(residue("A", 1, 0, 0, 0), residue("A", 2, 4, 1, 0), residue("A", 3, 8, 0, 1), residue("A", 4, 12, 2, 0), sam(6));
+  // The same protein, shifted 20 A: what a fold returns in its own frame.
+  const refold = pdb(residue("A", 1, 20, 0, 0), residue("A", 2, 24, 1, 0), residue("A", 3, 28, 0, 1), residue("A", 4, 32, 2, 0), sam(26));
+
+  it("is fitted on its protein, not left where the fold put it", () => {
+    const fitted = alignToReference(refold, design, "A");
+    expect(rawOffset(fitted, design, "A")).toBeLessThan(1e-3);
+  });
+});

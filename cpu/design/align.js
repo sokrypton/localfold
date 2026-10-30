@@ -23,6 +23,18 @@ import { superimposeCoords3D } from "../../shared/rfd4p/output.js";
 import { alphaCarbons, coordinateAtoms, rewriteCoordinates } from "../../shared/heads/superpose-pdb.js";
 
 /**
+ * Alpha carbons of polymer residues only.
+ *
+ * 🔴 A LIGAND CAN HAVE AN ATOM CALLED CA. SAM's methionine half does, so a
+ * small-molecule binder's "other chains" offered one alpha carbon - the
+ * ligand's - and the refold was left unfitted, drawn in the fold's own frame
+ * beside a design it matched to 0.5 A. HETATM records never hold a fit.
+ */
+function polymerAlphaCarbons(atoms, wanted) {
+  return alphaCarbons(atoms, wanted).filter((index) => !atoms.hetero[index]);
+}
+
+/**
  * `pdb` moved onto `reference`, by whichever chains they share besides `designed`.
  *
  * @param {string} pdb the cycle to move
@@ -38,15 +50,17 @@ export function alignToReference(pdb, reference, designed) {
   // The chains both structures have, minus the one being designed.
   const held = Array.isArray(designed) ? designed : [designed];
   const onto = (chain) => !held.includes(chain);
-  let movingIndices = alphaCarbons(moving, onto);
-  let fixedIndices = alphaCarbons(fixed, onto);
+  let movingIndices = polymerAlphaCarbons(moving, onto);
+  let fixedIndices = polymerAlphaCarbons(fixed, onto);
 
   // 🔴 A MONOMER DESIGN HAS NOTHING ELSE TO HOLD, so it is fitted on itself.
   // That still removes the tumbling, which is the point; what it cannot do is
   // show the chain moving relative to something, because there is nothing.
-  if (movingIndices.length === 0 || fixedIndices.length === 0) {
-    movingIndices = alphaCarbons(moving, () => true);
-    fixedIndices = alphaCarbons(fixed, () => true);
+  // 🔴 FEWER THAN THREE IS NOTHING TOO, not only zero: a fit on one or two atoms
+  // is no fit, and the frame was then left as the fold made it.
+  if (Math.min(movingIndices.length, fixedIndices.length) < 3) {
+    movingIndices = polymerAlphaCarbons(moving, () => true);
+    fixedIndices = polymerAlphaCarbons(fixed, () => true);
   }
 
   // 🔴 AND A FIT NEEDS THE SAME ATOMS ON BOTH SIDES. A cycle whose target lost a
