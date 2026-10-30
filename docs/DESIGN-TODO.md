@@ -941,7 +941,7 @@ active sites, MCSA) - all defined in their `configs/metrics/pass_criteria/all_pa
 | small molecules | `sm_binder` (above) | 34.3% | 62.3% (TS7) | ahead |
 | small molecules | `disco`: backbone RMSD <= 2, ligand centroid <= 2 A | 64.7% | **74.7% (TS7, CI 70.8-78.6)** | ahead |
 | DNA | min iPAE <= 1.5, binder RMSD <= 8 after DNA alignment | 3.5% | 8.3% (TD15), 6.7% (TD9) | ahead, on 4-5 passes |
-| enzyme active sites | `ame` (below) | 14.7% | **22.1% (TA6, 34 of 37 targets, CI 17.6-26.5; RFD4 14.9% on the same 34)** | ahead; >= 20.3% over all 37 even if the 3 reruns fail |
+| enzyme active sites | `ame` (below) | 14.7% | **21.6% (TA6, all 37 targets, 74 attempts, CI 17.6-25.7), a pass on 11** | ahead |
 
 - **`disco` rescored, nothing refolded** (`disco-score.py`): from each row's own design and refold PDBs, the binder's
   backbone fitted, the largest ligand-chain centroid distance. The paper groups a ligand by connectivity including
@@ -1013,8 +1013,8 @@ them - every conditioned atom is coordinate group 0), and no polymer-ligand pair
 - 🔴 M0365, M0663 and M0907 errored on the first design fold: their input conditions a ligand atom AF3's CCD
   component does not build (FBP, RIB and CAP's O1, leaving atoms) and `--motif` refuses an atom it cannot find.
   The harness now folds a stub once a target and guides only the ligand atoms AF3 builds (e3d2219a; only the
-  PROTEIN motif atoms are scored, so this changes nothing judged); the six attempts are being re-run. Even at 0 of 6
-  the 37-target mean is 20.3%.
+  PROTEIN motif atoms are scored, so this changes nothing judged); the six attempts re-run: **all 37 targets, 21.6% (CI 17.6-25.7),
+  a pass on 11, against RFD4-Proteina high's 14.7%.**
 
 **DNA held in a fixed frame, TD17.** The DNA benchmark gives the duplex as SEQUENCE only (`*_sequence_context`,
 coordinates zero; `*_structure_context` is the fixed variant only BoltzGen and RFD3 ran, at 0.8%), so every design
