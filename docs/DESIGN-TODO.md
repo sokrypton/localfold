@@ -997,7 +997,14 @@ them - every conditioned atom is coordinate group 0), and no polymer-ligand pair
   MPNN draws with the matched residues held, each folded free and matched again, the best kept when closer
   (motif RMSD, then interface PAE); every structure reached is a check candidate. Smoke test M0097: 3.5 -> 1.28 A in
   two generations. With no passing check the submitted design is now the nearest to passing, never a guided one.
-  Results: (running, 37 x 1)
+  Results so far: 0 of 6 on the alphabetically first (mostly hard) targets. The climb does not rescue a large motif
+  - it starts 5-8 A off on M0050/M0058/M0078 and never improves; it reached 1.37 A once on M0040 (check 2.43).
+- **TA5 final on RFD4-Proteina's eight best targets: 3 of 8** (M0630, M0097, M0710) against their 39% mean there.
+- **TA7 = TA6 + `mpnnMsa` (the user's idea): an alignment of MPNN's own draws** - 32 sequences off the previous
+  cycle's backbone at temperature 0.3, the motif held - handed to AF3 as the binder's unpaired MSA in every guided
+  design fold, its depth falling linearly to none at the last cycle so the run ends single-sequence, as it is
+  judged. Probes, checks and the evaluation stay single-sequence. Run in RFD4-Proteina's per-target order, best
+  first. Results: (running)
 
 **DNA held in a fixed frame, TD17.** The DNA benchmark gives the duplex as SEQUENCE only (`*_sequence_context`,
 coordinates zero; `*_structure_context` is the fixed variant only BoltzGen and RFD3 ran, at 0.8%), so every design

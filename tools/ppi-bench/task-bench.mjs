@@ -47,10 +47,12 @@ const seedOf = (text) => createHash("sha1").update(text).digest().readUInt32LE(0
 const LETTERS = "ABCDEFGHIJ";
 
 /** One native fold of [binder, ...the task's chains] from an AF3 job; the structure and the paper's terms. */
-async function fold(t, binder, { steps, recycles, seed, motif }) {
+async function fold(t, binder, { steps, recycles, seed, motif, msa }) {
   const file = path.join(work, `f${process.pid}-${Date.now()}.pdb`);
   const job = file.replace(".pdb", ".json");
-  const sequences = [{ protein: { id: "A", sequence: binder } }, ...t.chains.map((c, i) => {
+  // `msa`: sequences handed to AF3 as the binder's unpaired alignment (mpnnMsa); none, a single-sequence fold
+  const alignment = msa === undefined ? {} : { unpairedMsa: [`>query\n${binder}`, ...msa.map((m, k) => `>mpnn${k}\n${m}`)].join("\n") + "\n", pairedMsa: "" };
+  const sequences = [{ protein: { id: "A", sequence: binder, ...alignment } }, ...t.chains.map((c, i) => {
     const id = LETTERS[i + 1];
     if (c.kind === "dna") return { dna: { id, sequence: c.sequence } };
     return { ligand: c.ccd !== undefined ? { id, ccdCodes: [c.ccd] } : { id, smiles: c.smiles } };
@@ -308,6 +310,17 @@ async function attempt(name, index) {
     // `guideCycles`: only cycles before it are inpainted; the rest fold free, and only a free cycle can be checked -
     // a guided fold's motif agreement is the guide's, not the sequence's
     const guidedAt = (cycle) => cfg.guideCycles === undefined || cycle < cfg.guideCycles;
+    // `mpnnMsa` {depth, temperature}: a design fold's alignment, MPNN's own draws off the previous cycle's backbone
+    // (the motif held) at a higher temperature - `depth` of them after cycle 0, falling linearly to none at the last
+    // cycle, so the run leans on the alignment early and ends single-sequence, as it is judged
+    const mpnnMsaAt = (context) => {
+      if (cfg.mpnnMsa === undefined || context.previous === undefined) return undefined;
+      const n = Math.round(cfg.mpnnMsa.depth * (1 - context.cycle / Math.max(1, cfg.cycles - 1)));
+      if (n <= 0) return undefined;
+      const random = mulberry(seedOf(`msa:${name}:${index}:${restart}:${context.cycle}`));
+      return Array.from({ length: n }, () => designChain(mpnn, { pdb: context.previous, chain: "A",
+        temperature: cfg.mpnnMsa.temperature, omit: cfg.omit?.[t.task] ?? "C", random, kind: "protein", hold: positions }).sequence);
+    };
     if (t.task === "ame") {
       const gap = cfg.motifGap ?? 4, edge = cfg.motifEdge ?? 8;
       for (let tries = 0; ; tries += 1) {
@@ -358,7 +371,7 @@ async function attempt(name, index) {
             const ef2 = cfg.designEngine === "ef2" || (cfg.ef2Cycles !== undefined && context.cycle < cfg.ef2Cycles);
             r = ef2 ? await foldEf2(t, sequence, { seed: s })
               : await fold(t, sequence, { steps: cfg.steps, recycles: cfg.recycles, seed: s,
-                motif: guidedAt(context.cycle) ? motif : undefined });
+                motif: guidedAt(context.cycle) ? motif : undefined, msa: mpnnMsaAt(context) });
             if (contactProblem(r.pdb, { chain: "A" }) === null) { docked = true; break; }
           }
           foldSeconds += (Date.now() - t0) / 1000;
