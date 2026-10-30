@@ -1004,6 +1004,8 @@ coordinates zero; `*_structure_context` is the fixed variant only BoltzGen and R
 fold made its own duplex and MPNN designed against a different one each cycle. TD17 = TD9 + `dnaFrame`: the duplex
 folded once per target from its sequence alone (beside a 5-residue stub; no information the unfixed input lacks),
 then inpainted into every design fold token by token. Checks and evaluation fold free. Same 60 attempts as TD9.
-- Results: (running)
-- Next if it helps: `--motif-until` (release the frame for the last steps, so the design agrees better with a free
+- **0 of 10, stopped** (TD9 1 of the same 10). Docking unchanged: 11 of 92 design cycles at interface PAE < 5
+  against TD9's 17 of 113. A fixed duplex is not what keeps the binder off it.
+- **TD16 (TD9 + beam 3): 0 of 18, stopped** (TD9 2 of the same 18).
+- Not tried, if DNA is revisited: `--motif-until` (release the frame for the last steps, so the design agrees better with a free
   refold), a partial pull, and holding only the part of the target the binder does not touch.
