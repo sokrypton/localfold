@@ -56,7 +56,7 @@ def chain_sequence(pdb, chain):
     return out
 
 
-def job(sequences, ligands=(), modifications=None):
+def job(sequences, ligands=(), modifications=None, seed=1):
     """AlphaFold 3 JSON as web/job-json.js writes it for these rows."""
     entries, ids = [], iter("ABCDEFGHIJ")
     for index, sequence in enumerate(sequences):
@@ -67,7 +67,7 @@ def job(sequences, ligands=(), modifications=None):
     for code in ligands:
         # a CCD code, or {"smiles": ...} - a structure the page builds with shared/chem
         entries.append({"ligand": {"id": next(ids), **(code if isinstance(code, dict) else {"ccdCodes": [code]})}})
-    return json.dumps({"name": "check", "modelSeeds": [1], "sequences": entries, "dialect": "alphafold3", "version": 1})
+    return json.dumps({"name": "check", "modelSeeds": [seed], "sequences": entries, "dialect": "alphafold3", "version": 1})
 
 
 BIOTIN = "OC(=O)CCCC[C@@H]1SC[C@@H]2NC(=O)N[C@H]12"
@@ -126,6 +126,9 @@ def cases(offline):
         # case (cuda/*/gate.py) cannot see any of them
         ("af3 6mrr again (the resident server, after other jobs)", {"family": "af3", "controls": controls(),
          "entities": [protein(S6)], "job": job([S6]), "samePdbAs": "af3 6mrr"}, (f"{FIX}/6mrr-crystal.pdb", "A"), 1.0, 68, None),
+        # 🔴 ...AND THE SAME JOB AT ANOTHER SEED MUST NOT (the page writes its Random seed as the job's modelSeeds)
+        ("af3 6mrr at seed 2 (the resident server)", {"family": "af3", "controls": controls(**{"random-seed": "2"}),
+         "entities": [protein(S6)], "job": job([S6], seed=2), "otherPdbThan": "af3 6mrr"}, (f"{FIX}/6mrr-crystal.pdb", "A"), 1.0, 68, None),
         ("af2 monomer 6mrr", {"family": "monomer", "controls": controls(**{"model-family": "monomer", "af2Model": "1"}),
          "entities": [protein(S6)], "job": job([S6])}, (f"{FIX}/6mrr-crystal.pdb", "A"), 2.5, 68, None),
         ("af2 monomer 6mrr, stopping early at 0.5 A", {"family": "monomer",
@@ -519,6 +522,7 @@ def main():
         expected_bonds = payload.pop("ligandBonds", None)
         samples = payload.pop("samples", None)
         same_as = payload.pop("samePdbAs", None)
+        other_than = payload.pop("otherPdbThan", None)
         if payload.get("bioemu2Frame") == "previous":
             payload["bioemu2Frame"] = previous
         started = time.time()
@@ -557,6 +561,8 @@ def main():
         folded[name] = result.get("samples") or [previous]
         if same_as is not None and folded[name] != folded.get(same_as):
             problems.append(f"not the same structures as {same_as!r}")
+        if other_than is not None and folded[name] == folded.get(other_than):
+            problems.append(f"the same structures as {other_than!r} at another seed")
         if payload["family"] == "bioemu2":
             n = len((result.get("tokens") or {}).get("chainIds") or [])
             got = result.get("samples") or []

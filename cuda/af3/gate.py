@@ -110,6 +110,32 @@ def run(name, model, inputs, fold, ref, codes=None):
     return got
 
 
+def served_seeds():
+    """🔴 A RESIDENT SERVER MUST FOLD A JOB AT THAT JOB'S --seed: it parsed the flag and then folded at its own
+    start-up seed, so two folds of one input at two seeds were one fold (fixed 2026-10-30). Every case above runs
+    in a fresh process and cannot see it. Returns a problem, or None."""
+    fold = os.path.join(HERE, "fold")
+    # (`--serve` itself says whether one was up: a stopped server's pid file outlives it, and folds with no server
+    # behind them run in fresh processes, where the seed always worked - which is how this case first passed on
+    # the broken binary)
+    up = "already serving" in subprocess.run([fold, "--serve"], check=True, capture_output=True, text=True).stdout
+    try:
+        out = {}
+        for tag, seed in (("a", 1), ("b", 2), ("c", 1)):
+            pdb = os.path.join(TMP, f"served-seed-{tag}.pdb")
+            subprocess.run([fold, pdb, f"--sequence={SEQ_6MRR}", "--", "--steps=25", f"--seed={seed}"],
+                           check=True, capture_output=True)
+            out[tag] = [l for l in open(pdb) if l.startswith("ATOM")]
+        if out["a"] == out["b"]:
+            return "seeds 1 and 2 folded the same structure on the resident server"
+        if out["a"] != out["c"]:
+            return "seed 1 folded twice on the resident server came back different"
+        return None
+    finally:
+        if not up:
+            subprocess.run([fold, "--stop"], capture_output=True)
+
+
 def main():
     write = "--write" in sys.argv
     only = next((a.split("=", 1)[1].split(",") for a in sys.argv if a.startswith("--only=")), None)
@@ -139,6 +165,11 @@ def main():
         line = (f"{name:22s} " + (f"{rmsd}pLDDT {got['plddt']:6.2f}  pTM {got['ptm']:>6s}  {extra}"
                                    f"{got['ms']:7.1f} ms  " if "error" not in got else "") + verdict)
         print(line, flush=True)
+    if not only or "served" in only:
+        os.makedirs(TMP, exist_ok=True)
+        problem = served_seeds()
+        print(f"{'served seeds':22s} " + ("ok" if problem is None else "FAILED: " + problem), flush=True)
+        failed += problem is not None
     if write:
         json.dump(base, open(BASELINE, "w"), indent=1, sort_keys=True)
         print(f"wrote {BASELINE}")

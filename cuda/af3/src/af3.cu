@@ -190,6 +190,10 @@ static int foldMain(int argc, char** argv) {
     if (!setS) samples = 5;
   }
   const uint64_t seedArg = seed;
+  // 🔴 THE SEED A FOLD RUNS WITH, which a served job sets: runInput read `seedArg` - the server's own start-up
+  // seed - so every job's --seed was parsed and then ignored, and two folds of one input at two seeds were one
+  // fold (2026-10-30: a benchmark's internal check and its "independent" evaluation came out byte-identical)
+  uint64_t seedNow = seedArg;
   const std::string seedsArg0 = seedsArg;
   std::vector<uint64_t> seedList;
   if (getenv("FLASH_WARPS")) FLASH_WARPS_OVERRIDE = atoi(getenv("FLASH_WARPS"));   // experiments
@@ -246,7 +250,7 @@ static int foldMain(int argc, char** argv) {
   if (inputs.size() > 1) out = outs[which];
   { const float* sm = M.f("batch.seqMask"); size_t k = M.len("batch.seqMask"); MASK_ALL_ONES = true;
     for (size_t i = 0; i < k; ++i) if (!(sm[i] > 0)) MASK_ALL_ONES = false; }
-  seed = !seedGiven && M.has("job.seed") ? (uint64_t)M.meta("job.seed") : seedArg;   // the job's own modelSeeds[0]
+  seed = !seedGiven && M.has("job.seed") ? (uint64_t)M.meta("job.seed") : seedNow;   // the job's own modelSeeds[0]
   // --seeds=a,b,c, else the job's modelSeeds, else the one seed: AlphaFold 3 runs every seed, each
   // with its samples, and ranks them all (each seed its own trunk where its MSA rows are drawn - an alignment deeper
   // than a pass reads: seedGroups below - else one trunk serves every seed and a seed costs a diffusion and a confidence)
@@ -1163,7 +1167,7 @@ static int foldMain(int argc, char** argv) {
         else if (!f.compare(0, 7, "--seed=")) { seed = strtoull(f.c_str() + 7, nullptr, 10); jobSeed = true; }
         else if (!f.compare(0, 8, "--seeds=")) seedsArg = f.substr(8);
       }
-      seedGiven = jobSeed;
+      seedGiven = jobSeed; seedNow = jobSeed ? seed : seedArg;
       inputs = {input}; outs = {out};
       int seg = (int)M.segs.size();
       int code = runInput(0);

@@ -104,6 +104,26 @@ function verdict(task, designPdb, r) {
   return { rmsd, ligandRmsd, pass: r.iptm >= 0.8 && r.ipae <= 1.5 && rmsd <= 1.5 && ligandRmsd <= 5 };
 }
 
+/** `minFootprint`: a design must touch at least that many residues of the other chains (heavy atoms within 4.5 A) -
+ * on a 10-bp duplex a binder that grips one end or three bases moves 15-40 A on refolding, one that spans both
+ * strands holds its pose. */
+function footprintProblem(pdb) {
+  if (config.minFootprint === undefined) return null;
+  const binder = [], other = new Map();
+  for (const line of pdb.split("\n")) {
+    if (!line.startsWith("ATOM") && !line.startsWith("HETATM")) continue;
+    if (line.slice(76, 78).trim() === "H") continue;
+    const xyz = [+line.slice(30, 38), +line.slice(38, 46), +line.slice(46, 54)];
+    if (line[21] === "A") binder.push(xyz);
+    else { const k = line.slice(21, 26); if (!other.has(k)) other.set(k, []); other.get(k).push(xyz); }
+  }
+  let touched = 0;
+  for (const atoms of other.values()) {
+    if (atoms.some((a) => binder.some((b) => (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2 < 4.5 ** 2))) touched += 1;
+  }
+  return touched >= config.minFootprint ? null : `footprint ${touched} residues, needs ${config.minFootprint}`;
+}
+
 async function attempt(name, index) {
   const t = tasks[name];
   const cfg = config;
@@ -136,7 +156,7 @@ async function attempt(name, index) {
         seed: seed + 101 * restart, signal: controller.signal, kind: "protein", beam: cfg.beam ?? 1,
         // `omit`: letters MPNN may never write, per task (a DNA binder without D/E is basic) - the loop's own default is "C"
         ...(cfg.omit?.[t.task] === undefined ? {} : { omit: cfg.omit[t.task] }),
-        veto: ({ pdb }) => contactProblem(pdb, { chain: "A" }),
+        veto: ({ pdb }) => contactProblem(pdb, { chain: "A" }) ?? footprintProblem(pdb),
         fold: async (sequence, context) => {
           const t0 = Date.now();
           // `contactTries`: a fold that leaves the binder off the target is folded again with the next seed, up to
@@ -144,7 +164,7 @@ async function attempt(name, index) {
           let r;
           for (let k = 0; k < (cfg.contactTries ?? 1); k += 1) {
             r = await fold(t, sequence, { steps: cfg.steps, recycles: cfg.recycles, seed: seed + 101 * restart + 13 * context.cycle + 7919 * k });
-            if (contactProblem(r.pdb, { chain: "A" }) === null) break;
+            if ((contactProblem(r.pdb, { chain: "A" }) ?? footprintProblem(r.pdb)) === null) break;
           }
           foldSeconds += (Date.now() - t0) / 1000;
           return { pdb: r.pdb, confidence: r.confidence, terms: { binderPtm: r.binderPtm, ipae: r.ipae, iptm: r.iptm } };
@@ -179,10 +199,37 @@ async function attempt(name, index) {
       break;
     }
   }
+  // `polish`: when no restart produced a passing check, redesign around the NEAREST misses instead of from scratch -
+  // `draws` MPNN sequences on each of the `from` closest checked candidates' design backbones, each folded at the
+  // design settings, and the best `top` of them (by design iPAE, under the check's thresholds) checked in turn
+  const margin = (r) => Math.max(r.ipae / 1.5, t.task === "dna" ? r.rmsd / 8 : Math.max(r.rmsd / 1.5, r.ligandRmsd / 5, 0.8 / Math.max(r.iptm, 1e-3)));
+  let polished = 0;
+  if (cfg.polish !== undefined && !checked.some((c) => c.result.pass)) {
+    const near = [...checked].sort((a, b) => margin(a.result) - margin(b.result)).slice(0, cfg.polish.from);
+    const pool = [];
+    for (const [n, c] of near.entries()) {
+      for (let k = 0; k < cfg.polish.draws; k += 1) {
+        const random = mulberry(seedOf(`polish:${name}:${index}:${n}:${k}`));
+        const designed = designChain(mpnn, { pdb: c.entry.pdb, chain: "A", temperature: cfg.polish.temperature ?? 0.1,
+          omit: cfg.omit?.[t.task] ?? "C", random, kind: "protein" });
+        const r = await fold(t, designed.sequence, { steps: cfg.steps, recycles: cfg.recycles, seed: seed + 50000 + 97 * n + k });
+        polished += 1;
+        records.push({ restart: -1, cycle: n, polish: k, ipae: r.ipae, iptm: r.iptm, binderPtm: r.binderPtm });
+        const alanine = [...designed.sequence].filter((x) => x === "A").length / designed.sequence.length;
+        if (alanine <= 0.2 && (contactProblem(r.pdb, { chain: "A" }) ?? footprintProblem(r.pdb)) === null) pool.push({ ipae: r.ipae, iptm: r.iptm, binderPtm: r.binderPtm, restart: -1, cycle: n, sequence: designed.sequence, pdb: r.pdb });
+      }
+    }
+    for (const entry of pool.filter(promisingOf).sort((a, b) => a.ipae - b.ipae).slice(0, cfg.polish.top)) {
+      const result = await assess(entry.sequence, entry.pdb, seed * 7 + 777 + checked.length);
+      checked.push({ entry, result });
+      eligible.push(entry);
+      if (result.pass) break;
+    }
+  }
   const chosen = checked.find((c) => c.result.pass) ?? null;
   const best = chosen !== null ? chosen.entry
     : eligible.length > 0 ? eligible.reduce((a, b) => (b.ipae < a.ipae ? b : a)) : null;
-  const row = { target: name, task: t.task, attempt: index, length, config: cfg.tag, runs, records, foldSeconds,
+  const row = { target: name, task: t.task, attempt: index, length, config: cfg.tag, runs, polished, records, foldSeconds,
     checks: checked.map((c) => ({ restart: c.entry.restart, cycle: c.entry.cycle, ipae: c.result.ipae, iptm: c.result.iptm,
       rmsd: c.result.rmsd, ligandRmsd: c.result.ligandRmsd, pass: c.result.pass })) };
   if (best !== null) {
@@ -198,7 +245,31 @@ async function attempt(name, index) {
   return row;
 }
 
+// --rescore <rows.jsonl>: every submitted design evaluated again at its own evaluation seed (the attempt's seeded
+// draw) - for rows whose evaluation ran on a server that ignored the job's seed (fixed 2026-10-30; see af3.cu)
+async function rescore(rowsPath) {
+  for (const line of fs.readFileSync(rowsPath, "utf8").split("\n").filter(Boolean)) {
+    const d = JSON.parse(line);
+    if (done.has(`${d.target}:${d.attempt}`) || d.error) continue;
+    const t = tasks[d.target];
+    const rng = mulberry(seedOf(`${config.pair ?? config.tag}:${d.target}:${d.attempt}`));
+    rng();
+    const evalSeed = 1 + Math.floor(rng() * 2 ** 30);
+    const row = { target: d.target, task: d.task, attempt: d.attempt, config: d.config, rescored: true,
+      served: { ipae: d.ipae, iptm: d.iptm, rmsd: d.rmsd, ligandRmsd: d.ligandRmsd, pass: d.pass } };
+    if (d.binder) {
+      const r = await fold(t, d.binder, { steps: 200, recycles: 5, seed: evalSeed });
+      Object.assign(row, { binder: d.binder, binderPtm: r.binderPtm, ipae: r.ipae, iptm: r.iptm, ...verdict(t.task, d.designPdb, r) });
+    } else {
+      row.pass = false;
+    }
+    fs.appendFileSync(out, JSON.stringify(row) + "\n");
+    console.log(d.target, d.attempt, d.pass, "->", row.pass, row.ipae?.toFixed?.(2), row.rmsd?.toFixed?.(2));
+  }
+}
+
 try {
+  if (jobs[0] === "--rescore") { await rescore(jobs[1]); jobs.length = 0; }
   for (const job of jobs) {
     if (done.has(job)) continue;
     const [name, index] = job.split(":");
