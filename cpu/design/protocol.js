@@ -19,9 +19,10 @@
  * page's own refold: a check that passes here is a check at the evaluator's thresholds, read off the page's AF3.
  */
 import { weightedRigidAlign } from "../af3/diffusion/rigid-align.js";
+import { motifTerms } from "./motif.js";
 
-/** Which confidence number each criterion reads beside the interface PAE (DNA's reads none). */
-const CONFIDENCE = { ppi: "binderPtm", sm: "iptm", dna: null };
+/** Which confidence number each criterion reads beside the interface PAE (DNA's and AME's read none). */
+const CONFIDENCE = { ppi: "binderPtm", sm: "iptm", dna: null, ame: null };
 
 /**
  * The winning recipes. `stop` ends a restart on a design cycle this confident; `check` refolds a restart's `top`
@@ -51,13 +52,42 @@ export const PROTOCOLS = {
     check: { top: 3, confidence: 0.8, ipae: 2.5 },
     polish: { from: 2, draws: 8, top: 3 },
   },
+  // TS7F: 50.6% against 22.9% (studio_figure_2c_fixed) - TS7 with the given conformer inpainted into every design
+  // fold to the last step; and 64.9% against 52.7% by the disco criterion
+  smFixed: {
+    tag: "TS7F", criterion: "sm", cycles: 6, steps: 100, recycles: 3, restarts: 10, temperature: 0.2,
+    designer: "ligand", guide: true,
+    stop: { confidence: 0.85, ipae: 1.2 },
+    check: { top: 3, confidence: 0.8, ipae: 2.5, seeds: 2 },
+    polish: { from: 2, draws: 8, top: 3, temperature: 0.2 },
+  },
+  // TD18F: the one variant still level with RFD4 + Search (2 of 52 against 4.5%; TD9F, the guide held to the last
+  // step, was 0 of 60) - TD15 with the given duplex inpainted and released below sigma 1 (`guideUntil`)
+  dnaFixed: {
+    tag: "TD18F", criterion: "dna", cycles: 6, steps: 100, recycles: 3, restarts: 10, omit: "CDE",
+    designer: "ligand", foldTries: 5, stick: true, minFootprint: 8, guide: true, guideUntil: 1.0,
+    stop: { confidence: 0.85, ipae: 1.2 },
+    check: { top: 3, confidence: 0.8, ipae: 2.5 },
+    polish: { from: 2, draws: 8, top: 3 },
+  },
+  // TA6: 21.6% against 18.7% (mcsa_fixed), 20.3% against 19.6% (mcsa_unfixed) - the motif and the ligand inpainted,
+  // released below sigma 1; every design folded again unguided (`probe`) and the motif found in it unindexed, which
+  // is what a cycle is judged and checked by; and a hill-climb on motif RMSD when no restart passed
+  ame: {
+    tag: "TA6", criterion: "ame", cycles: 6, steps: 100, recycles: 3, restarts: 10, designer: "ligand",
+    guide: true, guideUntil: 1.0, probe: true,
+    stop: { ipae: 1.2, motif: 1.0 },
+    check: { top: 3, ipae: 2.5, motif: 1.5 },
+    climb: { from: 3, gens: 6, draws: 6, top: 3 },
+  },
 };
 
 /**
  * The recipe for a job, from what it carries besides the designed chain.
  *
- * @param {{ligands?: number, nucleic?: number, partners?: number, designs?: string}} contents ligands, DNA/RNA
- *   chains and other chains of any kind beside the designed one, and what the designed chain is made of
+ * @param {{ligands?: number, nucleic?: number, partners?: number, designs?: string, motif?: number,
+ *   fixed?: boolean}} contents ligands, DNA/RNA chains and other chains of any kind beside the designed one, what the
+ *   designed chain is made of, how many held structure residues it carries, and whether coordinates are held
  * @returns {{protocol: object|null, why: string}} null with the reason where no recipe applies
  */
 export function protocolFor(contents = {}) {
@@ -67,8 +97,23 @@ export function protocolFor(contents = {}) {
   if ((contents.ligands ?? 0) > 0 && (contents.nucleic ?? 0) > 0) {
     return { protocol: null, why: "a ligand and a DNA chain together: no benchmark measured that combination" };
   }
-  if ((contents.ligands ?? 0) > 0) return { protocol: PROTOCOLS.sm, why: "a ligand is present" };
-  if ((contents.nucleic ?? 0) > 0) return { protocol: PROTOCOLS.dna, why: "a DNA or RNA chain is present" };
+  // 🔴 A HELD MOTIF IS ONLY A BENCHMARK WITH A LIGAND BESIDE IT (AME): scaffolding alone was never measured, and the
+  // AME criterion reads an interface - and its motif has to be held, or there is nothing to score it against
+  if ((contents.motif ?? 0) > 0) {
+    if ((contents.ligands ?? 0) === 0) {
+      return { protocol: null, why: "a motif with no ligand: only enzyme design (AME, a motif around a ligand) was benchmarked" };
+    }
+    if (!contents.fixed) return { protocol: null, why: "a motif is judged against its coordinates: turn on Hold coordinates" };
+    return { protocol: PROTOCOLS.ame, why: "a motif is held around a ligand" };
+  }
+  if ((contents.ligands ?? 0) > 0) {
+    return contents.fixed ? { protocol: PROTOCOLS.smFixed, why: "a ligand is held where the structure has it" }
+      : { protocol: PROTOCOLS.sm, why: "a ligand is present" };
+  }
+  if ((contents.nucleic ?? 0) > 0) {
+    return contents.fixed ? { protocol: PROTOCOLS.dnaFixed, why: "the DNA is held where the structure has it" }
+      : { protocol: PROTOCOLS.dna, why: "a DNA or RNA chain is present" };
+  }
   if ((contents.partners ?? 0) > 0) return { protocol: PROTOCOLS.ppi, why: "the target is protein" };
   return { protocol: null, why: "there is nothing to bind: a search judges an interface" };
 }
@@ -102,10 +147,14 @@ export function interfaceTerms(fold, chainIndex = 0) {
   return { ipae, binderPtm: fold.confidence.chainPtm[String(binder)], iptm };
 }
 
-/** Is a cycle with these terms confident enough for `bound` ({confidence, ipae}) under `criterion`? */
+/**
+ * Is a cycle with these terms confident enough for `bound` ({confidence, ipae, motif?}) under `criterion`? A `motif`
+ * bound also wants the motif within that RMSD and no clash (AME).
+ */
 export function confident(terms, bound, criterion) {
   const key = CONFIDENCE[criterion];
   if (key === undefined) throw new Error(`no criterion ${criterion}`);
+  if (bound.motif !== undefined && !(terms.motifRmsd <= bound.motif && terms.clashes === 0)) return false;
   return terms.ipae <= bound.ipae && (key === null || terms[key] >= bound.confidence);
 }
 
@@ -152,19 +201,28 @@ function fittedRmsd(fitDesign, fitRefold, measureDesign, measureRefold) {
  *
  * ppi: binder pTM >= 0.8, interface PAE <= 1.5, binder backbone RMSD <= 2.5 after fitting the target's backbone.
  * sm: ipTM >= 0.8, interface PAE <= 1.5, binder backbone RMSD <= 1.5 (self-fitted), ligand RMSD <= 5 after the
- * binder's fit. dna: interface PAE <= 1.5, binder backbone RMSD <= 8 after fitting the DNA.
+ * binder's fit. dna: interface PAE <= 1.5, binder backbone RMSD <= 8 after fitting the DNA. ame: interface PAE < 1.5,
+ * binder backbone RMSD <= 2, the motif's atoms within 1.5 A of their target (self-superposed), no clash in the design.
  *
  * @param {"ppi"|"sm"|"dna"} criterion
  * @param {string} designPdb
  * @param {string} refoldPdb
  * @param {{ipae: number, binderPtm: number, iptm: number}} terms the refold's interfaceTerms
  * @param {string} [chain="A"] the designed chain's letter
+ * @param {{motif: object[], positions: number[]}} [held] AME: the motif and where it sits in the design
  * @returns {{pass: boolean, margin: number, rmsd: number, ligandRmsd?: number}} `margin` is the largest of the
  *   ratios to each threshold - under 1 passes - which orders near misses
  */
-export function verdict(criterion, designPdb, refoldPdb, terms, chain = "A") {
+export function verdict(criterion, designPdb, refoldPdb, terms, chain = "A", held = undefined) {
   const d = atomsOf(designPdb, chain, criterion === "ppi");
   const r = atomsOf(refoldPdb, chain, criterion === "ppi");
+  if (criterion === "ame") {
+    if (held === undefined) throw new Error("the AME criterion needs the motif and its positions");
+    const rmsd = fittedRmsd(d.binder, r.binder, d.binder, r.binder);
+    const m = motifTerms(held.motif, held.positions, designPdb, refoldPdb, chain);
+    const margin = Math.max(terms.ipae / 1.5, rmsd / 2, m.motifRmsd / 1.5, m.clashes > 0 ? 2 : 0);
+    return { rmsd, ...m, margin, pass: terms.ipae < 1.5 && rmsd <= 2 && m.motifRmsd <= 1.5 && m.clashes === 0 };
+  }
   if (criterion === "ppi") {
     const rmsd = fittedRmsd(d.rest, r.rest, d.binder, r.binder);
     const margin = Math.max(terms.ipae / 1.5, rmsd / 2.5, 0.8 / Math.max(terms.binderPtm, 1e-3));

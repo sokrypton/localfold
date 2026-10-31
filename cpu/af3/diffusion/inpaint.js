@@ -28,15 +28,19 @@ function nameAt(chars, slot) {
  * A motif's entries as dense slots of `batch` and their target coordinates.
  *
  * @param {object} batch the featurised batch (asymId, refAtomNameChars, predDenseAtomMask, shape)
- * @param {{token: number, atom: string, xyz: number[]}[]} entries
- * @returns {{slots: Int32Array, xyz: Float32Array}}
+ * 🔴 AN `optional` ENTRY THAT NAMES NO ATOM IS LEFT OUT AND COUNTED, NEVER GUESSED: a structure's ligand carries
+ * leaving atoms AF3's component drops (FBP's O1) and a strand's 5' phosphate may be absent, so a guide read off a
+ * deposited structure names atoms the fold does not have. Two matches are still refused, optional or not.
+ *
+ * @param {{token: number, atom: string, xyz: number[], optional?: boolean}[]} entries
+ * @returns {{slots: Int32Array, xyz: Float32Array, dropped: number}}
  */
 export function motifSlots(batch, entries) {
   const tokens = batch.asymId.length;
   const dense = batch.predDenseAtomMask.length / tokens;
-  const slots = new Int32Array(entries.length);
-  const xyz = new Float32Array(entries.length * 3);
-  entries.forEach(({ token, atom, xyz: at }, index) => {
+  const kept = [];
+  let dropped = 0;
+  entries.forEach(({ token, atom, xyz: at, optional }) => {
     if (token >= tokens) throw new Error(`a motif names token ${token} of ${tokens}`);
     const found = [];
     for (let t = token >= 0 ? token : 0; t < (token >= 0 ? token + 1 : tokens); t += 1) {
@@ -46,15 +50,18 @@ export function motifSlots(batch, entries) {
         if (batch.predDenseAtomMask[slot] && nameAt(batch.refAtomNameChars, slot) === atom) found.push(slot);
       }
     }
+    if (found.length === 0 && optional === true) { dropped += 1; return; }
     if (found.length !== 1) {
       throw new Error(`a motif names ${token >= 0 ? `token ${token}` : `chain ${-token}`}'s ${atom}, `
         + `which is ${found.length} atoms of the input`);
     }
-    slots[index] = found[0];
-    xyz.set(at, index * 3);
+    kept.push({ slot: found[0], at });
   });
-  if (slots.length < 3) throw new Error(`a motif of ${slots.length} atoms: a rigid fit needs three`);
-  return { slots, xyz };
+  if (kept.length < 3) throw new Error(`a motif of ${kept.length} atoms: a rigid fit needs three`);
+  const slots = Int32Array.from(kept.map((entry) => entry.slot));
+  const xyz = new Float32Array(kept.length * 3);
+  kept.forEach((entry, index) => xyz.set(entry.at, index * 3));
+  return { slots, xyz, dropped };
 }
 
 /**

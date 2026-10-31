@@ -165,6 +165,18 @@ The style IS index.html's: py2Dmol's light application CSS plus web/localfold.cs
                                 <option value="recipe">Benchmark recipe</option>
                             </select>
                         </div>
+                        <!-- 🔴 HOLD (2026-10-31): the loaded structure's ligands, kept DNA strands and the motif residues
+                             inside the designed chain inpainted into every design fold (cpu/design/motif.js,
+                             cpu/af3/diffusion/inpaint.js) - the fixed-target and enzyme benchmarks' input. The check
+                             and the refold still fold free. -->
+                        <div class="fetch-option-group" id="holdGroup">
+                            <label class="fetch-option-title" for="hold-coordinates">Coordinates</label>
+                            <select id="hold-coordinates"
+                                title="Free: the fold places the ligand, the DNA and any motif wherever it likes. Held: every design fold is held to the loaded structure's ligands, kept DNA strands and motif residues (a check fold is still free).">
+                                <option value="free" selected>Free</option>
+                                <option value="held">Held to the structure</option>
+                            </select>
+                        </div>
                         <!-- 🔴 HISTORY (2026-10-28): blank is the reference's method. Set, each cycle draws up
                              to "Sequences" designs one at a time and keeps the first whose fold stays this
                              close to the cycle before (web/hunt.js, `accept`). -->

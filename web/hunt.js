@@ -91,6 +91,9 @@ export { FOLDERS } from "./validate-design.js";
  * @param {boolean} [options.stick] a cycle that will not dock hands the NEXT design the run's last docked fold instead
  *   of its own, marked `stuck` - MPNN redesigning an undocked binder writes a soluble protein that never comes back.
  *   A stuck cycle's structure is not its sequence's, so a caller must never choose it (cpu/design/protocol.js)
+ * @param {(input: {sequence: string, folded: object, context: object}) => Promise<object>} [options.examine]
+ *   called on every design fold before its cycle is reported, its answer attached as `folded.examined` - a second
+ *   look the cycle is judged by, e.g. the same sequence folded again unguided (web/search.js's AME probe)
  * @param {(record: object) => void} options.report called once per cycle
  * @param {(text: string) => void} [options.status]
  * @param {(fraction: number) => void} [options.progress]
@@ -207,6 +210,8 @@ export async function hunt(options) {
     const runLength = drawn?.length ?? length;
     const runHold = drawn?.hold ?? options.hold;
     const runHotspots = drawn?.hotspots ?? options.hotspots;
+    // ...and a run's own guide, where its job builds one: a drawn length moves every token after it
+    const runMotif = drawn?.motif ?? options.motif;
     // 🔴 THE HOTSPOTS AS A POCKET, for the folders that read one (cpu/design/contact.js hotspotPocket);
     // the rest of a rotation gets the check alone, as ProteinHunter's other models do
     const pocket = hotspotPocket(runHotspots, chainIndex, CHAIN_IDS);
@@ -290,8 +295,8 @@ export async function hunt(options) {
             ? {} : { modifications }),
           ...(pocket.length > 0 && readsPocket(folder) ? { constraints: pocket } : {}),
           ...(steering ? { steer: { binder: chainIndex, contacts: pocket[0].contacts, ...options.steer } } : {}),
-          ...(options.motif === undefined ? {} : { motif: { atoms: options.motif.atoms(runLength),
-            ...(options.motif.until === undefined ? {} : { until: options.motif.until }) } }),
+          ...(runMotif === undefined ? {} : { motif: { atoms: runMotif.atoms(runLength),
+            ...(runMotif.until === undefined ? {} : { until: runMotif.until }) } }),
           seed,
           recycles: options.recycles,
           // 🔴 foldAf3 HAS NO DEFAULT FOR `calls` - it destructures it and the
@@ -308,16 +313,18 @@ export async function hunt(options) {
         // 🔴 `foldTries` AND `stick` ARE OFF UNLESS ASKED, so a plain hunt folds exactly as before: one fold a cycle
         // at the run's seed. A retry's seed is a fixed offset from it, so a hunt is still named by its seed.
         const tries = options.foldTries ?? 1;
+        const examined = async (folded) => (options.examine === undefined ? folded
+          : { ...folded, examined: await options.examine({ sequence, folded, context }) });
         let folded;
         let docked = false;
         for (let k = 0; k < tries; k += 1) {
           folded = await foldAt((options.seed ?? 0) + context.run + 7919 * k);
-          if (tries === 1 && !options.stick) return folded;
+          if (tries === 1 && !options.stick) return examined(folded);
           if (contactProblem(folded.pdb, { chain: CHAIN_IDS[chainIndex] }) === null) { docked = true; break; }
         }
         if (docked) lastDocked = folded;
         else if (options.stick && lastDocked !== null) return { ...lastDocked, stuck: true };
-        return folded;
+        return examined(folded);
       },
 
       design: async (pdb, context) => {

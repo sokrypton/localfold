@@ -1150,7 +1150,7 @@ steering is. Checked: M0050 (six catalytic tips + U5P) through the page's own `f
 name resolution and its refusals, and the fit (watched failing with the fit removed). Not yet a control on
 design.html: the page has no way to pick a motif's atoms or a ligand's conformer.
 
-### The benchmark recipe on design.html: Search (2026-10-31) - built; the page A/B is running
+### The benchmark recipe on design.html: Search (2026-10-31) - built, and it is the bench's loop
 
 Every winning run is one loop around a hunt with a few switches that the job's own contents decide. So that loop now
 lives in the page rather than in the bench harnesses:
@@ -1199,9 +1199,62 @@ lives in the page rather than in the bench harnesses:
     sequence, already read iPAE 6.204 against PI's 6.244.
   - A fresh-process fold at a seed repeats to the digit (fold.js, pLDDT 33.5505 twice). So the page's folds depend
     on what the page did before: PI ran its attempts in another order in a long-lived browser.
-  - The A/B that answers it runs each arm on the same attempt in its own fresh browser, old loop then new: (running).
-- **Not on the page yet:**
-  - the AME extras (motif placement, the free refold of each design, order-free motif matching, the climb);
-  - holding a loaded structure's ligand or duplex coordinates (fixed ligand / fixed DNA): `hunt({motif})` takes the
-    atoms, but nothing on the page builds them;
-  - the TD18F guide release.
+  - **The A/B, each arm in its own fresh browser: the old loop and `web/search.js` give the same binder, the same
+    restart count and the same best cycle on 04_IFNAR2:40 and 05_CD45:40.** The fresh IFNAR2 run also reproduces
+    PI's own row (1 restart, restart 1 cycle 3). So the search is the bench's loop.
+  - 🔴 **The PIS divergence is a page-state leak, and it is open:** the same attempt folds differently after the page
+    has run another one (PIS ran PD1 first). A long-lived design.html session is therefore not a fresh one. Every
+    resident-state bug this repository has had (CLAUDE.md, "A resident server is not a fresh process") had this
+    shape, and none was found by a per-process gate.
+
+### Held coordinates and the enzyme recipe on design.html (2026-10-31) - built, checked on the page's engine
+
+What was "not on the page yet" above:
+
+- **Coordinates: Free / Held to the structure** (beside Search). Held inpaints into every design fold:
+  - the loaded structure's ligands;
+  - its kept DNA/RNA strands;
+  - the motif residues inside the designed chain.
+
+  It works for a plain hunt (guided to the last step) and for a search (as its recipe says). The check and the refold
+  still fold free.
+  - `cpu/design/motif.js heldCoordinates` builds the entries from `chainsOf`'s new `structureParts` and lays them on
+    the fold's tokens:
+    - a polymer residue at its chain's offset, with the designed chain at the run's length;
+    - a ligand as its whole chain (`-(chains + 1 + j)`), by atom name.
+  - Every entry is `optional`: `motifSlots` drops and counts a name the fold does not build (a leaving atom, a 5'
+    phosphate, an OXT) and still refuses a name it has twice.
+  - Each run's job builds its own, so a drawn length moves the tokens with it.
+  - Held with nothing to hold, or no structure, is refused with a sentence before any weights load.
+- **Checked through the page's own `foldAf3`**, one seed, 30 steps, unguided against guided:
+  - the 7M5W fixed duplex (all 388 atoms resolved by name): **DNA RMSD to the given coordinates 2.38 A free, 0.0007 A
+    held**;
+  - M0040's catalytic tips plus ADP, from their names: **motif 18.9 A free, 0.0007 A held; ADP 1.86 A free, 0.0006 A
+    held**.
+- **The recipes, chosen from the job when Search is on** (`protocolFor`, with `motif` and `fixed`):
+  - **smFixed = TS7F** (the conformer guided to the last step);
+  - **dnaFixed = TD18F** (guided, released below sigma 1, `guideUntil`);
+  - **ame = TA6:**
+    - the motif and ligand guided, released below sigma 1;
+    - `probe`: every design refolded UNGUIDED through `hunt`'s new `examine` hook, its motif found unindexed
+      (`motifMatch`), and those terms and that structure are what the cycle is judged and checked by;
+    - the stop and check want the motif within 1.0 / 1.5 A and no clash;
+    - a climb on motif RMSD when no restart passed;
+    - the paper's `ame` criterion in `verdict`;
+    - the motif-score fallback.
+- **Refusals:**
+  - a motif with no ligand is refused (only enzyme design was benchmarked);
+  - a motif that is not held is refused (there is nothing to score it against).
+- **Tests** (`test/design-motif.test.js`):
+  - the token layout;
+  - the motif terms and the unindexed match;
+  - the recipe choice;
+  - AME through the loop with scripted folds: the guide and its release reaching the hunt, every cycle judged by its
+    unguided refold (it fails with the refold ignored), and the climb on a miss.
+- **Not yet:**
+  - **No page search has been benchmarked:** the fixed and AME recipes ran on the native port (task-bench.mjs), and
+    the page's versions of them are checked piece by piece, not by a pass rate.
+  - **Motif placement is the contig's (indexed),** where TA6 drew random positions per restart. The unindexed match
+    still finds the motif wherever each unguided refold put it, and the climb holds those residues.
+  - **A SMILES ligand cannot be held:** the page holds a ligand by its CCD atom names; the fixed-sm benchmark's
+    SMILES-order mapping (task-bench `ligandAtomsInOrder`) is not ported.

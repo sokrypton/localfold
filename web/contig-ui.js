@@ -632,10 +632,13 @@ export function drawLengths(spans, options = {}) {
  * @returns {{chains: string[], chainKinds: string[], ligandCodes: string[],
  *            chainIndex: number, length: number, hold: number[],
  *            fromStructure: {index: number, chain: string, first: number, last: number}[],
+ *            structureParts: {index: number, at: number, chain: string, first: number, last: number,
+ *              held: boolean, polymer: string, designed: boolean}[],
  *            problems: string[]}} `hold` is positions within the designed chain
  *   the designer must not rewrite - see designChain() in cpu/design/mpnn-bridge.js.
  *   `fromStructure` names each kept protein chain made wholly of one loaded chain's residues, so the
- *   fold can template it
+ *   fold can template it. `structureParts` is every part copied from the loaded structure, at its offset `at`
+ *   in fold chain `index` - a kept strand, a motif inside the designed chain - which a coordinate guide reads
  */
 export function chainsOf(spans, options = {}) {
   const sequenceOf = options.sequenceOf;
@@ -650,6 +653,8 @@ export function chainsOf(spans, options = {}) {
   let designedLength = 0;
   let current = { parts: [], polymer: "protein", designed: false, length: 0, given: false, sources: [] };
   const fromStructure = [];
+  // every part copied from the loaded structure, where it sits in its fold chain - what a coordinate guide reads
+  const structureParts = [];
 
   const finish = () => {
     if (current.parts.length === 0) return;
@@ -664,6 +669,10 @@ export function chainsOf(spans, options = {}) {
     for (const part of current.parts) {
       if (part.held) {
         for (let at = 0; at < part.text.length; at += 1) held.push(text.length + at);
+      }
+      if (part.source !== undefined) {
+        structureParts.push({ index, at: text.length, ...part.source, held: part.held, polymer: current.polymer,
+          designed: current.designed });
       }
       text += part.text;
     }
@@ -763,7 +772,8 @@ export function chainsOf(spans, options = {}) {
     const redesign = span.redesign === true;
     if (redesign) current.designed = true;
     current.given = true;
-    current.parts.push({ text, held: !redesign });
+    current.parts.push({ text, held: !redesign,
+      ...(span.kind === "sequence" ? {} : { source: current.sources[current.sources.length - 1] }) });
   }
   finish();
 
@@ -794,7 +804,7 @@ export function chainsOf(spans, options = {}) {
 
   return {
     chains, chainKinds: kinds, ligandCodes: ligands, chainIndex: designedIndex,
-    length: designedLength, hold, modifications: placed, fromStructure,
+    length: designedLength, hold, modifications: placed, fromStructure, structureParts,
     problems: [...new Set(problems)],
   };
 }

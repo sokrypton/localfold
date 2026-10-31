@@ -30,6 +30,7 @@ import { CHAIN_IDS, MAX_ALANINE } from "../webgpu/design/hunter-loop.js";
 import { hunt } from "./hunt.js";
 import { search } from "./search.js";
 import { protocolFor } from "../cpu/design/protocol.js";
+import { heldCoordinates } from "../cpu/design/motif.js";
 import { createStructureViewer } from "./viewer.js";
 import {
   createConditionEditor, inputResidueMap, inputStructureAtoms, picksOf, residueRanges, segmentsOf,
@@ -219,6 +220,7 @@ const number = (id, fallback) => {
 const designerSelect = element("designer");
 const designerNote = element("designer-note");
 const searchSelect = element("search");
+const holdSelect = element("hold-coordinates");
 const searchNote = element("search-note");
 
 /**
@@ -235,8 +237,25 @@ const searchNote = element("search-note");
  * control that lies.
  */
 const searchRecipe = (spans) => {
-  const { chains, ligandCodes } = chainsOf(spans, readers());
-  return protocolFor({ ...contentsOf(spans), partners: Math.max(0, chains.length - 1) + (ligandCodes?.length ?? 0) });
+  const { chains, ligandCodes, chainIndex, structureParts } = chainsOf(spans, readers());
+  const motif = structureParts.filter((part) => part.held && part.index === chainIndex)
+    .reduce((n, part) => n + part.last - part.first + 1, 0);
+  return protocolFor({ ...contentsOf(spans), partners: Math.max(0, chains.length - 1) + (ligandCodes?.length ?? 0),
+    motif, fixed: holdSelect.value === "held" });
+};
+/**
+ * What Held coordinates holds for one run's spans: null when Free. 🔴 REFUSED, NOT SKIPPED, when there is nothing to
+ * hold - a reader who asked for the DNA held and has no structure loaded gets a sentence, not a free fold.
+ */
+const heldFor = (job) => {
+  if (holdSelect.value !== "held") return null;
+  if (loaded === null) throw new Error("Held coordinates needs a loaded structure to read them from");
+  const held = heldCoordinates({ atoms: loaded.atoms, chains: job.chains, chainIndex: job.chainIndex,
+    ligandCodes: job.ligandCodes, structureParts: job.structureParts });
+  if (held.atoms(job.length).length < 3) {
+    throw new Error("Held coordinates: the loaded structure has no ligand, kept DNA or motif residue of this job to hold");
+  }
+  return held;
 };
 const paintSearchNote = (spans) => {
   const on = method.value === "hunter" && searchSelect.value === "recipe";
@@ -245,9 +264,12 @@ const paintSearchNote = (spans) => {
   const { protocol, why } = searchRecipe(spans);
   searchNote.classList.toggle("warn", protocol === null);
   searchNote.textContent = protocol === null ? `No benchmark recipe fits this job: ${why}.`
-    : `The ${protocol.criterion === "ppi" ? "protein-binder" : protocol.criterion === "sm" ? "small-molecule" : "DNA"}`
-      + ` recipe (${protocol.tag}), because ${why}: up to ${protocol.restarts} restarts of ${protocol.cycles} cycles,`
-      + ` the best cycles refolded at 200 steps as a check${protocol.polish === undefined ? "" : ", near misses polished"}.`
+    : `The ${{ ppi: "protein-binder", sm: "small-molecule", dna: "DNA", ame: "enzyme (AME)" }[protocol.criterion]}`
+      + ` recipe (${protocol.tag}), because ${why}: up to ${protocol.restarts} restarts of ${protocol.cycles} cycles`
+      + `${protocol.guide ? `, every design fold held to the structure${protocol.guideUntil === undefined ? ""
+        : ` until its last steps`}` : ""}${protocol.probe ? ", each design refolded unguided and its motif found in it" : ""},`
+      + ` the best cycles refolded at 200 steps as a check${protocol.polish === undefined ? "" : ", near misses polished"}`
+      + `${protocol.climb === undefined ? "" : ", a climb on the motif when nothing passes"}.`
       + " Its own cycles, temperature, omitted letters and designer replace the ones set here.";
 };
 
@@ -539,6 +561,7 @@ window.__designSpans = spanList;
 
 designerSelect.addEventListener("change", () => paintDesignerNote(spanList.read()));
 searchSelect.addEventListener("change", () => paintSearchNote(spanList.read()));
+holdSelect.addEventListener("change", () => paintSearchNote(spanList.read()));
 // A random seed, drawn on request rather than behind the reader's back: the box shows it, so the
 // same design can be made again.
 element("random-seed").addEventListener("click", () => {
@@ -575,6 +598,7 @@ const UNUSED_BY = {
     folderGroup: "RFD4-Proteina generates structure directly, so nothing folds it in a loop.",
     cyclesGroup: "RFD4-Proteina has no fold-and-redesign cycle to repeat.",
     searchGroup: "The search wraps Protein Hunter's hunt; RFD4-Proteina generates once.",
+    holdGroup: "RFD4-Proteina keeps a structure's coordinates by its own conditioning.",
     stayGroup: "RFD4-Proteina has no cycle to hold to the one before.",
     warmGroup: "RFD4-Proteina has no previous cycle to start a fold from.",
     steerGroup: "RFD4-Proteina conditions on hotspots itself.",
@@ -1283,6 +1307,13 @@ const startHunt = async () => {
     say(`no benchmark recipe fits this job: ${recipe.why}`, true);
     return;
   }
+  // ...and Held coordinates is resolved now, so nothing to hold is said before any weights are fetched
+  try {
+    heldFor(chainsOf(spans, readers()));
+  } catch (error) {
+    say(error.message, true);
+    return;
+  }
   const controller = new AbortController();
   running = controller;
   huntLabel.textContent = "Stop";
@@ -1316,7 +1347,11 @@ const startHunt = async () => {
       job: (run) => {
         const drawn = drawLengths(spans, { run, seed: number("seed", 0) });
         // ...and its hotspots in that run's fold numbering (a drawn length moves what follows it)
-        return { ...chainsOf(drawn, readers()), hotspots: window.__designHotspots ?? hotspotsOf(drawn) };
+        const job = { ...chainsOf(drawn, readers()), hotspots: window.__designHotspots ?? hotspotsOf(drawn) };
+        // ...and what it holds in place, in that run's tokens: a search takes it as `held` and guides by its recipe,
+        // a plain hunt guides every design fold to the last step
+        const held = heldFor(job);
+        return held === null ? job : { ...job, held, ...(recipe === null ? { motif: { atoms: held.atoms } } : {}) };
       },
       chains,
       chainKinds,

@@ -25,6 +25,15 @@ test("a name that is not exactly one atom is refused, never guessed past", () =>
   assert.throws(() => motifSlots(batch, [{ token: 0, atom: "N", xyz: [0, 0, 0] }]), /three/);
 });
 
+test("an optional name the input lacks is left out and counted; an optional duplicate is still refused", () => {
+  const { slots, dropped } = motifSlots(batch, [{ token: 0, atom: "OXT", xyz: [0, 0, 0], optional: true },
+    { token: 0, atom: "N", xyz: [0, 0, 0] }, { token: 0, atom: "CA", xyz: [1, 0, 0] }, { token: 0, atom: "C", xyz: [0, 1, 0] }]);
+  assert.deepEqual([...slots], [0, 1, 2]);
+  assert.equal(dropped, 1);
+  assert.throws(() => motifSlots(batch, [{ token: -1, atom: "CA", xyz: [0, 0, 0], optional: true },
+    { token: 0, atom: "N", xyz: [0, 0, 0] }, { token: 0, atom: "C", xyz: [0, 0, 0] }]), /2 atoms/);
+});
+
 const target = Float32Array.from([0, 0, 0, 1.5, 0, 0, 0, 1.4, 0, 0.3, 0.2, 1.1]);
 const motif = { slots: Int32Array.from([1, 3, 6, 8]), xyz: target };
 /** `target` under a rotation about z and a translation, written into a 15-slot answer at the motif's slots. */
