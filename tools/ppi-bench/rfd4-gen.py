@@ -30,15 +30,18 @@ RADII = {'H': 0.31, 'C': 0.76, 'N': 0.71, 'O': 0.66, 'S': 1.05, 'P': 1.07, 'F': 
          'B': 0.84, 'SE': 1.2, 'SI': 1.11, 'FE': 1.32, 'CU': 1.32, 'ZN': 1.22, 'MN': 1.39, 'NI': 1.24, 'CO': 1.26, 'MG': 1.41}
 
 
-def graph(atoms):
-    """Bonds from distances (covalent radii + 0.45 A) over [(element, xyz)]: one rule for both sides of a match."""
+def graph(atoms, slack=0.45, split_metals=False):
+    """Bonds from distances (covalent radii + `slack` A) over [(element, xyz)]; `split_metals` drops a metal's."""
     n = len(atoms)
     adj = [set() for _ in range(n)]
     for i in range(n):
         for j in range(i + 1, n):
             (a, p), (b, q) = atoms[i], atoms[j]
-            if sum((x - y) ** 2 for x, y in zip(p, q)) ** 0.5 < RADII[a.upper()] + RADII[b.upper()] + 0.45:
+            if sum((x - y) ** 2 for x, y in zip(p, q)) ** 0.5 < RADII[a.upper()] + RADII[b.upper()] + slack:
                 adj[i].add(j); adj[j].add(i)
+    if split_metals:
+        metal = [a.upper() in METALS for a, _ in atoms]
+        adj = [{j for j in adj[i] if not (metal[i] or metal[j])} for i in range(n)]
     colour = [a.upper() for a, _ in atoms]
     for _ in range(6):
         colour = [f"{colour[i]}|{','.join(sorted(colour[j] for j in adj[i]))}" for i in range(n)]
@@ -51,7 +54,22 @@ def isomorphism(design, reference):
     """design atom index -> reference atom index, over element-labelled bond graphs (backtracking, colour-pruned)."""
     if sorted(a.upper() for a, _ in design) != sorted(a.upper() for a, _ in reference):
         return None
-    (da, dc), (ra, rc) = graph(design), graph(reference)
+    # a design's ligand is a generated pose and a conformer an idealised one: a bond stretched past the distance rule,
+    # or a contact inside it, and the two graphs differ by an edge. So both sides are read at a few slacks, and with a
+    # metal's coordination dropped (a metal is then placed by its element alone)
+    for metals in (False, True):
+        for ref_slack in (0.45, 0.35):
+            ra, rc = graph(reference, ref_slack, metals)
+            for slack in (0.45, 0.55, 0.65, 0.35, 0.75):
+                da, dc = graph(design, slack, metals)
+                if sum(map(len, da)) == sum(map(len, ra)):
+                    mapped = _isomorphism(design, reference, da, dc, ra, rc)
+                    if mapped is not None:
+                        return mapped
+    return None
+
+
+def _isomorphism(design, reference, da, dc, ra, rc):
     order, seen = [], set()
     for start in range(len(design)):
         stack = [start]
@@ -100,32 +118,44 @@ def xyz(l):
     return [float(l[30:38]), float(l[38:46]), float(l[46:54])]
 
 
+def components(lines, split_metals):
+    """Bonded components of a chain's atoms; `split_metals` drops a metal's contacts (coordination, not bonds)."""
+    adj, _ = graph([(element(l), xyz(l)) for l in lines], split_metals=split_metals)
+    seen, out = set(), []
+    for start in range(len(lines)):
+        if start in seen:
+            continue
+        group, stack = [], [start]
+        while stack:
+            i = stack.pop()
+            if i in seen:
+                continue
+            seen.add(i); group.append(i); stack.extend(adj[i])
+        out.append([lines[i] for i in sorted(group)])
+    return out
+
+
 def units(chains, binder):
-    """The design's non-binder molecules: a DNA strand whole, a ligand chain split into its bonded components (RFD4
-    writes several ions or molecules as one chain where the task lists each)."""
+    """The design's non-binder molecules: a DNA strand whole, a ligand chain as its bonded components (RFD4 writes
+    several ions or molecules as one chain where the task lists each). Each comes with the finer split to try when
+    it matches nothing whole: two copper ions 2.3 A apart bond by distance and are two molecules, where a heme's iron
+    is part of the heme."""
     out = []
     for c, ls in chains.items():
         if c == binder:
             continue
         if all(l[17:20].strip() in NA for l in ls):
-            out.append(ls)
+            out.append((ls, [ls]))
             continue
-        adj, _ = graph([(element(l), xyz(l)) for l in ls])
-        # a metal's contacts are coordination, not bonds: two copper ions 2.3 A apart are two molecules
-        metal = [element(l).upper() in METALS for l in ls]
-        adj = [{j for j in adj[i] if not (metal[i] or metal[j])} for i in range(len(ls))]
-        seen = set()
-        for start in range(len(ls)):
-            if start in seen:
-                continue
-            group, stack = [], [start]
-            while stack:
-                i = stack.pop()
-                if i in seen:
-                    continue
-                seen.add(i); group.append(i); stack.extend(adj[i])
-            out.append([ls[i] for i in sorted(group)])
+        for whole in components(ls, False):
+            out.append((whole, components(whole, True)))
     return out
+
+
+def reference_element(name):
+    """A CCD atom name's element: a metal when the name, digits stripped, is one (FE1, CO), else its first letter."""
+    stem = name.rstrip("0123456789").upper()
+    return stem if stem in METALS else stem[0]
 
 
 def match(unit, entry):
@@ -140,7 +170,12 @@ def match(unit, entry):
         # a one-atom ion written as a generic ligand: its CCD atom name is its element
         if len(unit) == 1 and element(unit[0]).upper() == entry["ccd"].upper():
             return [f" {entry['ccd'].upper()}".ljust(4)]
-        return None
+        # a dictionary ligand written as a generic one: matched by bond graph against its reference conformer
+        reference = entry.get("conformerNames")
+        if not reference or len(reference) != len(unit):
+            return None
+        mapped = isomorphism([(element(l), xyz(l)) for l in unit], [(reference_element(a[0]), a[1:]) for a in reference])
+        return None if mapped is None else [(" " + reference[mapped[k]][0] if len(reference[mapped[k]][0]) < 4 else reference[mapped[k]][0]).ljust(4) for k in range(len(unit))]
     mapped = isomorphism([(element(l), xyz(l)) for l in unit], [(a[0], a[1:]) for a in entry["conformer"]])
     if mapped is None:
         return None
@@ -161,14 +196,28 @@ def relabel(pdb, task):
     out = [l[:21] + "A" + f"{index[(l[22:27], l[17:20].strip())] + 1:4d} " + l[27:] for l in chains[binder]]
     sequence = "".join(AA[r] for _, r in order)
     taken = set()
-    for unit in units(chains, binder):
+    def place(unit):
         for i, e in enumerate(t["chains"]):
             names = None if i in taken else match(unit, e)
             if names is not None:
+                return i, names
+        return None
+    placed = []
+    for whole, pieces in units(chains, binder):
+        found = place(whole)
+        if found is not None:
+            taken.add(found[0]); placed.append((whole, *found))
+            continue
+        for unit in pieces if len(pieces) > 1 else []:
+            found = place(unit)
+            if found is None:
                 break
+            taken.add(found[0]); placed.append((unit, *found))
         else:
-            raise ValueError(f"{task}: a design molecule ({unit[0][17:20]}, {len(unit)} atoms) matches no entry of the task")
-        taken.add(i)
+            if len(pieces) > 1:
+                continue
+        raise ValueError(f"{task}: a design molecule ({whole[0][17:20]}, {len(whole)} atoms) matches no entry of the task")
+    for unit, i, names in placed:
         index, _ = residues(unit)
         out += [l[:12] + n + l[16:21] + chr(66 + i) + f"{index[(l[22:27], l[17:20].strip())] + 1:4d} " + l[27:] for l, n in zip(unit, names)]
     if len(taken) != len(t["chains"]):
