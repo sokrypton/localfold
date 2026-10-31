@@ -355,10 +355,17 @@ async function attempt(name, index) {
   // mean a passing evaluation
   const checkAt = async (entry, s0) => {
     let result;
-    for (let k = 0; k < (cfg.check?.seeds ?? 1); k += 1) {
-      result = await assess(entry.sequence, entry.pdb, s0 + 104729 * k, entry.positions);
-      result.seedsPassed = k + (result.pass ? 1 : 0);
-      if (!result.pass) break;
+    // `checkModel` (a list): a CONSENSUS check - every model must pass, each at its own seed; unset, the generation
+    // model alone. `check.passIpae` tightens the iPAE a checker must reach (a checker whose PAE runs lower than AF3's)
+    const models = cfg.checkModel === undefined ? [undefined] : [].concat(cfg.checkModel);
+    let k = 0;
+    for (const [m, model] of models.entries()) {
+      for (let j = 0; j < (cfg.check?.seeds ?? 1); j += 1, k += 1) {
+        result = await assess(entry.sequence, entry.pdb, s0 + 104729 * j + 7919 * m, entry.positions, model);
+        if (result.ipae > (cfg.check?.passIpae ?? Infinity)) result.pass = false;
+        result.seedsPassed = k + (result.pass ? 1 : 0);
+        if (!result.pass) return result;
+      }
     }
     return result;
   };
