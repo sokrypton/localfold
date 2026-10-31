@@ -1169,6 +1169,17 @@ criterion is the task's own. `task-score.py` reports each variant against its ow
   - Same 48 attempts as NC.
 - **NCC: NC with cysteine allowed** (`omit: ""`; the loop's default forbids C). It asks whether blocking cysteines
   costs PPI passes. Same 48 attempts.
+- **NCH: history at the designer** (the user's idea). Each MPNN design's raw logits for the designed chain (before
+  bias and temperature) are kept, and the next cycle adds them, times `history` (1.0), to its own. So each cycle
+  samples from this backbone's preferences multiplied by the last one's, and a restart starts with none.
+  - `designChain` returns `logits` and takes `logitBias`, added once per tied group across states.
+  - `test/mpnn-states.test.js`: the logits' shape, a +50 tryptophan bias writing all-W with and without tied states,
+    and a wrong-sized bias refused.
+  - Same 48 attempts as NC.
+- **Interim, PPI, paired with NC on the same attempts:** averaging (NCS) 1/14 against NC's 3; cysteine allowed (NCC)
+  3/13 against 3; RFD4-Proteina designing (NCR) 0/3 against 0.
+- **One task at a time from here** (the user's call): the other tasks' runs are SIGSTOPped and a queue resumes each
+  when the one before finishes: PPI, then sm, AME, DNA, fixed DNA, then TD21F and TD19.
 
 - 🔴 **THE DISK FILLED (497 GB, 4.5 MB free)** while the page A/B's browsers each cached the 1.4 GB float32 bundle:
   native folds failed in the `fold` wrapper (`exit: : numeric argument required` - its `.done` file could not be

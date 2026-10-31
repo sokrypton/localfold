@@ -117,6 +117,9 @@ export function chainMaskFor(structure, chain) {
  *   inverse folding's fixed residues all are.
  * @param {"protein"|"dna"|"rna"} [options.kind="protein"] what the designed chain is made of. A
  *   DNA or RNA chain needs NA-MPNN, and comes back in AF3's letters (ACGT, ACGU, N for unknown).
+ * @param {Float32Array} [options.logitBias] [designed residues x the model's letters], added to the designed chain's
+ *   logits - the previous cycle's own `logits` (scaled) is HISTORY at the designer: each cycle samples from this
+ *   backbone's preferences times the last one's. Added to every state's twin, so a tied group carries it once.
  * @param {{pdb: string, weight?: number}[]} [options.states] MULTI-STATE design: further predictions of the same
  *   complex (another model's fold of it, say) whose designed chain is TIED to this one's position by position -
  *   decoded at one step, its logits the weighted sum over the states (ProteinMPNN's tied positions). `pdb` is the
@@ -218,6 +221,23 @@ export function designChain(model, options) {
     }
   }
 
+  const bias = designBias(structure.chainIds.length, {
+    omit: options.omit, alanineBias: options.alanineBias, residueBias: options.residueBias, alphabet,
+    ...(nucleic ? { designs: "nucleic" } : {}),
+  });
+  // ...plus the history, at every state's twin of each designed position: a tied group's bias is the weighted sum of
+  // its members', and the weights sum to one, so the group carries it exactly once
+  const V = bias.length / structure.chainIds.length;
+  if (options.logitBias !== undefined) {
+    if (options.logitBias.length !== designed * V) {
+      throw new Error(`a logit bias of ${options.logitBias.length} for ${designed} residues of ${V} letters`);
+    }
+    for (const offsets of stateOffsets) {
+      offsets.forEach((index, i) => {
+        for (let v = 0; v < V; v += 1) bias[index * V + v] += options.logitBias[i * V + v];
+      });
+    }
+  }
   const result = model.sample(model.encode({
     X: structure.X,
     mask: structure.mask,
@@ -245,10 +265,7 @@ export function designChain(model, options) {
     ...(states.length === 1 ? {} : {
       symmetry: stateOffsets[0].map((_, i) => stateOffsets.map((offsets, k) => ({ pos: offsets[i], weight: shares[k] }))),
     }),
-    bias: designBias(structure.chainIds.length, {
-      omit: options.omit, alanineBias: options.alanineBias, residueBias: options.residueBias, alphabet,
-      ...(nucleic ? { designs: "nucleic" } : {}),
-    }),
+    bias,
   });
 
   // 🔴 `result.seq` IS 21-LETTER, WHATEVER THE MODEL IS, AND READING NA-MPNN
@@ -297,6 +314,9 @@ export function designChain(model, options) {
     // caller wanting a profile or a logo needs them anyway.
     tokens: result.S[0],
     alphabet,
+    // the designed chain's raw logits (before any bias or temperature), [residues x letters] - what a next cycle takes
+    // as `logitBias`
+    logits: Float32Array.from(stateOffsets[0].flatMap((index) => [...result.logits[0].subarray(index * V, (index + 1) * V)])),
   };
 }
 

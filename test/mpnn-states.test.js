@@ -63,3 +63,20 @@ test("a state's weight is what it contributes: at zero weight changing it change
   assert.equal(design(scrambled(1), 0), design(scrambled(2), 0));
   assert.notEqual(design(scrambled(1), 0.5), design(scrambled(2), 0.5));
 });
+
+test("history: a design hands back its raw logits, and a logit bias steers the next one", () => {
+  const first = designChain(model, { pdb: complex(), chain: "A", random: uniformFrom(3) });
+  const V = first.logits.length / first.sequence.length;
+  assert.equal(first.logits.length, first.sequence.length * V);
+  assert.ok(first.logits.every(Number.isFinite));
+  // a bias of +50 on tryptophan everywhere writes tryptophan everywhere (cysteine stays omitted)
+  const W = "ACDEFGHIKLMNPQRSTVWYX".indexOf("W");
+  const toward = new Float32Array(first.logits.length);
+  for (let i = 0; i < first.sequence.length; i += 1) toward[i * V + W] = 50;
+  assert.match(designChain(model, { pdb: complex(), chain: "A", random: uniformFrom(3), logitBias: toward }).sequence, /^W+$/);
+  // ...and the same holds across tied states: the group carries the bias once, not once per state
+  const tied = designChain(model, { pdb: complex(), chain: "A", random: uniformFrom(3), logitBias: toward,
+    states: [{ pdb: scrambled(1) }] });
+  assert.match(tied.sequence, /^W+$/);
+  assert.throws(() => designChain(model, { pdb: complex(), chain: "A", logitBias: new Float32Array(3) }), /logit bias of 3/);
+});

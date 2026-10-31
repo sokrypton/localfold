@@ -203,6 +203,10 @@ async function attempt(name, index) {
     const controller = new AbortController();
     const mine = [];
     const statesOf = new Map();     // (a design fold's structure -> the other models' structures of its sequence)
+    // `history`: the last design's raw MPNN logits, scaled, added to the next design's - each cycle samples from this
+    // backbone's preferences times the previous one's (mpnn-bridge.js `logitBias`). A restart starts with none.
+    let lastLogits = null;
+    const remember = (designed) => { lastLogits = designed.logits; return designed; };
     try {
       const stream = runDesign({
         chains: ["", ...t.sequences], chainIndex: 0, cycles: cfg.cycles, length, run: restart,
@@ -230,9 +234,10 @@ async function attempt(name, index) {
         },
         design: (pdb, context) => cfg.designer === "rfd4p"
           ? rfd4pDesign(pdb, seed + 101 * restart + 13 * context.cycle + 1000 * (context.draw ?? 0))
-          : designChain(mpnn, { pdb, chain: context.chain, temperature: context.temperature,
+          : remember(designChain(mpnn, { pdb, chain: context.chain, temperature: context.temperature,
+          ...(cfg.history !== undefined && lastLogits !== null ? { logitBias: lastLogits.map((v) => v * cfg.history) } : {}),
           ...(statesOf.has(pdb) ? { states: statesOf.get(pdb).map((other) => ({ pdb: other })) } : {}),
-          omit: context.omit, alanineBias: context.alanineBias, random: context.random, hold: context.hold, kind: context.kind }),
+          omit: context.omit, alanineBias: context.alanineBias, random: context.random, hold: context.hold, kind: context.kind })),
       });
       for await (const record of stream) {
         const terms = record.folded.terms;
