@@ -1106,21 +1106,28 @@ of the top 2) scores 24.1% through the page (`bench.js`, C) and 37.9% natively (
   It matters for scoring, which is native now, and little for the design loop (71 against 74 check-worthy of 144 at
   design settings). No engine bug.
 
-### The other datasets the paper reports (2026-10-30, night) - running
+### The other datasets the paper reports (2026-10-30, night; scored 2026-10-31)
 
 Besides each benchmark's figure-2 set, `rfd4-paper-data.json` reports a FIXED-target variant (the ligand's or the
 duplex's coordinates given) and, for AME, an UNFIXED-ligand one. RFD4-Proteina high / + Search:
 
 | variant | ours | RFD4 high | + Search | how |
 |---|---|---|---|---|
-| AME, ligand unfixed (`mcsa_37`, "U-" targets) | (running, TA6U) | 15.2% | 19.6% | TA6's recipe; only the atoms that file conditions are inpainted (the tips, and a few ligand atoms) |
-| DNA fixed (`*_structure_context`, "F-") | (running, TD9F) | 2.2% | 4.5% | TD9's recipe; the given duplex inpainted token by token into every design fold |
-| small molecules, ligand fixed ("F-") | (next) | 15.9% | 22.9% | the file's conformer inpainted: a SMILES chain by token, in RDKit's `_smilesAtomOutputOrder`, checked element by element against what AF3 builds; a CCD chain by atom name; fewer than 3 atoms (an ion) unguided |
-| `disco`, ligand fixed | (next) | 45.3% | 52.7% | the same rows, `disco-score.py` |
+| AME, ligand unfixed (`mcsa_37`, "U-" targets) | **21.6%** (37 targets, all) | 15.2% | 19.6% | TA6's recipe; only the atoms that file conditions are inpainted (the tips, and a few ligand atoms) |
+| DNA fixed (`*_structure_context`, "F-") | **0 of 34** (TD9F); TD18F running | 2.2% | 4.5% | TD9's recipe; the given duplex inpainted token by token into every design fold |
+| small molecules, ligand fixed ("F-") | **51.3%** (CI 48.1-53.9; 77 targets, 110 attempts; TS7F) | 15.9% | 22.9% | the file's conformer inpainted: a SMILES chain by token, in RDKit's `_smilesAtomOutputOrder`, checked element by element against what AF3 builds; a CCD chain by atom name; fewer than 3 atoms (an ion) unguided |
+| `disco`, ligand fixed | **64.9%** (CI 62.3-67.5; 112 attempts) | 45.3% | 52.7% | the same rows, `disco-score.py` |
 | PPI all-atom | - | 16.9% | - | same targets and criterion as `ppi_backbone`; NC's 37.9% is not re-run |
 
 In every variant only the DESIGN folds are guided; the internal check and the evaluation fold free, and the
 criterion is the task's own. `task-score.py` reports each variant against its own dataset and against Search.
+
+- **DNA fixed is the one variant behind: 0 of 34** (7m5w, 7n5u, 7rte), where TD15 passes 5 of 60 on the SAME three
+  targets unfixed. The design funnel is no worse - 5.0% of design folds reach iPAE <= 2.5 against TD15's 6.7%, 9
+  checks against 23 at 0.26 against 0.38 an attempt, 3 checks at iPAE <= 1.5 each - but the submitted designs fail
+  the free evaluation's placement: binder RMSD <= 8 after DNA alignment on 4 of 34 against 10 of 60. A binder
+  designed on the crystal's duplex does not keep its place on AF3's own. **TD18F** adds TD15's polish and releases the
+  guide below sigma 1.0 (`motifUntil`), so the duplex settles toward AF3's form in each design fold's last steps.
 
 - 🔴 **THE DISK FILLED (497 GB, 4.5 MB free)** while the page A/B's browsers each cached the 1.4 GB float32 bundle:
   native folds failed in the `fold` wrapper (`exit: : numeric argument required` - its `.done` file could not be
