@@ -1178,6 +1178,20 @@ criterion is the task's own. `task-score.py` reports each variant against its ow
   - Same 48 attempts as NC.
 - **Interim, PPI, paired with NC on the same attempts:** averaging (NCS) 1/14 against NC's 3; cysteine allowed (NCC)
   3/13 against 3; RFD4-Proteina designing (NCR) 0/3 against 0.
+- **Cross-evaluation, because AF3 designing, checking and evaluating is a circle** (the user's point, 2026-10-31):
+  - **Our designs, other evaluator:** every task's best run is rescored by Protenix-2, which took no part in those
+    designs: task-bench `--rescore` with `evalModel` (`config-X*.json`, out `X-<run>-protenix2.jsonl`), same
+    seeds and criteria. PPI's own cross-evaluation (NC by Boltz-2, Chai-1, Protenix-2 and ESMFold2) is from 10-29.
+  - **RFD4-Proteina's designs, same evaluators:** the paper's designs were only ever scored by AF3, so a fair
+    non-AF3 comparison needs theirs folded too. They are generated here with the native port (the user cleared
+    its weights): `cuda/rfd4p/localfold-rfd4p` on each PPI benchmark target's own annotated input
+    (`data/benchmarks/ppi/ppi_bb_only/*.cif.zst`, `input_as_annotated_cif`), `thinking_high` (`recycleSchedule:
+    high`, 60 steps), 10 designs a target.
+    - The output numbers the target as `targets.json` does: chain B from 1, identical sequence.
+    - Scored by AF3 (rescore.py), which should reproduce the paper's 19.3% if the port is faithful, and by
+      Protenix-2, Boltz-2, Chai-1 and ESMFold2 (xeval.py).
+    - The goal is a designer x evaluator matrix: AF3, AF3 int5, Boltz-2, Chai-1 and RFD4-Proteina designs, each
+      judged by every model. Running.
 - **One task at a time from here** (the user's call): the other tasks' runs are SIGSTOPped and a queue resumes each
   when the one before finishes: PPI, then sm, AME, DNA, fixed DNA, then TD21F and TD19.
 
