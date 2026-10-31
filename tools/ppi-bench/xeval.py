@@ -33,6 +33,8 @@ else:
         tp = os.path.join(work, "t", d["target"] + ".pdb")
         if not os.path.exists(tp): open(tp, "w").write(t["pdb"])
         slots = ",".join(f"{tp}:{'BCDEFG'[i]}@{i + 1}" for i in range(len(t["sequences"])))
+        # a fold already written (a batch that died part-way) is kept; the rest go to a fresh process
+        if os.path.exists(out_of(d)): continue
         lines.append(f"{out_of(d)} --sequence={sequence_of(d)} --template={slots}")
     batch = os.path.join(work, "batch.txt")
     open(batch, "w").write("\n".join(lines) + "\n")

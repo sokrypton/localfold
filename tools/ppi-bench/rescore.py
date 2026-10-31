@@ -21,6 +21,9 @@ for d in rows:
     tp = os.path.join(work, "t", d["target"] + ".pdb")
     if not os.path.exists(tp): open(tp, "w").write(t["pdb"])
     out = os.path.join(work, f"{d['target']}_{d['attempt']}.pdb")
+    # a fold already written (a batch that died part-way: cuda/af3's "scratch slot grows inside a graph capture",
+    # 2026-10-31, after 180 of 240) is kept; the rest go to a fresh process
+    if os.path.exists(out.replace(".pdb", "_summary_confidences.json")): continue
     lines.append(" ".join(fold_line(t, d["binder"], tp, out)))
 batch = os.path.join(work, "batch.txt")
 open(batch, "w").write("\n".join(lines) + "\n")

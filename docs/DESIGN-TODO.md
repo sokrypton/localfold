@@ -1181,6 +1181,18 @@ criterion is the task's own. `task-score.py` reports each variant against its ow
 - **Final, PPI, all 48 attempts AF3-rescored (`R-<run>.jsonl`), paired with NC:** cysteine allowed (NCC) **19 against
   17**, inside the noise, so blocking cysteines costs nothing measurable; history (NCH) **12 against 17**, worse - the
   last backbone's preferences pull the next design toward a backbone the fold has already left. Neither replaces NC.
+- **RFD4-Proteina's own PPI designs, same judges (2026-10-31):** 24 targets x 10, `cuda/rfd4p` "high" from each
+  target's own `ppi_bb_only` input (`RFD4P.jsonl`). AF3 **16.3%** (the paper's 19.3% at 200 a target: the port holds),
+  Protenix-2 15.4, Boltz-2 16.7, Chai-1 21.2, ESMFold2 9.6 - against ours (NC) 37.5 / 25.1 / 23.8 / 26.7 / 6.3. Under
+  every judge that designed neither side but ESMFold2 (no pTM, the weakest interface judge) ours lead by 5-10 points.
+  🔴 cuda/af3 `--batch` died twice on mixed lengths: "scratch slot.5 grows inside a graph capture" (af3, after 180 of
+  240) and "operation not permitted when stream is capturing at trunk.cuh:2541" (chai1). rescore.py and xeval.py
+  now keep written folds and send the rest to a fresh process; the native bug itself is open.
+- **Generation without AF3 (the user's rule from 2026-10-31: AF3 may judge, never generate):** task-bench `model`
+  puts every generating fold on another checkpoint; `checkModel` as a list is a consensus check, `check.passIpae`
+  tightens it. NP (Protenix-2 designs and checks, PPI) 1/14 against NC's 3 on the same attempts, stopped: Protenix-2's
+  iPAE runs ~0.5 A under AF3's (checks at 0.8-1.2, AF3 1.5-1.8). NP2 (Protenix-2 designs; Protenix-2 AND Boltz-2 must
+  pass at iPAE 1.0; 6 restarts) and TS7P (the same for small molecules) are running.
 - **Cross-evaluation, every task (2026-10-31):** Protenix-2 judging our AF3 designs keeps PPI at 25% (of 37.5) but
   takes sm 62.3 -> 20.1, AME fixed 27.0 -> 5.4, AME unfixed 20.3 -> 2.7, DNA 8.3 -> 1.7, DNA fixed 3.2 -> 1.6. Boltz-2
   and Chai-1 are judging the same six sets (`X-<run>-<model>.jsonl`; `--rescore` needed `taskOf` for "F-" targets).
