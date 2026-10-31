@@ -1135,6 +1135,9 @@ criterion is the task's own. `task-score.py` reports each variant against its ow
   only the duplex's coarse placement is held.
 - **The DNA designer, paired (TD19 = TD15 with NA-MPNN, TD15's attempts): NA-MPNN 0 against LigandMPNN 3 on the
   first 18** - LigandMPNN stays the recipe's designer; running to 60.
+- **TD21F: TD18F with the design folds rotating AF3 and Protenix-2 by cycle** (task-bench `rotate`; the other model
+  folds as its own process, 1-2 s, beside the one resident AF3; the check and the evaluation stay AF3) - Protein
+  Hunter's measured win, never tried here, on the same 62 attempts as TD18F. Running.
 
 - 🔴 **THE DISK FILLED (497 GB, 4.5 MB free)** while the page A/B's browsers each cached the 1.4 GB float32 bundle:
   native folds failed in the `fold` wrapper (`exit: : numeric argument required` - its `.done` file could not be

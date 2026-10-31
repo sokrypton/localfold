@@ -47,7 +47,7 @@ const seedOf = (text) => createHash("sha1").update(text).digest().readUInt32LE(0
 const LETTERS = "ABCDEFGHIJ";
 
 /** One native fold of [binder, ...the task's chains] from an AF3 job; the structure and the paper's terms. */
-async function fold(t, binder, { steps, recycles, seed, motif, msa }) {
+async function fold(t, binder, { steps, recycles, seed, motif, msa, model }) {
   const file = path.join(work, `f${process.pid}-${Date.now()}.pdb`);
   const job = file.replace(".pdb", ".json");
   // `msa`: sequences handed to AF3 as the binder's unpaired alignment (mpnnMsa); none, a single-sequence fold
@@ -60,7 +60,8 @@ async function fold(t, binder, { steps, recycles, seed, motif, msa }) {
   fs.writeFileSync(job, JSON.stringify({ dialect: "alphafold3", version: 2, name: "j", modelSeeds: [seed], sequences }));
   // `motif`: a design fold inpainted with the task's catalytic motif (cuda/af3 --motif; never a check or the evaluation)
   const guide = motif === undefined ? [] : [`--motif=${motif}`, ...(config.motifUntil === undefined ? [] : [`--motif-until=${config.motifUntil}`])];
-  await run(`${ROOT}/cuda/af3/fold`, [file, `--job=${job}`, "--", `--steps=${steps}`, `--recycles=${recycles}`, `--seed=${seed}`, ...guide],
+  // `model`: another AF3-lineage checkpoint (cuda/af3/fold --model=, its own standalone process - one resident server)
+  await run(`${ROOT}/cuda/af3/fold`, [file, `--job=${job}`, ...(model === undefined || model === "af3" ? [] : [`--model=${model}`]), "--", `--steps=${steps}`, `--recycles=${recycles}`, `--seed=${seed}`, ...guide],
     { maxBuffer: 1 << 26 });
   const pdb = fs.readFileSync(file, "utf8");
   const s = JSON.parse(fs.readFileSync(file.replace(".pdb", "_summary_confidences.json"), "utf8"));
@@ -473,7 +474,10 @@ async function attempt(name, index) {
             const ef2 = cfg.designEngine === "ef2" || (cfg.ef2Cycles !== undefined && context.cycle < cfg.ef2Cycles);
             r = ef2 ? await foldEf2(t, sequence, { seed: s })
               : await fold(t, sequence, { steps: cfg.steps, recycles: cfg.recycles, seed: s,
-                motif: guidedAt(context.cycle) ? motif : undefined, msa: mpnnMsaAt(context) });
+                motif: guidedAt(context.cycle) ? motif : undefined, msa: mpnnMsaAt(context),
+                // `rotate`: the design folds' model by cycle (Protein Hunter's rotation: a design has to satisfy several
+                // models); the check, the probe and the evaluation stay AF3
+                model: cfg.rotate?.[context.cycle % cfg.rotate.length] });
             if (contactProblem(r.pdb, { chain: "A" }) === null) { docked = true; break; }
           }
           foldSeconds += (Date.now() - t0) / 1000;
