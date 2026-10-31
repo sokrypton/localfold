@@ -1,20 +1,26 @@
-# engine-probe.py <out.jsonl> <calls> <recycles> <arm> [<limit>]: the same protein-binder complexes - NC's submitted
-# binders, attempts 0-2 on every target, two seeds each, the target templated - folded by one engine, to separate the
-# page's design loop from its folding engine (docs/DESIGN-TODO.md, "the page against native").
+# engine-probe.py <out.jsonl> <calls> <recycles> <arm> [<limit>] [--source=<rows.jsonl>] [--seeds=11,12] [--attempts=0-2]:
+# the same protein-binder complexes - a run's submitted binders (NC's by default, attempts 0-2), at each seed, the
+# target templated - folded by one engine, to compare the page's AF3 with the native one on identical inputs
+# (docs/DESIGN-TODO.md, "the page against native").
 #   arm: "native" (cuda/af3/fold, its int8 weights, as native-bench.mjs folds) | "int5" (the page's AF3 on its shipped
 #   bundle) | a bundle directory served from the checkout, e.g. "/model-af3-full-f32/" (the page's AF3 on it)
 import json, os, socket, subprocess, sys, tempfile, time
 ROOT = os.path.expanduser("~/localfold"); sys.path.insert(0, os.path.join(ROOT, "tools")); import cdp
 HERE = os.path.dirname(os.path.abspath(__file__))
-out, calls, recycles, arm = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
-limit = int(sys.argv[5]) if len(sys.argv) > 5 else None
+opts = {a.split("=", 1)[0][2:]: a.split("=", 1)[1] for a in sys.argv[1:] if a.startswith("--")}
+pos = [a for a in sys.argv[1:] if not a.startswith("--")]
+out, calls, recycles, arm = pos[0], int(pos[1]), int(pos[2]), pos[3]
+limit = int(pos[4]) if len(pos) > 4 else None
+source = opts.get("source", os.path.expanduser("~/ppi-bench-2026-10-29/NC.jsonl"))
+seeds = [int(x) for x in opts.get("seeds", "11,12").split(",")]
+lo, hi = (int(x) for x in opts.get("attempts", "0-2").split("-"))
 targets = json.load(open(os.path.join(HERE, "targets.json")))
 items = []
-for line in open(os.path.expanduser("~/ppi-bench-2026-10-29/NC.jsonl")):
+for line in open(source):
     d = json.loads(line)
-    if d.get("error") or not d.get("binder") or d["attempt"] > 2: continue
+    if d.get("error") or not d.get("binder") or not lo <= d["attempt"] <= hi: continue
     t = targets[d["target"]]
-    for seed in (11, 12):
+    for seed in seeds:
         items.append({"key": f"{d['target']}:{d['attempt']}", "seed": seed, "binder": d["binder"], "sequences": t["sequences"], "pdb": t["pdb"]})
 items = items[:limit]
 rows = []

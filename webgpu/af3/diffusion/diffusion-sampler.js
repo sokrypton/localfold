@@ -14,6 +14,7 @@
 import { noiseLevels, randomAugmentation, samplerStep } from "../../../cpu/af3/diffusion/diffusion-sampler.js";
 import { weightedRigidAlign } from "../../../cpu/af3/diffusion/rigid-align.js";
 import { steerDenoised } from "../../../cpu/af3/diffusion/steering.js";
+import { inpaintDenoised } from "../../../cpu/af3/diffusion/inpaint.js";
 import { Af3DiffusionHeadGpu } from "./diffusion-head.js";
 
 /**
@@ -25,12 +26,16 @@ import { Af3DiffusionHeadGpu } from "./diffusion-head.js";
  *          noiseScale?: number, stepScale?: number, schedule?: "karras"|"geometric",
  *          update?: "euler"|"exponential", churn?: boolean,
  *          start?: {positions: Float32Array, level: number},
- *          steer?: {binder: number[], pocket: number[], weight: number, cutoff?: number}}} options
+ *          steer?: {binder: number[], pocket: number[], weight: number, cutoff?: number},
+ *          motif?: {slots: Int32Array, xyz: Float32Array, until?: number}}} options
  *   `start` begins the walk part-way down: at the first scheduled level at or below `level`
  *   (angstroms), from `positions` (the dense layout) plus that much noise, running only the steps
  *   left. RFdiffusion's partial diffusion, on AF3's schedule.
  *   `steer` pulls the `binder` tokens toward the `pocket` tokens: each denoised prediction has its
  *   binder translated down a contact restraint before the update reads it (cpu/af3/diffusion/steering.js).
+ *   `motif` holds those dense slots to its coordinates: each denoised prediction has them replaced by the
+ *   target fitted onto its own copies of them (cpu/af3/diffusion/inpaint.js, cuda/af3's --motif) while the
+ *   step's noise level is above `until` (angstroms, default 0: every step).
  */
 export async function sampleOnGpu(device, input, weights, options) {
   const { steps, normal } = options;
@@ -104,9 +109,12 @@ export async function sampleOnGpu(device, input, weights, options) {
                                weights);
     // 🔴 STEERING DISPLACES THE PREDICTION, NOT THE WALK: the update moves toward what it is handed,
     // so the restraint's descent step goes in here and the denoiser itself is untouched
-    const denoised = options.steer === undefined ? raw.positions
+    const steered = options.steer === undefined ? raw.positions
       : steerDenoised(raw.positions, input.atomMask, input.shape.dense, options.steer,
                       (step - first - 1) / (levels.length - 1 - first));
+    // ...and a motif held, the same way: the prediction's motif atoms replaced, the walk untouched
+    const denoised = options.motif === undefined || !(tHat > (options.motif.until ?? 0)) ? steered
+      : inpaintDenoised(steered, options.motif);
     // (boltz2 rigid-aligns the noisy copy onto the answer before the step: dialect.realignSampler)
     const aligned = input.dialect?.realignSampler === true
       ? weightedRigidAlign(noisy, denoised, input.atomMask, atoms) : noisy;

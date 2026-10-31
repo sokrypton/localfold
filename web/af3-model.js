@@ -15,6 +15,7 @@
  * for a single-sequence input rather than a stub.
  */
 import { startFromPdb } from "../shared/af3/structure/warm-start.js";
+import { motifSlots } from "../cpu/af3/diffusion/inpaint.js";
 import { ccdUrl, parseCcdComponent, ligandChain } from "../shared/af3/featurise/ccd-component.js";
 import { smilesComponent } from "../shared/chem/component.js";
 import { CROSSLINKER_COMPONENTS } from "../shared/chem/crosslinkers.js";
@@ -627,9 +628,14 @@ export async function foldAf3(options) {
   // batch, the one place both exist (cpu/af3/diffusion/steering.js). `binder` and each contact's `asym`
   // are the featuriser's 0-based chain order, as a constraint's are.
   const steer = options.steer === undefined ? undefined : steerTokens(batch, options.steer);
+  // 🔴 A MOTIF IS NAMED BY TOKEN AND ATOM NAME (a negative token a whole chain, by asymId) and the
+  // sampler holds DENSE SLOTS: resolved here, the one place the batch exists (cpu/af3/diffusion/inpaint.js)
+  const motif = options.motif === undefined ? undefined
+    : { ...motifSlots(batch, options.motif.atoms), ...(options.motif.until === undefined ? {} : { until: options.motif.until }) };
   const result = await foldBatch(device, batch, options.weights, {
     steps: calls, recycles, seed, reuse: options.reuse, templateSlots,
     ...(steer === undefined ? {} : { steer }),
+    ...(motif === undefined ? {} : { motif }),
     // ...forwarded for probes that move the noise schedule
     schedule: options.schedule,
     ...(start === undefined ? {} : { start }),

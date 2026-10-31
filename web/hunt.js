@@ -81,6 +81,10 @@ export { FOLDERS } from "./validate-design.js";
  * @param {{text: string, chainId: string, chain: number}[]} [options.templates] structures for
  *   the KEPT chains, as foldAf3 takes them, handed to every fold - a target folded from its
  *   sequence alone is a target nobody designed against
+ * @param {{atoms: (length: number) => {token: number, atom: string, xyz: number[]}[], until?: number}} [options.motif]
+ *   atoms held in every fold (cpu/af3/diffusion/inpaint.js, foldAf3's `motif`): a function of the run's
+ *   designed-chain LENGTH, because a token after that chain moves with it - a catalytic site's tips, a fixed
+ *   ligand's conformer, a given duplex. `until` releases the hold below that noise level (angstroms)
  * @param {(record: object) => void} options.report called once per cycle
  * @param {(text: string) => void} [options.status]
  * @param {(fraction: number) => void} [options.progress]
@@ -278,6 +282,8 @@ export async function hunt(options) {
             ? {} : { modifications }),
           ...(pocket.length > 0 && readsPocket(folder) ? { constraints: pocket } : {}),
           ...(steering ? { steer: { binder: chainIndex, contacts: pocket[0].contacts, ...options.steer } } : {}),
+          ...(options.motif === undefined ? {} : { motif: { atoms: options.motif.atoms(runLength),
+            ...(options.motif.until === undefined ? {} : { until: options.motif.until }) } }),
           seed: (options.seed ?? 0) + context.run,
           recycles: options.recycles,
           // 🔴 foldAf3 HAS NO DEFAULT FOR `calls` - it destructures it and the

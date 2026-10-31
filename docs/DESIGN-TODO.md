@@ -1117,3 +1117,16 @@ criterion is the task's own. `task-score.py` reports each variant against its ow
   read), and three result files got truncated lines. Error and truncated rows were dropped and re-run; `~/.cache`
   was cleared (the user's call; the CCD cache kept, the featuriser reads it every fold) for 33 GB.
 - The page A/B (PI/PF/NCn) was restarted lean, attempts 40-41.
+
+### Motif inpainting on the page (2026-10-31)
+
+`cuda/af3 --motif`, ported to the WebGPU sampler: `cpu/af3/diffusion/inpaint.js` (`motifSlots` resolves the native
+file's entries - a token and an atom name, a negative token a whole chain - against the batch; `inpaintDenoised`
+fits the target onto the denoised answer's own copies of those atoms and writes it in), applied in
+`sampleOnGpu` after steering (`motif: {slots, xyz, until}`), threaded through `foldBatch`, `foldAf3`
+(`motif: {atoms, until}`) and `hunt()` (`motif: {atoms: length => [...], until}`, a function of the run's drawn
+length because a token after the designed chain moves with it). Refused for OpenDDE (structural tokens), as
+steering is. Checked: M0050 (six catalytic tips + U5P) through the page's own `foldAf3`, same seed - motif RMSD
+**0.0007 A guided against 19.14 unguided** (native: 0.0007 against 6.26). `test/motif-inpaint.test.js` holds the
+name resolution and its refusals, and the fit (watched failing with the fit removed). Not yet a control on
+design.html: the page has no way to pick a motif's atoms or a ligand's conformer.

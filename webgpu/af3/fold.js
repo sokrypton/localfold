@@ -1243,9 +1243,14 @@ async function foldHolding(device, batch, weights, options, held) {
   if (options.steer !== undefined && structural !== undefined) {
     throw new Error("steering is not wired for a model that samples in structural tokens (OpenDDE)");
   }
+  // (a motif names dense RESIDUE slots, the same refusal)
+  if (options.motif !== undefined && structural !== undefined) {
+    throw new Error("a motif is not wired for a model that samples in structural tokens (OpenDDE)");
+  }
   const sampled = await sampleOnGpu(device, headInput, weights.diffusion, {
     ...(start === undefined ? {} : { start }),
     ...(options.steer === undefined ? {} : { steer: options.steer }),
+    ...(options.motif === undefined ? {} : { motif: options.motif }),
     steps, stopAfter: options.stopAfter, head,
     normal: normalFrom(options.seed ?? 20260831),
     onStep,
