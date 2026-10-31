@@ -1325,8 +1325,10 @@ inline void releaseScratch(std::initializer_list<const char*> names) {
 // Whether `bytes` more would fit on the card now with an eighth of it to spare - for the memory levers that
 // cost time (blocked contractions, recomputed biases), which only a short card should pay. Scratch held
 // under any of `held` already counts toward it, since the whole form would reuse it.
+inline LF_TLS std::map<std::pair<size_t, std::string>, bool> ROOM_ANSWERED;     // (a request -> the eager answer)
 inline bool roomFor(size_t bytes, std::initializer_list<const char*> held = {}) {
   if (BIG_FORCED) return false;
+  std::pair<size_t, std::string> asked{bytes, held.size() ? *held.begin() : ""};
   const void* seen[16]; int nSeen = 0;
   for (const char* p : held) {
     auto it = SCRATCH.find(heldAs(p));
@@ -1338,10 +1340,22 @@ inline bool roomFor(size_t bytes, std::initializer_list<const char*> held = {}) 
     if (nSeen < 16) seen[nSeen++] = ptr;
     bytes -= std::min(bytes, it->second.second);
   }
+  // 🔴 inside a capture: only what the eager pass already holds. The held scratch is subtracted above, so where the
+  // eager pass (nothing held yet) answered "no room" and sized a chunk, the captured pass would see that chunk
+  // subtracted, answer "room" and grow the buffer in the capture - rosettafold3 PPI folds beside other processes,
+  // tr.wide exactly doubling ("scratch slot.0 grows inside a graph capture", 2026-10-31). A capture never sizes scratch
+  // (scratchNamed), so a "no" here costs at most the chunked form, and a "yes" means every byte is already there
+  // So a capture repeats the answer the same request got outside it (the eager pass it repeats), and a request never
+  // made outside one is granted only from held scratch
+  cudaStreamCaptureStatus capturing; CK(cudaStreamIsCapturing(STREAM, &capturing));
+  if (capturing != cudaStreamCaptureStatusNone) {
+    auto it = ROOM_ANSWERED.find(asked);
+    return it != ROOM_ANSWERED.end() ? it->second : bytes == 0;
+  }
   static LF_TLS size_t f = 0, t = 0;
   static LF_TLS uint64_t gen = 0;
   if (gen != MEM_GEN) { deviceMemInfo(&f, &t); gen = MEM_GEN; }
-  return f > bytes + t / 8;
+  return ROOM_ANSWERED[asked] = f > bytes + t / 8;
 }
 // what holds the device when an allocation is refused: the largest scratch buffers, and the free memory
 inline void scratchReportOOM(const char* what, size_t bytes) {

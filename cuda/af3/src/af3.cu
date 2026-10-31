@@ -589,6 +589,7 @@ static int foldMain(int argc, char** argv) {
       passesRun = pass + 1;
       return true;
     };
+    ROOM_ANSWERED.clear();     // (a fold's own eager answers only: a resident server's last job asked on another card state)
     for (int pass = 0; pass <= lastPass; ++pass) {
       drawMsa(t);                   // (this pass's MSA rows, before - never inside - the captured graph)
       if (pass == 0) {
