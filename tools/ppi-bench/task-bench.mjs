@@ -47,7 +47,10 @@ const seedOf = (text) => createHash("sha1").update(text).digest().readUInt32LE(0
 const LETTERS = "ABCDEFGHIJ";
 
 /** One native fold of [binder, ...the task's chains] from an AF3 job; the structure and the paper's terms. */
-async function fold(t, binder, { steps, recycles, seed, motif, msa, model }) {
+// `model` (config): every fold that GENERATES - design folds, the internal check, probe, polish, climb, DNA frames -
+// runs on that checkpoint; only the final evaluation names AF3 (or `evalModel`) explicitly. So `model: "protenix2"`
+// is a pipeline in which AF3 never sees a design before it judges it.
+async function fold(t, binder, { steps, recycles, seed, motif, msa, model = config.model }) {
   const file = path.join(work, `f${process.pid}-${Date.now()}.pdb`);
   const job = file.replace(".pdb", ".json");
   // `msa`: sequences handed to AF3 as the binder's unpaired alignment (mpnnMsa); none, a single-sequence fold
@@ -343,8 +346,8 @@ async function attempt(name, index) {
   const evalSeed = 1 + Math.floor(rng() * 2 ** 30);
   const seed = 1000 * index + 7;
   const mpnn = mpnnFor(t.task);
-  const assess = async (binder, designPdb, foldSeed, positions) => {
-    const r = await fold(t, binder, { steps: 200, recycles: 5, seed: foldSeed });
+  const assess = async (binder, designPdb, foldSeed, positions, model) => {
+    const r = await fold(t, binder, { steps: 200, recycles: 5, seed: foldSeed, model });
     return { ...r, ...verdict(t.task, designPdb, r, t, positions) };
   };
   // `check.seeds`: a candidate passes the internal check only if it passes at that many seeds (the first that
@@ -650,7 +653,7 @@ async function attempt(name, index) {
       pass: c.result.pass, seedsPassed: c.result.seedsPassed })) };
   if (best !== null) {
     // 🔴 THE EVALUATION IS ALWAYS THE NATIVE AF3 at the benchmark's settings, with its own seed
-    const final = await assess(best.sequence, best.pdb, evalSeed, best.positions);
+    const final = await assess(best.sequence, best.pdb, evalSeed, best.positions, config.evalModel ?? "af3");
     Object.assign(row, { binder: best.sequence, bestCycle: best.cycle, bestRestart: best.restart,
       binderPtm: final.binderPtm, ipae: final.ipae, iptm: final.iptm, rmsd: final.rmsd, ligandRmsd: final.ligandRmsd,
       motifRmsd: final.motifRmsd, clashes: final.clashes, positions: best.positions,
@@ -681,7 +684,7 @@ async function rescore(rowsPath) {
     if (d.binder && positions !== null) {
       // `evalModel`: CROSS-EVALUATION - the same designs judged by a model that took no part in them (Protenix-2,
       // Boltz-2, ...), same settings, criterion and seed; AF3 when unset
-      const r = await fold(t, d.binder, { steps: 200, recycles: 5, seed: evalSeed, model: config.evalModel });
+      const r = await fold(t, d.binder, { steps: 200, recycles: 5, seed: evalSeed, model: config.evalModel ?? "af3" });
       Object.assign(row, { binder: d.binder, binderPtm: r.binderPtm, ipae: r.ipae, iptm: r.iptm, evalModel: config.evalModel ?? "af3",
         ...verdict(t.task, d.designPdb, r, t, positions) });
     } else {
