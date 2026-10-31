@@ -257,7 +257,16 @@ async function attempt(name, index) {
       const promising = mine.filter((e) => e.binderPtm >= cfg.check.ptm && e.ipae <= cfg.check.ipae)
         .sort((a, b) => a.ipae - b.ipae).slice(0, cfg.check.top);
       for (const entry of promising) {
-        const result = await assess(entry.sequence, entry.pdb, seed * 7 + entry.cycle + 1000 * restart, checkModel);
+        // `checkModel` may name several models: a CONSENSUS check, passed only when every one of them passes (the
+        // first that fails ends it); `check.passIpae` tightens the check's own iPAE bound, for a checker whose interface
+        // PAE runs lower than the evaluator's
+        let result;
+        for (const [k, model] of [].concat(checkModel).entries()) {
+          result = await assess(entry.sequence, entry.pdb, seed * 7 + entry.cycle + 1000 * restart + 7919 * k, model);
+          result.model = model;
+          if (result.ipae > (cfg.check.passIpae ?? 1.5)) result.pass = false;
+          if (!result.pass) break;
+        }
         checked.push({ entry, result });
         if (result.pass) break;
       }
@@ -274,7 +283,7 @@ async function attempt(name, index) {
     : confident.length > 0 ? confident.reduce((a, b) => (b.ipae < a.ipae ? b : a))
     : eligible.length > 0 ? eligible.reduce((a, b) => (b.binderPtm > a.binderPtm ? b : a)) : null;
   const row = { target: name, attempt: index, length, config: cfg.tag, runs, records, foldSeconds,
-    checks: checked.map((c) => ({ restart: c.entry.restart, cycle: c.entry.cycle, binderPtm: c.result.binderPtm, ipae: c.result.ipae, rmsd: c.result.rmsd })) };
+    checks: checked.map((c) => ({ restart: c.entry.restart, cycle: c.entry.cycle, model: c.result.model, binderPtm: c.result.binderPtm, ipae: c.result.ipae, rmsd: c.result.rmsd, pass: c.result.pass })) };
   if (best !== null) {
     // 🔴 THE EVALUATION IS ALWAYS AF3 (the native port), whatever designed or checked
     const final = await assess(best.sequence, best.pdb, evalSeed, "af3");
