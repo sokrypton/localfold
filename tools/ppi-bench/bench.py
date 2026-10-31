@@ -5,8 +5,11 @@ ROOT = os.path.expanduser("~/localfold"); sys.path.insert(0, os.path.join(ROOT, 
 HERE = os.path.dirname(os.path.abspath(__file__))
 def free():
     s = socket.socket(); s.bind(("127.0.0.1", 0)); p = s.getsockname()[1]; s.close(); return p
-out, config = sys.argv[1], json.load(open(sys.argv[2]))
-jobs = [a.split(":") for a in sys.argv[3:]]
+# --root=<dir>: serve the page from another checkout (a worktree carrying a change to test), not this one
+args = [a for a in sys.argv[1:] if not a.startswith("--root=")]
+SITE = next((a[7:] for a in sys.argv[1:] if a.startswith("--root=")), ROOT)
+out, config = args[0], json.load(open(args[1]))
+jobs = [a.split(":") for a in args[2:]]
 targets = json.load(open(os.path.join(HERE, "targets.json")))
 done = set()
 if os.path.exists(out):
@@ -14,7 +17,7 @@ if os.path.exists(out):
         d = json.loads(line); done.add((d["target"], d["attempt"]))
 bench_js = open(os.path.join(HERE, "bench.js")).read()
 port = free()
-srv = subprocess.Popen([sys.executable, os.path.join(ROOT, "tools/serve.py"), str(port)], cwd=ROOT,
+srv = subprocess.Popen([sys.executable, os.path.join(SITE, "tools/serve.py"), str(port)], cwd=SITE,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 prof = f"/tmp/localfold-bench-{os.getpid()}"
 proc, ws = None, None
