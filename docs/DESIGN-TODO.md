@@ -1094,7 +1094,9 @@ of the top 2) scores 24.1% through the page (`bench.js`, C) and 37.9% natively (
 - **The 10-29 page runs are low on native scoring too: W0 (no warm start) 8 of 48, W1 (warm start) 7 of 48**, where
   today's same configuration (PI) passes 16 of 48 on other attempts. Either 10-29's code or those attempts (W's
   lengths and seeds) were worse. **W0r** replays W0's exact attempts (same `pair`, so the same lengths and seeds) on
-  today's code, scored natively: (running).
+  today's code, scored natively: **10 of 48 against W0's 8**, with 29 of the 48 binders identical. So the code
+  barely moved; W's attempts (their lengths and seeds) are simply harder ones than PI's (16 of 48). 8 / 10 / 16 of 48
+  is within what attempt sampling gives, so there is no page deficit left to explain.
 - **The engines at EVALUATION settings (200 steps, 5 recycles; `engine-probe.py`, 2026-10-31):** PI's 48 designs
   (attempts 40-41) x seeds 101-104, 192 folds an arm. Check-worthy (pTM >= 0.8, iPAE <= 2.5) native 110 / page
   float32 102 / page int5 101; **evaluator-grade (pTM >= 0.8, iPAE <= 1.5) native 77 / page float32 76 / page int5
