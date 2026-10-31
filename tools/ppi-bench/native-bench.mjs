@@ -33,6 +33,61 @@ if ((await enableAcceleration(bytes(`${ROOT}/web/vendor/mpnn/kernels.wasm`))) ==
 const mpnn = new Model(Weights.fromArrayBuffer(bytes(`${ROOT}/web/public/mpnn/solublempnn_v_48_020.mpnn`)));
 const work = fs.mkdtempSync(path.join(os.tmpdir(), "ppi-native-"));
 
+/** A PDB's atoms as the minimal mmCIF the native RFD4-Proteina featuriser reads (it takes no PDB). */
+function pdbToCif(pdb) {
+  const rows = [];
+  for (const line of pdb.split("\n")) {
+    if (!line.startsWith("ATOM") && !line.startsWith("HETATM")) continue;
+    const name = line.slice(12, 16).trim();
+    const quoted = /['\d]/.test(name[0]) || name.includes("'") ? `"${name}"` : name;
+    const residue = Number(line.slice(22, 26));
+    rows.push([line.slice(0, 6).trim(), rows.length + 1, line.slice(76, 78).trim() || name[0], quoted, line.slice(17, 20).trim(),
+      line[21], residue, residue, line[21], line.slice(30, 38).trim(), line.slice(38, 46).trim(), line.slice(46, 54).trim(),
+      "1.00", (line.slice(60, 66).trim() || "0"), 1].join(" "));
+  }
+  const keys = "group_PDB id type_symbol label_atom_id label_comp_id label_asym_id label_seq_id auth_seq_id auth_asym_id"
+    + " Cartn_x Cartn_y Cartn_z occupancy B_iso_or_equiv pdbx_PDB_model_num";
+  return `data_design\nloop_\n${keys.split(" ").map((k) => `_atom_site.${k}\n`).join("")}${rows.join("\n")}\n#\n`;
+}
+
+/**
+ * `designer: "rfd4p"`: RFD4-Proteina's inverse folding (cuda/rfd4p, int8) in MPNN's place - every backbone held, the
+ * other chains' sequences conditioned, chain A's sequence and side chains co-designed by the model. Returns chain A.
+ */
+async function rfd4pDesign(pdb, seed) {
+  const stem = path.join(work, `if${process.pid}-${Date.now()}`);
+  // 🔴 AN UNKNOWN RESIDUE IS DROPPED BY ITS FEATURISER, AND A CYCLE-0 BINDER IS MOSTLY UNKNOWN: the whole chain went,
+  // and the design came back without chain A. Its backbone named GLY is the same backbone, which is all an inverse
+  // fold reads of a position it is about to rewrite.
+  pdb = pdb.split("\n").filter((l) => !(l.startsWith("ATOM") && l.slice(17, 20) === "UNK"
+    && !["N", "CA", "C", "O"].includes(l.slice(12, 16).trim())))
+    .map((l) => (l.startsWith("ATOM") && l.slice(17, 20) === "UNK" ? `${l.slice(0, 17)}GLY${l.slice(20)}` : l)).join("\n");
+  fs.writeFileSync(`${stem}.cif`, pdbToCif(pdb));
+  const chains = new Map();
+  for (const line of pdb.split("\n")) {
+    if (!line.startsWith("ATOM")) continue;
+    const r = Number(line.slice(22, 26));
+    const span = chains.get(line[21]) ?? [r, r];
+    chains.set(line[21], [Math.min(span[0], r), Math.max(span[1], r)]);
+  }
+  const others = [...chains.keys()].filter((c) => c !== "A");
+  fs.writeFileSync(`${stem}.json`, JSON.stringify({ input: `${stem}.cif`, inverseFolding: true, nsteps: 60,
+    contig: [...chains].map(([c, [a, b]]) => `${c}${a}-${b}`).join(",/0,"),
+    conditions: { C_SEQ: { true: others.map((c) => ({ select: `sel('${c}/*/*/*')` })) } } }));
+  await run(`${ROOT}/cuda/rfd4p/localfold-rfd4p`, [`--job=${stem}.json`, `--int8=${ROOT}/model-rfd4p-int8`,
+    `--out=${stem}.out.pdb`, "--fast", `--seed=${seed}`], { maxBuffer: 1 << 26 });
+  const three = { ALA: "A", ARG: "R", ASN: "N", ASP: "D", CYS: "C", GLN: "Q", GLU: "E", GLY: "G", HIS: "H", ILE: "I",
+    LEU: "L", LYS: "K", MET: "M", PHE: "F", PRO: "P", SER: "S", THR: "T", TRP: "W", TYR: "Y", VAL: "V" };
+  const sequence = fs.readFileSync(`${stem}.out.pdb`, "utf8").split("\n")
+    .filter((l) => l.startsWith("ATOM") && l[21] === "A" && l.slice(12, 16).trim() === "CA")
+    .map((l) => three[l.slice(17, 20)] ?? "X").join("");
+  for (const f of fs.readdirSync(work)) if (f.startsWith(path.basename(stem))) fs.rmSync(path.join(work, f), { recursive: true });
+  if (sequence.length !== chains.get("A")[1] - chains.get("A")[0] + 1) {
+    throw new Error(`RFD4-Proteina returned ${sequence.length} residues for chain A`);
+  }
+  return { sequence, score: 0 };
+}
+
 // seeded, as the page's hunt is: one stream per attempt
 function mulberry(seed) {
   let a = seed >>> 0;
@@ -152,6 +207,8 @@ async function attempt(name, index) {
       const stream = runDesign({
         chains: ["", ...t.sequences], chainIndex: 0, cycles: cfg.cycles, length, run: restart,
         seed: seed + 101 * restart, signal: controller.signal, kind: "protein",
+        // `omit`: the letters MPNN may never write (the loop's default is "C"; "" allows cysteine)
+        ...(cfg.omit === undefined ? {} : { omit: cfg.omit }),
         veto: ({ pdb }) => contactProblem(pdb, { chain: "A" }),
         fold: async (sequence, context) => {
           const t0 = Date.now();
@@ -171,7 +228,9 @@ async function attempt(name, index) {
           foldSeconds += (Date.now() - t0) / 1000;
           return { pdb: r.pdb, confidence: r.confidence, terms: { binderPtm: r.binderPtm, ipae: r.ipae } };
         },
-        design: (pdb, context) => designChain(mpnn, { pdb, chain: context.chain, temperature: context.temperature,
+        design: (pdb, context) => cfg.designer === "rfd4p"
+          ? rfd4pDesign(pdb, seed + 101 * restart + 13 * context.cycle + 1000 * (context.draw ?? 0))
+          : designChain(mpnn, { pdb, chain: context.chain, temperature: context.temperature,
           ...(statesOf.has(pdb) ? { states: statesOf.get(pdb).map((other) => ({ pdb: other })) } : {}),
           omit: context.omit, alanineBias: context.alanineBias, random: context.random, hold: context.hold, kind: context.kind }),
       });

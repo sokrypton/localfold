@@ -1158,6 +1158,17 @@ criterion is the task's own. `task-score.py` reports each variant against its ow
   - **TD15S** = TD15, unfixed DNA (3 targets x attempts 0-9).
   - TD21F and TD19 are paused (SIGSTOP) for them; TD20F was stopped at 1 of 30 against TD18F's 2 on the same
     attempts.
+- **NCR: RFD4-Proteina's inverse folding as the designer**, in MPNN's place (`designer: "rfd4p"` in
+  native-bench.mjs). Each redesign is `cuda/rfd4p/localfold-rfd4p` (int8, `--fast`) on the design fold:
+  - `inverseFolding`, 60 steps;
+  - every backbone held, and the target's sequence conditioned (`C_SEQ`);
+  - the input written as a minimal mmCIF, because the native featuriser reads no PDB;
+  - 🔴 a cycle-0 binder's UNK residues renamed GLY (backbone only), because its featuriser drops a chain of
+    unknowns whole and the design came back without chain A.
+  - Cysteine is allowed, since RFD4's inverse fold has no omit. The user cleared RFD4-Proteina's weights for this.
+  - Same 48 attempts as NC.
+- **NCC: NC with cysteine allowed** (`omit: ""`; the loop's default forbids C). It asks whether blocking cysteines
+  costs PPI passes. Same 48 attempts.
 
 - 🔴 **THE DISK FILLED (497 GB, 4.5 MB free)** while the page A/B's browsers each cached the 1.4 GB float32 bundle:
   native folds failed in the `fold` wrapper (`exit: : numeric argument required` - its `.done` file could not be
