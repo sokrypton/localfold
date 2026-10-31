@@ -85,6 +85,12 @@ export { FOLDERS } from "./validate-design.js";
  *   atoms held in every fold (cpu/af3/diffusion/inpaint.js, foldAf3's `motif`): a function of the run's
  *   designed-chain LENGTH, because a token after that chain moves with it - a catalytic site's tips, a fixed
  *   ligand's conformer, a given duplex. `until` releases the hold below that noise level (angstroms)
+ * @param {number} [options.foldTries=1] a fold that leaves the designed chain touching nothing is folded again at the
+ *   next seed, up to this many times, so MPNN designs from a docked backbone rather than a binder floating free
+ *   (task-bench's `contactTries`; the DNA recipe's 5)
+ * @param {boolean} [options.stick] a cycle that will not dock hands the NEXT design the run's last docked fold instead
+ *   of its own, marked `stuck` - MPNN redesigning an undocked binder writes a soluble protein that never comes back.
+ *   A stuck cycle's structure is not its sequence's, so a caller must never choose it (cpu/design/protocol.js)
  * @param {(record: object) => void} options.report called once per cycle
  * @param {(text: string) => void} [options.status]
  * @param {(fraction: number) => void} [options.progress]
@@ -207,6 +213,8 @@ export async function hunt(options) {
     // 🔴 ...AND STEERED TOWARD BY ANY FOLDER, when asked: the same chains and residues, pulled on
     // during the diffusion instead of read by the network
     const steering = options.steer !== undefined && pocket.length > 0;
+    // the run's last fold that touched its target, for `stick`
+    let lastDocked = null;
 
     const stream = runDesign({
       chains: runChains.slice(), chainIndex, cycles, length: runLength, run, signal,
@@ -261,7 +269,7 @@ export async function hunt(options) {
         // structure, instead of from noise (shared/af3/structure/warm-start.js)
         const warm = options.warm !== undefined && context.previous !== undefined
           && context.cycle >= (options.warm.from ?? 2);
-        return foldAf3({
+        const foldAt = (seed) => foldAf3({
           sequence, weights: loaded.get(folder), device, signal,
           // 🔴 THE TARGET AS ITS OWN TEMPLATE, as the refold (validate-design.js) and RFD4-Proteina's
           // AF3 benchmark both fold it (2026-10-29): designing against a target AF3 refolds elsewhere
@@ -284,7 +292,7 @@ export async function hunt(options) {
           ...(steering ? { steer: { binder: chainIndex, contacts: pocket[0].contacts, ...options.steer } } : {}),
           ...(options.motif === undefined ? {} : { motif: { atoms: options.motif.atoms(runLength),
             ...(options.motif.until === undefined ? {} : { until: options.motif.until }) } }),
-          seed: (options.seed ?? 0) + context.run,
+          seed,
           recycles: options.recycles,
           // 🔴 foldAf3 HAS NO DEFAULT FOR `calls` - it destructures it and the
           // caller owns it - so passing `undefined` folds anyway and writes
@@ -297,6 +305,19 @@ export async function hunt(options) {
             + `${folders.length > 1 ? ` · ${folder}` : ""} · ${text}`),
           onProgress: (fraction) => toBar(spanOf(done, fraction)),
         });
+        // 🔴 `foldTries` AND `stick` ARE OFF UNLESS ASKED, so a plain hunt folds exactly as before: one fold a cycle
+        // at the run's seed. A retry's seed is a fixed offset from it, so a hunt is still named by its seed.
+        const tries = options.foldTries ?? 1;
+        let folded;
+        let docked = false;
+        for (let k = 0; k < tries; k += 1) {
+          folded = await foldAt((options.seed ?? 0) + context.run + 7919 * k);
+          if (tries === 1 && !options.stick) return folded;
+          if (contactProblem(folded.pdb, { chain: CHAIN_IDS[chainIndex] }) === null) { docked = true; break; }
+        }
+        if (docked) lastDocked = folded;
+        else if (options.stick && lastDocked !== null) return { ...lastDocked, stuck: true };
+        return folded;
       },
 
       design: async (pdb, context) => {

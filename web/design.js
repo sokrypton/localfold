@@ -28,6 +28,8 @@ import { chooseDesigner, DESIGNERS } from "../cpu/design/designers.js";
 import { CHAIN_IDS, MAX_ALANINE } from "../webgpu/design/hunter-loop.js";
 
 import { hunt } from "./hunt.js";
+import { search } from "./search.js";
+import { protocolFor } from "../cpu/design/protocol.js";
 import { createStructureViewer } from "./viewer.js";
 import {
   createConditionEditor, inputResidueMap, inputStructureAtoms, picksOf, residueRanges, segmentsOf,
@@ -216,6 +218,8 @@ const number = (id, fallback) => {
 
 const designerSelect = element("designer");
 const designerNote = element("designer-note");
+const searchSelect = element("search");
+const searchNote = element("search-note");
 
 /**
  * What the Designer picker says underneath itself.
@@ -225,6 +229,28 @@ const designerNote = element("designer-note");
  * the target - picking ProteinMPNN against a ligand is legal and loses the
  * ligand, and the page should say which.
  */
+/**
+ * Which recipe a search would run for this job, and why - or why none applies. The recipe's own numbers replace
+ * Cycles, Temperature, Omit and the designer, and the note says so, because a control the run then ignores is a
+ * control that lies.
+ */
+const searchRecipe = (spans) => {
+  const { chains, ligandCodes } = chainsOf(spans, readers());
+  return protocolFor({ ...contentsOf(spans), partners: Math.max(0, chains.length - 1) + (ligandCodes?.length ?? 0) });
+};
+const paintSearchNote = (spans) => {
+  const on = method.value === "hunter" && searchSelect.value === "recipe";
+  searchNote.hidden = !on;
+  if (!on) return;
+  const { protocol, why } = searchRecipe(spans);
+  searchNote.classList.toggle("warn", protocol === null);
+  searchNote.textContent = protocol === null ? `No benchmark recipe fits this job: ${why}.`
+    : `The ${protocol.criterion === "ppi" ? "protein-binder" : protocol.criterion === "sm" ? "small-molecule" : "DNA"}`
+      + ` recipe (${protocol.tag}), because ${why}: up to ${protocol.restarts} restarts of ${protocol.cycles} cycles,`
+      + ` the best cycles refolded at 200 steps as a check${protocol.polish === undefined ? "" : ", near misses polished"}.`
+      + " Its own cycles, temperature, omitted letters and designer replace the ones set here.";
+};
+
 const paintDesignerNote = (spans) => {
   const contents = contentsOf(spans);
   if (method.value !== "hunter") { designerNote.textContent = ""; return; }
@@ -504,6 +530,7 @@ const paintJob = () => {
   contigProblems.textContent = theirs.join(" · ");
   contigProblems.classList.toggle("warn", theirs.length > 0);
   paintDesignerNote(spans);
+  paintSearchNote(spans);
   warnIgnoredEdit(spans);
   scheduleJobView();
 };
@@ -511,6 +538,7 @@ const paintJob = () => {
 window.__designSpans = spanList;
 
 designerSelect.addEventListener("change", () => paintDesignerNote(spanList.read()));
+searchSelect.addEventListener("change", () => paintSearchNote(spanList.read()));
 // A random seed, drawn on request rather than behind the reader's back: the box shows it, so the
 // same design can be made again.
 element("random-seed").addEventListener("click", () => {
@@ -546,6 +574,7 @@ const UNUSED_BY = {
   rfd4p: {
     folderGroup: "RFD4-Proteina generates structure directly, so nothing folds it in a loop.",
     cyclesGroup: "RFD4-Proteina has no fold-and-redesign cycle to repeat.",
+    searchGroup: "The search wraps Protein Hunter's hunt; RFD4-Proteina generates once.",
     stayGroup: "RFD4-Proteina has no cycle to hold to the one before.",
     warmGroup: "RFD4-Proteina has no previous cycle to start a fold from.",
     steerGroup: "RFD4-Proteina conditions on hotspots itself.",
@@ -710,6 +739,7 @@ const drawCycle = (record) => {
     if (className) cell.className = className;
     row.append(cell);
   }
+  row.dataset.key = `${record.run}:${record.cycle}`;
   resultsBody.append(row);
 
   // 🔴 PUSHED BEFORE THE ROW IS DRAWN would be wrong: the viewer is built on
@@ -1206,6 +1236,35 @@ window.__designDrawn = () => (inputView === null ? null : {
   positions: viewer.renderer?.chains?.length ?? 0,
 });
 
+/**
+ * A search's answer on the page: its design marked best in the table, the track and the refold picker. A polished
+ * design was never a hunt's cycle, so it joins the designs list here.
+ */
+function finishSearch({ best, passed, checks, runs, polished }) {
+  if (best === null) {
+    say(`no design: ${runs} restarts found no eligible cycle`);
+    return;
+  }
+  for (const design of designs) if (design.record !== undefined) design.record.best = false;
+  for (const marked of resultsBody.querySelectorAll("tr.best")) marked.classList.remove("best");
+  let found = designs.find((design) => design.record?.run === best.restart && design.record?.cycle === best.cycle
+    && design.record?.sequence === best.sequence);
+  if (found === undefined) {
+    const chain = CHAIN_IDS[0];
+    found = { label: `Polish ${best.cycle + 1}`, pdb: reference === null ? best.pdb : alignToReference(best.pdb, reference, chain),
+      chain, record: { run: best.restart, cycle: best.cycle, sequence: best.sequence, chain } };
+    designs.push(found);
+  }
+  found.record.best = true;
+  resultsBody.querySelector(`tr[data-key="${best.restart}:${best.cycle}"]`)?.classList.add("best");
+  paintRefoldStep();
+  const check = best.check;
+  say(`done · ${passed ? "passed its check" : "no check passed; the nearest miss"} · ${found.label}`
+    + (check === undefined ? "" : ` · check iPAE ${check.ipae.toFixed(2)}, RMSD ${check.rmsd.toFixed(1)} Å`)
+    + ` · ${runs} restart${runs === 1 ? "" : "s"}, ${checks.length} check${checks.length === 1 ? "" : "s"}`
+    + (polished > 0 ? `, ${polished} polished` : ""));
+}
+
 const startHunt = async () => {
   const spans = spanList.read();
   // 🔴 THE SPANS ARE THE JOB; `chainsOf` is how Hunter reads them. It also says
@@ -1215,6 +1274,13 @@ const startHunt = async () => {
     = chainsOf(spans, readers());
   if (problems.length > 0) {
     say(problems.join(" · "), true);
+    return;
+  }
+  // 🔴 THE SEARCH TAKES THE SAME JOB AND THE SAME HUNT SETTINGS, with the recipe's numbers over the few it owns, and
+  // answers with ONE design: the first whose check passed, else the nearest miss (web/search.js)
+  const recipe = searchSelect.value === "recipe" ? searchRecipe(spans) : null;
+  if (recipe !== null && recipe.protocol === null) {
+    say(`no benchmark recipe fits this job: ${recipe.why}`, true);
     return;
   }
   const controller = new AbortController();
@@ -1234,8 +1300,16 @@ const startHunt = async () => {
   progress.value = 0;
   progress.dataset.state = "running";
 
+  const runner = recipe === null ? hunt : (options) => search({
+    ...options, protocol: recipe.protocol,
+    // a search's restarts are its runs: the table numbers them, and a length range draws one per restart
+    report: (record) => { record.run = record.restart; options.report(record); },
+    onCheck: (check) => say(`restart ${check.restart + 1} · cycle ${check.cycle} checked: iPAE ${check.ipae.toFixed(2)},`
+      + ` RMSD ${check.rmsd.toFixed(1)} Å — ${check.pass ? "passes" : "misses"}`),
+  });
+
   try {
-    const { best, cycles } = await hunt({
+    const outcome = await runner({
       // 🔴 RE-READ PER RUN, so a length RANGE becomes a search over lengths
       // rather than a notation the hunt ignores. `drawLengths` is deterministic
       // in the seed and the run, so the same hunt twice is the same hunt.
@@ -1290,6 +1364,12 @@ const startHunt = async () => {
       status: (text) => say(text),
       progress: (fraction) => { progress.value = fraction; },
     });
+    if (recipe !== null) {
+      finishSearch(outcome);
+      progress.dataset.state = "done";
+      return;
+    }
+    const { best, cycles } = outcome;
     // 🔴 WHY NO CYCLE WON, FROM THE CYCLES THEMSELVES. This used to blame the
     // alanine ceiling unconditionally, which became a lie the moment a second
     // veto existed: a run rejected for touching nothing was reported as

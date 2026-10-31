@@ -1149,3 +1149,59 @@ steering is. Checked: M0050 (six catalytic tips + U5P) through the page's own `f
 **0.0007 A guided against 19.14 unguided** (native: 0.0007 against 6.26). `test/motif-inpaint.test.js` holds the
 name resolution and its refusals, and the fit (watched failing with the fit removed). Not yet a control on
 design.html: the page has no way to pick a motif's atoms or a ligand's conformer.
+
+### The benchmark recipe on design.html: Search (2026-10-31) - built; the page A/B is running
+
+Every winning run is one loop around a hunt with a few switches that the job's own contents decide. So that loop now
+lives in the page rather than in the bench harnesses:
+
+- **`cpu/design/protocol.js`** holds the recipes as data, named by the run that measured them:
+  - `PROTOCOLS.ppi` = NC;
+  - `PROTOCOLS.sm` = TS7;
+  - `PROTOCOLS.dna` = TD15.
+
+  `protocolFor(contents)` picks one from what the job carries: a ligand, a DNA/RNA chain, or a protein partner. It
+  returns none, with the reason, for a job with nothing to bind, a designed nucleic chain, or a ligand and DNA
+  together (no benchmark measured that).
+
+  The same module holds what the recipes are judged by:
+  - `interfaceTerms`: the designed chain's pTM, its mean pair ipTM, and its lowest two-way interface PAE;
+  - `verdict`: the paper's three criteria on a design and its refold;
+  - `footprint`.
+- **`web/search.js`** is the loop:
+  - restarts at `seed + 101 r`, each a one-run `hunt()`, stopped by `controller.abort()` on a confident cycle;
+  - the restart's top cycles refolded FREE at 200 steps / 5 recycles, at `7 seed + cycle + 1000 r`, every one of
+    `check.seeds` seeds required;
+  - a polish of the nearest checked misses when nothing passed;
+  - the answer: the first passing check, else the nearest miss.
+
+  Those seeds are bench.js's, so a PPI search is bench.js's NC attempt. Its folds and designer are injectable, and
+  `test/design-search.test.js` runs the whole loop with scripted folds. It was watched failing with the early stop
+  removed and with the check-pass exit removed.
+- **`web/hunt.js`** gained the DNA recipe's two fold-side switches, both off by default so a plain hunt is unchanged:
+  - `foldTries`: an undocked fold is refolded at `seed + 7919 k`;
+  - `stick`: an undocked cycle hands the next design the run's last docked fold, marked `stuck`, and the search
+    never chooses it.
+- **design.html** has **Search: One hunt / Benchmark recipe** beside Cycles:
+  - the note under it names the recipe it will run and why, or why none fits;
+  - the recipe's cycles, temperature, omitted letters and designer replace the page's own, and the note says so;
+  - the answer is marked best in the table and the refold picker, and a polished design is added to the picker,
+    since it was never a cycle.
+
+  Driven in a fresh page:
+  - from scratch: "nothing to bind";
+  - PD-L1: NC;
+  - SAM: TS7;
+  - 7M5W: TD15.
+- **The check:** `bench.js` with `search: true` (config-PIS) sends a PI attempt through `web/search.js`.
+  - **01_PD1:40 reproduced PI's row exactly**: same binder, restart 3 cycle 4, 3 restarts.
+  - **04_IFNAR2:40 did not, and the cause is upstream of the search.** Cycle 0, the same seed and the same starting
+    sequence, already read iPAE 6.204 against PI's 6.244.
+  - A fresh-process fold at a seed repeats to the digit (fold.js, pLDDT 33.5505 twice). So the page's folds depend
+    on what the page did before: PI ran its attempts in another order in a long-lived browser.
+  - The A/B that answers it runs each arm on the same attempt in its own fresh browser, old loop then new: (running).
+- **Not on the page yet:**
+  - the AME extras (motif placement, the free refold of each design, order-free motif matching, the climb);
+  - holding a loaded structure's ligand or duplex coordinates (fixed ligand / fixed DNA): `hunt({motif})` takes the
+    atoms, but nothing on the page builds them;
+  - the TD18F guide release.

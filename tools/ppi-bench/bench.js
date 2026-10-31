@@ -108,6 +108,27 @@ window.__bench = async (cfg) => {
         chains, chains.map(() => "protein")).alignment;
     };
   }
+  // 🔴 cfg.search: the same attempt through web/search.js, the page's own search loop, with this config's numbers as
+  // its protocol - so the loop the page runs is held to this one's rows at the same seeds (docs/DESIGN-TODO.md)
+  if (cfg.search) {
+    const { search } = await import("/web/search.js");
+    const protocol = { criterion: "ppi", cycles: cfg.cycles, steps: cfg.steps, recycles: cfg.recycles,
+      restarts: cfg.restarts ?? 1, stop: { confidence: cfg.stop.ptm, ipae: cfg.stop.ipae },
+      check: { top: cfg.check.top, confidence: cfg.check.ptm, ipae: cfg.check.ipae } };
+    const t0 = performance.now();
+    const out = await search({
+      chains: ["", ...t.sequences], chainIndex: 0, length: cfg.length, folders: cfg.folders ?? ["af3"], seed: cfg.seed,
+      templates, protocol, ...(Object.keys(hotspots).length > 0 ? { hotspots } : {}), ...(cfg.hunt ?? {}),
+    });
+    const huntSeconds = (performance.now() - t0) / 1000;
+    const summary = { huntSeconds, records: out.records, runs: out.runs, viaSearch: true,
+      checks: out.checks.map((c) => ({ restart: c.restart, cycle: c.cycle, binderPtm: c.binderPtm, ipae: c.ipae, rmsd: c.rmsd })) };
+    if (out.best === null) return { ...summary, best: null };
+    const final = await assess(out.best.sequence, out.best.pdb, cfg.evalSeed);
+    return { ...summary, binder: out.best.sequence, bestCycle: out.best.cycle, bestRestart: out.best.restart,
+      bestScore: out.best.score, chainPtm: final.chainPtm, coi: final.coi, ipae: final.ipae, rmsd: final.rmsd,
+      designPdb: out.best.pdb, refoldPdb: final.refoldPdb, iptm: final.iptm, ptm: final.ptm };
+  }
   const started = performance.now();
   const eligible = [];
   const checked = [];

@@ -153,6 +153,18 @@ The style IS index.html's: py2Dmol's light application CSS plus web/localfold.cs
                             <input type="number" id="cycles" min="1" max="50" value="5"
                                 title="How many fold-then-redesign rounds each run does.">
                         </div>
+                        <!-- 🔴 SEARCH (2026-10-31): the recipe that beat RFD4-Proteina + Search on its benchmarks
+                             (cpu/design/protocol.js, web/search.js) - restarts that stop on a confident cycle, the
+                             best cycles refolded at the evaluation's settings as a check, the nearest misses polished
+                             - chosen from what the job carries. Off is one hunt, as before. -->
+                        <div class="fetch-option-group" id="searchGroup">
+                            <label class="fetch-option-title" for="search">Search</label>
+                            <select id="search"
+                                title="One hunt, or the benchmark's recipe: restarts, a check fold of the best cycles at the evaluation's settings, and a polish of near misses. Much longer; it ends at the first design whose check passes.">
+                                <option value="off" selected>One hunt</option>
+                                <option value="recipe">Benchmark recipe</option>
+                            </select>
+                        </div>
                         <!-- 🔴 HISTORY (2026-10-28): blank is the reference's method. Set, each cycle draws up
                              to "Sequences" designs one at a time and keeps the first whose fold stays this
                              close to the cycle before (web/hunt.js, `accept`). -->
@@ -258,6 +270,7 @@ The style IS index.html's: py2Dmol's light application CSS plus web/localfold.cs
                              costs in folds. -->
                         <div class="design-notes">
                             <div id="unused-note" class="option-note" hidden></div>
+                            <div id="search-note" class="option-note" hidden></div>
                             <div id="designer-note" class="option-note"></div>
                             <div id="folder-note" class="option-note"></div>
                         </div>
