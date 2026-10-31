@@ -118,8 +118,9 @@ async function fold(t, templateFile, sequence, { model = "af3", steps, recycles,
   } else {
     input.push(...alignment);
   }
-  await run(`${ROOT}/cuda/af3/fold`, [file, ...input, ...templated,
-    ...(model === "af3" ? [] : [`--model=${model}`]), "--", `--steps=${steps}`, `--recycles=${recycles}`, `--seed=${seed}`],
+  // (a standalone model's fold takes a GPU slot - tools/ppi-bench/gpu-slot; the resident AF3 server's does not)
+  await run(model === "af3" ? `${ROOT}/cuda/af3/fold` : `${HERE}/gpu-slot`, [...(model === "af3" ? [] : [`${ROOT}/cuda/af3/fold`]),
+    file, ...input, ...templated, ...(model === "af3" ? [] : [`--model=${model}`]), "--", `--steps=${steps}`, `--recycles=${recycles}`, `--seed=${seed}`],
     { maxBuffer: 1 << 26 });
   const pdb = fs.readFileSync(file, "utf8");
   const s = JSON.parse(fs.readFileSync(file.replace(".pdb", "_summary_confidences.json"), "utf8"));

@@ -24,7 +24,7 @@ def sequence_of(d): return ":".join([d["binder"]] + targets[d["target"]]["sequen
 if model == "ef2":
     for d in rows:
         if not os.path.exists(out_of(d)):
-            subprocess.run([os.path.join(ROOT, "cuda/ef2/fold"), out_of(d), f"--sequence={sequence_of(d)}",
+            subprocess.run([os.path.join(HERE, "gpu-slot"), os.path.join(ROOT, "cuda/ef2/fold"), out_of(d), f"--sequence={sequence_of(d)}",
                             "--", f"--seed={seed}"], check=True, stdout=subprocess.DEVNULL)
 else:
     lines = []
@@ -39,7 +39,7 @@ else:
     batch = os.path.join(work, "batch.txt")
     open(batch, "w").write("\n".join(lines) + "\n")
     if lines:
-        subprocess.run([os.path.join(ROOT, "cuda/af3/fold"), f"--batch={batch}", f"--model={model}", "--",
+        subprocess.run([os.path.join(HERE, "gpu-slot"), os.path.join(ROOT, "cuda/af3/fold"), f"--batch={batch}", f"--model={model}", "--",
                         "--recycles=5", "--steps=200", f"--seed={seed}"], check=True, stdout=subprocess.DEVNULL)
 
 def backbone(text):

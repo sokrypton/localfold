@@ -64,7 +64,9 @@ async function fold(t, binder, { steps, recycles, seed, motif, msa, model = conf
   // `motif`: a design fold inpainted with the task's catalytic motif (cuda/af3 --motif; never a check or the evaluation)
   const guide = motif === undefined ? [] : [`--motif=${motif}`, ...(config.motifUntil === undefined ? [] : [`--motif-until=${config.motifUntil}`])];
   // `model`: another AF3-lineage checkpoint (cuda/af3/fold --model=, its own standalone process - one resident server)
-  await run(`${ROOT}/cuda/af3/fold`, [file, `--job=${job}`, ...(model === undefined || model === "af3" ? [] : [`--model=${model}`]), "--", `--steps=${steps}`, `--recycles=${recycles}`, `--seed=${seed}`, ...guide],
+  // (a standalone model's fold takes a GPU slot - tools/ppi-bench/gpu-slot; the resident AF3 server's does not)
+  const standalone = model !== undefined && model !== "af3";
+  await run(standalone ? `${HERE}/gpu-slot` : `${ROOT}/cuda/af3/fold`, [...(standalone ? [`${ROOT}/cuda/af3/fold`] : []), file, `--job=${job}`, ...(standalone ? [`--model=${model}`] : []), "--", `--steps=${steps}`, `--recycles=${recycles}`, `--seed=${seed}`, ...guide],
     { maxBuffer: 1 << 26 });
   const pdb = fs.readFileSync(file, "utf8");
   const s = JSON.parse(fs.readFileSync(file.replace(".pdb", "_summary_confidences.json"), "utf8"));
