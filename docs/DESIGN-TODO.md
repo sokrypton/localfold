@@ -1025,8 +1025,12 @@ them - every conditioned atom is coordinate group 0), and no polymer-ligand pair
   cycle's backbone at temperature 0.3, the motif held - handed to AF3 as the binder's unpaired MSA in every guided
   design fold, its depth falling linearly to none at the last cycle so the run ends single-sequence, as it is
   judged. Probes, checks and the evaluation stay single-sequence. Run in RFD4-Proteina's per-target order, best
-  first. Results (partial, strongest targets first): 7 of 12 passed, 58.3% against RFD4-Proteina's 32.2% on those
-  12 - including M0097 and M0738, which TA6 missed on both attempts.
+  first. **A null, stopped at 32 of 37 targets.** Paired with TA6 on the same attempt-0 targets (same placements and
+  seeds through `pair`): **10 passes against 9**, 5 targets only with the MSA and 4 only without - where TA6's own
+  second attempt on those targets passes 6, so one is noise. The probes (the single-sequence folds that judge each
+  design) are slightly WORSE with it: motif within 1.5 A on 7.5% of cycles against 8.6%, median iPAE 4.79 against
+  3.75. The 31% it showed beside TA6's 21.6% was a strongest-first subset against all 37. It also costs 32 MPNN draws
+  a cycle on the CPU. TA6 stays the AME recipe.
 - **TA6, 2 attempts on each target (TA6 + TA6b): 22.1% (CI 17.6-26.5) over 34 targets, a pass on 10**, against
   RFD4-Proteina high's 14.9% on the same 34. Ours both times: M0129 (theirs 63%), M0710 (37%), M0110 (13%), M0717
   (8%), M0096 (1.5%); once: M0630, M0636, M0209, M0739, M0664. Missed where theirs is high: M0097 (47%), M0738 (43%),
@@ -1071,7 +1075,10 @@ of the top 2) scores 24.1% through the page (`bench.js`, C) and 37.9% natively (
   median iPAE on finished designs that agree, and possibly more on the X-rich ones a run starts from.
 - **The test running: PI/PF**, the page's own loop on its int5 bundle against the float32 export (`cfg.bundle`, a
   `bench.js`-only override of AF3's registry entry), no warm start, attempts 40-41 on all 24 targets, paired; NCn is
-  native on the same attempts. Results: (running)
+  native on the same attempts. **44 paired attempts: page int5 10, page float32 10, native 14** - int5 is not it; the
+  page's loop still trails native by about a third (means 20.8 / 27.1 / 33.3% over 24 targets). Its design cycles
+  are vetoed for touching nothing ~4% of the time against native's <1%, and it folds every cycle of a run at one
+  seed where native varies it per cycle - the next arm.
 
 ### The other datasets the paper reports (2026-10-30, night) - running
 
