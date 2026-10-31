@@ -1079,6 +1079,18 @@ of the top 2) scores 24.1% through the page (`bench.js`, C) and 37.9% natively (
   page's loop still trails native by about a third (means 20.8 / 27.1 / 33.3% over 24 targets). Its design cycles
   are vetoed for touching nothing ~4% of the time against native's <1%, and it folds every cycle of a run at one
   seed where native varies it per cycle - the next arm.
+- **Final, 48 paired: page int5 12, page float32 13, native 16 - and the page's designs RE-SCORED NATIVELY
+  (`rescore.py`) pass 16 (PI) and 14 (PF).** So today's page design loop is native's: the deficit was the page
+  scoring its own designs with one AF3 seed, a label that reproduces at another seed only 64-78% of the time. The
+  funnel agrees: check-worthy cycles 8.6 / 10.2 / 10.6%, attempts with a passing check 16 / 18 / 18. The
+  per-cycle-seed arm (PS) was stopped as moot.
+- **Not the cause: an untemplated design loop.** `hunt()` gained `templates` at 07:19 on 10-29 and C finished at
+  11:07, so C looked like it might have designed against an untemplated target - but its design structures sit as
+  close to the crystal target as every templated run's (target CA RMSD median 1.05 A, against 1.04-1.12).
+- **The 10-29 page runs are low on native scoring too: W0 (no warm start) 8 of 48, W1 (warm start) 7 of 48**, where
+  today's same configuration (PI) passes 16 of 48 on other attempts. Either 10-29's code or those attempts (W's
+  lengths and seeds) were worse. **W0r** replays W0's exact attempts (same `pair`, so the same lengths and seeds) on
+  today's code, scored natively: (running).
 
 ### The other datasets the paper reports (2026-10-30, night) - running
 
