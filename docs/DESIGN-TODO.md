@@ -1211,10 +1211,25 @@ lives in the page rather than in the bench harnesses:
     restart count and the same best cycle on 04_IFNAR2:40, 05_CD45:40 and 12_Claudin1:40, with every design fold's
     interface PAE identical to the last digit.** The fresh IFNAR2 run also reproduces
     PI's own row (1 restart, restart 1 cycle 3). So the search is the bench's loop.
-  - 🔴 **The PIS divergence is a page-state leak, and it is open:** the same attempt folds differently after the page
-    has run another one (PIS ran PD1 first). A long-lived design.html session is therefore not a fresh one. Every
-    resident-state bug this repository has had (CLAUDE.md, "A resident server is not a fresh process") had this
-    shape, and none was found by a per-process gate.
+  - 🔴 **The PIS divergence was tiered pipeline compilation, not leaked state** (debugged 2026-10-31). In one page,
+    AF3 int5, a 69 + 104 residue complex at one seed, folded A, A, B, A:
+    - **The first fold differs and every later one agrees:** A1 -29.119 against A2 = A4 -28.999. Folding B in between
+      moves nothing, so no job's state reaches the next.
+    - **The first fold is not even stable:** another page's A1 read -28.909.
+    - **The trunk is identical** (single and pair sums equal), and the diffusion on fold 1's trunk gives fold 2's
+      answer. So it is the sampler's first run.
+    - **Not the memory-dependent choices:** the batched gates and the pair-logits cache decide alike on both folds.
+    - **It is `runtimeLoopBounds: "tiered"`.** A first fold, and the first at a new length, runs opaque-bound and
+      length-generic kernels, and the unrolled ones are swapped in behind it as they finish compiling, so which kernel
+      a step runs depends on timing. With `false`, A reads -28.999 from the first fold on.
+    - **DEFAULT_TUNING called tiering "bit-identical", and it is not.** No benchmark could see it, because
+      `gpu-chrome.mjs` runs it off.
+    - **Fixed:** `hunt()` (and bench.js, before its own weight load) switches the device to fixed loop bounds before
+      any compile, because a design is named by its seed.
+    - **Cost:** none measurable here: the first fold took 9.5 s against tiering's 11.7, on a shared GPU.
+    - **Re-checked through bench.py: IFNAR2:40 after PD1:40 in one page and IFNAR2:40 alone in a fresh page are now
+      identical** (binder, 3 restarts, best restart 1 cycle 5, every design fold's interface PAE). Before the fix
+      they were different designs.
 
 ### Held coordinates and the enzyme recipe on design.html (2026-10-31) - built, checked on the page's engine
 

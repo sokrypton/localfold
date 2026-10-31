@@ -27,6 +27,7 @@ import { contactProblem, hotspotPocket } from "../cpu/design/contact.js";
 import { CONSTRAINT_FAMILIES } from "../shared/af3/featurise/constraints.js";
 import { designedDrift } from "../cpu/design/align.js";
 import { FOLDERS } from "./validate-design.js";
+import { deviceTuning, setDeviceTuning } from "../webgpu/runtime/device-profile.js";
 
 /** The folding models this driver can actually run, and what each is in af3-model's terms. */
 export { FOLDERS } from "./validate-design.js";
@@ -165,6 +166,14 @@ export async function hunt(options) {
   status(folders.length === 1 ? "loading the folding model"
     : `loading ${folders.length} folding models`);
   const device = await getDevice(signal);
+  // 🔴 A HUNT IS NAMED BY ITS SEED, AND TIERED KERNELS BREAK THAT (2026-10-31). Tiered compilation folds first with
+  // opaque-bound and length-generic kernels and swaps the unrolled ones in behind the fold whenever they finish - so a
+  // page's first fold, and the first at each new length, differs from every later one, by an amount that depends on
+  // timing (AF3 int5, a 69 + 104 residue complex: first fold -29.119 / -28.909 in two pages, every later one -28.999,
+  // and -28.999 from the first fold on with `runtimeLoopBounds: false`). A hunt amplifies that into a different
+  // design: PI's IFNAR2:40 designed one binder in a fresh page and another after PD1:40. So the design page compiles
+  // with fixed loop bounds before its first kernel; it costs nothing measurable against a hunt's minutes.
+  if (deviceTuning(device).runtimeLoopBounds === "tiered") setDeviceTuning(device, { runtimeLoopBounds: false });
   const loaded = new Map();
   for (const [index, name] of folders.entries()) {
     const share = (step) => 0.05 * ((index + step) / folders.length);

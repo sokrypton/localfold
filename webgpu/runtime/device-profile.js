@@ -428,9 +428,14 @@ export const DEFAULT_TUNING = Object.freeze({
   // cleared, AF3 68 residues first fold / AF2 whole run, seconds: T4 14 -> 8.6
   // and 11.7 -> 4.4 (with the flash attention below), L4 3.7 -> 2.56 and 3.8 ->
   // 2.45, A100 4.07 -> 2.5 and 3.9 -> 2.4, G4 (Blackwell) at 255 residues 2.76 ->
-  // 1.77 and 2.09 -> 1.55. Bit-identical; the cost is a few slower folds while
-  // the unrolled kernels compile behind them. Benchmarks run it off - see
-  // tools/gpu-chrome.mjs.
+  // 1.77 and 2.09 -> 1.55. The cost is a few slower folds while the unrolled
+  // kernels compile behind them. Benchmarks run it off - see tools/gpu-chrome.mjs.
+  // 🔴 NOT BIT-IDENTICAL, which this comment used to say: the opaque-bound and
+  // length-generic kernels round differently from the unrolled ones, and which
+  // are swapped in by a given step depends on timing - so a page's first fold
+  // (and the first at a new length) differs from its repeats and between pages
+  // (AF3 int5, A100: -29.119 and -28.909 against -28.999; AF2 on a Mali, the
+  // valhall note below). web/hunt.js turns it off: a design is named by its seed.
   runtimeLoopBounds: "tiered",
   // Its geometry, "subgroupsXkeys"; null takes GRID_ATTEND_MATRIX_DEFAULT_TILE.
   gridAttendMatrixTile: null,

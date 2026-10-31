@@ -82,6 +82,13 @@ window.__bench = async (cfg) => {
     const manifest = await (await fetch(`${cfg.bundle}manifest.json`)).json();
     Object.assign(MODEL_BUNDLES.af3, { directory: cfg.bundle, remote: null, load: async () => ({ MANIFEST: manifest }) });
   }
+  // 🔴 FIXED LOOP BOUNDS BEFORE THE FIRST COMPILE, as hunt() sets them: tiered kernels make a page's first folds differ
+  // from its later ones, so an attempt's design would depend on what the page ran before it (docs/DESIGN-TODO.md)
+  {
+    const { deviceTuning, setDeviceTuning } = await import("/webgpu/runtime/device-profile.js");
+    const device = await getDevice();
+    if (deviceTuning(device).runtimeLoopBounds === "tiered") setDeviceTuning(device, { runtimeLoopBounds: false });
+  }
   const weights = await loadAf3Weights(() => {}, "af3");
   // 🔴 cfg.checkModel: the internal check may fold with another model (the final evaluation is always AF3)
   const checkWeights = cfg.checkModel === undefined || cfg.checkModel === "af3" ? weights
