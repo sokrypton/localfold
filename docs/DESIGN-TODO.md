@@ -1095,6 +1095,14 @@ of the top 2) scores 24.1% through the page (`bench.js`, C) and 37.9% natively (
   today's same configuration (PI) passes 16 of 48 on other attempts. Either 10-29's code or those attempts (W's
   lengths and seeds) were worse. **W0r** replays W0's exact attempts (same `pair`, so the same lengths and seeds) on
   today's code, scored natively: (running).
+- **The engines at EVALUATION settings (200 steps, 5 recycles; `engine-probe.py`, 2026-10-31):** PI's 48 designs
+  (attempts 40-41) x seeds 101-104, 192 folds an arm. Check-worthy (pTM >= 0.8, iPAE <= 2.5) native 110 / page
+  float32 102 / page int5 101; **evaluator-grade (pTM >= 0.8, iPAE <= 1.5) native 77 / page float32 76 / page int5
+  63**, median iPAE 1.71 / 1.68 / 2.19. Paired with native: float32 dIPAE median -0.01, worse on 22 of 48 designs -
+  **the page's AF3 is native's**; int5 +0.08, worse on 32 of 48. So the only engine difference is the int5
+  bundle's quantisation, a small upward shift in iPAE that lands right on the 1.5 threshold (18% fewer passes there).
+  It matters for scoring, which is native now, and little for the design loop (71 against 74 check-worthy of 144 at
+  design settings). No engine bug.
 
 ### The other datasets the paper reports (2026-10-30, night) - running
 
