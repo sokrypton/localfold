@@ -91,7 +91,17 @@ inline size_t poolIdle() {
   return last = reserved > used ? reserved - used : 0;
 }
 inline LF_TLS uint64_t MEM_GEN = 1;
-inline void deviceMemInfo(size_t* f, size_t* t) { CK(cudaMemGetInfo(f, t)); *f += poolIdle(); }
+// 🔴 inside a capture, the answer the eager pass last got: a captured pass must choose what its eager pass chose, and
+// cudaMemGetInfo is the CARD's free memory, which another process moves between the two - a chunk sized larger in
+// the capture than in the pass that sized its scratch killed the fold ("scratch slot.0 grows inside a graph
+// capture", rosettafold3 beside three other folding processes, 2026-10-31; alone the same fold is clean)
+inline void deviceMemInfo(size_t* f, size_t* t) {
+  static LF_TLS size_t lastF = 0, lastT = 0;
+  cudaStreamCaptureStatus capturing; CK(cudaStreamIsCapturing(STREAM, &capturing));
+  if (capturing != cudaStreamCaptureStatusNone && lastT != 0) { *f = lastF; *t = lastT; return; }
+  CK(cudaMemGetInfo(f, t)); *f += poolIdle();
+  lastF = *f; lastT = *t;
+}
 inline void trimPool() { ++MEM_GEN; CK(lfDeviceSynchronize()); CK(cudaMemPoolTrimTo(scratchPool(), 0)); }
 template <class P> cudaError_t devMalloc(P** p, size_t bytes) {
   ++MEM_GEN;
@@ -1403,8 +1413,11 @@ template <class T> T* scratchNamed(const std::string& name, size_t n, bool fatal
     size_t bytes = std::max<size_t>(n, 1) * sizeof(T);
     cudaStreamCaptureStatus capturing; CK(cudaStreamIsCapturing(STREAM, &capturing));
     if (p && capturing != cudaStreamCaptureStatusNone) {     // (the pass before the capture should have sized it)
-      fprintf(stderr, "scratch %s grows inside a graph capture (%zu -> %zu bytes): the pass before it did not size it\n",
-              name.c_str(), have, bytes);
+      std::string wanted;     // (a shared slot: the buffers it stands for)
+      for (auto& [buf, k] : SHARED_SLOT) if (name == "slot." + std::to_string(k)) wanted += (wanted.empty() ? " (" : " ") + buf;
+      if (!wanted.empty()) wanted += ")";
+      fprintf(stderr, "scratch %s%s grows inside a graph capture (%zu -> %zu bytes): the pass before it did not size it\n",
+              name.c_str(), wanted.c_str(), have, bytes);
       fflush(stderr); _exit(1);
     }
     if (p) { CK(lfDeviceSynchronize()); CK(cudaFreeAsync(p, STREAM)); p = nullptr; }
