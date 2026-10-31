@@ -322,11 +322,16 @@ async function ligandAtomsInOrder(name, t) {
   return (ligandOrder[name] = chains);
 }
 
-async function attempt(name, index) {
-  // "F-<key>": a small-molecule target with its ligand FIXED (the paper's studio_figure_2c_fixed) - the same task,
-  // the file's conformer inpainted into every design fold
+// "F-<key>": a small-molecule target with its ligand FIXED (the paper's studio_figure_2c_fixed) - the same task,
+// the file's conformer inpainted into every design fold
+function taskOf(name) {
   const t = tasks[name] ?? (name.startsWith("F-") && tasks[name.slice(2)]?.task === "sm" ? tasks[name.slice(2)] : undefined);
   if (t === undefined) throw new Error(`no task ${name}`);
+  return t;
+}
+
+async function attempt(name, index) {
+  const t = taskOf(name);
   const fixedLigand = name.startsWith("F-") && t.task === "sm";
   const cfg = config;
   const rng = mulberry(seedOf(`${cfg.pair ?? cfg.tag}:${name}:${index}`));
@@ -663,7 +668,7 @@ async function rescore(rowsPath) {
   for (const line of fs.readFileSync(rowsPath, "utf8").split("\n").filter(Boolean)) {
     const d = JSON.parse(line);
     if (done.has(`${d.target}:${d.attempt}`) || d.error) continue;
-    const t = tasks[d.target];
+    const t = taskOf(d.target);
     const rng = mulberry(seedOf(`${config.pair ?? config.tag}:${d.target}:${d.attempt}`));
     rng();
     const evalSeed = 1 + Math.floor(rng() * 2 ** 30);
