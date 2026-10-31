@@ -674,12 +674,16 @@ async function rescore(rowsPath) {
     const evalSeed = 1 + Math.floor(rng() * 2 ** 30);
     const row = { target: d.target, task: d.task, attempt: d.attempt, config: d.config, rescored: true,
       served: { ipae: d.ipae, iptm: d.iptm, rmsd: d.rmsd, ligandRmsd: d.ligandRmsd, pass: d.pass } };
-    if (d.binder) {
+    // 🔴 a design from elsewhere (RFD4-Proteina's own) carries no motif positions: the motif is found in it unindexed,
+    // as the paper's AME evaluation does, and a design with no such placement fails
+    const positions = d.positions ?? (t.task === "ame" ? motifMatch(t, d.designPdb)?.positions ?? null : undefined);
+    if (positions === null) row.reason = "no motif placement in the design";
+    if (d.binder && positions !== null) {
       // `evalModel`: CROSS-EVALUATION - the same designs judged by a model that took no part in them (Protenix-2,
       // Boltz-2, ...), same settings, criterion and seed; AF3 when unset
       const r = await fold(t, d.binder, { steps: 200, recycles: 5, seed: evalSeed, model: config.evalModel });
       Object.assign(row, { binder: d.binder, binderPtm: r.binderPtm, ipae: r.ipae, iptm: r.iptm, evalModel: config.evalModel ?? "af3",
-        ...verdict(t.task, d.designPdb, r, t, d.positions) });
+        ...verdict(t.task, d.designPdb, r, t, positions) });
     } else {
       row.pass = false;
     }
