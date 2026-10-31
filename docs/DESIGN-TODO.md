@@ -1114,7 +1114,7 @@ duplex's coordinates given) and, for AME, an UNFIXED-ligand one. RFD4-Proteina h
 | variant | ours | RFD4 high | + Search | how |
 |---|---|---|---|---|
 | AME, ligand unfixed (`mcsa_37`, "U-" targets) | **20.3%** (CI 18.9-21.6; 37 targets, 74 attempts) | 15.2% | 19.6% | TA6's recipe; only the atoms that file conditions are inpainted (the tips, and a few ligand atoms) |
-| DNA fixed (`*_structure_context`, "F-") | **TD18F 2 of 32 (6.3%)** on attempts 0-10, where TD9F is 0 of 60; attempts 11-20 running | 2.2% | 4.5% | TD9's recipe; the given duplex inpainted token by token into every design fold |
+| DNA fixed (`*_structure_context`, "F-") | **TD18F 2 of 62 (3.2%, CI 0-7.9)**: above one-shot, below Search; TD20F (released below sigma 4) running | 2.2% | 4.5% | TD9's recipe; the given duplex inpainted token by token into every design fold |
 | small molecules, ligand fixed ("F-") | **50.6%** (CI 46.1-55.2; 77 targets, 154 attempts; TS7F) | 15.9% | 22.9% | the file's conformer inpainted: a SMILES chain by token, in RDKit's `_smilesAtomOutputOrder`, checked element by element against what AF3 builds; a CCD chain by atom name; fewer than 3 atoms (an ion) unguided |
 | `disco`, ligand fixed | **64.9%** (CI 62.3-67.5; 112 attempts) | 45.3% | 52.7% | the same rows, `disco-score.py` |
 | PPI all-atom | - | 16.9% | - | same targets and criterion as `ppi_backbone`; NC's 37.9% is not re-run |
@@ -1130,6 +1130,11 @@ criterion is the task's own. `task-score.py` reports each variant against its ow
   guide below sigma 1.0 (`motifUntil`), so the duplex settles toward AF3's form in each design fold's last steps.
   **2 of 32 on attempts 0-10** (7m5w:1 iPAE 1.37 RMSD 4.3; 7rte:3 iPAE 1.35 RMSD 2.6), where TD9F's same attempts are
   0 of 32: 6.3% against RFD4 + Search's 4.5%, a two-pass difference, so attempts 11-20 are being added.
+  **Final: 2 of 62 (3.2%)** - attempts 11-20 added none. On these three targets the guide is the cost: held to the
+  last step 0/60, released below sigma 1 2/62, unguided (TD15, unfixed) 5/60. **TD20F** releases it below sigma 4, so
+  only the duplex's coarse placement is held.
+- **The DNA designer, paired (TD19 = TD15 with NA-MPNN, TD15's attempts): NA-MPNN 0 against LigandMPNN 3 on the
+  first 18** - LigandMPNN stays the recipe's designer; running to 60.
 
 - 🔴 **THE DISK FILLED (497 GB, 4.5 MB free)** while the page A/B's browsers each cached the 1.4 GB float32 bundle:
   native folds failed in the `fold` wrapper (`exit: : numeric argument required` - its `.done` file could not be
