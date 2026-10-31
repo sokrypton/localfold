@@ -1205,7 +1205,8 @@ lives in the page rather than in the bench harnesses:
   - A fresh-process fold at a seed repeats to the digit (fold.js, pLDDT 33.5505 twice). So the page's folds depend
     on what the page did before: PI ran its attempts in another order in a long-lived browser.
   - **The A/B, each arm in its own fresh browser: the old loop and `web/search.js` give the same binder, the same
-    restart count and the same best cycle on 04_IFNAR2:40 and 05_CD45:40.** The fresh IFNAR2 run also reproduces
+    restart count and the same best cycle on 04_IFNAR2:40, 05_CD45:40 and 12_Claudin1:40, with every design fold's
+    interface PAE identical to the last digit.** The fresh IFNAR2 run also reproduces
     PI's own row (1 restart, restart 1 cycle 3). So the search is the bench's loop.
   - 🔴 **The PIS divergence is a page-state leak, and it is open:** the same attempt folds differently after the page
     has run another one (PIS ran PD1 first). A long-lived design.html session is therefore not a fresh one. Every
