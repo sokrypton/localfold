@@ -1150,6 +1150,14 @@ criterion is the task's own. `task-score.py` reports each variant against its ow
     state's weight is its contribution: at 0 changing it changes nothing, at 0.5 it does. Two of the three tests
     fail with the tie removed.
   - AF3's fold stays the one the cycle is judged and checked by. Same 62 attempts as TD18F and TD21F. Running.
+- **The averaging on every task** (2026-10-31): the winning run plus `states: ["protenix2"]`, paired with it on
+  the same attempts, lengths and seeds (`pair`):
+  - **NCS** = NC, PPI (24 targets x attempts 0-1). `native-bench.mjs` gained the same `states` hook.
+  - **TS7S** = TS7, small molecules (40 targets, attempt 0).
+  - **TA6S** = TA6, AME (all 37, attempt 0).
+  - **TD15S** = TD15, unfixed DNA (3 targets x attempts 0-9).
+  - TD21F and TD19 are paused (SIGSTOP) for them; TD20F was stopped at 1 of 30 against TD18F's 2 on the same
+    attempts.
 
 - 🔴 **THE DISK FILLED (497 GB, 4.5 MB free)** while the page A/B's browsers each cached the 1.4 GB float32 bundle:
   native folds failed in the `fold` wrapper (`exit: : numeric argument required` - its `.done` file could not be

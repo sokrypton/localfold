@@ -1,0 +1,1 @@
+{"tag": "NCS", "cycles": 6, "steps": 100, "recycles": 3, "restarts": 3, "stop": {"ptm": 0.85, "ipae": 1.2}, "check": {"top": 2, "ptm": 0.8, "ipae": 2.5}, "states": ["protenix2"], "pair": "NC"}

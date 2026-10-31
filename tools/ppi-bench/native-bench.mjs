@@ -147,6 +147,7 @@ async function attempt(name, index) {
     runs += 1;
     const controller = new AbortController();
     const mine = [];
+    const statesOf = new Map();     // (a design fold's structure -> the other models' structures of its sequence)
     try {
       const stream = runDesign({
         chains: ["", ...t.sequences], chainIndex: 0, cycles: cfg.cycles, length, run: restart,
@@ -157,10 +158,21 @@ async function attempt(name, index) {
           const r = await fold(t, templateFile, sequence, { model: designModel, steps: cfg.steps, recycles: cfg.recycles,
             // `sameSeed`: every cycle of a run folds at ONE diffusion seed, as web/hunt.js does (a control for the page)
             seed: seed + 101 * restart + (cfg.sameSeed ? 0 : 13 * context.cycle), pocket, msas: targetMsas });
+          // `states`: the same sequence folded by each of these models too, and MPNN designs the next cycle from all the
+          // structures at once, tied position by position (mpnn-bridge.js `states`) - task-bench.mjs's TD22F, for PPI
+          if (cfg.states !== undefined) {
+            const others = [];
+            for (const other of cfg.states) {
+              others.push((await fold(t, templateFile, sequence, { model: other, steps: cfg.steps, recycles: cfg.recycles,
+                seed: seed + 101 * restart + 13 * context.cycle + 31337, pocket, msas: targetMsas })).pdb);
+            }
+            statesOf.set(r.pdb, others);
+          }
           foldSeconds += (Date.now() - t0) / 1000;
           return { pdb: r.pdb, confidence: r.confidence, terms: { binderPtm: r.binderPtm, ipae: r.ipae } };
         },
         design: (pdb, context) => designChain(mpnn, { pdb, chain: context.chain, temperature: context.temperature,
+          ...(statesOf.has(pdb) ? { states: statesOf.get(pdb).map((other) => ({ pdb: other })) } : {}),
           omit: context.omit, alanineBias: context.alanineBias, random: context.random, hold: context.hold, kind: context.kind }),
       });
       for await (const record of stream) {
