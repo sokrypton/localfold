@@ -93,6 +93,63 @@ def residues(lines):
     return seen, order
 
 
+METALS = {'FE', 'CU', 'ZN', 'MN', 'NI', 'CO', 'MG'}
+
+
+def xyz(l):
+    return [float(l[30:38]), float(l[38:46]), float(l[46:54])]
+
+
+def units(chains, binder):
+    """The design's non-binder molecules: a DNA strand whole, a ligand chain split into its bonded components (RFD4
+    writes several ions or molecules as one chain where the task lists each)."""
+    out = []
+    for c, ls in chains.items():
+        if c == binder:
+            continue
+        if all(l[17:20].strip() in NA for l in ls):
+            out.append(ls)
+            continue
+        adj, _ = graph([(element(l), xyz(l)) for l in ls])
+        # a metal's contacts are coordination, not bonds: two copper ions 2.3 A apart are two molecules
+        metal = [element(l).upper() in METALS for l in ls]
+        adj = [{j for j in adj[i] if not (metal[i] or metal[j])} for i in range(len(ls))]
+        seen = set()
+        for start in range(len(ls)):
+            if start in seen:
+                continue
+            group, stack = [], [start]
+            while stack:
+                i = stack.pop()
+                if i in seen:
+                    continue
+                seen.add(i); group.append(i); stack.extend(adj[i])
+            out.append([ls[i] for i in sorted(group)])
+    return out
+
+
+def match(unit, entry):
+    """Our atom names for a unit if it is this task entry, else None."""
+    names = [r for _, r in residues(unit)[1]]
+    if entry["kind"] == "dna":
+        ok = all(n in NA for n in names) and "".join(NA[n] for n in names) == entry["sequence"]
+        return [l[12:16] for l in unit] if ok else None
+    if entry.get("ccd"):
+        if names == [entry["ccd"]]:
+            return [l[12:16] for l in unit]
+        # a one-atom ion written as a generic ligand: its CCD atom name is its element
+        if len(unit) == 1 and element(unit[0]).upper() == entry["ccd"].upper():
+            return [f" {entry['ccd'].upper()}".ljust(4)]
+        return None
+    mapped = isomorphism([(element(l), xyz(l)) for l in unit], [(a[0], a[1:]) for a in entry["conformer"]])
+    if mapped is None:
+        return None
+    # our featuriser names a SMILES ligand's atoms element + per-element counter, in the conformer's order
+    conformer = [a[0] for a in entry["conformer"]]
+    ours = [f" {e}{conformer[:k + 1].count(e)}".ljust(4) for k, e in enumerate(conformer)]
+    return [ours[mapped[k]] for k in range(len(unit))]
+
+
 def relabel(pdb, task):
     t = TASKS[task]
     chains = chains_of(pdb)
@@ -100,44 +157,22 @@ def relabel(pdb, task):
     if len(protein) != 1:
         raise ValueError(f"{task}: {len(protein)} protein chains in the design")
     binder = protein[0]
-    taken, letter, atom_maps = set(), {binder: "A"}, {}
-    for c, ls in chains.items():
-        if c == binder:
-            continue
-        _, order = residues(ls)
-        names = [r for _, r in order]
+    index, order = residues(chains[binder])
+    out = [l[:21] + "A" + f"{index[(l[22:27], l[17:20].strip())] + 1:4d} " + l[27:] for l in chains[binder]]
+    sequence = "".join(AA[r] for _, r in order)
+    taken = set()
+    for unit in units(chains, binder):
         for i, e in enumerate(t["chains"]):
-            if i in taken:
-                continue
-            if e["kind"] == "dna" and all(n in NA for n in names) and "".join(NA[n] for n in names) == e["sequence"]:
+            names = None if i in taken else match(unit, e)
+            if names is not None:
                 break
-            if e["kind"] == "ligand" and e.get("ccd") and names == [e["ccd"]]:
-                break
-            if e["kind"] == "ligand" and e.get("smiles"):
-                mapped = isomorphism([(element(l), [float(l[30:38]), float(l[38:46]), float(l[46:54])]) for l in ls],
-                                     [(a[0], a[1:]) for a in e["conformer"]])
-                if mapped is not None:
-                    atom_maps[c] = mapped
-                    break
         else:
-            raise ValueError(f"{task}: design chain {c} ({names[:3]}, {len(ls)} atoms) matches no entry of the task")
+            raise ValueError(f"{task}: a design molecule ({unit[0][17:20]}, {len(unit)} atoms) matches no entry of the task")
         taken.add(i)
-        letter[c] = chr(66 + i)
+        index, _ = residues(unit)
+        out += [l[:12] + n + l[16:21] + chr(66 + i) + f"{index[(l[22:27], l[17:20].strip())] + 1:4d} " + l[27:] for l, n in zip(unit, names)]
     if len(taken) != len(t["chains"]):
-        raise ValueError(f"{task}: the design has {len(taken)} of the task's {len(t['chains'])} other chains")
-    out, sequence = [], ""
-    for c, ls in chains.items():
-        index, order = residues(ls)
-        if c in atom_maps:
-            # our featuriser names a SMILES ligand's atoms element + per-element counter, in the conformer's order
-            conformer = [a[0] for a in t["chains"][ord(letter[c]) - 66]["conformer"]]
-            ours = [f" {e}{conformer[:k + 1].count(e)}".ljust(4) for k, e in enumerate(conformer)]
-        for k, l in enumerate(ls):
-            number = index[(l[22:27], l[17:20].strip())] + 1
-            name = ours[atom_maps[c][k]] if c in atom_maps else l[12:16]
-            out.append(l[:12] + name + l[16:21] + letter[c] + f"{number:4d} " + l[27:])
-        if letter[c] == "A":
-            sequence = "".join(AA[r] for _, r in order)
+        raise ValueError(f"{task}: the design has {len(taken)} of the task's {len(t['chains'])} other molecules")
     out.sort(key=lambda l: l[21])
     return sequence, "\n".join(out) + "\n"
 
@@ -167,7 +202,14 @@ def main():
         with open(out, "a") as f:
             for k in range(designs):
                 path = pdb if k == 0 else pdb[:-4] + f"_{k + 1}.pdb"
-                sequence, design = relabel(open(path).read(), target)
+                try:
+                    sequence, design = relabel(open(path).read(), target)
+                except ValueError as error:
+                    # 🔴 recorded, never dropped: an unreadable design is counted as a failed attempt
+                    f.write(json.dumps({"target": target, "task": TASKS[target]["task"], "attempt": k, "config": "RFD4P-high",
+                                        "unreadable": str(error)}) + "\n")
+                    print(target, k, "unreadable:", error, flush=True)
+                    continue
                 f.write(json.dumps({"target": target, "task": TASKS[target]["task"], "attempt": k, "config": "RFD4P-high",
                                     "binder": sequence, "designPdb": design}) + "\n")
         print(target, "ok", flush=True)
