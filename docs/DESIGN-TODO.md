@@ -1178,6 +1178,12 @@ criterion is the task's own. `task-score.py` reports each variant against its ow
   - Same 48 attempts as NC.
 - **Interim, PPI, paired with NC on the same attempts:** averaging (NCS) 1/14 against NC's 3; cysteine allowed (NCC)
   3/13 against 3; RFD4-Proteina designing (NCR) 0/3 against 0.
+- **Final, PPI, all 48 attempts AF3-rescored (`R-<run>.jsonl`), paired with NC:** cysteine allowed (NCC) **19 against
+  17**, inside the noise, so blocking cysteines costs nothing measurable; history (NCH) **12 against 17**, worse - the
+  last backbone's preferences pull the next design toward a backbone the fold has already left. Neither replaces NC.
+- **Cross-evaluation, every task (2026-10-31):** Protenix-2 judging our AF3 designs keeps PPI at 25% (of 37.5) but
+  takes sm 62.3 -> 20.1, AME fixed 27.0 -> 5.4, AME unfixed 20.3 -> 2.7, DNA 8.3 -> 1.7, DNA fixed 3.2 -> 1.6. Boltz-2
+  and Chai-1 are judging the same six sets (`X-<run>-<model>.jsonl`; `--rescore` needed `taskOf` for "F-" targets).
 - **Cross-evaluation, because AF3 designing, checking and evaluating is a circle** (the user's point, 2026-10-31):
   - **Our designs, other evaluator:** every task's best run is rescored by Protenix-2, which took no part in those
     designs: task-bench `--rescore` with `evalModel` (`config-X*.json`, out `X-<run>-protenix2.jsonl`), same
