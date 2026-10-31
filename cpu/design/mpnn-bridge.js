@@ -117,6 +117,10 @@ export function chainMaskFor(structure, chain) {
  *   inverse folding's fixed residues all are.
  * @param {"protein"|"dna"|"rna"} [options.kind="protein"] what the designed chain is made of. A
  *   DNA or RNA chain needs NA-MPNN, and comes back in AF3's letters (ACGT, ACGU, N for unknown).
+ * @param {{pdb: string, weight?: number}[]} [options.states] MULTI-STATE design: further predictions of the same
+ *   complex (another model's fold of it, say) whose designed chain is TIED to this one's position by position -
+ *   decoded at one step, its logits the weighted sum over the states (ProteinMPNN's tied positions). `pdb` is the
+ *   first state; `weight` defaults to an equal share, and the first state's is `options.weight`.
  * @returns {{sequence: string, full: string, score: number,
  *            designed: number, structure: object}} `sequence` is the designed
  *   chain alone, which is what goes back into the fold; `full` is every chain,
@@ -137,7 +141,13 @@ export function designChain(model, options) {
   // Handing NA-MPNN the protein-only parse is the quiet one: the nucleic chain
   // simply is not in the structure, the designed chain is graphed against
   // nothing, and every number downstream looks reasonable.
-  const structure = structureFromText(options.pdb, {
+  // 🔴 SEVERAL STATES ARE ONE INPUT: each later state is laid 1000 A along x with its chains renamed, so no residue
+  // or ligand atom of one is ever a neighbour of another's, and the parser reads them all at once
+  const states = [{ pdb: options.pdb, weight: options.weight }, ...(options.states ?? [])];
+  const { text, letters: stateLetters } = states.length === 1 ? { text: options.pdb, letters: [options.chain] }
+    : combineStates(states.map((state) => state.pdb), options.chain);
+  const shares = states.map((state) => state.weight ?? 1 / states.length);
+  const structure = structureFromText(text, {
     ligands: model.isLigand, nucleicAsResidues: model.isNA,
   });
   const alphabet = model.isNA ? NA_ALPHABET : ALPHABET;
@@ -151,6 +161,20 @@ export function designChain(model, options) {
     throw new Error(`the prediction has no chain ${options.chain}`
       + ` (it has ${structure.chainList.join(", ")})`);
   }
+  // each state's designed chain, by position, and every one of them designable
+  const stateOffsets = stateLetters.map((letter) => {
+    const offsets = [];
+    for (let index = 0; index < structure.chainIds.length; index += 1) {
+      if (structure.chainIds[index] === letter) offsets.push(index);
+    }
+    return offsets;
+  });
+  for (const [k, offsets] of stateOffsets.entries()) {
+    if (offsets.length !== designed) {
+      throw new Error(`state ${k + 1}'s chain ${options.chain} has ${offsets.length} residues where the first has ${designed}`);
+    }
+    if (k > 0) for (const index of offsets) chainMask[index] = 1;
+  }
 
   // 🔴 WHICH POSITIONS ARE IN THE CHAIN, KEPT BEFORE ANY ARE HELD. The returned
   // sequence is the whole designed chain, held residues included - the loop
@@ -159,6 +183,8 @@ export function designChain(model, options) {
   // Reading the mask returned only the free residues: a 22-residue scaffold came
   // back as the 12 designed ones, and the next cycle folded that.
   const inChain = Float32Array.from(chainMask);
+  // (only the FIRST state's chain is read back: the others are its twins)
+  for (const offsets of stateOffsets.slice(1)) for (const index of offsets) inChain[index] = 0;
 
   // 🔴 HELD POSITIONS ARE THE CHAIN MASK'S ZEROES, AND NOTHING ELSE IS NEEDED.
   // `S` already carries the structure's own residue at every position - that is
@@ -181,6 +207,7 @@ export function designChain(model, options) {
         throw new Error(`cannot hold position ${position} of a ${offsets.length}-residue chain`);
       }
       chainMask[offset] = 0;
+      for (const twins of stateOffsets.slice(1)) chainMask[twins[position]] = 0;
       held += 1;
     }
     // 🔴 HOLDING EVERY POSITION IS NOT A DESIGN. It runs, returns the sequence
@@ -214,6 +241,10 @@ export function designChain(model, options) {
     // amino acids, not on the all-X default.
     S: Int32Array.from(structure.S),
     chainMask,
+    // the twins of each designed position, decoded together at their states' weights
+    ...(states.length === 1 ? {} : {
+      symmetry: stateOffsets[0].map((_, i) => stateOffsets.map((offsets, k) => ({ pos: offsets[i], weight: shares[k] }))),
+    }),
     bias: designBias(structure.chainIds.length, {
       omit: options.omit, alanineBias: options.alanineBias, residueBias: options.residueBias, alphabet,
       ...(nucleic ? { designs: "nucleic" } : {}),
@@ -267,6 +298,41 @@ export function designChain(model, options) {
     tokens: result.S[0],
     alphabet,
   };
+}
+
+/**
+ * Several predictions of one complex as one PDB: the first as it is, each later one 1000 A further along x with its
+ * chains renamed to letters the first does not use. Returns the text and each state's letter for `chain`.
+ *
+ * @param {string[]} pdbs
+ * @param {string} chain the designed chain's letter in every state
+ * @returns {{text: string, letters: string[]}}
+ */
+export function combineStates(pdbs, chain) {
+  const record = (line) => line.startsWith("ATOM") || line.startsWith("HETATM");
+  const used = new Set();
+  for (const pdb of pdbs) for (const line of pdb.split("\n")) if (record(line)) used.add(line[21]);
+  const spare = [..."ZYXWVUTSRQPONMLKJIHGFEDCBAzyxwvutsrqponmlkjihgfedcba0987654321"].filter((c) => !used.has(c));
+  const lines = [];
+  const letters = [];
+  pdbs.forEach((pdb, k) => {
+    const rename = new Map();
+    for (const line of pdb.split("\n")) {
+      if (!record(line)) continue;
+      const from = line[21];
+      if (k > 0 && !rename.has(from)) {
+        const to = spare.shift();
+        if (to === undefined) throw new Error("too many chains across the states for one PDB");
+        rename.set(from, to);
+      }
+      const x = k === 0 ? line.slice(30, 38) : (Number(line.slice(30, 38)) + 1000 * k).toFixed(3).padStart(8);
+      if (x.length !== 8) throw new Error(`a state's x coordinate ${x} does not fit a PDB column`);
+      lines.push(`${line.slice(0, 21)}${k === 0 ? from : rename.get(from)}${line.slice(22, 30)}${x}${line.slice(38)}`);
+    }
+    letters.push(k === 0 ? chain : rename.get(chain));
+    if (letters[k] === undefined) throw new Error(`state ${k + 1} has no chain ${chain}`);
+  });
+  return { text: `${lines.join("\n")}\nEND\n`, letters };
 }
 
 /**

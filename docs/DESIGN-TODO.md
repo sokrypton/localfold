@@ -1138,6 +1138,18 @@ criterion is the task's own. `task-score.py` reports each variant against its ow
 - **TD21F: TD18F with the design folds rotating AF3 and Protenix-2 by cycle** (task-bench `rotate`; the other model
   folds as its own process, 1-2 s, beside the one resident AF3; the check and the evaluation stay AF3) - Protein
   Hunter's measured win, never tried here, on the same 62 attempts as TD18F. Running.
+- **TD22F: the two models AVERAGED at the designer instead of alternated** (the user's idea). Each design cycle
+  folds the sequence with AF3 and with Protenix-2, both guided alike, and MPNN designs the next sequence from both
+  structures at once. Every position of the designed chain is tied to its twin: one decoding step, and the logits
+  are the weighted sum over the states.
+  - That is ProteinMPNN's tied positions, which our port (sokrypton/mpnn's) already had as `symmetry` with
+    per-position weights, so nothing needed revendoring.
+  - `designChain({states})` lays each later state 1000 A along x with its chains renamed (`combineStates`), so one
+    parse reads them all and no neighbour graph or ligand context crosses between states.
+  - `test/mpnn-states.test.js` checks the layout, that twins carry one sequence with holds in both, and that a
+    state's weight is its contribution: at 0 changing it changes nothing, at 0.5 it does. Two of the three tests
+    fail with the tie removed.
+  - AF3's fold stays the one the cycle is judged and checked by. Same 62 attempts as TD18F and TD21F. Running.
 
 - 🔴 **THE DISK FILLED (497 GB, 4.5 MB free)** while the page A/B's browsers each cached the 1.4 GB float32 bundle:
   native folds failed in the `fold` wrapper (`exit: : numeric argument required` - its `.done` file could not be

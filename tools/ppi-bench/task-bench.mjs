@@ -452,6 +452,7 @@ async function attempt(name, index) {
       fs.writeFileSync(motif, (await dnaFrame(name, t)).map((a) => `${offsets[a.chain] + a.residue - 1} ${a.atom} ${a.xyz.join(" ")}`).join("\n") + "\n");
     }
     let lastDocked = null, undockedRun = 0;
+    const statesOf = new Map();     // (a design fold's structure -> the other models' structures of its sequence)
     try {
       const stream = runDesign({
         chains: [start], chainIndex: 0, cycles: cfg.cycles, length, run: restart,
@@ -479,6 +480,18 @@ async function attempt(name, index) {
                 // models); the check, the probe and the evaluation stay AF3
                 model: cfg.rotate?.[context.cycle % cfg.rotate.length] });
             if (contactProblem(r.pdb, { chain: "A" }) === null) { docked = true; break; }
+          }
+          // `states`: the same sequence folded by each of these models too (guided alike), and MPNN designs the next
+          // cycle from all the structures at once, every position tied across them (mpnn-bridge.js `states`) - the
+          // models AVERAGED at the designer, where `rotate` alternates them; this cycle's own terms stay AF3's
+          if (cfg.states !== undefined) {
+            const others = [];
+            for (const other of cfg.states) {
+              const q = await fold(t, sequence.split(":")[0], { steps: cfg.steps, recycles: cfg.recycles,
+                seed: seed + 101 * restart + 13 * context.cycle + 31337, motif: guidedAt(context.cycle) ? motif : undefined, model: other });
+              others.push(q.pdb);
+            }
+            statesOf.set(r.pdb, others);
           }
           foldSeconds += (Date.now() - t0) / 1000;
           // `stick`: a cycle that will not dock hands the NEXT design the restart's last docked structure instead of
@@ -514,6 +527,7 @@ async function attempt(name, index) {
           return { pdb: r.pdb, confidence: r.confidence, terms: { binderPtm: r.binderPtm, ipae: r.ipae, iptm: r.iptm, ...own } };
         },
         design: (pdb, context) => designChain(mpnn, { pdb, chain: context.chain, temperature: context.temperature,
+          ...(statesOf.has(pdb) ? { states: statesOf.get(pdb).map((other) => ({ pdb: other })) } : {}),
           omit: context.omit, alanineBias: context.alanineBias, random: context.random, hold: context.hold, kind: context.kind,
           // `residueBias`: per task, MPNN logits added per letter (a DNA binder pushed toward K/R)
           ...(cfg.residueBias?.[t.task] === undefined ? {} : { residueBias: cfg.residueBias[t.task] }) }),
