@@ -1084,6 +1084,10 @@ of the top 2) scores 24.1% through the page (`bench.js`, C) and 37.9% natively (
   scoring its own designs with one AF3 seed, a label that reproduces at another seed only 64-78% of the time. The
   funnel agrees: check-worthy cycles 8.6 / 10.2 / 10.6%, attempts with a passing check 16 / 18 / 18. The
   per-cycle-seed arm (PS) was stopped as moot.
+- **So `bench.py` now scores natively** (`native_eval.py`, shared with `rescore.py`): every submitted page design is
+  evaluated by the native AF3 at the attempt's own evaluation seed, and the page's own score of it is kept beside it
+  as `pageBinderPtm`/`pageIpae`/`pageRmsd` (`evaluator: "native"` on the row). A page run and a native run are
+  judged by the same model from here on.
 - **Not the cause: an untemplated design loop.** `hunt()` gained `templates` at 07:19 on 10-29 and C finished at
   11:07, so C looked like it might have designed against an untemplated target - but its design structures sit as
   close to the crystal target as every templated run's (target CA RMSD median 1.05 A, against 1.04-1.12).
