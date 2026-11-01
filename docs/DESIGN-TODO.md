@@ -1231,6 +1231,13 @@ criterion is the task's own. `task-score.py` reports each variant against its ow
   - Running: TS7C - AF3 designs, a design counts only if AF3, Protenix-2 and Boltz-2 all pass (iPAE <= 1.5), judged
     by the six models it does not use; and NIF/NOB/NDD/NRF, PPI designed by IntelliFold-2 / OpenBind-0 / OpenDDE /
     RoseTTAFold3 and judged by AF3.
+- **PPI won with AF3 only judging (2026-11-01)**: IntelliFold-2 designs, a second model checks, AF3 evaluates. Over two
+  attempts on the 24 PPI targets, **NCI2** (IntelliFold-2 designs, IntelliFold-2 + Chai-1 check, passIpae 1.0) passes
+  **15/48** and **NIF** (IntelliFold-2 + Protenix-2 check) **14/48**, against RFD4-Proteina's expected **7.8** on the same
+  targets (binomial p 0.007 and 0.018). On attempt 0 NCI2 is 8/24 against our AF3-designed NC's 6. Chai-1 designing
+  loses: NCI1 1/24; NCI3 (Chai-1 designs from both models' structures) and NCI4 (both fold every cycle, worse score
+  counts) 0/13 each, stopped. Which model DESIGNS decides it; the pair helps as a check, not as a designer. Small
+  molecules next with the same split: TSI2/TSIF on TS7P's 21 targets.
 - **One task at a time from here** (the user's call): the other tasks' runs are SIGSTOPped and a queue resumes each
   when the one before finishes: PPI, then sm, AME, DNA, fixed DNA, then TD21F and TD19.
 
