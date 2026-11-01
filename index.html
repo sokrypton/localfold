@@ -343,8 +343,9 @@ AI Context: STANDALONE WEB APP ENTRY POINT
               <!-- 🔴 BioEmu2'S OWN ROWS, SHOWN WITH IT (syncBioemu2Controls). Its
                    method token is "non-md" for a structure and "md" for an
                    equilibrium ensemble; propagation is equilibrium sampling
-                   conditioned on a starting frame at a lag, chained. Contacts are
-                   BioEmu2's own Contact form, as JSON. -->
+                   conditioned on a starting frame at a lag, chained. Its contacts
+                   are the entity list's Contact rows (bioemu2ContactsFromRows), not
+                   a box of their own. -->
               <div class="fetch-option-group" id="bioemu2ModeGroup" hidden>
                 <span class="fetch-option-title">Mode</span>
                 <select id="bioemu2-mode" title="Structure: predict a structure (BioEmu2's non-MD mode). Equilibrium: sample its equilibrium ensemble (MD mode). Propagate: run time forward from a structure of this input, each step one lag.">
@@ -355,12 +356,16 @@ AI Context: STANDALONE WEB APP ENTRY POINT
               </div>
               <div class="fetch-option-group" id="bioemu2SamplesGroup" hidden>
                 <span class="fetch-option-title">Samples</span>
-                <select id="bioemu2-samples" title="How many structures to sample, all through one denoiser call a step; each is a frame of the play bar.">
+                <select id="bioemu2-samples" title="How many structures to sample, in batches of up to five through one trunk; each is a frame of the play bar, ordered along the ensemble's first principal component. Stop keeps the batches already finished.">
                   <option value="1" selected>1</option>
                   <option value="2">2</option>
                   <option value="3">3</option>
                   <option value="5">5</option>
                   <option value="8">8</option>
+                  <option value="10">10</option>
+                  <option value="25">25</option>
+                  <option value="50">50</option>
+                  <option value="100">100</option>
                 </select>
               </div>
               <div class="fetch-option-group" id="bioemu2PropagationGroup" hidden>
@@ -374,11 +379,6 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                   <option value="upload">PDB file</option>
                 </select>
                 <input type="file" id="bioemu2-x0-file" accept=".pdb" hidden>
-              </div>
-              <div class="fetch-option-group" id="bioemu2ContactsGroup" hidden>
-                <span class="fetch-option-title">Contacts</span>
-                <input type="text" id="bioemu2-contacts" value="" placeholder='[{"token1":{"asym_id":"A","res_id":5},"token2":{"asym_id":"A","res_id":60},"max_distance":8}]'
-                  title="Condition on contacts, in BioEmu2's Contact form (JSON): token1, token2 (asym_id, res_id, atom_name), max_distance 4-20 A. Empty for none.">
               </div>
 
               <!-- MSA options on the right of the row -->
@@ -891,6 +891,13 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                          of bug that looks like it works. -->
                     <div id="heatmapContainer" class="container-box" style="display: none;">
                         <canvas id="heatmapCanvas" style="cursor: crosshair;"></canvas>
+                    </div>
+
+                    <!-- A BioEmu2 ENSEMBLE'S PCA, on py2Dmol's own scatter plot: one point a
+                         sample, the frame on screen highlighted, a click jumps to it. Hidden
+                         until a fold's frames carry points (showEnsembleScatter in web/app.js). -->
+                    <div id="scatterContainer" class="container-box" style="display: none; position: relative;">
+                        <canvas id="scatterCanvas" style="cursor: pointer;"></canvas>
                     </div>
 
                     <!-- THE RAW PREDICTION, under the confidence it describes.

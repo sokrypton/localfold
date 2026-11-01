@@ -299,3 +299,22 @@ process's bytes is what catches it: with the fix removed the heteromer served se
 - The ligand steering tier is an approximation (above), not the vendor's RDKit tables.
 - A SMILES ligand's conformer and atom names are this port's (the vendor's ETKDG draw is unseeded and its names
   come from RDKit's canonical ranking).
+
+## An ensemble on the page: batches, the PCA, and PC1 order (2026-11-01)
+
+The Samples menu goes to 100. `foldBioemu2` compiles the denoiser for one batch (`bioemu2Batches`: as few batches
+of at most `BIOEMU2_MAX_BATCH` = 5 as fit, all one size) and runs batch after batch on ONE trunk, the draws
+continuing - so up to five samples is exactly the old single call, same draws, and 25 by 5 reproduces a 10-sample
+run's first ten. Each batch reaches the page as it lands (`onSamples`) and joins the play bar; a Stop part-way
+returns the finished batches (`stopped: true`) and the status line reads "10 of 25 samples (stopped)".
+
+`web/bioemu2-ensemble.js` turns the ensemble into a distribution: each token's CA (or C1', else its first atom),
+the PCA of the samples' pairwise distances between them (no superposition, so a rotated sample is the same point;
+through the n x n Gram matrix, strided past 300 atoms), and the fraction of samples with a pair inside 8 A, which
+replaces the distogram as every frame's contact map. The PCA is py2Dmol's own scatter plot - `frame.scatter` a
+frame, its slots give it a tab, the current frame highlighted, a click jumps - and the page asks for it in the
+second slot once a fold. The finished play bar is ordered along PC1 so playing it sweeps the distribution; a frame
+keeps its draw-order name (`sample_7`), and a propagation keeps its trajectories in time order with no PCA.
+
+Measured in the page on 6MRR, equilibrium, 50 steps: 10 samples in two batches, 65 s; PC1 44%, PC2 19%. A
+1-sample structure fold afterwards shows no Scatter tab, nor does ESMFold2 after that.

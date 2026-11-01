@@ -35,6 +35,9 @@ export function updateScoresCard(confidence) {
     none.style.display = confidence.none === true ? "flex" : "none";
     const text = document.getElementById("metricNoConfidenceText");
     if (text && confidence.none === true) text.textContent = confidence.label ?? "No confidence head";
+    // ...and the cell's own name, which a model with something else to report sets (BioEmu2: "Physicality")
+    const title = none.querySelector(".score-metric-label");
+    if (title && confidence.none === true) title.textContent = confidence.title ?? "Confidence";
   }
   if (confidence.none === true) {
     for (const id of ["metricIptmCell", "metricMultimerCell"]) {
