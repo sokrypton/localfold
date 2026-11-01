@@ -481,6 +481,10 @@ async function attempt(name, index) {
         // and almost nothing reached the check
         // (`true` for the loop's default ramp, or {start, end} for another)
         ...(cfg.alanineBias ? { alanineBias: true, alanineBiasStart: cfg.alanineBias.start, alanineBiasEnd: cfg.alanineBias.end } : {}),
+        // `percentX`: how much of the starting sequence is unknown (the loop's default 90) - IntelliFold-2 reads a
+        // mostly-X ligand binder at median ipTM 0.16 on cycle 0 where AF3 reads 0.43, and never catches up (0.41 by
+        // cycle 2 against AF3's 0.79)
+        ...(cfg.percentX === undefined ? {} : { percentX: cfg.percentX }),
         // `omit`: letters MPNN may never write, per task (a DNA binder without D/E is basic) - the loop's own default is "C"
         ...(cfg.omit?.[t.task] === undefined ? {} : { omit: cfg.omit[t.task] }),
         veto: ({ pdb }) => contactProblem(pdb, { chain: "A" }),
