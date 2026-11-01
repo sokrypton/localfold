@@ -332,9 +332,7 @@ export function rowChains(entities) {
     const name = POLYMER_TYPES.includes(chain.kind)
       ? `${ENTITY_LABELS[chain.kind]}, ${n} residue${n === 1 ? "" : "s"}`
       : chain.kind === "smiles" ? "SMILES ligand" : chain.residues.join("-");
-    const short = POLYMER_TYPES.includes(chain.kind) ? `${chain.kind === "protein" ? "prot" : chain.kind.toUpperCase()} ${n}`
-      : chain.kind === "smiles" ? "SMILES" : chain.residues.join("-");
-    return { letter: chainLetter(asym), ...chain, name, short };
+    return { letter: chainLetter(asym), ...chain, name };
   });
 }
 

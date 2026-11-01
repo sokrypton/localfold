@@ -102,9 +102,8 @@ export function buildLinkField(entity, readEntities, changed) {
     const fill = () => {
       const chains = rowChains(readEntities());
       const current = get();
-      // short in the menu (it sits in a row of other controls), the whole description on hover
-      const options = chains.map((chain) => Object.assign(new Option(`${chain.letter} · ${chain.short}`, chain.letter),
-                                                          { title: chain.name }));
+      // the letter alone, as the viewer and the PDB name the chain; what it is shows on hover and beside the residue
+      const options = chains.map((chain) => Object.assign(new Option(chain.letter, chain.letter), { title: chain.name }));
       if (current !== "" && !chains.some((chain) => chain.letter === current)) {
         options.push(new Option(`${current} (missing)`, current));
       }
@@ -199,7 +198,7 @@ export function buildLinkField(entity, readEntities, changed) {
     const linker = element("select", "entity-picker link-linker", { title: "Crosslinker" });
     linker.setAttribute("aria-label", "Crosslinker");
     for (const [name, entry] of Object.entries(CROSSLINKERS)) {
-      linker.append(new Option(`${name} · ${entry.description}`, name));
+      linker.append(Object.assign(new Option(name, name), { title: entry.description }));
     }
     if (!(parts.linker in CROSSLINKERS)) linker.append(new Option(`${parts.linker} (unknown)`, parts.linker));
     linker.value = parts.linker;
