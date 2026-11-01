@@ -81,7 +81,7 @@ import {
 } from "./fold-session.js";
 import { looksLikeZip, readZip, writeZip } from "./zip.js";
 import { createEntityList } from "./entity-ui.js";
-import { buildTemplate, describeCoverage, fetchStructure, mergeAtom37Templates } from "./template-source.js";
+import { buildTemplate, describeCoverage, fetchStructure, mergeAtom37Templates, parseSource } from "./template-source.js";
 import { fetchMmseqs2Templates } from "../shared/input/mmseqs2-api.js";
 import { RuntimeEstimator } from "../webgpu/runtime/cost-model.js";
 import { nativeRole, installNativeBridge, remoteBackendChoice, remoteBackendName, remoteCommand,
@@ -4839,6 +4839,16 @@ async function fold(event) {
         continue;
       }
       if (kind === "none" || source === "") continue;
+      // ...the file the popup's Fetch already checked, when it is for this id:
+      // the structure the reader looked at is the one folded, and not a second
+      // download. The chain comes from the box, which the chain menu writes.
+      const parsed = parseSource(source, kind);
+      const fetched = template.fetched;
+      if (fetched !== undefined && fetched.id === parsed.id && fetched.kind === kind) {
+        templateSources.push({ ...common, chainId: parsed.chain ?? fetched.chains[0]?.chain,
+          text: fetched.text, source });
+        continue;
+      }
       status(`Fetching template ${source}`);
       const structure = await fetchStructure(source, { signal, kind });
       templateSources.push({ ...common, chainId: structure.chain,

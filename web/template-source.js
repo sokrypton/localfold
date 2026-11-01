@@ -112,6 +112,46 @@ export async function fetchStructure(text, options = {}) {
 }
 
 /**
+ * The protein chains a fetched structure holds, and how many residues each
+ * resolves - what the popup shows after Fetch, so the chain is a choice made
+ * looking at the file rather than a suffix guessed before it.
+ *
+ * Read by the SAME two readers `buildTemplate` uses, so a count here is the
+ * count a fold will see.
+ *
+ * @param {string} text a PDB or mmCIF
+ * @returns {{chain: string, residues: number}[]} in file order
+ */
+export function structureChains(text) {
+  const cif = /^\s*(data_|#|loop_|_)/m.test(text.slice(0, 4096)) && text.includes("_atom_site.");
+  const ids = [];
+  if (cif) {
+    for (const atom of parseCIFAtoms(text)) {
+      if (!atom.hetero && !ids.includes(atom.chain)) ids.push(atom.chain);
+    }
+  } else {
+    for (const line of text.split("\n")) {
+      if (line.startsWith("ATOM  ") && line.length > 21 && !ids.includes(line[21])) ids.push(line[21]);
+    }
+  }
+  const chains = [];
+  for (const chain of ids) {
+    let residues = 0;
+    try {
+      const read = cif ? residuesFromCif(text, chain) : chainResidues(text, chain);
+      // ...amino acids only (MSE among them): a template takes a protein chain,
+      // and a DNA strand in the same entry is not one to offer.
+      residues = read.residues.filter((residue) => isStandardAmino(residue.resName)
+        || residue.resName === "MSE").length;
+    } catch {
+      continue;
+    }
+    if (residues > 0) chains.push({ chain, residues });
+  }
+  return chains;
+}
+
+/**
  * Line a structure's residues up with a query chain.
  *
  * 🔴 TWO CASES WITH DIFFERENT FAILURE MODES, AND THE SAFE ONE IS THE DEFAULT.

@@ -402,6 +402,16 @@ def main():
                              " or upload:PATH[@CHAIN] for a local structure."
                              " Goes to the network either way. `;` gives one"
                              " a protein chain, in order.")
+    parser.add_argument("--template-fetch", default="",
+                        help="ID or ID@CHAIN: set the first protein's template"
+                             " THROUGH THE POPUP - PDB entry, type the id, press"
+                             " Fetch, pick the chain from its menu - and count"
+                             " RCSB requests during the fold, which must be 0:"
+                             " the fold reuses the file Fetch checked. --template"
+                             " sets the entity object and never touches the popup.")
+    parser.add_argument("--save-pdb", default="",
+                        help="write the prediction's PDB (the page's own"
+                             " download) to this path")
     parser.add_argument("--then-sequence", default=None,
                         help="fold a SECOND time on this sequence, which is a"
                              " fresh fold rather than a continuation")
@@ -879,6 +889,54 @@ def main():
               list.set(entities);
               return JSON.stringify(list.read().map((e) => e.template ? e.template.kind : null));
             })()""" % json.dumps([template_entry(t) for t in args.template.split(";")])))
+
+        if args.template_fetch:
+            wanted, _, chain = args.template_fetch.partition("@")
+            fetched = json.loads(cdp.evaluate(ws, """(async () => {
+              const popup = () => document.querySelector('.entity-popup');
+              const open = document.querySelector('.entity-options');
+              if (open === null) return JSON.stringify({ error: 'no protein row' });
+              if (popup() === null) open.click();
+              if (popup() === null) open.click();
+              const kind = popup().querySelector('.entity-template-kind');
+              kind.value = 'pdb';
+              kind.dispatchEvent(new Event('change', { bubbles: true }));
+              const box = popup().querySelector('.entity-template-source');
+              box.value = %s;
+              box.dispatchEvent(new Event('input', { bubbles: true }));
+              popup().querySelector('.entity-template-fetch').click();
+              let status = '';
+              for (let i = 0; i < 600; i += 1) {
+                status = popup().querySelector('.entity-template-status')?.textContent ?? '';
+                if (!status.startsWith('Fetching')) break;
+                await new Promise((r) => setTimeout(r, 100));
+              }
+              const menus = popup().querySelectorAll('.entity-template-kind');
+              const chainMenu = menus.length > 1 ? menus[menus.length - 1] : null;
+              const chains = chainMenu === null ? [] : [...chainMenu.options].map((o) => o.textContent);
+              if (chainMenu !== null && %s !== '') {
+                chainMenu.value = %s;
+                chainMenu.dispatchEvent(new Event('change', { bubbles: true }));
+                status = popup().querySelector('.entity-template-status').textContent;
+              }
+              const source = popup().querySelector('.entity-template-source').value;
+              popup().querySelector('.entity-popup-head button')?.click();
+              // ...and every RCSB request from here on is counted: the fold
+              // should take the file Fetch already holds.
+              window.__rcsbAfterFetch = 0;
+              const real = window.fetch;
+              window.fetch = (url, init) => {
+                if (String(url).includes('rcsb.org')) window.__rcsbAfterFetch += 1;
+                return real(url, init);
+              };
+              const template = window.__entityList.read()[0].template;
+              return JSON.stringify({ status, chains, source,
+                                      cached: typeof template?.fetched?.text === 'string' });
+            })()""" % (json.dumps(wanted), json.dumps(chain), json.dumps(chain)), await_promise=True))
+            print("template fetch:", fetched)
+            if "error" in fetched or not fetched["cached"]:
+                print("FAIL: Fetch did not leave a structure on the template")
+                return 1
 
         msa_mode = args.msa_mode if args.msa_mode is not None else (None if args.job else "none")
         cdp.evaluate(ws, """(() => {
@@ -1454,6 +1512,32 @@ def main():
         # and the bytes are the only thing that says what the B-factor column
         # holds, which is a pLDDT for a scored model and something else for one
         # with no confidence head.
+        if args.template_fetch:
+            again = cdp.evaluate(ws, "window.__rcsbAfterFetch")
+            print("rcsb requests during the fold:", again)
+            if again != 0:
+                print("FAIL: the fold fetched the template again instead of"
+                      " reusing the file Fetch checked")
+                return 1
+        if args.save_pdb:
+            text = cdp.evaluate(ws, """(async () => {
+              let blob = null;
+              const made = URL.createObjectURL;
+              URL.createObjectURL = (b) => { blob = b; return made.call(URL, b); };
+              const clicked = HTMLAnchorElement.prototype.click;
+              HTMLAnchorElement.prototype.click = function () {};
+              document.getElementById('download-pdb').click();
+              await new Promise((done) => setTimeout(done, 1500));
+              URL.createObjectURL = made;
+              HTMLAnchorElement.prototype.click = clicked;
+              return blob === null ? null : await blob.text();
+            })()""", await_promise=True)
+            if text is None:
+                print("FAIL: the PDB button wrote nothing")
+                return 1
+            with open(args.save_pdb, "w") as handle:
+                handle.write(text)
+            print("saved:", args.save_pdb)
         if args.download_pdb:
             saved = json.loads(cdp.evaluate(ws, """(async () => {
               // The anchor carries the FILENAME and the blob carries the bytes,
