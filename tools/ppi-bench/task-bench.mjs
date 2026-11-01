@@ -476,6 +476,11 @@ async function attempt(name, index) {
         ...(positions === undefined ? {} : { hold: positions }),
         seed: seed + 101 * restart, signal: controller.signal, kind: "protein", beam: cfg.beam ?? 1,
         ...(cfg.temperature === undefined ? {} : { temperature: cfg.temperature }),
+        // `alanineBias`: the loop's alanine ramp on MPNN's logits (-0.5 -> -0.1 over the cycles) - IntelliFold-2's
+        // ligand designs ran 29% alanine (median) against AF3's 17%, so 82% of its cycles fell over the 0.2 ceiling
+        // and almost nothing reached the check
+        // (`true` for the loop's default ramp, or {start, end} for another)
+        ...(cfg.alanineBias ? { alanineBias: true, alanineBiasStart: cfg.alanineBias.start, alanineBiasEnd: cfg.alanineBias.end } : {}),
         // `omit`: letters MPNN may never write, per task (a DNA binder without D/E is basic) - the loop's own default is "C"
         ...(cfg.omit?.[t.task] === undefined ? {} : { omit: cfg.omit[t.task] }),
         veto: ({ pdb }) => contactProblem(pdb, { chain: "A" }),
