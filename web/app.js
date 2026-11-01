@@ -5869,6 +5869,12 @@ modeSelect.addEventListener("change", () => {
 installDevPanel();
 syncMode();
 
+// The footer's Credits button. getElementById rather than element(), as with
+// the privacy note: the dialog is index.html's and this file should not
+// require it to exist.
+const creditsDialog = document.getElementById("credits");
+document.getElementById("credits-open")?.addEventListener("click", () => creditsDialog?.showModal());
+
 // 🔴 THE MODEL DECIDES WHICH CONTROLS EXIST, and syncMode decides what the MSA
 // ones say - so the model listener runs syncModelControls and then syncMode,
 // in that order: the second reads the visibility the first just set.
