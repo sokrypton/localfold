@@ -170,7 +170,11 @@ async function attempt(name, index) {
   const seed = 1000 * index + 7;
   const templateFile = path.join(work, `${name}.pdb`);
   if (!fs.existsSync(templateFile)) fs.writeFileSync(templateFile, t.pdb);
-  const designModel = cfg.folder ?? "af3";
+  // `folder` may name several models: every cycle folds with each, the cycle is scored by the WORSE of them (the larger
+  // interface PAE, the smaller binder pTM) and MPNN designs from all of their structures at once, tied position by
+  // position - a design must satisfy every folder, not exploit one
+  const designModels = [].concat(cfg.folder ?? "af3");
+  const designModel = designModels[0];
   const targetMsas = cfg.msaDir === undefined ? undefined
     : t.sequences.map((s) => path.join(cfg.msaDir, `${createHash("sha1").update(s).digest("hex").slice(0, 12)}.a3m`));
   // the benchmark's hotspots in the fold's numbering (each target chain's residues in order), handed as a pocket
@@ -217,9 +221,15 @@ async function attempt(name, index) {
         veto: ({ pdb }) => contactProblem(pdb, { chain: "A" }),
         fold: async (sequence, context) => {
           const t0 = Date.now();
-          const r = await fold(t, templateFile, sequence, { model: designModel, steps: cfg.steps, recycles: cfg.recycles,
-            // `sameSeed`: every cycle of a run folds at ONE diffusion seed, as web/hunt.js does (a control for the page)
-            seed: seed + 101 * restart + (cfg.sameSeed ? 0 : 13 * context.cycle), pocket, msas: targetMsas });
+          const folds = [];
+          for (const [k, model] of designModels.entries()) {
+            folds.push(await fold(t, templateFile, sequence, { model, steps: cfg.steps, recycles: cfg.recycles,
+              // `sameSeed`: every cycle of a run folds at ONE diffusion seed, as web/hunt.js does (a control for the page)
+              seed: seed + 101 * restart + (cfg.sameSeed ? 0 : 13 * context.cycle) + 7919 * k, pocket, msas: targetMsas }));
+          }
+          const r = folds.length === 1 ? folds[0]
+            : { ...folds[0], binderPtm: Math.min(...folds.map((f) => f.binderPtm)), ipae: Math.max(...folds.map((f) => f.ipae)) };
+          if (folds.length > 1) statesOf.set(r.pdb, folds.slice(1).map((f) => f.pdb));
           // `states`: the same sequence folded by each of these models too, and MPNN designs the next cycle from all the
           // structures at once, tied position by position (mpnn-bridge.js `states`) - task-bench.mjs's TD22F, for PPI
           if (cfg.states !== undefined) {
@@ -228,7 +238,7 @@ async function attempt(name, index) {
               others.push((await fold(t, templateFile, sequence, { model: other, steps: cfg.steps, recycles: cfg.recycles,
                 seed: seed + 101 * restart + 13 * context.cycle + 31337, pocket, msas: targetMsas })).pdb);
             }
-            statesOf.set(r.pdb, others);
+            statesOf.set(r.pdb, [...(statesOf.get(r.pdb) ?? []), ...others]);
           }
           foldSeconds += (Date.now() - t0) / 1000;
           return { pdb: r.pdb, confidence: r.confidence, terms: { binderPtm: r.binderPtm, ipae: r.ipae } };
