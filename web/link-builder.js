@@ -14,8 +14,8 @@
 
 import { CROSSLINKERS } from "../shared/chem/crosslinkers.js";
 import { THREE_LETTER } from "../shared/af3/structure/pdb.js";
-import { DEFAULT_CONSTRAINT_DISTANCE, POLYMER_TYPES, parseBond, parseContact, parseCrosslink, parsePocket, rowChains }
-  from "./entities.js";
+import { COMMON_MODIFICATIONS, DEFAULT_CONSTRAINT_DISTANCE, POLYMER_TYPES, parseBond, parseContact, parseCrosslink,
+  parseModification, parsePocket, rowChains } from "./entities.js";
 
 /**
  * Each crosslinker's spacer arm in Angstrom, as its manufacturer quotes it - what people choose a crosslinker by, so
@@ -28,7 +28,7 @@ export const SPACER_ARM = {
 };
 
 /** The row types written by pickers rather than typed. */
-export const LINK_TYPES = ["bond", "crosslink", "pocket", "contact"];
+export const LINK_TYPES = ["modification", "bond", "crosslink", "pocket", "contact"];
 
 const endText = (end) => (end.chain === "" || !(end.residue > 0) ? `${end.chain}`
   : `${end.chain}${end.residue}${end.atom ? `:${end.atom}` : ""}`);
@@ -40,6 +40,7 @@ const endText = (end) => (end.chain === "" || !(end.residue > 0) ? `${end.chain}
 export function linkText(type, parts) {
   if (type === "bond") return `${endText(parts.ends[0])} - ${endText(parts.ends[1])}`;
   if (type === "contact") return `${endText(parts.ends[0])} - ${endText(parts.ends[1])} @ ${parts.distance}`;
+  if (type === "modification") return `${endText({ ...parts.ends[0], atom: null })} ${parts.code}`.trim();
   if (type === "crosslink") {
     const bare = (end) => endText({ ...end, atom: null });
     return `${parts.linker}: ${bare(parts.ends[0])} - ${bare(parts.ends[1])}`;
@@ -53,8 +54,14 @@ export function linkParts(type, value, chains) {
   const second = chains[1]?.letter ?? first;
   const blank = (chain) => ({ chain, residue: null, atom: null });
   const fromEnd = (end) => ({ chain: end.chain, residue: end.residue, atom: end.atom ?? null });
+  const firstPolymer = chains.find((chain) => POLYMER_TYPES.includes(chain.kind))?.letter ?? first;
   const defaults = { ends: [blank(first), blank(second)], distance: DEFAULT_CONSTRAINT_DISTANCE,
-                     linker: Object.keys(CROSSLINKERS)[0], binder: second, residues: "" };
+                     linker: Object.keys(CROSSLINKERS)[0], binder: second, residues: "", code: "" };
+  if (type === "modification") {
+    const parsed = parseModification(value);
+    return parsed === null ? { ...defaults, ends: [blank(firstPolymer)] }
+      : { ...defaults, ends: [{ chain: parsed.chain, residue: parsed.residue, atom: null }], code: parsed.code };
+  }
   if (type === "bond") {
     const parsed = parseBond(value);
     return parsed === null ? defaults : { ...defaults, ends: [fromEnd(parsed.from), fromEnd(parsed.to)] };
@@ -107,10 +114,10 @@ export function buildLinkField(entity, readEntities, changed) {
   };
 
   /** A menu of the chains, rebuilt when it is opened; `get`/`set` move its letter. */
-  const chainMenu = (get, set, title) => {
+  const chainMenu = (get, set, title, polymersOnly = false) => {
     const menu = element("select", "entity-picker link-chain", { title });
     const fill = () => {
-      const chains = rowChains(readEntities());
+      const chains = rowChains(readEntities()).filter((chain) => !polymersOnly || POLYMER_TYPES.includes(chain.kind));
       const current = get();
       // the letter alone, as the viewer and the PDB name the chain; what it is shows on hover and beside the residue
       const options = chains.map((chain) => Object.assign(new Option(chain.letter, chain.letter), { title: chain.name }));
@@ -128,7 +135,7 @@ export function buildLinkField(entity, readEntities, changed) {
   };
 
   /** One end: chain, residue (with what it lands on), and an atom where the row takes one. */
-  const endControls = (end, label, withAtom) => {
+  const endControls = (end, label, withAtom, polymersOnly = false) => {
     // text with a numeric keypad rather than type=number, whose spinner takes half of a box this narrow
     const residue = element("input", "entity-value link-residue", {
       type: "text", inputMode: "numeric", placeholder: "res", title: `${label}: residue number, counting from 1`,
@@ -162,7 +169,7 @@ export function buildLinkField(entity, readEntities, changed) {
       end.chain = letter;
       takeLoneResidue();
       refresh();
-    }, `${label}: chain`);
+    }, `${label}: chain`, polymersOnly);
     if (!(end.residue > 0)) takeLoneResidue();
     menu.setAttribute("aria-label", `${label} chain`);
     residue.addEventListener("input", () => {
@@ -198,7 +205,41 @@ export function buildLinkField(entity, readEntities, changed) {
     return group;
   };
 
-  if (type === "bond") {
+  if (type === "modification") {
+    // a residue, then what it becomes: the common ones by name, anything else as a CCD code typed in
+    const end = endControls(parts.ends[0], "Modified residue", false, true);
+    const menu = element("select", "entity-picker link-code", { title: "Common modifications" });
+    menu.setAttribute("aria-label", "Modification");
+    menu.append(new Option("Custom", ""));
+    for (const entry of COMMON_MODIFICATIONS) {
+      menu.append(Object.assign(new Option(entry.code, entry.code), { title: `${entry.name} (on ${entry.parent})` }));
+    }
+    const typed = element("input", "entity-value link-atom link-code-typed", {
+      type: "text", placeholder: "CCD", spellcheck: false, value: parts.code, title: "The modified residue's CCD code",
+    });
+    typed.setAttribute("aria-label", "Modification CCD code");
+    const sync = () => { menu.value = COMMON_MODIFICATIONS.some((entry) => entry.code === parts.code) ? parts.code : ""; };
+    sync();
+    menu.addEventListener("change", () => {
+      if (menu.value === "") { typed.focus(); return; }
+      parts.code = menu.value;
+      typed.value = menu.value;
+      write();
+    });
+    typed.addEventListener("input", () => { parts.code = typed.value.trim().toUpperCase(); sync(); write(); });
+    // which chains it lands on: every copy of the sequence the letter names
+    const copies = element("span", "link-word link-copies");
+    const sayCopies = () => {
+      const chains = rowChains(readEntities());
+      const named = chains.find((chain) => chain.letter === parts.ends[0].chain);
+      const all = named === undefined ? [] : chains.filter((chain) => chain.entity === named.entity);
+      copies.textContent = all.length > 1 ? `(applies to ${all.map((chain) => chain.letter).join(", ")})` : "";
+    };
+    sayCopies();
+    field.addEventListener("change", sayCopies);
+    field.addEventListener("focusin", sayCopies);
+    field.append(end, word("→"), menu, typed, copies);
+  } else if (type === "bond") {
     field.append(endControls(parts.ends[0], "First end", true), word("–"),
                  endControls(parts.ends[1], "Second end", true));
   } else if (type === "contact") {
