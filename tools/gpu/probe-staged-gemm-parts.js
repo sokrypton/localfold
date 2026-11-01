@@ -17,8 +17,8 @@
  *  - `noStage`    multiply out of uninitialised workgroup memory. Isolates the
  *                 matrix issue from the memory that feeds it.
  */
-import { createStagedMatrixShader } from "../../src/kernels/matrix-linear.js";
-import { deviceMatrixConfig } from "../../src/runtime/device-profile.js";
+import { createStagedMatrixShader } from "../../webgpu/kernels/matrix-linear.js";
+import { deviceMatrixConfig } from "../../webgpu/runtime/device-profile.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;

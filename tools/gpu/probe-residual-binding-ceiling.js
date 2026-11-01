@@ -22,7 +22,7 @@
  * This demonstrates the failure rather than computing it, because a ceiling
  * nobody has crossed is arithmetic and not a bug report.
  */
-import { WebGpuExecution } from "../../src/runtime/execution.js";
+import { WebGpuExecution } from "../../webgpu/runtime/execution.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;

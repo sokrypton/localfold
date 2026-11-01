@@ -29,7 +29,15 @@ const SIX_MRR = "GWSTELEKHREELKEFLKKEGITNVEIRIDNGRLEVRVEGGTERLKRFLEELRQKLEKKGYTV
 
 export const FOLDS = [
   ["AF2", ["tools/gpu/fold-af2.js", "--repeat=2"]],
-  ["AF3", ["tools/gpu/fold.js", "--model=/model-af3-int5/manifest.json"]],
+  // 🔴 TWO FOLDS, AND THE TRUNK'S WEIGHTS GIVEN BACK BETWEEN THEM. A streamed
+  // trunk's recorded int5 codes are destroyed when a fold releases them, and
+  // the next fold replayed the destroyed buffers - "[Buffer "int5-codes"] used
+  // in submit while destroyed" in fold 2, which then never finished. One fold
+  // cannot see that, and on an A100 the ampere prior keeps the trunk's weights
+  // so it never releases: the M2 found it. The knob forces the release on every
+  // box, and the second fold's pLDDT is the first's.
+  ["AF3", ["tools/gpu/fold.js", "--model=/model-af3-int5/manifest.json",
+           "--folds=2", "--tune=keepTrunkWeights=false"]],
   ["OpenDDE", ["tools/gpu/fold-opendde.js", "--target=6mrr", "--steps=16"]],
   ["ESMFold2", ["tools/gpu/fold-esmfold2.js", "--bundle=/model-esmfold2-int5"]],
   // 🔴 boltz2 is the one to watch: its token transformer amplifies its input by
@@ -58,6 +66,9 @@ export const FOLDS = [
                     `--sequence=${SIX_MRR}`, "--steps=50"]],
   ["rosettafold3", ["tools/gpu/fold.js", "--model=/model-rosettafold3-int5/manifest.json",
                     `--sequence=${SIX_MRR}`, "--steps=50"]],
+  // BioEmu2: its own graph (webgpu/bioemu2) - a generic GEMM, its LayerNorm and softmax kernels and the
+  // ESMFold2/AF3 pair track - from the job, through its own featuriser, 6MRR's 68 residues
+  ["BioEmu2", ["tools/gpu/fold-bioemu2.js", "--job=/tools/fixtures/bioemu2/6mrr-68.json", "--steps=50"]],
 ];
 
 const run = (args, env) => new Promise((resolve) => {

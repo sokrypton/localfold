@@ -54,6 +54,15 @@ const MODELS = [
     args: ["--target=5caj", "--chain=A", "--rows=16", "--extra-rows=16"],
     withMax: 5.0, withoutMin: 10.0,
   }],
+  // 🔴 AND THE MULTIMER, ON A COMPLEX, because its term is a different embedder
+  // and its slot spans chains: 1BRS A:D, both chains templated from the crystal
+  // into one atom37 slot. **16.679 A without and 0.782 with**, single sequence.
+  ["model", "af2-multimer", {
+    tool: "tools/gpu/fold-af2.js",
+    args: ["--family=multimer", "--target=1brs", "--chain=A,D", "--rows=1", "--extra-rows=1"],
+    template: "/tools/fixtures/1brs-crystal.pdb:A,D",
+    withMax: 3.0, withoutMin: 10.0,
+  }],
 ];
 
 /** One fold of 5CAJ chain A, with or without the self-template. */
@@ -67,7 +76,7 @@ function fold(bundle, template, entry = {}) {
     : ["tools/gpu-chrome.mjs", entry.tool, ...entry.args];
   // A fold with no template is 17-30 A out and its backbone is not always a
   // chain; that arm is the CONTROL and not the thing under test.
-  if (template) args.push(`--template=${TEMPLATE}`);
+  if (template) args.push(`--template=${entry.template ?? TEMPLATE}`);
   else args.push("--allow-broken-geometry");
   const text = execFileSync("node", args,
     { encoding: "utf8", maxBuffer: 1 << 28, stdio: ["ignore", "pipe", "pipe"] });

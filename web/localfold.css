@@ -969,6 +969,12 @@
   #plmGroup,
   #toleranceGroup,
   #msaModeGroup, #maxMsaGroup { flex: 1 1 calc(50% - 7px); }
+  /* 🔴 STEPS LOST ITS PARTNER WHEN FLOW WENT (2026-10-16). It was the second half of
+     Sampler/Steps; alone, its half left room for MSA beside it and Max MSA wrapped
+     onto a line by itself - the split pair this block exists to prevent. So with the
+     MSA pair shown after it Steps takes its line, and with it hidden (a PLM model)
+     Steps stays a half and PLM is its other half, as before. */
+  #af3CountGroup:has(~ #msaModeGroup:not([hidden])) { flex-basis: 100%; }
   #foldOptions > .fetch-option-group + .fetch-option-group,
   #plmGroup,
   #msaModeGroup {
@@ -1184,12 +1190,12 @@
    in web/app.js. */
 
 /* WHERE FOLD RUNS, AND WHETHER IT IS STILL THERE.
-   Only ever on a page opened from the notebook's link (?backend=colab), and
-   built by web/colab-bridge.js rather than marked up, so a page that folds in
+   Only ever on a page opened from the notebook's link (?backend=native), and
+   built by web/native-bridge.js rather than marked up, so a page that folds in
    this browser carries nothing of it. The dot is the pulse: green while the
    runtime page is collecting its commands, amber once it has stopped - which
    is the same twenty seconds after which a fold in flight gives up. */
-.colab-status {
+.native-status {
   display: inline-flex;
   align-items: center;
   gap: 8px;
@@ -1201,28 +1207,571 @@
   color: #374151;
   white-space: nowrap;
 }
-.colab-dot {
+.native-dot {
   width: 8px;
   height: 8px;
   border-radius: 50%;
   background: #9ca3af;
   flex: 0 0 auto;
 }
-.colab-status[data-state="live"] .colab-dot { background: #22c55e; }
-.colab-status[data-state="gone"] .colab-dot { background: #f59e0b; }
-.colab-status[data-state="gone"] { border-color: #fcd34d; background: #fffbeb; }
+.native-status[data-state="live"] .native-dot { background: #22c55e; }
+.native-status[data-state="gone"] .native-dot { background: #f59e0b; }
+.native-status[data-state="gone"] { border-color: #fcd34d; background: #fffbeb; }
 
 /* ...and it sits BETWEEN the title and the actions, in a slot of its own: the
    head is `space-between`, so a third child would push Fold and Add entity
    out of the place a reader has already learnt. The slot takes the leftover
    width and centres the badge in it, and gives it up entirely when the head
    wraps on a narrow screen. */
-.colab-status-slot {
+.native-live { display: inline-flex; align-items: center; gap: 3px; cursor: pointer; }
+.native-live input { margin: 0; }
+
+.native-status-slot {
   flex: 1 1 auto;
   min-width: 0;
   display: flex;
   justify-content: center;
 }
 @media (max-width: 948px) {
-  .colab-status-slot { flex: 1 1 100%; justify-content: flex-start; }
+  .native-status-slot { flex: 1 1 100%; justify-content: flex-start; }
 }
+
+/* ---------------------------------------------------------------------------
+   design.html — the design page
+
+   🔴 ONLY WHAT THIS PAGE INTRODUCES. Its head, its panel, its option strip and
+   its buttons are index.html's own classes, reused rather than restyled, so the
+   two pages stay the same page. What follows is the three surfaces a design page
+   needs and a fold page has none of: a span row, a line saying what the spans
+   amount to, and a per-cycle result.
+   --------------------------------------------------------------------------- */
+
+/* A SPAN ROW. Three grid tracks and exactly three children whatever the kind,
+   for the reason .entity-row's own note gives: a grid with more children than
+   tracks does not overflow, it WRAPS onto an implicit second row, which
+   tools/mobile-layout.py reports as a row broken across two lines. The per-kind
+   fields live inside the middle child.
+
+   🔴 AND THE LIST NEEDS THE PANEL'S FULL WIDTH. With the structure and preset
+   controls beside it the list computed to 248px, the middle track to 70, and
+   every row's fields wrapped into a column - the page read as rubble. Both now
+   sit in the option strip, which is what index.html's page-head note is about. */
+/* 🔴 THE EXAMPLE PICKER IS CAPPED, BECAUSE THE TITLES ARE SENTENCES. "Custom
+   Contig - CATH 3.40.50 Rossmann + Secondary Structure" sets the select's
+   natural width to about half the page, which pushed "Add span" onto two lines
+   and shoved the primary button to the edge. Capped, the select truncates its
+   own text - which is what a select does - and the head stays one row. */
+.fold-actions #preset { max-width: 240px; }
+
+/* ...and a button in that row never wraps: it is two words and a glyph, and a
+   wrapped one changes the height of the whole head. */
+.fold-actions .btn { white-space: nowrap; }
+
+/* 🔴 A SEGMENT IS A CARD (2026-10-27): its type, chain and remove on top, then every setting it
+   has, wrapping, then a "More" for the rare ones. Not a three-track grid any more - that grid kept a
+   segment's hotspots behind a disclosure because they did not fit on its one line. */
+.contig-cards { display: flex; flex-direction: column; gap: 8px; }
+.contig-row {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  position: relative;
+  padding: 8px 10px;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  background: #fff;
+}
+.contig-row.selected { border-color: #93c5fd; box-shadow: 0 0 0 1px #93c5fd inset; }
+.contig-row-break { padding-top: 4px; padding-bottom: 4px; background: #f9fafb; border-style: dashed; }
+.contig-head { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.contig-head .contig-kind { flex: 0 0 auto; font-weight: 600; }
+.contig-head .contig-break { min-width: 0; }
+.contig-chain-tag { font-size: 12px; font-weight: 600; color: var(--chain-colour, #6b7280); white-space: nowrap; }
+.contig-head .entity-remove { margin-left: auto; }
+.contig-control { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; min-width: 0; }
+.contig-unit { font-size: 12px; color: #6b7280; }
+.contig-hint { flex: 1 1 100%; font-size: 12px; color: #6b7280; line-height: 1.35; }
+/* the hotspots line is the one a binder is made of, so it is marked in the hotspot colour */
+.contig-hot { padding: 6px 8px; border-left: 3px solid #f59e0b; background: #fffbeb; border-radius: 0 6px 6px 0; }
+.contig-label-hot { font-weight: 600; color: #b45309; }
+.contig-hot .contig-hotspots { flex: 1 1 10ch; width: auto; min-width: 10ch; }
+.contig-redesign { color: #374151; }
+
+/* WHICH CHAIN THIS BLOCK IS, as the colour it will be in the viewer. The bar is
+   a ::before rather than a grid child because this is a three-track grid whose
+   tracks the phone breakpoint assigns by hand - a fourth element would have to
+   be placed twice, and would be the first thing to break there.
+
+   Rows in the same chain carry the same bar, so a chain break is visible as the
+   colour changing rather than only as the "New chain" row that causes it. */
+.contig-row-chained { padding-left: 14px; }
+
+.contig-row-chained::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 5px;
+  border-radius: 8px 0 0 8px;
+  background: var(--chain-colour, transparent);
+}
+
+/* One line, and it stays one line: the fields of a kind are few enough to fit,
+   and the two that are not - a sequence and its extras - get the row below. */
+.contig-fields {
+  display: grid;
+  grid-template-columns: 5.5rem minmax(0, 1fr);
+  align-items: center;
+  gap: 8px 10px;
+  min-width: 0;
+}
+.contig-fields > .contig-label { align-self: center; }
+
+/* The words between the controls. They carry the row's grammar: "residues 5 to
+   20" reads, three bare number boxes do not. */
+.contig-label {
+  font-size: 12px;
+  color: #6b7280;
+  white-space: nowrap;
+}
+
+/* 🔴 WIDE ENOUGH FOR THREE DIGITS AND THE SPINNER. At 6ch a number input fits
+   "75" and clips "120" behind the up/down arrows, which is most of the presets:
+   sm_sam asks for 120-165 and motif_unidx for 60-105. The arrows take ~2ch of
+   whatever is declared, so the field has to be the content plus them. */
+.contig-number { width: 9ch; padding: 6px 4px 6px 8px; text-align: right; }
+.contig-chain { width: 5ch; padding: 6px 8px; text-align: center; }
+.contig-code { width: 6ch; padding: 6px 8px; text-transform: uppercase; }
+.contig-name { width: 5ch; padding: 6px 8px; }
+.contig-hotspots { width: 9ch; padding: 6px 8px; }
+.contig-modified { width: 14ch; padding: 6px 8px; }
+
+/* A sequence is the one field that wants the room, so it takes what is left. */
+.contig-sequence {
+  width: 100%;
+  min-width: 0;
+  min-height: 34px;
+  padding: 7px 10px;
+  resize: vertical;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  word-break: break-all;
+}
+
+/* A break has nothing to fill in, so its row says what it does instead. */
+.contig-break { font-style: italic; color: #9ca3af; }
+
+/* A span the chosen method cannot honour: marked, still present, carrying its
+   reason. Never display:none - a control that vanishes teaches nothing. */
+.contig-row-unavailable .entity-value,
+.contig-row-unavailable .entity-picker { border-color: #fbbf24; }
+.contig-reason { flex: 1 1 100%; }
+
+
+/* WHAT THE SPANS AMOUNT TO, between the list and the settings: the notation the
+   chosen method is actually asked in, and anything wrong with the job. */
+.design-summary {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  padding: 8px 2px 0;
+}
+
+#contig-line {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  letter-spacing: .02em;
+  color: #374151;
+  background: #f9fafb;
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  padding: 3px 8px;
+  min-width: 0;
+  overflow-x: auto;
+  white-space: nowrap;
+}
+
+#contig-line:empty, #contig-problems:empty { display: none; }
+
+/* The structure control is three things on one line inside its group. */
+.design-structure { display: flex; align-items: center; gap: 6px; }
+.design-structure #structure-id { width: 7ch; }
+
+/* 🔴 THE FILE INPUT IS DRIVEN BY ITS LABEL, NOT SHOWN. A native file control
+   renders as a button plus a filename the browser truncates to "N…n" at this
+   width, which is both ugly and says nothing. The label is a button like the
+   others and the input is reachable by keyboard, so it is hidden from sight
+   rather than from the page. */
+.design-structure input[type="file"] {
+  position: absolute;
+  width: 1px; height: 1px;
+  padding: 0; margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.design-structure input[type="file"]:focus-visible + label { outline: 2px solid #3b82f6; }
+
+/* EVERYTHING THE PAGE DECIDED FOR YOU, in one short column under the strip
+   rather than four paragraphs threaded through it. */
+.design-notes { display: flex; flex-direction: column; gap: 2px; padding: 8px 2px 0; }
+.design-notes .option-note { max-width: none; }
+.design-notes .option-note:empty { display: none; }
+
+/* A control the chosen method cannot honour: greyed, still there, with its
+   reason. */
+#designOptions .fetch-option-group.unavailable > label,
+#designOptions .fetch-option-group.unavailable > .fetch-option-title { opacity: .45; }
+#designOptions .fetch-option-group.unavailable select,
+#designOptions .fetch-option-group.unavailable input { opacity: .45; cursor: not-allowed; }
+.unavailable-reason { font-style: italic; }
+
+/* THE CONDITION EDITOR under the viewer (web/condition-editor.js): one strip of controls, the rows
+   as the selections they write, each with its own remove button. Wraps on a phone. */
+.condition-editor .condition-controls { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 4px; }
+.condition-editor .condition-controls [hidden] { display: none; }
+.condition-field { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: #6b7280; }
+.condition-more .condition-controls { align-items: flex-end; margin-top: 8px; }
+.condition-more select, .condition-more input[type="text"] { box-sizing: border-box; height: 34px; padding: 0 8px;
+  border: 1px solid #d1d5db; border-radius: 8px; background: #fff; color: #111827; font-size: 13px; }
+.condition-more summary { cursor: pointer; color: #2563eb; font-size: 13px; margin-top: 8px; }
+.condition-editor .condition-controls :disabled { opacity: .45; cursor: not-allowed; }
+.condition-rows { list-style: none; margin: 6px 0 0; padding: 0; font-size: 13px; }
+.condition-rows li { padding: 2px 0; overflow-wrap: anywhere; }
+.condition-drop { border: none; background: none; color: #6b7280; cursor: pointer; font-size: 15px; padding: 0 4px; }
+
+/* ============================================================================
+   THE DESIGN PAGE'S LAYOUT (design.html, 2026-10-27): five steps on the left in the order a
+   newcomer decides them, the picture on the right. One column below 980px, in step order.
+   ============================================================================ */
+.design-page { max-width: 1760px; margin: 0 auto; }
+.design-head { margin-bottom: 12px; }
+.design-head h1 { margin: 0; }
+.design-tagline { margin: 2px 0 0; color: #6b7280; font-size: 14px; }
+.design-layout { display: grid; grid-template-columns: minmax(360px, 420px) minmax(0, 1fr); gap: 16px; align-items: start;
+  --viewer-height: max(420px, calc(100vh - 210px)); }
+.design-steps { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+/* full screen is the two columns (design.html): the page's background, and the steps scroll in it */
+.design-layout:fullscreen { background: #f9fafb; padding: 8px 16px; overflow-y: auto; }
+/* 🔴 THE PICTURE STAYS IN VIEW while the steps scroll past it: the stage sticks to the top, and a
+   run's table and downloads scroll in their own box under the viewer (.design-below) - the stage
+   scrolling as a whole let the viewer be scrolled away, and the canvas then took the wheel back as
+   a zoom. The stage itself scrolls only on a window too short for the viewer's minimum. */
+.design-stage { display: flex; flex-direction: column; gap: 8px; min-width: 0;
+  position: sticky; top: 8px; max-height: calc(100vh - 16px); overflow-y: auto; }
+.design-stage > * { flex: 0 0 auto; }
+.design-stage > .design-below { flex: 1 1 auto; min-height: 0; overflow-y: auto;
+  display: flex; flex-direction: column; gap: 8px; }
+.design-stage.has-results > .design-below { min-height: 120px; }
+.design-step { background: #fff; border: 1px solid #e5e7eb; border-radius: 10px; padding: 12px 14px; }
+.design-step[hidden] { display: none; }
+.design-step h2 { display: flex; align-items: center; gap: 8px; margin: 0 0 8px; font-size: 15px; font-weight: 600; color: #111827; }
+.step-number { display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px;
+  border-radius: 50%; background: #2563eb; color: #fff; font-size: 12px; font-weight: 700; flex: 0 0 auto; }
+.step-optional { margin-left: auto; font-size: 11px; font-weight: 500; color: #9ca3af; text-transform: uppercase; letter-spacing: .04em; }
+.step-hint { margin: -4px 0 8px; font-size: 13px; color: #6b7280; }
+.step-more { display: flex; align-items: center; gap: 8px; margin-top: 10px; font-size: 13px; color: #6b7280; }
+.step-more select { flex: 1 1 auto; min-width: 0; }
+.design-step .option-note:empty { display: none; }
+
+/* the goals: a card each, the chosen one outlined */
+/* the method and its models: three labelled pickers that wrap */
+.model-row { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: flex-end; }
+.model-field { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.model-field label { font-size: 12px; color: #6b7280; }
+.model-field select { min-width: 7.5rem; }
+#step-method .step-hint { margin: 8px 0 0; }
+.example-picker { width: 100%; }
+#preset-note { margin-top: 6px; }
+.structure-line { display: flex; align-items: center; gap: 8px; margin: 4px 0 8px; }
+.structure-line .option-note:empty + #clear-structure { display: none; }
+.add-segment { flex: 0 1 auto; min-width: 12rem; }
+.visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden;
+  clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+
+.design-step .design-structure { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.design-step .design-structure input[type="text"] { flex: 1 1 140px; min-width: 0; }
+
+/* the job at a glance: a row per chain, a block per piece */
+.chain-diagram { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
+.chain-diagram:empty { display: none; }
+.chain-block-hot { display: inline-block; padding: 1px 5px; border-radius: 8px; background: #f59e0b; color: #111827; font-weight: 600; }
+.chain-row { display: flex; align-items: center; gap: 8px; }
+.chain-name { width: 14px; font-size: 12px; font-weight: 700; color: var(--chain-colour, #6b7280); }
+.chain-track { display: flex; flex: 1 1 auto; gap: 2px; min-width: 0; }
+.chain-block { flex-basis: 0; min-width: 44px; height: 28px; border-radius: 5px; border: 1px solid var(--chain-colour, #6b7280);
+  font: 11px/1 system-ui, sans-serif; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding: 0 6px;
+  cursor: pointer; color: #111827; background: #fff; }
+.chain-block-segment { background: var(--chain-colour, #6b7280); color: #fff; }
+.chain-block-generated { background: repeating-linear-gradient(135deg,
+  color-mix(in srgb, var(--chain-colour, #6b7280) 22%, #fff) 0 6px, #fff 6px 12px); }
+.chain-block-sequence { border-style: dashed; }
+.chain-block-ligand { flex: 0 0 auto; border-color: #78716c; border-radius: 14px; background: #f5f5f4; }
+.chain-block.selected, .chain-block:focus-visible { outline: 2px solid #111827; outline-offset: 1px; }
+.contig-row-flash { animation: contig-flash 1.2s ease-out; }
+@keyframes contig-flash { from { background: #dbeafe; } to { background: transparent; } }
+.design-step .design-summary { display: flex; align-items: center; gap: 10px; margin-top: 6px; }
+.design-step .design-summary code { font-size: 12px; color: #6b7280; background: none; border: 0; }
+
+/* the run: the settings, then Advanced and the one button */
+.design-step .fetch-options { margin: 0; }
+.not-this-method { display: none !important; }
+.run-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 10px; }
+.run-button { padding: 8px 22px; font-size: 15px; }
+
+/* the picture: py2Dmol sizes its viewer for its own page (948px, a 600px canvas beside a 340px
+   panel); here it is the column's width. */
+.design-stage .py2dmol-viewer-instance { width: 100%; }
+/* ...and the canvas follows #canvasContainer (py2Dmol's viewport watches it), which show() fixes
+   inline at the width it was built at - so a window resized after the first frame kept it. */
+.design-stage #viewerWrapper, .design-stage #canvasContainer { width: 100% !important; }
+/* ...and as tall as the window leaves, which py2Dmol's observer follows the same way. */
+.design-stage #canvasContainer { height: var(--viewer-height) !important; }
+/* 🔴 AND SHORTER BY THE STRIP WHEN THE STRIP IS UP, so both are on screen: a window-tall viewer put the
+   strip below the fold, where through a run it read as gone. A long sequence scrolls inside its box. */
+.design-stage.has-sequence { --viewer-height: max(320px, calc(100vh - 360px)); }
+.design-stage #sequence-viewer-container { flex: 0 0 auto; }
+.design-stage #sequenceView { max-height: 104px; overflow-y: auto; }
+/* ...and shorter again while a run's table is up, leaving that box about a third of the window */
+.design-stage.has-results { --viewer-height: max(260px, calc(70vh - 110px)); }
+.design-stage.has-sequence.has-results { --viewer-height: max(240px, calc(70vh - 250px)); }
+.seed-field { display: inline-flex; align-items: center; gap: 4px; }
+.seed-field input { width: 9ch; }
+.viewer-bar { display: flex; align-items: center; gap: 10px; min-height: 26px; }
+.viewer-bar [hidden] { display: none !important; }
+.viewer-bar #show-job { margin-left: auto; }
+
+/* 🔴 THE STEPS NUMBER THEMSELVES: the Selection step is hidden until a structure is loaded, and a
+   typed "5" after "3" read as a step the reader had missed. */
+.design-steps { counter-reset: design-step; }
+.design-step:not([hidden]) { counter-increment: design-step; }
+.design-step .step-number { font-size: 0; }
+.design-step .step-number::before { content: counter(design-step); font-size: 12px; }
+
+/* 🔴 ONE LOOK FOR EVERY FIELD ON THE PAGE: the Run settings and the structure box were bare browser
+   inputs under py2Dmol's uppercase captions, beside rounded, sentence-case cards. */
+#step-run .fetch-options { gap: 10px 16px; padding: 0; background: none; border: 0; }
+#step-run .fetch-option-group + .fetch-option-group { border-left: 0; padding-left: 0; margin-left: 0; }
+#step-run .fetch-option-title { font-size: 12px; font-weight: 400; letter-spacing: 0; text-transform: none; color: #6b7280; }
+#step-run input[type="number"], #step-run input[type="text"], #step-run select,
+.design-structure #structure-id {
+  box-sizing: border-box; height: 34px; padding: 0 8px; border: 1px solid #d1d5db; border-radius: 8px;
+  background: #fff; color: #111827; font-size: 13px; }
+#step-run input[type="number"], #step-run input[type="text"] { width: 9ch; }
+#step-run select { min-width: 7rem; }
+#step-run .seed-field input { width: 10ch; }
+#step-run .seed-field .btn { height: 34px; }
+.run-advanced { margin-top: 10px; padding: 10px 12px; border: 1px solid #e5e7eb; border-radius: 8px; background: #f9fafb; }
+.run-advanced[hidden] { display: none; }
+.run-advanced-title { margin: 0 0 8px; font-size: 13px; font-weight: 600; color: #374151; }
+.run-advanced .design-notes { padding: 8px 0 0; }
+
+/* a chain break says what it does, small, beside its picker */
+.contig-head .contig-break { font-style: normal; font-size: 12px; color: #6b7280; }
+/* a CCD code is upper case; its example is not shouted */
+.contig-code::placeholder { text-transform: none; }
+.viewer-bar #show-job[hidden] + .run-button { margin-left: auto; }
+.viewer-bar .run-button { flex: 0 0 auto; }
+.run-where { font-size: 12px; color: #9ca3af; }
+.viewer-legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; color: #4b5563; }
+.viewer-key { display: inline-flex; align-items: center; gap: 5px; }
+.viewer-key i { width: 12px; height: 12px; border-radius: 3px; background: var(--key-colour); }
+.viewer-empty { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px;
+  height: var(--viewer-height); border: 1px dashed #d1d5db; border-radius: 10px; background: #fff;
+  color: #9ca3af; text-align: center; padding: 16px; }
+.viewer-empty[hidden] { display: none; }
+.viewer-empty i { font-size: 32px; }
+.viewer-empty p { margin: 0; font-size: 14px; max-width: 260px; }
+.sequence-hint { font-size: 12px; color: #9ca3af; }
+/* the designs' files: a row each (its name and buttons, its metrics under them), the archive last.
+   #downloads is the fold page's 340px flex row, which this is not. */
+.design-stage #downloads { width: auto; display: flex; flex-direction: column; align-items: stretch; gap: 8px; padding: 10px 14px; }
+.design-stage #downloads h3 { margin: 0; font-size: 14px; }
+.design-stage #downloads > div { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 13px; }
+.design-stage #downloads button { flex: 0 0 auto; }
+.design-stage #downloads .design-metrics { flex: 1 1 100%; font-size: 12px; color: #6b7280; }
+.design-stage #downloads > button { align-self: flex-start; }
+.design-foot { margin-top: 16px; text-align: center; }
+.design-foot .option-note { max-width: none; }
+
+/* the constraints: what is selected, what to do with it, and the chips */
+.condition-selection { font-size: 13px; color: #6b7280; }
+.condition-selection.has-selection { color: #111827; font-weight: 500; }
+.condition-quick { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.condition-quick button:disabled, .condition-controls button:disabled { opacity: .45; cursor: not-allowed; }
+.condition-more { margin-top: 8px; font-size: 13px; }
+.condition-quick[hidden], .condition-more[hidden] { display: none; }
+.condition-more summary { cursor: pointer; color: #2563eb; }
+.condition-chip { display: flex; align-items: center; gap: 6px; }
+.condition-rows .role-swatch { flex: 0 0 auto; }
+
+@media (max-width: 980px) {
+  .design-layout { grid-template-columns: minmax(0, 1fr); --viewer-height: min(70vh, 100vw); }
+  .design-stage.has-sequence { --viewer-height: min(60vh, 100vw); }
+  /* one column: the picture is a section in the page's flow, not a pane beside it - and it comes
+     right after the goal, so choosing one shows the job (and Generate) without scrolling past
+     every step. The steps' box dissolves so its sections can be ordered around the stage. */
+  .design-stage { position: static; max-height: none; overflow: visible; order: 2; }
+  .design-stage > .design-below, .design-stage.has-results > .design-below { min-height: 0; overflow: visible; }
+  .design-stage.has-results, .design-stage.has-sequence.has-results { --viewer-height: min(60vh, 100vw); }
+  .design-steps { display: contents; }
+  .design-step { order: 3; }
+  #step-method { order: 0; }
+  #step-goal { order: 1; }
+  .viewer-empty { min-height: 120px; }
+}
+
+/* What a control says underneath itself. */
+.option-note {
+  font-size: 12px;
+  line-height: 1.4;
+  color: #6b7280;
+  margin-top: 4px;
+  max-width: 420px;
+}
+
+/* 🔴 AMBER, NOT RED. A warning here means the run will proceed and lose
+   something - a designer that cannot see the ligand, five folders where two
+   measured better. Red is for a page that cannot proceed. */
+.option-note.warn { color: #92400e; }
+
+/* THE RESULTS. The roles are named beside them, because that is where they are
+   read - at the foot of the page they explained a picture nobody was looking
+   at. */
+#roles-legend .role-list {
+  list-style: none;
+  margin: 0 0 10px;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  font-size: 12px;
+  color: #374151;
+}
+
+#roles-legend .role-list li { display: flex; align-items: center; gap: 6px; }
+
+.role-swatch {
+  width: 11px;
+  height: 11px;
+  border-radius: 3px;
+  border: 1px solid #d1d5db;
+  flex: 0 0 auto;
+}
+
+/* Free is the page's own background, so it reads as "nothing is holding this"
+   and the held roles are the ones that carry colour. */
+/* The swatch takes its colour from the job now - one per chain, set inline from
+   the same palette the span rows and the viewer use - so there are no per-role
+   background rules left to drift out of step with it. */
+.role-swatch { background: var(--chain-colour, #e5e7eb); }
+
+/* One line a cycle, at the sequence viewer's measure so two cycles read against
+   each other. */
+#cycle-track {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  letter-spacing: .02em;
+  overflow-x: auto;
+  margin-bottom: 10px;
+}
+
+#cycle-track:empty { display: none; }
+#cycle-track .best-line { font-weight: 500; }
+
+#results-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+#results-table th,
+#results-table td {
+  text-align: left;
+  padding: 4px 8px;
+  border-bottom: 1px solid #e5e7eb;
+  white-space: nowrap;
+}
+
+#results-table th { color: #6b7280; font-weight: 500; }
+#results-table tr.best td { background: #f0fdf4; font-weight: 500; }
+
+/* 🔴 A REJECTED CYCLE KEEPS ITS ROW AND ITS NUMBER, because a verdict with the
+   measurement removed is the thing this page exists not to do. */
+#results-table tr.rejected td { color: #92400e; }
+#results-table td.validity { white-space: normal; }
+
+/* The folders a run rotates through, as chips: one line, and what is on is
+   plain without reading a scrollbar. */
+.design-chips { display: flex; flex-wrap: wrap; gap: 4px; }
+
+.design-chip {
+  height: 26px;
+  padding: 0 10px;
+  border: 1px solid #d1d5db;
+  border-radius: 13px;
+  background: #fff;
+  color: #6b7280;
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.design-chip:hover { border-color: #9ca3af; color: #111827; }
+
+/* 🔴 ON IS A FILLED CHIP, not a tinted row. The listbox this replaced showed
+   its selection as a grey highlight, which is what every disabled control on
+   the page also looks like. */
+.design-chip-on {
+  background: #eff6ff;
+  border-color: #3b82f6;
+  color: #1d4ed8;
+  font-weight: 500;
+}
+
+/* 🔴 A CONTROL AS WIDE AS ITS CONTENT, NOT AS WIDE AS ITS COLUMN. Omit holds
+   one letter and Seed one digit, and both were stretching to fill the strip -
+   which pushed "Start from" onto a line of its own and made the settings read
+   as three ragged rows rather than one block. The groups still share the strip
+   evenly; it is the inputs inside them that stop growing. */
+#designOptions #omit { width: 8ch; }
+#designOptions #seed { width: 8ch; }
+#designOptions #temperature { width: 8ch; }
+#designOptions #cycles, #designOptions #runs, #designOptions #steps,
+#designOptions #beam { width: 8ch; }
+#designOptions #preset { max-width: 240px; }
+#designOptions #designer { max-width: 180px; }
+#designOptions #folders, #designOptions #validate { max-width: 150px; }
+
+/* The advanced toggle has no label above it, so it needs the control's own
+   height to sit on the strip's baseline with everything else. */
+#advancedGroup .fetch-option-title { visibility: hidden; }
+
+
+
+
+}
+
+/* 🔴 STEP 6, THE REFOLD: a design, a model of its own, the button - one row that wraps. */
+#step-refold .refold-design-field select { min-width: 11rem; }
+#step-refold .model-row .btn { height: 34px; }
+#step-refold .option-note { margin-top: 8px; }
+
+/* The template popup's Fetch, beside the id it checks. Sized to the 30px
+   inputs on that row so the two read as one control. */
+.entity-template-fetch {
+  flex: 0 0 auto;
+  height: 30px;
+  padding: 0 10px;
+  font-size: 12px;
+  border: 1px solid #d1d5db;
+  border-radius: 7px;
+  background: #f9fafb;
+  color: inherit;
+  cursor: pointer;
+}
+.entity-template-fetch:hover { background: #f3f4f6; }

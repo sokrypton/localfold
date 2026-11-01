@@ -1,9 +1,9 @@
 import { describe, expect, it } from "./harness.js";
 import {
-  GAP_AATYPE, chainResidues, filterByConfidence, identityMap, templateSlot,
-} from "../src/af3/featurise/template-input.js";
-import { NUM_DENSE } from "../src/af3/featurise/template-features.js";
-import { aatypeFor } from "../src/af3/featurise/reference-conformers.js";
+  GAP_AATYPE, chainResidues, chosenAltLocs, filterByConfidence, identityMap, templateSlot,
+} from "../shared/af3/featurise/template-input.js";
+import { NUM_DENSE } from "../shared/af3/featurise/template-features.js";
+import { aatypeFor } from "../shared/af3/featurise/reference-conformers.js";
 
 /**
  * `tools/oracle/check_af3_template_geometry.js` holds this to AF3 itself -
@@ -68,8 +68,15 @@ describe("chainResidues", () => {
   });
 
   it("reads an unknown residue name as X rather than dropping it", () => {
-    const odd = `${line(1, "CA", "SEP", "A", 1, " ", 0, 0, 0)}\nEND\n`;
+    const odd = `${line(1, "CA", "ZZZ", "A", 1, " ", 0, 0, 0)}\nEND\n`;
     expect(chainResidues(odd, "A").sequence).toBe("X");
+  });
+
+  // 🔴 AND A MODIFIED AMINO ACID AS ITS PARENT, AlphaFold 3's reading (SEP -> SER): it was an X, then dropped as a
+  // HETATM, where AF3's template carries the serine (af3-any-model colab, 5K9P)
+  it("reads a modified amino acid as its parent", () => {
+    const sep = `${line(1, "CA", "SEP", "A", 1, " ", 0, 0, 0)}\nEND\n`;
+    expect(chainResidues(sep, "A").sequence).toBe("S");
   });
 });
 
@@ -155,5 +162,35 @@ describe("identityMap and filterByConfidence", () => {
     expect([...filterByConfidence(map, structure, 70, confidence)])
       .toEqual([[0, 0], [1, 1], [2, 2]]);
     expect(filterByConfidence(map, structure, 0, confidence)).toBe(map);
+  });
+});
+
+describe("alternate locations", () => {
+  // `line` with an altLoc and an occupancy written into columns 17 and 55-60
+  const alt = (text, altLoc, occupancy) =>
+    text.slice(0, 16) + altLoc + text.slice(17, 54) + occupancy.toFixed(2).padStart(6) + text.slice(60);
+
+  it("keeps the most occupied conformer, as AF3 and Biopython do, not the first", () => {
+    // 5CAJ's residues 166, 168 and 247 are this shape: B at 0.52 after A at 0.48
+    const pdb = [
+      line(1, "N", "SER", "A", 1, " ", 0, 0, 0),
+      alt(line(2, "CA", "SER", "A", 1, " ", 1, 0, 0), "A", 0.48),
+      alt(line(3, "CA", "SER", "A", 1, " ", 2, 0, 0), "B", 0.52),
+      alt(line(4, "OG", "SER", "A", 1, " ", 3, 0, 0), "A", 0.48),
+      alt(line(5, "OG", "SER", "A", 1, " ", 4, 0, 0), "B", 0.52),
+    ].join("\n");
+    const [residue] = chainResidues(pdb, "A").residues;
+    expect(residue.atoms.get("N")[0]).toBe(0);
+    expect(residue.atoms.get("CA")[0]).toBe(2);
+    expect(residue.atoms.get("OG")[0]).toBe(4);
+  });
+
+  it("breaks a tie alphabetically, and leaves a residue without conformers alone", () => {
+    const chosen = chosenAltLocs([
+      { key: "1", altLoc: "B", occupancy: 0.5 }, { key: "1", altLoc: "A", occupancy: 0.5 },
+      { key: "2", altLoc: "", occupancy: 1 },
+    ]);
+    expect(chosen.get("1")).toBe("A");
+    expect(chosen.has("2")).toBe(false);
   });
 });

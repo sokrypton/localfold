@@ -27,9 +27,9 @@
  * download besides. It makes the numbers meaningless as biology and perfectly
  * good as a fingerprint, which is what a regression needs.
  *
- * 🔴 MULTIMER SHARES EVERY KERNEL AND HAD NO GATE AT ALL. src/af2/multimer/block.js
+ * 🔴 MULTIMER SHARES EVERY KERNEL AND HAD NO GATE AT ALL. webgpu/af2/multimer/block.js
  * builds its blocks from the same attention, transition and outer-product-mean
- * shaders src/af2/evoformer/block.js does, with its own dispatches - so a tile
+ * shaders webgpu/af2/evoformer/block.js does, with its own dispatches - so a tile
  * changed in one and not threaded through the other is a bug that only a
  * multimer fold can see. `--family=multimer` runs that path, through
  * AlphaFoldUnifiedGpu and the multimer regime the page passes (outer product
@@ -41,20 +41,21 @@
  * real protein and nothing else; `caca` is the number that a wrong kernel
  * cannot fake, so it is printed with its worst outlier.
  */
-import { memorySnapshot } from "../../src/runtime/device-memory.js";
-import { noteResidencyRefused, setMemoryBudget } from "../../src/runtime/device-memory.js";
-import { DEFAULT_TUNING, setDeviceTuning } from "../../src/runtime/device-profile.js";
-import { AlphaFoldFixture } from "../../src/bundles/alphafold-fixture.js";
-import { HttpTensorStore } from "../../src/bundles/http-tensor-store.js";
-import { AlphaFoldMonomerGpu } from "../../src/af2/model/monomer.js";
-import { AlphaFoldUnifiedGpu } from "../../src/af2/multimer/model.js";
-import { setShaderSourceVerification } from "../../src/runtime/shader-source-cache.js";
-import { featureStats, resetFeatureStats } from "../../src/input/a3m-features.js";
+import { memorySnapshot } from "../../webgpu/runtime/device-memory.js";
+import { noteResidencyRefused, setMemoryBudget } from "../../webgpu/runtime/device-memory.js";
+import { DEFAULT_TUNING, setDeviceTuning } from "../../webgpu/runtime/device-profile.js";
+import { AlphaFoldFixture } from "../../shared/bundles/alphafold-fixture.js";
+import { HttpTensorStore } from "../../shared/bundles/http-tensor-store.js";
+import { AlphaFoldMonomerGpu } from "../../webgpu/af2/model/monomer.js";
+import { AlphaFoldUnifiedGpu } from "../../webgpu/af2/multimer/model.js";
+import { setShaderSourceVerification } from "../../webgpu/runtime/shader-source-cache.js";
+import { featureStats, resetFeatureStats } from "../../shared/input/a3m-features.js";
 import { chainResidues, identityMap, templateSlotAtom37 }
-  from "../../src/af3/featurise/template-input.js";
+  from "../../shared/af3/featurise/template-input.js";
 import { superpose } from "./superpose.js";
-import { DeltaTensorStore } from "../../src/bundles/delta-tensor-store.js";
-import { MODEL_BUNDLES, graphFamily } from "../../src/bundles/manifests/index.js";
+import { predictionToPdb } from "../../web/prediction-results.js";
+import { DeltaTensorStore } from "../../shared/bundles/delta-tensor-store.js";
+import { MODEL_BUNDLES, graphFamily } from "../../shared/bundles/manifests/index.js";
 
 /**
  * One `--name=value` argument, or a bare `--name` as the empty string.
@@ -136,6 +137,19 @@ function summariseStages(marks, started) {
   }));
 }
 
+// One chain, or a comma list of them read in order and concatenated - the
+// residue axis a multimer folds over.
+function complexResidues(text, spec) {
+  const names = spec === undefined ? [undefined] : spec.split(",");
+  if (names.length === 1) return chainResidues(text, names[0]);
+  const parts = names.map((name) => chainResidues(text, name));
+  return {
+    residues: parts.flatMap((part) => part.residues),
+    sequence: parts.map((part) => part.sequence).join(""),
+    chainLengths: parts.map((part) => part.residues.length),
+  };
+}
+
 export async function main(device, args) {
   // 🔴 A CEILING, SO THE RESIDENCY FALLBACK CAN BE MADE TO FIRE. AF2 keeps its
   // block weights on the device now - 280 MiB of a 387 MiB fold at 59 residues
@@ -171,7 +185,7 @@ export async function main(device, args) {
   let targetStructure;
   if (targetName !== "") {
     const text = await (await fetch(`/tools/fixtures/${targetName}-crystal.pdb`)).text();
-    targetStructure = chainResidues(text, targetChain);
+    targetStructure = complexResidues(text, targetChain);
   }
   const sequence = option(args, "sequence",
     targetStructure?.sequence ?? DEFAULT_SEQUENCE);
@@ -185,7 +199,9 @@ export async function main(device, args) {
       + ` one of ${Object.keys(MODEL_BUNDLES)
         .filter((name) => ["monomer", "multimer"].includes(graphFamily(name))).join(", ")}`);
   }
-  const chainLengths = option(args, "chains", "").split(",").filter(Boolean).map(Number);
+  // `--chain=A,D` on a target names a complex, whose chain lengths it states.
+  const chainLengths = option(args, "chains", targetStructure?.chainLengths?.length > 1
+    ? targetStructure.chainLengths.join(",") : "").split(",").filter(Boolean).map(Number);
   const rows = Number(option(args, "rows", "128"));
   // 🔴 AF2's TWO STACKS HAVE TWO DEPTHS AND THIS TOOL CONFLATED THEM. The
   // monomer runs an EXTRA-MSA stack and then the main evoformer, and AlphaFold's
@@ -238,7 +254,7 @@ export async function main(device, args) {
   // ...the LOCAL bundle, by directory rather than through web/model.js's
   // loadModel: that resolves the monomer family to its remote base, and this
   // machine should not pull 227 MB to run a regression.
-  const { loadManifest } = await import("../../src/bundles/manifests/index.js");
+  const { loadManifest } = await import("../../shared/bundles/manifests/index.js");
   // 🔴 `--bundle=<directory>` READS THE manifest.json BESIDE THE SHARDS, which
   // is the ONLY way to fold a bundle the registry does not name - and AlphaFold
   // 2 ships five models where this repository has published one. It is the
@@ -252,7 +268,7 @@ export async function main(device, args) {
     : await HttpTensorStore.open(`${bundleDirectory}/manifest.json`);
   // 🔴 A DELTA BUNDLE IS HALF A MODEL AND SAYS SO. Its manifest carries a
   // `delta` header naming the family it is added to, so this opens that base as
-  // well - see src/bundles/delta-tensor-store.js. `--base=` overrides the
+  // well - see shared/bundles/delta-tensor-store.js. `--base=` overrides the
   // directory for a base that is not the registry's.
   if (store.manifest.delta !== undefined) {
     const header = store.manifest.delta;
@@ -398,7 +414,9 @@ export async function main(device, args) {
   if (templateSpec !== "") {
     const [path, wantedChain] = templateSpec.split(":");
     const text = await (await fetch(path.startsWith("/") ? path : `/${path}`)).text();
-    const structure = chainResidues(text, wantedChain);
+    // `path:A,D` concatenates chains, which is a multimer's template: one
+    // atom37 slot over the whole complex, with asymId masking what crosses.
+    const structure = complexResidues(text, wantedChain);
     if (structure.residues.length === 0) {
       throw new Error(`--template=${templateSpec} resolved no residues`);
     }
@@ -488,7 +506,9 @@ export async function main(device, args) {
     const checksum = checksumOf(other.final.structure.atom37);
     repeats.push({ milliseconds: Math.round(performance.now() - at), checksum,
                    sameFold: checksum === firstChecksum });
-    if (checksum !== firstChecksum) {
+    // `--allow-nondeterminism` records every repeat instead, so the pattern can be read: A, B, B is a
+    // first-touch difference, A, B, C a race (bench-af2-warm.js's same escape).
+    if (checksum !== firstChecksum && !args.includes("--allow-nondeterminism")) {
       throw new Error(`fold ${again + 1} returned checksum ${checksum} where the first`
         + ` returned ${firstChecksum}; the same input at the same seed must fold the same`);
     }
@@ -566,7 +586,12 @@ export async function main(device, args) {
   }
 
   const round = (value, places = 4) => Number(value.toFixed(places));
+  // `--pdb`: the structure as the page writes it (web/prediction-results.js), for a scorer outside this
+  // process - cuda/af2/parity scores this arm with DockQ against ColabFold's and the CUDA port's
+  const pdb = args.includes("--pdb")
+    ? predictionToPdb(sequence, final.structure, final.confidence.plddt, chains) : undefined;
   return {
+    pdb,
     sequence: sequence.length > 24 ? `${sequence.slice(0, 24)}...(${length})` : sequence,
     family: graph === family ? family : `${family} (${graph} graph)`,
     chains, length, rows, extraRows, recycles, seed,
@@ -580,12 +605,15 @@ export async function main(device, args) {
       .map(([key, value]) => [key, key === "calls" ? value : Math.round(value)])),
     packBy: Object.fromEntries(Object.entries(globalThis.__pk ?? {}).map(([k,v]) => [k, Math.round(v)]).sort((a,b)=>b[1]-a[1])),
     // What the fold left on the device, and in what - the totals alone cannot
-    // say which tensor to attack. See src/runtime/device-memory.js.
-    deviceMemory: trimMemory(memorySnapshot(device)),
+    // say which tensor to attack. See webgpu/runtime/device-memory.js. `--memory-rows=` for more than twelve.
+    deviceMemory: trimMemory(memorySnapshot(device), Number(option(args, "memory-rows", "12"))),
     meanPlddt: round(final.confidence.meanPlddt, 3),
     ptm: round(final.confidence.ptm, 4),
     ...(final.confidence.iptm === undefined ? {} : { iptm: round(final.confidence.iptm, 4) }),
     caca: { median: round(median, 3), worst: round(worst, 3), ok: chainOk },
+    // `--ca`: every residue's alpha carbon, so two arms' structures can be superposed rather than checksummed
+    ...(args.includes("--ca") ? { alphaCarbons: Array.from({ length: atom37.length / 111 }, (_, r) =>
+      [0, 1, 2].map((d) => round(atom37[(r * 37 + 1) * 3 + d], 3))) } : {}),
     stages: summariseStages(stageMarks, started),
     phases: prediction.stageMilliseconds === undefined ? undefined
       : Object.fromEntries(Object.entries(prediction.stageMilliseconds)

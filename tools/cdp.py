@@ -112,8 +112,8 @@ LINUX_FLAGS = ["--use-angle=vulkan", "--enable-features=Vulkan", "--use-vulkan=n
 
 
 # 🔴 AND A CALLER MAY ADD TO THEM, because one machine's flags are not every
-# machine's. tools/colab_backend.py runs on a container with NO DISPLAY AT ALL,
-# where Chrome's own documentation adds `--disable-vulkan-surface`; the A100
+# machine's. A Colab container has NO DISPLAY AT ALL, where Chrome's own
+# documentation adds `--disable-vulkan-surface`; the A100
 # box these flags were written for runs headed, where a surface exists. Passing
 # them per caller keeps the shared list the shared list.
 def chrome_flags():
@@ -123,6 +123,12 @@ def chrome_flags():
     if not sys.platform.startswith("linux"):
         return ["--headless=new"]
     headless = ["--headless=new"] if os.environ.get("LOCALFOLD_HEADLESS") == "1" else []
+    # 🔴 LOCALFOLD_STOCK_FLAGS=1 DROPS THE TWO DEVELOPER FLAGS, as gpu-chrome.mjs
+    # does: a visitor's Chrome has neither, so a page timing with them is a
+    # configuration nobody runs.
+    if os.environ.get("LOCALFOLD_STOCK_FLAGS") == "1":
+        return headless + [f for f in LINUX_FLAGS if "vulkan_enable_f16" not in f] \
+            + ["--disable-gpu-sandbox"]
     return headless + LINUX_FLAGS + ["--enable-unsafe-webgpu", "--disable-gpu-sandbox"]
 
 
@@ -137,6 +143,20 @@ def launch(port, profile, keep=False, extra_args=()):
     nothing here has ever measured what a RETURNING user pays, and Chrome
     caches compiled pipelines on disk.
     """
+    # 🔴 A PORT THAT ALREADY ANSWERS IS ANOTHER BROWSER, AND CONNECTING TO IT
+    # IS A SILENT WRONG ANSWER. The Chrome started below cannot bind a taken
+    # port and exits, and the poll after it then finds the OLD browser's page
+    # and returns it: a broker restarted on a fresh profile drove a runtime
+    # left over from an earlier run, whose page re-loaded last session's
+    # modules from its own HTTP cache - every measurement through it tested
+    # code that was no longer on disk. Refused, naming the port.
+    try:
+        urllib.request.urlopen("http://127.0.0.1:%d/json/version" % port, timeout=1)
+    except Exception:
+        pass
+    else:
+        raise RuntimeError("port %d already has a browser on it - a Chrome left over from"
+                           " an earlier run; stop it before starting another" % port)
     if not keep:
         shutil.rmtree(profile, ignore_errors=True)
     p = subprocess.Popen([chrome_binary()] + chrome_flags() + list(extra_args) + [

@@ -2,7 +2,7 @@ import { describe, expect, it } from "./harness.js";
 import {
   planRecycleReuse,
   recycleConvergenceDistance, shouldStopAfterRecycle, validatedRecycleTolerance,
-} from "../src/af2/model/recycle-convergence.js";
+} from "../shared/af2/model/recycle-convergence.js";
 
 function positions(caCoordinates) {
   const result = new Float32Array(caCoordinates.length * 37 * 3);
@@ -112,7 +112,7 @@ describe("what a press of Fold has to compute", () => {
 
   it("will not resume from a run whose state says it cannot", () => {
     // A fold whose state could not be read back comes back without one - see
-    // the readback in src/af2/model/monomer.js, which no longer fails the
+    // the readback in webgpu/af2/model/monomer.js, which no longer fails the
     // fold over it. There is nothing to continue from, so it starts again.
     const noState = { key, recycles: [{}, {}], resumable: {} };
     expect(planRecycleReuse({ cache: noState, key, passes: passesOf(5), recycles: 5 }).plan)

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "./harness.js";
-import { HttpTensorStore } from "../src/bundles/http-tensor-store.js";
+import { HttpTensorStore } from "../shared/bundles/http-tensor-store.js";
 
 afterEach(() => vi.unstubAllGlobals());
 

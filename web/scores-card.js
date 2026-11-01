@@ -24,6 +24,25 @@ export function updateScoresCard(confidence) {
     return;
   }
   box.style.display = "flex";
+  // 🔴 A MODEL WITH NO CONFIDENCE HEAD SAYS SO HERE, rather than showing a dash that reads as a measurement that
+  // failed: BioEmu2 predicts structures and nothing about them.
+  const none = document.getElementById("metricNoConfidence");
+  for (const id of ["metricMeanPlddt", "metricPtm"]) {
+    const cell = document.getElementById(id)?.parentElement;
+    if (cell) cell.style.display = confidence.none === true ? "none" : "flex";
+  }
+  if (none) {
+    none.style.display = confidence.none === true ? "flex" : "none";
+    const text = document.getElementById("metricNoConfidenceText");
+    if (text && confidence.none === true) text.textContent = confidence.label ?? "No confidence head";
+  }
+  if (confidence.none === true) {
+    for (const id of ["metricIptmCell", "metricMultimerCell"]) {
+      const node = document.getElementById(id);
+      if (node) node.style.display = "none";
+    }
+    return;
+  }
 
   const set = (id, value, digits) => {
     const node = document.getElementById(id);

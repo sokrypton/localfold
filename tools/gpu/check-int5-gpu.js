@@ -19,7 +19,7 @@
  * not. Whether that ever changes the f16 result is an empirical question about
  * the numbers a real model holds.
  */
-import { readTensorRange } from "../../src/weights/dtype.js";
+import { readTensorRange } from "../../shared/weights/dtype.js";
 
 const GROUP = 32;
 const GROUP_BYTES = 20;
@@ -51,7 +51,7 @@ fn decode(index: u32, scale: f32, zero: f32) -> f32 {
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   // 🔴 ONE INVOCATION OWNS ONE WORD, WHICH IS TWO ELEMENTS. WGSL cannot write
   // sixteen bits, so the pair that shares a word has to be produced together -
-  // see src/runtime/storage.js for the rule and what breaking it costs.
+  // see webgpu/runtime/storage.js for the rule and what breaking it costs.
   let word = id.x;
   let first = word * 2u;
   if (first >= ELEMENTS) { return; }

@@ -40,7 +40,7 @@ REPO = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
 DEFAULT = "GWSTELEKHREELKEFLKKEGITLGFTNAEKQEQAQKLGLGKKVSPELLIKAFAILKK"
 
 
-MANIFESTS = "/src/bundles/manifests/index.js"
+MANIFESTS = "/shared/bundles/manifests/index.js"
 REMOTE_LINE = re.compile(rb'^\s*remote:\s*"[^"]*",\s*$', re.MULTILINE)
 
 
@@ -70,7 +70,7 @@ def serve(local_weights=True):
                 source = open(os.path.join(REPO, MANIFESTS.lstrip("/")), "rb").read()
                 body = REMOTE_LINE.sub(b"", source)
                 # 🔴 AND IT RAISES RATHER THAN SERVING THE MODULE UNCHANGED. The
-                # src/ reorganisation moved this file to src/bundles/ and left
+                # src/ reorganisation moved this file to shared/bundles/ and left
                 # MANIFESTS naming the old path, so this branch simply stopped
                 # matching: no error, no missing page, just 150 MB off Hugging
                 # Face on every run of a check that exists to avoid it. The
@@ -272,7 +272,11 @@ def main():
     # 🔴 SINGLE SEQUENCE BY DEFAULT, because this tool is a wiring check and a
     # search is a minute of somebody else's server. `--msa-mode search` is
     # needed for `--template auto`, which has nothing to draw on without one.
-    parser.add_argument("--msa-mode", default="none", choices=["none", "search"])
+    # 🔴 AND A --job SETS IT ITSELF: a job carrying its own alignments turns the
+    # dial to Upload, and forcing "none" over that folded AF3's kitchen-sink job
+    # as a single sequence with its alignments sitting unused. Unless asked, a
+    # --job run leaves the dial where the job put it.
+    parser.add_argument("--msa-mode", default=None, choices=["none", "search"])
     # 🔴 EF2-fast's OWN "single sequence". Its evolutionary information comes
     # from a protein language model rather than an alignment, so turning ESM-C
     # off is the same ablation `--msa-mode none` is for the other models.
@@ -328,7 +332,9 @@ def main():
                              " `cleanSequence`, which keeps only amino-acid"
                              " letters, so `A12:SG - B1:C25` came back"
                              " `A:SGB:C` the moment the reader clicked away."
-                             " Third row type to walk into that branch.")
+                             " Third row type to walk into that branch. The"
+                             " page gets a glycerol as chain B first, so the"
+                             " fold after it can place the bond.")
     parser.add_argument("--smiles-ui", action="store_true",
                         help="set the SMILES row by DRIVING THE CONTROLS - pick"
                              " the type from the dropdown, type into the box,"
@@ -342,7 +348,7 @@ def main():
                         help="a ligand given as a SMILES string rather than a"
                              " CCD code, e.g. 'OCC(O)CO' for glycerol. Its"
                              " conformer is BUILT rather than fetched - see"
-                             " src/chem/ and docs/SMILES.md - so unlike"
+                             " shared/chem/ and docs/SMILES.md - so unlike"
                              " --ligand it needs no network.")
     parser.add_argument("--ligand", default="",
                         help="a CCD code folded alongside the sequence, e.g. GOL."
@@ -394,7 +400,18 @@ def main():
                              " `auto` to use what the MSA search finds, or"
                              " pdb:ID / afdb:ID to name the database outright,"
                              " or upload:PATH[@CHAIN] for a local structure."
-                             " Goes to the network either way.")
+                             " Goes to the network either way. `;` gives one"
+                             " a protein chain, in order.")
+    parser.add_argument("--template-fetch", default="",
+                        help="ID or ID@CHAIN: set the first protein's template"
+                             " THROUGH THE POPUP - PDB entry, type the id, press"
+                             " Fetch, pick the chain from its menu - and count"
+                             " RCSB requests during the fold, which must be 0:"
+                             " the fold reuses the file Fetch checked. --template"
+                             " sets the entity object and never touches the popup.")
+    parser.add_argument("--save-pdb", default="",
+                        help="write the prediction's PDB (the page's own"
+                             " download) to this path")
     parser.add_argument("--then-sequence", default=None,
                         help="fold a SECOND time on this sequence, which is a"
                              " fresh fold rather than a continuation")
@@ -715,13 +732,31 @@ def main():
             # `cleanSequence` strips. Setting it through the entity list's API
             # cannot see that; typing it and clicking away is what a reader
             # does.
+            #
+            # 🔴 AND THE BOND MUST NAME ATOMS THAT EXIST, BECAUSE THE FOLD RUNS
+            # AFTER: the page resolves a contact to the tokens carrying its
+            # atoms and refuses one it cannot place. This probe used to type the
+            # placeholder's `A12:SG - B1:C25` onto a page with ONE chain, so its
+            # UI half passed and its fold died on "bond 1 to: no chain 1" - the
+            # page right, the probe wrong. Chain B is a glycerol row added
+            # first, and the contact names atoms the two chains have.
             print("contact ui:", cdp.evaluate(ws, """(() => {
-              const want = 'A12:SG - B1:C25';
-              document.getElementById('add-entity')?.click();
+              const want = 'A12:CA - B1:C1';
               // Re-queried after every mutation, never held: a type change and
               // a blur both re-render the list, so an element captured before
               // one is detached afterwards. See the note on --smiles-ui.
               const last = () => [...document.querySelectorAll('.entity-row')].pop();
+              document.getElementById('add-entity')?.click();
+              {
+                const select = last().querySelector('.entity-type');
+                select.value = 'ligand';
+                select.dispatchEvent(new Event('change', { bubbles: true }));
+                const box = last().querySelector('textarea.entity-value, input.entity-value');
+                box.value = 'GOL';
+                box.dispatchEvent(new Event('input', { bubbles: true }));
+                box.dispatchEvent(new Event('blur', { bubbles: true }));
+              }
+              document.getElementById('add-entity')?.click();
               const setType = (value) => {
                 const select = last().querySelector('.entity-type');
                 select.value = value;
@@ -846,13 +881,64 @@ def main():
               const list = window.__entityList;
               if (!list) return 'no entity list';
               const entities = list.read();
-              const protein = entities.find((e) => e.type === 'protein');
-              if (!protein) return 'no protein entity';
-              protein.template = %s;
+              // `;` separates one template a protein chain, in order.
+              const templates = %s;
+              const proteins = entities.filter((e) => e.type === 'protein');
+              if (proteins.length < templates.length) return 'fewer protein entities than templates';
+              templates.forEach((template, at) => { proteins[at].template = template; });
               list.set(entities);
-              return JSON.stringify(list.read().map((e) => e.template || null));
-            })()""" % json.dumps(template_entry(args.template))))
+              return JSON.stringify(list.read().map((e) => e.template ? e.template.kind : null));
+            })()""" % json.dumps([template_entry(t) for t in args.template.split(";")])))
 
+        if args.template_fetch:
+            wanted, _, chain = args.template_fetch.partition("@")
+            fetched = json.loads(cdp.evaluate(ws, """(async () => {
+              const popup = () => document.querySelector('.entity-popup');
+              const open = document.querySelector('.entity-options');
+              if (open === null) return JSON.stringify({ error: 'no protein row' });
+              if (popup() === null) open.click();
+              if (popup() === null) open.click();
+              const kind = popup().querySelector('.entity-template-kind');
+              kind.value = 'pdb';
+              kind.dispatchEvent(new Event('change', { bubbles: true }));
+              const box = popup().querySelector('.entity-template-source');
+              box.value = %s;
+              box.dispatchEvent(new Event('input', { bubbles: true }));
+              popup().querySelector('.entity-template-fetch').click();
+              let status = '';
+              for (let i = 0; i < 600; i += 1) {
+                status = popup().querySelector('.entity-template-status')?.textContent ?? '';
+                if (!status.startsWith('Fetching')) break;
+                await new Promise((r) => setTimeout(r, 100));
+              }
+              const menus = popup().querySelectorAll('.entity-template-kind');
+              const chainMenu = menus.length > 1 ? menus[menus.length - 1] : null;
+              const chains = chainMenu === null ? [] : [...chainMenu.options].map((o) => o.textContent);
+              if (chainMenu !== null && %s !== '') {
+                chainMenu.value = %s;
+                chainMenu.dispatchEvent(new Event('change', { bubbles: true }));
+                status = popup().querySelector('.entity-template-status').textContent;
+              }
+              const source = popup().querySelector('.entity-template-source').value;
+              popup().querySelector('.entity-popup-head button')?.click();
+              // ...and every RCSB request from here on is counted: the fold
+              // should take the file Fetch already holds.
+              window.__rcsbAfterFetch = 0;
+              const real = window.fetch;
+              window.fetch = (url, init) => {
+                if (String(url).includes('rcsb.org')) window.__rcsbAfterFetch += 1;
+                return real(url, init);
+              };
+              const template = window.__entityList.read()[0].template;
+              return JSON.stringify({ status, chains, source,
+                                      cached: typeof template?.fetched?.text === 'string' });
+            })()""" % (json.dumps(wanted), json.dumps(chain), json.dumps(chain)), await_promise=True))
+            print("template fetch:", fetched)
+            if "error" in fetched or not fetched["cached"]:
+                print("FAIL: Fetch did not leave a structure on the template")
+                return 1
+
+        msa_mode = args.msa_mode if args.msa_mode is not None else (None if args.job else "none")
         cdp.evaluate(ws, """(() => {
           const set = (id, value) => {
             const el = document.getElementById(id);
@@ -863,7 +949,7 @@ def main():
           set('model-family', %s);
           set('af2Model', %s);
           set('recycles', %s);
-          set('msa-mode', %s);
+          if (%s !== null) set('msa-mode', %s);
           set('plm-mode', %s);
           // 🔴 THE STEP COUNT IS SET LAST, AND IT WAS SET FOURTH. `#af3-count`
           // is REBUILT from the chosen model's own table - `syncAf3Count` - and
@@ -892,7 +978,7 @@ def main():
           } catch (e) { /* asked again, which the dialog check covers */ }
         })()""" % (json.dumps(args.model), json.dumps(args.af2_model),
                    json.dumps(args.recycles),
-                   json.dumps(args.msa_mode), json.dumps(args.plm),
+                   json.dumps(msa_mode), json.dumps(msa_mode), json.dumps(args.plm),
                    json.dumps(args.steps)))
         time.sleep(0.5)
         print("controls:", cdp.evaluate(ws, """(() => {
@@ -1017,13 +1103,21 @@ def main():
                 coords: v.coords ? v.coords.length : 0});
             })()"""))
                 time.sleep(0.35)
+        # 🔴 A FOLD THAT FAILED IS FINISHED TOO. Waiting only for success sat
+        # out the whole timeout on a status line that already said why - fifteen
+        # minutes, once, on "Automatic templates need an MSA search".
         cdp.wait_for(ws, """(() => {
           const s = document.getElementById('status-message');
           const text = s ? s.textContent : '';
+          if (s && s.classList.contains('error')) return true;
           return /done|complete|finished|s\\b/i.test(text)
             && document.getElementById('downloads').style.display !== 'none';
         })()""", timeout=args.timeout, what="the fold to finish",
                      progress=STATUS_LINE)
+        failed = cdp.evaluate(ws, """(() => { const s = document.getElementById('status-message');
+          return s && s.classList.contains('error') ? s.textContent : ''; })()""")
+        if failed:
+            raise SystemExit(f"the fold failed: {failed}")
         time.sleep(1.5)
         if args.tab_trace:
             cdp.evaluate(ws, "cancelAnimationFrame(window.__tabRaf), 1")
@@ -1047,7 +1141,7 @@ def main():
               // The first version of this filtered the whole resource list by
               // name and reported a 1.2s "overlap" - which the unchanged tree
               // reproduced exactly, because both patterns were matching MODULE
-              // fetches from page load: `src/input/mmseqs2-api.js` is a match
+              // fetches from page load: `shared/input/mmseqs2-api.js` is a match
               // for /mmseqs/, and the local weights directory is probed before
               // the button is ever pressed. A span that starts at 66ms is not
               // a span of anything a click caused.
@@ -1283,7 +1377,7 @@ def main():
         print("weightPhases:", cdp.evaluate(ws, """(async () => {
           try {
             const m = await import('/web/af3-model.js');
-            const s = await import('/src/bundles/http-tensor-store.js');
+            const s = await import('/shared/bundles/http-tensor-store.js');
             const d = s.tensorDecodeStats || {};
             return JSON.stringify({ ...(m.af3LoadMilliseconds || {}),
               hostDecodeMs: Math.round(d.ms || 0), hostDecodeCalls: d.calls || 0 });
@@ -1418,6 +1512,32 @@ def main():
         # and the bytes are the only thing that says what the B-factor column
         # holds, which is a pLDDT for a scored model and something else for one
         # with no confidence head.
+        if args.template_fetch:
+            again = cdp.evaluate(ws, "window.__rcsbAfterFetch")
+            print("rcsb requests during the fold:", again)
+            if again != 0:
+                print("FAIL: the fold fetched the template again instead of"
+                      " reusing the file Fetch checked")
+                return 1
+        if args.save_pdb:
+            text = cdp.evaluate(ws, """(async () => {
+              let blob = null;
+              const made = URL.createObjectURL;
+              URL.createObjectURL = (b) => { blob = b; return made.call(URL, b); };
+              const clicked = HTMLAnchorElement.prototype.click;
+              HTMLAnchorElement.prototype.click = function () {};
+              document.getElementById('download-pdb').click();
+              await new Promise((done) => setTimeout(done, 1500));
+              URL.createObjectURL = made;
+              HTMLAnchorElement.prototype.click = clicked;
+              return blob === null ? null : await blob.text();
+            })()""", await_promise=True)
+            if text is None:
+                print("FAIL: the PDB button wrote nothing")
+                return 1
+            with open(args.save_pdb, "w") as handle:
+                handle.write(text)
+            print("saved:", args.save_pdb)
         if args.download_pdb:
             saved = json.loads(cdp.evaluate(ws, """(async () => {
               // The anchor carries the FILENAME and the blob carries the bytes,

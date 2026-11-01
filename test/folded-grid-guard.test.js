@@ -25,7 +25,7 @@ import { describe, it } from "node:test";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 
-import { WebGpuExecution } from "../src/runtime/execution.js";
+import { WebGpuExecution } from "../webgpu/runtime/execution.js";
 
 // Every way this repository folds a dispatch into y. `linearGrid` folds an
 // INVOCATION index with the workgroup size in the stride - 64 everywhere but the
@@ -85,7 +85,7 @@ describe("a folded linear grid", () => {
 describe("every shader that folds its index", () => {
   const guarded = [];
   const unguarded = [];
-  for (const path of sourceFiles("src")) {
+  for (const path of ["shared", "cpu", "webgpu"].flatMap((tree) => sourceFiles(tree))) {
     const lines = readFileSync(path, "utf8").split("\n");
     for (const [at, line] of lines.entries()) {
       const match = FOLDED.exec(line);

@@ -10,8 +10,8 @@
  * GLIBC_2.38 and `webgpu@0.4.0` is what loads on this box.
  */
 import { create, globals } from "webgpu";
-import { createDeterministicTriangleInput } from "../src/testing/deterministic-input.js";
-import { TriangleMultiplicationOutgoingGpu } from "../src/kernels/triangle/webgpu.js";
+import { createDeterministicTriangleInput } from "../webgpu/testing/deterministic-input.js";
+import { TriangleMultiplicationOutgoingGpu } from "../webgpu/kernels/triangle/webgpu.js";
 
 function option(name, fallback) {
   const prefix = `--${name}=`;

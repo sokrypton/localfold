@@ -1,0 +1,927 @@
+// One ESM-C block on the GPU.
+//
+// Eight dispatches, deliberately: LayerNorm, qkv projection, QK-norm and RoPE,
+// attention, output projection with the residual, FFN LayerNorm, the widening
+// projection with its SwiGLU gate, and the contraction with the residual.
+//
+// 🔴 IT IS NOT FUSED AND THAT IS THE POINT, FOR NOW. `transition.js`
+// keeps a whole widened row in workgroup memory precisely so it never reaches
+// global memory, and this block will want the same treatment - the qkv
+// projection alone writes rows x 3456 floats that are read once. But a fused
+// kernel that is wrong is hard to localise, and this repository's own scars are
+// mostly about kernels that conformed in shape and computed something else. So:
+// eight dispatches that can be checked one at a time against
+// `oracle-dumps/esmc-*.json`, and a bench afterwards.
+//
+// 🔴 THE QK LayerNorm IS OVER THE FULL d_model AND HAPPENS BEFORE THE HEAD
+// SPLIT, and RoPE pairs channel d with d + headDim/2. Both readings conform in
+// shape; see cpu/esmc/tower.js, where the alternatives are measured at
+// 1.2e-1 and 2.8e-1 against 5.9e-7 for these.
+import { GpuBufferAllocator } from "../runtime/allocator.js";
+import { float32ToFloat16Array } from "../../shared/weights/float16.js";
+import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
+
+export const LANES = 64;
+export const GRID_WIDTH = 32768;
+
+/**
+ * LayerNorm over the last axis, one workgroup a row.
+ *
+ * 🔴 THE OFFSET BINDING IS DECLARED ONLY WHEN IT IS READ, for the reason the
+ * linear kernel's residual is - and this one was written the other way and
+ * shipped, because the block only ever used the offset form. ESM-C's final norm
+ * is scale-only and the tower is its first caller: the shader compiled, the
+ * compiler dropped the unread binding, and the bind group then had an entry the
+ * layout did not. "binding index 2 not present in the bind group layout", at
+ * dispatch, thirty-six blocks after anything a checker could see.
+ */
+export function createLayerNormShader({ rows, channels }, hasOffset, epsilon) {
+  const stageRow = channels <= 1536;
+  return `
+@group(0) @binding(0) var<storage, read> source: array<f32>;
+@group(0) @binding(1) var<storage, read> scale: array<f32>;
+${hasOffset ? "@group(0) @binding(2) var<storage, read> offset: array<f32>;" : ""}
+@group(0) @binding(${hasOffset ? 3 : 2}) var<storage, read_write> destination: array<f32>;
+
+var<workgroup> sums: array<f32, ${LANES}>;
+var<workgroup> squares: array<f32, ${LANES}>;
+${stageRow ? `var<workgroup> rowBuf: array<f32, ${channels}>;\n` : ""}@compute @workgroup_size(${LANES})
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_id) local: vec3<u32>) {
+  let row = group.x + group.y * ${GRID_WIDTH}u;
+  if (row >= ${rows}u) { return; }
+  let base = row * ${channels}u;
+  var total = 0.0;
+  var square = 0.0;
+  for (var c = local.x; c < ${channels}u; c += ${LANES}u) {
+    let value = source[base + c];
+${stageRow ? "    rowBuf[c] = value;\n" : ""}    total += value;
+    square += value * value;
+  }
+  sums[local.x] = total;
+  squares[local.x] = square;
+  workgroupBarrier();
+  if (local.x < 32u) { sums[local.x] += sums[local.x + 32u]; squares[local.x] += squares[local.x + 32u]; } workgroupBarrier();
+  if (local.x < 16u) { sums[local.x] += sums[local.x + 16u]; squares[local.x] += squares[local.x + 16u]; } workgroupBarrier();
+  if (local.x < 8u) { sums[local.x] += sums[local.x + 8u]; squares[local.x] += squares[local.x + 8u]; } workgroupBarrier();
+  if (local.x == 0u) {
+    sums[0] = ((sums[0] + sums[4]) + (sums[2] + sums[6])) + ((sums[1] + sums[5]) + (sums[3] + sums[7]));
+    squares[0] = ((squares[0] + squares[4]) + (squares[2] + squares[6])) + ((squares[1] + squares[5]) + (squares[3] + squares[7]));
+  }
+  workgroupBarrier();
+  let mean = sums[0] / ${channels}.0;
+  // 🔴 E[x^2] - mean^2, which is what the reference's two-pass form computes to
+  // within float32. The alternative - a second pass over the row - is exact and
+  // costs a second read of a row already in registers nowhere.
+  let variance = max(squares[0] / ${channels}.0 - mean * mean, 0.0);
+  let inverse = inverseSqrt(variance + ${epsilon});
+  for (var c = local.x; c < ${channels}u; c += ${LANES}u) {
+    let normalised = (${stageRow ? "rowBuf[c]" : "source[base + c]"} - mean) * inverse * scale[c];
+    destination[base + c] = ${hasOffset ? "normalised + offset[c]" : "normalised"};
+  }
+}`;
+}
+
+/**
+ * out = input @ weights^T (+ bias) (+ residual), with the input row staged.
+ *
+ * `weights` is (outer, inner) row-major, which is how torch stores a Linear and
+ * how tools/export_esmc_model.py writes it.
+ *
+ * 🔴 THE RESIDUAL BINDING IS DECLARED ONLY WHEN IT IS READ. A binding a shader
+ * declares and never uses can be eliminated by the compiler, and then the bind
+ * group has an entry the layout does not - which fails validation at dispatch,
+ * not at compile, and reads as a broken kernel. Binding a one-element dummy
+ * instead is the same trap with an extra buffer.
+ */
+export const ROW_TILE = 8;
+/** Columns a lane owns, as one vec4. */
+export const COLUMNS_PER_LANE = 4;
+const K_CHUNK = 32;
+
+/**
+ * The grid a tiled linear pass wants: column tiles across x, row tiles up y.
+ *
+ * 🔴 NOT THE ROW COUNT. Every other kernel here takes one workgroup a row and
+ * flattens into (x, y) against GRID_WIDTH; this one means something different
+ * by each axis, and dispatching it the old way would leave most of the output
+ * unwritten - which reads as a speedup, not as an error.
+ */
+export function linearGrid(rows, outer, rowTile = ROW_TILE) {
+  return [Math.ceil(outer / (LANES * COLUMNS_PER_LANE)), Math.ceil(rows / rowTile)];
+}
+
+/**
+ * out = input @ weights (+ residual), tiled over rows and columns, vectorised.
+ *
+ * 🔴 THE FIRST VERSION GAVE EACH WORKGROUP ONE ROW AND EVERY ROW RE-READ THE
+ * WHOLE WEIGHT MATRIX - 19.1 GB of weight traffic at 300 tokens, 87.6 GB/s
+ * against a device with about 100.
+ *
+ * 🔴 TRANSPOSING THE BUNDLE TO (inner, outer) WAS WORTH 3.8x, and not by
+ * reducing the reads. It makes ADJACENT LANES READ ADJACENT ADDRESSES, so a
+ * weight row is fetched once and shared; the effective rate went to 331 GB/s,
+ * above DRAM, which is what a cache hit looks like from outside.
+ *
+ * 🔴 A LANE OWNS FOUR CONSECUTIVE COLUMNS AS ONE vec4, which is what lets the
+ * weight arrive in one load and the multiply-add issue four at a time. It also
+ * requires `outer` to be a multiple of four - 3456, 1152 and 256 all are - and
+ * the check is here rather than in a comment because a shape that is not would
+ * read three quarters of a matrix and look plausible.
+ *
+ * 🔴 THE ROW TILE IS EIGHT, AND IT WAS FOUR AN HOUR AGO. With SCALAR
+ * accumulators a tile of eight was slower - 40.6 ms at 300 tokens against
+ * four's 36.1 - because eight rows times four columns is 32 registers a lane.
+ * As vec4 the same tile is 8 registers holding 32 floats, and it wins: 1.086x
+ * at 61 tokens and 1.026x at 300, measured interleaved. Sixteen is 0.86x, so
+ * the ceiling is real and close.
+ *
+ * 🔴 WHICH IS WHY THE TILE IS NOT A CONSTANT TO BE REASONED ABOUT. It interacts
+ * with the vector width, and the right answer reversed when that changed.
+ */
+export function createLinearShader({ rows, inner, outer }, withResidual,
+                                   weightPrecision = "f32", boundsTest = false,
+                                   rowTile = ROW_TILE, unroll = 4, kSplits = 1,
+                                   scaleInput = false) {
+  if (!["f32", "f16"].includes(weightPrecision)) {
+    throw new RangeError(`unknown weight precision ${weightPrecision}`);
+  }
+  if (outer % 4 !== 0) {
+    throw new RangeError(`vectorised linear needs a multiple of four columns; got ${outer}`);
+  }
+  const half = weightPrecision === "f16";
+  const vectorColumns = outer / 4;
+  // 🔴 SPLIT OVER K WHEN THE ROWS ARE FEW. A workgroup walks the whole inner extent serially, so at 40
+  // tokens a 768x768 projection is 60 workgroups each with a long dependent loop - latency, not
+  // arithmetic (0.13 ms for 24 MFLOP on an A100). With kSplits > 1 workgroup z takes one K range and
+  // writes a partial to output[z]; createSplitReduceShader sums them (and adds the residual). At 1 the
+  // source is the one this function always produced.
+  const split = kSplits > 1;
+  const span = split ? Math.ceil(inner / K_CHUNK / kSplits) * K_CHUNK : inner;
+  if (split && withResidual) throw new RangeError("a split linear leaves the residual to its reduce");
+  const load = half
+    ? (e) => `vec4<f32>(weights[${e}])`
+    : (e) => `weights[${e}]`;
+
+  const declare = [];
+  const stores = [];
+  for (let t = 0; t < rowTile; t += 1) {
+    declare.push(`  var acc_${t} = vec4<f32>(0.0);`);
+    stores.push(`  {
+    let row = row_origin + ${t}u;
+    if (row < ${rows}u && vector_column < ${vectorColumns}u) {
+      let slot = row * ${vectorColumns}u + vector_column;
+      output[${split ? `group.z * ${rows * vectorColumns}u + ` : ""}slot] = ${withResidual ? `residual[slot] + acc_${t}` : `acc_${t}`};
+    }
+  }`);
+  }
+  // 🔴 THE k LOOP IS UNROLLED BY FOUR SO THE STAGED INPUT IS READ AS vec4 TOO.
+  // Scalar, the inner loop did one workgroup read per vec4 multiply-add - eight
+  // reads and eight FMAs per k at a row tile of eight - which makes the
+  // workgroup memory, not the arithmetic, the thing being issued. Consecutive k
+  // are adjacent in `staged` for a fixed row, so four of them are one read.
+  //
+  // 🔴 NO BOUNDS TEST ON THE WEIGHT READ. The condition is loop-invariant, so
+  // testing it inside the k loop paid for it once per k; WGSL has no
+  // out-of-bounds access and the STORE is masked. Measured interleaved, keeping
+  // the test is 0.946x at 61 tokens and 1.026x at 300 - a wash, so the cheaper
+  // form is kept because it is cheaper.
+  const exactK = inner % K_CHUNK === 0;
+  const exactUnroll = inner % unroll === 0;
+  const body = [];
+  for (let u = 0; u < unroll; u += 1) {
+    body.push(`      {`);
+    if (!exactUnroll && u > 0) {
+      body.push(`        if (k_absolute + ${u}u >= ${inner}u) { break; }`);
+    }
+    body.push(`        let w = ${boundsTest
+      ? `select(vec4<f32>(0.0), ${load(`(k_absolute + ${u}u) * ${vectorColumns}u + vector_column`)}, vector_column < ${vectorColumns}u)`
+      : load(`(k_absolute + ${u}u) * ${vectorColumns}u + vector_column`)};`);
+    for (let t = 0; t < rowTile; t += 1) {
+      body.push(`        acc_${t} += staged[${t}u * ${K_CHUNK}u + k + ${u}u] * w;`);
+    }
+    body.push(`      }`);
+  }
+
+  const wBinding = scaleInput ? 2 : 1;
+  const resBinding = scaleInput ? 3 : 2;
+  const outBinding = (withResidual ? 3 : 2) + (scaleInput ? 1 : 0);
+  return `${half ? "enable f16;\n" : ""}
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+${scaleInput ? "@group(0) @binding(1) var<storage, read> inputScale: array<f32>;\n" : ""}@group(0) @binding(${wBinding}) var<storage, read> weights: array<vec4<${weightPrecision}>>;
+${withResidual ? `@group(0) @binding(${resBinding}) var<storage, read> residual: array<vec4<f32>>;` : ""}
+@group(0) @binding(${outBinding}) var<storage, read_write> output: array<vec4<f32>>;
+
+var<workgroup> staged: array<f32, ${rowTile * K_CHUNK}>;
+
+@compute @workgroup_size(${LANES})
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_id) local: vec3<u32>) {
+  let row_origin = group.y * ${rowTile}u;
+  let vector_column = group.x * ${LANES}u + local.x;
+  if (row_origin >= ${rows}u) { return; }
+
+${declare.join("\n")}
+
+${split ? `  let k_start = group.z * ${span}u;
+  let k_end = min(k_start + ${span}u, ${inner}u);
+` : ""}  let k_lane = local.x & ${K_CHUNK - 1}u;
+  for (var k0 = ${split ? "k_start" : "0u"}; k0 < ${split ? "k_end" : `${inner}u`}; k0 += ${K_CHUNK}u) {
+    let k_col = k0 + k_lane;
+${scaleInput ? `    let in_scale = select(0.0, inputScale[k_col], ${exactK ? "true" : `k_col < ${inner}u`});\n` : ""}    for (var slot = local.x; slot < ${rowTile * K_CHUNK}u; slot += ${LANES}u) {
+      let row = row_origin + (slot / ${K_CHUNK}u);
+      staged[slot] = select(0.0, input[row * ${inner}u + k_col]${scaleInput ? " * in_scale" : ""},
+                            ${exactK ? `row < ${rows}u` : `row < ${rows}u && k_col < ${inner}u`});
+    }
+    workgroupBarrier();
+    for (var k = 0u; k < ${K_CHUNK}u; k += ${unroll}u) {
+      let k_absolute = k0 + k;
+${exactK ? "" : `      if (k_absolute >= ${inner}u) { break; }\n`}${body.join("\n")}
+    }
+    workgroupBarrier();
+  }
+
+${stores.join("\n")}
+}`;
+}
+
+/**
+ * How many K splits a createLinearShader projection of this shape takes: the smallest power of two
+ * whose workgroup count reaches `target`, at most `cap`. A few rows leave a projection a few dozen
+ * workgroups each walking all of K - ESMFold2's denoiser at 40 tokens ran 60 a pass at 0.13 ms for
+ * 24 MFLOP - and splitting K is what gives the device the rest.
+ */
+export function linearKSplits(rows, outer, rowTile = ROW_TILE, cap = 8, target = 1024) {
+  const groups = linearGrid(rows, outer, rowTile).reduce((a, b) => a * b, 1);
+  let splits = 1;
+  while (splits < cap && groups * splits < target) splits *= 2;
+  return splits;
+}
+
+/**
+ * Sums createLinearShader's kSplits partials into the output, plus the residual when it has one.
+ * One lane a vec4; dispatch elementwise over rows * outer / 4 lanes.
+ */
+export function createSplitReduceShader({ rows, outer, splits }, withResidual) {
+  const vectors = rows * (outer / 4);
+  const terms = Array.from({ length: splits }, (_, z) => `partials[${z * vectors}u + slot]`).join(" + ");
+  return `
+@group(0) @binding(0) var<storage, read> partials: array<vec4<f32>>;
+${withResidual ? "@group(0) @binding(1) var<storage, read> residual: array<vec4<f32>>;" : ""}
+@group(0) @binding(${withResidual ? 2 : 1}) var<storage, read_write> output: array<vec4<f32>>;
+
+@compute @workgroup_size(${LANES})
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let slot = id.x + id.y * ${GRID_WIDTH * LANES}u;
+  if (slot >= ${vectors}u) { return; }
+  output[slot] = ${withResidual ? "residual[slot] + " : ""}${terms};
+}`;
+}
+
+/**
+ * createSwigluShader split over K: the SwiGLU weight is a linear of width 2 * ffn with the gate half
+ * first, so createLinearShader({inner: model, outer: 2 * ffn}, ..., kSplits) writes its partials and
+ * this sums each split's gate and value and writes silu(gate) * value, one lane a vec4.
+ */
+export function createSplitSwigluReduceShader({ rows, ffn, splits }) {
+  const vectorFfn = ffn / 4, wide = rows * 2 * vectorFfn;
+  const sum = (offset) => Array.from({ length: splits },
+    (_, z) => `partials[${z * wide}u + base + ${offset}]`).join(" + ");
+  return `
+@group(0) @binding(0) var<storage, read> partials: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read_write> destination: array<vec4<f32>>;
+
+@compute @workgroup_size(${LANES})
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let slot = id.x + id.y * ${GRID_WIDTH * LANES}u;
+  if (slot >= ${rows * vectorFfn}u) { return; }
+  let row = slot / ${vectorFfn}u;
+  let base = row * ${2 * vectorFfn}u + slot % ${vectorFfn}u;
+  let gate = ${sum("0u")};
+  let value = ${sum(`${vectorFfn}u`)};
+  destination[slot] = gate / (vec4<f32>(1.0) + exp(-gate)) * value;
+}`;
+}
+
+/**
+ * Split the fused qkv, LayerNorm q and k over the FULL width, rotate both.
+ *
+ * One workgroup a row. The two norms are computed here rather than by the
+ * LayerNorm kernel because they read from the packed (rows, 3 * model) tensor
+ * and write into three separate ones; routing that through a generic kernel
+ * means three copies of a tensor that is read once.
+ */
+export function createPrepareShader({ rows, model, heads }, epsilon, base) {
+  const headDim = model / heads;
+  return `
+@group(0) @binding(0) var<storage, read> qkv: array<f32>;
+@group(0) @binding(1) var<storage, read> qScale: array<f32>;
+@group(0) @binding(2) var<storage, read> kScale: array<f32>;
+@group(0) @binding(3) var<storage, read_write> query: array<f32>;
+@group(0) @binding(4) var<storage, read_write> key: array<f32>;
+@group(0) @binding(5) var<storage, read_write> value: array<f32>;
+
+var<workgroup> sums: array<f32, ${LANES}>;
+var<workgroup> squares: array<f32, ${LANES}>;
+var<workgroup> cosTab: array<f32, ${headDim / 2}>;
+var<workgroup> sinTab: array<f32, ${headDim / 2}>;
+
+fn reduce(lane: u32) {
+  if (lane < 32u) { sums[lane] += sums[lane + 32u]; squares[lane] += squares[lane + 32u]; } workgroupBarrier();
+  if (lane < 16u) { sums[lane] += sums[lane + 16u]; squares[lane] += squares[lane + 16u]; } workgroupBarrier();
+  if (lane < 8u) { sums[lane] += sums[lane + 8u]; squares[lane] += squares[lane + 8u]; } workgroupBarrier();
+  if (lane == 0u) {
+    sums[0] = ((sums[0] + sums[4]) + (sums[2] + sums[6])) + ((sums[1] + sums[5]) + (sums[3] + sums[7]));
+    squares[0] = ((squares[0] + squares[4]) + (squares[2] + squares[6])) + ((squares[1] + squares[5]) + (squares[3] + squares[7]));
+  }
+  workgroupBarrier();
+}
+
+@compute @workgroup_size(${LANES})
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_id) local: vec3<u32>) {
+  let row = group.x + group.y * ${GRID_WIDTH}u;
+  if (row >= ${rows}u) { return; }
+  let packed = row * ${3 * model}u;
+  let out = row * ${model}u;
+
+  for (var d = local.x; d < ${headDim / 2}u; d += ${LANES}u) {
+    let frequency = f32(row) / pow(${base}, f32(2u * d) / ${headDim}.0);
+    cosTab[d] = cos(frequency);
+    sinTab[d] = sin(frequency);
+  }
+
+  // v needs neither norm nor rotation.
+  for (var c = local.x; c < ${model}u; c += ${LANES}u) {
+    value[out + c] = qkv[packed + ${2 * model}u + c];
+  }
+
+  // 🔴 THE NORM IS OVER ALL ${model} CHANNELS, not over each head's ${headDim}.
+  for (var side = 0u; side < 2u; side += 1u) {
+    // 'from' is a WGSL reserved keyword, hence origin.
+    let origin = packed + side * ${model}u;
+    var total = 0.0;
+    var square = 0.0;
+    for (var c = local.x; c < ${model}u; c += ${LANES}u) {
+      let v = qkv[origin + c];
+      total += v;
+      square += v * v;
+    }
+    sums[local.x] = total;
+    squares[local.x] = square;
+    workgroupBarrier();
+    reduce(local.x);
+    let mean = sums[0] / ${model}.0;
+    let variance = max(squares[0] / ${model}.0 - mean * mean, 0.0);
+    let inverse = inverseSqrt(variance + ${epsilon});
+    // 🔴 THE KEY IS WRITTEN (head, dim, row) AND THE VALUE (row, head, dim),
+    // because the two are read by different phases of the attention with
+    // different lanes. Attention's logit phase gives a lane a KEY, so it
+    // wants consecutive rows adjacent; its accumulation phase gives a lane a
+    // CHANNEL, so it wants consecutive dims adjacent. One buffer cannot suit
+    // both and they do not have to: the same kernel writes them.
+    // 🔴 SPLIT HALVES: channel d of a head pairs with d + ${headDim / 2}, not with
+    // d + 1. Interleaving adjacent channels is the other common convention and
+    // conforms in shape. Fused with the LayerNorm writeback so unrotated query
+    // and strided key never round-trip through global memory.
+${(() => {
+    const invD = LANES % (headDim / 2) === 0;
+    return `    ${invD ? `let d = local.x % ${headDim / 2}u;\n    let c = cosTab[d];\n    let s = sinTab[d];\n` : ""}    if (side == 0u) {
+      for (var slot = local.x; slot < ${model / 2}u; slot += ${LANES}u) {
+        let head = slot / ${headDim / 2}u;
+${invD ? "" : `        let d = slot % ${headDim / 2}u;\n        let c = cosTab[d];\n        let s = sinTab[d];\n`}        let c0 = head * ${headDim}u + d;
+        let c1 = c0 + ${headDim / 2}u;
+        let q0 = (qkv[origin + c0] - mean) * inverse * qScale[c0];
+        let q1 = (qkv[origin + c1] - mean) * inverse * qScale[c1];
+        query[out + c0] = q0 * c - q1 * s;
+        query[out + c1] = q0 * s + q1 * c;
+      }
+      workgroupBarrier();
+    } else {
+      for (var slot = local.x; slot < ${model / 2}u; slot += ${LANES}u) {
+        let head = slot / ${headDim / 2}u;
+${invD ? "" : `        let d = slot % ${headDim / 2}u;\n        let c = cosTab[d];\n        let s = sinTab[d];\n`}        let c0 = head * ${headDim}u + d;
+        let c1 = c0 + ${headDim / 2}u;
+        let k0 = (qkv[origin + c0] - mean) * inverse * kScale[c0];
+        let k1 = (qkv[origin + c1] - mean) * inverse * kScale[c1];
+        let kFirst = c0 * ${rows}u + row;
+        let kSecond = kFirst + ${headDim / 2}u * ${rows}u;
+        key[kFirst] = k0 * c - k1 * s;
+        key[kSecond] = k0 * s + k1 * c;
+      }
+    }`;
+  })()}
+  }
+}`;
+}
+
+export const QUERY_TILE = 8;
+
+/**
+ * Self-attention: one workgroup per (query tile, head), one lane per key then
+ * per channel.
+ *
+ * 🔴 THE KEY IS READ AS (head, dim, row) AND THE VALUE AS (row, head, dim).
+ * The logit phase gives a lane a KEY, so it wants consecutive rows adjacent;
+ * the accumulation phase gives a lane a CHANNEL, so it wants consecutive dims
+ * adjacent. Read the key the other way and the lanes are a whole row apart -
+ * 4.6 KB - which cost this kernel 2.8x and is the same uncoalesced pattern the
+ * weight transpose fixed for the projections.
+ *
+ * 🔴 A TILE OF ${QUERY_TILE} QUERIES, SO A READ SERVES ${QUERY_TILE} OF THEM.
+ * Untiled, this kernel did one multiply-add per global read - the worst
+ * arithmetic intensity in the block - and ran at 164 GFLOP/s against the
+ * projections' 320. Swept interleaved: 8 is 1.047x on 4 at 300 tokens and
+ * 0.998x at 1500, and 16 is 0.86x / 0.91x. The block now measures 579 GFLOP/s
+ * at 1500 tokens against this device's ~610 G scalar fused multiply-adds a
+ * second, so there is not much left to take here without changing the
+ * arithmetic itself.
+ *
+ * 🔴 AND K AND V ARE NOT STAGED IN WORKGROUP MEMORY, WHICH A FIRST ATTEMPT DID
+ * AND WAS 0.8x FOR IT. Their working set is 750 KB a head at 1500 tokens, which
+ * is L2-resident, so the re-reads were already cache hits; staging bought
+ * traffic nobody was paying and cost lane utilisation, because a chunk small
+ * enough to fit 16 KB leaves three quarters of a 64-lane workgroup idle. What
+ * was worth taking from that attempt is the ONLINE SOFTMAX, which is what lets
+ * a tile of queries hold only the current chunk's logits instead of all L.
+ */
+/**
+ * 🔴 AND `chainAware` IS WHAT A COMPLEX NEEDS, WHICH IS NOT A FLAG ABOUT
+ * SPEED. ESMFold2 hands ESM-C every chain in one packed array -
+ * `[BOS] chain1 [EOS BOS] chain2 ... [EOS]` - with a `sequence_id` per chain,
+ * and the attention is `seq_id[i] == seq_id[j]`: a key in another chain is
+ * excluded outright. Running the tower once per chain instead is NOT the same
+ * model, because the rotary positions are ABSOLUTE over the packed array with
+ * no per-chain reset - chain two's first residue sits at `len(chain one) + 3`,
+ * and giving it position 1 changes the phase on every head while conforming in
+ * every shape.
+ */
+export function createAttentionShader({ rows, model, heads }, queryTile = QUERY_TILE,
+                                      chainAware = false) {
+  const headDim = model / heads;
+  if (headDim !== LANES) {
+    throw new RangeError(`this kernel assumes headDim == ${LANES}; got ${headDim}`);
+  }
+  const logits = [], rescales = [], accumulators = [];
+  for (let t = 0; t < queryTile; t += 1) {
+    logits.push(`      var dot_${t} = 0.0;`);
+    accumulators.push(`  var acc_${t} = 0.0;`);
+    rescales.push(t);
+  }
+  const dotStep = (u) => {
+    const dExpr = `(d + ${u}u)`;
+    const lines = [`        let k_${u} = key[(head * ${headDim}u + ${dExpr}) * ${rows}u + j];`];
+    for (let t = 0; t < queryTile; t += 1) {
+      lines.push(`        dot_${t} += q_tile[${t}u * ${headDim}u + ${dExpr}] * k_${u};`);
+    }
+    return lines.join("\n");
+  };
+  const CHUNK_STRIDE = LANES + 1;
+  const dotUnroll = headDim % 8 === 0 ? 8 : 1;
+  const dots = Array.from({ length: dotUnroll }, (_, u) => dotStep(u)).join("\n");
+  const writeLogits = [];
+  for (let t = 0; t < queryTile; t += 1) {
+    // ...one liveness per QUERY when the chains matter, because the test is
+    // between this query and this key rather than about the key alone.
+    const alive = chainAware ? `live && q_sequence[${t}u] == key_sequence` : "live";
+    writeLogits.push(`      chunk[${t * CHUNK_STRIDE}u + local.x] = `
+      + `select(-3.0e38, dot_${t} * ${(1 / Math.sqrt(headDim)).toPrecision(9)}, ${alive});`);
+  }
+  const accumulate = [];
+  for (let t = 0; t < queryTile; t += 1) {
+    accumulate.push(`      acc_${t} = acc_${t} * rescale_${t} + part_${t};`);
+  }
+
+  return `
+@group(0) @binding(0) var<storage, read> query: array<f32>;
+@group(0) @binding(1) var<storage, read> key: array<f32>;
+@group(0) @binding(2) var<storage, read> value: array<f32>;
+@group(0) @binding(3) var<storage, read_write> destination: array<f32>;
+${chainAware ? "@group(0) @binding(4) var<storage, read> sequence: array<i32>;" : ""}
+
+var<workgroup> q_tile: array<f32, ${queryTile * headDim}>;
+var<workgroup> chunk: array<f32, ${queryTile * CHUNK_STRIDE}>;
+var<workgroup> peak: array<f32, ${queryTile}>;
+var<workgroup> rescale_of: array<f32, ${queryTile}>;
+var<workgroup> total: array<f32, ${queryTile}>;
+var<workgroup> running: array<f32, ${queryTile}>;
+${chainAware ? `var<workgroup> q_sequence: array<i32, ${queryTile}>;` : ""}
+
+@compute @workgroup_size(${LANES})
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_id) local: vec3<u32>) {
+  let row_origin = group.x * ${queryTile}u;
+  let head = group.y;
+  if (row_origin >= ${rows}u) { return; }
+
+  for (var slot = local.x; slot < ${queryTile * headDim}u; slot += ${LANES}u) {
+    let t = slot / ${headDim}u;
+    let d = slot % ${headDim}u;
+    let row = row_origin + t;
+    q_tile[slot] = select(0.0, query[row * ${model}u + head * ${headDim}u + d],
+                          row < ${rows}u);
+  }
+  if (local.x < ${queryTile}u) {
+    peak[local.x] = -3.0e38;
+    running[local.x] = 0.0;
+${chainAware ? `    q_sequence[local.x] = select(-1, sequence[row_origin + local.x],
+                                row_origin + local.x < ${rows}u);` : ""}
+  }
+  workgroupBarrier();
+
+${accumulators.join("\n")}
+
+  for (var k0 = 0u; k0 < ${rows}u; k0 += ${LANES}u) {
+    let j = k0 + local.x;
+    let live = j < ${rows}u;
+${chainAware ? `    let key_sequence = select(-2, sequence[j], live);` : ""}
+    // Phase one: a lane owns a KEY. Each key value it reads is used by all
+    // ${queryTile} queries, which is the whole point of the tile.
+${logits.join("\n")}
+    if (live) {
+      for (var d = 0u; d < ${headDim}u; d += ${dotUnroll}u) {
+${dots}
+      }
+    }
+${writeLogits.join("\n")}
+    workgroupBarrier();
+
+    // The chunk's maximum per query, and the flash rescale of what came before.
+    if (local.x < ${queryTile}u) {
+      let t = local.x;
+      let row_base = t * ${CHUNK_STRIDE}u;
+      var largest = -3.0e38;
+      for (var l = 0u; l < ${LANES}u; l += 8u) {
+${Array.from({ length: 8 }, (_, u) => `        largest = max(largest, chunk[row_base + l + ${u}u]);`).join("\n")}
+      }
+      let previous = peak[t];
+      let combined = max(previous, largest);
+      // exp(-inf - -inf) is NaN, and the first chunk has no previous maximum.
+      let r = select(exp(previous - combined), 0.0, previous <= -3.0e38);
+      rescale_of[t] = r;
+      running[t] = running[t] * r;
+      peak[t] = combined;
+      var sum = 0.0;
+      for (var l = 0u; l < ${LANES}u; l += 8u) {
+${Array.from({ length: 8 }, (_, u) => `        {
+          let w_${u} = exp(chunk[row_base + l + ${u}u] - combined);
+          chunk[row_base + l + ${u}u] = w_${u};
+          sum += w_${u};
+        }`).join("\n")}
+      }
+      running[t] += sum;
+    }
+    workgroupBarrier();
+
+    // Phase two: a lane owns a CHANNEL. Each value it reads is used by all
+    // ${queryTile} queries too.
+${Array.from({ length: queryTile }, (_, t) =>
+    `    let rescale_${t} = rescale_of[${t}u];\n    var part_${t} = 0.0;`).join("\n")}
+    if (k0 + ${LANES}u <= ${rows}u) {
+      for (var l = 0u; l < ${LANES}u; l += 4u) {
+${Array.from({ length: 4 }, (_, u) => {
+  const src = `(k0 + l + ${u}u)`;
+  return `        {
+          let v = value[${src} * ${model}u + head * ${headDim}u + local.x];
+${Array.from({ length: queryTile }, (__, t) =>
+    `          part_${t} += chunk[${t * CHUNK_STRIDE}u + l + ${u}u] * v;`).join("\n")}
+        }`;
+}).join("\n")}
+      }
+    } else {
+      for (var l = 0u; l < ${LANES}u; l += 1u) {
+        let source = k0 + l;
+        if (source >= ${rows}u) { break; }
+        let v = value[source * ${model}u + head * ${headDim}u + local.x];
+${Array.from({ length: queryTile }, (_, t) =>
+    `        part_${t} += chunk[${t * CHUNK_STRIDE}u + l] * v;`).join("\n")}
+      }
+    }
+${accumulate.join("\n")}
+    workgroupBarrier();
+  }
+
+${Array.from({ length: queryTile }, (_, t) => `  {
+    let row = row_origin + ${t}u;
+    if (row < ${rows}u) {
+      destination[row * ${model}u + head * ${headDim}u + local.x] =
+        acc_${t} / running[${t}u];
+    }
+  }`).join("\n")}
+}`;
+}
+
+/**
+ * The SwiGLU widening, tiled and vectorised like the other projections.
+ *
+ * 🔴 THIS KERNEL HELD 44% OF A BLOCK'S WEIGHTS AND NONE OF ITS OPTIMISATION.
+ * fc1 is 7.08 M of a block's 15.93 M parameters, and while `createLinearShader`
+ * was transposed, tiled and vectorised into 320 GFLOP/s this one stayed as it
+ * was written: one workgroup a row, scalar, every row re-reading the whole
+ * matrix. At those two rates fc1 is 84% of the block's time for 44% of its
+ * work - which is what comes of tuning the kernels one has been thinking about
+ * rather than the ones holding the weights.
+ *
+ * 🔴 THE LayerNorm MOVED OUT, because a row tile cannot stage what it needs.
+ * The old kernel normalised in workgroup memory and kept the row there, which
+ * costs ${ROW_TILE} x model floats at a tile of ${ROW_TILE} - 36 KB against a
+ * 16 KB limit. Normalising into its own buffer first costs one pass and
+ * rows x model floats, and lets the widening tile like everything else.
+ *
+ * 🔴 AND BOTH HALVES ARE COMPUTED IN REGISTERS, so the (rows, 2 * ffn)
+ * intermediate never exists. That is the property the old kernel had and the
+ * one worth keeping: at 1500 tokens it would be 36.9 MB written to be read
+ * once.
+ */
+export function createSwigluShader({ rows, model, ffn }, weightPrecision = "f32") {
+  if (ffn % 4 !== 0) {
+    throw new RangeError(`vectorised SwiGLU needs a multiple of four columns; got ${ffn}`);
+  }
+  const half = weightPrecision === "f16";
+  const load = half ? (e) => `vec4<f32>(weights[${e}])` : (e) => `weights[${e}]`;
+  const vectorFfn = ffn / 4;
+  const stride = (2 * ffn) / 4;
+  const tile = 4;   // gate and value both accumulate, so half the linear tile
+
+  const declare = [], body = [], stores = [];
+  for (let t = 0; t < tile; t += 1) {
+    declare.push(`  var gate_${t} = vec4<f32>(0.0);`);
+    declare.push(`  var value_${t} = vec4<f32>(0.0);`);
+    stores.push(`  {
+    let row = row_origin + ${t}u;
+    if (row < ${rows}u && vector_column < ${vectorFfn}u) {
+      let activated = gate_${t} / (vec4<f32>(1.0) + exp(-gate_${t}));
+      destination[row * ${vectorFfn}u + vector_column] = activated * value_${t};
+    }
+  }`);
+  }
+  // 🔴 THE GATE HALF IS FIRST: silu(wide[c]) * wide[ffn + c]. Swapped, the block
+  // still runs and returns a plausible tensor of the same shape.
+  // The same four-way k unroll the linear kernel uses, and for the same reason:
+  // scalar, this loop did one workgroup read per multiply-add.
+  const exactK = model % K_CHUNK === 0;
+  const unroll = 4;
+  const exactUnroll = model % unroll === 0;
+  for (let u = 0; u < unroll; u += 1) {
+    body.push(`      {`);
+    if (!exactUnroll && u > 0) {
+      body.push(`        if (k_absolute + ${u}u >= ${model}u) { break; }`);
+    }
+    body.push(`        let wg = ${load(`(k_absolute + ${u}u) * ${stride}u + vector_column`)};`);
+    body.push(`        let wv = ${load(`(k_absolute + ${u}u) * ${stride}u + ${vectorFfn}u + vector_column`)};`);
+    for (let t = 0; t < tile; t += 1) {
+      body.push(`        let s_${t} = staged[${t}u * ${K_CHUNK}u + k + ${u}u];`);
+      body.push(`        gate_${t} += s_${t} * wg;`);
+      body.push(`        value_${t} += s_${t} * wv;`);
+    }
+    body.push(`      }`);
+  }
+
+  return `${half ? "enable f16;\n" : ""}
+@group(0) @binding(0) var<storage, read> normalised: array<f32>;
+@group(0) @binding(1) var<storage, read> weights: array<vec4<${weightPrecision}>>;
+@group(0) @binding(2) var<storage, read_write> destination: array<vec4<f32>>;
+
+var<workgroup> staged: array<f32, ${tile * K_CHUNK}>;
+
+@compute @workgroup_size(${LANES})
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_id) local: vec3<u32>) {
+  let row_origin = group.y * ${tile}u;
+  let vector_column = group.x * ${LANES}u + local.x;
+  if (row_origin >= ${rows}u) { return; }
+
+${declare.join("\n")}
+
+  let k_lane = local.x & ${K_CHUNK - 1}u;
+  for (var k0 = 0u; k0 < ${model}u; k0 += ${K_CHUNK}u) {
+    let k_col = k0 + k_lane;
+    for (var slot = local.x; slot < ${tile * K_CHUNK}u; slot += ${LANES}u) {
+      let row = row_origin + (slot / ${K_CHUNK}u);
+      staged[slot] = select(0.0, normalised[row * ${model}u + k_col],
+                            ${exactK ? `row < ${rows}u` : `row < ${rows}u && k_col < ${model}u`});
+    }
+    workgroupBarrier();
+    for (var k = 0u; k < ${K_CHUNK}u; k += ${unroll}u) {
+      let k_absolute = k0 + k;
+${exactK ? "" : `      if (k_absolute >= ${model}u) { break; }\n`}${body.join("\n")}
+    }
+    workgroupBarrier();
+  }
+
+${stores.join("\n")}
+}`;
+}
+
+/** The grid the tiled SwiGLU wants. Its row tile is half the linear kernel's. */
+export function swigluGrid(rows, ffn) {
+  return [Math.ceil(ffn / 4 / LANES), Math.ceil(rows / 4)];
+}
+
+export class EsmcBlockGpu {
+  constructor(device, allocator = new GpuBufferAllocator(device)) {
+    this.device = device;
+    this.allocator = allocator;
+    this.pipelines = pipelineCacheForDevice(device);
+  }
+
+  /**
+   * One block. `input` is (rows, model); `weights` holds the ten tensors
+   * tools/export_esmc_model.py writes for a block, under their leaf names.
+   */
+  async run(input, shape, weights, options = {}) {
+    const { rows, model, heads, ffn } = shape;
+    // (derived where the depth is given, as webgpu/esmc/tower.js: sqrt(layers / 36) - 0.9129 at 300M's 30)
+    const residualScale = Number.isInteger(shape.layers) && shape.layers > 0
+      ? Math.sqrt(shape.layers / 36) : (shape.residualScale ?? 1);
+    const epsilon = (options.epsilon ?? 1e-5).toExponential();
+    const ropeBase = (options.ropeBase ?? 10000).toFixed(1);
+    // 🔴 f16 WEIGHTS BY DEFAULT: 1.26x FASTER AND EXACTLY FREE, because the
+    // CHECKPOINT IS bfloat16. ESM-C is trained in bf16 and widened to float32
+    // on the way out - see docs/EF2FAST.md - so every weight carries 7 mantissa
+    // bits and float16 holds 10. Narrowing is lossless: relRMS 1.58e-8 over two
+    // million of fc1's weights, against 2.08e-4 for random float32 of the same
+    // scale.
+    //
+    // 🔴 SO THE BENCH'S DIVERGENCE COLUMN OVERSTATES WHAT THIS COSTS. It
+    // synthesises full-precision weights and reads max|f16-f32| = 3.1e-5; the
+    // real block moves 3.49e-7 -> 3.47e-7 against the oracle, which is nothing.
+    // A synthetic weight is the right thing to TIME and the wrong thing to
+    // price precision against.
+    //
+    // The accumulator stays f32 either way: a 3072-long dot product is not
+    // summed in ten mantissa bits.
+    const weightPrecision = options.weightPrecision ?? "f16";
+    const boundsTest = options.boundsTest ?? false;
+    const rowTile = options.rowTile ?? ROW_TILE;
+    const profile = options.profile ?? false;
+    const queryTile = options.queryTile ?? QUERY_TILE;
+    const unroll = options.unroll ?? 4;
+    if (input.length !== rows * model) {
+      throw new Error(`input has ${input.length} elements; expected ${rows * model}`);
+    }
+    if (model % heads !== 0) throw new Error(`${model} channels over ${heads} heads`);
+
+    const storage = GPUBufferUsage.STORAGE;
+    const kept = [];
+    const keep = (allocation) => { kept.push(allocation); return allocation; };
+    const upload = (name, values) => keep(this.allocator.upload(`esmc.${name}`, values, storage));
+    const scratch = (name, elements) => keep(this.allocator.allocate(
+      `esmc.${name}`, elements * 4, storage | GPUBufferUsage.COPY_SRC));
+    try {
+      const x = upload("input", input);
+      const normed = scratch("normed", rows * model);
+      const qkv = scratch("qkv", rows * 3 * model);
+      const query = scratch("query", rows * model);
+      const key = scratch("key", rows * model);
+      const value = scratch("value", rows * model);
+      const context = scratch("context", rows * model);
+      const afterAttention = scratch("afterAttention", rows * model);
+      const ffnNormed = scratch("ffnNormed", rows * model);
+      const gated = scratch("gated", rows * ffn);
+      const output = scratch("output", rows * model);
+
+      // 🔴 ONLY THE FOUR PROJECTIONS NARROW. The norms are 0.04% of a block's
+      // bytes and are where an error is not averaged away by a matmul, which is
+      // the rule tools/quantize_af3.py applies for the same reason.
+      const narrow = (values) => (weightPrecision === "f16"
+        ? float32ToFloat16Array(values) : values);
+      const w = (leaf) => upload(leaf, weights[leaf]);
+      const attnScale = w("attn_norm/scale");
+      const attnOffset = w("attn_norm/offset");
+      const qkvWeights = upload("qkv/weights", narrow(weights["qkv/weights"]));
+      const qScale = w("q_norm/scale");
+      const kScale = w("k_norm/scale");
+      const attnOut = upload("attn_out/weights", narrow(weights["attn_out/weights"]));
+      const ffnScale = w("ffn_norm/scale");
+      const ffnOffset = w("ffn_norm/offset");
+      const fc1 = upload("fc1/weights", narrow(weights["fc1/weights"]));
+      const fc2 = upload("fc2/weights", narrow(weights["fc2/weights"]));
+
+      // 🔴 THE RESIDUAL SCALE IS FOLDED INTO THE PROJECTION WEIGHTS, not applied
+      // as a separate pass. It is sqrt(layers / 36), which is exactly 1 at 36
+      // layers - so a port that dropped it entirely would agree here and diverge
+      // on the 6B tower, where it is sqrt(80/36).
+      const scaled = (values) => {
+        if (residualScale === 1) return values;
+        const out = new Float32Array(values.length);
+        for (let i = 0; i < values.length; i += 1) out[i] = values[i] / residualScale;
+        return out;
+      };
+      const attnOutScaled = residualScale === 1 ? attnOut
+        : upload("attn_out/scaled", narrow(scaled(weights["attn_out/weights"])));
+      const fc2Scaled = residualScale === 1 ? fc2
+        : upload("fc2/scaled", narrow(scaled(weights["fc2/weights"])));
+
+      const pipeline = async (name, source) => this.pipelines.get(name, source);
+      const normPipeline = await pipeline(
+        `esmc-ln:${rows}:${model}:${epsilon}`,
+        createLayerNormShader({ rows, channels: model }, true, epsilon));
+      const qkvPipeline = await pipeline(
+        `esmc-linear:${rows}:${model}:${3 * model}:0:${weightPrecision}:${boundsTest}:${rowTile}:${unroll}`,
+        createLinearShader({ rows, inner: model, outer: 3 * model }, false, weightPrecision, boundsTest, rowTile, unroll));
+      const preparePipeline = await pipeline(
+        `esmc-prepare:${rows}:${model}:${heads}:${epsilon}:${ropeBase}`,
+        createPrepareShader({ rows, model, heads }, epsilon, ropeBase));
+      const attentionPipeline = await pipeline(
+        `esmc-attend:${rows}:${model}:${heads}:${queryTile}`,
+        createAttentionShader({ rows, model, heads }, queryTile));
+      const outPipeline = await pipeline(
+        `esmc-linear:${rows}:${model}:${model}:1:${weightPrecision}:${boundsTest}:${rowTile}:${unroll}`,
+        createLinearShader({ rows, inner: model, outer: model }, true, weightPrecision, boundsTest, rowTile, unroll));
+      const swigluPipeline = await pipeline(
+        `esmc-swiglu:${rows}:${model}:${ffn}:${weightPrecision}`,
+        createSwigluShader({ rows, model, ffn }, weightPrecision));
+      const downPipeline = await pipeline(
+        `esmc-linear:${rows}:${ffn}:${model}:1:${weightPrecision}:${boundsTest}:${rowTile}:${unroll}`,
+        createLinearShader({ rows, inner: ffn, outer: model }, true, weightPrecision, boundsTest, rowTile, unroll));
+
+      const readback = keep(this.allocator.allocate(
+        "esmc.readback", rows * model * 4,
+        GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
+      // 🔴 THE qkv INPUT COMES BACK TOO, BECAUSE IT IS THE ONE POINT THE ORACLE
+      // RECORDS INSIDE THE BLOCK. A block that disagrees only at its output
+      // leaves eight dispatches to bisect; a block that agrees on `normed` and
+      // disagrees at the output has narrowed it to seven, and the LayerNorm is
+      // the dispatch most likely to be right.
+      const normedReadback = keep(this.allocator.allocate(
+        "esmc.readback.normed", rows * model * 4,
+        GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
+
+      // 🔴 ONE PASS PER DISPATCH ONLY WHEN PROFILING. tools/gpu/profile.js times
+      // LABELLED passes, and seven dispatches in one pass is one label - so the
+      // attribution this port has been arguing from arithmetic was never
+      // measurable. Separate passes cost a little scheduling, so the totals
+      // under --profile are not the shipped totals; the shares are.
+      this.device.pushErrorScope("validation");
+      const encoder = this.device.createCommandEncoder({ label: "esmc-block" });
+      let pass = encoder.beginComputePass({ label: "esmc-block" });
+      const stage = (label) => {
+        if (!profile) return;
+        pass.end();
+        pass = encoder.beginComputePass({ label: `esmc.${label}` });
+      };
+      const bindOf = (built, bindings) => this.device.createBindGroup({
+        layout: built.getBindGroupLayout(0),
+        entries: bindings.map((allocation, binding) => ({
+          binding, resource: { buffer: allocation.buffer },
+        })),
+      });
+      const dispatch = (built, bindings, count) => {
+        pass.setPipeline(built);
+        pass.setBindGroup(0, bindOf(built, bindings));
+        pass.dispatchWorkgroups(Math.min(count, GRID_WIDTH), Math.ceil(count / GRID_WIDTH));
+      };
+      const dispatchLinear = (built, bindings, outer) => {
+        pass.setPipeline(built);
+        pass.setBindGroup(0, bindOf(built, bindings));
+        const [x, y] = linearGrid(rows, outer, rowTile);
+        pass.dispatchWorkgroups(x, y);
+      };
+
+      stage("attn-norm");
+      dispatch(normPipeline, [x, attnScale, attnOffset, normed], rows);
+      stage("qkv");
+      dispatchLinear(qkvPipeline, [normed, qkvWeights, qkv], 3 * model);
+      stage("prepare");
+      dispatch(preparePipeline, [qkv, qScale, kScale, query, key, value], rows);
+      stage("attend");
+      pass.setPipeline(attentionPipeline);
+      pass.setBindGroup(0, bindOf(attentionPipeline, [query, key, value, context]));
+      pass.dispatchWorkgroups(Math.ceil(rows / queryTile), heads);
+      stage("attn-out");
+      dispatchLinear(outPipeline, [context, attnOutScaled, x, afterAttention], model);
+      stage("ffn-norm");
+      dispatch(normPipeline, [afterAttention, ffnScale, ffnOffset, ffnNormed], rows);
+      stage("swiglu");
+      pass.setPipeline(swigluPipeline);
+      pass.setBindGroup(0, bindOf(swigluPipeline, [ffnNormed, fc1, gated]));
+      {
+        const [gx, gy] = swigluGrid(rows, ffn);
+        pass.dispatchWorkgroups(gx, gy);
+      }
+      stage("fc2");
+      dispatchLinear(downPipeline, [gated, fc2Scaled, afterAttention, output], model);
+      pass.end();
+      encoder.copyBufferToBuffer(output.buffer, 0, readback.buffer, 0, rows * model * 4);
+      encoder.copyBufferToBuffer(normed.buffer, 0, normedReadback.buffer, 0, rows * model * 4);
+
+      const started = performance.now();
+      this.device.queue.submit([encoder.finish()]);
+      const error = await this.device.popErrorScope();
+      if (error !== null) throw new Error(`WebGPU validation failed: ${error.message}`);
+      await readback.buffer.mapAsync(GPUMapMode.READ);
+      const result = new Float32Array(readback.buffer.getMappedRange().slice(0));
+      readback.buffer.unmap();
+      await normedReadback.buffer.mapAsync(GPUMapMode.READ);
+      const normedResult = new Float32Array(normedReadback.buffer.getMappedRange().slice(0));
+      normedReadback.buffer.unmap();
+      return {
+        output: result, normed: normedResult,
+        elapsedMilliseconds: performance.now() - started,
+      };
+    } finally {
+      for (let index = kept.length - 1; index >= 0; index -= 1) kept[index].release();
+    }
+  }
+}

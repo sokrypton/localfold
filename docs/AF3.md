@@ -557,7 +557,7 @@ protenix2 there is no widening. Two config divergences (a 65-bin distogram and
 an MSA module that holds ONE set of weights and runs it four times, which the
 converter replicates so this port sees four blocks) and then a long list of
 forward branches, most of them gated on the model NAME in the reference rather
-than on a convention tuple. `src/af3/dialect.js`'s ROSETTAFOLD3 lists every one,
+than on a convention tuple. `shared/af3/dialect.js`'s ROSETTAFOLD3 lists every one,
 implemented or not; four are done and they are worth an order of magnitude:
 
 | rf3 trunk, `--dump=` reference batch, int5 | start | +conformer bias | +is_paired | +OPM bias | +grid bias |
@@ -869,7 +869,7 @@ tile is 4,672 bytes and fits anything, which is why a constant nobody priced
 survived five models.
 
 🔴 **AND IT IS IN TWO FILES, WHICH MADE THE FIRST HALF OF THE FIX LOOK LIKE NO
-FIX AT ALL.** `grid-attention-webgpu.js` and `src/kernels/triangle/shaders.js` each
+FIX AT ALL.** `grid-attention.js` and `webgpu/kernels/triangle/shaders.js` each
 carry their own copy of that LayerNorm, and both come to **exactly** 16,960
 bytes at 512 channels - so fixing one left the error byte-for-byte identical and
 read as "the flag is not reaching the kernel". docs/ARCHITECTURE.md lists this
@@ -1146,7 +1146,7 @@ the same scopes. It is built now; see the template section.
 
 ### The template stack's width was a constant, and IntelliFold-2's is 256
 
-`const CHANNELS = 64` sat in BOTH template-reference.js and template-webgpu.js.
+`const CHANNELS = 64` sat in BOTH template.js and template.js.
 It is 64 in five checkpoints and **256 in if2**, whose template grid attention is
 8 heads of 32 against AF3's 4 of 16. `templateWeights` reads it now from the norm
 after the stack - `output_layer_norm/scale` for the nine-projection embedder and
@@ -1307,7 +1307,7 @@ the 1.12e-4 is approximation rather than error. Without an arm that genuinely
 gets f32 there is no way to tell those two apart.
 
 🔴 **AND THE TRUNK HAS THREE PAIR TRACKS, WHICH IS WHY THE FIRST PIN DID
-NOTHING.** `pairMatrixKernels` wired into `pairformer-block-webgpu.js` alone
+NOTHING.** `pairMatrixKernels` wired into `pairformer-block.js` alone
 moved an f32 request from 1.12e-4 to 1.11e-4: the MSA stack and the template
 embedder compile their own `compilePairTrack` and kept theirs. All three take
 the option now, and both of the other two had to learn to read it from the
@@ -1390,7 +1390,7 @@ hand, and each dropped something the other passed:
   where the page takes a **seeded random subset** of the whole file.
 
 So every `--a3m` gate in this repository was measuring a fold the site does not
-run. Both call `af3BatchFromA3m` in src/af3/featurise/batch.js now, and with the two
+run. Both call `af3BatchFromA3m` in shared/af3/featurise/batch.js now, and with the two
 batches made identical field by field the CLI reproduced 72.4 - which is how the
 weights became the only thing left.
 
@@ -1447,11 +1447,11 @@ A protein chain typed into `index.html` folds with AlphaFold 3 entirely in the
 browser: featurisation, trunk, diffusion and confidence, no server. Pick **AF3**
 in the Model dropdown.
 
-- **From a sequence, not a dump.** `src/af3/featurise/featurise.js` builds AF3's whole
+- **From a sequence, not a dump.** `shared/af3/featurise/featurise.js` builds AF3's whole
   batch in JavaScript. Checked array-by-array against AF3's own batch for 6MRR
   and for a three-chain complex: `node tools/oracle/check_af3_featurise.js`.
 - **Complexes**, chains separated by `:`. Chain identity comes from
-  `src/input/chains.js` - the same `chainIdentity()` AlphaFold-multimer uses.
+  `shared/input/chains.js` - the same `chainIdentity()` AlphaFold-multimer uses.
 - **Two samplers.** *Diffusion* (**the default**) is AF3's own stochastic
   sampler, 25 steps on the page. *Flow* draws once at the top of the schedule
   and walks it down deterministically, 16 cycles. Both are seeded. Diffusion is
@@ -1469,14 +1469,14 @@ in the Model dropdown.
   array-by-array against AF3 for protein+DNA, protein+RNA and a three-chain
   complex; folded geometry checked by `tools/gpu/probe-nucleic.js` (bond ratio
   1.013 DNA, 1.009 RNA, against 1.017 for the protein control). Their reference
-  conformers are `src/af3/featurise/reference-conformers-nucleic.js`, generated from the
+  conformers are `shared/af3/featurise/reference-conformers-nucleic.js`, generated from the
   oracle rather than typed. No MSA: AF3 searches an RNA database this page has
   no server for, and DNA gets none in AF3 either.
 - **Modified residues** on protein chains; modified BASES are refused, since the
   modified-residue path resolves parents through the amino-acid table.
 - **Recycles** for AF3 as well as AF2.
 - **MSAs**, through the page's own alignment controls - search, paste or upload,
-  shared with both AlphaFold 2 models. `src/af3/featurise/msa-features.js` is the whole of
+  shared with both AlphaFold 2 models. `shared/af3/featurise/msa-features.js` is the whole of
   the adapter. On the 59-residue demo sequence a 512-row alignment moves pLDDT
   55.8 -> 65.7 and costs about 2 s (the MSA stack goes from nothing to 239 ms at
   512 rows).
@@ -1565,12 +1565,12 @@ precision the buffer ends up in. Dropping to f32 weights would save 178 ms of
 
 🔴 **AND IT IS A COMPUTE PASS NOW, NOT HOST WORK AT ALL.** Hiding it behind the
 trunk was considered and would have cost 378 MiB; decoding it on the GPU costs
-nothing and is 3.7x faster. `src/weights/quantised-upload.js` uploads the int5
+nothing and is 3.7x faster. `webgpu/weights/quantised-upload.js` uploads the int5
 CODES - about an eighth of the bytes - and decodes them straight into the
 resident buffer. Over the 24 blocks, both arms cold: **437 ms on the host
 against 119 on the device**, and 0 of 198 million elements differ.
 
-The same helper (`src/af3/weights/device-weights.js`) took the trunk's two f16 labels,
+The same helper (`webgpu/af3/weights/device-weights.js`) took the trunk's two f16 labels,
 which were the next largest:
 
 | packer | MiB | host, cold |
@@ -1778,9 +1778,9 @@ After that:
 
 - **The model never saw it.** `fold.js` assembles the trunk's input as an object
   literal and did not name `bondMatrix`, so the embedder got `undefined` - which
-  is indistinguishable from a fold with no ligand. And `embedder-webgpu.js`, the
+  is indistinguishable from a fold with no ligand. And `embedder.js`, the
   one a browser fold runs, had neither the `bondEmbedding` weight nor the term,
-  while `embedder-reference.js` had both. `diffuser/evoformer/bond_embedding/
+  while `embedder.js` had both. `diffuser/evoformer/bond_embedding/
   weights` was in the shipped bundle, downloaded on every fold, multiplied by
   nothing. `tools/gpu/check-af3-embedder.js` passed throughout because its
   fixture carried no bond matrix either: **a feature absent from both sides of a
@@ -1939,7 +1939,7 @@ What did **not** work, measured, so it is not retried:
   the up-front burst serialises ahead of all compute.
 - **Caching bind groups**: exactly zero, 636-639 either way, though ~1,680 are
   created per stack.
-- **f16 weights for the triangle, for SPEED.** `src/kernels/triangle/` has had a
+- **f16 weights for the triangle, for SPEED.** `webgpu/kernels/triangle/` has had a
   precision option since before this port and `bench-triangle.js` reports 1.40x
   for it at L=128, which reads exactly like an unclaimed win. Wired through to
   the pairformer it measured **377 ms against 378**. The bench's 1.40x is its
@@ -1969,7 +1969,7 @@ What did **not** work, measured, so it is not retried:
   trunk's own traffic for exactly what it saves. It is the same finding as the
   up-front weight burst above, in a new place.
 - **Anything that adds registers to the flash attention kernel.** See
-  src/kernels/attention.js: a vec4 q.k accumulator is worth exactly zero
+  webgpu/kernels/attention.js: a vec4 q.k accumulator is worth exactly zero
   (the compiler already does it), grouping the keys to amortise the softmax
   rescale is 2.3x SLOWER, and two queries a lane is 4.7x slower. The query and
   the accumulators are already 64 registers a lane and that is the ceiling.
@@ -2108,7 +2108,7 @@ measurements is in each file.
 - **ipTM**, which is what a complex is actually judged by, is still not
   implemented for AF3 - the confidence head emits PAE and PDE, and pTM/ipTM are
   absent rather than approximated.
-- **The A3M parser is narrower than AF3's alphabet.** `src/input/a3m.js` rejects
+- **The A3M parser is narrower than AF3's alphabet.** `shared/input/a3m.js` rejects
   B, Z, J, O and U, which AF3 maps to D, E, X, X and C. The codes are in
   `AF3_MSA_CODES` and unreachable through that parser - for AlphaFold 2 too, so
   widening it is a change to all three models rather than to AF3's path.
@@ -2127,8 +2127,8 @@ measurements is in each file.
   checkers compare against at 1e-6, which is a tolerance nobody chose. What is
   left is ~4 ms of genuine dense work and is no longer worth a kernel.
 - ~~**Templates raise** rather than compute.~~ Closed on the CPU 2026-09-04:
-  `src/af3/featurise/template-features.js` computes all six geometry features and
-  `template-reference.js` loops over real slots. Against AF3 on a 16-residue
+  `shared/af3/featurise/template-features.js` computes all six geometry features and
+  `template.js` loops over real slots. Against AF3 on a 16-residue
   query with Top7 in slot 0 of four:
 
   | | relRMS |
@@ -2272,7 +2272,7 @@ the remainder to the unpaired block, which is what featurise.js needs to compute
 the profile over the right half.
 
 🔴 THE FOLD PASSED ONE MSA ROW TO THE TRUNK, and that was the whole of it.
-`src/af3/fold.js` called the trunk with `sequences: 1` and sliced every MSA
+`webgpu/af3/fold.js` called the trunk with `sequences: 1` and sliced every MSA
 array down to the query, so the MSA stack never saw an alignment. Fixed; the
 numbers below are after.
 
@@ -2324,7 +2324,7 @@ the better part of a minute and the trunk appeared to hang. Measured at the
 time: pass 1 reached block 11 in five minutes hidden, then jumped to block 28
 the moment the tab was touched.
 
-`src/runtime/yield.js` is the fix (commit 882e3f2) and the whole of it: a
+`webgpu/runtime/yield.js` is the fix (commit 882e3f2) and the whole of it: a
 MessageChannel message is a task, so it still lets the page paint and still
 lets Stop respond, but it is not a timer and is not clamped.
 
@@ -2491,7 +2491,7 @@ but the exponent has not changed and it will lead again on a longer chain.
 Anything further should be measured at 150, not at 59.
 
 🔴 **AND ON A DEVICE WITH MATRIX UNITS THIS KERNEL IS NOW A DIFFERENT ONE.**
-`src/af3/trunk/grid-attention-matrix.js` is the same online-softmax flash attention
+`webgpu/af3/trunk/grid-attention-matrix.js` is the same online-softmax flash attention
 AF2 runs, and it is 1.40x to 1.53x over the staged scalar kernel below across
 200 to 640 tokens on an A100 - the whole measurement, and the AF2 tile rule that
 does NOT transfer to it, are in docs/A100.md. It is off unless
@@ -2698,7 +2698,7 @@ What paid, in order of size:
 4. **Per-token workgroups were 64 lanes wide**, so the token count was the
    occupancy. 256 is the ceiling and the optimum.
 5. **Weights packed and uploaded per call.** Now packed once per weight object
-   and resident on the device - src/runtime/resident.js.
+   and resident on the device - webgpu/runtime/resident.js.
 6. **The key rows are a gather of the query rows**, four slots to an atom, and
    the atom transformer projected each slot separately. Projecting per atom and
    expanding is a quarter of the work and numerically identical.
@@ -2739,7 +2739,7 @@ kernels are ALU-bound.
 
 🔴 **AND THERE IS A BETTER TOOL THAN THE ONE USED HERE.** Every bisect above
 disabled a pass and re-measured, which is noisy and cost two wrong conclusions.
-`timestamp-query` is in the features src/runtime/device.js already requests, and
+`timestamp-query` is in the features webgpu/runtime/device.js already requests, and
 README.md records per-kernel timestamp profiling being used on the triangle
 stack. Use that first next time.
 
@@ -2936,7 +2936,7 @@ working well. The binder's length is passed in now.
 `tools/oracle/dump_af3_trunk.py --template <pdb>[:CHAIN]` folds a query with a
 real structure as its template and captures the module's inputs and its
 per-slot outputs. That answers the objection at the top of
-`src/af3/trunk/template-reference.js` - "with no template the six geometry features
+`cpu/af3/trunk/template.js` - "with no template the six geometry features
 are identically zero, so nothing here can tell a correct implementation of them
 from a wrong one" - which was true and is the reason only the empty-slot path
 exists. See docs/AF3.md's template entry for the numbers.
@@ -2984,7 +2984,7 @@ of a weight matrix: the residue-alphabet permutation, the i/j crossing between
 AF3's two pair-embedding sites, the SwiGLU gate/value concatenation, and the
 element index shift - `one_hot(e - 1) @ W` is exactly
 `one_hot(e) @ W[max(0, arange - 1)]`, which `converters/common.py` proves to
-max|d| = 0. `src/af3/dialect.js` is the table:
+max|d| = 0. `shared/af3/dialect.js` is the table:
 
 | flag | what changes | where |
 |---|---|---|
@@ -3169,7 +3169,7 @@ DeepMind's checkpoint" - so a second AF3-graph family took the AlphaFold 2
 branch at each. Three of them were CAPABILITY guards, and they refused ligands,
 modified residues and nucleic chains under OpenBind with a message naming a
 capability the model has: *"Ligands need AlphaFold 3; the model is set to
-openbind"*. `AF3_FAMILIES` in `src/bundles/manifests/index.js` is the list;
+openbind"*. `AF3_FAMILIES` in `shared/bundles/manifests/index.js` is the list;
 `isAf3Family` is the test.
 
 🔴 **AND THE DIALOG SAYS "NOT AVAILABLE FOR COMMERCIAL USE" AND NOT "ACADEMIC
@@ -3292,9 +3292,9 @@ trunk looks the way it does.
 ### 🔴 And `pairTransitionChunkBytes` never reached this track at all
 
 Chasing that starved dispatch found the reason a knob could not move it.
-`pairformer-block-webgpu.js` and `msa-stack-webgpu.js` both put
+`pairformer-block.js` and `msa-stack.js` both put
 `pairTransitionChunkBytes` into the options they hand `encodePairTrack`, and
-`pair-track-gpu.js` - the only caller of `transitionSplitChunkRows` - never read
+`pair-track.js` - the only caller of `transitionSplitChunkRows` - never read
 it, so the rule fell back to its own 64 MiB default. **Every AF3 and OpenDDE arm
 ever measured with that knob was measured at 64 MiB**, which is why the first
 sweep of 64, 128 and 256 moved the group count not at all and the pass by 0.4 ms
@@ -3435,6 +3435,13 @@ to check it compared two PDB captures that were both EMPTY - `fold.js --folds=1`
 prints JSON and the grep matched nothing - and reported "STRUCTURE IDENTICAL",
 which is this repository's "a gate that cannot fail is not a gate" in one line.
 
+🔴 **AND ON THE PAGE THE BUDGET SIZES IT NOW** (2026-10-19). The page always runs under a memory budget
+(`budgetForDevice`, a third of `navigator.deviceMemory`), so where no tuning names a size the cache takes half of the
+room left under that budget, never less than the constant, decided once a schedule (`pairLogitsCacheBytes` in
+diffusion-transformer.js). A tool with no budget keeps the constant. AF3 int5 at 522 tokens on an M5, stock Chrome, 25
+steps: the sampler **8.0 -> 6.8-7.0 s** with all twenty-four blocks held (399 MiB), the fold's peak 814 -> 1100 MiB
+under a 1365 MiB budget, pLDDT to the digit. It is released with the head, before the confidence head allocates.
+
 ## The outer product mean's block was fitted at 150 tokens and inverts at 300
 
 `OPM_BLOCK_I` is 2 and its note reasons from "the workgroup count still wins at
@@ -3475,22 +3482,32 @@ the 59-token case, where one wins by 1.9 ms. A trunk pass at 400 tokens is
 ## A recycle criterion for a trunk that returns no structure
 
 AF2 stops recycling on ColabFold's `compute_tol` - the RMS change of every
-C-alpha pair distance - and `src/af2/model/recycle-convergence.js` implements it.
+C-alpha pair distance - and `shared/af2/model/recycle-convergence.js` implements it.
 **AF3 has no early stop at all**, and the reason is structural rather than an
-oversight: `src/af3/fold.js`'s recycle loop is a bare `for (let pass = firstPass;
+oversight: `webgpu/af3/fold.js`'s recycle loop is a bare `for (let pass = firstPass;
 pass <= recycles; pass += 1)` because AF2 recycles a STRUCTURE and AF3 recycles
 the single and pair representations alone, running the sampler once at the end.
 There are no coordinates to compare until every recycle is already paid for.
 OpenDDE runs the same fold; ESMFold2 has its own recycle path and does not.
 
-So the only signal is the representation. `src/af3/feature-convergence.js` is
+So the only signal is the representation. `shared/af3/feature-convergence.js` is
 the metric - relative RMS change, `||b - a|| / ||b||`, dimensionless so it can
 be compared across models and token counts - and it costs nothing: the loop
 already holds `previousPair` and `previousSingle` as HOST arrays, because the
 pairformer reads them back each pass. No kernel, no readback, no device memory.
 
 `recycleDeltas` reports it per pass and `--recycle-tolerance` acts on it, **0 and
-off by default**. On the 68-token default input:
+off by default**.
+
+🔴 **AND THE ANGSTROM COLUMN IS OPT-IN NOW: `--recycle-distances`.** "It costs
+nothing" held for the pair and single deltas (12 ms a pass at 255 tokens) and
+not for `expectedDistances`, a softmax over every pair's 64 bins: **84-88 ms a
+pass**, host time with the GPU idle, ~350 ms of a 4.7 s page-default fold for a
+number nothing reads unless a tolerance is set. A tolerance above zero still
+computes it; the page sets none. **And the pair and single deltas are opt-in too
+(`--recycle-deltas`)**: between recycles the pair stays on the device now, so a
+pass has host arrays to compare only when something asks for every pass to be
+read back - a tolerance, this flag or `--recycle-distances`. On the 68-token default input:
 
 | pass | pair | single |
 |---:|---:|---:|
@@ -3553,7 +3570,7 @@ distance matrix for free - and the RMS change of that matrix is exactly what
 ColabFold's `compute_tol` takes over a structure. AF2's criterion and this one
 are the same measurement in the same unit, one from coordinates and one from
 the trunk. `expectedDistances` and `distanceChange` in
-src/af3/feature-convergence.js; the tolerance is angstroms and ColabFold's
+shared/af3/feature-convergence.js; the tolerance is angstroms and ColabFold's
 default for the analogous number is 0.5.
 
 | pass | pair | single | **distogram** |
@@ -3632,7 +3649,7 @@ second model becomes a different `--blob`, not a second exporter" - holding.
 triangle heads at c_z 256, a 2-block template stack of 2 heads at 64, four MSA
 blocks at c_m 128 with value_dim 8, a 64-bin distogram with a biased half-logit
 projection. Every one matches the reference's `PROTENIX2_SETTINGS`, which is
-what says `src/af3/weights/weights.js`'s derivation works rather than a table here
+what says `shared/af3/weights/weights.js`'s derivation works rather than a table here
 having to keep step.
 
 ### What the assertions caught, one run each
@@ -3759,7 +3776,7 @@ is what found the `rt_j`/`rt_i` order above. Dump it first.
 scopes mapped and 0 unmapped - as
 `oracle-dumps/af3-oracle-template-protenix2.json`: 76 tokens, the 108 feature
 columns and the module's output separately. `fusedTemplateEmbedding` in
-src/af3/trunk/template-reference.js is held to it by
+cpu/af3/trunk/template.js is held to it by
 `tools/gpu/check-af3-template-fused.js` at **relRMS 1.52e-7**, ours rms 12.4434
 against native's 12.4434.
 
@@ -3909,7 +3926,7 @@ itself, which cannot be a port difference and has to be a malformed input.
 Derived from the bundle, protenix2's trunk reads **pair 6.31e-5 at 1011x its
 envelope**, beside AlphaFold 3's 855.9x.
 
-`src/af3/fold.js` had the same constant in two places, under a comment that
+`webgpu/af3/fold.js` had the same constant in two places, under a comment that
 already recorded OpenDDE's being 384 and "the two differ by exactly 3x". Fixed,
 though it changed nothing here.
 
@@ -4106,6 +4123,10 @@ and on a deep alignment the query itself survives only with probability
 order, which is `subsample_msa_keep_query`'s rule rather than `shuffle_msa`'s.
 A coverage limit, named; `DETERMINISTIC_MSA=1` on the oracle side makes the two
 comparable.
+
+🔴 **SUPERSEDED (2026-10-27): THE ROWS ARE DRAWN AFRESH EVERY TRUNK PASS NOW, AS AF3 DRAWS THEM** - see "AF3's MSA
+draw, every pass" at the end of this file. The "coverage limit" named here was 8S83's whole gap to stock AF3. A batch
+read from an AF3 dump still takes the prefix, so the oracle comparison above is unchanged.
 
 ### What is still open
 
@@ -4403,7 +4424,7 @@ Thirty-fold on three of the five, for nothing measurable. **A cost nobody has
 measured is not a reason; it is a measurement nobody has taken.**
 
 🔴 **AND THE SAME LINE IS IN THE TRUNK, WHERE IT IS LATENT.**
-`pairformer-block-webgpu.js` sizes its scratch by `pairChannels` too, and every
+`pairformer-block.js` sizes its scratch by `pairChannels` too, and every
 trunk shipped here has `heads * dimension == channels`, so it has never been
 wrong. Written the same way now, so the next checkpoint does not pay for it
 twice.
@@ -4863,7 +4884,7 @@ became observable, which it had not been.
 
 ### 🔴 And it goes through `af3BatchFromA3m`, which is the half that catches a caller
 
-src/af3/featurise/batch.js forwards the dialect to `featuriseProtein` **field by field**.
+shared/af3/featurise/batch.js forwards the dialect to `featuriseProtein` **field by field**.
 A gate that calls the featuriser directly would stay green while the page and
 every fold tool silently dropped a convention. Verified by deleting
 `atomizedBackboneBonds` from that forwarding: the gate goes red with "4 bonds
@@ -4886,7 +4907,7 @@ featuriser has no business with `noResidual`.
   the reference, so `msa` is not compared. Its evidence is elsewhere (AF3 6MRR
   83.084 -> 83.169).
 - **opendde's second token space** - 65 `struct/` and `structbook/` fields that
-  this port DOES build, in src/af3/featurise/structural-tokens.js, and that nothing
+  this port DOES build, in shared/af3/featurise/structural-tokens.js, and that nothing
   compares against the reference. Named in the output rather than silently
   absent.
 
@@ -5580,7 +5601,7 @@ from the other side. So it is not "rf3 wants sigma0 16"; it is "rf3 wants
 sigma0 16 AT eight steps", and the page's flow preset is sixteen cycles.
 
 🔴 **AND 16 CANNOT BE THE GLOBAL DEFAULT**, which is why this is a dialect field
-and not a constant change: the note in diffusion-sampler-webgpu.js records that
+and not a constant change: the note in diffusion-sampler.js records that
 sigma0 = 16 COLLAPSES AlphaFold 3's protein, and probe-ligand-flow.js chose 160
 as the value safe for protein and ligand together. Two checkpoints, two optima.
 
@@ -5660,7 +5681,7 @@ it and the one path a visitor takes did not.** Same shape as
 that ships. A visitor folding if2 in Flow would have been handed that seed-7
 structure with "pLDDT 83.3" beside it and nothing else.
 
-* the rule is `src/af3/chain-geometry.js` now, one implementation;
+* the rule is `shared/af3/chain-geometry.js` now, one implementation;
 * `tools/gpu/chain-geometry.js` keeps the terminal's half - the throw and the
   "--allow-broken-geometry" advice, which is not advice for a browser - and
   re-exports the rest. A test compares the function IDENTITIES, so a second copy
@@ -5709,7 +5730,7 @@ what a visitor is getting is not a measurement of it.
 drives the real page in a real browser rather than a fold tool. This is the
 check CLAUDE.md's own trap demands - "a bundle the CLI likes can be one the PAGE
 cannot load", because the page reads the manifest baked into
-`src/bundles/manifests/<family>.js` and not the JSON beside the shards, and
+`shared/bundles/manifests/<family>.js` and not the JSON beside the shards, and
 opendde once died at 122/472 MiB with every CLI gate passing.
 
     IntelliFold-2 · 58 residues · in 5 s · single sequence · 2 passes · pLDDT 54.5
@@ -5828,7 +5849,7 @@ single-sequence wall 5CAJ shows for a monomer.
 The page builds one template SLOT PER CHAIN, which is AF3's convention.
 `multichainMaskFor` opens a cross-chain pair only where a slot covers BOTH ends,
 so per-chain slots contribute nothing across the boundary however `spanChains`
-is set - each covers one end. `mergeTemplateSlots` (src/af3/featurise/template-input.js)
+is set - each covers one end. `mergeTemplateSlots` (shared/af3/featurise/template-input.js)
 folds them into ONE slot that does; `--per-chain-templates` is the arm without
 it, and `--no-span-chains` is the same MERGED slot with the cross-chain block
 masked.
@@ -6229,7 +6250,7 @@ residues rather than of a checkpoint. Past ~400 residues it breaks outright.
 worse fold**, so `index.html` no longer offers it and `AF3_COUNTS` has no row.
 
 What stays: `--mode=ode` on any fold tool, and the step in
-`diffusion-sampler-webgpu.js`. The intellifold2 square is real and nobody has
+`diffusion-sampler.js`. The intellifold2 square is real and nobody has
 explained it, so removing the code would throw away the question along with the
 option. `foldBatch` still validates the three modes and still throws on a
 fourth.
@@ -6327,7 +6348,7 @@ Two mistakes, both of them counting a distance that chemistry fixes:
 
 - **MolProbity's threshold needs MolProbity's radii.** The 0.4 A cutoff was
   calibrated by the Richardson lab on their set, where oxygen is 1.40 A;
-  `vanDerWaalsRadius` in src/chem/geometry-tables.js is Bondi's 1.52, and it is
+  `vanDerWaalsRadius` in shared/chem/geometry-tables.js is Bondi's 1.52, and it is
   right for what it does - flooring the conformer builder's non-bonded
   distances - so the fix is a local table in the scorer, not an edit there.
 - **A 1-4 pair is a torsion, not a collision.** The single largest class of
@@ -6430,3 +6451,481 @@ this same function - the A10 has the reference checkout.
 The counts on the small targets are small enough to be noisy: one clash in 595
 atoms is 1.68, so 5K9P's rosettafold3 15.13 is nine clashes and 6MRR's
 rosettafold3 0 is none. The pooled row is the one to quote.
+
+## 🔴 AlphaFold 3 takes twenty steps from sigma 80, not twenty-five from 160
+
+🔴 **SUPERSEDED 2026-10-16**: every family now folds twenty-five steps of the exponential update on the geometric
+schedule, and the short schedules below are gone - see "The default sampler". Kept as the record.
+
+Measured on the M2 (2026-09-26), AF3 int5, stock flags. The schedule starts at
+160 x sigmaData, where the denoiser's skip weight is ~4e-5 and its output all
+but ignores its input, and rho 7 still spends several of twenty-five calls up
+there. Fewer steps on the same schedule is the regression the note under
+`AF3_COUNTS` records; fewer steps from a LOWER START is not.
+
+`tools/gpu/bench-sampler-geometry.js --schedule-arms=` (new: named arms with
+their own `sigmaMax`, `rho`, ...) over seven systems and eight seeds, bond rms,
+plus `fold-opendde.js --schedule=` (new) against the crystal, four seeds:
+
+| arm | calls | bond median | mean | > 0.15 A | 6MRR | 1QYS |
+|---|---:|---:|---:|---:|---:|---:|
+| diffusion 25 | 25 | 0.0576 | 0.0841 | 6/56 | 0.640 | 0.906 |
+| **sigmaMax 80, 20** | **20** | **0.0561** | **0.0777** | **5/56** | **0.593** | **0.896** |
+| sigmaMax 80, 16 | 16 | 0.0588 | 0.0653 | 3/56 | 0.690 | 0.843 |
+| sigmaMax 40, 16 | 16 | 0.0592 | 0.0610 | 1/56 | 0.721 | 0.938 |
+| sigmaMax 20, 16 | 16 | 0.0581 | 0.0816 | 6/56 | 0.711 | 0.938 |
+| diffusion 16 | 16 | 0.0625 | 0.0760 | 4/56 | - | - |
+
+5CAJ with a self-template is 0.244 A either way; 5K9P from sequence fails either
+way. The trade inside the table is real: the high-noise calls PLACE the chain
+(RMSD wants a high start) and the low-noise density fixes BONDS (a ligand or a
+modified residue wants a low one). 80 at 20 wins both; 40 at 16 is the best
+bond geometry here and 0.08 A worse on 6MRR.
+
+🔴 **THE SEP COLUMN IS ONE SEED WIDE.** Across three rounds the 25-step
+baseline's phosphoserine median read 0.099, 0.222 and 0.367 - a single bad
+draw moves the mean - so rank arms on the median and the count over 0.15 A,
+over eight seeds or more, never on three.
+
+The page: `ALPHAFOLD3_COUNTS` (20 preferred) and `diffusionScheduleFor` in
+web/af3-model.js, read once through `countsForFamily`, gated by
+test/sampler-options.test.js. AlphaFold 3 ONLY - boltz2 has its own schedule
+(rho 8) and the other families are unmeasured, so they keep 25 on theirs. Page
+fold, 6MRR, first visit: done at 2653-2680 ms -> **2298-2415**, pLDDT 67.4 ->
+69.2.
+
+### 🔴 ...and the other six checkpoints: it does NOT transfer as one setting
+
+The same arms against each family's OWN twenty-five-step schedule, same
+panel (bonds over seven systems x eight seeds; CA-RMSD over four seeds):
+
+| family | 6MRR | 1QYS | bonds | ligands | verdict |
+|---|---|---|---|---|---|
+| intellifold2 | 1.528 -> 1.533 | 1.223 -> **1.027** | median 0.082 -> 0.076, bad 14 -> 9 | GOL 0.120 -> **0.052**, SEP 0.202 -> 0.094 | **taken** |
+| protenix2 | 1.236 -> **0.846** | 0.936 -> 0.892 | level | GOL 0.097 -> 0.118, SEP better | held: ligand sweep |
+| openbind0 | 1.706 -> 1.546 | 0.957 -> 0.876 | level | GOL 0.117 -> 0.174, ATP better | held: ligand sweep |
+| boltz2 | 0.508 -> 0.529 | 0.896 -> 0.852 | level | GOL 0.032 -> 0.051 | not taken |
+| rosettafold3 | 1.597 -> 1.627 | 0.957 -> 0.884 | level | **GOL 0.095 -> 0.409** | not taken |
+| opendde | 16 at 160 vs 12 at 80: level | level | not runnable | - | not taken |
+
+🔴 **rosettafold3 at sigma 80 / 20 returned a fold that is NOT A CHAIN** - 1QYS
+seed 3, a consecutive CA-CA of 8.29 A, pLDDT 80.15 - while its own twenty-five
+on the same seed is fine. The schedule is a per-checkpoint constant exactly as
+`dialect.sampler` already is (boltz2's rho 8), and one family's win is no
+evidence for the next: `SHORT_SCHEDULE_FAMILIES` in web/af3-model.js is the list.
+
+🔴 **THE TRADE IS WHERE THE CALLS SIT, AND LIGANDS PULL THE OTHER WAY.** sigma 80
+at 20 keeps the default's calls below 1 A (4) and cuts the ones above 640 A
+(6 -> 3), which is where the fold gains come from; a small flexible ligand
+(glycerol) settles in the 1-16 A band, which 20 steps thins. A lower start (40)
+is the best glycerol on AF3 and protenix2 and the worst fold placement. So a
+schedule that depends on whether the job HAS a ligand - which the page knows
+before the fold - is the next thing to measure, with `--ligands=` over a real
+set rather than three molecules.
+
+### 🔴 ...and the start depends on whether the job has a ligand
+
+Ten CCD ligands (GOL EDO ATP ADP BTN SAM PLP HEM NAD FAD) x four seeds,
+`bench-sampler-geometry.js --ligands=`, mean ligand bond rms (median, count
+over 0.15 A of 40):
+
+| family | own 25 | sigma 80 / 20 | sigma 40 / 20 |
+|---|---|---|---|
+| af3 | 0.064 (0.048, 2) | 0.061 (0.047, 2) | **0.051** (0.047, 0) |
+| protenix2 | 0.084 (0.055, 4) | 0.086 (0.059, 6) | **0.075** (0.056, 4) |
+| openbind0 | 0.100 (0.067, 7) | 0.117 (0.072, 9) | **0.080** (0.058, 3) |
+| intellifold2 | 0.153 (0.120, 18) | **0.139** (0.077, 15) | 0.167 (0.084, 14) |
+
+The high-noise calls place a chain and the low-noise calls settle a small
+molecule, so at the same twenty calls the start should follow the job:
+`SHORT_SCHEDULES` in web/af3-model.js names a protein start and a ligand start
+per family (80/40 for af3, protenix2 and openbind0; 80/80 for intellifold2),
+and the page passes `hasLigand` for a ligand or a modified residue. That brings
+protenix2 and openbind0 in: sigma 80 improves their plain folds (above) and
+sigma 40 beats their own twenty-five on ligands.
+
+🔴 **THE FOUR "NOT A CHAIN" ROWS IN EVERY ARM ARE THE BENCH, NOT THE FOLD.**
+S-adenosylmethionine carries an atom named CA, and the bench's backbone check
+collects every CA in the PDB - so the SAM row reads as broken at a CA-CA of
+3.83 A in all three arms. Filter the ligand's residue before trusting that
+column.
+
+## 🔴 The WebGPU sampler, 2026-10-03: three things the CUDA port did not do, and one it did that did not transfer
+
+Measured on the A100 (developer flags, int5 bundle), 5CAJ chain A (262 tokens) unless stated.
+
+- **The denoiser's token attention runs on AF2's register flash kernel** (`0bb9c91`,
+  `diffusionFlashAttend`). The old `attend` gave every (query, head) a workgroup and re-read all keys
+  and values for it. 24 blocks a call: 68 tokens 1.13 -> 1.36 ms (ceil(T/64) x heads workgroups starve
+  the card - so it is OFF below 100 tokens), 128 2.59 -> 2.06, 262 7.70 -> 4.54, 600 33.6 -> 10.4.
+  Oracle 9.92e-4 both arms. 32 lanes a workgroup instead of 64: +11% at 600, -9% at 262, not taken.
+- **The head's first call of a fold is chained like every other** (`06f0c36`). It awaited each stage
+  and read the encoder's five statics back (14 MB at 262 tokens) because the pair conditioning was
+  once a host array the caches keyed on. First step 159-191 -> 60-82 ms, warm fold 1.63 -> 1.54 s.
+- **buildTargetFeat stops reading those statics back too** (`438b5ae`): 67-85 -> 39-42 ms a fold.
+- 🔴 **DECLINED: the single conditioning's noise-free half once a fold** - the CUDA port's
+  `DCACHE.singleBase`. A batched profile of OpenDDE put `single-initial` at 2.6 ms a call on 130
+  workgroups, about a sixth of a 16 ms step. Built (base kernel once, a C_SEQ-wide noise row and a
+  broadcast a step) and measured interleaved against HEAD: OpenDDE's steady repeat 250-253 against
+  260-286 ms of sampler, AF3 at 262 tokens 1.467-1.531 s against 1.475-1.502 - nothing. 🔴 **THE 2.6 ms
+  WAS THE PROFILE, NOT THE KERNEL**: fold-opendde's profile spans every repeat, and the early ones run
+  the pipeline cache's first-tier (`.generic`, opaque loop bounds) kernels before the unrolled ones
+  land. A per-kernel cost read off a profile that includes a fold's first repeats is a first-tier
+  cost. The new kernels even made repeat 3 WORSE (331-340 against 259-263), because three new
+  pipelines start on that tier too.
+- **Where the gap to CUDA is now**: at 262 tokens the trunks are close (native ~380 ms warm against
+  ~430-500 ms of WebGPU GPU time); the sampler is not (native 74 ms for 25 steps, WebGPU ~830). The
+  denoiser's projections run ~6 TFLOPS of f32 on vector kernels - the transformer has no matrix-unit
+  path, and a stock browser has no matrix units, so the CUDA port's tensor cores have no WebGPU
+  equivalent for a visitor. At 68 tokens a call is ~290 dispatches at ~35 us each and the shipped split
+  configuration still beats every fewer-dispatch alternative swept (10 ms against 11-16).
+
+### 🔴 ...and the denoiser's flash attention twice more (2026-10-03)
+
+- **It never took the device's softmax shape** (`7936301`). AF2's call sites pass `attentionGroup` and
+  `attentionVectorScore` (the ampere prior's g4v, 1.226x there); the denoiser passed neither, and head
+  width 48 derives a key chunk of 21 that no group divides. With both: 128 tokens 2.05 -> 1.79 ms a
+  call, 262 4.56 -> 3.25, 600 10.38 -> 8.17. Vector score alone moves nothing; group 8 ties or loses.
+- **It splits over keys** (`e7b4b64`): 80 workgroups at 262 tokens each walked every key.
+  `keySplits` on createAttentionRegisterFlashShader plus createAttentionSplitCombineShader; doubled
+  while the dispatch is short of ~512 workgroups and each split keeps 32 keys. 262 tokens 3.25 -> 1.69
+  + 0.60 (combine), 600 8.18 -> 4.94 + 0.58; warm folds 1.44 -> 1.38 s at 262. The combine is a fixed
+  ~0.45 ms a call, which is why the old per-(query, head) kernel still wins below 80 tokens (68: 1.12
+  against 1.46) and the threshold is 80.
+
+## The diffusion's discretisation after Blitz: the exponential update and the geometric schedule (2026-10-15)
+
+Blitz (an ICLR 2027 submission: AlphaFold 3 and Boltz-2 distilled to eight diffusion steps) replaces the sampler's
+Euler step with `x' = r^S x + (1 - r^S) D`, `r = sigma' / sigma`, and Karras's rho-7 schedule with one evenly spaced in
+log sigma. Neither needs training. Both were added as options, inert by default (byte-identical folds), and are
+the DEFAULT since 2026-10-16 - see "The default sampler" below; `--update=euler --schedule=karras` is the old walk:
+`--update=exponential`, `--schedule=geometric` and `--no-churn` on cuda/af3 and `tools/gpu/fold.js`, and
+`{ update, schedule, churn }` in `foldBatch`'s `diffusion` option (cpu/af3/diffusion/diffusion-sampler.js holds the
+arithmetic; test/diffusion-update.test.js its closed forms). A Flow, or chai-1's sampler, refuses them.
+
+**Why Euler fails below ~25 steps.** Its coefficient on x is `1 + S (r - 1)`, which goes negative once `r < 1/3` at
+AF3's step scale of 1.5. At 8 steps every model's fold is not a chain (consecutive CA ~25 A) - on the WebGPU page path
+too. The exponential step's coefficient is `r^S`, always between 0 and 1.
+
+**The grid** (cuda/af3, seven models - af3, boltz2, protenix2, intellifold2, rosettafold3, openbind0, opendde - by
+bench-sampler-geometry.js's seven systems, two seeds; bond RMS by class against the CCD; ligand = GOL, ATP and SEP):
+
+| arm | ligand bonds median / mean | ligand cells > 0.15 A | protein + nucleic median (max) |
+|---|---:|---:|---:|
+| 8 Euler | 32 / 31 (not a chain) | 21/21 | 25 A |
+| 8 exponential | 0.59 / 0.62 | 20/21 | 0.061 (0.158) |
+| 8 geometric + exponential | 0.46 / 0.44 | 19/21 | 0.049 (0.093) |
+| 8 geometric + exponential, no churn | 0.46 / 0.48 | 18/21 | 0.044 (0.115) |
+| 16 Euler | 0.109 / 0.139 | 8/21 | 0.038 (0.057) |
+| 16 geometric + exponential | 0.092 / 0.113 | 5/21 | 0.038 (0.065) |
+| 16 geometric + exponential, no churn | 0.241 / 0.236 | 13/21 | 0.039 (0.056) |
+| 25 Euler (the page's default) | 0.070 / 0.124 | 5/21 | 0.038 (0.056) |
+| 25 exponential | 0.078 / 0.087 | 2/21 | 0.038 (0.071) |
+| **25 geometric + exponential** | **0.057 / 0.066** | **0/21** | 0.039 (0.057) |
+| 200 Euler | 0.053 / 0.057 | 0/21 | 0.037 (0.056) |
+
+**Crystals** (CA RMSD, five seeds, mean and range):
+
+| | 25 Euler | 25 geometric + exp | 8 geometric + exp | 200 Euler |
+|---|---|---|---|---|
+| af3 6MRR | 0.595 (0.52-0.68) | 0.694 (0.65-0.83) | 0.581 (0.49-0.70) | 0.614 (0.58-0.67) |
+| af3 1QYS | 1.152 | 1.141 | 1.127 | 1.214 |
+| af3 5K9P | 12.04 | 10.74 | 11.31 | 10.65 |
+| af3 5CAJ (alignment) | 1.921 | 1.981 | 1.901 | 1.948 |
+| af3 1TIM (alignment) | 1.099 | 1.122 | 1.101 | 1.103 |
+| boltz2 6MRR | 0.545 | 0.591 | 0.595 | 0.525 |
+| boltz2 1QYS | 1.851 (1.21-2.82) | 2.608 (1.14-3.34) | 2.477 | 2.467 |
+| boltz2 5K9P | 2.075 | 2.196 | 1.964 | 2.094 |
+| boltz2 5CAJ (alignment) | 1.943 | 1.875 | 1.789 | 1.876 |
+| boltz2 1TIM (alignment) | 1.198 | 1.163 | 1.170 | 1.163 |
+
+What it says:
+- **Eight steps fold a protein or a nucleic acid as well as 200**, with geometric + exponential, on every crystal above
+  and on the grid's protein and nucleic bonds. Ligands and modified residues are not there at 8 (0.46 against 0.053):
+  an 8-step setting is for jobs without them.
+- **At 25 steps geometric + exponential brings ligand bonds to the 200-step level** (0/21 cells past 0.15 A against
+  Euler's 5/21), with the crystals level on nine of ten cells and af3's 6MRR 0.1 A worse.
+- **Churn stays.** Blitz deploys its students deterministically; the undistilled teachers lose ligand geometry without
+  churn at 16 and 25 steps.
+- **The exponential update alone is not the gain at 16-25.** Without the geometric schedule it is mixed there.
+
+🔴 **AND THE GRID FOUND A STANDING DEFECT: OpenDDE's protein + DNA.** Its nucleic bonds are 1.3-2.3 A RMS in EVERY arm
+including 200 Euler steps, where its DNA alone is 0.037 and every other model's protein + DNA is 0.036-0.041. Not
+investigated here; the sampler options do not cause it.
+
+Raw rows: `/tmp/claude-1000/sch/grid*.txt` and `acc-*.txt` on the A100 box (not kept). The defaults were not changed by
+that commit; "The default sampler" below is what changed them.
+
+## Flow removed (2026-10-16)
+
+The Flow walk - one draw at sigma 160 A, then the state replaced by each denoiser prediction - is gone from the page
+(the sampler select), `foldBatch` (`mode: "flow"` and `"ode"`; anything but `"diffusion"` is refused by name), the
+CUDA port (`--flow`, refused by name), the worker (a job still asking for it is refused) and the dialect
+(`noFlowSampler`). It was the page's cheap option and the evidence no longer supports keeping it:
+
+- **It breaks large inputs and complexes, on every model tested.** cuda/af3, CA RMSD over the best chain assignment:
+
+  | target | Flow 16 (+ geometric + per-step pose) | diffusion (Euler 25 / 100, exponential 25) |
+  |---|---:|---:|
+  | 1JZ7 A, 1,023 residues: boltz2 / openbind0 / rosettafold3 | 8.6 / 27.6 / 2.0 | 0.57-0.72 / 1.09-1.12 / 0.78-0.86 |
+  | 1JZ7 A:B, 2,046: af3 / boltz2 | 15.6 / 35.7 | 0.98-1.13 / 0.80-0.87 |
+  | GroEL ring alone, 3,829 (against 1AON's apo trans ring): af3 / boltz2 | 25.9 / 49.2 | 1.44-2.22 / 3.14-3.62 |
+  | GroEL ring + GroES, 4,508: af3 | 40.0 (single chains 15-19 A) | 1.88-3.43 |
+  | 1TIM A:B, 494: openbind0 / opendde | 16.9 / 8.2 (seeds to 25 / 15 A) | 1.14-1.17 / 1.20-1.24 |
+
+  (Scored over the OPTIMAL assignment of identical chains, and for 1JZ7 - a tetramer - against whichever of its
+  three chain pairs the prediction is: a greedy nearest-centroid assignment first scored a correct GroEL ring at 44 A,
+  and AF3 and Boltz-2 legitimately choose different 1JZ7 interfaces, A:B and A:D.)
+
+  On OpenBind-0's 1TIM dimer each chain is right (1.07 / 1.28 A) and their placement is not (24 A) - a deterministic
+  walk from one draw does not break the symmetry of two identical chains. That Boltz-2 failure on the templated dimer
+  (2 seeds in 5, recorded under AF3_COUNTS) was the same thing.
+- **RoseTTAFold3 never had a working one** (its walk collapses: N-CA 6.94 A). It was traced here: a per-step random
+  pose (the augmentation diffusion applies, which the checkpoint was trained with) fixes it - 6MRR 16 A -> 1.67 - but
+  that does not rescue the large-input failures above.
+- **Where it was good it is not needed.** At 16 calls on small systems Flow + geometric had the best ligand bonds
+  measured (median 0.046 A against diffusion 25's 0.070, AF3 / Boltz-2 / Protenix2), and crystals level - but the
+  exponential diffusion (`update: "exponential"`, `schedule: "geometric"`) reaches 200 steps' ligand geometry at 25
+  calls without Flow's failure modes, and at 8 calls folds proteins as well as 200.
+
+Removed with it: `flowOnGpu`, the `#af3-mode` select and `samplerModeFor` / `NO_FLOW_SAMPLER_FAMILIES` /
+`OPENDDE_SAMPLER_MODE` (web/af3-model.js), the CUDA gate's Flow fold and its rf3 / chai1 refusals (one refusal of
+Flow itself remains), `probe-flow-sigma-by-size.js` and `probe-one-step-sigma.js` (both questions about Flow).
+`test:modified` folds at diffusion 200 where it used Flow 16. `--mode=` on the fold tools takes only "diffusion".
+
+## The default sampler: twenty-five exponential steps on the geometric schedule, every family (2026-10-16)
+
+`foldBatch` (webgpu/af3/fold.js `DIFFUSION_DEFAULTS`) and cuda/af3 (`DiffusionOptions` in sampler.cuh) both default to
+the exponential update on the geometric schedule with churn, and the page's one dial (`AF3_COUNTS` in web/af3-model.js)
+prefers 25 for every AF3-lineage family. Gone with it: `ALPHAFOLD3_COUNTS`, `OPENDDE_COUNTS`, `SHORT_SCHEDULES` and
+`diffusionScheduleFor` on the page, and the worker's `--sigma-max`. chai-1 kept its own sampler here, and
+took the exponential step on its own schedule a day later - "chai-1's sampler", below. `--update=euler --schedule=karras` folds the old way.
+
+**The decision run** (cuda/af3, seven models; each model's OLD page default against the exponential sampler at
+16 / 20 / 25 and both samplers at 200). Bonds over bench-sampler-geometry.js's seven systems x two seeds; ligand =
+GOL, ATP, SEP, median bond RMS and how many of six folds went past 0.15 A:
+
+| model (old default) | old default | exp 16 | exp 20 | **exp 25** | exp 200 | Euler 200 |
+|---|---|---|---|---|---|---|
+| rosettafold3 (Euler 25) | **0.340, 4/6** | 0.168, 3/6 | 0.067 | **0.067, 0/6** | 0.052 | 0.062 |
+| boltz2 (Euler 25) | 0.086 | 0.097, 2/6 | 0.084, 1/6 | **0.071** | 0.075 | 0.077 |
+| intellifold2 (Euler 20 from 80) | 0.069, 1/6 | 0.059, 1/6 | 0.053 | **0.049** | 0.047 | 0.049 |
+| opendde (Euler 16) | 0.069, 1/6 | 0.091, 2/6 | 0.063 | **0.053, 1/6** | 0.044 | 0.048 |
+| af3 (Euler 20 from 80 / 40) | 0.048 | 0.071 | 0.060 | **0.042, 1/6** | 0.041 | 0.045 |
+| openbind0 (Euler 20 from 80 / 40) | 0.060 | 0.106, 1/6 | 0.074 | **0.059** | 0.054 | 0.065 |
+| protenix2 (Euler 20 from 80 / 40) | 0.045 | 0.050 | 0.050 | **0.047** | 0.043 | 0.045 |
+
+Nucleic and side-chain bonds are the same in every arm. Crystals (6MRR, 1QYS, 5CAJ and 1TIM A with their alignments,
+1TIM A:B, 1BRS A:D; three seeds, CA RMSD over the best chain assignment) do not separate the arms: with 1QYS left out,
+exp 25 minus the old default is -0.16 to +0.05 A per model (mean of per-target medians), inside the seed spread.
+
+- **25 exponential steps is best or level on ligands for every family, and rosettafold3's ligands stop tearing**
+  (4/6 past 0.15 A at its old Euler 25).
+- **Fewer exponential steps is not a cheaper option**: 16 and 20 are worse on ligands than most of the old defaults.
+  So the short schedules (20 from a lower start) and OpenDDE's 16 went rather than being carried over.
+- 🔴 **1QYS IS BIMODAL ON EVERY ARM**: each seed lands at ~1.2 A or ~2.8 A for boltz2, protenix2 and intellifold2,
+  at 25 steps and at 200, Euler and exponential alike - a three-seed median there is a coin. Leave it out of any
+  sampler comparison or give it ten seeds.
+- **Cost**: 25 denoiser calls where af3, protenix2, openbind0 and intellifold2 took 20 and opendde 16. The diffusion is
+  ~46 ms of a 189 ms 68-token af3 fold here.
+- OpenDDE's protein + DNA defect (above) is unchanged by the sampler (nucleic mean 0.74-0.79 A in every arm).
+- 🔴 **A PERFECT TEMPLATE IS THE ONE PLACE IT IS A LITTLE WORSE.** AlphaFold 3 on 5CAJ with its own crystal as the
+  template (cuda/af3/gate.py's case, seeds 42 / 1 / 2 / 3): Euler 25 0.136 / 0.171 / 0.153 / 0.138 A, exponential 25
+  0.182 / 0.188 / 0.237 / 0.252, Euler 200 0.142-0.209, exponential 200 0.158-0.225 with seed 42 at 0.488 (the gate's
+  recorded figure). rosettafold3 is 0.085-0.103 on every arm and boltz2 is spread 1.7-3.4 on every arm. Taken: ~0.06 A
+  on an answer the template already pins, against ligands that stop tearing.
+
+Raw rows: `/tmp/claude-1000/sch/finalA.txt`, `finalB.txt` and `fsum.py` on the A100 box (not kept).
+
+## chai-1's sampler: the exponential step on its own schedule (2026-10-17)
+
+chai-1 kept its own sampler when the lineage moved (above): chai-lab's schedule (sigma_max 80, rho 7, sigma_min 4e-4 at
+the N midpoints), its churn, and its step - by default one denoiser call a step, `x = noisy + 2 dt g1`, an Euler step at
+a scale of 2 (cuda/af3/src/sampler.cuh, `sampleChai`). It now takes the lineage's flags, and its default step is the
+exponential one, `x' = r^S noisy + (1 - r^S) D` with `r = sigma / tHat` and S its own 2, on ITS schedule.
+`--update=euler` is the sampler before (byte-identical), `--schedule=geometric` the lineage's schedule at its endpoints,
+`--step-scale=` another S, `--chai-second-order` two calls a step (the exponential Heun step, or with
+`--update=euler` chai-lab's two-call step as written).
+
+**Measured** with the lineage's decision run (cuda/af3: bench-sampler-geometry's seven systems x two seeds of bonds; 6MRR,
+1QYS, 5CAJ, 1TIM A, 1TIM A:B and 1BRS A:D x three seeds of CA RMSD), all at the page's 25 steps but the 200 rows. Medians;
+ligand = GOL, ATP and SEP, its mean and how many of six folds went past 0.15 A; clashes MolProbity's clashscore:
+
+| arm | mainchain | peptide | side chain | nucleic | ligand (mean, torn) | crystals | clashes |
+|---|---|---|---|---|---|---|---|
+| its own step (the default before) | 0.063 | 0.052 | 0.075 | 0.075 | 0.058 (0.092, 1/6) | 1.294 | 0.00 |
+| **exponential, its own schedule (the default)** | **0.034** | **0.019** | **0.052** | **0.048** | **0.055 (0.058, 0/6)** | **1.285** | **0.00** |
+| exponential, geometric schedule | 0.034 | 0.017 | 0.052 | 0.051 | 0.052 (0.055, 0/6) | 1.263 | 3.49 |
+| exponential, geometric, S 1.5 | 0.034 | 0.017 | 0.052 | 0.053 | 0.049 (0.053, 0/6) | 1.270 | 2.62 |
+| its own step, 200 | 0.033 | 0.017 | 0.052 | 0.049 | 0.043 (0.038, 0/6) | 1.296 | 0.00 |
+| exponential, geometric, 200 | 0.034 | 0.019 | 0.053 | 0.050 | 0.046 (0.065, 0/6) | 1.321 | 5.24 |
+
+- **The exponential step gives 25 steps its 200 steps' bonds** - mainchain and peptide halved and more, side chains
+  and nucleic acids to 200's - at the same cost, and no ligand tears; crystals level (inside the seed spread).
+- 🔴 **THE GEOMETRIC SCHEDULE ADDS ONE TO THREE CLASHES A FOLD, AND THAT IS WHY IT IS NOT chai-1's**: every protein
+  and ligand system on both seeds (one clash is 1.75 at these sizes), at 25 and at 200, for the same bonds the
+  exponential step gets on chai-1's own schedule. The lineage's decision run did not score clashes, so whether its own
+  geometric default pays the same is not known - its clash column is the thing to add.
+
+**And two calls a step buys nothing - on either update.** `--chai-second-order` now takes the exponential update too, as
+the exponential Heun step: `x' = r noisy + (1 - r) D1` (a point at the step's own level, where the second call evaluates
+it), `D2 = D(x', sigma)`, then `x = r^S noisy + (1 - r^S) (D1 + D2) / 2` - the one-call default exactly when D2 = D1, as
+chai-lab's two-call step reduces to its one-call form. `--update=euler --chai-second-order` is chai-lab's as written.
+At matched denoiser calls (the same protocol):
+
+| arm | calls | mainchain | peptide | side chain | nucleic | ligand (mean) | crystals | clashes (mean) |
+|---|---|---|---|---|---|---|---|---|
+| exponential, one call (the default), 25 steps | 25 | 0.034 | 0.019 | 0.052 | 0.048 | 0.055 (0.058) | 1.285 | 1.00 |
+| exponential, one call, 50 steps | 50 | 0.033 | 0.015 | 0.052 | 0.049 | 0.050 (0.044) | 1.290 | 1.62 |
+| exponential Heun, 25 steps | 50 | 0.034 | 0.018 | 0.052 | 0.048 | 0.053 (0.066) | 1.288 | 1.12 |
+| chai-lab's two-call step, 25 steps | 50 | 0.055 | 0.042 | 0.065 | 0.059 | 0.049 (0.052) | 1.292 | 0.87 |
+
+The exponential Heun step at twice the cost is the one-call step's fold; spent on 50 one-call steps the same calls do a
+little better on ligands and peptides. The second call is close to the first (D2 ~ D1), which is why the one-call
+form was chai-1's default already. Not taken; the flag keeps it.
+
+Raw rows: `/tmp/claude-1000/chai/run.txt`, `run2.txt`, `chai.sh` and `chai2.sh` on the A100 box (not kept).
+
+## A multistep update: measured, kept as an option, not taken (2026-10-16)
+
+`--update=multistep` on cuda/af3 is the exponential step on DPM-Solver++ 2M's extrapolation: the denoiser's previous
+prediction, moved into this step's frame by the same rotation and shift the augmentation gave the coordinates, blended
+as `D = (1 + w) d - w d_prev`, `w = h / (2 h_prev)` with `h` this step's log-sigma drop and `h_prev` the gap between the
+two levels the denoiser was evaluated at (churn makes those the raised levels, not the schedule's).
+`--multistep-below=<A>` applies it only at steps under that noise level and the plain exponential step above. Native
+only; the page does not have it.
+
+Seven models, the decision run's systems (7 x 2 seeds of bonds) and crystals (6 targets x 3 seeds). Ligand bond
+median / mean (A) and folds past 0.15 A of 6, then the crystals' mean CA RMSD:
+
+| model | exp 25 (default) | multistep 12 | hybrid 12, below 4 A | hybrid 12, below 8 A | hybrid 25, below 4 A |
+|---|---|---|---|---|---|
+| af3 | 0.042 / 0.062, 1 · 1.106 | 0.046 / 0.086 · **1.344** | 0.035 / 0.087, 1 · 1.105 | - | 0.037 / 0.034, 0 · 1.129 |
+| boltz2 | 0.071 / 0.073 · 1.439 | 0.103 / 0.124 · 1.181 | 0.066 / 0.110, 2 · 1.395 | 0.093 / 0.089, 1 · 1.437 | 0.070 / 0.061 · 1.458 |
+| intellifold2 | 0.049 / 0.052 · 1.592 | 0.044 / 0.043 · 1.660 | 0.035 / 0.068, 1 · 1.588 | 0.036 / 0.033 · 1.608 | 0.036 / 0.036 · 1.609 |
+| openbind0 | 0.059 / 0.065 · 1.375 | 0.038 / 0.043 · 1.414 | 0.055 / 0.091, 1 · 1.289 | 0.042 / 0.042 · 1.343 | 0.046 / 0.053 · 1.401 |
+| opendde | 0.053 / 0.082, 1 · 1.123 | 0.046 / 0.051 · 1.321 | 0.041 / 0.037 · 1.248 | 0.039 / 0.043 · 1.277 | 0.040 / 0.042 · 1.140 |
+| protenix2 | 0.047 / 0.049 · 1.565 | 0.042 / 0.038 · 1.624 | 0.042 / 0.035 · 1.462 | 0.042 / 0.033 · 1.510 | 0.043 / 0.037 · 1.585 |
+| rosettafold3 | 0.067 / 0.082 · 1.299 | 0.066 / 0.117, 2 · 1.331 | 0.079 / 0.097, 1 · 1.292 | 0.051 / 0.081, 1 · 1.326 | 0.066 / 0.070 · 1.388 |
+
+- **Everywhere, it moves chains.** Extrapolating at high noise, where the steps PLACE the chain, costs af3 0.24 A and
+  opendde 0.20 A of crystal RMSD at 12 steps. On af3 + ATP alone it looked like a clean win (12 steps 0.042-0.049 A
+  against the exponential's 0.16-0.29) - the ligand bench cannot see placement.
+- **Below 4 A it keeps them**: those steps are exactly the exponential ones above the threshold, so the crystals equal
+  the exponential's at the same count. Below 16 A af3's 6MRR slips (0.62 -> 0.98).
+- **At 25 steps below 4 A the ligand mean improves on all seven models** and no fold tears (exp 25 tore two), against
+  crystals 0.02-0.09 A worse - the same sign on all seven, each inside three seeds' spread. Not taken: the default's
+  ligands are already at the 200-step level.
+- **Twelve steps place the chain** (exp 12's crystals match exp 25's on six of seven; opendde's 6MRR is the one) - the
+  steps past twelve are spent settling small molecules. Hybrid 12 still loses ligand tails on boltz2, rosettafold3 and
+  openbind0, so the open question is the ALLOCATION: fewer steps above ~4 A and more below.
+
+Raw rows: `/tmp/claude-1000/sch/ms*.txt`, `hy*.txt` on the A100 box (not kept).
+
+### 🔴 ...and the steps cannot be reallocated for free: above 4 A places complexes, below settles ligands
+
+`--schedule-split=<A>:<K>` (cuda/af3) runs the geometric schedule as two segments, K steps from the top down to that
+level and the rest below it. With multistep below 4 A, against the exponential 25 (which spends ~12.5 steps above
+4 A):
+
+- **Four steps above place a 68-494 residue chain** (16 calls, 4 above: ligands and six crystals level on all seven
+  models) **and do NOT place an assembly**: a Boltz-2 GroEL ring sample broke to 23.6 A (every chain 12.5 A) where
+  exp 25's two were 2.9 / 3.4, and AF3's ring went 1.41 -> 2.28 on one sample. The small crystals cannot see it.
+- **Eight above hold the assemblies** (rings, 1JZ7 A:B, ring + GroES within a sample's spread of exp 25), but at 16
+  calls (8 below) ligand tails come back - two of twelve past 0.15 A on boltz2, opendde and rosettafold3 against 0, 1
+  and 0 - and at 20 calls (12 below) the ligands are level while the 1TIM dimer is ~0.1 A worse on four models
+  (af3 1.11 -> 1.25, boltz2 1.38 -> 1.45, protenix2 1.16 -> 1.31, opendde 1.18 -> 1.27).
+- So the default stays: 20% fewer calls is not worth a consistent 0.1 A on a dimer, and the exponential 25 is close
+  to the balance of the two halves. The flags stay for measuring; `/tmp/claude-1000/sch/sp*.txt` and
+  `/tmp/claude-1000/big/big2.txt`, `big3.txt` on the A100 box (not kept).
+
+## 🔴 AF3's MSA draw, every pass (2026-10-27)
+
+**AF3 draws `num_msa` (1024) of its alignment rows afresh on EVERY trunk pass, and this port drew them once per
+fold.** `_embed_process_msa` runs `shuffle_msa` (a Gumbel argsort over all of the batch's up to 16384 rows, query
+included, with that pass's key) and `truncate_msa_batch` inside each of the 11 passes. The featuriser here drew 1024
+rows once and every pass read the same ones - the "coverage limit" of "The MSA is capped at num_msa now" above.
+
+**It is what separated this port from stock AF3 on 8S83** - a complex whose small chain has ~10 rows in a 5630-row
+alignment, so one draw holds 1-4 of them and eleven see nearly all. Stock AF3 run with its shuffle FROZEN to one draw
+(`stock_fixed.py`, `~/af3_dockq_bench`) falls to exactly this port's rate. DockQ >= 0.23 counts a seed as docked:
+
+| 8S83, AF3 weights, 10 recycles, 5 samples, 200 Euler/Karras steps | docked | mean DockQ |
+|---|---|---|
+| stock AF3, seeds 1-60 | 40 of 60 | 0.49 |
+| stock AF3, its shuffle frozen to one draw, seeds 1-20 | 6 of 20 | 0.26 |
+| this port, one draw (before; `--msa-draw=once`), seeds 1-60 | 17 of 60 | 0.22 |
+| this port, a draw every pass (now), seeds 1-60 | 27 of 60 | 0.35 |
+
+2OOB, with the 16384-row crop (below) and the draw every pass: 19 of 20 docked, against 4 of 20 before either.
+
+🔴 **AND IT DOES NOT CLOSE 8S83's GAP ALONE: 27 of 60 against stock's 40 (Fisher p = 0.027).** Scored over all five
+samples of every seed, the rest is in two places and neither is the MSA. Stock's samples dock 130 of 300 and this
+port's 86 (seeds with any docked sample 41 against 33) - the trunk or the sampler - and stock's ranking picks a docked
+sample in 40 of the 41 seeds that have one where this port's picks one in 27 of 33 - the confidence head or the
+ranking score. Open; `~/af3_dockq_bench/8S83` holds both arms' samples.
+
+**What changed, in each place:**
+
+- **The featuriser exports AF3's whole pool**, not a draw from it: the paired block to `msa_size // 2`, the unpaired
+  block to what it leaves, 16384 rows at most (shared/af3/featurise/msa-features.js, cuda/featurise/msa.h). Drawn from
+  ALL of a deep alignment instead of AF3's crop, 2OOB's 44-residue chain docked 4 seeds of 20 where AF3's crop gives
+  12; the profile and deletion mean are still over every row, as AF3 computes them before its crop. `batch.numMsa`
+  carries the rows a pass reads (`--max-msa`, the page's depth; AF3's 1024).
+- **Every trunk draws its pass's rows before the MSA embedding** - `msaDrawRows` in shared/af3/msa-draw.js (the page),
+  its twin cuda/featurise/msa_draw.h (cuda/af3 `drawMsa`, metal/af3 `drawMsa`): one integer hash, so a seed names the
+  same rows on all three, pinned by test/msa-draw.test.js. On CUDA the draw is gathered on the host OUTSIDE the
+  captured recycle graph (a captured copy would replay one pass's rows for ever), and boltz2's and rf3's is_paired flag
+  reads whether the query was drawn from the device for the same reason.
+- **The query is drawn like any other row**, as AF3's Gumbel shuffle draws it (logit 0 for every unmasked row), so on
+  8S83 it is absent from ~80% of passes; the sequence still reaches every row through target_feat. A draw is sorted,
+  so the query is row 0 exactly when drawn, and is_paired follows it.
+- **Not drawn: chai-1** (af3-any-model's `if not chai1`, it takes the first rows) **and a batch read from an AF3 dump**
+  (no `numMsa`): their oracles were taken on the prefix (`AF3_DETERMINISTIC_MSA`), so they keep it and every oracle
+  gate is unchanged. `--msa-draw=pass|once|prefix` on cuda/af3, metal/af3 and `tools/gpu/fold.js` (`msaDraw` on
+  `foldBatch`); `once` is the old behaviour, the control arm.
+- **A trunk a seed** where the rows are drawn (`seedGroups` in cuda/af3/src/af3.cu and metal/af3/main.mm): stock AF3
+  runs its whole model once a seed, and one trunk for a `--seeds` job (or a job's `modelSeeds`) was the first seed's
+  draws under every seed. `--seeds=1,2` in one process now writes, sample for sample, the atoms `--seed=1` and
+  `--seed=2` write alone (8S83, all ten samples), and its best and its confidences carry their own trunk's contact map.
+  Where nothing is drawn every seed's trunk is the same trunk and it runs once, as before (the kitchen sink's two
+  seeds, within its baseline). Several GPUs keep one trunk and say so: their ranks are dealt out of it.
+
+**What it costs.** Nothing in the fold: the trunk is 1710 ms with a draw every pass and 1711 with one (8S83, 11
+passes), and the device holds the 1024 rows a pass reads as before - the pool never goes to the device. The pool is
+held as AF3 holds it, a byte a code, a byte a deletion count and a byte of mask (int8 / bool / int8 in features.py),
+and exported packed, an int32 a cell (`batch.msaPacked`, `packMsa`); before that it was 12 bytes a cell and 8S83's
+input 15 MB against 3.2. Now 5.4 MB, 2OOB's 7.6, and the featuriser's peak memory within 10% of a single draw's.
+
+🔴 **AND AF3 CLIPS A DELETION COUNT AT 127**, which this port did not: `safe_cast_int8` on `deletion_matrix`, after
+`deletion_mean` is computed from the true counts. Clipped here the same way, the profile's rows unclipped. A count
+past 127 reaches the model as `atan(d/3) * 2/pi`, 0.985 at 127 against 0.994 at 300, so it was small.
+
+### 🔴 ...and protenix2's trunk is random however shallow the alignment (2026-10-27)
+
+**Every other family's trunk is deterministic below 1024 rows** - AF3's shuffle then only reorders the rows, and the
+MSA stack is row-permutation-equivariant - but af3-any-model replays native Protenix's own inference randomness for
+protenix2 by default (model_registry `native_rng`, pipeline/protenix_rng.py), and this port ran the AF3 path instead:
+
+- **every pass reads a row COUNT drawn uniformly from 1 to the whole pool**, then that many rows - no `num_msa` cap
+  (the reference skips its shuffle-and-truncate: native's "test cutoff is 16384"). So a 50-row alignment differs pass
+  to pass, and a deep one reads half the pool on average;
+- **once a seed, at odds 0.4, MC dropout at 0.4 on the recycled pair's projection** (`Linear(LN(z_prev))` before it is
+  added), a fresh mask every pass.
+
+Now `msaNativeSample`, `recycleMcDropout` and `recycleMcDropoutOdds` in dialect.js, protenix2 alone: `msaNativeRows`
+and `mcDropout*` in shared/af3/msa-draw.js, twins in cuda/featurise/msa_draw.h (test/msa-draw.test.js pins both).
+CUDA and Metal read exactly the drawn rows, their MSA buffers sized for the whole pool and the recycle graph off for
+these folds; the page pads a pass up to a power of two with masked rows (a pipeline a row count, ~14 shapes rather than
+one a pass). The dropout is one integer hash of (pass key, pair row, channel) on every backend - CUDA's `mcDropoutK`,
+Metal's `af3_outer_sum`, the page's embedder - and a seed decides it, so protenix2 runs a trunk a seed always. Native's
+stream is Philox on the CUDA generator laid out by the SM count: its DRAWS cannot be replayed on a second backend; this
+is its distribution. Cost on 8S83 (5,590 rows): 4.4 s a trunk against AF3's 1.7 at 1024 rows - the uncapped rows.
+
+🔴 **AND IT FOUND A LATENT FLOAT16 OVERFLOW IN THE OUTER PRODUCT MEAN.** The sum over rows `P = L^T R` is held in T
+before the normaliser divides it; past ~4,700 rows of protenix2's 128-channel MSA on 8S83 one token's sums passed 65504,
+its pair row went NaN, and every row's attention to it NaN in the next block (bisected with the f32 path folding the
+same input). Unreachable while every trunk read 1024 rows. CUDA and Metal now hold that sum at 1024 rows' magnitude past
+1024 rows - the contraction scaled by 2^-k, the f32 projection by 2^k, k <= 4 - which is exact and moves nothing at or
+under 1024 rows (4,096 rows: pLDDT 68.99 before and after). The page sums a k step in f16 and accumulates in f32, with
+the count applied before its f16 output GEMM, so it has no such sum to overflow.

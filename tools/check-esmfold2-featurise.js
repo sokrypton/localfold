@@ -11,8 +11,8 @@
 // `ref_pos`, and it cannot be: both models draw a fresh conformer per residue
 // INSTANCE, so bond lengths and angles agree and torsions do not.
 //
-// 🔴 AND THE FEATURISER IS AF3's, WITH AN ADAPTER. src/esmfold2/featurise.js is
-// three differences from src/af3/featurise/featurise.js - a ragged atom layout, two
+// 🔴 AND THE FEATURISER IS AF3's, WITH AN ADAPTER. shared/esmfold2/featurise.js is
+// three differences from shared/af3/featurise/featurise.js - a ragged atom layout, two
 // different residue alphabets, and no terminal atom - so what this really
 // checks is that those three are the only ones. A second featuriser written
 // from scratch would pass this and would still be a second place for a CCD
@@ -21,7 +21,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import process from "node:process";
 
-import { featuriseForEsmfold2, languageModelInput } from "../src/esmfold2/featurise.js";
+import { featuriseForEsmfold2, languageModelInput } from "../shared/esmfold2/featurise.js";
 
 const ROOT = new URL("..", import.meta.url).pathname;
 const positional = process.argv.slice(2).filter((a) => !a.startsWith("--"));

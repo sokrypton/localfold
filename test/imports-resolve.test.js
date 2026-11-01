@@ -22,7 +22,7 @@ import { fileURLToPath } from "node:url";
  * thing.
  */
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const AREAS = ["src", "tools", "test", "web"];
+const AREAS = ["shared", "cpu", "webgpu", "tools", "test", "web"];
 const SKIP = new Set(["node_modules", ".git", ".ipynb_checkpoints"]);
 
 /**
@@ -108,7 +108,7 @@ test("every relative import resolves to a file that exists", () => {
  * blind to them and that blindness cost 129 stale references in one afternoon.
  * The `src/af3` reorganisation rewrote import SPECIFIERS and `.md` files and
  * left every `src/af3/<file>.js` written inside a code comment pointing at a
- * path that no longer existed - in `dialect.js`, in `transition-webgpu.js`, in
+ * path that no longer existed - in `dialect.js`, in `transition.js`, in
  * 75 files. A comment naming a module the reader cannot open is the
  * "doc that disagrees with itself" failure this repository keeps paying for,
  * and it is mechanically checkable.
@@ -127,7 +127,7 @@ test("every module path named in a comment exists", () => {
 
   const broken = [];
   let named = 0;
-  const PATH = /(?<![/\w-])((?:src|tools|test|web)\/[A-Za-z0-9_./-]+\.m?js)\b/g;
+  const PATH = /(?<![/\w-])((?:src|shared|cpu|webgpu|tools|test|web)\/[A-Za-z0-9_./-]+\.m?js)\b/g;
   for (const file of files) {
     for (const match of readFileSync(file, "utf8").matchAll(PATH)) {
       const named_path = match[1];
@@ -150,7 +150,7 @@ test("every module path named in a comment exists", () => {
  * **tools/write_manifest_module.py** without a single gate noticing.
  *
  * That file carries a `"module"` WRITE TARGET per family, each naming a file
- * under the old `src/reference/manifests` directory. After that directory became `src/bundles/` it
+ * under the old `src/reference/manifests` directory. After that directory became `shared/bundles/` it
  * would have written thirteen manifest modules into a directory nothing loads,
  * silently recreating the old tree while the live one went stale - and it is
  * the tool you run straight after `hf upload`, so the first time anyone noticed
@@ -173,7 +173,7 @@ test("every module path named in a comment exists", () => {
  * `src/core/`, `src/io/`, `src/panels/` are a DIFFERENT checkout's paths, named
  * here on purpose, and the first version of this rule reported them as missing.
  */
-test("every src/ path named in python, yaml, html or markdown exists", () => {
+test("every source path named in python, yaml, html or markdown exists", () => {
   // Other projects' own `src/` trees, named here on purpose and not ours to
   // resolve: py2Dmol's SIX directories, the AlphaFold 3 reference checkout,
   // Dawn's C++, and the two upstreams `tools/sync-*.py` vendor from.
@@ -191,9 +191,16 @@ test("every src/ path named in python, yaml, html or markdown exists", () => {
   // ours and went red on this very paragraph. A path preceded by `/` is
   // another checkout's - which is the convention that rule's own header
   // documents, and the accurate way to write it.
+  //
+  // 🔴 AND `src/parts/` IS py2Dmol's SEVENTH, ARRIVING THE SAME WAY cartoon's
+  // DID - which is the paragraph above happening a second time. It is now the
+  // LARGEST of them (embed.js, multi.js, plugins.js, selectpanel.js,
+  // sidechains.js), and docs/DESIGN-PY2DMOL.md cites those files because an
+  // audit of someone else's API is worth nothing without the line it was read
+  // from. Nothing of ours has ever lived at src/parts/.
   const FOREIGN = ["src/align/", "src/app/", "src/cartoon/", "src/core/", "src/io/",
-                   "src/panels/", "src/alphafold3/", "src/dawn/", "src/mpnn/",
-                   "src/py2Dmol/"];
+                   "src/panels/", "src/parts/", "src/alphafold3/", "src/dawn/",
+                   "src/mpnn/", "src/py2Dmol/"];
   // Its own walker: the shared one above is deliberately JS-only, and widening
   // it made the comment rule read python it has no exclusions for.
   const walkAny = (dir, out = []) => {
@@ -220,7 +227,7 @@ test("every src/ path named in python, yaml, html or markdown exists", () => {
   // 🔴 ONE DOCUMENT MAY NAME A PATH THAT MOVED, AND IT IS THE ONE THAT RECORDS
   // THE MOVE. docs/ARCHITECTURE.md's whole subject is the reorganisation -
   // "`src/evoformer/` WAS TWO THINGS", "after `src/reference/` became
-  // `src/bundles/`" - and rewriting those sentences to the new names would
+  // `shared/bundles/`" - and rewriting those sentences to the new names would
   // delete the history the document exists to keep. Every other file names the
   // tree as it is.
   //
@@ -233,7 +240,9 @@ test("every src/ path named in python, yaml, html or markdown exists", () => {
   // Matched as a PREFIX, because a narrative names both the directory and a
   // file inside it - `src/reference/manifests` and, quoting the line that
   // broke, `/src/reference/manifests/index.js`.
-  const FORMER = ["src/reference", "src/model", "src/evoformer", "src/triangle"];
+  // (src/ as a whole since it became shared/, cpu/ and webgpu/ - which the earlier src/reference, src/model,
+  // src/evoformer and src/triangle allowances are now inside of)
+  const FORMER = ["src"];
   const formerUsed = new Set();
   const former = (path) => FORMER.find(
     (prefix) => path === prefix || path.startsWith(`${prefix}/`));
@@ -252,12 +261,12 @@ test("every src/ path named in python, yaml, html or markdown exists", () => {
   // `/src/reference/http-tensor-store.js`, whose import sat inside a `try` that
   // prints `'unavailable: ' + error.message` - a fallback, reporting a moved
   // file as a missing measurement.
-  const PATH = /(?<![\w.-])\/?(src\/[A-Za-z0-9_./-]+\.m?js)\b/g;
+  const PATH = /(?<![\w.@-])\/?((?:src|shared|cpu|webgpu)\/[A-Za-z0-9_./-]+\.m?js)\b/g;
   // 🔴 AND A DIRECTORY IS A PATH TOO. `src/reference/manifests` without a file
   // on the end is how six documents and two tools name the manifest modules,
   // and `src/reference/` has not existed since the reorganisation. A rule that
   // requires a `.js` suffix reads those as prose.
-  const DIRECTORY = /(?<![\w.-])\/?(src\/[a-z0-9-]+(?:\/[a-z0-9-]+)*)\/?(?![\w./-])/g;
+  const DIRECTORY = /(?<![\w.@-])\/?((?:src|shared|cpu|webgpu)\/[a-z0-9-]+(?:\/[a-z0-9-]+)*)\/?(?![\w./-])/g;
   for (const file of files) {
     const text = readFileSync(file, "utf8");
     const relative = file.slice(ROOT.length + 1);
@@ -290,7 +299,7 @@ test("every src/ path named in python, yaml, html or markdown exists", () => {
       }
     }
   }
-  assert.ok(named >= 150, `only ${named} src paths named outside JS`);
+  assert.ok(named >= 150, `only ${named} source paths named outside JS`);
   assert.deepEqual(broken, [], `${broken.length} non-JS files name a module that is gone`);
 
   const revived = FORMER.filter((path) => existsSync(join(ROOT, path)));

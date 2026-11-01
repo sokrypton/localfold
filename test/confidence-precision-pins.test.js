@@ -25,8 +25,8 @@ const PINS = [
 ];
 
 const HEADS = {
-  "AlphaFold 3 (and its lineage)": "confidence-webgpu.js",
-  OpenDDE: "opendde-confidence.js",
+  "AlphaFold 3 (and its lineage)": "webgpu:confidence.js",
+  OpenDDE: "webgpu:opendde-confidence.js",
 };
 
 describe("the confidence heads' pairformer precision", () => {

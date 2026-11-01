@@ -101,7 +101,7 @@ reported numbers. Both now come from one file. The altLoc rule matters too:
 
 ## The widths, which are the whole reason the loader changed
 
-Every width in `src/af3/weights/weights.js` used to be a number typed next to the
+Every width in `shared/af3/weights/weights.js` used to be a number typed next to the
 tensor it describes. A declared width is right for exactly one checkpoint and
 silent for every other: this bundle loads through `pairChannels: 128` without
 complaint and dispatches every kernel over a third of its own tensor.
@@ -128,7 +128,7 @@ tensor. Only `v_projection`'s own shape says so.
 
 ## The dialect
 
-`src/af3/dialect.js`. OpenDDE and OpenBind-0 are both OpenFold3 by lineage and
+`shared/af3/dialect.js`. OpenDDE and OpenBind-0 are both OpenFold3 by lineage and
 **disagree in opposite directions on the two flags they share**, which is the
 whole reason that table exists:
 
@@ -266,7 +266,7 @@ template embedder share every name and differ only in width; the diffusion
 shares 51 of 53; the confidence head shares nothing usable.
 
 So the port is a second token space threaded through the atom layouts, which
-is what `src/af3/featurise/structural-tokens.js` and `tools/gpu/fold-opendde.js` are. The
+is what `shared/af3/featurise/structural-tokens.js` and `tools/gpu/fold-opendde.js` are. The
 bundle is the whole model: 481 tensors, 655.8 M parameters, upstream's own
 published `parameter_count` exactly.
 
@@ -399,7 +399,7 @@ now - a default is what let the two drift.
 
 🔴 **AND THE BLOCK-LEVEL DIFFERENTIAL IS WHAT FOUND IT, NOT THE FOLD.** The
 per-kernel checkers all passed. `tools/gpu/check-af3-block-any.js` runs a whole
-pairformer block against `pairformer-reference.js` THROUGH THE LOADER, so the
+pairformer block against `pairformer.js` THROUGH THE LOADER, so the
 widths are the bundle's: it read **1.293** for OpenDDE against 3.7e-3 for
 AlphaFold 3, which is the difference between "assembled wrongly" and "rounding".
 `tools/gpu/probe-opendde-kernels.js` then attributed it, by running each of the
@@ -513,6 +513,10 @@ and on 6MRR the whole ladder, one seed: 16 -> 0.9146, 25 -> 0.8925,
 (15.9 s against 26.3 on 6MRR, 29.6 against 43.2 on 1QYS). `OPENDDE_COUNTS`
 carries 16 as the preferred value; the AlphaFold 3 settings stay on the ladder
 so they remain selectable and comparable.
+
+🔴 **SUPERSEDED 2026-10-16**: those were Euler steps. On the exponential update OpenDDE folds 25 like every
+family and `OPENDDE_COUNTS` is gone - docs/AF3.md, "The default sampler" (its ligands 0.069 -> 0.053 A, crystals
+level).
 
 🔴 **AND THE SEED SPREAD IS WHAT MAKES THAT A RESULT.** Three seeds at 16 steps
 and two at 100: every 16-step fold has a better TM than every 100-step fold and
@@ -669,7 +673,7 @@ shapes. To get it back:
 on RMSD and TM cannot see a bond length.
 
 **The other three models must stay bit-identical**, and are the gate on any
-change to `src/af3/featurise/featurise.js`, which all of them share:
+change to `shared/af3/featurise/featurise.js`, which all of them share:
 
 | | |
 |---|---|

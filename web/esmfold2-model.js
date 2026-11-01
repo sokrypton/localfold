@@ -23,18 +23,18 @@
  * ignored, because a search that runs and is discarded is a minute of somebody
  * else's server for no reason.
  */
-import { HttpTensorStore } from "../src/bundles/http-tensor-store.js";
-import { readTensor } from "../src/weights/dtype.js";
-import { MODEL_BUNDLES, bundleBaseUrl, loadManifest } from "../src/bundles/manifests/index.js";
+import { HttpTensorStore } from "../shared/bundles/http-tensor-store.js";
+import { readTensor } from "../shared/weights/dtype.js";
+import { MODEL_BUNDLES, bundleBaseUrl, loadManifest } from "../shared/bundles/manifests/index.js";
 import {
   atomDecoderWeights, atomEncoderWeights, confidenceHeadWeights, denoiserWeights,
   featuriserWeights, trunkBlockWeights,
-} from "../src/esmfold2/weights.js";
-import { SHIM_PAIR_TENSORS } from "../src/esmfold2/language-pair-webgpu.js";
-import { EsmcTowerGpu } from "../src/esmc/tower-webgpu.js";
-import { SAMPLER_DEFAULTS, SAMPLER_PRESETS } from "../src/esmfold2/fold.js";
+} from "../shared/esmfold2/weights.js";
+import { SHIM_PAIR_TENSORS } from "../webgpu/esmfold2/language-pair.js";
+import { EsmcTowerGpu } from "../webgpu/esmc/tower.js";
+import { SAMPLER_DEFAULTS, SAMPLER_PRESETS } from "../webgpu/esmfold2/fold.js";
 import { churnFactors, noiseLevels, noiseSchedule }
-  from "../src/esmfold2/sampler-reference.js";
+  from "../cpu/esmfold2/sampler.js";
 
 /** The ten tensors an ESM-C block holds, under the names its exporter writes. */
 const BLOCK_LEAVES = ["attn_norm/scale", "attn_norm/offset", "qkv/weights",
@@ -83,6 +83,55 @@ export const ESMFOLD2_COUNTS = {
 export const ESMFOLD2_SAMPLER_MODE = "diffusion";
 
 /**
+ * 🔴 A LIGAND OR A MODIFIED RESIDUE TAKES AT LEAST 64 SCHEDULED STEPS (45 RUN),
+ * NOT THE CHECKPOINT'S 15 (11 RUN). A backbone is converged in eleven steps and
+ * a molecule made of per-atom tokens is not: biotin from its CCD code or its
+ * SMILES comes out with atoms 0.2-0.7 A apart and 18-20 "bonds" for its 17,
+ * on every seed - and so does the VENDOR's own ESMFold2 on the same checkpoint
+ * (esm 3.4.1, three seeds, 0.18-0.70 A), so it is the sampler and not either
+ * port. Scheduled steps, biotin, three seeds each on the WebGPU port:
+ *
+ * | scheduled (run) | biotin bonds | shortest |
+ * |---|---|---|
+ * | 15 (11) | 18-20 of 17 | 0.29-0.43 A |
+ * | 32 (23) | 19 of 17 | 0.51-0.70 A |
+ * | 64 (45) | **17 of 17** | **1.20-1.22 A** |
+ * | 200 (138) | 17 of 17 | 1.22 A |
+ *
+ * and the vendor at 64 and 200 is 17 of 17 at 1.23-1.80 A. Glycerol is placed
+ * the same at 11 and 45 (mean 1.42 A either way) and a phosphoserine is as good
+ * or better (bond ratio 0.949/0.985 at 11, 1.007/0.986 at 45, control 1.00).
+ * The cost is the sampler's: a warm 58-residue fold with a ligand 0.47 -> 0.93 s.
+ * python/localfold/worker.py applies the same floor to a job it is handed.
+ */
+export const ESMFOLD2_ATOMISED_STEPS = 64;
+
+/**
+ * ...and the same floor for a LONG input. Past ~2,048 residues the checkpoint's
+ * 15 scheduled steps (11 run) leave the backbone short: the denoiser's answer
+ * there is a shrunken chain, and 11 steps do not walk out of it. Copies of 6MRR
+ * on the 600M model, CA-CA outside 3.6-4.0 A (two seeds):
+ *
+ * | residues | 15 (11) | 25 (18) | 45 (32) |
+ * |---|---|---|---|
+ * | 2,040 | 0.3% | | |
+ * | 3,060 | 15.9% | **0.4%** | |
+ * | 4,080 | 91.5% | 9.4% | **0.1%** |
+ *
+ * and the sampler is a few percent of such a fold (11 steps 0.2 s against a
+ * 31 s trunk at 3,060; the wall clock the same at 15 and 25). Euler's update,
+ * not the exponential one, which is WORSE there - a shorter backbone at every
+ * count (docs/EF2FAST.md, "Long inputs"). python/localfold/worker.py and
+ * cuda/featurise/standalone.cpp apply it too.
+ */
+export const ESMFOLD2_LONG_RESIDUES = 2048;
+
+/** The scheduled step count a fold runs: the dial's, raised to the floor above for per-atom tokens or a long input. */
+export function esmfold2StepsFor(asked, { atomised = false, residues = 0 } = {}) {
+  return atomised || residues > ESMFOLD2_LONG_RESIDUES ? Math.max(asked, ESMFOLD2_ATOMISED_STEPS) : asked;
+}
+
+/**
  * How many steps a preset ACTUALLY runs, which is not the number in its name.
  *
  * 🔴 `max_inference_sigma` DROPS EVERY SCHEDULE ENTRY ABOVE 256 AND PREPENDS
@@ -97,6 +146,7 @@ export function actualSteps(preset) {
   const schedule = noiseSchedule({
     steps: settings.steps, sMax: settings.sMax, sMin: settings.sMin,
     p: settings.p, sigmaData: settings.sigmaData, maxSigma: settings.maxSigma,
+    schedule: settings.schedule,
   });
   return noiseLevels(schedule,
     churnFactors(schedule, settings.gammaMin, settings.gamma0)).length;
@@ -201,7 +251,7 @@ export function loadEsmfold2Weights(onProgress,
     // 🔴 AND IT CARRIES THE TWO HALVES A LAZY LOADER NEEDS. `source` hands the
     // bytes over undecoded so the GPU can dequantise them, and `decode` is the
     // synchronous host fallback a getter can call. See
-    // src/esmfold2/weights.js: without these the loaders behave exactly as they
+    // shared/esmfold2/weights.js: without these the loaders behave exactly as they
     // did, and with them the denoiser's 1.17 s of int5 decoding and 880 ms of
     // narrowing both stop happening on the main thread.
     const read = (name) => foldStore.tensor(name);
@@ -260,7 +310,7 @@ export function loadEsmfold2Weights(onProgress,
       confidenceWeights: confidence,
       language: {
         manifest: towerManifest.languageModel,
-        // ...what the language band in src/esmfold2/cost.js is priced on, taken
+        // ...what the language band in webgpu/esmfold2/cost.js is priced on, taken
         // from the store that already counted it rather than written down.
         megabytes: towerStore.totalBytes / 1048576,
         shared: towerShared,

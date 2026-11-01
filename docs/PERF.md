@@ -24,7 +24,7 @@ track a few hundred rows at a time. The grid attention takes it happily - q, k,
 v and the gate are indexed `((row * N + i) * HEADS + head)`, row outermost, so
 a row chunk is a contiguous byte range and binding that SLICE makes the
 existing indexing address it with **no kernel change at all**. `run` in
-src/af3/trunk/pairformer-block-webgpu.js accepts a slice for this, and
+webgpu/af3/trunk/pairformer-block.js accepts a slice for this, and
 `encodePairTrack` has a `rowChunk` that defaults to the whole track.
 
 🔴 **AND IT STOPS AT THE TRIANGLE, FOR TWO REASONS.** Its intermediates are
@@ -96,7 +96,7 @@ output IS before pricing its weights.
 
 🔴 **MEMORY HAS TWO HALVES AND THE BENCHES ONLY EVER SHOWED ONE.** The GPU
 allocator's snapshot cannot see a `Float32Array`, and until
-`src/runtime/device-memory.js` existed nothing counted the buffers created
+`webgpu/runtime/device-memory.js` existed nothing counted the buffers created
 outside the allocator - which are most of them by size. Host heap comes from
 `tools/gpu/probe-memory.js` (it forces a collection first, or the reading
 carries 300 MiB of garbage); device memory from `memorySnapshot(device)`,
@@ -216,7 +216,7 @@ confirm with `bench-trunk.js`.
 🔴 **ACTIVATIONS CAN BE STORED TWO HALVES TO A WORD, AND `pack2x16float` IS
 CORE WGSL.** Unlike the `f16` TYPE, it needs no device feature, so a tensor
 halves on hardware that cannot compute in half precision at all.
-`src/runtime/storage.js` is the whole mechanism and `execution.allocate`'s
+`webgpu/runtime/storage.js` is the whole mechanism and `execution.allocate`'s
 fourth argument is how a caller asks. A 59-residue fold at 512 MSA rows went
 **603.0 -> 396.4 MiB** across four tensors, for 0.043 pLDDT, and got 4.5%
 faster where the reader re-reads (the flash kernel's key and value); where it
@@ -394,6 +394,748 @@ Caching the transformer's bind groups and scratch tensors bought nothing
 measurable against that - the stage sat at 45-46 ms either way - so the next
 thing there is chaining the stages ON THE DEVICE, not another cache.
 
+## The 2026-09-26 speed pass, before and after
+
+Every row is a page-default fold under `LOCALFOLD_STOCK_FLAGS=1` on the A100 -
+what an NVIDIA visitor's browser gets - original `8d6bb47` against the pass's
+last commit, in clean worktrees, two folds each (first, then warm). AF3-lineage
+models: 25 diffusion steps, 3 recycles; OpenDDE 16 steps. "59" is the
+59-residue fixture alignment; "255" is 5CAJ chain A from its sequence alone.
+pLDDT is identical to three decimals in every row, and the AF3 row, boltz2 and
+rosettafold3 are byte-identical folds.
+
+| model | size | first fold | warm fold | warm speedup |
+|---|---:|---:|---:|---:|
+| AlphaFold 3 | 59 | 4.27 -> 1.94 s | 1.46 -> 1.11 s | 1.32x |
+| AlphaFold 3 | 255 | 8.77 -> 4.50 | 6.03 -> 3.64 | **1.66x** |
+| boltz2 | 59 | 5.65 -> 2.37 | 1.72 -> 1.23 | 1.40x |
+| boltz2 | 255 | 13.47 -> 5.76 | 7.17 -> 4.73 | 1.52x |
+| protenix2 | 59 | 5.17 -> 2.55 | 2.26 -> 1.68 | 1.35x |
+| protenix2 | 255 | 17.56 -> 10.04 | 13.53 -> 9.03 | 1.50x |
+| rosettafold3 | 59 | 4.39 -> 2.04 | 1.48 -> 1.07 | 1.38x |
+| IntelliFold-2 | 59 | 9.49 -> 4.56 | 6.32 -> 3.38 | 1.87x |
+| IntelliFold-2 | 255 | 63.88 -> 27.66 | 60.37 -> 26.42 | **2.29x** |
+| OpenDDE | 59 | 7.55 -> 3.46 | 4.30 -> 2.45 | 1.76x |
+| OpenDDE | 255 | 38.62 -> 20.39 | 34.96 -> 19.12 | **1.83x** |
+| ESMFold2 (with its head) | 255 | 6.26 -> 5.14 | 5.50 -> 4.57 | 1.20x |
+| AF2 monomer | 255 | 1.76 -> 1.73 | 1.37 -> 1.36 | (untouched) |
+
+rosettafold3 at 255 from a single sequence is refused by the geometry gate on
+BOTH commits, so it has no row. The first-fold column gains most on the AF3
+lineage because of the f32 weight-decode fix below (~2 s a first fold without
+`shader-f16`), which a flagged or Apple device never paid. On Colab's T4 (flags
+on) the same series measured 1.1-1.3x a trunk pass; see below.
+
+🔴 **THE AF3 TRUNK HAD THE SAME HABIT, AND IT WAS 44% OF A PASS.** Five stages
+- embedder, template, MSA stack, pairformer, distogram - each took the pair as
+a Float32Array, uploaded it, computed and read it back, and a readback is a
+drain. At 255 tokens under stock flags a trunk pass was 1050 ms of wall for 587
+of GPU; the four small stages did ~80 ms of GPU work in ~420 ms of wall. Two
+more drains hid beside the readbacks: the MSA stack waited on the device after
+EVERY block to release weights (the pairformer stopped doing that long ago), and
+an awaited `popErrorScope` in Dawn resolves when the submitted work does, so
+each stage's validation check was a drain too.
+
+The pair, MSA and single now stay on the device from the embedder to the
+distogram (`keepOnDevice` / `pairBuffer` / `msaBuffer` / `singleBuffer`, the
+pairformer's existing convention), the template term and boltz2's double add
+are device adds, and validation is collected and settled once. Same kernels,
+same f32 adds, so it is held to BIT-IDENTICAL output: all seven AF3-lineage
+models give the same PDB byte for byte against the parent commit, the trunk
+seam oracle reads identically on both trees, and the peak is unchanged to the
+byte. Stock flags, AF3 int5, `bench-trunk.js --msa=128 --passes=4`:
+
+| tokens | pass before | after |
+|---:|---:|---:|
+| 68 | 184 ms | **114** |
+| 255 | 1040 | **692** |
+| 400 | 2631 | **1841** |
+
+A page-default fold (25 steps, 3 recycles) at 255 tokens: first 11.45 -> 7.59
+s, warm 5.84-6.04 -> 4.58-4.66. 🔴 **AND THE PER-STAGE TIMES STOP MEANING THE
+STAGE'S COST**: the embedder, template and MSA stack now read 2-9 ms because
+nothing waits for them, and their GPU work lands in the pairformer's wait. Only
+`whole` is a cost. Not measured on an M2, whose unified memory never paid the
+bus half of this.
+
+🔴 **AND A PASS ENDED IN TWO DRAINS, NOW ONE.** The pairformer read back its
+pair and single, THEN the distogram packed its weights and contact bins,
+submitted, and read back again. The head is prepared before the pairformer runs
+(nothing it packs depends on the pair's values), the pairformer takes
+`deferReadback` - no final window wait, no settle, no readback - and the pass
+closes with one submit copying the logits, contacts, pair and single out
+together. Byte-identical on all seven models and on both seam oracles.
+Interleaved against the parent, three rounds, no overlap: **113-115 -> 107 ms**
+at 68 tokens and **703-714 -> 676-680** at 255.
+
+🔴 **AND THE CONFIDENCE HEAD WAS THE SAME SHAPE, AND WORSE IN PROPORTION.**
+Embed, a four-block stack and the heads handed the pair along as host arrays -
+the trunk's pair uploaded, the embedded pair read back and uploaded, the stack's
+read back and uploaded - so at 255 tokens the head was 282-326 ms of wall for
+~43 ms of GPU inside a fold. The embedded pair and single now reach the stack
+as buffers (`deferReadback`), the heads read the stack's buffers, and the only
+readback is the heads' outputs. `returnRepresentations` reads the embedded pair
+and the stack's output back from those same buffers, for
+`check-af3-confidence.js`, the one reader. Byte-identical PDB, pLDDT, pTM and
+ipTM on all seven models; `check-af3-confidence.js` and the confidence oracle
+(af3, boltz2's re-embedding head) identical on both trees.
+`bench-confidence.js --calls=7`, stock flags, three interleaved rounds:
+
+| tokens | head before | after |
+|---:|---:|---:|
+| 68 | 68-70 ms | **41-42** |
+| 255 | 266-269 | **89-91** |
+| 400 | 600-616 | **213-215** |
+
+🔴 **AND WITHOUT `shader-f16` THE FIRST FOLD PACKED 920 MiB OF WEIGHTS ON THE
+CPU.** `residentBlockOnDevice` and the zero-gate packer in
+diffusion-transformer.js each returned undefined unless the precision
+was f16 - the same refusal the pair track had until its fix, one stack later -
+so on a device with no `shader-f16`, which is every stock Chrome on NVIDIA, the
+diffusion transformer's weights fell back to the host SILENTLY: `hostPack`
+1965 ms, 1593 of it `difftx.block.resident` (756 MiB) and 363 `difftx.zerogate`
+(162 MiB), against **10 ms** for the same fold with the developer flags. The
+decoder has taken an f32 destination all along; both now pass one. Byte-
+identical on all seven models. First fold, 59 residues with an alignment, stock
+flags: af3 3.97 -> 1.77 s, boltz2 5.22 -> 2.09, protenix2 4.43 -> 2.11, rf3
+4.00 -> 1.82, if2 6.84 -> 4.28, opendde 5.91 -> 3.26 (both columns include the
+trunk and head work above). **Read `hostPack` under `LOCALFOLD_STOCK_FLAGS=1`
+before believing it is 12 ms** - the row in CLAUDE.md that says so was measured
+behind the flag that provides f16.
+
+🔴 **AND ON COLAB'S T4 THE SAME SERIES IS WORTH LESS, WHICH WAS PREDICTED.**
+The Colab runtime passes both developer flags, so its T4 has `shader-f16` and
+subgroup matrices and the f32 packing fix above never applied there. Measured on
+a T4 through the Colab CLI, `8d6bb47` against `e5c02ba`, interleaved: a trunk
+pass **317-377 -> 229-266 ms** at 68 tokens and **3775-3893 -> 3354-3584** at
+255; a page-default fold at 255 tokens 31.6 -> 21.2 s first and 21.9 -> 19.3
+warm (one run each on a two-CPU VM). The T4's GPU is ~5x slower than the A100's,
+so the round trips removed are a smaller share of each pass. At 68 tokens the
+whole-fold timings were inside that VM's noise and are not claimed.
+
+🔴 **AND THE T4 IS NOT DETERMINISTIC AT 68 TOKENS, ON THE ORIGINAL CODE.** The
+same 68-token fold (the 59-residue alignment, 25 steps, 3 recycles) returned two
+different PDBs across runs of `8d6bb47` - sha256 `e5f2e0f9...` and `9ff98f83...`,
+pLDDT identical to six digits - and the new code returned the same two. At 255
+tokens both commits agreed byte for byte, and the A100 has never shown it in
+either configuration. By this repository's own rule a run-to-run difference is a
+memory bug - a race or a read of memory nobody wrote - and not precision; the
+M2's was a missing bounds check. Not chased yet.
+
+🔴 **AND BETWEEN RECYCLES THE PAIR NOW STAYS ON THE DEVICE TOO.** Each pass
+read its pair, single and logits back and the next uploaded the pair again as
+its "previous" - ~80 MiB over the bus and a drain per pass at 255 tokens, for a
+page that reads only the contact map per pass. The trunk takes
+`previousPairBuffer`/`previousSingleBuffer` and a `readback` selection and can
+keep its outputs (`keepOutputs`); the fold reads the contact map per pass and
+everything on the LAST pass, so every consumer after the loop gets the host
+arrays it always did. Pass one's zero "previous" is cleared on the device
+instead of a 33 MiB host upload. `recycleDeltas` becomes opt-in like the
+distances (`--recycle-deltas`), because comparing passes needs every pass on
+the host; a tolerance still reads every pass. Byte-identical on all seven
+models; trunk reuse still hands its trunk to a retry. AF3 int5, stock flags,
+255 tokens: warm fold 4.00-4.12 -> **3.66-3.74 s**.
+
+### The second night: a vector GEMM that owns adjacent columns, and a distogram read 96 times
+
+🔴 **THE VECTOR SPLIT'S GEMM PUT SIXTEEN LANES ON ONE BANK.** It staged the
+source panel k-major at a stride of 64 words, so the sixteen lanes writing one
+row's sixteen k all hit the same bank, and a lane's four columns were strided
+by 16, so every operand read was a scalar. A lane now owns four ADJACENT
+columns (one vec4 weight read), and the panel's stride is 68. Each output still
+sums over k in order from zero, so it is **bit-identical** - 0 differing against
+the old kernel, and the same pLDDT to every digit on OpenDDE, IntelliFold-2,
+protenix2 and ESMFold2 at 255. Isolated, A100 stock flags, 65,025 rows, ms wide
+/ down: 384 channels 12.4 / 7.6 -> **10.5 / 6.0**, 512 13.2 / 8.4 -> 11.4 / 6.5.
+Without the padding it is 12.7 / 7.1. Tried and slower: 4 x 8 and 8 x 4 a lane,
+8 x 8 on a 128 x 128 block, the source panel as vec4. A 32-deep step is 2-5%
+faster at 16.9 KiB, over the floor, so not taken. The widening pass's 64 x 128
+block goes: with this layout 64 x 64 wins both.
+
+🔴 **THE DISTOGRAM HEAD RE-READ THE PAIR ONCE PER BIN.** Bins outer, channels
+inner: 96 x 384 x 2 loads a pair on OpenDDE. Channels outer with an accumulator
+a bin sums in the same order - **0 differing of 6.3 M** - and is 35.8 -> 2.2 ms
+at 255 tokens (8.7 -> 2.2 for AF3's 128 x 64). 🔴 The trunk's `distogram` stage
+reads ~1.2 s on OpenDDE and that is NOT this kernel: the pairformer defers its
+last window's wait (`deferReadback`), so its GPU work lands in whichever stage
+waits next.
+
+And OpenDDE's confidence `s1`/`s2`, two host matmuls of 495 x 449 -> 384 at 255
+residues, run on the device (19123 -> 18842 ms warm, f32 against f64
+accumulation: pLDDT moves in the 11th digit; oracle PAE 8.56e-7, PDE 1.12e-6).
+
+Warm 255-residue folds, stock flags, against the table above's last column:
+OpenDDE 19.12 -> **17.87 s**, IntelliFold-2 26.42 -> **24.92**, protenix2 9.03 ->
+**8.6**, ESMFold2 4.57 -> **3.99** (with the confidence-head commit before it).
+
+🔴 **THREE KERNELS RAN A THREAD A ROW OF SOMETHING LARGE**, found by reading
+`groupsPerPass` off `--profile-batched`. `embed.project-tokens` and
+`embed.project-single-init` were a thread a TOKEN - 4 workgroups at 255 tokens,
+12 and 5 ms a trunk pass at OpenDDE's 384 x 384 - and are a thread an output
+channel now (0.1 ms). `template.embed` was a thread a pair row reading its row
+of the 384-wide pair at a 384-float stride and recomputing each normalised
+value once per output channel: **14.3 -> 0.64 ms a slot**, four rows staged a
+workgroup. All three sum in the same order and are bit-identical.
+
+🔴 **AND THE HANDOFFS AROUND THE SAMPLER STILL WENT THROUGH THE HOST.** OpenDDE's
+expander uploaded the trunk pair the trunk had just read back (100 MB at 255
+residues), and its diffusion conditioning read its pair back (125 MB at 495
+structural tokens) for the transformer to upload on the first step. ESMFold2's
+confidence head read back the trunk pair and the relative encoding (64 MiB
+each) to upload them, and added the bond term on the host. All are device
+buffers now - OpenDDE 17.81 -> 17.37 s warm, ESMFold2 3.96 -> 3.56 - and the
+cost is peak memory: +121 MiB and +127 MiB at 255, pair-sized and so quadratic,
+which is why ESMFold2 keeps the host copies where a memory ceiling cannot spare
+them (the page sets none).
+
+🔴 **THE TRIANGLE'S OUTPUT PROJECTION WANTED ITS OWN TILE.** Its accumulator is
+a vec2 where the input projection's is a vec4, so at the same 32 x 32 tile it
+held half the registers: at 32 x 64 it is 4.34 -> 3.26 ms at 384 channels and
+0.56 -> 0.44 at 128, bit-identical, where the input projection gets slower.
+`triangleProjectOutColumns` (ampere prior, 64), and ONLY where the kernel
+accumulates in f32: with f16 accumulators it is no faster and rounds
+differently (relRMS 2.13e-3 against f32, where 32 x 32 is 1.70e-3), which moved
+all six AF3-lineage signatures at the spec floor - the one gate arm that runs
+this kernel with `shader-f16` - until it was confined. The template stack and
+ESMFold2's trunk had never read `trianglePairProjectTile` at all and ran the
+32 x 16 default; they take both now. 🔴 The first cut left the vec2 accumulator
+array sized by the INPUT tile - WGSL clamps an out-of-range index into the
+array, so it compiled, ran and returned a wrong tensor, and the chain-geometry
+gate is what refused the fold (CA median 6.7 A).
+
+Warm 255-residue folds at the end of the night, stock flags: AF3 3.64 -> **3.5
+s**, IntelliFold-2 26.42 -> **24.0**, OpenDDE 19.12 -> **16.88**, protenix2 9.03 ->
+**8.6**, ESMFold2 4.57 -> **3.33**. Every change is bit-identical except the two
+that move f64 host accumulation to f32 on the device (OpenDDE's s1/s2 and
+ESMFold2's head projections, both at 1e-8 of pLDDT).
+
+🔴 **AND AF2, WHICH THE FIRST PASS NEVER TOUCHED.** Profiled one block at 255
+residues and 128 rows under stock flags: 22.67 ms, every kernel at 4-7 TMAC/s.
+Three changes, all bit-identical (monomer checksum 8703532 at 5CAJ-255,
+multimer -394634, the stock and portable gate signatures unmoved):
+`attentionProjectRowsPerLane: 8` - the q/k/v/gate projection's tile was an M2's
+register budget, and here 8 rows a lane is 1.912 -> 1.375 ms
+(bench-attention-project.js); `triangleProjectOutColumns` reaching AF2's
+triangle too (0.498 -> 0.426 ms each); and `opmVectorOutput` - the outer
+product mean's output projection carried four pairs a workgroup and re-read the
+whole 1024 x 128 weight matrix for them, ~8.5 GB of L2 traffic a block, and as a
+64 x 64 vector GEMM (bias-first, cells ascending, scaled at the result, which is
+the old kernel's arithmetic exactly) it is 2.06 -> 1.32 ms. Block 22.67 ->
+**20.72 ms**, warm fold 1.37 -> **1.25 s**. Re-swept and left alone:
+`opmProjectOutputPairs` (4 still best under stock: 2 is 3.38 ms, 8 is 2.25).
+Then its contraction the same way (`opmVectorContract`): one workgroup a PAIR
+re-read both residues' slices, and as a GEMM over rows (i, a) and columns (j, b)
+- both operands already K-major in the vector projection's layout, blocks cut on
+whole rows of `i` - it is 1.60 -> 1.22 ms, bit-identical including at odd MSA
+depths (37 and 33 rows). Block **20.22 ms**, warm fold **1.23 s**.
+
+🔴 **DEAD ENDS ON `grid.attend`, BOTH MEASURED IN THE TRUNK** (AF3 int5, 255
+tokens, stock flags, 10 blocks profiled): four keys a group with one rescale -
+1.25 exps a key instead of 2, 10 accumulator operations instead of 16, not
+bit-identical - moved it **31.0 -> 28.6 ms**; two queries a lane, halving the
+staged k/v reads per multiply-add and bit-identical, moved it **30.9 -> 30.5**.
+So neither the arithmetic nor the shared-memory reads bind it; both reverted.
+A third: staging each key chunk's BIAS block coalesced (each lane is a
+different query, so the per-key bias reads are N floats apart across a warp)
+made it 35.1 -> 40.7 ms - each lane walks its own bias row, so the lines are
+reused from cache anyway, and the 8 KiB tile costs occupancy. Reverted.
+And `tri.contract` as the split transition's 256-lane 64 x 64 vector GEMM
+(bit-identical, k ascending) was no faster than the 8 x 8 kernel: AF3 at 255
+10.34 -> 10.74 ms over six blocks, IntelliFold-2 39.1 -> 38.2. Reverted.
+
+`perAtomConditioning` (host, run twice a fold - the target-feat encoder and the
+diffusion head) was seven passes over `rows x channels` and three temporary
+arrays; fused into one pass a row with the same operations in the same order it
+is **0 of 1,069,760 floats different** (Object.is) and 32.5 -> 12.8 ms at 255
+tokens in node.
+
+🔴 **AND FOUR MORE KERNELS WERE A THREAD A ROW OVER A WIDE ROW**, found by
+listing every pass under 2,500 workgroups at more than 0.25 ms. Each is now
+four rows staged a workgroup (or, for the MSA logits, one normalisation shared
+by every head), and each keeps its sums in the same order - bit-identical on
+every model folded, alignment included:
+
+| kernel | model, stock flags, 255 tokens | before | after |
+|---|---|---:|---:|
+| `template.output` | IntelliFold-2, a trunk pass | 62.8 ms | **1.7** |
+| `msa.attention-weights` (now logits + softmax) | IntelliFold-2, four MSA blocks | 15.4 | **2.7** |
+| `opm.project` | IntelliFold-2, four MSA blocks, 128 rows | 10.8 | **0.9** |
+| AF2 `opm.contract` (vector GEMM, above) | a block | 1.60 | **1.22** |
+
+`pair-logits` and `grid.bias` are the same shape at ~1% of an IntelliFold-2
+fold and were left: they already normalise each row once, and what is left is
+uncoalesced reads.
+
+🔴 **DEAD END: THE DIFFUSION TRANSFORMER'S ATTENTION, SEVERAL QUERIES A
+WORKGROUP.** Its value step runs on 48 of 256 lanes, each walking all 255 keys
+in turn, so five queries of one head per workgroup fill it (240 lanes) and share
+the key staging and the barriers - bit-identical, since each query keeps its
+lane layout and its sum order. `attend` 7.37 -> 6.55 ms a denoiser call at 255
+tokens (2: 6.99, 3: 6.96, 4: 6.64) and ~20 ms of a 3.46 s fold, for ~130 lines
+of shader. Staging the values as well, to shorten each lane's chain of global
+loads, was WORSE (8.75). The chain is what binds it, and shortening it means
+splitting the key sum across lanes, which changes its order. Not taken.
+
+🔴 **AF3's OUTER PRODUCT MEAN AS TWO GEMMs: `opm.contract` 195.9 -> 46.6 ms.**
+The fused kernel had each lane walk every sequence for its cells, a chain of
+2 x SEQUENCES dependent loads, and at 1024 MSA rows it was the trunk's largest
+kernel. The operands are AF2's layout exactly (`left[s][i][c]`), so AF2's vector
+contraction builds a `[pair][cell]` intermediate for a block of whole rows of i
+(16 MiB), and `createAf3OpmVectorOutputShader` projects it with AF3's own
+epilogue - bias first, cells ascending, DIVIDED by `1e-3 + count` (boltz2's
+bias-after-norm too). **Bit-exact on all six models folded with an alignment**
+(`diff-fold-coords.py` against `--tune=opmVectorContract=false`, 448/448 atoms,
+and OpenDDE through fold-opendde.js). AF3 int5, 255 tokens, 1024 rows, stock
+flags: trunk GPU 762.9 -> 631.3 ms, a steady pass 936 -> 803, +17 MiB. A 64 MiB
+intermediate is another 1.5% for 48 MiB and was not taken.
+🔴 Tried after it and reverted: staging `grid.attend`'s bias in workgroup
+memory (108 -> 137 ms - the per-lane bias rows are cache-resident already), and
+a flash-style softmax with one maximum per 32-key chunk (108 -> 99 ms, 1% of a
+pass, and not bit-identical).
+
+## Memory: what a large fold holds, and what it no longer does
+
+🔴 **FIVE CHANGES, ALL BIT-IDENTICAL, AND THE ONE THAT IS NOT FREE IS SIZE-GATED.**
+Peaks, stock flags, A100:
+
+| fold | before | after |
+|---|---:|---:|
+| OpenDDE, 5CAJ 255 (495 structural tokens) | 5440 MiB | **2349** |
+| AF3, 757 residues | 3724 | **3304** |
+| ESMFold2, 502 residues | 2647 | **2031** |
+| AF3, 5CAJ 255 (a small fold) | 1980 | 1980 (unchanged, same speed) |
+
+- **Buffers released when their last reader has run, not at the end.**
+  OpenDDE's refined pair after the confidence head's pair init has copied it
+  and its diffusion pair conditioning at sample-done (5440 -> 4970);
+  ESMFold2's confidence input copies after that head's pair init (-492 MiB at
+  502). Submitted work keeps what it binds, so a release after the submit is
+  safe; the rule is never to release what an UNSUBMITTED encoder names.
+- **The grid attention a third of its rows at a time** (`gridChunked`): q, k, v
+  and the gate were the only reason a pair track held five pair-sized
+  tensors. Row r's attention reads only row r's q/k/v, so its chunk tensors
+  pack into scratch the triangle is done with, under a (first row, count)
+  uniform. Four tensors.
+- **The triangle a quarter of its channels at a time** (`compact`): a[h] and b[h]
+  are read only by channel h's contraction, so projectAB and the contraction
+  walk channel groups with a and b held for one group in a small fourth
+  buffer, and the grid takes quarters of its rows. Three tensors and a small
+  one.
+- **A large fold releases its resident weights** whatever the device prior
+  says: keeping them is a fixed upload saved for a fixed amount of memory
+  held through the peak, and memory pressure grows with the fold. OpenDDE
+  4432 -> 2349 MiB for +2.7% warm.
+
+All three size-dependent choices share one gate, a largest pair tensor of 128
+MiB (`GRID_CHUNK_MIN_BYTES`), because below it they cost time and save nothing
+that matters: chunking AF3's grid at 255 tokens was 2.5% slower with the peak
+unchanged, and releasing its weights +9.5%. 🔴 And the host path for
+ESMFold2's confidence inputs was measured and rejected: the same -492 MiB at
+502 for +1.7 s, where releasing the device copies early costs nothing.
+
+What is left under stock flags is mostly arithmetic: the pair track's f32
+kernels now run at 9-17 TFLOPS on a 19.5 TFLOPS card (`grid.project` 16.6,
+`tri.project` 14, the vector split 13-15, `tri.project-out` ~12, `grid.attend`
+and `tri.contract` ~9), and OpenDDE's trunk at 255 is 86% GPU-busy.
+
+### A small fold streams its trunk weights too, and keeps the codes
+
+🔴 **FREE AT 255 TOKENS ONCE THE REPLAY WAS ONE DISPATCH A BLOCK.** Streaming a
+small AF3 fold's weights cost +20% warm when it was first tried, and none of it
+was the decode's arithmetic:
+- every replayed decode was its own `queue.submit` (~800 a fold) - now they
+  queue and ride at the head of the next submit;
+- every TENSOR was its own dispatch (~12,000 a fold), each behind a barrier
+  because all of them write one buffer - now one dispatch replays a whole
+  recording, a workgroup per 512 slots of one tensor (`int5-replay` 132 -> 88
+  ms GPU a fold);
+- and the codes were dropped at the end of every fold and re-uploaded by the
+  next. A small fold now keeps them (`streamTrunkWeights`), an int5 fifth of
+  the decoded weights.
+
+AF3 5CAJ-255, stock flags, warm fold / peak: decoded **1.84 s / 1980 MiB**,
+trunk streamed **1.84 s / 1530**, trunk and sampler streamed 1.93 s / 1072 (not
+taken: +4%). OpenDDE 59 residues with an alignment **2889 -> 1708 MiB**, 931 ->
+955 ms. Bit-exact on af3, boltz2, rf3, protenix2 and OpenDDE. 🔴 What the decode
+still costs is not its instructions: `value_at`'s dynamic vector index selected
+instead, one word read instead
+of two bytes, 256 lanes, longer runs - all moved `int5-replay` by nothing.
+Forcing every tensor down the contiguous path (a wrong answer, for timing) was
+67 ms, so transposes are ~22 and the rest is a floor this kernel shape has.
+
+🔴 **AND A STREAMED RING IS SHARED, SO A FILL THAT SKIPS ITS ZEROS MUST NAME
+ITS LAYOUT.** Bit-exact under stock flags, this moved boltz2's 5CAJ
+self-template 0.837 -> 1.623 A under the developer flags, and bisecting by
+label put all of it on `w.tri`: the pairformer packs its triangles interleaved
+for the matrix projection and the MSA stack blocked, both fills leave their
+layout's zero regions unwritten, and one ring buffer served both. The layout is
+in the triangle's variant now, and 0.837 comes back to the digit.
+
+**ESMFold2's ESM-C tower keeps its codes too.** Its resident blocks were ~890
+MiB of decoded halves; a kept block now holds its recorded int3 decode and
+replays each matrix into one persistent buffer a name (a fresh buffer a block
+was +113 ms of creates and zero-fills - this allocator destroys on release).
+59 residues, stock flags, repeat fold / peak: **0.84 s / 1798 MiB -> 0.88 s /
+957**, same fold. The +40 ms is 144 decodes on the loop's critical path, since
+the tower waits for each block.
+
+🔴 **DEAD ENDS FROM THE SAME NIGHT, SO NOBODY RETRIES THEM.**
+- **The diffusion transformer's weights as packed halves without shader-f16**
+  (`array<u32>` read through `unpack2x16float`, the f16 path's own buffer):
+  AF3 5CAJ-255 peak 1530 -> 1071 MiB, but +3% warm and stock numerics move
+  (pLDDT 27.354 -> 27.356). Streaming the sampler's weights reaches 1072 MiB
+  for +4% and is bit-identical, so this buys nothing.
+- **The int5 decode kernel itself.** A replay of one diffusion block (8.26 M
+  elements, 13 tensors) is 0.12 ms: ~70 G elements/s, ~280 GB/s written, a
+  fifth of the card. Most of those tensors are TRANSPOSES, so either the reads
+  or the writes scatter and every element pays four runtime divides; forcing
+  them all contiguous (a wrong answer, for timing) is only 95 G/s. Runs of
+  64 / 128 / 512 / 1024 slots a workgroup: 49 / 61 / 70 / 69 G/s. A tiled
+  transpose is what would move it, and it is only worth building if the
+  sampler's weights are ever streamed by default.
+- **ESMFold2's SwiGLU at a smaller row tile** (it stays at 4): tile 2 is
+  slower, 309 -> 331 ms of sampler at 59 residues, and tile 1 only equals 4.
+- **The pairformer's single transition as the vector split** (the pair
+  track's two GEMMs, 64 rows a workgroup, residual added in place): SLOWER,
+  AF3 trunk 12.7 -> 21.3 ms of single transition at 68 tokens and 13.3 -> 21.1
+  at 255, and not bit-identical (20 of 574 atoms at 0.001 A). With `n` rows the
+  GEMMs launch 12-96 workgroups; the fused kernel's per-row weight reads come
+  out of L2, so the "one workgroup a row" starvation is not the cost it looks.
+
+### A single cold run, which is what most visitors make
+
+`LOCALFOLD_STOCK_FLAGS=1` now reaches `tools/fold-in-page.py` too (tools/cdp.py
+drops the same two flags gpu-chrome.mjs does). The page, AF3 int5, 58
+residues, weights from the local server, dev report phases after the click:
+
+| phase | cold | warm equivalent |
+|---|---:|---:|
+| weights (loopback) | ~1000 ms | - |
+| Trunk 1/2 | 471 | 139 (pass 2) |
+| first denoiser call ("Folding") | 464 | ~19 |
+| step 1 / step 2 (page draws the first frames) | 185 / 84 | ~19 |
+| last step (confidence head) | 187 | - |
+
+Of the ~1.1 s that only a cold fold pays, the shader cache is worth ~340 ms (a
+`--keep-profile` second visit, weights phase subtracted). What was tried:
+- **The transformer's resident weights filled inside `warm`**, which a fold
+  calls as its trunk starts: taken, the first call 464 -> 210 ms, but trunk 1
+  grows 471 -> 705 because the fill competes with a cold trunk rather than
+  hiding behind it - net ~20 ms. Kept, because it is where the work belongs.
+- **The int5 upload by `mappedAtCreation`** (straight into the code buffer, or
+  into a MAP_WRITE staging buffer copied on the device): 24 blocks' fill is
+  185 ms of host time, 109 of it writeBuffer at 1.65 GB/s, and neither route
+  beat it - creating and unmapping fresh mapped memory costs what the call did.
+  Not taken; the section above on the weight upload already said so.
+- **What would move a cold run by seconds is the DOWNLOAD** - 265 MiB for AF3,
+  started only when Fold is pressed (and after the model-terms dialog) - and
+  both levers are decisions rather than kernels: start it on intent (a pasted
+  sequence), or re-shard so the trunk's tensors arrive first and the trunk
+  runs while the diffusion shards are still on the wire (today every shard but
+  the first two mixes trunk, sampler and confidence tensors).
+
+🔴 **AND THE COMPILES WERE SERIAL IN TWO PLACES, BOTH TAKEN.**
+- **Inside a stage.** Five AF3 stages and four ESMFold2/OpenDDE heads awaited
+  each pipeline as they asked for it (`compiled[name] = await get(...)` in a
+  loop), so the embedder's five were 69 ms busy for 69 ms summed. Asked for
+  together (`settleAll`): AF3 6MRR first fold 1.36-1.41 -> 1.33 s, ESMFold2
+  1.32-1.33 -> 1.30-1.31.
+- **Between stages.** The embedder, template embedder and MSA stack each
+  compiled when the trunk reached it. `Af3TrunkGpu.warm` runs the three with
+  `compileOnly` - the same keys, returning before any input is read or
+  anything allocated - as the fold starts, beside the target features: 1.33 ->
+  1.27-1.29 s, still 137 pipelines (a mismatched warm would add some) and the
+  same pLDDT to every digit.
+- **And the template embedder during the download.** It is the largest of those
+  three and the only one whose keys do not name the alignment's depth, so the
+  page's store-open warm (`warmTrunkPipelines`) compiles it from shapes-only
+  weights beside the pairformer. Page, cold: trunk pass 1 705 -> 501-547 ms,
+  first sampler step at 2090-2129 ms after the click against ~2250.
+
+## A Colab T4, which is what a free user folds on
+
+Measured through the Colab CLI (`colab new --gpu T4`, the notebook's own setup,
+bundles fetched from their pinned Hugging Face revisions). 🔴 **THE COLAB
+RUNTIME'S CHROME IS OURS, SO IT HAS BOTH DEVELOPER FLAGS** (`tools/cdp.py`):
+a free user gets `shader-f16` AND the T4's subgroup matrices, unlike a visitor's
+own browser. Every number here is that configuration, `main` against
+`opus-55-opt`, interleaved.
+
+| fold, seconds | `main` | branch |
+|---|---:|---:|
+| AF3 68 residues, warm | 1.42-1.86 | **1.25-1.31** |
+| AF3 255, warm | 8.45-9.72 | **7.26-7.93** |
+| AF3 68, first fold on a fresh VM (driver cache cleared) | 16.9-17.1 | **14.3-14.6** |
+| AF2 59, whole first run | 11.5 | **1.7** |
+| ESMFold2 255, warm, same work | 15.2-15.7 | 15.3-15.7 once the row tile went back to 8 |
+
+🔴 **THE T4's DERIVED DIFFUSION GEOMETRY WAS A COIN TOSS.** The occupancy probe
+feeding `diffusionSplitK`, `atomRowTile` and `diffusionTokenTile` read 2048,
+512, 2048, 8, 4, 512 workgroups across six identical runs (logged at the
+transformer's compile), and the denoiser call at 255 tokens came out 132 to 198
+ms with it. A clock warm-up and a third round did not steady it (4 to 2048
+again, fold weights loading beside it). The turing prior now pins all three -
+measured values and tables in `webgpu/runtime/device-profile.js` - and the call
+holds at 126-133 ms. A CORRECT width would not have helped: ~640 workgroups
+says "no split" at 255 tokens and that was the slow arm; these GEMMs stream
+weights and want the workgroups for latency.
+
+🔴 **ESMFold2's ROW TILE OF TWO WAS AN A100 WIN AND A T4 LOSS** (language model
+211 -> 290 ms at 255 residues): a smaller tile re-reads the weights per row tile,
+which a 4 MB L2 at 320 GB/s pays for. It is the ampere prior's now.
+
+🔴 **A FIRST FOLD ON A FRESH COLAB VM IS ~13 s OF SHADER COMPILATION, AND A NEW
+LENGTH PAYS IT AGAIN.** 151 pipelines for a 68-residue AF3 fold compile in 12.85 s
+one at a time on the T4 (~85 ms each; the NVIDIA driver caches them in
+`~/.cache/nvidia/GLCache`, which is why only the VM's first run shows it), and
+the 2-vCPU VM gets little from compiling them concurrently. Nearly every shader
+bakes the token count, so a 70-residue fold after a 68-residue one is 16.6 s
+cold again. De-duplicating the 34 that differ only in unused constants bought
+nothing: Tint strips the dead constants and the driver cache already dedupes
+identical SPIR-V.
+
+🔴 **WHAT DOES PAY IS COMPILING WITHOUT UNROLLING FIRST - "TIERED" LOOP
+BOUNDS, THE TURING PRIOR.** The NVIDIA compiler unrolls every loop whose bound
+is a constant; `withRuntimeLoopBounds` in webgpu/runtime/pipeline-cache.js makes
+each `i < CONST` bound opaque (`+ (arrayLength(&x) >> 31u)`, always zero), which
+compiles about 12x faster and runs up to 1.5x slower. `runtimeLoopBounds:
+"tiered"` hands out that kernel first and compiles the unrolled one behind it,
+swapping it in on a later request. 🔴 **THE UPGRADES MUST WAIT FOR A QUIET
+SPELL**: started beside the fold they took one of the VM's two cores and
+ESMFold2's first run went 4.5 -> 6.7 s, so they now start only after 2 s with no
+new pipeline request, one at a time. T4, driver cache cleared per run,
+`c944041`, `runtimeLoopBounds=false` against tiered:
+
+| | off | tiered |
+|---|---:|---:|
+| AF3 68, first fold (two rounds) | 12.2, 11.5 | **9.6, 6.6** |
+| AF3 68, folds 2-4 | 1.23-1.72 | 1.93-2.28 |
+| AF3 255, first fold | 20.6 | **15.7** |
+| AF3 255, folds 2-3 | 7.5, 7.4 | 9.9, 8.1 |
+| AF2 59, whole run (ms) | 5992 | 6324 |
+| ESMFold2, whole run (s) | 4.65 | 4.58 |
+
+The later folds are slower because the upgrades are still compiling: ~55
+kernels have loops worth unrolling, and the unrolled ones are exactly the slow
+compiles, so the queue takes most of a minute. Taking the most-requested kernel
+first (`6e5a5cd`) did not shorten it - eight back-to-back folds after a cold
+first fold of 9.4 / 7.9 / 6.6 s all stayed at 1.8-2.3 s. A visitor who reads the
+first result for a minute before folding again gets the unrolled kernels. That trade is chosen for the single cold run,
+which is most of what a free user does. A token-count-independent shader set is
+still the only thing that would make a second LENGTH free. 🔴 **AND CAPPING
+HOW MANY COMPILE AT ONCE DOES NOT HELP**, although a cold fold's compiler is
+busy 6.8 s where the same 118 opaque kernels compile in 4.9 s one at a time: at
+a cap of one the first fold is 8.7-10.8 s, at two 6.7-8.5, unlimited 6.6-7.2
+(five rounds each, interleaved, driver cache cleared). The fold overlaps the
+compiles with its weight download, which a queue gives up.
+
+🔴 **THE TRIANGLE PROJECTION ON THE T4's MATRIX UNITS PAYS AT AF3's 128
+CHANNELS**, which `TRIANGLE_PROJECT_MATRIX_MIN_CHANNELS` (192, calibrated on an
+A100) declines. `bench-trunk.js --tokens=255 --profile`, two rounds interleaved:
+a trunk pass 2179 -> 1909 and 2236 -> 1981 ms, `tri.contract` halving with it. A
+whole 5CAJ fold is 7.73-7.98 -> 7.52-7.63 s; 6MRR's pLDDT moves 85.718 -> 85.726
+with N-CA/CA-C/CA-CA medians unchanged to 1e-4. 🔴 **AND THE TURING PRIOR
+DOES NOT SET IT, BECAUSE A COLD FOLD PAYS MORE THAN A WARM ONE SAVES**: its
+matrix kernels are slow to compile. A first 68-residue fold with the driver
+cache cleared, six rounds interleaved: 7.5-11.1 s (median 9.5) with it against
+6.7-8.6 (median 8.2) without. 🔴 A T4's cold fold scatters by 1.5x in one arm
+(7.0 and 10.8 s back to back), so two rounds decide nothing here.
+`gridAttendMatrix`, which the turing prior DOES set, is the same trade and is
+kept: off, the cold 68-residue fold's median is 7.0 s against 7.8 (six rounds),
+but the prior's own measurement is 8-12% of a 300-token trunk with 512 rows,
+which a single fold of that size wins back. Every other matrix knob a T4
+resolves is read by AF2's or the shared kernels, not by AF3's. Swept
+beside it and not taken: the pair-transition split at 128 channels (3-4% of the
+trunk) and the matrix grid projection (`grid.project` -10%, ~1% of the trunk).
+
+🔴 **A NEW PROTEIN LENGTH NO LONGER RECOMPILES EVERY KERNEL** (tiered devices,
+i.e. the turing prior). Nearly every kernel bakes the token count in as
+`const L: u32 = <n>u;`, so each new length was ~100 driver compiles. The cache
+now builds each kernel's first pipeline GENERIC: every module `u32` constant
+that code reads only in expressions is read from a uniform in bind group 1
+instead (`lengthPlan` in webgpu/runtime/pipeline-cache.js; constants derived from
+them are inlined), and kernels whose text is otherwise identical share that
+pipeline at any length. The length-specific kernel still compiles behind the
+fold as the tiered upgrade. Refused, and compiled per length as before: a
+constant that sizes an array or a workgroup, feeds another constant the
+planner does not inline, or reaches a float (`x / f32(C)` folds exactly; a
+run-time division is not exact) - which is what keeps every fold BIT-IDENTICAL
+(pLDDT and gyration to the last digit at 68/70/74 residues, AF2's checksum,
+ESMFold2's atom checksum, OpenDDE's pLDDT, `test:cache` clean with tiered
+forced). The diffusion transformer's `${rows}u` literals became `${ROWS}`
+(`TOKENS` at one sample) so its kernels qualify; `check-difftx-samples.js`
+still reads identical.
+
+AF3, A100, tiered forced, four lengths in one process: 97 / 4 / 4 / 4 compiles,
+against ~100 each before. A Colab T4, driver cache cleared, one browser, the
+first fold at each length (three rounds):
+
+| residues | before | after |
+|---|---:|---:|
+| 68 (fresh VM) | 11.5-11.6 s | 9.0-10.7 |
+| 90 | 7.6-8.8 | **3.6-3.7** |
+| 120 | 8.6-10.0 | 6.2-7.0 |
+| 150 | 9.7-10.1 | 6.6-6.7 |
+
+A repeat at 120 is 4.4 s, so a new length now costs ~1 s over a warm fold
+where it cost ~5. What still compiles per length: attention kernels with a
+`var<workgroup> logits: array<f32, L>`, the single attention's split count
+(it moves with length), and the confidence head's per-length TM table.
+🔴 `tools/gpu/fold.js` used to start its pipeline warm BEFORE applying
+`--tune`, so a `--tune` arm that changes a kernel warmed the prior's kernels;
+it applies `--tune` first now (`--tune-json` never had the problem).
+
+### A Colab L4 had no prior; it has one now
+
+Colab Pro's step up from the T4 is an L4 (Ada, `architecture: "lovelace"`, 12
+vCPUs), which took DEFAULT_TUNING. `--prior=NAME` (gpu-chrome) answers with
+another architecture's prior, so both measured priors were tried on it; two
+rounds interleaved, driver cache cleared, seconds:
+
+| L4 | default | ampere | turing | ampere + tiered + AF2 flash off the units |
+|---|---:|---:|---:|---:|
+| AF3 68, first fold | 3.7 | 4.0-4.2 | 2.5 | **2.56** |
+| AF3 68, later folds | 0.61 | 0.59-0.65 | 1.1-1.2 | 1.06 -> 0.67 by fold 8 |
+| AF3 255, later folds | 3.3-3.4 | **2.9-3.0** | 4.5-4.9 | 3.97, 3.75, then 2.97 |
+| AF2, whole run | 3.7-3.9 | 3.85-3.9 | 1.9 | **2.43-2.47** |
+| ESMFold2, repeats | 0.80 | **0.62-0.64** | 0.90 | 0.62-0.64 |
+
+The `lovelace` prior is the last column. The tiered upgrade queue now runs a
+quarter of the CPU's threads wide (one on a T4's two vCPUs, as measured there;
+three on the L4's twelve), without which the later folds sat on the slow
+kernels for most of a minute.
+
+The G4 (RTX PRO 6000 Blackwell, 48 vCPUs, `architecture: "blackwell"`) has the
+same shape at half the times - ampere's settings win warm (AF3 68 0.30 s a fold
+against 0.49; 255 0.85 against 1.18), the tiered compile wins AF3 255's first
+fold (1.77 s against 2.76) and AF2's cold run (1.55 against 2.09) - so it takes
+the lovelace prior. The table is in webgpu/runtime/device-profile.js.
+
+🔴 **AND THEN IT BECAME EVERY DEVICE'S DEFAULT.** A Colab A100 (the ampere
+prior's own architecture, 12 vCPUs) shows the same trade: AF3 68 first fold
+4.05-4.09 -> 2.48-2.59 s, AF3 255 5.0-5.4 -> 3.8, AF2's whole run 3.9 -> 2.4,
+with later folds 0.53-0.57 -> 0.99-1.08 until the upgrades land. Four NVIDIA
+parts, one answer, so `runtimeLoopBounds: "tiered"` is in DEFAULT_TUNING and
+AF2's flash attention is off in the capability layer and the ampere prior;
+lovelace and blackwell are ampere's prior again. Bench and profile tools run
+tiered OFF (gpu-chrome.mjs), because a few passes would time the first-build
+kernels; `--tune-json={"runtimeLoopBounds":"tiered"}` puts it back.
+`test:portable`'s AF2 signature moved -1309830 -> -1315603 on the A100, which
+is the flash-attention kernel and nothing else (the Colab A100 gave the same
+pair with the knob on and off); the other seven and all of `test:stock` and
+`test:spec-floor` are unchanged. An M2 inherits the default too and has not
+measured it.
+
+🔴 **A COLAB TPU CANNOT RUN LOCALFOLD.** WebGPU reaches hardware only through a
+Vulkan/Metal/D3D12 driver and a TPU has none, so Chrome on a TPU VM gives
+WebGPU nothing but SwiftShader - the VM's 24 host CPU cores, with the TPU idle.
+`LOCALFOLD_SWIFTSHADER=1` (gpu-chrome.mjs, with `--allow-software`) asks for
+exactly that: Chrome's GPU process sat at ~13 cores for 15 minutes and had not
+finished `probe-tuning.js`, let alone a fold. Using a TPU means a JAX backend,
+not a faster WebGPU. Colab also offered an A100 (the ampere prior's
+own architecture) and a G4; H100 was refused on Pro, and neither was measured.
+
+### ESMFold2's sampler and ESM-C tower were starved at a row tile of eight
+
+The shared vectorised linear (`webgpu/esmc/block.js`) tiles eight rows by
+256 columns, so a token-sized projection at 768 or 1152 channels ran 15 to 60
+workgroups a pass on a card that holds thousands. Each output sums k in the same
+order at any row tile, so two rows is more workgroups for the same bits - pLDDT
+identical to every digit at every length below, `test:stock` and
+`test:spec-floor` signatures unchanged. Stock flags, A100, warm fold:
+
+| | 59 residues | 255 | 510 |
+|---|---:|---:|---:|
+| sampler, tile 8 -> 2 (`esmfold2TokenRowTile`) | 499 -> 309 ms | 618 -> 437 | 845 -> 679 |
+| language model, tile 8 -> 2 (`esmcRowTile`) | 145 -> 114 | 163 -> 128 | |
+| whole fold | 0.88 -> 0.65 s | 3.30 -> 3.08 | |
+
+Tile 1 is the same as 2 and 4 is between. ESMFold2's trunk is not this class:
+its `tri.project` runs at ~90% of f32 peak and the wide transition at ~70%.
+
+## The split pair transition, for a device with no matrix units
+
+🔴 **NO MATRIX UNITS MEANT NO SPLIT, AND NO VISITOR HAS MATRIX UNITS.** The
+split transition (normalise, widen, contract-with-the-gate) was built only on
+the staged matrix GEMM, so `splitTransitionConfig` answered `false` wherever
+`deviceMatrixConfig` was null - every stock browser, NVIDIA and Apple alike -
+and the wide models ran the FUSED kernel, whose row tile halves as the channels
+double. OpenDDE's 384-channel transition was **291 ms of a 558 ms** trunk pass
+at 68 tokens, ~3 TFLOPS on the kernel AF3's 128 channels runs at ~15.
+
+`createVectorGemmShader` in transition.js is a register-tiled vector
+GEMM for exactly the split's two projections: 64 x 64 blocks on 256 lanes, 4 x 4
+a lane, 8 KiB of workgroup memory, f32 accumulation, the SwiGLU applied as
+`down` stages its operand - the same bindings and uniform as the matrix GEMM, so
+the encoder is shared. Scratch is f16 where the device has `shader-f16` and f32
+where it does not. Pair-transition GPU ms per trunk pass, A100, stock flags:
+
+| channels | model | 68 tokens | 255 tokens |
+|---:|---|---:|---:|
+| 128 | AlphaFold 3 | - | 91.3 -> 148.9 (loses) |
+| 256 | protenix2 | 56.7 -> 46.8 | 597 -> 519 |
+| 384 | OpenDDE | 291 -> 98 | - |
+| 512 | IntelliFold-2 | 639 -> 160 | **8395 -> 1601** |
+
+So `VECTOR_SPLIT_MIN_CHANNELS` is 192: the four 128-channel models stay on the
+fused kernel and are byte-identical. IntelliFold-2's trunk pass at 255 tokens
+goes **12.9 s -> 6.7 s**. Accuracy is the fused kernel's: OpenDDE's trunk
+against af3-any-model on the f32 bundle reads `trunk_out_pair` **1.57e-6 fused
+and 1.59e-6 split**; IntelliFold-2's oracle is identical on both trees;
+test:template's 5CAJ figures match to three decimals; pLDDT moves in the
+seventh decimal (test:stock re-recorded for those three). With the developer
+flags nothing changes - the matrix split is untouched, byte for byte.
+
+🔴 **AND ITS NORMALISE WAS OVER THE 16 KiB FLOOR AT 512 CHANNELS, WHICH THE
+CHOOSER NEVER PRICED.** Eight staged rows of 512 f32 is 16736 bytes with the
+scratch. `splitNormalizeBytes` prices it now and stages four (or two) rows where
+eight do not fit; eight stays wherever it already fitted. 🔴 **AND AF2 FAILS THE
+FLOOR UNDER STOCK FLAGS ON THE OLD CODE TOO** - `block:opm:project-output-
+residual` stages 17424 bytes without f16 - which test:spec-floor cannot see,
+because it runs with the flags on. 🔴 **FIXED**: `opmProjectOutputPairs` takes
+the largest pair count at or below the prior's that fits the device's workgroup
+storage (2 at the floor, where the prior's 4 does not fit). Stock flags at the
+floor, the monomer went from "total use of workgroup storage (17424 bytes) is
+larger than the maximum allowed (16384 bytes)" to checksum -1308439 - the same
+as without the ceiling - and the multimer folds at -394634 both ways.
+
+🔴 **THE DIFFUSION HEAD'S FIRST STEP OF A FOLD READ ITS PAIR CONDITIONING BACK
+AND UPLOADED IT TWICE.** The encoder's and the transformer's per-fold caches
+were keyed on the host ARRAY the conditioning returned, so the first call
+drained the device to copy `tokens^2 x 128` floats back (32 MiB at 255 tokens),
+then the transformer uploaded it for its pair norm and the encoder for its
+static build. The conditioning takes `outputs.pair` now and the head keeps that
+buffer for the fold; both caches key on its handle and bind it. Same values,
+so bit-identical on all seven models. First step at 255 tokens, AF3, stock
+flags: conditioning 77.9 -> ~47.5 ms, atom-encoder 85.3 -> ~69.6, transformer
+62.3 -> 34-48 - about 75 ms a fold. 🔴 **AND `x.buffer !== undefined` IS NOT
+"x IS ON THE DEVICE"**: a Float32Array has a `.buffer` too, and OpenDDE hands
+the head a host array, so the first version bound an ArrayBuffer and died. The
+test is `instanceof GPUBuffer`.
+
+🔴 **AND THE CONFIDENCE HEADS' PIN SWITCHED THE SPLIT OFF WITH THE MATRIX
+KERNELS.** The heads pin `pairMatrixKernels: false` because the matrix kernels
+are f16 and move pLDDT and PAE by thousands of times their envelope - and the
+same flag gated the split transition, so OpenDDE's 384-channel head and
+IntelliFold-2's 512-channel one ran the fused kernel. `splitTransitionConfig`'s
+`f32Only` gives a pinned stack the VECTOR split with f32 scratch, which is f32
+arithmetic throughout. OpenDDE's confidence oracle on the f32 bundle, before ->
+after: pLDDT 1.13e-7 -> 1.11e-7, PAE 8.46e-7 -> 8.93e-7, PDE 9.73e-7 ->
+9.92e-7; protenix2's unchanged at 1.31e-7 / 2.02e-7 / 1.99e-7. The 128-channel
+heads are below the width threshold and byte-identical. OpenDDE at 255 residues:
+the confidence stage 2295 -> 1651 ms, warm fold 20.09 -> 19.44 s.
+
+🔴 **DEAD END: THE TRIANGLE OUTPUT PROJECTION AS THE SPLIT'S VECTOR GEMM.**
+`tri.project-out` runs ~9.7 TFLOPS where the projections beside it reach ~15,
+so it was rebuilt on the vector-GEMM shape - 64 x 64 blocks, 256 lanes, 4 x 4
+a lane, a projection and a gate accumulator a cell, 16 KiB of staging. It was
+SLOWER everywhere, stock flags: AF3 at 255 tokens 52.3 -> 57.1 ms a pass,
+OpenDDE at 68 38.1 -> 44.1, IntelliFold-2 at 255 575 -> 625. The existing
+kernel multiplies the projection and its gate as one packed vec2, which is
+more useful work an instruction than two scalar accumulators, and four staged
+tiles halve the occupancy the two-tile transition GEMM gets. Reverted; a faster
+version would keep the vec2 pairing and stage less.
+
 🔴 **AN ATTENTION'S OUTPUT CAN LIVE IN ITS NORMALISED INPUT, AND THAT IS TRUE
 IN BOTH MODELS.** The shape is the same everywhere: normalise into a tensor,
 project it into q/k/v/gate, attend into a fresh one, project out. The
@@ -435,11 +1177,11 @@ archive is 28 ms for a 2 MB alignment.
 
 🔴 **QUANTISED WEIGHTS CAN BE DECODED ON THE GPU, AND IT IS 3.7x.** The path to
 a resident f16 buffer used to be: decode int5 into float32 on the main thread,
-narrow the lot into a Float16Array, upload. `src/weights/quantised-upload.js`
+narrow the lot into a Float16Array, upload. `webgpu/weights/quantised-upload.js`
 uploads the CODES instead - an eighth of the bytes - and decodes them into the
 destination with one dispatch per tensor. 437 ms of host packing becomes 119 of
 compute for the diffusion transformer's 24 blocks, and a real page fold went
-**3.31 s to 2.30**. `src/af3/weights/device-weights.js` is the shared entry point;
+**3.31 s to 2.30**. `webgpu/af3/weights/device-weights.js` is the shared entry point;
 docs/AF3.md has the per-packer table.
 
 🔴 **AND BIT-IDENTITY WAS THE FIRST THING MEASURED, NOT THE LAST.** JavaScript
@@ -459,7 +1201,7 @@ the host arm WARM and flattered the GPU by 234 ms of work it had itself caused.
 
 🔴 **AND `Float16Array.set` FROM A Float32Array IS NOT A MEMMOVE.** 8M elements
 measure 9.4 ms through `set`, 6.1 through a plain loop and 4.4 unrolled eight
-ways - bit-identical. `writeInto` in src/weights/float16.js is that loop, and
+ways - bit-identical. `writeInto` in shared/weights/float16.js is that loop, and
 it leaves same-element copies to `set`, which really is a memmove. On real
 shapes it is 26% of the narrowing rather than 52%: a block is forty tensors
 averaging 200k elements, so per-call overhead is a much larger share than the
@@ -497,8 +1239,8 @@ new one is its output. The previous is read exactly once, into
 `embed.previous-msa-normalized`, by the first dispatch of the encoder; every
 later dispatch writes the new one. So they could be one buffer, ordered within
 the encoder, for 29.5 MiB of 365. It is not taken because it is an ownership
-change through TWO recycle loops (`src/af2/evoformer/input-embedder.js` and
-`src/af2/multimer/input-embedder.js`) for 8%, and `fold-af2.js`'s checksum
+change through TWO recycle loops (`webgpu/af2/evoformer/input-embedder.js` and
+`webgpu/af2/multimer/input-embedder.js`) for 8%, and `fold-af2.js`'s checksum
 (-2047044 at 512 rows and one recycle) is what would have to gate it.
 
 🔴 **SO THE EF2 RESULT DOES NOT GENERALISE, AND THE REASON IS INSTRUCTIVE.**
@@ -548,7 +1290,7 @@ activation as `f16` whenever `hiddenChannels % 4 == 0`, which the MSA
 transition's 1024 and the pair transition's are, and the second matmul reads it
 through `storedElement` - an `unpack2x16float` expression. `subgroupMatrixLoad`
 cannot consume an expression. So taking the matrix path there means storing
-`hidden` unpacked, which src/runtime/storage.js records as 16 MiB at 512 MSA
+`hidden` unpacked, which webgpu/runtime/storage.js records as 16 MiB at 512 MSA
 rows for a BIT-IDENTICAL fold - a free win being given back. That is a real
 trade to weigh, not a number to quote.
 
@@ -1376,7 +2118,7 @@ is worth most of a morning if the first number is believed. Use `--repeats`.
 ### Ruled out with numbers
 
 - **`popErrorScope` is not a stall.** 428 of them in an OpenDDE fold summing to
-  3469 ms looks alarming, and 370 come from `src/runtime/validation.js` - which
+  3469 ms looks alarming, and 370 come from `webgpu/runtime/validation.js` - which
   is the DeferredValidation class, whose whole point is that the pops are held
   and settled together at a boundary that already synchronises. They resolve
   concurrently; the sum is not a wall. The other **58 calls come from 11 sites
@@ -1405,7 +2147,7 @@ a real T4 (`measuredWidth` 512):
 | `atomRowTile` | 316 | `outputRowTileFor(queryRows, workgroupTarget)` |
 | `diffusionNormSplit` | 526 | **nothing - no derivation exists** |
 
-`src/runtime/device.js` fires the occupancy measurement whenever
+`webgpu/runtime/device.js` fires the occupancy measurement whenever
 `diffusionSplitK` is null, and `deviceDerivationsAllowed` excludes only Apple,
 so an NVIDIA card with no prior derives all four. That leaves ONE candidate,
 and `tools/gpu/bench-normsplit.js` measures it at nothing: **-0.5% / +0.9% /
@@ -1442,7 +2184,7 @@ tokens), which is the resolution this question needed and never had.
 thing you present TO and a Colab container has no display, so Vulkan never came
 up and Chrome fell back to **SwiftShader** - which answers `requestAdapter`
 perfectly happily. `tools/cdp.py` has carried the flag for
-`tools/colab_backend.py` since that file was written, and its own note says why
+`python/localfold/server.py` since that file was written, and its own note says why
 the shared list does not: the A100 box these flags were written on runs HEADED,
 where a surface exists. So the PAGE was always on the GPU and the BENCH
 LAUNCHER was not, on any box with no display.
@@ -1467,7 +2209,7 @@ every arm looked hung and two rounds of harness debugging went into a flag. The
 Turing section below is NOT affected: it reports the adapter offering
 `shader-f16` AND `chromium-experimental-subgroup-matrix`, and SwiftShader offers
 neither, so those runs had the card. Nor is any user's fold - the notebook folds
-through `colab_backend.py`.
+through `python/localfold/server.py`.
 
 **It is refused now, not warned about.** `gpu-chrome` exits 2 on a software
 adapter unless `--allow-software` is passed, and names both usual causes (no
@@ -1517,7 +2259,7 @@ best of everything tried on this kernel, and a prior copied from a neighbour
 would have shipped a regression to every Colab user.
 
 🔴 **AND THE WHOLE-FOLD MEASUREMENT SAID THE OPPOSITE, WITH ITS OWN CONTROL
-DISPROVING IT.** Folding a 154-residue protein through `tools/colab_backend.py`
+DISPROVING IT.** Folding a 154-residue protein through `python/localfold/server.py`
 reported Ampere's prior **19% FASTER** (3826/3644 ms against 3147/3043) - and
 the same unrecognised configuration re-run at the end of that session came back
 at 4063/3998/4021, a **31% drift**. An A/B whose control moves further than its
@@ -1569,3 +2311,538 @@ both true) and has never been swept on Turing; and the triangle kernel runs at
 **0.19-0.24 effective TFLOP/s** on a part rated ~8 f32, which is a ceiling
 question rather than a knob question and wants the same figure from the M2 and
 the A100 beside it before anything is concluded from it.
+
+## 🔴 The M2's sampler: three levers measured, none taken
+
+Measured 2026-09-26 on the M2 (stock flags, `shader-f16`, no matrix units),
+AF3 int5, 58 tokens unless stated. A page fold is ~45% sampler (25 steps x ~47
+ms) and a denoiser call is ~40 ms of GPU, ~31 ms of it the diffusion
+transformer. Knob sweeps first - all at the shipped default: split-K 1.4-3.3x
+SLOWER, the shared token tile of 2 12% slower, `diffusionNormSplit` flat on
+whole folds, `transitionThreadTarget` flat on the trunk. Then three kernel
+changes to `qkvg`, each timed with `bench-diffusion-transformer.js --profile`:
+
+| arm | qkvg, 11 calls |
+|---|---:|
+| shipped (tile 4, f16 weights widened to f32) | 68.0 ms |
+| f16 multiply-adds, runs of 16-32 summed in f16 into f32 | 61-63 |
+| ...on top of an interleaved q/k/v/gate `vec4<f16>` read (timing prototype) | 68-69 |
+| token tile 2 for qkvg alone (honest dispatch) | 63-64 |
+
+**Nothing moves more than ~10% of one kernel**, which is ~1.5% of a denoiser
+call. The interleaved read changing nothing says `qkvg` is not bound on load
+INSTRUCTIONS: four scalar streams and one vec4 stream are the same bytes. f16
+arithmetic buys a little and stops stacking with anything; `ffw-wide` at tile 2
+is 1.4x SLOWER (107 against 77, and 322 against 148 at 150 tokens).
+
+🔴 **AND THE TILE ARM FIRST MEASURED 1.5x, WHICH WAS HALF THE WORK.** Without a
+K split, `qkvg` and `ffw-wide` are dispatched as `Math.ceil(rows / tile)` - the
+SHARED tile - while their shaders tile by `qkvgTile`/`wideTile`. Those are equal
+in every shipping path, so it is latent; a change that lets them differ must
+move the dispatch too. A fold with the prior on failed the chain-geometry gate
+(good); the bench reported the missing tokens as `qkvg 68 -> 45` (bad), because
+it has **no correctness check at all** - synthetic weights, time only. CLAUDE.md's
+"a dispatch dividing by eight under a shader tiling by four, reported as a 30%
+speedup", once more. Check a new arm through `fold.js` before believing a bench.
+
+🔴 **AND THE TRUNK, AT 255 TOKENS x 1024 ROWS, THE SAME STORY.** A steady pass is
+~6.2 s; pair-transition 16%, grid.attend 16%, grid.project 11%, opm.contract 9%,
+the triangle kernels ~23%. Three more arms, none taken:
+
+| arm | kernel | whole pass |
+|---|---|---|
+| LayerNorm barrier trees emptied in the pair transition (`bench-transition.js 8:128:n`, an upper bound for subgroup reductions) | 24.8 -> 23.6 ms (-5%) | - |
+| f16 pair weights (`--pair-weights=f16`); the transition itself 18.6 -> 16.4 | - | 6042-6245 -> 5962-5966 ms, flat at 58 tokens |
+| the OPM vector GEMM reading A's four rows as one vec4 (5 -> 2 shared reads a k step) | 567 -> 532 ms | unmoved (6202/6338 against 6208/6457) |
+
+The pair transition already runs its f16-staged arm (18.5 ms a call in the
+profile against 18.6 in the bench), so the precision lever it has left is the
+weights, which docs/AF3.md declined on accuracy and which buys 1-4% here.
+
+## The T4's wide models ran the vector kernels: three matrix choices were the ampere prior's alone
+
+The head-to-head (docs/WEB.md) had a T4 at 180 s cold for IntelliFold-2 at 261
+residues and protenix2 at 58 s warm. Two causes, found without a T4:
+
+1. **NOT the bridge, which was the first guess and is wrong.** Those cells ran
+   before the readback stopped sending a 158 MiB event, but the T4's own status
+   lines say what the FOLD took, and at 261 residues it is nearly all of it:
+   AF3 22 s of 24, boltz2 29 of 32, protenix2 55 of 58, IntelliFold-2 177 of
+   180. The old bridge pinned to two cores here costs 2-3 s. Against this A100
+   the fold is 5.5x slower for AF3, 6x boltz2, 8x protenix2 and **11x
+   IntelliFold-2** - the widest pair track, and the outlier.
+2. **The wide models lost three kernels a T4 has the units for.** On this A100
+   with `--prior=turing`, IntelliFold-2 (512-channel pair) slowed 54% against
+   its own prior where AF3 slowed 11%. Bisecting the ampere prior's 41 knobs
+   (`--no-prior=<group>`) put it on `pairTransitionSplit` (the MATRIX split),
+   `triangleProjectMatrix` and `gridProjectMatrix`: each was `true` only in the
+   ampere prior, so a T4 - and every GPU with matrix units and no prior - ran
+   them on the vector path at every width. The width rules were already
+   written (192 channels, `TRANSITION_SPLIT_MIN_CHANNELS`,
+   `TRIANGLE_PROJECT_MATRIX_MIN_CHANNELS`); they now DECIDE when no prior has,
+   and a prior may only refuse. AF3-width models (128) are untouched, so the
+   turing prior's own T4 measurements stand.
+
+| A100 under `--prior=turing`, 5CAJ 261 | before | after |
+|---|---:|---:|
+| IntelliFold-2, first / warm | 12.4 / 8.88 s | **7.7 / 6.07** |
+| OpenDDE, a fold | 11.15 s | **8.12** |
+| AF3, warm | 2.02 s | 2.04 |
+| boltz2, warm | 2.66 s | 2.64 |
+
+pLDDT identical to the last digit against this card's own prior (IntelliFold-2
+83.453, OpenDDE 92.04 on 6MRR), which has always taken these kernels.
+🔴 **AND THE GRID PROJECTION NOW PRICES ITS FIT**: it stages 32 KiB, and the
+width rule's first spec-floor run could not create it at WebGPU's guaranteed 16
+KiB - unseen while only a 48 KiB part chose it. `gridProjectMatrixConfig`
+declines like the triangle's and the transition's choosers. The turing
+prior's `opmBlockI: 8` had the same shape - 32 KiB on the OPM contraction at
+16 KiB - and now halves until it fits (`createOuterProductMeanShaders` takes the
+device's limit); no real device has both, but the choosers are all priced now.
+
+**MEASURED ON A T4 SINCE**, through the reader page and the bridge exactly as a
+Colab user folds: one VM, the code before this change against after it and
+after it again, a fresh browser profile and the NVIDIA shader cache cleared per
+arm, seconds cold / warm:
+
+| T4 | before | after | after, again |
+|---|---:|---:|---:|
+| IntelliFold-2, 261 | 165.6 / 161.5 | **98.7 / 96.9** | 98.7 / 95.6 |
+| OpenDDE, 261 | 117.0 / 108.9 | **80.4 / 70.2** | 76.1 / 70.3 |
+| protenix2, 261 | 55.8 / 54.5 | **40.3 / 37.4** | 42.4 / 38.9 |
+| AF3, 261 (128 channels, the control) | 25.7 / 24.3 | 34.3 / 23.5 | 27.8 / 24.1 |
+| IntelliFold-2, 68 | 54.0 / 13.7 | 58.3 / 8.6 | 54.8 / 9.2 |
+| OpenDDE, 68 | 41.4 / 10.1 | 46.9 / 8.6 | 45.5 / 9.1 |
+
+A third to two fifths off the wide models at 261 residues, cold and warm alike;
+AF3 unmoved warm. The cold price the turing prior was built to avoid shows at 68
+residues and is small - OpenDDE 41 -> 45-47 s, IntelliFold-2 within its own
+scatter - against 30-65 s saved on a fold of 261. 🔴 **AND protenix2 GAINS
+TOO**, which the A100 proxy did not predict (5% there): its trunk pair is 128
+but not every track it runs is, so the width rules reach part of it. The proxy
+found the defect; only the T4 could price it.
+
+## A T4's cold fold is waiting, so the runtime starts while the reader is choosing
+
+Measured on a Colab T4, through the page with its weights from Hugging Face, 68
+residues, a fresh profile and the NVIDIA shader cache cleared per model
+(`createComputePipeline` intervals unioned, shard timings from the resource
+table):
+
+| cold | wall | weights arrived | pipelines | compiler busy |
+|---|---:|---:|---:|---:|
+| AF3 | 22.5 s | 9.5 s | 124 | 16.5 s |
+| protenix2 | 27.7 | 8.0 | 144 | 23.7 |
+| OpenDDE | 50.5 | 21.0 | 186 | 43.8 |
+| IntelliFold-2 | 73.6 | **57.2** | 182 | **63.9** |
+
+So the compiler is busy for three quarters of the wall or more, and
+IntelliFold-2's 612 MB take nearly as long again at ~10 MB/s. None of it
+depends on the SEQUENCE - only on the model - and a Colab runtime sat idle while
+the reader chose one and typed. The reader now sends `warm` when the model
+changes (web/app.js `warmRemoteModel`; only after `/health` says the runtime has
+a real GPU, so a TPU's SwiftShader is never asked), and the runtime starts that
+model's weights and its trunk's pipelines (`window.__warmModel`); the loaders
+keep their promises, so the fold takes what is under way. Same T4, fold pressed
+at once against 60 s after choosing:
+
+| T4, cold, 68 residues | at once | after 60 s |
+|---|---:|---:|
+| IntelliFold-2 | 67.0 s | **14.9** |
+| OpenDDE | 78.5 | **12.5** |
+| AF3 | 32.3 | **12.1** |
+
+pLDDT identical in each pair. On the A100 the same is 9.2 -> 6.1 s. What is left
+is the fold itself and the stages the warm does not reach (the sampler and the
+confidence head compile at the fold); a reader who presses Fold within a few
+seconds of choosing gets a partial head start.
+
+### ...and then the runtime also folds a throwaway, and fetches its weights itself
+
+Two more steps on the same T4, and one dead end.
+
+**The warm-up now folds a dummy.** `warmAf3Pipelines` compiles the trunk from
+the manifest's shapes, but the sampler, the atom encoder and decoder, the
+conditioning and the confidence head have no compile-only path, so a warmed
+first fold still paid them. Once the weights are in, the runtime now folds a
+dummy sequence at the reader's length (two sampler steps, no recycles) through
+`foldAf3`: every pipeline compiled and the weights resident. A real fold waits
+for a dummy already running and supersedes one not yet started. AF3 after 60 s
+of choosing: **12.1 -> 6.6 s**, which is a warm fold.
+
+**The runtime's weights come through the broker.** The T4 VM downloads
+IntelliFold-2's 641 MB from Hugging Face in **6.8 s with parallel curl**, but
+its headless Chrome fetched them at 29 MB/s (22 s alone, 55 s beside a fold's
+compiles) - the network stack is what two vCPUs cannot feed, since Chrome reads
+the same files over loopback in 6.6 s. The broker now serves `/hf/<path>`:
+Python fetches upstream, streams to the page and keeps a disk copy
+(`_weights_proxy`), and `bundleBaseUrl` rewrites Hugging Face URLs to it only
+on a page the broker opened with `weights=proxy`. IntelliFold-2 folded at once
+with the proxy: 18.7 and 23.0 s; without, 44.7 and then 21.2 - Hugging Face's
+CDN is fast once it has the files, so the proxy removes the worst case more
+than it moves the median. The loader also stopped teeing each download into
+Cache Storage (the copy is written from the finished buffer) and reports
+progress at most every 100 ms.
+
+T4, 68 residues, from the start of this pass:
+
+| | at once, before | at once, now | after 60 s, now |
+|---|---:|---:|---:|
+| AF3 | 32.3 s | 16.3 | **6.6** |
+| IntelliFold-2 | 73.9 s | ~19-23 | 13.0 |
+
+🔴 **THE DRIVER'S SHADER CACHE IS NOT A LEVER, AND ONE RUN SAID IT WAS.** A
+fresh browser profile with NVIDIA's `~/.cache/nvidia/GLCache` kept read AF3
+23.5 -> 12.4 s once; repeated, 20.3 -> 20.2 with the cache populated. A T4's
+cold fold scatters by 1.5x (above), and one pair is inside it. Shipping or
+persisting that cache is not pursued. (`__GL_SHADER_DISK_CACHE_PATH` does not
+redirect it for Chrome's Vulkan either.)
+
+🔴 **AND A DAY OF LOCAL BRIDGE NUMBERS WERE A STALE BROWSER'S.** Two headless
+Chromes from a pinned-core experiment kept debugging port 9333 for a day, and
+every local broker after them attached to the OLD browser - old page, old
+modules from its HTTP cache - instead of starting its own. The proxy "did
+nothing" until the port was checked. A broker's `cdp.launch` cannot tell a
+browser it started from one it found; kill by profile, and check the port.
+
+### The runtime page's own overhead on a T4
+
+A warm AF3 fold at 68 residues on the T4 is **3.8 s through `fold.js`** (4 passes,
+25 steps) and **3.2-3.5 s folded directly in the runtime page**, so the page is
+not the slow part once it is warm. A JavaScript profile of the runtime during a
+fold (CDP `Profiler`, 0.5 ms sampling) put 547 ms in `fetch` - every status, bar
+fraction and sampler frame was its own POST to the broker - and time in drawing
+each frame into a viewer nobody looks at. Two changes:
+
+- **the runtime pushes its live frames and draws none**; the finished structure
+  still loads, which its download button reads;
+- **the bridge sends a task's events as one request**, by microtask, and a batch
+  older than 50 ms goes at once (a long synchronous stretch must not hold the
+  feed - `test:bridge`'s busy-page arm failed at 6 s with the microtask alone).
+
+The warm-up dummy also takes one recycle now, so a recycled pass's kernels
+compile. T4, 68 residues:
+
+| | at once | after 60 s |
+|---|---:|---:|
+| AF3 | **13.0 s** (32.3 at the start of these passes) | **6.4** |
+| IntelliFold-2 | 18.7-40.8 (network) | **8.9** (67 at the start) |
+
+IntelliFold-2 folded at once is Hugging Face's to decide: 28.9 s before its
+fold began on one run, 6.5 on another, through the same proxy. What is left
+after a warm-up is the first real fold's ~5 s against 3.2-3.5 for later ones.
+
+### Every family warms, and what the upgrades are worth
+
+The warm-up covers ESMFold2 and AlphaFold 2 now - a throwaway fold through each
+family's own entry point (`foldEsmfold2`; `AlphaFoldMonomerGpu` /
+`AlphaFoldUnifiedGpu` with the multimer's regime over two chains). T4, 68
+residues, fold at once against 60 s after choosing:
+
+| T4 | at once | after 60 s |
+|---|---:|---:|
+| ESMFold2 600M | 28.7 s | **5.6** |
+| AF2 monomer | 21.9 s | **3.4** |
+| AF3 | 13.0 s | 6.4-7.0 (5.4 after 150 s) |
+
+The AF3 gap between 60 s and 150 s is the tiered upgrades still compiling one
+at a time on two vCPUs. Letting them take every thread while nothing folds was
+tried (`setUpgradeBoost`) and reverted: three arms read 5.5 / 7.1 / 8.5 s, which
+is the T4's own scatter and no evidence either way. Not taken without a result.
+
+### The T4 prior: ampere's knobs under turing's (2026-09-30)
+
+The turing prior set four knobs and left the rest at DEFAULT_TUNING, on the
+strength of a standalone triangle bench where ampere's entry regressed 40%. A
+whole fold disagrees. Colab T4, two rounds interleaved, 255 residues, seconds:
+AF3 warm 11.5-13.0 -> **10.7-10.9**, first fold 17.1-20.9 -> **14.5-15.8**, AF2
+monomer 15.2-16.3 -> **12.0-12.1**, IntelliFold-2 warm 35.5 -> **33.4**, against
+ampere's entry alone at 11.2-11.4 / 15.4-15.9 / 12.0 / 33.8. So turing is now
+ampere's entry with turing's measured settings on top and `opmBlockITokens`
+cleared (see device-profile.js). The same T4 profile found the AF3 trunk's
+distogram stage at 918 ms of a 3.1 s pass with a 5.7 ms kernel - the readback,
+not the head - which is what the logits change addressed; the pair and single
+read back for the conditioning and confidence heads are the rest of it, and
+taking them off the host touches the trunk cache and rf3's host global norm.
+
+**And the new prior's trunk knobs, each flipped on a T4** (bench-trunk, 255
+tokens, every arm beside its own baseline, AF3 two rounds, IntelliFold-2 one):
+none of the six should move. Trunk pass, ms, baseline -> arm:
+`triangleProjectMatrix` off AF3 1497 -> 1756 and 1607 -> 1918, IntelliFold-2
+14164 -> 20077; `gridProjectMatrix` off 1522 -> 1651, 14124 -> 17333;
+`gridAttendMatrix` off 1431 -> 1620; `pairTransitionSplit` off 1469 -> 1635 and,
+for IntelliFold-2's 512-channel pair, **14135 -> 65576 (4.6x)**;
+`stagedMatrixPrefetch` and `transitionThreadTarget` inside the noise.
+
+**The pair round trip, split by `bench-trunk.js --readback=contacts`** (reads
+back the contact map alone, as a fold's non-final passes do; timing only, the
+next pass recycles zeros). IntelliFold-2 at 255 tokens on this A100, two rounds:
+the distogram stage 880 -> 745 ms and the next pass's embedder 126 -> 5 ms, so
+reading the 133 MB pair back and uploading it again is ~260 ms a pass that does
+it - and a fold does it once, on the last pass, where the conditioning and the
+confidence head upload it again. Keeping it on the device is worth ~0.2 s of a
+13 s warm fold here, estimated 0.5-1 s of 33 on a T4; not taken, since it
+touches the trunk cache, the confidence head and rf3's host global norm. The
+other ~745 ms charged to that stage is not the readback: the stage clock also
+absorbs pairformer work still on the GPU.
+
+**And it does not cost the cold start.** `fold.js --folds=N`'s "first fold"
+cannot judge a prior's compile cost - bench tools run the tiered compile off and
+the driver's shader cache survives between arms - so the page was measured
+instead: Colab T4, the reader folds the moment it picks the model, driver cache,
+profile and weight cache cleared before every arm, two rounds. AF3 at 68
+residues 17.6 / 14.9 s old against 15.0 / 16.4 new; AF2 15.5 / 12.2 against
+15.6 / 18.2 - inside this card's spread both ways. A brand-new VM's very first
+fold read 21.7 s for AF3 (Chrome's first start and a cold path to Hugging Face
+included); 60 s after picking the model the page folds AF3 in 6.1 s and AF2 in
+4.0.
+
+**And the other six families on the same T4, old prior -> new** (two rounds
+interleaved, 255 residues, warm folds, seconds): ESMFold2 **18.0-18.3 -> 7.5-7.6**
+(its trunk 3.8 -> 1.3 s a recycle), AF2 multimer 16.7-17.3 -> 13.0-13.3,
+RoseTTAFold3 12.4-14.1 -> 11.2-11.6, Boltz-2 13.9-16.2 -> 13.5-14.0, Protenix-v2
+15.5-17.1 -> 15.5-15.8, OpenDDE 69.8 -> 67.4-67.7. No family got slower. Every
+fold passed its tool's chain check; ESMFold2's pLDDT reads 65.16 (old) and 65.70
+(new) on the T4 against 65.28 on this A100 under either prior, which is the
+kernel choice moving a stochastic sampler, not a different answer.
+
+### Keeping a T4 runtime's shader caches between sessions: measured, not worth it
+
+A returning Colab user starts on a new VM with no NVIDIA driver cache and no
+Chrome profile, so the question was whether saving both (to Drive, as the
+notebook already does for JAX's compile cache) would take the first fold down.
+Measured on one T4 by folding cold, saving `~/.cache/nvidia/GLCache` (5.5 MB)
+and the runtime's profile (`LOCALFOLD_KEEP_PROFILE=1` on the broker keeps it),
+then restoring each into a cleared machine, weights always re-downloaded. AF3
+at 68 residues, folded the moment the model is picked, two rounds: restored
+nothing 12.2 / 21.8 s, driver cache 16.1 / 20.5, profile 14.7 / 23.0, both
+13.5 / 15.8; AF2 7.3-13.2 across every arm. The rounds disagree by more than the
+arms do (the card heats between them), and the profile is **696 MB** - 338 MB of
+`DawnWebGPUCache` and 344 MB of service-worker cache - to move through Drive
+every session for no measurable win. Not built.
+
+The number that did stand out is the VM's FIRST fold: 23.0 s against 12.2 for
+the "restored nothing" arm on the same machine minutes later, with every cache
+of ours cleared in both. What a fresh VM pays is first-launch and network
+warm-up below this repository - the OS page cache, the CDN path to Hugging Face
+- not shader compilation.
+
+**And the tiles under it, swept on a T4 and left alone.** The turing entry says
+its grid-attention tile "was NOT swept here"; neither were the staged GEMM block
+or the triangle projection's tiles, all of them ampere's. bench-trunk, AF3 at
+255 tokens, each arm beside its own baseline, two rounds, trunk-pass change:
+grid-attend tile 2x16 +4.4/+7.3%, 2x32 -1.8/+2.4, 4x16 +3.4/+2.7, 6x16 -0.4/+1.1;
+staged block 64x64x16x1x4 +1.3/-1.2, 128x64x16x2x4 -3.0/+1.2, 32x128x16x1x8
+-4.3/-2.3, 64x128x32x1x8 +1.9/-1.8, 128x128x16x2x8 +4.2/+0.4; triangle pair
+tile 32x16 -4.0/0.0, 16x32 +4.7/-0.5; triangle output columns 32 0.0/-1.4, 128
+-5.0/-1.4. The baseline drifted 2212 -> 2606 ms across the session as the card
+heated, and nothing clears that by both rounds' agreement and size together:
+the two that lean the same way twice (32x128x16x1x8, columns 128) do so by 2-5%,
+inside this card's spread. A plateau, so ampere's tiles stay.
+
+### The trunk's last pair stays on the device for the heads that read it
+
+Every AF3-lineage fold read its last pass's pair back to the host (kept: a retry
+and a re-sampled fold resume from it) and then uploaded it TWICE more, once for
+the diffusion conditioning and once for the confidence head - `tokens^2 x
+pairChannels` floats each, 133 MB apiece for IntelliFold-2 at 255 tokens. The
+last pass now keeps its pair allocation for every model, as OpenDDE's already
+did for its expander: the conditioning binds it (it only reads), and the
+confidence head copies it on the device (it updates its pair in place).
+RoseTTAFold3's host global norm keeps its upload; a resumed or re-sampled trunk
+has no device pair and uploads from the host as before - checked on the page:
+fresh, "(trunk reused)" and "(1 more recycle)" all fold.
+
+Warm folds at 255 residues on this A100, interleaved: IntelliFold-2 6.27-6.33 ->
+**6.03-6.12 s**, AF3 2.42-2.52 -> 2.40-2.48. Peak device memory unchanged - 1605.5
+MiB and 897.8 MiB both ways, because the peak is in the trunk and not the
+sampler. Every pLDDT identical to the last digit; test:stock 8 of 8, ligand,
+modified, template, portable, spec-floor and cache all pass.
+
+## 🔴 A stock fold's device peak, halved: what a short device holds and why
+
+Measured on the A100 under `LOCALFOLD_STOCK_FLAGS=1` (no shader-f16, which is
+what an NVIDIA visitor's Chrome has) with `fold.js --budget=2800`, because the
+PAGE sets a budget (`deviceMemory / 3`) and a tool run does not - without
+`--budget` none of the streaming rules below engage, and a peak taken that way
+is not a visitor's. 262 tokens, 25 steps:
+
+| | AF3 | boltz2 |
+|---|---:|---:|
+| session start | 1594 MiB | 2110 MiB |
+| sampler weights stream (c82de34) | 1126 | 1490 |
+| pair norm fused, conditioning in place, no batched gates while streaming (28b092a) | **796** | **967** |
+
+Four changes, in order of what they took:
+
+1. **The sampler's decoded weights stream** from their int5 codes (as the
+   trunk's always have) when a budget is set and the device lacks shader-f16 or
+   the budget is under 2 GiB - `streamSamplerWeights` forces either arm. An f32
+   decoded copy of all 24 blocks was the largest thing a fold held.
+2. **No batched gates while the sampler streams** - 297 MiB of the 1093:
+   the decoded gate weights of every block at once (`difftx.zerogate`, 162) and
+   four per-block outputs over the tokens (`adaln-scale-shift`,
+   `ffw-adaln-scale-shift`, two `zero-gates`, 110). It costs **4-5% of a warm
+   fold** (3.00 -> 3.11-3.17 s, two rounds interleaved), which is the right side
+   of the trade in the mode that exists because room is short, and the wrong
+   side everywhere else - so streaming decides it, over any prior.
+3. **The pair LayerNorm folds into the pair-logits pass.** It wrote a
+   normalised copy of the pair conditioning (`difftx.pair-norm`, 33.5 MiB at
+   262 tokens, 4x that at IntelliFold-2's 512 channels) to be read by a pass
+   that, cached, runs ONCE a block a schedule. Bit-identical (574/574 atoms,
+   2113/2113 at 262), because each element is computed by the same expression
+   in the same order.
+4. **The conditioning's two pair transitions run in place** - the shared
+   transition kernel's residual form - where each wrote a pair-sized delta to
+   `cond.pair-scratch` and added it back. Bit-identical: f32 addition commutes.
+
+🔴 **WHAT IS LEFT IS NOT WASTE.** `int5-codes` (254 MiB for AF3) is the bundle
+itself and is what streaming decodes from; `difftx.block.resident.stream` is
+the one super-block being decoded; `difftx.pair-logits` (100.6) is the
+per-block attention bias cache, whose recompute at ~1 ms a block per step is
+not worth 100 MiB; `af3-embed.pair` and `head.pair-cond` are the trunk's pair
+and its conditioned form, both read later.
+
+🔴 **AND IntelliFold-2's PEAK MOVED TO THE CONFIDENCE HEAD** (945 MiB at 262):
+its pairformer's scratch is 469 MiB - 3.5 pair tensors at 512 channels, already
+in compact mode - beside a 134 MiB pair and a 128 MiB split-transition chunk.
+The next cut there is the triangle's normalised-pair scratch, which needs the
+LayerNorm folded into the triangle projections (vector and matrix) - a shared
+kernel change, not taken here.
+
+🔴 **check-af3-denoise.js on boltz2 FAILS AT 2.206e-1 ON `main` TOO**, with
+the identical figure, so it is a stale dump against a changed reference, not
+anything here. AlphaFold 3 reads 9.92e-4 before and after.
+
+## RFD4-Proteina's trunk on an M5, and why its kernels have no headroom left
+
+Measured 2026-10-25 on an **Apple M5 MacBook Air, 8-core GPU, 16 GB**, Chrome/Dawn/Metal
+(`apple / metal-3`), via `tools/gpu/profile-rfd4p.js --lengths=`. One trunk pass, 14 layers,
+f16 arm, `--e2e=0`. Every figure here is a GPU-timestamp total, and wall time per pass equals
+it to within a percent, so there is no host or launch-gap time in question.
+
+| n | pass | triProjG | l1 | l2 | linear_z | tri-in + tri-out |
+|---:|---:|---:|---:|---:|---:|---:|
+| 100 | 115.8 | 51.8 | - | - | - | - |
+| 200 | 444.5 | 204.9 | 56.8 | 62.7 | 37.3 | 33.1 |
+| 400 | 1815.8 | 821.6 | 228.4 | 246.5 | 151.0 | 220.0 |
+| 512 | 2914.2 | 1348.0 | 375.4 | 403.3 | 245.8 | 323.2 |
+
+🔴 **NOTHING WAS MEASURING PAST 191 TOKENS.** The longest preset in this repository is
+`ppi_pdl1`; the profiler's default cases are 100 and 191. So every number ever recorded for
+this port described the short path, and the chunked arm had never been profiled at all -
+which is how the cliff fixed in 7b6aa6c9 survived, and how a WGSL compile error in
+`gemm-sm8-f-ve` (8e687427) sat in a variant that had never once run.
+
+### 2.9 TFLOP/s is the machine, not the kernels
+
+Every large GEMM independently measures **2.68-2.95 TFLOP/s**, across five different aspect
+ratios, with and without a fused norm, with and without a scattered epilogue. An 8-core Apple
+GPU is 1024 FP32 ALUs; at ~1.45 GHz one FMA per ALU per cycle is **~2.97 TFLOP/s**. The f16
+subgroup-matrix path is therefore delivering exactly **1x the FP32 ALU rate** - not the 2x a
+half-width SIMD path would give, and nowhere near M5's per-core matrix units.
+
+🔴 **AND THE PROBE SETTLES IT RATHER THAN ARGUING IT.** Duplicating the four
+`subgroupMatrixMultiplyAccumulate` calls in `gemmSubmatSource`'s `mmaTile` makes each K step
+do 64 MMAs instead of 32 **on registers already loaded** - no extra loads, no extra barriers,
+not one more byte of traffic. If the loop were waiting on memory this would be nearly free:
+
+| | baseline | 64 MMAs | |
+|---|---:|---:|---|
+| triProjG | 821.6 | 1590.4 | x1.94 |
+| l2 `384<-768` | 246.5 | 461.1 | x1.87 |
+| l1 `768<-384` | 228.4 | 437.7 | x1.92 |
+| linear_z `384<-256` | 151.0 | 289.4 | x1.92 |
+| tri-out | 110.1 | 215.5 | x1.96 |
+| tri-in | 109.9 | 214.4 | x1.95 |
+| whole pass | 1815.8 | 3403.3 | x1.87 |
+
+Time scales with MMA count alone. **The subgroup-matrix pipeline is saturated**, so the
+kernels are not waiting on anything and there is nothing to recover by tuning them.
+
+🔴 **WHICH KILLS A WHOLE FAMILY OF PLAUSIBLE IDEAS.** Padding `stB`'s workgroup stride to
+dodge bank conflicts (`stA` is already padded to 24 and `stB` is not), reshaping the subgroup
+grid from `SGY=1,SGX=8` to `SGY=2,SGX=4` to cut `subgroupMatrixLoad`s from 20 to 16 per K=16,
+dropping to a 4-subgroup workgroup for occupancy, loading the B panel straight from
+`var<storage>` - every one of these targets load or barrier time, and the probe says there is
+none. None were taken.
+
+🔴 **AND M5'S MATRIX UNITS ARE NOT REACHABLE FROM WGSL.** Dawn advertises only 8x8x8
+(`f32->f32` and `f16->f16`), which is the shape of Metal's legacy `simdgroup_matrix`; M5's
+neural accelerators are exposed through Metal 4's `mpp::tensor_ops::matmul2d`, and WGSL has no
+inline-MSL escape hatch and Tint emits no such op. Nothing in this repository can change that.
+
+### The tile overhang: real, 30%, and worth 0.4% of a pass
+
+`tri-in` and `tri-out` are the one place with measurable waste. They are batched over 256
+channels, so `tiles64` is multiplied by 256 and `small` sees plenty of work and takes the
+64-row tile - which pads a 400x400 matrix to 448x512: **160,000 real elements inside 229,376
+launched, 30% of the MACs computing overhang.** That is the whole gap between these kernels'
+2.08 TFLOP/s and every other GEMM's 2.95, since 2.08 / 0.6975 = 2.98.
+
+🔴 **MEASURED AND NOT TAKEN.** Choosing the 32-row tile whenever it strictly reduces the
+padded row count (n=400: 448 -> 416, n=200: 256 -> 224) moved the contraction kernels
+**220.0 -> 213.0 ms at n=400 and 33.1 -> 30.2 at n=200** - about 3%, as the padding arithmetic
+promises - and the pass total went **1815.8 -> 1832.3**, which is backwards and inside
+run-to-run variance either way. Half the rows a workgroup is twice the workgroups re-staging
+the same B panel, and that cancels it. The contraction is 12% of the pass, so even erasing
+all of its padding is ~3% of a pass; it is not where the money is. Reverted.
+
+### What is left, and all of it is approximate
+
+With the kernels at the ALU ceiling, the only remaining lever is **fewer FLOPs**, and every
+candidate changes the numbers rather than the schedule:
+
+- **896 of triProjG's 1408 output channels (63.6%) are sigmoid pre-activations** - `a_g`,
+  `b_g` and the 384-wide output gate - which is **~523 ms, 28.8% of a whole pass**, spent
+  computing arguments to a function whose derivative never exceeds 1/4. Factoring the three
+  gate matrices jointly, `[W_ag; W_bg; W_g]` as `U(896xr) V(rx384)`, shares one `V z`
+  projection across all 896 and breaks even at r=269; at r=96 it would cut triProjG's FLOPs by
+  ~39%. Approximate.
+- **The triangle's hidden width pays 5.4x in the projections for every 1x in the contraction.**
+  Projection over contraction FLOPs is `2688/n`, so the crossover is n=2688 and at 200-512 the
+  "cubic" triangle update is 5-13x dominated by its quadratic channel projections. Trimming
+  `tri_mult_c` from 256 shrinks 73% of triProjG, all of both contractions and all of
+  `linear_z` at once. Approximate, and the channels never mix inside the contraction, so the
+  pruning is at least well-posed.
+- **Low-rank on the whole projection is not available**: the input width 384 already IS the
+  rank bound for a `1408x384` weight, so an exact factorisation does more work, not less.
+- **No (i,j) symmetry to exploit** anywhere in the pass: `pairWriteLnIn` multiplies two
+  different learned halves of `linear_x` indexed by j and i, and the two triangles use
+  different weights, so `z_ij != z_ji` from the first pair write onward.
+
+None of these are taken. They are model changes wearing an optimisation's clothes, and they
+need a quality argument - a re-fold of the designs, not a backbone that merely looks protein-
+shaped - before any of them belongs behind a flag.
+
+### And 95% of the pass is matmul, which is why there is nothing left to borrow
+
+| n | pass | matmul | everything else |
+|---:|---:|---:|---:|
+| 200 | 444.5 | 425.6 (95.7%) | 18.9 (4.3%) |
+| 400 | 1815.8 | 1719.3 (94.7%) | 96.5 (5.3%) |
+| 512 | 2914.2 | 2754.8 (94.5%) | 159.4 (5.5%) |
+
+"Everything else" is every norm, transpose, bias, gate, softmax and elementwise kernel in the
+pass added together. So the ceiling above is not a detail about six kernels - it is 95% of the
+work, and the other 5% cannot be made negative.
+
+🔴 **WHICH IS WHY `cuda/rfd4p`'S OPTIMISATION ROUND DOES NOT TRANSFER.** That port's late
+commits are byte-count work - narrowing planes and the pair tensor to f16, vectorising
+elementwise kernels, fusing norms into the stages that produce them - because on an A-series
+card its GEMMs were already at 144 TFLOP/s against a 156 TF32 ceiling and "what is left is
+bytes". Here the GEMMs are the ceiling and the bytes are 5%. The same change is worth 19% on
+that card and under a percent here.
+
+Checked one by one against this port: the fused triangle projections, the fused q/k/v/gate,
+the one-kernel pair bias (with four pairs a subgroup and one vec4 reduction serving all
+four), f16 planes and pair tensor and transition hidden, norms fused into GEMM
+prologues/epilogues, residuals and biases fused into producers, tiled transposes, and the
+conditioning hoisted out of the recycle loop - **all already here**, and `condUniform`
+(collapsing the conditioning to one row when it is token-invariant) is here and not there.
+The one thing they have that this port does not is `abffcfee`, each pair stage leaving the
+next stage's LayerNorm behind. Of the three norms it fuses, two are already fused here
+(`pairWriteLnIn`, and `l1Fused`'s `inNorm: 'ln'` prologue); the third is the standalone
+`ln 160000x384` before the incoming triangle, which is **12.996 ms over 7 calls, 0.72% of a
+pass** - and it already runs at ~132 GB/s, so fusing it saves the read of z and not the
+write. Worth about a third of a percent. Not taken.

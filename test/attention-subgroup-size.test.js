@@ -13,7 +13,7 @@ import { describe, expect, it } from "./harness.js";
 import {
   allowsAttentionSubgroupSize, buildAttentionFlashKernel, selectAttentionFlashKernel,
   supportsAttentionSubgroups,
-} from "../src/kernels/attention.js";
+} from "../webgpu/kernels/attention.js";
 
 const deviceWith = (subgroupMinSize, subgroupMaxSize, features = ["subgroups", "subgroup-size-control"]) => ({
   features: new Set(features),

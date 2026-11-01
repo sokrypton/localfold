@@ -5,7 +5,7 @@ GitHub Pages publishes at most a gigabyte, and the weights are most of it: AF2
 monomer 227 MB, AF3 150 MB, before a third model exists. A page meaning to offer
 five keeps its parameters elsewhere.
 
-Everything a bundle needs is one field. In `src/bundles/manifests/index.js`:
+Everything a bundle needs is one field. In `shared/bundles/manifests/index.js`:
 
 ```js
 af3: {
@@ -205,7 +205,7 @@ checkpoints it beats asymmetric g64 outright and comes close to the shipped
 scheme: **opendde 0.0434 and protenix2 0.0452**, against asym g64's 0.0517 and
 0.0556 and shipped asym g32's 0.0411 and 0.0425. On af3 and boltz2 the ranking
 INVERTS and asym g64 wins. Neither can be tried: `quantize_af3.py` emits
-asymmetric only, and `codecOf` in src/weights/quantised-upload.js ties symmetry
+asymmetric only, and `codecOf` in webgpu/weights/quantised-upload.js ties symmetry
 to width - `signed: bits === 8` - so a symmetric five-bit code has no
 representation. Adding one is a codec, a packer flag and a gate arm, for 8.3% on
 two models of seven. Written down so the next person costs it rather than
@@ -431,7 +431,7 @@ Group 32, not 128: docs/EF2FAST.md records OpenDDE at group 128 folding 6MRR
 into a 3283 A explosion at pLDDT 46.69, and 128 is ESM-C's alone.
 
 🔴 **NEITHER IS IN THE REGISTRY AND NEITHER IS PUBLISHED.**
-`src/bundles/manifests/` has no `boltz2.js` or `protenix2.js`, so the page
+`shared/bundles/manifests/` has no `boltz2.js` or `protenix2.js`, so the page
 cannot load either however good the bundle is - and a bundle the CLI likes can
 still be one the page cannot, because the page reads the manifest baked into the
 module and pinned to a commit. Publishing them is a `tools/build_site.py` and a
@@ -452,7 +452,7 @@ Uploaded to `sokrypton/localfold` at commit
 `check_remote_bundle.py` reads all twelve OpenDDE shards and all eight of
 AlphaFold 3's back from the remote.
 
-`src/bundles/manifests/opendde.js` is regenerated from the uploaded bundle and
+`shared/bundles/manifests/opendde.js` is regenerated from the uploaded bundle and
 its `remote:` re-pinned to that commit;
 `boltz2.js` and `protenix2.js` are new modules.
 `test/registry-manifest-widths.test.js` is GREEN, which is the signal the deploy

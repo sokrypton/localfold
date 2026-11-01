@@ -2,35 +2,38 @@
   "adapter": "nvidia / ampere",
   "arms": {
     "stock": {
-      "AF2": "\"checksum\": -1308439",
-      "AF3": "\"meanPlddt\": 85.8348190958907",
-      "OpenDDE": "\"meanPlddt\": 92.03821103830371",
-      "ESMFold2": "\"atomChecksum\": -61003",
-      "boltz2": "\"meanPlddt\": 96.45960561240592",
-      "protenix2": "\"meanPlddt\": 84.65288238658307",
-      "intellifold2": "\"meanPlddt\": 83.22311492573736",
-      "rosettafold3": "\"meanPlddt\": 81.53424395815864"
+      "AF2": "\"checksum\": -1325647",
+      "AF3": "\"meanPlddt\": 86.89409297185493",
+      "OpenDDE": "\"meanPlddt\": 92.03828650816807",
+      "ESMFold2": "\"meanPlddt\": 53.834",
+      "boltz2": "\"meanPlddt\": 96.49695141888661",
+      "protenix2": "\"meanPlddt\": 84.67055907565127",
+      "intellifold2": "\"meanPlddt\": 83.19319083594942",
+      "rosettafold3": "\"meanPlddt\": 81.53048190770973",
+      "BioEmu2": "\"atomChecksum\": 9577744"
     },
     "portable": {
-      "AF2": "\"checksum\": -1309830",
-      "AF3": "\"meanPlddt\": 85.83318174009955",
-      "OpenDDE": "\"meanPlddt\": 92.03958192353464",
-      "ESMFold2": "\"atomChecksum\": -128226",
-      "boltz2": "\"meanPlddt\": 96.45921661961785",
-      "protenix2": "\"meanPlddt\": 84.67090797424316",
-      "intellifold2": "\"meanPlddt\": 83.22122278929173",
-      "rosettafold3": "\"meanPlddt\": 81.53339809397752"
+      "AF2": "\"checksum\": -1315603",
+      "AF3": "\"meanPlddt\": 86.88979851327291",
+      "OpenDDE": "\"meanPlddt\": 92.03965636994366",
+      "ESMFold2": "\"meanPlddt\": 73.342",
+      "boltz2": "\"meanPlddt\": 96.49871047282468",
+      "protenix2": "\"meanPlddt\": 84.68859008629563",
+      "intellifold2": "\"meanPlddt\": 83.19145885687225",
+      "rosettafold3": "\"meanPlddt\": 81.52963292785964",
+      "BioEmu2": "\"atomChecksum\": 9577762"
     },
     "spec-floor": {
       "AF2": "\"checksum\": -1304306",
-      "AF3": "\"meanPlddt\": 85.81644298141427",
-      "OpenDDE": "\"meanPlddt\": 92.04126292903248",
-      "ESMFold2": "\"atomChecksum\": -128226",
-      "boltz2": "\"meanPlddt\": 96.45788437314981",
-      "protenix2": "\"meanPlddt\": 84.66979283322856",
-      "intellifold2": "\"meanPlddt\": 83.21916867134667",
-      "rosettafold3": "\"meanPlddt\": 81.53200262046401"
+      "AF3": "\"meanPlddt\": 86.85846084833976",
+      "OpenDDE": "\"meanPlddt\": 92.04090432090626",
+      "ESMFold2": "\"meanPlddt\": 73.342",
+      "boltz2": "\"meanPlddt\": 96.49462035973313",
+      "protenix2": "\"meanPlddt\": 84.68504328844024",
+      "intellifold2": "\"meanPlddt\": 83.18924131276928",
+      "rosettafold3": "\"meanPlddt\": 81.5279306674711",
+      "BioEmu2": "\"atomChecksum\": 9577762"
     }
   },
-  "recorded": "2026-09-18"
+  "recorded": "2026-10-16"
 }

@@ -1,5 +1,5 @@
 /**
- * AF3's confidence head: GPU against src/af3/confidence/confidence-reference.js.
+ * AF3's confidence head: GPU against cpu/af3/confidence/confidence.js.
  *
  *     node tools/gpu-chrome.mjs tools/gpu/check-af3-confidence.js
  *
@@ -8,11 +8,11 @@
  * it as (384, 50) and broadcasting gives plausible per-residue numbers, so a
  * check that compares token-wise means would pass on it.
  */
-import { confidenceHead, distogramFeatures } from "../../src/af3/confidence/confidence-reference.js";
-import { linear } from "../../src/af3/trunk/pairformer-reference.js";
-import { pairformerBlock } from "../../src/af3/trunk/pairformer-reference.js";
-import { Af3ConfidenceHeadGpu } from "../../src/af3/confidence/confidence-webgpu.js";
-import { confidenceWeights, openAf3Store } from "../../src/af3/weights/weights.js";
+import { confidenceHead, distogramFeatures } from "../../cpu/af3/confidence/confidence.js";
+import { linear } from "../../cpu/af3/trunk/pairformer.js";
+import { pairformerBlock } from "../../cpu/af3/trunk/pairformer.js";
+import { Af3ConfidenceHeadGpu } from "../../webgpu/af3/confidence/confidence.js";
+import { confidenceWeights, openAf3Store } from "../../shared/af3/weights/weights.js";
 
 const DIALECT = { swapTransposedBias: false };
 const DENSE = 24;
@@ -48,7 +48,7 @@ function relativeRms(actual, expected) {
 
 export async function main(device, args) {
   const tokens = Number(option(args, "n", "24"));
-  const store = await openAf3Store();
+  const store = await openAf3Store(option(args, "model", undefined));
   const weights = await confidenceWeights(store);
   const blockCount = Number(option(args, "blocks", "4"));
   weights.blocks = weights.blocks.slice(0, blockCount);
@@ -86,7 +86,9 @@ export async function main(device, args) {
   const gpu = await new Af3ConfidenceHeadGpu(
     device, { stagedPrecision, weightPrecision, accumulatePrecision })
     .run(input, weights, DIALECT,
-    { variance: option(args, "variance", "fast") });
+    // The embedded pair and the stack's output stay on the device in a fold;
+    // this checker compares them, so it asks for them back.
+    { variance: option(args, "variance", "fast"), returnRepresentations: true });
 
   // 🔴 THE FOUR CONFIDENCE PAIRFORMER BLOCKS ARE THE SAME CHAOTIC STACK the
   // trunk runs 48 of, so the heads downstream of them inherit its conditioning.

@@ -7,7 +7,7 @@
  * WHY. `inject` - `noisy[i] = positions[i] + injected * normal()` - is **2.1 ms
  * of a 48.7 ms sampler step at 240 tokens**, the largest single piece of host
  * work in the loop, and it is what stops the positions living on the device
- * across a schedule. src/af3/fold.js's `normalFrom` is Box-Muller over a 32-bit
+ * across a schedule. webgpu/af3/fold.js's `normalFrom` is Box-Muller over a 32-bit
  * LCG: two uniforms, a log, a sqrt and a cos per draw, in float64.
  *
  * Two GPU forms are timed here against it:
@@ -33,7 +33,7 @@ const option = (args, name, fallback) => {
   return args.find((a) => a.startsWith(prefix))?.slice(prefix.length) ?? fallback;
 };
 
-// src/af3/fold.js's generator, verbatim, as the thing to reproduce.
+// webgpu/af3/fold.js's generator, verbatim, as the thing to reproduce.
 function hostNormals(seed, count) {
   let state = seed >>> 0;
   const uniform = () => {

@@ -18,6 +18,15 @@ absolutely positioned tab strip was drawn against the viewer instead of the
 panel. Accepted by the code and unstyled by the CSS is the shape of bug that
 looks like it works, so this asserts on GEOMETRY as well as on the tabs.
 
+🔴 AND THE TABS ARE THE SLOT'S NOW, NOT THE PANEL'S. py2Dmol's slot layout
+(parts/slots.js) wraps `#heatmapContainer` in a slot and names every view the
+slot can show in its OWN strip, `.py2dmol-slot-tabs`, directly above the body
+- a map is the tab `data-view="map:<key>"`, beside the structure's. The
+heatmap's own strip (`.py2dmol-map-tabs`) is still built and is kept hidden in
+a slot. This check looked for tabs inside the container, found none, and the
+click arm then passed by clicking nothing; it reads the slot's strip, and an
+arm with no tabs to act on is a failure rather than a pass.
+
 🔴 THE FILE READER IS `readAsync`, NOT `text`. web/app.js hands py2Dmol virtual
 files as `{name, readAsync}`, and a file with the wrong reader loads without
 error and produces no object at all: `objectsData` comes back empty and the
@@ -113,8 +122,14 @@ def main():
         state = cdp.evaluate(ws, """(() => {
           const c = document.getElementById('heatmapContainer');
           if (!c) return JSON.stringify({ error: 'no #heatmapContainer' });
-          const tabs = [...c.querySelectorAll('[role="tab"], button')]
-            .map((t) => t.textContent.trim()).filter(Boolean);
+          const mapTabs = () => {
+            const c = document.getElementById('heatmapContainer');
+            const slot = c && c.closest('.py2dmol-slot');
+            const strip = slot && slot.querySelector(':scope > .py2dmol-slot-tabs');
+            return strip ? [...strip.querySelectorAll('[role="tab"]')]
+              .filter((t) => (t.dataset.view || '').startsWith('map:')) : [];
+          };
+          const tabs = mapTabs().map((t) => t.textContent.trim()).filter(Boolean);
           const cs = getComputedStyle(c);
           const box = c.getBoundingClientRect();
           // 🔴 THE STRIP HANGS ABOVE THE PANEL AND MUST STAY GLUED TO IT. The
@@ -124,9 +139,8 @@ def main():
           // they are positioned against the CONTAINER: a strip that escaped to
           // a positioned ancestor would be somewhere else on the page
           // entirely, which is the bug this replaced.
-          const strip = c.querySelector('[role="tablist"]')
-            || (c.querySelector('[role="tab"], button') || {}).parentElement;
-          const s = strip ? strip.getBoundingClientRect() : null;
+          const strip = mapTabs().length ? mapTabs()[0].parentElement : null;
+          const s = strip && !strip.hidden ? strip.getBoundingClientRect() : null;
           return JSON.stringify({
             visible: cs.display !== 'none',
             position: cs.position,
@@ -148,24 +162,43 @@ def main():
         # every switch - the plot jumps and the strip moves with it. The
         # reservation is over the SET of maps; this is what says so.
         geom = cdp.evaluate(ws, """(() => {
-          const c = document.getElementById('heatmapContainer');
+          const mapTabs = () => {
+            const c = document.getElementById('heatmapContainer');
+            const slot = c && c.closest('.py2dmol-slot');
+            const strip = slot && slot.querySelector(':scope > .py2dmol-slot-tabs');
+            return strip ? [...strip.querySelectorAll('[role="tab"]')]
+              .filter((t) => (t.dataset.view || '').startsWith('map:')) : [];
+          };
           const canvas = document.getElementById('heatmapCanvas');
-          const tabs = [...c.querySelectorAll('[role="tab"]')];
+          const tabs = mapTabs();
           const rect = () => {
             const b = canvas.getBoundingClientRect();
             return [Math.round(b.left), Math.round(b.top),
                     Math.round(b.width), Math.round(b.height)];
           };
           const seen = {};
-          for (const t of tabs) { t.click(); seen[t.dataset.mapKey] = rect(); }
+          // ...and the click must actually change the map on screen, or it is a
+          // tab that does nothing.
+          const shown = {};
+          for (const t of tabs) {
+            t.click();
+            seen[t.dataset.view] = rect();
+            shown[t.dataset.view] = window.py2dmol_viewers
+              && Object.values(window.py2dmol_viewers)[0].renderer.heatmapRenderer
+              ? Object.values(window.py2dmol_viewers)[0].renderer.heatmapRenderer.mapKey : null;
+          }
           const keys = Object.keys(seen);
-          const same = keys.every((k) =>
+          const same = keys.length >= 2 && keys.every((k) =>
             seen[k].join() === seen[keys[0]].join());
-          return JSON.stringify({ same, seen });
+          const switched = keys.every((k) => shown[k] === k.slice(4));
+          return JSON.stringify({ same, switched, seen, shown });
         })()""")
         print("on click:", geom)
         if '"same":true' not in geom:
-            failures.append("the plot moves when a tab is clicked: %s" % geom)
+            failures.append("the plot moves when a tab is clicked (or there were"
+                            " not two tabs to click): %s" % geom)
+        if '"switched":true' not in geom:
+            failures.append("clicking a map's tab does not put that map on screen: %s" % geom)
 
         # 🔴 AND THE PLOT MUST NOT MOVE WHEN THE SECOND MAP ARRIVES. A fold
         # adds them at different times - the contact map comes off the trunk
@@ -211,7 +244,7 @@ def main():
         # computed off the critical path - AF2's per recycle, AF3's at
         # trunk-done - so they always arrive after their frame, and for a
         # while none of them ever showed.
-        deferred = cdp.evaluate(ws, """(() => {
+        deferred = cdp.evaluate(ws, """(async () => {
           const reg = window.py2dmol_viewers || {};
           const v = reg[Object.keys(reg)[0]] && reg[Object.keys(reg)[0]].renderer;
           const name = v.currentObjectName;
@@ -224,12 +257,21 @@ def main():
           frame.maps = Object.assign({}, frame.maps, {
             late: { data: late, n, vmin: 0, vmax: 1 },
           });
-          const tabs = () => [...document.querySelectorAll(
-            '#heatmapContainer [role="tab"]')].map((t) => t.dataset.mapKey);
+          const mapTabs = () => {
+            const c = document.getElementById('heatmapContainer');
+            const slot = c && c.closest('.py2dmol-slot');
+            const strip = slot && slot.querySelector(':scope > .py2dmol-slot-tabs');
+            return strip ? [...strip.querySelectorAll('[role="tab"]')]
+              .filter((t) => (t.dataset.view || '').startsWith('map:')) : [];
+          };
+          const tabs = () => mapTabs().map((t) => t.dataset.view.slice(4));
           v.render('render-only');
           const afterRender = tabs();
           window.Heatmap.updateFrame(v, object, v.currentFrame || 0);
           v.render('after-update');
+          // The slot's strip is rebuilt from the render loop, so the new tab is
+          // there a frame later rather than in the same tick.
+          for (let i = 0; i < 2; i++) await new Promise((r) => requestAnimationFrame(r));
           return JSON.stringify({ afterRender, afterUpdate: tabs() });
         })()""")
         print("deferred:", deferred)

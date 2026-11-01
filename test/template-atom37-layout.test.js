@@ -18,9 +18,9 @@
 import { describe, it, expect } from "./harness.js";
 import { readFileSync } from "node:fs";
 import { chainResidues, identityMap, templateSlot, templateSlotAtom37 }
-  from "../src/af3/featurise/template-input.js";
+  from "../shared/af3/featurise/template-input.js";
 import { ATOM37, AF2_ATOM37_MONOMER, NUM_DENSE, packTemplateGeometry, templateGeometry }
-  from "../src/af3/featurise/template-features.js";
+  from "../shared/af3/featurise/template-features.js";
 
 const CRYSTAL = readFileSync("tools/fixtures/5caj-crystal.pdb", "utf8");
 const structure = chainResidues(CRYSTAL, "A");

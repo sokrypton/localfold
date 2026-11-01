@@ -20,7 +20,7 @@
  * lanes consecutive channels, so neither half of a packed word is owned by the
  * lane that would write it. The packed form gives a lane a PAIR of adjacent
  * channels - half the lanes, twice the accumulators - and twice the
- * accumulators is exactly where src/kernels/attention.js records an AF2 tile
+ * accumulators is exactly where webgpu/kernels/attention.js records an AF2 tile
  * getting SLOWER, because sixteen vec4 spill. That is the question this arm
  * exists to answer:
  *
@@ -30,7 +30,7 @@
  * 1e-3, which is half precision and not a fault. A tile that leaves rows
  * unwritten shows up far larger; that is still what the column is for.
  */
-import { createGridAttentionShaders } from "../../src/af3/trunk/grid-attention-webgpu.js";
+import { createGridAttentionShaders } from "../../webgpu/af3/trunk/grid-attention.js";
 import { createMatrixLinearShader, matrixLinearFits } from "./gemm-matrix.js";
 
 const option = (args, name, fallback) => {
@@ -117,11 +117,15 @@ export async function main(device, args) {
   };
   for (const spec of arms_spec) {
     const [shapeSpec, drop] = spec.split(":");
-    const packed = shapeSpec.endsWith("p");
-    const [rows, chunk] = (packed ? shapeSpec.slice(0, -1) : shapeSpec).split("/").map(Number);
+    // ...`h` after the rows: the projection in f16 arithmetic (`projectArithmetic`)
+    const half = shapeSpec.endsWith("h");
+    const bare = half ? shapeSpec.slice(0, -1) : shapeSpec;
+    const packed = bare.endsWith("p");
+    const [rows, chunk] = (packed ? bare.slice(0, -1) : bare).split("/").map(Number);
     const sources = createGridAttentionShaders(
       { n, channels, heads, dimension, transpose: false,
         projectRows: rows, projectOutRows: rows, attendKeyChunk: chunk,
+        ...(half ? { projectArithmetic: "f16" } : {}),
       },
       // ...gathered and normalized stay f32 here: this bench asks about
       // q/k/v/gate alone, which is the one that needs the ownership change.

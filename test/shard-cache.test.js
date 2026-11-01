@@ -1,5 +1,5 @@
 import { describe, expect, it } from "./harness.js";
-import { staleShardCaches } from "../src/bundles/http-tensor-store.js";
+import { staleShardCaches } from "../shared/bundles/http-tensor-store.js";
 
 const manifest = (model, bytes, tensors) => ({
   bundle: { model, bytes },

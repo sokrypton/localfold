@@ -9,7 +9,7 @@
  * negative time, and it named the atom encoder's attention blocks when the real
  * cost was four times bigger and in a pass nobody had suspected.
  *
- * `timestamp-query` is already among the features src/runtime/device.js
+ * `timestamp-query` is already among the features webgpu/runtime/device.js
  * requests. This uses it: every compute pass already carries a label, so
  * wrapping createCommandEncoder is enough to time all of them with no change to
  * any kernel.
@@ -21,7 +21,7 @@
  * does not.
  */
 
-import { setDeviceTuning } from "../../src/runtime/device-profile.js";
+import { setDeviceTuning } from "../../webgpu/runtime/device-profile.js";
 
 /**
  * @param {GPUDevice} device

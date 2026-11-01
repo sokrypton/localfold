@@ -54,11 +54,11 @@
  * sigma0 = 160 is the setting that is defensible for both: 0.047 against 0.168
  * on the ligand at sixteen steps, for 0.025 A of backbone RMSD on 1QYS.
  */
-import { featuriseProtein } from "../../src/af3/featurise/featurise.js";
-import { foldBatch } from "../../src/af3/fold.js";
-import { ccdUrl, parseCcdComponent } from "../../src/af3/featurise/ccd-component.js";
-import { openAf3Store } from "../../src/af3/weights/weights.js";
-import { foldWeights } from "../../src/af3/weights/diffusion-weights.js";
+import { featuriseProtein } from "../../shared/af3/featurise/featurise.js";
+import { foldBatch } from "../../webgpu/af3/fold.js";
+import { ccdUrl, parseCcdComponent } from "../../shared/af3/featurise/ccd-component.js";
+import { openAf3Store } from "../../shared/af3/weights/weights.js";
+import { foldWeights } from "../../shared/af3/weights/diffusion-weights.js";
 
 /** sigmaMax is in units of sigmaData, so the walk starts at sigmaData*sigmaMax. */
 const SIGMA_DATA = 16;
@@ -121,7 +121,7 @@ export function ligandBondError(batch, positions, components) {
  */
 export async function sweepLigandFlow(options) {
   const { device, weights, components, stepCounts } = options;
-  const mode = options.mode ?? "flow";
+  const mode = options.mode ?? "diffusion";
   const startSigmas = mode === "flow" ? options.startSigmas : [null];
   const sequence = options.sequence ?? "";
   const batch = featuriseProtein(sequence, { ligands: components });
@@ -178,7 +178,7 @@ export async function main(device, args) {
     // question here that generalises: did the component come out as itself?
     // Under any other mode the sigma column is the sampler's own schedule and
     // `startSigmas` is ignored, so it is collapsed to one cell.
-    mode: option(args, "mode", "flow"),
+    mode: option(args, "mode", "diffusion"),
     startSigmas: option(args, "sigmas", "2560,640,160,56,16").split(",").map(Number),
     stepCounts: option(args, "steps", "2,4,6,8,16").split(",").map(Number),
     seed: Number(option(args, "seed", "20260831")),

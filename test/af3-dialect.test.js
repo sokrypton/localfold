@@ -21,9 +21,9 @@ import { describe, it } from "node:test";
 import {
   ALPHAFOLD3, DIALECTS, OPENBIND0, OPENDDE, dialectFor, featuriserDialect,
   singleCondPadding, singleCondPaddingWgsl, singleCondSource,
-} from "../src/af3/dialect.js";
-import { af3Dialect } from "../src/af3/weights/weights.js";
-import { featuriseProtein } from "../src/af3/featurise/featurise.js";
+} from "../shared/af3/dialect.js";
+import { af3Dialect } from "../shared/af3/weights/weights.js";
+import { featuriseProtein } from "../shared/af3/featurise/featurise.js";
 
 const LIGAND = {
   code: "TST",
@@ -53,11 +53,19 @@ describe("the dialect table", () => {
   it("turns on exactly the branches OpenBind-0 needs", () => {
     assert.deepEqual(on(OPENBIND0),
       [
+      // 🔴 OF3's ATOMISED TOKENS AND LEAVING ATOMS (af3-any-model colab's of3 knobs, against its batches): UNK on the
+      // restype alone, a link only between two atomised residues, the CCD leaving group at a declared bond and a
+      // modified residue's at the chain ends, a ligand otherwise whole - and no DNA in its alignment.
+      "atomizedBackboneBonds", "atomizedUnknownRestype",
+      // 🔴 OPENFOLD3's FEATURISER, three ways AlphaFold 3's is not (af3-any-model b84aa69): an unknown amino acid is
+      // the CCD's UNK, the main MSA each chain's first 16384 rows deduplicated, and every (slot, token) without
+      // template atoms the GAP restype.
+      "ccdUnknownResidue",
       // 🔴 CENTRE_REF_CONFORMERS: every family but stock AlphaFold 3 centres
       // its reference conformers per `ref_space_uid`. Missing here, it was
       // worth 2.89e-2 -> 2.47e-2 on openbind0's sequence-featurised
-      // `target_feat` against af3-any-model. See src/af3/featurise/featurise.js.
-      "centreRefConformers",
+      // `target_feat` against af3-any-model. See shared/af3/featurise/featurise.js.
+      "centreRefConformers", "declaredBondLeavingAtoms", "dnaGapMsa",
       // 🔴 NO TERMINAL OXT AND NO 5' OP3, which is not an OpenFold-lineage
       // question - protenix and opendde are in that lineage and deliberately
       // KEEP the OXT. Carrying it put openbind0's last two atom windows 128
@@ -65,7 +73,8 @@ describe("the dialect table", () => {
       // window's edge is the atom COUNT. `tools/check-atom-windows.js` is the
       // gate and all seven models are exact on it.
       "dropTerminalAtoms",
-      "maskPaddedKeys", "padSingleCondUnknownDna", "symmetriseBonds"]);
+      "keepLigandLeavingAtoms", "keysUidFromQueriesLayout", "mainMsaCap", "maskPaddedKeys", "modifiedLeavingAtEnds",
+      "padSingleCondUnknownDna", "perAtomHeadsByRank", "symmetriseBonds", "templateGapWhereNoAtoms", "templateModified"]);
   });
 
   /**
@@ -100,9 +109,16 @@ describe("the dialect table", () => {
       // 🔴 CENTRE_REF_CONFORMERS: every family but stock AlphaFold 3 centres
       // its reference conformers per `ref_space_uid`. Missing here, it was
       // worth 2.89e-2 -> 2.47e-2 on openbind0's sequence-featurised
-      // `target_feat` against af3-any-model. See src/af3/featurise/featurise.js.
+      // `target_feat` against af3-any-model. See shared/af3/featurise/featurise.js.
       "centreRefConformers",
       "chainedAtomLayerNorm",
+      // 🔴 DECLARED BONDS AS PROTENIX'S include_discont_poly_poly_bonds ("discontinuous": af3-any-model 964990e)
+      // 🔴 AND THE LEAVING GROUP AT EACH DECLARED BOND DROPPED BEFORE TOKENISING (af3-any-model b61bd1d)
+      "declaredBondLeavingAtoms",
+      "declaredPolymerBonds",
+      // 🔴 THE QUERY ONCE IN A SELF-MSA, and a ligand UNK in the MSA: protenix's featuriser (af3-any-model's
+      // dedupe_self_msa and native_nonprotein_msa for opendde)
+      "dedupeSelfMsa",
       "distogramBias",
       // 🔴 THE GAP RESTYPE IN ITS ONE EMPTY TEMPLATE SLOT, which is a VALUE
       // (21) and not a boolean. OpenDDE takes protenix's featuriser, so a query
@@ -110,23 +126,29 @@ describe("the dialect table", () => {
       // the rest - and writing 0 everywhere was worth 2.07e-2 on the trunk's
       // `z_after_template` seam against af3-any-model. See docs/AF3.md.
       "emptyTemplateAatype",
-      "keyMaskedAtomAttention",
+      "keepLigandLeavingAtoms", "keyMaskedAtomAttention",
+      // 🔴 THE KEYS' REFERENCE SPACE FROM THE QUERIES LAYOUT, as its vendor gates it: stock AF3 alone keeps
+      // upstream's token-layout gather (sokrypton/alphafold3 c8c6ba9)
+      "keysUidFromQueriesLayout",
       "maskPaddedKeys",
       "msaUpdateBeforeOuterProduct",
+      "nativeNonproteinMsa",
       "padSingleCondUnknownDna",
       // 🔴 WHERE THE ATOM KEY WINDOW SITS, WHICH IS NOT WHETHER ITS PADDED
       // SLOTS ARE MASKED - `maskPaddedKeys` above is the second question. This
       // family CLAMPS the window and masks what falls outside; AlphaFold 3
       // slides it bodily in bounds. af3-any-model measured its own version of
-      // this at 6MRR 0.767 -> 0.737 here. See src/af3/featurise/featurise.js.
+      // this at 6MRR 0.767 -> 0.737 here. See shared/af3/featurise/featurise.js.
       "paddedAtomKeys",
       "pairInitFromSingle",
       "perBlockAtomPairLayerNorm",
-      "perBlockPairLayerNorm",
+      "perBlockPairLayerNorm", "protenixUnpairedMsa", "sampler",
       "splitPairConditioning",
       "structuralTokens",
       "swapTransposedBias",
-      "symmetriseBonds",
+      "symmetriseBonds", "templateModified",
+      // 🔴 EACH CENTRED CONFORMER MOVED BY U(-1, 1) PER AXIS, protenix's inference augmentation (af3-any-model 345cb11)
+      "translateConformers",
     ]);
   });
 
@@ -302,14 +324,17 @@ describe("the token bond matrix", () => {
 it("the atomised-token conventions are the four the references show", () => {
   const expected = {
     alphafold3:   [false, false, false, false],
-    openbind0:    [false, false, false, false],
+    // openbind0 (of3): the unknown restype alone - its alignment keeps the letter - and a link between two atomised
+    openbind0:    [false, "aatype", false, "both"],
     opendde:      [false, false, false, false],
     protenix2:    [false, false, false, false],
     // boltz2 gives an atomised token the unknown restype and leaves the
     // ALIGNMENT holding the parent residue; rf3 moves both.
     boltz2:       [false, true,  false, false],
     intellifold2: [false, false, false, false],
-    rosettafold3: [true,  true,  true,  true],
+    rosettafold3: [true,  "nucleic", true, true],
+    // chai-1: an atomised amino acid 20 and an atomised nucleotide 30 (its DX/RX), in every alignment row
+    chai1:        [false, "chai", true, false],
   };
   for (const [model, want] of Object.entries(expected)) {
     const dialect = dialectFor(model);
@@ -330,7 +355,7 @@ it("featuriserDialect carries every featuriser convention", () => {
   for (const field of ["symmetriseBonds", "centreRefConformers", "paddedAtomKeys",
                        "qblockAtomKeys", "dropTerminalAtoms", "dedupeSelfMsa",
                        "atomizedElementNames", "atomizedUnknownRestype",
-                       "atomizedUnknownMsa", "atomizedBackboneBonds"]) {
+                       "atomizedUnknownMsa", "atomizedBackboneBonds", "declaredBondFeature"]) {
     assert.ok(carried.includes(field), `featuriserDialect drops ${field}`);
   }
   // ...and NOT the graph conventions: a featuriser has no business with a
@@ -340,38 +365,4 @@ it("featuriserDialect carries every featuriser convention", () => {
     assert.ok(!carried.includes(field), `featuriserDialect should not carry ${field}`);
   }
   assert.deepEqual(featuriserDialect(undefined), {});
-});
-
-// 🔴 THE SAMPLER A CHECKPOINT ACTUALLY HAS, which the page was not asking
-// about. rosettafold3 has no working flow walk - `--mode=flow` gives N-CA
-// 6.94 A against 1.46 and consecutive CA collapsing to 0.23 A, a fold the
-// geometry gate refuses - while pLDDT reads 81.47 against the good fold's
-// 81.53. The page's sampler select defaults to Flow, so that is what a visitor
-// picking this model would have got, with a confidence number saying nothing
-// was wrong. Every other family folds in flow (af3 CA-CA 3.58, if2 3.88).
-it("only rosettafold3 declares that it has no flow sampler", () => {
-  for (const [model, dialect] of Object.entries(DIALECTS)) {
-    assert.equal(dialect.noFlowSampler, model === "rosettafold3",
-      `${model}'s noFlowSampler`);
-  }
-});
-
-// ...and the PAGE must agree with the table, or the guard in `foldBatch` throws
-// at a visitor instead of the page never asking.
-it("the page forces diffusion for exactly those families", async () => {
-  const { NO_FLOW_SAMPLER_FAMILIES, samplerModeFor } =
-    await import("../web/af3-model.js");
-  const declared = Object.entries(DIALECTS)
-    .filter(([, dialect]) => dialect.noFlowSampler === true).map(([model]) => model);
-  for (const model of declared) {
-    assert.ok(NO_FLOW_SAMPLER_FAMILIES.includes(model),
-      `${model} has no flow sampler and the page still offers one`);
-    assert.equal(samplerModeFor(model, "flow"), "diffusion");
-  }
-  // ...and it does not force it on a model that is fine, which would silently
-  // make every other fold slower and different.
-  assert.equal(samplerModeFor("alphafold3", "flow"), "flow");
-  assert.equal(samplerModeFor("intellifold2", "flow"), "flow");
-  // OpenDDE is forced for its own, measured, different reason.
-  assert.equal(samplerModeFor("opendde", "flow"), "diffusion");
 });

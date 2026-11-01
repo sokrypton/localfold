@@ -1,0 +1,33 @@
+{
+ "name": "6mrr-gol-sep",
+ "modelSeeds": [
+  1
+ ],
+ "sequences": [
+  {
+   "protein": {
+    "id": "A",
+    "sequence": "GWSTELEKHREELKKEFLKKEGITNVEIRIDNGRLEVRVEGGTEERLKRFLEELRQKLEKKGYTVDDIKIE",
+    "modifications": [
+     {
+      "ptmType": "SEP",
+      "ptmPosition": 3
+     }
+    ],
+    "unpairedMsa": ">q\nGWSTELEKHREELKKEFLKKEGITNVEIRIDNGRLEVRVEGGTEERLKRFLEELRQKLEKKGYTVDDIKIE\n",
+    "pairedMsa": "",
+    "templates": []
+   }
+  },
+  {
+   "ligand": {
+    "id": "B",
+    "ccdCodes": [
+     "GOL"
+    ]
+   }
+  }
+ ],
+ "dialect": "alphafold3",
+ "version": 2
+}

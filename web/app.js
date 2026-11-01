@@ -21,44 +21,50 @@
  * keep working. What the reader downloads is separate and explicit - see the
  * two buttons at the foot of this file, which write what the model produced.
  */
-import { AlphaFoldMonomerGpu } from "../src/af2/model/monomer.js";
-import { AlphaFoldUnifiedGpu } from "../src/af2/multimer/model.js";
+import { AlphaFoldMonomerGpu } from "../webgpu/af2/model/monomer.js";
+import { AlphaFoldUnifiedGpu } from "../webgpu/af2/multimer/model.js";
 import { blankChainColumns, foldsAsSingleSequence, parseA3m }
-  from "../src/input/a3m.js";
-import { planRecycleReuse } from "../src/af2/model/recycle-convergence.js";
+  from "../shared/input/a3m.js";
+import { mergeJobAlignments } from "../shared/input/chains.js";
+import { planRecycleReuse } from "../shared/af2/model/recycle-convergence.js";
 // 🔴 mergeSearchedChains IS USED ONLY WHEN A SEARCH IS REUSED, which is why it
 // shipped missing from this list. That path needs a cache from an earlier fold
 // AND more than one chain, so a first fold never reaches it - and stopping a
 // fold partway is one of the few ways to get a filled cache and then fold
 // again. test/module-references.test.js now looks for the whole class.
 import { generateMmseqs2ComplexMsa, generateMmseqs2Msa, mergeSearchedChains,
-  expandSearchedChains, planSearchReuse, searchCacheEntry }
-  from "../src/input/mmseqs2-api.js";
-import { isAbortError, throwIfAborted } from "../src/runtime/abort.js";
-import { distogramContactProbabilities } from "../src/heads/distogram.js";
+  expandSearchedChains, planSearchReuse, searchCacheEntry, singleSequenceA3m }
+  from "../shared/input/mmseqs2-api.js";
+import { isAbortError, throwIfAborted } from "../webgpu/runtime/abort.js";
 import { GpuMemoryBudgetError, setMemoryBudget }
-  from "../src/runtime/device-memory.js";
-import { AF3_COUNTS, OPENDDE_COUNTS, OPENDDE_SAMPLER_MODE, NO_FLOW_SAMPLER_FAMILIES,
-  samplerModeFor, af3SequenceProblem, alphaCarbons, fittedPdb, foldAf3,
+  from "../webgpu/runtime/device-memory.js";
+import { AF3_COUNTS, af3SequenceProblem, alphaCarbons, fittedPdb, foldAf3,
   loadAf3Weights, toPoints, warmAf3Pipelines } from "./af3-model.js";
-import { actualSteps, ESMFOLD2_COUNTS, ESMFOLD2_SAMPLER_MODE, languageModelRunner,
+import { actualSteps, ESMFOLD2_COUNTS, ESMFOLD2_SAMPLER_MODE, esmfold2StepsFor, languageModelRunner,
   loadEsmfold2Weights } from "./esmfold2-model.js";
-import { SAMPLER_PRESETS, foldEsmfold2 } from "../src/esmfold2/fold.js";
-import { spreadOverAtoms, toDensePositions } from "../src/esmfold2/featurise.js";
-import { toPdb } from "../src/af3/fold.js";
-import { chainGeometryOf, chainGeometryVerdict } from "../src/af3/chain-geometry.js";
-import { ccdUrl, parseCcdComponent } from "../src/af3/featurise/ccd-component.js";
-import { smilesComponent } from "../src/chem/component.js";
-import { GpuBufferAllocator } from "../src/runtime/allocator.js";
+import { SAMPLER_PRESETS, foldEsmfold2 } from "../webgpu/esmfold2/fold.js";
+import { spreadOverAtoms, toDensePositions } from "../shared/esmfold2/featurise.js";
+import { toPdb } from "../webgpu/af3/fold.js";
+import { BIOEMU2_COUNTS, BIOEMU2_DEFAULT_STEPS, bioemu2Features, bioemu2Network, bioemu2ViewerTokens,
+  loadBioemu2Weights, releaseBioemu2, x0FromPdb } from "./bioemu2-model.js";
+import { foldBioemu2 } from "../webgpu/bioemu2/fold.js";
+import { alphaCarbonSpacings, bioemu2Pdb } from "../shared/bioemu2/structure.js";
+import { BioEmu2Graph } from "../shared/bioemu2/graph.js";
+import { checkPhysicality } from "../shared/bioemu2/physicality.js";
+import { chainGeometryOf, chainGeometryVerdict } from "../shared/af3/chain-geometry.js";
+import { ccdUrl, parseCcdComponent } from "../shared/af3/featurise/ccd-component.js";
+import { smilesComponent } from "../shared/chem/component.js";
+import { GpuBufferAllocator } from "../webgpu/runtime/allocator.js";
 import { getDevice, loadModel, releaseModel } from "./model.js";
-import { AF3_FAMILIES, ALL_ATOM_FAMILIES, MODEL_BUNDLES, MODELS_WITHOUT_CONFIDENCE,
+import { releaseAllWeights } from "../webgpu/runtime/resident.js";
+import { AF3_FAMILIES, ALL_ATOM_FAMILIES, BIOEMU2_FAMILIES, MODEL_BUNDLES, MODELS_WITHOUT_CONFIDENCE,
   SINGLE_SEQUENCE_FAMILIES, graphFamily }
-  from "../src/bundles/manifests/index.js";
-import { devAdopt, devBeginRun, devEndRun, devNote, devOnEntry, devSourceIs, devStatus,
-  devUseDevice } from "./dev-log.js";
+  from "../shared/bundles/manifests/index.js";
+import { devBeginRun, devEndRun, devNote, devPhase, devStatus, devUseDevice } from "./dev-log.js";
 import { installDevPanel } from "./dev-panel.js";
 import { correspondence } from "./align.js";
 import { superposeOnto } from "./morph.js";
+import { superposePdbOnto } from "./pdb-superpose.js";
 import { CHAIN_IDS, confidenceJson, contactMapFor, matrixForViewer, modifiedPositions,
   paeMatrix, predictionToPdb, safeJobName, viewerTokens } from "./prediction-results.js";
 import { complexSequenceProblem } from "./sequence.js";
@@ -67,19 +73,19 @@ import { complexSequenceProblem } from "./sequence.js";
 import { updateScoresCard } from "./scores-card.js";
 import { entitiesFromText, entitiesProblem, expandEntities, POLYMER_TYPES,
          templateKind } from "./entities.js";
-import { buildFoldArchive, tokenLayoutFrom, msasFromArchive,
+import { buildFoldArchive, tokenLayoutFrom, msasFromArchive, templatesFromArchive,
          SINGLE_SEQUENCE_ORIGIN } from "./fold-archive.js";
-import { jobFromJson } from "./job-json.js";
+import { jobFromJson, jobInputJson } from "./job-json.js";
 import {
   clearSession, jobMeta, readSession, readSessionMeta, saveSession,
 } from "./fold-session.js";
 import { looksLikeZip, readZip, writeZip } from "./zip.js";
 import { createEntityList } from "./entity-ui.js";
-import { buildTemplate, describeCoverage, fetchStructure } from "./template-source.js";
-import { fetchMmseqs2Templates } from "../src/input/mmseqs2-api.js";
-import { RuntimeEstimator } from "../src/runtime/cost-model.js";
-import { colabRole, installColabBridge, remoteCommand, remoteEvents, remoteHead,
-  revivePrediction, tapOut } from "./colab-bridge.js";
+import { buildTemplate, describeCoverage, fetchStructure, mergeAtom37Templates, parseSource } from "./template-source.js";
+import { fetchMmseqs2Templates } from "../shared/input/mmseqs2-api.js";
+import { RuntimeEstimator } from "../webgpu/runtime/cost-model.js";
+import { nativeRole, installNativeBridge, remoteBackendChoice, remoteBackendName, remoteCommand,
+  remoteLiveChoice, remoteEvents, remoteHead } from "./native-bridge.js";
 const element = (id) => {
   const value = document.getElementById(id);
   if (value === null) throw new Error(`missing element #${id}`);
@@ -124,13 +130,11 @@ function foldStem(fallback) {
 // on what the model still held. `set` is the same call the paste path makes.
 window.__entityList = entityList;
 
-// 🔴 AND THE FINISHED PREDICTION, FOR THE SAME REASON. A backend driving this
-// page headlessly (tools/colab_backend.py) could read the STRUCTURE out of the
-// download button and nothing else - so a remote fold arrived with no
-// alignment, no confidence and no scores card, which is most of what the page
-// shows about a fold. `lastPrediction` is a module binding; a function rather
-// than the value because it is REASSIGNED on every fold and a captured
-// reference would hand back the one before.
+// 🔴 AND THE FINISHED PREDICTION, FOR THE SAME REASON: a gate driving this page
+// (tools/check-native-worker.py, tools/check-model-pending.py) reads what the page
+// holds rather than what its download button writes. `lastPrediction` is a
+// module binding; a function rather than the value because it is REASSIGNED on
+// every fold and a captured reference would hand back the one before.
 window.__lastPrediction = () => lastPrediction;
 
 // 🔴 THE ENTITY LIST IS THE INPUT NOW, and everything below it still reads a
@@ -329,7 +333,7 @@ function rememberTermsAccepted() {
  * ignored looks exactly like one that worked, and the reader finds out from the
  * fold they get. `of3` is deliberately NOT an alias for `openbind`: OpenFold3's
  * preview-2 and its v0.5.0 release are different models with different forward
- * conventions (see src/af3/dialect.js), so quietly resolving one to the other
+ * conventions (see shared/af3/dialect.js), so quietly resolving one to the other
  * would hand somebody a model they did not ask for. `openbind` IS accepted,
  * because that is the name upstream publishes the blob under and the name this
  * page used before the release number was added - but it resolves to
@@ -346,7 +350,7 @@ const MODEL_ALIASES = { openbind: "openbind0", ob: "openbind0", ob0: "openbind0"
                         // family name resolves to the release this page
                         // actually carries rather than standing for whatever
                         // the name means next.
-                        boltz: "boltz2", protenix: "protenix2" };
+                        boltz: "boltz2", protenix: "protenix2", "mol-1": "mol1" };
 
 function applyModelFromUrl() {
   let asked;
@@ -367,7 +371,7 @@ function applyModelFromUrl() {
   // silently-ignored parameter this function exists to prevent, wearing a
   // complaint that names a family the page really does have.
   const viaPlm = Object.entries(PLM_FAMILIES)
-    .find(([, family]) => family === wanted && wanted !== PLM_FAMILIES.none);
+    .find(([, family]) => family === wanted);
   const plm = document.getElementById("plm-mode");
   if (viaPlm !== undefined && plm !== null) {
     const host = [...select.options].map((option) => option.value)
@@ -591,7 +595,24 @@ const isAf3Family = (family) => AF3_FAMILIES.includes(family);
  * a capability it has. That is the mistake recorded in CLAUDE.md for the
  * AF3/OpenBind split, one model later, and this is the name that prevents it.
  */
-const supportsAllAtom = (family) => ALL_ATOM_FAMILIES.includes(family);
+/**
+ * The models only a native port folds: biohub's released ESMFold2-Fast and ESMFold2, on ESM-C 6B (2.5 GB as 3-bit
+ * codes, more than a page holds), from local exports - offered when `localfold serve` says it has them
+ * (web/native-bridge.js), refused by name on this page's own WebGPU. Both take ligands, modified residues and nucleic
+ * chains as the single-sequence tier does; ESMFold2 also reads an alignment, so it keeps the MSA row.
+ */
+const NATIVE_ONLY_FAMILIES = ["ef2-fast", "ef2"];
+/**
+ * 🔴 TWO QUESTIONS ABOUT ESMFold2, AND THEY ARE NOT ONE. The model row has one ESMFold2 entry and the variant row picks
+ * the checkpoint: Fast on ESM-C 600M or 300M (biohub's experimental tier - SINGLE_SEQUENCE_FAMILIES, the WebGPU
+ * registry's), Fast on ESM-C 6B, Full on ESM-C 6B (the released two, native only). `isEsmfold2` is "show the variant
+ * row and ESMFold2's step dial"; `readsNoAlignment` is the experimental tier alone, whose checkpoint disables its
+ * alignment features - the released Fast reads an alignment's profile and Full encodes it. Asked as one question
+ * ("the single-sequence tier"), choosing the 6B Fast hid the row it was chosen on and sent AlphaFold 3's step count.
+ */
+const readsNoAlignment = (family) => SINGLE_SEQUENCE_FAMILIES.includes(family);
+const isEsmfold2 = (family) => readsNoAlignment(family) || NATIVE_ONLY_FAMILIES.includes(family);
+const supportsAllAtom = (family) => ALL_ATOM_FAMILIES.includes(family) || NATIVE_ONLY_FAMILIES.includes(family);
 
 /**
  * What a fold's viewer object and downloaded files are called, per model.
@@ -611,6 +632,7 @@ const MODEL_STEMS = {
   opendde: "opendde",
   boltz2: "boltz2",
   protenix2: "protenix2",
+  mol1: "mol1",
   intellifold2: "intellifold2",
   rosettafold3: "rosettafold3",
   monomer: "af2",
@@ -629,6 +651,9 @@ const MODEL_STEMS = {
   "multimer-5": "af2_multimer_model5",
   "ef2-fast-600m": "ef2_fast_600m",
   "ef2-fast-300m": "ef2_fast_300m",
+  "ef2-fast": "esmfold2_fast",
+  ef2: "esmfold2",
+  bioemu2: "bioemu2",
 };
 
 /** What to call each model while its weights download. */
@@ -651,12 +676,9 @@ const MODEL_STEMS = {
 
 
 /** The family a prediction's own label names, where the label is one we write. */
-const familyFromLabel = (label) => Object.keys(MODEL_LABELS)
-  .find((family) => MODEL_LABELS[family] === label);
-
 const MODEL_LABELS = {
   af3: "AlphaFold 3",
-  // Upstream's own name for this release. See src/af3/dialect.js for why the
+  // Upstream's own name for this release. See shared/af3/dialect.js for why the
   // number is not decoration.
   openbind0: "OpenBind-0",
   opendde: "OpenDDE",
@@ -665,6 +687,7 @@ const MODEL_LABELS = {
   // that has more than one member.
   boltz2: "Boltz-2",
   protenix2: "Protenix-v2",
+  mol1: "Mol-1",
   intellifold2: "IntelliFold-2",
   rosettafold3: "RoseTTAFold3",
   monomer: "AlphaFold 2",
@@ -684,6 +707,9 @@ const MODEL_LABELS = {
   // ...the same folding model against the smaller tower, and its own
   // checkpoint. The label names the tower because that is what differs.
   "ef2-fast-300m": "EF2-fast (300M)",
+  "ef2-fast": "ESMFold2-Fast (ESM-C 6B)",
+  ef2: "ESMFold2",
+  bioemu2: "BioEmu2",
   // 🔴 AND THE FIVE AF2 MODELS SAY WHICH ONE IS LOADING, DERIVED RATHER THAN
   // TYPED. A delta downloads its BASE as well as itself, so the dial reading
   // "AlphaFold 2 · 73 / 116 MiB" under model 2 is the only place a reader is
@@ -755,13 +781,12 @@ const modelFamily = (ligandCount = 0, modificationCount = 0, nucleicCount = 0,
   //
   // 🔴 AND AlphaFold 2's MONOMER IS NOT IN THAT CLASS ANY MORE. Its term was
   // always there and oracle-checked; the driver simply never forwarded the
-  // slot, so this refusal was right for the wrong reason. The MULTIMER stays
-  // refused here: it forwards a template in its own driver, but its embedder
-  // is a different dialect with a different feature set and nothing on this
-  // page has ever built one for it - which is exactly the gap that made the
-  // monomer's term look supported for a year.
-  if (templateCount > 0 && !isAf3Family(choice) && graphOf(choice) !== "monomer") {
-    throw new Error("Templates need AF3, OpenBind-0 or AlphaFold 2 monomer;"
+  // slot, so this refusal was right for the wrong reason. Nor is the MULTIMER:
+  // its embedder is a different dialect, and the page builds its slot too -
+  // one atom37 slot over the complex, each chain at its offset (see the AF2
+  // branch of the fold). 1BRS A:D with a self-template: 16.68 -> 0.78 A.
+  if (templateCount > 0 && !isAf3Family(choice) && !["monomer", "multimer"].includes(graphOf(choice))) {
+    throw new Error("Templates need an AF3-lineage model or AlphaFold 2;"
       + ` the model is set to ${choice}`);
   }
   // 🔴 AND THREE OF ALPHAFOLD 2's FIVE MODELS HAVE NO TEMPLATE EMBEDDER AT ALL.
@@ -811,7 +836,7 @@ const msaMode = () => {
   // family - "unknown model ef2-fast-600m: expected monomer, multimer, af3,
   // openbind0". The control was ignored everywhere except the one place it
   // could still throw.
-  if (SINGLE_SEQUENCE_FAMILIES.includes(chosenFamily())) return "single";
+  if (readsNoAlignment(chosenFamily())) return "single";
   const chosen = element("msa-mode").value;
   // 🔴 `job` IS AN ACTION AND NOT A MODE, SO IT NEVER REACHES A FOLD. Selecting
   // it opens a file picker; it answers here with the mode it replaced, because
@@ -860,6 +885,17 @@ const predictions = new Map();
  * unpaired block, which reads back as a fold nobody ran.
  */
 function archiveMsas(chains, alignment) {
+  // 🔴 THE ARCHIVE WRITES `{unpaired, paired}` AND AN UPLOADED ARCHIVE IS HELD
+  // AS `{chainA3ms, pairedA3ms}`, so returning it whole wrote neither block and
+  // re-saving a fold made from a dropped archive lost its alignments. A job's
+  // own alignments are per chain already.
+  if (msaMode() === "upload" && uploadedMsas?.inline !== undefined) {
+    return { unpaired: uploadedMsas.inline.unpaired, paired: uploadedMsas.inline.paired };
+  }
+  if (msaMode() === "upload" && uploadedMsas?.chains > 0) {
+    return { unpaired: uploadedMsas.chainA3ms,
+             paired: uploadedMsas.chainA3ms.map((_, index) => uploadedMsas.pairedA3ms?.get(index)) };
+  }
   if (msaMode() === "upload" && uploadedMsas !== undefined) return uploadedMsas;
   if (msaMode() === "search" && searchCache?.raw !== undefined) {
     const { chainA3ms, pairedA3ms, single } = searchCache.raw;
@@ -906,9 +942,16 @@ let foldContext = {};
  * path, and half of it is what the fold RESOLVED rather than what was asked
  * for. Reading a form back out of a report is how the two drift.
  */
+// The family the page last folded, so a change of model can release the last
+// one's resident weights - see the fold's first lines.
+let lastFoldedFamily;
+
 const FOLD_CONTROLS = ["model-family", "af2Model", "plm-mode", "msa-mode",
                        "msa-text", "max-msa", "recycles", "tolerance",
-                       "af3-mode", "af3-count", "random-seed"];
+                       "af3-count", "random-seed",
+                       // BioEmu2's own: its mode, its sample count, its contacts and its propagation
+                       "bioemu2-mode", "bioemu2-samples", "bioemu2-contacts", "bioemu2-lag",
+                       "bioemu2-propagation-steps", "bioemu2-propagate-from"];
 
 /** What the form says now, in one object the session can carry. */
 function formInputs() {
@@ -977,13 +1020,10 @@ function applyInputs(inputs) {
   return true;
 }
 
-// 🔴 EXPOSED FOR THE COLAB BRIDGE, WHICH CANNOT IMPORT THIS FILE. web/app.js
-// imports web/colab-bridge.js, so the call the other way would be a cycle -
-// the same reason the runtime-stopped notice travels as a DOM event. The
-// runtime's page needs exactly these two: `read` is what the reader sends
-// when Fold is pressed on the other machine, `apply` is how this page puts
-// that form on before pressing its own button. Sharing them is what stops the
-// bridge growing a second, staler idea of what a fold is made of.
+// 🔴 EXPOSED FOR WHAT DRIVES THIS PAGE FROM OUTSIDE (tools/check-model-switch.py):
+// `read` is the form a fold is made of and `apply` puts one on, through the
+// same path a restored session takes - so a driver has no second, staler idea
+// of what a fold is made of.
 window.__foldInputs = { read: formInputs, apply: applyInputs };
 
 /** The last prediction, kept so it can be downloaded as it was computed. */
@@ -1005,25 +1045,7 @@ let viewer;
 let viewerObject;
 
 /** py2Dmol's own status line, so folding reports where fetching used to. */
-// 🔴 A TAP, NOT A SECOND FOLD PATH. When this page is the one a Colab runtime
-// is driving headlessly, the page a reader is looking at is somewhere else -
-// so the status line, the bar and every sampler frame have to travel. They
-// travel as the SAME calls the local fold already makes, handed to
-// web/colab-bridge.js here; there is no remote-only code path to keep in step
-// with the real one, which is the whole reason the runtime runs this page
-// rather than a port of it.
-//
-// `tapOut` PUSHES, in the task that made the event - it used to park it in an
-// array for tools/colab_backend.py to collect over CDP every 250 ms, and a
-// busy page answers a debugger when it feels like it: reported as the reader's
-// bar sitting at "embedder · 1%" for a whole fold. Off the runtime it is one
-// property read per status write and nothing else.
-function remoteTap(kind, payload) {
-  tapOut(kind, payload);
-}
-
 function status(text, isError = false) {
-  remoteTap("status", text);
   const node = document.getElementById("status-message");
   // 🔴 THE TIMELINE IS FED BEFORE THE EARLY RETURN, so a page whose status line
   // is missing still records. It costs one string compare a write, and only a
@@ -1034,7 +1056,7 @@ function status(text, isError = false) {
   // the runtime's phases against this browser's clock and file them under this
   // browser's (empty) device - the rows that arrive as `dev` events are the
   // real ones, taken where the work happened.
-  if (colabRole() !== "reader") devStatus(text);
+  if (nativeRole() !== "reader") devStatus(text);
   if (node === null) return;
   node.textContent = text;
   node.classList.toggle("error", isError);
@@ -1164,11 +1186,13 @@ function modelProgress(fraction, detail = "") {
  * because none of them has a language model to run.
  */
 function usesLanguageModel(family = chosenFamily()) {
-  if (!SINGLE_SEQUENCE_FAMILIES.includes(family)) return false;
-  return plmChoice() !== "none";
+  // (every ESMFold2 variant folds from its language model: "no language model" is not offered - it was the
+  // sequence alone, which no ESMFold2 is)
+  return isEsmfold2(family);
 }
 
-const plmChoice = () => document.getElementById("plm-mode")?.value ?? "esmc-600m";
+// (|| : a saved session or link naming a variant the row no longer has - "none" - comes back as the default, not blank)
+const plmChoice = () => document.getElementById("plm-mode")?.value || "esmc-600m";
 
 /**
  * What to call the language model in a record of the fold.
@@ -1181,8 +1205,9 @@ const plmChoice = () => document.getElementById("plm-mode")?.value ?? "esmc-600m
  */
 function plmLabel() {
   if (!usesLanguageModel()) return "none";
+  // (the option's own record of its tower: its text names the variant, Fast or Full, beside it)
   const select = document.getElementById("plm-mode");
-  return select?.selectedOptions?.[0]?.textContent?.trim() ?? plmChoice();
+  return select?.selectedOptions?.[0]?.dataset?.languageModel ?? plmChoice();
 }
 
 /**
@@ -1195,15 +1220,16 @@ function plmLabel() {
  * would let a page ask for a pairing that has never existed. The model row
  * therefore shows ONE "EF2-fast" and this row says which.
  *
- * 🔴 AND "None" KEEPS WHICHEVER FOLDING MODEL IS ALREADY THERE, because it is
- * the folding model that folds: with no tower every token takes
- * `shimSingleForZeroState`, which each bundle has its own version of. 600M's is
- * the default and the one the measurements above were made against.
+ * (A "None" variant - the 600M folding model with no tower, every token taking `shimSingleForZeroState` - was offered
+ * here and is not: no ESMFold2 folds from the sequence alone. A session that saved it reads as the 600M default.)
  */
 const PLM_FAMILIES = {
   "esmc-600m": "ef2-fast-600m",
   "esmc-300m": "ef2-fast-300m",
-  none: "ef2-fast-600m",
+  // ...and biohub's RELEASED ESMFold2-Fast, which folds from ESM-C 6B on a native port only (NATIVE_ONLY_FAMILIES)
+  "esmc-6b": "ef2-fast",
+  // ...and biohub's released ESMFold2 itself, the same tower with an MSA encoder and twice the trunk (native only)
+  "esmc-6b-full": "ef2",
 };
 
 function startModelPreload(family, signal) {
@@ -1245,7 +1271,8 @@ function startModelPreload(family, signal) {
   // families and a third is published; `family === "ef2-fast-600m"` sends the
   // 300M one down AlphaFold 2's branch, which is the `family === "af3"` mistake
   // this file already records once.
-  const load = SINGLE_SEQUENCE_FAMILIES.includes(family)
+  const load = BIOEMU2_FAMILIES.includes(family) ? loadBioemu2Weights(report)
+    : SINGLE_SEQUENCE_FAMILIES.includes(family)
     ? loadEsmfold2Weights(report,
                           { languageModel: needsLanguageModel, family })
     : (AF3_FAMILIES.includes(family)
@@ -1262,7 +1289,6 @@ function startModelPreload(family, signal) {
 }
 
 function progress(fraction) {
-  remoteTap("progress", fraction);
   const bar = element("progress");
   if (fraction === null) {
     bar.dataset.state = "idle";
@@ -1684,7 +1710,16 @@ async function loadIntoViewer({ stem, pdb, scores, a3m, pae, length, confidence,
     // both this and the PDB are written from `sequence`.
     files.push(file(`${stem}.a3m`, a3m));
   }
-  const stats = await load(files, true);
+  // 🔴 A LIGAND THE READER ASKED FOR IS NOT A CRYSTALLISATION ADDITIVE. py2Dmol drops HETATM groups named in its
+  // CRYSTAL_ADDITIVES (sulfate, glycerol, the PEGs - P6G among them - buffers, salts and ions) from a loaded structure
+  // unless viewerConfig.ui.filterAdditives is false, and its default is true: right for a crystal off the PDB, wrong
+  // for a prediction, where every ligand is one the reader folded. Reported by a user - a P6G folded, in the PDB and the
+  // archive, and absent from the picture while E0H beside it drew. Off for our own loads, the default put back after.
+  const ui = window.viewerConfig?.ui;
+  const filtered = ui?.filterAdditives;
+  if (ui) ui.filterAdditives = false;
+  let stats;
+  try { stats = await load(files, true); } finally { if (ui) ui.filterAdditives = filtered; }
   const registry = window.py2dmol_viewers ?? {};
   viewer = registry[Object.keys(registry)[0]]?.renderer;
   viewerObject = viewer?.currentObjectName;
@@ -1954,6 +1989,8 @@ function showTrunkContacts(liveContacts, chains) {
     });
     window.Heatmap?.updateVisibility?.(renderer);
     renderer.render("trunk-contacts");
+    // (counted, for a gate: tools/check-native-worker.py reads that a later fold's trunk drew its maps)
+    window.__trunkContactsShown = (window.__trunkContactsShown ?? 0) + 1;
   } catch (cause) {
     console.warn("could not show the trunk's contact map", cause);
   }
@@ -2401,37 +2438,27 @@ function meanByChain(asymId, values) {
   });
 }
 
-function attachContactMap(frame, recycle, weights, length) {
-  if (weights?.distogram === undefined || recycle.pair === undefined) return;
-  setTimeout(() => {
-    try {
-      const head = weights.distogram;
-      const contacts = distogramContactProbabilities(
-        recycle.pair, head.halfLogitsWeights, head.halfLogitsBias, length,
-        { bins: head.bins, first: head.firstBreak, last: head.lastBreak });
-      // AF2 tokenises one residue per letter - nothing to collapse, and it
-      // refuses a modified residue outright (see modelFamily).
-      const contact = contactMapFor(contacts, undefined);
-      if (contact === undefined) return;
-      frame.maps = { ...frame.maps, contact };
-      // ...and kept, so a rewind can put this frame back without recomputing a
-      // head that costs 131 ms at 128 residues and 712 at 300.
-      recycle.contactMap = contact;
-      // 🔴 AND THE PROBABILITIES THEMSELVES, NOT ONLY THE BYTES. `contactMapFor`
-      // quantises to 0-255 for the heatmap, which is all the panel needs and is
-      // a lossy thing to put in a results file - the archive writes the same
-      // numbers AlphaFold 3 does, so it wants what the head produced.
-      recycle.contactProbs = contacts;
-      refreshHeatmap();
-      // 🔴 AND THE SAVED COPY IS REWRITTEN, because it was written before this
-      // arrived. AF2's contact map is the panel its archive is worth keeping
-      // for, and the fold was already saved without it by the time this runs.
-      // One record, so this replaces rather than adds.
-      if (lastPrediction?.contactSource === recycle) void rememberSession(lastPrediction);
-    } catch (cause) {
-      console.warn("contact map unavailable for this pass", cause);
-    }
-  }, 0);
+function attachContactMap(frame, recycle) {
+  // The probabilities come from the device (monomer.js's `contacts` option,
+  // webgpu/heads/distogram.js). 🔴 THEY WERE COMPUTED HERE, in JavaScript,
+  // from a host copy of the pair representation - on the main thread between
+  // the fold's own steps, which made it 3.4 s of a 6.0 s AF2 fold at 261
+  // residues and more on a slower CPU. A pass without them (the multimer, a
+  // pass restored from a session saved before) has no contact map, as before.
+  const contacts = recycle.contactProbs;
+  if (contacts === undefined) return;
+  // AF2 tokenises one residue per letter - nothing to collapse, and it
+  // refuses a modified residue outright (see modelFamily).
+  const contact = contactMapFor(contacts, undefined);
+  if (contact === undefined) return;
+  frame.maps = { ...frame.maps, contact };
+  // ...and kept, so a rewind can put this frame back without recomputing it.
+  recycle.contactMap = contact;
+  refreshHeatmap();
+  // 🔴 AND THE SAVED COPY IS REWRITTEN, because it was written before this
+  // frame existed. AF2's contact map is the panel its archive is worth keeping
+  // for. One record, so this replaces rather than adds.
+  if (lastPrediction?.contactSource === recycle) void rememberSession(lastPrediction);
 }
 
 function appendPass(sequence, chainLengths, recycle, recycleIndex, firstPassStructure = undefined,
@@ -2459,7 +2486,7 @@ function appendPass(sequence, chainLengths, recycle, recycleIndex, firstPassStru
   // that ever says so: pass zero - the one `loadIntoViewer` and every
   // `frames.length === 0` site key on - belongs to the run being resumed.
   foldIsShowing(viewer);
-  attachContactMap(frame, recycle, weights, sequence.length);
+  attachContactMap(frame, recycle);
   // ...and jump to it, so the newest pass is the one being looked at.
   const object = viewer.objects?.find((entry) => entry.name === viewerObject);
   if (object?.frames?.length) viewer.setFrame(object.frames.length - 1);
@@ -2552,49 +2579,49 @@ function syncModelControls() {
   if (toleranceNode !== null) {
     toleranceNode.hidden = af2Row !== "monomer" && af2Row !== "multimer";
   }
-  // 🔴 THE SAMPLER ROW IS SHARED, BECAUSE IT IS THE SAME QUESTION. ESMFold2's
-  // structure head is an EDM sampler with a churn factor, exactly as AF3's is,
-  // so "flow or diffusion, and how many steps" means the same thing under both
-  // - what differs is the numbers, which is why the count dial is rebuilt from
-  // a per-model table rather than shared.
-  const sampled = af3 || SINGLE_SEQUENCE_FAMILIES.includes(family);
+  // 🔴 THE STEP DIAL IS SHARED, BECAUSE IT IS THE SAME QUESTION. ESMFold2's structure head is an EDM sampler with a
+  // churn factor, exactly as AF3's is, so "how many steps" means the same thing under both - what differs is the
+  // numbers, which is why the dial is rebuilt from a per-model table rather than shared. (One sampler: Flow was
+  // removed, docs/AF3.md "Flow removed".)
+  const bioemu2 = BIOEMU2_FAMILIES.includes(family);
+  const sampled = af3 || isEsmfold2(family) || bioemu2;
   const countNode = document.getElementById("af3CountGroup");
   if (countNode !== null) countNode.hidden = !sampled;
-  // 🔴 THE STEP COUNT IS SHARED AND THE MODE IS NOT. ESMFold2's own sampler is
-  // eleven steps, so a flow arm has nothing to escape from and runs MORE of
-  // them than the shipped one - see ESMFOLD2_COUNTS. Offering a choice whose
-  // every option is equivalent-or-worse is the same fault as offering one that
-  // is ignored, so the mode row is hidden for it.
-  // 🔴 AND OpenDDE HIDES IT FOR THE SAME REASON, MEASURED ON ITS OWN SAMPLER.
-  // Flow and diffusion cost it the SAME 16.1 s at sixteen steps and flow is
-  // plainly worse - TM 0.8307 and 0.8601 against 0.9044 and 0.9169 on 6MRR,
-  // two seeds each and no overlap. Its sampler re-noises every step, which is
-  // what a flow arm exists to escape, and escaping it here loses the structure
-  // rather than buying time. See OPENDDE_SAMPLER_MODE.
-  // 🔴 AND rosettafold3 HIDES IT BECAUSE FLOW BREAKS THE STRUCTURE, which is a
-  // different reason from OpenDDE's "measurably worse": N-CA 6.94 A against
-  // 1.46 and a collapsed backbone, with pLDDT reading 81.47 as if fine. See
-  // NO_FLOW_SAMPLER_FAMILIES.
-  const modeNode = document.getElementById("af3ModeGroup");
-  if (modeNode !== null) {
-    modeNode.hidden = !af3 || family === "opendde"
-      || NO_FLOW_SAMPLER_FAMILIES.includes(family);
+  // ...and BioEmu2's own rows: its mode, its samples, its contacts, and - in propagation - the lag and the steps
+  syncBioemu2Controls(bioemu2);
+  // 🔴 ESMFold2 FOLDS FROM ITS LANGUAGE MODEL, AND AN ALIGNMENT IS AN OPT-IN.
+  // Its experimental tier reads ESM-C alone (`disable_msa_features` in its
+  // checkpoint), so it has no MSA row: a search left live would run, take a
+  // minute of somebody else's server and be discarded. The released 6B two CAN
+  // read one beside ESM-C (Fast as profile features, Full through its encoder),
+  // so their row is shown, starts at "ESM-C only" - what "Single Sequence" means
+  // for a model whose evolutionary information is a language model - and offers
+  // the search and an upload as the reader's choice. The reader's own setting
+  // for the other models is kept and given back when one is chosen again.
+  const noAlignment = readsNoAlignment(family);
+  const esmfold2 = isEsmfold2(family);
+  const msaSelect = document.getElementById("msa-mode");
+  const msaNode = document.getElementById("msaModeGroup");
+  if (msaNode !== null) msaNode.hidden = noAlignment;
+  const single = msaSelect?.querySelector('option[value="none"]');
+  if (msaSelect !== null && single !== null && single !== undefined) {
+    single.dataset.label ??= single.textContent;
+    single.textContent = esmfold2 ? "ESM-C only" : single.dataset.label;
+    if (esmfold2 && msaSelect.dataset.kept === undefined) {
+      msaSelect.dataset.kept = msaSelect.value;           // (into ESMFold2: its default, the reader's kept)
+      msaSelect.value = "none";
+    } else if (!esmfold2 && msaSelect.dataset.kept !== undefined) {
+      msaSelect.value = msaSelect.dataset.kept;            // (out of it: given back)
+      delete msaSelect.dataset.kept;
+    }
   }
-  // 🔴 AND A MODEL WITH NO ALIGNMENT HIDES THE MSA ROW RATHER THAN IGNORING IT.
-  // `disable_msa_features` is true in ESMFold2's checkpoint; a search left on
-  // screen would run, take a minute of somebody else's server, and be
-  // discarded - which is the "quietly ignored control" this function exists to
-  // prevent, one step worse.
-  const singleSequence = SINGLE_SEQUENCE_FAMILIES.includes(family);
-  for (const id of ["msaModeGroup", "maxMsaGroup"]) {
-    const node = document.getElementById(id);
-    if (node !== null) node.hidden = singleSequence;
-  }
-  // ...and the row that replaces them, which is the same question for a model
-  // whose evolutionary information comes from a language model rather than an
-  // alignment. Shown exactly where the MSA row is not.
+  // ...and Max MSA, which no ESMFold2 takes (the full model subsamples its own alignment to 1,024 rows)
+  const maxNode = document.getElementById("maxMsaGroup");
+  // (BioEmu2 takes its alignment whole, 4,092 rows as Boltz-1 does, so it has no depth to set either)
+  if (maxNode !== null) maxNode.hidden = isEsmfold2(family) || bioemu2;
+  // ...and the variant row, for every ESMFold2
   const plmNode = document.getElementById("plmGroup");
-  if (plmNode !== null) plmNode.hidden = !singleSequence;
+  if (plmNode !== null) plmNode.hidden = !isEsmfold2(family);
   // 🔴 A HIDDEN CONTROL HAS TO BE RESTORED. The first version only ever SET
   // hidden, so choosing AF3 and going back to AF2 left the page with no
   // Recycles until it was reloaded.
@@ -2602,7 +2629,7 @@ function syncModelControls() {
   // 🔴 RECYCLES AND SEED ARE SHOWN FOR EVERY MODEL, so the row keeps one order
   // whatever is chosen. AF3 recycles too - its embedder has always done
   // `pair += prev_embedding(LayerNorm(recycled pair))`, and the loop driving it
-  // is in src/af3/fold.js.
+  // is in webgpu/af3/fold.js.
   // The MSA controls belong to syncMode, which greys Max MSA out when the MSA
   // select reads None. Setting them here as well would give one pair of
   // controls two owners that disagree - so they are not touched here at all,
@@ -2645,19 +2672,40 @@ function syncMaxMsa() {
   select.value = kept ?? values[0];
 }
 
+/**
+ * BioEmu2's rows, shown with the model: Mode (structure, equilibrium, propagate), Samples, Contacts, and the
+ * propagation's lag, steps and starting frame only when it propagates. A hidden row keeps its value, and the fold
+ * reads these only under BioEmu2.
+ */
+function syncBioemu2Controls(shown = BIOEMU2_FAMILIES.includes(chosenFamily())) {
+  for (const id of ["bioemu2ModeGroup", "bioemu2SamplesGroup", "bioemu2ContactsGroup"]) {
+    const node = document.getElementById(id);
+    if (node !== null) node.hidden = !shown;
+  }
+  const propagating = document.getElementById("bioemu2-mode")?.value === "propagate";
+  const node = document.getElementById("bioemu2PropagationGroup");
+  if (node !== null) node.hidden = !(shown && propagating);
+  const upload = document.getElementById("bioemu2-x0-file");
+  if (upload !== null) upload.hidden = document.getElementById("bioemu2-propagate-from")?.value !== "upload";
+}
+
 /** The count dial, rebuilt for the sampler - see AF3_COUNTS for why. */
 function syncAf3Count() {
-  const mode = samplerModeFor(chosenFamily(),
-    document.getElementById("af3-mode")?.value ?? "diffusion");
-  // ...and ESMFold2's table has one mode, so the shared select cannot pick a
-  // row that is not there.
-  const ef2 = SINGLE_SEQUENCE_FAMILIES.includes(chosenFamily());
-  // ...and OpenDDE's own, because more steps make its fold worse; see
-  // OPENDDE_COUNTS for the two targets and nine folds that say so.
-  const table = ef2 ? ESMFOLD2_COUNTS
-    : chosenFamily() === "opendde" ? OPENDDE_COUNTS : AF3_COUNTS;
-  const { label, values, preferred } = table[ef2 ? ESMFOLD2_SAMPLER_MODE : mode]
-    ?? table.flow ?? table.diffusion;
+  // BioEmu2's dial is its own: the vendor's 200 steps first, cheaper ones for a quick look
+  if (BIOEMU2_FAMILIES.includes(chosenFamily())) {
+    const title = document.getElementById("af3-count-label");
+    if (title !== null) title.textContent = "Steps";
+    const select = document.getElementById("af3-count");
+    if (select === null) return;
+    const kept = Number(select.value);
+    select.replaceChildren(...BIOEMU2_COUNTS.map((value) => Object.assign(
+      document.createElement("option"), { value: String(value), textContent: String(value) })));
+    select.value = String(BIOEMU2_COUNTS.includes(kept) ? kept : BIOEMU2_DEFAULT_STEPS);
+    return;
+  }
+  const ef2 = isEsmfold2(chosenFamily());
+  const table = ef2 ? ESMFOLD2_COUNTS : AF3_COUNTS;
+  const { label, values, preferred } = table[ef2 ? ESMFOLD2_SAMPLER_MODE : "diffusion"];
   const title = document.getElementById("af3-count-label");
   if (title !== null) title.textContent = label;
   const select = document.getElementById("af3-count");
@@ -2788,6 +2836,24 @@ const cheapHash = (text) => {
 };
 
 /**
+ * The diffusion steps a fold runs, resolved from the controls once - for this page's own fold AND for one handed
+ * to a runtime, which would otherwise fall back to the model's own default (200).
+ */
+function samplerPlan(modifications) {
+  const row = AF3_COUNTS.diffusion;
+  const asked = Number(document.getElementById("af3-count")?.value)
+    || row.preferred;
+  // 🔴 SIXTEEN IS THE FLOOR AND THE DIAL NO LONGER OFFERS LESS, so this is
+  // insurance rather than policy - a stale stored value or a hand-edited option
+  // is the only way below it now. AF3_COUNTS carries the measurements and the
+  // reason; the short version is that a modified residue's atoms are each their
+  // own token and eight steps leaves them compressed (0.835 against a control
+  // of 1.003) while sixteen does not (0.974).
+  const calls = Math.max(asked, modifications.length > 0 ? 16 : 0);
+  return { asked, calls };
+}
+
+/**
  * One AlphaFold 3 fold, drawn into py2Dmol as it computes.
  *
  * 🔴 THE PANELS ARE BUILT ON THE FIRST FRAME AND THE SCORES ARRIVE ON THE LAST.
@@ -2799,7 +2865,7 @@ const cheapHash = (text) => {
  */
 async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCodes = [],
                            modifications = [], chainKinds = [], templates = [],
-                           modelLoad = undefined, family = "af3") {
+                           modelLoad = undefined, family = "af3", msaColumnKinds = undefined) {
   // 🔴 THE FOLD SAYS WHICH MODEL MADE IT, and this is not decoration. Two
   // bundles run this same function; a status line and an archive that both
   // read "AlphaFold 3" for an OpenBind fold are a record of the wrong
@@ -2861,35 +2927,7 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
     if (problem !== null) throw new Error(problem);
   }
 
-  // 🔴 FORCED IN CODE, NOT ONLY HIDDEN. Hiding a control does not change its
-  // value: the shared `#af3-mode` select still reads "flow" behind a hidden
-  // row, which is the trap docs/EF2FAST.md records for that model an hour
-  // after hiding its own.
-  const opendde = chosenFamily() === "opendde";
-  // 🔴 FORCED FOR rosettafold3 TOO, and for a worse reason than OpenDDE's - see
-  // `samplerModeFor`. Hiding the row does not change the select's value, which
-  // is the trap the comment above records.
-  const mode = samplerModeFor(chosenFamily(),
-    document.getElementById("af3-mode")?.value ?? "diffusion");
-  const counts = opendde ? OPENDDE_COUNTS : AF3_COUNTS;
-  // 🔴 THE SAME FALLBACK AS `syncAf3Count`, AND IT WAS MISSING HERE. That
-  // function reads `table[mode] ?? table.flow ?? table.diffusion`; this one
-  // subscripted the table and took `.preferred` off whatever came back, so a
-  // mode with no row - a stale select value, a removed option, a family whose
-  // table is narrower than AF3's - threw "cannot read properties of undefined"
-  // in the middle of starting a fold rather than falling back. Two readings of
-  // one table, one of them guarded, is this file's own stale-allow-list trap.
-  // `test/sampler-options.test.js` gates the two lists against each other.
-  const row = counts[mode] ?? counts.diffusion ?? counts.flow;
-  const asked = Number(document.getElementById("af3-count")?.value)
-    || row.preferred;
-  // 🔴 SIXTEEN IS THE FLOOR AND THE DIAL NO LONGER OFFERS LESS, so this is
-  // insurance rather than policy - a stale stored value or a hand-edited option
-  // is the only way below it now. AF3_COUNTS carries the measurements and the
-  // reason; the short version is that a modified residue's atoms are each their
-  // own token and eight steps leaves them compressed (0.835 against a control
-  // of 1.003) while sixteen does not (0.974).
-  const calls = Math.max(asked, modifications.length > 0 ? 16 : 0);
+  const { asked, calls } = samplerPlan(modifications);
   const recycles = recycleCount();
   const { requested: maxMsaSequences } = maxMsaConfig();
   // 🔴 RECYCLES ARE NOT IN THE KEY, because more of them is a CONTINUATION
@@ -2921,6 +2959,8 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
     // not this fold's - the `chainKinds` rule beside it. Off `foldContext`,
     // because this function is handed chains and ligands and never the rows.
     bonds: foldContext.bonds ?? [],
+    // ...and so does a constraint
+    constraints: foldContext.constraints ?? [],
     alignment: alignmentBlocks === null ? null : cheapHash(JSON.stringify(alignmentBlocks)),
   });
   const cached = trunkCache?.key === trunkKey ? trunkCache.reusable : undefined;
@@ -2939,10 +2979,13 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   // overwrite each other, and the message that loses is the one about the
   // server that might be queuing for a minute. The download reports itself on
   // the right instead, dial and label both.
+  // (the device asked for first, so an Apple GPU's kernel races run under the weights' download: web/model.js)
+  const deviceStarted = getDevice();
+  deviceStarted.catch(() => {});
   const weights = await (modelLoad ?? loadAf3Weights());
   throwIfAborted(signal);
 
-  const device = await getDevice();
+  const device = await deviceStarted;
   throwIfAborted(signal);
 
   predictionCount += 1;
@@ -2984,7 +3027,6 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
    */
   let liveSampler = 0;
   const drawLiveFrame = (pdb, kind) => {
-    remoteTap("frame", pdb);
     if (signal.aborted || api?.frameFromText === undefined) return;
     const registry = window.py2dmol_viewers ?? {};
     const renderer = registry[Object.keys(registry)[0]]?.renderer;
@@ -3033,9 +3075,10 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   let viewerKeep;
   let viewerModified = [];
   const result = await foldAf3({
-    sequence, mode, calls, recycles, weights, device, signal,
+    sequence, calls, recycles, weights, device, signal,
     alignment: alignmentBlocks, maxMsaSequences, ligandCodes, modifications,
-    chainKinds, reuse, bonds: foldContext.bonds,
+    chainKinds, reuse, bonds: foldContext.bonds, constraints: foldContext.constraints,
+    ...(msaColumnKinds === undefined ? {} : { msaColumnKinds }),
     // 🔴 WHICH TOKENS THE VIEWER DRAWS, and the reason every matrix below goes
     // through it: a modified residue is one POSITION and ten TOKENS, so its
     // PAE and its contact map are wider than the structure they belong to and
@@ -3103,7 +3146,7 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
     // final load, so that the score-card poll cannot refill from a fold in
     // progress. drawLiveFrame reaches the renderer the same way openBlankFold
     // does.
-    onFrame: (pdb) => { drawLiveFrame(pdb, mode); },
+    onFrame: (pdb) => { drawLiveFrame(pdb, "diffusion"); },
   });
   await pending;
   throwIfAborted(signal);
@@ -3142,8 +3185,8 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   // structure below still carries the real pLDDT.
   if (viewer !== undefined && viewerObject !== undefined && result.framePdbs.length > 0) {
     // 🔴 THE FINISHED STRUCTURE REPLACES THE LAST SAMPLER FRAME, it is not
-    // appended after it. The last frame IS that call's output - in flow mode
-    // they agree to a fraction of an angstrom - so appending made a redundant
+    // appended after it. The last frame IS that call's output - they agree to a
+    // fraction of an angstrom - so appending made a redundant
     // extra frame and a play bar that ended on the same picture twice. The
     // returned structure is the authoritative one, so it takes that slot.
     // 🔴 THE TRAJECTORY IS THE SAMPLER'S, AND ONLY THE SAMPLER'S. The trunk
@@ -3152,7 +3195,7 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
     // through the contact map instead, which moves per pass and costs nothing.
     const timeline = [...result.framePdbs.slice(0, -1), result.pdb];
     /** What a frame is called: the sampler's calls, then the answer. */
-    const frameName = (index, last) => (last ? "final" : `${mode}_${index}`);
+    const frameName = (index, last) => (last ? "final" : `diffusion_${index}`);
     const camera = { ...(viewer?.viewerState ?? {}) };
     // ...and the live frames are dropped first. They are the same structures,
     // drawn with the uncalibrated colour and named by their position in a list
@@ -3308,6 +3351,7 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   // twenty characters are enough to recognise the one you typed.
   if (ligandCodes.length > 0) {
     what.push(ligandCodes.map((entry) => (typeof entry === "string" ? entry
+      : entry.codes ? entry.codes.join("-")
       : entry.smiles.length > 24 ? `${entry.smiles.slice(0, 21)}...` : entry.smiles))
       .join(", "));
   }
@@ -3396,7 +3440,7 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
  * syncModelControls exists to prevent, and a preset table is exactly the kind
  * of thing that gains a value on the page before it gains one in the code.
  */
-function samplerPreset() {
+function samplerPreset({ atomised = false, residues = 0 } = {}) {
   // 🔴 THE MODEL DECIDES THE MODE, NOT THE HIDDEN SELECT. Hiding a control does
   // not change its value - that is what put "unknown model esmfold2" in front
   // of somebody folding an oligomer - so this reads the model's own answer and
@@ -3409,10 +3453,12 @@ function samplerPreset() {
   // threw on it and the message named a sampler called `flow-`, which describes
   // the symptom and not the cause.
   const chosen = document.getElementById("af3-count")?.value;
-  const steps = chosen === undefined || chosen === ""
-    ? String(ESMFOLD2_COUNTS[mode]?.preferred ?? ESMFOLD2_COUNTS.diffusion.preferred)
-    : chosen;
-  const name = `${mode}-${steps}`;
+  const dial = chosen === undefined || chosen === ""
+    ? ESMFOLD2_COUNTS[mode]?.preferred ?? ESMFOLD2_COUNTS.diffusion.preferred
+    : Number(chosen);
+  // ...raised for a ligand or a modified residue, whose per-atom tokens eleven steps leave torn
+  // (ESMFOLD2_ATOMISED_STEPS), and for a long input, whose backbone they leave short (ESMFOLD2_LONG_RESIDUES)
+  const name = `${mode}-${esmfold2StepsFor(dial, { atomised, residues })}`;
   if (SAMPLER_PRESETS[name] === undefined) {
     throw new Error(`no ESMFold2 sampler called ${name}; `
       + `known: ${Object.keys(SAMPLER_PRESETS).join(", ")}`);
@@ -3436,6 +3482,10 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
   // small mmCIF; the 21 polymer components stay baked.
   const ligands = [];
   for (const entry of ligandCodes) {
+    if (entry.codes !== undefined) {      // a chain of components: the AF3-lineage path only
+      throw new Error(`${modelName} folds one component per ligand; ${entry.codes.join("-")} is a chain of`
+        + ` ${entry.codes.length} - fold it with an AlphaFold 3-lineage model`);
+    }
     // A structure rather than a code; see the note in web/af3-model.js.
     if (typeof entry !== "string") {
       status(`${modelName} · building ${entry.code ?? "ligand"}`);
@@ -3463,6 +3513,9 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
     modifyWith.push({ chain: modification.chain, position: modification.position,
                       ...parseCcdComponent(await response.text()) });
   }
+  // ...and the sampler, decided once: the fold runs it and the archive records it
+  const sampler = samplerPreset({ atomised: ligands.length > 0 || modifyWith.length > 0,
+    residues: chains.reduce((sum, chain) => sum + chain.length, 0) });
   throwIfAborted(signal);
   const loaded = await (modelLoad
     ?? loadEsmfold2Weights(undefined,
@@ -3491,7 +3544,6 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
   let colouring = false;
   const framePdbs = [];
   const drawLiveFrame = (pdb) => {
-    remoteTap("frame", pdb);
     if (signal.aborted || api?.frameFromText === undefined) return;
     const registry = window.py2dmol_viewers ?? {};
     const renderer = registry[Object.keys(registry)[0]]?.renderer;
@@ -3610,7 +3662,7 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
     confidenceWeights: loaded.confidenceWeights,
     tower: languageModelRunner(device, new GpuBufferAllocator(device), loaded,
                                loaded.shape.pairChannels),
-    sampler: samplerPreset(),
+    sampler,
     seed: randomSeed(),
     // 🔴 THIS MODEL'S "SINGLE SEQUENCE". Without ESM-C it has no evolutionary
     // information at all - measured on a 76-mer, the fold moves 10.96 A, the
@@ -3720,11 +3772,11 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
   // pAE IMPROVES, 8.84 -> 7.97. A panel that looks BETTER on a failed fold is
   // the worst possible panel, because the fold somebody checks the PAE on is
   // the one they doubt - the same reason the per-residue certainty colour was
-  // measured and not shipped. `src/esmfold2/aligned-error.js` and
+  // measured and not shipped. `shared/esmfold2/aligned-error.js` and
   // `tools/pae-transfer.py` keep the estimator and the numbers; nothing draws
   // it until the inversion is fixed.
   // 🔴 AND THE PAE IS DRAWN NOW, because it is predicted rather than estimated.
-  // What used to be here was `src/esmfold2/aligned-error.js`, withheld with its
+  // What used to be here was `shared/esmfold2/aligned-error.js`, withheld with its
   // numbers: it ordered pairs WITHIN a fold at 0.746 against AlphaFold 3's real
   // PAE and INVERTED across folds at -0.867, so a failed fold scored better
   // than a good one. This is the head's own, on the same 0-32 scale as
@@ -3842,7 +3894,7 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
       seed: foldContext.settings?.seed,
       "trunk passes": recycleCount() + 1,
       "language model": plmLabel(),
-      sampler: samplerPreset(),
+      sampler,
       "diffusion steps": result.steps,
     },
     // ...and no alignment or template line, rather than "none", which reads as
@@ -3882,27 +3934,237 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
   progress(null);
 }
 
+/** The last BioEmu2 fold's first sample, keyed by its atoms, for propagating from it (`pdb` for a native fold). */
+let lastBioemu2;
+
+/**
+ * BioEmu2's own physicality report of each sample (shared/bioemu2/physicality.js, held to the colab port), and the
+ * line the status and the scores card carry. It changes no coordinate; it says whether each sample's protein passes
+ * the high_quality thresholds and the first check that failed - what this model offers in place of a confidence.
+ * Both fold paths read it: this page's WebGPU fold, and a native one whose samples come back as PDB text.
+ */
+function bioemu2Physicality(featurised, samples) {
+  const { atomKeys, topology } = featurised;
+  const where = new Map(atomKeys.map((key, at) => [key.join("|"), at]));
+  const declared = (featurised.job.bondedAtomPairs ?? [])
+    .map(([a, b]) => [where.get(a.join("|")), where.get(b.join("|"))])
+    .filter(([a, b]) => a !== undefined && b !== undefined);
+  let report = [];
+  try {
+    report = checkPhysicality(topology, new BioEmu2Graph(topology).bonds,
+      samples.map((x) => Float64Array.from(x.subarray(0, atomKeys.length * 3))), "high_quality", declared);
+  } catch (cause) {
+    console.warn("physicality report skipped:", cause);
+  }
+  const passed = report.filter((one) => one.ok).length;
+  const firstFailure = report.find((one) => !one.ok)?.reason;
+  const line = report.length === 0 ? ""
+    : ` · physicality ${passed}/${report.length} pass${firstFailure ? ` (${firstFailure.replaceAll("_", " ")})` : ""}`;
+  return { report, line };
+}
+
+/**
+ * A BioEmu2 fold on this page's WebGPU (webgpu/bioemu2).
+ *
+ * 🔴 NO CONFIDENCE HEAD, AND THE CARD SAYS SO. BioEmu2 predicts a structure (or
+ * an ensemble) and a distogram, and nothing about how much to believe either;
+ * the scores card reads "no confidence head" rather than a number, the
+ * structure is coloured by chain (forcePlddtColours(false): a pLDDT ramp over
+ * an empty B-factor paints a claim), and the contact map is the distogram's.
+ *
+ * 🔴 SAMPLES ARE FRAMES. Every sample is one denoiser call's batch member, so a
+ * five-sample fold is five structures of one input - an ensemble, which in
+ * equilibrium mode is the point - laid on the play bar as sample_1..5. The saved
+ * structure is the first sample.
+ */
+async function foldWithBioemu2({ chains, chainKinds, alignment, alignmentBlocks, signal, modelLoad, modifications }) {
+  const family = "bioemu2";
+  const modelName = MODEL_LABELS[family];
+  const started = performance.now();
+  const choice = document.getElementById("bioemu2-mode")?.value ?? "structure";
+  const propagating = choice === "propagate";
+  const mode = propagating ? "equilibrium" : choice;
+  const samples = Math.max(1, Number(document.getElementById("bioemu2-samples")?.value) || 1);
+  const steps = Number(element("af3-count").value) || BIOEMU2_DEFAULT_STEPS;
+  const contacts = (document.getElementById("bioemu2-contacts")?.value ?? "").trim();
+  status(`${modelName} · featurising`);
+  const { entities } = formInputs();
+  const jobJson = jobInputJson({ name: "fold", seed: randomSeed(), entities });
+  const proteinChains = chains.filter((_, at) => chainKinds[at] === "protein");
+  // the paired block, where a complex has one, and the unpaired one; a single chain's alignment is all unpaired
+  const unpaired = alignmentBlocks?.unpaired ?? alignment;
+  const featurised = await bioemu2Features(jobJson, {
+    alignment: unpaired ?? null, pairedAlignment: alignmentBlocks?.paired ?? null, proteinChains, mode,
+    contacts: contacts === "" ? null : contacts, signal,
+  });
+  const { features, atomKeys, topology, tokens } = featurised;
+  // the starting frame: the last BioEmu2 fold of THIS input, or an uploaded PDB of it
+  let propagation;
+  if (propagating) {
+    const lagNs = Number(document.getElementById("bioemu2-lag")?.value);
+    const lagSteps = Math.max(1, Number(document.getElementById("bioemu2-propagation-steps")?.value) || 1);
+    const source = document.getElementById("bioemu2-propagate-from")?.value ?? "last";
+    let x0;
+    if (source === "upload") {
+      const file = document.getElementById("bioemu2-x0-file")?.files?.[0];
+      if (file === undefined) throw new Error("Choose a PDB to propagate from, or propagate from the last fold");
+      x0 = x0FromPdb(await file.text(), atomKeys);
+    } else {
+      const key = JSON.stringify(atomKeys);
+      if (lastBioemu2?.key !== key) {
+        throw new Error("Propagation starts from a structure of this same input - fold it with BioEmu2 first,"
+          + " or upload a PDB of it");
+      }
+      x0 = lastBioemu2.coords;
+    }
+    if (!(lagNs > 0)) throw new Error("The propagation lag must be a positive number of nanoseconds");
+    propagation = { x0, lagNs, steps: lagSteps };
+  }
+  throwIfAborted(signal);
+  const loaded = await modelLoad;
+  throwIfAborted(signal);
+  const device = await getDevice();
+  throwIfAborted(signal);
+  const network = bioemu2Network(device, loaded.read);
+
+  predictionCount += 1;
+  const stem = foldStem(`${MODEL_STEMS[family]}_${predictionCount}`);
+  openBlankFold(stem);
+  viewer = undefined;
+  viewerObject = undefined;
+  const keep = bioemu2ViewerTokens(topology, tokens);
+  const api = window.py2Dmol;
+  let drawn = 0;
+  let colouring = false;
+  let liveContacts;
+  const realAtoms = atomKeys.length;
+  // the first sample's denoised structure, every few steps, as the play bar's live frames
+  const drawLive = (denoised) => {
+    if (signal.aborted || api?.frameFromText === undefined) return;
+    const registry = window.py2dmol_viewers ?? {};
+    const renderer = registry[Object.keys(registry)[0]]?.renderer;
+    const object = renderer?.objectsData?.[renderer?.currentObjectName];
+    if (renderer === undefined || object === undefined) return;
+    try {
+      foldIsShowing(renderer);
+      const frame = api.frameFromText(bioemu2Pdb(atomKeys, topology, denoised.subarray(0, realAtoms * 3)));
+      frame.name = frame.label = frame.title = `sampler_${drawn++}`;
+      if (liveContacts !== undefined) frame.maps = { contact: liveContacts };
+      renderer.addFrame(frame, renderer.currentObjectName);
+      renderer.setFrame(object.frames.length - 1);
+      if (!colouring) { colouring = setColourMode("chain"); orientBestView(renderer); }
+    } catch (cause) {
+      console.warn("live frame skipped:", cause);
+    }
+  };
+  const every = Math.max(1, Math.round(steps / 20));
+  const result = await foldBioemu2(device, loaded.read, features, {
+    network, samples, steps, seed: randomSeed(), mode, propagation, passes: recycleCount() + 1,
+    // the distogram's contact map exists before any structure does, and is shown as the trunk's is
+    onContacts: (contact) => {
+      if (signal.aborted) return;
+      liveContacts = contactMapFor(contact, keep);
+      showTrunkContacts(liveContacts, chains);
+    },
+    onProgress: (stage, done, total, denoised) => {
+      if (signal.aborted) throw new DOMException("the fold was stopped", "AbortError");
+      if (stage === "trunk") {
+        status(`${modelName} · trunk`);
+        progress(0.15 * done / total);
+        return;
+      }
+      status(`${modelName} · sampling ${done}/${total}`);
+      progress(0.15 + 0.85 * done / total);
+      if (denoised !== undefined && (done % every === 0 || done === total)) drawLive(denoised);
+    },
+  });
+  throwIfAborted(signal);
+  const contactMap = contactMapFor(result.contact, keep);
+  const pdbs = result.samples.map((x) => bioemu2Pdb(atomKeys, topology, x.subarray(0, realAtoms * 3)));
+  const sequence = chains.join("");
+  const scores = { sequence, contact_probs: paeMatrix(result.contact, tokens) };
+  const registry = window.py2dmol_viewers ?? {};
+  const liveRenderer = registry[Object.keys(registry)[0]]?.renderer;
+  const camera = { ...(liveRenderer?.viewerState ?? {}) };
+  const live = liveRenderer?.objectsData?.[liveRenderer?.currentObjectName];
+  if (live?.frames !== undefined) live.frames.length = 0;
+  await loadIntoViewer({ stem, pdb: pdbs[0], scores, confidence: undefined });
+  if (viewer !== undefined && Object.keys(camera).length > 0) {
+    Object.assign(viewer.viewerState, camera);
+    viewer.render?.("localfold.restore-camera");
+  }
+  const label = (at) => (propagation
+    ? `trajectory_${Math.floor(at / propagation.steps) + 1}_step_${(at % propagation.steps) + 1}`
+    : `sample_${at + 1}`);
+  if (api?.frameFromText !== undefined && viewer !== undefined) {
+    const object = viewer.objectsData?.[viewerObject];
+    const first = object?.frames?.[0];
+    if (first !== undefined) {
+      first.name = first.label = first.title = label(0);
+      if (contactMap !== undefined) first.maps = { ...first.maps, contact: contactMap };
+    }
+    for (const [index, text] of pdbs.slice(1).entries()) {
+      const frame = api.frameFromText(text);
+      frame.name = frame.label = frame.title = label(index + 1);
+      viewer.addFrame(frame, viewerObject);
+    }
+    forcePlddtColours(false);
+    viewer.setFrame(0);
+    viewer.render("bioemu2-final");
+  }
+  // 🔴 BioEmu2's OWN PHYSICALITY REPORT, per sample, in place of a confidence (bioemu2Physicality)
+  const { report: physicality, line: physicalityLine } = bioemu2Physicality(featurised, result.samples);
+  updateScoresCard({ none: true, label: `No confidence head${physicalityLine}` });
+  recordPrediction({
+    stem, pdb: pdbs[0], chains, confidence: undefined, scores: JSON.stringify(scores, null, 2),
+    chainLengths: chains.map((chain) => chain.length),
+    contactSource: { contactProbs: result.contact },
+    model: modelName,
+    tokens: tokenLayoutFrom(features.asym_id, features.residue_index),
+    ...foldContext,
+    settings: {
+      seed: foldContext.settings?.seed, mode: choice, samples, "diffusion steps": steps,
+      "trunk passes": recycleCount() + 1, ...(propagation ? { "lag (ns)": propagation.lagNs, "propagation steps": propagation.steps } : {}),
+      ...(contacts === "" ? {} : { contacts }),
+      ...(physicality.length === 0 ? {} : { physicality: physicality.map((one) => (one.ok ? "passed" : `rejected: ${one.reason}`)) }),
+    },
+  }, family);
+  void rememberSessionWhenSettled(lastPrediction);
+  lastBioemu2 = { key: JSON.stringify(atomKeys), coords: result.samples[0].subarray(0, realAtoms * 3), pdb: pdbs[0] };
+  // the chain gate the CLI tools assert, as a warning here (shared/af3/chain-geometry.js)
+  const geometry = chainGeometryOf(alphaCarbonSpacings(atomKeys, topology, result.samples[0]).spacing);
+  const verdict = Number.isFinite(geometry.caca) ? chainGeometryVerdict(geometry) : { ok: true };
+  const seconds = ((performance.now() - started) / 1000).toFixed(1);
+  const residues = chains.reduce((total, chain) => total + chain.length, 0);
+  const named = (modifications ?? []).map((one) => `${one.code}${one.position}`);
+  status(`${modelName} · ${residues} res` + (named.length === 0 ? "" : ` + ${named.join(", ")}`)
+    + ` · ${choice}` + (propagation ? ` ${propagation.lagNs} ns x ${propagation.steps}` : "")
+    + ` · ${samples} sample${samples === 1 ? "" : "s"} · ${steps} steps · ${seconds}s · no confidence head`
+    + physicalityLine
+    + (verdict.ok ? "" : " · NOT A CHAIN"));
+  progress(null);
+}
+
 /**
  * WHERE THIS FOLD HAPPENS, AND HOW TO ASK.
  *
  * 🔴 THE PAGE IS SERVED BY THE THING THAT FOLDS, so this is SAME-ORIGIN and
- * there is no CORS question at all: `notebooks/localfold.ipynb` runs
- * tools/colab_backend.py on the runtime, that server serves this checkout,
- * and the link that cell prints opens index.html on it. `?backend=colab` is
- * the cell saying which of the two machines should do the work, and `t` is
+ * there is no CORS question at all: python/localfold/server.py - `localfold serve`
+ * on the reader's own machine, or the Colab notebook's cell on a runtime - serves
+ * this page, and the link it prints opens index.html on it. `?backend=native` is
+ * the server saying which of the two should do the work, and `t` is
  * the token that server requires of every request - it is in the URL because
  * a page cannot be handed a header by whoever framed it.
  *
- * THE SAME SERVER RUNS A SECOND COPY OF THIS PAGE HEADLESSLY, at
- * `?role=runtime`, and that is the one that folds. The two talk through
- * web/colab-bridge.js: this page posts a command, that page pushes what it
- * says and draws. Neither knows anything about the other's machine.
+ * THE SAME SERVER KEEPS ONE WORKER, python/localfold/worker.py, and that is what
+ * folds - with metal/ on a Mac, cuda/ on an NVIDIA card: this page posts the job,
+ * the worker's events come back through web/native-bridge.js, and this page draws them.
  *
  * Absent the parameter this returns null and nothing anywhere changes: the
  * website folds where it always did, in the reader's own browser.
  */
 function remoteBackend() {
-  return colabRole() === "reader" ? {} : null;
+  return nativeRole() === "reader" ? {} : null;
 }
 
 /**
@@ -3932,15 +4194,67 @@ async function foldOnBackend({ chains, chainKinds, ligandCodes, modifications,
   // regime - and the answer is the same one: forward the object.
   //
   // 🔴 THE CONTROLS' OWN VALUES, NOT THE RESOLVED ONES. `msaMode()` maps
-  // "none" to "single" for the code below it; the runtime puts these back into
-  // the SELECTS, and a select silently refuses a value it has no option for -
-  // so "single" left the control empty there and the fold died with "unknown
-  // alignment mode". Raw values let the runtime's page resolve them with the
-  // same functions this one uses.
+  // "none" to "single" for the code below it, and the worker's exporters read
+  // the controls with this page's own functions - so they get what the selects
+  // said, and resolve it the way this page does.
   const { entities, controls } = formInputs();
   const request = { entities, controls };
   const label = MODEL_LABELS[family] ?? family;
-  status(`${label} · folding on the runtime…`);
+  // 🔴 EVERY REMOTE FOLD IS A CUDA FOLD (remoteBackendChoice), HANDED THE JOB AS
+  // AlphaFold 3 JSON, written by the same module that writes the archive's
+  // request - so the entity conversion is this page's and not re-implemented
+  // in Python. See python/localfold/worker.py.
+  request.backend = remoteBackendChoice();
+  // ...and the steps this page would fold with (samplerPlan), because an
+  // empty dial is the family's preferred count here and would be the model's own default there
+  // (ESMFold2's from its own table and floor - samplerPreset - where AlphaFold 3's table would be the wrong one)
+  if (isEsmfold2(family)) {
+    const atomised = (ligandCodes ?? []).length > 0 || (modifications ?? []).length > 0;
+    const residues = chains.reduce((sum, chain) => sum + chain.length, 0);
+    request.schedule = { steps: Number(samplerPreset({ atomised, residues }).split("-").pop()) };
+  } else if (BIOEMU2_FAMILIES.includes(family)) {
+    // (BioEmu2's own dial: BIOEMU2_COUNTS, the vendor's 200 when it is empty - not AlphaFold 3's table)
+    request.schedule = { steps: Number(element("af3-count").value) || BIOEMU2_DEFAULT_STEPS };
+    // 🔴 A PROPAGATION'S STARTING FRAME TRAVELS WITH THE JOB, because the worker keeps nothing between folds and the
+    // structure is on this machine: the uploaded PDB, or the last BioEmu2 fold's first sample. The native featuriser
+    // refuses a frame of another input by name, so a stale one cannot propagate the wrong molecule.
+    if (controls["bioemu2-mode"] === "propagate") {
+      const upload = (controls["bioemu2-propagate-from"] ?? "last") === "upload";
+      const file = upload ? document.getElementById("bioemu2-x0-file")?.files?.[0] : undefined;
+      if (upload && file === undefined) throw new Error("Choose a PDB to propagate from, or propagate from the last fold");
+      const frame = upload ? await file.text() : lastBioemu2?.pdb;
+      if (frame !== undefined) request.bioemu2Frame = frame;
+    }
+    // ...and a steered sampler's potentials file, which is on this machine too (the controls carry the sampler)
+    const potentials = document.getElementById("bioemu2-potentials")?.files?.[0];
+    if (potentials !== undefined && (controls["bioemu2-sampler"] ?? "edm") !== "edm") {
+      request.bioemu2Potentials = await potentials.text();
+    }
+  } else {
+    request.schedule = { steps: samplerPlan(modifications ?? []).calls };
+  }
+  // ...and whether it streams its intermediate results here (the badge's Live preview)
+  request.frames = remoteLiveChoice();
+  // ...the RESOLVED model, which is not the row's value where a second row
+  // picks it: the PLM row turns "ef2" into the 600M or 300M checkpoint.
+  request.family = family;
+  request.job = jobInputJson({ name: safeJobName(entityList.header() ?? "fold"),
+    seed: Number(controls["random-seed"]) || 1, entities });
+  // ...and an uploaded alignment travels with the job, because the worker is
+  // on the other machine and the file is on this one. A pasted one is in
+  // `controls["msa-text"]` already; a searched one the worker fetches itself.
+  // An archive holds one alignment a chain and a Map of paired ones, which
+  // JSON cannot carry; a bare a3m is the text in the box.
+  if (msaMode() === "upload" && uploadedMsas?.inline !== undefined) {
+    throw new Error("the job's own alignments fold on this machine only - fold it here, or set the MSA to search");
+  }
+  if (msaMode() === "upload") {
+    request.msas = uploadedMsas?.chains > 0
+      ? { unpaired: uploadedMsas.chainA3ms,
+          paired: uploadedMsas.chainA3ms.map((_, index) => uploadedMsas.pairedA3ms?.get(index) ?? "") }
+      : { merged: uploadedMsas?.merged ?? uploadedA3m };
+  }
+  status(`${label} · folding on the runtime with ${remoteBackendName()}…`);
   progress("waiting");
   // 🔴 THE WATERMARK IS TAKEN BEFORE THE COMMAND IS SENT. The broker keeps
   // every event of the session, so a reader that started at zero would replay
@@ -3973,7 +4287,45 @@ async function foldOnBackend({ chains, chainKinds, ligandCodes, modifications,
  */
 async function followRemoteFold({ since, label, signal }) {
   const stem = uniqueStem(safeJobName(entityList.header() ?? "fold"));
-  const draw = remoteFrameDrawer(stem);
+  // 🔴 A REMOTE FOLD'S INTERMEDIATE CONTACT MAPS, AS A LOCAL ONE SHOWS THEM. The CUDA backend streams
+  // each trunk pass's map (python/localfold/worker.py, `contacts`: a byte a pair); before the sampler has a
+  // frame it goes to the panel as the local trunk's does, and every frame after it carries the latest.
+  let liveContact;
+  const draw = remoteFrameDrawer(stem, () => (liveContact === undefined ? undefined : { contact: liveContact }));
+  let drawnFrame;
+  // (every drawn frame, so the trajectory rebuilt after the result keeps what was streamed onto it)
+  const liveFrames = [];
+  const carry = (into, from) => {
+    if (into === undefined || from === undefined) return;
+    for (const key of ["maps", "pae", "pae_n", "confidence"]) if (from[key] !== undefined) into[key] = from[key];
+  };
+  // ...and a pass's confidences (the CUDA AF2 streams each pass's, `scores`), onto the card and onto the
+  // frame that pass drew - its PAE and pLDDT, as a local AF2 fold's appendPass gives its frames
+  const showScores = (payload) => {
+    try {
+      updateScoresCard({ meanPlddt: payload.meanPlddt, ptm: payload.ptm, iptm: payload.iptm ?? Number.NaN });
+      if (drawnFrame === undefined || payload.paeU8 === undefined) return;
+      const bytes = Uint8Array.from(atob(payload.paeU8), (c) => c.charCodeAt(0));
+      const pae = new Float32Array(bytes.length);
+      for (let i = 0; i < bytes.length; i += 1) pae[i] = bytes[i] * payload.paeScale;
+      drawnFrame.confidence = { meanPlddt: payload.meanPlddt, ptm: payload.ptm, iptm: payload.iptm,
+                                plddt: Float32Array.from(payload.plddt ?? []), predictedAlignedError: pae };
+      drawnFrame.pae = paeMatrix(pae, payload.n);
+      drawnFrame.pae_n = payload.n;
+      refreshHeatmap();
+    } catch (cause) { console.warn("streamed scores skipped:", cause); }
+  };
+  const showContacts = (payload) => {
+    try {
+      const bytes = Uint8Array.from(atob(payload.u8), (c) => c.charCodeAt(0));
+      const probs = new Float32Array(bytes.length);
+      for (let i = 0; i < bytes.length; i += 1) probs[i] = bytes[i] / 255;
+      liveContact = contactMapFor(probs, undefined);
+      if (liveContact === undefined) return;
+      draw.open();
+      showTrunkContacts(liveContact, expandEntities(formInputs().entities).chains);
+    } catch (cause) { console.warn("streamed contact map skipped:", cause); }
+  };
   const framePdbs = [];
   let result;
   for (;;) {
@@ -3994,23 +4346,35 @@ async function followRemoteFold({ since, label, signal }) {
         + " page could apply them - the trajectory will have a gap");
     }
     since = state.n ?? since;
-    // 🔴 IN THE RUNTIME PAGE'S ORDER, NOT THE NETWORK'S. Events are pushed as
-    // they happen and several sends can be in flight at once - which is what
-    // keeps the feed live while that page is busy - so `seq` is the page's own
-    // count and this is where it is put back in order.
+    // 🔴 IN THE WORKER'S ORDER: `seq` is the broker's count of the worker's lines,
+    // and this is where a batch is put back in it.
     const batch = [...(state.events ?? [])]
       .sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
-    for (const said of batch) {
-      // The page's own calls, replayed here: the same status writes, the same
-      // bar fractions, the same sampler frames, in the order they happened.
+    // 🔴 ONLY A BATCH'S LAST FRAME IS DRAWN AS IT ARRIVES. A warm CUDA fold is a tenth of a second, so its
+    // twenty sampler frames land in two or three batches - and drawing each (parse, add, show: ~10 ms here)
+    // made the reader wait for twenty pictures nobody could see, 0.25 s of a 0.5 s click-to-result. The
+    // others keep a record (the contact map they were streamed beside, the scores of their pass) and every
+    // frame is in the trajectory rebuilt from `framePdbs` once the result is in. A slow fold's frames come
+    // one a batch, and each is drawn.
+    const lastFrame = batch.findLastIndex((said) => said.kind === "frame");
+    for (const [at, said] of batch.entries()) {
+      // The worker's events, applied through the page's own calls: the same status
+      // writes, bar fractions and sampler frames a local fold makes, in order.
       if (said.kind === "status") status(said.payload);
       else if (said.kind === "progress") progress(said.payload);
-      else if (said.kind === "frame") { framePdbs.push(said.payload); draw(said.payload); }
-      // ...and the runtime's own timing rows, recorded on its card against its
-      // clock, rather than a reconstruction of them from over here.
-      else if (said.kind === "dev") devAdopt(said.payload);
+      else if (said.kind === "frame") {
+        framePdbs.push(said.payload);
+        drawnFrame = at === lastFrame ? draw(said.payload)
+          : { maps: liveContact === undefined ? undefined : { contact: liveContact } };
+        liveFrames.push(drawnFrame);
+      }
+      else if (said.kind === "contacts") showContacts(said.payload);
+      else if (said.kind === "scores") showScores(said.payload);
+      // ...and the worker's own timing of each step, as it ends, into the timing report (web/dev-log.js)
+      else if (said.kind === "dev") devPhase(said.payload?.phase, said.payload?.ms, said.payload?.sub === true,
+        said.payload?.at);
       // 🔴 AND THE LAG IS RECORDED RATHER THAN ARGUED ABOUT. Each event
-      // carries the runtime page's own clock and the broker's arrival stamp,
+      // carries the worker's own clock and the broker's arrival stamp,
       // so "the fold was slow" and "the feed was slow" are two numbers. It is
       // what the pulled version could not tell apart.
       else if (said.kind === "result") { result = said.payload ?? {}; }
@@ -4019,36 +4383,30 @@ async function followRemoteFold({ since, label, signal }) {
       }
     }
     if (result !== undefined) break;
-    // 🔴 AND A RUNTIME THAT HAS GONE MUST NOT BE POLLED FOR EVER. Colab
-    // recycles a runtime when the notebook is closed or left idle, and the
-    // broker's busy flag is raised HERE and lowered by the runtime page - so a
-    // page that has gone takes the flag with it and this loop would wait out
-    // the rest of the session on a fold nobody is doing. `runtimeSeen` is how
-    // long it has been since that page asked for its commands, which it does
-    // three times a second.
-    // 🔴 A BUSY PAGE IS NOT A DEAD RUNTIME, AND THE FIRST VERSION OF THIS
-    // COULD NOT TELL THEM APART. The heartbeat is the runtime page's own
-    // command poll, which STOPS while that page holds its main thread -
-    // measured at 6.2 s from six seconds of deliberate long tasks, and a real
-    // fold (shader compilation, a big upload) can hold it longer. Giving up
-    // on silence alone would abort a fold that was working. `browserAlive` is
-    // the DevTools endpoint answering, which is the browser PROCESS rather
-    // than the page: gone means gone.
-    const quiet = state.runtimeSeen ?? 0;
-    if (quiet > 20000 && state.browserAlive === false) {
-      throw new Error("the runtime stopped answering - its notebook may have"
-        + " been closed or its runtime recycled; run the Colab cell again");
-    }
-    // ...and a page that is alive but silent for five minutes is a fold that
-    // has hung rather than one that is thinking. Long, because the cost of
-    // being wrong here is abandoning a fold somebody waited for.
-    if (quiet > 300000) {
-      throw new Error("the runtime's page has not spoken for five minutes -"
-        + " its fold may have hung; run the Colab cell again");
-    }
-    await new Promise((done) => setTimeout(done, 300));
+    // 🔴 A RUNTIME THAT HAS GONE IS NOT POLLED FOR EVER: a closed notebook or a
+    // recycled VM takes the broker with it, and the next ask throws. A worker that
+    // dies mid-fold is a `result` with an error, which the broker writes itself.
+    // (a broker that held the ask has already waited for the next event; an older one answered at once)
+    if (!state.waits) await new Promise((done) => setTimeout(done, 300));
   }
-  if (result.error) throw new Error(`${result.error}${result.status ? ` · ${result.status}` : ""}`);
+  // ...and the worker's status line beside its error only where it adds
+  // something: a fold that failed usually says the same thing twice.
+  if (result.error) {
+    throw new Error(result.status && !result.status.includes(result.error)
+      && !result.error.includes(result.status) ? `${result.error} · ${result.status}` : result.error);
+  }
+
+  // 🔴 A NATIVE FOLD COMES BACK AS AlphaFold 3's OWN FIELDS, NOT AS THIS PAGE'S
+  // PREDICTION - there is no copy of this page on the other side to build one.
+  // So it is built here, in the shape the AF3 path records (typed arrays, a
+  // token layout, the context the archive and the session read), and it goes
+  // through the same doors: loadIntoViewer for the picture, recordPrediction
+  // for the downloads, the scores card and the saved session.
+  // (an older worker marked it `cuda: true`; this one says which native port folded it)
+  if (result.native === undefined && result.cuda !== true) {
+    throw new Error("the runtime answered with something that is not a native fold");
+  }
+  const cuda = nativePrediction(result, stem, label);
 
   // 🔴 THE FILE STILL GOES IN THROUGH `loadIntoViewer`, because that is what
   // fills the sequence strip, the download buttons and the scores card - the
@@ -4064,54 +4422,171 @@ async function followRemoteFold({ since, label, signal }) {
   // pass `{pdb, scores: {}}`, so a remote fold came back with no MSA panel, no
   // PAE plot and an empty scores card - the page looked like it had folded
   // nothing but coordinates, because it had been given nothing else.
+  // 🔴 A BioEmu2 FOLD IS AN ENSEMBLE: its play bar is ONE FRAME A SAMPLE, as this page's own foldWithBioemu2 leaves it -
+  // the streamed frames (the first sample's denoising, metal/bioemu2's --frames) were the live preview and are replaced,
+  // not kept as a trajectory with the samples appended after it. (cuda/bioemu2 streams none, so this path never met them)
+  const ensemble = result.family === "bioemu2" && Array.isArray(result.samples) && result.samples.length > 0;
   await loadIntoViewer({
-    stem, pdb: framePdbs[0] ?? result.pdb,
-    scores: result.scores ?? {},
-    a3m: result.a3m,
-    confidence: result.confidence,
+    stem, pdb: ensemble ? result.samples[0] : framePdbs[0] ?? result.pdb,
+    scores: cuda.scores,
+    a3m: result.a3m ?? undefined,
+    confidence: cuda.confidence,
     length: result.length,
   });
-  if (viewer !== undefined && Object.keys(camera).length > 0) {
+  // 🔴 THE CAMERA IS KEPT ONLY WHERE THE FOLD WAS WATCHED. It is the streamed trajectory's, oriented on its first
+  // frame, and keeping it holds the picture steady as the result replaces the frames. With Live preview off nothing
+  // was streamed: the camera held is the PREVIOUS fold's, and the result - in the model's own coordinates, tens of
+  // angstroms from anywhere - was drawn off-centre or out of view. It gets the best view of itself instead.
+  if (viewer !== undefined && framePdbs.length > 0 && Object.keys(camera).length > 0) {
     Object.assign(viewer.viewerState, camera);
     viewer.render?.("localfold.restore-camera");
+  } else if (viewer !== undefined && framePdbs.length === 0) {
+    orientBestView(viewer);
   }
   const api = window.py2Dmol;
-  if (api?.frameFromText !== undefined && viewer !== undefined && framePdbs.length > 0) {
+  if (!ensemble && api?.frameFromText !== undefined && viewer !== undefined && framePdbs.length > 0) {
     const first = viewer.objectsData?.[viewerObject]?.frames?.[0];
     if (first !== undefined) first.name = first.label = first.title = "sampler_0";
-    for (const [index, text] of [...framePdbs.slice(1, -1), result.pdb].entries()) {
+    carry(first, liveFrames[0]);
+    // 🔴 THE RESULT DRAWN WHERE THE FRAMES ARE. The native ports superpose each streamed frame onto the first and
+    // return the structure in the model's own frame - the same atoms as the last frame once fitted, 4-60 A away as
+    // drawn - so the trajectory jumped on its last frame. The final frame is the result moved onto the last streamed
+    // one (web/pdb-superpose.js); the downloads keep the result as the model wrote it.
+    const settled = superposePdbOnto(result.pdb, framePdbs[framePdbs.length - 1]);
+    for (const [index, text] of [...framePdbs.slice(1, -1), settled].entries()) {
       try {
         const frame = api.frameFromText(text);
         const last = index === framePdbs.length - 2;
         frame.name = frame.label = frame.title = last ? "final" : `sampler_${index + 1}`;
+        carry(frame, liveFrames[index + 1]);
         viewer.addFrame(frame, viewerObject);
       } catch (cause) { console.warn("frame skipped:", cause); }
     }
   }
+  // 🔴 A NATIVE BioEmu2 FOLD IS AN ENSEMBLE AND HAS NO CONFIDENCE HEAD, as this page's own is (foldWithBioemu2):
+  // every sample on the play bar, coloured by chain, and the card carrying BioEmu2's physicality report of them
+  // rather than a pLDDT the B-factors do not hold
+  if (result.family === "bioemu2" && Array.isArray(result.samples)) await nativeBioemu2Samples(result, cuda);
   // 🔴 AND THE DOWNLOAD BUTTONS NEED A PREDICTION, WHICH THIS PAGE NEVER MADE.
   // `activePrediction()` reads `predictions.get(name)` and falls back to
   // `lastPrediction` - both written by the LOCAL fold paths - so on a remote
   // fold the buttons were either a silent no-op or, worse, handed back
   // whatever this tab had folded BEFORE: the wrong structure, downloaded
-  // without a word. The runtime sends its whole prediction object and it is
-  // registered here under THIS page's stem, which is the name the viewer knows
-  // the object by and therefore the one `activePrediction` looks up.
-  if (result.predJson) {
-    try {
-      const remote = revivePrediction(result.predJson);
-      remote.stem = stem;
-      // ...through the one funnel, so this path records what every other
-      // one does: the last prediction, the map entry, the downloads, and
-      // the page's claim on the object (see recordPrediction).
-      recordPrediction(remote, remote.family ?? familyFromLabel(remote.model));
-    } catch (cause) {
-      console.warn("the runtime's prediction did not parse:", cause);
-    }
-  }
-  // ...and the runtime's own summary, which already reads the way this page's
-  // status line does - it is the same code, on the other machine.
+  // without a word. The prediction built above is registered under THIS page's
+  // stem, which is the name the viewer knows the object by and therefore the
+  // one `activePrediction` looks up.
+  recordPrediction(cuda, cuda.family);
+  void rememberSessionWhenSettled(lastPrediction);
+  // ...and the worker's own summary line.
   status(result.status || `${label} · folded on the runtime`);
   progress(null);
+}
+
+/**
+ * A native BioEmu2 fold's samples: frames after the first (which loadIntoViewer drew), the physicality report on the
+ * status line and the card, and the first sample kept for a propagation from it.
+ */
+async function nativeBioemu2Samples(result, prediction) {
+  const { entities, controls } = formInputs();
+  const propagating = controls["bioemu2-mode"] === "propagate";
+  const perTrajectory = Math.max(1, Number(controls["bioemu2-propagation-steps"]) || 1);
+  const label = (at) => (propagating
+    ? `trajectory_${Math.floor(at / perTrajectory) + 1}_step_${(at % perTrajectory) + 1}` : `sample_${at + 1}`);
+  const api = window.py2Dmol;
+  if (api?.frameFromText !== undefined && viewer !== undefined) {
+    const object = viewer.objectsData?.[viewerObject];
+    const first = object?.frames?.[0];
+    if (first !== undefined) first.name = first.label = first.title = label(0);
+    for (const [index, text] of result.samples.slice(1).entries()) {
+      try {
+        const frame = api.frameFromText(text);
+        frame.name = frame.label = frame.title = label(index + 1);
+        if (first?.maps !== undefined) frame.maps = first.maps;
+        viewer.addFrame(frame, viewerObject);
+      } catch (cause) { console.warn("sample skipped:", cause); }
+    }
+    forcePlddtColours(false);
+    viewer.setFrame(0);
+    viewer.render("bioemu2-final");
+  }
+  let line = "";
+  try {
+    const featurised = await bioemu2Features(jobInputJson({ name: "fold", seed: 1, entities }), { mode: "structure" });
+    const samples = result.samples.map((text) => x0FromPdb(text, featurised.atomKeys));
+    const physicality = bioemu2Physicality(featurised, samples);
+    line = physicality.line;
+    prediction.settings = { ...prediction.settings, mode: controls["bioemu2-mode"] ?? "structure",
+      samples: result.samples.length,
+      ...(physicality.report.length === 0 ? {} : {
+        physicality: physicality.report.map((one) => (one.ok ? "passed" : `rejected: ${one.reason}`)) }) };
+    lastBioemu2 = { key: JSON.stringify(featurised.atomKeys), coords: samples[0], pdb: result.samples[0] };
+  } catch (cause) {
+    console.warn("physicality report skipped:", cause);
+    lastBioemu2 = { pdb: result.samples[0] };
+  }
+  updateScoresCard({ none: true, label: `No confidence head${line}` });
+  result.status = `${result.status ?? ""}${line}`;
+}
+
+/**
+ * A native fold's result as this page's own prediction.
+ *
+ * The worker (python/localfold/worker.py) sends AlphaFold 3's per-token pLDDT, PAE and
+ * contact probabilities, its token layout and the alignment it used; the rest
+ * - the entities, the settings, the form - is this page's, taken now, because
+ * the reader's form is what asked for this fold.
+ */
+function nativePrediction(result, stem, label) {
+  const backend = result.native === "metal" ? "Metal" : "CUDA";
+  const floats = (values) => (values == null ? undefined : Float32Array.from(values));
+  const given = result.confidence ?? {};
+  const confidence = {
+    ...given,
+    // 🔴 NaN, NOT ABSENT, FOR A FOLD WITH NO INTERFACE - which is what the AF3
+    // path records and what the scores card reads as "-". Absent, the card kept
+    // the LAST fold's ipTM: a monomer after a complex read "ipTM 0.51".
+    iptm: given.iptm ?? Number.NaN,
+    plddt: floats(given.plddt),
+    predictedAlignedError: floats(given.predictedAlignedError),
+    contactProbs: floats(given.contactProbs),
+  };
+  const chains = result.chains ?? [];
+  const { entities, controls } = formInputs();
+  // ...the family the worker folded, which the request named RESOLVED.
+  const family = result.family ?? chosenFamily();
+  const mode = controls["msa-mode"] ?? "none";
+  return {
+    stem,
+    pdb: result.pdb,
+    confidence,
+    scores: confidenceJson(chains.join(""), confidence),
+    a3m: result.a3m ?? undefined,
+    chains,
+    chainLengths: chains.map((chain) => chain.length),
+    contactSource: { contactProbs: confidence.contactProbs },
+    tokens: result.tokens,
+    model: `${label} (${backend})`,
+    family,
+    entities,
+    inputs: { entities, controls },
+    // ...the structures the worker used, one a fold chain, in the shape the
+    // archive writes - so a saved CUDA fold reloads with its templates rather
+    // than as a search, and its README does not say "templates: none".
+    templates: result.templates ?? [],
+    msas: result.msas ?? {},
+    msaOrigin: {
+      none: SINGLE_SEQUENCE_ORIGIN,
+      search: `MMseqs2 search at api.colabfold.com (by the ${backend} backend)`,
+      paste: "pasted by hand",
+      upload: "uploaded a3m",
+    }[mode] ?? mode,
+    settings: {
+      backend: `${backend} (${result.model})`,
+      seed: Number(controls["random-seed"]) || 1,
+      recycles: Number(controls.recycles) || undefined,
+      "max msa": controls["max-msa"],
+    },
+  };
 }
 
 /**
@@ -4129,7 +4604,7 @@ async function followRemoteFold({ since, label, signal }) {
  * one runs is refused by the broker with its own words.
  */
 async function attachToRunningFold() {
-  if (colabRole() !== "reader") return;
+  if (nativeRole() !== "reader") return;
   try {
     const head = await remoteHead();
     if (!head.folding) return;
@@ -4153,11 +4628,12 @@ async function attachToRunningFold() {
  * on the trunk - and a fold the runtime REFUSES (429, a second reader) would
  * leave an empty object on the page with nothing ever arriving in it.
  */
-function remoteFrameDrawer(stem) {
+function remoteFrameDrawer(stem, liveMaps = () => undefined) {
   let drawn = 0;
+  let lastFrame;
   let opened = false;
   let colouring = false;
-  return (pdb) => {
+  const drawer = (pdb) => {
     const api = window.py2Dmol;
     if (api?.frameFromText === undefined) return;
     const registry = window.py2dmol_viewers ?? {};
@@ -4170,7 +4646,11 @@ function remoteFrameDrawer(stem) {
       foldIsShowing(renderer);
       const frame = api.frameFromText(pdb);
       frame.name = frame.label = frame.title = `sampler_${drawn++}`;
+      // ...carrying the latest streamed contact map, as a local fold's frames carry theirs
+      const maps = liveMaps();
+      if (maps !== undefined) frame.maps = { ...frame.maps, ...maps };
       renderer.addFrame(frame, renderer.currentObjectName);
+      lastFrame = frame;
       renderer.setFrame(object.frames.length - 1);
       // The B-factor column of every model this backend drives is a pLDDT, so
       // the trajectory is watchable in confidence from its first frame - the
@@ -4179,7 +4659,15 @@ function remoteFrameDrawer(stem) {
     } catch (cause) {
       console.warn("live frame skipped:", cause);
     }
+    return lastFrame;
   };
+  // 🔴 THIS FOLD'S OBJECT, OPENED BY ITS FIRST CONTACT MAP AND NOT ONLY BY ITS FIRST FRAME. The trunk's maps are drawn
+  // only while the current object has no frames (showTrunkContacts), and the object was opened here on the sampler's
+  // first frame - so on every fold after the first, the previous fold's frames held the panel and each trunk pass's
+  // map was dropped: a second fold showed none (found on IntelliFold-2, true of every model). The WebGPU paths open
+  // theirs as the fold starts.
+  drawer.open = () => { if (!opened) { openBlankFold(stem); opened = true; } };
+  return drawer;
 }
 
 async function fold(event) {
@@ -4194,13 +4682,11 @@ async function fold(event) {
   const { signal } = controller;
   activeFold = controller;
   // 🔴 THE PAGE SAYS WHETHER IT IS FOLDING, because everything else is a
-  // proxy. A backend driving this page headlessly used to watch for a NEW
-  // object with frames, which is true of a first fold and FALSE of a second:
-  // a repeat fold reuses the stem, so the watcher waited out its whole timeout
-  // on a fold that had finished in a second (measured - status line
-  // "AlphaFold 3 · 13 residues · in 1 s (trunk reused)", watcher timed out).
-  // The button is no good either: it stays enabled throughout, being how you
-  // stop one. See tools/colab_backend.py.
+  // proxy. A driver that watched for a NEW object with frames was right on a
+  // first fold and WRONG on a second: a repeat fold reuses the stem, so it
+  // waited out its whole timeout on a fold that had finished in a second. The
+  // button is no good either: it stays enabled throughout, being how you stop
+  // one. The gates read this (tools/check-model-switch.py and others).
   window.__foldState = { running: true, since: Date.now() };
   // Whether this press computed anything; see the AF2 replay.
   let foldWasReplayed = false;
@@ -4209,7 +4695,7 @@ async function fold(event) {
   // will actually do rather than what a hidden control still says.
   devBeginRun(`fold · ${element("model-family").value}`
     + ` · alignment ${msaMode()}`
-    + ` · ${element("recycles").value} recycles`);
+    + ` · ${element("recycles").value} recycles`, MODEL_LABELS[element("model-family").value]);
   // 🔴 THE LAST FOLD'S NUMBERS GO BEFORE THIS ONE STARTS. The card kept showing
   // a mean pLDDT and a pTM for a structure that was no longer being computed,
   // for as long as the new fold took - which is worse than an empty panel,
@@ -4242,7 +4728,7 @@ async function fold(event) {
     // 🔴 THE BONDS COME OFF THE ROWS, NOT OUT OF A VARIABLE. They were held in
     // `jobBonds`, set when a job loaded and invisible thereafter - the same
     // shape as the job NAME that was built and then removed for being state
-    // nobody could see. A `contact` row sits in the entity list with the chains
+    // nobody could see. A `bond` row sits in the entity list with the chains
     // it names, so editing the rows edits the bonds, and `expandEntities`
     // resolves the letters against the chain order the fold will actually see.
     const bonds = request.bonds ?? [];
@@ -4253,6 +4739,19 @@ async function fold(event) {
     const nucleicCount = chainKinds.filter((kind) => kind !== "protein").length;
     let family = modelFamily(ligandCodes.length, modifications.length, nucleicCount,
                              (request.templates ?? []).length);
+    // 🔴 A CONSTRAINT IS REFUSED BY A MODEL THAT CANNOT READ IT, NOT FOLDED AS IF IT WERE NOT THERE. Boltz-2 and
+    // chai-1 were trained on pockets and contacts (shared/af3/featurise/constraints.js); every other family's path
+    // never looks at the rows, so this is the one place that can say so before any download.
+    if ((request.constraints ?? []).length > 0 && family !== "boltz2" && family !== "chai1") {
+      throw new Error(`${MODEL_LABELS[family] ?? family} was not trained with pocket or contact constraints;`
+        + " choose Boltz-2 or Chai-1, or remove the pocket and contact rows");
+    }
+    // ...and a crosslink is a ligand BONDED to two residues: only the AlphaFold 3-lineage path reads the bonds, so
+    // elsewhere it would fold a free-floating bridge
+    if (entities.some((entity) => entity.type === "crosslink") && !isAf3Family(family)) {
+      throw new Error(`${MODEL_LABELS[family] ?? family} does not take covalent bonds, which a crosslink is;`
+        + " choose an AlphaFold 3-lineage model, or remove the crosslink rows");
+    }
     // 🔴 THE TERMS ARE ASKED BEFORE THE DOWNLOAD, NOT BEFORE THE PAGE. AF3's
     // parameters carry DeepMind's own terms, and the moment they apply is the
     // moment the bytes are fetched - which is the next line. Asking on page
@@ -4273,11 +4772,24 @@ async function fold(event) {
     // watch. Everything above still runs - the entities are validated, the
     // model is resolved, the terms are asked - because those are questions
     // about the JOB, and the job is the same wherever it runs.
+    if (NATIVE_ONLY_FAMILIES.includes(family) && remoteBackend() === null) {
+      throw new Error(`${MODEL_LABELS[family] ?? family} folds on a native backend only - run \`localfold serve\``
+        + " with its export on disk (metal/README.md)");
+    }
     if (remoteBackend() !== null) {
       await foldOnBackend({ chains, chainKinds, ligandCodes, modifications,
                             templates: request.templates ?? [], family, signal });
       return;
     }
+    // 🔴 A DIFFERENT MODEL LETS THE LAST ONE'S GPU WEIGHTS GO. Residency is
+    // kept between folds so the same model's next fold skips its packing, and
+    // it was kept across a CHANGE of model too - four models in one page and
+    // the fourth fold died at 2.9 GiB live. See releaseAllWeights.
+    if (lastFoldedFamily !== undefined && lastFoldedFamily !== family) {
+      releaseAllWeights(await getDevice());
+      releaseBioemu2(await getDevice());
+    }
+    lastFoldedFamily = family;
     // ...and started, not awaited. The templates and the alignment below are
     // network work of their own; this runs beside them.
     const modelLoad = startModelPreload(family, signal);
@@ -4304,7 +4816,7 @@ async function fold(event) {
     // this used to say "AF3 only: AF2's drivers take a template through a
     // different path and nothing on this page builds one for them yet", and
     // the reason was that monomer.js never forwarded the slot. It does now.
-    // The MULTIMER is still refused upstream, in chosenFamily's guard.
+    // And for the MULTIMER, one slot over the complex.
     const templateSources = [];
     for (const template of request.templates ?? []) {
       const kind = templateKind(template);
@@ -4327,6 +4839,16 @@ async function fold(event) {
         continue;
       }
       if (kind === "none" || source === "") continue;
+      // ...the file the popup's Fetch already checked, when it is for this id:
+      // the structure the reader looked at is the one folded, and not a second
+      // download. The chain comes from the box, which the chain menu writes.
+      const parsed = parseSource(source, kind);
+      const fetched = template.fetched;
+      if (fetched !== undefined && fetched.id === parsed.id && fetched.kind === kind) {
+        templateSources.push({ ...common, chainId: parsed.chain ?? fetched.chains[0]?.chain,
+          text: fetched.text, source });
+        continue;
+      }
       status(`Fetching template ${source}`);
       const structure = await fetchStructure(source, { signal, kind });
       templateSources.push({ ...common, chainId: structure.chain,
@@ -4355,7 +4877,26 @@ async function fold(event) {
     // database this page has no server for. Either way the reader asked for an
     // alignment and is getting one for some of their chains, so the status line
     // says which.
-    if (nucleicCount > 0 && msaMode() !== "single") {
+    // 🔴 A JOB'S OWN ALIGNMENTS COVER EVERY POLYMER CHAIN, nucleic ones too, so
+    // they bypass the protein-only path below and reach the featuriser with
+    // each column's alphabet (mergeJobAlignments, the native exporter's too).
+    const inlineMsas = msaMode() === "upload" ? uploadedMsas?.inline : undefined;
+    if (inlineMsas !== undefined) {
+      if (!isAf3Family(family)) {
+        throw new Error("the job's own alignments are AlphaFold 3's - choose an AlphaFold 3-lineage model,"
+          + " or set the MSA to search");
+      }
+      // ...and only for the chains they were written for: an edited row is
+      // a different sequence, and its alignment would gap the wrong columns
+      [...inlineMsas.unpaired, ...inlineMsas.paired].forEach((text, at) => {
+        const chain = at % chains.length;
+        if (text && parseA3m(text, { anyLetter: true }).query.toUpperCase() !== chains[chain].toUpperCase()) {
+          throw new Error(`the job's alignment for chain ${chain + 1} is for a different sequence -`
+            + " load the job again, or set the MSA to search");
+        }
+      });
+    }
+    if (inlineMsas === undefined && nucleicCount > 0 && msaMode() !== "single") {
       const kinds = [...new Set(chainKinds.filter((kind) => kind !== "protein"))]
         .map((kind) => kind.toUpperCase()).join(" and ");
       status(proteinChains.length === 0
@@ -4367,8 +4908,18 @@ async function fold(event) {
     // sequence - the right message for an empty box, the wrong one for a job
     // that is already complete. A DNA-only fold is the same case: there is no
     // protein to search with, and no RNA database here to search instead.
-    const alignmentResult = proteinChains.length === 0
-      ? null : await alignmentText(proteinChains, signal, family, proteinWantsMsa);
+    let msaColumnKinds;
+    let alignmentResult;
+    if (inlineMsas !== undefined) {
+      const merged = mergeJobAlignments(inlineMsas, chains, chainKinds);
+      msaColumnKinds = merged.msaColumnKinds;
+      alignmentResult = { text: merged.alignment.unpaired ?? merged.alignment.paired, blocks: merged.alignment };
+      status(`Alignments from the job · ${inlineMsas.unpaired.filter(Boolean).length} unpaired,`
+        + ` ${inlineMsas.paired.filter(Boolean).length} paired`);
+    } else {
+      alignmentResult = proteinChains.length === 0
+        ? null : await alignmentText(proteinChains, signal, family, proteinWantsMsa);
+    }
     const alignment = typeof alignmentResult === "string"
       ? alignmentResult : (alignmentResult?.text ?? null);
     // A pasted or uploaded A3M is one text and cannot be split into blocks; it
@@ -4429,7 +4980,9 @@ async function fold(event) {
       template.source = best.target;
     }
     throwIfAborted(signal);
-    if (alignment !== null) {
+    // (a job's own alignments were checked chain by chain above, and cover the
+    // nucleic chains too, so this protein-only rule does not apply to them)
+    if (alignment !== null && inlineMsas === undefined) {
       // THE ALIGNMENT'S QUERY WINS. An A3M carries its own first record, and
       // folding the box's sequence against somebody else's alignment would be
       // folding two different proteins at once.
@@ -4460,6 +5013,8 @@ async function fold(event) {
     foldContext = {
       entities,
       bonds,
+      // ...and the pocket and contact constraints, off the rows the same way (read by boltz2 and chai-1 alone)
+      constraints: request.constraints ?? [],
       // 🔴 THE FORM AS IT IS RIGHT NOW, which is what makes a restored fold
       // continuable: it rides into every prediction through the spread of
       // this object and into the session through jobMeta. Read HERE, at the
@@ -4496,6 +5051,10 @@ async function fold(event) {
     // and that is the point: search, paste and upload, the query-wins rule and
     // the pairing decision are one implementation for all three models. What
     // differs is only how the A3M is encoded, which is af3MsaFromA3m's job.
+    if (BIOEMU2_FAMILIES.includes(family)) {
+      await foldWithBioemu2({ chains, chainKinds, alignment, alignmentBlocks, signal, modelLoad, modifications });
+      return;
+    }
     if (SINGLE_SEQUENCE_FAMILIES.includes(family)) {
       // 🔴 MODIFICATIONS TRAVEL HERE TOO, AND USED NOT TO. `modelFamily`
       // refuses one for AlphaFold 2 by name - it would "return a confident
@@ -4509,7 +5068,7 @@ async function fold(event) {
     }
     if (isAf3Family(family)) {
       await foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCodes,
-                        modifications, chainKinds, templateSources, modelLoad, family);
+                        modifications, chainKinds, templateSources, modelLoad, family, msaColumnKinds);
       return;
     }
 
@@ -4552,7 +5111,10 @@ async function fold(event) {
     // QueryOnlyTemplateGpu with no weights. See graphFamily.
     const multimer = graphOf(family) === "multimer";
     const unified = multimer || new URLSearchParams(location.search).get("graph") === "unified";
-    const alignmentForDriver = alignment === null ? `>query\n${sequence}\n` : alignmentForModel;
+    // (none: each chain's own row, merged as a search's - on the monomer a complex's copies each a row of their own,
+    // as ColabFold folds it; see singleSequenceA3m)
+    const alignmentForDriver = alignment === null ? singleSequenceA3m(chains, multimer ? "multimer" : "monomer")
+      : alignmentForModel;
 
     // 🔴 THE MONOMER'S TEMPLATE, BUILT BEFORE af2Key, because a trunk cached
     // from a fold WITHOUT one is not this fold's trunk - which is what that
@@ -4568,27 +5130,39 @@ async function fold(event) {
     // See test/template-atom37-layout.test.js.
     let af2Template;
     if (templateSources.length > 0) {
-      // 🔴 REFUSED RATHER THAN DROPPED. `?graph=unified` runs the MULTIMER's
-      // graph over a monomer, and that embedder is a different dialect nothing
-      // here builds a slot for - so folding on would quietly ignore it, which
-      // is the failure this whole path exists to avoid.
-      if (unified) {
-        // ...and it names which of the two it is, because a session restored
-        // from a job that set both reaches here without passing chosenFamily's
-        // guard, and "drop ?graph=unified" is not advice a multimer can take.
-        throw new Error(multimer
-          ? "AlphaFold 2 multimer's template embedder is a different dialect"
-            + " and this page does not build a slot for it"
-          : "the unified graph has no monomer template embedder;"
-            + " drop ?graph=unified to fold with a template");
+      // 🔴 REFUSED RATHER THAN DROPPED. `?graph=unified` over a MONOMER family
+      // runs the multimer's graph with the monomer's weights, which have no
+      // multimer template embedder - so folding on would quietly ignore it.
+      if (unified && !multimer) {
+        throw new Error("the unified graph has no monomer template embedder;"
+          + " drop ?graph=unified to fold with a template");
       }
-      const source = templateSources[0];
-      status(`Aligning template ${source.source ?? ""}`);
-      af2Template = buildTemplate({
-        text: source.text, chain: source.chainId, query: sequence,
-        tokens: sequence.length, minConfidence: source.minConfidence ?? 0,
-        layout: "atom37",
-      });
+      // 🔴 THE MULTIMER TAKES ONE atom37 SLOT OVER THE WHOLE COMPLEX, each
+      // templated chain written at its own residue offset and the rest left as
+      // gap - which is what AlphaFold's multimer pipeline builds too, one
+      // template per chain concatenated along the residue axis. asymId masks
+      // what crosses chains, so two chains templated from two files never
+      // claim to know their relative placement. The monomer is one chain at
+      // offset zero, so it is the same loop.
+      const offsets = chainLengths.map((_, at) => chainLengths.slice(0, at).reduce((a, b) => a + b, 0));
+      const seen = new Set();
+      const built = [];
+      for (const source of templateSources) {
+        const at = multimer ? source.chain ?? 0 : 0;
+        if (seen.has(at)) {
+          throw new Error(`AlphaFold 2 takes one template a chain; chain ${at + 1} has two`);
+        }
+        seen.add(at);
+        status(`Aligning template ${source.source ?? ""}`);
+        built.push(buildTemplate({
+          text: source.text, chain: source.chainId,
+          query: multimer ? chains[at] : sequence, offset: multimer ? offsets[at] : 0,
+          tokens: sequence.length, minConfidence: source.minConfidence ?? 0,
+          layout: "atom37",
+          ...(source.mapping === undefined ? {} : { mapping: source.mapping }),
+        }));
+      }
+      af2Template = built.length === 1 ? built[0] : mergeAtom37Templates(built, sequence.length);
       throwIfAborted(signal);
     }
 
@@ -4602,7 +5176,8 @@ async function fold(event) {
       // ...the SOURCE rather than the slot: the slot is megabytes of float and
       // the text plus the chain is what decides every one of them.
       template: af2Template === undefined ? null
-        : cheapHash(`${templateSources[0].text}\u0000${templateSources[0].chainId ?? ""}`),
+        : cheapHash(templateSources.map((source) =>
+          `${source.chain ?? ""}\u0000${source.text}\u0000${source.chainId ?? ""}`).join("\u0001")),
     });
     // 🔴 AND A SWEEP IS NEVER A CONTINUATION. The cache holds ONE model's trunk
     // under a key naming that model, so resuming a five-model run would replay
@@ -4783,7 +5358,7 @@ async function fold(event) {
           void initialLoadPromise.then(() => {
             const frame = viewer?.objectsData?.[viewerObject]?.frames?.[0];
             if (frame !== undefined) {
-              attachContactMap(frame, recycle, weights, sequence.length);
+              attachContactMap(frame, recycle);
             }
           });
         } else {
@@ -4793,7 +5368,7 @@ async function fold(event) {
         }
       };
       // 🔴 THE UNITS ARE COSTS, NOT COUNTS, and that is what makes a clock
-      // possible. src/af2/model/*.js weight every step by what the cost model says it
+      // possible. webgpu/af2/model/*.js weight every step by what the cost model says it
       // costs, so `completed / total` is a fraction of the WORK - and the ratio
       // of elapsed time to work done is this machine's speed, whatever it is.
       // RuntimeEstimator holds that reasoning; a plan of one stage is enough for
@@ -4843,7 +5418,7 @@ async function fold(event) {
         ? { outerProductMeanFirst: true, positionScale: 20,
           chainAware: true, chainSequences: chains }
         : {};
-      // ...?graph=unified runs the MONOMER weights through src/af2/multimer/ instead.
+      // ...?graph=unified runs the MONOMER weights through webgpu/af2/multimer/ instead.
       // With its switches off that graph reproduces the monomer one bit for bit,
       // which is the check that the superset is right; a difference is a graph
       // bug rather than a weights bug.
@@ -4886,12 +5461,12 @@ async function fold(event) {
           // (the CLI tools, the differential gates, an embedder) folds once and
           // used to pay for it anyway.
           { recycles, randomSeed: seed, maxMsaSequences, maxExtraSequences, chainLengths, tolerance, signal,
-          // ...and `pairHost: true` for the distogram contact overlay, which is
-          // the only reader of the host copy of the pair representation.
+          // ...and `contacts`, the distogram head, for the contact overlay:
+          // monomer.js computes it on the device and returns the probabilities.
           // ...and the template slot, which monomer.js forwards into
           // QueryOnlyTemplateGpu. `undefined` is a fully masked template, which
           // is what every fold on this page was before it.
-            resume, resumable: true, pairHost: true, template: af2Template?.slot, ...regime },
+            resume, resumable: true, contacts: weights.distogram, template: af2Template?.slot, ...regime },
           model.paeBreaks, onRecycle, runProgress);
 
       // 🔴 THE EARLIER PASSES COME BACK FOR THE ANIMATION. A continuation returns
@@ -5135,12 +5710,14 @@ async function fold(event) {
     // the only thing on screen that says one arrived.
     let templateText = "";
     if (af2Template !== undefined) {
-      const source = templateSources[0];
-      if (source.origin !== undefined) {
-        source.origin.status = describeCoverage(af2Template.coverage);
-      }
-      templateText = ` · template ${source.source ?? ""}`
-        + ` ${af2Template.coverage.residues}/${af2Template.coverage.of}`;
+      // One entry a templated chain; the monomer is the one-part case.
+      const parts = af2Template.parts ?? [af2Template];
+      parts.forEach((part, index) => {
+        const source = templateSources[index];
+        if (source.origin !== undefined) source.origin.status = describeCoverage(part.coverage);
+        templateText += ` · template ${source.source ?? ""}`
+          + ` ${part.coverage.residues}/${part.coverage.of}`;
+      });
     }
     status(`${foldWasReplayed ? "Already folded · shown from memory"
       : `Done in ${took} s`} · pLDDT ${best.confidence.meanPlddt.toFixed(1)}`
@@ -5306,7 +5883,6 @@ if (familySelect !== null) {
     syncModelControls(); syncMode();
   });
 }
-document.getElementById("af3-mode")?.addEventListener("change", syncAf3Count);
 // 🔴 AND THE MODEL NUMBER CHANGES THE FAMILY TOO, exactly as the PLM row does -
 // `chosenFamily` folds it into the name, so everything keyed on a family (the
 // weight cache, the download stem, the status line) has to be refreshed here or
@@ -5322,7 +5898,12 @@ document.getElementById("af2Model")?.addEventListener("change", () => {
 document.getElementById("plm-mode")?.addEventListener("change", () => {
   syncModelControls();
   syncAf3Count();
+  syncMode();             // (the variant can grey the MSA row or give it back: what hangs off that row follows)
 });
+// BioEmu2's mode decides whether the propagation row shows, and its source whether the file box does
+for (const id of ["bioemu2-mode", "bioemu2-propagate-from"]) {
+  document.getElementById(id)?.addEventListener("change", () => syncBioemu2Controls());
+}
 // 🔴 URL FIRST, THEN BOTH SYNCS, IN THE LISTENER'S ORDER. `?model=` moves the
 // row after syncMode() has already read it above, so the controls have to be
 // brought back into agreement exactly as a change event would - and
@@ -5354,6 +5935,10 @@ reportModelFromUrl();
  */
 
 function applyJob(job) {
+  // (the page builds no chemistry a job defines itself; the native fold does - cuda/af3/fold)
+  if (job.userCcd !== undefined) {
+    throw new Error("userCCD describes chemistry this page does not build - remove it to fold the rest");
+  }
   entityList.set(job.entities);
   const said = [];
   if (job.seed !== undefined) {
@@ -5363,7 +5948,16 @@ function applyJob(job) {
       said.push(`seed ${job.seed}`);
     }
   }
-  if (job.singleSequence && modeSelect.value !== "none") {
+  if (job.alignments !== undefined) {
+    // 🔴 THE FILE'S OWN ALIGNMENTS, HELD AS AN UPLOAD. They are what AF3's data
+    // pipeline wrote for these chains; the dial says Upload so a search is not
+    // run over them, and loading another alignment replaces them.
+    uploadedMsas = { inline: job.alignments };
+    uploadedA3m = "";
+    modeSelect.value = "upload";
+    syncMode();
+    said.push("alignments from the file");
+  } else if (job.singleSequence && modeSelect.value !== "none") {
     modeSelect.value = "none";
     syncMode();
     said.push("MSA off");
@@ -5377,7 +5971,7 @@ function applyJob(job) {
     modeSelect.value = modeBeforeJob;
     syncMode();
   }
-  // 🔴 CHAINS, NOT ROWS. A contact row is a bond between two chains and a
+  // 🔴 CHAINS, NOT ROWS. A bond row is a bond between two chains and a
   // ligand is not a chain either, so counting rows reported "2 chains + 1
   // ligand" for a protein, a ligand and the bond between them.
   const chains = job.entities.reduce((total, entity) =>
@@ -5421,6 +6015,28 @@ async function readHandedFile(bytes, { name = "", textIs = "alignment" } = {}) {
       try { loadedJob = applyJob(jobFromJson(files.get(requestName))); }
       catch (error) { loadedJob = `job not loaded: ${error.message}`; }
     }
+    // 🔴 AND THE TEMPLATES, AS THE STRUCTURES THAT WERE USED. The request
+    // says only `useStructureTemplate: true`, which reads back as "from the
+    // search" - so an uploaded crystal came back as a search nobody asked for.
+    // The archive carries the files and an index naming each one's chain.
+    const usedTemplates = templatesFromArchive(files);
+    if (usedTemplates.length > 0 && typeof loadedJob === "string"
+        && !loadedJob.startsWith("job not loaded")) {
+      const rows = entityList.read();
+      // A fold chain is a polymer COPY, so the rows are walked counting copies.
+      const rowOfChain = [];
+      rows.forEach((row, at) => {
+        if (POLYMER_TYPES.includes(row.type)) for (let c = 0; c < row.copies; c += 1) rowOfChain.push(at);
+      });
+      for (const used of usedTemplates) {
+        const row = rows[rowOfChain[used.chain]];
+        if (row?.type !== "protein") continue;
+        row.template = { kind: "upload", text: used.text, filename: used.filename,
+                         source: used.structureChain ?? "" };
+      }
+      entityList.set(rows);
+      loadedJob += ` · ${usedTemplates.length} template${usedTemplates.length === 1 ? "" : "s"}`;
+    }
     const restored = msasFromArchive(files);
     if (restored.chains === 0 && restored.merged === undefined) {
       if (loadedJob !== undefined) { status(`archive · ${loadedJob}`); return; }
@@ -5439,6 +6055,19 @@ async function readHandedFile(bytes, { name = "", textIs = "alignment" } = {}) {
     }
     uploadedMsas = restored;
     uploadedA3m = "";
+    // 🔴 AN ARCHIVE OF A FOLD WITH NUCLEIC ALIGNMENTS (a job's own, written one
+    // file per fold chain) goes back the way it came: the archive path below
+    // merges PROTEIN chains for a search's pairing, and would count the RNA's
+    // file as a protein's
+    try {
+      const expanded = expandEntities(entityList.read());
+      if (restored.chains === expanded.chains.length && expanded.chainKinds.some((kind) => kind !== "protein")) {
+        uploadedMsas = { inline: {
+          unpaired: restored.chainA3ms.map((text) => text || null),
+          paired: expanded.chains.map((_, index) => restored.pairedA3ms.get(index) ?? null),
+        } };
+      }
+    } catch { /* rows that do not expand are reported when folded */ }
     const paired = restored.pairedA3ms.size;
     status(`archive · ${restored.chains} chain${restored.chains === 1 ? "" : "s"}`
       + `${paired > 0 ? `, ${paired} with paired rows` : ", no paired rows"}`
@@ -5717,21 +6346,12 @@ function archiveFor(pred, { includeAlignment = true } = {}) {
           // ...per chain, which the confidence object itself does not carry:
           // `meanByChain` needs the token-to-chain map and the fold has it.
           chainPlddt: pred.chainPlddt,
-          // 🔴 RESOLVED HERE, NOT WHEN THE FOLD FINISHED. AlphaFold 2 computes
-          // its contact map in a setTimeout - the distogram head costs 131 ms
-          // at 128 residues and is deliberately off the fold's critical path -
-          // so at the moment the prediction was stored it does not exist yet.
-          // By the time anyone presses this it does. `contactSource` is the
-          // pass the saved structure came from, which is not always the last.
-          // 🔴 ONE FIELD, AND IT IS A REFERENCE RATHER THAN A COPY. The three
-          // models produce this at three different MOMENTS - AF3 with the
-          // trunk, EF2-fast with the trunk and no confidence object to put it
-          // in, AF2 in a setTimeout off the saved pass, because its distogram
-          // head costs 131 ms at 128 residues and is deliberately off the
-          // fold's critical path. So `contactSource` holds the OBJECT that
-          // carries them, which for AF2 is still filling in when the
-          // prediction is stored and is filled by the time anyone presses
-          // this. It was three fields and the archive knew two of them.
+          // `contactSource` is the pass the saved structure came from, which
+          // is not always the last. 🔴 ONE FIELD, AND IT IS A REFERENCE RATHER
+          // THAN A COPY: the three models produce contact probabilities at
+          // different moments (AF3 and EF2-fast with the trunk, AF2 with each
+          // pass, on the device), so it holds the OBJECT that carries them. It
+          // was three fields and the archive knew two of them.
           contactProbs: pred.contactSource?.contactProbs,
         },
       },
@@ -6241,22 +6861,11 @@ document.addEventListener("visibilitychange", () => {
 void offerSession();
 
 /**
- * 🔴 AND ON A COLAB RUNTIME THIS PAGE IS THE ONE FOLDING, WITH NOBODY LOOKING,
- * while the page a reader OPENED gets the badge that says so - both halves are
- * `installColabBridge`, because the one question "which half of this am I" has
- * one answer and should be asked once.
- * `?role=runtime` is the backend saying so: the bridge then announces itself,
- * pushes every status write, bar fraction and sampler frame as it happens, and
- * takes its instructions from the reader's page over the broker. Off that
- * runtime `installColabBridge` returns immediately and nothing here runs.
- * See web/colab-bridge.js.
+ * 🔴 AND ON A READER'S PAGE (`?backend=native`) THE BADGE that says where Fold
+ * runs and offers the way back. Otherwise `installNativeBridge` returns
+ * immediately and nothing here runs. See web/native-bridge.js.
  */
-// 🔴 AND ON THE RUNTIME, THE DEV LOG IS THE THING WORTH SENDING: it is the one
-// record made where the work happened, with that card's memory in it. One hook,
-// beside the status tap, for the same reason - these are the page's own calls
-// and there is no second reporting path to keep in step.
-if (colabRole() === "runtime") devOnEntry((entry) => remoteTap("dev", entry));
-installColabBridge();
+installNativeBridge();
 // ...and if one is already under way on the runtime, follow it from here.
 void attachToRunningFold();
 
@@ -6269,7 +6878,7 @@ syncDownloads();
 document.addEventListener("py2dmol-frame-change", syncDownloads);
 
 // 🔴 THE BRIDGE SAYS WHEN THE RUNTIME HAS BEEN STOPPED, on an event rather
-// than by calling in: web/colab-bridge.js is imported BY this file, so a call
+// than by calling in: web/native-bridge.js is imported BY this file, so a call
 // the other way would be a cycle. One listener, and the page is a viewer.
 document.addEventListener("localfold-runtime-stopped", (event) => {
   retireFolding(event.detail?.why ?? "the fold service has been stopped");

@@ -87,9 +87,9 @@ def header_line(path: Path) -> str | None:
     suffix = path.suffix
 
     if suffix == ".py":
-        # The docstring, past a shebang and a `from __future__` line.
+        # The docstring, past a shebang, a vendored file's licence comment and a `from __future__`.
         match = re.search(
-            r'^\s*(?:#![^\n]*\n)?(?:from __future__[^\n]*\n)?\s*("""|\'\'\')(.*?)\1',
+            r'^\s*(?:#[^\n]*\n\s*)*(?:from __future__[^\n]*\n)?\s*("""|\'\'\')(.*?)\1',
             text, re.S,
         )
         return _first(match.group(2)) if match else None

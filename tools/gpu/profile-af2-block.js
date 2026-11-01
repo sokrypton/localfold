@@ -5,9 +5,9 @@
  *     node tools/gpu-chrome.mjs tools/gpu/profile-af2-block.js --length=200 --sequences=32
  *
  * 🔴 THE PROFILER THIS DRIVES WAS ALREADY BUILT AND NOTHING RAN IT.
- * src/runtime/execution.js has beginTimestampProfile/finishTimestampProfile/
+ * webgpu/runtime/execution.js has beginTimestampProfile/finishTimestampProfile/
  * readTimestampProfile, dispatch() already threads a label through every
- * kernel, and src/af2/evoformer/stack.js already honours `profileBlock` - it gives
+ * kernel, and webgpu/af2/evoformer/stack.js already honours `profileBlock` - it gives
  * the chosen block a pass per dispatch instead of the batched one, so the
  * labels survive. All of that existed with no caller. This is the caller.
  *
@@ -60,7 +60,7 @@
  *
  * The outer product mean's contraction is half the rate of the projections and
  * has not moved all session: its sequence chunk is at its measured optimum (see
- * src/kernels/outer-product-mean.js) and neither f16 lever applies cleanly to
+ * webgpu/kernels/outer-product-mean.js) and neither f16 lever applies cleanly to
  * it. That is where the next thing is.
  *
  * 🔴 WHAT MOVED AFTERWARDS WAS NOT A TILE EITHER - IT WAS THE ELEMENT. The
@@ -101,10 +101,10 @@
  * a differently-scheduled machine. Every block has identical shapes, so one
  * block times them all; multiply by blockWeights.length for a stack.
  */
-import { AlphaFoldFixture } from "../../src/bundles/alphafold-fixture.js";
-import { HttpTensorStore } from "../../src/bundles/http-tensor-store.js";
-import { EvoformerStackGpu, ExtraMsaStackGpu } from "../../src/af2/evoformer/stack.js";
-import { setDeviceTuning } from "../../src/runtime/device-profile.js";
+import { AlphaFoldFixture } from "../../shared/bundles/alphafold-fixture.js";
+import { HttpTensorStore } from "../../shared/bundles/http-tensor-store.js";
+import { EvoformerStackGpu, ExtraMsaStackGpu } from "../../webgpu/af2/evoformer/stack.js";
+import { setDeviceTuning } from "../../webgpu/runtime/device-profile.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
@@ -156,9 +156,13 @@ export async function main(device, args) {
   const extra = stack === "extra";
   const cM = extra ? 64 : 256;
 
-  const { MODEL_BUNDLES, loadManifest } = await import("../../src/bundles/manifests/index.js");
-  const fixture = AlphaFoldFixture.fromStore(await HttpTensorStore.fromManifest(
-    MODEL_BUNDLES.monomer.directory, await loadManifest("monomer")));
+  const { MODEL_BUNDLES, loadManifest } = await import("../../shared/bundles/manifests/index.js");
+  // `--bundle=<directory>` opens that bundle's own manifest.json, as fold-af2.js does (a checkout whose ./model/ is
+  // an older export lacks the extra stack's tensors)
+  const bundleDirectory = option(args, "bundle", "").replace(/\/$/, "");
+  const fixture = AlphaFoldFixture.fromStore(bundleDirectory === ""
+    ? await HttpTensorStore.fromManifest(MODEL_BUNDLES.monomer.directory, await loadManifest("monomer"))
+    : await HttpTensorStore.open(`${bundleDirectory}/manifest.json`));
   const blockWeights = extra ? await fixture.extraStackWeights() : await fixture.mainStackWeights();
 
   // 🔴 SYNTHETIC ACTIVATIONS, WHICH IS SOUND FOR TIMING AND ONLY FOR TIMING.
@@ -250,9 +254,14 @@ export async function main(device, args) {
       for (const value of values) {
         setDeviceTuning(device, { [knob]: value });
         const run = await once();
-        const of = (label) => run.kernels.find((k) => k.label === label) ?? { ms: 0, dispatches: 0 };
+        // A chunked kernel is labelled per chunk (`msa-transition.first-8192`),
+        // so a watched label sums its chunks rather than reading 0.
+        const of = (label) => run.kernels
+          .filter((k) => k.label === label || (k.label.startsWith(`${label}-`)
+            && /^\d+$/.test(k.label.slice(label.length + 1))))
+          .reduce((sum, k) => sum + k.ms, 0);
         const row = { [knob]: value, blockMs: Number(run.blockMs.toFixed(2)) };
-        for (const label of watch) row[label] = of(label).ms;
+        for (const label of watch) row[label] = Number(of(label).toFixed(2));
         const key = JSON.stringify(value);
         const seen = best.get(key);
         if (seen === undefined || row.blockMs < seen.blockMs) best.set(key, row);

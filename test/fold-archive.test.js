@@ -1,12 +1,12 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "./harness.js";
 import {
-  buildFoldArchive, fullDataJson, jobRequestJson, msasFromArchive,
+  buildFoldArchive, fullDataJson, jobRequestJson, msasFromArchive, templatesFromArchive,
   summaryConfidencesJson, tokenIdentifiers,
 } from "../web/fold-archive.js";
 import { safeJobName } from "../web/prediction-results.js";
 import { readZip, writeZip } from "../web/zip.js";
-import { mergeSearchedChains } from "../src/input/mmseqs2-api.js";
+import { mergeSearchedChains } from "../shared/input/mmseqs2-api.js";
 
 // Two residues per chain, one atom each, so the atom arrays are checkable by eye.
 function pdb(chains) {
@@ -54,6 +54,29 @@ describe("the fold archive", () => {
     { type: "protein", value: "ACDE", copies: 2, template: { kind: "pdb", source: "1abc" } },
     { type: "ligand", value: "hem", copies: 1 },
   ];
+
+  // 🔴 THE TEMPLATES COME BACK AS THE STRUCTURES THAT WERE USED, CHAIN AND ALL.
+  // The request can only say `useStructureTemplate: true`, which reads back as
+  // a search; the file names say the FOLD chain and not the structure's, and
+  // 1BRS's barstar is chain D of its file.
+  it("carries each template's structure chain for the way back", () => {
+    const files = buildFoldArchive({
+      stem: "fold_test", model: "AlphaFold 2 (multimer)", settings: { seed: 7 },
+      entities, prediction: prediction(),
+      templates: [
+        { chain: 0, text: "ATOM      1  CA  ALA A   1\n", chainId: "A", source: "1brs.pdb" },
+        { chain: 1, text: "ATOM      1  CA  ALA D   1\n", chainId: "D", source: "1brs.pdb" },
+      ],
+    });
+    expect(files.has("templates/fold_test_template_hit_1_chains_b.pdb")).toBe(true);
+    const back = templatesFromArchive(files);
+    expect(back.map((t) => [t.chain, t.structureChain, t.filename])).toEqual(
+      [[0, "A", "1brs.pdb"], [1, "D", "1brs.pdb"]]);
+    expect(back[1].text.includes("ALA D")).toBe(true);
+    // ...and an archive without the index (the server's) restores none.
+    files.delete("templates/fold_test_templates.json");
+    expect(templatesFromArchive(files)).toEqual([]);
+  });
 
   it("writes the members the AlphaFold 3 server writes", () => {
     const files = buildFoldArchive({
@@ -507,7 +530,8 @@ describe("where a fold's contact map lives", () => {
     // `recordPrediction` is the one door; a path that does not go through it
     // is not counted here, which is the point.
     const blocks = [...app.matchAll(/recordPrediction\(\{\n([\s\S]*?)\n\s*\}, /g)];
-    expect(blocks.length).toBe(3);
+    // ...four now: AlphaFold 2's, AlphaFold 3's, ESMFold2's and BioEmu2's
+    expect(blocks.length).toBe(4);
     for (const [, body] of blocks) {
       expect(body).toContain("contactSource");
     }

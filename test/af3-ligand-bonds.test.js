@@ -6,9 +6,9 @@
  *
  *   THE MODEL. `featurise.js` builds the contact matrix and `fold.js` handed
  *   the trunk an object built FIELD BY FIELD that did not name it, so the
- *   embedder saw `undefined`; and `embedder-webgpu.js` - the one a browser fold
+ *   embedder saw `undefined`; and `embedder.js` - the one a browser fold
  *   runs - had neither the `bondEmbedding` weight nor the term, while
- *   `embedder-reference.js` had both. `bond_embedding/weights` was downloaded
+ *   `embedder.js` had both. `bond_embedding/weights` was downloaded
  *   with every fold and multiplied by nothing. The pair track therefore carried
  *   no statement that any two ligand atoms are bonded.
  *
@@ -29,10 +29,13 @@ import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
 
 import { af3Source } from "./helpers/af3-source.js";
-import { featuriseProtein } from "../src/af3/featurise/featurise.js";
+import { featuriseProtein } from "../shared/af3/featurise/featurise.js";
 import { paeMatrix } from "../web/prediction-results.js";
-import { toPdb } from "../src/af3/fold.js";
-import { ELEMENT_SYMBOLS } from "../src/af3/featurise/ccd-component.js";
+import { toPdb } from "../webgpu/af3/fold.js";
+import { ELEMENT_SYMBOLS, ligandChain } from "../shared/af3/featurise/ccd-component.js";
+
+// the first ligand token: one past the polymers
+const polymerStart = (batch) => batch.ligandSpans[0].from;
 
 /**
  * A ligand shaped like a small phosphate-and-metal cofactor: the elements are
@@ -93,7 +96,7 @@ describe("a ligand's bonds reach the model", () => {
     // key thrown away - and `undefined` there is indistinguishable from a fold
     // with no ligand, which is what made it survive. Read out of the source,
     // because the alternative is running a fold.
-    const source = af3Source("fold.js");
+    const source = af3Source("webgpu:fold.js");
     const call = source.slice(source.indexOf("trunk = await trunkGpu.run({"),
                               source.indexOf("}, weights.trunk, weights.trunk.dialect"));
     assert.ok(/bondMatrix:\s*batch\.bondMatrix/.test(call),
@@ -103,13 +106,13 @@ describe("a ligand's bonds reach the model", () => {
   it("is applied by the GPU embedder, not only by the reference", () => {
     // The reference has had this term throughout; the GPU path is what a
     // browser fold runs, and it had neither the weight nor the arithmetic.
-    const gpu = af3Source("embedder-webgpu.js");
+    const gpu = af3Source("webgpu:embedder.js");
     assert.ok(/"bondEmbedding"/.test(gpu),
       "bondEmbedding is not in the GPU embedder's packed weight list");
     assert.ok(/bonds\[row\]\s*\*\s*weights\[W_BOND \+ c\]/.test(gpu),
       "the GPU pair init does not add the bond term");
     // ...and the weight has to be loadable, or packEmbedderWeights throws.
-    const weights = af3Source("weights.js");
+    const weights = af3Source("shared:weights.js");
     assert.ok(/bondEmbedding:\s*await T\("bond_embedding\/weights"\)/.test(weights),
       "embedderWeights does not read bond_embedding/weights");
   });
@@ -350,7 +353,7 @@ describe("a bond a job declares", () => {
     chainKinds: ["protein"], ligands: [glycerol], bonds,
   });
 
-  it("joins a polymer residue to a ligand atom, both ways", () => {
+  it("joins a polymer residue to a ligand atom, in the job's direction, as a covalent bond", () => {
     const batch = batchWith([
       { from: { asym: 0, residue: 3, atom: "SG" }, to: { asym: 1, atom: "C2" } },
     ]);
@@ -359,8 +362,30 @@ describe("a bond a job declares", () => {
     // three atoms follow the five polymer tokens, so C2 is token 5 + 2.
     const cys = 2;
     const c2 = batch.ligandSpans[0].from + 2;
+    // 🔴 ONE DIRECTION, [from][to]: AF3's gather lists a declared bond once, in
+    // the order the job writes it (dumped with the pair reversed, it reverses),
+    // and its contact matrix sets exactly the listed cell. This test asserted
+    // both until a reference batch with a declared bond existed.
     assert.equal(batch.bondMatrix[cys * tokens + c2], 1);
-    assert.equal(batch.bondMatrix[c2 * tokens + cys], 1);
+    assert.equal(batch.bondMatrix[c2 * tokens + cys], 0);
+    // ...and COVALENT (5), the code AF3 gives every link between two residues
+    assert.equal(batch.bondOrderMatrix[cys * tokens + c2], 5);
+  });
+
+  it("builds a chain of components, a residue each, bonded where the job says", () => {
+    const sugar = (code) => ({ ...glycerol, code });
+    const chain = ligandChain([sugar("NAG"), sugar("BMA")]);
+    const batch = featuriseProtein("GWCTE", {
+      chainKinds: ["protein"], ligands: [chain],
+      bonds: [{ from: { asym: 1, residue: 1, atom: "O1" }, to: { asym: 1, residue: 2, atom: "C1" } }],
+    });
+    const start = polymerStart(batch);
+    // two components, one chain: residues 1 and 2, one asym, a reference space each
+    assert.deepEqual(Array.from(batch.features.residueIndex.slice(start, start + 6)), [1, 1, 1, 2, 2, 2]);
+    assert.equal(new Set(Array.from(batch.features.asymId.slice(start, start + 6))).size, 1);
+    assert.deepEqual(batch.ligandSpans.map((span) => span.code), ["NAG", "BMA"]);
+    // O1 of the first (token +1) to C1 of the second (token +3): C1 is in both
+    assert.equal(batch.bondMatrix[(start + 1) * batch.tokens + start + 3], 1);
   });
 
   it("refuses an atom the component does not have, by name", () => {
@@ -377,9 +402,9 @@ describe("a bond a job declares", () => {
   });
 
   it("is forwarded by the batch builder, which lists its fields by hand", () => {
-    // The literal in src/af3/featurise/batch.js is exactly the kind that loses
+    // The literal in shared/af3/featurise/batch.js is exactly the kind that loses
     // a key - it is how `modifications` went missing on the ESMFold2 path.
-    assert.ok(readSource("src/af3/featurise/batch.js").includes("bonds: options.bonds"));
+    assert.ok(readSource("shared/af3/featurise/batch.js").includes("bonds: options.bonds"));
   });
 });
 

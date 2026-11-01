@@ -20,19 +20,15 @@
  * states bonds rather than inferring them from a distance cutoff, and it is the
  * same source the featuriser reads - not the prediction, so a fold is not
  * scored against itself.
- *
- * 🔴 AND rosettafold3 HAS NO FLOW SAMPLER. `noFlowSampler` makes `foldBatch`
- * throw rather than switch silently, so its flow arms are SKIPPED and said to
- * be skipped - a blank cell is not a pass.
  */
 import { confidenceWeights, openAf3Store, trunkWeights }
-  from "../../src/af3/weights/weights.js";
+  from "../../shared/af3/weights/weights.js";
 import { diffusionWeights, atomReference, targetFeatureWeights }
-  from "../../src/af3/weights/diffusion-weights.js";
-import { dialectFor, featuriserDialect } from "../../src/af3/dialect.js";
-import { featuriseProtein } from "../../src/af3/featurise/featurise.js";
-import { foldBatch, toPdb } from "../../src/af3/fold.js";
-import { ccdUrl, parseCcdComponent } from "../../src/af3/featurise/ccd-component.js";
+  from "../../shared/af3/weights/diffusion-weights.js";
+import { dialectFor, featuriserDialect } from "../../shared/af3/dialect.js";
+import { featuriseProtein } from "../../shared/af3/featurise/featurise.js";
+import { foldBatch, toPdb } from "../../webgpu/af3/fold.js";
+import { ccdUrl, parseCcdComponent } from "../../shared/af3/featurise/ccd-component.js";
 import { bondGeometry, parsePdbResidues } from "./bond-geometry.js";
 // 🔴 A NON-CHAIN IS NOT A BOND-LENGTH QUESTION and would pass every column
 // above: this repository has measured intellifold2 in flow returning a fold
@@ -54,24 +50,18 @@ const SET = [
   { name: "protein+dna", chains: [PROTEIN, "ACGTACGTACGT"], kinds: ["protein", "dna"] },
 ];
 
-// mode and its count. The page prefers diffusion 25 and flow 16, and those are
-// the two a visitor actually gets; the others say how much of any difference is
-// the sampler and how much is the truncation.
-const ARMS = [["diffusion", 25], ["diffusion", 200], ["flow", 16], ["flow", 32]];
+// [mode, steps, schedule, name, diffusion options]: Euler at the page's 25 and the converged 200, and the exponential
+// update on the geometric schedule (cpu/af3/diffusion/diffusion-sampler.js) at 25. (Flow's arms went with it -
+// docs/AF3.md, "Flow removed".)
+const EXPONENTIAL = { update: "exponential", schedule: "geometric" };
+const ARMS = [["diffusion", 25], ["diffusion", 200], ["diffusion", 25, undefined, "exponential25", EXPONENTIAL]];
 
 /**
- * Matched budgets: the same number of denoiser calls to each sampler.
- *
- * 🔴 THE PAGE'S TWO SETTINGS ARE NOT A FAIR COMPARISON AND CANNOT TEST THE
- * CLAIM FLOW WAS ADDED FOR. Flow is offered at 16 cycles and diffusion at 25
- * steps, so "flow16 beats diffusion25" confounds the sampler with a 1.6x
- * budget - and the hope was that flow needs FEWER calls than diffusion to get a
- * small molecule right, which is a statement about the CURVE and not about one
- * pair of points. A denoiser call costs the same either way, so equal calls is
- * the honest axis and `--budgets=8,16,32,64` is how to ask.
+ * Matched budgets: the same number of denoiser calls to each update rule - Euler's and the exponential one -
+ * `--budgets=8,16,32,64`. A denoiser call costs the same either way, so equal calls is the honest axis.
  */
 const matchedBudgets = (counts) =>
-  counts.flatMap((n) => [["diffusion", n], ["flow", n]]);
+  counts.flatMap((n) => [["diffusion", n], ["diffusion", n, undefined, `exponential${n}`, EXPONENTIAL]]);
 
 const option = (args, name, fallback) => {
   const hit = args.find((a) => a.startsWith(`--${name}=`));
@@ -103,6 +93,17 @@ export async function main(device, args) {
     // against rather than only against the other sampler.
     ARMS.push(["diffusion", 200]);
   }
+  // `--schedule-arms=name:steps:key=value+key=value,...` adds diffusion arms
+  // with their own EDM schedule - sigmaMax, rho, gamma0, stepScale, anything
+  // `noiseLevels` and the step take - under a name of their own.
+  const scheduleArms = option(args, "schedule-arms", "").split(",").filter(Boolean)
+    .map((spec) => {
+      const [name, steps, pairs = ""] = spec.split(":");
+      const schedule = Object.fromEntries(pairs.split("+").filter(Boolean)
+        .map((pair) => pair.split("=")).map(([k, v]) => [k, Number(v)]));
+      return ["diffusion", Number(steps), schedule, name];
+    });
+  for (const arm of scheduleArms) ARMS.push(arm);
   const store = await openAf3Store(
     option(args, "model", "/model-af3-int5/manifest.json"));
   const conformers = await (await fetch("/tools/oracle/reference-conformers.json")).json();
@@ -114,7 +115,6 @@ export async function main(device, args) {
     targetFeat: await targetFeatureWeights(store),
   };
   const dialect = weights.trunk?.dialect ?? dialectFor(weights);
-  const noFlow = dialect.noFlowSampler === true;
 
   // Every component the set needs, fetched once: the ligands, and the four
   // bases of whichever nucleic chains are in it.
@@ -149,15 +149,12 @@ export async function main(device, args) {
       ...(target.ptms ? { modifications: target.ptms.map(([code, at]) =>
         ({ chain: 0, position: at, ...components.get(code) })) } : {}),
     });
-    for (const [mode, steps] of ARMS) {
-      if (armsWanted.length > 0 && !armsWanted.includes(`${mode}${steps}`)) continue;
-      if (mode === "flow" && noFlow) {
-        rows.push({ target: target.name, arm: `${mode}${steps}`, skipped: "noFlowSampler" });
-        continue;
-      }
+    for (const [mode, steps, schedule, armName, diffusion] of ARMS) {
+      const arm = armName ?? `${mode}${steps}`;
+      if (armsWanted.length > 0 && !armsWanted.includes(arm)) continue;
       for (const seed of seeds) {
         const result = await foldBatch(device, batch, weights,
-          { mode, steps, recycles: 0, seed });
+          { mode, steps, recycles: 0, seed, ...(schedule ? { schedule } : {}), ...(diffusion ? { diffusion } : {}) });
         const pdb = toPdb(batch, result.positions);
         const scored = bondGeometry(pdb, conformers, { components });
         // 🔴 `chainGeometryOf` TAKES SPACINGS, NOT A PDB - it is the shared rule
@@ -171,7 +168,7 @@ export async function main(device, args) {
         const chain = chainGeometryOf(spacings);
         const verdict = chainGeometryVerdict(chain);
         rows.push({
-          target: target.name, arm: `${mode}${steps}`, seed,
+          target: target.name, arm, seed,
           plddt: Number((result.meanPlddt ?? 0).toFixed(2)),
           mainchain: round(scored.mainchain.rms), sidechain: round(scored.sidechain.rms),
           peptide: round(scored.peptide.rms), nucleic: round(scored.nucleic.rms),
@@ -183,5 +180,5 @@ export async function main(device, args) {
       }
     }
   }
-  return { model: option(args, "model", ""), noFlow, rows };
+  return { model: option(args, "model", ""), rows };
 }

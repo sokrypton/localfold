@@ -17,8 +17,20 @@
  */
 import { COMMON_IONS, COMMON_LIGANDS, COMMON_MODIFICATIONS, ENTITY_LABELS, ENTITY_TYPES,
   MENU_CODES, MSA_KINDS, POLYMER_TYPES, TEMPLATE_KINDS, entitiesFromText, entityProblem,
-  newEntity, templateAsked, templateKind } from "./entities.js";
+  newEntity, templateAsked, templateKind, templateProblem } from "./entities.js";
 import { cleanSequence, cleanSequenceMap, extractFastaHeader } from "./sequence.js";
+import { fetchStructure, parseSource, structureChains } from "./template-source.js";
+
+/** What a fetched template says once fetched: the chain a fold will take, and the rest. */
+function fetchedStatus(template) {
+  const { id, chains } = template.fetched;
+  const asked = parseSource(template.source ?? "", template.fetched.kind).chain;
+  const used = chains.find(({ chain }) => chain === asked) ?? chains[0];
+  const others = chains.length - 1;
+  return `${id} chain ${used.chain}: ${used.residues} residues`
+    + (others > 0 ? ` (${others} other protein chain${others === 1 ? "" : "s"})` : "")
+    + ". Coverage appears after the fold.";
+}
 
 /**
  * Wire an entity list into a container.
@@ -29,6 +41,7 @@ import { cleanSequence, cleanSequenceMap, extractFastaHeader } from "./sequence.
  * @returns {{read: () => object[], set: (entities: object[]) => void,
  *            setChains: (chains: string[]) => void, header: () => string | null}}
  */
+
 export function createEntityList(rowsContainer, addButton, options = {}) {
   const notify = options.onChange ?? (() => {});
   // 🔴 ASKED, NOT READ. "From the MSA search" is the one template source whose
@@ -414,6 +427,8 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
           delete template.text;
           delete template.filename;
           delete template.status;
+          delete template.statusError;
+          delete template.fetched;
           draw();
           notify();
         });
@@ -422,6 +437,7 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
         kindLine.append(kindMenu);
         section.append(kindLine);
 
+        let chainLine;
         if (kind === "pdb" || kind === "afdb") {
           const source = document.createElement("input");
           source.type = "text";
@@ -432,15 +448,94 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
             ? "PDB entry" : "UniProt accession");
           source.addEventListener("input", () => {
             template.source = source.value;
+            // A fetch answered a different id, so what it said no longer
+            // describes this box. Written into the status line by hand rather
+            // than through draw(), which would replace this input mid-word.
+            const id = parseSource(source.value, kind).id;
+            if (template.fetched !== undefined && template.fetched.id !== id) {
+              delete template.fetched;
+              delete template.status;
+              delete template.statusError;
+              status.className = "entity-popup-empty entity-template-status";
+              status.textContent = waiting[kind];
+              chainLine?.remove();
+            }
             // ...the badge, not the popup: see refreshBadge. Rebuilding here
             // would replace this input between one keystroke and the next.
             refreshBadge();
             notify();
           });
+          // 🔴 FETCH BEFORE FOLD, SO THE ID IS CHECKED WHERE IT IS TYPED. Until
+          // this a PDB id was only fetched once Fold was pressed, so a typo, an
+          // entry with five chains or one the RCSB has no .pdb for said nothing
+          // here and surfaced as a failed or quietly different fold. The fetched
+          // text is kept on the template and the fold reuses it (app.js), so the
+          // structure checked here is the structure folded.
+          const fetchButton = document.createElement("button");
+          fetchButton.type = "button";
+          fetchButton.className = "entity-template-fetch";
+          fetchButton.textContent = template.fetched !== undefined ? "Fetched" : "Fetch";
+          const fetchNow = async () => {
+            const typed = source.value.trim();
+            if (typed === "" || templateProblem(entity) !== null) return;
+            const parsed = parseSource(typed, kind);
+            template.status = `Fetching ${parsed.id}…`;
+            delete template.statusError;
+            delete template.fetched;
+            draw();
+            try {
+              const structure = await fetchStructure(typed, { kind });
+              const chains = structureChains(structure.text);
+              if (chains.length === 0) throw new Error(`${parsed.id} holds no protein chain`);
+              if (parsed.chain !== undefined && !chains.some(({ chain }) => chain === parsed.chain)) {
+                throw new Error(`${parsed.id} has no protein chain ${parsed.chain}`
+                  + ` (it has ${chains.map(({ chain }) => chain).join(", ")})`);
+              }
+              template.fetched = { id: parsed.id, kind, text: structure.text, chains };
+              template.status = fetchedStatus(template);
+            } catch (error) {
+              template.status = `Could not fetch ${parsed.id}: ${error.message ?? error}`;
+              template.statusError = true;
+            }
+            draw();
+            notify();
+          };
+          fetchButton.addEventListener("click", fetchNow);
+          source.addEventListener("keydown", (event) => {
+            if (event.key === "Enter") { event.preventDefault(); void fetchNow(); }
+          });
           const line = document.createElement("div");
           line.className = "entity-popup-row";
-          line.append(source);
+          line.append(source, fetchButton);
           section.append(line);
+
+          // ...and once fetched, the chain is a MENU of what the file holds,
+          // which is the part `1abc_A` asked the reader to know in advance.
+          const fetched = template.fetched;
+          if (fetched !== undefined && fetched.id === parseSource(source.value, kind).id
+              && fetched.chains.length > 1) {
+            const chainMenu = document.createElement("select");
+            chainMenu.className = "entity-template-kind";
+            chainMenu.setAttribute("aria-label", "Template chain");
+            const current = parseSource(source.value, kind).chain ?? fetched.chains[0].chain;
+            for (const { chain, residues } of fetched.chains) {
+              const option = document.createElement("option");
+              option.value = chain;
+              option.textContent = `Chain ${chain} · ${residues} residues`;
+              chainMenu.append(option);
+            }
+            chainMenu.value = current;
+            chainMenu.addEventListener("change", () => {
+              template.source = `${fetched.id}_${chainMenu.value}`;
+              template.status = fetchedStatus(template);
+              draw();
+              notify();
+            });
+            chainLine = document.createElement("div");
+            chainLine.className = "entity-popup-row";
+            chainLine.append(chainMenu);
+            section.append(chainLine);
+          }
         }
 
         if (kind === "upload") {
@@ -491,8 +586,8 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
         // structure comes from, and that coverage is reported after the fetch.
         const waiting = {
           none: "A known structure to fold this chain against.",
-          pdb: "A PDB entry. Coverage appears once it is fetched.",
-          afdb: "An accession from AlphaFold DB.",
+          pdb: "A PDB entry. Fetch to see its chains; Fold fetches it otherwise.",
+          afdb: "An accession from AlphaFold DB. Fetch to check it.",
           search: "The best hit the MSA search finds. Needs the MSA set to search.",
           upload: template.filename ?? "A PDB or mmCIF file from this machine.",
         };
@@ -502,7 +597,10 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
         // loop, finds no hits and throws. The page knows both halves before
         // anything runs, so it says so here, where the choice is made.
         const needsSearch = kind === "search" && !msaIsSearch();
-        if (needsSearch && template.status === undefined) {
+        if (template.statusError === true) {
+          status.className = "entity-popup-problem entity-template-status";
+          status.textContent = template.status;
+        } else if (needsSearch && template.status === undefined) {
           status.className = "entity-popup-problem entity-template-status";
           status.textContent = "The MSA is not set to search, so there are no hits"
             + " to take a template from. Set the MSA to search, or name a structure.";
@@ -663,11 +761,11 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
       mirror.setAttribute("aria-hidden", "true");
     }
 
-    // 🔴 A CONTACT IS ONE LINE TOO. It is a short spec, not a sequence, and a
+    // 🔴 A BOND IS ONE LINE TOO. It is a short spec, not a sequence, and a
     // textarea would give a bond three rows of empty box in the middle of the
     // list.
     const oneLine = entity.type === "ligand" || entity.type === "smiles"
-      || entity.type === "contact";
+      || entity.type === "bond" || entity.type === "crosslink" || entity.type === "pocket" || entity.type === "contact";
     const value = oneLine
       ? document.createElement("input")
       : document.createElement("textarea");
@@ -677,14 +775,28 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
       value.type = "text";
       value.placeholder = "CCD code, e.g. HEM";
       value.setAttribute("aria-label", "Ligand CCD code");
-    } else if (entity.type === "contact") {
+    } else if (entity.type === "bond") {
       // 🔴 A BOND BETWEEN TWO RESIDUES, WRITTEN AS A READER WOULD SAY IT.
       // Chains are the letters the viewer and the PDB use; the atoms are
       // optional, because `token_bonds` is token x token and a standard
-      // residue has one token whichever atom is named. See parseContact.
+      // residue has one token whichever atom is named. See parseBond.
       value.type = "text";
       value.placeholder = "A12:SG - B1:C25";
-      value.setAttribute("aria-label", "Contact between two residues");
+      value.setAttribute("aria-label", "Bond between two residues");
+    } else if (entity.type === "crosslink") {
+      // a crosslinker bonded to two residues as a ligand (af3x's crosslinks; shared/chem/crosslinkers.js)
+      value.type = "text";
+      value.placeholder = "DSSO: A2 - B30";
+      value.setAttribute("aria-label", "Crosslink: a crosslinker and the two residues it joined");
+    } else if (entity.type === "pocket") {
+      // a binder chain within a distance of listed residues (shared/af3/featurise/constraints.js): boltz2 and chai-1
+      value.type = "text";
+      value.placeholder = "B: A9, A12, A16 @ 6";
+      value.setAttribute("aria-label", "Pocket: a binder chain, the residues it sits by, and a distance in Angstrom");
+    } else if (entity.type === "contact") {
+      value.type = "text";
+      value.placeholder = "A10 - B44 @ 8";
+      value.setAttribute("aria-label", "Contact constraint: two residues within a distance, in Angstrom");
     } else if (entity.type === "smiles") {
       // 🔴 ITS OWN CLASS, BECAUSE `.entity-value-ligand` IS UPPERCASED IN CSS.
       // Borrowing the ligand's styling would DISPLAY a SMILES upper case -
@@ -766,8 +878,9 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
         // so it no longer parsed. Both happened the moment the reader clicked
         // away from the box, silently rewriting what they had typed.
         entity.value = value.value.trim();
-      } else if (entity.type === "contact") {
-        // 🔴 TRIMMED AND NOTHING ELSE, FOR THE THIRD TIME AT THIS SEAM. The
+      } else if (entity.type === "bond" || entity.type === "crosslink" || entity.type === "pocket"
+                 || entity.type === "contact") {
+        // 🔴 TRIMMED AND NOTHING ELSE, FOR THE THIRD TIME AT THIS SEAM. (A constraint row too: the same spec syntax.) The
         // `else` below is `cleanSequence`, which keeps only amino-acid letters:
         // a contact typed as `A12:SG - B1:C25` came back `A:SGB:C` the moment
         // the reader clicked away - the residue numbers, the spaces and the
@@ -775,7 +888,7 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
         // is the same branch that turned benzene into hexane, and the comment
         // above it did not stop a third row type walking into it.
         //
-        // 🔴 AND NOT UPPER-CASED HERE EITHER. `parseContact` upper-cases the
+        // 🔴 AND NOT UPPER-CASED HERE EITHER. `parseBond` upper-cases the
         // chain letter and the atom name when it reads them, which is where
         // that belongs; doing it here would also upper-case whatever a reader
         // is halfway through typing.

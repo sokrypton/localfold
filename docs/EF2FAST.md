@@ -8,7 +8,7 @@ fold from a single sequence in a browser. Everything before that is the port.
 
 🔴 **IT IS AF3's PAIRFORMER BLOCK WITH THE GRID ATTENTIONS AND THE SINGLE TRACK
 REMOVED, AND THAT IS MEASURED.** `tools/check-esmfold2-trunk.js` composes
-`src/af3/trunk/pairformer-reference.js`'s three surviving pieces 24 times and scores
+`cpu/af3/trunk/pairformer.js`'s three surviving pieces 24 times and scores
 them against the values the native model recorded going into and coming out of
 its trunk at each of its four recycles: **relRMS 1.4e-6** against a 2e-4 bound.
 So the port needed no new arithmetic, only the weights in AF3's shapes -
@@ -43,7 +43,7 @@ projection is zero adds zero, so a zeroed AF3 block already IS ESMFold2's block
 and needs no graph code at all. It is also pure waste: `grid.attend` is the
 largest kernel in an AF3 trunk and this trunk runs 24 blocks four times over.
 `compilePairTrack`/`encodePairTrack` take a `gridAttention` flag (default true,
-so no existing caller moves) and `src/esmfold2/trunk-webgpu.js` sets it false.
+so no existing caller moves) and `webgpu/esmfold2/trunk.js` sets it false.
 Worth **1.42x**, and `tools/gpu/check-esmfold2-trunk-gpu.js` runs both arms over
 the same weights at the same shapes and asserts **0 differing elements** - not a
 tolerance, because dropping passes from a track whose five updates each read the
@@ -119,7 +119,7 @@ self-attention** over atoms, half-window 64, whose only positional signal is a
 raw index, the diagonal is always allowed, the blocks are adaLN-Zero with
 **affine-free RMSNorm**, and q/k take a second affine-free RMSNorm before the
 rotation. Nothing in the shapes says any of this: both are "an atom transformer
-at 128 channels". `src/af3/diffusion/atom-encoder-reference.js`.
+at 128 channels". `cpu/af3/diffusion/atom-encoder.js`.
 
 🔴 **THE DIFFUSION MODULE IS `structure_head`, AND ITS CONDITIONING IS PORTED.**
 345 tensors, and the shape of it: conditioning, then the SAME SWA atom encoder
@@ -436,9 +436,9 @@ encoder is 32-query / 128-key windowed attention biased by a pair
 representation; this is plain sliding-window self-attention whose only
 positional signal is a rotary embedding built from the REFERENCE CONFORMER.
 Both are "an atom transformer at 128 channels".
-`src/esmfold2/atom-transformer-webgpu.js` is four new shaders - `modulate`,
+`webgpu/esmfold2/atom-transformer.js` is four new shaders - `modulate`,
 `prepare`, `attend`, `gated` - and everything that is a plain projection comes
-from `src/esmc/block-webgpu.js`, whose tiled GEMM and fused SwiGLU are exactly
+from `webgpu/esmc/block.js`, whose tiled GEMM and fused SwiGLU are exactly
 the shapes `ffnUp` and `lin_swish` are packed in.
 
 🔴 **AND THE WINDOW IS RESOLVED ON THE HOST, BECAUSE IT IS OVER RANK.** Two
@@ -1226,7 +1226,7 @@ Reported as exactly that. **A recycle is not a phase; it is the seam between two
 trunk passes.** Measured on a 76-mer, the line now changes 7 times over 4 shapes
 where it changed 17 over 11.
 
-🔴 **AND THE BAR RUNS OFF A COST MODEL FITTED THIS SESSION**, `src/esmfold2/cost.js`:
+🔴 **AND THE BAR RUNS OFF A COST MODEL FITTED THIS SESSION**, `webgpu/esmfold2/cost.js`:
 
 | band | at 40 | at 150 | at 300 | the shape |
 |---|---|---|---|---|
@@ -1276,7 +1276,7 @@ GPU promise resolves as a MICROTASK, which returns control to the microtask
 queue and never to the browser - so a page that only moved a bar there would
 write it and never paint it. `yieldToBrowser` posts a MessageChannel message,
 which is a task and is not clamped to a second in a background tab the way
-`setTimeout` is. See src/runtime/yield.js.
+`setTimeout` is. See webgpu/runtime/yield.js.
 
 Measured in the page, 150 residues: **140 bar samples, largest jump 0.047**,
 monotonic from 0.01 to 1.00 - against 45 samples and a 0.53 leap before.
@@ -1391,7 +1391,7 @@ finished, long after the function's own `finally` has freed them. The failure wa
 which names the buffer and not the lifetime.
 
 🔴 **SO THE COLOUR SHIPS, AND THE PRE-SAMPLER ARM DOES NOT USE THE STRUCTURE.**
-`CERTAINTY` in src/esmfold2/distogram-webgpu.js: the mass within **2 A of the
+`CERTAINTY` in webgpu/esmfold2/distogram.js: the mass within **2 A of the
 distogram's mode**, meaned over every pair at sequence separation above **3**
 whose predicted distance is under **12 A**. Ranked on realistic corruption rates
 (0 and 15%) by WORST fold, the two families are a tie -
@@ -1551,7 +1551,7 @@ protein chains**, so nothing in this file had ever borne on a ligand token.
 
 62% of that fold's contacts were ATP's internal pairs, so the precision a
 checker prints was mostly a statement about a conformer the model was HANDED.
-`partnerKeys` in src/esmfold2/distogram-webgpu.js replaces the arithmetic with
+`partnerKeys` in webgpu/esmfold2/distogram.js replaces the arithmetic with
 two numbers per token - the asym id and the residue number - and the rule
 becomes "the same chain, and within `separation` RESIDUES". A ligand's atoms
 share one residue number, so a gap of zero drops the whole self-block; two
@@ -1797,7 +1797,7 @@ on the sugar - a silent 4 A error in the representative.
 
 🔴 **AND AF2 AND AF3'S CONFIDENCE IS NOT AFFECTED, BUT AF3's CONTACT MAP IS.**
 The report was "this affects all models". Half of it does. No AGGREGATION is at
-risk: `distogramContactProbabilities` in src/heads/distogram.js is per PAIR with
+risk: `distogramContactProbabilities` in shared/heads/distogram.js is per PAIR with
 no separation rule, `web/prediction-results.js` exports the matrix as it stands,
 and both models take their confidence from a confidence head - so ESMFold2 is
 the only one here that DERIVES a confidence from a distogram. But the THRESHOLD
@@ -1806,7 +1806,7 @@ exactly as ESMFold2 does, so its contact map wanted the same table. AF2 does
 not: monomer and multimer are protein-only, every pair is two residues, and 8 A
 is simply right there.
 
-🔴 **SO THE TABLE LIVES IN `src/heads/contact-threshold.js`, WHICH IS NEITHER
+🔴 **SO THE TABLE LIVES IN `shared/heads/contact-threshold.js`, WHICH IS NEITHER
 MODEL'S.** `contactAngstromsForClasses` takes two CLASSES - nucleic, ligand, or
 one of the twenty amino acids - and each model maps its own alphabet onto them.
 The two heads then disagree about one thing only, which is where a bin's edge
@@ -2165,7 +2165,7 @@ colour, because the fold somebody is staring at is the one they doubt". **A PAE
 panel that looks better on a failed fold is the same fault and worse**, because
 a PAE is what people check precisely when they suspect a fold. `alignedError` is
 opt-in on `foldEsmfold2` and nothing on the page passes it; the estimator, the
-fit and the numbers stay in `src/esmfold2/aligned-error.js` and
+fit and the numbers stay in `shared/esmfold2/aligned-error.js` and
 `tools/pae-transfer.py`.
 
 🔴 **AND THE CERTAINTY CAUGHT EVERY ONE OF THESE CASES, WHICH IS THE OTHER HALF
@@ -2220,7 +2220,7 @@ hardest target reads 8.84 against 12.71. **Report the MAP, not the number** -
 exists, and says so in the field beside it.
 
 🔴 **AND IT IS CARRIED TO EF2-fast NOW, WHICH IS THE POINT.**
-`src/esmfold2/aligned-error.js` is the estimator and
+`shared/esmfold2/aligned-error.js` is the estimator and
 `tools/gpu/probe-pae-esmfold2.js` collects the features. It is a **pAE** in the
 literal sense - a predicted aligned error - and the mechanism being a read-off
 rather than a head does not change what the matrix is. Nine sequences folded
@@ -2291,7 +2291,7 @@ link still works - the same shape as openbind0's rename, and for the same
 reason.
 
 🔴 **THE SOURCE DIRECTORY AND THE BUNDLE KEEP THEIR OLD NAMES**, as
-`src/af3/` does for openbind0: a path is not the model's name, and renaming
+the AF3 trees do for openbind0: a path is not the model's name, and renaming
 `model-esmfold2-int5` would move 366 MiB for nothing.
 
 🔴 **AND A RENAMED KEY BREAKS EVERY LOOKUP THAT WAS SPELLED OUT.**
@@ -2537,7 +2537,7 @@ own 0.99 / 7.06, and its median crystal RMSD is 2.53 against float32's 2.52.
 `tools/quantize_af3.py` records int5 group-32 asymmetric costing AF3 nothing
 either (0.66 A against float32's 0.69, inside the spread between diffusion
 seeds). Two models, two graphs, one packer, the same verdict - and LocalFold
-already has the GPU decoder for it (`src/weights/quantised-upload.js`).
+already has the GPU decoder for it (`webgpu/weights/quantised-upload.js`).
 
 🔴 **int4 IS THE EDGE AND int3 IS OVER IT**, which is again where AF3 lands.
 int4's worst case (13.17 A) is nearly twice the worst the sampler produces on
@@ -2785,7 +2785,7 @@ writes ONE shared table for the whole tower - 1024 entries of 4 float16 is
 **8 KB** - so decoding a weight is an index into it and a multiply by the
 group's scale, against int5's shift-mask-across-a-byte-boundary. LocalFold
 already expands quantised weights into a dense float16 buffer in one dispatch
-(`src/weights/quantised-upload.js`); this is that same dispatch with a simpler
+(`webgpu/weights/quantised-upload.js`); this is that same dispatch with a simpler
 body. It is not the same shader, but it is not a harder one.
 
 🔴 **AND THE ROTATION - QuIP#'s OTHER HALF - IS NOT WORTH IT HERE.** Multiplying
@@ -2860,7 +2860,7 @@ than for an error nothing will make. Five passes per block instead of one, and
 the whole 573M tower takes **70 seconds on an A100**.
 
 🔴 **AND NEITHER METHOD CHANGES THE STORAGE FORMAT, WHICH IS WHY THESE TWO AND
-NOT THE OTHERS.** Both emit exactly what `src/weights/quantised-upload.js`
+NOT THE OTHERS.** Both emit exactly what `webgpu/weights/quantised-upload.js`
 already decodes: asymmetric codes, one float16 scale and one float16 zero per
 group of 32. GPTQ's group axis lines up for free - LocalFold groups 32
 CONSECUTIVE elements of a row-major `(out, in)` tensor, which is 32 consecutive
@@ -3042,7 +3042,7 @@ about it.
 ## The confidence head this checkpoint never had
 
 biohub ships ESMFold2 with `confidence_head.enabled: false` and zero confidence
-tensors, which is what the certainty estimate and `src/esmfold2/aligned-error.js`
+tensors, which is what the certainty estimate and `shared/esmfold2/aligned-error.js`
 above exist for. Synthyra froze that trunk and trained a head on it - 780
 updates, 18.1 h, MIT with redistribution allowed - for the 300M and the 600M
 both. It is ported, gated and wired; nothing is published.
@@ -3175,7 +3175,7 @@ model-row tooltip and the `<option>` comment in index.html. What is KEPT is the
 archive's presence-driven branches (`scored`, `estimated_aligned_error`): no
 model on this page is headless today, so they are the rule rather than a live
 case, and the rule is what stops the next headless checkpoint labelling its
-column `atom_plddts`. `src/esmfold2/aligned-error.js` stays too, with its
+column `atom_plddts`. `shared/esmfold2/aligned-error.js` stays too, with its
 numbers - it is the record of a measured, declined estimator.
 
 ### Why the PAE map looks "sparse and detailed", and what their own numbers say
@@ -3345,7 +3345,7 @@ neither side supplies.** The only thing that could was running their PIPELINE,
 which chooses the arguments itself - and that is why an end-to-end native run is
 worth the transformers-5.13 venv it costs.
 
-The tensor already exists on our side: `diffusion-webgpu.js` takes `relPos`,
+The tensor already exists on our side: `diffusion.js` takes `relPos`,
 "the same relative-position encoding z_init used, on device", because the
 diffusion conditioning needs it. The fix is to pass it to the confidence head
 and add it to the pair init in the host reference and the WGSL alike, then
@@ -3641,7 +3641,7 @@ believe the rewrite before changing what it computes: 85.675 / 0.814972 and
 atomChecksum **693370**, identical to the kernel it replaced.
 
 **Two: the window is gone from the INPUTS EMBEDDER - and only there.**
-`atom-transformer-reference.js` defaults to dense too, so the CPU reference and
+`atom-transformer.js` defaults to dense too, so the CPU reference and
 the GPU agree on what the model is. `--atom-windowed=1` restores the old
 behaviour for comparison.
 
@@ -3828,3 +3828,318 @@ on the GPU and N on this tree's CPU reference from the same start, so a defect
 that accumulates per block and one that lives in a single kernel look different.
 Here it showed a clean linear accumulation, which is what sent the search to the
 knobs rather than to a kernel.
+
+## 🔴 2026-10-03: a 40-token fold's sampler step cost more than AF3's at 262 tokens - two latency faults
+
+A warm 40-token fold was 0.63 s on the A100 (int5) and each of its 11 denoise steps 28 ms. Found with
+`fold-esmfold2.js --profile` (new; the last repeat, a pass a dispatch):
+
+- **`createLinearShader` walks all of K in one workgroup**, so a 768x768 projection at 40 tokens was 60
+  workgroups - 0.13 ms for 24 MFLOP. Batching the step's ~350 dispatches into one compute pass moved
+  nothing (28 ms either way), which is what said the time was in the kernels. `kSplits` (opt-in; the
+  144 unsplit forms are byte-identical) puts K ranges on workgroup z and `createSplitReduceShader`
+  sums them; `linearKSplits` picks the smallest power of two reaching ~1024 workgroups, at most 8.
+  The SwiGLU splits the same way, since its weight IS a linear of width 2*ffn
+  (`createSplitSwigluReduceShader`). Denoiser step 28 -> 12 ms at 40 tokens, 32 -> 18 at 150, 39 -> 28
+  at 262. Knobs `esmfold2TokenKSplits`, `esmcKSplits`; the row tile alone (`esmfold2TokenRowTile` 1)
+  was worth 2 ms.
+- **The ESM-C tower awaited `onSubmittedWorkDone` after each of its 36 blocks** to release the block's
+  scratch, which WebGPU allows once the naming command buffer is submitted. Language model 111 -> 52 ms
+  at 40 tokens (39 with the split SwiGLU), 121 -> ~90 at 262; checksums identical, resident and
+  streamed (`--budget=2000`).
+
+Warm folds: 40 tokens 0.63 -> 0.38 s, 150 1.16 -> 0.93, 262 2.13 -> 1.93. `check-esmc-tower.js` sits
+closer to its oracle split (worst block 2.6e-6 -> 1.7e-6 against 5e-5); `check-esmfold2-diffusion-gpu.js`
+1.43e-4 / 2.38e-4 either arm.
+
+## 🔴 Eleven steps tear a ligand; a fold with per-atom tokens takes 45 (2026-10-08)
+
+Found asking whether the CUDA backend folds a SMILES ligand. The AF3 lineage
+does (a SMILES glycerol at bond mean 1.454 A against the CCD's 1.459, a SMILES
+biotin with all 17 bonds at 1.23-1.76). ESMFold2 did not - and it was not the
+SMILES, and not the CUDA port, though both looked guilty first:
+
+| biotin, three seeds | bonds (of 17) | closest atoms |
+|---|---|---|
+| CUDA port, SMILES, 11 steps | 20 | 0.30-0.62 A |
+| WebGPU port, SMILES, 11 steps | 20 | 0.17-0.61 A |
+| WebGPU port, CCD `BTN`, 11 steps | 18-19 | 0.29-0.43 A |
+| **the vendor** (`esm` 3.4.1, same checkpoint), CCD and SMILES, 15 scheduled | 18-19 | 0.18-0.70 A |
+| WebGPU, 32 scheduled (23 run) | 19 | 0.51-0.70 A |
+| WebGPU, 64 scheduled (45 run) | **17** | **1.20-1.22 A** |
+| WebGPU 200 / vendor 64 and 200 | 17 | 1.22-1.24 A |
+
+So the checkpoint's own eleven-step sampler cannot hold a fused-ring ligand
+together, on either port or on the reference; a backbone is converged at eleven
+and a molecule made of per-atom tokens is not - AlphaFold 3's lesson
+(docs/AF3.md, bench-sampler-geometry) on a second model. Glycerol is placed the
+same at 11 and 45 (mean ~1.42 A) and a phosphoserine as well or better (bond
+ratio 0.949/0.985 -> 1.007/0.986, control 1.00).
+
+`ESMFOLD2_ATOMISED_STEPS` (web/esmfold2-model.js) is the floor: a job with a
+ligand or a modified residue samples at least 64 scheduled steps. The page
+applies it in `samplerPreset`, sends ESMFold2's own count to a runtime (it sent
+AlphaFold 3's table's, which the worker ignored), and python/localfold/worker.py now passes
+`--steps` to the ESMFold2 binary and mirrors the floor for a job no page sent.
+Cost: a warm 58-residue fold with a ligand 0.47 -> 0.93 s.
+
+🔴 THE FIRST READING BLAMED THE WRONG THING TWICE. One page fold of biotin came
+back whole, and it was a lucky sample read as the reference - three seeds of the
+same input through the tool were torn. And a "vendor torn too" first number read
+`coords[-n:]`, which on the vendor's PADDED atom axis is padding: glycerol at
+"13 bonds". The ligand is selected by `atom_attention_mask` and its chain.
+
+Gated: `npm run test:native` folds a SMILES biotin through AF3 and ESMFold2 and a
+CCD glycerol through ESMFold2, asserting the ligand's bond count and that no two
+atoms sit closer than 1 A (watched failing with the floor at 15: "18 bonds, closest
+atoms 0.258 A"); test/esmfold2-atomised-steps.test.js holds the page's floor and
+the worker's copy to one number. `tools/gpu/fold-esmfold2.js --smiles=` folds a
+SMILES ligand on the WebGPU port.
+
+## 🔴 Against upstream ESMFold2: time, memory, accuracy (2026-10-08)
+
+**The port is 1.6-5x faster than upstream's fastest path, at the same accuracy once both read full-precision
+weights - and on the full model in half to two thirds of its memory; on the 600M model upstream is lighter below
+~500 tokens and ours above.** Upstream is biohub's `esm` at repo main, 3.4.1.post1 (`43b4548`,
+the speedups co-authored with Claude: the `fused` Triton kernels, the cuEquivariance backend, bf16 autocast),
+against `cuda/ef2/localfold-ef2` on this A100-SXM4-40GB. `tools/esmc/compare-upstream-esmfold2.py` produces every
+number below.
+
+**Same settings on both sides**: one diffusion sample, seed 1, the checkpoint's own sampler (fast 15 scheduled / 11
+run, full 14 clipped at sigma 256), and upstream's EXTRA `lm_dropout` off (the port has none; the full model's own
+per-loop 0.25 is architecture and runs on both). 🔴 Upstream's defaults differ and would not be a comparison:
+`fold()` samples 16 (fast) or 32 (full) structures and adds 0.3 LM dropout, and the full checkpoint's current config
+runs **20** loops where the port's bundle (exported from the older revision `8fc3ff4710`) says 3 - both loop counts
+are measured. Upstream is timed warm (once untimed, then timed, synchronised); the port reports its stage times after
+its weights are up, and featurises in parallel with that, so upstream's `fold()` figures (the full model) also carry
+6-100 ms of featurisation a single sequence and more with an alignment. Memory is the whole PROCESS's, from
+nvidia-smi, for both, and each target's own peak above where the process started. 🔴 The first version of this section read
+upstream's as a RUNNING maximum - every target carried the largest before it, and a sample begun before a reset
+wrote the previous peak back - which put the full model at 25-37 GB where it is 14-33; re-measured 2026-10-08 with
+both fixed in the tool. One sample a target: read RMSD differences under ~0.1 A as noise.
+
+### ESMFold2-fast 600M (the website's)
+
+| target | tokens | upstream PyTorch | upstream cuEquivariance | upstream fused | **ours int5** (ships) | ours float32 |
+|---|---:|---:|---:|---:|---:|---:|
+| 6MRR | 68 | 434 ms | 426 | 456 | **89** | 220 |
+| 1BRS | 195 | 830 | 557 | 529 | **186** | 362 |
+| 5CAJ | 261 | 1,444 | 824 | 576 | **284** | 458 |
+| 1TIM | 494 | 5,813 | 2,108 | 1,292 | **760** | 934 |
+| 1TIM x4 | 988 | 65,581 | 7,779 | 4,712 | **2,962** | 3,122 |
+
+(The float32 column ran without the warm-up, so its small targets carry first launches.) Process GPU memory, 68 /
+195 / 261 / 494 / 988 tokens: upstream fused **2.5 / 3.0 / 3.5 / 5.8 / 16.5 GB**, ours int5 **4.9 / 5.1 / 5.2 / 5.1 /
+8.2** - ours sizes its buffers up front and grows less, so it is the heavier below ~500 tokens and half upstream's at
+988.
+Command to structure, cold: upstream ~18 s (imports and the model load), ours 0.8-1.6 s (4.0 s at 988 tokens).
+
+| CA RMSD to the crystal | upstream fused | ours int5 | ours float32 |
+|---|---:|---:|---:|
+| 6MRR | 1.52 | 1.47 | **0.85** |
+| 1BRS | 0.52 | 0.91 | **0.53** |
+| 5CAJ | 2.25 | 2.10 | **2.06** |
+| 1TIM | 1.30 | 1.52 | **1.22** |
+
+Upstream's three backends agree within 0.02 A, and its default 0.3 dropout changes little. The two complexes the
+int5 bundle loses are its quantisation (cuda/ef2/README.md: 1BRS 0.53 -> 0.92), not the port: on float32 weights
+the port matches or beats upstream on all four. The page ships int5 for its download; the native binaries could ship
+float32 (2.9 GB) or int8 instead.
+
+### ESMFold2 (the full, released model: ESM-C 6B, 48 trunk blocks, MSA encoder)
+
+| target | tokens | 3 loops: upstream fused -> ours | 20 loops: upstream fused -> ours |
+|---|---:|---:|---:|
+| 6MRR | 68 | 724 -> **188 ms** (3.9x) | 2,525 -> **533 ms** (4.7x) |
+| 1BRS | 195 | 908 -> **392** (2.3x) | 3,287 -> **1,403** (2.3x) |
+| 5CAJ | 261 | 1,207 -> **597** (2.0x) | 4,856 -> **2,388** (2.0x) |
+| 1TIM | 494 | 3,468 -> **1,650** (2.1x) | 15,552 -> **7,485** (2.1x) |
+| 1TIM x4 | 988 | 20,436 -> **6,429** (3.2x) | 100,320 -> **30,909** (3.2x) |
+| 5CAJ + alignment | 261 | 2,107 -> **622** (3.4x) | 6,147 -> **2,433** (2.5x) |
+| 1TIM + alignment | 494 | 6,575 -> **1,713** (3.8x) | 19,693 -> **7,582** (2.6x) |
+
+Process GPU memory, 68 / 195 / 261 / 494 / 988 tokens (the 3- and 20-loop peaks agree to 0.1 GB): upstream
+**14.1 / 14.6 / 15.2 / 18.4 / 33.0 GB** (ESM-C 6B in bf16, and a transient 25.4 GB while it loads), with the
+alignment 15.8 (5CAJ) and 20.0 (1TIM); ours **9.1 / 9.4 / 9.6 / 10.4 / 14.8**, with the alignment 10.6 and 12.0 (the
+tower resident as int8). Upstream's model load alone is 10.5 s; ours is 1.6-4 s command to structure.
+
+| CA RMSD to the crystal | 3 loops: upstream / ours | 20 loops: upstream / ours |
+|---|---:|---:|
+| 6MRR | 1.63 / 1.63 | 1.71 / 1.66 |
+| 1BRS | 0.62 / 0.58 | 0.64 / 0.59 |
+| 5CAJ | 1.98 / 1.97 | 1.89 / 1.92 |
+| 1TIM | 1.34 / 1.23 | 1.37 / 1.31 |
+| 5CAJ + alignment | 1.96 / 1.96 | 1.91 / 1.95 |
+| 1TIM + alignment | 1.24 / 1.13 | 1.29 / 1.23 |
+
+### ESMFold2-fast 600M on Colab's RTX PRO 6000 (2026-10-09)
+
+The same tool on a G4 session (RTX PRO 6000 Blackwell, sm_120, CUDA 13.0), upstream installed by
+`pip install "esm[fused,cueq] @ git+https://github.com/evolutionaryscale/esm"` - torch 2.11.0+cu130, triton 3.6,
+cuEquivariance 0.12.0, no flash-attention or xformers - and the port **timed warm too** (`localfold-ef2 warm`: its
+resident server folds each case three times and the third is read; see below why the one-shot column is not that):
+
+| target | tokens | upstream PyTorch | upstream cuEquivariance | upstream fused | **ours, warm** | ours, one-shot |
+|---|---:|---:|---:|---:|---:|---:|
+| 6MRR | 68 | 169 ms | 175 | 178 | **46** (3.9x fused) | 198 |
+| 1BRS | 195 | 427 | 259 | 228 | **104** (2.2x) | 246 |
+| 5CAJ | 261 | 772 | 371 | 312 | **165** (1.9x) | 309 |
+| 1TIM | 494 | 3,335 | 1,365 | 784 | **501** (1.6x) | 642 |
+| 1TIM x4 | 988 | 19,249 | (fails) | 2,829 | **1,876** (1.5x) | 2,002 |
+
+Against upstream's plain PyTorch 3.7-10x, against its cuEquivariance backend 2.2-3.8x (which still dies at 988
+tokens, now on 0.12.0 - "unexpected keyword argument 's'"), against its fused backend 1.5-3.9x. CA RMSD as on the
+A100 (ours 1.47 / 0.91 / 2.10 / 1.52 A, upstream 1.51 / 0.52 / 2.22 / 1.30). 🔴 **On this card upstream is far
+closer than on the A100** (6MRR 178 ms against the A100's 456; its torch, triton and CUDA are two years newer
+there), and the port's lead is now the small inputs and the 988-token one. 🔴 **AND THE ONE-SHOT COLUMN IS COLD**:
+since b7118c9 a standalone fold skips its warm-up when the input is already written (it saves wall time, command to
+structure), so its stage times carry every kernel's first launch - 6MRR's 198 ms against 46 warm; the A100 table
+above was taken before that commit, warm. The full model was not run there: its bundle is a local export.
+
+### ESMFold2-Fast (the released one, ESM-C 6B) on Colab's RTX PRO 6000 (2026-10-09)
+
+Its bundles exported on the VM from the same sources as this box's (biohub/ESMFold2-Fast at `c6c7958d63`, its
+safetensors' SHA-256 equal to ours; af3-any-model's `lm/esmc.bin.zst`, unpacked by its own loader's steps) -
+`--model=ef2-fast`, both sides warm, one sample, 3 loops (the port's bundle) and 20 (the checkpoint's config):
+
+| target | tokens | loops | upstream PyTorch | cuEquivariance | fused | **ours, warm** |
+|---|---:|---:|---:|---:|---:|---:|
+| 6MRR | 68 | 3 / 20 | 190 / 425 ms | 198 / 475 | 199 / 482 | **95 / 192** |
+| 1BRS | 195 | 3 / 20 | 512 / 1,826 | 311 / 914 | 272 / 680 | **175 / 505** |
+| 5CAJ | 261 | 3 / 20 | 934 / 3,765 | 451 / 1,507 | 362 / 1,058 | **252 / 850** |
+| 1TIM | 494 | 3 / 20 | 4,017 / 18,763 | 1,666 / 6,952 | 954 / 3,434 | **667 / 2,778** |
+| 1TIM x4 | 988 | 3 / 20 | 23,592 / 115,255 | (fails) | 3,457 / 13,883 | **2,313 / 10,818** |
+
+Against the fused backend 1.4-2.1x at 3 loops and 1.24-2.5x at 20; against cuEquivariance 1.8-2.5x; against plain
+PyTorch 2.0-10.7x. CA RMSD level (ours 1.66 / 0.56 / 1.91 / 1.05 A at 3 loops, upstream 1.67 / 0.62 / 1.82 / 1.21).
+Process memory: upstream 14.0 / 14.4 / 14.6 / 17.8 / 30.1 GB (fused), ours one-shot 8.2 / 8.8 / 9.3 / 10.0 / 15.1.
+🔴 **Here the port's lead is smallest**: at 20 loops a fold is the trunk, where upstream's Triton kernels on this
+card come within 1.25-1.4x of ours. Our trunk on it (988 tokens, 4 passes, 1,977 ms of GPU): triIn256K 28%,
+triangleOutK 22%, transitionUpK 20%, the contraction and the transition's second GEMM 31% - the three fused kernels
+run at one block an SM on its ~100 KB of shared memory (triIn256K's two-tile form needs two), unmeasured otherwise.
+
+### FP8 for the triangle's contraction on Ada and Blackwell (2026-10-09)
+
+Where the card has FP8 tensor instructions (compute capability 8.9 on: an L4, the RTX PRO 6000; an A100 has none),
+the triangle multiplication's two operands are written e4m3 and contracted by cuBLASLt's FP8 GEMM into the bf16
+product (`fp8Tensor`, `triContractTN`; `LOCALFOLD_FP8=0` keeps bf16). An FP8 GEMM takes only the layout with the
+contracted index contiguous in both operands, which the outgoing triangle has and the incoming one does not, so the
+incoming triangle's input kernel reads the pair TRANSPOSED (`RectMap::T`) and both run as the outgoing GEMM; the plane
+is padded to 16 (an FP8 GEMM's leading dimensions). No scale: the operands sit well inside e4m3's range.
+
+On the RTX PRO 6000 the GEMM is 1.7-1.9x bf16's (0.84 against 1.42 ms at np 992, 18.1 against 33.9 at 2,976):
+ESMFold2-fast 600M's trunk **-7% at 988 tokens and -17.6% at 2,964** (21.0 -> 17.3 s of GPU), AlphaFold 3's trunk -4%
+and -8.5% (its contraction is a smaller share beside the grid attention). Accuracy, emulated on the A100 first (the
+operands rounded through e4m3 into the bf16 GEMM) and then measured there: ESMFold2 within 0.02 A on 1BRS / 5CAJ /
+1TIM (0.903 / 2.091 / 1.535 against 0.906 / 2.104 / 1.517), AlphaFold 3 0.009-0.022 A between the forms on 5CAJ with
+its alignment, 1BRS templated and 1TIM with alignments, 5CAJ self-templated 0.171 A both ways on the 6000.
+**And on the big-input (blocked) path too** (`triangleBlockedTN`, `triangleBlockedTNEf2`): b and each block's a e4m3,
+the incoming triangle's block a block of z^T's rows (RectMap::T on a rectangle). In bf16 (`LOCALFOLD_TRI_TN=1`) it is
+byte-identical to the old blocks on the A100 (5CAJ and 988 tokens, both ports). On the 6000 forced big: AlphaFold 3's
+2,964-token trunk 13.03 -> 12.04 s, 5CAJ self-templated 0.171 -> 0.170 A; ESMFold2 988 tokens 2,108 -> 2,002 ms of
+GPU. **AlphaFold 3 at 10,127 tokens with FP8: trunk pass 389 -> 362 s, the whole fold (one pass, 100 steps) 443 ->
+414 s.**
+🔴 **NOT THE WEIGHTS**: the same rounding of the transition's second weight (one e4m3 scale for the tensor) put
+1BRS / 5CAJ / 1TIM at 12.8 / 14.7 / 22.6 A - the operands' errors average out over a contraction of ~1,000 terms, a
+weight's repeat in every row. The transition's hidden rows alone were harmless (within 0.02 A), but its GEMM's FP8
+form needs FP8 weights too, so it stays bf16.
+
+### 🔴 The comparison found a bug of ours, and it looked like nondeterminism
+
+The first full-model run of 1BRS at 3 loops came back at **13.2 A, pLDDT 28.6** - the same command an hour later
+gave 0.58 A, and eight seeds 0.58-0.66. The binary warms up while its weights are still being copied up and then
+forgets what it derived from them; `Wbf`, the bf16 copy of each block's transition that the bf16-pair trunk reads
+past 80 tokens, was never forgotten, so a slow upload (here: the page cache emptied by upstream's 26 GB load) kept
+copies of blocks that had not arrived. The 600M model was exposed too (5CAJ 90.7 -> 63.6 pLDDT, 1TIM 90.8 -> 50.6
+under a slowed upload) - which is how its resident server on Colab starts. Two wrong theories cost an hour first: a
+fix to a cache cuda/ef2 never links (`triInGemmWeights` - the include graph said so) "worked" because the bug had
+stopped reproducing on its own, and uninitialized device memory, ruled out by folding after filling the card with
+NaN. **Fixed in `447ed96`**; `LOCALFOLD_SLOW_UPLOAD_MS` makes the slow disk on demand (pLDDT 26 unfixed, byte-identical
+fixed), `test:standalone` holds a slow upload to a fast one, and `test/cuda-derived-caches.test.js` requires every
+device-weight cache in cuda/ef2's include graph to register a forget hook. See cuda/ef2/README.md, "Traps it cost".
+
+### Upstream's own problems, met on the way
+
+- **The cuEquivariance path cannot run on the version it pins.** `esm/models/esmfold2/layers.py` calls
+  `attention_pair_bias(s=, q=, k=, v=, z=, ...)`, cuEquivariance 0.8.x's signature; its lock file pins 0.11.1 and
+  `>=0.8.1` admits 0.12, both of which renamed the arguments (`single_repr`, `pair_repr`), so the call raises
+  `TypeError ... unexpected keyword argument 's'` once an input is large enough to take that kernel (988 tokens
+  here). Measured on 0.8.1.
+- **The base install forces the CUDA 13 build on every Linux x86_64**: `cuequivariance-ops-torch-cu13` is a plain
+  dependency, which cannot load on a CUDA 12 driver (`libnvrtc.so.13`), and the non-torch `cuequivariance-ops-cu13`
+  then shadows a `cu12` build installed beside it. Both had to be removed by hand.
+- **`fold()` cannot drive the 600M experimental checkpoint**: it ships without a confidence head, and `fold()` reads
+  `plddt` unconditionally (`KeyError`).
+- **Not upstream's best environment, by necessity**: its locked fast setup is CUDA 13 with a prebuilt flash-attention
+  wheel; this box's driver (570) runs CUDA 12.8, so the run used torch 2.11+cu128, triton 3.6, xformers 0.0.35 and
+  cuEquivariance 0.8.1, without flash-attention's rotary kernel or Transformer Engine. Both touch only the ESM-C
+  tower, which is the port's "language model" stage: 9-64 ms of these folds.
+
+To reproduce: a Python 3.12 venv with `torch` from the cu128 index, `pip install "esm[fused,cueq12] @ git+https://github.com/evolutionaryscale/esm"`,
+then `pip uninstall cuequivariance-ops-torch-cu13 cuequivariance-ops-cu13` and `pip install cuequivariance==0.8.1
+cuequivariance-torch==0.8.1 cuequivariance-ops-cu12==0.8.1 cuequivariance-ops-torch-cu12==0.8.1 gemmi`, and `xformers`
+from the cu128 index; `--model` takes localfold-ef2's names (`ef2-fast-600m`, `ef2-fast-300m`, `ef2-fast`, `ef2`), each defaulting to its
+upstream checkpoint (`--checkpoint=` overrides: biohub's `ESMFold2-Experimental-Fast-base600M-step1500k` for the site's), the full one
+`biohub/ESMFold2` (26 GB, fetched by `from_pretrained`).
+
+## The sampler's exponential update and geometric schedule (2026-10-15)
+
+ESMFold2's sampler takes the options AlphaFold 3's does (docs/AF3.md, "The diffusion's discretisation after Blitz"):
+`--update=exponential`, `--schedule=geometric` and `--no-churn` on cuda/ef2 and `tools/gpu/fold-esmfold2.js`, and
+`schedule` / `update` / `churn` in `foldEsmfold2`'s `samplerOverrides` (cpu/esmfold2/sampler.js, pinned by
+test/diffusion-update.test.js). Default folds are byte-identical. 🔴 **The geometric schedule changes the number of
+steps run**: max_sigma's cap drops two of its levels where it drops four of Karras's, so 15 scheduled run 13, not 11.
+Compare arms by the steps RUN (the binary's `(N steps)`), never by `--steps`.
+
+Measured over the 600M and 300M models by seven systems (protein, +GOL, +ATP, +SEP, RNA, DNA, protein+DNA), two seeds,
+bond RMS against the CCD (ligand = GOL, ATP, SEP; six cells):
+
+| arm (scheduled, run) | ligand median / mean | ligand cells > 0.15 A | protein + nucleic median (max) |
+|---|---:|---:|---:|
+| 8 Euler (6) | 60 / 62 (not a chain) | 6/6 | 65 A |
+| 8 geometric + exponential (7) | 0.42 / 0.46 | 6/6 | 0.067 (0.096) |
+| 15 Euler (11) - the default | 0.154 / 0.171 | 5/6 | 0.066 (0.076) |
+| 15 geometric + exponential (13) | 0.110 / 0.124 | 2/6 | 0.061 (0.080) |
+| 25 Euler (18) | 0.103 / 0.107 | 1/6 | 0.057 (0.066) |
+| 25 geometric + exponential (21) | 0.068 / 0.085 | 1/6 | 0.058 (0.068) |
+| 45 Euler (32) - ligand jobs on the page | 0.058 / 0.067 | 0/6 | 0.058 (0.063) |
+| 45 geometric + exponential (38) | 0.056 / 0.067 | 0/6 | 0.057 (0.062) |
+| 138 Euler (96) | 0.052 / 0.048 | 0/6 | 0.057 (0.061) |
+
+Crystals (CA RMSD, five seeds): 15 Euler (11 run) is already level with 138 (96) on all ten model/target cells - 6MRR,
+1QYS, 5K9P, 5CAJ and 1TIM on both models, e.g. 600M 1TIM 1.216 against 1.222 - and so are 15 geometric + exponential
+and 8 with either option (6-7 run): 600M 1TIM 1.183, 300M 1QYS 1.213.
+
+**No default changes, and why.** Unlike AlphaFold 3, ESMFold2's default is not in Euler's broken range: max_sigma's cap
+removes the four largest jumps, so 11 steps already fold at 96 steps' accuracy. What the options buy is ligand
+geometry at a given scheduled count, at the price of two to six more steps run, and per denoiser call that is level
+with Euler at more steps (15 geometric + exponential at 13 run, 0.110; 25 Euler at 18 run, 0.103). They do not let a
+ligand job run fewer steps: at 25 scheduled 300M's glycerol is 0.199 A. And 7 steps fold the backbone but leave
+side-chain bonds at 0.09-0.13 A against 0.06 at 11, to save four of a fold's ~1 s of denoiser calls.
+
+## Long inputs: the step floor, and why it is Euler's (2026-10-24)
+
+Past ~2,048 residues the checkpoint's 15 scheduled steps (11 run) leave the backbone **short**: the denoiser's answer
+at those lengths is a shrunken chain and eleven steps do not walk out of it. Copies of 6MRR, single sequence, 600M,
+two seeds, CA-CA outside 3.6-4.0 A / median:
+
+| residues | 15 (11) Euler | 25 (18) Euler | 45 (32) Euler | 15 exp | 25 exp | 25 exp+geo (21) |
+|---|---|---|---|---|---|---|
+| 68 | 0% / 3.82 | 0% / 3.81 | | 0% / 3.81 | 0% / 3.81 | 0% / 3.81 |
+| 2,040 | 0.3% / 3.79 | | | | | |
+| 3,060 | 15.9% / 3.68 | **0.4% / 3.77** | | 63.9% / 3.56 | 21.0% / 3.68 | 14.2% / 3.67 |
+| 4,080 | 91.5% / 3.44 | 9.4% / 3.69 | **0.1% / 3.80** | 97.1% / 3.37 | 83.9% / 3.51 | 79.0% / 3.54 |
+
+(300M at 3,060: Euler 2.5% at 15, 1.7% at 25; exp 21.0% and 1.4%.) The per-chain RMSD follows: 5.01 A at 3,060 and 25
+Euler steps against 5.75-6.24 for the exponential arms. **The exponential update is worse here, at every count** - the
+opposite of AlphaFold 3. It is not a defect: cuda/ef2's step and cpu/esmfold2/sampler.js's are the same line, and
+test/diffusion-update.test.js holds it to r^S x + (1 - r^S) d. What differs is the overshoot: biohub's step scale is
+1.638, so an Euler step lands PAST the denoiser's answer, which corrects a shrunken one; the exponential step never
+passes it, and lands a backbone the denoiser shrank. Every failing arm above fails SHORT, and the exponential always
+shorter.
+
+So the default stays Euler and a long input takes the per-atom floor, 64 scheduled (45 run): `ESMFOLD2_LONG_RESIDUES`
+(web/esmfold2-model.js), mirrored by python/localfold/worker.py and cuda/featurise/standalone.cpp and held together by
+test/esmfold2-atomised-steps.test.js. It costs the sampler's time only, which past that length is a few percent of a
+fold: 45 copies 785 ms of sampler (45 steps) against a 31 s trunk, the wall clock the same at 15 and 25. 45 copies
+through `cuda/ef2/fold` now: 0.6% out of band, median 3.78 (15.9% / 3.68 before).

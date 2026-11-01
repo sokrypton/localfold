@@ -162,7 +162,7 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                   <!-- 🔴 THE SAME GRAPH, DIFFERENT PARAMETERS. OpenBind-0 runs
                        through foldWithAf3 exactly as AF3 does; what differs is
                        the bundle and the three dialect branches its weights
-                       were trained with. See src/af3/dialect.js. -->
+                       were trained with. See shared/af3/dialect.js. -->
                   <option value="openbind0">OpenBind-0</option>
                   <!-- 🔴 TWO TOKEN SPACES, AND NO CONFIDENCE HEAD. OpenDDE
                        re-tokenises each residue into a backbone and a sidechain
@@ -180,9 +180,13 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                        Protenix-v2 concatenates its template features and
                        applies one projection where AF3 runs nine. Both are
                        read from the bundle rather than typed in - see
-                       src/af3/dialect.js and docs/AF3.md. -->
+                       shared/af3/dialect.js and docs/AF3.md. -->
                   <option value="boltz2">Boltz-2</option>
                   <option value="protenix2">Protenix-v2</option>
+                  <!-- Mol-1 (Molence Bio): Protenix-v2's model at a 448-channel pair, with eight PairMixer blocks
+                       (no triangle attention) and a 320-channel trunk between two width adapters. See
+                       shared/af3/dialect.js MOL1. -->
+                  <option value="mol1">Mol-1</option>
                   <!-- 🔴 THE SMALLEST DIALECT AND THE WIDEST BUNDLE. Its module
                        tree is stock AlphaFold 3's - the nine-projection
                        template embedder and AF3's MSA stack - and the reference
@@ -211,7 +215,18 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                        and a confidence head - Synthyra's, trained against the
                        same frozen trunk biohub published, so its pLDDT, PAE
                        and pTM are predicted rather than estimated. -->
-                  <option value="ef2-fast-600m">EF2-fast</option>
+                  <!-- 🔴 ONE ENTRY FOR ESMFold2, AND THE VARIANT ROW SAYS WHICH. Its
+                       checkpoints differ in the language model, the trunk's
+                       depth and what they make of an alignment all at once, so
+                       they are one choice (the value is the 600M checkpoint's,
+                       which saved sessions and links name). -->
+                  <option value="ef2-fast-600m">ESMFold2</option>
+                  <!-- 🔴 AN EMULATOR, NOT ONLY A PREDICTOR, AND WITH NO CONFIDENCE HEAD.
+                       BioEmu2 (Microsoft Research, MIT) samples a structure or an
+                       equilibrium ensemble, and propagates a structure forward in
+                       time; its own graph is webgpu/bioemu2 (a PairMixer trunk and a
+                       dual-stream denoiser). Its rows below show with it. -->
+                  <option value="bioemu2">BioEmu2</option>
                 </select>
               </div>
 
@@ -226,9 +241,7 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                    🔴 AND 3, 4 AND 5 HAVE NO TEMPLATE EMBEDDER AT ALL - those
                    checkpoints simply do not contain it - so choosing one
                    refuses a template rather than ignoring the one it was
-                   given. Hiding a control does not change its value; see
-                   samplerModeFor in web/af3-model.js for the same rule at the
-                   sampler. -->
+                   given. Hiding a control does not change its value. -->
               <div class="fetch-option-group" id="af2ModelGroup" hidden>
                 <span class="fetch-option-title">Model #</span>
                 <select id="af2Model">
@@ -254,7 +267,7 @@ AI Context: STANDALONE WEB APP ENTRY POINT
               <!-- 🔴 ALL THREE MODELS RECYCLE. AF3's embedder has always done
                    `pair += prev_embedding(LayerNorm(recycled pair))`; what was
                    missing was the loop driving it, which is now in
-                   src/af3/fold.js. Each recycle is another whole trunk. -->
+                   webgpu/af3/fold.js. Each recycle is another whole trunk. -->
 
               <!-- ...and an id, like every other group here. The narrow layout
                    puts Model / Recycles / Seed on one line and the pairs below
@@ -318,19 +331,54 @@ AI Context: STANDALONE WEB APP ENTRY POINT
               </div>
 
 
-              <!-- AF3'S OWN, AFTER THE SHARED ONES. web/app.js shows them with
-                   the model rather than leaving controls on screen that are
-                   quietly ignored. -->
-              <div class="fetch-option-group" id="af3ModeGroup" hidden>
-                <span class="fetch-option-title">Sampler</span>
-                <select id="af3-mode" title="Diffusion: AlphaFold 3's own sampler, noise injected at every step - the default, and ahead on almost every target measured. Flow: one draw at the top, then a deterministic walk that replaces the state with each prediction - close behind at the same price on average, but it cannot recover from a bad first draw, so a minority of seeds come out far worse. Diffusion re-noises at every step and does not.">
-                  <option value="flow">Flow</option>
-                  <option value="diffusion" selected>Diffusion</option>
-                </select>
-              </div>
+              <!-- AF3'S OWN, AFTER THE SHARED ONES. web/app.js shows it with
+                   the model rather than leaving a control on screen that is
+                   quietly ignored. One sampler, so no sampler select: Flow was
+                   removed (docs/AF3.md, "Flow removed"). -->
               <div class="fetch-option-group" id="af3CountGroup" hidden>
                 <span class="fetch-option-title" id="af3-count-label">Steps</span>
                 <select id="af3-count"></select>
+              </div>
+
+              <!-- 🔴 BioEmu2'S OWN ROWS, SHOWN WITH IT (syncBioemu2Controls). Its
+                   method token is "non-md" for a structure and "md" for an
+                   equilibrium ensemble; propagation is equilibrium sampling
+                   conditioned on a starting frame at a lag, chained. Contacts are
+                   BioEmu2's own Contact form, as JSON. -->
+              <div class="fetch-option-group" id="bioemu2ModeGroup" hidden>
+                <span class="fetch-option-title">Mode</span>
+                <select id="bioemu2-mode" title="Structure: predict a structure (BioEmu2's non-MD mode). Equilibrium: sample its equilibrium ensemble (MD mode). Propagate: run time forward from a structure of this input, each step one lag.">
+                  <option value="structure" selected>Structure</option>
+                  <option value="equilibrium">Equilibrium</option>
+                  <option value="propagate">Propagate</option>
+                </select>
+              </div>
+              <div class="fetch-option-group" id="bioemu2SamplesGroup" hidden>
+                <span class="fetch-option-title">Samples</span>
+                <select id="bioemu2-samples" title="How many structures to sample, all through one denoiser call a step; each is a frame of the play bar.">
+                  <option value="1" selected>1</option>
+                  <option value="2">2</option>
+                  <option value="3">3</option>
+                  <option value="5">5</option>
+                  <option value="8">8</option>
+                </select>
+              </div>
+              <div class="fetch-option-group" id="bioemu2PropagationGroup" hidden>
+                <span class="fetch-option-title">Lag (ns)</span>
+                <input type="number" id="bioemu2-lag" value="1" min="0.001" step="any" title="The time each propagation step advances, in nanoseconds.">
+                <span class="fetch-option-title">Steps</span>
+                <input type="number" id="bioemu2-propagation-steps" value="1" min="1" max="100" step="1" title="How many lag-time steps each trajectory takes.">
+                <span class="fetch-option-title">From</span>
+                <select id="bioemu2-propagate-from" title="The starting frame: the last BioEmu2 fold of this same input, or a PDB of it.">
+                  <option value="last" selected>Last fold</option>
+                  <option value="upload">PDB file</option>
+                </select>
+                <input type="file" id="bioemu2-x0-file" accept=".pdb" hidden>
+              </div>
+              <div class="fetch-option-group" id="bioemu2ContactsGroup" hidden>
+                <span class="fetch-option-title">Contacts</span>
+                <input type="text" id="bioemu2-contacts" value="" placeholder='[{"token1":{"asym_id":"A","res_id":5},"token2":{"asym_id":"A","res_id":60},"max_distance":8}]'
+                  title="Condition on contacts, in BioEmu2's Contact form (JSON): token1, token2 (asym_id, res_id, atom_name), max_distance 4-20 A. Empty for none.">
               </div>
 
               <!-- MSA options on the right of the row -->
@@ -357,12 +405,25 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                    SEPARATE control rather than a third option on the MSA row
                    because web/app.js reads that row's values as alignment
                    modes - see the note there about renaming them. -->
+              <!-- 🔴 THE VARIANT ROW: which ESMFold2 checkpoint, named by what
+                   differs - Fast or Full, and the ESM-C tower it folds from.
+                   The two 6B ones are biohub's released models and fold on a
+                   native backend only (`localfold serve`), shown when it says
+                   it has them (web/native-bridge.js). The MSA row stays beside
+                   it for the 6B two, which can read an alignment beside ESM-C (the
+                   released Fast as profile features, Full through its encoder):
+                   it starts at "ESM-C only" and a search or an upload is the
+                   reader's opt-in. The 600M and 300M checkpoints read ESM-C
+                   alone and have no MSA row. Every ESMFold2 folds from its
+                   language model, so "no language model" is not offered. The select keeps its id and values (plm-mode,
+                   esmc-*), which saved sessions and links carry. -->
               <div class="fetch-option-group" id="plmGroup" hidden>
-                <span class="fetch-option-title">PLM</span>
-                <select id="plm-mode" title="The protein language model, and with it the folding checkpoint trained against it. 300M is 94 MiB smaller for a median 0.03 A - inside the sampler's own seed spread. Without one, this model has no evolutionary information at all: on a 76-mer the fold moves 11 A and the distogram predicts no long-range contact, though a designed protein like 6MRR folds without it.">
-                  <option value="esmc-600m" selected>ESM-C 600M</option>
-                  <option value="esmc-300m">ESM-C 300M</option>
-                  <option value="none">None</option>
+                <span class="fetch-option-title">Variant</span>
+                <select id="plm-mode" title="Which ESMFold2: Fast or Full, and the protein language model it folds from. 300M is 94 MiB smaller than 600M for a median 0.03 A. The ESM-C 6B variants are biohub's released models (Fast reads an alignment's profile, Full encodes the alignment) and fold on a local native server. Every variant folds from its language model; the 6B two can also read an alignment, off by default.">
+                  <option value="esmc-600m" data-language-model="ESM-C 600M" selected>Fast · ESM-C 600M</option>
+                  <option value="esmc-300m" data-language-model="ESM-C 300M">Fast · ESM-C 300M</option>
+                  <option value="esmc-6b" data-language-model="ESM-C 6B" data-native-model="ef2-fast" hidden>Fast · ESM-C 6B</option>
+                  <option value="esmc-6b-full" data-language-model="ESM-C 6B" data-native-model="ef2" hidden>Full · ESM-C 6B</option>
                 </select>
               </div>
               <div class="fetch-option-group" id="msaModeGroup">
@@ -859,6 +920,10 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                                 <div class="score-metric-label">ipTM</div>
                                 <div id="metricIptm" class="score-metric-value">-</div>
                             </div>
+                            <div id="metricNoConfidence" class="score-metric-cell" style="display: none;">
+                                <div class="score-metric-label">Confidence</div>
+                                <div id="metricNoConfidenceText" class="score-metric-value">No confidence head</div>
+                            </div>
                             <div id="metricMultimerCell" class="score-metric-cell" style="display: none;">
                                 <div class="score-metric-label">Ranking</div>
                                 <div id="metricMultimer" class="score-metric-value">-</div>
@@ -1126,7 +1191,7 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                post says what OpenBind is; the source tree says how to build
                it. It also names the release we actually ported -
                openfold-3/releases/tag/v0.5.0 - which is the distinction
-               src/af3/dialect.js exists to keep straight. -->
+               shared/af3/dialect.js exists to keep straight. -->
           <a href="https://openbind.uk/news/blog-openbind-0-advancing-open-molecular-structure-prediction/"
              target="_blank" rel="noopener noreferrer">about OpenBind-0</a>
         </p>

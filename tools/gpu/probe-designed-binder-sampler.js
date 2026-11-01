@@ -28,7 +28,7 @@
  * WHAT IS HELD AND WHAT MOVES. Recycles 0 and an MSA capped at 128 rows are
  * held, because a real fold of this target is already known to work at those.
  * The sampler is what moves: AF3's own stochastic sampler across step counts,
- * and the flow beside it. probe-flow-sigma-by-size.js found the sampler badly
+ * and the flow beside it. probe-flow-sigma-by-size.js (removed with Flow) found the sampler badly
  * under-stepped at the page's 20 on a synthetic complex; this asks the same
  * question where the answer matters.
  *
@@ -50,7 +50,7 @@
  * is 0.068 between their means. So a fold or two per setting - which is how
  * anyone tunes by hand - will show a "setting that fixed it" that is the seed.
  *
- * 🔴 AND IT NARROWS A RESULT MEASURED ELSEWHERE. probe-flow-sigma-by-size.js
+ * 🔴 AND IT NARROWS A RESULT MEASURED ELSEWHERE. probe-flow-sigma-by-size.js (removed with Flow)
  * found AF3's sampler badly under-stepped at 20, scoring less than half of 80
  * on Top7 x3. That does NOT hold here: 20 is as good as 320. The difference
  * between the panels is the alignment - Top7 x3 is single-sequence and
@@ -80,7 +80,7 @@
  * the VHHs and 2 and 3 the S100A4s, so 2|3 is the native dimer and 0|2, 0|3,
  * 1|2, 1|3 are the four binder interfaces.
  */
-import { generateMmseqs2ComplexMsa } from "../../src/input/mmseqs2-api.js";
+import { generateMmseqs2ComplexMsa } from "../../shared/input/mmseqs2-api.js";
 import { foldAf3, loadAf3Weights } from "../../web/af3-model.js";
 
 const option = (args, name, fallback) => {
@@ -119,8 +119,6 @@ const S100A4 = "SMACPLEKALDVMVSTFHKYSGKEGDKFKLNKSELKELLTRELPSFLGKRTDEAAFQKLMSNLD
 const ARMS = [
   ["diffusion", 1], ["diffusion", 20], ["diffusion", 40], ["diffusion", 80],
   ["diffusion", 160], ["diffusion", 320],
-  ["flow", 16], ["flow", 32], ["flow", 64],
-  ["flow", 16, 640], ["flow", 16, 2560], ["flow", 32, 2560],
 ];
 
 /** `--arms=diffusion:20,flow:16` to run a subset, for bisecting a failure. */

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "./harness.js";
 import { concatenateAs, float32ToFloat16Array, numberToFloat16, writeInto }
-  from "../src/weights/float16.js";
+  from "../shared/weights/float16.js";
 
 describe("float16 encoding", () => {
   it("encodes IEEE-754 boundary values", () => {

@@ -35,7 +35,7 @@
  * The array behind a value, or a throw naming what it got instead.
  *
  * Accepts a bare typed array, a plain array, or anything with an `output`
- * holding one - which is the shape every GPU stage in `src/af3` returns.
+ * holding one - which is the shape every GPU stage in `webgpu/af3` returns.
  *
  * @param {unknown} value
  * @param {string} [what] names the side, so a failure says which one

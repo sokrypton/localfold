@@ -16,13 +16,13 @@
  * number of rows reached this - half of all shallow ones.
  *
  * This is a CPU test because the arithmetic is where the bug was; the GPU-side
- * guard is the 256 check in src/runtime/execution.js, which names the binding
+ * guard is the 256 check in webgpu/runtime/execution.js, which names the binding
  * rather than letting WebGPU name the wrong tensor.
  */
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { outerFirstPairBlocks } from "../src/kernels/outer-product-mean.js";
+import { outerFirstPairBlocks } from "../webgpu/kernels/outer-product-mean.js";
 
 /** The rule block.js applies, restated here so the test fails if it changes. */
 function residueMultiple(cOuter, sequences) {

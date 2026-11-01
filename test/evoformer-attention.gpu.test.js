@@ -4,10 +4,10 @@ import {
   AttentionGpu,
   supportsAttentionSubgroup64x64,
 
-} from "../src/kernels/attention.js";
-import { FileTensorStore } from "../src/bundles/tensor-store.js";
-import { errorMetrics } from "../src/kernels/triangle/types.js";
-import { requestAlphaFoldDevice } from "../src/runtime/device.js";
+} from "../webgpu/kernels/attention.js";
+import { FileTensorStore } from "../shared/bundles/tensor-store.js";
+import { errorMetrics } from "../webgpu/kernels/triangle/types.js";
+import { requestAlphaFoldDevice } from "../webgpu/runtime/device.js";
 
 const enabled = process.env.LOCALFOLD_GPU_TESTS === "1";
 const MANIFEST = "test/fixtures/evoformer/model1-query-59-block0/manifest.json";

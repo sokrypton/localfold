@@ -17,7 +17,7 @@
  * refusal at build time instead.
  */
 import { selectAttentionFlashKernel, supportsAttentionSubgroups, allowsAttentionSubgroupSize }
-  from "../../src/kernels/attention.js";
+  from "../../webgpu/kernels/attention.js";
 
 export async function main(device) {
   const info = device.adapterInfo ?? device.info ?? {};

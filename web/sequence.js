@@ -142,20 +142,18 @@ export function sequenceProblem(sequence) {
 }
 
 /**
- * The four bases of each kind. T is DNA's and U is RNA's, and swapping them is
+ * The four bases of each kind, and N. T is DNA's and U is RNA's, and swapping them is
  * the typo this catches: a `U` in a DNA chain is not thymine spelled oddly, it
  * is a different chain than the one that was meant.
  */
-const NUCLEIC_BASES = { dna: "ACGT", rna: "ACGU" };
+const NUCLEIC_BASES = { dna: "ACGTN", rna: "ACGUN" };
 
 /**
  * Why this DNA or RNA sequence cannot be folded, or null if it can.
  *
- * 🔴 N IS NOT ACCEPTED, THOUGH PROTEIN'S X IS. The alphabet has an UNK slot for
- * an unknown amino acid and none for an unknown base - AF3's restypes run
- * A G C U for RNA and DA DG DC DT for DNA and stop - so an N would have to
- * become UNK, which is the amino-acid unknown and would put a protein token in
- * a nucleic chain.
+ * 🔴 N IS ACCEPTED, AS PROTEIN'S X IS. This said AF3's alphabet had no slot for an unknown base, and it has one:
+ * restype 30, its CCD component N (DN in a DNA chain) - a sugar-phosphate backbone with no base. The featuriser builds
+ * it as af3-any-model does (reference-conformers-nucleic.js), where it once made it the protein unknown, N CA C O.
  *
  * @param {string} sequence cleaned letters
  * @param {"dna"|"rna"} kind

@@ -1,0 +1,309 @@
+/**
+ * BioEmu2's small once-per-fold arithmetic, on the host.
+ *
+ * What runs here is per ATOM or per atom-WINDOW PAIR and touches tens of
+ * thousands of numbers, once a fold: the atom features, the windowed pair
+ * geometry and its MLP, the per-layer window biases, the token means of the
+ * input embedder and the trunk's single initialisation. Each is a line-for-line
+ * transcription of af3-any-model's `network/bioemu2.py`, in float64 with a
+ * float32 store, as numpy rounds a float32 tensor.
+ */
+import { BIOEMU2 } from "../../shared/bioemu2/weights.js";
+
+const W_Q = BIOEMU2.windowQueries;
+const W_K = BIOEMU2.windowKeys;
+const CTX = (W_K - W_Q) / 2;
+
+/** y[r] = LN(x[r]) * w + b over `width`, biased variance, eps 1e-5. */
+export function lnRows(x, rows, width, w, b, eps = 1e-5) {
+  const y = new Float32Array(rows * width);
+  for (let r = 0; r < rows; r += 1) {
+    const xr = r * width;
+    let mean = 0;
+    for (let c = 0; c < width; c += 1) mean += x[xr + c];
+    mean /= width;
+    let v = 0;
+    for (let c = 0; c < width; c += 1) { const d = x[xr + c] - mean; v += d * d; }
+    const inv = 1 / Math.sqrt(v / width + eps);
+    for (let c = 0; c < width; c += 1) {
+      let value = (x[xr + c] - mean) * inv;
+      if (w) value *= w[c];
+      if (b) value += b[c];
+      y[xr + c] = value;
+    }
+  }
+  return y;
+}
+
+/** y = x . W^T (+ b): W torch (out, in). */
+export function linearRows(x, rows, inC, w, outC, b) {
+  const y = new Float32Array(rows * outC);
+  for (let r = 0; r < rows; r += 1) {
+    const xr = r * inC;
+    const yr = r * outC;
+    for (let o = 0; o < outC; o += 1) {
+      let s = b ? b[o] : 0;
+      const wo = o * inC;
+      for (let i = 0; i < inC; i += 1) s += x[xr + i] * w[wo + i];
+      y[yr + o] = s;
+    }
+  }
+  return y;
+}
+
+/** The front of compute_static_context: c (N, 128) and the reference-geometry pair (NW, 32, 128, 16). */
+export function atomFeatures(p, f) {
+  const N = f.atom_pad_mask.length;
+  const NW = N / W_Q;
+  const C = BIOEMU2.atom;
+  const Z = BIOEMU2.atomPair;
+  const c = new Float32Array(N * C);
+  const cont = p["proj_atom_continuous/weight"];       // (128, 4)
+  const element = p["embed_element/weight"];          // (128, 128)
+  const n0 = p["embed_atom_name_chars_0/weight"];
+  const n1 = p["embed_atom_name_chars_1/weight"];
+  const n2 = p["embed_atom_name_chars_2/weight"];
+  const n3 = p["embed_atom_name_chars_3/weight"];
+  for (let a = 0; a < N; a += 1) {
+    if (!f.atom_pad_mask[a]) continue;
+    const r0 = f.template_coords[a * 3];
+    const r1 = f.template_coords[a * 3 + 1];
+    const r2 = f.template_coords[a * 3 + 2];
+    const r3 = f.charge[a];
+    const elBase = f.element[a] * C;
+    const n0Base = f.name_encoding[a * 4] * C;
+    const n1Base = f.name_encoding[a * 4 + 1] * C;
+    const n2Base = f.name_encoding[a * 4 + 2] * C;
+    const n3Base = f.name_encoding[a * 4 + 3] * C;
+    const aBase = a * C;
+    for (let o = 0; o < C; o += 1) {
+      const co = o * 4;
+      let s = 0;
+      s += r0 * cont[co];
+      s += r1 * cont[co + 1];
+      s += r2 * cont[co + 2];
+      s += r3 * cont[co + 3];
+      s += element[elBase + o];
+      s += n0[n0Base + o];
+      s += n1[n1Base + o];
+      s += n2[n2Base + o];
+      s += n3[n3Base + o];
+      c[aBase + o] = s;
+    }
+  }
+  // windowed_atom_pair_geometry
+  const pos = p["embed_atompair_ref_pos/weight"];      // (16, 3)
+  const dist = p["embed_atompair_ref_dist/weight"];    // (16, 1)
+  const maskW = p["embed_atompair_mask/weight"];       // (16, 1)
+  const pr = new Float32Array(NW * W_Q * W_K * Z);
+  for (let w = 0; w < NW; w += 1) {
+    for (let i = 0; i < W_Q; i += 1) {
+      const qa = w * W_Q + i;
+      if (!f.atom_pad_mask[qa]) continue;
+      const qx = f.template_coords[qa * 3];
+      const qy = f.template_coords[qa * 3 + 1];
+      const qz = f.template_coords[qa * 3 + 2];
+      const quid = f.ref_space_uid[qa];
+      for (let j = 0; j < W_K; j += 1) {
+        const ka = w * W_Q - CTX + j;
+        const inside = ka >= 0 && ka < N;
+        const kuid = inside && f.atom_pad_mask[ka] ? f.ref_space_uid[ka] : -1;
+        if (quid !== kuid) continue;
+        const d0 = (inside ? f.template_coords[ka * 3] : 0) - qx;
+        const d1 = (inside ? f.template_coords[ka * 3 + 1] : 0) - qy;
+        const d2 = (inside ? f.template_coords[ka * 3 + 2] : 0) - qz;
+        const inv = 1 / (1 + d0 * d0 + d1 * d1 + d2 * d2);
+        const at = ((w * W_Q + i) * W_K + j) * Z;
+        for (let o = 0; o < Z; o += 1) {
+          pr[at + o] = pos[o * 3] * d0 + pos[o * 3 + 1] * d1 + pos[o * 3 + 2] * d2 + dist[o] * inv + maskW[o];
+        }
+      }
+    }
+  }
+  return { c, pr, N, NW };
+}
+
+function dot16(v, m, row) {
+  let s = 0;
+  s += v[0] * m[row]; s += v[1] * m[row + 1]; s += v[2] * m[row + 2]; s += v[3] * m[row + 3];
+  s += v[4] * m[row + 4]; s += v[5] * m[row + 5]; s += v[6] * m[row + 6]; s += v[7] * m[row + 7];
+  s += v[8] * m[row + 8]; s += v[9] * m[row + 9]; s += v[10] * m[row + 10]; s += v[11] * m[row + 11];
+  s += v[12] * m[row + 12]; s += v[13] * m[row + 13]; s += v[14] * m[row + 14]; s += v[15] * m[row + 15];
+  return s;
+}
+
+/** c -> p (queries and keys), then the three-layer p MLP. In place on `pr`. */
+export function atomPairTail(p, c, pr, N) {
+  const NW = N / W_Q;
+  const C = BIOEMU2.atom;
+  const Z = BIOEMU2.atomPair;
+  const reluC = new Float32Array(c.length);
+  for (let k = 0; k < c.length; k += 1) { const v = c[k]; reluC[k] = v > 0 ? v : 0; }
+  const cq = linearRows(reluC, N, C, p["c_to_p_trans_q_1/weight"], Z);
+  const ck = linearRows(reluC, N, C, p["c_to_p_trans_k_1/weight"], Z);
+  const m1 = p["p_mlp_1/weight"];
+  const m3 = p["p_mlp_3/weight"];
+  const m5 = p["p_mlp_5/weight"];
+  const r0 = new Float64Array(Z);
+  const h = new Float64Array(Z);
+  const g = new Float64Array(Z);
+  for (let w = 0; w < NW; w += 1) {
+    for (let i = 0; i < W_Q; i += 1) {
+      const qa = w * W_Q + i;
+      const qBase = qa * Z;
+      for (let j = 0; j < W_K; j += 1) {
+        const ka = w * W_Q - CTX + j;
+        const at = ((w * W_Q + i) * W_K + j) * Z;
+        const inside = ka >= 0 && ka < N;
+        const kBase = ka * Z;
+        for (let o = 0; o < Z; o += 1) {
+          const val = pr[at + o] + cq[qBase + o] + (inside ? ck[kBase + o] : 0);
+          pr[at + o] = val;
+          r0[o] = val > 0 ? val : 0;
+        }
+        for (let o = 0; o < Z; o += 1) {
+          const s = dot16(r0, m1, o * 16);
+          h[o] = s > 0 ? s : 0;
+        }
+        for (let o = 0; o < Z; o += 1) {
+          const s = dot16(h, m3, o * 16);
+          g[o] = s > 0 ? s : 0;
+        }
+        for (let o = 0; o < Z; o += 1) {
+          pr[at + o] += dot16(g, m5, o * 16);
+        }
+      }
+    }
+  }
+  return pr;
+}
+
+/** Pre-normalise `pr` once so multiple `windowBias` calls can reuse `(pr - mean) * inv`. */
+export function normalizeWindowPair(pr) {
+  const Z = BIOEMU2.atomPair;
+  const out = new Float64Array(pr.length);
+  for (let at = 0; at < pr.length; at += Z) {
+    let mean = 0;
+    for (let k = 0; k < Z; k += 1) mean += pr[at + k];
+    mean /= Z;
+    let v = 0;
+    for (let k = 0; k < Z; k += 1) { const d = pr[at + k] - mean; v += d * d; }
+    const inv = 1 / Math.sqrt(v / Z + 1e-5);
+    for (let k = 0; k < Z; k += 1) out[at + k] = (pr[at + k] - mean) * inv;
+  }
+  return out;
+}
+
+/** LN(pair) * norm_z -> proj_z, heads first: (NW, H, 32, 128). */
+export function windowBias(pr, N, normZ, projZ, heads, prNorm = null) {
+  const NW = N / W_Q;
+  const Z = BIOEMU2.atomPair;
+  const out = new Float32Array(NW * heads * W_Q * W_K);
+  if (prNorm !== null) {
+    const x = new Float64Array(Z);
+    for (let win = 0; win < NW; win += 1) {
+      for (let i = 0; i < W_Q; i += 1) {
+        for (let j = 0; j < W_K; j += 1) {
+          const at = ((win * W_Q + i) * W_K + j) * Z;
+          x[0] = prNorm[at] * normZ[0]; x[1] = prNorm[at + 1] * normZ[1];
+          x[2] = prNorm[at + 2] * normZ[2]; x[3] = prNorm[at + 3] * normZ[3];
+          x[4] = prNorm[at + 4] * normZ[4]; x[5] = prNorm[at + 5] * normZ[5];
+          x[6] = prNorm[at + 6] * normZ[6]; x[7] = prNorm[at + 7] * normZ[7];
+          x[8] = prNorm[at + 8] * normZ[8]; x[9] = prNorm[at + 9] * normZ[9];
+          x[10] = prNorm[at + 10] * normZ[10]; x[11] = prNorm[at + 11] * normZ[11];
+          x[12] = prNorm[at + 12] * normZ[12]; x[13] = prNorm[at + 13] * normZ[13];
+          x[14] = prNorm[at + 14] * normZ[14]; x[15] = prNorm[at + 15] * normZ[15];
+          for (let h = 0; h < heads; h += 1) {
+            out[((win * heads + h) * W_Q + i) * W_K + j] = dot16(x, projZ, h * 16);
+          }
+        }
+      }
+    }
+    return out;
+  }
+  const x = new Float64Array(Z);
+  for (let w = 0; w < NW; w += 1) {
+    for (let i = 0; i < W_Q; i += 1) {
+      for (let j = 0; j < W_K; j += 1) {
+        const at = ((w * W_Q + i) * W_K + j) * Z;
+        let mean = 0;
+        for (let k = 0; k < Z; k += 1) mean += pr[at + k];
+        mean /= Z;
+        let v = 0;
+        for (let k = 0; k < Z; k += 1) { const d = pr[at + k] - mean; v += d * d; }
+        const inv = 1 / Math.sqrt(v / Z + 1e-5);
+        for (let k = 0; k < Z; k += 1) x[k] = (pr[at + k] - mean) * inv * normZ[k];
+        for (let h = 0; h < heads; h += 1) {
+          let s = 0;
+          for (let k = 0; k < Z; k += 1) s += x[k] * projZ[h * Z + k];
+          out[((w * heads + h) * W_Q + i) * W_K + j] = s;
+        }
+      }
+    }
+  }
+  return out;
+}
+
+/** broadcast_token_pair_to_atom_window, added into `pr`: z[tok_q, tok_k] where both atoms are real. */
+export function addTokenPairToWindows(pr, zp, T, f) {
+  const N = f.atom_pad_mask.length;
+  const NW = N / W_Q;
+  const Z = BIOEMU2.atomPair;
+  for (let w = 0; w < NW; w += 1) {
+    for (let i = 0; i < W_Q; i += 1) {
+      const qa = w * W_Q + i;
+      if (!f.atom_pad_mask[qa]) continue;
+      const tq = f.token_idx_at_atom[qa];
+      for (let j = 0; j < W_K; j += 1) {
+        const ka = w * W_Q - CTX + j;
+        if (ka < 0 || ka >= N || !f.atom_pad_mask[ka]) continue;
+        const tk = f.token_idx_at_atom[ka];
+        const at = ((w * W_Q + i) * W_K + j) * Z;
+        const src = (tq * T + tk) * Z;
+        for (let o = 0; o < Z; o += 1) pr[at + o] += zp[src + o];
+      }
+    }
+  }
+}
+
+/** s_inputs = [token mean of relu(q W) | one-hot res_type | profile | deletion_mean | one-hot pocket]. */
+export function sInputs(q, f, w, T) {
+  const N = f.atom_pad_mask.length;
+  const proj = linearRows(q, N, BIOEMU2.atom, w, BIOEMU2.single);
+  const sums = new Float64Array(T * BIOEMU2.single);
+  const counts = new Float64Array(T);
+  for (let a = 0; a < N; a += 1) {
+    if (!f.atom_pad_mask[a]) continue;
+    const t = f.token_idx_at_atom[a];
+    counts[t] += 1;
+    for (let o = 0; o < BIOEMU2.single; o += 1) sums[t * BIOEMU2.single + o] += Math.max(proj[a * BIOEMU2.single + o], 0);
+  }
+  const width = BIOEMU2.sInputs;
+  const out = new Float32Array(T * width);
+  for (let t = 0; t < T; t += 1) {
+    const row = t * width;
+    for (let o = 0; o < BIOEMU2.single; o += 1) out[row + o] = sums[t * BIOEMU2.single + o] / (counts[t] + 1e-6);
+    out[row + 384 + f.res_type[t]] = 1;
+    for (let k = 0; k < 33; k += 1) out[row + 417 + k] = f.profile[t * 33 + k];
+    out[row + 450] = f.deletion_mean[t];
+    out[row + 451 + f.pocket_feature[t]] = 1;
+  }
+  return out;
+}
+
+/** DampedHarmonicTimeEmbedding for a scalar lag: [envelope, sin, cos], timescale-major. */
+export function dampedHarmonic(dt, taus, quality) {
+  const n = taus.length;
+  const Q = quality.length;
+  const env = Array.from(taus, (tau) => Math.exp(-dt / tau));
+  const out = new Float32Array(n * (1 + 2 * Q));
+  for (let i = 0; i < n; i += 1) out[i] = env[i];
+  for (let i = 0; i < n; i += 1) {
+    for (let k = 0; k < Q; k += 1) {
+      const phase = 2 * Math.PI * quality[k] * (dt / taus[i]);
+      out[n + i * Q + k] = env[i] * Math.sin(phase);
+      out[n + n * Q + i * Q + k] = env[i] * Math.cos(phase);
+    }
+  }
+  return out;
+}

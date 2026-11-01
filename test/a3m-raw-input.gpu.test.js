@@ -1,10 +1,10 @@
 import { readFile } from "node:fs/promises";
 import { afterAll, beforeAll, describe, expect, it } from "./harness.js";
 import { create, globals } from "webgpu";
-import { AlphaFoldMonomerGpu } from "../src/af2/model/monomer.js";
-import { AlphaFoldFixture } from "../src/bundles/alphafold-fixture.js";
-import { FileTensorStore } from "../src/bundles/tensor-store.js";
-import { requestAlphaFoldDevice } from "../src/runtime/device.js";
+import { AlphaFoldMonomerGpu } from "../webgpu/af2/model/monomer.js";
+import { AlphaFoldFixture } from "../shared/bundles/alphafold-fixture.js";
+import { FileTensorStore } from "../shared/bundles/tensor-store.js";
+import { requestAlphaFoldDevice } from "../webgpu/runtime/device.js";
 
 const enabled = process.env.LOCALFOLD_GPU_TESTS === "1";
 const MANIFEST = "test/fixtures/evoformer/model1-query-59-stack/manifest.json";

@@ -26,15 +26,15 @@
  * pLDDT and passed everything this repository had.
  */
 import { confidenceWeights, openAf3Store, trunkWeights }
-  from "../../src/af3/weights/weights.js";
+  from "../../shared/af3/weights/weights.js";
 import { diffusionWeights, atomReference, targetFeatureWeights }
-  from "../../src/af3/weights/diffusion-weights.js";
-import { dialectFor, featuriserDialect } from "../../src/af3/dialect.js";
-import { featuriseProtein } from "../../src/af3/featurise/featurise.js";
-import { af3BatchFromA3m } from "../../src/af3/featurise/batch.js";
-import { generateMmseqs2Msa } from "../../src/input/mmseqs2-api.js";
-import { foldBatch, toPdb } from "../../src/af3/fold.js";
-import { ccdUrl, parseCcdComponent } from "../../src/af3/featurise/ccd-component.js";
+  from "../../shared/af3/weights/diffusion-weights.js";
+import { dialectFor, featuriserDialect } from "../../shared/af3/dialect.js";
+import { featuriseProtein } from "../../shared/af3/featurise/featurise.js";
+import { af3BatchFromA3m } from "../../shared/af3/featurise/batch.js";
+import { generateMmseqs2Msa } from "../../shared/input/mmseqs2-api.js";
+import { foldBatch, toPdb } from "../../webgpu/af3/fold.js";
+import { ccdUrl, parseCcdComponent } from "../../shared/af3/featurise/ccd-component.js";
 import { bondGeometry } from "./bond-geometry.js";
 
 const SIGMA_DATA = 16;
@@ -72,7 +72,7 @@ export async function main(device, args = []) {
   const sigmas = option(args, "sigmas", "160,40,16,8").split(",").map(Number);
   const steps = Number(option(args, "steps", "8"));
   const seeds = option(args, "seeds", "1,2,3").split(",").map(Number);
-  const mode = option(args, "mode", "flow");
+  const mode = option(args, "mode", "diffusion");
   const withMsa = args.includes("--msa");
   const only = option(args, "targets", "").split(",").filter(Boolean);
   const conformers = await (await fetch("/tools/oracle/reference-conformers.json")).json();

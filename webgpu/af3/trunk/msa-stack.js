@@ -1,0 +1,695 @@
+/**
+ * AF3's MSA stack, resident on the GPU. Four blocks, ahead of the pairformer's
+ * forty-eight.
+ *
+ *     pair += outer_product_mean(msa)          <- the msa AS IT ARRIVED
+ *     msa  += msa_attention(msa, pair)         <- the pair the line above changed
+ *     msa  += transition(msa)
+ *     ...then the same five pair updates the pairformer runs
+ *
+ * 🔴 THE OUTER PRODUCT MEAN READS THE MSA BEFORE THE TWO MSA UPDATES, and the
+ * MSA attention reads the pair AFTER the outer product mean has changed it. So
+ * the two tracks are interleaved, not sequential: neither "do the MSA then the
+ * pair" nor "do the pair then the MSA" is what AF3 does, and both run.
+ *
+ * The five pair updates are shared with the pairformer stack; see
+ * webgpu/af3/trunk/pair-track.js.
+ */
+import { deviceTuning, halfPrecisionAvailable, shapedKnob } from "../../runtime/device-profile.js";
+import { resolveGridAttendMatrix } from "./grid-attention-matrix.js";
+import { GpuBufferAllocator } from "../../runtime/allocator.js";
+import { residentWeightBuffer } from "../../runtime/resident.js";
+import { residencyAllowed } from "../../runtime/device-memory.js";
+import { storageBytes } from "../../runtime/storage.js";
+import { pipelineCacheForDevice } from "../../runtime/pipeline-cache.js";
+import {
+  GRID_WIDTH, PAIR_SCRATCH_COUNT, UNPACKED_PAIR_SCRATCH, compilePairTrack, createAddShader,
+  encodePairTrack, packPairTrackWeights,
+} from "./pair-track.js";
+import { residentPairTrackOnDevice } from "../weights/pair-track-device-weights.js";
+import { residentPackedOnDevice } from "../weights/device-weights.js";
+import {
+  af3OpmVectorBlockPairs, createAf3OpmVectorOutputShader, createOuterProductMeanShaders,
+  OPM_PROJECT_ROWS, packOuterProductMeanWeights,
+} from "./outer-product-mean.js";
+import { createOuterProductMeanVectorContractShader } from "../../kernels/outer-product-mean.js";
+import { vectorGemmBlock, vectorGemmBlockKey } from "../../kernels/vector-gemm-block.js";
+import { createMsaAttentionShaders, msaAttentionKeyPart, packMsaAttentionWeights } from "./msa-attention.js";
+import { allocateGridProjectMatrix, gridProjectMatrixConfig }
+  from "./grid-project-matrix.js";
+import {
+  allocateTransitionSplit, createTransitionShader, packTransitionWeights,
+  splitTransitionConfig, pairTransitionArithmetic, transitionRowTile, TRANSITION_ORDER,
+} from "./transition.js";
+import { weightLength } from "../../../shared/weights/weight-pack.js";
+import { settleGridAttendTiling } from "./grid-attend-race.js";
+
+// The two-GEMM outer product's intermediate cap; see af3OpmVectorBlockPairs.
+const OPM_VECTOR_BYTES = 16 * 1024 * 1024;
+// The MSA rows one msa.project workgroup normalises and projects (createMsaAttentionShaders' projectRows): the value
+// and gate weights read once for all of them.
+const MSA_PROJECT_ROWS = 16;
+// (`msaProjectRows` a device tuning for the arms; 1 is the row-a-workgroup kernel) - halved until the tile's workgroup
+// storage fits the device: R x (C_M + 128) floats and R statistics pairs. 🔴 At a 128-channel MSA (protenix2, OpenDDE,
+// IntelliFold-2) 16 rows are 16512 bytes, 128 over the 16384 WebGPU guarantees, so test:spec-floor could not create
+// those three models' pipelines; AlphaFold 3's 64 channels fit (12416). The kernel is bit-identical at any row count.
+const msaProjectRows = (device, msaChannels) => {
+  const room = device.limits?.maxComputeWorkgroupStorageSize ?? 16384;
+  let rows = deviceTuning(device).msaProjectRows ?? MSA_PROJECT_ROWS;
+  while (rows > 1 && rows * ((msaChannels + 128) * 4 + 8) > room) rows = Math.ceil(rows / 2);
+  return rows;
+};
+// ...and the consecutive tokens of one sequence one msa.average workgroup averages (`msaAverageRows`; 1 the control)
+const MSA_AVERAGE_ROWS = 8;
+const msaAverageRows = (device) => deviceTuning(device).msaAverageRows ?? MSA_AVERAGE_ROWS;
+
+export class Af3MsaStackGpu {
+  constructor(device, options = {}) {
+    this.device = device;
+    this.allocator = new GpuBufferAllocator(device);
+    this.pipelines = pipelineCacheForDevice(device);
+    // 🔴 KEPT, BECAUSE THE TRUNK PINS THROUGH THE CONSTRUCTOR. Af3TrunkGpu
+    // hands `this.options` to all three stacks' constructors and its run-time
+    // options to two of their `run`s, so a stack reading only `run`'s could not
+    // see `pairMatrixKernels` set the way the pairformer sees it.
+    this.options = options;
+    // The same default and the same escape the pairformer takes.
+    this.residentWeights = (options.residentWeights ?? true) && residencyAllowed(device);
+  }
+
+  /**
+   * @param {{pair: Float32Array, msa: Float32Array, pairMask: Float32Array,
+   *          msaMask: Float32Array, tokens: number, sequences: number}} state
+   * @param {object[]} blocks one weight bundle per block
+   * @param {{swapTransposedBias: boolean}} dialect
+   * @param {{epsilon?: number, variance?: "fast"|"two-pass",
+   *          msaChannels?: number, onBlock?: (index: number) => void}} options
+   */
+  async run(state, blocks, dialect, options = {}) {
+    const n = state.tokens;
+    const sequences = state.sequences;
+    const pairs = n * n;
+    // 🔴 BOTH WIDTHS ARE THE BLOCK'S. OpenDDE's MSA track is 128 channels and
+    // its pair track 384, against AlphaFold 3's 64 and 128, and a declared
+    // width loads either bundle without complaint - see shared/af3/weights/weights.js.
+    // `options.msaChannels` survives for a caller that is checking a stack in
+    // isolation; the weights win when they say anything.
+    const msaChannels = blocks[0].msaChannels ?? options.msaChannels ?? 64;
+    const pairChannels = blocks[0].pairChannels;
+    if (dialect?.msaUpdateBeforeOuterProduct === undefined) {
+      throw new Error("dialect.msaUpdateBeforeOuterProduct has no default: AF3 "
+        + "takes the outer product off the pre-update MSA and OpenDDE off the "
+        + "updated one");
+    }
+    const { msaUpdateBeforeOuterProduct } = dialect;
+    // 🔴 ONE VARIABLE FOR THE SHADER AND FOR THE PACKING, because they are the
+    // same decision made twice. `compilePairTrack` generates kernels that read
+    // the weights at this element and `packPairTrackWeights` writes them at
+    // it - and this stack compiled at one and packed at the other, so an f16
+    // kernel read f32 bytes as pairs of halves. Every coordinate came back NaN.
+    // Same shape as the dispatch that was sized for 128 while the kernels were
+    // built for 384; a value resolved in two places is how they drift.
+    const pairWeightPrecision = options.pairWeightPrecision ?? "f32";
+    if (!(pairChannels > 0)) {
+      throw new Error("MSA blocks carry no pairChannels; they are built by "
+        + "shared/af3/weights/weights.js, which derives it from the weights");
+    }
+    const rows = sequences * n;
+    const epsilon = options.epsilon ?? 1e-5;
+    const variance = options.variance ?? "fast";
+    if (dialect?.swapTransposedBias === undefined) {
+      throw new Error("dialect.swapTransposedBias has no default");
+    }
+    // The same two checks on whichever form the tensor arrives in: a host
+    // array's length, or a device buffer's bytes.
+    const elements = (array, buffer) => (buffer !== undefined ? buffer.size / 4 : array.length);
+    // 🔴 `compileOnly` BUILDS THE PIPELINES AND RETURNS, for Af3TrunkGpu.warm:
+    // no input is read, nothing is allocated.
+    const compileOnly = options.compileOnly === true;
+    const msaElements = compileOnly ? rows * msaChannels : elements(state.msa, options.msaBuffer);
+    const pairElements = compileOnly ? pairs * pairChannels
+      : elements(state.pair, options.pairBuffer);
+    if (msaElements !== rows * msaChannels) {
+      throw new Error(`msa has ${msaElements} elements; expected ${rows * msaChannels}`);
+    }
+    if (pairElements !== pairs * pairChannels) {
+      throw new Error(`pair has ${pairElements} elements; expected ${pairs * pairChannels}`);
+    }
+
+    const sample = blocks[0];
+    const gridHeads = sample.pairAttention1.heads;
+    const msaHeads = sample.msaAttention1.heads;
+    const msaDimension = sample.msaAttention1.dimension;
+    const msaWidth = msaHeads * msaDimension;
+    const outerChannels = sample.outerProductMean.outerChannels;
+    const storage = GPUBufferUsage.STORAGE;
+    const allocations = [];
+    const keep = (allocation) => { allocations.push(allocation); return allocation; };
+
+    const base = `af3-msa:${n}:${sequences}:${msaChannels}:${pairChannels}:${epsilon}:${variance}`
+      + `:${dialect.swapTransposedBias}`;
+    // 🔴 THE MATRIX PAIR KERNELS ARE A PRECISION AXIS - see the note in
+    // pairformer-block.js. The trunk has THREE pair tracks and a pin
+    // wired into one of them moves almost nothing: asking check-af3-trunk for
+    // f32 with only the pairformer pinned read 1.11e-4 against the f16 path's
+    // 1.12e-4, because this stack and the template embedder kept theirs.
+    const pairMatrixKernels =
+      (options.pairMatrixKernels ?? this.options?.pairMatrixKernels) !== false;
+    // grid.attend's tiled form where this device has not been told: see grid-attend-race.js
+    await settleGridAttendTiling(this.device);
+    const hasF16 = halfPrecisionAvailable(this.device);
+    const stagedPrecision = options.stagedPrecision ?? this.options?.stagedPrecision ?? (hasF16 ? "f16" : "f32");
+    const accumulatePrecision = options.accumulatePrecision ?? this.options?.accumulatePrecision ?? (hasF16 ? "f16" : "f32");
+    const pipelines = await compilePairTrack(this.pipelines, {
+      // The device's answer, or undefined for the shared default.
+      triangleProjectTile: shapedKnob(deviceTuning(this.device).trianglePairProjectTile),
+      triangleProjectOutColumns: deviceTuning(this.device).triangleProjectOutColumns,
+      attendTiled: deviceTuning(this.device).gridAttendTiled ?? false,
+      attendTiledHalf: pairMatrixKernels && deviceTuning(this.device).gridAttendTiledHalf === true
+        && hasF16,
+      // ...its tile maximum by subgroup shuffles where the device has 32-lane subgroups (`gridAttendSubgroups: false`
+      // the control): bit-identical, 3-4% of the kernel on an M5
+      attendSubgroupMax: this.device.features.has("subgroups") && (this.device.adapterInfo?.subgroupMinSize ?? 0) === 32
+        && (this.device.adapterInfo?.subgroupMaxSize ?? 0) === 32 && deviceTuning(this.device).gridAttendSubgroups !== false,
+      // ...and the bias read as one vec4 a query a tile, from rows the bias pass permutes and pads (`gridAttendBiasVec4:
+      // false` the control): bit-identical
+      attendBiasVec4: deviceTuning(this.device).gridAttendBiasVec4 !== false,
+      // ...and no mask read where this pass's pair mask is all ones, as a fold's is (a warm-up has none and compiles
+      // that form); `gridAttendMaskFree: false` the control
+      attendMaskFree: deviceTuning(this.device).gridAttendMaskFree !== false
+        && (state.pairMask === undefined || state.pairMask.every((value) => value > 0)),
+      // ...and q, k and v handed to the half-tiled attend in f16, which it rounds them to anyway (`gridAttendQkvHalf:
+      // false` the control): bit-identical, half the staging's bytes
+      attendQkvHalf: deviceTuning(this.device).gridAttendQkvHalf !== false,
+      attendMatrix: pairMatrixKernels && resolveGridAttendMatrix(
+        this.device, sample.pairAttention1.dimension, deviceTuning(this.device)),
+      scratchStorage: UNPACKED_PAIR_SCRATCH,
+      stagedPrecision,
+      accumulatePrecision,
+      // 🔴 THE TRACK'S WIDTH IS THIS STACK'S, NOT compilePairTrack's DEFAULT.
+      // Omitting it fell back to AlphaFold 3's 128 and split OpenDDE's
+      // [384, 768] triangle projection at AF3's stride.
+      n, channels: pairChannels, sample, epsilon, variance, dialect, base,
+      weightPrecision: pairWeightPrecision,
+      // 🔴 THIS STACK RUNS THE SAME PAIR TRACK AND HAD NONE OF ITS KERNEL
+      // CHOICES. `grid.project`'s 108 passes in an AF3 trunk are 96 pairformer,
+      // 8 MSA and 4 template - so a knob wired only into the pairformer leaves
+      // an eighth of that kernel on the vector path for no reason. It costs no
+      // memory and reads the layout this pack already writes.
+      gridProjectMatrix: pairMatrixKernels && gridProjectMatrixConfig(this.device, pairChannels),
+      // 🔴 AND THE SPLIT TRANSITION, WHICH THIS STACK ALSO NEVER HAD. Four of
+      // an AF3 trunk's `pair-transition` passes are this stack's, and at
+      // OpenDDE's 384 channels the fused kernel loses to the split by 3.71x -
+      // the whole reason the pairformer takes it. Same width rule, same knob.
+      pairTransitionSplit: splitTransitionConfig(this.device, pairChannels,
+        { f32Only: !pairMatrixKernels, arithmetic: pairTransitionArithmetic(pairChannels) }),
+      pairTransitionChunkBytes: deviceTuning(this.device).pairTransitionChunkBytes,
+      // ...and the triangle's contraction in f16 arithmetic, under the same policy as the transition's (see
+      // webgpu/kernels/triangle/shaders.js); `triangleContractArithmetic: "f32"` is the control arm
+      triangleContractArithmetic: pairMatrixKernels && halfPrecisionAvailable(this.device)
+        && (deviceTuning(this.device).triangleContractArithmetic ?? "f16") === "f16" ? "f16" : "f32",
+      gridProjectArithmetic: deviceTuning(this.device).gridProjectArithmetic,
+      maxComputeWorkgroupStorageSize: this.device.limits.maxComputeWorkgroupStorageSize,
+      maxStorageBufferBindingSize: this.device.limits.maxStorageBufferBindingSize,
+      minStorageBufferOffsetAlignment: this.device.limits.minStorageBufferOffsetAlignment,
+    });
+    const gridProjectMatrix = pipelines.gridProjectMatrix === undefined || compileOnly
+      ? undefined : allocateGridProjectMatrix(this.allocator, {
+        ...pipelines.gridProjectMatrix, label: "af3-msa.grid-project",
+      }, keep);
+    // 🔴 COMPILED CONCURRENTLY - see the note in pair-track.js.
+    const compile = (key, source) => this.pipelines.get(key, source);
+    const compiling = [];
+    const into = (slot, key, source) => {
+      compiling.push(compile(key, source).then((pipeline) => { pipelines[slot] = pipeline; }));
+    };
+
+    const opmTuning = deviceTuning(this.device);
+    // See OPM_BLOCK_I_TOKENS: the shipped block of two is 1.5x SLOWER past 256
+    // tokens, on the trunk's second-largest kernel.
+    //
+    // 🔴 AND IT IS THE PRIOR'S TO SET, NOT A DERIVATION'S. This shipped for one
+    // commit as `deviceDerivationsAllowed(device) && n > OPM_BLOCK_I_TOKENS`,
+    // which applied a threshold measured on ONE card to every device including
+    // parts nobody has run it on. The five derivations this repository has all
+    // read something the DEVICE reports - its measured width, its memory budget
+    // - and 256 tokens is not that: it is where this A100's memory system turns
+    // over. `opmBlockITokens` is null everywhere but the ampere prior, so
+    // another part keeps the measured block of two until someone measures it
+    // there.
+    const blockITokens = opmTuning.opmBlockITokens;
+    const opmBlockI = opmTuning.opmBlockI
+      ?? (blockITokens != null && n > blockITokens ? 1 : null);
+    const opmShape = { sequences, tokens: n, msaChannels, outerChannels,
+                       pairChannels,
+                       // boltz2 divides before it adds the bias; see the note
+                       // in outer-product-mean.js.
+                       opmBiasAfterNorm: dialect.opmBiasAfterNorm === true,
+                       ...(opmBlockI == null ? {} : { blockI: opmBlockI }),
+                       maxComputeWorkgroupStorageSize:
+                         this.device.limits?.maxComputeWorkgroupStorageSize,
+                       ...(opmTuning.opmCellChunk == null
+                         ? {} : { cellChunk: opmTuning.opmCellChunk }) };
+    const opmOffsets = packOuterProductMeanWeights(sample.outerProductMean).offsets;
+    const { blockI, blockJ, blocksPerRow, ...opmSources } = createOuterProductMeanShaders(
+      opmShape, opmOffsets, epsilon, variance);
+    // 🔴 THE CONTRACTION AS TWO GEMMs where the widths allow it; see
+    // createAf3OpmVectorOutputShader. The output GEMM tiles C_Z by 64 and the
+    // cells by 16 with no tail, so a width that does not divide keeps the
+    // fused kernel. `opmVectorContract: false` is the control arm, the same
+    // knob AF2's contraction answers to.
+    const useOpmVector = opmTuning.opmVectorContract !== false
+      && pairChannels % 64 === 0 && (outerChannels * outerChannels) % 16 === 0
+      && outerChannels % 4 === 0 && opmOffsets.outputW % 4 === 0 && opmOffsets.outputB % 4 === 0;
+    // ...the contraction GEMM in f16 arithmetic on the device's block where this stack's f16 policy is on, as AF2's
+    // (webgpu/af2/evoformer/block.js: a k step's BK sequences' products summed in f16, then into f32). M5, stock
+    // flags, 300 tokens x 1024 rows: see the commit that made it. `opmVectorArithmetic: "f32"` is the control.
+    const opmArithmetic = pairMatrixKernels && halfPrecisionAvailable(this.device)
+      && opmTuning.opmVectorArithmetic !== "f32" ? "f16" : "f32";
+    const opmBlock = vectorGemmBlock(this.device, opmArithmetic, () => true);
+    const opmOutBlock = vectorGemmBlock(this.device, opmArithmetic,
+      ({ columns, inner }) => pairChannels % columns === 0 && (outerChannels * outerChannels) % inner === 0);
+    pipelines.opmVecBlock = opmBlock;
+    pipelines.opmVecOutColumns = opmOutBlock.columns;
+    if (useOpmVector) {
+      into("opmVecContract", `af3-opm-vec-contract:${outerChannels}:${vectorGemmBlockKey(opmBlock)}:${opmArithmetic}`,
+           createOuterProductMeanVectorContractShader(outerChannels, opmBlock, opmArithmetic));
+      into("opmVecOutput", `af3-opm-vec-output:ban${opmShape.opmBiasAfterNorm}:${vectorGemmBlockKey(opmOutBlock)}:${opmArithmetic}:r1`,
+           createAf3OpmVectorOutputShader({ biasAfterNorm: opmShape.opmBiasAfterNorm, residual: true,
+                                           columns: opmOutBlock.columns, inner: opmOutBlock.inner,
+                                           arithmetic: opmArithmetic }));
+    }
+    // ...the contraction's dispatch is one workgroup per (i, j) block of token
+    // pairs; see the note on its kernel.
+    pipelines.opmBlocks = Math.ceil(n / blockI) * blocksPerRow;
+    for (const [name, source] of Object.entries(opmSources)) {
+      // 🔴 THE BLOCK AND THE CHUNK ARE IN THE KEY. Both change the generated
+      // WGSL and the dispatch, which is the collision docs/AF2.md records twice.
+      into(`opm:${name}`, `${base}:opm:${name}`
+        + `:${blockI}x${blockJ}:${opmTuning.opmCellChunk ?? "d"}`
+        + `:ban${opmShape.opmBiasAfterNorm}`
+        // ...and rosettafold3's biased projections, which add two `const W_*`
+        // to the source and a term to its inner loop.
+        + `:lrb${sample.outerProductMean.leftProjectionBias != null}`, source);
+    }
+    const attentionSources = createMsaAttentionShaders(
+      { sequences, tokens: n, msaChannels, pairChannels,
+        heads: msaHeads, dimension: msaDimension, projectRows: msaProjectRows(this.device, msaChannels),
+        averageRows: msaAverageRows(this.device) },
+      packMsaAttentionWeights(sample.msaAttention1).offsets, epsilon, variance);
+    for (const [name, source] of Object.entries(attentionSources)) {
+      // 🔴 THE HEAD SHAPE IS IN THE KEY, and leaving it out was a real
+      // collision: every kernel in msa-attention.js shares one `common`
+      // preamble, so all of them embed HEADS and DIMENSION - even `keyMask`,
+      // which reads neither. AlphaFold 3 and RoseTTAFold3 are both msaChannels
+      // 64 with 8 heads, of dimension 8 and 32, and `base` names the channels
+      // and not the heads, so the two produced the SAME key for DIFFERENT text.
+      // The OPM loop above already appends its own discriminators; this one
+      // appended nothing.
+      into(`msa:${name}`, `${base}:msa:${name}:${msaAttentionKeyPart(
+        { heads: msaHeads, dimension: msaDimension })}${name === "project" ? `:r${msaProjectRows(this.device, msaChannels)}` : name === "average" ? `:r${msaAverageRows(this.device)}` : ""}`, source);
+    }
+    into("msaTransition", `${base}:msa-transition`,
+      createTransitionShader({ rows, channels: msaChannels, factor: 4 },
+                             packTransitionWeights(sample.msaTransition).offsets,
+                             epsilon, variance));
+    into("addMsa", `${base}:add-msa`, createAddShader(rows * msaChannels));
+    await Promise.all(compiling);
+    if (compileOnly) return undefined;
+
+    // 🔴 THE TRUNK'S OWN BUFFERS, UPDATED IN PLACE, WHEN IT HANDS THEM OVER -
+    // the pairformer's `pairBuffer` convention, for the pair AND the MSA. On
+    // that path nothing is read back and no block waits for the device, so the
+    // stack pipelines like the pairformer does; see trunk.js.
+    const onDevice = options.pairBuffer !== undefined;
+    if (onDevice && (options.msaBuffer === undefined || options.validation === undefined)) {
+      throw new Error("pairBuffer needs msaBuffer and validation beside it");
+    }
+    try {
+      const pair = onDevice ? { buffer: options.pairBuffer }
+        : keep(this.allocator.upload("af3-msa.pair", state.pair,
+                                     storage | GPUBufferUsage.COPY_SRC));
+      const msa = onDevice ? { buffer: options.msaBuffer }
+        : keep(this.allocator.upload("af3-msa.msa", state.msa,
+                                     storage | GPUBufferUsage.COPY_SRC));
+      const pairMask = keep(this.allocator.upload("af3-msa.pair-mask", state.pairMask, storage));
+      const msaMask = keep(this.allocator.upload("af3-msa.msa-mask", state.msaMask, storage));
+
+      // 🔴 FIVE PAIR-SIZED SCRATCH BUFFERS, AND THIS STACK KEEPS THEM WHOLE.
+      // See UNPACKED_PAIR_SCRATCH for the four checkers that say so. The
+      // allocation and the shaders read the SAME array, because a buffer that
+      // disagrees with a shader about its element is not something WebGPU can
+      // catch.
+      const scratch = [];
+      for (let index = 0; index < pipelines.pairScratchCount; index += 1) {
+        scratch.push(keep((options.scratchAllocator ?? this.allocator).allocate(
+          `af3-msa.scratch${index}`,
+          pipelines.pairScratchBytes(index,
+  storageBytes(pairs * pairChannels, UNPACKED_PAIR_SCRATCH[index])), storage)));
+      }
+      const transitionSplit = pipelines.transitionSplit === undefined ? undefined
+        : allocateTransitionSplit(this.allocator, {
+          rows: n * n, channels: pairChannels,
+          factor: weightLength(sample.pairTransition, "transition2") / (pairChannels * pairChannels),
+          chunkRows: pipelines.transitionSplit.chunkRows,
+          precision: pipelines.transitionSplit.storage,
+          offsets: packTransitionWeights(sample.pairTransition).offsets,
+          scratch,
+          label: "af3-msa.transition",
+        }, keep);
+      const biasBuffer = keep(this.allocator.allocate(
+        "af3-msa.bias", (pipelines.gridBiasElements ?? gridHeads * pairs) * 4, storage));
+      const reuseScratch = (slot, bytes, label) => (slot !== undefined && slot.byteLength >= bytes
+        ? { buffer: slot.buffer, byteOffset: slot.byteOffset ?? 0, byteSize: bytes }
+        : keep(this.allocator.allocate(label, bytes, storage)));
+      // Pair-track scratch[1..3] and biasBuffer are idle during outerProduct() and updateMsa(),
+      // and scratch[0] is idle during updateMsa(), so alias them whenever their byteLength suffices.
+      const left = reuseScratch(scratch[2], rows * outerChannels * 4, "af3-msa.left");
+      const right = reuseScratch(scratch[3], rows * outerChannels * 4, "af3-msa.right");
+      // ...the outer product's denominator, computed once per pass rather than
+      // carried through its contraction; see outer-product-mean.js.
+      const opmCounts = reuseScratch(biasBuffer, pairs * 4, "af3-msa.opm-counts");
+      // ...and the two-GEMM contraction's [pair][cell] intermediate, a block of
+      // whole rows of i at a time, with one pair of uniforms per block.
+      let opmVector;
+      if (useOpmVector) {
+        const cells = outerChannels * outerChannels;
+        const blockPairs = af3OpmVectorBlockPairs(n, outerChannels, OPM_VECTOR_BYTES);
+        const blockRows = blockPairs / n;
+        const intermediate = reuseScratch(
+          scratch[1], blockPairs * cells * 4, "af3-msa.opm-outer");
+        const steps = [];
+        for (let i0 = 0; i0 < n; i0 += blockRows) {
+          const count = Math.min(blockRows, n - i0);
+          steps.push({
+            count,
+            contract: keep(this.allocator.upload(`af3-msa.opm-p-contract-${i0}`,
+              new Uint32Array([count * outerChannels, sequences, n * outerChannels,
+                               i0 * outerChannels, 0, 0, n, 0]), GPUBufferUsage.UNIFORM)),
+            output: keep(this.allocator.upload(`af3-msa.opm-p-output-${i0}`,
+              new Uint32Array([count * n, cells, pairChannels, opmOffsets.outputW,
+                               opmOffsets.outputB, 0, i0 * n, 0]), GPUBufferUsage.UNIFORM)),
+          });
+        }
+        opmVector = { intermediate, steps };
+      }
+      const keyMask = keep(this.allocator.allocate("af3-msa.key-mask", n * 4, storage));
+      const attention = reuseScratch(scratch[1], msaHeads * pairs * 4, "af3-msa.attention");
+      const msaScratchBytes = rows * Math.max(msaWidth, msaChannels) * 4;
+      const msaSlots = [scratch[0], scratch[2], scratch[3]];
+      const msaScratch = [];
+      for (let index = 0; index < 3; index += 1) {
+        msaScratch.push(reuseScratch(
+          msaSlots[index], msaScratchBytes, `af3-msa.msa-scratch${index}`));
+      }
+
+
+      const start = performance.now();
+      for (let index = 0; index < blocks.length; index += 1) {
+        await this.#encodeBlock({
+          blockIndex: index,
+          // ...the pair track skipped on the LAST block only, so `--stop-after-opm`
+          // with one block is that block's first half and with four is three
+          // whole blocks plus the fourth's first half.
+          stopAfterOpm: options.stopAfterOpm === true && index === blocks.length - 1,
+          block: blocks[index], n, sequences, rows, pairs, msaChannels, msaHeads, gridHeads,
+          pairChannels, outerChannels, msaUpdateBeforeOuterProduct, pairWeightPrecision,
+          pipelines, storage, pair, msa, pairMask, msaMask, scratch, biasBuffer,
+          left, right, opmCounts, opmVector, keyMask, attention, msaScratch, gridProjectMatrix,
+          transitionSplit, validation: onDevice ? options.validation : undefined,
+        });
+        options.onBlock?.(index);
+      }
+      const releaseScratch = () => {
+        for (const allocation of [
+          ...scratch, ...msaScratch, biasBuffer, attention, left, right,
+          opmCounts, opmVector?.intermediate, keyMask,
+          transitionSplit?.normalized, transitionSplit?.wide,
+        ]) {
+          allocation?.release?.();
+        }
+      };
+      if (onDevice) {
+        // Released on queue ordering, as the pairformer releases its own.
+        releaseScratch();
+        return { elapsedMilliseconds: performance.now() - start,
+                 memory: this.allocator.snapshot() };
+      }
+
+      // 🔴 THE READBACKS COME AFTER THE SCRATCH GOES, NOT BEFORE THE LOOP.
+      // They are written once, by the copy below, and a pair-sized MAP_READ
+      // buffer standing beside six pair-sized scratch tensors for the whole
+      // stack is 19.5 MiB at 200 tokens of the peak this stage HOLDS. The
+      // drain is free here: the mapAsync two lines down is one anyway.
+      await this.device.queue.onSubmittedWorkDone();
+      releaseScratch();
+      const readbackPair = keep(this.allocator.allocate(
+        "af3-msa.readback-pair", pairs * pairChannels * 4,
+        GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
+      const readbackMsa = keep(this.allocator.allocate(
+        "af3-msa.readback-msa", rows * msaChannels * 4,
+        GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
+
+      const encoder = this.device.createCommandEncoder({ label: "af3-msa.readback" });
+      encoder.copyBufferToBuffer(pair.buffer, 0, readbackPair.buffer, 0, pairs * pairChannels * 4);
+      encoder.copyBufferToBuffer(msa.buffer, 0, readbackMsa.buffer, 0, rows * msaChannels * 4);
+      this.device.queue.submit([encoder.finish()]);
+      await readbackPair.buffer.mapAsync(GPUMapMode.READ);
+      const outPair = new Float32Array(readbackPair.buffer.getMappedRange().slice(0));
+      readbackPair.buffer.unmap();
+      await readbackMsa.buffer.mapAsync(GPUMapMode.READ);
+      const outMsa = new Float32Array(readbackMsa.buffer.getMappedRange().slice(0));
+      readbackMsa.buffer.unmap();
+
+      return {
+        pair: outPair, msa: outMsa,
+        elapsedMilliseconds: performance.now() - start,
+        memory: this.allocator.snapshot(),
+      };
+    } finally {
+      for (let index = allocations.length - 1; index >= 0; index -= 1) allocations[index].release();
+    }
+  }
+
+  async #encodeBlock(context) {
+    const { block, n, sequences, rows, pairs, msaChannels, msaHeads, gridHeads } = context;
+    const { pairChannels } = context;
+    const { pipelines, storage, pair, msa, pairMask, msaMask, scratch, biasBuffer } = context;
+    const { left, right, opmCounts, opmVector, keyMask, attention, msaScratch } = context;
+    const { gridProjectMatrix, transitionSplit } = context;
+
+    const blockAllocations = [];
+    const upload = (label, data) => {
+      const allocation = this.allocator.upload(label, data, storage);
+      blockAllocations.push(allocation);
+      return allocation;
+    };
+    // 🔴 PACKED ON DEMAND AND UPLOADED ONCE, EVER, which the pairformer beside
+    // this has done for a long time and this stack had not. It is four blocks
+    // rather than forty-eight, and the pair-track pack alone is about 10 ms of
+    // host time a block at AF3's width and more at OpenDDE's - on every pass of
+    // every recycle, over weights that never change. See the note in
+    // webgpu/af3/trunk/pairformer-block.js for why residency is a trade the
+    // BUDGET answers rather than a choice made in advance.
+    const resident = this.residentWeights
+      ? (label, key, pack, variant) => ({
+        buffer: residentWeightBuffer(this.device, key, label, pack, variant),
+      })
+      : (label, key, pack) => upload(label, pack());
+    // Lazily, and not held: residentWeightBuffer calls pack() only on a miss.
+    // The four the device can pack itself; see webgpu/af3/weights/pair-track-device-weights.js
+    // for why a transpose and an interleave could not go the contiguous way.
+    const onDevice = await residentPairTrackOnDevice(this.device, block, {
+      channels: pairChannels, pairWeightPrecision: context.pairWeightPrecision,
+      resident: this.residentWeights,
+    });
+    let packedPair;
+    const w = context.pairWeightPrecision;
+    const pairTransitionOnDevice = this.residentWeights
+      ? await residentPackedOnDevice(this.device, {
+          key: block.pairTransition, label: "w.pair-transition",
+          order: TRANSITION_ORDER, weights: block.pairTransition, variant: w,
+          destination: w === "f16" ? "f16" : "f32",
+        }).then((buffer) => (buffer === undefined ? undefined : { buffer }))
+      : undefined;
+    // ...and asked BEFORE the pack, because `packPairTrackWeights` builds all
+    // five from one call: a caller that stopped binding one was still paying to
+    // build it. See webgpu/af3/weights/pair-track-device-weights.js.
+    const want = { ...onDevice.want, transition: pairTransitionOnDevice === undefined };
+    const packedFor = () => (packedPair ??= packPairTrackWeights(
+      block, pairChannels, context.pairWeightPrecision, true, "blocked", want));
+    const pairTrackWeights = {
+      outgoing: onDevice.buffers.outgoing
+        ?? resident("w.tri.out", block, () => packedFor().outgoing, w),
+      incoming: onDevice.buffers.incoming
+        ?? resident("w.tri.in", block, () => packedFor().incoming, w),
+      grid1: onDevice.buffers.grid1 ?? resident("w.grid1", block, () => packedFor().grid1),
+      grid2: onDevice.buffers.grid2 ?? resident("w.grid2", block, () => packedFor().grid2),
+      // 🔴 THE ONE PAIR-TRACK TENSOR THE CONTIGUOUS DECODER CAN TAKE, and the
+      // pairformer has taken it for a while. This stack had not: measured with
+      // `residentPackStats`, `w.pair-transition` is 56 calls and 92 ms of an
+      // AF3 fold and 12 calls and 130 ms of an OpenDDE one, and four of those
+      // calls are this loop.
+      transition: pairTransitionOnDevice
+        ?? resident("w.pair-transition", block, () => packedFor().transition, w),
+    };
+    const opmWeights = resident("w.opm", block,
+      () => packOuterProductMeanWeights(block.outerProductMean).data);
+    const attentionWeights = resident("w.msa-attn", block,
+      () => packMsaAttentionWeights(block.msaAttention1).data);
+    const msaTransitionWeights = resident("w.msa-transition", block,
+      () => packTransitionWeights(block.msaTransition).data);
+
+    if (context.validation !== undefined) context.validation.begin();
+    else this.device.pushErrorScope("validation");
+    const encoder = this.device.createCommandEncoder({ label: "af3-msa-block" });
+    const batchPasses = deviceTuning(this.device).batchComputePasses !== false;
+    let openPass = null;
+    const endPass = () => { if (openPass !== null) { openPass.end(); openPass = null; } };
+    const run = (label, pipeline, buffers, x, y = 1, z = 1) => {
+      const pass = batchPasses
+        ? (openPass ??= encoder.beginComputePass({ label: `${label.split(".")[0]}.block` }))
+        : encoder.beginComputePass({ label });
+      pass.setPipeline(pipeline);
+      pass.setBindGroup(0, this.device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        // 🔴 byteOffset AND byteSize ARE HONOURED, as they are in the other two
+        // stacks that encode this track. Dropping them binds the WHOLE buffer
+        // where the caller asked for a range, which is silent: every index the
+        // shader forms is then relative to the wrong base. The split pair
+        // transition binds the pair at a row offset per chunk and is the first
+        // caller here to need it; the inconsistency predates it.
+        entries: buffers.map((allocation, binding) => ({
+          binding,
+          resource: allocation.byteOffset === undefined
+            ? { buffer: allocation.buffer }
+            : { buffer: allocation.buffer,
+                offset: allocation.byteOffset, size: allocation.byteSize },
+        })),
+      }));
+      pass.dispatchWorkgroups(x, y, z);
+      if (!batchPasses) pass.end();
+    };
+    const spread = (groups) => [Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH)];
+    const ceil = (value, divisor) => Math.ceil(value / divisor);
+
+    // 🔴 THE TWO HALVES OF AN MSA BLOCK, AND WHICH RUNS FIRST IS THE MODEL.
+    // AlphaFold 3 takes the outer product off the PRE-update MSA and then
+    // updates the rows against the pair that outer product just changed;
+    // OpenDDE updates the rows FIRST and feeds the UPDATED MSA to the outer
+    // product (upstream's `MSABlock.forward`, gated as
+    // `msaUpdateBeforeOuterProduct`). Neither ordering changes a shape and both
+    // produce a plausible representation, so nothing but this flag distinguishes
+    // them - and the difference compounds over every block of every pass.
+    const outerProduct = () => {
+      const rowGroups = spread(ceil(rows, OPM_PROJECT_ROWS));
+      run("opm.project", pipelines["opm:project"],
+          [msa, msaMask, opmWeights, left, right], rowGroups[0], rowGroups[1]);
+      const countGroups = spread(ceil(pairs, 64));
+      run("opm.counts", pipelines["opm:counts"], [msaMask, opmCounts],
+          countGroups[0], countGroups[1]);
+      if (opmVector !== undefined) {
+        const { intermediate, steps } = opmVector;
+        for (const step of steps) {
+          run("opm.contract", pipelines.opmVecContract,
+              [left, right, step.contract, intermediate],
+              ceil(n * context.outerChannels, pipelines.opmVecBlock.columns),
+              ceil(step.count * context.outerChannels, pipelines.opmVecBlock.rows));
+          run("opm.output", pipelines.opmVecOutput,
+              [intermediate, opmWeights, step.output, pair, opmCounts],
+              ceil(pairChannels, pipelines.opmVecOutColumns), ceil(step.count * n, 64));
+        }
+      } else {
+        const perBlock = spread(pipelines.opmBlocks);
+        run("opm.contract", pipelines["opm:contract"],
+            [left, right, opmCounts, opmWeights, scratch[0]], perBlock[0], perBlock[1]);
+        const addPairGroups = spread(ceil(pairs * pairChannels, 64));
+        run("opm.add", pipelines.addPair, [pair, scratch[0]], addPairGroups[0], addPairGroups[1]);
+      }
+    };
+
+    // The row update: the pair-weighted average, then the transition. Upstream
+    // keeps the transition inside `_msa_update`, so it moves with it.
+    const updateMsa = () => {
+      const addMsaGroups = spread(ceil(rows * msaChannels, 64));
+      if (!context.blockIndex) {
+        run("msa.key-mask", pipelines["msa:keyMask"], [msaMask, keyMask], ceil(n, 64));
+      }
+      const logitGroups = spread(ceil(n * n, 64));
+      run("msa.attention-logits", pipelines["msa:attentionLogits"],
+          [pair, keyMask, attentionWeights, attention], logitGroups[0], logitGroups[1]);
+      const weightGroups = spread(msaHeads * n);
+      run("msa.attention-weights", pipelines["msa:attentionWeights"],
+          [attention], weightGroups[0], weightGroups[1]);
+      const perRow = spread(rows);
+      // ...one workgroup a row now; see the note on the kernel.
+      const perProjectTile = spread(ceil(rows, msaProjectRows(this.device, msaChannels)));
+      run("msa.project", pipelines["msa:project"],
+          [msa, attentionWeights, msaScratch[0], msaScratch[1]], perProjectTile[0], perProjectTile[1]);
+      const perAverageTile = spread(sequences * ceil(n, msaAverageRows(this.device)));
+      run("msa.average", pipelines["msa:average"],
+          [attention, msaScratch[0], msaScratch[1], attentionWeights, msaScratch[2]],
+          perAverageTile[0], perAverageTile[1]);
+      run("msa.add", pipelines.addMsa, [msa, msaScratch[2]], addMsaGroups[0], addMsaGroups[1]);
+
+      const perTransition = spread(ceil(rows, transitionRowTile(rows, msaChannels)));
+      run("msa-transition", pipelines.msaTransition, [msa, msaTransitionWeights, msaScratch[0]],
+          perTransition[0], perTransition[1]);
+      run("msa-transition.add", pipelines.addMsa, [msa, msaScratch[0]],
+          addMsaGroups[0], addMsaGroups[1]);
+    };
+
+    if (context.msaUpdateBeforeOuterProduct) {
+      updateMsa();
+      outerProduct();
+    } else {
+      outerProduct();
+      updateMsa();
+    }
+
+    // 🔴 THE PAIR AFTER THE MSA UPDATE AND THE OUTER PRODUCT, BEFORE THE PAIR
+    // TRACK. `z_after_msa` is the whole stack, so a wrong OPM and a wrong
+    // triangle were the same number; the reference records the same seam under
+    // `msa_block_post_opm` (an io_callback tap, because inside layer_stack the
+    // value is a tracer).
+    // 🔴 A STOP POINT, NOT A READBACK. `stopAfterOpm` ends the stack here so
+    // the pair the loop already reads back IS this seam - the alternative is a
+    // mid-encode submit and a second MAP_READ buffer, for a diagnostic. The
+    // reference records the same point as `msa_block_post_opm` (an io_callback
+    // tap, because inside layer_stack the value is a tracer).
+    // 🔴 SKIP THE PAIR TRACK, NOT THE SUBMIT. Written as an early `return` this
+    // skipped `queue.submit` two lines below and threw the WHOLE block away -
+    // the OPM included - so the stopped pair came back identical to
+    // `z_after_template` and read as "our outer product mean contributes
+    // exactly zero". It matched the reference's own z_after_template-vs-post_opm
+    // distance to three digits, which is what made it convincing. The control
+    // that broke it: the same arm on the sequence path, where the MSA plainly
+    // works (pLDDT 87.3 with none against 94.9 with 128 rows) and the stopped
+    // pair was ALSO unchanged.
+    if (!context.stopAfterOpm) encodePairTrack({
+      run, pipelines, n, channels: pairChannels, gridHeads, pair, pairMask,
+      scratch, biasBuffer, gridProjectMatrix, transitionSplit,
+      weights: pairTrackWeights,
+    });
+
+    endPass();
+    this.device.queue.submit([encoder.finish()]);
+    // 🔴 A DRAIN PER BLOCK ONLY ON THE HOST PATH. Releasing the block's weights
+    // after the submit is safe on queue ordering - the pairformer has done it
+    // for as long as it has pipelined - and on the device path there is no
+    // readback for the drain to protect.
+    if (context.validation !== undefined) {
+      context.validation.end("msa block");
+      for (let index = blockAllocations.length - 1; index >= 0; index -= 1) {
+        blockAllocations[index].release();
+      }
+      return;
+    }
+    const error = await this.device.popErrorScope();
+    await this.device.queue.onSubmittedWorkDone();
+    for (let index = blockAllocations.length - 1; index >= 0; index -= 1) {
+      blockAllocations[index].release();
+    }
+    if (error !== null) throw new Error(`WebGPU validation failed: ${error.message}`);
+  }
+}
