@@ -326,7 +326,7 @@ def main():
                              " overlapped. The two used to be strictly"
                              " sequential.")
     parser.add_argument("--contact-ui", action="store_true",
-                        help="type a CONTACT row through the controls and fire"
+                        help="pick a BOND row through its controls and fire"
                              " the blur. \U0001f534 SAME REASON AS --smiles-ui,"
                              " and the same handler: the blur's final `else` is"
                              " `cleanSequence`, which keeps only amino-acid"
@@ -740,53 +740,46 @@ def main():
             # UI half passed and its fold died on "bond 1 to: no chain 1" - the
             # page right, the probe wrong. Chain B is a glycerol row added
             # first, and the contact names atoms the two chains have.
+            # 🔴 AND THE ROW IS PICKED NOW, NOT TYPED (web/link-builder.js): chain menus, residue numbers and atom
+            # boxes write the spec text. So this drives those controls and reads back the text they wrote - and
+            # still blurs, since a blur handler filtering the text is the bug this probe was written for.
             print("contact ui:", cdp.evaluate(ws, """(() => {
               const want = 'A12:CA - B1:C1';
-              // Re-queried after every mutation, never held: a type change and
-              // a blur both re-render the list, so an element captured before
-              // one is detached afterwards. See the note on --smiles-ui.
               const last = () => [...document.querySelectorAll('.entity-row')].pop();
-              document.getElementById('add-entity')?.click();
-              {
-                const select = last().querySelector('.entity-type');
-                select.value = 'ligand';
-                select.dispatchEvent(new Event('change', { bubbles: true }));
-                const box = last().querySelector('textarea.entity-value, input.entity-value');
-                box.value = 'GOL';
-                box.dispatchEvent(new Event('input', { bubbles: true }));
-                box.dispatchEvent(new Event('blur', { bubbles: true }));
-              }
-              document.getElementById('add-entity')?.click();
               const setType = (value) => {
                 const select = last().querySelector('.entity-type');
                 select.value = value;
                 select.dispatchEvent(new Event('change', { bubbles: true }));
               };
-              const typeInto = (text) => {
-                const box = last().querySelector('textarea.entity-value, input.entity-value');
-                box.value = text;
-                box.dispatchEvent(new Event('input', { bubbles: true }));
-                box.dispatchEvent(new Event('blur', { bubbles: true }));
+              const fire = (el, value, kind) => {
+                el.value = value;
+                el.dispatchEvent(new Event(kind, { bubbles: true }));
+                el.dispatchEvent(new Event('blur', { bubbles: true }));
               };
-              const offered = [...last().querySelector('.entity-type').options]
-                .map((o) => o.value);
-              setType('contact');
+              document.getElementById('add-entity')?.click();
+              setType('ligand');
+              fire(last().querySelector('input.entity-value'), 'GOL', 'input');
+              document.getElementById('add-entity')?.click();
+              const offered = [...last().querySelector('.entity-type').options].map((o) => o.value);
+              setType('bond');
               const label = [...last().querySelector('.entity-type').options]
-                .find((o) => o.value === 'contact')?.textContent;
-              typeInto(want);
-              const box = last()
-                .querySelector('textarea.entity-value, input.entity-value');
+                .find((o) => o.value === 'bond')?.textContent;
+              const chainMenus = [...last().querySelectorAll('.link-chain')];
+              chainMenus.forEach((m) => m.dispatchEvent(new Event('focus')));
+              const menuLetters = [...chainMenus[0].options].map((o) => o.value);
+              fire(chainMenus[0], 'A', 'change');
+              fire(chainMenus[1], 'B', 'change');
+              const residues = [...last().querySelectorAll('.link-residue')];
+              const atoms = [...last().querySelectorAll('.link-atom')];
+              fire(residues[0], '12', 'input');
+              fire(atoms[0], 'CA', 'input');
+              fire(atoms[1], 'C1', 'input');
               const stored = window.__entityList.read().pop();
               return JSON.stringify({
-                offered: offered.includes('contact'), label,
-                tag: box.tagName, placeholder: box.placeholder,
-                // 🔴 UPPERCASING WOULD ALSO BE A FILTER. `.entity-value-ligand`
-                // is `text-transform: uppercase` in CSS, so borrowing that
-                // class would DISPLAY a contact differently from what it holds.
-                transform: getComputedStyle(box).textTransform,
-                typed: want, stored: stored.value,
-                kept: stored.value === want,
-                shownInBox: box.value === want,
+                offered: offered.includes('bond'), label, menuLetters,
+                ligandResidueTaken: residues[1].value === '1',
+                residueName: last().querySelector('.link-residue-name')?.textContent,
+                typed: want, stored: stored.value, kept: stored.value === want,
               });
             })()"""))
 

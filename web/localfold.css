@@ -559,6 +559,28 @@
    so the menu takes the width the sequence would have had. */
 /* A ligand takes no template, so its row keeps five tracks. */
 .entity-row-ligand { grid-template-columns: auto auto minmax(0, 1fr) 9ch auto; }
+/* A bond, contact, pocket or crosslink row is picked rather than typed (web/link-builder.js): chain menus, residue
+   numbers, an atom and a distance, wrapping inside the one field cell when the row is narrow. */
+.entity-link {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 8px;
+  min-width: 0;
+}
+.entity-link .link-end { display: inline-flex; align-items: center; gap: 4px; min-width: 0; }
+.entity-link .entity-picker { max-width: 16ch; text-overflow: ellipsis; }
+.entity-link .entity-value { height: 34px; padding: 4px 6px; }
+.entity-link .link-residue { width: 6ch; }
+.entity-link .link-atom { width: 6ch; text-transform: uppercase; }
+.entity-link .link-atom::placeholder { text-transform: none; }
+.entity-link .link-distance { width: 6ch; }
+.entity-link .link-residue-past { color: #b91c1c; }
+/* a bond or constraint is one thing, so its copies box would only invite a number nothing reads */
+.entity-row-link > .entity-copies { visibility: hidden; }
+.entity-link .link-residues { flex: 1 1 16ch; min-width: 12ch; }
+.entity-link .link-residue-name { min-width: 3ch; color: #6b7280; font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
+.entity-link .link-word { color: #6b7280; font-size: 13px; }
 .entity-picker {
   box-sizing: border-box;
   min-width: 0;
@@ -873,6 +895,7 @@
      five characters and stays on the first line - it is its PICKER, the menu of
      common codes, that needs the width. */
   .entity-row > .entity-field,
+  .entity-row > .entity-link,
   .entity-row > .entity-value:not(.entity-value-ligand),
   .entity-row > .entity-picker { order: 1; flex: 1 0 100%; min-width: 0; }
   .entity-row > .entity-value-ligand { flex: 0 0 9ch; }

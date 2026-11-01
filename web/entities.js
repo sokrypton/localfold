@@ -296,6 +296,48 @@ export const COMMON_MODIFICATIONS = [
   { code: "PCA", parent: "E", name: "pyroglutamate" },
 ];
 
+/** A chain's letter from its 0-based asym number: A..Z, then AA, AB - the inverse of `letterAsym` in expandEntities. */
+export function chainLetter(asym) {
+  let letter = "";
+  for (let n = asym + 1; n > 0; n = Math.floor((n - 1) / 26)) letter = String.fromCharCode(65 + ((n - 1) % 26)) + letter;
+  return letter;
+}
+
+/**
+ * The chains the rows will fold, lettered as expandEntities letters them: every polymer copy first, in row order, then
+ * every ligand copy. What the bond, contact, pocket and crosslink pickers offer.
+ *
+ * @returns {{letter: string, kind: string, residues: string[], name: string}[]} `residues` one letter (a polymer) or
+ *   one CCD code (a ligand) a residue; a SMILES ligand is one residue named by its row
+ */
+export function rowChains(entities) {
+  const polymers = [];
+  const ligands = [];
+  for (const entity of entities) {
+    if (!isChainEntity(entity)) continue;
+    const copies = Number.isInteger(entity.copies) && entity.copies > 0 ? entity.copies : 1;
+    for (let copy = 0; copy < copies; copy += 1) {
+      if (POLYMER_TYPES.includes(entity.type)) {
+        polymers.push({ kind: entity.type, residues: [...cleanSequence(entity.value)] });
+      } else if (entity.type === "smiles") {
+        ligands.push({ kind: "smiles", residues: ["LIG"] });
+      } else {
+        const codes = entity.value.trim().toUpperCase().split(",").map((code) => code.trim()).filter(Boolean);
+        ligands.push({ kind: "ligand", residues: codes.length === 0 ? ["?"] : codes });
+      }
+    }
+  }
+  return [...polymers, ...ligands].map((chain, asym) => {
+    const n = chain.residues.length;
+    const name = POLYMER_TYPES.includes(chain.kind)
+      ? `${ENTITY_LABELS[chain.kind]}, ${n} residue${n === 1 ? "" : "s"}`
+      : chain.kind === "smiles" ? "SMILES ligand" : chain.residues.join("-");
+    const short = POLYMER_TYPES.includes(chain.kind) ? `${chain.kind === "protein" ? "prot" : chain.kind.toUpperCase()} ${n}`
+      : chain.kind === "smiles" ? "SMILES" : chain.residues.join("-");
+    return { letter: chainLetter(asym), ...chain, name, short };
+  });
+}
+
 /** A fresh entity of the given type, as `+ Add entity` makes one. */
 export function newEntity(type = "protein") {
   return { type, value: "", copies: 1, modifications: [] };

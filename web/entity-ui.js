@@ -20,6 +20,7 @@ import { COMMON_IONS, COMMON_LIGANDS, COMMON_MODIFICATIONS, ENTITY_LABELS, ENTIT
   newEntity, templateAsked, templateKind, templateProblem } from "./entities.js";
 import { cleanSequence, cleanSequenceMap, extractFastaHeader } from "./sequence.js";
 import { fetchStructure, parseSource, structureChains } from "./template-source.js";
+import { LINK_TYPES, buildLinkField } from "./link-builder.js";
 
 /** What a fetched template says once fetched: the chain a fold will take, and the rest. */
 function fetchedStatus(template) {
@@ -982,7 +983,12 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
     // The mirror goes in a box with the textarea so the two share one grid
     // cell and one set of metrics.
     let field = value;
-    if (mirror !== null) {
+    // 🔴 A BOND, CONTACT, POCKET OR CROSSLINK IS PICKED, NOT TYPED: chain menus, residue numbers, an atom and a
+    // distance, which write the same spec text the box took (web/link-builder.js). Nobody remembers `A12:SG - B1:C25`.
+    if (LINK_TYPES.includes(entity.type)) {
+      field = buildLinkField(entity, () => entities, notify);
+      wrapper.classList.add("entity-row-link");
+    } else if (mirror !== null) {
       field = document.createElement("div");
       field.className = "entity-field";
       field.append(mirror, value);
@@ -1034,8 +1040,9 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
       // when an alignment's own query replaces the chain list, and filtering
       // on `type === "ligand"` DELETED a SMILES row - so folding with an A3M
       // silently dropped the ligand and folded the protein alone.
-      const ligands = entities.filter(
-        (entity) => entity.type === "ligand" || entity.type === "smiles");
+      // ...and a bond, contact, pocket or crosslink row survives too, after the chains, for the same reason.
+      const ligands = entities.filter((entity) => entity.type === "ligand" || entity.type === "smiles"
+        || LINK_TYPES.includes(entity.type));
       const proteins = [];
       for (const chain of chains) {
         const existing = proteins.find((row) => row.value === chain);
