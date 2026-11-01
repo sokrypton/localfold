@@ -355,12 +355,16 @@ AI Context: STANDALONE WEB APP ENTRY POINT
               </div>
               <div class="fetch-option-group" id="bioemu2SamplesGroup" hidden>
                 <span class="fetch-option-title">Samples</span>
-                <select id="bioemu2-samples" title="How many structures to sample, all through one denoiser call a step; each is a frame of the play bar.">
+                <select id="bioemu2-samples" title="How many structures to sample, in batches of up to five through one trunk; each is a frame of the play bar, ordered along the ensemble's first principal component. Stop keeps the batches already finished.">
                   <option value="1" selected>1</option>
                   <option value="2">2</option>
                   <option value="3">3</option>
                   <option value="5">5</option>
                   <option value="8">8</option>
+                  <option value="10">10</option>
+                  <option value="25">25</option>
+                  <option value="50">50</option>
+                  <option value="100">100</option>
                 </select>
               </div>
               <div class="fetch-option-group" id="bioemu2PropagationGroup" hidden>
@@ -891,6 +895,13 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                          of bug that looks like it works. -->
                     <div id="heatmapContainer" class="container-box" style="display: none;">
                         <canvas id="heatmapCanvas" style="cursor: crosshair;"></canvas>
+                    </div>
+
+                    <!-- A BioEmu2 ENSEMBLE'S PCA, on py2Dmol's own scatter plot: one point a
+                         sample, the frame on screen highlighted, a click jumps to it. Hidden
+                         until a fold's frames carry points (showEnsembleScatter in web/app.js). -->
+                    <div id="scatterContainer" class="container-box" style="display: none; position: relative;">
+                        <canvas id="scatterCanvas" style="cursor: pointer;"></canvas>
                     </div>
 
                     <!-- THE RAW PREDICTION, under the confidence it describes.

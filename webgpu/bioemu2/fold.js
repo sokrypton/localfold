@@ -125,11 +125,35 @@ async function sampleMany({ denoise, setCompanion, mask, N, S, schedule, stepSca
 }
 
 /**
+ * The most samples one denoiser call carries. Five is the batch measured at 255 tokens (docs/BIOEMU2.md: 664 ms a
+ * call); an ensemble larger than that is several calls of the same compiled program.
+ */
+export const BIOEMU2_MAX_BATCH = 5;
+
+/**
+ * How `samples` split into denoiser batches of at most `maxBatch`: as few batches as fit, all the same size, so a
+ * batch never carries more than `batches - 1` samples nobody asked for (100 by 5 is 20 of 5; 12 by 5 is 3 of 4).
+ */
+export function bioemu2Batches(samples, maxBatch = BIOEMU2_MAX_BATCH) {
+  if (!(samples >= 1) || !(maxBatch >= 1)) throw new Error(`BioEmu2 batches need a positive count, got ${samples}/${maxBatch}`);
+  const batches = Math.ceil(samples / maxBatch);
+  return { batches, size: Math.ceil(samples / batches) };
+}
+
+/**
  * Fold one feature dict (shared/bioemu2/featurise.js's `features`).
  *
- * @param options `samples` (5), `steps` (200), `seed`, `mode` (the features' own; decides the step scale),
+ * 🔴 AN ENSEMBLE IS SAMPLED IN BATCHES, ONE TRUNK FOR ALL OF THEM. The denoiser is
+ * compiled for one batch (`bioemu2Batches`) and called batch after batch with the
+ * draws continuing, so a hundred samples cost a hundred samples' sampling and one
+ * trunk. `onSamples(frames, first)` hands each batch over as it lands, and a stop
+ * part-way through - an AbortError out of `onProgress` once a batch has finished -
+ * returns the finished batches with `stopped: true` rather than throwing them away.
+ *
+ * @param options `samples` (5), `batch` (the most a denoiser call carries, BIOEMU2_MAX_BATCH), `steps` (200),
+ *   `seed`, `mode` (the features' own; decides the step scale),
  *   `propagation`: {x0 (real atoms x 3, the featuriser's order), lagNs, steps}, `onProgress(stage, done, total)`,
- *   `half` / `trunkPrecision` (see Bioemu2Gpu)
+ *   `onSamples(frames, first)`, `half` / `trunkPrecision` (see Bioemu2Gpu)
  */
 export async function foldBioemu2(device, read, features, options = {}) {
   const f = features;
@@ -167,23 +191,24 @@ export async function foldBioemu2(device, read, features, options = {}) {
     const schedule = bioemu2Schedule(options.steps ?? BIOEMU2_SAMPLER.steps);
     const normal = normalFrom(options.seed ?? 1);
     const samples = options.samples ?? 5;
+    const { batches, size } = bioemu2Batches(samples, options.batch ?? BIOEMU2_MAX_BATCH);
     const frames = [];
     const dn = await clock("denoiser-compile", () => net.denoiserProgram(g, sIn, sTrunk, trunk.z, {
-      samples, ...(propagation ? { dt: propagation.lagNs * 1000, dynamics: true } : {}) }));
+      samples: size, ...(propagation ? { dt: propagation.lagNs * 1000, dynamics: true } : {}) }));
     net.ops.free(trunk.z, dn.context.z, g.tokenInts, g.atomToken);
     const t0 = performance.now();
     let calls = 0;
     const denoise = async (x, sigma) => { calls += 1; return dn.denoise(x, sigma); };
-    const total = (schedule.length - 1) * (propagation?.steps ?? 1);
+    const total = (schedule.length - 1) * (propagation?.steps ?? 1) * batches;
     let done = 0;
     const onStep = (k, steps, denoised) => { done += 1; return progress("diffusion", done, total, denoised); };
-    const common = { denoise, setCompanion: dn.setCompanion, mask, N, S: samples, schedule, stepScale, normal, onStep };
-    if (!propagation) {
-      for (const x of await sampleMany({ ...common, companions: null })) frames.push(centre(x, mask, N));
-    } else {
+    const common = { denoise, setCompanion: dn.setCompanion, mask, N, S: size, schedule, stepScale, normal, onStep };
+    // one batch: `size` samples, or `size` trajectories of `propagation.steps` frames each
+    const sampleBatch = async () => {
+      if (!propagation) return (await sampleMany({ ...common, companions: null })).map((x) => centre(x, mask, N));
       // each sample its own trajectory, chained: step k+1 starts from step k's endpoint, superposed on its start
-      let prev = Array.from({ length: samples }, () => { const x = new Float32Array(N * 3); x.set(propagation.x0); return x; });
-      const trajectories = Array.from({ length: samples }, () => []);
+      let prev = Array.from({ length: size }, () => { const x = new Float32Array(N * 3); x.set(propagation.x0); return x; });
+      const trajectories = Array.from({ length: size }, () => []);
       for (let k = 0; k < (propagation.steps ?? 1); k += 1) {
         const comps = prev.map((x) => centre(Float32Array.from(x), mask, N));
         const ends = await sampleMany({ ...common, companions: comps });
@@ -191,11 +216,28 @@ export async function foldBioemu2(device, read, features, options = {}) {
         prev.forEach((x, s) => trajectories[s].push(Float32Array.from(x)));
       }
       // sample i of the output is trajectory i // steps, step i % steps + 1, as af3-any-model lays them out
-      for (const trajectory of trajectories) frames.push(...trajectory);
+      return trajectories.flat();
+    };
+    const perSample = propagation?.steps ?? 1;
+    let stopped = false;
+    for (let batch = 0; batch < batches; batch += 1) {
+      let landed;
+      try {
+        landed = await sampleBatch();
+      } catch (error) {
+        if (error?.name !== "AbortError" || frames.length === 0) throw error;
+        stopped = true;
+        break;
+      }
+      // the last batch may carry samples nobody asked for (bioemu2Batches); they are dropped here
+      landed = landed.slice(0, (samples - batch * size) * perSample);
+      const first = frames.length;
+      frames.push(...landed);
+      await options.onSamples?.(landed, first);
     }
     timings.diffusion = Math.round(performance.now() - t0);
     return { samples: frames, contact, distogram: logits, tokens: g.T, atoms: N, liveAtoms: mask.reduce((a, b) => a + b, 0),
-             calls, timings, mode, stepScale,
+             calls, timings, mode, stepScale, stopped, batches, batchSize: size,
              deviceMiB: { activations: Math.round(net.ops.bytes / 1048576), weights: Math.round(net.ops.weightBytes / 1048576) } };
   } finally {
     if (owned) net.ops.destroyWeights();

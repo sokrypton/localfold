@@ -47,6 +47,7 @@ import { spreadOverAtoms, toDensePositions } from "../shared/esmfold2/featurise.
 import { toPdb } from "../webgpu/af3/fold.js";
 import { BIOEMU2_COUNTS, BIOEMU2_DEFAULT_STEPS, bioemu2Features, bioemu2Network, bioemu2ViewerTokens,
   loadBioemu2Weights, releaseBioemu2, x0FromPdb } from "./bioemu2-model.js";
+import { ensembleContacts, ensemblePca, orderAlongPc1, representativeAtoms } from "./bioemu2-ensemble.js";
 import { foldBioemu2 } from "../webgpu/bioemu2/fold.js";
 import { alphaCarbonSpacings, bioemu2Pdb } from "../shared/bioemu2/structure.js";
 import { BioEmu2Graph } from "../shared/bioemu2/graph.js";
@@ -3977,6 +3978,51 @@ function bioemu2Physicality(featurised, samples) {
  * equilibrium mode is the point - laid on the play bar as sample_1..5. The saved
  * structure is the first sample.
  */
+/**
+ * py2Dmol's scatter plot, for a BioEmu2 ensemble's PCA (web/bioemu2-ensemble.js). The plot is the
+ * viewer's own: one point a frame from `frame.scatter`, the current frame highlighted, a click
+ * jumps to it, and its slots give it a Scatter tab beside the maps for any object whose frames
+ * carry points. index.html supplies #scatterCanvas; this refreshes it, and `ask` puts it in the
+ * second slot - once a fold, so a reader who picks another tab keeps it.
+ */
+function showEnsembleScatter(renderer, ask) {
+  const canvas = document.getElementById("scatterCanvas");
+  if (canvas === null || window.ScatterPlotViewer === undefined) return;
+  // py2Dmol's own app attaches one when it loads a CSV; this page has no such path, so it attaches one
+  // here, sized first - the viewer reads its pixel scale off the canvas once, when it is made - and
+  // following its box after (parts/ui.js does the same for the embed)
+  if (!renderer.scatterRenderer) {
+    const box = canvas.parentElement;
+    const scale = Math.max(2, Math.min(window.devicePixelRatio || 1, 1.5) * 2);
+    const fit = (width, height) => {
+      canvas.width = Math.round(width * scale);
+      canvas.height = Math.round(height * scale);
+      canvas.style.width = `${width}px`;
+      canvas.style.height = `${height}px`;
+    };
+    const side = document.getElementById("heatmapContainer")?.clientWidth || 340;
+    fit(side, side);
+    renderer.setScatterRenderer(new window.ScatterPlotViewer(canvas, renderer));
+    if (window.ResizeObserver !== undefined) {
+      new ResizeObserver(([entry]) => {
+        const { width, height } = entry.contentRect;
+        if (width < 10 || height < 10) return;
+        if (Math.abs(width - parseFloat(canvas.style.width)) < 0.5 && Math.abs(height - parseFloat(canvas.style.height)) < 0.5) return;
+        fit(width, height);
+        renderer.scatterRenderer?.render(true);
+      }).observe(box);
+    }
+  }
+  renderer.updateScatterData?.();
+  renderer.updateScatterContainerVisibility?.();
+  if (!ask || typeof renderer.setSlots !== "function") return;
+  try {
+    renderer.setSlots([null, "scatter"]);
+  } catch (cause) {
+    console.warn("could not show the scatter plot", cause);
+  }
+}
+
 async function foldWithBioemu2({ chains, chainKinds, alignment, alignmentBlocks, signal, modelLoad, modifications }) {
   const family = "bioemu2";
   const modelName = MODEL_LABELS[family];
@@ -4038,9 +4084,13 @@ async function foldWithBioemu2({ chains, chainKinds, alignment, alignmentBlocks,
   let colouring = false;
   let liveContacts;
   const realAtoms = atomKeys.length;
-  // the first sample's denoised structure, every few steps, as the play bar's live frames
+  const reps = representativeAtoms(topology, tokens);
+  // every sample finished so far, in draw order; the play bar shows these once the first batch lands
+  const landed = [];
+  // the first sample's denoised structure, every few steps, as the play bar's live frames - until
+  // the first batch of samples lands, after which the play bar is the ensemble
   const drawLive = (denoised) => {
-    if (signal.aborted || api?.frameFromText === undefined) return;
+    if (signal.aborted || landed.length > 0 || api?.frameFromText === undefined) return;
     const registry = window.py2dmol_viewers ?? {};
     const renderer = registry[Object.keys(registry)[0]]?.renderer;
     const object = renderer?.objectsData?.[renderer?.currentObjectName];
@@ -4058,8 +4108,56 @@ async function foldWithBioemu2({ chains, chainKinds, alignment, alignmentBlocks,
     }
   };
   const every = Math.max(1, Math.round(steps / 20));
+  const perSample = propagation?.steps ?? 1;
+  // each batch's samples join the play bar as they land, and the PCA and contact frequency follow
+  const onSamples = (frames) => {
+    if (signal.aborted || api?.frameFromText === undefined) return;
+    const registry = window.py2dmol_viewers ?? {};
+    const renderer = registry[Object.keys(registry)[0]]?.renderer;
+    const object = renderer?.objectsData?.[renderer?.currentObjectName];
+    if (renderer === undefined || object === undefined) return;
+    try {
+      if (landed.length === 0) object.frames.length = 0;
+      for (const x of frames) {
+        const frame = api.frameFromText(bioemu2Pdb(atomKeys, topology, x.subarray(0, realAtoms * 3)));
+        frame.name = frame.label = frame.title = sampleLabel(landed.length);
+        landed.push(x);
+        renderer.addFrame(frame, renderer.currentObjectName);
+      }
+      showEnsemble(renderer, object, landed.map((_, at) => at));
+      renderer.setFrame(object.frames.length - 1);
+      if (!colouring) { colouring = setColourMode("chain"); orientBestView(renderer); }
+    } catch (cause) {
+      console.warn("ensemble frames skipped:", cause);
+    }
+  };
+  let scatterAsked = false;
+  const sampleLabel = (at) => (propagation
+    ? `trajectory_${Math.floor(at / propagation.steps) + 1}_step_${(at % propagation.steps) + 1}`
+    : `sample_${at + 1}`);
+  // the PCA on py2Dmol's scatter plot and the contact frequency on every frame, for frames holding
+  // the samples `order` names (draw-order indices into `landed`)
+  const showEnsemble = (renderer, object, order) => {
+    if (propagation !== null && propagation !== undefined) return;
+    const coords = order.map((at) => landed[at]);
+    const frequency = coords.length > 1 ? contactMapFor(ensembleContacts(coords, reps), keep) : undefined;
+    const pca = ensemblePca(coords, reps);
+    object.frames.forEach((frame, i) => {
+      if (frequency !== undefined) frame.maps = { ...frame.maps, contact: frequency };
+      if (pca !== null) frame.scatter = pca.scores[i];
+    });
+    if (frequency !== undefined) showTrunkContacts(frequency, chains);
+    if (pca !== null) {
+      const percent = (share) => `${Math.round(share * 100)}%`;
+      object.scatterConfig = { xlabel: `PC1 (${percent(pca.explained[0])})`, ylabel: `PC2 (${percent(pca.explained[1])})`,
+        xlim: null, ylim: null };
+      showEnsembleScatter(renderer, !scatterAsked);
+      scatterAsked = true;
+    }
+    return pca;
+  };
   const result = await foldBioemu2(device, loaded.read, features, {
-    network, samples, steps, seed: randomSeed(), mode, propagation, passes: recycleCount() + 1,
+    network, samples, steps, seed: randomSeed(), mode, propagation, passes: recycleCount() + 1, onSamples,
     // the distogram's contact map exists before any structure does, and is shown as the trunk's is
     onContacts: (contact) => {
       if (signal.aborted) return;
@@ -4078,9 +4176,16 @@ async function foldWithBioemu2({ chains, chainKinds, alignment, alignmentBlocks,
       if (denoised !== undefined && (done % every === 0 || done === total)) drawLive(denoised);
     },
   });
-  throwIfAborted(signal);
+  // 🔴 A STOP PART-WAY THROUGH AN ENSEMBLE KEEPS THE BATCHES THAT FINISHED (foldBioemu2's `stopped`)
+  if (!result.stopped) throwIfAborted(signal);
   const contactMap = contactMapFor(result.contact, keep);
-  const pdbs = result.samples.map((x) => bioemu2Pdb(atomKeys, topology, x.subarray(0, realAtoms * 3)));
+  // the play bar in PC1 order, so playing it sweeps across the distribution; a propagation's
+  // trajectories keep their own order, which is time
+  const drawOrder = result.samples.map((_, at) => at);
+  const order = propagation ? drawOrder
+    : orderAlongPc1(result.samples.length >= 3 ? ensemblePca(result.samples, reps) : null, result.samples.length);
+  const ordered = order.map((at) => result.samples[at]);
+  const pdbs = ordered.map((x) => bioemu2Pdb(atomKeys, topology, x.subarray(0, realAtoms * 3)));
   const sequence = chains.join("");
   const scores = { sequence, contact_probs: paeMatrix(result.contact, tokens) };
   const registry = window.py2dmol_viewers ?? {};
@@ -4093,9 +4198,8 @@ async function foldWithBioemu2({ chains, chainKinds, alignment, alignmentBlocks,
     Object.assign(viewer.viewerState, camera);
     viewer.render?.("localfold.restore-camera");
   }
-  const label = (at) => (propagation
-    ? `trajectory_${Math.floor(at / propagation.steps) + 1}_step_${(at % propagation.steps) + 1}`
-    : `sample_${at + 1}`);
+  // a frame keeps the name it had while sampling, so sample_7 is the seventh drawn wherever PC1 puts it
+  const label = (at) => sampleLabel(order[at]);
   if (api?.frameFromText !== undefined && viewer !== undefined) {
     const object = viewer.objectsData?.[viewerObject];
     const first = object?.frames?.[0];
@@ -4108,12 +4212,15 @@ async function foldWithBioemu2({ chains, chainKinds, alignment, alignmentBlocks,
       frame.name = frame.label = frame.title = label(index + 1);
       viewer.addFrame(frame, viewerObject);
     }
+    landed.length = 0;
+    landed.push(...result.samples);
+    if (object !== undefined) showEnsemble(viewer, object, order);
     forcePlddtColours(false);
     viewer.setFrame(0);
     viewer.render("bioemu2-final");
   }
   // 🔴 BioEmu2's OWN PHYSICALITY REPORT, per sample, in place of a confidence (bioemu2Physicality)
-  const { report: physicality, line: physicalityLine } = bioemu2Physicality(featurised, result.samples);
+  const { report: physicality, line: physicalityLine } = bioemu2Physicality(featurised, ordered);
   updateScoresCard({ none: true, label: `No confidence head${physicalityLine}` });
   recordPrediction({
     stem, pdb: pdbs[0], chains, confidence: undefined, scores: JSON.stringify(scores, null, 2),
@@ -4123,23 +4230,25 @@ async function foldWithBioemu2({ chains, chainKinds, alignment, alignmentBlocks,
     tokens: tokenLayoutFrom(features.asym_id, features.residue_index),
     ...foldContext,
     settings: {
-      seed: foldContext.settings?.seed, mode: choice, samples, "diffusion steps": steps,
+      seed: foldContext.settings?.seed, mode: choice, samples: result.samples.length / perSample, "diffusion steps": steps,
       "trunk passes": recycleCount() + 1, ...(propagation ? { "lag (ns)": propagation.lagNs, "propagation steps": propagation.steps } : {}),
       ...(contacts === "" ? {} : { contacts }),
       ...(physicality.length === 0 ? {} : { physicality: physicality.map((one) => (one.ok ? "passed" : `rejected: ${one.reason}`)) }),
     },
   }, family);
   void rememberSessionWhenSettled(lastPrediction);
-  lastBioemu2 = { key: JSON.stringify(atomKeys), coords: result.samples[0].subarray(0, realAtoms * 3), pdb: pdbs[0] };
+  lastBioemu2 = { key: JSON.stringify(atomKeys), coords: ordered[0].subarray(0, realAtoms * 3), pdb: pdbs[0] };
   // the chain gate the CLI tools assert, as a warning here (shared/af3/chain-geometry.js)
-  const geometry = chainGeometryOf(alphaCarbonSpacings(atomKeys, topology, result.samples[0]).spacing);
+  const geometry = chainGeometryOf(alphaCarbonSpacings(atomKeys, topology, ordered[0]).spacing);
   const verdict = Number.isFinite(geometry.caca) ? chainGeometryVerdict(geometry) : { ok: true };
   const seconds = ((performance.now() - started) / 1000).toFixed(1);
+  const sampled = result.samples.length / perSample;
   const residues = chains.reduce((total, chain) => total + chain.length, 0);
   const named = (modifications ?? []).map((one) => `${one.code}${one.position}`);
   status(`${modelName} · ${residues} res` + (named.length === 0 ? "" : ` + ${named.join(", ")}`)
     + ` · ${choice}` + (propagation ? ` ${propagation.lagNs} ns x ${propagation.steps}` : "")
-    + ` · ${samples} sample${samples === 1 ? "" : "s"} · ${steps} steps · ${seconds}s · no confidence head`
+    + ` · ${sampled === samples ? "" : `${sampled} of `}${samples} sample${samples === 1 ? "" : "s"}`
+    + (result.stopped ? " (stopped)" : "") + ` · ${steps} steps · ${seconds}s · no confidence head`
     + physicalityLine
     + (verdict.ok ? "" : " · NOT A CHAIN"));
   progress(null);
