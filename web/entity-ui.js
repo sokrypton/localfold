@@ -51,6 +51,11 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
   // to one page's markup. The caller answers; a caller that does not answer
   // gets the old behaviour, which is to assume it is fine.
   const msaIsSearch = options.msaIsSearch ?? (() => true);
+  // 🔴 WHAT THE CHOSEN MODEL CANNOT TAKE, ASKED THE SAME WAY: the page knows the model, so it answers - a sentence
+  // saying why for a row type the model does not read, null for one it does. A type it refuses is left out of the
+  // menu of a row that does not hold it, and a row that already holds it stays, greyed, with the sentence on it:
+  // dropping the row would lose what was typed, and the fold still refuses it by name (web/app.js).
+  const rowRefusal = options.rowRefusal ?? (() => null);
 
   /**
    * Everything the closed ⋮ button has to say about one entity.
@@ -496,6 +501,8 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
       const option = document.createElement("option");
       option.value = value;
       option.textContent = ENTITY_LABELS[value];
+      // (hidden where the browser hides an option, and disabled where it does not)
+      if (value !== entity.type && rowRefusal(value) !== null) { option.hidden = true; option.disabled = true; }
       type.append(option);
     }
     type.value = entity.type;
@@ -643,7 +650,8 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
       const marked = new Set();
       // (folded, the rows keep their order with the modification rows taken out)
       const mine = foldModificationRows(entities)[entities.filter((one) => one.type !== "modification").indexOf(entity)];
-      for (const modification of mine?.modifications ?? []) {
+      // (none where the model takes no modifications: their rows are greyed, so the sequence is not marked either)
+      for (const modification of rowRefusal("modification") === null ? mine?.modifications ?? [] : []) {
         const offset = offsets[modification.position - 1];
         if (offset !== undefined) marked.add(offset);
       }
@@ -832,6 +840,12 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
                    ...(options === null ? [] : [options]), ...spacer, remove);
     paint();
     if (picker !== null) wrapper.classList.add("entity-row-ligand");
+    const refused = rowRefusal(entity.type);
+    if (refused !== null) {
+      wrapper.classList.add("entity-row-unsupported");
+      wrapper.title = refused;
+      type.title = refused;
+    }
     return wrapper;
   };
 
@@ -893,5 +907,7 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
       render();
     },
     header: () => pastedHeader,
+    /** Redraw, after the model changed: which types it takes is asked again (`options.rowRefusal`). */
+    refresh: () => render(),
   };
 }
