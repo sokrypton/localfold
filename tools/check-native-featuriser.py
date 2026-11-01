@@ -294,6 +294,10 @@ def cases():
         ("ef2-biotin-smiles", "ef2", job("t", [protein("A", SEQ_6MRR),
                                                     {"ligand": {"id": "B", "smiles": "OC(=O)CCCC[C@@H]1SC[C@@H]2NC(=O)N[C@H]12"}}]), [], EF),
         ("ef2-1brs-a3m", "ef2", job("t", [protein("A", brs_a), protein("D", brs_d)]), [f"--a3m={sa},{sd}"], EF),
+        # the page's Max MSA as an override of ESMFold2's own 16384 rows, and a value that is not a row count
+        ("ef2-1brs-a3m-max-msa", "ef2", job("t", [protein("A", brs_a), protein("D", brs_d)]),
+         [f"--a3m={sa},{sd}", "--max-msa=7"], EF),
+        ("ef2-max-msa-refused", "ef2", job("t", [protein("A", SEQ_6MRR)]), ["--max-msa=1.5"], EF),
     ]
     # BioEmu2 (cuda/bioemu2/export_input.mjs): its own featuriser (shared/bioemu2/featurise.js), the page's SMILES
     # templates and alignment split (shared/bioemu2/inputs.js)
@@ -313,6 +317,14 @@ def cases():
          [f"--propagate-from={BF}/6mrr-sample.cif", "--lag-ns=2.5", "--propagation-steps=3"], B),
         ("bioemu2-propagate-pdb", "bioemu2", os.path.join(BF, "6mrr.json"), [f"--propagate-from={BF}/6mrr-sample.pdb"], B),
         ("bioemu2-wrong-frame-refused", "bioemu2", os.path.join(BF, "6mrr-gol-sep.json"), [f"--propagate-from={BF}/6mrr-sample.pdb"], B),
+        # the page's Max MSA as an override of BioEmu2's own 4092 rows: the paired path and the unpaired one, and a
+        # value that is not a row count
+        ("bioemu2-a3m-per-chain-max-msa", "bioemu2", os.path.join(BF, "heteromer-nomsa.json"),
+         [f"--a3m={BF}/msa/u0.a3m,{BF}/msa/u1.a3m,{BF}/msa/u2.a3m", f"--paired-a3m={BF}/msa/p0.a3m,{BF}/msa/p1.a3m,{BF}/msa/p2.a3m",
+          "--max-msa=5"], B),
+        ("bioemu2-a3m-unpaired-max-msa", "bioemu2", os.path.join(BF, "heteromer-nomsa.json"),
+         [f"--a3m={BF}/msa/u0.a3m,{BF}/msa/u1.a3m,{BF}/msa/u2.a3m", "--max-msa=3"], B),
+        ("bioemu2-max-msa-refused", "bioemu2", os.path.join(BF, "6mrr.json"), ["--max-msa=0"], B),
     ]
     # ...and the steering potentials' tables (--steering: shared/bioemu2/steering-tables.js, the CCD's ligand half too),
     # over the stereochemistry the vendor ships (fetched once into ~/.cache/alphafold3/bioemu2)

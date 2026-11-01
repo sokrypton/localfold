@@ -4,7 +4,7 @@
 // it, and pdb.template - the page's PDB records with each atom's index where its coordinates go.
 //
 //   ef2-featurise <out dir> (--job=<AF3 job.json> | --sequence=<A:B> [--kinds= --ligands= --smiles= --modify=])
-//                      [--a3m=<one a protein chain>] [--fold-bundle=<dir>]
+//                      [--a3m=<one a protein chain>] [--fold-bundle=<dir>] [--max-msa=16384]
 #pragma once
 #include <cmath>
 #include <map>
@@ -284,7 +284,15 @@ inline Esmfold2Export exportEsmfold2(const Args& args) {
     }
     size_t deepest = 1;
     for (auto& [k, m] : chainMsa) deepest = std::max(deepest, m.rows.size());
-    int depth = (int)std::min<size_t>(16384, deepest);
+    // (16384 rows, or --max-msa where the page overrides it: cuda/ef2/export_input.mjs)
+    int maxMsa = 16384;
+    if (!args.option("max-msa").empty()) {
+      double asked = jsNumberOf(args.option("max-msa"));
+      if (!(asked >= 1) || asked != std::floor(asked))
+        throw std::runtime_error("ESMFold2 Max MSA " + args.option("max-msa") + ": want a whole number of rows");
+      maxMsa = (int)asked;
+    }
+    int depth = (int)std::min<size_t>((size_t)maxMsa, deepest);
     std::vector<int> rows((size_t)depth * T, GAP);
     std::vector<float> dels((size_t)depth * T, 0.0f);
     for (int t = 0; t < T; ++t) {

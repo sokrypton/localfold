@@ -326,7 +326,8 @@ inline std::vector<Row> encodeRows(const std::vector<std::string>& rows) {
 struct ChainInfo { Chain chain; std::string kind; std::string payload; std::vector<std::string> codes; std::vector<Residue> residues; int from, to; };
 }  // namespace detail
 
-inline void msaFeatures(Features& F, const std::vector<detail::ChainInfo>& info, int T) {
+// (maxSeqs: the rows kept, MAX_SEQS unless --max-msa overrides it - shared/bioemu2/featurise.js msaFeatures)
+inline void msaFeatures(Features& F, const std::vector<detail::ChainInfo>& info, int T, int maxSeqs = MAX_SEQS) {
   using namespace detail;
   std::vector<int> protein;
   for (size_t i = 0; i < info.size(); ++i) if (info[i].kind == "protein") protein.push_back((int)i);
@@ -351,7 +352,7 @@ inline void msaFeatures(Features& F, const std::vector<detail::ChainInfo>& info,
   auto all = [&](int v) { return std::vector<int>(nChains, v); };
   if (pairedGiven) {
     std::map<int, std::vector<std::string>> pairedRows, unpaired;
-    int depth = MAX_SEQS - 1;
+    int depth = maxSeqs - 1;
     for (int i : protein) {
       auto rows = a3mRows(info[i].chain.pairedMsa);
       if ((int)rows.size() > MAX_PAIRED_SEQS + 1) rows.resize(MAX_PAIRED_SEQS + 1);
@@ -360,7 +361,7 @@ inline void msaFeatures(Features& F, const std::vector<detail::ChainInfo>& info,
       if ((int)kept.size() > MAX_PAIRED_SEQS) kept.resize(MAX_PAIRED_SEQS);
       pairedRows[i] = kept;
       auto u = unpairedRows(i);
-      if ((int)u.size() > MAX_SEQS) u.resize(MAX_SEQS);
+      if ((int)u.size() > maxSeqs) u.resize(maxSeqs);
       unpaired[i] = u;
     }
     for (int i : protein) depth = std::min(depth, (int)pairedRows[i].size());
@@ -369,7 +370,7 @@ inline void msaFeatures(Features& F, const std::vector<detail::ChainInfo>& info,
       for (int k = 0; k < depth; ++k) combined.push_back(pairedRows[i][k]);
       auto& u = unpaired[i];
       int start = !u.empty() && upper(noGaps(u[0])) == upper(seqs[i]) ? 1 : 0;
-      int take = MAX_SEQS - (int)combined.size();
+      int take = maxSeqs - (int)combined.size();
       for (int k = start; k < (int)u.size() && k < start + take; ++k) combined.push_back(u[k]);
       msas[i] = encodeRows(combined);
     }
@@ -389,18 +390,18 @@ inline void msaFeatures(Features& F, const std::vector<detail::ChainInfo>& info,
       for (int c = 0; c < nChains; ++c) p[c] = isProtein(c) && offset + k < (int)msas[c].size() ? offset + k : -1;
       pairing.push_back(p);
       isPaired.push_back(all(0));
-      if ((int)pairing.size() >= MAX_SEQS) break;
+      if ((int)pairing.size() >= maxSeqs) break;
     }
   } else {
     for (int i : protein) {
       auto rows = unpairedRows(i);
-      if ((int)rows.size() > MAX_SEQS) rows.resize(MAX_SEQS);
+      if ((int)rows.size() > maxSeqs) rows.resize(maxSeqs);
       msas[i] = encodeRows(rows);
     }
     bool homomeric = distinct.size() == 1 && protein.size() > 1;
     int nSeqs = 1;
     if (!protein.empty()) { nSeqs = INT32_MAX; for (int c : protein) nSeqs = std::min(nSeqs, (int)msas[c].size()); }
-    nSeqs = std::min(nSeqs, MAX_SEQS);
+    nSeqs = std::min(nSeqs, maxSeqs);
     for (int k = 0; k < nSeqs; ++k) {
       int flag = homomeric ? 1 : (k == 0 ? 1 : 0);
       isPaired.push_back(all(flag));
@@ -534,7 +535,7 @@ inline std::vector<Contact> parseContacts(const Json& raw) {
 
 // featuriseBioemu2. `smiles` is a SMILES chain's template, by chain id.
 inline Features featurise(const Job& job, const CcdReader& ccd, const std::string& mode, const std::vector<Contact>* contacts,
-                          const std::map<std::string, Template>& smiles) {
+                          const std::map<std::string, Template>& smiles, int maxMsa = MAX_SEQS) {
   using namespace detail;
   int method = methodOf(mode);
   Features F;
@@ -679,7 +680,7 @@ inline Features featurise(const Job& job, const CcdReader& ccd, const std::strin
   for (size_t p = 0; p < (size_t)T * T; ++p) cc[p * 5] = 1;
   F.ints["contact_conditioning"] = cc;
   F.floats["contact_threshold"] = std::vector<float>((size_t)T * T, 0.f);
-  msaFeatures(F, info, T);
+  msaFeatures(F, info, T, maxMsa);
   if (contacts) contactFeatures(F, *contacts, info, tokCentre, T);
   int nPad = (nAtoms + WINDOW - 1) / WINDOW * WINDOW;
   F.atomsPadded = nPad;

@@ -129,7 +129,8 @@ if (unpairedA3ms !== null) {
 }
 const contacts = option("contacts", "") ? parseContacts(JSON.parse(readFileSync(option("contacts", ""), "utf8"))) : null;
 let { features: f, atomKeys, tokens: T, atoms: realAtoms, atomsPadded: N, topology } =
-  featuriseBioemu2(job, { ccd, mode, contacts, smilesTemplates });
+  featuriseBioemu2(job, { ccd, mode, contacts, smilesTemplates,
+    ...(option("max-msa", "") === "" ? {} : { maxMsa: Number(option("max-msa", "")) }) });
 
 // ---- propagation: the starting frame, every atom read by (chain, residue, name) from a PDB or an mmCIF
 const propagateFrom = option("propagate-from", "");

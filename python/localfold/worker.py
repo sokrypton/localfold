@@ -276,6 +276,14 @@ def binary(port):
     return path
 
 
+def max_msa_override(controls):
+    """The page's Max MSA where it overrides a model's own row cap - ESMFold2's 16384 and BioEmu2's 4092 - as the
+    featuriser's flag; nothing on "Default" (the dial's empty value), so those folds are byte for byte what they were.
+    AF3 and AF2 always take the dial (their featurisers' --max-msa above)."""
+    depth = str(controls.get("max-msa") or "").split(":")[0]
+    return [f"--max-msa={int(depth)}"] if depth.isdigit() and int(depth) > 0 else []
+
+
 def featuriser(name):
     """A native featuriser (cuda/featurise/<name>) - waited for while cuda/build.sh compiles it, refused if nothing
     is building it."""
@@ -837,7 +845,7 @@ class Worker:
                            "--search", *local_ccd()], "searching", log, live)
                 flags = [f"--a3m={os.path.join(searched, 'search.a3m')}"]
             featurise([featuriser("ef2-featurise"), inputs, f"--job={job_path}", f"--fold-bundle={trunk}", *flags,
-                       *local_ccd()], "featurising", log, live)
+                       *max_msa_override(controls), *local_ccd()], "featurising", log, live)
             if mode == "search" and os.path.exists(os.path.join(WORK, "ef2-search", "search.a3m")):
                 shutil.copy(os.path.join(WORK, "ef2-search", "search.a3m"), os.path.join(inputs, "search.a3m"))
             dev("featurising" + (" and the MMseqs2 search" if mode == "search" else ""), (time.time() - at) * 1000, begin=at)
@@ -998,7 +1006,7 @@ class Worker:
         server = self.server_for(key, [binary("bioemu2"), "-", f"--weights={weights[0]}", "--fast"], residues)
         choice = controls.get("bioemu2-mode") or "structure"
         export = [featuriser("bioemu2-featurise"), os.path.join(WORK, "in"), f"--job={job_path}",
-                  f"--mode={'equilibrium' if choice == 'propagate' else choice}"]
+                  f"--mode={'equilibrium' if choice == 'propagate' else choice}", *max_msa_override(controls)]
         # the sampler (the page's bioemu2-sampler): edm, or the steered edm_gd / edm_fk / edm_fkc, which read the steering tables
         # the featuriser writes when asked, and the potentials the page hands over as text (bioemu2Potentials)
         sampler = controls.get("bioemu2-sampler") or "edm"

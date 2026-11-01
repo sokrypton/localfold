@@ -194,7 +194,7 @@ inline Bioemu2Export exportBioemu2(const Args& args) {
   if (args.positional.empty() || (jobPath.empty() && sequence.empty()))
     throw std::runtime_error("usage: bioemu2-featurise <out dir> --job=<job.json> | --sequence=<SEQ>[:<SEQ>...]"
                              " [--mode=structure|equilibrium] [--contacts=<json>] [--propagate-from=<pdb|cif>] [--lag-ns=1]"
-                             " [--propagation-steps=1] [--a3m=...] [--paired-a3m=...]");
+                             " [--propagation-steps=1] [--a3m=...] [--paired-a3m=...] [--max-msa=4092]");
   Json json;
   if (!jobPath.empty()) json = parseJson(readFile(jobPath));
   else {
@@ -283,7 +283,14 @@ inline Bioemu2Export exportBioemu2(const Args& args) {
   std::vector<bioemu2::Contact> contacts;
   std::string contactsPath = args.option("contacts");
   if (!contactsPath.empty()) contacts = bioemu2::parseContacts(parseJson(readFile(contactsPath)));
-  bioemu2::Features F = bioemu2::featurise(job, ccd, mode, contactsPath.empty() ? nullptr : &contacts, smiles);
+  // the page's Max MSA, when it overrides BioEmu2's own 4092 rows (shared/bioemu2/featurise.js `maxMsa`)
+  int maxMsa = bioemu2::MAX_SEQS;
+  if (!args.option("max-msa").empty()) {
+    double asked = lf::jsNumberOf(args.option("max-msa"));   // (JavaScript's Number, not the PDB column reader above)
+    if (!(asked >= 1) || asked != std::floor(asked)) throw std::runtime_error("BioEmu2 Max MSA " + args.option("max-msa") + ": want a whole number of rows");
+    maxMsa = (int)asked;
+  }
+  bioemu2::Features F = bioemu2::featurise(job, ccd, mode, contactsPath.empty() ? nullptr : &contacts, smiles, maxMsa);
   const int T = F.tokens, N = F.atomsPadded;
 
   std::string propagateFrom = args.option("propagate-from");

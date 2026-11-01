@@ -24,7 +24,8 @@ const option = (name, fallback) => args.find((a) => a.startsWith(`--${name}=`))?
 let sequence = option("sequence", "").trim().toUpperCase();
 if (!out || out.startsWith("--") || (sequence === "" && option("job", "") === "")) {
   console.error("usage: export_input.mjs <out dir> --sequence=<SEQ>[:<SEQ>...] [--kinds=protein,dna,...]"
-    + " [--ligands=GOL,ATP] [--smiles=OCC(O)CO|...] [--modify=SEP@3[@chain]] | --job=<AF3 job.json>"); process.exit(1);
+    + " [--ligands=GOL,ATP] [--smiles=OCC(O)CO|...] [--modify=SEP@3[@chain]] | --job=<AF3 job.json> [--max-msa=16384]");
+  process.exit(1);
 }
 // what the page folds besides one protein chain, resolved as cuda/af3's exporter and the page do:
 // --kinds (one per ":"-chain: protein, dna, rna), --ligands (CCD codes, from the RCSB), --smiles
@@ -138,7 +139,11 @@ int("distogram_atom_idx", representativeAtoms(f, T));
       : { rows: [[...chainSeqs[c]].map(code)], dels: [new Array(chainSeqs[c].length).fill(0)] };
     chainMsa.set(asyms[c], msa);
   }
-  const depth = Math.min(16384, Math.max(1, ...[...chainMsa.values()].map((m) => m.rows.length)));
+  // (16384 rows, or the page's Max MSA where it overrides that: the first rows, the query among them - the encoder
+  // subsamples past the bundle's msaMaxDepth only when more than that many are left)
+  const maxMsa = option("max-msa", "") === "" ? 16384 : Number(option("max-msa", ""));
+  if (!(Number.isInteger(maxMsa) && maxMsa >= 1)) throw new Error(`ESMFold2 Max MSA ${option("max-msa", "")}: want a whole number of rows`);
+  const depth = Math.min(maxMsa, Math.max(1, ...[...chainMsa.values()].map((m) => m.rows.length)));
   const rows = new Int32Array(depth * T).fill(GAP), dels = new Float32Array(depth * T);
   for (let t = 0; t < T; t += 1) {
     const msa = chainMsa.get(f.asymId[t]);
