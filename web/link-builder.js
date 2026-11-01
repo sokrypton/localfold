@@ -17,6 +17,16 @@ import { THREE_LETTER } from "../shared/af3/structure/pdb.js";
 import { DEFAULT_CONSTRAINT_DISTANCE, POLYMER_TYPES, parseBond, parseContact, parseCrosslink, parsePocket, rowChains }
   from "./entities.js";
 
+/**
+ * Each crosslinker's spacer arm in Angstrom, as its manufacturer quotes it - what people choose a crosslinker by, so
+ * the menu shows it beside the code. Not in shared/chem/crosslinkers.js, which is generated from af3-any-model and
+ * carries chemistry only. CDI is left out: one carbonyl, near zero length, and no figure everyone quotes.
+ */
+export const SPACER_ARM = {
+  DSS: 11.4, BS3: 11.4, DSG: 7.7, BS2G: 7.7, DSSO: 10.1, DSBU: 12.5, PHOX: 5.5, BSPEG5: 21.7, BSPEG9: 35.8,
+  "AZIDE-A-DSBSO": 14, SDA: 3.9, LCSDA: 12.5, SDAD: 13.5,
+};
+
 /** The row types written by pickers rather than typed. */
 export const LINK_TYPES = ["bond", "crosslink", "pocket", "contact"];
 
@@ -198,7 +208,9 @@ export function buildLinkField(entity, readEntities, changed) {
     const linker = element("select", "entity-picker link-linker", { title: "Crosslinker" });
     linker.setAttribute("aria-label", "Crosslinker");
     for (const [name, entry] of Object.entries(CROSSLINKERS)) {
-      linker.append(Object.assign(new Option(name, name), { title: entry.description }));
+      const arm = SPACER_ARM[name];
+      linker.append(Object.assign(new Option(arm === undefined ? name : `${name} · ${arm} Å`, name),
+                                  { title: entry.description }));
     }
     if (!(parts.linker in CROSSLINKERS)) linker.append(new Option(`${parts.linker} (unknown)`, parts.linker));
     linker.value = parts.linker;
