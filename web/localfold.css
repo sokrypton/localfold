@@ -578,6 +578,10 @@
 .entity-link .link-atom::placeholder { text-transform: none; }
 .entity-link .link-distance { width: 6ch; }
 .entity-link .link-residue-past { color: #b91c1c; }
+/* a row the chosen model does not take: greyed, its reason on hover (entity-ui.js rowRefusal); the type menu and
+   the remove button stay live, since changing or removing the row is what the reader can do about it */
+.entity-row-unsupported > :not(.entity-type):not(.entity-remove) { opacity: .4; }
+.entity-row-unsupported > .entity-type { color: #9ca3af; text-decoration: line-through; }
 /* a bond or constraint is one thing, so its copies box would only invite a number nothing reads */
 .entity-row-link > .entity-copies { visibility: hidden; }
 .entity-link .link-residues { flex: 1 1 16ch; min-width: 12ch; }

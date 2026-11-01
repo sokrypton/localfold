@@ -99,6 +99,8 @@ const element = (id) => {
 // by the time this runs; the rows have to exist before the first handler fires
 // rather than at the bottom of the file with the other listeners, because
 // sequenceValue() and the fold path both go through them.
+/** Which row types the chosen model cannot take: set once the model controls exist (rowTypeRefusal, below). */
+let entityRowRefusal = null;
 const entityList = createEntityList(
   element("entity-rows"), element("add-entity"),
   // The default is the sequence the old textarea shipped with, so the page
@@ -107,7 +109,8 @@ const entityList = createEntityList(
     value: "PIAQIHILEGRSDEQKETLIREVSEAISRSLDAPLTSVRVIITEMAKGHFGIGGELASK" }],
     // See createEntityList: the entity list owns the template kind and this
     // page owns the MSA control, so it answers rather than reaching for it.
-    msaIsSearch: () => msaMode() === "search" });
+    msaIsSearch: () => msaMode() === "search",
+    rowRefusal: (type) => entityRowRefusal?.(type) ?? null });
 
 /**
  * ONE NAME for a fold: the viewer object, every file in the archive, and the
@@ -2571,6 +2574,7 @@ function setFoldButton(state) {
  * put, so the row keeps one order.
  */
 function syncModelControls() {
+  entityList.refresh();   // (which row types the model takes: rowTypeRefusal)
   const family = chosenFamily();
   const af3 = isAf3Family(family);
   // 🔴 THE MODEL NUMBER IS AF2's ALONE, and the test is the ROW's value rather
@@ -6027,6 +6031,32 @@ document.getElementById("credits-open")?.addEventListener("click", () => credits
 // 🔴 THE MODEL DECIDES WHICH CONTROLS EXIST, and syncMode decides what the MSA
 // ones say - so the model listener runs syncModelControls and then syncMode,
 // in that order: the second reads the visibility the first just set.
+/**
+ * Why the chosen model cannot take a row of this type, or null - the entity list greys such a row and leaves the type
+ * out of a new row's menu. 🔴 THE SAME LINES THE FOLD REFUSES ON (modelFamily, and the constraint and crosslink checks
+ * in runFold), so a row is greyed exactly when pressing Fold would refuse it; and a bond, which the page's WebGPU
+ * ESMFold2 and BioEmu2 never read (only the AF3 lineage's featuriser and the native ESMFold2 take declared bonds).
+ */
+function rowTypeRefusal(type) {
+  const family = chosenFamily();
+  const label = MODEL_LABELS[family] ?? family;
+  if (["dna", "rna", "ligand", "smiles", "modification"].includes(type) && !supportsAllAtom(family)) {
+    return `${label} folds proteins only: choose an AlphaFold 3-lineage model, ESMFold2 or BioEmu2 for this row`;
+  }
+  if ((type === "bond" || type === "crosslink") && !isAf3Family(family)
+      && !(type === "bond" && NATIVE_ONLY_FAMILIES.includes(family))) {
+    return `${label} does not take covalent bonds: choose an AlphaFold 3-lineage model for this row`;
+  }
+  if (type === "pocket" && family !== "boltz2" && family !== "chai1") {
+    return `${label} was not trained with pockets: choose Boltz-2 or Chai-1 for this row`;
+  }
+  if (type === "contact" && family !== "boltz2" && family !== "chai1" && !BIOEMU2_FAMILIES.includes(family)) {
+    return `${label} was not trained with contacts: choose Boltz-2, Chai-1 or BioEmu2 for this row`;
+  }
+  return null;
+}
+entityRowRefusal = rowTypeRefusal;
+
 const familySelect = document.getElementById("model-family");
 if (familySelect !== null) {
   // 🔴 AND ALL THREE ROWS THAT MOVE THE FAMILY HAVE TO SAY SO. `chosenFamily`
