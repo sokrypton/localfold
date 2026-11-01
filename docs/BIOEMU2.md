@@ -318,3 +318,14 @@ keeps its draw-order name (`sample_7`), and a propagation keeps its trajectories
 
 Measured in the page on 6MRR, equilibrium, 50 steps: 10 samples in two batches, 65 s; PC1 44%, PC2 19%. A
 1-sample structure fold afterwards shows no Scatter tab, nor does ESMFold2 after that.
+
+## Max MSA, as an override (2026-11-01)
+
+The page's Max MSA dial is shown for every model that reads an alignment. BioEmu2 opens it on **Default (4092)**, its
+own cap (Boltz-1's), and ESMFold2 (the released, native-only models) on **Default (16384)**, the featuriser's; any other
+setting replaces that cap in the featuriser - `featuriseBioemu2({maxMsa})` on the page, `--max-msa=` on
+`bioemu2-featurise` / `ef2-featurise` natively (passed by `max_msa_override` in python/localfold/worker.py only off
+Default, so a Default fold is byte for byte what it was). Rows are kept in the alignment's order, query first, as the
+cap always took them; ESMFold2's encoder still subsamples past its bundle's 1024 when more are left. Held JS-native by
+`tools/check-native-featuriser.py --only=max-msa`; measured: ubiquitin on the page 4092 rows -> 16, and natively on
+Metal a 30-row alignment -> 5 for both BioEmu2 and ESMFold2 (`msa encoder ... (5 rows)`).

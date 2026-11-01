@@ -252,7 +252,8 @@ function entitiesOf(job) {
  * @returns {{features: object, atomKeys: [string, number, string][], topology: object}}
  */
 export function featuriseBioemu2(job, options = {}) {
-  const { ccd, mode = "structure", contacts = null, smilesTemplates = {} } = options;
+  const { ccd, mode = "structure", contacts = null, smilesTemplates = {}, maxMsa = MAX_SEQS } = options;
+  if (!(Number.isInteger(maxMsa) && maxMsa >= 1)) throw new Error(`BioEmu2 Max MSA ${maxMsa}: want a whole number of rows`);
   if (!(mode in METHOD)) throw new Error(`BioEmu2 mode ${mode}: want structure or equilibrium`);
   const bonds = job.bondedAtomPairs ?? [];
   const atoms = { coords: [], element: [], charge: [], name: [], residue: [], token: [], mol: [], restype: [] };
@@ -385,7 +386,7 @@ export function featuriseBioemu2(job, options = {}) {
   };
   const residueOfAtom = Int32Array.from(atoms.residue);
   const tokenOfAtom = Int32Array.from(atoms.token);
-  Object.assign(features, msaFeatures(chainInfo, residueOfAtom, tokenOfAtom, T));
+  Object.assign(features, msaFeatures(chainInfo, residueOfAtom, tokenOfAtom, T, maxMsa));
   if (contacts) Object.assign(features, contactFeatures(contacts, chainInfo, residueOfAtom, tokenOfAtom, atoms.name, centre, T));
 
   // atoms, padded to the window (batch_collate)
@@ -461,7 +462,8 @@ function encodeRows(rows) {
   });
 }
 
-function msaFeatures(chainInfo, residueOfAtom, tokenOfAtom, T) {
+// (maxSeqs: the rows kept, MAX_SEQS unless the page's Max MSA overrides it - the same cap, wherever MAX_SEQS was)
+function msaFeatures(chainInfo, residueOfAtom, tokenOfAtom, T, maxSeqs = MAX_SEQS) {
   const protein = chainInfo.map((info, i) => (info.kind === "protein" ? i : -1)).filter((i) => i >= 0);
   const seqs = new Map(protein.map((i) => [i, chainInfo[i].payload]));
   const unpairedRows = (i) => {
@@ -484,13 +486,13 @@ function msaFeatures(chainInfo, residueOfAtom, tokenOfAtom, T) {
   if (pairedGiven) {
     const pairedRows = new Map(protein.map((i) => [i, a3mRows(chainInfo[i].chain.pairedMsa)
       .slice(0, MAX_PAIRED_SEQS + 1).slice(1).filter((r) => r.replaceAll("-", "")).slice(0, MAX_PAIRED_SEQS)]));
-    const unpaired = new Map(protein.map((i) => [i, unpairedRows(i).slice(0, MAX_SEQS)]));
-    const depth = Math.min(Math.min(...protein.map((i) => pairedRows.get(i).length)), MAX_SEQS - 1);
+    const unpaired = new Map(protein.map((i) => [i, unpairedRows(i).slice(0, maxSeqs)]));
+    const depth = Math.min(Math.min(...protein.map((i) => pairedRows.get(i).length)), maxSeqs - 1);
     for (const i of protein) {
       const combined = [seqs.get(i), ...pairedRows.get(i).slice(0, depth)];
       const u = unpaired.get(i);
       const start = u.length && u[0].replaceAll("-", "").toUpperCase() === seqs.get(i).toUpperCase() ? 1 : 0;
-      combined.push(...u.slice(start, start + MAX_SEQS - combined.length));
+      combined.push(...u.slice(start, start + maxSeqs - combined.length));
       msas.set(i, encodeRows(combined));
     }
     pairing.push(all(0));
@@ -505,12 +507,12 @@ function msaFeatures(chainInfo, residueOfAtom, tokenOfAtom, T) {
       pairing.push(Array.from({ length: nChains }, (_, c) => (protein.includes(c) && offset + k < msas.get(c).length
         ? offset + k : -1)));
       isPaired.push(all(0));
-      if (pairing.length >= MAX_SEQS) break;
+      if (pairing.length >= maxSeqs) break;
     }
   } else {
-    for (const i of protein) msas.set(i, encodeRows(unpairedRows(i).slice(0, MAX_SEQS)));
+    for (const i of protein) msas.set(i, encodeRows(unpairedRows(i).slice(0, maxSeqs)));
     const homomeric = distinct.size === 1 && protein.length > 1;
-    const nSeqs = Math.min(protein.length ? Math.min(...protein.map((c) => msas.get(c).length)) : 1, MAX_SEQS);
+    const nSeqs = Math.min(protein.length ? Math.min(...protein.map((c) => msas.get(c).length)) : 1, maxSeqs);
     for (let k = 0; k < nSeqs; k += 1) {
       const flag = homomeric ? 1 : (k === 0 ? 1 : 0);
       isPaired.push(all(flag));

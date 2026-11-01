@@ -195,7 +195,9 @@ const maxMsaConfig = () => {
   // mean 512 there, and reusing the AF2 number would quietly drop four rows.
   const maxMsaSequences = requested === 512 ? 508 : requested;
   const maxExtraSequences = Number.isFinite(extraPart) && extraPart >= 0 ? extraPart : 1024;
-  return { maxMsaSequences, maxExtraSequences, requested };
+  // ...and for a model with a cap of its own (BioEmu2, ESMFold2), the dial's override or null on "Default" (its value "")
+  const override = Number.isFinite(msaPart) && msaPart > 0 ? msaPart : null;
+  return { maxMsaSequences, maxExtraSequences, requested, override };
 };
 /**
  * Which weights to fold with: monomer, multimer, or let the sequence decide.
@@ -2631,8 +2633,9 @@ function syncModelControls() {
   }
   // ...and Max MSA, which no ESMFold2 takes (the full model subsamples its own alignment to 1,024 rows)
   const maxNode = document.getElementById("maxMsaGroup");
-  // (BioEmu2 takes its alignment whole, 4,092 rows as Boltz-1 does, so it has no depth to set either)
-  if (maxNode !== null) maxNode.hidden = isEsmfold2(family) || bioemu2;
+  // (every model that reads an alignment shows it - BioEmu2 and ESMFold2 with their own cap as "Default", syncMaxMsa;
+  // only the experimental ESMFold2 tier, which reads none, has nothing to set)
+  if (maxNode !== null) maxNode.hidden = readsNoAlignment(family);
   // ...and the variant row, for every ESMFold2
   const plmNode = document.getElementById("plmGroup");
   if (plmNode !== null) plmNode.hidden = !isEsmfold2(family);
@@ -2674,15 +2677,31 @@ const MAX_MSA_DEPTHS = [512, 256, 128, 64, 32, 16];
 function syncMaxMsa() {
   const select = document.getElementById("max-msa");
   if (select === null) return;
-  const af3 = isAf3Family(chosenFamily());
+  const family = chosenFamily();
+  const af3 = isAf3Family(family);
+  // 🔴 ONE DIAL FOR EVERY MODEL THAT READS AN ALIGNMENT. AF2 and AF3 have always taken it; BioEmu2 (4092 rows) and
+  // ESMFold2 (16384, its encoder subsampling 1024) keep their own cap on "Default" and take the same depths as an
+  // override - in their featurisers, on the page and natively alike (`max_msa_override` in python/localfold/worker.py).
+  const ownCap = BIOEMU2_FAMILIES.includes(family) ? 4092 : isEsmfold2(family) && !readsNoAlignment(family) ? 16384 : null;
   const previous = Number.parseInt(select.value, 10);
-  const values = MAX_MSA_DEPTHS.map((depth) => (af3 ? String(depth) : `${depth}:${depth * 2}`));
-  select.replaceChildren(...values.map((value) => Object.assign(
-    document.createElement("option"), { value, textContent: value })));
+  const values = MAX_MSA_DEPTHS.map((depth) => (af3 || ownCap !== null ? String(depth) : `${depth}:${depth * 2}`));
+  const options = values.map((value) => Object.assign(document.createElement("option"), { value, textContent: value }));
+  if (ownCap !== null) options.unshift(Object.assign(document.createElement("option"),
+    { value: "", textContent: `Default (${ownCap})` }));
+  select.replaceChildren(...options);
+  // a model with its own cap starts on it - AF2's and AF3's 128 is the page's choice for them, not an override - and
+  // keeps an override chosen under another such model
+  const hadOwnCap = select.dataset.ownCap === "true";
+  select.dataset.ownCap = String(ownCap !== null);
+  if (ownCap !== null && !(hadOwnCap && previous > 0)) {
+    select.value = "";
+    return;
+  }
   // The DEPTH survives the switch, because it is the same quantity either way -
   // only its notation changed, and re-picking it after every model change would
-  // be the dial forgetting what it was told.
-  const kept = values.find((value) => Number.parseInt(value, 10) === previous);
+  // be the dial forgetting what it was told. (Off "Default", AF2 and AF3 go back to the page's 128.)
+  const kept = values.find((value) => Number.parseInt(value, 10) === previous)
+    ?? values.find((value) => Number.parseInt(value, 10) === 128);
   select.value = kept ?? values[0];
 }
 
@@ -4066,7 +4085,7 @@ async function foldWithBioemu2({ chains, chainKinds, alignment, alignmentBlocks,
   const unpaired = alignmentBlocks?.unpaired ?? alignment;
   const featurised = await bioemu2Features(jobJson, {
     alignment: unpaired ?? null, pairedAlignment: alignmentBlocks?.paired ?? null, proteinChains, mode,
-    contacts, signal,
+    contacts, maxMsa: maxMsaConfig().override, signal,
   });
   const { features, atomKeys, topology, tokens } = featurised;
   // the starting frame: the last BioEmu2 fold of THIS input, or an uploaded PDB of it
@@ -4290,7 +4309,9 @@ async function foldWithBioemu2({ chains, chainKinds, alignment, alignmentBlocks,
   status(`${modelName} · ${residues} res` + (named.length === 0 ? "" : ` + ${named.join(", ")}`)
     + ` · ${choice}` + (propagation ? ` ${propagation.lagNs} ns x ${propagation.steps}` : "")
     + ` · ${sampled === samples ? "" : `${sampled} of `}${samples} sample${samples === 1 ? "" : "s"}`
-    + (result.stopped ? " (stopped)" : "") + ` · ${steps} steps · ${seconds}s`
+    + (result.stopped ? " (stopped)" : "") + ` · ${steps} steps`
+    // the alignment's rows as the trunk read them, as the other models' lines say - a Max MSA override shows here
+    + (featurised.msaRows > 1 ? ` · ${featurised.msaRows} MSA rows` : " · single sequence") + ` · ${seconds}s`
     + physicalityLine
     + (verdict.ok ? "" : " · NOT A CHAIN"));
   progress(null);
