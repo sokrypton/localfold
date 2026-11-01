@@ -485,6 +485,8 @@ async function attempt(name, index) {
         // mostly-X ligand binder at median ipTM 0.16 on cycle 0 where AF3 reads 0.43, and never catches up (0.41 by
         // cycle 2 against AF3's 0.79)
         ...(cfg.percentX === undefined ? {} : { percentX: cfg.percentX }),
+        // `composition`: the starting sequence's known letters drawn by these weights instead of uniformly
+        ...(cfg.composition === undefined ? {} : { composition: cfg.composition }),
         // `omit`: letters MPNN may never write, per task (a DNA binder without D/E is basic) - the loop's own default is "C"
         ...(cfg.omit?.[t.task] === undefined ? {} : { omit: cfg.omit[t.task] }),
         veto: ({ pdb }) => contactProblem(pdb, { chain: "A" }),

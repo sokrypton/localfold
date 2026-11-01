@@ -130,3 +130,19 @@ describe("alanineFraction", () => {
     expect(alanineFraction("")).toBe(0);
   });
 });
+
+describe("sampleSequence composition", () => {
+  it("draws only the letters it names, in proportion to their weights", () => {
+    const sequence = sampleSequence(4000, { percentX: 0, composition: { L: 3, E: 1 }, random: uniformFrom(5) });
+    expect(/^[LE]+$/.test(sequence)).toBe(true);
+    const share = [...sequence].filter((c) => c === "L").length / sequence.length;
+    expect(Math.abs(share - 0.75) < 0.03).toBe(true);
+  });
+
+  it("refuses what it cannot mean", () => {
+    expect(() => sampleSequence(10, { percentX: 0, composition: { B: 1 } })).toThrow();
+    expect(() => sampleSequence(10, { percentX: 0, composition: { L: 0 } })).toThrow();
+    expect(() => sampleSequence(10, { percentX: 0, composition: { L: 1 }, excludeP: true })).toThrow();
+    expect(() => sampleSequence(10, { kind: "dna", composition: { A: 1 } })).toThrow();
+  });
+});

@@ -207,7 +207,7 @@ export async function* runDesign(options) {
       ?? (minLength + Math.floor(random() * (maxLength - minLength + 1)));
     sequence = sampleSequence(length, {
       percentX: options.percentX ?? 90,
-      excludeP: options.excludeP ?? false,
+      ...(options.composition === undefined ? { excludeP: options.excludeP ?? false } : { composition: options.composition }),
       kind,
       random,
     });

@@ -31,10 +31,16 @@ export const BASES = { dna: "ACGT", rna: "ACGU" };
 
 /**
  * A starting sequence: `percentX` of the positions unknown, the rest drawn
- * uniformly, then shuffled.
+ * uniformly (or by `composition`), then shuffled.
+ *
+ * `composition` is not the reference's: a map from amino acid to a relative
+ * weight, replacing the uniform pool for a protein chain - the reference's
+ * fixed pool was tuned on AF3, and another folding model may read a different
+ * start better. Letters it does not name are never drawn.
  *
  * @param {number} length
  * @param {{percentX?: number, excludeP?: boolean, kind?: "protein"|"dna"|"rna",
+ *          composition?: Record<string, number>,
  *          random?: () => number}} [options] `random` returns [0, 1); pass
  *   `uniformFrom(seed)` from webgpu/af3/fold.js to make a run reproducible.
  * @returns {string}
@@ -50,13 +56,16 @@ export function sampleSequence(length, options = {}) {
     : options.excludeP === true ? POOL_WITHOUT_PROLINE : `${POOL_WITHOUT_PROLINE}P`;
   if (pool === undefined) throw new Error(`no starting pool for a ${kind} chain`);
   const unknownLetter = kind === "protein" ? "X" : "N";
+  const draw = options.composition === undefined
+    ? () => pool[Math.floor(random() * pool.length)]
+    : weightedDraw(options.composition, { kind, excludeP: options.excludeP, random });
   // ...`round`, not `floor`: the reference's `round(length * frac_X)`, so 90%
   // of 15 is 14 rather than 13.
   const unknown = Math.round(length * (percentX / 100));
   const letters = [];
   for (let index = 0; index < unknown; index += 1) letters.push(unknownLetter);
   for (let index = unknown; index < length; index += 1) {
-    letters.push(pool[Math.floor(random() * pool.length)]);
+    letters.push(draw());
   }
   // Fisher-Yates, so the X positions are not a prefix. `random.shuffle` there.
   for (let index = letters.length - 1; index > 0; index -= 1) {
@@ -66,6 +75,27 @@ export function sampleSequence(length, options = {}) {
     letters[other] = held;
   }
   return letters.join("");
+}
+
+/** A draw from `composition`'s letters in proportion to their weights; refuses what it cannot mean. */
+function weightedDraw(composition, { kind, excludeP, random }) {
+  if (kind !== "protein") throw new Error(`a starting composition is for a protein chain, not ${kind}`);
+  if (excludeP !== undefined) throw new Error("pass composition or excludeP, not both: a composition names its letters");
+  const entries = Object.entries(composition);
+  for (const [letter, weight] of entries) {
+    if (!`${POOL_WITHOUT_PROLINE}P`.includes(letter) || letter.length !== 1) throw new Error(`composition names ${letter}, not an amino acid`);
+    if (!(Number.isFinite(weight) && weight >= 0)) throw new Error(`composition weight for ${letter} is ${weight}`);
+  }
+  const total = entries.reduce((sum, [, weight]) => sum + weight, 0);
+  if (!(total > 0)) throw new Error("composition has no positive weight");
+  return () => {
+    let target = random() * total;
+    for (const [letter, weight] of entries) {
+      target -= weight;
+      if (target < 0) return letter;
+    }
+    return entries.findLast(([, weight]) => weight > 0)[0];
+  };
 }
 
 /**
