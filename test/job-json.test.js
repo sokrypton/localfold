@@ -9,7 +9,7 @@
  * OUT, with every field-by-field test passing.
  */
 import { describe, expect, it } from "./harness.js";
-import { jobFromJson, jobRequestJson } from "../web/job-json.js";
+import { jobFromJson, jobInputJson, jobRequestJson } from "../web/job-json.js";
 
 const server = (sequences, extra = {}) => JSON.stringify([{
   name: "j", modelSeeds: ["7"], sequences,
@@ -224,6 +224,26 @@ describe("reading the open-source dialect", () => {
  * the failure mode this whole file exists to prevent, and the one the archive
  * hit twice this week from the writing side.
  */
+describe("a polymer is written as the sequence that folds", () => {
+  /**
+   * The sequence box keeps what was typed - a length, spaces, a FASTA header -
+   * and `expandEntities` folds `cleanSequence` of it. A job written from the
+   * raw box handed BioEmu2's featuriser "261 PRGS..." and it refused the "2",
+   * where every other model folded the 261 residues; the archive recorded the
+   * typing rather than the molecule.
+   */
+  const entities = [
+    { type: "protein", value: "261 prgs hml\n", copies: 1 },
+    { type: "dna", value: ">x\nAC GT", copies: 1 },
+  ];
+  it("in both dialects", () => {
+    const open = JSON.parse(jobInputJson({ name: "t", seed: 7, entities }));
+    expect(open.sequences.map((s) => (s.protein ?? s.dna).sequence)).toEqual(["PRGSHML", "ACGT"]);
+    const back = jobFromJson(jobRequestJson({ name: "t", seed: 7, entities }));
+    expect(back.entities.map((e) => e.value)).toEqual(["PRGSHML", "ACGT"]);
+  });
+});
+
 describe("a SMILES ligand survives the archive", () => {
   /**
    * 🔴 THE ARCHIVE RECORDED BENZENE AS CYCLOHEXANE, AND THAT IS WHY THIS

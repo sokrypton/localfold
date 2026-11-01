@@ -52,6 +52,7 @@ import { CONSTRAINT_TYPES, NUCLEIC_TYPES, entitiesProblem, parseBond, parseCross
   from "./entities.js";
 import { crosslinker } from "../shared/chem/crosslinkers.js";
 import { userCcdCodes } from "../shared/af3/featurise/ccd-component.js";
+import { cleanSequence } from "./sequence.js";
 
 /**
  * The request that produced this fold, in the server's own dialect.
@@ -99,7 +100,7 @@ export function jobRequestJson({ name, seed, entities }) {
           ptmType: `CCD_${modification.code.trim().toUpperCase()}`,
           ptmPosition: modification.position,
         }));
-      sequences.push({ proteinChain: { sequence: value, count,
+      sequences.push({ proteinChain: { sequence: cleanSequence(value), count,
         // ...absent rather than empty, because `modifications: []` is a claim
         // that the chain was checked and carries none, and every unmodified
         // fold this page has ever written says nothing at all.
@@ -114,7 +115,7 @@ export function jobRequestJson({ name, seed, entities }) {
           modificationType: `CCD_${modification.code.trim().toUpperCase()}`,
           basePosition: modification.position,
         }));
-      sequences.push({ [`${entity.type}Sequence`]: { sequence: value, count,
+      sequences.push({ [`${entity.type}Sequence`]: { sequence: cleanSequence(value), count,
         ...(modifications.length === 0 ? {} : { modifications }) } });
     } else if (entity.type === "smiles") {
       // Unreachable: the whole file went open above. Here so that adding a
@@ -185,7 +186,7 @@ function openDialectJson({ name, seed, entities }) {
           ptmType: modification.code.trim().toUpperCase(),
           ptmPosition: modification.position,
         }));
-      sequences.push({ protein: { id, sequence: value,
+      sequences.push({ protein: { id, sequence: cleanSequence(value),
         ...(modifications.length === 0 ? {} : { modifications }) } });
     } else if (entity.type === "dna" || entity.type === "rna") {
       const modifications = (entity.modifications ?? [])
@@ -194,7 +195,7 @@ function openDialectJson({ name, seed, entities }) {
           modificationType: modification.code.trim().toUpperCase(),
           basePosition: modification.position,
         }));
-      sequences.push({ [entity.type]: { id, sequence: value,
+      sequences.push({ [entity.type]: { id, sequence: cleanSequence(value),
         ...(modifications.length === 0 ? {} : { modifications }) } });
     } else if (entity.type === "smiles") {
       // 🔴 NOT UPPER-CASED. Case is meaning in a SMILES and this is the whole
