@@ -570,6 +570,7 @@
 }
 .entity-link .link-end { display: inline-flex; align-items: center; gap: 4px; min-width: 0; }
 .entity-link .entity-picker { max-width: 16ch; text-overflow: ellipsis; }
+.entity-link .link-chain { width: auto; min-width: 7ch; }
 .entity-link .entity-value { height: 34px; padding: 4px 6px; }
 .entity-link .link-residue { width: 6ch; }
 .entity-link .link-atom { width: 6ch; text-transform: uppercase; }
