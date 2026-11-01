@@ -117,10 +117,11 @@ export function bioemu2ContactsFromRows(constraints, jobJson) {
  * @param jobJson the job as `jobInputJson` writes it
  * @param alignment the fold's merged A3M over its protein chains (or null), and `proteinChains` their sequences in
  *   the order the merge used; each chain gets its own columns back
- * @param options `mode`, `contacts` (BioEmu2 Contact JSON, a string or a parsed list), `signal`
+ * @param options `mode`, `contacts` (BioEmu2 Contact JSON, a string or a parsed list), `maxMsa` (the page's Max MSA
+ *   where it overrides BioEmu2's own 4092 rows, else null), `signal`
  */
 export async function bioemu2Features(jobJson, { alignment = null, pairedAlignment = null, proteinChains = [],
-                                                 mode = "structure", contacts = null, signal } = {}) {
+                                                 mode = "structure", contacts = null, maxMsa = null, signal } = {}) {
   const job = bioemu2JobFromAf3Json(typeof jobJson === "string" ? JSON.parse(jobJson) : jobJson);
   // each protein chain's slice of the merged alignment, by sequence (a homomer's copies share one)
   if (alignment !== null && proteinChains.length > 0) {
@@ -141,7 +142,8 @@ export async function bioemu2Features(jobJson, { alignment = null, pairedAlignme
     : parseContacts(typeof contacts === "string" ? JSON.parse(contacts) : contacts);
   const ccd = await fetchComponents(job, { signal });
   const templates = await smilesTemplates(job);
-  return { job, ...featuriseBioemu2(job, { ccd, mode, contacts: parsedContacts, smilesTemplates: templates }) };
+  return { job, ...featuriseBioemu2(job, { ccd, mode, contacts: parsedContacts, smilesTemplates: templates,
+                                            ...(maxMsa === null ? {} : { maxMsa }) }) };
 }
 
 /**
