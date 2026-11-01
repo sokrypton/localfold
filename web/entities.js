@@ -38,7 +38,7 @@ import { cleanSequence, nucleicProblem, sequenceProblem } from "./sequence.js";
  * looks like a three-letter code, so the row says.
  */
 export const ENTITY_TYPES = ["protein", "dna", "rna", "ligand", "smiles",
-                            "bond", "crosslink", "pocket", "contact"];
+                            "modification", "bond", "crosslink", "pocket", "contact"];
 
 /**
  * The row types that CONSTRAIN the fold rather than describe the molecule: a `pocket` (a binder chain to sit within a
@@ -168,10 +168,65 @@ export function parseCrosslink(value) {
            to: { chain: match[4].toUpperCase(), residue: Number(match[5]) } };
 }
 
+/**
+ * A modification row's text, parsed - or null.
+ *
+ *     A3 SEP                   residue 3 of chain A is a phosphoserine
+ *
+ * 🔴 A ROW IN THE LIST, NOT A FIELD ON THE SEQUENCE, so everything that names a residue is a row read the same way
+ * (bond, crosslink, contact, pocket). But a modification still BELONGS to the sequence, as in AlphaFold 3's job: the
+ * list's `read()` folds each row back into its sequence's `modifications` (`foldModificationRows`), so the fold, the
+ * job JSON and every tool see exactly what they saw - and naming any copy of a sequence modifies every copy.
+ */
+export function parseModification(value) {
+  const match = /^\s*([A-Za-z]+)\s*(\d+)\s+([A-Za-z0-9]{1,5})\s*$/.exec(String(value ?? ""));
+  if (match === null) return null;
+  return { chain: match[1].toUpperCase(), residue: Number(match[2]), code: match[3].toUpperCase() };
+}
+
+/**
+ * The rows with each modification row folded into the sequence it names: what the list's `read()` hands the page.
+ * A row that names no polymer chain stays, carrying `problem`, so the page refuses the fold by saying why.
+ */
+export function foldModificationRows(rows) {
+  const chains = rowChains(rows);
+  const out = rows.map((row) => (row.type === "modification" ? null
+    : POLYMER_TYPES.includes(row.type) ? { ...row, modifications: [...(row.modifications ?? [])] } : { ...row }));
+  const left = [];
+  for (const row of rows) {
+    if (row.type !== "modification") continue;
+    const parsed = parseModification(row.value);
+    const chain = parsed === null ? undefined : chains.find((one) => one.letter === parsed.chain);
+    if (parsed === null || chain === undefined || !POLYMER_TYPES.includes(chain.kind)) {
+      left.push({ ...row, problem: parsed === null ? undefined
+        : `Modification ${parsed.chain}${parsed.residue}: no protein, DNA or RNA chain ${parsed.chain}` });
+      continue;
+    }
+    out[chain.entity].modifications.push({ code: parsed.code, position: parsed.residue });
+  }
+  return [...out.filter((row) => row !== null), ...left];
+}
+
+/** The inverse: each sequence's modifications as rows right after it, naming its first copy. */
+export function modificationRows(entities) {
+  const letters = new Map();
+  for (const chain of rowChains(entities)) if (!letters.has(chain.entity)) letters.set(chain.entity, chain.letter);
+  const out = [];
+  entities.forEach((entity, index) => {
+    const modifications = POLYMER_TYPES.includes(entity.type) ? entity.modifications ?? [] : [];
+    out.push(modifications.length === 0 ? entity : { ...entity, modifications: [] });
+    for (const one of modifications) {
+      out.push({ type: "modification", copies: 1, modifications: [],
+                 value: `${letters.get(index)}${one.position} ${String(one.code ?? "").toUpperCase()}` });
+    }
+  });
+  return out;
+}
+
 /** How they are labelled, in the order the menu offers them. */
 export const ENTITY_LABELS = {
   protein: "Protein", dna: "DNA", rna: "RNA", ligand: "Ligand (CCD)",
-  smiles: "Ligand (SMILES)", bond: "Bond", crosslink: "Crosslink",
+  smiles: "Ligand (SMILES)", modification: "Modification", bond: "Bond", crosslink: "Crosslink",
   pocket: "Pocket (constraint)", contact: "Contact (constraint)",
 };
 
@@ -307,26 +362,27 @@ export function chainLetter(asym) {
  * The chains the rows will fold, lettered as expandEntities letters them: every polymer copy first, in row order, then
  * every ligand copy. What the bond, contact, pocket and crosslink pickers offer.
  *
- * @returns {{letter: string, kind: string, residues: string[], name: string}[]} `residues` one letter (a polymer) or
- *   one CCD code (a ligand) a residue; a SMILES ligand is one residue named by its row
+ * @returns {{letter: string, kind: string, entity: number, residues: string[], name: string}[]} `entity` the row it
+ *   is a copy of; `residues` one letter (a polymer) or one CCD code (a ligand) a residue; a SMILES ligand is one
+ *   residue named by its row
  */
 export function rowChains(entities) {
   const polymers = [];
   const ligands = [];
-  for (const entity of entities) {
-    if (!isChainEntity(entity)) continue;
+  entities.forEach((entity, index) => {
+    if (!isChainEntity(entity)) return;
     const copies = Number.isInteger(entity.copies) && entity.copies > 0 ? entity.copies : 1;
     for (let copy = 0; copy < copies; copy += 1) {
       if (POLYMER_TYPES.includes(entity.type)) {
-        polymers.push({ kind: entity.type, residues: [...cleanSequence(entity.value)] });
+        polymers.push({ kind: entity.type, entity: index, residues: [...cleanSequence(entity.value)] });
       } else if (entity.type === "smiles") {
-        ligands.push({ kind: "smiles", residues: ["LIG"] });
+        ligands.push({ kind: "smiles", entity: index, residues: ["LIG"] });
       } else {
         const codes = entity.value.trim().toUpperCase().split(",").map((code) => code.trim()).filter(Boolean);
-        ligands.push({ kind: "ligand", residues: codes.length === 0 ? ["?"] : codes });
+        ligands.push({ kind: "ligand", entity: index, residues: codes.length === 0 ? ["?"] : codes });
       }
     }
-  }
+  });
   return [...polymers, ...ligands].map((chain, asym) => {
     const n = chain.residues.length;
     const name = POLYMER_TYPES.includes(chain.kind)
@@ -468,6 +524,10 @@ export function modificationProblem(modification, sequence) {
  */
 export function entityProblem(entity) {
   if (!ENTITY_TYPES.includes(entity.type)) return `Unknown entity type ${entity.type}`;
+  if (entity.type === "modification") {
+    // (one that names a polymer chain was folded into it by foldModificationRows; this is what was left)
+    return entity.problem ?? "A modification is a residue and a CCD code, as A3 SEP";
+  }
   if (entity.type === "pocket") {
     return parsePocket(entity.value) === null
       ? "A pocket is a binder chain and the residues it sits by, as B: A9, A12, A16 @ 6 (Angstrom)" : null;
@@ -654,7 +714,8 @@ export function expandEntities(entities) {
   for (const entity of entities) {
     // 🔴 A CONTACT IS NOT A CHAIN, and the `else` below would make it a LIGAND.
     // Handled after the loop, once the chains it names exist. Nor is a constraint.
-    if (entity.type === "bond" || entity.type === "crosslink" || CONSTRAINT_TYPES.includes(entity.type)) continue;
+    if (entity.type === "bond" || entity.type === "crosslink" || entity.type === "modification"
+        || CONSTRAINT_TYPES.includes(entity.type)) continue;
     for (let copy = 0; copy < entity.copies; copy += 1) {
       if (POLYMER_TYPES.includes(entity.type)) {
         for (const modification of entity.modifications ?? []) {
