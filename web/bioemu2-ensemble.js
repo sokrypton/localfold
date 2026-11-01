@@ -8,10 +8,16 @@
  * and orders the play bar along PC1, so the animation sweeps across the distribution rather
  * than through the order the samples happened to be drawn.
  *
+ * The frames themselves are superposed in play-bar order, each onto the one before it (`alignSequentially`), so
+ * stepping through them shows the molecule changing rather than tumbling: BioEmu2 centres every sample but leaves
+ * it in the random orientation its sampler ended in.
+ *
  * 🔴 DISTANCES, NOT COORDINATES. A distance matrix needs no superposition, so the plot does not
  * depend on which frame anything was aligned to, and a sample that is the same shape rotated is
  * the same point.
  */
+
+import { weightedRigidAlign } from "../cpu/af3/diffusion/rigid-align.js";
 
 /** Pairs within this many angstroms count as a contact - the 8 A CA rule the contact maps use. */
 export const ENSEMBLE_CONTACT_CUTOFF = 8;
@@ -191,4 +197,27 @@ export function orderAlongPc1(pca, count) {
   const order = Array.from({ length: count }, (_, i) => i);
   if (pca === null) return order;
   return order.sort((a, b) => pca.scores[a][0] - pca.scores[b][0] || a - b);
+}
+
+/** Weights for a superposition over the representatives: one at each, zero elsewhere. */
+export function representativeWeights(reps, atoms) {
+  const weights = new Float32Array(atoms);
+  for (const a of reps) if (a >= 0 && a < atoms) weights[a] = 1;
+  return weights;
+}
+
+/**
+ * Each sample superposed onto the one before it, in the order given - the play bar's - over the representatives.
+ * The first stays where it is; a chain of small moves rather than everything onto one reference, so a frame lines up
+ * with its neighbour even where the ensemble wanders far from where it started.
+ *
+ * @returns {Float32Array[]} new arrays, the inputs untouched
+ */
+export function alignSequentially(samples, reps) {
+  if (samples.length === 0) return [];
+  const atoms = samples[0].length / 3;
+  const weights = representativeWeights(reps, atoms);
+  const out = [Float32Array.from(samples[0])];
+  for (let k = 1; k < samples.length; k += 1) out.push(weightedRigidAlign(samples[k], out[k - 1], weights, atoms));
+  return out;
 }

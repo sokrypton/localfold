@@ -71,6 +71,47 @@ export function releaseBioemu2(device) {
 }
 
 /**
+ * The page's Contact rows (web/entities.js `constraints`, each end an asym, a residue and maybe an atom) as BioEmu2's
+ * own Contact list - `{token1: {asym_id, res_id, atom_name?}, token2, max_distance}`, which parseContacts reads.
+ *
+ * 🔴 ONE INPUT FOR A CONTACT, THE ROW. BioEmu2 had a JSON box of its own, added before the Contact row existed, and
+ * the row refused BioEmu2 by saying it "was not trained with pocket or contact constraints" - when contact
+ * conditioning is one of BioEmu2's modes. A Pocket row has no BioEmu2 counterpart and is refused by name.
+ *
+ * 🔴 AN ASYM IS NAMED BY THE JOB THE FEATURISER READS, not by its letter. `expandEntities` numbers polymers first
+ * and ligands after them; `jobInputJson` hands out ids in row order. They agree unless a ligand row sits above a
+ * polymer row, and then a letter would name the wrong chain - so each asym is looked up in the job itself.
+ *
+ * @param constraints the request's `constraints` (pockets and contacts, row order)
+ * @param jobJson the job as `jobInputJson` writes it
+ * @returns {object[]|null} the contact list, or null with no contact rows
+ */
+export function bioemu2ContactsFromRows(constraints, jobJson) {
+  const rows = constraints ?? [];
+  if (rows.some((row) => row.kind === "pocket")) {
+    throw new Error("BioEmu2 conditions on contacts, not pockets: write each pocket residue as a Contact row, or"
+      + " choose Boltz-2 or Chai-1");
+  }
+  const contacts = rows.filter((row) => row.kind === "contact");
+  if (contacts.length === 0) return null;
+  const job = typeof jobJson === "string" ? JSON.parse(jobJson) : jobJson;
+  const polymers = [];
+  const ligands = [];
+  for (const entry of job.sequences ?? []) {
+    const [[kind, body]] = Object.entries(entry);
+    const ids = Array.isArray(body.id) ? body.id : [body.id];
+    (["protein", "dna", "rna"].includes(kind) ? polymers : ligands).push(...ids);
+  }
+  const idOf = [...polymers, ...ligands];
+  const token = (end) => {
+    const id = idOf[end.asym];
+    if (id === undefined) throw new Error(`a Contact row names chain ${end.asym + 1}, and the fold has ${idOf.length}`);
+    return { asym_id: id, res_id: end.residue, ...(end.atom === undefined ? {} : { atom_name: end.atom }) };
+  };
+  return contacts.map((row) => ({ token1: token(row.token1), token2: token(row.token2), max_distance: row.maxDistance }));
+}
+
+/**
  * The page's rows -> BioEmu2's features.
  *
  * @param jobJson the job as `jobInputJson` writes it

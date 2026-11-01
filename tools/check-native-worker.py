@@ -238,9 +238,10 @@ def cases(offline):
          "entities": [protein(S6)], "job": j6, "samples": 4, "bioemu2Frame": "previous"},
          ("previous", "A"), 3.0, 68, None),
         ("bioemu2 6mrr equilibrium, contacts", {"family": "bioemu2",
-         "controls": be2(**{"bioemu2-mode": "equilibrium", "bioemu2-samples": "2",
-                            "bioemu2-contacts": open(f"{FIX}/bioemu2/contacts.json").read()}),
-         "entities": [protein(S6)], "job": j6, "samples": 2}, ("chain", "A"), None, 68, None),
+         "controls": be2(**{"bioemu2-mode": "equilibrium", "bioemu2-samples": "2"}),
+         # (the page sends its Contact rows converted, as the job's bioemu2Contacts: web/bioemu2-model.js)
+         "entities": [protein(S6)], "job": j6, "samples": 2,
+         "bioemu2Contacts": json.load(open(f"{FIX}/bioemu2/contacts.json"))}, ("chain", "A"), None, 68, None),
         # 🔴 AND A SECOND FOLD OF THE SAME LENGTH IS THE FIRST FOLD: the resident server once kept a triangle mask by its
         # address, which the denoiser's buffers overwrote, so every same-length fold after the first was garbage
         ("bioemu2 6mrr again (the resident server, warm)", {"family": "bioemu2", "controls": be2(**{"bioemu2-samples": "2"}),

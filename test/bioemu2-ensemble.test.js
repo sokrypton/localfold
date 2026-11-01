@@ -8,7 +8,7 @@
  */
 import assert from "node:assert/strict";
 import { describe, it } from "./harness.js";
-import { distanceFeatures, ensembleContacts, ensemblePca, orderAlongPc1, pca2, representativeAtoms }
+import { alignSequentially, distanceFeatures, ensembleContacts, ensemblePca, orderAlongPc1, pca2, representativeAtoms }
   from "../web/bioemu2-ensemble.js";
 import { bioemu2Batches } from "../webgpu/bioemu2/fold.js";
 
@@ -90,5 +90,19 @@ describe("BioEmu2's denoiser batches", () => {
     assert.deepEqual(bioemu2Batches(12), { batches: 3, size: 4 });
     assert.deepEqual(bioemu2Batches(100), { batches: 20, size: 5 });
     assert.deepEqual(bioemu2Batches(8, 8), { batches: 1, size: 8 });
+  });
+});
+
+describe("the ensemble's frames", () => {
+  it("are superposed each on the one before it", () => {
+    // one bent chain, then the same chain rotated 90 degrees about z and moved: superposed, it lands back on the first
+    const a = chain(5, 3.8, 6);
+    const b = new Float32Array(a.length);
+    for (let i = 0; i < 5; i += 1) { b[i * 3] = -a[i * 3 + 1] + 10; b[i * 3 + 1] = a[i * 3]; b[i * 3 + 2] = a[i * 3 + 2] - 4; }
+    const [first, second] = alignSequentially([a, b], Int32Array.from([0, 1, 2, 3, 4]));
+    assert.deepEqual(Array.from(first), Array.from(a));
+    assert.ok(second.every((v, k) => Math.abs(v - a[k]) < 1e-3), `not superposed: ${Array.from(second)}`);
+    // the inputs are untouched
+    assert.equal(b[0], -a[1] + 10);
   });
 });

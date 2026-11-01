@@ -1008,7 +1008,10 @@ class Worker:
             raise Refused("BioEmu2 propagation runs unsteered here; use the edm sampler to propagate")
         if sampler != "edm":
             export.append("--steering")
-        contacts = (controls.get("bioemu2-contacts") or "").strip()
+        # the page's Contact rows, as BioEmu2's Contact list (web/bioemu2-model.js bioemu2ContactsFromRows) - the job's
+        # `bioemu2Contacts`; `bioemu2-contacts` is the JSON box a page before the rows sent
+        contacts = json.dumps(job["bioemu2Contacts"]) if job.get("bioemu2Contacts") else \
+            (controls.get("bioemu2-contacts") or "").strip()
         if contacts:
             path = os.path.join(WORK, "contacts.json")
             with open(path, "w") as handle:
