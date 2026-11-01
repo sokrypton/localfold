@@ -487,6 +487,9 @@ async function attempt(name, index) {
         ...(cfg.percentX === undefined ? {} : { percentX: cfg.percentX }),
         // `composition`: the starting sequence's known letters drawn by these weights instead of uniformly
         ...(cfg.composition === undefined ? {} : { composition: cfg.composition }),
+        // `excludeP`: no proline in the starting sequence (the loop's MPNN already omits it on the first design cycle;
+        // at 90% X the start holds ~0.5 prolines, fully random ~5)
+        ...(cfg.excludeP === undefined ? {} : { excludeP: cfg.excludeP }),
         // `omit`: letters MPNN may never write, per task (a DNA binder without D/E is basic) - the loop's own default is "C"
         ...(cfg.omit?.[t.task] === undefined ? {} : { omit: cfg.omit[t.task] }),
         veto: ({ pdb }) => contactProblem(pdb, { chain: "A" }),
