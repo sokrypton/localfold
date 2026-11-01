@@ -1210,6 +1210,27 @@ criterion is the task's own. `task-score.py` reports each variant against its ow
       Protenix-2, Boltz-2, Chai-1 and ESMFold2 (xeval.py).
     - The goal is a designer x evaluator matrix: AF3, AF3 int5, Boltz-2, Chai-1 and RFD4-Proteina designs, each
       judged by every model. Running.
+- **The full matrix, both sides x every task x eight neutral judges (2026-11-01):** RFD4-Proteina's designs for
+  every task (`rfd4-gen.py`, "high", 2 a target: `P-<run>.jsonl`) and ours, each refolded by Protenix-2, Boltz-2,
+  Chai-1, RoseTTAFold3, IntelliFold-2, OpenBind-0, OpenDDE and Mol-1 (`X-`/`P-<run>-<model>.jsonl`, `x-<model>-NC`
+  / `-RFD4P` for PPI). Ours wins **PPI under 5 of 8** (Protenix-2 25.1/15.4, Boltz-2 23.8/16.7, Chai-1 26.7/21.2,
+  OpenBind-0 28.4/18.8, Mol-1 20.0/15.4; loses RoseTTAFold3 8.3/19.6, IntelliFold-2 10.8/14.6, OpenDDE 10.4/14.6).
+  As a vote of the eight: >=4 judges 20.0/17.9, all eight 2.1/4.6. **Every other task loses under all eight (0 of
+  40 cells)**: sm 4-28 against 27-52, AME fixed 0-8 against 3-18, AME unfixed 0-7 against 3-22, DNA 0-3 against
+  2-30, DNA fixed 0-5 against 0-22. The designs that win most under AF3 fall furthest outside it: the loop fits
+  the model it designs with.
+  - TS9 (sm unfixed, disco stop), all eight judges: 33-42% on the disco criterion against RFD4-Proteina's 62-69;
+    on the sm criterion worse than TS7.
+  - TS7P (Protenix-2 designs, Protenix-2 + Boltz-2 check, AF3 judges), stopped at 21: **2/21** against
+    RFD4-Proteina's 40.5% and TS7's 66.7% on the same targets. Generation without AF3 fits Protenix-2 the same way.
+  - NCR (RFD4-Proteina as the loop's sequence designer), AF3 rescore of all 46: **0** against NC's 14; the loop's
+    own check already said iPAE 7-21.
+  - 🔴 cuda/af3 capture fixes this needed: roomFor repeats its eager answer inside a capture (e5a23c20), and
+    `tools/ppi-bench/gpu-slot` caps standalone folds at two, because several queues each sizing scratch from free
+    memory killed one another out of memory.
+  - Running: TS7C - AF3 designs, a design counts only if AF3, Protenix-2 and Boltz-2 all pass (iPAE <= 1.5), judged
+    by the six models it does not use; and NIF/NOB/NDD/NRF, PPI designed by IntelliFold-2 / OpenBind-0 / OpenDDE /
+    RoseTTAFold3 and judged by AF3.
 - **One task at a time from here** (the user's call): the other tasks' runs are SIGSTOPped and a queue resumes each
   when the one before finishes: PPI, then sm, AME, DNA, fixed DNA, then TD21F and TD19.
 
