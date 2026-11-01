@@ -50,7 +50,7 @@ import { BIOEMU2_COUNTS, BIOEMU2_DEFAULT_STEPS, bioemu2Features, bioemu2Network,
 import { alignSequentially, ensembleContacts, ensemblePca, orderAlongPc1, representativeAtoms, representativeWeights }
   from "./bioemu2-ensemble.js";
 import { weightedRigidAlign } from "../cpu/af3/diffusion/rigid-align.js";
-import { foldBioemu2 } from "../webgpu/bioemu2/fold.js";
+import { BIOEMU2_MAX_BATCH, bioemu2Batches, foldBioemu2 } from "../webgpu/bioemu2/fold.js";
 import { alphaCarbonSpacings, bioemu2Pdb } from "../shared/bioemu2/structure.js";
 import { BioEmu2Graph } from "../shared/bioemu2/graph.js";
 import { checkPhysicality } from "../shared/bioemu2/physicality.js";
@@ -4114,10 +4114,13 @@ async function foldWithBioemu2({ chains, chainKinds, alignment, alignmentBlocks,
   const landed = [];
   // ...and as drawn, each superposed on the one before it
   const shown = [];
-  // the first sample's denoised structure, every few steps, as the play bar's live frames - until
-  // the first batch of samples lands, after which the play bar is the ensemble
+  // the first sample's denoised structure, every few steps, as the play bar's live frames - for ONE sample only.
+  // 🔴 AN ENSEMBLE IS ONE FRAME A SAMPLE FROM THE START: its play bar is the distribution, and a denoising walk in
+  // front of the first batch (frames that were not samples, then replaced by the ones that were) read as part of it.
+  // Each sample joins as it lands (onSamples); the play bar is re-sorted along PC1 and re-superposed once all are in.
+  const ensemble = samples > 1 && !propagation;
   const drawLive = (denoised) => {
-    if (signal.aborted || landed.length > 0 || api?.frameFromText === undefined) return;
+    if (signal.aborted || ensemble || landed.length > 0 || api?.frameFromText === undefined) return;
     const registry = window.py2dmol_viewers ?? {};
     const renderer = registry[Object.keys(registry)[0]]?.renderer;
     const object = renderer?.objectsData?.[renderer?.currentObjectName];
@@ -4188,6 +4191,7 @@ async function foldWithBioemu2({ chains, chainKinds, alignment, alignmentBlocks,
     }
     return pca;
   };
+  const { batches } = bioemu2Batches(samples, BIOEMU2_MAX_BATCH);
   const result = await foldBioemu2(device, loaded.read, features, {
     network, samples, steps, seed: randomSeed(), mode, propagation, passes: recycleCount() + 1, onSamples,
     // the distogram's contact map exists before any structure does, and is shown as the trunk's is
@@ -4203,7 +4207,11 @@ async function foldWithBioemu2({ chains, chainKinds, alignment, alignmentBlocks,
         progress(0.15 * done / total);
         return;
       }
-      status(`${modelName} · sampling ${done}/${total}`);
+      // (an ensemble says which batch, since nothing is drawn until one finishes)
+      status(ensemble && batches > 1
+        ? `${modelName} · sampling batch ${Math.min(batches, Math.floor((done - 1) / (total / batches)) + 1)} of ${batches}`
+          + ` · ${landed.length} of ${samples} samples · step ${done}/${total}`
+        : `${modelName} · sampling ${done}/${total}`);
       progress(0.15 + 0.85 * done / total);
       if (denoised !== undefined && (done % every === 0 || done === total)) drawLive(denoised);
     },
