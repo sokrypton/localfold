@@ -1123,6 +1123,10 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                      people named in its own "Running other models through this
                      code", AlphaFold and ColabFold's MMseqs2 server, which is
                      where a citation is looked for. -->
+                <!-- A button, not a link: it opens #credits below rather than
+                     going anywhere, and the README stays the place a citation
+                     is looked for. -->
+                <button type="button" id="credits-open" class="footer-credits">Credits</button>
             </div>
             <!-- 🔴 TRACKS THE ALIGNMENT MODE. It read "No data is uploaded to a
                  server", which stopped being true when remote MSA search became
@@ -1223,6 +1227,57 @@ AI Context: STANDALONE WEB APP ENTRY POINT
         <!-- 🔴 REMEMBERED, AND SAID TO BE. An acknowledgement that silently
              never returns looks like it did not register the first time. -->
         <p class="terms-note">Accepting is remembered on this browser.</p>
+      </form>
+    </dialog>
+
+    <!-- The people whose work runs on this page. Opened from the footer's
+         Credits button; README.md's "Acknowledgments and citation" is the long
+         form, with what to cite. -->
+    <dialog id="credits" class="terms-dialog credits-dialog" aria-labelledby="credits-title">
+      <form method="dialog" class="terms-form">
+        <h2 id="credits-title" class="terms-title">Credits</h2>
+        <p class="terms-body">
+          LocalFold began as a fork of
+          <a href="https://github.com/martin-steinegger/alphafold2-webgpu" target="_blank" rel="noopener noreferrer">AlphaFold2 WebGPU</a>
+          by Martin Steinegger. The viewer is
+          <a href="https://github.com/sokrypton/py2Dmol" target="_blank" rel="noopener noreferrer">py2Dmol</a>,
+          and the alignment search is the
+          <a href="https://github.com/sokrypton/ColabFold" target="_blank" rel="noopener noreferrer">ColabFold</a>
+          MMseqs2 server (Milot Mirdita, Martin Steinegger).
+        </p>
+        <p class="terms-body">
+          The models beyond AlphaFold 2 are ported from and checked against
+          <a href="https://github.com/sokrypton/alphafold3" target="_blank" rel="noopener noreferrer">sokrypton/alphafold3</a>,
+          with work by Marielle Russo (@maraxen), ChoongHwanLee (@chlee19990109-cloud),
+          juliabuhmann (@juliabuhmann) and Milot Mirdita (@milot-mirdita).
+        </p>
+        <h3 class="credits-heading">Methods borrowed</h3>
+        <ul class="credits-list">
+          <li><a href="https://arxiv.org/abs/2610.23703" target="_blank" rel="noopener noreferrer"><strong>Blitz</strong></a>
+            (Vinay Saji Mathew, Soundar Kumara, Gretta Kellogg, William K. M. Lai):
+            the diffusion sampler's exponential update and geometric noise
+            schedule, used by every AlphaFold 3-family model here.</li>
+          <li><strong>Synthyra</strong>: the ESMFold2 confidence head (pLDDT, PAE,
+            pTM), trained on ESMFold2's frozen trunk -
+            <a href="https://github.com/Synthyra/FastPLMs" target="_blank" rel="noopener noreferrer">FastPLMs</a>,
+            <a href="https://huggingface.co/Synthyra/ESMFold2-600" target="_blank" rel="noopener noreferrer">ESMFold2-600</a>.</li>
+        </ul>
+        <h3 class="credits-heading">Models</h3>
+        <ul class="credits-list">
+          <li>AlphaFold 2 and AlphaFold 3 - Google DeepMind</li>
+          <li>OpenBind-0 (OpenFold3 v0.5.0) - OpenBind</li>
+          <li>OpenDDE - Aureka Research</li>
+          <li>Boltz-2 - the Boltz team</li>
+          <li>Protenix-2 - ByteDance</li>
+          <li>Mol-1 - Molence Bio</li>
+          <li>IntelliFold-2 - IntelliGen AI</li>
+          <li>RoseTTAFold3 - Baker lab / RosettaCommons</li>
+          <li>ESMFold2 and ESM-C - Biohub</li>
+          <li>BioEmu2 - Microsoft Research</li>
+        </ul>
+        <div class="terms-actions">
+          <button type="submit" value="close" class="terms-button">Close</button>
+        </div>
       </form>
     </dialog>
 

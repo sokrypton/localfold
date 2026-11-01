@@ -1775,3 +1775,22 @@
   cursor: pointer;
 }
 .entity-template-fetch:hover { background: #f3f4f6; }
+
+/* The footer's Credits button, dressed as the footer's links, and the dialog
+   it opens - the terms dialog's frame, with room for two short lists. */
+.footer-credits {
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  color: #3b82f6;
+  cursor: pointer;
+}
+.footer-credits:hover { text-decoration: underline; }
+.credits-dialog { max-width: 520px; }
+.credits-dialog a { color: #2563eb; }
+.credits-heading { margin: 4px 0 0; font-size: 12.5px; font-weight: 600; color: #111827; }
+.credits-list { margin: 0; padding-left: 18px; font-size: 12px; line-height: 1.5; color: #374151; }
+@media (max-width: 560px) {
+  .credits-dialog { max-width: calc(100vw - 24px); }
+}
