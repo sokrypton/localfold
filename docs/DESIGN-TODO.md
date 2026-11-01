@@ -1238,6 +1238,13 @@ criterion is the task's own. `task-score.py` reports each variant against its ow
   loses: NCI1 1/24; NCI3 (Chai-1 designs from both models' structures) and NCI4 (both fold every cycle, worse score
   counts) 0/13 each, stopped. Which model DESIGNS decides it; the pair helps as a check, not as a designer. Small
   molecules next with the same split: TSI2/TSIF on TS7P's 21 targets.
+- **Small molecules are NOT won that way (2026-11-01)**: **TSI2A** (IntelliFold-2 designs with the alanine ramp,
+  IntelliFold-2 + Chai-1 check) passes **15/77 (19.5%)** under AF3 against RFD4-Proteina's 34.3%. TS7P's 21 targets
+  flattered it - 17/42 (40.5%) there against 41.6%, five of its eight passes metal ions - and the other 56 gave 7.
+  🔴 The check is not the limit: 40 of 77 attempts never produced a promising candidate, 5 checks passed and 4 of
+  those passed AF3. The designer is. Not ahead on the 21 either: Protenix-2 designing with an IntelliFold-2 check (TSP2
+  4/21, TSPI 3/21: IF2 reads Protenix-2's designs at iPAE 2-18), 20 restarts (TSI2D 7/21). Next: the five untried
+  models as designers (TSX-*), same check, every 4th of the 77 targets (TSI2A 3/20 there).
 - **One task at a time from here** (the user's call): the other tasks' runs are SIGSTOPped and a queue resumes each
   when the one before finishes: PPI, then sm, AME, DNA, fixed DNA, then TD21F and TD19.
 
