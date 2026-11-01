@@ -199,6 +199,13 @@ def cases():
          ["--template=@F/6mrr-crystal.pdb:A@0"], AF3_FAMILIES),
         ("tmpl-four", "af3", job("t", [protein("A", caj)]),
          ["--template=" + ",".join(["@F/5caj-crystal.pdb:A@0"] * 4)], AF3_FAMILIES),
+        # (each chain's own template PACKED into one slot as AF3 does - "&", what the worker sends for the page's rows,
+        # the cross-chain block masked: the same bytes as tmpl-1brs-nospan; and six copies of a homomer, one slot
+        # where a slot a copy was six and refused)
+        ("tmpl-1brs-packed", "af3", job("t", [protein("A", brs_a), protein("D", brs_d)]),
+         ["--template=@F/1brs-crystal.pdb:A@0&@F/1brs-crystal.pdb:D@1"], AF3_FAMILIES),
+        ("tmpl-homomer-packed", "af3", job("t", [protein(c, SEQ_6MRR) for c in "ABCDEF"]),
+         ["--template=" + "&".join(f"@F/6mrr-crystal.pdb:A@{i}" for i in range(6))], ["af3", "rosettafold3"]),
     ]
     # chai-1's own MSA inputs (shared/af3/featurise/chai-msa.js): a chain's uint8 profile over its deduplicated rows (600
     # rows: a column's count passes 256 and wraps), the single-sequence context of a modified protein and a DNA chain

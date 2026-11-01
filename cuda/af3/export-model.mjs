@@ -315,10 +315,13 @@ if (dialect.structuralTokens) {
   }
 }
 // --template=<pdb or cif>:<chain>[@<query chain index>], comma-separated, one slot each (at most
-// four); parts joined by "+" share ONE slot, as AF3 puts each chain's k-th template in slot k -
-// e.g. 1brs.pdb:A@0+1brs.pdb:D@1 - and that merged slot may speak across the chains it covers
-// (--no-span-chains masks the cross-chain block). Each part is built by the page's own
-// buildTemplate.
+// four). Parts share ONE slot two ways:
+//   "+"  one structure placing several chains - e.g. 1brs.pdb:A@0+1brs.pdb:D@1 - and the merged slot
+//        may speak across the chains it covers (--no-span-chains masks the cross-chain block): a
+//        MULTI-CHAIN template;
+//   "&"  each chain's own template packed into one slot as AF3 puts every chain's k-th in slot k, the
+//        cross-chain block always masked - what the worker sends for the page's rows.
+// A slot uses one or the other. Each part is built by the page's own buildTemplate.
 const templateSpecs = option("template", "").split(",").filter(Boolean);
 const TEMPLATES = 4;                    // the padded slot count every family folds with
 if (templateSpecs.length > TEMPLATES) throw new Error("at most four template slots");
@@ -338,7 +341,9 @@ if (templateSpecs.length > 0) {
   const residuesOfChain = [];
   Array.from(batch.chainOfResidue).forEach((chain, residue) => (residuesOfChain[chain] ??= []).push(residue));
   templateSpecs.forEach((spec, k) => {
-    const parts = spec.split("+").map((part) => {
+    const packed = spec.includes("&");
+    if (packed && spec.includes("+")) throw new Error(`template slot ${k} joins parts with both "+" and "&"`);
+    const parts = spec.split(packed ? "&" : "+").map((part) => {
       const [where, target = "0"] = part.split("@");
       const cut = where.lastIndexOf(":");
       const path = where.slice(0, cut), chain = where.slice(cut + 1) || undefined, index = Number(target);
@@ -354,7 +359,7 @@ if (templateSpecs.length > 0) {
     }).filter((one) => one !== null);
     if (parts.length === 0) return;
     const slot = parts.length === 1 ? parts[0] : mergeTemplateSlots(parts);
-    const spanChains = parts.length > 1 && !args.includes("--no-span-chains");
+    const spanChains = parts.length > 1 && !packed && !args.includes("--no-span-chains");
     slots.push({ slot, mask: multichainMaskFor(batch.asymId, batch.tokens,
                                                { coverage: coverageOf(slot, batch.tokens), spanChains }) });
   });
@@ -398,20 +403,23 @@ if (args.includes("--search-templates")) {
   if (extraSlotParts.length === 0) console.log("search: no template hits");
 }
 // ...--template-search-chains=<fold chains>: the page's "from the MSA search" template (web/app.js): each
-// listed chain's BEST hit from the same search, in a slot of its own; a chain the search found nothing
-// for is an error, as it is on the page
+// listed chain's BEST hit from the same search, every chain's in ONE slot as AF3 packs a chain's first
+// template (web/af3-model.js packTemplateSlots) - a slot a chain refused six copies of a homomer; a
+// chain the search found nothing for is an error, as it is on the page
 const searchChains = option("template-search-chains", "").split(",").filter(Boolean).map(Number);
 if (searchChains.length > 0) {
   if (searchedHits === null) throw new Error("--template-search-chains needs --search: the hits come from that search");
   const { fetchMmseqs2Templates } = await import(`${repo}/shared/input/mmseqs2-api.js`);
   const hits = new Map([...searchedHits].map(([at, found]) => [searchedProteinAt[at] ?? at, found]));
+  const parts = [];
   for (const chain of searchChains) {
     const best = (hits.get(chain) ?? [])[0];
     if (best === undefined) throw new Error(`the search found no template for chain ${chain + 1}`);
     const text = (await fetchMmseqs2Templates([best.target])).get(best.id);
     if (text === undefined) throw new Error(`no structure came back for ${best.target}`);
-    extraSlotParts.push([{ text, chainId: best.chain, chain, label: `search hit ${best.target}` }]);
+    parts.push({ text, chainId: best.chain, chain, label: `search hit ${best.target}` });
   }
+  extraSlotParts.push(parts);
 }
 if (extraSlotParts.length > 0) {
   const { buildTemplate } = await import(`${repo}/web/template-source.js`);

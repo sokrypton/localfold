@@ -146,7 +146,12 @@ inline void addTemplates(Af3Export& out, const Args& args, const Batch& batch, c
   if ((int)specs.size() > TEMPLATES) throw std::runtime_error("at most four template slots");
   for (size_t k = 0; k < specs.size(); ++k) {
     std::vector<TemplateSlot> parts;
-    for (auto& part : splitOn(specs[k], '+')) {
+    // "+": one structure placing several chains, which may speak across them; "&": each chain's own template packed
+    // into one slot as AF3 does, the cross-chain block masked (export-model.mjs says the same)
+    bool packed = specs[k].find('&') != std::string::npos;
+    if (packed && specs[k].find('+') != std::string::npos)
+      throw std::runtime_error("template slot " + std::to_string(k) + " joins parts with both \"+\" and \"&\"");
+    for (auto& part : splitOn(specs[k], packed ? '&' : '+')) {
       auto at = part.find('@');
       std::string where = part.substr(0, at), target = at == std::string::npos ? "0" : part.substr(at + 1);
       size_t cut = where.rfind(':');
@@ -162,7 +167,7 @@ inline void addTemplates(Af3Export& out, const Args& args, const Batch& batch, c
     }
     if (parts.empty()) continue;   // (every part dropped by the model's template policy)
     TemplateSlot slot = parts.size() == 1 ? parts[0] : mergeTemplateSlots(parts);
-    bool spanChains = parts.size() > 1 && !args.has("no-span-chains");
+    bool spanChains = parts.size() > 1 && !packed && !args.has("no-span-chains");
     std::vector<float> coverage = coverageOf(slot, tokens);
     slots.push_back({slot, multichainMaskFor(batch.asymId, tokens, &coverage, spanChains)});
   }
@@ -210,12 +215,14 @@ inline void addTemplates(Af3Export& out, const Args& args, const Batch& batch, c
     }
     if (extra.empty()) out.said.push_back("search: no template hits");
   }
-  // --template-search-chains: the page's "from the MSA search" - each listed chain's BEST hit, a slot of its own
+  // --template-search-chains: the page's "from the MSA search" - each listed chain's BEST hit, every chain's in ONE slot as AF3
+  // packs a chain's first template (web/af3-model.js packTemplateSlots; a slot a chain refused six copies of a homomer)
   auto searchChains = splitNonEmpty(args.option("template-search-chains"), ',');
   if (!searchChains.empty()) {
     if (!found.searched) throw std::runtime_error("--template-search-chains needs --search: the hits come from that search");
     std::map<int, std::vector<search::Hit>> byChain;
     for (auto& [at, hits] : found.hits) byChain[at < (int)found.proteinAt.size() ? found.proteinAt[at] : at] = hits;
+    std::vector<TemplatePart> parts;
     for (auto& c : searchChains) {
       int chain = (int)jsNumberOf(c);
       auto it = byChain.find(chain);
@@ -226,8 +233,9 @@ inline void addTemplates(Af3Export& out, const Args& args, const Batch& batch, c
       if (st == structures.end()) throw std::runtime_error("no structure came back for " + best.target);
       TemplatePart p;
       p.text = st->second; p.hasChain = true; p.chain = best.chain; p.queryChain = chain; p.label = "search hit " + best.target;
-      extra.push_back({p});
+      parts.push_back(p);
     }
+    extra.push_back(parts);
   }
   for (size_t k = 0; k < extra.size(); ++k) {
     std::vector<TemplateSlot> parts;

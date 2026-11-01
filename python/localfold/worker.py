@@ -713,8 +713,17 @@ class Worker:
         if named:
             emit("status", f"{family} on {NATIVE_NAME} · templates {', '.join(t['source'] for t in named)}")
         if port == "af3":
+            # as AlphaFold 3 packs them (web/af3-model.js packTemplateSlots): every chain's k-th template in slot k,
+            # joined by "&", which masks the cross-chain block - a slot a ROW (a chain copy) refused six copies of a
+            # homomer ("at most four template slots"), and split a complex's templates across slots. "+" stays free
+            # for a multi-chain template, one structure placing several chains, whose slot may span them.
             if named:
-                flags.append("--template=" + ",".join(f"{t['file']}:{t['chainId'] or ''}@{t['chain']}" for t in named))
+                by_chain = {}
+                for t in named:
+                    by_chain.setdefault(t["chain"], []).append(f"{t['file']}:{t['chainId'] or ''}@{t['chain']}")
+                slots = ["&".join(parts[k] for parts in by_chain.values() if k < len(parts))
+                         for k in range(min(4, max(len(parts) for parts in by_chain.values())))]
+                flags.append("--template=" + ",".join(slots))
         elif named:
             flags.append("--template=" + "+".join(f"{t['file']}:{t['chainId'] or ''}@{t['chain']}" for t in named))
         if searched:

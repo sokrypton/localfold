@@ -60,8 +60,11 @@ ALIGNMENT (none by default: single sequence)
 TEMPLATES (up to four slots)
   --template=<file>:<chain>[@<query chain>]
                            a PDB or mmCIF chain aligned to a query chain (0-based); '+' joins parts into one
-                           slot spanning chains, ',' separates slots:
+                           slot spanning chains (one structure placing several), '&' packs each chain's own
+                           template into one slot as AlphaFold 3 does (chains masked from each other), ','
+                           separates slots:
                            --template=1brs.pdb:A@0+1brs.pdb:D@1
+                           --template=a.pdb:A@0&b.pdb:A@1
   --search-templates       each protein chain's best four hits from the MMseqs2 search
 
 FOLD

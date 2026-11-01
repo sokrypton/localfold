@@ -32,6 +32,7 @@ import { AF3_FAMILIES, bundleBaseUrl, loadManifest }
   from "../shared/bundles/manifests/index.js";
 import { throwIfAborted } from "../webgpu/runtime/abort.js";
 import { buildTemplate } from "./template-source.js";
+import { mergeTemplateSlots } from "../shared/af3/featurise/template-input.js";
 import { yieldToBrowser } from "../webgpu/runtime/yield.js";
 import { af3Plan, af3TrunkStageSpans, RuntimeEstimator }
   from "../webgpu/runtime/cost-model.js";
@@ -362,6 +363,50 @@ const TRUNK_SPANS = af3TrunkStageSpans();
  *          onStatus: (text: string) => void, onProgress: (fraction: number) => void,
  *          onFrame?: (pdb: string, index: number) => void}} options
  */
+
+/** The trunk's template slot count, AlphaFold 3's `max_templates`. */
+const AF3_TEMPLATE_SLOTS = 4;
+
+/**
+ * Per-chain template slots packed the way AlphaFold 3 packs them (model/features.py,
+ * `Templates.compute_features`): each chain keeps its first four templates, and slot k holds
+ * EVERY chain's k-th template at that chain's own tokens - "concatenated on the num_res
+ * dimension", with the multichain mask keeping one chain's template from seeing another's.
+ *
+ * 🔴 ONE SLOT A CHAIN WAS WRONG, AND A HOMOMER FOUND IT: six copies of a chain with one template
+ * each are one slot in AlphaFold 3 and were six here, which the trunk's four slots refused
+ * ("6 templates for 4 slots"). It also split a complex's templates across slots, so a dialect
+ * that averages over PRESENT slots (rf3's) read each chain's template at a fraction of its weight.
+ *
+ * A slot built to span chains (`spanChains`: one structure placing several chains) is already a
+ * whole complex and keeps a slot of its own.
+ *
+ * @param {{chain: number, slot: object}[]} built in request order
+ * @returns {object[]} at most AF3_TEMPLATE_SLOTS slots
+ */
+export function packTemplateSlots(built) {
+  const spanning = built.filter(({ slot }) => slot.spanChains === true).map(({ slot }) => slot);
+  const byChain = new Map();
+  for (const { chain, slot } of built) {
+    if (slot.spanChains === true) continue;
+    if (!byChain.has(chain)) byChain.set(chain, []);
+    byChain.get(chain).push(slot);
+  }
+  const packed = [];
+  for (let k = 0; k < AF3_TEMPLATE_SLOTS; k += 1) {
+    const layer = [...byChain.values()].map((slots) => slots[k]).filter((slot) => slot !== undefined);
+    if (layer.length === 0) break;
+    const merged = mergeTemplateSlots(layer);
+    packed.push(layer.length === 1 ? merged : { ...merged, spanChains: false });
+  }
+  const slots = [...packed, ...spanning];
+  if (slots.length > AF3_TEMPLATE_SLOTS) {
+    throw new Error(`${slots.length} template slots: AlphaFold 3 takes ${AF3_TEMPLATE_SLOTS}`
+      + ` - at most ${AF3_TEMPLATE_SLOTS} templates a chain, including any that span chains`);
+  }
+  return slots;
+}
+
 export async function foldAf3(options) {
   const { sequence, calls, recycles, seed, signal, device, onStatus, onProgress } = options;
   // 🔴 THE SLOTS ARE BUILT HERE, AFTER FEATURISATION, AND NOT BY THE CALLER.
@@ -596,7 +641,7 @@ export async function foldAf3(options) {
   }
   const templateSlots = options.templateSlots ?? (templateSources.length === 0
     ? undefined
-    : templateSources.map((template) => buildTemplate({
+    : packTemplateSlots(templateSources.map((template) => buildTemplate({
       text: template.text,
       chain: template.chainId,
       query: sequence.split(":")[template.chain] ?? "",
@@ -608,10 +653,11 @@ export async function foldAf3(options) {
         ?? -1] ?? -1,
       // (how this model reads a template's modified residues and altlocs: templatePolicyFor)
       policy: templatePolicyFor(options.weights.trunk.dialect),
-    })).filter((built) => built !== null).map((built) => {
+    })).map((built, at) => {
+      if (built === null) return null;
       templateCoverage.push(built.coverage);
-      return built.slot;
-    }));
+      return { chain: templateSources[at].chain, slot: built.slot };
+    }).filter((one) => one !== null)));
 
   // 🔴 THE BATCH, BEFORE THE FOLD RATHER THAN AFTER IT. It is returned below
   // too, and that is too late for anything the TRUNK produces: the contact map
