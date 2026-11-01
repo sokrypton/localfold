@@ -57,3 +57,11 @@ describe("the link pickers' text", () => {
     assert.equal(entityProblem({ type: "contact", value: "A5 - B1 @ 8", copies: 1 }), null);
   });
 });
+
+describe("the crosslinker menu's spacer arms", () => {
+  it("name only crosslinkers the fold knows", async () => {
+    const { CROSSLINKERS } = await import("../shared/chem/crosslinkers.js");
+    const { SPACER_ARM } = await import("../web/link-builder.js");
+    for (const name of Object.keys(SPACER_ARM)) assert.ok(name in CROSSLINKERS, `${name} is not a crosslinker`);
+  });
+});
