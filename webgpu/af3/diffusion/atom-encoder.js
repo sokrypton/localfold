@@ -2068,7 +2068,12 @@ export class Af3AtomEncoderGpu {
       // ...and the chirality term, which adds a BINDING to build-act as well as
       // a term, so a shared pipeline would fail its bind group rather than
       // quietly compute the wrong thing.
-      + `:cg${shape.chiralGradients}`;
+      + `:cg${shape.chiralGradients}`
+      // 🔴 ...and the TRUNK's widths and the block count, which every source
+      // embeds as C_TRUNK_SINGLE, C_TRUNK_PAIR and BLOCKS. AF3's pair is 128
+      // wide and another family's 256 or 448 with the same atom widths, so a
+      // page that folded one and then the other collided here (issue #4).
+      + `:ts${shape.trunkSingleChannels}:tp${shape.trunkPairChannels}:b${shape.blocks}`;
     const compiled = {};
     // 🔴 COMPILED CONCURRENTLY - see the note in pair-track.js.
     const compiling = [];

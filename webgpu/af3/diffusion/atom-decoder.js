@@ -374,7 +374,7 @@ export class Af3AtomDecoderGpu {
       // generated WGSL and every other dimension here can match while it
       // differs, so two models would have shared one compiled kernel - the
       // collision this repository has paid for five times now.
-      + `:tp${shape.trunkPairChannels}`
+      + `:tp${shape.trunkPairChannels}:ts${shape.trunkSingleChannels}:b${shape.blocks}`
       // ...and the two conventions, for the reason the encoder's key names
       // them: the arms index one buffer differently and produce one shape.
       + `:${shape.perBlockPair ? "pb" : ""}${shape.keyMaskedAtomAttention ? "km" : ""}`

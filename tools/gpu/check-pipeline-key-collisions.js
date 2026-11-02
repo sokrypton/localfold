@@ -187,6 +187,9 @@ export async function main(device, args) {
     "/model-rosettafold3-int5/manifest.json",
     "/model-openbind0-f32/manifest.json",
     "/model-opendde-int5/manifest.json",
+    // mol1's diffusion reads a 448-wide trunk pair, which the atom encoder's
+    // key did not name: protenix2 (256) then mol1 collided on the page (#4).
+    "/model-mol1-int5/manifest.json",
   ].join(",")).split(",").map((m) => m.trim()).filter((m) => m !== "");
   const models = [];
   for (const model of requested) {
