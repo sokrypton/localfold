@@ -409,7 +409,13 @@ export async function main(device, args = []) {
     entities: entitiesFor(),
     shape: { ...M, loops: recycles + 1 },
     submissionWindow,
+    // --segment-rows=<a power of two>, --hidden-parts=2: a pair of several buffers and an output of two, at a length that
+    // does not need them, which is how a fold past 1448 tokens is held to the same digits as one that fits one buffer.
+    // --spill: z_init and the head's initial pair wait on the host.
+    ...(option(args, "segment-rows", "") === "" ? {} : { segmentRows: Number(option(args, "segment-rows", "")) }),
+    ...(args.includes("--spill") ? { spillPairs: true } : {}),
     trunk: {
+      ...(option(args, "hidden-parts", "") === "" ? {} : { sequentialHiddenParts: Number(option(args, "hidden-parts", "")) }),
       ...(trunkWeights === "" ? {} : { weightPrecision: trunkWeights }),
       ...(trunkPrecision === "" ? {} : {
         stagedPrecision: trunkPrecision.split(":")[0],
@@ -978,6 +984,9 @@ export async function main(device, args = []) {
   }
 
   return {
+    // Every coordinate's bits, so two runs that should be one number can be compared as one.
+    coordinateHash: new Uint32Array(result.coordinates.buffer, result.coordinates.byteOffset, result.coordinates.length)
+      .reduce((hash, word) => Math.imul(hash ^ word, 16777619) >>> 0, 2166136261),
     confidence: result.confidence === undefined ? undefined : (() => {
       const c = result.confidence;
       const mean = (v) => v.reduce((a, b) => a + b, 0) / v.length;

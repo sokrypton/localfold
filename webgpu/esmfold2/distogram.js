@@ -20,6 +20,7 @@
  */
 import { GRID_WIDTH, LANES, createLinearShader, linearGrid } from "../esmc/block.js";
 import { settleAll } from "../runtime/pipeline-cache.js";
+import { segmentBuffers, segmentedRead } from "../runtime/segmented.js";
 import { MOL_NONPOLYMER, MOL_PROTEIN } from "../../shared/esmfold2/featurise.js";
 import {
   CLASS_AMINO, CLASS_LIGAND, CLASS_NUCLEIC, CLASS_PROTEIN, PSEUDO_BETA_RESIDUES,
@@ -31,9 +32,13 @@ export { CONTACT_EDGES, CERTAINTY, partnerKeys, PARTNER_ANGSTROMS, contactAngstr
 export { CONTACT_ANGSTROMS, CONTACT_ANGSTROMS_BY_KIND, LIGAND_PROTEIN_ANGSTROMS } from "../../shared/heads/contact-threshold.js";
 
 /** `out[i, j] = pair[i, j] + pair[j, i]`, which is what the head is handed. */
-export function createSymmetriseShader({ tokens, channels, chunkRows }) {
+export function createSymmetriseShader({ tokens, channels, chunkRows, segmentRows = tokens * tokens }) {
+  // A row and its mirror are nowhere near each other, so this is the one read of the pair that cannot be a chunk's.
+  const segments = Math.ceil(tokens * tokens / segmentRows);
+  const pairAt = (element) => (segments === 1 ? `pair[${element}]` : `pair_at(${element})`);
   return `
-@group(0) @binding(0) var<storage, read> pair: array<f32>;
+${segments === 1 ? "@group(0) @binding(0) var<storage, read> pair: array<f32>;"
+    : segmentedRead("pair", { firstBinding: 0, moreBindingsFrom: 3, segments, elementsPerSegment: segmentRows * channels })}
 @group(0) @binding(1) var<storage, read> start: array<u32>;
 @group(0) @binding(2) var<storage, read_write> output: array<f32>;
 
@@ -45,7 +50,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let c = i % ${channels}u;
   let row = cell / ${tokens}u;
   let column = cell % ${tokens}u;
-  output[i] = pair[cell * ${channels}u + c] + pair[(column * ${tokens}u + row) * ${channels}u + c];
+  output[i] = ${pairAt(`cell * ${channels}u + c`)} + ${pairAt(`(column * ${tokens}u + row) * ${channels}u + c`)};
 }`;
 }
 
@@ -389,8 +394,9 @@ export async function encodeContactMap(context, { tokens, channels, bins, pair,
   const key = `esmfold2-disto:${tokens}:${channels}:${bins}`;
   // The symmetrised pair is read a chunk at a time by the projection and by nothing else, so it is built a chunk at a
   // time: it was a whole pair-sized tensor beside the trunk's own, at a fold's fullest.
-  const symmetriseCompiling = settleAll(Object.fromEntries(heights.map((rows) => [rows, cache.get(`${key}:sym:${rows}`,
-    createSymmetriseShader({ tokens, channels, chunkRows: rows }))])));
+  const segmentRows = pair.segmentRows ?? pairs;
+  const symmetriseCompiling = settleAll(Object.fromEntries(heights.map((rows) => [rows,
+    cache.get(`${key}:sym:${rows}:${segmentRows}`, createSymmetriseShader({ tokens, channels, chunkRows: rows, segmentRows }))])));
   // 🔴 THE CERTAINTY RIDES ON THE SAME PROJECTION. Its per-pair pass reads the
   // logits chunk the contact pass has just been handed, so the distogram is
   // projected ONCE and both readings come off it. Computing it separately would
@@ -506,7 +512,9 @@ export async function encodeContactMap(context, { tokens, channels, bins, pair,
       const rows = Math.min(height, pairs - start);
       device.queue.writeBuffer(chunkStart.buffer, 0, Uint32Array.of(start));
       await submit("esmfold2.distogram", [
-        ["symmetrise", symmetrise[rows], [pair, chunkStart, symmetric], ...elementwise(rows * channels)],
+        ["symmetrise", symmetrise[rows], pair.segments === undefined ? [pair, chunkStart, symmetric]
+          : [{ buffer: pair.segments[0].buffer }, chunkStart, symmetric, ...segmentBuffers(pair).slice(1)],
+         ...elementwise(rows * channels)],
         ["project", project[rows],
          [symmetric, projection,
           wholeLogits

@@ -9,7 +9,7 @@
  * Nothing here touches a device or the DOM. A plan is advice to the page's preflight, and the fold's own account stays
  * the authority once it is running.
  */
-import { esmfold2PeakBytes, FOLD_MARGIN_BYTES, FOLD_WEIGHT_BYTES, FOLD_WEIGHT_BYTES_F32, pairBytes }
+import { esmfold2PeakBytes, esmfold2TokenCeiling, FOLD_MARGIN_BYTES, FOLD_WEIGHT_BYTES, FOLD_WEIGHT_BYTES_F32, pairBytes }
   from "../webgpu/esmfold2/memory-plan.js";
 
 const RATES_KEY = "localfold.fold-rates";
@@ -74,9 +74,10 @@ export function planEsmfold2({ tokens, loops = 4 }, { preference = "auto", gpu, 
   const least = esmfold2PeakBytes({ tokens, weightBytes, spill: true });
   const over = gpu.budgetBytes !== undefined && gpu.budgetBytes !== null
     && least + FOLD_MARGIN_BYTES > gpu.budgetBytes;
-  const binding = gpu.maxBindingBytes !== undefined && pairBytes(tokens) > gpu.maxBindingBytes;
-  const spills = gpu.budgetBytes !== undefined && gpu.budgetBytes !== null
-    && whole + FOLD_MARGIN_BYTES > gpu.budgetBytes;
+  const binding = gpu.maxBindingBytes !== undefined
+    && tokens > esmfold2TokenCeiling({ maxBindingBytes: gpu.maxBindingBytes });
+  const spills = (gpu.maxBindingBytes !== undefined && pairBytes(tokens) > gpu.maxBindingBytes)
+    || (gpu.budgetBytes !== undefined && gpu.budgetBytes !== null && whole + FOLD_MARGIN_BYTES > gpu.budgetBytes);
   const needBytes = spills ? least : whole;
   const seconds = gpuFoldSeconds({ tokens, loops }) * (rates.cards?.[gpu.name] ?? 1);
   if (binding || over) {
@@ -134,7 +135,7 @@ export function describePlan(plan) {
     case "over":
       return plan.why === "binding"
         ? { text: `Too long for WebGPU${cpuOption}`,
-            title: "This fold's pair tensor is larger than one WebGPU storage binding can address, on any card.",
+            title: "Past the longest fold WebGPU's buffer bindings can address, on any card.",
             tone: "warn" }
         : { text: `Needs ${gib(plan.needBytes)} of ${gib(plan.budgetBytes)} GiB${cpuOption}`,
             title: "More than the page lets one fold hold on this card, which keeps the rest for the desktop and other"
@@ -149,7 +150,7 @@ export function describePlan(plan) {
 /** The same, in a sentence, for a fold that has been refused and offers a way on. */
 export function describeRefusal(plan) {
   if (plan.where === "none") return `This fold needs ${gib(plan.needBytes)} GiB of system memory, more than this machine can spare.`;
-  if (plan.why === "binding") return "This fold's pair tensor is larger than one WebGPU binding can address, on any card.";
+  if (plan.why === "binding") return "This fold is past the longest WebGPU's buffer bindings can address, on any card.";
   return `This fold needs ${gib(plan.needBytes)} GiB, and the page lets one fold hold ${gib(plan.budgetBytes)} GiB on this card.`;
 }
 

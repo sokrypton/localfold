@@ -56,6 +56,7 @@ import {
 } from "../../cpu/esmfold2/sampler.js";
 import { ESMFOLD2_PHASES, esmfold2Plan, trunkPhase } from "./cost.js";
 import { esmfold2Spills, FOLD_WEIGHT_BYTES, FOLD_WEIGHT_BYTES_F32 } from "./memory-plan.js";
+import { allocatePairSized, rangeOf, segmentRowsFor } from "../runtime/segmented.js";
 
 /** The largest pair copied to the host; past it the browser refuses the array. */
 const HOST_PAIR_MAX_BYTES = 1024 * 1024 * 1024;
@@ -432,8 +433,13 @@ export async function foldEsmfold2(device, options) {
     completed = Math.max(completed, plan.languageModelEnd);
     enter(ESMFOLD2_PHASES.embedder);
     await settleReleasedMemory(device);
+    // Past what one buffer or binding can hold, every pair-sized tensor is several buffers bound a chunk at a time. See
+    // webgpu/runtime/segmented.js. Such a fold has no business holding two more of them than it must, so it spills.
+    const segmentRows = options.segmentRows ?? segmentRowsFor(device, pairs, channels * 4);
+    const segmented = segmentRows < pairs;
+    const pairSized = (label, usage) => allocatePairSized(allocator, label, pairs, channels * 4, usage, segmentRows);
     const lmPair = reuse !== undefined ? undefined
-      : keep(allocator.allocate("esmfold2.lm-pair", pairs * channels * 4,
+      : keep(pairSized("esmfold2.lm-pair",
         storage | (options.onLanguagePair !== undefined ? GPUBufferUsage.COPY_SRC : 0)));
     if (reuse === undefined) await mark("language pair", () => encodeLanguagePair(
       { device, allocator, cache, submit },
@@ -524,7 +530,7 @@ export async function foldEsmfold2(device, options) {
       perHeight("esmfold2-recycle-project", (rows) => createLinearShader(
         { rows, inner: channels, outer: channels }, true)),
     ]);
-    const bytesOf = (allocation, offset, size) => ({ buffer: allocation.buffer, byteOffset: offset, byteSize: size });
+    const bytesOf = rangeOf;
     const eachChunk = async (work) => {
       for (let start = 0; start < pairs; start += chunkRows) {
         // eslint-disable-next-line no-await-in-loop
@@ -557,12 +563,12 @@ export async function foldEsmfold2(device, options) {
     const pairBytes = pairs * channels * 4;
     // Whether what a stage only reads waits on the host, which costs seconds of traffic and gives back a whole
     // pair-sized tensor twice over. See webgpu/esmfold2/memory-plan.js.
-    const spill = options.spillPairs ?? esmfold2Spills({
+    const spill = segmented || options.spillPairs === true || options.spillPairs === undefined && esmfold2Spills({
       tokens, channels, ...memoryTotals(device),
       weightBytes: halfPrecisionAvailable(device) ? FOLD_WEIGHT_BYTES : FOLD_WEIGHT_BYTES_F32,
     });
     let zInit = reuse !== undefined ? undefined
-      : keep(allocator.allocate("esmfold2.z-init", pairBytes,
+      : keep(pairSized("esmfold2.z-init",
           storage | (options.returnConfidenceInputs === true || spill ? GPUBufferUsage.COPY_SRC : 0)));
     if (reuse === undefined) await mark("z_init", async () => {
       // 🔴 PROJECT THEN BROADCAST. The two per-token projections are 2n rows of
@@ -612,15 +618,14 @@ export async function foldEsmfold2(device, options) {
 
     // z_init has one reader, once a loop, a chunk of rows at a time. It can wait on the host between them.
     const zInitHost = !spill || zInit === undefined ? undefined
-      : await spillToHost(device, allocator, zInit.buffer, pairBytes, "esmfold2.z-init");
+      : await spillToHost(device, allocator, zInit, pairBytes, "esmfold2.z-init");
     if (zInitHost !== undefined) {
       zInit.release();
       held.splice(held.indexOf(zInit), 1);
       zInit = undefined;
       await settleReleasedMemory(device);
     }
-    const pair = keep(allocator.allocate("esmfold2.pair", pairBytes,
-      storage | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST));
+    const pair = keep(pairSized("esmfold2.pair", storage | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST));
 
     advance(plan.embedder);
 
@@ -651,15 +656,12 @@ export async function foldEsmfold2(device, options) {
     // which the browser refused ("Array buffer allocation failed").
     {
       const encoder = device.createCommandEncoder({ label: "esmfold2.pair-zero" });
-      encoder.clearBuffer(pair.buffer, 0, pairs * channels * 4);
+      if (segmented) pair.clear(encoder); else encoder.clearBuffer(pair.buffer, 0, pairs * channels * 4);
       device.queue.submit([encoder.finish()]);
     }
     const trunk = new Esmfold2TrunkGpu(device, { allocator, sequentialTriangle: true, ...options.trunk });
     keep({ release: () => trunk.releaseHeldScratch() });
-    const slice = (allocation, row, rows) => ({
-      buffer: allocation.buffer, byteOffset: row * channels * 4,
-      byteSize: rows * channels * 4,
-    });
+    const slice = (allocation, row, rows) => rangeOf(allocation, row * channels * 4, rows * channels * 4);
     // 🔴 THE LOOPS, OR THE PAIR THEY WOULD HAVE PRODUCED. On reuse the cached
     // pair is uploaded straight into the buffer the sampler reads, which is the
     // whole saving: 96 block evaluations at 256 channels, 85% of a 300-token
@@ -750,7 +752,7 @@ export async function foldEsmfold2(device, options) {
     // 🔴 AND NOT PAST A GIGABYTE, where the browser will not hand out the array
     // (`HOST_PAIR_MAX_BYTES`; AF3's fold.js has the same rule and the same
     // failure). A trunk that cannot be cached is simply not offered for reuse.
-    const hostPairFits = pairs * channels * 4 <= HOST_PAIR_MAX_BYTES;
+    const hostPairFits = pairs * channels * 4 <= HOST_PAIR_MAX_BYTES && !segmented;
     const reusable = options.wantReusable !== true || !hostPairFits ? undefined : {
       tokens, channels, sInputs,
       pair: await (async () => {
@@ -791,7 +793,7 @@ export async function foldEsmfold2(device, options) {
     };
     let confidencePairOnDevice = deviceConfidence ? deviceCopy("esmfold2.confidence-pair", pair) : undefined;
     let confidencePairSpill = options.confidenceWeights != null && !hostConfidence && spill
-      ? await spillToHost(device, allocator, pair.buffer, pairBytes, "esmfold2.confidence-pair") : undefined;
+      ? await spillToHost(device, allocator, pair, pairBytes, "esmfold2.confidence-pair") : undefined;
     const confidencePair = !hostConfidence ? undefined
       : await (async () => {
         const back = allocator.allocate("esmfold2.confidence-pair", pairBytes,
@@ -855,7 +857,7 @@ export async function foldEsmfold2(device, options) {
     // kept through the trunk in its place; see where it is first built.
     // ...COPY_SRC, because the confidence head's copy is taken off this buffer
     // below and the conditioning overwrites it immediately after.
-    const relPos = keep(allocator.allocate("esmfold2.rel-pos", pairBytes, storage | GPUBufferUsage.COPY_SRC));
+    const relPos = keep(pairSized("esmfold2.rel-pos", storage | GPUBufferUsage.COPY_SRC));
     await buildRelativePositions(relPos);
     // Once, from whichever comes first: the head after its pair init, or the fold's end.
     const releaseConfidenceCopies = () => {
@@ -1017,6 +1019,8 @@ export async function foldEsmfold2(device, options) {
         pairBuffer: confidencePairOnDevice?.buffer,
         pairSpill: confidencePairSpill,
         spillInitial: spill,
+        segmentRows,
+        trunk: options.trunk,
         atomToToken: features.atomToToken,
         atomMask: features.mask,
         tokenMask: new Float32Array(tokens).fill(1),

@@ -73,7 +73,7 @@ describe("a spill", () => {
     new Float32Array(source.data).set(values);
     allocator.peak = 0;
     allocator.live = 0;
-    const spill = await spillToHost(device, allocator, source, values.byteLength, "t", 256);
+    const spill = await spillToHost(device, allocator, { buffer: source }, values.byteLength, "t", 256);
     assert.equal(spill.pieces.length, 16);
     assert.equal(allocator.peak, 256);
     assert.equal(allocator.live, 0);
@@ -102,8 +102,8 @@ describe("a spill", () => {
   });
 
   it("refuses pieces that would split a float", async () => {
-    await assert.rejects(spillToHost(fakeDevice(), allocator, gpuBuffer(64), 64, "t", 6), RangeError);
-    await assert.rejects(spillToHost(fakeDevice(), allocator, gpuBuffer(64), 62, "t", 8), RangeError);
+    await assert.rejects(spillToHost(fakeDevice(), allocator, { buffer: gpuBuffer(64) }, 64, "t", 6), RangeError);
+    await assert.rejects(spillToHost(fakeDevice(), allocator, { buffer: gpuBuffer(64) }, 62, "t", 8), RangeError);
   });
 
   it("lets a tensor smaller than a piece be one piece of its own size", async () => {
@@ -111,7 +111,7 @@ describe("a spill", () => {
     const values = floats(8);
     const source = gpuBuffer(values.byteLength);
     new Float32Array(source.data).set(values);
-    const spill = await spillToHost(device, allocator, source, values.byteLength, "t", 1024);
+    const spill = await spillToHost(device, allocator, { buffer: source }, values.byteLength, "t", 1024);
     assert.equal(spill.pieces.length, 1);
     assert.equal(spill.pieceBytes, values.byteLength);
     const target = gpuBuffer(values.byteLength);

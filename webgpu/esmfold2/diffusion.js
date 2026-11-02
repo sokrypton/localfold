@@ -30,6 +30,7 @@
  */
 import { deviceTuning, halfPrecisionAvailable } from "../runtime/device-profile.js";
 import { settleReleasedMemory } from "../runtime/allocator.js";
+import { rangeOf } from "../runtime/segmented.js";
 import { GRID_WIDTH, LANES, createLayerNormShader, createLinearShader, createSplitReduceShader,
          createSplitSwigluReduceShader, createSwigluShader, linearGrid, linearKSplits, ROW_TILE, swigluGrid } from "../esmc/block.js";
 import { float32ToFloat16Array } from "../../shared/weights/float16.js";
@@ -771,7 +772,7 @@ export class Esmfold2DenoiserGpu {
     if (byteOffset % 256 !== 0) {
       throw new Error(`a binding offset of ${byteOffset} is not 256-byte aligned`);
     }
-    return { buffer: allocation.buffer, byteOffset, byteSize: rows * channels * 4 };
+    return rangeOf(allocation, byteOffset, rows * channels * 4);
   }
 
   /** Encode and submit a list of passes right now, outside the recorded step. */

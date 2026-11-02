@@ -8,6 +8,8 @@
  * Held in pieces, because a browser refuses one ArrayBuffer past about a gigabyte. A piece is read through a mapped
  * buffer of its own size, so the spill itself costs the card one piece and not one tensor.
  */
+import { rangeOf } from "./segmented.js";
+
 export const SPILL_PIECE_BYTES = 64 * 1024 * 1024;
 
 export class HostSpill {
@@ -48,7 +50,7 @@ export class HostSpill {
 /**
  * Read `byteLength` bytes of `source` into host pieces.
  *
- * @param {GPUBuffer} source needs COPY_SRC
+ * @param {{buffer: GPUBuffer}|SegmentedAllocation} source needs COPY_SRC
  */
 export async function spillToHost(device, allocator, source, byteLength, label, pieceBytes = SPILL_PIECE_BYTES) {
   if (byteLength % 4 !== 0 || pieceBytes % 4 !== 0) {
@@ -61,7 +63,8 @@ export async function spillToHost(device, allocator, source, byteLength, label, 
     for (let offset = 0; offset < byteLength; offset += size) {
       const count = Math.min(size, byteLength - offset);
       const encoder = device.createCommandEncoder({ label: `${label}-spill` });
-      encoder.copyBufferToBuffer(source, offset, staging.buffer, 0, count);
+      const from = rangeOf(source, offset, count);
+      encoder.copyBufferToBuffer(from.buffer, from.byteOffset, staging.buffer, 0, count);
       device.queue.submit([encoder.finish()]);
       // eslint-disable-next-line no-await-in-loop
       await staging.buffer.mapAsync(GPUMapMode.READ, 0, count);

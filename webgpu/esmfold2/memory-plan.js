@@ -53,11 +53,17 @@ export function esmfold2Spills({ tokens, channels = 256, residentBytes = 0, budg
   return peak + FOLD_MARGIN_BYTES > budgetBytes;
 }
 
-/** The longest fold this budget holds, in tokens. The ceiling is the largest tensor a storage binding can name. */
+/**
+ * The longest fold any device can bind. Every pair-sized tensor is several buffers past one binding's reach and is bound
+ * a chunk at a time, but the contraction's output is read across all its channels at once, from two buffers.
+ */
+export const esmfold2TokenCeiling = ({ channels = 256, maxBindingBytes = 2147483644 } = {}) =>
+  Math.floor(Math.sqrt(2 * maxBindingBytes / (channels * 4)));
+
+/** The longest fold this budget holds, in tokens. */
 export function esmfold2MaxTokens({ budgetBytes, channels = 256, maxBindingBytes = 2147483644,
                                     weightBytes = FOLD_WEIGHT_BYTES }) {
   const available = budgetBytes - weightBytes - TRACK_CHUNK_BYTES - FOLD_MARGIN_BYTES;
   const tokens = Math.floor(Math.sqrt(available / (2 + AB_PAIRS) / (channels * 4)));
-  const ceiling = Math.floor(Math.sqrt(maxBindingBytes / (channels * 4)));
-  return Math.max(0, Math.min(tokens, ceiling));
+  return Math.max(0, Math.min(tokens, esmfold2TokenCeiling({ channels, maxBindingBytes })));
 }

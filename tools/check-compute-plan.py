@@ -111,7 +111,7 @@ try:
         check("no GPU: the line offers the CPU", "CPU thread" in plan["text"], plan["text"])
     shot(ws, "plan-fits.png")
 
-    set_rows(ws, 2000)
+    set_rows(ws, 2100)
     plan = read_plan(ws)
     if usable:
         check("past the binding ceiling the line warns", plan["tone"] == "warn" and "Too long" in plan["text"], plan["text"])

@@ -48,13 +48,19 @@ describe("the memory plan against what was measured", () => {
     assert.equal(planEsmfold2({ tokens: tokens + 1 }, machine).where, "over");
   });
 
-  it("stops at the largest tensor a binding can name, whatever the card", () => {
+  it("stops at the longest fold two halves of a tensor can bind, whatever the card", () => {
     const large = { ...a10, budgetBytes: 80 * GIB };
-    assert.equal(esmfold2MaxTokens({ budgetBytes: large.budgetBytes }), 1448);
-    assert.equal(planEsmfold2({ tokens: 1448 }, { ...machine, gpu: large }).where, "gpu");
-    const plan = planEsmfold2({ tokens: 1449 }, { ...machine, gpu: large });
+    assert.equal(esmfold2MaxTokens({ budgetBytes: large.budgetBytes }), 2047);
+    assert.equal(planEsmfold2({ tokens: 2047 }, { ...machine, gpu: large }).where, "gpu");
+    const plan = planEsmfold2({ tokens: 2048 }, { ...machine, gpu: large });
     assert.equal(plan.where, "over");
     assert.equal(plan.why, "binding");
+  });
+
+  it("spills past one binding, however much the budget has room for", () => {
+    const large = { ...a10, budgetBytes: 80 * GIB };
+    assert.equal(planEsmfold2({ tokens: 1448 }, { ...machine, gpu: large }).spills, false);
+    assert.equal(planEsmfold2({ tokens: 1449 }, { ...machine, gpu: large }).spills, true);
   });
 });
 

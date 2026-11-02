@@ -164,11 +164,15 @@ def main():
 
         # Somebody with no GPU who has chosen nothing: one press of Fold, across the reload.
         cdp.evaluate(ws, "document.querySelector('#settings-compute button:first-child').click()")
-        cdp.wait_for(ws, "navigator.serviceWorker.getRegistrations().then((all) => all.length === 0)", timeout=30,
-                     what="the service worker to go")
-        ws.call("Page.reload")
-        cdp.wait_for(ws, f"self.crossOriginIsolated === false && {READY}", timeout=60,
-                     what="the page to come back without isolation")
+        cdp.wait_for(ws, "localStorage.getItem('localfold.compute') === 'auto'", timeout=30, what="the choice to stick")
+        # A registration is only let go once nothing it controls is left, and a reload can go through it once more.
+        for _ in range(4):
+            ws.call("Page.reload")
+            time.sleep(1)
+            cdp.wait_for(ws, READY, timeout=60, what="the page to reload")
+            if cdp.evaluate(ws, "self.crossOriginIsolated") is False:
+                break
+        assert cdp.evaluate(ws, "self.crossOriginIsolated") is False, "the page stayed isolated after choosing the GPU"
         cdp.evaluate(ws, """(() => {
           for (const [id, value] of [['model-family', 'ef2-fast-600m'], ['plm-mode', 'esmc-300m']]) {
             const el = document.getElementById(id); el.value = value;
