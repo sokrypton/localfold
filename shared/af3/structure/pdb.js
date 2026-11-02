@@ -65,6 +65,13 @@ export function atomName(nameChars, slot) {
  * caller that knows which checkpoint ran is the page, and because three tests
  * and several tools read this output in file order: emitting a line they did
  * not ask for would change what every one of them parses.
+ *
+ * 🔴 AND A LINK RECORD FOR EVERY BOND THE JOB DECLARED (`options.links`, expandEntities' `bonds`: a crosslinker to
+ * the two lysines it joined, a covalent inhibitor to its cysteine, a Bond row). CONECT cannot carry one - it names
+ * serials, and a viewer that draws a protein residue as one position has no position for its NZ until the side chain
+ * is shown - so the bond fell off the picture and the bridge sat beside the residues it joins. LINK names residue and
+ * atom, which py2Dmol keeps until the side chain exists and opens the side chain for. A CALLER's, like the header:
+ * only the page knows which bonds the job declared, and the featuriser's batch is exported field by field.
  */
 export function toPdb(batch, positions, plddt, options = {}) {
   // 🔴 ONE TEMPLATE A BATCH, BECAUSE A TRAJECTORY IS 25 FILES OF THE SAME
@@ -77,6 +84,7 @@ export function toPdb(batch, positions, plddt, options = {}) {
   // ...first, before any coordinate record: a reader that stops at the first
   // ATOM never sees anything written after one, and most readers do.
   for (const text of options.remark ?? []) lines.push(`REMARK   1 ${text}`);
+  for (const line of linkRecords(batch, records, options.links)) lines.push(line);
   for (const record of records) {
     if (record === "TER") { lines.push("TER"); continue; }
     const { slot, head, tail } = record;
@@ -93,6 +101,34 @@ export function toPdb(batch, positions, plddt, options = {}) {
 }
 
 const PDB_TEMPLATES = new WeakMap();
+
+/**
+ * One LINK record per declared bond both of whose ends name an atom this batch wrote - `{asym, residue, atom}`, asym
+ * 0-based over polymers then ligands, which is the batch's own `asymId - 1`. An end with no atom (a token-level
+ * `A12 - B1`) has nothing to draw a stick between, and is left out.
+ */
+function linkRecords(batch, records, links) {
+  if (links === undefined || links.length === 0) return [];
+  // the record head's own columns: atom name 13-16, residue name 18-20, chain 22, residue number 23-26
+  const byAtom = new Map();
+  for (const record of records) {
+    if (record === "TER") continue;
+    const token = Math.floor(record.slot / batch.dense);
+    const key = `${batch.asymId === undefined ? 0 : batch.asymId[token] - 1}:`
+      + `${batch.features.residueIndex[token]}:${record.head.slice(12, 16).trim()}`;
+    if (!byAtom.has(key)) byAtom.set(key, record.head);
+  }
+  const lines = [];
+  for (const { from, to } of links) {
+    if (!from?.atom || !to?.atom) continue;
+    const a = byAtom.get(`${from.asym}:${from.residue}:${from.atom}`);
+    const b = byAtom.get(`${to.asym}:${to.residue}:${to.atom}`);
+    if (a === undefined || b === undefined) continue;
+    const end = (head) => head.slice(12, 16) + " " + head.slice(17, 20) + " " + head.slice(21, 26) + " ";
+    lines.push("LINK        " + end(a) + " ".repeat(15) + end(b));
+  }
+  return lines;
+}
 
 /** The position-free part of `toPdb`'s output for a batch, built once. */
 function pdbTemplate(batch) {

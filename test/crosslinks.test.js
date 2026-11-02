@@ -108,4 +108,23 @@ describe("a crosslink expanded", () => {
     // XL-DSSO cut to its three columns, the chain letter where a reader looks for it
     for (const line of het) { expect(line.slice(17, 20)).toBe("XL-"); expect(line.slice(21, 22)).toBe("C"); }
   });
+  it("writes a LINK record for each of its bonds, which is what the viewer draws the stick from", () => {
+    // (CONECT names serials, and a protein residue's NZ is not a viewer position until its side chain is shown)
+    const out = expandEntities([...proteins(), row("crosslink", "DSSO: A2 - B3")]);
+    const { batch } = af3BatchFromA3m(out.sequence, null, {
+      chainKinds: out.chainKinds, bonds: out.bonds,
+      ligands: out.ligandCodes.map((code) => parseCcdComponent(CROSSLINKER_COMPONENTS[code])),
+      ...featuriserDialect(dialectFor("af3")) });
+    const positions = new Float32Array(batch.refMask.length * 3);
+    const links = toPdb(batch, positions, null, { links: out.bonds }).split("\n").filter((l) => l.startsWith("LINK"));
+    const [d1, d2] = CROSSLINKERS.DSSO.attach;
+    // the format's columns: name 13-16, residue 18-20, chain 22, number 23-26, and the second end from 43
+    expect(links.map((l) => [l.slice(12, 16).trim(), l.slice(17, 20), l[21], +l.slice(22, 26),
+                             l.slice(42, 46).trim(), l.slice(47, 50), l[51], +l.slice(52, 56)]))
+      .toEqual([["NZ", "LYS", "A", 2, d1, "XL-", "C", 1], ["NZ", "LYS", "B", 3, d2, "XL-", "C", 1]]);
+    // ...before the first coordinate record, and only where the caller passed the job's bonds
+    const pdb = toPdb(batch, positions, null, { links: out.bonds });
+    expect(pdb.indexOf("LINK") < pdb.indexOf("ATOM")).toBe(true);
+    expect(toPdb(batch, positions, null).includes("LINK")).toBe(false);
+  });
 });
