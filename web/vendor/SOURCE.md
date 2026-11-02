@@ -4,8 +4,8 @@
 upstream and re-run `python3 tools/sync-py2dmol.py`;
 `python3 tools/sync-py2dmol.py --check` says whether they have drifted.
 
-- upstream: `/home/ubuntu/py2Dmol`
-- commit: `bfef031853bbe521991a5857862bcc17413606d7`
+- upstream: `/Users/mini/Documents/GitHub/py2Dmol`
+- commit: `20780859796562bc0b79ed58c46a91b4990e0c3d`
 
 Two of these are built by upstream's `tools/bundle.py build` and two
 are source files that ship as they are. `full` is the website plus the
@@ -14,4 +14,4 @@ because index.html loads one and the other two pages load the other.
 
 - `py2Dmol.app.css` — `f7fda445ca6a5629` — index.html
 - `py2Dmol.align.js` — `24cc39809ebe3ba4` — index.html (TM-align; upstream cannot bundle it)
-- `py2Dmol.full.min.js` — `6c3dc2904796595a` — index.html
+- `py2Dmol.full.min.js` — `be75779e77b174c9` — index.html
