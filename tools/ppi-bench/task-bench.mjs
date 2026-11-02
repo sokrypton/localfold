@@ -14,6 +14,7 @@ import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash } from "node:crypto";
+import zlib from "node:zlib";
 
 const run = promisify(execFile);
 const HERE = path.dirname(new URL(import.meta.url).pathname);
@@ -684,6 +685,23 @@ async function attempt(name, index) {
   } else {
     row.pass = false;
   }
+  // every candidate the loop could have submitted (each eligible entry: its sequence, design structure, held motif
+  // positions and loop terms, and its internal check where one ran), so a different checker or selection rule can be
+  // tried on these designs later without running the loop again - <out>.candidates/<target>-<attempt>.json.gz
+  const checkOf = new Map(checked.map((c) => [c.entry, c.result]));
+  const candidates = eligible.map((e) => {
+    const c = checkOf.get(e);
+    return { restart: e.restart, cycle: e.cycle, sequence: e.sequence, positions: e.positions, guided: e.guided ?? false,
+      ipae: e.ipae, iptm: e.iptm, binderPtm: e.binderPtm, motifRmsd: e.motifRmsd, clashes: e.clashes, score: e.score,
+      submitted: e === best, pdb: e.pdb,
+      check: c === undefined ? null : { ipae: c.ipae, iptm: c.iptm, rmsd: c.rmsd, ligandRmsd: c.ligandRmsd, centroid: c.centroid,
+        motifRmsd: c.motifRmsd, clashes: c.clashes, pass: c.pass, seedsPassed: c.seedsPassed } };
+  });
+  const store = `${out}.candidates`;
+  fs.mkdirSync(store, { recursive: true });
+  fs.writeFileSync(path.join(store, `${name}-${index}.json.gz`), zlib.gzipSync(JSON.stringify({ target: name, attempt: index,
+    config: cfg.tag, length, evalSeed, candidates })));
+  row.candidates = candidates.length;
   row.wall = (Date.now() - started) / 1000;
   return row;
 }
