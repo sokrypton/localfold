@@ -131,6 +131,13 @@
   text-transform: uppercase; color: var(--lf-muted);
 }
 .settings-note { margin: 6px 0 0; color: var(--lf-muted); }
+.settings-select {
+  max-width: 60%; padding: 2px 4px; border: 1px solid var(--lf-border); border-radius: 6px;
+  background: var(--lf-surface); color: var(--lf-text-2); font: inherit; font-variant-numeric: tabular-nums;
+}
+/* What this fold will take, beside the button that starts it. */
+.fold-plan { color: var(--lf-muted); font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.fold-plan[data-tone="warn"] { color: var(--lf-warn-text); }
 .settings-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .settings-row + .settings-row { margin-top: 4px; }
 .settings-value { font-variant-numeric: tabular-nums; }
@@ -1013,6 +1020,8 @@
      INSIDE the button - measured as 13px of scrollHeight past clientHeight,
      which is what a box that states its height does instead of growing. */
   .page-head-fold { flex-wrap: wrap; gap: 8px 12px; }
+  .fold-actions { flex-wrap: wrap; }
+  .fold-plan { flex-basis: 100%; white-space: normal; }
 
   /* 🔴 THE SEQUENCE BOX GETS ITS OWN LINE, AND A GRID CANNOT GIVE IT ONE.
      .entity-row is five tracks - type, copies, `1fr`, options, remove - so the

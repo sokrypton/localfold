@@ -80,6 +80,7 @@ AI Context: STANDALONE WEB APP ENTRY POINT
         <div class="page-head page-head-fold" style="padding-right: 0;">
             <h1>LocalFold</h1>
             <div class="fold-actions">
+              <span id="fold-plan" class="fold-plan" role="status" hidden></span>
               <div class="settings-anchor">
                 <button type="button" id="settings-toggle" class="btn btn-grey btn-small"
                         aria-haspopup="dialog" aria-expanded="false" title="Settings">
@@ -100,13 +101,17 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                     <h2 class="settings-title">GPU memory</h2>
                     <div class="settings-row"><span>Card</span><span id="settings-gpu-name" class="settings-value"></span></div>
                     <div class="settings-row"><span>This page</span><span id="settings-gpu-value" class="settings-value"></span></div>
-                    <div class="settings-row"><span>Limit</span><span id="settings-gpu-limit" class="settings-value"></span></div>
+                    <div class="settings-row">
+                      <label for="settings-gpu-limit">One fold may hold</label>
+                      <select id="settings-gpu-limit" class="settings-select"></select>
+                    </div>
                     <div class="settings-row" style="margin-top: 8px; justify-content: flex-start;">
                       <button type="button" id="settings-gpu-release" class="btn btn-grey btn-small"
                               title="Gives the card back now. The next fold uploads its weights again.">Free GPU memory</button>
                       <button type="button" id="settings-gpu-forget" class="btn btn-grey btn-small" hidden
                               title="A lost device lowered the limit. Use this if something else caused it.">Reset limit</button>
                     </div>
+                    <p id="settings-gpu-limit-note" class="settings-note"></p>
                     <p class="settings-note">Given back by itself after two minutes in a hidden tab, or fifteen idle.</p>
                   </section>
                   <section class="settings-section">

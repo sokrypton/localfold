@@ -5,11 +5,13 @@
  * Every number shown is read when the panel opens, so nothing polls while it is shut.
  */
 import { clearShardCaches, shardCacheContents } from "../shared/bundles/http-tensor-store.js";
-import { deviceSummary, releaseDevice } from "./model.js";
-import { forgetLearnedLimit, gpuName, learnedLimitBytes } from "./gpu-limits.js";
+import { applyMemoryLimit, deviceSummary, planningGpu, releaseDevice } from "./model.js";
+import { chosenLimitBytes, forgetLearnedLimit, gpuName, learnedLimitBytes, setChosenLimitBytes } from "./gpu-limits.js";
 
 const THEME_KEY = "localfold.theme";
 const COMPUTE_KEY = "localfold.compute";
+/** The CPU for as long as this tab lasts: a GPU that is missing or refusing today is no choice to remember. */
+const COMPUTE_NOW_KEY = "localfold.compute-now";
 
 const read = (key, fallback) => {
   try { return localStorage.getItem(key) ?? fallback; } catch { return fallback; }
@@ -31,7 +33,30 @@ function applyTheme(choice) {
 
 /** "auto" or "cpu". Auto is the GPU: the CPU is only ever asked for. */
 export function computePreference() {
+  try {
+    if (sessionStorage.getItem(COMPUTE_NOW_KEY) === "cpu") return "cpu";
+  } catch { /* a private window */ }
   return read(COMPUTE_KEY, "auto");
+}
+
+/**
+ * Fold on the CPU without changing what Settings remembers.
+ *
+ * @param {() => void} [keepPage] saves what must survive the reload that turns isolation on
+ * @returns {Promise<boolean>} true if the page is reloading for it
+ */
+export async function useCpuForNow(keepPage) {
+  try { sessionStorage.setItem(COMPUTE_NOW_KEY, "cpu"); } catch { /* a private window */ }
+  document.dispatchEvent(new CustomEvent("localfold-compute"));
+  if (window.crossOriginIsolated === true) return false;
+  keepPage?.();
+  try {
+    if (await setIsolated(true)) {
+      location.reload();
+      return true;
+    }
+  } catch (cause) { console.warn("isolation", cause); }
+  return false;
 }
 
 /** How many threads a CPU fold gets: the physical cores, so the machine stays usable. */
@@ -39,6 +64,13 @@ export function cpuThreads() {
   const logical = navigator.hardwareConcurrency ?? 4;
   return window.crossOriginIsolated === true ? Math.max(1, Math.ceil(logical / 2)) : 1;
 }
+
+/** How many a CPU fold would get, for a plan: a page that is not isolated yet becomes so on the way to one. */
+export function cpuThreadsOnceIsolated() {
+  return "serviceWorker" in navigator ? Math.max(1, Math.ceil((navigator.hardwareConcurrency ?? 4) / 2)) : cpuThreads();
+}
+
+const LIMIT_CHOICES_GIB = [1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 20, 24, 32, 40, 48, 64, 80];
 
 /** The card's marketing name out of a WebGL renderer string. */
 function shortName(name) {
@@ -85,11 +117,11 @@ export async function setIsolated(wanted) {
 
 /**
  * @param {{onReleaseGpu: () => void, onComputeChange?: (choice: string) => void,
- *          keepPage?: () => void}} hooks
+ *          onLimitChange?: () => void, keepPage?: () => void}} hooks
  *   `onReleaseGpu` clears what the page holds outside the device; `keepPage` saves
  *   whatever must survive the reload that turns isolation on.
  */
-export function installSettings({ onReleaseGpu, onComputeChange, keepPage }) {
+export function installSettings({ onReleaseGpu, onComputeChange, onLimitChange, keepPage }) {
   const toggle = document.getElementById("settings-toggle");
   const panel = document.getElementById("settings-panel");
   const badge = document.getElementById("device-badge");
@@ -130,6 +162,7 @@ export function installSettings({ onReleaseGpu, onComputeChange, keepPage }) {
   segments(panel.querySelector("#settings-compute"), [["auto", "GPU"], ["cpu", "CPU"]], computePreference(),
            async (choice) => {
              write(COMPUTE_KEY, choice);
+             try { sessionStorage.removeItem(COMPUTE_NOW_KEY); } catch { /* a private window */ }
              describeCompute();
              void updateBadge();
              onComputeChange?.(choice);
@@ -145,7 +178,8 @@ export function installSettings({ onReleaseGpu, onComputeChange, keepPage }) {
   describeCompute();
 
   const gpuValue = panel.querySelector("#settings-gpu-value");
-  const limitValue = panel.querySelector("#settings-gpu-limit");
+  const limitChoice = panel.querySelector("#settings-gpu-limit");
+  const limitNote = panel.querySelector("#settings-gpu-limit-note");
   const gpuName_ = panel.querySelector("#settings-gpu-name");
   const release = panel.querySelector("#settings-gpu-release");
   const forget = panel.querySelector("#settings-gpu-forget");
@@ -159,8 +193,21 @@ export function installSettings({ onReleaseGpu, onComputeChange, keepPage }) {
       : shortName(summary?.name ?? gpuName()) || "Not reported";
     gpuValue.textContent = summary === undefined ? "Nothing held"
       : `${size(summary.residentBytes)} held, ${size(summary.peakBytes)} at peak`;
-    limitValue.textContent = summary?.budgetBytes === undefined || summary?.budgetBytes === null
-      ? "Set when a fold starts" : size(summary.budgetBytes);
+    const gpu = await planningGpu();
+    limitChoice.disabled = gpu === undefined;
+    const chosen = chosenLimitBytes();
+    // Whole gibibytes up to the card, and whatever was chosen on a card that has since changed.
+    const card = gpu?.memoryBytes ?? 32 * 1073741824;
+    const sizes = LIMIT_CHOICES_GIB.map((gib) => gib * 1073741824).filter((bytes) => bytes <= card);
+    if (chosen !== undefined && !sizes.includes(chosen)) sizes.push(chosen);
+    limitChoice.replaceChildren(
+      new Option(gpu === undefined ? "Automatic" : `Automatic: ${size(gpu.automaticBytes)}`, ""),
+      ...sizes.sort((a, b) => a - b).map((bytes) => new Option(size(bytes), String(bytes))),
+    );
+    limitChoice.value = chosen === undefined ? "" : String(chosen);
+    limitNote.textContent = gpu === undefined ? ""
+      : "Leaves the rest of the card to the desktop and other programs. No browser can see how much of it they are"
+        + " using, so lower this if they need more, and raise it if nothing else is running.";
     release.disabled = summary === undefined;
     forget.hidden = learnedLimitBytes() === undefined;
   };
@@ -182,6 +229,12 @@ export function installSettings({ onReleaseGpu, onComputeChange, keepPage }) {
     clear.disabled = contents.length === 0;
   };
 
+  limitChoice.addEventListener("change", async () => {
+    setChosenLimitBytes(limitChoice.value === "" ? undefined : Number(limitChoice.value));
+    await applyMemoryLimit();
+    await refreshGpu();
+    onLimitChange?.();
+  });
   release.addEventListener("click", async () => {
     onReleaseGpu();
     await releaseDevice();
@@ -209,5 +262,6 @@ export function installSettings({ onReleaseGpu, onComputeChange, keepPage }) {
     if (event.key === "Escape" && !panel.hidden) { setOpen(false); toggle.focus(); }
   });
   void updateBadge();
+  document.addEventListener("localfold-compute", () => { describeCompute(); void updateBadge(); });
   return { refresh: () => { void updateBadge(); if (!panel.hidden) void refreshGpu(); } };
 }

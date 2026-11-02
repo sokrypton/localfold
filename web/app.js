@@ -58,9 +58,11 @@ import { chainGeometryOf, chainGeometryVerdict } from "../shared/af3/chain-geome
 import { ccdUrl, parseCcdComponent } from "../shared/af3/featurise/ccd-component.js";
 import { smilesComponent } from "../shared/chem/component.js";
 import { GpuBufferAllocator } from "../webgpu/runtime/allocator.js";
-import { getDevice, loadModel, onDeviceFault, releaseDevice, releaseModel } from "./model.js";
-import { learnFromLoss } from "./gpu-limits.js";
-import { computePreference, cpuThreads, installSettings } from "./settings-panel.js";
+import { getDevice, loadModel, onDeviceFault, planningGpu, releaseDevice, releaseModel } from "./model.js";
+import { gpuName, learnFromLoss } from "./gpu-limits.js";
+import { computePreference, cpuThreads, cpuThreadsOnceIsolated, installSettings, useCpuForNow } from "./settings-panel.js";
+import { describePlan, describeRefusal, noteFold, planEsmfold2, readFoldRates, roughDuration } from "./compute-plan.js";
+import { beginFold, showProgressInTitle } from "./fold-guard.js";
 import { installViewerTheme } from "./viewer-theme.js";
 import { foldEsmfold2OnCpu, releaseCpuFold } from "./esmfold2-cpu.js";
 import { releaseAllWeights } from "../webgpu/runtime/resident.js";
@@ -1346,6 +1348,7 @@ function startModelPreload(family, signal) {
 
 function progress(fraction) {
   const bar = element("progress");
+  showProgressInTitle(typeof fraction === "number" ? fraction : null);
   if (fraction === null) {
     bar.dataset.state = "idle";
     bar.value = 0;
@@ -4000,6 +4003,10 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
   esmfold2Trunk = result.reusable === undefined ? esmfold2Trunk
     : { key: trunkKey, reusable: result.reusable };
   const seconds = ((performance.now() - started) / 1000).toFixed(1);
+  if (!result.trunkReused) {
+    noteFold({ where: onCpu ? "cpu" : "gpu", card: gpuName() ?? "", loops: recycleCount() + 1, threads: cpuThreads(),
+               tokens: chains.reduce((total, chain) => total + chain.length, 0), seconds: Number(seconds) });
+  }
   const mean = confidence.meanPlddt;
   // 🔴 IT SAYS pLDDT NOW, AND THAT IS A CHANGE OF FACT AND NOT OF WORDING.
   // This line read "certainty" for as long as the checkpoint had no confidence
@@ -4933,7 +4940,11 @@ async function fold(event) {
   updateScoresCard(undefined);
   // ...and the rest of the last result with it - see hideResults.
   hideResults();
+  let endGuard = () => {};
   try {
+    endGuard = await beginFold({
+      signal, onWaiting: () => status("Waiting for the fold in another LocalFold tab to finish…"),
+    });
     const entities = entityList.read();
     const enteredProblem = entitiesProblem(entities);
     // A pasted/uploaded A3M remains self-describing: as before, its query may
@@ -5015,7 +5026,18 @@ async function fold(event) {
     // kept between folds so the same model's next fold skips its packing, and
     // it was kept across a CHANGE of model too - four models in one page and
     // the fourth fold died at 2.9 GiB live. See releaseAllWeights.
-    const onCpu = foldsOnCpu(family);
+    let onCpu = foldsOnCpu(family);
+    // Before the download, which is the point of asking here and not at the first allocation that fails.
+    if (!onCpu && isEsmfold2(family) && !ceilingLifted) {
+      const plan = await currentPlan();
+      if (plan?.where === "cpu") {
+        if (await prepareCpuFold()) return;
+        onCpu = foldsOnCpu(family);
+      } else if (plan?.where === "over" || plan?.where === "none") {
+        offerAlternatives(plan);
+        return;
+      }
+    }
     if (computePreference() === "cpu" && !onCpu) {
       throw new Error(`${MODEL_LABELS[family] ?? family} folds on a GPU only. Settings: Fold on, GPU.`);
     }
@@ -5991,8 +6013,8 @@ async function fold(event) {
       // on the button says, in those words.
       const cpu = isEsmfold2(chosenFamily()) && computePreference() !== "cpu" ? [{
         label: "Fold on CPU",
-        title: "Slower, and it cannot run out of GPU memory. Settings keeps this choice.",
-        onClick: () => document.querySelector("#settings-compute button:last-child")?.click(),
+        title: "Slower, and it cannot run out of GPU memory. For this tab: Settings keeps its own choice.",
+        onClick: () => { void foldOnCpuInstead(); },
       }] : [];
       if (error instanceof GpuMemoryBudgetError && !ceilingLifted) {
         statusWithAction(
@@ -6008,6 +6030,8 @@ async function fold(event) {
       } else status(error instanceof Error ? error.message : String(error), true);
     }
   } finally {
+    endGuard();
+    void refreshPlan();
     window.__foldState = { running: false, since: Date.now() };
     // ...whatever happened, including a stop. The timeline is most useful about
     // the fold that did NOT finish, so it is closed here and not on the way out
@@ -6027,6 +6051,87 @@ async function fold(event) {
 }
 
 // --- wiring ----------------------------------------------------------------
+
+/** The plan for what the entity rows hold now, or undefined where there is nothing to plan or no plan for this model. */
+async function currentPlan() {
+  const family = chosenFamily();
+  if (!isEsmfold2(family) || remoteBackend() !== null) return undefined;
+  const entities = entityList.read();
+  if (entitiesProblem(entities) !== null) return undefined;
+  const request = expandEntities(entities);
+  // Atoms are tokens here. A ligand's are not known until its component is fetched, so a typical one stands in; the
+  // fold's own account takes over once it has the real count.
+  const tokens = request.chains.reduce((total, chain) => total + chain.length, 0)
+    + 30 * (request.ligandCodes?.length ?? 0) + 10 * (request.modifications?.length ?? 0);
+  if (tokens === 0) return undefined;
+  const preference = computePreference();
+  const memory = navigator.deviceMemory;
+  return planEsmfold2({ tokens, loops: recycleCount() + 1 }, {
+    preference, threads: window.crossOriginIsolated === true ? cpuThreads() : cpuThreadsOnceIsolated(),
+    gpu: preference === "cpu" ? undefined : await planningGpu(),
+    ramBytes: typeof memory === "number" ? memory * 1024 ** 3 : undefined,
+    rates: readFoldRates(),
+  });
+}
+
+let planTimer;
+let planAsked = 0;
+
+/** Rewrite the line beside the button, once whatever is being typed has settled. */
+function refreshPlan() {
+  clearTimeout(planTimer);
+  planTimer = setTimeout(async () => {
+    planAsked += 1;
+    const asked = planAsked;
+    const line = element("fold-plan");
+    let plan;
+    try { plan = await currentPlan(); } catch (cause) { console.warn("plan", cause); }
+    if (asked !== planAsked) return;
+    line.hidden = plan === undefined;
+    if (plan === undefined) return;
+    const { text, title, tone } = describePlan(plan);
+    line.textContent = text;
+    line.title = title;
+    line.dataset.tone = tone;
+  }, 120);
+}
+
+const FOLD_AFTER_RELOAD = "localfold.fold-after-reload";
+
+/** Put this tab on the CPU. True if that takes a reload, on the far side of which the fold starts by itself. */
+async function prepareCpuFold() {
+  try { sessionStorage.setItem(FOLD_AFTER_RELOAD, "1"); } catch { /* the reader presses Fold again */ }
+  const reloading = await useCpuForNow(keepFormForReload);
+  if (!reloading) {
+    try { sessionStorage.removeItem(FOLD_AFTER_RELOAD); } catch { /* it was never set */ }
+  }
+  return reloading;
+}
+
+async function foldOnCpuInstead() {
+  chooseCpuModel();
+  if (await prepareCpuFold()) return;
+  void refreshPlan();
+  await fold();
+}
+
+/** A fold the GPU should not take, and the reader's way on from it. */
+function offerAlternatives(plan) {
+  const cpu = {
+    label: plan.cpuFits ? `Fold on CPU · ${roughDuration(plan.cpuSeconds)}` : "Try on CPU anyway",
+    title: "Cannot run out of GPU memory, and Stop works at once. For this tab: Settings keeps its own choice.",
+    onClick: () => { void foldOnCpuInstead(); },
+  };
+  const gpu = {
+    label: "Try on GPU anyway",
+    title: "Lifts the limit for this session. A card that runs out can reset its graphics driver, and the browser"
+      + " may then need a restart before it can use the GPU again.",
+    onClick: () => { void foldWithoutCeiling(); },
+  };
+  const choices = plan.where === "none" || plan.why === "binding" ? [cpu] : [cpu, gpu];
+  const [first, ...more] = choices;
+  statusWithAction(describeRefusal(plan), first.label, first.title, first.onClick, more);
+}
 
 /**
  * Whether the reader has taken the ceiling off, which lasts the session.
@@ -6126,9 +6231,16 @@ installSettings({
   onComputeChange: (choice) => {
     if (choice === "cpu") chooseCpuModel();
     else releaseCpuFold();
+    refreshPlan();
   },
+  onLimitChange: () => refreshPlan(),
   keepPage: keepFormForReload,
 });
+// Whatever can change the answer, including a row added or set from outside the form.
+element("entity-rows").addEventListener("input", refreshPlan);
+element("entity-rows").addEventListener("change", refreshPlan);
+new MutationObserver(refreshPlan).observe(element("entity-rows"), { childList: true });
+for (const id of ["model-family", "plm-mode", "recycles"]) element(id).addEventListener("change", refreshPlan);
 installViewerTheme();
 
 element("predict").addEventListener("click", (event) => void fold(event));
@@ -7257,3 +7369,10 @@ document.addEventListener("localfold-runtime-stopped", (event) => {
 // ...last, because they run the syncs, and every one of those is defined by now.
 if (computePreference() === "cpu") chooseCpuModel();
 restoreKeptForm();
+refreshPlan();
+try {
+  if (sessionStorage.getItem(FOLD_AFTER_RELOAD) !== null) {
+    sessionStorage.removeItem(FOLD_AFTER_RELOAD);
+    void fold();
+  }
+} catch { /* a private window: Fold is one press away */ }

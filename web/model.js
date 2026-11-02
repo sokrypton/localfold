@@ -23,7 +23,7 @@ import { MODEL_BUNDLES, bundleBaseUrl, graphFamily, loadManifest }
   from "../shared/bundles/manifests/index.js";
 import { DeltaTensorStore } from "../shared/bundles/delta-tensor-store.js";
 import { requestAlphaFoldDevice } from "../webgpu/runtime/device.js";
-import { budgetForDevice, memoryTotals } from "../webgpu/runtime/device-memory.js";
+import { budgetForDevice, memoryTotals, setMemoryBudget } from "../webgpu/runtime/device-memory.js";
 import { deviceProfile } from "../webgpu/runtime/device-profile.js";
 import { settleGridAttendTiling } from "../webgpu/af3/trunk/grid-attend-race.js";
 import { devUseDevice } from "./dev-log.js";
@@ -232,6 +232,52 @@ const NO_ADAPTER = "WebGPU found no usable GPU. If a fold just failed, the brows
   + " have stopped offering this site the GPU: close every window of this browser and"
   + " open it again. chrome://gpu shows what it thinks.";
 
+/** A device request has failed since this page loaded, which on Windows means the browser has to restart. */
+let deviceRefused = false;
+let planningAdapter;
+
+const automaticBudget = (adapter) => budgetForDevice(4, {
+  gpuMemoryBytes: gpuMemoryBytes(adapter), learnedBytes: learnedLimitBytes(), userBytes: chosenLimitBytes(),
+});
+
+/**
+ * What a plan needs to know about the GPU, without making a device to find out: undefined where there is no adapter.
+ * Cheap enough for a line the page rewrites as somebody types, because the adapter is asked for once.
+ */
+export async function planningGpu() {
+  if (navigator.gpu === undefined) return undefined;
+  try {
+    planningAdapter ??= navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+    const adapter = await planningAdapter;
+    if (adapter === null) {
+      planningAdapter = undefined;
+      return undefined;
+    }
+    const held = await deviceSummary();
+    const name = gpuName() ?? adapter.info?.description ?? "";
+    return {
+      name,
+      memoryBytes: gpuMemoryBytes(adapter),
+      budgetBytes: held === undefined ? automaticBudget(adapter) : held.budgetBytes,
+      automaticBytes: budgetForDevice(4, { gpuMemoryBytes: gpuMemoryBytes(adapter), learnedBytes: learnedLimitBytes() }),
+      maxBindingBytes: adapter.limits.maxStorageBufferBindingSize,
+      halfWeights: adapter.features.has("shader-f16"),
+      software: adapter.info?.isFallbackAdapter === true || /SwiftShader|llvmpipe|Basic Render/i.test(name),
+      refusing: deviceRefused,
+    };
+  } catch (cause) {
+    console.warn("planning", cause);
+    return undefined;
+  }
+}
+
+/** The limit Settings has just changed, for a device that already exists. */
+export async function applyMemoryLimit() {
+  if (devicePromise === undefined) return;
+  const adapter = await planningAdapter;
+  setMemoryBudget(await devicePromise, adapter === null || adapter === undefined ? undefined : automaticBudget(adapter));
+}
+
 const NO_DEVICE = "The GPU is not accepting work. If a fold just failed the graphics driver may have reset, and this"
   + " browser cannot use the GPU again until it restarts: close every window of it and open it again.";
 
@@ -261,8 +307,10 @@ export function getDevice() {
       // Measured on Windows after a driver reset: an adapter is still offered and every device request is refused with
       // DXGI_ERROR_DEVICE_REMOVED, for as long as this browser's GPU process lives.
       console.error("requestDevice", cause);
+      deviceRefused = true;
       throw new Error(NO_DEVICE);
     }
+    deviceRefused = false;
     currentAdapterInfo = { name: gpuName() ?? adapter.info?.description ?? "",
                            vendor: adapter.info?.vendor ?? "",
                            architecture: adapter.info?.architecture ?? "",
@@ -270,6 +318,7 @@ export function getDevice() {
     void device.lost.then((info) => {
       if (devicePromise === request) { devicePromise = undefined; currentAdapterInfo = undefined; }
       if (info.reason === "destroyed") return;
+      planningAdapter = undefined;
       // What the page holds on a lost device goes when this says so, and until then the browser keeps it on the card:
       // measured, about 5 GiB of an 8 GiB card after a reset.
       try { device.destroy(); } catch { /* it is lost either way */ }
