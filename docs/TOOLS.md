@@ -356,6 +356,10 @@ go through CDP, and the deploy.
 - **`check-job-archive.py`** - Does a fold archive describe the AlphaFold 3 job that was handed in?
 - **`check-ligand-path.mjs`** - Every AF3-lineage model folds a LIGAND, and its bonds are the right length.
 - **`check-model-pending.py`** - One fold at a time, and a model row that starts a new session.
+- **`check-cpu-fold.py`** - A whole ESMFold2 fold on the CPU, through the page, in a Chrome with no GPU.
+- **`fold-esmfold2-cpu.mjs`** - A whole ESMFold2 fold on the CPU from node, with its stage times and scores.
+- **`bench-cpu-backend.mjs`** - The CPU backend's kernels against the reference's loops, in GFLOP/s.
+- **`dark-theme.py`** - Regenerates web/localfold-dark.css from the vendored py2Dmol sheet.
 - **`check-model-switch.py`** - Ten models folded in ONE page, as a reader switching models does.
 - **`check-modified-path.mjs`** - Does every model fold a MODIFIED RESIDUE, and does it hold together?
 - **`check-multigpu.py`** - One AlphaFold 3 fold across several GPUs (cuda/af3 --gpus=N): correctness against the one-GPU fold, then scaling.

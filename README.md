@@ -36,7 +36,8 @@ for them:
 - **Templates** fetch a structure from the RCSB or AlphaFold DB by the
   identifier you type.
 
-The model weights themselves are downloaded once and cached by the browser.
+The model weights themselves are downloaded once and cached by the browser;
+Settings lists them and deletes them.
 
 ## What you get out
 
@@ -53,6 +54,9 @@ the alignments it recorded.
 A browser with WebGPU - Chrome or Edge 113+, or Safari 18+. A discrete or
 Apple-silicon GPU makes a large difference; a 60-residue protein folds in a few
 seconds on an M2, and a few hundred residues takes minutes.
+
+No GPU, or one too small for the job? ESMFold2 also folds on the CPU: **Settings,
+Fold on, CPU**. It is slower: 76 residues takes a minute on eight threads, and 300 takes eleven. Every other model needs the GPU.
 
 Nothing is installed, and there is nothing to set up: open the page and fold.
 
