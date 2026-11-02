@@ -1128,7 +1128,8 @@ let deviceFault;
 /** What a fault means for the next press of Fold, since that is the reader's question. */
 function describeDeviceFault(fault) {
   const mib = (bytes) => `${Math.round(bytes / 1048576)} MiB`;
-  return `${fault.message} Nothing on this page needs a reload: Fold asks for a new device.`
+  return `${fault.message} Press Fold to ask for a new device; if the graphics driver reset, this browser has to`
+    + " restart before it can use the GPU again."
     + (fault.learned === undefined ? ""
       : ` This fold held more than the card could, so the limit is now ${mib(fault.learned)}.`);
 }

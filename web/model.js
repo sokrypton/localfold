@@ -27,7 +27,7 @@ import { budgetForDevice, memoryTotals } from "../webgpu/runtime/device-memory.j
 import { deviceProfile } from "../webgpu/runtime/device-profile.js";
 import { settleGridAttendTiling } from "../webgpu/af3/trunk/grid-attend-race.js";
 import { devUseDevice } from "./dev-log.js";
-import { gpuMemoryBytes, gpuName, learnedLimitBytes } from "./gpu-limits.js";
+import { chosenLimitBytes, gpuMemoryBytes, gpuName, learnedLimitBytes } from "./gpu-limits.js";
 import { withAbort } from "../webgpu/runtime/abort.js";
 
 const stores = new Map();
@@ -232,6 +232,9 @@ const NO_ADAPTER = "WebGPU found no usable GPU. If a fold just failed, the brows
   + " have stopped offering this site the GPU: close every window of this browser and"
   + " open it again. chrome://gpu shows what it thinks.";
 
+const NO_DEVICE = "The GPU is not accepting work. If a fold just failed the graphics driver may have reset, and this"
+  + " browser cannot use the GPU again until it restarts: close every window of it and open it again.";
+
 /** The WebGPU device, with the optional features the fast paths look for. */
 export function getDevice() {
   if (devicePromise !== undefined) return devicePromise;
@@ -248,10 +251,18 @@ export function getDevice() {
     // set: a third of system RAM, a share of the card's own memory where its name
     // says, and whatever a lost device has already taught this browser.
     const gpuMemory = gpuMemoryBytes(adapter);
-    const device = await requestAlphaFoldDevice(adapter, {
-      memoryBudgetBytes: budgetForDevice(4, { gpuMemoryBytes: gpuMemory,
-                                              learnedBytes: learnedLimitBytes() }),
-    });
+    let device;
+    try {
+      device = await requestAlphaFoldDevice(adapter, {
+        memoryBudgetBytes: budgetForDevice(4, { gpuMemoryBytes: gpuMemory, learnedBytes: learnedLimitBytes(),
+                                                userBytes: chosenLimitBytes() }),
+      });
+    } catch (cause) {
+      // Measured on Windows after a driver reset: an adapter is still offered and every device request is refused with
+      // DXGI_ERROR_DEVICE_REMOVED, for as long as this browser's GPU process lives.
+      console.error("requestDevice", cause);
+      throw new Error(NO_DEVICE);
+    }
     currentAdapterInfo = { name: gpuName() ?? adapter.info?.description ?? "",
                            vendor: adapter.info?.vendor ?? "",
                            architecture: adapter.info?.architecture ?? "",
@@ -259,6 +270,9 @@ export function getDevice() {
     void device.lost.then((info) => {
       if (devicePromise === request) { devicePromise = undefined; currentAdapterInfo = undefined; }
       if (info.reason === "destroyed") return;
+      // What the page holds on a lost device goes when this says so, and until then the browser keeps it on the card:
+      // measured, about 5 GiB of an 8 GiB card after a reset.
+      try { device.destroy(); } catch { /* it is lost either way */ }
       reportFault("lost", `The GPU device was lost${info.message ? `: ${info.message}` : ""}`, device);
     });
     // A failed createBuffer returns an invalid buffer and says nothing until the

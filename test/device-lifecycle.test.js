@@ -5,6 +5,7 @@
  */
 import { strict as assert } from "node:assert";
 import { beforeEach, describe, it } from "node:test";
+import { cardBudgetBytes, UNNAMED_CARD_BYTES } from "../webgpu/runtime/device-memory.js";
 
 function fakeAdapter() {
   const lost = {};
@@ -120,7 +121,8 @@ describe("the page's device", () => {
     await getDevice();
     const summary = await deviceSummary();
     assert.equal(summary.vendor, "acme");
-    assert.equal(summary.budgetBytes, Math.round(16 * 1024 ** 3 / 3));
+    // A card the name table does not know is taken for a common one, not the system's third.
+    assert.equal(summary.budgetBytes, cardBudgetBytes(UNNAMED_CARD_BYTES));
     assert.equal(summary.residentBytes, 0);
   });
 });

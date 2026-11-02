@@ -12,7 +12,7 @@ import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 
 import {
-  budgetForDevice, GpuMemoryBudgetError, gpuMemoryFromName, GPU_MEMORY_SHARE, memorySnapshot,
+  budgetForDevice, cardBudgetBytes, GpuMemoryBudgetError, gpuMemoryFromName, memorySnapshot,
   noteAllocation, noteDestroy, setMemoryBudget,
 } from "../webgpu/runtime/device-memory.js";
 
@@ -115,7 +115,7 @@ describe("the ceiling a page gives a device", () => {
     // The report this exists for: 32 GiB of RAM and an 8 GiB RTX 3070 was a 10.9 GiB ceiling.
     const name = "ANGLE (NVIDIA, NVIDIA GeForce RTX 3070 (0x00002484) Direct3D11 vs_5_0 ps_5_0, D3D11)";
     const budget = withRam(32, () => budgetForDevice(4, { gpuMemoryBytes: gpuMemoryFromName(name) }));
-    assert.equal(budget, Math.round(8 * GIB * GPU_MEMORY_SHARE));
+    assert.equal(budget, cardBudgetBytes(8 * GIB));
   });
 
   it("still takes a third of system RAM where that is the smaller", () => {

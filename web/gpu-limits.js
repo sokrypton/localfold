@@ -7,9 +7,10 @@
  * needs a page, and every read is guarded because a failure only costs a tighter
  * or looser guess.
  */
-import { GPU_MEMORY_SHARE, gpuMemoryFromName } from "../webgpu/runtime/device-memory.js";
+import { GPU_MEMORY_SHARE, gpuMemoryFromName, UNNAMED_CARD_BYTES } from "../webgpu/runtime/device-memory.js";
 
 const LEARNED_KEY = "localfold.gpu-limit";
+const CHOSEN_KEY = "localfold.gpu-chosen-limit";
 /** A loss under this says nothing about memory: nothing large was being held. */
 const LEARN_FROM_BYTES = 512 * 1024 * 1024;
 
@@ -38,7 +39,12 @@ export function gpuMemoryBytes(adapter) {
     const size = Math.max(...(local.length > 0 ? local : heaps).map((heap) => Number(heap.size)));
     if (Number.isFinite(size) && size > 0) return size;
   }
-  return gpuMemoryFromName(gpuName());
+  const named = gpuMemoryFromName(gpuName());
+  if (named !== undefined) return named;
+  // Not a table's card. A software adapter and unified memory have no card to run out of.
+  const vendor = adapter?.info?.vendor ?? "";
+  if (vendor === "" || vendor === "apple" || vendor === "google" || adapter?.info?.isFallbackAdapter === true) return undefined;
+  return UNNAMED_CARD_BYTES;
 }
 
 function readLearned() {
@@ -46,6 +52,21 @@ function readLearned() {
     const saved = JSON.parse(localStorage.getItem(LEARNED_KEY) ?? "null");
     return saved?.name === (gpuName() ?? "unknown") && Number.isFinite(saved.bytes) ? saved.bytes : undefined;
   } catch { return undefined; }
+}
+
+/** What the reader has said this card can spare, in bytes, if they have. */
+export function chosenLimitBytes() {
+  try {
+    const saved = Number(localStorage.getItem(CHOSEN_KEY));
+    return Number.isFinite(saved) && saved > 0 ? saved : undefined;
+  } catch { return undefined; }
+}
+
+export function setChosenLimitBytes(bytes) {
+  try {
+    if (bytes === undefined) localStorage.removeItem(CHOSEN_KEY);
+    else localStorage.setItem(CHOSEN_KEY, String(Math.round(bytes)));
+  } catch { /* a private window: back to the automatic limit */ }
 }
 
 /** The ceiling a lost device has taught this browser for this card, if one has. */

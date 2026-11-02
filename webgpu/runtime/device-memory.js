@@ -88,23 +88,44 @@ export function setMemoryBudget(device, budgetBytes) {
  * number nobody checked as if it were a device limit, which is why the only
  * thing it is used for is choosing between two paths that both work.
  */
-export function budgetForDevice(fallbackGiB = 4, { gpuMemoryBytes, learnedBytes } = {}) {
+export function budgetForDevice(fallbackGiB = 4, { gpuMemoryBytes, learnedBytes, userBytes } = {}) {
+  // Somebody who has said what their machine can spare is the one reading that is not a guess.
+  if (userBytes !== undefined) return userBytes;
   const gib = (typeof navigator === "object" && navigator !== null
     && typeof navigator.deviceMemory === "number") ? navigator.deviceMemory : fallbackGiB;
   const bytes = [Math.round(gib * 1024 * 1024 * 1024 / 3)];
   // A third of system RAM says nothing about a discrete card's own memory: a
   // 32 GiB desktop with an 8 GiB RTX 3070 was given a 10.9 GiB ceiling, and a
-  // fold under it ran the card out and lost the device. The same fifth is kept
-  // back for the desktop, the browser and the driver's own overhead.
-  if (gpuMemoryBytes !== undefined) bytes.push(Math.round(gpuMemoryBytes * GPU_MEMORY_SHARE));
+  // fold under it ran the card out and lost the device.
+  if (gpuMemoryBytes !== undefined) bytes.push(cardBudgetBytes(gpuMemoryBytes));
   if (learnedBytes !== undefined) bytes.push(learnedBytes);
   return Math.min(...bytes);
 }
 
-/** How much of a discrete card's own memory one fold may hold. */
+/** What a lost device says the limit was, as a share of what it was holding. */
 export const GPU_MEMORY_SHARE = 0.8;
 
 const GIB = 1024 * 1024 * 1024;
+
+/**
+ * How much of a discrete card's own memory one fold may hold.
+ *
+ * Not a fixed share, because what else is on the card does not scale with the card. On an 8 GiB RTX 3070 running a
+ * desktop and a browser, nvidia-smi read 1.7 to 2.5 GiB before a fold started, and a stale destroyed buffer or two sits
+ * on top of a fold's own sum. Windows reset the driver twice with the card at about 7.4 GiB of 8: once at 800 residues
+ * with the allocator's sum at 3.9 GiB, well inside the 6.4 GiB that a fifth held back had allowed. No browser API
+ * reports free GPU memory, so the reserve is a measured allowance: 40% of a card, between 1.2 GiB and 3.2 GiB.
+ */
+export function cardBudgetBytes(cardBytes) {
+  return Math.round(cardBytes - Math.max(1.2 * GIB, Math.min(3.2 * GIB, 0.4 * cardBytes)));
+}
+
+/**
+ * A card this browser will not name, or a name the table does not know. Assuming it has the system's third is how a
+ * small card got a large ceiling, so an unnamed card is taken to have about what most discrete cards do until a reader
+ * says otherwise in the settings. Unified memory has no card to run out of, so Apple's adapters keep the system's third.
+ */
+export const UNNAMED_CARD_BYTES = 6 * GIB;
 
 /**
  * The smallest memory each consumer GPU name has shipped with, in GiB.
@@ -133,6 +154,9 @@ const GPU_MEMORY_GIB = [
   [/\bRX\s*9060\b/i, 8], [/\bRX\s*9070\b/i, 16],
   [/\bArc\b.*\bA380\b/i, 6], [/\bArc\b.*\bA5[08]0\b/i, 8], [/\bArc\b.*\bA7[57]0\b/i, 8],
   [/\bArc\b.*\bB570\b/i, 10], [/\bArc\b.*\bB580\b/i, 12],
+  // Rented ones, which are where a Colab or a cloud fold runs.
+  [/\b(?:NVIDIA|Tesla)\s+T4\b/i, 16], [/\bNVIDIA\s+A10G?\b/i, 24], [/\bNVIDIA\s+L4\b/i, 24],
+  [/\bNVIDIA\s+L40S?\b/i, 48], [/\bNVIDIA\s+A100\b/i, 40], [/\bNVIDIA\s+H100\b/i, 80],
 ];
 
 /**
