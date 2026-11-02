@@ -24,7 +24,7 @@
  *   poolRows      a masked softmax along j and the weighted sum of the row.
  */
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
-import { GpuBufferAllocator } from "../runtime/allocator.js";
+import { GpuBufferAllocator, settleReleasedMemory } from "../runtime/allocator.js";
 import { spillToHost } from "../runtime/host-spill.js";
 import { Esmfold2TrunkGpu } from "./trunk.js";
 import { createAddShader } from "../runtime/execution.js";
@@ -699,6 +699,7 @@ export async function esmfold2ConfidenceFold(device, input, weights, options = {
   // of rows at a time, and the blocks run in place.
   const initialSpill = input.spillInitial !== true ? undefined
     : await spillToHost(device, allocator, initial.buffer, elements * 4, "ef2-conf.init");
+  if (initialSpill !== undefined) await settleReleasedMemory(device);
   const stackPair = initialSpill !== undefined ? initial
     : allocator.allocate("ef2-conf.stack-pair", elements * 4,
                          GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST);

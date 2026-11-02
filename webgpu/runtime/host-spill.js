@@ -28,7 +28,8 @@ export class HostSpill {
       const index = Math.floor(at / this.pieceBytes);
       const within = at - index * this.pieceBytes;
       const count = Math.min(byteSize - written, this.pieceBytes - within);
-      device.queue.writeBuffer(buffer, bufferOffset + written, this.pieces[index], within, count);
+      // The piece's ArrayBuffer and not the typed array, whose offset and size writeBuffer takes in elements.
+      device.queue.writeBuffer(buffer, bufferOffset + written, this.pieces[index].buffer, within, count);
       written += count;
     }
   }

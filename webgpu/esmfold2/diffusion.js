@@ -29,6 +29,7 @@
  * a kernel to build a one-hot it will immediately contract away.
  */
 import { deviceTuning, halfPrecisionAvailable } from "../runtime/device-profile.js";
+import { settleReleasedMemory } from "../runtime/allocator.js";
 import { GRID_WIDTH, LANES, createLayerNormShader, createLinearShader, createSplitReduceShader,
          createSplitSwigluReduceShader, createSwigluShader, linearGrid, linearKSplits, ROW_TILE, swigluGrid } from "../esmc/block.js";
 import { float32ToFloat16Array } from "../../shared/weights/float16.js";
@@ -1369,16 +1370,20 @@ export class Esmfold2DenoiserGpu {
       this.allocations.splice(this.allocations.indexOf(allocation), 1);
     }
 
+    // What was just destroyed, the trunk's pair above all, comes back only when the device ticks. Without this the twelve
+    // biases land on top of it: measured at 1200 tokens on an RTX 3070, the card read 1.4 GiB over the allocator's own sum,
+    // the fullest it was in the whole fold.
+    await settleReleasedMemory(this.device);
     b.bias = weights.tokenBlocks.map((_, index) =>
       this.#alloc(`esmfold2.diff.bias.${index}`, pairs * tokenHeads));
     const biasTemps = [scratchNorm];
-    const biasPasses = [];
     for (let index = 0; index < weights.tokenBlocks.length; index += 1) {
       const block = weights.tokenBlocks[index].attention;
       const scale = upload(`b${index}.pair-norm-scale`, block.pairNormScale);
       const offset = upload(`b${index}.pair-norm-offset`, block.pairNormOffset);
       const projection = upload(`b${index}.pair-bias`, block.pairBiasWeights);
       biasTemps.push(scale, offset, projection);
+      const biasPasses = [];
       for (let start = 0; start < pairs; start += chunk) {
         const rows = Math.min(chunk, pairs - start);
         const p = pipelines.pair[rows];
@@ -1391,8 +1396,12 @@ export class Esmfold2DenoiserGpu {
            ...linearGrid(rows, tokenHeads)],
         );
       }
+      // A submit a block, with one drain after them all: as one submit this was the longest thing a fold asks of the
+      // GPU without a break, 740 ms at 1200 tokens, and a driver that wants the GPU back has to wait for all of it.
+      // eslint-disable-next-line no-await-in-loop
+      await this.#now("esmfold2.diff.bias", biasPasses, false);
     }
-    await this.#now("esmfold2.diff.bias", biasPasses);
+    await this.device.queue.onSubmittedWorkDone();
     if (reuseRelPos) {
       releaseRelPos?.();
     } else {

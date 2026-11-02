@@ -30,7 +30,7 @@ import {
 } from "../../shared/esmfold2/featurise.js";
 import { EsmcTowerGpu } from "../esmc/tower.js";
 import { createAddShader } from "../runtime/execution.js";
-import { deviceTuning } from "../runtime/device-profile.js";
+import { deviceTuning, halfPrecisionAvailable } from "../runtime/device-profile.js";
 import { memoryTotals } from "../runtime/device-memory.js";
 import { GpuBufferAllocator, settleReleasedMemory } from "../runtime/allocator.js";
 import { spillToHost } from "../runtime/host-spill.js";
@@ -55,7 +55,7 @@ import {
   samplerStep, uniforms,
 } from "../../cpu/esmfold2/sampler.js";
 import { ESMFOLD2_PHASES, esmfold2Plan, trunkPhase } from "./cost.js";
-import { esmfold2Spills } from "./memory-plan.js";
+import { esmfold2Spills, FOLD_WEIGHT_BYTES, FOLD_WEIGHT_BYTES_F32 } from "./memory-plan.js";
 
 /** The largest pair copied to the host; past it the browser refuses the array. */
 const HOST_PAIR_MAX_BYTES = 1024 * 1024 * 1024;
@@ -557,7 +557,10 @@ export async function foldEsmfold2(device, options) {
     const pairBytes = pairs * channels * 4;
     // Whether what a stage only reads waits on the host, which costs seconds of traffic and gives back a whole
     // pair-sized tensor twice over. See webgpu/esmfold2/memory-plan.js.
-    const spill = options.spillPairs ?? esmfold2Spills({ tokens, channels, ...memoryTotals(device) });
+    const spill = options.spillPairs ?? esmfold2Spills({
+      tokens, channels, ...memoryTotals(device),
+      weightBytes: halfPrecisionAvailable(device) ? FOLD_WEIGHT_BYTES : FOLD_WEIGHT_BYTES_F32,
+    });
     let zInit = reuse !== undefined ? undefined
       : keep(allocator.allocate("esmfold2.z-init", pairBytes,
           storage | (options.returnConfidenceInputs === true || spill ? GPUBufferUsage.COPY_SRC : 0)));
@@ -1105,5 +1108,8 @@ export async function foldEsmfold2(device, options) {
     for (let at = held.length - 1; at >= 0; at -= 1) {
       try { held[at].release(); } catch { /* already released */ }
     }
+    // A stopped fold has work in flight, so what was just destroyed comes back only when the device next ticks, and an
+    // idle device does not: measured at 1000 tokens, a stopped fold left 5 GiB on the card with nothing running.
+    await settleReleasedMemory(device).catch(() => { /* a lost device has nothing left to give back */ });
   }
 }

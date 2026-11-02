@@ -17,6 +17,8 @@ const MIB = 1024 * 1024;
 
 /** Weights resident at the same time, measured at 600 tokens: 170 MiB of trunk beside the denoiser's 200 and change. */
 export const FOLD_WEIGHT_BYTES = 480 * MIB;
+/** The same weights on a device with no shader-f16, which reads them as f32. Measured on an A10 at 600 and 1200 tokens. */
+export const FOLD_WEIGHT_BYTES_F32 = 720 * MIB;
 /** The sequential track's own row chunks, two of them. */
 export const TRACK_CHUNK_BYTES = 128 * MIB;
 /** A pair this size or larger takes the sequential track; see gridChunkWorthIt in webgpu/af3/trunk/pair-track.js. */
@@ -30,23 +32,31 @@ const AB_PAIRS = 2 / 8;
 export const pairBytes = (tokens, channels = 256) => tokens * tokens * channels * 4;
 
 /** The most a fold holds at once, in bytes. `spill`: z_init and the head's initial pair wait on the host. */
-export function esmfold2PeakBytes({ tokens, channels = 256, spill = false }) {
+export function esmfold2PeakBytes({ tokens, channels = 256, spill = false, weightBytes = FOLD_WEIGHT_BYTES }) {
   const P = pairBytes(tokens, channels);
   // Below the gate the whole-tensor track: the pair, a, b, the contraction's output and the normalised input.
   const track = P < COMPACT_MIN_BYTES ? 5 * P : (2 + AB_PAIRS) * P + TRACK_CHUNK_BYTES;
   const beside = spill ? 0 : P;
-  return track + beside + FOLD_WEIGHT_BYTES;
+  return track + beside + weightBytes;
 }
 
-/** Whether z_init and the head's initial pair should wait on the host, given what the device holds and may hold. */
-export function esmfold2Spills({ tokens, channels = 256, residentBytes = 0, budgetBytes }) {
+/**
+ * Whether z_init and the head's initial pair should wait on the host, given what the device holds and may hold.
+ *
+ * `residentBytes` is mostly this fold's own weights by the time this is asked, so it stands in for the plan's figure
+ * and is not added to it; whichever is the larger is what the fold will have on the card beside its tensors.
+ */
+export function esmfold2Spills({ tokens, channels = 256, residentBytes = 0, budgetBytes,
+                                 weightBytes = FOLD_WEIGHT_BYTES }) {
   if (budgetBytes === undefined || budgetBytes === null) return false;
-  return residentBytes + esmfold2PeakBytes({ tokens, channels }) + FOLD_MARGIN_BYTES > budgetBytes;
+  const peak = esmfold2PeakBytes({ tokens, channels, weightBytes: Math.max(residentBytes, weightBytes) });
+  return peak + FOLD_MARGIN_BYTES > budgetBytes;
 }
 
 /** The longest fold this budget holds, in tokens. The ceiling is the largest tensor a storage binding can name. */
-export function esmfold2MaxTokens({ budgetBytes, channels = 256, maxBindingBytes = 2147483644 }) {
-  const available = budgetBytes - FOLD_WEIGHT_BYTES - TRACK_CHUNK_BYTES - FOLD_MARGIN_BYTES;
+export function esmfold2MaxTokens({ budgetBytes, channels = 256, maxBindingBytes = 2147483644,
+                                    weightBytes = FOLD_WEIGHT_BYTES }) {
+  const available = budgetBytes - weightBytes - TRACK_CHUNK_BYTES - FOLD_MARGIN_BYTES;
   const tokens = Math.floor(Math.sqrt(available / (2 + AB_PAIRS) / (channels * 4)));
   const ceiling = Math.floor(Math.sqrt(maxBindingBytes / (channels * 4)));
   return Math.max(0, Math.min(tokens, ceiling));
