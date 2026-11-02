@@ -14,7 +14,9 @@ this checks:
   * the fold crosses the worker and lands: a status line with scores, and no console error;
   * a second fold keeps the worker's weights;
   * Stop ends the fold at once, and the next fold still works from the shard cache;
-  * and with --complex, two chains cross the worker and come back with an ipTM.
+  * with --complex, two chains cross the worker and come back with an ipTM;
+  * and with nothing chosen, the line beside the button offers the CPU, Fold goes there, and the reload that takes
+    carries the fold across it, with nothing remembered for the next visit.
 """
 import argparse
 import base64
@@ -159,6 +161,37 @@ def main():
             shot(ws, "complex")
         report["caches"] = cdp.evaluate(ws, "caches.keys()")
         assert len(report["caches"]) >= 2, f"the shard caches did not survive: {report['caches']}"
+
+        # Somebody with no GPU who has chosen nothing: one press of Fold, across the reload.
+        cdp.evaluate(ws, "document.querySelector('#settings-compute button:first-child').click()")
+        cdp.wait_for(ws, "navigator.serviceWorker.getRegistrations().then((all) => all.length === 0)", timeout=30,
+                     what="the service worker to go")
+        ws.call("Page.reload")
+        cdp.wait_for(ws, f"self.crossOriginIsolated === false && {READY}", timeout=60,
+                     what="the page to come back without isolation")
+        cdp.evaluate(ws, """(() => {
+          for (const [id, value] of [['model-family', 'ef2-fast-600m'], ['plm-mode', 'esmc-300m']]) {
+            const el = document.getElementById(id); el.value = value;
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+          }
+          const list = window.__entityList;
+          list.set([{ ...list.read()[0], value: %s, copies: 1 }]);
+        })()""" % json.dumps(SEQUENCE))
+        cdp.wait_for(ws, "document.getElementById('fold-plan')?.textContent.includes('CPU thread')", timeout=15,
+                     what="the line beside the button to offer the CPU")
+        report["plan_line"] = cdp.evaluate(ws, "document.getElementById('fold-plan').textContent")
+        cdp.evaluate(ws, "document.getElementById('predict').click()")
+        cdp.wait_for(ws, f"self.crossOriginIsolated === true && {READY}", timeout=60,
+                     what="Fold to bring the page back isolated")
+        cdp.wait_for(ws, "(document.getElementById('status-message')?.textContent ?? '').includes('pLDDT')"
+                         " || document.getElementById('status-message')?.classList.contains('error') === true",
+                     timeout=args.timeout, what="the fold to finish on its own after the reload", progress=STATUS)
+        report["one_press"] = now = state(ws)
+        assert not now["failed"], f"the fold failed: {now['status']}"
+        assert now["residues"] == len(SEQUENCE), f"the reload lost the sequence: {now}"
+        assert now["errors"] == [], f"console errors: {now['errors']}"
+        remembered = cdp.evaluate(ws, "localStorage.getItem('localfold.compute')")
+        assert remembered in (None, "auto"), f"the fallback was remembered as a choice: {remembered}"
         print(json.dumps(report, indent=1))
         print("PASS")
     finally:

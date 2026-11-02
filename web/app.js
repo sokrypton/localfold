@@ -1346,9 +1346,38 @@ function startModelPreload(family, signal) {
   return load;
 }
 
+/**
+ * How long a running fold has left, on the line that said how long it would take.
+ *
+ * Measured off the fold's own bar, so it has nothing to do with the plan's figure and gets better as the fold goes.
+ * Not before it has something to go on, and not for a fold nearly done, where the number would only flicker.
+ */
+let timeLeftFrom;
+let timeLeftShown = 0;
+function showTimeLeft(fraction) {
+  if (typeof fraction !== "number" || !Number.isFinite(fraction) || activeFold === undefined) {
+    timeLeftFrom = undefined;
+    return;
+  }
+  const now = performance.now();
+  timeLeftFrom ??= { at: now, fraction };
+  const done = fraction - timeLeftFrom.fraction;
+  const elapsed = (now - timeLeftFrom.at) / 1000;
+  if (done < 0.05 || elapsed < 5 || now - timeLeftShown < 2000) return;
+  timeLeftShown = now;
+  const seconds = elapsed * (1 - fraction) / done;
+  if (seconds < 10) return;
+  const line = element("fold-plan");
+  line.hidden = false;
+  line.textContent = `${roughDuration(seconds)} left`;
+  line.title = "From how fast this fold has gone so far.";
+  line.dataset.tone = "plain";
+}
+
 function progress(fraction) {
   const bar = element("progress");
   showProgressInTitle(typeof fraction === "number" ? fraction : null);
+  showTimeLeft(fraction);
   if (fraction === null) {
     bar.dataset.state = "idle";
     bar.value = 0;
