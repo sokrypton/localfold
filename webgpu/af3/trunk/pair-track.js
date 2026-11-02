@@ -103,6 +103,48 @@ function chunkUniforms(device, key, n, rows) {
   return chunks;
 }
 
+/**
+ * The sequential triangle's chunks of pair rows and its uniforms: (first channel, channels, first pair row, pair
+ * rows), one 256-byte slot per channel group and chunk, plus a row of slots for the output stage. One buffer, because
+ * a large fold has thousands of these and each is sixteen bytes that never change.
+ */
+function sequentialChunks(device, pairs, channels, groupChannels, rowsPerChunk) {
+  const key = `sequential:${pairs}:${channels}:${groupChannels}:${rowsPerChunk}`;
+  let byLength = GRID_CHUNKS.get(device);
+  if (byLength === undefined) GRID_CHUNKS.set(device, byLength = new Map());
+  let table = byLength.get(key);
+  if (table !== undefined) return table;
+  const groups = [];
+  for (let from = 0; from < channels; from += groupChannels) {
+    groups.push({ from, count: Math.min(groupChannels, channels - from) });
+  }
+  const rows = [];
+  for (let from = 0; from < pairs; from += rowsPerChunk) {
+    rows.push({ from, rows: Math.min(rowsPerChunk, pairs - from) });
+  }
+  const slots = (groups.length + 1) * rows.length;
+  const buffer = device.createBuffer({ label: `chunk-${key}`, size: slots * 256,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  const words = new Uint32Array(slots * 64);
+  const at = (group, row) => (group * rows.length + row) * 64;
+  groups.forEach((group, g) => rows.forEach((chunk, r) => {
+    words.set([group.from, group.count, chunk.from, chunk.rows], at(g, r));
+  }));
+  rows.forEach((chunk, r) => words.set([0, 0, chunk.from, chunk.rows], at(groups.length, r)));
+  device.queue.writeBuffer(buffer, 0, words);
+  table = {
+    groups, rows, rowsPerChunk,
+    uniform: (group, row) => ({ buffer, byteOffset: (group * rows.length + row) * 256, byteSize: 16 }),
+  };
+  byLength.set(key, table);
+  return table;
+}
+
+/** Bytes of each of the sequential triangle's two row-chunk buffers: the most a block holds beyond its pair tensors. */
+export const SEQUENTIAL_CHUNK_BYTES = 64 * 1024 * 1024;
+/** Channel groups in the sequential triangle: a and b for one group are 2/SEQUENTIAL_GROUPS of a pair tensor. */
+export const SEQUENTIAL_GROUPS = 8;
+
 export async function compilePairTrack(cache, options) {
   const { n, sample, epsilon, variance, dialect, base } = options;
   // 🔴 THE SCRATCH LAYOUT IS THIS STACK'S, NOT THE MODULE'S. See
@@ -242,7 +284,14 @@ export async function compilePairTrack(cache, options) {
   const compact = options.channelChunked !== false && projectMatrix === false
     && scratchStorage.every((storage) => storage === "f32") && n >= 9
     && (gridChunked || !gridAttention)
-    && gridChunkWorthIt(n, channels, sample.pairAttention1);
+    && (options.forceCompact === true || gridChunkWorthIt(n, channels, sample.pairAttention1));
+  // 🔴 AND THE NORMALISED PAIR AND HIDDEN A CHUNK OF ROWS AT A TIME, WHICH IS TWO MORE. Neither has to outlive the row
+  // that reads it: LayerNorm(pair) is the same bits whenever it is taken, because the pair does not change until the
+  // output pass, and the normalised hidden has one reader. So each is computed into a small buffer just before it is
+  // read, and a block holds the pair, the contraction's output and a and b for one channel group - about 2.4 pair-sized
+  // tensors where compact holds 4.5. ESMFold2's stacks only: the grid attention needs a whole normalised input, and it
+  // keeps its chunks in the buffers this removes.
+  const sequential = compact && !gridAttention && options.sequentialTriangle === true;
   const abLayout = projectMatrix === false ? "blocked" : "interleaved";
   // ...and the output projection's two matrices, which the same knob moves and
   // which need a transpose rather than an interleave. See project-matrix.js.
@@ -274,7 +323,7 @@ export async function compilePairTrack(cache, options) {
     // of this track's updates do that now; see the note in
     // webgpu/af3/trunk/transition.js for what the add pass was costing.
     const { projectTile, contractTile, normalizeRows, projectGridWidth, ...sources } = createTriangleShaders(
-      compact ? { ...shape, channelChunked: true } : shape,
+      compact ? { ...shape, channelChunked: true, rowChunked: sequential } : shape,
       "f32", triangleOffsets, epsilon, direction, variance,
       // 🔴 THE PROJECTION TILE IS THE CALLER'S, because it is an occupancy
       // choice and this file cannot see the device. undefined keeps
@@ -334,7 +383,7 @@ export async function compilePairTrack(cache, options) {
                   // ...and the 1/L, which is a `const`-free difference INSIDE
                   // normalize-hidden's source: two dialects sharing a base
                   // would otherwise collide on it.
-                  + `:dl${shape.triangleMulDivideByLength}:nr${normalizeRows}:cc${compact}`
+                  + `:dl${shape.triangleMulDivideByLength}:nr${normalizeRows}:cc${compact}:rc${sequential}`
                   // ...and the tile each vector kernel was generated at.
                   + `:pt${projectTile.rows}x${projectTile.columns}x${projectTile.outColumns ?? "-"}w${projectTile.workgroup ?? 8}`
                   + `:ct${contractTile.rows}x${contractTile.columns}${contractTile.arithmetic ?? ""}`
@@ -585,7 +634,7 @@ export async function compilePairTrack(cache, options) {
   await Promise.all(pending);
   // How many pair-sized scratch tensors this track needs, and the rows the
   // grid attention runs at a time. Callers allocate `pairScratchCount`.
-  pipelines.pairScratchCount = gridAttention && !gridChunked
+  pipelines.pairScratchCount = sequential ? 3 : gridAttention && !gridChunked
     ? PAIR_SCRATCH_COUNT : PAIR_SCRATCH_COUNT - 1;
   // 🔴 AS MANY CHUNKS AS IT TAKES FOR THE SLOTS TO FIT A CHANNEL-WIDE BUFFER.
   // Quarters (three slots to a buffer) and thirds (two) fit only where the
@@ -610,6 +659,23 @@ export async function compilePairTrack(cache, options) {
     ? [[1, 0], [1, 1], [1, 2], [2, 0], [2, 1]]
     : [[1, 0], [1, 1], [2, 0], [2, 1], [3, 0]];
   pipelines.compact = compact;
+  if (sequential) {
+    const groupChannels = Math.ceil(channels / (options.sequentialGroups ?? SEQUENTIAL_GROUPS));
+    const abBytes = groupChannels * pairs * 4;
+    const chunkBytes = options.sequentialChunkBytes ?? SEQUENTIAL_CHUNK_BYTES;
+    const statsBytes = pairs * 8;
+    // A whole number of the project kernel's row tiles, so only a fold's last chunk has a short tile.
+    const tile = pipelines.projectTile.rows * pipelines.normalizeRows;
+    const rowsPerChunk = Math.max(tile, Math.floor(chunkBytes / (channels * 4) / tile) * tile);
+    const table = sequentialChunks(cache.device, pairs, channels, groupChannels, rowsPerChunk);
+    const tempBytes = Math.ceil(Math.min(rowsPerChunk, pairs) * channels * 4 / 256) * 256;
+    const abOffset = Math.ceil(abBytes / 256) * 256;
+    pipelines.sequential = { ...table, tempBytes, abOffset, statsBytes };
+    /** [the two row chunks and the row statistics, the contraction's output, a and b for one group]. */
+    pipelines.pairScratchBytes = (index, fullBytes) =>
+      [2 * tempBytes + statsBytes, fullBytes, abOffset + abBytes][index];
+    return pipelines;
+  }
   if (compact) {
     const pairs = n * n;
     const groupChannels = Math.ceil(channels / 4);
@@ -833,13 +899,65 @@ export function encodePairTrack(context) {
     const w = weights[direction];
     const p = (name) => pipelines[`tri:${direction}:${name}`];
     const perNormalizeTile = spread(ceil(pairs, pipelines.normalizeRows));
-    run("tri.normalize", p("normalizeInput"), [pair, w, scratch[0]],
-        perNormalizeTile[0], perNormalizeTile[1]);
+    if (pipelines.sequential === undefined) {
+      run("tri.normalize", p("normalizeInput"), [pair, w, scratch[0]],
+          perNormalizeTile[0], perNormalizeTile[1]);
+    }
     // ...rows folded over y and z: x is the channel tile, so the pair rows have
     // nowhere else to go and there are n^2 of them. See the note in the kernel.
     // ...the vector row tile, which `tri.project-out` still uses whichever
     // kernel does the projection: only projectAB moves to the units.
     const perProjectTile = spreadTriangle(ceil(pairs, pipelines.projectTile.rows));
+    if (pipelines.sequential !== undefined) {
+      // 🔴 SEE `sequential` IN compilePairTrack. scratch[0] is the two row chunks, scratch[1] the contraction's whole
+      // output and scratch[2] a and b for one channel group, and the pair is only ever bound a chunk of rows at a time.
+      const { groups, rows, uniform, tempBytes, abOffset, statsBytes } = pipelines.sequential;
+      const stats = {
+        buffer: scratch[0].buffer, byteOffset: (scratch[0].byteOffset ?? 0) + 2 * tempBytes, byteSize: statsBytes,
+      };
+      const temp = (which, chunk) => ({
+        buffer: scratch[0].buffer,
+        byteOffset: (scratch[0].byteOffset ?? 0) + which * tempBytes,
+        byteSize: chunk.rows * channels * 4,
+      });
+      const pairRows = (chunk) => ({
+        buffer: pair.buffer,
+        byteOffset: (pair.byteOffset ?? 0) + chunk.from * channels * 4,
+        byteSize: chunk.rows * channels * 4,
+      });
+      const normalizeTiles = (chunk) => spread(ceil(chunk.rows, pipelines.normalizeRows));
+      const projectTiles = (chunk) => spreadTriangle(ceil(chunk.rows, pipelines.projectTile.rows));
+      const hidden = scratch[1];
+      rows.forEach((chunk, r) => {
+        const [nx, ny] = normalizeTiles(chunk);
+        run("tri.normalize-stats", p("normalizeStats"), [pairRows(chunk), stats, uniform(groups.length, r)], nx, ny);
+      });
+      groups.forEach((group, g) => {
+        const a = { buffer: scratch[2].buffer, byteOffset: scratch[2].byteOffset ?? 0,
+                    byteSize: group.count * pairs * 4 };
+        const b = { buffer: scratch[2].buffer, byteOffset: (scratch[2].byteOffset ?? 0) + abOffset,
+                    byteSize: group.count * pairs * 4 };
+        rows.forEach((chunk, r) => {
+          const [py, pz] = projectTiles(chunk);
+          run("tri.project", p("projectAB"), [pairRows(chunk), pairMask, w, a, b, uniform(g, r), stats],
+              ceil(group.count, pipelines.projectTile.columns), py, pz);
+        });
+        run("tri.contract", p("contract"), [a, b, hidden, uniform(g, 0)],
+            ceil(n, pipelines.contractTile.columns), ceil(n, pipelines.contractTile.rows), group.count);
+        context.flush?.();
+      });
+      rows.forEach((chunk, r) => {
+        const slot = uniform(groups.length, r);
+        const [nx, ny] = normalizeTiles(chunk);
+        run("tri.normalize", p("normalizeInput"), [pairRows(chunk), w, temp(0, chunk), slot], nx, ny);
+        run("tri.normalize-hidden", p("normalizeHidden"), [hidden, w, temp(1, chunk), slot], nx, ny);
+        const [py, pz] = projectTiles(chunk);
+        run("tri.project-out", p("projectOutput"), [temp(0, chunk), temp(1, chunk), w, pairRows(chunk), slot],
+            ceil(channels, pipelines.projectTile.outColumns ?? pipelines.projectTile.columns), py, pz);
+      });
+      context.flush?.();
+      continue;
+    }
     if (pipelines.compact) {
       // 🔴 A QUARTER OF THE CHANNELS AT A TIME - see `compact` in
       // compilePairTrack. a and b for one group live in scratch[3], the
@@ -1045,6 +1163,7 @@ export function encodePairTrack(context) {
           [scratchSplit.wide, weights.transition, parameters.down, at(pair)],
           Math.ceil(channels / split.tiles.blockColumns),
           Math.ceil(count / split.tiles.blockRows));
+      if ((start / split.chunkRows) % 16 === 15) context.flush?.();
     }
     return;
   }

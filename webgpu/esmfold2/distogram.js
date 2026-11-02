@@ -31,21 +31,21 @@ export { CONTACT_EDGES, CERTAINTY, partnerKeys, PARTNER_ANGSTROMS, contactAngstr
 export { CONTACT_ANGSTROMS, CONTACT_ANGSTROMS_BY_KIND, LIGAND_PROTEIN_ANGSTROMS } from "../../shared/heads/contact-threshold.js";
 
 /** `out[i, j] = pair[i, j] + pair[j, i]`, which is what the head is handed. */
-export function createSymmetriseShader({ tokens, channels }) {
-  const pairs = tokens * tokens;
+export function createSymmetriseShader({ tokens, channels, chunkRows }) {
   return `
 @group(0) @binding(0) var<storage, read> pair: array<f32>;
-@group(0) @binding(1) var<storage, read_write> output: array<f32>;
+@group(0) @binding(1) var<storage, read> start: array<u32>;
+@group(0) @binding(2) var<storage, read_write> output: array<f32>;
 
 @compute @workgroup_size(${LANES})
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let i = id.x + id.y * ${GRID_WIDTH * LANES}u;
-  if (i >= ${pairs * channels}u) { return; }
-  let cell = i / ${channels}u;
+  if (i >= ${chunkRows * channels}u) { return; }
+  let cell = start[0] + i / ${channels}u;
   let c = i % ${channels}u;
   let row = cell / ${tokens}u;
   let column = cell % ${tokens}u;
-  output[i] = pair[i] + pair[(column * ${tokens}u + row) * ${channels}u + c];
+  output[i] = pair[cell * ${channels}u + c] + pair[(column * ${tokens}u + row) * ${channels}u + c];
 }`;
 }
 
@@ -387,8 +387,10 @@ export async function encodeContactMap(context, { tokens, channels, bins, pair,
   const height = Math.min(chunk, pairs);
   const heights = [...new Set([height, pairs % height].filter((h) => h > 0))];
   const key = `esmfold2-disto:${tokens}:${channels}:${bins}`;
-  const symmetriseCompiling = cache.get(`${key}:sym`,
-    createSymmetriseShader({ tokens, channels }));
+  // The symmetrised pair is read a chunk at a time by the projection and by nothing else, so it is built a chunk at a
+  // time: it was a whole pair-sized tensor beside the trunk's own, at a fold's fullest.
+  const symmetriseCompiling = settleAll(Object.fromEntries(heights.map((rows) => [rows, cache.get(`${key}:sym:${rows}`,
+    createSymmetriseShader({ tokens, channels, chunkRows: rows }))])));
   // 🔴 THE CERTAINTY RIDES ON THE SAME PROJECTION. Its per-pair pass reads the
   // logits chunk the contact pass has just been handed, so the distogram is
   // projected ONCE and both readings come off it. Computing it separately would
@@ -445,8 +447,8 @@ export async function encodeContactMap(context, { tokens, channels, bins, pair,
     return [Math.min(GRID_WIDTH, groups), Math.ceil(groups / GRID_WIDTH)];
   };
   try {
-    const symmetric = keep(allocator.allocate("esmfold2.disto.sym",
-      pairs * channels * 4, storage));
+    const symmetric = keep(allocator.allocate("esmfold2.disto.sym", height * channels * 4, storage));
+    const chunkStart = keep(allocator.allocate("esmfold2.disto.start", 16, storage | GPUBufferUsage.COPY_DST));
     const projection = keep(allocator.upload("w.esmfold2.disto", weights, storage));
     const biasBuffer = keep(allocator.upload("w.esmfold2.disto-bias", bias, storage));
     // 🔴 THE LOGITS ARE A CHUNK UNLESS A CALLER WANTS THEM ALL. The contact map
@@ -500,15 +502,13 @@ export async function encodeContactMap(context, { tokens, channels, bins, pair,
     };
     const binCounts = keep(allocator.upload("esmfold2.disto.contact-bins",
       contactBinCountsByPair(molType, residueType, tokens, bins), storage));
-    await submit("esmfold2.distogram", [
-      ["symmetrise", symmetrise, [pair, symmetric], ...elementwise(pairs * channels)],
-    ]);
     for (let start = 0; start < pairs; start += height) {
       const rows = Math.min(height, pairs - start);
+      device.queue.writeBuffer(chunkStart.buffer, 0, Uint32Array.of(start));
       await submit("esmfold2.distogram", [
+        ["symmetrise", symmetrise[rows], [pair, chunkStart, symmetric], ...elementwise(rows * channels)],
         ["project", project[rows],
-         [{ buffer: symmetric.buffer, byteOffset: start * channels * 4,
-            byteSize: rows * channels * 4 }, projection,
+         [symmetric, projection,
           wholeLogits
             ? { buffer: logits.buffer, byteOffset: start * bins * 4,
                 byteSize: rows * bins * 4 }

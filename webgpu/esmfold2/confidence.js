@@ -25,6 +25,7 @@
  */
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 import { GpuBufferAllocator } from "../runtime/allocator.js";
+import { spillToHost } from "../runtime/host-spill.js";
 import { Esmfold2TrunkGpu } from "./trunk.js";
 import { createAddShader } from "../runtime/execution.js";
 import { categoricalMean, paeAndTmScores } from "../../cpu/esmfold2/confidence.js";
@@ -81,6 +82,8 @@ const EPSILON: f32 = 1.0e-5;
 // optional argument defaulting to None, so omitting it is silent. See
 // docs/EF2FAST.md: 13.8 pLDDT and a PAE 2.4x rougher than theirs on one fold.
 @group(0) @binding(7) var<storage, read> pairbias: array<f32>;
+// (first pair row, pair rows). pair, extra, pairbias and out are bound over just those rows.
+@group(0) @binding(8) var<uniform> chunk: vec4<u32>;
 
 var<workgroup> reduce: array<f32, LANES>;
 var<workgroup> rowBuf: array<f32, CHANNELS>;
@@ -100,12 +103,13 @@ fn total_of(lane: u32, value: f32) -> f32 {
 @compute @workgroup_size(LANES)
 fn main(@builtin(workgroup_id) group: vec3<u32>,
         @builtin(local_invocation_id) local: vec3<u32>) {
-  let row = group.x + group.y * GRID_WIDTH;
-  if (row >= TOKENS * TOKENS) { return; }
+  let chunkRow = group.x + group.y * GRID_WIDTH;
+  if (chunkRow >= chunk.y) { return; }
+  let row = chunk.x + chunkRow;
   let lane = local.x;
   let i = row / TOKENS;
   let j = row % TOKENS;
-  let rowBase = row * CHANNELS;
+  let rowBase = chunkRow * CHANNELS;
 
   var partial = 0.0;
   for (var c = lane; c < CHANNELS; c += LANES) {
@@ -167,6 +171,8 @@ const GRID_WIDTH: u32 = ${GRID_WIDTH}u;
 @group(0) @binding(1) var<storage, read> right: array<f32>;
 @group(0) @binding(2) var<storage, read> weight: array<f32>;
 @group(0) @binding(3) var<storage, read_write> out: array<f32>;
+// (first pair row, pair rows); out holds just those rows.
+@group(0) @binding(4) var<uniform> chunk: vec4<u32>;
 ${stageProd ? "var<workgroup> prod: array<f32, CHANNELS>;" : ""}
 
 @compute @workgroup_size(64)
@@ -174,8 +180,8 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
         @builtin(local_invocation_id) local: vec3<u32>) {
   let wg = group.x + group.y * GRID_WIDTH;
   let slot = wg * 64u + local.x;
-  if (wg * 64u >= TOKENS * TOKENS * OUT) { return; }
-  let row = slot / OUT;
+  if (wg * 64u >= chunk.y * OUT) { return; }
+  let row = chunk.x + slot / OUT;
   let o = slot % OUT;
   let i = row / TOKENS;
   let j = row % TOKENS;
@@ -184,7 +190,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   ${stageProd ? `for (var c = local.x; c < CHANNELS; c += 64u) {
     prod[c] = left[iBase + c] * right[jBase + c];
   }
-  workgroupBarrier();` : "if (slot >= TOKENS * TOKENS * OUT) { return; }"}
+  workgroupBarrier();` : "if (slot >= chunk.y * OUT) { return; }"}
   var sum = 0.0;
   for (var c = 0u; c < CHANNELS; c += ${channels % 8 === 0 ? 8 : 1}u) {
 ${Array.from({ length: channels % 8 === 0 ? 8 : 1 }, (_, u) =>
@@ -379,6 +385,9 @@ ${channels === 4 * LANES ? `  var sum0 = 0.0;
 
 const storage = () => GPUBufferUsage.STORAGE;
 
+/** Pair rows of the head's init at a time: 8 MiB at its 256 channels. */
+const CONFIDENCE_CHUNK = 8192;
+
 /**
  * The pair the confidence blocks are handed, and the single their answer makes.
  *
@@ -428,48 +437,34 @@ export async function esmfold2ConfidencePairInit(device, input, weights, options
     })();
     const left = projected4?.left ?? keep(allocator.upload("ef2-conf.left", input.left, storage()));
     const right = projected4?.right ?? keep(allocator.upload("ef2-conf.right", input.right, storage()));
-    const projected = keep(allocator.allocate("ef2-conf.projected", pairs * channels * 4,
-                                              storage()));
+    // A chunk of pair rows at a time: `projected`, the pair and the bias are read once each, a row at a time, so the only
+    // pair-sized tensor this holds of its own is `out`. Their rows go past in small buffers where the caller can make
+    // them that way: `pairSpill` for a pair held on the host, `fillPairBias` for a bias built on demand.
+    const chunkRows = Math.min(CONFIDENCE_CHUNK, pairs);
+    const projected = keep(allocator.allocate("ef2-conf.projected", chunkRows * channels * 4, storage()));
+    const chunk = keep(allocator.allocate("ef2-conf.chunk", 16, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST));
     // 🔴 THE CALLER'S BUFFER WHEN IT HAS ONE. In a real fold the trunk's pair
     // never leaves the device - `fold.js` holds it as an allocation - so
     // uploading a host copy would be a readback and an upload of
     // `tokens^2 x 256` for a tensor already sitting where it is needed. The
     // checker passes a Float32Array because its pair comes out of a dump.
-    const pair = input.pairBuffer !== undefined
-      ? { buffer: input.pairBuffer }
-      : keep(allocator.upload("ef2-conf.pair", input.pair, storage()));
+    const pairWhole = input.pairBuffer !== undefined ? { buffer: input.pairBuffer }
+      : input.pairSpill !== undefined ? undefined
+        : keep(allocator.upload("ef2-conf.pair", input.pair, storage()));
+    const pairChunk = pairWhole !== undefined ? undefined
+      : keep(allocator.allocate("ef2-conf.pair", chunkRows * channels * 4, storage() | GPUBufferUsage.COPY_DST));
     const out = keep(allocator.allocate("ef2-conf.init", pairs * channels * 4,
                                         storage() | GPUBufferUsage.COPY_SRC));
     const up = (name, values) => keep(allocator.upload(`ef2-conf.${name}`, values, storage()));
     const bind = (pipeline, buffers) => device.createBindGroup({
       layout: pipeline.getBindGroupLayout(0),
       entries: buffers.map((allocation, binding) => ({
-        binding, resource: { buffer: allocation.buffer },
+        binding,
+        resource: allocation.byteOffset === undefined ? { buffer: allocation.buffer }
+          : { buffer: allocation.buffer, offset: allocation.byteOffset, size: allocation.byteSize },
       })),
     });
 
-    device.pushErrorScope("validation");
-    const encoder = device.createCommandEncoder({ label: "ef2-confidence-pair-init" });
-    if (projected4 !== undefined) {
-      const sPass = encoder.beginComputePass({ label: "ef2-conf.s-to-z" });
-      sPass.setPipeline(sToZShader);
-      const groups = Math.ceil(tokens * channels / 64);
-      for (const bindGroup of projected4.dispatches) {
-        sPass.setBindGroup(0, bindGroup);
-        sPass.dispatchWorkgroups(Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH));
-      }
-      sPass.end();
-    }
-    let pass = encoder.beginComputePass({ label: "ef2-conf.project" });
-    pass.setPipeline(project);
-    pass.setBindGroup(0, bind(project,
-      [left, right, up("prodOut", weights.sToZProdOut), projected]));
-    const cells = pairs * channels;
-    pass.dispatchWorkgroups(Math.min(Math.ceil(cells / 64), GRID_WIDTH),
-                            Math.ceil(Math.ceil(cells / 64) / GRID_WIDTH));
-    pass.end();
-    pass = encoder.beginComputePass({ label: "ef2-conf.init" });
-    pass.setPipeline(init);
     const constants = new Float32Array(channels * 2 + weights.boundaries.length + tokens * 3);
     constants.set(weights.zNormScale, 0);
     constants.set(weights.zNormOffset, channels);
@@ -480,21 +475,68 @@ export async function esmfold2ConfidencePairInit(device, input, weights, options
     // that forgets it gets a quietly worse answer and no error - which is
     // exactly what happened here. A zero buffer would reproduce that silence,
     // so this refuses instead.
-    if (input.pairBias === undefined && input.pairBiasBuffer === undefined) {
+    if (input.pairBias === undefined && input.pairBiasBuffer === undefined && input.fillPairBias === undefined) {
       throw new Error("ef2 confidence: pairBias is required (see docs/EF2FAST.md)");
     }
-    pass.setBindGroup(0, bind(init, [
-      pair, up("constants", constants), projected4?.rows ?? up("rows", input.rows),
-      projected4?.cols ?? up("cols", input.cols),
-      projected, up("embedding", weights.distanceEmbedding), out,
-      input.pairBiasBuffer !== undefined ? { buffer: input.pairBiasBuffer }
-        : up("pairbias", input.pairBias)]));
-    pass.dispatchWorkgroups(Math.min(pairs, GRID_WIDTH), Math.ceil(pairs / GRID_WIDTH));
-    pass.end();
+    const biasWhole = input.pairBiasBuffer !== undefined ? { buffer: input.pairBiasBuffer }
+      : input.fillPairBias !== undefined ? undefined : up("pairbias", input.pairBias);
+    const biasChunk = biasWhole !== undefined ? undefined
+      : keep(allocator.allocate("ef2-conf.pairbias", chunkRows * channels * 4, storage()));
+    const prodOut = up("prodOut", weights.sToZProdOut);
+    const constantsBuffer = up("constants", constants);
+    const rowsBuffer = projected4?.rows ?? up("rows", input.rows);
+    const colsBuffer = projected4?.cols ?? up("cols", input.cols);
+    const embedding = up("embedding", weights.distanceEmbedding);
+    const rowsOf = (allocation, start, rows) => ({ buffer: allocation.buffer, byteOffset: start * channels * 4,
+                                                   byteSize: rows * channels * 4 });
+
+    device.pushErrorScope("validation");
+    if (projected4 !== undefined) {
+      const encoder = device.createCommandEncoder({ label: "ef2-confidence-s-to-z" });
+      const sPass = encoder.beginComputePass({ label: "ef2-conf.s-to-z" });
+      sPass.setPipeline(sToZShader);
+      const groups = Math.ceil(tokens * channels / 64);
+      for (const bindGroup of projected4.dispatches) {
+        sPass.setBindGroup(0, bindGroup);
+        sPass.dispatchWorkgroups(Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH));
+      }
+      sPass.end();
+      device.queue.submit([encoder.finish()]);
+    }
+    for (let start = 0; start < pairs; start += chunkRows) {
+      const rows = Math.min(chunkRows, pairs - start);
+      device.queue.writeBuffer(chunk.buffer, 0, Uint32Array.of(start, rows, 0, 0));
+      if (input.pairSpill !== undefined) {
+        input.pairSpill.writeTo(device, pairChunk.buffer, 0, start * channels * 4, rows * channels * 4);
+      }
+      // eslint-disable-next-line no-await-in-loop
+      if (biasChunk !== undefined) await input.fillPairBias(start, rows, biasChunk);
+      const encoder = device.createCommandEncoder({ label: "ef2-confidence-pair-init" });
+      let pass = encoder.beginComputePass({ label: "ef2-conf.project" });
+      pass.setPipeline(project);
+      pass.setBindGroup(0, bind(project, [left, right, prodOut, projected, chunk]));
+      const cells = rows * channels;
+      pass.dispatchWorkgroups(Math.min(Math.ceil(cells / 64), GRID_WIDTH),
+                              Math.ceil(Math.ceil(cells / 64) / GRID_WIDTH));
+      pass.end();
+      pass = encoder.beginComputePass({ label: "ef2-conf.init" });
+      pass.setPipeline(init);
+      pass.setBindGroup(0, bind(init, [
+        pairWhole !== undefined ? rowsOf(pairWhole, start, rows) : pairChunk,
+        constantsBuffer, rowsBuffer, colsBuffer, projected, embedding,
+        rowsOf(out, start, rows),
+        biasWhole !== undefined ? rowsOf(biasWhole, start, rows) : biasChunk,
+        chunk]));
+      pass.dispatchWorkgroups(Math.min(rows, GRID_WIDTH), Math.ceil(rows / GRID_WIDTH));
+      pass.end();
+      device.queue.submit([encoder.finish()]);
+      // Bounded, so the host's writes above do not pile up as staging memory.
+      // eslint-disable-next-line no-await-in-loop
+      if ((start / chunkRows) % 16 === 15) await device.queue.onSubmittedWorkDone();
+    }
     // 🔴 ON THE DEVICE WHEN THE FOLD ASKS, because its only reader is the
     // block stack - which took it back as a host array to upload again.
     if (options.keepOnDevice === true) {
-      device.queue.submit([encoder.finish()]);
       const error = await device.popErrorScope();
       if (error !== null) throw new Error(`WebGPU validation failed: ${error.message}`);
       allocations.splice(allocations.indexOf(out), 1);
@@ -502,6 +544,7 @@ export async function esmfold2ConfidencePairInit(device, input, weights, options
     }
     const readback = keep(allocator.allocate("ef2-conf.rb-init", pairs * channels * 4,
                                              GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
+    const encoder = device.createCommandEncoder({ label: "ef2-confidence-init-readback" });
     encoder.copyBufferToBuffer(out.buffer, 0, readback.buffer, 0, pairs * channels * 4);
     device.queue.submit([encoder.finish()]);
     const error = await device.popErrorScope();
@@ -625,8 +668,9 @@ export async function esmfold2ConfidenceFold(device, input, weights, options = {
   }
 
   const initial = await esmfold2ConfidencePairInit(device, {
-    tokens, pair: input.pair, pairBuffer: input.pairBuffer,
+    tokens, pair: input.pair, pairBuffer: input.pairBuffer, pairSpill: input.pairSpill,
     normed, repCoordinates, pairBias: input.pairBias, pairBiasBuffer: input.pairBiasBuffer,
+    fillPairBias: input.fillPairBias,
   }, weights, { allocator, keepOnDevice: true });
   // 🔴 THE HEAD'S TWO PAIR-SIZED INPUTS ARE DEAD ONCE THE PAIR INIT HAS BEEN
   // SUBMITTED: the blocks run on its output. Handing them back here rather than
@@ -650,39 +694,80 @@ export async function esmfold2ConfidenceFold(device, input, weights, options = {
   const elements = tokens * tokens * dPair;
   // See confidence.js: their line adds the stack's input a second
   // time - `pair = pair + folding_trunk(pair)` - so the blocks run on a COPY
-  // of the initial pair and the initial pair is added back.
-  const stackPair = allocator.allocate("ef2-conf.stack-pair", elements * 4,
-    GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST);
+  // of the initial pair and the initial pair is added back. Where the card is
+  // tight the copy is the one on the host, read back once and added back a chunk
+  // of rows at a time, and the blocks run in place.
+  const initialSpill = input.spillInitial !== true ? undefined
+    : await spillToHost(device, allocator, initial.buffer, elements * 4, "ef2-conf.init");
+  const stackPair = initialSpill !== undefined ? initial
+    : allocator.allocate("ef2-conf.stack-pair", elements * 4,
+                         GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST);
   let readouts;
   try {
-    const copy = device.createCommandEncoder({ label: "ef2-conf.stack-copy" });
-    copy.copyBufferToBuffer(initial.buffer, 0, stackPair.buffer, 0, elements * 4);
-    device.queue.submit([copy.finish()]);
-    await new Esmfold2TrunkGpu(device, { allocator }).run(
+    if (initialSpill === undefined) {
+      const copy = device.createCommandEncoder({ label: "ef2-conf.stack-copy" });
+      copy.copyBufferToBuffer(initial.buffer, 0, stackPair.buffer, 0, elements * 4);
+      device.queue.submit([copy.finish()]);
+    }
+    await new Esmfold2TrunkGpu(device, { allocator, sequentialTriangle: true }).run(
       { buffer: stackPair, pairMask }, weights.blocks,
-      { n: tokens, channels: dPair, readback: false });
-    const add = await pipelineCacheForDevice(device).get(`ef2-conf-add:${elements}`,
-                                                         createAddShader(elements));
+      { n: tokens, channels: dPair, readback: false, ...input.trunk });
     device.pushErrorScope("validation");
-    const encoder = device.createCommandEncoder({ label: "ef2-conf.residual" });
-    const pass = encoder.beginComputePass({ label: "ef2-conf.residual" });
-    pass.setPipeline(add);
-    pass.setBindGroup(0, device.createBindGroup({
-      layout: add.getBindGroupLayout(0),
-      entries: [stackPair, initial].map((allocation, binding) => ({
-        binding, resource: { buffer: allocation.buffer } })),
-    }));
-    const groups = Math.ceil(elements / 64);
-    pass.dispatchWorkgroups(Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH));
-    pass.end();
-    device.queue.submit([encoder.finish()]);
+    if (initialSpill === undefined) {
+      const add = await pipelineCacheForDevice(device).get(`ef2-conf-add:${elements}`,
+                                                           createAddShader(elements));
+      const encoder = device.createCommandEncoder({ label: "ef2-conf.residual" });
+      const pass = encoder.beginComputePass({ label: "ef2-conf.residual" });
+      pass.setPipeline(add);
+      pass.setBindGroup(0, device.createBindGroup({
+        layout: add.getBindGroupLayout(0),
+        entries: [stackPair, initial].map((allocation, binding) => ({
+          binding, resource: { buffer: allocation.buffer } })),
+      }));
+      const groups = Math.ceil(elements / 64);
+      pass.dispatchWorkgroups(Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH));
+      pass.end();
+      device.queue.submit([encoder.finish()]);
+    } else {
+      const chunkRows = Math.min(CONFIDENCE_CHUNK, tokens * tokens);
+      const held = allocator.allocate("ef2-conf.initial-chunk", chunkRows * dPair * 4,
+                                      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
+      try {
+        for (let start = 0; start < tokens * tokens; start += chunkRows) {
+          const rows = Math.min(chunkRows, tokens * tokens - start);
+          // eslint-disable-next-line no-await-in-loop
+          const add = await pipelineCacheForDevice(device).get(`ef2-conf-add:${rows * dPair}`,
+                                                               createAddShader(rows * dPair));
+          initialSpill.writeTo(device, held.buffer, 0, start * dPair * 4, rows * dPair * 4);
+          const encoder = device.createCommandEncoder({ label: "ef2-conf.residual" });
+          const pass = encoder.beginComputePass({ label: "ef2-conf.residual" });
+          pass.setPipeline(add);
+          pass.setBindGroup(0, device.createBindGroup({
+            layout: add.getBindGroupLayout(0),
+            entries: [
+              { binding: 0, resource: { buffer: stackPair.buffer, offset: start * dPair * 4, size: rows * dPair * 4 } },
+              { binding: 1, resource: { buffer: held.buffer, offset: 0, size: rows * dPair * 4 } },
+            ],
+          }));
+          const groups = Math.ceil(rows * dPair / 64);
+          pass.dispatchWorkgroups(Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH));
+          pass.end();
+          device.queue.submit([encoder.finish()]);
+          // eslint-disable-next-line no-await-in-loop
+          if ((start / chunkRows) % 16 === 15) await device.queue.onSubmittedWorkDone();
+        }
+        await device.queue.onSubmittedWorkDone();
+      } finally {
+        held.release();
+      }
+    }
     const error = await device.popErrorScope();
     if (error !== null) throw new Error(`WebGPU validation failed: ${error.message}`);
     readouts = await esmfold2ConfidenceReadouts(device, {
       tokens, pairBuffer: stackPair.buffer, tokenMask: input.tokenMask,
     }, weights, { allocator });
   } finally {
-    stackPair.release();
+    if (stackPair !== initial) stackPair.release();
     initial.release();
   }
 

@@ -258,8 +258,20 @@ export function createTriangleShaders(
   // read-modify-write race. See webgpu/runtime/storage.js.
   const countOf = (axis) => (axis === "CZ" ? shape.cZ : shape.cHidden);
   const fastVariance = variance === "fast";
+  // A chunk of pair rows at a time, where the caller asks: `chunk` is (first channel, channels, first pair row, pair
+  // rows). The normalised pair and hidden then live in a small buffer for just those rows, and are computed again from
+  // the pair and the contraction whenever they are wanted - the same bits, with two pair-sized tensors gone.
+  //
+  // The projection does not take the normalised pair from a buffer at all, because that is a write and a read of a whole
+  // pair per channel group, and a LayerNorm is nearly all memory traffic: measured at 600 tokens on an RTX 3070, eight
+  // groups of it cost 22% of a trunk. Each row's mean and inverse deviation are taken once a direction (`normalizeStats`,
+  // P/128), and the projection applies them to the pair as it stages it - the same expression on the same values.
+  const rowChunked = shape.rowChunked === true;
+  const ROW_LIMIT = rowChunked ? "chunk.w" : "PAIRS";
+  const ROW_BASE = rowChunked ? "chunk.z + " : "";
+  const chunkBinding = (binding) => (rowChunked ? `@group(0) @binding(${binding}) var<uniform> chunk: vec4<u32>;` : "");
   const stagedLayerNorm = (count, load, scale, offset, sourceMajor = "row",
-                           outputStorage = "f32") => {
+                           outputStorage = "f32", statsOnly = false) => {
     const cVal = countOf(count);
     const tileStride = sourceMajor === "channel" && cVal % 32 === 0 && NORMALIZE_ROWS === 8
       ? cVal + 4 : cVal;
@@ -277,7 +289,7 @@ const LANES_PER_ROW: u32 = ${LANES_PER_ROW}u;
 fn main(@builtin(workgroup_id) group: vec3<u32>,
         @builtin(local_invocation_id) local_id: vec3<u32>) {
   let base_row = (group.x + group.y * LINEAR_GRID_WIDTH) * NORMALIZE_ROWS;
-  if (base_row >= PAIRS) { return; }
+  if (base_row >= ${ROW_LIMIT}) { return; }
   let local = local_id.x;
 
   // 🔴 THE TAIL IS ZEROED, NOT SKIPPED. PAIRS is rarely a multiple of the tile
@@ -288,7 +300,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   // output, where consecutive lanes have to be consecutive ROWS or every lane
   // pulls its own cache line again. Either way the tile lands as
   // [slot][channel] and everything below is the same.
-  let full_tile = base_row + NORMALIZE_ROWS <= PAIRS;
+  let full_tile = base_row + NORMALIZE_ROWS <= ${ROW_LIMIT};
   if (full_tile) {
     for (var index = local; index < NORMALIZE_ROWS * ${count}; index += 64u) {
       ${sourceMajor === "channel"
@@ -307,7 +319,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
         : `let slot_of = index / ${count};
       let channel = index % ${count};`}
       let row = base_row + slot_of;
-      tile[slot_of * ${strideExpr} + channel] = select(0.0, ${load("row", "channel")}, row < PAIRS);
+      tile[slot_of * ${strideExpr} + channel] = select(0.0, ${load("row", "channel")}, row < ${ROW_LIMIT});
     }
   }
   workgroupBarrier();
@@ -339,7 +351,9 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     row_inverse_std[slot] = inverseSqrt(variance + EPSILON);
   }
   workgroupBarrier();
-
+${statsOnly ? `  if (lane == 0u && base_row + slot < ${ROW_LIMIT}) {
+    stats[chunk.z + base_row + slot] = vec2<f32>(row_mean[slot], row_inverse_std[slot]);
+  }` : `
   // A lane owns a PAIR of channels, so it owns the whole word they share - and
   // an ODD count leaves the last word half used rather than dropping it. The
   // comment here used to say the count was even in every caller and call the
@@ -354,7 +368,7 @@ ${cVal % 128 === 0 ? `  for (var col_word = local; col_word < PAIR_COUNT; col_wo
     let w_offset_1 = ${readWeight(`weights[W_${offset} + channel + 1u]`)};
     for (var slot_of = 0u; slot_of < NORMALIZE_ROWS; slot_of += 1u) {
       let row = base_row + slot_of;
-      if (!full_tile && row >= PAIRS) { break; }
+      if (!full_tile && row >= ${ROW_LIMIT}) { break; }
       let index = slot_of * ${strideExpr} + channel;
       let scaled = row_inverse_std[slot_of];
       let centre = row_mean[slot_of];
@@ -366,7 +380,7 @@ ${cVal % 128 === 0 ? `  for (var col_word = local; col_word < PAIR_COUNT; col_wo
   }` : `  for (var word = local; word < NORMALIZE_ROWS * PAIR_COUNT; word += 64u) {
     let slot_of = word / PAIR_COUNT;
     let row = base_row + slot_of;
-    if (!full_tile && row >= PAIRS) { continue; }
+    if (!full_tile && row >= ${ROW_LIMIT}) { continue; }
     let channel = (word % PAIR_COUNT) * 2u;
     let index = slot_of * ${strideExpr} + channel;
     let scaled = row_inverse_std[slot_of];
@@ -384,7 +398,7 @@ ${cVal % 128 === 0 ? `  for (var col_word = local; col_word < PAIR_COUNT; col_wo
   cVal % 2 === 0 ? "" : `, channel + 1u < ${count})`};
     let pair_word = row * PAIR_COUNT + (word % PAIR_COUNT);
     ${storedPair(outputStorage, "normalized", "pair_word", "low", "high")}
-  }`}
+  }`}`}
 }`;
   };
 
@@ -392,8 +406,16 @@ ${cVal % 128 === 0 ? `  for (var col_word = local; col_word < PAIR_COUNT; col_wo
 @group(0) @binding(0) var<storage, read> source: array<${t}>;
 @group(0) @binding(1) var<storage, read> weights: array<${tw}>;
 @group(0) @binding(2) var<storage, read_write> normalized: array<${storageArray(normalizedStorage)}>;
+${chunkBinding(3)}
 ${stagedLayerNorm("CZ", (row, channel) => read(precision, `source[${row} * CZ + ${channel}]`),
                   "LAYERNORMINWEIGHT", "LAYERNORMINBIAS", "row", normalizedStorage)}`;
+
+  const normalizeStats = !rowChunked ? undefined : `${common}
+@group(0) @binding(0) var<storage, read> source: array<${t}>;
+@group(0) @binding(1) var<storage, read_write> stats: array<vec2<f32>>;
+${chunkBinding(2)}
+${stagedLayerNorm("CZ", (row, channel) => read(precision, `source[${row} * CZ + ${channel}]`),
+                  "LAYERNORMINWEIGHT", "LAYERNORMINBIAS", "row", normalizedStorage, true)}`;
 
   // Where the register block is spent. Each invocation owns ROWS_PER_THREAD
   // pair rows by COLUMNS_PER_THREAD hidden channels, and the workgroup is
@@ -549,20 +571,24 @@ ${Array.from({ length: columnsPerThread }, (_, c) => `      {
         let h = h0 + ${columnOfCol(c)};
         if (h < ${H_END}) {
           let cell = vec4<f32>(acc_${r}_${c});
-          let index = ${channelChunked ? "(h - chunk.x)" : "h"} * PAIRS + row;
+          let index = ${channelChunked ? "(h - chunk.x)" : "h"} * PAIRS + ${ROW_BASE}row;
           a[index] = pair_mask * cell.x * logistic(cell.y);
           b[index] = pair_mask * cell.z * logistic(cell.w);
         }
       }`).join("\n");
     return `  {
     let row = row0 + ${r * PROJECT_W}u;
-    if (row < PAIRS) {
-      let pair_mask = mask[row];
+    if (row < ${ROW_LIMIT}) {
+      let pair_mask = mask[${ROW_BASE}row];
 ${body}
     }
   }`;
   }).join("\n");
 
+  const projectSource = (r, index) => {
+    const element = storedElement(normalizedStorage, "z", index);
+    return rowChunked ? `((${element} - row_stats_${r}.x) * row_stats_${r}.y * norm_cell.x + norm_cell.y)` : element;
+  };
   const projectAB = `${common}
 const TILE_ROWS: u32 = ${PROJECT_TILE_ROWS}u;
 const TILE_COLUMNS: u32 = ${PROJECT_TILE_COLUMNS}u;
@@ -573,6 +599,9 @@ const TILE_COLUMNS: u32 = ${PROJECT_TILE_COLUMNS}u;
 @group(0) @binding(3) var<storage, read_write> a: array<${storageArray(abStorage)}>;
 @group(0) @binding(4) var<storage, read_write> b: array<${storageArray(abStorage)}>;
 ${channelChunked ? "@group(0) @binding(5) var<uniform> chunk: vec4<u32>;" : ""}
+${rowChunked ? `@group(0) @binding(6) var<storage, read> stats: array<vec2<f32>>;
+// The input LayerNorm's scale and offset, one vec2 a channel.
+var<workgroup> tile_norm: array<vec2<f32>, ${shape.cZ}>;` : ""}
 
 var<workgroup> tile_source: array<${projectRowVector}, ${PROJECT_W_SOURCE}>;
 // 🔴 ONE vec4 A CELL, NOT FOUR ARRAYS. a, b and their two gates are four
@@ -592,20 +621,26 @@ fn main(
   let row0 = (group.y + group.z * PROJECT_GRID_WIDTH) * TILE_ROWS + local.y;
   let h0 = ${channelChunked ? "chunk.x + " : ""}group.x * TILE_COLUMNS;
   let tile_index = local.y * ${SOURCE_STRIDE}u + local.x;
-  let full_rows = row0 + ${(rowsPerThread - 1) * PROJECT_W}u < PAIRS;
+  let full_rows = row0 + ${(rowsPerThread - 1) * PROJECT_W}u < ${ROW_LIMIT};
   let s_base0 = row0 * CZ_STRIDE + local.x;
+${rowChunked ? `  for (var c = local.y * ${PROJECT_W}u + local.x; c < CZ; c += ${PROJECT_W2}u) {
+    tile_norm[c] = vec2<f32>(${readWeight("weights[W_LAYERNORMINWEIGHT + c]")}, ${readWeight("weights[W_LAYERNORMINBIAS + c]")});
+  }
+  workgroupBarrier();
+${overRows((r) => `  let row_stats_${r} = stats[chunk.z + row0 + ${r * PROJECT_W}u];`)}` : ""}
   // Each cell accumulates (a, a's gate, b, b's gate).
 ${abBiasDeclare.join("\n")}
   for (var c0 = 0u; c0 < CZ; c0 += ${PROJECT_W}u) {
     let source_c = c0 + local.x;
+${rowChunked ? "    let norm_cell = tile_norm[min(source_c, CZ - 1u)];" : ""}
     var staged = ${projectRowVector}(0.0);
     ${exactCzSteps ? "" : "if (source_c < CZ) {\n      "}if (full_rows) {
         let s0 = s_base0 + c0;
-        ${overRows((r) => `${rowAt("staged", r)} = ${accNarrow(storedElement(normalizedStorage, "z", `s0 + ${r * PROJECT_W}u * CZ_STRIDE`))};`)}
+        ${overRows((r) => `${rowAt("staged", r)} = ${accNarrow(projectSource(r, `s0 + ${r * PROJECT_W}u * CZ_STRIDE`))};`)}
       } else {
         ${overRows((r) => `{
           let row = row0 + ${r * PROJECT_W}u;
-          if (row < PAIRS) { ${rowAt("staged", r)} = ${accNarrow(storedElement(normalizedStorage, "z", "row * CZ_STRIDE + source_c"))}; }
+          if (row < ${ROW_LIMIT}) { ${rowAt("staged", r)} = ${accNarrow(projectSource(r, "row * CZ_STRIDE + source_c"))}; }
         }`)}
       }${exactCzSteps ? "" : "\n    }"}
     tile_source[tile_index] = staged;
@@ -849,6 +884,7 @@ ${f16Stores}
 @group(0) @binding(0) var<storage, read> source: array<f32>;
 @group(0) @binding(1) var<storage, read> weights: array<${tw}>;
 @group(0) @binding(2) var<storage, read_write> normalized: array<${storageArray(hiddenStorage)}>;
+${chunkBinding(3)}
 // ...READS CHANNEL-MAJOR AND WRITES CHANNEL-MINOR, because this is where the
 // two layouts meet: the contraction upstream wants h slowest, and
 // projectOutput downstream reads a row's channels contiguously. Doing the
@@ -856,8 +892,8 @@ ${f16Stores}
 // a dedicated one, and staging it through workgroup memory is what lets BOTH
 // sides be read and written along their own major axis.
 ${stagedLayerNorm("CH", (row, channel) => divideByLength
-                    ? `(source[${channel} * PAIRS + ${row}] / f32(L))`
-                    : `source[${channel} * PAIRS + ${row}]`,
+                    ? `(source[${channel} * PAIRS + ${ROW_BASE}${row}] / f32(L))`
+                    : `source[${channel} * PAIRS + ${ROW_BASE}${row}]`,
                   "LAYERNORMOUTWEIGHT", "LAYERNORMOUTBIAS", "channel", hiddenStorage)}`;
 
   // 🔴 THE OUTPUT PROJECTION MAY TAKE A WIDER TILE THAN THE INPUT ONE, because
@@ -929,7 +965,7 @@ ${Array.from({ length: outColumnsPerThread }, (_, c) => `      {
     }`).join("\n");
   const outStores = Array.from({ length: rowsPerThread }, (_, r) => `  {
     let row = row0 + ${r * PROJECT_W}u;
-    if (row < PAIRS) {
+    if (row < ${ROW_LIMIT}) {
 ${Array.from({ length: outColumnsPerThread }, (_, c) => `      {
         let out_channel = channel0 + ${c * PROJECT_W}u;
         if (out_channel < CZ) {
@@ -946,6 +982,7 @@ const TILE_COLUMNS: u32 = ${OUT_TILE_COLUMNS}u;
 @group(0) @binding(1) var<storage, read> x: array<${storageArray(hiddenStorage)}>;
 @group(0) @binding(2) var<storage, read> weights: array<${tw}>;
 @group(0) @binding(3) var<storage, read_write> output: array<f32>;
+${chunkBinding(4)}
 
 var<workgroup> tile_x: array<${outRowVector}, ${OUT_PROJECT_W_SOURCE}>;
 var<workgroup> tile_z: array<${outRowVector}, ${OUT_PROJECT_W_SOURCE}>;
@@ -982,7 +1019,7 @@ fn main(
   let row0 = (group.y + group.z * PROJECT_GRID_WIDTH) * TILE_ROWS + local.y;
   let channel0 = group.x * TILE_COLUMNS + local.x;
   let tile_index = local.y * ${OUT_SOURCE_STRIDE}u + local.x;
-  let full_rows = row0 + ${(rowsPerThread - 1) * PROJECT_W}u < PAIRS;
+  let full_rows = row0 + ${(rowsPerThread - 1) * PROJECT_W}u < ${ROW_LIMIT};
   let sx_base0 = row0 * CH_STRIDE + local.x;
   let sz_base0 = row0 * CZ_STRIDE + local.x;
   // ...the projection contracts over CH and the gate over CZ, on the same
@@ -1010,7 +1047,7 @@ ${outBiasDeclare.join("\n")}
     } else {
       ${overRows((r) => `{
         let row = row0 + ${r * PROJECT_W}u;
-        if (row < PAIRS) {
+        if (row < ${ROW_LIMIT}) {
           ${exactOutSteps ? "" : "if (source_k < CH) { "}${rowAt("staged_x", r)} = ${accNarrow(storedElement(hiddenStorage, "x", "row * CH_STRIDE + source_k"))};${exactOutSteps ? "" : " }"}
           ${exactOutSteps ? "" : "if (source_k < CZ) { "}${rowAt("staged_z", r)} = ${accNarrow(storedElement(normalizedStorage, "z", "row * CZ_STRIDE + source_k"))};${exactOutSteps ? "" : " }"}
         }
@@ -1026,7 +1063,8 @@ ${outInner}
 ${outStores}
 }`;
 
-  return { normalizeInput, projectAB, contract: contractF16 ?? contract, normalizeHidden, projectOutput,
+  return { normalizeInput, ...(rowChunked ? { normalizeStats } : {}),
+           projectAB, contract: contractF16 ?? contract, normalizeHidden, projectOutput,
            projectTile: { ...projectTile },
            // ...the f16 contraction's tile is its own, whatever the 8 x 8 kernel's was
            contractTile: contractF16 === undefined ? { ...contractTile } : { rows: 64, columns: 64, arithmetic: "f16" },
