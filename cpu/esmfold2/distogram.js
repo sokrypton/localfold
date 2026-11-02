@@ -16,9 +16,17 @@
  * which is what can be checked against the model, and leaves turning them into
  * distances to a caller that has the edges from somewhere real.
  */
+import { fastLinear } from "../runtime/linear-backend.js";
 
 /** rows x inChannels against (inChannels, outChannels), plus a bias. */
 function linear(input, rows, inChannels, outChannels, weights, bias) {
+  const fast = fastLinear(input, rows, inChannels, weights, outChannels);
+  if (fast !== undefined) {
+    for (let row = 0; row < rows; row += 1) {
+      for (let o = 0; o < outChannels; o += 1) fast[row * outChannels + o] += bias[o];
+    }
+    return fast;
+  }
   const out = new Float32Array(rows * outChannels);
   for (let row = 0; row < rows; row += 1) {
     const inBase = row * inChannels;

@@ -44,6 +44,7 @@
  * query projection. A reference that helpfully added the missing biases would
  * open every gate and be wrong everywhere.
  */
+import { fastLinear, fastLogistic, fastTriangle } from "../../runtime/linear-backend.js";
 
 const EPSILON = 1e-5;
 
@@ -99,6 +100,17 @@ export function layerNorm(input, rows, channels, scale, offset) {
  */
 export function linear(input, rows, inChannels, outChannels, weights, bias = null,
                        transposed = false) {
+  if (!transposed) {
+    const fast = fastLinear(input, rows, inChannels, weights, outChannels);
+    if (fast !== undefined) {
+      if (bias !== null) {
+        for (let row = 0; row < rows; row += 1) {
+          for (let out = 0; out < outChannels; out += 1) fast[row * outChannels + out] += bias[out];
+        }
+      }
+      return fast;
+    }
+  }
   const output = new Float32Array(rows * outChannels);
   // 🔴 THE (in, out) LAYOUT WALKS ITS WEIGHTS ROW BY ROW, NOT COLUMN BY COLUMN.
   // The loop below read `weights[c * outChannels + out]` innermost - a stride
@@ -189,12 +201,15 @@ export function transition(input, rows, channels, weights, factor = 4) {
                                weights.inputLayerNormOffset);
   const wide = linear(normalised, rows, channels, intermediate * 2, weights.transition1);
   const gated = new Float32Array(rows * intermediate);
+  const logistic = fastLogistic(wide);
   for (let row = 0; row < rows; row += 1) {
     const wideBase = row * intermediate * 2;
     const gatedBase = row * intermediate;
     for (let i = 0; i < intermediate; i += 1) {
       // ...[gate half | value half], in that order.
-      gated[gatedBase + i] = swish(wide[wideBase + i]) * wide[wideBase + intermediate + i];
+      const at = wideBase + i;
+      gated[gatedBase + i] = (logistic === undefined ? swish(wide[at]) : wide[at] * logistic[at])
+        * wide[wideBase + intermediate + i];
     }
   }
   return linear(gated, rows, intermediate, channels, weights.transition2);
@@ -222,19 +237,23 @@ export function triangleMultiplication(pair, mask, n, channels, direction, weigh
   // as (channel, i, j) because that is the axis order the einsum contracts in.
   const a = new Float32Array(channels * pairs);
   const b = new Float32Array(channels * pairs);
+  const gates = fastLogistic(gate);
   for (let index = 0; index < pairs; index += 1) {
     const wide = index * channels * 2;
     const maskValue = mask[index];
     for (let c = 0; c < channels; c += 1) {
-      const gated = maskValue * sigmoid(gate[wide + c * 2]);
-      a[c * pairs + index] = projection[wide + c * 2] * gated;
-      b[c * pairs + index] = projection[wide + c * 2 + 1]
-        * maskValue * sigmoid(gate[wide + c * 2 + 1]);
+      const first = wide + c * 2;
+      const gated = maskValue * (gates === undefined ? sigmoid(gate[first]) : gates[first]);
+      a[c * pairs + index] = projection[first] * gated;
+      b[c * pairs + index] = projection[first + 1]
+        * maskValue * (gates === undefined ? sigmoid(gate[first + 1]) : gates[first + 1]);
     }
   }
 
-  const product = new Float32Array(channels * pairs);
-  for (let c = 0; c < channels; c += 1) {
+  const contracted = dialect?.triangleMulDivideByLength === true ? undefined
+    : fastTriangle(a, b, n, channels, direction);
+  const product = contracted ?? new Float32Array(channels * pairs);
+  for (let c = 0; contracted === undefined && c < channels; c += 1) {
     const plane = c * pairs;
     for (let i = 0; i < n; i += 1) {
       for (let j = 0; j < n; j += 1) {
@@ -293,8 +312,9 @@ export function triangleMultiplication(pair, mask, n, channels, direction, weigh
 
   const projected = linear(centred, pairs, channels, channels, weights.outputProjection);
   const outputGate = linear(normalised, pairs, channels, channels, weights.gatingLinear);
+  const outputGates = fastLogistic(outputGate);
   for (let index = 0; index < projected.length; index += 1) {
-    projected[index] *= sigmoid(outputGate[index]);
+    projected[index] *= outputGates === undefined ? sigmoid(outputGate[index]) : outputGates[index];
   }
   return projected;
 }
