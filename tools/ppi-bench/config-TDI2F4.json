@@ -1,0 +1,1 @@
+{"tag": "TDI2F4", "pair": "T", "cycles": 6, "steps": 100, "recycles": 3, "restarts": 10, "contactTries": 5, "minFootprint": 8, "omit": {"dna": "CDE"}, "stop": {"iptm": 0.85, "ipae": 1.2}, "check": {"top": 5, "iptm": 0.6, "ipae": 4}, "stick": true, "mpnn": {"dna": "ligandmpnn_v_32_020_25.mpnn"}, "model": "intellifold2", "checkModel": ["intellifold2", "chai1"]}
