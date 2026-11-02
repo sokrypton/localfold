@@ -3754,6 +3754,9 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
     signal,
     reuse,
     wantReusable: !onCpu,
+    // With the limit lifted the fold's own account has nothing to measure against, and somebody who asked for that is
+    // the last person whose fold should hold more than it has to.
+    ...(ceilingLifted ? { spillPairs: true } : {}),
     family: chosenFamily(),
     threads: cpuThreads(),
     loops: recycleCount() + 1,
@@ -6188,6 +6191,7 @@ onDeviceFault(({ kind, message, resident }) => {
     ? learnFromLoss(resident) : undefined;
   forgetDeviceState();
   if (kind === "out-of-memory") void releaseDevice();
+  refreshPlan();
   if (activeFold !== undefined) {
     deviceFault = { kind, message, learned };
     activeFold.abort();

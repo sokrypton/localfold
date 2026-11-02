@@ -260,7 +260,7 @@ export async function planningGpu() {
       memoryBytes: gpuMemoryBytes(adapter),
       budgetBytes: held === undefined ? automaticBudget(adapter) : held.budgetBytes,
       automaticBytes: budgetForDevice(4, { gpuMemoryBytes: gpuMemoryBytes(adapter), learnedBytes: learnedLimitBytes() }),
-      maxBindingBytes: adapter.limits.maxStorageBufferBindingSize,
+      maxBindingBytes: Math.min(adapter.limits.maxStorageBufferBindingSize, adapter.limits.maxBufferSize),
       halfWeights: adapter.features.has("shader-f16"),
       software: adapter.info?.isFallbackAdapter === true || /SwiftShader|llvmpipe|Basic Render/i.test(name),
       refusing: deviceRefused,
