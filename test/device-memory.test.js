@@ -12,7 +12,8 @@ import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 
 import {
-  GpuMemoryBudgetError, memorySnapshot, noteAllocation, noteDestroy, setMemoryBudget,
+  budgetForDevice, GpuMemoryBudgetError, gpuMemoryFromName, GPU_MEMORY_SHARE, memorySnapshot,
+  noteAllocation, noteDestroy, setMemoryBudget,
 } from "../webgpu/runtime/device-memory.js";
 
 /** A device is only ever a WeakMap key here, so anything unique will do. */
@@ -95,5 +96,60 @@ describe("device memory accounting", () => {
     const gpu = device();
     noteAllocation(gpu, "a", 4 * MIB);
     assert.throws(() => noteDestroy(gpu, 8 * MIB), /underflow/);
+  });
+});
+
+describe("the ceiling a page gives a device", () => {
+  const GIB = 1024 * MIB;
+  const withRam = (gib, run) => {
+    const before = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+    Object.defineProperty(globalThis, "navigator",
+      { value: { deviceMemory: gib }, configurable: true });
+    try { return run(); } finally {
+      if (before === undefined) delete globalThis.navigator;
+      else Object.defineProperty(globalThis, "navigator", before);
+    }
+  };
+
+  it("stays under a discrete card's own memory, not a third of system RAM", () => {
+    // The report this exists for: 32 GiB of RAM and an 8 GiB RTX 3070 was a 10.9 GiB ceiling.
+    const name = "ANGLE (NVIDIA, NVIDIA GeForce RTX 3070 (0x00002484) Direct3D11 vs_5_0 ps_5_0, D3D11)";
+    const budget = withRam(32, () => budgetForDevice(4, { gpuMemoryBytes: gpuMemoryFromName(name) }));
+    assert.equal(budget, Math.round(8 * GIB * GPU_MEMORY_SHARE));
+  });
+
+  it("still takes a third of system RAM where that is the smaller", () => {
+    assert.equal(withRam(8, () => budgetForDevice(4, { gpuMemoryBytes: 24 * GIB })),
+                 Math.round(8 * GIB / 3));
+  });
+
+  it("is unchanged for a card whose name says nothing", () => {
+    assert.equal(withRam(16, () => budgetForDevice(4, { gpuMemoryBytes: gpuMemoryFromName("Apple M2") })),
+                 Math.round(16 * GIB / 3));
+  });
+
+  it("takes what a lost device taught it when that is lower still", () => {
+    assert.equal(withRam(32, () => budgetForDevice(4, { gpuMemoryBytes: 8 * GIB, learnedBytes: 3 * GIB })),
+                 3 * GIB);
+  });
+});
+
+describe("a card's memory from its name", () => {
+  const GIB = 1024 * MIB;
+  it("reads the renderer strings browsers actually report", () => {
+    assert.equal(gpuMemoryFromName("ANGLE (NVIDIA, NVIDIA GeForce RTX 3070 Direct3D11 vs_5_0 ps_5_0, D3D11)"), 8 * GIB);
+    assert.equal(gpuMemoryFromName("ANGLE (NVIDIA, NVIDIA GeForce RTX 4090 Direct3D11 vs_5_0 ps_5_0, D3D11)"), 16 * GIB);
+    assert.equal(gpuMemoryFromName("ANGLE (AMD, AMD Radeon RX 6800 XT Direct3D11 vs_5_0 ps_5_0, D3D11)"), 12 * GIB);
+    assert.equal(gpuMemoryFromName("ANGLE (Intel, Intel(R) Arc(TM) A770 Graphics Direct3D11)"), 8 * GIB);
+  });
+
+  it("says nothing rather than guess", () => {
+    for (const name of ["Apple M2", "ANGLE (Intel, Intel(R) UHD Graphics 630)", "Mali-G78", "", null, undefined]) {
+      assert.equal(gpuMemoryFromName(name), undefined);
+    }
+  });
+
+  it("does not read a device id or driver number as a model", () => {
+    assert.equal(gpuMemoryFromName("ANGLE (NVIDIA, NVIDIA Tesla A100 (0x00003070))"), undefined);
   });
 });

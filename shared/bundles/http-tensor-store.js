@@ -19,16 +19,25 @@ function delay(milliseconds) {
 }
 
 async function fetchWithRetry(url, label) {
-  let lastStatus = 0;
+  let lastFailure = 0;
   for (let attempt = 0; attempt < 5; attempt += 1) {
-    const response = await fetch(url);
+    // A dropped connection rejects rather than answering with a status, and it
+    // is the likelier failure across a few hundred MiB on a laptop's wifi.
+    let response;
+    try {
+      response = await fetch(url);
+    } catch (error) {
+      lastFailure = error instanceof Error ? error.message : String(error);
+      if (attempt < 4) await delay(250 * 2 ** attempt);
+      continue;
+    }
     if (response.ok) return response;
-    lastStatus = response.status;
+    lastFailure = response.status;
     if (!RETRYABLE_STATUS.has(response.status) || attempt === 4) break;
     await response.body?.cancel();
     await delay(250 * 2 ** attempt);
   }
-  throw new Error(`failed to load ${label}: ${lastStatus}`);
+  throw new Error(`failed to load ${label}: ${lastFailure}`);
 }
 
 /**
@@ -51,7 +60,9 @@ export const tensorDecodeStats = { calls: 0, elements: 0, ms: 0 };
 // - file:// included - and can refuse on quota, so every call here is guarded
 // and a failure only costs the speed-up: the fetch path underneath is unchanged.
 
-const CACHE_PREFIX = "localfold-model-";
+const CACHE_PREFIX = "localfold-shards-";
+/** The names used before a cache name carried its bundle. Nothing reads them now. */
+const LEGACY_CACHE_PREFIX = "localfold-model-";
 const CACHE_TIMEOUT_MS = 2_000;
 
 /**
@@ -82,44 +93,131 @@ function cacheToken(manifest) {
   return `${bundle.model ?? "model"}-${bundle.bytes ?? 0}-${Object.keys(manifest.tensors).length}`;
 }
 
-/**
- * The cached shard sets this manifest supersedes: OTHER EXPORTS OF THE SAME
- * MODEL, and nothing else.
- *
- * 🔴 IT USED TO SWEEP EVERY CACHE, which was right when there was one model and
- * wrong the moment there were two. A cache whose name did not match could only
- * mean a stale export of the one model; now it also means THE OTHER MODEL, and
- * the sweep evicted it. Loading multimer deleted the monomer's 97 MiB and
- * loading the monomer deleted multimer's, so every switch between families paid
- * a full cold download - measured at ~5 s each on a local server, and far worse
- * over a network.
- *
- * The model name is part of the cache name, so keeping the two apart is a
- * matter of only sweeping within one. The trailing "-" matters: without it
- * `model_1` would claim `model_1_multimer_v3`'s caches.
- *
- * @param {readonly string[]} names existing cache names
- * @param {{bundle?: {model?: string}, tensors: object}} manifest
- */
-export function staleShardCaches(names, manifest) {
-  const keep = CACHE_PREFIX + cacheToken(manifest);
-  const mine = `${CACHE_PREFIX}${manifest.bundle?.model ?? "model"}-`;
-  return names.filter((existing) => existing.startsWith(mine) && existing !== keep);
+/** FNV-1a: enough to tell two revisions of one directory apart in a cache name. */
+function shortHash(text) {
+  let hash = 0x811c9dc5;
+  for (let at = 0; at < text.length; at += 1) {
+    hash ^= text.charCodeAt(at);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(36);
 }
 
-async function openShardCache(manifest) {
-  if (typeof caches === "undefined") return undefined;
-  const name = CACHE_PREFIX + cacheToken(manifest);
-  try {
-    return await withTimeout((async () => {
-      for (const stale of staleShardCaches(await caches.keys(), manifest)) {
-        await caches.delete(stale);
-      }
-      return caches.open(name);
-    })(), undefined);
-  } catch {
-    return undefined;                 // insecure origin, private mode, no quota
+/**
+ * The directory a bundle's shards live in: the one name unique per bundle.
+ *
+ * `manifest.bundle.model` is not. Both ESM-C towers are "esmc", both EF2-fast
+ * folding bundles are "esmfold2-trunk", and AlphaFold 2's deltas carry no model
+ * name at all, so the sweep below took each for an older export of the other.
+ * Measured on the page: choosing ESM-C 600M deleted 300M's 130 MiB, choosing
+ * 300M deleted 600M's 224 MiB, and every switch between them downloaded again.
+ */
+function bundleStem(manifestUrl) {
+  const path = String(manifestUrl).split(/[?#]/, 1)[0];
+  const parts = path.split("/").filter((part) => part.length > 0);
+  // A base URL ends in "/"; a manifest URL ends in its file, and the directory names it.
+  const last = parts.at(-1) ?? "bundle";
+  return (last.endsWith(".json") ? parts.at(-2) ?? last : last).replaceAll("@", "_");
+}
+
+/**
+ * The cache one export of one bundle is stored under.
+ *
+ * "@" ends the stem because a directory name may hold "-", so `model-int5-` would
+ * claim `model-int5-2`'s caches. The hash carries the pinned revision in the URL.
+ *
+ * @param {{bundle?: {model?: string, bytes?: number}, tensors: object}} manifest
+ * @param {string | URL} manifestUrl where its shards are addressed from
+ */
+export function shardCacheName(manifest, manifestUrl) {
+  return `${CACHE_PREFIX}${bundleStem(manifestUrl)}@${shortHash(String(manifestUrl))}`
+    + `-${cacheToken(manifest)}`;
+}
+
+/**
+ * The cached shard sets this bundle supersedes: other exports of the same
+ * bundle, and any cache named before names carried a bundle.
+ *
+ * @param {readonly string[]} names existing cache names
+ * @param {{bundle?: {model?: string, bytes?: number}, tensors: object}} manifest
+ * @param {string | URL} manifestUrl
+ */
+export function staleShardCaches(names, manifest, manifestUrl) {
+  const keep = shardCacheName(manifest, manifestUrl);
+  const mine = `${CACHE_PREFIX}${bundleStem(manifestUrl)}@`;
+  return names.filter((existing) => existing.startsWith(LEGACY_CACHE_PREFIX)
+    || (existing.startsWith(mine) && existing !== keep));
+}
+
+/**
+ * Open this bundle's cache. No timeout here: `fromManifest` decides how long a
+ * load waits, and a cache that answers late still serves what follows.
+ *
+ * The sweep is not awaited. Deleting a stale 224 MiB entry can outlast the wait,
+ * and when it did the store ran with no cache at all: nothing read, nothing
+ * written, and the next visit downloaded everything again.
+ */
+function openShardCache(manifest, manifestUrl) {
+  if (typeof caches === "undefined") return Promise.resolve(undefined);
+  void (async () => {
+    for (const stale of staleShardCaches(await caches.keys(), manifest, manifestUrl)) {
+      await caches.delete(stale);
+    }
+  })().catch(() => {});
+  // ...rejects on an insecure origin, in private mode, or with no quota.
+  return caches.open(shardCacheName(manifest, manifestUrl)).catch(() => undefined);
+}
+
+let persistenceAsked = false;
+
+/**
+ * Ask once that the shard cache not be evicted under storage pressure.
+ *
+ * An origin is "best effort" by default, and the browser may drop every
+ * downloaded model when the disk fills, which reads as a cache that forgets.
+ * Chrome decides silently; refusal changes nothing.
+ */
+function askForPersistentStorage() {
+  if (persistenceAsked) return;
+  persistenceAsked = true;
+  const storage = typeof navigator === "object" ? navigator.storage : undefined;
+  void storage?.persisted?.()
+    .then((already) => (already ? true : storage.persist?.()))
+    .catch(() => {});
+}
+
+/**
+ * What the shard cache holds, one row per bundle export.
+ *
+ * @returns {Promise<{name: string, bundle: string, bytes: number, shards: number}[]>}
+ */
+export async function shardCacheContents() {
+  if (typeof caches === "undefined") return [];
+  const contents = [];
+  for (const name of await caches.keys()) {
+    if (!name.startsWith(CACHE_PREFIX)) continue;
+    const cache = await caches.open(name);
+    const requests = await cache.keys();
+    let bytes = 0;
+    for (const request of requests) {
+      const response = await cache.match(request);
+      bytes += Number(response?.headers.get("content-length") ?? 0);
+    }
+    contents.push({ name, bundle: name.slice(CACHE_PREFIX.length).split("@", 1)[0],
+                    bytes, shards: requests.length });
   }
+  return contents;
+}
+
+/** Delete every downloaded model. Each downloads again when next used. */
+export async function clearShardCaches() {
+  if (typeof caches === "undefined") return 0;
+  let cleared = 0;
+  for (const name of await caches.keys()) {
+    if (!name.startsWith(CACHE_PREFIX) && !name.startsWith(LEGACY_CACHE_PREFIX)) continue;
+    if (await caches.delete(name)) cleared += 1;
+  }
+  return cleared;
 }
 
 /** Lazy browser tensor store backed by a JSON manifest and fetchable weight shards. */
@@ -188,8 +286,10 @@ export class HttpTensorStore {
       ? manifestUrlValue
       : new URL(manifestUrlValue, typeof location !== "undefined" ? location.href : "http://localhost/");
     if (manifest.tensors === undefined) throw new Error("model manifest has no tensor table");
+    const opening = openShardCache(manifest, manifestUrl);
     const store = new HttpTensorStore(manifestUrl, manifest, onProgress,
-      await openShardCache(manifest), shardQuery ?? `?v=${cacheToken(manifest)}`);
+      await withTimeout(opening, undefined), shardQuery ?? `?v=${cacheToken(manifest)}`);
+    void opening.then((cache) => { store.#shardCache ??= cache; });
     store.#reportProgress();
     return store;
   }
@@ -522,7 +622,8 @@ export class HttpTensorStore {
         if (buffer.byteLength === expectedLength) {
           this.#loadedBytes += buffer.byteLength;
           this.#reportProgress();
-          void this.#cachePut(url, new Response(buffer));
+          void this.#cachePut(url, new Response(buffer, {
+            headers: { "content-length": String(buffer.byteLength) } }));
           return buffer;
         }
         arrived = buffer.byteLength;
@@ -594,7 +695,10 @@ export class HttpTensorStore {
   }
 
   async #cachePut(url, response) {
-    try { await this.#shardCache?.put(url, response); } catch { /* quota, or no cache */ }
+    try {
+      await this.#shardCache?.put(url, response);
+      if (this.#shardCache !== undefined) askForPersistentStorage();
+    } catch { /* quota, or no cache */ }
   }
 
   async #cacheDelete(url) {

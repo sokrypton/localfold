@@ -88,10 +88,64 @@ export function setMemoryBudget(device, budgetBytes) {
  * number nobody checked as if it were a device limit, which is why the only
  * thing it is used for is choosing between two paths that both work.
  */
-export function budgetForDevice(fallbackGiB = 4) {
+export function budgetForDevice(fallbackGiB = 4, { gpuMemoryBytes, learnedBytes } = {}) {
   const gib = (typeof navigator === "object" && navigator !== null
     && typeof navigator.deviceMemory === "number") ? navigator.deviceMemory : fallbackGiB;
-  return Math.round(gib * 1024 * 1024 * 1024 / 3);
+  const bytes = [Math.round(gib * 1024 * 1024 * 1024 / 3)];
+  // A third of system RAM says nothing about a discrete card's own memory: a
+  // 32 GiB desktop with an 8 GiB RTX 3070 was given a 10.9 GiB ceiling, and a
+  // fold under it ran the card out and lost the device. The same fifth is kept
+  // back for the desktop, the browser and the driver's own overhead.
+  if (gpuMemoryBytes !== undefined) bytes.push(Math.round(gpuMemoryBytes * GPU_MEMORY_SHARE));
+  if (learnedBytes !== undefined) bytes.push(learnedBytes);
+  return Math.min(...bytes);
+}
+
+/** How much of a discrete card's own memory one fold may hold. */
+export const GPU_MEMORY_SHARE = 0.8;
+
+const GIB = 1024 * 1024 * 1024;
+
+/**
+ * The smallest memory each consumer GPU name has shipped with, in GiB.
+ *
+ * WebGPU reports no memory size outside Chrome's developer-features flag, and
+ * the unmasked WebGL renderer string is the one place a page can read the card's
+ * name. A model that shipped in several sizes (RTX 3060: 6 on laptops, 8 and 12
+ * on desktops) takes the smallest, because this is only ever used as a ceiling:
+ * too low costs a warning on a fold that would have fitted, too high costs the
+ * device. A name not listed here keeps the ceiling from system RAM alone.
+ */
+const GPU_MEMORY_GIB = [
+  [/\bGTX\s*1050\b/i, 2], [/\bGTX\s*1060\b/i, 3], [/\bGTX\s*1070\b/i, 8], [/\bGTX\s*1080\b/i, 8],
+  [/\bGTX\s*1650\b/i, 4], [/\bGTX\s*1660\b/i, 6],
+  [/\bRTX\s*2060\b/i, 6], [/\bRTX\s*2070\b/i, 8], [/\bRTX\s*2080\b/i, 8],
+  [/\bRTX\s*3050\b/i, 4], [/\bRTX\s*3060\b/i, 6], [/\bRTX\s*3070\b/i, 8], [/\bRTX\s*3080\b/i, 8],
+  [/\bRTX\s*3090\b/i, 24],
+  [/\bRTX\s*4050\b/i, 6], [/\bRTX\s*4060\b/i, 8], [/\bRTX\s*4070\b/i, 8], [/\bRTX\s*4080\b/i, 12],
+  [/\bRTX\s*4090\b/i, 16],
+  [/\bRTX\s*5050\b/i, 8], [/\bRTX\s*5060\b/i, 8], [/\bRTX\s*5070\b/i, 8], [/\bRTX\s*5080\b/i, 16],
+  [/\bRTX\s*5090\b/i, 24],
+  [/\bRX\s*5500\b/i, 4], [/\bRX\s*5600\b/i, 6], [/\bRX\s*5700\b/i, 8],
+  [/\bRX\s*6400\b/i, 4], [/\bRX\s*6500\b/i, 4], [/\bRX\s*66[05]0\b/i, 8], [/\bRX\s*6700\b/i, 10],
+  [/\bRX\s*6750\b/i, 12], [/\bRX\s*6800\b/i, 12], [/\bRX\s*6900\b/i, 16],
+  [/\bRX\s*7600\b/i, 8], [/\bRX\s*7700\b/i, 12], [/\bRX\s*7800\b/i, 16], [/\bRX\s*7900\b/i, 16],
+  [/\bRX\s*9060\b/i, 8], [/\bRX\s*9070\b/i, 16],
+  [/\bArc\b.*\bA380\b/i, 6], [/\bArc\b.*\bA5[08]0\b/i, 8], [/\bArc\b.*\bA7[57]0\b/i, 8],
+  [/\bArc\b.*\bB570\b/i, 10], [/\bArc\b.*\bB580\b/i, 12],
+];
+
+/**
+ * A card's memory from its name, or undefined when the name says nothing.
+ *
+ * @param {string | null | undefined} name the unmasked WebGL renderer string
+ */
+export function gpuMemoryFromName(name) {
+  if (typeof name !== "string") return undefined;
+  for (const [pattern, gib] of GPU_MEMORY_GIB) {
+    if (pattern.test(name)) return gib * GIB;
+  }
+  return undefined;
 }
 
 /**

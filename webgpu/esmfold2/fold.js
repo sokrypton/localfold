@@ -33,6 +33,7 @@ import { createAddShader } from "../runtime/execution.js";
 import { deviceTuning } from "../runtime/device-profile.js";
 import { memoryBudgetBytes } from "../runtime/device-memory.js";
 import { GpuBufferAllocator } from "../runtime/allocator.js";
+import { throwIfAborted } from "../runtime/abort.js";
 import { yieldToBrowser } from "../runtime/yield.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 import { Esmfold2TrunkGpu } from "./trunk.js";
@@ -347,7 +348,12 @@ export async function foldEsmfold2(device, options) {
   const enter = (name) => { phase = name; say(); };
   const advance = (units) => { completed = Math.min(plan.total, completed + units); say();
                                onProgress(completed / plan.total); };
+  // Stop was only read after the whole fold had finished, so a large fold kept the
+  // GPU for minutes after being told to stop. Checked at each stage, at each trunk
+  // block and at each sampler step, none of which has work in flight it still owns.
+  const stopIfAsked = () => throwIfAborted(options.signal);
   const mark = async (label, work) => {
+    stopIfAsked();
     const at = performance.now();
     const value = await work();
     timings[label] = performance.now() - at;
@@ -675,6 +681,7 @@ export async function foldEsmfold2(device, options) {
             // message, which is a task and is not clamped in a background tab.
             onBlock: async (index) => {
               await yieldToBrowser();
+              stopIfAsked();
               return options.onBlock?.(loop, index);
             } }));
       }
@@ -954,6 +961,7 @@ export async function foldEsmfold2(device, options) {
     let x = new Float32Array(atoms * 3);
     for (let i = 0; i < x.length; i += 1) x[i] = schedule[0] * draw();
     for (let step = 0; step < levels.length; step += 1) {
+      stopIfAsked();
       const at = performance.now();
       x = centreRandomAugmentation(x, features.mask, atoms, draw);
       const tHat = levels[step];

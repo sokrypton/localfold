@@ -572,8 +572,11 @@ async function foldHolding(device, batch, weights, options, held) {
   const largeFold = deviceTuning(device).largeFoldReleasesWeights !== false
     && largestTokens * largestTokens * (weights.trunk?.embedder?.pairChannels ?? 128) * 4
       >= WEIGHT_RELEASE_MIN_BYTES;
-  const keepWeights = (knob) => !largeFold && (deviceTuning(device)[knob]
-    ?? (deviceDerivationsAllowed(device) && keepResidentAffordable(device))) === true;
+  // A prior says the architecture's card has room; the budget says whether this one
+  // does. `ampere` was measured on a 40 GB A100 and is also what an 8 GB RTX 3070
+  // reports, so a prior of true may not keep weights a small card's budget refuses.
+  const keepWeights = (knob) => !largeFold && keepResidentAffordable(device)
+    && (deviceTuning(device)[knob] ?? deviceDerivationsAllowed(device)) === true;
   // 🔴 AND A LARGE FOLD STREAMS ITS TRUNK WEIGHTS INSIDE THE FOLD TOO. Kept for
   // the four passes, the trunk's decoded `w.` weights were 2.35 GB of
   // IntelliFold-2's 3.34 GB peak at 255 residues; streamed, each block's int5
