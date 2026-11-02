@@ -880,11 +880,21 @@ ${f16Stores}
 }`;
   }
 
+  // Past what one binding can name, the contraction's output is two buffers split between two channels. A channel is
+  // the slowest axis of this tensor, so the split costs a branch and moves nothing.
+  const hiddenParts = shape.hiddenParts ?? 1;
+  const hiddenAt = (channel, row) => (hiddenParts === 1 ? `source[${channel} * PAIRS + ${ROW_BASE}${row}]`
+    : `hidden_at(${channel}, ${ROW_BASE}${row})`);
   const normalizeHidden = `${common}
 @group(0) @binding(0) var<storage, read> source: array<f32>;
 @group(0) @binding(1) var<storage, read> weights: array<${tw}>;
 @group(0) @binding(2) var<storage, read_write> normalized: array<${storageArray(hiddenStorage)}>;
 ${chunkBinding(3)}
+${hiddenParts === 1 ? "" : `@group(0) @binding(4) var<storage, read> source_high: array<f32>;
+fn hidden_at(channel: u32, at: u32) -> f32 {
+  if (channel < ${shape.cHidden / hiddenParts}u) { return source[channel * PAIRS + at]; }
+  return source_high[(channel - ${shape.cHidden / hiddenParts}u) * PAIRS + at];
+}`}
 // ...READS CHANNEL-MAJOR AND WRITES CHANNEL-MINOR, because this is where the
 // two layouts meet: the contraction upstream wants h slowest, and
 // projectOutput downstream reads a row's channels contiguously. Doing the
@@ -892,8 +902,8 @@ ${chunkBinding(3)}
 // a dedicated one, and staging it through workgroup memory is what lets BOTH
 // sides be read and written along their own major axis.
 ${stagedLayerNorm("CH", (row, channel) => divideByLength
-                    ? `(source[${channel} * PAIRS + ${ROW_BASE}${row}] / f32(L))`
-                    : `source[${channel} * PAIRS + ${ROW_BASE}${row}]`,
+                    ? `(${hiddenAt(channel, row)} / f32(L))`
+                    : hiddenAt(channel, row),
                   "LAYERNORMOUTWEIGHT", "LAYERNORMOUTBIAS", "channel", hiddenStorage)}`;
 
   // 🔴 THE OUTPUT PROJECTION MAY TAKE A WIDER TILE THAN THE INPUT ONE, because

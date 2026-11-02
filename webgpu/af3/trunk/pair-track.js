@@ -41,6 +41,7 @@ import {
   transitionRowTile, transitionSplitChunkRows,
 } from "./transition.js";
 import { weightLength } from "../../../shared/weights/weight-pack.js";
+import { rangeOf } from "../../runtime/segmented.js";
 
 export const PAIR_CHANNELS = 128;
 export const GRID_WIDTH = 32_768;
@@ -108,8 +109,8 @@ function chunkUniforms(device, key, n, rows) {
  * rows), one 256-byte slot per channel group and chunk, plus a row of slots for the output stage. One buffer, because
  * a large fold has thousands of these and each is sixteen bytes that never change.
  */
-function sequentialChunks(device, pairs, channels, groupChannels, rowsPerChunk) {
-  const key = `sequential:${pairs}:${channels}:${groupChannels}:${rowsPerChunk}`;
+function sequentialChunks(device, pairs, channels, groupChannels, rowsPerChunk, hiddenParts = 1) {
+  const key = `sequential:${pairs}:${channels}:${groupChannels}:${rowsPerChunk}:${hiddenParts}`;
   let byLength = GRID_CHUNKS.get(device);
   if (byLength === undefined) GRID_CHUNKS.set(device, byLength = new Map());
   let table = byLength.get(key);
@@ -122,7 +123,9 @@ function sequentialChunks(device, pairs, channels, groupChannels, rowsPerChunk) 
   for (let from = 0; from < pairs; from += rowsPerChunk) {
     rows.push({ from, rows: Math.min(rowsPerChunk, pairs - from) });
   }
-  const slots = (groups.length + 1) * rows.length;
+  // ...and a last row for the contraction: its channels counted from the start of the buffer it writes.
+  const contractSlots = groups.length;
+  const slots = (groups.length + 1) * rows.length + contractSlots;
   const buffer = device.createBuffer({ label: `chunk-${key}`, size: slots * 256,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
   const words = new Uint32Array(slots * 64);
@@ -131,10 +134,19 @@ function sequentialChunks(device, pairs, channels, groupChannels, rowsPerChunk) 
     words.set([group.from, group.count, chunk.from, chunk.rows], at(g, r));
   }));
   rows.forEach((chunk, r) => words.set([0, 0, chunk.from, chunk.rows], at(groups.length, r)));
+  const contractAt = (groups.length + 1) * rows.length;
+  const partChannels = channels / hiddenParts;
+  groups.forEach((group, g) => {
+    if (Math.floor(group.from / partChannels) !== Math.floor((group.from + group.count - 1) / partChannels)) {
+      throw new RangeError(`a channel group ${group.from}+${group.count} crosses the output's halves`);
+    }
+    words.set([group.from % partChannels, group.count, 0, pairs], (contractAt + g) * 64);
+  });
   device.queue.writeBuffer(buffer, 0, words);
   table = {
     groups, rows, rowsPerChunk,
     uniform: (group, row) => ({ buffer, byteOffset: (group * rows.length + row) * 256, byteSize: 16 }),
+    contractUniform: (group) => ({ buffer, byteOffset: (contractAt + group) * 256, byteSize: 16 }),
   };
   byLength.set(key, table);
   return table;
@@ -292,6 +304,9 @@ export async function compilePairTrack(cache, options) {
   // tensors where compact holds 4.5. ESMFold2's stacks only: the grid attention needs a whole normalised input, and it
   // keeps its chunks in the buffers this removes.
   const sequential = compact && !gridAttention && options.sequentialTriangle === true;
+  // How many buffers the contraction's output takes. Two reach a pair of 4 GiB, which is past anything else's limit here.
+  const hiddenParts = !sequential ? 1 : options.sequentialHiddenParts
+    ?? (n * n * channels * 4 > Math.min(options.maxStorageBufferBindingSize ?? Infinity, options.maxBufferSize ?? Infinity) ? 2 : 1);
   const abLayout = projectMatrix === false ? "blocked" : "interleaved";
   // ...and the output projection's two matrices, which the same knob moves and
   // which need a transpose rather than an interleave. See project-matrix.js.
@@ -323,7 +338,7 @@ export async function compilePairTrack(cache, options) {
     // of this track's updates do that now; see the note in
     // webgpu/af3/trunk/transition.js for what the add pass was costing.
     const { projectTile, contractTile, normalizeRows, projectGridWidth, ...sources } = createTriangleShaders(
-      compact ? { ...shape, channelChunked: true, rowChunked: sequential } : shape,
+      compact ? { ...shape, channelChunked: true, rowChunked: sequential, hiddenParts } : shape,
       "f32", triangleOffsets, epsilon, direction, variance,
       // 🔴 THE PROJECTION TILE IS THE CALLER'S, because it is an occupancy
       // choice and this file cannot see the device. undefined keeps
@@ -383,7 +398,7 @@ export async function compilePairTrack(cache, options) {
                   // ...and the 1/L, which is a `const`-free difference INSIDE
                   // normalize-hidden's source: two dialects sharing a base
                   // would otherwise collide on it.
-                  + `:dl${shape.triangleMulDivideByLength}:nr${normalizeRows}:cc${compact}:rc${sequential}`
+                  + `:dl${shape.triangleMulDivideByLength}:nr${normalizeRows}:cc${compact}:rc${sequential}:hp${hiddenParts}`
                   // ...and the tile each vector kernel was generated at.
                   + `:pt${projectTile.rows}x${projectTile.columns}x${projectTile.outColumns ?? "-"}w${projectTile.workgroup ?? 8}`
                   + `:ct${contractTile.rows}x${contractTile.columns}${contractTile.arithmetic ?? ""}`
@@ -667,10 +682,10 @@ export async function compilePairTrack(cache, options) {
     // A whole number of the project kernel's row tiles, so only a fold's last chunk has a short tile.
     const tile = pipelines.projectTile.rows * pipelines.normalizeRows;
     const rowsPerChunk = Math.max(tile, Math.floor(chunkBytes / (channels * 4) / tile) * tile);
-    const table = sequentialChunks(cache.device, pairs, channels, groupChannels, rowsPerChunk);
+    const table = sequentialChunks(cache.device, pairs, channels, groupChannels, rowsPerChunk, hiddenParts);
     const tempBytes = Math.ceil(Math.min(rowsPerChunk, pairs) * channels * 4 / 256) * 256;
     const abOffset = Math.ceil(abBytes / 256) * 256;
-    pipelines.sequential = { ...table, tempBytes, abOffset, statsBytes };
+    pipelines.sequential = { ...table, tempBytes, abOffset, statsBytes, hiddenParts };
     /** [the two row chunks and the row statistics, the contraction's output, a and b for one group]. */
     pipelines.pairScratchBytes = (index, fullBytes) =>
       [2 * tempBytes + statsBytes, fullBytes, abOffset + abBytes][index];
@@ -920,14 +935,12 @@ export function encodePairTrack(context) {
         byteOffset: (scratch[0].byteOffset ?? 0) + which * tempBytes,
         byteSize: chunk.rows * channels * 4,
       });
-      const pairRows = (chunk) => ({
-        buffer: pair.buffer,
-        byteOffset: (pair.byteOffset ?? 0) + chunk.from * channels * 4,
-        byteSize: chunk.rows * channels * 4,
-      });
+      const pairRows = (chunk) => rangeOf(pair, chunk.from * channels * 4, chunk.rows * channels * 4);
       const normalizeTiles = (chunk) => spread(ceil(chunk.rows, pipelines.normalizeRows));
       const projectTiles = (chunk) => spreadTriangle(ceil(chunk.rows, pipelines.projectTile.rows));
-      const hidden = scratch[1];
+      // One buffer, or the two halves of one past what a binding can name.
+      const hidden = scratch[1].segments ?? [scratch[1]];
+      const hiddenOf = (group) => hidden[Math.floor(group.from / (channels / hidden.length))];
       rows.forEach((chunk, r) => {
         const [nx, ny] = normalizeTiles(chunk);
         run("tri.normalize-stats", p("normalizeStats"), [pairRows(chunk), stats, uniform(groups.length, r)], nx, ny);
@@ -942,7 +955,7 @@ export function encodePairTrack(context) {
           run("tri.project", p("projectAB"), [pairRows(chunk), pairMask, w, a, b, uniform(g, r), stats],
               ceil(group.count, pipelines.projectTile.columns), py, pz);
         });
-        run("tri.contract", p("contract"), [a, b, hidden, uniform(g, 0)],
+        run("tri.contract", p("contract"), [a, b, hiddenOf(group), pipelines.sequential.contractUniform(g)],
             ceil(n, pipelines.contractTile.columns), ceil(n, pipelines.contractTile.rows), group.count);
         context.flush?.();
       });
@@ -950,7 +963,7 @@ export function encodePairTrack(context) {
         const slot = uniform(groups.length, r);
         const [nx, ny] = normalizeTiles(chunk);
         run("tri.normalize", p("normalizeInput"), [pairRows(chunk), w, temp(0, chunk), slot], nx, ny);
-        run("tri.normalize-hidden", p("normalizeHidden"), [hidden, w, temp(1, chunk), slot], nx, ny);
+        run("tri.normalize-hidden", p("normalizeHidden"), [hidden[0], w, temp(1, chunk), slot, ...hidden.slice(1)], nx, ny);
         const [py, pz] = projectTiles(chunk);
         run("tri.project-out", p("projectOutput"), [temp(0, chunk), temp(1, chunk), w, pairRows(chunk), slot],
             ceil(channels, pipelines.projectTile.outColumns ?? pipelines.projectTile.columns), py, pz);
@@ -1145,11 +1158,7 @@ export function encodePairTrack(context) {
       // shape and reads `byteOffset`/`byteSize` off it, and an allocation is
       // itself often a sub-range of a pooled buffer - so the chunk's offset is
       // added to the one the allocation already has rather than replacing it.
-      const at = (allocation) => ({
-        buffer: allocation.buffer,
-        byteOffset: (allocation.byteOffset ?? 0) + start * channels * 4,
-        byteSize: count * channels * 4,
-      });
+      const at = (allocation) => rangeOf(allocation, start * channels * 4, count * channels * 4);
       const perNormalize = spread(Math.ceil(count / split.tiles.normalizeRows));
       run("pair-transition.normalize", p("normalize"),
           [at(pair), weights.transition, scratchSplit.normalized, parameters.normalize],

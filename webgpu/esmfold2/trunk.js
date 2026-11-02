@@ -40,6 +40,7 @@ import {
 } from "../runtime/device-profile.js";
 import { stagedMatrixBlock } from "../kernels/matrix-linear.js";
 import { residentWeightBuffer } from "../runtime/resident.js";
+import { SegmentedAllocation } from "../runtime/segmented.js";
 import { memoryTotals, residencyAllowed } from "../runtime/device-memory.js";
 import {
   allocateTransitionSplit, packTransitionWeights, splitTransitionConfig,
@@ -262,8 +263,10 @@ export class Esmfold2TrunkGpu {
     const sequentialTriangle = options.sequentialTriangle ?? this.options.sequentialTriangle ?? false;
     const sequentialGroups = options.sequentialGroups ?? this.options.sequentialGroups;
     const sequentialChunkBytes = options.sequentialChunkBytes ?? this.options.sequentialChunkBytes;
+    const sequentialHiddenParts = options.sequentialHiddenParts ?? this.options.sequentialHiddenParts;
     const trackKey = `${base}:${stagedPrecision}:${weightPrecision}:${accumulatePrecision}:${transitionFactor}:`
-      + `seq${sequentialTriangle}:${sequentialGroups ?? ""}:${sequentialChunkBytes ?? ""}:fc${options.forceCompact === true}:`
+      + `seq${sequentialTriangle}:${sequentialGroups ?? ""}:${sequentialChunkBytes ?? ""}:${sequentialHiddenParts ?? ""}:`
+      + `fc${options.forceCompact === true}:`
       + `${triangleContractArithmetic}:${JSON.stringify(pairTransitionSplit)}:${JSON.stringify(triangleProjectMatrix)}:`
       + `${JSON.stringify(tuning.trianglePairProjectTile)}:${tuning.triangleProjectOutColumns ?? ""}:${tuning.pairTransitionChunkBytes ?? ""}`;
     if (!this.compiledTracks.has(trackKey)) {
@@ -283,7 +286,8 @@ export class Esmfold2TrunkGpu {
           // pair track (webgpu/kernels/triangle/shaders.js; raced on an Apple GPU: grid-attend-race.js)
           triangleContractArithmetic,
           triangleProjectMatrix,
-          sequentialTriangle, sequentialGroups, sequentialChunkBytes,
+          sequentialTriangle, sequentialGroups, sequentialChunkBytes, sequentialHiddenParts,
+          maxBufferSize: this.device.limits.maxBufferSize,
           // (forces the channel chunking below the size that is worth it, for a checker at a small n)
           ...(options.forceCompact === true ? { forceCompact: true } : {}),
           maxComputeWorkgroupStorageSize: this.device.limits.maxComputeWorkgroupStorageSize,
@@ -319,10 +323,14 @@ export class Esmfold2TrunkGpu {
       // ...four of them without the grid attention, not five; see
       // pairScratchCount in webgpu/af3/trunk/pair-track.js.
       for (let index = scratch.length; index < pipelines.pairScratchCount; index += 1) {
-        scratch.push(keep(this.allocator.allocate(
+        const parts = index === 1 ? pipelines.sequential?.hiddenParts ?? 1 : 1;
+        // The contraction's output past one binding: two buffers, split between two channels.
+        scratch.push(keep(parts === 1 ? this.allocator.allocate(
           `esmfold2-trunk.scratch${index}`,
           pipelines.pairScratchBytes(index,
-            storageBytes(pairs * channels, UNPACKED_PAIR_SCRATCH[index])), storage)));
+            storageBytes(pairs * channels, UNPACKED_PAIR_SCRATCH[index])), storage)
+          : new SegmentedAllocation(this.allocator, `esmfold2-trunk.scratch${index}`, channels, pairs * 4, storage,
+                                    channels / parts)));
       }
       // ...and the split transition's two intermediates, sized for one chunk of
       // rows. The widened one is 369 MiB at 300 tokens unchunked, which is the
@@ -335,7 +343,7 @@ export class Esmfold2TrunkGpu {
           offsets: transitionOffsets,
           // The widened row in the contraction's output and the normalised row in a and b, both dead by the transition;
           // the sequential triangle's scratch[0] is too small to be either.
-          scratch: pipelines.sequential === undefined ? scratch : [scratch[2], scratch[1]],
+          scratch: pipelines.sequential === undefined ? scratch : [scratch[2], scratch[1].segments?.[0] ?? scratch[1]],
           label: "esmfold2-trunk.transition",
         }, keep);
       const projectMatrix = pipelines.projectMatrix === undefined ? undefined

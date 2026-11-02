@@ -18,6 +18,8 @@
  */
 import { Esmfold2TrunkGpu } from "../../webgpu/esmfold2/trunk.js";
 import { reader } from "./fold-esmfold2.js";
+import { GpuBufferAllocator } from "../../webgpu/runtime/allocator.js";
+import { SegmentedAllocation } from "../../webgpu/runtime/segmented.js";
 import { trunkBlockWeights } from "../../shared/esmfold2/weights.js";
 
 const option = (args, name, fallback) => {
@@ -56,6 +58,31 @@ export async function main(device, args) {
                                   { n, channels, leanPair: true, submissionWindow: 1, ...options });
       return { label, pair: out.pair, ms: performance.now() - started, peak: out.memory.peakBytes };
     };
+    // The same track over a pair of several buffers, written and read back a segment at a time.
+    const runSegmented = async (label, segmentRows, options) => {
+      const allocator = new GpuBufferAllocator(device);
+      const usage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST;
+      const held = new SegmentedAllocation(allocator, "pair", pairs, channels * 4, usage, segmentRows);
+      held.segments.forEach((segment, at) => device.queue.writeBuffer(
+        segment.buffer, 0, pair, at * segmentRows * channels, Math.min(segmentRows, pairs - at * segmentRows) * channels));
+      const trunk = new Esmfold2TrunkGpu(device, { residentWeights: false, allocator });
+      await trunk.run({ buffer: held, pairMask }, blocks,
+                      { n, channels, leanPair: true, submissionWindow: 1, readback: false, ...options });
+      const back = new Float32Array(pair.length);
+      for (const [at, segment] of held.segments.entries()) {
+        const bytes = Math.min(segmentRows, pairs - at * segmentRows) * channels * 4;
+        const staging = device.createBuffer({ size: bytes, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+        const encoder = device.createCommandEncoder();
+        encoder.copyBufferToBuffer(segment.buffer, 0, staging, 0, bytes);
+        device.queue.submit([encoder.finish()]);
+        // eslint-disable-next-line no-await-in-loop
+        await staging.mapAsync(GPUMapMode.READ);
+        back.set(new Float32Array(staging.getMappedRange()), at * segmentRows * channels);
+        staging.destroy();
+      }
+      held.release();
+      return { label, pair: back, ms: 0 };
+    };
     // eslint-disable-next-line no-await-in-loop
     const whole = await run("whole", { forceCompact: false });
     const arms = [
@@ -70,6 +97,16 @@ export async function main(device, args) {
       // eslint-disable-next-line no-await-in-loop
       await run("sequential g16", { forceCompact: true, sequentialTriangle: true, sequentialGroups: 16,
                                     sequentialChunkBytes: 262144 }),
+      // eslint-disable-next-line no-await-in-loop
+      await run("sequential, output in two buffers", {
+        forceCompact: true, sequentialTriangle: true, sequentialGroups: 8, sequentialHiddenParts: 2,
+        sequentialChunkBytes: 1048576,
+      }),
+      // eslint-disable-next-line no-await-in-loop
+      await runSegmented("sequential, pair in segments", 16384, {
+        forceCompact: true, sequentialTriangle: true, sequentialGroups: 8, sequentialHiddenParts: 2,
+        sequentialChunkBytes: 1048576,
+      }),
     ];
     for (const arm of arms) {
       let differing = 0;
