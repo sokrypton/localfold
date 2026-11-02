@@ -19,7 +19,7 @@
  * code with the thing it checks tests nothing.
  */
 import { OuterProductMeanGpu, useOuterFirstContraction }
-  from "../../src/kernels/outer-product-mean.js";
+  from "../../webgpu/kernels/outer-product-mean.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;

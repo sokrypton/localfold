@@ -19,7 +19,7 @@ boltz2 reads, the chirality centres and `bond-geometry.js`'s scoring all come
 off that. So SMILES support is not a second featuriser, not a second code path
 through the model, and not a dialect: it is **a second producer of that
 object**, and nothing downstream can tell which one it got. `smilesComponent`
-in `src/chem/component.js` is that producer, and the whole of `src/chem/` exists
+in `shared/chem/component.js` is that producer, and the whole of `shared/chem/` exists
 to fill it in.
 
 🔴 **AND ONLY AS MUCH CHEMISTRY AS THE MODELS READ.** No canonical SMILES, no
@@ -74,7 +74,7 @@ WebAssembly build. Measured rather than argued:
 
 | | raw | gzipped | 3D conformers? |
 |---|---:|---:|---|
-| `src/chem/`, all of it | 151 KB | **50 KB** | yes |
+| `shared/chem/`, all of it | 151 KB | **50 KB** | yes |
 | ...without the GPU kernel | 129 KB | 43 KB | yes |
 | ...code only, comments stripped | 60 KB | **18 KB** | yes |
 | `@rdkit/rdkit` 2026.3.6 MinimalLib | 7.3 MB | **2.39 MB** | **no** |
@@ -607,10 +607,10 @@ were two callers and only one of them named anything.
 `tools/gpu/fold.js` took a single `--smiles-code` for every ligand, so
 `--smiles='c1ccccc1|OCCO'` wrote ten atoms into ONE residue with `C1` and `C2`
 appearing twice - a file no reader and no bond checker can make sense of.
-`ligandName` and `nameSmilesLigands` live in `src/chem/component.js` and both
+`ligandName` and `nameSmilesLigands` live in `shared/chem/component.js` and both
 callers use them.
 
-Names are three characters because `src/af3/fold.js` writes the residue name
+Names are three characters because `webgpu/af3/fold.js` writes the residue name
 with `.padEnd(3)` into a fixed-width column: `LIG`, `LG2` to `LG9`, then `L10`
 upwards, and `LIG2` truncated back to `LIG` would have put the collision
 straight back. Identical strings still share a name, because they are the same

@@ -24,7 +24,6 @@ export function updateScoresCard(confidence) {
     return;
   }
   box.style.display = "flex";
-
   const set = (id, value, digits) => {
     const node = document.getElementById(id);
     if (node) node.textContent = value === undefined ? "-" : Number(value).toFixed(digits);

@@ -13,7 +13,7 @@ import { describe, it } from "node:test";
 
 import {
   GpuMemoryBudgetError, memorySnapshot, noteAllocation, noteDestroy, setMemoryBudget,
-} from "../src/runtime/device-memory.js";
+} from "../webgpu/runtime/device-memory.js";
 
 /** A device is only ever a WeakMap key here, so anything unique will do. */
 const device = () => ({});

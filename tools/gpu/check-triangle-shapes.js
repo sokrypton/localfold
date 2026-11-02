@@ -5,10 +5,10 @@
  * cHidden 6 - and fails on it while the three AlphaFold fixtures at cZ 128
  * pass. This sweeps the three extents to say which one the kernel is wrong in.
  */
-import { createDeterministicTriangleInput } from "../../src/testing/deterministic-input.js";
-import { triangleMultiplicationOutgoingReference } from "../../src/kernels/triangle/cpu-reference.js";
-import { errorMetrics } from "../../src/kernels/triangle/types.js";
-import { TriangleMultiplicationOutgoingGpu } from "../../src/kernels/triangle/webgpu.js";
+import { createDeterministicTriangleInput } from "../../webgpu/testing/deterministic-input.js";
+import { triangleMultiplicationOutgoingReference } from "../../webgpu/kernels/triangle/cpu-reference.js";
+import { errorMetrics } from "../../webgpu/kernels/triangle/types.js";
+import { TriangleMultiplicationOutgoingGpu } from "../../webgpu/kernels/triangle/webgpu.js";
 
 export async function main(device, args = []) {
   const runner = new TriangleMultiplicationOutgoingGpu(device);

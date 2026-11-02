@@ -28,8 +28,8 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools' / 'esmc'))
 
 from safetensors_read import SafeTensors                    # noqa: E402
-from esmfold2_trunk_weights import trunk_block              # noqa: E402
-from export_esmc_model import ShardWriter                   # noqa: E402
+from esmfold2_trunk_weights import trunk_block, transition_weights   # noqa: E402
+from export_esmc_model import ShardWriter, SHIM_TENSORS     # noqa: E402
 
 
 # 🔴 FOUR OF THE HEAD'S 93 TENSORS ARE DEAD, AND EXPORTING THEM WOULD SAY THE
@@ -62,6 +62,10 @@ def open_head(path):
     return out
 
 
+def transposed_of(get, name):
+    return np.ascontiguousarray(np.asarray(get(name), np.float32).T)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--esmfold2', default='esmfold2-fast-600m')
@@ -83,6 +87,8 @@ def main():
     arguments = parser.parse_args()
 
     source = SafeTensors(ROOT / arguments.esmfold2 / 'model.safetensors')
+    config_path = ROOT / arguments.esmfold2 / 'config.json'
+    config = json.loads(config_path.read_text()) if config_path.exists() else {}
     get = lambda name: source[name]
     layers = len({k.split('.')[2] for k in source.keys()
                   if k.startswith('folding_trunk.blocks.')})
@@ -103,11 +109,95 @@ def main():
                 continue                      # synthesised, never shipped
             for leaf, array in values.items():
                 writer.add('blocks/%d/%s/%s' % (layer, group, leaf), array)
-    # The recycle projection, which is the trunk's one divergence from AF3.
-    writer.add('recycle/norm/scale', np.asarray(get('pair_loop_proj.0.weight'), np.float32))
-    writer.add('recycle/norm/offset', np.asarray(get('pair_loop_proj.0.bias'), np.float32))
-    writer.add('recycle/projection', np.ascontiguousarray(
-        np.asarray(get('pair_loop_proj.1.weight'), np.float32).T))
+    # The recycle, which is the trunk's one divergence from AF3 - in one of two forms. The experimental tier
+    # (esmfold2_lm600m / lm300m) projects the previous pass's pair: z = z_init + W(LN(z)). The released
+    # models (ESMFold2, ESMFold2-Fast) run "parcae", a discretised linear state update in which the
+    # LayerNorm is on the INJECTION and not on z: z = a * z + LN(z_init + lm_encoder(...)) b^T, then the
+    # trunk (biohub's modeling_esmfold2.py _run_one_loop). a and b are folded here, in float64, from the
+    # three parameters the checkpoint keeps - a = exp(-softplus(log_delta) exp(log_a)), b = softplus(
+    # log_delta)[:, None] b_cont - as _discretized_dynamics folds them at every call.
+    parcae = 'parcae_log_a' in source.keys()
+    coda_blocks = lm_encoder_blocks = 0
+    if parcae:
+        delta = np.logaddexp(0.0, np.asarray(get('parcae_log_delta'), np.float64))     # softplus
+        writer.add('recycle/decay', np.exp(-delta * np.exp(np.asarray(get('parcae_log_a'), np.float64))).astype(np.float32))
+        writer.add('recycle/norm/scale', np.asarray(get('parcae_input_norm.weight'), np.float32))
+        writer.add('recycle/norm/offset', np.asarray(get('parcae_input_norm.bias'), np.float32))
+        b = delta[:, None] * np.asarray(get('parcae_b_cont'), np.float64)             # F.linear(x, b): x b^T
+        writer.add('recycle/projection', np.ascontiguousarray(b.T.astype(np.float32)))
+        # after the loop: the readout, then the coda's pair-only blocks - what the distogram, the diffusion and
+        # the confidence head read; the recycle carries the pre-coda pair
+        writer.add('readout', np.ascontiguousarray(np.asarray(get('parcae_readout.weight'), np.float32).T))
+        # ...and inside the loop, the language model's pair refined by its own pair-only blocks before it is
+        # injected (in place of the experimental tier's adding the shim's pair to z_init once)
+        for prefix, out_name in (('parcae_coda', 'coda'), ('lm_encoder', 'lmEncoder')):
+            count = len({k.split('.')[2] for k in source.keys() if k.startswith(prefix + '.blocks.')})
+            for layer in range(count):
+                for group, values in trunk_block(get, layer, channels, arguments.heads, prefix=prefix).items():
+                    if not isinstance(values, dict) or group == 'pairAttention':
+                        continue
+                    for leaf, array in values.items():
+                        writer.add('%s/blocks/%d/%s/%s' % (out_name, layer, group, leaf), array)
+            if out_name == 'coda': coda_blocks = count
+            else: lm_encoder_blocks = count
+    else:
+        writer.add('recycle/norm/scale', np.asarray(get('pair_loop_proj.0.weight'), np.float32))
+        writer.add('recycle/norm/offset', np.asarray(get('pair_loop_proj.0.bias'), np.float32))
+        writer.add('recycle/projection', np.ascontiguousarray(
+            np.asarray(get('pair_loop_proj.1.weight'), np.float32).T))
+    # The full ESMFold2's MSA encoder (ESMFold2-Fast has none: msa_encoder.enabled false). It reads the
+    # alignment and z_init and its answer REPLACES the injection (msa_encoder_overwrite) - biohub's
+    # MSAEncoder: m = embed([one-hot 33 | has_deletion | deletion_value]) + project_inputs(s_inputs)[token];
+    # per block the outer product mean into the pair (Wout(outer) / max(pair count, 1), the bias divided
+    # too), then - not on the last block - the pair-weighted averaging and the MSA's transition, then the
+    # pair-only block every trunk block is. Matrices inner-major ([in, out]) as everywhere here.
+    msa_blocks = len({k.split('.')[2] for k in source.keys() if k.startswith('msa_encoder.blocks.')})
+    msa_meta = {}
+    if msa_blocks:
+        writer.add('msaEncoder/embed', transposed_of(get, 'msa_encoder.embed.weight'))
+        writer.add('msaEncoder/projectInputs', transposed_of(get, 'msa_encoder.project_inputs.weight'))
+        for layer in range(msa_blocks):
+            at = 'msa_encoder.blocks.%d' % layer
+            out = 'msaEncoder/blocks/%d/' % layer
+            opm = at + '.outer_product_mean'
+            writer.add(out + 'outerProductMean/normScale', np.asarray(get(opm + '.norm.weight'), np.float32))
+            writer.add(out + 'outerProductMean/normOffset', np.asarray(get(opm + '.norm.bias'), np.float32))
+            writer.add(out + 'outerProductMean/projection', transposed_of(get, opm + '.W.weight'))      # [Cm, a | b]
+            writer.add(out + 'outerProductMean/output', transposed_of(get, opm + '.Wout.weight'))      # [(c, d), C]
+            writer.add(out + 'outerProductMean/outputBias', np.asarray(get(opm + '.Wout.bias'), np.float32))
+            pwa = at + '.msa_pair_weighted_averaging'
+            if pwa + '.Wv.weight' in source.keys():
+                writer.add(out + 'pairWeightedAveraging/normScale', np.asarray(get(pwa + '.norm_single.weight'), np.float32))
+                writer.add(out + 'pairWeightedAveraging/normOffset', np.asarray(get(pwa + '.norm_single.bias'), np.float32))
+                writer.add(out + 'pairWeightedAveraging/pairNormScale', np.asarray(get(pwa + '.compute_bias.0.weight'), np.float32))
+                writer.add(out + 'pairWeightedAveraging/pairNormOffset', np.asarray(get(pwa + '.compute_bias.0.bias'), np.float32))
+                writer.add(out + 'pairWeightedAveraging/pairLogits', transposed_of(get, pwa + '.compute_bias.1.weight'))
+                writer.add(out + 'pairWeightedAveraging/value', transposed_of(get, pwa + '.Wv.weight'))
+                writer.add(out + 'pairWeightedAveraging/gate', transposed_of(get, pwa + '.Wgate.weight'))
+                writer.add(out + 'pairWeightedAveraging/output', transposed_of(get, pwa + '.Wout.weight'))
+                for leaf, array in transition_weights(get, at + '.msa_transition').items():
+                    writer.add(out + 'msaTransition/' + leaf, array)
+            for group, values in trunk_block(get, layer, channels, arguments.heads, prefix='msa_encoder').items():
+                if not isinstance(values, dict) or group == 'pairAttention':
+                    continue
+                for leaf, array in values.items():
+                    writer.add(out + group + '/' + leaf, array)
+        msa = config.get('msa_encoder', {})
+        msa_meta = {'msaBlocks': msa_blocks, 'msaChannels': int(source.shape('msa_encoder.embed.weight')[0]),
+                    'msaHeads': int(msa.get('n_heads_msa', 8)),
+                    'msaHeadWidth': int(source.shape('msa_encoder.blocks.0.msa_pair_weighted_averaging.Wv.weight')[0])
+                    // int(msa.get('n_heads_msa', 8)),
+                    'opmHidden': int(source.shape('msa_encoder.blocks.0.outer_product_mean.W.weight')[0]) // 2,
+                    'msaMaxDepth': 1024, 'msaColumnMaskRate': 0.1}
+    # The language model's shim, which is this checkpoint's and not the tower's: the full ESMFold2's twelve
+    # differ from ESMFold2-Fast's in every tensor, so a folding bundle carries its own and the native port reads
+    # it before the ESM-C bundle's (cuda/ef2/src/ops.cuh shimKey). Laid out as tools/export_esmc6b.py lays it.
+    if 'language_model.base_z_combine' in source.keys():
+        for leaf, name in SHIM_TENSORS:
+            values = np.asarray(get('language_model.' + leaf), np.float32)
+            if name in ('lm/projection/weights', 'lm/downproject/weights', 'lm/pair_mlp_1/weights', 'lm/pair_mlp_2/weights'):
+                values = np.ascontiguousarray(values.T)
+            writer.add(name, values)
     # 🔴 EVERYTHING THAT BUILDS z_init EXCEPT THE ATOM ENCODER AND THE LANGUAGE
     # MODEL. z_init is a sum of five terms and these are the three cheap ones;
     # the shim's pair term is already in the ESM-C bundle, and the atom
@@ -253,7 +343,7 @@ def main():
 
     # 🔴 THE INPUTS EMBEDDER, WHICH IS NOT AF3'S ATOM ENCODER. Sliding-window
     # self-attention over atoms with a 3D rotary embedding built from the
-    # reference conformer - see src/af3/diffusion/atom-encoder-reference.js. Reusing
+    # reference conformer - see cpu/af3/diffusion/atom-encoder.js. Reusing
     # AF3's windowed pair-biased encoder would have been the obvious wrong move;
     # nothing in the shapes says they differ.
     atom = 'inputs_embedder.atom_attention_encoder'
@@ -297,8 +387,11 @@ def main():
                     writer.add('confidence/blocks/%d/%s/%s' % (layer, group, leaf), array)
         vector = lambda name: np.asarray(head[name], np.float32)
         matrix = lambda name: np.ascontiguousarray(np.asarray(head[name], np.float32).T)
+        # (the released heads - ESMFold2, ESMFold2-Fast - put a LayerNorm in front of the PAE projection; the
+        # Synthyra head on the experimental tier has none)
+        has_pae_norm = 'pae_ln.weight' in head
         for leaf, name in (('s_inputs_norm', 'sInputsNorm'), ('z_norm', 'zNorm'),
-                           ('plddt_ln', 'plddtNorm')):
+                           ('plddt_ln', 'plddtNorm')) + ((('pae_ln', 'paeNorm'),) if has_pae_norm else ()):
             writer.add('confidence/%s/scale' % name, vector('%s.weight' % leaf))
             writer.add('confidence/%s/offset' % name, vector('%s.bias' % leaf))
         for leaf, name in (('s_to_z', 'sToZ'), ('s_to_z_transpose', 'sToZTranspose'),
@@ -314,7 +407,7 @@ def main():
         # predicted rep-atom distance falls in. Transposing it - which is what
         # every other matrix here wants - would silently make it a matmul
         # against the wrong axis, and `boundaries` beside it is the 127 edges
-        # of linspace(2, 52), the same grid src/esmfold2/distogram-webgpu.js
+        # of linspace(2, 52), the same grid webgpu/esmfold2/distogram.js
         # already borrowed from this head while the head was absent.
         writer.add('confidence/distanceEmbedding', vector('dist_bin_pairwise_embed.weight')
                    if head['dist_bin_pairwise_embed.weight'].ndim == 1 else
@@ -339,7 +432,7 @@ def main():
             # Stated, because a reader who counts 93 against 89 should find the
             # answer here rather than in a diff.
             'unusedInCheckpoint': list(HEAD_UNUSED),
-            'pairOnlyBlocks': True, 'hasPde': False,
+            'pairOnlyBlocks': True, 'hasPde': False, 'paeNorm': has_pae_norm,
         }
 
     # 🔴 CLOSED AFTER THE LAST `add`, WHICH IS NOT WHERE IT USED TO BE. The
@@ -385,6 +478,28 @@ def main():
                       '%s.atom_to_token_linear.weight'
                       % 'inputs_embedder.atom_attention_encoder')[0]),
                   'relativeFeatures': int(source.shape('rel_pos.embed.weight')[1]),
+                  'recycle': 'parcae' if parcae else 'projection',
+                  # the released models' loop, from their own config.json beside the checkpoint: num_loops + 1 passes
+                  # (biohub's forward: total_steps = max(1, num_loops + 1)), and the dropout on the language model's
+                  # pair - p 0.25, a fresh mask every pass and AT INFERENCE (F.dropout(training=True))
+                  # ...and their sampler: AlphaFold 3's EDM constants (rho 7, sigma 4e-4 to 160) with the config's
+                  # churn, noise and step scale, fourteen steps, the schedule clipped at sigma 256 - where the
+                  # experimental tier runs Boltz-2's (af3-any-model model_registry._SAMPLER_CONSTANTS)
+                  **({'samplerSteps': int(config['structure_head'].get('inference_num_steps', 14)),
+                      'samplerGamma0': float(config['structure_head'].get('gamma_0', 0.8)),
+                      'samplerGammaMin': float(config['structure_head'].get('gamma_min', 1.0)),
+                      'samplerNoiseScale': float(config['structure_head'].get('noise_scale', 1.003)),
+                      'samplerStepScale': float(config['structure_head'].get('step_scale', 1.5)),
+                      'samplerRho': 7.0, 'samplerSigmaMin': 0.0004, 'samplerSigmaMax': 160.0, 'samplerMaxSigma': 256.0}
+                     if parcae and 'structure_head' in config else {}),
+                  **({'loops': int(config.get('num_loops', 3)),
+                      'lmDropout': float(config.get('lm_encoder', {}).get('lm_dropout', 0.0))
+                      if config.get('lm_encoder', {}).get('per_loop_lm_dropout') else 0.0} if parcae else {}),
+                  'codaBlocks': coda_blocks, 'lmEncoderBlocks': lm_encoder_blocks, **msa_meta,
+                  # whether s_inputs carries the alignment's profile and mean deletion: biohub's experimental
+                  # forward zeroes both under disable_msa_features, the released one reads them (one row of
+                  # the query when there is no alignment)
+                  'msaFeatures': 0 if config.get('disable_msa_features', True) else 1,
                   'weightLayout': 'af3-pairformer-in-out',
                   'triangleDoubleWidth': 'interleaved',
                   'transitionDoubleWidth': 'blocked-gate-first'},

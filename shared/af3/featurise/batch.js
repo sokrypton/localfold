@@ -1,0 +1,187 @@
+/**
+ * One place where a sequence and an A3M become AF3's batch.
+ *
+ * Kept out of msa-features.js so that module stays a parser: this one reaches
+ * the featuriser and the fold's seeded uniform, which msa-features.js must not
+ * depend on.
+ */
+import { af3MsaFromA3m } from "./msa-features.js";
+import { featuriseProtein } from "./featurise.js";
+import { applyChaiMsa } from "./chai-msa.js";
+import { applyConstraints } from "./constraints.js";
+
+/**
+ * A sequence plus an A3M, as the batch AF3's graph is actually fed.
+ *
+ * 🔴 THIS EXISTS BECAUSE THE PAGE AND THE CLI BUILT IT DIFFERENTLY, AND THE
+ * DIFFERENCE WAS INVISIBLE. Both called `af3MsaFromA3m` and then
+ * `featuriseProtein`, and each dropped something the other passed:
+ *
+ *   - the CLI never passed `profileMsa`/`profileDeletionMatrix`, so it profiled
+ *     the 127 CROPPED rows where the page profiles all 8076. That is a
+ *     different feature, not a different sample of one, and it fed `target_feat`
+ *     as well as the profile itself.
+ *   - the CLI never seeded the row subsample, so it took the alignment's PREFIX
+ *     where the page took a seeded random subset of the whole file. (The draw
+ *     is the trunk's now, every pass: shared/af3/msa-draw.js.)
+ *
+ * So every `--a3m` gate was measuring a fold the site does not run, and the one
+ * bug that only the page had - boltz2's trunk truncated to 48 of its 64 blocks
+ * by a hardcoded depth in web/af3-model.js - could not be reproduced by the
+ * tool written to reproduce the page. Both call this now, so a divergence is a
+ * change to this function rather than an omission in one caller.
+ *
+ * @param {string} sequence chains joined by ":"
+ * @param {?(string|{paired?: ?string, unpaired?: ?string, unpairedProfile?: ?string})} alignment
+ *   null for a single-sequence fold, which is what AF3 itself does with none.
+ * @param {{maxSequences?: number, seed?: number,
+ *          ligands?: Array, modifications?: Array, symmetriseBonds?: boolean,
+ *          chainKinds?: string[]}} [options]
+ *   `maxSequences` is the trunk's rows a pass (`batch.numMsa`, default AF3's
+ *   1024); `seed` moves only OpenDDE's and protenix's conformer translation.
+ * @returns {{batch: object, rows: object}}
+ */
+export function af3BatchFromA3m(sequence, alignment, options = {}) {
+  const rows = alignment === null || alignment === undefined
+    ? { msa: [], deletionMatrix: [], depth: 1, unpairedFrom: 0 }
+    : af3MsaFromA3m(alignment, {
+      // an alignment over nucleic chains too: each column's alphabet (see af3MsaFromA3m)
+      ...(options.msaColumnKinds === undefined ? {} : { columnKinds: options.msaColumnKinds }),
+      // openbind0's main-MSA cap (msa-features.js capMainMsa), each column's chain from the polymer chains' lengths
+      ...(options.mainMsaCap === undefined || options.mainMsaCap === null ? {} : { mainMsaCap: options.mainMsaCap }),
+      // (protenix and OpenDDE: each protein chain's paired rows in its unpaired MSA, deduplicated - pairedIntoUnpaired)
+      ...(options.protenixUnpairedMsa === true ? { protenixUnpairedMsa: true } : {}),
+      ...(options.rf3ProfileMsa === true ? { rf3ProfileMsa: true } : {}),
+      ...(options.if2ProfileMsa === true ? { if2ProfileMsa: true } : {}),
+      ...((options.mainMsaCap ?? null) === null && options.protenixUnpairedMsa !== true && options.rf3ProfileMsa !== true
+          && options.if2ProfileMsa !== true ? {} : {
+        chainOfColumn: sequence.split(":").flatMap((chain, index) => Array(chain.length).fill(index)),
+      }),
+    });
+  const batch = featuriseProtein(sequence, {
+    ...(options.ligands === undefined ? {} : { ligands: options.ligands }),
+    ...(options.modifications === undefined ? {} : { modifications: options.modifications }),
+    // 🔴 THE BONDS A JOB DECLARED. `bondedAtomPairs` in AlphaFold 3's format;
+    // a key absent from this literal is a key thrown away, which is the note
+    // three lines up and the bug that lost `modifications` on the ESMFold2
+    // path. See featurise.js's `tokenOfEndpoint`.
+    ...(options.bonds === undefined ? {} : { bonds: options.bonds }),
+    ...(options.symmetriseBonds === undefined
+      ? {} : { symmetriseBonds: options.symmetriseBonds }),
+    ...(options.chainKinds === undefined ? {} : { chainKinds: options.chainKinds }),
+    // 🔴 CENTRE_REF_CONFORMERS: every family but stock AlphaFold 3 expects the
+    // reference conformers centred per ref_space_uid. See featurise.js.
+    ...(options.centreRefConformers === undefined
+      ? {} : { centreRefConformers: options.centreRefConformers }),
+    ...(options.rawLastConformer === undefined
+      ? {} : { rawLastConformer: options.rawLastConformer }),
+    ...(options.declaredPolymerBonds === undefined
+      ? {} : { declaredPolymerBonds: options.declaredPolymerBonds }),
+    ...(options.ccdUnknownResidue === undefined
+      ? {} : { ccdUnknownResidue: options.ccdUnknownResidue }),
+    ...(options.declaredBondFeature === undefined
+      ? {} : { declaredBondFeature: options.declaredBondFeature }),
+    ...(options.chaiConformers === undefined
+      ? {} : { chaiConformers: options.chaiConformers }),
+    // (OpenDDE's and protenix's U(-1, 1) move of each conformer, drawn from the fold's seed)
+    ...(options.translateConformers === true ? { translateConformers: true, conformerSeed: options.seed ?? 0 } : {}),
+    ...(options.declaredBondLeavingAtoms === undefined
+      ? {} : { declaredBondLeavingAtoms: options.declaredBondLeavingAtoms }),
+    ...(options.keepLigandLeavingAtoms === undefined
+      ? {} : { keepLigandLeavingAtoms: options.keepLigandLeavingAtoms }),
+    ...(options.dnaGapMsa === undefined ? {} : { dnaGapMsa: options.dnaGapMsa }),
+    ...(options.modifiedLeavingAtEnds === undefined ? {} : { modifiedLeavingAtEnds: options.modifiedLeavingAtEnds }),
+    ...(options.modifiedNucleotideKeepsOp3 === undefined ? {} : { modifiedNucleotideKeepsOp3: options.modifiedNucleotideKeepsOp3 }),
+    ...(options.modifiedProteinLetter === undefined ? {} : { modifiedProteinLetter: options.modifiedProteinLetter }),
+    ...(options.unresolvedLeavingAtoms === undefined ? {} : { unresolvedLeavingAtoms: options.unresolvedLeavingAtoms }),
+    ...(options.ligandMsaUnk === undefined ? {} : { ligandMsaUnk: options.ligandMsaUnk }),
+    ...(options.proteinOnlyMsa === undefined ? {} : { proteinOnlyMsa: options.proteinOnlyMsa }),
+    ...(options.zeroDeletions === undefined ? {} : { zeroDeletions: options.zeroDeletions }),
+    ...(options.profileOverAllRows === undefined ? {} : { profileOverAllRows: options.profileOverAllRows }),
+    ...(options.atomizeLigandBonded === undefined ? {} : { atomizeLigandBonded: options.atomizeLigandBonded }),
+    ...(options.declaredBondCharge === undefined ? {} : { declaredBondCharge: options.declaredBondCharge }),
+    // 🔴 PADDED_KEYS: rf3, opendde and protenix CLAMP the atom key window and
+    // mask its out-of-range slots where AlphaFold 3 slides it in bounds. See
+    // `paddedAtomKeys` in dialect.js.
+    ...(options.paddedAtomKeys === undefined
+      ? {} : { paddedAtomKeys: options.paddedAtomKeys }),
+    ...(options.qblockAtomKeys === undefined
+      ? {} : { qblockAtomKeys: options.qblockAtomKeys }),
+    // 🔴 THE ATOMISED-TOKEN CONVENTIONS, all four inert until a batch has a
+    // MODIFIED RESIDUE or a LIGAND in it - which is exactly why they went
+    // unnoticed, and why tools/check-batch-fields.js grew a second target.
+    // `atomizedElementNames` renames an atomised atom to its element symbol
+    // (rf3); `atomizedUnknownRestype` gives an atomised token the UNKNOWN
+    // restype (boltz2 and rf3); `atomizedUnknownMsa` carries that into the
+    // alignment too (rf3 alone - boltz2 keeps the parent residue there);
+    // `atomizedBackboneBonds` bonds an atomised residue back into the chain
+    // (rf3 alone).
+    ...(options.atomizedElementNames === undefined
+      ? {} : { atomizedElementNames: options.atomizedElementNames }),
+    ...(options.atomizedUnknownRestype === undefined
+      ? {} : { atomizedUnknownRestype: options.atomizedUnknownRestype }),
+    ...(options.atomizedUnknownMsa === undefined
+      ? {} : { atomizedUnknownMsa: options.atomizedUnknownMsa }),
+    ...(options.atomizedBackboneBonds === undefined
+      ? {} : { atomizedBackboneBonds: options.atomizedBackboneBonds }),
+    // 🔴 AND `modifiedAsOneToken`, WHICH THIS LIST NOT NAMING IS THE WHOLE BUG
+    // THIS COMMENT BLOCK EXISTS TO WARN ABOUT. boltz2 keeps a modified residue
+    // in ONE token; adding the flag to the dialect and to `featuriserDialect`
+    // and not here left `check-batch-fields.js` building 83 tokens against the
+    // reference's 74 - the featuriser had the branch and never saw the flag.
+    ...(options.modifiedAsOneToken === undefined
+      ? {} : { modifiedAsOneToken: options.modifiedAsOneToken }),
+    // 🔴 DROP_ATOMS: four families carry no terminal OXT and no 5' OP3. The
+    // featuriser's switch is `terminalAtoms`, which ESMFold2 already used; this
+    // is the same knob under the dialect's name. See dialect.js.
+    ...(options.dropTerminalAtoms === true ? { terminalAtoms: false }
+      : options.dropTerminalAtoms === "protein" ? { terminalAtoms: "nucleic" } : {}),
+    // 🔴 AND THE QUERY TWICE, for the three families whose paired and unpaired
+    // blocks each contribute it. Only where the alignment is empty; see
+    // `duplicateQueryRow` in dialect.js.
+    // 🔴 THE INVERSION HAPPENS HERE AND NOWHERE ELSE. The dialect names the
+    // reference's convention (`dedupeSelfMsa`, which stock AlphaFold 3 does
+    // NOT do) and the featuriser names the behaviour (`duplicateQueryRow`), so
+    // one of them has to read the other way round; doing it once, at the
+    // boundary, is what stops a caller getting it backwards.
+    ...(options.dedupeSelfMsa === undefined
+      ? {} : { duplicateQueryRow: options.dedupeSelfMsa === false }),
+    // ...and OpenDDE's and protenix's MSA on a ligand and on a nucleic chain's all-gap rows; see featurise.js
+    ...(options.nativeNonproteinMsa === true ? { nativeNonproteinMsa: true } : {}),
+    // ...and the featuriser told its columns cover every polymer residue, not the protein ones alone
+    ...(options.msaColumnKinds?.some((kind) => kind !== "protein") ? { msaCoversNucleic: true } : {}),
+    msa: rows.msa,
+    deletionMatrix: rows.deletionMatrix,
+    unpairedFrom: rows.unpairedFrom,
+    // The profile's rows, which are not the MSA's: AF3 computes the profile
+    // before deduplicating the unpaired block against the paired one and before
+    // cropping either. See af3MsaFromA3m.
+    profileMsa: rows.profileMsa,
+    profileDeletionMatrix: rows.profileDeletionMatrix,
+  });
+  // 🔴 CHAI-1 WITH NO ALIGNMENT FOLDS FROM AN ALL-GAP ONE (af3-any-model model_features.py _zero_msa, checked there
+  // against chai's own captured features): the MSA mask, the profile and the mean deletion all zero, where AF3's
+  // featuriser keeps the query's row and profile live. Only with no alignment at all.
+  // ...and with one, chai's own profile, single-sequence context and row deduplication (chai-msa.js), unless every row
+  // is a chain's own query, which is no alignment either (ColabFold ebbd90d)
+  if (options.chaiMsaFeatures === true) {
+    const texts = alignment === null || alignment === undefined ? null
+      : typeof alignment === "string" ? { unpaired: alignment }
+        : { paired: alignment.paired ?? null, unpaired: alignment.unpairedProfile ?? alignment.unpaired ?? null };
+    const chains = sequence.split(":").map((one, index) => ({
+      sequence: one, kind: options.chainKinds?.[index] ?? "protein",
+      modifications: (options.modifications ?? []).filter((mod) => mod.chain === index)
+        .map((mod) => ({ position: mod.position, code: mod.code })),
+    }));
+    if (texts === null || !applyChaiMsa(batch, chains, texts, options.msaColumnKinds?.some((kind) => kind !== "protein") === true)) {
+      batch.msaMask.fill(0); batch.profile.fill(0); batch.deletionMean.fill(0);
+    }
+  }
+  // 🔴 THE JOB'S POCKET AND CONTACT CONSTRAINTS, built on the finished batch as the family's own featuriser builds them,
+  // or refused by a family trained on neither (constraints.js). `constraints` are resolved: asym numbers, not letters.
+  applyConstraints(batch, options.constraints, options.constraintFamily ?? null, options.modelName);
+  // 🔴 HOW MANY ROWS A TRUNK PASS READS (AF3's num_msa), drawn afresh each pass from the pool above by the trunk
+  // (shared/af3/msa-draw.js). The pool no longer depends on the seed or on this number; the trunk's draw does.
+  batch.numMsa = options.maxSequences ?? 1024;
+  return { batch, rows };
+}

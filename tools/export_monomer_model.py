@@ -18,7 +18,7 @@ needs numpy and the npz.
 exporter numbers its tensors as it walks the parameter tree, which is correct
 and makes a rebuilt model_1 only ACCIDENTALLY comparable with the shipped one -
 any reordering in the walk renames every tensor. Here each tensor is written
-under the name `src/bundles/manifests/monomer.js` already gives it, so a rebuilt
+under the name `shared/bundles/manifests/monomer.js` already gives it, so a rebuilt
 model_1_ptm is name-identical to the bundle that ships and the two can be folded
 against each other. That is the gate this exporter is checked by: rebuilt
 model_1, quantised the way the shipped bundle is, must fold to the SAME
@@ -67,7 +67,7 @@ DISTOGRAM = A + "distogram_head/half_logits"
 def reference_manifest() -> dict:
     """The shipped monomer tensor table, read from its generated module."""
     source = (Path(__file__).resolve().parent.parent
-              / "src" / "bundles" / "manifests" / "monomer.js").read_text()
+              / "shared" / "bundles" / "manifests" / "monomer.js").read_text()
     marker = source.index("MANIFEST")
     return json.loads(source[source.index("=", marker) + 1:].rsplit(";", 1)[0].strip())
 

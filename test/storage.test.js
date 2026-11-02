@@ -7,7 +7,7 @@ import {
   storedElement,
   storedPair,
   unpackHalfWords,
-} from "../src/runtime/storage.js";
+} from "../webgpu/runtime/storage.js";
 
 describe("activation storage", () => {
   it("names the WGSL array element", () => {

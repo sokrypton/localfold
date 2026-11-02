@@ -1,9 +1,9 @@
 import { describe, it } from "node:test";
 import { strict as assert } from "node:assert";
 
-import { parseSmiles, molecularFormula, adjacency } from "../src/chem/smiles.js";
-import { kekulize, valenceProblems } from "../src/chem/kekulize.js";
-import { smallestRings, circuitRank } from "../src/chem/rings.js";
+import { parseSmiles, molecularFormula, adjacency } from "../shared/chem/smiles.js";
+import { kekulize, valenceProblems } from "../shared/chem/kekulize.js";
+import { smallestRings, circuitRank } from "../shared/chem/rings.js";
 
 /**
  * 🔴 THESE ARE THE INTERNAL-CONSISTENCY HALF AND THEY ARE NOT THE GATE. A

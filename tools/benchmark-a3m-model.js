@@ -11,10 +11,10 @@
  * here.
  */
 import { create, globals } from "webgpu";
-import { AlphaFoldMonomerGpu } from "../src/af2/model/monomer.js";
-import { AlphaFoldFixture } from "../src/bundles/alphafold-fixture.js";
-import { FileTensorStore } from "../src/bundles/tensor-store.js";
-import { requestAlphaFoldDevice } from "../src/runtime/device.js";
+import { AlphaFoldMonomerGpu } from "../webgpu/af2/model/monomer.js";
+import { AlphaFoldFixture } from "../shared/bundles/alphafold-fixture.js";
+import { FileTensorStore } from "../shared/bundles/tensor-store.js";
+import { requestAlphaFoldDevice } from "../webgpu/runtime/device.js";
 
 Object.assign(globalThis, globals);
 const input = AlphaFoldFixture.fromStore(await FileTensorStore.open(

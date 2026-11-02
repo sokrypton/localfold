@@ -1,0 +1,23 @@
+{
+ "name": "rna-dna",
+ "modelSeeds": [
+  1
+ ],
+ "sequences": [
+  {
+   "rna": {
+    "id": "A",
+    "sequence": "GGCGCUAGCGCC",
+    "unpairedMsa": ""
+   }
+  },
+  {
+   "dna": {
+    "id": "B",
+    "sequence": "GACTGGTC"
+   }
+  }
+ ],
+ "dialect": "alphafold3",
+ "version": 2
+}

@@ -1,0 +1,19 @@
+{
+ "name": "6mrr",
+ "modelSeeds": [
+  1
+ ],
+ "sequences": [
+  {
+   "protein": {
+    "id": "A",
+    "sequence": "GWSTELEKHREELKKEFLKKEGITNVEIRIDNGRLEVRVEGGTEERLKRFLEELRQKLEKKGYTVDDIKIE",
+    "unpairedMsa": ">q\nGWSTELEKHREELKKEFLKKEGITNVEIRIDNGRLEVRVEGGTEERLKRFLEELRQKLEKKGYTVDDIKIE\n",
+    "pairedMsa": "",
+    "templates": []
+   }
+  }
+ ],
+ "dialect": "alphafold3",
+ "version": 2
+}

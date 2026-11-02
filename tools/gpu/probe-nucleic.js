@@ -29,13 +29,13 @@
  * matters more here than anywhere - a nucleotide has a C4 AND a C4', a C2 and a
  * C2', and the primes are the part a reader drops.
  */
-import { af3BatchFromA3m } from "../../src/af3/featurise/batch.js";
-import { featuriserDialect } from "../../src/af3/dialect.js";
-import { foldBatch, atomName } from "../../src/af3/fold.js";
-import { REFERENCE_CONFORMERS } from "../../src/af3/featurise/reference-conformers.js";
-import { nucleicConformers } from "../../src/af3/featurise/reference-conformers-nucleic.js";
-import { openAf3Store } from "../../src/af3/weights/weights.js";
-import { foldWeights } from "../../src/af3/weights/diffusion-weights.js";
+import { af3BatchFromA3m } from "../../shared/af3/featurise/batch.js";
+import { featuriserDialect } from "../../shared/af3/dialect.js";
+import { foldBatch, atomName } from "../../webgpu/af3/fold.js";
+import { REFERENCE_CONFORMERS } from "../../shared/af3/featurise/reference-conformers.js";
+import { nucleicConformers } from "../../shared/af3/featurise/reference-conformers-nucleic.js";
+import { openAf3Store } from "../../shared/af3/weights/weights.js";
+import { foldWeights } from "../../shared/af3/weights/diffusion-weights.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
@@ -52,7 +52,7 @@ export async function main(device, args) {
   const dna = option(args, "dna", "");
   const rna = option(args, "rna", "");
   const protein = option(args, "sequence", "");
-  const mode = option(args, "mode", "flow");
+  const mode = option(args, "mode", "diffusion");
   const steps = Number(option(args, "steps", "16"));
   // Protein first, because featuriseProtein numbers asym straight through and
   // the polymers come before the ligands; the order here is the order of the

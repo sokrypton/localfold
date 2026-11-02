@@ -1,0 +1,3 @@
+potentials:
+- _target_: bioemu2.denoising.steering.potentials.ChiralAtomPotential
+  parameters: {guidance_weight: 0.3}

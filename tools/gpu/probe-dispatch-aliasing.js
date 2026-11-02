@@ -17,7 +17,7 @@
  * argued about. A read-only pair sharing a buffer is reported too and is not
  * by itself wrong - the point is to see the aliasing at all.
  */
-import { WebGpuExecution } from "../../src/runtime/execution.js";
+import { WebGpuExecution } from "../../webgpu/runtime/execution.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;

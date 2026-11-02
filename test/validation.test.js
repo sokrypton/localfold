@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, expect, it } from "./harness.js";
-import { DeferredValidation } from "../src/runtime/validation.js";
+import { DeferredValidation } from "../webgpu/runtime/validation.js";
 
 /** A GPUDevice's error-scope stack, and nothing else. */
 function fakeDevice(errors = []) {

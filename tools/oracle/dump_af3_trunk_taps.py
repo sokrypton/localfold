@@ -45,7 +45,47 @@ if os.environ.get("DETERMINISTIC_MSA"):
     _feat.shuffle_msa = lambda key, msa: (msa, key)
 PASSES = int(os.environ.get("PASSES", "1"))
 seq, _ = fold_check.parse_ca(os.path.expanduser("~/6MRR.pdb"))
-batch, cfg, model_dir = fold_check._fold_setup(MODEL, seq, None)
+# MODEL_DIR= names the blob's directory (default fold_check's ~/ported/<model>), so the dump reads the blob the
+# bundle under test was exported from
+# TEMPLATE_CIF=<file> [TEMPLATE_CHAIN=A]: fold that chain's sequence with the structure as its own template
+# (template_parity._self_template), and name the dump with SUFFIX=
+templates = None
+if os.environ.get("TEMPLATE_CIF"):
+    import template_parity
+    seq, tmpl = template_parity._self_template(os.environ["TEMPLATE_CIF"], os.environ.get("TEMPLATE_CHAIN", "A"))
+    # 🔴 _self_template maps query i to template i, which is right only when the chain's SEQRES starts where the
+    # resolved sequence does. 5CAJ's carries a 15-residue expression tag first, so identity templates the query
+    # against a structure shifted 15 residues: TEMPLATE_OFFSET=15 there.
+    off = int(os.environ.get("TEMPLATE_OFFSET", "0"))
+    if off:
+        from alphafold3.common import folding_input
+        tmpl = folding_input.Template(mmcif=tmpl.mmcif, query_to_template_map={i: i + off for i in range(len(seq))})
+    templates = [tmpl]
+    print("self-template", len(seq), "residues:", seq)
+# SEQ= / SEP=<position> / USER_CCD=<cif>: another job, a phosphoserine on it (an atomised residue, which 6MRR
+# cannot reach)
+chains = None
+if os.environ.get("SEQ"):
+    seq = os.environ["SEQ"]
+if os.environ.get("SEP"):
+    from alphafold3.common import folding_input
+    chains = [folding_input.ProteinChain(id="A", sequence=seq, ptms=[("SEP", int(os.environ["SEP"]))],
+                                         unpaired_msa="", paired_msa="", templates=[])]
+# A3M=<file>: the chain's unpaired alignment, featurised as run_alphafold.py does with one (has_msa=True: fold_check's
+# has_msa=False zeroes chai1's alignment, so no chai1 trunk oracle had seen one)
+if os.environ.get("A3M"):
+    from alphafold3.common import folding_input
+    from alphafold3.model.pipeline import model_features as _mf
+    chains = [folding_input.ProteinChain(id="A", sequence=seq, ptms=[], unpaired_msa=open(os.environ["A3M"]).read(),
+                                         paired_msa="", templates=[])]
+    _apply = _mf.apply
+    _mf.apply = lambda *a, **k: _apply(*a, **{**k, "has_msa": True})
+if os.environ.get("USER_CCD"):
+    import functools
+    from alphafold3.constants import decoded_ccd
+    decoded_ccd.get_ccd = functools.partial(decoded_ccd.get_ccd, user_ccd=open(os.environ["USER_CCD"]).read())
+batch, cfg, model_dir = fold_check._fold_setup(MODEL, seq, os.environ.get("MODEL_DIR") or None, templates,
+                                               chains=chains)
 # 🔴 fp32, NOT the fold path's bfloat16. A port compared against a bfloat16
 # reference is being held to the reference's rounding as well as its model.
 cfg.global_config.bfloat16 = "none"
@@ -57,6 +97,18 @@ BLOCKS = int(os.environ.get("BLOCKS", "0")) or cfg.evoformer.pairformer.num_laye
 cfg.evoformer.pairformer.num_layer = BLOCKS
 MSA_BLOCKS = int(os.environ.get("MSA_BLOCKS", "0")) or cfg.evoformer.msa_stack.num_layer
 cfg.evoformer.msa_stack.num_layer = MSA_BLOCKS
+# TEMPLATE_IDENTITY=1: every template block passes its input through - the embedding and output path alone
+if os.environ.get("TEMPLATE_IDENTITY"):
+    from alphafold3.model.network import modules as _modules
+    _pfi = _modules.PairFormerIteration.__call__
+    def _identity(self, act, *a, **k):
+        if "template" in self.module_name:
+            return act
+        return _pfi(self, act, *a, **k)
+    _modules.PairFormerIteration.__call__ = _identity
+# TEMPLATE_BLOCKS= truncates the template stack the same way (not to 0: a zero-block stack is no template path)
+TEMPLATE_BLOCKS = int(os.environ.get("TEMPLATE_BLOCKS", "0")) or cfg.evoformer.template.template_stack.num_layer
+cfg.evoformer.template.template_stack.num_layer = TEMPLATE_BLOCKS
 
 
 @hk.transform
@@ -68,14 +120,22 @@ def fwd(b):
             "single": jnp.zeros((length, cfg.evoformer.seq_channel), jnp.float32)}
     target = af3_model.create_target_feat_embedding(
         batch=fb, config=cfg.evoformer, global_config=cfg.global_config)
+    # chai1 (SEPARATE_STRUCTURE_TARGET_FEAT) returns (trunk, structure): the trunk gets the first
+    structure = None
+    if isinstance(target, tuple):
+        target, structure = target
     module = ev.Evoformer(cfg.evoformer, cfg.global_config)
     embeddings = None
+    if MODEL == "chai1":      # chai seeds pass 1 with the initial representations (model.py's recycle_first)
+        prev = {**prev, "recycle_first": jnp.ones((), jnp.float32)}
     for _ in range(PASSES):
         embeddings = module(batch=fb, prev=prev, target_feat=target,
                             key=jax.random.PRNGKey(0))
         prev = {**prev, **{k: v.astype(jnp.float32)
                            for k, v in embeddings.items() if k in prev}}
-    return embeddings, target
+        if "recycle_first" in prev:
+            prev["recycle_first"] = jnp.zeros((), jnp.float32)
+    return embeddings, (target if structure is None else (target, structure))
 
 
 b = jax.tree_util.tree_map(jnp.asarray, utils.remove_invalidly_typed_feats(batch))
@@ -100,6 +160,8 @@ for scope, leaves in params.items():
             value = value[:want[0]]
             cut += 1
         sliced[scope][leaf] = value
+if os.environ.get("TEMPLATE_IDENTITY"):    # its blocks' weights are unread, and a stack would scan over them
+    sliced = {k: v for k, v in sliced.items() if "template_embedding_iteration" not in k}
 if cut:
     print("  sliced %d stacked tensors to %d blocks" % (cut, BLOCKS))
     for name in _cut_names[:6]:
@@ -148,10 +210,12 @@ def put(name, a):
                     "data": a.ravel().tolist()}
     print("  %-22s %-20s rms %9.4f" % (name, list(a.shape), record[name]["rms"]))
 
+if isinstance(target, tuple):
+    put("target_feat_structure", target[1]); target = target[0]
 put("target_feat", target)
 for name, values in taps.items():
     put("tap.%s" % name, values[-1])       # the LAST pass; the dump keeps one cycle
-for name in ("single", "pair"):
+for name in ("single", "pair", "pair_init"):
     if name in out: put(name, out[name])
 # 🔴 AND `CAPTURE=LIST` MUST COME AFTER THE FORWARD PASS. Placed at the first
 # `CAPTURE = ...`, which is BEFORE it, `SCOPES` is empty and the listing prints
@@ -217,7 +281,11 @@ if CAPTURE:
     # A capture that matches nothing is a typo, not agreement.
     assert kept, "CAPTURE=%r matched none of %d modules" % (CAPTURE, len(SCOPES))
 
-p = ("/tmp/af3-oracle-trunk-%s.json" % MODEL if BLOCKS == 48
-     else "/tmp/af3-oracle-trunk-%s-b%d.json" % (MODEL, BLOCKS))
+# ONLY=<regex> keeps just the matching records (a 261-token dump is 2.6 GB whole)
+if os.environ.get("ONLY"):
+    import re as _re2
+    record = {k: v for k, v in record.items() if _re2.search(os.environ["ONLY"], k)}
+p = ("/tmp/af3-oracle-trunk-%s%s.json" % (MODEL, os.environ.get("SUFFIX", "")) if BLOCKS == 48
+     else "/tmp/af3-oracle-trunk-%s%s-b%d.json" % (MODEL, os.environ.get("SUFFIX", ""), BLOCKS))
 open(p, "w").write(json.dumps({"model": MODEL, "passes": PASSES, "stages": record}))
 print("wrote", p, "%.1f MB" % (os.path.getsize(p) / 2 ** 20))

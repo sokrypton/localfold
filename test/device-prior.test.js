@@ -19,7 +19,7 @@ import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 import {
   DEFAULT_TUNING, deviceTuning, ignoreDevicePrior, recordAdapter, setDeviceTuning,
-} from "../src/runtime/device-profile.js";
+} from "../webgpu/runtime/device-profile.js";
 
 /** Enough of a GPUDevice for the profile: it only ever uses it as a map key. */
 const fakeDevice = () => ({ features: new Set(), limits: {} });

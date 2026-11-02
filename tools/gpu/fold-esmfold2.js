@@ -19,34 +19,36 @@
 // RMSD after superposition.
 import {
   readTensor, readTensorAsFloat16, tensorByteLength,
-} from "../../src/weights/dtype.js";
-import { GpuBufferAllocator } from "../../src/runtime/allocator.js";
-import { EsmcTowerGpu } from "../../src/esmc/tower-webgpu.js";
-import { foldEsmfold2, SAMPLER_PRESETS } from "../../src/esmfold2/fold.js";
+} from "../../shared/weights/dtype.js";
+import { GpuBufferAllocator } from "../../webgpu/runtime/allocator.js";
+import { EsmcTowerGpu } from "../../webgpu/esmc/tower.js";
+import { foldEsmfold2, SAMPLER_PRESETS } from "../../webgpu/esmfold2/fold.js";
 import {
   atomDecoderWeights, atomEncoderWeights, denoiserWeights, featuriserWeights,
   trunkBlockWeights,
   confidenceHeadWeights,
-} from "../../src/esmfold2/weights.js";
-import { SHIM_PAIR_TENSORS } from "../../src/esmfold2/language-pair-webgpu.js";
-import { weightedRigidAlign } from "../../src/esmfold2/sampler-reference.js";
-import { ccdUrl, parseCcdComponent } from "../../src/af3/featurise/ccd-component.js";
-import { toDensePositions } from "../../src/esmfold2/featurise.js";
-import { toPdb } from "../../src/af3/fold.js";
+} from "../../shared/esmfold2/weights.js";
+import { SHIM_PAIR_TENSORS } from "../../webgpu/esmfold2/language-pair.js";
+import { weightedRigidAlign } from "../../cpu/esmfold2/sampler.js";
+import { ccdUrl, parseCcdComponent } from "../../shared/af3/featurise/ccd-component.js";
+import { nameSmilesLigands, smilesComponent } from "../../shared/chem/component.js";
+import { toDensePositions } from "../../shared/esmfold2/featurise.js";
+import { toPdb } from "../../webgpu/af3/fold.js";
 // 🔴 THE SHARED SCORER, NOT A SECOND COPY. `bondGeometry` reads each residue's
 // bonds from the CCD - stated bonds with orders, not a distance cutoff - and
 // takes a `components` map so a modified residue is scored against its OWN
 // dictionary entry. docs/AF2.md's rule: a fold is not scored against itself.
 import { bondGeometry } from "./bond-geometry.js";
-import { memorySnapshot } from "../../src/runtime/device-memory.js";
-import { setDeviceTuning } from "../../src/runtime/device-profile.js";
-import { setMemoryBudget } from "../../src/runtime/device-memory.js";
+import { memorySnapshot } from "../../webgpu/runtime/device-memory.js";
+import { setDeviceTuning } from "../../webgpu/runtime/device-profile.js";
+import { setMemoryBudget } from "../../webgpu/runtime/device-memory.js";
 import {
   CONTACT_EDGES, contactAngstromsFor,
-} from "../../src/esmfold2/distogram-webgpu.js";
+} from "../../webgpu/esmfold2/distogram.js";
 import { assertChainGeometry, chainGeometryOf } from "./chain-geometry.js";
 
 import { profileBuffers } from "./buffer-profile.js";
+import { profileDevice } from "./profile.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
@@ -99,7 +101,7 @@ export function reader(bundle) {
   };
   // 🔴 WHERE THE BYTES ARE, WITHOUT DECODING ANY OF THEM - the same contract
   // HttpTensorStore.tensorSource has, so the GPU dequantiser can take these.
-  // See src/esmc/tower-webgpu.js: the tower's four big matrices are 4.8 seconds
+  // See webgpu/esmc/tower.js: the tower's four big matrices are 4.8 seconds
   // of host int3 decoding on a first fold, and this is how they skip it.
   const source = async (name) => {
     const record = await recordFor(name);
@@ -108,7 +110,7 @@ export function reader(bundle) {
   };
   // 🔴 HUNG OFF `read`, BECAUSE THAT IS WHAT THE LOADERS ARE HANDED. Every
   // ESMFold2 weight helper takes a bare `read` function - see the note in
-  // src/esmfold2/weights.js about methods losing `this` - so the two halves a
+  // shared/esmfold2/weights.js about methods losing `this` - so the two halves a
   // lazy loader needs travel as properties of it: `source` for the bytes and
   // `decode` for the host fallback, synchronous so it can sit behind a getter.
   read.source = source;
@@ -157,6 +159,8 @@ export async function main(device, args = []) {
   // RDKit rather than through mmCIF, and takes the ideal conformer for the same
   // reason.
   const ligandCodes = option(args, "ligands", "").split(",").filter((c) => c !== "");
+  // ...and a ligand by SMILES (`|`-separated), built by shared/chem as the page builds one.
+  const smilesList = option(args, "smiles", "").split("|").filter((c) => c !== "");
   // 🔴 CODE@POSITION, 1-BASED, AS THE PAGE COUNTS. `npm run test:modified`
   // folds a SEP@3 through seven AF3-lineage bundles and could not reach this
   // one - `probe-modified.js` opens an AF3 store and calls `foldBatch` - which
@@ -171,7 +175,7 @@ export async function main(device, args = []) {
   const trunkPrecision = option(args, "trunk-precision", "");
   // The element the TRUNK's weight buffers hold, which is neither of the two
   // above and is what stagedMatrixDirectWeights needs - see the note on
-  // weightPrecision in src/esmfold2/trunk-webgpu.js.
+  // weightPrecision in webgpu/esmfold2/trunk.js.
   const trunkWeights = option(args, "trunk-weights", "");
   for (const pair of (args ?? []).filter((a) => a.startsWith("--tune="))
        .flatMap((a) => a.slice("--tune=".length).split(",")).filter(Boolean)) {
@@ -186,6 +190,14 @@ export async function main(device, args = []) {
   const foldBundle = option(args, "bundle", "/model-esmfold2-trunk-f32");
   const towerBundle = option(args, "esmc", "/model-esmc-600m-int3");
   const sampler = option(args, "sampler", "diffusion-15");
+  // the discretisation (cpu/esmfold2/sampler.js), the native port's flags: --schedule=geometric,
+  // --update=exponential, --no-churn, and --steps= over the preset's count
+  const samplerOverrides = {
+    ...(option(args, "schedule", undefined) ? { schedule: option(args, "schedule", undefined) } : {}),
+    ...(option(args, "update", undefined) ? { update: option(args, "update", undefined) } : {}),
+    ...(args.includes("--no-churn") ? { churn: false } : {}),
+    ...(option(args, "steps", undefined) ? { steps: Number(option(args, "steps", undefined)) } : {}),
+  };
   const seed = Number(option(args, "seed", "0"));
   // 🔴 THE REFERENCE IS A DIFFERENT SAMPLE, NOT A DIFFERENT ANSWER. The sampler
   // draws a rotation, a translation and a noise vector per step; this uses its
@@ -206,7 +218,7 @@ export async function main(device, args = []) {
   // which is where this model's evolutionary information comes from.
   const noPlm = args.includes("--no-plm");
   // The element the denoiser's token blocks hold their weights in; see
-  // src/esmfold2/diffusion-webgpu.js. Unset lets the fold choose.
+  // webgpu/esmfold2/diffusion.js. Unset lets the fold choose.
   const denoiserWeightElement = option(args, "denoiser-weights", "");
   // 🔴 FOLD TWICE, THE SECOND TIME REUSING THE TRUNK, which is the only way to
   // check that the saving is real and that the answer is the same one.
@@ -326,7 +338,7 @@ export async function main(device, args = []) {
     // 🔴 `towerShared` IS THE MODEL, AND THAT IS WHAT KEYS THE RESIDENCY. The
     // tower is constructed fresh per fold and cannot be the key; this object is
     // built once from the bundle and lives as long as it does. See
-    // residentBlocks in src/esmc/tower-webgpu.js.
+    // residentBlocks in webgpu/esmc/tower.js.
     }, towerShared, { sequenceId, onBlock, weightKey: towerShared });
     return result.single;
   };
@@ -348,6 +360,8 @@ export async function main(device, args = []) {
     const text = await (await fetch(ccdUrl(code))).text();
     ligands.push(parseCcdComponent(text));
   }
+  const smilesNames = nameSmilesLigands(smilesList);
+  for (const [i, text] of smilesList.entries()) ligands.push(await smilesComponent(text, { code: smilesNames[i] }));
   // ...and a modified residue's component from the same place, for the reason
   // web/af3-model.js gives: the featuriser is synchronous, so a CODE has to
   // become ATOMS before it is called.
@@ -367,8 +381,30 @@ export async function main(device, args = []) {
   // nothing here could say which side of the bus the difference was on. It
   // wraps the device rather than the kernels; see tools/gpu/buffer-profile.js.
   const buffers = args.includes("--buffers") ? profileBuffers(device) : null;
+  // --compare-lm=<url>: a native port's language-model pair (EF2_SAVE_LMZ, raw float32 [T, T, P]) against this one
+  const compareLm = option(args, "compare-lm", "");
+  // --compare-zi=<url> / --compare-pair=<url>: z_init (+ "<url>.s": s_inputs) and the trunk's pair against a native port's
+  const fetchF32 = async (u) => new Float32Array(await (await fetch(u)).arrayBuffer());
+  const relRms = (a, b) => { let e = 0, n = 0; for (let i = 0; i < a.length; i += 1) { const d = a[i] - b[i]; e += d * d; n += a[i] * a[i]; }
+    return Math.sqrt(e / n).toExponential(3) + ` (${a.length} against ${b.length})`; };
+  const nativeLm = compareLm === "" ? null : new Float32Array(await (await fetch(compareLm)).arrayBuffer());
+  const cmpZi = option(args, "compare-zi", ""), cmpPair = option(args, "compare-pair", "");
+  // --dump-denoise=<step>: that denoiser call's level, input and output, in the report (a native port replays them)
+  const dumpDenoiseStep = option(args, "dump-denoise", "");
+  let denoiseDump = null;
   const result = await foldEsmfold2(device, {
-    sequence, allocator, seed, sampler,
+    ...(dumpDenoiseStep === "" ? {} : { onDenoise: (step, noisy, denoised, tHat) => {
+      if (step === Number(dumpDenoiseStep)) denoiseDump = { step, tHat, noisy: Array.from(noisy), denoised: Array.from(denoised) };
+    } }),
+    ...(cmpZi === "" ? {} : { onZInit: async (z) => console.log(`z_init against ${cmpZi}: relRMS ${relRms(z, await fetchF32(cmpZi))}`) }),
+    ...(cmpPair === "" ? {} : { onTrunkPair: async (z) => console.log(`trunk pair against ${cmpPair}: relRMS ${relRms(z, await fetchF32(cmpPair))}`) }),
+    ...(nativeLm === null ? {} : { onLanguagePair: (pair) => {
+      let err = 0, nrm = 0;
+      for (let i = 0; i < pair.length; i += 1) { const d = pair[i] - nativeLm[i]; err += d * d; nrm += pair[i] * pair[i]; }
+      console.log(`language pair against ${compareLm}: relRMS ${Math.sqrt(err / nrm).toExponential(3)}`
+        + ` (${pair.length} against ${nativeLm.length} values)`);
+    } }),
+    sequence, allocator, seed, sampler, samplerOverrides,
     ...(denoiserWeightElement === "" ? {} : { denoiserWeightPrecision: denoiserWeightElement }),
     entities: entitiesFor(),
     shape: { ...M, loops: recycles + 1 },
@@ -396,12 +432,12 @@ export async function main(device, args = []) {
       ? {} : { attentionPrecision: option(args, "attention-precision", "") }),
     tower: runTower,
     distogramLogits: contactSweep,
-    // ...measured and not drawn; see src/esmfold2/aligned-error.js.
+    // ...measured and not drawn; see shared/esmfold2/aligned-error.js.
     alignedError: true,
     lmMaskFraction: lmMask,
     languageModel: !noPlm,
     wantReusable: twice,
-    // ...the band the bar gives the tower is its bytes; see src/esmfold2/cost.js.
+    // ...the band the bar gives the tower is its bytes; see webgpu/esmfold2/cost.js.
     languageModelMiB: Object.values((await tower.manifest()).tensors)
       .reduce((sum, record) => sum + tensorByteLength(record), 0) / 1048576,
     onStatus: (label) => { progress.push(label); },
@@ -414,6 +450,8 @@ export async function main(device, args = []) {
       updates.set(phase, (updates.get(phase) ?? 0) + 1);
     },
   });
+  if (denoiseDump !== null) console.log("DENOISE_DUMP " + JSON.stringify(denoiseDump));
+  if (cmpZi !== "") console.log(`s_inputs against ${cmpZi}.s: relRMS ${relRms(result.sInputs, await fetchF32(cmpZi + ".s"))}`);
 
   if (buffers !== null) {
     const traffic = buffers.report();
@@ -439,7 +477,7 @@ export async function main(device, args = []) {
   let second;
   if (twice) {
     second = await foldEsmfold2(device, {
-      sequence, allocator, seed, sampler,
+      sequence, allocator, seed, sampler, samplerOverrides,
       ...(denoiserWeightElement === "" ? {} : { denoiserWeightPrecision: denoiserWeightElement }),
       entities: entitiesFor(),
       shape: { ...M, loops: recycles + 1 },
@@ -452,10 +490,13 @@ export async function main(device, args = []) {
   }
 
   const repeats = [];
+  // --profile times every labelled pass of the LAST repeat (a warm fold), one pass a dispatch.
+  const profile = args.includes("--profile") ? profileDevice(device) : null;
   for (let again = 1; again < repeat; again += 1) {
+    if (profile !== null && again === repeat - 1) profile.reset();
     const started = performance.now();
     const other = await foldEsmfold2(device, {
-      sequence, allocator, seed, sampler,
+      sequence, allocator, seed, sampler, samplerOverrides,
       ...(denoiserWeightElement === "" ? {} : { denoiserWeightPrecision: denoiserWeightElement }),
       entities: entitiesFor(),
       shape: { ...M, loops: recycles + 1 },
@@ -468,6 +509,11 @@ export async function main(device, args = []) {
         }),
       },
       weights: { featuriser, inputsEmbedder, trunkBlocks, denoiser, shim },
+      // 🔴 AND THE CONFIDENCE HEAD, WHICH THE PAGE RUNS ON EVERY FOLD. This
+      // literal named everything the first fold passes except this, so every
+      // "warm" figure it printed left out a stage that is ~1.3 s at 255 tokens -
+      // the allow-list trap, measured on the tool instead of the page.
+      confidenceWeights,
       tower: runTower,
       languageModel: !noPlm,
       lmMaskFraction: lmMask,
@@ -505,7 +551,7 @@ export async function main(device, args = []) {
   // 🔴 THE pAE, WHICH THIS CHECKPOINT HAS NO HEAD FOR. Reported as a summary
   // rather than a matrix - the matrix is tokens^2 and belongs in the archive -
   // and named for what it is: a predicted aligned error read off the distogram,
-  // fitted against AlphaFold 3's own. See src/esmfold2/aligned-error.js.
+  // fitted against AlphaFold 3's own. See shared/esmfold2/aligned-error.js.
   const pae = result.alignedError;
   let alignedError;
   if (pae !== undefined) {
@@ -987,6 +1033,8 @@ export async function main(device, args = []) {
         }),
       };
     })(),
+    ...(profile === null ? {} : { profile: { dropped: profile.dropped(),
+      rows: (await profile.report()).sort((x, y) => y.ms - x.ms).slice(0, 30) } }),
     sequence, sampler, seed, trunkPrecision, trunkWeights, repeats,
     contactSweep: sweep, certaintyByChain,
     lmMask: result.lmMask,

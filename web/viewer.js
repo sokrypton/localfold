@@ -46,8 +46,14 @@ export const VIEWER_CANVAS_HEIGHT = 420;
  * @param {(message: string) => void} [options.onFail] shown in place of the
  *   structure; defaults to writing the message into the container.
  */
-export function createStructureViewer({ container, canvasHeight = VIEWER_CANVAS_HEIGHT, onFail,
-                                        frameLabel = "recycle" }) {
+export function createStructureViewer(options) {
+  const { container, canvasHeight = VIEWER_CANVAS_HEIGHT, onFail, frameLabel = "recycle" } = options;
+  // 🔴 ASKED ONCE, HERE, BECAUSE THE REBUILD IS PER-FRAME. py2Dmol builds
+  // side-chain atoms at frame-load time, so wanting none is a property of the
+  // VIEWER and not something a page can settle after a frame lands - see the
+  // note on the showSidechains call in `push`. Defaults to true, which is what
+  // index.html's pages want.
+  const wantsSidechains = options.sidechains !== false;
   let renderer;
   let objectName;
   let frames = 0;
@@ -95,6 +101,86 @@ export function createStructureViewer({ container, canvasHeight = VIEWER_CANVAS_
       if (renderer === undefined) return;
       renderer.setColor("plddt");
       renderer.setSidechainColor("hydrophobicity");
+    },
+
+    /**
+     * The design page's own painting: cartoon only, coloured by role.
+     *
+     * 🔴 NO SIDECHAINS. `paint()` above colours them by hydrophobicity, which is
+     * the right answer for looking at ONE finished structure and the wrong one
+     * for watching a design move: every cycle redraws a different set of
+     * sidechains and the backbone - the thing that is actually being designed -
+     * disappears behind them.
+     *
+     * 🔴 AND NO pLDDT RAMP EITHER. It answers "how sure is the model", where
+     * this page's question is "what is being decided". Running both means
+     * whichever painted last silently wins.
+     *
+     * @param {Record<string, string>} roles chain id to colour
+     */
+    paintRoles(roles) {
+      if (renderer === undefined) return;
+      // Belt and braces for a viewer that WAS built wanting them and is being
+      // repainted by role; a viewer built with `sidechains: false` never made
+      // any and this is a no-op.
+      try {
+        renderer.hideSidechains?.();
+      } catch { /* a structure with none is already right */ }
+      this.colourChains(roles);
+    },
+
+    /**
+     * Colour whole chains, one colour each.
+     *
+     * 🔴 WHICH IS STILL NOT ABOUT THE PREDICTION, so it belongs here: a chain
+     * is a fact about the structure. What the colours MEAN - designed, held,
+     * part of the target - is the caller's, and the design page's roles are the
+     * first use.
+     *
+     * 🔴 AND IT OVERRIDES `paint()`, which sets a continuous pLDDT ramp. The two
+     * answer different questions - "how sure is the model" against "what is
+     * being decided" - and a page wanting the second must not also call the
+     * first, or whichever ran last silently wins.
+     *
+     * @param {Record<string, string>} colours chain id to CSS colour
+     * @param {string} [object] which object (see addObject); the one shown last by default
+     */
+    colourChains(colours, object) {
+      if (renderer === undefined) return;
+      for (const [chain, colour] of Object.entries(colours)) {
+        try {
+          renderer.setColor(colour, object === undefined ? { chain } : { chain, object });
+        } catch {
+          /* a chain the structure does not have is not an error worth stopping a hunt for */
+        }
+      }
+    },
+
+    /**
+     * Colour individual residues, over whatever `colourChains` has painted.
+     *
+     * 🔴 POSITIONS ARE GLOBAL AND ZERO-BASED - indices into the object's whole
+     * residue list, ligands included, not positions within the chain. That is
+     * py2Dmol's own convention (`positionsFor` ranges over `coords`), and the
+     * `chain` key INTERSECTS rather than re-bases, so passing a chain's own
+     * numbering here silently colours the wrong residues of the right chain.
+     *
+     * 🔴 AND IT MERGES RATHER THAN REPLACES: setColor keeps the advanced colour
+     * object it finds, so a chain colour set first stays underneath. Call this
+     * AFTER colourChains, never before.
+     *
+     * @param {number[]} positions
+     * @param {string} colour
+     * @param {string} [chain]
+     */
+    colourResidues(positions, colour, chain) {
+      if (renderer === undefined || positions.length === 0) return;
+      try {
+        renderer.setColor(colour, chain === undefined
+          ? { positions } : { chain, positions });
+      } catch {
+        /* a residue the structure does not have is not worth stopping a hunt for */
+      }
     },
 
     fail,
@@ -174,14 +260,78 @@ export function createStructureViewer({ container, canvasHeight = VIEWER_CANVAS_
         // check per frame. It throws on a structure carrying no side-chain
         // atoms at all, which a poly-glycine legitimately is, and that is not a
         // reason to lose the fold.
-        try { renderer.showSidechains(); } catch { /* backbone-only structure */ }
+        //
+        // 🔴 AND A PAGE THAT DOES NOT WANT THEM MUST BE ASKED HERE, NOT AFTER.
+        // This line is per-FRAME and `onPaint` below is first-frame only, so a
+        // page that hid them in onPaint had them put back by frame two and
+        // every frame after - which is exactly what the design page saw, with
+        // nothing throwing and the hide call itself working perfectly. Hiding
+        // them after showing them would also flash them once a cycle. Not
+        // asking for them is the only fix that is not a race with this line.
+        //
+        // 🔴 AND NOT WANTING THEM IS ALSO PER-FRAME, because py2Dmol builds them
+        // whether or not this page asks: `show` takes no option for it, and
+        // `renderer.sidechains` reads true after the first frame with the
+        // showSidechains call above removed entirely. So the opposite call has
+        // to run on the same cadence as the rebuild it is undoing - measured,
+        // not assumed, after a guard that skipped the show left them on.
+        try {
+          if (wantsSidechains) renderer.showSidechains();
+          else renderer.hideSidechains();
+        } catch { /* backbone-only structure: nothing to show or hide */ }
         frames += 1;
-        if (built) { this.paint(); onBuild?.(container); }
+        // 🔴 `onPaint` LETS A PAGE OWN ITS OWN LOOK. index.html's pages want the
+        // pLDDT ramp and hydrophobic sidechains; the design page wants a bare
+        // cartoon coloured by role, and calling paint() first then overriding it
+        // made every frame flash the ramp before settling.
+        if (built) { (options.onPaint ?? (() => this.paint()))(this); onBuild?.(container); }
         return { built, frames };
       } catch (error) {
         if (frames === 0) fail(error instanceof Error ? error.message : String(error));
         return { built: false, frames };
       }
+    },
+
+    /**
+     * Colour residues named by chain and residue NUMBER (the file's), in one object.
+     *
+     * 🔴 BY NUMBER, NOT POSITION, where the caller counted residues itself: py2Dmol does not keep
+     * a file's chain order, so a count made over the file lands on the wrong chain.
+     *
+     * @param {string} object
+     * @param {string} chain
+     * @param {number[]} residues
+     * @param {string} colour
+     */
+    colourNumbered(object, chain, residues, colour) {
+      if (renderer === undefined || residues.length === 0) return;
+      renderer.setColor(colour, { object, chain, residues });
+    },
+
+    /**
+     * A second structure in the same viewer, as its own object, for drawing over the first
+     * (showObjects). The viewer must already be built by `push`.
+     *
+     * 🔴 IT BECOMES THE OBJECT BEING EDITED (py2Dmol's addObject switches to it), so a colour meant
+     * for the first one is set before this or names it.
+     *
+     * @param {string} name
+     * @param {string} pdb
+     */
+    addObject(name, pdb) {
+      if (renderer === undefined) throw new Error("the viewer has no structure to add an object beside");
+      renderer.addObject(name);
+      renderer.addFrame(window.py2Dmol.frameFromText(pdb), name);
+      try {
+        if (wantsSidechains) renderer.showSidechains();
+        else renderer.hideSidechains();
+      } catch { /* backbone-only structure: nothing to show or hide */ }
+    },
+
+    /** Draw these objects together, overlaid; `null` goes back to one at a time. */
+    showObjects(names) {
+      if (renderer === undefined) return;
+      renderer.setShownObjects(names);
     },
 
     /**

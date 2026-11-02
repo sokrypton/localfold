@@ -1,0 +1,1694 @@
+/**
+ * AF3's batch for a single protein chain, built from a sequence in JavaScript.
+ *
+ *     const batch = featuriseProtein("GWSTELEK...");
+ *
+ * This is the piece that turns "the model runs on the GPU against a batch
+ * prepared elsewhere" into "the browser folds a sequence you type". AF3's own
+ * featuriser is a 515 MB chemical component dictionary and a tokeniser, and
+ * neither is going into a web page; what a protein chain actually reaches of
+ * that dictionary is 21 components, baked into reference-conformers.js.
+ *
+ * Every array here is checked element-for-element against AF3's own batch for
+ * 6MRR by tools/oracle/check_af3_featurise.js. Two are checked differently and
+ * the difference is the point:
+ *
+ * 🔴 ref_pos CANNOT MATCH AND DOES NOT NEED TO. AF3 samples a fresh conformer
+ * for every residue INSTANCE - fixed bond lengths and angles, random torsions -
+ * so the 13 internal glutamates in a 6MRR batch have 13 different side chains.
+ * A baked table gives them all the same one. Measured end to end, that moves
+ * the trunk's pair representation by relRMS 2.7e-2 and the folded structure by
+ * 0.01 A RMSD. The checker holds the bonded geometry to AF3 and lets the
+ * torsions go.
+ *
+ * 🔴 THE MSA IS THE QUERY ALONE. A de novo design has no homologues, and the
+ * dump this was built against ran num_msa=1. `msa`, `profile` and
+ * `deletionMatrix` are all one row of the query, which is what AF3 produces for
+ * a single-sequence input - not a stub. A real MSA changes only these three
+ * arrays; nothing else here depends on depth.
+ *
+ * 🔴 A COLON SEPARATES CHAINS, as it does everywhere else on the page. The
+ * chain identity comes from shared/input/chains.js - the same chainIdentity() and
+ * residueIndexPerChain() AlphaFold-multimer uses - because AF3 wants exactly
+ * what AF2-multimer wants and writing a second copy of it is how the two drift.
+ * The only difference is the base: AF2 counts asym, entity and sym from zero
+ * and AF3 from one. The relative encoding reads DIFFERENCES and EQUALITY, so
+ * the offset changes nothing the model sees; it is applied so this matches
+ * AF3's own batch element for element, which is what makes the checker strict.
+ *
+ * WHAT IS NOT HERE, deliberately: ligands, nucleic acids, covalent bonds
+ * between chains, and templates. Each is a token type this tokeniser does not
+ * create, and each would need its own CCD entries.
+ */
+import { conformerFor, aatypeFor, RESIDUE_TYPES } from "./reference-conformers.js";
+import { UNK_CCD_CONFORMER } from "./reference-conformers-unk.js";
+import { BOLTZ2_RAW_CONFORMERS } from "./boltz2-conformers.js";
+import { CHAI1_CONFORMERS } from "./chai1-conformers.js";
+import { uniformFrom } from "../random.js";
+import { declaredBondLeaving, declaredLigandLeavingAtoms, glycanO1Leaving } from "./declared-leaving.js";
+import { polymerResidue, parentLetter, parseCcdComponent, ELEMENT_SYMBOLS } from "./ccd-component.js";
+import { STANDARD_COMPONENTS } from "./standard-components.js";
+import { nucleicAatypeFor, nucleicConformerFor }
+  from "./reference-conformers-nucleic.js";
+import { chainIdentity, residueIndexPerChain } from "../../input/chains.js";
+
+const DENSE = 24;
+// AF3's residue_names.POLYMER_TYPES_WITH_UNKNOWN_AND_GAP: a token's restype, named
+const POLYMER_TYPE_NAMES = ["ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE", "LEU", "LYS", "MET", "PHE",
+  "PRO", "SER", "THR", "TRP", "TYR", "VAL", "UNK", "-", "A", "G", "C", "U", "DA", "DG", "DC", "DT", "N"];
+const QUERIES = 32;
+const KEYS = 128;
+/** AF3's restype alphabet is 31 wide: 20 amino acids, UNK, and the nucleic acids. */
+const RESTYPES = 31;
+/** Every ligand token carries UNK, whatever the atom is. */
+const UNK_AATYPE = 20;
+// AF3's unknown DNA nucleotide (DN), the class chai-1 reads for any atomised base (its DX/RX)
+const UNKNOWN_NUCLEOTIDE = 30;
+
+/**
+ * The four characters of an ATOMISED atom's name, as AF3 stores them - the code
+ * minus 32, zero-padded.
+ *
+ * 🔴 rosettafold3 RENAMES EVERY ATOMISED ATOM TO ITS ELEMENT SYMBOL, which is
+ * `atomized_element_names` in its convention set: a phosphoserine's "CA", "CB",
+ * "OG", "O1P" become "C", "C", "O", "O", and a glycerol's "C1" and "O1" become
+ * "C" and "O". Every other family keeps the component's own names. Measured
+ * against the reference's own batch for 6MRR + GOL + SEP@3: 15 characters over
+ * 12 atoms, and rf3 alone.
+ *
+ * A residue's own atoms are NOT touched by this - only atoms that have been
+ * atomised into one-atom tokens, which is what "atomized" names.
+ */
+function writeAtomName(target, flat, name, element, elementNames) {
+  const text = elementNames === true
+    ? (ELEMENT_SYMBOLS[element - 1] ?? "C") : name;
+  for (let character = 0; character < 4; character += 1) {
+    target[flat * 4 + character] =
+      character < text.length ? text.charCodeAt(character) - 32 : 0;
+  }
+}
+/** ...and a gap in the MSA, which sits between the amino acids and the nucleotides. */
+const MSA_GAP = 21;
+
+/**
+ * A gather in AF3's form: indices into a flattened source, and a mask marking
+ * which of them are real.
+ */
+function gather(count) {
+  return { indices: new Int32Array(count), mask: new Float32Array(count), count };
+}
+
+/**
+ * The six atom gathers, from a token layout and its compacted atom list.
+ *
+ * 🔴 EXTRACTED SO THE STRUCTURAL TOKENISER CAN REUSE IT RATHER THAN COPY IT.
+ * OpenDDE folds a REGROUPING of these same atoms (see structural-tokens.js), so
+ * it needs exactly this construction over a different (token, slot) layout -
+ * and a second copy of a windowing rule this delicate is how the two would
+ * drift. Everything here is a function of its arguments; nothing reads the
+ * enclosing featuriser.
+ *
+ * @param {{tokens: number, dense: number, realAtoms: ArrayLike<number>,
+ *          pseudoBetaSlot: ArrayLike<number>}} layout
+ */
+export function atomGathers({ tokens, dense, realAtoms, pseudoBetaSlot,
+                              paddedKeys = false, qblockKeys = false }) {
+  const atomCount = realAtoms.length;
+  // 🔴 SUBSETS COUNT THE REAL ATOMS, NOT THE PADDED GRID. The query layout is
+  // the compacted list of real atoms, so a subset past `atomCount / 32` holds
+  // 32 masked queries, gathers nothing, scatters nowhere and computes a full
+  // 32 x `keys` attention over padding. Sizing it from `tokens * dense` made
+  // that the common case: 51 subsets for 574 atoms on a 68-residue chain where
+  // 18 carry an atom, and OpenDDE's structural layout - the same atoms in
+  // twice the tokens - took 98. The atom encoder and decoder run once per
+  // diffusion step and every buffer they hold is `subsets * queries * keys`
+  // wide, so the padding was the majority of both.
+  const subsets = Math.max(1, Math.ceil(atomCount / QUERIES));
+  // token_atoms_to_queries: query slot -> flat token-atom, the compacted list.
+  const tokenAtomsToQueries = gather(subsets * QUERIES);
+  for (let query = 0; query < atomCount; query += 1) {
+    tokenAtomsToQueries.indices[query] = realAtoms[query];
+    tokenAtomsToQueries.mask[query] = 1;
+  }
+
+  // queries_to_token_atoms: its inverse, laid out over the dense (token, slot)
+  // grid, masked exactly where an atom is real.
+  const queriesToTokenAtoms = gather(tokens * dense);
+  for (let query = 0; query < atomCount; query += 1) {
+    queriesToTokenAtoms.indices[realAtoms[query]] = query;
+    queriesToTokenAtoms.mask[realAtoms[query]] = 1;
+  }
+
+  // queries_to_keys: a contiguous window per subset of 32 queries, centred on
+  // it and SHIFTED IN-BOUNDS at the ends rather than truncated - every subset
+  // sees exactly `keys` of them.
+  //
+  // 🔴 THE WINDOW IS CLAMPED AGAINST THE REAL ATOM COUNT, NOT subsets * 32.
+  // The query layout is padded out to the dense grid (51 subsets for 574
+  // atoms here), so clamping against the padded length would slide the last
+  // windows off the end of the molecule and into masked slots.
+  //
+  // 🔴 AND THE WINDOW NEVER EXCEEDS THE MOLECULE, so there is no such thing as
+  // a padded KEY. AlphaFold 3 pads because JAX wants static shapes; nothing
+  // here does - the kernels are generated per shape and size their workgroup
+  // storage from `keys`. Above 128 atoms the clamp already guaranteed this and
+  // measured it: `tools/gpu/probe-ablate.js` reports zero padded keys at 143
+  // atoms and above. BELOW 128 the window could not fit, and 288 of a
+  // 4-residue chain's 384 key slots were padding, each gathering reference
+  // space ZERO - which collides with the first conformer's own uid and makes
+  // every one of them a valid neighbour of residue 0. That is the released
+  // AF3 bug OpenFold3 trained around, and it cannot occur here at any size
+  // now, so `maskPaddedKeys` has nothing left to switch off.
+  const keys = Math.min(KEYS, atomCount);
+  const queriesToKeys = gather(subsets * keys);
+  const tokensToQueries = gather(subsets * QUERIES);
+  const tokensToKeys = gather(subsets * keys);
+  const tokenOfQuery = new Int32Array(atomCount);
+  for (let query = 0; query < atomCount; query += 1) {
+    tokenOfQuery[query] = (realAtoms[query] / dense) | 0;
+  }
+  // 🔴 AND THREE FAMILIES DO NOT SLIDE IT AT ALL: THEY CLAMP AND MASK. rf3,
+  // opendde and protenix centre the window on `subset * 32 + 16` and take a
+  // FIXED offset range around it - `clamp(index, 0, L - 1)` on the gather so
+  // the read is in bounds, and `-1e9 * (maskQ | maskK)` on the attention so the
+  // out-of-range slots contribute NOTHING. The end subsets therefore see FEWER
+  // real keys, where sliding gives them a full window of real ones.
+  //
+  // It is an END EFFECT and it is not small: af3-any-model measured its own
+  // version of this fix at 6MRR 0.767 -> 0.737 on opendde, and here the atom
+  // encoder's skip connection reads relRMS 1.17e+0 against the oracle with our
+  // rms 43.5 where native's is 30.5 - too BIG, which is what a window that sees
+  // 128 real keys instead of 80 does. Upstream missed it on rf3 for a reason
+  // worth keeping: rf3 was already in KEY_MASKED_ATOM_ATTENTION, and that list
+  // is about the MASK, not about where the window SITS.
+  // 🔴 AND IntelliFold-2 SLIDES AGAINST A PADDED EDGE, which is a THIRD rule.
+  // It reshapes the flat atom axis into windows and pads to a whole query block
+  // first, so its last window starts at `ceil(atoms / 32) * 32 - keys`: 448 on
+  // 6MRR where the plain slide gives 446. Its last two subsets therefore take
+  // keys 448..575 and reach past the last real atom, which the mask handles.
+  const edge = qblockKeys ? Math.ceil(atomCount / QUERIES) * QUERIES : atomCount;
+  // 🔴 AND ITS WINDOW IS THE FULL 128 KEYS WHEREVER IT SITS: the reference clamps a block's start to
+  // `max(edge - 128, 0)`, so below 128 atoms every block starts at 0 and sees every atom. Shifting by the shrunken
+  // window here (keys = the atom count) started the last block at `edge - atoms` - 3 at 93 atoms, dropping atoms 0..2
+  // from its keys - and an odd count made that shift fractional, which the two featurisers truncated differently.
+  const lastStart = Math.max(0, edge - (qblockKeys ? KEYS : keys));
+  for (let subset = 0; subset < subsets; subset += 1) {
+    const start = paddedKeys
+      ? subset * QUERIES + (QUERIES >> 1) - (keys >> 1)
+      : Math.min(Math.max(subset * QUERIES - (keys - QUERIES) / 2, 0), lastStart);
+    for (let key = 0; key < keys; key += 1) {
+      const query = start + key;
+      const at = subset * keys + key;
+      // ...clamped so the GATHER is in bounds and left MASKED so it counts for
+      // nothing. `continue` is the same thing for a slot whose index and mask
+      // both start at zero, and index 0 is a real atom - so the clamp is what
+      // the reference writes and the mask is what makes either safe.
+      if (query < 0 || query >= atomCount) continue;
+      queriesToKeys.indices[at] = query;
+      queriesToKeys.mask[at] = 1;
+      tokensToKeys.indices[at] = tokenOfQuery[query];
+      tokensToKeys.mask[at] = 1;
+    }
+    for (let slot = 0; slot < QUERIES; slot += 1) {
+      const query = subset * QUERIES + slot;
+      if (query >= atomCount) continue;
+      const at = subset * QUERIES + slot;
+      tokensToQueries.indices[at] = tokenOfQuery[query];
+      tokensToQueries.mask[at] = 1;
+    }
+  }
+
+  const tokenAtomsToPseudoBeta = gather(tokens);
+  for (let token = 0; token < tokens; token += 1) {
+    tokenAtomsToPseudoBeta.indices[token] = token * dense + pseudoBetaSlot[token];
+    tokenAtomsToPseudoBeta.mask[token] = pseudoBetaSlot[token] >= 0 ? 1 : 0;
+  }
+
+  return { subsets, keys, atomCount, tokenAtomsToQueries, queriesToTokenAtoms,
+           queriesToKeys, tokensToQueries, tokensToKeys, tokenAtomsToPseudoBeta };
+}
+
+/**
+ * @param {string} sequence one-letter codes; anything unrecognised becomes UNK
+ * @param {{msa?: number[][], deletionMatrix?: number[][], unpairedFrom?: number}}
+ *   [options] extra MSA rows, each already tokenised to AF3 aatypes and the
+ *   same length as the
+ *   sequence. The query is always row zero and is prepended here.
+ */
+// A standard residue's CCD code from its chain's letter, or null (rf3's atomizeLigandBonded)
+const PROTEIN_THREE = { A: "ALA", R: "ARG", N: "ASN", D: "ASP", C: "CYS", Q: "GLN", E: "GLU", G: "GLY", H: "HIS",
+  I: "ILE", L: "LEU", K: "LYS", M: "MET", F: "PHE", P: "PRO", S: "SER", T: "THR", W: "TRP", Y: "TYR", V: "VAL" };
+function standardCode(kind, letter) {
+  if (kind === "protein") return PROTEIN_THREE[letter] ?? null;
+  if (kind === "dna") return "ACGT".includes(letter) ? `D${letter}` : null;
+  if (kind === "rna") return "ACGU".includes(letter) ? letter : null;
+  return null;
+}
+
+// IntelliFold's restype for a modified residue (modifiedProteinLetter): its CCD one-letter code in AF3's amino-acid
+// order, else the unknown amino acid
+const PROTEIN_LETTERS = "ARNDCQEGHILKMFPSTWYV";
+function proteinLetterAatype(letter) {
+  const at = letter === null || letter === undefined || letter.length !== 1 ? -1 : PROTEIN_LETTERS.indexOf(letter);
+  return at >= 0 ? at : 20;
+}
+
+export function featuriseProtein(sequence, options = {}) {
+  const chains = sequence.split(":").filter((chain) => chain.length > 0);
+  const joined = chains.join("");
+  // How many RESIDUES the polymers hold. It used to be the token count too,
+  // and stopped being when a modified residue became several tokens.
+  const residueCount = joined.length;
+  // 🔴 A LIGAND IS ONE TOKEN PER HEAVY ATOM, not one token. Sixty-eight
+  // residues plus glycerol is seventy-four tokens, plus heme is a hundred and
+  // eleven - checked against AF3's own batch. Every array below is sized from
+  // this total, and a ligand counted as a single token produces a batch whose
+  // shapes all agree with each other and with nothing else.
+  // (protenix and OpenDDE: the leaving group at each declared bond goes before tokenising - declared-leaving.js)
+  const leaving = options.declaredBondLeavingAtoms === true
+    ? declaredBondLeaving(chains, chains.map((_, k) => options.chainKinds?.[k] ?? "protein"), options.modifications,
+      options.ligands ?? [], options.bonds)
+    : null;
+  // (and AF3's own rule after it: a glycan residue's O1 goes unless it is bonded - glycanO1Leaving)
+  const ligands = options.keepLigandLeavingAtoms === true ? leaving?.ligands ?? options.ligands ?? []
+    : glycanO1Leaving(chains.length, leaving?.ligands ?? options.ligands ?? [], options.bonds);
+  const ligandTokens = ligands.reduce((sum, ligand) => sum + ligand.atoms.length, 0);
+
+  // 🔴 A MODIFIED RESIDUE IS ONE TOKEN PER HEAVY ATOM, LIKE A LIGAND, BUT IT
+  // LIVES IN THE CHAIN. Measured against AF3: a ten-residue chain with a
+  // phosphoserine at position 3 is NINETEEN tokens, the ten belonging to SEP
+  // each carrying one atom, all of them holding the PARENT residue's aatype
+  // (serine), all sharing that residue's index, and all keeping the chain's
+  // asym, entity and sym. Only MSE is different - AF3 folds selenomethionine
+  // into methionine's alphabet slot and leaves it as one token - which is why
+  // `component` being null is the standard path and not an exception.
+  //
+  // So a chain's tokens are no longer one per letter, and everything below that
+  // used to index the sequence by token now indexes the RESIDUE list instead.
+  // 🔴 A CHAIN'S KIND DECIDES WHAT ITS LETTERS MEAN. `A` is alanine in a protein
+  // chain and adenine in a nucleic one, and the two take different aatypes,
+  // different conformers and a different terminal rule - so a kind is carried
+  // per chain rather than inferred from the letters, which cannot distinguish
+  // them. Absent, every chain is protein, which is what every caller before
+  // nucleic acids meant.
+  const chainKinds = chains.map((_, index) => options.chainKinds?.[index] ?? "protein");
+  // A modified residue's PARENT restype, through the alphabet of its chain's kind: a modified base
+  // (5CM on a DNA C) is a DC, which the amino-acid table would read as a cysteine
+  const parentAatype = (kind, code) => (kind === "protein"
+    ? aatypeFor(code) : (nucleicAatypeFor(kind, code) ?? UNK_AATYPE));
+  const modificationOf = new Map();
+  for (const modification of options.modifications ?? []) {
+    modificationOf.set(`${modification.chain}:${modification.position}`, modification);
+  }
+  // 🔴 rf3 ATOMISES A STANDARD RESIDUE A DECLARED BOND TIES TO A LIGAND (`atomizeLigandBonded`, atomworks'
+  // covalent_modifications, af3-any-model's atomize_ligand_bonded): a glycosylated Asn, a cysteine under a covalent
+  // inhibitor, one token per heavy atom from its CCD entry (standard-components.js) - and it keeps its OWN restype,
+  // in aatype and in the alignment, where an atomised modified residue reads unknown.
+  const ligandBonded = [];
+  if (options.atomizeLigandBonded === true) {
+    for (const bond of options.bonds ?? []) {
+      const [poly, ligand] = bond.from.asym < chains.length ? [bond.from, bond.to] : [bond.to, bond.from];
+      if (!(poly.asym < chains.length) || !(ligand.asym >= chains.length)) continue;
+      ligandBonded.push({ chain: poly.asym, position: poly.residue, ligand: ligand.asym });
+      const key = `${poly.asym}:${poly.residue}`;
+      if (modificationOf.has(key)) continue;
+      const code = standardCode(chainKinds[poly.asym], chains[poly.asym][poly.residue - 1]);
+      if (code === null) continue;
+      modificationOf.set(key, { chain: poly.asym, position: poly.residue,
+                                ...parseCcdComponent(STANDARD_COMPONENTS[code]), standard: true });
+    }
+  }
+  // Which chain each residue came from, so a reader can ask what its letters
+  // mean without re-deriving the split.
+  const chainOfResidue = [];
+  const residues = [];
+  chains.forEach((chain, chainIndex) => {
+    for (let at = 0; at < chain.length; at += 1) {
+      const asked = modificationOf.get(`${chainIndex}:${at + 1}`) ?? null;
+      // 🔴 RESOLVED AGAINST THE END OF THE CHAIN HERE, ONCE. The dictionary
+      // describes a free amino acid, so a modified residue arrives carrying the
+      // OXT it loses on forming a peptide bond: ten atoms in the middle of a
+      // chain and eleven at the C-terminus, which is what AF3 counts. See
+      // polymerResidue.
+      // (a nucleotide's terminal atom is the 5' OP3, at the chain's first residue)
+      const protein = chainKinds[chainIndex] === "protein";
+      const dropsTerminal = leaving?.terminalDropped.has(`${chainIndex}:${at}`) === true;
+      // (boltz2's one-token residue keeps no terminal atom either: genuine Boltz-2 drops every leaving atom of a modified
+      // residue, so a 5' 2-methylguanosine is 24 atoms and fits its token, where keeping the OP3 cost the base's C4)
+      // (OpenBind-0, `modifiedLeavingAtEnds`: of3 drops a non-standard residue's CCD leaving atoms wherever it sits,
+      // ends included - a 5' 2-methylguanosine loses its OP3 - and a component flagging none loses OXT, or OP3/O3P)
+      const atEnds = options.modifiedLeavingAtEnds === true;
+      let source = asked === null || !atEnds || asked.atoms.some((atom) => atom.leaving) ? asked
+        : { ...asked, atoms: asked.atoms.map((atom) => ({ ...atom,
+          leaving: protein ? atom.name === "OXT" : atom.name === "OP3" || atom.name === "O3P" })) };
+      // (IntelliFold-2 and chai-1, `modifiedNucleotideKeepsOp3`: a modified nucleotide keeps its OP3 mid-chain -
+      // IntelliFold's parse_ccd_residue keeps every CCD heavy atom but OXT, chai-lab keeps a non-standard base's OP3)
+      if (source !== null && !protein && options.modifiedNucleotideKeepsOp3 === true) {
+        source = { ...source, atoms: source.atoms.map((atom) => (atom.name === "OP3" ? { ...atom, leaving: false } : atom)) };
+      }
+      // (ESMFold2, `modifiedTerminalLast`: esm's prepare_input keeps a modified residue's leaving atoms only where it ENDS
+      // the chain, a nucleotide's too - a 5' 2-methylguanosine loses its OP3)
+      const endsHere = options.modifiedTerminalLast === true ? at === chain.length - 1
+        : protein ? at === chain.length - 1 : at === 0;
+      const modification = asked === null ? null
+        : polymerResidue(source, endsHere && !dropsTerminal
+          && options.modifiedAsOneToken !== true && !atEnds, protein ? "OXT" : "OP3");
+      if (modification !== null && asked.standard === true) modification.standard = true;
+      residues.push({
+        // a modified residue's letter is its dictionary parent's (see parseCcdComponent)
+        code: (modification !== null && parentLetter(modification.parent, chainKinds[chainIndex])) || chain[at],
+        kind: chainKinds[chainIndex],
+        // 🔴 THE TERMINAL RULE IS AT THE OTHER END FOR A NUCLEOTIDE. A protein
+        // residue takes its extra atom (OXT) at the chain's LAST residue; a
+        // nucleotide takes its extra atom (OP3) at the FIRST.
+        //
+        // 🔴 AND NOT EVERY MODEL HAS ONE. ESMFold2's featuriser uses the
+        // internal atom set at both ends of every chain - its DNA_HEAVY_ATOMS
+        // list has no OP3 and its dumps carry no OXT - so `terminalAtoms:
+        // false` is what a caller building for it passes. It is off only when
+        // asked, because every AF3-shaped caller means the AF3 rule.
+        // 🔴 AND CHAI-1 DROPS ONLY THE PROTEIN'S: its reference masks the C-terminal OXT and keeps the 5' OP3
+        // (`drop_atoms=('OXT',)`), so `terminalAtoms: "nucleic"` keeps a nucleotide's and no other.
+        terminal: options.terminalAtoms === false || (options.terminalAtoms === "nucleic" && protein) || dropsTerminal ? false
+          : (chainKinds[chainIndex] === "protein"
+            ? at === chain.length - 1
+            : at === 0),
+        modification,
+        // 🔴 boltz2 KEEPS A MODIFIED RESIDUE IN ONE TOKEN. Every other family
+        // atomises it - one token per atom - and giving boltz2 the atomised
+        // form tears the residue apart: SEP's own bonds at ratio 1.813 where
+        // the others are 0.73-1.16. See `modifiedAsOneToken` in dialect.js.
+        tokens: modification === null || options.modifiedAsOneToken === true
+          ? 1 : modification.atoms.length,
+      });
+      chainOfResidue.push(chainIndex);
+    }
+  });
+  // 🔴 AN ALIGNMENT COLUMN IS NOT A TOKEN INDEX, AND USED TO BE ASSUMED TO BE
+  // ONE. An A3M has one column per RESIDUE of the PROTEIN chains, and a batch
+  // has one token per residue only in the simplest case: a modified residue is
+  // several tokens, a ligand is several more, and a nucleic chain has no
+  // columns in a protein alignment at all. Copying a row in flat - which is
+  // what `msa.set(row, ...)` did - lines the alignment up with the tokens for
+  // as long as those agree and shifts it silently from the first modified
+  // residue onward, laying one residue's homologs over another's.
+  //
+  // Measured against AF3, twice, because the two cases differ:
+  //   - a modified residue's tokens ALL REPEAT the parent residue's column
+  //     (SEP at position 3 gives ten tokens, every one of them reading the
+  //     alignment's third column - 15 in every row, the gapped one included)
+  //   - a nucleic token takes MSA_GAP in a protein row, and its own aatype in
+  //     the query row.
+  const msaColumnOfResidue = new Int32Array(residueCount).fill(-1);
+  {
+    // Only the protein chains are in the alignment, in chain order, which is
+    // the order its columns are in - unless the caller's alignment spans the
+    // nucleic chains as well (`msaCoversNucleic`: a job's own RNA alignment),
+    // when every polymer residue has its column.
+    let column = 0;
+    for (let residue = 0; residue < residueCount; residue += 1) {
+      if (residues[residue].kind !== "protein" && options.msaCoversNucleic !== true) continue;
+      msaColumnOfResidue[residue] = column;
+      column += 1;
+    }
+  }
+  const polymerTokens = residues.reduce((sum, residue) => sum + residue.tokens, 0);
+  const tokens = polymerTokens + ligandTokens;
+  if (tokens === 0) throw new Error("featuriseProtein: empty sequence");
+  const chainLengths = chains.map((chain) => chain.length);
+  // 🔴 NOT COMPUTED WHEN THERE ARE NO RESIDUES. A ligand on its own is a valid
+  // fold - AF3 accepts one - and both of these reject a zero-length sequence,
+  // rightly, because a zero-length CHAIN is a bug. There is no chain here to be
+  // wrong about: they are read only inside the polymer loop below, which does
+  // not run.
+  // ...over RESIDUES, not tokens: chain identity is a property of the residue,
+  // and every token of a modified one repeats it.
+  const identity = residueCount === 0
+    ? null : chainIdentity(residueCount, chainLengths, chains);
+  const withinChain = residueCount === 0
+    ? null : residueIndexPerChain(residueCount, chainLengths);
+  // 🔴 THE LAST RESIDUE OF EVERY CHAIN TAKES AN OXT, not the last token of the
+  // batch. Checked against AF3's own complex: a three-chain A/A/B dump carries
+  // it on tokens 20, 41 and 62. Getting this wrong is one missing oxygen and
+  // one spurious one per extra chain, both of which land in a token's pooled
+  // atom representation and in the atom-pair window around it.
+  const lastOfChain = new Set();
+  let edge = -1;
+  for (const length of chainLengths) { edge += length; lastOfChain.add(edge); }
+
+  const aatype = new Int32Array(tokens);
+  const refPos = new Float32Array(tokens * DENSE * 3);
+  const refMask = new Float32Array(tokens * DENSE);
+  const refElement = new Int32Array(tokens * DENSE);
+  const refCharge = new Float32Array(tokens * DENSE);
+  const refAtomNameChars = new Int32Array(tokens * DENSE * 4);
+  const refSpaceUid = new Int32Array(tokens * DENSE);
+  const residueIndex = new Int32Array(tokens);
+  const tokenIndex = new Int32Array(tokens);
+  const asymId = new Int32Array(tokens);
+  const entityId = new Int32Array(tokens);
+  const symId = new Int32Array(tokens);
+  const seqMask = new Float32Array(tokens);
+
+  // The flat index of every real atom, in token-then-slot order. AF3's query
+  // layout is this list compacted, so it is built once and read four times.
+  const realAtoms = [];
+  const pseudoBetaSlot = new Int32Array(tokens).fill(-1);
+
+  // Where each modified residue's tokens sit, so a writer can name its atoms:
+  // the batch's `sequence` covers one letter per residue and a modified
+  // residue's tokens index into it as one letter for all of them.
+  const modifiedSpans = [];
+  // 🔴 WHICH RESIDUE A TOKEN BELONGS TO, WHICH USED TO BE THE TOKEN'S OWN INDEX.
+  // Anything that reads `sequence[token]` - a PDB writer naming an atom, a
+  // checker looking up a conformer - is wrong from the first modified residue
+  // onwards without this, and wrong in a way that still finds A residue and so
+  // reports a plausible disagreement rather than an error. -1 for a ligand,
+  // which is not a residue at all.
+  const residueOfToken = new Int32Array(tokens).fill(-1);
+  let token = 0;
+  // 🔴 ONE REFERENCE SPACE PER RESIDUE, COUNTED SEPARATELY FROM THE TOKENS.
+  // They used to be the same number because a residue was a token; a modified
+  // residue makes them diverge, and AF3 keeps counting SPACES - a chain with a
+  // phosphoserine at position 3 gives the residue after it uid 3, not uid 12.
+  // The uid decides only whether a PAIR of atoms may compare reference
+  // coordinates, so a wrong one silently lets the atom encoder compare two
+  // residues that were oriented independently.
+  let space = 0;
+  for (let residue = 0; residue < residueCount; residue += 1) {
+    const { code, kind, terminal, modification } = residues[residue];
+    // 🔴 lastOfChain IS THE PROTEIN RULE AND ONLY THE PROTEIN RULE. `terminal`
+    // above already knows which end this residue's kind cares about; keeping
+    // the old set here would put an OXT on a nucleotide's last base.
+    const isCTerminal = terminal;
+    void lastOfChain;
+    const asym = identity.asymId[residue] + 1;
+    const entity = identity.entityId[residue] + 1;
+    const sym = identity.symId[residue] + 1;
+    // AF3 counts these from one; chains.js counts from zero. See the note above.
+    const number = withinChain[residue] + 1;
+
+    if (modification === null) {
+      // 🔴 THE KIND PICKS THE ALPHABET, NOT THE LETTER. A in a protein chain is
+      // aatype 0 and in an RNA chain 22; there is no way to tell from the
+      // letter, and getting it wrong folds a different molecule that looks
+      // entirely reasonable.
+      aatype[token] = kind === "protein"
+        ? aatypeFor(code) : (nucleicAatypeFor(kind, code) ?? UNK_AATYPE);
+      residueIndex[token] = number;
+      tokenIndex[token] = token + 1;
+      asymId[token] = asym;
+      entityId[token] = entity;
+      symId[token] = sym;
+      seqMask[token] = 1;
+      residueOfToken[token] = residue;
+
+      const atoms = kind === "protein"
+        // (an unknown amino acid as the CCD's UNK where the dialect says - openbind0)
+        ? (options.ccdUnknownResidue === true && (code === "X" || !RESIDUE_TYPES.includes(code))
+          ? (isCTerminal ? UNK_CCD_CONFORMER.cTerminal : UNK_CCD_CONFORMER.internal)
+          : conformerFor(code, isCTerminal))
+        : (nucleicConformerFor(kind, code, isCTerminal) ?? conformerFor("X", false));
+      for (const [slot, name, element, charge, x, y, z] of atoms) {
+        const flat = token * DENSE + slot;
+        refMask[flat] = 1;
+        refElement[flat] = element;
+        refCharge[flat] = charge;
+        refPos[flat * 3] = x;
+        refPos[flat * 3 + 1] = y;
+        refPos[flat * 3 + 2] = z;
+        // AF3 stores an atom name as four characters offset by 32, zero-padded.
+        for (let character = 0; character < 4; character += 1) {
+          refAtomNameChars[flat * 4 + character] =
+            character < name.length ? name.charCodeAt(character) - 32 : 0;
+        }
+        realAtoms.push(flat);
+      }
+      // 🔴 CB, FALLING BACK TO CA. Glycine has no CB, and taking its slot anyway
+      // would read a masked slot sitting at the origin - the pseudo-beta feeds
+      // the confidence head's distance bins, so every glycine would come out
+      // tens of angstroms from everything.
+      // 🔴 A NUCLEOTIDE HAS NEITHER CB NOR CA, AND ITS CENTRE IS IN THE BASE.
+      // Read out of AF3's own gather rather than guessed: C4 for a purine and
+      // C2 for a pyrimidine - ring atoms, not the primed sugar carbons, and not
+      // the C1' the sugar hangs the base off, which was the plausible wrong
+      // answer. The distinction is by base, since both names exist in both:
+      // a pyrimidine has a C4 as well, so matching on the name alone would take
+      // the wrong atom in three of the five components.
+      const purine = code === "A" || code === "G";
+      const beta = kind === "protein"
+        ? (atoms.find((atom) => atom[1] === "CB") ?? atoms.find((atom) => atom[1] === "CA"))
+        : atoms.find((atom) => atom[1] === (purine ? "C4" : "C2"));
+      // (and with none of those - the unknown nucleotide has no base - AF3's first held atom: "does not contain a
+      // pseudo-beta atom. Using first valid atom", OP3 at a 5' end and P elsewhere. A family that drops the 5' OP3
+      // masks it AFTER that choice, so its 5' unknown nucleotide's gather stays masked - as its reference's does)
+      if (beta) pseudoBetaSlot[token] = beta[0];
+      else if (atoms.length > 0 && !(kind !== "protein" && number === 1 && options.terminalAtoms === false)) {
+        pseudoBetaSlot[token] = atoms[0][0];
+      }
+      // 🔴 ONE REFERENCE SPACE PER TOKEN. Every atom of a residue shares its uid,
+      // and the atom encoder uses the uid only to decide whether a PAIR of atoms
+      // may compare reference coordinates at all - which is what makes the random
+      // per-residue orientation harmless.
+      for (let slot = 0; slot < DENSE; slot += 1) refSpaceUid[token * DENSE + slot] = space;
+      space += 1;
+      token += 1;
+      continue;
+    }
+
+    // 🔴 A MODIFIED RESIDUE, ONE TOKEN PER ATOM, AND ITS REFERENCE SPACE IS
+    // SHARED. Ten tokens carrying one atom each are still ONE rigid conformer,
+    // so they take a single uid between them - exactly the reasoning the
+    // ligand loop below spells out. Giving each its own would tell the atom
+    // encoder that the phosphate may not be compared with the backbone.
+    const uid = space;
+    space += 1;
+    // 🔴 boltz2's SINGLE TOKEN, WHICH IS A DIFFERENT SHAPE AND NOT A SPECIAL
+    // CASE OF THE LOOP BELOW: all of the residue's atoms go into ONE token's
+    // dense slots, where the atomised form puts each in slot zero of its own
+    // token. The restype is the UNKNOWN one (`atomizedUnknownRestype`, already
+    // true for boltz2) and `modifiedSpans` still describes the residue so a
+    // writer names it - it is one token wide now rather than ten.
+    if (options.modifiedAsOneToken === true) {
+      modifiedSpans.push({ from: token, count: 1, code: modification.code,
+                           residue, atoms: modification.atoms,
+                           bonds: modification.bonds, oneToken: true });
+      // 🔴 GENUINE Boltz-2's RESTYPE FOR A ONE-TOKEN MODIFIED RESIDUE IS ITS CHAIN'S UNKNOWN (tokenize/boltz2.py
+      // `get_unk_token(chain)`): the protein unknown, and an RNA chain's N - AF3's class 30, Boltz's 27 through the
+      // converter. Giving a modified RNA base the PROTEIN unknown, as af3-any-model's boltz2 does, stretched
+      // 2'-O-methylguanosine's O2'-CM2 to 2.4-2.7 A where genuine Boltz-2 holds 1.55-1.71 (this: 1.66-1.77). A DNA
+      // chain's DN reads 30 too, and boltz2's DN row (Boltz's DNA unknown, kept by af3-any-model's converter since
+      // 2026-10-18) is added on a DNA token there - methylated DNA folds 0.50-0.78 A from genuine Boltz-2 that way,
+      // 0.65-0.92 without the row.
+      aatype[token] = options.atomizedUnknownRestype === true || options.atomizedUnknownRestype === "nucleic"
+        || options.atomizedUnknownRestype === "chai" ? (kind !== "protein" ? UNKNOWN_NUCLEOTIDE : UNK_AATYPE)
+        : parentAatype(kind, code);
+      residueIndex[token] = number;
+      tokenIndex[token] = token + 1;
+      asymId[token] = asym;
+      entityId[token] = entity;
+      symId[token] = sym;
+      seqMask[token] = 1;
+      residueOfToken[token] = residue;
+      // 🔴 ...UNLESS ITS SLOTS RUN PAST THE TOKEN'S: then its atoms are packed, so every one is kept, as genuine
+      // Boltz-2 keeps every atom of a modified residue (it has no 24-slot layout). 2'-O-methylguanosine's holes put its
+      // C4 at slot 24, and dropping it - af3-any-model's boltz2 does - lost the purine's pseudo-beta atom and three bonds
+      // and stretched O2'-CM2 to 2.66 A (genuine Boltz-2 2.2.1: 1.61). af3-any-model packs it the same way since 2026-10-18.
+      // 🔴 AND NO HOLES: genuine Boltz-2 lists a residue's kept atoms in order (it has no slot table), so a removed
+      // leaving atom leaves no gap - a mid-chain phosphoserine is N,CA,CB,OG,C,O,P,O1P,O2P,O3P (af3-any-model colab,
+      // e2a2246, measured against stock Boltz 2.2.1; this held the component slot, OXT's empty, until 2026-10-20).
+      const slotOf = (one, at) => at;
+      for (let atom = 0; atom < modification.atoms.length; atom += 1) {
+        const source = modification.atoms[atom];
+        // 🔴 THE COMPONENT'S OWN SLOT, NOT A COMPACTED ONE. A removed leaving
+        // atom leaves its dense slot EMPTY - a mid-chain phosphoserine is
+        // N,CA,CB,OG,C,O,_,P,O1P,O2P,O3P with a hole at 6 where the OXT was -
+        // and compacting shifts the phosphate and its three oxygens down one.
+        // (and a component of more heavy atoms than the token has slots, packed, still loses the rest - said, not hidden:
+        // slot 24 is the NEXT token's slot 0)
+        const slotHere = slotOf(source, atom);
+        if (slotHere >= DENSE) {
+          console.warn(`${modification.code}: atom ${source.name} is past the token's ${DENSE} slots and is dropped`);
+          continue;
+        }
+        const flat = token * DENSE + slotHere;
+        refMask[flat] = 1;
+        refElement[flat] = source.element;
+        refCharge[flat] = source.charge;
+        refPos[flat * 3] = source.x;
+        refPos[flat * 3 + 1] = source.y;
+        refPos[flat * 3 + 2] = source.z;
+        writeAtomName(refAtomNameChars, flat, source.name, source.element,
+                      options.atomizedElementNames);
+        realAtoms.push(flat);
+      }
+      // 🔴 THE REPRESENTATIVE ATOM IS THE RESIDUE'S FIRST, AS GENUINE Boltz-2's: parse_ccd_residue gives a modified
+      // residue `atom_center=0, atom_disto=0`, so its centre and its distogram atom are the first atom it keeps (a
+      // phosphoserine's N). This took CB (a base's C4 / C2) for a while, held to af3-any-model's boltz2 batch, which did
+      // until 2026-10-18 and takes the first atom now.
+      let firstHeld = 0;
+      while (firstHeld < DENSE - 1 && !refMask[token * DENSE + firstHeld]) firstHeld += 1;
+      pseudoBetaSlot[token] = firstHeld;
+      for (let slot = 0; slot < DENSE; slot += 1) refSpaceUid[token * DENSE + slot] = uid;
+      token += 1;
+      continue;
+    }
+    modifiedSpans.push({ from: token, count: modification.atoms.length,
+                         code: modification.code, residue,
+                         atoms: modification.atoms, bonds: modification.bonds,
+                         ...(modification.standard === true ? { standard: true } : {}) });
+    for (let atom = 0; atom < modification.atoms.length; atom += 1) {
+      const source = modification.atoms[atom];
+      // ...the PARENT's aatype, on every one of them. AF3 writes serine for all
+      // ten tokens of a phosphoserine, in `aatype` and in the MSA alike.
+      //
+      // 🔴 EXCEPT boltz2 AND rosettafold3, which write the UNKNOWN restype
+      // instead - `atomized_unknown_restype`. An atomised token is not a
+      // serine to them, it is one atom of something, so it takes X. Measured
+      // against both references on 6MRR + GOL + SEP@3: all ten of the
+      // phosphoserine's tokens, 15 -> 20, and it carries into `profile`, which
+      // is a one-hot over the same alphabet.
+      // (true is for an atomised AMINO ACID alone; rf3's "nucleic" takes a modified base's atom tokens
+      // too - native atomworks reads a 5CM's twenty as 20, where af3-any-model once kept DC, 28: 0464f71)
+      // ("chai": an amino acid's 20, a nucleotide's the unknown nucleotide, 30 - chai-lab's DX/RX)
+      // ("aatype": OpenBind-0's - the unknown amino acid on every atomised token, a base's too, and the alignment keeps
+      // the sequence letter: of3 sets UNK on restype alone)
+      // ("modifiedProteinLetter": IntelliFold-2's - the CCD one-letter code through the PROTEIN table, else the
+      // unknown amino acid, whatever the chain: 5CM ('C') is a cysteine, PSU ('U') protein UNK)
+      aatype[token] = modification.standard === true ? parentAatype(kind, code)
+        : options.modifiedProteinLetter === true ? proteinLetterAatype(modification.oneLetter)
+        : options.atomizedUnknownRestype === "nucleic" || options.atomizedUnknownRestype === "aatype"
+        || ((options.atomizedUnknownRestype === true || options.atomizedUnknownRestype === "chai") && kind === "protein")
+        ? UNK_AATYPE : options.atomizedUnknownRestype === "chai" ? UNKNOWN_NUCLEOTIDE : parentAatype(kind, code);
+      residueIndex[token] = number;
+      tokenIndex[token] = token + 1;
+      asymId[token] = asym;
+      entityId[token] = entity;
+      symId[token] = sym;
+      seqMask[token] = 1;
+      residueOfToken[token] = residue;
+
+      const flat = token * DENSE;          // one atom, and it sits in slot zero
+      refMask[flat] = 1;
+      refElement[flat] = source.element;
+      refCharge[flat] = source.charge;
+      refPos[flat * 3] = source.x;
+      refPos[flat * 3 + 1] = source.y;
+      refPos[flat * 3 + 2] = source.z;
+      writeAtomName(refAtomNameChars, flat, source.name, source.element,
+                    options.atomizedElementNames);
+      realAtoms.push(flat);
+      // Each token holds exactly one atom, so that atom is its pseudo-beta.
+      pseudoBetaSlot[token] = 0;
+      for (let slot = 0; slot < DENSE; slot += 1) refSpaceUid[token * DENSE + slot] = uid;
+      token += 1;
+    }
+  }
+
+  // 🔴 THE LIGANDS, AFTER EVERY POLYMER CHAIN. Their tokens continue the token
+  // index, take their own asym_id, and share ONE ref_space_uid across the whole
+  // component - the six atoms of a glycerol are one rigid conformer, not six
+  // independent ones, and giving each its own uid tells the atom encoder they
+  // may not be compared, which is the opposite of true.
+  let asym = chainLengths.length;
+  // 🔴 A LIGAND'S ENTITY FOLLOWS THE POLYMER ENTITIES, NOT THE POLYMER CHAINS. AF3 numbers distinct
+  // entities in chain order, so a homodimer's two copies are entity 1 and its ligand entity 2 -
+  // counting chains gave the ligand 3 (AF3's tetr_dimer_tetracycline example, against AF3's batch)
+  let polymerEntities = 0;
+  if (identity !== null) for (const e of identity.entityId) polymerEntities = Math.max(polymerEntities, e + 1);
+  // Keyed on what the ligand IS, not on what it is called; see below.
+  const entityOfLigand = new Map();
+  const copiesOfEntity = new Map();
+  let ligandToken = polymerTokens;
+  // Where each ligand's tokens sit, so a writer can name them: the batch's
+  // `sequence` covers the polymers only, and a ligand token indexed into it
+  // comes back undefined and is written as UNK.
+  const ligandSpans = [];
+  // each ligand chain's first token and its components (one, unless it is several bonded
+  // components - see ligandChain), for the bond endpoints below
+  const ligandStart = [];
+  const partsOf = (ligand) => ligand.residues
+    ?? [{ code: ligand.code, from: 0, count: ligand.atoms.length }];
+  for (const ligand of ligands) {
+    asym += 1;
+    ligandStart.push(ligandToken);
+    // ...AND ITS BONDS TRAVEL WITH IT, because a writer needs them too. The
+    // bond matrix beside this is token x token and one direction only, which is
+    // the shape the MODEL wants; a PDB's CONECT records want the pairs, and
+    // scanning L^2 cells per trajectory frame to recover them is the wrong way
+    // round when the list is right here.
+    // (a span per COMPONENT, each with its own bonds: a writer names and numbers residues by them)
+    for (const part of partsOf(ligand)) {
+      ligandSpans.push({ from: ligandToken + part.from, count: part.count, code: part.code,
+                         bonds: ligand.bonds
+                           .filter((b) => b.from >= part.from && b.from < part.from + part.count)
+                           .map((b) => ({ ...b, from: b.from - part.from, to: b.to - part.from })) });
+    }
+    // Identical codes are one entity, and each occurrence is a copy of it -
+    // the same rule chainIdentity applies to repeated sequences.
+    //
+    // 🔴 AND "IDENTICAL" IS THE MOLECULE, NOT THE CODE, WHICH ONLY MATTERS
+    // SINCE A LIGAND CAN ARRIVE AS A STRUCTURE. A CCD code identifies its
+    // contents - two ATPs really are one entity - so for every fold this port
+    // has ever done the two keys agree. A SMILES ligand has no code at all and
+    // is given one, and two DIFFERENT structures in one job both arrived as
+    // `LIG`: benzene and glycerol came out sharing an entity_id, with the
+    // model told that six carbons and a glycerol are two copies of one thing.
+    // Keying on what the component IS rather than on what it is called fixes
+    // that and cannot change a dictionary fold, where the two are equivalent.
+    const identity = `${ligand.code}|${ligand.atoms.length}|`
+      + `${ligand.atoms.map((atom) => `${atom.element}:${atom.charge}`).join(",")}|`
+      + `${ligand.bonds.map((bond) => `${bond.from}-${bond.to}:${bond.order}`).join(",")}`;
+    if (!entityOfLigand.has(identity)) entityOfLigand.set(identity, entityOfLigand.size);
+    const entity = entityOfLigand.get(identity);
+    const copy = (copiesOfEntity.get(entity) ?? 0) + 1;
+    copiesOfEntity.set(entity, copy);
+    // ...and its space continues the residues' count, not the token index. The
+    // two are the same number until a modified residue makes them differ. A
+    // chain of several components takes one space EACH, as AF3 gives them.
+    const parts = partsOf(ligand);
+    const uidOfPart = parts.map(() => space++);
+    for (let atom = 0; atom < ligand.atoms.length; atom += 1) {
+      const token = ligandToken + atom;
+      const source = ligand.atoms[atom];
+      const part = parts.findIndex((p) => atom >= p.from && atom < p.from + p.count);
+      const uid = uidOfPart[part];
+      aatype[token] = UNK_AATYPE;
+      // Every atom of a component is the same residue, so they share its
+      // number - AF3 writes 1 for a single-residue ligand, k for a chain's k-th.
+      residueIndex[token] = part + 1;
+      tokenIndex[token] = token + 1;
+      // `asym` is already one past the last polymer chain, and AF3 counts from
+      // one, so the two cancel: no further +1 here.
+      asymId[token] = asym;
+      entityId[token] = polymerEntities + entity + 1;
+      symId[token] = copy;
+      seqMask[token] = 1;
+
+      const flat = token * DENSE;          // one atom, and it sits in slot zero
+      refMask[flat] = 1;
+      refElement[flat] = source.element;
+      refCharge[flat] = source.charge;
+      refPos[flat * 3] = source.x;
+      refPos[flat * 3 + 1] = source.y;
+      refPos[flat * 3 + 2] = source.z;
+      writeAtomName(refAtomNameChars, flat, source.name, source.element,
+                    options.atomizedElementNames);
+      realAtoms.push(flat);
+      // ...and it is its own centre, where a residue's is CB.
+      pseudoBetaSlot[token] = 0;
+      for (let slot = 0; slot < DENSE; slot += 1) refSpaceUid[token * DENSE + slot] = uid;
+    }
+    ligandToken += ligand.atoms.length;
+  }
+
+  // 🔴 ONE DIRECTION PER BOND, AND [0,0] CLEARED. AF3 sets contact[i][j] from
+  // the CCD's bond table and does NOT set [j][i]; only the OpenFold3 dialect
+  // symmetrises. It then clears [0,0] explicitly, because its padded gather
+  // rows are zeros and would otherwise mark token 0 as bonded to itself.
+  // Neither is cosmetic: this matrix goes through a learned linear straight
+  // into the pair representation.
+  //
+  // 🔴 A MODIFIED RESIDUE'S OWN BONDS GO HERE TOO, and its peptide bonds to its
+  // neighbours do NOT. AF3 puts a phosphoserine's nine internal bonds through
+  // the same ligand-bond machinery as a ligand's, and leaves the backbone
+  // connectivity implicit in residue_index, exactly as it is for an
+  // unmodified chain - `polymer_ligand_bonds` comes back empty for one.
+  //
+  // 🔴 EXCEPT rosettafold3, WHICH BONDS IT BACK INTO THE CHAIN. That is
+  // `atomized_backbone_bonds`, and it is rf3's alone: on 6MRR + GOL + SEP@3
+  // the reference lists 18 bonded token pairs for rf3 and 14 for every other
+  // family, and the four extra are the peptide bonds either side of the
+  // atomised residue - the preceding residue to its N, and its C to the
+  // following residue, each way round. Without them the phosphoserine is a
+  // ligand floating beside the chain as far as the pair track is concerned.
+  const bondedGroups = [
+    // 🔴 A ONE-TOKEN MODIFIED RESIDUE CONTRIBUTES NO TOKEN-TOKEN BONDS. Its
+    // bonds are INSIDE the token, and `base + bond.from` only means a token
+    // while each atom is its own; under boltz2's convention it walks off the
+    // residue and bonds the neighbours instead - measured as 18 pairs the
+    // reference does not have, `2-3 3-2 3-4 3-6 4-3 4-5`, where 2 is the
+    // phosphoserine and 3 and 4 are the residues after it. The atoms are still
+    // bonded to each other; the pair track just is not where that is said.
+    ...modifiedSpans.filter((span) => span.oneToken !== true)
+      .map((span) => ({ base: span.from, bonds: span.bonds })),
+    ...ligands.map((ligand, index) => ({
+      base: polymerTokens + ligands.slice(0, index)
+        .reduce((sum, earlier) => sum + earlier.atoms.length, 0),
+      bonds: ligand.bonds,
+    })),
+  ];
+  // 🔴 AND THE BOND ORDER IS A SECOND PLANE, WHICH NOTHING HERE BUILT. boltz2's
+  // z-init reads TWO planes - the contact flag and the bond ORDER - and it is
+  // the only family with `tokenBondsTypeEmbed`, so it is the only one that
+  // notices. `embedder.js` and `confidence.js` both read
+  // `input.bondOrderMatrix`, `fold.js` forwards `batch.bondOrderMatrix`, and
+  // the featuriser never set it: five consumers and no producer, so every bond
+  // reached boltz2 with order 0 - "unspecified" - where the CCD says 1 or 2.
+  //
+  // Measured by tools/check-ligand-path.mjs, which is what found it: glycerol
+  // folded into boltz2 came apart at bond rms 3.602 A, C1-O1 at 6.97 A against
+  // a 1.43 ideal, while its pLDDT read 92.38. Every other family was 0.044 to
+  // 0.069. The order is in the component's own bond table and has been all
+  // along - `parseCcdComponent` returns it - so this is a channel that was
+  // parsed, forwarded and never filled.
+  // 🔴 AND THE BONDS A JOB DECLARES, which is `bondedAtomPairs` in AlphaFold 3's
+  // own format and the thing three of its fourteen example jobs are refused
+  // for. An endpoint is addressed by `asymId`, because that is how the batch is
+  // actually indexed and it is one namespace over polymers AND ligands - the
+  // same namespace the file's chain letters are in. Polymer chains take
+  // 0..chains-1 in order and each ligand the next, which is what makes the
+  // caller's letter-to-number map computable.
+  //
+  // 🔴 AND AN ATOM NAME RESOLVES TO A TOKEN, NOT TO AN ATOM. `token_bonds` is
+  // token x token: for a standard residue that is its single token whichever
+  // atom was named, and for a LIGAND or an atomised residue it is the token
+  // carrying that atom. Reading the name as an atom index would put the bond on
+  // whichever token happened to sit there.
+  const tokenOfEndpoint = (endpoint, where) => {
+    const { asym, residue, atom } = endpoint;
+    if (!Number.isInteger(asym) || asym < 0) {
+      throw new Error(`${where}: chain ${asym} is not one this batch has`);
+    }
+    if (asym >= chainLengths.length) {
+      const ligand = ligands[asym - chainLengths.length];
+      if (ligand === undefined) throw new Error(`${where}: no chain ${asym}`);
+      // a component chain is addressed by residue as well as atom (C1 is in every sugar)
+      const parts = partsOf(ligand);
+      const part = parts.length === 1 ? parts[0] : parts[residue - 1];
+      if (part === undefined) throw new Error(`${where}: ${ligand.code} has no residue ${residue}`);
+      const slot = ligand.atoms.slice(part.from, part.from + part.count).findIndex((one) => one.name === atom);
+      if (slot < 0) {
+        throw new Error(`${where}: ${part.code} has no atom ${atom}`);
+      }
+      return ligandStart[asym - chainLengths.length] + part.from + slot;
+    }
+    let global = residue - 1;
+    for (let before = 0; before < asym; before += 1) global += chainLengths[before];
+    if (residue < 1 || global < 0 || global >= residueCount) {
+      throw new Error(`${where}: residue ${residue} is past the end of chain ${asym}`);
+    }
+    const span = modifiedSpans.find((one) => one.residue === global);
+    if (span === undefined) {
+      // A standard residue is one token, and `residueOfToken` is the only map
+      // from a residue back to it that survives atomisation elsewhere.
+      const token = residueOfToken.indexOf(global);
+      if (token < 0) throw new Error(`${where}: residue ${residue} has no token`);
+      // ...and a named atom must be one the token HAS: unchecked, a mistyped name or an atom this family drops (a
+      // terminal OXT, a 5' OP3) bonded the residue anyway, where af3-any-model's featuriser finds no such atom
+      if (atom !== undefined && atom !== null && atom !== "") {
+        let found = false;
+        for (let slot = 0; slot < DENSE && !found; slot += 1) {
+          const flat = token * DENSE + slot;
+          if (refMask[flat] === 0) continue;
+          let name = "";
+          for (let c = 0; c < 4; c += 1) {
+            const v = refAtomNameChars[flat * 4 + c];
+            if (v >= 0 && v < 64) name += String.fromCharCode(v + 32);
+          }
+          found = name.trim() === atom;
+        }
+        if (!found) throw new Error(`${where}: ${residues[global].code} ${residue} has no atom ${atom}`);
+      }
+      return token;
+    }
+    if (span.oneToken === true) return span.from;
+    const slot = span.atoms.findIndex((one) => one.name === atom);
+    if (slot < 0) throw new Error(`${where}: ${span.code} has no atom ${atom}`);
+    return span.from + slot;
+  };
+  // 🔴 WHICH DECLARED BONDS A MODEL READS IS EACH VENDOR'S OWN RULE (af3-any-model 964990e). AlphaFold 3 featurises a
+  // declared bond only where one side is a ligand: a bond between two polymer residues never reaches its token bonds -
+  // and this featuriser placed every bond it was handed, so a disulfide typed as a contact reached AlphaFold 3. The
+  // dialect's `declaredPolymerBonds` adds what the others read on top: "all" (Boltz-2: every bond between two tokens),
+  // "discontinuous" (Protenix, OpenDDE: polymer-polymer between residues more than one apart or in different chains,
+  // and a modified residue's bond to a ligand), "ligand" (RoseTTAFold3: the modified residue's bond to a ligand alone).
+  // AlphaFold 3's own go one way (the job's) and covalent; the added ones both ways and covalent, as af3-any-model's
+  // _add_token_bonds; a bond within one token is none.
+  const rule = options.declaredPolymerBonds ?? null;
+  const isLigandEnd = (end) => end.asym >= chainLengths.length;
+  const isModifiedEnd = (end) => {
+    let global = end.residue - 1;
+    for (let before = 0; before < end.asym; before += 1) global += chainLengths[before];
+    // (a standard residue rf3 atomised for its ligand bond is still a standard residue here: AF3 featurises its bond)
+    return modifiedSpans.some((one) => one.residue === global && one.standard !== true);
+  };
+  const declaredBonds = [];
+  // chai-1's declared-bond feature (dialect `declaredBondFeature`): every declared bond, whatever the rule above
+  // keeps, [from][to] in the job's direction - its own matrix, separate from the token bonds
+  const declaredBondMatrix = options.declaredBondFeature === true && (options.bonds ?? []).length > 0
+    ? new Float32Array(tokens * tokens) : undefined;
+  for (const [index, bond] of (options.bonds ?? []).entries()) {
+    const where = `bond ${index + 1}`;
+    // (resolved first, whichever way the rule goes: an endpoint this batch does not have is refused by name)
+    const from = tokenOfEndpoint(bond.from, `${where} from`), to = tokenOfEndpoint(bond.to, `${where} to`);
+    if (declaredBondMatrix !== undefined) declaredBondMatrix[from * tokens + to] = 1;
+    const fromLigand = isLigandEnd(bond.from), toLigand = isLigandEnd(bond.to);
+    let added;
+    if (fromLigand && toLigand) added = false;
+    // (a polymer residue's bond to a ligand is AlphaFold 3's own, a modified residue's too - its tokens are atoms, and
+    // AF3 3.1.16 featurises the kitchen sink's HY3 CA - HEM CHA one way; a family with a rule also adds it the other way)
+    else if (fromLigand || toLigand) added = rule !== null && isModifiedEnd(fromLigand ? bond.to : bond.from); else if (rule === "all") added = true;
+    else if (rule === "discontinuous"
+             && !(bond.from.asym === bond.to.asym && Math.abs(bond.from.residue - bond.to.residue) <= 1)) added = true;
+    // (rf3: a polymer-polymer bond from a modified residue, to any residue - atomworks keeps an atomised residue's)
+    else if (rule === "ligand" && (isModifiedEnd(bond.from) || isModifiedEnd(bond.to))) added = true;
+    else continue;
+    // 🔴 A DECLARED BOND IS COVALENT (code 5), not single: AF3's `_bond_orders_for_layout`
+    // gives every link between two residues BOND_ORDER_COVALENT - a glycosidic bond and a
+    // covalent inhibitor's alike - and boltz2's bond-type plane reads it
+    if (added && from === to) continue;
+    declaredBonds.push({ from, to, order: added ? 5 : bond.order ?? 5, bothWays: added });
+  }
+
+  // 🔴 rf3's CHARGE ON AN ATOM A DECLARED BOND FORMS ON (`declaredBondCharge`, atomworks'
+  // correct_formal_charges_for_specified_atoms, af3-any-model's _declared_bond_charge): the sum of the bond orders it
+  // still has - hydrogens included, its leaving group gone - plus the declared bonds, minus its default valence. The
+  // amide N of a glycosylated Asn keeps both hydrogens and gains the C1 bond: +1 where the CCD says 0.
+  if (options.declaredBondCharge === true && (options.bonds ?? []).length > 0) {
+    const VALENCE = { H: 1, C: 4, N: 3, O: 2, F: 1, Cl: 1, Br: 1, B: 3 };
+    const ORDER = { SING: 1, DOUB: 2, TRIP: 3, QUAD: 4 };
+    const counted = new Map();
+    for (const bond of options.bonds) {
+      for (const end of [bond.from, bond.to]) {
+        if (end.atom === undefined || end.atom === null || end.atom === "") continue;
+        const key = `${end.asym}\u0000${end.residue}\u0000${end.atom}`;
+        if (!counted.has(key)) counted.set(key, { end, n: 0 });
+        counted.get(key).n += 1;
+      }
+    }
+    const standardGraphs = new Map();
+    const located = (end) => {
+      if (end.asym >= chainLengths.length) {
+        const k = end.asym - chainLengths.length, ligand = ligands[k];
+        if (ligand === undefined) return null;
+        const parts = partsOf(ligand);
+        const part = parts.length === 1 ? parts[0] : parts[end.residue - 1];
+        if (part === undefined) return null;
+        const at = ligand.atoms.slice(part.from, part.from + part.count).findIndex((one) => one.name === end.atom);
+        return at < 0 ? null
+          : { flat: (ligandStart[k] + part.from + at) * DENSE, graph: part.graph ?? ligand.graph };
+      }
+      let global = end.residue - 1;
+      for (let before = 0; before < end.asym; before += 1) global += chainLengths[before];
+      const span = modifiedSpans.find((one) => one.residue === global);
+      if (span !== undefined) {
+        const at = span.atoms.findIndex((one) => one.name === end.atom);
+        return at < 0 || span.oneToken === true ? null
+          : { flat: (span.from + at) * DENSE, graph: residues[global].modification.graph };
+      }
+      const token = residueOfToken.indexOf(global);
+      const standard = token < 0 ? null : standardCode(residues[global].kind, residues[global].code);
+      if (standard === null) return null;
+      if (!standardGraphs.has(standard)) standardGraphs.set(standard, parseCcdComponent(STANDARD_COMPONENTS[standard]).graph);
+      for (let slot = 0; slot < DENSE; slot += 1) {
+        const flat = token * DENSE + slot;
+        if (refMask[flat] === 0) continue;
+        let name = "";
+        for (let c = 0; c < 4; c += 1) {
+          const v = refAtomNameChars[flat * 4 + c];
+          if (v >= 0 && v < 64) name += String.fromCharCode(v + 32);
+        }
+        if (name.trim() === end.atom) return { flat, graph: standardGraphs.get(standard) };
+      }
+      return null;
+    };
+    for (const { end, n } of counted.values()) {
+      const where = located(end);
+      if (where === null || where.graph === undefined) continue;
+      const { names, elements, leaving, bonds: edges } = where.graph;
+      const atom = names.indexOf(end.atom);
+      if (atom < 0 || !(elements[atom] in VALENCE)) continue;
+      const neighbours = names.map(() => []);
+      for (const [x, y, order] of edges) {
+        const a = names.indexOf(x), b = names.indexOf(y);
+        if (a < 0 || b < 0) continue;
+        neighbours[a].push([b, order]);
+        neighbours[b].push([a, order]);
+      }
+      const gone = new Set();
+      const todo = neighbours[atom].filter(([m]) => leaving[m]).map(([m]) => m);
+      while (todo.length > 0) {
+        const m = todo.pop();
+        if (gone.has(m)) continue;
+        gone.add(m);
+        for (const [next] of neighbours[m]) if (leaving[next] && next !== atom) todo.push(next);
+      }
+      let degree = n;
+      for (const [m, order] of neighbours[atom]) if (!gone.has(m)) degree += ORDER[order] ?? 1;
+      refCharge[where.flat] = degree - VALENCE[elements[atom]];
+    }
+  }
+
+  let bondMatrix;
+  let bondOrderMatrix;
+  // 🔴 boltz2's ONE-TOKEN MODIFIED RESIDUE BONDS TO ITSELF (af3-any-model's _modified_self_bonds, against boltz on SEP
+  // and PSU): its tokeniser maps every bond of a non-standard residue onto tokens, so a residue held as one token gets
+  // ONE self-bond whose type is its LAST bond between atoms it keeps - z_init's bond terms read it at (t, t)
+  const selfBonds = modifiedSpans.filter((span) => span.oneToken === true && span.bonds.length > 0)
+    .map((span) => ({ token: span.from, order: span.bonds[span.bonds.length - 1].order ?? 1 }));
+  if (bondedGroups.some((group) => group.bonds.length > 0)
+      || declaredBonds.length > 0 || selfBonds.length > 0) {
+    bondMatrix = new Float32Array(tokens * tokens);
+    bondOrderMatrix = new Float32Array(tokens * tokens);
+    for (const { base, bonds } of bondedGroups) {
+      for (const bond of bonds) {
+        bondMatrix[(base + bond.from) * tokens + (base + bond.to)] = 1;
+        bondOrderMatrix[(base + bond.from) * tokens + (base + bond.to)] = bond.order ?? 1;
+        if (options.symmetriseBonds) {
+          bondMatrix[(base + bond.to) * tokens + (base + bond.from)] = 1;
+          bondOrderMatrix[(base + bond.to) * tokens + (base + bond.from)] = bond.order ?? 1;
+        }
+      }
+    }
+    // 🔴 ONE DIRECTION, THE JOB'S - [from][to] as bondedAtomPairs writes the pair - like a
+    // component's own bonds, and both only where the dialect symmetrises. This said "both
+    // directions always" until a reference batch was dumped with a declared bond (the glycosylated
+    // RNase B): AF3 lists the Asn-NAG link once, and writing a glycosidic bond reversed in the job
+    // reverses its pair in the gather (139-135 against 135-139). AF3's contact matrix sets exactly
+    // the listed [i][j].
+    for (const bond of declaredBonds) {
+      bondMatrix[bond.from * tokens + bond.to] = 1;
+      bondOrderMatrix[bond.from * tokens + bond.to] = bond.order;
+      if (options.symmetriseBonds || bond.bothWays) {
+        bondMatrix[bond.to * tokens + bond.from] = 1;
+        bondOrderMatrix[bond.to * tokens + bond.from] = bond.order;
+      }
+    }
+    // ("both": OpenBind-0's - of3's filter_fully_atomized_bonds keeps a link only between two atomised residues)
+    if (options.atomizedBackboneBonds === true || options.atomizedBackboneBonds === "both") {
+      const both = options.atomizedBackboneBonds === "both";
+      for (const span of modifiedSpans) {
+        // The span's own N and C, by name - the atom ORDER is the component's
+        // and is not something to count on.
+        const slotOf = (name) => span.atoms.findIndex((atom) => atom.name === name);
+        // (a nucleotide's backbone link is the phosphodiester: its P from the previous residue, its
+        // O3' to the next - the reference bonds a modified base back into its chain the same way)
+        const nucleic = residues[span.residue].kind !== "protein";
+        const nitrogen = slotOf(nucleic ? "P" : "N");
+        const carbon = slotOf(nucleic ? "O3'" : "C");
+        const sameChain = (residue) => residue >= 0 && residue < residueCount
+          && chainOfResidue[residue] === chainOfResidue[span.residue];
+        // 🔴 BOTH DIRECTIONS, unlike the internal bonds, which the reference
+        // lists one way round. Its own gather carries 1-2 AND 2-1, 6-12 AND
+        // 12-6, where the nine internal SEP bonds appear once each.
+        const link = (a, b) => {
+          if (a < 0 || b < 0 || a >= tokens || b >= tokens) return;
+          bondMatrix[a * tokens + b] = 1;
+          bondMatrix[b * tokens + a] = 1;
+          // A peptide bond is a single bond. rf3 has no bond-order embedding,
+          // so this changes nothing for it and is right rather than blank.
+          bondOrderMatrix[a * tokens + b] = 1;
+          bondOrderMatrix[b * tokens + a] = 1;
+        };
+        // The neighbouring residue's token is the one adjacent to the span - while that neighbour is
+        // one token. 🔴 AN ATOMISED NEIGHBOUR IS MANY: the token before this span is then the previous
+        // residue's LAST ATOM (a 5' 6OG's OP3), and the link from it was a bond the reference does not
+        // have. Its own forward link is the bond (O3' to this residue's P), so the backward one is
+        // skipped, and a forward link into an atomised residue lands on its own P (or N). AF3's
+        // kitchen-sink DNA, 6OG at 1 and 6MA at 2, against rf3's batch: 67-70 both ways, not 69-70.
+        const spanOf = (residue) => modifiedSpans.find((other) => other.residue === residue);
+        if (!both && nitrogen >= 0 && sameChain(span.residue - 1) && spanOf(span.residue - 1) === undefined) {
+          link(span.from - 1, span.from + nitrogen);
+        }
+        if (carbon >= 0 && sameChain(span.residue + 1) && (!both || spanOf(span.residue + 1) !== undefined)) {
+          const next = spanOf(span.residue + 1);
+          const into = next === undefined ? 0
+            : next.atoms.findIndex((atom) => atom.name === (nucleic ? "P" : "N"));
+          if (into >= 0) link(span.from + carbon, span.from + span.count + into);
+        }
+      }
+    }
+    bondMatrix[0] = 0;
+    bondOrderMatrix[0] = 0;
+    // (after the padding reset at (0, 0): a self-bond is real even on token 0)
+    for (const { token, order } of selfBonds) {
+      bondMatrix[token * tokens + token] = 1;
+      bondOrderMatrix[token * tokens + token] = order;
+    }
+  }
+
+  const atomCount = realAtoms.length;
+
+  // 🔴 `subsets` COMES FROM HERE AND NOWHERE ELSE. It used to be computed a
+  // second time, three hundred lines above, from `tokens * DENSE` - so the
+  // batch's `shape.subsets` and the gathers sized beside it were two
+  // derivations of one number, which is the failure this repository keeps
+  // meeting: a dispatch sized for one width against buffers built for another.
+  // They agreed only while both were wrong.
+  const {
+    subsets, keys, tokenAtomsToQueries, queriesToTokenAtoms, queriesToKeys,
+    tokensToQueries, tokensToKeys, tokenAtomsToPseudoBeta,
+  } = atomGathers({ tokens, dense: DENSE, realAtoms, pseudoBetaSlot,
+                    // rf3, opendde and protenix clamp the key window and mask
+                    // its out-of-range slots; see the note on the rule.
+                    paddedKeys: options.paddedAtomKeys === true,
+                    qblockKeys: options.qblockAtomKeys === true });
+
+  // The MSA. Row zero is the query; anything the caller supplies follows.
+  const extra = options.msa ?? [];
+  // 🔴 WITH NO ALIGNMENT, THREE FAMILIES GET THE QUERY TWICE AND FOUR GET IT
+  // ONCE, and this port gave all seven one row. AlphaFold 3 concatenates a
+  // PAIRED and an UNPAIRED block, so a chain with no homologs contributes its
+  // own sequence to each and the model sees depth 2; boltz's featuriser - which
+  // protenix, IntelliFold-2 and RoseTTAFold3 all fork or match - emits a
+  // depth-1 `dummy_msa` and finds nothing to pair. Counted in the reference's
+  // own batches on 6MRR: alphafold3 and openbind0 have TWO live rows and
+  // boltz2, protenix2, intellifold2, rosettafold3 and opendde have ONE.
+  //
+  // 🔴 AND IT IS NOT COSMETIC. The outer product mean over two identical rows
+  // is unchanged, but the pair-weighted averaging and the row transition are
+  // DEPTH-sensitive - upstream measured the same convention at 4.3% of
+  // esmfold2's MSA injection - so the three that want two rows have been
+  // folding single sequences one row short. Only where the alignment is EMPTY:
+  // with homologs the query's second copy is what
+  // `deduplicateUnpairedAgainstPaired` already removes.
+  const duplicateQuery = extra.length === 0 && options.duplicateQueryRow === true;
+  let sequences = 1 + extra.length + (duplicateQuery ? 1 : 0);
+  // 🔴 THREE BYTES A CELL, AS AF3 STORES THEM (int8 rows, bool mask, int8 deletions - features.py), because the batch
+  // carries AF3's whole pool now - up to 16384 rows, drawn from afresh every trunk pass (shared/af3/msa-draw.js) - and
+  // at 12 bytes a cell a deep 2000-token alignment was 390 MB of a page's memory. A deletion count is clipped at 127
+  // on the way in, which is AF3's cast; a backend widens the rows a pass reads.
+  let msa = new Int8Array(sequences * tokens);
+  let msaMask = new Uint8Array(sequences * tokens).fill(1);
+  let deletionMatrix = new Uint8Array(sequences * tokens);
+  // 🔴 A LIGAND TOKEN IS A GAP IN THE MSA, NOT AN UNKNOWN RESIDUE. Its aatype
+  // is UNK (20) but AF3 writes MSA_GAP (21) in the alignment and in the
+  // profile - an alignment has nothing to say about an atom. Copying aatype
+  // across, which is right for every polymer token, puts a 20 there instead and
+  // tells the model the ligand is a row of unknown amino acids.
+  // ...AND MOVES IT INTO THE LIGAND'S UNIT (atomworks' pn_unit, af3-any-model's _ligand_bonded_units): its tokens take
+  // the ligand's asym_id, keep their entity, and are that entity's next copy.
+  // (every declared bond with an atomised end is walked, as af3-any-model's loop does: one to another polymer chain
+  // moves the residue there first, and the entity's copy count it leaves is what the ligand's move then reads)
+  if (ligandBonded.length > 0) {
+    const newSym = new Map();
+    let chainStart = 0;
+    const residueStart = chains.map((chain) => { const at = chainStart; chainStart += chain.length; return at; });
+    const atomised = new Set(ligandBonded.map(({ chain, position }) => `${chain}:${position}`));
+    const moves = [];
+    for (const bond of options.bonds ?? []) {
+      const [poly, other] = atomised.has(`${bond.from.asym}:${bond.from.residue}`) ? [bond.from, bond.to] : [bond.to, bond.from];
+      if (!atomised.has(`${poly.asym}:${poly.residue}`)) continue;
+      moves.push({ chain: poly.asym, position: poly.residue, ligand: other.asym });
+    }
+    for (const { chain, position, ligand } of moves) {
+      const residue = residueStart[chain] + position - 1;
+      const span = modifiedSpans.find((one) => one.residue === residue);
+      if (span === undefined) continue;
+      const entity = entityId[span.from];
+      const key = `${entity}:${ligand}`;
+      if (!newSym.has(key)) {
+        let most = 0;
+        for (let token = 0; token < tokens; token += 1) if (entityId[token] === entity) most = Math.max(most, symId[token]);
+        newSym.set(key, most + 1);
+      }
+      asymId.fill(ligand + 1, span.from, span.from + span.count);
+      symId.fill(newSym.get(key), span.from, span.from + span.count);
+    }
+  }
+  const queryRow = Int32Array.from(aatype);
+  // 🔴 boltz2 MOVES `aatype` TO UNKNOWN AND LEAVES THE ALIGNMENT ALONE, WHERE
+  // rosettafold3 MOVES BOTH. Two conventions, and one flag reported them as
+  // one: with `atomizedUnknownRestype` alone, boltz2's profile came out 20
+  // where the reference has 15, because the query row of the MSA is built from
+  // `aatype` and the profile is built from the MSA. Read off the references'
+  // own query rows at 6MRR + GOL + SEP@3, tokens 2..11:
+  //     alphafold3   15 15 15 ...   aatype 15
+  //     boltz2       15 15 15 ...   aatype 20
+  //     rosettafold3 20 20 20 ...   aatype 20
+  // So the alignment keeps the PARENT residue for everyone but rf3, whose
+  // atomised token is unknown wherever it appears.
+  if ((options.atomizedUnknownRestype === true || options.atomizedUnknownRestype === "chai"
+       || options.atomizedUnknownRestype === "aatype") && options.atomizedUnknownMsa !== true) {
+    for (const span of modifiedSpans) {
+      // (genuine Boltz-2's one-token residue reads the protein unknown in the alignment's query row - its residue
+      // record's type, which its featuriser writes over the query's letter - so its profile is UNK's one-hot)
+      const parent = span.oneToken === true ? UNK_AATYPE : parentAatype(residues[span.residue].kind, residues[span.residue].code);
+      for (let at = 0; at < span.count; at += 1) queryRow[span.from + at] = parent;
+    }
+  }
+  // (IntelliFold-2's protein-letter restype is its query row too, and so its profile)
+  if (options.modifiedProteinLetter === true) {
+    for (const span of modifiedSpans) {
+      queryRow.fill(proteinLetterAatype(residues[span.residue].modification.oneLetter), span.from, span.from + span.count);
+    }
+  }
+  // (boltz2's query row on a ligand token is its res_type, protein UNK, where AF3 writes the gap: `ligandMsaUnk`)
+  for (let token = polymerTokens; token < tokens; token += 1) queryRow[token] = options.ligandMsaUnk === true ? UNK_AATYPE : MSA_GAP;
+  msa.set(queryRow, 0);
+  // ...and again, for the families whose two blocks each contribute it.
+  if (duplicateQuery) msa.set(queryRow, tokens);
+  // Which column of the alignment each TOKEN reads, or -1 for a token the
+  // alignment does not describe: a ligand's atom, or any token of a nucleic
+  // chain.
+  const msaColumnOfToken = new Int32Array(tokens).fill(-1);
+  const nucleicToken = new Uint8Array(tokens);
+  for (let token = 0; token < tokens; token += 1) {
+    const residue = residueOfToken[token];
+    if (residue < 0) continue;
+    msaColumnOfToken[token] = msaColumnOfResidue[residue];
+    if (residues[residue].kind !== "protein") nucleicToken[token] = 1;
+  }
+  // Where the unpaired block starts in the finished array, which is where a
+  // chain's own alignment begins. Read before `unpairedFrom` is declared below,
+  // so it is computed here by the same rule.
+  const unpairedFromRow = () => options.unpairedFrom ?? (extra.length === 0 ? 0 : 1);
+  // 🔴 A NUCLEIC CHAIN CONTRIBUTES ONE ROW OF ITS OWN, AND IT IS NOT ROW ZERO.
+  // AF3 stacks each chain's unpaired block side by side and pads the short ones
+  // with gaps, so a DNA chain - whose alignment is only itself - puts its own
+  // sequence in the FIRST ROW OF THE UNPAIRED BLOCK and gaps below it. Measured:
+  // in a protein+DNA batch rows 0 and 1 both read 26 28 27 29 at the DNA
+  // columns and rows 2 and 3 read 21. Gapping every row but the query is the
+  // natural reading and is one row short, which is a row the model reads as the
+  // chain being absent from its own alignment.
+  // ...and rosettafold3's atomised token is unknown in EVERY row, a gap's included: its reference
+  // profile is 1.0 at restype 20 for a hydroxyproline and for a P1L whose alignment row is a gap
+  // (AF3's kitchen-sink job, against rf3's batch) - where reading the A3M gave P, or half gap
+  const unknownEverywhere = new Uint8Array(tokens);
+  if (options.atomizedUnknownMsa === true) {
+    for (const span of modifiedSpans) unknownEverywhere.fill(1, span.from, span.from + span.count);
+  }
+  const nucleicRow = unpairedFromRow();
+  for (let row = 0; row < extra.length; row += 1) {
+    const base = (row + 1) * tokens;
+    const deletions = options.deletionMatrix?.[row];
+    const nucleicHere = row + 1 === nucleicRow ? "own" : MSA_GAP;
+    for (let token = 0; token < tokens; token += 1) {
+      const column = msaColumnOfToken[token];
+      // (a nucleic token WITH a column is read from the alignment like any other)
+      if (column < 0 && nucleicToken[token]) {
+        msa[base + token] = nucleicHere === "own" ? aatype[token] : MSA_GAP;
+        continue;
+      }
+      msa[base + token] = unknownEverywhere[token] ? queryRow[token]
+        : column < 0 ? MSA_GAP : (extra[row][column] ?? MSA_GAP);
+      if (deletions !== undefined) {
+        deletionMatrix[base + token] = column < 0 ? 0 : Math.min(deletions[column] ?? 0, 127);
+      }
+    }
+  }
+
+  // 🔴 boltz2's ALIGNMENT IS ITS PROTEIN CHAINS' (`proteinOnlyMsa`, af3-any-model's _boltz_msa as `boltz predict` builds
+  // it): a nucleic chain's own alignment is not read, so past the query it is gap in every row; and no deletion
+  // survives its mapping (`zeroDeletions`, _boltz_surviving_deletions keeps none).
+  if (options.proteinOnlyMsa === true) {
+    for (let row = 1; row < sequences; row += 1) {
+      for (let token = 0; token < polymerTokens; token += 1) {
+        if (!nucleicToken[token]) continue;
+        msa[row * tokens + token] = MSA_GAP;
+        deletionMatrix[row * tokens + token] = 0;
+      }
+    }
+  }
+  // (a row that was a nucleic chain's alone is then no row at all: boltz has none for it)
+  if (options.proteinOnlyMsa === true && sequences > 1) {
+    const keep = [0];
+    for (let row = 1; row < sequences; row += 1) {
+      let gap = true;
+      for (let token = 0; token < tokens && gap; token += 1) gap = msa[row * tokens + token] === MSA_GAP;
+      if (!gap) keep.push(row);
+    }
+    if (keep.length < sequences) {
+      const take = (array) => {
+        const out = new array.constructor(keep.length * tokens);
+        keep.forEach((row, at) => out.set(array.subarray(row * tokens, (row + 1) * tokens), at * tokens));
+        return out;
+      };
+      msa = take(msa); msaMask = take(msaMask); deletionMatrix = take(deletionMatrix);
+      sequences = keep.length;
+    }
+  }
+  if (options.zeroDeletions === true) deletionMatrix.fill(0);
+  // profile: the column-wise restype frequency, and deletionMean the mean
+  // deletion count.
+  //
+  // 🔴 THESE ARE NOT AVERAGES OVER THE WHOLE ARRAY ABOVE. AF3 computes them in
+  // its data pipeline, per chain, over the UNPAIRED alignment alone - before
+  // the paired rows are prepended and before the query row joins them. So a
+  // 32-row A3M gives a 33-row `msa` and a profile over 32, and averaging the 33
+  // instead double-counts the query in every column. `unpairedFrom` names where
+  // that block starts; 0 means there is no alignment and the profile is the
+  // query's own one-hot, which is what AF3 produces for a single sequence.
+  //
+  // 🔴 AND THEY ARE COMPUTED BEFORE DEDUPLICATION, so their rows are not always
+  // the rows of `msa`. AF3 calls get_profile_features on each chain and only
+  // then runs deduplicate_unpaired_sequences, which drops every unpaired row
+  // the paired block already had - rows that still counted towards the profile.
+  // `profileMsa` carries that original block when the caller has one; without
+  // it the slice of `msa` is the same thing, which is every case with no
+  // pairing.
+  const unpairedFrom = options.unpairedFrom ?? (extra.length === 0 ? 0 : 1);
+  // An empty block is no block: the profile then falls back to the query's own
+  // one-hot through the slice below, which is what AF3 gives a single sequence.
+  const profileRows = (options.profileMsa?.length ?? 0) > 0 ? options.profileMsa : null;
+  const profile = new Float32Array(tokens * RESTYPES);
+  const deletionMean = new Float32Array(tokens);
+  const profileDepth = profileRows === null
+    ? Math.max(1, sequences - unpairedFrom)
+    : Math.max(1, profileRows.length);
+  //
+  // 🔴 AND THE PROFILE'S ROWS ARE ALIGNMENT COLUMNS TOO. `profileMsa` comes
+  // straight from the A3M and was indexed here by token, which is the same
+  // off-by-a-modified-residue as the block above.
+  const codeAt = profileRows === null
+    ? (row, token) => msa[(unpairedFrom + row) * tokens + token]
+    : (row, token) => {
+      const column = msaColumnOfToken[token];
+      // a token with no column (a ligand's) is a gap in every row, as `msa` holds it above: AF3's
+      // profile puts a ligand token's whole weight on the gap - measured on its kitchen-sink job,
+      // 1.0 at restype 21 for every ligand token - where returning nothing left it all zeros
+      if (column < 0) return MSA_GAP;
+      if (profileRows[row] === undefined) return -1;
+      return unknownEverywhere[token] ? queryRow[token] : profileRows[row][column];
+    };
+  const deletionAt = profileRows === null
+    ? (row, token) => deletionMatrix[(unpairedFrom + row) * tokens + token]
+    : (row, token) => {
+      const column = msaColumnOfToken[token];
+      return column < 0 ? 0 : (options.profileDeletionMatrix?.[row]?.[column] ?? 0);
+    };
+  // 🔴 A NUCLEIC TOKEN'S PROFILE IS ONE-HOT AT ITS OWN AATYPE, NOT AT THE GAP.
+  // AF3 runs get_profile_features PER CHAIN, so a DNA chain - which has no
+  // alignment beyond itself - gets a profile of its own sequence: measured as
+  // exactly 1.0 at restype 26 for a leading A. Letting it fall out of the loop
+  // below would put that 1.0 at MSA_GAP instead, which says the chain is absent.
+  // (and every nucleic token's where the alignment is the protein chains' alone: boltz2's and rf3's `proteinOnlyMsa`)
+  const ownProfile = (token) => nucleicToken[token] && (msaColumnOfToken[token] < 0 || options.proteinOnlyMsa === true);
+  // 🔴 EACH CHAIN'S PROFILE OVER ITS OWN ROWS, NOT THE MERGED BLOCK'S. AF3 computes it per chain
+  // before stacking the chains' unpaired rows side by side, so the gap rows that pad a shorter
+  // chain's alignment to the deepest one's are not part of it: a 3-row protein beside a 4-row RNA
+  // is averaged over 3. A chain's depth is its last row with a residue in any of its columns.
+  const depthOfChain = new Map();
+  for (let token = 0; token < polymerTokens; token += 1) {
+    // (an rf3 atomised token reads unknown in every row, which says nothing about the chain's depth)
+    if (ownProfile(token) || msaColumnOfToken[token] < 0 || unknownEverywhere[token]) continue;
+    const chain = chainOfResidue[residueOfToken[token]];
+    let deepest = depthOfChain.get(chain) ?? 1;
+    for (let row = profileDepth - 1; row >= deepest; row -= 1) {
+      const code = codeAt(row, token);
+      if (code >= 0 && code !== MSA_GAP) { deepest = row + 1; break; }
+    }
+    depthOfChain.set(chain, deepest);
+  }
+  const depthOf = (token) => (token < polymerTokens && residueOfToken[token] >= 0
+    ? depthOfChain.get(chainOfResidue[residueOfToken[token]]) ?? profileDepth : profileDepth);
+  for (let token = 0; token < tokens; token += 1) {
+    if (ownProfile(token)) continue;
+    const depth = depthOf(token);
+    for (let row = 0; row < depth; row += 1) {
+      const code = codeAt(row, token);
+      if (code >= 0 && code < RESTYPES) profile[token * RESTYPES + code] += 1 / depth;
+      deletionMean[token] += deletionAt(row, token) / depth;
+    }
+  }
+
+  // (at its code in the alignment's QUERY ROW, which is its aatype except where a dialect gives
+  // the token the unknown restype and keeps its parent in the alignment - boltz2's one-token modified
+  // base, whose profile the reference puts at the parent nucleotide: 28 for a 5CM, not 20)
+  for (let token = 0; token < tokens; token += 1) {
+    if (ownProfile(token)) profile[token * RESTYPES + queryRow[token]] = 1;
+  }
+  // (a ligand token whose query row is UNK has no other row: atomworks pads it, so its profile is UNK's one-hot)
+  if (options.ligandMsaUnk === true) {
+    for (let token = polymerTokens; token < tokens; token += 1) {
+      profile.fill(0, token * RESTYPES, (token + 1) * RESTYPES);
+      profile[token * RESTYPES + UNK_AATYPE] = 1;
+    }
+  }
+
+  // 🔴 A SELF-MSA IS THE QUERY ONCE, for the families whose featurisers emit depth 1 (`dedupeSelfMsa`, which reaches
+  // here as `duplicateQueryRow: false`) - and not only with no alignment: an A3M of the query alone gave the query and
+  // its own copy, two identical rows, where af3-any-model's _dedupe_self_msa (and OpenDDE's and protenix's own
+  // featurisers) leave one. Only where EVERY row is the query - beside real homologs the paired block's query is the
+  // vendors' too (protenix's own 4-row A3M batch carries five rows). After the profile, which it does not change.
+  // ...and its profile and deletion mean are over EVERY row of that alignment, the query's included (boltz's
+  // msa_profile over its whole MSA), where AF3's are each chain's unpaired block. A row repeating an earlier one is
+  // counted once: boltz's parse_csv drops repeats, and this port's query reappears as its unpaired block's first row.
+  if (options.profileOverAllRows === true) {
+    const seen = new Set();
+    const rows = [];
+    // (keyed on the protein columns, the rows boltz builds: its query row 0 holds the nucleic chains' sequences too)
+    const proteinTokens = [];
+    for (let token = 0; token < polymerTokens; token += 1) if (!nucleicToken[token]) proteinTokens.push(token);
+    // (and the query as its alignments spell it - the letters, a modified residue's parent where row 0 reads UNK - is
+    // seen already: boltz reads each a3m past its own query, so a block's copy of it is no row)
+    const letters = proteinTokens.map((token) => (residueOfToken[token] >= 0
+      ? parentAatype(residues[residueOfToken[token]].kind, residues[residueOfToken[token]].code) : msa[token])).join(",");
+    for (let row = 0; row < sequences; row += 1) {
+      const key = proteinTokens.map((token) => msa[row * tokens + token]).join(",");
+      if (row === 1) seen.add(letters);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      rows.push(row);
+    }
+    profile.fill(0);
+    deletionMean.fill(0);
+    for (const row of rows) {
+      for (let token = 0; token < tokens; token += 1) {
+        const code = msa[row * tokens + token];
+        if (code >= 0 && code < RESTYPES) profile[token * RESTYPES + code] += 1 / rows.length;
+        deletionMean[token] += deletionMatrix[row * tokens + token] / rows.length;
+      }
+    }
+  }
+  if (options.duplicateQueryRow === false && sequences > 1) {
+    let self = true;
+    for (let at = tokens; at < sequences * tokens && self; at += 1) self = msa[at] === msa[at % tokens];
+    if (self) {
+      sequences = 1;
+      msa = msa.slice(0, tokens); msaMask = msaMask.slice(0, tokens); deletionMatrix = deletionMatrix.slice(0, tokens);
+    }
+  }
+  // (genuine Boltz-2 profiles a one-token modified residue from a query whose letter it has overwritten with UNK, so a
+  // profile that is just the query's - the parent's one-hot - is UNK's; af3-any-model's _mark_modified_residues, the
+  // same rule, holds the alignment case to it too)
+  for (const span of modifiedSpans) {
+    if (span.oneToken !== true) continue;
+    const parent = parentAatype(residues[span.residue].kind, residues[span.residue].code);
+    const row = span.from * RESTYPES;
+    let total = 0;
+    for (let k = 0; k < RESTYPES; k += 1) total += profile[row + k];
+    if (profile[row + parent] === 1 && total === 1) { profile[row + parent] = 0; profile[row + UNK_AATYPE] = 1; }
+  }
+  // 🔴 OpenDDE's AND PROTENIX'S MSA ON A NON-PROTEIN TOKEN (`nativeNonproteinMsa`, af3-any-model's
+  // _native_nonprotein_msa): their featuriser fills a ligand's columns with the unknown restype in every row, the query's
+  // included, and its profile with UNK, where AlphaFold 3 writes the gap; and a nucleic chain's rows that are all gap -
+  // every row but its own beside a protein's alignment - repeat its query rather than reading as the chain absent.
+  if (options.nativeNonproteinMsa === true) {
+    for (let row = 0; row < sequences; row += 1) msa.fill(UNK_AATYPE, row * tokens + polymerTokens, (row + 1) * tokens);
+    for (let token = polymerTokens; token < tokens; token += 1) {
+      profile.fill(0, token * RESTYPES, (token + 1) * RESTYPES);
+      profile[token * RESTYPES + UNK_AATYPE] = 1;
+    }
+    const nucleicChains = new Map();
+    for (let token = 0; token < polymerTokens; token += 1) {
+      const residue = residueOfToken[token];
+      if (residue < 0 || residues[residue].kind === "protein") continue;
+      const chain = chainOfResidue[residue];
+      if (!nucleicChains.has(chain)) nucleicChains.set(chain, []);
+      nucleicChains.get(chain).push(token);
+    }
+    for (const chainTokens of nucleicChains.values()) {
+      for (let row = 1; row < sequences; row += 1) {
+        const base = row * tokens;
+        if (chainTokens.every((token) => msa[base + token] === MSA_GAP)) {
+          for (const token of chainTokens) msa[base + token] = msa[token];
+        }
+      }
+    }
+  }
+
+  // 🔴 OpenBind-0's MSA HAS NO DNA (`dnaGapMsa`, af3-any-model's _dna_gap_msa): OpenFold3's alignment server adds query
+  // rows for protein and RNA only, so a DNA chain reads GAP in every row - the query's included - with a zero profile
+  // and deletion mean, and a LIGAND's profile is zero too where AF3 writes the gap's one-hot. A job with no protein
+  // or RNA is left with the one dummy row.
+  if (options.dnaGapMsa === true) {
+    const dna = (token) => token < polymerTokens && residueOfToken[token] >= 0
+      && residues[residueOfToken[token]].kind === "dna";
+    let otherPolymer = false;
+    for (let token = 0; token < tokens; token += 1) {
+      if (token >= polymerTokens || dna(token)) {
+        profile.fill(0, token * RESTYPES, (token + 1) * RESTYPES);
+        if (dna(token)) deletionMean[token] = 0;
+      } else otherPolymer = true;
+    }
+    for (let row = 0; row < sequences; row += 1) {
+      for (let token = 0; token < polymerTokens; token += 1) {
+        if (!dna(token)) continue;
+        msa[row * tokens + token] = MSA_GAP;
+        deletionMatrix[row * tokens + token] = 0;
+      }
+    }
+    if (!otherPolymer && sequences > 1) {
+      sequences = 1;
+      msa = msa.slice(0, tokens); msaMask = msaMask.slice(0, tokens); deletionMatrix = deletionMatrix.slice(0, tokens);
+    }
+  }
+  // 🔴 THE NAME THE MODEL READS AND THE NAME A PDB CARRIES ARE NOT THE SAME
+  // NAME, once `atomizedElementNames` is on. rf3 renames every atomised atom to
+  // its element symbol, which is right for the FEATURE and wrong for the FILE:
+  // the PDB writer reads the same array, so a glycerol came out as six atoms
+  // called C, O, C, O, C, O in one residue - names that are not unique within a
+  // residue, which the format does not allow and a viewer keying on them
+  // collapses. The reference renames its batch feature; what it writes out is
+  // its own business. So `displayAtomNameChars` keeps the component's real
+  // names and everything that produces OUTPUT reads it.
+  //
+  // It is the same array unless the rename is on, so this costs nothing for the
+  // other six families.
+  let displayAtomNameChars = refAtomNameChars;
+  if (options.atomizedElementNames === true) {
+    displayAtomNameChars = Int32Array.from(refAtomNameChars);
+    const restore = (base, atoms) => {
+      for (let at = 0; at < atoms.length; at += 1) {
+        writeAtomName(displayAtomNameChars, (base + at) * DENSE, atoms[at].name,
+                      atoms[at].element, false);
+      }
+    };
+    for (const span of modifiedSpans) restore(span.from, span.atoms);
+    for (let index = 0; index < ligands.length; index += 1) {
+      const base = polymerTokens + ligands.slice(0, index)
+        .reduce((sum, earlier) => sum + earlier.atoms.length, 0);
+      restore(base, ligands[index].atoms);
+    }
+  }
+
+  // 🔴 THE REFERENCE CONFORMERS ARE CENTRED PER `ref_space_uid`, AND FIVE OF
+  // THE SIX FAMILIES EXPECT IT. `CENTRE_REF_CONFORMERS` in af3-any-model is
+  // ('boltz2', 'openfold3', 'openbind0', protenix*, 'opendde') - everything but
+  // stock AlphaFold 3, which is the reference implementation, and intellifold2,
+  // which passes centering=False. Their featurisers all subtract the group mean
+  // (boltz2 `centering=True` per ref_space_uid; openbind0
+  // `pos_centered = xl - mean_xl`; protenix/opendde `random_transform(
+  // centralize=True)`), and this port did not - measured, glycine's four atoms
+  // mean to exactly (0,0,0) in the reference's batch and to (1.31, -0.02, 0.58)
+  // here.
+  //
+  // 🔴 IT IS THE RAW `ref_pos` CHANNEL ONLY, and that is why it hid: the atom
+  // encoder reads the positions BOTH raw and through a translation-invariant
+  // pairwise difference, so half the module cannot see a translation at all.
+  // What it cost is the floor under every sequence-featurised oracle
+  // comparison - openbind0's `target_feat` 2.89e-2 from a sequence against
+  // 4.93e-8 from the reference's own batch.
+  //
+  // Centring is applied to every family here rather than behind a dialect flag
+  // ONLY IF the dialect says so; stock AF3 must keep its uncentred CCD ideals.
+  if (options.centreRefConformers === true) {
+    const sums = new Map();
+    for (let slot = 0; slot < tokens * DENSE; slot += 1) {
+      if (refMask[slot] === 0) continue;
+      const uid = refSpaceUid[slot];
+      const entry = sums.get(uid) ?? [0, 0, 0, 0];
+      entry[0] += refPos[slot * 3]; entry[1] += refPos[slot * 3 + 1];
+      entry[2] += refPos[slot * 3 + 2]; entry[3] += 1;
+      sums.set(uid, entry);
+    }
+    for (let slot = 0; slot < tokens * DENSE; slot += 1) {
+      if (refMask[slot] === 0) continue;
+      const entry = sums.get(refSpaceUid[slot]);
+      if (entry === undefined || entry[3] === 0) continue;
+      refPos[slot * 3] -= entry[0] / entry[3];
+      refPos[slot * 3 + 1] -= entry[1] / entry[3];
+      refPos[slot * 3 + 2] -= entry[2] / entry[3];
+    }
+  }
+
+  // 🔴 boltz2's LAST CONFORMER GROUP KEEPS BOLTZ-2's STORED CONFORMER, RAW. Boltz-2 centres and rotates each group in
+  // `range(max(ref_space_uid))` - an off-by-one that skips the last - so native feeds its final group the stored
+  // conformer in its own frame (boltz2-conformers.js). af3-any-model 79edb5e matched it: polyQ200 pLDDT 53 -> 85, native
+  // 83. As there: after the centring, the last group's tokens take the stored conformer (overrideConformer below).
+  // (both by af3-any-model's _override_ref_conformers: a token that is not atomised takes the table's position of every
+  // atom whose name its residue's entry has - the restype names the entry, AF3's POLYMER_TYPES_WITH_UNKNOWN_AND_GAP -
+  // and the rest keep theirs; an atomised residue, more than one token on one (asym, residue), is left alone)
+  const share = new Map();
+  for (let token = 0; token < tokens; token += 1) {
+    const key = `${asymId[token]}:${residueIndex[token]}`;
+    share.set(key, (share.get(key) ?? 0) + 1);
+  }
+  const overrideConformer = (token, table) => {
+    if (share.get(`${asymId[token]}:${residueIndex[token]}`) > 1) return;
+    const entry = table[POLYMER_TYPE_NAMES[aatype[token]]];
+    if (entry === undefined) return;
+    for (let slot = 0; slot < DENSE; slot += 1) {
+      const flat = token * DENSE + slot;
+      if (refMask[flat] === 0) continue;
+      let name = "";
+      for (let c = 0; c < 4; c += 1) {
+        const v = refAtomNameChars[flat * 4 + c];
+        if (v >= 0 && v < 64) name += String.fromCharCode(v + 32);
+      }
+      const xyz = entry[name.trim()];
+      if (xyz === undefined) continue;
+      refPos[flat * 3] = xyz[0]; refPos[flat * 3 + 1] = xyz[1]; refPos[flat * 3 + 2] = xyz[2];
+    }
+  };
+  // 🔴 chai-1 READS chai-lab's OWN CONFORMERS for every standard residue and nucleotide (chai1-conformers.js,
+  // af3-any-model 9e7446b), where AlphaFold 3 takes the CCD's ideal coordinates: ubiquitin pLDDT 81.6 -> 86.7 there,
+  // native 84.8.
+  if (options.chaiConformers === true) {
+    for (let token = 0; token < tokens; token += 1) overrideConformer(token, CHAI1_CONFORMERS);
+  }
+  if (options.rawLastConformer === true) {
+    let last = -Infinity;
+    for (let slot = 0; slot < tokens * DENSE; slot += 1) if (refMask[slot] !== 0) last = Math.max(last, refSpaceUid[slot]);
+    for (let token = 0; token < tokens; token += 1) {
+      let inLast = false;
+      for (let slot = 0; slot < DENSE; slot += 1) {
+        const flat = token * DENSE + slot;
+        if (refMask[flat] !== 0 && refSpaceUid[flat] === last) { inLast = true; break; }
+      }
+      if (inLast) overrideConformer(token, BOLTZ2_RAW_CONFORMERS);
+    }
+  }
+
+  // 🔴 OpenDDE AND PROTENIX MOVE EACH CENTRED CONFORMER BY U(-1, 1) PER AXIS at inference, as their featuriser does
+  // (af3-any-model 345cb11, `translateConformers`): the weights were trained on ref_pos that is never exactly centred.
+  // Drawn from the fold's seed (as the MSA subsample is), three uniforms a reference space in ascending ref_space_uid,
+  // so a seed names the batch; af3-any-model seeds its draw from a hash of the positions, so the convention is shared
+  // and the values are not (check-batch-fields.js holds both to the unit cube).
+  if (options.translateConformers === true) {
+    const uids = new Set();
+    for (let slot = 0; slot < tokens * DENSE; slot += 1) if (refMask[slot] !== 0) uids.add(refSpaceUid[slot]);
+    const uniform = uniformFrom(options.conformerSeed ?? 0);
+    const shift = new Map();
+    for (const uid of [...uids].sort((a, b) => a - b)) {
+      shift.set(uid, [2 * uniform() - 1, 2 * uniform() - 1, 2 * uniform() - 1]);
+    }
+    for (let slot = 0; slot < tokens * DENSE; slot += 1) {
+      if (refMask[slot] === 0) continue;
+      const s = shift.get(refSpaceUid[slot]);
+      refPos[slot * 3] += s[0]; refPos[slot * 3 + 1] += s[1]; refPos[slot * 3 + 2] += s[2];
+    }
+  }
+
+  // Per-token molecule flags, which boltz2's target_feat sums (its mol-type and modified
+  // conditioning) and batchFromDump has always carried from the reference's batch. Without them
+  // every token read as an unmodified protein residue.
+  const isDna = new Int32Array(tokens);
+  const isRna = new Int32Array(tokens);
+  const isLigand = new Int32Array(tokens);
+  const isModified = new Int32Array(tokens);
+  for (let token = 0; token < tokens; token += 1) {
+    const residue = residueOfToken[token];
+    if (residue < 0) continue;
+    const kind = chainKinds[chainOfResidue[residue]];
+    isDna[token] = kind === "dna" ? 1 : 0;
+    isRna[token] = kind === "rna" ? 1 : 0;
+  }
+  for (const span of ligandSpans) isLigand.fill(1, span.from, span.from + span.count);
+  for (const span of modifiedSpans) isModified.fill(1, span.from, span.from + span.count);
+
+  function unresolvedMask() {
+    if (options.unresolvedLeavingAtoms !== true) return refMask;
+    const mask = Float32Array.from(refMask);
+    const groups = declaredLigandLeavingAtoms(chains.length, ligands, options.bonds);
+    let base = polymerTokens;
+    ligands.forEach((ligand, k) => {
+      for (const atom of groups[k]) mask[(base + atom) * DENSE] = 0;
+      base += ligand.atoms.length;
+    });
+    return mask;
+  }
+  return {
+    sequence: joined, chains, chainLengths,
+    tokens, dense: DENSE, subsets, atomCount, sequences,
+    // the paired block's row count, the query's included (chai-1's IsPairedMSA reads it: af3-any-model num_paired)
+    pairedRows: unpairedFrom,
+    shape: { tokens, dense: DENSE, subsets, queries: QUERIES, keys },
+    aatype, profile, deletionMean,
+    msa, msaMask, deletionMatrix,
+    residueIndex, tokenIndex, asymId, entityId, symId, seqMask,
+    refPos, refMask, refElement, refCharge, refAtomNameChars, refSpaceUid,
+    displayAtomNameChars,
+    // AF3 keeps these separate and they are equal for a protein-only chain:
+    // every atom the model predicts is one it has a reference conformer for.
+    // (chai-1 alone keeps a ligand's leaving group at a declared bond as a token it does not place)
+    predDenseAtomMask: unresolvedMask(),
+    bondMatrix, bondOrderMatrix, declaredBondMatrix, ligandSpans, modifiedSpans, residueOfToken,
+    chainKinds, chainOfResidue, isDna, isRna, isLigand, isModified,
+    tokenAtomsToQueries, queriesToKeys, queriesToTokenAtoms,
+    tokensToQueries, tokensToKeys, tokenAtomsToPseudoBeta,
+    features: { residueIndex, tokenIndex, asymId, entityId, symId },
+  };
+}

@@ -20,8 +20,8 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { featuriseProtein } from "../src/af3/featurise/featurise.js";
-import { toPdb } from "../src/af3/fold.js";
+import { featuriseProtein } from "../shared/af3/featurise/featurise.js";
+import { toPdb } from "../webgpu/af3/fold.js";
 
 const batchOf = () => featuriseProtein("GWSTELEKHR");
 

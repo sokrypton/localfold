@@ -5,35 +5,36 @@
  *       --steps=200 --model=/model-af3-int5/manifest.json
  *     node tools/gpu-chrome.mjs tools/gpu/fold.js --dump=/oracle-dumps/af3-6mrr.json
  *
- * --sequence folds what you type, through src/af3/featurise/featurise.js. --dump folds
+ * --sequence folds what you type, through shared/af3/featurise/featurise.js. --dump folds
  * AF3's own batch and reports the disagreement at every point where the two can
  * be compared, which is the only way the trunk can be checked against AF3's.
  *
- * WHAT IS HERE AND NOT IN src/af3/fold.js: argument parsing, the comparison
+ * WHAT IS HERE AND NOT IN webgpu/af3/fold.js: argument parsing, the comparison
  * against the dump, and the geometry report. The pipeline itself is shared with
  * the page, because the page has to run what was measured.
  */
-import { memorySnapshot, setMemoryBudget } from "../../src/runtime/device-memory.js";
-import { ccdUrl, parseCcdComponent } from "../../src/af3/featurise/ccd-component.js";
-import { nameSmilesLigands, smilesComponent } from "../../src/chem/component.js";
-import { af3ContactClasses } from "../../src/af3/featurise/contact-classes.js";
-import { CLASS_LIGAND, CLASS_NUCLEIC } from "../../src/heads/contact-threshold.js";
-import { af3BatchFromA3m } from "../../src/af3/featurise/batch.js";
-import { mergeRowAlignedChainA3ms } from "../../src/input/chains.js";
-import { foldBatch, toPdb, backboneGeometry } from "../../src/af3/fold.js";
+import { startFromPdb } from "../../shared/af3/structure/warm-start.js";
+import { memorySnapshot, setMemoryBudget } from "../../webgpu/runtime/device-memory.js";
+import { ccdUrl, parseCcdComponent } from "../../shared/af3/featurise/ccd-component.js";
+import { nameSmilesLigands, smilesComponent } from "../../shared/chem/component.js";
+import { af3ContactClasses } from "../../shared/af3/featurise/contact-classes.js";
+import { CLASS_LIGAND, CLASS_NUCLEIC } from "../../shared/heads/contact-threshold.js";
+import { af3BatchFromA3m } from "../../shared/af3/featurise/batch.js";
+import { mergeRowAlignedChainA3ms } from "../../shared/input/chains.js";
+import { foldBatch, toPdb, backboneGeometry } from "../../webgpu/af3/fold.js";
 import { assertChainGeometry } from "./chain-geometry.js";
 import { bondGeometry } from "./bond-geometry.js";
 import { confidenceWeights, openAf3Store, trunkDepths, trunkWeights }
-  from "../../src/af3/weights/weights.js";
-import { warmTrunkPipelines } from "../../src/af3/fold.js";
+  from "../../shared/af3/weights/weights.js";
+import { warmTrunkPipelines } from "../../webgpu/af3/fold.js";
 import { diffusionWeights, atomReference, targetFeatureWeights }
-  from "../../src/af3/weights/diffusion-weights.js";
-import { Af3DiffusionTransformerGpu } from "../../src/af3/diffusion/diffusion-transformer-webgpu.js";
-import { dialectFor , featuriserDialect } from "../../src/af3/dialect.js";
+  from "../../shared/af3/weights/diffusion-weights.js";
+import { Af3DiffusionTransformerGpu } from "../../webgpu/af3/diffusion/diffusion-transformer.js";
+import { dialectFor , featuriserDialect } from "../../shared/af3/dialect.js";
 import { profileDevice } from "./profile.js";
 import { profileBuffers } from "./buffer-profile.js";
 import { setDeviceTuning, deviceTuning, DEFAULT_TUNING }
-  from "../../src/runtime/device-profile.js";
+  from "../../webgpu/runtime/device-profile.js";
 
 function option(args, name, fallback) {
   const prefix = `--${name}=`;
@@ -54,119 +55,9 @@ function relativeRms(actual, expected) {
   return Math.sqrt(error / Math.max(scale, 1e-30));
 }
 
-/**
- * AF3's own batch, in the shape src/af3/featurise/featurise.js produces, so the fold reads
- * one object either way and the two paths cannot silently diverge in what they
- * supply.
- */
-export function batchFromDump(dump) {
-  const tokens = dump.tokens;
-  const dense = 24;
-  // 🔴 PADDED, DELIBERATELY, AND ONLY HERE. The featuriser sizes its subsets
-  // from the real atom count; this path does not, because its gathers ARE
-  // AF3's - read straight out of the dump, at the dense grid's width - and a
-  // subset count that disagreed with the arrays beside it is the failure this
-  // repository keeps meeting. The two paths differ in shape and agree to every
-  // digit in what they fold, which is what the padding was worth.
-  const subsets = Math.ceil((tokens * dense) / 32);
-  const raw = (name) => dump.inputs[name].data;
-  // 🔴 count IS NOT DECORATION. convert() in atom-encoder-reference.js sizes its
-  // output from it, so a gather without one silently produces a zero-length
-  // tensor - which reads downstream as a model that runs and folds a 17 A
-  // spaghetti rather than as an error.
-  const gather = (name) => {
-    const indices = ints(raw(`${name}:gather_idxs`));
-    return {
-    indices, mask: floats(raw(`${name}:gather_mask`)), count: indices.length };
-  };
-  const refMask = floats(raw("ref_mask"));
-  let atomCount = 0;
-  for (const value of refMask) atomCount += value;
-  return {
-    sequence: dump.sequence, tokens, dense, subsets, atomCount,
-    shape: { tokens, dense, subsets, queries: 32, keys: 128 },
-    aatype: ints(raw("aatype")), profile: floats(raw("profile")),
-    deletionMean: floats(raw("deletion_mean")),
-    msa: ints(raw("msa")), msaMask: floats(raw("msa_mask")),
-    // 🔴 THE ROW COUNT IS A SHAPE, AND THE DUMP IS THE ONLY PLACE IT IS WRITTEN
-    // DOWN. AF3 pads its msa array to the crop size and records how many rows
-    // are real in `numMsa`, so deriving it from the array's length reads the
-    // padding as alignment. Absent, the trunk's shader was built with
-    // `const SEQUENCES: u32 = undefinedu;` and the fold died in WGSL parsing -
-    // which is a shape bug wearing a compiler error.
-    sequences: dump.numMsa ?? 1,
-    // ...and the chain identity, which the confidence head's ipTM reduction
-    // indexes directly. Absent, it threw inside reduceTmScore AFTER the whole
-    // fold had run, which is the most expensive place to discover a missing
-    // field.
-    asymId: ints(raw("asym_id")),
-    deletionMatrix: floats(raw("deletion_matrix")),
-    seqMask: floats(raw("seq_mask")),
-    // 🔴 AND WHICH RESIDUE EACH TOKEN BELONGS TO, which the featuriser records
-    // and this path did not. OpenDDE's structural layout reads it to decide a
-    // token's molecule kind, so `fold-opendde.js --dump=` died in
-    // `kindOfToken` reading undefined - a batch that is complete for AF3 and
-    // incomplete for the family that re-tokenises. Derived from the dump's own
-    // (asym_id, residue_index) pairs: a new pair starts a new residue, which is
-    // exactly the grouping the featuriser builds.
-    ...(() => {
-      const asym = ints(raw("asym_id"));
-      const residueIndex = ints(raw("residue_index"));
-      const residueOfToken = new Int32Array(tokens).fill(-1);
-      const chainOfResidue = [];
-      const chains = new Map();
-      let residue = -1, lastKey = null;
-      for (let token = 0; token < tokens; token += 1) {
-        const key = `${asym[token]}:${residueIndex[token]}`;
-        if (key !== lastKey) {
-          residue += 1; lastKey = key;
-          if (!chains.has(asym[token])) chains.set(asym[token], chains.size);
-          chainOfResidue.push(chains.get(asym[token]));
-        }
-        residueOfToken[token] = residue;
-      }
-      return { residueOfToken, chainOfResidue };
-    })(),
-    refPos: floats(raw("ref_pos")), refMask,
-    refElement: ints(raw("ref_element")), refCharge: floats(raw("ref_charge")),
-    refAtomNameChars: ints(raw("ref_atom_name_chars")),
-    refSpaceUid: ints(raw("ref_space_uid")),
-    predDenseAtomMask: floats(raw("pred_dense_atom_mask")),
-    // 🔴 boltz2's `target_feat` READS ALL FOUR OF THESE and every other model
-    // reads none of them, so they were in the dump and not in the batch. Its
-    // InputEmbedder projects a mol_type one-hot and a modified flag onto the
-    // single track; see `targetFeatures`.
-    // Each independently, because a dump written for one model carries a
-    // different subset - `af3-6mrr.json` has is_dna and no is_modified, and
-    // reading them as a group threw inside `raw` on a fold that never needed
-    // any of them.
-    ...Object.fromEntries([["isDna", "is_dna"], ["isRna", "is_rna"],
-                           ["isLigand", "is_ligand"], ["isModified", "is_modified"]]
-      .filter(([, name]) => dump.inputs[name] !== undefined)
-      .map(([field, name]) => [field, ints(raw(name))])),
-    tokenAtomsToQueries: gather("token_atoms_to_queries"),
-    queriesToKeys: gather("queries_to_keys"),
-    queriesToTokenAtoms: gather("queries_to_token_atoms"),
-    tokensToQueries: gather("tokens_to_queries"),
-    tokensToKeys: gather("tokens_to_keys"),
-    tokenAtomsToPseudoBeta: gather("token_atoms_to_pseudo_beta"),
-    // 🔴 AND AT THE TOP LEVEL TOO, WHICH IS WHERE THE READERS LOOK. The
-    // featuriser returns `residueIndex, tokenIndex, asymId, entityId, symId` as
-    // fields of the batch; this path had them ONLY under `features`, so
-    // `structural-tokens.js` read `batch.entityId` as undefined and
-    // `fold-opendde.js --dump=` crashed AFTER the trunk comparison had already
-    // printed - which reads as a broken tool rather than a missing field. Same
-    // class as `residueOfToken` above: a batch that is complete for AF3 and
-    // incomplete for the family that re-tokenises.
-    residueIndex: ints(raw("residue_index")), tokenIndex: ints(raw("token_index")),
-    entityId: ints(raw("entity_id")), symId: ints(raw("sym_id")),
-    features: {
-      residueIndex: ints(raw("residue_index")), tokenIndex: ints(raw("token_index")),
-      asymId: ints(raw("asym_id")), entityId: ints(raw("entity_id")),
-      symId: ints(raw("sym_id")),
-    },
-  };
-}
+import { batchFromDump } from "../../shared/af3/featurise/batch-from-dump.js";
+export { batchFromDump } from "../../shared/af3/featurise/batch-from-dump.js";
+
 
 export async function main(device, args) {
   const dumpPath = option(args, "dump", "/oracle-dumps/af3-6mrr.json");
@@ -197,11 +88,12 @@ export async function main(device, args) {
   // and prints an N-CA of 27 A next to an ideal of 1.46, which reads as
   // corrupted weights rather than as the wrong flag. The flow reaches a
   // structure in eight because it is a different walk - see
-  // src/af3/diffusion/diffusion-sampler-webgpu.js - so say so rather than let the
+  // webgpu/af3/diffusion/diffusion-sampler.js - so say so rather than let the
   // geometry report take the blame.
-  if (samplerMode === "diffusion" && steps < 50) {
+  // (with Euler's step: --update=exponential folds 6MRR at 8 steps, cpu/af3/diffusion/diffusion-sampler.js)
+  if (samplerMode === "diffusion" && steps < 50 && option(args, "update", "euler") !== "exponential") {
     console.log(`🔴 ${steps} steps of the DIFFUSION sampler will not converge -`
-      + " it wants about 200. Add --mode=flow to get a structure in this many,"
+      + " it wants about 200. Add --update=exponential to get a structure in this many,"
       + " or raise --steps. What follows is expected to look like noise.");
   }
 
@@ -287,8 +179,9 @@ export async function main(device, args) {
   // "a fold run here is the fold the page runs" and for two features it was
   // not: it passed no profile rows (profiling the CROPPED msa where the page
   // profiles the whole file) and no seeded row choice (taking the alignment's
-  // prefix where the page takes a seeded subset). `--prefix-rows` restores the
-  // second for comparing against a baseline recorded before this.
+  // prefix where the page took a seeded subset). The row choice is the trunk's
+  // now, every pass (shared/af3/msa-draw.js): `--msa-draw=prefix` is the old
+  // prefix and `--msa-draw=once` the old single draw.
   // 🔴 THE DIALECT BEFORE THE STORE, because the batch is built here and the
   // weights are not loaded until later - and `weights?.trunk?.dialect?...`
   // written at this line would be `undefined` forever, which is a convention
@@ -306,10 +199,9 @@ export async function main(device, args) {
     ? af3BatchFromA3m(sequenceArg, alignment, {
       maxSequences: Number(option(args, "max-msa", "512")),
       seed: Number(option(args, "seed", "20260831")),
-    // The padded template slot count; see src/af3/fold.js.
+    // The padded template slot count; see webgpu/af3/fold.js.
     ...(option(args, "templates", "") === "" ? {}
       : { templates: Number(option(args, "templates", "")) }),
-      prefixRows: args.includes("--prefix-rows"),
       // Every featuriser convention the dialect names, forwarded as one - see
       // `featuriserDialect`. Listing them here is how the atomised-token four
       // would have reached the checker and not the fold.
@@ -389,6 +281,26 @@ export async function main(device, args) {
   const depths = trunkDepths(store);
   const blocks = blocksOption === "" ? depths.pairformerBlocks : Number(blocksOption);
   console.log(`trunk ${blocks} pairformer blocks, ${depths.msaBlocks} MSA blocks`);
+  // 🔴 APPLIED BEFORE THE WARM BELOW, which compiles under whatever tuning is
+  // in force when it starts: after it, a `--tune` arm that changes a kernel
+  // warmed the prior's kernels and folded with its own.
+  const tune = option(args, "tune", "");
+  if (tune !== "") {
+    const forced = {};
+    for (const pair of tune.split(",").filter(Boolean)) {
+      const at = pair.indexOf("=");
+      if (at < 0) throw new Error(`--tune wants key=value, got ${pair}`);
+      const key = pair.slice(0, at);
+      const raw = pair.slice(at + 1);
+      if (!(key in DEFAULT_TUNING)) {
+        throw new Error(`--tune names ${key}, which is not a tuning knob. `
+          + `Known: ${Object.keys(DEFAULT_TUNING).sort().join(", ")}`);
+      }
+      try { forced[key] = JSON.parse(raw); } catch { forced[key] = raw; }
+    }
+    setDeviceTuning(device, forced);
+    console.log(`tuning forced: ${JSON.stringify(forced)}`);
+  }
   // 🔴 THE PAIRFORMER'S SHADERS, WHILE THE SHARDS ARE STILL ARRIVING. A fold's
   // compilation is 0.80 s of AF3's 2.47 and 1.23 of OpenDDE's 2.93, the
   // compiler pool is saturated while it runs, and the weight load in front of
@@ -588,23 +500,6 @@ export async function main(device, args) {
       return result;
     };
   }
-  const tune = option(args, "tune", "");
-  if (tune !== "") {
-    const forced = {};
-    for (const pair of tune.split(",").filter(Boolean)) {
-      const at = pair.indexOf("=");
-      if (at < 0) throw new Error(`--tune wants key=value, got ${pair}`);
-      const key = pair.slice(0, at);
-      const raw = pair.slice(at + 1);
-      if (!(key in DEFAULT_TUNING)) {
-        throw new Error(`--tune names ${key}, which is not a tuning knob. `
-          + `Known: ${Object.keys(DEFAULT_TUNING).sort().join(", ")}`);
-      }
-      try { forced[key] = JSON.parse(raw); } catch { forced[key] = raw; }
-    }
-    setDeviceTuning(device, forced);
-    console.log(`tuning forced: ${JSON.stringify(forced)}`);
-  }
   const keepWeights = option(args, "keep-weights", null);
   if (keepWeights === "off") setDeviceTuning(device, { keepTrunkWeights: null });
   if (keepWeights === "on") setDeviceTuning(device, { keepTrunkWeights: true });
@@ -711,22 +606,49 @@ export async function main(device, args) {
   trajectory.length = 0;
   lastDenoised = null;
 
+  // 🔴 --start=<served path of a previous fold's PDB> --start-level=<A>: AF3's diffusion joined
+  // part-way down from that structure (shared/af3/structure/warm-start.js) - Protein Hunter's history,
+  // measurable alone here
+  const startPath = option(args, "start", "");
+  const start = startPath === "" ? undefined : {
+    positions: startFromPdb(batch, await (await fetch(startPath)).text()).positions,
+    level: Number(option(args, "start-level", "10")),
+  };
   result = await foldBatch(device, batch, weights, {
+    ...(start === undefined ? {} : { start }),
     // Omitted, each defaults to what the device supports. See docs/AF3.md.
     stagedPrecision: option(args, "staged", undefined),
     weightPrecision: option(args, "weights", undefined),
     pairWeightPrecision: option(args, "pair-weights", undefined),
     accumulatePrecision: option(args, "accumulate", undefined),
     mode: samplerMode,
+    // the diffusion's discretisation (cpu/af3/diffusion/diffusion-sampler.js): --schedule=geometric,
+    // --update=exponential, --no-churn - the native port's flags
+    diffusion: {
+      ...(option(args, "schedule", undefined) ? { schedule: option(args, "schedule", undefined) } : {}),
+      ...(option(args, "update", undefined) ? { update: option(args, "update", undefined) } : {}),
+      ...(args.includes("--no-churn") ? { churn: false } : {}),
+    },
     recycles: Number(option(args, "recycles", "0")),
     // 🔴 THE ONLY EARLY STOP A TRUNK-ONLY RECYCLE CAN HAVE, in ANGSTROMS, on
     // the distances the distogram predicts - the same quantity and unit as
     // AF2's, whose ColabFold default is 0.5. 0 is off; see
-    // src/af3/feature-convergence.js and docs/AF3.md for what has actually
+    // shared/af3/feature-convergence.js and docs/AF3.md for what has actually
     // been measured, which is two inputs' worth and not a corpus.
     recycleTolerance: Number(option(args, "recycle-tolerance", "0")),
+    // The angstrom metric costs a softmax over every pair's bins each pass,
+    // so it is computed only when asked; a tolerance above zero asks for it.
+    recycleDistances: args.includes("--recycle-distances"),
+    // ...and the pair/single deltas, which need every pass read back to the host.
+    recycleDeltas: args.includes("--recycle-deltas"),
+    // The pair track's scratch layout: `on` forces the lean one (vector
+    // kernels, three and a quarter pair-sized buffers), `off` the matrix one;
+    // omitted, the device's budget decides. See trunk.js.
+    leanPair: { on: true, off: false }[option(args, "lean-pair", "")],
     steps, stopAfter: Number(option(args, "truncate", String(steps))),
     seed: Number(option(args, "seed", "20260831")),
+    // which MSA rows each trunk pass reads: pass (AF3's, the default), once, prefix
+    ...(option(args, "msa-draw", "") === "" ? {} : { msaDraw: option(args, "msa-draw", "") }),
     // The trunk's intermediate seams, compared as they are produced.
     ...(trunkOracle === null ? {} : {
       onSeam: (name, value) => compareToOracle(name, value),
@@ -981,7 +903,7 @@ export async function main(device, args) {
     denoisedPdb: toPdb(batch, lastDenoised, result.scores?.plddt),
     // Per recycle, how far the trunk's single and pair moved from the pass
     // before. A trunk-only recycle produces no coordinates, so this is the only
-    // convergence signal there is - see src/af3/feature-convergence.js.
+    // convergence signal there is - see shared/af3/feature-convergence.js.
     recycleDeltas: result.recycleDeltas?.map((d) => ({
       pass: d.pass,
       pair: Number(d.pair.toExponential(3)),

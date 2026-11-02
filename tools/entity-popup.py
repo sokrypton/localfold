@@ -137,6 +137,75 @@ MEASURE = """(() => {
 })()"""
 
 
+# 🔴 AND DOES FETCH SAY WHAT A PDB ID HOLDS BEFORE THE FOLD. A PDB id used to
+# be fetched only when Fold was pressed, so a typo or a six-chain entry said
+# nothing in the popup. The RCSB is stubbed with the 1BRS fixture so this runs
+# offline: Fetch must list its six protein chains as a menu, choosing one must
+# write `1BRS_D` into the box, the cached text must be on the template for the
+# fold to reuse, and editing the id must take all of it away again.
+FETCH = """(async () => {
+  const fixture = await (await fetch('/tools/fixtures/1brs-crystal.pdb')).text();
+  const real = window.fetch;
+  let asked = 0;
+  window.fetch = async (url, init) => {
+    if (String(url).startsWith('https://files.rcsb.org/')) {
+      asked += 1;
+      return String(url).endsWith('/1BRS.pdb') ? new Response(fixture)
+        : new Response('', { status: 404 });
+    }
+    return real(url, init);
+  };
+  const popup = () => document.querySelector('.entity-popup');
+  // ...twice when needed: MEASURE's `set` re-rendered the row under an open
+  // popup, so the first click only closes the detached one.
+  if (popup() === null) document.querySelector('.entity-options')?.click();
+  if (popup() === null) document.querySelector('.entity-options')?.click();
+  if (popup() === null) {
+    return JSON.stringify({ error: 'no popup: ' + JSON.stringify(window.__entityList.read().map((e) => e.type))
+      + ' options ' + document.querySelectorAll('.entity-options').length });
+  }
+  const kind = popup().querySelector('.entity-template-kind');
+  kind.value = 'pdb';
+  kind.dispatchEvent(new Event('change', { bubbles: true }));
+  const box = popup().querySelector('.entity-template-source');
+  box.value = '1brs';
+  box.dispatchEvent(new Event('input', { bubbles: true }));
+  popup().querySelector('.entity-template-fetch').click();
+  const settled = async () => {
+    for (let i = 0; i < 100; i += 1) {
+      const text = popup()?.querySelector('.entity-template-status')?.textContent ?? '';
+      if (!text.startsWith('Fetching')) return text;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    return 'timed out';
+  };
+  const out = { status: await settled() };
+  const menus = popup().querySelectorAll('.entity-template-kind');
+  const chainMenu = menus.length > 1 ? menus[menus.length - 1] : null;
+  out.chains = chainMenu === null ? [] : [...chainMenu.options].map((o) => o.value);
+  if (chainMenu !== null) {
+    chainMenu.value = 'D';
+    chainMenu.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+  out.box = popup().querySelector('.entity-template-source').value;
+  out.after = popup().querySelector('.entity-template-status').textContent;
+  out.cached = typeof window.__entityList.read()[0].template?.fetched?.text === 'string';
+  const again = popup().querySelector('.entity-template-source');
+  again.value = '1qys';
+  again.dispatchEvent(new Event('input', { bubbles: true }));
+  out.cleared = window.__entityList.read()[0].template?.fetched === undefined;
+  again.value = '9zzz';
+  again.dispatchEvent(new Event('input', { bubbles: true }));
+  popup().querySelector('.entity-template-fetch').click();
+  out.missing = await settled();
+  out.missingIsProblem = popup().querySelector('.entity-template-status')
+    .classList.contains('entity-popup-problem');
+  out.asked = asked;
+  window.fetch = real;
+  return JSON.stringify(out);
+})()"""
+
+
 def main() -> int:
     httpd = serve()
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
@@ -215,9 +284,30 @@ def main() -> int:
                 print("FAIL: a row for a DIFFERENT sequence kept the old"
                       " chain's setting")
                 failed = True
+        fetched = json.loads(cdp.evaluate(ws, FETCH))
+        if "error" in fetched:
+            print("could not fetch:", fetched["error"])
+            return 1
+        print(f"  fetch    {fetched['status']!r}")
+        print(f"           chains {fetched['chains']}  ->  box {fetched['box']!r}")
+        print(f"           {fetched['after']!r}")
+        print(f"           cached {fetched['cached']}  cleared on edit {fetched['cleared']}")
+        print(f"           missing: {fetched['missing']!r}")
+        if fetched["chains"] != ["A", "B", "C", "D", "E", "F"]:
+            print("FAIL: Fetch did not list 1BRS's six protein chains")
+            failed = True
+        if fetched["box"] != "1BRS_D" or "chain D: 87 residues" not in fetched["after"]:
+            print("FAIL: choosing chain D did not reach the box and the status")
+            failed = True
+        if not fetched["cached"] or not fetched["cleared"]:
+            print("FAIL: the fetched file is not kept for the fold, or outlives an edit")
+            failed = True
+        if not fetched["missing"].startswith("Could not fetch 9ZZZ") or not fetched["missingIsProblem"]:
+            print("FAIL: an entry the RCSB does not hold did not say so")
+            failed = True
         if failed:
             return 1
-        print("OK: the popup holds its size across every template source")
+        print("OK: the popup holds its size across every template source, and Fetch reports the entry")
         return 0
     finally:
         proc.kill()

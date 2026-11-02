@@ -24,7 +24,7 @@ const option = (args, name, fallback) => {
   return args.find((a) => a.startsWith(prefix))?.slice(prefix.length) ?? fallback;
 };
 
-// src/af3/fold.js's generator, verbatim.
+// webgpu/af3/fold.js's generator, verbatim.
 const GENERATOR = `
 function make(seed) {
   let state = seed >>> 0;

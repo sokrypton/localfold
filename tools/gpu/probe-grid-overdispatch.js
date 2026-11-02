@@ -31,7 +31,7 @@
  * non-atomic read-modify-writes on one address is a race, so expect a different
  * value each run there - which is the point, and why `runs` repeats it.
  */
-import { ADD_IN_PLACE_SHADER } from "../../src/runtime/execution.js";
+import { ADD_IN_PLACE_SHADER } from "../../webgpu/runtime/execution.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;

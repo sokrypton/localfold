@@ -11,8 +11,8 @@ import {
   CLASS_LIGAND, CLASS_NUCLEIC, CLASS_PROTEIN, LIGAND_PROTEIN_ANGSTROMS,
   PSEUDO_BETA_RESIDUES, contactAngstromsForClasses, contactBinsByPair,
   contactClass,
-} from "../src/heads/contact-threshold.js";
-import { af3ContactBins, af3ContactClasses } from "../src/af3/featurise/contact-classes.js";
+} from "../shared/heads/contact-threshold.js";
+import { af3ContactBins, af3ContactClasses } from "../shared/af3/featurise/contact-classes.js";
 
 describe("the contact threshold", () => {
   it("has one number for each of the twenty, and they span the side chains", () => {

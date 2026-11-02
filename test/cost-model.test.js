@@ -16,7 +16,7 @@ import {
   af2BlockUnits, af2Plan, af2StructureStepUnits, af3DenoiserCallUnits, af3Plan,
   af3TrunkPassUnits, af3TrunkStageSpans, AF3_TRUNK_STAGE_SHARES,
   describeRemaining, planTotal, RuntimeEstimator,
-} from "../src/runtime/cost-model.js";
+} from "../webgpu/runtime/cost-model.js";
 
 /** Measured on the reference M2 by tools/gpu/bench-runtime.js. */
 const AF3_TRUNK = [

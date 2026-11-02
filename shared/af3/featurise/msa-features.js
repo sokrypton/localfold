@@ -1,0 +1,351 @@
+/**
+ * An A3M alignment, in the codes AF3's MSA one-hot expects.
+ *
+ *     const { msa, deletionMatrix } = af3MsaFromA3m(text);
+ *     featuriseProtein(sequence, { msa, deletionMatrix });
+ *
+ * This is the whole of AF3's MSA path. It is short because AF3's is short: the
+ * data pipeline hands the model aligned rows and deletion counts, and the model
+ * draws `num_msa` of them afresh on every trunk pass (shared/af3/msa-draw.js).
+ * Everything else AlphaFold 2 does between those two points - clustering to 508
+ * centres, a separate extra-MSA stack of 1024 more rows, Gumbel masking - AF3
+ * does not do at all.
+ *
+ * 🔴 GAP IS 21, NOT 31. AF3's MSA alphabet is
+ * `PROTEIN_TYPES_WITH_UNKNOWN + (GAP,) + NUCLEIC_TYPES_WITH_2_UNKS`, so the gap
+ * sits between the amino acids and the nucleotides rather than at the end of a
+ * 32-wide one-hot. Putting it at 31 type-checks, folds, and quietly tells the
+ * model that every gap is an unknown nucleotide. The table below is transcribed
+ * from `_PROTEIN_TO_ID` in AF3's `data/msa_features.py`, aliases included.
+ *
+ * 🔴 THE DELETION COUNTS STAY RAW. AF2's featuriser squashes them on the way in
+ * (`atan(n/3) * 2/pi`); AF3's does not, because its embedder does the squashing
+ * itself - `msaFeatures()` emits both a clipped and an arctan channel from the
+ * same integer. Passing pre-squashed values here applies the transform twice
+ * and costs the model the distinction between one deletion and thirty.
+ *
+ * 🔴 ROWS ARE TAKEN IN ORDER, NOT SAMPLED. AF3's `truncate_msa_batch` is
+ * `jnp.arange(num_msa)` - the first N rows, whatever they are. That is only a
+ * good alignment because the pipeline upstream sorted them; MMseqs2 returns
+ * hits in decreasing similarity, so the first N are the N most similar. A
+ * shuffle here would be a different model input, not a fairer sample.
+ */
+import { parseA3m } from "../../input/a3m.js";
+
+/**
+ * AF3's protein MSA alphabet, `_PROTEIN_TO_ID`.
+ *
+ * The 20 amino acids are in AF2's order, so a code is interchangeable with an
+ * AF2 aatype up to 19. Past that they diverge: X is 20 in both, but AF3 puts
+ * the gap at 21 where AF2 has no gap code at all.
+ */
+export const AF3_MSA_CODES = Object.freeze({
+  A: 0, R: 1, N: 2, D: 3, C: 4, Q: 5, E: 6, G: 7, H: 8, I: 9,
+  L: 10, K: 11, M: 12, F: 13, P: 14, S: 15, T: 16, W: 17, Y: 18, V: 19,
+  X: 20,
+  "-": 21,
+  // The ambiguity codes, resolved as AF3 resolves them: B and Z to the acid
+  // rather than the amide, U (selenocysteine) to cysteine, J and O to unknown.
+  B: 3, Z: 6, U: 4, J: 20, O: 20,
+});
+
+/** AF3's `padding_shapes.msa_size`: the rows features.py keeps, of which the model's shuffle draws num_msa. */
+export const AF3_MSA_SIZE = 16384;
+/** AF3 stores an MSA deletion count as int8 (features.py safe_cast_int8): the most a row's column can say */
+export const AF3_MSA_MAX_DELETION = 127;
+
+/** The gap, which is neither an amino acid nor a nucleotide. */
+export const AF3_MSA_GAP = 21;
+
+// AF3's _RNA_TO_ID and _DNA_TO_ID: the nucleotides continue past the gap, and every other letter
+// is the nucleic unknown, 30
+const nucleicCodes = (table) => {
+  const codes = {};
+  for (let c = 65; c <= 90; c += 1) codes[String.fromCharCode(c)] = 30;
+  return Object.freeze({ ...codes, ...table, "-": 21 });
+};
+export const AF3_RNA_MSA_CODES = nucleicCodes({ A: 22, G: 23, C: 24, U: 25 });
+export const AF3_DNA_MSA_CODES = nucleicCodes({ A: 26, G: 27, C: 28, T: 29 });
+const CODES_OF_KIND = { protein: AF3_MSA_CODES, rna: AF3_RNA_MSA_CODES, dna: AF3_DNA_MSA_CODES };
+
+/**
+ * Turn A3M text into AF3's MSA rows.
+ *
+ * 🔴 AF3's MSA IS TWO BLOCKS, NOT ONE. A chain carries a `paired_msa` and an
+ * `unpaired_msa`, and the model's `msa` is the first followed by the second.
+ * The paired block's rows line up ACROSS chains - row s is one species in every
+ * chain - which is what lets the model read coevolution between chains; the
+ * unpaired block is block-diagonal, each chain's homologs against gaps
+ * everywhere else. A merged single alignment can only be the unpaired block.
+ *
+ * 🔴 AN ABSENT PAIRED BLOCK IS THE QUERY, NOT NOTHING (`Msa.sequences or
+ * [query_sequence]`), and AF3 keeps the unpaired block's own query row as well.
+ * So a monomer folded against a 32-row A3M reaches the model as 33 rows whose
+ * first two are identical. Dropping the duplicate looks tidier, reads better,
+ * and is a different model input. `featuriseProtein` writes the first of the
+ * two - it is the paired block's only row - and this returns everything after.
+ *
+ * 🔴 AND THE PROFILE IS OVER THE UNPAIRED BLOCK ALONE. AF3 computes it in the
+ * data pipeline, per chain, from the unpaired alignment, before the paired
+ * rows are prepended - so `unpairedFrom` is returned rather than left to be
+ * guessed from the row count. Averaging the whole array instead double-counts
+ * the query in every column.
+ *
+ * A complex needs no special case here: the rows of a merged complex A3M are
+ * already the full token length, with gaps where a chain has no homolog. Which
+ * merge produced them - paired or block-diagonal - is the caller's decision,
+ * and is what the two arguments distinguish.
+ *
+ * @param {{paired?: string|null, unpaired?: string|null,
+ *           unpairedProfile?: string|null}|string} alignment A3M text for each
+ *   block; a bare string is the unpaired block, which is what a monomer has.
+ *   `unpairedProfile` is the unpaired block BEFORE deduplication, for the
+ *   profile; it defaults to `unpaired`, which is right whenever nothing was
+ *   deduplicated.
+ * @param {object} [options] the column kinds and the families' conventions; how
+ *   many rows the MODEL reads a pass is the trunk's (`batch.numMsa`), not this.
+ * @returns {{msa: Int32Array[], deletionMatrix: Float32Array[], depth: number,
+ *            unpairedFrom: number, length: number,
+ *            profileMsa: Int32Array[], profileDeletionMatrix: Float32Array[]}}
+ *   `profileMsa` is the unpaired block the PROFILE is computed over: before
+ *   deduplication and before the crop, which is where AF3 computes it.
+ */
+/**
+ * A block's rows as OpenFold3 reads its main MSA: per chain, the first `cap` rows (the chain's query first), deduplicated
+ * on the aligned (insertion-free) row. `chainOfColumn` names each column's chain; absent, every column is one chain.
+ */
+export function capMainMsa(parsed, cap, chainOfColumn) {
+  const chainOf = (row) => {
+    const aligned = parsed.sequences[row];
+    for (let column = 0; column < aligned.length; column += 1) {
+      if (aligned[column] !== "-") return chainOfColumn === undefined ? 0 : chainOfColumn[column];
+    }
+    return chainOfColumn === undefined ? 0 : chainOfColumn[0];
+  };
+  const counted = new Map(), seen = new Map();
+  const keep = [0];
+  for (let row = 1; row < parsed.depth; row += 1) {
+    const chain = chainOf(row);
+    if (!seen.has(chain)) { seen.set(chain, new Set([parsed.sequences[0]])); counted.set(chain, 1); }
+    const n = counted.get(chain);
+    counted.set(chain, n + 1);
+    if (n >= cap || seen.get(chain).has(parsed.sequences[row])) continue;
+    seen.get(chain).add(parsed.sequences[row]);
+    keep.push(row);
+  }
+  if (keep.length === parsed.depth) return parsed;
+  return { ...parsed, descriptions: keep.map((r) => parsed.descriptions[r]),
+           rawSequences: keep.map((r) => parsed.rawSequences[r]), sequences: keep.map((r) => parsed.sequences[r]),
+           deletionMatrix: keep.map((r) => parsed.deletionMatrix[r]), depth: keep.length };
+}
+
+/**
+ * protenix's (and OpenDDE's) unpaired MSA (`protenixUnpairedMsa`, af3-any-model's prepare_input with
+ * dedupe_unpaired_msa and pair_as_unpair): each PROTEIN chain's paired rows join its unpaired rows, paired first, and
+ * the result is deduplicated on the aligned (insertion-free) row - its query once. `unpaired` and `paired` are merged
+ * blocks, row-aligned across chains (mergeRowAlignedChainA3ms), so each chain's rows are cut from its own columns and
+ * the chains are stacked side by side again, a shorter one padded with gaps. A segment that is all gap in the
+ * unpaired block past its query is a pad and not a row; in the paired block it is the chain's row for that species.
+ */
+export function pairedIntoUnpaired(unpaired, paired, chainOfColumn, columnKinds, { dedupe = true } = {}) {
+  if (unpaired === null && paired === null) return null;
+  const base = unpaired ?? paired;
+  const length = base.length;
+  const chainOf = (column) => (chainOfColumn === undefined ? 0 : chainOfColumn[column]);
+  const ranges = [];
+  for (let column = 0; column < length; column += 1) {
+    const chain = chainOf(column);
+    if (ranges.length === 0 || ranges[ranges.length - 1].chain !== chain) ranges.push({ chain, from: column, to: column });
+    ranges[ranges.length - 1].to = column + 1;
+  }
+  const lists = ranges.map(({ from, to }) => {
+    const protein = columnKinds === undefined || (columnKinds[from] ?? "protein") === "protein";
+    const rows = [];
+    const take = (parsed, row) => ({ sequence: parsed.sequences[row].slice(from, to),
+                                     deletions: parsed.deletionMatrix[row].slice(from, to) });
+    if (protein && paired !== null) for (let row = 0; row < paired.depth; row += 1) rows.push(take(paired, row));
+    if (unpaired !== null) {
+      // (without the dedupe - rf3's - the unpaired block's own query is skipped where the paired rows began with it)
+      for (let row = dedupe || !protein || paired === null ? 0 : 1; row < unpaired.depth; row += 1) {
+        const one = take(unpaired, row);
+        if (row > 0 && /^-*$/.test(one.sequence)) continue;
+        rows.push(one);
+      }
+    }
+    if (!protein || !dedupe) return rows;
+    // ("letters": IntelliFold's boltz-derived parse_csv - a row repeating an earlier one's residues, gaps aside, goes)
+    const key = (one) => (dedupe === "letters" ? one.sequence.replace(/-/g, "") : one.sequence);
+    const seen = new Set();
+    return rows.filter((one) => (seen.has(key(one)) ? false : (seen.add(key(one)), true)));
+  });
+  const depth = Math.max(...lists.map((rows) => rows.length));
+  const sequences = [], deletionMatrix = [];
+  for (let row = 0; row < depth; row += 1) {
+    let sequence = "";
+    const deletions = [];
+    ranges.forEach(({ from, to }, k) => {
+      const one = lists[k][row];
+      sequence += one === undefined ? "-".repeat(to - from) : one.sequence;
+      for (let at = 0; at < to - from; at += 1) deletions.push(one === undefined ? 0 : one.deletions[at]);
+    });
+    sequences.push(sequence);
+    deletionMatrix.push(deletions);
+  }
+  return { ...base, descriptions: sequences.map((_, row) => `row ${row}`), rawSequences: sequences.slice(), sequences,
+           deletionMatrix, depth };
+}
+
+export function af3MsaFromA3m(alignment, options = {}) {
+  const texts = typeof alignment === "string" ? { unpaired: alignment } : (alignment ?? {});
+  // 🔴 A COLUMN'S ALPHABET IS ITS CHAIN'S. A U in an RNA column is uracil (25), in a protein
+  // column selenocysteine (read as C); `columnKinds` names each column's chain kind when the
+  // alignment spans nucleic chains, and every column is protein without it.
+  const columnKinds = options.columnKinds;
+  const codeTables = columnKinds === undefined ? null
+    : columnKinds.map((kind) => CODES_OF_KIND[kind] ?? AF3_MSA_CODES);
+  const codeOf = (aligned, column) => {
+    const table = codeTables === null ? AF3_MSA_CODES : codeTables[column];
+    return table[aligned[column]] ?? (table === AF3_MSA_CODES ? AF3_MSA_CODES.X : 30);
+  };
+  const parse = (text) => {
+    if (text === undefined || text === null || text.trim() === "") return null;
+    const parsed = parseA3m(text, { anyLetter: codeTables !== null });
+    if (codeTables !== null && parsed.length !== codeTables.length) {
+      throw new Error(`the alignment is ${parsed.length} columns and its chains ${codeTables.length}`);
+    }
+    return parsed;
+  };
+  const paired = parse(texts.paired);
+  // 🔴 OPENFOLD3's MAIN MSA (openbind0's `mainMsaCap`): each chain's first N rows of its unpaired alignment,
+  // deduplicated ignoring insertions, are all it reads - its profile and deletion mean included - where AlphaFold 3
+  // keeps every row (af3-any-model b84aa69: on msa_gappy 6530 of 21577 rows, profile max|d| 0.18 without). The block
+  // here is block-diagonal - each chain's rows fill its own columns under one full-length query - so a row's chain is
+  // the chain of its first filled column, and a chain's own query (row zero) counts as its first row.
+  const capped = (parsed) => (parsed === null || !(options.mainMsaCap > 0) ? parsed
+    : capMainMsa(parsed, options.mainMsaCap, options.chainOfColumn));
+  const protenix = (parsed) => (options.protenixUnpairedMsa === true
+    ? pairedIntoUnpaired(parsed, parse(texts.paired), options.chainOfColumn, columnKinds) : parsed);
+  const unpaired = protenix(capped(parse(texts.unpaired)));
+  // 🔴 THE PROFILE IS COMPUTED BEFORE DEDUPLICATION, over the chain's FULL
+  // unpaired alignment. AF3's features.py calls get_profile_features on every
+  // chain and only then runs msa_pairing.deduplicate_unpaired_sequences, so the
+  // rows the dedup removes still counted towards the profile. Computing it from
+  // what survives is the natural reading and it is a different feature - on a
+  // target with good pairing most of the unpaired block is removed, so most of
+  // the profile would be missing from it.
+  let unpairedProfile = (texts.unpairedProfile ? protenix(capped(parse(texts.unpairedProfile))) : null) ?? unpaired;
+  // (rf3: atomworks' MSA is one block a chain - its query, its paired rows, its unpaired rows, none dropped - and its
+  // profile is over that block; the rows the model reads stay this port's, the profile's are atomworks')
+  if (options.rf3ProfileMsa === true && paired !== null) {
+    unpairedProfile = pairedIntoUnpaired(unpairedProfile, paired, options.chainOfColumn, columnKinds, { dedupe: false });
+  }
+  // (intellifold2: its profile is per chain over the chain's own sequences - query, paired and unpaired, repeats
+  // dropped - the first msa_valid_depths rows of its paired MSA, af3-any-model's _boltz_msa intellifold2 variant)
+  if (options.if2ProfileMsa === true && paired !== null) {
+    unpairedProfile = pairedIntoUnpaired(unpairedProfile, paired, options.chainOfColumn, columnKinds, { dedupe: "letters" });
+  }
+
+  // 🔴 THE ROWS RETURNED ARE AF3's WHOLE 16384-ROW MSA, NOT A DRAW FROM IT. features.py crops every chain to
+  // `msa_size` rows (choose_paired_unpaired_msa_crop_sizes: the paired block to half, `max_paired_sequences =
+  // msa_size // 2`, the unpaired to what the paired block leaves), and the model's trunk then draws `num_msa` of those
+  // afresh on EVERY pass - shared/af3/msa-draw.js, gathered by each backend's trunk. This function drew 1024 once, for
+  // the whole fold, and that one change was 8S83's whole gap to stock AF3 (13 seeds of 20 docked against 6).
+  //
+  // 🔴 AND THE PAIRED BLOCK IS ONE ROW TALLER THAN ITS A3M. The pairing keeps
+  // row 0 as the query and then emits the species-aligned rows, which begin at
+  // the A3M's own query again - the same duplication the unpaired block has. So
+  // the block AF3 crops is `depth + 1`, and the rows returned here are all of
+  // the A3M's, not all-but-the-first. Skipping one looks right, matches on a
+  // monomer (where there is no paired block at all), and is short by a row on
+  // every complex.
+  //
+  // 🔴 AND THE POOL IS THE CROP, NOT THE WHOLE ALIGNMENT. Since the unpaired block is stacked row k beside row k,
+  // cropping each chain to its first N rows is this block's first N. On an unbalanced pair it is not a detail: 2OOB's
+  // 44-residue chain has 1313 rows beside its partner's 21603, the crop drops 5219 rows that carry only the partner,
+  // and drawn from all of them the small chain docked on 4 seeds of 20 against 12 of 20 drawn from AF3's pool. The
+  // profile is computed before the crop (below) and keeps every row.
+  //
+  // 🔴 NOTHING IS PINNED, AND THE QUERY IS SAFE ANYWAY. featuriseProtein writes the query as row zero of the finished
+  // array and these blocks are appended after it; the trunk's draw then treats row zero like any other, as AF3's
+  // gumbel shuffle does (see msa-draw.js).
+  const pairedBlock = paired === null ? 1 : paired.depth + 1;
+  const pairedPool = paired === null ? 0 : Math.min(paired.depth, Math.min(pairedBlock, AF3_MSA_SIZE / 2) - 1);
+  const unpairedPool = unpaired === null ? 0 : Math.min(unpaired.depth, AF3_MSA_SIZE - Math.min(pairedBlock, AF3_MSA_SIZE / 2));
+
+  const msa = [];
+  const deletionMatrix = [];
+  let length = 0;
+  // 🔴 A BYTE A CODE AND A BYTE A DELETION COUNT, CLIPPED AT 127 - AF3's own storage (features.py `safe_cast_int8` on
+  // `msa` and `deletion_matrix`), which is also what keeps a 16384-row pool affordable on the page. The clip is AF3's
+  // too, and only the MSA's: the profile's rows below keep the true count, as AF3's deletion_mean does (computed
+  // before the cast). A count past 127 reaches the model as atan(d/3) * 2/pi, 0.985 at 127.
+  const append = (parsed, from, upTo) => {
+    if (parsed === null) return;
+    length = parsed.length;
+    for (let row = from; row < upTo; row += 1) {
+      const aligned = parsed.sequences[row];
+      const codes = new Int8Array(parsed.length);
+      for (let column = 0; column < parsed.length; column += 1) {
+        // An unlisted character cannot reach here - parseA3m rejects anything
+        // outside its alphabet - so the fallback is unknown rather than an error.
+        codes[column] = codeOf(aligned, column);
+      }
+      msa.push(codes);
+      deletionMatrix.push(Uint8Array.from(parsed.deletionMatrix[row], (count) => Math.min(count, AF3_MSA_MAX_DELETION)));
+    }
+  };
+
+  // The paired block contributes its rows AFTER the first: row zero is the
+  // query, and featuriseProtein has already written it from the sequence.
+  append(paired, 0, pairedPool);
+  // +1 because unpairedFrom indexes the full array, whose row zero is the query.
+  const unpairedFrom = msa.length + 1;
+  // 🔴 AND THE UNPAIRED BLOCK SKIPS ITS OWN QUERY WHEN THERE IS A PAIRED ONE.
+  // Every A3M repeats the query as its first row, and the merged MSA already
+  // opens with it - AF3 reaches the same place by deduplicating, since a paired
+  // alignment always contains the query. Keeping it sends the model the query
+  // twice and leaves the batch one row taller than AF3's, which is exactly how
+  // it was found. With no paired block the unpaired query IS row zero's source
+  // and must stay.
+  const unpairedStart = paired === null ? 0 : 1;
+  append(unpaired, unpairedStart, unpairedPool);
+  const unpairedRows = msa.length + 1 - unpairedFrom;
+
+  // The profile's own rows: the whole unpaired block, query included, before
+  // any deduplication - see above. Kept separate from `msa` rather than
+  // recomputed by the caller, because the two row sets differ only in ways this
+  // function knows about.
+  const profileMsa = [];
+  const profileDeletionMatrix = [];
+  {
+    const into = (parsed, from, upTo) => {
+      if (parsed === null) return;
+      for (let row = from; row < upTo; row += 1) {
+        const aligned = parsed.sequences[row];
+        const codes = new Int32Array(parsed.length);
+        for (let column = 0; column < parsed.length; column += 1) {
+          codes[column] = codeOf(aligned, column);
+        }
+        profileMsa.push(codes);
+        profileDeletionMatrix.push(Float32Array.from(parsed.deletionMatrix[row]));
+      }
+    };
+    // 🔴 UNCROPPED, TOO. get_profile_features runs at features.py:543 and the
+    // crop only at 576, so the profile sees the whole alignment however few
+    // rows the MSA itself is allowed. Cropping it here is invisible on a
+    // monomer with a shallow alignment and wrong on every deep one.
+    into(unpairedProfile, 0, unpairedProfile === null ? 0 : unpairedProfile.depth);
+  }
+
+  return {
+    msa,
+    deletionMatrix,
+    profileMsa,
+    profileDeletionMatrix,
+    depth: msa.length + 1,
+    // With no unpaired rows the profile falls back to the query, which is the
+    // single-sequence case and is what AF3 does with an empty MSA.
+    unpairedFrom: unpairedRows === 0 ? 0 : unpairedFrom,
+    length,
+  };
+}

@@ -122,3 +122,108 @@ LocalFold pins this rather than papering over it: `npm run test:modified`
 carries `boltz2` as an expected failure with these numbers as its evidence, and
 reports `FIXED` — telling the reader to delete the entry rather than widen it —
 the moment it comes good. So the fix will be noticed on the next run.
+
+## 2026-09-29: fixed upstream, as measured through the JAX backend
+
+Re-measured through LocalFold's JAX worker (sokrypton/alphafold3 `colab`
+branch over the `alphafold3-colabfold` 3.1.11 wheel, on the A100), SEP at
+position 3 of 6MRR, single sequence, one sample: af3-any-model's **boltz2 reads
+a mean bond ratio of 0.994** (worst 1.010) - in line with genuine Boltz-2's
+0.986-1.011 - where this brief was written against 2.705. The other six
+AF3-lineage families read 0.958-1.023 on the same job. So the reference's
+boltz2 no longer inflates a modified residue; this brief is history.
+
+## 2026-10-02: a second residue, 3-hydroxyproline - and the reference has it too
+
+Found by folding AlphaFold 3's kitchen-sink example (`alphafold_input.json`) through all seven
+families natively: boltz2 alone tore its modified residues apart - ligand-class bond rms **0.500 Å**
+against 0.04-0.10 for the other six - and the culprits were HY3 (1.12), P1L (1.07), 6OG and 2MG
+(0.82), where 5MC, the glycan, HEM and the SMILES ATP were all clean.
+
+Isolated on 6MRR with a proline introduced (`P..P..`), single sequence, bond rms of the modified
+residue (`cuda/af3/bonds.mjs`):
+
+| | AlphaFold 3 | boltz2 |
+|---|---:|---:|
+| SEP@3 | 0.048 | 0.078 |
+| HYP@1 (4-hydroxyproline) | 0.082 | 0.160 |
+| HY3@1 (3-hydroxyproline) | 0.087 | **0.463** |
+| HY3@4 | 0.060 | **0.897** |
+
+- **The featurisation is not it.** boltz2's batch for HY3@4 is exact against af3-any-model's own
+  (`tools/check-batch-fields.js --model=boltz2 --target=hy3`, 47 fields, the conformer floor aside):
+  one token, the component's slots, its restype and bonds.
+- **The reference does it too.** af3-any-model's own boltz2 (`run_alphafold.py --model=boltz2`, the
+  int8 weights in `~/lfjax/weights`, HY3 given as `userCCD` because the pip CCD lacks it) reads
+  **0.994 / 0.907 / 0.703 Å** over three samples - the same tearing. So LocalFold's boltz2 is
+  faithful to its reference here, and the question is the one the SEP case asked: does GENUINE
+  Boltz-2 place a 3-hydroxyproline? 🔴 **NO - MEASURED 2026-10-02, AND IT IS THE MODEL.** Boltz 2.2.1
+  installed on the A100 (`~/venv_boltz`, torch 2.7.1+cu126 - the default wheel is built for a newer
+  CUDA than this driver's 12.8 and dies in `_cuda_init`), the same 68-mer with HY3 at 4, single
+  sequence, three samples, `--no_kernels`: HY3 bond rms **1.312 / 1.169 / 1.010 Å** over its 8 bonds,
+  the ring collapsed (C3, C4 and C5 within 0.4 Å of each other), while the same run's SEP@3 control is
+  **0.121 / 0.113 / 0.046 Å** and every protein class is 0.008-0.051. So af3-any-model's boltz2 (0.70-0.99)
+  and this port's (0.897) inherit it from Boltz-2 itself; there is no port defect to find here, and
+  boltz2 should not be expected to hold a hydroxyproline together. Scored with `cuda/af3/bonds.mjs`
+  on gemmi's PDB of each mmCIF.
+
+**And the modified BASES the same way, with the batch exact.** After boltz2's batch was made exact
+on modified bases too (`--target=dna-5cm|rna-mods`, four conventions fixed - the profile at the
+parent nucleotide, atoms past the 24 dense slots dropped as the reference drops them, the
+representative falling back to the first held atom), the kitchen-sink job still reads, for boltz2:
+6OG **0.834**, 2MG **0.823**, 6MA 0.229, 5MC 0.067 Å bond rms - where AlphaFold 3 and the other five
+families are 0.04-0.10 on every one. 6OG and 2MG are the 25-atom guanosines whose one-token form
+loses a ring atom by construction, so they cannot be whole; 6MA is the open question beside HY3. 🔴 **6MA IS NOT A DEFECT EITHER, MEASURED 2026-10-02**: a 14-bp duplex with 6MA at 2 and 9 of one
+strand, single sequence, three samples - genuine Boltz-2 **0.064 / 0.132 / 0.139 Å** bond rms over the two
+residues' 48 bonds, this port's native boltz2 **0.104 / 0.122 / 0.135 Å** on the identical input. The
+kitchen sink's 0.229 is one sample of a harder job; on a like-for-like target the two are one band.
+
+## 2026-10-18: a modified NUCLEOTIDE in boltz2's one-token form - an overflowing slot, and a stretched methyl
+
+AF3's `modified_rna` example (OMG@4, PSU@13, 5MC@18) folded through boltz2, three samples each, scored by
+`cuda/af3/bonds.mjs` (ligand class: the three modified residues' CCD bonds):
+
+| | bonds scored | ligand rms | PSU13 C5-C1' | OMG4 O2'-CM2 |
+|---|---:|---:|---:|---:|
+| genuine Boltz-2 2.2.1 (`~/venv_boltz`, `msa: empty`) | 69 | 0.27 | 3.71-3.72 | **1.55-1.71** |
+| af3-any-model 3.1.16 boltz2 (`run_alphafold.py`, int8) | 69 | **2.97-3.77** | 3.77-3.78 | 2.57-2.74 |
+| this port, before | 66 | 0.32 | 3.78 | 2.66 |
+| this port, OMG packed | 69 | 0.30-0.31 | 3.77 | 2.41-2.54 |
+
+- **PSU's C5-C1' is Boltz-2's own** - genuine Boltz-2 tears it too (pseudouridine's base hangs from C5, not N1).
+- **OMG overflows the one-token form's 24 slots.** It keeps its CCD slots and its leaving atoms leave holes, so C4
+  - its pseudo-beta atom - lands at slot 24 and is dropped, in af3-any-model's batch and so in this port's (`ref_mask`
+  identical). Genuine Boltz-2 has no slot layout and keeps every atom. This port now PACKS a one-token residue whose
+  slots overflow (featurise.js `modifiedAsOneToken`), and af3-any-model's tokenizer packs it the same way now.
+- **O2'-CM2 was stretched by the RESTYPE.** Genuine Boltz-2 tokenises a modified residue at residue level with
+  `res_type = get_unk_token(chain)` (tokenize/boltz2.py): an RNA base's N, where af3-any-model's boltz2 - and so this
+  port - gave every one the PROTEIN unknown. With N (AF3's class 30, Boltz's 27 through the converter's permutation):
+  **O2'-CM2 1.66-1.77 A, ligand rms 0.277-0.279** over three seeds, against genuine's 1.55-1.71 and 0.27. Two more of
+  genuine's conventions went in beside it, neither moving this fold: the alignment's query reads UNK there (the
+  residue record's type, which its featuriser writes over the query's letter), and the representative atom is the
+  residue's first (`atom_center=0, atom_disto=0` from parse_ccd_residue).
+
+| | bonds scored | ligand rms | PSU13 C5-C1' | OMG4 O2'-CM2 |
+|---|---:|---:|---:|---:|
+| this port, genuine Boltz-2's conventions | 69 | **0.277-0.279** | 3.77 | **1.66-1.77** |
+
+### The DNA unknown, which the converter dropped
+
+Boltz's vocabulary has TWO nucleic unknowns, N (27) and DN (32); AF3's has one (30), and af3-any-model's converter
+mapped 30 to N and threw DN's column away. So a DNA token whose restype is the unknown - a modified DNA base in the
+one-token form, or an `N` in a DNA chain - read RNA's N. The blob now carries DN as three DELTA rows (DN - N: the
+diffusion's `res_type` input, its `msa_profile` input, and the MSA embedder's row), added where the token is DNA and
+reads 30: an old blob is unchanged, a blob without the rows zero-fills with a warning. Published 2026-10-18 -
+af3-any-model `ba282d31` (all three precisions, every earlier record byte-identical) and localfold's boltz2-int5
+`4c892464` (one 3 KiB shard). Carried in every port: the CPU reference, WebGPU (a host-rewritten MSA code 64 on a
+DNA column), CUDA, Metal, and af3-any-model's JAX (branch `boltz2-dn`).
+
+The batch conventions above are af3-any-model's too now (`_mark_modified_residues`, the tokenizer's packing, the
+pipeline dropping a modified residue's every CCD leaving atom), so `check-batch-fields.js` compares boltz2 with NO
+exception - 16 pairs exact. Folded natively, three seeds:
+
+| | SEP (GOL+SEP3) ligand rms | modified_rna ligand rms | O2'-CM2 | methylated_dna ligand rms | methylated_dna vs genuine | DNA with N vs genuine |
+|---|---:|---:|---:|---:|---:|---:|
+| genuine Boltz-2 2.2.1 | - | 0.27 | 1.55-1.71 | 0.039-0.040 | - | - |
+| this port, DN carried | 0.063-0.104 | 0.277-0.279 | 1.68-1.78 | 0.038 | 0.53-0.92 A | 0.70-0.82 A |
+| af3-any-model boltz2: DN carried, then read as N | | | | | 0.50-0.78 / 0.65-0.92 A | 0.65-0.97 / 1.20-1.42 A |

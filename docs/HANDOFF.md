@@ -136,7 +136,7 @@ inside 15 A, the same 6 restricted to it, and both sets normalised by that mass.
 
 ## Traps that have already cost time
 
-- **`recycle-done` fires BEFORE that pass's preview** in `src/af3/fold.js`.
+- **`recycle-done` fires BEFORE that pass's preview** in `webgpu/af3/fold.js`.
   Reading backwards from a captured list pairs each distogram with the PREVIOUS
   pass's structure. Silent - every row still looks well formed.
 - **A plain reload serves cached ES modules.** `http.server` sends no cache

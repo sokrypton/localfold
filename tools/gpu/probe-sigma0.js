@@ -45,14 +45,14 @@
  * alignment is needed and none is done, which keeps this from quietly scoring a
  * shifted register as a good fit.
  */
-import { dialectFor, featuriserDialect } from "../../src/af3/dialect.js";
-import { af3BatchFromA3m } from "../../src/af3/featurise/batch.js";
-import { generateMmseqs2Msa } from "../../src/input/mmseqs2-api.js";
-import { featuriseProtein } from "../../src/af3/featurise/featurise.js";
-import { atomName, foldBatch } from "../../src/af3/fold.js";
-import { confidenceWeights, openAf3Store, trunkWeights } from "../../src/af3/weights/weights.js";
+import { dialectFor, featuriserDialect } from "../../shared/af3/dialect.js";
+import { af3BatchFromA3m } from "../../shared/af3/featurise/batch.js";
+import { generateMmseqs2Msa } from "../../shared/input/mmseqs2-api.js";
+import { featuriseProtein } from "../../shared/af3/featurise/featurise.js";
+import { atomName, foldBatch } from "../../webgpu/af3/fold.js";
+import { confidenceWeights, openAf3Store, trunkWeights } from "../../shared/af3/weights/weights.js";
 import { diffusionWeights, atomReference, targetFeatureWeights }
-  from "../../src/af3/weights/diffusion-weights.js";
+  from "../../shared/af3/weights/diffusion-weights.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
@@ -176,7 +176,7 @@ export function rmsdAndTm(a, b) {
 export async function main(device, args) {
   const sigmas = option(args, "sigmas", "2560,160").split(",").map(Number);
   const steps = Number(option(args, "steps", "8"));
-  const mode = option(args, "mode", "flow");
+  const mode = option(args, "mode", "diffusion");
   const msa = args.includes("--msa");
   const maxMsa = Number(option(args, "max-msa", "512"));
   // One search per TARGET, memoised, because the sweep folds each target

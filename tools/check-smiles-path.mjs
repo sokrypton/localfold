@@ -41,8 +41,8 @@
  * still shows, because a broken bond is long in any order.
  */
 import { execFileSync } from "node:child_process";
-import { parseSmiles } from "../src/chem/smiles.js";
-import { smilesComponent } from "../src/chem/component.js";
+import { parseSmiles } from "../shared/chem/smiles.js";
+import { smilesComponent } from "../shared/chem/component.js";
 
 const SEQUENCE = "GWSTELEKHREELKEFLKKEGITNVEIRIDNGRLEVRVEGGTERLKRFLEELRQKLEKKGYTVDIKIE";
 const MODEL = "/model-af3-int5/manifest.json";

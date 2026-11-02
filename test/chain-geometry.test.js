@@ -90,7 +90,7 @@ describe("the chain geometry gate", () => {
 describe("one rule, reachable from both the tools and the page", () => {
   it("the tools' wrapper and src/ agree, because there is one implementation",
     async () => {
-      const shared = await import("../src/af3/chain-geometry.js");
+      const shared = await import("../shared/af3/chain-geometry.js");
       const tool = await import("../tools/gpu/chain-geometry.js");
       assert.equal(tool.chainGeometryVerdict, shared.chainGeometryVerdict,
         "the tools re-export the rule rather than carrying a second copy");
@@ -98,7 +98,7 @@ describe("one rule, reachable from both the tools and the page", () => {
     });
 
   it("refuses the intellifold2 flow fold that the page used to draw", async () => {
-    const { chainGeometryVerdict } = await import("../src/af3/chain-geometry.js");
+    const { chainGeometryVerdict } = await import("../shared/af3/chain-geometry.js");
     const verdict = chainGeometryVerdict({ caca: 4.255, worstCaca: 4.70 },
       { plddt: 83.30 });
     assert.equal(verdict.ok, false);
@@ -108,12 +108,12 @@ describe("one rule, reachable from both the tools and the page", () => {
   });
 
   it("...and rosettafold3's flow fold, which is the collapsed kind", async () => {
-    const { chainGeometryVerdict } = await import("../src/af3/chain-geometry.js");
+    const { chainGeometryVerdict } = await import("../shared/af3/chain-geometry.js");
     assert.equal(chainGeometryVerdict({ caca: 3.071, worstCaca: 0.23 }).ok, false);
   });
 
   it("passes the diffusion folds those two models actually ship", async () => {
-    const { chainGeometryVerdict } = await import("../src/af3/chain-geometry.js");
+    const { chainGeometryVerdict } = await import("../shared/af3/chain-geometry.js");
     for (const good of [{ caca: 3.81, worstCaca: 3.85 },
                         { caca: 3.76, worstCaca: 3.69 },
                         { caca: 3.88, worstCaca: 4.08 }]) {
@@ -124,7 +124,7 @@ describe("one rule, reachable from both the tools and the page", () => {
   // 🔴 ONLY THE TOOLS' WRAPPER MENTIONS A FLAG. "Pass --allow-broken-geometry"
   // is advice for a terminal; the page shows the same verdict without it.
   it("the CLI hint is the wrapper's, not the rule's", async () => {
-    const { chainGeometryVerdict } = await import("../src/af3/chain-geometry.js");
+    const { chainGeometryVerdict } = await import("../shared/af3/chain-geometry.js");
     const { assertChainGeometry } = await import("../tools/gpu/chain-geometry.js");
     const bare = chainGeometryVerdict({ caca: 1.0, worstCaca: 1.0 });
     assert.ok(!bare.reason.includes("--allow-broken-geometry"));

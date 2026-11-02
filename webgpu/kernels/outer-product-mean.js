@@ -1,0 +1,1913 @@
+import { GpuBufferAllocator } from "../runtime/allocator.js";
+import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
+import { memoryTotals } from "../runtime/device-memory.js";
+import { deviceTuning, halfPrecisionAvailable, deviceMatrixConfig } from "../runtime/device-profile.js";
+import { createStagedMatrixShader, stagedMatrixStorage } from "./matrix-linear.js";
+import { shapedKnob } from "../runtime/device-profile.js";
+import { DEFAULT_VECTOR_GEMM_BLOCK } from "./vector-gemm-block.js";
+
+const GRID_WIDTH = 32_768;
+
+/**
+ * How many MSA rows one outer-product tile may cover.
+ *
+ * The bounded path holds tileCapacity * length * cOuter * cZ floats at once,
+ * and at 1,024 extra rows of a long sequence 32 of them is more than a storage
+ * binding may be - so the tile shrinks to whatever does bind. Thirty-two is
+ * still the ceiling; this only ever lowers it.
+ */
+export const OUTER_PRODUCT_MEAN_TILE_SEQUENCES = 32;
+
+export function outerProductMeanTileCapacity(input, maxStorageBufferBindingSize) {
+  const values = [input.sequences, input.length, input.cOuter, input.cZ, maxStorageBufferBindingSize];
+  if (!values.every((value) => Number.isSafeInteger(value) && value > 0)) {
+    throw new RangeError("outer-product tile dimensions and binding limit must be positive safe integers");
+  }
+  const bytesPerSequence = input.length * input.cOuter * input.cZ * Float32Array.BYTES_PER_ELEMENT;
+  const capacity = Math.floor(maxStorageBufferBindingSize / bytesPerSequence);
+  if (capacity < 1) {
+    throw new RangeError("WebGPU storage binding is too small for one outer-product sequence tile");
+  }
+  const ceiling = (typeof globalThis !== "undefined"
+    && Number.isFinite(globalThis.__OPM_TILE_CAP__))
+    ? globalThis.__OPM_TILE_CAP__ : OUTER_PRODUCT_MEAN_TILE_SEQUENCES;
+  return Math.min(input.sequences, ceiling, capacity);
+}
+const ceilDivide = (value, divisor) => Math.ceil(value / divisor);
+
+function validate(input) {
+  const { sequences, length, cM, cOuter, cZ, activations, mask, weights } = input;
+  if (![sequences, length, cM, cOuter, cZ].every((value) => Number.isSafeInteger(value) && value > 0)) {
+    throw new RangeError("outer product mean dimensions must be positive safe integers");
+  }
+  // ...see MAX_C_OUTER: the contraction kernel's arrays are sized for it.
+  if (cOuter > MAX_C_OUTER) {
+    throw new RangeError(`cOuter ${cOuter} exceeds the ${MAX_C_OUTER} the contraction stages for`);
+  }
+  const expected = [
+    ["activations", activations, sequences * length * cM],
+    ["mask", mask, sequences * length],
+    ["layerNormScale", weights.layerNormScale, cM],
+    ["layerNormOffset", weights.layerNormOffset, cM],
+    ["leftWeight", weights.leftWeight, cM * cOuter],
+    ["leftBias", weights.leftBias, cOuter],
+    ["rightWeight", weights.rightWeight, cM * cOuter],
+    ["rightBias", weights.rightBias, cOuter],
+    ["outputWeight", weights.outputWeight, cOuter * cOuter * cZ],
+    ["outputBias", weights.outputBias, cZ],
+  ];
+  for (const [name, value, size] of expected) {
+    if (value.length !== size) throw new RangeError(`${name} has ${value.length} values; expected ${size}`);
+  }
+}
+
+/**
+ * The properties this packer concatenates, in order.
+ *
+ * 🔴 EXPORTED SO THE DEVICE PATH CANNOT DRIFT FROM THE HOST ONE, the reason
+ * TRANSITION_PACK_ORDER is. Nothing here is reshaped - the outer product mean
+ * indexes every one of its eight tensors in the layout the bundle stores - so
+ * the device pack is this list and nothing else.
+ */
+export const OUTER_PRODUCT_MEAN_PACK_ORDER = [
+  "layerNormScale", "layerNormOffset", "leftWeight", "leftBias",
+  "rightWeight", "rightBias", "outputWeight", "outputBias",
+];
+
+export function packOuterProductMeanWeights(input) {
+  const tensors = OUTER_PRODUCT_MEAN_PACK_ORDER.map((name) => input.weights[name]);
+  const offsets = [];
+  let size = 0;
+  for (const tensor of tensors) { offsets.push(size); size += tensor.length; }
+  const data = new Float32Array(size);
+  tensors.forEach((tensor, index) => data.set(tensor, offsets[index]));
+  return { data, offsets };
+}
+
+export function createOuterProductMeanParameters(input, offsets) {
+  const buffer = new ArrayBuffer(64);
+  const view = new DataView(buffer);
+  const integers = [input.sequences, input.length, input.cM, input.cOuter, input.cZ, ...offsets];
+  integers.forEach((value, index) => view.setUint32(index * 4, value, true));
+  view.setFloat32(52, input.layerNormEpsilon ?? 1e-5, true);
+  view.setFloat32(56, input.normalizationEpsilon ?? 1e-3, true);
+  return new Uint8Array(buffer);
+}
+
+/**
+ * The largest c_outer the contraction kernel stages for, and the cells a lane
+ * then owns.
+ *
+ * 🔴 THE SHADER IS ONE PIPELINE FOR EVERY SHAPE - its dimensions come from a
+ * uniform, not from generation - so its workgroup array and its accumulator
+ * array have to be sized for the largest c_outer that can arrive, and the loop
+ * bounds have to be the real ones. AlphaFold's c_outer is 32; anything larger
+ * would overrun `totals` silently, so it is checked rather than assumed.
+ */
+const MAX_C_OUTER = 32;
+const MAX_CELLS_PER_LANE = (MAX_C_OUTER * MAX_C_OUTER) / 64;
+
+const COMMON = `
+struct Parameters {
+  sequences: u32,
+  length: u32,
+  c_m: u32,
+  c_outer: u32,
+  c_z: u32,
+  layer_norm_scale: u32,
+  layer_norm_offset: u32,
+  left_weight: u32,
+  left_bias: u32,
+  right_weight: u32,
+  right_bias: u32,
+  output_weight: u32,
+  output_bias: u32,
+  layer_norm_epsilon: f32,
+  normalization_epsilon: f32,
+  padding: u32,
+};
+const GRID_WIDTH: u32 = 32768u;
+`;
+
+export const OUTER_PRODUCT_MEAN_NORMALIZE_SHADER = `${COMMON}
+@group(0) @binding(0) var<storage, read> source: array<f32>;
+@group(0) @binding(1) var<storage, read> weights: array<f32>;
+@group(0) @binding(2) var<uniform> p: Parameters;
+@group(0) @binding(3) var<storage, read_write> output: array<f32>;
+var<workgroup> partial: array<f32, 64>;
+var<workgroup> row_stat: array<f32, 1>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) group: vec3<u32>) {
+  let rows = p.sequences * p.length;
+  // ...FOLDED, for the same reason as the transition's: a row per sequence and
+  // residue is far more than a dispatch may be wide at any real MSA depth.
+  let row = group.x + group.y * GRID_WIDTH;
+  if (row >= rows) { return; }
+  let lane = local.x;
+  let n_ch = p.c_m;
+  let base = row * n_ch;
+  var x0 = 0.0; var x1 = 0.0; var x2 = 0.0; var x3 = 0.0;
+  var sum = 0.0;
+  if (n_ch <= 256u) {
+    if (lane < n_ch) { x0 = source[base + lane]; sum += x0; }
+    if (lane + 64u < n_ch) { x1 = source[base + lane + 64u]; sum += x1; }
+    if (lane + 128u < n_ch) { x2 = source[base + lane + 128u]; sum += x2; }
+    if (lane + 192u < n_ch) { x3 = source[base + lane + 192u]; sum += x3; }
+  } else {
+    for (var c = lane; c < n_ch; c += 64u) { sum += source[base + c]; }
+  }
+  partial[lane] = sum;
+  workgroupBarrier();
+  if (lane < 32u) { partial[lane] += partial[lane + 32u]; }
+  workgroupBarrier();
+  if (lane < 16u) { partial[lane] += partial[lane + 16u]; }
+  workgroupBarrier();
+  if (lane < 8u) { partial[lane] += partial[lane + 8u]; }
+  workgroupBarrier();
+  if (lane == 0u) {
+    let total = ((partial[0] + partial[4]) + (partial[2] + partial[6]))
+      + ((partial[1] + partial[5]) + (partial[3] + partial[7]));
+    row_stat[0] = total / f32(n_ch);
+  }
+  workgroupBarrier();
+  let mean = row_stat[0];
+  var squared = 0.0;
+  if (n_ch <= 256u) {
+    if (lane < n_ch) { let d0 = x0 - mean; squared += d0 * d0; }
+    if (lane + 64u < n_ch) { let d1 = x1 - mean; squared += d1 * d1; }
+    if (lane + 128u < n_ch) { let d2 = x2 - mean; squared += d2 * d2; }
+    if (lane + 192u < n_ch) { let d3 = x3 - mean; squared += d3 * d3; }
+  } else {
+    for (var c = lane; c < n_ch; c += 64u) {
+      let centered = source[base + c] - mean;
+      squared += centered * centered;
+    }
+  }
+  partial[lane] = squared;
+  workgroupBarrier();
+  if (lane < 32u) { partial[lane] += partial[lane + 32u]; }
+  workgroupBarrier();
+  if (lane < 16u) { partial[lane] += partial[lane + 16u]; }
+  workgroupBarrier();
+  if (lane < 8u) { partial[lane] += partial[lane + 8u]; }
+  workgroupBarrier();
+  if (lane == 0u) {
+    let total_sq = ((partial[0] + partial[4]) + (partial[2] + partial[6]))
+      + ((partial[1] + partial[5]) + (partial[3] + partial[7]));
+    row_stat[0] = inverseSqrt(total_sq / f32(n_ch) + p.layer_norm_epsilon);
+  }
+  workgroupBarrier();
+  let inverse_std = row_stat[0];
+  if (n_ch <= 256u) {
+    if (lane < n_ch) {
+      output[base + lane] = (x0 - mean) * inverse_std * weights[p.layer_norm_scale + lane] + weights[p.layer_norm_offset + lane];
+    }
+    if (lane + 64u < n_ch) {
+      let c = lane + 64u;
+      output[base + c] = (x1 - mean) * inverse_std * weights[p.layer_norm_scale + c] + weights[p.layer_norm_offset + c];
+    }
+    if (lane + 128u < n_ch) {
+      let c = lane + 128u;
+      output[base + c] = (x2 - mean) * inverse_std * weights[p.layer_norm_scale + c] + weights[p.layer_norm_offset + c];
+    }
+    if (lane + 192u < n_ch) {
+      let c = lane + 192u;
+      output[base + c] = (x3 - mean) * inverse_std * weights[p.layer_norm_scale + c] + weights[p.layer_norm_offset + c];
+    }
+  } else {
+    for (var c = lane; c < n_ch; c += 64u) {
+      output[base + c] = (source[base + c] - mean) * inverse_std
+        * weights[p.layer_norm_scale + c] + weights[p.layer_norm_offset + c];
+    }
+  }
+}`;
+
+/**
+ * The tile one workgroup of the left/right projection computes, and the only
+ * statement of it - both call sites dispatch with these.
+ */
+export const OPM_PROJECT_TILE = { lanesX: 8, lanesY: 8, rowsPerLane: 4, columnsPerLane: 4 };
+export const opmProjectTileRows = (tile = OPM_PROJECT_TILE) => tile.lanesY * tile.rowsPerLane;
+export const opmProjectTileColumns = (tile = OPM_PROJECT_TILE) => tile.lanesX * tile.columnsPerLane;
+
+/**
+ * The left and right projections of the normalised MSA, in one pass.
+ *
+ * 🔴 IT WAS ONE THREAD PER (row, channel) AND IT WALKED THE WHOLE CONTRACTION.
+ * Every thread read `source[row * c_m + c]` for all 256 channels - and the 32
+ * threads holding that row's 32 outer channels each read the SAME value, so a
+ * row's activation was fetched from global memory 32 times over - plus one
+ * weight for the left projection and one for the right. Three global reads and
+ * two multiply-adds per step of c: 0.4 useful operations an instruction, on a
+ * machine that issues about 640 billion a second whatever their width. It
+ * measured 4.16 ms of a 113 ms block at 512 MSA rows, which is 238 GFLOP/s
+ * where every tuned kernel around it runs at 1000.
+ *
+ * It is a plain matrix multiply and it is now tiled like one: a workgroup takes
+ * 32 rows by 32 outer channels, stages the source TRANSPOSED so one vec4 read
+ * serves four rows, and stages the weights per thread so a lane's four strided
+ * channels are one vec4. Per step of c an invocation issues three reads and
+ * eight vector multiply-adds for thirty-two products - 2.9 an instruction.
+ *
+ * 🔴 LEFT AND RIGHT ARE THE SAME CONTRACTION OVER THE SAME SOURCE, which is why
+ * they stay one kernel rather than becoming two. The source tile and its whole
+ * staging cost are shared; splitting them would read it twice.
+ */
+/**
+ * @param {boolean} [transposeLeft] write `left` channel-major -
+ *   `left[(residue * c_outer + channel) * sequences + sequence]` - which is what
+ *   the matrix contraction wants as its SOURCE. The contraction is a GEMM whose
+ *   rows are `(i, cl)` and whose inner extent is the sequence, and the staged
+ *   matrix kernel reads its source row-major; writing the transpose here is one
+ *   index, where transposing afterwards is another pass over 54 MB. `right` is
+ *   untouched: sequence-major is exactly the `[inner][columns]` the kernel wants
+ *   of its weight side.
+ */
+export function createOuterProductMeanProjectShader(tile = OPM_PROJECT_TILE,
+                                                    transposeLeft = false) {
+  const { lanesX, lanesY, rowsPerLane, columnsPerLane } = tile;
+  if (rowsPerLane % 4 !== 0 || columnsPerLane % 4 !== 0) {
+    throw new RangeError("OPM project tile must be a multiple of 4 each way");
+  }
+  const lanes = lanesX * lanesY;
+  const step = lanesY;
+  const tileRows = lanesY * rowsPerLane;
+  const tileColumns = lanesX * columnsPerLane;
+  const rowVectors = tileRows / 4;
+  const columnVectors = columnsPerLane / 4;
+  const sourceTasks = step * rowVectors;
+  const sourcePerLane = Math.ceil(sourceTasks / lanes);
+
+  const declare = [];
+  for (const side of ["left", "right"]) {
+    for (let r = 0; r < rowsPerLane; r += 1) {
+      for (let v = 0; v < columnVectors; v += 1) {
+        // ...the bias rides in as the accumulator's initial value, read once a
+        // lane rather than once a row.
+        declare.push(`  var acc_${side}_${r}_${v} = bias_${side}_${v};`);
+      }
+    }
+  }
+  const bias = [];
+  for (const side of ["left", "right"]) {
+    for (let v = 0; v < columnVectors; v += 1) {
+      const c0 = `${v * 4 * lanesX}u`;
+      const c1 = `${(v * 4 + 1) * lanesX}u`;
+      const c2 = `${(v * 4 + 2) * lanesX}u`;
+      const c3 = `${(v * 4 + 3) * lanesX}u`;
+      bias.push(`  var bias_${side}_${v} = vec4<f32>(0.0);
+  if (column_origin + ${c3} < p.c_outer) {
+    bias_${side}_${v} = vec4<f32>(
+      weights[p.${side}_bias + column_origin + ${c0}],
+      weights[p.${side}_bias + column_origin + ${c1}],
+      weights[p.${side}_bias + column_origin + ${c2}],
+      weights[p.${side}_bias + column_origin + ${c3}],
+    );
+  } else {
+    if (column_origin + ${c0} < p.c_outer) { bias_${side}_${v}.x = weights[p.${side}_bias + column_origin + ${c0}]; }
+    if (column_origin + ${c1} < p.c_outer) { bias_${side}_${v}.y = weights[p.${side}_bias + column_origin + ${c1}]; }
+    if (column_origin + ${c2} < p.c_outer) { bias_${side}_${v}.z = weights[p.${side}_bias + column_origin + ${c2}]; }
+  }`);
+    }
+  }
+
+  const inner = [];
+  for (let k = 0; k < step; k += 1) {
+    for (let g = 0; g < rowsPerLane / 4; g += 1) {
+      inner.push(`    let s_${k}_${g} = tile_source[${k * rowVectors}u + local_y * ${rowsPerLane / 4}u + ${g}u];`);
+    }
+    for (const side of ["left", "right"]) {
+      for (let v = 0; v < columnVectors; v += 1) {
+        inner.push(`    let w_${side}_${k}_${v} = tile_${side}[${k * lanesX * columnVectors}u + local_x * ${columnVectors}u + ${v}u];`);
+      }
+    }
+    for (const side of ["left", "right"]) {
+      for (let r = 0; r < rowsPerLane; r += 1) {
+        for (let v = 0; v < columnVectors; v += 1) {
+          inner.push(`    acc_${side}_${r}_${v} += s_${k}_${Math.floor(r / 4)}.${"xyzw"[r % 4]} * w_${side}_${k}_${v};`);
+        }
+      }
+    }
+  }
+
+  const stageSource = [];
+  for (let n = 0; n < sourcePerLane; n += 1) {
+    const task = n === 0 ? "linear_lane" : `(linear_lane + ${n * lanes}u)`;
+    const guard = (n + 1) * lanes > sourceTasks ? `if (${task} < ${sourceTasks}u) ` : "";
+    stageSource.push(`    ${guard}{
+      let task = ${task};
+      let row_group = task / ${step}u;
+      let k_local = task % ${step}u;
+      let c = c0 + k_local;
+      let row_base = first_row + row_group * 4u;
+      var staged = vec4<f32>(0.0);
+      if (c < p.c_m) {
+        if (row_base + 3u < rows) {
+          let b0 = row_base * p.c_m + c;
+          let b1 = b0 + p.c_m;
+          let b2 = b1 + p.c_m;
+          let b3 = b2 + p.c_m;
+          staged = vec4<f32>(source[b0], source[b1], source[b2], source[b3]);
+        } else {
+          if (row_base < rows) { staged.x = source[row_base * p.c_m + c]; }
+          if (row_base + 1u < rows) { staged.y = source[(row_base + 1u) * p.c_m + c]; }
+          if (row_base + 2u < rows) { staged.z = source[(row_base + 2u) * p.c_m + c]; }
+        }
+      }
+      tile_source[k_local * ${rowVectors}u + row_group] = staged;
+    }`);
+  }
+
+  const colValidPre = [];
+  for (let v = 0; v < columnVectors; v += 1) {
+    const c0 = `${v * 4 * lanesX}u`;
+    const c1 = `${(v * 4 + 1) * lanesX}u`;
+    const c2 = `${(v * 4 + 2) * lanesX}u`;
+    const c3 = `${(v * 4 + 3) * lanesX}u`;
+    colValidPre.push(`  let col_full_${v} = column_origin + ${c3} < p.c_outer;
+  let col_v0_${v} = column_origin + ${c0} < p.c_outer;
+  let col_v1_${v} = column_origin + ${c1} < p.c_outer;
+  let col_v2_${v} = column_origin + ${c2} < p.c_outer;`);
+  }
+
+  const stageWeight = [];
+  for (const side of ["left", "right"]) {
+    for (let v = 0; v < columnVectors; v += 1) {
+      const c0 = `${v * 4 * lanesX}u`;
+      const c1 = `${(v * 4 + 1) * lanesX}u`;
+      const c2 = `${(v * 4 + 2) * lanesX}u`;
+      const c3 = `${(v * 4 + 3) * lanesX}u`;
+      stageWeight.push(`    {
+      var staged = vec4<f32>(0.0);
+      if (weight_c < p.c_m) {
+        let w_base = p.${side}_weight + weight_c * p.c_outer + column_origin;
+        if (col_full_${v}) {
+          staged = vec4<f32>(weights[w_base + ${c0}], weights[w_base + ${c1}], weights[w_base + ${c2}], weights[w_base + ${c3}]);
+        } else {
+          if (col_v0_${v}) { staged.x = weights[w_base + ${c0}]; }
+          if (col_v1_${v}) { staged.y = weights[w_base + ${c1}]; }
+          if (col_v2_${v}) { staged.z = weights[w_base + ${c2}]; }
+        }
+      }
+      tile_${side}[local_y * ${lanesX * columnVectors}u + local_x * ${columnVectors}u + ${v}u] = staged;
+    }`);
+    }
+  }
+
+  const store = [];
+  for (let r = 0; r < rowsPerLane; r += 1) {
+    const body = [];
+    for (let v = 0; v < columnVectors; v += 1) {
+      for (let c = 0; c < 4; c += 1) {
+        body.push(`      {
+        let outer = column_origin + ${(v * 4 + c) * lanesX}u;
+        if (outer < p.c_outer) {
+          let index = row_${r} * p.c_outer + outer;
+          ${transposeLeft
+            ? `left[((row_${r} % p.length) * p.c_outer + outer) * p.sequences`
+              + ` + row_${r} / p.length] = keep_${r} * acc_left_${r}_${v}.${"xyzw"[c]};`
+            : `left[index] = keep_${r} * acc_left_${r}_${v}.${"xyzw"[c]};`}
+          right[index] = keep_${r} * acc_right_${r}_${v}.${"xyzw"[c]};
+        }
+      }`);
+      }
+    }
+    store.push(`  {
+    let row_${r} = first_row + local_y * ${rowsPerLane}u + ${r}u;
+    if (row_${r} < rows) {
+      let keep_${r} = mask[row_${r}];
+${body.join("\n")}
+    }
+  }`);
+  }
+
+  return `${COMMON}
+@group(0) @binding(0) var<storage, read> source: array<f32>;
+@group(0) @binding(1) var<storage, read> mask: array<f32>;
+@group(0) @binding(2) var<storage, read> weights: array<f32>;
+@group(0) @binding(3) var<uniform> p: Parameters;
+@group(0) @binding(4) var<storage, read_write> left: array<f32>;
+@group(0) @binding(5) var<storage, read_write> right: array<f32>;
+
+// Transposed: four ROWS to a vector, so one read serves four accumulators.
+var<workgroup> tile_source: array<vec4<f32>, ${step * rowVectors}>;
+// Laid out per thread: a lane's own strided channels, contiguous where it reads.
+var<workgroup> tile_left: array<vec4<f32>, ${step * lanesX * columnVectors}>;
+var<workgroup> tile_right: array<vec4<f32>, ${step * lanesX * columnVectors}>;
+
+@compute @workgroup_size(${lanesX}, ${lanesY}, 1)
+fn main(
+  @builtin(local_invocation_id) local: vec3<u32>,
+  @builtin(workgroup_id) group: vec3<u32>,
+) {
+  let rows = p.sequences * p.length;
+  // ...FOLDED in x and y, because a row per sequence and residue is far more
+  // than a dispatch may be wide at any real MSA depth; the channel tile is z.
+  let tile_index = group.x + group.y * GRID_WIDTH;
+  let first_row = tile_index * ${tileRows}u;
+  if (first_row >= rows) { return; }
+  let local_x = local.x;
+  let local_y = local.y;
+  let linear_lane = local_y * ${lanesX}u + local_x;
+  let column_origin = group.z * ${tileColumns}u + local_x;
+${colValidPre.join("\n")}
+${bias.join("\n")}
+${declare.join("\n")}
+
+  for (var c0 = 0u; c0 < p.c_m; c0 += ${step}u) {
+    let weight_c = c0 + local_y;
+${stageSource.join("\n")}
+${stageWeight.join("\n")}
+    workgroupBarrier();
+${inner.join("\n")}
+    workgroupBarrier();
+  }
+
+${store.join("\n")}
+}`;
+}
+
+export const OUTER_PRODUCT_MEAN_PROJECT_SHADER = createOuterProductMeanProjectShader();
+
+export const OUTER_PRODUCT_MEAN_INTERMEDIATE_SHADER = `${COMMON}
+@group(0) @binding(0) var<storage, read> left: array<f32>;
+@group(0) @binding(1) var<storage, read> weights: array<f32>;
+@group(0) @binding(2) var<uniform> p: Parameters;
+@group(0) @binding(3) var<storage, read_write> output: array<f32>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let index = id.x + id.y * GRID_WIDTH * 64u;
+  let elements = p.sequences * p.length * p.c_outer * p.c_z;
+  if (index >= elements) { return; }
+  let z = index % p.c_z;
+  let outer_right = (index / p.c_z) % p.c_outer;
+  let residue = (index / (p.c_z * p.c_outer)) % p.length;
+  let sequence = index / (p.c_z * p.c_outer * p.length);
+  var value = 0.0;
+  for (var outer_left = 0u; outer_left < p.c_outer; outer_left += 1u) {
+    let left_index = (sequence * p.length + residue) * p.c_outer + outer_left;
+    let weight_index = ((outer_left * p.c_outer + outer_right) * p.c_z) + z;
+    value += left[left_index] * weights[p.output_weight + weight_index];
+  }
+  output[index] = value;
+}`;
+
+export const OUTER_PRODUCT_MEAN_OUTPUT_SHADER = `${COMMON}
+@group(0) @binding(0) var<storage, read> right: array<f32>;
+@group(0) @binding(1) var<storage, read> intermediate: array<f32>;
+@group(0) @binding(2) var<storage, read> mask: array<f32>;
+@group(0) @binding(3) var<storage, read> weights: array<f32>;
+@group(0) @binding(4) var<uniform> p: Parameters;
+@group(0) @binding(5) var<storage, read_write> output: array<f32>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let index = id.x + id.y * GRID_WIDTH * 64u;
+  if (index >= p.length * p.length * p.c_z) { return; }
+  let z = index % p.c_z;
+  let pair = index / p.c_z;
+  let i = pair / p.length;
+  let j = pair % p.length;
+  var value = weights[p.output_bias + z];
+  var count = 0.0;
+  for (var sequence = 0u; sequence < p.sequences; sequence += 1u) {
+    count += mask[sequence * p.length + i] * mask[sequence * p.length + j];
+    for (var outer = 0u; outer < p.c_outer; outer += 1u) {
+      let temp_index = (((sequence * p.length + i) * p.c_outer + outer) * p.c_z) + z;
+      let right_index = (sequence * p.length + j) * p.c_outer + outer;
+      value += intermediate[temp_index] * right[right_index];
+    }
+  }
+  output[index] = value / (p.normalization_epsilon + count);
+}`;
+
+const OPM_TILE_COMMON = `${COMMON}
+struct TileParameters { offset: u32, count: u32, padding0: u32, padding1: u32 };
+`;
+
+// The outer-first path's own block descriptor. Same two fields as
+// TileParameters and a different axis: that one blocks the SEQUENCES the tiled
+// fallback accumulates over, this one blocks the PAIRS the fast path holds an
+// intermediate for. See createOuterProductMeanContractShader.
+const OPM_PAIR_BLOCK = `${COMMON}
+struct PairBlock { offset: u32, count: u32, padding0: u32, padding1: u32 };
+`;
+
+export const OUTER_PRODUCT_MEAN_TILE_INTERMEDIATE_SHADER = `${OPM_TILE_COMMON}
+@group(0) @binding(0) var<storage, read> left: array<f32>;
+@group(0) @binding(1) var<storage, read> weights: array<f32>;
+@group(0) @binding(2) var<uniform> p: Parameters;
+@group(0) @binding(3) var<uniform> tile: TileParameters;
+@group(0) @binding(4) var<storage, read_write> output: array<f32>;
+var<workgroup> shared_left_a: array<vec4<f32>, ${MAX_C_OUTER}>;
+var<workgroup> shared_left_b: array<vec4<f32>, ${MAX_C_OUTER}>;
+@compute @workgroup_size(64)
+fn main(
+  @builtin(global_invocation_id) id: vec3<u32>,
+  @builtin(local_invocation_id) local: vec3<u32>,
+  @builtin(workgroup_id) group: vec3<u32>,
+) {
+  let elements = tile.count * p.length * p.c_outer * p.c_z;
+  if (p.c_z % 64u == 0u && p.c_outer <= ${MAX_C_OUTER}u) {
+    let total_rows = tile.count * p.length;
+    let row_tiles = (total_rows + 7u) / 8u;
+    let z_chunks = p.c_z / 64u;
+    let active_groups = row_tiles * p.c_outer * z_chunks;
+    let group_id = group.x + group.y * GRID_WIDTH;
+    if (group_id >= active_groups) { return; }
+    let z_chunk = group_id % z_chunks;
+    let ro_tile = group_id / z_chunks;
+    let outer_right = ro_tile % p.c_outer;
+    let row_base = (ro_tile / p.c_outer) * 8u;
+    let z = z_chunk * 64u + local.x;
+    if (local.x < p.c_outer) {
+      let ol = local.x;
+      let l_off = tile.offset * p.length;
+      shared_left_a[ol] = vec4<f32>(
+        select(0.0, left[(l_off + row_base) * p.c_outer + ol], row_base < total_rows),
+        select(0.0, left[(l_off + row_base + 1u) * p.c_outer + ol], row_base + 1u < total_rows),
+        select(0.0, left[(l_off + row_base + 2u) * p.c_outer + ol], row_base + 2u < total_rows),
+        select(0.0, left[(l_off + row_base + 3u) * p.c_outer + ol], row_base + 3u < total_rows),
+      );
+      shared_left_b[ol] = vec4<f32>(
+        select(0.0, left[(l_off + row_base + 4u) * p.c_outer + ol], row_base + 4u < total_rows),
+        select(0.0, left[(l_off + row_base + 5u) * p.c_outer + ol], row_base + 5u < total_rows),
+        select(0.0, left[(l_off + row_base + 6u) * p.c_outer + ol], row_base + 6u < total_rows),
+        select(0.0, left[(l_off + row_base + 7u) * p.c_outer + ol], row_base + 7u < total_rows),
+      );
+    }
+    workgroupBarrier();
+    var acc_a = vec4<f32>(0.0);
+    var acc_b = vec4<f32>(0.0);
+    let w_stride = p.c_outer * p.c_z;
+    var w_idx = p.output_weight + outer_right * p.c_z + z;
+    for (var outer_left = 0u; outer_left < p.c_outer; outer_left += 1u) {
+      let w = weights[w_idx];
+      acc_a += shared_left_a[outer_left] * w;
+      acc_b += shared_left_b[outer_left] * w;
+      w_idx += w_stride;
+    }
+    let out_stride = p.c_outer * p.c_z;
+    let out_base = (row_base * p.c_outer + outer_right) * p.c_z + z;
+    if (row_base < total_rows) { output[out_base] = acc_a.x; }
+    if (row_base + 1u < total_rows) { output[out_base + out_stride] = acc_a.y; }
+    if (row_base + 2u < total_rows) { output[out_base + 2u * out_stride] = acc_a.z; }
+    if (row_base + 3u < total_rows) { output[out_base + 3u * out_stride] = acc_a.w; }
+    if (row_base + 4u < total_rows) { output[out_base + 4u * out_stride] = acc_b.x; }
+    if (row_base + 5u < total_rows) { output[out_base + 5u * out_stride] = acc_b.y; }
+    if (row_base + 6u < total_rows) { output[out_base + 6u * out_stride] = acc_b.z; }
+    if (row_base + 7u < total_rows) { output[out_base + 7u * out_stride] = acc_b.w; }
+    return;
+  }
+  let index = id.x + id.y * GRID_WIDTH * 64u;
+  if (index >= elements) { return; }
+  let z = index % p.c_z; let outer_right = (index / p.c_z) % p.c_outer;
+  let residue = (index / (p.c_z * p.c_outer)) % p.length;
+  let sequence = index / (p.c_z * p.c_outer * p.length);
+  var value = 0.0;
+  for (var outer_left = 0u; outer_left < p.c_outer; outer_left += 1u) {
+    let left_index = ((tile.offset + sequence) * p.length + residue) * p.c_outer + outer_left;
+    let weight_index = (outer_left * p.c_outer + outer_right) * p.c_z + z;
+    value += left[left_index] * weights[p.output_weight + weight_index];
+  }
+  output[index] = value;
+}`;
+
+export const OUTER_PRODUCT_MEAN_TILE_ACCUMULATE_SHADER = `${OPM_TILE_COMMON}
+@group(0) @binding(0) var<storage, read> right: array<f32>;
+@group(0) @binding(1) var<storage, read> intermediate: array<f32>;
+@group(0) @binding(2) var<uniform> p: Parameters;
+@group(0) @binding(3) var<uniform> tile: TileParameters;
+@group(0) @binding(4) var<storage, read_write> output: array<f32>;
+var<workgroup> shared_right_a: array<vec4<f32>, ${8 * MAX_C_OUTER}>;
+var<workgroup> shared_right_b: array<vec4<f32>, ${8 * MAX_C_OUTER}>;
+@compute @workgroup_size(64)
+fn main(
+  @builtin(global_invocation_id) id: vec3<u32>,
+  @builtin(local_invocation_id) local: vec3<u32>,
+  @builtin(workgroup_id) group: vec3<u32>,
+) {
+  let elements = p.length * p.length * p.c_z;
+  if (p.c_z % 64u == 0u && p.c_outer <= ${MAX_C_OUTER}u) {
+    let z_chunks = p.c_z / 64u;
+    let j_tiles = (p.length + 7u) / 8u;
+    let active_groups = p.length * j_tiles * z_chunks;
+    let group_id = group.x + group.y * GRID_WIDTH;
+    if (group_id >= active_groups) { return; }
+    let z_chunk = group_id % z_chunks;
+    let ij_tile = group_id / z_chunks;
+    let i = ij_tile / j_tiles;
+    let j_base = (ij_tile % j_tiles) * 8u;
+    let z = z_chunk * 64u + local.x;
+    var acc_a = vec4<f32>(0.0);
+    var acc_b = vec4<f32>(0.0);
+    let seq_stride = p.length * p.c_outer * p.c_z;
+    for (var s0 = 0u; s0 < tile.count; s0 += 8u) {
+      let s_count = min(8u, tile.count - s0);
+      let chunk_elems = s_count * p.c_outer;
+      workgroupBarrier();
+      for (var k = local.x; k < chunk_elems; k += 64u) {
+        let seq = tile.offset + s0 + k / p.c_outer;
+        let outer = k % p.c_outer;
+        let r_row = seq * p.length;
+        shared_right_a[k] = vec4<f32>(
+          select(0.0, right[(r_row + j_base) * p.c_outer + outer], j_base < p.length),
+          select(0.0, right[(r_row + j_base + 1u) * p.c_outer + outer], j_base + 1u < p.length),
+          select(0.0, right[(r_row + j_base + 2u) * p.c_outer + outer], j_base + 2u < p.length),
+          select(0.0, right[(r_row + j_base + 3u) * p.c_outer + outer], j_base + 3u < p.length),
+        );
+        shared_right_b[k] = vec4<f32>(
+          select(0.0, right[(r_row + j_base + 4u) * p.c_outer + outer], j_base + 4u < p.length),
+          select(0.0, right[(r_row + j_base + 5u) * p.c_outer + outer], j_base + 5u < p.length),
+          select(0.0, right[(r_row + j_base + 6u) * p.c_outer + outer], j_base + 6u < p.length),
+          select(0.0, right[(r_row + j_base + 7u) * p.c_outer + outer], j_base + 7u < p.length),
+        );
+      }
+      workgroupBarrier();
+      var seq_base = ((s0 * p.length + i) * p.c_outer) * p.c_z + z;
+      var r_idx = 0u;
+      for (var s = 0u; s < s_count; s += 1u) {
+        var temp_index = seq_base;
+        for (var outer = 0u; outer < p.c_outer; outer += 1u) {
+          let inter = intermediate[temp_index];
+          acc_a += shared_right_a[r_idx] * inter;
+          acc_b += shared_right_b[r_idx] * inter;
+          temp_index += p.c_z;
+          r_idx += 1u;
+        }
+        seq_base += seq_stride;
+      }
+    }
+    let out_base = (i * p.length + j_base) * p.c_z + z;
+    if (j_base < p.length) { output[out_base] += acc_a.x; }
+    if (j_base + 1u < p.length) { output[out_base + p.c_z] += acc_a.y; }
+    if (j_base + 2u < p.length) { output[out_base + 2u * p.c_z] += acc_a.z; }
+    if (j_base + 3u < p.length) { output[out_base + 3u * p.c_z] += acc_a.w; }
+    if (j_base + 4u < p.length) { output[out_base + 4u * p.c_z] += acc_b.x; }
+    if (j_base + 5u < p.length) { output[out_base + 5u * p.c_z] += acc_b.y; }
+    if (j_base + 6u < p.length) { output[out_base + 6u * p.c_z] += acc_b.z; }
+    if (j_base + 7u < p.length) { output[out_base + 7u * p.c_z] += acc_b.w; }
+    return;
+  }
+  let index = id.x + id.y * GRID_WIDTH * 64u;
+  if (index >= elements) { return; }
+  let z = index % p.c_z; let pair = index / p.c_z;
+  let i = pair / p.length; let j = pair % p.length; var value = 0.0;
+  for (var sequence = 0u; sequence < tile.count; sequence += 1u) {
+    for (var outer = 0u; outer < p.c_outer; outer += 1u) {
+      let temp_index = (((sequence * p.length + i) * p.c_outer + outer) * p.c_z) + z;
+      let right_index = (((tile.offset + sequence) * p.length + j) * p.c_outer) + outer;
+      value += intermediate[temp_index] * right[right_index];
+    }
+  }
+  output[index] += value;
+}`;
+
+export const OUTER_PRODUCT_MEAN_FINALIZE_SHADER = `${COMMON}
+@group(0) @binding(0) var<storage, read> mask: array<f32>;
+@group(0) @binding(1) var<storage, read> weights: array<f32>;
+@group(0) @binding(2) var<uniform> p: Parameters;
+@group(0) @binding(3) var<storage, read_write> output: array<f32>;
+var<workgroup> shared_denom: array<f32, 1>;
+@compute @workgroup_size(64)
+fn main(
+  @builtin(global_invocation_id) id: vec3<u32>,
+  @builtin(local_invocation_id) local: vec3<u32>,
+  @builtin(workgroup_id) group: vec3<u32>,
+) {
+  let elements = p.length * p.length * p.c_z;
+  if (p.c_z % 64u == 0u) {
+    let group_base = (group.x + group.y * GRID_WIDTH) * 64u;
+    if (group_base >= elements) { return; }
+    let index = group_base + local.x;
+    let z = index % p.c_z;
+    if (local.x == 0u) {
+      let pair = group_base / p.c_z;
+      let i = pair / p.length;
+      let j = pair % p.length;
+      var count = 0.0;
+      for (var sequence = 0u; sequence < p.sequences; sequence += 1u) {
+        count += mask[sequence * p.length + i] * mask[sequence * p.length + j];
+      }
+      shared_denom[0] = p.normalization_epsilon + count;
+    }
+    workgroupBarrier();
+    output[index] = (output[index] + weights[p.output_bias + z]) / shared_denom[0];
+    return;
+  }
+  let index = id.x + id.y * GRID_WIDTH * 64u;
+  if (index >= elements) { return; }
+  let z = index % p.c_z; let pair = index / p.c_z; let i = pair / p.length; let j = pair % p.length;
+  var count = 0.0;
+  for (var sequence = 0u; sequence < p.sequences; sequence += 1u) {
+    count += mask[sequence * p.length + i] * mask[sequence * p.length + j];
+  }
+  output[index] = (output[index] + weights[p.output_bias + z]) / (p.normalization_epsilon + count);
+}`;
+
+// Algebraically identical to AF2's original einsum order: first contract the
+// MSA sequence axis into [L, L, c_outer, c_outer], then apply output_w once.
+/**
+ * The sequence contraction, generated for one c_outer.
+ *
+ * 🔴 IT IS A FUNCTION AND NOT A CONSTANT BECAUSE THE ACCUMULATORS HAVE TO BE
+ * REGISTERS. A thread owns c_outer^2 / 64 cells and carries a running sum for
+ * each across the whole sweep; written as an ARRAY indexed by a loop variable,
+ * WGSL puts that in spillable local memory and the kernel measured 38 ms
+ * against the 29 it replaced. Named variables need the count at generation
+ * time, and c_outer arrives in a uniform - so the shader is generated per
+ * c_outer and the pipeline cache key carries it. AF3's outer product learned
+ * the same thing the same way; see the note in
+ * webgpu/af3/trunk/outer-product-mean.js.
+ *
+ * 🔴 AND A CHUNK OF SEQUENCES IS STAGED, which is what the cells buy. A thread
+ * that owned ONE cell re-read the same two 32-float slices as its 1023
+ * neighbours: two global reads for every multiply-add, 3.6 billion reads a
+ * block at 512 rows, which at the 111 billion a second tools/gpu/probe-alu.js
+ * measures is most of what this cost. Staged, a chunk's reads are shared by the
+ * whole workgroup and a thread's sixteen cells come out of eight of them.
+ */
+/**
+ * @param {"f32"|"f16"} precision what the STAGED TILE and the chunk accumulator
+ *   are. The running total is f32 in both, which is the whole safety argument;
+ *   see the note below.
+ */
+export function createOuterProductMeanContractShader(cOuter, precision = "f32") {
+  if (precision !== "f32" && precision !== "f16") {
+    throw new RangeError(`unknown OPM contraction precision ${precision}`);
+  }
+  const half = precision === "f16";
+  const cells = cOuter * cOuter;
+  // 🔴 EIGHT IS MEASURED, AND IT WAS A HARDCODED GUESS UNTIL IT WAS. Swept
+  // through profile-af2-block.js at 512 MSA rows, in runs where every untouched
+  // kernel matched to 0.1 ms - the block and this kernel:
+  //
+  //     chunk  8   87.49 / 5.34 ms      16   87.89 / 5.33
+  //           32   88.39 / 5.67         64   90.21 / 7.82
+  //
+  // Sixteen ties and everything above it loses, so the constant was right. It
+  // is not obvious that it would be: a bigger chunk halves the barriers, and
+  // this kernel takes 128 of them per workgroup at 512 rows. It is not what
+  // governs.
+  // 🔴 AND THE f16 PATH WANTS A LONGER ONE, because it pays a promotion at each
+  // chunk boundary that the f32 path does not. See the accumulator note below:
+  // 8 sequences is 32 vec4 multiply-adds a lane against 8 conversions, 25%
+  // overhead on the thing the precision was bought to speed up; 32 sequences is
+  // 6%, and the staged tile is still only 4 KiB.
+  const chunk = half ? 32 : 8;
+  // Both operands are read four channels at a time, so the staged rows are
+  // padded up to a whole vector and the tail staged as zero - which contributes
+  // exactly zero to a product and needs no guard in the inner loop.
+  const vectors = Math.ceil(cOuter / 4);
+  const blocks = vectors * vectors;
+  const blocksPerLane = Math.ceil(blocks / 64);
+  const overBlocks = (body) =>
+    Array.from({ length: blocksPerLane }, (_, slot) => body(slot)).join("\n    ");
+  const acc = half ? "vec4<f16>" : "vec4<f32>";
+  const stage = half ? "vec4<f16>" : "vec4<f32>";
+  const narrow = (value) => (half ? `f16(${value})` : value);
+  const exactVec = cOuter % 4 === 0;
+  const ioType = exactVec ? "vec4<f32>" : "f32";
+  const vecCast = (value) => (half ? `vec4<f16>(${value})` : value);
+  return `${half ? "enable f16;\n" : ""}${OPM_PAIR_BLOCK}
+@group(0) @binding(0) var<storage, read> left: array<${ioType}>;
+@group(0) @binding(1) var<storage, read> right: array<${ioType}>;
+@group(0) @binding(2) var<uniform> p: Parameters;
+@group(0) @binding(3) var<storage, read_write> outer: array<${ioType}>;
+@group(0) @binding(4) var<uniform> blk: PairBlock;
+
+const OPM_CHUNK: u32 = ${chunk}u;
+const C_OUTER: u32 = ${cOuter}u;
+const CELLS: u32 = ${cells}u;
+const VECTORS: u32 = ${vectors}u;
+const BLOCKS: u32 = ${blocks}u;
+
+var<workgroup> left_tile: array<${stage}, ${chunk * vectors}>;
+var<workgroup> right_tile: array<${stage}, ${chunk * vectors}>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_id) local_id: vec3<u32>) {
+  // 🔴 THE INTERMEDIATE IS INDEXED BY THE LOCAL PAIR AND THE OPERANDS BY THE
+  // GLOBAL ONE. That one substitution is the whole of pair blocking: the buffer
+  // holds blk.count pairs wherever the block sits, so its size stops being a
+  // function of the protein.
+  let local_pair = group.x + group.y * GRID_WIDTH;
+  if (local_pair >= blk.count) { return; }
+  let pair = blk.offset + local_pair;
+  let i = pair / p.length;
+  let j = pair % p.length;
+  let local = local_id.x;
+
+  // A lane owns a 4x4 BLOCK of cells, not sixteen scattered ones - see the note
+  // above. Four accumulators, each a vector over the right-hand channel.
+  ${overBlocks((slot) => `let block${slot} = local + ${slot}u * 64u;
+    let live${slot} = block${slot} < BLOCKS;
+    let left_block${slot} = select(0u, block${slot} / VECTORS, live${slot});
+    let right_block${slot} = select(0u, block${slot} % VECTORS, live${slot});
+    var acc${slot}_0 = vec4<f32>(0.0);
+    var acc${slot}_1 = vec4<f32>(0.0);
+    var acc${slot}_2 = vec4<f32>(0.0);
+    var acc${slot}_3 = vec4<f32>(0.0);`)}
+
+  for (var s0 = 0u; s0 < p.sequences; s0 += OPM_CHUNK) {
+    workgroupBarrier();
+    for (var index = local; index < OPM_CHUNK * VECTORS; index += 64u) {
+      let s = s0 + index / VECTORS;
+      let v = index % VECTORS;
+      var l = ${stage}(0.0);
+      var r = ${stage}(0.0);
+      if (s < p.sequences) {
+${exactVec
+  ? `        let row_s = s * p.length;
+        l = ${vecCast("left[(row_s + i) * VECTORS + v]")};
+        r = ${vecCast("right[(row_s + j) * VECTORS + v]")};`
+  : `        for (var c = 0u; c < 4u; c += 1u) {
+          let o = v * 4u + c;
+          if (o < C_OUTER) {
+            l[c] = ${narrow("left[(s * p.length + i) * C_OUTER + o]")};
+            r[c] = ${narrow("right[(s * p.length + j) * C_OUTER + o]")};
+          }
+        }`}
+      }
+      left_tile[index] = l;
+      right_tile[index] = r;
+    }
+    workgroupBarrier();
+
+    let available = min(OPM_CHUNK, p.sequences - s0);
+    // 🔴 THE CHUNK ACCUMULATES IN ${precision} AND THE TOTAL IN f32, WHICH IS THE
+    // WHOLE SAFETY ARGUMENT. martin-steinegger/alphafold2-webgpu records in its
+    // own source that accumulating a whole contraction in f16 is the fastest
+    // arrangement and is unsafe: on a 508-row alignment it takes pLDDT from
+    // 96.80 to 69.94 and pTM to NaN. It overflows because the sum runs over
+    // every sequence. This one runs over OPM_CHUNK of them and is promoted, so
+    // the running value is bounded by the chunk however deep the MSA is - and
+    // f16 is exactly 2.0x f32 on this card, which is what makes it worth the
+    // conversion at all.
+${half ? `    ${overBlocks((slot) => `var chunk${slot}_0 = vec4<f16>(0.0);
+    var chunk${slot}_1 = vec4<f16>(0.0);
+    var chunk${slot}_2 = vec4<f16>(0.0);
+    var chunk${slot}_3 = vec4<f16>(0.0);`)}` : ""}
+    for (var t = 0u; t < available; t += 1u) {
+      let base = t * VECTORS;
+      ${overBlocks((slot) => `let lv${slot} = left_tile[base + left_block${slot}];
+      let rv${slot} = right_tile[base + right_block${slot}];
+      ${half ? "chunk" : "acc"}${slot}_0 += lv${slot}.x * rv${slot};
+      ${half ? "chunk" : "acc"}${slot}_1 += lv${slot}.y * rv${slot};
+      ${half ? "chunk" : "acc"}${slot}_2 += lv${slot}.z * rv${slot};
+      ${half ? "chunk" : "acc"}${slot}_3 += lv${slot}.w * rv${slot};`)}
+    }
+${half ? `    ${overBlocks((slot) => `acc${slot}_0 += vec4<f32>(chunk${slot}_0);
+    acc${slot}_1 += vec4<f32>(chunk${slot}_1);
+    acc${slot}_2 += vec4<f32>(chunk${slot}_2);
+    acc${slot}_3 += vec4<f32>(chunk${slot}_3);`)}` : ""}
+  }
+
+  ${overBlocks((slot) => exactVec
+    ? `if (live${slot}) {
+      let out_base = local_pair * (BLOCKS * 4u) + (left_block${slot} * 4u) * VECTORS + right_block${slot};
+      outer[out_base] = acc${slot}_0;
+      outer[out_base + VECTORS] = acc${slot}_1;
+      outer[out_base + VECTORS * 2u] = acc${slot}_2;
+      outer[out_base + VECTORS * 3u] = acc${slot}_3;
+    }`
+    : `if (live${slot}) {
+      for (var a = 0u; a < 4u; a += 1u) {
+        let cl = left_block${slot} * 4u + a;
+        if (cl < C_OUTER) {
+          var row = acc${slot}_0;
+          if (a == 1u) { row = acc${slot}_1; }
+          if (a == 2u) { row = acc${slot}_2; }
+          if (a == 3u) { row = acc${slot}_3; }
+          for (var b = 0u; b < 4u; b += 1u) {
+            let cr = right_block${slot} * 4u + b;
+            if (cr < C_OUTER) { outer[local_pair * CELLS + cl * C_OUTER + cr] = row[b]; }
+          }
+        }
+      }
+    }`)}
+}`;
+}
+
+/**
+ * How many pairs one output-projection workgroup carries.
+ *
+ * 🔴 IT EXISTS TO AMORTISE THE WEIGHT READ AND NOTHING ELSE. Every pair
+ * contracts its c_outer^2 cells against the SAME output matrix, so a workgroup
+ * holding P pairs reads that matrix once for all of them - one global read
+ * buying P multiply-adds where it used to buy one. The cost is P * CELLS floats
+ * of workgroup memory, which is occupancy.
+ *
+ * Swept at 512 MSA rows, as this kernel's share of the block, with the
+ * untouched kernels around it matching to 0.1 ms:
+ *
+ *     as it was  3.12      P=1  3.14      P=2  2.22      P=4  3.12
+ *
+ * P=1 is the loop swap alone - cell outside channel, so a staged value serves
+ * both of a lane's channels - and it is worth NOTHING on its own, which is the
+ * measurement that says this kernel was waiting on the weight read and not on
+ * the staged one. P=4 gives it all back: 16 KiB of workgroup memory against
+ * this device's 32 KiB leaves two workgroups a core, and that costs more than
+ * halving the reads buys. The same shape of answer as every other tile in this
+ * repository - see chooseLinearTile, and the attention key chunk.
+ */
+export const OPM_PROJECT_OUTPUT_PAIRS = 2;
+
+/**
+ * ...and what THIS device wants, which is not the same question.
+ *
+ * 🔴 THE SWEEP ABOVE WAS TAKEN ON AN M2 AND ITS ANSWER DOES NOT TRAVEL. What P
+ * buys is weight-read amortisation and what it costs is workgroup storage, and
+ * an A100 has 48 KiB of that against Apple's 32 - so the tile that left two
+ * workgroups a core there leaves room here. See docs/AF2.md for the A100 sweep.
+ */
+/**
+ * Whether this device's OPM contraction runs its staged tile in half precision.
+ *
+ * Gated on the feature AND on the whole-f16 switch, like every other automatic
+ * f16 choice here - a caller that names a precision still gets it, so the
+ * differential checker can test the path the default is not using.
+ */
+export function opmContractPrecision(device) {
+  const requested = deviceTuning(device).opmContractPrecision;
+  if (requested === "f32" || requested === null || requested === undefined) return "f32";
+  if (requested !== "f16") throw new RangeError(`unknown OPM contraction precision ${requested}`);
+  return halfPrecisionAvailable(device) ? "f16" : "f32";
+}
+
+export function opmProjectOutputPairs(device, cOuter = 32) {
+  const wanted = shapedKnob(deviceTuning(device).opmProjectOutputPairs) ?? OPM_PROJECT_OUTPUT_PAIRS;
+  // 🔴 PRICED AGAINST THE DEVICE, because the ampere prior's 4 stages 17,424
+  // bytes at c_outer 32 and WebGPU guarantees 16,384: a conforming minimum
+  // device without matrix units could not create AF2's pipeline at all. The
+  // largest count at or below the wanted one that fits; where the wanted one
+  // fits - every device measured - nothing changes.
+  const limit = device.limits?.maxComputeWorkgroupStorageSize ?? 16384;
+  const bytes = (pairs) => (cOuter * cOuter * pairs + 64 * pairs + pairs) * 4;
+  const fits = [8, 4, 2, 1].find((pairs) => pairs <= wanted && bytes(pairs) <= limit);
+  if (fits === undefined) {
+    throw new RangeError(`the OPM output projection does not fit ${limit} bytes of `
+      + `workgroup storage even at one pair (c_outer ${cOuter})`);
+  }
+  return fits;
+}
+
+/**
+ * The output projection, generated for one c_outer.
+ *
+ * 🔴 IT RECOMPUTED THE DENOMINATOR ONCE PER OUTPUT CHANNEL. The count of
+ * sequences covering both tokens depends on the PAIR alone, and a thread owned
+ * a (pair, channel) - so 128 threads each swept all 512 sequences for the same
+ * number: 456 million redundant reads a block at depth, about a third of what
+ * this kernel cost. One workgroup a pair computes it once, cooperatively.
+ *
+ * 🔴 AND EVERY THREAD RE-READ THE WHOLE OUTER TENSOR. A pair's c_outer^2 values
+ * are the same for all 128 channels; staged in workgroup memory they are one
+ * global read each rather than 128, which halves what is left.
+ *
+ * 🔴 WHAT WAS LEFT AFTER BOTH WAS ONE GLOBAL WEIGHT READ PER MULTIPLY-ADD. The
+ * loops ran channel-outside-cell, so a lane re-read all CELLS staged values for
+ * each of its channels, and read `weights[output_weight + cell * c_z + z]` for
+ * every product it formed: one workgroup read, one global read and one
+ * multiply-add, 0.33 useful operations an instruction. At 512 MSA rows it
+ * measured 3.12 ms of a 110 ms block - 296 GFLOP/s, and 69% of this device's
+ * instruction issue, so it was the count and not the bytes.
+ *
+ * Cell is now the OUTER loop, so a staged value is read once for both of a
+ * lane's channels, and a workgroup carries several pairs whose products share
+ * that one weight read. Per cell an invocation issues one staged read, two
+ * weight reads and two vector multiply-adds for 2*P products.
+ */
+export function createOuterProductMeanProjectOutputShader(
+  cOuter, residual = false, pairsPerGroup = OPM_PROJECT_OUTPUT_PAIRS,
+) {
+  const cells = cOuter * cOuter;
+  const pairs = pairsPerGroup;
+  // 🔴 THE CEILING IS WORKGROUP STORAGE AND THE SHADER SAYS SO. A group stages
+  // `CELLS * P` floats, 4 KiB a pair at AlphaFold's widths, against a limit of
+  // 32 KiB on an M2 and 48 on this card - so 8 is the largest that fits
+  // anywhere and 16 fits nowhere. Powers of two only, because the accumulator
+  // is chunked into vec4s.
+  if (![1, 2, 4, 8].includes(pairs)) {
+    throw new RangeError(`OPM output pairs must be 1, 2, 4 or 8; got ${pairsPerGroup}`);
+  }
+  // Chunks of at most four pairs, so one weight read multiplies into a whole
+  // vector of them. Eight is two vec4s rather than a wider type WGSL lacks.
+  const chunks = [];
+  for (let rest = pairs; rest > 0;) {
+    const width = rest >= 4 ? 4 : rest;
+    chunks.push({ width, first: pairs - rest });
+    rest -= width;
+  }
+  const vector = (width) => ({ 1: "f32", 2: "vec2<f32>", 4: "vec4<f32>" })[width];
+  const at = (name, chunk, lane) => (chunk.width === 1 ? name : `${name}.${"xyzw"[lane]}`);
+  const overChunks = (body) => chunks.map((chunk, index) => body(chunk, index)).join("\n");
+  const overPairs = (body) => chunks
+    .map((chunk, index) => Array.from({ length: chunk.width },
+      (_, lane) => body(chunk.first + lane, chunk, index, lane)).join("\n"))
+    .join("\n");
+
+  return `${OPM_PAIR_BLOCK}
+@group(0) @binding(0) var<storage, read> outer: array<f32>;
+@group(0) @binding(1) var<storage, read> mask: array<f32>;
+@group(0) @binding(2) var<storage, read> weights: array<f32>;
+@group(0) @binding(3) var<uniform> p: Parameters;
+@group(0) @binding(4) var<storage, read_write> output: array<f32>;
+@group(0) @binding(5) var<uniform> blk: PairBlock;
+
+const CELLS: u32 = ${cells}u;
+const PAIRS_PER_GROUP: u32 = ${pairs}u;
+
+// One vector a cell per chunk, holding that cell's value for each pair.
+${overChunks((chunk, index) => `var<workgroup> staged${index}: array<${vector(chunk.width)}, ${cells}>;
+var<workgroup> reduce${index}: array<${vector(chunk.width)}, 64>;`)}
+var<workgroup> scales: array<f32, ${pairs}>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_id) local_id: vec3<u32>) {
+  let first_local = (group.x + group.y * GRID_WIDTH) * PAIRS_PER_GROUP;
+  if (first_local >= blk.count) { return; }
+  let local = local_id.x;
+
+  // ...a pair past the end of the BLOCK is clamped rather than skipped, so
+  // every lane reaches every barrier below; it is dropped at the write. The
+  // staged read is local to the block, the mask and the write are global.
+${overPairs((n) => `  let local_pair${n} = min(first_local + ${n}u, blk.count - 1u);
+  let pair${n} = blk.offset + local_pair${n};
+  let live${n} = first_local + ${n}u < blk.count;`)}
+
+  for (var cell = local; cell < CELLS; cell += 64u) {
+${overChunks((chunk, index) => `    var value${index} = ${vector(chunk.width)}(0.0);`)}
+${overPairs((n, chunk, index, lane) =>
+    `    ${at(`value${index}`, chunk, lane)} = outer[local_pair${n} * CELLS + cell];`)}
+${overChunks((chunk, index) => `    staged${index}[cell] = value${index};`)}
+  }
+  workgroupBarrier();
+
+  // 🔴 ONE BARRIER TREE FOR ALL P DENOMINATORS, NOT P OF THEM. The count of
+  // sequences covering both tokens depends on the PAIR alone - so it is
+  // computed once per pair rather than once per output channel, which is what
+  // it used to be. But a group carrying eight pairs then ran eight sequential
+  // 64-lane reductions, six barriers each: 48 barriers to produce eight floats,
+  // and the sweep's fixed cost was exactly that. The counts reduce as a VECTOR
+  // instead, one tree whatever P is, and the mask read for the row index is
+  // shared by every pair in the chunk.
+${overChunks((chunk, index) => `  {
+${Array.from({ length: chunk.width }, (_, lane) => {
+      const n = chunk.first + lane;
+      return `    let i${n} = pair${n} / p.length;\n    let j${n} = pair${n} % p.length;`;
+    }).join("\n")}
+    var count = ${vector(chunk.width)}(0.0);
+    for (var sequence = local; sequence < p.sequences; sequence += 64u) {
+      let row = sequence * p.length;
+${Array.from({ length: chunk.width }, (_, lane) => {
+      const n = chunk.first + lane;
+      return `      ${at("count", chunk, lane)} += mask[row + i${n}] * mask[row + j${n}];`;
+    }).join("\n")}
+    }
+    reduce${index}[local] = count;
+    workgroupBarrier();
+    if (local < 32u) { reduce${index}[local] += reduce${index}[local + 32u]; }
+    workgroupBarrier();
+    if (local < 16u) { reduce${index}[local] += reduce${index}[local + 16u]; }
+    workgroupBarrier();
+    if (local < 8u) { reduce${index}[local] += reduce${index}[local + 8u]; }
+    workgroupBarrier();
+    if (local == 0u) {
+      let total${index} = ((reduce${index}[0] + reduce${index}[4]) + (reduce${index}[2] + reduce${index}[6]))
+        + ((reduce${index}[1] + reduce${index}[5]) + (reduce${index}[3] + reduce${index}[7]));
+${Array.from({ length: chunk.width }, (_, lane) => `      scales[${chunk.first + lane}u] = `
+      + `1.0 / (p.normalization_epsilon + ${at(`total${index}`, chunk, lane)});`).join("\n")}
+    }
+  }`)}
+  workgroupBarrier();
+
+  // 🔴 CELL OUTSIDE CHANNEL. A lane's channels share the staged value, and all
+  // PAIRS_PER_GROUP pairs share the weight read - which is the whole point of
+  // carrying more than one. That read is this kernel's cost: a workgroup sweeps
+  // the whole CELLS x c_z output matrix once, 512 KiB at AlphaFold's widths, and
+  // divides it among P pairs. Doubling P halves the traffic, which is why the
+  // measured curve is 70.9 / 43.2 / 30.2 ms at P = 1, 2, 4.
+  if (p.c_z == 128u) {
+    let z0 = local;
+    let z1 = local + 64u;
+${overChunks((chunk, index) => `    var acc${index}_0 = ${vector(chunk.width)}(weights[p.output_bias + z0]);
+    var acc${index}_1 = ${vector(chunk.width)}(weights[p.output_bias + z1]);`)}
+    var w_off = p.output_weight + z0;
+    for (var cell = 0u; cell < CELLS; cell += 1u) {
+      let w0 = weights[w_off];
+      let w1 = weights[w_off + 64u];
+${overChunks((chunk, index) => `      let s${index} = staged${index}[cell];
+      acc${index}_0 += s${index} * w0;
+      acc${index}_1 += s${index} * w1;`)}
+      w_off += 128u;
+    }
+${overPairs((n, chunk, index, lane) => `    if (live${n}) {
+      let sc${n} = scales[${n}u];
+      let out_base${n} = pair${n} * 128u;
+      output[out_base${n} + z0] ${residual ? "+=" : "="} ${at(`acc${index}_0`, chunk, lane)} * sc${n};
+      output[out_base${n} + z1] ${residual ? "+=" : "="} ${at(`acc${index}_1`, chunk, lane)} * sc${n};
+    }`)}
+  } else {
+    for (var z = local; z < p.c_z; z += 64u) {
+${overChunks((chunk, index) => `      var acc${index} = ${vector(chunk.width)}(weights[p.output_bias + z]);`)}
+      for (var cell = 0u; cell < CELLS; cell += 1u) {
+        let w = weights[p.output_weight + cell * p.c_z + z];
+${overChunks((chunk, index) => `        acc${index} += staged${index}[cell] * w;`)}
+      }
+${overPairs((n, chunk, index, lane) => `      if (live${n}) {
+        output[pair${n} * p.c_z + z] ${residual ? "+=" : "="} ${at(`acc${index}`, chunk, lane)} * scales[${n}u];
+      }`)}
+    }
+  }
+}`;
+}
+
+// 🔴 64 MiB WAS A NUMBER, NOT A DEVICE, AND IT COST 6.8x ON EVERY REAL PROTEIN.
+// The outer-first intermediate is `L^2 * cOuter^2 * 4`, so a 64 MiB cap stops
+// at **L = 128** - past which every fold fell back to `opm.accumulate`, a naive
+// triple loop with one invocation per (i, j, z) that re-reads `right` for all
+// 128 channels. Measured at 400 residues and 512 rows, one evoformer block:
+//
+//   64 MiB cap, tiled fallback   591.2 ms   opm.accumulate 552.7 (93.5%)
+//   the device's own limit       86.9 ms    opm.contract 15.2 + project-out 10.1
+//
+// **6.8x on the block, 22x on the kernel**, and at 825 residues the fallback is
+// 93.7% of a block and 102 s of a 150 s fold.
+//
+// 🔴 THE DEVICE'S BINDING LIMIT IS THE RIGHT CAP BECAUSE IT SCALES WITH THE
+// DEVICE. `maxStorageBufferBindingSize` is ~128 MiB on a phone and 2 GiB here,
+// so the same rule keeps a small device on the tiled path and lets a large one
+// take the fast one. It is also a HARD limit: 2.79 GB at 825 residues is
+// refused by WebGPU outright ("larger than the maximum storage buffer binding
+// size"), which is why the fallback still has to exist above L = 724.
+const OUTER_FIRST_LIMIT_BYTES = 64 * 1024 * 1024;
+
+/**
+ * The largest outer-first intermediate this device can actually take.
+ *
+ * 🔴 TWO REAL CONSTRAINTS AND NO INVENTED ONE. A binding limit is a hard
+ * refusal - 2.79 GB at 825 residues is rejected outright - and the memory
+ * budget is what webgpu/runtime/device-memory.js already exists to answer, with
+ * its own note that "the only thing it is used for is choosing between two
+ * paths that both work". What is left unclaimed is the honest test of whether
+ * the fast path fits, because the allocator THROWS on a budget overrun rather
+ * than falling back: picking the fast path when it does not fit is a failed
+ * fold, not a slow one.
+ */
+export function outerFirstLimitBytes(device) {
+  const limits = device?.limits;
+  if (limits === undefined) return OUTER_FIRST_LIMIT_BYTES;
+  const bindable = Math.min(limits.maxStorageBufferBindingSize ?? OUTER_FIRST_LIMIT_BYTES,
+                            limits.maxBufferSize ?? Number.MAX_SAFE_INTEGER);
+  const { budgetBytes, residentBytes } = memoryTotals(device);
+  if (budgetBytes === undefined) return bindable;
+  return Math.max(0, Math.min(bindable, budgetBytes - residentBytes));
+}
+
+/**
+ * How much of the outer-first intermediate to hold at once.
+ *
+ * 🔴 IT IS A TILE, NOT A LIMIT, WHICH IS THE WHOLE POINT. The intermediate used
+ * to be `L^2 * cOuter^2 * 4` - all the pairs at once - so a device that could
+ * not bind 2.79 GB fell off the fast path entirely at 825 residues and paid 6.8x
+ * for it. Blocked, the buffer holds `OPM_PAIR_BLOCK_BYTES` worth of pairs
+ * wherever the block sits and the protein's length leaves the allocation
+ * completely: **every device takes the fast path at every length**, and the
+ * device limit only decides how many blocks it takes to get there.
+ *
+ * 64 MiB is a working set, chosen so the buffer is small enough to reuse and
+ * large enough that the dispatch count is noise. At AlphaFold's cOuter = 32 a
+ * pair is 4 KiB, so a block is 16,384 pairs - 16,384 contraction workgroups,
+ * which fills any device this runs on - and 825 residues takes 42 of them, 84
+ * dispatches against a kernel that costs hundreds of milliseconds.
+ */
+export const OPM_PAIR_BLOCK_BYTES = 64 * 1024 * 1024;
+
+/**
+ * The contraction as a GEMM on the matrix units.
+ *
+ * 🔴 IT IS THE BIGGEST KERNEL IN AN AF2 BLOCK AND IT IS A PLAIN MATMUL.
+ * `outer[i][j][cl][cr] = sum_s left[s][i][cl] * right[s][j][cr]` is
+ * `C[(i,cl)][(j,cr)] = sum_s A[s][(i,cl)] * B[s][(j,cr)]` - rows and columns of
+ * `L * c_outer`, an inner extent of the whole alignment. At 825 residues and 512
+ * sequences that is 26,400 x 26,400 x 512, **713 GFLOP**, and the hand-tiled
+ * kernel runs it at 10.6 TFLOP/s: 67.3 ms, 18.7% of a block. docs/A100.md's rule
+ * for when the matrix units pay is "the operand is materialised, the problem is
+ * past a billion multiply-accumulates, and K is deep" - and this is the deepest
+ * K in the model.
+ *
+ * 🔴 AND IT NEEDS NO LAYOUT MIGRATION, WHICH IS THE ONLY REASON IT IS CHEAP. The
+ * store writes by PAIR rather than row-major, so `opm.project-output` and the
+ * pair blocking are untouched; the only requirement is that a pair block is a
+ * whole number of `i` rows, which outerFirstPairBlocks now rounds to. `left` is
+ * written transposed by the projection that produces it, and `right` is already
+ * the `[inner][columns]` the kernel wants.
+ */
+/**
+ * Whether this device runs the OPM contraction on its matrix units, and with
+ * what geometry. `null` is the hand-tiled vector kernel.
+ */
+export function opmMatrixContract(device, input) {
+  if (deviceTuning(device).opmMatrixContract !== true) return null;
+  if (!halfPrecisionAvailable(device)) return null;
+  const config = deviceMatrixConfig(device, { element: "f16" });
+  if (config === null) return null;
+  const tile = { M: config.M, N: config.N, K: config.K };
+  const subgroupRows = 1;
+  const subgroupColumns = 8;
+  const geometry = {
+    blockRows: 8 * tile.M * subgroupRows,
+    blockColumns: subgroupColumns * tile.N,
+    blockInner: Math.max(16, tile.K),
+    subgroupRows, subgroupColumns, tile,
+    // 🔴 ONE GEOMETRY, TWO KERNELS, AND ONLY ONE OF THEM MAY NARROW. The output
+    // projection contracts `c_outer^2` - a channel count - and the contraction
+    // contracts the ALIGNMENT DEPTH, which is an input size: its partial sums
+    // are the ones `rowScaleOffset` already exists to keep inside f16's range
+    // at the operand, and an f16 accumulator would put them back outside it.
+    // So `contractResult` carries the device's own answer through to the
+    // contraction whatever the knob says. Same rule as the triangle's.
+    result: shapedKnob(deviceTuning(device).stagedMatrixResult) ?? config.resultComponentType,
+    contractResult: config.resultComponentType,
+    prefetch: deviceTuning(device).stagedMatrixPrefetch === true,
+    matrixElement: config.componentType,
+    // 🔴 A vec4 READ OF BOTH OPERANDS, which docs/A100.md prices at 1.24 -> 0.70
+    // ms on the transition - the largest single thing in that kernel after the
+    // units themselves. Every extent here divides by four: the alignment depth,
+    // `length * c_outer`, and both block extents.
+    vectorStaging: input !== undefined
+      && input.sequences % 4 === 0 && (input.length * input.cOuter) % 4 === 0,
+  };
+  // ...the same two device limits chooseMatrixLinear checks, for the same
+  // reasons; a geometry that does not fit is not a slower path, it is a refused
+  // pipeline.
+  const limit = device.limits?.maxComputeWorkgroupStorageSize ?? 16384;
+  if (stagedMatrixStorage(geometry) > limit) return null;
+  const threads = subgroupRows * subgroupColumns * 32;
+  if (threads > (device.limits?.maxComputeInvocationsPerWorkgroup ?? 256)) return null;
+  // 🔴 THE BLOCK HAS TO DIVIDE A ROW OF THE OUTPUT, because the store indexes by
+  // PAIR: a column block that straddled two `j` values would be fine, but a ROW
+  // block that straddled two `i` values would need the pair block to know. The
+  // pair block is rounded to whole rows of `i` instead, which is cheaper.
+  if (input !== undefined && (input.length * input.cOuter) % geometry.blockColumns !== 0) {
+    // ...not a refusal: the kernel guards its own edges. Kept as a note.
+  }
+  return geometry;
+}
+
+/**
+ * The per-pair denominator: how many sequences cover both tokens.
+ *
+ * 🔴 ITS OWN PASS, because the output projection is a GEMM now and a GEMM has
+ * nowhere to put a cooperative reduction. It used to be computed inside
+ * `opm.project-output`, once per pair per workgroup; the total work is the same
+ * either way - `L^2 * sequences` mask products - and src/af3/
+ * outer-product-mean.js already made this exact move for the same reason
+ * ("it is PAIRS x SEQUENCES multiply-adds in total, a thousandth of the
+ * contraction's, so it is cheaper to compute once into a buffer than to carry").
+ *
+ * It emits the RECIPROCAL, so the projection multiplies where it used to divide.
+ */
+export const OUTER_PRODUCT_MEAN_SCALE_SHADER = `${COMMON}
+@group(0) @binding(0) var<storage, read> mask: array<f32>;
+@group(0) @binding(1) var<uniform> p: Parameters;
+@group(0) @binding(2) var<storage, read_write> scale: array<f32>;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let pair = id.x + id.y * GRID_WIDTH * 64u;
+  if (pair >= p.length * p.length) { return; }
+  let len = p.length;
+  let i = pair / len;
+  let j = pair % len;
+  var count = 0.0;
+  var sequence = 0u;
+  for (; sequence + 3u < p.sequences; sequence += 4u) {
+    let r0 = sequence * len;
+    let r1 = r0 + len;
+    let r2 = r1 + len;
+    let r3 = r2 + len;
+    count += mask[r0 + i] * mask[r0 + j];
+    count += mask[r1 + i] * mask[r1 + j];
+    count += mask[r2 + i] * mask[r2 + j];
+    count += mask[r3 + i] * mask[r3 + j];
+  }
+  for (; sequence < p.sequences; sequence += 1u) {
+    let row = sequence * len;
+    count += mask[row + i] * mask[row + j];
+  }
+  scale[pair] = 1.0 / (p.normalization_epsilon + count);
+}`;
+
+/**
+ * The output projection as a GEMM on the matrix units.
+ *
+ * 🔴 IT IS A MATMUL TOO, AND A DEEP ONE. `output[pair][z] = (bias + sum_cell
+ * outer[pair][cell] * W[cell][z]) / count[pair]`: rows are the block's pairs,
+ * the inner extent is `c_outer^2` - 1024 at AlphaFold's widths - and the columns
+ * are `c_z`. The intermediate is already `[localPair][cell]` row-major and the
+ * weight is already `[cell][z]`, so unlike the contraction this one needs no
+ * transpose at all; the scale is the only thing a plain GEMM lacks, and
+ * `scaleIndex` supplies it.
+ */
+export function createOuterProductMeanMatrixOutputShader(geometry, residual) {
+  return createStagedMatrixShader({
+    ...geometry,
+    sourcePrecision: "f32",
+    weightPrecision: "f32",
+    outputPrecision: "f32",
+    residual,
+    bias: true,
+    // 🔴 AT THE OPERAND, NOT THE RESULT. The intermediate is a sum over the whole
+    // alignment and leaves f16's range at 1024 sequences; see rowScaleOffset.
+    // 🔴 AND BY THE GLOBAL PAIR, so the whole scale buffer is bound and no view
+    // is needed - a view would have to start on a 256-byte boundary, and a pair
+    // block is a whole number of `i` rows, which at an odd length is not one.
+    rowScaleOffset: "parameters.padding.x",
+    // ...the block's pairs are contiguous in the pair index, so the output row
+    // is the local one plus the block's offset, carried in the spare parameter.
+    outputIndex: "(parameters.padding.x + row) * parameters.columns + column",
+  });
+}
+
+/**
+ * The output projection as a register-tiled VECTOR GEMM, for a device with no
+ * matrix units - every stock browser.
+ *
+ * 🔴 THE PAIR-BLOCKED KERNEL RE-READ THE WHOLE WEIGHT MATRIX PER FOUR PAIRS.
+ * `createOuterProductMeanProjectOutputShader` carries P pairs a workgroup and
+ * sweeps `c_outer^2 x c_z` weights for them, so at 255 residues its 16,257
+ * workgroups read 8.5 GB of weights a block out of L2: 2.06 ms, ~4 TMAC/s. As
+ * a GEMM over the block's pairs a staged weight panel serves 64 rows. Same
+ * bindings and uniform as the matrix kernel - `[intermediate, weights,
+ * MatmulParameters, output, scale]`, the pair offset in `padding.x` - so the
+ * caller's matrix branch drives it unchanged.
+ *
+ * 🔴 AND IT IS THE VECTOR KERNEL'S ARITHMETIC, NOT THE MATRIX ONE'S: each
+ * accumulator STARTS at the bias, sums the cells in ascending order, and is
+ * scaled at the result - so the answer is bit-identical to the pair-blocked
+ * kernel. (The count behind the scale is a sum of 0/1 products, an exact
+ * integer in any order.) A 64 x 64 block on 256 lanes, 4 x 4 adjacent outputs
+ * a lane, the source panel padded to a stride of 68 - the layout of the split
+ * transition's vector GEMM in webgpu/af3/trunk/transition.js.
+ */
+export function createOuterProductMeanVectorOutputShader(residual, block = DEFAULT_VECTOR_GEMM_BLOCK, arithmetic = "f32") {
+  // 🔴 f16 ARITHMETIC (VECTOR_GEMM_F16's: f16 panels, a k step's products summed in f16 and then added into f32) needs
+  // the source SCALED AS IT IS STAGED: the intermediate is a sum over the sequences, not yet a mean, and at depth it
+  // passes what f16 holds. So the f16 form computes scale * bias + sum((scale * a) w) where the f32 one computes
+  // scale * (bias + sum(a w)) - the same value, rounded differently.
+  const f16 = arithmetic === "f16";
+  const T = f16 ? "f16" : "f32";
+  // (a lane owns TM adjacent rows and TN adjacent columns of the block - 4 x 4 at the default; see
+  // webgpu/kernels/vector-gemm-block.js)
+  const { rows: BM, columns: BN, inner: BK } = block;
+  const AS = BM + 4, TM = BM / 16, TN = BN / 16, TV = TN / 4;
+  const acc = [], stores = [], biases = [], flush = [];
+  for (let j = 0; j < TV; j += 1) {
+    biases.push(`  let bias_${j} = weights[b0 + ${j}u];`);
+  }
+  for (let i = 0; i < TM; i += 1) {
+    for (let j = 0; j < TV; j += 1) {
+      acc.push(`  var acc_${i}_${j} = ${f16 ? "vec4<f32>(0.0)" : `bias_${j}`};`);
+      if (f16) {
+        flush.push(`    acc_${i}_${j} += vec4<f32>(part_${i}_${j});`);
+      }
+    }
+    stores.push(`  {
+    let row = row_origin + ty * ${TM}u + ${i}u;
+    if (row < parameters.rows) {
+      let pair = parameters.padding.x + row;
+      let pair_scale = scale[pair];
+      let row_out = pair * columns4 + column4;
+${Array.from({ length: TV }, (_, j) => `      {
+        let scaled = ${f16 ? `acc_${i}_${j} + bias_${j} * pair_scale` : `acc_${i}_${j} * pair_scale`};
+        output[row_out + ${j}u] ${residual ? "+=" : "="} scaled;
+      }`).join("\n")}
+    }
+  }`);
+  }
+  const innerSteps = Array.from({ length: BK }, (_, k) => {
+    const bLoads = Array.from({ length: TV }, (_, j) =>
+      `      let b_${j} = b_tile[${k * (BN / 4)}u + tx * ${TV}u + ${j}u];`).join("\n");
+    const aLoads = Array.from({ length: TM }, (_, i) =>
+      `      let a_${i} = a_tile[a_base + ${i}u];`).join("\n");
+    const mads = [];
+    for (let i = 0; i < TM; i += 1) {
+      for (let j = 0; j < TV; j += 1) {
+        if (f16) {
+          mads.push(`      part_${i}_${j} = fma(vec4<f16>(a_${i}), b_${j}, part_${i}_${j});`);
+        } else {
+          mads.push(`      acc_${i}_${j} += a_${i} * b_${j};`);
+        }
+      }
+    }
+    return `    {
+      let a_base = ${k * AS}u + ty * ${TM}u;
+${aLoads}
+${bLoads}
+${mads.join("\n")}
+    }`;
+  }).join("\n");
+  const partInit = f16 ? Array.from({ length: TM }, (_, i) =>
+    Array.from({ length: TV }, (__, j) => `    var part_${i}_${j} = vec4<f16>(0.0);`).join("\n")).join("\n") : "";
+  const k4PerStep = BK / 4;
+  const aSteps = (BM * k4PerStep) / 256;
+  const bSteps = ((BN / 4) * BK) / 256;
+  const aPrecompute = Array.from({ length: aSteps }, (_, s) => {
+    const eExpr = s === 0 ? "li" : `(li + ${s * 256}u)`;
+    return `  let a_m_${s} = ${eExpr} / ${k4PerStep}u;
+  let a_k4_${s} = ${eExpr} % ${k4PerStep}u;
+  let a_row_${s} = row_origin + a_m_${s};
+  let a_valid_${s} = a_row_${s} < parameters.rows;
+  let a_src_${s} = a_row_${s} * (parameters.inner >> 2u) + a_k4_${s};
+  let a_dst_${s} = (a_k4_${s} * 4u) * ${AS}u + a_m_${s};${f16 ? `
+  var a_scale_${s} = 0.0;
+  if (a_valid_${s}) { a_scale_${s} = scale[parameters.padding.x + a_row_${s}]; }` : ""}`;
+  }).join("\n");
+  const bPrecompute = Array.from({ length: bSteps }, (_, s) => {
+    const eExpr = s === 0 ? "li" : `(li + ${s * 256}u)`;
+    return `  let b_k_${s} = ${eExpr} / ${BN / 4}u;
+  let b_col4_${s} = weight_offset4 + column_origin4 + (${eExpr} % ${BN / 4}u) + b_k_${s} * columns4;`;
+  }).join("\n");
+  const aStage = Array.from({ length: aSteps }, (_, s) => `    {
+      var a_vec = vec4<f32>(0.0);
+      if (a_valid_${s}) { a_vec = source[a_src_${s} + (k0 >> 2u)]${f16 ? ` * a_scale_${s}` : ""}; }
+      a_tile[a_dst_${s}] = ${T}(a_vec.x);
+      a_tile[a_dst_${s} + ${AS}u] = ${T}(a_vec.y);
+      a_tile[a_dst_${s} + ${2 * AS}u] = ${T}(a_vec.z);
+      a_tile[a_dst_${s} + ${3 * AS}u] = ${T}(a_vec.w);
+    }`).join("\n");
+  const bStage = Array.from({ length: bSteps }, (_, s) => {
+    const eExpr = s === 0 ? "li" : `(li + ${s * 256}u)`;
+    return `    {
+      let base4 = b_col4_${s} + k0 * columns4;
+      b_tile[${eExpr}] = vec4<${T}>(weights[base4]);
+    }`;
+  }).join("\n");
+  return `${f16 ? "enable f16;\n" : ""}struct MatmulParameters {
+  rows: u32, inner: u32, columns: u32, weight_offset: u32,
+  bias_offset: u32, activation: u32, padding: vec2<u32>,
+};
+@group(0) @binding(0) var<storage, read> source: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> weights: array<vec4<f32>>;
+@group(0) @binding(2) var<uniform> parameters: MatmulParameters;
+@group(0) @binding(3) var<storage, read_write> output: array<vec4<f32>>;
+@group(0) @binding(4) var<storage, read> scale: array<f32>;
+var<workgroup> a_tile: array<${T}, ${AS * BK}>;
+var<workgroup> b_tile: array<vec4<${T}>, ${BK * BN / 4}>;
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_index) li: u32) {
+  let row_origin = group.y * ${BM}u;
+  let column_origin4 = group.x * ${BN / 4}u;
+  let columns4 = parameters.columns >> 2u;
+  let weight_offset4 = parameters.weight_offset >> 2u;
+  let tx = li & 15u;
+  let ty = li >> 4u;
+  let column4 = column_origin4 + tx * ${TV}u;
+  let b0 = (parameters.bias_offset >> 2u) + column4;
+${biases.join("\n")}
+${acc.join("\n")}
+${aPrecompute}
+${bPrecompute}
+  for (var k0 = 0u; k0 < parameters.inner; k0 += ${BK}u) {
+${aStage}
+${bStage}
+    workgroupBarrier();
+${partInit}
+${innerSteps}
+${flush.join("\n")}
+    workgroupBarrier();
+  }
+${stores.join("\n")}
+}`;
+}
+/** The vector output GEMM's block, which its dispatch divides by. */
+export const OPM_VECTOR_OUTPUT_BLOCK = Object.freeze({ rows: 64, columns: 64 });
+
+/**
+ * The sequence contraction as a register-tiled VECTOR GEMM over a pair block.
+ *
+ * 🔴 ONE WORKGROUP A PAIR RE-READ ITS TWO SLICES FOR EVERY PAIR. The kernel
+ * above stages `left[., i, :]` and `right[., j, :]` per pair, so each residue's
+ * slice is read L times over: 1.60 ms at 255 residues x 128 rows, ~5.3 TMAC/s.
+ * As a GEMM - rows (i, a), columns (j, b), inner the sequences - a staged
+ * 64-wide panel serves 64 outputs. Both operands are already K-major in the
+ * layout the vector projection writes (`left[(s * L + i) * C + a]`), so the
+ * panels stage coalesced with no transpose.
+ *
+ * 🔴 AND IT SUMS EACH CELL OVER THE SEQUENCES IN ASCENDING ORDER FROM ZERO,
+ * `acc += l[a] * r[b]` in f32, as the kernel above does: bit-identical.
+ *
+ * Uniform: rows = (block's residues) x C, inner = sequences, columns = L x C,
+ * `weight_offset` = the block's first residue x C, `padding.x` = L. The store
+ * writes the pair-major intermediate the output projection reads.
+ */
+export function createOuterProductMeanVectorContractShader(cOuter, block = DEFAULT_VECTOR_GEMM_BLOCK, arithmetic = "f32") {
+  // (f16 arithmetic: VECTOR_GEMM_F16's - each k step's products, k the sequences, summed in f16, then into f32)
+  const f16 = arithmetic === "f16";
+  const T = f16 ? "f16" : "f32";
+  const vec4Align = cOuter % 4 === 0;
+  const { rows: BM, columns: BN, inner: BK } = block;
+  const AS = BM + 4, AV = AS / 4, TM = BM / 16, MV = TM / 4, TN = BN / 16, TV = TN / 4;
+  const acc = [], stores = [], flush = [];
+  for (let i = 0; i < TM; i += 1) {
+    for (let j = 0; j < TV; j += 1) {
+      acc.push(`  var acc_${i}_${j} = vec4<f32>(0.0);`);
+      if (f16) {
+        flush.push(`    acc_${i}_${j} += vec4<f32>(part_${i}_${j});`);
+      }
+    }
+    stores.push(`  {
+    let row = row_origin + ty * ${TM}u + ${i}u;
+    if (row < parameters.rows) {
+      let row_i = (row / ${cOuter}u) * parameters.padding.x;
+      let row_rem = (row % ${cOuter}u) * ${cOuter}u;
+${Array.from({ length: TV }, (_, j) => `      {
+        let c0 = column + ${4 * j}u;
+        if (c0 < parameters.columns) {
+          let local_pair = row_i + c0 / ${cOuter}u;
+          let at = local_pair * ${cOuter * cOuter}u + row_rem + c0 % ${cOuter}u;
+          ${vec4Align
+            ? `outer[at / 4u] = acc_${i}_${j};`
+            : [0, 1, 2, 3].map((c) => `outer[at + ${c}u] = acc_${i}_${j}.${"xyzw"[c]};`).join("\n          ")}
+        }
+      }`).join("\n")}
+    }
+  }`);
+  }
+  const innerSteps = Array.from({ length: BK }, (_, k) => {
+    const bLoads = Array.from({ length: TV }, (_, j) =>
+      `      let b_${j} = b_tile[${k * (BN / 4)}u + tx * ${TV}u + ${j}u];`).join("\n");
+    const aLoads = Array.from({ length: MV }, (_, v) =>
+      `      let a_${v} = a_tile[${k * AV}u + ty * ${MV}u + ${v}u];`).join("\n");
+    const mads = [];
+    for (let i = 0; i < TM; i += 1) {
+      const ai = `a_${Math.floor(i / 4)}.${"xyzw"[i % 4]}`;
+      for (let j = 0; j < TV; j += 1) {
+        if (f16) {
+          mads.push(`      part_${i}_${j} = fma(vec4<f16>(${ai}), b_${j}, part_${i}_${j});`);
+        } else {
+          mads.push(`      acc_${i}_${j} += ${ai} * b_${j};`);
+        }
+      }
+    }
+    return `    {
+${aLoads}
+${bLoads}
+${mads.join("\n")}
+    }`;
+  }).join("\n");
+  const partInit = f16 ? Array.from({ length: TM }, (_, i) =>
+    Array.from({ length: TV }, (__, j) => `    var part_${i}_${j} = vec4<f16>(0.0);`).join("\n")).join("\n") : "";
+  const storageType = vec4Align ? "vec4<f32>" : "f32";
+  const load4 = (buf) => vec4Align
+    ? `${buf}[base]`
+    : `vec4<f32>(${buf}[base], ${buf}[base + 1u], ${buf}[base + 2u], ${buf}[base + 3u])`;
+  const aSteps = ((BM / 4) * BK) / 256;
+  const bSteps = ((BN / 4) * BK) / 256;
+  const aPre = Array.from({ length: aSteps }, (_, s) => {
+    const eExpr = s === 0 ? "li" : `(li + ${s * 256}u)`;
+    return `  let a_k_${s} = ${eExpr} / ${BM / 4}u;
+  let a_mg_${s} = ${eExpr} % ${BM / 4}u;
+  let a_r_${s} = row_origin + a_mg_${s} * 4u;
+  let a_valid_${s} = a_r_${s} < parameters.rows;
+  let a_col_${s} = ${vec4Align ? `(parameters.weight_offset + a_r_${s}) / 4u` : `parameters.weight_offset + a_r_${s}`} + a_k_${s} * stride;
+  let a_idx_${s} = a_k_${s} * ${AV}u + a_mg_${s};`;
+  }).join("\n");
+  const bPre = Array.from({ length: bSteps }, (_, s) => {
+    const eExpr = s === 0 ? "li" : `(li + ${s * 256}u)`;
+    return `  let b_k_${s} = ${eExpr} / ${BN / 4}u;
+  let b_c_${s} = column_origin + (${eExpr} % ${BN / 4}u) * 4u;
+  let b_valid_${s} = b_c_${s} < parameters.columns;
+  let b_col_${s} = ${vec4Align ? `b_c_${s} / 4u` : `b_c_${s}`} + b_k_${s} * stride;`;
+  }).join("\n");
+  const aStage = Array.from({ length: aSteps }, (_, s) => `    {
+      let k = k0 + a_k_${s};
+      var value = vec4<f32>(0.0);
+      if (k < parameters.inner && a_valid_${s}) {
+        let base = k0 * stride + a_col_${s};
+        value = ${load4("left")};
+      }
+      a_tile[a_idx_${s}] = vec4<${T}>(value);
+    }`).join("\n");
+  const bStage = Array.from({ length: bSteps }, (_, s) => {
+    const eExpr = s === 0 ? "li" : `(li + ${s * 256}u)`;
+    return `    {
+      let k = k0 + b_k_${s};
+      var value = vec4<f32>(0.0);
+      if (k < parameters.inner && b_valid_${s}) {
+        let base = k0 * stride + b_col_${s};
+        value = ${load4("right")};
+      }
+      b_tile[${eExpr}] = vec4<${T}>(value);
+    }`;
+  }).join("\n");
+  return `${f16 ? "enable f16;\n" : ""}struct MatmulParameters {
+  rows: u32, inner: u32, columns: u32, weight_offset: u32,
+  bias_offset: u32, activation: u32, padding: vec2<u32>,
+};
+@group(0) @binding(0) var<storage, read> left: array<${storageType}>;
+@group(0) @binding(1) var<storage, read> right: array<${storageType}>;
+@group(0) @binding(2) var<uniform> parameters: MatmulParameters;
+@group(0) @binding(3) var<storage, read_write> outer: array<${storageType}>;
+var<workgroup> a_tile: array<vec4<${T}>, ${AV * BK}>;
+var<workgroup> b_tile: array<vec4<${T}>, ${BK * BN / 4}>;
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_index) li: u32) {
+  let row_origin = group.y * ${BM}u;
+  let column_origin = group.x * ${BN}u;
+  let tx = li % 16u;
+  let ty = li / 16u;
+  let column = column_origin + tx * ${TN}u;
+  // Both operands are [sequence][residue * C + channel]; a row of the GEMM is
+  // one of the block's residues' channels, a column one of any residue's.
+  let stride = ${vec4Align ? "parameters.columns / 4u" : "parameters.columns"};
+${acc.join("\n")}
+${aPre}
+${bPre}
+  for (var k0 = 0u; k0 < parameters.inner; k0 += ${BK}u) {
+${aStage}
+${bStage}
+    workgroupBarrier();
+${partInit}
+${innerSteps}
+${flush.join("\n")}
+    workgroupBarrier();
+  }
+${stores.join("\n")}
+}`;
+}
+
+export function createOuterProductMeanMatrixContractShader(cOuter, geometry) {
+  return createStagedMatrixShader({
+    ...geometry,
+    ...(geometry.contractResult === undefined ? {} : { result: geometry.contractResult }),
+    sourcePrecision: "f32",
+    weightPrecision: "f32",
+    outputPrecision: "f32",
+    // ...NOT `sourceTransposed`: the projection writes `left` channel-major, so
+    // it is already the `[rows][inner]` the kernel reads by default. The option
+    // exists for a caller whose operand is the other way round.
+    bias: false,
+    // ...row is (local i, cl) and column is (j, cr); the intermediate is
+    // indexed by the pair within the block, exactly as the vector kernel
+    // leaves it.
+    outputIndex: `((row / ${cOuter}u) * parameters.padding.x + column / ${cOuter}u)`
+      + ` * ${cOuter * cOuter}u + (row % ${cOuter}u) * ${cOuter}u + (column % ${cOuter}u)`,
+  });
+}
+
+/**
+ * The pairs one outer-first block carries, clamped to what the device can bind.
+ *
+ * Never zero: a single pair is `cOuter^2 * 4` bytes - 4 KiB at AlphaFold's
+ * widths - and a device that cannot bind that cannot run any of this.
+ */
+export function outerFirstPairsPerBlock(input, limitBytes = OUTER_FIRST_LIMIT_BYTES,
+                                        targetBytes = OPM_PAIR_BLOCK_BYTES,
+                                        multiple = 1) {
+  const bytesPerPair = input.cOuter * input.cOuter * 4;
+  const budget = Math.min(limitBytes, targetBytes ?? OPM_PAIR_BLOCK_BYTES);
+  const fits = Math.max(1, Math.floor(budget / bytesPerPair));
+  // 🔴 A WHOLE NUMBER OF `i` ROWS WHEN THE MATRIX PATH TAKES IT, because that
+  // kernel's row index is local to the block and its store divides by c_outer to
+  // recover `i`. A block ending mid-row would put the wrong pair in the wrong
+  // cell, silently. `multiple` is 1 for the vector kernel, which does not care.
+  const aligned = Math.max(multiple, Math.floor(fits / multiple) * multiple);
+  return Math.min(aligned, input.length * input.length);
+}
+
+/**
+ * The blocks of pairs the outer-first path runs, as `[offset, count]` pairs.
+ */
+export function outerFirstPairBlocks(input, limitBytes = OUTER_FIRST_LIMIT_BYTES,
+                                     targetBytes = OPM_PAIR_BLOCK_BYTES,
+                                     multiple = 1) {
+  targetBytes = targetBytes ?? OPM_PAIR_BLOCK_BYTES;
+  const pairs = input.length * input.length;
+  const perBlock = outerFirstPairsPerBlock(input, limitBytes, targetBytes, multiple);
+  const blocks = [];
+  for (let offset = 0; offset < pairs; offset += perBlock) {
+    blocks.push([offset, Math.min(perBlock, pairs - offset)]);
+  }
+  return blocks;
+}
+
+/**
+ * 🔴 THE LENGTH IS GONE FROM THIS DECISION. What is left is the one thing that
+ * was ever algebraic about it - the outer-first order contracts the sequence
+ * axis first, which only wins when there are more sequences than outer channels
+ * - plus the honest question of whether a SINGLE pair fits, which is the only
+ * way a device can genuinely be too small for the path.
+ */
+export function useOuterFirstContraction(input, limitBytes = OUTER_FIRST_LIMIT_BYTES) {
+  const bytesPerPair = input.cOuter * input.cOuter * 4;
+  return input.sequences >= input.cOuter && bytesPerPair <= limitBytes;
+}
+
+export class OuterProductMeanGpu {
+  device;
+  allocator;
+  pipelines;
+
+  constructor(device) {
+    this.device = device;
+    this.allocator = new GpuBufferAllocator(device);
+    this.pipelines = pipelineCacheForDevice(device);
+  }
+
+  async run(input) {
+    validate(input);
+    const packed = packOuterProductMeanWeights(input);
+    // 🔴 A TEST SEAM, so a checker can force EITHER path at ONE size and compare
+    // them. The two are algebraically identical and numerically different - they
+    // contract the sequence axis in a different order - so the only honest gate
+    // is running both on the same input, which needs the limit to be movable.
+    const outerFirst = useOuterFirstContraction(
+      input, input.outerFirstLimitBytes ?? outerFirstLimitBytes(this.device));
+    const contractPrecision = input.contractPrecision ?? opmContractPrecision(this.device);
+    const [normalize, project, intermediatePipeline, accumulatePipeline, finalizePipeline,
+      contractPipeline, projectOutputPipeline] = await Promise.all([
+      this.pipelines.get("opm:normalize", OUTER_PRODUCT_MEAN_NORMALIZE_SHADER),
+      this.pipelines.get("opm:project", OUTER_PRODUCT_MEAN_PROJECT_SHADER),
+      outerFirst ? undefined : this.pipelines.get("opm:tile-intermediate", OUTER_PRODUCT_MEAN_TILE_INTERMEDIATE_SHADER),
+      outerFirst ? undefined : this.pipelines.get("opm:tile-accumulate", OUTER_PRODUCT_MEAN_TILE_ACCUMULATE_SHADER),
+      outerFirst ? undefined : this.pipelines.get("opm:finalize", OUTER_PRODUCT_MEAN_FINALIZE_SHADER),
+      outerFirst
+        ? this.pipelines.get(`opm:contract:${input.cOuter}:${contractPrecision}`,
+          createOuterProductMeanContractShader(input.cOuter, contractPrecision))
+        : undefined,
+      outerFirst
+        ? this.pipelines.get(`opm:project-output:${input.cOuter}:${opmProjectOutputPairs(this.device, input.cOuter)}`,
+          createOuterProductMeanProjectOutputShader(
+            input.cOuter, false, opmProjectOutputPairs(this.device, input.cOuter)))
+        : undefined,
+    ]);
+    const storage = GPUBufferUsage.STORAGE;
+    const allocations = [];
+    const keep = (value) => { allocations.push(value); return value; };
+    const rows = input.sequences * input.length;
+    const pairElements = input.length * input.length * input.cZ;
+    // ONE WORKGROUP PER ROW, folded the same way linearGrid folds elements.
+    const rowGrid = (rows) => [Math.min(rows, GRID_WIDTH), Math.ceil(rows / GRID_WIDTH)];
+    const linearGrid = (elements) => {
+      const groups = ceilDivide(elements, 64);
+      return [Math.min(groups, GRID_WIDTH), ceilDivide(groups, GRID_WIDTH)];
+    };
+    try {
+      const source = keep(this.allocator.upload("opm.source", input.activations, storage));
+      const mask = keep(this.allocator.upload("opm.mask", input.mask, storage));
+      const weights = keep(this.allocator.upload("opm.weights", packed.data, storage));
+      const params = keep(this.allocator.upload(
+        "opm.parameters", createOuterProductMeanParameters(input, packed.offsets), GPUBufferUsage.UNIFORM,
+      ));
+      const normalized = keep(this.allocator.allocate("opm.normalized", rows * input.cM * 4, storage));
+      const left = keep(this.allocator.allocate("opm.left", rows * input.cOuter * 4, storage));
+      const right = keep(this.allocator.allocate("opm.right", rows * input.cOuter * 4, storage));
+      const tileCapacity = outerProductMeanTileCapacity(
+        input, this.device.limits.maxStorageBufferBindingSize);
+      const pairBlocks = outerFirstPairBlocks(
+        input, input.outerFirstLimitBytes ?? outerFirstLimitBytes(this.device),
+        deviceTuning(this.device).opmPairBlockBytes);
+      const intermediateElements = outerFirst
+        ? pairBlocks[0][1] * input.cOuter * input.cOuter
+        : tileCapacity * input.length * input.cOuter * input.cZ;
+      const intermediate = keep(this.allocator.allocate("opm.intermediate", intermediateElements * 4, storage));
+      const output = keep(this.allocator.allocate(
+        "opm.output", pairElements * 4, storage | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+      ));
+      const readback = keep(this.allocator.allocate(
+        "opm.readback", pairElements * 4, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+      ));
+      const encoder = this.device.createCommandEncoder({ label: "outer-product-mean" });
+      this.device.pushErrorScope("validation");
+      const pass = (pipeline, buffers, x, y = 1, z = 1) => {
+        const compute = encoder.beginComputePass();
+        compute.setPipeline(pipeline);
+        compute.setBindGroup(0, this.device.createBindGroup({
+          layout: pipeline.getBindGroupLayout(0),
+          entries: buffers.map((buffer, binding) => ({ binding, resource: { buffer } })),
+        }));
+        compute.dispatchWorkgroups(x, y, z);
+        compute.end();
+      };
+      const normalizeGrid = rowGrid(rows);
+      pass(normalize, [source.buffer, weights.buffer, params.buffer, normalized.buffer],
+        normalizeGrid[0], normalizeGrid[1]);
+      // ...tiles, not threads, and folded the same way the block encoders fold
+      // it - this path is what check-evoformer-opm.js drives, so a dispatch
+      // that disagreed with theirs would leave the real one ungated.
+      const projectTiles = Math.ceil(rows / opmProjectTileRows());
+      const projectGrid = rowGrid(projectTiles);
+      pass(project, [normalized.buffer, mask.buffer, weights.buffer, params.buffer, left.buffer, right.buffer],
+        projectGrid[0], projectGrid[1], Math.ceil(input.cOuter / opmProjectTileColumns()));
+      const outputGrid = linearGrid(pairElements);
+      if (outerFirst) {
+        // ...a block of pairs at a time, and one block on anything but a huge
+        // protein; see outerFirstPairBlocks. Each block is a contraction and a
+        // projection over the SAME intermediate buffer, so they serialise
+        // naturally - the projection reads what the contraction just wrote.
+        for (const [offset, count] of pairBlocks) {
+          const blk = keep(this.allocator.upload(
+            `opm.pair-block-${offset}`, new Uint32Array([offset, count, 0, 0]),
+            GPUBufferUsage.UNIFORM,
+          ));
+          // ...one workgroup per PAIR, not per element; see the contraction kernel.
+          const outerGrid = [Math.min(count, GRID_WIDTH), Math.ceil(count / GRID_WIDTH)];
+          pass(contractPipeline,
+            [left.buffer, right.buffer, params.buffer, intermediate.buffer, blk.buffer],
+            outerGrid[0], outerGrid[1]);
+          // ...several pairs a workgroup; see the note on the kernel. This is
+          // the path check-evoformer-opm.js drives, so its grid has to agree
+          // with the block encoders' or the gate would test a dispatch no fold
+          // uses.
+          const outputGroups = Math.ceil(count / opmProjectOutputPairs(this.device, input.cOuter));
+          const projectOutputGrid = [
+            Math.min(outputGroups, GRID_WIDTH), Math.ceil(outputGroups / GRID_WIDTH)];
+          pass(projectOutputPipeline,
+            [intermediate.buffer, mask.buffer, weights.buffer, params.buffer, output.buffer,
+              blk.buffer],
+            projectOutputGrid[0], projectOutputGrid[1]);
+        }
+      } else {
+        encoder.clearBuffer(output.buffer);
+        const fastTiled = input.cZ % 64 === 0 && input.cOuter <= MAX_C_OUTER;
+        const accumulateGrid = fastTiled
+          ? linearGrid(input.length * Math.ceil(input.length / 8) * input.cZ)
+          : outputGrid;
+        for (let offset = 0; offset < input.sequences; offset += tileCapacity) {
+          const count = Math.min(tileCapacity, input.sequences - offset);
+          const tileParams = keep(this.allocator.upload(
+            `opm.tile-${offset}`, new Uint32Array([offset, count, 0, 0]), GPUBufferUsage.UNIFORM,
+          ));
+          const intermediateGrid = linearGrid(
+            (fastTiled ? Math.ceil((count * input.length) / 8) : count * input.length)
+              * input.cOuter * input.cZ);
+          pass(intermediatePipeline, [left.buffer, weights.buffer, params.buffer, tileParams.buffer, intermediate.buffer],
+            intermediateGrid[0], intermediateGrid[1]);
+          pass(accumulatePipeline, [right.buffer, intermediate.buffer, params.buffer, tileParams.buffer, output.buffer],
+            accumulateGrid[0], accumulateGrid[1]);
+        }
+        pass(finalizePipeline, [mask.buffer, weights.buffer, params.buffer, output.buffer],
+          outputGrid[0], outputGrid[1]);
+      }
+      encoder.copyBufferToBuffer(output.buffer, 0, readback.buffer, 0, pairElements * 4);
+      const start = performance.now();
+      this.device.queue.submit([encoder.finish()]);
+      const validationError = await this.device.popErrorScope();
+      if (validationError !== null) throw new Error(`WebGPU validation failed: ${validationError.message}`);
+      await readback.buffer.mapAsync(GPUMapMode.READ);
+      const result = new Float32Array(readback.buffer.getMappedRange().slice(0));
+      readback.buffer.unmap();
+      return { output: result, elapsedMilliseconds: performance.now() - start, memory: this.allocator.snapshot() };
+    } finally {
+      for (let index = allocations.length - 1; index >= 0; index -= 1) allocations[index] .release();
+    }
+  }
+}

@@ -22,13 +22,13 @@
  * VALUES are irrelevant. Zeros are used to make that explicit; anything else
  * would work identically and would suggest it mattered.
  */
-import { featuriseProtein } from "../../src/af3/featurise/featurise.js";
-import { perAtomConditioning } from "../../src/af3/diffusion/atom-conditioning-reference.js";
-import { atomCrossAttentionEncoder } from "../../src/af3/diffusion/atom-encoder-reference.js";
-import { ALPHAFOLD3 } from "../../src/af3/dialect.js";
-import { Af3AtomEncoderGpu } from "../../src/af3/diffusion/atom-encoder-webgpu.js";
-import { openAf3Store } from "../../src/af3/weights/weights.js";
-import { targetFeatureWeights } from "../../src/af3/weights/diffusion-weights.js";
+import { featuriseProtein } from "../../shared/af3/featurise/featurise.js";
+import { perAtomConditioning } from "../../cpu/af3/diffusion/atom-conditioning.js";
+import { atomCrossAttentionEncoder } from "../../cpu/af3/diffusion/atom-encoder.js";
+import { ALPHAFOLD3 } from "../../shared/af3/dialect.js";
+import { Af3AtomEncoderGpu } from "../../webgpu/af3/diffusion/atom-encoder.js";
+import { openAf3Store } from "../../shared/af3/weights/weights.js";
+import { targetFeatureWeights } from "../../shared/af3/weights/diffusion-weights.js";
 
 const SEQUENCE = "GWSTELEKHREELKEFLKKEGITNVEIRIDNGRLEVRVEGGTERLKRFLEELRQKLEKKGYTVDIKIE";
 
@@ -93,8 +93,9 @@ export async function main(device, args) {
     tokensToKeys: batch.tokensToKeys,
     // The three the conditioning encoder does not have - see the note above.
     tokenAtomsAct: new Float32Array(atoms * 3),
-    trunkSingleCond: new Float32Array(tokens * 384),
-    trunkPairCond: new Float32Array(tokens * tokens * 128),
+    // What a fold passes: no trunk, zeroed on the device.
+    trunkSingleCond: null,
+    trunkPairCond: null,
   }, asDiffusionShapedWeights(weights.encoder));
   const gpuMs = performance.now() - gpuStarted;
 

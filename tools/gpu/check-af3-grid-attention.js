@@ -1,5 +1,5 @@
 /**
- * AF3 triangle (grid) self-attention: GPU against src/af3/trunk/pairformer-reference.js.
+ * AF3 triangle (grid) self-attention: GPU against cpu/af3/trunk/pairformer.js.
  *
  *     node tools/gpu-chrome.mjs tools/gpu/check-af3-grid-attention.js
  *
@@ -9,9 +9,9 @@
  * are, and it is checked with a RAGGED MASK so that a kernel using the query's
  * mask instead of the key's fails here rather than in a fold.
  */
-import { gridSelfAttention } from "../../src/af3/trunk/pairformer-reference.js";
-import { Af3GridSelfAttentionGpu } from "../../src/af3/trunk/grid-attention-webgpu.js";
-import { HttpTensorStore } from "../../src/bundles/http-tensor-store.js";
+import { gridSelfAttention } from "../../cpu/af3/trunk/pairformer.js";
+import { Af3GridSelfAttentionGpu } from "../../webgpu/af3/trunk/grid-attention.js";
+import { HttpTensorStore } from "../../shared/bundles/http-tensor-store.js";
 
 const MANIFEST = "/model-af3-full-f32/manifest.json";
 const STACK = "diffuser/evoformer/__layer_stack_no_per_layer_1/trunk_pairformer";
@@ -53,7 +53,8 @@ function relativeRms(actual, expected) {
 export async function main(device, args) {
   const n = Number(option(args, "n", "24"));
   const block = Number(option(args, "block", "0"));
-  const store = await HttpTensorStore.open(MANIFEST);
+  // (--model= another bundle - both sides read it, so an int5 one checks the kernels against its own weights)
+  const store = await HttpTensorStore.open(option(args, "model", MANIFEST));
   const runner = new Af3GridSelfAttentionGpu(device);
 
   const layer = async (leaf) => {
@@ -89,7 +90,8 @@ export async function main(device, args) {
   // 🔴 RAGGED, so the key-vs-query mask confusion is visible. With an all-ones
   // mask both choices agree and the check passes on a kernel that is wrong.
   const sequence = new Float32Array(n);
-  for (let i = 0; i < n; i += 1) sequence[i] = i < Math.ceil(n * 0.75) ? 1 : 0;
+  // (...all ones under --mask-free, the only mask that form is right for, or --all-ones for its control)
+  for (let i = 0; i < n; i += 1) sequence[i] = args.includes("--mask-free") || args.includes("--all-ones") || i < Math.ceil(n * 0.75) ? 1 : 0;
   const mask = new Float32Array(n * n);
   for (let i = 0; i < n; i += 1) {
     for (let j = 0; j < n; j += 1) mask[i * n + j] = sequence[i] * sequence[j];
@@ -138,12 +140,20 @@ export async function main(device, args) {
       for (const draw of draws) {
         const run = await runner.run(
           draw.pair, mask, { n, channels: CHANNELS, transpose }, weights, DIALECT,
-          { stagedPrecision });
+          { stagedPrecision, attendTiled: option(args, "tiled", "") === "" ? args.includes("--tiled") : option(args, "tiled", ""),
+            // --tiled-half: the tiled form's f16 tiles (gridAttendTiledHalf), held to the f16 bound on both arms
+            attendTiledHalf: args.includes("--tiled-half"),
+            // --bias-vec4: the tiled form's bias read as vec4 from permuted, padded rows (gridAttendBiasVec4)
+            attendBiasVec4: args.includes("--bias-vec4"),
+            // --mask-free: no mask read (gridAttendMaskFree) - only right where the mask is all ones
+            attendMaskFree: args.includes("--mask-free"),
+            // --qkv-half: q, k and v written in f16 for the half-tiled attend (gridAttendQkvHalf)
+            attendQkvHalf: args.includes("--qkv-half") });
         relRms = Math.max(relRms, relativeRms(run.output, draw.expected));
         elapsedMilliseconds = run.elapsedMilliseconds;
         memory = run.memory;
       }
-      const bound = bounds[stagedPrecision];
+      const bound = args.includes("--tiled-half") ? bounds.f16 : bounds[stagedPrecision];
       if (relRms > bound) failed += 1;
       results[`${module}/${stagedPrecision}`] = {
         transpose, stagedPrecision, seeds, relRms, bound,

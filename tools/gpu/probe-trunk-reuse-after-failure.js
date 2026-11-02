@@ -19,12 +19,12 @@
  * feeding it back skips the trunk entirely - counted in recycle stages, not
  * guessed from a clock.
  */
-import { featuriseProtein } from "../../src/af3/featurise/featurise.js";
-import { foldBatch } from "../../src/af3/fold.js";
+import { featuriseProtein } from "../../shared/af3/featurise/featurise.js";
+import { foldBatch } from "../../webgpu/af3/fold.js";
 import { confidenceWeights, openAf3Store, trunkWeights }
-  from "../../src/af3/weights/weights.js";
+  from "../../shared/af3/weights/weights.js";
 import { diffusionWeights, atomReference, targetFeatureWeights }
-  from "../../src/af3/weights/diffusion-weights.js";
+  from "../../shared/af3/weights/diffusion-weights.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
@@ -54,7 +54,7 @@ export async function main(device, args) {
     const started = performance.now();
     try {
       await foldBatch(device, batch, weights, {
-        mode: "flow", steps, recycles, seed: 5, reuse,
+        mode: "diffusion", steps, recycles, seed: 5, reuse,
         onStage: (name, detail) => {
           if (name === "recycle") recycleStages += 1;
           if (name === "trunk-done") {

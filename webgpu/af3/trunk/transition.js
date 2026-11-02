@@ -1,0 +1,1347 @@
+import { packNamedWeights } from "../../../shared/weights/weight-pack.js";
+/**
+ * AF3's transition block on the GPU: LayerNorm, then SwiGLU, then a projection
+ * back down.
+ *
+ *     x -> LayerNorm -> [gate | value] (2 * channels * factor wide)
+ *       -> swish(gate) * value -> down-projection -> out
+ *
+ * WHY THIS IS NOT AF2's TRANSITION KERNEL. AF2's is LayerNorm, Linear, ReLU,
+ * Linear. AF3's widens to DOUBLE the intermediate in one weight and spends half
+ * of it on a swish gate. Same name, same position in the block, different
+ * function - so unlike triangle multiplication, this one could not be adapted.
+ *
+ * 🔴 THE DOUBLE-WIDTH SPLIT IS BLOCKED HERE AND INTERLEAVED IN TRIANGLE
+ * MULTIPLICATION. transition1 is [all the gates | all the values]; the triangle
+ * `projection` is a,b,a,b. Both are double-width weights in the same block of
+ * the same model, and using either convention for the other conforms in shape
+ * and returns a plausible tensor. See webgpu/af3/trunk/triangle.js.
+ *
+ * 🔴 THE GATE HALF IS FIRST. `swish(wide[i]) * wide[intermediate + i]`. Swapped,
+ * the block still runs and still trains-looking output comes out, because both
+ * halves are the same shape and similar scale.
+ *
+ * WHY ONE WORKGROUP PER ROW. The intermediate is `channels * factor * 2` - 1024
+ * floats for the trunk pair track - which is 4 KB of workgroup memory, so a row
+ * can be normalised, widened, gated and contracted without the widened tensor
+ * ever reaching global memory. Materialising it would cost rows * 1024 * 4
+ * bytes: 1.47 GB at 600 tokens, for a value read once. AF2's kernel chunks rows
+ * to survive that; this one never allocates it.
+ */
+import {
+  createStagedMatrixShader, directWeightsAllowed, stagedMatrixStorage,
+} from "../../kernels/matrix-linear.js";
+import { deviceMatrixConfig, deviceTuning, halfPrecisionAvailable } from "../../runtime/device-profile.js";
+import { vectorGemmBlock } from "../../kernels/vector-gemm-block.js";
+import { GpuBufferAllocator } from "../../runtime/allocator.js";
+import { pipelineCacheForDevice } from "../../runtime/pipeline-cache.js";
+
+/**
+ * 🔴 128 EVEN WHERE THE ROWS RUN OUT, WHICH IS NOT WHAT IT LOOKS LIKE. One
+ * workgroup a row means the pairformer's SINGLE transition launches 59 of them
+ * on a 59-residue chain - 7,552 invocations on a part that wants tens of
+ * thousands - so widening the workgroup looks like the only lever left. It is
+ * slower: 256 lanes measured 0.728 ms against 128 lanes' 0.591 on exactly that
+ * shape. The LayerNorm's tree reduction grows a level, and the second matmul
+ * hands 384 channels to 256 lanes, so half of them do two and half do one.
+ * `shape.width` still overrides it, for tools/gpu/bench-transition.js.
+ */
+const DEFAULT_WORKGROUP = 128;
+
+/**
+ * How many rows one workgroup transitions at once, given how many there are.
+ *
+ * 🔴 A FUNCTION OF THE ROW COUNT, NOT A CONSTANT, BECAUSE THE TWO CALLERS ARE
+ * NOTHING ALIKE. The pair track transitions 3481 rows and the weight set is
+ * what costs - tiling by four cut it from 241 ms to 85. The pairformer's SINGLE
+ * transition has one row a token, 59 of them, and tiling by four leaves fifteen
+ * workgroups: it went 30.6 ms to 43.7, because there is no occupancy left to
+ * trade. So the tile is taken only when the rows can spare it.
+ *
+ * 🔴 AND EIGHT ONLY BECAME THE RIGHT ANSWER ONCE THE ROWS WERE VECTOR LANES.
+ * As scalar code tile 8 measured 1.556 ms against tile 4's 1.525 on the pair
+ * shape; with four rows to a vec4 it is 1.394 against 1.494. Vectorising the
+ * arithmetic bought nothing on its own - this kernel waits on its weight reads,
+ * not its multiply-adds - but it freed the tile to grow.
+ *
+ * 🔴 AND EVERY CALLER MUST AGREE WITH THE SHADER. The shader is generated with
+ * this tile and the dispatch is divided by it, so a caller that computes one
+ * and not the other silently transitions a fraction of its rows. Both sides
+ * call this with the same `rows`, which is why it is a pure function.
+ */
+export function transitionRowTile(rows, channels = STAGED_TILE_FLOATS / 8) {
+  for (const tile of [8, 4, 2]) {
+    if (rows / tile >= 220) return Math.max(1, Math.min(tile, Math.floor(STAGED_TILE_FLOATS / channels)));
+  }
+  return 1;
+}
+
+/**
+ * How many floats each half of the staged block holds, whatever the shape.
+ *
+ * 🔴 THE TILE WAS A FUNCTION OF THE ROW COUNT ALONE, AND THE ROW COUNT IS NOT
+ * WHAT FILLS THE WORKGROUP. The staged block is `tile * channels` for the
+ * normalised rows plus `tile * chunk` for the gated intermediate, so the
+ * CHANNELS decide what a tile costs - and at 256 channels the tile the row rule
+ * picks is twice what fits well. ESMFold2's trunk runs 256 where AF3's pair
+ * track runs 128, and it is 62.5% of that trunk's GPU time, so it is where this
+ * showed. Swept at 90,000 rows x 256 channels by bench-transition.js, every arm
+ * bit-identical (relRMS 0):
+ *
+ * | tile:chunk | 4:256 | 4:512 | 4:1024 | 8:128 | 8:256 | 2:1024 | 16:128 | 8:512 |
+ * |---|---|---|---|---|---|---|---|---|
+ * | ms | **230.9** | 245.2 | 353.5 | 369.1 | 394.8 | 396.1 | 560.2 | 773.5 |
+ *
+ * 8:256 is what the row rule picked; 4:256 is **1.71x** it.
+ *
+ * 🔴 AND 1024 REPRODUCES EVERY TUNED VALUE ALREADY IN THE TREE, which is the
+ * only reason it is a rule rather than a second special case. AF3's pair track
+ * measured 8:128 optimal at 128 channels and its MSA stack, its template stack
+ * and both diffusion transitions land on exactly what they run today:
+ *
+ * | stack | channels | intermediate | tile | chunk |
+ * |---|---|---|---|---|
+ * | AF3 pair track | 128 | 512 | 8 | 128 |
+ * | AF3 MSA stack | 64 | 256 | 8 | 128 (the workgroup floor) |
+ * | AF3 template stack | 64 | 128 | 8 | 128 (the whole intermediate) |
+ * | diffusion, pair | 128 | 256 | 8 | 128 |
+ * | diffusion, single | 384 | 768 | 1 | 768 (the whole intermediate) |
+ * | **ESMFold2 trunk** | **256** | **1024** | **4** | **256** |
+ *
+ * Only the last row moves. `test/transition-tile.test.js` pins the whole table,
+ * because a rule that quietly re-tunes four shipped stacks while fixing a fifth
+ * is not the change this is.
+ */
+export const STAGED_TILE_FLOATS = 1024;
+
+/**
+ * How much of the widened intermediate is resident in workgroup memory at once.
+ *
+ * 🔴 NEITHER THE LARGEST NOR THE SMALLEST THAT FITS. The chunk sets two things
+ * against each other: it is the whole of this kernel's workgroup memory, so a
+ * smaller one leaves more workgroups resident per core, and it is also how many
+ * slots one invocation accumulates at once, so a larger one reads the
+ * normalised tile fewer times. Measured on the pair track's shape - 3481 rows,
+ * 512 intermediate - at tile 4 the whole intermediate is 1.559 ms, half 1.525,
+ * a quarter 1.569; at tile 8 a quarter is 1.394 and a half 1.713. What holds
+ * across both is the product: TILE * CHUNK stays at two intermediates' worth of
+ * floats, 4 KB for the pair track, so the tile buys its halved weight traffic
+ * without also spending workgroup memory.
+ *
+ * The MSA track lands on the floor of one workgroup width and is flat there
+ * anyway (0.262 to 0.269 ms across every arm), and the single track's tile is 1
+ * so it stays unchunked.
+ */
+export function transitionChunk(intermediate, tile = 1, width = DEFAULT_WORKGROUP) {
+  // Keep the staged block a constant size - see STAGED_TILE_FLOATS. The tile
+  // then trades weight traffic for occupancy and not for workgroup memory as
+  // well, at any channel count rather than at 128 alone.
+  const wanted = Math.max(width, Math.round(STAGED_TILE_FLOATS / tile / width) * width);
+  const chunk = Math.min(intermediate, wanted);
+  return intermediate % chunk === 0 ? chunk : intermediate;
+}
+
+const GRID_WIDTH = 32_768;
+
+/** The packing order of the four tensors this kernel reads. */
+export const TRANSITION_ORDER =
+  ["inputLayerNormScale", "inputLayerNormOffset", "transition1", "transition2"];
+const ORDER = TRANSITION_ORDER;
+
+/**
+ * @param {"f32"|"f16"} precision the element the packed buffer holds. The
+ *   offsets are in ELEMENTS and do not depend on it, so a caller that packs one
+ *   way and builds the shader the other gets a wrong answer rather than an
+ *   error - which is why `createTransitionShader` takes the same word.
+ */
+export function packTransitionWeights(weights, precision = "f32") {
+  return packNamedWeights(weights,
+    { label: "transition weights", order: ORDER, precision });
+}
+
+/**
+ * How wide the workgroup should be, from how many of them there will be.
+ *
+ * 🔴 THE DISPATCH IS ROWS ONLY, SO A SHORT TRACK CANNOT FILL A LARGE DEVICE.
+ * `main` takes `base_row = (group.x + group.y * GRID_WIDTH) * TILE`, and that
+ * is the whole grid - there is no second axis. So the thread count is
+ * `ceil(rows / tile) * WORKGROUP` and nothing else, and at 128 the AF3 trunk's
+ * SINGLE transition gets 200 rows x 128 = 25,600 threads on a device that
+ * holds 221,184. It measured 2.3% of this device's arithmetic ceiling while
+ * being 13.6% of the trunk's GPU time.
+ *
+ * Widening the workgroup is the only axis left, and it is enough. Measured on
+ * bench-transition.js at the two shapes the AF3 trunk actually runs:
+ *
+ *     single, 200 rows x 384 x 1536:   128 -> 0.594 ms   512 -> 0.208   2.86x
+ *     pair, 40000 rows x 128 x 512:    128 -> 1.098      512 -> 1.567   0.70x
+ *
+ * The pair track already has 5000 workgroups and a wider one only costs it
+ * occupancy, so the rule has to be a function of the workgroup COUNT rather
+ * than a new constant - which is what `threadTarget` is. On a device that
+ * wants ~25,000 threads (an M2) it returns the 128 it always did.
+ *
+ * 🔴 AND 768 IS NOT A CHOICE, IT IS A WRONG ANSWER. The bench reports width
+ * 768 at relRMS **0.55** against the same kernel at 128 - not slower, wrong -
+ * so the widths here are powers of two and `createTransitionShader` rejects
+ * anything else rather than trusting a caller. Whatever the reduction assumes,
+ * it assumes it of a power of two.
+ */
+export function transitionWidth(rows, tile, threadTarget, width = DEFAULT_WORKGROUP,
+                                intermediate = undefined, maxWorkgroup = Infinity) {
+  if (!threadTarget) return width;
+  const groups = Math.max(1, Math.ceil(rows / tile));
+  for (const candidate of [512, 256]) {
+    // 🔴 AND A WIDTH THE DEVICE WILL NOT RUN IS NOT A CHOICE EITHER. 512 is a
+    // PERFORMANCE pick from the ampere prior, and WebGPU guarantees only 256
+    // invocations and a 256 X extent - so on a conforming device reporting the
+    // minimum this kernel refused to compile at all and AlphaFold 3, boltz2 and
+    // protenix2 did not fold. Measured with `check-portable-limits.mjs
+    // --spec-floor`, which is the only thing that could see it: PORTABLE_CEILINGS
+    // caps at 1024, which is what an A100 and an M2 report. Clamping here is not
+    // a fallback - the narrower width is one of the two the tuner was already
+    // choosing between.
+    if (candidate > maxWorkgroup) continue;
+    // 🔴 AND A WIDTH THE CHUNK CANNOT DIVIDE IS NOT A CHOICE. `transitionChunk`
+    // falls back to the whole intermediate when its preferred chunk does not
+    // divide it, and the kernel then refuses: "chunk 768 is not a multiple of
+    // the workgroup 512". AlphaFold 3's intermediate is 768 and 512 does not
+    // divide it, where boltz2's 1536 does - so widening the diffusion
+    // conditioning's transition worked for one model and threw for the other.
+    // A caller that names its intermediate gets only widths that fit; one that
+    // does not behaves exactly as before.
+    if (intermediate !== undefined && intermediate % candidate !== 0) continue;
+    if (groups * candidate <= threadTarget * 2) return candidate;
+  }
+  return width;
+}
+
+export function createTransitionShader(shape, offsets, epsilon, variance) {
+  const { rows, channels, factor } = shape;
+  const intermediate = channels * factor;
+  const tile = shape.tile ?? transitionRowTile(rows, channels);
+  const WORKGROUP = shape.width
+    ?? transitionWidth(rows, tile, shape.threadTarget, undefined, undefined,
+                       shape.maxWorkgroup ?? Infinity);
+  // 🔴 A POWER OF TWO OR NOTHING - see transitionWidth. 768 compiles, runs, and
+  // returns relRMS 0.55.
+  if ((WORKGROUP & (WORKGROUP - 1)) !== 0) {
+    throw new Error(`transition workgroup ${WORKGROUP} is not a power of two`);
+  }
+  const chunk = shape.chunk ?? transitionChunk(intermediate, tile, WORKGROUP);
+  if (intermediate % chunk !== 0) {
+    throw new Error(`chunk ${chunk} does not divide intermediate ${intermediate}`);
+  }
+  // The second matmul gives each invocation this many output channels, and one
+  // accumulator per (channel, tile row) has to survive the chunk loop.
+  const channelsPerThread = Math.ceil(channels / WORKGROUP);
+  if (chunk % WORKGROUP !== 0) {
+    throw new Error(`chunk ${chunk} is not a multiple of the workgroup ${WORKGROUP}`);
+  }
+  const slotsPerThread = chunk / WORKGROUP;
+  // 🔴 THE TILE'S ROWS ARE THE VECTOR LANES, AND THAT IS WORTH ABOUT 4x. This
+  // device runs a scalar multiply-add at 1287 GFLOP/s and a vec4 one at 5034 -
+  // measured, by tools/gpu/probe-alu.js, because the paper figure says nothing
+  // about what WGSL reaches here. Both matmuls do the SAME multiply against
+  // every row of the tile, so the tile is exactly the axis to vectorise: four
+  // rows become one vec4 and four multiply-adds become one. It also quarters
+  // the workgroup reads, since the four rows now live in one slot.
+  //
+  // The single track's tile is 1 - there are only 59 rows to give it - so this
+  // generates scalar code there, which is what LANES = 1 means below.
+  // 🔴 WRITING THE RESIDUAL IN PLACE RATHER THAN A DELTA AND AN ADD PASS. The
+  // pair track's five updates each wrote a full pair tensor to scratch and then
+  // read it, read the pair, and wrote the pair back - four passes over 11.5 MB
+  // at 150 tokens where two will do, and `add` measured 113 ms of a 2106 ms
+  // pairformer there. This kernel already reads every row it writes, into
+  // workgroup memory, before it writes any of them, and no other workgroup
+  // touches those rows - so the read-modify-write is safe within one dispatch.
+  const residual = shape.residual ?? false;
+  // 🔴 AND THE ACCUMULATORS ARE A THIRD FORMAT, FOR THE THIRD REASON AGAIN.
+  // `sum` is a WGSL ARRAY of `groups * channelsPerThread` vectors - the shape a
+  // driver spills first - and this is the largest kernel in the trunk. Halving
+  // it is the same change as webgpu/kernels/triangle/shaders.js's two projections, where
+  // it was worth 1.55x and 1.43x. The layer norm's reductions, the swish and
+  // the store stay f32; only the running sum and the weight it multiplies
+  // narrow.
+  const accumulatePrecision = shape.accumulatePrecision ?? "f32";
+  if (!["f32", "f16"].includes(accumulatePrecision)) {
+    throw new RangeError(`unknown transition accumulate precision ${accumulatePrecision}`);
+  }
+  const acc16 = accumulatePrecision === "f16";
+  const lanes = shape.lanes ?? (tile % 4 === 0 ? 4 : 1);
+  if (tile % lanes !== 0) throw new Error(`tile ${tile} is not a multiple of ${lanes} lanes`);
+  const groups = tile / lanes;
+  const vector = lanes === 1 ? "f32" : `vec${lanes}<f32>`;
+  // The running sum's element; see the note on accumulatePrecision above.
+  const sumVector = acc16 ? (lanes === 1 ? "f16" : `vec${lanes}<f16>`) : vector;
+  const sumZero = acc16 ? `${sumVector}(0.0)` : null;
+  const toSum = (e) => (acc16 ? `${sumVector}(${e})` : e);
+  const fromSum = (e) => (acc16 ? `${vector}(${e})` : e);
+  // 🔴 THE TWO STAGED BLOCKS ARE WHAT THIS KERNEL IS SHORT OF, NOT ARITHMETIC.
+  // `normalized` and `gated` are 4 KiB each for the pair track, and both are
+  // read once per output channel by every lane - the same shape as the staged
+  // key and value in webgpu/kernels/attention.js, where narrowing them to f16
+  // bought 1.22x through occupancy. Only the STAGED COPY narrows: the layer
+  // norm's reductions, the accumulators and the store all stay f32.
+  const stagePrecision = shape.stagePrecision ?? "f32";
+  if (!["f32", "f16"].includes(stagePrecision)) {
+    throw new RangeError(`unknown transition stage precision ${stagePrecision}`);
+  }
+  const stage16 = stagePrecision === "f16";
+  // 🔴 AND THE WEIGHT BUFFER IS A STORAGE FORMAT TOO, WHICH IS A MEMORY WIN AND
+  // NOT A SPEED ONE. This kernel reads its weights one scalar at a time and
+  // this machine is instruction-bound, so halving their bytes changes the time
+  // by nothing measurable - but `w.single-transition` is 324 MiB of the 567 an
+  // AF3 TRUNK keeps resident, more than every other tensor in it together,
+  // and that is the number that decides whether a phone folds at all. Every
+  // read is wrapped in f32() at the point of use, so the arithmetic is
+  // unchanged.
+  const weightPrecision = shape.weightPrecision ?? "f32";
+  if (!["f32", "f16"].includes(weightPrecision)) {
+    throw new RangeError(`unknown transition weight precision ${weightPrecision}`);
+  }
+  const weight16 = weightPrecision === "f16";
+  const w = (e) => (weight16 ? `f32(${e})` : e);
+  const stageVector = stage16
+    ? (lanes === 1 ? "f16" : `vec${lanes}<f16>`) : vector;
+  const narrow = (e) => (stage16 ? `${stageVector}(${e})` : e);
+  const widen = (e) => (stage16 ? `${vector}(${e})` : e);
+  const zero = lanes === 1 ? "0.0" : `${vector}(0.0)`;
+  const overLanes = (body) =>
+    Array.from({ length: lanes }, (_, l) => body(l, lanes === 1 ? "" : `.${"xyzw"[l]}`));
+  const overGroups = (body) =>
+    Array.from({ length: groups }, (_, g) => body(g)).join("\n");
+  const overBlocks = (body) =>
+    Array.from({ length: slotsPerThread }, (_, b) => body(b)).join("\n");
+  const overOutSlots = (body) =>
+    Array.from({ length: channelsPerThread }, (_, s) => body(s)).join("\n");
+  return `${stage16 || weight16 || acc16 ? "enable f16;\n" : ""}
+const ROWS: u32 = ${rows}u;
+const CHANNELS: u32 = ${channels}u;
+const INTERMEDIATE: u32 = ${intermediate}u;
+const WORKGROUP: u32 = ${WORKGROUP}u;
+const TILE: u32 = ${tile}u;
+const CHUNK: u32 = ${chunk}u;
+const BLOCK: u32 = ${slotsPerThread}u;
+const GRID_WIDTH: u32 = ${GRID_WIDTH}u;
+const EPSILON: f32 = ${epsilon};
+const W_SCALE: u32 = ${offsets.inputLayerNormScale}u;
+const W_OFFSET: u32 = ${offsets.inputLayerNormOffset}u;
+const W_T1: u32 = ${offsets.transition1}u;
+const W_T2: u32 = ${offsets.transition2}u;
+
+${residual
+  ? `// 🔴 ONE BINDING FOR BOTH, because WebGPU refuses a bind group that lists
+// the same buffer as a read binding and a writable one. In place is what the
+// residual form means here anyway: this kernel reads every row it touches into
+// workgroup memory before it writes any of them.
+@group(0) @binding(0) var<storage, read_write> input: array<f32>;
+@group(0) @binding(1) var<storage, read> weights: array<${weightPrecision}>;`
+  : `@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read> weights: array<${weightPrecision}>;
+@group(0) @binding(2) var<storage, read_write> output: array<f32>;`}
+
+var<workgroup> normalized: array<${stageVector}, ${groups * channels}>;
+var<workgroup> gated: array<${stageVector}, ${groups * chunk}>;
+${(() => {
+  const vecNorm = channels % WORKGROUP === 0 && WORKGROUP <= 128;
+  return `var<workgroup> reduce_a: array<${vector}, ${WORKGROUP}>;
+${variance === "fast" ? `var<workgroup> reduce_b: array<${vector}, ${WORKGROUP}>;\n` : ""}\
+${vecNorm ? "" : `var<workgroup> row_mean: array<f32, ${tile}>;
+var<workgroup> row_inverse_std: array<f32, ${tile}>;`}`;
+})()}
+
+fn swish(value: ${vector}) -> ${vector} { return value / (${vector}(1.0) + exp(-value)); }
+
+@compute @workgroup_size(${WORKGROUP})
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_id) local_id: vec3<u32>) {
+  // 🔴 A TILE OF ROWS, NOT ONE, BECAUSE THE WEIGHTS WERE THE COST. Timestamp
+  // profiling put this kernel at 241 ms of a 632 ms pairformer pass - the
+  // largest single kernel in the trunk - and one workgroup a row means every
+  // workgroup reads the whole weight set: 196k floats for 3481 pair rows, which
+  // is 2.7 GB a block. Tiling divides that by TILE and the arithmetic is
+  // unchanged. The disable-and-remeasure bisect this replaced said 129 ms.
+  let base_row = (group.x + group.y * GRID_WIDTH) * TILE;
+  if (base_row >= ROWS) { return; }
+  let local = local_id.x;
+
+${channels % WORKGROUP === 0 && WORKGROUP <= 128 ? (() => {
+  const overSteps = (body) =>
+    Array.from({ length: channelsPerThread }, (_, s) => body(s)).join("\n    ");
+  return `  ${overSteps((s) => `let c_ln_${s} = local + ${s * WORKGROUP}u;
+  let scale_ln_${s} = ${w(`weights[W_SCALE + c_ln_${s}]`)};
+  let offset_ln_${s} = ${w(`weights[W_OFFSET + c_ln_${s}]`)};`)}
+  ${overGroups((g) => `{
+    ${overLanes((l) => `let row_${g}_${l} = min(base_row + ${g * lanes + l}u, ROWS - 1u);
+    let base_${g}_${l} = row_${g}_${l} * CHANNELS;`).join("\n    ")}
+    ${overSteps((s) => `var in_${s}_${g}: ${vector};
+    ${overLanes((l, at) => `in_${s}_${g}${at} = input[base_${g}_${l} + c_ln_${s}];`).join("\n    ")}`)}
+    var total_${g} = in_0_${g};
+    ${variance === "fast" ? `var sq_total_${g} = in_0_${g} * in_0_${g};` : ""}
+    ${Array.from({ length: channelsPerThread - 1 }, (_, idx) => {
+      const s = idx + 1;
+      return `total_${g} += in_${s}_${g};
+    ${variance === "fast" ? `sq_total_${g} += in_${s}_${g} * in_${s}_${g};` : ""}`;
+    }).join("\n    ")}
+    reduce_a[local] = total_${g};
+    ${variance === "fast" ? `reduce_b[local] = sq_total_${g};` : ""}
+    workgroupBarrier();
+    for (var stride = WORKGROUP / 2u; stride > 0u; stride >>= 1u) {
+      if (local < stride) {
+        reduce_a[local] += reduce_a[local + stride];
+        ${variance === "fast" ? "reduce_b[local] += reduce_b[local + stride];" : ""}
+      }
+      workgroupBarrier();
+    }
+    let mean_${g} = reduce_a[0] / ${vector}(f32(CHANNELS));
+    ${variance === "fast"
+      ? `let variance_${g} = reduce_b[0] / ${vector}(f32(CHANNELS)) - mean_${g} * mean_${g};`
+      : `var centered_total_${g} = ${zero};
+    ${overSteps((s) => `{
+      let d_${s}_${g} = in_${s}_${g} - mean_${g};
+      in_${s}_${g} = d_${s}_${g};
+      centered_total_${g} += d_${s}_${g} * d_${s}_${g};
+    }`)}
+    workgroupBarrier();
+    reduce_a[local] = centered_total_${g};
+    workgroupBarrier();
+    for (var stride = WORKGROUP / 2u; stride > 0u; stride >>= 1u) {
+      if (local < stride) { reduce_a[local] += reduce_a[local + stride]; }
+      workgroupBarrier();
+    }
+    let variance_${g} = reduce_a[0] / ${vector}(f32(CHANNELS));`}
+    let inv_std_${g} = inverseSqrt(variance_${g} + ${vector}(EPSILON));
+    ${overSteps((s) => `{
+      let packed_${s}_${g} = (${variance === "fast" ? `in_${s}_${g} - mean_${g}` : `in_${s}_${g}`}) * inv_std_${g} * scale_ln_${s} + offset_ln_${s};
+      normalized[${g * channels}u + c_ln_${s}] = ${narrow(`packed_${s}_${g}`)};
+    }`)}
+    workgroupBarrier();
+  }`)}`;
+})() : `  // 🔴 THE LAYER NORM IS PER ROW AND STAYS THAT WAY. Its reduction is over
+  // CHANNELS and the tile's rows do not share it, so this loop is sequential -
+  // it is cheap next to the two matmuls, which are what the tile is for. What
+  // it leaves behind is a mean and an inverse deviation per row, so that the
+  // normalised tile can then be written LANES rows at a time.
+  for (var g = 0u; g < ${groups}u; g += 1u) {
+    ${overLanes((l) => `let base_${l} = min(base_row + g * ${lanes}u + ${l}u, ROWS - 1u) * CHANNELS;`).join("\n    ")}
+    var total = ${zero};
+    ${variance === "fast" ? `var sq_total = ${zero};` : ""}
+    for (var c = local; c < CHANNELS; c += WORKGROUP) {
+      var value: ${vector};
+      ${overLanes((l, at) => `value${at} = input[base_${l} + c];`).join("\n      ")}
+      total += value;
+      ${variance === "fast" ? "sq_total += value * value;" : ""}
+    }
+    reduce_a[local] = total;
+    ${variance === "fast" ? "reduce_b[local] = sq_total;" : ""}
+    workgroupBarrier();
+    for (var stride = WORKGROUP / 2u; stride > 0u; stride >>= 1u) {
+      if (local < stride) {
+        reduce_a[local] += reduce_a[local + stride];
+        ${variance === "fast" ? "reduce_b[local] += reduce_b[local + stride];" : ""}
+      }
+      workgroupBarrier();
+    }
+    let mean = reduce_a[0] / ${vector}(f32(CHANNELS));
+    ${variance === "fast"
+      ? `let variance = reduce_b[0] / ${vector}(f32(CHANNELS)) - mean * mean;`
+      : `var centered_total = ${zero};
+    for (var c = local; c < CHANNELS; c += WORKGROUP) {
+      var d: ${vector};
+      ${overLanes((l, at) => `d${at} = input[base_${l} + c] - mean${at};`).join("\n      ")}
+      centered_total += d * d;
+    }
+    workgroupBarrier();
+    reduce_a[local] = centered_total;
+    workgroupBarrier();
+    for (var stride = WORKGROUP / 2u; stride > 0u; stride >>= 1u) {
+      if (local < stride) { reduce_a[local] += reduce_a[local + stride]; }
+      workgroupBarrier();
+    }
+    let variance = reduce_a[0] / ${vector}(f32(CHANNELS));`}
+    if (local == 0u) {
+      ${overLanes((l, at) => `row_mean[g * ${lanes}u + ${l}u] = mean${at};
+      row_inverse_std[g * ${lanes}u + ${l}u] = inverseSqrt(variance${at} + EPSILON);`).join("\n      ")}
+    }
+    workgroupBarrier();
+  }
+
+  // ...LANES rows of one channel per slot, which is the layout both matmuls
+  // read. A row past the end is clamped rather than skipped: it contributes to
+  // no output, and leaving the lane uninitialised would put a NaN in a vector
+  // whose other lanes are real.
+  for (var c = local; c < CHANNELS; c += WORKGROUP) {
+    let scale = ${w("weights[W_SCALE + c]")};
+    let offset = ${w("weights[W_OFFSET + c]")};
+    for (var g = 0u; g < ${groups}u; g += 1u) {
+      var packed: ${vector};
+      ${overLanes((l, at) => `{
+        let row${l} = min(base_row + g * ${lanes}u + ${l}u, ROWS - 1u);
+        packed${at} = (input[row${l} * CHANNELS + c] - row_mean[g * ${lanes}u + ${l}u])
+          * row_inverse_std[g * ${lanes}u + ${l}u] * scale + offset;
+      }`).join("\n      ")}
+      normalized[g * CHANNELS + c] = ${narrow("packed")};
+    }
+  }
+  workgroupBarrier();`}
+
+  // transition1 is (channels, intermediate * 2), so a column is strided by the
+  // full doubled width. Gate half first, value half second.
+  //
+  // 🔴 THE INTERMEDIATE IS WALKED IN CHUNKS SO THAT THE ROW TILE COSTS NOTHING.
+  // gated is the whole of this kernel's workgroup memory - TILE * 512 floats
+  // for the pair track - and holding all of it is what capped the tile at four:
+  // tile 8 fits in the 32 KiB this device grants and measured 1.77x SLOWER,
+  // because 20 KiB a workgroup leaves one resident per core. The contraction
+  // below only ever reads gated in the order it is written, so a chunk can be
+  // produced, consumed into the output accumulators, and overwritten. Shared
+  // memory then depends on CHUNK rather than INTERMEDIATE, and the tile buys
+  // its halved weight traffic without spending occupancy for it.
+  let wide = INTERMEDIATE * 2u;
+${overOutSlots((s) => overGroups((g) => `  var sum_${s}_${g}: ${sumVector} = ${sumZero ?? zero};`))}
+
+  for (var chunk0 = 0u; chunk0 < INTERMEDIATE; chunk0 += CHUNK) {
+    // ...before overwriting the chunk the previous iteration is still reading.
+    workgroupBarrier();
+    // 🔴 EVERY SLOT THIS INVOCATION OWNS IS ACCUMULATED AT ONCE, so the tile's
+    // normalised values are read from workgroup memory once for all of them
+    // rather than once each. The loop used to be slot-outer, channel-inner:
+    // GROUPS shared reads and two weight reads bought 2 * GROUPS multiply-adds.
+    // Blocked, BLOCK * 2 weight reads and the same GROUPS shared reads buy
+    // BLOCK * 2 * GROUPS. CHUNK is what sets BLOCK, which is why the chunk that
+    // wins is not simply the smallest one that fits.
+${overBlocks((b) => overGroups((g) => `    var gate_${b}_${g}: ${vector} = ${zero};
+    var value_${b}_${g}: ${vector} = ${zero};`))}
+    let col_base = chunk0 + local;
+    for (var c = 0u; c < CHANNELS; c += 1u) {
+      let column = c * wide + col_base;
+${overGroups((g) => `      let x_${g} = ${widen(`normalized[${g * channels}u + c]`)};`)}
+${overBlocks((b) => `      let wg_${b} = ${w(`weights[column + ${offsets.transition1 + b * WORKGROUP}u]`)};
+      let wv_${b} = ${w(`weights[column + ${offsets.transition1 + intermediate + b * WORKGROUP}u]`)};
+${overGroups((g) => `      gate_${b}_${g} += x_${g} * wg_${b};
+      value_${b}_${g} += x_${g} * wv_${b};`)}`)}
+    }
+${overBlocks((b) => overGroups((g) => `    gated[${g * chunk + b * WORKGROUP}u + local] = ${narrow(
+      `swish(gate_${b}_${g}) * value_${b}_${g}`)};`))}
+    workgroupBarrier();
+
+    // transition2 is (intermediate, channels).
+    for (var slot = 0u; slot < CHUNK; slot += 1u) {
+      let t2_row = (chunk0 + slot) * CHANNELS + local;
+${overGroups((g) => `      let g_${g} = ${acc16 ? `${sumVector}(gated[${g * chunk}u + slot])` : widen(`gated[${g * chunk}u + slot]`)};`)}
+${overOutSlots((s) => {
+  const needsGuard = s * WORKGROUP >= channels || (s === channelsPerThread - 1 && channels % WORKGROUP !== 0);
+  const body = `      let w_${s} = ${acc16 ? `f16(${w(`weights[t2_row + ${offsets.transition2 + s * WORKGROUP}u]`)})` : w(`weights[t2_row + ${offsets.transition2 + s * WORKGROUP}u]`)};
+${overGroups((g) => `      sum_${s}_${g} += g_${g} * w_${s};`)}`;
+  return needsGuard ? `      if (local + ${s * WORKGROUP}u < CHANNELS) {\n  ${body}\n      }` : body;
+})}
+    }
+  }
+
+${overOutSlots((s) => {
+  const needsGuard = s * WORKGROUP >= channels || (s === channelsPerThread - 1 && channels % WORKGROUP !== 0);
+  const body = `  {
+    let c = local + ${s * WORKGROUP}u;
+${overGroups((g) => `    {
+      let packed = ${fromSum(`sum_${s}_${g}`)};
+      ${overLanes((l, at) => `{
+        let row${l} = base_row + ${g * lanes + l}u;
+        if (row${l} < ROWS) {
+          ${residual ? "input" : "output"}[row${l} * CHANNELS + c] ${residual ? "+=" : "="} packed${at};
+        }
+      }`).join("\n      ")}
+    }`)}
+  }`;
+  return needsGuard ? `  if (local + ${s * WORKGROUP}u < CHANNELS) {\n${body}\n  }` : body;
+})}
+}`;
+}
+
+export class Af3TransitionGpu {
+  constructor(device) {
+    this.device = device;
+    this.allocator = new GpuBufferAllocator(device);
+    this.pipelines = pipelineCacheForDevice(device);
+  }
+
+  /**
+   * @param {Float32Array} input rows * channels
+   * @param {{rows: number, channels: number, factor?: number}} shape
+   * @param {object} weights inputLayerNormScale/Offset, transition1, transition2
+   * @param {{epsilon?: number, variance?: "fast"|"two-pass"}} options
+   */
+  async run(input, shape, weights, options = {}) {
+    const { rows, channels } = shape;
+    const factor = shape.factor ?? 4;
+    const epsilon = options.epsilon ?? 1e-5;
+    const variance = options.variance ?? "fast";
+    if (input.length !== rows * channels) {
+      throw new Error(`input has ${input.length} elements; expected ${rows * channels}`);
+    }
+    const intermediate = channels * factor;
+    if (weights.transition1.length !== channels * intermediate * 2) {
+      throw new Error(`transition1 has ${weights.transition1.length} elements; expected `
+        + `${channels * intermediate * 2} - is the widening factor ${factor}?`);
+    }
+    if (weights.transition2.length !== intermediate * channels) {
+      throw new Error(`transition2 has ${weights.transition2.length} elements; expected `
+        + `${intermediate * channels}`);
+    }
+
+    const packed = packTransitionWeights(weights);
+    const source = createTransitionShader({ rows, channels, factor }, packed.offsets,
+                                          epsilon, variance);
+    const pipeline = await this.pipelines.get(
+      `af3-transition:${rows}:${channels}:${factor}:${epsilon}:${variance}`, source);
+
+    const storage = GPUBufferUsage.STORAGE;
+    const allocations = [];
+    const keep = (allocation) => { allocations.push(allocation); return allocation; };
+    try {
+      const inputBuffer = keep(this.allocator.upload("af3-transition.input", input, storage));
+      const weightBuffer = keep(this.allocator.upload("af3-transition.weights", packed.data, storage));
+      const outputBuffer = keep(this.allocator.allocate(
+        "af3-transition.output", rows * channels * 4, storage | GPUBufferUsage.COPY_SRC));
+      const readback = keep(this.allocator.allocate(
+        "af3-transition.readback", rows * channels * 4,
+        GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
+
+      this.device.pushErrorScope("validation");
+      const encoder = this.device.createCommandEncoder({ label: "af3-transition" });
+      const pass = encoder.beginComputePass({ label: "af3-transition" });
+      pass.setPipeline(pipeline);
+      pass.setBindGroup(0, this.device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [inputBuffer, weightBuffer, outputBuffer].map((allocation, binding) => ({
+          binding, resource: { buffer: allocation.buffer },
+        })),
+      }));
+      // ...one workgroup a TILE of rows; see TRANSITION_ROW_TILE.
+      const groups = Math.ceil(rows / transitionRowTile(rows));
+      pass.dispatchWorkgroups(Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH));
+      pass.end();
+      encoder.copyBufferToBuffer(outputBuffer.buffer, 0, readback.buffer, 0, rows * channels * 4);
+
+      const start = performance.now();
+      this.device.queue.submit([encoder.finish()]);
+      const error = await this.device.popErrorScope();
+      if (error !== null) throw new Error(`WebGPU validation failed: ${error.message}`);
+      await readback.buffer.mapAsync(GPUMapMode.READ);
+      const result = new Float32Array(readback.buffer.getMappedRange().slice(0));
+      readback.buffer.unmap();
+      return {
+        output: result,
+        elapsedMilliseconds: performance.now() - start,
+        memory: this.allocator.snapshot(),
+      };
+    } finally {
+      for (let index = allocations.length - 1; index >= 0; index -= 1) allocations[index].release();
+    }
+  }
+}
+
+/**
+ * The same transition, as three passes instead of one.
+ *
+ * 🔴 THE FUSION STOPS PAYING AT 256 CHANNELS, WHICH IS MEASURED AND NOT
+ * ASSUMED. docs/A100.md item 9 declined splitting AF3's transitions because the
+ * fused kernel keeps the widened activation out of global memory, and at AF3's
+ * 128 channels that is right: split into two plain GEMMs it is a WASH (1.134 ms
+ * against 1.138 at 40,000 rows) and the split pays two intermediates for
+ * nothing. At ESMFold2's 256 the same comparison is 7.82 ms against 16.07 - the
+ * fused kernel loses by 2.05x before any matrix units are involved.
+ *
+ * The mechanism is the thing the fusion is for. What it holds in workgroup
+ * memory is the WIDENED row, `2 * channels * factor` floats: 4 KB at 128
+ * channels with a row tile of 16, 8 KB at 256 with the tile collapsed to 4 -
+ * and the tile is the whole of its weight-read amortisation. Per row it is
+ * 28.5 ns for AF3 and 178.6 for ESMFold2 at exactly four times the work, which
+ * is 1.57x worse per multiply-add. The fusion's cost scales with the channel
+ * count and its benefit does not.
+ *
+ * 🔴 AND THE SWISH GATE IS NOT A PASS. Fusing it into the FIRST projection's
+ * epilogue is impossible at any block width - it pairs column `i` with column
+ * `i + hidden`, `hidden` columns apart, which is a different workgroup - and as
+ * its own elementwise pass it costs a rows x hidden tensor and 553 MB of
+ * traffic at 300 tokens. `createStagedMatrixShader`'s `sourceGate` applies it
+ * where the SECOND projection stages its operand, which is one extra vec4 read
+ * in a loop that already runs. So it is three passes: normalise, widen,
+ * contract-with-the-gate.
+ *
+ * @param {{rows, channels, factor}} shape
+ * @param {object} offsets from packTransitionWeights
+ * @param {{normalizedStorage?, wideStorage?, geometry?, weightPrecision?, matrix?}} [options]
+ */
+/**
+ * A register-tiled VECTOR GEMM for the split transition's two projections, for
+ * a device with no subgroup matrices - which is every visitor's browser.
+ *
+ * 🔴 WITHOUT MATRIX UNITS THE SPLIT DID NOT EXIST AT ALL, and the fused kernel
+ * it replaces is the WIDTH-HOSTILE one: it holds the widened row in workgroup
+ * memory, so its row tile halves as the channels double. Measured on an A100
+ * under stock flags, OpenDDE's 384-channel pair transition was 291 ms of a
+ * 558 ms trunk pass at 68 tokens - ~3 TFLOPS on a kernel AF3's 128 channels
+ * runs at ~15 - because `splitTransitionConfig` answered "no matrix units, no
+ * split". The split's three-pass shape does not need matrix units; only its
+ * GEMM did.
+ *
+ * Same bindings and uniform as `createStagedMatrixShader`'s transition use -
+ * `[source, weights, MatmulParameters, output]`, dispatched `(columns / BN,
+ * rows / BM)` - so the encoder in pair-track.js is shared. A workgroup owns
+ * a 64 x 64 block on 256 lanes (WebGPU's guaranteed maximum), 4 x 4 each; 8.4
+ * KiB of workgroup memory, under the 16 KiB floor. f32 accumulation in k order.
+ * `sourceGate` applies the SwiGLU as the operand is staged, exactly where the
+ * matrix path applies it, so the hidden activation never exists.
+ *
+ * 🔴 A LANE OWNS FOUR ADJACENT COLUMNS, AND THE SOURCE PANEL IS PADDED - worth
+ * 1.17-1.29x on both passes, bit-identical. The first version strided a lane's
+ * columns by 16, so every operand read was a scalar, and staged the source
+ * panel k-major at a stride of 64 words: the sixteen lanes writing one row's
+ * sixteen k landed in ONE bank. Adjacent columns make the weight panel a vec4
+ * read; a stride of 68 spreads the store. Measured on an A100 under stock flags
+ * at 65,025 rows (ms, wide / down): 384 channels 12.4 / 7.6 -> 10.5 / 6.0, 512
+ * 13.2 / 8.4 -> 11.4 / 6.5, 256 at 40,000 rows 3.6 / 2.5 -> 3.0 / 1.9. Without
+ * the padding the gain is gone (12.7 / 7.1). Tried and slower: 64 x 128 and 128
+ * x 64 (4 x 8 a lane), 128 x 128 (8 x 8), the source panel as vec4. A 32-deep
+ * step is 2-5% faster and 16.9 KiB, over the floor.
+ */
+export const VECTOR_GEMM_BLOCK = Object.freeze({ rows: 64, columns: 64, inner: 16 });
+/**
+ * VECTOR_GEMM_F16: the panels staged in f16 and each k step's BK products summed in f16 (`fma` on vec4<f16>), the
+ * step's sums then added into f32 accumulators - so no f16 partial sum runs past BK products. check-transition-split.js
+ * `--vector=1 --arithmetic=f16`: relRMS 1.22e-3 against 4.38e-4 for the f32 arithmetic over the same f16 scratch. The
+ * block, per arithmetic, is the device's: see webgpu/kernels/vector-gemm-block.js.
+ */
+/**
+ * Where the VECTOR split starts to pay, which is not where the matrix one does.
+ * Measured on an A100 under stock flags, pair-transition GPU ms per trunk pass,
+ * fused against vector split:
+ *
+ *     channels  model          68 tokens        255 tokens
+ *          128  AlphaFold 3        -           91.3 -> 148.9  (loses)
+ *          256  protenix2      56.7 -> 46.8     597 -> 519
+ *          384  OpenDDE         291 -> 98            -
+ *          512  IntelliFold-2   639 -> 160     8395 -> 1601
+ *
+ * The matrix split's 128-channel threshold comes from the ampere prior and was
+ * measured on matrix units; without them the fused kernel still wins at 128.
+ */
+export const VECTOR_SPLIT_MIN_CHANNELS = 192;
+/**
+ * ...and where the f16 arithmetic does (VECTOR_GEMM_F16), which is lower: measured on an M5 under stock flags
+ * (bench-transition.js, 128 channels at 255 tokens, the whole transition) the fused kernel is 15.12 ms, the vector
+ * split in f32 at the Apple block 14.84, and in f16 10.60 at 64 x 128 x 32 - 1.43x at AF3's width.
+ */
+export const VECTOR_F16_SPLIT_MIN_CHANNELS = 128;
+/**
+ * The vector split's arithmetic an AF3-lineage pair track asks for: f16 at every width. At AF3's 128 channels it is
+ * what makes the split pay at all (VECTOR_F16_SPLIT_MIN_CHANNELS, checked against the fold); at 256 it is 1.66x on the
+ * GEMM (ESMFold2's, the same kernel). Approximations are acceptable here (the user's call, 2026-10-12) and only AF3's
+ * bundle was folded both ways. `vectorTransitionArithmetic` overrides it - the control arm.
+ */
+export const pairTransitionArithmetic = () => "f16";
+
+/**
+ * The workgroup storage the split's NORMALIZE kernel stages: `rows` whole rows
+ * of f32, plus its reduction scratch.
+ *
+ * 🔴 THE CHOOSER PRICED THE GEMM AND NOT THIS, AND AT 512 CHANNELS THIS IS THE
+ * ONE OVER THE FLOOR. Eight rows of IntelliFold-2's 512 channels is 16384 bytes
+ * before the scratch - 16736 in all, against the 16384 WebGPU guarantees - so a
+ * conforming minimum device refused the pipeline, matrix units or not. Fewer
+ * rows fit; eight stays wherever it already did, so those kernels are unchanged.
+ */
+export function splitNormalizeBytes(channels, rows = 8) {
+  return (rows * channels + 64 * 2 + 2 * rows) * 4;
+}
+function splitNormalizeRows(device, channels) {
+  const limit = device.limits.maxComputeWorkgroupStorageSize;
+  return [8, 4, 2].find((rows) => splitNormalizeBytes(channels, rows) <= limit);
+}
+function createVectorGemmShader({ sourcePrecision, weightPrecision, outputPrecision,
+                                  residual = false, sourceGate = null,
+                                  block = VECTOR_GEMM_BLOCK, arithmetic = "f32",
+                                  innerCols = null, outCols = null, weightOffset = null }) {
+  const { rows: BM, columns: BN, inner: BK } = block;
+  // 🔴 NO GUARD ON k OR ON THE COLUMNS, ONLY ON THE ROWS. The inner extent must
+  // divide by BK and the columns by BN; `createTransitionSplitShaders` refuses a
+  // width that does not (`channels % 64`), and the transition's two extents are
+  // `channels` and `channels * factor`. A new caller must make the same check.
+  // A 16 x 16 lane grid; each lane owns TM adjacent rows and TN adjacent columns.
+  const TM = BM / 16;
+  const MV = TM / 4;
+  const TN = BN / 16;
+  // The source panel's stride: four words past the block, see above.
+  const AS = BM + 4;
+  const AV = AS / 4;
+  // 🔴 f16 ARITHMETIC: the panels staged in f16 and a k step's products summed
+  // in f16, each step's sums then added into f32 accumulators - so no partial
+  // sum in f16 runs past BK products. See VECTOR_GEMM_F16.
+  const f16 = arithmetic === "f16";
+  const T = f16 ? "f16" : "f32";
+  const half = f16 || [sourcePrecision, weightPrecision, outputPrecision].includes("f16");
+  const innerExpr = innerCols !== null ? `${innerCols}u` : "parameters.inner";
+  const colsExpr = outCols !== null ? `${outCols}u` : "parameters.columns";
+  const cols4Expr = outCols !== null ? `${outCols / 4}u` : "(parameters.columns >> 2u)";
+  const wOff4Expr = weightOffset !== null ? `${weightOffset / 4}u` : "(parameters.weight_offset >> 2u)";
+  const accumulators = [];
+  const inner = [];
+  const stores = [];
+  const flush = [];
+  for (let i = 0; i < TM; i += 1) {
+    const rowStores = [];
+    for (let j = 0; j < TN / 4; j += 1) {
+      accumulators.push(`  var acc_${i}_${j} = vec4<f32>(0.0);`);
+      if (f16) {
+        flush.push(`    acc_${i}_${j} += vec4<f32>(part_${i}_${j});`);
+      }
+      const value = outputPrecision === "f32" ? `acc_${i}_${j}` : `vec4<${outputPrecision}>(acc_${i}_${j})`;
+      rowStores.push(`      output[row_base4_${i} + ${j}u] ${residual ? `+= ${value};` : `= ${value};`}`);
+    }
+    stores.push(`  {
+    let row_${i} = row_origin + ty * ${TM}u + ${i}u;
+    if (row_${i} < parameters.rows) {
+      let row_base4_${i} = row_${i} * ${cols4Expr} + (column_origin >> 2u) + tx * ${TN / 4}u;
+${rowStores.join("\n")}
+    }
+  }`);
+  }
+  for (let k = 0; k < BK; k += 1) {
+    for (let v = 0; v < MV; v += 1) {
+      inner.push(`    let a_${k}_${v} = a_tile[${k * AV}u + ty * ${MV}u + ${v}u];`);
+    }
+    for (let j = 0; j < TN / 4; j += 1) {
+      inner.push(`    let b_${k}_${j} = b_tile[${k * (BN / 4)}u + tx * ${TN / 4}u + ${j}u];`);
+    }
+    for (let i = 0; i < TM; i += 1) {
+      const ai = `a_${k}_${Math.floor(i / 4)}.${"xyzw"[i % 4]}`;
+      for (let j = 0; j < TN / 4; j += 1) {
+        if (f16) {
+          inner.push(k === 0
+            ? `    var part_${i}_${j} = vec4<f16>(${ai}) * b_0_${j};`
+            : `    part_${i}_${j} = fma(vec4<f16>(${ai}), b_${k}_${j}, part_${i}_${j});`);
+        } else {
+          inner.push(`    acc_${i}_${j} += ${ai} * b_${k}_${j};`);
+        }
+      }
+    }
+  }
+  const aSteps = ((BM / 4) * BK) / 256;
+  const bSteps = ((BN / 4) * BK) / 256;
+  const aStrideExpr = sourceGate === null ? innerExpr : `${sourceGate.stride}u`;
+  const loadAt = (idxExpr) => sourceGate === null
+    ? (sourcePrecision === T ? `source[${idxExpr}]` : `${T}(source[${idxExpr}])`)
+    : `${T}(gated(${idxExpr}))`;
+  const aPre = Array.from({ length: aSteps }, (_, s) => {
+    const eExpr = s === 0 ? "li" : `(li + ${s * 256}u)`;
+    return `  let a_mg_${s} = ${eExpr} / BK;
+  let a_k_${s} = ${eExpr} % BK;
+  let a_r0_${s} = row_origin + a_mg_${s} * 4u;
+  let a_full_${s} = a_r0_${s} + 3u < parameters.rows;
+  let a_base_${s} = a_r0_${s} * ${aStrideExpr} + a_k_${s};
+  let a_idx_${s} = a_k_${s} * ${AV}u + a_mg_${s};`;
+  }).join("\n");
+  const bPre = Array.from({ length: bSteps }, (_, s) => {
+    const eExpr = s === 0 ? "li" : `(li + ${s * 256}u)`;
+    return `  let b_k_${s} = ${eExpr} / ${BN / 4}u;
+  let b_col4_${s} = ${wOff4Expr} + (column_origin >> 2u) + (${eExpr} % ${BN / 4}u) + b_k_${s} * ${cols4Expr};`;
+  }).join("\n");
+  const aStage = Array.from({ length: aSteps }, (_, s) => `    {
+      let base0 = a_base_${s} + k0;
+      var value = vec4<${T}>(0.0);
+      if (a_full_${s}) {
+        value = vec4<${T}>(${loadAt("base0")}, ${loadAt(`base0 + ${aStrideExpr}`)}, ${loadAt(`base0 + 2u * ${aStrideExpr}`)}, ${loadAt(`base0 + 3u * ${aStrideExpr}`)});
+      } else {
+        let r0 = a_r0_${s};
+        if (r0 < parameters.rows) { value.x = ${loadAt("base0")}; }
+        if (r0 + 1u < parameters.rows) { value.y = ${loadAt(`base0 + ${aStrideExpr}`)}; }
+        if (r0 + 2u < parameters.rows) { value.z = ${loadAt(`base0 + 2u * ${aStrideExpr}`)}; }
+      }
+      a_tile[a_idx_${s}] = value;
+    }`).join("\n");
+  const bStage = Array.from({ length: bSteps }, (_, s) => {
+    const eExpr = s === 0 ? "li" : `(li + ${s * 256}u)`;
+    const wVec = `weights[b_col4_${s} + k0 * ${cols4Expr}]`;
+    return `    {
+      b_tile[${eExpr}] = ${weightPrecision === T ? wVec : `vec4<${T}>(${wVec})`};
+    }`;
+  }).join("\n");
+  return `${half ? "enable f16;\n" : ""}struct MatmulParameters {
+  rows: u32, inner: u32, columns: u32, weight_offset: u32,
+  bias_offset: u32, activation: u32, padding: vec2<u32>,
+};
+@group(0) @binding(0) var<storage, read> source: array<${sourcePrecision}>;
+@group(0) @binding(1) var<storage, read> weights: array<vec4<${weightPrecision}>>;
+@group(0) @binding(2) var<uniform> parameters: MatmulParameters;
+@group(0) @binding(3) var<storage, read_write> output: array<vec4<${outputPrecision}>>;
+const BM: u32 = ${BM}u;
+const BN: u32 = ${BN}u;
+const BK: u32 = ${BK}u;
+var<workgroup> a_tile: array<vec4<${T}>, ${AV * BK}>;
+var<workgroup> b_tile: array<vec4<${T}>, ${BK * BN / 4}>;
+${sourceGate === null ? "" : `fn swish(value: f32) -> f32 { return value / (1.0 + exp(-value)); }
+fn gated(at: u32) -> f32 {
+  return swish(f32(source[at])) * f32(source[at + ${sourceGate.offset}u]);
+}`}
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_index) li: u32) {
+  let row_origin = group.y * BM;
+  let column_origin = group.x * BN;
+  let tx = li % 16u;
+  let ty = li / 16u;
+${accumulators.join("\n")}
+${aPre}
+${bPre}
+  for (var k0 = 0u; k0 < ${innerExpr}; k0 += BK) {
+${aStage}
+${bStage}
+    workgroupBarrier();
+${inner.join("\n")}
+${flush.join("\n")}
+    workgroupBarrier();
+  }
+${stores.join("\n")}
+}`;
+}
+
+export function createTransitionSplitShaders(shape, offsets, epsilon, variance, options = {}) {
+  const { rows, channels, factor } = shape;
+  const intermediate = channels * factor;
+  const wide = intermediate * 2;
+  const matrix = options.matrix ?? {};
+  // 🔴 THE VECTOR SPLIT STORES ITS TWO SCRATCH TENSORS IN WHAT THE DEVICE HAS.
+  // The matrix path always has f16, because matrix units imply it; a device
+  // without them may lack `shader-f16` too, and then both are f32.
+  const vector = matrix.vector === true;
+  const normalizedStorage = options.normalizedStorage ?? (vector ? matrix.storage : "f16");
+  const wideStorage = options.wideStorage ?? (vector ? matrix.storage : "f16");
+  const weightPrecision = options.weightPrecision ?? "f32";
+  // 🔴 THE VEC4 STAGING NEEDS EVERY EXTENT IT FORMS AN OFFSET FROM DIVISIBLE BY
+  // FOUR, AND THAT INCLUDES THE GATE'S. A vec4 read at element i returns
+  // i & ~3 upward, so an odd stride shifts the value half against the gate.
+  const vectorStaging = [channels, intermediate, wide].every((v) => v % 4 === 0);
+
+  // 🔴 THE NORMALISE IS ITS OWN PASS BECAUSE A LAYER NORM IS A ROW REDUCTION
+  // AND THE GEMM STAGES A K-SLICE. There is no hook in a staged matmul that can
+  // see a whole row, so this is the one part of the fused kernel that has to
+  // come out whole. It is cheap: `tri.normalize` is 1.5% of an ESMFold2 trunk
+  // at the same shape and this is the same kernel.
+  // 🔴 ROWS A WORKGROUP STAGES: eight unless the chooser priced that over the
+  // device's workgroup storage - see splitNormalizeBytes.
+  const NORMALIZE_ROWS = matrix.normalizeRows ?? 8;
+  const LANES = 64;
+  const LANES_PER_ROW = LANES / NORMALIZE_ROWS;
+  const w = (expression) => (weightPrecision === "f16" ? `f32(${expression})` : expression);
+  const fastVariance = variance === "fast";
+
+  const normalize = `${normalizedStorage === "f16" || weightPrecision === "f16" ? "enable f16;\n" : ""}
+// 🔴 THE ROW COUNT IS A UNIFORM, NOT A CONSTANT, BECAUSE THE ROWS ARE CHUNKED.
+// The widened activation is 369 MiB at 300 ESMFold2 tokens, so a caller walks
+// the rows in chunks and the last one is ragged - see
+// transitionSplitChunkRows. Baking the count would need a second shader for
+// the tail, and the two would then be a pair that can drift.
+struct NormalizeParameters { rows: u32, channels: u32, padding: vec2<u32> };
+const CHANNELS: u32 = ${channels}u;
+const NORMALIZE_ROWS: u32 = ${NORMALIZE_ROWS}u;
+const LANES_PER_ROW: u32 = ${LANES_PER_ROW}u;
+const GRID_WIDTH: u32 = ${GRID_WIDTH}u;
+const EPSILON: f32 = ${epsilon};
+const W_SCALE: u32 = ${offsets.inputLayerNormScale}u;
+const W_OFFSET: u32 = ${offsets.inputLayerNormOffset}u;
+
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read> weights: array<${weightPrecision}>;
+@group(0) @binding(2) var<storage, read_write> normalized: array<${normalizedStorage}>;
+@group(0) @binding(3) var<uniform> p: NormalizeParameters;
+
+// 🔴 A ROW A THREAD IS THE WRONG SHAPE FOR A LAYER NORM - a thread walking its
+// own row reads CHANNELS * 4 bytes from its neighbours and pulls a cache line
+// to use four bytes of it. Staged, both the load and the writeback are
+// consecutive-lane-consecutive-address. Same finding as grid.normalize and
+// webgpu/kernels/triangle/shaders.js's input normalisation.
+var<workgroup> tile: array<f32, ${NORMALIZE_ROWS * channels}>;
+var<workgroup> partial_sum: array<f32, ${LANES}>;
+${fastVariance ? `var<workgroup> partial_squares: array<f32, ${LANES}>;\n` : ""}\
+var<workgroup> row_mean: array<f32, ${NORMALIZE_ROWS}>;
+var<workgroup> row_inverse_std: array<f32, ${NORMALIZE_ROWS}>;
+
+@compute @workgroup_size(${LANES})
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_id) local_id: vec3<u32>) {
+  // 🔴 THE FOLDED GRID'S y TERM. Past 32768 workgroups the caller folds into y,
+  // and a kernel that reads only .x recomputes the first row block once per y
+  // row and never writes its own - silently. See CLAUDE.md.
+  let base_row = (group.x + group.y * GRID_WIDTH) * NORMALIZE_ROWS;
+  if (base_row >= p.rows) { return; }
+  let local = local_id.x;
+
+  // The tail is zeroed rather than skipped: the reduction runs over the whole
+  // staged block.
+  let full_tile = base_row + NORMALIZE_ROWS <= p.rows;
+  let base_idx = base_row * CHANNELS;
+  if (full_tile) {
+    for (var index = local; index < NORMALIZE_ROWS * CHANNELS; index += ${LANES}u) {
+      tile[index] = input[base_idx + index];
+    }
+  } else {
+    for (var index = local; index < NORMALIZE_ROWS * CHANNELS; index += ${LANES}u) {
+      let row = base_row + index / CHANNELS;
+      tile[index] = select(0.0, input[base_idx + index], row < p.rows);
+    }
+  }
+  workgroupBarrier();
+
+  let slot = local / LANES_PER_ROW;
+  let lane = local % LANES_PER_ROW;
+  var total = 0.0;
+  ${fastVariance ? "var squares = 0.0;" : ""}
+  for (var c = lane; c < CHANNELS; c += LANES_PER_ROW) {
+    let value = tile[slot * CHANNELS + c];
+    total += value;
+    ${fastVariance ? "squares += value * value;" : ""}
+  }
+  partial_sum[local] = total;
+  ${fastVariance ? "partial_squares[local] = squares;" : ""}
+  workgroupBarrier();
+  if (lane == 0u) {
+    var row_total = 0.0;
+    ${fastVariance ? "var row_squares = 0.0;" : ""}
+    for (var l = 0u; l < LANES_PER_ROW; l += 1u) {
+      row_total += partial_sum[slot * LANES_PER_ROW + l];
+      ${fastVariance ? "row_squares += partial_squares[slot * LANES_PER_ROW + l];" : ""}
+    }
+    let mean = row_total / f32(CHANNELS);
+    ${fastVariance
+      ? "let variance = row_squares / f32(CHANNELS) - mean * mean;"
+      : `var variance = 0.0;
+    for (var c = 0u; c < CHANNELS; c += 1u) {
+      let d = tile[slot * CHANNELS + c] - mean;
+      variance += d * d;
+    }
+    variance /= f32(CHANNELS);`}
+    row_mean[slot] = mean;
+    row_inverse_std[slot] = inverseSqrt(variance + EPSILON);
+  }
+  workgroupBarrier();
+
+  // 🔴 A LANE OWNS A PAIR OF CHANNELS, WHICH IS THE WHOLE 32-BIT WORD THEY
+  // SHARE. Writing one f16 at a time makes two lanes write the two halves of
+  // one word, and the hardware turns that into a read-modify-write it does not
+  // charge for anywhere legible. The triangle's own layer norm beside this has
+  // always paired them and says so; this did not, and measured 408 GB/s against
+  // its 815 on the same shape.
+  const PAIR_COUNT: u32 = CHANNELS / 2u;
+${channels % 128 === 0 ? `  for (var col_word = local; col_word < PAIR_COUNT; col_word += ${LANES}u) {
+    let c = col_word * 2u;
+    let w_scale_0 = ${w("weights[W_SCALE + c]")};
+    let w_scale_1 = ${w("weights[W_SCALE + c + 1u]")};
+    let w_offset_0 = ${w("weights[W_OFFSET + c]")};
+    let w_offset_1 = ${w("weights[W_OFFSET + c + 1u]")};
+    for (var slot_of = 0u; slot_of < NORMALIZE_ROWS; slot_of += 1u) {
+      let row = base_row + slot_of;
+      if (!full_tile && row >= p.rows) { break; }
+      let index = slot_of * CHANNELS + c;
+      let centre = row_mean[slot_of];
+      let inverse = row_inverse_std[slot_of];
+      let low = (tile[index] - centre) * inverse * w_scale_0 + w_offset_0;
+      let high = (tile[index + 1u] - centre) * inverse * w_scale_1 + w_offset_1;
+      normalized[base_idx + index] = ${normalizedStorage}(low);
+      normalized[base_idx + index + 1u] = ${normalizedStorage}(high);
+    }
+  }` : `  for (var word = local; word < NORMALIZE_ROWS * PAIR_COUNT; word += ${LANES}u) {
+    let slot_of = word / PAIR_COUNT;
+    let row = base_row + slot_of;
+    if (!full_tile && row >= p.rows) { continue; }
+    let c = (word % PAIR_COUNT) * 2u;
+    let index = slot_of * CHANNELS + c;
+    let centre = row_mean[slot_of];
+    let inverse = row_inverse_std[slot_of];
+    let low = (tile[index] - centre) * inverse
+      * ${w("weights[W_SCALE + c]")} + ${w("weights[W_OFFSET + c]")};
+    let high = (tile[index + 1u] - centre) * inverse
+      * ${w("weights[W_SCALE + c + 1u]")} + ${w("weights[W_OFFSET + c + 1u]")};
+    normalized[base_idx + index] = ${normalizedStorage}(low);
+    normalized[base_idx + index + 1u] = ${normalizedStorage}(high);
+  }`}
+}`;
+
+  if (vector) {
+    const block = matrix.block ?? VECTOR_GEMM_BLOCK;
+    const arithmetic = matrix.arithmetic ?? "f32";
+    if (channels % block.columns !== 0 || channels % block.inner !== 0) {
+      throw new RangeError(`the vector split transition wants channels divisible by `
+        + `${block.columns}; got ${channels}`);
+    }
+    return {
+      normalize,
+      wide: createVectorGemmShader({ sourcePrecision: normalizedStorage, weightPrecision,
+                                     outputPrecision: wideStorage, block, arithmetic,
+                                     innerCols: channels, outCols: wide, weightOffset: offsets.transition1 }),
+      down: createVectorGemmShader({ sourcePrecision: wideStorage, weightPrecision,
+                                     outputPrecision: "f32", residual: true,
+                                     sourceGate: { stride: wide, offset: intermediate },
+                                     block, arithmetic,
+                                     innerCols: intermediate, outCols: channels, weightOffset: offsets.transition2 }),
+      shape: { rows, channels, intermediate, wide },
+      geometry: null,
+      storage: normalizedStorage,
+      tiles: { normalizeRows: NORMALIZE_ROWS, blockRows: block.rows,
+               blockColumns: block.columns },
+    };
+  }
+  const geometry = { ...SPLIT_TRANSITION_GEOMETRY, ...matrix };
+  // The right operand is read out of the weight buffer without staging where
+  // the geometry asks and the shape allows - see directWeightsAllowed. The two
+  // passes contract DIFFERENT extents, so they answer separately.
+  const staged = (inner, extra) => createStagedMatrixShader({
+    ...geometry, vectorStaging, bias: false, weightPrecision,
+    directWeights: directWeightsAllowed(geometry, { inner, weightPrecision }),
+    ...extra,
+  });
+
+  return {
+    normalize,
+    // normalized (rows x channels) x transition1 (channels x wide) -> wide.
+    wide: staged(channels, {
+      sourcePrecision: normalizedStorage, outputPrecision: wideStorage,
+    }),
+    // ...and the gate is applied HERE, where the operand is staged, so the
+    // hidden activation never exists as a tensor at all.
+    down: staged(intermediate, {
+      sourcePrecision: wideStorage, outputPrecision: "f32", residual: true,
+      sourceGate: { stride: wide, offset: intermediate },
+    }),
+    shape: { rows, channels, intermediate, wide },
+    geometry,
+    storage: normalizedStorage,
+    tiles: { normalizeRows: NORMALIZE_ROWS, blockRows: geometry.blockRows,
+             blockColumns: geometry.blockColumns },
+  };
+}
+
+/**
+ * The channel width at which splitting the transition starts to pay.
+ *
+ * 🔴 IT IS A WIDTH RULE BECAUSE THE MEASUREMENT IS MONOTONE IN THE WIDTH, and
+ * the reason is mechanical: the fused kernel holds the WIDENED row in workgroup
+ * memory, so its row tile - all of its weight-read amortisation - halves each
+ * time the channels double. Against the fused kernel's own best tile at 200
+ * tokens (tools/gpu/bench-transition.js --channels=N --arms=4,8:128,16:128,split):
+ *
+ *     channels    fused    split   speedup   who runs it
+ *          128    1.100    0.969      1.13   AlphaFold 3
+ *          256    7.156    2.588      2.77   ESMFold2
+ *          384   19.606    5.288      3.71   OpenDDE
+ *
+ * 🔴 AND THE SPLIT IS NOT FREE: it brings back the widened activation the
+ * fusion exists to avoid, chunked, which is 72 MiB of device memory at the
+ * default chunk. At 256 channels that buys 1.51x on an ESMFold2 trunk; at AF3's
+ * 128 it buys 1.19x on the kernel and **1.8% of the trunk** (390.7 -> 383.9 ms
+ * of GPU at 400 tokens), which is not worth 72 MiB on a device that has a
+ * budget. So the default declines it at 128 and takes it from 192 up, and
+ * `bench-transition.js`'s `split` arm reaches the kernel either way.
+ */
+export const TRANSITION_SPLIT_MIN_CHANNELS = 192;
+
+/**
+ * How many rows one pass of the split transition may cover at once.
+ *
+ * 🔴 THE WIDENED ACTIVATION IS THE WHOLE REASON THE FUSED KERNEL EXISTS, and
+ * the split brings it back: `rows * 2 * channels * factor`, which at ESMFold2's
+ * 300 tokens is 369 MiB in f16 and at 600 is 1.47 GiB. Chunking the rows is
+ * what keeps the split from trading a 2.9x for an allocation nothing can hold -
+ * the same trade `transitionChunkRows` makes for AF2, and for the same reason.
+ *
+ * 🔴 AND THE CHUNK IS A SPEED KNOB AS WELL AS A MEMORY ONE, which the first
+ * version of this did not say. A chunk is dispatched on its own, so a chunk
+ * that does not fill the device leaves it idle - 16,384 rows is 2,048
+ * workgroups of the normalise, 59% of what this card holds, six times a block.
+ * Measured on an ESMFold2 trunk at 300 tokens, GPU time of the three passes:
+ *
+ *     budget    chunk rows   normalise   wide    down    trunk    peak
+ *      64 MiB       16,384        7.77   72.2    57.8    332.7   517.8 MiB
+ *     512 MiB       90,000        5.12   69.1    40.8    310.2   see below
+ *
+ * The `down` pass loses most - 29% - because it is the one whose dispatch is
+ * smallest. So the budget is a tuning knob, `pairTransitionChunkBytes`, and a
+ * device with room should raise it.
+ *
+ * 🔴 AND THE CHUNK IS ALIGNED TO THE BINDING, NOT ONLY TO THE TILE. Each chunk
+ * BINDS the pair at a row offset, and an offset that is not a multiple of
+ * `minStorageBufferOffsetAlignment` is a validation error rather than a slow
+ * path. `channels * 4` is the pair's row stride, so how many rows reach a
+ * 256-byte boundary depends on it.
+ */
+const gcd = (first, second) => {
+  let a = first; let b = second;
+  while (b !== 0) { const remainder = a % b; a = b; b = remainder; }
+  return a;
+};
+
+export function transitionSplitChunkRows(rows, channels, factor, limits = {}) {
+  const targetBytes = limits.targetBytes ?? 64 * 1024 * 1024;
+  const alignment = limits.minStorageBufferOffsetAlignment ?? 256;
+  const blockRows = limits.blockRows ?? 128;
+  // The widened row, in f16 - the biggest of the three tensors a chunk holds.
+  const rowBytes = channels * factor * 2 * 2;
+  const ceiling = Math.min(limits.maxStorageBufferBindingSize ?? Infinity, targetBytes);
+  if (rows * rowBytes <= ceiling) return rows;
+  const pairRowBytes = channels * 4;
+  const offsetRows = alignment / gcd(pairRowBytes, alignment);
+  const step = blockRows * offsetRows / gcd(blockRows, offsetRows);
+  const capacity = Math.floor(ceiling / rowBytes);
+  if (capacity < step) {
+    throw new RangeError("a split transition chunk cannot be aligned inside the binding limit");
+  }
+  return Math.min(rows, Math.floor(capacity / step) * step);
+}
+
+/**
+ * The buffers a split transition needs beyond the pair track's own scratch.
+ *
+ * 🔴 THE CALLER ALLOCATES, BECAUSE encodePairTrack HAS NO ALLOCATOR AND SHOULD
+ * NOT GROW ONE. Three stacks compile this track and each already owns its
+ * buffers' lifetimes; handing the encoder a bag it did not make is how the pair
+ * scratch works and this follows it.
+ *
+ * `parameters` is indexed by ROW COUNT, because a ragged tail chunk is a
+ * different `rows` in the matmul uniform and there are at most two of them.
+ */
+export function allocateTransitionSplit(allocator, shape, keep = (a) => a) {
+  const { rows, channels, factor, chunkRows, precision = "f16", offsets, label = "transition", scratch } = shape;
+  const intermediate = channels * factor;
+  const width = precision === "f16" ? 2 : 4;
+  const normBytes = chunkRows * channels * width;
+  const wideBytes = chunkRows * intermediate * 2 * width;
+  const reuse = (slot, bytes, name) => (slot !== undefined && slot.byteLength >= bytes
+    ? { buffer: slot.buffer, byteOffset: slot.byteOffset ?? 0, byteSize: bytes }
+    : keep(allocator.allocate(`${label}.${name}`, bytes, GPUBufferUsage.STORAGE)));
+  const normalized = reuse(scratch?.[0], normBytes, "normalized");
+  const wide = reuse(scratch?.[1], wideBytes, "wide");
+  const parameters = new Map();
+  for (const count of new Set([chunkRows, rows % chunkRows].filter((c) => c > 0))) {
+    parameters.set(count, {
+      normalize: keep(allocator.upload(`${label}.p-norm-${count}`,
+        new Uint32Array([count, channels, 0, 0]), GPUBufferUsage.UNIFORM)),
+      wide: keep(allocator.upload(`${label}.p-wide-${count}`,
+        new Uint32Array([count, channels, intermediate * 2, offsets.transition1, 0, 0, 0, 0]),
+        GPUBufferUsage.UNIFORM)),
+      down: keep(allocator.upload(`${label}.p-down-${count}`,
+        new Uint32Array([count, intermediate, channels, offsets.transition2, 0, 0, 0, 0]),
+        GPUBufferUsage.UNIFORM)),
+    });
+  }
+  return { normalized, wide, parameters, chunkRows, precision };
+}
+
+/**
+ * This device's answer for the split transition: a geometry, or false.
+ *
+ * 🔴 IT LIVES HERE FOR THE REASON gridProjectMatrixConfig DOES. Two stacks
+ * compile this pair track and run its transition - the pairformer and the MSA
+ * stack - and the rule was written into one of them, so four of an AF3 trunk's
+ * `pair-transition` passes kept the fused kernel however the knob was set. A
+ * selection rule belongs to the kernel, not to one of its callers.
+ *
+ * The width rule is real and is measured in webgpu/af3/trunk/transition.js's
+ * TRANSITION_SPLIT_MIN_CHANNELS: the fused kernel holds the WIDENED row in
+ * workgroup memory, so its row tile halves as the channels double.
+ * `pairTransitionSplitMinChannels` is what a device that has re-measured it
+ * says instead.
+ */
+/**
+ * The split transition's block geometry, before a caller's `matrix` overrides.
+ *
+ * Named because the CHOOSER has to price it: `splitTransitionConfig` decides
+ * whether to split at all, and it cannot ask how many bytes the answer stages
+ * without knowing the geometry the shaders would be built from.
+ */
+export const SPLIT_TRANSITION_GEOMETRY = Object.freeze({
+  blockRows: 128, blockColumns: 128, blockInner: 32,
+  subgroupRows: 2, subgroupColumns: 4,
+});
+
+// 🔴 `f32Only` IS FOR A STACK PINNED TO f32 - the confidence heads, which pin
+// `pairMatrixKernels: false` because the MATRIX kernels are f16 and move pLDDT
+// and PAE by thousands of times their envelope. That pin also turned the split
+// off, so a 384- or 512-channel head ran the fused kernel the split beats 3.7x.
+// The vector split with f32 scratch is f32 arithmetic throughout - the same
+// class as the fused kernel, only reordered - so a pinned stack takes it.
+export function splitTransitionConfig(device, channels, { f32Only = false, arithmetic = "f32" } = {}) {
+  const tuning = deviceTuning(device);
+  // 🔴 THE WIDTH DECIDES BOTH SPLITS; A PRIOR MAY ONLY REFUSE. (It read "the
+  // prior decides the matrix split", which left a T4 on the vector one.)
+  // Both used to need `pairTransitionSplit: true`, which only the ampere prior
+  // sets - so an Apple part, a T4, and every GPU with no prior ran the fused
+  // kernel on IntelliFold-2's and OpenDDE's wide pair tracks, the kernel whose
+  // row tile halves as the channels double. That is a property of the fused
+  // kernel on every device, not of an A100, so from VECTOR_SPLIT_MIN_CHANNELS
+  // up the vector split is the default unless a device says `false`. The
+  // matrix split is still the prior's to choose: it was measured per device.
+  if (tuning.pairTransitionSplit === false) return false;
+  // ...and the MATRIX split too, now, unless a prior refused it: past the
+  // width rule below it was the ampere prior's alone, so a T4 with matrix
+  // units ran IntelliFold-2's transition on the vector split.
+  const config = f32Only || tuning.pairTransitionSplit === false || tuning.matrixLinear === false ? null
+    : deviceMatrixConfig(device, { element: "f16" });
+  // 🔴 THE VECTOR SPLIT IN f16 ARITHMETIC PAYS FROM AF3's 128 CHANNELS, where the f32 one starts at 192 - see
+  // VECTOR_F16_SPLIT_MIN_CHANNELS. The width rule below is every other path's.
+  const vectorF16 = config === null && !f32Only && halfPrecisionAvailable(device)
+    && (tuning.vectorTransitionArithmetic ?? arithmetic) === "f16"
+    && channels >= VECTOR_F16_SPLIT_MIN_CHANNELS;
+  if (!vectorF16 && channels < (tuning.pairTransitionSplitMinChannels ?? TRANSITION_SPLIT_MIN_CHANNELS)) {
+    return false;
+  }
+  // 🔴 NO MATRIX UNITS IS NOT NO SPLIT. It used to be, so every stock browser -
+  // none of which exposes subgroup matrices - ran the fused kernel at every
+  // width. The vector GEMM above takes the split's two projections instead,
+  // storing its scratch in f16 only where the device has `shader-f16`.
+  const normalizeRows = splitNormalizeRows(device, channels);
+  if (normalizeRows === undefined) return false;
+  const rows = normalizeRows === 8 ? {} : { normalizeRows };
+  if (config === null) {
+    if (!vectorF16 && channels < VECTOR_SPLIT_MIN_CHANNELS) return false;
+    if (channels % VECTOR_GEMM_BLOCK.columns !== 0) return false;
+    // 🔴 THE f16 SWITCH, NOT THE FEATURE BIT. Asked as `features.has`, --f16=off
+    // could not reach this scratch, so an "f32" trunk on a 256-channel model
+    // rounded its widened transition to f16: protenix2's pair transition alone,
+    // one MSA block, stock flags, against the native f32 port (metal/) - 3.13e-5
+    // asked that way, 1.31e-7 now. (With matrix units the MATRIX split runs,
+    // which is f16 by construction and which no switch reaches: 5.25e-4 there.)
+    const storage = !f32Only && halfPrecisionAvailable(device) ? "f16" : "f32";
+    // 🔴 THE GEMM'S ARITHMETIC IS THE CALLER'S PRECISION POLICY, NOT THIS
+    // FUNCTION'S: f16 only where the stack already multiplies and accumulates
+    // in f16 (ESMFold2's trunk, see its trunk.js) and the device has it.
+    // `vectorTransitionArithmetic` overrides it - the control arm.
+    const asked = tuning.vectorTransitionArithmetic ?? arithmetic;
+    const math = asked === "f16" && storage === "f16" ? "f16" : "f32";
+    // (the two extents it contracts and produces are `channels` and four times it)
+    const block = vectorGemmBlock(device, math,
+      ({ columns, inner }) => channels % columns === 0 && channels % inner === 0);
+    return { vector: true, storage, ...rows,
+             ...(math === "f16" ? { arithmetic: "f16" } : {}), ...(block ? { block } : {}) };
+  }
+  const answer = {
+    result: tuning.stagedMatrixResult ?? config.resultComponentType,
+    contractResult: config.resultComponentType,
+    matrixElement: config.componentType,
+    tile: { M: config.M, N: config.N, K: config.K },
+    prefetch: tuning.stagedMatrixPrefetch === true,
+    directWeights: tuning.stagedMatrixDirectWeights === true,
+  };
+  // 🔴 AND WHETHER THIS DEVICE CAN STAGE IT, which this asked about the matrix
+  // units and the channel width and not about MEMORY. `compilePairTrack` prices
+  // the answer and RAISES - "a split transition stages 32768 B, over the limit"
+  // - so a device with WebGPU's guaranteed 16 KiB of workgroup storage did not
+  // fold at all where one with 32 KiB did, and `check-portable-limits.mjs
+  // --spec-floor` is the only thing that could see it. `resolveGridAttendMatrix`
+  // beside this already answers the same question the same way: a geometry the
+  // device cannot hold resolves to FALSE rather than throwing. The raise stays,
+  // for a caller that names a geometry by hand.
+  const bytes = stagedMatrixStorage({ ...SPLIT_TRANSITION_GEOMETRY, ...answer });
+  if (bytes > device.limits.maxComputeWorkgroupStorageSize) return false;
+  return { ...answer, ...rows };
+}

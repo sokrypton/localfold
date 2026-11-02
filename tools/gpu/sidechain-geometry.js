@@ -12,8 +12,8 @@
  * the answer: two swapped labels would compare a bond against the ideal of the
  * bond it was swapped with, and could look perfect.
  */
-import { REFERENCE_CONFORMERS } from "../../src/af3/featurise/reference-conformers.js";
-import { atomName } from "../../src/af3/fold.js";
+import { REFERENCE_CONFORMERS } from "../../shared/af3/featurise/reference-conformers.js";
+import { atomName } from "../../webgpu/af3/fold.js";
 
 /** Every aromatic type, and the ring atoms whose closure is the question. */
 export const RINGS = {

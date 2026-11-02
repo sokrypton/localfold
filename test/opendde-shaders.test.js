@@ -17,9 +17,9 @@
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 
-import { createAtomBlockShaders, createAtomEncoderShaders } from "../src/af3/diffusion/atom-encoder-webgpu.js";
-import { createGridAttentionShaders, packGridAttentionWeights } from "../src/af3/trunk/grid-attention-webgpu.js";
-import { ALPHAFOLD3, OPENDDE } from "../src/af3/dialect.js";
+import { createAtomBlockShaders, createAtomEncoderShaders } from "../webgpu/af3/diffusion/atom-encoder.js";
+import { createGridAttentionShaders, packGridAttentionWeights } from "../webgpu/af3/trunk/grid-attention.js";
+import { ALPHAFOLD3, OPENDDE } from "../shared/af3/dialect.js";
 
 const ATOM_SHAPE = {
   subsets: 1, queries: 32, keys: 128, channels: 128, heads: 4, dimension: 32,
@@ -28,16 +28,16 @@ const ATOM_SHAPE = {
 describe("the atom attention's mask bias", () => {
   const lineOf = (keyMaskedAtomAttention) => createAtomBlockShaders(
     "", { ...ATOM_SHAPE, keyMaskedAtomAttention },
-  ).attendFor(0).split("\n").find((line) => line.includes("let bias ="));
+  ).attendFor(0).split("\n").find((line) => /let bias0? =/.test(line));   // (two keys a lane: bias0 / bias1)
 
   it("is a PRODUCT under AlphaFold 3 - both padded, or no penalty", () => {
     const line = lineOf(false);
-    assert.match(line, /\(queries_mask\[query_index\] - 1\.0\) \* \(keys_mask\[key_index\] - 1\.0\)/);
+    assert.match(line, /\((q_mask|queries_mask\[query_index\]) - 1\.0\) \* \(keys_mask\[key_index0?\] - 1\.0\)/);
   });
 
   it("is a SUM under OpenDDE - either padded is enough", () => {
     const line = lineOf(true);
-    assert.match(line, /-1\.0e9 \* \(\(1\.0 - queries_mask\[query_index\]\) \+ /);
+    assert.match(line, /-1\.0e9 \* \(\(1\.0 - (q_mask|queries_mask\[query_index\])\) \+ /);
   });
 
   it("really does generate two different kernels", () => {

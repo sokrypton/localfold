@@ -1,0 +1,8 @@
+potentials:
+- _target_: bioemu2.denoising.steering.potentials.ChiralAtomPotential
+  parameters:
+    guidance_weight: 0.3
+    buffer: 0.4
+- _target_: bioemu2.denoising.steering.potentials.BondLengthPotential
+  sigma_tolerance: 4.0
+  parameters: {guidance_weight: 0.02}

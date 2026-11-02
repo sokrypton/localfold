@@ -18,7 +18,7 @@
  *     af3-msa:59:128:64:128:0.00001:fast:false:msa:keyMask
  *     line 8 of 35: "const DIMENSION: u32 = 8u;" against "...= 32u;"
  *
- * Every kernel in msa-attention-webgpu.js is built from one `common` preamble,
+ * Every kernel in msa-attention.js is built from one `common` preamble,
  * so all of them embed HEADS and DIMENSION - even `keyMask`, thirteen lines
  * that read neither - while the stack keyed on the channel widths alone.
  * AlphaFold 3 and openbind0 are msaChannels 64 with 8 heads of dimension 8;
@@ -34,17 +34,17 @@
  * collide in; it says nothing about whether either model folds well, and
  * `test:template` and `test:ligand` are what say that.
  */
-import { featuriseProtein } from "../../src/af3/featurise/featurise.js";
-import { buildTargetFeat, foldBatch } from "../../src/af3/fold.js";
-import { Af3TrunkGpu } from "../../src/af3/trunk/trunk-webgpu.js";
-import { af3BatchFromA3m } from "../../src/af3/featurise/batch.js";
+import { featuriseProtein } from "../../shared/af3/featurise/featurise.js";
+import { buildTargetFeat, foldBatch } from "../../webgpu/af3/fold.js";
+import { Af3TrunkGpu } from "../../webgpu/af3/trunk/trunk.js";
+import { af3BatchFromA3m } from "../../shared/af3/featurise/batch.js";
 import {
   af3Dialect, confidenceWeights, openAf3Store, openddeConfidenceWeights,
   structuralExpanderWeights, structuralRefinerWeights, trunkDepths, trunkWeights,
-} from "../../src/af3/weights/weights.js";
+} from "../../shared/af3/weights/weights.js";
 import { atomReference, diffusionWeights, targetFeatureWeights }
-  from "../../src/af3/weights/diffusion-weights.js";
-import { dialectFor, featuriserDialect } from "../../src/af3/dialect.js";
+  from "../../shared/af3/weights/diffusion-weights.js";
+import { dialectFor, featuriserDialect } from "../../shared/af3/dialect.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
@@ -132,9 +132,7 @@ async function foldPass(device, model, sequence, steps) {
       : { confidence: await confidenceWeights(store) }),
   };
   const sample = trunk.msaBlocks[0];
-  // 🔴 DIFFUSION, NOT FLOW: rosettafold3 REFUSES flow outright - see
-  // `noFlowSampler` - and this gate must run every checkpoint. Four steps
-  // will not converge and does not need to: a pipeline is compiled on the
+  // Four steps will not converge and do not need to: a pipeline is compiled on the
   // first one, and nothing here reads the structure.
   const result = await foldBatch(device, batch, weights,
                                  { steps, mode: "diffusion", recycles: 0 });
@@ -222,7 +220,14 @@ export async function main(device, args) {
   const DEFAULT_TOOLS = [
     "fold-af2 --length=59 --rows=16 --extra-rows=16",
     "fold-af2 --family=multimer --chains=30,29 --length=59 --rows=16 --extra-rows=16",
+    // The monomer's template kernels compile only when a slot is passed; the
+    // multimer's embedder runs every recycle, so the arm above already has it.
+    "fold-af2 --target=5caj --chain=A --rows=16 --extra-rows=16"
+      + " --template=/tools/fixtures/5caj-crystal.pdb:A",
     "fold-esmfold2 --bundle=/model-esmfold2-int5 --length=40",
+    // BioEmu2 shares the pair track (ESMFold2's trunk, AF3's kernels) with the panel, and its own kernels are keyed
+    // `bioemu2:`; four sampler steps compile every kernel a fold does
+    "fold-bioemu2 --job=/tools/fixtures/bioemu2/6mrr-68.json --steps=4 --allow-broken-geometry",
   ].join(";");
   const toolsGiven = args.some((a) => a.startsWith("--tools="));
   const tools = option(args, "tools", DEFAULT_TOOLS).split(";")

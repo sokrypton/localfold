@@ -1,7 +1,7 @@
 {
   "//": [
     "OPTIONAL. Nothing in this repository needs a compiler - the browser and node",
-    "both load src/**/*.js as written. This file exists so `npm run typecheck` can",
+    "both load shared/, cpu/ and webgpu/ as written. This file exists so `npm run typecheck` can",
     "still read the JSDoc on the public surface and catch a typo or a wrong arity.",
     "",
     "`strict` is off deliberately. With checkJs and strict together, every one of",
@@ -23,6 +23,6 @@
     "noImplicitAny": false,
     "skipLibCheck": true
   },
-  "include": ["src/**/*.js", "web/**/*.js"],
+  "include": ["shared/**/*.js", "cpu/**/*.js", "webgpu/**/*.js", "web/**/*.js"],
   "exclude": ["web/vendor"]
 }

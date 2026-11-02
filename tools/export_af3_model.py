@@ -41,6 +41,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import struct
 import sys
 from pathlib import Path
@@ -77,7 +78,7 @@ COLABDESIGN2 = os.path.expanduser("~/Documents/GitHub/ColabDesign2")
 #
 # 🔴 openbind0 IS NOT openfold3, WHATEVER THE LINEAGE SUGGESTS. They are two
 # releases of one project with different forward conventions - see
-# src/af3/dialect.js - so they are two entries, and the manifest's model.name
+# shared/af3/dialect.js - so they are two entries, and the manifest's model.name
 # is what carries the difference into the page.
 #
 # 🔴 AND THE RELEASE NUMBER IS PART OF THE NAME. Upstream's announcement calls
@@ -101,7 +102,7 @@ COLABDESIGN2 = os.path.expanduser("~/Documents/GitHub/ColabDesign2")
 # template tensor has AlphaFold 3's name and a different WIDTH - the pair track
 # is 384 channels rather than 128, the MSA 128 rather than 64, the triangle
 # attention 12 heads rather than 4 (2 rather than 4 in the template stack) and
-# the distogram 96 bins rather than 64. That is why src/af3/weights/weights.js derives
+# the distogram 96 bins rather than 64. That is why shared/af3/weights/weights.js derives
 # every width from the tensor that states it: this bundle loads through
 # AlphaFold 3's declared widths without complaint and dispatches every kernel
 # over a third of its own tensor.
@@ -127,7 +128,7 @@ COLABDESIGN2 = os.path.expanduser("~/Documents/GitHub/ColabDesign2")
 #
 # ...and it does NOT expand structural tokens, which is OpenDDE's one difference
 # that is not a flag. Its widths are its own (c_z 256, c_m 128, 8 trunk triangle
-# heads, 2 template, msa value_dim 8) and src/af3/weights/weights.js derives every one
+# heads, 2 template, msa value_dim 8) and shared/af3/weights/weights.js derives every one
 # from the tensor that states it, so they need no table here.
 #
 #     curl -sSLO https://huggingface.co/sokrypton/af3-any-model/resolve/main/\
@@ -148,12 +149,48 @@ BLOBS = {
     # exporter does not care which vendor wrote them.
     "intellifold2": "~/ported/intellifold2/intellifold2.bin.zst",
     "rosettafold3": "~/ported/rosettafold3/rosettafold3.bin.zst",
+    # Chai-1 (Apache 2.0), not OpenFold-derived: chai ships frozen TorchScript, and af3-any-model's converter maps
+    # it onto AlphaFold 3's scopes. Its tokens also read ESM2 3B (lm/esm2.bin.zst, a separate bundle).
+    #     curl -sSLO https://huggingface.co/sokrypton/af3-any-model/resolve/main/chai1/chai1.bin.zst
+    "chai1": "~/af3_ported/ref/weights/chai1/chai1.bin.zst",
+    # Mol-1 (Molence Bio, Apache 2.0): Protenix-2's model with a PairMixer stack and a 320-wide trunk (af3-any-model's
+    # mol1-port branch, converters/mol1.py).
+    #     curl -sSLO https://huggingface.co/sokrypton/af3-any-model/resolve/1b41e3337b861081c321420c3f4a40ff9e2a6044/mol1/mol1.bin.zst
+    "mol1": "~/af3_ported/mol1.bin.zst",
 }
 
 # The trunk: the evoformer stacks, the conditioning that builds their inputs
 # (including the atom transformer encoder, which produces 384 of target_feat's
 # 447 columns), and the distogram head that reads the pair out.
 TRUNK = ("diffuser/evoformer", "diffuser/distogram_head")
+
+# Per model: matrices a quantised bundle must still carry as float32, because
+# the activations they multiply are large enough that a few percent of weight
+# error swamps the signal. They reach tools/quantize_af3.py as `float32Tensors`.
+#
+# 🔴 Mol-1's trunk single transition2. Its trained weights hold six trunk single
+# channels at ~3e5 on every token (af3-any-model's FP32_TRUNK_SINGLE), and the
+# gated activation transition2 multiplies reaches 6.6e4. At int5 g32 the error
+# that lands in every output channel is thousands: the channels inside the
+# confidence head's +/-512 clamp, which carry the per-token signal it reads,
+# came out wrong in sign and size (channel 72: 4478 against -397), and pLDDT
+# went flat - 87.8 on a random 80-mer, 84.3 on poly-G, 87.8 on ubiquitin,
+# against 74 / 78 / 92 from the float32 bundle. With these two tensors (28 M
+# parameters, +88 MiB) float32 the int5 bundle reads 73.8 / 77.4 / 92.5. int7
+# for the whole transition is not enough (88.5), and transition1 alone at
+# float32 does nothing (87.8).
+#
+# 🔴 boltz2's contact conditioning, at both of its sites: the encoder a pocket or contact constraint runs through and the
+# Fourier projection of its distance (17 k parameters each, +130 KiB). Read on the host into a table of a few rows
+# (shared/af3/featurise/constraints.js), so the cost is bytes alone; at int5 g32 the term came out 1.3-5.6% from
+# float32's (the confidence site's 12 A contact the worst), where the rest of the pair is held to its own int5 error.
+# And its two class constants (128 floats each): with any constraint every pair it does not mark is UNSELECTED - 99% of
+# them on the harness cases - and at int5 that class's shift from unspecified came out 17-22% from float32's.
+MODEL_FLOAT32 = {
+    "mol1": re.compile(r"/single_transition/transition2/weights$"),
+    # (and its DN rows - Boltz's DNA unknown, three vectors - which the published bundle has always carried as float32)
+    "boltz2": re.compile(r"/contact_(encoder|fourier)/weights$|/contact_encoding_(unspecified|unselected)$|/boltz2_dn_"),
+}
 
 # 🔴 SIZED IN FLOAT32 BYTES, FOR AN INT8 RESULT, exactly as the multimer export
 # is: quantize_model.py maps shard to shard, so a 48 MiB float32 shard lands at
@@ -365,6 +402,7 @@ def export(blob_path: str, out_dir: Path, include: tuple[str, ...],
     # manifest are checked at build time; a layout that depended on dict order
     # would fail that check for no reason.
     keep_float32 = []
+    model_float32 = MODEL_FLOAT32.get(model)
     for scope, name, array in sorted(wanted):
         tensor = f"{scope}/{name}"
         writer.add(tensor, array)
@@ -376,7 +414,8 @@ def export(blob_path: str, out_dir: Path, include: tuple[str, ...],
         # ...and the Fourier embedding, which is 512 numbers and a RANDOM
         # PROJECTION: quantising it would perturb the very thing whose spread
         # makes the embedding informative, to save half a kilobyte.
-        if name in ("offset", "scale", "bias") or name in FOURIER_LEAVES:
+        if (name in ("offset", "scale", "bias") or name in FOURIER_LEAVES
+                or (model_float32 is not None and model_float32.search(tensor))):
             keep_float32.append(tensor)
     writer.close()
 

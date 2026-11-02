@@ -9,8 +9,8 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
-import { chainPairTmScores, reduceTmScore } from "../src/heads/tm-score.js";
-import { computeTmScores } from "../src/heads/confidence.js";
+import { chainPairTmScores, reduceTmScore } from "../shared/heads/tm-score.js";
+import { computeTmScores } from "../webgpu/heads/confidence.js";
 
 /** Three chains of `per` tokens each. */
 const layout = (per) => {

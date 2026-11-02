@@ -14,176 +14,57 @@
  * no alignment the MSA is the query alone, which is what AF3 itself produces
  * for a single-sequence input rather than a stub.
  */
-import { ccdUrl, parseCcdComponent } from "../src/af3/featurise/ccd-component.js";
-import { smilesComponent } from "../src/chem/component.js";
-import { af3BatchFromA3m } from "../src/af3/featurise/batch.js";
-import { featuriserDialect } from "../src/af3/dialect.js";
+import { startFromPdb } from "../shared/af3/structure/warm-start.js";
+import { motifSlots } from "../cpu/af3/diffusion/inpaint.js";
+import { ccdUrl, parseCcdComponent, ligandChain } from "../shared/af3/featurise/ccd-component.js";
+import { smilesComponent } from "../shared/chem/component.js";
+import { CROSSLINKER_COMPONENTS } from "../shared/chem/crosslinkers.js";
+import { af3BatchFromA3m } from "../shared/af3/featurise/batch.js";
+import { featuriserDialect, templatePolicyFor } from "../shared/af3/dialect.js";
 import { foldBatch, toPdb, atomName, warmTrunkPipelines }
-  from "../src/af3/fold.js";
+  from "../webgpu/af3/fold.js";
 import { confidenceWeights, openddeConfidenceWeights, structuralExpanderWeights,
-  structuralRefinerWeights, trunkDepths, trunkWeights } from "../src/af3/weights/weights.js";
+  structuralRefinerWeights, trunkDepths, trunkWeights } from "../shared/af3/weights/weights.js";
 import { diffusionWeights, atomReference, targetFeatureWeights }
-  from "../src/af3/weights/diffusion-weights.js";
-import { HttpTensorStore } from "../src/bundles/http-tensor-store.js";
+  from "../shared/af3/weights/diffusion-weights.js";
+import { HttpTensorStore } from "../shared/bundles/http-tensor-store.js";
 import { AF3_FAMILIES, bundleBaseUrl, loadManifest }
-  from "../src/bundles/manifests/index.js";
-import { throwIfAborted } from "../src/runtime/abort.js";
+  from "../shared/bundles/manifests/index.js";
+import { throwIfAborted } from "../webgpu/runtime/abort.js";
 import { buildTemplate } from "./template-source.js";
-import { yieldToBrowser } from "../src/runtime/yield.js";
+import { mergeTemplateSlots } from "../shared/af3/featurise/template-input.js";
+import { yieldToBrowser } from "../webgpu/runtime/yield.js";
 import { af3Plan, af3TrunkStageSpans, RuntimeEstimator }
-  from "../src/runtime/cost-model.js";
+  from "../webgpu/runtime/cost-model.js";
 
 const ALPHABET = "ACDEFGHIKLMNPQRSTVWYX";
 
 /**
- * What the count dial offers per mode, and what it is called.
+ * What the step dial offers, and what it is called. One sampler: Flow was removed (docs/AF3.md, "Flow removed").
  *
- * 🔴 THE TWO NUMBERS ARE NOT INTERCHANGEABLE. A flow CYCLE walks the whole
- * schedule; a diffusion STEP discretises it, and below twenty the sampler does
- * not land - ten gives 5.91 A on 6MRR with a CA-CA of 8.40 A, a chain that is
- * not connected. So the dial is rebuilt on a mode change rather than carrying a
- * number across.
+ * One dial for every AF3-lineage family; twenty-five is the lowest it offers.
  *
- * 🔴 AND SIXTEEN IS THE LOWEST EITHER OFFERS, WHICH IT WAS NOT. Flow used to
- * start at two and prefer eight, and eight IS a finished structure for a chain
- * of standard residues - but not for a modified one, whose atoms are each their
- * own token rather than coming from a shared residue conformer and so have to
- * be placed individually. Measured with tools/gpu/probe-modified.js on a
- * phosphoserine, as the median predicted-to-ideal bond ratio against the
- * unmodified residues of the same chain:
- *
- *     flow-8    0.835   (control 1.003)
- *     flow-16   0.974   (control 1.007)
- *     flow-32   0.996   (control 1.010)
- *
- * A dial whose lowest setting is wrong for a supported input is a trap, and one
- * number that is always good enough beats two and a rule about when to use
- * which. The cost is a few seconds. AF3 itself scores 0.956 against this port's
- * 0.953 at matched settings, so what is left at sixteen is the architecture's
- * price for an atom-tokenised residue and not something more steps will fix.
+ * 🔴 SIXTEEN IS THE FLOOR UNDER ANY DIAL. A modified residue's atoms are each their own token and have to be placed
+ * individually; below sixteen calls they come out compressed (tools/gpu/probe-modified.js, a phosphoserine's median
+ * predicted-to-ideal bond ratio 0.835 at eight against a control of 1.003, 0.974 at sixteen).
  */
 export const AF3_COUNTS = {
-  // 🔴 THE DIAL IS NAMED FOR THE SAMPLER IT DISCRETISES, NOT FOR ITS UNIT. Both
-  // arms used to read "Steps", which says nothing: the numbers differ by an
-  // order of magnitude precisely BECAUSE a flow step walks the whole schedule
-  // and a diffusion step discretises it, and a reader seeing 16 in one mode and
-  // 200 in the other has no way to know that from the word. "Cycles" beside
-  // "Recycles" was the earlier objection and these avoid it too.
-  // 🔴 FLOW'S RISK IS A BAD FIRST DRAW, NOT LENGTH - and this row used to say
-  // length. Measured on 1TIM A:B (494 residues) with a self-template: boltz2
-  // under Flow is 17.7 / 1.04 / 19.6 / 1.01 / 1.06 across five seeds - two
-  // catastrophic - while DIFFUSION at the same seeds is 1.01-1.11 and af3 under
-  // Flow is 0.943-0.992 on all five. So it is not "Flow past 400 residues":
-  // af3's Flow is fine there and boltz2's Flow is fine on a LONGER target
-  // (5CAJ A:B, 522, four seeds, 0.57-0.85).
-  //
-  // The two failing seeds fail under every template configuration - merged,
-  // cross-chain masked, per-chain, and none at all - so it is the initial draw.
-  // Flow takes one and walks down deterministically, so it never escapes a bad
-  // one; diffusion re-noises at every step and does. 🔴 AND NEITHER FAILURE IS
-  // VISIBLE: both pass the chain-geometry gate, and one reads pLDDT 85 against
-  // a good fold's 93.
-  flow: { label: "Flow", values: [16, 32, 64], preferred: 16 },
-  // 🔴 THERE IS NO "ODE" ROW, AND THERE WAS. The flow walk's step can be an
-  // integration step - `x <- D + (sigma_next/sigma)(x - D)` rather than
-  // `x <- D` - and it shipped here as a third named sampler on the strength of
-  // "the only step that folds 1QYS for AlphaFold 3". That measurement was taken
-  // on a hand-reverted tree and does not reproduce; see the retraction in
-  // docs/AF3.md.
-  //
-  // Measured against DIFFUSION rather than against a Flow that was never
-  // broken, it wins **1 of 12** model/target pairs - intellifold2 on 6MRR,
-  // 0.769 against 1.549 - and loses the other eleven, by 2.3x on af3's own
-  // 6MRR. Its one win does not survive length either: the same model at 494
-  // residues is 1.665 against 1.058 and 1.065. And it breaks outright past ~400
-  // (494 residues: 6.62 mean against 0.958, the interface collapsing from fnat
-  // 0.87 to 0.26).
-  //
-  // A third option that is never the right pick is a way for a visitor to get a
-  // worse fold, so the page does not offer it. The STEP is still there and
-  // still reachable - `--mode=ode` on any fold tool - because the intellifold2
-  // square is real and worth understanding. See src/af3/fold.js.
   // 🔴 AND 200 IS ON THE DIAL BECAUSE IT IS WHAT AF3 WAS TRAINED WITH. The
   // powers-of-two ladder (20, 40, 80, 160, 320) never landed on it, so the
-  // model's own setting was the one number the page could not select. 25 keeps
-  // the floor the note above measured - below twenty the sampler does not land,
-  // and ten gives 5.91 A on 6MRR with a CA-CA of 8.40 A.
+  // model's own setting was the one number the page could not select.
+  // 🔴 ONE DIAL FOR EVERY FAMILY, 25 ON THE EXPONENTIAL UPDATE (2026-10-16). The
+  // fold takes webgpu/af3/fold.js's DIFFUSION_DEFAULTS, the exponential update on
+  // the geometric schedule, and twenty-five of those against each family's old
+  // default (Euler at 20 from sigma 80 or 40 for af3/protenix2/openbind0/
+  // intellifold2, 16 for opendde, 25 for boltz2 and rosettafold3), seven models,
+  // seven systems x two seeds of bonds and six crystal targets x three seeds:
+  // ligand bond median 0.042-0.071 A against 0.045-0.340, rosettafold3's ligands
+  // 4/6 torn -> 0/6, and CA-RMSD level on every model (within 0.05-0.1 A; 1QYS
+  // is bimodal at ~1.2/~2.8 A on every arm, even 200 steps). Sixteen or twenty
+  // exponential steps were WORSE on ligands than the old defaults, so the short
+  // schedules, the per-family starts and OpenDDE's sixteen went. docs/AF3.md,
+  // "The default sampler".
   diffusion: { label: "Diffusion", values: [25, 50, 100, 200], preferred: 25 },
-};
-
-/**
- * OpenDDE's own step counts, because more steps make its fold WORSE.
- *
- * 🔴 MEASURED ON TWO TARGETS AND NINE FOLDS, AGAINST THE SEED SPREAD. TM
- * against the deposition, seeds within an arm:
- *
- *   6MRR   16 steps  0.9044 0.9169 0.9039   100 steps  0.8884 0.8828
- *   1QYS   16        0.9449 0.9394          100        0.9285 0.9319
- *
- * The ranges do not overlap on either target, and 16 is 32-40% faster. This is
- * the second model here to say it - docs/EF2FAST.md records "more steps than
- * the schedule buy nothing" for that one - and the mechanism is the same:
- * OpenDDE's sampler re-noises at every step, so a longer schedule is more
- * chances to wander, not a finer approach.
- *
- * The ladder keeps 25 and up so the AlphaFold 3 settings remain selectable and
- * comparable; what moves is which one a fold takes when nobody chooses.
- */
-/**
- * 🔴 OpenDDE TAKES THE DIFFUSION SAMPLER, AND THE FLOW ARM IS A LOSS AT THE
- * SAME PRICE. On 6MRR at sixteen steps, two seeds each: diffusion TM 0.9044
- * and 0.9169 against flow's 0.8307 and 0.8601, both arms 16.1 s.
- * 🔴 THE SENTENCE THAT USED TO FOLLOW - "AlphaFold 3 prefers flow because its
- * diffusion default is 200 steps and flow-16 reaches it in a twelfth of the
- * calls" - was stale twice over. The page's diffusion preset is **25**, not
- * 200 (see AF3_COUNTS), so the ratio was 16 against 25 rather than a twelfth;
- * and AlphaFold 3 does not prefer flow any more, because flow returned a fold
- * that is NOT A CHAIN on 1QYS across four seeds while diffusion gave 1.072 A.
- * Diffusion is the page default now. OpenDDE's sampler is already best at
- * sixteen,
- * so there is nothing for a flow arm to escape and escaping it loses the
- * structure. The mode row is hidden for this family AND the value forced, so a
- * stale select cannot reintroduce it.
- */
-export const OPENDDE_SAMPLER_MODE = "diffusion";
-
-/**
- * Families whose CHECKPOINT has no working flow walk, so the page must not
- * offer one.
- *
- * 🔴 THIS IS NOT A PREFERENCE LIKE OpenDDE'S, IT IS A BROKEN STRUCTURE. OpenDDE
- * hides the row because flow is measurably WORSE for it; rosettafold3 hides it
- * because flow gives N-CA **6.94 A** against 1.46 and consecutive CA collapsing
- * to 0.23 A - a fold the geometry gate refuses - while pLDDT reads 81.47
- * against the good fold's 81.53. The page defaulted to Flow, so this was what a
- * visitor picking rosettafold3 would have got, with a confidence number saying
- * nothing was wrong.
- *
- * `foldBatch` throws for these rather than switching silently; the page's job
- * is to not ask. See `noFlowSampler` in src/af3/dialect.js.
- */
-export const NO_FLOW_SAMPLER_FAMILIES = ["rosettafold3"];
-export const samplerModeFor = (family, asked) =>
-  (family === "opendde" || NO_FLOW_SAMPLER_FAMILIES.includes(family)
-    ? OPENDDE_SAMPLER_MODE : asked);
-
-export const OPENDDE_COUNTS = {
-  // 🔴 FLOW'S RISK IS A BAD FIRST DRAW, NOT LENGTH - and this row used to say
-  // length. Measured on 1TIM A:B (494 residues) with a self-template: boltz2
-  // under Flow is 17.7 / 1.04 / 19.6 / 1.01 / 1.06 across five seeds - two
-  // catastrophic - while DIFFUSION at the same seeds is 1.01-1.11 and af3 under
-  // Flow is 0.943-0.992 on all five. So it is not "Flow past 400 residues":
-  // af3's Flow is fine there and boltz2's Flow is fine on a LONGER target
-  // (5CAJ A:B, 522, four seeds, 0.57-0.85).
-  //
-  // The two failing seeds fail under every template configuration - merged,
-  // cross-chain masked, per-chain, and none at all - so it is the initial draw.
-  // Flow takes one and walks down deterministically, so it never escapes a bad
-  // one; diffusion re-noises at every step and does. 🔴 AND NEITHER FAILURE IS
-  // VISIBLE: both pass the chain-geometry gate, and one reads pLDDT 85 against
-  // a good fold's 93.
-  flow: { label: "Flow", values: [16, 32, 64], preferred: 16 },
-  diffusion: { label: "Diffusion", values: [16, 25, 50, 100, 200], preferred: 16 },
 };
 
 /**
@@ -392,8 +273,7 @@ export const toPoints = (positions, count) => Array.from(
  * FITTED. AF3's sampler calls randomAugmentation at the top of every step - a
  * fresh rotation and translation of the whole system - so consecutive frames
  * differ by a rigid motion far larger than anything the denoiser did, and
- * unfitted playback is a protein tumbling. Flow mode rotates nothing, so there
- * the fit is a no-op that costs one superposition a frame.
+ * unfitted playback is a protein tumbling.
  *
  * 🔴 FITTED TO THE FIRST FRAME, NOT THE LAST, because the frames are shown as
  * they are computed and there is no last one yet.
@@ -423,7 +303,7 @@ export function fittedPdb(batch, positions, reference, slots, plddt, options = {
  * worth of work whatever was being folded. Measured, that ratio is 3.1 at 59
  * tokens and 15.3 at 256 - the trunk grows as L squared and the sampler barely
  * faster than linearly - so the bar raced through the trunk band and stalled on
- * anything long. src/runtime/cost-model.js has the fits and the measurements.
+ * anything long. webgpu/runtime/cost-model.js has the fits and the measurements.
  */
 function foldPlan({ tokens, rows, passes, calls, atoms }) {
   const plan = af3Plan({ tokens, rows, passes, calls, atoms });
@@ -469,7 +349,7 @@ const TRUNK_SPANS = af3TrunkStageSpans();
 /**
  * Fold one chain with AlphaFold 3.
  *
- * @param {{sequence: string, mode: "flow"|"diffusion", calls: number, seed: number,
+ * @param {{sequence: string, calls: number, seed: number,
  *          signal: AbortSignal, device: GPUDevice,
  *          alignment?: string|{paired?: string|null, unpaired?: string|null}|null,
  *          maxMsaSequences?: number,
@@ -483,8 +363,52 @@ const TRUNK_SPANS = af3TrunkStageSpans();
  *          onStatus: (text: string) => void, onProgress: (fraction: number) => void,
  *          onFrame?: (pdb: string, index: number) => void}} options
  */
+
+/** The trunk's template slot count, AlphaFold 3's `max_templates`. */
+const AF3_TEMPLATE_SLOTS = 4;
+
+/**
+ * Per-chain template slots packed the way AlphaFold 3 packs them (model/features.py,
+ * `Templates.compute_features`): each chain keeps its first four templates, and slot k holds
+ * EVERY chain's k-th template at that chain's own tokens - "concatenated on the num_res
+ * dimension", with the multichain mask keeping one chain's template from seeing another's.
+ *
+ * 🔴 ONE SLOT A CHAIN WAS WRONG, AND A HOMOMER FOUND IT: six copies of a chain with one template
+ * each are one slot in AlphaFold 3 and were six here, which the trunk's four slots refused
+ * ("6 templates for 4 slots"). It also split a complex's templates across slots, so a dialect
+ * that averages over PRESENT slots (rf3's) read each chain's template at a fraction of its weight.
+ *
+ * A slot built to span chains (`spanChains`: one structure placing several chains) is already a
+ * whole complex and keeps a slot of its own.
+ *
+ * @param {{chain: number, slot: object}[]} built in request order
+ * @returns {object[]} at most AF3_TEMPLATE_SLOTS slots
+ */
+export function packTemplateSlots(built) {
+  const spanning = built.filter(({ slot }) => slot.spanChains === true).map(({ slot }) => slot);
+  const byChain = new Map();
+  for (const { chain, slot } of built) {
+    if (slot.spanChains === true) continue;
+    if (!byChain.has(chain)) byChain.set(chain, []);
+    byChain.get(chain).push(slot);
+  }
+  const packed = [];
+  for (let k = 0; k < AF3_TEMPLATE_SLOTS; k += 1) {
+    const layer = [...byChain.values()].map((slots) => slots[k]).filter((slot) => slot !== undefined);
+    if (layer.length === 0) break;
+    const merged = mergeTemplateSlots(layer);
+    packed.push(layer.length === 1 ? merged : { ...merged, spanChains: false });
+  }
+  const slots = [...packed, ...spanning];
+  if (slots.length > AF3_TEMPLATE_SLOTS) {
+    throw new Error(`${slots.length} template slots: AlphaFold 3 takes ${AF3_TEMPLATE_SLOTS}`
+      + ` - at most ${AF3_TEMPLATE_SLOTS} templates a chain, including any that span chains`);
+  }
+  return slots;
+}
+
 export async function foldAf3(options) {
-  const { sequence, mode, calls, recycles, seed, signal, device, onStatus, onProgress } = options;
+  const { sequence, calls, recycles, seed, signal, device, onStatus, onProgress } = options;
   // 🔴 THE SLOTS ARE BUILT HERE, AFTER FEATURISATION, AND NOT BY THE CALLER.
   // They are indexed by TOKEN, and a caller has no way to know the token
   // layout: a modified residue is one token PER ATOM and a ligand is a chain of
@@ -506,6 +430,10 @@ export async function foldAf3(options) {
   // stay baked in reference-conformers.js, because every fold needs those.
   const componentCache = new Map();
   const component = async (code, what) => {
+    // a crosslinker's bridge is built in (shared/chem/crosslinkers.js), not a PDB entry
+    if (!componentCache.has(code) && CROSSLINKER_COMPONENTS[code] !== undefined) {
+      componentCache.set(code, parseCcdComponent(CROSSLINKER_COMPONENTS[code]));
+    }
     if (!componentCache.has(code)) {
       onStatus(`Fetching ${what} ${code}`);
       let response;
@@ -535,6 +463,12 @@ export async function foldAf3(options) {
   }
   const ligands = [];
   for (const entry of options.ligandCodes ?? []) {
+    if (entry.codes !== undefined) {      // several components as one chain (a glycan)
+      const parts = [];
+      for (const code of entry.codes) { await component(code, "ligand"); parts.push(componentCache.get(code)); }
+      ligands.push(ligandChain(parts));
+      continue;
+    }
     // 🔴 A LIGAND IS EITHER A CODE OR A STRUCTURE, AND IT SAYS WHICH RATHER
     // THAN BEING SNIFFED. A plain string is a CCD code, as it always was; an
     // object carrying `smiles` is a molecule drawn out. Guessing between them
@@ -547,7 +481,7 @@ export async function foldAf3(options) {
       // 🔴 AND IT IS BUILT, NOT FETCHED, WHICH IS THE WHOLE POINT. There is no
       // dictionary entry to look up: `smilesComponent` returns exactly what
       // `parseCcdComponent` returns, so nothing downstream can tell which
-      // producer made it. See src/chem/component.js.
+      // producer made it. See shared/chem/component.js.
       ligands.push(await smilesComponent(entry.smiles, { code: entry.code ?? "LIG" }));
       continue;
     }
@@ -560,6 +494,8 @@ export async function foldAf3(options) {
 
   const { batch, rows } = af3BatchFromA3m(sequence, alignment, {
     maxSequences: options.maxMsaSequences,
+    // a job's own alignments cover nucleic chains too: each column's alphabet
+    ...(options.msaColumnKinds === undefined ? {} : { msaColumnKinds: options.msaColumnKinds }),
     seed: options.seed ?? 0,
     ligands,
     modifications,
@@ -568,6 +504,9 @@ export async function foldAf3(options) {
     // different answer, and this literal is exactly the kind that loses a key.
     ...(options.bonds === undefined || options.bonds.length === 0
       ? {} : { bonds: options.bonds }),
+    // ...and its pocket and contact constraints (expandEntities' `constraints`), read by boltz2 and chai-1 alone
+    ...(options.constraints === undefined || options.constraints.length === 0
+      ? {} : { constraints: options.constraints, modelName: options.weights.trunk.dialect.name ?? "this model" }),
     // 🔴 THE BOND MATRIX IS PART OF THE MODEL, NOT OF THE MOLECULE. AF3 sets
     // contact[i][j] from the CCD's bond table alone; the OpenFold3 lineage was
     // trained with both directions set, and a ring ligand folded through the
@@ -607,15 +546,15 @@ export async function foldAf3(options) {
   // this before doing anything, not after.
   let budget = null;
   const plan = () => (budget ??= foldPlan({
-    tokens: batch.tokens, rows: rows.depth, passes, calls, atoms: batch.atomCount,
+    // (the rows a trunk pass reads - drawn from the pool each pass - not the pool: shared/af3/msa-draw.js)
+    tokens: batch.tokens, rows: Math.min(rows.depth, batch.numMsa ?? 1024), passes, calls, atoms: batch.atomCount,
   }));
   /**
    * The status line: what is running, and how far in.
    *
    * 🔴 THREE WORDS FOR THE WHOLE FOLD: Preparing, Trunk, Folding. What went was
    * the SAMPLER's name - the line used to read "Refining" or "Diffusing"
-   * depending on the mode, which is a distinction the mode dial already makes
-   * and a reader watching a bar has no reason to care about.
+   * depending on the sampler, which a reader watching a bar has no reason to care about.
    *
    * 🔴 TWO FIELDS, NOT SIX. It used to read "Trunk · pass 1 of 4 · pairformer
    * block 23 of 48", which is a number that changes forty-eight times a pass
@@ -702,19 +641,23 @@ export async function foldAf3(options) {
   }
   const templateSlots = options.templateSlots ?? (templateSources.length === 0
     ? undefined
-    : templateSources.map((template) => buildTemplate({
+    : packTemplateSlots(templateSources.map((template) => buildTemplate({
       text: template.text,
       chain: template.chainId,
       query: sequence.split(":")[template.chain] ?? "",
       tokens: batch.tokens,
       minConfidence: template.minConfidence ?? 0,
       spanChains: template.spanChains === true,
+      ...(template.mapping === undefined ? {} : { mapping: template.mapping }),
       tokenOf: (residue) => tokenOfResidue[(residuesOfChain[template.chain] ?? [])[residue]
         ?? -1] ?? -1,
-    })).map((built) => {
+      // (how this model reads a template's modified residues and altlocs: templatePolicyFor)
+      policy: templatePolicyFor(options.weights.trunk.dialect),
+    })).map((built, at) => {
+      if (built === null) return null;
       templateCoverage.push(built.coverage);
-      return built.slot;
-    }));
+      return { chain: templateSources[at].chain, slot: built.slot };
+    }).filter((one) => one !== null)));
 
   // 🔴 THE BATCH, BEFORE THE FOLD RATHER THAN AFTER IT. It is returned below
   // too, and that is too late for anything the TRUNK produces: the contact map
@@ -723,11 +666,25 @@ export async function foldAf3(options) {
   // the live map is collapsed the same way the final one is.
   options.onBatch?.(batch);
 
+  // 🔴 A WARM START IS A PREVIOUS FOLD'S PDB, laid out for THIS batch here - the one place both exist
+  // (shared/af3/structure/warm-start.js) - and handed to the sampler as dense coordinates
+  const start = options.start === undefined ? undefined
+    : { positions: startFromPdb(batch, options.start.pdb).positions, level: options.start.level };
+  // 🔴 STEERING IS NAMED BY CHAIN AND RESIDUE and the sampler pulls TOKENS, resolved here against the
+  // batch, the one place both exist (cpu/af3/diffusion/steering.js). `binder` and each contact's `asym`
+  // are the featuriser's 0-based chain order, as a constraint's are.
+  const steer = options.steer === undefined ? undefined : steerTokens(batch, options.steer);
+  // 🔴 A MOTIF IS NAMED BY TOKEN AND ATOM NAME (a negative token a whole chain, by asymId) and the
+  // sampler holds DENSE SLOTS: resolved here, the one place the batch exists (cpu/af3/diffusion/inpaint.js)
+  const motif = options.motif === undefined ? undefined
+    : { ...motifSlots(batch, options.motif.atoms), ...(options.motif.until === undefined ? {} : { until: options.motif.until }) };
   const result = await foldBatch(device, batch, options.weights, {
-    mode, steps: calls, recycles, seed, reuse: options.reuse, templateSlots,
-    // ...forwarded for probes that move the noise schedule. Unset for a page
-    // fold, which is AF3's own for the sampler and 160 A for the flow.
+    steps: calls, recycles, seed, reuse: options.reuse, templateSlots,
+    ...(steer === undefined ? {} : { steer }),
+    ...(motif === undefined ? {} : { motif }),
+    // ...forwarded for probes that move the noise schedule
     schedule: options.schedule,
+    ...(start === undefined ? {} : { start }),
     onStage: async (name, detail) => {
       throwIfAborted(signal);
       if (name === "recycle-done" && detail.trunk?.contactProbs !== undefined) {
@@ -937,7 +894,7 @@ export async function foldAf3(options) {
       iptm: result.iptm,
       // ...and one ipTM per interface, which the pooled one averages away on
       // more than two chains. Empty for a monomer; the same number as `iptm`
-      // for exactly two chains. See src/heads/tm-score.js.
+      // for exactly two chains. See shared/heads/tm-score.js.
       chainPairIptm: result.chainPairIptm,
       // ...and per chain: how well each one folded alone, and how well it sits
       // against the rest. Written into the archive's summary_confidences.
@@ -946,4 +903,28 @@ export async function foldAf3(options) {
       predictedAlignedError: result.scores.pae,
     },
   };
+}
+
+/**
+ * A steering request's chains and residues as the batch's token indices.
+ *
+ * @param {object} batch
+ * @param {{binder: number, contacts: {asym: number, residue: number}[], weight: number, cutoff?: number}} steer
+ * @returns {{binder: number[], pocket: number[], weight: number, cutoff?: number}}
+ */
+export function steerTokens(batch, steer) {
+  const binder = [];
+  const pocket = [];
+  for (let token = 0; token < batch.asymId.length; token += 1) {
+    const asym = batch.asymId[token] - 1;
+    if (asym === steer.binder) binder.push(token);
+    if (steer.contacts.some((c) => c.asym === asym && c.residue === batch.residueIndex[token])) pocket.push(token);
+  }
+  for (const c of steer.contacts) {
+    const found = pocket.some((token) => batch.asymId[token] - 1 === c.asym && batch.residueIndex[token] === c.residue);
+    if (!found) throw new Error(`steering names chain ${c.asym} residue ${c.residue}, which is no token of the input`);
+  }
+  if (binder.length === 0) throw new Error(`steering names chain ${steer.binder} as the binder, which has no tokens`);
+  const { binder: _b, contacts: _c, ...rest } = steer;
+  return { binder, pocket, ...rest };
 }

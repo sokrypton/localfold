@@ -143,7 +143,7 @@ export async function main(device, args) {
       // shader either way; what halves is the bytes the texture cache moves,
       // and the 32-bit arm is pinned at 2.50 TB/s of logical texel traffic
       // against this card's 1.5 TB/s of HBM. Exactly the trade
-      // src/runtime/storage.js makes with pack2x16float on the WebGPU side.
+      // webgpu/runtime/storage.js makes with pack2x16float on the WebGPU side.
       gl.texImage2D(gl.TEXTURE_2D, 0, internal, width, height, 0, gl.RGBA, gl.FLOAT, data);
       return tex;
     };

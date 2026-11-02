@@ -13,8 +13,8 @@
  * are fused into one weight - which changes no FLOP and no allocation. So this
  * kernel answers the AF3 question before any AF3 code exists.
  */
-import { createDeterministicTriangleInput } from "../../src/testing/deterministic-input.js";
-import { TriangleMultiplicationOutgoingGpu } from "../../src/kernels/triangle/webgpu.js";
+import { createDeterministicTriangleInput } from "../../webgpu/testing/deterministic-input.js";
+import { TriangleMultiplicationOutgoingGpu } from "../../webgpu/kernels/triangle/webgpu.js";
 
 function option(args, name, fallback) {
   const prefix = `--${name}=`;

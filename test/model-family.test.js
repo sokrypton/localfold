@@ -18,7 +18,7 @@ import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
 
 import { AF3_FAMILIES, FOLDING_FAMILIES, MODEL_BUNDLES }
-  from "../src/bundles/manifests/index.js";
+  from "../shared/bundles/manifests/index.js";
 
 const app = readFileSync(new URL("../web/app.js", import.meta.url), "utf8");
 const page = readFileSync(new URL("../index.html", import.meta.url), "utf8");
@@ -26,7 +26,7 @@ const page = readFileSync(new URL("../index.html", import.meta.url), "utf8");
 describe("the AlphaFold 3 families", () => {
   it("lists every bundle that builds that graph, and only those", () => {
     assert.deepEqual([...AF3_FAMILIES].sort(),
-                     ["af3", "boltz2", "intellifold2", "openbind0", "opendde",
+                     ["af3", "boltz2", "intellifold2", "mol1", "openbind0", "opendde",
                       "protenix2", "rosettafold3"]);
     for (const family of AF3_FAMILIES) {
       assert.ok(family in MODEL_BUNDLES, `${family} has no bundle`);
@@ -92,10 +92,14 @@ describe("the AlphaFold 3 families", () => {
   // direction: a dropdown offering a family with no bundle fails at load.
   it("names no family it does not have", () => {
     const app = readFileSync(new URL("../web/app.js", import.meta.url), "utf8");
+    // ...a family a NATIVE port folds counts, where the page declares it so: biohub's released ESMFold2-Fast is the
+    // ESM-C 6B choice on this row, and no WebGPU bundle exists for it (web/native-bridge.js shows it from /health)
+    const nativeOnly = [...(app.match(/const NATIVE_ONLY_FAMILIES = \[([^\]]*)\]/)?.[1] ?? "")
+      .matchAll(/"([\w-]+)"/g)].map((m) => m[1]);
     const variants = app.slice(app.indexOf("const PLM_FAMILIES = {"));
     for (const [, family] of variants.slice(0, variants.indexOf("};"))
         .matchAll(/"(ef2-[\w-]+)"/g)) {
-      assert.ok(FOLDING_FAMILIES.includes(family),
+      assert.ok(FOLDING_FAMILIES.includes(family) || nativeOnly.includes(family),
         `PLM_FAMILIES names ${family}, which is not a folding family`);
     }
   });
@@ -189,8 +193,8 @@ describe("what a fold is called", () => {
 
   it("uses it on both fold paths, not just the AlphaFold 3 one", () => {
     const uses = [...app.matchAll(/MODEL_STEMS\[family\]/g)];
-    assert.equal(uses.length, 2,
-      "MODEL_STEMS should name the object on the AF3 path and the AF2 path");
+    assert.equal(uses.length, 3,
+      "MODEL_STEMS should name the object on the AF3 path, the AF2 path and the BioEmu2 path");
   });
 
   /**
@@ -217,8 +221,8 @@ describe("what a fold is called", () => {
     assert.ok(body.includes("uniqueStem("), "foldStem does not uniquify");
     assert.ok(body.indexOf("header === null ? fallback") > 0,
               "the model prefix must be the fallback, never an override");
-    assert.equal([...app.matchAll(/foldStem\(/g)].length, 4,
-      "foldStem should be declared once and called on all three fold paths");
+    assert.equal([...app.matchAll(/foldStem\(/g)].length, 5,
+      "foldStem should be declared once and called on all four fold paths");
   });
 
   /**
@@ -283,7 +287,7 @@ describe("the trunk cache", () => {
 describe("?model= in the URL", () => {
   it("does not resolve of3 to openbind0", () => {
     // 🔴 THEY ARE DIFFERENT MODELS. OpenFold3's preview-2 and its v0.5.0
-    // release differ in forward conventions - see src/af3/dialect.js - so
+    // release differ in forward conventions - see shared/af3/dialect.js - so
     // quietly accepting one name for the other hands somebody a model they did
     // not ask for, which is the whole class of error this port guards against.
     const aliases = app.match(/const MODEL_ALIASES = \{([^}]*)\}/s);

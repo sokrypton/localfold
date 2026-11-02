@@ -35,7 +35,7 @@
  */
 import { CHAIN_IDS, paeMatrix, safeJobName } from "./prediction-results.js";
 import { jobRequestJson } from "./job-json.js";
-import { coordinateAtoms } from "../src/heads/superpose-pdb.js";
+import { coordinateAtoms } from "../shared/heads/superpose-pdb.js";
 
 /**
  * 🔴 TWO DECIMALS, WHICH IS WHAT THE SERVER WRITES. Not cosmetic: `full_data`
@@ -175,7 +175,7 @@ export function fullDataJson({ confidence, alignedError, pdb, tokenChainIds, tok
   } else if (alignedError !== undefined) {
     // 🔴 A DIFFERENT KEY, BECAUSE IT IS A DIFFERENT PROVENANCE. This is
     // estimated from the distogram rather than predicted by a confidence head
-    // (src/esmfold2/aligned-error.js), and `pae` is the key a reader parses
+    // (shared/esmfold2/aligned-error.js), and `pae` is the key a reader parses
     // expecting the server's - the same care `atom_certainty` takes with the
     // B-factor column. It is still a predicted aligned error, and it is still
     // in angstroms; what it is not is this model's own head's opinion.
@@ -240,7 +240,7 @@ function asymOrder(confidence, chainCount) {
  * so an unfiltered maximum reports 1.00 for every chain and says nothing. The
  * rule is the one used everywhere else here - the same chain and within six
  * RESIDUES, which drops a ligand's whole self-block because its atoms share a
- * residue number. See ../src/heads/contact-threshold.js for why a token index
+ * residue number. See ../shared/heads/contact-threshold.js for why a token index
  * would not do.
  */
 export function chainPairMaxContact(contactProbs, tokenChainIds, tokenResIds, chains) {
@@ -617,6 +617,11 @@ export function buildFoldArchive({
   // back that there is nothing to reconstruct.
   if (msas.merged) files.set(`msas/${name}_merged_msa.a3m`, msas.merged);
 
+  // 🔴 AND AN INDEX BESIDE THEM, because the file name says which FOLD chain a
+  // template served and not which chain of the STRUCTURE it was - 1BRS's
+  // barstar is chain D - and without that a dropped archive could only ask
+  // for a search again. `templatesFromArchive` reads it back.
+  const templateIndex = [];
   (templates ?? []).forEach((template, index) => {
     if (!template?.text) return;
     // ...named by what it IS. The server's are always mmCIF; ours come from
@@ -624,9 +629,14 @@ export function buildFoldArchive({
     // endpoint as mmCIF, so the extension follows the bytes.
     const cif = /^\s*(data_|#|loop_|_)/m.test(template.text.slice(0, 4096));
     const letter = chainLetter(template.chain ?? 0).toLowerCase();
-    files.set(`templates/${name}_template_hit_${index}_chains_${letter}`
-      + `.${cif ? "cif" : "pdb"}`, template.text);
+    const file = `templates/${name}_template_hit_${index}_chains_${letter}.${cif ? "cif" : "pdb"}`;
+    files.set(file, template.text);
+    templateIndex.push({ file, chain: template.chain ?? 0,
+                         structureChain: template.chainId ?? null, source: template.source ?? null });
   });
+  if (templateIndex.length > 0) {
+    files.set(`templates/${name}_templates.json`, JSON.stringify(templateIndex, null, 1));
+  }
 
   files.set("README.md", readme({
     // 🔴 UNDEFINED MEANS "THIS MODEL HAS NONE", AS `msaOrigin` DOES. EF2-fast
@@ -683,4 +693,22 @@ export function msasFromArchive(files) {
     if (/^msas\/.*_merged_msa\.a3m$/i.test(path)) merged = text;
   }
   return { chainA3ms, pairedA3ms: paired, chains: highest + 1, merged };
+}
+
+/**
+ * The templates a fold ARCHIVE used, from the index `buildFoldArchive` writes
+ * beside them: `[{chain, text, structureChain, filename}]`, fold-chain order.
+ * An archive without the index (the AF3 server's, or an older one of ours)
+ * gives none - its files name no structure chain to take.
+ *
+ * @param {Map<string, string>} files from readZip
+ */
+export function templatesFromArchive(files) {
+  const indexName = [...files.keys()].find((path) => /^templates\/.*_templates\.json$/.test(path));
+  if (indexName === undefined) return [];
+  return JSON.parse(files.get(indexName))
+    .filter((entry) => files.has(entry.file))
+    .map((entry) => ({ chain: entry.chain, text: files.get(entry.file),
+                       structureChain: entry.structureChain ?? undefined,
+                       filename: entry.source ?? entry.file.split("/").pop() }));
 }

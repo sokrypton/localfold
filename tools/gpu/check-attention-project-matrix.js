@@ -20,14 +20,14 @@ import {
   ATTENTION_OUTPUT_TILE, ATTENTION_PROJECT_TILE, attentionOutputTileColumns,
   attentionOutputTileRows, createAttentionOutputShader, createAttentionProjectShader,
   packAttentionWeights,
-} from "../../src/kernels/attention.js";
+} from "../../webgpu/kernels/attention.js";
 import {
   attentionOutputMatrixDispatch, attentionProjectMatrixDispatch,
   attentionProjectMatrixFits, createAttentionOutputMatrixShader,
   createAttentionProjectMatrixShader,
-} from "../../src/kernels/attention-project-matrix.js";
-import { stagedMatrixBlock } from "../../src/kernels/matrix-linear.js";
-import { deviceMatrixConfig, deviceTuning } from "../../src/runtime/device-profile.js";
+} from "../../webgpu/kernels/attention-project-matrix.js";
+import { stagedMatrixBlock } from "../../webgpu/kernels/matrix-linear.js";
+import { deviceMatrixConfig, deviceTuning } from "../../webgpu/runtime/device-profile.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;

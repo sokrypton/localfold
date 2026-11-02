@@ -15,11 +15,11 @@
  * The wrapped tool's own result is returned under `tool`, so a gate does not
  * stop being a gate when it is measured.
  */
-import { blockUploadStats } from "../../src/weights/quantised-upload.js";
-import { residentPackStats } from "../../src/runtime/resident.js";
-import { tensorDecodeStats } from "../../src/bundles/http-tensor-store.js";
-import { pipelineCacheStats } from "../../src/runtime/pipeline-cache.js";
-import { shaderSourceStats } from "../../src/runtime/shader-source-cache.js";
+import { blockUploadStats } from "../../webgpu/weights/quantised-upload.js";
+import { residentPackStats } from "../../webgpu/runtime/resident.js";
+import { tensorDecodeStats } from "../../shared/bundles/http-tensor-store.js";
+import { pipelineCacheStats } from "../../webgpu/runtime/pipeline-cache.js";
+import { shaderSourceStats } from "../../webgpu/runtime/shader-source-cache.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
