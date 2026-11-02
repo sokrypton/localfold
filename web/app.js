@@ -3998,21 +3998,13 @@ function bioemu2Physicality(featurised, samples) {
 }
 
 /**
- * BioEmu2's card: no confidence head, so the one cell is its physicality report ("5/5 pass") - and no report, no
- * card, rather than a cell saying what the model does not have.
- */
-function showPhysicality(summary) {
-  updateScoresCard(summary === "" ? undefined : { none: true, title: "Physicality", label: summary });
-}
-
-/**
  * A BioEmu2 fold on this page's WebGPU (webgpu/bioemu2).
  *
  * 🔴 NO CONFIDENCE HEAD. BioEmu2 predicts a structure (or an ensemble) and a
  * distogram, and nothing about how much to believe either; the scores card
- * holds its physicality report instead (showPhysicality), the structure is
- * coloured by chain (forcePlddtColours(false): a pLDDT ramp over an empty
- * B-factor paints a claim), and the contact map is the distogram's - or, for an
+ * is hidden (its physicality report is on the status line), the structure is
+ * coloured by py2Dmol's "auto" (chains for a complex, a rainbow for one chain:
+ * a pLDDT ramp over an empty B-factor paints a claim), and the contact map is the distogram's - or, for an
  * ensemble, how often each pair is in contact across the samples.
  *
  * 🔴 SAMPLES ARE FRAMES. Every sample is one denoiser call's batch member, so a
@@ -4151,7 +4143,7 @@ async function foldWithBioemu2({ chains, chainKinds, alignment, alignmentBlocks,
       if (liveContacts !== undefined) frame.maps = { contact: liveContacts };
       renderer.addFrame(frame, renderer.currentObjectName);
       renderer.setFrame(object.frames.length - 1);
-      if (!colouring) { colouring = setColourMode("chain"); orientBestView(renderer); }
+      if (!colouring) { colouring = setColourMode("auto"); orientBestView(renderer); }
     } catch (cause) {
       console.warn("live frame skipped:", cause);
     }
@@ -4180,7 +4172,7 @@ async function foldWithBioemu2({ chains, chainKinds, alignment, alignmentBlocks,
       }
       showEnsemble(renderer, object, landed.map((_, at) => at));
       renderer.setFrame(object.frames.length - 1);
-      if (!colouring) { colouring = setColourMode("chain"); orientBestView(renderer); }
+      if (!colouring) { colouring = setColourMode("auto"); orientBestView(renderer); }
     } catch (cause) {
       console.warn("ensemble frames skipped:", cause);
     }
@@ -4276,13 +4268,13 @@ async function foldWithBioemu2({ chains, chainKinds, alignment, alignmentBlocks,
     landed.length = 0;
     landed.push(...result.samples);
     if (object !== undefined) showEnsemble(viewer, object, order);
-    forcePlddtColours(false);
+    setColourMode("auto");
     viewer.setFrame(0);
     viewer.render("bioemu2-final");
   }
   // 🔴 BioEmu2's OWN PHYSICALITY REPORT, per sample, in place of a confidence (bioemu2Physicality)
   const { report: physicality, line: physicalityLine, summary } = bioemu2Physicality(featurised, ordered);
-  showPhysicality(summary);
+  updateScoresCard(undefined);
   recordPrediction({
     stem, pdb: pdbs[0], chains, confidence: undefined, scores: JSON.stringify(scores, null, 2),
     chainLengths: chains.map((chain) => chain.length),
@@ -4682,7 +4674,7 @@ async function nativeBioemu2Samples(result, prediction) {
         viewer.addFrame(frame, viewerObject);
       } catch (cause) { console.warn("sample skipped:", cause); }
     }
-    forcePlddtColours(false);
+    setColourMode("auto");
     viewer.setFrame(0);
     viewer.render("bioemu2-final");
   }
@@ -4703,7 +4695,7 @@ async function nativeBioemu2Samples(result, prediction) {
     console.warn("physicality report skipped:", cause);
     lastBioemu2 = { pdb: result.samples[0] };
   }
-  showPhysicality(summary);
+  updateScoresCard(undefined);
   result.status = `${result.status ?? ""}${line}`;
 }
 
