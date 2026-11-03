@@ -36,6 +36,8 @@ import { join, dirname } from "node:path";
 import { featuriseBioemu2, bioemu2JobFromAf3Json, parseContacts, addPropagation, METHOD } from "../../shared/bioemu2/featurise.js";
 import { ccdUrl, ELEMENT_SYMBOLS } from "../../shared/af3/featurise/ccd-component.js";
 import { STANDARD_COMPONENTS } from "../../shared/af3/featurise/standard-components.js";
+import { CROSSLINKER_COMPONENTS } from "../../shared/chem/crosslinkers.js";
+import { pdbLinkRecords } from "../../shared/af3/structure/pdb.js";
 import { smilesTemplates as pageSmilesTemplates, splitA3mByChains } from "../../shared/bioemu2/inputs.js";
 import { steeringTables, parseStereoTables, STEREO_URL, STEREO_COMMIT } from "../../shared/bioemu2/steering-tables.js";
 
@@ -77,6 +79,7 @@ const cacheDir = join(homedir(), ".cache", "localfold", "ccd");
 const texts = new Map();
 for (const code of needed) {
   if (STANDARD_COMPONENTS[code]) continue;
+  if (CROSSLINKER_COMPONENTS[code]) continue;   // a crosslinker's bridge: built in, read by the featuriser itself
   if (userComponents.has(code)) { texts.set(code, userComponents.get(code)); continue; }
   const fixture = join(here, "..", "..", "tools", "fixtures", "ccd", `${code}.cif`);
   const cached = join(cacheDir, `${code}.cif`);
@@ -270,7 +273,12 @@ chainOrder.forEach((id, c) => {
   }
   records.push("TER");
 });
-const pdb = records.join("\n") + "\nEND\n";
+// ...and a LINK record for each declared bond (a crosslink's two among them), first, as the page's writer puts them:
+// the native port copies every line that is not an atom record, so the fold's PDB carries them
+const letterOf = new Map(chainOrder.map((id, c) => [id, id.length === 1 ? id : CHAIN_CHARACTERS[c % CHAIN_CHARACTERS.length]]));
+const links = pdbLinkRecords(records, (job.bondedAtomPairs ?? []).map((pair) =>
+  pair.map(([id, residue, atom]) => [letterOf.get(id) ?? id, residue, atom])));
+const pdb = [...links, ...records].join("\n") + "\nEND\n";
 writeFileSync(`${out}/pdb.template`, pdb);
 writeFileSync(`${out}/confidence.template.json`, JSON.stringify({
   tokens: outTokens, token_chain_ids: tokenChainIds, token_res_ids: tokenResIds,

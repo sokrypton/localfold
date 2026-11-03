@@ -13,6 +13,7 @@ import { toPdb } from "../shared/af3/structure/pdb.js";
 
 const SEQ_A = "MKTAYIAKQRQISFVKSHFSRQ";   // M1 K2 T3 A4 Y5 K8 S13 K16
 const SEQ_B = "GSKELAAKLGKEAYEK";         // G1 S2 K3 K8 G10 K11 Y14
+const job_ = (crosslinks) => job(crosslinks);
 const row = (type, value) => ({ type, value, copies: 1, modifications: [] });
 const proteins = () => [row("protein", SEQ_A), row("protein", SEQ_B)];
 const job = (crosslinks) => JSON.stringify({
@@ -126,5 +127,32 @@ describe("a crosslink expanded", () => {
     const pdb = toPdb(batch, positions, null, { links: out.bonds });
     expect(pdb.indexOf("LINK") < pdb.indexOf("ATOM")).toBe(true);
     expect(toPdb(batch, positions, null).includes("LINK")).toBe(false);
+  });
+});
+
+describe("a crosslink through BioEmu2", () => {
+  it("is a bridge chain bonded to its two residues, read into token_bonds, and written as LINK records", async () => {
+    const { bioemu2JobFromAf3Json, featuriseBioemu2 } = await import("../shared/bioemu2/featurise.js");
+    const { bioemu2Pdb } = await import("../shared/bioemu2/structure.js");
+    const job = bioemu2JobFromAf3Json(JSON.parse(job_([{ name: "DSSO", residue_pairs: [[["A", 2], ["B", 3]]] }])));
+    const [d1, d2] = CROSSLINKERS.DSSO.attach;
+    expect(job.chains.map((c) => `${c.id}:${c.kind}`)).toEqual(["A:protein", "B:protein", "C:ligand"]);
+    expect(job.chains[2].ccdCodes).toEqual(["XL-DSSO"]);
+    expect(job.bondedAtomPairs).toEqual([[["A", 2, "NZ"], ["C", 1, d1]], [["B", 3, "NZ"], ["C", 1, d2]]]);
+    const { features, atomKeys, topology } = featuriseBioemu2(job, {});
+    const T = features.residue_index.length;
+    // residue A2 (token 1) and B3 (token 22 + 2) each bonded to a bridge token
+    const bonded = (i) => { for (let j = SEQ_A.length + SEQ_B.length; j < T; j += 1) if (features.token_bonds[i * T + j]) return true; return false; };
+    expect(bonded(1) && bonded(SEQ_A.length + 2)).toBe(true);
+    const links = bioemu2Pdb(atomKeys, topology, new Float32Array(atomKeys.length * 3), { links: job.bondedAtomPairs })
+      .split("\n").filter((l) => l.startsWith("LINK"));
+    expect(links.map((l) => [l.slice(12, 16).trim(), l[21], +l.slice(22, 26), l.slice(42, 46).trim(), l[51]]))
+      .toEqual([["NZ", "A", 2, d1, "C"], ["NZ", "B", 3, d2, "C"]]);
+  });
+  it("refuses an end it cannot bond, in its own words", async () => {
+    const { bioemu2JobFromAf3Json } = await import("../shared/bioemu2/featurise.js");
+    expect(() => bioemu2JobFromAf3Json(JSON.parse(job_([{ name: "DSS", residue_pairs: [[["A", 4], ["B", 3]]] }]))))
+      .toThrow(/NHS ester .* not ALA/);
+    expect(() => bioemu2JobFromAf3Json(JSON.parse(job_([{ name: "EDC", residue_pairs: [] }])))).toThrow(/unknown crosslinker EDC/);
   });
 });

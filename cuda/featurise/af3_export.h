@@ -626,7 +626,8 @@ inline Af3Export exportAf3(const Args& args) {
   // passes - in the exporter's order
   std::vector<std::string> chains = splitOn(sequence, ':');
   addTemplates(out, args, batch, D, chains, jobTemplates, haveJob ? &request : nullptr, found);
-  try { out.pdb = pdbTemplateText(batch); }
+  // (the job's declared bonds as LINK records, as export-model.mjs passes them to toPdb)
+  try { out.pdb = pdbTemplateText(batch, haveJob ? &request.bonds : nullptr); }
   catch (const std::exception& e) { out.said.push_back(std::string("no PDB template (") + e.what() + "); the native writer will name residues itself"); }
   return out;
 }

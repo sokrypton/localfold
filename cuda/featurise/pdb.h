@@ -35,7 +35,38 @@ inline std::string toFixed(double v, int digits) {
   return (negative ? "-" : "") + out;     // (-0.0001).toFixed(3) is "-0.000" in JavaScript, and (-0).toFixed(3) "0.000"
 }
 
-inline std::string pdbText(const Batch& b, const std::vector<float>& positions) {
+// shared/af3/structure/pdb.js linkLine: the LINK record joining two atom records (or their heads) - name 13-16,
+// residue name 18-20, chain 22, residue number 23-26, the second end from column 43
+inline std::string linkLine(const std::string& a, const std::string& b) {
+  auto end = [](const std::string& r) { return r.substr(12, 4) + " " + r.substr(17, 3) + " " + r.substr(21, 5) + " "; };
+  return "LINK        " + end(a) + std::string(15, ' ') + end(b);
+}
+
+// shared/af3/structure/pdb.js pdbLinkRecords: LINK records for declared bonds over a PDB's own atom records, each end
+// (chain letter, residue, atom) as the records spell it - BioEmu2's writer, which has no batch
+struct LinkEnd { std::string chain; int residue; std::string atom; };
+inline std::vector<std::string> pdbLinkRecords(const std::vector<std::string>& records,
+                                               const std::vector<std::pair<LinkEnd, LinkEnd>>& bonds) {
+  std::vector<std::string> lines;
+  if (bonds.empty()) return lines;
+  std::map<std::string, std::string> byAtom;
+  for (auto& r : records) {
+    if (r.rfind("ATOM", 0) != 0 && r.rfind("HETATM", 0) != 0) continue;
+    std::string key = r.substr(21, 1) + ":" + std::to_string(std::stoi(r.substr(22, 4))) + ":" + trimWs(r.substr(12, 4));
+    byAtom.emplace(key, r);
+  }
+  for (auto& [from, to] : bonds) {
+    auto a = byAtom.find(from.chain + ":" + std::to_string(from.residue) + ":" + from.atom);
+    auto c = byAtom.find(to.chain + ":" + std::to_string(to.residue) + ":" + to.atom);
+    if (a != byAtom.end() && c != byAtom.end()) lines.push_back(linkLine(a->second, c->second));
+  }
+  return lines;
+}
+
+// toPdb's options.links: a LINK record per declared bond both of whose ends name an atom the batch wrote, keyed by
+// (asymId - 1, residue_index, atom name) as shared/af3/structure/pdb.js linkRecords keys them; first, before the atoms
+inline std::string pdbText(const Batch& b, const std::vector<float>& positions,
+                           const std::vector<DeclaredBond>* links = nullptr) {
   static const std::map<char, std::string> THREE = {{'A', "ALA"}, {'R', "ARG"}, {'N', "ASN"}, {'D', "ASP"}, {'C', "CYS"},
     {'Q', "GLN"}, {'E', "GLU"}, {'G', "GLY"}, {'H', "HIS"}, {'I', "ILE"}, {'L', "LEU"}, {'K', "LYS"}, {'M', "MET"},
     {'F', "PHE"}, {'P', "PRO"}, {'S', "SER"}, {'T', "THR"}, {'W', "TRP"}, {'Y', "TYR"}, {'V', "VAL"}};
@@ -50,6 +81,7 @@ inline std::string pdbText(const Batch& b, const std::vector<float>& positions) 
     return trimWs(name);
   };
   std::vector<std::string> lines;
+  std::map<std::string, std::string> headOf;     // (asym, residue, atom) -> its record's head, for the LINK records
   std::map<int, int> serialOfToken;
   int serial = 1;
   for (int token = 0; token < b.tokens; ++token) {
@@ -76,6 +108,7 @@ inline std::string pdbText(const Batch& b, const std::vector<float>& positions) 
       std::string head = std::string(ligand == componentOf.end() ? "ATOM  " : "HETATM") + padStart(std::to_string(serial % 100000), 5) + " "
         + (name.size() < 4 ? padEnd(" " + name, 4) : name.substr(0, 4)) + " " + padEnd(resName, 3).substr(0, 3) + " "   // three columns (shared/af3/structure/pdb.js)
         + CHAINS[(b.asymId[token] - 1) % (int)CHAINS.size()] + padStart(std::to_string(b.residueIndex[token]), 4) + "    ";
+      if (links) headOf.emplace(std::to_string(b.asymId[token] - 1) + ":" + std::to_string(b.residueIndex[token]) + ":" + name, head);
       lines.push_back(head + padStart(toFixed(positions[slot * 3], 3), 8) + padStart(toFixed(positions[slot * 3 + 1], 3), 8)
                       + padStart(toFixed(positions[slot * 3 + 2], 3), 8)
                       + "  1.00" + padStart(toFixed(0, 2), 6) + "          " + padStart(symbol, 2));
@@ -103,16 +136,26 @@ inline std::string pdbText(const Batch& b, const std::vector<float>& positions) 
       lines.push_back(line);
     }
   lines.push_back("END");
+  if (links) {
+    std::vector<std::string> linkLines;
+    for (auto& bond : *links) {
+      if (!bond.from.hasAtom || bond.from.atom.empty() || !bond.to.hasAtom || bond.to.atom.empty()) continue;
+      auto a = headOf.find(std::to_string(bond.from.asym) + ":" + std::to_string(bond.from.residue) + ":" + bond.from.atom);
+      auto c = headOf.find(std::to_string(bond.to.asym) + ":" + std::to_string(bond.to.residue) + ":" + bond.to.atom);
+      if (a != headOf.end() && c != headOf.end()) linkLines.push_back(linkLine(a->second, c->second));
+    }
+    lines.insert(lines.begin(), linkLines.begin(), linkLines.end());
+  }
   std::string out;
   for (size_t i = 0; i < lines.size(); ++i) out += (i ? "\n" : "") + lines[i];
   return out + "\n";
 }
 
 // the exporter's template.pdb: each atom's dense slot as its x coordinate
-inline std::string pdbTemplateText(const Batch& b) {
+inline std::string pdbTemplateText(const Batch& b, const std::vector<DeclaredBond>* links = nullptr) {
   std::vector<float> slots((size_t)b.tokens * b.dense * 3, 0.0f);
   for (size_t i = 0; i < (size_t)b.tokens * b.dense; ++i) slots[i * 3] = (float)i;
-  return pdbText(b, slots);
+  return pdbText(b, slots, links);
 }
 
 }  // namespace lf

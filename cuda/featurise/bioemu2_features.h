@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "ccd.h"
+#include "crosslinks.h"
 #include "json.h"
 #include <array>
 #include <functional>
@@ -171,6 +172,8 @@ inline std::string componentText(const CcdReader& ccd, const std::string& code) 
   auto& standard = standardComponentTexts();
   auto it = standard.find(code);
   if (it != standard.end()) return it->second;
+  // (a crosslinker's bridge is built in, as on the AF3 path: XL-<name> is no CCD entry)
+  if (const std::string* bridge = crosslinkerComponent(code)) return *bridge;
   return ccd(code);
 }
 
@@ -228,6 +231,74 @@ struct Job { std::vector<Chain> chains; std::vector<std::pair<AtomRef, AtomRef>>
 struct ContactToken { std::string chain; int residue; bool hasAtom; std::string atom; };
 struct Contact { ContactToken a, b; double distance; };
 
+// A..Z, then AA, AB, ... (shared/bioemu2/featurise.js chainLetterAt)
+inline std::string chainLetterAt(int index) {
+  std::string out;
+  for (int n = index + 1; n > 0; n = (n - 1) / 26) out = std::string(1, (char)('A' + (n - 1) % 26)) + out;
+  return out;
+}
+
+// af3x's `crosslinks`: each pair a ligand chain of the bridge (XL-<name>) after every other chain, bonded to its two
+// residues as declared bonds (shared/bioemu2/featurise.js crosslinkChains)
+inline void crosslinkChains(const Json* crosslinks, Job& job) {
+  if (Json::absent(crosslinks)) return;
+  static const std::map<char, std::string> three = {{'A', "ALA"}, {'R', "ARG"}, {'N', "ASN"}, {'D', "ASP"},
+    {'C', "CYS"}, {'Q', "GLN"}, {'E', "GLU"}, {'G', "GLY"}, {'H', "HIS"}, {'I', "ILE"}, {'L', "LEU"}, {'K', "LYS"},
+    {'M', "MET"}, {'F', "PHE"}, {'P', "PRO"}, {'S', "SER"}, {'T', "THR"}, {'W', "TRP"}, {'Y', "TYR"}, {'V', "VAL"}};
+  std::set<std::string> used;
+  for (auto& c : job.chains) used.insert(c.id);
+  int next = 0;
+  for (size_t index = 0; index < crosslinks->a.size(); ++index) {
+    const Json& entry = crosslinks->a[index];
+    const Json* nameJson = entry.get("name");
+    std::string name = Json::absent(nameJson) ? std::string() : nameJson->s;
+    const CrosslinkerEntry* xl = crosslinker(name);
+    if (xl == nullptr) throw std::runtime_error("BioEmu2: crosslinks[" + std::to_string(index) + "]: unknown crosslinker " + name);
+    const Json* pairs = entry.get("residue_pairs");
+    if (Json::absent(pairs)) continue;
+    for (auto& pair : pairs->a) {
+      std::vector<AtomRef> ends;
+      for (int k = 0; k < 2; ++k) {
+        std::string chainId = pair.a.at(k).a.at(0).s;
+        int residue = (int)pair.a.at(k).a.at(1).n;
+        std::string where = "crosslink " + name + ": " + chainId + std::to_string(residue);
+        const Chain* chain = nullptr;
+        for (auto& c : job.chains) if (c.id == chainId) { chain = &c; break; }
+        if (chain == nullptr || chain->kind != "protein") throw std::runtime_error("BioEmu2: " + where + " is not a protein residue");
+        if (!(residue >= 1 && residue <= (int)chain->sequence.size()))
+          throw std::runtime_error("BioEmu2: " + where + " is past the chain's end");
+        std::string restype;
+        for (auto& m : chain->modifications) if (m.position == residue) { restype = m.code; break; }
+        if (restype.empty()) {
+          auto it = three.find(chain->sequence[residue - 1]);
+          restype = it == three.end() ? "UNK" : it->second;
+        }
+        std::string atom;
+        if ((k == 0 ? xl->end1 : xl->end2) == "nhs") {
+          if (auto* a = crosslinkLookup(crosslinkNhsAtoms(), restype)) atom = *a;
+          else if (residue == 1) atom = "N";
+          else throw std::runtime_error("BioEmu2: " + where + ": an NHS ester reacts with K, S, T, Y or the N-terminus, not " + restype);
+        } else {
+          auto* a = crosslinkLookup(crosslinkDiazirineAtoms(), restype);
+          if (a == nullptr) throw std::runtime_error("BioEmu2: " + where + ": no side-chain atom known for " + restype);
+          atom = *a;
+        }
+        ends.push_back(AtomRef{chainId, residue, atom});
+      }
+      while (used.count(chainLetterAt(next))) ++next;
+      std::string id = chainLetterAt(next);
+      used.insert(id);
+      Chain bridge;
+      bridge.id = id;
+      bridge.kind = "ligand";
+      bridge.ccdCodes = {xl->code};
+      job.chains.push_back(bridge);
+      job.bonds.push_back({ends[0], AtomRef{id, 1, xl->attach1}});
+      job.bonds.push_back({ends[1], AtomRef{id, 1, xl->attach2}});
+    }
+  }
+}
+
 // bioemu2JobFromAf3Json
 inline Job jobFromAf3Json(const Json& json) {
   Job job;
@@ -273,6 +344,7 @@ inline Job jobFromAf3Json(const Json& json) {
       auto end = [](const Json& p) { return AtomRef{p.a.at(0).s, (int)p.a.at(1).n, p.a.at(2).s}; };
       job.bonds.push_back({end(pair.a.at(0)), end(pair.a.at(1))});
     }
+  crosslinkChains(json.get("crosslinks"), job);
   return job;
 }
 

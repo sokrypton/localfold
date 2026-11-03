@@ -372,7 +372,7 @@ inline Esmfold2Export exportEsmfold2(const Args& args) {
       positions[(size_t)slot * 3] = (float)(atom / 1000);
       positions[(size_t)slot * 3 + 1] = (float)(atom % 1000);
     }
-    out.pdb = pdbText(b, positions);
+    out.pdb = pdbText(b, positions, haveJob ? &request.bonds : nullptr);   // (export_input.mjs passes the job's bonds)
   }
   return out;
 }

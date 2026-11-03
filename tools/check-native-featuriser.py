@@ -298,6 +298,11 @@ def cases():
         ("ef2-1brs-a3m-max-msa", "ef2", job("t", [protein("A", brs_a), protein("D", brs_d)]),
          [f"--a3m={sa},{sd}", "--max-msa=7"], EF),
         ("ef2-max-msa-refused", "ef2", job("t", [protein("A", SEQ_6MRR)]), ["--max-msa=1.5"], EF),
+        # af3x's crosslinks through ESMFold2: the bridge bonded to its residues, and both bonds as LINK records in the
+        # PDB template (which the port copies into the fold's PDB)
+        ("ef2-crosslinks", "ef2", job("t", [protein("A", "MKTAYIAKQRQISFVKSHFSRQ"), protein("B", "GSKELAAKLGKEAYEK")],
+                                      crosslinks=[{"name": "DSSO", "residue_pairs": [[["A", 2], ["B", 3]]]},
+                                                  {"name": "sulfo-SDA", "residue_pairs": [[["A", 1], ["B", 10]]]}]), [], EF),
     ]
     # BioEmu2 (cuda/bioemu2/export_input.mjs): its own featuriser (shared/bioemu2/featurise.js), the page's SMILES
     # templates and alignment split (shared/bioemu2/inputs.js)
@@ -307,6 +312,19 @@ def cases():
             for n in ("6mrr", "6mrr-gol-sep", "rna-dna", "smiles", "6mrr-nag-ret", "heteromer")]
     out += [
         ("bioemu2-glycan", "bioemu2", os.path.join(FIX, "glycan-standalone.json"), [], B),
+        # af3x's crosslinks: each pair a bridge chain after every other, bonded through bondedAtomPairs (a declared
+        # bond beside them too), all of them LINK records in pdb.template; and the refusals, in BioEmu2's words
+        ("bioemu2-crosslinks", "bioemu2", job("t", [protein("A", "MKTAYIAKQRQISFVKSHFSRQ"), protein("B", "GSKELAAKLGKEAYEK"),
+                                                    {"ligand": {"id": "C", "ccdCodes": ["GOL"]}}],
+                                              bondedAtomPairs=[[["A", 13, "OG"], ["C", 1, "C1"]]],
+                                              crosslinks=[{"name": "DSSO", "residue_pairs": [[["A", 2], ["B", 3]]]},
+                                                          {"name": "sulfo-SDA", "residue_pairs": [[["A", 1], ["B", 10]]]}]),
+         [], B),
+        ("bioemu2-crosslink-not-acylated", "bioemu2", job("t", [protein("A", "MKTAYIAKQR"), protein("B", "GSKELAAK")],
+                                                          crosslinks=[{"name": "DSS", "residue_pairs": [[["A", 4], ["B", 3]]]}]),
+         [], B),
+        ("bioemu2-crosslink-unknown", "bioemu2", job("t", [protein("A", "MKTAYIAKQR")],
+                                                     crosslinks=[{"name": "EDC", "residue_pairs": [[["A", 2], ["A", 8]]]}]), [], B),
         ("bioemu2-equilibrium-contacts", "bioemu2", os.path.join(BF, "6mrr.json"),
          ["--mode=equilibrium", f"--contacts={BF}/contacts.json"], B),
         ("bioemu2-a3m-per-chain", "bioemu2", os.path.join(BF, "heteromer-nomsa.json"),

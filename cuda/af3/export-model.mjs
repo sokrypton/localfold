@@ -566,7 +566,8 @@ try {
   const { toPdb } = await import(`${repo}/shared/af3/structure/pdb.js`);
   const slots = new Float32Array(batch.tokens * batch.dense * 3);
   for (let i = 0; i < batch.tokens * batch.dense; i += 1) slots[i * 3] = i;
-  writeFileSync(`${out}/template.pdb`, toPdb(batch, slots, null) + "\n");
+  // (and the job's declared bonds as LINK records: the native writer copies them, so the fold's PDB draws them)
+  writeFileSync(`${out}/template.pdb`, toPdb(batch, slots, null, { links: jobRequest?.bonds }) + "\n");
 } catch (error) {
   console.log(`no PDB template (${error.message}); the native writer will name residues itself`);
 }

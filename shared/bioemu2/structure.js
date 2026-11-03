@@ -7,12 +7,17 @@
  * for an unknown residue, the component's code for a ligand or a modified one).
  */
 import { ELEMENT_SYMBOLS } from "../af3/featurise/ccd-component.js";
+import { pdbLinkRecords } from "../af3/structure/pdb.js";
 
 const STANDARD = new Set(["ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE", "LEU", "LYS", "MET",
   "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL", "UNK", "A", "C", "G", "U", "N", "DA", "DC", "DG", "DT", "DN"]);
 
-/** Records for one sample's real atoms (`coords` the featuriser's order, padded or not). */
-export function bioemu2Pdb(atomKeys, topology, coords, { bFactors } = {}) {
+/**
+ * Records for one sample's real atoms (`coords` the featuriser's order, padded or not), and a LINK record for each of
+ * the job's declared bonds (`links`, its `bondedAtomPairs`: a crosslink's two, a covalent ligand's), which is what the
+ * viewer draws the stick between a side chain and a ligand from (see shared/af3/structure/pdb.js).
+ */
+export function bioemu2Pdb(atomKeys, topology, coords, { bFactors, links } = {}) {
   const lines = [];
   let serial = 1;
   let previousChain = null;
@@ -34,7 +39,9 @@ export function bioemu2Pdb(atomKeys, topology, coords, { bFactors } = {}) {
     serial += 1;
   }
   lines.push("TER", "END");
-  return `${lines.join("\n")}\n`;
+  // (the record's chain column is the id's first character, so an end is named the same way)
+  const bonds = (links ?? []).map((pair) => pair.map(([chain, residue, atom]) => [String(chain).slice(0, 1), residue, atom]));
+  return `${[...pdbLinkRecords(lines, bonds), ...lines].join("\n")}\n`;
 }
 
 /** Each atom's (chain, residue) CA or C1' for the chain-geometry gate: the spacing between consecutive residues. */

@@ -124,8 +124,38 @@ function linkRecords(batch, records, links) {
     const a = byAtom.get(`${from.asym}:${from.residue}:${from.atom}`);
     const b = byAtom.get(`${to.asym}:${to.residue}:${to.atom}`);
     if (a === undefined || b === undefined) continue;
-    const end = (head) => head.slice(12, 16) + " " + head.slice(17, 20) + " " + head.slice(21, 26) + " ";
-    lines.push("LINK        " + end(a) + " ".repeat(15) + end(b));
+    lines.push(linkLine(a, b));
+  }
+  return lines;
+}
+
+/**
+ * The LINK record joining two atom records (or their heads), in the format's columns: name 13-16, residue name 18-20,
+ * chain 22, residue number 23-26, and the second end from column 43.
+ */
+export function linkLine(a, b) {
+  const end = (record) => record.slice(12, 16) + " " + record.slice(17, 20) + " " + record.slice(21, 26) + " ";
+  return "LINK        " + end(a) + " ".repeat(15) + end(b);
+}
+
+/**
+ * LINK records for declared bonds over a PDB's own atom records - each end `[chain, residue, atom]` as the records
+ * spell it (the chain letter in column 22) - for a writer that has no batch: BioEmu2's (shared/bioemu2/structure.js,
+ * cuda/bioemu2/export_input.mjs). An end the records do not have is left out.
+ */
+export function pdbLinkRecords(records, bonds) {
+  if (bonds === undefined || bonds.length === 0) return [];
+  const byAtom = new Map();
+  for (const record of records) {
+    if (!record.startsWith("ATOM") && !record.startsWith("HETATM")) continue;
+    const key = `${record[21]}:${Number(record.slice(22, 26))}:${record.slice(12, 16).trim()}`;
+    if (!byAtom.has(key)) byAtom.set(key, record);
+  }
+  const lines = [];
+  for (const [from, to] of bonds) {
+    const a = byAtom.get(`${from[0]}:${from[1]}:${from[2]}`);
+    const b = byAtom.get(`${to[0]}:${to[1]}:${to[2]}`);
+    if (a !== undefined && b !== undefined) lines.push(linkLine(a, b));
   }
   return lines;
 }

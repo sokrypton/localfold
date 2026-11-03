@@ -19,6 +19,7 @@
 #include "entries.h"
 #include "fetch.h"
 #include "jsmath.h"
+#include "pdb.h"
 
 namespace lf {
 
@@ -409,6 +410,26 @@ inline Bioemu2Export exportBioemu2(const Args& args) {
       serial += 1;
     }
     pdb += "TER\n";
+  }
+  // ...and a LINK record for each declared bond (a crosslink's two among them), first (export_input.mjs): the native
+  // port copies every line that is not an atom record, so the fold's PDB carries them
+  {
+    std::map<std::string, std::string> letterOf;
+    for (size_t c = 0; c < chainOrder.size(); ++c)
+      letterOf[chainOrder[c]] = chainOrder[c].size() == 1 ? chainOrder[c] : std::string(1, CHAIN_CHARACTERS[c % CHAIN_CHARACTERS.size()]);
+    auto letter = [&](const std::string& id) { auto it = letterOf.find(id); return it == letterOf.end() ? id : it->second; };
+    std::vector<std::pair<LinkEnd, LinkEnd>> bonds;
+    for (auto& [a, b] : job.bonds)
+      bonds.push_back({LinkEnd{letter(a.chain), a.residue, a.atom}, LinkEnd{letter(b.chain), b.residue, b.atom}});
+    std::vector<std::string> records;
+    for (size_t at = 0; at < pdb.size();) {
+      size_t end = pdb.find('\n', at);
+      records.push_back(pdb.substr(at, end - at));
+      at = end == std::string::npos ? pdb.size() : end + 1;
+    }
+    std::string links;
+    for (auto& line : pdbLinkRecords(records, bonds)) links += line + "\n";
+    pdb = links + pdb;
   }
   out.pdb = pdb + "END\n";
   std::string conf = "{\"tokens\":[";

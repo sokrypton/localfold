@@ -17,6 +17,7 @@ import { featuriseForEsmfold2, languageModelInput } from "../../shared/esmfold2/
 import { representativeAtoms } from "../../shared/esmfold2/representative-atoms.js";
 import { toDensePositions } from "../../shared/esmfold2/featurise.js";
 import { toPdb } from "../../shared/af3/structure/pdb.js";
+import { CROSSLINKER_COMPONENTS } from "../../shared/chem/crosslinkers.js";
 
 const args = process.argv.slice(2);
 const out = args[0];
@@ -52,6 +53,8 @@ if (option("job", "") !== "") {
 }
 const ccd = async (code) => {
   if (userComponents.has(code.toUpperCase())) return userComponents.get(code.toUpperCase());
+  // (a crosslinker's bridge is built in, as on the native side's ComponentSource: XL-<name> is no CCD entry)
+  if (CROSSLINKER_COMPONENTS[code.toUpperCase()]) return parseCcdComponent(CROSSLINKER_COMPONENTS[code.toUpperCase()]);
   const response = await fetch(ccdUrl(code));
   if (!response.ok) throw new Error(`could not fetch ${code}: ${response.status}`);
   return parseCcdComponent(await response.text());
@@ -191,6 +194,7 @@ renameSync(`${out}/model.idx.tmp`, `${out}/model.idx`);
 {
   const coordinates = new Float32Array(A * 3);
   for (let atom = 0; atom < A; atom += 1) { coordinates[atom * 3] = Math.floor(atom / 1000); coordinates[atom * 3 + 1] = atom % 1000; }
-  writeFileSync(`${out}/pdb.template`, toPdb(f.batch, toDensePositions(f, coordinates)) + "\n");
+  writeFileSync(`${out}/pdb.template`, toPdb(f.batch, toDensePositions(f, coordinates), undefined,
+                                                    { links: jobRequest?.bonds }) + "\n");
 }
 console.log(`${T} tokens, ${A} atoms (${f.liveAtoms} live), ${lm.ids.length} tower rows -> ${out}`);

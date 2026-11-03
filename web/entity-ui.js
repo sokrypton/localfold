@@ -17,7 +17,8 @@
  */
 import { COMMON_IONS, COMMON_LIGANDS, ENTITY_LABELS, ENTITY_TYPES,
   MENU_CODES, MSA_KINDS, POLYMER_TYPES, TEMPLATE_KINDS, entitiesFromText, entityProblem, foldModificationRows,
-  modificationRows, newEntity, templateAsked, templateKind, templateProblem } from "./entities.js";
+  modificationRows, newEntity, parseCrosslink, rowChains, templateAsked, templateKind, templateProblem }
+  from "./entities.js";
 import { cleanSequence, cleanSequenceMap, extractFastaHeader } from "./sequence.js";
 import { fetchStructure, parseSource, structureChains } from "./template-source.js";
 import { LINK_TYPES, buildLinkField } from "./link-builder.js";
@@ -643,17 +644,33 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
       value.setAttribute("aria-label", `${what} sequence`);
     }
     value.value = entity.value;
-    /** Repaint the highlight from the text and the modification list. */
+    /** Repaint the highlight from the text, the modification list and the crosslink rows. */
     const paint = () => {
       if (mirror === null) return;
       const { offsets } = cleanSequenceMap(value.value);
-      const marked = new Set();
+      // text offset -> what marks it: a modified residue, or one a crosslink joins
+      const marked = new Map();
       // (folded, the rows keep their order with the modification rows taken out)
       const mine = foldModificationRows(entities)[entities.filter((one) => one.type !== "modification").indexOf(entity)];
       // (none where the model takes no modifications: their rows are greyed, so the sequence is not marked either)
       for (const modification of rowRefusal("modification") === null ? mine?.modifications ?? [] : []) {
         const offset = offsets[modification.position - 1];
-        if (offset !== undefined) marked.add(offset);
+        if (offset !== undefined) marked.set(offset, "modification");
+      }
+      // ...and a crosslinked residue, named by the chain letter of any copy of this sequence (rowChains letters them
+      // as the fold does) - its own colour, so a reader can tell the two apart; the same refusal rule
+      if (rowRefusal("crosslink") === null && entities.some((one) => one.type === "crosslink")) {
+        const index = entities.indexOf(entity);
+        const letters = new Set(rowChains(entities).filter((chain) => chain.entity === index)
+          .map((chain) => chain.letter));
+        for (const one of entities) {
+          if (one.type !== "crosslink") continue;
+          const parsed = parseCrosslink(one.value);
+          for (const end of parsed === null ? [] : [parsed.from, parsed.to]) {
+            const offset = letters.has(end.chain) ? offsets[end.residue - 1] : undefined;
+            if (offset !== undefined && !marked.has(offset)) marked.set(offset, "crosslink");
+          }
+        }
       }
       mirror.replaceChildren();
       const text = value.value;
@@ -663,6 +680,7 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
         if (!marked.has(at)) { run += text[at]; continue; }
         flush();
         const mark = document.createElement("mark");
+        if (marked.get(at) === "crosslink") mark.className = "entity-mark-crosslink";
         mark.textContent = text[at];
         mirror.append(mark);
       }
@@ -815,7 +833,7 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
     if (LINK_TYPES.includes(entity.type)) {
       field = buildLinkField(entity, () => entities, () => {
         notify();
-        if (entity.type === "modification") repaintAll();
+        if (entity.type === "modification" || entity.type === "crosslink") repaintAll();
       });
       wrapper.classList.add("entity-row-link");
     } else if (mirror !== null) {
