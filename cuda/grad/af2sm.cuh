@@ -518,7 +518,7 @@ inline IterSave iterForward(StructureModule& m, const SmRun& run, const real* ac
   s.x2 = cloneR(s.t1, (size_t)L * C); m.tr2.forward(r1, s.x2, L, 1);
   s.act = ARENA.get((size_t)L * C); s.lt = lnForward(m.transLn, s.x2, s.act, L);
   s.u = ARENA.get((size_t)L * 6); m.quat.forward(s.act, s.u, L);
-  s.rig = ARENA.get((size_t)L * 12); rigidUpdateK<<<blocks(L), 128, 0, STREAM>>>(rig, s.u, s.rig, L);
+  s.rig = ARENA.get((size_t)L * 12); rigidUpdateK<<<blocks(L, 128), 128, 0, STREAM>>>(rig, s.u, s.rig, L);
   return s;
 }
 // d act', d rig' -> d act, d rig (written); d act2d, d b2d, d w (added)
@@ -528,7 +528,7 @@ inline void iterBackward(StructureModule& m, const SmRun& run, const IterSave& s
   const int H = m.H, Cs = m.Cs, Pq = m.Pq, Pv = m.Pv, C = m.C, J = Cs + 3 * Pv;
   GK(cudaMemsetAsync(drig, 0, (size_t)L * 12 * sizeof(real), STREAM));
   real* du = ARENA.get((size_t)L * 6);
-  rigidUpdateBwdK<<<blocks(L), 128, 0, STREAM>>>(rig, s.u, drigOut, drig, du, L);
+  rigidUpdateBwdK<<<blocks(L, 128), 128, 0, STREAM>>>(rig, s.u, drigOut, drig, du, L);
   real* dA = cloneR(dactOut, (size_t)L * C);
   m.quat.backward(s.act, du, dA, L, true);
   real* dx2 = ARENA.get((size_t)L * C); lnBackward(m.transLn, s.lt, dA, dx2, L, false);
@@ -586,7 +586,7 @@ inline void smForward(StructureModule& m, SmRun& r, const real* single, const re
   for (int k = 0; k <= N; ++k) { r.acts[k] = ARENA.get((size_t)L * C); r.rigs[k] = ARENA.get((size_t)L * 12); }
   r.traj = ARENA.get((size_t)N * L * 12);
   GK(cudaMemcpyAsync(r.acts[0], r.act0, (size_t)L * C * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
-  identityRigidK<<<blocks(L), 128, 0, STREAM>>>(r.rigs[0], L);
+  identityRigidK<<<blocks(L, 128), 128, 0, STREAM>>>(r.rigs[0], L);
   for (int k = 0; k < N; ++k) {
     Scratch sc;
     IterSave s = iterForward(m, r, r.acts[k], r.rigs[k], mask, L);

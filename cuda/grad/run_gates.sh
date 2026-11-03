@@ -22,6 +22,8 @@ build cuda/grad/test-af3-f64 -O2 -DGRAD_F64 cuda/grad/test_af3.cu
 build cuda/grad/test-af3diff -O1 --default-stream per-thread cuda/grad/test_af3diff.cu
 build cuda/grad/test-af3diff-f64 -O2 -DGRAD_F64 cuda/grad/test_af3diff.cu
 build cuda/grad/test-ef2 -O1 cuda/grad/test_ef2.cu
+build cuda/grad/test-ef2atom -O1 cuda/grad/test_ef2atom.cu
+build cuda/grad/test-ef2atom-f64 -O2 -DGRAD_F64 cuda/grad/test_ef2atom.cu
 build cuda/grad/test-msap -O1 cuda/grad/test_msap.cu
 build cuda/grad/test-msap-f64 -O2 -DGRAD_F64 cuda/grad/test_msap.cu
 build cuda/grad/test-bioemu2 -O1 cuda/grad/test_bioemu2.cu
@@ -43,6 +45,7 @@ build cuda/grad/test-rfd4p-f64 -O2 -DGRAD_F64 cuda/grad/test_rfd4p.cu
 for d in cuda/grad/data/af2-*/; do run cuda/grad/test-af2-block-f64 "$d" --gradcheck; done
 for d in cuda/grad/data/af2-block*/ cuda/grad/data/af2-extra-block/; do run cuda/grad/test-af2-block "$d"; done
 run cuda/grad/test-af2sm
+run cuda/grad/test-af2sm --input=cuda/af2/data-1brs --weights=cuda/af2/weights-model_1_multimer_v3   # (199 residues: past a 128-thread block)
 run cuda/grad/test-af2sm-f64
 run cuda/grad/test-af2io
 run cuda/grad/test-af2io-f64
@@ -75,6 +78,8 @@ done
 run cuda/grad/test-atom-f64
 run cuda/grad/test-af3 --bundle=model-mol1-f32 --family=mol1 --prefix=trunk.pairMixerBlocks.
 run cuda/grad/test-ef2
+run cuda/grad/test-ef2atom
+run cuda/grad/test-ef2atom-f64
 run cuda/grad/test-msap --layer=0
 run cuda/grad/test-msap-f64
 run cuda/grad/test-bioemu2

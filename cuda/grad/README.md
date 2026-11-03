@@ -32,6 +32,7 @@ port computes, and its gradient is the gradient of that.
 | **AF3 lineage: the input embedder and distogram** (`af3embed.cuh`) | target_feat (its atom encoder and the concatenation), z_init (the left/right outer sum, the recycled pair, the relative encoding, the bond terms), s_init and the recycled single, the MSA embedding, the distogram head | `buildTargetFeat()` and `embed<float>()`'s z_init seam, single and msa on pass 0: <= 3.1e-7 on af3, protenix2, intellifold2, rosettafold3, opendde, openbind0, mol1 | 109 tensors <= 2.4e-5 (af3) |
 | **AF3 lineage: the confidence head** (`af3conf.cuh`) | target_feat's projections and the pseudo-beta distogram into the pair, its four pairformer blocks, the PDE (AF3's symmetrised-after, protenix2's LN(z + z^T)), PAE and per-atom pLDDT logits | `confidenceHead()`'s expectations: PAE/PDE <= 4.5e-6 on af3, protenix2, intellifold2, openbind0, mol1; pLDDT held to 4x the port's own sensitivity (below) | 219 tensors <= 5.5e-6 (af3), 222 (protenix2) |
 | **ESMFold2** (`af3.cuh`, `msap.cuh`) | pair trunk blocks of the trunk, coda, LM and MSA encoders | `trunkBlock`: 1.9e-7..3.8e-7 | the pairformer's |
+| **ESMFold2's atom stack** (`ef2atom.cuh`) | c0 and the sliding-window adaLN-Zero blocks (q/k rms-normed per head and rotated by the 3D RoPE table, the window by valid rank, the live gate, the gated SwiGLU) the inputs embedder and the diffusion module's encoder and decoder share | `prepareAtoms` + `swaBlock` in their float32 arm: <= 9.0e-8; **the vendor's own float32-attention dump**: <= 1.3e-7 | 21 tensors <= 5.5e-7 |
 | **ESM-C / ESM2** (`plm.cuh`) | the towers, ESM-C's sequence head, a masked-LM cross entropy | `esmcTower`, 36 layers: 5.8e-7 | <= 5.3e-7 |
 | **MSA Pairformer** (`msap.cuh`) | its layer: PWA, transition, query-biased OPM (differential sequence weights), pair block | the port's float32 path: <= 4.2e-7 | 2.6e-6 |
 | **BioEmu2** (`bioemu2.cuh`) | MSA layer and PairMixer layer (Boltz modules, stacked (out, in) weights) | `pairWeightedAveraging`/`transition`/`outerProductMean`/`trimul`: <= 2.1e-6 | <= 2.1e-6 |
@@ -62,6 +63,11 @@ same comparison is 3.5e-7, the port's own sensitivity 3.4e-7.
 the pair 3e-6. The single track reads the pair through the single attention's bias: moving the port's PAIR by 1e-7 moves
 its own pLDDT logits 2.0e-4 (intellifold2) and 3.9e-3 (openbind0), where moving its single moves them 2.3e-5. So the
 gate takes the port against itself with both inputs moved 1e-7 and holds pLDDT to max(1e-4, 4x that).
+
+🔴 **A LAUNCH BOUND BY `blocks(n)` IS A 256-THREAD BOUND.** `blocks(n, t = 256)` - five kernels here launched 128
+threads a block over `blocks(n)` blocks, so the second half of their work never ran: ESMFold2's q/k preparation (the atom
+stack read 0.12 against the port at its first block) and the AF2 structure module's rigid update and identity, which no
+gate saw because both its inputs were under 128 residues. The structure module's gate takes 1BRS (199) now.
 
 ## The reference-free gate (`gradcheck.cuh`)
 
