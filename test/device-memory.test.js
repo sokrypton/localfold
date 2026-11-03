@@ -12,7 +12,7 @@ import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 
 import {
-  budgetForDevice, cardBudgetBytes, GpuMemoryBudgetError, gpuMemoryFromName, memorySnapshot,
+  budgetForDevice, cardBudgetBytes, GpuMemoryBudgetError, gpuMemoryFromName, memorySnapshot, UNNAMED_CARD_BYTES,
   noteAllocation, noteDestroy, setMemoryBudget,
 } from "../webgpu/runtime/device-memory.js";
 
@@ -118,9 +118,12 @@ describe("the ceiling a page gives a device", () => {
     assert.equal(budget, cardBudgetBytes(8 * GIB));
   });
 
-  it("still takes a third of system RAM where that is the smaller", () => {
-    assert.equal(withRam(8, () => budgetForDevice(4, { gpuMemoryBytes: 24 * GIB })),
-                 Math.round(8 * GIB / 3));
+  it("is not held to a third of system RAM either, because the card's memory is its own", () => {
+    assert.equal(withRam(16, () => budgetForDevice(4, { gpuMemoryBytes: 24 * GIB })), cardBudgetBytes(24 * GIB));
+  });
+
+  it("holds a card it cannot name to both, because it may be sharing the RAM", () => {
+    assert.equal(withRam(8, () => budgetForDevice(4, { gpuMemoryBytes: UNNAMED_CARD_BYTES })), Math.round(8 * GIB / 3));
   });
 
   it("is unchanged for a card whose name says nothing", () => {

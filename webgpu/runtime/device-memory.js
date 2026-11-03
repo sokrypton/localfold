@@ -93,10 +93,13 @@ export function budgetForDevice(fallbackGiB = 4, { gpuMemoryBytes, learnedBytes,
   if (userBytes !== undefined) return userBytes;
   const gib = (typeof navigator === "object" && navigator !== null
     && typeof navigator.deviceMemory === "number") ? navigator.deviceMemory : fallbackGiB;
-  const bytes = [Math.round(gib * 1024 * 1024 * 1024 / 3)];
   // A third of system RAM says nothing about a discrete card's own memory: a
   // 32 GiB desktop with an 8 GiB RTX 3070 was given a 10.9 GiB ceiling, and a
-  // fold under it ran the card out and lost the device.
+  // fold under it ran the card out and lost the device. Nor does it limit one:
+  // a 24 GiB card in a 16 GiB desktop was held to 5.3. So a card the table knows
+  // goes by its own memory, and only a card it cannot name is held to both.
+  const named = gpuMemoryBytes !== undefined && gpuMemoryBytes !== UNNAMED_CARD_BYTES;
+  const bytes = named ? [] : [Math.round(gib * 1024 * 1024 * 1024 / 3)];
   if (gpuMemoryBytes !== undefined) bytes.push(cardBudgetBytes(gpuMemoryBytes));
   if (learnedBytes !== undefined) bytes.push(learnedBytes);
   return Math.min(...bytes);

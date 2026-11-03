@@ -12,7 +12,7 @@ const LOCK = "localfold-fold";
 /** A fold past this is worth a question before the tab closes on it. */
 const CONFIRM_CLOSE_AFTER_MS = 30 * 1000;
 /** And past this the screen stays on. */
-const KEEP_AWAKE_ABOVE_S = 60;
+const KEEP_AWAKE_AFTER_MS = 60 * 1000;
 
 const PAGE_TITLE = document.title;
 
@@ -74,14 +74,16 @@ async function foldTurn(signal, onWaiting) {
 /**
  * Everything above, for one fold.
  *
- * @param {{signal: AbortSignal, onWaiting: () => void, expectedSeconds?: number}} options
+ * @param {{signal: AbortSignal, onWaiting: () => void}} options
  * @returns {Promise<() => void>} ends it, whatever became of the fold
  */
-export async function beginFold({ signal, onWaiting, expectedSeconds }) {
+export async function beginFold({ signal, onWaiting }) {
   const endTurn = await foldTurn(signal, onWaiting);
   const allowClose = confirmClose();
-  const allowSleep = (expectedSeconds ?? 0) > KEEP_AWAKE_ABOVE_S ? keepAwake() : () => {};
+  let allowSleep = () => {};
+  const staying = setTimeout(() => { allowSleep = keepAwake(); }, KEEP_AWAKE_AFTER_MS);
   return () => {
+    clearTimeout(staying);
     allowSleep();
     allowClose();
     endTurn();
