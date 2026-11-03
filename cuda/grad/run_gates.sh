@@ -26,6 +26,8 @@ build cuda/grad/test-ef2atom -O1 cuda/grad/test_ef2atom.cu
 build cuda/grad/test-ef2atom-f64 -O2 -DGRAD_F64 cuda/grad/test_ef2atom.cu
 build cuda/grad/test-ef2diff -O1 cuda/grad/test_ef2diff.cu
 build cuda/grad/test-ef2diff-f64 -O2 -DGRAD_F64 cuda/grad/test_ef2diff.cu
+build cuda/grad/test-ef2trunk -O1 cuda/grad/test_ef2trunk.cu
+build cuda/grad/test-ef2trunk-f64 -O2 -DGRAD_F64 cuda/grad/test_ef2trunk.cu
 build cuda/grad/test-msap -O1 cuda/grad/test_msap.cu
 build cuda/grad/test-msap-f64 -O2 -DGRAD_F64 cuda/grad/test_msap.cu
 build cuda/grad/test-msapmodel -O1 cuda/grad/test_msapmodel.cu
@@ -92,6 +94,13 @@ run cuda/grad/test-ef2atom
 run cuda/grad/test-ef2atom-f64
 run cuda/grad/test-ef2diff
 run cuda/grad/test-ef2diff-f64
+run cuda/grad/test-ef2trunk
+run cuda/grad/test-ef2trunk-f64
+for b in model-esmfold2-fast-f32 model-esmfold2-f32; do
+  if [ ! -d $b ]; then echo "== ef2trunk --parcae: no $b here"; continue; fi
+  run cuda/grad/test-ef2trunk --parcae=$b
+  run cuda/grad/test-ef2trunk-f64 --parcae=$b
+done
 run cuda/grad/test-msap --layer=0
 run cuda/grad/test-msap-f64
 run cuda/grad/test-msapmodel

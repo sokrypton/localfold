@@ -215,33 +215,34 @@ inline void towerForward(Tower& t, Run& run, const int* ids, const int* seq, con
   run.ensure(c, R);
   embedK<<<blocks(R * c.C), 256, 0, STREAM>>>(ids, t.embed.w, run.xs[0], R, c.C, c.embedScale);
   for (int l = 0; l < L; ++l) {
-    ARENA.reset();
+    Scratch sc;
     blockForward(c, t.blocks[l], run.xs[l], run.xs[l + 1], R, seq, pos);
   }
-  ARENA.reset();
   run.finalSave = lnForward(t.final, run.xs[L], run.out, R);   // (its stats live in the arena until the next reset)
 }
-// dout [R, C] (the final LayerNorm's output's gradient) -> every parameter's
+// dout [R, C] (the final LayerNorm's output's gradient) -> every parameter's. dstate(l, dx), when given, adds a
+// cotangent on block l's input xs[l] (ESMFold2's shim reads every hidden state: cuda/grad/ef2trunk.cuh); dx is that
+// state's gradient so far
 inline void towerBackward(Tower& t, Run& run, const real* dout, const int* ids, const int* seq, const int* pos,
-                          int upToLayers = -1) {
+                          int upToLayers = -1, const std::function<void(int, real*)>& dstate = nullptr) {
   const Config& c = t.cfg;
   int L = upToLayers < 0 ? c.layers : upToLayers;
   size_t R = run.R;
   real* dx; GK(cudaMallocAsync(&dx, R * c.C * sizeof(real), STREAM));
   {
-    // the final norm: its stats were in the arena, so recompute them
-    ARENA.reset();
+    // the final norm: its stats may be gone with the caller's scratch, so recompute them
+    Scratch sc;
     real* y = ARENA.get(R * c.C);
     LnSave fs = lnForward(t.final, run.xs[L], y, R);
     lnBackward(t.final, fs, dout, dx, R, false);
   }
   real* scratchOut; GK(cudaMallocAsync(&scratchOut, R * c.C * sizeof(real), STREAM));
   for (int l = L; l-- > 0;) {
-    ARENA.reset();
+    Scratch sc;
     BlockSave s = blockForward(c, t.blocks[l], run.xs[l], scratchOut, R, seq, pos);
     blockBackward(c, t.blocks[l], s, dx, dx, R, seq, pos);
+    if (dstate) dstate(l, dx);
   }
-  ARENA.reset();
   embedBwdK<<<blocks(R * c.C), 256, 0, STREAM>>>(ids, dx, t.embed.g, R, c.C, c.embedScale);
   GK(cudaFreeAsync(dx, STREAM)); GK(cudaFreeAsync(scratchOut, STREAM));
 }

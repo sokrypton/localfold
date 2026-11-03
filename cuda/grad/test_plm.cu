@@ -56,21 +56,31 @@ static int gradcheckTower(g::plm::Tower& t, int R, const std::vector<int>& ids, 
   g::real* ce; CK(cudaMalloc(&ce, sizeof(g::real)));
   g::real one = 1; g::real* dOne; CK(cudaMalloc(&dOne, sizeof(g::real))); CK(cudaMemcpy(dOne, &one, sizeof(g::real), cudaMemcpyHostToDevice));
   auto forward = [&] {
+    g::ARENA.reset();
     g::plm::towerForward(t, run, dIds, dSeq, nullptr, R);
     double l = g::plm::headLoss(t, run.out, dTarget, count, dhead, R, false);
     g::real lr = (g::real)l;
     CK(cudaMemcpyAsync(ce, &lr, sizeof(g::real), cudaMemcpyHostToDevice, g::STREAM));
     CK(cudaStreamSynchronize(g::STREAM));
   };
+  // and every block input a cotangent of its own, through towerBackward's dstate (ESMFold2's shim reads them all)
+  std::vector<g::real*> cs(t.cfg.layers);
+  for (int l = 0; l < t.cfg.layers; ++l) {
+    CK(cudaMalloc(&cs[l], n * sizeof(g::real)));
+    curandGenerator_t gen; curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT); curandSetPseudoRandomGeneratorSeed(gen, 11 + l);
+    g::randn(gen, cs[l], (n + 1) & ~(size_t)1); curandDestroyGenerator(gen);
+  }
   t.params.zeroGrad();
+  g::ARENA.reset();
   g::plm::towerForward(t, run, dIds, dSeq, nullptr, R);
   g::plm::headLoss(t, run.out, dTarget, count, dhead, R);
   g::add(dhead, ct, n);                                      // d(sum(out ct) + ce)/d out
-  g::plm::towerBackward(t, run, dhead, dIds, dSeq, nullptr);
+  g::plm::towerBackward(t, run, dhead, dIds, dSeq, nullptr, -1, [&](int l, g::real* dx) { g::add(dx, cs[l], n); });
   g::GradCheck gc;
   for (auto* p : t.params.all) gc.add(*p);
   gc.output(run.out, ct, n);
   gc.output(ce, dOne, 1);
+  for (int l = 0; l < t.cfg.layers; ++l) gc.output(run.xs[l], cs[l], n);
   printf("%s: %d layers, C %d, %d rows, %zu tensors, %zu parameters\n", what, t.cfg.layers, t.cfg.C, R,
          t.params.all.size(), t.params.count());
   return gc.run(forward);
