@@ -301,6 +301,7 @@ struct DiffRun {
 };
 inline void transformerForward(DiffTransformer& t, DiffRun& r, const real* act, const real* cond, const real* mask,
                                const real* pairCond, real* out, int n) {
+  const Arena::Mark m0 = ARENA.mark();   // the caller's arena is kept: this scopes its own use
   const size_t nn = (size_t)n * n;
   const int nb = (int)t.blocks.size();
   if (r.n != n || r.acts.empty()) {
@@ -312,7 +313,7 @@ inline void transformerForward(DiffTransformer& t, DiffRun& r, const real* act, 
     GK(cudaMalloc(&r.pl, (size_t)nb * t.H * nn * sizeof(real)));
     r.n = n;
   }
-  ARENA.reset();
+  ARENA.rewind(m0);
   {
     real* mean = ARENA.get(nn); real* rstd = ARENA.get(nn);
     lnFwdK<<<blocks(nn, 8), 256, 0, STREAM>>>(pairCond, t.pairNorm.g.w, nullptr, r.pn, mean, rstd, nn, t.Cz, t.pairNorm.eps);
@@ -324,15 +325,16 @@ inline void transformerForward(DiffTransformer& t, DiffRun& r, const real* act, 
   }
   GK(cudaMemcpyAsync(r.acts[0], act, (size_t)n * t.C * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
   for (int b = 0; b < nb; ++b) {
-    ARENA.reset();
+    ARENA.rewind(m0);
     diffBlockForward(t, t.blocks[b], r.acts[b], cond, mask, r.pl + (size_t)b * t.H * nn, r.acts[b + 1], n);
   }
-  ARENA.reset();
+  ARENA.rewind(m0);
   GK(cudaMemcpyAsync(out, r.acts[nb], (size_t)n * t.C * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
 }
 // dout -> dact (written), dcond (added), dpairCond (added)
 inline void transformerBackward(DiffTransformer& t, DiffRun& r, const real* cond, const real* mask,
                                 const real* pairCond, const real* dout, real* dact, real* dcond, real* dpairCond) {
+  const Arena::Mark m0 = ARENA.mark();
   const int n = r.n, nb = (int)t.blocks.size();
   const size_t nn = (size_t)n * n;
   real *dx, *dpl, *tmp;
@@ -342,12 +344,12 @@ inline void transformerBackward(DiffTransformer& t, DiffRun& r, const real* cond
   GK(cudaMemsetAsync(dpl, 0, (size_t)nb * t.H * nn * sizeof(real), STREAM));
   GK(cudaMemcpyAsync(dx, dout, (size_t)n * t.C * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
   for (int b = nb; b-- > 0;) {
-    ARENA.reset();
+    ARENA.rewind(m0);
     const real* pl = r.pl + (size_t)b * t.H * nn;
     DiffBlockSave s = diffBlockForward(t, t.blocks[b], r.acts[b], cond, mask, pl, tmp, n);
     diffBlockBackward(t, t.blocks[b], s, r.acts[b], cond, mask, pl, dx, dx, dcond, dpl + (size_t)b * t.H * nn, n);
   }
-  ARENA.reset();
+  ARENA.rewind(m0);
   {
     real* dflat = ARENA.get(nn * t.perSuper * t.H);
     real* dpn = ARENA.zeros(nn * t.Cz);
@@ -362,7 +364,7 @@ inline void transformerBackward(DiffTransformer& t, DiffRun& r, const real* cond
     LnSave ls{pairCond, mean, rstd};
     lnBackward(t.pairNorm, ls, dpn, dpairCond, nn, true);
   }
-  ARENA.reset();
+  ARENA.rewind(m0);
   GK(cudaMemcpyAsync(dact, dx, (size_t)n * t.C * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
   GK(cudaStreamSynchronize(STREAM));
   GK(cudaFree(dx)); GK(cudaFree(tmp)); GK(cudaFree(dpl));

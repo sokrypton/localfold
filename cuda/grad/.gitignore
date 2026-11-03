@@ -19,3 +19,4 @@ test-rfd4p
 test-rfd4p-f64
 test-atom
 test-atom-f64
+test-*

@@ -22,6 +22,11 @@ __global__ void axpyK(real* y, const real* x, real a, size_t n) {
 
 inline void randn(curandGenerator_t g, float* p, size_t n) { curandGenerateNormal(g, p, n, 0.f, 1.f); }
 inline void randn(curandGenerator_t g, double* p, size_t n) { curandGenerateNormalDouble(g, p, n, 0.0, 1.0); }
+// v *= |w| / rms: a direction that steps each entry in proportion to itself
+__global__ void scaleByAbsK(real* v, const real* w, double invRms, size_t n) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t < n) v[t] *= (real)(fabs((double)w[t]) * invRms);
+}
 struct Checked { std::string name; real* w; const real* g; size_t n; };
 struct Output { const real* out; const real* ct; size_t n; real* plus = nullptr; };
 
@@ -95,6 +100,19 @@ struct GradCheck {
         double e = std::fabs(an - fd) / std::max({std::fabs(an), std::fabs(fd), 1e-300});
         if (k == 0 || e < bestE) { bestE = e; best = {t.name, an, fd}; }
         if (e <= bar) break;
+      }
+      // ...and then directions scaled by |w|: a weight with near-dead columns (protenix2's aggregation projection has
+      // 130 output channels whose largest entry is 3e-3 of the tensor's rms) holds ReLU inputs that a step sized to the
+      // tensor's rms crosses in EVERY random direction; stepped in proportion to itself, each entry stays on its side.
+      // A wrong gradient is wrong along these directions as well.
+      for (int k = 0; k < tries && !(bestE <= bar) && rms > 0; ++k) {
+        randn(gen, v, n2);
+        scaleByAbsK<<<blocks(t.n), 256, 0, STREAM>>>(v, t.w, 1 / rms, t.n);
+        double an = h * dot(t.g, v, t.n);
+        double d1 = central(forward, t, v, h), d2 = central(forward, t, v, 2 * h) / 2;
+        double fd = (4 * d1 - d2) / 3;
+        double e = std::fabs(an - fd) / std::max({std::fabs(an), std::fabs(fd), 1e-300});
+        if (e < bestE) { bestE = e; best = {t.name + " (|w|-scaled)", an, fd}; }
       }
       GK(cudaFree(v));
       rows.push_back(best);

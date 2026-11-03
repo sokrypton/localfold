@@ -77,6 +77,13 @@ inline void lnBackward(LayerNorm& ln, const LnSave& s, const real* dy, real* dx,
   lnBwdK<<<gr, 256, 2 * ln.C * sizeof(real), STREAM>>>(s.x, dy, ln.g.w, s.mean, s.rstd, dx, ln.g.g, ln.b.g, rows, ln.C, accumulate);
 }
 
+// an arena copy (af3.cuh keeps its own in its namespace)
+inline real* cloneR(const real* x, size_t n) {
+  real* y = ARENA.get(n);
+  GK(cudaMemcpyAsync(y, x, n * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
+  return y;
+}
+
 // ---------------------------------------------------------------- elementwise pieces
 __global__ void sigmoidK(real* x, size_t n) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
