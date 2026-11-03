@@ -43,6 +43,8 @@ build cuda/grad/test-af3denoise-f64 -O2 -DGRAD_F64 --default-stream per-thread c
 build cuda/grad/test-af3embed -O1 --default-stream per-thread cuda/grad/test_af3embed.cu
 build cuda/grad/test-af3embed-f64 -O2 -DGRAD_F64 --default-stream per-thread cuda/grad/test_af3embed.cu
 build cuda/grad/test-af3conf -O1 --default-stream per-thread cuda/grad/test_af3conf.cu
+build cuda/grad/test-af3tmpl -O1 --default-stream per-thread cuda/grad/test_af3tmpl.cu
+build cuda/grad/test-af3tmpl-f64 -O2 -DGRAD_F64 --default-stream per-thread cuda/grad/test_af3tmpl.cu
 build cuda/grad/test-af3conf-f64 -O2 -DGRAD_F64 --default-stream per-thread cuda/grad/test_af3conf.cu
 build cuda/grad/test-rfd4p -O1 cuda/grad/test_rfd4p.cu
 build cuda/grad/test-rfd4p-f64 -O2 -DGRAD_F64 cuda/grad/test_rfd4p.cu
@@ -79,6 +81,12 @@ for fb in "model-af3-full-f32 af3" "model-boltz2-f32 boltz2" "model-protenix2-f3
     run cuda/grad/test-af3denoise --bundle=$1 --family=$2 --input=$in
     run cuda/grad/test-af3denoise-f64 --bundle=$1 --family=$2 --input=$in
   fi
+  # the template embedder: 6MRR with its own crystal in two slots (every family; chai-1 through templateEmbedding alone)
+  tin=cuda/grad/data/af3-tmpl-$2
+  [ -d $tin ] || cuda/featurise/af3-featurise $tin --no-weights --family=$2 --sequence=GWSTELEKHREELKEFLKKEGITNVEIRIDNGRLEVRVEGGTERLKRFLEELRQKLEKKGYTVDIKIE \
+    --template=tools/fixtures/6mrr-crystal.pdb:A,tools/fixtures/6mrr-crystal.pdb:A > /dev/null
+  run cuda/grad/test-af3tmpl --bundle=$1 --family=$2 --input=$tin
+  case $2 in af3|boltz2|chai1|rosettafold3|protenix2) run cuda/grad/test-af3tmpl-f64 --bundle=$1 --family=$2 --input=$tin;; esac
   # the input embedder's generic path (not boltz2's atom-only target_feat sum, nor chai-1's token embedding); the
   # confidence head's (not boltz2's re-embedding, rf3's global norms, chai-1's, nor OpenDDE's own head)
   case $2 in boltz2|chai1) ;; *) run cuda/grad/test-af3embed --bundle=$1 --family=$2 --input=cuda/grad/data/af3-in-$2
