@@ -81,9 +81,9 @@ for fb in "model-af3-full-f32 af3" "model-boltz2-f32 boltz2" "model-protenix2-f3
   run cuda/grad/test-af3 --bundle=$1 --family=$2
   run cuda/grad/test-af3 --msa --bundle=$1 --family=$2
   run cuda/grad/test-af3diff --bundle=$1 --family=$2
+  in=cuda/grad/data/af3-in-$2
+  [ -d $in ] || cuda/featurise/af3-featurise $in --no-weights --family=$2 --sequence=GWSTELEKHREELKEFLKKEGITNVEIRIDNGRLEVRVEGGTERLKRFLEELRQKLEKKGYTVDIKIE > /dev/null
   if [ "$2" != chai1 ] && [ "$2" != opendde ]; then
-    in=cuda/grad/data/af3-in-$2
-    [ -d $in ] || cuda/featurise/af3-featurise $in --no-weights --family=$2 --sequence=GWSTELEKHREELKEFLKKEGITNVEIRIDNGRLEVRVEGGTERLKRFLEELRQKLEKKGYTVDIKIE > /dev/null
     run cuda/grad/test-af3denoise --bundle=$1 --family=$2 --input=$in
     run cuda/grad/test-af3denoise-f64 --bundle=$1 --family=$2 --input=$in
   fi
@@ -93,12 +93,12 @@ for fb in "model-af3-full-f32 af3" "model-boltz2-f32 boltz2" "model-protenix2-f3
     --template=tools/fixtures/6mrr-crystal.pdb:A,tools/fixtures/6mrr-crystal.pdb:A > /dev/null
   run cuda/grad/test-af3tmpl --bundle=$1 --family=$2 --input=$tin
   case $2 in af3|boltz2|chai1|rosettafold3|protenix2) run cuda/grad/test-af3tmpl-f64 --bundle=$1 --family=$2 --input=$tin;; esac
-  # the input embedder's generic path (not boltz2's atom-only target_feat sum, nor chai-1's token embedding); the
-  # confidence head's (not boltz2's re-embedding, rf3's global norms, chai-1's, nor OpenDDE's own head)
-  case $2 in boltz2|chai1) ;; *) run cuda/grad/test-af3embed --bundle=$1 --family=$2 --input=cuda/grad/data/af3-in-$2
-                                 run cuda/grad/test-af3embed-f64 --bundle=$1 --family=$2 --input=cuda/grad/data/af3-in-$2 ;; esac
-  case $2 in boltz2|chai1|rosettafold3|opendde) ;; *) run cuda/grad/test-af3conf --bundle=$1 --family=$2 --input=cuda/grad/data/af3-in-$2
-                                                      run cuda/grad/test-af3conf-f64 --bundle=$1 --family=$2 --input=cuda/grad/data/af3-in-$2 ;; esac
+  # the input embedder (boltz2's atom-only target_feat sum included; not chai-1's token embedding); the confidence head
+  # (every form but OpenDDE's own head)
+  case $2 in chai1) ;; *) run cuda/grad/test-af3embed --bundle=$1 --family=$2 --input=$in
+                          run cuda/grad/test-af3embed-f64 --bundle=$1 --family=$2 --input=$in ;; esac
+  case $2 in opendde) ;; *) run cuda/grad/test-af3conf --bundle=$1 --family=$2 --input=$in
+                            run cuda/grad/test-af3conf-f64 --bundle=$1 --family=$2 --input=$in ;; esac
   for E in diffusion.encoder diffusion.decoder targetFeat.encoder; do run cuda/grad/test-atom --bundle=$1 --family=$2 --stack=$E; done
 done
 run cuda/grad/test-atom-f64

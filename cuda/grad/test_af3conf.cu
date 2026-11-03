@@ -70,16 +70,17 @@ int main(int argc, char** argv) {
   M.loadBundle(bundle, "", [&](const std::map<std::string, std::vector<long long>>& shapes) {
     lf::weights::Shapes S; S.shape = shapes; return lf::weights::af3WeightLines(family, S); });
   M.load(input);
-  for (const char* f : {"trunk.dialect.reembedConfidencePair", "trunk.dialect.confidenceGlobalNorm", "trunk.dialect.chaiConfidence",
-                        "trunk.dialect.confidenceCaDgram", "trunk.dialect.structuralTokens"})
-    if (M.flag(f)) { fprintf(stderr, "%s: %s - not af3conf.cuh's head\n", family.c_str(), f); return 1; }
-  if (M.has("confidence.interHalfDistanceLogits")) { fprintf(stderr, "split intra/inter-chain heads are not here\n"); return 1; }
-  const int n = (int)M.meta("batch.tokens"), dense = (int)M.meta("batch.dense");
+  if (M.flag("trunk.dialect.structuralTokens")) { fprintf(stderr, "%s: OpenDDE's own head is not af3conf.cuh's\n", family.c_str()); return 1; }
+  const bool chai = M.flag("trunk.dialect.chaiConfidence");
+  const int n = (int)M.meta("batch.tokens"), dense = chai ? 37 : (int)M.meta("batch.dense");   // (chai-1: its ATOM37 slots)
   const size_t nn = (size_t)n * n;
   const std::string P = "confidence";
   g::af3::ConfidenceHead h;
   h.C = (int)M.meta(P + ".pairChannels"); h.Cs = (int)M.meta(P + ".singleChannels"); h.F = (int)M.meta(P + ".targetFeatWidth");
-  h.bins = (int)(M.at(P + ".distogramFeatProject").length / h.C); h.dense = dense;
+  h.reembed = M.flag("trunk.dialect.reembedConfidencePair"); h.globalNorm = M.flag("trunk.dialect.confidenceGlobalNorm");
+  h.binMode = chai ? g::af3::BIN_CHAI : M.flag("trunk.dialect.confidenceCaDgram") ? g::af3::BIN_CA : g::af3::BIN_AF3;
+  h.unmasked = chai;
+  h.bins = h.reembed ? 64 : (int)(M.at(P + ".distogramFeatProject").length / h.C); h.dense = dense;
   h.preSym = M.flag("trunk.dialect.preSymmetrisedPde");
   h.d = g::af3::Dialect{M.flag("trunk.dialect.swapTransposedBias"), M.flag("trunk.dialect.triangleMulDivideByLength")};
   int nb = 0; while (M.has(P + ".blocks." + std::to_string(nb) + ".singleChannels")) ++nb;
@@ -99,19 +100,28 @@ int main(int argc, char** argv) {
     std::vector<g::real> r(hh.begin(), hh.end());
     GK(cudaMemcpy(p.w, r.data(), len * sizeof(g::real), cudaMemcpyHostToDevice));
   });
-  setAdaMode(false);
-  const float* tfF = buildTargetFeat();
+  setAdaMode(M.flag("trunk.dialect.chaiAtomStack"));
+  // (chai-1's target_feat reads ESM2 3B, which the head need not: a random one there)
+  const float* tfF = chai ? nullptr : buildTargetFeat();
+  if (chai) { auto r = gauss((size_t)n * h.F, 4, 1); std::vector<float> f(r.begin(), r.end()); float* d = dalloc(f.size()); CK(cudaMemcpy(d, f.data(), f.size() * 4, cudaMemcpyHostToDevice)); tfF = d; }
   CK(cudaStreamSynchronize(STREAM));
+  // what the re-embedding and the split heads read
+  g::af3::ConfidenceBatch cb{Idev("batch.features.residueIndex"), Idev("batch.features.tokenIndex"), Idev("batch.features.asymId"),
+                             Idev("batch.features.entityId"), Idev("batch.features.symId"),
+                             M.has("batch.bondMatrix") ? devReal(Fdev("batch.bondMatrix"), nn) : nullptr,
+                             M.has("batch.bondOrderMatrix") ? devReal(Fdev("batch.bondOrderMatrix"), nn) : nullptr};
   auto zH = gauss(nn * h.C, 1, 1), sH = gauss((size_t)n * h.Cs, 2, 1), bH = gauss((size_t)n * 3, 3, 10);
   std::vector<double> smH(n, 1), pmH(nn, 1);
   g::real *z = devReal(zH), *sg = devReal(sH), *beta = devReal(bH), *tf = devReal(tfF, (size_t)n * h.F),
           *sm = devReal(smH), *pm = devReal(pmH);
-  printf("%s (%s), %d tokens: %d blocks, pair %d, single %d, target_feat %d, %d distance bins%s%s\n", family.c_str(), bundle.c_str(),
-         n, nb, h.C, h.Cs, h.F, h.bins, h.preSym ? ", pre-symmetrised PDE" : "", h.singleNorm ? ", clamped single norm" : "");
+  printf("%s (%s), %d tokens: %d blocks, pair %d, single %d, target_feat %d, %d distance bins%s%s%s%s%s%s\n", family.c_str(), bundle.c_str(),
+         n, nb, h.C, h.Cs, h.F, h.bins, h.preSym ? ", pre-symmetrised PDE" : "", h.singleNorm ? ", clamped single norm" : "",
+         h.reembed ? ", re-embedded" : "", h.split ? ", split chain heads" : "", h.globalNorm ? (h.absent ? ", global norms (absent columns)" : ", global norms") : "",
+         chai ? ", chai-1's distance embedding and ATOM37 pLDDT" : "");
 #ifndef GRAD_F64
   g::ARENA.reset();
   g::af3::ConfidenceLogits o{};
-  g::af3::confidenceForward(h, z, sg, tf, beta, sm, pm, pm, n, o);
+  g::af3::confidenceForward(h, z, sg, tf, beta, sm, pm, pm, n, o, cb);
   ConfidenceOut ref = confidenceHead(devF(zH), devF(sH), tfF, devF(bH), devF(smH), devF(pmH), n);
   CK(cudaStreamSynchronize(STREAM));
   const int NB = 64; const double step = 31.0 / (NB - 2);
@@ -122,6 +132,13 @@ int main(int argc, char** argv) {
   auto hv = [](const g::real* d, size_t len) { auto v = g::host(d, len); return std::vector<double>(v.begin(), v.end()); };
   auto pae = expect(hv(o.pae, nn * NB), nn, NB, dc, 1), pde = expect(hv(o.pde, nn * NB), nn, NB, dc, 1);
   auto pl = expect(hv(o.plddt, (size_t)n * dense * 50), (size_t)n * dense, 50, pc, 100);
+  if (chai) {     // each dense slot's from its ATOM37 slot (the port's atom37Index)
+    const int D = (int)M.meta("batch.dense");
+    std::vector<int> idx((size_t)n * D); CK(cudaMemcpy(idx.data(), atom37Index(n, D), idx.size() * 4, cudaMemcpyDeviceToHost));
+    std::vector<double> g((size_t)n * D);
+    for (int t = 0; t < n; ++t) for (int k = 0; k < D; ++k) g[(size_t)t * D + k] = pl[(size_t)t * 37 + idx[(size_t)t * D + k]];
+    pl.swap(g);
+  }
   if (M.flag("trunk.dialect.perAtomHeadsByRank")) {       // each atom's by its rank among the token's real atoms (the port's)
     const int* chars = M.i("batch.refAtomNameChars");
     std::vector<double> ranked(pl.size());
@@ -170,7 +187,7 @@ int main(int argc, char** argv) {
   auto fwd = [&] {
     g::ARENA.reset();
     g::af3::ConfidenceLogits o{};
-    g::af3::confidenceForward(h, z, sg, tf, beta, sm, pm, pm, n, o);
+    g::af3::confidenceForward(h, z, sg, tf, beta, sm, pm, pm, n, o, cb);
     GK(cudaMemcpyAsync(oPde, o.pde, nn * 64 * sizeof(g::real), cudaMemcpyDeviceToDevice, g::STREAM));
     GK(cudaMemcpyAsync(oPae, o.pae, nn * 64 * sizeof(g::real), cudaMemcpyDeviceToDevice, g::STREAM));
     GK(cudaMemcpyAsync(oPl, o.plddt, (size_t)n * dense * 50 * sizeof(g::real), cudaMemcpyDeviceToDevice, g::STREAM));
@@ -178,8 +195,8 @@ int main(int argc, char** argv) {
   ps.zeroGrad();
   g::ARENA.reset();
   g::af3::ConfidenceLogits o{};
-  auto s = g::af3::confidenceForward(h, z, sg, tf, beta, sm, pm, pm, n, o);
-  g::af3::confidenceBackward(h, s, sg, tf, sm, pm, pm, g::af3::ConfidenceLogits{ctPde, ctPae, ctPl}, dz, ds, dtf);
+  auto s = g::af3::confidenceForward(h, z, sg, tf, beta, sm, pm, pm, n, o, cb);
+  g::af3::confidenceBackward(h, s, z, sg, tf, sm, pm, pm, g::af3::ConfidenceLogits{ctPde, ctPae, ctPl}, dz, ds, dtf, cb);
   g::GradCheck gc;
   gc.add("in/trunkPair", z, dz, nn * h.C);
   gc.add("in/trunkSingle", sg, ds, (size_t)n * h.Cs);
