@@ -39,10 +39,11 @@ port computes, and its gradient is the gradient of that.
 | **BioEmu2** (`bioemu2.cuh`) | MSA layer and PairMixer layer (Boltz modules, stacked (out, in) weights) | `pairWeightedAveraging`/`transition`/`outerProductMean`/`trimul`: <= 2.1e-6 | <= 2.1e-6 |
 | **BioEmu2's denoiser** (`bioemu2den.cuh` on `tape.cuh`) | the static context (the pairwise conditioner's pair and relative encoding, the atom features, the windowed atom pair's geometry, token term and MLP tail, every layer's window and token biases, the single conditioner's static half, a's trunk half) and one D(x, sigma): the single conditioning, 16 dual-stream layers (windowed and full conditioned attention, the coupling mixers), the readout | `staticContext` + `denoise()` float32: the context <= 1.1e-7, D 5.7e-5 at sigma 5 and 5.3e-6 at 40; d/dx against the port's own vjp tape (jax.grad's) at float32's floor (below) | 709 tensors <= 7.6e-5, the context's weights and the trunk's three inputs included |
 | **RFD4-Proteina** (`rfd4p.cuh`) | token layer (RMS AdaLN, pair-biased attention, SwiGLU, output scales) and pair update | `tokenLayer`/`pairReprUpdate` <float>: 5e-8 / 1.6e-7 | 1.9e-6 |
+| **RFD4-Proteina's whole trunk** (`rfd4trunk.cuh`) | one cycle: the conditioning and its two SwiGLU transitions, s_init, z_init (the pair factory's RMS-normed projection adaLN-conditioned on the pair condition), the 14 token layers and 7 pair updates, the CA, local-latent, sequence and insertion heads | `forward()` FP32, one recycle, on a real 54-token input: every stage and head <= 4.4e-7 | 93 tensors <= 1.9e-6 |
 
 Not yet: the template embedders (AF2's, AF3's), the dialect branches named in each header (boltz2's re-embedded
 confidence head and atom-only target_feat, rf3's global norms, chai-1's embeddings, OpenDDE's structural tokens),
-RFD4-Proteina's encoder and decoder, MSA Pairformer's embeddings and heads. The layers they are made of are mostly here.
+RFD4-Proteina's autoencoder (its encoder and decoder), MSA Pairformer's embeddings and heads. The layers they are made of are mostly here.
 
 Also: AdamW (`adam.cuh`); `train-af2-smoke` - real weights perturbed 10% and trained back, loss 918 -> 14.7 in 60
 steps.
