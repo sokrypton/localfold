@@ -15,6 +15,8 @@ build cuda/grad/test-af2sm -O1 cuda/grad/test_af2sm.cu
 build cuda/grad/test-af2io -O1 cuda/grad/test_af2io.cu
 build cuda/grad/test-af2io-f64 -O2 -DGRAD_F64 cuda/grad/test_af2io.cu
 build cuda/grad/test-af2sm-f64 -O2 -DGRAD_F64 cuda/grad/test_af2sm.cu
+build cuda/grad/test-af2tmpl -O1 cuda/grad/test_af2tmpl.cu
+build cuda/grad/test-af2tmpl-f64 -O2 -DGRAD_F64 cuda/grad/test_af2tmpl.cu
 build cuda/grad/test-plm -O2 cuda/grad/test_plm.cu
 build cuda/grad/test-plm-f64 -O2 -DGRAD_F64 cuda/grad/test_plm.cu
 build cuda/grad/test-af3 -O1 --default-stream per-thread cuda/grad/test_af3.cu
@@ -63,6 +65,10 @@ run cuda/grad/test-af2sm --input=cuda/af2/data-1brs --weights=cuda/af2/weights-m
 run cuda/grad/test-af2sm-f64
 run cuda/grad/test-af2io
 run cuda/grad/test-af2io-f64
+run cuda/grad/test-af2tmpl                                   # the multimer's, 1BRS with a template
+run cuda/grad/test-af2tmpl-f64
+run cuda/grad/test-af2tmpl --weights=cuda/af2/weights-model_1_ptm --input=cuda/af2/data-5caj-t     # the monomer's
+run cuda/grad/test-af2tmpl-f64 --weights=cuda/af2/weights-model_1_ptm --input=cuda/af2/data-5caj-t
 run cuda/grad/test-plm
 run cuda/grad/test-plm-f64
 run cuda/grad/test-af3-f64
