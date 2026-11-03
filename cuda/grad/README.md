@@ -37,11 +37,12 @@ port computes, and its gradient is the gradient of that.
 | **ESM-C / ESM2** (`plm.cuh`) | the towers, ESM-C's sequence head, a masked-LM cross entropy | `esmcTower`, 36 layers: 5.8e-7 | <= 5.3e-7 |
 | **MSA Pairformer** (`msap.cuh`) | its layer: PWA, transition, query-biased OPM (differential sequence weights), pair block | the port's float32 path: <= 4.2e-7 | 2.6e-6 |
 | **BioEmu2** (`bioemu2.cuh`) | MSA layer and PairMixer layer (Boltz modules, stacked (out, in) weights) | `pairWeightedAveraging`/`transition`/`outerProductMean`/`trimul`: <= 2.1e-6 | <= 2.1e-6 |
+| **BioEmu2's denoiser** (`bioemu2den.cuh` on `tape.cuh`) | the static context (the pairwise conditioner's pair and relative encoding, the atom features, the windowed atom pair's geometry, token term and MLP tail, every layer's window and token biases, the single conditioner's static half, a's trunk half) and one D(x, sigma): the single conditioning, 16 dual-stream layers (windowed and full conditioned attention, the coupling mixers), the readout | `staticContext` + `denoise()` float32: the context <= 1.1e-7, D 5.7e-5 at sigma 5 and 5.3e-6 at 40; d/dx against the port's own vjp tape (jax.grad's) at float32's floor (below) | 709 tensors <= 7.6e-5, the context's weights and the trunk's three inputs included |
 | **RFD4-Proteina** (`rfd4p.cuh`) | token layer (RMS AdaLN, pair-biased attention, SwiGLU, output scales) and pair update | `tokenLayer`/`pairReprUpdate` <float>: 5e-8 / 1.6e-7 | 1.9e-6 |
 
 Not yet: the template embedders (AF2's, AF3's), the dialect branches named in each header (boltz2's re-embedded
-confidence head and atom-only target_feat, rf3's global norms, chai-1's embeddings, OpenDDE's structural tokens), and, BioEmu2's denoiser,
-RFD4-P's encoder/decoder glue). The layers they are made of are mostly here already.
+confidence head and atom-only target_feat, rf3's global norms, chai-1's embeddings, OpenDDE's structural tokens),
+RFD4-Proteina's encoder and decoder, MSA Pairformer's embeddings and heads. The layers they are made of are mostly here.
 
 Also: AdamW (`adam.cuh`); `train-af2-smoke` - real weights perturbed 10% and trained back, loss 918 -> 14.7 in 60
 steps.
@@ -69,6 +70,17 @@ gate takes the port against itself with both inputs moved 1e-7 and holds pLDDT t
 threads a block over `blocks(n)` blocks, so the second half of their work never ran: ESMFold2's q/k preparation (the atom
 stack read 0.12 against the port at its first block) and the AF2 structure module's rigid update and identity, which no
 gate saw because both its inputs were under 128 residues. The structure module's gate takes 1BRS (199) now.
+
+`tape.cuh` is a reverse-mode tape over `real` whose weights are Params (cuda/bioemu2/src/vjp.cuh's tape, op for op,
+with the weights' gradients): BioEmu2's denoiser is written on it, the static context included, because a graph of
+~2,000 ops with a handful of custom ones ported more faithfully op by op than as hand-written backwards.
+
+🔴 **BioEmu2's d/dx IS FLOAT32-LIMITED, AND THE PORT'S TWO FLOAT32 PATHS AGREEING DOES NOT SAY OTHERWISE.** At sigma 5 on
+random noise the network's part of d/dx read 2.1e-2 against the port's vjp tape, where the port against itself (x moved
+1e-7) reads 3.1e-4 - so it looked like a defect. It is not: both sides cut to the same depth agree to 1.3e-7 with no
+layers, the context agrees to 1e-7, the float64 gradcheck holds every tensor, and this denoiser's float32 is 1.0e-2 from
+its own float64 - as far as the port's float32 is. The port's vjp and denoise() agree to 8e-6 because they make the
+same cuBLAS calls in the same order. A nudge of the INPUT measures conditioning; it does not measure rounding.
 
 ## The reference-free gate (`gradcheck.cuh`)
 

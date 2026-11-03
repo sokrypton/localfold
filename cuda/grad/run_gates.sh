@@ -30,6 +30,8 @@ build cuda/grad/test-msap -O1 cuda/grad/test_msap.cu
 build cuda/grad/test-msap-f64 -O2 -DGRAD_F64 cuda/grad/test_msap.cu
 build cuda/grad/test-bioemu2 -O1 cuda/grad/test_bioemu2.cu
 build cuda/grad/test-bioemu2-f64 -O2 -DGRAD_F64 cuda/grad/test_bioemu2.cu
+build cuda/grad/test-bioemu2den -O1 cuda/grad/test_bioemu2den.cu
+build cuda/grad/test-bioemu2den-f64 -O2 -DGRAD_F64 cuda/grad/test_bioemu2den.cu
 build cuda/grad/test-atom -O1 --default-stream per-thread cuda/grad/test_atom.cu
 build cuda/grad/test-atom-f64 -O2 -DGRAD_F64 cuda/grad/test_atom.cu
 build cuda/grad/test-af3denoise -O1 --default-stream per-thread cuda/grad/test_af3denoise.cu
@@ -89,6 +91,10 @@ run cuda/grad/test-msap-f64
 run cuda/grad/test-bioemu2
 run cuda/grad/test-bioemu2 --layer=3
 run cuda/grad/test-bioemu2-f64
+[ -d cuda/grad/data/be2-6mrr ] || node cuda/bioemu2/export_input.mjs cuda/grad/data/be2-6mrr --sequence=GWSTELEKHREELKEFLKKEGITNVEIRIDNGRLEVRVEGGTERLKRFLEELRQKLEKKGYTVDIKIE > /dev/null
+run cuda/grad/test-bioemu2den
+run cuda/grad/test-bioemu2den --sigma=40
+run cuda/grad/test-bioemu2den-f64
 run cuda/grad/test-rfd4p
 run cuda/grad/test-rfd4p --layer=12      # (pair updates on even layers only)
 run cuda/grad/test-rfd4p-f64
