@@ -403,5 +403,249 @@ inline void pairformerBackward(Pairformer& b, const Dialect& d, const Pairformer
   GK(cudaMemcpyAsync(dpair, dp, nn * Cz * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
 }
 
+
+// ---------------------------------------------------------------- the MSA module
+// Pair-weighted averaging (AF3's MSA attention): no queries and no keys - the weights are softmax_j of LN(pair) Wl
+// plus a key mask (the coverage: max over the rows; chai-1 the token mask, with masked rows' values zeroed), shared
+// by every MSA row; values and a gate from LN(msa).
+struct Pwa {
+  LayerNorm ln, pn;
+  Linear logits, v, gate, out;     // logits [Cz, H]; v, gate [Cm, HD]; out [HD, Cm]
+  int Cm = 0, Cz = 0, H = 0, D = 0;
+  bool chaiMask = false;
+};
+struct PwaSave { LnSave ln, lp; real *xn, *pn, *w, *vh, *oh, *g, *km; int S, n; };
+// keyMask[j] = max_s msaMask[s, j]
+__global__ void coverageK(const real* m, real* km, int S, int n) {
+  int j = blockIdx.x * blockDim.x + threadIdx.x;
+  if (j >= n) return;
+  real a = 0; for (int s = 0; s < S; ++s) a = fmax(a, m[(size_t)s * n + j]);
+  km[j] = a;
+}
+// w[h, i, j] = softmax_j(flat[(i j), h] + 1e9 (km[j] - 1))
+__global__ void pwaWeightsK(const real* flat, const real* km, real* w, int n, int H) {
+  size_t row = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+  int lane = threadIdx.x & 31;
+  if (row >= (size_t)H * n) return;
+  int h = row / n, i = row % n;
+  real* wr = w + row * n;
+  real mx = -INFINITY;
+  for (int j = lane; j < n; j += 32) { real v = flat[((size_t)i * n + j) * H + h] + 1e9f * (km[j] - 1); wr[j] = v; mx = fmax(mx, v); }
+  for (int o = 16; o; o >>= 1) mx = fmax(mx, __shfl_xor_sync(~0u, mx, o));
+  real sum = 0;
+  for (int j = lane; j < n; j += 32) { real e = exp(wr[j] - mx); wr[j] = e; sum += e; }
+  for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(~0u, sum, o);
+  for (int j = lane; j < n; j += 32) wr[j] /= sum;
+}
+// dW [H, n, n] in place -> dlogits, then scattered to dflat [(i j), h]
+__global__ void pwaWeightsBwdK(real* dw, const real* w, real* dflat, int n, int H) {
+  size_t row = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+  int lane = threadIdx.x & 31;
+  if (row >= (size_t)H * n) return;
+  int h = row / n, i = row % n;
+  real* d = dw + row * n;
+  const real* p = w + row * n;
+  real s = 0;
+  for (int j = lane; j < n; j += 32) s += d[j] * p[j];
+  for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
+  for (int j = lane; j < n; j += 32) dflat[((size_t)i * n + j) * H + h] = p[j] * (d[j] - s);
+}
+// [S, n, H, D] <-> [H][n][S D]
+__global__ void pwaHeadsK(const real* x, real* y, int S, int n, int H, int D, bool back) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)S * n * H * D) return;
+  int d = t % D; size_t r = t / D; int h = r % H; r /= H; int j = r % n; int s = (int)(r / n);
+  size_t q = (((size_t)h * n + j) * S + s) * D + d;
+  if (back) y[t] = x[q]; else y[q] = x[t];
+}
+// msa [S, n, Cm] += pwa(msa, pair)
+inline PwaSave pwaForward(const Pwa& a, const real* msa, const real* msaMask, const real* seqMask, const real* pair,
+                          real* msaOut, int S, int n) {
+  size_t rows = (size_t)S * n, nn = (size_t)n * n;
+  const int HD = a.H * a.D;
+  PwaSave s{}; s.S = S; s.n = n;
+  s.xn = ARENA.get(rows * a.Cm);
+  s.ln = lnForward(a.ln, msa, s.xn, rows);
+  s.pn = ARENA.get(nn * a.Cz);
+  s.lp = lnForward(a.pn, pair, s.pn, nn);
+  s.km = ARENA.get(n);
+  if (a.chaiMask) GK(cudaMemcpyAsync(s.km, seqMask, n * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
+  else coverageK<<<blocks(n), 256, 0, STREAM>>>(msaMask, s.km, S, n);
+  s.w = ARENA.get((size_t)a.H * nn);
+  {
+    Scratch scratch;
+    real* flat = ARENA.get(nn * a.H);
+    a.logits.forward(s.pn, flat, nn);
+    pwaWeightsK<<<blocks((size_t)a.H * n, 8), 256, 0, STREAM>>>(flat, s.km, s.w, n, a.H);
+  }
+  s.vh = ARENA.get(rows * HD); s.oh = ARENA.get(rows * HD); s.g = ARENA.get(rows * HD);
+  Scratch scratch;
+  real* v = ARENA.get(rows * HD);
+  a.v.forward(s.xn, v, rows);
+  if (a.chaiMask) rowMaskK<<<blocks(rows * HD), 256, 0, STREAM>>>(v, msaMask, rows, HD);
+  pwaHeadsK<<<blocks(rows * HD), 256, 0, STREAM>>>(v, s.vh, S, n, a.H, a.D, false);
+  const int SD = S * a.D;
+  bmm(false, false, n, SD, n, s.w, (long long)nn, s.vh, (long long)n * SD, s.oh, (long long)n * SD, a.H);
+  a.gate.forward(s.xn, s.g, rows);
+  sigmoidK<<<blocks(rows * HD), 256, 0, STREAM>>>(s.g, rows * HD);
+  real* o = ARENA.get(rows * HD);
+  pwaHeadsK<<<blocks(rows * HD), 256, 0, STREAM>>>(s.oh, o, S, n, a.H, a.D, true);
+  mulK<<<blocks(rows * HD), 256, 0, STREAM>>>(o, o, s.g, rows * HD);
+  a.out.forward(o, msaOut, rows, 1);
+  return s;
+}
+// dout [S n, Cm] -> dmsa (added), dpair (added)
+inline void pwaBackward(Pwa& a, const PwaSave& s, const real* msaMask, const real* dout, real* dmsa, real* dpair) {
+  Scratch scratch;
+  const int S = s.S, n = s.n, HD = a.H * a.D, SD = S * a.D;
+  size_t rows = (size_t)S * n, nn = (size_t)n * n;
+  real *o = ARENA.get(rows * HD), *og = ARENA.get(rows * HD);
+  pwaHeadsK<<<blocks(rows * HD), 256, 0, STREAM>>>(s.oh, o, S, n, a.H, a.D, true);
+  mulK<<<blocks(rows * HD), 256, 0, STREAM>>>(og, o, s.g, rows * HD);
+  real* dog = ARENA.get(rows * HD);
+  a.out.backward(og, dout, dog, rows);
+  real *dO = ARENA.get(rows * HD), *dg = ARENA.get(rows * HD);
+  gateBwdK<<<blocks(rows * HD), 256, 0, STREAM>>>(dog, o, s.g, dO, dg, rows * HD);
+  real* dxn = ARENA.get(rows * a.Cm);
+  a.gate.backward(s.xn, dg, dxn, rows);
+  real* doh = ARENA.get(rows * HD);
+  pwaHeadsK<<<blocks(rows * HD), 256, 0, STREAM>>>(dO, doh, S, n, a.H, a.D, false);
+  real *dw = ARENA.get((size_t)a.H * nn), *dvh = ARENA.get(rows * HD);
+  bmm(false, true, n, n, SD, doh, (long long)n * SD, s.vh, (long long)n * SD, dw, (long long)nn, a.H);   // dW = dO V^T
+  bmm(true, false, n, SD, n, s.w, (long long)nn, doh, (long long)n * SD, dvh, (long long)n * SD, a.H);  // dV = W^T dO
+  real* dv = ARENA.get(rows * HD);
+  pwaHeadsK<<<blocks(rows * HD), 256, 0, STREAM>>>(dvh, dv, S, n, a.H, a.D, true);
+  if (a.chaiMask) rowMaskK<<<blocks(rows * HD), 256, 0, STREAM>>>(dv, msaMask, rows, HD);
+  a.v.backward(s.xn, dv, dxn, rows, true);
+  lnBackward(a.ln, s.ln, dxn, dmsa, rows, true);
+  real* dflat = ARENA.get(nn * a.H);
+  pwaWeightsBwdK<<<blocks((size_t)a.H * n, 8), 256, 0, STREAM>>>(dw, s.w, dflat, n, a.H);
+  real* dpn = ARENA.get(nn * a.Cz);
+  a.logits.backward(s.pn, dflat, dpn, nn);
+  lnBackward(a.pn, s.lp, dpn, dpair, nn, true);
+}
+
+// One MSA block:  AF3:  pair += OPM(msa); msa += PWA(msa, pair); msa += T(msa); then the pair half
+//                 updateFirst (OpenDDE, Boltz-2): the MSA update first, the outer product of the updated MSA
+//                 chai-1 (grouped): pair += gOPM(msa); msa += T(msa) + PWA(msa, pair) off the same msa; then the
+//                 pair half in two parallel stages: {triOut, triIn, transition}, then {grid row, grid column}
+struct MsaBlock {
+  Opm opm;
+  Pwa att;
+  GatedTransition trans;
+  Pairformer pairHalf;
+  bool updateFirst = false, chai = false;
+};
+struct MsaSave {
+  OpmSave opm;
+  PwaSave att;
+  GtSave tr;
+  PairformerSave ph;       // sequential pair half
+  TriMulSave tOut, tIn; GtSave pt; GridSave g1, g2;  // chai's two parallel stages
+  real *pairA, *pairB, *msaA;
+  int S, n;
+};
+inline MsaSave msaForward(MsaBlock& b, const Dialect& d, const real* msa, const real* pair, const real* msaMask,
+                          const real* pairMask, const real* maskT, const real* seqMask, real* msaOut, real* pairOut,
+                          int S, int n) {
+  const int Cz = b.pairHalf.triOut.C, Cm = b.att.Cm;
+  size_t rows = (size_t)S * n, nn = (size_t)n * n;
+  MsaSave s{}; s.S = S; s.n = n;
+  real* p = cloneR(pair, nn * Cz);
+  if (b.chai) {
+    s.opm = opmForward(b.opm, msa, msaMask, p, S, n);
+    GK(cudaMemcpyAsync(msaOut, msa, rows * Cm * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
+    s.tr = gtForward(b.trans, msa, msaOut, rows, 1);
+    s.att = pwaForward(b.att, msa, msaMask, seqMask, p, msaOut, S, n);
+    s.pairA = p;
+    real* a2 = cloneR(p, nn * Cz);
+    real* u = ARENA.get(nn * Cz);
+    b.pairHalf.triOut.divideByLength = b.pairHalf.triIn.divideByLength = d.divideByLength;
+    s.tOut = triMulForward(b.pairHalf.triOut, p, pairMask, u, n); add(a2, u, nn * Cz);
+    s.tIn = triMulForward(b.pairHalf.triIn, p, pairMask, u, n); add(a2, u, nn * Cz);
+    s.pt = gtForward(b.pairHalf.pairTrans, p, a2, nn, 1);
+    s.pairB = a2;
+    real* a3 = cloneR(a2, nn * Cz);
+    s.g1 = gridForward(b.pairHalf.grid1, d, a2, pairMask, maskT, a3, n);
+    s.g2 = gridForward(b.pairHalf.grid2, d, a2, pairMask, maskT, a3, n);
+    GK(cudaMemcpyAsync(pairOut, a3, nn * Cz * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
+    return s;
+  }
+  const real* mIn = msa;
+  if (!b.updateFirst) s.opm = opmForward(b.opm, msa, msaMask, p, S, n);
+  s.pairA = p;
+  s.msaA = cloneR(msa, rows * Cm);
+  // (update first: the attention reads the incoming pair, which p is about to stop being - a save keeps a pointer)
+  s.att = pwaForward(b.att, msa, msaMask, seqMask, b.updateFirst ? pair : p, s.msaA, S, n);
+  GK(cudaMemcpyAsync(msaOut, s.msaA, rows * Cm * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
+  s.tr = gtForward(b.trans, s.msaA, msaOut, rows, 1);
+  if (b.updateFirst) { s.pairA = p; s.opm = opmForward(b.opm, msaOut, msaMask, p, S, n); }
+  (void)mIn;
+  s.ph = pairformerForward(b.pairHalf, d, p, nullptr, pairMask, maskT, seqMask, nullptr, pairOut, nullptr, n);
+  return s;
+}
+// dmsaOut, dpairOut -> dmsa, dpair (written; may alias them)
+inline void msaBackward(MsaBlock& b, const Dialect& d, const MsaSave& s, const real* msaMask, const real* pairMask,
+                        const real* maskT, const real* seqMask, const real* dmsaOut, const real* dpairOut, real* dmsa,
+                        real* dpair) {
+  const int S = s.S, n = s.n, Cz = b.pairHalf.triOut.C, Cm = b.att.Cm;
+  size_t rows = (size_t)S * n, nn = (size_t)n * n;
+  real* dm = cloneR(dmsaOut, rows * Cm);
+  real* dp = ARENA.get(nn * Cz);
+  if (b.chai) {
+    // pairOut = a2 + g1(a2) + g2(a2); a2 = p + triOut(p) + triIn(p) + T(p); p = pair + gOPM(msa)
+    real* da2 = cloneR(dpairOut, nn * Cz);
+    gridBackward(b.pairHalf.grid2, d, s.g2, pairMask, maskT, dpairOut, da2);
+    gridBackward(b.pairHalf.grid1, d, s.g1, pairMask, maskT, dpairOut, da2);
+    GK(cudaMemcpyAsync(dp, da2, nn * Cz * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
+    gtBackward(b.pairHalf.pairTrans, s.pt, da2, dp);
+    triMulBackward(b.pairHalf.triIn, s.tIn, pairMask, da2, dp);
+    triMulBackward(b.pairHalf.triOut, s.tOut, pairMask, da2, dp);
+    // msaOut = msa + T(msa) + PWA(msa, p)
+    gtBackward(b.trans, s.tr, dmsaOut, dm);
+    pwaBackward(b.att, s.att, msaMask, dmsaOut, dm, dp);
+    opmBackward(b.opm, s.opm, msaMask, dp, dm);
+  } else {
+    pairformerBackward(b.pairHalf, d, s.ph, pairMask, maskT, seqMask, dpairOut, nullptr, dp, nullptr, nullptr);
+    if (b.updateFirst) opmBackward(b.opm, s.opm, msaMask, dp, dm);    // p = pairA + OPM(msaOut)
+    { Scratch sc; real* du = cloneR(dm, rows * Cm); gtBackward(b.trans, s.tr, du, dm); }   // msaOut = msaA + T(msaA)
+    { Scratch sc; real* du = cloneR(dm, rows * Cm); pwaBackward(b.att, s.att, msaMask, du, dm, dp); }
+    if (!b.updateFirst) opmBackward(b.opm, s.opm, msaMask, dp, dm);   // pairA = pair + OPM(msa)
+  }
+  GK(cudaMemcpyAsync(dmsa, dm, rows * Cm * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
+  GK(cudaMemcpyAsync(dpair, dp, nn * Cz * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
+}
+
+// every parameter of an MSA block under `pre` ("trunk.msaBlocks.0"), the port's names
+inline void forEachParam(MsaBlock& b, const std::string& pre, int Cz, int Cm, int Hp, int Dp, int Ha, int Da, int O, int G,
+                         bool opmBiases, bool gridBiases, const std::function<void(const std::string&, Param&, size_t)>& f) {
+  auto ln = [&](const std::string& n, LayerNorm& l, int C) { l.C = C; f(n + "Scale", l.g, C); f(n + "Offset", l.b, C); };
+  auto lin = [&](const std::string& n, Linear& l, int K, int N, bool bias = false, const std::string& bn = "") {
+    l.K = K; l.N = N; l.hasBias = bias; f(n, l.w, (size_t)K * N); if (bias) f(bn, l.b, N);
+  };
+  const std::string O_ = pre + ".outerProductMean";
+  b.opm.C = Cm; b.opm.O = O; b.opm.Cz = Cz; b.opm.grouped = b.chai; b.opm.G = G;
+  ln(O_ + ".layerNormInput", b.opm.ln, Cm);
+  lin(O_ + ".leftProjection", b.opm.left, Cm, O, opmBiases, O_ + ".leftProjectionBias");
+  lin(O_ + ".rightProjection", b.opm.right, Cm, O, opmBiases, O_ + ".rightProjectionBias");
+  const int OO = b.chai ? O / G * O : O * O;
+  if (b.chai) { ln(O_ + ".productNorm", b.opm.pn, OO); b.opm.pn.eps = 0.1f; }
+  f(O_ + ".outputW", b.opm.wo, (size_t)OO * Cz);
+  f(O_ + ".outputB", b.opm.bo, Cz);
+  const std::string A = pre + ".msaAttention1";
+  b.att.Cm = Cm; b.att.Cz = Cz; b.att.H = Ha; b.att.D = Da; b.att.chaiMask = b.chai;
+  ln(A + ".actNorm", b.att.ln, Cm);
+  ln(A + ".pairNorm", b.att.pn, Cz);
+  lin(A + ".pairLogits", b.att.logits, Cz, Ha);
+  lin(A + ".vProjection", b.att.v, Cm, Ha * Da);
+  lin(A + ".gatingQuery", b.att.gate, Cm, Ha * Da);
+  lin(A + ".outputProjection", b.att.out, Ha * Da, Cm);
+  b.trans.C = Cm; b.trans.F = 4 * Cm;
+  ln(pre + ".msaTransition.inputLayerNorm", b.trans.ln, Cm);
+  lin(pre + ".msaTransition.transition1", b.trans.t1, Cm, 8 * Cm);
+  lin(pre + ".msaTransition.transition2", b.trans.t2, 4 * Cm, Cm);
+  forEachParam(b.pairHalf, pre, Cz, 0, Hp, Dp, 0, 0, 4, 4, gridBiases, false, f, true, b.chai);
+}
+
 }  // namespace af3
 }  // namespace grad
