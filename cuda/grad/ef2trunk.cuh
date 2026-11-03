@@ -478,5 +478,80 @@ inline void distogramBackward(Distogram& d, const real* z, int n, const real* dl
   symK<<<blocks(rows * d.C), 256, 0, STREAM>>>(dzs, dz, n, d.C, true);
 }
 
+
+// ---------------------------------------------------------------- the inputs embedder
+// s_inputs [T, Si] = [pool(relu(stack(c0) @ toToken)) | aatype | profile | deletion mean], c0 = LN(features @ linear)
+// (cuda/ef2's inputsEmbedder; the stack is ef2atom.cuh's, windowed as the port's INPUTS_HALF_WINDOW)
+struct InputsEmbedder {
+  Linear lin, toToken;
+  LayerNorm norm;
+  SwaStack stack;
+  int F = 0, Ca = 0, Ct = 0, K = 0, Si = 0;
+};
+inline void forEachParam(InputsEmbedder& e, int F, int Ca, int hidden, int nb, int Ct, int K, int hw,
+                         const std::function<void(const std::string&, Param&, size_t)>& f) {
+  e.F = F; e.Ca = Ca; e.Ct = Ct; e.K = K; e.Si = Ct + 2 * K + 1;
+  e.lin.K = F; e.lin.N = Ca; e.lin.hasBias = false; f("atom/linear", e.lin.w, (size_t)F * Ca);
+  e.norm.C = Ca; f("atom/norm/scale", e.norm.g, Ca); f("atom/norm/offset", e.norm.b, Ca);
+  e.stack.C = Ca; e.stack.hidden = hidden; e.stack.hw = hw;
+  forEachParam(e.stack, "atom", nb, f);
+  e.toToken.K = Ca; e.toToken.N = Ct; e.toToken.hasBias = false; f("atom/toToken", e.toToken.w, (size_t)Ca * Ct);
+}
+struct InputsBatch {
+  AtomLayout L;
+  const real* feat;                     // [A, F] atom features
+  const int *tokStart, *tokAtoms;       // each token's valid atoms (CSR)
+  const real *aatype, *profile, *delMean;   // [T, K], [T, K] and [T] (profile null: the experimental tier's zeros)
+  int T;
+};
+struct InputsSave { real *pre, *c0, *x, *tokPre; LnSave ln; SwaRun run; };
+__global__ void inputsTailK(const real* pooled, const real* aatype, const real* profile, const real* delMean, real* out,
+                            int T, int Ct, int K) {
+  const int Si = Ct + 2 * K + 1;
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)T * Si) return;
+  int token = (int)(t / Si), f = (int)(t % Si);
+  real v;
+  if (f < Ct) v = pooled[(size_t)token * Ct + f];
+  else if ((f -= Ct) < K) v = aatype[(size_t)token * K + f];
+  else if (!profile) v = 0;
+  else v = f < 2 * K ? profile[(size_t)token * K + f - K] : delMean[token];
+  out[t] = v;
+}
+__global__ void colsK(const real* x, int ld, real* out, size_t rows, int C) {   // out = x[:, :C]
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t < rows * C) out[t] = x[(t / C) * ld + t % C];
+}
+inline InputsSave inputsForward(InputsEmbedder& e, const InputsBatch& b, real* sIn) {
+  InputsSave s{};
+  const int A = b.L.A; const size_t AC = (size_t)A * e.Ca, AT = (size_t)A * e.Ct;
+  s.pre = ARENA.get(AC); e.lin.forward(b.feat, s.pre, A);
+  s.c0 = ARENA.get(AC); s.ln = lnForward(e.norm, s.pre, s.c0, A);
+  s.x = ARENA.get(AC); swaStackForward(e.stack, b.L, s.c0, s.c0, s.x, s.run);
+  s.tokPre = ARENA.get(AT); e.toToken.forward(s.x, s.tokPre, A);
+  Scratch sc;
+  real* tok = ARENA.get(AT); reluK<<<blocks(AT), 256, 0, STREAM>>>(tok, s.tokPre, AT);
+  real* pooled = ARENA.get((size_t)b.T * e.Ct);
+  poolK<<<blocks((size_t)b.T * e.Ct), 256, 0, STREAM>>>(tok, b.tokStart, b.tokAtoms, pooled, b.T, e.Ct);
+  inputsTailK<<<blocks((size_t)b.T * e.Si), 256, 0, STREAM>>>(pooled, b.aatype, b.profile, b.delMean, sIn, b.T, e.Ct, e.K);
+  return s;
+}
+// dsIn [T, Si] -> every parameter (the tail is input; the features take no gradient)
+inline void inputsBackward(InputsEmbedder& e, const InputsBatch& b, const InputsSave& s, const real* dsIn) {
+  Scratch sc;
+  const int A = b.L.A; const size_t AC = (size_t)A * e.Ca, AT = (size_t)A * e.Ct;
+  real* dp = ARENA.get((size_t)b.T * e.Ct);
+  colsK<<<blocks((size_t)b.T * e.Ct), 256, 0, STREAM>>>(dsIn, e.Si, dp, b.T, e.Ct);
+  real* dtok = ARENA.zeros(AT);
+  poolBwdK<<<blocks((size_t)b.T * e.Ct), 256, 0, STREAM>>>(dp, b.tokStart, b.tokAtoms, dtok, b.T, e.Ct);
+  reluBwdK<<<blocks(AT), 256, 0, STREAM>>>(dtok, s.tokPre, AT);
+  real* dx = ARENA.get(AC); e.toToken.backward(s.x, dtok, dx, A);
+  real* dc0 = ARENA.zeros(AC); real* dxIn = ARENA.get(AC);
+  swaStackBackward(e.stack, b.L, s.c0, s.run, dx, dxIn, dc0);
+  add(dc0, dxIn, AC);                                   // (the stack's input is c0 too)
+  real* dpre = ARENA.get(AC); lnBackward(e.norm, s.ln, dc0, dpre, A, false);
+  e.lin.backward(b.feat, dpre, nullptr, A);
+}
+
 }  // namespace ef2
 }  // namespace grad

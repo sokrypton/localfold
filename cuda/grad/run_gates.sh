@@ -96,6 +96,7 @@ run cuda/grad/test-ef2diff
 run cuda/grad/test-ef2diff-f64
 run cuda/grad/test-ef2trunk
 run cuda/grad/test-ef2trunk-f64
+run cuda/grad/test-ef2trunk-f64 --inputs
 for b in model-esmfold2-fast-f32 model-esmfold2-f32; do
   if [ ! -d $b ]; then echo "== ef2trunk --parcae: no $b here"; continue; fi
   run cuda/grad/test-ef2trunk --parcae=$b

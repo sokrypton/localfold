@@ -2,13 +2,14 @@
 //   1. float32, the experimental tier (cuda/ef2/weights, data-6mrr): the shim from the vendor's 37 hidden states
 //      against its lm_z and the pair MLP against cuda/ef2's lmPairRows; z_init's seams against the vendor's and the
 //      port's zInit; the four recycle passes' in and out against the vendor's; the trunk against cuda/ef2's
-//      foldingTrunk, the distogram against both. Then a whole backward, timed;
+//      foldingTrunk, the distogram against both; the inputs embedder's s_inputs against both. Then a whole backward,
+//      timed;
 //   2. float32, --parcae=<bundle> (ESMFold2-Fast's, ESMFold2's): the parcae recycle - lmEncoder, the decay, the
 //      readout and the coda - against foldingTrunk under EF2_DETERMINISTIC on a random z_init and language-model
 //      pair;
 //   3. -DGRAD_F64: the backward against central differences end to end (37 states -> shim -> z_init -> trunk ->
 //      distogram), on a small random input with truncated stacks; --parcae=<bundle> the parcae form with its
-//      dropout on and a random initial state.
+//      dropout on and a random initial state; --inputs the inputs embedder on the real input.
 //
 //   nvcc -O1 -std=c++17 -arch=sm_80 -o cuda/grad/test-ef2trunk cuda/grad/test_ef2trunk.cu -lcublas -lcublasLt -ldl -lcurand
 //   cuda/grad/test-ef2trunk [--weights=cuda/ef2/weights] [--input=cuda/ef2/data-6mrr] [--parcae=model-esmfold2-fast-f32]
@@ -49,6 +50,7 @@ static std::vector<double> hostD(const g::real* d, size_t n) { auto h = g::host(
 #ifdef GRAD_F64
 static std::vector<double> hostD(const float* d, size_t n) { std::vector<float> h(n); GK(cudaMemcpy(h.data(), d, n * 4, cudaMemcpyDeviceToHost)); return std::vector<double>(h.begin(), h.end()); }
 #endif
+static std::vector<double> hostF(const float* d, size_t n) { std::vector<float> h(n); GK(cudaMemcpy(h.data(), d, n * 4, cudaMemcpyDeviceToHost)); return std::vector<double>(h.begin(), h.end()); }
 static int* devI(const std::vector<int>& h) {
   int* d; GK(cudaMalloc(&d, std::max<size_t>(h.size(), 1) * 4)); GK(cudaMemcpy(d, h.data(), h.size() * 4, cudaMemcpyHostToDevice));
   return d;
@@ -78,9 +80,40 @@ struct Loader {
   }
 };
 
+
+// ESMFold2's inputs embedder over the loaded input's atoms (cuda/ef2's prepareAtoms gives the layout and the features)
+struct InputsArm {
+  g::ef2::InputsEmbedder e;
+  g::ef2::InputsBatch b;
+  int T = 0, A = 0, Si = 0;
+};
+static void inputsArm(InputsArm& r, Loader& L) {
+  r.T = (int)M.meta("meta/tokens"); r.A = (int)M.len("atom_mask");
+  const int K = (int)M.meta("meta/classes"), nb = (int)M.meta("meta/atomBlocks");
+  Atoms at = prepareAtoms(r.A, "atom");
+  const int Ca = at.ctx.C, Ct = (int)dimOf("f/atom/toToken", 1);
+  g::ef2::forEachParam(r.e, ATOM_FEATURES, Ca, at.ctx.hidden, nb, Ct, K, INPUTS_HALF_WINDOW, L.fn());
+  r.Si = r.e.Si;
+  float* featF = dalloc((size_t)r.A * ATOM_FEATURES);
+  atomFeaturesK<<<blocks((size_t)r.A * ATOM_FEATURES), 256, 0, STREAM>>>(W("ref_pos"), W("ref_charge"), at.ctx.mask,
+    Idev("ref_element"), Idev("ref_atom_name_chars"), featF, r.A);
+  CK(cudaStreamSynchronize(STREAM));
+  const bool msaFeatures = M.has("meta/msaFeatures") && M.meta("meta/msaFeatures") > 0;
+  r.b.L = g::ef2::AtomLayout{r.A, at.ctx.nValid, at.ctx.valid, devReal(hostF(at.ctx.mask, r.A)), devReal(hostF(at.ctx.cosT, (size_t)r.A * 16)),
+                             devReal(hostF(at.ctx.sinT, (size_t)r.A * 16))};
+  r.b.feat = devReal(hostF(featF, (size_t)r.A * ATOM_FEATURES));
+  r.b.tokStart = at.ctx.tokenStart; r.b.tokAtoms = at.ctx.tokenAtoms;
+  r.b.aatype = devReal(M.f("aatype"), (size_t)r.T * K);
+  r.b.profile = msaFeatures ? devReal(M.f("profile"), (size_t)r.T * K) : nullptr;
+  r.b.delMean = devReal(M.f("deletion_mean"), r.T);
+  r.b.T = r.T;
+}
+
 int main(int argc, char** argv) {
   std::string weights = "cuda/ef2/weights", input = "cuda/ef2/data-6mrr", parcae;
+  bool inputsOnly = false;
   for (int i = 1; i < argc; ++i) {
+    if (!strcmp(argv[i], "--inputs")) inputsOnly = true;
     if (!strncmp(argv[i], "--weights=", 10)) weights = argv[i] + 10;
     else if (!strncmp(argv[i], "--input=", 8)) input = argv[i] + 8;
     else if (!strncmp(argv[i], "--parcae=", 9)) parcae = argv[i] + 9;
@@ -130,7 +163,11 @@ int main(int argc, char** argv) {
   }
   // ---------------------------------------------------------------- 1. the experimental tier, against the vendor
   M.load(input);
-  M.load(input + "/oracle");
+  // the vendor's float32-attention dump where there is one: the default dump's atom attention is not float32, and
+  // reads 2.1e-4 from s_inputs that the port and this agree on to 5.5e-8
+  const std::string oracle = access((input + "/oracle-f32att/model.idx").c_str(), R_OK) == 0 ? input + "/oracle-f32att" : input + "/oracle";
+  M.load(oracle);
+  printf("  (the vendor's tensors: %s)\n", oracle.c_str());
   const int T = (int)M.meta("meta/tokens"), Si = (int)M.meta("meta/singleInputs");
   const size_t PT = (size_t)T * T, P = PT * C;
   const int Cm = (int)M.len("c/lm/norm/scale"), S = (int)M.len("c/lm/combine"), B = (int)dimOf("f/distogram/weights", 1);
@@ -220,6 +257,18 @@ int main(int argc, char** argv) {
     expect("the distogram against cuda/ef2's", g::relRms(hostD(lg, PT * B), hostD(lp, PT * B)), 1e-4);
     expect("the distogram against the vendor's", g::relRms(hostD(lg, PT * B), std::vector<double>(M.f("o/distogram"), M.f("o/distogram") + PT * B)), 1e-5);
   }
+  // the inputs embedder, against the vendor's s_inputs and cuda/ef2's inputsEmbedder
+  {
+    InputsArm ia; inputsArm(ia, L);
+    const size_t n = (size_t)T * ia.Si;
+    g::real* si = g::ARENA.get(n);
+    g::ef2::inputsForward(ia.e, ia.b, si);
+    float* sp = dalloc(n);
+    inputsEmbedder(T, ia.A, sp, ia.Si, false);
+    CK(cudaStreamSynchronize(STREAM));
+    expect("s_inputs against cuda/ef2's inputsEmbedder", g::relRms(hostD(si, n), hostD(sp, n)), 1e-5);
+    expect("s_inputs against the vendor's (o/s_inputs)", g::relRms(hostD(si, n), std::vector<double>(M.f("o/s_inputs"), M.f("o/s_inputs") + n)), 1e-5);
+  }
   // a whole step, end to end: the states -> the distogram's logits, timed
   {
     g::ARENA.release();
@@ -256,6 +305,26 @@ int main(int argc, char** argv) {
   }
 #else
   // ---------------------------------------------------------------- 3. the backward against central differences
+  if (inputsOnly) {
+    // the inputs embedder on the real input (its atom layout is the windowed stack's), s_inputs a cotangent
+    M.load(input);
+    InputsArm ia; inputsArm(ia, L);
+    const size_t n = (size_t)ia.T * ia.Si;
+    printf("ESMFold2's inputs embedder backward: %d tokens, %d atoms, %d blocks\n", ia.T, ia.A, (int)ia.e.stack.blocks.size());
+    g::real *si, *ct = devReal(gauss(n, 21, 1)); GK(cudaMalloc(&si, n * sizeof(g::real)));
+    auto fwd = [&] { g::ARENA.reset(); g::ef2::inputsForward(ia.e, ia.b, si); };
+    L.ps.zeroGrad();
+    g::ARENA.reset();
+    auto s1 = g::ef2::inputsForward(ia.e, ia.b, si);
+    g::ef2::inputsBackward(ia.e, ia.b, s1, ct);
+    g::GradCheck gc;
+    gc.verbose = getenv("GRAD_VERBOSE") != nullptr;
+    for (auto* q : L.ps.all) gc.add(*q);
+    gc.output(si, ct, n);
+    failed += gc.run(fwd);
+    printf("%s\n", failed ? "FAIL" : "PASS");
+    return failed ? 1 : 0;
+  }
   const int T = 12, R = T - 1, nb = 2, nl = 1, nc = 1, lp = 2;
   const size_t PT = (size_t)T * T, P = PT * C;
   const bool par = !parcae.empty();
