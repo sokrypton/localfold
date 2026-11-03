@@ -1812,13 +1812,23 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     resolve.destroy();
   }
 
-  /** Run steps (or programs) now, in one compute pass. */
-  run(...items) {
-    const encoder = this.device.createCommandEncoder({ label: "bioemu2" });
-    const pass = encoder.beginComputePass({ label: "bioemu2" });
-    for (const item of items.flat()) {
+  /**
+   * Run steps (or programs) now, in one compute pass, or with `oneSubmitEach` a submission a step: the pairwise
+   * conditioner's two dozen passes over a 256-channel pair are 2.9 s at 600 tokens, and a driver judges a hang by how
+   * long one submission keeps the card.
+   */
+  run(items, { oneSubmitEach = false } = {}) {
+    let encoder = this.device.createCommandEncoder({ label: "bioemu2" });
+    let pass = encoder.beginComputePass({ label: "bioemu2" });
+    for (const item of [items].flat()) {
       if (item.run) item.run(pass);
       else { pass.setPipeline(item.pipeline); pass.setBindGroup(0, item.bindGroup); pass.dispatchWorkgroups(item.x, item.y); }
+      if (oneSubmitEach) {
+        pass.end();
+        this.device.queue.submit([encoder.finish()]);
+        encoder = this.device.createCommandEncoder({ label: "bioemu2" });
+        pass = encoder.beginComputePass({ label: "bioemu2" });
+      }
     }
     pass.end();
     this.device.queue.submit([encoder.finish()]);
