@@ -53,23 +53,28 @@ export class Bioemu2Gpu {
     this.host = new Map();
   }
 
+  /** Once, if it works: this network lasts as long as its device, and a fold whose download failed is not its last. */
+  once(map, key, start) {
+    if (!map.has(key)) {
+      const pending = start();
+      map.set(key, pending);
+      pending.catch(() => { if (map.get(key) === pending) map.delete(key); });
+    }
+    return map.get(key);
+  }
+
   /** A weight on the device, once. */
   async w(name, { half = this.half, transform } = {}) {
     if (!transform) return this.stacked(`${name}|${half}|`, [name], half);
-    const key = `${name}|${half}|t`;
-    if (!this.weights.has(key)) {
-      this.weights.set(key, (async () => {
-        const values = transform(await this.read(name));
-        return this.ops.weight(name, values, half && values.length % 2 === 0);
-      })());
-    }
-    return this.weights.get(key);
+    return this.once(this.weights, `${name}|${half}|t`, async () => {
+      const values = transform(await this.read(name));
+      return this.ops.weight(name, values, half && values.length % 2 === 0);
+    });
   }
 
   /** A weight on the host, once. */
   async h(name) {
-    if (!this.host.has(name)) this.host.set(name, this.read(name));
-    return this.host.get(name);
+    return this.once(this.host, name, () => this.read(name));
   }
 
   async hostGroup(prefix, names) {
@@ -84,21 +89,18 @@ export class Bioemu2Gpu {
    * never uploaded on their own.
    */
   async stacked(key, names, half, swiglu = false) {
-    if (!this.weights.has(key)) {
-      this.weights.set(key, (async () => {
-        const flat = names.flatMap((n) => (swiglu ? [`${n}/fc1/weight`, `${n}/fc2/weight`] : [n]));
-        if (typeof this.read.source === "function" && typeof this.read.decode === "function") {
-          const sources = await Promise.all(flat.map((n) => this.read.source(n)));
-          return this.ops.weightFromSources(key, sources, half, this.read.decode);
-        }
-        const parts = await Promise.all(flat.map((n) => this.read(n)));
-        const all = new Float32Array(parts.reduce((t, v) => t + v.length, 0));
-        let at = 0;
-        for (const v of parts) { all.set(v, at); at += v.length; }
-        return this.ops.weight(key, all, half && all.length % 2 === 0);
-      })());
-    }
-    return this.weights.get(key);
+    return this.once(this.weights, key, async () => {
+      const flat = names.flatMap((n) => (swiglu ? [`${n}/fc1/weight`, `${n}/fc2/weight`] : [n]));
+      if (typeof this.read.source === "function" && typeof this.read.decode === "function") {
+        const sources = await Promise.all(flat.map((n) => this.read.source(n)));
+        return this.ops.weightFromSources(key, sources, half, this.read.decode);
+      }
+      const parts = await Promise.all(flat.map((n) => this.read(n)));
+      const all = new Float32Array(parts.reduce((t, v) => t + v.length, 0));
+      let at = 0;
+      for (const v of parts) { all.set(v, at); at += v.length; }
+      return this.ops.weight(key, all, half && all.length % 2 === 0);
+    });
   }
 
   /** [fc1; fc2] stacked, so a SwiGLU's two projections are one GEMM. */

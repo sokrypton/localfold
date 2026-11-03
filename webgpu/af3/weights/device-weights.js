@@ -106,7 +106,7 @@ export async function residentPackedOnDevice(device, options) {
       // purpose. Measured: a page fold's Trunk 1/2 phase went 647 ms to 778.
       // The promise still fires, and the buffers still go; nothing between now
       // and then reads them.
-      void device.queue.onSubmittedWorkDone().then(release);
+      void device.queue.onSubmittedWorkDone().then(release, release);
     },
     variant);
 }

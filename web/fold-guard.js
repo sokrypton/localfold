@@ -64,9 +64,16 @@ async function foldTurn(signal, onWaiting) {
       return lock === null ? undefined : held;
     }).catch(reject);
   });
-  if (!await take({ ifAvailable: true })) {
-    onWaiting();
-    await take({ signal });
+  try {
+    if (!await take({ ifAvailable: true })) {
+      onWaiting();
+      await take({ signal });
+    }
+  } catch (cause) {
+    if (signal.aborted) throw cause;
+    // Refused outright, as on an opaque origin: this fold goes on, as in a browser with no locks at all.
+    console.warn("fold lock", cause);
+    return () => {};
   }
   return finish;
 }

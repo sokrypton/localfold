@@ -10,6 +10,7 @@ import { CpuBackend } from "../cpu/runtime/backend.js";
 import { setLinearBackend } from "../cpu/runtime/linear-backend.js";
 import { foldEsmfold2Cpu } from "./esmfold2-cpu-fold.js";
 import { loadEsmfold2CpuWeights } from "../cpu/esmfold2/load.js";
+import { ModelDownloadError } from "../shared/bundles/http-tensor-store.js";
 
 let held;
 
@@ -47,6 +48,7 @@ self.onmessage = async ({ data }) => {
     });
     self.postMessage({ type: "result", result }, [...movable(result.coordinates), ...movable(result.contacts)]);
   } catch (error) {
-    self.postMessage({ type: "error", message: error?.message ?? String(error), stack: error?.stack });
+    self.postMessage({ type: "error", message: error?.message ?? String(error), stack: error?.stack,
+                       ...(error instanceof ModelDownloadError ? { downloadFailed: error.reason } : {}) });
   }
 };

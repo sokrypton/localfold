@@ -623,7 +623,13 @@ async function foldHolding(device, batch, weights, options, held) {
     setStreamedWeights(device, prefixes);
   }
   const { tokens, dense } = batch;
-  const stage = (name, detail = {}) => options.onStage?.(name, detail);
+  // Most of these are awaited. The ones that only announce are not, and a page that has been stopped rejects them all: the
+  // next that is awaited says so, and these would each be an uncaught rejection in its console.
+  const stage = (name, detail = {}) => {
+    const answered = options.onStage?.(name, detail);
+    answered?.catch?.(() => {});
+    return answered;
+  };
 
   // Announced before it runs and awaited, so a page can say what is happening
   // and hand back a frame first. It used to be five seconds of blocked main

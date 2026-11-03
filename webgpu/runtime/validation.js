@@ -46,6 +46,7 @@ export class DeferredValidation {
     // an abort, most often - which would report the wrong failure.
     this.#pending.push(this.#device.popErrorScope().then(
       (error) => (error === null ? null : `${where}: ${error.message}`),
+      (cause) => `${where}: ${cause.message}`,
     ));
   }
 

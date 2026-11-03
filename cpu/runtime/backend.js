@@ -70,7 +70,8 @@ export class CpuBackend {
     try {
       memory = new WebAssembly.Memory({ initial: pages, maximum: pages, shared });
     } catch (error) {
-      throw new Error(`The CPU fold could not reserve ${gibibytes} GiB of address space: ${error.message}`);
+      console.warn("WebAssembly.Memory", error);
+      throw new Error(`The CPU fold could not get the ${gibibytes} GiB of memory it reserves. Close other tabs and press Fold again.`);
     }
     const module = await WebAssembly.compile(
       gemmModuleBytes({ shared, pages, relaxed: relaxedSimdSupported() }));

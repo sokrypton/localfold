@@ -5,7 +5,7 @@
  * Every number shown is read when the panel opens, so nothing polls while it is shut.
  */
 import { clearShardCaches, shardCacheContents } from "../shared/bundles/http-tensor-store.js";
-import { applyMemoryLimit, deviceSummary, planningGpu, releaseDevice } from "./model.js";
+import { applyMemoryLimit, askForAdapter, deviceSummary, planningGpu, releaseDevice } from "./model.js";
 import { chosenLimitBytes, forgetLearnedLimit, gpuName, learnedLimitBytes, setChosenLimitBytes } from "./gpu-limits.js";
 
 const THEME_KEY = "localfold.theme";
@@ -59,15 +59,40 @@ export async function useCpuForNow(keepPage) {
   return false;
 }
 
-/** How many threads a CPU fold gets: the physical cores, so the machine stays usable. */
+/** The physical cores, so the machine stays usable, and no more than memory can feed. */
+const MOST_CPU_THREADS = 32;
+const coresToUse = () => Math.min(MOST_CPU_THREADS, Math.max(1, Math.ceil((navigator.hardwareConcurrency ?? 4) / 2)));
+
+/** How many threads a CPU fold gets. */
 export function cpuThreads() {
-  const logical = navigator.hardwareConcurrency ?? 4;
-  return window.crossOriginIsolated === true ? Math.max(1, Math.ceil(logical / 2)) : 1;
+  return window.crossOriginIsolated === true ? coresToUse() : 1;
 }
+
+/**
+ * When the page last reloaded to turn isolation on, so that one it did not isolate does not try for ever. A time and not a
+ * flag: a tab's sessionStorage does not follow it across the change of browsing context group that isolation is, so a hard
+ * reload back out of an isolated page finds the mark that page cleared in its own copy.
+ */
+const ISOLATION_TRIED_KEY = "localfold.isolation-tried";
+const ISOLATION_RELOAD_MS = 30 * 1000;
+/** How long the worker gets to start. One that fails to install leaves `serviceWorker.ready` waiting for ever. */
+const ISOLATION_WAIT_MS = 5 * 1000;
+
+/**
+ * A browser that will not register the worker (a private window in some), or one where the worker did not give this page
+ * its headers, keeps it on one thread.
+ */
+let isolationRefused = (() => {
+  try {
+    const tried = Number(sessionStorage.getItem(ISOLATION_TRIED_KEY));
+    sessionStorage.removeItem(ISOLATION_TRIED_KEY);
+    return Date.now() - tried < ISOLATION_RELOAD_MS && window.crossOriginIsolated !== true;
+  } catch { return false; }
+})();
 
 /** How many a CPU fold would get, for a plan: a page that is not isolated yet becomes so on the way to one. */
 export function cpuThreadsOnceIsolated() {
-  return "serviceWorker" in navigator ? Math.max(1, Math.ceil((navigator.hardwareConcurrency ?? 4) / 2)) : cpuThreads();
+  return "serviceWorker" in navigator && !isolationRefused ? coresToUse() : cpuThreads();
 }
 
 const LIMIT_CHOICES_GIB = [1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 20, 24, 32, 40, 48, 64, 80];
@@ -106,8 +131,17 @@ function segments(host, options, current, onChoose) {
 export async function setIsolated(wanted) {
   if (!("serviceWorker" in navigator)) return false;
   if (wanted) {
-    await navigator.serviceWorker.register("./coi-worker.js");
-    await navigator.serviceWorker.ready;
+    if (isolationRefused) return false;
+    try {
+      await navigator.serviceWorker.register("./coi-worker.js");
+      await Promise.race([navigator.serviceWorker.ready, new Promise((_, reject) => {
+        setTimeout(() => reject(new Error("the service worker did not start")), ISOLATION_WAIT_MS);
+      })]);
+    } catch (cause) {
+      isolationRefused = true;
+      throw cause;
+    }
+    try { sessionStorage.setItem(ISOLATION_TRIED_KEY, String(Date.now())); } catch { /* a private window: it may try again */ }
     return true;
   }
   const registrations = await navigator.serviceWorker.getRegistrations();
@@ -149,7 +183,7 @@ export function installSettings({ onReleaseGpu, onComputeChange, onLimitChange, 
       return;
     }
     let adapter = null;
-    try { adapter = await navigator.gpu?.requestAdapter({ powerPreference: "high-performance" }); } catch { /* none */ }
+    try { adapter = navigator.gpu === undefined ? null : await askForAdapter(); } catch { /* none, or none that answers */ }
     if (adapter === null || adapter === undefined) {
       badge.textContent = "No GPU found";
       toggle.dataset.state = "missing";
@@ -170,7 +204,11 @@ export function installSettings({ onReleaseGpu, onComputeChange, onLimitChange, 
                // Threads need a load that happens under the worker's headers.
                computeNote.textContent = "Reloading once, so the fold can use every core…";
                keepPage?.();
-               if (await setIsolated(true)) location.reload();
+               try {
+                 if (await setIsolated(true)) { location.reload(); return; }
+               } catch (cause) { console.warn("isolation", cause); }
+               describeCompute();
+               onComputeChange?.(choice);
              } else if (choice !== "cpu" && window.crossOriginIsolated === true) {
                await setIsolated(false);
              }

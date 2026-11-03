@@ -293,7 +293,7 @@ export const toPoints = (positions, count) => Array.from(
 export function fittedPdb(batch, positions, reference, slots, plddt, options = {}) {
   const api = window.py2Dmol;
   const count = batch.tokens * batch.dense;
-  if (api?.superpose === undefined || reference === null) {
+  if (api?.superpose === undefined || reference === null || slots.length < 3) {
     return toPdb(batch, positions, plddt, options);
   }
   const moved = api.superpose(toPoints(positions, count), reference,

@@ -129,6 +129,10 @@ def chrome_flags():
     if os.environ.get("LOCALFOLD_STOCK_FLAGS") == "1":
         return headless + [f for f in LINUX_FLAGS if "vulkan_enable_f16" not in f] \
             + ["--disable-gpu-sandbox"]
+    # ...and LOCALFOLD_F16_ONLY=1 keeps only the toggle: shader-f16 and no matrix units, which is what a stock browser
+    # gets on Windows and macOS. Both flags together are a configuration no visitor has, on any platform.
+    if os.environ.get("LOCALFOLD_F16_ONLY") == "1":
+        return headless + LINUX_FLAGS + ["--disable-gpu-sandbox"]
     return headless + LINUX_FLAGS + ["--enable-unsafe-webgpu", "--disable-gpu-sandbox"]
 
 
@@ -163,7 +167,8 @@ def launch(port, profile, keep=False, extra_args=()):
         "--user-data-dir=" + profile, "--no-first-run",
         "--hide-scrollbars", "--remote-debugging-port=%d" % port, "about:blank"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    end = time.time() + 25
+    # ...which a first start in a cold container has taken more than 25 s to reach.
+    end = time.time() + 60
     while time.time() < end:
         try:
             js = json.load(urllib.request.urlopen("http://127.0.0.1:%d/json/list" % port))

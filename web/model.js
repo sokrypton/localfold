@@ -15,6 +15,7 @@
  * NO DOM IN HERE. Progress arrives as a callback, because the two pages report
  * it differently and neither one's markup belongs in a module about weights.
  */
+import { settleReleasedMemory } from "../webgpu/runtime/allocator.js";
 import { AlphaFoldFixture } from "../shared/bundles/alphafold-fixture.js";
 import { HttpTensorStore } from "../shared/bundles/http-tensor-store.js";
 import { tensorByteLength } from "../shared/weights/dtype.js";
@@ -183,8 +184,8 @@ export function onDeviceFault(listener) {
 }
 
 function reportFault(kind, message, device) {
-  const resident = memoryTotals(device).residentBytes;
-  for (const listener of deviceListeners) listener({ kind, message, resident });
+  const { residentBytes: resident, budgetBytes: budget } = memoryTotals(device);
+  for (const listener of deviceListeners) listener({ kind, message, resident, budget });
 }
 
 /**
@@ -207,6 +208,17 @@ export async function releaseDevice() {
   } catch {
     return false;
   }
+}
+
+/**
+ * Whatever a fold let go of, off the card. A destroyed buffer's memory comes back on a device tick, an idle page makes none,
+ * and a fold that ended in an exception has not made its own: 920 MiB stayed held after one at 200 residues of OpenBind-0.
+ */
+export async function settleHeldDevice() {
+  if (devicePromise === undefined) return;
+  try {
+    await settleReleasedMemory(await devicePromise);
+  } catch { /* lost or refused, which gave it back */ }
 }
 
 /** The live device's identity and memory, or undefined when none is held. */
@@ -236,6 +248,25 @@ const NO_ADAPTER = "WebGPU found no usable GPU. If a fold just failed, the brows
 let deviceRefused = false;
 let planningAdapter;
 
+/** How long a browser gets to answer for a GPU. A wedged GPU process answers neither yes nor no. */
+const ADAPTER_WAIT_MS = 20 * 1000;
+const DEVICE_WAIT_MS = 30 * 1000;
+
+function within(asked, milliseconds, message, onLate) {
+  return new Promise((resolve, reject) => {
+    let late = false;
+    const timer = setTimeout(() => { late = true; reject(new Error(message)); }, milliseconds);
+    asked.then((value) => {
+      clearTimeout(timer);
+      if (late) onLate?.(value); else resolve(value);
+    }, (cause) => { clearTimeout(timer); reject(cause); });
+  });
+}
+
+/** The browser's high-performance adapter, or a rejection if it has not answered in time. */
+export const askForAdapter = () => within(navigator.gpu.requestAdapter({ powerPreference: "high-performance" }),
+                                          ADAPTER_WAIT_MS, "the browser did not answer for a GPU");
+
 const automaticBudget = (adapter) => budgetForDevice(4, {
   gpuMemoryBytes: gpuMemoryBytes(adapter), learnedBytes: learnedLimitBytes(), userBytes: chosenLimitBytes(),
 });
@@ -247,7 +278,7 @@ const automaticBudget = (adapter) => budgetForDevice(4, {
 export async function planningGpu() {
   if (navigator.gpu === undefined) return undefined;
   try {
-    planningAdapter ??= navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+    planningAdapter ??= askForAdapter();
     const adapter = await planningAdapter;
     if (adapter === null) {
       planningAdapter = undefined;
@@ -261,12 +292,14 @@ export async function planningGpu() {
       budgetBytes: held === undefined ? automaticBudget(adapter) : held.budgetBytes,
       automaticBytes: budgetForDevice(4, { gpuMemoryBytes: gpuMemoryBytes(adapter), learnedBytes: learnedLimitBytes() }),
       maxBindingBytes: Math.min(adapter.limits.maxStorageBufferBindingSize, adapter.limits.maxBufferSize),
+      maxBufferBytes: adapter.limits.maxBufferSize,
       halfWeights: adapter.features.has("shader-f16"),
       software: adapter.info?.isFallbackAdapter === true || /SwiftShader|llvmpipe|Basic Render/i.test(name),
       refusing: deviceRefused,
     };
   } catch (cause) {
     console.warn("planning", cause);
+    planningAdapter = undefined;
     return undefined;
   }
 }
@@ -289,8 +322,14 @@ export function getDevice() {
   // against a dead device after any failure bad enough to lose one.
   const request = (async () => {
     if (navigator.gpu === undefined) throw new Error("This browser has no WebGPU. It ships in current Chrome, Edge, Safari and Firefox.");
-    const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
-    if (adapter === null) throw new Error(NO_ADAPTER);
+    const adapter = await askForAdapter().catch((cause) => {
+      console.warn("requestAdapter", cause);
+      return null;
+    });
+    if (adapter === null) {
+      planningAdapter = undefined;
+      throw new Error(NO_ADAPTER);
+    }
     // 🔴 THE PAGE IS THE ONE CALLER THAT HAS TO SURVIVE BEING WRONG. A bench
     // that asks for too much should fail loudly and does; a page that asks for
     // too much takes the machine down with it, so this is where the ceiling is
@@ -299,10 +338,10 @@ export function getDevice() {
     const gpuMemory = gpuMemoryBytes(adapter);
     let device;
     try {
-      device = await requestAlphaFoldDevice(adapter, {
+      device = await within(requestAlphaFoldDevice(adapter, {
         memoryBudgetBytes: budgetForDevice(4, { gpuMemoryBytes: gpuMemory, learnedBytes: learnedLimitBytes(),
                                                 userBytes: chosenLimitBytes() }),
-      });
+      }), DEVICE_WAIT_MS, "the browser did not answer for a device", (late) => late.destroy());
     } catch (cause) {
       // Measured on Windows after a driver reset: an adapter is still offered and every device request is refused with
       // DXGI_ERROR_DEVICE_REMOVED, for as long as this browser's GPU process lives.
@@ -322,7 +361,9 @@ export function getDevice() {
       // What the page holds on a lost device goes when this says so, and until then the browser keeps it on the card:
       // measured, about 5 GiB of an 8 GiB card after a reset.
       try { device.destroy(); } catch { /* it is lost either way */ }
-      reportFault("lost", `The GPU device was lost${info.message ? `: ${info.message}` : ""}`, device);
+      console.error("device lost", info.message);
+      const reason = info.message?.split("\n", 1)[0].trim().replace(/\.$/, "");
+      reportFault("lost", `The GPU device was lost${reason ? `: ${reason}` : ""}.`, device);
     });
     // A failed createBuffer returns an invalid buffer and says nothing until the
     // validation errors that follow, or until the fold reads back zeros. This is

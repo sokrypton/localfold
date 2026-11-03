@@ -42,7 +42,7 @@ Object.defineProperty(globalThis, "navigator", {
   value: { gpu: { requestAdapter: async () => adapters.shift() ?? null }, deviceMemory: 16 },
 });
 
-const { deviceSummary, getDevice, onDeviceFault, releaseDevice } = await import("../web/model.js");
+const { deviceSummary, getDevice, onDeviceFault, planningGpu, releaseDevice } = await import("../web/model.js");
 
 const settled = () => new Promise((resolve) => { setTimeout(resolve, 5); });
 
@@ -61,6 +61,31 @@ describe("the page's device", () => {
 
   it("says what to do about no adapter", async () => {
     await assert.rejects(getDevice(), /close every window of this browser/);
+  });
+
+  it("stops planning on an adapter that has gone, once a device request finds none", async () => {
+    await assert.rejects(getDevice(), /no usable GPU/);
+    const { adapter } = fakeAdapter();
+    adapter.limits = { maxBufferSize: 2 ** 31, maxStorageBufferBindingSize: 2 ** 31 };
+    adapters.push(adapter);
+    assert.notEqual(await planningGpu(), undefined);
+    // ...asked once and remembered, which a line rewritten at every keystroke needs: a second crash, while the first's new
+    // device was being asked for, left every later line and press planning on this one.
+    assert.notEqual(await planningGpu(), undefined);
+    await assert.rejects(getDevice(), /no usable GPU/);
+    assert.equal(await planningGpu(), undefined);
+  });
+
+  it("says one line of why a device was lost", async () => {
+    const { adapter, device } = fakeAdapter();
+    adapters.push(adapter);
+    await getDevice();
+    const faults = [];
+    const stop = onDeviceFault((fault) => faults.push(fault));
+    device.fail("ID3D12Device::GetDeviceRemovedReason failed with DXGI_ERROR_DEVICE_HUNG (0x887A0006)\n - While handling\n    at CheckHRESULTImpl\n\nBackend messages:\n");
+    await settled();
+    stop();
+    assert.equal(faults[0].message, "The GPU device was lost: ID3D12Device::GetDeviceRemovedReason failed with DXGI_ERROR_DEVICE_HUNG (0x887A0006).");
   });
 
   it("hands out one device while it is alive", async () => {

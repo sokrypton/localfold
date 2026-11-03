@@ -156,7 +156,7 @@ for (const threads of [1, 3]) {
 
 describe("a backend whose weights pass 2 GiB", () => {
   // 600M's weights do, and 300M's do not, so nothing else here reaches these offsets.
-  it("multiplies, contracts and gates at offsets above 2^31", { skip: !gemmSupported() }, async () => {
+  it("multiplies, contracts and gates at offsets above 2^31", async () => {
     const high = await CpuBackend.create({ threads: 2 });
     const low = await CpuBackend.create({ threads: 2 });
     try {

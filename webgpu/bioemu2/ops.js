@@ -899,7 +899,7 @@ export class Bioemu2Ops {
       this.weightBytes += buffer.size;
       if (dest === "f16") buffer.half = true;
       const release = await runBlockUpload(this.device, planned.gpu, buffer);
-      void this.device.queue.onSubmittedWorkDone().then(release);
+      void this.device.queue.onSubmittedWorkDone().then(release, release);
       return buffer;
     }
     const parts = sources.map((s) => decode(s));

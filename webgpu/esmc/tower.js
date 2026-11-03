@@ -187,7 +187,7 @@ async function decodeIntoOnDevice(device, source, elements, destination, multipl
   // 🔴 NOT AWAITED. The staging goes when the queue says so; waiting here would
   // put a host-device synchronisation inside the block loop, which is the one
   // thing this loop is written to avoid. See webgpu/af3/weights/device-weights.js.
-  void device.queue.onSubmittedWorkDone().then(release);
+  void device.queue.onSubmittedWorkDone().then(release, release);
   return true;
 }
 

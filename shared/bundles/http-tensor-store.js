@@ -18,18 +18,47 @@ function delay(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
-async function fetchWithRetry(url, label) {
+/** The network's failure and not the model's: nothing is wrong with the fold, and the next press finds what has arrived. */
+export class ModelDownloadError extends Error {
+  constructor(message, reason) {
+    super(message);
+    this.name = "ModelDownloadError";
+    this.reason = reason;
+  }
+}
+
+/**
+ * Until nothing has arrived for a while, and then `onStall`. A connection that stops without closing says nothing at all:
+ * the page sat on one percentage for good. "Nothing" means on any connection, by `lastArrival`, because on a slow line a
+ * request that has no answer yet is usually waiting for a socket: Chrome gives HTTP/1.1 six to a host, and a shard can take
+ * many minutes. So one stalled among seven that are arriving waits for them, and costs that much.
+ */
+function watchForStall(lastArrival, onStall) {
+  const started = performance.now();
+  const timer = setInterval(() => {
+    if (performance.now() - Math.max(started, lastArrival()) < HttpTensorStore.stallMs) return;
+    clearInterval(timer);
+    onStall();
+  }, HttpTensorStore.stallMs / 15);
+  return () => clearInterval(timer);
+}
+
+async function fetchWithRetry(url, label, lastArrival = () => 0) {
   let lastFailure = 0;
   for (let attempt = 0; attempt < 5; attempt += 1) {
     // A dropped connection rejects rather than answering with a status, and it
     // is the likelier failure across a few hundred MiB on a laptop's wifi.
     let response;
+    const asking = new AbortController();
+    const stopWatching = watchForStall(lastArrival, () => asking.abort(new Error("nothing arrived for a long time")));
     try {
-      response = await fetch(url);
+      response = await fetch(url, { signal: asking.signal });
     } catch (error) {
       lastFailure = error instanceof Error ? error.message : String(error);
       if (attempt < 4) await delay(250 * 2 ** attempt);
       continue;
+    } finally {
+      stopWatching();
     }
     if (response.ok) return response;
     lastFailure = response.status;
@@ -37,7 +66,8 @@ async function fetchWithRetry(url, label) {
     await response.body?.cancel();
     await delay(250 * 2 ** attempt);
   }
-  throw new Error(`failed to load ${label}: ${lastFailure}`);
+  throw new ModelDownloadError(`failed to load ${label}: ${lastFailure}`,
+                               typeof lastFailure === "number" ? `HTTP ${lastFailure}` : lastFailure);
 }
 
 /**
@@ -158,14 +188,15 @@ export function staleShardCaches(names, manifest, manifestUrl) {
  * written, and the next visit downloaded everything again.
  */
 function openShardCache(manifest, manifestUrl) {
-  if (typeof caches === "undefined") return Promise.resolve(undefined);
+  // ...and reading the name can itself throw, where a browser blocks this origin's storage.
+  try { if (typeof caches === "undefined") return Promise.resolve(undefined); } catch { return Promise.resolve(undefined); }
   void (async () => {
     for (const stale of staleShardCaches(await caches.keys(), manifest, manifestUrl)) {
       await caches.delete(stale);
     }
   })().catch(() => {});
   // ...rejects on an insecure origin, in private mode, or with no quota.
-  return caches.open(shardCacheName(manifest, manifestUrl)).catch(() => undefined);
+  return Promise.resolve().then(() => caches.open(shardCacheName(manifest, manifestUrl))).catch(() => undefined);
 }
 
 let persistenceAsked = false;
@@ -222,8 +253,12 @@ export async function clearShardCaches() {
 
 /** Lazy browser tensor store backed by a JSON manifest and fetchable weight shards. */
 export class HttpTensorStore {
+  /** How long a download goes on with nothing arriving at all. */
+  static stallMs = 30_000;
+
   manifestUrl;
   manifest;
+  #lastArrival = 0;
   #cache = new Map();
   #fileCache = new Map();
   #fileBuffers = new Map();
@@ -307,9 +342,21 @@ export class HttpTensorStore {
   }
 
   tensor(name) {
-    let value = this.#cache.get(name);
-    if (value === undefined) { value = this.#load(name); this.#cache.set(name, value); }
-    return value;
+    return this.#cache.get(name) ?? this.#keep(this.#cache, name, this.#load(name));
+  }
+
+  /**
+   * Keep what is on its way, for as long as it is. A failure is not kept: this store outlives the fold that met it, and a
+   * rejected promise in either map would have answered every later fold of the page with the same dropped connection.
+   */
+  #keep(map, key, pending) {
+    map.set(key, pending);
+    pending.catch(() => { if (map.get(key) === pending) map.delete(key); });
+    return pending;
+  }
+
+  #shard(file, tensorName) {
+    return this.#fileCache.get(file) ?? this.#keep(this.#fileCache, file, this.#scheduleDownload(file, tensorName));
   }
 
   /**
@@ -327,12 +374,7 @@ export class HttpTensorStore {
    */
   tensorAsFloat16(name) {
     const key = `${name}\u0000f16`;
-    let value = this.#cache.get(key);
-    if (value === undefined) {
-      value = this.#load(name, Float16Array);
-      this.#cache.set(key, value);
-    }
-    return value;
+    return this.#cache.get(key) ?? this.#keep(this.#cache, key, this.#load(name, Float16Array));
   }
 
   /**
@@ -428,10 +470,7 @@ export class HttpTensorStore {
     for (const [name, record] of Object.entries(this.manifest.tensors)) {
       if (!firstTensorIn.has(record.file)) firstTensorIn.set(record.file, name);
     }
-    for (const file of order) {
-      if (this.#fileCache.has(file)) continue;
-      this.#fileCache.set(file, this.#scheduleDownload(file, firstTensorIn.get(file)));
-    }
+    for (const file of order) this.#shard(file, firstTensorIn.get(file));
   }
   shape(name) {
     const record = this.manifest.tensors[name]; if (record === undefined) throw new Error(`missing tensor ${name}`);
@@ -475,14 +514,7 @@ export class HttpTensorStore {
   async open(name) {
     const record = this.manifest.tensors[name];
     if (record === undefined) throw new Error(`missing tensor ${name}`);
-    if (!this.#fileBuffers.has(record.file)) {
-      let pendingFile = this.#fileCache.get(record.file);
-      if (pendingFile === undefined) {
-        pendingFile = this.#scheduleDownload(record.file, name);
-        this.#fileCache.set(record.file, pendingFile);
-      }
-      this.#fileBuffers.set(record.file, await pendingFile);
-    }
+    if (!this.#fileBuffers.has(record.file)) this.#fileBuffers.set(record.file, await this.#shard(record.file, name));
     // ...counted per TENSOR, not per shard, so a lazily loaded model fills the
     // progress bar the same way an eagerly loaded one does. The set is what
     // keeps a second open of the same name from counting twice, which the
@@ -537,12 +569,7 @@ export class HttpTensorStore {
   async #load(name, Output = Float32Array) {
     const record = this.manifest.tensors[name];
     if (record === undefined) throw new Error(`missing tensor ${name}`);
-    let pendingFile = this.#fileCache.get(record.file);
-    if (pendingFile === undefined) {
-      pendingFile = this.#scheduleDownload(record.file, name);
-      this.#fileCache.set(record.file, pendingFile);
-    }
-    const buffer = await pendingFile;
+    const buffer = await this.#shard(record.file, name);
     this.#fileBuffers.set(record.file, buffer);
     const byteOffset = record.byteOffset ?? 0;
     const byteLength = tensorByteLength(record);
@@ -609,7 +636,7 @@ export class HttpTensorStore {
     // this file already has a note about exactly that.
     let arrived;
     for (let attempt = 0; attempt < 3; attempt += 1) {
-      const response = await fetchWithRetry(url, `tensor ${tensorName}`);
+      const response = await fetchWithRetry(url, `tensor ${tensorName}`, () => this.#lastArrival);
       // 🔴 THE CACHE COPY IS WRITTEN FROM THE FINISHED BUFFER, NOT TEED OFF THE
       // STREAM. A `response.clone()` put beside the read ties the download to
       // the disk: on a Colab T4 (two vCPUs) IntelliFold-2's 612 MB took 33.6 s
@@ -643,8 +670,8 @@ export class HttpTensorStore {
       await this.#cacheDelete(url);
       if (attempt < 2) await delay(250 * 2 ** attempt);
     }
-    throw new Error(`${file} has an invalid byte length: ${arrived} bytes arrived `
-      + `where the manifest says ${expectedLength}, after three attempts`);
+    throw new ModelDownloadError(`${file} has an invalid byte length: ${arrived} bytes arrived `
+      + `where the manifest says ${expectedLength}, after three attempts`, "the connection kept dropping");
   }
 
   /**
@@ -661,10 +688,13 @@ export class HttpTensorStore {
     const output = new Uint8Array(expectedLength);
     const reader = response.body.getReader();
     let offset = 0;
+    // ...which ends this read as a short one, and a short one is asked for again.
+    const stopWatching = watchForStall(() => this.#lastArrival, () => { void reader.cancel().catch(() => {}); });
     try {
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
+        this.#lastArrival = performance.now();
         if (offset + value.byteLength > output.byteLength) break;
         output.set(value, offset);
         offset += value.byteLength;
@@ -680,6 +710,8 @@ export class HttpTensorStore {
       this.#reportProgress();
     } catch {
       offset = -1;                                   // a torn cache entry reads as a failure
+    } finally {
+      stopWatching();
     }
     this.#lastStreamBytes = Math.max(0, offset);
     if (offset === output.byteLength) return output.buffer;
@@ -702,7 +734,7 @@ export class HttpTensorStore {
   }
 
   async #cacheDelete(url) {
-    try { await this.#shardCache?.delete(url); } catch { /* nothing to drop */ }
+    try { await withTimeout(this.#shardCache?.delete(url), undefined); } catch { /* nothing to drop */ }
   }
   #reportProgress(tensorName) {
     const progress = {

@@ -2,17 +2,23 @@
  * The CPU fold from the page's side: the same callbacks as `foldEsmfold2`, with the
  * work in web/esmfold2-cpu-worker.js.
  */
+import { ModelDownloadError } from "../shared/bundles/http-tensor-store.js";
 import { predictionAbortError } from "../webgpu/runtime/abort.js";
 
 let worker;
 let workerFamily;
+let workerFolded = false;
 
 /** End the worker, which is what stops a fold and gives back its 2 to 4 GiB. */
 export function releaseCpuFold() {
   worker?.terminate();
   worker = undefined;
   workerFamily = undefined;
+  workerFolded = false;
 }
+
+/** Whether the next fold of this model finds the weights and the tower's decode in memory, which only a finished one leaves. */
+export const cpuFoldLoaded = (family) => workerFolded && workerFamily === family;
 
 /**
  * @param {object} options `family`, `entities`, `sequence`, `loops`, `languageModel`,
@@ -42,6 +48,8 @@ export function foldEsmfold2OnCpu(options) {
     if (options.signal?.aborted) { onAbort(); return; }
     options.signal?.addEventListener("abort", onAbort, { once: true });
     running.onerror = (event) => {
+      // Said below, and an error left unhandled here goes on to the page as an uncaught one.
+      event.preventDefault();
       releaseCpuFold();
       finish(reject, new Error(event.message || "The CPU fold's worker failed to start."));
     };
@@ -57,13 +65,17 @@ export function foldEsmfold2OnCpu(options) {
           void options.onStep?.({ step: data.step, total: data.total, coordinates: data.coordinates,
                                   denoised: data.denoised, features });
           break;
-        case "result": finish(resolve, data.result); break;
+        case "result":
+          workerFolded = true;
+          finish(resolve, data.result);
+          break;
         case "error":
           console.error("CPU fold failed", data.stack);
           // A wasm trap or an allocation failure leaves the worker's memory in no
           // state to fold again; a fresh one reloads from the shard cache.
           releaseCpuFold();
-          finish(reject, new Error(data.message));
+          finish(reject, data.downloadFailed === undefined ? new Error(data.message)
+            : new ModelDownloadError(data.message, data.downloadFailed));
           break;
         default:
       }
