@@ -8,7 +8,8 @@ import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 
 import {
-  cpuFoldSeconds, cpuPeakBytes, describePlan, gpuFoldSeconds, noteFold, planEsmfold2, readFoldRates, roughDuration,
+  cpuFoldSeconds, cpuPeakBytes, describePlan, gpuFoldSeconds, measuredFoldSeconds, noteFold, planEsmfold2, planMeasuredModel,
+  readFoldRates, roughDuration,
 } from "../web/compute-plan.js";
 import { cardBudgetBytes } from "../webgpu/runtime/device-memory.js";
 import { esmfold2MaxTokens, esmfold2PeakBytes, esmfold2Spills, FOLD_WEIGHT_BYTES, pairBytes }
@@ -76,12 +77,19 @@ describe("where a fold is sent", () => {
   });
 
   it("asks when the fold is too big for the card, with what the CPU would cost", () => {
-    const plan = planEsmfold2({ tokens: 1400 }, machine);
+    const plan = planEsmfold2({ tokens: 1400 }, { ...machine, ramBytes: 64 * GIB });
     assert.equal(plan.where, "over");
     assert.equal(plan.why, "memory");
     assert.ok(plan.cpuSeconds > plan.seconds);
     assert.match(describePlan(plan).text, /Needs \d\.\d of 4\.8 GiB · CPU about/);
     assert.equal(describePlan(plan).tone, "warn");
+  });
+
+  it("offers no CPU a fold would not fit in", () => {
+    const plan = planEsmfold2({ tokens: 1400 }, machine);
+    assert.equal(plan.where, "over");
+    assert.equal(plan.cpuFits, false);
+    assert.match(describePlan(plan).text, /^Needs \d\.\d of 4\.8 GiB$/);
   });
 
   it("counts a device without shader-f16 as holding wider weights", () => {
@@ -183,5 +191,89 @@ describe("how long it will take", () => {
 describe("the pair tensor", () => {
   it("is the figure the rest is built on", () => {
     assert.equal(pairBytes(1000), 1000 * 1000 * 256 * 4);
+  });
+});
+
+describe("a CPU fold's memory", () => {
+  it("reads what the process reached, to within 2%", () => {
+    for (const [tokens, measuredGib] of [[76, 2.83], [300, 4.93], [600, 9.97]]) {
+      const planned = cpuPeakBytes({ tokens }) / GIB;
+      assert.ok(Math.abs(planned / measuredGib - 1) < 0.02, `${tokens}: planned ${planned} against ${measuredGib} GiB`);
+    }
+  });
+});
+
+describe("the other models", () => {
+  const onCard = { gpu: rtx3070 };
+
+  it("a size that was measured reads as it was measured", () => {
+    assert.equal(planMeasuredModel("opendde", { tokens: 600 }, onCard).needBytes, 4846 * MIB);
+    assert.equal(planMeasuredModel("boltz2", { tokens: 300 }, onCard).needBytes, 1003 * MIB);
+    assert.equal(measuredFoldSeconds("mol1", { tokens: 300 }), 24);
+  });
+
+  it("past the last size the last line goes on, and more residues never cost less", () => {
+    for (const family of ["boltz2", "opendde", "monomer", "multimer", "bioemu2", "intellifold2"]) {
+      let needed = 0;
+      let taken = 0;
+      for (let tokens = 76; tokens <= 2000; tokens += 50) {
+        const plan = planMeasuredModel(family, { tokens }, { gpu: a10 });
+        assert.ok(plan.needBytes >= needed, `${family} at ${tokens}`);
+        assert.ok(plan.seconds >= taken, `${family} at ${tokens}`);
+        needed = plan.needBytes;
+        taken = plan.seconds;
+      }
+    }
+  });
+
+  it("AlphaFold 3 reads as OpenBind-0, whose weights are not the reader's to accept", () => {
+    assert.deepEqual(planMeasuredModel("af3", { tokens: 400 }, onCard), planMeasuredModel("openbind0", { tokens: 400 }, onCard));
+  });
+
+  it("a model nobody measured has no line", () => {
+    assert.equal(planMeasuredModel("not-a-model", { tokens: 400 }, onCard), undefined);
+    assert.equal(measuredFoldSeconds("not-a-model", { tokens: 400 }), undefined);
+  });
+
+  it("what does not fit says so, and the rest say what they will hold and take", () => {
+    const fits = describePlan(planMeasuredModel("boltz2", { tokens: 300 }, onCard));
+    assert.equal(fits.tone, "plain");
+    assert.match(fits.text, /^1\.0 of 4\.8 GiB · about \d+ s$/);
+    const over = planMeasuredModel("opendde", { tokens: 700 }, onCard);
+    assert.equal(over.over, true);
+    assert.equal(describePlan(over).tone, "warn");
+    assert.match(describePlan(over).text, /^Needs .* of 4\.8 GiB$/);
+  });
+
+  it("every way of having no GPU says it folds on one only", () => {
+    const cases = [{ preference: "cpu", gpu: rtx3070 }, {}, { gpu: { ...rtx3070, refusing: true } }, { gpu: { ...rtx3070, software: true } }];
+    for (const machine of cases) {
+      const shown = describePlan(planMeasuredModel("boltz2", { tokens: 300 }, machine));
+      assert.equal(shown.text, "Folds on a GPU only");
+      assert.equal(shown.tone, "warn");
+      assert.ok(shown.title.length > 0);
+    }
+  });
+
+  it("five models in one press take five times as long, in the memory of one", () => {
+    const one = planMeasuredModel("monomer", { tokens: 300 }, onCard);
+    const five = planMeasuredModel("monomer", { tokens: 300, models: 5 }, onCard);
+    assert.equal(five.seconds, one.seconds * 5);
+    assert.equal(five.needBytes, one.needBytes);
+  });
+
+  it("a fold of any model teaches the card's rate, for all of them and for ESMFold2", () => {
+    const storage = fakeStorage();
+    noteFold({ where: "gpu", card: rtx3070.name, family: "opendde", tokens: 300, loops: 4, seconds: 72 }, storage);
+    const rates = readFoldRates(storage);
+    assert.equal(rates.cards[rtx3070.name], 2);
+    assert.equal(planMeasuredModel("boltz2", { tokens: 300 }, { gpu: rtx3070, rates }).seconds, 22);
+    assert.equal(planEsmfold2({ tokens: 300 }, { gpu: rtx3070, rates }).seconds, 2 * gpuFoldSeconds({ tokens: 300 }));
+  });
+
+  it("a model nobody measured teaches nothing", () => {
+    const storage = fakeStorage();
+    noteFold({ where: "gpu", card: rtx3070.name, family: "not-a-model", tokens: 300, loops: 4, seconds: 72 }, storage);
+    assert.deepEqual(readFoldRates(storage).cards, {});
   });
 });

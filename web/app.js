@@ -61,7 +61,8 @@ import { GpuBufferAllocator } from "../webgpu/runtime/allocator.js";
 import { getDevice, loadModel, onDeviceFault, planningGpu, releaseDevice, releaseModel } from "./model.js";
 import { gpuName, learnFromLoss } from "./gpu-limits.js";
 import { computePreference, cpuThreads, cpuThreadsOnceIsolated, installSettings, useCpuForNow } from "./settings-panel.js";
-import { describePlan, describeRefusal, noteFold, planEsmfold2, readFoldRates, roughDuration } from "./compute-plan.js";
+import { describePlan, describeRefusal, noteFold, planEsmfold2, planMeasuredModel, readFoldRates, roughDuration }
+  from "./compute-plan.js";
 import { beginFold, showProgressInTitle } from "./fold-guard.js";
 import { installViewerTheme } from "./viewer-theme.js";
 import { foldEsmfold2OnCpu, releaseCpuFold } from "./esmfold2-cpu.js";
@@ -3472,6 +3473,10 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
       : named.join(", ");
     what.push(shown);
   }
+  if (reuse === undefined) {
+    noteFold({ where: "gpu", card: gpuName() ?? "", family: graphOf(family), tokens: residues, loops: recycles + 1,
+               seconds: result.seconds });
+  }
   const detail = [`in ${result.seconds.toFixed(0)} s`
     // Said out loud, because a fold that took a third of the time it used to
     // otherwise reads as something having gone wrong.
@@ -4393,6 +4398,10 @@ async function foldWithBioemu2({ chains, chainKinds, alignment, alignmentBlocks,
   const seconds = ((performance.now() - started) / 1000).toFixed(1);
   const sampled = result.samples.length / perSample;
   const residues = chains.reduce((total, chain) => total + chain.length, 0);
+  if (choice === "structure" && samples === 1 && steps === BIOEMU2_DEFAULT_STEPS && !result.stopped) {
+    noteFold({ where: "gpu", card: gpuName() ?? "", family, tokens: residues, loops: recycleCount() + 1,
+               seconds: Number(seconds) });
+  }
   const named = (modifications ?? []).map((one) => `${one.code}${one.position}`);
   status(`${modelName} · ${residues} res` + (named.length === 0 ? "" : ` + ${named.join(", ")}`)
     + ` · ${choice}` + (propagation ? ` ${propagation.lagNs} ns x ${propagation.steps}` : "")
@@ -5932,6 +5941,9 @@ async function fold(event) {
     // enough to catch.
     updateScoresCard(best.confidence);
     const took = ((performance.now() - started) / 1000).toFixed(1);
+    noteFold({ where: "gpu", card: gpuName() ?? "", family: graphOf(family), models: sweep.length,
+               tokens: chains.reduce((total, chain) => total + chain.length, 0),
+               loops: alignedRecycles.length / sweep.length, seconds: Number(took) });
 
     // 🔴 COUNTED OVER THE WHOLE RUN, because `allRecycles` is one MODEL's and a
     // sweep has five of them. Reading it here was a ReferenceError waiting for
@@ -6087,7 +6099,11 @@ async function fold(event) {
 /** The plan for what the entity rows hold now, or undefined where there is nothing to plan or no plan for this model. */
 async function currentPlan() {
   const family = chosenFamily();
-  if (!isEsmfold2(family) || remoteBackend() !== null) return undefined;
+  if (remoteBackend() !== null) return undefined;
+  // BioEmu2's ensembles batch their samples, and nobody has measured what that holds.
+  if (graphOf(family) === "bioemu2" && (document.getElementById("bioemu2-mode")?.value !== "structure"
+    || Number(document.getElementById("bioemu2-samples")?.value) !== 1
+    || Number(element("af3-count").value) !== BIOEMU2_DEFAULT_STEPS)) return undefined;
   const entities = entityList.read();
   if (entitiesProblem(entities) !== null) return undefined;
   const request = expandEntities(entities);
@@ -6098,6 +6114,11 @@ async function currentPlan() {
   if (tokens === 0) return undefined;
   const preference = computePreference();
   const memory = navigator.deviceMemory;
+  if (!isEsmfold2(family)) {
+    return planMeasuredModel(graphOf(family), { tokens, loops: recycleCount() + 1, models: af2Sweep(family).length }, {
+      preference, gpu: preference === "cpu" ? undefined : await planningGpu(), rates: readFoldRates(),
+    });
+  }
   return planEsmfold2({ tokens, loops: recycleCount() + 1 }, {
     preference, threads: window.crossOriginIsolated === true ? cpuThreads() : cpuThreadsOnceIsolated(),
     gpu: preference === "cpu" ? undefined : await planningGpu(),
@@ -6273,7 +6294,9 @@ installSettings({
 element("entity-rows").addEventListener("input", refreshPlan);
 element("entity-rows").addEventListener("change", refreshPlan);
 new MutationObserver(refreshPlan).observe(element("entity-rows"), { childList: true });
-for (const id of ["model-family", "plm-mode", "recycles"]) element(id).addEventListener("change", refreshPlan);
+for (const id of ["model-family", "plm-mode", "recycles", "af2Model", "bioemu2-mode", "bioemu2-samples", "af3-count"]) {
+  document.getElementById(id)?.addEventListener("change", refreshPlan);
+}
 installViewerTheme();
 
 element("predict").addEventListener("click", (event) => void fold(event));

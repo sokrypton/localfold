@@ -14,14 +14,18 @@ import { esmfold2PeakBytes, esmfold2TokenCeiling, FOLD_MARGIN_BYTES, FOLD_WEIGHT
 
 const RATES_KEY = "localfold.fold-rates";
 
+/** How much of a fold of four passes a fold of this many takes: the sampler and the confidence head run once. */
+const passesShare = (loops) => 0.15 + 0.85 * (loops / 4);
+
 /**
- * What a fold holds in host memory on a CPU, at its fullest.
- *
- * Measured with tools/fold-esmfold2-cpu.mjs: see the CPU fold's record. Every pair-sized tensor the GPU's account above
- * keeps apart lives here at once, because the reference kernels hold them as plain arrays, beside the weights as f32.
+ * What a fold holds in host memory on a CPU, at its fullest: the weights as f32, what grows with the language model and
+ * the atoms, and the pair-sized arrays. Fitted to the process's high-water mark under tools/fold-esmfold2-cpu.mjs, 2.83 GiB
+ * at 76 residues, 4.93 at 300 and 9.97 at 600. The arrays are the plain ones the reference kernels hold, and more of them
+ * than a block needs at once, because a fold keeps what it has finished with for the next kernel that asks.
  */
-export const CPU_WEIGHT_BYTES = 2.5 * 1024 ** 3;
-export const CPU_PEAK_PAIRS = 6;
+export const CPU_WEIGHT_BYTES = 2.44 * 1024 ** 3;
+const CPU_BYTES_PER_TOKEN = 4.15 * 1024 ** 2;
+export const CPU_PEAK_PAIRS = 15;
 /** What a machine's RAM can give one fold: the browser, the desktop and the OS's own caches keep the rest. */
 const RAM_SHARE = 0.7;
 
@@ -31,8 +35,7 @@ const RAM_SHARE = 0.7;
  * reference with a rate of its own: see `noteFold`.
  */
 export function gpuFoldSeconds({ tokens, loops = 4 }) {
-  const trunkShare = 0.15 + 0.85 * (loops / 4);
-  return 1.5 + (4.94e-5 * tokens ** 2 + 3.29e-8 * tokens ** 3) * trunkShare;
+  return 1.5 + (4.94e-5 * tokens ** 2 + 3.29e-8 * tokens ** 3) * passesShare(loops);
 }
 
 /**
@@ -40,12 +43,11 @@ export function gpuFoldSeconds({ tokens, loops = 4 }) {
  * threads for 76 residues, 670 s for 300, and a thread count that stops paying as the memory bus fills.
  */
 export function cpuFoldSeconds({ tokens, loops = 4, threads = 1 }) {
-  const trunkShare = 0.15 + 0.85 * (loops / 4);
-  return 54 * (tokens / 76) ** 1.8 * (0.786 + 1.714 / Math.max(1, threads)) * trunkShare;
+  return 54 * (tokens / 76) ** 1.8 * (0.786 + 1.714 / Math.max(1, threads)) * passesShare(loops);
 }
 
 export const cpuPeakBytes = ({ tokens, channels = 256 }) =>
-  CPU_PEAK_PAIRS * pairBytes(tokens, channels) + CPU_WEIGHT_BYTES;
+  CPU_WEIGHT_BYTES + CPU_BYTES_PER_TOKEN * tokens + CPU_PEAK_PAIRS * pairBytes(tokens, channels);
 
 /**
  * @param {object} fold `tokens`, `loops`
@@ -87,6 +89,63 @@ export function planEsmfold2({ tokens, loops = 4 }, { preference = "auto", gpu, 
   return { where: "gpu", needBytes, budgetBytes: gpu.budgetBytes, spills, seconds, cpuSeconds, cpuFits, threads };
 }
 
+/**
+ * The other models on an A10 through the page, with no alignment: what the fold's own account reached in MiB, and the
+ * seconds of a fold of four passes, at MEASURED_RESIDUES. Between two sizes the estimate is a straight line in n^2 for
+ * memory and n^3 for time, and past the last the last line goes on. Each is named by its graph. AlphaFold 3's weights are
+ * the reader's to accept, and OpenBind-0 is the same graph at the same widths (shared/bundles/manifests), so it stands in.
+ */
+const MEASURED_RESIDUES = [76, 300, 600];
+const MEASURED_MODELS = {
+  bioemu2: { peakMiB: [1524, 1856, 3117], seconds: [13.4, 14.9, 42.1] },
+  boltz2: { peakMiB: [677, 1003, 1329], seconds: [4, 11, 38] },
+  intellifold2: { peakMiB: [1215, 1515, 3377], seconds: [6, 47, 207] },
+  mol1: { peakMiB: [934, 1387, 2443], seconds: [6, 24, 112] },
+  monomer: { peakMiB: [388, 747, 1752], seconds: [3.2, 5.7, 19.1] },
+  multimer: { peakMiB: [401, 1056, 2764], seconds: [2.8, 5.9, 20.4] },
+  openbind0: { peakMiB: [512, 829, 1191], seconds: [4, 9, 30] },
+  opendde: { peakMiB: [1114, 1524, 4846], seconds: [6, 36, 142] },
+  protenix2: { peakMiB: [659, 935, 1550], seconds: [4, 15, 71] },
+  rosettafold3: { peakMiB: [514, 833, 1196], seconds: [4, 9, 34] },
+};
+MEASURED_MODELS.af3 = MEASURED_MODELS.openbind0;
+
+function along(tokens, values, power) {
+  let from = 0;
+  while (from < values.length - 2 && tokens > MEASURED_RESIDUES[from + 1]) from += 1;
+  const [low, high] = [MEASURED_RESIDUES[from] ** power, MEASURED_RESIDUES[from + 1] ** power];
+  return values[from] + (values[from + 1] - values[from]) * (tokens ** power - low) / (high - low);
+}
+
+/** `models`: what one press runs, which is five for AlphaFold 2's "all". Undefined for a model nobody measured. */
+export function measuredFoldSeconds(family, { tokens, loops = 4, models = 1 }) {
+  const measured = MEASURED_MODELS[family];
+  return measured === undefined ? undefined : models * along(tokens, measured.seconds, 3) * passesShare(loops);
+}
+
+/**
+ * A model that folds on a GPU only. This is an estimate for the reader and stops nothing: an alignment adds to it by an
+ * amount a sequence cannot predict, and the fold's own account already refuses what does not fit.
+ *
+ * @param {string} family a graph: see MEASURED_MODELS
+ * @param {{tokens: number, loops?: number, models?: number}} fold
+ * @param {{preference?: "auto"|"cpu", gpu?: object, rates?: object}} machine as planEsmfold2's
+ * @returns {{where: "estimate"|"gpu-only", why?: string, needBytes?: number, budgetBytes?: number, seconds?: number,
+ *            over?: boolean}|undefined} undefined for a model nobody measured
+ */
+export function planMeasuredModel(family, { tokens, loops = 4, models = 1 }, { preference = "auto", gpu, rates = {} }) {
+  const measured = MEASURED_MODELS[family];
+  if (measured === undefined) return undefined;
+  if (preference === "cpu") return { where: "gpu-only", why: "chosen" };
+  if (gpu === undefined) return { where: "gpu-only", why: "no-gpu" };
+  if (gpu.refusing === true) return { where: "gpu-only", why: "gpu-refusing" };
+  if (gpu.software === true) return { where: "gpu-only", why: "software" };
+  const needBytes = along(tokens, measured.peakMiB, 2) * 1024 ** 2;
+  const seconds = measuredFoldSeconds(family, { tokens, loops, models }) * (rates.cards?.[gpu.name] ?? 1);
+  const over = gpu.budgetBytes !== undefined && gpu.budgetBytes !== null && needBytes + FOLD_MARGIN_BYTES > gpu.budgetBytes;
+  return { where: "estimate", needBytes, budgetBytes: gpu.budgetBytes, seconds, over };
+}
+
 const gib = (bytes) => (bytes / 1024 ** 3).toFixed(1);
 
 /** "about 40 s", "about 3 min", "about 1.5 h": as rough as a figure that has not met this machine should read. */
@@ -107,6 +166,31 @@ export function describePlan(plan) {
   const threads = `${plan.threads} CPU thread${plan.threads === 1 ? "" : "s"}`;
   const cpuOption = plan.cpuFits ? ` · CPU ${roughDuration(plan.cpuSeconds)}` : "";
   switch (plan.where) {
+    case "estimate": {
+      const memory = plan.budgetBytes === undefined || plan.budgetBytes === null ? `${gib(plan.needBytes)} GiB`
+        : `${gib(plan.needBytes)} of ${gib(plan.budgetBytes)} GiB`;
+      const measured = "Measured with no alignment, which adds to this.";
+      return plan.over
+        ? { text: `Needs ${memory}`,
+            title: `${measured} More than the page lets one fold hold on this card, which keeps the rest for the desktop`
+              + " and other programs. Settings can change the limit.",
+            tone: "warn" }
+        : { text: `${memory} · ${roughDuration(plan.seconds)}`,
+            title: `${measured} Settings says what the limit is and can change it.`,
+            tone: "plain" };
+    }
+    case "gpu-only":
+      return {
+        text: "Folds on a GPU only",
+        title: {
+          chosen: "Settings has folds on the CPU, where only ESMFold2 runs. Settings: Fold on, GPU.",
+          "no-gpu": "This browser offers no GPU. ESMFold2 folds on the CPU.",
+          "gpu-refusing": "The GPU is not accepting work, and restarting the browser brings it back."
+            + " ESMFold2 folds on the CPU.",
+          software: "This browser's only GPU is a software one. ESMFold2 folds on the CPU.",
+        }[plan.why],
+        tone: "warn",
+      };
     case "gpu": {
       const memory = plan.budgetBytes === undefined || plan.budgetBytes === null ? `${gib(plan.needBytes)} GiB`
         : `${gib(plan.needBytes)} of ${gib(plan.budgetBytes)} GiB`;
@@ -171,14 +255,18 @@ const RATE_RANGE = [0.02, 50];
  * A short fold says little, because its constant is most of it. The average is an even one, so a machine that was busy
  * once does not set its figure for good.
  *
- * @param {{where: "gpu"|"cpu", card?: string, tokens: number, loops: number, threads?: number, seconds: number}} fold
+ * @param {{where: "gpu"|"cpu", card?: string, tokens: number, loops: number, threads?: number, seconds: number,
+ *          family?: string, models?: number}} fold `family`: the graph of a model other than ESMFold2. A card's rate is
+ *   its own whichever model taught it, so a first fold of any of them improves the figures for all of them.
  */
-export function noteFold({ where, card, tokens, loops, threads, seconds }, storage = globalThis.localStorage) {
+export function noteFold({ where, card, tokens, loops, threads, seconds, family, models }, storage = globalThis.localStorage) {
   if (seconds < FOLD_WORTH_TIMING_S) return;
-  const reference = where === "cpu" ? cpuFoldSeconds({ tokens, loops, threads }) : gpuFoldSeconds({ tokens, loops });
-  const measured = Math.min(RATE_RANGE[1], Math.max(RATE_RANGE[0], seconds / reference));
+  const reference = family !== undefined ? measuredFoldSeconds(family, { tokens, loops, models })
+    : where === "cpu" ? cpuFoldSeconds({ tokens, loops, threads }) : gpuFoldSeconds({ tokens, loops });
+  if (reference === undefined) return;
+  const rate = Math.min(RATE_RANGE[1], Math.max(RATE_RANGE[0], seconds / reference));
   const rates = readFoldRates(storage);
-  const blend = (old) => (old === undefined ? measured : (old + measured) / 2);
+  const blend = (old) => (old === undefined ? rate : (old + rate) / 2);
   if (where === "cpu") rates.cpu = blend(rates.cpu);
   else rates.cards[card ?? ""] = blend(rates.cards[card ?? ""]);
   try { storage.setItem(RATES_KEY, JSON.stringify(rates)); } catch { /* a private window: this fold only */ }

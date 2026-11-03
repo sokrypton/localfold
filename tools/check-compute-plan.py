@@ -100,7 +100,6 @@ try:
     usable = adapter is not None and not adapter["fallback"]
     print("adapter", adapter, flush=True)
 
-    # A family with no plan yet shows no line.
     set_control(ws, "model-family", "ef2-fast-600m")
     set_rows(ws, 300)
     plan = read_plan(ws)
@@ -155,10 +154,17 @@ try:
         plan = read_plan(ws)
         check("back to automatic, it fits again", plan["tone"] == "plain", plan["text"])
 
-    # Another family, which has no plan yet.
-    set_control(ws, "model-family", "af3")
+    # A model that folds on a GPU only: an estimate, or that it needs one.
+    set_control(ws, "model-family", "boltz2")
     plan = read_plan(ws)
-    check("a model with no plan shows no line", plan["hidden"], str(plan))
+    if usable:
+        check("another model says what it holds and how long", "GiB" in plan["text"] and "about" in plan["text"], plan["text"])
+        set_rows(ws, 6000)
+        plan = read_plan(ws)
+        check("another model past what the card can hold says so", plan["tone"] == "warn" and "Needs" in plan["text"], plan["text"])
+        set_rows(ws, 300)
+    else:
+        check("no GPU: another model says it folds on one only", plan["text"] == "Folds on a GPU only", plan["text"])
     set_control(ws, "model-family", "ef2-fast-600m")
 
     # A second tab waits its turn, and Stop ends the wait. Held from outside the page, so no fold runs.
