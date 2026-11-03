@@ -92,6 +92,7 @@ import {
 import { looksLikeZip, readZip, writeZip } from "./zip.js";
 import { createEntityList } from "./entity-ui.js";
 import { buildTemplate, describeCoverage, fetchStructure, mergeAtom37Templates, parseSource } from "./template-source.js";
+import { IMPOSSIBLE_FOLD, isImpossibleFold } from "./impossible-fold.js";
 import { fetchMmseqs2Templates } from "../shared/input/mmseqs2-api.js";
 import { RuntimeEstimator } from "../webgpu/runtime/cost-model.js";
 import { nativeRole, installNativeBridge, remoteBackendChoice, remoteBackendName, remoteCommand,
@@ -530,6 +531,12 @@ function syncDownloads() {
  * find an identity is a lookup that is neither total nor one-to-one.
  */
 function recordPrediction(prediction, family) {
+  // Every fold ends here, so this is where a result that cannot be one is refused, with whatever was kept to go on from it.
+  if (isImpossibleFold(prediction)) {
+    forgetDeviceState();
+    esmfold2Trunk = undefined;
+    throw new Error(IMPOSSIBLE_FOLD);
+  }
   // The family still travels ON the prediction: the archive, the session's
   // `localfold` block and the Colab reader all read it, and a label is a
   // thing to read rather than an identifier - see the note above.
