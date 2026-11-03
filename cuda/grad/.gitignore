@@ -13,3 +13,5 @@ test-af3diff-f64
 test-ef2
 test-msap
 test-msap-f64
+test-bioemu2
+test-bioemu2-f64

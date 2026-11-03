@@ -10,7 +10,7 @@
 // close it into a loss. Rematerialised per block like cuda/grad/af2.cuh's stack: each block's input kept, its
 // forward replayed before its backward.
 #pragma once
-#include "ops.cuh"
+#include "pair.cuh"
 
 namespace grad {
 namespace plm {
@@ -74,14 +74,6 @@ inline void allocTower(Tower& t) {
   forEachParam(t, [&](const std::string& n, Param& p, size_t len) { allocParam(p, n, len); t.params.add(p); });
 }
 
-// y[r, 0..cols) = x[r * ldx + 0..cols) (accumulate: +=)
-__global__ void copyColsK(const real* x, int ldx, real* y, int ldy, size_t rows, int cols, bool accumulate) {
-  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= rows * cols) return;
-  size_t r = t / cols; int c = t % cols;
-  real v = x[r * ldx + c];
-  y[r * ldy + c] = accumulate ? y[r * ldy + c] + v : v;
-}
 inline void copyCols(const real* x, int ldx, real* y, int ldy, size_t rows, int cols, bool accumulate = false) {
   copyColsK<<<blocks(rows * cols), 256, 0, STREAM>>>(x, ldx, y, ldy, rows, cols, accumulate);
 }
