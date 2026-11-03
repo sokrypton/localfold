@@ -99,8 +99,22 @@
 :root[data-theme="dark"] #canvasContainer { background: #000; }
 :root[data-theme="dark"] #heatmapContainer canvas,
 :root[data-theme="dark"] #scatterContainer canvas,
-:root[data-theme="dark"] #msaView canvas,
+:root[data-theme="dark"] .msa-canvas canvas,
 :root[data-theme="dark"] #sequenceView canvas { filter: var(--lf-canvas-filter); }
+
+/* What py2Dmol styles for itself, in a sheet it injects and in this page's own attributes. Its fullscreen button is a pale box
+   whose icon takes the dark theme's pale grey, so it could not be seen. */
+:root[data-theme="dark"] .py2dmol-slot-tab { background: var(--lf-surface-3); border-color: var(--lf-border); color: var(--lf-muted); }
+:root[data-theme="dark"] .py2dmol-slot-tab[aria-selected="true"] { background: var(--lf-surface); border-color: var(--lf-border); color: var(--lf-text); }
+:root[data-theme="dark"] .py2dmol-fs-btn { background: var(--lf-surface-3); border-color: var(--lf-border); color: var(--lf-text-2); }
+:root[data-theme="dark"] .py2dmol-fs-btn:hover { background: var(--lf-surface-4); color: var(--lf-text); }
+/* ...and py2Dmol's status colours are generated above an error's, which read as blue as any other line. */
+:root[data-theme="dark"] #status-message.error { background: var(--lf-error-bg); border-color: var(--lf-error-border); color: var(--lf-error-text); }
+:root[data-theme="dark"] .msa-filters { background: var(--lf-surface) !important; border-color: var(--lf-border) !important; }
+:root[data-theme="dark"] .msa-filters span,
+:root[data-theme="dark"] .msa-filters label,
+:root[data-theme="dark"] #msaSortContainer label,
+:root[data-theme="dark"] #logoBitScoreContainer label { color: var(--lf-text-2) !important; }
 
 /* The settings button and its panel. */
 .settings-anchor { position: relative; }
