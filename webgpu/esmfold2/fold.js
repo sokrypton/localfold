@@ -711,6 +711,16 @@ export async function foldEsmfold2(device, options) {
               stopIfAsked();
               return options.onBlock?.(loop, index);
             } }));
+        // `onLoopContacts(loop, contacts)`: the contact map off this pass's pair, for what a recycle changed.
+        if (options.onLoopContacts !== undefined) {
+          const { contacts } = await encodeContactMap(
+            { device, allocator, cache, submit },
+            { tokens, channels, bins: shape.distogramBins, pair,
+              weights: weights.featuriser.distogramWeights, bias: weights.featuriser.distogramBias,
+              partners: partnerKeys(features, tokens), bonds: features.tokenBonds,
+              molType: features.molType, residueType: features.residueType });
+          await options.onLoopContacts(loop, contacts);
+        }
       }
       recycleScratch.release();
     }
