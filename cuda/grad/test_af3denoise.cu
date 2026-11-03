@@ -11,6 +11,9 @@
 //   nvcc -O2 -std=c++17 -arch=sm_80 -DGRAD_F64 --default-stream per-thread -o cuda/grad/test-af3denoise-f64 cuda/grad/test_af3denoise.cu -lcublas -lcublasLt -ldl -lcurand
 #include "../af3/src/trunk.cuh"
 #include "../af3/src/diffusion.cuh"
+#include "../af3/src/sampler.cuh"
+#include "../af3/src/scores.cuh"
+#include "../af3/src/structural.cuh"
 #include "../featurise/af3_weights.h"
 #include "af3denoise.cuh"
 #include "gradcheck.cuh"
@@ -65,8 +68,10 @@ int main(int argc, char** argv) {
   M.loadBundle(bundle, "", [&](const std::map<std::string, std::vector<long long>>& shapes) {
     lf::weights::Shapes S; S.shape = shapes; return lf::weights::af3WeightLines(family, S); });
   M.load(input);
-  if (M.flag("trunk.dialect.chaiAtomStack")) { fprintf(stderr, "chai-1's denoiser is not here (af3denoise.cuh)\n"); return 1; }
-  setAdaMode(false);
+  const bool chai = M.flag("trunk.dialect.chaiAtomStack");
+  setAdaMode(chai);
+  // OpenDDE's diffusion runs on its structural tokens: the structural batch in place of the residue one (cuda/af3's)
+  if (M.flag("trunk.dialect.structuralTokens")) swapBatch();
   AtomShape sh = atomShape();
   const int n = sh.tokens;
   const std::string P = "diffusion.conditioning", E = "diffusion.encoder", Dd = "diffusion.decoder", Tn = "diffusion.transformer";
@@ -77,8 +82,10 @@ int main(int argc, char** argv) {
   c.Czt = (int)M.meta(P + ".trunkPairChannels"); c.Cst = (int)M.meta(P + ".trunkSingleChannels");
   c.F = (int)M.meta(P + ".targetFeatWidth"); c.rel = (int)M.meta(P + ".relativeWidth");
   c.nc = (int)M.at(P + ".fourierWeight").length; c.pad = M.flag("trunk.dialect.padSingleCondUnknownDna");
-  c.split = has(P + ".zTrunkProjection"); c.relpe = !c.split && has(P + ".relpeProjection");
+  c.chai = M.flag("trunk.dialect.chaiDiffusionConditioning");
+  c.split = !c.chai && has(P + ".zTrunkProjection"); c.relpe = !c.chai && !c.split && has(P + ".relpeProjection");
   g::af3::DiffEncoder& e = m.enc;
+  e.chai = chai; m.decChai = chai;
   e.C = (int)M.meta(E + ".channels"); e.Cp = (int)M.meta(E + ".pairChannels"); e.H = (int)M.meta(E + ".heads");
   e.D = (int)M.meta(E + ".dimension"); e.perToken = (int)M.meta(E + ".perTokenChannels");
   e.Cst = (int)M.meta(E + ".trunkSingleChannels"); e.Cz = (int)M.meta(E + ".trunkPairChannels");
@@ -91,7 +98,7 @@ int main(int argc, char** argv) {
   g::af3::DiffTransformer& t = m.tr;
   t.C = (int)M.meta(Tn + ".channels"); t.Cc = (int)M.meta(Tn + ".condChannels"); t.Cz = (int)M.meta(Tn + ".pairChannels");
   t.H = (int)M.meta(Tn + ".heads"); t.D = (int)M.meta(Tn + ".dimension"); t.perSuper = (int)M.meta(Tn + ".blocksPerSuperBlock");
-  t.factor = (int)M.meta(Tn + ".transitionFactor"); t.noResidual = M.flag(Tn + ".noResidual"); t.chai = false;
+  t.factor = (int)M.meta(Tn + ".transitionFactor"); t.noResidual = M.flag(Tn + ".noResidual"); t.chai = chai;
   int nSuper = 0; while (M.has(Tn + ".superBlocks." + std::to_string(nSuper) + ".pairLogitsProjection")) ++nSuper;
   const bool perBlock = M.flag(E + ".pairNormPerBlock"), up = M.has(E + ".blocks.0.ffwAToB"),
              kq = M.has(E + ".blocks.0.queryLayerNormScale"), noTr2 = !M.has(E + ".blocks.0.Transition2");
@@ -131,6 +138,16 @@ int main(int argc, char** argv) {
   b.refElement = Idev("batch.refElement"); b.nameChars = Idev("batch.refAtomNameChars");
   const int *ri = Idev("batch.features.residueIndex"), *ti = Idev("batch.features.tokenIndex"), *asym = Idev("batch.features.asymId"),
             *ent = Idev("batch.features.entityId"), *sym = Idev("batch.features.symId");
+  if (c.chai) {      // chai-1's structure pair: the dense ranks of the entity and sym ids, the declared bonds
+    auto rank = [&](const char* k) {
+      const int* h = M.i(k); size_t len = M.len(k);
+      std::vector<int> sorted(h, h + len); std::sort(sorted.begin(), sorted.end()); sorted.erase(std::unique(sorted.begin(), sorted.end()), sorted.end());
+      std::vector<int> r(len); for (size_t q = 0; q < len; ++q) r[q] = (int)(std::lower_bound(sorted.begin(), sorted.end(), h[q]) - sorted.begin());
+      int* d; GK(cudaMalloc(&d, len * 4)); GK(cudaMemcpy(d, r.data(), len * 4, cudaMemcpyHostToDevice)); return (const int*)d;
+    };
+    c.entRank = rank("batch.features.entityId"); c.symRank = rank("batch.features.symId");
+    if (M.has("batch.declaredBondMatrix")) c.declBonds = devReal(Fdev("batch.declaredBondMatrix"), nn);
+  }
   // random trunk outputs and noisy positions (the positions at sigma's scale)
   auto tsH = gauss((size_t)n * c.Cst, 1, 1), tpH = gauss(nn * c.Czt, 2, 1), tfH = gauss((size_t)n * c.F, 3, 0.5),
        xH = gauss(atoms * 3, 4, sigma);
@@ -250,7 +267,9 @@ int main(int argc, char** argv) {
   g::GradCheck gc;
   // a step 10x under the default: the encoder's pair MLP has ~4M ReLU inputs, and at 1e-7 a few sit inside +-2h of
   // their kink (pairMlp1 read 2e-4; at 1e-8 the worst tensor of all 688 is 1.1e-5)
-  gc.rel = getenv("GRAD_REL") ? atof(getenv("GRAD_REL")) : 1e-8;
+  // (h = 1e-8 for the ReLU kinks of the atom pair MLP; OpenDDE's 130 structural tokens take 1e-7, where its zero-gate
+  // biases' directional derivatives - 2.7e-9 - sit at 1e-8's difference floor: 1.06e-4 there, 1.2e-5 worst at 1e-7)
+  gc.rel = getenv("GRAD_REL") ? atof(getenv("GRAD_REL")) : M.flag("trunk.dialect.structuralTokens") ? 1e-7 : 1e-8;
   gc.add("in/trunkSingle", ts, dts, (size_t)n * c.Cst);
   gc.add("in/trunkPair", tp, dtp, nn * c.Czt);
   gc.add("in/targetFeat", tf, dtf, (size_t)n * c.F);

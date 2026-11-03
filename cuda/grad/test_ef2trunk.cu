@@ -10,7 +10,10 @@
 //   3. -DGRAD_F64: the backward against central differences end to end (37 states -> shim -> z_init -> trunk ->
 //      distogram), on a small random input with truncated stacks; --parcae=<bundle> the parcae form with its
 //      dropout on and a random initial state; --inputs the inputs embedder on the real input; --msa (with the full
-//      ESMFold2's bundle and an input with an alignment) the MSA encoder, a column mask on.
+//      ESMFold2's bundle and an input with an alignment) the MSA encoder, a column mask on; --confidence the confidence
+//      head (Synthyra's) on 6MRR's vendor inputs.
+//   --confidence in float32: the head against the vendor's PAE logits and per-atom pLDDT (from its final trunk pair
+//      and coordinates) and against cuda/ef2's confidenceHead.
 //   --msa in float32: the full ESMFold2's MSA encoder against cuda/ef2's msaEncode (EF2_DETERMINISTIC: the first
 //      1,024 rows, no column mask).
 //
@@ -22,7 +25,8 @@
 #include "../ef2/src/atoms.cuh"
 #include "../ef2/src/trunk.cuh"
 #include "../ef2/src/msa.cuh"
-#include "ef2trunk.cuh"
+#include "../ef2/src/confidence.cuh"
+#include "ef2conf.cuh"
 #include "gradcheck.cuh"
 
 namespace g = grad;
@@ -140,10 +144,49 @@ static void msaArmFor(MsaArm& r, Loader& L, int maxRows, double rate, unsigned s
   r.b = g::ef2::MsaBatch{devI(rows), devReal(del), devReal(mask), r.S, r.T};
 }
 
+// ESMFold2's confidence head on the loaded input: the vendor's s_inputs, its final trunk pair and coordinates
+struct ConfArm {
+  g::ef2::ZInit zi;
+  g::ef2::Ef2Confidence h;
+  g::ef2::Tokens tok;
+  g::ef2::ConfInputs in;
+  g::real *sIn, *z, *x, *mask;
+  int T = 0, A = 0;
+};
+static void confArmFor(ConfArm& r, Loader& L, const std::string& lastPass) {
+  r.T = (int)M.meta("meta/tokens"); r.A = (int)M.len("atom_mask");
+  const int T = r.T, C = (int)dimOf("f/confidence/sToZ", 1), Si = (int)M.meta("meta/singleInputs");
+  g::ef2::forEachParam(r.zi, Si, (int)M.meta("meta/pairChannels"), L.fn());
+  g::ef2::Ef2Confidence& h = r.h;
+  h.Si = Si; h.C = C; h.Cs = (int)dimOf("f/confidence/poolingOutput", 1);
+  h.slots = (int)dimOf("f/confidence/plddtWeight", 0); h.bins = (int)dimOf("f/confidence/plddtWeight", 2);
+  h.pb = (int)dimOf("f/confidence/pae", 1);
+  const float* e = M.f("f/confidence/boundaries"); h.edges.assign(e, e + M.len("f/confidence/boundaries"));
+  h.dEdges = devReal(std::vector<double>(h.edges.begin(), h.edges.end()));
+  h.zi = &r.zi;
+  int nb = 0; while (M.has("f/confidence/blocks/" + std::to_string(nb) + "/pairTransition/transition1")) ++nb;
+  const int pf = (int)(M.at("f/confidence/blocks/0/pairTransition/transition1").length / (2 * (size_t)C * C));
+  g::ef2::forEachParam(h, nb, pf, [](const std::string& k) { return M.has("f/" + k); }, L.fn());
+  const size_t P = (size_t)T * T;
+  r.tok = g::ef2::Tokens{Idev("residue_index"), Idev("asym_id"), Idev("sym_id"), Idev("entity_id"), Idev("token_index"),
+                         devReal(M.f("token_bonds"), P), T};
+  std::vector<int> a2t(r.A), slot(r.A);
+  GK(cudaMemcpy(a2t.data(), Idev("atom_to_token"), r.A * 4, cudaMemcpyDeviceToHost));
+  for (int a = 0, k = 0; a < r.A; ++a) { if (a > 0 && a2t[a] != a2t[a - 1]) k = 0; slot[a] = std::min(k++, h.slots - 1); }
+  r.in = g::ef2::ConfInputs{&r.tok, nullptr, Idev("distogram_atom_idx"), Idev("atom_to_token"), devI(slot), r.A};
+  r.sIn = devReal(M.f("o/s_inputs"), (size_t)T * Si);
+  r.z = devReal(M.f(lastPass), P * (size_t)M.meta("meta/pairChannels"));
+  r.x = devReal(M.f("o/coords"), (size_t)r.A * 3); r.in.x = r.x;
+  r.mask = devReal(std::vector<double>(P, 1));
+  printf("ESMFold2's confidence head: %d tokens, %d atoms, pair %d, %d blocks, %d slots x %d bins, PAE %d bins, %zu distance edges%s\n",
+         T, r.A, C, nb, h.slots, h.bins, h.pb, h.edges.size(), h.hasPaeLn ? ", PAE norm" : "");
+}
+
 int main(int argc, char** argv) {
   std::string weights = "cuda/ef2/weights", input = "cuda/ef2/data-6mrr", parcae;
-  bool inputsOnly = false, msaArm = false;
+  bool inputsOnly = false, msaArm = false, confArm = false;
   for (int i = 1; i < argc; ++i) {
+    if (!strcmp(argv[i], "--confidence")) confArm = true;
     if (!strcmp(argv[i], "--msa")) msaArm = true;
     if (!strcmp(argv[i], "--inputs")) inputsOnly = true;
     if (!strncmp(argv[i], "--weights=", 10)) weights = argv[i] + 10;
@@ -165,6 +208,37 @@ int main(int argc, char** argv) {
   Loader L; L.prefix = "f/";
 
 #ifndef GRAD_F64
+  if (confArm) {
+    // ---------------------------------------------------------------- the confidence head, against the vendor's
+    M.load(input);
+    const std::string oracle = access((input + "/oracle-f32att/model.idx").c_str(), R_OK) == 0 ? input + "/oracle-f32att" : input + "/oracle";
+    M.load(oracle);
+    ConfArm ca; confArmFor(ca, L, "o/loop3/out");
+    const int T = ca.T; const size_t P = (size_t)T * T;
+    g::ARENA.reset();
+    g::ef2::ConfLogits o{};
+    g::ef2::confForward(ca.h, ca.in, ca.sIn, ca.z, ca.mask, o);
+    buildBonds(T);
+    Confidence ref = confidenceHead(T, ca.A, devF(hostD(ca.z, P * C)), devF(hostD(ca.sIn, (size_t)T * ca.h.Si)), ca.h.Si,
+                                    devF(hostD(ca.x, (size_t)ca.A * 3)), false);
+    CK(cudaStreamSynchronize(STREAM));
+    auto pl = hostD(o.plddt, (size_t)ca.A * ca.h.bins);
+    std::vector<double> pe(ca.A);
+    for (int a = 0; a < ca.A; ++a) {
+      double mx = -1e300; for (int b = 0; b < ca.h.bins; ++b) mx = std::max(mx, pl[(size_t)a * ca.h.bins + b]);
+      double sw = 0, e = 0; for (int b = 0; b < ca.h.bins; ++b) { double w = std::exp(pl[(size_t)a * ca.h.bins + b] - mx); sw += w; e += w * (b + 0.5) / ca.h.bins; }
+      pe[a] = e / sw;
+    }
+    auto mk = std::vector<double>(M.f("atom_mask"), M.f("atom_mask") + ca.A);
+    std::vector<double> a1, r1, r2;
+    for (int a = 0; a < ca.A; ++a) if (mk[a] != 0) { a1.push_back(pe[a]); r1.push_back(M.f("o/conf/plddt_per_atom")[a]); r2.push_back(ref.plddtAtom[a]); }
+    expect("pLDDT per atom against the vendor's (o/conf/plddt_per_atom)", g::relRms(a1, r1), 1e-5);
+    expect("pLDDT per atom against cuda/ef2's confidenceHead", g::relRms(a1, r2), 1e-5);
+    expect("PAE logits against the vendor's (o/conf/pae_logits)", g::relRms(hostD(o.pae, P * ca.h.pb),
+           std::vector<double>(M.f("o/conf/pae_logits"), M.f("o/conf/pae_logits") + P * ca.h.pb)), 1e-5);
+    printf("%s\n", failed ? "FAIL" : "PASS");
+    return failed ? 1 : 0;
+  }
   if (msaArm) {
     // ---------------------------------------------------------------- the MSA encoder, against cuda/ef2's msaEncode
     M.load(input);
@@ -356,6 +430,38 @@ int main(int argc, char** argv) {
   }
 #else
   // ---------------------------------------------------------------- 3. the backward against central differences
+  if (confArm) {
+    // the confidence head on 6MRR's vendor inputs, every logit a cotangent
+    M.load(input);
+    M.load(input + "/oracle");
+    ConfArm ca; confArmFor(ca, L, "o/loop3/out");
+    const int T = ca.T; const size_t P = (size_t)T * T;
+    g::real *ctP = devReal(gauss((size_t)ca.A * ca.h.bins, 31, 1)), *ctA = devReal(gauss(P * ca.h.pb, 32, 1)), *oP, *oA;
+    GK(cudaMalloc(&oP, (size_t)ca.A * ca.h.bins * sizeof(g::real))); GK(cudaMalloc(&oA, P * ca.h.pb * sizeof(g::real)));
+    auto fwd = [&] {
+      g::ARENA.reset(); g::ef2::ConfLogits o{};
+      g::ef2::confForward(ca.h, ca.in, ca.sIn, ca.z, ca.mask, o);
+      GK(cudaMemcpyAsync(oP, o.plddt, (size_t)ca.A * ca.h.bins * sizeof(g::real), cudaMemcpyDeviceToDevice, STREAM));
+      GK(cudaMemcpyAsync(oA, o.pae, P * ca.h.pb * sizeof(g::real), cudaMemcpyDeviceToDevice, STREAM));
+    };
+    L.ps.zeroGrad();
+    g::ARENA.reset();
+    g::ef2::ConfLogits o{};
+    auto cs = g::ef2::confForward(ca.h, ca.in, ca.sIn, ca.z, ca.mask, o);
+    g::real *ds, *dz;
+    GK(cudaMalloc(&ds, (size_t)T * ca.h.Si * sizeof(g::real))); GK(cudaMemset(ds, 0, (size_t)T * ca.h.Si * sizeof(g::real)));
+    GK(cudaMalloc(&dz, P * C * sizeof(g::real))); GK(cudaMemset(dz, 0, P * C * sizeof(g::real)));
+    g::ef2::confBackward(ca.h, ca.in, cs, ca.sIn, ca.mask, g::ef2::ConfLogits{ctP, ctA}, ds, dz);
+    g::GradCheck gc;
+    gc.verbose = getenv("GRAD_VERBOSE") != nullptr;
+    gc.add("in/sInputs", ca.sIn, ds, (size_t)T * ca.h.Si);
+    gc.add("in/zTrunk", ca.z, dz, P * C);
+    for (auto* q : L.ps.all) gc.add(*q);
+    gc.output(oP, ctP, (size_t)ca.A * ca.h.bins); gc.output(oA, ctA, P * ca.h.pb);
+    failed += gc.run(fwd);
+    printf("%s\n", failed ? "FAIL" : "PASS");
+    return failed ? 1 : 0;
+  }
   if (msaArm) {
     // the MSA encoder on the real alignment's first 16 rows, a column mask on, z_init and s_inputs random
     M.load(input);

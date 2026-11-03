@@ -85,10 +85,8 @@ for fb in "model-af3-full-f32 af3" "model-boltz2-f32 boltz2" "model-protenix2-f3
   run cuda/grad/test-af3diff --bundle=$1 --family=$2
   in=cuda/grad/data/af3-in-$2
   [ -d $in ] || cuda/featurise/af3-featurise $in --no-weights --family=$2 --sequence=GWSTELEKHREELKEFLKKEGITNVEIRIDNGRLEVRVEGGTERLKRFLEELRQKLEKKGYTVDIKIE > /dev/null
-  if [ "$2" != chai1 ] && [ "$2" != opendde ]; then
-    run cuda/grad/test-af3denoise --bundle=$1 --family=$2 --input=$in
-    run cuda/grad/test-af3denoise-f64 --bundle=$1 --family=$2 --input=$in
-  fi
+  run cuda/grad/test-af3denoise --bundle=$1 --family=$2 --input=$in          # (OpenDDE's on its structural tokens)
+  run cuda/grad/test-af3denoise-f64 --bundle=$1 --family=$2 --input=$in
   # the template embedder: 6MRR with its own crystal in two slots (every family; chai-1 through templateEmbedding alone)
   tin=cuda/grad/data/af3-tmpl-$2
   [ -d $tin ] || cuda/featurise/af3-featurise $tin --no-weights --family=$2 --sequence=GWSTELEKHREELKEFLKKEGITNVEIRIDNGRLEVRVEGGTERLKRFLEELRQKLEKKGYTVDIKIE \
@@ -115,6 +113,8 @@ run cuda/grad/test-ef2diff-f64
 run cuda/grad/test-ef2trunk
 run cuda/grad/test-ef2trunk-f64
 run cuda/grad/test-ef2trunk-f64 --inputs
+run cuda/grad/test-ef2trunk --confidence            # (Synthyra's head, on the vendor's 6MRR tensors)
+run cuda/grad/test-ef2trunk-f64 --confidence
 for b in model-esmfold2-fast-f32 model-esmfold2-f32; do
   if [ ! -d $b ]; then echo "== ef2trunk --parcae: no $b here"; continue; fi
   run cuda/grad/test-ef2trunk --parcae=$b

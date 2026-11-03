@@ -73,23 +73,56 @@ struct DiffCond {
   Linear pairProj, singleProj, noiseProj, relpeProj, zTrunkProj;
   GatedTransition pairT[2], singleT[2];
   Param fw, fb;
-  int width() const { return split ? 2 * Cz : relpe ? Czt + Cz : Czt + rel; }
+  // chai-1's (trunk.dialect.chaiDiffusionConditioning): its 163 structure token-pair columns through a biased projection
+  // beside the trunk pair (and the declared bonds), the pair track closed by an affine LayerNorm; set chai before
+  // forEachParam and the ranks and bonds before condForward
+  bool chai = false, hasStructBond = false;
+  Linear structW;
+  Param structBond;
+  LayerNorm pairFinal;
+  const int *entRank = nullptr, *symRank = nullptr;     // [n]: the dense ranks of the entity and sym ids
+  const real* declBonds = nullptr;                       // [n, n] (null: none)
+  int width() const { return chai ? Czt + Cz : split ? 2 * Cz : relpe ? Czt + Cz : Czt + rel; }
   int swidth() const { return Cst + F + (pad ? 2 : 0); }
 };
 struct CondSave {
-  real *rel, *relProj, *tn, *tproj, *f2, *f2n, *pair0, *pair1, *pairOut, *f1, *f1n, *base, *e, *en, *nproj, *s0, *s1, *sOut, *sFinal;
-  LnSave lp, lz, ls, le, lf;
+  real *rel, *relProj, *tn, *tproj, *f2, *f2n, *pair0, *pair1, *pairOut, *f1, *f1n, *base, *e, *en, *nproj, *s0, *s1, *sOut, *sFinal, *pairPre;
+  LnSave lp, lz, ls, le, lf, lpf;
   GtSave pt0, pt1, st0, st1;
   real tr;
   int n;
 };
+// chai-1's structure token-pair columns (cuda/af3's chaiStructurePairK): docking (5: none), the relative chain (6..11),
+// entity (12..14), residue (15..81) and token (82..148) separations, and the two masked restraints (155, 162)
+__global__ void chaiStructOneHotK(const int* ri, const int* ti, const int* asym, const int* entRank, const int* symRank, real* out, int n) {
+  size_t ij = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (ij >= (size_t)n * n) return;
+  int i = ij / n, j = ij % n;
+  auto clip = [](int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); };
+  bool same = asym[i] == asym[j];
+  int rss = same ? clip(ri[i] - ri[j] + 33, 0, 65) : 66;
+  int rts = same && ri[i] == ri[j] ? clip(ti[i] - ti[j] + 32, 0, 65) : 66;
+  int relE = entRank[i] - entRank[j];
+  int rchain = relE != 0 ? 5 : clip(symRank[i] - symRank[j] + 2, 0, 4);
+  int rent = clip(relE + 1, 0, 2);
+  real* o = out + ij * 163;
+  for (int k = 0; k < 163; ++k) o[k] = 0;
+  o[5] = o[155] = o[162] = 1; o[6 + rchain] = 1; o[12 + rent] = 1; o[15 + rss] = 1; o[82 + rts] = 1;
+}
 inline CondSave condForward(DiffCond& c, const real* trunkSingle, const real* trunkPair, const real* targetFeat,
                             const int* ri, const int* ti, const int* asym, const int* ent, const int* sym, real sigma, int n) {
   const size_t nn = (size_t)n * n; const int W = c.width(), SW = c.swidth();
   CondSave s{}; s.n = n;
+  s.f2 = ARENA.get(nn * W);
+  if (c.chai) {
+    s.rel = ARENA.get(nn * 163);
+    chaiStructOneHotK<<<blocks(nn), 256, 0, STREAM>>>(ri, ti, asym, c.entRank, c.symRank, s.rel, n);
+    s.relProj = ARENA.get(nn * c.Cz); c.structW.forward(s.rel, s.relProj, nn);
+    if (c.hasStructBond && c.declBonds) mm(c.declBonds, c.structBond.w, s.relProj, (int)nn, 1, c.Cz, 1);
+    concat2K<<<blocks(nn * W), 256, 0, STREAM>>>(trunkPair, c.Czt, s.relProj, c.Cz, s.f2, nn, -1, -1, nullptr, nullptr);
+  } else {
   s.rel = ARENA.get(nn * c.rel);
   relposK<<<blocks(nn * c.rel), 256, 0, STREAM>>>(ri, ti, asym, ent, sym, s.rel, n);
-  s.f2 = ARENA.get(nn * W);
   if (c.split || c.relpe) {
     s.relProj = ARENA.get(nn * c.Cz); c.relpeProj.forward(s.rel, s.relProj, nn);
     const real* first = trunkPair; int fw = c.Czt;
@@ -100,10 +133,12 @@ inline CondSave condForward(DiffCond& c, const real* trunkSingle, const real* tr
     }
     concat2K<<<blocks(nn * W), 256, 0, STREAM>>>(first, fw, s.relProj, c.Cz, s.f2, nn, -1, -1, nullptr, nullptr);
   } else concat2K<<<blocks(nn * W), 256, 0, STREAM>>>(trunkPair, c.Czt, s.rel, c.rel, s.f2, nn, -1, -1, nullptr, nullptr);
+  }
   s.f2n = ARENA.get(nn * W); s.lp = lnForward(c.pairLn, s.f2, s.f2n, nn);
   s.pair0 = ARENA.get(nn * c.Cz); c.pairProj.forward(s.f2n, s.pair0, nn);
   s.pair1 = cloneR(s.pair0, nn * c.Cz); s.pt0 = gtForward(c.pairT[0], s.pair0, s.pair1, nn, 1);
   s.pairOut = cloneR(s.pair1, nn * c.Cz); s.pt1 = gtForward(c.pairT[1], s.pair1, s.pairOut, nn, 1);
+  if (c.chai) { s.pairPre = s.pairOut; s.pairOut = ARENA.get(nn * c.Cz); s.lpf = lnForward(c.pairFinal, s.pairPre, s.pairOut, nn); }
   s.f1 = ARENA.get((size_t)n * SW);
   concat2K<<<blocks((size_t)n * SW), 256, 0, STREAM>>>(trunkSingle, c.Cst, targetFeat, c.F, s.f1, n,
                                                        c.pad ? c.Cst + 31 : -1, c.pad ? c.Cst + 63 : -1, nullptr, nullptr);
@@ -143,12 +178,18 @@ inline void condBackward(DiffCond& c, const CondSave& s, const real* dpairIn, co
                                                        c.pad ? c.Cst + 63 : -1, tsd, dtargetFeat);
   // pair
   real* dp = cloneR(dpairIn, nn * c.Cz);
+  if (c.chai) { real* t = ARENA.get(nn * c.Cz); lnBackward(c.pairFinal, s.lpf, dp, t, nn, false); dp = t; }
   { real* du = cloneR(dp, nn * c.Cz); gtBackward(c.pairT[1], s.pt1, du, dp); }
   { real* du = cloneR(dp, nn * c.Cz); gtBackward(c.pairT[0], s.pt0, du, dp); }
   real* df2n = ARENA.get(nn * W); c.pairProj.backward(s.f2n, dp, df2n, nn);
   real* df2 = ARENA.get(nn * W); lnBackward(c.pairLn, s.lp, df2n, df2, nn, false);
   real* tpd = dtrunkPair ? dtrunkPair : ARENA.zeros(nn * c.Czt);
-  if (c.split || c.relpe) {
+  if (c.chai) {
+    real* ds2 = ARENA.zeros(nn * c.Cz);
+    concat2K<<<blocks(nn * W), 256, 0, STREAM>>>(nullptr, c.Czt, nullptr, c.Cz, df2, nn, -1, -1, tpd, ds2);
+    c.structW.backward(s.rel, ds2, nullptr, nn);
+    if (c.hasStructBond && c.declBonds) mmAT(c.declBonds, ds2, c.structBond.g, (int)nn, 1, c.Cz);
+  } else if (c.split || c.relpe) {
     real* drp = ARENA.zeros(nn * c.Cz);
     real* dfirst = c.split ? ARENA.zeros(nn * c.Cz) : tpd;
     concat2K<<<blocks(nn * W), 256, 0, STREAM>>>(nullptr, c.split ? c.Cz : c.Czt, nullptr, c.Cz, df2, nn, -1, -1, dfirst, drp);
@@ -380,7 +421,7 @@ struct EncSave {
   AtomCtx ctx;
   int n;
 };
-struct DecSave { real *proj, *act0, *act, *xm, *xn, *upd; LnSave ln; StackRun run; AtomCtx ctx; };
+struct DecSave { real *proj, *act0, *act, *xm, *xn, *upd, *qc, *kc; LnSave ln, lc; StackRun run; AtomCtx ctx; };
 struct Denoiser {
   DiffCond cond;
   DiffEncoder enc;
@@ -390,6 +431,8 @@ struct Denoiser {
   Linear decBroadcast, decUpdate;
   AtomStack decStack;
   LayerNorm decLn;
+  bool decChai = false;        // chai-1: the decoder conditioned on an affine LayerNorm of the encoder's, within one reference space
+  LayerNorm decCondLn;
   Params params;
   DiffRun run;          // the transformer's kept block inputs: cudaMalloc'd once, reused by every call at this size
 };
@@ -611,6 +654,14 @@ inline DenoiseSave denoiseForward(Denoiser& m, const AtomBatch& b, const real* t
   s.ds.ctx.maskBias = ARENA.get(Rq * b.K);
   atomMaskBiasK<<<blocks(Rq * b.K), 256, 0, STREAM>>>(s.es.qMask, s.es.kMask, const_cast<real*>(s.ds.ctx.maskBias), b.subsets, b.Q,
                                                       b.K, m.decStack.blocks[0].keyMasked);
+  if (m.decChai) {
+    chaiRefMaskK<<<blocks(Rq * b.K), 256, 0, STREAM>>>(const_cast<real*>(s.ds.ctx.maskBias), s.es.qUid, b.tq.mask, s.es.kUid, b.tk.mask,
+                                                       b.subsets, b.Q, b.K);
+    const size_t Rk = (size_t)b.subsets * b.K;
+    s.ds.qc = ARENA.get(Rq * C); s.ds.lc = lnForward(m.decCondLn, s.es.qCond, s.ds.qc, Rq);
+    s.ds.kc = ARENA.get(Rk * C); gather(b.q2k, s.ds.qc, s.ds.kc, C);
+    s.ds.ctx.qCond = s.ds.qc; s.ds.ctx.kCond = s.ds.kc;
+  }
   s.ds.act = ARENA.get(Rq * C);
   stackForward(m.decStack, s.ds.ctx, s.es.pair, s.ds.act0, s.ds.act, s.ds.run);
   s.ds.xm = cloneR(s.ds.act, Rq * C); rowMaskK<<<blocks(Rq * C), 256, 0, STREAM>>>(s.ds.xm, s.es.qMask, Rq, C);
@@ -638,6 +689,7 @@ inline void denoiseBackward(Denoiser& m, const AtomBatch& b, const DenoiseSave& 
   real *dact0 = ARENA.get(Rq * C), *dqCondDec = ARENA.zeros(Rq * C), *dkCondDec = ARENA.zeros(Rk * C), *dpairDec = ARENA.zeros(rows * Cp);
   stackBackward(m.decStack, s.ds.ctx, s.es.pair, s.ds.run, dact, dact0, dqCondDec, dkCondDec, dpairDec);
   scatter(b.q2k, dkCondDec, dqCondDec, C);
+  if (m.decChai) { real* t = ARENA.get(Rq * C); lnBackward(m.decCondLn, s.ds.lc, dqCondDec, t, Rq, false); dqCondDec = t; }
   real *ddproj = ARENA.zeros((size_t)n * C), *dskip = ARENA.zeros(Rq * C);
   broadcastBwdK<<<blocks(Rq * C), 256, 0, STREAM>>>(dact0, b.t2q.idx, b.t2q.mask, s.es.qMask, ddproj, dskip, Rq, C, b.dense);
   real* dactn = ARENA.get((size_t)n * P); m.decBroadcast.backward(s.actn, ddproj, dactn, n);
@@ -716,7 +768,13 @@ inline void forEachParam(Denoiser& m, int nbEnc, int nbDec, int nSuper, bool per
   };
   const std::string P = "diffusion.conditioning", E = "diffusion.encoder", R = "atomReference", Dd = "diffusion.decoder";
   DiffCond& c = m.cond;
-  c.split = has(P + ".zTrunkProjection"); c.relpe = !c.split && has(P + ".relpeProjection");
+  if (c.chai) {
+    c.structW.K = 163; c.structW.N = c.Cz; c.structW.hasBias = true;
+    f(P + ".structurePairWeights", c.structW.w, (size_t)163 * c.Cz); f(P + ".structurePairBias", c.structW.b, c.Cz);
+    c.hasStructBond = has(P + ".structureBondWeights"); if (c.hasStructBond) f(P + ".structureBondWeights", c.structBond, c.Cz);
+    ln(P + ".pairCondFinalNorm", c.pairFinal, c.Cz);
+  }
+  c.split = !c.chai && has(P + ".zTrunkProjection"); c.relpe = !c.chai && !c.split && has(P + ".relpeProjection");
   if (c.split) { ln(P + ".zTrunkNorm", c.zTrunkLn, c.Czt); lin(P + ".zTrunkProjection", c.zTrunkProj, c.Czt, c.Cz); }
   if (c.split || c.relpe) lin(P + ".relpeProjection", c.relpeProj, c.rel, c.Cz);
   ln(P + ".pairCondInitialNorm", c.pairLn, c.width());
@@ -742,7 +800,8 @@ inline void forEachParam(Denoiser& m, int nbEnc, int nbDec, int nSuper, bool per
   ln("diffusion.outputNorm", m.outLn, e.perToken);
   // the decoder
   lin(Dd + ".projectTokenFeaturesForBroadcast", m.decBroadcast, e.perToken, C);
-  forEachParam(m.decStack, Dd, nbDec, perBlock, false, upGate, f, kqNorm, noTr2);
+  forEachParam(m.decStack, Dd, nbDec, perBlock, m.decChai, upGate, f, kqNorm, noTr2);
+  if (m.decChai) ln(Dd + ".postAtomCondLayerNorm", m.decCondLn, C);
   ln(Dd + ".atomFeaturesLayerNorm", m.decLn, C);
   lin(Dd + ".atomFeaturesToPositionUpdate", m.decUpdate, C, 3);
 }
