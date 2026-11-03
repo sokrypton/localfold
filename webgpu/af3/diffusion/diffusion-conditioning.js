@@ -36,9 +36,14 @@
  * AdaLN. They reuse the trunk's transition shader with two-pass variance.
  */
 import { createAddShader } from "../../runtime/execution.js";
+import { FLUSH_MIN_BYTES } from "../trunk/pair-track.js";
+import { rowPieces } from "../trunk/sequential-groups.js";
 import { GpuBufferAllocator } from "../../runtime/allocator.js";
 import { noteAllocation, noteDestroy } from "../../runtime/device-memory.js";
 import { pipelineCacheForDevice, settleAll } from "../../runtime/pipeline-cache.js";
+
+/** Multiply-adds a dispatch of the pair kernels here, a factor-2 transition's two matmuls being 4 x channels^2 a row. About 200 ms on an A10. */
+const CONDITIONING_STEP_WORK = 100e9;
 
 const STATIC_UPLOADS = new WeakMap();
 import { residentWeightBuffer } from "../../runtime/resident.js";
@@ -207,6 +212,7 @@ const EPSILON: f32 = 1.0e-5;
 // literal, and one would end the string.)
 @group(0) @binding(4) var<storage, read> column_sums: array<f32>;
 @group(0) @binding(5) var<storage, read_write> pair: array<f32>;
+@group(0) @binding(6) var<uniform> row_range: vec2<u32>;
 
 fn residue_index(t: u32) -> i32 { return features[t]; }
 fn token_index(t: u32) -> i32 { return features[TOKENS + t]; }
@@ -217,8 +223,8 @@ fn clamp_bin(value: i32, high: i32) -> i32 { return min(max(value, 0), high); }
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let row = id.x + id.y * GRID_WIDTH * 64u;
-  if (row >= PAIRS) { return; }
+  let row = row_range.x + id.x + id.y * GRID_WIDTH * 64u;
+  if (row >= row_range.y) { return; }
   let i = row / TOKENS;
   let j = row % TOKENS;
   let base = row * C_PAIR;
@@ -466,6 +472,7 @@ const EPSILON: f32 = 1.0e-5;
 @group(0) @binding(5) var<storage, read> scale: array<f32>;
 @group(0) @binding(6) var<storage, read> projection: array<f32>;
 @group(0) @binding(7) var<storage, read_write> pair: array<f32>;
+@group(0) @binding(8) var<uniform> row_range: vec2<u32>;
 
 var<workgroup> reduce: array<f32, LANES>;
 var<workgroup> concatenated: array<f32, WIDTH>;
@@ -493,8 +500,8 @@ fn total_of(lane: u32, value: f32) -> f32 {
 @compute @workgroup_size(LANES)
 fn main(@builtin(workgroup_id) group: vec3<u32>,
         @builtin(local_invocation_id) local: vec3<u32>) {
-  let row = group.x + group.y * GRID_WIDTH;
-  if (row >= PAIRS) { return; }
+  let row = row_range.x + group.x + group.y * GRID_WIDTH;
+  if (row >= row_range.y) { return; }
   let lane = local.x;
   let base = row * C_TRUNK;
 
@@ -625,11 +632,13 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 @group(0) @binding(4) var<storage, read> relpe_projection: array<f32>;
 @group(0) @binding(5) var<storage, read> scale: array<f32>;
 @group(0) @binding(6) var<storage, read> projection: array<f32>;
-@group(0) @binding(7) var<storage, read_write> pair: array<f32>;`,
+@group(0) @binding(7) var<storage, read_write> pair: array<f32>;
+@group(0) @binding(8) var<uniform> row_range: vec2<u32>;`,
              `@group(0) @binding(2) var<storage, read> relpe_projection: array<f32>;
 @group(0) @binding(3) var<storage, read> scale: array<f32>;
 @group(0) @binding(4) var<storage, read> projection: array<f32>;
-@group(0) @binding(5) var<storage, read_write> pair: array<f32>;`)
+@group(0) @binding(5) var<storage, read_write> pair: array<f32>;
+@group(0) @binding(6) var<uniform> row_range: vec2<u32>;`)
     .replace(`  // LayerNorm over the trunk pair's own width.
   var partial = 0.0;
   for (var c = lane; c < C_TRUNK; c += LANES) { partial += trunk_pair[base + c]; }
@@ -793,7 +802,7 @@ export class Af3DiffusionConditioningGpu {
     for (let index = 0; index < 2; index += 1) {
       transitionPipelines.pair.push(reusePair !== undefined ? undefined
         : this.pipelines.get(`${base}:pair-transition:${index}`,
-            createTransitionShader({ rows: pairs, channels: pairChannels, factor: 2, residual: true },
+            createTransitionShader({ rows: pairs, channels: pairChannels, factor: 2, residual: true, rowRange: true },
                                    prepared.pairTransitions[index].offsets, 1e-5, "two-pass")));
       // 🔴 THE SINGLE TRANSITION IS `tokens` ROWS AND THE KERNEL DISPATCHES
       // ROWS ONLY, so at 68 tokens it runs 68 workgroups of the default 128
@@ -1002,7 +1011,7 @@ export class Af3DiffusionConditioningGpu {
       const deferred = outSingle === undefined ? undefined : options.validation;
       if (deferred === undefined) this.device.pushErrorScope("validation");
       else deferred.begin();
-      const encoder = this.device.createCommandEncoder({ label: "af3-diffusion-conditioning" });
+      let encoder = this.device.createCommandEncoder({ label: "af3-diffusion-conditioning" });
       const batchPasses = deviceTuning(this.device).batchComputePasses !== false;
       let openPass = null;
       const passFor = (label) => {
@@ -1026,6 +1035,7 @@ export class Af3DiffusionConditioningGpu {
         if (!batchPasses) pass.end();
       };
       const spread = (groups) => [Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH)];
+      const pairTile = transitionRowTile(pairs, pairChannels);
       // 🔴 THE PAIR CONDITIONING DOES NOT DEPEND ON THE NOISE LEVEL. It is the
       // trunk's pair and the relative encoding, projected and twice
       // transitioned - and none of that reads sigma, which enters only through
@@ -1036,20 +1046,34 @@ export class Af3DiffusionConditioningGpu {
       // because only the head knows the trunk has not changed underneath it -
       // and it is read at the top of this method, because the uploads and the
       // allocations above it are pair-track work too.
-      // The split kernel is a workgroup per pair row; the joint one is a lane.
-      // The two projected kernels are a workgroup per pair row; the joint one is
-      // a lane.
-      const pairLinear = spread((split || projectedRelpos) ? pairs
-        : Math.ceil(pairs / 64));
-      if (reusePair === undefined) {
+      // A wide pair's passes are seconds at 600 tokens, as the pair track's, so a piece a submission (encodePairTrack's flush).
+      const flush = () => {
+        if (reusePair !== undefined || pairs * pairChannels * 4 < FLUSH_MIN_BYTES) return;
+        endPass();
+        this.device.queue.submit([encoder.finish()]);
+        encoder = this.device.createCommandEncoder({ label: "af3-diffusion-conditioning" });
+      };
+      // 🔴 AND ONE DISPATCH OF A PIECE STILL HELD THE DEVICE FOR ALL OF IT. IntelliFold-2's 512 channels at 1000 tokens took
+      // 1984 ms on an A10, in one dispatch that no submit can break up, which is a reset on a slower card under Windows. Each
+      // pair is its own in all three kernels, so the rows go a bounded number at a time.
+      const pairPieces = reusePair !== undefined ? [] : rowPieces(
+        pairs, 4 * pairChannels * pairChannels, deviceTuning(this.device).pairHeadStepWork ?? CONDITIONING_STEP_WORK, pairTile)
+        .map(({ first, count }) => ({ count, range: keep(this.allocator.upload("cond.row-range",
+          new Uint32Array([first, first + count, 0, 0]), GPUBufferUsage.UNIFORM)) }));
+      for (const { count, range } of pairPieces) {
+        // The split kernel is a workgroup per pair row; the joint one is a lane.
+        // The two projected kernels are a workgroup per pair row; the joint one is
+        // a lane.
+        const pairLinear = spread((split || projectedRelpos) ? count : Math.ceil(count / 64));
         run("pair-initial", compiled.pairInitial,
             split
               ? [trunkPair, features, zScale, zProjection, relpeProjection,
-                 pairScale, pairProjection, pair]
+                 pairScale, pairProjection, pair, range]
               : projectedRelpos
-                ? [trunkPair, features, relpeProjection, pairScale, pairProjection, pair]
-                : [trunkPair, features, pairScale, pairProjection, sums, pair],
+                ? [trunkPair, features, relpeProjection, pairScale, pairProjection, pair, range]
+                : [trunkPair, features, pairScale, pairProjection, sums, pair, range],
             pairLinear[0], pairLinear[1]);
+        flush();
       }
       run("single-initial", compiled.singleInitial,
           [trunkSingle, targetFeat, singleScale, singleProjection, noise, noiseWeights, single],
@@ -1059,12 +1083,13 @@ export class Af3DiffusionConditioningGpu {
       // closed-form relative-encoding path is checked on its own.
       const transitionCount = options.transitions ?? 2;
       for (let index = 0; index < transitionCount; index += 1) {
-        if (reusePair === undefined) {
-          const perPair = spread(Math.ceil(pairs / transitionRowTile(pairs, pairChannels)));
+        for (const { count, range } of pairPieces) {
+          const perPair = spread(Math.ceil(count / pairTile));
           // In place (the kernel's residual form): a delta written to a
           // pair-sized scratch and added back was one more pair tensor held.
           run(`pair-transition-${index}`, transitionPipelines.pair[index],
-              [pair, transitionWeights.pair[index]], perPair[0], perPair[1]);
+              [pair, transitionWeights.pair[index], range], perPair[0], perPair[1]);
+          flush();
         }
         run(`single-transition-${index}`, transitionPipelines.single[index],
             [single, transitionWeights.single[index]],

@@ -29,6 +29,7 @@
  * which is an independently written JAX ESMFold2; this agrees with it term for
  * term and is checked against the native model's own recorded output.
  */
+import { fastLinear } from "../runtime/linear-backend.js";
 
 /** One-hot widths, from ESMFold2's own constants. */
 export const MAX_ELEMENT = 128;
@@ -78,6 +79,8 @@ function layerNorm(values, rows, channels, scale, offset, epsilon = 1e-5) {
 
 /** rows x inChannels against (inChannels, outChannels). */
 function linear(input, rows, inChannels, outChannels, weights) {
+  const fast = fastLinear(input, rows, inChannels, weights, outChannels);
+  if (fast !== undefined) return fast;
   const out = new Float32Array(rows * outChannels);
   for (let row = 0; row < rows; row += 1) {
     const inBase = row * inChannels;

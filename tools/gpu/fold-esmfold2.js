@@ -392,7 +392,11 @@ export async function main(device, args = []) {
   // --dump-denoise=<step>: that denoiser call's level, input and output, in the report (a native port replays them)
   const dumpDenoiseStep = option(args, "dump-denoise", "");
   let denoiseDump = null;
+  // --loop-changes: the contact map at each pass, for how much each recycle moved it.
+  const loopContacts = [];
   const result = await foldEsmfold2(device, {
+    ...(args.includes("--loop-changes")
+      ? { onLoopContacts: (_, contacts) => { loopContacts.push(Float32Array.from(contacts)); } } : {}),
     ...(dumpDenoiseStep === "" ? {} : { onDenoise: (step, noisy, denoised, tHat) => {
       if (step === Number(dumpDenoiseStep)) denoiseDump = { step, tHat, noisy: Array.from(noisy), denoised: Array.from(denoised) };
     } }),
@@ -409,7 +413,13 @@ export async function main(device, args = []) {
     entities: entitiesFor(),
     shape: { ...M, loops: recycles + 1 },
     submissionWindow,
+    // --segment-rows=<a power of two>, --hidden-parts=2: a pair of several buffers and an output of two, at a length that
+    // does not need them, which is how a fold past 1448 tokens is held to the same digits as one that fits one buffer.
+    // --spill: z_init and the head's initial pair wait on the host.
+    ...(option(args, "segment-rows", "") === "" ? {} : { segmentRows: Number(option(args, "segment-rows", "")) }),
+    ...(args.includes("--spill") ? { spillPairs: true } : {}),
     trunk: {
+      ...(option(args, "hidden-parts", "") === "" ? {} : { sequentialHiddenParts: Number(option(args, "hidden-parts", "")) }),
       ...(trunkWeights === "" ? {} : { weightPrecision: trunkWeights }),
       ...(trunkPrecision === "" ? {} : {
         stagedPrecision: trunkPrecision.split(":")[0],
@@ -978,6 +988,27 @@ export async function main(device, args = []) {
   }
 
   return {
+    loopChanges: loopContacts.slice(1).map((contacts, at) => {
+      const before = loopContacts[at];
+      const chain = result.features.asymId;
+      const n = chain.length;
+      const mean = { all: [0, 0], interface: [0, 0], contacts: [0, 0] };
+      for (let i = 0; i < n; i += 1) {
+        for (let j = 0; j < n; j += 1) {
+          const cell = i * n + j;
+          const moved = Math.abs(contacts[cell] - before[cell]);
+          mean.all[0] += moved;
+          mean.all[1] += 1;
+          if (chain[i] !== chain[j]) { mean.interface[0] += moved; mean.interface[1] += 1; }
+          if (Math.max(contacts[cell], before[cell]) > 0.1) { mean.contacts[0] += moved; mean.contacts[1] += 1; }
+        }
+      }
+      const of = ([total, count]) => (count === 0 ? null : Number((total / count).toFixed(5)));
+      return { pass: at + 1, all: of(mean.all), interface: of(mean.interface), contacts: of(mean.contacts) };
+    }),
+    // Every coordinate's bits, so two runs that should be one number can be compared as one.
+    coordinateHash: new Uint32Array(result.coordinates.buffer, result.coordinates.byteOffset, result.coordinates.length)
+      .reduce((hash, word) => Math.imul(hash ^ word, 16777619) >>> 0, 2166136261),
     confidence: result.confidence === undefined ? undefined : (() => {
       const c = result.confidence;
       const mean = (v) => v.reduce((a, b) => a + b, 0) / v.length;

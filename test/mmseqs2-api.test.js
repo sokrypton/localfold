@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "./harness.js";
 import {
+  AlignmentServerError,
   expandSearchedChains,
   extractMmseqs2A3m, generateMmseqs2ComplexMsa, generateMmseqs2Msa,
   generateMmseqs2PairedMsa, mergeSearchedChains, planSearchReuse, readTarFiles,
@@ -301,6 +302,80 @@ describe("MMseqs2 API", () => {
     expect(parsed.sequences).toContain("AC-E----");
     expect(parsed.sequences).toContain("----AC-E");
     expect(parsed.sequences.includes("AC-EAC-E")).toBe(false);
+  });
+});
+
+describe("when the server does not answer as itself", () => {
+  const search = (respond) => generateMmseqs2Msa("ACDE", {
+    fetchImplementation: vi.fn(respond), wait: async () => {}, decompress: async () => { throw new TypeError("invalid gzip"); },
+  });
+  const failure = async (respond) => {
+    try {
+      await search(respond);
+    } catch (error) {
+      return error;
+    }
+    throw new Error("the search succeeded");
+  };
+
+  it("says who could not be reached, not what a fetch says", async () => {
+    const calls = vi.fn();
+    const error = await failure(async () => { calls(); throw new TypeError("Failed to fetch"); });
+    expect(error instanceof AlignmentServerError).toBe(true);
+    expect(error.message).toContain("api.colabfold.com");
+    expect(error.message.includes("Failed to fetch")).toBe(false);
+    expect(calls.mock.calls).toHaveLength(5);
+  });
+
+  it("does not wait after the last attempt", async () => {
+    const waits = [];
+    await generateMmseqs2Msa("ACDE", {
+      fetchImplementation: async () => new Response("boom", { status: 503 }),
+      wait: async (milliseconds) => { waits.push(milliseconds); },
+    }).catch(() => {});
+    expect(waits).toEqual([500, 1000, 2000, 4000]);
+  });
+
+  it("says that something else answered, not where JSON's parser tripped", async () => {
+    const error = await failure(async () => new Response("<html>a captive portal</html>"));
+    expect(error instanceof AlignmentServerError).toBe(true);
+    expect(error.message.includes("Unexpected token")).toBe(false);
+    expect(error.message).toContain("sign-in page");
+  });
+
+  it("reads a body of the wrong shape as a server that refused", async () => {
+    for (const body of ["null", "3", "[]", '"COMPLETE"']) {
+      // eslint-disable-next-line no-await-in-loop
+      const error = await failure(async () => new Response(body));
+      expect(error instanceof AlignmentServerError).toBe(true);
+      expect(error.message).toContain("rejected the sequence");
+    }
+  });
+
+  it("says the same of a result that does not unpack", async () => {
+    const responses = [new Response(JSON.stringify({ status: "COMPLETE", id: "t" })), new Response("<html></html>")];
+    const error = await failure(async () => responses.shift());
+    expect(error instanceof AlignmentServerError).toBe(true);
+    expect(error.message.includes("invalid gzip")).toBe(false);
+  });
+
+  it("does not read a Stop as a server's fault", async () => {
+    const controller = new AbortController();
+    const body = new Response(new ReadableStream({ start: (stream) => {
+      controller.signal.addEventListener("abort", () => stream.error(new DOMException("stopped", "AbortError")));
+    } }));
+    const searched = generateMmseqs2Msa("ACDE", { fetchImplementation: async () => body, signal: controller.signal });
+    setTimeout(() => controller.abort(), 0);
+    let error;
+    await searched.catch((caught) => { error = caught; });
+    expect(error?.name).toBe("AbortError");
+  });
+
+  it("leaves a sequence the reader has to correct as a plain error", async () => {
+    let error;
+    await generateMmseqs2Msa("AC1E", {}).catch((caught) => { error = caught; });
+    expect(error instanceof Error).toBe(true);
+    expect(error instanceof AlignmentServerError).toBe(false);
   });
 });
 

@@ -569,6 +569,14 @@ export class Af3TemplateEmbedderGpu {
       gridProjectMatrix:
         (options.pairMatrixKernels ?? this.options?.pairMatrixKernels) !== false
         && gridProjectMatrixConfig(this.device),
+      // ...and a large pair a piece at a time, as in the pairformer. IntelliFold-2's stack is 256 channels, and with the
+      // other two stacks on this track its seven pair-sized tensors would be the fold's peak.
+      sequentialTriangle: options.sequentialTriangle ?? deviceTuning(this.device).sequentialTriangle ?? true,
+      sequentialGroups: options.sequentialGroups,
+      sequentialChunkBytes: options.sequentialChunkBytes,
+      sequentialContractWork: options.sequentialContractWork,
+      sequentialHiddenParts: 1,
+      ...(options.forceCompact === true ? { forceCompact: true } : {}),
       maxComputeWorkgroupStorageSize: this.device.limits.maxComputeWorkgroupStorageSize,
     });
     const [compiled, trackPipelines] = await Promise.all([settleAll(compiling), trackCompiling]);
@@ -847,7 +855,7 @@ export class Af3TemplateEmbedderGpu {
 
       if (pairBuffer !== undefined) options.validation.begin();
       else this.device.pushErrorScope("validation");
-      const encoder = this.device.createCommandEncoder({ label: "af3-template" });
+      let encoder = this.device.createCommandEncoder({ label: "af3-template" });
       const batchPasses = deviceTuning(this.device).batchComputePasses !== false;
       let openPass = null;
       const endPass = () => { if (openPass !== null) { openPass.end(); openPass = null; } };
@@ -870,6 +878,11 @@ export class Af3TemplateEmbedderGpu {
         }));
         pass.dispatchWorkgroups(x, y, z);
         if (!batchPasses) pass.end();
+      };
+      const flush = () => {
+        endPass();
+        this.device.queue.submit([encoder.finish()]);
+        encoder = this.device.createCommandEncoder({ label: "af3-template" });
       };
       const spread = (groups) => [Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH)];
       const linear = spread(Math.ceil(pairs / 64));
@@ -946,7 +959,7 @@ export class Af3TemplateEmbedderGpu {
           encodePairTrack({
             run, pipelines: trackPipelines, n: tokens, channels: CHANNELS, gridHeads,
             pair: act, pairMask, scratch, biasBuffer, weights: blockWeights[index],
-            gridProjectMatrix,
+            gridProjectMatrix, flush,
           });
         }
         run(`template.accumulate.${slot}`, compiled.accumulate,

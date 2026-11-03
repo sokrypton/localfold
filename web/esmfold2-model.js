@@ -367,7 +367,25 @@ export function loadEsmfold2Weights(onProgress,
     };
   })();
   weightsPromises.set(family, promise);
+  // A download that failed once must not fail until the reader reloads.
+  promise.catch(() => {
+    if (weightsPromises.get(family) === promise) weightsPromises.delete(family);
+  });
   return promise;
+}
+
+/**
+ * Let go of every other family's weights, which are about a gigabyte of JS heap each.
+ *
+ * The memo is permanent by design, and that was right while one model was loaded
+ * at a time. Moving 300M to 600M and back kept both trees in the tab for good. A
+ * family let go here reads its shards back from the shard cache when next chosen,
+ * which takes a moment rather than a download.
+ */
+export function releaseEsmfold2Weights(keepFamily) {
+  for (const family of weightsPromises.keys()) {
+    if (family !== keepFamily) weightsPromises.delete(family);
+  }
 }
 
 /**

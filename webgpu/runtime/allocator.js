@@ -76,6 +76,14 @@ export class GpuBufferAllocator {
       throw new RangeError(`invalid allocation size ${requestedBytes} for ${label}`);
     }
     let byteLength = Math.ceil(requestedBytes / 4) * 4;
+    // A buffer over the adapter's limit is a validation error nothing awaits, and
+    // the fold then reads zeros. 2 GiB on D3D12 and 1 GiB on SwiftShader, which a pair
+    // tensor reaches well before any memory budget does.
+    const largest = this.device.limits?.maxBufferSize;
+    if (typeof largest === "number" && byteLength > largest) {
+      throw new RangeError(`${label} needs a single ${Math.round(byteLength / 1048576)} MiB buffer`
+        + ` and this GPU allows ${Math.round(largest / 1048576)} MiB: the input is too long for this device`);
+    }
     // 🔴 A POOLED STORAGE BUFFER CARRIES BOTH COPY FLAGS, so one size is one
     // key. The key is size AND usage, and AlphaFold 2's graph asks for the
     // same pair size as STORAGE, STORAGE|COPY_SRC and STORAGE|COPY_DST in

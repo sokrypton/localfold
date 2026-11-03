@@ -738,6 +738,84 @@ kernels now run at 9-17 TFLOPS on a 19.5 TFLOPS card (`grid.project` 16.6,
 `tri.project` 14, the vector split 13-15, `tri.project-out` ~12, `grid.attend`
 and `tri.contract` ~9), and OpenDDE's trunk at 255 is 86% GPU-busy.
 
+### The pair track a piece at a time, in every stack that has one
+
+The compact track above holds about 4.5 pair-sized tensors. The sequential track (`sequentialTriangle`) holds about 2.25 to
+3: the pair, the contraction's output, and 2/groups of a tensor for one channel group's a and b or one chunk's
+normalised rows. It rests on one fact, that LayerNorm(pair) is the same bits whenever it is taken before the output pass writes, so
+each normalised input is computed into a small buffer just before its reader instead of being stored whole.
+
+The grid attention is the part that needed new kernels. Its normalised input comes from a pair an earlier chunk of the
+same pass has already written, so the bias, which reads every row, goes first; each chunk then normalises its own rows
+from the pair (`localSource` in createGridAttentionShaders); and q, k, v and the gate live in the contraction's buffer
+while the normalised rows and the attention's output live in a and b's, because one dispatch may not read and write one
+buffer. Every stack with a pair track takes it from 128 MiB up (`COMPACT_MIN_BYTES`): ESMFold2's trunk, BioEmu2's, and
+the AF3 lineage's pairformer, MSA, template and confidence stacks.
+
+**The channel groups follow the room.** Each group reads the whole pair to project its channels, so fewer are faster, and a
+and b for one group are 2/groups of a pair tensor, so fewer hold more. `webgpu/af3/trunk/sequential-groups.js` takes the
+fewest of 2, 4 and 8 that fit what the device has left, once a pass in the AF3 trunk and once a fold in ESMFold2's, because
+what the first stack leaves in the pool, or a loop keeps between passes, would otherwise read as memory in use. Whole folds
+alternated in one browser on an A10 under stock Chrome, `tools/gpu/hash-af3-fold.js`, the round after the first; seconds of
+the fold, and against it what the pairformer stack holds in MiB (`tools/gpu/memory-af3-track.js`):
+
+| model (pair channels) | n | compact | 8 groups | 4 groups | 2 groups |
+|---|---:|---:|---:|---:|---:|
+| OpenBind-0 (128) | 600 | 30.1 s, 811 | 33.3 s, 548 | 31.2 s, 591 | 30.6 s, 679 |
+| OpenBind-0 (128) | 1000 | 103.4 s, 2231 | 112.5 s, 1270 | 106.0 s, 1392 | 104.8 s, 1636 |
+| Protenix-v2 (256) | 600 | 83.5 s, 1614 | 87.0 s, 955 | 85.3 s, 1043 | 84.4 s, 1219 |
+
+ESMFold2's trunk with four blocks queued, `tools/gpu/time-esmfold2-groups.js`, ms a block and MiB: at 600 tokens 191 and 1583
+for compact, 212 and 923 for eight groups, 197 and 1011 for four, 193 and 1187 for two; at 1000 tokens 604 and 4398, 652 and
+2337, 620 and 2581, 616 and 3069.
+
+🔴 **A STACK TIMED WITH EACH BLOCK DRAINED CANNOT SEE THIS.** It counts the device waiting on the host: the same arms read 154
+and 157 ms a block at 600 tokens where a fold's are 107 and 124. And a whole run of a stack favours whichever arm holds the
+least, because the first block pays for a lazy clear of every new buffer: that read eight groups as 11% faster. Two A10
+containers differ by up to 40%, so arms belong in one browser, alternated.
+
+**The contraction's dispatches are bounded apart from the groups** (`CONTRACT_STEP_WORK`): tokens^3 x channels, 32 channels
+at 1000 tokens and three at 2046, so a group of two holds the device no longer than a group of eight did.
+
+**And the kernels that treat each pair alone go a bounded number of rows at a time** (`rowPieces`). A submit cannot break up
+one dispatch, and the AF3 conditioning's pair kernels and the distogram were one each, 1984 and 914 ms at 1000 tokens of
+IntelliFold-2 on an A10, and so was the fused pair transition. Each pair is its own in all of them, so a uniform names the
+range. The arm `pieces` in `hash-af3-fold.js` cuts them far finer than the page does, and reads the same fold.
+
+**Bit-identical**: `tools/gpu/check-af3-sequential.js` runs each arm against the whole-tensor track over real weights, a mask
+with holes and with none, and the MSA and template stacks: 448 arms over openbind0, opendde, boltz2, protenix2, mol1,
+intellifold2 and rosettafold3 at 130 and 257 tokens on an A10 under stock Chrome, 192 over three of them on an RTX 3070 with
+f16, zero differing elements. `tools/gpu/check-esmfold2-sequential.js` is the same for ESMFold2. And whole folds, the round
+after the first, with the same PDB and contact maps as `main` on all seven (`tools/gpu/hash-af3-fold.js`).
+
+### What reaches the queue, and when
+
+A driver judges a hang by how long one submission keeps the card, two seconds on Windows, and Windows gives up on a
+driver after a handful in a minute. One block as one submission reached 3219 ms for OpenDDE at 600 tokens on an A10, a
+card about as fast as a 3070. Everything queued is also committed: Stop waits for it, and so does closing the tab. So
+`webgpu/runtime/queue-pacing.js` paces every stack by time:
+
+- **A large block goes in pieces** (a pair of 32 MiB and up, `FLUSH_MIN_BYTES`). encodePairTrack offers a boundary after
+  each row chunk's projection, contraction step, grid chunk and run of transition chunks, and the pacer takes as many
+  pieces to a submission as fill 50 ms, starting from one until a block has been timed. The pieces cost nothing: a pairformer
+  stage at 600 tokens on an A10 reads 20.6 s with them and without, alternated. The fold's saved PDB is the same at 50 ms, at
+  200 ms and with no boundaries after the first block.
+- **A heavy piece ends its submission.** The count is a mean over pieces that differ a lot, and a run of grid and transition
+  chunks taken as cheap filled 900 ms at 1000 tokens of IntelliFold-2. So contraction steps, grid chunks and transition
+  pieces never share a submission with what follows them.
+- **The window is about a second of queued work**, up to the sixteen blocks that were measured on a small fold.
+- **It slides.** A new block waits for the oldest rather than for the queue to empty, so the card is not left idle while
+  the next block is encoded, unless one block is worth the whole second.
+- **ESMFold2's sampler goes in pieces too.** A denoiser step was one submission of 236 to 336 dispatches, all eleven of them:
+  694 ms at 2046 tokens on an A10 and 920 at 1200 on a T4, so a card three times slower than a T4 would pass two seconds on every
+  step. A submission now holds 48 dispatches (`DENOISE_PIECE_DISPATCHES`), and the atom stack 12 (`EMBED_PIECE_DISPATCHES`).
+
+🔴 **A LONG ROW ON `longestSubmits` IS NOT ALWAYS A LONG DISPATCH.** It reads `done - max(submit, previous done)`, an upper bound,
+and a fold's first submissions read long whatever they hold, because they wait for the GPU process. On an H100 at 600 tokens an
+`occupancy` probe of four workgroups read 1489 ms, and the first int3 upload read 626 ms with 3888 workgroups where the fold's
+other 389 uploads took 122 ms between them. Cutting that upload into pieces of 256 workgroups read 1340 ms for its first piece and
+added 5400 submissions a fold, so it did not stay. What is long reads long every time: all eleven denoiser steps, not one first row.
+
 ### A small fold streams its trunk weights too, and keeps the codes
 
 🔴 **FREE AT 255 TOKENS ONCE THE REPLAY WAS ONE DISPATCH A BLOCK.** Streaming a

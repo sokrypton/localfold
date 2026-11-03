@@ -19,13 +19,27 @@ AI Context: STANDALONE WEB APP ENTRY POINT
          console that it is not for production - to supply EIGHT utility rules.
          They are in src/app/style.css now, with Tailwind's own values. -->
     <!-- JSZip library for handling zip file uploads -->
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <!-- Neither this nor the icons below may hold the page up: a network that drops this host answers nothing at all, and a
+         head waits for what it asked. The viewer asks whether JSZip is there when it needs it. -->
+    <script async src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
     <!-- canvas2svg is src/core/svg.js -->
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css"
+        media="print" onload="this.media = 'all'"
         xintegrity="sha512-SnH5WK+bZxgPHs44uWIX+LLMDJd4gYm4zQ6UvE6j3v/3Tf7U7T2Y9p6gJzU0bW5V6f6G6X6b6W6w6+g6w=="
         crossorigin="anonymous" referrerpolicy="no-referrer" />
     <link rel="stylesheet" href="./web/vendor/py2Dmol.app.css">
     <link rel="stylesheet" href="./web/localfold.css">
+    <link rel="stylesheet" href="./web/localfold-dark.css">
+    <!-- THE THEME, BEFORE FIRST PAINT, or a dark page flashes white on every load.
+         web/settings-panel.js applies the same rule when the choice changes. -->
+    <script>
+      try {
+        const saved = localStorage.getItem("localfold.theme");
+        const dark = saved === "dark" || (saved !== "light"
+          && matchMedia("(prefers-color-scheme: dark)").matches);
+        document.documentElement.dataset.theme = dark ? "dark" : "light";
+      } catch { /* a blocked storage: the light page */ }
+    </script>
     <!-- WHAT THE STATUS LINE SAYS WITH NOTHING LOADED. py2Dmol's default names
          two controls this page does not have. Set here rather than in the
          module, because the app writes this message on load and again on every
@@ -69,6 +83,53 @@ AI Context: STANDALONE WEB APP ENTRY POINT
         <div class="page-head page-head-fold" style="padding-right: 0;">
             <h1>LocalFold</h1>
             <div class="fold-actions">
+              <span id="fold-plan" class="fold-plan" role="status" hidden></span>
+              <div class="settings-anchor">
+                <button type="button" id="settings-toggle" class="btn btn-grey btn-small"
+                        aria-haspopup="dialog" aria-expanded="false" title="Settings">
+                  <i class="fa-solid fa-gear" aria-hidden="true"></i>
+                  <span id="device-badge">Settings</span>
+                </button>
+                <div id="settings-panel" class="settings-panel" role="dialog" aria-label="Settings" hidden>
+                  <section class="settings-section">
+                    <h2 class="settings-title">Appearance</h2>
+                    <div id="settings-theme" class="settings-segments"></div>
+                  </section>
+                  <section class="settings-section">
+                    <h2 class="settings-title">Fold on</h2>
+                    <div id="settings-compute" class="settings-segments"></div>
+                    <p id="settings-compute-note" class="settings-note"></p>
+                  </section>
+                  <section class="settings-section">
+                    <h2 class="settings-title">GPU memory</h2>
+                    <div class="settings-row"><span>Card</span><span id="settings-gpu-name" class="settings-value"></span></div>
+                    <div class="settings-row"><span>This page</span><span id="settings-gpu-value" class="settings-value"></span></div>
+                    <div class="settings-row">
+                      <label for="settings-gpu-limit">One fold may hold</label>
+                      <select id="settings-gpu-limit" class="settings-select"></select>
+                    </div>
+                    <div class="settings-row" style="margin-top: 8px; justify-content: flex-start;">
+                      <button type="button" id="settings-gpu-release" class="btn btn-grey btn-small"
+                              title="Gives the card back now. The next fold uploads its weights again.">Free GPU memory</button>
+                      <button type="button" id="settings-gpu-forget" class="btn btn-grey btn-small" hidden
+                              title="A lost device lowered the limit. Use this if something else caused it.">Reset limit</button>
+                    </div>
+                    <p id="settings-gpu-limit-note" class="settings-note"></p>
+                    <p class="settings-note">Given back by itself after two minutes in a hidden tab, or fifteen idle.</p>
+                  </section>
+                  <section class="settings-section">
+                    <div class="settings-row">
+                      <h2 class="settings-title" style="margin: 0;">Downloaded models</h2>
+                      <span id="settings-models-total" class="settings-value"></span>
+                    </div>
+                    <ul id="settings-models" class="settings-models"></ul>
+                    <div class="settings-row" style="margin-top: 8px; justify-content: flex-start;">
+                      <button type="button" id="settings-models-clear" class="btn btn-grey btn-small"
+                              title="Deletes every downloaded model. Each downloads again when next used.">Delete all</button>
+                    </div>
+                  </section>
+                </div>
+              </div>
               <button type="button" id="add-entity" class="btn btn-grey btn-small">
                 <i class="fa-solid fa-plus"></i>
                 <span>Add entity</span>
@@ -812,7 +873,7 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                              the readouts above a track with no width at all: the handles
                              were there and unusable. -->
                         <div id="clipPanel" hidden class="control-group"
-                            style="display: flex; flex-direction: column; align-items: stretch; gap: 6px; border: 1px solid #e5e7eb; border-radius: 8px; background: #fff; padding: 8px; margin-bottom: 4px;">
+                            style="display: flex; flex-direction: column; align-items: stretch; gap: 6px; border: 1px solid var(--lf-border-2); border-radius: 8px; background: var(--lf-surface); padding: 8px; margin-bottom: 4px;">
                             <div style="display: flex; flex-direction: row; align-items: center; gap: 8px;">
                                 <label for="clipNear" class="font-medium text-gray-700"
                                     style="width: 34px; font-size: 11px; flex-shrink: 0;"
@@ -962,7 +1023,7 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                              of ours: the vendored bundle wires any
                              #saveStateButton to saveViewerState. -->
                         <button id="saveStateButton" class="btn btn-secondary" type="button"
-                            title="Save everything the viewer is showing as a py2Dmol session (.json): every fold, its frames, maps, colours, selections and the camera. Opens on py2dmol.solab.org.">
+                            title="Save everything the viewer is showing as a py2Dmol session (.json): every fold, its frames, maps, colours, selections and the camera. Drop it back on this page to bring them back, or open it on py2dmol.solab.org.">
                             <i class="fa-solid fa-floppy-disk"></i><span>Session</span>
                         </button>
                     </div>
@@ -1011,7 +1072,7 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                      of their own (a single structure, or a session from before
                      they were kept). -->
                 <div id="frameNameLabel"
-                    style="flex: 1; min-width: 0; text-align: center; font-size: 12px; color: #6b7280; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;"></div>
+                    style="flex: 1; min-width: 0; text-align: center; font-size: 12px; color: var(--lf-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;"></div>
 
                 <!-- Action buttons aligned to the right -->
                 <div class="sequence-actions" style="margin-left: auto;">
@@ -1108,15 +1169,15 @@ AI Context: STANDALONE WEB APP ENTRY POINT
     </div>
 
     <!-- Footer -->
-    <footer style="margin-top: var(--container-gap); padding: 0; color: #6b7280; font-size: 11px;">
+    <footer style="margin-top: var(--container-gap); padding: 0; color: var(--lf-muted); font-size: 11px;">
         <div class="page-width"
-            style="margin: 0 auto; padding: 8px 0 0 0; border-top: 1px solid #e5e7eb; display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 4px 16px;">
+            style="margin: 0 auto; padding: 8px 0 0 0; border-top: 1px solid var(--lf-border-2); display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 4px 16px;">
             <!-- WRAPS RATHER THAN ELLIPSISES. One unbroken line with the overflow
                  hidden is a footer that reads "LocalFold · forks alphafold2-web…" on a
                  phone and hides the link to the single-sequence page entirely; at
                  948 it is one line either way. -->
             <div id="footer-links" style="flex: 1 1 auto; min-width: 0; display: flex; flex-wrap: wrap; align-items: center; gap: 2px 8px;">
-                <a href="https://github.com/sokrypton/localfold" target="_blank" rel="noopener noreferrer" style="color: #3b82f6; text-decoration: none;"><i class="fab fa-github" style="margin-right: 5px;"></i>LocalFold</a>
+                <a href="https://github.com/sokrypton/localfold" target="_blank" rel="noopener noreferrer" style="color: var(--lf-link); text-decoration: none;"><i class="fab fa-github" style="margin-right: 5px;"></i>LocalFold</a>
                 <!-- 🔴 THE FORKS AND THE UPSTREAM PROJECTS ARE IN THE README,
                      NOT HERE. Four links of provenance in a footer is a row a
                      reader has to read past to find the one thing the footer

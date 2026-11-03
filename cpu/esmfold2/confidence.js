@@ -24,6 +24,7 @@
  * that read that line as an ordinary residual is short exactly one copy of the
  * input, which is a PAE that looks entirely reasonable and is wrong.
  */
+import { recycle } from "../runtime/recycled-floats.js";
 import { layerNorm, linear, transition, triangleMultiplication }
   from "../af3/trunk/pairformer.js";
 
@@ -285,6 +286,7 @@ export function esmfold2Confidence(inputs, weights) {
   let stack = Float32Array.from(pair);
   const add = (delta) => {
     for (let index = 0; index < stack.length; index += 1) stack[index] += delta[index];
+    recycle(delta);
   };
   for (const block of weights.blocks) {
     add(triangleMultiplication(stack, pairMask, tokens, dPair, "outgoing",

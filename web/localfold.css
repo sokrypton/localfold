@@ -10,6 +10,164 @@
  * this project introduced.
  */
 
+/* THE PAGE'S COLOURS, BY ROLE. The light values are the literals these replaced, so
+   the light page is unchanged. The dark ones hold body text at 13:1 on the surface and
+   muted text at 6:1. py2Dmol's own literals get the same tokens through
+   web/localfold-dark.css, and its gray scale is flipped here. */
+:root {
+  color-scheme: light;
+  --lf-bg: #f8fafc;
+  --lf-surface: #fff;
+  --lf-surface-2: #f9fafb;
+  --lf-surface-3: #f3f4f6;
+  --lf-surface-4: #e5e7eb;
+  --lf-text: #111827;
+  --lf-text-2: #374151;
+  --lf-muted: #6b7280;
+  --lf-faint: #9ca3af;
+  --lf-link: #2563eb;
+  --lf-border: #d1d5db;
+  --lf-border-2: #e5e7eb;
+  --lf-info-bg: #eff6ff;
+  --lf-info-bg-2: #dbeafe;
+  --lf-info-text: #1d4ed8;
+  --lf-info-border: #bfdbfe;
+  --lf-error-bg: #fee2e2;
+  --lf-error-text: #991b1b;
+  --lf-error-border: #fca5a5;
+  --lf-warn-bg: #fffbeb;
+  --lf-warn-text: #92400e;
+  --lf-warn-border: #fde68a;
+  --lf-ok-bg: #f0fdf4;
+  /* A canvas py2Dmol paints white itself takes this, and is left alone in light mode. */
+  --lf-canvas-filter: none;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --lf-bg: #0e1116;
+  --lf-surface: #161a21;
+  --lf-surface-2: #1c2129;
+  --lf-surface-3: #232932;
+  --lf-surface-4: #2d343f;
+  --lf-text: #e8ebf0;
+  --lf-text-2: #c9ced8;
+  --lf-muted: #98a1af;
+  --lf-faint: #737c8a;
+  --lf-link: #7aa7ff;
+  --lf-border: #38404c;
+  --lf-border-2: #2b323c;
+  --lf-info-bg: #14233d;
+  --lf-info-bg-2: #1a2e50;
+  --lf-info-text: #a9c7ff;
+  --lf-info-border: #27457a;
+  --lf-error-bg: #3a1a1c;
+  --lf-error-text: #ffb3b0;
+  --lf-error-border: #6e2a2d;
+  --lf-warn-bg: #33270f;
+  --lf-warn-text: #f4cf85;
+  --lf-warn-border: #6b5118;
+  --lf-ok-bg: #12291c;
+  --lf-canvas-filter: brightness(0.9);
+  --color-gray-50: #1c2129;
+  --color-gray-100: #232932;
+  --color-gray-200: #2d343f;
+  --color-gray-300: #3a424e;
+  --color-gray-400: #737c8a;
+  --color-gray-500: #98a1af;
+  --color-gray-600: #b4bbc7;
+  --color-gray-700: #c9ced8;
+  --color-gray-800: #dfe2e8;
+  --color-gray-900: #f0f2f5;
+  --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.4);
+  --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.45), 0 2px 4px -1px rgba(0, 0, 0, 0.3);
+  --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.5), 0 4px 6px -2px rgba(0, 0, 0, 0.35);
+  --shadow-xl: 0 20px 25px -5px rgba(0, 0, 0, 0.55), 0 10px 10px -5px rgba(0, 0, 0, 0.4);
+}
+
+:root[data-theme="dark"] body { background: var(--lf-bg); color: var(--lf-text); }
+:root[data-theme="dark"] h1 { color: var(--lf-text); }
+:root[data-theme="dark"] input,
+:root[data-theme="dark"] select,
+:root[data-theme="dark"] textarea {
+  background-color: var(--lf-surface-2);
+  color: var(--lf-text);
+  border-color: var(--lf-border);
+}
+/* The maps and the sequence stay on their white plates, only dimmed: their colours are data,
+   and an inverted pLDDT blue would no longer be the blue on the structure beside it. */
+:root[data-theme="dark"] #canvasContainer { background: #000; }
+:root[data-theme="dark"] #heatmapContainer canvas,
+:root[data-theme="dark"] #scatterContainer canvas,
+:root[data-theme="dark"] .msa-canvas canvas,
+:root[data-theme="dark"] #sequenceView canvas { filter: var(--lf-canvas-filter); }
+
+/* What py2Dmol styles for itself, in a sheet it injects and in this page's own attributes. Its fullscreen button is a pale box
+   whose icon takes the dark theme's pale grey, so it could not be seen. */
+:root[data-theme="dark"] .py2dmol-slot-tab { background: var(--lf-surface-3); border-color: var(--lf-border); color: var(--lf-muted); }
+:root[data-theme="dark"] .py2dmol-slot-tab[aria-selected="true"] { background: var(--lf-surface); border-color: var(--lf-border); color: var(--lf-text); }
+:root[data-theme="dark"] .py2dmol-fs-btn { background: var(--lf-surface-3); border-color: var(--lf-border); color: var(--lf-text-2); }
+:root[data-theme="dark"] .py2dmol-fs-btn:hover { background: var(--lf-surface-4); color: var(--lf-text); }
+/* ...and py2Dmol's status colours are generated above an error's, which read as blue as any other line. */
+:root[data-theme="dark"] #status-message.error { background: var(--lf-error-bg); border-color: var(--lf-error-border); color: var(--lf-error-text); }
+:root[data-theme="dark"] .msa-filters { background: var(--lf-surface) !important; border-color: var(--lf-border) !important; }
+:root[data-theme="dark"] .msa-filters span,
+:root[data-theme="dark"] .msa-filters label,
+:root[data-theme="dark"] #msaSortContainer label,
+:root[data-theme="dark"] #logoBitScoreContainer label { color: var(--lf-text-2) !important; }
+
+/* The settings button and its panel. */
+.settings-anchor { position: relative; }
+#settings-toggle { gap: 6px; max-width: 260px; }
+#device-badge {
+  max-width: 190px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+#settings-toggle[data-state="missing"] { color: var(--lf-error-text); }
+.settings-panel {
+  position: absolute; top: calc(100% + 6px); right: 0; z-index: 40;
+  width: min(360px, calc(100vw - 32px)); box-sizing: border-box; padding: 14px;
+  background: var(--lf-surface); color: var(--lf-text);
+  border: 1px solid var(--lf-border-2); border-radius: 12px; box-shadow: var(--shadow-xl);
+  font-size: 12px; line-height: 1.45;
+}
+.settings-panel[hidden] { display: none; }
+@media (max-width: 560px) {
+  #device-badge { display: none; }
+  /* The button sits at the row's left here, and a panel hung from its right edge runs off the page. */
+  .settings-panel { position: fixed; top: auto; left: 16px; right: 16px; width: auto; max-height: 80vh; overflow-y: auto; }
+}
+.settings-section + .settings-section {
+  margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--lf-border-2);
+}
+.settings-title {
+  margin: 0 0 6px; font-size: 11px; font-weight: 600; letter-spacing: 0.04em;
+  text-transform: uppercase; color: var(--lf-muted);
+}
+.settings-note { margin: 6px 0 0; color: var(--lf-muted); }
+.settings-select {
+  max-width: 60%; padding: 2px 4px; border: 1px solid var(--lf-border); border-radius: 6px;
+  background: var(--lf-surface); color: var(--lf-text-2); font: inherit; font-variant-numeric: tabular-nums;
+}
+/* What this fold will take, beside the button that starts it. */
+.fold-plan { color: var(--lf-muted); font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.fold-plan[data-tone="warn"] { color: var(--lf-warn-text); }
+.settings-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.settings-row + .settings-row { margin-top: 4px; }
+.settings-value { font-variant-numeric: tabular-nums; }
+.settings-segments {
+  display: flex; padding: 2px; gap: 2px; border-radius: 8px; background: var(--lf-surface-3);
+}
+.settings-segments button {
+  flex: 1 1 0; height: 26px; border: 0; border-radius: 6px; cursor: pointer; font: inherit;
+  background: transparent; color: var(--lf-muted);
+}
+.settings-segments button[aria-pressed="true"] {
+  background: var(--lf-surface); color: var(--lf-text); box-shadow: var(--shadow-sm);
+}
+.settings-segments button:focus-visible { outline: 2px solid var(--lf-link); outline-offset: 1px; }
+.settings-models { margin: 6px 0 0; padding: 0; list-style: none; }
+
 /* THE SEQUENCE BOX IS THE FETCH BOX, one line taller. py2Dmol's #fetch-id is
    the shape a reader already associates with "the thing you type into", so this
    copies it rather than inventing a second look: same border, radius, focus
@@ -33,15 +191,15 @@
   min-width: 0;
   height: 58px;
   padding: 8px 16px;
-  border: 1px solid #d1d5db;
+  border: 1px solid var(--lf-border);
   border-radius: 8px;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 13px;
   line-height: 1.35;
   letter-spacing: .02em;
   resize: vertical;
-  background: #fff;
-  color: #111827;
+  background: var(--lf-surface);
+  color: var(--lf-text);
 }
 
 #sequence:hover,
@@ -68,7 +226,7 @@
    one line. Everything here is content-sized; leave it that way. */
 #msaModeGroup, #plmGroup {
   margin-left: auto;
-  border-left: 1px solid #e5e7eb;
+  border-left: 1px solid var(--lf-border-2);
   padding-left: 16px;
 }
 /* 🔴 AND THE PLM ROW TAKES THE MSA ROW'S PLACE WITHOUT ITS `margin-left: auto`,
@@ -94,12 +252,12 @@
   width: 100%;
   min-height: 64px;
   padding: 8px 12px;
-  border: 1px solid #d1d5db;
+  border: 1px solid var(--lf-border);
   border-radius: 8px;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 12px;
-  background: #fff;
-  color: #111827;
+  background: var(--lf-surface);
+  color: var(--lf-text);
   resize: vertical;
 }
 #msa-text:focus { outline: none; border-color: #3b82f6; }
@@ -110,10 +268,10 @@
 #foldOptions select,
 #foldOptions input[type="number"] {
   height: 28px;
-  border: 1px solid #d1d5db;
+  border: 1px solid var(--lf-border);
   border-radius: 6px;
-  background: #fff;
-  color: #111827;
+  background: var(--lf-surface);
+  color: var(--lf-text);
   font-size: 13px;
   box-sizing: border-box;
 }
@@ -161,7 +319,7 @@
   cursor: pointer;
   font-size: var(--btn-font-size, 14px);
   font-weight: 600;
-  color: #374151;
+  color: var(--lf-text-2);
   line-height: 1;
   display: flex;
   align-items: center;
@@ -231,8 +389,8 @@
   border-radius: 6px;
   font-size: 13px;
   font-weight: 500;
-  border: 1px solid #bfdbfe;
-  background: #dbeafe;
+  border: 1px solid var(--lf-info-border);
+  background: var(--lf-info-bg-2);
   color: #1e40af;
   line-height: 1.25;
   display: block;
@@ -243,9 +401,9 @@
 }
 
 #status-message.error {
-  border-color: #fca5a5;
-  background: #fee2e2;
-  color: #991b1b;
+  border-color: var(--lf-error-border);
+  background: var(--lf-error-bg);
+  color: var(--lf-error-text);
 }
 
 /* PROGRESS IS PART OF THE STATUS BLOCK AND IS ALWAYS THERE.
@@ -293,7 +451,7 @@
 #model-load-text {
   font-size: 11px;
   line-height: 1;
-  color: #6b7280;
+  color: var(--lf-muted);
   white-space: nowrap;
   font-variant-numeric: tabular-nums;
 }
@@ -313,7 +471,7 @@
   fill: none;
   stroke-width: 3;
 }
-.model-load-track { stroke: #e5e7eb; }
+.model-load-track { stroke: var(--lf-border-2); }
 .model-load-fill {
   stroke: #3b82f6;
   stroke-linecap: round;
@@ -357,10 +515,10 @@
   border: 0;
   border-radius: 2px;
   appearance: none;
-  background: #e5e7eb;
+  background: var(--lf-surface-4);
   transition: opacity .2s ease;
 }
-#status-row progress::-webkit-progress-bar { background: #e5e7eb; border-radius: 2px; }
+#status-row progress::-webkit-progress-bar { background: var(--lf-surface-4); border-radius: 2px; }
 #status-row progress::-webkit-progress-value { background: #3b82f6; border-radius: 2px; }
 #status-row progress::-moz-progress-bar { background: #3b82f6; border-radius: 2px; }
 
@@ -376,7 +534,7 @@
    trunk queues its blocks and then waits, and a bar frozen at a number reads
    as a hang where one that is visibly moving reads as work. */
 #status-row progress[data-state="waiting"] {
-  background: linear-gradient(90deg, #e5e7eb 25%, #3b82f6 50%, #e5e7eb 75%) 0 0 / 250% 100%;
+  background: linear-gradient(90deg, var(--lf-surface-4) 25%, #3b82f6 50%, var(--lf-surface-4) 75%) 0 0 / 250% 100%;
   animation: localfold-sweep 1.2s linear infinite;
 }
 #status-row progress[data-state="waiting"]::-webkit-progress-bar { background: transparent; }
@@ -404,7 +562,7 @@
 }
 
 /* Legend & swatches */
-.legend { display: flex; flex-wrap: wrap; gap: 4px 8px; font-size: 11px; color: #64748b; }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 8px; font-size: 11px; color: var(--lf-muted); }
 .swatch { display: inline-flex; align-items: center; gap: 4px; }
 .swatch::before { content: ""; width: 8px; height: 8px; border-radius: 2px; background: var(--swatch); }
 
@@ -412,18 +570,18 @@
 #mutate-panel {
   padding: 10px 14px;
   border-radius: 8px;
-  background: #ffffff;
-  border: 1px solid #e2e8f0;
+  background: var(--lf-surface);
+  border: 1px solid var(--lf-border-2);
   box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.05);
 }
 .mutate-bar { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
-.mutate-title { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 14px; font-weight: 700; color: #0f172a; }
-.mutate-hint { flex: 1; margin: 0; font-size: 12px; color: #64748b; }
+.mutate-title { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 14px; font-weight: 700; color: var(--lf-text); }
+.mutate-hint { flex: 1; margin: 0; font-size: 12px; color: var(--lf-muted); }
 .mutate-grid { display: flex; flex-wrap: wrap; gap: 4px; }
 .mutate-cell {
   flex: 1 1 24px; min-width: 24px; height: 28px; padding: 0;
   border: 1px solid rgba(0, 0, 0, 0.12); border-radius: 4px; background: var(--cell);
-  color: #0f172a; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--lf-text); font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 13px; font-weight: 600; cursor: pointer;
   display: flex; align-items: center; justify-content: center;
   transition: transform 0.1s ease;
@@ -436,10 +594,10 @@
 }
 .mutate-close {
   width: 24px; height: 24px; padding: 0; border: 0; border-radius: 4px;
-  background: transparent; color: #64748b; font-size: 18px; line-height: 1; cursor: pointer;
+  background: transparent; color: var(--lf-muted); font-size: 18px; line-height: 1; cursor: pointer;
   display: flex; align-items: center; justify-content: center;
 }
-.mutate-close:hover { color: #0f172a; background: #f1f5f9; }
+.mutate-close:hover { color: var(--lf-text); background: var(--lf-surface-3); }
 
 /* --- Prediction scores card --- */
 /* 🔴 FOUR NUMBERS DO NOT NEED FOUR BOXES, OR A LINE OF THEIR OWN. This was a
@@ -505,13 +663,13 @@
 }
 .score-metric-label {
   font-size: 11px;
-  color: #6b7280;
+  color: var(--lf-muted);
   font-weight: 500;
 }
 .score-metric-value {
   font-size: 14px;
   font-weight: 700;
-  color: #111827;
+  color: var(--lf-text);
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
@@ -577,25 +735,25 @@
 .entity-link .link-atom { width: 6ch; text-transform: uppercase; }
 .entity-link .link-atom::placeholder { text-transform: none; }
 .entity-link .link-distance { width: 6ch; }
-.entity-link .link-residue-past { color: #b91c1c; }
+.entity-link .link-residue-past { color: var(--lf-error-text); }
 /* a row the chosen model does not take: greyed, its reason on hover (entity-ui.js rowRefusal); the type menu and
    the remove button stay live, since changing or removing the row is what the reader can do about it */
 .entity-row-unsupported > :not(.entity-type):not(.entity-remove) { opacity: .4; }
-.entity-row-unsupported > .entity-type { color: #9ca3af; text-decoration: line-through; }
+.entity-row-unsupported > .entity-type { color: var(--lf-faint); text-decoration: line-through; }
 /* a bond or constraint is one thing, so its copies box would only invite a number nothing reads */
 .entity-row-link > .entity-copies { visibility: hidden; }
 .entity-link .link-residues { flex: 1 1 16ch; min-width: 12ch; }
-.entity-link .link-residue-name { min-width: 3ch; color: #6b7280; font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
-.entity-link .link-word { color: #6b7280; font-size: 13px; }
+.entity-link .link-residue-name { min-width: 3ch; color: var(--lf-muted); font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
+.entity-link .link-word { color: var(--lf-muted); font-size: 13px; }
 .entity-picker {
   box-sizing: border-box;
   min-width: 0;
   height: 34px;
   padding: 0 8px;
-  border: 1px solid #d1d5db;
+  border: 1px solid var(--lf-border);
   border-radius: 8px;
-  background: #fff;
-  color: #111827;
+  background: var(--lf-surface);
+  color: var(--lf-text);
   font-size: 13px;
 }
 
@@ -605,14 +763,14 @@
   box-sizing: border-box;
   min-width: 0;
   padding: 8px 12px;
-  border: 1px solid #d1d5db;
+  border: 1px solid var(--lf-border);
   border-radius: 8px;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 13px;
   line-height: 1.35;
   letter-spacing: .02em;
-  background: #fff;
-  color: #111827;
+  background: var(--lf-surface);
+  color: var(--lf-text);
 }
 
 /* 🔴 TWO LINES FOR A SEQUENCE, ONE FOR A LIGAND, AND THE HEIGHT IS SET HERE
@@ -663,34 +821,34 @@
   z-index: 30;
   min-width: 340px;
   padding: 10px 12px 12px;
-  border: 1px solid #d1d5db;
+  border: 1px solid var(--lf-border);
   border-radius: 10px;
-  background: #fff;
+  background: var(--lf-surface);
   box-shadow: 0 8px 24px rgba(15, 23, 42, .16);
   display: flex;
   flex-direction: column;
   gap: 6px;
 }
 .entity-popup-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-.entity-popup-title { font-size: 12px; font-weight: 600; color: #374151; }
+.entity-popup-title { font-size: 12px; font-weight: 600; color: var(--lf-text-2); }
 /* A round close in the corner, since the popup no longer dismisses itself. */
 .entity-popup-close {
   flex-shrink: 0;
   width: 22px; height: 22px;
   display: grid; place-items: center;
   padding: 0;
-  border: 1px solid #d1d5db;
+  border: 1px solid var(--lf-border);
   border-radius: 50%;
-  background: #fff;
-  color: #6b7280;
+  background: var(--lf-surface);
+  color: var(--lf-muted);
   font-size: 11px;
   cursor: pointer;
 }
-.entity-popup-close:hover { background: #f3f4f6; color: #111827; }
+.entity-popup-close:hover { background: var(--lf-surface-3); color: var(--lf-text); }
 .entity-popup-empty, .entity-popup-problem {
-  margin: 0; font-size: 12px; line-height: 1.4; color: #6b7280;
+  margin: 0; font-size: 12px; line-height: 1.4; color: var(--lf-muted);
 }
-.entity-popup-problem { color: #b91c1c; }
+.entity-popup-problem { color: var(--lf-error-text); }
 .entity-popup-row { display: flex; align-items: center; gap: 6px; }
 /* 🔴 ONE SET OF METRICS FOR EVERY CONTROL IN THIS POPUP. The template section
    arrived with its own - 28px tall, 4px radius, a grey #f8fafc fill - beside a
@@ -709,14 +867,14 @@
   height: 30px;
   padding: 0 6px;
   font-size: 12px;
-  border: 1px solid #d1d5db;
+  border: 1px solid var(--lf-border);
   border-radius: 7px;
-  background: #fff;
+  background: var(--lf-surface);
   color: inherit;
 }
 .entity-popup-code { flex: 1 1 auto; min-width: 0; }
 .entity-popup-typed { width: 6ch; text-align: center; text-transform: uppercase; }
-.entity-popup-at { font-size: 12px; color: #6b7280; }
+.entity-popup-at { font-size: 12px; color: var(--lf-muted); }
 /* 🔴 SEVEN CHARACTERS FOR FOUR DIGITS, measured. With the spinner gone the
    box is content again - 26px of it at 6ch - and "1000" is 26.7px wide in
    this font, so a four-digit position on a long chain clipped by a hair. */
@@ -725,13 +883,13 @@
    rather than as a validation message after pressing Fold. */
 .entity-popup-residue {
   width: 2ch; font-family: ui-monospace, Menlo, monospace; font-size: 12px;
-  font-weight: 600; color: #2563eb; text-align: center;
+  font-weight: 600; color: var(--lf-link); text-align: center;
 }
-.entity-popup-hint { margin: 0; font-size: 11px; color: #6b7280; }
+.entity-popup-hint { margin: 0; font-size: 11px; color: var(--lf-muted); }
 /* Which row a click on the sequence will move. Without it the click looks like
    it lands somewhere at random once there is more than one modification. */
 .entity-popup-row-active { 
-  background: #eff6ff;
+  background: var(--lf-info-bg);
   border-radius: 7px;
   box-shadow: 0 0 0 3px #eff6ff;
 }
@@ -752,7 +910,7 @@
   overflow-wrap: anywhere;      /* a sequence is one unbroken word */
   color: transparent;
   pointer-events: none;
-  background: #fff;
+  background: var(--lf-surface);
 }
 .entity-mirror mark {
   background: #fde68a;
@@ -786,10 +944,10 @@
   flex-shrink: 0;
   height: 34px;
   padding: 0 8px;
-  border: 1px solid #d1d5db;
+  border: 1px solid var(--lf-border);
   border-radius: 8px;
-  background: #fff;
-  color: #111827;
+  background: var(--lf-surface);
+  color: var(--lf-text);
   font-size: 13px;
 }
 
@@ -801,10 +959,10 @@
   width: 66px;
   height: 34px;
   padding: 0 4px 0 8px;
-  border: 1px solid #d1d5db;
+  border: 1px solid var(--lf-border);
   border-radius: 8px;
-  background: #fff;
-  color: #111827;
+  background: var(--lf-surface);
+  color: var(--lf-text);
   font-size: 13px;
 }
 
@@ -876,6 +1034,8 @@
      INSIDE the button - measured as 13px of scrollHeight past clientHeight,
      which is what a box that states its height does instead of growing. */
   .page-head-fold { flex-wrap: wrap; gap: 8px 12px; }
+  .fold-actions { flex-wrap: wrap; }
+  .fold-plan { flex-basis: 100%; white-space: normal; }
 
   /* 🔴 THE SEQUENCE BOX GETS ITS OWN LINE, AND A GRID CANNOT GIVE IT ONE.
      .entity-row is five tracks - type, copies, `1fr`, options, remove - so the
@@ -1064,7 +1224,7 @@
 }
 
 /* The template's own controls, inside the options popup. */
-.entity-popup-section { margin-top: 12px; border-top: 1px solid #e5e7eb; padding-top: 10px; }
+.entity-popup-section { margin-top: 12px; border-top: 1px solid var(--lf-border-2); padding-top: 10px; }
 /* 🔴 THE TEMPLATE SECTION RESERVES ITS TALLEST SHAPE, so choosing a source
    does not move the menu that is choosing it. A PDB entry and an AlphaFold
    accession add a text row and an upload adds a file row; "no template" and
@@ -1088,7 +1248,7 @@
    content's size at 320px. */
 .entity-template-file { flex: 1 1 auto; min-width: 0; padding: 4px 6px; }
 .entity-template-chain { flex: 0 0 72px; }
-.entity-template-status.error { color: #b91c1c; }
+.entity-template-status.error { color: var(--lf-error-text); }
 .entity-popup-check { display: flex; align-items: center; gap: 6px; font-size: 12px; margin-bottom: 6px; }
 
 
@@ -1097,36 +1257,36 @@
 .terms-dialog {
   max-width: 460px;
   padding: 0;
-  border: 1px solid #d1d5db;
+  border: 1px solid var(--lf-border);
   border-radius: 12px;
   box-shadow: 0 18px 48px rgba(15, 23, 42, .24);
-  color: #111827;
+  color: var(--lf-text);
 }
 .terms-dialog::backdrop { background: rgba(15, 23, 42, .45); }
 .terms-form { display: flex; flex-direction: column; gap: 10px; padding: 16px 18px 14px; }
 .terms-title { margin: 0; font-size: 15px; font-weight: 600; }
-.terms-body { margin: 0; font-size: 12.5px; line-height: 1.5; color: #374151; }
-.terms-links { margin: 0; font-size: 11.5px; color: #6b7280; }
-.terms-links a { color: #2563eb; }
-.terms-note { margin: 0; font-size: 11px; color: #6b7280; }
+.terms-body { margin: 0; font-size: 12.5px; line-height: 1.5; color: var(--lf-text-2); }
+.terms-links { margin: 0; font-size: 11.5px; color: var(--lf-muted); }
+.terms-links a { color: var(--lf-link); }
+.terms-note { margin: 0; font-size: 11px; color: var(--lf-muted); }
 /* The chooser: which model to fold with instead. Its options are cloned from
    the model row when the dialog opens, so this styles a list whose longest
    label is not known here - hence min-width: 0 on the select, without which a
    flex item refuses to shrink below its content and pushes the dialog wider
    than the viewport. tools/model-terms.py measures that at 320px. */
 .terms-choice { display: flex; align-items: center; gap: 8px; margin-top: 2px; }
-.terms-choice-label { font-size: 12.5px; color: #374151; }
+.terms-choice-label { font-size: 12.5px; color: var(--lf-text-2); }
 .terms-select {
   flex: 1 1 auto;
   min-width: 0;
   max-width: 100%;
   padding: 6px 8px;
-  border: 1px solid #d1d5db;
+  border: 1px solid var(--lf-border);
   border-radius: 8px;
-  background: #fff;
+  background: var(--lf-surface);
   font: inherit;
   font-size: 12.5px;
-  color: #374151;
+  color: var(--lf-text-2);
 }
 /* 🔴 THE ALTERNATIVE READS FIRST, and it is the one styled as the primary
    action. A dialog whose only emphasis is on "I agree" is a toll gate; the
@@ -1136,15 +1296,15 @@
   flex: 1 1 auto;
   min-width: 150px;
   padding: 8px 12px;
-  border: 1px solid #d1d5db;
+  border: 1px solid var(--lf-border);
   border-radius: 8px;
-  background: #fff;
+  background: var(--lf-surface);
   font: inherit;
   font-size: 12.5px;
-  color: #374151;
+  color: var(--lf-text-2);
   cursor: pointer;
 }
-.terms-button:hover { background: #f3f4f6; }
+.terms-button:hover { background: var(--lf-surface-3); }
 .terms-button-primary {
   border-color: #2563eb;
   background: #2563eb;
@@ -1198,7 +1358,7 @@
   margin: 2px 0 0;
   font-size: 11px;
   line-height: 1.45;
-  color: #6b7280;
+  color: var(--lf-muted);
 }
 .entity-hint code {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -1229,11 +1389,11 @@
   align-items: center;
   gap: 8px;
   padding: 3px 8px 3px 10px;
-  border: 1px solid #e5e7eb;
+  border: 1px solid var(--lf-border-2);
   border-radius: 999px;
-  background: #fff;
+  background: var(--lf-surface);
   font-size: 12px;
-  color: #374151;
+  color: var(--lf-text-2);
   white-space: nowrap;
 }
 .native-dot {
@@ -1245,7 +1405,7 @@
 }
 .native-status[data-state="live"] .native-dot { background: #22c55e; }
 .native-status[data-state="gone"] .native-dot { background: #f59e0b; }
-.native-status[data-state="gone"] { border-color: #fcd34d; background: #fffbeb; }
+.native-status[data-state="gone"] { border-color: var(--lf-warn-border); background: var(--lf-warn-bg); }
 
 /* ...and it sits BETWEEN the title and the actions, in a slot of its own: the
    head is `space-between`, so a third child would push Fold and Add entity
@@ -1306,25 +1466,25 @@
   gap: 8px;
   position: relative;
   padding: 8px 10px;
-  border: 1px solid #e5e7eb;
+  border: 1px solid var(--lf-border-2);
   border-radius: 8px;
-  background: #fff;
+  background: var(--lf-surface);
 }
-.contig-row.selected { border-color: #93c5fd; box-shadow: 0 0 0 1px #93c5fd inset; }
-.contig-row-break { padding-top: 4px; padding-bottom: 4px; background: #f9fafb; border-style: dashed; }
+.contig-row.selected { border-color: var(--lf-info-border); box-shadow: 0 0 0 1px #93c5fd inset; }
+.contig-row-break { padding-top: 4px; padding-bottom: 4px; background: var(--lf-surface-2); border-style: dashed; }
 .contig-head { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .contig-head .contig-kind { flex: 0 0 auto; font-weight: 600; }
 .contig-head .contig-break { min-width: 0; }
-.contig-chain-tag { font-size: 12px; font-weight: 600; color: var(--chain-colour, #6b7280); white-space: nowrap; }
+.contig-chain-tag { font-size: 12px; font-weight: 600; color: var(--chain-colour, var(--lf-muted)); white-space: nowrap; }
 .contig-head .entity-remove { margin-left: auto; }
 .contig-control { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; min-width: 0; }
-.contig-unit { font-size: 12px; color: #6b7280; }
-.contig-hint { flex: 1 1 100%; font-size: 12px; color: #6b7280; line-height: 1.35; }
+.contig-unit { font-size: 12px; color: var(--lf-muted); }
+.contig-hint { flex: 1 1 100%; font-size: 12px; color: var(--lf-muted); line-height: 1.35; }
 /* the hotspots line is the one a binder is made of, so it is marked in the hotspot colour */
-.contig-hot { padding: 6px 8px; border-left: 3px solid #f59e0b; background: #fffbeb; border-radius: 0 6px 6px 0; }
+.contig-hot { padding: 6px 8px; border-left: 3px solid #f59e0b; background: var(--lf-warn-bg); border-radius: 0 6px 6px 0; }
 .contig-label-hot { font-weight: 600; color: #b45309; }
 .contig-hot .contig-hotspots { flex: 1 1 10ch; width: auto; min-width: 10ch; }
-.contig-redesign { color: #374151; }
+.contig-redesign { color: var(--lf-text-2); }
 
 /* WHICH CHAIN THIS BLOCK IS, as the colour it will be in the viewer. The bar is
    a ::before rather than a grid child because this is a three-track grid whose
@@ -1361,7 +1521,7 @@
    20" reads, three bare number boxes do not. */
 .contig-label {
   font-size: 12px;
-  color: #6b7280;
+  color: var(--lf-muted);
   white-space: nowrap;
 }
 
@@ -1389,7 +1549,7 @@
 }
 
 /* A break has nothing to fill in, so its row says what it does instead. */
-.contig-break { font-style: italic; color: #9ca3af; }
+.contig-break { font-style: italic; color: var(--lf-faint); }
 
 /* A span the chosen method cannot honour: marked, still present, carrying its
    reason. Never display:none - a control that vanishes teaches nothing. */
@@ -1412,9 +1572,9 @@
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 12px;
   letter-spacing: .02em;
-  color: #374151;
-  background: #f9fafb;
-  border: 1px solid #e5e7eb;
+  color: var(--lf-text-2);
+  background: var(--lf-surface-2);
+  border: 1px solid var(--lf-border-2);
   border-radius: 6px;
   padding: 3px 8px;
   min-width: 0;
@@ -1463,15 +1623,15 @@
    as the selections they write, each with its own remove button. Wraps on a phone. */
 .condition-editor .condition-controls { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 4px; }
 .condition-editor .condition-controls [hidden] { display: none; }
-.condition-field { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: #6b7280; }
+.condition-field { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--lf-muted); }
 .condition-more .condition-controls { align-items: flex-end; margin-top: 8px; }
 .condition-more select, .condition-more input[type="text"] { box-sizing: border-box; height: 34px; padding: 0 8px;
-  border: 1px solid #d1d5db; border-radius: 8px; background: #fff; color: #111827; font-size: 13px; }
-.condition-more summary { cursor: pointer; color: #2563eb; font-size: 13px; margin-top: 8px; }
+  border: 1px solid var(--lf-border); border-radius: 8px; background: var(--lf-surface); color: var(--lf-text); font-size: 13px; }
+.condition-more summary { cursor: pointer; color: var(--lf-link); font-size: 13px; margin-top: 8px; }
 .condition-editor .condition-controls :disabled { opacity: .45; cursor: not-allowed; }
 .condition-rows { list-style: none; margin: 6px 0 0; padding: 0; font-size: 13px; }
 .condition-rows li { padding: 2px 0; overflow-wrap: anywhere; }
-.condition-drop { border: none; background: none; color: #6b7280; cursor: pointer; font-size: 15px; padding: 0 4px; }
+.condition-drop { border: none; background: none; color: var(--lf-muted); cursor: pointer; font-size: 15px; padding: 0 4px; }
 
 /* ============================================================================
    THE DESIGN PAGE'S LAYOUT (design.html, 2026-10-27): five steps on the left in the order a
@@ -1480,12 +1640,12 @@
 .design-page { max-width: 1760px; margin: 0 auto; }
 .design-head { margin-bottom: 12px; }
 .design-head h1 { margin: 0; }
-.design-tagline { margin: 2px 0 0; color: #6b7280; font-size: 14px; }
+.design-tagline { margin: 2px 0 0; color: var(--lf-muted); font-size: 14px; }
 .design-layout { display: grid; grid-template-columns: minmax(360px, 420px) minmax(0, 1fr); gap: 16px; align-items: start;
   --viewer-height: max(420px, calc(100vh - 210px)); }
 .design-steps { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
 /* full screen is the two columns (design.html): the page's background, and the steps scroll in it */
-.design-layout:fullscreen { background: #f9fafb; padding: 8px 16px; overflow-y: auto; }
+.design-layout:fullscreen { background: var(--lf-surface-2); padding: 8px 16px; overflow-y: auto; }
 /* 🔴 THE PICTURE STAYS IN VIEW while the steps scroll past it: the stage sticks to the top, and a
    run's table and downloads scroll in their own box under the viewer (.design-below) - the stage
    scrolling as a whole let the viewer be scrolled away, and the canvas then took the wheel back as
@@ -1496,14 +1656,14 @@
 .design-stage > .design-below { flex: 1 1 auto; min-height: 0; overflow-y: auto;
   display: flex; flex-direction: column; gap: 8px; }
 .design-stage.has-results > .design-below { min-height: 120px; }
-.design-step { background: #fff; border: 1px solid #e5e7eb; border-radius: 10px; padding: 12px 14px; }
+.design-step { background: var(--lf-surface); border: 1px solid var(--lf-border-2); border-radius: 10px; padding: 12px 14px; }
 .design-step[hidden] { display: none; }
-.design-step h2 { display: flex; align-items: center; gap: 8px; margin: 0 0 8px; font-size: 15px; font-weight: 600; color: #111827; }
+.design-step h2 { display: flex; align-items: center; gap: 8px; margin: 0 0 8px; font-size: 15px; font-weight: 600; color: var(--lf-text); }
 .step-number { display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px;
   border-radius: 50%; background: #2563eb; color: #fff; font-size: 12px; font-weight: 700; flex: 0 0 auto; }
-.step-optional { margin-left: auto; font-size: 11px; font-weight: 500; color: #9ca3af; text-transform: uppercase; letter-spacing: .04em; }
-.step-hint { margin: -4px 0 8px; font-size: 13px; color: #6b7280; }
-.step-more { display: flex; align-items: center; gap: 8px; margin-top: 10px; font-size: 13px; color: #6b7280; }
+.step-optional { margin-left: auto; font-size: 11px; font-weight: 500; color: var(--lf-faint); text-transform: uppercase; letter-spacing: .04em; }
+.step-hint { margin: -4px 0 8px; font-size: 13px; color: var(--lf-muted); }
+.step-more { display: flex; align-items: center; gap: 8px; margin-top: 10px; font-size: 13px; color: var(--lf-muted); }
 .step-more select { flex: 1 1 auto; min-width: 0; }
 .design-step .option-note:empty { display: none; }
 
@@ -1511,7 +1671,7 @@
 /* the method and its models: three labelled pickers that wrap */
 .model-row { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: flex-end; }
 .model-field { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
-.model-field label { font-size: 12px; color: #6b7280; }
+.model-field label { font-size: 12px; color: var(--lf-muted); }
 .model-field select { min-width: 7.5rem; }
 #step-method .step-hint { margin: 8px 0 0; }
 .example-picker { width: 100%; }
@@ -1528,23 +1688,23 @@
 /* the job at a glance: a row per chain, a block per piece */
 .chain-diagram { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
 .chain-diagram:empty { display: none; }
-.chain-block-hot { display: inline-block; padding: 1px 5px; border-radius: 8px; background: #f59e0b; color: #111827; font-weight: 600; }
+.chain-block-hot { display: inline-block; padding: 1px 5px; border-radius: 8px; background: #f59e0b; color: var(--lf-text); font-weight: 600; }
 .chain-row { display: flex; align-items: center; gap: 8px; }
-.chain-name { width: 14px; font-size: 12px; font-weight: 700; color: var(--chain-colour, #6b7280); }
+.chain-name { width: 14px; font-size: 12px; font-weight: 700; color: var(--chain-colour, var(--lf-muted)); }
 .chain-track { display: flex; flex: 1 1 auto; gap: 2px; min-width: 0; }
 .chain-block { flex-basis: 0; min-width: 44px; height: 28px; border-radius: 5px; border: 1px solid var(--chain-colour, #6b7280);
   font: 11px/1 system-ui, sans-serif; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding: 0 6px;
-  cursor: pointer; color: #111827; background: #fff; }
+  cursor: pointer; color: var(--lf-text); background: var(--lf-surface); }
 .chain-block-segment { background: var(--chain-colour, #6b7280); color: #fff; }
 .chain-block-generated { background: repeating-linear-gradient(135deg,
-  color-mix(in srgb, var(--chain-colour, #6b7280) 22%, #fff) 0 6px, #fff 6px 12px); }
+  color-mix(in srgb, var(--chain-colour, #6b7280) 22%, var(--lf-surface)) 0 6px, var(--lf-surface) 6px 12px); }
 .chain-block-sequence { border-style: dashed; }
-.chain-block-ligand { flex: 0 0 auto; border-color: #78716c; border-radius: 14px; background: #f5f5f4; }
+.chain-block-ligand { flex: 0 0 auto; border-color: #78716c; border-radius: 14px; background: var(--lf-surface-3); }
 .chain-block.selected, .chain-block:focus-visible { outline: 2px solid #111827; outline-offset: 1px; }
 .contig-row-flash { animation: contig-flash 1.2s ease-out; }
-@keyframes contig-flash { from { background: #dbeafe; } to { background: transparent; } }
+@keyframes contig-flash { from { background: var(--lf-info-bg-2); } to { background: transparent; } }
 .design-step .design-summary { display: flex; align-items: center; gap: 10px; margin-top: 6px; }
-.design-step .design-summary code { font-size: 12px; color: #6b7280; background: none; border: 0; }
+.design-step .design-summary code { font-size: 12px; color: var(--lf-muted); background: none; border: 0; }
 
 /* the run: the settings, then Advanced and the one button */
 .design-step .fetch-options { margin: 0; }
@@ -1585,56 +1745,56 @@
    inputs under py2Dmol's uppercase captions, beside rounded, sentence-case cards. */
 #step-run .fetch-options { gap: 10px 16px; padding: 0; background: none; border: 0; }
 #step-run .fetch-option-group + .fetch-option-group { border-left: 0; padding-left: 0; margin-left: 0; }
-#step-run .fetch-option-title { font-size: 12px; font-weight: 400; letter-spacing: 0; text-transform: none; color: #6b7280; }
+#step-run .fetch-option-title { font-size: 12px; font-weight: 400; letter-spacing: 0; text-transform: none; color: var(--lf-muted); }
 #step-run input[type="number"], #step-run input[type="text"], #step-run select,
 .design-structure #structure-id {
-  box-sizing: border-box; height: 34px; padding: 0 8px; border: 1px solid #d1d5db; border-radius: 8px;
-  background: #fff; color: #111827; font-size: 13px; }
+  box-sizing: border-box; height: 34px; padding: 0 8px; border: 1px solid var(--lf-border); border-radius: 8px;
+  background: var(--lf-surface); color: var(--lf-text); font-size: 13px; }
 #step-run input[type="number"], #step-run input[type="text"] { width: 9ch; }
 #step-run select { min-width: 7rem; }
 #step-run .seed-field input { width: 10ch; }
 #step-run .seed-field .btn { height: 34px; }
-.run-advanced { margin-top: 10px; padding: 10px 12px; border: 1px solid #e5e7eb; border-radius: 8px; background: #f9fafb; }
+.run-advanced { margin-top: 10px; padding: 10px 12px; border: 1px solid var(--lf-border-2); border-radius: 8px; background: var(--lf-surface-2); }
 .run-advanced[hidden] { display: none; }
-.run-advanced-title { margin: 0 0 8px; font-size: 13px; font-weight: 600; color: #374151; }
+.run-advanced-title { margin: 0 0 8px; font-size: 13px; font-weight: 600; color: var(--lf-text-2); }
 .run-advanced .design-notes { padding: 8px 0 0; }
 
 /* a chain break says what it does, small, beside its picker */
-.contig-head .contig-break { font-style: normal; font-size: 12px; color: #6b7280; }
+.contig-head .contig-break { font-style: normal; font-size: 12px; color: var(--lf-muted); }
 /* a CCD code is upper case; its example is not shouted */
 .contig-code::placeholder { text-transform: none; }
 .viewer-bar #show-job[hidden] + .run-button { margin-left: auto; }
 .viewer-bar .run-button { flex: 0 0 auto; }
-.run-where { font-size: 12px; color: #9ca3af; }
+.run-where { font-size: 12px; color: var(--lf-faint); }
 .viewer-legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; color: #4b5563; }
 .viewer-key { display: inline-flex; align-items: center; gap: 5px; }
 .viewer-key i { width: 12px; height: 12px; border-radius: 3px; background: var(--key-colour); }
 .viewer-empty { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px;
-  height: var(--viewer-height); border: 1px dashed #d1d5db; border-radius: 10px; background: #fff;
-  color: #9ca3af; text-align: center; padding: 16px; }
+  height: var(--viewer-height); border: 1px dashed var(--lf-border); border-radius: 10px; background: var(--lf-surface);
+  color: var(--lf-faint); text-align: center; padding: 16px; }
 .viewer-empty[hidden] { display: none; }
 .viewer-empty i { font-size: 32px; }
 .viewer-empty p { margin: 0; font-size: 14px; max-width: 260px; }
-.sequence-hint { font-size: 12px; color: #9ca3af; }
+.sequence-hint { font-size: 12px; color: var(--lf-faint); }
 /* the designs' files: a row each (its name and buttons, its metrics under them), the archive last.
    #downloads is the fold page's 340px flex row, which this is not. */
 .design-stage #downloads { width: auto; display: flex; flex-direction: column; align-items: stretch; gap: 8px; padding: 10px 14px; }
 .design-stage #downloads h3 { margin: 0; font-size: 14px; }
 .design-stage #downloads > div { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 13px; }
 .design-stage #downloads button { flex: 0 0 auto; }
-.design-stage #downloads .design-metrics { flex: 1 1 100%; font-size: 12px; color: #6b7280; }
+.design-stage #downloads .design-metrics { flex: 1 1 100%; font-size: 12px; color: var(--lf-muted); }
 .design-stage #downloads > button { align-self: flex-start; }
 .design-foot { margin-top: 16px; text-align: center; }
 .design-foot .option-note { max-width: none; }
 
 /* the constraints: what is selected, what to do with it, and the chips */
-.condition-selection { font-size: 13px; color: #6b7280; }
-.condition-selection.has-selection { color: #111827; font-weight: 500; }
+.condition-selection { font-size: 13px; color: var(--lf-muted); }
+.condition-selection.has-selection { color: var(--lf-text); font-weight: 500; }
 .condition-quick { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
 .condition-quick button:disabled, .condition-controls button:disabled { opacity: .45; cursor: not-allowed; }
 .condition-more { margin-top: 8px; font-size: 13px; }
 .condition-quick[hidden], .condition-more[hidden] { display: none; }
-.condition-more summary { cursor: pointer; color: #2563eb; }
+.condition-more summary { cursor: pointer; color: var(--lf-link); }
 .condition-chip { display: flex; align-items: center; gap: 6px; }
 .condition-rows .role-swatch { flex: 0 0 auto; }
 
@@ -1658,7 +1818,7 @@
 .option-note {
   font-size: 12px;
   line-height: 1.4;
-  color: #6b7280;
+  color: var(--lf-muted);
   margin-top: 4px;
   max-width: 420px;
 }
@@ -1666,7 +1826,7 @@
 /* 🔴 AMBER, NOT RED. A warning here means the run will proceed and lose
    something - a designer that cannot see the ligand, five folders where two
    measured better. Red is for a page that cannot proceed. */
-.option-note.warn { color: #92400e; }
+.option-note.warn { color: var(--lf-warn-text); }
 
 /* THE RESULTS. The roles are named beside them, because that is where they are
    read - at the foot of the page they explained a picture nobody was looking
@@ -1679,7 +1839,7 @@
   flex-wrap: wrap;
   gap: 4px 14px;
   font-size: 12px;
-  color: #374151;
+  color: var(--lf-text-2);
 }
 
 #roles-legend .role-list li { display: flex; align-items: center; gap: 6px; }
@@ -1688,7 +1848,7 @@
   width: 11px;
   height: 11px;
   border-radius: 3px;
-  border: 1px solid #d1d5db;
+  border: 1px solid var(--lf-border);
   flex: 0 0 auto;
 }
 
@@ -1697,7 +1857,7 @@
 /* The swatch takes its colour from the job now - one per chain, set inline from
    the same palette the span rows and the viewer use - so there are no per-role
    background rules left to drift out of step with it. */
-.role-swatch { background: var(--chain-colour, #e5e7eb); }
+.role-swatch { background: var(--chain-colour, var(--lf-surface-4)); }
 
 /* One line a cycle, at the sequence viewer's measure so two cycles read against
    each other. */
@@ -1722,16 +1882,16 @@
 #results-table td {
   text-align: left;
   padding: 4px 8px;
-  border-bottom: 1px solid #e5e7eb;
+  border-bottom: 1px solid var(--lf-border-2);
   white-space: nowrap;
 }
 
-#results-table th { color: #6b7280; font-weight: 500; }
-#results-table tr.best td { background: #f0fdf4; font-weight: 500; }
+#results-table th { color: var(--lf-muted); font-weight: 500; }
+#results-table tr.best td { background: var(--lf-ok-bg); font-weight: 500; }
 
 /* 🔴 A REJECTED CYCLE KEEPS ITS ROW AND ITS NUMBER, because a verdict with the
    measurement removed is the thing this page exists not to do. */
-#results-table tr.rejected td { color: #92400e; }
+#results-table tr.rejected td { color: var(--lf-warn-text); }
 #results-table td.validity { white-space: normal; }
 
 /* The folders a run rotates through, as chips: one line, and what is on is
@@ -1741,24 +1901,24 @@
 .design-chip {
   height: 26px;
   padding: 0 10px;
-  border: 1px solid #d1d5db;
+  border: 1px solid var(--lf-border);
   border-radius: 13px;
-  background: #fff;
-  color: #6b7280;
+  background: var(--lf-surface);
+  color: var(--lf-muted);
   font-size: 12px;
   line-height: 1;
   cursor: pointer;
 }
 
-.design-chip:hover { border-color: #9ca3af; color: #111827; }
+.design-chip:hover { border-color: #9ca3af; color: var(--lf-text); }
 
 /* 🔴 ON IS A FILLED CHIP, not a tinted row. The listbox this replaced showed
    its selection as a grey highlight, which is what every disabled control on
    the page also looks like. */
 .design-chip-on {
-  background: #eff6ff;
+  background: var(--lf-info-bg);
   border-color: #3b82f6;
-  color: #1d4ed8;
+  color: var(--lf-info-text);
   font-weight: 500;
 }
 
@@ -1797,13 +1957,13 @@
   height: 30px;
   padding: 0 10px;
   font-size: 12px;
-  border: 1px solid #d1d5db;
+  border: 1px solid var(--lf-border);
   border-radius: 7px;
-  background: #f9fafb;
+  background: var(--lf-surface-2);
   color: inherit;
   cursor: pointer;
 }
-.entity-template-fetch:hover { background: #f3f4f6; }
+.entity-template-fetch:hover { background: var(--lf-surface-3); }
 
 /* The footer's Credits button, dressed as the footer's links, and the dialog
    it opens - the terms dialog's frame, with room for two short lists. */
@@ -1812,14 +1972,14 @@
   border: 0;
   background: none;
   font: inherit;
-  color: #3b82f6;
+  color: var(--lf-link);
   cursor: pointer;
 }
 .footer-credits:hover { text-decoration: underline; }
 .credits-dialog { max-width: 520px; }
-.credits-dialog a { color: #2563eb; }
-.credits-heading { margin: 4px 0 0; font-size: 12.5px; font-weight: 600; color: #111827; }
-.credits-list { margin: 0; padding-left: 18px; font-size: 12px; line-height: 1.5; color: #374151; }
+.credits-dialog a { color: var(--lf-link); }
+.credits-heading { margin: 4px 0 0; font-size: 12.5px; font-weight: 600; color: var(--lf-text); }
+.credits-list { margin: 0; padding-left: 18px; font-size: 12px; line-height: 1.5; color: var(--lf-text-2); }
 @media (max-width: 560px) {
   .credits-dialog { max-width: calc(100vw - 24px); }
 }

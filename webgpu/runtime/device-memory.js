@@ -88,10 +88,100 @@ export function setMemoryBudget(device, budgetBytes) {
  * number nobody checked as if it were a device limit, which is why the only
  * thing it is used for is choosing between two paths that both work.
  */
-export function budgetForDevice(fallbackGiB = 4) {
+export function budgetForDevice(fallbackGiB = 4, { gpuMemoryBytes, learnedBytes, userBytes } = {}) {
+  // Somebody who has said what their machine can spare is the one reading that is not a guess.
+  if (userBytes !== undefined) return userBytes;
   const gib = (typeof navigator === "object" && navigator !== null
     && typeof navigator.deviceMemory === "number") ? navigator.deviceMemory : fallbackGiB;
-  return Math.round(gib * 1024 * 1024 * 1024 / 3);
+  // A third of system RAM says nothing about a discrete card's own memory: a
+  // 32 GiB desktop with an 8 GiB RTX 3070 was given a 10.9 GiB ceiling, and a
+  // fold under it ran the card out and lost the device. Nor does it limit one:
+  // a 24 GiB card in a 16 GiB desktop was held to 5.3. So a card the table knows
+  // goes by its own memory, and only a card it cannot name is held to both.
+  const named = gpuMemoryBytes !== undefined && gpuMemoryBytes !== UNNAMED_CARD_BYTES;
+  const bytes = named ? [] : [Math.round(gib * 1024 * 1024 * 1024 / 3)];
+  if (gpuMemoryBytes !== undefined) bytes.push(cardBudgetBytes(gpuMemoryBytes));
+  if (learnedBytes !== undefined) bytes.push(learnedBytes);
+  return Math.min(...bytes);
+}
+
+/** What a lost device says the limit was, as a share of what it was holding. */
+export const GPU_MEMORY_SHARE = 0.8;
+
+/**
+ * Whether a lost device says anything about the card's memory, which it does only if it was holding a good part of what a
+ * fold may hold. A crash, a driver update and another program's reset lose a device just the same: reading one of those as
+ * memory held a 24 GiB card to 1.0 GiB, for as long as the browser remembered, after its GPU process was killed under a
+ * 300-residue fold. With the limit lifted there is no such part to compare, and only the floor applies.
+ */
+export const lossTeachesLimit = (residentBytes, budgetBytes) => residentBytes >= 512 * 1024 * 1024
+  && (budgetBytes === undefined || budgetBytes === null || residentBytes >= budgetBytes / 2);
+
+const GIB = 1024 * 1024 * 1024;
+
+/**
+ * How much of a discrete card's own memory one fold may hold.
+ *
+ * Not a fixed share, because what else is on the card does not scale with the card. On an 8 GiB RTX 3070 running a
+ * desktop and a browser, nvidia-smi read 1.7 to 2.5 GiB before a fold started, and a stale destroyed buffer or two sits
+ * on top of a fold's own sum. Windows reset the driver twice with the card at about 7.4 GiB of 8: once at 800 residues
+ * with the allocator's sum at 3.9 GiB, well inside the 6.4 GiB that a fifth held back had allowed. No browser API
+ * reports free GPU memory, so the reserve is a measured allowance: 40% of a card, between 1.2 GiB and 3.2 GiB.
+ */
+export function cardBudgetBytes(cardBytes) {
+  return Math.round(cardBytes - Math.max(1.2 * GIB, Math.min(3.2 * GIB, 0.4 * cardBytes)));
+}
+
+/**
+ * A card this browser will not name, or a name the table does not know. Assuming it has the system's third is how a
+ * small card got a large ceiling, so an unnamed card is taken to have about what most discrete cards do until a reader
+ * says otherwise in the settings. Unified memory has no card to run out of, so Apple's adapters keep the system's third.
+ */
+export const UNNAMED_CARD_BYTES = 6 * GIB;
+
+/**
+ * The smallest memory each consumer GPU name has shipped with, in GiB.
+ *
+ * WebGPU reports no memory size outside Chrome's developer-features flag, and
+ * the unmasked WebGL renderer string is the one place a page can read the card's
+ * name. A model that shipped in several sizes (RTX 3060: 6 on laptops, 8 and 12
+ * on desktops) takes the smallest, because this is only ever used as a ceiling:
+ * too low costs a warning on a fold that would have fitted, too high costs the
+ * device. A name not listed here keeps the ceiling from system RAM alone.
+ */
+const GPU_MEMORY_GIB = [
+  [/\bGTX\s*1050\b/i, 2], [/\bGTX\s*1060\b/i, 3], [/\bGTX\s*1070\b/i, 8], [/\bGTX\s*1080\b/i, 8],
+  [/\bGTX\s*1650\b/i, 4], [/\bGTX\s*1660\b/i, 6],
+  [/\bRTX\s*2060\b/i, 6], [/\bRTX\s*2070\b/i, 8], [/\bRTX\s*2080\b/i, 8],
+  [/\bRTX\s*3050\b/i, 4], [/\bRTX\s*3060\b/i, 6], [/\bRTX\s*3070\b/i, 8], [/\bRTX\s*3080\b/i, 8],
+  [/\bRTX\s*3090\b/i, 24],
+  [/\bRTX\s*4050\b/i, 6], [/\bRTX\s*4060\b/i, 8], [/\bRTX\s*4070\b/i, 8], [/\bRTX\s*4080\b/i, 12],
+  [/\bRTX\s*4090\b/i, 16],
+  [/\bRTX\s*5050\b/i, 8], [/\bRTX\s*5060\b/i, 8], [/\bRTX\s*5070\b/i, 8], [/\bRTX\s*5080\b/i, 16],
+  [/\bRTX\s*5090\b/i, 24],
+  [/\bRX\s*5500\b/i, 4], [/\bRX\s*5600\b/i, 6], [/\bRX\s*5700\b/i, 8],
+  [/\bRX\s*6400\b/i, 4], [/\bRX\s*6500\b/i, 4], [/\bRX\s*66[05]0\b/i, 8], [/\bRX\s*6700\b/i, 10],
+  [/\bRX\s*6750\b/i, 12], [/\bRX\s*6800\b/i, 12], [/\bRX\s*6900\b/i, 16],
+  [/\bRX\s*7600\b/i, 8], [/\bRX\s*7700\b/i, 12], [/\bRX\s*7800\b/i, 16], [/\bRX\s*7900\b/i, 16],
+  [/\bRX\s*9060\b/i, 8], [/\bRX\s*9070\b/i, 16],
+  [/\bArc\b.*\bA380\b/i, 6], [/\bArc\b.*\bA5[08]0\b/i, 8], [/\bArc\b.*\bA7[57]0\b/i, 8],
+  [/\bArc\b.*\bB570\b/i, 10], [/\bArc\b.*\bB580\b/i, 12],
+  // Rented ones, which are where a Colab or a cloud fold runs.
+  [/\b(?:NVIDIA|Tesla)\s+T4\b/i, 16], [/\bNVIDIA\s+A10G?\b/i, 24], [/\bNVIDIA\s+L4\b/i, 24],
+  [/\bNVIDIA\s+L40S?\b/i, 48], [/\bNVIDIA\s+A100\b/i, 40], [/\bNVIDIA\s+H100\b/i, 80],
+];
+
+/**
+ * A card's memory from its name, or undefined when the name says nothing.
+ *
+ * @param {string | null | undefined} name the unmasked WebGL renderer string
+ */
+export function gpuMemoryFromName(name) {
+  if (typeof name !== "string") return undefined;
+  for (const [pattern, gib] of GPU_MEMORY_GIB) {
+    if (pattern.test(name)) return gib * GIB;
+  }
+  return undefined;
 }
 
 /**

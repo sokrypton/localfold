@@ -40,6 +40,7 @@ import {
 } from "../runtime/device-profile.js";
 import { stagedMatrixBlock } from "../kernels/matrix-linear.js";
 import { residentWeightBuffer } from "../runtime/resident.js";
+import { SegmentedAllocation } from "../runtime/segmented.js";
 import { memoryTotals, residencyAllowed } from "../runtime/device-memory.js";
 import {
   allocateTransitionSplit, packTransitionWeights, splitTransitionConfig,
@@ -59,9 +60,10 @@ import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 import { storageBytes } from "../runtime/storage.js";
 import {
   UNPACKED_PAIR_SCRATCH,
-  compilePairTrack, encodePairTrack, packPairTrackWeights,
+  compilePairTrack, encodePairTrack, packPairTrackWeights, sequentialGroupsFor,
 } from "../af3/trunk/pair-track.js";
 import { settleGridAttendTiling } from "../af3/trunk/grid-attend-race.js";
+import { QueuePacer } from "../runtime/queue-pacing.js";
 
 /** ESMFold2-Experimental-Fast's `d_pair`. */
 export const PAIR_CHANNELS = 256;
@@ -113,7 +115,11 @@ export class Esmfold2TrunkGpu {
     const epsilon = options.epsilon ?? 1e-5;
     const variance = options.variance ?? "fast";
     const storage = GPUBufferUsage.STORAGE;
-    const allocations = [];
+    // Four passes of a fold allocated and destroyed the same scratch four times, and a destroyed buffer's memory comes
+    // back only on a device tick (see settleReleasedMemory): each pass overlapped the last one's on the card. A caller
+    // running a loop says so, and gets it back with releaseHeldScratch.
+    const held = options.holdScratch === true ? (this.heldScratch ??= { allocations: [] }) : undefined;
+    const allocations = held?.allocations ?? [];
     const keep = (allocation) => { allocations.push(allocation); return allocation; };
     const pairBytes = pairs * channels * 4;
 
@@ -224,8 +230,9 @@ export class Esmfold2TrunkGpu {
     // rule as AF3's trunk (see trunk.js there); `options.leanPair`
     // forces it either way.
     const { residentBytes, budgetBytes } = memoryTotals(this.device);
-    const leanPair = options.leanPair ?? (budgetBytes != null
-      && residentBytes + 4 * pairs * channels * 4 + 512 * 1048576 > budgetBytes);
+    // (and a pair in several buffers has no other way through: only the sequential track binds it a chunk at a time)
+    const leanPair = options.leanPair ?? ((state.buffer?.segments?.length ?? 1) > 1 || (budgetBytes != null
+      && residentBytes + 4 * pairs * channels * 4 + 512 * 1048576 > budgetBytes));
     const triangleProjectMatrix = !leanPair
       && tuning.triangleProjectMatrix === true && splitConfig !== null
       && !matrixContractionOverflows(this.device)
@@ -252,7 +259,16 @@ export class Esmfold2TrunkGpu {
         : false;
     const triangleContractArithmetic = stagedPrecision === "f16" && accumulatePrecision === "f16"
       && (tuning.triangleContractArithmetic ?? "f16") === "f16" ? "f16" : "f32";
+    const sequentialTriangle = options.sequentialTriangle ?? tuning.sequentialTriangle ?? this.options.sequentialTriangle ?? false;
+    // Asked once, because a fold's loops hold their scratch between them and it would read as memory in use.
+    const sequentialGroups = options.sequentialGroups ?? this.options.sequentialGroups
+      ?? (this.fewestGroups ??= sequentialGroupsFor(this.device, pairs * channels * 4));
+    const sequentialChunkBytes = options.sequentialChunkBytes ?? this.options.sequentialChunkBytes;
+    const sequentialHiddenParts = options.sequentialHiddenParts ?? this.options.sequentialHiddenParts;
+    const sequentialContractWork = options.sequentialContractWork ?? this.options.sequentialContractWork;
     const trackKey = `${base}:${stagedPrecision}:${weightPrecision}:${accumulatePrecision}:${transitionFactor}:`
+      + `seq${sequentialTriangle}:${sequentialGroups}:${sequentialChunkBytes ?? ""}:${sequentialHiddenParts ?? ""}:${sequentialContractWork ?? ""}:`
+      + `fc${options.forceCompact === true}:`
       + `${triangleContractArithmetic}:${JSON.stringify(pairTransitionSplit)}:${JSON.stringify(triangleProjectMatrix)}:`
       + `${JSON.stringify(tuning.trianglePairProjectTile)}:${tuning.triangleProjectOutColumns ?? ""}:${tuning.pairTransitionChunkBytes ?? ""}`;
     if (!this.compiledTracks.has(trackKey)) {
@@ -272,6 +288,10 @@ export class Esmfold2TrunkGpu {
           // pair track (webgpu/kernels/triangle/shaders.js; raced on an Apple GPU: grid-attend-race.js)
           triangleContractArithmetic,
           triangleProjectMatrix,
+          sequentialTriangle, sequentialGroups, sequentialChunkBytes, sequentialHiddenParts, sequentialContractWork,
+          maxBufferSize: this.device.limits.maxBufferSize,
+          // (forces the channel chunking below the size that is worth it, for a checker at a small n)
+          ...(options.forceCompact === true ? { forceCompact: true } : {}),
           maxComputeWorkgroupStorageSize: this.device.limits.maxComputeWorkgroupStorageSize,
           maxStorageBufferBindingSize: this.device.limits.maxStorageBufferBindingSize,
           minStorageBufferOffsetAlignment: this.device.limits.minStorageBufferOffsetAlignment,
@@ -301,39 +321,46 @@ export class Esmfold2TrunkGpu {
         "esmfold2-trunk.pair", state.pair, storage | GPUBufferUsage.COPY_SRC));
       const pairMask = state.maskBuffer ?? keep(this.allocator.upload(
         "esmfold2-trunk.pair-mask", state.pairMask, storage));
-      const scratch = [];
+      const scratch = held?.scratch ?? [];
       // ...four of them without the grid attention, not five; see
       // pairScratchCount in webgpu/af3/trunk/pair-track.js.
-      for (let index = 0; index < pipelines.pairScratchCount; index += 1) {
-        scratch.push(keep(this.allocator.allocate(
+      for (let index = scratch.length; index < pipelines.pairScratchCount; index += 1) {
+        const parts = index === 1 ? pipelines.sequential?.hiddenParts ?? 1 : 1;
+        // The contraction's output past one binding: two buffers, split between two channels.
+        scratch.push(keep(parts === 1 ? this.allocator.allocate(
           `esmfold2-trunk.scratch${index}`,
           pipelines.pairScratchBytes(index,
-            storageBytes(pairs * channels, UNPACKED_PAIR_SCRATCH[index])), storage)));
+            storageBytes(pairs * channels, UNPACKED_PAIR_SCRATCH[index])), storage)
+          : new SegmentedAllocation(this.allocator, `esmfold2-trunk.scratch${index}`, channels, pairs * 4, storage,
+                                    channels / parts)));
       }
       // ...and the split transition's two intermediates, sized for one chunk of
       // rows. The widened one is 369 MiB at 300 tokens unchunked, which is the
       // tensor the fused kernel existed to avoid; see transitionSplitChunkRows.
       const transitionSplit = pipelines.transitionSplit === undefined ? undefined
-        : allocateTransitionSplit(this.allocator, {
+        : held?.transitionSplit ?? allocateTransitionSplit(this.allocator, {
           rows: pairs, channels, factor: transitionFactor,
           chunkRows: pipelines.transitionSplit.chunkRows,
           precision: pipelines.transitionSplit.storage,
           offsets: transitionOffsets,
-          scratch,
+          // The widened row in the contraction's output and the normalised row in a and b, both dead by the transition;
+          // the sequential triangle's scratch[0] is too small to be either.
+          scratch: pipelines.sequential === undefined ? scratch : [scratch[2], scratch[1].segments?.[0] ?? scratch[1]],
           label: "esmfold2-trunk.transition",
         }, keep);
       const projectMatrix = pipelines.projectMatrix === undefined ? undefined
-        : allocateTriangleProjectMatrix(this.allocator, {
+        : held?.projectMatrix ?? allocateTriangleProjectMatrix(this.allocator, {
           rows: pairs, cZ: channels, cHidden: channels,
           offsets: projectMatrixOffsets,
           label: "esmfold2-trunk.tri-project",
         }, keep);
       const gridHeads = gridAttention ? blocks[0].pairAttention1.heads : 0;
       const biasBuffer = gridAttention
-        ? keep(this.allocator.allocate("esmfold2-trunk.bias", gridHeads * pairs * 4, storage))
+        ? held?.biasBuffer ?? keep(this.allocator.allocate("esmfold2-trunk.bias", gridHeads * pairs * 4, storage))
         : undefined;
+      if (held !== undefined) Object.assign(held, { scratch, transitionSplit, projectMatrix, biasBuffer });
 
-      const submissionWindow = options.submissionWindow ?? 16;
+      const pacer = new QueuePacer(this.device, { fixed: options.submissionWindow, start: this.pacedWindow });
       const validation = new DeferredValidation(this.device, "ESMFold2 trunk");
       const start = performance.now();
       for (let index = 0; index < blocks.length; index += 1) {
@@ -345,7 +372,7 @@ export class Esmfold2TrunkGpu {
         await this.#encodeBlock({
           block: blocks[index], n, channels, pipelines, storage, pending, weightPrecision,
           pair, pairMask, scratch, gridAttention, gridHeads, biasBuffer, transitionSplit,
-          projectMatrix,
+          projectMatrix, pacer,
         });
         validation.end(`block ${index}`);
         for (let at = pending.length - 1; at >= 0; at -= 1) pending[at].release();
@@ -367,10 +394,11 @@ export class Esmfold2TrunkGpu {
         if (options.onBlockDone !== undefined) {
           const submitted = index + 1;
           void this.device.queue.onSubmittedWorkDone()
-            .then(() => options.onBlockDone(submitted, blocks.length));
+            .then(() => options.onBlockDone(submitted, blocks.length)).catch(() => {});
         }
-        if (options.wait !== false && ((index + 1) % submissionWindow === 0 || index === blocks.length - 1)) {
-          await this.device.queue.onSubmittedWorkDone();
+        if (options.wait !== false) {
+          await pacer.blockSubmitted(index === blocks.length - 1);
+          this.pacedWindow = pacer.window;
         }
         // 🔴 AWAITED, SO A CALLER CAN YIELD. Every await above resolves from a
         // GPU promise, which is a microtask - so a page that only moved a
@@ -383,10 +411,12 @@ export class Esmfold2TrunkGpu {
       // ...allocated after the scratch is released, not beside it. See the
       // note in webgpu/af3/trunk/pairformer-block.js: this allocator does not
       // pool, so releasing DESTROYS and the peak actually moves.
-      for (const allocation of scratch) allocation.release();
-      transitionSplit?.normalized?.release?.();
-      transitionSplit?.wide?.release?.();
-      biasBuffer?.release();
+      if (held === undefined) {
+        for (const allocation of scratch) allocation.release();
+        transitionSplit?.normalized?.release?.();
+        transitionSplit?.wide?.release?.();
+        biasBuffer?.release();
+      }
       if (options.readback === false) {
         return { pair: undefined,
                  precision: { staged: stagedPrecision, accumulate: accumulatePrecision },
@@ -415,11 +445,21 @@ export class Esmfold2TrunkGpu {
         memory: this.allocator.snapshot(),
       };
     } finally {
-      for (let index = allocations.length - 1; index >= 0; index -= 1) allocations[index].release();
+      if (held === undefined) {
+        for (let index = allocations.length - 1; index >= 0; index -= 1) allocations[index].release();
+      }
     }
   }
 
-  /** One block, submitted as one command buffer. */
+  /** Give back what `holdScratch` kept. */
+  releaseHeldScratch() {
+    const held = this.heldScratch;
+    this.heldScratch = undefined;
+    if (held === undefined) return;
+    for (let index = held.allocations.length - 1; index >= 0; index -= 1) held.allocations[index].release();
+  }
+
+  /** One block: one command buffer, or a few where the track is sequential. */
   async #encodeBlock(context) {
     const { block, n, channels, pipelines, storage, pending, weightPrecision } = context;
     const { pair, pairMask, scratch, gridAttention, gridHeads, biasBuffer,
@@ -503,7 +543,7 @@ export class Esmfold2TrunkGpu {
       } : {}),
     };
 
-    const encoder = this.device.createCommandEncoder({ label: "esmfold2-trunk-block" });
+    let encoder = this.device.createCommandEncoder({ label: "esmfold2-trunk-block" });
     // 🔴 ONE PASS A BLOCK, NOT ONE A DISPATCH. WebGPU orders dispatches inside
     // a compute pass and makes each one's writes visible to the next - which is
     // what AF2's evoformer stack has always relied on. A block is about thirty
@@ -531,9 +571,15 @@ export class Esmfold2TrunkGpu {
       pass.dispatchWorkgroups(x, y, z);
       if (!batchPasses) pass.end();
     };
+    const flush = (heavy) => {
+      if (!context.pacer.pieceDue(heavy)) return;
+      endPass();
+      this.device.queue.submit([encoder.finish()]);
+      encoder = this.device.createCommandEncoder({ label: "esmfold2-trunk-block" });
+    };
     encodePairTrack({
       run, pipelines, n, channels, pair, pairMask, scratch, weights,
-      gridAttention, gridHeads, biasBuffer, transitionSplit, projectMatrix,
+      gridAttention, gridHeads, biasBuffer, transitionSplit, projectMatrix, flush,
     });
     endPass();
     this.device.queue.submit([encoder.finish()]);

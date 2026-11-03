@@ -240,8 +240,20 @@ export function loadAf3Weights(onProgress, family = "af3") {
       return built;
     })();
     weightsPromises.set(family, promise);
+    // A download that failed once must not fail until the reader reloads.
+    const settled = promise;
+    settled.catch(() => {
+      if (weightsPromises.get(family) === settled) weightsPromises.delete(family);
+    });
   }
   return promise;
+}
+
+/** Let go of every other AF3-graph family's weights; see releaseEsmfold2Weights. */
+export function releaseAf3Weights(keepFamily) {
+  for (const family of weightsPromises.keys()) {
+    if (family !== keepFamily) weightsPromises.delete(family);
+  }
 }
 
 /** The dense slot of every alpha carbon, which frames are fitted on. */
@@ -281,7 +293,7 @@ export const toPoints = (positions, count) => Array.from(
 export function fittedPdb(batch, positions, reference, slots, plddt, options = {}) {
   const api = window.py2Dmol;
   const count = batch.tokens * batch.dense;
-  if (api?.superpose === undefined || reference === null) {
+  if (api?.superpose === undefined || reference === null || slots.length < 3) {
     return toPdb(batch, positions, plddt, options);
   }
   const moved = api.superpose(toPoints(positions, count), reference,

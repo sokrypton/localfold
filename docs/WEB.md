@@ -4455,3 +4455,135 @@ stereo the CCD's coordinates define, our conformer matching the SMILES every tim
 heme in the 180-degree-flipped orientation in 5 of 5 seeds (symmetry-aware 0.19 -> 6.27 A, the iron in place), and
 Boltz-2 from one sequence in 4 of 5; biotin and Protenix-2 are unaffected, and atom ORDER changed nothing anywhere. A
 map carrying names was 2.1 MB but still rebuilt conformers and charges; the dictionary itself changes nothing.
+
+## The page and the machine it runs on
+
+A fold used to find out what it needed by asking for it. Having downloaded a model and spent a minute, it was refused, or
+worse, on a card that was already full, it lost its device, and a lost device was memoised until a reload. Everything below
+is the same answer: say it before the download, hold to it during the fold, and give it all back after.
+
+**The line beside Fold** (`web/compute-plan.js`) says what a fold will hold of what the card can spare, and about how long it
+will take, before anything is fetched. ESMFold2 reads `webgpu/esmfold2/memory-plan.js`, the numbers the fold itself works to.
+The other models read what they were measured to hold and take at a few sizes, which is advice and stops nothing: an
+alignment adds an amount a sequence cannot predict, and the fold's own account already refuses what does not fit. The first
+fold of any model on a card teaches that card's rate for all of them (`noteFold`), so a figure improves as soon as it has met
+the machine.
+
+**What it does about the answer.** A fold that does not fit is refused before the download, with the CPU's estimate and a way
+on. With no adapter, a software adapter or one that has been refusing work, ESMFold2 goes to the CPU and carries on across
+the reload threads need; a model that folds on a GPU only says so. `npm run test:plan` drives each of these through the page
+without pressing Fold on anything that would run.
+
+**What one fold may hold** (`cardBudgetBytes`, `webgpu/runtime/device-memory.js`). WebGPU reports no memory size, so a card's
+is read from its name, and a third of system RAM, which said 10.9 GiB for an 8 GiB RTX 3070, no longer stands for it. What
+else is on the card does not scale with the card, and no browser API reports free GPU memory, so the reserve is a measured
+allowance: 40% of the card, between 1.2 and 3.2 GiB. A card the table cannot name is taken to have 6 GiB until a reader says
+otherwise in Settings. A device lost while holding at least half of what a fold may hold teaches a lower limit for that
+browser, and any other loss says nothing about memory (`lossTeachesLimit`): a crash under a 300-residue fold once held a 24 GiB
+card to 1.0 GiB. Lifting the limit ("Try on GPU anyway") still folds as tightly as it can.
+
+**A lost device.** Nothing used to listen to `device.lost`, and a rejected or lost device stayed memoised, so every later
+fold failed on it until a reload. Now a loss clears it and the next fold asks again. With the GPU process killed under a fold
+on an A10, `main` reads "A valid external Instance reference no longer exists." on that fold and on every one after it. Here
+that fold stops within 2 s and says what happened, and the next folds on a new device. Killed a second time, Chrome stops
+offering a GPU, the line beside Fold says the CPU, and ESMFold2 folds there on the same page. After a driver reset, where Chrome
+fails every request until it restarts, the page says that instead of "no compatible adapter". The paths have fake adapters too
+(`test/device-lifecycle.test.js`), because no tool here can reset a driver on purpose.
+
+**Stop means now.** ESMFold2 ignored Stop until it finished, and the queue held up to sixteen blocks of committed work. Stop
+now takes effect at the next block, the queue holds about a second, and the fold settles what it destroyed, because a
+destroyed buffer's memory comes back only on a device tick. Stopped in its trunk at 1000 residues on an A10, the page is free
+in 1.0 s and the card idle in 1.4, where both took 54 s (two rounds each, alternated in one container). A fold waiting on its
+download stops at once too, and the download goes on behind the page, because what arrives is kept and the next fold wants it.
+
+**One fold across a browser** (`web/fold-guard.js`). Two tabs each get their own device and each believe they have the whole
+budget, which is how a fold that fits loses its device, so a Web Lock queues them. A fold past 30 s asks before its tab
+closes, past a minute it keeps the screen on, and it shows its progress in the tab's title. A browser without one of these
+APIs folds exactly as it did.
+
+**The cache.** Both ESM-C towers carry the model name `esmc`, so each load's sweep deleted the other's shards. A page that
+had both in hand never noticed, and the next visit downloaded the tower again: a new browser's first fold, after a switch,
+fetched 130 MiB and took 5.4 s, and now fetches 0.2 and takes 2.0. Cache names carry the bundle and its manifest's hash.
+Settings lists what is downloaded and deletes it.
+
+**What goes wrong, on purpose** (`npm run test:robust`, `tools/check-robustness.py`). The GPU process killed at each stage of each
+kind of fold, Stop at each stage and in a storm, downloads that fail once and for good, an alignment server that hangs or answers
+a captive portal's page, storage that throws or is full, input no model can read, the sizes either side of what the plan accepts,
+a device with the lowest limits WebGPU allows, a card another tab has filled, two tabs, reloads, a frozen tab, forty folds in one
+page, GPU calls and workers that never answer, an exception from anywhere in a fold, files that are not what they say, sessions
+that no longer read, a browser with none of the optional APIs, a connection that stops without closing, a Cache API or an IndexedDB
+that has stopped answering, a cached shard gone short, site data cleared under the page, a processor and a card many times slower
+than these, a clock that jumps, a driver that refuses a shader or a readback once, a tab that crashes, numbers from a GPU that cannot
+be right, a host out of memory, another program on the card and another browser beside it, alignments and templates handed in, every
+job in `tools/fixtures` on the code before this and on this, which change to a job folds anew and which goes on from its trunk, a fold
+handed back as its archive or its session file, markup in every name, a reader of the old page coming back to its caches and its
+session, a library's host that takes the connection and says nothing, a file of the page missing at load, and the site as the build
+leaves it, from a plain static host. Every scenario starts a new browser, and what each must leave behind is the same: a page that
+folds again with no reload, reads what a clean fold reads, and draws it. Nor may anything be thrown that nobody catches, however the scenario
+ended, and each page proves that check can fail, by throwing three ways and reading them back before anything else happens: a
+capture script that did not parse once passed it for every scenario. It kills GPU processes and fills cards, so it runs on a rented
+card under Linux and refuses anywhere else. Run it three ways, because they are different
+programs: `LOCALFOLD_STOCK_FLAGS=1` (no `shader-f16`, as stock Chrome on NVIDIA under Linux), `LOCALFOLD_F16_ONLY=1`
+(`shader-f16` and no matrix units, as stock Chrome on Windows and macOS), and neither (both, which no visitor has). What it has
+found, each now fixed and most with a test beside the code:
+
+- A failed shard stayed in the store as a rejected promise, and BioEmu2's network kept its weights' the same way, so a fold after
+  one dropped connection failed the same way until a reload.
+- A read of `localStorage` in a default parameter threw outside its `try` where site data is blocked, at every press of Fold.
+- A rate stored as text read "about NaN h" beside the button, and a `cards` that was not an object threw at the end of a fold that
+  had succeeded.
+- A session that could not be saved took a finished fold's scores off the line, and asked the reader to clear the site data that
+  held the models.
+- "Fold on CPU" was offered beside "Enter a protein sequence", and beside a download the CPU needs as well.
+- A second crash, while the first's new device was being asked for, left the plan on an adapter that had gone, so every later press
+  asked it again and failed.
+- One or two residues folded and then failed finding a rotation for the viewer.
+- Stop during a download waited for the download.
+- A device dying under a fold rejected a dozen waits nobody was waiting on. None of them mattered, and each was one more red line
+  in the console of a page that had already said what happened.
+- Stop waited for ever on a queue, a readback or a pipeline that never answered, with the button disabled: a wedged GPU says
+  nothing at all. A stopped fold now gets ten seconds to reach its next check, and past that the page leaves it behind with its
+  device (`STOP_GRACE_MS`). A request for an adapter or a device has a deadline of its own, 20 and 30 s.
+- A service worker that failed to install left `serviceWorker.ready` waiting for ever, so "Fold on CPU" did nothing at all. It gets
+  five seconds, and a page that reloaded for the worker's headers and did not get them stays on one thread, says so beside Fold and
+  does not try again. A hard reload goes round the worker, so a page with the CPU chosen came back on one thread while the line
+  promised twelve; the next press now reloads once for them.
+- A failed download in a CPU fold came through its worker as a plain error, read "failed to load tensor ...: Failed to fetch", and
+  offered the fold that had just failed.
+- `navigator.locks` refusing, as it does on an opaque origin, stopped every fold.
+- An alignment server that could not be reached said "Failed to fetch", a sign-in page answering for it said where the JSON parser
+  tripped, and neither offered a way on. Both now say so in words and offer the fold as a single sequence.
+- A file of random bytes became 4097 chains, one named `.json` became 257, and a job of a hundred thousand chains stopped the page
+  for over a minute building its rows.
+- A pair past one buffer could not be bound by the whole-tensor track that a device with matrix units takes when it has room, so
+  1449 residues failed on such a device where 1448 folded (`leanPair`).
+- A connection that stopped without closing left the page on one percentage for good, because a `fetch` that gets no answer, or a
+  body that stops arriving, says nothing at all. Once nothing has arrived on any of a store's connections for 30 s
+  (`HttpTensorStore.stallMs`) it asks again. On any of them, because a request with no answer yet is usually waiting for a socket:
+  Chrome gives HTTP/1.1 six to a host, and a shard on a slow line can take many minutes.
+- A stopped AF3-lineage fold threw an uncaught rejection for each stage it only announces (`stage` in `webgpu/af3/fold.js`), and an
+  error from a CPU worker that failed to start reached the page as uncaught as well as being said.
+- A stored session that read as `null` threw on every load, deciding whether to offer it.
+- A pipeline a driver refused once stayed in the cache for the life of the device, so every later fold on that page failed on the
+  first's answer, whatever had caused it (`#forget` in `webgpu/runtime/pipeline-cache.js`).
+- A GPU process that died took the structure and the PAE map with it, and they stayed blank until the next fold, because the viewer
+  draws only when something moves and a map is painted from a copy that went the same way (`redrawViewer`).
+- A sleep the fold slept through taught a card's rate fifty times over. No one fold moves a known rate more than fourfold now. And a
+  CPU fold's first run, which loads everything, said about 9 s and took minutes: the line adds what a first fold has to load, and that
+  fold no longer teaches the rate.
+- A template added to a fold just run went unread on an AF3-lineage model: the trunk's key left it out, so the trunk without it was
+  reused, while the status line named the template. OpenBind-0 on 5CAJ read 35.7 either way, and reads 92.9 with its own crystal now.
+- Numbers a fold cannot have come back with were called a result: "pLDDT NaN" on the status line, NaNs in the file, every atom on one
+  point, and a trunk kept to go on from, so the same fold read NaN again a second later. `web/impossible-fold.js` refuses them where
+  every fold ends, with whatever was kept.
+- The Session button's file, handed back, was refused as "a job carries both `dialect` and `version` or neither". It opens now.
+- A browser older than `Float16Array`, which Chrome had WebGPU for two years without, read "this runtime has no Float16Array, and the
+  model scales are float16", and offered the CPU, which reads the same weights.
+- The head asks cdnjs for the icons and for JSZip and waited for both, so a host that takes the connection and says nothing left a
+  blank page for 34 s. JSZip is `async` now and the icons' stylesheet applies when it arrives: the viewer asks whether JSZip is there
+  when it needs it, and a page with no icons yet still folds.
+
+**The dark theme.** Colours are `--lf-*` tokens, whose light values are the old literals, so the light page is unchanged.
+`tools/dark-theme.py` generates the overrides py2Dmol's own controls need (`web/localfold-dark.css`), and
+`test/dark-theme.test.js` holds both themes to the same tokens and fails on a py2Dmol re-vendored without them. The viewer
+uses its own black mode, and the matrices stay on dimmed white plates because their colours are data.

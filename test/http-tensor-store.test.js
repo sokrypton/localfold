@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "./harness.js";
-import { HttpTensorStore } from "../shared/bundles/http-tensor-store.js";
+import { HttpTensorStore, ModelDownloadError } from "../shared/bundles/http-tensor-store.js";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -78,6 +78,101 @@ describe("HttpTensorStore", () => {
   });
 });
 
+describe("a download that stops without closing", () => {
+  const manifest = { tensors: {
+    first: { file: "first.bin", dtype: "float32", shape: [4], byteOffset: 0 },
+    second: { file: "second.bin", dtype: "float32", shape: [4], byteOffset: 0 },
+  } };
+  const load = async () => HttpTensorStore.fromManifest(new URL("https://example.test/model/manifest.json"), manifest, undefined, "");
+  const bytes = () => new Float32Array([1, 2, 3, 4]);
+  /** No answer at all, until the asker gives up. */
+  const noAnswer = (init) => new Promise((_, reject) => {
+    init.signal.addEventListener("abort", () => reject(init.signal.reason));
+  });
+  const held = HttpTensorStore.stallMs;
+  afterEach(() => { HttpTensorStore.stallMs = held; });
+
+  it("asks again when an answer never comes", async () => {
+    HttpTensorStore.stallMs = 60;
+    let asked = 0;
+    vi.stubGlobal("fetch", vi.fn(async (_, init) => {
+      asked += 1;
+      return asked === 1 ? noAnswer(init) : new Response(bytes());
+    }));
+    const store = await load();
+    expect(Array.from(await store.tensor("first"))).toEqual([1, 2, 3, 4]);
+    expect(asked).toBe(2);
+  });
+
+  it("asks again when a body stops partway", async () => {
+    HttpTensorStore.stallMs = 60;
+    let asked = 0;
+    vi.stubGlobal("fetch", vi.fn(async () => {
+      asked += 1;
+      if (asked > 1) return new Response(bytes());
+      return new Response(new ReadableStream({ start(controller) { controller.enqueue(new Uint8Array(4)); } }));
+    }));
+    const store = await load();
+    expect(Array.from(await store.tensor("first"))).toEqual([1, 2, 3, 4]);
+    expect(asked).toBe(2);
+  });
+
+  it("takes a request that is only waiting its turn for one that is, while another still arrives", async () => {
+    HttpTensorStore.stallMs = 120;
+    let asked = 0;
+    let finishSecond;
+    const secondAnswered = new Promise((resolve) => { finishSecond = resolve; });
+    vi.stubGlobal("fetch", vi.fn(async (input) => {
+      if (String(input).includes("second")) {
+        asked += 1;
+        await secondAnswered;
+        return new Response(bytes());
+      }
+      // A chunk every 40 ms for three times what would call this download stalled.
+      return new Response(new ReadableStream({
+        async start(controller) {
+          for (let chunk = 0; chunk < 16; chunk += 1) {
+            await new Promise((resolve) => setTimeout(resolve, 40));
+            controller.enqueue(new Uint8Array(1));
+          }
+          finishSecond();
+          controller.close();
+        },
+      }));
+    }));
+    const store = await load();
+    const [first, second] = await Promise.all([store.tensor("first"), store.tensor("second")]);
+    expect(first.length).toBe(4);
+    expect(second.length).toBe(4);
+    expect(asked).toBe(1);
+  });
+
+  it("says so in the end, when nothing ever arrives, and the next load asks again", async () => {
+    HttpTensorStore.stallMs = 30;
+    vi.stubGlobal("fetch", vi.fn(async (_, init) => noAnswer(init)));
+    const store = await load();
+    let failure;
+    try { await store.tensor("first"); } catch (error) { failure = error; }
+    expect(failure instanceof ModelDownloadError).toBe(true);
+    expect(failure.message.includes("nothing arrived")).toBe(true);
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(bytes())));
+    expect(Array.from(await store.tensor("first"))).toEqual([1, 2, 3, 4]);
+  });
+
+  it("does not wait on a cache that has stopped answering, to drop a short entry", async () => {
+    const put = vi.fn(async () => {});
+    const shardCache = {
+      match: async () => new Response(new Uint8Array(3)),
+      put,
+      delete: () => new Promise(() => {}),
+    };
+    vi.stubGlobal("caches", { keys: async () => [], open: async () => shardCache, delete: async () => true });
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(bytes())));
+    const store = await load();
+    expect(Array.from(await store.tensor("first"))).toEqual([1, 2, 3, 4]);
+  });
+});
+
 describe("prefetch ordering", () => {
   // 🔴 THE LAST SHARD TO START DECIDES WHEN THE LOAD ENDS, and the shards are
   // not evenly sized: a shard is at least one whole tensor, so AF3's stacked
@@ -113,5 +208,21 @@ describe("prefetch ordering", () => {
       globalThis.fetch = original;
     }
     expect(asked.slice(0, 3)).toEqual(["huge.bin", "mid.bin", "small.bin"]);
+  });
+
+  it("does not keep a failed download, so the next fold asks again", async() => {
+    const manifest = { tensors: { a: { file: "a.bin", dtype: "float32", shape: [4] } } };
+    let up = false;
+    vi.stubGlobal("fetch", vi.fn(async() => (up ? new Response(new ArrayBuffer(16)) : new Response("gone", { status: 404 }))));
+    const store = await HttpTensorStore.fromManifest("https://example.test/m/", manifest, undefined, "");
+    store.prefetch();                         // nobody awaits this one, and it must not reject unhandled
+    const failure = await store.tensor("a").catch((error) => error);
+    expect(failure instanceof ModelDownloadError).toBe(true);
+    expect(failure.reason).toBe("HTTP 404");
+    const again = await store.open("a").catch((error) => error);
+    expect(again instanceof ModelDownloadError).toBe(true);
+    up = true;
+    await store.open("a");
+    expect((await store.tensor("a")).length).toBe(4);
   });
 });
