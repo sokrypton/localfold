@@ -6,3 +6,5 @@ train-af2-smoke
 test-af2-block-f64
 test-plm
 test-plm-f64
+test-af3
+test-af3-f64

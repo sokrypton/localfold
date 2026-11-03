@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -181,19 +182,25 @@ inline void colSum(real* g, const real* d, size_t rows, int C) {
 }
 
 // ---------------------------------------------------------------- a Linear: y = x W + b, W [K, N] haiku's layout
+// W is [K, N] (in, out: haiku's layout), or [N, K] with `trans` (AF3's transpose_weights, torch's (out, in))
 struct Linear {
   Param w, b;
   int K = 0, N = 0;
-  bool hasBias = true;
-  void forward(const real* x, real* y, size_t rows) const {
-    mm(x, w.w, y, (int)rows, K, N);
+  bool hasBias = true, trans = false;
+  void forward(const real* x, real* y, size_t rows, real beta = 0) const {
+    if (trans) mmBT(x, w.w, y, (int)rows, N, K, beta);
+    else mm(x, w.w, y, (int)rows, K, N, beta);
     if (hasBias) biasK<<<blocks(rows * N), 256, 0, STREAM>>>(y, b.w, rows, N);
   }
   // dW += x^T dy, db += colsum dy; dx (+)= dy W^T when dx is not null
   void backward(const real* x, const real* dy, real* dx, size_t rows, bool accumulate = false) {
-    mmAT(x, dy, w.g, (int)rows, K, N, 1.f);
+    if (trans) mmAT(dy, x, w.g, (int)rows, N, K, 1.f);
+    else mmAT(x, dy, w.g, (int)rows, K, N, 1.f);
     if (hasBias) colSum(b.g, dy, rows, N);
-    if (dx) mmBT(dy, w.w, dx, (int)rows, K, N, accumulate ? 1.f : 0.f);
+    if (dx) {
+      if (trans) mm(dy, w.w, dx, (int)rows, N, K, accumulate ? 1.f : 0.f);
+      else mmBT(dy, w.w, dx, (int)rows, K, N, accumulate ? 1.f : 0.f);
+    }
   }
 };
 
