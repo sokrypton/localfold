@@ -27,8 +27,8 @@ import { memoryTotals } from "../../runtime/device-memory.js";
 
 /** The largest tensor the distogram head reads back through one mapping. */
 const READBACK_PIECE_BYTES = 256 * 1048576;
-/** Multiply-adds a dispatch of the distogram, which is channels x bins a pair. About 200 ms on an A10. */
-const DISTOGRAM_STEP_WORK = 8e9;
+/** Multiply-adds a dispatch of the distogram, which is channels x bins a pair. About 20 ms on an A10 before the kernel tiers up. */
+const DISTOGRAM_STEP_WORK = 0.25e9;
 import { pipelineCacheForDevice } from "../../runtime/pipeline-cache.js";
 import { Af3EmbedderGpu } from "./embedder.js";
 import { Af3MsaStackGpu } from "./msa-stack.js";

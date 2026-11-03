@@ -24,7 +24,7 @@ export const FOLD_WEIGHT_BYTES_F32 = 720 * MIB;
 /** The sequential track's own row chunks, two of them. */
 export const TRACK_CHUNK_BYTES = 2 * SEQUENTIAL_CHUNK_BYTES;
 /** A pair this size or larger takes the sequential track; see gridChunkWorthIt in webgpu/af3/trunk/pair-track.js. */
-export const COMPACT_MIN_BYTES = 128 * MIB;
+export const COMPACT_MIN_BYTES = 32 * MIB;
 /** What one fold may not leave free: the allocator's sums do not count a destroyed buffer the driver has not yet freed. */
 export const FOLD_MARGIN_BYTES = 256 * MIB;
 

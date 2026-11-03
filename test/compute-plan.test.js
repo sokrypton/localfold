@@ -31,8 +31,9 @@ function fakeStorage() {
 describe("the memory plan against what was measured", () => {
   it("reads a fold's peak on an RTX 3070 to within 6% over and 1% under", () => {
     // The allocator's own peak from a page fold, with the groups its buffers show it took: 1000 residues whole, 1200 and 1350
-    // with the spill. Not all the weights are resident at the track's peak, which is the room on the high side.
-    for (const [tokens, spill, groups, measuredMiB] of [[1000, false, 2, 4248], [1200, true, 2, 4581], [1350, true, 8, 4646]]) {
+    // with the spill, less the 64 MiB the row chunks fell by when they halved, which a T4 held to the same budget read at all
+    // three. Not all the weights are resident at the track's peak, which is the room on the high side.
+    for (const [tokens, spill, groups, measuredMiB] of [[1000, false, 2, 4248 - 64], [1200, true, 2, 4581 - 64], [1350, true, 8, 4646 - 64]]) {
       const planned = esmfold2PeakBytes({ tokens, spill, groups }) / MIB;
       assert.ok(planned / measuredMiB < 1.07 && planned / measuredMiB > 0.99, `${tokens}: planned ${planned} against ${measuredMiB} MiB`);
     }

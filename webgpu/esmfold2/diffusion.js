@@ -346,8 +346,11 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 // otherwise identical.
 import { createAddShader } from "../runtime/execution.js";
 
-/** How many of a denoising step's dispatches one submission holds. */
-const DENOISE_PIECE_DISPATCHES = 48;
+/**
+ * How many of a denoising step's dispatches one submission holds: 48 were 13 ms on an A10 at 600 residues, about 4800 atoms,
+ * and 43 on a T4, and a step's time grows about as the square of its length.
+ */
+const denoisePieceDispatches = (atoms) => Math.max(4, Math.min(24, Math.round(24 * (4800 / atoms) ** 2)));
 export { createAddShader };
 
 /** `out = a * sigmoid(gate)`, elementwise. */
@@ -1698,7 +1701,7 @@ export class Esmfold2DenoiserGpu {
       if (!batch) { pass.end(); pass = null; }
       // A step is 236 to 336 dispatches: 694 ms in one submission at 2046 tokens on an A10, 920 at 1200 on a T4.
       dispatched += 1;
-      if (dispatched % DENOISE_PIECE_DISPATCHES === 0) {
+      if (dispatched % denoisePieceDispatches(atoms) === 0) {
         if (pass !== null) { pass.end(); pass = null; }
         this.device.queue.submit([encoder.finish()]);
         encoder = this.device.createCommandEncoder({ label: "esmfold2.denoise" });

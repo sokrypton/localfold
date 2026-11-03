@@ -816,8 +816,10 @@ export class Bioemu2Gpu {
     // concatenation, the transitions' scratch and the bias's norm were all held at once: 2.5 GiB of 3.9 at 600 tokens,
     // which is the fold's peak, for tensors that are never needed together.
     const large = T * T * 256 * 4 >= FLUSH_MIN_BYTES;
+    // A sampler step is about 460 dispatches, 118 ms on an A10 at 600 tokens, and it grows about as the square of the length.
+    const dispatchesEach = large ? Math.max(8, Math.min(64, Math.round(32 * (600 / T) ** 2))) : Infinity;
     const runStage = async (steps, ...finished) => {
-      o.run(steps, { oneSubmitEach: large });
+      o.run(steps, { oneSubmitEach: large, dispatchesEach });
       o.free(...finished);
       if (large) await settleReleasedMemory(this.device);
     };
@@ -1120,7 +1122,7 @@ export class Bioemu2Gpu {
         }
         o.write(fvec, fv);
         o.write(X, x);
-        o.run(program);
+        o.run(program, { dispatchesEach });
         return o.read(out);
       },
       setCompanion: (values) => o.write(companion, values),

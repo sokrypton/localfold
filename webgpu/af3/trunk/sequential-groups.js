@@ -11,8 +11,8 @@ const MIB = 1024 * 1024;
 export const SEQUENTIAL_GROUP_CHOICES = [2, 4, 8];
 /** The most: what a fold's memory is planned around, because no fold holds more than this needs and still has to fit. */
 export const MOST_SEQUENTIAL_GROUPS = SEQUENTIAL_GROUP_CHOICES[SEQUENTIAL_GROUP_CHOICES.length - 1];
-/** Bytes of each of the track's two row chunks. */
-export const SEQUENTIAL_CHUNK_BYTES = 64 * MIB;
+/** Bytes of each of the track's two row chunks, which also sets how long a dispatch over a chunk's rows holds the card. */
+export const SEQUENTIAL_CHUNK_BYTES = 32 * MIB;
 /** What the choice leaves free: a stack holds more than the track (the grid's bias, a split transition's buffers). */
 export const GROUPS_MARGIN_BYTES = 512 * MIB;
 

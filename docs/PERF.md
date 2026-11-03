@@ -726,10 +726,10 @@ Peaks, stock flags, A100:
   held through the peak, and memory pressure grows with the fold. OpenDDE
   4432 -> 2349 MiB for +2.7% warm.
 
-All three size-dependent choices share one gate, a largest pair tensor of 128
-MiB (`GRID_CHUNK_MIN_BYTES`), because below it they cost time and save nothing
-that matters: chunking AF3's grid at 255 tokens was 2.5% slower with the peak
-unchanged, and releasing its weights +9.5%. 🔴 And the host path for
+The first two share a gate, a largest pair tensor of 32 MiB (`GRID_CHUNK_MIN_BYTES`), and the third has its
+own of 64: chunking AF3's grid at 255 tokens was 2.5% slower with the peak unchanged, and releasing its weights
++9.5%. For memory alone the first gate would be 128, and it is lower for how long a whole tensor holds the card;
+see "What reaches the queue, and when". 🔴 And the host path for
 ESMFold2's confidence inputs was measured and rejected: the same -492 MiB at
 502 for +1.7 s, where releasing the device copies early costs nothing.
 
@@ -774,8 +774,8 @@ and 157 ms a block at 600 tokens where a fold's are 107 and 124. And a whole run
 least, because the first block pays for a lazy clear of every new buffer: that read eight groups as 11% faster. Two A10
 containers differ by up to 40%, so arms belong in one browser, alternated.
 
-**The contraction's dispatches are bounded apart from the groups** (`CONTRACT_STEP_WORK`): tokens^3 x channels, 32 channels
-at 1000 tokens and three at 2046, so a group of two holds the device no longer than a group of eight did.
+**The contraction's dispatches are bounded apart from the groups** (`CONTRACT_STEP_WORK`): tokens^3 x channels, 16 channels
+at 1000 tokens and one at 2046, so a group of two holds the device no longer than a group of eight did.
 
 **And the kernels that treat each pair alone go a bounded number of rows at a time** (`rowPieces`). A submit cannot break up
 one dispatch, and the AF3 conditioning's pair kernels and the distogram were one each, 1984 and 914 ms at 1000 tokens of
@@ -790,31 +790,98 @@ after the first, with the same PDB and contact maps as `main` on all seven (`too
 
 ### What reaches the queue, and when
 
-A driver judges a hang by how long one submission keeps the card, two seconds on Windows, and Windows gives up on a
-driver after a handful in a minute. One block as one submission reached 3219 ms for OpenDDE at 600 tokens on an A10, a
-card about as fast as a 3070. Everything queued is also committed: Stop waits for it, and so does closing the tab. So
-`webgpu/runtime/queue-pacing.js` paces every stack by time:
+Windows gives a card two seconds to finish or preempt what it is doing, and gives up on a driver after a handful of misses
+in a minute. One block as one submission reached 3219 ms for OpenDDE at 600 tokens on an A10, a card about as fast as a 3070.
+Everything queued is also committed: Stop waits for it, and so does closing the tab.
 
-- **A large block goes in pieces** (a pair of 32 MiB and up, `FLUSH_MIN_BYTES`). encodePairTrack offers a boundary after
-  each row chunk's projection, contraction step, grid chunk and run of transition chunks, and the pacer takes as many
-  pieces to a submission as fill 50 ms, starting from one until a block has been timed. The pieces cost nothing: a pairformer
-  stage at 600 tokens on an A10 reads 20.6 s with them and without, alternated. The fold's saved PDB is the same at 50 ms, at
-  200 ms and with no boundaries after the first block.
-- **A heavy piece ends its submission.** The count is a mean over pieces that differ a lot, and a run of grid and transition
-  chunks taken as cheap filled 900 ms at 1000 tokens of IntelliFold-2. So contraction steps, grid chunks and transition
-  pieces never share a submission with what follows them.
+🔴 **ANOTHER PROGRAM STARTING ON THE CARD STOPS IT, SO TWO SECONDS IS NOT THE LENGTH THAT MATTERS.** On an RTX 3070 under
+Windows 10 (driver 32.0.16.1047, hardware scheduling off), another process bringing up a D3D12 device while a submission of 35 ms
+or more was running froze the card for about 2.2 s, and Windows reset the driver. This is with no fold and no model, a shader of a
+chosen length in stock Chrome, a fresh browser each row, and the ladder stopping at each reset:
+
+| dispatch, ms | a submission holds | queued | one submission took, ms | what arrived | trials | resets |
+|---:|---:|---:|---:|---|---:|---:|
+| 12 | 1 | 20, 80 | 8 | Chrome's benchmark | 2 | 0 |
+| 6 | 2 | 20 | 12 | Chrome's benchmark | 3 | 0 |
+| 6 | 3 | 14 | 18 | Chrome's benchmark | 3 | 0 |
+| 5 | 5 | 10 | 25.7 | Chrome's benchmark | 3 | 0 |
+| 5 | 7 | 8 | 35.5 | Chrome's benchmark | 1 | 1 |
+| 50 | 1 | 10 | 46 | Chrome's benchmark | 1 | 1 |
+| 5 | 10 | 6 | 51 | Chrome's benchmark | 1 | 1 |
+| 50 | 1 | 10 | 54 | another browser's WebGPU page | 1 | 1 |
+
+So what decides is the length of a submission, not of a dispatch, and not the depth of the queue. Why the driver stops is not
+known. After a reset the next new device can fail with `E_OUTOFMEMORY` and reset the driver again, 3 times in 5 here, so the page
+does not ask for one until told to.
+
+**Chrome starts such a program itself.** Its on-device AI benchmark, a utility process of about 170 MiB
+(`on_device_model.mojom.OnDeviceModelService`), runs 180 s after the browser starts, once per Chrome version per profile, unless
+Local State has the answer (`kLogOnDeviceMetricsOnStartup`). A fold started within three minutes of opening Chrome is on the
+card when it does. `Summarizer.availability()` runs it at once if it is owed, takes about 2 s on this card, downloads nothing, and
+leaves nothing to run at 180 s. So the page asks as it loads, and the first device waits for the answer
+(`web/chrome-benchmark.js`).
+
+The rest of what could arrive cannot be scheduled around, so `webgpu/runtime/queue-pacing.js` aims a submission at 15 ms:
+
+- **A block goes in pieces** from a pair of 8 MiB (`FLUSH_MIN_BYTES`). encodePairTrack offers a boundary after every dispatch, and
+  the pacer sends the first block's pieces alone and times them on this card, then adds them up to 15 ms. A fast card sends a small
+  block whole. A boundary costs nothing where the pacer does not cut.
+- **A piece's time follows the block's.** The longest of the last four blocks, because the page hears a fence late while it
+  encodes the next block, and the next one then reads short. Kernels tier up during a first fold, each by its own factor, and a
+  piece that did not looks cheap beside a block that got quicker, so a stack under 80% of its steady time is timed again.
+- **What the page hears is not what the card did.** It hears nothing while it encodes. Fences heard long after the card ran the block
+  say nothing about its pieces, and they arrive microseconds apart, so they look like readings: AF2's extra stack at 1000 tokens sent
+  the next three blocks of its second pass whole, 257 ms each. So if most of a block is heard with the first fence, or its fences
+  span under half the time since its first submission, the next block is timed instead, unless that time is under 25 ms, when
+  cutting the block by count holds nothing longer. Pieces heard with the first fence otherwise read at the mean of the others. Giving
+  them the time since the block began took a share from the pieces the card did spend time on, because much of that time is the page
+  encoding: submissions at 200 and 300 tokens that had been 18 ms went to 29 on an A10 and 33 on a T4.
+- **A kernel too long for that takes the rows it owns.** A dispatch cannot be cut from outside, because `global_invocation_id` starts
+  at zero. The grid chunks (`GRID_STEP_WORK`), the transitions (`TRANSITION_STEP_WORK`), the embedder's assemble-pair
+  (`EMBED_PAIR_STEP_WORK`), the conditioning (`CONDITIONING_STEP_WORK`), the distogram (`DISTOGRAM_STEP_WORK`) and the pair logits
+  (`PAIR_LOGITS_STEP_WORK`) take a uniform of rows. These are work, not time, so a slower card's pieces are longer. A pair from
+  32 MiB takes the sequential track (`GRID_CHUNK_MIN_BYTES`, 128 MiB until a T4 read 44 ms in one `projectAB` at 200 tokens of
+  IntelliFold-2), whose row chunks (`SEQUENTIAL_CHUNK_BYTES`) and contraction (`CONTRACT_STEP_WORK`) set how long its dispatches run.
 - **The window is about a second of queued work**, up to the sixteen blocks that were measured on a small fold.
 - **It slides.** A new block waits for the oldest rather than for the queue to empty, so the card is not left idle while
   the next block is encoded, unless one block is worth the whole second.
 - **ESMFold2's sampler goes in pieces too.** A denoiser step was one submission of 236 to 336 dispatches, all eleven of them:
-  694 ms at 2046 tokens on an A10 and 920 at 1200 on a T4, so a card three times slower than a T4 would pass two seconds on every
-  step. A submission now holds 48 dispatches (`DENOISE_PIECE_DISPATCHES`), and the atom stack 12 (`EMBED_PIECE_DISPATCHES`).
+  694 ms at 2046 tokens on an A10 and 920 at 1200 on a T4. A submission now holds `denoisePieceDispatches(atoms)`, 24 up to 4800 atoms
+  and fewer past it, and the atom stack 12 (`EMBED_PIECE_DISPATCHES`). BioEmu2's run and AF3's atom encoder do the same by count.
 
-🔴 **A LONG ROW ON `longestSubmits` IS NOT ALWAYS A LONG DISPATCH.** It reads `done - max(submit, previous done)`, an upper bound,
-and a fold's first submissions read long whatever they hold, because they wait for the GPU process. On an H100 at 600 tokens an
-`occupancy` probe of four workgroups read 1489 ms, and the first int3 upload read 626 ms with 3888 workgroups where the fold's
-other 389 uploads took 122 ms between them. Cutting that upload into pieces of 256 workgroups read 1340 ms for its first piece and
-added 5400 submissions a fold, so it did not stay. What is long reads long every time: all eleven denoiser steps, not one first row.
+`main` against this, the two turning about in one A10 at 600 residues, stock Chrome, by the card's clock. "Past 25 ms" is the share of
+the card's time in submissions longer than that. A fold in these runs starts as the page loads, so this side's time includes 2 to 3 s
+waiting for Chrome's answer, which a fold started later does not pay.
+
+| model | fold, s | on the card, s | past 25 ms, % | longest, ms | submissions |
+|---|---:|---:|---:|---:|---:|
+| AF2 monomer | 28.0 / 28.0 | 23.3 / 23.5 | 99.4 / 1.3 | 116 / 58 | 732 / 2895 |
+| AF2 multimer | 28.5 / 30.5 | 24.6 / 24.8 | 99.7 / 0.8 | 154 / 48 | 727 / 2961 |
+| BioEmu2 | 51.4 / 47.9 | 32.1 / 32.0 | 99.7 / 2.7 | 342 / 184 | 707 / 3915 |
+| Boltz-2 | 42.6 / 44.9 | 30.3 / 30.8 | 93.9 / 0.1 | 683 / 26 | 1202 / 7046 |
+| ESMFold2 | 29.7 / 28.8 | 21.3 / 21.7 | 98.4 / 0.0 | 220 / 20 | 838 / 3424 |
+| IntelliFold-2 | 204.2 / 197.3 | 186.9 / 180.1 | 99.5 / 1.1 | 1674 / 283 | 1002 / 24737 |
+| Mol-1 | 143.6 / 136.3 | 134.7 / 124.5 | 99.1 / 0.3 | 1221 / 52 | 981 / 20211 |
+| OpenBind-0 | 37.2 / 40.4 | 30.3 / 31.6 | 94.6 / 0.1 | 138 / 26 | 986 / 6873 |
+| OpenDDE | 186.7 / 194.7 | 176.9 / 181.9 | 99.7 / 0.5 | 3251 / 305 | 1026 / 24885 |
+| Protenix-v2 | 70.7 / 73.8 | 60.2 / 60.8 | 98.4 / 0.1 | 310 / 30 | 988 / 11217 |
+| RoseTTAFold3 | 36.0 / 39.5 | 23.4 / 24.1 | 94.2 / 0.1 | 303 / 27 | 989 / 7221 |
+
+What stays long is mostly once a fold: the atom encoder's first dispatches, `opendde-expand`, the confidence heads and readouts. Those are
+a second or two of a fold. AF2's triangle kernels are whole dispatches, 25 to 28 ms each on a T4 at 600 residues. The extra submissions cost
+almost nothing here on Linux. Their cost under Windows is not measured, and none of this has yet met the trigger there.
+
+🔴 **A KERNEL CAN BE FASTER CUT UP, AND IT CAN BE SLOWER.** IntelliFold-2's pair logits were 55 ms a dispatch at 600 tokens on an A10, 325
+of them a fold, and the fold's whole diffusion stack read 20.6 s at one piece a block, 20.5 at two, 20.1 at four, 9.6 at eight and 5.9
+at twenty. OpenDDE's, a quarter of the channels over 3.7 times the rows, have no such step and pay about a millisecond a dispatch: 10.2 s at
+one, 16.3 at nineteen. Why many wide rows in one dispatch run several times slower is not known, and other wide kernels have not been
+tried. So `PAIR_LOGITS_STEP_WORK` is rows x channels^2, which gives the first about nineteen pieces and the second five.
+
+🔴 **READ A FOLD'S SUBMISSIONS ON THE CARD'S CLOCK.** `done - max(submit, previous done)`, which `longestSubmits` reads, is an upper bound:
+a fold's first submissions read long whatever they hold, because they wait for the GPU process, and any submission reads long
+while the page is busy encoding the next. On an H100 at 600 tokens an `occupancy` probe of four workgroups read 1489 ms, and the first
+int3 upload read 626 ms with 3888 workgroups where the fold's other 389 uploads took 122 ms between them. Timestamps on each command
+buffer's passes settle it: ESMFold2-300 at 300 tokens on an A10 read 18 submissions of 25 ms and up by the fence and none by the card.
 
 ### A small fold streams its trunk weights too, and keeps the codes
 

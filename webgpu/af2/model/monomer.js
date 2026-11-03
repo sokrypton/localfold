@@ -10,6 +10,7 @@ import { settleReleasedMemory } from "../../runtime/allocator.js";
 import { af2Plan, planTotal } from "../../runtime/cost-model.js";
 import { isAbortError, predictionAbortError, throwIfAborted, withAbort } from "../../runtime/abort.js";
 import { DeferredValidation } from "../../runtime/validation.js";
+import { FLUSH_MIN_BYTES, PacedEncoder, QueuePacer, firstWindow } from "../../runtime/queue-pacing.js";
 import { StructureModuleGpu } from "../structure/module.js";
 import {
   recycleConvergenceDistance, shouldStopAfterRecycle, validatedRecycleTolerance,
@@ -279,7 +280,10 @@ export class AlphaFoldMonomerGpu {
         const recycleStart = performance.now();
         const msaMask = execution.upload(`monomer.msa-mask-${recycle}`, features.msaMask);
         const extraMsaMask = execution.upload(`monomer.extra-msa-mask-${recycle}`, features.extraMsaMask);
-        const embeddingEncoder = encode(`monomer.embedding-${recycle}`);
+        const large = length * length * 128 * 4 >= FLUSH_MIN_BYTES;
+        // Its dispatches were one submission of 160 to 480 ms on an A10 at 600 residues. A pacer that never learns cuts at each.
+        this.device.pushErrorScope("validation");
+        const embeddingEncoder = new PacedEncoder(this.device, large ? new QueuePacer(this.device) : undefined, `monomer.embedding-${recycle}`);
         const embedding = await encodeInputEmbedder(execution, embeddingEncoder, {
           ...features,
           previousMsaFirstRow: new Float32Array(0), previousPair: new Float32Array(0),
@@ -313,7 +317,7 @@ export class AlphaFoldMonomerGpu {
         };
         stageMilliseconds.embedder += performance.now() - phaseStart;
         phaseStart = performance.now();
-        const windowSize = signal !== undefined ? 8 : weights.mainStack.length;
+        const pacerFor = (blocks) => new QueuePacer(this.device, { fixed: signal !== undefined ? undefined : blocks, start: firstWindow(large) });
         const validation = new DeferredValidation(this.device, `recycle ${recycle}`);
         const mainDescriptor = {
           msa: new Float32Array(0), pair: new Float32Array(0), msaMask: new Float32Array(0),
@@ -346,10 +350,11 @@ export class AlphaFoldMonomerGpu {
           stageMilliseconds.warm += performance.now() - phaseStart;
           phaseStart = performance.now();
         }
+        const extraPacer = pacerFor(weights.extraStack.length);
         for (let block = 0; block < weights.extraStack.length; block += 1) {
           throwIfAborted(signal);
           const checkpoint = execution.checkpoint();
-          const encoder = this.device.createCommandEncoder({ label: `monomer.extra-${recycle}-${block}` });
+          const encoder = new PacedEncoder(this.device, large ? extraPacer : undefined, `monomer.extra-${recycle}-${block}`);
           validation.begin();
           await encodeExtraMsaBlock(execution, encoder, extraShape, weights.extraStack[block],
             embedding.extraMsa, embedding.pairWithoutTemplates, extraMsaMask, pairMaskTensor);
@@ -357,8 +362,7 @@ export class AlphaFoldMonomerGpu {
           this.device.queue.submit([encoder.finish()]);
           validation.end(`extra-MSA block ${block}`);
           execution.releaseSince(checkpoint);
-          const endOfWindow = (block + 1) % windowSize === 0 || block + 1 === weights.extraStack.length;
-          if (endOfWindow) await withAbort(this.device.queue.onSubmittedWorkDone(), signal);
+          await withAbort(extraPacer.blockSubmitted(block + 1 === weights.extraStack.length), signal);
           if (onProgress !== undefined) void this.device.queue.onSubmittedWorkDone().then(() => step(EXTRA_BLOCK)).catch(() => {});
         }
         stageMilliseconds.extraStack += performance.now() - phaseStart;
@@ -370,10 +374,11 @@ export class AlphaFoldMonomerGpu {
         execution.allocator.destroyPooled();
         await settleReleasedMemory(this.device);
 
+        const mainPacer = pacerFor(weights.mainStack.length);
         for (let block = 0; block < weights.mainStack.length; block += 1) {
           throwIfAborted(signal);
           const checkpoint = execution.checkpoint();
-          const encoder = this.device.createCommandEncoder({ label: `monomer.main-${recycle}-${block}` });
+          const encoder = new PacedEncoder(this.device, large ? mainPacer : undefined, `monomer.main-${recycle}-${block}`);
           validation.begin();
           await encodeEvoformerBlock(execution, encoder, {
             ...mainDescriptor, weights: weights.mainStack[block],
@@ -382,8 +387,7 @@ export class AlphaFoldMonomerGpu {
           this.device.queue.submit([encoder.finish()]);
           validation.end(`main Evoformer block ${block}`);
           execution.releaseSince(checkpoint);
-          const endOfWindow = (block + 1) % windowSize === 0 || block + 1 === weights.mainStack.length;
-          if (endOfWindow) await withAbort(this.device.queue.onSubmittedWorkDone(), signal);
+          await withAbort(mainPacer.blockSubmitted(block + 1 === weights.mainStack.length), signal);
           if (onProgress !== undefined) void this.device.queue.onSubmittedWorkDone().then(() => step(MAIN_BLOCK)).catch(() => {});
         }
 
