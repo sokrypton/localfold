@@ -48,6 +48,8 @@ build cuda/grad/test-af3conf -O1 --default-stream per-thread cuda/grad/test_af3c
 build cuda/grad/test-af3tmpl -O1 --default-stream per-thread cuda/grad/test_af3tmpl.cu
 build cuda/grad/test-af3tmpl-f64 -O2 -DGRAD_F64 --default-stream per-thread cuda/grad/test_af3tmpl.cu
 build cuda/grad/test-af3conf-f64 -O2 -DGRAD_F64 --default-stream per-thread cuda/grad/test_af3conf.cu
+build cuda/grad/test-opendde -O1 --default-stream per-thread cuda/grad/test_opendde.cu
+build cuda/grad/test-opendde-f64 -O2 -DGRAD_F64 --default-stream per-thread cuda/grad/test_opendde.cu
 build cuda/grad/test-rfd4p -O1 cuda/grad/test_rfd4p.cu
 build cuda/grad/test-rfd4p-f64 -O2 -DGRAD_F64 cuda/grad/test_rfd4p.cu
 build cuda/grad/test-rfd4trunk -O1 cuda/grad/test_rfd4trunk.cu
@@ -97,8 +99,10 @@ for fb in "model-af3-full-f32 af3" "model-boltz2-f32 boltz2" "model-protenix2-f3
   # but OpenDDE's own head, which test-opendde holds)
   run cuda/grad/test-af3embed --bundle=$1 --family=$2 --input=$in
   run cuda/grad/test-af3embed-f64 --bundle=$1 --family=$2 --input=$in
-  case $2 in opendde) ;; *) run cuda/grad/test-af3conf --bundle=$1 --family=$2 --input=$in
-                            run cuda/grad/test-af3conf-f64 --bundle=$1 --family=$2 --input=$in ;; esac
+  case $2 in opendde) run cuda/grad/test-opendde --bundle=$1 --input=$in        # (its structural tokens and own head)
+                      run cuda/grad/test-opendde-f64 --bundle=$1 --input=$in ;;
+             *) run cuda/grad/test-af3conf --bundle=$1 --family=$2 --input=$in
+                run cuda/grad/test-af3conf-f64 --bundle=$1 --family=$2 --input=$in ;; esac
   for E in diffusion.encoder diffusion.decoder targetFeat.encoder; do run cuda/grad/test-atom --bundle=$1 --family=$2 --stack=$E; done
 done
 run cuda/grad/test-atom-f64
