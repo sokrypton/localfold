@@ -171,6 +171,11 @@ struct DiffEncoder {
   bool hasChiral = false, hasTrunkSingle = true, hasTrunkPair = true, hasPositions = true;
   AtomStack stack;
   bool preTrunkQuery = false, keysUidFromQueries = false, maskPaddedKeys = false;
+  // chai-1's encoder (trunk.dialect.chaiAtomStack): its conditioning LayerNormed (affine-free), its atom-pair term a
+  // biased projection of 14 features, a two-layer pair MLP with no ReLU on its input, the attention within one
+  // reference space; set before forEachParam
+  bool chai = false;
+  Param wPairFeat, pairFeatBias;      // [14, Cp], [Cp]
 };
 // the batch's atom layout, on the device
 struct AtomBatch {
@@ -318,10 +323,59 @@ __global__ void gatherClampK(const int* idx, const real* m, const real* src, siz
   out[t] = m[t] != 0 ? src[i] : (real)0;
 }
 
+// chai-1's atom-pair term: [one_hot(#(|d|^2 > e^2, e in 0 1 2 3 4 5 6 8 12 16), or 11 across reference spaces; 12) |
+// 1 / (1 + |d|^2) | valid] W + b, plus row, col and the trunk's pair (cuda/af3's chaiAtomPairK); and back
+__device__ inline int chaiPairBin(real sq, bool valid) {
+  const real edges[10] = {0, 1, 4, 9, 16, 25, 36, 64, 144, 256};
+  int idx = 0;
+  for (int e = 0; e < 10; ++e) idx += sq > edges[e];
+  return valid ? idx : 11;
+}
+__global__ void chaiPairFwdK(const real* row, const real* col, const real* qPos, const real* kPos, const real* qUid, const real* kUid,
+                             const real* Wf, const real* bf, const real* tp, const int* tqI, const real* tqM, const int* tkI,
+                             const real* tkM, real* pair, int subsets, int Q, int K, int Cp, int tokens) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)subsets * Q * K * Cp) return;
+  int c = t % Cp; size_t rest = t / Cp; int key = rest % K; size_t qi = rest / K; int s = qi / Q;
+  size_t ki = (size_t)s * K + key;
+  real v = row[qi * Cp + c] + col[ki * Cp + c];
+  if (tp && tqM[qi] != 0 && tkM[ki] != 0) v += tp[((size_t)tqI[qi] * tokens + tkI[ki]) * Cp + c];
+  bool valid = qUid[qi] == kUid[ki];
+  real d0 = qPos[qi * 3] - kPos[ki * 3], d1 = qPos[qi * 3 + 1] - kPos[ki * 3 + 1], d2 = qPos[qi * 3 + 2] - kPos[ki * 3 + 2];
+  real sq = d0 * d0 + d1 * d1 + d2 * d2;
+  v += bf[c] + Wf[(size_t)chaiPairBin(sq, valid) * Cp + c] + Wf[(size_t)12 * Cp + c] / (1 + sq) + (valid ? Wf[(size_t)13 * Cp + c] : 0);
+  pair[t] = v;
+}
+__global__ void chaiPairBwdK(const real* d, const real* qPos, const real* kPos, const real* qUid, const real* kUid, real* drow,
+                             real* dcol, real* dWf, real* dbf, real* dtp, const int* tqI, const real* tqM, const int* tkI,
+                             const real* tkM, int subsets, int Q, int K, int Cp, int tokens) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)subsets * Q * K * Cp) return;
+  int c = t % Cp; size_t rest = t / Cp; int key = rest % K; size_t qi = rest / K; int s = qi / Q;
+  size_t ki = (size_t)s * K + key;
+  real g = d[t];
+  atomicAdd(&drow[qi * Cp + c], g); atomicAdd(&dcol[ki * Cp + c], g); atomicAdd(&dbf[c], g);
+  bool valid = qUid[qi] == kUid[ki];
+  real d0 = qPos[qi * 3] - kPos[ki * 3], d1 = qPos[qi * 3 + 1] - kPos[ki * 3 + 1], d2 = qPos[qi * 3 + 2] - kPos[ki * 3 + 2];
+  real sq = d0 * d0 + d1 * d1 + d2 * d2;
+  atomicAdd(&dWf[(size_t)chaiPairBin(sq, valid) * Cp + c], g);
+  atomicAdd(&dWf[(size_t)12 * Cp + c], g / (1 + sq));
+  if (valid) atomicAdd(&dWf[(size_t)13 * Cp + c], g);
+  if (dtp && tqM[qi] != 0 && tkM[ki] != 0) atomicAdd(&dtp[((size_t)tqI[qi] * tokens + tkI[ki]) * Cp + c], g);
+}
+// chai-1's attention mask: both atoms real and in one reference space (cuda/af3's sameRefSpaceMaskK), on the bias
+__global__ void chaiRefMaskK(real* mb, const real* qUid, const real* tqM, const real* kUid, const real* tkM, int subsets, int Q, int K) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)subsets * Q * K) return;
+  int k = t % K; size_t r = t / K; int q = r % Q; int s = (int)(r / Q);
+  size_t qi = (size_t)s * Q + q, ki = (size_t)s * K + k;
+  if (!(tqM[qi] != 0 && tkM[ki] != 0 && qUid[qi] == kUid[ki])) mb[t] = (real)-1e9;
+}
+
 struct EncSave {
   real *cond, *qCond0, *tsn, *tsProj, *qCond, *kCond, *qMask, *kMask, *rq, *rk, *row, *col, *tpn, *tp, *qPos, *kPos, *qUid, *kUid,
-       *pair0, *h1, *h2, *pair, *pos, *act0, *skip, *proj, *mb;
-  LnSave lts, ltp;
+       *pair0, *h1, *h2, *pair, *pos, *act0, *skip, *proj, *mb, *qPre;
+  LnSave lts, ltp, lc;
   StackRun run;
   AtomCtx ctx;
   int n;
@@ -363,6 +417,11 @@ inline EncSave encForward(DiffEncoder& e, const AtomBatch& b, const real* trunkS
     s.tsProj = ARENA.get((size_t)n * C); e.tsProj.forward(s.tsn, s.tsProj, n);
     real* pq = ARENA.get(Rq * C); gather(b.tq, s.tsProj, pq, C); add(s.qCond, pq, Rq * C);
   }
+  if (e.chai) {     // chai: the conditioning LayerNormed, affine-free, before the mask
+    s.qPre = s.qCond; s.qCond = ARENA.get(Rq * C);
+    LayerNorm plain; plain.C = C;
+    s.lc = lnForward(plain, s.qPre, s.qCond, Rq);
+  }
   rowMaskK<<<blocks(Rq * C), 256, 0, STREAM>>>(s.qCond, s.qMask, Rq, C);
   s.kCond = ARENA.get(Rk * C); gather(b.q2k, s.qCond, s.kCond, C);
   s.kMask = ARENA.get(Rk); gather(b.q2k, s.qMask, s.kMask, 1);
@@ -382,9 +441,20 @@ inline EncSave encForward(DiffEncoder& e, const AtomBatch& b, const real* trunkS
   if (e.keysUidFromQueries) gather(b.q2k, s.qUid, s.kUid, 1);
   else gatherClampK<<<blocks(Rk), 256, 0, STREAM>>>(b.q2k.idx, b.q2k.mask, b.uid, atoms, s.kUid, (int)Rk);
   s.pair0 = ARENA.get(rows * Cp);
+  if (e.chai)
+    chaiPairFwdK<<<blocks(rows * Cp), 256, 0, STREAM>>>(s.row, s.col, s.qPos, s.kPos, s.qUid, s.kUid, e.wPairFeat.w, e.pairFeatBias.w,
+        s.tp, b.tq.idx, b.tq.mask, b.tk.idx, b.tk.mask, s.pair0, b.subsets, b.Q, b.K, Cp, n);
+  else
   atomPairFwdK<<<blocks(rows * Cp), 256, 0, STREAM>>>(s.row, s.col, s.qPos, s.kPos, s.qUid, s.kUid, s.kMask, e.wOff.w, e.wDist.w,
       e.wValid.w, s.tp, b.tq.idx, b.tq.mask, b.tk.idx, b.tk.mask, s.pair0, b.subsets, b.Q, b.K, Cp, n, e.maskPaddedKeys);
   s.h1 = ARENA.get(rows * Cp); s.h2 = ARENA.get(rows * Cp);
+  if (e.chai) {     // chai's pair MLP: pair = pair0 + W2 relu(W1 pair0)
+    e.mlp1.forward(s.pair0, s.h1, rows);
+    s.pair = cloneR(s.pair0, rows * Cp);
+    Scratch sc;
+    real* r = ARENA.get(rows * Cp); reluK<<<blocks(rows * Cp), 256, 0, STREAM>>>(r, s.h1, rows * Cp);
+    e.mlp2.forward(r, s.pair, rows, 1);
+  } else {
   {
     Scratch sc;
     real* r = ARENA.get(rows * Cp);
@@ -397,9 +467,11 @@ inline EncSave encForward(DiffEncoder& e, const AtomBatch& b, const real* trunkS
     real* r = ARENA.get(rows * Cp);
     reluK<<<blocks(rows * Cp), 256, 0, STREAM>>>(r, s.h2, rows * Cp); e.mlp3.forward(r, s.pair, rows, 1);
   }
-  // the queries: the start (cond, or its masked pre-trunk copy), plus the positions' projection, masked
-  s.act0 = cloneR(e.preTrunkQuery && trunkSingle ? s.qCond0 : s.qCond, Rq * C);
-  if (e.preTrunkQuery && trunkSingle) rowMaskK<<<blocks(Rq * C), 256, 0, STREAM>>>(s.act0, s.qMask, Rq, C);
+  }
+  // the queries: the start (cond, or its masked pre-trunk copy - chai's always), plus the positions' projection, masked
+  const bool preStart = e.preTrunkQuery && (trunkSingle || e.chai);
+  s.act0 = cloneR(preStart ? s.qCond0 : s.qCond, Rq * C);
+  if (preStart) rowMaskK<<<blocks(Rq * C), 256, 0, STREAM>>>(s.act0, s.qMask, Rq, C);
   if (positions) {
     s.pos = ARENA.get(Rq * 3); gather(b.t2q, positions, s.pos, 3);
     real* pp = ARENA.get(Rq * C); e.posProj.forward(s.pos, pp, Rq);
@@ -409,6 +481,7 @@ inline EncSave encForward(DiffEncoder& e, const AtomBatch& b, const real* trunkS
   }
   s.mb = ARENA.get(rows);
   atomMaskBiasK<<<blocks(rows), 256, 0, STREAM>>>(s.qMask, s.kMask, s.mb, b.subsets, b.Q, b.K, e.stack.blocks[0].keyMasked);
+  if (e.chai) chaiRefMaskK<<<blocks(rows), 256, 0, STREAM>>>(s.mb, s.qUid, b.tq.mask, s.kUid, b.tk.mask, b.subsets, b.Q, b.K);
   s.ctx = AtomCtx{b.q2k, s.qMask, s.kMask, s.qCond, s.kCond, s.mb, b.subsets, b.Q, b.K};
   s.skip = ARENA.get(Rq * C);
   stackForward(e.stack, s.ctx, s.pair, s.act0, s.skip, s.run);
@@ -444,11 +517,18 @@ inline void encBackward(DiffEncoder& e, const AtomBatch& b, const EncSave& s, co
     if (dpositions) scatter(b.t2q, dpos, dpositions, 3);
   }
   real* dqCond0 = ARENA.zeros(Rq * C);
-  if (e.preTrunkQuery && trunkSingle) {
+  if (e.preTrunkQuery && (trunkSingle || e.chai)) {
     real* t = cloneR(dact0, Rq * C); rowMaskK<<<blocks(Rq * C), 256, 0, STREAM>>>(t, s.qMask, Rq, C); add(dqCond0, t, Rq * C);
   } else add(dqCond, dact0, Rq * C);
   // the pair: MLP residual, then its features
-  {
+  if (e.chai) {
+    real *r = ARENA.get(rows * Cp), *dr = ARENA.get(rows * Cp), *dh = ARENA.get(rows * Cp);
+    reluK<<<blocks(rows * Cp), 256, 0, STREAM>>>(r, s.h1, rows * Cp);
+    e.mlp2.backward(r, dpair, dr, rows);
+    reluBwdK<<<blocks(rows * Cp), 256, 0, STREAM>>>(dr, s.h1, rows * Cp);
+    e.mlp1.backward(s.pair0, dr, dh, rows);
+    add(dpair, dh, rows * Cp);
+  } else {
     real *r = ARENA.get(rows * Cp), *dr = ARENA.get(rows * Cp), *dh = ARENA.get(rows * Cp);
     reluK<<<blocks(rows * Cp), 256, 0, STREAM>>>(r, s.h2, rows * Cp);
     e.mlp3.backward(r, dpair, dr, rows);
@@ -462,6 +542,10 @@ inline void encBackward(DiffEncoder& e, const AtomBatch& b, const EncSave& s, co
     add(dpair, dr, rows * Cp);                       // d pair0 = d pair (the residual) + the MLP's
   }
   real *drow = ARENA.zeros(Rq * Cp), *dcol = ARENA.zeros(Rk * Cp), *dtp = s.tp ? ARENA.zeros((size_t)n * n * Cp) : nullptr;
+  if (e.chai)
+    chaiPairBwdK<<<blocks(rows * Cp), 256, 0, STREAM>>>(dpair, s.qPos, s.kPos, s.qUid, s.kUid, drow, dcol, e.wPairFeat.g, e.pairFeatBias.g,
+        dtp, b.tq.idx, b.tq.mask, b.tk.idx, b.tk.mask, b.subsets, b.Q, b.K, Cp, n);
+  else
   atomPairBwdK<<<blocks(rows * Cp), 256, 0, STREAM>>>(dpair, s.qPos, s.kPos, s.qUid, s.kUid, s.kMask, drow, dcol, e.wOff.g,
       e.wDist.g, e.wValid.g, dtp, b.tq.idx, b.tq.mask, b.tk.idx, b.tk.mask, b.subsets, b.Q, b.K, Cp, n, e.maskPaddedKeys);
   if (s.tp) {
@@ -476,6 +560,12 @@ inline void encBackward(DiffEncoder& e, const AtomBatch& b, const EncSave& s, co
   reluBwdK<<<blocks(Rk * C), 256, 0, STREAM>>>(drk, s.kCond, Rk * C); add(dkCond, drk, Rk * C);
   scatter(b.q2k, dkCond, dqCond, C);                 // kCond = gather(qCond)
   rowMaskK<<<blocks(Rq * C), 256, 0, STREAM>>>(dqCond, s.qMask, Rq, C);   // qCond = mask (qCond0 + trunk term)
+  if (e.chai) {     // ... its LayerNorm (affine-free, so its weights take nothing)
+    real* d = ARENA.get(Rq * C);
+    LayerNorm plain; plain.C = C;
+    lnBackward(plain, s.lc, dqCond, d, Rq, false);
+    dqCond = d;
+  }
   add(dqCond0, dqCond, Rq * C);
   if (trunkSingle) {
     real* dts = ARENA.zeros((size_t)n * C); scatter(b.tq, dqCond, dts, C);
@@ -591,15 +681,20 @@ inline void forEachParam(DiffEncoder& e, const std::string& E, const std::string
   lin(E + ".singleToPairCondRow", e.row, C, Cp); lin(E + ".singleToPairCondCol", e.col, C, Cp);
   e.hasTrunkPair = has(E + ".embedTrunkPairCond");
   if (e.hasTrunkPair) { ln(E + ".lnormTrunkPairCond", e.tpLn, e.Cz); lin(E + ".embedTrunkPairCond", e.tpProj, e.Cz, Cp); }
-  f(E + ".embedPairOffsets", e.wOff, (size_t)3 * Cp); f(E + ".embedPairDistances", e.wDist, Cp);
-  f(E + ".embedPairOffsetsValid", e.wValid, Cp);
-  lin(E + ".pairMlp1", e.mlp1, Cp, Cp); lin(E + ".pairMlp2", e.mlp2, Cp, Cp); lin(E + ".pairMlp3", e.mlp3, Cp, Cp);
+  if (e.chai) {
+    f(E + ".embedAtomPairFeat", e.wPairFeat, (size_t)14 * Cp); f(E + ".embedAtomPairFeatBias", e.pairFeatBias, Cp);
+    lin(E + ".pairMlp1", e.mlp1, Cp, Cp); lin(E + ".pairMlp2", e.mlp2, Cp, Cp);
+  } else {
+    f(E + ".embedPairOffsets", e.wOff, (size_t)3 * Cp); f(E + ".embedPairDistances", e.wDist, Cp);
+    f(E + ".embedPairOffsetsValid", e.wValid, Cp);
+    lin(E + ".pairMlp1", e.mlp1, Cp, Cp); lin(E + ".pairMlp2", e.mlp2, Cp, Cp); lin(E + ".pairMlp3", e.mlp3, Cp, Cp);
+  }
   e.hasPositions = has(E + ".atomPositionsToFeatures");
   if (e.hasPositions) lin(E + ".atomPositionsToFeatures", e.posProj, 3, C);
   e.hasChiral = has(E + ".atomChiralToFeatures"); if (e.hasChiral) lin(E + ".atomChiralToFeatures", e.chiralProj, 3, C);
   lin(E + ".projectAtomFeaturesForAggr", e.aggr, C, e.perToken);
   e.stack.C = C; e.stack.Cp = Cp; e.stack.H = e.H; e.stack.D = e.D;
-  forEachParam(e.stack, E, nb, perBlock, false, upGate, f, kqNorm, noTr2);
+  forEachParam(e.stack, E, nb, perBlock, e.chai, upGate, f, kqNorm, noTr2);
 }
 
 // Every parameter of the denoiser under its bundle names. `has` answers for the optional tensors (LayerNorm offsets

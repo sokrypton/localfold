@@ -44,8 +44,9 @@ static g::af3::Gather gatherG(const ::Gather& q) { return g::af3::Gather{q.idx, 
 
 int main(int argc, char** argv) {
   int failed = 0;
-  std::string bundle = "model-af3-full-f32", family = "af3", input = "cuda/grad/data/af3-in-af3";
+  std::string bundle = "model-af3-full-f32", family = "af3", input = "cuda/grad/data/af3-in-af3", esmBundle = "af3am-esm2";
   for (int i = 1; i < argc; ++i) {
+    if (!strncmp(argv[i], "--esm-bundle=", 13)) esmBundle = argv[i] + 13;     // (chai-1's ESM2 3B)
     if (!strncmp(argv[i], "--bundle=", 9)) bundle = argv[i] + 9;
     else if (!strncmp(argv[i], "--family=", 9)) family = argv[i] + 9;
     else if (!strncmp(argv[i], "--input=", 8)) input = argv[i] + 8;
@@ -56,10 +57,13 @@ int main(int argc, char** argv) {
   M.loadBundle(bundle, "", [&](const std::map<std::string, std::vector<long long>>& shapes) {
     lf::weights::Shapes S; S.shape = shapes; return lf::weights::af3WeightLines(family, S); });
   M.load(input);
-  if (M.flag("trunk.dialect.chaiTokenEmbedding") || M.flag("trunk.dialect.targetFeatAtomOnly") || M.flag("trunk.dialect.chaiMsaFeatures")) {
-    fprintf(stderr, "%s: its target_feat / MSA embedding is not af3embed.cuh's generic path\n", family.c_str()); return 1;
+  const bool chai = M.flag("trunk.dialect.chaiTokenEmbedding");
+  if (chai) {     // its target_feat reads ESM2 3B's embeddings (af3.cu's --esm-bundle)
+    const int seg = (int)M.segs.size();
+    M.loadBundle(esmBundle, "e", nullptr, "", "esm2/blocks/");
+    M.upload(seg);
   }
-  setAdaMode(false);
+  setAdaMode(M.flag("trunk.dialect.chaiAtomStack"));
   AtomShape sh = atomShape();
   const int n = sh.tokens; const size_t nn = (size_t)n * n, atoms = (size_t)n * sh.dense;
   auto has = [&](const std::string& k) { return M.has(k); };
@@ -73,6 +77,7 @@ int main(int argc, char** argv) {
   // gradient)
   e.Cst = has(E + ".embedTrunkSingleCond") ? (int)(M.at(E + ".embedTrunkSingleCond").length / e.C) : 0;
   e.Cz = has(E + ".embedTrunkPairCond") ? (int)(M.at(E + ".embedTrunkPairCond").length / e.Cp) : 0;
+  e.chai = M.flag("trunk.dialect.chaiAtomStack");
   e.rawCharge = M.flag("trunk.dialect.rawRefCharge"); e.preTrunkQuery = M.flag("trunk.dialect.preTrunkQuery");
   e.keysUidFromQueries = M.flag("trunk.dialect.keysUidFromQueriesLayout"); e.maskPaddedKeys = M.flag("trunk.dialect.maskPaddedKeys");
   int nbE = 0; while (M.has(E + ".blocks." + std::to_string(nbE) + ".qProjection")) ++nbE;
@@ -87,6 +92,21 @@ int main(int argc, char** argv) {
     GK(cudaMemcpy(p.w, r.data(), len * sizeof(g::real), cudaMemcpyHostToDevice));
   };
   g::af3::forEachParam(e, E, "targetFeat.reference", nbE, perBlock, up, kq, noTr2, has, load);
+  tfm.chai = chai;
+  if (chai) {
+    const std::string S = E + ".chaiToken.";
+    const int Ct = (int)M.at(S + "tokenFeatureBias").length, P = e.perToken;
+    g::af3::forEachParam(tfm.ct, P, Ct, (int)(M.at(S + "esmWeights").length / Ct), (int)(M.at(S + "singleProjInTrunk").length / (P + Ct)),
+                         (int)(M.at(S + "singleProjInStructure").length / (P + Ct)), has(S + "dx"), load);
+    tfm.flags.isDna = M.has("batch.isDna") ? Idev("batch.isDna") : nullptr;
+  }
+  tfm.atomOnly = M.flag("trunk.dialect.targetFeatAtomOnly");       // (boltz2: the encoder's columns plus six token terms)
+  if (tfm.atomOnly) {
+    const std::string S = E + ".targetFeatSum.";
+    g::af3::forEachParam(tfm.sum, e.perToken, (int)(M.at(S + "method").length / e.perToken), has(S + "dnResType"), load);
+    auto flag = [&](const char* k) { return M.has(k) ? Idev(k) : nullptr; };
+    tfm.flags = g::af3::TokenFlags{flag("batch.isDna"), flag("batch.isRna"), flag("batch.isLigand"), flag("batch.isModified")};
+  }
   for (auto& b : e.stack.blocks) {
     const std::string B0 = E + ".blocks.0";
     b.keyMasked = M.flag(B0 + ".keyMaskedAtomAttention"); b.chained = M.flag(B0 + ".chainedAtomLayerNorm");
@@ -99,10 +119,11 @@ int main(int argc, char** argv) {
   te.F = (int)M.meta(TE + "targetFeatWidth"); te.fromSingle = M.flag("trunk.dialect.pairInitFromSingle");
   te.msaWidth = (int)(M.at(TE + "msaActivations").length / te.Cm);
   te.pairedQuery = M.flag("trunk.dialect.msaPairedQueryRow");
+  te.chai = M.flag("trunk.dialect.recycleFromInit");
   g::af3::forEachParam(te, has, load);
   g::af3::DistogramHead dh; dh.C = te.C; dh.bins = (int)M.meta("trunk.distogram.bins");
   dh.scale = M.flag("trunk.dialect.mlpDistogram") ? 0.5f : 1.f;
-  if (M.has("trunk.distogram.hidden")) { fprintf(stderr, "the MLP distogram is not here\n"); return 1; }
+  if (M.has("trunk.distogram.hidden")) dh.Hd = (int)M.at("trunk.distogram.hiddenBias").length;
   g::af3::forEachParam(dh, has, load);
   // the batch
   g::af3::AtomBatch b;
@@ -132,6 +153,23 @@ int main(int argc, char** argv) {
                         M.has("batch.bondMatrix") ? devReal(Fdev("batch.bondMatrix"), nn) : nullptr,
                         M.has("batch.bondOrderMatrix") ? devReal(Fdev("batch.bondOrderMatrix"), nn) : nullptr,
                         t.msaRows, devReal(t.deletion, (size_t)t.S * n), n, t.S};
+  // chai-1's: its ESM2 rows, its declared bonds, its MSA's 41 columns (the port's chain hits)
+  g::real *esm = nullptr, *tfS = nullptr; int esmE = 0, outS = 0;
+  if (chai) {
+    const float* ef = esmEmbeddings(n, esmE);
+    esm = devReal(ef, (size_t)n * esmE);
+    outS = tfm.ct.structure.N; GK(cudaMalloc(&tfS, (size_t)n * outS * sizeof(g::real)));
+    if (M.has("batch.declaredBondMatrix")) eb.declaredBonds = devReal(Fdev("batch.declaredBondMatrix"), nn);
+    int chains = 1; { const int* asym = M.i("batch.features.asymId"); for (int k = 0; k < n; ++k) chains = std::max(chains, asym[k] + 1); }
+    const size_t rows = (size_t)t.S * n;
+    int* chainHit; CK(cudaMalloc(&chainHit, (size_t)t.S * chains * sizeof(int))); CK(cudaMemset(chainHit, 0, (size_t)t.S * chains * sizeof(int)));
+    chaiChainHitK<<<blocks(rows), 256, 0, STREAM>>>(t.msaRows, t.msaMask, Idev("batch.features.asymId"), chainHit, rows, n, chains);
+    g::real* F; GK(cudaMalloc(&F, rows * 41 * sizeof(g::real)));
+    g::af3::chaiMsaFeatK<<<g::blocks(rows), 256, 0, STREAM>>>(t.msaRows, t.deletion, t.msaMask, Idev("batch.features.asymId"), chainHit,
+      chains, M.has("batch.pairedRows") ? (int)M.meta("batch.pairedRows") : 0, M.has("batch.isLigand") ? Idev("batch.isLigand") : nullptr,
+      M.has("batch.msaSource") ? Idev("batch.msaSource") : nullptr, F, rows, n);
+    eb.chaiMsa = F;
+  }
   const int* aatype = Idev("batch.aatype");
   g::real *profile = devReal(Fdev("batch.profile"), (size_t)n * 31), *delMean = devReal(Fdev("batch.deletionMean"), n);
   g::real *tf, *pair, *single, *msa, *logits;
@@ -144,8 +182,8 @@ int main(int argc, char** argv) {
   {
     g::real *pp = devReal(std::vector<double>(nn * te.C, 0)), *pss = devReal(std::vector<double>((size_t)n * te.Cs, 0));
     g::ARENA.reset();
-    if (te.F != 63 + e.perToken) { fprintf(stderr, "target_feat %d wide, 63 + %d expected\n", te.F, e.perToken); return 1; }
-    g::af3::targetFeatForward(tfm, b, aatype, profile, delMean, tf);
+    if (!chai && te.F != (tfm.atomOnly ? 0 : 63) + e.perToken) { fprintf(stderr, "target_feat %d wide, 63 + %d expected\n", te.F, e.perToken); return 1; }
+    g::af3::targetFeatForward(tfm, b, aatype, profile, delMean, tf, esm, tfS);
     g::af3::trunkEmbedForward(te, eb, tf, pp, pss, pair, single, msa);
     // the distogram on the port's z_init (a pair any head could read)
     float* half_ = scratch<float>("test.half", nn * dh.bins); float* ref = scratch<float>("test.logits", nn * dh.bins);
@@ -160,6 +198,7 @@ int main(int argc, char** argv) {
       if (!(er < 1e-4)) { printf("  <-- ABOVE 1e-4\n"); ++failed; }
     };
     cmp("target_feat", tf, refTf, (size_t)n * te.F);
+    if (chai) cmp("target_feat (the structure's)", tfS, TARGET_FEAT_STRUCTURE, (size_t)n * outS);
     cmp("z_init (before templates)", pair, zInit, nn * te.C);
     cmp("single", single, t.single, (size_t)n * te.Cs);
     cmp("msa", msa, t.msa, (size_t)t.S * n * te.Cm);
@@ -175,20 +214,22 @@ int main(int argc, char** argv) {
     GK(cudaMemset(dpp, 0, nn * te.C * sizeof(g::real))); GK(cudaMemset(dps, 0, (size_t)n * te.Cs * sizeof(g::real)));
     auto fwd = [&] {
       g::ARENA.reset();
-      g::af3::targetFeatForward(tfm, b, aatype, profile, delMean, tf);
+      g::af3::targetFeatForward(tfm, b, aatype, profile, delMean, tf, esm, tfS);
       g::af3::trunkEmbedForward(te, eb, tf, pp, pss, pair, single, msa);
       g::af3::distogramForward(dh, pair, n, logits);
     };
     ps.zeroGrad();
     g::ARENA.reset();
-    auto ts = g::af3::targetFeatForward(tfm, b, aatype, profile, delMean, tf);
+    auto ts = g::af3::targetFeatForward(tfm, b, aatype, profile, delMean, tf, esm, tfS);
     auto es = g::af3::trunkEmbedForward(te, eb, tf, pp, pss, pair, single, msa);
     g::af3::distogramForward(dh, pair, n, logits);
     g::real* dpair = g::cloneR(ctP, nn * te.C);
     g::af3::distogramBackward(dh, pair, n, ctD, dpair);
     g::real* dtf = g::ARENA.zeros((size_t)n * te.F);
     g::af3::trunkEmbedBackward(te, eb, es, tf, dpair, ctS, ctM, dtf, dpp, dps);
-    g::af3::targetFeatBackward(tfm, b, ts, dtf);
+    g::real *ctT = chai ? devReal(gauss((size_t)n * outS, 85, 1)) : nullptr, *desm = nullptr;
+    if (chai) { GK(cudaMalloc(&desm, (size_t)n * esmE * sizeof(g::real))); GK(cudaMemset(desm, 0, (size_t)n * esmE * sizeof(g::real))); }
+    g::af3::targetFeatBackward(tfm, b, ts, dtf, ctT, desm);
     g::GradCheck gc;
     gc.rel = 1e-8;      // (the target_feat encoder's pair MLP: ReLU inputs near their kink at 1e-7, as the denoiser's)
     gc.add("in/prevPair", pp, dpp, nn * te.C);
@@ -196,6 +237,7 @@ int main(int argc, char** argv) {
     for (auto* p : ps.all) gc.add(*p);
     gc.output(pair, ctP, nn * te.C); gc.output(single, ctS, (size_t)n * te.Cs);
     gc.output(msa, ctM, (size_t)t.S * n * te.Cm); gc.output(logits, ctD, nn * dh.bins);
+    if (chai) { gc.add("in/esm", esm, desm, (size_t)n * esmE); gc.output(tfS, ctT, (size_t)n * outS); }
     failed += gc.run(fwd);
   }
 #endif

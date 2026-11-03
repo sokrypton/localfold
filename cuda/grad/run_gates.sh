@@ -93,10 +93,10 @@ for fb in "model-af3-full-f32 af3" "model-boltz2-f32 boltz2" "model-protenix2-f3
     --template=tools/fixtures/6mrr-crystal.pdb:A,tools/fixtures/6mrr-crystal.pdb:A > /dev/null
   run cuda/grad/test-af3tmpl --bundle=$1 --family=$2 --input=$tin
   case $2 in af3|boltz2|chai1|rosettafold3|protenix2) run cuda/grad/test-af3tmpl-f64 --bundle=$1 --family=$2 --input=$tin;; esac
-  # the input embedder (boltz2's atom-only target_feat sum included; not chai-1's token embedding); the confidence head
-  # (every form but OpenDDE's own head)
-  case $2 in chai1) ;; *) run cuda/grad/test-af3embed --bundle=$1 --family=$2 --input=$in
-                          run cuda/grad/test-af3embed-f64 --bundle=$1 --family=$2 --input=$in ;; esac
+  # the input embedder (every family's form; chai-1's reads ESM2 3B from af3am-esm2); the confidence head (every form
+  # but OpenDDE's own head, which test-opendde holds)
+  run cuda/grad/test-af3embed --bundle=$1 --family=$2 --input=$in
+  run cuda/grad/test-af3embed-f64 --bundle=$1 --family=$2 --input=$in
   case $2 in opendde) ;; *) run cuda/grad/test-af3conf --bundle=$1 --family=$2 --input=$in
                             run cuda/grad/test-af3conf-f64 --bundle=$1 --family=$2 --input=$in ;; esac
   for E in diffusion.encoder diffusion.decoder targetFeat.encoder; do run cuda/grad/test-atom --bundle=$1 --family=$2 --stack=$E; done
