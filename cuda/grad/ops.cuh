@@ -35,7 +35,7 @@ __global__ void lnFwdK(const real* __restrict__ x, const real* __restrict__ g, c
   for (int c = lane; c < C; c += 32) { real d = xr[c] - mu; v += d * d; }
   for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
   real rs = rsqrt(v / C + eps);
-  for (int c = lane; c < C; c += 32) y[r * C + c] = (xr[c] - mu) * rs * g[c] + b[c];
+  for (int c = lane; c < C; c += 32) y[r * C + c] = (xr[c] - mu) * rs * g[c] + (b ? b[c] : (real)0);
   if (lane == 0) { mean[r] = mu; rstd[r] = rs; }
 }
 // dx = rstd (dxhat - mean(dxhat) - xhat mean(dxhat xhat)), dxhat = dy g; dg += dy xhat, db += dy (atomics a block)
@@ -63,7 +63,7 @@ __global__ void lnBwdK(const real* __restrict__ x, const real* __restrict__ dy, 
     }
   }
   __syncthreads();
-  for (int c = threadIdx.x; c < C; c += blockDim.x) { atomicAdd(&dg[c], sh[c]); atomicAdd(&db[c], sh[C + c]); }
+  for (int c = threadIdx.x; c < C; c += blockDim.x) { atomicAdd(&dg[c], sh[c]); if (db) atomicAdd(&db[c], sh[C + c]); }
 }
 
 struct LnSave { const real* x; real* mean; real* rstd; };
@@ -139,6 +139,8 @@ struct Sdpa {
   const real* keyMask = nullptr;   // [B, K], 1 kept, 0 masked (-1e9)
   Bias bias[2];
   bool clip = false;                // AF2's clip of the logits to +-1e8
+  const int* seqQ = nullptr;        // [Q] and [K]: a key whose id differs from the query's is excluded (a chain mask)
+  const int* seqK = nullptr;
 };
 
 __global__ void softmaxBiasK(real* __restrict__ S, Sdpa a, int b0, int nb) {
@@ -152,8 +154,10 @@ __global__ void softmaxBiasK(real* __restrict__ S, Sdpa a, int b0, int nb) {
   const real* n0 = a.bias[0].p ? a.bias[0].p + b * a.bias[0].sb + h * a.bias[0].sh + q * a.bias[0].sq : nullptr;
   const real* n1 = a.bias[1].p ? a.bias[1].p + b * a.bias[1].sb + h * a.bias[1].sh + q * a.bias[1].sq : nullptr;
   real mx = -INFINITY;
+  const int sid = a.seqQ ? a.seqQ[q] : 0;
   for (int k = lane; k < K; k += 32) {
     real v = s[k];
+    if (a.seqQ && a.seqK[k] != sid) { s[k] = -INFINITY; continue; }
     if (m) v += 1e9f * (m[k] - 1.f);
     if (n0) v += n0[k];
     if (n1) v += n1[k];
@@ -162,9 +166,9 @@ __global__ void softmaxBiasK(real* __restrict__ S, Sdpa a, int b0, int nb) {
   }
   for (int o = 16; o; o >>= 1) mx = fmax(mx, __shfl_xor_sync(~0u, mx, o));
   real sum = 0;
-  for (int k = lane; k < K; k += 32) { real e = s[k] == -INFINITY ? 0.f : exp(s[k] - mx); s[k] = e; sum += e; }
+  for (int k = lane; k < K; k += 32) { real e = s[k] == -INFINITY ? (real)0 : exp(s[k] - mx); s[k] = e; sum += e; }
   for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(~0u, sum, o);
-  real inv = sum > 0 ? 1.f / sum : 0.f;
+  real inv = sum > 0 ? (real)1 / sum : (real)0;
   for (int k = lane; k < K; k += 32) s[k] *= inv;
 }
 // dS = P (dP - sum_k dP P), in place on dP; every bias with a grad gets dS accumulated
@@ -341,6 +345,85 @@ inline void attnBackward(Attention& a, const AttnSave& s, const real* mask, cons
     colSum(a.bg.g, dg, rows, HD);
     mmBT(dg, a.wg.w, dx, (int)rows, a.C, HD, 1.f);
   }
+}
+
+// ---------------------------------------------------------------- language-model pieces
+// rotary embedding, split halves within each head of D: channel d with d + D/2, angle pos * base^(-2d/D).
+// sign -1 is the inverse rotation - the backward.
+__global__ void ropeK(real* x, int rows, int heads, int D, int ld, const int* pos, double base, real sign) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  int half = D / 2;
+  if (t >= (size_t)rows * heads * half) return;
+  int d = t % half, h = (t / half) % heads, row = (int)(t / ((size_t)half * heads));
+  double ang = (double)(pos ? pos[row] : row) * pow(base, -2.0 * d / D);
+  real s = (real)sin(ang) * sign, c = (real)cos(ang);
+  real* p = x + (size_t)row * ld + h * D + d;
+  real a = p[0], b = p[half];
+  p[0] = a * c - b * s;
+  p[half] = a * s + b * c;
+}
+inline void rope(real* x, int rows, int heads, int D, int ld, const int* pos = nullptr, double base = 10000, bool inverse = false) {
+  ropeK<<<blocks((size_t)rows * heads * (D / 2)), 256, 0, STREAM>>>(x, rows, heads, D, ld, pos, base, inverse ? -1 : 1);
+}
+__device__ inline real siluR(real a) { return a / (1 + exp(-a)); }
+// g[r, f] = silu(h[r, f]) h[r, F + f]   (the first half gated)
+__global__ void swigluK(const real* h, real* g, size_t rows, int F) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= rows * F) return;
+  size_t r = t / F; int f = t % F;
+  g[t] = siluR(h[r * 2 * F + f]) * h[r * 2 * F + F + f];
+}
+__global__ void swigluBwdK(const real* h, const real* dg, real* dh, size_t rows, int F) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= rows * F) return;
+  size_t r = t / F; int f = t % F;
+  real a = h[r * 2 * F + f], b = h[r * 2 * F + F + f], sg = 1 / (1 + exp(-a));
+  dh[r * 2 * F + f] = dg[t] * b * (sg + a * sg * (1 - sg));
+  dh[r * 2 * F + F + f] = dg[t] * a * sg;
+}
+// the exact (erf) GELU
+__global__ void geluK(real* y, const real* x, size_t n) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t < n) y[t] = (real)0.5 * x[t] * (1 + erf(x[t] * (real)0.70710678118654752));
+}
+__global__ void geluBwdK(real* d, const real* x, size_t n) {       // d *= gelu'(x)
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= n) return;
+  real v = x[t];
+  d[t] *= (real)0.5 * (1 + erf(v * (real)0.70710678118654752)) + v * exp(-(real)0.5 * v * v) * (real)0.3989422804014327;
+}
+__global__ void scaleK(real* x, real a, size_t n) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t < n) x[t] *= a;
+}
+// x[r] = table[ids[r]] * scale ; the backward scatters into the table's gradient
+__global__ void embedK(const int* ids, const real* table, real* x, size_t rows, int C, real scale) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t < rows * C) x[t] = table[(size_t)ids[t / C] * C + t % C] * scale;
+}
+__global__ void embedBwdK(const int* ids, const real* dx, real* dtable, size_t rows, int C, real scale) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t < rows * C) atomicAdd(&dtable[(size_t)ids[t / C] * C + t % C], dx[t] * scale);
+}
+// mean cross entropy over the rows with a target >= 0 (a row's target < 0 is not scored); dlogits written, the
+// loss accumulated in double
+__global__ void crossEntropyK(const real* logits, const int* target, real* dlogits, int rows, int V, double* loss,
+                              const int* count) {
+  int r = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x & 31;
+  if (r >= rows) return;
+  const real* z = logits + (size_t)r * V;
+  real* dz = dlogits + (size_t)r * V;
+  int tg = target[r];
+  if (tg < 0) { for (int v = lane; v < V; v += 32) dz[v] = 0; return; }
+  real mx = -INFINITY;
+  for (int v = lane; v < V; v += 32) mx = fmax(mx, z[v]);
+  for (int o = 16; o; o >>= 1) mx = fmax(mx, __shfl_xor_sync(~0u, mx, o));
+  real s = 0;
+  for (int v = lane; v < V; v += 32) s += exp(z[v] - mx);
+  for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
+  real inv = 1 / (real)*count;
+  for (int v = lane; v < V; v += 32) dz[v] = (exp(z[v] - mx) / s - (v == tg ? 1 : 0)) * inv;
+  if (lane == 0) atomicAdd(loss, (double)((log(s) + mx - z[tg]) * inv));
 }
 
 // ---------------------------------------------------------------- AF2's ReLU transition: LN, Linear, relu, Linear

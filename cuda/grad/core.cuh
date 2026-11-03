@@ -28,7 +28,7 @@ typedef float real;
 #endif
 inline cublasStatus_t xgemm(cublasHandle_t h, cublasOperation_t a, cublasOperation_t b, int m, int n, int k,
                             const float* al, const float* A, int la, const float* B, int lb, const float* be, float* C, int lc) {
-  return xgemm(h, a, b, m, n, k, al, A, la, B, lb, be, C, lc);
+  return cublasSgemm(h, a, b, m, n, k, al, A, la, B, lb, be, C, lc);
 }
 inline cublasStatus_t xgemm(cublasHandle_t h, cublasOperation_t a, cublasOperation_t b, int m, int n, int k,
                             const double* al, const double* A, int la, const double* B, int lb, const double* be, double* C, int lc) {
@@ -37,7 +37,7 @@ inline cublasStatus_t xgemm(cublasHandle_t h, cublasOperation_t a, cublasOperati
 inline cublasStatus_t xgemmB(cublasHandle_t h, cublasOperation_t a, cublasOperation_t b, int m, int n, int k, const float* al,
                              const float* A, int la, long long sa, const float* B, int lb, long long sb, const float* be,
                              float* C, int lc, long long sc, int count) {
-  return xgemmB(h, a, b, m, n, k, al, A, la, sa, B, lb, sb, be, C, lc, sc, count);
+  return cublasSgemmStridedBatched(h, a, b, m, n, k, al, A, la, sa, B, lb, sb, be, C, lc, sc, count);
 }
 inline cublasStatus_t xgemmB(cublasHandle_t h, cublasOperation_t a, cublasOperation_t b, int m, int n, int k, const double* al,
                              const double* A, int la, long long sa, const double* B, int lb, long long sb, const double* be,
