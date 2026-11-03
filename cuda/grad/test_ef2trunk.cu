@@ -9,7 +9,10 @@
 //      pair;
 //   3. -DGRAD_F64: the backward against central differences end to end (37 states -> shim -> z_init -> trunk ->
 //      distogram), on a small random input with truncated stacks; --parcae=<bundle> the parcae form with its
-//      dropout on and a random initial state; --inputs the inputs embedder on the real input.
+//      dropout on and a random initial state; --inputs the inputs embedder on the real input; --msa (with the full
+//      ESMFold2's bundle and an input with an alignment) the MSA encoder, a column mask on.
+//   --msa in float32: the full ESMFold2's MSA encoder against cuda/ef2's msaEncode (EF2_DETERMINISTIC: the first
+//      1,024 rows, no column mask).
 //
 //   nvcc -O1 -std=c++17 -arch=sm_80 -o cuda/grad/test-ef2trunk cuda/grad/test_ef2trunk.cu -lcublas -lcublasLt -ldl -lcurand
 //   cuda/grad/test-ef2trunk [--weights=cuda/ef2/weights] [--input=cuda/ef2/data-6mrr] [--parcae=model-esmfold2-fast-f32]
@@ -18,6 +21,7 @@
 #include "../ef2/src/shim.cuh"
 #include "../ef2/src/atoms.cuh"
 #include "../ef2/src/trunk.cuh"
+#include "../ef2/src/msa.cuh"
 #include "ef2trunk.cuh"
 #include "gradcheck.cuh"
 
@@ -109,10 +113,38 @@ static void inputsArm(InputsArm& r, Loader& L) {
   r.b.T = r.T;
 }
 
+// the full ESMFold2's MSA encoder over the loaded input's alignment: its first S rows, a column mask of rate `rate`
+// below the query (the port's form), drawn from `seed`
+struct MsaArm {
+  g::ef2::MsaEncoder e;
+  g::ef2::MsaBatch b;
+  int T = 0, S = 0, Si = 0;
+};
+static void msaArmFor(MsaArm& r, Loader& L, int maxRows, double rate, unsigned seed) {
+  r.T = (int)M.meta("meta/tokens"); r.Si = (int)M.meta("meta/singleInputs");
+  const int depth = (int)M.meta("meta/msa_depth");
+  r.S = std::min(depth, maxRows);
+  const int Cm = (int)M.meta("meta/msaChannels"), C = (int)M.meta("meta/pairChannels"), H = (int)M.meta("meta/msaHeads");
+  const int D = (int)M.meta("meta/msaHeadWidth"), Hh = (int)M.meta("meta/opmHidden"), nb = (int)M.meta("meta/msaBlocks");
+  const int pf = (int)(M.at("f/msaEncoder/blocks/0/pairTransition/transition1").length / (2 * (size_t)C * C));
+  const int mf = (int)(M.at("f/msaEncoder/blocks/0/msaTransition/transition1").length / (2 * (size_t)Cm * Cm));
+  g::ef2::forEachParam(r.e, r.Si, Cm, C, H, D, Hh, nb, pf, mf, L.fn(), [](const std::string& n) { return M.has("f/" + n); });
+  const int* rowsH = M.i("msa/rows"); const float* delH = M.f("msa/deletion");
+  std::vector<int> rows(rowsH, rowsH + (size_t)r.S * r.T);
+  std::vector<double> del(delH, delH + (size_t)r.S * r.T), mask((size_t)r.S * r.T, 1);
+  unsigned long long x = seed * 2654435761ull + 7;
+  for (int t = 0; t < r.T && rate > 0; ++t) {
+    x = x * 6364136223846793005ull + 1442695040888963407ull;
+    if (((x >> 11) + 0.5) / 9007199254740992.0 < rate) for (int s = 1; s < r.S; ++s) mask[(size_t)s * r.T + t] = 0;
+  }
+  r.b = g::ef2::MsaBatch{devI(rows), devReal(del), devReal(mask), r.S, r.T};
+}
+
 int main(int argc, char** argv) {
   std::string weights = "cuda/ef2/weights", input = "cuda/ef2/data-6mrr", parcae;
-  bool inputsOnly = false;
+  bool inputsOnly = false, msaArm = false;
   for (int i = 1; i < argc; ++i) {
+    if (!strcmp(argv[i], "--msa")) msaArm = true;
     if (!strcmp(argv[i], "--inputs")) inputsOnly = true;
     if (!strncmp(argv[i], "--weights=", 10)) weights = argv[i] + 10;
     else if (!strncmp(argv[i], "--input=", 8)) input = argv[i] + 8;
@@ -133,6 +165,25 @@ int main(int argc, char** argv) {
   Loader L; L.prefix = "f/";
 
 #ifndef GRAD_F64
+  if (msaArm) {
+    // ---------------------------------------------------------------- the MSA encoder, against cuda/ef2's msaEncode
+    M.load(input);
+    MsaArm ma; msaArmFor(ma, L, (int)M.meta("meta/msaMaxDepth"), 0, 0);
+    const int T = ma.T; const size_t P = (size_t)T * T * C;
+    printf("ESMFold2's MSA encoder (%s, %s): %d tokens, %d of %d rows, %d blocks\n", parcae.c_str(), input.c_str(), T, ma.S,
+           (int)M.meta("meta/msa_depth"), (int)ma.e.blocks.size());
+    auto ziH = gauss(P, 3, 1), sH = gauss((size_t)T * ma.Si, 4, 1);
+    g::real *z = devReal(ziH), *sIn = devReal(sH);
+    g::ef2::MsaEncRun run;
+    g::ARENA.reset();
+    g::ef2::msaEncForward(ma.e, ma.b, run, sIn, z);
+    float* zp = devF(ziH);
+    msaEncode(zp, devF(sH), T, C, ma.Si, 0);
+    CK(cudaStreamSynchronize(STREAM));
+    expect("the encoder's pair against cuda/ef2's msaEncode", g::relRms(hostD(z, P), hostD(zp, P)), 1e-5);
+    printf("%s\n", failed ? "FAIL" : "PASS");
+    return failed ? 1 : 0;
+  }
   if (!parcae.empty()) {
     // ---------------------------------------------------------------- 2. the parcae recycle, against foldingTrunk
     const int n = 37; const size_t P = (size_t)n * n * C;
@@ -305,6 +356,35 @@ int main(int argc, char** argv) {
   }
 #else
   // ---------------------------------------------------------------- 3. the backward against central differences
+  if (msaArm) {
+    // the MSA encoder on the real alignment's first 16 rows, a column mask on, z_init and s_inputs random
+    M.load(input);
+    MsaArm ma; msaArmFor(ma, L, 16, 0.3, 5);
+    const int T = ma.T; const size_t P = (size_t)T * T * C;
+    printf("ESMFold2's MSA encoder backward: %d tokens, %d rows, %d blocks\n", T, ma.S, (int)ma.e.blocks.size());
+    g::real *z0 = devReal(gauss(P, 3, 1)), *sIn = devReal(gauss((size_t)T * ma.Si, 4, 1)), *z, *ct = devReal(gauss(P, 5, 1));
+    GK(cudaMalloc(&z, P * sizeof(g::real)));
+    g::ef2::MsaEncRun run;
+    auto fwd = [&] {
+      g::ARENA.reset();
+      GK(cudaMemcpyAsync(z, z0, P * sizeof(g::real), cudaMemcpyDeviceToDevice, STREAM));
+      g::ef2::msaEncForward(ma.e, ma.b, run, sIn, z);
+    };
+    L.ps.zeroGrad();
+    fwd();
+    g::real *dz, *ds; GK(cudaMalloc(&dz, P * sizeof(g::real))); GK(cudaMalloc(&ds, (size_t)T * ma.Si * sizeof(g::real)));
+    GK(cudaMemcpy(dz, ct, P * sizeof(g::real), cudaMemcpyDeviceToDevice)); GK(cudaMemset(ds, 0, (size_t)T * ma.Si * sizeof(g::real)));
+    g::ef2::msaEncBackward(ma.e, ma.b, run, sIn, dz, ds);
+    g::GradCheck gc;
+    gc.verbose = getenv("GRAD_VERBOSE") != nullptr;
+    gc.add("in/zInit", z0, dz, P);
+    gc.add("in/sInputs", sIn, ds, (size_t)T * ma.Si);
+    for (auto* q : L.ps.all) gc.add(*q);
+    gc.output(z, ct, P);
+    failed += gc.run(fwd);
+    printf("%s\n", failed ? "FAIL" : "PASS");
+    return failed ? 1 : 0;
+  }
   if (inputsOnly) {
     // the inputs embedder on the real input (its atom layout is the windowed stack's), s_inputs a cotangent
     M.load(input);

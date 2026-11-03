@@ -102,6 +102,13 @@ for b in model-esmfold2-fast-f32 model-esmfold2-f32; do
   run cuda/grad/test-ef2trunk --parcae=$b
   run cuda/grad/test-ef2trunk-f64 --parcae=$b
 done
+# the full ESMFold2's MSA encoder, on a real alignment (tools/fixtures/test.a3m, 59 residues, 8,076 rows)
+if [ -d model-esmfold2-f32 ]; then
+  in=cuda/grad/data/ef2-msa59
+  [ -d $in ] || cuda/featurise/ef2-featurise $in --sequence=$(sed -n 3p tools/fixtures/test.a3m) --a3m=tools/fixtures/test.a3m > /dev/null
+  run cuda/grad/test-ef2trunk --parcae=model-esmfold2-f32 --msa --input=$in
+  run cuda/grad/test-ef2trunk-f64 --parcae=model-esmfold2-f32 --msa --input=$in
+fi
 run cuda/grad/test-msap --layer=0
 run cuda/grad/test-msap-f64
 run cuda/grad/test-msapmodel

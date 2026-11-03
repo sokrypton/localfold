@@ -553,5 +553,150 @@ inline void inputsBackward(InputsEmbedder& e, const InputsBatch& b, const Inputs
   e.lin.backward(b.feat, dpre, nullptr, A);
 }
 
+
+// ---------------------------------------------------------------- the full ESMFold2's MSA encoder (over z_init, in place)
+//   m = embed([one-hot(33) * mask | has_deletion | (pi/2) atan(d / 3)]) + projectInputs(s_inputs)[token]
+//   per block:  pair += OPM(m) (Wout(outer) + b over max(count, 1));  (not the last) m += PWA(m, pair), m += T(m);
+//               pair = the pair-only block (pair)
+// Saved: each block's m and pair; a block's forward is replayed before its backward (cuda/ef2's msa.cuh).
+struct MsaEncoder {
+  struct Block { Opm opm; af3::Pwa pwa; af3::GatedTransition tr; af3::Pairformer pair; bool hasPwa = false; };
+  Linear project;
+  Param embed;                         // [35, Cm]
+  std::vector<Block> blocks;
+  int Cm = 0, C = 0;
+};
+inline void forEachParam(MsaEncoder& e, int Si, int Cm, int C, int H, int D, int Hh, int nb, int pairFactor, int msaFactor,
+                         const std::function<void(const std::string&, Param&, size_t)>& f, const std::function<bool(const std::string&)>& has) {
+  e.Cm = Cm; e.C = C;
+  auto ln = [&](const std::string& n, LayerNorm& l, int Cc, const std::string& sc = "Scale", const std::string& of = "Offset") {
+    l.C = Cc; f(n + sc, l.g, Cc); f(n + of, l.b, Cc);
+  };
+  auto lin = [&](const std::string& n, Linear& l, int K, int N) { l.K = K; l.N = N; l.hasBias = false; f(n, l.w, (size_t)K * N); };
+  lin("msaEncoder/projectInputs", e.project, Si, Cm);
+  f("msaEncoder/embed", e.embed, (size_t)35 * Cm);
+  e.blocks.resize(nb);
+  for (int b = 0; b < nb; ++b) {
+    MsaEncoder::Block& k = e.blocks[b];
+    const std::string B = "msaEncoder/blocks/" + std::to_string(b) + "/";
+    Opm& o = k.opm;
+    o.C = Cm; o.O = Hh; o.Cz = C; o.fused = true; o.clampCount = true;
+    ln(B + "outerProductMean/norm", o.ln, Cm);
+    lin(B + "outerProductMean/projection", o.proj, Cm, 2 * Hh);
+    f(B + "outerProductMean/output", o.wo, (size_t)Hh * Hh * C);
+    f(B + "outerProductMean/outputBias", o.bo, C);
+    k.hasPwa = has(B + "pairWeightedAveraging/value");
+    if (k.hasPwa) {
+      af3::Pwa& a = k.pwa;
+      a.Cm = Cm; a.Cz = C; a.H = H; a.D = D; a.noKeyMask = true;
+      ln(B + "pairWeightedAveraging/norm", a.ln, Cm);
+      ln(B + "pairWeightedAveraging/pairNorm", a.pn, C);
+      lin(B + "pairWeightedAveraging/pairLogits", a.logits, C, H);
+      lin(B + "pairWeightedAveraging/value", a.v, Cm, H * D);
+      lin(B + "pairWeightedAveraging/gate", a.gate, Cm, H * D);
+      lin(B + "pairWeightedAveraging/output", a.out, H * D, Cm);
+      k.tr.C = Cm; k.tr.F = Cm * msaFactor;
+      ln(B + "msaTransition/inputLayerNorm", k.tr.ln, Cm);
+      lin(B + "msaTransition/transition1", k.tr.t1, Cm, 2 * Cm * msaFactor);
+      lin(B + "msaTransition/transition2", k.tr.t2, Cm * msaFactor, Cm);
+    }
+    af3::forEachParam(k.pair, "msaEncoder/blocks/" + std::to_string(b), C, 0, 0, 0, 0, 0, pairFactor, 0, false, false, f, false, false, "/");
+  }
+}
+struct MsaBatch { const int* rows; const real* del; const real* mask; int S, T; };   // [S, T] each
+struct MsaEncRun { std::vector<real*> ms, pairs; real* ones = nullptr; };
+__global__ void msaEmbedK(const int* rows, const real* del, const real* mask, const real* E, const real* fromInputs, real* m,
+                          size_t count, int T, int C) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= count * C) return;
+  int c = (int)(t % C); size_t row = t / C; int token = (int)(row % T);
+  real d = del[row];
+  real v = mask[row] > 0 ? E[(size_t)rows[row] * C + c] : (real)0;
+  if (d > 0) v += E[(size_t)33 * C + c];
+  v += (real)1.57079632679489662 * atan(d / 3) * E[(size_t)34 * C + c];
+  m[t] = v + fromInputs[(size_t)token * C + c];
+}
+// dE [35, C] += ..., one thread per (k, c) over the rows; dfi [T, C] = sum over the alignment's rows
+__global__ void msaEmbedBwdK(const int* rows, const real* del, const real* mask, const real* dm, real* dE, size_t count, int C) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)35 * C) return;
+  int k = (int)(t / C), c = (int)(t % C);
+  real acc = 0;
+  for (size_t r = 0; r < count; ++r) {
+    real d = del[r], g = dm[r * C + c];
+    if (k < 33) { if (rows[r] == k && mask[r] > 0) acc += g; }
+    else if (k == 33) { if (d > 0) acc += g; }
+    else acc += (real)1.57079632679489662 * atan(d / 3) * g;
+  }
+  dE[t] += acc;
+}
+__global__ void sumRowsOverSK(const real* dm, real* out, int S, int T, int C) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)T * C) return;
+  real acc = 0;
+  for (int s = 0; s < S; ++s) acc += dm[(size_t)s * T * C + t];
+  out[t] = acc;
+}
+struct MsaBlockSave { OpmSave opm; af3::PwaSave pwa; af3::GtSave tr; af3::PairformerSave pb; real *p1, *m1; };
+inline MsaBlockSave msaBlockForward(MsaEncoder::Block& k, const MsaBatch& b, const real* ones, const real* m, const real* pair,
+                                    real* mOut, real* pairOut, int Cm, int C) {
+  const size_t R = (size_t)b.S * b.T, P = (size_t)b.T * b.T;
+  MsaBlockSave s{};
+  s.p1 = cloneR(pair, P * C);
+  s.opm = opmForward(k.opm, m, b.mask, s.p1, b.S, b.T);
+  if (k.hasPwa) {
+    s.m1 = cloneR(m, R * Cm);
+    s.pwa = af3::pwaForward(k.pwa, m, b.mask, nullptr, s.p1, s.m1, b.S, b.T);
+    GK(cudaMemcpyAsync(mOut, s.m1, R * Cm * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
+    s.tr = af3::gtForward(k.tr, s.m1, mOut, R, 1);
+  } else if (mOut != m) GK(cudaMemcpyAsync(mOut, m, R * Cm * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
+  s.pb = af3::pairformerForward(k.pair, {}, s.p1, nullptr, ones, ones, nullptr, nullptr, pairOut, nullptr, b.T);
+  return s;
+}
+// sIn [T, Si], z [T, T, C] (z_init) -> z replaced by the encoder's pair
+inline void msaEncForward(MsaEncoder& e, const MsaBatch& b, MsaEncRun& r, const real* sIn, real* z) {
+  const size_t R = (size_t)b.S * b.T, P = (size_t)b.T * b.T;
+  const int Cm = e.Cm, C = e.C, nb = (int)e.blocks.size();
+  r.ones = ARENA.get(P); fillR<<<blocks(P), 256, 0, STREAM>>>(r.ones, 1, P);
+  r.ms.assign(nb + 1, nullptr); r.pairs.assign(nb, nullptr);
+  r.ms[0] = ARENA.get(R * Cm);
+  {
+    Scratch sc;
+    real* fi = ARENA.get((size_t)b.T * Cm); e.project.forward(sIn, fi, b.T);
+    msaEmbedK<<<blocks(R * Cm), 256, 0, STREAM>>>(b.rows, b.del, b.mask, e.embed.w, fi, r.ms[0], R, b.T, Cm);
+  }
+  for (int k = 0; k < nb; ++k) {
+    r.pairs[k] = cloneR(z, P * C);
+    r.ms[k + 1] = e.blocks[k].hasPwa ? ARENA.get(R * Cm) : r.ms[k];
+    Scratch sc;
+    msaBlockForward(e.blocks[k], b, r.ones, r.ms[k], r.pairs[k], r.ms[k + 1], z, Cm, C);
+  }
+}
+// dz: the encoder's pair's gradient, replaced by z_init's; dsIn added
+inline void msaEncBackward(MsaEncoder& e, const MsaBatch& b, const MsaEncRun& r, const real* sIn, real* dz, real* dsIn) {
+  Scratch scratch;
+  const size_t R = (size_t)b.S * b.T, P = (size_t)b.T * b.T;
+  const int Cm = e.Cm, C = e.C, nb = (int)e.blocks.size();
+  real* dm = ARENA.zeros(R * Cm);
+  for (int k = nb; k-- > 0;) {
+    Scratch sc;
+    MsaEncoder::Block& bk = e.blocks[k];
+    real *mo = ARENA.get(R * Cm), *po = ARENA.get(P * C);
+    MsaBlockSave s = msaBlockForward(bk, b, r.ones, r.ms[k], r.pairs[k], mo, po, Cm, C);
+    real* dp = ARENA.get(P * C);
+    af3::pairformerBackward(bk.pair, {}, s.pb, r.ones, r.ones, nullptr, dz, nullptr, dp, nullptr, nullptr);
+    if (bk.hasPwa) {
+      { Scratch t; real* du = cloneR(dm, R * Cm); af3::gtBackward(bk.tr, s.tr, du, dm); }
+      { Scratch t; real* du = cloneR(dm, R * Cm); af3::pwaBackward(bk.pwa, s.pwa, b.mask, du, dm, dp); }
+    }
+    opmBackward(bk.opm, s.opm, b.mask, dp, dm);
+    GK(cudaMemcpyAsync(dz, dp, P * C * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
+  }
+  msaEmbedBwdK<<<blocks((size_t)35 * Cm), 256, 0, STREAM>>>(b.rows, b.del, b.mask, dm, e.embed.g, R, Cm);
+  real* dfi = ARENA.get((size_t)b.T * Cm);
+  sumRowsOverSK<<<blocks((size_t)b.T * Cm), 256, 0, STREAM>>>(dm, dfi, b.S, b.T, Cm);
+  e.project.backward(sIn, dfi, dsIn, b.T, true);
+}
+
 }  // namespace ef2
 }  // namespace grad
