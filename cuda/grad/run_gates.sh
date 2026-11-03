@@ -46,6 +46,8 @@ build cuda/grad/test-rfd4p -O1 cuda/grad/test_rfd4p.cu
 build cuda/grad/test-rfd4p-f64 -O2 -DGRAD_F64 cuda/grad/test_rfd4p.cu
 build cuda/grad/test-rfd4trunk -O1 cuda/grad/test_rfd4trunk.cu
 build cuda/grad/test-rfd4trunk-f64 -O2 -DGRAD_F64 cuda/grad/test_rfd4trunk.cu
+build cuda/grad/test-rfd4ae -O1 cuda/grad/test_rfd4ae.cu
+build cuda/grad/test-rfd4ae-f64 -O2 -DGRAD_F64 cuda/grad/test_rfd4ae.cu
 # AF2 against af3-any-model's jax.vjp: the float64 build on every dump (both sides float64 - no ReLU input can sit
 # within rounding of its kink on one side only), with the reference-free check beside it; the float32 build on the
 # single blocks. (The three-block stack in float32 holds ~2.7M ReLU inputs, and a tie among them is a coin toss on
@@ -106,5 +108,8 @@ run cuda/grad/test-rfd4p --layer=12      # (pair updates on even layers only)
 run cuda/grad/test-rfd4p-f64
 run cuda/grad/test-rfd4trunk
 run cuda/grad/test-rfd4trunk-f64
+run cuda/grad/test-rfd4ae
+run cuda/grad/test-rfd4ae --encoder
+run cuda/grad/test-rfd4ae-f64
 [ $fail = 0 ] && echo "ALL GATES PASS" || echo "SOME GATE FAILED"
 exit $fail
