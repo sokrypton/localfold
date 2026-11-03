@@ -36,6 +36,7 @@
  * AdaLN. They reuse the trunk's transition shader with two-pass variance.
  */
 import { createAddShader } from "../../runtime/execution.js";
+import { FLUSH_MIN_BYTES } from "../trunk/pair-track.js";
 import { GpuBufferAllocator } from "../../runtime/allocator.js";
 import { noteAllocation, noteDestroy } from "../../runtime/device-memory.js";
 import { pipelineCacheForDevice, settleAll } from "../../runtime/pipeline-cache.js";
@@ -1002,7 +1003,7 @@ export class Af3DiffusionConditioningGpu {
       const deferred = outSingle === undefined ? undefined : options.validation;
       if (deferred === undefined) this.device.pushErrorScope("validation");
       else deferred.begin();
-      const encoder = this.device.createCommandEncoder({ label: "af3-diffusion-conditioning" });
+      let encoder = this.device.createCommandEncoder({ label: "af3-diffusion-conditioning" });
       const batchPasses = deviceTuning(this.device).batchComputePasses !== false;
       let openPass = null;
       const passFor = (label) => {
@@ -1051,6 +1052,14 @@ export class Af3DiffusionConditioningGpu {
                 : [trunkPair, features, pairScale, pairProjection, sums, pair],
             pairLinear[0], pairLinear[1]);
       }
+      // A wide pair's passes are seconds at 600 tokens: a piece each, as the pair track's (encodePairTrack's flush).
+      const flush = () => {
+        if (reusePair !== undefined || pairs * pairChannels * 4 < FLUSH_MIN_BYTES) return;
+        endPass();
+        this.device.queue.submit([encoder.finish()]);
+        encoder = this.device.createCommandEncoder({ label: "af3-diffusion-conditioning" });
+      };
+      flush();
       run("single-initial", compiled.singleInitial,
           [trunkSingle, targetFeat, singleScale, singleProjection, noise, noiseWeights, single],
           tokens);
@@ -1065,6 +1074,7 @@ export class Af3DiffusionConditioningGpu {
           // pair-sized scratch and added back was one more pair tensor held.
           run(`pair-transition-${index}`, transitionPipelines.pair[index],
               [pair, transitionWeights.pair[index]], perPair[0], perPair[1]);
+          flush();
         }
         run(`single-transition-${index}`, transitionPipelines.single[index],
             [single, transitionWeights.single[index]],

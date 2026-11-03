@@ -63,9 +63,7 @@ import {
   compilePairTrack, encodePairTrack, packPairTrackWeights,
 } from "../af3/trunk/pair-track.js";
 import { settleGridAttendTiling } from "../af3/trunk/grid-attend-race.js";
-
-/** How long the queue may be, in milliseconds of work; see `submissionWindow`. */
-const QUEUED_WORK_MS = 1000;
+import { QueuePacer } from "../runtime/queue-pacing.js";
 
 /** ESMFold2-Experimental-Fast's `d_pair`. */
 export const PAIR_CHANNELS = 256;
@@ -358,12 +356,7 @@ export class Esmfold2TrunkGpu {
         : undefined;
       if (held !== undefined) Object.assign(held, { scratch, transitionSplit, projectMatrix, biasBuffer });
 
-      // Sixteen blocks in the queue is a third of a second at 150 tokens and forty seconds at 1400, all of it committed:
-      // Stop waits for it, and so does closing the tab. So the window is a time. It starts at one block, measures, and
-      // settles at about a second of queued work, which is nothing lost to a card that is never left idle.
-      let submissionWindow = options.submissionWindow ?? this.pacedWindow ?? 1;
-      let sinceDrain = 0;
-      let drainedAt = performance.now();
+      const pacer = new QueuePacer(this.device, { fixed: options.submissionWindow, start: this.pacedWindow });
       const validation = new DeferredValidation(this.device, "ESMFold2 trunk");
       const start = performance.now();
       for (let index = 0; index < blocks.length; index += 1) {
@@ -375,7 +368,7 @@ export class Esmfold2TrunkGpu {
         await this.#encodeBlock({
           block: blocks[index], n, channels, pipelines, storage, pending, weightPrecision,
           pair, pairMask, scratch, gridAttention, gridHeads, biasBuffer, transitionSplit,
-          projectMatrix,
+          projectMatrix, pacer,
         });
         validation.end(`block ${index}`);
         for (let at = pending.length - 1; at >= 0; at -= 1) pending[at].release();
@@ -399,16 +392,9 @@ export class Esmfold2TrunkGpu {
           void this.device.queue.onSubmittedWorkDone()
             .then(() => options.onBlockDone(submitted, blocks.length));
         }
-        sinceDrain += 1;
-        if (options.wait !== false && (sinceDrain >= submissionWindow || index === blocks.length - 1)) {
-          await this.device.queue.onSubmittedWorkDone();
-          const perBlock = (performance.now() - drainedAt) / sinceDrain;
-          if (options.submissionWindow === undefined) {
-            submissionWindow = Math.max(1, Math.min(16, Math.round(QUEUED_WORK_MS / perBlock)));
-            this.pacedWindow = submissionWindow;
-          }
-          sinceDrain = 0;
-          drainedAt = performance.now();
+        if (options.wait !== false) {
+          await pacer.blockSubmitted(index === blocks.length - 1);
+          this.pacedWindow = pacer.window;
         }
         // 🔴 AWAITED, SO A CALLER CAN YIELD. Every await above resolves from a
         // GPU promise, which is a microtask - so a page that only moved a
@@ -581,17 +567,15 @@ export class Esmfold2TrunkGpu {
       pass.dispatchWorkgroups(x, y, z);
       if (!batchPasses) pass.end();
     };
-    // A large block is seconds of work, so the sequential track hands it to the queue a piece at a time: a driver
-    // judges a hang by how long one submission keeps the card, and the desktop waits on the same queue.
     const flush = () => {
+      if (!context.pacer.pieceDue()) return;
       endPass();
       this.device.queue.submit([encoder.finish()]);
       encoder = this.device.createCommandEncoder({ label: "esmfold2-trunk-block" });
     };
     encodePairTrack({
       run, pipelines, n, channels, pair, pairMask, scratch, weights,
-      gridAttention, gridHeads, biasBuffer, transitionSplit, projectMatrix,
-      flush: pipelines.sequential === undefined ? undefined : flush,
+      gridAttention, gridHeads, biasBuffer, transitionSplit, projectMatrix, flush,
     });
     endPass();
     this.device.queue.submit([encoder.finish()]);
