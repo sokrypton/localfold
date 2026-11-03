@@ -15,3 +15,5 @@ test-msap
 test-msap-f64
 test-bioemu2
 test-bioemu2-f64
+test-rfd4p
+test-rfd4p-f64

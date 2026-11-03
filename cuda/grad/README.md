@@ -17,15 +17,37 @@ the opposite of each of those choices, so the training graph is written **beside
 
 ## Status
 
-| model | forward + backward (inputs and every parameter) | gate |
-|---|---|---|
-| AF2 Evoformer block - main stack, extra-MSA stack (global column attention), OPM first (multimer) or last (monomer) | **done** | `test-af2-block`, 5 dumps |
-| AF2 stack (48 + 4 blocks, rematerialised) | **done** (`af2::Stack`) | `test-af2-block` on a 3-block JAX stack: 255 parameter gradients, worst 0.60 of its bar |
-| AdamW (fused, global-norm clip) | **done** (`adam.cuh`) | `train-af2-smoke`: weights perturbed 10%, trained back - loss 918 -> 14.7 in 60 steps |
-| AF2 embedder, template stack, structure module, heads, losses | next | |
-| AF3 lineage (pairformer, MSA module, templates, diffusion, atom transformer, confidence) | planned | |
-| ESMFold2, BioEmu2 (has `vjp.cuh`: activations only), RFD4-P, MSA-P | planned | |
-| ESM-C / ESM2 (`cuda/plm`) | planned - esmc-cuda (sokrypton/esmc-cuda) is a complete trainer to port from | |
+Every port's main network has a training forward and backward. Two gates each (`run_gates.sh` runs all of them):
+the float32 forward held to the PORT's own float32 path on its real weights, and the float64 build's backward held
+to central differences of that same forward (`gradcheck.cuh`, below) - so the training graph computes what the
+port computes, and its gradient is the gradient of that.
+
+| port | what trains | forward vs the port | backward |
+|---|---|---|---|
+| **AF2** (`af2.cuh`) | Evoformer block, main and extra-MSA stacks, OPM first/last; the rematerialised 48-block stack | JAX `jax.vjp` in float64 (`oracle_af2_block.py`) | <= 3.3e-5, and 0.00-0.03 of the JAX bar |
+| **AF3 lineage**, nine families (`af3.cuh`, `af3diff.cuh`) | pairformer block (sequential, chai-1's parallel, Mol-1's PairMixer), MSA block (AF3, update-first, chai-1 grouped), the 24-block diffusion transformer (AdaLN, chai-1's raw AdaLN, Boltz-2's up-gate, rf3's q/k norm and noResidual) | `pairformerBlockAt`, `msaBlock`, `diffusionTransformer` <float>: 2e-7..3.3e-5 on af3, boltz2, protenix2, intellifold2, rosettafold3, opendde, openbind0, mol1, chai1 | <= 8.5e-6 under every dialect switch |
+| **ESMFold2** (`af3.cuh`, `msap.cuh`) | pair trunk blocks of the trunk, coda, LM and MSA encoders | `trunkBlock`: 1.9e-7..3.8e-7 | the pairformer's |
+| **ESM-C / ESM2** (`plm.cuh`) | the towers, ESM-C's sequence head, a masked-LM cross entropy | `esmcTower`, 36 layers: 5.8e-7 | <= 5.3e-7 |
+| **MSA Pairformer** (`msap.cuh`) | its layer: PWA, transition, query-biased OPM (differential sequence weights), pair block | the port's float32 path: <= 4.2e-7 | 2.6e-6 |
+| **BioEmu2** (`bioemu2.cuh`) | MSA layer and PairMixer layer (Boltz modules, stacked (out, in) weights) | `pairWeightedAveraging`/`transition`/`outerProductMean`/`trimul`: <= 2.1e-6 | <= 2.1e-6 |
+| **RFD4-Proteina** (`rfd4p.cuh`) | token layer (RMS AdaLN, pair-biased attention, SwiGLU, output scales) and pair update | `tokenLayer`/`pairReprUpdate` <float>: 5e-8 / 1.6e-7 | 1.9e-6 |
+
+Not yet: the input embedders, templates and heads around those networks (AF2's structure module and heads, AF3's
+atom encoder/decoder and confidence head, ESMFold2's atom stack and diffusion module, BioEmu2's denoiser,
+RFD4-P's encoder/decoder glue). The layers they are made of are mostly here already.
+
+Also: AdamW (`adam.cuh`); `train-af2-smoke` - real weights perturbed 10% and trained back, loss 918 -> 14.7 in 60
+steps.
+
+## The reference-free gate (`gradcheck.cuh`)
+
+The whole library is written on `real`, float or (`-DGRAD_F64`) double. In double, each tensor's analytic gradient
+dotted with a random direction is held to a Richardson-extrapolated central difference of the same forward, the
+outputs differenced elementwise (never two large losses subtracted), at h = 1e-7 x the tensor's RMS: a correct
+gradient reads ~1e-6, and deleting one term of the LayerNorm backward reads 1.5 (74 tensors fail). Up to three
+directions a tensor, because a ReLU input within h of its kink spoils one direction and a wrong gradient all of them.
+🔴 A loss over padded positions is not defined: a query masked in every key has logits q.k - 1e9, and even float64
+rounds q.k there to 1e-7, so every gate's cotangent is zero on padding - as a loss over real residues is.
 
 ## The gate
 
