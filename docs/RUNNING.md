@@ -115,7 +115,12 @@ most of it is not the triangle's cube yet: at 76 tokens the helper threads sat i
 of the fold, waiting on single-threaded JavaScript, which is why one thread is only 2.5 times slower
 than eight.
 
-Without isolation (a browser with no service worker) the fold runs on one thread. The kernels
+A fold's system memory grows with the square of the tokens: 2.8 GiB at 76, 4.9 at 300 and 10.0 at 600 at its fullest, on
+300M with eight threads (2230 s at 600). The line beside Fold works from this and offers the CPU only where it fits in 70%
+of what the browser reports.
+
+Without isolation (Safari, which has no `credentialless`, or a browser with no service worker) the fold runs on one thread, and the
+line beside Fold says so. The kernels
 here are the references in `cpu/`, with their matrix multiplies, triangle contractions and logistics in generated
 WebAssembly SIMD (`cpu/runtime/`). `npm run test:cpu` drives the whole path through the page.
 
