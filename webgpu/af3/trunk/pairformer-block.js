@@ -104,6 +104,7 @@ function projectMatrixConfig(device, channels) {
 }
 import { DeferredValidation } from "../../runtime/validation.js";
 import { GpuBufferAllocator } from "../../runtime/allocator.js";
+import { QueuePacer, firstWindow } from "../../runtime/queue-pacing.js";
 import { pipelineCacheForDevice } from "../../runtime/pipeline-cache.js";
 import { releaseResidentWeights, residentWeightBuffer } from "../../runtime/resident.js";
 import { storageBytes } from "../../runtime/storage.js";
@@ -114,7 +115,7 @@ import { splitTransitionConfig, pairTransitionArithmetic, transitionRowTile } fr
 import { allocateGridProjectMatrix, gridProjectMatrixConfig }
   from "./grid-project-matrix.js";
 import {
-  GRID_WIDTH, PAIR_SCRATCH_COUNT, UNPACKED_PAIR_SCRATCH,
+  FLUSH_MIN_BYTES, GRID_WIDTH, PAIR_SCRATCH_COUNT, UNPACKED_PAIR_SCRATCH,
   compilePairTrack, encodePairTrack,
   packPairTrackWeights,
 } from "./pair-track.js";
@@ -511,6 +512,13 @@ export class Af3PairformerStackGpu {
         && projectMatrixConfig(this.device, pairChannels),
       // ...and grid attention's projection, by the same width rule.
       gridProjectMatrix: pairMatrixKernels && gridProjectMatrixConfig(this.device, pairChannels),
+      // ...and a large pair a piece at a time, in about half the memory: same bits (check-af3-sequential.js)
+      sequentialTriangle: options.sequentialTriangle ?? deviceTuning(this.device).sequentialTriangle ?? true,
+      sequentialGroups: options.sequentialGroups,
+      sequentialChunkBytes: options.sequentialChunkBytes,
+      sequentialContractWork: options.sequentialContractWork,
+      sequentialHiddenParts: 1,
+      ...(options.forceCompact === true ? { forceCompact: true } : {}),
       maxComputeWorkgroupStorageSize: this.device.limits.maxComputeWorkgroupStorageSize,
       maxStorageBufferBindingSize: this.device.limits.maxStorageBufferBindingSize,
       minStorageBufferOffsetAlignment: this.device.limits.minStorageBufferOffsetAlignment,
@@ -653,10 +661,11 @@ export class Af3PairformerStackGpu {
         gridHeads * (blocks[0]?.pairAttention1?.dimension ?? 0));
       const scratch = [];
       for (let index = 0; index < pipelines.pairScratchCount; index += 1) {
+        // (reuseLarger: Mol-1's pairformer is narrower than the stacks before it, and took a second set beside theirs)
         scratch.push(keep((options.scratchAllocator ?? this.allocator).allocate(
           `af3-block.scratch${index}`,
           pipelines.pairScratchBytes(index,
-  storageBytes(pairs * attentionWidth, UNPACKED_PAIR_SCRATCH[index])), storage)));
+  storageBytes(pairs * attentionWidth, UNPACKED_PAIR_SCRATCH[index])), storage, { reuseLarger: true })));
       }
       const transitionSplit = pipelines.transitionSplit === undefined ? undefined
         : allocateTransitionSplit(this.allocator, {
@@ -665,7 +674,8 @@ export class Af3PairformerStackGpu {
           chunkRows: pipelines.transitionSplit.chunkRows,
           precision: pipelines.transitionSplit.storage,
           offsets: packTransitionWeights(blocks[0].pairTransition).offsets,
-          scratch,
+          // (the sequential track's first buffer is the row chunks, too small for either; see the ESMFold2 trunk)
+          scratch: pipelines.sequential === undefined ? scratch : [scratch[2], scratch[1]],
           label: "af3-block.transition",
         }, keep);
       // Uploaded once for the stack, not per block: it is the same tensor for
@@ -706,8 +716,12 @@ export class Af3PairformerStackGpu {
       // wait is a full pipeline drain, so a narrow window spends most of the
       // stack refilling; past sixteen the curve is flat and the remaining
       // waits are cheap insurance against an unbounded queue.
-      const submissionWindow = options.submissionWindow
-        ?? shapedKnob(deviceTuning(this.device).pairformerSubmissionWindow) ?? 16;
+      // ...and at 600 tokens sixteen blocks of OpenDDE are sixteen seconds nothing can take back, so the most is what
+      // a second of work allows: see QueuePacer.
+      const pacer = new QueuePacer(this.device, {
+        fixed: options.submissionWindow ?? shapedKnob(deviceTuning(this.device).pairformerSubmissionWindow),
+        start: firstWindow(pairBytes >= FLUSH_MIN_BYTES),
+      });
       // 🔴 THE CALLER READS BACK, WHEN IT SAYS SO. The trunk reads this stack's
       // pair and single in the same submit as the distogram, so a pass ends in
       // ONE drain instead of this stack's and then the head's. On that path the
@@ -741,7 +755,7 @@ export class Af3PairformerStackGpu {
           pairChannels, singleChannels, extraPairBias,
           weightPrecision, pairWeightPrecision,
           pair, single, pairMask, seqMask, scratch, biasBuffer, pairLogits, singleScratch,
-          transitionSplit, projectMatrix, gridProjectMatrix,
+          transitionSplit, projectMatrix, gridProjectMatrix, pacer,
         });
         encodeMilliseconds += performance.now() - encodeStart;
         validation.end(`block ${index}`);
@@ -765,13 +779,12 @@ export class Af3PairformerStackGpu {
         if (options.onBlockDone !== undefined) {
           const submitted = index + 1;
           void this.device.queue.onSubmittedWorkDone()
-            .then(() => options.onBlockDone(submitted, blocks.length));
+            .then(() => options.onBlockDone(submitted, blocks.length)).catch(() => {});
         }
         const last = index === blocks.length - 1;
-        if (((index + 1) % submissionWindow === 0 && !(last && deferReadback))
-          || (last && !deferReadback)) {
+        if (!(last && deferReadback)) {
           const waitStart = performance.now();
-          await this.device.queue.onSubmittedWorkDone();
+          await pacer.blockSubmitted(last);
           waitMilliseconds += performance.now() - waitStart;
         }
         // 🔴 AWAITED, SO A CALLER CAN YIELD. Every await above resolves from a
@@ -1056,7 +1069,7 @@ export class Af3PairformerStackGpu {
     // so a CPU reference sharing the same weights still works, just slower.
     if (this.residentWeights) releaseWeights(block);
 
-    const encoder = this.device.createCommandEncoder({ label: "af3-pairformer-block" });
+    let encoder = this.device.createCommandEncoder({ label: "af3-pairformer-block" });
     // 🔴 A BUFFER ARGUMENT MAY BE A SLICE OF ONE, WHICH IS HOW THE PAIR TRACK
     // RUNS IN LESS MEMORY. Every pass in that track indexes its pair-shaped
     // buffers so that a range of ROWS is a contiguous range of bytes - a pair
@@ -1093,11 +1106,17 @@ export class Af3PairformerStackGpu {
     };
     const spread = (groups) => [Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH)];
     const ceil = (value, divisor) => Math.ceil(value / divisor);
+    const large = context.pipelines.sequential !== undefined || pairs * pairChannels * 4 >= FLUSH_MIN_BYTES;
+    const flush = () => context.pacer.pieceEnded(() => {
+      endPass();
+      this.device.queue.submit([encoder.finish()]);
+      encoder = this.device.createCommandEncoder({ label: "af3-pairformer-block" });
+    });
 
     encodePairTrack({
       run, pipelines, n, channels: pairChannels, gridHeads, pair, pairMask, gridAttention: context.gridAttention,
       scratch, biasBuffer, transitionSplit, projectMatrix, gridProjectMatrix,
-      weights: pairTrackWeights,
+      weights: pairTrackWeights, flush,
     });
 
     // 🔴 AFTER the five, never before.
@@ -1109,14 +1128,17 @@ export class Af3PairformerStackGpu {
           ? [pair, logitsWeights, logitsWeights, pairLogits]
           : [pair, logitsWeights, logitsWeights, pairLogits, extraPairBias],
         linear[0], linear[1]);
+    if (large) flush();
 
     const singleTiles = ceil(n, pipelines.singleProjectRows);
     run("single.project", pipelines["single:project"],
         [single, singleWeights, singleScratch[0], singleScratch[1], singleScratch[2],
          singleScratch[3]], singleTiles * pipelines.singleProjectSplits);
+    if (large) flush();
     run("single.attend", pipelines["single:attend"],
         [singleScratch[0], singleScratch[1], singleScratch[2], pairLogits, seqMask,
          singleScratch[4]], n * heads);
+    if (large) flush();
     run("single.project-out", pipelines["single:project_out"],
         [singleScratch[4], singleScratch[3], singleWeights, single], singleTiles);
 

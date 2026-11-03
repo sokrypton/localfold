@@ -19,6 +19,7 @@
  * decay, a readout and a second trunk as a coda. Both files define a
  * `folding_trunk` and a `z_init`; neither names the other. See CLAUDE.md.
  */
+import { fastLinear } from "../runtime/linear-backend.js";
 
 /** LayerNorm over the last axis, with scale and offset. */
 function layerNorm(input, rows, channels, scale, offset, epsilon = 1e-5) {
@@ -43,6 +44,8 @@ function layerNorm(input, rows, channels, scale, offset, epsilon = 1e-5) {
 
 /** rows x inChannels against (inChannels, outChannels). */
 function linear(input, rows, inChannels, outChannels, weights) {
+  const fast = fastLinear(input, rows, inChannels, weights, outChannels);
+  if (fast !== undefined) return fast;
   const out = new Float32Array(rows * outChannels);
   for (let row = 0; row < rows; row += 1) {
     const inBase = row * inChannels;

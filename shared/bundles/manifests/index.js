@@ -34,6 +34,7 @@
  * makes the URL immutable, which is also what lets the browser cache it
  * forever.
  */
+import { ModelDownloadError } from "../http-tensor-store.js";
 export const MODEL_BUNDLES = {
   monomer: {
     model: "model_1_ptm",
@@ -548,5 +549,10 @@ export async function loadManifest(family) {
     throw new RangeError(`unknown model family ${family}:`
       + ` expected ${Object.keys(MODEL_BUNDLES).join(" or ")}`);
   }
-  return (await bundle.load()).MANIFEST;
+  try {
+    return (await bundle.load()).MANIFEST;
+  } catch (cause) {
+    // A chunk of this page that will not come is a reader who went offline after opening it.
+    throw new ModelDownloadError(`failed to load the manifest of ${family}: ${cause.message}`, "offline, or the site is out of reach");
+  }
 }

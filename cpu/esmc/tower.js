@@ -1,3 +1,4 @@
+import { fastLinear } from "../runtime/linear-backend.js";
 // ESM-C's tower and ESMFold2's language-model shim, on the CPU.
 //
 // The reference the WebGPU tower is checked against, and the place the
@@ -84,6 +85,8 @@ export function layerNorm(values, rows, channels, scale, offset, eps = 1e-5) {
  * transpose per fold or a second kernel.
  */
 export function linear(input, rows, inner, weights, outer) {
+  const fast = fastLinear(input, rows, inner, weights, outer);
+  if (fast !== undefined) return fast;
   const out = new Float32Array(rows * outer);
   for (let row = 0; row < rows; row += 1) {
     const source = row * inner;
@@ -122,7 +125,7 @@ export function applyRope(values, rows, heads, headDim, base = 10000) {
 }
 
 /** Full self-attention. q/k/v are (rows, heads, headDim); returns (rows, heads*headDim). */
-export function esmcAttention(query, key, value, rows, heads, headDim) {
+export function esmcAttention(query, key, value, rows, heads, headDim, sequenceId = undefined) {
   const out = new Float32Array(rows * heads * headDim);
   const scale = 1 / Math.sqrt(headDim);
   const weights = new Float32Array(rows);
@@ -131,6 +134,11 @@ export function esmcAttention(query, key, value, rows, heads, headDim) {
       const qBase = (i * heads + head) * headDim;
       let largest = -Infinity;
       for (let j = 0; j < rows; j += 1) {
+        // A complex is one packed run, and a chain attends only to itself.
+        if (sequenceId !== undefined && sequenceId[i] !== sequenceId[j]) {
+          weights[j] = -Infinity;
+          continue;
+        }
         const kBase = (j * heads + head) * headDim;
         let dot = 0;
         for (let d = 0; d < headDim; d += 1) dot += query[qBase + d] * key[kBase + d];
@@ -187,7 +195,7 @@ export function esmcBlock(x, rows, weights, dims, layer) {
   applyRope(query, rows, heads, headDim);
   applyRope(key, rows, heads, headDim);
 
-  const context = esmcAttention(query, key, value, rows, heads, headDim);
+  const context = esmcAttention(query, key, value, rows, heads, headDim, dims.sequenceId);
   const attention = linear(context, rows, model, at("attn_out/weights"), model);
 
   const afterAttention = new Float32Array(rows * model);

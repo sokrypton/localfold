@@ -3,6 +3,7 @@ import { carriesTensor } from "../../../shared/weights/weight-sources.js";
 import { packNamedWeights } from "../../../shared/weights/weight-pack.js";
 import { deviceTuning, halfPrecisionAvailable } from "../../runtime/device-profile.js";
 import { residentPackedOnDevice } from "../weights/device-weights.js";
+import { rowPieces } from "../trunk/sequential-groups.js";
 import { SOURCES } from "../../../shared/af3/weights/weights.js";
 import { createAttentionRegisterFlashShader, createAttentionSplitCombineShader }
   from "../../kernels/attention.js";
@@ -55,6 +56,7 @@ import { GpuMemoryBudgetError, noteResidencyRefused, residencyAllowed,
 import { isStreamed, releaseResidentWeights, residentWeightBuffer } from "../../runtime/resident.js";
 import { pipelineCacheForDevice } from "../../runtime/pipeline-cache.js";
 import { DeferredValidation } from "../../runtime/validation.js";
+import { QueuePacer } from "../../runtime/queue-pacing.js";
 import { releaseWeights } from "../../../shared/af3/weights/weights.js";
 import { deviceSaturationWorkgroups } from "../../runtime/occupancy.js";
 import { deviceDerivationsAllowed } from "../../runtime/device-profile.js";
@@ -86,6 +88,17 @@ export function pairLogitsCacheBytes(device) {
 }
 
 const GRID_WIDTH = 32_768;
+/** Below this a stack is about 8 ms on an A10, and keeps its one submission. */
+const STACK_PIECES_MIN_TOKENS = 150;
+/**
+ * Rows x pair channels^2 in one dispatch of the pair logits. Not the kernel's multiply-adds, because two things set its time and
+ * they pull apart. Each dispatch costs about 1 ms before it reads anything, which is all OpenDDE's 128 channels over 1154 tokens
+ * notice: 16.3 s of stack at 19 pieces a block against 10.2 at one, on an A10 at 600 residues. And many wide rows in one dispatch
+ * run several times slower, why is not known, which is all IntelliFold-2's 512 notice: 5.9 s at 20 pieces, 20.1 at 4 and 20.6 at one.
+ */
+const PAIR_LOGITS_STEP_WORK = 5e9;
+/** WebGPU's default minUniformBufferOffsetAlignment, the most a device may ask, and this one asks for no better. */
+const UNIFORM_STRIDE = 256;
 
 export const BLOCK_ORDER = [
   "SingleCondLayerNormScale", "SingleCondScaleWeights", "SingleCondScaleBias", "SingleCondBias",
@@ -651,11 +664,13 @@ const PER_SUPER: u32 = ${perSuper}u;
 // c * PER_SUPER * HEADS + INNER * HEADS, and HEADS is sixteen.
 @group(0) @binding(2) var<storage, read> projection: array<vec4<f32>>;
 @group(0) @binding(3) var<storage, read_write> logits: array<f32>;
+// The rows this dispatch owns, first and past the last; see PAIR_LOGITS_STEP_WORK.
+@group(0) @binding(4) var<uniform> row_range: vec4<u32>;
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let row = id.x + id.y * GRID_WIDTH * 64u;
-  if (row >= PAIRS) { return; }
+  let row = row_range.x + id.x + id.y * GRID_WIDTH * 64u;
+  if (row >= row_range.y) { return; }
   let base = row * C_PAIR;
   // The pair LayerNorm (two-pass, no offset), in the row's own thread: a
   // normalised copy of the pair would be one more pair-sized tensor held for
@@ -691,11 +706,12 @@ const PER_SUPER: u32 = ${perSuper}u;
 @group(0) @binding(2) var<storage, read> projection: array<vec4<f32>>;
 ${Array.from({ length: perSuper }, (_, i) =>
   `@group(0) @binding(${3 + i}) var<storage, read_write> logits_${i}: array<f32>;`).join("\n")}
+@group(0) @binding(${3 + perSuper}) var<uniform> row_range: vec4<u32>;
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let row = id.x + id.y * GRID_WIDTH * 64u;
-  if (row >= PAIRS) { return; }
+  let row = row_range.x + id.x + id.y * GRID_WIDTH * 64u;
+  if (row >= row_range.y) { return; }
   let base = row * C_PAIR;
   var sum = 0.0;
   for (var c = 0u; c < C_PAIR; c += 1u) { sum += pair_cond[base + c]; }
@@ -2334,6 +2350,11 @@ export class Af3DiffusionTransformerGpu {
    * recycled) rebuilds rather than binding something else.
    */
   #bindGroups = new Map();
+  #pacers = new Map();
+  #pacerFor(kindOfCall) {
+    if (!this.#pacers.has(kindOfCall)) this.#pacers.set(kindOfCall, new QueuePacer(this.device));
+    return this.#pacers.get(kindOfCall);
+  }
 
   /**
    * The stack's scratch tensors, kept across calls.
@@ -2374,6 +2395,7 @@ export class Af3DiffusionTransformerGpu {
   dispose() {
     this.#releasePairLogits();
     this.#bindGroups.clear();
+    this.#pacers.clear();
     if (this.#scratch !== undefined) {
       for (const [label, entry] of Object.entries(this.#scratch.buffers)) {
         entry.buffer.destroy();
@@ -3048,6 +3070,22 @@ export class Af3DiffusionTransformerGpu {
         ? scratch("difftx.pair-scale", pairChannels * 4, storage | GPUBufferUsage.COPY_DST)
         : undefined;
       if (computesLogits) write(pairScale, weights.pairInputLayerNormScale);
+      // 🔴 THE PAIR LOGITS GO IN PIECES, AND ONLY THE KERNEL CAN CUT THEM. One dispatch was 55 ms on an A10 at 600 tokens of
+      // IntelliFold-2, 325 of them a fold because the blocks past the cache recompute theirs every call, and
+      // webgpu/runtime/queue-pacing.js says why that is too long. Every piece's rows are a window onto one uniform buffer.
+      const logitsPieces = (blocks) => {
+        const pieces = rowPieces(pairs, pairChannels * pairChannels * blocks, PAIR_LOGITS_STEP_WORK, 64);
+        const words = new Uint32Array(pieces.length * UNIFORM_STRIDE / 4);
+        pieces.forEach(({ first, count }, at) => words.set([first, first + count], at * UNIFORM_STRIDE / 4));
+        const ranges = scratch(`difftx.logits-rows.${blocks}`, words.byteLength,
+          GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
+        write(ranges, words);
+        return pieces.map(({ count }, at) => ({
+          count, range: { allocation: ranges, offset: at * UNIFORM_STRIDE, size: 16 },
+        }));
+      };
+      const blockLogitsPieces = computesLogits ? logitsPieces(1) : [];
+      const superLogitsPieces = computesLogits && perSuper >= 2 ? logitsPieces(perSuper) : [];
       if (buildPairLogits) {
         this.#releasePairLogits();
         const buffers = [];
@@ -3299,6 +3337,15 @@ export class Af3DiffusionTransformerGpu {
        * is only overwritten after the passes reading it have run. This is the
        * pairformer stack's idiom, for the same reason.
        */
+      // 🔴 A LONG STACK GOES IN PIECES, EACH DISPATCH A PLACE IT CAN BE CUT: four blocks were 187 ms on an A10 at 600 tokens of
+      // IntelliFold-2, and webgpu/runtime/queue-pacing.js says why that is too long. A call that builds the pair logits holds
+      // dispatches the others do not, so each kind of call times its own pieces. What it submits owns no upload to release.
+      const pacer = tokens < STACK_PIECES_MIN_TOKENS ? undefined : this.#pacerFor(`${tokens}:${buildPairLogits}`);
+      const send = () => {
+        endPass();
+        this.device.queue.submit([encoder.finish()]);
+        encoder = this.device.createCommandEncoder({ label: "difftx.stack" });
+      };
       const flush = (label) => {
         endPass();
         this.device.queue.submit([encoder.finish()]);
@@ -3358,8 +3405,18 @@ export class Af3DiffusionTransformerGpu {
           // entry per label would be a cache that misses every time and
           // rebuilds - or, worse, hits and binds block 0's weights.
           const at = groupIndex * perSuper + inner;
-          const runBlock = (label, pipeline, buffers, x, y = 1, z = 1) =>
+          const runBlock = (label, pipeline, buffers, x, y = 1, z = 1) => {
             run(label, pipeline, buffers, x, y, `${label}:${at}`, z);
+            pacer?.pieceEnded(send);
+          };
+          const runLogits = (pipeline, pieces, outputs) => {
+            for (const [piece, { count, range }] of pieces.entries()) {
+              const groups = Math.ceil(count / 64);
+              run("pair-logits", pipeline, [pairBuffer, pairScale, projection, ...outputs, range],
+                  Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH), `pair-logits:${at}:${piece}`);
+              pacer?.pieceEnded(send);
+            }
+          };
           const logits = logitsFor(at);
           if (noResidual && !batchedGates) {
             const copyGroups = Math.ceil((rows * channels) / (shape.lanes ?? 256));
@@ -3372,17 +3429,11 @@ export class Af3DiffusionTransformerGpu {
             && compiled.pairLogitsSuper !== undefined;
           if (superPairLogits) {
             if (inner === 0) {
-              const pairGroups = Math.ceil(pairs / 64);
-              runBlock("pair-logits", compiled.pairLogitsSuper,
-                  [pairBuffer, pairScale, projection,
-                   ...Array.from({ length: perSuper }, (_, i) => logitsFor(firstInGroup + i))],
-                  Math.min(pairGroups, GRID_WIDTH), Math.ceil(pairGroups / GRID_WIDTH));
+              runLogits(compiled.pairLogitsSuper, superLogitsPieces,
+                  Array.from({ length: perSuper }, (_, i) => logitsFor(firstInGroup + i)));
             }
           } else if (buildPairLogits || at >= cached) {
-            const pairGroups = Math.ceil(pairs / 64);
-            runBlock("pair-logits", compiled.pairLogits[inner],
-                [pairBuffer, pairScale, projection, logits],
-                Math.min(pairGroups, GRID_WIDTH), Math.ceil(pairGroups / GRID_WIDTH));
+            runLogits(compiled.pairLogits[inner], blockLogitsPieces, [logits]);
           }
           if (normKSplits > 1) {
             runBlock("adaln", compiled.adaln, [condNormalised, blockWeights, normPartials],
@@ -3531,6 +3582,7 @@ export class Af3DiffusionTransformerGpu {
       // cache marked ready before it is filled is one attend reads as noise.
       this.#pairLogits.ready = true;
       this.#pairCondSeen = pairCond;
+      await pacer?.blockSubmitted();
       // 🔴 THE PAIR PROJECTIONS ARE RELEASED AFTER THE SUBMIT, NOT INSIDE THE
       // LOOP. They are pooled, so releasing one while a later block's encoded
       // pass still refers to it would hand the same buffer to that block's

@@ -2371,6 +2371,61 @@ that fits is.
 
 ---
 
+## 🔴 Stock Chrome on NVIDIA under Linux folded on noise, and the gate had written it down (2026-11-02)
+
+`uploadNarrow` decoded ESM-C's large matrices to f16 into half-sized buffers on every device, and on a device with no
+`shader-f16` the tower's shaders compile to f32. A stream of halves read as floats is not an error: nothing throws, the
+language model's output is noise, and the fold goes on to finish on it. Chrome offers no `shader-f16` on NVIDIA over Vulkan,
+so that was every fold on such a machine unless a flag said otherwise.
+
+| stock Chrome, ubiquitin, A10 and T4 | before | now |
+|---|---:|---:|
+| 300M | pLDDT 52.1, pTM 0.187 | pLDDT 87.0, pTM 0.859 |
+| 600M | pLDDT 55.6, pTM 0.213 | pLDDT 88.2, pTM 0.883 |
+
+It reproduces anywhere by hiding the capability: `fold-esmfold2` on an RTX 3070 reads 53.834 and 0.2318 with f16 off and 73.341
+and 0.5410 with it on, and with the fix 73.346 and 73.341. The two arms now round differently and agree.
+
+**The gate had this as its expected answer.** `tools/gate-baseline.json` held 53.834 for ESMFold2's stock arm, eleven lines
+from 73.342 in the others, and `test:stock` passed for as long as a fold kept reproducing it: a run held to its own past says
+nothing about a past that was wrong. `test/gate-baseline.test.js` now fails when a model's confidence differs across the arms.
+
+## How long a fold each card holds (2026-11-02)
+
+A fold's pair tensors grow with the square of its residues, and now one at a time (`docs/PERF.md`), so what a card holds is what
+`webgpu/esmfold2/memory-plan.js` says it holds:
+
+| card | what one fold may hold | longest fold, `shader-f16` | without it |
+|---:|---:|---:|---:|
+| 3 GiB | 1.8 GiB | 667 | 580 |
+| 4 GiB | 2.4 GiB | 851 | 784 |
+| 6 GiB | 3.6 GiB | 1133 | 1084 |
+| 8 GiB | 4.8 GiB | 1357 | 1317 |
+| 10 GiB | 6.8 GiB | 1666 | 1632 |
+| 12 GiB | 8.8 GiB | 1925 | 1897 |
+| 16 GiB and more | 12.8 GiB | 2047 | 2047 |
+
+**2047 is WebGPU's and not a card's.** Every pair-sized tensor is several buffers past one binding's reach and is bound a chunk
+at a time, but the contraction's output is read across all its channels at once, from two buffers.
+
+**The table is held to its edges.** `tools/check-robustness.py --group sizes` sets a limit, finds the longest fold the line beside
+Fold accepts under it, folds that, and has the next residue refused before anything starts. An A10 under 1.5, 2, 3, 4.8 and 6.4
+GiB folded 443, 655, 946, 1317 and 1574 residues under stock Chrome, and 553, 734, 1002, 1357 and 1609 with `shader-f16` alone,
+which is what Windows and macOS offer.
+
+On an RTX 3070 (4.8 GiB, from a reader's Windows Chrome, one fold each), on the code before the sampler's pieces, which shorten
+a submission and not a fold:
+
+| residues | 300M | MiB, allocator / card | longest submission | 600M | MiB, allocator / card | longest submission |
+|---:|---:|---:|---:|---:|---:|---:|
+| 800 | 55.6 s | 3102 / 4092 | 317 ms | 49.9 s | 3134 / 4109 | 351 ms |
+| 1000 | 78.3 s | 4248 / 5117 | 476 ms | 74.6 s | 4271 / 5060 | 478 ms |
+| 1200 | 119 s | 4581 / 5254 | 682 ms | 116 s | 4605 / 5407 | 685 ms |
+| 1350 | 154 s | 4646 / 5634 | 878 ms | 150 s | 4678 / 5649 | 864 ms |
+
+And past what one buffer can bind, 2 GiB, which is where this used to stop: 300M on an A10 folds 1448 residues in 189 s, 1800 in
+357 s and 2046 in 516 s, holding 13.2 GiB; 600M on an H100 folds 2046 in 165 s.
+
 # Before the port: can a language model replace the MSA search?
 
 What follows was written while nothing here shipped, and it answers one

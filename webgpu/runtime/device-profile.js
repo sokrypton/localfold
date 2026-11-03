@@ -453,6 +453,12 @@ export const DEFAULT_TUNING = Object.freeze({
   // dispatch, and one that does not fill the device leaves it idle - so a card
   // with room should raise it. See transitionSplitChunkRows.
   pairTransitionChunkBytes: null,
+  // How many channel groups the sequential triangle takes; null is the rule, as few as fit (webgpu/af3/trunk/sequential-groups.js)
+  sequentialGroups: null,
+  // ...and `false` keeps the AF3 stacks and ESMFold2's trunk on the channel-chunked track it replaced: the control arm
+  sequentialTriangle: null,
+  // Multiply-adds a dispatch of the AF3 conditioning's pair kernels and its distogram; null is theirs, about 200 ms on an A10.
+  pairHeadStepWork: null,
   // 🔴 THE VECTOR SPLIT'S GEMM BLOCK, PER ARITHMETIC: { f32: "RxCxK", f16: "RxCxK" }; null (or a block the device
   // cannot stage) is VECTOR_GEMM_BLOCK. See vectorGemmBlockStorage in webgpu/af3/trunk/transition.js.
   vectorGemmBlock: null,

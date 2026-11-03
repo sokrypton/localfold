@@ -26,22 +26,23 @@ import { AlphaFoldUnifiedGpu } from "../webgpu/af2/multimer/model.js";
 import { blankChainColumns, foldsAsSingleSequence, parseA3m }
   from "../shared/input/a3m.js";
 import { mergeJobAlignments } from "../shared/input/chains.js";
+import { ModelDownloadError } from "../shared/bundles/http-tensor-store.js";
 import { planRecycleReuse } from "../shared/af2/model/recycle-convergence.js";
 // 🔴 mergeSearchedChains IS USED ONLY WHEN A SEARCH IS REUSED, which is why it
 // shipped missing from this list. That path needs a cache from an earlier fold
 // AND more than one chain, so a first fold never reaches it - and stopping a
 // fold partway is one of the few ways to get a filled cache and then fold
 // again. test/module-references.test.js now looks for the whole class.
-import { generateMmseqs2ComplexMsa, generateMmseqs2Msa, mergeSearchedChains,
+import { AlignmentServerError, generateMmseqs2ComplexMsa, generateMmseqs2Msa, mergeSearchedChains,
   expandSearchedChains, planSearchReuse, searchCacheEntry, singleSequenceA3m }
   from "../shared/input/mmseqs2-api.js";
-import { isAbortError, throwIfAborted } from "../webgpu/runtime/abort.js";
+import { isAbortError, throwIfAborted, withAbort } from "../webgpu/runtime/abort.js";
 import { GpuMemoryBudgetError, setMemoryBudget }
   from "../webgpu/runtime/device-memory.js";
 import { AF3_COUNTS, af3SequenceProblem, alphaCarbons, fittedPdb, foldAf3,
-  loadAf3Weights, toPoints, warmAf3Pipelines } from "./af3-model.js";
+  loadAf3Weights, releaseAf3Weights, toPoints, warmAf3Pipelines } from "./af3-model.js";
 import { actualSteps, ESMFOLD2_COUNTS, ESMFOLD2_SAMPLER_MODE, esmfold2StepsFor, languageModelRunner,
-  loadEsmfold2Weights } from "./esmfold2-model.js";
+  loadEsmfold2Weights, releaseEsmfold2Weights } from "./esmfold2-model.js";
 import { SAMPLER_PRESETS, foldEsmfold2 } from "../webgpu/esmfold2/fold.js";
 import { spreadOverAtoms, toDensePositions } from "../shared/esmfold2/featurise.js";
 import { toPdb } from "../webgpu/af3/fold.js";
@@ -58,7 +59,15 @@ import { chainGeometryOf, chainGeometryVerdict } from "../shared/af3/chain-geome
 import { ccdUrl, parseCcdComponent } from "../shared/af3/featurise/ccd-component.js";
 import { smilesComponent } from "../shared/chem/component.js";
 import { GpuBufferAllocator } from "../webgpu/runtime/allocator.js";
-import { getDevice, loadModel, releaseModel } from "./model.js";
+import { getDevice, loadModel, onDeviceFault, planningGpu, releaseDevice, settleHeldDevice, releaseModel } from "./model.js";
+import { gpuName, learnFromLoss } from "./gpu-limits.js";
+import { settleBrowserBenchmark } from "./chrome-benchmark.js";
+import { computePreference, cpuThreads, cpuThreadsOnceIsolated, installSettings, useCpuForNow } from "./settings-panel.js";
+import { describePlan, describeRefusal, noteFold, planEsmfold2, planMeasuredModel, readFoldRates, roughDuration }
+  from "./compute-plan.js";
+import { beginFold, showProgressInTitle } from "./fold-guard.js";
+import { installViewerTheme } from "./viewer-theme.js";
+import { cpuFoldLoaded, foldEsmfold2OnCpu, releaseCpuFold } from "./esmfold2-cpu.js";
 import { releaseAllWeights } from "../webgpu/runtime/resident.js";
 import { AF3_FAMILIES, ALL_ATOM_FAMILIES, BIOEMU2_FAMILIES, MODEL_BUNDLES, MODELS_WITHOUT_CONFIDENCE,
   SINGLE_SEQUENCE_FAMILIES, graphFamily }
@@ -85,6 +94,7 @@ import {
 import { looksLikeZip, readZip, writeZip } from "./zip.js";
 import { createEntityList } from "./entity-ui.js";
 import { buildTemplate, describeCoverage, fetchStructure, mergeAtom37Templates, parseSource } from "./template-source.js";
+import { IMPOSSIBLE_FOLD, isImpossibleFold } from "./impossible-fold.js";
 import { fetchMmseqs2Templates } from "../shared/input/mmseqs2-api.js";
 import { RuntimeEstimator } from "../webgpu/runtime/cost-model.js";
 import { nativeRole, installNativeBridge, remoteBackendChoice, remoteBackendName, remoteCommand,
@@ -523,6 +533,12 @@ function syncDownloads() {
  * find an identity is a lookup that is neither total nor one-to-one.
  */
 function recordPrediction(prediction, family) {
+  // Every fold ends here, so this is where a result that cannot be one is refused, with whatever was kept to go on from it.
+  if (isImpossibleFold(prediction)) {
+    forgetDeviceState();
+    esmfold2Trunk = undefined;
+    throw new Error(IMPOSSIBLE_FOLD);
+  }
   // The family still travels ON the prediction: the archive, the session's
   // `localfold` block and the Colab reader all read it, and a label is a
   // thing to read rather than an identifier - see the note above.
@@ -794,7 +810,7 @@ const modelFamily = (ligandCount = 0, modificationCount = 0, nucleicCount = 0,
   // one atom37 slot over the complex, each chain at its offset (see the AF2
   // branch of the fold). 1BRS A:D with a self-template: 16.68 -> 0.78 A.
   if (templateCount > 0 && !isAf3Family(choice) && !["monomer", "multimer"].includes(graphOf(choice))) {
-    throw new Error("Templates need an AF3-lineage model or AlphaFold 2;"
+    throw new JobRefused("Templates need an AF3-lineage model or AlphaFold 2;"
       + ` the model is set to ${choice}`);
   }
   // 🔴 AND THREE OF ALPHAFOLD 2's FIVE MODELS HAVE NO TEMPLATE EMBEDDER AT ALL.
@@ -1077,19 +1093,27 @@ function status(text, isError = false) {
  * name and a device's own error string, neither of which this page authored -
  * so it goes in as text and the button is built beside it.
  */
-function statusWithAction(text, label, title, onClick) {
+/** A word beside what the line says now: a session that could not be saved must not take a finished fold's scores off the screen. */
+function statusBeside(text) {
+  const said = document.getElementById("status-message")?.textContent ?? "";
+  status(activeFold === undefined && said !== "" ? `${said} · ${text}` : text);
+}
+
+function statusWithAction(text, label, title, onClick, more = []) {
   const node = document.getElementById("status-message");
   if (node === null) return;
   node.replaceChildren();
   node.classList.add("error");
   node.append(document.createTextNode(text + " "));
-  const button = document.createElement("button");
-  button.type = "button";
-  button.className = "btn btn-grey btn-small status-action";
-  button.textContent = label;
-  button.title = title;
-  button.addEventListener("click", onClick, { once: true });
-  node.append(button);
+  for (const action of [{ label, title, onClick }, ...more]) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "btn btn-grey btn-small status-action";
+    button.textContent = action.label;
+    button.title = action.title;
+    button.addEventListener("click", action.onClick, { once: true });
+    node.append(button, document.createTextNode(" "));
+  }
 }
 
 /**
@@ -1110,6 +1134,41 @@ function describeBudget(error) {
   const mib = (bytes) => `${Math.round(bytes / 1048576)} MiB`;
   return `Needs ${mib(error.residentBytes + error.bytes)}, over this device's`
     + ` ${mib(error.budgetBytes)} limit.`;
+}
+
+/**
+ * The page's device stopped working, set while a fold is told to stop for it.
+ *
+ * @type {{kind: string, message: string, learned?: number} | undefined}
+ */
+let deviceFault;
+
+/** What a fault means for the next press of Fold, since that is the reader's question. */
+function describeDeviceFault(fault) {
+  // The device is fine, and what is short is the room other programs left, which no browser can see.
+  if (fault.kind === "out-of-memory") {
+    return `${fault.message} Other programs or tabs may be using more of the card than this page can see: close them, or`
+      + " lower what one fold may hold in Settings, and press Fold.";
+  }
+  const mib = (bytes) => `${Math.round(bytes / 1048576)} MiB`;
+  return `${fault.message} The graphics driver may have reset, which another program starting on the GPU can cause.`
+    + " Press Fold to ask for a new device; if it is refused, close every window of this browser and open it again."
+    + (fault.learned === undefined ? ""
+      : ` That is the second in an hour, so memory may be the cause: the limit is now ${mib(fault.learned)}, and Settings can take it back.`);
+}
+
+/**
+ * Everything the page holds that lives on the device, for a device that is gone.
+ *
+ * The weights and pipelines are keyed on the device and go with it. These two are
+ * not: each holds buffers for continuing a fold, and raising the recycle count
+ * after a lost device would resume from buffers that no longer exist.
+ */
+function forgetDeviceState() {
+  trunkCache = undefined;
+  af2Cache = undefined;
+  lastFoldedFamily = undefined;
+  ceilingLifted = false;
 }
 
 /**
@@ -1193,6 +1252,11 @@ function modelProgress(fraction, detail = "") {
  * returning "none". For a family that has no such row the answer is simply no,
  * because none of them has a language model to run.
  */
+/** ESMFold2 only, by the reader's choice: AlphaFold never falls back (AGENTS.md). */
+function foldsOnCpu(family = chosenFamily()) {
+  return computePreference() === "cpu" && isEsmfold2(family);
+}
+
 function usesLanguageModel(family = chosenFamily()) {
   // (every ESMFold2 variant folds from its language model: "no language model" is not offered - it was the
   // sequence alone, which no ESMFold2 is)
@@ -1300,11 +1364,46 @@ function startModelPreload(family, signal) {
   // properly itself. Attaching a handler marks it handled; the original still
   // throws where it is awaited.
   load.then(() => modelProgress(null), () => modelProgress(null));
-  return load;
+  // Stop does not wait for the download, which on a slow line is minutes. It goes on behind the page: what arrives is
+  // kept, and the next fold takes it up where it has got to.
+  signal.addEventListener("abort", () => modelProgress(null), { once: true });
+  const stoppable = withAbort(load, signal);
+  stoppable.catch(() => {});
+  return stoppable;
+}
+
+/**
+ * How long a running fold has left, on the line that said how long it would take.
+ *
+ * Measured off the fold's own bar, so it has nothing to do with the plan's figure and gets better as the fold goes.
+ * Not before it has something to go on, and not for a fold nearly done, where the number would only flicker.
+ */
+let timeLeftFrom;
+let timeLeftShown = 0;
+function showTimeLeft(fraction) {
+  if (typeof fraction !== "number" || !Number.isFinite(fraction) || activeFold === undefined) {
+    timeLeftFrom = undefined;
+    return;
+  }
+  const now = performance.now();
+  timeLeftFrom ??= { at: now, fraction };
+  const done = fraction - timeLeftFrom.fraction;
+  const elapsed = (now - timeLeftFrom.at) / 1000;
+  if (done < 0.05 || elapsed < 5 || now - timeLeftShown < 2000) return;
+  timeLeftShown = now;
+  const seconds = elapsed * (1 - fraction) / done;
+  if (seconds < 10) return;
+  const line = element("fold-plan");
+  line.hidden = false;
+  line.textContent = `${roughDuration(seconds)} left`;
+  line.title = "From how fast this fold has gone so far.";
+  line.dataset.tone = "plain";
 }
 
 function progress(fraction) {
   const bar = element("progress");
+  showProgressInTitle(typeof fraction === "number" ? fraction : null);
+  showTimeLeft(fraction);
   if (fraction === null) {
     bar.dataset.state = "idle";
     bar.value = 0;
@@ -2995,6 +3094,8 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
     // ...and so does a constraint
     constraints: foldContext.constraints ?? [],
     alignment: alignmentBlocks === null ? null : cheapHash(JSON.stringify(alignmentBlocks)),
+    // ...and a template: adding one to a fold just run reused the trunk without it, and the status line said it had been used.
+    templates: templates.map(({ chain, kind, source, text }) => [chain, kind, source, text === undefined ? null : cheapHash(text)]),
   });
   const cached = trunkCache?.key === trunkKey ? trunkCache.reusable : undefined;
   const reuse = cached !== undefined && cached.recycles <= recycles ? cached : undefined;
@@ -3397,6 +3498,10 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
       : named.join(", ");
     what.push(shown);
   }
+  if (reuse === undefined) {
+    noteFold({ where: "gpu", card: gpuName() ?? "", family: graphOf(family), tokens: residues, loops: recycles + 1,
+               seconds: result.seconds });
+  }
   const detail = [`in ${result.seconds.toFixed(0)} s`
     // Said out loud, because a fold that took a third of the time it used to
     // otherwise reads as something having gone wrong.
@@ -3516,7 +3621,7 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
   const ligands = [];
   for (const entry of ligandCodes) {
     if (entry.codes !== undefined) {      // a chain of components: the AF3-lineage path only
-      throw new Error(`${modelName} folds one component per ligand; ${entry.codes.join("-")} is a chain of`
+      throw new JobRefused(`${modelName} folds one component per ligand; ${entry.codes.join("-")} is a chain of`
         + ` ${entry.codes.length} - fold it with an AlphaFold 3-lineage model`);
     }
     // A structure rather than a code; see the note in web/af3-model.js.
@@ -3550,7 +3655,8 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
   const sampler = samplerPreset({ atomised: ligands.length > 0 || modifyWith.length > 0,
     residues: chains.reduce((sum, chain) => sum + chain.length, 0) });
   throwIfAborted(signal);
-  const loaded = await (modelLoad
+  const onCpu = foldsOnCpu(chosenFamily());
+  const loaded = onCpu ? undefined : await (modelLoad
     ?? loadEsmfold2Weights(undefined,
                            { languageModel: usesLanguageModel(), family: chosenFamily() }));
   // 🔴 ASKED AGAIN HERE, BECAUSE THE PRELOAD DECIDED IT EARLIER AND THE MEMO
@@ -3559,9 +3665,9 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
   // changed since, or the promise can have been built for a previous fold that
   // did not want it. Idempotent, and it is a head start rather than a
   // correctness fix: the store serves the blocks on demand either way.
-  if (usesLanguageModel()) loaded.language.prefetch?.();
+  if (usesLanguageModel()) loaded?.language.prefetch?.();
   throwIfAborted(signal);
-  const device = await getDevice();
+  const device = onCpu ? undefined : await getDevice();
   throwIfAborted(signal);
 
   predictionCount += 1;
@@ -3659,7 +3765,7 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
   // and changing it reuses; but the config class documents single-sequence
   // checkpoints as setting 0.1, so a future bundle turns this on by existing
   // and the key has to be right before that rather than after.
-  const lmMask = (loaded.shape.lmMaskPct ?? 0);
+  const lmMask = (loaded?.shape.lmMaskPct ?? 0);
   const trunkKey = JSON.stringify({
     family: chosenFamily(), chains, chainKinds, ligandCodes,
     // A modification changes what is folded, so a trunk cached for the plain
@@ -3672,9 +3778,25 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
   const reuse = esmfold2Trunk?.key === trunkKey ? esmfold2Trunk.reusable : undefined;
   let viewerKeep;
   let viewerModified = [];
-  const result = await foldEsmfold2(device, {
+  // A fold that loaded everything first says nothing about the rate.
+  const teachesRate = !onCpu || cpuFoldLoaded(chosenFamily());
+  const foldHere = onCpu ? (options) => foldEsmfold2OnCpu(options)
+    : (options) => foldEsmfold2(device, options);
+  const result = await foldHere({
+    signal,
     reuse,
-    wantReusable: true,
+    wantReusable: !onCpu,
+    // With the limit lifted the fold's own account has nothing to measure against, and somebody who asked for that is
+    // the last person whose fold should hold more than it has to.
+    ...(ceilingLifted ? { spillPairs: true } : {}),
+    family: chosenFamily(),
+    threads: cpuThreads(),
+    loops: recycleCount() + 1,
+    onDownload: ({ loadedBytes, totalBytes }) => {
+      if (totalBytes > 0 && loadedBytes < totalBytes) modelProgress(loadedBytes / totalBytes,
+        `${modelName} · ${Math.round(loadedBytes / 1048576)} / ${Math.round(totalBytes / 1048576)} MiB`);
+      else modelProgress(null);
+    },
     sequence,
     entities: { sequence, chainKinds, ligands, modifications: modifyWith },
     // ...and which tokens the viewer will draw, so this path's contact map is
@@ -3690,11 +3812,13 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
     // is exact: upstream runs `range(num_loops + 1)` and this checkpoint's
     // `num_loops` is 3, which is the dial's own default, so the default fold is
     // the same four passes it always was.
-    shape: { ...loaded.shape, loops: recycleCount() + 1 },
-    weights: loaded.weights,
-    confidenceWeights: loaded.confidenceWeights,
-    tower: languageModelRunner(device, new GpuBufferAllocator(device), loaded,
-                               loaded.shape.pairChannels),
+    ...(onCpu ? {} : {
+      shape: { ...loaded.shape, loops: recycleCount() + 1 },
+      weights: loaded.weights,
+      confidenceWeights: loaded.confidenceWeights,
+      tower: languageModelRunner(device, new GpuBufferAllocator(device), loaded,
+                                 loaded.shape.pairChannels),
+    }),
     sampler,
     seed: randomSeed(),
     // 🔴 THIS MODEL'S "SINGLE SEQUENCE". Without ESM-C it has no evolutionary
@@ -3705,7 +3829,7 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
     languageModel: usesLanguageModel(),
     // ...and how big it is, so the bar's language band is this tower's and not
     // the one the constants were fitted against.
-    languageModelMiB: loaded.language.megabytes,
+    languageModelMiB: loaded?.language.megabytes,
     // 🔴 NO `frameCertainty`, AND DROPPING IT GIVES BACK 46 MiB AT 300 TOKENS.
     // It kept the distogram's logits resident so every sampler frame could be
     // scored and coloured; the head reads the finished coordinates, so the
@@ -3943,6 +4067,10 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
   esmfold2Trunk = result.reusable === undefined ? esmfold2Trunk
     : { key: trunkKey, reusable: result.reusable };
   const seconds = ((performance.now() - started) / 1000).toFixed(1);
+  if (!result.trunkReused && teachesRate) {
+    noteFold({ where: onCpu ? "cpu" : "gpu", card: gpuName() ?? "", loops: recycleCount() + 1, threads: cpuThreads(),
+               tokens: chains.reduce((total, chain) => total + chain.length, 0), seconds: Number(seconds) });
+  }
   const mean = confidence.meanPlddt;
   // 🔴 IT SAYS pLDDT NOW, AND THAT IS A CHANGE OF FACT AND NOT OF WORDING.
   // This line read "certainty" for as long as the checkpoint had no confidence
@@ -4297,6 +4425,10 @@ async function foldWithBioemu2({ chains, chainKinds, alignment, alignmentBlocks,
   const seconds = ((performance.now() - started) / 1000).toFixed(1);
   const sampled = result.samples.length / perSample;
   const residues = chains.reduce((total, chain) => total + chain.length, 0);
+  if (choice === "structure" && samples === 1 && steps === BIOEMU2_DEFAULT_STEPS && !result.stopped) {
+    noteFold({ where: "gpu", card: gpuName() ?? "", family, tokens: residues, loops: recycleCount() + 1,
+               seconds: Number(seconds) });
+  }
   const named = (modifications ?? []).map((one) => `${one.code}${one.position}`);
   status(`${modelName} · ${residues} res` + (named.length === 0 ? "" : ` + ${named.join(", ")}`)
     + ` · ${choice}` + (propagation ? ` ${propagation.lagNs} ns x ${propagation.steps}` : "")
@@ -4841,6 +4973,30 @@ function remoteFrameDrawer(stem, liveMaps = () => undefined) {
   return drawer;
 }
 
+/** A job this model cannot read, which the CPU folding the same model would refuse the same way. */
+class JobRefused extends Error {}
+
+/** A browser older than Float16Array reads no weights at all, on the GPU or the CPU. */
+const tooOldToRead = (error) => /no Float16Array/.test(error instanceof Error ? error.message : String(error));
+
+/** What a fold's error says, unless it is one of these, which say nothing a reader can use. */
+function readableFailure(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  if (/array buffer allocation failed|invalid (typed )?array( buffer)? length/i.test(message)) {
+    return "This fold needs more system memory than this browser could give it. A shorter one may fit, and closing other tabs may help.";
+  }
+  if (tooOldToRead(error)) return "This browser is too old to read the model's weights: it has no Float16Array. Update it and reload.";
+  // ...which AlphaFold 2's recycling is the first to read.
+  if (/convergence distance must be non-negative finite/.test(message)) return IMPOSSIBLE_FOLD;
+  return message;
+}
+
+/**
+ * How long a stopped fold gets to reach its next check before the page leaves it behind. A block's pieces and the queue
+ * behind them are a second or so of work, and this is for a GPU that has stopped answering at all.
+ */
+const STOP_GRACE_MS = 10 * 1000;
+
 async function fold(event) {
   event?.preventDefault();
   if (activeFold !== undefined) {
@@ -4876,7 +5032,51 @@ async function fold(event) {
   updateScoresCard(undefined);
   // ...and the rest of the last result with it - see hideResults.
   hideResults();
+  let endGuard = () => {};
+  // Whichever comes first: the fold ending however it ends, or the page leaving it behind.
+  let settled = false;
+  let leaving;
+  const settle = () => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(leaving);
+    endGuard();
+    void refreshPlan();
+    window.__foldState = { running: false, since: Date.now() };
+    // ...whatever happened, including a stop. The timeline is most useful about
+    // the fold that did NOT finish, so it is closed here and not on the way out
+    // of the success path.
+    devEndRun();
+    // ...and the slots handed back, for AF2 - whose recycles ARE its frames,
+    // so the end of the fold is the end of recycling - and for any fold that
+    // stopped or failed before its sampler drew.
+    contactsBig(false);
+    // ...and what was on screen before, where this fold never drew: a stop or
+    // a failure must not leave the page blank with every fold still in it.
+    restoreResults();
+    if (activeFold === controller) activeFold = undefined;
+    setFoldButton("idle");
+    armIdleRelease();
+    void settleHeldDevice();
+  };
+  // A wedged GPU answers nothing, so a fold waiting on it never reaches the check that would end it. What it holds goes
+  // with the device, and whatever it is waiting on ends with that or never: it can only find itself settled.
+  signal.addEventListener("abort", () => {
+    leaving = setTimeout(() => {
+      console.error("left behind", "a stopped fold did not end");
+      progress(null);
+      forgetDeviceState();
+      void releaseDevice();
+      status(deviceFault !== undefined ? describeDeviceFault(deviceFault)
+        : "The GPU did not answer, so that fold was left behind. The next one asks for a new device.", true);
+      deviceFault = undefined;
+      settle();
+    }, STOP_GRACE_MS);
+  }, { once: true });
   try {
+    endGuard = await beginFold({
+      signal, onWaiting: () => status("Waiting for the fold in another LocalFold tab to finish…"),
+    });
     const entities = entityList.read();
     const enteredProblem = entitiesProblem(entities);
     // A pasted/uploaded A3M remains self-describing: as before, its query may
@@ -4916,13 +5116,13 @@ async function fold(event) {
     // BioEmu2 conditions on contacts and reads the Contact rows itself (bioemu2ContactsFromRows, which refuses a pocket).
     if ((request.constraints ?? []).length > 0 && family !== "boltz2" && family !== "chai1"
         && !BIOEMU2_FAMILIES.includes(family)) {
-      throw new Error(`${MODEL_LABELS[family] ?? family} was not trained with pocket or contact constraints;`
+      throw new JobRefused(`${MODEL_LABELS[family] ?? family} was not trained with pocket or contact constraints;`
         + " choose Boltz-2, Chai-1 or (contacts) BioEmu2, or remove the pocket and contact rows");
     }
     // ...and a crosslink is a ligand BONDED to two residues: only the AlphaFold 3-lineage path reads the bonds, so
     // elsewhere it would fold a free-floating bridge
     if (entities.some((entity) => entity.type === "crosslink") && !isAf3Family(family)) {
-      throw new Error(`${MODEL_LABELS[family] ?? family} does not take covalent bonds, which a crosslink is;`
+      throw new JobRefused(`${MODEL_LABELS[family] ?? family} does not take covalent bonds, which a crosslink is;`
         + " choose an AlphaFold 3-lineage model, or remove the crosslink rows");
     }
     // 🔴 THE TERMS ARE ASKED BEFORE THE DOWNLOAD, NOT BEFORE THE PAGE. AF3's
@@ -4958,14 +5158,41 @@ async function fold(event) {
     // kept between folds so the same model's next fold skips its packing, and
     // it was kept across a CHANGE of model too - four models in one page and
     // the fourth fold died at 2.9 GiB live. See releaseAllWeights.
-    if (lastFoldedFamily !== undefined && lastFoldedFamily !== family) {
+    let onCpu = foldsOnCpu(family);
+    // Before the download, which is the point of asking here and not at the first allocation that fails.
+    if (!onCpu && isEsmfold2(family) && !ceilingLifted) {
+      const plan = await currentPlan();
+      if (plan?.where === "cpu") {
+        if (await prepareCpuFold()) return;
+        onCpu = foldsOnCpu(family);
+      } else if (plan?.where === "over" || plan?.where === "none") {
+        offerAlternatives(plan);
+        return;
+      }
+    } else if (onCpu && isEsmfold2(family) && !ramLifted) {
+      const plan = await currentPlan();
+      if (plan?.where === "none") {
+        offerAlternatives(plan);
+        return;
+      }
+      // A hard reload goes round the worker, so a page with the CPU chosen can come back on one thread with the rest a
+      // reload away. A worker that does not give it to them says so, once: see setIsolated.
+      if (!carriedOverReload && cpuThreads() < cpuThreadsOnceIsolated() && await prepareCpuFold()) return;
+    }
+    if (computePreference() === "cpu" && !onCpu) {
+      throw new Error(`${MODEL_LABELS[family] ?? family} folds on a GPU only. Settings: Fold on, GPU.`);
+    }
+    if (!onCpu && lastFoldedFamily !== undefined && lastFoldedFamily !== family) {
       releaseAllWeights(await getDevice());
       releaseBioemu2(await getDevice());
+      releaseEsmfold2Weights(family);
+      releaseAf3Weights(family);
     }
-    lastFoldedFamily = family;
+    if (!onCpu) lastFoldedFamily = family;
     // ...and started, not awaited. The templates and the alignment below are
-    // network work of their own; this runs beside them.
-    const modelLoad = startModelPreload(family, signal);
+    // network work of their own; this runs beside them. A CPU fold's worker loads
+    // its own, through the same shard cache.
+    const modelLoad = onCpu ? undefined : startModelPreload(family, signal);
     // 🔴 AND THE SHADERS, WHILE THE SHARDS ARE STILL ARRIVING. The tools have
     // done this since the warm existed - fold-opendde.js measures 2533 ms
     // against 2839 with `--no-warm` - and the page never did, because
@@ -5814,6 +6041,9 @@ async function fold(event) {
     // enough to catch.
     updateScoresCard(best.confidence);
     const took = ((performance.now() - started) / 1000).toFixed(1);
+    noteFold({ where: "gpu", card: gpuName() ?? "", family: graphOf(family), models: sweep.length,
+               tokens: chains.reduce((total, chain) => total + chain.length, 0),
+               loops: alignedRecycles.length / sweep.length, seconds: Number(took) });
 
     // 🔴 COUNTED OVER THE WHOLE RUN, because `allRecycles` is one MODEL's and a
     // sweep has five of them. Reading it here was a ReferenceError waiting for
@@ -5898,8 +6128,15 @@ async function fold(event) {
       + ` · pTM ${best.confidence.ptm.toFixed(3)}${bestIptmText}${ranked}${converged}`
       + templateText + broken);
   } catch (error) {
+    if (settled) return;
     progress(null);
-    if (signal.aborted || isAbortError(error)) status("Prediction stopped");
+    // A fault is an abort from the page's side, and must not read as the reader's
+    // own Stop: they did not press anything, and they need to know what happened.
+    if (deviceFault !== undefined) {
+      console.error("fold failed", deviceFault.message, error);
+      status(describeDeviceFault(deviceFault), true);
+      deviceFault = undefined;
+    } else if (signal.aborted || isAbortError(error)) status("Prediction stopped");
     else {
       // 🔴 THE STACK GOES TO THE CONSOLE, ALWAYS. The status line gets the
       // message because that is what a reader can act on, but a message alone
@@ -5919,34 +6156,144 @@ async function fold(event) {
       // paging and reports nothing: without it the failure is not an error
       // message, it is a machine that stops responding. That is what the title
       // on the button says, in those words.
-      if (error instanceof GpuMemoryBudgetError && !ceilingLifted) {
+      const gpusFault = entitiesProblem(entityList.read()) === null && !(error instanceof ModelDownloadError)
+        && !(error instanceof JobRefused) && !tooOldToRead(error);
+      const cpu = gpusFault && isEsmfold2(chosenFamily()) && computePreference() !== "cpu" ? [{
+        label: "Fold on CPU",
+        title: "Slower, and it cannot run out of GPU memory. For this tab: Settings keeps its own choice.",
+        onClick: () => { void foldOnCpuInstead(); },
+      }] : [];
+      if (error instanceof ModelDownloadError) {
+        status(`Could not download this model (${error.reason}). Check the connection and press Fold again:`
+          + " what has arrived is kept.", true);
+      } else if (error instanceof AlignmentServerError) {
+        statusWithAction(error.message, "Fold as a single sequence",
+                         "Needs no server, and most models read less well without an alignment. For this fold and the next: the MSA setting is changed.",
+                         () => { void foldAsSingleSequence(); });
+      } else if (error instanceof GpuMemoryBudgetError && !ceilingLifted) {
         statusWithAction(
           describeBudget(error),
           "Fold anyway",
           "Lifts the limit for this session. The limit is what turns running out"
-          + " of memory into a message; without it the tab may stop responding.",
-          () => { void foldWithoutCeiling(); });
-      } else status(error instanceof Error ? error.message : String(error), true);
+          + " of memory into a message; without it the tab may stop responding,"
+          + " and a lost GPU can leave this browser without WebGPU until it restarts.",
+          () => { void foldWithoutCeiling(); }, cpu);
+      } else if (cpu.length > 0) {
+        statusWithAction(readableFailure(error), cpu[0].label, cpu[0].title, cpu[0].onClick);
+      } else status(readableFailure(error), true);
     }
   } finally {
-    window.__foldState = { running: false, since: Date.now() };
-    // ...whatever happened, including a stop. The timeline is most useful about
-    // the fold that did NOT finish, so it is closed here and not on the way out
-    // of the success path.
-    devEndRun();
-    // ...and the slots handed back, for AF2 - whose recycles ARE its frames,
-    // so the end of the fold is the end of recycling - and for any fold that
-    // stopped or failed before its sampler drew.
-    contactsBig(false);
-    // ...and what was on screen before, where this fold never drew: a stop or
-    // a failure must not leave the page blank with every fold still in it.
-    restoreResults();
-    if (activeFold === controller) activeFold = undefined;
-    setFoldButton("idle");
+    settle();
   }
 }
 
 // --- wiring ----------------------------------------------------------------
+
+/** The plan for what the entity rows hold now, or undefined where there is nothing to plan or no plan for this model. */
+async function currentPlan() {
+  const family = chosenFamily();
+  if (remoteBackend() !== null) return undefined;
+  // BioEmu2's ensembles batch their samples, and nobody has measured what that holds.
+  if (graphOf(family) === "bioemu2" && (document.getElementById("bioemu2-mode")?.value !== "structure"
+    || Number(document.getElementById("bioemu2-samples")?.value) !== 1
+    || Number(element("af3-count").value) !== BIOEMU2_DEFAULT_STEPS)) return undefined;
+  const entities = entityList.read();
+  if (entitiesProblem(entities) !== null) return undefined;
+  const request = expandEntities(entities);
+  // Atoms are tokens here. A ligand's are not known until its component is fetched, so a typical one stands in; the
+  // fold's own account takes over once it has the real count.
+  const tokens = request.chains.reduce((total, chain) => total + chain.length, 0)
+    + 30 * (request.ligandCodes?.length ?? 0) + 10 * (request.modifications?.length ?? 0);
+  if (tokens === 0) return undefined;
+  const preference = computePreference();
+  const memory = navigator.deviceMemory;
+  if (!isEsmfold2(family)) {
+    return planMeasuredModel(graphOf(family), { tokens, loops: recycleCount() + 1, models: af2Sweep(family).length }, {
+      preference, gpu: preference === "cpu" ? undefined : await planningGpu(), rates: readFoldRates(),
+    });
+  }
+  return planEsmfold2({ tokens, loops: recycleCount() + 1 }, {
+    preference, threads: window.crossOriginIsolated === true ? cpuThreads() : cpuThreadsOnceIsolated(),
+    gpu: preference === "cpu" ? undefined : await planningGpu(),
+    ramBytes: typeof memory === "number" ? memory * 1024 ** 3 : undefined,
+    rates: readFoldRates(),
+    cpuLoaded: cpuFoldLoaded(family),
+  });
+}
+
+let planTimer;
+let planAsked = 0;
+
+/** Rewrite the line beside the button, once whatever is being typed has settled. */
+function refreshPlan() {
+  clearTimeout(planTimer);
+  planTimer = setTimeout(async () => {
+    planAsked += 1;
+    const asked = planAsked;
+    const line = element("fold-plan");
+    let plan;
+    try { plan = await currentPlan(); } catch (cause) { console.warn("plan", cause); }
+    if (asked !== planAsked) return;
+    line.hidden = plan === undefined;
+    if (plan === undefined) return;
+    const { text, title, tone } = describePlan(plan);
+    line.textContent = text;
+    line.title = title;
+    line.dataset.tone = tone;
+  }, 120);
+}
+
+const FOLD_AFTER_RELOAD = "localfold.fold-after-reload";
+
+/** Put this tab on the CPU. True if that takes a reload, on the far side of which the fold starts by itself. */
+async function prepareCpuFold() {
+  try { sessionStorage.setItem(FOLD_AFTER_RELOAD, ramLifted ? "ram-lifted" : "1"); } catch { /* the reader presses Fold again */ }
+  const reloading = await useCpuForNow(keepFormForReload);
+  if (!reloading) {
+    try { sessionStorage.removeItem(FOLD_AFTER_RELOAD); } catch { /* it was never set */ }
+  }
+  return reloading;
+}
+
+/** The reader has seen what a CPU fold needs and asked for it anyway. */
+let ramLifted = false;
+/** This press came across a reload for threads, so it folds on what that gave it. */
+let carriedOverReload = false;
+
+async function foldOnCpuInstead() {
+  chooseCpuModel();
+  if (await prepareCpuFold()) return;
+  void refreshPlan();
+  await fold();
+}
+
+/** A search that failed, and the setting a reader would otherwise change by hand to go on without it. */
+async function foldAsSingleSequence() {
+  modeSelect.value = "none";
+  modeSelect.dispatchEvent(new Event("change", { bubbles: true }));
+  await fold();
+}
+
+/** A fold the GPU should not take, and the reader's way on from it. */
+function offerAlternatives(plan) {
+  const cpu = {
+    label: plan.cpuFits ? `Fold on CPU · ${roughDuration(plan.cpuSeconds)}` : "Try on CPU anyway",
+    title: "Cannot run out of GPU memory, and Stop works at once. For this tab: Settings keeps its own choice.",
+    onClick: () => {
+      ramLifted ||= !plan.cpuFits;
+      void foldOnCpuInstead();
+    },
+  };
+  const gpu = {
+    label: "Try on GPU anyway",
+    title: "Lifts the limit for this session. A card that runs out can reset its graphics driver, and the browser"
+      + " may then need a restart before it can use the GPU again.",
+    onClick: () => { void foldWithoutCeiling(); },
+  };
+  const choices = plan.where === "none" || plan.why === "binding" ? [cpu] : [cpu, gpu];
+  const [first, ...more] = choices;
+  statusWithAction(describeRefusal(plan), first.label, first.title, first.onClick, more);
+}
 
 /**
  * Whether the reader has taken the ceiling off, which lasts the session.
@@ -5966,6 +6313,119 @@ async function foldWithoutCeiling() {
   setMemoryBudget(device, undefined);
   await fold();
 }
+
+/**
+ * What is on screen, drawn again. A GPU process that dies takes the viewer's picture with it, and the viewer draws only when
+ * something moves, so a result stayed blank until the next fold.
+ */
+function redrawViewer() {
+  const registry = window.py2dmol_viewers ?? {};
+  for (const name of Object.keys(registry)) {
+    const renderer = registry[name]?.renderer;
+    renderer?.render?.("localfold.redraw");
+    // ...and a map is painted from its own copy, which went the same way, so it is made again.
+    for (const heatmap of [renderer?.heatmapRenderer, ...(renderer?._heatmapPool ?? []).map((slot) => slot.hm)]) {
+      if (heatmap) heatmap.baseCanvas = null;
+    }
+    renderer?.heatmapRenderer?.render?.();
+  }
+}
+for (const id of ["canvas", "heatmapCanvas"]) document.getElementById(id)?.addEventListener("contextrestored", redrawViewer);
+
+onDeviceFault(({ kind, message, resident, budget }) => {
+  if (kind === "lost") setTimeout(redrawViewer, 1000);
+  // Lost devices are the one measurement of the card's real limit a page ever gets,
+  // and only a device that was actually holding a lot says anything about it.
+  const learned = kind === "lost" && (activeFold !== undefined || ceilingLifted)
+    ? learnFromLoss(resident, budget) : undefined;
+  forgetDeviceState();
+  if (kind === "out-of-memory") void releaseDevice();
+  refreshPlan();
+  if (activeFold !== undefined) {
+    deviceFault = { kind, message, learned };
+    activeFold.abort();
+  } else status(describeDeviceFault({ kind, message, learned }), true);
+});
+
+/**
+ * Hand the GPU back when nobody is using this page.
+ *
+ * Keeping weights between folds is what makes a second fold fast, and it also held
+ * gigabytes of a shared card for as long as a tab stayed open, through every game,
+ * video call and other model the machine went on to run. A tab left hidden gives it
+ * back quickly and a visible one eventually; the next fold pays a re-upload and a
+ * recompile, about the cost of a change of model.
+ */
+const IDLE_RELEASE_HIDDEN_MS = 2 * 60 * 1000;
+const IDLE_RELEASE_VISIBLE_MS = 15 * 60 * 1000;
+let idleTimer;
+
+function armIdleRelease() {
+  clearTimeout(idleTimer);
+  const wait = document.visibilityState === "hidden"
+    ? IDLE_RELEASE_HIDDEN_MS : IDLE_RELEASE_VISIBLE_MS;
+  idleTimer = setTimeout(() => {
+    if (activeFold !== undefined) { armIdleRelease(); return; }
+    forgetDeviceState();
+    releaseCpuFold();
+    void releaseDevice();
+  }, wait);
+}
+
+document.addEventListener("visibilitychange", armIdleRelease);
+// ...and at once when the page goes, rather than whenever the browser gets to it.
+window.addEventListener("pagehide", () => {
+  forgetDeviceState();
+  releaseCpuFold();
+  void releaseDevice();
+});
+
+/**
+ * What must survive the one reload that isolates the page for a threaded CPU fold:
+ * everything the reader has set, which is the same object a session carries.
+ */
+const KEPT_FORM = "localfold.reload-form";
+function keepFormForReload() {
+  try { sessionStorage.setItem(KEPT_FORM, JSON.stringify(formInputs())); } catch { /* lost */ }
+}
+function restoreKeptForm() {
+  try {
+    const kept = sessionStorage.getItem(KEPT_FORM);
+    if (kept === null) return;
+    sessionStorage.removeItem(KEPT_FORM);
+    applyInputs(JSON.parse(kept));
+  } catch { /* the default row stays */ }
+}
+
+/**
+ * Only ESMFold2 folds on a CPU. On one it takes about 6% longer at 600M than at 300M, and
+ * docs/RUNNING.md's 1BRS is better for it, so 300M is for machines short of the extra
+ * gibibyte the larger tower holds.
+ */
+function chooseCpuModel() {
+  if (isEsmfold2(chosenFamily())) return;
+  const roomy = (navigator.deviceMemory ?? 0) >= 16;
+  applyInputs({ controls: { "model-family": "ef2-fast-600m", "plm-mode": roomy ? "esmc-600m" : "esmc-300m" } });
+}
+
+installSettings({
+  onReleaseGpu: () => { forgetDeviceState(); releaseCpuFold(); },
+  onComputeChange: (choice) => {
+    if (choice === "cpu") chooseCpuModel();
+    else releaseCpuFold();
+    refreshPlan();
+  },
+  onLimitChange: () => refreshPlan(),
+  keepPage: keepFormForReload,
+});
+// Whatever can change the answer, including a row added or set from outside the form.
+element("entity-rows").addEventListener("input", refreshPlan);
+element("entity-rows").addEventListener("change", refreshPlan);
+new MutationObserver(refreshPlan).observe(element("entity-rows"), { childList: true });
+for (const id of ["model-family", "plm-mode", "recycles", "af2Model", "bioemu2-mode", "bioemu2-samples", "af3-count"]) {
+  document.getElementById(id)?.addEventListener("change", refreshPlan);
+}
+installViewerTheme();
 
 element("predict").addEventListener("click", (event) => void fold(event));
 // ...and only now is it safe to press. See the note on the button in index.html:
@@ -6145,6 +6605,9 @@ function applyJob(job) {
   if (job.userCcd !== undefined) {
     throw new Error("userCCD describes chemistry this page does not build - remove it to fold the rest");
   }
+  if (job.entities.length > MOST_ENTITY_ROWS) {
+    throw new Error(`that job has ${job.entities.length} entities, past anything here folds`);
+  }
   entityList.set(job.entities);
   const said = [];
   if (job.seed !== undefined) {
@@ -6201,6 +6664,10 @@ function applyJob(job) {
  *
  * Throws; the callers below turn that into the status line.
  */
+/** A row per chain is a DOM row per chain, and past these a file has only stopped the page by the time it is refused. */
+const LONGEST_INPUT_TEXT = 1048576;
+const MOST_ENTITY_ROWS = 2047;
+
 async function readHandedFile(bytes, { name = "", textIs = "alignment" } = {}) {
   if (looksLikeZip(bytes)) {
     const files = await readZip(bytes);
@@ -6280,13 +6747,23 @@ async function readHandedFile(bytes, { name = "", textIs = "alignment" } = {}) {
       + alsoJob);
     return;
   }
+  // Random bytes decode to text with newlines in it, and that was 4097 chains from a file of weights. (A few NULs are not
+  // the same thing: MMseqs2 writes them between an a3m's queries.)
+  const opening = bytes.subarray(0, 65536);
+  if (opening.reduce((count, byte) => count + (byte < 9 || (byte > 13 && byte < 32) ? 1 : 0), 0) > opening.length / 100) {
+    throw new Error("that is not a text file - drop an AlphaFold 3 job JSON, a fold archive or an alignment");
+  }
   const text = new TextDecoder().decode(bytes);
   // 🔴 THE BYTES DECIDE HERE TOO. A job JSON and an a3m are both text, and
   // parseA3m reads `[{"name": ...` as a record whose sequence is the file -
   // no error, a "1 sequence" status, and a fold against an alignment made
   // of punctuation. The first non-space character is what separates them.
-  if (/^\s*[[{]/.test(text)) {
-    status(`job · ${applyJob(jobFromJson(text))}`);
+  // (or the name, for a file that says it is JSON and does not begin as a job can)
+  if (/^\s*[[{]/.test(text) || /\.json$/i.test(name)) {
+    // ...and the Session button's file is JSON too, which was refused as a job with something wrong with it.
+    const session = viewerSessionIn(text);
+    if (session !== undefined) await showSession(session);
+    else status(`job · ${applyJob(jobFromJson(text))}`);
     return;
   }
   // 🔴 A STRUCTURE IS REFUSED BY NAME, BECAUSE parseA3m WOULD TAKE IT. An a3m
@@ -6311,6 +6788,9 @@ async function readHandedFile(bytes, { name = "", textIs = "alignment" } = {}) {
   // went to py2Dmol - so no reader has ever dropped an a3m here and had it
   // taken as one.
   if (textIs === "input" && !looksLikeAlignment(text, name)) {
+    if (text.length > LONGEST_INPUT_TEXT) {
+      throw new Error(`that file holds ${Math.round(text.length / 1048576)} MiB of sequence, far past anything here folds`);
+    }
     const rows = entitiesFromText(text);
     if (rows.length === 0) throw new Error("no sequence in that file");
     entityList.set(rows);
@@ -6678,12 +7158,10 @@ async function rememberSession(pred) {
     if (saved === "quota" && state.localfold.msas !== undefined) {
       delete state.localfold.msas;
       saved = await saveSession(state);
-      if (saved !== "quota") {
-        status("saved without its alignment - there was no room for it", true);
-      }
+      if (saved !== "quota") statusBeside("saved without its alignment: no room for it");
     }
     if (saved === "quota") {
-      status("no room to save this session - clear site data to save again", true);
+      statusBeside("not saved: no room in this browser's storage, and Settings can delete downloaded models");
       return;
     }
     // 🔴 AND THE OFFER IS RE-ASKED, because the record it describes has just
@@ -6718,13 +7196,23 @@ function agoLabel(then, now = Date.now()) {
  * reader is looking at, which reads as the page not knowing what it is doing.
  */
 async function offerSession() {
+  // What is stored can be anything: a browser's storage outlives every version of this page that wrote to it.
+  try {
+    await describeSession();
+  } catch (cause) {
+    console.warn("the last session cannot be described", cause);
+    if (element("session") !== null) element("session").hidden = true;
+  }
+}
+
+async function describeSession() {
   const row = element("session");
   if (row === null) return;
   // 🔴 THE SUMMARY, NOT THE SESSION. This read the whole record to draw one
   // line - fine at 52 KB, and 2.8 MB of gzip over 9.2 MB of JSON once the
   // alignment travelled, on every page load, to decide whether to show a row.
   const meta = await readSessionMeta();
-  if (meta === undefined || predictions.has(meta.stem)) {
+  if (typeof meta?.model !== "string" || predictions.has(meta.stem)) {
     row.hidden = true;
     return;
   }
@@ -6862,6 +7350,18 @@ async function restoreSession() {
     status("there is no saved session to restore", true);
     return;
   }
+  await showSession(state);
+}
+
+/** What the Session button wrote, if this is one: the viewer's objects, and no job's sequences. */
+function viewerSessionIn(text) {
+  let parsed;
+  try { parsed = JSON.parse(text); } catch { return undefined; }
+  return Array.isArray(parsed?.objects) && parsed.sequences === undefined ? parsed : undefined;
+}
+
+/** A session brought back, from this page's own store or from a file. */
+async function showSession(state) {
   if (typeof globalThis.loadViewerState !== "function") {
     status("this build cannot restore a session", true);
     return;
@@ -7089,3 +7589,19 @@ document.addEventListener("py2dmol-frame-change", syncDownloads);
 document.addEventListener("localfold-runtime-stopped", (event) => {
   retireFolding(event.detail?.why ?? "the fold service has been stopped");
 });
+
+void settleBrowserBenchmark();
+
+// ...last, because they run the syncs, and every one of those is defined by now.
+if (computePreference() === "cpu") chooseCpuModel();
+restoreKeptForm();
+refreshPlan();
+try {
+  const carriedOn = sessionStorage.getItem(FOLD_AFTER_RELOAD);
+  if (carriedOn !== null) {
+    sessionStorage.removeItem(FOLD_AFTER_RELOAD);
+    ramLifted = carriedOn === "ram-lifted";
+    carriedOverReload = true;
+    void fold().finally(() => { carriedOverReload = false; });
+  }
+} catch { /* a private window: Fold is one press away */ }

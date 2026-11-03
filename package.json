@@ -86,6 +86,12 @@
     "test:delta": "node tools/gpu-chrome.mjs tools/gpu/check-delta-upload.js --target=/model-mono-3",
     "//test:pending": "A result belongs to the model that made it: switching the model row veils the structure and the map and takes the confidence numbers away, rather than leaving the previous model's answer under the new model's name. It borrows python/localfold/server.py as a FIXTURE to get a prediction onto a page without weights, and measures the veil as pixels.",
     "test:pending": "python3 tools/check-model-pending.py",
+    "//test:cpu": "A whole ESMFold2 fold on the CPU through the page, in a Chrome with no GPU: the reload that isolates it, the worker, Stop, and the fold after Stop.",
+    "test:cpu": "python3 tools/check-cpu-fold.py",
+    "//test:plan": "What the line beside Fold says on this machine, and what a press does when the plan refuses, for ESMFold2 and the other models. Folds nothing on a GPU, so it is safe on a display's own card.",
+    "test:plan": "python3 tools/check-compute-plan.py",
+    "//test:robust": "What the page does when things go wrong: the GPU process killed at each stage of a fold, Stop at each stage, downloads that fail, storage that is blocked, input a model cannot read, the sizes either side of what the plan accepts, a card that runs out, tabs, reloads and long sessions. A rented card only, under Linux: it ends GPU processes and fills cards. --group or --only for part of it.",
+    "test:robust": "python3 tools/check-robustness.py",
     "test:switch": "python3 tools/check-model-switch.py",
     "//test:tools": "Every tool has a header line saying what it is, and docs/TOOLS.md lists exactly the tools that exist with exactly those lines. 🔴 44 TOOLS WERE NAMED BY NOTHING AT ALL - not CLAUDE.md's table, not docs/, not another tool - including working differential checkers. The index is DERIVED from each file's own header, so an entry cannot drift from it; regenerate with `python3 tools/index-tools.py --write`.",
     "test:tools": "python3 tools/index-tools.py"

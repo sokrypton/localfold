@@ -899,7 +899,7 @@ export class Bioemu2Ops {
       this.weightBytes += buffer.size;
       if (dest === "f16") buffer.half = true;
       const release = await runBlockUpload(this.device, planned.gpu, buffer);
-      void this.device.queue.onSubmittedWorkDone().then(release);
+      void this.device.queue.onSubmittedWorkDone().then(release, release);
       return buffer;
     }
     const parts = sources.map((s) => decode(s));
@@ -1812,13 +1812,30 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     resolve.destroy();
   }
 
-  /** Run steps (or programs) now, in one compute pass. */
-  run(...items) {
-    const encoder = this.device.createCommandEncoder({ label: "bioemu2" });
-    const pass = encoder.beginComputePass({ label: "bioemu2" });
-    for (const item of items.flat()) {
-      if (item.run) item.run(pass);
-      else { pass.setPipeline(item.pipeline); pass.setBindGroup(0, item.bindGroup); pass.dispatchWorkgroups(item.x, item.y); }
+  /**
+   * Run steps (or programs) now, in one compute pass, or with `oneSubmitEach` a submission a step: the pairwise
+   * conditioner's two dozen passes over a 256-channel pair are 2.9 s at 600 tokens, and see webgpu/runtime/queue-pacing.js
+   * for why a submission has to be far shorter than that. `dispatchesEach` cuts a program as well.
+   */
+  run(items, { oneSubmitEach = false, dispatchesEach = Infinity } = {}) {
+    let encoder = this.device.createCommandEncoder({ label: "bioemu2" });
+    let pass = encoder.beginComputePass({ label: "bioemu2" });
+    const send = () => {
+      pass.end();
+      this.device.queue.submit([encoder.finish()]);
+      encoder = this.device.createCommandEncoder({ label: "bioemu2" });
+      pass = encoder.beginComputePass({ label: "bioemu2" });
+    };
+    let dispatched = 0;
+    for (const item of [items].flat()) {
+      for (const step of item.steps ?? [item]) {
+        pass.setPipeline(step.pipeline);
+        pass.setBindGroup(0, step.bindGroup);
+        pass.dispatchWorkgroups(step.x, step.y);
+        dispatched += 1;
+        if (dispatched % dispatchesEach === 0) send();
+      }
+      if (oneSubmitEach) send();
     }
     pass.end();
     this.device.queue.submit([encoder.finish()]);

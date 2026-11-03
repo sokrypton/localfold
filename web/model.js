@@ -15,6 +15,7 @@
  * NO DOM IN HERE. Progress arrives as a callback, because the two pages report
  * it differently and neither one's markup belongs in a module about weights.
  */
+import { settleReleasedMemory } from "../webgpu/runtime/allocator.js";
 import { AlphaFoldFixture } from "../shared/bundles/alphafold-fixture.js";
 import { HttpTensorStore } from "../shared/bundles/http-tensor-store.js";
 import { tensorByteLength } from "../shared/weights/dtype.js";
@@ -23,8 +24,12 @@ import { MODEL_BUNDLES, bundleBaseUrl, graphFamily, loadManifest }
   from "../shared/bundles/manifests/index.js";
 import { DeltaTensorStore } from "../shared/bundles/delta-tensor-store.js";
 import { requestAlphaFoldDevice } from "../webgpu/runtime/device.js";
+import { budgetForDevice, memoryTotals, setMemoryBudget } from "../webgpu/runtime/device-memory.js";
+import { deviceProfile } from "../webgpu/runtime/device-profile.js";
 import { settleGridAttendTiling } from "../webgpu/af3/trunk/grid-attend-race.js";
 import { devUseDevice } from "./dev-log.js";
+import { chosenLimitBytes, gpuMemoryBytes, gpuName, learnedLimitBytes } from "./gpu-limits.js";
+import { settleBrowserBenchmark } from "./chrome-benchmark.js";
 import { withAbort } from "../webgpu/runtime/abort.js";
 
 const stores = new Map();
@@ -158,23 +163,223 @@ export function openStore(onProgress, family = DEFAULT_FAMILY) {
         opened);
     })();
     stores.set(family, store);
+    // A download that failed once must not fail until the reader reloads.
+    store.catch(() => { if (stores.get(family) === store) stores.delete(family); });
   }
   return store;
 }
 
 let devicePromise;
+const deviceListeners = new Set();
+/** What the badge reads: which adapter the current device is on. */
+let currentAdapterInfo;
+
+/**
+ * Hear about a device that stopped working by itself: `{kind, message, resident}`,
+ * where kind is "lost" or "out-of-memory". A device this page destroyed on purpose
+ * says nothing.
+ */
+export function onDeviceFault(listener) {
+  deviceListeners.add(listener);
+  return () => deviceListeners.delete(listener);
+}
+
+function reportFault(kind, message, device) {
+  const { residentBytes: resident, budgetBytes: budget } = memoryTotals(device);
+  for (const listener of deviceListeners) listener({ kind, message, resident, budget });
+}
+
+/**
+ * Give the device back, and everything held on it with it.
+ *
+ * The resident weights, the pooled buffers and the compiled pipelines are all keyed
+ * on the device, so destroying it frees them at once and nothing can reach them
+ * afterwards. The next fold asks for a new device and pays its upload and compile
+ * again. Holders outside this file (the page's trunk caches) must be cleared by
+ * the caller.
+ */
+export async function releaseDevice() {
+  const pending = devicePromise;
+  devicePromise = undefined;
+  currentAdapterInfo = undefined;
+  if (pending === undefined) return false;
+  try {
+    (await pending).destroy();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Whatever a fold let go of, off the card. A destroyed buffer's memory comes back on a device tick, an idle page makes none,
+ * and a fold that ended in an exception has not made its own: 920 MiB stayed held after one at 200 residues of OpenBind-0.
+ */
+export async function settleHeldDevice() {
+  if (devicePromise === undefined) return;
+  try {
+    await settleReleasedMemory(await devicePromise);
+  } catch { /* lost or refused, which gave it back */ }
+}
+
+/** The live device's identity and memory, or undefined when none is held. */
+export async function deviceSummary() {
+  if (devicePromise === undefined) return undefined;
+  try {
+    const device = await devicePromise;
+    return { ...currentAdapterInfo, ...memoryTotals(device),
+             software: deviceProfile(device).software };
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Why there is no adapter, in terms a reader can act on.
+ *
+ * A browser answers null when there is no usable GPU, and also when the GPU
+ * process has crashed: Chrome stops offering WebGPU to a page after that, and a
+ * reload does not bring it back. The page cannot tell the two apart or undo either.
+ */
+const NO_ADAPTER = "WebGPU found no usable GPU. If a fold just failed, the browser may"
+  + " have stopped offering this site the GPU: close every window of this browser and"
+  + " open it again. chrome://gpu shows what it thinks.";
+
+/** A device request has failed since this page loaded, which on Windows means the browser has to restart. */
+let deviceRefused = false;
+let planningAdapter;
+
+/** How long a browser gets to answer for a GPU. A wedged GPU process answers neither yes nor no. */
+const ADAPTER_WAIT_MS = 20 * 1000;
+const DEVICE_WAIT_MS = 30 * 1000;
+
+function within(asked, milliseconds, message, onLate) {
+  return new Promise((resolve, reject) => {
+    let late = false;
+    const timer = setTimeout(() => { late = true; reject(new Error(message)); }, milliseconds);
+    asked.then((value) => {
+      clearTimeout(timer);
+      if (late) onLate?.(value); else resolve(value);
+    }, (cause) => { clearTimeout(timer); reject(cause); });
+  });
+}
+
+/** The browser's high-performance adapter, or a rejection if it has not answered in time. */
+export const askForAdapter = () => within(navigator.gpu.requestAdapter({ powerPreference: "high-performance" }),
+                                          ADAPTER_WAIT_MS, "the browser did not answer for a GPU");
+
+const automaticBudget = (adapter) => budgetForDevice(4, {
+  gpuMemoryBytes: gpuMemoryBytes(adapter), learnedBytes: learnedLimitBytes(), userBytes: chosenLimitBytes(),
+});
+
+/**
+ * What a plan needs to know about the GPU, without making a device to find out: undefined where there is no adapter.
+ * Cheap enough for a line the page rewrites as somebody types, because the adapter is asked for once.
+ */
+export async function planningGpu() {
+  if (navigator.gpu === undefined) return undefined;
+  try {
+    planningAdapter ??= askForAdapter();
+    const adapter = await planningAdapter;
+    if (adapter === null) {
+      planningAdapter = undefined;
+      return undefined;
+    }
+    const held = await deviceSummary();
+    const name = gpuName() ?? adapter.info?.description ?? "";
+    return {
+      name,
+      memoryBytes: gpuMemoryBytes(adapter),
+      budgetBytes: held === undefined ? automaticBudget(adapter) : held.budgetBytes,
+      automaticBytes: budgetForDevice(4, { gpuMemoryBytes: gpuMemoryBytes(adapter), learnedBytes: learnedLimitBytes() }),
+      maxBindingBytes: Math.min(adapter.limits.maxStorageBufferBindingSize, adapter.limits.maxBufferSize),
+      maxBufferBytes: adapter.limits.maxBufferSize,
+      halfWeights: adapter.features.has("shader-f16"),
+      software: adapter.info?.isFallbackAdapter === true || /SwiftShader|llvmpipe|Basic Render/i.test(name),
+      refusing: deviceRefused,
+    };
+  } catch (cause) {
+    console.warn("planning", cause);
+    planningAdapter = undefined;
+    return undefined;
+  }
+}
+
+/** The limit Settings has just changed, for a device that already exists. */
+export async function applyMemoryLimit() {
+  if (devicePromise === undefined) return;
+  const adapter = await planningAdapter;
+  setMemoryBudget(await devicePromise, adapter === null || adapter === undefined ? undefined : automaticBudget(adapter));
+}
+
+const NO_DEVICE = "The GPU is not accepting work. If a fold just failed the graphics driver may have reset, and this"
+  + " browser cannot use the GPU again until it restarts: close every window of it and open it again.";
 
 /** The WebGPU device, with the optional features the fast paths look for. */
 export function getDevice() {
-  devicePromise ??= (async () => {
+  if (devicePromise !== undefined) return devicePromise;
+  // Neither a rejection nor a lost device may stay memoised: that is what left the
+  // page saying "No compatible WebGPU adapter was found" until a reload, and folding
+  // against a dead device after any failure bad enough to lose one.
+  const request = (async () => {
     if (navigator.gpu === undefined) throw new Error("This browser has no WebGPU. It ships in current Chrome, Edge, Safari and Firefox.");
-    const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
-    if (adapter === null) throw new Error("No compatible WebGPU adapter was found");
+    await settleBrowserBenchmark();
+    const adapter = await askForAdapter().catch((cause) => {
+      console.warn("requestAdapter", cause);
+      return null;
+    });
+    if (adapter === null) {
+      planningAdapter = undefined;
+      throw new Error(NO_ADAPTER);
+    }
     // 🔴 THE PAGE IS THE ONE CALLER THAT HAS TO SURVIVE BEING WRONG. A bench
     // that asks for too much should fail loudly and does; a page that asks for
     // too much takes the machine down with it, so this is where the ceiling is
-    // set. `null` takes the guess in device-memory.js from navigator.deviceMemory.
-    const device = await requestAlphaFoldDevice(adapter, { memoryBudgetBytes: null });
+    // set: a third of system RAM, a share of the card's own memory where its name
+    // says, and whatever a lost device has already taught this browser.
+    const gpuMemory = gpuMemoryBytes(adapter);
+    let device;
+    try {
+      device = await within(requestAlphaFoldDevice(adapter, {
+        memoryBudgetBytes: budgetForDevice(4, { gpuMemoryBytes: gpuMemory, learnedBytes: learnedLimitBytes(),
+                                                userBytes: chosenLimitBytes() }),
+      }), DEVICE_WAIT_MS, "the browser did not answer for a device", (late) => late.destroy());
+    } catch (cause) {
+      // Measured on Windows after a driver reset: an adapter is still offered and every device request is refused with
+      // DXGI_ERROR_DEVICE_REMOVED, for as long as this browser's GPU process lives.
+      console.error("requestDevice", cause);
+      deviceRefused = true;
+      throw new Error(NO_DEVICE);
+    }
+    deviceRefused = false;
+    currentAdapterInfo = { name: gpuName() ?? adapter.info?.description ?? "",
+                           vendor: adapter.info?.vendor ?? "",
+                           architecture: adapter.info?.architecture ?? "",
+                           gpuMemoryBytes: gpuMemory };
+    void device.lost.then((info) => {
+      if (devicePromise === request) { devicePromise = undefined; currentAdapterInfo = undefined; }
+      if (info.reason === "destroyed") return;
+      planningAdapter = undefined;
+      // What the page holds on a lost device goes when this says so, and until then the browser keeps it on the card:
+      // measured, about 5 GiB of an 8 GiB card after a reset.
+      try { device.destroy(); } catch { /* it is lost either way */ }
+      console.error("device lost", info.message);
+      const reason = info.message?.split("\n", 1)[0].trim().replace(/\.$/, "");
+      reportFault("lost", `The GPU device was lost${reason ? `: ${reason}` : ""}.`, device);
+    });
+    // A failed createBuffer returns an invalid buffer and says nothing until the
+    // validation errors that follow, or until the fold reads back zeros. This is
+    // the first honest report that the card is out of memory.
+    let outOfMemory = false;
+    device.addEventListener("uncapturederror", (event) => {
+      console.error("WebGPU:", event.error?.message ?? event.error);
+      if (!outOfMemory && typeof GPUOutOfMemoryError !== "undefined"
+          && event.error instanceof GPUOutOfMemoryError) {
+        // ...once: every buffer the fold goes on to make fails the same way.
+        outOfMemory = true;
+        reportFault("out-of-memory", "The GPU ran out of memory.", device);
+      }
+    });
     // ...so the footer's timing panel can read this device's memory counters.
     // It reads them; it does not install anything on the device.
     devUseDevice(device);
@@ -185,7 +390,9 @@ export function getDevice() {
     settleGridAttendTiling(device);
     return device;
   })();
-  return devicePromise;
+  devicePromise = request;
+  request.catch(() => { if (devicePromise === request) devicePromise = undefined; });
+  return request;
 }
 
 const loaded = new Map();
@@ -301,5 +508,6 @@ export function loadModel(variant, onProgress, signal = undefined, family = "mon
     };
   })();
   loaded.set(key, pending);
+  pending.catch(() => { if (loaded.get(key) === pending) loaded.delete(key); });
   return withAbort(pending, signal);
 }

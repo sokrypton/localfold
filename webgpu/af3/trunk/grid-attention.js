@@ -285,6 +285,13 @@ export function createGridAttentionShaders(
   // with q/k/v/gate/gathered indexed LOCALLY and the normalised input, the
   // mask and the destination indexed GLOBALLY. Off, the text is unchanged.
   const chunked = shape.chunked === true;
+  // 🔴 AND THE NORMALISED INPUT A CHUNK AT A TIME, WHICH IS ONE MORE PAIR-SIZED TENSOR (`localSource`, with `chunked`).
+  // An update writes only its own rows, so a row not reached yet still holds what LayerNorm would have read before the
+  // pass began, and normalising a chunk just before its projection gives the same bits with nothing kept whole.
+  // `normalize` takes the chunk's rows from the pair (across it, in the column direction) and writes them locally,
+  // `project` reads them locally, and `bias` takes a chunk of untransposed rows. attend and project_out do not change.
+  const localSource = chunked && shape.localSource === true;
+  const NORMALIZE_LIVE = localSource ? "live_pairs" : "PAIRS";
   const LIVE = chunked ? "live_pairs" : "PAIRS";
   const chunkBinding = (binding) => (chunked
     ? `@group(0) @binding(${binding}) var<uniform> chunk: vec4<u32>;` : "");
@@ -355,6 +362,7 @@ const LANES_PER_ROW: u32 = ${LANES_PER_ROW}u;
 @group(0) @binding(0) var<storage, read> pair: array<f32>;
 @group(0) @binding(1) var<storage, read> weights: array<f32>;
 @group(0) @binding(2) var<storage, read_write> normalized: array<${storageArray(normalizedStorage)}>;
+${localSource ? "@group(0) @binding(3) var<uniform> chunk: vec4<u32>;" : ""}
 
 var<workgroup> tile: array<f32, ${NORMALIZE_ROWS} * ${channels}>;
 var<workgroup> partial_sum: array<f32, 64>;
@@ -366,13 +374,18 @@ var<workgroup> row_inverse_std: array<f32, ${NORMALIZE_ROWS}>;
 fn main(@builtin(workgroup_id) group: vec3<u32>,
         @builtin(local_invocation_id) local_id: vec3<u32>) {
   let base_row = (group.x + group.y * GRID_WIDTH) * NORMALIZE_ROWS;
-  if (base_row >= PAIRS) { return; }
+${localSource ? "  let live_pairs = chunk.y * N;\n" : ""}\
+  if (base_row >= ${NORMALIZE_LIVE}) { return; }
   let local = local_id.x;
 
   // 🔴 THE TAIL IS ZEROED, NOT SKIPPED: PAIRS is rarely a multiple of the tile
   // and the reduction below runs over the whole staged block.
-  let full_tile = base_row + NORMALIZE_ROWS <= PAIRS;
-  if (full_tile) {
+  let full_tile = base_row + NORMALIZE_ROWS <= ${NORMALIZE_LIVE};
+${localSource ? `  for (var index = local; index < NORMALIZE_ROWS * CHANNELS; index += 64u) {
+    let row = base_row + index / CHANNELS;
+    let source = select(0u, ${sourceRow.replace(/row/g, "(chunk.x * N + row)")}, row < live_pairs);
+    tile[index] = select(0.0, pair[source * CHANNELS + index % CHANNELS], row < live_pairs);
+  }` : `  if (full_tile) {
     let base_idx = base_row * CHANNELS;
     for (var index = local; index < NORMALIZE_ROWS * CHANNELS; index += 64u) {
       tile[index] = pair[base_idx + index];
@@ -382,7 +395,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
       let row = base_row + index / CHANNELS;
       tile[index] = select(0.0, pair[row * CHANNELS + index % CHANNELS], row < PAIRS);
     }
-  }
+  }`}
   workgroupBarrier();
 
   let slot = local / LANES_PER_ROW;
@@ -429,7 +442,7 @@ ${channels % 128 === 0 ? `  for (var col_word = local; col_word < PAIR_COUNT; co
     let w_offset_1 = weights[W_NORM_OFFSET + c + 1u];
     for (var slot_of = 0u; slot_of < NORMALIZE_ROWS; slot_of += 1u) {
       let row = base_row + slot_of;
-      if (!full_tile && row >= PAIRS) { break; }
+      if (!full_tile && row >= ${NORMALIZE_LIVE}) { break; }
       let index = slot_of * CHANNELS + c;
       let centre = row_mean[slot_of];
       let scaled = row_inverse_std[slot_of];
@@ -441,7 +454,7 @@ ${channels % 128 === 0 ? `  for (var col_word = local; col_word < PAIR_COUNT; co
   }` : `  for (var word = local; word < NORMALIZE_ROWS * PAIR_COUNT; word += 64u) {
     let slot_of = word / PAIR_COUNT;
     let row = base_row + slot_of;
-    if (!full_tile && row >= PAIRS) { continue; }
+    if (!full_tile && row >= ${NORMALIZE_LIVE}) { continue; }
     let c = (word % PAIR_COUNT) * 2u;
     let index = slot_of * CHANNELS + c;
     let centre = row_mean[slot_of];
@@ -516,15 +529,22 @@ ${vectorHeads
   : "// ...scalar, because HEADS is not a multiple of four; see above.\n"
     + "@group(0) @binding(1) var<storage, read> projection: array<f32>;"}
 @group(0) @binding(2) var<storage, read_write> bias: array<f32>;
+${localSource ? "@group(0) @binding(3) var<uniform> chunk: vec4<u32>;" : ""}
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let row = id.x + id.y * GRID_WIDTH * 64u;
-  if (row >= PAIRS) { return; }
+${localSource ? `  if (row >= chunk.y * N) { return; }
+  // 🔴 A CHUNK OF UNTRANSPOSED ROWS, SO THE SWAP MOVES TO THE WRITE: row r of the bias reads s(r), s swaps the indices
+  // and swapping twice is nothing, so the normalised row r belongs at s(r).
+  let whole = chunk.x * N + row;
+  let placed = ${swapBias ? "(whole % N) * N + whole / N" : "whole"};
+  let base = row * CHANNELS;
+  let destination = ${biasDestination.replace(/row/g, "placed")};` : `  if (row >= PAIRS) { return; }
   // 🔴 THE UNTRANSPOSED ROW unless the dialect says otherwise.
   let source = ${swapBias ? "(row % N) * N + row / N" : "row"};
   let base = source * CHANNELS;
-  let destination = ${biasDestination};
+  let destination = ${biasDestination};`}
   // 🔴 THE HEADS ARE CONTIGUOUS IN THE PROJECTION, SO THEY ARE THE VECTOR. This
   // looped heads OUTSIDE channels, re-reading the normalised row for each of
   // them and reading one weight per multiply-add.
@@ -636,7 +656,7 @@ ${ACT_VEC4 ? `${overActGroups((g) => {
   return [0, 1, 2, 3].map((l) => {
     const r = r0 + l;
     const rowExpr = `first + ${r}u`;
-    const srcExpr = chunked
+    const srcExpr = localSource ? rowExpr : chunked
       ? sourceRow.replace(/row/g, `(chunk.x * N + (${rowExpr}))`)
       : sourceRow.replace(/row/g, `(${rowExpr})`);
     return `  let row_${r} = ${rowExpr};
@@ -655,7 +675,7 @@ ${overActGroups((g) => {
 })}
   }` : `  for (var r = 0u; r < ROWS; r += 1u) {
     let row = first + r;
-    let source = select(0u, ${chunked
+    let source = select(0u, ${localSource ? "row" : chunked
       ? sourceRow.replace(/row/g, "(chunk.x * N + row)") : sourceRow}, row < ${LIVE});
     for (var c = local; c < CHANNELS; c += WG) {
       act[r * CHANNELS + c] = ${AT}(select(

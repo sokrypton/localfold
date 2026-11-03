@@ -20,6 +20,7 @@
  * would be fifteen times the largest tensor here for one answer; upstream
  * caches it in `inference_cache` and so should any port.
  */
+import { fastLinear } from "../runtime/linear-backend.js";
 
 const SIGMA_DATA = 16;
 
@@ -44,6 +45,8 @@ function layerNorm(values, rows, channels, scale, offset, epsilon = 1e-5) {
 }
 
 function linear(input, rows, inChannels, outChannels, weights) {
+  const fast = fastLinear(input, rows, inChannels, weights, outChannels);
+  if (fast !== undefined) return fast;
   const out = new Float32Array(rows * outChannels);
   for (let row = 0; row < rows; row += 1) {
     const inBase = row * inChannels;

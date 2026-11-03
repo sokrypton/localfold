@@ -172,7 +172,7 @@ function residentBlocks(device, key) {
  *
  * @param {{record: object, buffer: ArrayBuffer, byteOffset: number}} source
  */
-async function decodeIntoOnDevice(device, source, elements, destination, multiplier = 1) {
+async function decodeIntoOnDevice(device, source, elements, destination, multiplier = 1, element = "f16") {
   if (source === undefined || source === null) return false;
   // A thunk in the shape planBlockUpload reads: it never calls it, it only
   // wants the store, the name and the range. See shared/af3/weights/weights.js.
@@ -181,13 +181,13 @@ async function decodeIntoOnDevice(device, source, elements, destination, multipl
   thunk.tensorName = "tower";
   thunk.first = 0;
   thunk.count = elements;
-  const planned = planBlockUpload([{ name: "tower", thunk, offset: 0, length: elements }], "f16", { multiplier });
+  const planned = planBlockUpload([{ name: "tower", thunk, offset: 0, length: elements }], element, { multiplier });
   if (planned === undefined || planned.gpu.params.length === 0) return false;
   const release = await runBlockUpload(device, planned.gpu, destination);
   // 🔴 NOT AWAITED. The staging goes when the queue says so; waiting here would
   // put a host-device synchronisation inside the block loop, which is the one
   // thing this loop is written to avoid. See webgpu/af3/weights/device-weights.js.
-  void device.queue.onSubmittedWorkDone().then(release);
+  void device.queue.onSubmittedWorkDone().then(release, release);
   return true;
 }
 
@@ -284,11 +284,8 @@ export class EsmcTowerGpu {
       || (typeof Float16Array === "function" && values instanceof Float16Array);
     const narrow = (values) => {
       if (isNarrow(values)) {
-        if (weightPrecision !== "f16") {
-          throw new Error("this tower is compiled for float32 weights and was handed"
-            + " half-precision ones; the shader would read them at twice the stride");
-        }
-        return values;
+        if (weightPrecision === "f16") return values;
+        return values instanceof Uint16Array ? halvesToFloat32(values) : Float32Array.from(values);
       }
       return weightPrecision === "f16" ? float32ToFloat16Array(values) : values;
     };
@@ -596,7 +593,11 @@ export class EsmcTowerGpu {
           const source = sources?.[leaf];
           if (source !== undefined) {
             const elements = elementsOf(source.record);
-            const bytes = Math.ceil(elements / 2) * 4;
+            // In the element this tower's shaders read. These were decoded to halves on every device, and on one with no
+            // shader-f16 - stock Chrome over Vulkan on NVIDIA - the shaders read those halves as f32 from a buffer half
+            // the size: the language model's output was noise, every fold went on to finish on it, and ubiquitin came
+            // out at pLDDT 52 and pTM 0.19 where this reads 87 and 0.86.
+            const bytes = weightPrecision === "f16" ? Math.ceil(elements / 2) * 4 : elements * 4;
             if (store !== undefined) {
               const allocation = this.allocator.allocate(
                 `esmc.b${layer}.${name}`, bytes, storage | GPUBufferUsage.COPY_DST);
@@ -605,7 +606,7 @@ export class EsmcTowerGpu {
               let recordings;
               try {
                 decoded = await decodeIntoOnDevice(this.device, source, elements,
-                                                   allocation.buffer, multiplier);
+                                                   allocation.buffer, multiplier, weightPrecision);
               } finally {
                 recordings = stop();
               }
@@ -635,7 +636,7 @@ export class EsmcTowerGpu {
             }
             const allocation = this.allocator.allocate(
               `esmc.b${layer}.${name}`, bytes, storage | GPUBufferUsage.COPY_DST);
-            if (await decodeIntoOnDevice(this.device, source, elements, allocation.buffer, multiplier)) {
+            if (await decodeIntoOnDevice(this.device, source, elements, allocation.buffer, multiplier, weightPrecision)) {
               perBlock.push(allocation);
               return allocation;
             }

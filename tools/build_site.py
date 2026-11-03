@@ -38,7 +38,7 @@ DOMAIN = "localfold.org"
 
 # WHAT A PUBLIC SITE CONTAINS. Files are copied as-is; directories are copied
 # whole, minus the ignore patterns below.
-FILES = [".nojekyll", "index.html", "dev.html"]
+FILES = [".nojekyll", "index.html", "dev.html", "coi-worker.js"]
 # 🔴 HELD BACK UNTIL THEY ARE FIXED AND CHECKED, NOT DELETED. `single.html` and
 # `proteinhunter.html` are out of the repository and out of the site while the
 # model row they were built against moves under them; the files stay on disk and
