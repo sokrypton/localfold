@@ -3,3 +3,4 @@ test-af2-block
 bench-af2-block
 *.o
 train-af2-smoke
+test-af2-block-f64

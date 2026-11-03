@@ -12,6 +12,7 @@
 #include <map>
 #include <sstream>
 #include "af2.cuh"
+#include "gradcheck.cuh"
 
 using namespace grad;
 
@@ -41,23 +42,25 @@ struct Dump {
   }
 };
 
-static float* upload(const std::vector<float>& h) {
-  float* d; GK(cudaMalloc(&d, h.size() * 4));
-  GK(cudaMemcpy(d, h.data(), h.size() * 4, cudaMemcpyHostToDevice));
+static real* upload(const std::vector<float>& h) {
+  std::vector<real> r(h.begin(), h.end());
+  real* d; GK(cudaMalloc(&d, r.size() * sizeof(real)));
+  GK(cudaMemcpy(d, r.data(), r.size() * sizeof(real), cudaMemcpyHostToDevice));
   return d;
 }
-__global__ void nanK(float* x, size_t n) {
+__global__ void nanK(real* x, size_t n) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t < n) x[t] = __int_as_float(0x7fc00000);
+  if (t < n) x[t] = NAN;
 }
 
 int main(int argc, char** argv) {
   if (argc < 2) { fprintf(stderr, "usage: test-af2-block <dump dir> [--bar=1e-4] [--tf32] [--repeat=N]\n"); return 2; }
-  double bar = 1e-4; int repeat = 1;
+  double bar = 1e-4; int repeat = 1; bool fd = false;
   for (int i = 2; i < argc; ++i) {
     if (!strncmp(argv[i], "--bar=", 6)) bar = atof(argv[i] + 6);
     else if (!strcmp(argv[i], "--tf32")) TF32 = true;
     else if (!strncmp(argv[i], "--repeat=", 9)) repeat = atoi(argv[i] + 9);
+    else if (!strcmp(argv[i], "--gradcheck")) fd = true;
   }
   init();
   Dump d(argv[1]);
@@ -81,23 +84,25 @@ int main(int argc, char** argv) {
   for (auto* p : all.all) {
     const auto& v = d.at("p/" + p->name);
     if (v.size() != p->n) { fprintf(stderr, "%s: %zu in the dump, %zu expected\n", p->name.c_str(), v.size(), p->n); return 1; }
-    GK(cudaMemcpy(p->w, v.data(), p->n * 4, cudaMemcpyHostToDevice));
+    std::vector<real> r(v.begin(), v.end());
+    GK(cudaMemcpy(p->w, r.data(), p->n * sizeof(real), cudaMemcpyHostToDevice));
     nanK<<<blocks(p->n), 256>>>(p->g, p->n);
   }
   printf("%s: L %d S %d Cm %d, %s stack x%d, OPM %s; %zu parameter tensors, %zu parameters\n", argv[1], L, S, Cm,
          b.extra ? "extra" : "main", nblocks, b.opmFirst ? "first" : "last", all.all.size(), all.count());
-  float *msa = upload(d.at("in/msa")), *pair = upload(d.at("in/pair"));
-  float *mmask = upload(d.at("in/msa_mask")), *pmask = upload(d.at("in/pair_mask"));
-  float *ctm = upload(d.at("ct/msa")), *ctp = upload(d.at("ct/pair"));
+  real *msa = upload(d.at("in/msa")), *pair = upload(d.at("in/pair"));
+  real *mmask = upload(d.at("in/msa_mask")), *pmask = upload(d.at("in/pair_mask"));
+  real *ctm = upload(d.at("ct/msa")), *ctp = upload(d.at("ct/pair"));
   size_t mr = (size_t)S * L * Cm, pr = (size_t)L * L * 128;
-  float *mo, *po, *dm, *dp;
-  GK(cudaMalloc(&mo, mr * 4)); GK(cudaMalloc(&po, pr * 4)); GK(cudaMalloc(&dm, mr * 4)); GK(cudaMalloc(&dp, pr * 4));
+  real *mo, *po, *dm, *dp;
+  GK(cudaMalloc(&mo, mr * sizeof(real))); GK(cudaMalloc(&po, pr * sizeof(real)));
+  GK(cudaMalloc(&dm, mr * sizeof(real))); GK(cudaMalloc(&dp, pr * sizeof(real)));
 
   // the parameter gradients must be written, not merely read: zero them only on the second pass onward
   float fwdMs = 0, bwdMs = 0;
   cudaEvent_t e0, e1, e2; cudaEventCreate(&e0); cudaEventCreate(&e1); cudaEventCreate(&e2);
   for (int r = 0; r < repeat; ++r) {
-    if (r == 0) for (auto* p : all.all) GK(cudaMemset(p->g, 0, p->n * 4));
+    if (r == 0) for (auto* p : all.all) GK(cudaMemset(p->g, 0, p->n * sizeof(real)));
     else all.zeroGrad();
     ARENA.reset();
     cudaEventRecord(e0, STREAM);
@@ -107,11 +112,11 @@ int main(int argc, char** argv) {
       af2::blockBackward(b, s, mmask, pmask, ctm, ctp, dm, dp);
     } else {
       st.forward(msa, pair, mmask, pmask, S, L);
-      GK(cudaMemcpyAsync(mo, st.msaIn.back(), mr * 4, cudaMemcpyDeviceToDevice, STREAM));
-      GK(cudaMemcpyAsync(po, st.pairIn.back(), pr * 4, cudaMemcpyDeviceToDevice, STREAM));
+      GK(cudaMemcpyAsync(mo, st.msaIn.back(), mr * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
+      GK(cudaMemcpyAsync(po, st.pairIn.back(), pr * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
       cudaEventRecord(e1, STREAM);
-      GK(cudaMemcpyAsync(dm, ctm, mr * 4, cudaMemcpyDeviceToDevice, STREAM));
-      GK(cudaMemcpyAsync(dp, ctp, pr * 4, cudaMemcpyDeviceToDevice, STREAM));
+      GK(cudaMemcpyAsync(dm, ctm, mr * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
+      GK(cudaMemcpyAsync(dp, ctp, pr * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
       st.backward(mmask, pmask, dm, dp);
     }
     cudaEventRecord(e2, STREAM);
@@ -127,7 +132,7 @@ int main(int argc, char** argv) {
   // nothing but rounding on either side. What is reported is the ratio to that bar; a fail is a ratio above 1.
   double worst = 0; std::string worstName;
   int failed = 0;
-  auto check = [&](const std::string& name, const float* dev, const std::vector<float>& ref, bool quiet = false) {
+  auto check = [&](const std::string& name, const real* dev, const std::vector<float>& ref, bool quiet = false) {
     double e = relRms(host(dev, ref.size()), ref);
     auto it = d.t.find("e32/" + name);
     double e32 = it == d.t.end() ? 0 : it->second[0];
@@ -155,6 +160,20 @@ int main(int argc, char** argv) {
   printf("  every parameter gradient (%zu): worst %.2f of its bar\n", all.all.size(), pw);
   printf("  forward %.2f ms, backward %.2f ms; arena %.1f MiB high water, %.1f MiB held\n", fwdMs, bwdMs,
          ARENA.high / 1048576.0, ARENA.held() / 1048576.0);
+  if (fd) {        // the reference-free check (gradcheck.cuh) on the same block: it must agree with the oracle's verdict
+    GradCheck gc;
+    if (getenv("GC_REL")) gc.rel = atof(getenv("GC_REL"));
+    gc.add("in/msa", msa, dm, mr);
+    gc.add("in/pair", pair, dp, pr);
+    for (auto* p : all.all) gc.add(*p);
+    gc.output(nblocks == 1 ? mo : st.msaIn.back(), ctm, mr);
+    gc.output(nblocks == 1 ? po : st.pairIn.back(), ctp, pr);
+    failed += gc.run([&] {
+      ARENA.reset();
+      if (nblocks == 1) af2::blockForward(b, msa, pair, mmask, pmask, mo, po, S, L);
+      else st.forward(msa, pair, mmask, pmask, S, L);
+    });
+  }
   printf("%s: worst %.2f of its bar (%s), %d above\n", failed ? "FAIL" : "PASS", worst, worstName.c_str(), failed);
   return failed ? 1 : 0;
 }
