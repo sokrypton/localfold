@@ -22,6 +22,8 @@ build cuda/grad/test-msap -O1 cuda/grad/test_msap.cu
 build cuda/grad/test-msap-f64 -O2 -DGRAD_F64 cuda/grad/test_msap.cu
 build cuda/grad/test-bioemu2 -O1 cuda/grad/test_bioemu2.cu
 build cuda/grad/test-bioemu2-f64 -O2 -DGRAD_F64 cuda/grad/test_bioemu2.cu
+build cuda/grad/test-atom -O1 --default-stream per-thread cuda/grad/test_atom.cu
+build cuda/grad/test-atom-f64 -O2 -DGRAD_F64 cuda/grad/test_atom.cu
 build cuda/grad/test-rfd4p -O1 cuda/grad/test_rfd4p.cu
 build cuda/grad/test-rfd4p-f64 -O2 -DGRAD_F64 cuda/grad/test_rfd4p.cu
 # AF2 against af3-any-model's jax.vjp: the float64 build on every dump (both sides float64 - no ReLU input can sit
@@ -42,7 +44,9 @@ for fb in "model-af3-full-f32 af3" "model-boltz2-f32 boltz2" "model-protenix2-f3
   run cuda/grad/test-af3 --bundle=$1 --family=$2
   run cuda/grad/test-af3 --msa --bundle=$1 --family=$2
   run cuda/grad/test-af3diff --bundle=$1 --family=$2
+  for E in diffusion.encoder diffusion.decoder targetFeat.encoder; do run cuda/grad/test-atom --bundle=$1 --family=$2 --stack=$E; done
 done
+run cuda/grad/test-atom-f64
 run cuda/grad/test-af3 --bundle=model-mol1-f32 --family=mol1 --prefix=trunk.pairMixerBlocks.
 run cuda/grad/test-ef2
 run cuda/grad/test-msap --layer=0

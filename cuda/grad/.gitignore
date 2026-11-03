@@ -17,3 +17,5 @@ test-bioemu2
 test-bioemu2-f64
 test-rfd4p
 test-rfd4p-f64
+test-atom
+test-atom-f64
