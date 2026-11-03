@@ -211,9 +211,10 @@ export class Af3MsaStackGpu {
         && (deviceTuning(this.device).triangleContractArithmetic ?? "f16") === "f16" ? "f16" : "f32",
       gridProjectArithmetic: deviceTuning(this.device).gridProjectArithmetic,
       // ...and a large pair a piece at a time, as in the pairformer
-      sequentialTriangle: options.sequentialTriangle ?? true,
+      sequentialTriangle: options.sequentialTriangle ?? deviceTuning(this.device).sequentialTriangle ?? true,
       sequentialGroups: options.sequentialGroups,
       sequentialChunkBytes: options.sequentialChunkBytes,
+      sequentialContractWork: options.sequentialContractWork,
       sequentialHiddenParts: 1,
       ...(options.forceCompact === true ? { forceCompact: true } : {}),
       maxComputeWorkgroupStorageSize: this.device.limits.maxComputeWorkgroupStorageSize,
@@ -589,8 +590,8 @@ export class Af3MsaStackGpu {
     const spread = (groups) => [Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH)];
     const ceil = (value, divisor) => Math.ceil(value / divisor);
     // A large block goes to the queue in pieces: see `flush` in encodePairTrack.
-    const flush = () => {
-      if (!context.pacer.pieceDue()) return;
+    const flush = (heavy) => {
+      if (!context.pacer.pieceDue(heavy)) return;
       endPass();
       this.device.queue.submit([encoder.finish()]);
       encoder = this.device.createCommandEncoder({ label: "af3-msa-block" });

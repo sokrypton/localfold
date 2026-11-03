@@ -1,12 +1,12 @@
 /**
- * What the sequential track costs in the AlphaFold 3 lineage: a pairformer block's time against what the stack holds.
+ * What the sequential track holds in the AlphaFold 3 lineage: a pairformer stack's peak against each way of running it.
  *
- *     node tools/gpu-chrome.mjs tools/gpu/time-af3-track.js --family=intellifold2 --lengths=300 --blocks=4 \
- *       --arms=whole,compact,sequential,g2,g4,g16
+ *     node tools/gpu-chrome.mjs tools/gpu/memory-af3-track.js --family=intellifold2 --lengths=300 --blocks=2 \
+ *       --arms=whole,compact,sequential,g4,g2,g4c128
  *
- * `whole` is the whole-tensor track, `compact` the channel-chunked one, `sequential` what the page runs, and `gN` that
- * with N channel groups. Each arm runs twice over one random pair and single with real weights and the second run is the
- * one reported, so a pipeline's compile is not in its time.
+ * `whole` is the whole-tensor track, `compact` the channel-chunked one, `sequential` what the page runs, `gN` that with N
+ * channel groups and `gNcM` also with row chunks of M MiB. Each arm runs one random pair and single through real weights.
+ * What they cost in time is tools/gpu/hash-af3-fold.js's to say, over a whole fold: see the note there.
  */
 import { Af3PairformerStackGpu } from "../../webgpu/af3/trunk/pairformer-block.js";
 import { HttpTensorStore } from "../../shared/bundles/http-tensor-store.js";
@@ -32,14 +32,16 @@ function armOptions(arm) {
   if (arm === "whole") return { forceCompact: false, sequentialTriangle: false };
   if (arm === "compact") return { forceCompact: true, sequentialTriangle: false };
   if (arm === "sequential") return { forceCompact: true, sequentialTriangle: true };
-  return { forceCompact: true, sequentialTriangle: true, sequentialGroups: Number(arm.slice(1)) };
+  const [, groups, chunkMiB] = /^g(\d+)(?:c(\d+))?$/.exec(arm);
+  return { forceCompact: true, sequentialTriangle: true, sequentialGroups: Number(groups),
+           ...(chunkMiB === undefined ? {} : { sequentialChunkBytes: Number(chunkMiB) * 1024 * 1024 }) };
 }
 
 export async function main(device, args) {
   const family = option(args, "family", "protenix2");
   const lengths = option(args, "lengths", "300").split(",").map(Number);
-  const blockCount = Number(option(args, "blocks", "4"));
-  const arms = option(args, "arms", "whole,compact,sequential,g2,g4,g16").split(",");
+  const blockCount = Number(option(args, "blocks", "2"));
+  const arms = option(args, "arms", "whole,compact,sequential,g4,g2").split(",");
   const store = await HttpTensorStore.fromManifest(bundleBaseUrl(family), await loadManifest(family));
   const dialect = af3Dialect(store);
   const { pairformerBlocks: blocks } = await trunkWeights(store, blockCount, 0, { allowPrefix: true });
@@ -52,14 +54,9 @@ export async function main(device, args) {
     const seqMask = new Float32Array(n).fill(1);
     for (const arm of arms) {
       const stack = new Af3PairformerStackGpu(device, { residentWeights: false });
-      let last;
-      for (let repeat = 0; repeat < 2; repeat += 1) {
-        const started = performance.now();
-        // eslint-disable-next-line no-await-in-loop
-        const out = await stack.run({ pair: pair.slice(), single: single.slice(), pairMask, seqMask, tokens: n }, blocks, dialect, armOptions(arm));
-        last = { ms: performance.now() - started, peak: out.memory?.peakBytes ?? 0 };
-      }
-      const row = { family, n, arm, msPerBlock: Math.round(last.ms / blockCount), peakMiB: Math.round(last.peak / 1048576) };
+      // eslint-disable-next-line no-await-in-loop
+      const out = await stack.run({ pair: pair.slice(), single: single.slice(), pairMask, seqMask, tokens: n }, blocks, dialect, armOptions(arm));
+      const row = { family, n, arm, peakMiB: Math.round((out.memory?.peakBytes ?? 0) / 1048576) };
       console.log(JSON.stringify(row));
       report.push(row);
     }

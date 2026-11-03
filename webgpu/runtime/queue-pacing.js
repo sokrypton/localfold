@@ -5,13 +5,14 @@
  * waits for it, and so does closing the tab. So the window is a time, about a second of queued work, up to the sixteen a
  * small block was measured at. See the note in webgpu/af3/trunk/pairformer-block.js.
  *
- * It slides. Waiting for the queue to empty leaves the card idle while the next block is encoded, which is 5% of a fold
- * when a block takes a third of a second and the window is three, so each new block waits only for the oldest. The card
- * goes idle only where a block alone is worth the second and the window is one, and encoding is then a small part of it.
+ * It slides. Waiting for the queue to empty leaves the card idle while the next block is encoded, so each new block
+ * waits only for the oldest. The card goes idle only where a block alone is worth the second and the window is one, and
+ * encoding is then a small part of it.
  *
- * And a block too long for one submission goes in pieces, as many to a submission as fill SUBMISSION_MS. One piece each
- * was forty submissions a block, half a millisecond of driver time each. A piece is a mean, and the longest are a dozen
- * times that, which still leaves a submission well inside a driver's two seconds.
+ * And a block too long for one submission goes in pieces, as many to a submission as fill SUBMISSION_MS, where one piece
+ * each is forty submissions a block. A piece is a mean, and the kernels that dominate a block are far past it: at 1000
+ * tokens of IntelliFold-2 a run of grid chunks and transition chunks counted as cheap filled 900 ms against a target of 50.
+ * So a piece known to be heavy ends its submission whatever the count.
  */
 const QUEUED_WORK_MS = 1000;
 const MOST_BLOCKS = 16;
@@ -35,17 +36,20 @@ export class QueuePacer {
   }
 
   /** A piece of a block is encoded: whether to send what has built up. One at a time until a block says what a piece takes. */
-  pieceDue() {
+  pieceDue(heavy = false) {
     this.pieces += 1;
     this.unsent += 1;
-    if (this.unsent < this.piecesEach) return false;
+    if (!heavy && this.unsent < this.piecesEach) return false;
     this.unsent = 0;
     return true;
   }
 
   /** One block is in the queue. Resolves when there is room for the next; `drain` empties the queue whatever its length. */
   async blockSubmitted(drain = false) {
-    this.queued.push({ pieces: this.pieces, finished: this.device.queue.onSubmittedWorkDone().then(() => performance.now()) });
+    const finished = this.device.queue.onSubmittedWorkDone().then(() => performance.now());
+    // ...waited on by a later block, if there is one: a device lost before then is said by the fold, not by this.
+    finished.catch(() => {});
+    this.queued.push({ pieces: this.pieces, finished });
     this.pieces = 0;
     this.unsent = 0;
     while (this.queued.length > 0 && (drain || this.queued.length >= this.window)) {

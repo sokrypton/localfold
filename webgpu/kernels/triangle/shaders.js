@@ -736,7 +736,7 @@ fn main(
 ) {
   let i0 = group.y * CONTRACT_ROWS + local.y;
   let j0 = group.x * CONTRACT_COLUMNS + local.x;
-  let h = group.z;
+  let h = group.z${rowChunked ? " + chunk.z" : ""};
   let tile_a_index = local.y * 9u + local.x;
   let tile_b_index = local.y * 8u + local.x;
 ${contractRowPre}
@@ -846,7 +846,7 @@ fn main(
 ) {
   let i0 = group.y * 64u;
   let j0 = group.x * 64u;
-  let h = group.z;
+  let h = group.z${rowChunked ? " + chunk.z" : ""};
   let a_r0 = i0 + ${lane};
   let a_r1 = a_r0 + 16u;
   let a_r2 = a_r0 + 32u;

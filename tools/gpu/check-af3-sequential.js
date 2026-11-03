@@ -18,6 +18,7 @@ import { Af3TemplateEmbedderGpu } from "../../webgpu/af3/trunk/template.js";
 import { HttpTensorStore } from "../../shared/bundles/http-tensor-store.js";
 import { bundleBaseUrl, loadManifest } from "../../shared/bundles/manifests/index.js";
 import { af3Dialect, trunkWeights } from "../../shared/af3/weights/weights.js";
+import { setDeviceTuning } from "../../webgpu/runtime/device-profile.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
@@ -36,6 +37,11 @@ function random(length, seed) {
 
 const ARMS = [
   ["compact", { forceCompact: true, sequentialTriangle: false }],
+  ["sequential as a fold runs it", { forceCompact: true, sequentialTriangle: true }],
+  ["sequential g8", { forceCompact: true, sequentialTriangle: true, sequentialGroups: 8 }],
+  ["sequential g4", { forceCompact: true, sequentialTriangle: true, sequentialGroups: 4 }],
+  ["sequential g2", { forceCompact: true, sequentialTriangle: true, sequentialGroups: 2 }],
+  ["sequential g2, a channel a dispatch", { forceCompact: true, sequentialTriangle: true, sequentialGroups: 2, sequentialContractWork: 1 }],
   ["sequential", { forceCompact: true, sequentialTriangle: true, sequentialChunkBytes: 1048576 }],
   ["sequential g16", { forceCompact: true, sequentialTriangle: true, sequentialGroups: 16, sequentialChunkBytes: 262144 }],
 ];
@@ -45,10 +51,23 @@ function assertSameBits(where, arm, name, expected, actual) {
   if (!expected.every(Number.isFinite)) throw new Error(`${where}: ${name} has non-finite elements`);
   let differing = 0;
   for (let i = 0; i < expected.length; i += 1) if (!Object.is(expected[i], actual[i])) differing += 1;
-  if (differing !== 0) throw new Error(`${where}, ${arm}: ${name} differs from the whole-tensor track in ${differing} elements`);
+  if (differing !== 0) {
+    let largest = 0;
+    for (let i = 0; i < expected.length; i += 1) largest = Math.max(largest, Math.abs(expected[i] - actual[i]));
+    throw new Error(`${where}, ${arm}: ${name} differs from the whole-tensor track in ${differing} of ${expected.length} elements, by at most ${largest}`);
+  }
 }
 
 export async function main(device, args) {
+  // 🔴 ONE TIER OF KERNELS, or an arm is compared with a different kernel. `runtimeLoopBounds: "tiered"` swaps each
+  // opaque-bound kernel for its unrolled form behind a fold and the two round differently (see the knob's note), so the
+  // whole-tensor track's own answer moved partway through a run of this check on a 3070, the same two answers on `main`.
+  setDeviceTuning(device, { runtimeLoopBounds: false });
+  const named = option(args, "arms", "");
+  if (named !== "") {
+    const wanted = named.split(",");
+    for (let i = ARMS.length - 1; i >= 0; i -= 1) if (!wanted.includes(ARMS[i][0])) ARMS.splice(i, 1);
+  }
   const lengths = option(args, "lengths", "130,257").split(",").map(Number);
   const blockCount = Number(option(args, "blocks", "2"));
   const report = [];

@@ -60,7 +60,7 @@ import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 import { storageBytes } from "../runtime/storage.js";
 import {
   UNPACKED_PAIR_SCRATCH,
-  compilePairTrack, encodePairTrack, packPairTrackWeights,
+  compilePairTrack, encodePairTrack, packPairTrackWeights, sequentialGroupsFor,
 } from "../af3/trunk/pair-track.js";
 import { settleGridAttendTiling } from "../af3/trunk/grid-attend-race.js";
 import { QueuePacer } from "../runtime/queue-pacing.js";
@@ -230,8 +230,9 @@ export class Esmfold2TrunkGpu {
     // rule as AF3's trunk (see trunk.js there); `options.leanPair`
     // forces it either way.
     const { residentBytes, budgetBytes } = memoryTotals(this.device);
-    const leanPair = options.leanPair ?? (budgetBytes != null
-      && residentBytes + 4 * pairs * channels * 4 + 512 * 1048576 > budgetBytes);
+    // (and a pair in several buffers has no other way through: only the sequential track binds it a chunk at a time)
+    const leanPair = options.leanPair ?? ((state.buffer?.segments?.length ?? 1) > 1 || (budgetBytes != null
+      && residentBytes + 4 * pairs * channels * 4 + 512 * 1048576 > budgetBytes));
     const triangleProjectMatrix = !leanPair
       && tuning.triangleProjectMatrix === true && splitConfig !== null
       && !matrixContractionOverflows(this.device)
@@ -258,12 +259,15 @@ export class Esmfold2TrunkGpu {
         : false;
     const triangleContractArithmetic = stagedPrecision === "f16" && accumulatePrecision === "f16"
       && (tuning.triangleContractArithmetic ?? "f16") === "f16" ? "f16" : "f32";
-    const sequentialTriangle = options.sequentialTriangle ?? this.options.sequentialTriangle ?? false;
-    const sequentialGroups = options.sequentialGroups ?? this.options.sequentialGroups;
+    const sequentialTriangle = options.sequentialTriangle ?? tuning.sequentialTriangle ?? this.options.sequentialTriangle ?? false;
+    // Asked once, because a fold's loops hold their scratch between them and it would read as memory in use.
+    const sequentialGroups = options.sequentialGroups ?? this.options.sequentialGroups
+      ?? (this.fewestGroups ??= sequentialGroupsFor(this.device, pairs * channels * 4));
     const sequentialChunkBytes = options.sequentialChunkBytes ?? this.options.sequentialChunkBytes;
     const sequentialHiddenParts = options.sequentialHiddenParts ?? this.options.sequentialHiddenParts;
+    const sequentialContractWork = options.sequentialContractWork ?? this.options.sequentialContractWork;
     const trackKey = `${base}:${stagedPrecision}:${weightPrecision}:${accumulatePrecision}:${transitionFactor}:`
-      + `seq${sequentialTriangle}:${sequentialGroups ?? ""}:${sequentialChunkBytes ?? ""}:${sequentialHiddenParts ?? ""}:`
+      + `seq${sequentialTriangle}:${sequentialGroups}:${sequentialChunkBytes ?? ""}:${sequentialHiddenParts ?? ""}:${sequentialContractWork ?? ""}:`
       + `fc${options.forceCompact === true}:`
       + `${triangleContractArithmetic}:${JSON.stringify(pairTransitionSplit)}:${JSON.stringify(triangleProjectMatrix)}:`
       + `${JSON.stringify(tuning.trianglePairProjectTile)}:${tuning.triangleProjectOutColumns ?? ""}:${tuning.pairTransitionChunkBytes ?? ""}`;
@@ -284,7 +288,7 @@ export class Esmfold2TrunkGpu {
           // pair track (webgpu/kernels/triangle/shaders.js; raced on an Apple GPU: grid-attend-race.js)
           triangleContractArithmetic,
           triangleProjectMatrix,
-          sequentialTriangle, sequentialGroups, sequentialChunkBytes, sequentialHiddenParts,
+          sequentialTriangle, sequentialGroups, sequentialChunkBytes, sequentialHiddenParts, sequentialContractWork,
           maxBufferSize: this.device.limits.maxBufferSize,
           // (forces the channel chunking below the size that is worth it, for a checker at a small n)
           ...(options.forceCompact === true ? { forceCompact: true } : {}),
@@ -390,7 +394,7 @@ export class Esmfold2TrunkGpu {
         if (options.onBlockDone !== undefined) {
           const submitted = index + 1;
           void this.device.queue.onSubmittedWorkDone()
-            .then(() => options.onBlockDone(submitted, blocks.length));
+            .then(() => options.onBlockDone(submitted, blocks.length)).catch(() => {});
         }
         if (options.wait !== false) {
           await pacer.blockSubmitted(index === blocks.length - 1);
@@ -567,8 +571,8 @@ export class Esmfold2TrunkGpu {
       pass.dispatchWorkgroups(x, y, z);
       if (!batchPasses) pass.end();
     };
-    const flush = () => {
-      if (!context.pacer.pieceDue()) return;
+    const flush = (heavy) => {
+      if (!context.pacer.pieceDue(heavy)) return;
       endPass();
       this.device.queue.submit([encoder.finish()]);
       encoder = this.device.createCommandEncoder({ label: "esmfold2-trunk-block" });

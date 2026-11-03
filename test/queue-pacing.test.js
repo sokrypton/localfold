@@ -111,6 +111,16 @@ test("a fixed window stays, and its pieces are still measured", async (t) => {
   assert.equal(pacer.piecesEach, 25);
 });
 
+test("a heavy piece ends its submission whatever the count", async (t) => {
+  const clock = clocked(t);
+  const pacer = new QueuePacer(clock.device, { fixed: 1 });
+  await block(pacer, clock, 40, 2);
+  assert.equal(pacer.piecesEach, 25);
+  assert.equal(pacer.pieceDue(), false);
+  assert.equal(pacer.pieceDue(true), true);
+  assert.equal(pacer.unsent, 0);
+});
+
 test("a drain empties the queue whatever the window", async (t) => {
   const clock = clocked(t);
   const pacer = new QueuePacer(clock.device, { fixed: 8 });

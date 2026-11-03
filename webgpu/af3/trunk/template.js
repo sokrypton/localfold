@@ -571,9 +571,10 @@ export class Af3TemplateEmbedderGpu {
         && gridProjectMatrixConfig(this.device),
       // ...and a large pair a piece at a time, as in the pairformer. IntelliFold-2's stack is 256 channels, and with the
       // other two stacks on this track its seven pair-sized tensors would be the fold's peak.
-      sequentialTriangle: options.sequentialTriangle ?? true,
+      sequentialTriangle: options.sequentialTriangle ?? deviceTuning(this.device).sequentialTriangle ?? true,
       sequentialGroups: options.sequentialGroups,
       sequentialChunkBytes: options.sequentialChunkBytes,
+      sequentialContractWork: options.sequentialContractWork,
       sequentialHiddenParts: 1,
       ...(options.forceCompact === true ? { forceCompact: true } : {}),
       maxComputeWorkgroupStorageSize: this.device.limits.maxComputeWorkgroupStorageSize,

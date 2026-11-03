@@ -17,6 +17,7 @@
  * Both arms run in one process over one input, so a second process's random pair cannot be what differs.
  */
 import { Esmfold2TrunkGpu } from "../../webgpu/esmfold2/trunk.js";
+import { setDeviceTuning } from "../../webgpu/runtime/device-profile.js";
 import { reader } from "./fold-esmfold2.js";
 import { GpuBufferAllocator } from "../../webgpu/runtime/allocator.js";
 import { SegmentedAllocation } from "../../webgpu/runtime/segmented.js";
@@ -28,6 +29,8 @@ const option = (args, name, fallback) => {
 };
 
 export async function main(device, args) {
+  // One tier of kernels, or an arm is compared with a different kernel: see check-af3-sequential.js.
+  setDeviceTuning(device, { runtimeLoopBounds: false });
   const bundle = option(args, "bundle", "/model-ef2-fast-300m-int5");
   const lengths = option(args, "lengths", "130,257").split(",").map(Number);
   const blockCount = Number(option(args, "blocks", "2"));
@@ -97,6 +100,13 @@ export async function main(device, args) {
       // eslint-disable-next-line no-await-in-loop
       await run("sequential g16", { forceCompact: true, sequentialTriangle: true, sequentialGroups: 16,
                                     sequentialChunkBytes: 262144 }),
+      // eslint-disable-next-line no-await-in-loop
+      await run("sequential g2", { forceCompact: true, sequentialTriangle: true, sequentialGroups: 2 }),
+      // eslint-disable-next-line no-await-in-loop
+      await run("sequential g2, a channel a dispatch", { forceCompact: true, sequentialTriangle: true, sequentialGroups: 2,
+                                                         sequentialContractWork: 1 }),
+      // eslint-disable-next-line no-await-in-loop
+      await run("sequential as a fold runs it", { forceCompact: true, sequentialTriangle: true }),
       // eslint-disable-next-line no-await-in-loop
       await run("sequential, output in two buffers", {
         forceCompact: true, sequentialTriangle: true, sequentialGroups: 8, sequentialHiddenParts: 2,

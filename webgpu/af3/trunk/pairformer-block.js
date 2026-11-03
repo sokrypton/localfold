@@ -513,9 +513,10 @@ export class Af3PairformerStackGpu {
       // ...and grid attention's projection, by the same width rule.
       gridProjectMatrix: pairMatrixKernels && gridProjectMatrixConfig(this.device, pairChannels),
       // ...and a large pair a piece at a time, in about half the memory: same bits (check-af3-sequential.js)
-      sequentialTriangle: options.sequentialTriangle ?? true,
+      sequentialTriangle: options.sequentialTriangle ?? deviceTuning(this.device).sequentialTriangle ?? true,
       sequentialGroups: options.sequentialGroups,
       sequentialChunkBytes: options.sequentialChunkBytes,
+      sequentialContractWork: options.sequentialContractWork,
       sequentialHiddenParts: 1,
       ...(options.forceCompact === true ? { forceCompact: true } : {}),
       maxComputeWorkgroupStorageSize: this.device.limits.maxComputeWorkgroupStorageSize,
@@ -778,7 +779,7 @@ export class Af3PairformerStackGpu {
         if (options.onBlockDone !== undefined) {
           const submitted = index + 1;
           void this.device.queue.onSubmittedWorkDone()
-            .then(() => options.onBlockDone(submitted, blocks.length));
+            .then(() => options.onBlockDone(submitted, blocks.length)).catch(() => {});
         }
         const last = index === blocks.length - 1;
         if (!(last && deferReadback)) {
@@ -1105,8 +1106,8 @@ export class Af3PairformerStackGpu {
     };
     const spread = (groups) => [Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH)];
     const ceil = (value, divisor) => Math.ceil(value / divisor);
-    const flush = () => {
-      if (!context.pacer.pieceDue()) return;
+    const flush = (heavy) => {
+      if (!context.pacer.pieceDue(heavy)) return;
       endPass();
       this.device.queue.submit([encoder.finish()]);
       encoder = this.device.createCommandEncoder({ label: "af3-pairformer-block" });
