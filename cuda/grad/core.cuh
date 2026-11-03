@@ -17,8 +17,12 @@
 #include <functional>
 #include <string>
 #include <vector>
+#include <nvtx3/nvToolsExt.h>
 
 namespace grad {
+// an NVTX range for nsys (nsys stats -r nvtx_gpu_proj_sum): free when no profiler is attached
+struct Range { explicit Range(const char* n) { nvtxRangePushA(n); } ~Range() { nvtxRangePop(); } };
+
 
 // The whole library is written on `real`: float32 for training and for the oracle gates, float64 under
 // -DGRAD_F64 for the reference-free gradient check (gradcheck.cuh), where a central difference is exact to ~1e-8.
@@ -143,9 +147,38 @@ inline void mm(const real* x, const real* w, real* y, int M, int K, int N, real 
 inline void mmBT(const real* dy, const real* w, real* dx, int M, int K, int N, real beta = 0.f, real alpha = 1.f) {
   GB(xgemm(BLAS, CUBLAS_OP_T, CUBLAS_OP_N, K, M, N, &alpha, w, N, dy, N, &beta, dx, K));
 }
-// dw[K,N] (+)= x[M,K]^T dy[M,N]
+// dw[K,N] (+)= x[M,K]^T dy[M,N]. A weight gradient is a tall reduction into a small output (65,536 pair rows into
+// 128 x 128), which cuBLAS gives one CTA a 128 x 128 tile and does not split: 0.43 ms where the arithmetic is 0.03.
+// Where the output has too few tiles to fill the device, M is cut into equal chunks (one strided-batched GEMM into
+// partials) and the partials summed - in a fixed order, so it is as deterministic as the single GEMM.
+__global__ void sumPartialsK(real* dw, const real* p, int parts, size_t n, real alpha, real beta) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  real s = 0;
+  for (int k = 0; k < parts; ++k) s += p[k * n + i];
+  dw[i] = beta == 0 ? alpha * s : beta * dw[i] + alpha * s;
+}
 inline void mmAT(const real* x, const real* dy, real* dw, int M, int K, int N, real beta = 1.f, real alpha = 1.f) {
-  GB(xgemm(BLAS, CUBLAS_OP_N, CUBLAS_OP_T, N, K, M, &alpha, dy, N, x, K, &beta, dw, N));
+  // measured on the A100 (cuda/grad/README.md): only TF32 with a one-tile output gains - 65,536 x 128 x 128 0.42 ms
+  // -> 0.07 at 32 chunks - while pedantic float32's strided-batched kernels are 10-50x slower than its single GEMM
+  // and a larger output already fills the device
+  const bool oneTile = K <= 128 && N <= 128 && (size_t)K * N >= 8192;
+  const int splits = TF32 && oneTile ? std::min(32, M / 2048) : 1;
+  if (splits <= 1) {
+    GB(xgemm(BLAS, CUBLAS_OP_N, CUBLAS_OP_T, N, K, M, &alpha, dy, N, x, K, &beta, dw, N));
+    return;
+  }
+  Scratch scratch;
+  const int c = M / splits, rest = M - c * splits;
+  const size_t n = (size_t)K * N;
+  real* p = ARENA.get(n * splits);
+  const real one = 1, zero = 0;
+  GB(xgemmB(BLAS, CUBLAS_OP_N, CUBLAS_OP_T, N, K, c, &one, dy, N, (long long)c * N, x, K, (long long)c * K, &zero, p,
+            N, (long long)n, splits));
+  if (rest)
+    GB(xgemm(BLAS, CUBLAS_OP_N, CUBLAS_OP_T, N, K, rest, &one, dy + (size_t)c * splits * N, N,
+             x + (size_t)c * splits * K, K, &one, p, N));
+  sumPartialsK<<<blocks(n), 256, 0, STREAM>>>(dw, p, splits, n, alpha, beta);
 }
 // batched over `count` matrices at fixed strides: C_b = op(A_b) op(B_b), all row-major
 // (row-major C = A B is column-major C^T = B^T A^T)
@@ -168,17 +201,44 @@ __global__ void biasK(real* y, const real* b, size_t rows, int C) {
   if (t < rows * C) y[t] += b[t % C];
 }
 // g[c] += sum over rows of d[r, c]; a block a column tile, rows strided, one atomic a column a block
-__global__ void colSumK(real* g, const real* d, size_t rows, int C) {
+__global__ void colSumK(real* g, const real* d, size_t rows, int C, int ld) {
   int c = blockIdx.x * 32 + threadIdx.x;
   if (c >= C) return;
   real s = 0;
-  for (size_t r = blockIdx.y * blockDim.y + threadIdx.y; r < rows; r += (size_t)gridDim.y * blockDim.y) s += d[r * C + c];
+  for (size_t r = blockIdx.y * blockDim.y + threadIdx.y; r < rows; r += (size_t)gridDim.y * blockDim.y) s += d[r * ld + c];
   atomicAdd(&g[c], s);
 }
-inline void colSum(real* g, const real* d, size_t rows, int C) {
+// the same four columns a thread (float4 loads) where C allows: a block 32 x 4 = 128 columns by 8 row lanes, the
+// row lanes summed in shared memory and one atomic a column a block (atomics from every thread onto 128 addresses
+// were 5.6 ms of a 23 ms backward)
+__global__ void colSum4K(float* g, const float* d, size_t rows, int C, int ld) {
+  __shared__ float4 part[8][32];
+  int c = (blockIdx.x * 32 + threadIdx.x) * 4;
+  float4 s = make_float4(0.f, 0.f, 0.f, 0.f);
+  if (c < C)
+    for (size_t r = blockIdx.y * blockDim.y + threadIdx.y; r < rows; r += (size_t)gridDim.y * blockDim.y) {
+      float4 v = *reinterpret_cast<const float4*>(d + r * ld + c);
+      s.x += v.x; s.y += v.y; s.z += v.z; s.w += v.w;
+    }
+  part[threadIdx.y][threadIdx.x] = s;
+  __syncthreads();
+  if (threadIdx.y || c >= C) return;
+  for (int y = 1; y < 8; ++y) { float4 v = part[y][threadIdx.x]; s.x += v.x; s.y += v.y; s.z += v.z; s.w += v.w; }
+  atomicAdd(&g[c], s.x); atomicAdd(&g[c + 1], s.y); atomicAdd(&g[c + 2], s.z); atomicAdd(&g[c + 3], s.w);
+}
+// (d at row stride ld: a column block of a wider matrix)
+inline void colSum(real* g, const real* d, size_t rows, int C, int ld = 0) {
   if (!rows) return;
+  if (!ld) ld = C;
+  if (sizeof(real) == 4 && C % 4 == 0 && ld % 4 == 0 && ((uintptr_t)d & 15) == 0) {
+    const int C4 = C / 4;
+    const unsigned xb = (C4 + 31) / 32;
+    dim3 b(32, 8), gr(xb, (unsigned)std::min<size_t>((rows + 7) / 8, std::max(1u, 432 / xb)));
+    colSum4K<<<gr, b, 0, STREAM>>>((float*)g, (const float*)d, rows, C, ld);
+    return;
+  }
   dim3 b(32, 8), gr((C + 31) / 32, (unsigned)std::min<size_t>((rows + 7) / 8, 256));
-  colSumK<<<gr, b, 0, STREAM>>>(g, d, rows, C);
+  colSumK<<<gr, b, 0, STREAM>>>(g, d, rows, C, ld);
 }
 
 // ---------------------------------------------------------------- a Linear: y = x W + b, W [K, N] haiku's layout

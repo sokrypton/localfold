@@ -3,6 +3,7 @@
 //   cuda/grad/bench-af2-block [--L=256] [--S=128] [--extra] [--tf32] [--blocks=48]
 #include <cstring>
 #include <curand.h>
+#include <cuda_profiler_api.h>
 #include "af2.cuh"
 using namespace grad;
 int main(int argc, char** argv) {
@@ -37,8 +38,10 @@ int main(int argc, char** argv) {
     ARENA.reset();
     af2::BlockSave s = af2::blockForward(b, msa, pair, mm_, pm, mo, po, S, L);              // the replay, with saves
     cudaEventRecord(e2, STREAM);
+    if (r == 3) cudaProfilerStart();                                                        // (nsys --capture-range=cudaProfilerApi)
     af2::blockBackward(b, s, mm_, pm, ctm, ctp, dm, dp);
     cudaEventRecord(e3, STREAM);
+    if (r == 3) { GK(cudaStreamSynchronize(STREAM)); cudaProfilerStop(); }
     GK(cudaStreamSynchronize(STREAM));
     cudaEventElapsedTime(&f, e0, e1); cudaEventElapsedTime(&fs, e1, e2); cudaEventElapsedTime(&bw, e2, e3);
   }

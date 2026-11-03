@@ -135,7 +135,7 @@ inline QOpmSave qopmForward(const QOpm& o, const real* m, real* pair, int S, int
     real *aw = ARENA.get(R * o.O), *p2 = ARENA.get(LC * LC);
     rowScaleK<<<blocks(R * o.O), 256, 0, STREAM>>>(s.a, s.w, aw, S, (int)LC, (real)1e-32);
     mmAT(aw, s.b, p2, S, (int)LC, (int)LC, 0, (real)(1 / (s.ws + 1e-32)));      // [(i c), (j e)]
-    outerToPairK<<<blocks(P * o.O * o.O), 256, 0, STREAM>>>(p2, s.outer, L, o.O, false);
+    outerToPair(p2, s.outer, L, o.O, false);
   }
   o.toPair.forward(s.outer, s.h, P);
   gluAddK<<<blocks(P * o.Cz), 256, 0, STREAM>>>(s.h, pair, P, o.Cz);
@@ -154,7 +154,7 @@ inline void qopmBackward(QOpm& o, const QOpmSave& s, const real* dpair, real* dm
   // outer = sum_s (w_s + eps) a_s (x) b_s / ws: dws = -sum douter outer / ws
   const double dws = -dot(douter, s.outer, P * o.O * o.O) / (s.ws + 1e-32);
   real* dp2 = ARENA.get(LC * LC);
-  outerToPairK<<<blocks(P * o.O * o.O), 256, 0, STREAM>>>(douter, dp2, L, o.O, true);
+  outerToPair(douter, dp2, L, o.O, true);
   real *X = ARENA.get(R * o.O), *Y = ARENA.get(R * o.O);
   mmBT(s.b, dp2, X, S, (int)LC, (int)LC, 0, inv);       // X = b dP^T / ws  [S, (i c)]
   mm(s.a, dp2, Y, S, (int)LC, (int)LC, 0, inv);         // Y = a dP / ws    [S, (j e)]

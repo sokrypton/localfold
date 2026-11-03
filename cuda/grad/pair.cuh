@@ -25,17 +25,64 @@ struct TriMulSave {
 };
 // [L, L, C2] -> channel-major [C2][L][L]; interleaved, column 2p goes to plane p and 2p + 1 to plane C2/2 + p
 __device__ inline int planeOf(int c, int C2, bool inter) { return inter ? (c & 1) * (C2 / 2) + (c >> 1) : c; }
-__global__ void splitChannelsK(const real* __restrict__ pg, real* __restrict__ cm, int L, int C2, bool inter = false) {
-  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= (size_t)L * L * C2) return;
-  int c = t % C2; size_t ij = t / C2;
-  cm[(size_t)planeOf(c, C2, inter) * L * L + ij] = pg[t];
+// [rows][C2] <-> [plane(c)][rows], a 32 x 32 tile through shared memory so both sides are coalesced
+// mode 0: cm = transpose(pg); mode 1: pg = transpose(cm); mode 2 (split of proj * gate): cm = transpose(a b)
+__global__ void channelsT(const real* __restrict__ x, const real* __restrict__ y, real* __restrict__ out, size_t rows,
+                          int C2, bool inter, int mode) {
+  __shared__ real tile[32][33];
+  const size_t r0 = (size_t)blockIdx.x * 32;
+  const int c0 = blockIdx.y * 32, tx = threadIdx.x, ty = threadIdx.y;
+  if (mode != 1) {
+    for (int k = ty; k < 32; k += 8) {
+      size_t r = r0 + k; int c = c0 + tx;
+      if (r < rows && c < C2) tile[k][tx] = mode == 2 ? x[r * C2 + c] * y[r * C2 + c] : x[r * C2 + c];
+    }
+    __syncthreads();
+    for (int k = ty; k < 32; k += 8) {
+      int c = c0 + k; size_t r = r0 + tx;
+      if (r < rows && c < C2) out[(size_t)planeOf(c, C2, inter) * rows + r] = tile[tx][k];
+    }
+  } else {
+    for (int k = ty; k < 32; k += 8) {
+      int c = c0 + k; size_t r = r0 + tx;
+      if (r < rows && c < C2) tile[tx][k] = x[(size_t)planeOf(c, C2, inter) * rows + r];
+    }
+    __syncthreads();
+    for (int k = ty; k < 32; k += 8) {
+      size_t r = r0 + k; int c = c0 + tx;
+      if (r < rows && c < C2) out[r * C2 + c] = tile[k][tx];
+    }
+  }
 }
-__global__ void mergeChannelsK(const real* __restrict__ cm, real* __restrict__ pg, int L, int C2, bool inter = false) {
-  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= (size_t)L * L * C2) return;
-  int c = t % C2; size_t ij = t / C2;
-  pg[t] = cm[(size_t)planeOf(c, C2, inter) * L * L + ij];
+inline void splitChannels(const real* pg, real* cm, size_t rows, int C2, bool inter, const real* gate = nullptr) {
+  dim3 b(32, 8), g((unsigned)((rows + 31) / 32), (C2 + 31) / 32);
+  channelsT<<<g, b, 0, STREAM>>>(pg, gate, cm, rows, C2, inter, gate ? 2 : 0);
+}
+inline void mergeChannels(const real* cm, real* pg, size_t rows, int C2, bool inter) {
+  dim3 b(32, 8), g((unsigned)((rows + 31) / 32), (C2 + 31) / 32);
+  channelsT<<<g, b, 0, STREAM>>>(cm, nullptr, pg, rows, C2, inter, 1);
+}
+// the backward of pg = proj * gate, with the merge from channel-major dab fused in: dproj = d gate (row-masked),
+// dgate_pre = d proj gate (1 - gate)
+__global__ void mergeGateBwdT(const real* __restrict__ dab, const real* __restrict__ proj, const real* __restrict__ gate,
+                              const real* __restrict__ mask, real* __restrict__ dproj, real* __restrict__ dgp,
+                              size_t rows, int C2, bool inter) {
+  __shared__ real tile[32][33];
+  const size_t r0 = (size_t)blockIdx.x * 32;
+  const int c0 = blockIdx.y * 32, tx = threadIdx.x, ty = threadIdx.y;
+  for (int k = ty; k < 32; k += 8) {
+    int c = c0 + k; size_t r = r0 + tx;
+    if (r < rows && c < C2) tile[tx][k] = dab[(size_t)planeOf(c, C2, inter) * rows + r];
+  }
+  __syncthreads();
+  for (int k = ty; k < 32; k += 8) {
+    size_t r = r0 + k; int c = c0 + tx;
+    if (r >= rows || c >= C2) continue;
+    size_t i = r * C2 + c;
+    real d = tile[k][tx], sg = gate[i];
+    dproj[i] = mask ? d * sg * mask[r] : d * sg;
+    dgp[i] = d * proj[i] * sg * (1.f - sg);
+  }
 }
 
 inline TriMulSave triMulForward(const TriMul& m, const real* pair, const real* mask, real* out, int L) {
@@ -57,8 +104,7 @@ inline TriMulSave triMulForward(const TriMul& m, const real* pair, const real* m
   {
     Scratch scratch;
     real* pg = ARENA.get(rows * I2);
-    mulK<<<blocks(rows * I2), 256, 0, STREAM>>>(pg, s.proj, s.gate, rows * I2);
-    splitChannelsK<<<blocks(rows * I2), 256, 0, STREAM>>>(pg, s.ab, L, I2, m.interleaved);
+    splitChannels(s.proj, s.ab, rows, I2, m.interleaved, s.gate);   // (proj * gate, channel-major)
     const real *A = s.ab, *B = s.ab + (size_t)m.I * rows;
     if (m.swapAB) std::swap(A, B);
     real* ccm = pg;                                              // reuse: [I][L][L]
@@ -66,7 +112,7 @@ inline TriMulSave triMulForward(const TriMul& m, const real* pair, const real* m
     const real alpha = m.divideByLength ? (real)1 / L : (real)1;
     if (m.outgoing) bmm(false, true, L, L, L, A, st, B, st, ccm, st, m.I, 0, alpha);   // o_ij = sum_k a_ik b_jk
     else bmm(true, false, L, L, L, B, st, A, st, ccm, st, m.I, 0, alpha);              // o_ij = sum_k a_kj b_ki
-    mergeChannelsK<<<blocks(rows * m.I), 256, 0, STREAM>>>(ccm, s.center, L, m.I);
+    mergeChannels(ccm, s.center, rows, m.I, false);
   }
   s.lnC = lnForward(m.lnCenter, s.center, s.cn, rows);
   m.out.forward(s.cn, out, rows);
@@ -92,7 +138,7 @@ inline void triMulBackward(TriMul& m, const TriMulSave& s, const real* mask, con
   real* dcenter = ARENA.get(rows * m.I);
   lnBackward(m.lnCenter, s.lnC, dcn, dcenter, rows, false);
   real* dccm = ARENA.get(rows * m.I);
-  splitChannelsK<<<blocks(rows * m.I), 256, 0, STREAM>>>(dcenter, dccm, L, m.I);
+  splitChannels(dcenter, dccm, rows, m.I, false);
   real* dab = ARENA.get(rows * I2);
   const real *A = s.ab, *B = s.ab + (size_t)m.I * rows;
   real *dA = dab, *dB = dab + (size_t)m.I * rows;
@@ -106,12 +152,12 @@ inline void triMulBackward(TriMul& m, const TriMulSave& s, const real* mask, con
     bmm(false, false, L, L, L, B, st, dccm, st, dA, st, m.I, 0, alpha);
     bmm(false, true, L, L, L, A, st, dccm, st, dB, st, m.I, 0, alpha);
   }
-  real* dpg = ARENA.get(rows * I2);
-  mergeChannelsK<<<blocks(rows * I2), 256, 0, STREAM>>>(dab, dpg, L, I2, m.interleaved);
   // pg = proj * gate (proj already masked): dproj = dpg gate (then masked), dgate_pre = dpg proj gate (1 - gate)
   real *dproj = ARENA.get(rows * I2), *dgp = ARENA.get(rows * I2);
-  gateBwdK<<<blocks(rows * I2), 256, 0, STREAM>>>(dpg, s.proj, s.gate, dproj, dgp, rows * I2);
-  if (m.masked) rowMaskK<<<blocks(rows * I2), 256, 0, STREAM>>>(dproj, mask, rows, I2);
+  {
+    dim3 b(32, 8), g((unsigned)((rows + 31) / 32), (I2 + 31) / 32);
+    mergeGateBwdT<<<g, b, 0, STREAM>>>(dab, s.proj, s.gate, m.masked ? mask : nullptr, dproj, dgp, rows, I2, m.interleaved);
+  }
   m.proj.backward(s.xn, dproj, dxn, rows, true);
   m.gate.backward(s.xn, dgp, dxn, rows, true);
   lnBackward(m.lnIn, s.lnIn, dxn, dpair, rows, true);
@@ -138,12 +184,28 @@ struct Opm {
 struct OpmSave { LnSave ln, lp; real *xn, *lm, *rm, *norm, *pnorm; int S, L; };
 // lm [S, L, O] -> [S][L O] is already that layout. outer [(i c), (j e)] -> [(i j), (c e)]
 __global__ void outerToPairK(const real* __restrict__ o2, real* __restrict__ op, int L, int O, bool back) {
+  if (O % 4 == 0 && sizeof(real) == 4) {          // a float4 of e at a time (O = 32: one 128-byte row in 8 threads)
+    const int O4 = O / 4;
+    size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= (size_t)L * L * O * O4) return;
+    int e4 = t % O4; size_t r = t / O4; int c = r % O; r /= O; int j = r % L; int i = (int)(r / L);
+    size_t q = (((size_t)i * O + c) * L + j) * O4 + e4;
+    const float4* src = reinterpret_cast<const float4*>(o2);
+    float4* dst = reinterpret_cast<float4*>(op);
+    if (back) dst[q] = src[t]; else dst[t] = src[q];
+    return;
+  }
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   size_t n = (size_t)L * L * O * O;
   if (t >= n) return;
   int e = t % O; size_t r = t / O; int c = r % O; r /= O; int j = r % L; int i = (int)(r / L);   // op[i, j, c, e]
   size_t q = (((size_t)i * O + c) * L + j) * O + e;
   if (back) op[q] = o2[t]; else op[t] = o2[q];
+}
+inline void outerToPair(const real* o2, real* op, int L, int O, bool back) {
+  size_t n = (size_t)L * L * O * O;
+  if (O % 4 == 0 && sizeof(real) == 4) n /= 4;
+  outerToPairK<<<blocks(n), 256, 0, STREAM>>>(o2, op, L, O, back);
 }
 // [S, L, G, K] <-> group-major [G][S][L K]
 __global__ void groupMajorK(const real* __restrict__ x, real* __restrict__ y, int S, int L, int G, int K, bool back) {
@@ -197,7 +259,7 @@ inline void opmProducts(const Opm& m, OpmSave& s, real* op, bool forward) {
     const int LO = L * m.O;
     real* o2 = ARENA.get((size_t)LO * LO);
     mmAT(s.lm, s.rm, o2, S, LO, LO, 0.f);                 // o2[(i c), (j e)] = lm^T rm
-    outerToPairK<<<blocks(pr * m.O * m.O), 256, 0, STREAM>>>(o2, op, L, m.O, false);
+    outerToPair(o2, op, L, m.O, false);
     return;
   }
   const int G = m.G, K = m.O / G, LK = L * K;
@@ -286,7 +348,7 @@ inline void opmBackward(Opm& m, const OpmSave& s, const real* msaMask, const rea
   if (!m.grouped) {
     const int LO = L * m.O;
     real* do2 = ARENA.get((size_t)LO * LO);
-    outerToPairK<<<blocks(pr * OO), 256, 0, STREAM>>>(dop, do2, L, m.O, true);   // [(i c), (j e)]
+    outerToPair(dop, do2, L, m.O, true);   // [(i c), (j e)]
     mmBT(s.rm, do2, dlm, S, LO, LO);                      // dlm = rm dO2^T
     mm(s.lm, do2, drm, S, LO, LO);                        // drm = lm dO2
   } else {

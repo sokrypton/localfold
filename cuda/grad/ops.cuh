@@ -12,6 +12,10 @@
 namespace grad {
 
 inline size_t ATTN_CHUNK_BYTES = (size_t)256 << 20;
+#ifndef FLASH_DEFAULT
+#define FLASH_DEFAULT true
+#endif
+inline bool FLASH = FLASH_DEFAULT;   // the tensor-core flash attention (flash.cuh) where it has a kernel; false: the bmm path
 
 // ---------------------------------------------------------------- LayerNorm (eps 1e-5, haiku's)
 struct LayerNorm {
@@ -72,8 +76,54 @@ inline LnSave lnForward(const LayerNorm& ln, const real* x, real* y, size_t rows
   lnFwdK<<<blocks(rows, 8), 256, 0, STREAM>>>(x, ln.g.w, ln.b.w, y, s.mean, s.rstd, rows, ln.C, ln.eps);
   return s;
 }
+// the same with C = 32 N: a lane holds its N channels of the row (x and dy read once) and its own partial dg, db
+// across every row it takes; the block's warps reduce through shared memory once, at the end
+template <int N>
+__global__ void lnBwdRegK(const real* __restrict__ x, const real* __restrict__ dy, const real* __restrict__ g,
+                          const real* __restrict__ mean, const real* __restrict__ rstd, real* __restrict__ dx,
+                          real* __restrict__ dg, real* __restrict__ db, size_t rows, bool accumulate) {
+  constexpr int C = 32 * N;
+  extern __shared__ real sh[];           // [warps][2 C]
+  const int warps = blockDim.x / 32, warp = threadIdx.x / 32, lane = threadIdx.x & 31;
+  real gg[N], pg[N], pb[N];
+#pragma unroll
+  for (int k = 0; k < N; ++k) { gg[k] = g ? g[lane + 32 * k] : (real)1; pg[k] = pb[k] = 0; }
+  for (size_t r = (size_t)blockIdx.x * warps + warp; r < rows; r += (size_t)gridDim.x * warps) {
+    const real *xr = x + r * C, *dr = dy + r * C;
+    const real mu = mean[r], rs = rstd[r];
+    real xh[N], dv[N], s1 = 0, s2 = 0;
+#pragma unroll
+    for (int k = 0; k < N; ++k) {
+      xh[k] = (xr[lane + 32 * k] - mu) * rs; dv[k] = dr[lane + 32 * k];
+      real dh = dv[k] * gg[k];
+      s1 += dh; s2 += dh * xh[k];
+      pg[k] += dv[k] * xh[k]; pb[k] += dv[k];
+    }
+    for (int o = 16; o; o >>= 1) { s1 += __shfl_xor_sync(~0u, s1, o); s2 += __shfl_xor_sync(~0u, s2, o); }
+    s1 /= C; s2 /= C;
+#pragma unroll
+    for (int k = 0; k < N; ++k) {
+      real v = rs * (dv[k] * gg[k] - s1 - xh[k] * s2);
+      real& o = dx[r * C + lane + 32 * k];
+      o = accumulate ? o + v : v;
+    }
+  }
+#pragma unroll
+  for (int k = 0; k < N; ++k) { sh[warp * 2 * C + lane + 32 * k] = pg[k]; sh[warp * 2 * C + C + lane + 32 * k] = pb[k]; }
+  __syncthreads();
+  for (int c = threadIdx.x; c < C; c += blockDim.x) {
+    real a = 0, b = 0;
+    for (int w = 0; w < warps; ++w) { a += sh[w * 2 * C + c]; b += sh[w * 2 * C + C + c]; }
+    if (dg) atomicAdd(&dg[c], a);
+    if (db) atomicAdd(&db[c], b);
+  }
+}
 inline void lnBackward(LayerNorm& ln, const LnSave& s, const real* dy, real* dx, size_t rows, bool accumulate) {
   unsigned gr = (unsigned)std::min<size_t>(blocks(rows, 8), 1024);
+  const size_t sh = 8 * 2 * ln.C * sizeof(real);
+#define LNREG(N) case N: lnBwdRegK<N><<<gr, 256, sh, STREAM>>>(s.x, dy, ln.g.w, s.mean, s.rstd, dx, ln.g.g, ln.b.g, rows, accumulate); return;
+  if (ln.C % 32 == 0 && sh <= 48 * 1024) switch (ln.C / 32) { LNREG(1) LNREG(2) LNREG(3) LNREG(4) LNREG(6) LNREG(8) LNREG(12) default: break; }
+#undef LNREG
   lnBwdK<<<gr, 256, 2 * ln.C * sizeof(real), STREAM>>>(s.x, dy, ln.g.w, s.mean, s.rstd, dx, ln.g.g, ln.b.g, rows, ln.C, accumulate);
 }
 
@@ -221,9 +271,22 @@ inline int sdpaChunk(const Sdpa& a, int matrices, int vectors) {
   return (int)std::max<size_t>(1, std::min<size_t>(a.B, ATTN_CHUNK_BYTES / per));
 }
 
+}  // namespace grad
+#ifndef GRAD_F64
+#include "flash.cuh"
+#endif
+namespace grad {
+// lse [2][B, H, Q] (optional): each query's logit max and the log of its exp-sum, which sdpaBackward takes with o to skip
+// recomputing the forward. Float builds run the tensor-core flash kernels (flash.cuh) where D has one.
 inline void sdpaForward(const Sdpa& a, const real* q, int ldq, const real* k, int ldk, const real* v, int ldv,
-                        real* o, int ldo) {
+                        real* o, int ldo, real* lse = nullptr) {
   Scratch scratch;
+#ifndef GRAD_F64
+  if (FLASH && flash::supported(a.D)) {
+    flash::runForward(a, q, ldq, k, ldk, v, ldv, o, ldo, lse ? lse : ARENA.get((size_t)2 * a.B * a.H * a.Q));
+    return;
+  }
+#endif
   const int H = a.H, Q = a.Q, K = a.K, D = a.D;
   int chunk = sdpaChunk(a, 1, 3);
   real* S = ARENA.get((size_t)chunk * H * Q * K);
@@ -244,9 +307,28 @@ inline void sdpaForward(const Sdpa& a, const real* q, int ldq, const real* k, in
 // dO [B, Q, lddo] -> dq, dk, dv (written, or added where acc*), at their own leading dimensions
 inline void sdpaBackward(const Sdpa& a, const real* q, int ldq, const real* k, int ldk, const real* v, int ldv,
                          const real* dO, int lddo, real* dq, int lddq, real* dk, int lddk, real* dv, int lddv,
-                         bool accQ = false, bool accK = false, bool accV = false) {
+                         bool accQ = false, bool accK = false, bool accV = false, const real* o = nullptr,
+                         int ldo = 0, const real* lse = nullptr) {
   Scratch scratch;
   const int H = a.H, Q = a.Q, K = a.K, D = a.D;
+#ifndef GRAD_F64
+  if (FLASH && flash::supported(D)) {
+    if (!o || !lse) {                       // no saved forward: recompute o and the log-sum-exp
+      real* oo = ARENA.get((size_t)a.B * Q * H * D);
+      real* ll = ARENA.get((size_t)2 * a.B * H * Q);
+      flash::runForward(a, q, ldq, k, ldk, v, ldv, oo, H * D, ll);
+      o = oo; ldo = H * D; lse = ll;
+    }
+    real* Di = ARENA.get((size_t)a.B * H * Q);
+    flash::rowDot(dO, lddo, o, ldo, Di, a.B, H, Q, D);
+    if (!accQ) {
+      if (lddq == H * D) GK(cudaMemsetAsync(dq, 0, (size_t)a.B * Q * H * D * sizeof(real), STREAM));
+      else flash::zeroColsK<<<blocks((size_t)a.B * Q * H * D), 256, 0, STREAM>>>(dq, lddq, (size_t)a.B * Q, H * D);
+    }
+    flash::runBackward(a, q, ldq, k, ldk, v, ldv, dO, lddo, lse, Di, dq, lddq, dk, lddk, dv, lddv, accK, accV);
+    return;
+  }
+#endif
   int chunk = sdpaChunk(a, 2, 5);
   real *P = ARENA.get((size_t)chunk * H * Q * K), *dP = ARENA.get((size_t)chunk * H * Q * K);
   size_t hq = (size_t)chunk * H * Q * D, hk = (size_t)chunk * H * K * D;
@@ -282,12 +364,18 @@ struct Attention {
   int C = 0, H = 0, D = 0, O = 0;
   bool gating = true;
 };
+// The projections are interleaved, qkvg [B Q, P] with q, k, v, g at columns 0, HD, 2 HD, 3 HD (P = 3 or 4 HD), from
+// one GEMM against the four weights packed side by side; the backward is then one GEMM for the four weight gradients
+// and one for dx, where four of each at a quarter the width ran far below the device in float32 (the sdpa reads q, k,
+// v at a leading dimension of P in place).
 struct AttnSave {
   const real* x;    // [B Q, C] the (normalised) input
-  real* qkvg;       // [4][B Q, H D] the projections, gate already a sigmoid (q unscaled)
+  real* qkvg;       // [B Q, P] the projections, gate already a sigmoid (q unscaled)
   real* o;          // [B Q, H D] the attention's output before the gate
   real* og;         // [B Q, H D] after it (Wo's input)
   int B, Q;
+  real* lse;        // [2][B, H, Q] the logits' max and log exp-sum (the flash backward's)
+  real* W;          // [C, P] the packed projection weights
 };
 inline Sdpa af2Sdpa(const Attention& a, int B, int Q, const real* mask, const real* nb, real* dnb = nullptr) {
   Sdpa d;
@@ -296,24 +384,51 @@ inline Sdpa af2Sdpa(const Attention& a, int B, int Q, const real* mask, const re
   if (nb) d.bias[0] = Bias{nb, 0, (long long)Q * Q, Q, dnb};
   return d;
 }
+// W [C, roles HD] <- the roles' [C, HD] side by side (back: each role's gradient += its columns of W)
+__global__ void packRolesK(real* W, const real* w0, const real* w1, const real* w2, const real* w3, int C, int HD,
+                           int roles, bool back) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)C * roles * HD) return;
+  int j = t % HD; size_t r = t / HD; int role = r % roles; int c = (int)(r / roles);
+  const real* src[4] = {w0, w1, w2, w3};
+  real* x = (real*)src[role] + (size_t)c * HD + j;
+  if (back) *x += W[t]; else W[t] = *x;
+}
+// g = sigmoid(g + b) in place, the gate's columns of qkvg (row stride ld)
+__global__ void gateFwdK(real* g, const real* b, size_t rows, int HD, int ld) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= rows * HD) return;
+  real& x = g[(t / HD) * ld + t % HD];
+  x = (real)1 / ((real)1 + exp(-(x + b[t % HD])));
+}
+// og = o g; with dog: dO = dog g, dgp = dog o g (1 - g) - the gate at row stride ld
+__global__ void gateMulK(real* og, const real* o, const real* g, size_t rows, int HD, int ld) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t < rows * HD) og[t] = o[t] * g[(t / HD) * ld + t % HD];
+}
+__global__ void gateBwdLdK(const real* dog, const real* o, const real* g, real* dO, real* dgp, size_t rows, int HD,
+                           int ld) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= rows * HD) return;
+  size_t i = (t / HD) * ld + t % HD;
+  real s = g[i];
+  dO[t] = dog[t] * s;
+  dgp[i] = dog[t] * o[t] * s * (1.f - s);
+}
 
 // x [B, Q, C] -> out [B, Q, O]; mask [B, Q] (key mask, may be null); nb [H, Q, Q] (may be null)
 inline AttnSave attnForward(const Attention& a, const real* x, const real* mask, const real* nb, real* out, int B,
                             int Q) {
-  const int HD = a.H * a.D, P = (a.gating ? 4 : 3) * HD;
+  const int HD = a.H * a.D, roles = a.gating ? 4 : 3, P = roles * HD;
   size_t rows = (size_t)B * Q;
-  AttnSave s{x, ARENA.get(rows * P), ARENA.get(rows * HD), ARENA.get(rows * HD), B, Q};
-  mm(x, a.wq.w, s.qkvg, (int)rows, a.C, HD);
-  mm(x, a.wk.w, s.qkvg + rows * HD, (int)rows, a.C, HD);
-  mm(x, a.wv.w, s.qkvg + 2 * rows * HD, (int)rows, a.C, HD);
-  if (a.gating) {
-    real* g = s.qkvg + 3 * rows * HD;
-    mm(x, a.wg.w, g, (int)rows, a.C, HD);
-    biasK<<<blocks(rows * HD), 256, 0, STREAM>>>(g, a.bg.w, rows, HD);
-    sigmoidK<<<blocks(rows * HD), 256, 0, STREAM>>>(g, rows * HD);
-  }
-  sdpaForward(af2Sdpa(a, B, Q, mask, nb), s.qkvg, HD, s.qkvg + rows * HD, HD, s.qkvg + 2 * rows * HD, HD, s.o, HD);
-  if (a.gating) mulK<<<blocks(rows * HD), 256, 0, STREAM>>>(s.og, s.o, s.qkvg + 3 * rows * HD, rows * HD);
+  AttnSave s{x, ARENA.get(rows * P), ARENA.get(rows * HD), ARENA.get(rows * HD), B, Q, ARENA.get(2 * rows * a.H),
+             ARENA.get((size_t)a.C * P)};
+  packRolesK<<<blocks((size_t)a.C * P), 256, 0, STREAM>>>(s.W, a.wq.w, a.wk.w, a.wv.w, a.gating ? a.wg.w : nullptr,
+                                                         a.C, HD, roles, false);
+  mm(x, s.W, s.qkvg, (int)rows, a.C, P);
+  if (a.gating) gateFwdK<<<blocks(rows * HD), 256, 0, STREAM>>>(s.qkvg + 3 * HD, a.bg.w, rows, HD, P);
+  sdpaForward(af2Sdpa(a, B, Q, mask, nb), s.qkvg, P, s.qkvg + HD, P, s.qkvg + 2 * HD, P, s.o, HD, s.lse);
+  if (a.gating) gateMulK<<<blocks(rows * HD), 256, 0, STREAM>>>(s.og, s.o, s.qkvg + 3 * HD, rows, HD, P);
   else GK(cudaMemcpyAsync(s.og, s.o, rows * HD * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
   mm(s.og, a.wo.w, out, (int)rows, HD, a.O);
   biasK<<<blocks(rows * a.O), 256, 0, STREAM>>>(out, a.bo.w, rows, a.O);
@@ -324,34 +439,24 @@ inline AttnSave attnForward(const Attention& a, const real* x, const real* mask,
 inline void attnBackward(Attention& a, const AttnSave& s, const real* mask, const real* nb, const real* dout,
                          real* dx, real* dnb, bool accumulate) {
   Scratch scratch;
-  const int B = s.B, Q = s.Q, HD = a.H * a.D;
+  const int B = s.B, Q = s.Q, HD = a.H * a.D, roles = a.gating ? 4 : 3, P = roles * HD;
   size_t rows = (size_t)B * Q;
   colSum(a.bo.g, dout, rows, a.O);
   mmAT(s.og, dout, a.wo.g, (int)rows, HD, a.O);
   real* dog = ARENA.get(rows * HD);
   mmBT(dout, a.wo.w, dog, (int)rows, HD, a.O);
-  real* dqkvg = ARENA.get(rows * 4 * HD);
+  real* dqkvg = ARENA.get(rows * P);
   real* dO = ARENA.get(rows * HD);
-  if (a.gating) {
-    const real* g = s.qkvg + 3 * rows * HD;
-    gateBwdK<<<blocks(rows * HD), 256, 0, STREAM>>>(dog, s.o, g, dO, dqkvg + 3 * rows * HD, rows * HD);
-  } else {
-    GK(cudaMemcpyAsync(dO, dog, rows * HD * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
-  }
-  sdpaBackward(af2Sdpa(a, B, Q, mask, nb, dnb), s.qkvg, HD, s.qkvg + rows * HD, HD, s.qkvg + 2 * rows * HD, HD, dO, HD,
-               dqkvg, HD, dqkvg + rows * HD, HD, dqkvg + 2 * rows * HD, HD);
-  mmAT(s.x, dqkvg, a.wq.g, (int)rows, a.C, HD);
-  mmAT(s.x, dqkvg + rows * HD, a.wk.g, (int)rows, a.C, HD);
-  mmAT(s.x, dqkvg + 2 * rows * HD, a.wv.g, (int)rows, a.C, HD);
-  mmBT(dqkvg, a.wq.w, dx, (int)rows, a.C, HD, accumulate ? 1.f : 0.f);
-  mmBT(dqkvg + rows * HD, a.wk.w, dx, (int)rows, a.C, HD, 1.f);
-  mmBT(dqkvg + 2 * rows * HD, a.wv.w, dx, (int)rows, a.C, HD, 1.f);
-  if (a.gating) {
-    const real* dg = dqkvg + 3 * rows * HD;
-    mmAT(s.x, dg, a.wg.g, (int)rows, a.C, HD);
-    colSum(a.bg.g, dg, rows, HD);
-    mmBT(dg, a.wg.w, dx, (int)rows, a.C, HD, 1.f);
-  }
+  if (a.gating) gateBwdLdK<<<blocks(rows * HD), 256, 0, STREAM>>>(dog, s.o, s.qkvg + 3 * HD, dO, dqkvg + 3 * HD, rows, HD, P);
+  else GK(cudaMemcpyAsync(dO, dog, rows * HD * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
+  sdpaBackward(af2Sdpa(a, B, Q, mask, nb, dnb), s.qkvg, P, s.qkvg + HD, P, s.qkvg + 2 * HD, P, dO, HD,
+               dqkvg, P, dqkvg + HD, P, dqkvg + 2 * HD, P, false, false, false, s.o, HD, s.lse);
+  real* dW = ARENA.get((size_t)a.C * P);
+  mmAT(s.x, dqkvg, dW, (int)rows, a.C, P, 0.f);
+  packRolesK<<<blocks((size_t)a.C * P), 256, 0, STREAM>>>(dW, a.wq.g, a.wk.g, a.wv.g, a.gating ? a.wg.g : nullptr,
+                                                         a.C, HD, roles, true);
+  if (a.gating) colSum(a.bg.g, dqkvg + 3 * HD, rows, HD, P);
+  mmBT(dqkvg, s.W, dx, (int)rows, a.C, P, accumulate ? 1.f : 0.f);
 }
 
 // ---------------------------------------------------------------- language-model pieces
@@ -438,7 +543,8 @@ struct Transition {
   LayerNorm ln;
   Linear l1, l2;
 };
-struct TransSave { LnSave ln; real* xn; real* h; size_t rows; };
+struct TransSave { LnSave ln; real* xn; real* h; size_t rows; };   // h: the hidden layer AFTER the relu
+// (relu(h) > 0 exactly where h > 0, so the backward's mask reads the saved output and nothing recomputes it)
 inline TransSave transForward(const Transition& t, const real* x, real* out, size_t rows) {
   TransSave s;
   s.rows = rows;
@@ -446,19 +552,15 @@ inline TransSave transForward(const Transition& t, const real* x, real* out, siz
   s.ln = lnForward(t.ln, x, s.xn, rows);
   s.h = ARENA.get(rows * t.l1.N);
   t.l1.forward(s.xn, s.h, rows);
-  Scratch scratch;
-  real* r = ARENA.get(rows * t.l1.N);
-  reluK<<<blocks(rows * t.l1.N), 256, 0, STREAM>>>(r, s.h, rows * t.l1.N);
-  t.l2.forward(r, out, rows);
+  reluK<<<blocks(rows * t.l1.N), 256, 0, STREAM>>>(s.h, s.h, rows * t.l1.N);
+  t.l2.forward(s.h, out, rows);
   return s;
 }
 inline void transBackward(Transition& t, const TransSave& s, const real* dout, real* dx, bool accumulate) {
   Scratch scratch;
   size_t rows = s.rows, n = rows * t.l1.N;
-  real* r = ARENA.get(n);
-  reluK<<<blocks(n), 256, 0, STREAM>>>(r, s.h, n);
   real* dr = ARENA.get(n);
-  t.l2.backward(r, dout, dr, rows);
+  t.l2.backward(s.h, dout, dr, rows);
   reluBwdK<<<blocks(n), 256, 0, STREAM>>>(dr, s.h, n);
   real* dxn = ARENA.get(rows * t.ln.C);
   t.l1.backward(s.xn, dr, dxn, rows);

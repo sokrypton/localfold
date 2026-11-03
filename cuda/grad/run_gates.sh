@@ -9,6 +9,7 @@ NV="nvcc -std=c++17 -arch=sm_${LOCALFOLD_SM:-80}"
 fail=0
 run() { echo "== $*"; "$@" 2>&1 | grep -E "PASS|FAIL|ABOVE|against|gradcheck:|worst" || true; "$@" > /dev/null 2>&1 || fail=1; }
 build() { local out=$1; shift; $NV "$@" -o "$out" -lcublas -lcublasLt -ldl -lcurand 2>&1 | grep -i -B1 -A3 " error" && fail=1; }
+build cuda/grad/test-flash -O1 cuda/grad/test_flash.cu
 build cuda/grad/test-af2-block -O2 cuda/grad/test_af2_block.cu
 build cuda/grad/test-af2-block-f64 -O2 -DGRAD_F64 cuda/grad/test_af2_block.cu
 build cuda/grad/test-af2sm -O1 cuda/grad/test_af2sm.cu
@@ -65,6 +66,7 @@ build cuda/grad/test-rfd4ae-f64 -O2 -DGRAD_F64 cuda/grad/test_rfd4ae.cu
 # within rounding of its kink on one side only), with the reference-free check beside it; the float32 build on the
 # single blocks. (The three-block stack in float32 holds ~2.7M ReLU inputs, and a tie among them is a coin toss on
 # the arithmetic's last bit, not a defect: it moved with an unrelated change of rounding, see README.)
+run cuda/grad/test-flash                                     # the flash attention against the bmm path it replaces
 for d in cuda/grad/data/af2-*/; do run cuda/grad/test-af2-block-f64 "$d" --gradcheck; done
 for d in cuda/grad/data/af2-block*/ cuda/grad/data/af2-extra-block/; do run cuda/grad/test-af2-block "$d"; done
 run cuda/grad/test-af2sm

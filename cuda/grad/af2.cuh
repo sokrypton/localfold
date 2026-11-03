@@ -138,14 +138,22 @@ __global__ void gaBwdK(const real* __restrict__ mask, const real* __restrict__ q
   }
 }
 // dx[b, s, c] += mask[b, s] / (msum + eps) * dqa[b, c]
-__global__ void gaMeanBwdK(const real* mask, const real* dqa, real* dx, int B, int S, int C) {
+// msum[b] = sum_s mask[b, s] (a warp a row)
+__global__ void maskSumK(const real* mask, real* msum, int B, int S) {
+  int b = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x & 31;
+  if (b >= B) return;
+  real m = 0;
+  for (int s = lane; s < S; s += 32) m += mask[(size_t)b * S + s];
+  for (int o = 16; o; o >>= 1) m += __shfl_xor_sync(~0u, m, o);
+  if (!lane) msum[b] = m;
+}
+// (the mask sum once a column: summed per element it was an S-long loop for every one of B S C elements, 4.4 ms
+// of an extra-MSA block's 34)
+__global__ void gaMeanBwdK(const real* mask, const real* msum, const real* dqa, real* dx, int B, int S, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)B * S * C) return;
   int c = t % C; size_t bs = t / C; int b = (int)(bs / S);
-  const real* mb = mask + (size_t)b * S;
-  real msum = 0;
-  for (int s = 0; s < S; ++s) msum += mb[s];
-  dx[t] += mb[bs % S] / (msum + 1e-10f) * dqa[(size_t)b * C + c];
+  dx[t] += mask[bs] / (msum[b] + 1e-10f) * dqa[(size_t)b * C + c];
 }
 __global__ void gaMeanK(const real* x, const real* mask, real* qa, int B, int S, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -205,7 +213,9 @@ inline void gaBackward(GlobalAttention& a, const GaSave& s, const real* mask, co
   mmBT(dk, a.wk.w, dx, (int)rows, a.C, a.D, accumulate ? 1.f : 0.f);
   mmBT(dv, a.wv.w, dx, (int)rows, a.C, a.D, 1.f);
   mmBT(dgp, a.wg.w, dx, (int)rows, a.C, HD, 1.f);
-  gaMeanBwdK<<<blocks(rows * a.C), 256, 0, STREAM>>>(mask, dqa, dx, B, S, a.C);
+  real* msum = ARENA.get(B);
+  maskSumK<<<blocks((size_t)B * 32), 256, 0, STREAM>>>(mask, msum, B, S);
+  gaMeanBwdK<<<blocks(rows * a.C), 256, 0, STREAM>>>(mask, msum, dqa, dx, B, S, a.C);
 }
 
 // ---------------------------------------------------------------- attention modules with their norms
@@ -442,9 +452,10 @@ inline void blockBackward(Block& b, const BlockSave& s, const real* msaMask, con
   real* dp = clone(dpairOut, pr * Cz);        // the running gradient of the pair
   real* dm = clone(dmsaOut, mr * Cm);         // and of the MSA
   // pair transition
-  transBackward(b.pairTrans, s.pairT, dpairOut, dp, true);
+  { Range r("bw.pairTrans"); transBackward(b.pairTrans, s.pairT, dpairOut, dp, true); }
   // ending node: pair5 = pair4 + swap(attn(enXn))
   {
+    Range r("bw.triEnd");
     Scratch scratch;
     real* dupdT = ARENA.get(pr * Cz);
     swap01(dp, dupdT, L, L, Cz);
@@ -458,6 +469,7 @@ inline void blockBackward(Block& b, const BlockSave& s, const real* msaMask, con
   }
   // starting node
   {
+    Range r("bw.triStart");
     Scratch scratch;
     real* dnb = ARENA.zeros(pr * 4);
     real* dxn = ARENA.get(pr * Cz);
@@ -469,16 +481,18 @@ inline void blockBackward(Block& b, const BlockSave& s, const real* msaMask, con
   {
     Scratch scratch;
     real* dpu = clone(dp, pr * Cz);
-    triMulBackward(b.triIn, s.tIn, pairMask, dpu, dp);
+    { Range r("bw.triIn"); triMulBackward(b.triIn, s.tIn, pairMask, dpu, dp); }
+    Range r("bw.triOut");
     dpu = clone(dp, pr * Cz);
     triMulBackward(b.triOut, s.tOut, pairMask, dpu, dp);
   }
   if (!b.opmFirst) opmBackward(b.opm, s.opm, msaMask, dp, dm);    // pc = pair1 + opm(msa3)
   // MSA transition: msa3 = msa2 + T(msa2)
-  transBackward(b.msaTrans, s.msaT, dm, dm, true);
+  { Range r("bw.msaTrans"); transBackward(b.msaTrans, s.msaT, dm, dm, true); }
   // column attention: msa2 = msa1 + swap(col(swap(msa1)))
   {
     Scratch scratch;
+    Range r("bw.col");
     real* dupdT = ARENA.get(mr * Cm);
     swap01(dm, dupdT, S, L, Cm);
     real* dxn = ARENA.get(mr * Cm);
@@ -495,6 +509,7 @@ inline void blockBackward(Block& b, const BlockSave& s, const real* msaMask, con
   // row attention: msa1 = msa + row(LN(msa), bias(LN(pair1)))
   {
     Scratch scratch;
+    Range r("bw.row");
     real* dnb = ARENA.zeros(pr * 8);
     real* dxn = ARENA.get(mr * Cm);
     attnBackward(b.row.at, s.rowA, msaMask, s.rowNb, dm, dxn, dnb, false);
@@ -503,7 +518,7 @@ inline void blockBackward(Block& b, const BlockSave& s, const real* msaMask, con
     pairBiasBackward(s.rowPn, b.row.feat2d, dnb, dpn, L, Cz, 8, false);
     lnBackward(b.row.pn, s.rowP, dpn, dp, pr, true);
   }
-  if (b.opmFirst) opmBackward(b.opm, s.opm, msaMask, dp, dm);     // pair1 = pair + opm(msa)
+  if (b.opmFirst) { Range r("bw.opm"); opmBackward(b.opm, s.opm, msaMask, dp, dm); }    // pair1 = pair + opm(msa)
   GK(cudaMemcpyAsync(dmsa, dm, mr * Cm * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
   GK(cudaMemcpyAsync(dpair, dp, pr * Cz * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
 }
