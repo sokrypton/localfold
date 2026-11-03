@@ -38,6 +38,8 @@ build cuda/grad/test-bioemu2 -O1 cuda/grad/test_bioemu2.cu
 build cuda/grad/test-bioemu2-f64 -O2 -DGRAD_F64 cuda/grad/test_bioemu2.cu
 build cuda/grad/test-bioemu2den -O1 cuda/grad/test_bioemu2den.cu
 build cuda/grad/test-bioemu2den-f64 -O2 -DGRAD_F64 cuda/grad/test_bioemu2den.cu
+build cuda/grad/test-bioemu2trunk -O1 cuda/grad/test_bioemu2trunk.cu
+build cuda/grad/test-bioemu2trunk-f64 -O2 -DGRAD_F64 cuda/grad/test_bioemu2trunk.cu
 build cuda/grad/test-atom -O1 --default-stream per-thread cuda/grad/test_atom.cu
 build cuda/grad/test-atom-f64 -O2 -DGRAD_F64 cuda/grad/test_atom.cu
 build cuda/grad/test-af3denoise -O1 --default-stream per-thread cuda/grad/test_af3denoise.cu
@@ -138,6 +140,8 @@ run cuda/grad/test-bioemu2-f64
 run cuda/grad/test-bioemu2den
 run cuda/grad/test-bioemu2den --sigma=40
 run cuda/grad/test-bioemu2den-f64
+run cuda/grad/test-bioemu2trunk
+run cuda/grad/test-bioemu2trunk-f64
 run cuda/grad/test-rfd4p
 run cuda/grad/test-rfd4p --layer=12      # (pair updates on even layers only)
 run cuda/grad/test-rfd4p-f64

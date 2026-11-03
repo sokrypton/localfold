@@ -195,32 +195,32 @@ __global__ void fourBK(const real* w, const real* b, real tt, const real* g, rea
 
 // ---------------------------------------------------------------- the graph
 inline const std::string SM = "structure_module/";
-struct Graph { Weights& W; const Batch& b; Tape& t; };
+struct Graph { Weights& W; const Batch& b; Tape& t; std::string root = SM; };   // (root: the weights' prefix, the trunk's input embedder "")
 // fc3(silu(fc1 x) * fc2 x)
 inline Node* swiglu(Graph& g, Node* x, const std::string& p, int l) {
   Weights& W = g.W;
-  const int I = W.dim(SM + p + "fc1/weight", l < 0 ? 0 : 1), Co = W.dim(SM + p + "fc3/weight", l < 0 ? 0 : 1);
-  return g.t.linear(g.t.mul(g.t.silu(g.t.linear(x, W.get(SM + p + "fc1/weight", l), nullptr, I)),
-                            g.t.linear(x, W.get(SM + p + "fc2/weight", l), nullptr, I)),
-                    W.get(SM + p + "fc3/weight", l), nullptr, Co);
+  const int I = W.dim(g.root + p + "fc1/weight", l < 0 ? 0 : 1), Co = W.dim(g.root + p + "fc3/weight", l < 0 ? 0 : 1);
+  return g.t.linear(g.t.mul(g.t.silu(g.t.linear(x, W.get(g.root + p + "fc1/weight", l), nullptr, I)),
+                            g.t.linear(x, W.get(g.root + p + "fc2/weight", l), nullptr, I)),
+                    W.get(g.root + p + "fc3/weight", l), nullptr, Co);
 }
 inline Node* transition(Graph& g, Node* x, const std::string& p, int l) {      // x + swiglu(LN x)
   Weights& W = g.W;
-  return g.t.add(x, swiglu(g, g.t.layerNorm(x, &W.get(SM + p + "norm/weight", l), W.opt(SM + p + "norm/bias", l)), p, l));
+  return g.t.add(x, swiglu(g, g.t.layerNorm(x, &W.get(g.root + p + "norm/weight", l), W.opt(g.root + p + "norm/bias", l)), p, l));
 }
 inline Node* layerCondition(Graph& g, Node* c, const std::string& p, int l, int width) {
   Weights& W = g.W;
-  return g.t.linear(g.t.silu(g.t.layerNorm(c, &W.get(SM + p + "cond_0/weight", l), W.opt(SM + p + "cond_0/bias", l))),
-                    W.get(SM + p + "cond_2/weight", l), W.opt(SM + p + "cond_2/bias", l), width);
+  return g.t.linear(g.t.silu(g.t.layerNorm(c, &W.get(g.root + p + "cond_0/weight", l), W.opt(g.root + p + "cond_0/bias", l))),
+                    W.get(g.root + p + "cond_2/weight", l), W.opt(g.root + p + "cond_2/bias", l), width);
 }
 inline Node* conditioned(Graph& g, Node* x, Node* cond, const std::string& p, const std::string& att, int l, Node* bias, AttnShape a) {
   Tape& t = g.t; Weights& W = g.W;
   const int D = (int)x->cols;
   Node* h = t.adaLn(x, cond, 0, D);
-  Node* qkv = t.linear(h, W.get(SM + p + att + "proj_qkv/weight", l), nullptr, 3 * D);
-  Node* gt = t.sigmoid(t.linear(h, W.get(SM + p + att + "proj_g/weight", l), nullptr, D));
-  Node* o = t.attention(qkv, W.get(SM + p + att + "proj_q_bias", l), bias, a);
-  Node* ao = t.linear(t.mul(gt, o), W.get(SM + p + att + "proj_o/weight", l), nullptr, D);
+  Node* qkv = t.linear(h, W.get(g.root + p + att + "proj_qkv/weight", l), nullptr, 3 * D);
+  Node* gt = t.sigmoid(t.linear(h, W.get(g.root + p + att + "proj_g/weight", l), nullptr, D));
+  Node* o = t.attention(qkv, W.get(g.root + p + att + "proj_q_bias", l), bias, a);
+  Node* ao = t.linear(t.mul(gt, o), W.get(g.root + p + att + "proj_o/weight", l), nullptr, D);
   x = t.gatedAdd(x, ao, cond, 2 * D);
   Node* m = swiglu(g, t.adaLn(x, cond, 3 * D, 4 * D), p + "transition/", l);
   return t.gatedAdd(x, m, cond, 5 * D);
