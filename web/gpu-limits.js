@@ -10,7 +10,9 @@
 import { GPU_MEMORY_SHARE, gpuMemoryFromName, lossTeachesLimit, UNNAMED_CARD_BYTES } from "../webgpu/runtime/device-memory.js";
 
 const LEARNED_KEY = "localfold.gpu-limit";
+const LOSS_KEY = "localfold.gpu-last-loss";
 const CHOSEN_KEY = "localfold.gpu-chosen-limit";
+const SAME_TROUBLE_MS = 60 * 60 * 1000;
 
 let cachedName;
 
@@ -79,24 +81,40 @@ export function learnedLimitBytes() {
   return readLearned();
 }
 
+/** The last loss this card could put down to memory, if it was recent enough to be the same trouble. */
+function lossInTheLastHour(now) {
+  try {
+    const saved = JSON.parse(localStorage.getItem(LOSS_KEY) ?? "null");
+    return saved?.name === (gpuName() ?? "unknown") && now - saved.at >= 0 && now - saved.at < SAME_TROUBLE_MS;
+  } catch { return false; }
+}
+
 /**
- * Remember how much was on the card when its device was lost.
+ * Remember how much was on the card when its device was lost, the second time.
  *
- * The ceiling above is a guess from a name, and on an unlisted card from system
- * RAM alone. A device lost while holding much of what it may hold is a measurement,
- * so the next device on this card stops short of it. Reading the same loss twice
- * cannot raise it, and `forgetLearnedLimit` is how a reader takes it back when the
- * cause turned out to be something else.
+ * The ceiling above is a guess from a name, and on an unlisted card from system RAM alone, and a device lost while holding
+ * much of what it may hold can correct it. But one loss does not say why. Another program bringing up a device reset the
+ * driver under a fold holding 2.8 GiB of an 8 GiB RTX 3070, and read as memory that held the card to 2.3 GiB for as long as
+ * the browser remembered. A fold that does not fit fails again as soon as it is tried again, so it is the second loss in
+ * an hour that sets a ceiling. Reading a loss cannot raise it, and `forgetLearnedLimit` is how a reader takes it back when
+ * the cause turned out to be something else.
  *
  * @returns {number | undefined} the new ceiling, when this loss set one
  */
-export function learnFromLoss(residentBytes, budgetBytes) {
+export function learnFromLoss(residentBytes, budgetBytes, now = Date.now()) {
   if (!lossTeachesLimit(residentBytes, budgetBytes)) return undefined;
+  const second = lossInTheLastHour(now);
+  const name = gpuName() ?? "unknown";
   const bytes = Math.min(Math.round(residentBytes * GPU_MEMORY_SHARE), readLearned() ?? Infinity);
   try {
-    localStorage.setItem(LEARNED_KEY, JSON.stringify({ name: gpuName() ?? "unknown", bytes }));
-  } catch { /* private window: the lesson lasts this page instead of this browser */ }
-  return bytes;
+    if (second) {
+      localStorage.removeItem(LOSS_KEY);
+      localStorage.setItem(LEARNED_KEY, JSON.stringify({ name, bytes }));
+    } else {
+      localStorage.setItem(LOSS_KEY, JSON.stringify({ name, at: now }));
+    }
+  } catch { /* private window: there is nothing to compare a loss with, so nothing is learned */ }
+  return second ? bytes : undefined;
 }
 
 export function forgetLearnedLimit() {

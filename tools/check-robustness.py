@@ -620,6 +620,33 @@ def kill_then_more_recycles_monomer(s):
 
 
 @scenario("faults")
+def one_lost_device_teaches_no_limit(s):
+    # A reset another program causes loses a device just as memory does, so it takes two in an hour to set a ceiling.
+    # A limit just over what the fold needs is what makes each loss one that could teach: it holds half of that by the trunk's second pass.
+    tab = s.page(["""localStorage.setItem('localfold.gpu-chosen-limit', String(0.5 * 2 ** 30));"""])
+    tab.choose()
+    tab.set_size(800)
+    time.sleep(0.3)
+    line = tab.state()["line"]
+    needs = number_after("Needs", line)
+    s.check("the line says what the fold needs", needs is not None, line)
+    tab.evaluate(f"localStorage.setItem('localfold.gpu-chosen-limit', String({needs * 1.03} * 2 ** 30))")
+    learned = "localStorage.getItem('localfold.gpu-limit')"
+    for attempt, teaches in ((1, False), (2, True)):
+        tab.set_size(800)
+        tab.press()
+        tab.wait_status("Trunk 2/4")
+        kill_gpu_process()
+        end = tab.wait_finished(timeout=120)
+        s.check(f"lost device {attempt}: the fold ends, and says so", end["running"] is False and end["failed"] and not end.get("timed_out"), end["status"][:300])
+        s.check(f"lost device {attempt}: a limit {'set' if teaches else 'not set'}", (tab.evaluate(learned) is not None) == teaches, str(tab.evaluate(learned)))
+        s.check(f"lost device {attempt}: the line says the same", ("the limit is now" in end["status"]) == teaches, end["status"][:300])
+        s.check(f"lost device {attempt}: the loss is {'forgotten' if teaches else 'remembered'}", (tab.evaluate("localStorage.getItem('localfold.gpu-last-loss')") is None) == teaches, str(tab.evaluate("localStorage.getItem('localfold.gpu-last-loss')")))
+        time.sleep(3)
+    s.no_page_errors(end)
+
+
+@scenario("faults")
 def kill_then_the_same_again(s):
     # ESMFold2 keeps its trunk on the host, so the same fold after a kill reuses it on a new device.
     tab = s.page()
@@ -1899,6 +1926,53 @@ def no_webgpu_at_all(s):
 
 
 # Tabs, reloads, a hidden page, a long session.
+
+@scenario("lifecycle")
+def chromes_benchmark_goes_before_the_first_device(s):
+    # Asking whether Chrome's built-in AI can run here runs its benchmark of the card, which must not arrive under a fold.
+    tab = s.page(["""(() => {
+      window.__order = [];
+      globalThis.Summarizer = { availability: () => {
+        window.__order.push('asked');
+        return new Promise((done) => setTimeout(() => { window.__order.push('answered'); done('downloadable'); }, 2000));
+      } };
+      if (typeof GPUAdapter === 'undefined') return;
+      const held = GPUAdapter.prototype.requestDevice;
+      GPUAdapter.prototype.requestDevice = function (...given) { window.__order.push('device'); return held.apply(this, given); };
+    })();"""])
+    tab.choose()
+    tab.set_size(76)
+    end = tab.fold()
+    order = json.loads(tab.evaluate("JSON.stringify(window.__order)"))
+    s.check("asked as the page loaded, answered, and only then a device", order[:3] == ["asked", "answered", "device"], order)
+    s.check("a fold", not end["failed"], end["status"][:120])
+    kill_gpu_process()
+    time.sleep(3)
+    end = tab.fold()
+    order = json.loads(tab.evaluate("JSON.stringify(window.__order)"))
+    s.check("once a page, whatever devices follow", order.count("asked") == 1 and order.count("device") >= 2, order)
+    s.check("a fold on the new device", not end["failed"], end["status"][:120])
+    s.no_page_errors(end)
+
+
+@scenario("lifecycle")
+def chromes_benchmark_that_never_answers_does_not_hold_fold(s):
+    tab = s.page(["""globalThis.Summarizer = { availability: () => new Promise(() => {}) };"""])
+    tab.choose()
+    tab.set_size(76)
+    end = tab.fold()
+    s.check("a fold, after waiting a while", not end["failed"] and not end.get("timed_out") and end["seconds"] < 120, f"{end['seconds']} s: {end['status'][:120]}")
+    s.no_page_errors(end)
+
+
+@scenario("lifecycle")
+def chromes_benchmark_refused_does_not_hold_fold(s):
+    tab = s.page(["""globalThis.Summarizer = { availability: () => Promise.reject(new Error('blocked by policy')) };"""])
+    tab.choose()
+    tab.set_size(76)
+    end = tab.fold()
+    s.check("a fold", not end["failed"], end["status"][:120])
+
 
 @scenario("lifecycle")
 def two_tabs_second_waits(s):

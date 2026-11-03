@@ -61,6 +61,7 @@ import { smilesComponent } from "../shared/chem/component.js";
 import { GpuBufferAllocator } from "../webgpu/runtime/allocator.js";
 import { getDevice, loadModel, onDeviceFault, planningGpu, releaseDevice, settleHeldDevice, releaseModel } from "./model.js";
 import { gpuName, learnFromLoss } from "./gpu-limits.js";
+import { settleBrowserBenchmark } from "./chrome-benchmark.js";
 import { computePreference, cpuThreads, cpuThreadsOnceIsolated, installSettings, useCpuForNow } from "./settings-panel.js";
 import { describePlan, describeRefusal, noteFold, planEsmfold2, planMeasuredModel, readFoldRates, roughDuration }
   from "./compute-plan.js";
@@ -1150,10 +1151,10 @@ function describeDeviceFault(fault) {
       + " lower what one fold may hold in Settings, and press Fold.";
   }
   const mib = (bytes) => `${Math.round(bytes / 1048576)} MiB`;
-  return `${fault.message} Press Fold to ask for a new device; if the graphics driver reset, this browser has to`
-    + " restart before it can use the GPU again."
+  return `${fault.message} The graphics driver may have reset, which another program starting on the GPU can cause.`
+    + " Press Fold to ask for a new device; if it is refused, close every window of this browser and open it again."
     + (fault.learned === undefined ? ""
-      : ` This fold held more than the card could, so the limit is now ${mib(fault.learned)}.`);
+      : ` That is the second in an hour, so memory may be the cause: the limit is now ${mib(fault.learned)}, and Settings can take it back.`);
 }
 
 /**
@@ -6333,8 +6334,8 @@ for (const id of ["canvas", "heatmapCanvas"]) document.getElementById(id)?.addEv
 
 onDeviceFault(({ kind, message, resident, budget }) => {
   if (kind === "lost") setTimeout(redrawViewer, 1000);
-  // A lost device is the one measurement of the card's real limit a page ever
-  // gets, and only a device that was actually holding a lot says anything about it.
+  // Lost devices are the one measurement of the card's real limit a page ever gets,
+  // and only a device that was actually holding a lot says anything about it.
   const learned = kind === "lost" && (activeFold !== undefined || ceilingLifted)
     ? learnFromLoss(resident, budget) : undefined;
   forgetDeviceState();
@@ -7588,6 +7589,8 @@ document.addEventListener("py2dmol-frame-change", syncDownloads);
 document.addEventListener("localfold-runtime-stopped", (event) => {
   retireFolding(event.detail?.why ?? "the fold service has been stopped");
 });
+
+void settleBrowserBenchmark();
 
 // ...last, because they run the syncs, and every one of those is defined by now.
 if (computePreference() === "cpu") chooseCpuModel();

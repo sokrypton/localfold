@@ -29,6 +29,7 @@ import { deviceProfile } from "../webgpu/runtime/device-profile.js";
 import { settleGridAttendTiling } from "../webgpu/af3/trunk/grid-attend-race.js";
 import { devUseDevice } from "./dev-log.js";
 import { chosenLimitBytes, gpuMemoryBytes, gpuName, learnedLimitBytes } from "./gpu-limits.js";
+import { settleBrowserBenchmark } from "./chrome-benchmark.js";
 import { withAbort } from "../webgpu/runtime/abort.js";
 
 const stores = new Map();
@@ -322,6 +323,7 @@ export function getDevice() {
   // against a dead device after any failure bad enough to lose one.
   const request = (async () => {
     if (navigator.gpu === undefined) throw new Error("This browser has no WebGPU. It ships in current Chrome, Edge, Safari and Firefox.");
+    await settleBrowserBenchmark();
     const adapter = await askForAdapter().catch((cause) => {
       console.warn("requestAdapter", cause);
       return null;
