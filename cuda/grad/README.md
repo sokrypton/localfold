@@ -20,7 +20,8 @@ the opposite of each of those choices, so the training graph is written **beside
 | model | forward + backward (inputs and every parameter) | gate |
 |---|---|---|
 | AF2 Evoformer block - main stack, extra-MSA stack (global column attention), OPM first (multimer) or last (monomer) | **done** | `test-af2-block`, 5 dumps |
-| AF2 stack (48 + 4 blocks, rematerialised) | written (`af2::Stack`) | not yet gated end to end |
+| AF2 stack (48 + 4 blocks, rematerialised) | **done** (`af2::Stack`) | `test-af2-block` on a 3-block JAX stack: 255 parameter gradients, worst 0.60 of its bar |
+| AdamW (fused, global-norm clip) | **done** (`adam.cuh`) | `train-af2-smoke`: weights perturbed 10%, trained back - loss 918 -> 14.7 in 60 steps |
 | AF2 embedder, template stack, structure module, heads, losses | next | |
 | AF3 lineage (pairformer, MSA module, templates, diffusion, atom transformer, confidence) | planned | |
 | ESMFold2, BioEmu2 (has `vjp.cuh`: activations only), RFD4-P, MSA-P | planned | |
@@ -48,7 +49,10 @@ nvcc -O2 -std=c++17 -arch=sm_80 -o cuda/grad/test-af2-block cuda/grad/test_af2_b
 for d in cuda/grad/data/*/; do cuda/grad/test-af2-block $d | tail -1; done
 ```
 
-All five pass, the worst tensor at 0.26-0.45 of its bar (2026-11-03, A100). The forward agrees with float64 at
+`--nblocks 3 --block 10 --seed 3 --out cuda/grad/data/af2-stack3` dumps a three-block stack, which the same
+binary runs through `af2::Stack` - inputs kept, every block replayed before its backward.
+
+All five single-block dumps pass, the worst tensor at 0.26-0.45 of its bar (2026-11-03, A100). The forward agrees with float64 at
 1e-7 to 3e-6, inside JAX float32's own error on every case.
 
 🔴 **A FAILING SEED CAN BE A ReLU TIE, NOT A DEFECT.** Two seeds failed first, both the same way: ONE element of

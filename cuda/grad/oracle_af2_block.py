@@ -38,6 +38,7 @@ def main():
   ap.add_argument("--S", type=int, default=5)
   ap.add_argument("--pad", type=int, default=3, help="masked residues at the tail")
   ap.add_argument("--seed", type=int, default=0)
+  ap.add_argument("--nblocks", type=int, default=1, help="a stack of blocks --block.. (p/b<k>/...): the remat gate")
   args = ap.parse_args()
   sys.argv = sys.argv[:1]
   os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
@@ -61,19 +62,23 @@ def main():
   stack = "extra_msa_stack" if args.extra else "evoformer_iteration"
   prefix = "alphafold/alphafold_iteration/evoformer/" + stack + "/"
   raw = np.load(os.path.join(args.params, "params_" + args.model + ".npz"))
+  names = [stack] if args.nblocks == 1 else ["blk%d" % i for i in range(args.nblocks)]
   params = {}
   for k in raw.keys():
     if k.startswith(prefix):
       mod, name = k[len(prefix):].split("//")
-      params.setdefault(stack + "/" + mod, {})[name] = np.asarray(raw[k][args.block], np.float64)
+      for i, nm in enumerate(names):
+        params.setdefault(nm + "/" + mod, {})[name] = np.asarray(raw[k][args.block + i], np.float64)
   if not params:
     sys.exit("no parameters under " + prefix)
 
   def fn(msa, pair, msa_mask, pair_mask):
-    it = modules.EvoformerIteration(c, gc, is_extra_msa=args.extra, name=stack)
-    out = it({"msa": msa, "pair": pair}, {"msa": msa_mask, "pair": pair_mask}, use_dropout=False,
-             safe_key=modules.prng.SafeKey(jax.random.PRNGKey(0)))
-    return out["msa"], out["pair"]
+    act = {"msa": msa, "pair": pair}
+    for nm in names:
+      it = modules.EvoformerIteration(c, gc, is_extra_msa=args.extra, name=nm)
+      act = it(act, {"msa": msa_mask, "pair": pair_mask}, use_dropout=False,
+               safe_key=modules.prng.SafeKey(jax.random.PRNGKey(0)))
+    return act["msa"], act["pair"]
 
   f = hk.transform(fn)
   L, S = args.L, args.S
@@ -99,6 +104,9 @@ def main():
   (om, op), vjp = jax.vjp(loss_parts, params, jnp.asarray(msa), jnp.asarray(pair))
   gp, gm, gz = vjp((jnp.asarray(ct_msa), jnp.asarray(ct_pair)))
 
+  def pname(mod):                                     # 'evoformer_iteration/sub' -> 'sub'; 'blk1/sub' -> 'b1/sub'
+    head, rest = mod.split("/", 1)
+    return rest if args.nblocks == 1 else "b" + head[3:] + "/" + rest
   # the same vjp in float32: how far the reference's own float32 lands from its float64 on each tensor, which is
   # the scale a float32 port is judged on (an ill-conditioned gradient is ill-conditioned in JAX too)
   c32 = lambda t: jax.tree_util.tree_map(lambda x: jnp.asarray(x, jnp.float32), t)
@@ -115,18 +123,19 @@ def main():
     arrays["e32/" + name] = np.array([rel(a, b)], np.float32)
   for mod, d in gp.items():
     for name, v in d.items():
-      arrays["e32/g/p/" + mod[len(stack) + 1:] + "/" + name] = np.array([rel(gp32[mod][name], v)], np.float32)
+      arrays["e32/g/p/" + pname(mod) + "/" + name] = np.array([rel(gp32[mod][name], v)], np.float32)
   f32 = lambda x: np.asarray(x, np.float32).ravel()
   for mod, d in params.items():
     for name, v in d.items():
-      arrays["p/" + mod[len(stack) + 1:] + "/" + name] = f32(v)
+      arrays["p/" + pname(mod) + "/" + name] = f32(v)
   for name, v in [("in/msa", msa), ("in/pair", pair), ("in/msa_mask", msa_mask), ("in/pair_mask", pair_mask),
                   ("ct/msa", ct_msa), ("ct/pair", ct_pair), ("out/msa", om), ("out/pair", op),
                   ("g/msa", gm), ("g/pair", gz)]:
     arrays[name] = f32(v)
   for mod, d in gp.items():
     for name, v in d.items():
-      arrays["g/p/" + mod[len(stack) + 1:] + "/" + name] = f32(v)
+      arrays["g/p/" + pname(mod) + "/" + name] = f32(v)
+  arrays["meta/nblocks"] = np.array([args.nblocks], np.float32)
   arrays["meta/L"] = np.array([L], np.float32)
   arrays["meta/S"] = np.array([S], np.float32)
   arrays["meta/cm"] = np.array([cm], np.float32)
