@@ -2995,6 +2995,8 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
     // ...and so does a constraint
     constraints: foldContext.constraints ?? [],
     alignment: alignmentBlocks === null ? null : cheapHash(JSON.stringify(alignmentBlocks)),
+    // ...and a template: adding one to a fold just run reused the trunk without it, and the status line said it had been used.
+    templates: templates.map(({ chain, kind, source, text }) => [chain, kind, source, text === undefined ? null : cheapHash(text)]),
   });
   const cached = trunkCache?.key === trunkKey ? trunkCache.reusable : undefined;
   const reuse = cached !== undefined && cached.recycles <= recycles ? cached : undefined;
