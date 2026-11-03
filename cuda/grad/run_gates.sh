@@ -28,6 +28,8 @@ build cuda/grad/test-ef2diff -O1 cuda/grad/test_ef2diff.cu
 build cuda/grad/test-ef2diff-f64 -O2 -DGRAD_F64 cuda/grad/test_ef2diff.cu
 build cuda/grad/test-msap -O1 cuda/grad/test_msap.cu
 build cuda/grad/test-msap-f64 -O2 -DGRAD_F64 cuda/grad/test_msap.cu
+build cuda/grad/test-msapmodel -O1 cuda/grad/test_msapmodel.cu
+build cuda/grad/test-msapmodel-f64 -O2 -DGRAD_F64 cuda/grad/test_msapmodel.cu
 build cuda/grad/test-bioemu2 -O1 cuda/grad/test_bioemu2.cu
 build cuda/grad/test-bioemu2-f64 -O2 -DGRAD_F64 cuda/grad/test_bioemu2.cu
 build cuda/grad/test-bioemu2den -O1 cuda/grad/test_bioemu2den.cu
@@ -90,6 +92,8 @@ run cuda/grad/test-ef2diff
 run cuda/grad/test-ef2diff-f64
 run cuda/grad/test-msap --layer=0
 run cuda/grad/test-msap-f64
+run cuda/grad/test-msapmodel
+run cuda/grad/test-msapmodel-f64
 run cuda/grad/test-bioemu2
 run cuda/grad/test-bioemu2 --layer=3
 run cuda/grad/test-bioemu2-f64

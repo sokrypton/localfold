@@ -36,6 +36,7 @@ port computes, and its gradient is the gradient of that.
 | **ESMFold2's diffusion module** (`ef2diff.cuh`) | one denoiser call: the conditioning pair (its relative encoding, the two transitions) and every token block's bias, the noise-conditioned single, the atom encoder and decoder (the SWA stacks), the 12 adaLN token blocks with pair-biased gated attention and gated SwiGLU, the pooling and broadcast, EDM's combine | `makeDenoiser` + `denoise` in their float32 arm: 1.1e-6 | 349 tensors <= 2.6e-5 |
 | **ESM-C / ESM2** (`plm.cuh`) | the towers, ESM-C's sequence head, a masked-LM cross entropy | `esmcTower`, 36 layers: 5.8e-7 | <= 5.3e-7 |
 | **MSA Pairformer** (`msap.cuh`) | its layer: PWA, transition, query-biased OPM (differential sequence weights), pair block | the port's float32 path: <= 4.2e-7 | 2.6e-6 |
+| **MSA Pairformer's whole model** (`msapmodel.cuh`) | the MSA embedding, the initial pair (relative position over the break-shifted index, the bond), the layers, both contact heads (Cb, ConFind) at their layers and the LM head on the query row | `msaEmbedK`, `pairInitK`, `contacts()`, `lmHead()`: 0 to 1.5e-7 (the layers: the row above) | 115 tensors <= 2.8e-6 |
 | **BioEmu2** (`bioemu2.cuh`) | MSA layer and PairMixer layer (Boltz modules, stacked (out, in) weights) | `pairWeightedAveraging`/`transition`/`outerProductMean`/`trimul`: <= 2.1e-6 | <= 2.1e-6 |
 | **BioEmu2's denoiser** (`bioemu2den.cuh` on `tape.cuh`) | the static context (the pairwise conditioner's pair and relative encoding, the atom features, the windowed atom pair's geometry, token term and MLP tail, every layer's window and token biases, the single conditioner's static half, a's trunk half) and one D(x, sigma): the single conditioning, 16 dual-stream layers (windowed and full conditioned attention, the coupling mixers), the readout | `staticContext` + `denoise()` float32: the context <= 1.1e-7, D 5.7e-5 at sigma 5 and 5.3e-6 at 40; d/dx against the port's own vjp tape (jax.grad's) at float32's floor (below) | 709 tensors <= 7.6e-5, the context's weights and the trunk's three inputs included |
 | **RFD4-Proteina** (`rfd4p.cuh`) | token layer (RMS AdaLN, pair-biased attention, SwiGLU, output scales) and pair update | `tokenLayer`/`pairReprUpdate` <float>: 5e-8 / 1.6e-7 | 1.9e-6 |
@@ -43,7 +44,7 @@ port computes, and its gradient is the gradient of that.
 
 Not yet: the template embedders (AF2's, AF3's), the dialect branches named in each header (boltz2's re-embedded
 confidence head and atom-only target_feat, rf3's global norms, chai-1's embeddings, OpenDDE's structural tokens),
-RFD4-Proteina's autoencoder (its encoder and decoder), MSA Pairformer's embeddings and heads. The layers they are made of are mostly here.
+and RFD4-Proteina's autoencoder (its encoder and decoder). The layers they are made of are mostly here.
 
 Also: AdamW (`adam.cuh`); `train-af2-smoke` - real weights perturbed 10% and trained back, loss 918 -> 14.7 in 60
 steps.
