@@ -35,7 +35,7 @@ __global__ void lnFwdK(const real* __restrict__ x, const real* __restrict__ g, c
   for (int c = lane; c < C; c += 32) { real d = xr[c] - mu; v += d * d; }
   for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
   real rs = rsqrt(v / C + eps);
-  for (int c = lane; c < C; c += 32) y[r * C + c] = (xr[c] - mu) * rs * g[c] + (b ? b[c] : (real)0);
+  for (int c = lane; c < C; c += 32) y[r * C + c] = (xr[c] - mu) * rs * (g ? g[c] : (real)1) + (b ? b[c] : (real)0);
   if (lane == 0) { mean[r] = mu; rstd[r] = rs; }
 }
 // dx = rstd (dxhat - mean(dxhat) - xhat mean(dxhat xhat)), dxhat = dy g; dg += dy xhat, db += dy (atomics a block)
@@ -50,7 +50,7 @@ __global__ void lnBwdK(const real* __restrict__ x, const real* __restrict__ dy, 
     const real *xr = x + r * C, *dr = dy + r * C;
     real mu = mean[r], rs = rstd[r], s1 = 0, s2 = 0;
     for (int c = lane; c < C; c += 32) {
-      real xh = (xr[c] - mu) * rs, dh = dr[c] * g[c];
+      real xh = (xr[c] - mu) * rs, dh = dr[c] * (g ? g[c] : (real)1);
       s1 += dh; s2 += dh * xh;
       atomicAdd(&sh[c], dr[c] * xh);
       atomicAdd(&sh[C + c], dr[c]);
@@ -58,12 +58,12 @@ __global__ void lnBwdK(const real* __restrict__ x, const real* __restrict__ dy, 
     for (int o = 16; o; o >>= 1) { s1 += __shfl_xor_sync(~0u, s1, o); s2 += __shfl_xor_sync(~0u, s2, o); }
     s1 /= C; s2 /= C;
     for (int c = lane; c < C; c += 32) {
-      real xh = (xr[c] - mu) * rs, v = rs * (dr[c] * g[c] - s1 - xh * s2);
+      real xh = (xr[c] - mu) * rs, v = rs * (dr[c] * (g ? g[c] : (real)1) - s1 - xh * s2);
       dx[r * C + c] = accumulate ? dx[r * C + c] + v : v;
     }
   }
   __syncthreads();
-  for (int c = threadIdx.x; c < C; c += blockDim.x) { atomicAdd(&dg[c], sh[c]); if (db) atomicAdd(&db[c], sh[C + c]); }
+  for (int c = threadIdx.x; c < C; c += blockDim.x) { if (dg) atomicAdd(&dg[c], sh[c]); if (db) atomicAdd(&db[c], sh[C + c]); }
 }
 
 struct LnSave { const real* x; real* mean; real* rstd; };
