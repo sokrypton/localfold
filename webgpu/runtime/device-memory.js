@@ -108,6 +108,15 @@ export function budgetForDevice(fallbackGiB = 4, { gpuMemoryBytes, learnedBytes,
 /** What a lost device says the limit was, as a share of what it was holding. */
 export const GPU_MEMORY_SHARE = 0.8;
 
+/**
+ * Whether a lost device says anything about the card's memory, which it does only if it was holding a good part of what a
+ * fold may hold. A crash, a driver update and another program's reset lose a device just the same: reading one of those as
+ * memory held a 24 GiB card to 1.0 GiB, for as long as the browser remembered, after its GPU process was killed under a
+ * 300-residue fold. With the limit lifted there is no such part to compare, and only the floor applies.
+ */
+export const lossTeachesLimit = (residentBytes, budgetBytes) => residentBytes >= 512 * 1024 * 1024
+  && (budgetBytes === undefined || budgetBytes === null || residentBytes >= budgetBytes / 2);
+
 const GIB = 1024 * 1024 * 1024;
 
 /**

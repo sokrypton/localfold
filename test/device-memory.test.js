@@ -9,10 +9,11 @@
  * rather than what a caller still intends to use.
  */
 import { strict as assert } from "node:assert";
+import { nameIsAdapters } from "../web/gpu-limits.js";
 import { describe, it } from "node:test";
 
 import {
-  budgetForDevice, cardBudgetBytes, GpuMemoryBudgetError, gpuMemoryFromName, memorySnapshot, UNNAMED_CARD_BYTES,
+  budgetForDevice, cardBudgetBytes, GpuMemoryBudgetError, gpuMemoryFromName, lossTeachesLimit, memorySnapshot, UNNAMED_CARD_BYTES,
   noteAllocation, noteDestroy, setMemoryBudget,
 } from "../webgpu/runtime/device-memory.js";
 
@@ -134,6 +135,46 @@ describe("the ceiling a page gives a device", () => {
   it("takes what a lost device taught it when that is lower still", () => {
     assert.equal(withRam(32, () => budgetForDevice(4, { gpuMemoryBytes: 8 * GIB, learnedBytes: 3 * GIB })),
                  3 * GIB);
+  });
+});
+
+describe("what a lost device says about the card", () => {
+  const GIB = 1024 * MIB;
+
+  it("says nothing when it held little of what a fold may hold", () => {
+    assert.equal(lossTeachesLimit(1.3 * GIB, 20.8 * GIB), false);
+    assert.equal(lossTeachesLimit(2.3 * GIB, 4.8 * GIB), false);
+  });
+
+  it("is a measurement when it held much of it", () => {
+    assert.equal(lossTeachesLimit(3.9 * GIB, 4.8 * GIB), true);
+    assert.equal(lossTeachesLimit(2.4 * GIB, 4.8 * GIB), true);
+  });
+
+  it("is a measurement with the limit lifted, and never from almost nothing", () => {
+    assert.equal(lossTeachesLimit(5 * GIB, undefined), true);
+    assert.equal(lossTeachesLimit(100 * MIB, undefined), false);
+    assert.equal(lossTeachesLimit(100 * MIB, 150 * MIB), false);
+  });
+});
+
+describe("a name that is another card's", () => {
+  it("is told by the vendor the adapter reports", () => {
+    const rtx = "ANGLE (NVIDIA, NVIDIA GeForce RTX 3070 Direct3D11 vs_5_0 ps_5_0, D3D11)";
+    const uhd = "ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)";
+    const radeon = "ANGLE (AMD, AMD Radeon RX 6800 Direct3D11 vs_5_0 ps_5_0, D3D11)";
+    assert.equal(nameIsAdapters(rtx, "nvidia"), true);
+    assert.equal(nameIsAdapters(uhd, "intel"), true);
+    assert.equal(nameIsAdapters(radeon, "amd"), true);
+    assert.equal(nameIsAdapters(uhd, "nvidia"), false);
+    assert.equal(nameIsAdapters(rtx, "intel"), false);
+    assert.equal(nameIsAdapters(rtx, "amd"), false);
+  });
+
+  it("is not doubted where there is nothing to compare it with", () => {
+    assert.equal(nameIsAdapters("Apple M2", "apple"), true);
+    assert.equal(nameIsAdapters("anything", ""), true);
+    assert.equal(nameIsAdapters(null, "nvidia"), false);
   });
 });
 

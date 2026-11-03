@@ -8,7 +8,7 @@ import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 
 import {
-  cpuFoldSeconds, cpuPeakBytes, describePlan, gpuFoldSeconds, measuredFoldSeconds, noteFold, planEsmfold2, planMeasuredModel,
+  cpuFoldSeconds, cpuPeakBytes, describePlan, describeRefusal, gpuFoldSeconds, measuredFoldSeconds, noteFold, planEsmfold2, planMeasuredModel,
   readFoldRates, roughDuration,
 } from "../web/compute-plan.js";
 import { cardBudgetBytes } from "../webgpu/runtime/device-memory.js";
@@ -29,12 +29,22 @@ function fakeStorage() {
 }
 
 describe("the memory plan against what was measured", () => {
-  it("reads a fold's peak on an RTX 3070 to within 2%", () => {
-    // The allocator's own peak from a page fold: 1000 residues whole, 1200 and 1350 with the spill.
-    for (const [tokens, spill, measuredMiB] of [[1000, false, 3787], [1200, true, 3792], [1350, true, 4646]]) {
-      const planned = esmfold2PeakBytes({ tokens, spill }) / MIB;
-      assert.ok(Math.abs(planned / measuredMiB - 1) < 0.02, `${tokens}: planned ${planned} against ${measuredMiB} MiB`);
+  it("reads a fold's peak on an RTX 3070 to within 6% over and 1% under", () => {
+    // The allocator's own peak from a page fold, with the groups its buffers show it took: 1000 residues whole, 1200 and 1350
+    // with the spill. Not all the weights are resident at the track's peak, which is the room on the high side.
+    for (const [tokens, spill, groups, measuredMiB] of [[1000, false, 2, 4248], [1200, true, 2, 4581], [1350, true, 8, 4646]]) {
+      const planned = esmfold2PeakBytes({ tokens, spill, groups }) / MIB;
+      assert.ok(planned / measuredMiB < 1.07 && planned / measuredMiB > 0.99, `${tokens}: planned ${planned} against ${measuredMiB} MiB`);
     }
+  });
+
+  it("says what the fold will hold, which follows the room down to the least it can", () => {
+    const needAt = (budgetBytes) => planEsmfold2({ tokens: 1000 }, { ...machine, gpu: { ...rtx3070, budgetBytes } }).needBytes;
+    const roomy = needAt(32 * GIB);
+    assert.equal(roomy, esmfold2PeakBytes({ tokens: 1000, groups: 2 }));
+    const narrow = needAt(rtx3070.budgetBytes);
+    assert.ok(narrow < roomy, `${narrow} against ${roomy}`);
+    assert.ok(narrow >= esmfold2PeakBytes({ tokens: 1000, spill: true }));
   });
 
   it("does not count a fold's own weights twice in deciding to spill", () => {
@@ -85,6 +95,14 @@ describe("where a fold is sent", () => {
     assert.equal(describePlan(plan).tone, "warn");
   });
 
+  it("does not read as fitting when it misses by the margin", () => {
+    const tokens = esmfold2MaxTokens({ budgetBytes: rtx3070.budgetBytes }) + 1;
+    const plan = planEsmfold2({ tokens }, machine);
+    assert.equal(plan.where, "over");
+    assert.ok(Number(/Needs (\d\.\d) of/.exec(describePlan(plan).text)[1]) > 4.8, describePlan(plan).text);
+    assert.ok(Number(/needs (\d\.\d) GiB/.exec(describeRefusal(plan))[1]) > 4.8, describeRefusal(plan));
+  });
+
   it("offers no CPU a fold would not fit in", () => {
     const plan = planEsmfold2({ tokens: 1400 }, machine);
     assert.equal(plan.where, "over");
@@ -133,7 +151,8 @@ describe("where a fold is sent", () => {
 
 describe("how long it will take", () => {
   it("follows what an A10 measured, to within 15%", () => {
-    for (const [tokens, seconds] of [[300, 7.4], [600, 27.3], [800, 49.1], [1000, 78.4], [1200, 120.6]]) {
+    for (const [tokens, seconds] of [[300, 7.0], [600, 25.4], [800, 46.0], [1000, 74.1], [1200, 113.9], [1448, 187.6], [1800, 356.8],
+      [2046, 516.0]]) {
       const planned = gpuFoldSeconds({ tokens });
       assert.ok(Math.abs(planned / seconds - 1) < 0.15, `${tokens}: planned ${planned} against ${seconds} s`);
     }
@@ -172,6 +191,26 @@ describe("how long it will take", () => {
     assert.ok(Math.abs(readFoldRates(storage).cards["RTX 3070"] - 1.5) < 1e-9);
   });
 
+  it("does not learn a sleep, and a card that really is slower still gets there", () => {
+    const storage = fakeStorage();
+    const fold = { where: "gpu", card: "RTX 3070", tokens: 600, loops: 4 };
+    const reference = gpuFoldSeconds({ tokens: 600, loops: 4 });
+    noteFold({ ...fold, seconds: reference }, storage);
+    noteFold({ ...fold, seconds: 7200 }, storage);
+    assert.ok(Math.abs(readFoldRates(storage).cards["RTX 3070"] - 2.5) < 1e-9);
+    noteFold({ ...fold, seconds: reference * 10 }, storage);
+    noteFold({ ...fold, seconds: reference * 10 }, storage);
+    assert.ok(readFoldRates(storage).cards["RTX 3070"] > 8);
+  });
+
+  it("adds what a first CPU fold has to load, and only then", () => {
+    const fold = { tokens: 76 };
+    const loaded = planEsmfold2(fold, { preference: "cpu", threads: 8 });
+    const first = planEsmfold2(fold, { preference: "cpu", threads: 8, cpuLoaded: false });
+    assert.ok(Math.abs(loaded.seconds - cpuFoldSeconds({ tokens: 76, threads: 8 })) < 1e-9);
+    assert.ok(Math.abs(first.seconds - loaded.seconds - 35) < 1e-9);
+  });
+
   it("keeps the CPU's rate apart from any card's", () => {
     const storage = fakeStorage();
     noteFold({ where: "cpu", tokens: 300, loops: 4, threads: 8, seconds: cpuFoldSeconds({ tokens: 300, threads: 8 }) * 3 },
@@ -203,13 +242,38 @@ describe("a CPU fold's memory", () => {
   });
 });
 
+describe("what a browser stored", () => {
+  const storing = (value) => ({ getItem: () => value, setItem() {} });
+
+  it("is read as a measurement only if it is one", () => {
+    for (const value of ["not json", "null", "-1", "[]", "{}", '{"cards":7,"cpu":"fast"}', '{"cards":"x"}', '{"cards":null}']) {
+      const rates = readFoldRates(storing(value));
+      assert.equal(rates.cpu, undefined, value);
+      assert.deepEqual(rates.cards, {}, value);
+    }
+    const rates = readFoldRates(storing('{"cpu":-5,"cards":{"a":"abc","b":0,"c":-3,"d":1e9,"e":1.5}}'));
+    assert.equal(rates.cpu, undefined);
+    assert.deepEqual(rates.cards, { e: 1.5 });
+  });
+
+  it("cannot stop a fold from being noted, or make a line read NaN", () => {
+    for (const value of ['{"cards":7}', '{"cards":{"x":"abc"}}', "not json"]) {
+      let saved;
+      noteFold({ where: "gpu", card: "x", tokens: 300, loops: 4, seconds: 30 }, { getItem: () => value, setItem: (_, text) => { saved = text; } });
+      assert.ok(Number.isFinite(JSON.parse(saved).cards.x), value);
+      const plan = planEsmfold2({ tokens: 300 }, { ...machine, rates: readFoldRates(storing(value)) });
+      assert.doesNotMatch(describePlan(plan).text, /NaN/, value);
+    }
+  });
+});
+
 describe("the other models", () => {
   const onCard = { gpu: rtx3070 };
 
   it("a size that was measured reads as it was measured", () => {
     assert.equal(planMeasuredModel("opendde", { tokens: 600 }, onCard).needBytes, 4846 * MIB);
     assert.equal(planMeasuredModel("boltz2", { tokens: 300 }, onCard).needBytes, 1003 * MIB);
-    assert.equal(measuredFoldSeconds("mol1", { tokens: 300 }), 24);
+    assert.equal(measuredFoldSeconds("mol1", { tokens: 300 }), 26);
   });
 
   it("past the last size the last line goes on, and more residues never cost less", () => {
@@ -264,10 +328,10 @@ describe("the other models", () => {
 
   it("a fold of any model teaches the card's rate, for all of them and for ESMFold2", () => {
     const storage = fakeStorage();
-    noteFold({ where: "gpu", card: rtx3070.name, family: "opendde", tokens: 300, loops: 4, seconds: 72 }, storage);
+    noteFold({ where: "gpu", card: rtx3070.name, family: "opendde", tokens: 300, loops: 4, seconds: 74 }, storage);
     const rates = readFoldRates(storage);
     assert.equal(rates.cards[rtx3070.name], 2);
-    assert.equal(planMeasuredModel("boltz2", { tokens: 300 }, { gpu: rtx3070, rates }).seconds, 22);
+    assert.equal(planMeasuredModel("boltz2", { tokens: 300 }, { gpu: rtx3070, rates }).seconds, 24);
     assert.equal(planEsmfold2({ tokens: 300 }, { gpu: rtx3070, rates }).seconds, 2 * gpuFoldSeconds({ tokens: 300 }));
   });
 

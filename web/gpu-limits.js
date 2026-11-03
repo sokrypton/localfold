@@ -7,12 +7,10 @@
  * needs a page, and every read is guarded because a failure only costs a tighter
  * or looser guess.
  */
-import { GPU_MEMORY_SHARE, gpuMemoryFromName, UNNAMED_CARD_BYTES } from "../webgpu/runtime/device-memory.js";
+import { GPU_MEMORY_SHARE, gpuMemoryFromName, lossTeachesLimit, UNNAMED_CARD_BYTES } from "../webgpu/runtime/device-memory.js";
 
 const LEARNED_KEY = "localfold.gpu-limit";
 const CHOSEN_KEY = "localfold.gpu-chosen-limit";
-/** A loss under this says nothing about memory: nothing large was being held. */
-const LEARN_FROM_BYTES = 512 * 1024 * 1024;
 
 let cachedName;
 
@@ -29,6 +27,13 @@ export function gpuName() {
   return cachedName;
 }
 
+/**
+ * Whether a name can be the adapter's. WebGL takes the browser's default GPU where WebGPU was asked for the fast one, so on
+ * a laptop with two the name can be the other card's, and the table would answer for a card that is not doing the work.
+ */
+const VENDOR_NAMES = { nvidia: /nvidia|geforce|quadro|tesla/i, intel: /intel/i, amd: /\b(amd|ati|radeon)\b/i };
+export const nameIsAdapters = (name, vendor) => VENDOR_NAMES[vendor]?.test(name ?? "") ?? true;
+
 /** The card's memory in bytes, when its name is one that says. */
 export function gpuMemoryBytes(adapter) {
   // Chrome reports this only behind its developer-features flag, and then it is
@@ -39,10 +44,10 @@ export function gpuMemoryBytes(adapter) {
     const size = Math.max(...(local.length > 0 ? local : heaps).map((heap) => Number(heap.size)));
     if (Number.isFinite(size) && size > 0) return size;
   }
-  const named = gpuMemoryFromName(gpuName());
+  const vendor = adapter?.info?.vendor ?? "";
+  const named = nameIsAdapters(gpuName(), vendor) ? gpuMemoryFromName(gpuName()) : undefined;
   if (named !== undefined) return named;
   // Not a table's card. A software adapter and unified memory have no card to run out of.
-  const vendor = adapter?.info?.vendor ?? "";
   if (vendor === "" || vendor === "apple" || vendor === "google" || adapter?.info?.isFallbackAdapter === true) return undefined;
   return UNNAMED_CARD_BYTES;
 }
@@ -50,7 +55,7 @@ export function gpuMemoryBytes(adapter) {
 function readLearned() {
   try {
     const saved = JSON.parse(localStorage.getItem(LEARNED_KEY) ?? "null");
-    return saved?.name === (gpuName() ?? "unknown") && Number.isFinite(saved.bytes) ? saved.bytes : undefined;
+    return saved?.name === (gpuName() ?? "unknown") && Number.isFinite(saved.bytes) && saved.bytes > 0 ? saved.bytes : undefined;
   } catch { return undefined; }
 }
 
@@ -78,15 +83,15 @@ export function learnedLimitBytes() {
  * Remember how much was on the card when its device was lost.
  *
  * The ceiling above is a guess from a name, and on an unlisted card from system
- * RAM alone. A device lost while holding this much is a measurement, so the next
- * device on this card stops short of it. Reading the same loss twice cannot raise
- * it, and `forgetLearnedLimit` is how a reader takes it back when the cause turned
- * out to be something else.
+ * RAM alone. A device lost while holding much of what it may hold is a measurement,
+ * so the next device on this card stops short of it. Reading the same loss twice
+ * cannot raise it, and `forgetLearnedLimit` is how a reader takes it back when the
+ * cause turned out to be something else.
  *
  * @returns {number | undefined} the new ceiling, when this loss set one
  */
-export function learnFromLoss(residentBytes) {
-  if (!(residentBytes >= LEARN_FROM_BYTES)) return undefined;
+export function learnFromLoss(residentBytes, budgetBytes) {
+  if (!lossTeachesLimit(residentBytes, budgetBytes)) return undefined;
   const bytes = Math.min(Math.round(residentBytes * GPU_MEMORY_SHARE), readLearned() ?? Infinity);
   try {
     localStorage.setItem(LEARNED_KEY, JSON.stringify({ name: gpuName() ?? "unknown", bytes }));

@@ -9,7 +9,7 @@
  * Nothing here touches a device or the DOM. A plan is advice to the page's preflight, and the fold's own account stays
  * the authority once it is running.
  */
-import { esmfold2PeakBytes, esmfold2TokenCeiling, FOLD_MARGIN_BYTES, FOLD_WEIGHT_BYTES, FOLD_WEIGHT_BYTES_F32, pairBytes }
+import { esmfold2Groups, esmfold2PeakBytes, esmfold2TokenCeiling, FOLD_MARGIN_BYTES, FOLD_WEIGHT_BYTES, FOLD_WEIGHT_BYTES_F32, pairBytes }
   from "../webgpu/esmfold2/memory-plan.js";
 
 const RATES_KEY = "localfold.fold-rates";
@@ -30,12 +30,12 @@ export const CPU_PEAK_PAIRS = 15;
 const RAM_SHARE = 0.7;
 
 /**
- * Seconds for a fold of four loops on a card about as fast as the two measured, an RTX 3070 and an A10, which read the
- * same within 5% from 300 to 1200 residues. The cube is the triangle contraction. A card's own first fold replaces this
- * reference with a rate of its own: see `noteFold`.
+ * Seconds for a fold of four loops on a card about as fast as the two measured, an RTX 3070 and an A10, within 9% of the
+ * A10 from 76 to 2046 residues. The cube is the triangle contraction. A card's own first fold replaces this reference with
+ * a rate of its own: see `noteFold`.
  */
 export function gpuFoldSeconds({ tokens, loops = 4 }) {
-  return 1.5 + (4.94e-5 * tokens ** 2 + 3.29e-8 * tokens ** 3) * passesShare(loops);
+  return 1.5 + (4.7e-5 * tokens ** 2 + 3.2e-8 * tokens ** 3) * passesShare(loops);
 }
 
 /**
@@ -46,6 +46,9 @@ export function cpuFoldSeconds({ tokens, loops = 4, threads = 1 }) {
   return 54 * (tokens / 76) ** 1.8 * (0.786 + 1.714 / Math.max(1, threads)) * passesShare(loops);
 }
 
+/** What a CPU fold adds when nothing is in memory yet: 74 s against 40 for ubiquitin through the page, at twelve threads. */
+const CPU_FIRST_LOAD_S = 35;
+
 export const cpuPeakBytes = ({ tokens, channels = 256 }) =>
   CPU_WEIGHT_BYTES + CPU_BYTES_PER_TOKEN * tokens + CPU_PEAK_PAIRS * pairBytes(tokens, channels);
 
@@ -53,16 +56,16 @@ export const cpuPeakBytes = ({ tokens, channels = 256 }) =>
  * @param {object} fold `tokens`, `loops`
  * @param {object} machine
  *   `preference`: "auto" or "cpu"
- *   `gpu`: undefined where there is no adapter, otherwise `{name, budgetBytes, maxBindingBytes, halfWeights, software,
+ *   `gpu`: undefined where there is no adapter, otherwise `{name, budgetBytes, maxBindingBytes, maxBufferBytes, halfWeights, software,
  *   refusing}`; `refusing` is a device request that has failed since the page loaded
- *   `threads`, `ramBytes`, `rates`
+ *   `threads`, `ramBytes`, `rates`, `cpuLoaded`: whether a CPU fold would find everything in memory
  * @returns {{where: "gpu"|"cpu"|"over"|"none", why?: string, needBytes?: number, budgetBytes?: number, spills?: boolean,
  *            seconds?: number, cpuSeconds?: number, cpuFits: boolean, threads: number}}
  *   `over`: the GPU cannot hold it, and the reader decides; `none`: nothing here can.
  */
-export function planEsmfold2({ tokens, loops = 4 }, { preference = "auto", gpu, threads = 1, ramBytes, rates = {} }) {
+export function planEsmfold2({ tokens, loops = 4 }, { preference = "auto", gpu, threads = 1, ramBytes, rates = {}, cpuLoaded = true }) {
   const cpuFits = ramBytes === undefined || cpuPeakBytes({ tokens }) <= ramBytes * RAM_SHARE;
-  const cpuSeconds = cpuFoldSeconds({ tokens, loops, threads }) * (rates.cpu ?? 1);
+  const cpuSeconds = cpuFoldSeconds({ tokens, loops, threads }) * (rates.cpu ?? 1) + (cpuLoaded ? 0 : CPU_FIRST_LOAD_S);
   const onCpu = (why) => (cpuFits ? { where: "cpu", why, seconds: cpuSeconds, cpuSeconds, cpuFits, threads }
     : { where: "none", why: "ram", needBytes: cpuPeakBytes({ tokens }), cpuFits, threads });
   if (preference === "cpu") return onCpu("chosen");
@@ -80,7 +83,10 @@ export function planEsmfold2({ tokens, loops = 4 }, { preference = "auto", gpu, 
     && tokens > esmfold2TokenCeiling({ maxBindingBytes: gpu.maxBindingBytes });
   const spills = (gpu.maxBindingBytes !== undefined && pairBytes(tokens) > gpu.maxBindingBytes)
     || (gpu.budgetBytes !== undefined && gpu.budgetBytes !== null && whole + FOLD_MARGIN_BYTES > gpu.budgetBytes);
-  const needBytes = spills ? least : whole;
+  // ...and it takes as few channel groups as fit, so what it will hold follows the room, down to `least`
+  const needBytes = esmfold2PeakBytes({ tokens, weightBytes, spill: spills, groups: esmfold2Groups({
+    tokens, weightBytes, spill: spills, budgetBytes: gpu.budgetBytes, maxBufferBytes: gpu.maxBufferBytes,
+  }) });
   const seconds = gpuFoldSeconds({ tokens, loops }) * (rates.cards?.[gpu.name] ?? 1);
   if (binding || over) {
     return { where: "over", why: binding ? "binding" : "memory", needBytes, budgetBytes: gpu.budgetBytes, seconds, cpuSeconds,
@@ -90,23 +96,25 @@ export function planEsmfold2({ tokens, loops = 4 }, { preference = "auto", gpu, 
 }
 
 /**
- * The other models on an A10 through the page, with no alignment: what the fold's own account reached in MiB, and the
- * seconds of a fold of four passes, at MEASURED_RESIDUES. Between two sizes the estimate is a straight line in n^2 for
- * memory and n^3 for time, and past the last the last line goes on. Each is named by its graph. AlphaFold 3's weights are
- * the reader's to accept, and OpenBind-0 is the same graph at the same widths (shared/bundles/manifests), so it stands in.
+ * The other models on an A10 through the page, with no alignment, at MEASURED_RESIDUES: the least the fold's own account
+ * reached in MiB, which is what it holds where room is short, and the seconds of a fold of four passes on the quicker of two
+ * containers, a first fold in a new browser. Between two sizes the estimate is a straight line in n^2 for memory and n^3 for
+ * time, and past the last the last line goes on. OpenDDE's stops at 600, because at 1000 it asks for more than a binding can
+ * name. Each is named by its graph. AlphaFold 3's weights are the reader's to accept, and OpenBind-0 is the same graph at the
+ * same widths (shared/bundles/manifests), so it stands in.
  */
-const MEASURED_RESIDUES = [76, 300, 600];
+const MEASURED_RESIDUES = [76, 300, 600, 1000];
 const MEASURED_MODELS = {
-  bioemu2: { peakMiB: [1524, 1856, 3117], seconds: [13.4, 14.9, 42.1] },
-  boltz2: { peakMiB: [677, 1003, 1329], seconds: [4, 11, 38] },
-  intellifold2: { peakMiB: [1215, 1515, 3377], seconds: [6, 47, 207] },
-  mol1: { peakMiB: [934, 1387, 2443], seconds: [6, 24, 112] },
-  monomer: { peakMiB: [388, 747, 1752], seconds: [3.2, 5.7, 19.1] },
-  multimer: { peakMiB: [401, 1056, 2764], seconds: [2.8, 5.9, 20.4] },
-  openbind0: { peakMiB: [512, 829, 1191], seconds: [4, 9, 30] },
-  opendde: { peakMiB: [1114, 1524, 4846], seconds: [6, 36, 142] },
-  protenix2: { peakMiB: [659, 935, 1550], seconds: [4, 15, 71] },
-  rosettafold3: { peakMiB: [514, 833, 1196], seconds: [4, 9, 34] },
+  bioemu2: { peakMiB: [1524, 1856, 2755, 5764], seconds: [10.7, 15.8, 50.1, 121] },
+  boltz2: { peakMiB: [677, 1003, 1329, 2216], seconds: [3, 12, 44, 141] },
+  intellifold2: { peakMiB: [1215, 1515, 2838, 6607], seconds: [6, 62, 285, 897] },
+  mol1: { peakMiB: [934, 1387, 2443, 5725], seconds: [5, 26, 113, 350] },
+  monomer: { peakMiB: [388, 747, 1752, 3682], seconds: [2.3, 5.4, 18.7, 62] },
+  multimer: { peakMiB: [401, 1056, 2761, 6577], seconds: [1.7, 6.6, 26.7, 93.7] },
+  openbind0: { peakMiB: [512, 829, 1191, 2066], seconds: [3, 9, 34, 108] },
+  opendde: { peakMiB: [1114, 1529, 4846], seconds: [5, 37, 142] },
+  protenix2: { peakMiB: [659, 935, 1550, 3053], seconds: [3, 20, 87, 282] },
+  rosettafold3: { peakMiB: [514, 833, 1196, 2371], seconds: [3, 10, 37, 118] },
 };
 MEASURED_MODELS.af3 = MEASURED_MODELS.openbind0;
 
@@ -147,6 +155,8 @@ export function planMeasuredModel(family, { tokens, loops = 4, models = 1 }, { p
 }
 
 const gib = (bytes) => (bytes / 1024 ** 3).toFixed(1);
+/** What a fold refused for its memory asks for: with the margin it was refused on, rounded up, or missing by that reads "4.8 of 4.8 GiB". */
+const gibAsked = (plan) => (Math.ceil((plan.needBytes + FOLD_MARGIN_BYTES) / 1024 ** 3 * 10) / 10).toFixed(1);
 
 /** "about 40 s", "about 3 min", "about 1.5 h": as rough as a figure that has not met this machine should read. */
 export function roughDuration(seconds) {
@@ -171,7 +181,7 @@ export function describePlan(plan) {
         : `${gib(plan.needBytes)} of ${gib(plan.budgetBytes)} GiB`;
       const measured = "Measured with no alignment, which adds to this.";
       return plan.over
-        ? { text: `Needs ${memory}`,
+        ? { text: `Needs ${gibAsked(plan)} of ${gib(plan.budgetBytes)} GiB`,
             title: `${measured} More than the page lets one fold hold on this card, which keeps the rest for the desktop`
               + " and other programs. Settings can change the limit.",
             tone: "warn" }
@@ -219,9 +229,9 @@ export function describePlan(plan) {
     case "over":
       return plan.why === "binding"
         ? { text: `Too long for WebGPU${cpuOption}`,
-            title: "Past the longest fold WebGPU's buffer bindings can address, on any card.",
+            title: "Past the longest fold WebGPU's buffer bindings can address on this device.",
             tone: "warn" }
-        : { text: `Needs ${gib(plan.needBytes)} of ${gib(plan.budgetBytes)} GiB${cpuOption}`,
+        : { text: `Needs ${gibAsked(plan)} of ${gib(plan.budgetBytes)} GiB${cpuOption}`,
             title: "More than the page lets one fold hold on this card, which keeps the rest for the desktop and other"
               + " programs. Settings can change the limit.",
             tone: "warn" };
@@ -234,20 +244,28 @@ export function describePlan(plan) {
 /** The same, in a sentence, for a fold that has been refused and offers a way on. */
 export function describeRefusal(plan) {
   if (plan.where === "none") return `This fold needs ${gib(plan.needBytes)} GiB of system memory, more than this machine can spare.`;
-  if (plan.why === "binding") return "This fold is past the longest WebGPU's buffer bindings can address, on any card.";
-  return `This fold needs ${gib(plan.needBytes)} GiB, and the page lets one fold hold ${gib(plan.budgetBytes)} GiB on this card.`;
-}
-
-/** What this browser has measured of its own machine: how each card and the CPU run against the references above. */
-export function readFoldRates(storage = globalThis.localStorage) {
-  try {
-    const saved = JSON.parse(storage.getItem(RATES_KEY) ?? "{}");
-    return { cpu: Number.isFinite(saved.cpu) ? saved.cpu : undefined, cards: saved.cards ?? {} };
-  } catch { return { cards: {} }; }
+  if (plan.why === "binding") return "This fold is past the longest WebGPU's buffer bindings can address on this device.";
+  return `This fold needs ${gibAsked(plan)} GiB, and the page lets one fold hold ${gib(plan.budgetBytes)} GiB on this card.`;
 }
 
 const FOLD_WORTH_TIMING_S = 3;
 const RATE_RANGE = [0.02, 50];
+
+/**
+ * What this browser has measured of its own machine: how each card and the CPU run against the references above.
+ *
+ * Whatever else is in that key is not a measurement. A rate that is text reads "about NaN min" beside the button, and a
+ * `cards` that is a number throws from the end of a fold that succeeded. And `localStorage` itself throws where site data
+ * is blocked, which a default parameter would have thrown outside the try, at every press of Fold.
+ */
+export function readFoldRates(storage) {
+  const isRate = (value) => Number.isFinite(value) && value >= RATE_RANGE[0] && value <= RATE_RANGE[1];
+  try {
+    const saved = JSON.parse((storage ?? globalThis.localStorage).getItem(RATES_KEY) ?? "{}");
+    return { cpu: isRate(saved?.cpu) ? saved.cpu : undefined,
+             cards: Object.fromEntries(Object.entries(saved?.cards ?? {}).filter(([, rate]) => isRate(rate))) };
+  } catch { return { cards: {} }; }
+}
 
 /**
  * Learn from a fold that ran to its end.
@@ -259,15 +277,16 @@ const RATE_RANGE = [0.02, 50];
  *          family?: string, models?: number}} fold `family`: the graph of a model other than ESMFold2. A card's rate is
  *   its own whichever model taught it, so a first fold of any of them improves the figures for all of them.
  */
-export function noteFold({ where, card, tokens, loops, threads, seconds, family, models }, storage = globalThis.localStorage) {
+export function noteFold({ where, card, tokens, loops, threads, seconds, family, models }, storage) {
   if (seconds < FOLD_WORTH_TIMING_S) return;
   const reference = family !== undefined ? measuredFoldSeconds(family, { tokens, loops, models })
     : where === "cpu" ? cpuFoldSeconds({ tokens, loops, threads }) : gpuFoldSeconds({ tokens, loops });
   if (reference === undefined) return;
   const rate = Math.min(RATE_RANGE[1], Math.max(RATE_RANGE[0], seconds / reference));
   const rates = readFoldRates(storage);
-  const blend = (old) => (old === undefined ? rate : (old + rate) / 2);
+  // ...and no one fold moves it far: a laptop that slept through seven seconds' work read two hours, and then six minutes for the next.
+  const blend = (old) => (old === undefined ? rate : (old + Math.min(rate, old * 4)) / 2);
   if (where === "cpu") rates.cpu = blend(rates.cpu);
   else rates.cards[card ?? ""] = blend(rates.cards[card ?? ""]);
-  try { storage.setItem(RATES_KEY, JSON.stringify(rates)); } catch { /* a private window: this fold only */ }
+  try { (storage ?? globalThis.localStorage).setItem(RATES_KEY, JSON.stringify(rates)); } catch { /* a private window: this fold only */ }
 }
