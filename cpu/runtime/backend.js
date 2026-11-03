@@ -12,6 +12,7 @@
  */
 import { CONTROL, JOB_GEMM, JOB_LOGISTIC, runJobChunks } from "./backend-job.js";
 import { gemmModuleBytes, gemmSupported, relaxedSimdSupported } from "./gemm-wasm.js";
+import { floats } from "./recycled-floats.js";
 
 const PAGE = 65536;
 const GIB = 1024 * 1024 * 1024;
@@ -189,7 +190,7 @@ export class CpuBackend {
     const rowBytes = (inner + outer) * 4;
     const rowsAtOnce = Math.min(rows, Math.floor(room / rowBytes));
     if (rowsAtOnce < 1) throw new Error("The CPU fold's scratch memory is too small for one row.");
-    const output = new Float32Array(rows * outer);
+    const output = floats(rows * outer);
     for (let first = 0; first < rows; first += rowsAtOnce) {
       const here = Math.min(rowsAtOnce, rows - first);
       const inputAt = start;
@@ -226,7 +227,7 @@ export class CpuBackend {
     const room = this.#capacity - start;
     const planesAtOnce = Math.min(channels, Math.floor(room / (plane * 12)));
     if (planesAtOnce < 1) throw new Error("The CPU fold's scratch memory is too small for one plane.");
-    const output = new Float32Array(channels * plane);
+    const output = floats(channels * plane);
     const float = this.#float;
     const outgoing = direction === "outgoing";
     for (let first = 0; first < channels; first += planesAtOnce) {
@@ -264,7 +265,7 @@ export class CpuBackend {
     const room = this.#capacity - start;
     const atOnce = Math.min(input.length, Math.floor(room / 8) & ~3);
     if (atOnce < 4) throw new Error("The CPU fold's scratch memory is too small.");
-    const output = new Float32Array(input.length);
+    const output = floats(input.length);
     const float = this.#float;
     for (let first = 0; first < input.length; first += atOnce) {
       const here = Math.min(atOnce, input.length - first);

@@ -45,8 +45,23 @@
  * open every gate and be wrong everywhere.
  */
 import { fastLinear, fastLogistic, fastTriangle } from "../../runtime/linear-backend.js";
+import { floats, recycle } from "../../runtime/recycled-floats.js";
 
 const EPSILON = 1e-5;
+
+/**
+ * The pair rows a kernel takes at a time, which is the difference between holding a pair-sized tensor and not.
+ *
+ * Everything in a transition and in the two ends of a triangle multiplication is row by row: LayerNorm, each matrix
+ * multiply and each gate read one row and write one row. Done over the whole pair, a transition held 21 pair-sized
+ * tensors at its fullest and a multiplication 9, each copied through the multiply's memory and back. A chunk is 8 MiB of
+ * a 256-channel pair, which also fits a last-level cache, so the same multiplies do not spend the memory bus on it.
+ */
+const ROWS_AT_ONCE = 8192;
+
+function forRowChunks(rows, each) {
+  for (let first = 0; first < rows; first += ROWS_AT_ONCE) each(first, Math.min(ROWS_AT_ONCE, rows - first));
+}
 
 const sigmoid = (value) => 1 / (1 + Math.exp(-value));
 const swish = (value) => value * sigmoid(value);
@@ -67,7 +82,7 @@ const swish = (value) => value * sigmoid(value);
  * @returns {Float32Array} rows x channels
  */
 export function layerNorm(input, rows, channels, scale, offset) {
-  const output = new Float32Array(input.length);
+  const output = floats(input.length);
   for (let row = 0; row < rows; row += 1) {
     const base = row * channels;
     let sum = 0;
@@ -197,22 +212,28 @@ export function transition(input, rows, channels, weights, factor = 4) {
   // shape of the weights, so a wrong factor here reads them at the wrong stride
   // rather than failing.
   const intermediate = channels * factor;
-  const normalised = layerNorm(input, rows, channels, weights.inputLayerNormScale,
-                               weights.inputLayerNormOffset);
-  const wide = linear(normalised, rows, channels, intermediate * 2, weights.transition1);
-  const gated = new Float32Array(rows * intermediate);
-  const logistic = fastLogistic(wide);
-  for (let row = 0; row < rows; row += 1) {
-    const wideBase = row * intermediate * 2;
-    const gatedBase = row * intermediate;
-    for (let i = 0; i < intermediate; i += 1) {
-      // ...[gate half | value half], in that order.
-      const at = wideBase + i;
-      gated[gatedBase + i] = (logistic === undefined ? swish(wide[at]) : wide[at] * logistic[at])
-        * wide[wideBase + intermediate + i];
+  const output = floats(rows * channels);
+  forRowChunks(rows, (first, here) => {
+    const normalised = layerNorm(input.subarray(first * channels, (first + here) * channels), here, channels,
+                                 weights.inputLayerNormScale, weights.inputLayerNormOffset);
+    const wide = linear(normalised, here, channels, intermediate * 2, weights.transition1);
+    const gated = floats(here * intermediate);
+    const logistic = fastLogistic(wide);
+    for (let row = 0; row < here; row += 1) {
+      const wideBase = row * intermediate * 2;
+      const gatedBase = row * intermediate;
+      for (let i = 0; i < intermediate; i += 1) {
+        // ...[gate half | value half], in that order.
+        const at = wideBase + i;
+        gated[gatedBase + i] = (logistic === undefined ? swish(wide[at]) : wide[at] * logistic[at])
+          * wide[wideBase + intermediate + i];
+      }
     }
-  }
-  return linear(gated, rows, intermediate, channels, weights.transition2);
+    const out = linear(gated, here, intermediate, channels, weights.transition2);
+    output.set(out, first * channels);
+    recycle(normalised, wide, gated, logistic, out);
+  });
+  return output;
 }
 
 /**
@@ -228,31 +249,39 @@ export function transition(input, rows, channels, weights, factor = 4) {
 export function triangleMultiplication(pair, mask, n, channels, direction, weights,
                                        dialect = undefined) {
   const pairs = n * n;
-  const normalised = layerNorm(pair, pairs, channels, weights.leftNormInputScale,
-                               weights.leftNormInputOffset);
-  const projection = linear(normalised, pairs, channels, channels * 2, weights.projection);
-  const gate = linear(normalised, pairs, channels, channels * 2, weights.gate);
+  // LayerNorm(pair) is the same bits whenever it is taken, because the pair does not change until the caller adds what
+  // this returns: so it is taken again for the output gate, a chunk at a time, rather than kept.
+  const normalisedRows = (first, here) => layerNorm(
+    pair.subarray(first * channels, (first + here) * channels), here, channels,
+    weights.leftNormInputScale, weights.leftNormInputOffset);
 
   // The INTERLEAVED split - see the note at the top. `a` and `b` are laid out
   // as (channel, i, j) because that is the axis order the einsum contracts in.
-  const a = new Float32Array(channels * pairs);
-  const b = new Float32Array(channels * pairs);
-  const gates = fastLogistic(gate);
-  for (let index = 0; index < pairs; index += 1) {
-    const wide = index * channels * 2;
-    const maskValue = mask[index];
-    for (let c = 0; c < channels; c += 1) {
-      const first = wide + c * 2;
-      const gated = maskValue * (gates === undefined ? sigmoid(gate[first]) : gates[first]);
-      a[c * pairs + index] = projection[first] * gated;
-      b[c * pairs + index] = projection[first + 1]
-        * maskValue * (gates === undefined ? sigmoid(gate[first + 1]) : gates[first + 1]);
+  const a = floats(channels * pairs);
+  const b = floats(channels * pairs);
+  forRowChunks(pairs, (start, here) => {
+    const normalised = normalisedRows(start, here);
+    const projection = linear(normalised, here, channels, channels * 2, weights.projection);
+    const gate = linear(normalised, here, channels, channels * 2, weights.gate);
+    const gates = fastLogistic(gate);
+    for (let row = 0; row < here; row += 1) {
+      const index = start + row;
+      const wide = row * channels * 2;
+      const maskValue = mask[index];
+      for (let c = 0; c < channels; c += 1) {
+        const first = wide + c * 2;
+        const gated = maskValue * (gates === undefined ? sigmoid(gate[first]) : gates[first]);
+        a[c * pairs + index] = projection[first] * gated;
+        b[c * pairs + index] = projection[first + 1]
+          * maskValue * (gates === undefined ? sigmoid(gate[first + 1]) : gates[first + 1]);
+      }
     }
-  }
+    recycle(normalised, projection, gate, gates);
+  });
 
   const contracted = dialect?.triangleMulDivideByLength === true ? undefined
     : fastTriangle(a, b, n, channels, direction);
-  const product = contracted ?? new Float32Array(channels * pairs);
+  const product = contracted ?? floats(channels * pairs);
   for (let c = 0; contracted === undefined && c < channels; c += 1) {
     const plane = c * pairs;
     for (let i = 0; i < n; i += 1) {
@@ -292,31 +321,39 @@ export function triangleMultiplication(pair, mask, n, channels, direction, weigh
   // AF3 spells it LayerNorm(axis=0, param_axis=0), which reads like "normalise
   // over channels" only once you know the array is channel-major here. Doing it
   // over i or j instead still runs and still returns finite numbers.
-  const centred = new Float32Array(channels * pairs);
-  for (let index = 0; index < pairs; index += 1) {
-    let sum = 0;
-    let sumSquares = 0;
-    for (let c = 0; c < channels; c += 1) {
-      const value = product[c * pairs + index];
-      sum += value;
-      sumSquares += value * value;
+  recycle(a, b);
+  const output = floats(channels * pairs);
+  forRowChunks(pairs, (start, here) => {
+    const centred = floats(channels * here);
+    for (let row = 0; row < here; row += 1) {
+      const index = start + row;
+      let sum = 0;
+      let sumSquares = 0;
+      for (let c = 0; c < channels; c += 1) {
+        const value = product[c * pairs + index];
+        sum += value;
+        sumSquares += value * value;
+      }
+      const mean = sum / channels;
+      const inverse = 1 / Math.sqrt(sumSquares / channels - mean * mean + EPSILON);
+      for (let c = 0; c < channels; c += 1) {
+        centred[row * channels + c] =
+          (product[c * pairs + index] - mean) * inverse * weights.centerNormScale[c]
+          + weights.centerNormOffset[c];
+      }
     }
-    const mean = sum / channels;
-    const inverse = 1 / Math.sqrt(sumSquares / channels - mean * mean + EPSILON);
-    for (let c = 0; c < channels; c += 1) {
-      centred[index * channels + c] =
-        (product[c * pairs + index] - mean) * inverse * weights.centerNormScale[c]
-        + weights.centerNormOffset[c];
+    const projected = linear(centred, here, channels, channels, weights.outputProjection);
+    const normalised = normalisedRows(start, here);
+    const outputGate = linear(normalised, here, channels, channels, weights.gatingLinear);
+    const outputGates = fastLogistic(outputGate);
+    for (let index = 0; index < projected.length; index += 1) {
+      projected[index] *= outputGates === undefined ? sigmoid(outputGate[index]) : outputGates[index];
     }
-  }
-
-  const projected = linear(centred, pairs, channels, channels, weights.outputProjection);
-  const outputGate = linear(normalised, pairs, channels, channels, weights.gatingLinear);
-  const outputGates = fastLogistic(outputGate);
-  for (let index = 0; index < projected.length; index += 1) {
-    projected[index] *= outputGates === undefined ? sigmoid(outputGate[index]) : outputGates[index];
-  }
-  return projected;
+    output.set(projected, start * channels);
+    recycle(centred, projected, normalised, outputGate, outputGates);
+  });
+  recycle(product);
+  return output;
 }
 
 /**

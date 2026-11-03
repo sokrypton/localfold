@@ -20,6 +20,7 @@ import { featuriseForEsmfold2, languageModelInput } from "../shared/esmfold2/fea
 import { contactBinCountsByPair } from "../shared/esmfold2/contacts.js";
 import { representativeAtoms } from "../shared/esmfold2/representative-atoms.js";
 import { transition, triangleMultiplication } from "../cpu/af3/trunk/pairformer.js";
+import { recycle, startRecycling, stopRecycling } from "../cpu/runtime/recycled-floats.js";
 import { esmcBlock, layerMix, layerNorm as towerNorm, linear as towerLinear, shimPair }
   from "../cpu/esmc/tower.js";
 import { atomDecoder, inputsEmbedder } from "../cpu/esmfold2/atom-transformer.js";
@@ -110,6 +111,15 @@ function contactProbabilities(logits, pairs, bins, nearBins) {
  *   `onProgress`, `onContacts` and `onStep`. `shouldStop` throws to stop.
  */
 export async function foldEsmfold2Cpu(options) {
+  startRecycling();
+  try {
+    return await foldWithRecycledFloats(options);
+  } finally {
+    stopRecycling();
+  }
+}
+
+async function foldWithRecycledFloats(options) {
   const { shape, weights } = options;
   const started = performance.now();
   const timings = {};
@@ -178,11 +188,14 @@ export async function foldEsmfold2Cpu(options) {
   const bonds = tokenBondEncoding(features.tokenBonds, tokens, channels, featuriser.tokenBonds);
   for (let i = 0; i < zInit.length; i += 1) zInit[i] += relPos[i] + bonds[i] + lmPair[i];
 
-  const recycle = { scale: featuriser.recycleScale, offset: featuriser.recycleOffset,
-                    projection: featuriser.recycleProjection };
+  const recycled = { scale: featuriser.recycleScale, offset: featuriser.recycleOffset,
+                     projection: featuriser.recycleProjection };
   const mask2d = new Float32Array(pairs).fill(1);
   let pair = new Float32Array(pairs * channels);
-  const add = (delta) => { for (let i = 0; i < pair.length; i += 1) pair[i] += delta[i]; };
+  const add = (delta) => {
+    for (let i = 0; i < pair.length; i += 1) pair[i] += delta[i];
+    recycle(delta);
+  };
   const runBlocks = (blocks, units, label) => stage(label, async () => {
     for (const block of blocks) {
       options.shouldStop?.();
@@ -196,9 +209,9 @@ export async function foldEsmfold2Cpu(options) {
     }
   });
   for (let loop = 0; loop < loops; loop += 1) {
-    const projected = recycleProjection(pair, pairs, channels, recycle);
-    pair = new Float32Array(pairs * channels);
+    const projected = recycleProjection(pair, pairs, channels, recycled);
     for (let i = 0; i < pair.length; i += 1) pair[i] = zInit[i] + projected[i];
+    recycle(projected);
     await runBlocks(weights.trunkBlocks, trunkUnits / loops, "Trunk");
   }
 
