@@ -345,6 +345,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 // to its order. ESM-C's LANES is 64 and its GRID_WIDTH 32768, so the text is
 // otherwise identical.
 import { createAddShader } from "../runtime/execution.js";
+
+/** How many of a denoising step's dispatches one submission holds. */
+const DENOISE_PIECE_DISPATCHES = 48;
 export { createAddShader };
 
 /** `out = a * sigmoid(gate)`, elementwise. */
@@ -1678,9 +1681,10 @@ export class Esmfold2DenoiserGpu {
     this.device.queue.writeBuffer(b.noise.buffer, 0,
       noiseEmbedding(tHat, sigmaData, this.weights.conditioning, tokenChannels));
 
-    const encoder = this.device.createCommandEncoder({ label: "esmfold2.denoise" });
+    let encoder = this.device.createCommandEncoder({ label: "esmfold2.denoise" });
     const batch = deviceTuning(this.device).batchComputePasses !== false;
     let pass = null;
+    let dispatched = 0;
     for (const step of this.program) {
       if (step.kind === "copy") {
         if (pass !== null) { pass.end(); pass = null; }
@@ -1692,6 +1696,13 @@ export class Esmfold2DenoiserGpu {
       pass.setBindGroup(0, step.bindGroup);
       pass.dispatchWorkgroups(step.x, step.y, step.z ?? 1);
       if (!batch) { pass.end(); pass = null; }
+      // A step is 236 to 336 dispatches: 694 ms in one submission at 2046 tokens on an A10, 920 at 1200 on a T4.
+      dispatched += 1;
+      if (dispatched % DENOISE_PIECE_DISPATCHES === 0) {
+        if (pass !== null) { pass.end(); pass = null; }
+        this.device.queue.submit([encoder.finish()]);
+        encoder = this.device.createCommandEncoder({ label: "esmfold2.denoise" });
+      }
     }
     if (pass !== null) pass.end();
     encoder.copyBufferToBuffer(b.update.buffer, 0, b.readback.buffer, 0, atoms * 3 * 4);
