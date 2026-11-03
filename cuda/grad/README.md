@@ -33,13 +33,14 @@ port computes, and its gradient is the gradient of that.
 | **AF3 lineage: the confidence head** (`af3conf.cuh`) | target_feat's projections and the pseudo-beta distogram into the pair, its four pairformer blocks, the PDE (AF3's symmetrised-after, protenix2's LN(z + z^T)), PAE and per-atom pLDDT logits | `confidenceHead()`'s expectations: PAE/PDE <= 4.5e-6 on af3, protenix2, intellifold2, openbind0, mol1; pLDDT held to 4x the port's own sensitivity (below) | 219 tensors <= 5.5e-6 (af3), 222 (protenix2) |
 | **ESMFold2** (`af3.cuh`, `msap.cuh`) | pair trunk blocks of the trunk, coda, LM and MSA encoders | `trunkBlock`: 1.9e-7..3.8e-7 | the pairformer's |
 | **ESMFold2's atom stack** (`ef2atom.cuh`) | c0 and the sliding-window adaLN-Zero blocks (q/k rms-normed per head and rotated by the 3D RoPE table, the window by valid rank, the live gate, the gated SwiGLU) the inputs embedder and the diffusion module's encoder and decoder share | `prepareAtoms` + `swaBlock` in their float32 arm: <= 9.0e-8; **the vendor's own float32-attention dump**: <= 1.3e-7 | 21 tensors <= 5.5e-7 |
+| **ESMFold2's diffusion module** (`ef2diff.cuh`) | one denoiser call: the conditioning pair (its relative encoding, the two transitions) and every token block's bias, the noise-conditioned single, the atom encoder and decoder (the SWA stacks), the 12 adaLN token blocks with pair-biased gated attention and gated SwiGLU, the pooling and broadcast, EDM's combine | `makeDenoiser` + `denoise` in their float32 arm: 1.1e-6 | 349 tensors <= 2.6e-5 |
 | **ESM-C / ESM2** (`plm.cuh`) | the towers, ESM-C's sequence head, a masked-LM cross entropy | `esmcTower`, 36 layers: 5.8e-7 | <= 5.3e-7 |
 | **MSA Pairformer** (`msap.cuh`) | its layer: PWA, transition, query-biased OPM (differential sequence weights), pair block | the port's float32 path: <= 4.2e-7 | 2.6e-6 |
 | **BioEmu2** (`bioemu2.cuh`) | MSA layer and PairMixer layer (Boltz modules, stacked (out, in) weights) | `pairWeightedAveraging`/`transition`/`outerProductMean`/`trimul`: <= 2.1e-6 | <= 2.1e-6 |
 | **RFD4-Proteina** (`rfd4p.cuh`) | token layer (RMS AdaLN, pair-biased attention, SwiGLU, output scales) and pair update | `tokenLayer`/`pairReprUpdate` <float>: 5e-8 / 1.6e-7 | 1.9e-6 |
 
 Not yet: the template embedders (AF2's, AF3's), the dialect branches named in each header (boltz2's re-embedded
-confidence head and atom-only target_feat, rf3's global norms, chai-1's embeddings, OpenDDE's structural tokens), and, ESMFold2's atom stack and diffusion module, BioEmu2's denoiser,
+confidence head and atom-only target_feat, rf3's global norms, chai-1's embeddings, OpenDDE's structural tokens), and, BioEmu2's denoiser,
 RFD4-P's encoder/decoder glue). The layers they are made of are mostly here already.
 
 Also: AdamW (`adam.cuh`); `train-af2-smoke` - real weights perturbed 10% and trained back, loss 918 -> 14.7 in 60

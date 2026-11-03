@@ -24,6 +24,8 @@ build cuda/grad/test-af3diff-f64 -O2 -DGRAD_F64 cuda/grad/test_af3diff.cu
 build cuda/grad/test-ef2 -O1 cuda/grad/test_ef2.cu
 build cuda/grad/test-ef2atom -O1 cuda/grad/test_ef2atom.cu
 build cuda/grad/test-ef2atom-f64 -O2 -DGRAD_F64 cuda/grad/test_ef2atom.cu
+build cuda/grad/test-ef2diff -O1 cuda/grad/test_ef2diff.cu
+build cuda/grad/test-ef2diff-f64 -O2 -DGRAD_F64 cuda/grad/test_ef2diff.cu
 build cuda/grad/test-msap -O1 cuda/grad/test_msap.cu
 build cuda/grad/test-msap-f64 -O2 -DGRAD_F64 cuda/grad/test_msap.cu
 build cuda/grad/test-bioemu2 -O1 cuda/grad/test_bioemu2.cu
@@ -80,6 +82,8 @@ run cuda/grad/test-af3 --bundle=model-mol1-f32 --family=mol1 --prefix=trunk.pair
 run cuda/grad/test-ef2
 run cuda/grad/test-ef2atom
 run cuda/grad/test-ef2atom-f64
+run cuda/grad/test-ef2diff
+run cuda/grad/test-ef2diff-f64
 run cuda/grad/test-msap --layer=0
 run cuda/grad/test-msap-f64
 run cuda/grad/test-bioemu2
