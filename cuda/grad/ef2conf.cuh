@@ -88,10 +88,9 @@ __global__ void rowPoolFwdK(const real* z, const real* score, real* w, real* poo
   }
 }
 // dz[i, j] += w dpooled[i]; dscore[i, j] = w (dw - sum_k w dw), dw = dpooled[i] . z[i, j]   (a block a row)
-__global__ void rowPoolBwdK(const real* z, const real* w, const real* dp, real* dz, real* dscore, int T, int C) {
+__global__ void rowPoolBwdK(const real* z, const real* w, const real* dp, real* dz, real* dscore, int T, int C, real* dwAll) {
   int i = blockIdx.x;
-  extern __shared__ char shm[];
-  real* dw = reinterpret_cast<real*>(shm);
+  real* dw = dwAll + (size_t)i * T;      // (global: in shared, T reals were past a launch's 48 KB at 6,144 tokens)
   for (int j = threadIdx.x; j < T; j += blockDim.x) {
     real a = 0;
     for (int c = 0; c < C; ++c) a += dp[(size_t)i * C + c] * z[((size_t)i * T + j) * C + c];
@@ -196,7 +195,7 @@ inline void confBackward(Ef2Confidence& h, const ConfInputs& in, const ConfSave&
     real* dsg = ARENA.get((size_t)T * h.Cs); lnBackward(h.plddtLn, s.lpl, dsn, dsg, T, false);
     real* dpool = ARENA.get((size_t)T * C); h.poolOut.backward(s.pooled, dsg, dpool, T);
     real* dscore = ARENA.get(P);
-    rowPoolBwdK<<<T, 256, T * sizeof(real), STREAM>>>(s.z, s.w, dpool, dz, dscore, T, C);
+    rowPoolBwdK<<<T, 256, 0, STREAM>>>(s.z, s.w, dpool, dz, dscore, T, C, ARENA.get(P));
     h.poolAttn.backward(s.z, dscore, dz, P, true);
   }
   // z = z0 + blocks(z0)

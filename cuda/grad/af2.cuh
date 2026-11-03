@@ -99,10 +99,11 @@ __global__ void gaMixBwdK(const real* dy, const real* wa, const real* g, real* d
 __global__ void gaBwdK(const real* __restrict__ mask, const real* __restrict__ q, const real* __restrict__ k,
                        const real* __restrict__ v, const real* __restrict__ w, const real* __restrict__ dwa,
                        real* __restrict__ dq, real* __restrict__ dk, real* __restrict__ dv, int B, int S, int H,
-                       int D) {
+                       int D, real* __restrict__ dsAll) {
   int b = blockIdx.x;
-  extern __shared__ real sh[];      // ds [H][S]
-  real* ds = sh;
+  // ds [H][S] a column, in global memory: in shared it was H S reals, past a launch's 48 KB at AF2's 5,120 extra rows
+  // (float32) and at 1,000 (float64) - the launch then failed and the gradient was whatever the buffers held
+  real* ds = dsAll + (size_t)b * H * S;
   for (int t = threadIdx.x; t < H * S; t += blockDim.x) {
     int h = t / S, s = t % S;
     real dp = 0;
@@ -187,7 +188,9 @@ inline void gaBackward(GlobalAttention& a, const GaSave& s, const real* mask, co
   real *dwa = ARENA.get((size_t)B * HD), *dgp = ARENA.get(rows * HD);
   gaMixBwdK<<<B, 128, 0, STREAM>>>(dy, s.wa, s.g, dwa, dgp, B, S, HD);
   real *dq = ARENA.get((size_t)B * HD), *dk = ARENA.get(rows * a.D), *dv = ARENA.get(rows * a.D);
-  gaBwdK<<<B, 256, (size_t)a.H * S * sizeof(real), STREAM>>>(mask, s.q, s.k, s.v, s.w, dwa, dq, dk, dv, B, S, a.H, a.D);
+  real* dsAll = ARENA.get((size_t)B * a.H * S);
+  gaBwdK<<<B, 256, 0, STREAM>>>(mask, s.q, s.k, s.v, s.w, dwa, dq, dk, dv, B, S, a.H, a.D, dsAll);
+  GK(cudaGetLastError());
   // q = qa Wq * scale: dWq += qa^T dq scale, dqa = dq Wq^T scale
   real* qa = ARENA.get((size_t)B * a.C);
   gaMeanK<<<blocks((size_t)B * a.C), 256, 0, STREAM>>>(s.x, mask, qa, B, S, a.C);
@@ -537,10 +540,9 @@ struct Stack {
     GK(cudaMemcpyAsync(msaIn[0], msa, (size_t)S * L * blocks[0].Cm * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
     GK(cudaMemcpyAsync(pairIn[0], pair, (size_t)L * L * 128 * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
     for (size_t i = 0; i < blocks.size(); ++i) {
-      ARENA.reset();
+      Scratch sc;          // (a scope, not a reset: a caller's saves in the arena outlive the stack)
       blockForward(blocks[i], msaIn[i], pairIn[i], msaMask, pairMask, msaIn[i + 1], pairIn[i + 1], S, L);
     }
-    ARENA.reset();
   }
   // gradients of the stack's output -> of its input (dmsa, dpair: in place)
   void backward(const real* msaMask, const real* pairMask, real* dmsa, real* dpair) {
@@ -548,11 +550,10 @@ struct Stack {
     GK(cudaMallocAsync(&om, (size_t)S * L * blocks[0].Cm * sizeof(real), STREAM));
     GK(cudaMallocAsync(&op, (size_t)L * L * 128 * sizeof(real), STREAM));
     for (size_t i = blocks.size(); i-- > 0;) {
-      ARENA.reset();
+      Scratch sc;
       BlockSave s = blockForward(blocks[i], msaIn[i], pairIn[i], msaMask, pairMask, om, op, S, L);
       blockBackward(blocks[i], s, msaMask, pairMask, dmsa, dpair, dmsa, dpair);
     }
-    ARENA.reset();
     GK(cudaFreeAsync(om, STREAM)); GK(cudaFreeAsync(op, STREAM));
   }
 };
