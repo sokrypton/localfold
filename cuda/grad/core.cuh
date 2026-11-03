@@ -204,6 +204,28 @@ struct Linear {
   }
 };
 
+// ---------------------------------------------------------------- a device dot product, in double
+__global__ void dotK(const real* a, const real* b, size_t n, double* out) {
+  double s = 0;
+  for (size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x; t < n; t += (size_t)gridDim.x * blockDim.x)
+    s += (double)a[t] * b[t];
+  for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
+  if ((threadIdx.x & 31) == 0) atomicAdd(out, s);
+}
+inline double dot(const real* a, const real* b, size_t n) {
+  static double* acc = nullptr;
+  if (!acc) GK(cudaMalloc(&acc, 8));
+  GK(cudaMemsetAsync(acc, 0, 8, STREAM));
+  dotK<<<(unsigned)std::min<size_t>(blocks(n), 1024), 256, 0, STREAM>>>(a, b, n, acc);
+  double h; GK(cudaMemcpyAsync(&h, acc, 8, cudaMemcpyDeviceToHost, STREAM));
+  GK(cudaStreamSynchronize(STREAM));
+  return h;
+}
+__global__ void axpyR(real* y, const real* x, real a, size_t n) {     // y += a x
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t < n) y[t] += a * x[t];
+}
+
 // ---------------------------------------------------------------- comparisons for the gates
 template <class A, class B> inline double relRms(const std::vector<A>& a, const std::vector<B>& b) {
   double num = 0, den = 0;

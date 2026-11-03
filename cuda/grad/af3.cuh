@@ -251,60 +251,60 @@ struct PairformerSave {
 inline void forEachParam(Pairformer& b, const std::string& pre, int Cz, int Cs, int Hp, int Dp, int Hs, int Ds,
                          int pairFactor, int singleFactor, bool gridBiases, bool hasSingle,
                          const std::function<void(const std::string&, Param&, size_t)>& f, bool hasGrid = true,
-                         bool parallel = false) {
+                         bool parallel = false, const std::string& sep = ".") {
   auto ln = [&](const std::string& n, LayerNorm& l, int C) { l.C = C; f(n + "Scale", l.g, C); f(n + "Offset", l.b, C); };
   auto lin = [&](const std::string& n, Linear& l, int K, int N, bool trans = false, bool bias = false) {
     l.K = K; l.N = N; l.trans = trans; l.hasBias = bias; f(n, l.w, (size_t)K * N);
   };
   b.hasSingle = hasSingle; b.hasGrid = hasGrid; b.parallel = parallel;
   for (auto* t : {&b.triOut, &b.triIn}) {
-    std::string n = pre + (t == &b.triOut ? ".triangleMultiplicationOutgoing" : ".triangleMultiplicationIncoming");
+    std::string n = pre + (t == &b.triOut ? sep + "triangleMultiplicationOutgoing" : sep + "triangleMultiplicationIncoming");
     t->C = Cz; t->I = Cz; t->outgoing = t == &b.triOut; t->interleaved = true;
-    ln(n + ".leftNormInput", t->lnIn, Cz);
-    ln(n + ".centerNorm", t->lnCenter, Cz);
-    lin(n + ".projection", t->proj, Cz, 2 * Cz);
-    lin(n + ".gate", t->gate, Cz, 2 * Cz);
-    lin(n + ".outputProjection", t->out, Cz, Cz);
-    lin(n + ".gatingLinear", t->gating, Cz, Cz);
+    ln(n + sep + "leftNormInput", t->lnIn, Cz);
+    ln(n + sep + "centerNorm", t->lnCenter, Cz);
+    lin(n + sep + "projection", t->proj, Cz, 2 * Cz);
+    lin(n + sep + "gate", t->gate, Cz, 2 * Cz);
+    lin(n + sep + "outputProjection", t->out, Cz, Cz);
+    lin(n + sep + "gatingLinear", t->gating, Cz, Cz);
   }
   for (auto* g : {&b.grid1, &b.grid2}) {
     if (!hasGrid) break;
-    std::string n = pre + (g == &b.grid1 ? ".pairAttention1" : ".pairAttention2");
+    std::string n = pre + (g == &b.grid1 ? sep + "pairAttention1" : sep + "pairAttention2");
     g->C = Cz; g->H = Hp; g->D = Dp; g->transpose = g == &b.grid2; g->untransposedResidual = parallel && g == &b.grid2;
     const int HD = Hp * Dp;
-    ln(n + ".actNorm", g->ln, Cz);
-    lin(n + ".pairBiasProjection", g->bias, Cz, Hp);
-    lin(n + ".qProjection", g->q, Cz, HD, true);
-    lin(n + ".kProjection", g->k, Cz, HD, true);
-    lin(n + ".vProjection", g->v, Cz, HD);
-    lin(n + ".gatingQuery", g->gate, Cz, HD, true);
-    lin(n + ".outputProjection", g->out, HD, Cz);
+    ln(n + sep + "actNorm", g->ln, Cz);
+    lin(n + sep + "pairBiasProjection", g->bias, Cz, Hp);
+    lin(n + sep + "qProjection", g->q, Cz, HD, true);
+    lin(n + sep + "kProjection", g->k, Cz, HD, true);
+    lin(n + sep + "vProjection", g->v, Cz, HD);
+    lin(n + sep + "gatingQuery", g->gate, Cz, HD, true);
+    lin(n + sep + "outputProjection", g->out, HD, Cz);
     if (gridBiases) {
-      g->gate.hasBias = true; f(n + ".gatingQueryBias", g->gate.b, HD);
-      g->out.hasBias = true; f(n + ".outputProjectionBias", g->out.b, Cz);
+      g->gate.hasBias = true; f(n + sep + "gatingQueryBias", g->gate.b, HD);
+      g->out.hasBias = true; f(n + sep + "outputProjectionBias", g->out.b, Cz);
     }
   }
   b.pairTrans.C = Cz; b.pairTrans.F = Cz * pairFactor;
-  ln(pre + ".pairTransition.inputLayerNorm", b.pairTrans.ln, Cz);
-  lin(pre + ".pairTransition.transition1", b.pairTrans.t1, Cz, 2 * Cz * pairFactor);
-  lin(pre + ".pairTransition.transition2", b.pairTrans.t2, Cz * pairFactor, Cz);
+  ln(pre + sep + "pairTransition" + sep + "inputLayerNorm", b.pairTrans.ln, Cz);
+  lin(pre + sep + "pairTransition" + sep + "transition1", b.pairTrans.t1, Cz, 2 * Cz * pairFactor);
+  lin(pre + sep + "pairTransition" + sep + "transition2", b.pairTrans.t2, Cz * pairFactor, Cz);
   if (!hasSingle) return;
   SingleAttn& a = b.single;
   a.C = Cs; a.Cz = Cz; a.H = Hs; a.D = Ds; a.gateConst = parallel ? 1 : 0;
   const int HD = Hs * Ds;
-  ln(pre + ".singleAttention.layerNorm", a.ln, Cs);
-  lin(pre + ".singleAttention.qProjection", a.q, Cs, HD);
-  a.q.hasBias = true; f(pre + ".singleAttention.qBias", a.q.b, HD);
-  lin(pre + ".singleAttention.kProjection", a.k, Cs, HD);
-  lin(pre + ".singleAttention.vProjection", a.v, Cs, HD);
-  lin(pre + ".singleAttention.gatingQuery", a.gate, Cs, HD);
-  lin(pre + ".singleAttention.outputProjection", a.out, HD, Cs);
-  ln(pre + ".singlePairLogitsNorm", a.pairLn, Cz);
-  lin(pre + ".singlePairLogitsProjection", a.pairProj, Cz, Hs);
+  ln(pre + sep + "singleAttention" + sep + "layerNorm", a.ln, Cs);
+  lin(pre + sep + "singleAttention" + sep + "qProjection", a.q, Cs, HD);
+  a.q.hasBias = true; f(pre + sep + "singleAttention" + sep + "qBias", a.q.b, HD);
+  lin(pre + sep + "singleAttention" + sep + "kProjection", a.k, Cs, HD);
+  lin(pre + sep + "singleAttention" + sep + "vProjection", a.v, Cs, HD);
+  lin(pre + sep + "singleAttention" + sep + "gatingQuery", a.gate, Cs, HD);
+  lin(pre + sep + "singleAttention" + sep + "outputProjection", a.out, HD, Cs);
+  ln(pre + sep + "singlePairLogitsNorm", a.pairLn, Cz);
+  lin(pre + sep + "singlePairLogitsProjection", a.pairProj, Cz, Hs);
   b.singleTrans.C = Cs; b.singleTrans.F = Cs * singleFactor;
-  ln(pre + ".singleTransition.inputLayerNorm", b.singleTrans.ln, Cs);
-  lin(pre + ".singleTransition.transition1", b.singleTrans.t1, Cs, 2 * Cs * singleFactor);
-  lin(pre + ".singleTransition.transition2", b.singleTrans.t2, Cs * singleFactor, Cs);
+  ln(pre + sep + "singleTransition" + sep + "inputLayerNorm", b.singleTrans.ln, Cs);
+  lin(pre + sep + "singleTransition" + sep + "transition1", b.singleTrans.t1, Cs, 2 * Cs * singleFactor);
+  lin(pre + sep + "singleTransition" + sep + "transition2", b.singleTrans.t2, Cs * singleFactor, Cs);
 }
 
 inline real* cloneR(const real* x, size_t n) {
@@ -413,8 +413,13 @@ struct Pwa {
   Linear logits, v, gate, out;     // logits [Cz, H]; v, gate [Cm, HD]; out [HD, Cm]
   int Cm = 0, Cz = 0, H = 0, D = 0;
   bool chaiMask = false;
+  bool noKeyMask = false;          // ESMFold2's MSA encoder and MSA Pairformer: no mask on the weights at all
 };
 struct PwaSave { LnSave ln, lp; real *xn, *pn, *w, *vh, *oh, *g, *km; int S, n; };
+__global__ void fillK(real* x, real v, size_t n) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t < n) x[t] = v;
+}
 // keyMask[j] = max_s msaMask[s, j]
 __global__ void coverageK(const real* m, real* km, int S, int n) {
   int j = blockIdx.x * blockDim.x + threadIdx.x;
@@ -469,7 +474,8 @@ inline PwaSave pwaForward(const Pwa& a, const real* msa, const real* msaMask, co
   s.pn = ARENA.get(nn * a.Cz);
   s.lp = lnForward(a.pn, pair, s.pn, nn);
   s.km = ARENA.get(n);
-  if (a.chaiMask) GK(cudaMemcpyAsync(s.km, seqMask, n * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
+  if (a.noKeyMask) fillK<<<blocks(n), 256, 0, STREAM>>>(s.km, 1, n);
+  else if (a.chaiMask) GK(cudaMemcpyAsync(s.km, seqMask, n * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
   else coverageK<<<blocks(n), 256, 0, STREAM>>>(msaMask, s.km, S, n);
   s.w = ARENA.get((size_t)a.H * nn);
   {
