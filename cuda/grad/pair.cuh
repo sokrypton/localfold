@@ -22,6 +22,7 @@ struct TriMulSave {
   LnSave lnIn, lnC;
   real *xn, *proj, *gate, *ab, *center, *cn, *og;   // og: sigmoid of the output gate
   int L;
+  bool bf = false;   // BF16: xn, proj, gate, ab, cn, og held in bf16 (the pointers' bytes are bf16), center in float
 };
 // [L, L, C2] -> channel-major [C2][L][L]; interleaved, column 2p goes to plane p and 2p + 1 to plane C2/2 + p
 __device__ inline int planeOf(int c, int C2, bool inter) { return inter ? (c & 1) * (C2 / 2) + (c >> 1) : c; }
@@ -85,7 +86,141 @@ __global__ void mergeGateBwdT(const real* __restrict__ dab, const real* __restri
   }
 }
 
+#ifndef GRAD_F64
+// channelsT on bf16: mode 0 / 2 a [rows][C2] tile (float or bf16; 2: the product of two bf16 ones) to bf16
+// channel-major, mode 1 bf16 channel-major back to float [rows][C2]
+template <class X>
+__global__ void channelsTBf(const X* __restrict__ x, const bf* __restrict__ y, void* __restrict__ out, size_t rows,
+                            int C2, bool inter, int mode) {
+  __shared__ float tile[32][33];
+  const size_t r0 = (size_t)blockIdx.x * 32;
+  const int c0 = blockIdx.y * 32, tx = threadIdx.x, ty = threadIdx.y;
+  if (mode != 1) {
+    for (int k = ty; k < 32; k += 8) {
+      size_t r = r0 + k; int c = c0 + tx;
+      if (r < rows && c < C2) tile[k][tx] = mode == 2 ? bfv(x[r * C2 + c]) * bfv(y[r * C2 + c]) : bfv(x[r * C2 + c]);
+    }
+    __syncthreads();
+    for (int k = ty; k < 32; k += 8) {
+      int c = c0 + k; size_t r = r0 + tx;
+      if (r < rows && c < C2) bfs(static_cast<bf*>(out) + (size_t)planeOf(c, C2, inter) * rows + r, tile[tx][k]);
+    }
+  } else {
+    for (int k = ty; k < 32; k += 8) {
+      int c = c0 + k; size_t r = r0 + tx;
+      if (r < rows && c < C2) tile[tx][k] = bfv(x[(size_t)planeOf(c, C2, inter) * rows + r]);
+    }
+    __syncthreads();
+    for (int k = ty; k < 32; k += 8) {
+      size_t r = r0 + k; int c = c0 + tx;
+      if (r < rows && c < C2) static_cast<float*>(out)[r * C2 + c] = tile[k][tx];
+    }
+  }
+}
+__global__ void mergeGateBwdTBf(const bf* __restrict__ dab, const bf* __restrict__ proj, const bf* __restrict__ gate,
+                                const real* __restrict__ mask, bf* __restrict__ dproj, bf* __restrict__ dgp,
+                                size_t rows, int C2, bool inter) {
+  __shared__ float tile[32][33];
+  const size_t r0 = (size_t)blockIdx.x * 32;
+  const int c0 = blockIdx.y * 32, tx = threadIdx.x, ty = threadIdx.y;
+  for (int k = ty; k < 32; k += 8) {
+    int c = c0 + k; size_t r = r0 + tx;
+    if (r < rows && c < C2) tile[tx][k] = bfv(dab[(size_t)planeOf(c, C2, inter) * rows + r]);
+  }
+  __syncthreads();
+  for (int k = ty; k < 32; k += 8) {
+    size_t r = r0 + k; int c = c0 + tx;
+    if (r >= rows || c >= C2) continue;
+    size_t i = r * C2 + c;
+    const float d = tile[k][tx], sg = bfv(gate[i]);
+    bfs(dproj + i, mask ? d * sg * mask[r] : d * sg);
+    bfs(dgp + i, d * bfv(proj[i]) * sg * (1.f - sg));
+  }
+}
+inline TriMulSave triMulForwardBf(const TriMul& m, const real* pair, const real* mask, real* out, int L) {
+  const size_t rows = (size_t)L * L;
+  const int I2 = 2 * m.I;
+  TriMulSave s;
+  s.L = L; s.bf = true;
+  bf* xn = bfGet(rows * m.C);
+  s.lnIn = lnForward(m.lnIn, pair, xn, rows);
+  bf *proj = bfGet(rows * I2), *gate = bfGet(rows * I2);
+  linearFwdBf(m.proj, xn, proj, rows);
+  if (m.masked) rowMaskBfK<<<blocks(rows * I2), 256, 0, STREAM>>>(proj, mask, rows, I2);
+  linearFwdBf(m.gate, xn, gate, rows);
+  sigmoidBfK<<<blocks(rows * I2), 256, 0, STREAM>>>(gate, rows * I2);
+  bf* ab = bfGet(rows * I2);                                      // channel-major a then b
+  s.center = ARENA.get(rows * m.I);
+  bf *cn = bfGet(rows * m.I), *og = bfGet(rows * m.C);
+  {
+    Scratch scratch;
+    dim3 b(32, 8), g((unsigned)((rows + 31) / 32), (I2 + 31) / 32);
+    channelsTBf<<<g, b, 0, STREAM>>>(proj, gate, ab, rows, I2, m.interleaved, 2);
+    const bf *A = ab, *B = ab + (size_t)m.I * rows;
+    if (m.swapAB) std::swap(A, B);
+    bf* ccm = bfGet(rows * m.I);
+    const long long st = (long long)L * L;
+    const float alpha = m.divideByLength ? 1.f / L : 1.f;
+    if (m.outgoing) bmmBf(false, true, L, L, L, A, st, B, st, ccm, st, m.I, alpha);
+    else bmmBf(true, false, L, L, L, B, st, A, st, ccm, st, m.I, alpha);
+    dim3 g2((unsigned)((rows + 31) / 32), (m.I + 31) / 32);
+    channelsTBf<<<g2, b, 0, STREAM>>>(ccm, nullptr, s.center, rows, m.I, false, 1);
+  }
+  s.lnC = lnForward(m.lnCenter, s.center, cn, rows);
+  linearFwdBf(m.out, cn, out, rows);
+  linearFwdBf(m.gating, xn, og, rows);
+  sigmoidBfK<<<blocks(rows * m.C), 256, 0, STREAM>>>(og, rows * m.C);
+  mulBfK<<<blocks(rows * m.C), 256, 0, STREAM>>>(out, og, rows * m.C);
+  s.xn = reinterpret_cast<real*>(xn); s.proj = reinterpret_cast<real*>(proj); s.gate = reinterpret_cast<real*>(gate);
+  s.ab = reinterpret_cast<real*>(ab); s.cn = reinterpret_cast<real*>(cn); s.og = reinterpret_cast<real*>(og);
+  return s;
+}
+inline void triMulBackwardBf(TriMul& m, const TriMulSave& s, const real* mask, const real* dout, real* dpair) {
+  Scratch scratch;
+  const int L = s.L, I2 = 2 * m.I;
+  const size_t rows = (size_t)L * L;
+  const bf *xn = reinterpret_cast<const bf*>(s.xn), *proj = reinterpret_cast<const bf*>(s.proj),
+           *gate = reinterpret_cast<const bf*>(s.gate), *ab = reinterpret_cast<const bf*>(s.ab),
+           *cn = reinterpret_cast<const bf*>(s.cn), *og = reinterpret_cast<const bf*>(s.og);
+  real* pre = ARENA.get(rows * m.C);
+  linearFwdBf(m.out, cn, pre, rows);
+  bf *dpre = bfGet(rows * m.C), *dgl = bfGet(rows * m.C);
+  gateBwdBfK<<<blocks(rows * m.C), 256, 0, STREAM>>>(dout, pre, og, dpre, dgl, rows * m.C);
+  real* dxn = ARENA.get(rows * m.C);
+  linearBwdBf(m.gating, xn, dgl, dxn, rows);
+  real* dcn = ARENA.get(rows * m.I);
+  linearBwdBf(m.out, cn, dpre, dcn, rows);
+  real* dcenter = ARENA.get(rows * m.I);
+  lnBackward(m.lnCenter, s.lnC, dcn, dcenter, rows, false);
+  bf* dccm = bfGet(rows * m.I);
+  dim3 b(32, 8), g1((unsigned)((rows + 31) / 32), (m.I + 31) / 32);
+  channelsTBf<<<g1, b, 0, STREAM>>>(dcenter, nullptr, dccm, rows, m.I, false, 0);
+  bf* dab = bfGet(rows * I2);
+  const bf *A = ab, *B = ab + (size_t)m.I * rows;
+  bf *dA = dab, *dB = dab + (size_t)m.I * rows;
+  if (m.swapAB) { std::swap(A, B); std::swap(dA, dB); }
+  const long long st = (long long)L * L;
+  const float alpha = m.divideByLength ? 1.f / L : 1.f;
+  if (m.outgoing) {
+    bmmBf(false, false, L, L, L, dccm, st, B, st, dA, st, m.I, alpha);
+    bmmBf(true, false, L, L, L, dccm, st, A, st, dB, st, m.I, alpha);
+  } else {
+    bmmBf(false, false, L, L, L, B, st, dccm, st, dA, st, m.I, alpha);
+    bmmBf(false, true, L, L, L, A, st, dccm, st, dB, st, m.I, alpha);
+  }
+  bf *dproj = bfGet(rows * I2), *dgp = bfGet(rows * I2);
+  dim3 g2((unsigned)((rows + 31) / 32), (I2 + 31) / 32);
+  mergeGateBwdTBf<<<g2, b, 0, STREAM>>>(dab, proj, gate, m.masked ? mask : nullptr, dproj, dgp, rows, I2, m.interleaved);
+  linearBwdBf(m.proj, xn, dproj, dxn, rows, true);
+  linearBwdBf(m.gate, xn, dgp, dxn, rows, true);
+  lnBackward(m.lnIn, s.lnIn, dxn, dpair, rows, true);
+}
+#endif
+
 inline TriMulSave triMulForward(const TriMul& m, const real* pair, const real* mask, real* out, int L) {
+#ifndef GRAD_F64
+  if (BF16) return triMulForwardBf(m, pair, mask, out, L);
+#endif
   size_t rows = (size_t)L * L;
   const int I2 = 2 * m.I;
   TriMulSave s;
@@ -123,6 +258,9 @@ inline TriMulSave triMulForward(const TriMul& m, const real* pair, const real* m
 }
 
 inline void triMulBackward(TriMul& m, const TriMulSave& s, const real* mask, const real* dout, real* dpair) {
+#ifndef GRAD_F64
+  if (s.bf) { triMulBackwardBf(m, s, mask, dout, dpair); return; }
+#endif
   Scratch scratch;
   const int L = s.L, I2 = 2 * m.I;
   size_t rows = (size_t)L * L;

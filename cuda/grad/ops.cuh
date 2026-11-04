@@ -521,6 +521,69 @@ __global__ void swigluBwdBfK(const bf* __restrict__ h, const bf* __restrict__ dg
   dh[r * 2 * F + F + f] = __float2bfloat16(d * a * sg);
 }
 #endif
+#ifndef GRAD_F64
+// ---- bf16-storage elementwise kernels (computed in float)
+__device__ __forceinline__ float bfv(bf x) { return __bfloat162float(x); }
+__device__ __forceinline__ float bfv(float x) { return x; }
+__device__ __forceinline__ void bfs(bf* p, float v) { *p = __float2bfloat16(v); }
+__device__ __forceinline__ void bfs(float* p, float v) { *p = v; }
+template <class Y> __global__ void biasAddK(Y* y, const float* b, size_t rows, int C) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t < rows * C) bfs(y + t, bfv(y[t]) + b[t % C]);
+}
+__global__ void sigmoidBfK(bf* x, size_t n) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t < n) bfs(x + t, 1.f / (1.f + __expf(-bfv(x[t]))));
+}
+__global__ void rowMaskBfK(bf* x, const float* mask, size_t rows, int C) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t < rows * C) bfs(x + t, bfv(x[t]) * mask[t / C]);
+}
+__global__ void mulBfK(float* y, const bf* g, size_t n) {   // y *= g
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t < n) y[t] *= bfv(g[t]);
+}
+// gateBwdK with the sigmoid saved in bf16 and the two gradients written in bf16
+__global__ void gateBwdBfK(const float* dy, const float* a, const bf* sig, bf* da, bf* dpre, size_t n) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= n) return;
+  const float s = bfv(sig[t]);
+  bfs(da + t, dy[t] * s);
+  bfs(dpre + t, dy[t] * a[t] * s * (1.f - s));
+}
+// g[c] += sum over rows of d[r, c], d bf16: two columns a thread, 8 row lanes, one atomic a column a block
+__global__ void colSumBfK(float* g, const __nv_bfloat162* d, size_t rows, int C2) {
+  __shared__ float2 part[8][32];
+  const int c = blockIdx.x * 32 + threadIdx.x;
+  float2 s = make_float2(0.f, 0.f);
+  if (c < C2)
+    for (size_t r = blockIdx.y * blockDim.y + threadIdx.y; r < rows; r += (size_t)gridDim.y * blockDim.y) {
+      const float2 v = __bfloat1622float2(d[r * C2 + c]);
+      s.x += v.x; s.y += v.y;
+    }
+  part[threadIdx.y][threadIdx.x] = s;
+  __syncthreads();
+  if (threadIdx.y || c >= C2) return;
+  for (int y = 1; y < 8; ++y) { s.x += part[y][threadIdx.x].x; s.y += part[y][threadIdx.x].y; }
+  atomicAdd(&g[2 * c], s.x); atomicAdd(&g[2 * c + 1], s.y);
+}
+inline void colSumBf(float* g, const bf* d, size_t rows, int C) {   // (C even)
+  const int C2 = C / 2;
+  const unsigned xb = (C2 + 31) / 32;
+  dim3 b(32, 8), gr(xb, (unsigned)std::min<size_t>((rows + 7) / 8, std::max(1u, 432 / xb)));
+  colSumBfK<<<gr, b, 0, STREAM>>>(g, reinterpret_cast<const __nv_bfloat162*>(d), rows, C2);
+}
+// batched C_b = op(A_b) op(B_b) on bf16 operands (bmm's row-major convention), C float or bf16
+template <class Y>
+inline void bmmBf(bool ta, bool tb, int M, int N, int K, const bf* A, long long sa, const bf* B, long long sb, Y* C,
+                  long long sc, int count, float alpha = 1.f) {
+  const int lda = ta ? M : K, ldb = tb ? K : N;
+  const float zero = 0.f;
+  GB(cublasGemmStridedBatchedEx(BLAS, tb ? CUBLAS_OP_T : CUBLAS_OP_N, ta ? CUBLAS_OP_T : CUBLAS_OP_N, N, M, K, &alpha,
+                                B, CUDA_R_16BF, ldb, sb, A, CUDA_R_16BF, lda, sa, &zero, C, dtype<Y>(), N, sc, count,
+                                CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+}
+#endif
 // the exact (erf) GELU
 __global__ void geluK(real* y, const real* x, size_t n) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;

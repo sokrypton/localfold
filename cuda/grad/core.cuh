@@ -307,22 +307,44 @@ template <class Y> inline void mmBf(const bf* x, const bf* w, Y* y, int M, int K
 template <class Y> inline void mmBTBf(const bf* dy, const bf* w, Y* dx, int M, int K, int N, float beta = 0) {
   gemmEx(CUBLAS_OP_T, CUBLAS_OP_N, K, M, N, w, CUDA_R_16BF, N, dy, CUDA_R_16BF, N, beta, dx, dtype<Y>(), K);
 }
+// (a weight gradient's tall reduction into a few output tiles is cut into row chunks, partials summed in a fixed
+// order, as mmAT does: 147,456 pair rows into 128 x 256 is two CTAs of a 108-SM device otherwise - 0.8 ms a call)
 inline void mmATBf(const bf* x, const bf* dy, float* dw, int M, int K, int N, float beta = 1) {
-  gemmEx(CUBLAS_OP_N, CUBLAS_OP_T, N, K, M, dy, CUDA_R_16BF, N, x, CUDA_R_16BF, K, beta, dw, CUDA_R_32F, N);
-}
-// Linear on bf16 operands (no bias: the modules that take this path have none)
-template <class Y> inline void linearFwdBf(const Linear& l, const bf* x, Y* y, size_t rows, float beta = 0) {
-  if (l.hasBias) { fprintf(stderr, "linearFwdBf: a bias\n"); exit(1); }
+  const size_t n = (size_t)K * N;
+  const int splits = n <= 512 * 512 ? std::min(64, M / 4096) : 1;
+  if (splits <= 1) {
+    gemmEx(CUBLAS_OP_N, CUBLAS_OP_T, N, K, M, dy, CUDA_R_16BF, N, x, CUDA_R_16BF, K, beta, dw, CUDA_R_32F, N);
+    return;
+  }
   Scratch scratch;
-  const bf* w = toBf(l.w.w, (size_t)l.K * l.N);
-  if (l.trans) mmBTBf(x, w, y, (int)rows, l.N, l.K, beta);
-  else mmBf(x, w, y, (int)rows, l.K, l.N, beta);
+  const int c = M / splits, rest = M - c * splits;
+  float* p = ARENA.get(n * splits);
+  const float one = 1.f, zero = 0.f;
+  GB(cublasGemmStridedBatchedEx(BLAS, CUBLAS_OP_N, CUBLAS_OP_T, N, K, c, &one, dy, CUDA_R_16BF, N, (long long)c * N, x,
+                                CUDA_R_16BF, K, (long long)c * K, &zero, p, CUDA_R_32F, N, (long long)n, splits,
+                                CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+  if (rest)
+    gemmEx(CUBLAS_OP_N, CUBLAS_OP_T, N, K, rest, dy + (size_t)c * splits * N, CUDA_R_16BF, N, x + (size_t)c * splits * K,
+           CUDA_R_16BF, K, 1.f, p, CUDA_R_32F, N);
+  sumPartialsK<<<blocks(n), 256, 0, STREAM>>>(dw, p, splits, n, 1.f, beta);
+}
+// Linear on bf16 operands; a bias is added in float (biasAddK, colSumBf: ops.cuh)
+template <class Y> __global__ void biasAddK(Y* y, const float* b, size_t rows, int C);
+inline void colSumBf(float* g, const bf* d, size_t rows, int C);
+template <class Y> inline void linearFwdBf(const Linear& l, const bf* x, Y* y, size_t rows, float beta = 0) {
+  {
+    Scratch scratch;
+    const bf* w = toBf(l.w.w, (size_t)l.K * l.N);
+    if (l.trans) mmBTBf(x, w, y, (int)rows, l.N, l.K, beta);
+    else mmBf(x, w, y, (int)rows, l.K, l.N, beta);
+  }
+  if (l.hasBias) biasAddK<<<blocks(rows * l.N), 256, 0, STREAM>>>(y, l.b.w, rows, l.N);
 }
 template <class DX>
 inline void linearBwdBf(Linear& l, const bf* x, const bf* dy, DX* dx, size_t rows, bool accumulate = false) {
-  if (l.hasBias) { fprintf(stderr, "linearBwdBf: a bias\n"); exit(1); }
   if (l.trans) mmATBf(dy, x, l.w.g, (int)rows, l.N, l.K);
   else mmATBf(x, dy, l.w.g, (int)rows, l.K, l.N);
+  if (l.hasBias) colSumBf(l.b.g, dy, rows, l.N);
   if (!dx) return;
   Scratch scratch;
   const bf* w = toBf(l.w.w, (size_t)l.K * l.N);
