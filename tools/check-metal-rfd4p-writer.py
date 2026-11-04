@@ -14,12 +14,17 @@ CA-CA spacing throughout. This is cuda/rfd4p/gate.py's `writer` and `metrics` ar
 `--dump-sample=` writes what `processSampleToAtoms` takes; check-writer.mjs runs the page's writer on it and
 requires the SAME TEXT, and design-metrics.mjs its metrics, value for value, with the pre-oracle verdict.
 
-🔴 AND THE CENTRING OFFSET IS REPORTED, NOT FAILED. `shared/rfd4p/output.js` adds `inputAtoms.center_shift` back
-after aligning - the centroid the featuriser subtracted when it featurised the conditioning - and no native port
-can: the featuriser exports `g/coords` and `g/condCoord` already centred (centroids 1e-7) and the offset with
-them. So each case is compared BOTH ways, and what is asserted is that removing the shift makes the two files
-identical - which says the writer agrees about everything that is this port's to get right, and names the one
-thing that is not. A case whose shift is zero is held to the page's text outright.
+🔴 AND THE CENTRING OFFSET IS ASSERTED NOW, NOT REPORTED. `shared/rfd4p/output.js` adds
+`inputAtoms.center_shift` back after aligning - the centroid the featuriser subtracted when it featurised the
+conditioning - and for a while no native port could, because the featuriser computed it and wrote it nowhere.
+It exports it (`meta/centerShift*`), metal/rfd4p adds it back, and every case is held to the page's text
+outright. The unshifted comparison is kept as a DIAGNOSIS of failure rather than a second way to pass: if a
+file differs and removing the shift makes it identical, the offset is not reaching the writer, and the tool
+says so instead of reporting a near-miss as expected.
+
+🔴 AND A LAST-PLACE DOUBLE IS NAMED FOR WHAT IT IS. Two motif RMSDs differ at 1.3e-16 and 2.3e-16 relative -
+one bit of a double, C++ against V8 inside a superposition - and a gate that calls that "the centring offset"
+is a gate that will hide the offset coming back. They are reported separately, with the relative size.
 """
 import json
 import subprocess
@@ -63,7 +68,7 @@ def main():
         print(f"no {BINARY.relative_to(REPO)} - build it with `bash metal/build.sh rfd4p`")
         return 2
 
-    writer_bad, metrics_bad, shifted = [], [], []
+    writer_bad, metrics_bad, lastplace = [], [], []
     for pid in presets:
         r = run(["node", REPO / "cuda/rfd4p/featurise/preset-spec.mjs", pid])
         if r.returncode != 0:
@@ -86,13 +91,13 @@ def main():
             w = run(["node", REPO / "cuda/rfd4p/check-writer.mjs", f"--spec={job}", "--seed=0", dump, out])
             if w.returncode == 0:
                 continue
-            # The one allowed difference: the centring offset no native port is given. Removing it must make
-            # the two files identical - anything left over is this port's.
-            s = run(["node", REPO / "tools/rfd4p-writer-unshifted.mjs", f"--spec={job}", "--seed=0", dump, out])
-            if s.returncode == 0:
-                shifted.append(f"{pid}.{ext}")
-            else:
-                writer_bad.append(f"{pid}.{ext}: {s.stdout.strip().splitlines()[0] if s.stdout else w.stdout.strip().splitlines()[0]}")
+            # It differs. Say WHY: if removing the centring offset from the page's side makes the two identical,
+            # the offset is not reaching this writer - `meta/centerShift*` absent from the export, or the
+            # add-back not running - which is a different repair from a wrong record or a wrong column.
+            d = run(["node", REPO / "tools/rfd4p-writer-unshifted.mjs", f"--spec={job}", "--seed=0", dump, out])
+            why = (" - and identical with the centring offset removed, so the offset is not being added back:"
+                   " check meta/centerShift* in the export" if d.returncode == 0 else "")
+            writer_bad.append(f"{pid}.{ext}: {w.stdout.strip().splitlines()[0] if w.stdout else 'failed'}{why}")
         # the metrics, native against the page's on the same sample: every value and the verdict
         native = Path(f"{dump}.metrics.json")
         if not native.exists():
@@ -107,10 +112,11 @@ def main():
             x, y = a["metrics"].get(k), b["metrics"].get(k)
             if x == y:
                 continue
-            # 🔴 A SUPERPOSED RMSD INHERITS THE CENTRING OFFSET, so it is reported at its size rather than
-            # asserted equal: the motif reference is in the input's frame and the design is a shift away.
-            if isinstance(x, float) and isinstance(y, float) and abs(x - y) <= 1e-6 * max(1.0, abs(y)):
-                shifted.append(f"{pid}:{k}")
+            # 🔴 A LAST-PLACE DOUBLE IS NOT A DIFFERENCE IN THE PORT. A superposed RMSD goes through an eigen
+            # solve, and C++ and V8 disagree in the final bit; reported with its size rather than asserted
+            # equal, and the bound is tight enough (1e-12) that anything structural still fails.
+            if isinstance(x, float) and isinstance(y, float) and abs(x - y) <= 1e-12 * max(1e-30, abs(y)):
+                lastplace.append(f"{pid}:{k} ({abs(x - y) / max(1e-30, abs(y)):.1e})")
                 continue
             metrics_bad.append(f"{pid}: {k} metal {x} page {y}")
         if a["preOracle"] != b["preOracle"]:
@@ -121,9 +127,9 @@ def main():
           f"{'ok ' if not writer_bad else 'DIFFERS: ' + '; '.join(writer_bad[:4])}")
     print(f"metrics  {n} designs against the page's metrics  "
           f"{'ok ' if not metrics_bad else 'DIFFERS: ' + '; '.join(metrics_bad[:4])}")
-    if shifted:
-        print(f"         {len(shifted)} identical only once the unexported centring offset is removed: "
-              f"{', '.join(shifted[:8])}")
+    if lastplace:
+        print(f"         {len(lastplace)} agreeing to the last place of a double rather than exactly: "
+              f"{', '.join(lastplace[:6])}")
     return 1 if writer_bad or metrics_bad else 0
 
 

@@ -160,15 +160,11 @@ Design buildDesign(rfd4p::GenOut& g, const OutInput& in) {
   // nothing - which is what this port did, so a motif design could not be scored against the target it was
   // built against.
   //
-  // 🔴 AND IT STILL LANDS A CENTRING OFFSET AWAY FROM THE PAGE'S, WHICH IS NOT THIS PORT'S TO FIX.
-  // `shared/rfd4p/output.js` adds `inputAtoms.center_shift` back after aligning - the centroid
-  // `centerAndFeaturizeCentroid` subtracted when it featurised the conditioning - and `alignToInputFrame` has no
-  // such step because the featuriser does not export that offset: both `g/coords` and `g/condCoord` come out
-  // already centred, measured centroids 1e-7, so there is nothing here to derive it from. It is sub-milliangstrom
-  // on an input that was already centred and ANGSTROMS on one that was not (`sm_sam` is over 3 A off the origin,
-  // `ppi_pdl1` 168), and it is the whole of what separates this writer from the page's: shifted by hand, the
-  // files are byte-identical. The fix is one tensor out of cuda/rfd4p's featuriser and three adds in
-  // `alignToInputFrame`, both of which are cuda/'s to make.
+  // 🔴 AND IT USED TO LAND A CENTRING OFFSET AWAY FROM THE PAGE'S, which is now exported rather than discarded.
+  // `centerAndFeaturizeCentroid` subtracts a centroid from everything the model is conditioned on, so a design
+  // aligned onto those coordinates is in the CENTRED frame; the featuriser computed that centroid and wrote it
+  // nowhere, so neither native port could undo it, and this writer differed from the page's on 337 of 612 lines
+  // of a motif job. `Centroid::shift` carries it out and `meta/centerShift*` exports it; the add-back is below.
   rfd4p::alignToInputFrame(g, n, condCoord.empty() ? nullptr : condCoord.data(),
                            condIntCrd.empty() ? nullptr : condIntCrd.data(),
                            coordGroup.empty() ? nullptr : coordGroup.data(), naming);

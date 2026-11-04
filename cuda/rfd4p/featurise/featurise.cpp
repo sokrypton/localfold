@@ -86,6 +86,7 @@ struct Batch {
   vector<uint8_t> conditionIndex;                       // [n, 37]  fill 1
   vector<int> tetrahedralVertices;                      // [n, 4]
   float centroidWithoutCond[3] = {0, 0, 0};
+  double centerShift[3] = {0, 0, 0};                    // the centroid `centerAndFeaturizeCentroid` subtracted
   vector<uint8_t> paddingMask;              // [n]  all 1
   vector<int> tokenType;                    // [n]
   vector<int> moleculeIid, moleculeEntityId, chainIid, indexGroup;
@@ -836,6 +837,7 @@ inline Batch buildStructureBatch(atoms::AtomArray& a, const atoms::Centroid& cen
   b.resize(nTokens);
   b.chiralFrameAtoms.assign((size_t)nTokens * 48, -1);
   for (int k = 0; k < 3; ++k) b.centroidWithoutCond[k] = centroid.v[k];
+  for (int k = 0; k < 3; ++k) b.centerShift[k] = centroid.shift[k];
   if (nTokens == 0) return b;
 
   vector<string> uniqueChains;
@@ -2669,6 +2671,15 @@ int run(int argc, char** argv) {
   g.meta("distDim", cfg.xtPairDistDim);
   g.meta("distMin", cfg.xtPairDistMin);
   g.meta("distMax", cfg.xtPairDistMax);
+  // 🔴 THE CENTROID THE CONDITIONING WAS CENTRED BY, WHICH THE OUTPUT HAS TO UNDO.
+  // `centerAndFeaturizeCentroid` subtracts it from everything the model is conditioned on, so a design aligned
+  // onto those coordinates lands in the CENTRED frame - a binder a centroid away from the target the reader
+  // loaded. `processSampleToAtoms` adds it back (shared/rfd4p/output.js, upstream's `3a7cda9d`) and no NATIVE
+  // port could, because this is the only place the quantity survives: `coords` and `condCoord` are both written
+  // already centred, measured centroids 1e-7, so a work directory held nothing to derive it from. Three numbers,
+  // read by whichever port's writer wants them; metal/rfd4p's does (its `buildDesign`), and with them
+  // `check-writer.mjs` goes from differing on 337 of 612 lines to IDENTICAL.
+  for (int k = 0; k < 3; ++k) g.meta("centerShift" + std::to_string(k), b.centerShift[k]);
   // The job's `metrics_tags` as shared/rfd4p/metrics.js's bits (`metricsTagBits`), with the
   // `partial_diffusion` upstream's generator adds itself to a run that starts from the input.
   {

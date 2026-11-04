@@ -1491,6 +1491,17 @@ inline void unindexFlaggedTokens(AtomArray& a, bool isInference = true) {
  */
 struct Centroid {
   float v[3];
+  // 🔴 AND THE CENTROID THIS SUBTRACTED, WHICH IS A DIFFERENT QUANTITY FROM `v` AND WAS BEING DISCARDED. `v` is
+  // the `chain_centroid` FEATURE - the centroid of the atoms that are NOT coordinate-conditioned, taken on the
+  // already-centred coordinates - and `shift` is the translation this function applied to everything the model
+  // is conditioned on. The output has to undo that translation or a design lands in the centred frame, a
+  // centroid away from the structure it was designed against (shared/rfd4p/output.js adds it back; upstream's
+  // `3a7cda9d`), and until now no native port could, because this was the only place it existed. In DOUBLE,
+  // because the writer prints three decimals and the page computes the add-back in double: rounded to float
+  // here the two writers' files differ in the last place. The two can look alike - on a job whose
+  // non-conditioned atoms happen to sit near the origin, `v` comes out close to `-shift` - which is exactly why
+  // reading `v` as the shift is a mistake that a single job will not catch.
+  double shift[3] = {0, 0, 0};
 };
 inline Centroid centerAndFeaturizeCentroid(AtomArray& a) {
   const size_t n = a.n();
@@ -1557,6 +1568,7 @@ inline Centroid centerAndFeaturizeCentroid(AtomArray& a) {
     ++uCount;
   }
   Centroid out;
+  out.shift[0] = shx; out.shift[1] = shy; out.shift[2] = shz;
   if (anyNotCond && uCount > 0) {
     out.v[0] = (float)(ux / uCount);
     out.v[1] = (float)(uy / uCount);

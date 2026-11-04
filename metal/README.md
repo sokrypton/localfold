@@ -428,18 +428,41 @@ internal distances are flat to the third decimal the writer prints and only the
 centroid moves (0.023 A on a motif job, 0.100 on a PPI, **0.000** on the
 small-molecule one, which has no anchors and so no alignment to do).
 
-🔴 **AND WHAT IS LEFT IS ONE TRANSLATION, AND IT IS NOT THIS PORT'S TO FIX.**
-`shared/rfd4p/output.js` adds `inputAtoms.center_shift` back after aligning -
-the centroid `centerAndFeaturizeCentroid` subtracted when it featurised the
-conditioning - and `alignToInputFrame` has no such step **because the featuriser
-does not export that offset**: `g/coords` and `g/condCoord` both come out
-already centred, measured centroids 1e-7, so there is nothing in a work
-directory to derive it from. It is the whole of what separates this writer from
-the page's - removing it from the page's side makes the two **byte-identical**,
-which is what `tools/rfd4p-writer-unshifted.mjs` asserts - and it is
-sub-milliangstrom only because a test input was already near the origin:
-`test/rfd4p-input-frame.test.js` measures `sm_sam` at over 3 A off it and
-`ppi_pdl1` at 168. It applies wherever there are anchors, so **cuda/rfd4p's
-writer carries the same gap** and `check-writer.mjs` differs there for the same
-reason. The fix is one tensor out of that featuriser and three adds in
-`alignToInputFrame`, both in cuda/.
+🔴 **AND THE ONE TRANSLATION THAT WAS LEFT IS CLOSED, BY EXPORTING A NUMBER THE
+FEATURISER WAS THROWING AWAY.** `shared/rfd4p/output.js` adds
+`inputAtoms.center_shift` back after aligning - the centroid
+`centerAndFeaturizeCentroid` subtracted when it featurised the conditioning,
+upstream's `3a7cda9d` - and no native port could, because that centroid was a
+local variable in the featuriser and nothing carried it out: `coords` and
+`condCoord` are both written already centred, measured centroids 1e-7, so a work
+directory held nothing to derive it from. `Centroid::shift` carries it now,
+`meta/centerShift*` exports it, and `buildDesign` adds it back on exactly the
+page's condition - any anchor at all and a non-zero shift, the anchor COUNT
+deciding rather than the fit, because one anchor does not fix a frame but the
+translation still applies. All twelve files match the page's text outright.
+
+🔴 **AND THE FIRST ATTEMPT EXPORTED THE WRONG QUANTITY, which one job would not
+have caught.** `Centroid::v` is the `chain_centroid` FEATURE - the centroid of
+the atoms that are NOT coordinate-conditioned, taken on the already-centred
+coordinates - and the featuriser carries it as `centroidWithoutCond`, which
+reads exactly like the name of the thing wanted. On `ppi_pdl1` it came out
+`-0.0431, +0.0782, -0.0416` against a true shift of `+0.0431, -0.0782, +0.0416`:
+the negation, to nine digits, because that job's non-conditioned atoms happen to
+sit near the origin. A sign flip looks like a sign bug and is a wrong tensor.
+Exported in **double**, because the add-back is computed in double on the page's
+side and rounded to float here the two writers' files differ in the last place.
+
+🔴 **AND ITS SIZE WAS OVERSTATED HERE.** This section used to say the offset is
+"sub-milliangstrom on an input that was already centred and ANGSTROMS on one
+that was not (`sm_sam` is over 3 A off the origin)". Measured per preset:
+`uncond_short` 0, `motif_idx_1prw` / `motif_unidx_1prw` / `dna_7m5w` 0.0005 A,
+`ppi_pdl1` **0.0985 A**, and `sm_sam` **6.07 A** - but `sm_sam` has no
+coordinate-conditioned atom, so it has no anchor, so neither the alignment nor
+the add-back runs on it and its 6 A is never applied. The cases where the offset
+applies ran 0.0005 to 0.0985 A here; it is large only for a job whose
+conditioned atoms sit far from the origin, which these presets are not.
+
+🔴 **AND cuda/rfd4p's WRITER HAD THE SAME GAP**, for the same reason, so
+`check-writer.mjs` differed there too on any job with an anchor. The export fixes
+the half that was missing; wiring its own `alignToInputFrame` to read
+`meta/centerShift*` is the other half and is not done here.

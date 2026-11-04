@@ -719,6 +719,13 @@ if (generate) {
     // The job's `metrics_tags`, as shared/rfd4p/metrics.js's bits: which design metrics the
     // native `--metrics=` computes.
     metricsTags: metricsTagBits(jobMetricsTags(preset)),
+    // 🔴 AND THE CENTROID THE CONDITIONING WAS CENTRED BY, which the writer at the far end has to add back or
+    // the design sits a centroid from the structure it was designed against (`processSampleToAtoms`). The
+    // native featuriser exports the same three numbers out of `Centroid::shift`; a key one exporter writes and
+    // the other does not is itself a difference, which is what gate.py's directory comparison fails on.
+    centerShift0: built.atoms?.center_shift?.[0] ?? 0,
+    centerShift1: built.atoms?.center_shift?.[1] ?? 0,
+    centerShift2: built.atoms?.center_shift?.[2] ?? 0,
   }, {
     "g/depths": Int32Array.from(depths),
     "g/stochastic": Int32Array.from(stepNoise),
