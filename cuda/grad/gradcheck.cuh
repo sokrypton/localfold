@@ -85,35 +85,42 @@ struct GradCheck {
     double scale = 0;
     // Up to `tries` directions a tensor, the first within the bar kept: a ReLU whose input sits within h of its
     // kink spoils ONE direction's difference, where a wrong gradient is wrong along every direction.
+    // Each tensor its own directions (seeded by its index): a retry on one tensor must not move every later
+    // tensor's, or a last-place rounding change anywhere reshuffles the whole check.
+    size_t index = 0;
     for (auto& t : tensors) {
+      curandSetPseudoRandomGeneratorSeed(gen, seed + 1000003ull * index++);
+      curandSetGeneratorOffset(gen, 0);
       size_t n2 = (t.n + 1) & ~(size_t)1;
       real* v; GK(cudaMalloc(&v, n2 * sizeof(real)));
       double rms = std::sqrt(dot(t.w, t.w, t.n) / t.n);
       double h = rel * (rms > 0 ? rms : 1.0);
       Row best{t.name, 0, 0};
       double bestE = INFINITY;
-      for (int k = 0; k < tries; ++k) {
+      bool any = false;
+      // One direction at step hk, |w|-scaled or not, keeping the best (a NaN is kept until something beats it). The
+      // row is reported per step h, so the 1e-3 * scale floor below compares like with like.
+      auto trial = [&](bool scaled, double hk, const char* tag) {
         randn(gen, v, n2);
-        double an = h * dot(t.g, v, t.n);
-        double d1 = central(forward, t, v, h), d2 = central(forward, t, v, 2 * h) / 2;
+        if (scaled) scaleByAbsK<<<blocks(t.n), 256, 0, STREAM>>>(v, t.w, 1 / rms, t.n);
+        double an = hk * dot(t.g, v, t.n);
+        double d1 = central(forward, t, v, hk), d2 = central(forward, t, v, 2 * hk) / 2;
         double fd = (4 * d1 - d2) / 3;
         double e = std::fabs(an - fd) / std::max({std::fabs(an), std::fabs(fd), 1e-300});
-        if (k == 0 || e < bestE) { bestE = e; best = {t.name, an, fd}; }
-        if (e <= bar) break;
-      }
+        if (!any || e < bestE || std::isnan(bestE)) { bestE = e; best = {t.name + tag, an * h / hk, fd * h / hk}; }
+        any = true;
+      };
+      for (int k = 0; k < tries && !(bestE <= bar); ++k) trial(false, h, "");
       // ...and then directions scaled by |w|: a weight with near-dead columns (protenix2's aggregation projection has
       // 130 output channels whose largest entry is 3e-3 of the tensor's rms) holds ReLU inputs that a step sized to the
       // tensor's rms crosses in EVERY random direction; stepped in proportion to itself, each entry stays on its side.
       // A wrong gradient is wrong along these directions as well.
-      for (int k = 0; k < tries && !(bestE <= bar) && rms > 0; ++k) {
-        randn(gen, v, n2);
-        scaleByAbsK<<<blocks(t.n), 256, 0, STREAM>>>(v, t.w, 1 / rms, t.n);
-        double an = h * dot(t.g, v, t.n);
-        double d1 = central(forward, t, v, h), d2 = central(forward, t, v, 2 * h) / 2;
-        double fd = (4 * d1 - d2) / 3;
-        double e = std::fabs(an - fd) / std::max({std::fabs(an), std::fabs(fd), 1e-300});
-        if (e < bestE) { bestE = e; best = {t.name + " (|w|-scaled)", an, fd}; }
-      }
+      for (int k = 0; k < tries && !(bestE <= bar) && rms > 0; ++k) trial(true, h, " (|w|-scaled)");
+      // ...and last a step ten times longer: a tensor whose whole effect on the outputs is ~1e-9 (a conditioning
+      // bias deep in the denoiser) has a difference whose rounding noise is a FIXED amount while its signal shrinks
+      // with h, so every direction at h sits at ~1e-4. Richardson leaves O(h^4), which 10x cannot lift to the bar,
+      // and a wrong gradient is wrong at every step.
+      for (int k = 0; k < tries && !(bestE <= bar); ++k) trial(false, 10 * h, " (10h)");
       GK(cudaFree(v));
       rows.push_back(best);
       scale = std::max(scale, std::max(std::fabs(best.an), std::fabs(best.fd)));
