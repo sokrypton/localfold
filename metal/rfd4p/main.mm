@@ -30,8 +30,8 @@
 // extra pair-sized planes whose 62.7 MB would be 0.48 ms unoverlapped, so two thirds of it is already hidden),
 // and then nothing above 3.6% - the centre norm, the two contractions, the pair write, the
 // bias projection, the triangle's doubled input norm. The two things that would move it further are named
-// above and below: core's norm-emitting epilogue on the matrix path (<= 1.2%), and a second triangle shape,
-// which the 400-token scaling says is not needed.
+// above and below, and neither is an opportunity: the norm-emitting epilogue is ALREADY firing on every pair
+// update, and a second triangle shape is what the 400-token scaling says is not needed.
 // 🔴 HALF IS THE DEFAULT AND `--f32` IS THE CONTROL, which is 3.6x slower: 12.6 s for that first design against
 // 3.5. One sampler step at 183 tokens went **681 ms of GPU time to 151, and 618 dispatches to 419**, over this
 // port's optimisation round: the weights, the activations and the PAIR TRACK in half; the triangle's projections
@@ -109,23 +109,22 @@
 // biases against it, and the mean still comes out negative - but a 1% effect under a 19% drift is not a
 // measurement. It is kept for the 165-token number, the exactness of the identity, and the buffer.
 //
-// 🔴 AND THE LAST PASS THAT COULD GO IS WORTH A TENTH OF A PERCENT, MEASURED RATHER THAN ARGUED. The
-// triangle's input LayerNorm runs TWICE a layer - 14 calls a step for 7 pair updates, 2.58 ms of profile,
-// 2.4% - where it should run once: `pairUpdate` asks the first triangle's gated add to emit the second's norm
-// in its epilogue (`Gemm::lnOut`, which is why `triangle` takes a `znPre`) and it never does, because core's
-// `lnEmit` needs the VECTOR epilogue or the 16384 gated-residual form ("gemm_tensor.metal's float tile has no
-// other emitting form") and on the matrix units this gated add is epilogue 192. The width is not the obstacle;
-// a 384-wide output has its own 64 x 128 clause.
-// What settles it is the price, taken the same way the gate's fusion was: skip ALL FOURTEEN and the wall moves
-// **-0.07, -0.16, -0.15, +0.27 s on ~14.4** - not consistent in sign, a mean of **-0.2%**. So the whole pass
-// is a fifth of a percent and the removable HALF is about a tenth, against 2.4% of profile: it is overlapped
-// almost entirely. Writing a new emitting form into the matrix tile that af3 and bioemu2 also run, for 0.1% of
-// wall, is not a trade worth making - and that is now a measurement rather than a judgement.
-// 🔴 AND THE SAME FOLD CANNOT BE USED HERE AS ON THE PAIR BIAS. A LayerNorm's channel scale folds into the
-// next weight, its mean folds into a per-output constant, and its row scale comes out after - but the
-// triangle's projection is FUSED with its gate now, and the gate applies a sigmoid to one of the four planes.
-// `sigmoid((x - m) / sd)` factors through nothing, so the fold and the fusion are mutually exclusive, and the
-// fusion is worth 5.2% against this pass's 0.2%.
+// 🔴 AND THE LAST PASS I THOUGHT WAS LEFT DOES NOT EXIST: THE FUSION IS ALREADY THERE. I read 14 `layernorm`
+// dispatches a step against 7 pair updates and concluded the triangle's input norm ran twice a layer, with
+// core's `lnEmit` never firing for the gated add. Both halves of that were wrong.
+//   * `lnEmit` DOES fire. The `e` number in a kernel's name is not the epilogue field - it is a packed
+//     instance key, `tri|1 plain|2 hacc|8 triReg|16 swigluReg|32 lnEmit|64 vecEp|128` - so the gated add's
+//     `e192` reads as **vecEp | lnEmit**, which is the opposite of what I took it for. Instrumented: both
+//     handoffs return true on all 147 pair updates of a run (`haveZnIn=1 haveTn=1`), so the first triangle's
+//     gated add emits the second's norm AND the second's emits the pair transition's. The fallback
+//     `layerNorm` calls in `triangle` and in `pairUpdate` never run at all.
+//   * THE 14 CALLS ARE THE TOKEN TRACK'S, one per token layer over [n][D] - there are 14 layers - and each is
+//     necessary. Their 2.58 ms is 0.18 ms a call for 0.5 MB of traffic, which is command-buffer overhead on a
+//     165-row dispatch under a profiling mode that gives every dispatch its own buffer, not work.
+// 🔴 AND THE MEASUREMENT I QUOTED FOR IT WAS VACUOUS, which is the part worth keeping. The probe skipped
+// `triangle`'s fallback norm - the branch that never executes - so "all fourteen skipped" skipped nothing, and
+// the -0.07 / -0.16 / -0.15 / +0.27 s it produced was noise, as its own sign disagreement should have said.
+// A control arm that cannot vary the thing under test is not a control: CLAUDE.md's own rule, earned again.
 //
 // So no kernel here is worth another tile sweep. The lever left is FEWER PASSES OVER THE PAIR TRACK - fusing an
 // elementwise pass into the epilogue of the GEMM that produced it, as the gate, the residual and the next
