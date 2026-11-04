@@ -13,10 +13,12 @@
 // SPEED, on an M5 (8-core GPU), a whole job including featurisation: a 54-residue design at 60 steps is
 // **3.7 s**, a 67-token motif 3.5 s, a 165-token small molecule 17.6 s, a 183-token interface 21.0 s.
 // 🔴 HALF IS THE DEFAULT AND `--f32` IS THE CONTROL, which is 3.5x slower: 12.6 s for that first design against
-// 3.7. One sampler step at 183 tokens went 681 ms of GPU time to 180 over this port's optimisation round - the
-// weights and the activations in half, the triangle's projections writing channel-major so nothing transposes,
-// the residual folded into the GEMM that produces it, and a pair row's index taken from its threadgroup rather
-// than from a software integer division a thread.
+// 3.7. One sampler step at 183 tokens went **681 ms of GPU time to 167, and 618 dispatches to 421**, over this
+// port's optimisation round: the weights and the activations in half; the triangle's projections writing
+// channel-major so nothing transposes; its gate, its residual and the NEXT stage's LayerNorm all folded into the
+// GEMM that writes the pair track; the four projections batched into one; every layer's adaLN conditioning
+// precomputed in a single GEMM, since none of it depends on the activations; and a pair row's index taken from
+// its threadgroup rather than from a software integer division a thread.
 //
 // WHAT RUNS: unconditional, motif scaffolding, protein-protein interfaces, small molecules (whose chirality is
 // re-aligned every step), coordinate groups (whose labels are permuted every step), partial diffusion and

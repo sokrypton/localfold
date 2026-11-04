@@ -11,6 +11,15 @@
 #include "rfd4p.h"
 #include <cmath>
 
+// 🔴 THE FUSED GATED ADD IS SILENTLY DROPPED FOR SOME SHAPES, which cost an hour and a wrong structure. core
+// chooses its epilogue by the output width (and the operands' alignment): at `out` a multiple of 128 it applies
+// `pair += aux * sigmoid(X W)`, and at 33489 it ran the PLAIN product instead and said so only in the profile's
+// kernel name (`e0` where the working calls read `e128`). So the gate was never applied, the structure was
+// wrong, and it was slower than what it replaced. Every call here goes through this check, which refuses rather
+// than letting a future width lose its gate in silence.
+static bool fusedGateFits(int out) { return out == 64 || out % 128 == 0; }
+
+
 void condC(const float* condFeats, float* c, size_t rows) {
   const int C = D_.C, inner = 2 * C;
   float* tmp = scratch<float>("c.tmp", rows * C);
@@ -129,6 +138,7 @@ void tokenLayer(int layer, float* s, const float* z, const float* c, const half*
   if (HALF && cH) {
     half* attnOut = scratch<half>("tl.attnOutH", (size_t)n * D);
     linH(ctxH, MHA + "to_out_node.weight", attnOut, n, D, D, M.f("w/" + MHA + "to_out_node.bias"));
+    if (!fusedGateFits(D)) die("rfd4p: the output scale cannot be fused at width %d", D);
     gemmGatedAdd(cH, weightT(L + "mhba.scale_output.to_adaln_zero_gamma.0.weight"), attnOut, s, n, D_.C, D,
                  M.f("w/" + L + "mhba.scale_output.to_adaln_zero_gamma.0.bias"));
   } else if (HALF) {
@@ -180,7 +190,15 @@ void tokenLayer(int layer, float* s, const float* z, const float* c, const half*
 // 🔴 AND IT HOLDS THE WHOLE PAIR TENSOR AT ONCE, which is what webgpu/rfd4p/trunk.js's `chunkPlan` exists not to
 // do: T * n^2 floats is 3 MB at n = 54 and 369 MB at n = 600, times the five buffers here. The slicing goes in
 // when a length needs it, with the bound measured on this machine rather than copied from the page's.
-static void triangle(const std::string& prefix, float* z, bool outgoing) {
+// `znPre`: the input's LayerNorm, already written by whatever produced `z` (metal/core's gated add can emit the
+// next norm as part of its epilogue). `nextScale`/`nextOffset`/`nextOut`: the norm THIS triangle's gated add
+// should emit for whatever reads `z` next - returns true where it did, and the caller then skips that norm.
+// 🔴 TWO OF A PAIR UPDATE'S THREE LayerNorms ARE SOMEBODY ELSE'S EPILOGUE: the outgoing triangle's add produces
+// the pair track that the incoming triangle immediately norms, and the incoming one's produces what the
+// transition norms. Emitting them costs the GEMM nothing and saves a pass over 25 MB each.
+static bool triangle(const std::string& prefix, float* z, bool outgoing, const half* znPre = nullptr,
+                     const float* nextScale = nullptr, const float* nextOffset = nullptr,
+                     half* nextOut = nullptr) {
   const int n = D_.n, P = D_.P, T = D_.T;
   const size_t nn = (size_t)n * n;
   const std::string W = "w/" + prefix + ".";
@@ -207,8 +225,11 @@ static void triangle(const std::string& prefix, float* z, bool outgoing) {
     // has one is refused by name rather than silently dropped.
     for (const char* b : {".linear_a_p.bias", ".linear_a_g.bias", ".linear_b_p.bias", ".linear_b_g.bias"})
       if (opt(prefix + b)) die("rfd4p: %s%s is a bias the channel-major projection cannot carry", prefix.c_str(), b);
-    half* zn = scratch<half>("tri.znH", nn * P);
-    layerNorm(z, zn, nn, P, M.f(W + "layer_norm_in.weight"), opt(prefix + ".layer_norm_in.bias"));
+    half* zn = const_cast<half*>(znPre);
+    if (!zn) {
+      zn = scratch<half>(outgoing ? "tri.znHo" : "tri.znHi", nn * P);
+      layerNorm(z, zn, nn, P, M.f(W + "layer_norm_in.weight"), opt(prefix + ".layer_norm_in.bias"));
+    }
     // 🔴 THE FOUR PROJECTIONS ARE ONE GEMM, because they share their input and differ only in the weight: the
     // four [T][P] matrices stacked into one [4T][P] (derived once) make a product four times the size and a
     // quarter of the dispatches. At 54 tokens each of them alone was 2916 x 256 x 384 - small enough that the
@@ -271,8 +292,9 @@ static void triangle(const std::string& prefix, float* z, bool outgoing) {
     // reference and took longer than what it replaced, which is a useful shape of bug: a fallback that fires
     // when nothing failed. The call always runs; off the matrix units it is lf_gemm's extended instance, which
     // is slower there and not wrong.
-    gemmGatedAdd(zn, weightT(prefix + ".linear_g.weight"), proj, z, nn, P, P, opt(prefix + ".linear_g.bias"));
-    return;
+    if (!fusedGateFits(P)) die("rfd4p: the triangle's gate cannot be fused at width %d", P);
+    return gemmGatedAdd(zn, weightT(prefix + ".linear_g.weight"), proj, z, nn, P, P,
+                        opt(prefix + ".linear_g.bias"), nextOut, nextScale, nextOffset, 1e-5f);
   }
 
   float* zn = scratch<float>("tri.zn", nn * P);
@@ -320,6 +342,7 @@ static void triangle(const std::string& prefix, float* z, bool outgoing) {
   RfdMulSigmoidArgs ms{};
   ms.x = proj; ms.g = gate; ms.y = z; ms.n = nn * P;
   run1d("rfd4p_mul_sigmoid", nn * P, ms);
+  return false;
 }
 
 void pairUpdate(int layer, const float* s, float* z) {
@@ -337,16 +360,24 @@ void pairUpdate(int layer, const float* s, float* z) {
   // a threadgroup a pair row (see the kernel): the row index is the group's, not a division a thread
   dispatch("rfd4p_pair_write", &pw, sizeof pw, grid1d(nn, 1), 256, 0, "rfd4p_pair_write");
 
-  // ---- the two triangles, each added in, the second reading what the first wrote
-  triangle(Q + "tri_mult_out", z, true);
-  triangle(Q + "tri_mult_in", z, false);
+  // ---- the two triangles, each added in, the second reading what the first wrote - and each asking the GEMM
+  // that writes the pair track to emit the norm of it that the next stage wants
+  const std::string TRI_IN = Q + "tri_mult_in", TR_ = Q + "transition_out.";
+  half* znIn = HALF ? scratch<half>("pu.znInH", nn * P) : nullptr;
+  half* tnBuf = HALF ? scratch<half>("pu.tnh", nn * P) : nullptr;
+  const bool haveZnIn = triangle(Q + "tri_mult_out", z, true, nullptr,
+                                 HALF ? M.f("w/" + TRI_IN + ".layer_norm_in.weight") : nullptr,
+                                 HALF ? opt(TRI_IN + ".layer_norm_in.bias") : nullptr, znIn);
+  const bool haveTn = triangle(TRI_IN, z, false, haveZnIn ? znIn : nullptr,
+                               HALF ? M.f("w/" + TR_ + "layer_norm.weight") : nullptr,
+                               HALF ? M.f("w/" + TR_ + "layer_norm.bias") : nullptr, tnBuf);
 
   // ---- the pair transition
   const std::string TR = Q + "transition_out.";
   const int hidden = (int)M.len("w/" + TR + "linear_1.bias");
   if (HALF) {
-    half* tn = scratch<half>("pu.tnh", nn * P);
-    layerNorm(z, tn, nn, P, M.f("w/" + TR + "layer_norm.weight"), M.f("w/" + TR + "layer_norm.bias"));
+    half* tn = tnBuf;
+    if (!haveTn) layerNorm(z, tn, nn, P, M.f("w/" + TR + "layer_norm.weight"), M.f("w/" + TR + "layer_norm.bias"));
     half* h = scratch<half>("pu.hh", nn * (size_t)hidden);
     linH(tn, TR + "linear_1.weight", h, nn, P, hidden, M.f("w/" + TR + "linear_1.bias"), true);
     float* tr = scratch<float>("pu.tr", nn * P);
