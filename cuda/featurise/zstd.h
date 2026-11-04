@@ -35,10 +35,20 @@ inline bool isCompressed(const std::string& bytes) {
  * allocate nothing and silently return an empty structure.
  */
 inline std::string decompress(const std::string& in, const char* what = "input") {
-  void* lib = dlopen("libzstd.so.1", RTLD_NOW);
-  if (!lib) lib = dlopen("libzstd.so", RTLD_NOW);
+  // 🔴 THE PROCESS ITSELF FIRST, THEN THE SYSTEM, AND BOTH PLATFORMS' NAMES. macOS ships no libzstd at all and
+  // has no `.so` even where one is installed, so `libzstd.so.1` alone made every compressed structure
+  // unreadable on a Mac - which is a refusal in the middle of a job rather than at its build. A port that
+  // statically links the decompressor (metal/build.sh does, for exactly that reason) exports these symbols into
+  // its own image, and `RTLD_DEFAULT` finds them there; a Mac with Homebrew's zstd has `libzstd.1.dylib`; Linux
+  // keeps `libzstd.so.1`. The comment above still holds for the Linux case: nothing is linked at build time.
+  void* lib = dlsym(RTLD_DEFAULT, "ZSTD_createDStream") ? RTLD_DEFAULT : nullptr;
+  for (const char* name : {"libzstd.so.1", "libzstd.so", "libzstd.1.dylib", "libzstd.dylib"}) {
+    if (lib) break;
+    lib = dlopen(name, RTLD_NOW);
+  }
   if (!lib) {
-    fprintf(stderr, "%s is zstd and this needs libzstd (libzstd.so.1): %s\n", what, dlerror());
+    fprintf(stderr, "%s is zstd and this needs libzstd (libzstd.so.1 / libzstd.1.dylib), or a port that links "
+                    "the decompressor: %s\n", what, dlerror());
     exit(1);
   }
   auto sym = [&](const char* n) {

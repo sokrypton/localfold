@@ -31,11 +31,13 @@ metal/
     model.h/.cpp   weights and inputs by name: page bundles and af3-any-model blobs decoded on the device, through
                    cuda/featurise's weight walks (af2_weights.h, af3_weights.h), delta bundles, featurised inputs
     host.h/.cpp    the drivers' shared host pieces: --serve, frame superposition, whole-file writes
-  rfd4p/         RFD4-Proteina's trunk (the design model: webgpu/rfd4p and cuda/rfd4p are the readings), reading
-                 the PAGE's published int8 bundle - manifest.json and its shards, which model.cpp already decodes,
-                 so there is no weight walk. Held stage by stage to cpu/rfd4p/reference.js over those same weights
-                 (`--oracle=`, two arms: every stage from the reference's own input, and the whole trunk chained;
-                 main.mm has the recipe). The sampler, the autoencoder and the featuriser are not here yet
+  rfd4p/         RFD4-Proteina, the design model (webgpu/rfd4p and cuda/rfd4p are the readings): the trunk, the
+                 autoencoder's two halves, the flow sampler and the writer, reading the PAGE's published int8
+                 bundle - manifest.json and its shards, which model.cpp already decodes, so there is no weight
+                 walk. `--job=<spec>` is one process with no JavaScript (cuda/rfd4p's featuriser linked in, its
+                 bytes identical to the JavaScript exporter's); a 54-residue design is 60 steps in 8.7 s at
+                 CA-CA 3.81 A. Held stage by stage to cpu/rfd4p/reference.js over those same weights and step by
+                 step to its trajectory (`--oracle=`, `--gen=`; main.mm has the recipe and the bounds)
   af3/ af2/ ef2/ one per port, flat: the port's kernels (kernels.h, <port>.metal), its stages (*.mm), main.mm,
                  fold, gate.py, gate-baseline.<chip>.json
   bioemu2/       BioEmu2: --job= on af3-any-model's int8 blob, read as the page's bundle through a weight walk

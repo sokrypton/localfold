@@ -23,6 +23,17 @@ namespace {
 
 std::string trimName(const char* s) { return s ? std::string(s) : std::string(); }
 
+// a string the exporter packed into `words` ints, four characters each, little-endian and zero-padded
+std::string unpackString(const int* w, int words) {
+  std::string out;
+  for (int i = 0; i < words; ++i)
+    for (int k = 0; k < 4; ++k) {
+      const char c = (char)((w[i] >> (8 * k)) & 0xff);
+      if (c) out += c;
+    }
+  return out;
+}
+
 // a PDB atom name's column rule: a one-letter element starts in column 14, anything else in 13
 std::string pdbAtomName(const std::string& name) {
   if (name.size() >= 4) return name;
@@ -106,10 +117,11 @@ void decoderPostprocess(int n, const float* caNm, const int* seq, const float* l
 }
 
 int writePdb(const std::string& path, int n, const float* coors, const uint8_t* atomMask, const int* residueType,
-             const int* outResId, const int* outChain, const int* chainIid, double* caSpacing) {
+             const int* outResId, const int* outChain, const int* chainIid, double* caSpacing, const OutTables& in) {
   std::string out;
   int serial = 0;
   std::vector<float> prevCa;
+  std::string prevChain;
   double worstGap = 0;
   std::vector<double> gaps;
   for (int i = 0; i < n; ++i) {
@@ -129,6 +141,24 @@ int writePdb(const std::string& path, int n, const float* coors, const uint8_t* 
     } else if (chainIid) {
       chain = std::string(1, (char)('A' + (chainIid[i] % 26)));
     }
+    // 🔴 AN ATOMISED TOKEN IS ONE ATOM AND IT IS THE INPUT'S. A ligand's atom or an atomised residue's is
+    // carried over whole - its own name, residue, element and HETATM flag - at the token's sampled position.
+    // Written from the vocabulary instead it comes out `UNK CA`, element C, `ATOM`: a glycerol as six alanines.
+    if (in.present && in.atomize[i]) {
+      const size_t at = (size_t)i * 37 + 1;
+      const std::string atomName = unpackString(&in.inName[at], 1);
+      const std::string resName2 = unpackString(&in.resName[(size_t)i * 2], 2);
+      const std::string el = in.inElem[at] ? unpackString(&in.inElem[at], 1) : std::string();
+      char line[96];
+      snprintf(line, sizeof line, "%-6s%5d %s %-3s %s%4d    %8.3f%8.3f%8.3f  1.00  0.00          %2s\n",
+               in.hetero[i] ? "HETATM" : "ATOM", (serial + 1) % 100000, pdbAtomName(atomName).c_str(),
+               resName2.c_str(), chain.substr(0, 1).c_str(), resId, coors[(size_t)i * 111 + 3],
+               coors[(size_t)i * 111 + 4], coors[(size_t)i * 111 + 5],
+               padLeft(el.empty() || el == "X" ? element(atomName) : el, 2).c_str());
+      out += line;
+      serial += 1;
+      continue;
+    }
     for (int a = 0; a < 37; ++a) {
       if (!atomMask[(size_t)i * 37 + a]) continue;
       const std::string atomName = rt >= 0 ? trimName(rfd4p::tables::TOKEN_ATOMS[(size_t)rt][(size_t)a])
@@ -137,19 +167,25 @@ int writePdb(const std::string& path, int n, const float* coors, const uint8_t* 
       const float x = coors[(size_t)i * 111 + a * 3], y = coors[(size_t)i * 111 + a * 3 + 1],
                   zc = coors[(size_t)i * 111 + a * 3 + 2];
       char line[96];
-      snprintf(line, sizeof line, "ATOM  %5d %s %-3s %s%4d    %8.3f%8.3f%8.3f  1.00  0.00          %2s\n",
+      snprintf(line, sizeof line, "%-6s%5d %s %-3s %s%4d    %8.3f%8.3f%8.3f  1.00  0.00          %2s\n",
+               in.present && in.hetero[i] && rt >= 0 && resName != "UNK" &&
+                       unpackString(&in.resName[(size_t)i * 2], 2) != "<M>" ? "HETATM" : "ATOM",
                (serial + 1) % 100000, pdbAtomName(atomName).c_str(), resName.c_str(), chain.substr(0, 1).c_str(),
                resId, x, y, zc, padLeft(element(atomName), 2).c_str());
       out += line;
       serial += 1;
       if (a == 1) {
-        if (!prevCa.empty()) {
+        // 🔴 WITHIN A CHAIN ONLY. Measured across every token in order, a two-chain design reports the jump
+        // from one chain's last residue to the next chain's first as a 60 A "bond" - which is the structure
+        // being right and the measurement being wrong, and it read exactly like a broken backbone.
+        if (!prevCa.empty() && chain == prevChain) {
           const double d = std::sqrt((double)(x - prevCa[0]) * (x - prevCa[0]) + (double)(y - prevCa[1]) * (y - prevCa[1]) +
                                      (double)(zc - prevCa[2]) * (zc - prevCa[2]));
           gaps.push_back(d);
           worstGap = std::max(worstGap, d);
         }
         prevCa = {x, y, zc};
+        prevChain = chain;
       }
     }
   }

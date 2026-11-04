@@ -77,12 +77,34 @@ for port in "${ports[@]}"; do
   srcs=()
   for s in "$pdir"/*.mm "$pdir"/*.cpp; do [ -f "$s" ] && srcs+=("$s"); done
   extra=(-Wl,-dead_strip)
+  # 🔴 A PORT WHOSE MODEL HAS ITS OWN FEATURISER LINKS IT, so `--job=<spec>` is one process with no JavaScript -
+  # what cuda/build.sh does for the same object and the same reason. RFD4-Proteina's pipeline shares nothing with
+  # AF3's (a contig and a selection language rather than a job of chains), so it is its own translation unit, and
+  # -DRFD4P_FEATURISE_NO_MAIN leaves its `main` out: the port has one.
+  # -ffp-contract=off because a featuriser's bytes are compared against the JavaScript's to the last place, and a
+  # fused multiply-add is a different rounding.
+  pfeat="$repo/cuda/$port/featurise/featurise.cpp"
+  if [ -f "$pfeat" ]; then
+    pobj="$build/$port-featurise.o"
+    # 🔴 THE SHARED HEADERS COUNT TOO. This watched only the port's own featurise directory, and rfd4p's
+    # featuriser includes `cuda/featurise`'s json and zstd readers - so a fix in one of those left the object
+    # untouched and the run reported the OLD message with the source plainly corrected. cuda/build.sh's own
+    # comment says the same thing about a stamp that named five files.
+    if [ ! -f "$pobj" ] || [ -n "$(find "$(dirname "$pfeat")" "$repo/cuda/featurise" -newer "$pobj" \( -name '*.h' -o -name '*.inc' -o -name '*.cpp' \) | head -1)" ]; then
+      clang++ -std=c++17 -O2 -ffp-contract=off -pthread -DRFD4P_FEATURISE_NO_MAIN -c "$pfeat" -o "$pobj"
+    fi
+    extra+=("$pobj")
+  fi
   if [ "$port" != selftest ]; then
     sobj="$repo/cuda/featurise/standalone.o"
     if [ ! -f "$sobj" ] || [ -n "$(find "$repo/cuda/featurise" -newer "$sobj" \( -name '*.h' -o -name '*.inc' -o -name '*.cpp' \) | head -1)" ]; then
       clang++ -std=c++17 -O2 -ffp-contract=off -pthread -c "$repo/cuda/featurise/standalone.cpp" -o "$sobj"
     fi
-    extra=("$sobj" -Wl,-force_load,"$zstd_lib")
+    # (appended, not assigned: a port's own featuriser object above is part of this list too)
+    # 🔴 AND EXPORTED, because the featurisers reach the decompressor through `dlsym` rather than a link-time
+    # reference (cuda/featurise/zstd.h says why) - so without this the symbols are in the binary and invisible
+    # to it, and a `.cif.zst` input fails on a Mac with no system libzstd, which is every Mac.
+    extra+=("$sobj" -Wl,-force_load,"$zstd_lib" -Wl,-export_dynamic)
   fi
   # a port may read a generated header of its own model's conventions (metal/rfd4p includes
   # "rfd4p/featurise/tables.inc": the vocabulary and the atom37 masks derived from shared/rfd4p rather than typed).

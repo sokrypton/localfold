@@ -148,6 +148,12 @@ int generate(const std::string& genDir, const std::string& outPath);
 extern double (*GATE_CHECK)(const char* label, const std::string& key, const float* ours, size_t n, double bound);
 extern double GATE_TRAJ_BOUND;
 
+// ---------------------------------------------------------------- chirality.mm
+// `align_chirality`, recomputed every step: the clean packed vectors rotated onto the directions their frame's
+// neighbours have in the current noisy state. `out` is [n][18] and starts as a copy of `chirClean`.
+void alignChirality(int n, const float* caNm, const float* chirClean, const int* frames, const int* owners,
+                    const float* pad, int frameWidth, float* out);
+
 // ---------------------------------------------------------------- output.mm
 // the decoder's C_SEQ: the job's conditioned residues kept, an emitted token with none taking the argmax of the
 // trunk's logits over its TOKEN TYPE's allowed residues. Returns how many it filled.
@@ -158,6 +164,13 @@ int sequenceForDecoder(int n, const float* logits, const int* condSeq, const int
 void decoderPostprocess(int n, const float* caNm, const int* seq, const float* logits, const float* coorsFlat,
                         const float* presence, const float* emit, const int* coordGroup, const int* attnIdx, int na,
                         float* coors, uint8_t* atomMask, int* residueType);
-// the PDB, and the consecutive alpha-carbon spacing (median, min, max) as the geometry check
+// the input's own per-token naming, where a job named a structure (the featuriser's `outputTables`): absent for
+// a de-novo design, and `present` says which
+struct OutTables {
+  bool present = false;
+  const int* atomize = nullptr; const int* hetero = nullptr; const int* resName = nullptr;
+  const int* inName = nullptr; const int* inElem = nullptr;
+};
+// the PDB, and the consecutive alpha-carbon spacing within a chain (median, min, max) as the geometry check
 int writePdb(const std::string& path, int n, const float* coors, const uint8_t* atomMask, const int* residueType,
-             const int* outResId, const int* outChain, const int* chainIid, double* caSpacing);
+             const int* outResId, const int* outChain, const int* chainIid, double* caSpacing, const OutTables& in);

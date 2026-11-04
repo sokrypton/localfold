@@ -1,27 +1,52 @@
-// RFD4-Proteina on Metal: the trunk, held stage by stage to the CPU reference over the same weights.
+// RFD4-Proteina on Metal: a job file in, a design out, in one process with no JavaScript.
 //
 //   bash metal/build.sh rfd4p
-//   node tools/rfd4p-bundle-to-safetensors.mjs                      # the int8 shards as float32, once
-//   node cuda/rfd4p/export_input.mjs <in> --oracle=<oracle> --recycles=1 \
-//        --checkpoint=$PWD/model-rfd4p-int8/model.safetensors        # the input and the reference's 37 stages
-//   ./metal/rfd4p/localfold-rfd4p <in> --bundle=model-rfd4p-int8 --oracle=<oracle>
+//   ./metal/rfd4p/localfold-rfd4p --job=<spec.json> --bundle=model-rfd4p-int8 [--out=design.pdb] [--seed=N]
 //
-// <input dir> is `cuda/rfd4p/export_input.mjs`'s output (model.idx / model.bin: the trunk's features and the
-// padding mask); --oracle= is that run's `--oracle=` directory. Run BOTH recycle counts: `--recycles=2` is the
-// only arm that exercises the cycle projections and the second conditioning at all.
+// The spec is read and featurised by `cuda/rfd4p/featurise/featurise.cpp` LINKED IN (the same object cuda/rfd4p
+// links, and byte for byte what `rfd4p-featurise` writes - measured: the whole input directory identical and all
+// 44 tensors of the generation export exact against `cuda/rfd4p/export_input.mjs`, the replayed Box-Muller stream
+// among them). Then the trunk, the autoencoder's decoder and the flow sampler run on this Mac's GPU, and the
+// design is written. A 54-residue unconditional design is 60 steps in 8.7 s; the whole job, featurisation
+// included, is 13.
 //
-// TWO ARMS, and the first is the one that holds the kernels:
-//   * every stage FROM THE ORACLE'S OWN INPUT, at 1e-6 - each kernel answering for its own arithmetic;
-//   * the whole trunk CHAINED, at 2e-6 - fourteen layers of float32 against a float64-accumulating reference.
-// Measured on an M5, 54 tokens: per stage 2.1e-7 to 5.8e-7 and FLAT in depth, chained 2.9e-7 growing to 1.0e-6
-// at z10. A failure in the first arm is a kernel; a failure in the second with the first green is drift.
+// WHAT RUNS: unconditional, motif scaffolding, protein-protein interfaces, small molecules (whose chirality is
+// re-aligned every step), partial diffusion and inverse folding. Measured, consecutive CA-CA within a chain:
+// unconditional 3.81 A median over [3.73, 3.90], motif 3.79, ppi 3.80, small molecule 3.81, partial 3.74 - and
+// inverse folding returns the input's own backbone to 0.0005 A, which is the nm-to-angstrom rounding.
+// 🔴 READ THAT AT A CONVERGED STEP COUNT: the same code at 2 steps gives 11 A and at 60 gives 3.81. The
+// trajectory gate below runs at 2 steps and says nothing about geometry; they are different questions.
+//
+// REFUSED BY NAME rather than run as something else: a job with two or more coordinate groups (their labels are
+// permuted every step and this port does not do it - and neither does cuda/rfd4p, which freezes them silently),
+// and `center_every_step`.
+//
+// THE GATE, over an exported input directory rather than a job:
+//   localfold-rfd4p <input dir> --bundle=<model-rfd4p-int8> [--oracle=<dir>] [--encoder=<dir>] [--gen=<dir>-gen]
+//     [--out=design.pdb] [--f16]
+// built by `cuda/rfd4p/export_input.mjs <in> --oracle=<o> [--encoder] [--generate --gen-oracle] --steps=N
+// --checkpoint=$PWD/model-rfd4p-int8/model.safetensors` (that file from `tools/rfd4p-bundle-to-safetensors.mjs`:
+// the int8 shards dequantised, so the oracle is built from the weights this port runs and the quantisation
+// cancels). Run BOTH recycle counts - `--recycles=2` is the only arm that exercises the cycle projections.
+//
+// FOUR ARMS, and the first two are the ones that hold the kernels:
+//   * every trunk stage FROM THE ORACLE'S OWN INPUT at 1e-6 - each kernel answering for its own arithmetic;
+//   * every autoencoder layer the same way at 1e-5 (it amplifies: see the bounds below);
+//   * the whole trunk and the decoder CHAINED, reported at 2e-6 and 1e-4;
+//   * the sampler against the reference's own per-step trajectory at 1e-4.
 #include "rfd4p.h"
 #include <cmath>
 #include <cstring>
 #include <map>
 #include <vector>
+#include <fstream>
+#include <filesystem>
 
 extern const char* PORT_SOURCE;
+
+// RFD4-Proteina's own featuriser, linked in rather than run as a second process
+// (cuda/rfd4p/featurise/featurise.cpp, the same object cuda/rfd4p links).
+namespace rfd4p { namespace featurise { int run(int argc, char** argv); } }
 
 namespace {
 
@@ -65,7 +90,7 @@ double checkFn(const char* label, const std::string& key, const float* ours, siz
 }  // namespace
 
 int main(int argc, char** argv) {
-  std::string input, bundle, oracle, encDir, genDir, outPath;
+  std::string input, bundle, oracle, encDir, genDir, outPath, job, workDir, seed;
   for (int i = 1; i < argc; ++i) {
     const char* a = argv[i];
     if (!strncmp(a, "--bundle=", 9)) bundle = a + 9;
@@ -73,12 +98,71 @@ int main(int argc, char** argv) {
     else if (!strncmp(a, "--encoder=", 10)) encDir = a + 10;
     else if (!strncmp(a, "--gen=", 6)) genDir = a + 6;
     else if (!strncmp(a, "--out=", 6)) outPath = a + 6;
+    else if (!strncmp(a, "--job=", 6)) job = a + 6;
+    else if (!strncmp(a, "--work-dir=", 11)) workDir = a + 11;
+    else if (!strncmp(a, "--seed=", 7)) seed = a + 7;
     else if (!strcmp(a, "--f16")) HALF = true;
     else if (a[0] != '-') input = a;
     else die("unknown flag %s", a);
   }
+  // 🔴 `--job=<spec>` IS ONE PROCESS AND NO JAVASCRIPT. The featuriser is linked in, so a condition spec becomes
+  // this port's input here - by the same code and the same bytes `rfd4p-featurise` writes, which
+  // `npm run test:featurise`-style gates hold to the JavaScript's to the last place. The directory is still
+  // written to disk, because that is what the port reads and what a second run reuses; what is gone is the
+  // second process and the Node it needed. cuda/rfd4p's `jobMain` is the reading.
+  if (!job.empty()) {
+    if (bundle.empty()) { fprintf(stderr, "--job= needs --bundle=<model-rfd4p-int8>\n"); return 2; }
+    if (workDir.empty()) workDir = job + ".featurised";
+    // 🔴 THE FEATURISER READS THE PUBLISHED LAYOUT (`<dir>/shards/<file>`) AND A LOCAL EXPORT IS FLAT.
+    // `tools/export_rfd4p_model.py` writes manifest.json beside its shards; the deployed bundle the port fetches
+    // keeps them under `shards/`. Rather than teach one side the other's layout, a run stages a directory of
+    // symlinks when it needs to - the bytes are not copied, and the bundle this port reads is untouched.
+    std::string fbundle = bundle;
+    {
+      std::error_code ec;
+      if (!std::filesystem::exists(bundle + "/shards", ec) && std::filesystem::exists(bundle + "/shard_000.bin", ec)) {
+        const std::string stage = workDir + "-weights";
+        std::filesystem::create_directories(stage + "/shards", ec);
+        const std::filesystem::path src = std::filesystem::absolute(bundle);
+        for (const char* f : {"manifest.json", "config.json"}) {
+          std::filesystem::remove(stage + "/" + f, ec);
+          std::filesystem::create_symlink(src / f, stage + "/" + f, ec);
+        }
+        for (const auto& e : std::filesystem::directory_iterator(src, ec)) {
+          const std::string name = e.path().filename().string();
+          if (name.size() < 4 || name.compare(name.size() - 4, 4, ".bin")) continue;
+          std::filesystem::remove(stage + "/shards/" + name, ec);
+          std::filesystem::create_symlink(e.path(), stage + "/shards/" + name, ec);
+        }
+        fbundle = stage;
+      }
+    }
+    std::vector<std::string> fargs = {"rfd4p-featurise", workDir, "--spec=" + job, "--generate", "--int8=" + fbundle};
+    if (!seed.empty()) fargs.push_back("--seed=" + seed);
+    std::vector<char*> fargv;
+    for (std::string& f : fargs) fargv.push_back(f.data());
+    const double tf = now();
+    if (const int rc = rfd4p::featurise::run((int)fargv.size(), fargv.data())) return rc;
+    printf("featurised %s in %.2f s\n", job.c_str(), now() - tf);
+    input = workDir;
+    genDir = workDir + "-gen";
+    if (outPath.empty()) outPath = "design.pdb";
+    // 🔴 THE ENCODER'S INPUTS FOR A PARTIAL RUN AND ONLY FOR ONE: the featuriser writes `<work>-enc` when the
+    // job is one and says so in the generation's metadata, and handing `--encoder=` to an ordinary run would
+    // read whatever a previous job left in the same work directory.
+    std::ifstream idx(genDir + "/model.idx");
+    std::string kind, name;
+    while (idx >> kind >> name) {
+      if (kind != "m") { std::string rest; std::getline(idx, rest); continue; }
+      double v = 0;
+      idx >> v;
+      if (name == "meta/partial" && v != 0) encDir = workDir + "-enc";
+    }
+  }
+
   if (input.empty() || bundle.empty()) {
-    fprintf(stderr, "usage: localfold-rfd4p <input dir> --bundle=<model-rfd4p-int8> [--oracle=<dir>] "
+    fprintf(stderr, "usage: localfold-rfd4p --job=<spec.json|.yaml> --bundle=<model-rfd4p-int8> [--out=design.pdb]\n"
+                    "       localfold-rfd4p <input dir> --bundle=<model-rfd4p-int8> [--oracle=<dir>] "
                     "[--encoder=<dir>] [--gen=<dir>-gen] [--out=design.pdb] [--f16]\n");
     return 2;
   }
@@ -90,7 +174,11 @@ int main(int argc, char** argv) {
   M.loadInput(input);
   if (!oracle.empty()) M.loadInput(oracle);
   // the encoder's own input directory and the reference's answer to it (`export_input.mjs --encoder`)
-  if (!encDir.empty()) { M.loadInput(encDir); M.loadInput(encDir + "-oracle"); }
+  // the encoder's input, and the reference's answer to it only where that was written (a job run has none)
+  if (!encDir.empty()) {
+    M.loadInput(encDir);
+    if (FILE* probe = fopen((encDir + "-oracle/model.idx").c_str(), "r")) { fclose(probe); M.loadInput(encDir + "-oracle"); }
+  }
   // a generation's exported inputs, and the reference's own trajectory over them where it was written
   if (!genDir.empty()) {
     M.loadInput(genDir);

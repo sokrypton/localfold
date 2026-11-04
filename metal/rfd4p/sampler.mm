@@ -63,6 +63,15 @@ std::vector<double> withTail(int mode, double p, int tailSteps, int mult, int ns
   return out;
 }
 
+// Python's `round`, half to even (`pyRound`): the expanded step count goes through it, and
+// `round(2.5)` being 2 rather than 3 moves a whole schedule by one step.
+int pyRound(double x) {
+  const double fl = std::floor(x);
+  const double diff = x - fl;
+  if (std::abs(diff - 0.5) < 1e-12) return (int)(std::fmod(fl, 2.0) == 0 ? fl : fl + 1);
+  return (int)std::round(x);
+}
+
 }  // namespace
 
 bool stochasticStep(double t, const Modality& m) {
@@ -122,6 +131,37 @@ Modality modalitySchedule(const char* tag, int nsteps) {
   return m;
 }
 
+// `buildPartialSchedule`: a partial run does not run its own schedule, it runs the TAIL of the full one - so the
+// times it steps through are the same times an unconditional run would reach, and the corruption time has to be
+// one of them. Two cases: with a step FRACTION the tail of the base schedule; otherwise a schedule expanded so
+// that `nsteps` of its tail start at the corruption time.
+Modality partialSchedule(const char* tag, int nsteps, int fullNsteps, double pt) {
+  Modality m = modalitySchedule(tag, nsteps);        // the step parameters; the times are rebuilt below
+  auto tailOf = [&](int steps) {
+    const Modality full = modalitySchedule(tag, steps);
+    Modality out = m;
+    out.ts.assign(full.ts.end() - (nsteps + 1), full.ts.end());
+    out.gt.assign(full.gt.end() - nsteps, full.gt.end());
+    return out;
+  };
+  if (fullNsteps > 0) {
+    if (!(nsteps >= 1 && nsteps <= fullNsteps))
+      die("rfd4p: a partial step count must be in [1, %d], got %d", fullNsteps, nsteps);
+    Modality out = tailOf(fullNsteps);
+    if (std::abs((float)out.ts[0] - (float)pt) > 1e-6)
+      die("rfd4p: %s's corruption time %g is not the first time of the full schedule's tail (%g)", tag, pt,
+          out.ts[0]);
+    return out;
+  }
+  const int dense = std::max(nsteps * 100, 1000);
+  const Modality d = modalitySchedule(tag, dense);
+  int iStart = dense;
+  for (int i = 0; i <= dense; ++i)
+    if ((float)d.ts[(size_t)i] >= pt - 1e-6) { iStart = i; break; }
+  const int nAbove = std::max(dense - iStart, 1);
+  return tailOf(pyRound((double)nsteps * dense / nAbove));
+}
+
 namespace {
 
 // `sample_noise` for both modalities, out of the replayed stream: the backbone zero-centred over its emitted
@@ -161,6 +201,44 @@ size_t initialNoise(const float* noise, float* bb, float* ll, int n, int latent,
   return at;
 }
 
+// `zeroComBbNoise`: n*3 normals zero-centred over the emitted tokens
+size_t noisedBackbone(const float* noise, int n, const float* emitBb, float* out) {
+  int cnt = 0;
+  float mean[3] = {0, 0, 0};
+  for (int i = 0; i < n; ++i) {
+    for (int k = 0; k < 3; ++k) out[i * 3 + k] = emitBb[i] != 0 ? noise[(size_t)i * 3 + k] : 0.f;
+    if (emitBb[i] == 0) continue;
+    cnt += 1;
+    for (int k = 0; k < 3; ++k) mean[k] += out[i * 3 + k];
+  }
+  for (int k = 0; k < 3; ++k) mean[k] = (float)(mean[k] / std::max(cnt, 1));
+  for (int i = 0; i < n; ++i)
+    if (emitBb[i] != 0)
+      for (int k = 0; k < 3; ++k) out[i * 3 + k] = (float)(out[i * 3 + k] - mean[k]);
+  return (size_t)n * 3;
+}
+
+// `applyPerGroupOffset`: one N(0, scale^2) offset a molecule instance, for tokens with no absolute coordinate
+// conditioning, in ascending instance order - which is the draw order and so part of the specification
+size_t groupOffsets(const float* noise, int n, const float* emitBb, const int* coordCond, const int* moleculeIid,
+                    float scale, float* out) {
+  std::set<int> groups;
+  for (int i = 0; i < n; ++i) if (emitBb[i] != 0 && !coordCond[i]) groups.insert(moleculeIid[i]);
+  size_t at = 0;
+  for (int g : groups) {
+    const float off[3] = {noise[at], noise[at + 1], noise[at + 2]};
+    at += 3;
+    for (int i = 0; i < n; ++i) {
+      if (!(emitBb[i] != 0 && !coordCond[i]) || moleculeIid[i] != g) continue;
+      for (int k = 0; k < 3; ++k) out[i * 3 + k] = (float)(out[i * 3 + k] + (float)(scale * off[k]));
+    }
+  }
+  for (int i = 0; i < n; ++i)
+    if (emitBb[i] == 0)
+      for (int k = 0; k < 3; ++k) out[i * 3 + k] = 0.f;
+  return at;
+}
+
 }  // namespace
 
 double (*GATE_CHECK)(const char*, const std::string&, const float*, size_t, double) = nullptr;
@@ -171,9 +249,35 @@ int generate(const std::string& genDir, const std::string& outPath) {
   const int n = D_.n, latent = DD_.latent;
   const size_t nn = (size_t)n * n;
   const int steps = (int)M.meta("meta/steps");
-  if (M.meta("meta/partial", 0) != 0 || M.meta("meta/inverseFolding", 0) != 0)
-    die("rfd4p: partial diffusion and inverse folding are not in this port yet (the export says this job is one)");
-  Modality bbM = modalitySchedule("Bb", steps), llM = modalitySchedule("Ll", steps);
+  const bool partial = M.meta("meta/partial", 0) != 0;
+  const bool inverse = M.meta("meta/inverseFolding", 0) != 0;
+  const double ptBb = M.meta("meta/partialTBb", 0), ptLl = M.meta("meta/partialTLl", 0);
+  const int fullNsteps = (int)M.meta("meta/fullNsteps", 0);
+  // 🔴 A PER-STEP FEATURE IS RECOMPUTED OR REPLAYED AND NEVER SILENTLY FROZEN, which is the export's own rule
+  // and the reason these are refusals rather than omissions. The chirality alignment fits a frame against the
+  // noisy alpha carbons every step and rotates the clean vectors (`cuda/rfd4p/src/chirality.cuh`), and a
+  // coordinate group's LABELS are permuted from a replayed `randperm` at the top of every step. Freezing either
+  // is a plausible structure generated from a feature the model was supposed to see move - so a job that needs
+  // one stops here by name instead.
+  const bool chiral = M.meta("meta/alignChirality", 0) != 0;
+  const int chirOff = (int)M.meta("meta/chirOff", -1);
+  const int frameWidth = (int)M.meta("meta/chiralFrameWidth", 0);
+  if (chiral && (chirOff < 0 || frameWidth <= 2 || !M.has("g/chir") || !M.has("g/chiralFrames")))
+    die("rfd4p: this job aligns chirality but its export carries no frames to align with");
+  // 🔴 A PERMUTATION OF ONE LABEL IS THE IDENTITY, which is why one group runs and two do not. The coordinate
+  // groups' labels are permuted from a replayed `randperm` at the top of every step, and this port does not
+  // apply it - so with two or more groups the feature would be FROZEN at the featuriser's own draw, which is the
+  // one thing the export's rule forbids. With one group there is nothing to permute and nothing is frozen.
+  // 🔴 AND cuda/rfd4p DOES NOT APPLY IT EITHER - `g/crdUniq` and `g/crdPerm` are exported and read by neither
+  // port, so a two-group job is frozen there without saying so. Worth a note upstream rather than copying.
+  if (M.meta("meta/nCrdGroups", 0) >= 2)
+    die("rfd4p: this job permutes %d coordinate-group labels a step and this port does not - with more than one "
+        "group that feature would be frozen rather than skipped (and cuda/rfd4p freezes it silently)",
+        (int)M.meta("meta/nCrdGroups", 0));
+  // 🔴 A PARTIAL RUN RUNS THE TAIL OF THE FULL SCHEDULE, NOT ITS OWN: its first time is the corruption time and
+  // every later one is a time an unconditional run would also reach.
+  Modality bbM = partial ? partialSchedule("Bb", steps, fullNsteps, ptBb) : modalitySchedule("Bb", steps);
+  Modality llM = partial ? partialSchedule("Ll", steps, fullNsteps, ptLl) : modalitySchedule("Ll", steps);
   if (bbM.center || llM.center)
     die("rfd4p: center_every_step is not implemented here (the reference and cuda/rfd4p run it)");
 
@@ -185,9 +289,95 @@ int generate(const std::string& genDir, const std::string& outPath) {
   const int* depths = M.hostI("g/depths");
   const int* stoch = M.hostI("g/stochastic");
 
-  std::vector<float> bb0((size_t)n * 3), ll0((size_t)n * latent);
-  size_t noiseAt = initialNoise(noise, bb0.data(), ll0.data(), n, latent, emitBb, emitLl, coordCond, moleculeIid,
-                               (float)M.meta("meta/centeringScale", 0.2));
+  const float scale = (float)M.meta("meta/centeringScale", 0.2);
+  std::vector<float> bb0((size_t)n * 3), ll0((size_t)n * latent), target;
+  size_t noiseAt = 0;
+  if (!partial) {
+    noiseAt = initialNoise(noise, bb0.data(), ll0.data(), n, latent, emitBb, emitLl, coordCond, moleculeIid, scale);
+  } else {
+    // 🔴 A PARTIAL RUN STARTS FROM THE INPUT, CORRUPTED - `corrupt_batch`, whose DRAW ORDER is not
+    // `sample_noise`'s: the encoder's reparameterisation, then the backbone's noise, then the latents', then the
+    // per-molecule offsets, where an unconditional run draws the backbone, the offsets, then the latents. One
+    // transposition shifts every later draw of the whole run, which is invisible in any one stage.
+    if (!M.has("e/feats") && !M.has("e/coorsNm"))
+      die("rfd4p: this job is partial diffusion and needs its encoder input (--encoder=<work>-enc)");
+    checkEncoderDims();
+    // the clean latents: the encoder's mean and log scale, reparameterised with this run's own eps
+    std::vector<int> attn, emitIdx, within;
+    const float* pad = M.hostF("in/mask");
+    for (int i = 0; i < n; ++i) if (M.hostF("in/attnMask")[i] != 0) attn.push_back(i);
+    {
+      int k = 0;
+      for (int i = 0; i < n; ++i) {
+        if (M.hostF("in/attnMask")[i] == 0) continue;
+        if (emitLl[i] != 0) { emitIdx.push_back(i); within.push_back(k); }
+        ++k;
+      }
+    }
+    const int na = (int)attn.size();
+    int* attnDev = uploadNew(attn.data(), attn.size());
+    float* ef = allocT<float>((size_t)n * ED_.feat);
+    encoderFeatures(n, M.hostF("e/coorsNm"), M.hostF("e/atomMask"), M.hostF("e/chainIid"), M.hostF("e/bondCounts"),
+                    M.hostI("e/element"), M.hostI("e/charge"), ef);
+    float* meanDev = allocT<float>((size_t)na * latent);
+    float* lsDev = allocT<float>((size_t)na * latent);
+    encode(ef, attnDev, na, meanDev, lsDev);
+    sync();
+    const float* mean = (const float*)host(meanDev);
+    const float* ls = (const float*)host(lsDev);
+    std::vector<float> x1Ll((size_t)n * latent, 0.f);
+    for (size_t e = 0; e < emitIdx.size(); ++e) {
+      const int tok = emitIdx[e], row = within[e];
+      for (int k = 0; k < latent; ++k) {
+        const float m = mean[(size_t)row * latent + k], l = ls[(size_t)row * latent + k];
+        x1Ll[(size_t)tok * latent + k] = (float)(m + (float)(noise[noiseAt + (size_t)tok * latent + k] * (float)std::exp(l)));
+      }
+    }
+    noiseAt += (size_t)n * latent;
+
+    // the clean backbone is the input's own alpha carbons, emit-masked
+    const float* caNm = M.hostF("in/caNm");
+    std::vector<float> x1Bb((size_t)n * 3, 0.f);
+    for (int i = 0; i < n; ++i)
+      if (emitBb[i] != 0)
+        for (int k = 0; k < 3; ++k) x1Bb[(size_t)i * 3 + k] = caNm[i * 3 + k];
+
+    // and the corruption: (1 - t) x0 + t x1, the backbone's x0 offset per molecule first
+    std::vector<float> x0Bb((size_t)n * 3), x0Ll((size_t)n * latent);
+    noiseAt += noisedBackbone(noise + noiseAt, n, emitBb, x0Bb.data());
+    for (int i = 0; i < n; ++i)
+      for (int k = 0; k < latent; ++k)
+        x0Ll[(size_t)i * latent + k] = emitLl[i] != 0 ? noise[noiseAt + (size_t)i * latent + k] : 0.f;
+    noiseAt += (size_t)n * latent;
+    noiseAt += groupOffsets(noise + noiseAt, n, emitBb, coordCond, moleculeIid, scale, x0Bb.data());
+    const float tB = (float)ptBb, tL = (float)ptLl;
+    for (int i = 0; i < n; ++i) {
+      if (emitBb[i] != 0)
+        for (int k = 0; k < 3; ++k)
+          bb0[(size_t)i * 3 + k] = (float)((float)((1.f - tB) * x0Bb[(size_t)i * 3 + k]) +
+                                           (float)(tB * x1Bb[(size_t)i * 3 + k]));
+      if (emitLl[i] != 0)
+        for (int k = 0; k < latent; ++k)
+          ll0[(size_t)i * latent + k] = (float)((float)((1.f - tL) * x0Ll[(size_t)i * latent + k]) +
+                                                (float)(tL * x1Ll[(size_t)i * latent + k]));
+    }
+    // 🔴 INVERSE FOLDING KEEPS THE CLEAN BACKBONE AND RE-NOISES IT EVERY STEP (the resampled forward marginal):
+    // the structure is given and only the sequence is designed, so the backbone is never integrated - it is
+    // drawn afresh at each step's time and handed back clean at the last.
+    if (inverse) {
+      target = x1Bb;
+      std::vector<float> xb((size_t)n * 3);
+      noiseAt += noisedBackbone(noise + noiseAt, n, emitBb, xb.data());
+      noiseAt += groupOffsets(noise + noiseAt, n, emitBb, coordCond, moleculeIid, scale, xb.data());
+      const float t0 = (float)bbM.ts[0];
+      for (int i = 0; i < n; ++i)
+        if (emitBb[i] != 0)
+          for (int k = 0; k < 3; ++k)
+            bb0[(size_t)i * 3 + k] = (float)((float)((1.f - t0) * xb[(size_t)i * 3 + k]) +
+                                             (float)(t0 * target[(size_t)i * 3 + k]));
+    }
+    (void)pad;
+  }
   float* xBb = uploadNew(bb0.data(), bb0.size());
   float* xLl = uploadNew(ll0.data(), ll0.size());
   float* eBb = uploadNew(emitBb, (size_t)n);
@@ -221,6 +411,23 @@ int generate(const std::string& genDir, const std::string& outPath) {
     // the step's own noised state into the sequence features - three columns at 0 and thirty-two at 3
     copy2d(seqF, (size_t)seqDim * 4, xBb, 3 * 4, 3 * 4, (size_t)n);
     copy2d(seqF + 3, (size_t)seqDim * 4, xLl, (size_t)latent * 4, (size_t)latent * 4, (size_t)n);
+    // 🔴 AND THE CHIRALITY, FITTED AGAINST THESE COORDINATES. The clean vectors rotated onto the directions
+    // their frame's neighbours have now: 18 columns at `chirOff`, recomputed because they describe the state the
+    // model is being shown rather than the structure the job came from.
+    if (chiral) {
+      sync();
+      std::vector<float> chirOut(M.len("g/chir"));
+      const float* clean = M.hostF("g/chir");
+      for (size_t k = 0; k < chirOut.size(); ++k) chirOut[k] = clean[k];
+      alignChirality(n, (const float*)host(xBb), clean, M.hostI("g/chiralFrames"), M.hostI("g/chiralOwners"),
+                     M.hostF("in/mask"), frameWidth, chirOut.data());
+      // into the 18 columns the featuriser put them at, a row at a time
+      std::vector<float> rows((size_t)n * 18);
+      for (int i = 0; i < n; ++i)
+        for (int k = 0; k < 18; ++k) rows[(size_t)i * 18 + k] = chirOut[(size_t)i * 18 + k];
+      float* dev = uploadNew(rows.data(), rows.size());
+      copy2d(seqF + chirOff, (size_t)seqDim * 4, dev, 18 * 4, 18 * 4, (size_t)n);
+    }
     // and the pair track's distance bins from the same coordinates
     RfdPairDistArgs pd{};
     pd.caNm = xBb; pd.pair = pairF; pd.rows = nn; pd.n = (uint)n;
@@ -277,6 +484,30 @@ int generate(const std::string& genDir, const std::string& outPath) {
       }
       run1d("rfd4p_sim_step", a.n, a);
     }
+    // the resampled target comes AFTER both modalities have stepped, and not after the last step, where the
+    // clean target is used as it is
+    if (inverse) {
+      sync();
+      std::vector<float> xb((size_t)n * 3);
+      float* x1b = (float*)host(x1Bb);
+      for (int i = 0; i < n; ++i)
+        for (int k = 0; k < 3; ++k) x1b[(size_t)i * 3 + k] = target[(size_t)i * 3 + k];
+      if (st + 1 == steps) {
+        upload(xBb, target.data(), target.size() * 4);
+      } else {
+        noiseAt += noisedBackbone(noise + noiseAt, n, emitBb, xb.data());
+        noiseAt += groupOffsets(noise + noiseAt, n, emitBb, coordCond, moleculeIid, scale, xb.data());
+        const float t1 = (float)bbM.ts[(size_t)st + 1];
+        std::vector<float> xt((size_t)n * 3, 0.f);
+        for (int i = 0; i < n; ++i)
+          if (emitBb[i] != 0)
+            for (int k = 0; k < 3; ++k)
+              xt[(size_t)i * 3 + k] = (float)((float)((1.f - t1) * xb[(size_t)i * 3 + k]) +
+                                              (float)(t1 * target[(size_t)i * 3 + k]));
+        upload(xBb, xt.data(), xt.size() * 4);
+      }
+    }
+
     // 🔴 EVERY STEP'S xt AND x1, NOT THE LAST STATE. A trajectory comparison that sees the end alone cannot say
     // which step went wrong - and the backbone's first step divides by t = 1e-3, so a difference the trunk makes
     // in the fifth digit arrives at the end a thousand times larger. The per-step record is what separates "the
@@ -331,10 +562,19 @@ int generate(const std::string& genDir, const std::string& outPath) {
                        M.has("g/coordGroup") ? M.hostI("g/coordGroup") : nullptr, attn.data(), na, coors.data(),
                        atomMask.data(), resType.data());
     double ca[3] = {0, 0, 0};
+    OutTables in;
+    if (M.has("g/outAtomize") && M.has("g/inName")) {
+      in.present = true;
+      in.atomize = M.hostI("g/outAtomize");
+      in.hetero = M.hostI("g/outHetero");
+      in.resName = M.hostI("g/outResName");
+      in.inName = M.hostI("g/inName");
+      in.inElem = M.hostI("g/inElem");
+    }
     const int atoms = writePdb(outPath, n, coors.data(), atomMask.data(), resType.data(),
                                M.has("g/outResId") ? M.hostI("g/outResId") : nullptr,
                                M.has("g/outChain") ? M.hostI("g/outChain") : nullptr,
-                               M.has("g/chainIid") ? M.hostI("g/chainIid") : nullptr, ca);
+                               M.has("g/chainIid") ? M.hostI("g/chainIid") : nullptr, ca, in);
     int emitted = 0;
     for (int i = 0; i < n; ++i) if (emitBb[i] != 0) emitted += 1;
     printf("generated %d residues, %d atoms over %d steps (%d sequence positions read out) -> %s\n", emitted, atoms,
