@@ -180,7 +180,22 @@ __global__ void swap01K(const real* __restrict__ in, real* __restrict__ out, int
   size_t o = ((size_t)b * A + a) * C + c;
   out[o] = accumulate ? out[o] + in[t] : in[t];
 }
+// (four channels a thread where C allows: one float a thread ran a pair transpose at ~450 GB/s)
+__global__ void swap01V4K(const float4* __restrict__ in, float4* __restrict__ out, int A, int B, int C4, bool accumulate) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)A * B * C4) return;
+  int c = t % C4; size_t ab = t / C4; int b = ab % B, a = (int)(ab / B);
+  size_t o = ((size_t)b * A + a) * C4 + c;
+  float4 v = in[t];
+  if (accumulate) { const float4 w = out[o]; v.x += w.x; v.y += w.y; v.z += w.z; v.w += w.w; }
+  out[o] = v;
+}
 inline void swap01(const real* in, real* out, int A, int B, int C, bool accumulate = false) {
+  if (sizeof(real) == 4 && C % 4 == 0 && ((uintptr_t)in & 15) == 0 && ((uintptr_t)out & 15) == 0) {
+    swap01V4K<<<blocks((size_t)A * B * C / 4), 256, 0, STREAM>>>(reinterpret_cast<const float4*>(in),
+                                                                reinterpret_cast<float4*>(out), A, B, C / 4, accumulate);
+    return;
+  }
   swap01K<<<blocks((size_t)A * B * C), 256, 0, STREAM>>>(in, out, A, B, C, accumulate);
 }
 // [R, C] <-> [C, R]
@@ -784,7 +799,8 @@ __global__ void colSumBfK(float* g, const __nv_bfloat162* d, size_t rows, int C2
 inline void colSumBf(float* g, const bf* d, size_t rows, int C, int ld) {   // (C, ld even; d 4-byte aligned)
   const int C2 = C / 2;
   const unsigned xb = (C2 + 31) / 32;
-  dim3 b(32, 8), gr(xb, (unsigned)std::min<size_t>((rows + 7) / 8, std::max(1u, 432 / xb)));
+  // (1728 blocks: 432 left a thread ~150 dependent rows at 65,536 x 512 - 0.15 ms where the bytes are 0.05)
+  dim3 b(32, 8), gr(xb, (unsigned)std::min<size_t>((rows + 7) / 8, std::max(1u, 1728 / xb)));
   colSumBfK<<<gr, b, 0, STREAM>>>(g, reinterpret_cast<const __nv_bfloat162*>(d), rows, C2, ld / 2);
 }
 // batched C_b = op(A_b) op(B_b) on bf16 operands (bmm's row-major convention), C float or bf16
@@ -858,6 +874,27 @@ __global__ void reluBwdBfK(bf* d, const bf* h, size_t n) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t < n && !(__bfloat162float(h[t]) > 0.f)) d[t] = __float2bfloat16(0.f);
 }
+// the relu's backward with the first layer's bias gradient in the same pass: d[r, c] = 0 where h <= 0, and g[c] +=
+// sum over rows of the masked d (colSumBfK's layout: two columns a thread, 8 row lanes)
+__global__ void reluBwdSumBfK(__nv_bfloat162* d, const __nv_bfloat162* h, float* g, size_t rows, int C2) {
+  __shared__ float2 part[8][32];
+  const int c = blockIdx.x * 32 + threadIdx.x;
+  float2 s = make_float2(0.f, 0.f);
+  if (c < C2)
+    for (size_t r = blockIdx.y * blockDim.y + threadIdx.y; r < rows; r += (size_t)gridDim.y * blockDim.y) {
+      const size_t i = r * C2 + c;
+      const float2 hv = __bfloat1622float2(h[i]);
+      float2 v = __bfloat1622float2(d[i]);
+      v.x = hv.x > 0.f ? v.x : 0.f; v.y = hv.y > 0.f ? v.y : 0.f;
+      d[i] = __floats2bfloat162_rn(v.x, v.y);
+      s.x += __bfloat162float(__float2bfloat16(v.x)); s.y += __bfloat162float(__float2bfloat16(v.y));
+    }
+  part[threadIdx.y][threadIdx.x] = s;
+  __syncthreads();
+  if (threadIdx.y || c >= C2 || !g) return;
+  for (int y = 1; y < 8; ++y) { s.x += part[y][threadIdx.x].x; s.y += part[y][threadIdx.x].y; }
+  atomicAdd(&g[2 * c], s.x); atomicAdd(&g[2 * c + 1], s.y);
+}
 // BF16: the normalised input and the hidden layer in bf16, both GEMMs on bf16 operands
 inline TransSave transForwardBf(const Transition& t, const real* x, real* out, size_t rows) {
   TransSave s; s.rows = rows; s.bf = true;
@@ -876,9 +913,19 @@ inline void transBackwardBf(Transition& t, const TransSave& s, const real* dout,
   const bf* db = toBf(dout, rows * t.l2.N);
   bf* dr = bfGet(n);
   linearBwdBf(t.l2, h, db, dr, rows);
-  reluBwdBfK<<<blocks(n), 256, 0, STREAM>>>(dr, h, n);
   real* dxn = ARENA.get(rows * t.ln.C);
-  linearBwdBf(t.l1, xn, dr, dxn, rows);
+  if (t.l1.N % 2 == 0) {   // the mask and l1's bias gradient in one pass
+    const int C2 = t.l1.N / 2;
+    const unsigned xb = (C2 + 31) / 32;
+    dim3 b(32, 8), gr(xb, (unsigned)std::min<size_t>((rows + 7) / 8, std::max(1u, 1728 / xb)));
+    reluBwdSumBfK<<<gr, b, 0, STREAM>>>(reinterpret_cast<__nv_bfloat162*>(dr), reinterpret_cast<const __nv_bfloat162*>(h),
+                                        t.l1.hasBias ? t.l1.b.g : nullptr, rows, C2);
+    Linear l1 = t.l1; l1.hasBias = false;   // (its bias gradient taken above)
+    linearBwdBf(l1, xn, dr, dxn, rows);
+  } else {
+    reluBwdBfK<<<blocks(n), 256, 0, STREAM>>>(dr, h, n);
+    linearBwdBf(t.l1, xn, dr, dxn, rows);
+  }
   lnBackward(t.ln, s.ln, dxn, dx, rows, accumulate);
 }
 #endif
