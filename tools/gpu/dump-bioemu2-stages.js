@@ -3,6 +3,7 @@
 //
 //     node tools/gpu-chrome.mjs tools/gpu/dump-bioemu2-stages.js --job=/tools/fixtures/bioemu2/6mrr.json \
 //       [--model=/model-bioemu2-int5] [--sigmas=160,16,1,0.05] [--mode=structure]
+//       [--contacts=/tools/fixtures/bioemu2/contacts.json]
 //
 // 🔴 THIS RUNS IN CHROME AND NOT IN NODE, THOUGH webgpu/node.js EXISTS. Dawn's node binding on this box has no
 // `device.tick` and its `mapAsync` never settles, so a node run exits 0 having written nothing - which is why
@@ -13,7 +14,7 @@
 // the first stage that disagrees is the one to read and a later one inherits it.
 import { Bioemu2Gpu } from "../../webgpu/bioemu2/network.js";
 import { bundleReader } from "../../shared/bioemu2/weights.js";
-import { featuriseBioemu2, bioemu2JobFromAf3Json } from "../../shared/bioemu2/featurise.js";
+import { featuriseBioemu2, bioemu2JobFromAf3Json, parseContacts } from "../../shared/bioemu2/featurise.js";
 import { fetchComponents, smilesTemplates } from "../../shared/bioemu2/inputs.js";
 
 const option = (args, name, fallback) => (args ?? []).find((a) => a.startsWith(`--${name}=`))?.slice(name.length + 3) ?? fallback;
@@ -39,6 +40,9 @@ export async function main(device, args) {
   const jobUrl = option(args, "job", "/tools/fixtures/bioemu2/6mrr.json");
   const model = option(args, "model", "/model-bioemu2-int5");
   const mode = option(args, "mode", "structure");
+  // the contact rows this reference had no path for: `contacts` was a hardcoded null here, so the one feature that
+  // only equilibrium mode carries was dumped by nothing and the Metal port's copy of it was compared against nothing
+  const contactsUrl = option(args, "contacts", null);
   const sigmas = option(args, "sigmas", "160,16,1,0.05").split(",").map(Number);
   // --half=off --trunk=f32: check-bioemu2-network.js's float32 arm (float32 weights decoded from the same codes, the
   // pair track in float32) - the one a float32 port is held to; the default is the shipped arm
@@ -48,7 +52,8 @@ export async function main(device, args) {
   const job = bioemu2JobFromAf3Json(await (await fetch(jobUrl)).json());
   const ccd = await fetchComponents(job, { local: (code) => `/tools/fixtures/ccd/${code}.cif` });
   const { features, atomKeys } = featuriseBioemu2(job, {
-    ccd, mode, contacts: null, smilesTemplates: await smilesTemplates(job) });
+    ccd, mode, contacts: contactsUrl ? parseContacts(await (await fetch(contactsUrl)).json()) : null,
+    smilesTemplates: await smilesTemplates(job) });
 
   const read = bundleReader(model);
   await read.prefetch();

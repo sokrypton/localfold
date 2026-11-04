@@ -158,6 +158,35 @@
 // timestamp attributes, over a 20 MB pair track touched by every stage, is most consistent with memory-system
 // work between dependent dispatches - and it is why the gate's fusion paid 5.2% while removing 28 dispatches
 // paid nothing: the fusion removed two whole PASSES over four pair-sized planes.
+// 🔴 AND THAT SCALING IS MEASURED NOW RATHER THAN INFERRED, WHICH TOOK A SWEEP AND TWO MORE CONTROLS.
+// `--job=<spec> --length=N` under `LF_GPUBUSY=1 LOCALFOLD_PROFILE=1` gives both halves of one run, so the
+// ratio is immune to this laptop's drift - which matters more than any absolute number here, because the same
+// 165-token job reads 225.7 ms a step cool and 571.7 hot. Four lengths, then the same four in REVERSE order:
+//
+//   tokens   kernels   busy/step   gap     gap/n^2 (us)      reverse pass
+//   54        18.3       49.4      31.1       10.67             13.55
+//   110       54.9      157.5     102.6        8.48             11.43
+//   165      124.6      358.0     233.4        8.57             13.81
+//   250      314.8      875.2     560.4        8.97             11.24
+//
+// The DISPATCH COUNT IS 390 AT ALL FOUR. So over a 21x range in n^2 the gap grows 18x while the count does
+// not move at all, and `gap / n^2` is flat to within the drift between the two passes (the reverse pass is
+// uniformly ~30% higher because the machine was hotter by then, and its own four are equally flat). A cost per
+// dispatch cannot produce that; the pair track's AREA can, and nothing else here has that shape.
+// Two further arms, because a constant-looking ratio invites two obvious wrong readings:
+//   * it is NOT the profiler's own unbatching. `LOCALFOLD_PROFILE=1` gives every dispatch its own command
+//     buffer, which is a real cost and would inflate the busy figure it is being compared against. Measured
+//     interleaved at 165 tokens, profiling OFF is **468.7 and 571.7 ms a step against ON's 430.9 and 543.0** -
+//     not faster, so the batching the profile gives up is not what the gap is made of.
+//   * and `busy / kernels` is NOT the constant it looks like. Interleaved half against `--f32` it reads 2.09,
+//     2.12, 2.25, 2.39 - but cool it is 1.83 (123.2 of 225.7) and hot 3.2, so it tracks TEMPERATURE, not the
+//     precision. Reading those four as a constant would say the timestamps undercount by a fixed factor, and
+//     the triangle gate refutes that outright: its profiled 30.91 ms over 14 calls of a 1024x27225x384 GEMM is
+//     300 GFLOP at **9.7 TFLOP/s against this GPU's measured 12.22 ceiling**, so a 2x undercount would put it
+//     past the ceiling. The big GEMMs' own timestamps are sound; the gap is beside them, not inside them.
+// What is left open is only the ATTRIBUTION - which kernel's traffic, and that needs Metal System Trace, which
+// an M5 will not give a compute encoder (the probe is in core.mm). The SHAPE is settled, and the shape is what
+// chooses the work: a pass removed from the pair track takes its profiled time AND its share of the gap.
 // 🔴 THE MERGES ARE KEPT, AND NOT AS A SPEED WIN: one GEMM where there were two (`to_qkv` [3D][D] and `to_g`
 // [D][D] stacked into [4D][D], whose natural layout IS core's packed q | k | v | g row, so the output stride
 // the two-GEMM form needed went with it), one dispatch where there were two (q's and k's RMSNorms, the only
