@@ -6,7 +6,8 @@ metal/rfd4p/localfold-rfd4p.
     python3 metal/rfd4p/gate.py --list               # what it would run, and where each input is
 
 🔴 WHY THIS EXISTS, AND WHAT IT ANSWERS THAT THE ORACLES DO NOT. The port's stage and trajectory oracles
-compare ARITHMETIC at the seams they name - 100 comparisons at 67, 183 and 250 tokens - and that is a
+compare ARITHMETIC at the seams they name - 100 comparisons at every length in `LENGTHS + LONG_LENGTHS`
+below, plus 67, 183 and 250 - and that is a
 different question from whether the port covers cuda/rfd4p's FEATURES. A symbol audit cannot answer it
 either: 15 of 100 top-level names are shared, because the two ports deliberately share no naming
 convention (`rmsNormK` is `rfd4p_rms_norm`, `triangle` is core's `gemmTriGate`, `mulSigmoidAddGate4HK` is
@@ -408,16 +409,33 @@ ARMS["presets"] = presets_arm
 # reference multiplies in double. The port's stage oracles existed only at 67, 183 and 250 - none of
 # them small - so the whole short end, where every edge case in this tree has lived, was unverified.
 # The CPU forward is cheap there (n = 7 builds 58 stages in seconds), so there is no reason not to.
-# 257 and 400 are left out on cost, not on principle: the stage oracle scales as n^3 and 250 took 1 h 47.
 LENGTHS = [1, 2, 7, 53, 100]
+# 🔴 AND THE TWO EXPENSIVE ONES ARE IN THE ARM'S SCOPE RATHER THAN OUT OF IT. 257 is the length the
+# reference gate's own note calls one ulp out, which makes it the most interesting of the seven and not
+# the least; 400 is the largest it names. Their stage oracles cost what the n^3 CPU forward costs (250
+# took 1 h 47, so ~2 h and ~7 h), which is more than a gate may spend inline - so this arm RUNS them
+# when the reference is on disk and reports them as NOT VERIFIED when it is not, naming the command that
+# builds one. It never builds one itself and never counts an unbuilt length as a pass: a skipped length
+# reported green is the vacuous row this tree warns about, and an unstated gap is worse than a stated one.
+LONG_LENGTHS = [257, 400]
+# 🔴 MEASURED, AND 257 WAS THE ONE WORTH THE TWO HOURS: **100 comparisons green at n = 1, 2, 7, 53, 100
+# and 257**, so the length the reference gate's own note singles out as one ulp out in ITS featuriser is
+# exact in this port's stage oracle - its `0.2f` centering scale is not a difference this port inherits.
+# With the port's own 67, 183 and 250, the arithmetic is verified at eight lengths from 1 to 257. 400's
+# reference is ~7 h of CPU forward and is the one row still unbuilt.
 
 
 def lengths_arm():
     """The stage oracle at the short lengths, where this tree's ulp bugs have always been."""
-    bad, rows = [], []
-    for n in LENGTHS:
+    bad, rows, pending = [], [], []
+    for n in LENGTHS + LONG_LENGTHS:
         d = os.path.join(WORK, f"len{n}")
         if not os.path.exists(os.path.join(d + "-o", "model.idx")):
+            if n in LONG_LENGTHS:
+                # NOT a pass and not a failure: an unbuilt reference is a gap, and it is named
+                pending.append(n)
+                rows.append(f"n{n}:unbuilt")
+                continue
             e = run(["node", "--max-old-space-size=8192", EXPORTER, d, f"--length={n}",
                      f"--oracle={d}-o", "--generate", "--gen-oracle", "--steps=2",
                      f"--checkpoint={CHECKPOINT}"])
@@ -431,8 +449,15 @@ def lengths_arm():
             rows.append(f"n{n}:FAILED")
         else:
             rows.append(f"n{n}:{m.group(1)}")
-    return not bad, ("stage oracle at " + " ".join(rows)
-                     + (f"  FAILED: {', '.join(bad)}" if bad else ""))
+    note = "stage oracle at " + " ".join(rows)
+    if pending:
+        note += ("  NOT VERIFIED at " + ",".join(str(n) for n in pending)
+                 + f" - build one with: node --max-old-space-size=12288 {os.path.relpath(EXPORTER, REPO)}"
+                 + f" {os.path.join(WORK, 'len<n>')} --length=<n> --oracle=<that>-o --generate"
+                 + " --gen-oracle --steps=2 --checkpoint=" + os.path.relpath(CHECKPOINT, REPO))
+    if bad:
+        note += f"  FAILED: {', '.join(bad)}"
+    return not bad, note
 
 
 ARMS["lengths"] = lengths_arm
