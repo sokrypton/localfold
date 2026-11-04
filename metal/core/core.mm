@@ -462,6 +462,18 @@ void gpuBusySnapshot(double* gpu, double* kern, long* n) {
 }
 }  // namespace
 
+// 🔴 AND PER-DISPATCH TIMING INSIDE A BATCHED BUFFER IS NOT AVAILABLE ON THIS HARDWARE, established by trying
+// it rather than assumed. `MTLComputeCommandEncoder sampleCountersInBuffer:` is the way to timestamp each
+// dispatch in the buffer a port really submits - the profile's buffer-per-dispatch form changes the thing it
+// measures - and an Apple M5 answers `supportsCounterSampling:` with **AtStageBoundary yes, AtDrawBoundary no,
+// AtDispatchBoundary NO, AtTileDispatchBoundary no, AtBlitBoundary no**, with `timestamp` its only counter set.
+// A stage boundary is a render encoder's, so a compute encoder asserts outright:
+//   "sampleCountersInBuffer:atSampleIndex:withBarrier not supported on this device"
+// (it is the `supportsCounterSampling:` answer that misleads - it says yes for a point a compute encoder
+// cannot use). So the gap between a step's GPU-busy time and the sum of its per-dispatch times cannot be
+// attributed from code on this Mac; it wants Xcode's Metal System Trace. The attempt was written and is not
+// kept: a branch that cannot run on the hardware it was written for is how a port grows a second, wrong
+// implementation.
 void gpuBusyReport(const char* what, int over) {
   double gpu = 0, kern = 0; long n = 0;
   gpuBusySnapshot(&gpu, &kern, &n);

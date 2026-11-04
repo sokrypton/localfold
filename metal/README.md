@@ -520,12 +520,27 @@ unexercised check: those cases are defined with `ref=None` (there is no crystal
 for a designed duplex or for AF3's kitchen sink) and the gate asserts them on
 pLDDT within `TOL_PLDDT` **and on ligand and nucleic BOND geometry within
 0.01 A**, which is the `ligand 0.043 nucleic 0.045` in those rows. metal/bioemu2
-is held to **two** webgpu reference dumps now, not one: 6mrr at 71 tokens (worst
-stage 8.4e-3) and `6mrr-gol-sep` at 86 - a glycerol and a phosphoserine, so a
-ligand and an atomised residue - at 9.3e-3, the same level. A third, 5caj at 255
-tokens, cannot be dumped at all: `tools/dump-bioemu2-webgpu.mjs` serialises the
-stages through a JSON string and V8 refuses at that size (`RangeError: Invalid
-string length`), which is the tool's limit and not the port's.
+is held to **five** webgpu reference dumps now, not one, and they were chosen for
+what they cover rather than for size:
+
+| reference | what it reaches | worst stage |
+|---|---|---|
+| `6mrr` (71 tokens) | a plain protein | 8.4e-3 |
+| `6mrr-gol-sep` (86) | a ligand and an atomised residue (glycerol, phosphoserine) | 9.3e-3 |
+| `heteromer` | two different chains | 5.1e-3 |
+| `rna-dna` | nucleic acids | 8.3e-3 |
+| `6mrr-nag-ret` | a glycan and a cofactor | 6.1e-3 |
+
+🔴 **AND A SIXTH CANNOT BE PRODUCED, FOR A REASON IN THE TOOL.** `5caj` at 255
+tokens needs ~400 MB of stages, and `tools/gpu/dump-bioemu2-stages.js` hands
+them back as ONE base64 string: its own comment already records chunking `btoa`
+because "btoa over a 150 MB string at once throws", but the chunks are still
+concatenated, and at this size V8 refuses the result (`RangeError: Invalid
+string length` at that line). The Node side would hit the same wall, since it
+does `Buffer.concat(chunks).toString("utf8")`. Fixing it means streaming - the
+page logging each chunk and the reader decoding straight to the file, never
+holding one big string - which is a change to the transport rather than to any
+port, and is not done here.
 
 ### What the mapping proves, and what the arms do
 
