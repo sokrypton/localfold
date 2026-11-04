@@ -11,7 +11,7 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-460 tools. `tools/fixtures/` is data and is not listed.
+461 tools. `tools/fixtures/` is data and is not listed.
 
 ## `tools/gpu/` - the WebGPU lane (217)
 
@@ -336,7 +336,7 @@ and turning it into a bundle.
 - **`safetensors_read.py`** - Read a .safetensors file into numpy arrays, without the safetensors package.
 - **`vector-quantise.py`** - Is a codebook worth a new decoder? Scalar codes against vector ones, at 2 bits.
 
-## `tools/` - everything else (155)
+## `tools/` - everything else (156)
 
 CPU checkers, the export and quantisation pipeline, the page drivers that
 go through CDP, and the deploy.
@@ -377,6 +377,7 @@ go through CDP, and the deploy.
 - **`check-esmfold2-trunk.js`** - Does LocalFold's pairformer arithmetic compute ESMFold2's trunk?
 - **`check-job-archive.py`** - Does a fold archive describe the AlphaFold 3 job that was handed in?
 - **`check-ligand-path.mjs`** - Every AF3-lineage model folds a LIGAND, and its bonds are the right length.
+- **`check-metal-rfd4p-coverage.py`** - Every top-level symbol of the cuda/rfd4p files metal/rfd4p RE-IMPLEMENTS, and what covers it.
 - **`check-metal-rfd4p-writer.py`** - The Metal port's structure writer and design metrics against the PAGE's, on the same sample.
 - **`check-model-pending.py`** - One fold at a time, and a model row that starts a new session.
 - **`check-model-switch.py`** - Ten models folded in ONE page, as a reader switching models does.

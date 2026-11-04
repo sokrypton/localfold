@@ -391,6 +391,42 @@ def presets_arm():
 ARMS["presets"] = presets_arm
 
 
+# 🔴 THE LENGTHS THIS TREE ALREADY KNOWS ARE DANGEROUS, not round numbers. cuda/rfd4p/gate.py's
+# `FEATURISE_LENGTHS` is [1, 2, 7, 53, 100, 257, 400] and says why: its featuriser "was exact at 53 and
+# 100 residues and one ulp out at 1, 2, 7 and 257", the centering scale written `0.2f` where the
+# reference multiplies in double. The port's stage oracles existed only at 67, 183 and 250 - none of
+# them small - so the whole short end, where every edge case in this tree has lived, was unverified.
+# The CPU forward is cheap there (n = 7 builds 58 stages in seconds), so there is no reason not to.
+# 257 and 400 are left out on cost, not on principle: the stage oracle scales as n^3 and 250 took 1 h 47.
+LENGTHS = [1, 2, 7, 53, 100]
+
+
+def lengths_arm():
+    """The stage oracle at the short lengths, where this tree's ulp bugs have always been."""
+    bad, rows = [], []
+    for n in LENGTHS:
+        d = os.path.join(WORK, f"len{n}")
+        if not os.path.exists(os.path.join(d + "-o", "model.idx")):
+            e = run(["node", "--max-old-space-size=8192", EXPORTER, d, f"--length={n}",
+                     f"--oracle={d}-o", "--generate", "--gen-oracle", "--steps=2",
+                     f"--checkpoint={CHECKPOINT}"])
+            if e.returncode:
+                bad.append(f"n={n} (export)")
+                continue
+        r = run([BIN, d, f"--bundle={BUNDLE}", f"--oracle={d}-o", f"--gen={d}-gen"])
+        m = re.search(r"all green: (\d+) comparisons", r.stdout + r.stderr)
+        if r.returncode or not m:
+            bad.append(f"n={n}")
+            rows.append(f"n{n}:FAILED")
+        else:
+            rows.append(f"n{n}:{m.group(1)}")
+    return not bad, ("stage oracle at " + " ".join(rows)
+                     + (f"  FAILED: {', '.join(bad)}" if bad else ""))
+
+
+ARMS["lengths"] = lengths_arm
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--only", default="")
