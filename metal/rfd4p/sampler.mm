@@ -338,7 +338,10 @@ int generate(const std::string& genDir, const std::string& outPath, int designs,
   float* seqF = allocT<float>((size_t)n * D_.seqDim);
   float* pairF = allocT<float>(nn * D_.pairDim);
   float* sAct = allocT<float>((size_t)n * D_.D);
-  float* zAct = allocT<float>(nn * D_.P);
+  // the pair track in the arm's own precision: half halves what the gated add, the transition and the row
+  // norms move, and those are three of the six most expensive dispatches of a step
+  Z zAct;
+  if (HALF) zAct.h = allocT<half>(nn * D_.P); else zAct.f = allocT<float>(nn * D_.P);
   float* vBb = allocT<float>((size_t)n * 3);
   float* vLl = allocT<float>((size_t)n * latent);
   float* logits = allocT<float>((size_t)n * 147);
@@ -357,6 +360,8 @@ int generate(const std::string& genDir, const std::string& outPath, int designs,
   float* pairCondBuf = allocT<float>((size_t)M.len("g/pairCond") / std::max(steps, 1));
   float* xBb = allocT<float>((size_t)n * 3);
   float* xLl = allocT<float>((size_t)n * latent);
+  float* x1Bb = allocT<float>((size_t)n * 3);
+  float* x1Ll = allocT<float>((size_t)n * latent);
   float* eBb = uploadNew(emitBb, (size_t)n);
   float* eLl = uploadNew(emitLl, (size_t)n);
 
@@ -481,14 +486,11 @@ int generate(const std::string& genDir, const std::string& outPath, int designs,
     GATE_CHECK("initial noise latents", "gen/x0Ll", xLl, (size_t)n * latent, GATE_TRAJ_BOUND);
   }
 
-  float* s = allocT<float>((size_t)n * D_.D);
-  float* z = allocT<float>(nn * D_.P);
-  float* vBb = allocT<float>((size_t)n * 3);
-  float* vLl = allocT<float>((size_t)n * latent);
-  float* logits = allocT<float>((size_t)n * 147);
-  float* insertion = allocT<float>(nn);
-  float* x1Bb = allocT<float>((size_t)n * 3);
-  float* x1Ll = allocT<float>((size_t)n * latent);
+  // 🔴 THE HOISTED BUFFERS, NOT A SECOND SET A DESIGN. These were allocated again inside the loop after the
+  // campaign work moved them out - which leaked a design's worth of activations per design and, with the pair
+  // track typed, stopped compiling. A campaign's point is that the second design pays for nothing.
+  float* s = sAct;
+  Z z = zAct;
 
   // LOCALFOLD_PROFILE=1: every labelled dispatch in its own command buffer, its GPU time summed by label - an
   // upper bound, for proportions. One step is profiled rather than all sixty: they are the same work.
@@ -548,7 +550,7 @@ int generate(const std::string& genDir, const std::string& outPath, int designs,
     // RMSNorm(0) is 0, so the first cycle's input is the init product. A step that inherited the step before
     // it would be a different network.
     fill(s, 0, (size_t)n * D_.D * 4);
-    fill(z, 0, nn * D_.P * 4);
+    fill(z.h ? (void*)z.h : (void*)z.f, 0, nn * D_.P * (z.h ? 2 : 4));
     // 🔴 NO `sync()` HERE, AND THAT IS WORTH A THIRD OF A STEP'S WALL CLOCK. One was added while hunting a
     // nondeterminism that turned out to be a missing barrier in the attention; it made the host wait for the GPU
     // to drain sixty times a generation, so the GPU idled while the next step was prepared. `fill` is already
@@ -617,7 +619,7 @@ int generate(const std::string& genDir, const std::string& outPath, int designs,
       printf("  trace addr: seqF %%16=%zu pairF %%16=%zu cond0 %%16=%zu s %%16=%zu z %%16=%zu "
              "in/seq %%16=%zu w/first %%16=%zu\n",
              (size_t)((uintptr_t)seqF % 16), (size_t)((uintptr_t)pairF % 16), (size_t)((uintptr_t)cond0Buf % 16),
-             (size_t)((uintptr_t)s % 16), (size_t)((uintptr_t)z % 16),
+             (size_t)((uintptr_t)s % 16), (size_t)((uintptr_t)(z.h ? (void*)z.h : (void*)z.f) % 16),
              (size_t)((uintptr_t)M.f("in/seq") % 16),
              (size_t)((uintptr_t)M.f("w/nn.cond_factory.linear_out.weight") % 16));
     }

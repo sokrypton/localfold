@@ -128,30 +128,41 @@ void encoderFeatures(int n, const float* coorsNm, const float* atomMask, const f
 // eps * exp(logScale); the gate's arm is the deterministic one (z = mean), as the reference's is.
 void encode(const float* feats, const int* attnIdx, int na, float* mean, float* logScale);
 
+// 🔴 THE PAIR TRACK, IN WHICHEVER PRECISION THE ARM KEEPS IT, and it is passed as a pair of pointers rather than
+// as one because exactly which is set decides what every kernel that touches it does. It is the most-read buffer
+// in the port - the gated add, the transition, the row norms and the hadamard write all go through it - so its
+// width is the port's bandwidth: at 183 tokens it is 51 MB in float and 26 in half, and three of the six
+// most expensive dispatches of a step read and write it.
+struct Z {
+  float* f = nullptr;
+  half* h = nullptr;
+  bool half_() const { return h != nullptr; }
+};
+
 // ---------------------------------------------------------------- trunk.mm
 // c = transition_c_2(transition_c_1(cond_factory(features))) over `rows` conditioning rows
 void condC(const float* condFeats, float* c, size_t rows);
 // s_init = init_repr_factory(seq features)
 void initSingle(const float* seqFeats, float* sInit);
 // z_init = AdaLN(RMSNorm(pair_repr_builder(pair features)), RMSNorm(pair cond)) - the pair conditioning is one row
-void initPair(const float* pairFeats, const float* pairCondFeats, float* zInit);
+void initPair(const float* pairFeats, const float* pairCondFeats, Z zInit);
 // one `MultiheadAttnAndTransition` block, in place on `s`: the pair-biased gated attention under its adaLN and
 // output scale, then the SwiGLU transition under its own, each with a residual
 // `cH`: the conditioning in half, where the caller has it - then the two output scales go through metal/core's
 // fused gated add (`x += y sigmoid(c Wg)`) instead of a GEMM and a pass of their own
-void tokenLayer(int layer, float* s, const float* z, const float* c, const half* cH = nullptr,
+void tokenLayer(int layer, float* s, Z z, const float* c, const half* cH = nullptr,
                 const float* gb = nullptr);
 // one `PairReprUpdate`, in place on `z`: the hadamard pair write from the single track, the outgoing and incoming
 // triangle multiplications, and the pair transition - each with a residual
-void pairUpdate(int layer, const float* s, float* z);
+void pairUpdate(int layer, const float* s, Z z);
 // the finished trunk's outputs: the alpha carbons (3), the local latents (32), the sequence logits (147), and the
 // insertion logits (n x n, or null for none)
 void heads(const float* s, float* bbCa, float* localLatents, float* logits, float* insertion);
 // one cycle's input: s = s_init + Lin(RMSNorm(s)), z = z_init + Lin(RMSNorm(z))
-void recycleIn(const float* sInit, const float* zInit, float* s, float* z);
+void recycleIn(const float* sInit, Z zInit, float* s, Z z);
 // the whole trunk over one step's features; `s` and `z` must start at zero, `insertion` may be null
 void trunkForward(const float* seqF, const float* cond0, const float* cond1, const float* pairF,
-                  const float* pairCondF, int nRecycle, float* s, float* z, float* bbCa, float* latents,
+                  const float* pairCondF, int nRecycle, float* s, Z z, float* bbCa, float* latents,
                   float* logits, float* insertion);
 
 // ---------------------------------------------------------------- sampler.mm

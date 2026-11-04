@@ -361,7 +361,7 @@ kernel void rfd4p_mul_sigmoid_hh(LF_ARGS(RfdMulSigmoidHHArgs)) {
 kernel void rfd4p_add_h(LF_ARGS(RfdAddHArgs)) {
   const ulong t = LF_INDEX;
   if (t >= a.n) return;
-  a.y[t] = (half)((float)a.a[t] + a.b[t]);
+  a.y[t] = (half)((float)a.a[t] + (float)a.b[t]);
 }
 
 kernel void rfd4p_transpose_h(LF_ARGS(RfdTransposeHArgs)) {

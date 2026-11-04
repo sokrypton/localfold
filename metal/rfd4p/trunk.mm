@@ -34,7 +34,7 @@ void initSingle(const float* seqFeats, float* sInit) {
   lin(seqFeats, "nn.init_repr_factory.linear_out.weight", sInit, D_.n, D_.seqDim, D_.D);
 }
 
-void initPair(const float* pairFeats, const float* pairCondFeats, float* zInit) {
+void initPair(const float* pairFeats, const float* pairCondFeats, Z zInit) {
   const int P = D_.P, C = D_.C;
   const size_t nn = (size_t)D_.n * D_.n;
   const std::string PB = "nn.pair_repr_builder.";
@@ -63,12 +63,12 @@ void initPair(const float* pairFeats, const float* pairCondFeats, float* zInit) 
   // input again (`applyNorm(x, ..., null, null)`) before scaling it, so z_init is normed TWICE: once by `ln_out`
   // above and once here. Fused into the scale so the second normalised copy is never written.
   RfdAdalnArgs a{};
-  a.x = normed; a.y = zInit; a.gamma = gamma; a.beta = beta;
+  a.x = normed; a.y = zInit.f; a.yh = zInit.h; a.gamma = gamma; a.beta = beta;
   a.rows = nn; a.C = P; a.eps = 1e-5f;
   run("rfd4p_adaln_bcast", grid1d((nn + 7) / 8, 1), 256, a);
 }
 
-void tokenLayer(int layer, float* s, const float* z, const float* c, const half* cH, const float* gb) {
+void tokenLayer(int layer, float* s, Z z, const float* c, const half* cH, const float* gb) {
   const int n = D_.n, D = D_.D, P = D_.P, H = D_.H, dimHead = D_.D / D_.H;
   const size_t nn = (size_t)n * n;
   const std::string L = "nn.transformer_layers." + std::to_string(layer) + ".";
@@ -114,13 +114,13 @@ void tokenLayer(int layer, float* s, const float* z, const float* c, const half*
   if (HALF) {
     half* znh = scratch<half>("tl.znh", nn * P);
     RfdRmsArgs r{};
-    r.x = z; r.y = nullptr; r.yh = znh; r.w = M.f("w/" + MHA + "pair_norm.weight");
+    r.x = z.f; r.xh = z.h; r.y = nullptr; r.yh = znh; r.w = M.f("w/" + MHA + "pair_norm.weight");
     r.rows = nn; r.C = P; r.eps = 1e-5f;
     run("rfd4p_rms_norm", grid1d((nn + 7) / 8, 1), 256, r);
     linHF(znh, MHA + "to_bias.weight", bias, nn, P, H);
   } else {
     float* zn = scratch<float>("tl.zn", nn * P);
-    rmsNorm(z, zn, nn, P, M.f("w/" + MHA + "pair_norm.weight"));
+    rmsNorm(z.f, zn, nn, P, M.f("w/" + MHA + "pair_norm.weight"));
     lin(zn, MHA + "to_bias.weight", bias, nn, P, H);
   }
 
@@ -196,7 +196,7 @@ void tokenLayer(int layer, float* s, const float* z, const float* c, const half*
 // 🔴 TWO OF A PAIR UPDATE'S THREE LayerNorms ARE SOMEBODY ELSE'S EPILOGUE: the outgoing triangle's add produces
 // the pair track that the incoming triangle immediately norms, and the incoming one's produces what the
 // transition norms. Emitting them costs the GEMM nothing and saves a pass over 25 MB each.
-static bool triangle(const std::string& prefix, float* z, bool outgoing, const half* znPre = nullptr,
+static bool triangle(const std::string& prefix, Z z, bool outgoing, const half* znPre = nullptr,
                      const float* nextScale = nullptr, const float* nextOffset = nullptr,
                      half* nextOut = nullptr) {
   const int n = D_.n, P = D_.P, T = D_.T;
@@ -228,7 +228,8 @@ static bool triangle(const std::string& prefix, float* z, bool outgoing, const h
     half* zn = const_cast<half*>(znPre);
     if (!zn) {
       zn = scratch<half>(outgoing ? "tri.znHo" : "tri.znHi", nn * P);
-      layerNorm(z, zn, nn, P, M.f(W + "layer_norm_in.weight"), opt(prefix + ".layer_norm_in.bias"));
+      if (z.h) layerNorm(z.h, zn, nn, P, M.f(W + "layer_norm_in.weight"), opt(prefix + ".layer_norm_in.bias"));
+      else layerNorm(z.f, zn, nn, P, M.f(W + "layer_norm_in.weight"), opt(prefix + ".layer_norm_in.bias"));
     }
     // 🔴 AND THE OTHER ORIENTATION MEASURES THE SAME, which is worth recording because the reason to try it was
     // good and wrong. Channel-major has an M dimension of 4T = 1024, so core's 64-row tiles re-read the whole
@@ -299,12 +300,15 @@ static bool triangle(const std::string& prefix, float* z, bool outgoing, const h
     // when nothing failed. The call always runs; off the matrix units it is lf_gemm's extended instance, which
     // is slower there and not wrong.
     if (!fusedGateFits(P)) die("rfd4p: the triangle's gate cannot be fused at width %d", P);
-    return gemmGatedAdd(zn, weightT(prefix + ".linear_g.weight"), proj, z, nn, P, P,
+    if (z.h)
+      return gemmGatedAdd(zn, weightT(prefix + ".linear_g.weight"), proj, z.h, nn, P, P,
+                          opt(prefix + ".linear_g.bias"), nextOut, nextScale, nextOffset, 1e-5f);
+    return gemmGatedAdd(zn, weightT(prefix + ".linear_g.weight"), proj, z.f, nn, P, P,
                         opt(prefix + ".linear_g.bias"), nextOut, nextScale, nextOffset, 1e-5f);
   }
 
   float* zn = scratch<float>("tri.zn", nn * P);
-  layerNorm(z, zn, nn, P, M.f(W + "layer_norm_in.weight"), opt(prefix + ".layer_norm_in.bias"));
+  layerNorm(z.f, zn, nn, P, M.f(W + "layer_norm_in.weight"), opt(prefix + ".layer_norm_in.bias"));
 
   float* aP = scratch<float>("tri.aP", nn * T);
   float* aG = scratch<float>("tri.aG", nn * T);
@@ -346,12 +350,12 @@ static bool triangle(const std::string& prefix, float* z, bool outgoing, const h
   lin(xn, prefix + ".linear_z.weight", proj, nn, T, P, opt(prefix + ".linear_z.bias"));
   lin(zn, prefix + ".linear_g.weight", gate, nn, P, P, opt(prefix + ".linear_g.bias"));
   RfdMulSigmoidArgs ms{};
-  ms.x = proj; ms.g = gate; ms.y = z; ms.n = nn * P;
+  ms.x = proj; ms.g = gate; ms.y = z.f; ms.n = nn * P;
   run1d("rfd4p_mul_sigmoid", nn * P, ms);
   return false;
 }
 
-void pairUpdate(int layer, const float* s, float* z) {
+void pairUpdate(int layer, const float* s, Z z) {
   const int n = D_.n, D = D_.D, P = D_.P;
   const size_t nn = (size_t)n * n;
   const std::string Q = "nn.pair_update_layers." + std::to_string(layer) + ".";
@@ -361,10 +365,16 @@ void pairUpdate(int layer, const float* s, float* z) {
   layerNorm(s, xn, n, D, M.f("w/" + Q + "layer_norm_in.weight"), M.f("w/" + Q + "layer_norm_in.bias"));
   float* pij = scratch<float>("pu.pij", (size_t)n * 2 * P);
   lin(xn, Q + "linear_x.weight", pij, n, D, 2 * P);
-  RfdPairWriteArgs pw{};
-  pw.pair = z; pw.pij = pij; pw.z = z; pw.rows = nn; pw.n = (uint)n; pw.P = (uint)P;
   // a threadgroup a pair row (see the kernel): the row index is the group's, not a division a thread
-  dispatch("rfd4p_pair_write", &pw, sizeof pw, grid1d(nn, 1), 256, 0, "rfd4p_pair_write");
+  if (z.h) {
+    RfdPairWriteHArgs pw{};
+    pw.pair = z.h; pw.pij = pij; pw.z = z.h; pw.rows = nn; pw.n = (uint)n; pw.P = (uint)P;
+    dispatch("rfd4p_pair_write_h", &pw, sizeof pw, grid1d(nn, 1), 256, 0, "rfd4p_pair_write_h");
+  } else {
+    RfdPairWriteArgs pw{};
+    pw.pair = z.f; pw.pij = pij; pw.z = z.f; pw.rows = nn; pw.n = (uint)n; pw.P = (uint)P;
+    dispatch("rfd4p_pair_write", &pw, sizeof pw, grid1d(nn, 1), 256, 0, "rfd4p_pair_write");
+  }
 
   // ---- the two triangles, each added in, the second reading what the first wrote - and each asking the GEMM
   // that writes the pair track to emit the norm of it that the next stage wants
@@ -383,7 +393,10 @@ void pairUpdate(int layer, const float* s, float* z) {
   const int hidden = (int)M.len("w/" + TR + "linear_1.bias");
   if (HALF) {
     half* tn = tnBuf;
-    if (!haveTn) layerNorm(z, tn, nn, P, M.f("w/" + TR + "layer_norm.weight"), M.f("w/" + TR + "layer_norm.bias"));
+    if (!haveTn) {
+      if (z.h) layerNorm(z.h, tn, nn, P, M.f("w/" + TR + "layer_norm.weight"), M.f("w/" + TR + "layer_norm.bias"));
+      else layerNorm(z.f, tn, nn, P, M.f("w/" + TR + "layer_norm.weight"), M.f("w/" + TR + "layer_norm.bias"));
+    }
     half* h = scratch<half>("pu.hh", nn * (size_t)hidden);
     linH(tn, TR + "linear_1.weight", h, nn, P, hidden, M.f("w/" + TR + "linear_1.bias"), true);
     float* tr = scratch<float>("pu.tr", nn * P);
@@ -391,7 +404,8 @@ void pairUpdate(int layer, const float* s, float* z) {
     // separate add was 9.2% of a step across the updates.
     Gemm g{};
     g.X = h; g.tx = F16; g.W = M.h("w/" + TR + "linear_2.weight"); g.tw = F16; g.transW = true;
-    g.Y = z; g.ty = F32; g.Yin = z; g.beta = 1.f;
+    if (z.h) { g.Y = z.h; g.ty = F16; g.Yin = z.h; } else { g.Y = z.f; g.ty = F32; g.Yin = z.f; }
+    g.beta = 1.f;
     g.rows = nn; g.in = hidden; g.out = P;
     g.bias = M.f("w/" + TR + "linear_2.bias"); g.tbias = F32;
     g.label = "pair-transition-out";
@@ -400,12 +414,12 @@ void pairUpdate(int layer, const float* s, float* z) {
     return;
   }
   float* tn = scratch<float>("pu.tn", nn * P);
-  layerNorm(z, tn, nn, P, M.f("w/" + TR + "layer_norm.weight"), M.f("w/" + TR + "layer_norm.bias"));
+  layerNorm(z.f, tn, nn, P, M.f("w/" + TR + "layer_norm.weight"), M.f("w/" + TR + "layer_norm.bias"));
   float* h = scratch<float>("pu.h", nn * (size_t)hidden);
   lin(tn, TR + "linear_1.weight", h, nn, P, hidden, M.f("w/" + TR + "linear_1.bias"), true);
   float* tr = scratch<float>("pu.tr", nn * P);
   lin(h, TR + "linear_2.weight", tr, nn, hidden, P, M.f("w/" + TR + "linear_2.bias"));
-  add(z, tr, nn * P);
+  add(z.f, tr, nn * P);
 }
 
 // The three heads and the insertion logits, each a norm and a projection of the finished single track.
@@ -441,7 +455,7 @@ void heads(const float* s, float* bbCa, float* localLatents, float* logits, floa
 // has no bias) and the projections have none either, so the delta is zero and the cycle's input is the init
 // product itself. Running it anyway is what keeps the two paths one path - and the caller may skip it on the
 // first cycle because it is a measured no-op, not because the code would be wrong.
-void recycleIn(const float* sInit, const float* zInit, float* s, float* z) {
+void recycleIn(const float* sInit, Z zInit, float* s, Z z) {
   const int n = D_.n, D = D_.D, P = D_.P;
   const size_t nn = (size_t)n * n;
   float* sn = scratch<float>("rc.sn", (size_t)n * D);
@@ -451,12 +465,26 @@ void recycleIn(const float* sInit, const float* zInit, float* s, float* z) {
   copy(s, sInit, (size_t)n * D * 4);
   add(s, sd, (size_t)n * D);
 
+  if (z.h) {
+    // the cycle's own norm and projection, in half like the track they read and write
+    half* zn = scratch<half>("rc.znH", nn * P);
+    RfdRmsArgs r{};
+    r.xh = z.h; r.yh = zn; r.w = M.f("w/nn.z_cycle_norm.weight");
+    r.rows = nn; r.C = P; r.eps = 1e-5f;
+    run("rfd4p_rms_norm", grid1d((nn + 7) / 8, 1), 256, r);
+    half* zd = scratch<half>("rc.zdH", nn * P);
+    linH(zn, "nn.z_cycle_proj.weight", zd, nn, P, P);
+    RfdAddHArgs a{};
+    a.a = zInit.h; a.b = zd; a.y = z.h; a.n = nn * P;
+    run1d("rfd4p_add_h", nn * P, a);
+    return;
+  }
   float* zn = scratch<float>("rc.zn", nn * P);
-  rmsNorm(z, zn, nn, P, M.f("w/nn.z_cycle_norm.weight"));
+  rmsNorm(z.f, zn, nn, P, M.f("w/nn.z_cycle_norm.weight"));
   float* zd = scratch<float>("rc.zd", nn * P);
   lin(zn, "nn.z_cycle_proj.weight", zd, nn, P, P);
-  copy(z, zInit, nn * P * 4);
-  add(z, zd, nn * P);
+  copy(z.f, zInit.f, nn * P * 4);
+  add(z.f, zd, nn * P);
 }
 
 // The whole trunk: the three init products, `nRecycle` cycles of 14 layers with the pair update after every even
@@ -464,14 +492,16 @@ void recycleIn(const float* sInit, const float* zInit, float* s, float* z) {
 // cycle's input is the init product because RMSNorm(0) is 0 and the projections have no bias); `insertion` may be
 // null, which is what every step but the last passes.
 void trunkForward(const float* seqF, const float* cond0, const float* cond1, const float* pairF,
-                  const float* pairCondF, int nRecycle, float* s, float* z, float* bbCa, float* latents,
+                  const float* pairCondF, int nRecycle, float* s, Z z, float* bbCa, float* latents,
                   float* logits, float* insertion) {
   const int n = D_.n;
   const size_t nn = (size_t)n * n;
   float* c = scratch<float>("tf.c", (size_t)n * D_.C);
   float* c1 = scratch<float>("tf.c1", (size_t)n * D_.C);
   float* sInit = scratch<float>("tf.sInit", (size_t)n * D_.D);
-  float* zInit = scratch<float>("tf.zInit", nn * D_.P);
+  Z zInit;
+  if (z.h) zInit.h = scratch<half>("tf.zInitH", nn * D_.P);
+  else zInit.f = scratch<float>("tf.zInit", nn * D_.P);
   condC(cond0, c, n);
   if (nRecycle > 1) condC(cond1, c1, n);
   initSingle(seqF, sInit);

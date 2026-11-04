@@ -71,7 +71,7 @@ struct RfdMulSigmoidHArgs { CP(half) x; CP(half) g; DP(float) y; u64 n; };
 // track is read and written by more kernels than anything else here, so its width is the port's bandwidth
 struct RfdPairWriteHArgs { CP(half) pair; CP(float) pij; DP(half) z; u64 rows; uint n, P; };
 struct RfdMulSigmoidHHArgs { CP(half) x; CP(half) g; DP(half) y; u64 n; };
-struct RfdAddHArgs { CP(half) a; CP(float) b; DP(half) y; u64 n; };
+struct RfdAddHArgs { CP(half) a; CP(half) b; DP(half) y; u64 n; };
 // a weight transposed once into its own buffer: core's fused gated add takes its weight as [in][out] where this
 // checkpoint stores [out][in], and a GEMM that fuses the gate and the residual is worth a 294 KB derived copy
 struct RfdTransposeHArgs { CP(half) in; DP(half) out; u64 rows; uint cols, pad; };

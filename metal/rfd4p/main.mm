@@ -12,13 +12,17 @@
 //
 // SPEED, on an M5 (8-core GPU), a whole job including featurisation: a 54-residue design at 60 steps is
 // **3.7 s**, a 67-token motif 3.5 s, a 165-token small molecule 17.6 s, a 183-token interface 21.0 s.
-// 🔴 HALF IS THE DEFAULT AND `--f32` IS THE CONTROL, which is 3.5x slower: 12.6 s for that first design against
-// 3.7. One sampler step at 183 tokens went **681 ms of GPU time to 167, and 618 dispatches to 421**, over this
-// port's optimisation round: the weights and the activations in half; the triangle's projections writing
-// channel-major so nothing transposes; its gate, its residual and the NEXT stage's LayerNorm all folded into the
-// GEMM that writes the pair track; the four projections batched into one; every layer's adaLN conditioning
+// 🔴 HALF IS THE DEFAULT AND `--f32` IS THE CONTROL, which is 3.6x slower: 12.6 s for that first design against
+// 3.5. One sampler step at 183 tokens went **681 ms of GPU time to 151, and 618 dispatches to 419**, over this
+// port's optimisation round: the weights, the activations and the PAIR TRACK in half; the triangle's projections
+// writing channel-major so nothing transposes; its gate, its residual and the NEXT stage's LayerNorm all folded
+// into the GEMM that writes the track; the four projections batched into one; every layer's adaLN conditioning
 // precomputed in a single GEMM, since none of it depends on the activations; and a pair row's index taken from
 // its threadgroup rather than from a software integer division a thread.
+// What is left, at 183 tokens: the batched projection 31.9 ms (21%, and core's tiling rather than this port's
+// layout - both orientations measure the same), the triangle's gated add 21.5, the pair transition 13.9, the
+// gate's channel-major pass 10.9, the attention 9.5. The attention is this port's own float32 kernel and
+// metal/core's flash one is the next thing to try.
 //
 // WHAT RUNS: unconditional, motif scaffolding, protein-protein interfaces, small molecules (whose chirality is
 // re-aligned every step), coordinate groups (whose labels are permuted every step), partial diffusion and
@@ -242,7 +246,16 @@ int main(int argc, char** argv) {
 
   float* c = allocT<float>((size_t)n * D_.C);
   float* sInit = allocT<float>((size_t)n * D_.D);
-  float* zInit = allocT<float>(nn * D_.P);
+  // 🔴 THE GATE KEEPS THE TRACK IN THE ARM'S OWN PRECISION, so what it holds is what ships: under `--f16` the
+  // pair track is half here too, and the comparisons go through a float copy rather than a float track.
+  Z zInit;
+  if (HALF) zInit.h = allocT<half>(nn * D_.P); else zInit.f = allocT<float>(nn * D_.P);
+  float* zCmp = allocT<float>(nn * D_.P);
+  auto asFloat = [&](Z zz) {
+    if (!zz.h) return zz.f;
+    toFloat(zz.h, zCmp, nn * D_.P);
+    return zCmp;
+  };
   float* c1 = allocT<float>((size_t)n * D_.C);
   float* bbCaS = allocT<float>((size_t)n * 3);
   float* latentsS = allocT<float>((size_t)n * 32);
@@ -293,11 +306,16 @@ int main(int argc, char** argv) {
     const double decChained = HALF ? 1e-2 : 1e-4;
     check("c", "c", c, (size_t)n * D_.C, bound);
     check("s_init", "sInit", sInit, (size_t)n * D_.D, bound);
-    check("z_init", "zInit", zInit, nn * D_.P, bound);
+    check("z_init", "zInit", asFloat(zInit), nn * D_.P, bound);
     // 🔴 EVERY STAGE COMPARED THE MOMENT IT IS PRODUCED, so the first one that moves is the one named - and the
     // pair track is compared after each update rather than only at the end, which is how `cuda/rfd4p` found three
     // of its bugs (its README: "o/s0 rather than a finished trunk that was merely wrong").
-    float* z = allocT<float>(nn * D_.P);
+    Z z;
+    if (HALF) z.h = allocT<half>(nn * D_.P); else z.f = allocT<float>(nn * D_.P);
+    auto loadZ = [&](const std::string& key) {
+      if (z.h) toHalf(M.f(key), z.h, nn * D_.P);
+      else copy(z.f, M.f(key), nn * D_.P * 4);
+    };
 
     // ---- arm 1: EVERY STAGE FROM THE ORACLE'S OWN INPUT ----------------------------------------------------
     // 🔴 THIS IS THE ARM THAT HOLDS THE KERNELS, AND THE CHAINED ONE BELOW CANNOT. Chained, a stage is handed
@@ -321,13 +339,13 @@ int main(int argc, char** argv) {
       for (int i = first; i < D_.layers; ++i) {
         const std::string sFrom = i == 0 ? "o/sInit" : "o/s" + std::to_string(i - 1);
         copy(s, M.f(sFrom), (size_t)n * D_.D * 4);
-        copy(z, M.f(std::string("o/") + zFrom), nn * D_.P * 4);
+        loadZ(std::string("o/") + zFrom);
         tokenLayer(i, s, z, cc);
         check(("stage s" + std::to_string(i)).c_str(), "s" + std::to_string(i), s, (size_t)n * D_.D, bound);
         if (i < D_.layers - 1 && i % 2 == 0) {
           copy(s, M.f("o/s" + std::to_string(i)), (size_t)n * D_.D * 4);
           pairUpdate(i, s, z);
-          check(("stage z" + std::to_string(i)).c_str(), "z" + std::to_string(i), z, nn * D_.P, bound);
+          check(("stage z" + std::to_string(i)).c_str(), "z" + std::to_string(i), asFloat(z), nn * D_.P, bound);
           zFrom = strdup(("z" + std::to_string(i)).c_str());
         }
       }
@@ -354,9 +372,8 @@ int main(int argc, char** argv) {
     // chained trunk that was right seven runs in eight and 7.2e-5 in the eighth, from the same bytes: a
     // difference between runs is a race, never a precision question. A fresh allocation cannot be raced.
     float* sc = allocT<float>((size_t)n * D_.D);
-    float* zc = allocT<float>(nn * D_.P);
     s = sc;
-    z = zc;
+    if (z.h) z.h = allocT<half>(nn * D_.P); else z.f = allocT<float>(nn * D_.P);
     for (int cycle = 0; cycle < D_.nRecycle; ++cycle) {
       recycleIn(sInit, zInit, s, z);
       // the conditioning of every cycle after the first is built from the `recycleRemaining` features
@@ -372,7 +389,7 @@ int main(int argc, char** argv) {
         if (last) check(("chained s" + std::to_string(i)).c_str(), "s" + std::to_string(i), s, (size_t)n * D_.D, chainedBound);
         if (i < D_.layers - 1 && i % 2 == 0) {
           pairUpdate(i, s, z);
-          if (last) check(("chained z" + std::to_string(i)).c_str(), "z" + std::to_string(i), z, nn * D_.P, chainedBound);
+          if (last) check(("chained z" + std::to_string(i)).c_str(), "z" + std::to_string(i), asFloat(z), nn * D_.P, chainedBound);
         }
       }
     }
@@ -392,7 +409,7 @@ int main(int argc, char** argv) {
     // SHOULD hold. So the amplification is stated and the head is gated where it answers for itself.
     check("chained insertion", "insertion", insertion, nn, 0);
     check("chained s", "s", s, (size_t)n * D_.D, chainedBound);
-    check("chained z", "z", z, nn * D_.P, chainedBound);
+    check("chained z", "z", asFloat(z), nn * D_.P, chainedBound);
     // ---- the autoencoder's decoder ------------------------------------------------------------------------
     // 🔴 FED THE ORACLE'S OWN LATENTS AND ALPHA CARBONS (`in/zLatent`, `in/caNm`), not the trunk's, for the same
     // reason every stage above is: the decoder is a separate network and its residual should be its own. The
