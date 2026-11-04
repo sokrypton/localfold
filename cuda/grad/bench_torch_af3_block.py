@@ -84,14 +84,14 @@ class SingleAttn(nn.Module):
 class Pairformer(nn.Module):
   def __init__(s, cz=128, cs=384):
     super().__init__()
-    s.to, s.ti = TriMul(cz, True), TriMul(cz, False)
+    s.tmo, s.tmi = TriMul(cz, True), TriMul(cz, False)
     s.a1, s.a2 = GridAttn(cz, 4, 32), GridAttn(cz, 4, 32)
     s.pt = SwiGLU(cz)
     s.sa, s.st = SingleAttn(cs, cz, 16, 24), SwiGLU(cs)
 
   def forward(s, z, x, zm, sm):
-    z = z + s.to(z, zm)
-    z = z + s.ti(z, zm)
+    z = z + s.tmo(z, zm)
+    z = z + s.tmi(z, zm)
     z = z + s.a1(z, zm)
     z = z + s.a2(z.transpose(0, 1), zm.t()).transpose(0, 1)
     z = z + s.pt(z)
@@ -104,6 +104,7 @@ def main():
   ap = argparse.ArgumentParser()
   ap.add_argument("--n", type=int, default=384)
   ap.add_argument("--tf32", action="store_true")
+  ap.add_argument("--bf16", action="store_true", help="torch.autocast(bfloat16): float32 weights, bf16 matmuls")
   ap.add_argument("--compile", action="store_true")
   ap.add_argument("--reps", type=int, default=7)
   a = ap.parse_args()
@@ -126,7 +127,8 @@ def main():
     torch.cuda.reset_peak_memory_stats()
     torch.cuda.synchronize()
     ev[0].record()
-    zo, xo = fn(z, x, zm, sm)
+    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=a.bf16):
+      zo, xo = fn(z, x, zm, sm)
     loss = (zo * ctz).sum() + (xo * ctx).sum()
     ev[1].record()
     loss.backward()
@@ -135,7 +137,7 @@ def main():
     if r >= 2:
       fw.append(ev[0].elapsed_time(ev[1])); bw.append(ev[1].elapsed_time(ev[2]))
   med = lambda v: sorted(v)[len(v) // 2]
-  print(f"torch n {a.n} (AF3 pairformer block{', tf32' if a.tf32 else ''}{', compile' if a.compile else ''}): "
+  print(f"torch n {a.n} (AF3 pairformer block{', bf16 autocast' if a.bf16 else ''}{', tf32' if a.tf32 else ''}{', compile' if a.compile else ''}): "
         f"forward {med(fw):.1f} ms, backward {med(bw):.1f} ms; peak {torch.cuda.max_memory_allocated() / 2**20:.0f} MiB")
 
 

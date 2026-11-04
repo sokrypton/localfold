@@ -32,30 +32,79 @@ __device__ __forceinline__ void mmaTf32(float* c, uint32_t a0, uint32_t a1, uint
 }
 // an A fragment (g, t) (g + 8, t) (g, t + 4) (g + 8, t + 4) as tf32, and with SPLIT its tail: split once per k-step
 // and reused across the n-tiles it multiplies
-template <bool SPLIT>
+// MODE 0: tf32; 1: 3xTF32 (SPLIT, float32's precision); 2: bf16 (the training precision). bf16's m16n8k8 holds a
+// thread's k pair as 2t, 2t + 1 where tf32's holds t, t + 4 - the same pairing in A and B, and k is summed, so the
+// tf32 fragment loads feed it unchanged, packed in twos
+__device__ __forceinline__ uint32_t bf2(float lo, float hi) {
+  uint32_t r;
+  asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(r) : "f"(hi), "f"(lo));
+  return r;
+}
+__device__ __forceinline__ void mmaBf16(float* c, uint32_t a0, uint32_t a1, uint32_t b) {
+  asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};"
+               : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a0), "r"(a1), "r"(b));
+}
+template <int MODE>
 struct AFrag {
-  uint32_t h[4], l[SPLIT ? 4 : 1];
+  uint32_t h[4], l[MODE == 1 ? 4 : 1];
   __device__ __forceinline__ explicit AFrag(const float* a) {
+    if (MODE == 2) { h[0] = bf2(a[0], a[2]); h[1] = bf2(a[1], a[3]); return; }
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
       h[i] = tf32(a[i]);
-      if (SPLIT) l[i] = tf32(a[i] - __uint_as_float(h[i]));
+      if (MODE == 1) l[i] = tf32(a[i] - __uint_as_float(h[i]));
     }
   }
 };
+
 // a B operand tile split when it is loaded into shared memory: hi as tf32 bits, and with SPLIT lo beside it (one
-// array of the tile's size further on), so a fragment read is two loads and no conversion
-template <bool SPLIT>
+// array of the tile's size further on), so a fragment read is two loads and no conversion. NS 3 adds a third part
+// (the score product's operands: hi + mid + lo carries float32's 24 bits where hi + lo carries ~22, and the softmax
+// turns a logit's absolute error into the probabilities' relative one)
+template <int NS>
 __device__ __forceinline__ void storeSplit(float* s, size_t lo, float x) {
+  if (NS == 0) { s[0] = x; return; }      // (bf16: rounded where the fragment is packed)
   uint32_t h = tf32(x);
   s[0] = __uint_as_float(h);
-  if (SPLIT) s[lo] = __uint_as_float(tf32(x - __uint_as_float(h)));
+  if (NS >= 2) {
+    float r = x - __uint_as_float(h);
+    uint32_t m = tf32(r);
+    s[lo] = __uint_as_float(m);
+    if (NS >= 3) s[2 * lo] = __uint_as_float(tf32(r - __uint_as_float(m)));
+  }
+}
+// the score product at float32's precision: A and B in three parts, the six products above 2^-33 of the result
+struct AFrag3 {
+  uint32_t h[4], m[4], l[4];
+  __device__ __forceinline__ explicit AFrag3(const float* a) {
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      h[i] = tf32(a[i]);
+      float r = a[i] - __uint_as_float(h[i]);
+      m[i] = tf32(r);
+      l[i] = tf32(r - __uint_as_float(m[i]));
+    }
+  }
+};
+__device__ __forceinline__ void mma3(float* c, const AFrag3& A, const float* s, size_t lo, int i0, int i1) {
+  uint32_t bh[2] = {__float_as_uint(s[i0]), __float_as_uint(s[i1])};
+  uint32_t bm[2] = {__float_as_uint(s[lo + i0]), __float_as_uint(s[lo + i1])};
+  uint32_t bl[2] = {__float_as_uint(s[2 * lo + i0]), __float_as_uint(s[2 * lo + i1])};
+  float t[4] = {0.f, 0.f, 0.f, 0.f};
+  mmaTf32(t, A.l[0], A.l[1], A.l[2], A.l[3], bh[0], bh[1]);
+  mmaTf32(t, A.h[0], A.h[1], A.h[2], A.h[3], bl[0], bl[1]);
+  mmaTf32(t, A.m[0], A.m[1], A.m[2], A.m[3], bm[0], bm[1]);
+  mmaTf32(t, A.m[0], A.m[1], A.m[2], A.m[3], bh[0], bh[1]);
+  mmaTf32(t, A.h[0], A.h[1], A.h[2], A.h[3], bm[0], bm[1]);
+  mmaTf32(t, A.h[0], A.h[1], A.h[2], A.h[3], bh[0], bh[1]);
+  c[0] += t[0]; c[1] += t[1]; c[2] += t[2]; c[3] += t[3];
 }
 // c += A B for one m16n8k8 step, b at (k t, n g) and (k t + 4, n g): s[i0] and s[i1] of a split tile
-template <bool SPLIT>
-__device__ __forceinline__ void mma(float* c, const AFrag<SPLIT>& A, const float* s, size_t lo, int i0, int i1) {
+template <int MODE>
+__device__ __forceinline__ void mma(float* c, const AFrag<MODE>& A, const float* s, size_t lo, int i0, int i1) {
+  if (MODE == 2) { mmaBf16(c, A.h[0], A.h[1], bf2(s[i0], s[i1])); return; }
   uint32_t bh[2] = {__float_as_uint(s[i0]), __float_as_uint(s[i1])};
-  if (SPLIT) {
+  if (MODE == 1) {
     uint32_t bl[2] = {__float_as_uint(s[lo + i0]), __float_as_uint(s[lo + i1])};
     // the k-step's three products summed on the tensor cores from zero, then added in float32: the tensor cores'
     // own accumulation is not IEEE (it does not round to nearest), and over a long sum that, not the operand
@@ -128,25 +177,27 @@ __device__ __forceinline__ float logit(float s, float add, const Sdpa& a) {
   return a.clip ? fminf(fmaxf(v, -1e8f), 1e8f) : v;
 }
 
-// rows [r0, r0 + 64) of x[b] (row stride ld) into s[64][D + PADK]; zero past `rows`; split for the B operand
-template <int D, bool SPLIT>
+// rows [r0, r0 + 64) of x[b] (row stride ld) into s[64][D + PADK]; zero past `rows`; split in NS parts for the B
+// operand
+template <int D, int NS>
 __device__ __forceinline__ void loadTile(float* s, const float* x, long long ld, int r0, int rows) {
   constexpr size_t LO = 64 * (D + PADK);
   for (int i = threadIdx.x; i < 64 * D; i += THREADS) {
     int r = i / D, d = i % D;
-    storeSplit<SPLIT>(s + r * (D + PADK) + d, LO, r0 + r < rows ? x[(long long)(r0 + r) * ld + d] : 0.f);
+    storeSplit<NS>(s + r * (D + PADK) + d, LO, r0 + r < rows ? x[(long long)(r0 + r) * ld + d] : 0.f);
   }
 }
 
 // grid: (query blocks) x H x B flattened; o [B, Q, ldo] at column h D; lse [B, H, Q]
-template <int D, bool SPLIT>
+template <int D, int MODE>
 __global__ void __launch_bounds__(THREADS) fwdK(Sdpa a, const float* __restrict__ q, int ldq,
                                                 const float* __restrict__ k, int ldk, const float* __restrict__ v,
                                                 int ldv, float* __restrict__ o, int ldo, float* __restrict__ lse) {
+  constexpr bool SPLIT = MODE == 1, BF = MODE == 2;
   extern __shared__ __align__(16) float sm[];
   constexpr size_t LO = BC * (D + PADK);           // a split tile's lo half, after its hi
   float* Ks = sm;                                  // [BC][D + PADK], split
-  float* Vs = Ks + (SPLIT ? 2 : 1) * LO;
+  float* Vs = Ks + (SPLIT ? 3 : 1) * LO;           // (K in three parts: the score product's)
   float* T = Vs + (SPLIT ? 2 : 1) * LO;            // [BR][BC + PADK]: the additive terms, then P
   const int nqb = (a.Q + BR - 1) / BR;
   const int qb = blockIdx.x % nqb, h = (blockIdx.x / nqb) % a.H, b = blockIdx.x / (nqb * a.H);
@@ -170,8 +221,8 @@ __global__ void __launch_bounds__(THREADS) fwdK(Sdpa a, const float* __restrict_
   float* P = T + warp * 16 * (BC + PADK);          // this warp's 16 rows
   for (int k0 = 0; k0 < a.K; k0 += BC) {
     __syncthreads();
-    loadTile<D, SPLIT>(Ks, kb_, ldk, k0, a.K);
-    loadTile<D, SPLIT>(Vs, vb_, ldv, k0, a.K);
+    loadTile<D, SPLIT ? 3 : BF ? 0 : 1>(Ks, kb_, ldk, k0, a.K);
+    loadTile<D, SPLIT ? 2 : BF ? 0 : 1>(Vs, vb_, ldv, k0, a.K);
     loadAdd(T, a, b, h, q0, k0);
     __syncthreads();
     float sacc[BC / 8][4];
@@ -179,10 +230,16 @@ __global__ void __launch_bounds__(THREADS) fwdK(Sdpa a, const float* __restrict_
     for (int j = 0; j < BC / 8; ++j) sacc[j][0] = sacc[j][1] = sacc[j][2] = sacc[j][3] = 0.f;
 #pragma unroll
     for (int s = 0; s < D / 8; ++s) {
-      const AFrag<SPLIT> A(qa[s]);
+      if constexpr (SPLIT) {
+        const AFrag3 A(qa[s]);
 #pragma unroll
-      for (int j = 0; j < BC / 8; ++j) {
-        mma<SPLIT>(sacc[j], A, Ks, LO, (j * 8 + g) * (D + PADK) + s * 8 + t, (j * 8 + g) * (D + PADK) + s * 8 + t + 4);
+        for (int j = 0; j < BC / 8; ++j)
+          mma3(sacc[j], A, Ks, LO, (j * 8 + g) * (D + PADK) + s * 8 + t, (j * 8 + g) * (D + PADK) + s * 8 + t + 4);
+      } else {
+        const AFrag<MODE> A(qa[s]);
+#pragma unroll
+        for (int j = 0; j < BC / 8; ++j)
+          mma<MODE>(sacc[j], A, Ks, LO, (j * 8 + g) * (D + PADK) + s * 8 + t, (j * 8 + g) * (D + PADK) + s * 8 + t + 4);
       }
     }
     float rmax[2] = {-INFINITY, -INFINITY};
@@ -231,10 +288,10 @@ __global__ void __launch_bounds__(THREADS) fwdK(Sdpa a, const float* __restrict_
     for (int s = 0; s < BC / 8; ++s) {
       float pa[4] = {P[g * (BC + PADK) + s * 8 + t], P[(g + 8) * (BC + PADK) + s * 8 + t],
                      P[g * (BC + PADK) + s * 8 + t + 4], P[(g + 8) * (BC + PADK) + s * 8 + t + 4]};
-      const AFrag<SPLIT> A(pa);
+      const AFrag<MODE> A(pa);
 #pragma unroll
       for (int n = 0; n < D / 8; ++n) {
-        mma<SPLIT>(oacc[n], A, Vs, LO, (s * 8 + t) * (D + PADK) + n * 8 + g, (s * 8 + t + 4) * (D + PADK) + n * 8 + g);
+        mma<MODE>(oacc[n], A, Vs, LO, (s * 8 + t) * (D + PADK) + n * 8 + g, (s * 8 + t + 4) * (D + PADK) + n * 8 + g);
       }
     }
   }
@@ -296,19 +353,20 @@ __global__ void zeroColsK(float* x, int ld, size_t rows, int C) {   // x[r, 0:C]
 // atomics. T holds the tile [query][key]: the additive terms, overwritten in place by P, then by dS. (Double-
 // buffering the query blocks with cp.async was measured: the second stage costs the third block an SM, and the
 // overlap does not buy it back - 1.48 -> 1.66 ms on AF2's triangle attention, TF32.)
-template <int D, bool SPLIT>
-__global__ void __launch_bounds__(THREADS, SPLIT ? 2 : 3) bwdK(Sdpa a, const float* __restrict__ q, int ldq,
+template <int D, int MODE>
+__global__ void __launch_bounds__(THREADS, MODE == 1 ? 2 : 3) bwdK(Sdpa a, const float* __restrict__ q, int ldq,
                                                    const float* __restrict__ k, int ldk, const float* __restrict__ v,
                                                    int ldv, const float* __restrict__ dO, int lddo,
                                                    const float* __restrict__ lse, const float* __restrict__ Di,
                                                    float* __restrict__ dq, int lddq, float* __restrict__ dk, int lddk,
                                                    float* __restrict__ dv, int lddv, bool accK, bool accV) {
+  constexpr bool SPLIT = MODE == 1, BF = MODE == 2;
   extern __shared__ __align__(16) float sm[];
   constexpr int LD = D + PADK, LT = BC + PADK;
   constexpr size_t LO = 64 * LD;                   // a split tile's lo half, after its hi
   float* Ks = sm;                                  // [BC][LD], split
-  float* Qs = Ks + (SPLIT ? 2 : 1) * LO;           // [BR][LD], split
-  float* Os = Qs + (SPLIT ? 2 : 1) * LO;           // dO [BR][LD], split; then the block's dQ (hi half, plain floats)
+  float* Qs = Ks + (SPLIT ? 2 : 1) * LO;           // [BR][LD], split (in three parts: the score product's)
+  float* Os = Qs + (SPLIT ? 3 : 1) * LO;           // dO [BR][LD], split; then the block's dQ (hi half, plain floats)
   float* T = Os + (SPLIT ? 2 : 1) * LO;            // [BR][LT]
   float* Ls = T + BR * LT;                         // lse [BR]
   float* Ds = Ls + BR;                             // Di [BR]
@@ -321,7 +379,7 @@ __global__ void __launch_bounds__(THREADS, SPLIT ? 2 : 3) bwdK(Sdpa a, const flo
   const float* ob_ = dO + (size_t)b * a.Q * lddo + h * D;
   const float* vb_ = v + (size_t)b * a.K * ldv + h * D;
   const float* kb_ = k + (size_t)b * a.K * ldk + h * D;
-  loadTile<D, SPLIT>(Ks, kb_, ldk, k0, a.K);
+  loadTile<D, SPLIT ? 2 : BF ? 0 : 1>(Ks, kb_, ldk, k0, a.K);
   __syncthreads();
   float ka[D / 8][4], va[D / 8][4];
 #pragma unroll
@@ -345,8 +403,8 @@ __global__ void __launch_bounds__(THREADS, SPLIT ? 2 : 3) bwdK(Sdpa a, const flo
   real* g1 = a.bias[1].grad ? a.bias[1].grad + b * a.bias[1].sb + h * a.bias[1].sh + k0 : nullptr;
   for (int q0 = 0; q0 < a.Q; q0 += BR) {
     __syncthreads();
-    loadTile<D, SPLIT>(Qs, qb_, ldq, q0, a.Q);
-    loadTile<D, SPLIT>(Os, ob_, lddo, q0, a.Q);
+    loadTile<D, SPLIT ? 3 : BF ? 0 : 1>(Qs, qb_, ldq, q0, a.Q);
+    loadTile<D, SPLIT ? 2 : BF ? 0 : 1>(Os, ob_, lddo, q0, a.Q);
     loadAdd(T, a, b, h, q0, k0);
     for (int i = threadIdx.x; i < BR; i += THREADS) {
       Ls[i] = q0 + i < a.Q ? lseb[q0 + i] : INFINITY;
@@ -363,12 +421,26 @@ __global__ void __launch_bounds__(THREADS, SPLIT ? 2 : 3) bwdK(Sdpa a, const flo
         for (int e = 0; e < 4; ++e) st[jj][e] = dpt[jj][e] = 0.f;
 #pragma unroll
       for (int s = 0; s < D / 8; ++s) {
-        const AFrag<SPLIT> Ka(ka[s]), Va(va[s]);
+        const AFrag<MODE> Va(va[s]);
+        if constexpr (SPLIT) {
+          const AFrag3 Ka(ka[s]);
+#pragma unroll
+          for (int jj = 0; jj < 4; ++jj) {
+            const int j = hq * 4 + jj;
+            mma3(st[jj], Ka, Qs, LO, (j * 8 + g) * LD + s * 8 + t, (j * 8 + g) * LD + s * 8 + t + 4);
+          }
+        } else {
+          const AFrag<MODE> Ka(ka[s]);
+#pragma unroll
+          for (int jj = 0; jj < 4; ++jj) {
+            const int j = hq * 4 + jj;
+            mma<MODE>(st[jj], Ka, Qs, LO, (j * 8 + g) * LD + s * 8 + t, (j * 8 + g) * LD + s * 8 + t + 4);
+          }
+        }
 #pragma unroll
         for (int jj = 0; jj < 4; ++jj) {
           const int j = hq * 4 + jj;
-          mma<SPLIT>(st[jj], Ka, Qs, LO, (j * 8 + g) * LD + s * 8 + t, (j * 8 + g) * LD + s * 8 + t + 4);
-          mma<SPLIT>(dpt[jj], Va, Os, LO, (j * 8 + g) * LD + s * 8 + t, (j * 8 + g) * LD + s * 8 + t + 4);
+          mma<MODE>(dpt[jj], Va, Os, LO, (j * 8 + g) * LD + s * 8 + t, (j * 8 + g) * LD + s * 8 + t + 4);
         }
       }
 #pragma unroll
@@ -388,10 +460,10 @@ __global__ void __launch_bounds__(THREADS, SPLIT ? 2 : 3) bwdK(Sdpa a, const flo
         const int qs = hq * 32 + s * 8;
         float pa[4] = {T[(qs + t) * LT + kl0 + g], T[(qs + t) * LT + kl0 + g + 8], T[(qs + t + 4) * LT + kl0 + g],
                        T[(qs + t + 4) * LT + kl0 + g + 8]};
-        const AFrag<SPLIT> A(pa);
+        const AFrag<MODE> A(pa);
 #pragma unroll
         for (int n = 0; n < D / 8; ++n) {
-          mma<SPLIT>(dva[n], A, Os, LO, (qs + t) * LD + n * 8 + g, (qs + t + 4) * LD + n * 8 + g);
+          mma<MODE>(dva[n], A, Os, LO, (qs + t) * LD + n * 8 + g, (qs + t + 4) * LD + n * 8 + g);
         }
       }
       __syncwarp();
@@ -407,10 +479,10 @@ __global__ void __launch_bounds__(THREADS, SPLIT ? 2 : 3) bwdK(Sdpa a, const flo
         const int qs = hq * 32 + s * 8;
         float pa[4] = {T[(qs + t) * LT + kl0 + g], T[(qs + t) * LT + kl0 + g + 8], T[(qs + t + 4) * LT + kl0 + g],
                        T[(qs + t + 4) * LT + kl0 + g + 8]};
-        const AFrag<SPLIT> A(pa);
+        const AFrag<MODE> A(pa);
 #pragma unroll
         for (int n = 0; n < D / 8; ++n) {
-          mma<SPLIT>(dka[n], A, Qs, LO, (qs + t) * LD + n * 8 + g, (qs + t + 4) * LD + n * 8 + g);
+          mma<MODE>(dka[n], A, Qs, LO, (qs + t) * LD + n * 8 + g, (qs + t + 4) * LD + n * 8 + g);
         }
       }
     }
@@ -435,10 +507,10 @@ __global__ void __launch_bounds__(THREADS, SPLIT ? 2 : 3) bwdK(Sdpa a, const flo
     for (int s = 0; s < BC / 8; ++s) {
       float pa[4] = {T[(qw + g) * LT + s * 8 + t], T[(qw + g + 8) * LT + s * 8 + t], T[(qw + g) * LT + s * 8 + t + 4],
                      T[(qw + g + 8) * LT + s * 8 + t + 4]};
-      const AFrag<SPLIT> A(pa);
+      const AFrag<MODE> A(pa);
 #pragma unroll
       for (int n = 0; n < D / 8; ++n) {
-        mma<SPLIT>(dqa[n], A, Ks, LO, (s * 8 + t) * LD + n * 8 + g, (s * 8 + t + 4) * LD + n * 8 + g);
+        mma<MODE>(dqa[n], A, Ks, LO, (s * 8 + t) * LD + n * 8 + g, (s * 8 + t + 4) * LD + n * 8 + g);
       }
     }
 #pragma unroll
@@ -471,31 +543,33 @@ __global__ void __launch_bounds__(THREADS, SPLIT ? 2 : 3) bwdK(Sdpa a, const flo
   }
 }
 
-template <int D, bool SPLIT>
-inline size_t bwdSmem() { return sizeof(float) * ((SPLIT ? 6 : 3) * 64 * (D + PADK) + BC * (BR + PADK) + 3 * BR); }
+template <int D, int MODE>
+inline size_t bwdSmem() { return sizeof(float) * ((MODE == 1 ? 7 : 3) * 64 * (D + PADK) + BC * (BR + PADK) + 3 * BR); }
 
-template <int D, bool SPLIT>
+template <int D, int MODE>
 inline void forward(const Sdpa& a, const float* q, int ldq, const float* k, int ldk, const float* v, int ldv, float* o,
                     int ldo, float* lse) {
+  constexpr bool SPLIT = MODE == 1;
   static bool attr = false;
-  size_t smem = sizeof(float) * ((SPLIT ? 4 : 2) * BC * (D + PADK) + BR * (BC + PADK));
-  if (!attr) { GK(cudaFuncSetAttribute(fwdK<D, SPLIT>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem)); attr = true; }
+  size_t smem = sizeof(float) * ((SPLIT ? 5 : 2) * BC * (D + PADK) + BR * (BC + PADK));
+  if (!attr) { GK(cudaFuncSetAttribute(fwdK<D, MODE>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem)); attr = true; }
   size_t grid = (size_t)((a.Q + BR - 1) / BR) * a.H * a.B;
-  fwdK<D, SPLIT><<<(unsigned)grid, THREADS, smem, STREAM>>>(a, q, ldq, k, ldk, v, ldv, o, ldo, lse);
+  fwdK<D, MODE><<<(unsigned)grid, THREADS, smem, STREAM>>>(a, q, ldq, k, ldk, v, ldv, o, ldo, lse);
 }
-template <int D, bool SPLIT>
+template <int D, int MODE>
 inline void backward(const Sdpa& a, const float* q, int ldq, const float* k, int ldk, const float* v, int ldv,
                      const float* dO, int lddo, const float* lse, const float* Di, float* dq, int lddq, float* dk,
                      int lddk, float* dv, int lddv, bool accK, bool accV) {
+  constexpr bool SPLIT = MODE == 1;
   static bool attr = false;
-  size_t smem = bwdSmem<D, SPLIT>();
+  size_t smem = bwdSmem<D, MODE>();
   if (!attr) {
-    GK(cudaFuncSetAttribute(bwdK<D, SPLIT>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
-    GK(cudaFuncSetAttribute(bwdK<D, SPLIT>, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+    GK(cudaFuncSetAttribute(bwdK<D, MODE>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
+    GK(cudaFuncSetAttribute(bwdK<D, MODE>, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
     attr = true;
   }
   size_t grid = (size_t)((a.K + BC - 1) / BC) * a.H * a.B;
-  bwdK<D, SPLIT><<<(unsigned)grid, THREADS, smem, STREAM>>>(a, q, ldq, k, ldk, v, ldv, dO, lddo, lse, Di, dq, lddq,
+  bwdK<D, MODE><<<(unsigned)grid, THREADS, smem, STREAM>>>(a, q, ldq, k, ldk, v, ldv, dO, lddo, lse, Di, dq, lddq,
                                                             dk, lddk, dv, lddv, accK, accV);
 }
 
@@ -513,14 +587,16 @@ inline void backward(const Sdpa& a, const float* q, int ldq, const float* k, int
 inline bool supported(int D) { return D == 8 || D == 16 || D == 24 || D == 32 || D == 48 || D == 64; }
 inline bool runForward(const Sdpa& a, const float* q, int ldq, const float* k, int ldk, const float* v, int ldv,
                        float* o, int ldo, float* lse) {
-  if (TF32) { FLASH_DISPATCH(a.D, (forward<DD, false>(a, q, ldq, k, ldk, v, ldv, o, ldo, lse))) }
-  else { FLASH_DISPATCH(a.D, (forward<DD, true>(a, q, ldq, k, ldk, v, ldv, o, ldo, lse))) }
+  if (BF16) { FLASH_DISPATCH(a.D, (forward<DD, 2>(a, q, ldq, k, ldk, v, ldv, o, ldo, lse))) }
+  else if (TF32) { FLASH_DISPATCH(a.D, (forward<DD, 0>(a, q, ldq, k, ldk, v, ldv, o, ldo, lse))) }
+  else { FLASH_DISPATCH(a.D, (forward<DD, 1>(a, q, ldq, k, ldk, v, ldv, o, ldo, lse))) }
 }
 inline bool runBackward(const Sdpa& a, const float* q, int ldq, const float* k, int ldk, const float* v, int ldv,
                         const float* dO, int lddo, const float* lse, const float* Di, float* dq, int lddq, float* dk,
                         int lddk, float* dv, int lddv, bool accK, bool accV) {
-  if (TF32) { FLASH_DISPATCH(a.D, (backward<DD, false>(a, q, ldq, k, ldk, v, ldv, dO, lddo, lse, Di, dq, lddq, dk, lddk, dv, lddv, accK, accV))) }
-  else { FLASH_DISPATCH(a.D, (backward<DD, true>(a, q, ldq, k, ldk, v, ldv, dO, lddo, lse, Di, dq, lddq, dk, lddk, dv, lddv, accK, accV))) }
+  if (BF16) { FLASH_DISPATCH(a.D, (backward<DD, 2>(a, q, ldq, k, ldk, v, ldv, dO, lddo, lse, Di, dq, lddq, dk, lddk, dv, lddv, accK, accV))) }
+  else if (TF32) { FLASH_DISPATCH(a.D, (backward<DD, 0>(a, q, ldq, k, ldk, v, ldv, dO, lddo, lse, Di, dq, lddq, dk, lddk, dv, lddv, accK, accV))) }
+  else { FLASH_DISPATCH(a.D, (backward<DD, 1>(a, q, ldq, k, ldk, v, ldv, dO, lddo, lse, Di, dq, lddq, dk, lddk, dv, lddv, accK, accV))) }
 }
 #undef FLASH_DISPATCH
 

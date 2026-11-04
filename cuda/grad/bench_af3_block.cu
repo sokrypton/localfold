@@ -12,6 +12,7 @@ int main(int argc, char** argv) {
   for (int i = 1; i < argc; ++i) {
     if (!strncmp(argv[i], "--n=", 4)) n = atoi(argv[i] + 4);
     else if (!strcmp(argv[i], "--tf32")) TF32 = true;
+    else if (!strcmp(argv[i], "--bf16")) BF16 = true;
   }
   init();
   curandGenerator_t gen; curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT); curandSetPseudoRandomGeneratorSeed(gen, 7);
@@ -48,5 +49,5 @@ int main(int argc, char** argv) {
   GK(cudaGetLastError());
   auto med = [](std::vector<float> v) { std::sort(v.begin(), v.end()); return v[v.size() / 2]; };
   printf("n %d (AF3 pairformer block%s): forward %.1f ms, replay %.1f ms, backward %.1f ms; arena high water %.0f MiB\n",
-         n, TF32 ? ", tf32" : "", med(fv), med(rv), med(bv), ARENA.high / 1048576.0);
+         n, BF16 ? ", bf16" : TF32 ? ", tf32" : "", med(fv), med(rv), med(bv), ARENA.high / 1048576.0);
 }

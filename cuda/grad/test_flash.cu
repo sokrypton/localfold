@@ -23,8 +23,9 @@ int main() {
                              {7, 8, 48, 48, 32, true, true, false, true, 6.f, true},     // large logits, a row masked whole
                              {5, 8, 37, 37, 32, true, true, false, true, 1.f, true}};
   int fails = 0;
-  for (bool tf : {false, true}) {
-    setTf32(tf);
+  for (int mode : {0, 1, 2}) {           // float32 (3xTF32), TF32, bf16
+    const bool tf = mode > 0;
+    setTf32(mode == 1); setBf16(mode == 2);
     for (auto c : cases) {
       int HD = c.H * c.D, ld = HD + 8;    // a leading dimension past the heads, as a packed qkv's
       size_t nq = (size_t)c.B * c.Q * ld, nk = (size_t)c.B * c.K * ld;
@@ -54,16 +55,49 @@ int main() {
       auto cmp = [&](const char* n, float* x, float* y, size_t rows) {
         auto hx = hostv(x, rows * ld), hy = hostv(y, rows * ld); double e = 0, mm = 0;
         for (size_t r = 0; r < rows; ++r) for (int j = 0; j < HD; ++j) { e = std::max(e, (double)fabs(hx[r * ld + j] - hy[r * ld + j])); mm = std::max(mm, (double)fabs(hy[r * ld + j])); }
-        double rr = e / (mm + 1e-30), bar = tf ? 5e-3 : c.sd > 1 ? 3e-5 : 2e-6;   // (logits ~ +-36: float32's own conditioning)
+        double rr = e / (mm + 1e-30), bar = mode == 2 ? 3e-2 : tf ? 5e-3 : c.sd > 1 ? 3e-5 : 2e-6;   // (logits ~ +-36: float32's own conditioning)
         printf("  %-4s %.2e%s", n, rr, rr > bar ? " <-- ABOVE" : ""); fails += rr > bar;
       };
-      printf("%s B %d H %d Q %d K %d D %d%s%s%s%s:", tf ? "tf32" : "fp32", c.B, c.H, c.Q, c.K, c.D, c.mask ? " mask" : "", c.bias ? " bias" : "", c.bias2 ? " bias2" : "", c.clip ? " clip" : "");
+      printf("%s B %d H %d Q %d K %d D %d%s%s%s%s:", mode == 2 ? "bf16" : tf ? "tf32" : "fp32", c.B, c.H, c.Q, c.K, c.D, c.mask ? " mask" : "", c.bias ? " bias" : "", c.bias2 ? " bias2" : "", c.clip ? " clip" : "");
       cmp("o", o[1], o[0], (size_t)c.B * c.Q); cmp("dq", dq[1], dq[0], (size_t)c.B * c.Q); cmp("dk", dk[1], dk[0], (size_t)c.B * c.K); cmp("dv", dv[1], dv[0], (size_t)c.B * c.K);
-      const double bb = tf ? 5e-3 : c.sd > 1 ? 3e-5 : 2e-6;
+      const double bb = mode == 2 ? 3e-2 : tf ? 5e-3 : c.sd > 1 ? 3e-5 : 2e-6;
       if (c.bias) { double r = rel(gb[1][0], gb[0][0], nb); printf("  db %.2e%s", r, r > bb ? " <-- ABOVE" : ""); fails += r > bb; }
       if (c.bias2) { double r = rel(gb[1][1], gb[0][1], nb2); printf("  db2 %.2e%s", r, r > bb ? " <-- ABOVE" : ""); fails += r > bb; }
       printf("\n");
     }
+  }
+  // both paths against a float64 forward on the host: which is closer to the truth, not only to each other
+  {
+    setTf32(false); setBf16(false);
+    const int B = 4, H = 4, Q = 96, K = 96, D = 32, HD = H * D;
+    std::vector<float> hq((size_t)B * Q * HD), hk((size_t)B * K * HD), hv((size_t)B * K * HD), hb((size_t)H * Q * K);
+    unsigned st = 5; auto rnd = [&] { st = st * 1664525u + 1013904223u; return ((st >> 8) / 16777216.0f - 0.5f) * 4.f; };
+    for (auto* v : {&hq, &hk, &hv, &hb}) for (auto& x : *v) x = rnd();
+    float *q, *k, *v, *bb, *o0, *o1, *lse;
+    for (auto pr : {std::make_pair(&q, &hq), std::make_pair(&k, &hk), std::make_pair(&v, &hv), std::make_pair(&bb, &hb)}) {
+      GK(cudaMalloc(pr.first, pr.second->size() * 4)); GK(cudaMemcpy(*pr.first, pr.second->data(), pr.second->size() * 4, cudaMemcpyHostToDevice)); }
+    GK(cudaMalloc(&o0, hq.size() * 4)); GK(cudaMalloc(&o1, hq.size() * 4)); GK(cudaMalloc(&lse, (size_t)2 * B * H * Q * 4));
+    Sdpa a; a.B = B; a.H = H; a.Q = Q; a.K = K; a.D = D; a.scale = 1.f / sqrtf((float)D); a.clip = true;
+    a.bias[0] = Bias{bb, 0, (long long)Q * K, K, nullptr};
+    FLASH = false; sdpaForward(a, q, HD, k, HD, v, HD, o0, HD, lse);
+    FLASH = true; sdpaForward(a, q, HD, k, HD, v, HD, o1, HD, lse);
+    auto r0 = hostv(o0, hq.size()), r1 = hostv(o1, hq.size());
+    double e0 = 0, e1 = 0, mx = 0;
+    std::vector<double> lg(K);
+    for (int b = 0; b < B; ++b) for (int h = 0; h < H; ++h) for (int i = 0; i < Q; ++i) {
+      double m = -1e300, sum = 0;
+      for (int j = 0; j < K; ++j) {
+        double d = 0; for (int c = 0; c < D; ++c) d += (double)hq[((size_t)b * Q + i) * HD + h * D + c] * hk[((size_t)b * K + j) * HD + h * D + c];
+        lg[j] = d / sqrt((double)D) + hb[((size_t)h * Q + i) * K + j]; m = std::max(m, lg[j]); }
+      for (int j = 0; j < K; ++j) { lg[j] = exp(lg[j] - m); sum += lg[j]; }
+      for (int c = 0; c < D; ++c) {
+        double t = 0; for (int j = 0; j < K; ++j) t += lg[j] * hv[((size_t)b * K + j) * HD + h * D + c];
+        t /= sum; size_t ix = ((size_t)b * Q + i) * HD + h * D + c;
+        e0 = std::max(e0, fabs(r0[ix] - t)); e1 = std::max(e1, fabs(r1[ix] - t)); mx = std::max(mx, fabs(t));
+      }
+    }
+    printf("against float64 (logits ~ +-10): bmm path %.2e, flash %.2e (max abs, relative to max |o|)\n", e0 / mx, e1 / mx);
+    fails += e1 > 3 * e0 + 1e-7;
   }
   printf(fails ? "FAIL\n" : "PASS\n");
   return fails ? 1 : 0;

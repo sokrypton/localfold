@@ -67,7 +67,7 @@ struct GridAttn {
   bool transpose = false;
   bool untransposedResidual = false;   // chai-1's parallel block: the column pass's update added as it comes out
 };
-struct GridSave { LnSave ln; real *xn, *act, *nb, *qkvg, *o; int n; };
+struct GridSave { LnSave ln; real *xn, *act, *nb, *qkvg, *o; int n; real* lse = nullptr; };
 // rawBias [nn, H] -> nb [H, nn], the column direction's source transposed when swap
 __global__ void gridBiasK(const real* raw, real* nb, int n, int H, bool swap, bool back) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -107,7 +107,7 @@ inline GridSave gridForward(const GridAttn& g, const Dialect& d, const real* pai
   g.q.forward(s.act, q, nn); g.k.forward(s.act, k, nn); g.v.forward(s.act, v, nn); g.gate.forward(s.act, gt, nn);
   sigmoidK<<<blocks(nn * HD), 256, 0, STREAM>>>(gt, nn * HD);
   s.o = ARENA.get(nn * HD);
-  sdpaForward(gridSdpa(g, n, g.transpose ? maskT : mask, s.nb), q, HD, k, HD, v, HD, s.o, HD);
+  { const Sdpa sd_ = gridSdpa(g, n, g.transpose ? maskT : mask, s.nb); s.lse = ARENA.get((size_t)2 * sd_.B * sd_.H * sd_.Q); sdpaForward(sd_, q, HD, k, HD, v, HD, s.o, HD, s.lse); }
   Scratch scratch;
   real* og = ARENA.get(nn * HD);
   mulK<<<blocks(nn * HD), 256, 0, STREAM>>>(og, s.o, gt, nn * HD);
@@ -134,7 +134,7 @@ inline void gridBackward(GridAttn& g, const Dialect& d, const GridSave& s, const
   real* dO = ARENA.get(nn * HD);
   gateBwdK<<<blocks(nn * HD), 256, 0, STREAM>>>(dog, s.o, gt, dO, dg, nn * HD);
   real* dnb = ARENA.zeros(nn * g.H);
-  sdpaBackward(gridSdpa(g, n, g.transpose ? maskT : mask, s.nb, dnb), q, HD, k, HD, v, HD, dO, HD, dq, HD, dk, HD, dv, HD);
+  sdpaBackward(gridSdpa(g, n, g.transpose ? maskT : mask, s.nb, dnb), q, HD, k, HD, v, HD, dO, HD, dq, HD, dk, HD, dv, HD, false, false, false, s.o, HD, s.lse);
   real* dact = ARENA.get(nn * g.C);
   g.q.backward(s.act, dq, dact, nn);
   g.k.backward(s.act, dk, dact, nn, true);
@@ -157,7 +157,7 @@ struct SingleAttn {
   int C = 0, Cz = 0, H = 0, D = 0;
   real gateConst = 0;                  // chai-1: sigmoid(g + 1), its gating linear's bias a constant
 };
-struct SingleSave { LnSave ln, pln; real *xn, *pn, *pl, *qkvg, *o; int n; };
+struct SingleSave { LnSave ln, pln; real *xn, *pn, *pl, *qkvg, *o; int n; real* lse = nullptr; };
 inline Sdpa singleSdpa(const SingleAttn& a, int n, const real* seqMask, const real* pl, real* dpl = nullptr) {
   Sdpa s;
   s.B = 1; s.H = a.H; s.Q = n; s.K = n; s.D = a.D; s.scale = 1 / sqrt((real)a.D);
@@ -189,7 +189,7 @@ inline SingleSave singleForward(const SingleAttn& a, const real* single, const r
   if (a.gateConst != 0) addConstK<<<blocks((size_t)n * HD), 256, 0, STREAM>>>(g, a.gateConst, (size_t)n * HD);
   sigmoidK<<<blocks((size_t)n * HD), 256, 0, STREAM>>>(g, (size_t)n * HD);
   s.o = ARENA.get((size_t)n * HD);
-  sdpaForward(singleSdpa(a, n, seqMask, s.pl), q, HD, k, HD, v, HD, s.o, HD);
+  { const Sdpa sd_ = singleSdpa(a, n, seqMask, s.pl); s.lse = ARENA.get((size_t)2 * sd_.B * sd_.H * sd_.Q); sdpaForward(sd_, q, HD, k, HD, v, HD, s.o, HD, s.lse); }
   Scratch scratch;
   real* og = ARENA.get((size_t)n * HD);
   mulK<<<blocks((size_t)n * HD), 256, 0, STREAM>>>(og, s.o, g, (size_t)n * HD);
@@ -212,7 +212,7 @@ inline void singleBackward(SingleAttn& a, const SingleSave& s, const real* seqMa
   real* dO = ARENA.get((size_t)n * HD);
   gateBwdK<<<blocks((size_t)n * HD), 256, 0, STREAM>>>(dog, s.o, g, dO, dg, (size_t)n * HD);
   real* dpl = ARENA.zeros(nn * a.H);
-  sdpaBackward(singleSdpa(a, n, seqMask, s.pl, dpl), q, HD, k, HD, v, HD, dO, HD, dq, HD, dk, HD, dv, HD);
+  sdpaBackward(singleSdpa(a, n, seqMask, s.pl, dpl), q, HD, k, HD, v, HD, dO, HD, dq, HD, dk, HD, dv, HD, false, false, false, s.o, HD, s.lse);
   real* dxn = ARENA.get((size_t)n * a.C);
   a.q.backward(s.xn, dq, dxn, n);
   a.k.backward(s.xn, dk, dxn, n, true);

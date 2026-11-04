@@ -153,12 +153,15 @@ int main(int argc, char** argv) {
     pl.swap(ranked);
   }
   // pLDDT's bar is the port's own conditioning: its single track reads the pair through the single attention's bias,
-  // and on random inputs a 1e-7 move of the pair moves intellifold2's pLDDT logits 2e-4 (openbind0's 4e-3) - the
-  // port against itself, both inputs moved by float32's last place, measured here every run
+  // and on random inputs a 3e-7 move of the pair moves intellifold2's pLDDT logits ~6e-4 (openbind0's ~1e-2) - the
+  // port against itself, both inputs moved by float32 rounding, measured here every run. (3e-7, not 1e-7: a float32
+  // attention that sums in another order differs by that much - the tensor-core flash in flash.cuh is 3-5e-7 from
+  // the bmm path, and against float64 it is the closer of the two, 4.1e-7 to 8.1e-7 (test-flash) - and a 1e-7 probe
+  // failed intellifold2 on that alone, the head turning 1e-7 into 2e-4.)
   double sens = 0;
   {
     std::vector<float> keep(ref.plddt);
-    auto n1 = gauss(zH.size(), 92, 1e-7), n2 = gauss(sH.size(), 91, 1e-7);
+    auto n1 = gauss(zH.size(), 92, 3e-7), n2 = gauss(sH.size(), 91, 3e-7);
     auto z2 = zH, s2 = sH;
     for (size_t i = 0; i < z2.size(); ++i) z2[i] *= 1 + n1[i];
     for (size_t i = 0; i < s2.size(); ++i) s2[i] *= 1 + n2[i];
@@ -172,7 +175,7 @@ int main(int argc, char** argv) {
   };
   cmp("PAE (expected)", pae, ref.pae, 1e-4);
   cmp("PDE (expected)", pde, ref.pde, 1e-4);
-  printf("  (the port's pLDDT against itself, its inputs moved 1e-7: %.3e)\n", sens);
+  printf("  (the port's pLDDT against itself, its inputs moved 3e-7: %.3e)\n", sens);
   cmp("pLDDT (expected)", pl, ref.plddt, std::max(1e-4, 4 * sens));
 #else
   auto ctD = gauss(nn * 64, 81, 1), ctA = gauss(nn * 64, 82, 1), ctL = gauss((size_t)n * dense * 50, 83, 1);

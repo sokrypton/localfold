@@ -124,6 +124,7 @@ __global__ void joinColsK(const real* dq, const real* dk, real* dqkv, int n, int
 struct AeSave {
   AeCond c; LnSave l1, ln, lq, lk, l2; SgSave sg;
   real *xn1, *ada1, *nodes, *qkv, *q, *k, *gpre, *o, *og, *attn, *s1, *xn2, *ada2, *tr;
+  real* lse = nullptr;   // the attention's logit max and log-sum, kept for its backward
 };
 inline Sdpa aeSdpa(const AeLayer& l, const real* mask, int n) {
   Sdpa a; a.B = 1; a.H = l.H; a.Q = a.K = n; a.D = l.D / l.H; a.scale = 1 / sqrt((real)a.D); a.keyMask = mask;
@@ -145,7 +146,7 @@ inline AeSave aeForward(AeLayer& l, const real* s, const real* mask, real* sOut,
   v.q = ARENA.get(nD); v.lq = lnForward(l.qn, qr, v.q, n);
   v.k = ARENA.get(nD); v.lk = lnForward(l.kn, kr, v.k, n);
   v.o = ARENA.get(nD);
-  sdpaForward(aeSdpa(l, mask, n), v.q, D, v.k, D, v.qkv + 2 * D, 3 * D, v.o, D);
+  { const Sdpa sd_ = aeSdpa(l, mask, n); v.lse = ARENA.get((size_t)2 * sd_.B * sd_.H * sd_.Q); sdpaForward(sd_, v.q, D, v.k, D, v.qkv + 2 * D, 3 * D, v.o, D, v.lse); }
   v.og = ARENA.get(nD); gateSigK<<<blocks(nD), 256, 0, STREAM>>>(v.o, v.gpre, v.og, nD);
   v.attn = ARENA.get(nD); l.out.forward(v.og, v.attn, n);
   v.s1 = cloneR(s, nD); aeScaleAddK<<<blocks(nD), 256, 0, STREAM>>>(v.attn, v.c.sA, mask, v.s1, n, D);
@@ -176,7 +177,7 @@ inline void aeBackward(AeLayer& l, const AeSave& v, const real* mask, const real
   real *dO = ARENA.get(nD), *dg = ARENA.get(nD);
   gateSigBwdK<<<blocks(nD), 256, 0, STREAM>>>(v.o, v.gpre, dog, dO, dg, nD);
   real *dq = ARENA.get(nD), *dk = ARENA.get(nD), *dqkv = ARENA.zeros(nD * 3);
-  sdpaBackward(aeSdpa(l, mask, n), v.q, D, v.k, D, v.qkv + 2 * D, 3 * D, dO, D, dq, D, dk, D, dqkv + 2 * D, 3 * D);
+  sdpaBackward(aeSdpa(l, mask, n), v.q, D, v.k, D, v.qkv + 2 * D, 3 * D, dO, D, dq, D, dk, D, dqkv + 2 * D, 3 * D, false, false, false, v.o, D, v.lse);
   real *dqr = ARENA.get(nD), *dkr = ARENA.get(nD);
   lnBackward(l.qn, v.lq, dq, dqr, n, false); lnBackward(l.kn, v.lk, dk, dkr, n, false);
   joinColsK<<<blocks(nD * 3), 256, 0, STREAM>>>(dqr, dkr, dqkv, n, D);

@@ -87,6 +87,7 @@ struct BlockSave {
   const real* x0;
   LnSave l1, lq, lk, l2;
   real *xn1, *qkv, *qraw, *kraw, *q, *k, *ctx, *x1, *xn2, *h;
+  real* lse = nullptr;   // the attention's logit max and log-sum, kept for its backward
 };
 inline Sdpa towerSdpa(const Config& c, int R, const int* seq) {
   Sdpa a;
@@ -119,7 +120,7 @@ inline BlockSave blockForward(const Config& c, Block& b, const real* x0, real* x
   rope(s.q, (int)R, c.H, c.D, C, pos, c.ropeBase);
   rope(s.k, (int)R, c.H, c.D, C, pos, c.ropeBase);
   s.ctx = ARENA.get(R * C);
-  sdpaForward(towerSdpa(c, (int)R, seq), s.q, C, s.k, C, s.qkv + 2 * C, 3 * C, s.ctx, C);
+  { const Sdpa sd_ = towerSdpa(c, (int)R, seq); s.lse = ARENA.get((size_t)2 * sd_.B * sd_.H * sd_.Q); sdpaForward(sd_, s.q, C, s.k, C, s.qkv + 2 * C, 3 * C, s.ctx, C, s.lse); }
   s.x1 = ARENA.get(R * C);
   {
     Scratch scratch;
@@ -174,7 +175,7 @@ inline void blockBackward(const Config& c, Block& b, const BlockSave& s, const r
   b.out.backward(s.ctx, du, dctx, R);
   real* dqkv = ARENA.get(R * 3 * C);
   real *dq = ARENA.get(R * C), *dk = ARENA.get(R * C);
-  sdpaBackward(towerSdpa(c, (int)R, seq), s.q, C, s.k, C, s.qkv + 2 * C, 3 * C, dctx, C, dq, C, dk, C, dqkv + 2 * C, 3 * C);
+  sdpaBackward(towerSdpa(c, (int)R, seq), s.q, C, s.k, C, s.qkv + 2 * C, 3 * C, dctx, C, dq, C, dk, C, dqkv + 2 * C, 3 * C, false, false, false, s.ctx, C, s.lse);
   rope(dq, (int)R, c.H, c.D, C, pos, c.ropeBase, true);
   rope(dk, (int)R, c.H, c.D, C, pos, c.ropeBase, true);
   if (c.qkNorm) {

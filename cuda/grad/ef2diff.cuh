@@ -232,6 +232,7 @@ inline void trBackward(Transition& t, const TrSave& s, const real* dy, real* dx,
 struct TokSave {
   real *sna, *snt, *ga, *sha, *gt, *sht, *ogA, *ogT, *an, *x, *q, *kv, *g, *ctx, *cg, *o, *a1, *an2, *x2, *w, *sg, *o2;
   LnSave l1, l2;
+  real* lse = nullptr;   // the attention's logit max and log-sum, kept for its backward
 };
 struct TokenCtx { const real* single; const real* sn; const real* bias; int T; };     // sn: LN(single), affine-free
 inline Sdpa tokenSdpa(const Ef2Denoiser& m, const real* bias, real* grad) {
@@ -258,7 +259,7 @@ inline TokSave tokenForward(Ef2Denoiser& m, TokenBlock& k, const TokenCtx& c, co
   s.kv = ARENA.get(TC * 2); k.kv.forward(s.x, s.kv, T);
   s.g = ARENA.get(TC); k.gate.forward(s.x, s.g, T);
   s.ctx = ARENA.get(TC);
-  sdpaForward(tokenSdpa(m, c.bias, nullptr), s.q, C, s.kv, 2 * C, s.kv + C, 2 * C, s.ctx, C);
+  { const Sdpa sd_ = tokenSdpa(m, c.bias, nullptr); s.lse = ARENA.get((size_t)2 * sd_.B * sd_.H * sd_.Q); sdpaForward(sd_, s.q, C, s.kv, 2 * C, s.kv + C, 2 * C, s.ctx, C, s.lse); }
   s.cg = ARENA.get(TC); sigGateK<<<blocks(TC), 256, 0, STREAM>>>(s.g, ARENA.zeros(C), s.ctx, nullptr, s.cg, T, C, false);
   s.o = ARENA.get(TC); k.out.forward(s.cg, s.o, T);
   s.a1 = cloneR(a, TC); sigGateK<<<blocks(TC), 256, 0, STREAM>>>(s.ogA, k.attnOgB.w, s.o, nullptr, s.a1, T, C, true);
@@ -305,7 +306,7 @@ inline void tokenBackward(Ef2Denoiser& m, TokenBlock& k, const TokenCtx& c, cons
   real *dg = ARENA.get(TC), *dctx = ARENA.zeros(TC);
   sigGateBwdK<<<blocks(TC), 256, 0, STREAM>>>(s.g, zeroB, s.ctx, dcg, dg, dctx, T, C);
   real *dq = ARENA.get(TC), *dkv = ARENA.get(TC * 2);
-  sdpaBackward(tokenSdpa(m, c.bias, dbias), s.q, C, s.kv, 2 * C, s.kv + C, 2 * C, dctx, C, dq, C, dkv, 2 * C, dkv + C, 2 * C);
+  sdpaBackward(tokenSdpa(m, c.bias, dbias), s.q, C, s.kv, 2 * C, s.kv + C, 2 * C, dctx, C, dq, C, dkv, 2 * C, dkv + C, 2 * C, false, false, false, s.ctx, C, s.lse);
   real* dx = ARENA.get(TC);
   k.q.backward(s.x, dq, dx, T); k.kv.backward(s.x, dkv, dx, T, true); k.gate.backward(s.x, dg, dx, T, true);
   real *dga = ARENA.get(TC), *dan = ARENA.zeros(TC);

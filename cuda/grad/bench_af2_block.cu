@@ -14,6 +14,7 @@ int main(int argc, char** argv) {
     else if (!strncmp(argv[i], "--blocks=", 9)) nblocks = atoi(argv[i] + 9);
     else if (!strcmp(argv[i], "--extra")) extra = true;
     else if (!strcmp(argv[i], "--tf32")) TF32 = true;
+    else if (!strcmp(argv[i], "--bf16")) BF16 = true;
   }
   init();
   curandGenerator_t gen; curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT); curandSetPseudoRandomGeneratorSeed(gen, 7);
@@ -47,8 +48,8 @@ int main(int argc, char** argv) {
   }
   GK(cudaGetLastError());
   double inBytes = (double)(mr + pr) * 4;
-  printf("L %d S %d Cm %d (%s): forward %.1f ms, replay %.1f ms, backward %.1f ms -> %.1f ms a block trained (%.2f s for %d blocks)\n",
-         L, S, b.Cm, extra ? "extra" : "main", f, fs, bw, f + fs + bw, (f + fs + bw) * nblocks / 1000, nblocks);
+  printf("L %d S %d Cm %d (%s%s): forward %.1f ms, replay %.1f ms, backward %.1f ms -> %.1f ms a block trained (%.2f s for %d blocks)\n",
+         L, S, b.Cm, extra ? "extra" : "main", BF16 ? ", bf16" : TF32 ? ", tf32" : "", f, fs, bw, f + fs + bw, (f + fs + bw) * nblocks / 1000, nblocks);
   printf("  one block's activations (arena high water) %.0f MiB; the stack's saved inputs %.0f MiB (%d blocks)\n",
          ARENA.high / 1048576.0, inBytes * (nblocks + 1) / 1048576.0, nblocks);
 }

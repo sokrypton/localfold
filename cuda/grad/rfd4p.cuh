@@ -139,7 +139,7 @@ struct PbAttn {
   Linear qkv, g, out, bias;      // qkv [D, 3D] with a bias, g [D, D] with a bias, out [D, D] with a bias, bias [P, H]
   int D = 0, P = 0, H = 0;
 };
-struct PbSave { RmsSave sn, sq, sk, sp; real *nn, *qkv, *q, *k, *g, *pl, *pn, *o; int n; };
+struct PbSave { RmsSave sn, sq, sk, sp; real *nn, *qkv, *q, *k, *g, *pl, *pn, *o; int n; real* lse = nullptr; };
 inline Sdpa pbSdpa(const PbAttn& a, int n, const real* mask, const real* pl, real* dpl = nullptr) {
   Sdpa s;
   s.B = 1; s.H = a.H; s.Q = n; s.K = n; s.D = a.D / a.H; s.scale = 1 / sqrt((real)(a.D / a.H));
@@ -166,7 +166,7 @@ inline PbSave pbForward(const PbAttn& a, const real* x, const real* pair, const 
     af3::gridBiasK<<<blocks(nn * a.H), 256, 0, STREAM>>>(raw, s.pl, n, a.H, false, false);
   }
   s.o = ARENA.get((size_t)n * D);
-  sdpaForward(pbSdpa(a, n, mask, s.pl), s.q, D, s.k, D, s.qkv + 2 * D, 3 * D, s.o, D);
+  { const Sdpa sd_ = pbSdpa(a, n, mask, s.pl); s.lse = ARENA.get((size_t)2 * sd_.B * sd_.H * sd_.Q); sdpaForward(sd_, s.q, D, s.k, D, s.qkv + 2 * D, 3 * D, s.o, D, s.lse); }
   Scratch scratch;
   real* og = ARENA.get((size_t)n * D);
   mulK<<<blocks((size_t)n * D), 256, 0, STREAM>>>(og, s.o, s.g, (size_t)n * D);
@@ -185,7 +185,7 @@ inline void pbBackward(PbAttn& a, const PbSave& s, const real* mask, const real*
   gateBwdK<<<blocks((size_t)n * D), 256, 0, STREAM>>>(dog, s.o, s.g, dO, dg, (size_t)n * D);
   real *dq = ARENA.get((size_t)n * D), *dk = ARENA.get((size_t)n * D), *dqkv = ARENA.get((size_t)n * 3 * D);
   real* dpl = ARENA.zeros(nn * a.H);
-  sdpaBackward(pbSdpa(a, n, mask, s.pl, dpl), s.q, D, s.k, D, s.qkv + 2 * D, 3 * D, dO, D, dq, D, dk, D, dqkv + 2 * D, 3 * D);
+  sdpaBackward(pbSdpa(a, n, mask, s.pl, dpl), s.q, D, s.k, D, s.qkv + 2 * D, 3 * D, dO, D, dq, D, dk, D, dqkv + 2 * D, 3 * D, false, false, false, s.o, D, s.lse);
   rmsBackward(a.qn, s.sq, dq, D, dqkv, 3 * D, false);
   rmsBackward(a.kn, s.sk, dk, D, dqkv + D, 3 * D, false);
   real* dnn = ARENA.get((size_t)n * D);

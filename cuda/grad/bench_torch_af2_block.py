@@ -134,6 +134,7 @@ def main():
   ap.add_argument("--S", type=int, default=128)
   ap.add_argument("--extra", action="store_true")
   ap.add_argument("--tf32", action="store_true")
+  ap.add_argument("--bf16", action="store_true", help="torch.autocast(bfloat16): float32 weights, bf16 matmuls")
   ap.add_argument("--sdpa", action="store_true")
   ap.add_argument("--compile", action="store_true")
   ap.add_argument("--reps", type=int, default=7)
@@ -159,7 +160,8 @@ def main():
     torch.cuda.reset_peak_memory_stats()
     torch.cuda.synchronize()
     ev[0].record()
-    mo, zo = fn(m, z, mm, zm, a.sdpa)
+    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=a.bf16):
+      mo, zo = fn(m, z, mm, zm, a.sdpa)
     loss = (mo * ctm).sum() + (zo * ctz).sum()
     ev[1].record()
     loss.backward()
@@ -168,7 +170,7 @@ def main():
     if r >= 2:
       fw.append(ev[0].elapsed_time(ev[1])); bw.append(ev[1].elapsed_time(ev[2]))
   med = lambda x: sorted(x)[len(x) // 2]
-  print(f"torch L {a.L} S {a.S} Cm {cm} ({'extra' if a.extra else 'main'}{', tf32' if a.tf32 else ''}"
+  print(f"torch L {a.L} S {a.S} Cm {cm} ({'extra' if a.extra else 'main'}{', bf16 autocast' if a.bf16 else ''}{', tf32' if a.tf32 else ''}"
         f"{', sdpa' if a.sdpa else ''}{', compile' if a.compile else ''}): forward {med(fw):.1f} ms, "
         f"backward {med(bw):.1f} ms -> {med(fw) + med(bw):.1f} ms; peak {torch.cuda.max_memory_allocated() / 2**20:.0f} MiB")
 

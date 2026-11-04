@@ -5,7 +5,7 @@
 #include "ops.cuh"
 using namespace grad;
 int main(int argc, char** argv) {
-  for (int i = 1; i < argc; ++i) if (!strcmp(argv[i], "--tf32")) TF32 = true;
+  for (int i = 1; i < argc; ++i) if (!strcmp(argv[i], "--tf32")) TF32 = true; else if (!strcmp(argv[i], "--bf16")) BF16 = true;
   init();
   curandGenerator_t gen; curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT); curandSetPseudoRandomGeneratorSeed(gen, 1);
   auto randn = [&](size_t n) { float* p; GK(cudaMalloc(&p, ((n + 1) & ~1) * 4)); curandGenerateNormal(gen, p, (n + 1) & ~1, 0.f, 1.f); return p; };

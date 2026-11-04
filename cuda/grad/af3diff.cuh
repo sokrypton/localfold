@@ -165,6 +165,7 @@ struct DiffBlockSave {
   LnSave lq, lk;
   real *qkvg, *qraw, *kraw, *o, *og, *x1, *h, *u, *g;
   AzSave z1, z2;
+  real* lse = nullptr;   // the attention's logit max and log-sum, kept for its backward
 };
 inline Sdpa tokenSdpa(const DiffBlock& b, int n, const real* mask, const real* pl, real* dpl = nullptr) {
   Sdpa a;
@@ -209,7 +210,7 @@ inline DiffBlockSave diffBlockForward(const DiffTransformer& t, const DiffBlock&
   b.v.forward(x, v, n); b.gate.forward(x, g, n);
   sigmoidK<<<blocks((size_t)n * HD), 256, 0, STREAM>>>(g, (size_t)n * HD);
   s.o = ARENA.get((size_t)n * HD);
-  sdpaForward(tokenSdpa(b, n, mask, pl), q, HD, k, HD, v, HD, s.o, HD);
+  { const Sdpa sd_ = tokenSdpa(b, n, mask, pl); s.lse = ARENA.get((size_t)2 * sd_.B * sd_.H * sd_.Q); sdpaForward(sd_, q, HD, k, HD, v, HD, s.o, HD, s.lse); }
   s.og = ARENA.get((size_t)n * HD);
   mulK<<<blocks((size_t)n * HD), 256, 0, STREAM>>>(s.og, s.o, g, (size_t)n * HD);
   s.x1 = ARENA.get((size_t)n * C);
@@ -259,7 +260,7 @@ inline void diffBlockBackward(const DiffTransformer& t, DiffBlock& b, const Diff
   real *dq = dqkvg, *dk = dq + (size_t)n * HD, *dv = dk + (size_t)n * HD, *dgt = dv + (size_t)n * HD;
   real* dO = ARENA.get((size_t)n * HD);
   gateBwdK<<<blocks((size_t)n * HD), 256, 0, STREAM>>>(dog, s.o, g, dO, dgt, (size_t)n * HD);
-  sdpaBackward(tokenSdpa(b, n, mask, pl, dpl), q, HD, k, HD, v, HD, dO, HD, dq, HD, dk, HD, dv, HD);
+  sdpaBackward(tokenSdpa(b, n, mask, pl, dpl), q, HD, k, HD, v, HD, dO, HD, dq, HD, dk, HD, dv, HD, false, false, false, s.o, HD, s.lse);
   real* x = ARENA.get((size_t)n * C);
   {
     real* sh = ARENA.get((size_t)n * C);
@@ -420,7 +421,7 @@ struct AtomCtx {               // what every block of a stack shares
   const real *qMask, *kMask, *qCond, *kCond, *maskBias;
   int subsets = 0, Q = 32, K = 128;
 };
-struct AtomSave { AdaSave aq, ak, af; LnSave lq, lk; real *act0, *keys, *xq, *xk, *qkvg, *qraw, *kraw, *o, *og, *x1, *h, *u, *g; AzSave z1, z2; };
+struct AtomSave { AdaSave aq, ak, af; LnSave lq, lk; real *act0, *keys, *xq, *xk, *qkvg, *qraw, *kraw, *o, *og, *x1, *h, *u, *g; AzSave z1, z2; real* lse = nullptr; };
 inline Sdpa atomSdpa(const AtomBlock& b, const AtomCtx& c, const real* pl, real* dpl = nullptr) {
   Sdpa a;
   a.B = c.subsets; a.H = b.H; a.Q = c.Q; a.K = c.K; a.D = b.D; a.scale = 1 / sqrt((real)b.D);
@@ -447,7 +448,7 @@ inline AtomSave atomForward(const AtomBlock& b, const AtomCtx& c, const real* ac
   b.gate.forward(s.xq, g, Rq); b.v.forward(s.xk, v, Rk);
   sigmoidK<<<blocks(Rq * HD), 256, 0, STREAM>>>(g, Rq * HD);
   s.o = ARENA.get(Rq * HD);
-  sdpaForward(atomSdpa(b, c, pl), q, HD, k, HD, v, HD, s.o, HD);
+  { const Sdpa sd_ = atomSdpa(b, c, pl); s.lse = ARENA.get((size_t)2 * sd_.B * sd_.H * sd_.Q); sdpaForward(sd_, q, HD, k, HD, v, HD, s.o, HD, s.lse); }
   s.og = ARENA.get(Rq * HD);
   mulK<<<blocks(Rq * HD), 256, 0, STREAM>>>(s.og, s.o, g, Rq * HD);
   s.x1 = cloneR(s.act0, Rq * C);
@@ -488,7 +489,7 @@ inline void atomBackward(AtomBlock& b, const AtomCtx& c, const AtomSave& s, cons
   real *dq = d, *dgt = dq + Rq * HD, *dk = dgt + Rq * HD, *dv = dk + Rk * HD;
   real* dO = ARENA.get(Rq * HD);
   gateBwdK<<<blocks(Rq * HD), 256, 0, STREAM>>>(dog, s.o, g, dO, dgt, Rq * HD);
-  sdpaBackward(atomSdpa(b, c, pl, dpl), q, HD, k, HD, v, HD, dO, HD, dq, HD, dk, HD, dv, HD);
+  sdpaBackward(atomSdpa(b, c, pl, dpl), q, HD, k, HD, v, HD, dO, HD, dq, HD, dk, HD, dv, HD, false, false, false, s.o, HD, s.lse);
   real *dxq = ARENA.get(Rq * C), *dxk = ARENA.get(Rk * C);
   if (b.kqNorm) {
     real *dqr = ARENA.get(Rq * HD), *dkr = ARENA.get(Rk * HD);

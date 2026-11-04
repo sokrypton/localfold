@@ -31,8 +31,14 @@ typedef double real;
 #else
 typedef float real;
 #endif
+// BF16: float32 storage, every float GEMM on the bf16 tensor cores (cuBLAS rounds the operands, float32
+// accumulation) and the flash attention on bf16 mma - the precision a bf16 training run computes in. Off by default.
+inline bool BF16 = false;
 inline cublasStatus_t xgemm(cublasHandle_t h, cublasOperation_t a, cublasOperation_t b, int m, int n, int k,
                             const float* al, const float* A, int la, const float* B, int lb, const float* be, float* C, int lc) {
+  if (BF16)
+    return cublasGemmEx(h, a, b, m, n, k, al, A, CUDA_R_32F, la, B, CUDA_R_32F, lb, be, C, CUDA_R_32F, lc,
+                        CUBLAS_COMPUTE_32F_FAST_16BF, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
   return cublasSgemm(h, a, b, m, n, k, al, A, la, B, lb, be, C, lc);
 }
 inline cublasStatus_t xgemm(cublasHandle_t h, cublasOperation_t a, cublasOperation_t b, int m, int n, int k,
@@ -42,6 +48,10 @@ inline cublasStatus_t xgemm(cublasHandle_t h, cublasOperation_t a, cublasOperati
 inline cublasStatus_t xgemmB(cublasHandle_t h, cublasOperation_t a, cublasOperation_t b, int m, int n, int k, const float* al,
                              const float* A, int la, long long sa, const float* B, int lb, long long sb, const float* be,
                              float* C, int lc, long long sc, int count) {
+  if (BF16)
+    return cublasGemmStridedBatchedEx(h, a, b, m, n, k, al, A, CUDA_R_32F, la, sa, B, CUDA_R_32F, lb, sb, be, C,
+                                      CUDA_R_32F, lc, sc, count, CUBLAS_COMPUTE_32F_FAST_16BF,
+                                      CUBLAS_GEMM_DEFAULT_TENSOR_OP);
   return cublasSgemmStridedBatched(h, a, b, m, n, k, al, A, la, sa, B, lb, sb, be, C, lc, sc, count);
 }
 inline cublasStatus_t xgemmB(cublasHandle_t h, cublasOperation_t a, cublasOperation_t b, int m, int n, int k, const double* al,
@@ -72,6 +82,7 @@ inline void init() {
   GB(cublasSetStream(BLAS, STREAM));
   GB(cublasSetMathMode(BLAS, TF32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_PEDANTIC_MATH));
 }
+inline void setBf16(bool on) { BF16 = on; }
 inline void setTf32(bool on) {
   TF32 = on;
   if (BLAS) GB(cublasSetMathMode(BLAS, on ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_PEDANTIC_MATH));
