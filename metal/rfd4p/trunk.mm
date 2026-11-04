@@ -106,11 +106,13 @@ void tokenLayer(int layer, float* s, Z z, const float* c, const half* cH, const 
   if (HALF) {
     linH(nodeNh, MHA + "to_qkv.weight", qkvg, n, D, 3 * D, M.f("w/" + MHA + "to_qkv.bias"), false, 4 * D);
     linH(nodeNh, MHA + "to_g.weight", qkvg + 3 * D, n, D, D, M.f("w/" + MHA + "to_g.bias"), false, 4 * D);
-    RfdRmsArgs rq{}; rq.xh = qkvg; rq.yh = qkvg; rq.w = M.f("w/" + MHA + "q_layer_norm.weight");
-    rq.rows = n; rq.C = D; rq.ldx = 4 * D; rq.ldy = 4 * D; rq.eps = 1e-5f;
-    run("rfd4p_rms_norm", grid1d((size_t)(n + 7) / 8, 1), 256, rq);
-    RfdRmsArgs rk = rq; rk.xh = qkvg + D; rk.yh = qkvg + D; rk.w = M.f("w/" + MHA + "k_layer_norm.weight");
-    run("rfd4p_rms_norm", grid1d((size_t)(n + 7) / 8, 1), 256, rk);
+    // q and k in ONE dispatch: independent, and a dispatch costs more than either (kernels.h says why)
+    RfdRms2Args rqk{};
+    rqk.xh = qkvg; rqk.yh = qkvg;
+    rqk.w1 = M.f("w/" + MHA + "q_layer_norm.weight");
+    rqk.w2 = M.f("w/" + MHA + "k_layer_norm.weight");
+    rqk.rows = (size_t)n; rqk.C = (uint)D; rqk.ld = (uint)(4 * D); rqk.eps = 1e-5f; rqk.off2 = (size_t)D;
+    run("rfd4p_rms_norm2", grid1d((size_t)(2 * n + 7) / 8, 1), 256, rqk);
   } else {
     lin(nodeN, MHA + "to_qkv.weight", qkv, n, D, 3 * D, M.f("w/" + MHA + "to_qkv.bias"));
     // q and k are normed in place out of the packed row (`use_qkln`); v is read where it lies, by stride.

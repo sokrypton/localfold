@@ -126,29 +126,29 @@
 // the -0.07 / -0.16 / -0.15 / +0.27 s it produced was noise, as its own sign disagreement should have said.
 // A control arm that cannot vary the thing under test is not a control: CLAUDE.md's own rule, earned again.
 //
-// 🔴 AND A STEP'S WALL IS 1.9x ITS SUMMED KERNEL TIME - CHASED, NOT JUST NOTED. At 183 tokens a step is
-// **230.6 ms** against the profile's **121.6 ms** over 419 dispatches. Where the 109 went, by elimination:
-//   * NOT a spurious serialisation. `Model::hostI` is `i(name); sync(); host(p)` - every one DRAINS the queue -
-//     and the step loop made three such calls (the coordinate groups, the chirality frames and owners, the
-//     padding mask), all LOOP-INVARIANT, so sixty drains a generation. They are read once before the loop now.
-//     The wall did not move (12.87 to 12.84 s): the wait was real GPU work, which just surfaces at the next
-//     blocking call instead. Worth keeping anyway - a loop-invariant read does not belong in the loop - but it
-//     is not the lever.
-//   * NOT the submission granularity. core commits every 128 encoded dispatches; swept at 8 / 32 / 128 / 512 /
-//     4096 the wall rises monotonically, which looks decisive and is THERMAL DRIFT - the sweep runs in that
-//     order on a laptop that heats up. Interleaved, 8 against 128 gives +0.59, +0.47, -0.10, -0.07 s: a wash.
-//   * AND THE PROFILE ONLY SEES WHAT IS LABELLED. `profiled.push_back` happens for a dispatch with a label;
-//     an unlabelled one is committed and never timed. So 121.6 ms is a sum over labelled dispatches, not over
-//     the step, and the gap is unmeasured GPU work plus per-dispatch launch latency (419 of them; at 54
-//     residues the same ~419 cost a 52 ms step, so latency is ~0.12 ms each, ~50 ms of it). Attributing the
-//     rest needs a GPU trace, which a shell here cannot take - but the port is GPU-BOUND, not host-bound, and
-//     that is now measured rather than assumed.
-// 🔴 AND ONE OF MY OWN EXPERIMENTS WAS INVALID, which is the useful part. "Doubling the trunk with
-// `--recycles=2` costs 1.2%" was vacuous: the SAMPLER takes its depth from `depths[st]`, the export's
-// `g/depths`, and `--recycles=` sets `D_.nRecycle`, which only the gate path reads. cuda/rfd4p is the same
-// (`o.recycles` feeds its trunk arm, its generation reads the export), so the flag's scope is consistent
-// between the ports - but the test proved nothing, and this is the second control in one round that could not
-// vary the thing under test.
+// 🔴 AND THE STEP IS 46% PER-DISPATCH OVERHEAD, WHICH IS NOW MEASURED RATHER THAN INFERRED. A step's wall is
+// 230.6 ms while the per-dispatch profile sums 123.2 ms over 419 dispatches, and two earlier explanations of
+// that gap were both wrong: `Model::hostI` does `sync()` so three loop-invariant reads were draining the queue
+// sixty times a generation (hoisted out - correct, and the wall did not move), and the profile does NOT miss
+// unlabelled work (`dispatch` defaults the label to the kernel's own name, so all 419 are timed).
+// What settles it is a measurement core could not make: `LF_GPUBUSY` sums every COMMITTED command buffer's own
+// `GPUEndTime - GPUStartTime` with batching left ON, which the per-dispatch profile cannot do because it gives
+// each dispatch a buffer of its own. It reports **228.1 ms a step over 11 buffers** against a 230.6 ms wall.
+// So the GPU is busy ~100% of the step and the port is GPU-BOUND - and the 105 ms between 228.1 and 123.2 is
+// GPU-side overhead spread over 419 dispatches, about **0.25 ms each**.
+// 🔴 SO THE LEVER IS THE DISPATCH COUNT, AND THE CENSUS SAYS WHERE: `rfd4p_rms_norm` runs **51 times for
+// 1.87 ms** of kernel, `rfd4p_adaln_rows` **28 times for 0.65 ms**. Those are not kernels to make faster, they
+// are dispatches to stop making. It also explains why the gate's fusion paid 5.2% for a kernel share that
+// looked smaller: it removed 14 dispatches as well as two passes over four planes.
+// 🔴 AND ONE MERGE IS TAKEN, WITH ITS WALL EFFECT HONESTLY UNMEASURABLE HERE. q and k are the one pair of
+// independent norms (both read `to_qkv`'s output and write different slices; the node norm before them and the
+// two adaLNs are sequential, since the transition's reads `s` after the attention), so they are one dispatch
+// now: **419 dispatches to 405 and 123.2 ms of kernel to 119.8**. The predicted wall gain is 14 x 0.25 =
+// 3.6 ms a step, 1.6%, and this laptop cannot show it: after a long benchmarking session it drifts **52%**
+// across eight runs, and consecutive runs of the SAME binary differ by 0.6 s. Both orderings were taken, and
+// the sign follows the order rather than the arm - ABAB +0.73 / +1.40 / +0.51 / +0.17 s, BABA -0.20 / -0.76 /
+// -0.44 - so whichever arm runs second loses. Kept on the dispatch count and the kernel sum, which are not
+// thermal; not claimed as a wall win.
 //
 // So no kernel here is worth another tile sweep. The lever left is FEWER PASSES OVER THE PAIR TRACK - fusing an
 // elementwise pass into the epilogue of the GEMM that produced it, as the gate, the residual and the next

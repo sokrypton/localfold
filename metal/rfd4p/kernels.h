@@ -31,6 +31,15 @@ struct RfdScaleAddArgs { DP(float) x; CP(float) y; CP(float) gamma; u64 rows; in
 // `outH`: the gated context in half as well, for the projection that reads it next
 struct RfdAttnArgs { CP(float) q; CP(float) k; CP(float) v; CP(float) bias; CP(float) g; DP(float) out;
                      uint n, heads, dimHead, ldv; u64 vOff; float scale; DP(half) outH; };
+// 🔴 TWO INDEPENDENT RMSNorms IN ONE DISPATCH, BECAUSE A DISPATCH COSTS MORE THAN THIS KERNEL DOES. Measured
+// on an M5: a step's 419 dispatches take the GPU 228.1 ms while their kernels sum to 123.2 - about 0.25 ms of
+// GPU-side overhead EACH, 46% of the step - and `rfd4p_rms_norm` runs 51 times a step for 1.87 ms of work.
+// q and k are the pair that can merge: both read `to_qkv`'s output and write different slices of the packed
+// row, so neither depends on the other. (The node norm before them and the two adaLNs cannot: the transition's
+// adaLN reads `s` after the attention has updated it.) A simdgroup still takes one row; the grid is twice the
+// rows and `which` picks the slice and its weight.
+struct RfdRms2Args { CP(half) xh; DP(half) yh; CP(float) w1; CP(float) w2; u64 rows; uint C, ld; float eps;
+                     u64 off2; };
 // the pair bias's two halves, where the norm is folded into the projection's weight instead of materialised:
 // `inv[r] = rsqrt(mean(z[r]^2) + eps)` a row, and then that applied down the [H][rows] product's COLUMNS.
 //

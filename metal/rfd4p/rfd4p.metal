@@ -46,6 +46,22 @@ kernel void rfd4p_bias_scale(LF_ARGS(RfdBiasScaleArgs)) {
   a.bias[t] = (half)((float)a.bias[t] * a.inv[t % a.rows]);
 }
 
+kernel void rfd4p_rms_norm2(constant RfdRms2Args& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
+                            uint3 ng [[threadgroups_per_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                            uint lane [[thread_index_in_simdgroup]]) {
+  const ulong slot = (ulong)(tg.y * ng.x + tg.x) * 8 + sg;
+  if (slot >= a.rows * 2) return;
+  const bool second = slot >= a.rows;
+  const ulong row = second ? slot - a.rows : slot;
+  device const half* x = a.xh + row * a.ld + (second ? a.off2 : 0);
+  device half* y = a.yh + row * a.ld + (second ? a.off2 : 0);
+  device const float* w = second ? a.w2 : a.w1;
+  float s = 0;
+  for (uint c = lane; c < a.C; c += 32) { const float v = (float)x[c]; s += v * v; }
+  const float inv = rsqrt(simd_sum(s) / (float)a.C + a.eps);
+  for (uint c = lane; c < a.C; c += 32) y[c] = (half)((float)x[c] * inv * w[c]);
+}
+
 kernel void rfd4p_swiglu(LF_ARGS(RfdSwigluArgs)) {
   const ulong t = LF_INDEX;
   if (t >= a.rows * a.I) return;

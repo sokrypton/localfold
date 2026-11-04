@@ -43,6 +43,7 @@ static const MTLGPUFamily APPLE10 = (MTLGPUFamily)1010;
 static const MTLLanguageVersion LANGUAGE4 = (MTLLanguageVersion)(4 << 16);
 
 namespace {
+void gpuBusyAdd(double gpuMs, double kernelMs);
 struct Alloc { id<MTLBuffer> buf; uint64_t addr; size_t size; };
 struct Stats { double syncMs = 0, compileMs = 0; long dispatches = 0, commits = 0, syncs = 0, staged = 0, allocs = 0, gemms = 0; };
 
@@ -75,6 +76,7 @@ struct Device {
   bool tensorOps = false;
   // profiling
   bool profileOn = false;
+  static bool gpuBusyOn() { static const bool on = getenv("LF_GPUBUSY") != nullptr; return on; }
   std::vector<std::pair<std::string, id<MTLCommandBuffer>>> profiled;
   Stats stats;
   // scratch
@@ -211,6 +213,13 @@ struct Device {
     }
     long seq;
     { std::lock_guard<std::mutex> g(inflightMu); seq = ++committedSeq; pending.insert(seq); }
+    // LF_GPUBUSY: every committed buffer's own GPU span, summed, with BATCHING LEFT ON - which is the one
+    // thing the per-dispatch profile cannot report, because it gives each dispatch a buffer of its own.
+    if (gpuBusyOn()) {
+      [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        gpuBusyAdd((done.GPUEndTime - done.GPUStartTime) * 1e3, (done.kernelEndTime - done.kernelStartTime) * 1e3);
+      }];
+    }
     [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
       if (done.error) {
         std::lock_guard<std::mutex> g(errorMu);
@@ -438,8 +447,29 @@ struct Device {
     }
   }
 };
+static std::mutex GPU_BUSY_MU;
+static double GPU_BUSY_MS = 0, GPU_KERNEL_MS = 0;
+static long GPU_BUSY_N = 0;
+void gpuBusyAdd(double gpuMs, double kernelMs) {
+  std::lock_guard<std::mutex> g(GPU_BUSY_MU);
+  GPU_BUSY_MS += gpuMs; GPU_KERNEL_MS += kernelMs; ++GPU_BUSY_N;
+}
+void gpuBusySnapshot(double* gpu, double* kern, long* n);
 Device& D() { static Device* d = new Device(); return *d; }
+void gpuBusySnapshot(double* gpu, double* kern, long* n) {
+  std::lock_guard<std::mutex> g(GPU_BUSY_MU);
+  *gpu = GPU_BUSY_MS; *kern = GPU_KERNEL_MS; *n = GPU_BUSY_N;
+}
 }  // namespace
+
+void gpuBusyReport(const char* what, int over) {
+  double gpu = 0, kern = 0; long n = 0;
+  gpuBusySnapshot(&gpu, &kern, &n);
+  if (!n) return;
+  fprintf(stderr, "%s: %ld command buffers, GPU busy %.1f ms, kernel %.1f ms", what, n, gpu, kern);
+  if (over > 0) fprintf(stderr, " (%.1f and %.1f a step over %d)", gpu / over, kern / over, over);
+  fprintf(stderr, "\n");
+}
 
 // ---------------------------------------------------------------- memory
 void* alloc(size_t bytes) { return D().alloc(bytes); }

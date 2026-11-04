@@ -797,6 +797,7 @@ int generate(const std::string& genDir, const std::string& outPath, int designs,
     }
     printf("generated %d residues, %d atoms over %d steps (%d sequence positions read out) -> %s\n", emitted, atoms,
            steps, filled, path.c_str());
+    if (getenv("LF_GPUBUSY")) gpuBusyReport("the whole generation", steps);
     printf("  consecutive CA-CA: median %.2f A, min %.2f, max %.2f\n", d.caSpacing[0], d.caSpacing[1],
            d.caSpacing[2]);
     // 🔴 AND WHAT UPSTREAM'S EVALUATION WOULD SAY ABOUT IT: the design metrics under the job's own
