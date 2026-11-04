@@ -29,8 +29,11 @@ int main(int argc, char** argv) {
         ARENA.reset();
         cudaEventRecord(e[0], STREAM);
         if (bfIn && f) {
-          static bf* pk = nullptr; static bf* dpk = nullptr;
-          if (!pk) { GK(cudaMalloc(&pk, n * 4 * 2)); GK(cudaMalloc(&dpk, n * 4 * 2)); GK(cudaMemset(pk, 0, n * 8)); }
+          static bf* pk = nullptr; static bf* dpk = nullptr; static size_t cap = 0;
+          if (cap < n) {   // (this shape's packed buffers: a later shape is larger)
+            if (pk) { GK(cudaFree(pk)); GK(cudaFree(dpk)); }
+            GK(cudaMalloc(&pk, n * 4 * 2)); GK(cudaMalloc(&dpk, n * 4 * 2)); GK(cudaMemset(pk, 0, n * 8)); cap = n;
+          }
           const int P = 4 * HD;
           sdpaForwardBf(a, pk, P, pk + HD, P, pk + 2 * HD, P, o, HD, lse);
           cudaEventRecord(e[1], STREAM);

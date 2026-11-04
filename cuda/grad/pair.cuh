@@ -163,24 +163,30 @@ __global__ void triPrepBfK(bf* __restrict__ pre, const real* __restrict__ mask, 
     if (r < rows && c < I2) ab[(size_t)planeOf(c, I2, inter) * rows + r] = __float2bfloat16(tile[tx][k]);
   }
 }
-// mergeGateBwdTBf reading proj, gate and writing their gradients at row stride P
+// mergeGateBwdTBf reading proj, gate and writing their gradients at row stride P: a 32-row x 64-column tile, the
+// channel-major read coalesced along rows, the row-major side a column pair (bf162) a thread
 __global__ void mergeGateBwdLdBfK(const bf* __restrict__ dab, const bf* __restrict__ pre, const real* __restrict__ mask,
                                   bf* __restrict__ dpre, size_t rows, int I2, int P, bool inter) {
-  __shared__ float tile[32][33];
+  __shared__ float tile[32][65];
   const size_t r0 = (size_t)blockIdx.x * 32;
-  const int c0 = blockIdx.y * 32, tx = threadIdx.x, ty = threadIdx.y;
-  for (int k = ty; k < 32; k += 8) {
+  const int c0 = blockIdx.y * 64, tx = threadIdx.x, ty = threadIdx.y;
+  for (int k = ty; k < 64; k += 8) {
     const int c = c0 + k; const size_t r = r0 + tx;
     if (r < rows && c < I2) tile[tx][k] = bfv(dab[(size_t)planeOf(c, I2, inter) * rows + r]);
   }
   __syncthreads();
+  const int c = c0 + 2 * tx;
+  if (c >= I2) return;
   for (int k = ty; k < 32; k += 8) {
-    const size_t r = r0 + k; const int c = c0 + tx;
-    if (r >= rows || c >= I2) continue;
+    const size_t r = r0 + k;
+    if (r >= rows) continue;
     const size_t i = r * P + c;
-    const float d = tile[k][tx], sg = bfv(pre[i + I2]);
-    dpre[i] = __float2bfloat16(mask ? d * sg * mask[r] : d * sg);
-    dpre[i + I2] = __float2bfloat16(d * bfv(pre[i]) * sg * (1.f - sg));
+    const float2 pj = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(pre + i));
+    const float2 sg = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(pre + i + I2));
+    const float d0 = tile[k][2 * tx], d1 = tile[k][2 * tx + 1], m = mask ? mask[r] : 1.f;
+    *reinterpret_cast<__nv_bfloat162*>(dpre + i) = __floats2bfloat162_rn(d0 * sg.x * m, d1 * sg.y * m);
+    *reinterpret_cast<__nv_bfloat162*>(dpre + i + I2) =
+        __floats2bfloat162_rn(d0 * pj.x * sg.x * (1.f - sg.x), d1 * pj.y * sg.y * (1.f - sg.y));
   }
 }
 // out = pre_out * og, og at row stride P: dpre_out = dy og (contiguous), d og_pre = dy pre_out og (1 - og) at P
@@ -267,7 +273,7 @@ inline void triMulBackwardBf(TriMul& m, const TriMulSave& s, const real* mask, c
     bmmBf(false, false, L, L, L, B, st, dccm, st, dA, st, m.I, alpha);
     bmmBf(false, true, L, L, L, A, st, dccm, st, dB, st, m.I, alpha);
   }
-  dim3 g2((unsigned)((rows + 31) / 32), (I2 + 31) / 32);
+  dim3 g2((unsigned)((rows + 31) / 32), (I2 + 63) / 64);
   mergeGateBwdLdBfK<<<g2, b, 0, STREAM>>>(dab, pre, m.masked ? mask : nullptr, dpre, rows, I2, P, m.interleaved);
   const Linear* roles[3] = {&m.proj, &m.gate, &m.gating};
   const int off[3] = {0, I2, 2 * I2};

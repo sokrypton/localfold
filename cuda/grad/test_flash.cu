@@ -89,7 +89,8 @@ int main() {
       printf("\n");
     }
   }
-  // the bf16 backward's bias gradient is summed in fixed point: bitwise the same on every run (float atomics are not)
+  // with Sdpa::deterministic the bf16 backward's bias gradient is summed in fixed point: bitwise the same on every
+  // run (float atomics are not)
   {
     setTf32(false); setBf16(true); FLASH = true;
     const int B = 64, H = 4, Q = 96, D = 32, HD = H * D;
@@ -99,7 +100,7 @@ int main() {
     std::vector<float> g[2];
     for (int r = 0; r < 2; ++r) {
       float* db = zeros((size_t)H * Q * Q);
-      Sdpa a; a.B = B; a.H = H; a.Q = a.K = Q; a.D = D; a.scale = 1.f / sqrtf((float)D);
+      Sdpa a; a.B = B; a.H = H; a.Q = a.K = Q; a.D = D; a.scale = 1.f / sqrtf((float)D); a.deterministic = true;
       a.bias[0] = Bias{bb, 0, (long long)Q * Q, Q, db};
       sdpaForward(a, q, HD, k, HD, v, HD, o, HD, lse);
       sdpaBackward(a, q, HD, k, HD, v, HD, dO, HD, dq, HD, dk, HD, dv, HD, false, false, false, o, HD, lse);

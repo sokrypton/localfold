@@ -262,6 +262,9 @@ struct Sdpa {
   bool clip = false;                // AF2's clip of the logits to +-1e8
   const int* seqQ = nullptr;        // [Q] and [K]: a key whose id differs from the query's is excluded (a chain mask)
   const int* seqK = nullptr;
+  // the bf16 backward's bias gradients summed in fixed point, bitwise the same on every run; off, float atomics
+  // (5% of AF3's pairformer backward at n 384, where the bias is shared by 384 batch rows: 226 M atomics a call)
+  bool deterministic = false;
 };
 
 __global__ void softmaxBiasK(real* __restrict__ S, Sdpa a, int b0, int nb) {
@@ -441,27 +444,33 @@ inline void sdpaForwardBf(const Sdpa& a, const bf* q, int ldq, const bf* k, int 
   sdpaForward(a, widen(q, (size_t)a.B * a.Q * ldq), ldq, widen(k, (size_t)a.B * a.K * ldk), ldk,
               widen(v, (size_t)a.B * a.K * ldv), ldv, o, ldo, lse);
 }
-template <class DKV>   // (dk, dv in bf16 for a module whose projections consume them so; dq is float, its atomics')
+template <class DKV, class DOT>   // (dk, dv in bf16 for a module whose projections consume them so; dq is float, its
+                                  // atomics'; dO float or bf16 - bf16 needs the row term DiIn formed by the caller)
 inline void sdpaBackwardBf(const Sdpa& a, const bf* q, int ldq, const bf* k, int ldk, const bf* v, int ldv,
-                           const float* dO, int lddo, float* dq, int lddq, DKV* dk, int lddk, DKV* dv, int lddv,
+                           const DOT* dO, int lddo, float* dq, int lddq, DKV* dk, int lddk, DKV* dv, int lddv,
                            const float* o, int ldo, const float* lse, const float* DiIn = nullptr) {
   Scratch scratch;
   const int H = a.H, Q = a.Q, D = a.D;
   if (FLASH && flash::supported(D)) {
     const real* Di = DiIn;   // (the row term sum_d dO o, when the gate's backward has already formed it)
-    if (!Di) { real* t = ARENA.get((size_t)a.B * H * Q); flash::rowDot(dO, lddo, o, ldo, t, a.B, H, Q, D); Di = t; }
+    if (!Di) {
+      if constexpr (sizeof(DOT) == 2) { fprintf(stderr, "sdpaBackwardBf: a bf16 dO needs its row term\n"); exit(1); }
+      else { real* t = ARENA.get((size_t)a.B * H * Q); flash::rowDot(dO, lddo, o, ldo, t, a.B, H, Q, D); Di = t; }
+    }
     if (lddq == H * D) GK(cudaMemsetAsync(dq, 0, (size_t)a.B * Q * H * D * sizeof(real), STREAM));
     else flash::zeroColsK<<<blocks((size_t)a.B * Q * H * D), 256, 0, STREAM>>>(dq, lddq, (size_t)a.B * Q, H * D);
     flash::runBackwardBfIn(a, q, ldq, k, ldk, v, ldv, dO, lddo, lse, Di, dq, lddq, dk, lddk, dv, lddv, false, false);
     return;
   }
+  const float* dOf;
+  if constexpr (sizeof(DOT) == 2) dOf = widen(dO, (size_t)a.B * a.Q * lddo); else dOf = dO;
   if constexpr (sizeof(DKV) == 4) {
     sdpaBackward(a, widen(q, (size_t)a.B * a.Q * ldq), ldq, widen(k, (size_t)a.B * a.K * ldk), ldk,
-                 widen(v, (size_t)a.B * a.K * ldv), ldv, dO, lddo, dq, lddq, dk, lddk, dv, lddv);
+                 widen(v, (size_t)a.B * a.K * ldv), ldv, dOf, lddo, dq, lddq, dk, lddk, dv, lddv);
   } else {   // the bmm path writes float: dk, dv through a float copy at the same leading dimensions
     float *fk = ARENA.get((size_t)a.B * a.K * lddk), *fv = ARENA.get((size_t)a.B * a.K * lddv);
     sdpaBackward(a, widen(q, (size_t)a.B * a.Q * ldq), ldq, widen(k, (size_t)a.B * a.K * ldk), ldk,
-                 widen(v, (size_t)a.B * a.K * ldv), ldv, dO, lddo, dq, lddq, fk, lddk, fv, lddv);
+                 widen(v, (size_t)a.B * a.K * ldv), ldv, dOf, lddo, dq, lddq, fk, lddk, fv, lddv);
     narrowColsK<<<blocks((size_t)a.B * a.K * a.H * a.D), 256, 0, STREAM>>>(fk, dk, lddk, (size_t)a.B * a.K, a.H * a.D);
     narrowColsK<<<blocks((size_t)a.B * a.K * a.H * a.D), 256, 0, STREAM>>>(fv, dv, lddv, (size_t)a.B * a.K, a.H * a.D);
   }
@@ -592,8 +601,11 @@ __global__ void gateBwdLdBfK(const real* dog, const real* o, const bf* g, real* 
   dO[t] = dog[t] * s;
   dgp[i] = __float2bfloat16(dog[t] * o[t] * s * (1.f - s));
 }
+__device__ __forceinline__ float stR(float* p, float v) { *p = v; return v; }
+__device__ __forceinline__ float stR(bf* p, float v) { *p = __float2bfloat16(v); return __bfloat162float(*p); }
+template <class DOT>   // (dO written float, or bf16 for the attention to read in place; the row term is of what is written)
 __global__ void gateBwdLdDiBfK(const real* __restrict__ dog, const real* __restrict__ o, const bf* __restrict__ g,
-                               real* __restrict__ dO, bf* __restrict__ dgp, float* __restrict__ Di, size_t rows,
+                               DOT* __restrict__ dO, bf* __restrict__ dgp, float* __restrict__ Di, size_t rows,
                                int H, int D, int ld, int Q) {
   const size_t w = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) / 32;
   const int lane = threadIdx.x & 31;
@@ -602,8 +614,8 @@ __global__ void gateBwdLdDiBfK(const real* __restrict__ dog, const real* __restr
   float acc = 0.f;
   for (int d = lane; d < D; d += 32) {
     const size_t t = row * H * D + (size_t)h * D + d, i = row * ld + (size_t)h * D + d;
-    const float s = __bfloat162float(g[i]), x = dog[t] * s;
-    dO[t] = x;
+    const float s = __bfloat162float(g[i]);
+    const float x = stR(dO + t, dog[t] * s);
     dgp[i] = __float2bfloat16(dog[t] * o[t] * s * (1.f - s));
     acc += x * o[t];
   }
@@ -670,15 +682,17 @@ inline void attnBackwardBf(Attention& a, const AttnSave& s, const real* mask, co
   // dq in float (its atomics'), dk, dv and the gate's gradient straight into the bf16 [rows, P] the GEMMs read
   bf* dqb = bfGet(rows * P);
   real* dq = ARENA.get(rows * HD);
-  real* dO = ARENA.get(rows * HD);
-  real* Di = nullptr;
-  if (a.gating) {
-    Di = ARENA.get(rows * a.H);
+  if (a.gating) {   // dO in bf16, its row term formed with it
+    bf* dO = bfGet(rows * HD);
+    real* Di = ARENA.get(rows * a.H);
     gateBwdLdDiBfK<<<blocks(rows * a.H * 32), 256, 0, STREAM>>>(dog, s.o, qkvg + 3 * HD, dO, dqb + 3 * HD, Di, rows,
                                                                a.H, a.D, P, Q);
-  } else GK(cudaMemcpyAsync(dO, dog, rows * HD * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
-  sdpaBackwardBf(af2Sdpa(a, B, Q, mask, nb, dnb), qkvg, P, qkvg + HD, P, qkvg + 2 * HD, P, dO, HD,
-                 dq, HD, dqb + HD, P, dqb + 2 * HD, P, s.o, HD, s.lse, Di);
+    sdpaBackwardBf(af2Sdpa(a, B, Q, mask, nb, dnb), qkvg, P, qkvg + HD, P, qkvg + 2 * HD, P, dO, HD,
+                   dq, HD, dqb + HD, P, dqb + 2 * HD, P, s.o, HD, s.lse, Di);
+  } else {
+    sdpaBackwardBf(af2Sdpa(a, B, Q, mask, nb, dnb), qkvg, P, qkvg + HD, P, qkvg + 2 * HD, P, (const real*)dog, HD,
+                   dq, HD, dqb + HD, P, dqb + 2 * HD, P, s.o, HD, s.lse);
+  }
   narrowRowsK<<<blocks(rows * HD), 256, 0, STREAM>>>(dq, dqb, HD, P, rows);
   if (a.gating) colSumBf(a.bg.g, dqb + 3 * HD, rows, HD, P);
   real* dW = ARENA.get((size_t)a.C * P);

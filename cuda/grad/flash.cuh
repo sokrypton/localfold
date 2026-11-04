@@ -845,6 +845,14 @@ __device__ __forceinline__ float ldOut(const float* p) { return *p; }
 __device__ __forceinline__ float ldOut(const __nv_bfloat16* p) { return __bfloat162float(*p); }
 __device__ __forceinline__ void stOut(float* p, float v) { *p = v; }
 __device__ __forceinline__ void stOut(__nv_bfloat16* p, float v) { *p = __float2bfloat16(v); }
+// two adjacent elements as one store where the address allows (an even column of an even row stride)
+__device__ __forceinline__ void st2(float* p, float a, float b) {
+  if (((uintptr_t)p & 7) == 0) *reinterpret_cast<float2*>(p) = make_float2(a, b); else { p[0] = a; p[1] = b; }
+}
+__device__ __forceinline__ void st2(__nv_bfloat16* p, float a, float b) {
+  if (((uintptr_t)p & 3) == 0) *reinterpret_cast<__nv_bfloat162*>(p) = __floats2bfloat162_rn(a, b);
+  else { p[0] = __float2bfloat16(a); p[1] = __float2bfloat16(b); }
+}
 constexpr double FIXED = 1099511627776.0;   // 2^40: |a gradient| to 8e6, resolved to 1e-12
 __global__ void fromFixedK(float* g, const unsigned long long* f, size_t n) {
   const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -1036,15 +1044,15 @@ __global__ void __launch_bounds__(THREADS, 3) bwdBf(Sdpa a, BiasTile bt, HSrc qs
     const int kk = k0 + kl0 + g + r * 8;
     if (kk >= a.K) continue;
 #pragma unroll
-    for (int n = 0; n < D / 8; ++n)
-#pragma unroll
-      for (int c = 0; c < 2; ++c) {
-        DKV* pk = dkb + (long long)kk * lddk + n * 8 + 2 * t + c;
-        DKV* pv = dvb + (long long)kk * lddv + n * 8 + 2 * t + c;
-        const float xk = dka[n][r * 2 + c] * a.scale, xv = dva[n][r * 2 + c];
-        stOut(pk, accK ? ldOut(pk) + xk : xk);
-        stOut(pv, accV ? ldOut(pv) + xv : xv);
-      }
+    for (int n = 0; n < D / 8; ++n) {
+      DKV* pk = dkb + (long long)kk * lddk + n * 8 + 2 * t;
+      DKV* pv = dvb + (long long)kk * lddv + n * 8 + 2 * t;
+      float xk0 = dka[n][r * 2] * a.scale, xk1 = dka[n][r * 2 + 1] * a.scale, xv0 = dva[n][r * 2], xv1 = dva[n][r * 2 + 1];
+      if (accK) { xk0 += ldOut(pk); xk1 += ldOut(pk + 1); }
+      if (accV) { xv0 += ldOut(pv); xv1 += ldOut(pv + 1); }
+      st2(pk, xk0, xk1);   // (the pair as one store: 4.65 -> 4.59 ms for AF3 block n 384 two calls)
+      st2(pv, xv0, xv1);
+    }
   }
 }
 template <int D, int QT = 64>
@@ -1076,9 +1084,9 @@ inline void forwardBf(const Sdpa& a, const X* q, int ldq, const X* k, int ldk, c
   const size_t grid = (size_t)((a.Q + BR - 1) / BR) * a.H * a.B;
   fwdBf<D><<<(unsigned)grid, THREADS, smem, STREAM>>>(a, bt, qs_, ks_, vs_, o, ldo, lse);
 }
-template <int D, class X, class DKV = float>
+template <int D, class X, class DKV = float, class DOT = float>
 inline void backwardBf(const Sdpa& a, const X* q, int ldq, const X* k, int ldk, const X* v, int ldv,
-                       const float* dO, int lddo, const float* lse, const float* Di, float* dq, int lddq, DKV* dk,
+                       const DOT* dO, int lddo, const float* lse, const float* Di, float* dq, int lddq, DKV* dk,
                        int lddk, DKV* dv, int lddv, bool accK, bool accV) {
   Scratch scratch;
   const int Npq = (a.Q + 63) / 64 * 64, Npk = (a.K + 63) / 64 * 64;
@@ -1100,7 +1108,7 @@ inline void backwardBf(const Sdpa& a, const X* q, int ldq, const X* k, int ldk, 
   size_t ext[2] = {0, 0};
   for (int j = 0; j < 2; ++j) {
     const Bias& B = a.bias[j];
-    if (!B.grad) continue;
+    if (!B.grad || !a.deterministic) continue;
     ext[j] = (size_t)((B.sb ? a.B - 1 : 0) * B.sb + (B.sh ? a.H - 1 : 0) * B.sh + (long long)(a.Q - 1) * B.sq + a.K);
     fx[j] = reinterpret_cast<unsigned long long*>(ARENA.get(2 * ext[j]));
     GK(cudaMemsetAsync(fx[j], 0, ext[j] * 8, STREAM));
@@ -1174,9 +1182,9 @@ inline bool runForwardBfIn(const Sdpa& a, const __nv_bfloat16* q, int ldq, const
                            const __nv_bfloat16* v, int ldv, float* o, int ldo, float* lse) {
   FLASH_DISPATCH(a.D, (forwardBf<DD>(a, q, ldq, k, ldk, v, ldv, o, ldo, lse)))
 }
-template <class DKV>
+template <class DKV, class DOT>
 inline bool runBackwardBfIn(const Sdpa& a, const __nv_bfloat16* q, int ldq, const __nv_bfloat16* k, int ldk,
-                            const __nv_bfloat16* v, int ldv, const float* dO, int lddo, const float* lse,
+                            const __nv_bfloat16* v, int ldv, const DOT* dO, int lddo, const float* lse,
                             const float* Di, float* dq, int lddq, DKV* dk, int lddk, DKV* dv, int lddv, bool accK,
                             bool accV) {
   FLASH_DISPATCH(a.D, (backwardBf<DD>(a, q, ldq, k, ldk, v, ldv, dO, lddo, lse, Di, dq, lddq, dk, lddk, dv, lddv, accK, accV)))

@@ -26,7 +26,7 @@ struct GatedTransition {
   Linear t1, t2;
   int C = 0, F = 0;
 };
-struct GtSave { LnSave ln; real *xn, *h; size_t rows; void *xb = nullptr, *hb = nullptr; };
+struct GtSave { LnSave ln; real *xn, *h; size_t rows; void *xb = nullptr, *hb = nullptr, *gb = nullptr; };   // (gb: swish(h1) h2, kept)
 // BF16: the normalised input and the hidden layer kept in bf16, every GEMM on bf16 operands
 #ifndef GRAD_F64
 inline GtSave gtForwardBf(const GatedTransition& t, const real* x, real* out, size_t rows, real beta) {
@@ -36,9 +36,9 @@ inline GtSave gtForwardBf(const GatedTransition& t, const real* x, real* out, si
   bf* hb = bfGet(rows * 2 * t.F);
   linearFwdBf(t.t1, xb, hb, rows);
   s.xb = xb; s.hb = hb;
-  Scratch scratch;
-  bf* g = bfGet(rows * t.F);
+  bf* g = bfGet(rows * t.F);   // (kept for t2's weight gradient: recomputing it was 0.25 ms of AF3's backward)
   swigluBfK<<<blocks(rows * t.F), 256, 0, STREAM>>>(hb, g, rows, t.F);
+  s.gb = g;
   linearFwdBf(t.t2, g, out, rows, beta);
   return s;
 }
@@ -46,8 +46,7 @@ inline void gtBackwardBf(GatedTransition& t, const GtSave& s, const real* dout, 
   Scratch scratch;
   const size_t rows = s.rows;
   const bf *xb = static_cast<const bf*>(s.xb), *hb = static_cast<const bf*>(s.hb);
-  bf* g = bfGet(rows * t.F);
-  swigluBfK<<<blocks(rows * t.F), 256, 0, STREAM>>>(hb, g, rows, t.F);
+  const bf* g = static_cast<const bf*>(s.gb);
   const bf* db = toBf(dout, rows * t.C);
   bf* dg = bfGet(rows * t.F);
   linearBwdBf(t.t2, g, db, dg, rows);
@@ -104,7 +103,7 @@ struct GridAttn {
   bool transpose = false;
   bool untransposedResidual = false;   // chai-1's parallel block: the column pass's update added as it comes out
 };
-struct GridSave { LnSave ln; real *xn, *act, *nb, *qkvg, *o; int n; real* lse = nullptr; bool bf = false; real* W = nullptr; };   // (bf: xn, act, qkvg [nn, 4 HD] and W [C, 4 HD] in bf16)
+struct GridSave { LnSave ln; real *xn, *act, *nb, *qkvg, *o; int n; real* lse = nullptr; bool bf = false; real* W = nullptr; void* og = nullptr; };   // (bf: xn, act, qkvg [nn, 4 HD] and W [C, 4 HD] in bf16)
 // rawBias [nn, H] -> nb [H, nn], the column direction's source transposed when swap
 __global__ void gridBiasK(const real* raw, real* nb, int n, int H, bool swap, bool back) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -174,9 +173,10 @@ inline GridSave gridForwardBf(const GridAttn& g, const Dialect& d, const real* p
   { const Sdpa sd_ = gridSdpa(g, n, g.transpose ? maskT : mask, s.nb); s.lse = ARENA.get((size_t)2 * sd_.B * sd_.H * sd_.Q); sdpaForwardBf(sd_, q, P, k, P, v, P, s.o, HD, s.lse); }
   s.xn = reinterpret_cast<real*>(xn); s.act = reinterpret_cast<real*>(act); s.qkvg = reinterpret_cast<real*>(qkvg);
   s.W = reinterpret_cast<real*>(W);
-  Scratch scratch;
-  bf* og = bfGet(nn * HD);
+  bf* og = bfGet(nn * HD);   // (kept for the output projection's weight gradient)
   gateMulBfK<<<blocks(nn * HD), 256, 0, STREAM>>>(og, s.o, gt, nn, HD, P);
+  s.og = og;
+  Scratch scratch;
   if (!g.transpose || g.untransposedResidual) { linearFwdBf(g.out, og, out, nn, 1.f); return s; }
   real* t = ARENA.get(nn * g.C);
   linearFwdBf(g.out, og, t, nn);
@@ -195,14 +195,13 @@ inline void gridBackwardBf(GridAttn& g, const Dialect& d, const GridSave& s, con
   const real* dy = dout;
   if (g.transpose && !g.untransposedResidual) { real* t = ARENA.get(nn * g.C); swap01(dout, t, n, n, g.C); dy = t; }
   const bf* dyb = toBf(dy, nn * g.C);
-  bf* og = bfGet(nn * HD);
-  gateMulBfK<<<blocks(nn * HD), 256, 0, STREAM>>>(og, s.o, gt, nn, HD, P);
+  const bf* og = static_cast<const bf*>(s.og);
   real* dog = ARENA.get(nn * HD);
   linearBwdBf(g.out, og, dyb, dog, nn);
   // d q, k, v, gate straight into one bf16 [nn, 4 HD]: dq through float (its atomics'), dk, dv from the attention,
   // the gate's from its backward, which also forms the softmax backward's row term
   bf* dqkvg = bfGet(nn * P);
-  real* dO = ARENA.get(nn * HD);
+  bf* dO = bfGet(nn * HD);   // (bf16: the attention reads it in place, and its row term is formed here)
   real* Di = ARENA.get(nn * g.H);
   gateBwdLdDiBfK<<<blocks(nn * g.H * 32), 256, 0, STREAM>>>(dog, s.o, gt, dO, dqkvg + 3 * HD, Di, nn, g.H, g.D, P, n);
   real* dq = ARENA.get(nn * HD);
