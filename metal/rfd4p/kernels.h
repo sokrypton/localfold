@@ -51,6 +51,26 @@ struct RfdRms2Args { CP(half) xh; DP(half) yh; CP(float) w1; CP(float) w2; u64 r
 // between is one float a row.
 struct RfdRmsInvArgs { CP(float) x; CP(half) xh; DP(float) inv; u64 rows; uint C, pad; float eps; };
 struct RfdBiasScaleArgs { DP(half) bias; CP(float) inv; u64 rows; uint heads, pad; };
+// 🔴 AND FUSING THESE TWO INTO ONE PASS LOSES, WHICH IS WORTH RECORDING BECAUSE IT IS THE ONE FUSION THIS PORT'S
+// OWN "FEWER PASSES OVER THE PAIR TRACK" RULE POINTS STRAIGHT AT. The row's sum of squares and the twelve head
+// dot products reduce over the SAME 384 channels of the same row, so one kernel can produce both from one read
+// and remove a whole 20.9 MB pass fourteen times a step. Built three ways and every one is slower than the two
+// dispatches it replaces, which cost **0.41 ms a call together** at 165 tokens:
+//   * the weight staged in threadgroup memory as [C][heads], head loop innermost - **3.97 ms a call**. Twelve
+//     dependent threadgroup reads on every channel's critical path, at a 24-byte stride that conflicts.
+//   * head loop outermost, the row re-read from memory per head - **1.89 ms**, and the arithmetic says why:
+//     twelve passes over 20.9 MB is 251 MB, which at this machine's measured 131 GB/s is 1.9 ms. The row does
+//     not stay in L1 across the head loop.
+//   * the row held in a `float v[12]` and only the weight streaming - **1.23 ms**, once the array was given a
+//     COMPILE-TIME bound: with a runtime loop count it spilled to thread-local memory and read 36 ms a step
+//     against 17. The remaining cost is the twelve `simd_sum` cross-lane reductions a row - 327,000 of them a
+//     call - which is work the matrix units simply do not do.
+// The reason the fusion cannot win is that there is nothing left in either kernel to take: measured per call
+// they run at **111 and 114 GB/s against a 131 GB/s copy**, so the second pass is already nearly free, while a
+// vector kernel computing twelve dot products a row cannot reach that rate at all. The pass is not the cost.
+// Same lesson as the transpose kernel for this very bias (22.6 ms against the 8.0 ms of attention it was there
+// to save): a saving in PASSES is not a saving if the pass removed was running at the machine's limit and the
+// kernel that replaces it leaves the matrix units idle.
 // the pair write (`pair_write: hadamard`): z[i n + j][d] = pair[i n + j][d] + pij[j][d] * pij[i][P + d] - the
 // first half of linear_x's output indexed by the COLUMN, the second by the row (pair_update.py's pi / pj)
 // `z` may be `pair` itself: the write is elementwise at one index, so the pair track is updated in place and
