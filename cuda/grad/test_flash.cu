@@ -13,6 +13,11 @@ static double rel(const float* a, const float* b, size_t n) {
   for (size_t i = 0; i < n; ++i) { e = std::max(e, (double)fabs(x[i] - y[i])); m = std::max(m, (double)fabs(y[i])); }
   return e / (m + 1e-30);
 }
+static double relRmsHost(const float* a, const float* b, size_t n) {
+  auto x = hostv(a, n), y = hostv(b, n); double e = 0, m = 0;
+  for (size_t i = 0; i < n; ++i) { e += (double)(x[i] - y[i]) * (x[i] - y[i]); m += (double)y[i] * y[i]; }
+  return sqrt(e / (m + 1e-30));
+}
 int main() {
   init(); curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT); curandSetPseudoRandomGeneratorSeed(gen, 3);
   struct Case { int B, H, Q, K, D; bool mask, bias, bias2, clip; float sd = 1.f; bool fullMask = false; };
@@ -56,16 +61,22 @@ int main() {
       }
       // compare only the head columns (the pad columns are never written by either)
       auto cmp = [&](const char* n, float* x, float* y, size_t rows) {
-        auto hx = hostv(x, rows * ld), hy = hostv(y, rows * ld); double e = 0, mm = 0;
-        for (size_t r = 0; r < rows; ++r) for (int j = 0; j < HD; ++j) { e = std::max(e, (double)fabs(hx[r * ld + j] - hy[r * ld + j])); mm = std::max(mm, (double)fabs(hy[r * ld + j])); }
-        double rr = e / (mm + 1e-30), bar = mode == 2 ? (c.sd > 1 ? 0.15 : 1e-2) : tf ? 5e-3 : c.sd > 1 ? 3e-5 : 2e-6;   // (logits ~ +-36: float32's own conditioning)
+        auto hx = hostv(x, rows * ld), hy = hostv(y, rows * ld); double e = 0, mm = 0, se = 0, sy = 0;
+        for (size_t r = 0; r < rows; ++r) for (int j = 0; j < HD; ++j) {
+          const double d = hx[r * ld + j] - hy[r * ld + j];
+          e = std::max(e, fabs(d)); mm = std::max(mm, (double)fabs(hy[r * ld + j])); se += d * d; sy += (double)hy[r * ld + j] * hy[r * ld + j];
+        }
+        // bf16 by relative rms: its rounding is ~0.5% of the largest value, which a max-abs bar cannot tell from a
+        // 1% defect; spread over every element it is ~0.3%, and a 1% defect is 1%
+        double rr = mode == 2 ? sqrt(se / (sy + 1e-30)) : e / (mm + 1e-30);
+        double bar = mode == 2 ? (c.sd > 1 ? 0.15 : 6e-3) : tf ? 5e-3 : c.sd > 1 ? 3e-5 : 2e-6;   // (logits ~ +-36: float32's own conditioning)
         printf("  %-4s %.2e%s", n, rr, rr > bar ? " <-- ABOVE" : ""); fails += rr > bar;
       };
       printf("%s B %d H %d Q %d K %d D %d%s%s%s%s:", mode == 2 ? "bf16" : tf ? "tf32" : "fp32", c.B, c.H, c.Q, c.K, c.D, c.mask ? " mask" : "", c.bias ? " bias" : "", c.bias2 ? " bias2" : "", c.clip ? " clip" : "");
       cmp("o", o[1], o[0], (size_t)c.B * c.Q); cmp("dq", dq[1], dq[0], (size_t)c.B * c.Q); cmp("dk", dk[1], dk[0], (size_t)c.B * c.K); cmp("dv", dv[1], dv[0], (size_t)c.B * c.K);
-      const double bb = mode == 2 ? (c.sd > 1 ? 0.15 : 1e-2) : tf ? 5e-3 : c.sd > 1 ? 3e-5 : 2e-6;
-      if (c.bias) { double r = rel(gb[1][0], gb[0][0], nb); printf("  db %.2e%s", r, r > bb ? " <-- ABOVE" : ""); fails += r > bb; }
-      if (c.bias2) { double r = rel(gb[1][1], gb[0][1], nb2); printf("  db2 %.2e%s", r, r > bb ? " <-- ABOVE" : ""); fails += r > bb; }
+      const double bb = mode == 2 ? (c.sd > 1 ? 0.15 : 6e-3) : tf ? 5e-3 : c.sd > 1 ? 3e-5 : 2e-6;
+      if (c.bias) { double r = (mode == 2 ? relRmsHost : rel)(gb[1][0], gb[0][0], nb); printf("  db %.2e%s", r, r > bb ? " <-- ABOVE" : ""); fails += r > bb; }
+      if (c.bias2) { double r = (mode == 2 ? relRmsHost : rel)(gb[1][1], gb[0][1], nb2); printf("  db2 %.2e%s", r, r > bb ? " <-- ABOVE" : ""); fails += r > bb; }
       printf("\n");
     }
   }

@@ -544,12 +544,15 @@ __global__ void __launch_bounds__(THREADS, MODE == 1 ? 2 : 3) bwdK(Sdpa a, const
   }
 }
 
-// ---- bf16: its own kernels, not MODE 2 of the ones above. The tiles are rounded to bf16 once, as they are staged
-// (MODE 2 kept them float and rounded at every fragment read), the products are m16n8k16 (twice m16n8k8's k a
-// fragment), and P and dS go from the accumulators straight into the next product's A operand - an m16n8k16 C pair
-// of n-tiles is exactly an A fragment - so P never touches shared memory. Every B operand is read as one 32-bit
-// word, which needs its contraction axis contiguous: a tile contracted over D is staged [row][D], one contracted
-// over its rows [D][row]. D pads to a multiple of 16 with zeros where it is contracted.
+// ---- bf16: its own kernels, not MODE 2 of the ones above - FlashAttention-2's structure. q, k, v (and dO) are first
+// copied to bf16, head-major and padded ([B, H, N rounded to 64, D rounded to 16], zeros past the ends), so a tile
+// is one contiguous block that cp.async moves into shared memory with no conversion and no bounds checks; the next
+// tile and its pair-bias tile load while this one computes (two stages). The [q][k] biases are summed into one bf16
+// tile the same way (bf16 is what a bf16 run's bias is: autocast's projection makes it so), and the key mask and any
+// per-key bias are added per key from a 64-entry vector. The products are m16n8k16; P and dS go from the
+// accumulators straight into the next product's A operand (an m16n8k16 C pair of n-tiles is an A fragment), so P
+// never touches shared memory; a B operand contracted over a tile's rows is read with ldmatrix.trans from the one
+// [row][D] copy. Shared memory is what decides three CTAs an SM or two, and two cannot hide the MMA latency.
 __device__ __forceinline__ void mma16(float* c, const uint32_t* a, uint32_t b0, uint32_t b1) {
   asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
                "{%0,%1,%2,%3};"
@@ -557,84 +560,172 @@ __device__ __forceinline__ void mma16(float* c, const uint32_t* a, uint32_t b0, 
                : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
 __device__ __forceinline__ uint32_t word(const uint16_t* s, int i) { return *reinterpret_cast<const uint32_t*>(s + i); }
-// the A fragment of rows r, r + 8 and columns c .. c + 15 of x [rows][ld] (zero past `rows` and past D)
-template <int D>
-__device__ __forceinline__ void aFrag(uint32_t* f, const float* x, long long ld, int r, int rows, int c) {
-#pragma unroll
-  for (int i = 0; i < 4; ++i) {
-    const int rr = r + (i & 1) * 8, cc = c + (i >> 1) * 8;
-    f[i] = rr < rows && cc < D ? bf2(x[(long long)rr * ld + cc], x[(long long)rr * ld + cc + 1]) : 0u;
-  }
+// the B fragment of rows k .. k + 15 and columns n .. n + 7 of a row-major bf16 tile (row stride ld): ldmatrix.trans
+__device__ __forceinline__ void ldT(uint32_t& b0, uint32_t& b1, const uint16_t* s, int k, int n, int ld) {
+  const unsigned a = (unsigned)__cvta_generic_to_shared(s + (k + (threadIdx.x & 15)) * ld + n);
+  asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];" : "=r"(b0), "=r"(b1) : "r"(a));
 }
+__device__ __forceinline__ void cp16(void* d, const void* s, bool on) {
+  const unsigned a = (unsigned)__cvta_generic_to_shared(d);
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(a), "l"(s), "r"(on ? 16 : 0));
+}
+__device__ __forceinline__ void cp4(void* d, const void* s, bool on) {
+  const unsigned a = (unsigned)__cvta_generic_to_shared(d);
+  asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;" ::"r"(a), "l"(s), "r"(on ? 4 : 0));
+}
+__device__ __forceinline__ void cpCommit() { asm volatile("cp.async.commit_group;"); }
+__device__ __forceinline__ void cpWait1() { asm volatile("cp.async.wait_group 1;"); }
 // two accumulator n-tiles (8 columns each) as one A fragment over their 16 columns
 __device__ __forceinline__ void cToA(uint32_t* f, const float* c0, const float* c1) {
   f[0] = bf2(c0[0], c0[1]); f[1] = bf2(c0[2], c0[3]); f[2] = bf2(c1[0], c1[1]); f[3] = bf2(c1[2], c1[3]);
 }
-constexpr int LR = 64 + 8;                         // a [D][64 rows] tile's row stride, in bf16
-template <int D> __host__ __device__ constexpr int ldBf() { return (D + 15) / 16 * 16 + 8; }   // a [64][D] tile's, padded D + 8
-// rows [r0, r0 + 64) of x (row stride ld, D columns): S [64][ldBf] (zero past D to the pad) and/or St [D][LR],
-// two rows by two columns a thread so every store is a word
-template <int D>
-__device__ __forceinline__ void loadBf(uint16_t* S, uint16_t* St, const float* x, long long ld, int r0, int rows) {
-  constexpr int DP = (D + 15) / 16 * 16, LK = ldBf<D>();
-  const bool v2 = (ld & 1) == 0 && ((uintptr_t)x & 7) == 0;
-  constexpr int N = 32 * (DP / 2) / THREADS;       // every load issued before the first store
-  static_assert(32 * (DP / 2) % THREADS == 0, "whole passes");
-  float2 u[N], w[N];
+// rows r, r + 8 and columns c .. c + 15 of a head-major [rows][DP] bf16 block, as an A fragment
+template <int DP>
+__device__ __forceinline__ void aFragH(uint32_t* f, const uint16_t* x, int r, int c) {
 #pragma unroll
-  for (int j = 0; j < N; ++j) {
-    const int i = threadIdx.x + j * THREADS, r = 2 * (i / (DP / 2)), c = 2 * (i % (DP / 2));
-    u[j] = w[j] = make_float2(0.f, 0.f);
-    if (c < D) {
-      const float* p = x + (long long)(r0 + r) * ld + c;
-      if (r0 + r < rows) u[j] = v2 ? *reinterpret_cast<const float2*>(p) : make_float2(p[0], p[1]);
-      if (r0 + r + 1 < rows) w[j] = v2 ? *reinterpret_cast<const float2*>(p + ld) : make_float2(p[ld], p[ld + 1]);
-    }
-  }
-#pragma unroll
-  for (int j = 0; j < N; ++j) {
-    const int i = threadIdx.x + j * THREADS, r = 2 * (i / (DP / 2)), c = 2 * (i % (DP / 2));
-    if (S) {
-      *reinterpret_cast<uint32_t*>(S + r * LK + c) = bf2(u[j].x, u[j].y);
-      *reinterpret_cast<uint32_t*>(S + (r + 1) * LK + c) = bf2(w[j].x, w[j].y);
-    }
-    if (St && c < D) {
-      *reinterpret_cast<uint32_t*>(St + c * LR + r) = bf2(u[j].x, w[j].x);
-      *reinterpret_cast<uint32_t*>(St + (c + 1) * LR + r) = bf2(u[j].y, w[j].y);
-    }
-  }
+  for (int i = 0; i < 4; ++i) f[i] = word(x, (r + (i & 1) * 8) * DP + c + (i >> 1) * 8);
 }
+template <int D> __host__ __device__ constexpr int padD() { return (D + 15) / 16 * 16; }
+template <int D> __host__ __device__ constexpr int ldBf() { return padD<D>() + 8; }   // a tile's row stride (bf16)
+// x [B, N, ld] at head h's D columns -> out [B, H, Np, DP] bf16, zero past N and D (two columns a thread)
+__global__ void headsBfK(const float* __restrict__ x, int ld, uint32_t* __restrict__ out, int N, int H, int D, int Np,
+                         int DP2, size_t total) {
+  const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= total) return;
+  const int c = 2 * (int)(i % DP2);
+  const size_t row = i / DP2;
+  const int n = (int)(row % Np), h = (int)((row / Np) % H);
+  const size_t b = row / ((size_t)Np * H);
+  uint32_t r = 0;
+  if (n < N && c < D) { const float* p = x + (b * N + n) * ld + (size_t)h * D + c; r = bf2(p[0], p[1]); }
+  out[i] = r;
+}
+inline const uint16_t* headsBf(const float* x, int ld, int B, int N, int H, int D, int Np, int DP) {
+  const size_t total = (size_t)B * H * Np * (DP / 2);
+  uint32_t* out = reinterpret_cast<uint32_t*>(ARENA.get(total));
+  headsBfK<<<blocks(total), 256, 0, STREAM>>>(x, ld, out, N, H, D, Np, DP / 2, total);
+  return reinterpret_cast<const uint16_t*>(out);
+}
+// the [q][k] biases (sq != 0) summed into one bf16 tile [Bb][Hh][Qp][Kp] (Bb, Hh 1 where every such bias
+// broadcasts), zero past Q and K
+struct BiasTile { const uint16_t* p = nullptr; long long sb = 0, sh = 0; int ld = 0; };
+__global__ void biasBfK(Sdpa a, uint16_t* __restrict__ out, int Bb, int Hh, int Qp, int Kp) {
+  const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= (size_t)Bb * Hh * Qp * Kp) return;
+  const int k = (int)(i % Kp), q = (int)((i / Kp) % Qp), h = (int)((i / ((size_t)Kp * Qp)) % Hh);
+  const int b = (int)(i / ((size_t)Kp * Qp * Hh));
+  float v = 0.f;
+  if (q < a.Q && k < a.K)
+    for (int j = 0; j < 2; ++j) {
+      const Bias& B = a.bias[j];
+      if (B.p && B.sq != 0) v += B.p[b * B.sb + h * B.sh + (long long)q * B.sq + k];
+    }
+  out[i] = (uint16_t)(bf2(v, 0.f) & 0xffff);
+}
+inline BiasTile biasBf(const Sdpa& a, int Qp, int Kp) {
+  BiasTile t;
+  bool any = false, perB = false, perH = false;
+  for (int j = 0; j < 2; ++j) {
+    const Bias& B = a.bias[j];
+    if (B.p && B.sq != 0) { any = true; perB |= B.sb != 0; perH |= B.sh != 0; }
+  }
+  if (!any) return t;
+  const int Bb = perB ? a.B : 1, Hh = perH ? a.H : 1;
+  const size_t n = (size_t)Bb * Hh * Qp * Kp;
+  uint16_t* out = reinterpret_cast<uint16_t*>(ARENA.get((n + 1) / 2));
+  biasBfK<<<blocks(n), 256, 0, STREAM>>>(a, out, Bb, Hh, Qp, Kp);
+  t.p = out; t.sb = perB ? (long long)Hh * Qp * Kp : 0; t.sh = perH ? (long long)Qp * Kp : 0; t.ld = Kp;
+  return t;
+}
+// 2^x in one MUFU instruction (2^-inf = 0); the exponentials below are taken in base 2
+__device__ __forceinline__ float ex2(float x) { float y; asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x)); return y; }
+constexpr float LOG2E = 1.4426950408889634f;
+__device__ __forceinline__ float bfToF(uint16_t x) { return __uint_as_float((uint32_t)x << 16); }
+// key k's additive term (the mask and every per-key bias; -inf past K)
+__device__ __forceinline__ float keyAdd(const Sdpa& a, int b, int h, int k) {
+  if (k >= a.K) return -INFINITY;
+  float v = a.keyMask ? 1e9f * (a.keyMask[(size_t)b * a.K + k] - 1.f) : 0.f;
+  for (int j = 0; j < 2; ++j) {
+    const Bias& B = a.bias[j];
+    if (B.p && B.sq == 0) v += B.p[b * B.sb + h * B.sh + k];
+  }
+  return v;
+}
+constexpr int LB = BC + 8;   // a bf16 [q][k] tile's row stride
 
 template <int D>
-__global__ void __launch_bounds__(THREADS) fwdBf(Sdpa a, const float* __restrict__ q, int ldq,
-                                                 const float* __restrict__ k, int ldk, const float* __restrict__ v,
-                                                 int ldv, float* __restrict__ o, int ldo, float* __restrict__ lse) {
-  constexpr int DP = (D + 15) / 16 * 16, LK = ldBf<D>(), LT = BC + PADK;
+__global__ void __launch_bounds__(THREADS) fwdBf(Sdpa a, BiasTile bt, const uint16_t* __restrict__ qh,
+                                                 const uint16_t* __restrict__ kh, const uint16_t* __restrict__ vh,
+                                                 int Npq, int Npk, float* __restrict__ o, int ldo,
+                                                 float* __restrict__ lse) {
+  constexpr int DP = padD<D>(), LK = ldBf<D>();
   extern __shared__ __align__(16) float sm[];
-  float* T = sm;                                                  // [BR][LT]: the additive terms
-  uint16_t* Ks = reinterpret_cast<uint16_t*>(T + BR * LT);        // [BC][LK]
-  uint16_t* Vt = Ks + BC * LK;                                    // [D][LR]
+  uint16_t* Kb = reinterpret_cast<uint16_t*>(sm);                 // [2][BC][LK]
+  uint16_t* Vb = Kb + 2 * BC * LK;                                // [2][BC][LK]
+  uint16_t* Tb = Vb + 2 * BC * LK;                                // [2][BR][LB]: the bias tile
+  float* KA = reinterpret_cast<float*>(Tb + 2 * BR * LB);         // [2][BC]: each key's additive term
+  int* KS = reinterpret_cast<int*>(KA + 2 * BC);                  // [2][BC]: seqK
   const int nqb = (a.Q + BR - 1) / BR;
   const int qb = blockIdx.x % nqb, h = (blockIdx.x / nqb) % a.H, b = blockIdx.x / (nqb * a.H);
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
   const int q0 = qb * BR, qr0 = q0 + warp * 16;
-  const float* qb_ = q + (size_t)b * a.Q * ldq + h * D;
-  const float* kb_ = k + (size_t)b * a.K * ldk + h * D;
-  const float* vb_ = v + (size_t)b * a.K * ldv + h * D;
+  const size_t bh = (size_t)b * a.H + h;
+  const uint16_t* kp = kh + bh * Npk * DP;
+  const uint16_t* vp = vh + bh * Npk * DP;
+  const uint16_t* tp = bt.p ? bt.p + b * bt.sb + h * bt.sh + (size_t)q0 * bt.ld : nullptr;
+  auto issue = [&](int st, int k0) {
+    uint16_t* Ks = Kb + st * BC * LK;
+    uint16_t* Vs = Vb + st * BC * LK;
+    for (int i = threadIdx.x; i < BC * DP / 8; i += THREADS) {
+      const int r = i / (DP / 8), c = (i % (DP / 8)) * 8;
+      cp16(Ks + r * LK + c, kp + (size_t)(k0 + r) * DP + c, true);
+      cp16(Vs + r * LK + c, vp + (size_t)(k0 + r) * DP + c, true);
+    }
+    if (tp) {
+      uint16_t* T = Tb + st * BR * LB;
+      for (int i = threadIdx.x; i < BR * BC / 8; i += THREADS) {
+        const int r = i / (BC / 8), c = (i % (BC / 8)) * 8;
+        cp16(T + r * LB + c, tp + (size_t)r * bt.ld + k0 + c, true);
+      }
+    }
+  };
+  issue(0, 0);
+  cpCommit();
+  if (threadIdx.x < BC) {
+    KA[threadIdx.x] = keyAdd(a, b, h, threadIdx.x);
+    KS[threadIdx.x] = a.seqK && threadIdx.x < a.K ? a.seqK[threadIdx.x] : 0;
+  }
   uint32_t qa[DP / 16][4];
 #pragma unroll
-  for (int s = 0; s < DP / 16; ++s) aFrag<D>(qa[s], qb_, ldq, qr0 + g, a.Q, s * 16 + 2 * t);
+  for (int s = 0; s < DP / 16; ++s) aFragH<DP>(qa[s], qh + bh * Npq * DP, qr0 + g, s * 16 + 2 * t);
+  int qs[2] = {0, 0};
+  if (a.seqQ)
+    for (int r = 0; r < 2; ++r) qs[r] = qr0 + g + r * 8 < a.Q ? a.seqQ[qr0 + g + r * 8] : 0;
   float oacc[D / 8][4];
 #pragma unroll
   for (int n = 0; n < D / 8; ++n) oacc[n][0] = oacc[n][1] = oacc[n][2] = oacc[n][3] = 0.f;
   float mx[2] = {-INFINITY, -INFINITY}, sum[2] = {0.f, 0.f};
-  const float* P = T + warp * 16 * LT;
-  for (int k0 = 0; k0 < a.K; k0 += BC) {
+  const int nk = (a.K + BC - 1) / BC;
+  for (int it = 0; it < nk; ++it) {
+    const int st = it & 1, k0 = it * BC;
+    float nka = 0.f;
+    int nks = 0;
+    if (it + 1 < nk) {
+      issue(st ^ 1, k0 + BC);
+      if (threadIdx.x < BC) {   // the next tile's keys: loaded now, stored after this tile's arithmetic
+        const int k = k0 + BC + threadIdx.x;
+        nka = keyAdd(a, b, h, k);
+        nks = a.seqK && k < a.K ? a.seqK[k] : 0;
+      }
+    }
+    cpCommit();
+    cpWait1();
     __syncthreads();
-    loadBf<D>(Ks, nullptr, kb_, ldk, k0, a.K);
-    loadBf<D>(nullptr, Vt, vb_, ldv, k0, a.K);
-    loadAdd(T, a, b, h, q0, k0);
-    __syncthreads();
+    const uint16_t* Ks = Kb + st * BC * LK;
+    const uint16_t* Vs = Vb + st * BC * LK;
+    const uint16_t* T = Tb + st * BR * LB + warp * 16 * LB;
+    const float* ka = KA + st * BC;
+    const int* ks = KS + st * BC;
     float sacc[BC / 8][4];
 #pragma unroll
     for (int j = 0; j < BC / 8; ++j) sacc[j][0] = sacc[j][1] = sacc[j][2] = sacc[j][3] = 0.f;
@@ -650,8 +741,13 @@ __global__ void __launch_bounds__(THREADS) fwdBf(Sdpa a, const float* __restrict
     for (int j = 0; j < BC / 8; ++j)
 #pragma unroll
       for (int e = 0; e < 4; ++e) {
-        int r = e >> 1;
-        float x = logit(sacc[j][e], P[(g + r * 8) * LT + j * 8 + 2 * t + (e & 1)], a);
+        const int r = e >> 1, kl = j * 8 + 2 * t + (e & 1);
+        float add = ka[kl];
+        if (add != -INFINITY) {
+          if (a.seqQ && ks[kl] != qs[r]) add = -INFINITY;
+          else if (tp) add += bfToF(T[(g + r * 8) * LB + kl]);
+        }
+        const float x = logit(sacc[j][e], add, a) * LOG2E;
         sacc[j][e] = x;
         rmax[r] = fmaxf(rmax[r], x);
       }
@@ -664,14 +760,14 @@ __global__ void __launch_bounds__(THREADS) fwdBf(Sdpa a, const float* __restrict
 #pragma unroll
     for (int r = 0; r < 2; ++r) {
       nm[r] = fmaxf(mx[r], rmax[r]);
-      alpha[r] = nm[r] == -INFINITY ? 1.f : expf(mx[r] - nm[r]);
+      alpha[r] = nm[r] == -INFINITY ? 1.f : ex2(mx[r] - nm[r]);
       mx[r] = nm[r];
     }
 #pragma unroll
     for (int j = 0; j < BC / 8; ++j)
 #pragma unroll
       for (int e = 0; e < 4; ++e) {
-        float p = sacc[j][e] == -INFINITY ? 0.f : expf(sacc[j][e] - nm[e >> 1]);
+        const float p = sacc[j][e] == -INFINITY ? 0.f : ex2(sacc[j][e] - nm[e >> 1]);
         rs[e >> 1] += p;
         sacc[j][e] = p;
       }
@@ -691,143 +787,190 @@ __global__ void __launch_bounds__(THREADS) fwdBf(Sdpa a, const float* __restrict
       cToA(pa, sacc[2 * u], sacc[2 * u + 1]);
 #pragma unroll
       for (int n = 0; n < D / 8; ++n) {
-        const int i = (n * 8 + g) * LR + u * 16 + 2 * t;
-        mma16(oacc[n], pa, word(Vt, i), word(Vt, i + 8));
+        uint32_t b0, b1;
+        ldT(b0, b1, Vs, u * 16, n * 8, LK);
+        mma16(oacc[n], pa, b0, b1);
       }
     }
+    if (it + 1 < nk && threadIdx.x < BC) { KA[(st ^ 1) * BC + threadIdx.x] = nka; KS[(st ^ 1) * BC + threadIdx.x] = nks; }
+    __syncthreads();   // this stage is the one the next iteration's issue overwrites
   }
   float* ob = o + (size_t)b * a.Q * ldo + h * D;
 #pragma unroll
   for (int r = 0; r < 2; ++r) {
-    int qq = qr0 + g + r * 8;
+    const int qq = qr0 + g + r * 8;
     if (qq >= a.Q) continue;
-    float inv = sum[r] > 0.f ? 1.f / sum[r] : 0.f;
+    const float inv = sum[r] > 0.f ? 1.f / sum[r] : 0.f;
 #pragma unroll
     for (int n = 0; n < D / 8; ++n) {
       ob[(long long)qq * ldo + n * 8 + 2 * t] = oacc[n][r * 2] * inv;
       ob[(long long)qq * ldo + n * 8 + 2 * t + 1] = oacc[n][r * 2 + 1] * inv;
     }
     if (t == 0) {
-      const size_t i = ((size_t)b * a.H + h) * a.Q + qq, N = (size_t)a.B * a.H * a.Q;
-      lse[i] = sum[r] > 0.f ? mx[r] : -INFINITY;
+      const size_t i = bh * a.Q + qq, N = (size_t)a.B * a.H * a.Q;
+      lse[i] = sum[r] > 0.f ? mx[r] / LOG2E : -INFINITY;   // (back in natural units)
       lse[N + i] = sum[r] > 0.f ? logf(sum[r]) : 0.f;
     }
   }
 }
 template <int D>
-inline size_t fwdBfSmem() { return sizeof(float) * BR * (BC + PADK) + 2 * (BC * ldBf<D>() + D * LR); }
+inline size_t fwdBfSmem() { return 2 * (4 * BC * ldBf<D>() + 2 * BR * LB) + 4 * (4 * BC); }
 
 // the backward as bwdK lays it out (a CTA a key block, a warp 16 keys, the queries in halves of 32), in bf16:
-// S^T = K Q^T and dP^T = V dO^T (A = K, V from registers; B = Q, dO [query][D]); dV += P^T dO and dK += dS^T Q
-// (A = P^T, dS^T from the accumulators; B = dO^T, Q^T [D][query]); dQ = dS K (A = dS from T in float, B = K^T).
-// dS is kept in float in T for the bias gradients.
+// S^T = K Q^T and dP^T = V dO^T (A = K, V from registers; B = Q, dO read as words), dV += P^T dO and dK += dS^T Q
+// (A = P^T, dS^T from the accumulators; B = dO, Q by ldmatrix.trans), dQ = dS K (A = dS, B = K by ldmatrix.trans).
+// dS takes the bias tile's place in shared memory, element by element (the thread that reads a bias writes its dS),
+// as bf16 - what a bf16 run's logits gradient is - for dQ and the bias gradients.
 template <int D>
-__global__ void __launch_bounds__(THREADS, D <= 32 ? 3 : 2) bwdBf(Sdpa a, const float* __restrict__ q, int ldq,
-                                                   const float* __restrict__ k, int ldk, const float* __restrict__ v,
-                                                   int ldv, const float* __restrict__ dO, int lddo,
-                                                   const float* __restrict__ lse, const float* __restrict__ Di,
-                                                   float* __restrict__ dq, int lddq, float* __restrict__ dk, int lddk,
-                                                   float* __restrict__ dv, int lddv, bool accK, bool accV) {
-  constexpr int DP = (D + 15) / 16 * 16, LK = ldBf<D>(), LT = BC + PADK, LS = D + PADK;
+__global__ void __launch_bounds__(THREADS, 3) bwdBf(Sdpa a, BiasTile bt, const uint16_t* __restrict__ qh,
+                                                    const uint16_t* __restrict__ kh, const uint16_t* __restrict__ vh,
+                                                    const uint16_t* __restrict__ doh, int Npq, int Npk,
+                                                    const float* __restrict__ lse, const float* __restrict__ Di,
+                                                    float* __restrict__ dq, int lddq, float* __restrict__ dk, int lddk,
+                                                    float* __restrict__ dv, int lddv, bool accK, bool accV) {
+  constexpr int DP = padD<D>(), LK = ldBf<D>();
   extern __shared__ __align__(16) float sm[];
-  float* T = sm;                                   // [BR][LT]: the additive terms, then dS
-  float* Ls = T + BR * LT;                         // lse [BR]
-  float* Ds = Ls + BR;                             // Di [BR]
-  float* Lg = Ds + BR;                             // log sum [BR]
-  float* St = Lg + BR;                             // [4 warps][16][LS]: dQ staged for coalesced atomics
-  uint16_t* Qs = reinterpret_cast<uint16_t*>(St + 4 * 16 * LS);   // [BR][LK]
-  uint16_t* Os = Qs + BR * LK;                                    // dO [BR][LK]
-  uint16_t* Qt = Os + BR * LK;                                    // [D][LR]
-  uint16_t* Ot = Qt + D * LR;                                     // [D][LR]
-  uint16_t* Kt = Ot + D * LR;                                     // [D][LR]
+  uint16_t* Kb = reinterpret_cast<uint16_t*>(sm);                 // [BC][LK]
+  uint16_t* Qb = Kb + BC * LK;                                    // [2][BR][LK]
+  uint16_t* Ob = Qb + 2 * BR * LK;                                // dO [2][BR][LK]
+  uint16_t* Tb = Ob + 2 * BR * LK;                                // [2][BR][LB]: the bias tile, then dS
+  float* QV = reinterpret_cast<float*>(Tb + 2 * BR * LB);         // [2][4][BR]: row max, log sum, Di, seqQ
   const int nkb = (a.K + BC - 1) / BC;
   const int kb = blockIdx.x % nkb, h = (blockIdx.x / nkb) % a.H, b = blockIdx.x / (nkb * a.H);
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
   const int k0 = kb * BC, kl0 = warp * 16;
-  const float* qb_ = q + (size_t)b * a.Q * ldq + h * D;
-  const float* ob_ = dO + (size_t)b * a.Q * lddo + h * D;
-  const float* vb_ = v + (size_t)b * a.K * ldv + h * D;
-  const float* kb_ = k + (size_t)b * a.K * ldk + h * D;
-  loadBf<D>(nullptr, Kt, kb_, ldk, k0, a.K);
+  const size_t bh = (size_t)b * a.H + h;
+  const uint16_t* qp = qh + bh * Npq * DP;
+  const uint16_t* op = doh + bh * Npq * DP;
+  const uint16_t* kp = kh + bh * Npk * DP;
+  const uint16_t* tp = bt.p ? bt.p + b * bt.sb + h * bt.sh + k0 : nullptr;
+  const float* lseb = lse + bh * a.Q;
+  const float* lgb = lseb + (size_t)a.B * a.H * a.Q;
+  const float* Dib = Di + bh * a.Q;
+  for (int i = threadIdx.x; i < BC * DP / 8; i += THREADS) {
+    const int r = i / (DP / 8), c = (i % (DP / 8)) * 8;
+    cp16(Kb + r * LK + c, kp + (size_t)(k0 + r) * DP + c, true);
+  }
+  auto issue = [&](int st, int q0) {
+    uint16_t* Qs = Qb + st * BR * LK;
+    uint16_t* Os = Ob + st * BR * LK;
+    for (int i = threadIdx.x; i < BR * DP / 8; i += THREADS) {
+      const int r = i / (DP / 8), c = (i % (DP / 8)) * 8;
+      cp16(Qs + r * LK + c, qp + (size_t)(q0 + r) * DP + c, true);
+      cp16(Os + r * LK + c, op + (size_t)(q0 + r) * DP + c, true);
+    }
+    if (tp) {
+      uint16_t* T = Tb + st * BR * LB;
+      for (int i = threadIdx.x; i < BR * BC / 8; i += THREADS) {
+        const int r = i / (BC / 8), c = (i % (BC / 8)) * 8;
+        cp16(T + r * LB + c, tp + (size_t)(q0 + r) * bt.ld + c, true);
+      }
+    }
+    if (threadIdx.x < BR) {
+      float* qv = QV + st * 4 * BR;
+      const int j = threadIdx.x, q = q0 + j;
+      const bool in = q < a.Q;
+      cp4(qv + j, in ? lseb + q : lseb, in);
+      cp4(qv + BR + j, in ? lgb + q : lgb, in);
+      cp4(qv + 2 * BR + j, in ? Dib + q : Dib, in);
+      if (a.seqQ) cp4(qv + 3 * BR + j, in ? a.seqQ + q : a.seqQ, in);
+    }
+  };
+  issue(0, 0);
+  cpCommit();
+  float kaR[2];
+  int ksR[2];
+#pragma unroll
+  for (int r = 0; r < 2; ++r) {
+    const int k = k0 + kl0 + g + r * 8;
+    kaR[r] = keyAdd(a, b, h, k);
+    ksR[r] = a.seqK && k < a.K ? a.seqK[k] : 0;
+  }
   uint32_t ka[DP / 16][4], va[DP / 16][4];
 #pragma unroll
   for (int s = 0; s < DP / 16; ++s) {
-    aFrag<D>(ka[s], kb_, ldk, k0 + kl0 + g, a.K, s * 16 + 2 * t);
-    aFrag<D>(va[s], vb_, ldv, k0 + kl0 + g, a.K, s * 16 + 2 * t);
+    aFragH<DP>(ka[s], kp, k0 + kl0 + g, s * 16 + 2 * t);
+    aFragH<DP>(va[s], vh + bh * Npk * DP, k0 + kl0 + g, s * 16 + 2 * t);
   }
   float dka[D / 8][4], dva[D / 8][4];
 #pragma unroll
   for (int n = 0; n < D / 8; ++n)
 #pragma unroll
     for (int e = 0; e < 4; ++e) dka[n][e] = dva[n][e] = 0.f;
-  const float* lseb = lse + ((size_t)b * a.H + h) * a.Q;
-  const float* lgb = lseb + (size_t)a.B * a.H * a.Q;
-  const float* Dib = Di + ((size_t)b * a.H + h) * a.Q;
   float* dqb = dq + (size_t)b * a.Q * lddq + h * D;
   real* g0 = a.bias[0].grad ? a.bias[0].grad + b * a.bias[0].sb + h * a.bias[0].sh + k0 : nullptr;
   real* g1 = a.bias[1].grad ? a.bias[1].grad + b * a.bias[1].sb + h * a.bias[1].sh + k0 : nullptr;
-  for (int q0 = 0; q0 < a.Q; q0 += BR) {
+  const int nq = (a.Q + BR - 1) / BR;
+  for (int it = 0; it < nq; ++it) {
+    const int st = it & 1, q0 = it * BR;
+    if (it + 1 < nq) issue(st ^ 1, q0 + BR);
+    cpCommit();
+    cpWait1();
     __syncthreads();
-    loadBf<D>(Qs, Qt, qb_, ldq, q0, a.Q);
-    loadBf<D>(Os, Ot, ob_, lddo, q0, a.Q);
-    loadAdd(T, a, b, h, q0, k0);
-    for (int i = threadIdx.x; i < BR; i += THREADS) {
-      Ls[i] = q0 + i < a.Q ? lseb[q0 + i] : INFINITY;
-      Lg[i] = q0 + i < a.Q ? lgb[q0 + i] : 0.f;
-      Ds[i] = q0 + i < a.Q ? Dib[q0 + i] : 0.f;
-    }
-    __syncthreads();
+    const uint16_t* Qs = Qb + st * BR * LK;
+    const uint16_t* Os = Ob + st * BR * LK;
+    uint16_t* T = Tb + st * BR * LB;
+    const float* qv = QV + st * 4 * BR;
 #pragma unroll 1
     for (int hq = 0; hq < 2; ++hq) {
-      float st[4][4], dpt[4][4];   // 16 keys x 32 queries
+      float sa[4][4], dpt[4][4];   // 16 keys x 32 queries
 #pragma unroll
       for (int jj = 0; jj < 4; ++jj)
 #pragma unroll
-        for (int e = 0; e < 4; ++e) st[jj][e] = dpt[jj][e] = 0.f;
+        for (int e = 0; e < 4; ++e) sa[jj][e] = dpt[jj][e] = 0.f;
 #pragma unroll
       for (int s = 0; s < DP / 16; ++s)
 #pragma unroll
         for (int jj = 0; jj < 4; ++jj) {
           const int i = ((hq * 4 + jj) * 8 + g) * LK + s * 16 + 2 * t;
-          mma16(st[jj], ka[s], word(Qs, i), word(Qs, i + 8));
+          mma16(sa[jj], ka[s], word(Qs, i), word(Qs, i + 8));
           mma16(dpt[jj], va[s], word(Os, i), word(Os, i + 8));
         }
 #pragma unroll
       for (int jj = 0; jj < 4; ++jj)
 #pragma unroll
         for (int e = 0; e < 4; ++e) {
-          int kl = kl0 + g + (e >> 1) * 8, ql = (hq * 4 + jj) * 8 + 2 * t + (e & 1);
-          float x = logit(st[jj][e], T[ql * LT + kl], a);
-          float p = x == -INFINITY ? 0.f : expf((x - Ls[ql]) - Lg[ql]);
-          float ds = p * (dpt[jj][e] - Ds[ql]);
-          T[ql * LT + kl] = ds;
-          st[jj][e] = p;
+          const int kl = kl0 + g + (e >> 1) * 8, ql = (hq * 4 + jj) * 8 + 2 * t + (e & 1);
+          float add = kaR[e >> 1];
+          if (add != -INFINITY) {
+            if (a.seqQ && ksR[e >> 1] != __float_as_int(qv[3 * BR + ql])) add = -INFINITY;
+            else if (tp) add += bfToF(T[ql * LB + kl]);
+          }
+          const float x = logit(sa[jj][e], add, a);
+          const float p = x == -INFINITY || q0 + ql >= a.Q ? 0.f : ex2(fmaf(x - qv[ql], LOG2E, -LOG2E * qv[BR + ql]));
+          const float ds = p * (dpt[jj][e] - qv[2 * BR + ql]);
+          T[ql * LB + kl] = (uint16_t)(bf2(ds, 0.f) & 0xffff);
+          sa[jj][e] = p;
           dpt[jj][e] = ds;
         }
 #pragma unroll
       for (int u = 0; u < 2; ++u) {
-        uint32_t pa[4], sa[4];
-        cToA(pa, st[2 * u], st[2 * u + 1]);
-        cToA(sa, dpt[2 * u], dpt[2 * u + 1]);
+        uint32_t pa[4], da[4];
+        cToA(pa, sa[2 * u], sa[2 * u + 1]);
+        cToA(da, dpt[2 * u], dpt[2 * u + 1]);
 #pragma unroll
         for (int n = 0; n < D / 8; ++n) {
-          const int i = (n * 8 + g) * LR + hq * 32 + u * 16 + 2 * t;
-          mma16(dva[n], pa, word(Ot, i), word(Ot, i + 8));
-          mma16(dka[n], sa, word(Qt, i), word(Qt, i + 8));
+          uint32_t b0, b1;
+          ldT(b0, b1, Os, hq * 32 + u * 16, n * 8, LK);
+          mma16(dva[n], pa, b0, b1);
+          ldT(b0, b1, Qs, hq * 32 + u * 16, n * 8, LK);
+          mma16(dka[n], da, b0, b1);
         }
       }
     }
     __syncthreads();
     if (g0 || g1)
       for (int i = threadIdx.x; i < BR * BC; i += THREADS) {
-        int ql = i / BC, kl = i % BC;
-        float ds = T[ql * LT + kl];
+        const int ql = i / BC, kl = i % BC;
+        const float ds = bfToF(T[ql * LB + kl]);
         if (ds != 0.f) {
-          long long qq = q0 + ql;
+          const long long qq = q0 + ql;
           if (g0) atomicAdd(g0 + qq * a.bias[0].sq + kl, ds);
           if (g1) atomicAdd(g1 + qq * a.bias[1].sq + kl, ds);
         }
       }
+    // dQ for this warp's 16 queries over the block's 64 keys, added straight from the accumulators (a warp's
+    // atomics cover eight rows' 32-byte sectors whole)
     const int qw = warp * 16;
     float dqa[D / 8][4];
 #pragma unroll
@@ -836,32 +979,31 @@ __global__ void __launch_bounds__(THREADS, D <= 32 ? 3 : 2) bwdBf(Sdpa a, const 
     for (int s = 0; s < BC / 16; ++s) {
       uint32_t A[4];
 #pragma unroll
-      for (int i = 0; i < 4; ++i) {
-        float2 x = *reinterpret_cast<const float2*>(T + (qw + g + (i & 1) * 8) * LT + s * 16 + 2 * t + (i >> 1) * 8);
-        A[i] = bf2(x.x, x.y);
-      }
+      for (int i = 0; i < 4; ++i) A[i] = word(T, (qw + g + (i & 1) * 8) * LB + s * 16 + 2 * t + (i >> 1) * 8);
 #pragma unroll
       for (int n = 0; n < D / 8; ++n) {
-        const int i = (n * 8 + g) * LR + s * 16 + 2 * t;
-        mma16(dqa[n], A, word(Kt, i), word(Kt, i + 8));
+        uint32_t b0, b1;
+        ldT(b0, b1, Kb, s * 16, n * 8, LK);
+        mma16(dqa[n], A, b0, b1);
       }
     }
-    float* stw = St + warp * 16 * LS;
 #pragma unroll
-    for (int n = 0; n < D / 8; ++n)
+    for (int r = 0; r < 2; ++r) {
+      const int qq = q0 + qw + g + r * 8;
+      if (qq >= a.Q) continue;
 #pragma unroll
-      for (int e = 0; e < 4; ++e) stw[(g + (e >> 1) * 8) * LS + n * 8 + 2 * t + (e & 1)] = dqa[n][e] * a.scale;
-    __syncwarp();
-    for (int i = lane; i < 16 * D; i += 32) {
-      int r = i / D, d = i % D, qq = q0 + qw + r;
-      if (qq < a.Q) atomicAdd(dqb + (long long)qq * lddq + d, stw[r * LS + d]);
+      for (int n = 0; n < D / 8; ++n) {
+        atomicAdd(dqb + (long long)qq * lddq + n * 8 + 2 * t, dqa[n][r * 2] * a.scale);
+        atomicAdd(dqb + (long long)qq * lddq + n * 8 + 2 * t + 1, dqa[n][r * 2 + 1] * a.scale);
+      }
     }
+    __syncthreads();   // this stage is the one the next iteration's issue overwrites
   }
   float* dkb = dk + (size_t)b * a.K * lddk + h * D;
   float* dvb = dv + (size_t)b * a.K * lddv + h * D;
 #pragma unroll
   for (int r = 0; r < 2; ++r) {
-    int kk = k0 + kl0 + g + r * 8;
+    const int kk = k0 + kl0 + g + r * 8;
     if (kk >= a.K) continue;
 #pragma unroll
     for (int n = 0; n < D / 8; ++n)
@@ -869,38 +1011,51 @@ __global__ void __launch_bounds__(THREADS, D <= 32 ? 3 : 2) bwdBf(Sdpa a, const 
       for (int c = 0; c < 2; ++c) {
         float* pk = dkb + (long long)kk * lddk + n * 8 + 2 * t + c;
         float* pv = dvb + (long long)kk * lddv + n * 8 + 2 * t + c;
-        float xk = dka[n][r * 2 + c] * a.scale, xv = dva[n][r * 2 + c];
+        const float xk = dka[n][r * 2 + c] * a.scale, xv = dva[n][r * 2 + c];
         *pk = accK ? *pk + xk : xk;
         *pv = accV ? *pv + xv : xv;
       }
   }
 }
 template <int D>
-inline size_t bwdBfSmem() {
-  return sizeof(float) * (BR * (BC + PADK) + 3 * BR + 4 * 16 * (D + PADK)) + 2 * (2 * BR * ldBf<D>() + 3 * D * LR);
-}
+inline size_t bwdBfSmem() { return 2 * (5 * BR * ldBf<D>() + 2 * BR * LB) + 4 * (2 * 4 * BR); }
 template <int D>
 inline void forwardBf(const Sdpa& a, const float* q, int ldq, const float* k, int ldk, const float* v, int ldv,
                       float* o, int ldo, float* lse) {
+  Scratch scratch;
+  constexpr int DP = padD<D>();
+  const int Npq = (a.Q + 63) / 64 * 64, Npk = (a.K + 63) / 64 * 64;
+  const uint16_t* qh = headsBf(q, ldq, a.B, a.Q, a.H, D, Npq, DP);
+  const uint16_t* kh = headsBf(k, ldk, a.B, a.K, a.H, D, Npk, DP);
+  const uint16_t* vh = headsBf(v, ldv, a.B, a.K, a.H, D, Npk, DP);
   static bool attr = false;
-  size_t smem = fwdBfSmem<D>();
+  const size_t smem = fwdBfSmem<D>();
   if (!attr) { GK(cudaFuncSetAttribute(fwdBf<D>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem)); attr = true; }
-  size_t grid = (size_t)((a.Q + BR - 1) / BR) * a.H * a.B;
-  fwdBf<D><<<(unsigned)grid, THREADS, smem, STREAM>>>(a, q, ldq, k, ldk, v, ldv, o, ldo, lse);
+  const BiasTile bt = biasBf(a, Npq, Npk);
+  const size_t grid = (size_t)((a.Q + BR - 1) / BR) * a.H * a.B;
+  fwdBf<D><<<(unsigned)grid, THREADS, smem, STREAM>>>(a, bt, qh, kh, vh, Npq, Npk, o, ldo, lse);
 }
 template <int D>
 inline void backwardBf(const Sdpa& a, const float* q, int ldq, const float* k, int ldk, const float* v, int ldv,
                        const float* dO, int lddo, const float* lse, const float* Di, float* dq, int lddq, float* dk,
                        int lddk, float* dv, int lddv, bool accK, bool accV) {
+  Scratch scratch;
+  constexpr int DP = padD<D>();
+  const int Npq = (a.Q + 63) / 64 * 64, Npk = (a.K + 63) / 64 * 64;
+  const uint16_t* qh = headsBf(q, ldq, a.B, a.Q, a.H, D, Npq, DP);
+  const uint16_t* oh = headsBf(dO, lddo, a.B, a.Q, a.H, D, Npq, DP);
+  const uint16_t* kh = headsBf(k, ldk, a.B, a.K, a.H, D, Npk, DP);
+  const uint16_t* vh = headsBf(v, ldv, a.B, a.K, a.H, D, Npk, DP);
   static bool attr = false;
-  size_t smem = bwdBfSmem<D>();
+  const size_t smem = bwdBfSmem<D>();
   if (!attr) {
     GK(cudaFuncSetAttribute(bwdBf<D>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
     GK(cudaFuncSetAttribute(bwdBf<D>, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
     attr = true;
   }
-  size_t grid = (size_t)((a.K + BC - 1) / BC) * a.H * a.B;
-  bwdBf<D><<<(unsigned)grid, THREADS, smem, STREAM>>>(a, q, ldq, k, ldk, v, ldv, dO, lddo, lse, Di, dq, lddq, dk,
+  const BiasTile bt = biasBf(a, Npq, Npk);
+  const size_t grid = (size_t)((a.K + BC - 1) / BC) * a.H * a.B;
+  bwdBf<D><<<(unsigned)grid, THREADS, smem, STREAM>>>(a, bt, qh, kh, vh, oh, Npq, Npk, lse, Di, dq, lddq, dk,
                                                        lddk, dv, lddv, accK, accV);
 }
 
