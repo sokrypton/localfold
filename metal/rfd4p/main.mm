@@ -1,25 +1,36 @@
 // RFD4-Proteina on Metal: a job file in, a design out, in one process with no JavaScript.
 //
 //   bash metal/build.sh rfd4p
-//   ./metal/rfd4p/localfold-rfd4p --job=<spec.json> --bundle=model-rfd4p-int8 [--out=design.pdb] [--seed=N]
+//   ./metal/rfd4p/localfold-rfd4p --job=<spec.json> --bundle=model-rfd4p-int8 [--out=design.pdb|.cif]
+//       [--designs=N] [--seed=N] [--f32]
 //
 // The spec is read and featurised by `cuda/rfd4p/featurise/featurise.cpp` LINKED IN (the same object cuda/rfd4p
 // links, and byte for byte what `rfd4p-featurise` writes - measured: the whole input directory identical and all
-// 44 tensors of the generation export exact against `cuda/rfd4p/export_input.mjs`, the replayed Box-Muller stream
-// among them). Then the trunk, the autoencoder's decoder and the flow sampler run on this Mac's GPU, and the
-// design is written. A 54-residue unconditional design is 60 steps in 8.7 s; the whole job, featurisation
-// included, is 13.
+// 44 tensors of the generation export exact against `cuda/rfd4p/export_input.mjs`, the replayed Box-Muller
+// stream among them). Then the trunk, the autoencoder and the flow sampler run on this Mac's GPU, and the design
+// is written - mmCIF where the name ends `.cif`, which is the format RFD4-Proteina itself writes.
+//
+// SPEED, on an M5 (8-core GPU), a whole job including featurisation: a 54-residue design at 60 steps is
+// **3.7 s**, a 67-token motif 3.5 s, a 165-token small molecule 17.6 s, a 183-token interface 21.0 s.
+// 🔴 HALF IS THE DEFAULT AND `--f32` IS THE CONTROL, which is 3.5x slower: 12.6 s for that first design against
+// 3.7. One sampler step at 183 tokens went 681 ms of GPU time to 180 over this port's optimisation round - the
+// weights and the activations in half, the triangle's projections writing channel-major so nothing transposes,
+// the residual folded into the GEMM that produces it, and a pair row's index taken from its threadgroup rather
+// than from a software integer division a thread.
 //
 // WHAT RUNS: unconditional, motif scaffolding, protein-protein interfaces, small molecules (whose chirality is
-// re-aligned every step), partial diffusion and inverse folding. Measured, consecutive CA-CA within a chain:
-// unconditional 3.81 A median over [3.73, 3.90], motif 3.79, ppi 3.80, small molecule 3.81, partial 3.74 - and
-// inverse folding returns the input's own backbone to 0.0005 A, which is the nm-to-angstrom rounding.
-// 🔴 READ THAT AT A CONVERGED STEP COUNT: the same code at 2 steps gives 11 A and at 60 gives 3.81. The
+// re-aligned every step), coordinate groups (whose labels are permuted every step), partial diffusion and
+// inverse folding. Measured, consecutive CA-CA within a chain at 60 steps: unconditional 3.81 A over
+// [3.69, 3.92], motif 3.80, interface 3.80, small molecule 3.83, partial 3.74 - and inverse folding returns the
+// input's own backbone to 0.0005 A, the nm-to-angstrom rounding.
+// 🔴 READ THOSE AT A CONVERGED STEP COUNT: the same code at 2 steps gives 11 A and at 60 gives 3.81. The
 // trajectory gate below runs at 2 steps and says nothing about geometry; they are different questions.
+// 🔴 AND HALF COSTS 0.022 A: the same seed through both arithmetics gives designs 0.022 A RMS apart (worst
+// 0.059) with 53 of 54 residues identical, against 13 to 23 A between seeds.
 //
-// REFUSED BY NAME rather than run as something else: a job with two or more coordinate groups (their labels are
-// permuted every step and this port does not do it - and neither does cuda/rfd4p, which freezes them silently),
-// and `center_every_step`.
+// REFUSED BY NAME rather than run as something else: a bias on the triangle's projections (`tri_mult_bias` is
+// false in this checkpoint and the channel-major projection cannot carry one), and a `coord_group_seq` block
+// whose place in the 897 sequence columns cannot be located.
 //
 // THE GATE, over an exported input directory rather than a job:
 //   localfold-rfd4p <input dir> --bundle=<model-rfd4p-int8> [--oracle=<dir>] [--encoder=<dir>] [--gen=<dir>-gen]
@@ -104,6 +115,7 @@ int main(int argc, char** argv) {
     else if (!strncmp(a, "--seed=", 7)) seed = a + 7;
     else if (!strncmp(a, "--designs=", 10)) designs = atoi(a + 10);
     else if (!strcmp(a, "--f16")) HALF = true;
+    else if (!strcmp(a, "--f32")) HALF = false;
     else if (a[0] != '-') input = a;
     else die("unknown flag %s", a);
   }
@@ -164,9 +176,9 @@ int main(int argc, char** argv) {
 
   if (input.empty() || bundle.empty()) {
     fprintf(stderr, "usage: localfold-rfd4p --job=<spec.json|.yaml> --bundle=<model-rfd4p-int8> [--out=design.pdb|.cif]\n"
-                    "         [--designs=N] [--seed=N]\n"
+                    "         [--designs=N] [--seed=N] [--f32]\n"
                     "       localfold-rfd4p <input dir> --bundle=<model-rfd4p-int8> [--oracle=<dir>] "
-                    "[--encoder=<dir>] [--gen=<dir>-gen] [--out=design.pdb] [--designs=N] [--f16]\n");
+                    "[--encoder=<dir>] [--gen=<dir>-gen] [--out=design.pdb] [--designs=N] [--f32]\n");
     return 2;
   }
 
@@ -496,11 +508,20 @@ int main(int argc, char** argv) {
   // ---- the flow sampler ---------------------------------------------------------------------------------
   if (!genDir.empty()) {
     checkDecoderDims();
-    GATE_CHECK = checkFn;
-    // 🔴 THE TRAJECTORY'S BOUND IS NOT A STAGE'S. Every step feeds the next, and the backbone's first step
-    // divides by t = 1e-3, so what a stage holds to 1e-6 arrives here multiplied; the per-step record is what
-    // says whether that is amplification (the numbers grow smoothly) or a wiring fault (one step jumps).
-    GATE_TRAJ_BOUND = HALF ? 1e-2 : 1e-4;
+    // only where the reference's own trajectory was exported beside the generation: without it there is nothing
+    // to hold the steps to, and printing "(not in the oracle)" sixty times says nothing
+    if (M.has("gen/x0Bb")) GATE_CHECK = checkFn;
+    // 🔴 THE TRAJECTORY'S BOUND IS NOT A STAGE'S. Every step feeds the next, so what a stage holds to 1e-6
+    // arrives here multiplied; the per-step record is what says whether that is amplification (the numbers grow
+    // smoothly) or a wiring fault (one step jumps).
+    GATE_TRAJ_BOUND = HALF ? 1e-3 : 1e-4;
+    // 🔴 THE NOISED STATE'S OWN BOUND IN HALF, from the arithmetic and then from the designs. A step's score
+    // divides by (1 - t), which at the LAST step is 0.091 over a two-step run - the worst-conditioned point a
+    // trajectory has - and there the half arm reads 1.5e-2 where x1, which divides by nothing, reads 1.4e-5.
+    // What that is worth was measured end to end rather than argued: at sixty steps on one seed the two
+    // arithmetics' designs are 0.022 A RMS apart (worst 0.059) with 53 of 54 residues identical, against 13 to
+    // 23 A between seeds. 3e-2 is that with room; the `--f32` arm holds every row at 1e-4.
+    GATE_TRAJ_XT_BOUND = HALF ? 3e-2 : 1e-4;
     const int ran = generate(genDir, outPath, designs, seed.empty() ? 0 : strtoull(seed.c_str(), nullptr, 10));
     printf("  the sampler ran %d steps\n", ran);
     GATE_CHECK = nullptr;

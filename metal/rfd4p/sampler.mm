@@ -274,6 +274,7 @@ Stream drawStream(uint64_t seed, int n, int latent, int steps, int groups, int c
 
 double (*GATE_CHECK)(const char*, const std::string&, const float*, size_t, double) = nullptr;
 double GATE_TRAJ_BOUND = 1e-4;
+double GATE_TRAJ_XT_BOUND = 1e-4;
 
 int generate(const std::string& genDir, const std::string& outPath, int designs, uint64_t seed) {
   (void)genDir;
@@ -491,7 +492,14 @@ int generate(const std::string& genDir, const std::string& outPath, int designs,
   float* x1Bb = allocT<float>((size_t)n * 3);
   float* x1Ll = allocT<float>((size_t)n * latent);
 
+  // LOCALFOLD_PROFILE=1: every labelled dispatch in its own command buffer, its GPU time summed by label - an
+  // upper bound, for proportions. One step is profiled rather than all sixty: they are the same work.
+  const int profileStep = profiling() ? (int)(getenv("LOCALFOLD_RFD4P_PROFILE_STEP")
+                                                  ? atoi(getenv("LOCALFOLD_RFD4P_PROFILE_STEP"))
+                                                  : steps - 1)
+                                      : -1;
   for (int st = 0; st < steps; ++st) {
+    if (st == profileStep) profileStart();
     // the step's own noised state into the sequence features - three columns at 0 and thirty-two at 3
     copy2d(seqF, (size_t)seqDim * 4, xBb, 3 * 4, 3 * 4, (size_t)n);
     copy2d(seqF + 3, (size_t)seqDim * 4, xLl, (size_t)latent * 4, (size_t)latent * 4, (size_t)n);
@@ -596,6 +604,7 @@ int generate(const std::string& genDir, const std::string& outPath, int designs,
         dispatch("rfd4p_center", &ca2, sizeof ca2, Grid{(uint32_t)dim, 1, 1}, 256, 0, "rfd4p_center");
       }
     }
+    if (st == profileStep) profileReport("one sampler step", 24);
     // LOCALFOLD_RFD4P_TRACE=1: a checksum of the state after every step, which is how a divergence between two
     // runs of one input is located - the step it first appears at says whether the difference came in with the
     // features or grew in the trunk.
@@ -653,14 +662,19 @@ int generate(const std::string& genDir, const std::string& outPath, int designs,
       const char* keys[4] = {"Bb", "Ll", "X1Bb", "X1Ll"};
       const char* names[4] = {"xt bb_ca", "xt latents", "x1 bb_ca", "x1 latents"};
       const size_t counts[4] = {(size_t)n * 3, (size_t)n * latent, (size_t)n * 3, (size_t)n * latent};
+      // 🔴 THE REPLAYED INPUTS ARE HELD EXACT IN BOTH ARITHMETICS AND THE TRAJECTORY IS NOT, which is the split
+      // that matters: the noise and the features are the same bytes whatever the GEMMs are told to do (measured
+      // 4.5e-8 and exactly 0.0), while a step DIVIDES - x1 by nothing but a near-cancelling sum, xt's score by
+      // (1 - t), which at the last step of a two-step run is 0.091, the worst-conditioned point a trajectory
+      // has. In half those read 4e-3 and 1.5e-2 where float32 reads 1e-5 and 6e-6.
       for (int k = 0; k < 4; ++k)
         GATE_CHECK(("step " + tag + " " + names[k]).c_str(), "gen/s" + tag + keys[k], ours[k], counts[k],
-                   GATE_TRAJ_BOUND);
+                   GATE_TRAJ_XT_BOUND);
     }
   }
   if (GATE_CHECK) {
-    GATE_CHECK("final xt bb_ca", "gen/xBb", xBb, (size_t)n * 3, GATE_TRAJ_BOUND);
-    GATE_CHECK("final xt latents", "gen/xLl", xLl, (size_t)n * latent, GATE_TRAJ_BOUND);
+    GATE_CHECK("final xt bb_ca", "gen/xBb", xBb, (size_t)n * 3, GATE_TRAJ_XT_BOUND);
+    GATE_CHECK("final xt latents", "gen/xLl", xLl, (size_t)n * latent, GATE_TRAJ_XT_BOUND);
   }
 
   // ---- the structure -------------------------------------------------------------------------------------

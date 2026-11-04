@@ -6,7 +6,12 @@
 #include "rfd4p.h"
 
 Dims D_;
-bool HALF = false;
+// 🔴 HALF BY DEFAULT, AND THE MEASUREMENT IS WHY. Over 54 tokens every trunk stage is within 1e-4 of the CPU
+// reference on the reference's own input and the chained trunk within 1.6e-4, the designs come out with the same
+// geometry (CA-CA median 3.81 A), and a generation is 3.5x faster: 12.58 s -> 3.63 s for a 60-step design, and
+// 3.36 -> 1.00 s for a 183-token one. `--f32` is the exact arm and the one the oracle gate's tight bounds
+// belong to; it is one flag away and the recipe in main.mm runs both.
+bool HALF = true;
 
 void loadWeights(const std::string& dir) {
   // 🔴 EVERY TENSOR FLOAT32 UNTIL A STAGE ASKS OTHERWISE. The trunk's GEMMs are held to a float64 CPU reference at

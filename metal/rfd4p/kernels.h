@@ -7,12 +7,16 @@
 struct RfdRmsArgs { CP(float) x; DP(float) y; DP(half) yh; CP(float) w; u64 rows; int C, ldx, ldy; float eps; };
 // the SwiGLU transition's middle: g[r][i] = silu(h[r][I + i]) * h[r][i], from the one [rows][2I] product
 struct RfdSwigluArgs { CP(float) h; DP(float) g; DP(half) gh; u64 rows; uint I, pad; };
+// the SwiGLU over a HALF product (the transition's first GEMM writing half), its result half for the second
+struct RfdSwigluHArgs { CP(half) h; DP(half) g; u64 rows; uint I, pad; };
 // AdaptiveLayerNorm with ONE conditioning row broadcast over every row (the pair track's z_init): out = RMS(x) *
 // sigmoid(gamma) + beta, the norm fused so the normalised x is never written. gamma and beta are [C].
 struct RfdAdalnArgs { CP(float) x; DP(float) y; DP(half) yh; CP(float) gamma; CP(float) beta; u64 rows; int C; float eps; };
 // AdaptiveLayerNorm with a conditioning row PER ROW (every token layer's two adaLNs): out = RMS(x) *
 // sigmoid(gamma[r]) + beta[r], the norm fused so the normalised x is never written
-struct RfdAdalnRowsArgs { CP(float) x; DP(float) y; CP(float) gamma; CP(float) beta; u64 rows; int C; float eps; };
+// `yh`: the result in half as well, for the GEMM that reads it next - staging an f32 operand was 205 conversion
+// passes and 9.6% of a step
+struct RfdAdalnRowsArgs { CP(float) x; DP(float) y; DP(half) yh; CP(float) gamma; CP(float) beta; u64 rows; int C; float eps; };
 // x[r][d] += y[r][d] * sigmoid(gamma[r][d]) - AdaptiveOutputScale and its residual, in one pass
 struct RfdScaleAddArgs { DP(float) x; CP(float) y; CP(float) gamma; u64 rows; int C; uint pad; };
 // pair-biased gated attention in float32, a threadgroup per (query, head): out[i][h D + d] =
@@ -22,6 +26,8 @@ struct RfdAttnArgs { CP(float) q; CP(float) k; CP(float) v; CP(float) bias; CP(f
                      uint n, heads, dimHead, ldv; u64 vOff; float scale; };
 // the pair write (`pair_write: hadamard`): z[i n + j][d] = pair[i n + j][d] + pij[j][d] * pij[i][P + d] - the
 // first half of linear_x's output indexed by the COLUMN, the second by the row (pair_update.py's pi / pj)
+// `z` may be `pair` itself: the write is elementwise at one index, so the pair track is updated in place and
+// the copy that followed it is gone
 struct RfdPairWriteArgs { CP(float) pair; CP(float) pij; DP(float) z; u64 rows; uint n, P; };
 // the triangle's operands, gated and transposed to channel-major planes in one pass:
 // aT[c][r] = aP[r][c] * sigmoid(aG[r][c]), and the same for b - what the batched contraction reads
@@ -46,3 +52,10 @@ struct RfdStepArgs { DP(float) x; DP(float) x1; CP(float) v; CP(float) eps; CP(f
                      float t, dt, gt, std, r, vsCoef; uint stochastic, pad; };
 // `_force_zero_com`: (x - the emitted tokens' mean) * emit, a threadgroup a channel
 struct RfdCenterArgs { DP(float) x; CP(float) emit; u64 tokens; uint dim, pad; };
+// the same three, over HALF buffers: the pair track's operands stay half from the norm to the contraction, so
+// nothing is converted on the way and the contraction's operands are what the matrix units want
+struct RfdTriAbHArgs { CP(half) aP; CP(half) aG; CP(half) bP; CP(half) bG; DP(half) aT; DP(half) bT; u64 rows; uint T, pad; };
+struct RfdTriGatherHArgs { CP(half) x; DP(half) out; u64 rows; uint T, pad; };
+// `add` folded in: y += x * sigmoid(g), which is the triangle's whole tail - the separate residual add was 9.2%
+// of a step over 23 calls, and it reads and writes the pair track again for nothing
+struct RfdMulSigmoidHArgs { CP(half) x; CP(half) g; DP(float) y; u64 n; };

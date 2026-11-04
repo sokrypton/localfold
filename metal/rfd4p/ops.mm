@@ -46,7 +46,7 @@ void transition(const float* x, float* y, size_t rows, int dim, int expansion, c
 }
 
 void adalnRows(const float* x, const float* cond, const std::string& prefix, float* y, size_t rows, int dim,
-               int condDim, bool ln) {
+               int condDim, bool ln, half* yh) {
   const int C = condDim ? condDim : D_.C;
   // 🔴 THE CONDITIONING IS NORMED AGAIN HERE, by this adaLN's own `norm_cond` - `adaptiveLayerNorm` in the CPU
   // reference norms both of its inputs, so c is normed per layer and x is normed on top of whatever normed it last.
@@ -64,7 +64,7 @@ void adalnRows(const float* x, const float* cond, const std::string& prefix, flo
     return;
   }
   RfdAdalnRowsArgs a{};
-  a.x = x; a.y = y; a.gamma = gamma; a.beta = beta; a.rows = rows; a.C = dim; a.eps = 1e-5f;
+  a.x = x; a.y = y; a.yh = yh; a.gamma = gamma; a.beta = beta; a.rows = rows; a.C = dim; a.eps = 1e-5f;
   run("rfd4p_adaln_rows", grid1d((rows + 7) / 8, 1), 256, a);
 }
 
@@ -87,4 +87,36 @@ void scaleAdd(float* x, const float* y, const float* cond, const std::string& pr
   RfdScaleAddArgs a{};
   a.x = x; a.y = y; a.gamma = gamma; a.rows = rows; a.C = dim;
   run1d("rfd4p_scale_add", rows * (size_t)dim, a);
+}
+
+void linH(const half* X, const std::string& w, half* Y, size_t rows, int in, int out, const float* bias, bool relu) {
+  Gemm g{};
+  g.X = X; g.tx = F16;
+  g.W = M.h("w/" + w); g.tw = F16; g.transW = true;
+  g.Y = Y; g.ty = F16;
+  g.rows = rows; g.in = in; g.out = out;
+  g.bias = bias; g.tbias = F32; g.relu = relu;
+  g.label = w.c_str();
+  gemm(g);
+}
+
+void linHF(const half* X, const std::string& w, float* Y, size_t rows, int in, int out, const float* bias, bool relu) {
+  Gemm g{};
+  g.X = X; g.tx = F16;
+  g.W = M.h("w/" + w); g.tw = F16; g.transW = true;
+  g.Y = Y; g.ty = F32;
+  g.rows = rows; g.in = in; g.out = out;
+  g.bias = bias; g.tbias = F32; g.relu = relu;
+  g.label = w.c_str();
+  gemm(g);
+}
+
+void transitionH(const half* x, half* y, size_t rows, int dim, int expansion, const std::string& prefix, half* hid,
+                 half* gated) {
+  const int inner = dim * expansion;
+  linH(x, prefix + ".swish_linear.0.weight", hid, rows, dim, 2 * inner);
+  RfdSwigluHArgs a{};
+  a.h = hid; a.g = gated; a.rows = rows; a.I = (uint)inner;
+  run1d("rfd4p_swiglu_h", rows * (size_t)inner, a);
+  linH(gated, prefix + ".linear_out.weight", y, rows, inner, dim);
 }

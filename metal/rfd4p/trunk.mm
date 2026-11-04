@@ -69,11 +69,22 @@ void tokenLayer(int layer, float* s, const float* z, const float* c) {
   // ---- 1. the pair-biased gated attention, under its adaLN and output scale
   float* xa = scratch<float>("tl.xa", (size_t)n * D);
   adalnRows(s, c, L + "mhba.adaln", xa, n, D);
+  // 🔴 THE NORM WRITES HALF WHERE THE NEXT GEMM WANTS HALF. Handing core an f32 operand with `half` asked for
+  // means it stages a converted copy first: 205 such passes were 9.6% of a step.
   float* nodeN = scratch<float>("tl.nodeN", (size_t)n * D);
-  rmsNorm(xa, nodeN, n, D, M.f("w/" + MHA + "node_norm.weight"));
+  half* nodeNh = HALF ? scratch<half>("tl.nodeNh", (size_t)n * D) : nullptr;
+  if (HALF) {
+    RfdRmsArgs r{};
+    r.x = xa; r.y = nullptr; r.yh = nodeNh; r.w = M.f("w/" + MHA + "node_norm.weight");
+    r.rows = n; r.C = D; r.eps = 1e-5f;
+    run("rfd4p_rms_norm", grid1d((size_t)(n + 7) / 8, 1), 256, r);
+  } else {
+    rmsNorm(xa, nodeN, n, D, M.f("w/" + MHA + "node_norm.weight"));
+  }
 
   float* qkv = scratch<float>("tl.qkv", (size_t)n * 3 * D);
-  lin(nodeN, MHA + "to_qkv.weight", qkv, n, D, 3 * D, M.f("w/" + MHA + "to_qkv.bias"));
+  if (HALF) linHF(nodeNh, MHA + "to_qkv.weight", qkv, n, D, 3 * D, M.f("w/" + MHA + "to_qkv.bias"));
+  else lin(nodeN, MHA + "to_qkv.weight", qkv, n, D, 3 * D, M.f("w/" + MHA + "to_qkv.bias"));
   // q and k are normed in place out of the packed row (`use_qkln`); v is read where it lies, by stride.
   float* q = scratch<float>("tl.q", (size_t)n * D);
   float* k = scratch<float>("tl.k", (size_t)n * D);
@@ -84,13 +95,23 @@ void tokenLayer(int layer, float* s, const float* z, const float* c) {
   run("rfd4p_rms_norm", grid1d((size_t)(n + 7) / 8, 1), 256, rk);
 
   float* g = scratch<float>("tl.g", (size_t)n * D);
-  lin(nodeN, MHA + "to_g.weight", g, n, D, D, M.f("w/" + MHA + "to_g.bias"));
+  if (HALF) linHF(nodeNh, MHA + "to_g.weight", g, n, D, D, M.f("w/" + MHA + "to_g.bias"));
+  else lin(nodeN, MHA + "to_g.weight", g, n, D, D, M.f("w/" + MHA + "to_g.bias"));
 
   // the pair bias: this layer's norm of the pair track, projected to one value a head
-  float* zn = scratch<float>("tl.zn", nn * P);
-  rmsNorm(z, zn, nn, P, M.f("w/" + MHA + "pair_norm.weight"));
   float* bias = scratch<float>("tl.bias", nn * H);
-  lin(zn, MHA + "to_bias.weight", bias, nn, P, H);
+  if (HALF) {
+    half* znh = scratch<half>("tl.znh", nn * P);
+    RfdRmsArgs r{};
+    r.x = z; r.y = nullptr; r.yh = znh; r.w = M.f("w/" + MHA + "pair_norm.weight");
+    r.rows = nn; r.C = P; r.eps = 1e-5f;
+    run("rfd4p_rms_norm", grid1d((nn + 7) / 8, 1), 256, r);
+    linHF(znh, MHA + "to_bias.weight", bias, nn, P, H);
+  } else {
+    float* zn = scratch<float>("tl.zn", nn * P);
+    rmsNorm(z, zn, nn, P, M.f("w/" + MHA + "pair_norm.weight"));
+    lin(zn, MHA + "to_bias.weight", bias, nn, P, H);
+  }
 
   float* ctx = scratch<float>("tl.ctx", (size_t)n * D);
   RfdAttnArgs at{};
@@ -104,11 +125,22 @@ void tokenLayer(int layer, float* s, const float* z, const float* c) {
   scaleAdd(s, attnOut, c, L + "mhba.scale_output", n, D);
 
   // ---- 2. the SwiGLU transition, under its own adaLN and output scale
-  adalnRows(s, c, L + "transition.adaln", xa, n, D);
-  float* hid = scratch<float>("tl.hid", (size_t)n * 8 * D);
-  float* gated = scratch<float>("tl.gated", (size_t)n * 4 * D);
   float* tr = scratch<float>("tl.tr", (size_t)n * D);
-  transition(xa, tr, n, D, 4, L + "transition.transition", hid, gated);
+  if (HALF) {
+    half* xah = scratch<half>("tl.xah", (size_t)n * D);
+    adalnRows(s, c, L + "transition.adaln", xa, n, D, 0, false, xah);
+    half* hid = scratch<half>("tl.hidh", (size_t)n * 8 * D);
+    half* gated = scratch<half>("tl.gatedh", (size_t)n * 4 * D);
+    half* trh = scratch<half>("tl.trh", (size_t)n * D);
+    transitionH(xah, trh, n, D, 4, L + "transition.transition", hid, gated);
+    // the result back in float for the residual, which accumulates over fourteen layers
+    toFloat(trh, tr, (size_t)n * D);
+  } else {
+    adalnRows(s, c, L + "transition.adaln", xa, n, D);
+    float* hid = scratch<float>("tl.hid", (size_t)n * 8 * D);
+    float* gated = scratch<float>("tl.gated", (size_t)n * 4 * D);
+    transition(xa, tr, n, D, 4, L + "transition.transition", hid, gated);
+  }
   scaleAdd(s, tr, c, L + "transition.scale_output", n, D);
 }
 
@@ -131,6 +163,83 @@ static void triangle(const std::string& prefix, float* z, bool outgoing) {
   // 🔴 LayerNorm, NOT RMSNorm, AND WITH ITS BIAS. The trunk's token side is RMSNorm throughout (`norm_type:
   // rmsnorm_torch_fused`) and the triangle's three norms are plain LayerNorms - mixing them up is a 1e-1 error
   // that still produces a plausible structure.
+  // 🔴 AND UNDER `--f16` THE WHOLE TRIANGLE IS HALF FROM HERE TO THE GATE, which is where the time is: with an
+  // f32 pair track the core staged every operand through `lf_to_half` - 289 conversions and 18.6% of a step -
+  // and the contraction ran on the vector units because its operands were floats. Half from the norm down, the
+  // conversions are gone and the contraction is what the matrix units take. The norm is computed in float
+  // either way (core's LayerNorm reads f32 and writes half), so what is in half is the PRODUCTS, not the sums.
+  if (HALF) {
+    // 🔴 THE PROJECTIONS WRITE CHANNEL-MAJOR BY SWAPPING THE GEMM'S OPERANDS, so the triangle has no transpose
+    // in it at all. The contraction wants [T] planes of n x n; the activations arrive as pair rows [n*n][T], and
+    // a kernel that transposes them was the two most expensive dispatches in a step (10.8% and 9.5%, both pure
+    // data movement of 17 MB a buffer with the writes a whole row apart and nothing coalescing). The identity is
+    // that the same product comes out transposed when the roles swap:
+    //     Y[t][r] = sum_p weight[t][p] zn[r][p]
+    // is `rows = T, in = P, out = n*n` with the WEIGHT as X and the activations as a transposed W. The GEMM
+    // writes the planes the contraction reads, and the gate below is elementwise in that layout.
+    // 🔴 AND A BIAS CANNOT COME THROUGH THIS WAY: core's bias is per output COLUMN, which here is a pair row
+    // rather than a channel. This checkpoint has `tri_mult_bias: false`, so there is none - and a bundle that
+    // has one is refused by name rather than silently dropped.
+    for (const char* b : {".linear_a_p.bias", ".linear_a_g.bias", ".linear_b_p.bias", ".linear_b_g.bias"})
+      if (opt(prefix + b)) die("rfd4p: %s%s is a bias the channel-major projection cannot carry", prefix.c_str(), b);
+    half* zn = scratch<half>("tri.znH", nn * P);
+    layerNorm(z, zn, nn, P, M.f(W + "layer_norm_in.weight"), opt(prefix + ".layer_norm_in.bias"));
+    half* aP = scratch<half>("tri.aPH", nn * T);
+    half* aG = scratch<half>("tri.aGH", nn * T);
+    half* bP = scratch<half>("tri.bPH", nn * T);
+    half* bG = scratch<half>("tri.bGH", nn * T);
+    auto projectT = [&](const char* name, half* Y) {
+      Gemm g{};
+      g.X = M.h("w/" + prefix + name); g.tx = F16;       // the weight [T][P] as the row operand
+      g.W = zn; g.tw = F16; g.transW = true;             // the activations [n*n][P] read as [out][in]
+      g.Y = Y; g.ty = F16;
+      g.rows = (size_t)T; g.in = P; g.out = (int)nn;
+      g.accFloat = true;
+      g.label = name;
+      gemm(g);
+    };
+    projectT(".linear_a_p.weight", aP);
+    projectT(".linear_a_g.weight", aG);
+    projectT(".linear_b_p.weight", bP);
+    projectT(".linear_b_g.weight", bG);
+
+    half* aT = scratch<half>("tri.aTH", nn * T);
+    half* bT = scratch<half>("tri.bTH", nn * T);
+    RfdTriAbHArgs ab{};
+    ab.aP = aP; ab.aG = aG; ab.bP = bP; ab.bG = bG; ab.aT = aT; ab.bT = bT; ab.rows = nn; ab.T = (uint)T;
+    // channel-major in and out: a thread's read and its write are the same index, so both coalesce
+    run1d("rfd4p_tri_ab_hm", nn * T, ab);
+
+    half* x = scratch<half>("tri.xH", nn * T);
+    Gemm g{};
+    g.X = aT; g.tx = F16; g.W = bT; g.tw = F16; g.Y = x; g.ty = F16;
+    g.rows = n; g.in = n; g.out = n;
+    g.ldx = n; g.ldw = n; g.ldy = n;
+    g.batch = T; g.sx = (int64_t)nn; g.sw = (int64_t)nn; g.sy = (int64_t)nn;
+    g.transW = outgoing;
+    g.transX = !outgoing;
+    // 🔴 ACCUMULATED IN FLOAT EVEN THOUGH THE OPERANDS ARE HALF: the contraction is over n terms of products of
+    // gated activations, and a half accumulator loses the small ones.
+    g.accFloat = true;
+    g.label = outgoing ? "tri-out" : "tri-in";
+    gemm(g);
+
+    // 🔴 THE CENTRE NORM TRANSPOSES AND NORMALISES IN ONE PASS - metal/core's own kernel, written for exactly
+    // this seam: a channel-major product in, pair rows of half out. It replaces a gather of 17 MB and a
+    // LayerNorm over it.
+    half* xn = scratch<half>("tri.xnH", nn * T);
+    centerNorm(x, 1.f, xn, n, n, T, M.f(W + "layer_norm_out.weight"), opt(prefix + ".layer_norm_out.bias"));
+
+    half* proj = scratch<half>("tri.projH", nn * P);
+    half* gate = scratch<half>("tri.gateH", nn * P);
+    linH(xn, prefix + ".linear_z.weight", proj, nn, T, P, opt(prefix + ".linear_z.bias"));
+    linH(zn, prefix + ".linear_g.weight", gate, nn, P, P, opt(prefix + ".linear_g.bias"));
+    RfdMulSigmoidHArgs ms{};
+    ms.x = proj; ms.g = gate; ms.y = z; ms.n = nn * P;
+    run1d("rfd4p_mul_sigmoid_h", nn * P, ms);
+    return;
+  }
+
   float* zn = scratch<float>("tri.zn", nn * P);
   layerNorm(z, zn, nn, P, M.f(W + "layer_norm_in.weight"), opt(prefix + ".layer_norm_in.bias"));
 
@@ -173,11 +282,9 @@ static void triangle(const std::string& prefix, float* z, bool outgoing) {
   float* gate = scratch<float>("tri.gate", nn * P);
   lin(xn, prefix + ".linear_z.weight", proj, nn, T, P, opt(prefix + ".linear_z.bias"));
   lin(zn, prefix + ".linear_g.weight", gate, nn, P, P, opt(prefix + ".linear_g.bias"));
-  float* outv = scratch<float>("tri.out", nn * P);
   RfdMulSigmoidArgs ms{};
-  ms.x = proj; ms.g = gate; ms.y = outv; ms.n = nn * P;
+  ms.x = proj; ms.g = gate; ms.y = z; ms.n = nn * P;
   run1d("rfd4p_mul_sigmoid", nn * P, ms);
-  add(z, outv, nn * P);
 }
 
 void pairUpdate(int layer, const float* s, float* z) {
@@ -190,11 +297,10 @@ void pairUpdate(int layer, const float* s, float* z) {
   layerNorm(s, xn, n, D, M.f("w/" + Q + "layer_norm_in.weight"), M.f("w/" + Q + "layer_norm_in.bias"));
   float* pij = scratch<float>("pu.pij", (size_t)n * 2 * P);
   lin(xn, Q + "linear_x.weight", pij, n, D, 2 * P);
-  float* zw = scratch<float>("pu.zw", nn * P);
   RfdPairWriteArgs pw{};
-  pw.pair = z; pw.pij = pij; pw.z = zw; pw.rows = nn; pw.n = (uint)n; pw.P = (uint)P;
-  run1d("rfd4p_pair_write", nn * P, pw);
-  copy(z, zw, nn * P * 4);
+  pw.pair = z; pw.pij = pij; pw.z = z; pw.rows = nn; pw.n = (uint)n; pw.P = (uint)P;
+  // a threadgroup a pair row (see the kernel): the row index is the group's, not a division a thread
+  dispatch("rfd4p_pair_write", &pw, sizeof pw, grid1d(nn, 1), 256, 0, "rfd4p_pair_write");
 
   // ---- the two triangles, each added in, the second reading what the first wrote
   triangle(Q + "tri_mult_out", z, true);
@@ -203,6 +309,24 @@ void pairUpdate(int layer, const float* s, float* z) {
   // ---- the pair transition
   const std::string TR = Q + "transition_out.";
   const int hidden = (int)M.len("w/" + TR + "linear_1.bias");
+  if (HALF) {
+    half* tn = scratch<half>("pu.tnh", nn * P);
+    layerNorm(z, tn, nn, P, M.f("w/" + TR + "layer_norm.weight"), M.f("w/" + TR + "layer_norm.bias"));
+    half* h = scratch<half>("pu.hh", nn * (size_t)hidden);
+    linH(tn, TR + "linear_1.weight", h, nn, P, hidden, M.f("w/" + TR + "linear_1.bias"), true);
+    float* tr = scratch<float>("pu.tr", nn * P);
+    // 🔴 THE RESIDUAL IS THE GEMM'S OWN beta, so the pair track is read and written once rather than twice: the
+    // separate add was 9.2% of a step across the updates.
+    Gemm g{};
+    g.X = h; g.tx = F16; g.W = M.h("w/" + TR + "linear_2.weight"); g.tw = F16; g.transW = true;
+    g.Y = z; g.ty = F32; g.Yin = z; g.beta = 1.f;
+    g.rows = nn; g.in = hidden; g.out = P;
+    g.bias = M.f("w/" + TR + "linear_2.bias"); g.tbias = F32;
+    g.label = "pair-transition-out";
+    gemm(g);
+    (void)tr;
+    return;
+  }
   float* tn = scratch<float>("pu.tn", nn * P);
   layerNorm(z, tn, nn, P, M.f("w/" + TR + "layer_norm.weight"), M.f("w/" + TR + "layer_norm.bias"));
   float* h = scratch<float>("pu.h", nn * (size_t)hidden);

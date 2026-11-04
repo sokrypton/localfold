@@ -63,7 +63,11 @@ kernel void rfd4p_adaln_rows(constant RfdAdalnRowsArgs& a [[buffer(0)]], uint3 t
   float s = 0;
   for (int c = lane; c < a.C; c += 32) { const float v = x[c]; s += v * v; }
   const float inv = rsqrt(simd_sum(s) / (float)a.C + a.eps);
-  for (int c = lane; c < a.C; c += 32) a.y[row * a.C + c] = x[c] * inv * lf_sigmoid(gm[c]) + bt[c];
+  for (int c = lane; c < a.C; c += 32) {
+    const float v = x[c] * inv * lf_sigmoid(gm[c]) + bt[c];
+    if (a.y) a.y[row * a.C + c] = v;
+    if (a.yh) a.yh[row * a.C + c] = (half)v;
+  }
 }
 
 kernel void rfd4p_scale_add(LF_ARGS(RfdScaleAddArgs)) {
@@ -138,13 +142,22 @@ kernel void rfd4p_attention(constant RfdAttnArgs& a [[buffer(0)]], uint3 tg [[th
   }
 }
 
-kernel void rfd4p_pair_write(LF_ARGS(RfdPairWriteArgs)) {
-  const ulong t = LF_INDEX;
-  if (t >= a.rows * (ulong)a.P) return;
+// 🔴 A THREADGROUP A PAIR ROW, NOT A THREAD AN ELEMENT, because the row index cost more than the arithmetic.
+// Apple's GPUs have no integer divider, so `row = t / P` is a software routine - and run once per ELEMENT that
+// was 12.9 million of them a call, which held this kernel at 33 GB/s where the band next to it reaches 127. The
+// row comes from the threadgroup's own index now and the channel from the thread's: no division at all.
+kernel void rfd4p_pair_write(constant RfdPairWriteArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
+                             uint3 ng [[threadgroups_per_grid]], uint tid [[thread_index_in_threadgroup]],
+                             uint3 tpg [[threads_per_threadgroup]]) {
+  const ulong row = (ulong)tg.y * ng.x + tg.x;
+  if (row >= a.rows) return;
   const uint P = a.P;
-  const ulong row = t / P, chan = t - row * P;
-  const uint i = lf_udiv((uint)row, a.n), j = (uint)row - i * a.n;
-  a.z[t] = a.pair[t] + a.pij[(ulong)j * 2 * P + chan] * a.pij[(ulong)i * 2 * P + P + chan];
+  const uint i = (uint)lf_udiv((uint)row, a.n), j = (uint)row - i * a.n;
+  device const float* pi = a.pij + (ulong)j * 2 * P;
+  device const float* pj = a.pij + (ulong)i * 2 * P + P;
+  device const float* pair = a.pair + row * P;
+  device float* z = a.z + row * P;
+  for (uint c = tid; c < P; c += tpg.x) z[c] = pair[c] + pi[c] * pj[c];
 }
 
 // a thread a (pair row, channel): the gate applied and the value transposed into its channel's plane
@@ -167,7 +180,7 @@ kernel void rfd4p_tri_gather(LF_ARGS(RfdTriGatherArgs)) {
 kernel void rfd4p_mul_sigmoid(LF_ARGS(RfdMulSigmoidArgs)) {
   const ulong t = LF_INDEX;
   if (t >= a.n) return;
-  a.y[t] = a.x[t] * lf_sigmoid(a.g[t]);
+  a.y[t] += a.x[t] * lf_sigmoid(a.g[t]);
 }
 
 // a simdgroup a row: LayerNorm(x) * sigmoid(gamma[row]) + beta[row] - the x-norm inside `adaptiveLayerNorm` has
@@ -279,4 +292,44 @@ kernel void rfd4p_center(constant RfdCenterArgs& a [[buffer(0)]], uint3 tg [[thr
   const float mean = total / max(n, 1.f);
   for (ulong t = tid; t < a.tokens; t += tpg.x)
     a.x[t * a.dim + c] = a.emit[t] != 0.f ? a.x[t * a.dim + c] - mean : 0.f;
+}
+
+// 🔴 THE GATE IS APPLIED IN FLOAT AND STORED IN HALF, not computed in half: sigmoid of a half is a half's worth
+// of resolution in the logistic's knee, where the product itself has the range to spare.
+kernel void rfd4p_tri_ab_h(LF_ARGS(RfdTriAbHArgs)) {
+  const ulong t = LF_INDEX;
+  if (t >= a.rows * (ulong)a.T) return;
+  const ulong row = t / a.T, c = t - row * a.T;
+  const ulong at = c * a.rows + row;
+  a.aT[at] = (half)((float)a.aP[t] * lf_sigmoid((float)a.aG[t]));
+  a.bT[at] = (half)((float)a.bP[t] * lf_sigmoid((float)a.bG[t]));
+}
+
+kernel void rfd4p_tri_gather_h(LF_ARGS(RfdTriGatherHArgs)) {
+  const ulong t = LF_INDEX;
+  if (t >= a.rows * (ulong)a.T) return;
+  const ulong row = t / a.T, c = t - row * a.T;
+  a.out[t] = a.x[c * a.rows + row];
+}
+
+kernel void rfd4p_mul_sigmoid_h(LF_ARGS(RfdMulSigmoidHArgs)) {
+  const ulong t = LF_INDEX;
+  if (t >= a.n) return;
+  a.y[t] += (float)a.x[t] * lf_sigmoid((float)a.g[t]);
+}
+
+// the gate over CHANNEL-MAJOR planes: a thread's reads and its write are one index, so everything coalesces
+kernel void rfd4p_tri_ab_hm(LF_ARGS(RfdTriAbHArgs)) {
+  const ulong t = LF_INDEX;
+  if (t >= a.rows * (ulong)a.T) return;
+  a.aT[t] = (half)((float)a.aP[t] * lf_sigmoid((float)a.aG[t]));
+  a.bT[t] = (half)((float)a.bP[t] * lf_sigmoid((float)a.bG[t]));
+}
+
+kernel void rfd4p_swiglu_h(LF_ARGS(RfdSwigluHArgs)) {
+  const ulong t = LF_INDEX;
+  if (t >= a.rows * (ulong)a.I) return;
+  const uint r = lf_udiv((uint)(t / a.I), 1), i = (uint)(t - (ulong)r * a.I);
+  device const half* h = a.h + (ulong)r * 2 * a.I;
+  a.g[t] = (half)(lf_silu((float)h[a.I + i]) * (float)h[i]);
 }

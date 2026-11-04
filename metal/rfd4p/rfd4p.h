@@ -44,6 +44,12 @@ extern bool HALF;
 // Y[rows, out] = X[rows, in] W[out, in]^T (+ bias) - torch's layout, which every tensor in this checkpoint uses
 void lin(const float* X, const std::string& w, float* Y, size_t rows, int in, int out, const float* bias = nullptr,
          bool relu = false);
+// the same with HALF operands and a half result: the pair track's path under `--f16`, where staging an f32
+// operand would mean a conversion pass of its own (measured at 18.6% of a step before these existed)
+void linH(const half* X, const std::string& w, half* Y, size_t rows, int in, int out, const float* bias = nullptr,
+          bool relu = false);
+void linHF(const half* X, const std::string& w, float* Y, size_t rows, int in, int out, const float* bias = nullptr,
+           bool relu = false);
 // a tensor that may not be in this checkpoint (`tri_mult_bias: false` leaves the triangle's biases out, and the
 // CPU reference reads every one of them optionally): its float32 bytes, or null
 const float* opt(const std::string& name);
@@ -56,7 +62,10 @@ void transition(const float* x, float* y, size_t rows, int dim, int expansion, c
 // AdaptiveLayerNorm against a conditioning row per row: y = RMS(x) * sigmoid(gamma) + beta, where gamma and beta
 // are that layer's projections of RMSNorm(cond, norm_cond.weight) - `prefix` is the adaLN's (e.g. "....mhba.adaln")
 void adalnRows(const float* x, const float* cond, const std::string& prefix, float* y, size_t rows, int dim,
-               int condDim = 0, bool ln = false);
+               int condDim = 0, bool ln = false, half* yh = nullptr);
+// one SwiGLU transition with half operands throughout (`--f16`): the product, the gate and the projection
+void transitionH(const half* x, half* y, size_t rows, int dim, int expansion, const std::string& prefix, half* hid,
+                 half* gated);
 // x += y * sigmoid(scale_output's gamma of `cond`) - AdaptiveOutputScale and the block's residual
 void scaleAdd(float* x, const float* y, const float* cond, const std::string& prefix, size_t rows, int dim,
               int condDim = 0);
@@ -147,6 +156,9 @@ int generate(const std::string& genDir, const std::string& outPath, int designs 
 // the dump's tensor `key`, at `bound`, returning the relative RMS. Null when nothing is being held.
 extern double (*GATE_CHECK)(const char* label, const std::string& key, const float* ours, size_t n, double bound);
 extern double GATE_TRAJ_BOUND;
+// the noised state's own bound: a step's `score` divides by (1 - t), so at the last step the velocity's error
+// arrives amplified where the clean estimate x1 - which does not divide by anything - does not
+extern double GATE_TRAJ_XT_BOUND;
 
 // ---------------------------------------------------------------- chirality.mm
 // `align_chirality`, recomputed every step: the clean packed vectors rotated onto the directions their frame's
