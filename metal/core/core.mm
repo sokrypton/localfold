@@ -44,6 +44,7 @@ static const MTLLanguageVersion LANGUAGE4 = (MTLLanguageVersion)(4 << 16);
 
 namespace {
 void gpuBusyAdd(double gpuMs, double kernelMs);
+void gpuSpanAdd(double start, double end, double kernelMs);
 struct Alloc { id<MTLBuffer> buf; uint64_t addr; size_t size; };
 struct Stats { double syncMs = 0, compileMs = 0; long dispatches = 0, commits = 0, syncs = 0, staged = 0, allocs = 0, gemms = 0; };
 
@@ -217,7 +218,8 @@ struct Device {
     // thing the per-dispatch profile cannot report, because it gives each dispatch a buffer of its own.
     if (gpuBusyOn()) {
       [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
-        gpuBusyAdd((done.GPUEndTime - done.GPUStartTime) * 1e3, (done.kernelEndTime - done.kernelStartTime) * 1e3);
+        gpuSpanAdd(done.GPUStartTime * 1e3, done.GPUEndTime * 1e3,
+                   (done.kernelEndTime - done.kernelStartTime) * 1e3);
       }];
     }
     [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
@@ -450,15 +452,31 @@ struct Device {
 static std::mutex GPU_BUSY_MU;
 static double GPU_BUSY_MS = 0, GPU_KERNEL_MS = 0;
 static long GPU_BUSY_N = 0;
-void gpuBusyAdd(double gpuMs, double kernelMs) {
+// 🔴 THE SPANS, NOT THEIR SUM. Several command buffers are in flight at once, so adding up every
+// `GPUEndTime - GPUStartTime` DOUBLE-COUNTS the overlap - and that is not a small effect: summed, this
+// reported the same GPU time per step whether the port ran 6 buffers a step or 744, which is what gave the
+// mistake away. The union of the spans is the GPU's real busy time; their sum is not.
+static std::vector<std::pair<double, double>> GPU_SPANS;
+void gpuBusyAdd(double gpuMs, double kernelMs) { (void)gpuMs; (void)kernelMs; }
+void gpuSpanAdd(double start, double end, double kernelMs) {
   std::lock_guard<std::mutex> g(GPU_BUSY_MU);
-  GPU_BUSY_MS += gpuMs; GPU_KERNEL_MS += kernelMs; ++GPU_BUSY_N;
+  GPU_SPANS.push_back({start, end});
+  GPU_KERNEL_MS += kernelMs; ++GPU_BUSY_N;
 }
-void gpuBusySnapshot(double* gpu, double* kern, long* n);
+void gpuBusySnapshot(double* gpu, double* kern, long* n, double* span);
 Device& D() { static Device* d = new Device(); return *d; }
-void gpuBusySnapshot(double* gpu, double* kern, long* n) {
+void gpuBusySnapshot(double* gpu, double* kern, long* n, double* span) {
   std::lock_guard<std::mutex> g(GPU_BUSY_MU);
-  *gpu = GPU_BUSY_MS; *kern = GPU_KERNEL_MS; *n = GPU_BUSY_N;
+  std::vector<std::pair<double, double>> v = GPU_SPANS;
+  std::sort(v.begin(), v.end());
+  double busy = 0, at = -1, end = -1, first = v.empty() ? 0 : v.front().first, last = 0;
+  for (auto& [a, b] : v) {
+    if (a > end) { if (end > at) busy += end - at; at = a; end = b; }
+    else if (b > end) end = b;
+    last = std::max(last, b);
+  }
+  if (end > at) busy += end - at;
+  *gpu = busy; *kern = GPU_KERNEL_MS; *n = GPU_BUSY_N; *span = last - first;
 }
 }  // namespace
 
@@ -475,11 +493,12 @@ void gpuBusySnapshot(double* gpu, double* kern, long* n) {
 // kept: a branch that cannot run on the hardware it was written for is how a port grows a second, wrong
 // implementation.
 void gpuBusyReport(const char* what, int over) {
-  double gpu = 0, kern = 0; long n = 0;
-  gpuBusySnapshot(&gpu, &kern, &n);
+  double gpu = 0, kern = 0, span = 0; long n = 0;
+  gpuBusySnapshot(&gpu, &kern, &n, &span);
   if (!n) return;
-  fprintf(stderr, "%s: %ld command buffers, GPU busy %.1f ms, kernel %.1f ms", what, n, gpu, kern);
-  if (over > 0) fprintf(stderr, " (%.1f and %.1f a step over %d)", gpu / over, kern / over, over);
+  fprintf(stderr, "%s: %ld command buffers, GPU busy %.1f ms of a %.1f ms span (%.0f%% busy)", what, n, gpu,
+          span, span > 0 ? 100 * gpu / span : 0.0);
+  if (over > 0) fprintf(stderr, ", %.1f ms a step over %d", gpu / over, over);
   fprintf(stderr, "\n");
 }
 

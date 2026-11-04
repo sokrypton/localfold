@@ -555,7 +555,6 @@ int generate(const std::string& genDir, const std::string& outPath, int designs,
     pd.dim = (uint)M.meta("meta/distDim", 30); pd.off = 0; pd.stride = (uint)pairDim;
     pd.dmin = (float)M.meta("meta/distMin", 0.1); pd.dmax = (float)M.meta("meta/distMax", 3);
     run1d("rfd4p_pair_dists", nn, pd);
-
     if (GATE_CHECK && st == 0) {
       GATE_CHECK("step 0 seq features", "gen/f0Seq", seqF, (size_t)n * seqDim, GATE_TRAJ_BOUND);
       GATE_CHECK("step 0 pair features", "gen/f0Pair", pairF, nn * pairDim, GATE_TRAJ_BOUND);

@@ -136,33 +136,39 @@
 // each dispatch a buffer of its own. It reports **228.1 ms a step over 11 buffers** against a 230.6 ms wall.
 // So the GPU is busy ~100% of the step and the port is GPU-BOUND - and the 105 ms between 228.1 and 123.2 is
 // GPU-side overhead spread over 419 dispatches, about **0.25 ms each**.
-// 🔴 AND THE OBVIOUS INFERENCE FROM THAT - "SO REMOVING A DISPATCH SAVES 0.25 ms" - IS WRONG, TESTED. The
-// census says where they are: `rfd4p_rms_norm` ran **51 times a step for 1.87 ms** of kernel,
-// `rfd4p_adaln_rows` **28 times for 0.65 ms**. Two pairs that share an input were merged, taking **419
-// dispatches a step to 391** with the kernel sum 123.2 ms to 119.4 - so 28 dispatches went and no arithmetic
-// came back:
-//   * `to_qkv` [3D][D] and `to_g` [D][D] into one [4D][D] product, whose natural layout IS core's packed
-//     q | k | v | g row - the output stride the two-GEMM form needed went with it;
-//   * q's and k's RMSNorms into one dispatch (independent: both read `to_qkv`'s output, different slices).
-// The model predicts 28 x 0.25 = 7 ms a step, 3%. Measured in both orderings: AB -0.12 / +0.82 / +0.21 s,
-// BA -0.10 / +0.11 / +0.39 - a mean of **+0.22 s, which is nothing, or marginally worse**. So the 105 ms is
-// NOT proportional to the dispatch count over the range this port can vary it.
-// WHAT IS ESTABLISHED: the GPU is busy for essentially the whole step (228.1 against a 230.6 ms wall), so
-// there is no host-side lever; the per-dispatch profile sums 123.2 ms over all 419, none of them unlabelled;
-// and the difference is real GPU time that no kernel accounts for. WHAT IS NOT: what it is. Three
-// explanations have failed - a spurious `sync` (hoisted, no change), unlabelled work (there is none), and the
-// dispatch count (above) - and the candidate left is that the per-dispatch timestamps UNDER-report what a
-// kernel costs inside a real command buffer, in which case there is nothing between the kernels to remove and
-// the roofline table above is computed against an under-count. Telling that apart needs a GPU trace.
-// 🔴 THE MERGES ARE KEPT, AND NOT AS A SPEED WIN: one GEMM where there were two, one dispatch where there
-// were two, a stride trick gone, 28 fewer dispatches, 3.8 ms less kernel time - facts about the code rather
-// than about this laptop's temperature. What cannot merge, so the next reader does not try: the two adaLNs a
-// layer are sequential (the transition's reads `s` after the attention), the node norm precedes q and k, and
-// the triangle's `linear_z` and `linear_g` read different tensors (`xn` and `zn`).
-// 🔴 AND NOTHING BELOW A FEW PERCENT CAN BE MEASURED ON THIS MACHINE ANY MORE. After a long session the job
-// that runs in 12.8 s cool takes **22.4 s**, and consecutive runs of ONE binary differ by 0.5 s. Every number
-// in this file above 4% was taken interleaved and survived both orderings; nothing smaller should be believed
-// from here without a cold machine.
+// 🔴 AND THE 105 ms IS NOT THE DISPATCH COUNT - FOUR EXPERIMENTS, AND THE LAST TWO ARE THE ones THAT SETTLE
+// IT. The GPU-busy figure had to be fixed first: summing every buffer's `GPUEndTime - GPUStartTime`
+// DOUBLE-COUNTS, because several are in flight at once, and the tell was that the sum came out the same per
+// step whether the port ran 6 buffers a step or 744. Taken as the UNION of the spans it reads **13542 ms of a
+// 13668 ms span - 99% busy, 225.7 ms a step** against a 228 ms wall. So the port is GPU-bound and there is no
+// host-side lever; that part is solid.
+// Then what the 105 ms is NOT:
+//   * not a spurious `sync` - three loop-invariant `M.hostI` reads were draining the queue sixty times a
+//     generation (each is `i(name); sync(); host(p)`), hoisted out, and the wall did not move;
+//   * not unlabelled work - `dispatch` defaults a label to the kernel's own name, so all 391 are timed;
+//   * not the dispatch COUNT, measured twice. Merging two pairs that share an input took 419 dispatches a step
+//     to 391 with the kernel sum 123.2 ms to 119.4, and the wall did not move. Then **36,000 extra trivial
+//     dispatches** were added to price one directly: the slope puts a dispatch at **0.02 to 0.07 ms**, so all
+//     391 are 8 to 27 ms a step - a fifth of the gap at most, which is exactly why removing 28 of them was
+//     invisible.
+//   * and it cannot be attributed per dispatch in situ at all on this GPU: core.mm records the probe - an M5
+//     supports counter sampling only `AtStageBoundary`, which a compute encoder cannot use.
+// 🔴 SO THE GAP SCALES WITH THE DATA, NOT WITH THE COUNT, and that is the conclusion this file already drew
+// from the other end: the lever is FEWER PASSES OVER THE PAIR TRACK. ~90 ms a step of GPU time that no kernel
+// timestamp attributes, over a 20 MB pair track touched by every stage, is most consistent with memory-system
+// work between dependent dispatches - and it is why the gate's fusion paid 5.2% while removing 28 dispatches
+// paid nothing: the fusion removed two whole PASSES over four pair-sized planes.
+// 🔴 THE MERGES ARE KEPT, AND NOT AS A SPEED WIN: one GEMM where there were two (`to_qkv` [3D][D] and `to_g`
+// [D][D] stacked into [4D][D], whose natural layout IS core's packed q | k | v | g row, so the output stride
+// the two-GEMM form needed went with it), one dispatch where there were two (q's and k's RMSNorms, the only
+// independent pair), a stride trick gone, 3.8 ms less kernel time. Facts about the code, not about this
+// laptop's temperature. What cannot merge: the two adaLNs a layer are sequential (the transition's reads `s`
+// after the attention), the node norm precedes q and k, and the triangle's `linear_z` and `linear_g` read
+// different tensors.
+// 🔴 AND MEASUREMENT HAS A FLOOR HERE. After a long session the job that runs in 12.8 s cool takes 22.4 s, and
+// three interleaved rounds of a **12%** effect (those 36,000 dispatches) came out -0.23, +1.95, +0.23 s. Every
+// number in this file above 4% was taken interleaved and survived both orderings; nothing smaller should be
+// believed from here without a cold machine.
 //
 // So no kernel here is worth another tile sweep. The lever left is FEWER PASSES OVER THE PAIR TRACK - fusing an
 // elementwise pass into the epilogue of the GEMM that produced it, as the gate, the residual and the next
