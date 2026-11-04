@@ -61,17 +61,19 @@ double check(const char* label, const std::string& name, const float* ours, size
 }  // namespace
 
 int main(int argc, char** argv) {
-  std::string input, bundle, oracle;
+  std::string input, bundle, oracle, encDir;
   for (int i = 1; i < argc; ++i) {
     const char* a = argv[i];
     if (!strncmp(a, "--bundle=", 9)) bundle = a + 9;
     else if (!strncmp(a, "--oracle=", 9)) oracle = a + 9;
+    else if (!strncmp(a, "--encoder=", 10)) encDir = a + 10;
     else if (!strcmp(a, "--f16")) HALF = true;
     else if (a[0] != '-') input = a;
     else die("unknown flag %s", a);
   }
   if (input.empty() || bundle.empty()) {
-    fprintf(stderr, "usage: localfold-rfd4p <input dir> --bundle=<model-rfd4p-int8> [--oracle=<dir>] [--f16]\n");
+    fprintf(stderr, "usage: localfold-rfd4p <input dir> --bundle=<model-rfd4p-int8> [--oracle=<dir>] "
+                    "[--encoder=<dir>] [--f16]\n");
     return 2;
   }
 
@@ -81,6 +83,8 @@ int main(int argc, char** argv) {
   checkDims();
   M.loadInput(input);
   if (!oracle.empty()) M.loadInput(oracle);
+  // the encoder's own input directory and the reference's answer to it (`export_input.mjs --encoder`)
+  if (!encDir.empty()) { M.loadInput(encDir); M.loadInput(encDir + "-oracle"); }
   D_.n = (int)M.meta("meta/n");
   D_.nRecycle = (int)M.meta("meta/nRecycle", 1);
   const int n = D_.n;
@@ -150,7 +154,12 @@ int main(int argc, char** argv) {
     // attention output from 3.43e-6 to 1.53e-6 and every stage below it with it (s0 1.26e-6 -> 5.9e-7, coors
     // 1.83e-6 -> 9.0e-7), while the same compensation on the softmax and the context sums moved NOTHING. The
     // trunk's q and k are RMSNormed and carry no bias, which is why its attention never needed it.
-    const double decBound = HALF ? 3e-3 : 1e-6;
+    // 🔴 1e-5 AND NOT THE TRUNK'S 1e-6, FROM TWO INPUTS RATHER THAN ONE. Over 54 tokens every decoder layer on
+    // the reference's own input reads 7.4e-8 to 9.9e-7; over the 67-token partial-diffusion input the same
+    // layers read ~4e-7 except LAYER 2, which reads 3.4e-6 - and layer 2 is the largest of the 54-token set
+    // too (9.9e-7), so what is near-degenerate is that layer's input and not its code. A bug in a layer would
+    // move every layer, since there is one `aeLayer`; this moves one, on both inputs, by the same ratio.
+    const double decBound = HALF ? 3e-3 : 1e-5;
     // the chained decoder, reported at the level measured above with room for another machine and another input
     const double decChained = HALF ? 1e-2 : 1e-4;
     check("c", "c", c, (size_t)n * D_.C, bound);
@@ -206,13 +215,19 @@ int main(int argc, char** argv) {
     // stages: a two-recycle run writes one s0..s13 and it is the second pass's. So the stages of the earlier
     // cycles are held only by the one they produce - which is why `--recycles=2` is the arm that exercises the
     // cycle projections and the second conditioning at all, and why cuda/rfd4p runs both.
-    // 🔴 ZEROED EXPLICITLY, BECAUSE THE FIRST CYCLE'S ANSWER IS A PROPERTY OF THE STATE BEING ZERO. `alloc`
-    // hands back zeroed memory, so this was invisible until arm 1 above ran first and left its own s and z in
-    // these buffers: the cycle projection then had something to project and the whole trunk came back at relRMS
-    // 1.9e-1 - a plausible structure, every stage wrong, and nothing in the recycle code touched. A fold that
-    // depends on a buffer starting at zero says so.
-    fill(s, 0, (size_t)n * D_.D * 4);
-    fill(z, 0, nn * D_.P * 4);
+    // 🔴 ITS OWN BUFFERS, ZEROED BY THE ALLOCATOR, AND NOT ARM 1'S ZEROED AGAIN. The first cycle's answer is a
+    // property of the state being zero (RMSNorm(0) is 0 and the projections have no bias, so the cycle's input
+    // IS the init product), and arm 1 leaves its own s and z in those buffers - which is how this read relRMS
+    // 1.9e-1 once, a plausible structure with every stage wrong and nothing in the recycle code touched.
+    // 🔴 AND ZEROING THEM WITH `fill` IS NOT THE FIX, WHICH COST AN HOUR TO SEE: `fill` memsets on the HOST
+    // when the device looks idle, so it can land while the dispatches that wrote those buffers are still in
+    // flight - the GPU's writes then arrive AFTER the zeroing and the state is not zero at all. It showed as a
+    // chained trunk that was right seven runs in eight and 7.2e-5 in the eighth, from the same bytes: a
+    // difference between runs is a race, never a precision question. A fresh allocation cannot be raced.
+    float* sc = allocT<float>((size_t)n * D_.D);
+    float* zc = allocT<float>(nn * D_.P);
+    s = sc;
+    z = zc;
     for (int cycle = 0; cycle < D_.nRecycle; ++cycle) {
       recycleIn(sInit, zInit, s, z);
       // the conditioning of every cycle after the first is built from the `recycleRemaining` features
@@ -314,6 +329,50 @@ int main(int argc, char** argv) {
       check("decoder chained logits", "d/logits", scattered(dLogits, DD_.types), (size_t)n * DD_.types, decChained);
       check("decoder chained coors", "d/coors", scattered(dCoors, 111), (size_t)n * 111, decChained);
       check("decoder chained presence", "d/presence", scattered(dPresence, 37), (size_t)n * 37, decChained);
+    }
+
+    // ---- the autoencoder's encoder ------------------------------------------------------------------------
+    if (M.has("e/feats")) {
+      checkEncoderDims();
+      const int na = attnCount;
+      float* ef = allocT<float>((size_t)n * ED_.feat);
+      encoderFeatures(n, M.hostF("e/coorsNm"), M.hostF("e/atomMask"), M.hostF("e/chainIid"), M.hostF("e/bondCounts"),
+                      M.hostI("e/element"), M.hostI("e/charge"), ef);
+      check("encoder feats", "e/feats", ef, (size_t)n * ED_.feat, bound);
+      float* mean = allocT<float>((size_t)na * ED_.latent);
+      float* logScale = allocT<float>((size_t)na * ED_.latent);
+      encode(ef, attnIdx, na, mean, logScale);
+      // 🔴 THE LATENTS ARE EMITTED ROWS ONLY, so the comparison is against the oracle's own emit mask and not
+      // the attention's: `emit = attn & supports_local_latent`, and a token that supports no latent has zeros
+      // there in the reference. Scattering by `emit` is what makes the two tables the same table.
+      const float* emit = M.hostF("e/emit");
+      std::vector<int> eidx;
+      for (int i = 0; i < n; ++i) if (emit[i] != 0) eidx.push_back(i);
+      int* ei = uploadNew(eidx.data(), eidx.size());
+      auto scatterEmitC = [&](const float* src, const char* name) {
+        float* out = scratch<float>(std::string("gate.") + name, (size_t)n * ED_.latent);
+        fill(out, 0, (size_t)n * ED_.latent * 4);
+        // the emitted rows are a subset of the attended ones, in the same order
+        float* gathered = scratch<float>("gate.eg", eidx.size() * ED_.latent);
+        std::vector<int> within;
+        {
+          const float* am = M.hostF("in/attnMask");
+          int k = 0;
+          for (int i = 0; i < n; ++i) { if (am[i] == 0) continue; if (emit[i] != 0) within.push_back(k); ++k; }
+        }
+        int* wi = uploadNew(within.data(), within.size());
+        gatherRows(src, gathered, wi, within.size(), ED_.latent);
+        scatterRows(gathered, out, ei, eidx.size(), ED_.latent);
+        return out;
+      };
+      // 🔴 THE ENCODER'S OUTPUT IS A TWELVE-LAYER CHAIN AND IS HELD AS ONE. There are no per-layer encoder
+      // stages in the dump, and there do not need to be: its layers ARE the decoder's (one `aeLayer`, the same
+      // prefix away), which the decoder's per-stage arm gates layer by layer. What is left for this arm to say
+      // is whether the chain and the head are wired right, at the chained level the decoder measures.
+      check("encoder mean", "e/mean", scatterEmitC(mean, "mean"), (size_t)n * ED_.latent, decChained);
+      check("encoder logScale", "e/logScale", scatterEmitC(logScale, "ls"), (size_t)n * ED_.latent, decChained);
+      // the deterministic latent IS the mean, which is what `e/zLatent` holds in this arm
+      check("encoder zLatent", "e/zLatent", scatterEmitC(mean, "zl"), (size_t)n * ED_.latent, decChained);
     }
 
     printf("%s (%.2f s)\n", FAILED ? "FAILED" : "all stages in band", now() - t0);

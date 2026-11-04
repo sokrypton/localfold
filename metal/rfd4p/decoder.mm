@@ -62,9 +62,13 @@ void decoderFeatures(const float* caNm, const float* zLatent, const int* tokenTy
 
 // one decoder layer, in place on `s` over `rows` gathered rows. The trunk's twin is `tokenLayer` in trunk.mm; the
 // differences are all here: LayerNorm rather than RMSNorm, no pair bias, and the 128-wide conditioning.
-void decoderLayer(int layer, float* s, const float* c, size_t rows) {
+// 🔴 THE ENCODER'S LAYERS ARE THIS SAME FUNCTION UNDER ANOTHER PREFIX, and that is a property of the
+// checkpoint rather than a convenience: both halves of the autoencoder are `MultiheadAttnAndTransition` with
+// LayerNorm, no pair bias and a 128-wide conditioning, and `cpu/rfd4p/encoder.js` and `decoder.js` call the same
+// `multiheadAttnAndTransition` with the same arguments but the prefix. One copy here too.
+void aeLayer(const std::string& prefix, int layer, float* s, const float* c, size_t rows) {
   const int D = DD_.D, H = DD_.H, dimHead = DD_.D / DD_.H, C = DD_.C;
-  const std::string L = "autoencoder.decoder.transformer_layers." + std::to_string(layer) + ".";
+  const std::string L = prefix + "transformer_layers." + std::to_string(layer) + ".";
   const std::string MHA = L + "mhba.mha.";
   if (rows > (size_t)LF_ATTN_MAX_N) die("rfd4p decoder: %zu rows is past this port's float32 attention (%d)", rows, LF_ATTN_MAX_N);
 
@@ -118,7 +122,7 @@ void decode(const float* feats, const int* attnIdx, int na, float* sOut, float* 
   lin(fg, P + "init_repr_factory.linear_out.weight", s, na, fdim, D);
   if (sInitOut) copy(sInitOut, s, (size_t)na * D * 4);
   for (int l = 0; l < DD_.layers; ++l) {
-    decoderLayer(l, s, c, na);
+    aeLayer(P, l, s, c, na);
     if (perLayer) copy(perLayer + (size_t)l * na * D, s, (size_t)na * D * 4);
   }
 
@@ -132,4 +136,6 @@ void decode(const float* feats, const int* attnIdx, int na, float* sOut, float* 
   }
 }
 
-void decoderLayerOne(int layer, float* s, const float* c, size_t rows) { decoderLayer(layer, s, c, rows); }
+void decoderLayerOne(int layer, float* s, const float* c, size_t rows) {
+  aeLayer("autoencoder.decoder.", layer, s, c, rows);
+}

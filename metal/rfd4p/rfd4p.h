@@ -87,6 +87,22 @@ extern float* DEC_TAP_ADA;
 extern float* DEC_TAP_ATTN;
 // one decoder layer in place on `rows` gathered rows - the gate's per-stage arm drives it directly
 void decoderLayerOne(int layer, float* s, const float* c, size_t rows);
+// one layer of either half of the autoencoder ("autoencoder.decoder." / "autoencoder.encoder.")
+void aeLayer(const std::string& prefix, int layer, float* s, const float* c, size_t rows);
+
+// ---------------------------------------------------------------- encoder.mm
+// The autoencoder's encoder: all-atom coordinates in, a token's 32 local latents out - what a partial-diffusion
+// or inverse-folding run starts from. `cpu/rfd4p/encoder.js` is the spec; the layers are the decoder's.
+struct EncDims { int layers = 12, D = 768, C = 128, H = 12, feat = 1587, latent = 32; };
+extern EncDims ED_;
+void checkEncoderDims();
+// the encoder's [n][1587] features, built on the host from the structure (its offsets read off the input's
+// metadata, which the featuriser derives from `feats_seq` rather than anybody typing them in)
+void encoderFeatures(int n, const float* coorsNm, const float* atomMask, const float* chainIid,
+                     const float* bondCounts, const int* element, const int* charge, float* feats);
+// the latents: `mean` and `logScale` over the attended rows ([na][32] each). The sampled z is the mean plus
+// eps * exp(logScale); the gate's arm is the deterministic one (z = mean), as the reference's is.
+void encode(const float* feats, const int* attnIdx, int na, float* mean, float* logScale);
 
 // ---------------------------------------------------------------- trunk.mm
 // c = transition_c_2(transition_c_1(cond_factory(features))) over `rows` conditioning rows
