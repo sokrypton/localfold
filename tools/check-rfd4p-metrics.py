@@ -146,6 +146,17 @@ def main() -> int:
             crafted = REPO / "cuda/rfd4p" / dname
             if (crafted / "coors.f32").exists():
                 pairs.append((str(REPO / "cuda/rfd4p/featurise" / jname), str(crafted)))
+    # 🔴 AND IT REFUSES AN EMPTY RUN RATHER THAN PASSING ONE. With no argument and none of those dumps on
+    # disk this printed "0 designs, 0 differing" and exited **0** - a green gate over an empty set, which is
+    # this tree's own recurring lesson and the same shape metal/rfd4p's own main already refuses with
+    # "NOTHING COMPARED - no oracle on disk, so no arm ran". A tool that cannot see its inputs must say so,
+    # because the alternative is a gate list in which this line is always green and never ran.
+    if not pairs:
+        raise SystemExit(
+            "check-rfd4p-metrics: nothing to compare - no `<job.json>:<dump dir>` argument, and none of the\n"
+            "  default dumps are on disk (cuda/rfd4p/gate-writer-*, gate-metrics-5o45, gate-groups-5o45,\n"
+            "  gate-partial-1brs, each needing its own coors.f32). Build them with cuda/rfd4p/gate.py's\n"
+            "  writer and metrics arms, or name a dump written by `localfold-rfd4p --dump-sample=<dir>`.")
     bad = 0
     for spec, dump in pairs:
         spec, dump = Path(spec), Path(dump)
