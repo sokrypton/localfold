@@ -353,9 +353,13 @@ def presets_arm():
     the other six through this port. This does, at the preset's own step count, and fails on a crash, a
     refusal, or a token count that is not the featuriser's own.
 
-    It is a reachability sweep, not a correctness one: the trajectory arms are what hold the arithmetic.
-    Said plainly because a green row here means "this feature runs", which is weaker than the arms above
-    and stronger than nothing - and nothing is what six of these had.
+    🔴 AND IT IS A CORRECTNESS SWEEP WHERE A REFERENCE EXISTS, not a reachability one. It was the
+    second when it was written, and "this feature runs" is a weak claim to leave standing over six
+    presets that had nothing else. So each preset is exported WITH `--gen-oracle --steps=2` and its
+    trajectory compared against the reference's own, exactly as the five named arms are; the fold at the
+    preset's own step count is kept beside it, because a converged chain and a matching trajectory are
+    different questions and this tree has been caught reading one as the other. A preset whose reference
+    is still building reports `reach` and says so, rather than a green row that means less than it looks.
     """
     ids = json.loads(run(["node", "-e", """
       import('./shared/rfd4p/presets.js').then(m => {
@@ -365,9 +369,13 @@ def presets_arm():
     bad, rows = [], []
     for pid in ids:
         d = os.path.join(WORK, f"preset-{pid}")
-        if not os.path.exists(os.path.join(d, "model.idx")):
+        # 🔴 KEYED ON THE REFERENCE, NOT THE INPUT. Keyed on the input, a directory exported before this
+        # arm wanted a `--gen-oracle` would never be upgraded: the input is there, so the build is
+        # skipped, and the preset reports `reach` for ever while looking settled.
+        if not os.path.exists(os.path.join(d + "-gen-oracle", "model.idx")):
             e = run(["node", "--max-old-space-size=8192", EXPORTER, d, f"--preset={pid}",
-                     "--generate", "--encoder", "--steps=60", f"--checkpoint={CHECKPOINT}"])
+                     "--generate", "--encoder", "--gen-oracle", "--steps=2",
+                     f"--checkpoint={CHECKPOINT}"])
             if e.returncode:
                 bad.append(f"{pid} (export)")
                 continue
@@ -379,11 +387,14 @@ def presets_arm():
         out = r.stdout + r.stderr
         m = re.search(r"generated (\d+) residues", out)
         g = re.search(r"consecutive CA-CA: median ([\d.]+)", out)
-        if r.returncode or not m:
+        cmp_ = re.search(r"all green: (\d+) comparisons", out)
+        has_ref = os.path.exists(os.path.join(d + "-gen-oracle", "model.idx"))
+        if r.returncode or not m or (has_ref and not cmp_):
             bad.append(pid)
             rows.append(f"{pid}:FAILED")
         else:
-            rows.append(f"{pid}:{m.group(1)}tok" + (f"/{float(g.group(1)):.1f}A" if g else ""))
+            tag = f"{cmp_.group(1)}cmp" if cmp_ else "reach"
+            rows.append(f"{pid}:{tag}/{m.group(1)}tok" + (f"/{float(g.group(1)):.1f}A" if g else ""))
     return not bad, (f"{len(ids) - len(bad)}/{len(ids)} shipped presets fold  "
                      + " ".join(rows) + (f"  FAILED: {', '.join(bad)}" if bad else ""))
 
