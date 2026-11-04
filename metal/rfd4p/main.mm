@@ -126,6 +126,22 @@
 // the -0.07 / -0.16 / -0.15 / +0.27 s it produced was noise, as its own sign disagreement should have said.
 // A control arm that cannot vary the thing under test is not a control: CLAUDE.md's own rule, earned again.
 //
+// 🔴 AND THE LARGEST UNEXPLAINED NUMBER IN THIS PORT IS NOT A KERNEL: A STEP'S WALL IS 1.9x ITS SUMMED KERNEL
+// TIME. Measured with host timers around the step body at 165 tokens: **230.6 ms a step**, of which 219.6
+// surfaces in the FIRST call of the next step - the `copy2d` that reads the previous step's `xBb` - 11.0 in
+// `trunkForward`'s encode and 0.0 anywhere else. `sync()` accounts for **zero**: the host never blocks there,
+// it blocks on the previous step's work at the top of the next one. Against that, the profile sums **121.6 ms**
+// of kernel time over 419 dispatches, and core commits every 128 dispatches, so the real run is ~3 command
+// buffers a step rather than one a dispatch.
+// So ~110 ms a step is either GPU idle between dispatches or host encode that does not overlap - and the two
+// can be told apart, but not with a host clock. What rules the simple encode story out: the SAME ~419
+// dispatches at 54 residues give a 52 ms step (3.13 s for 60), so encoding them cannot cost 110 ms; what rules
+// the simple idle story out is that 3 command buffers should not idle 45%. It wants a Metal System Trace or
+// counter sampling, which is not something a shell here can take.
+// 🔴 IT IS ALSO WHERE THE NEXT REAL WIN IS, AND IT IS BIGGER THAN ANYTHING LEFT IN THE KERNELS. Every item in
+// the roofline table above is 1-25% of 121.6 ms; this is 110 ms of 230.6. A round that closed half of it would
+// beat every kernel change this round made put together.
+//
 // So no kernel here is worth another tile sweep. The lever left is FEWER PASSES OVER THE PAIR TRACK - fusing an
 // elementwise pass into the epilogue of the GEMM that produced it, as the gate, the residual and the next
 // LayerNorm already are - and `gemmGatedAdd`'s own 878 MB is the measure of what one such pass costs. The
