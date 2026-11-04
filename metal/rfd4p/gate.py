@@ -36,9 +36,10 @@ lesson is a check that cannot vary the thing under test.
   * `refusals` 23/23 by name, and the control holds (a valid spec still folds 60 steps at CA-CA 3.80 A).
   * `smallmol` green, 14 comparisons - so chiral frames, the one sequence feature besides the noised
     state that moves between steps, are right.
-  * `inverse` returns its own target at **0.0005 A**, which is SELF-CONSISTENCY and not correctness -
-    see the unresolved item below. Two earlier conclusions about this arm were retracted on the way
-    (recorded below, because both are traps this gate will set again).
+  * `inverse` is green on the reference trajectory - its backbone rows are **BIT-EXACT** (relRMS
+    0.000e+00 on `x1 bb_ca` and `final xt bb_ca`) - and it returns the given backbone at 0.0005 A.
+    Two conclusions about this arm were retracted on the way (recorded below: both are traps this gate
+    will set again).
 🔴 TWO RETRACTED CONCLUSIONS, AND WHY A CHAIN CHECK CANNOT JUDGE THESE TWO MODES.
   * RETRACTED: `inverse` is not broken. Its 23.09 A chain reading is the TARGET'S OWN geometry: this
     preset's contig is `5-20,A16-35,10-25,A52-71,5-20`, so its 67 tokens are not sequential residues of
@@ -218,19 +219,24 @@ def inverse_arm():
     r = run([BIN, inp, f"--bundle={BUNDLE}", f"--gen={inp}-gen", f"--encoder={inp}-enc", f"--out={out}"])
     if r.returncode or not os.path.exists(out):
         return False, ((r.stderr or r.stdout).strip().splitlines() or ["(no output)"])[-1][:140]
-    tgt = read_tensor(inp, "in/caNm")
+    # 🔴 AGAINST `e/coorsNm`'S CA SLOT, NOT `in/caNm`. The first version of this check compared against
+    # `in/caNm` and read 0.0005 A - which was the port and the check sharing one mistake, the exact failure
+    # mode this tree warns about ("a writer and reader sharing a mistake agree perfectly"). `in/caNm` is the
+    # exporter's SAMPLE state; the clean backbone the reference designs against is `batch.coords_nm` at the
+    # atom37 CA slot, which `e/coorsNm` is written from unchanged. Pointed at the right tensor the same check
+    # reads 0.0005 A for the fixed port and 18.30 A for the old one.
+    coors = read_tensor(inp + "-enc", "e/coorsNm")
     ca = [[float(l[30:38]), float(l[38:46]), float(l[46:54])] for l in open(out)
           if l.startswith("ATOM") and l[12:16].strip() == "CA"]
-    n = min(len(ca), len(tgt) // 3)
-    rms = kabsch([[10 * tgt[i * 3 + k] for k in range(3)] for i in range(n)], ca[:n])
+    n = min(len(ca), len(coors) // (37 * 3))
+    rms = kabsch([[10 * coors[(i * 37 + 1) * 3 + k] for k in range(3)] for i in range(n)], ca[:n])
     # 🔴 THIS IS SELF-CONSISTENCY, NOT CORRECTNESS, AND IT MUST NOT BE READ AS THE SECOND. It compares the
     # port's output against `in/caNm` - the SAME tensor the port's partial/inverse branch takes as its clean
     # target - so a port that took the wrong tensor and returned it faithfully scores 0.0005 A here, which is
     # what this does score. The header says what is unresolved about that tensor. The arm is kept because a
     # REGRESSION in the return path still shows (it reads 17.52 A against a mode that generates instead of
     # returning, a 35,000x separation), and it is bounded loosely for the same reason.
-    return rms < 0.05, (f"returns ITS OWN target at {rms:.4f} A over {n} CAs (superposed) - "
-                        f"self-consistency only, see the header")
+    return rms < 0.05, f"returns the GIVEN backbone at {rms:.4f} A over {n} CAs (superposed)"
 
 
 def read_tensor(d, name):
@@ -260,7 +266,16 @@ ARMS["refusals"] = refusals_arm
 # 🔴 the inverse arm REPLACES its trajectory arm rather than joining it: that arm's bb rows compare
 # tensors with different semantics (the header says which), so leaving it in would be a red row that
 # means nothing, which this tree's own rule says is worse than no row at all.
-ARMS["inverse"] = inverse_arm
+def with_geometry(name, extra):
+    """The trajectory arm (the reference) AND the structural check, both reported."""
+    def arm():
+        ok1, note1 = trajectory_arm(name)
+        ok2, note2 = extra()
+        return ok1 and ok2, f"{note1}   |   {note2}"
+    return arm
+
+
+ARMS["inverse"] = with_geometry("inverse", inverse_arm)
 
 
 def partial_arm():
@@ -290,7 +305,7 @@ def partial_arm():
         f"generates a chain: CA-CA median {med:.2f} A (min {lo:.2f}, max {hi:.2f})"
 
 
-ARMS["partial"] = partial_arm
+ARMS["partial"] = with_geometry("partial", partial_arm)
 
 
 def main():

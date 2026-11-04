@@ -426,12 +426,24 @@ int generate(const std::string& genDir, const std::string& outPath, int designs,
     }
     noiseAt += (size_t)n * latent;
 
-    // the clean backbone is the input's own alpha carbons, emit-masked
-    const float* caNm = M.hostF("in/caNm");
+    // 🔴 THE CLEAN BACKBONE IS `e/coorsNm`'S CA SLOT, NOT `in/caNm`. This read `in/caNm` and called it "the
+    // input's own alpha carbons"; the exporter's own comment over that tensor says "`caNm` IS THE SAMPLE'S CA,
+    // NOT THE TRUNK'S OUTPUT", and the reference builds `x1.bb_ca` from `batch.coords_nm` at the atom37 CA slot
+    // (`(i * 37 + 1) * 3`, cpu/rfd4p/reference.js) - which is exactly what `e/coorsNm` is written from
+    // (export_input.mjs writes `"e/coorsNm": coords_nm` unchanged, same token layout). The two are different
+    // structures and not a reframing: `in/caNm`'s own consecutive-CA is median 22.99 A where the CA slot's is
+    // **3.80 A**, and against the reference's own `gen/s0Bb` they sit 20.30 A and 10.54 A. The wrong one still
+    // produced a plausible chain, which is why no geometry check caught it for either corrupted mode.
+    // `LOCALFOLD_RFD4P_X1_CANM=1` restores the old read, as the arm that measures this.
+    static const bool x1FromSample = getenv("LOCALFOLD_RFD4P_X1_CANM")
+                                     && atoi(getenv("LOCALFOLD_RFD4P_X1_CANM")) != 0;
+    const float* caNm = x1FromSample ? M.hostF("in/caNm") : nullptr;
+    const float* coorsNm = x1FromSample ? nullptr : M.hostF("e/coorsNm");
     std::vector<float> x1Bb((size_t)n * 3, 0.f);
     for (int i = 0; i < n; ++i)
       if (emitBb[i] != 0)
-        for (int k = 0; k < 3; ++k) x1Bb[(size_t)i * 3 + k] = caNm[i * 3 + k];
+        for (int k = 0; k < 3; ++k)
+          x1Bb[(size_t)i * 3 + k] = x1FromSample ? caNm[i * 3 + k] : coorsNm[((size_t)i * 37 + 1) * 3 + k];
 
     // and the corruption: (1 - t) x0 + t x1, the backbone's x0 offset per molecule first
     std::vector<float> x0Bb((size_t)n * 3), x0Ll((size_t)n * latent);
@@ -486,8 +498,23 @@ int generate(const std::string& genDir, const std::string& outPath, int designs,
     // 🔴 THE LOOP'S INPUT BEFORE ITS OUTPUT: the replayed noise against the draw the reference made, so that
     // "the port's noise is wrong", "the port's features are wrong" and "the port's trunk is wrong" are three
     // answers rather than one number.
-    GATE_CHECK("initial noise bb_ca", "gen/x0Bb", xBb, (size_t)n * 3, GATE_TRAJ_BOUND);
-    GATE_CHECK("initial noise latents", "gen/x0Ll", xLl, (size_t)n * latent, GATE_TRAJ_BOUND);
+    // 🔴 THESE FOUR ROWS CANNOT BE COMPARED ON A CORRUPTED RUN, AND SAYING SO BEATS FAILING. `gen/x0Bb`,
+    // `gen/x0Ll`, `gen/f0Seq` and `gen/f0Pair` are written by `export_input.mjs` from
+    // `sampleInitialNoise({...rng: seededRng(seed)})` - an UNCONDITIONAL start, on that block's own stated
+    // assumption that "nothing consumes the stream before `sample_noise`". A partial or inverse run starts
+    // from `corruptBatch`'s xt instead, and its encoder reparameterisation consumes n x latent normals before
+    // the backbone's, so both the tensor and the stream position differ by construction. The reference's own
+    // per-step rows below ARE comparable (they come from `generateRfd4pCpu` with the partial options) and are
+    // what holds this path: with the clean target read correctly they are 2.0e-3 and below on `partial`, and
+    // BIT-EXACT on `inverse`'s backbone. Fixing the four would mean writing the corrupted start into
+    // cuda/rfd4p's exporter, which belongs to someone else - so they are declined by name here.
+    if (!partial) {
+      GATE_CHECK("initial noise bb_ca", "gen/x0Bb", xBb, (size_t)n * 3, GATE_TRAJ_BOUND);
+      GATE_CHECK("initial noise latents", "gen/x0Ll", xLl, (size_t)n * latent, GATE_TRAJ_BOUND);
+    } else {
+      printf("  initial state + step 0 features   NOT COMPARED - the reference's are an unconditional "
+             "start (export_input.mjs); the per-step rows below are the arm\n");
+    }
   }
 
   // 🔴 THE HOISTED BUFFERS, NOT A SECOND SET A DESIGN. These were allocated again inside the loop after the
@@ -555,7 +582,10 @@ int generate(const std::string& genDir, const std::string& outPath, int designs,
     pd.dim = (uint)M.meta("meta/distDim", 30); pd.off = 0; pd.stride = (uint)pairDim;
     pd.dmin = (float)M.meta("meta/distMin", 0.1); pd.dmax = (float)M.meta("meta/distMax", 3);
     run1d("rfd4p_pair_dists", nn, pd);
-    if (GATE_CHECK && st == 0) {
+    // 🔴 AND NOT FOR A CORRUPTED MODE, BECAUSE THE REFERENCE BUILT THEM FOR A DIFFERENT START. See the note
+    // at the initial-state rows: `gen/f0Seq` and `gen/f0Pair` are built from `sampleInitialNoise`'s x0, so on
+    // a partial or inverse run they describe an unconditional first step this run never takes.
+    if (GATE_CHECK && st == 0 && !partial) {
       GATE_CHECK("step 0 seq features", "gen/f0Seq", seqF, (size_t)n * seqDim, GATE_TRAJ_BOUND);
       GATE_CHECK("step 0 pair features", "gen/f0Pair", pairF, nn * pairDim, GATE_TRAJ_BOUND);
     }
