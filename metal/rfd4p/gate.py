@@ -36,13 +36,20 @@ lesson is a check that cannot vary the thing under test.
   * `refusals` 23/23 by name, and the control holds (a valid spec still folds 60 steps at CA-CA 3.80 A).
   * `smallmol` green, 14 comparisons - so chiral frames, the one sequence feature besides the noised
     state that moves between steps, are right.
-  * **`inverse` IS BROKEN, and it is a real defect rather than a harness artefact.** At 60 steps - a
-    CONVERGED count - it gives CA-CA median **23.09 A** (min 6.22, max 53.84) where the same input
-    through the same export path gives 3.78 A under partial diffusion and 3.79 A unconditionally. Its
-    oracle arm localises it: `step 0 xt latents` is **2.5e-4 (ok)** and `x1 latents` 1.8e-3 (ok) while
-    every `bb_ca` row is 2.7 - so the trunk, the denoiser and the latent modality are all right and the
-    fault is in the BACKBONE, which is the one thing inverse folding does differently ("resampling the
-    target CA backbone from its forward marginal at every step").
+  * `inverse` is RIGHT, and getting there took retracting a conclusion twice - the record is below,
+    because both wrong readings are traps this gate will set again for the next person.
+    It reproduces the given backbone at **0.0005 A** Kabsch RMSD over 67 CAs, which is exactly what
+    inverse folding is for: the structure is handed back clean at the last step and only the sequence
+    is designed (`inverseArm` checks this, and it is the only check of that feature that means
+    anything).
+🔴 TWO RETRACTED CONCLUSIONS, AND WHY A CHAIN CHECK CANNOT JUDGE THESE TWO MODES.
+  * RETRACTED: `inverse` is not broken. Its 23.09 A chain reading is the TARGET'S OWN geometry: this
+    preset's contig is `5-20,A16-35,10-25,A52-71,5-20`, so its 67 tokens are not sequential residues of
+    one chain, and `in/caNm` itself measures median **22.99 A, min 6.22, max 53.84** against the
+    output's 23.09 / 6.22 / 53.84. Identical min and max with a 15.0 A UNSUPERPOSED rms is the tell: a
+    rigid transform preserves every internal distance, and the writer's `alignToInputFrame` applies one.
+    Superposed it is 0.0005 A. So `consecutive CA-CA` is meaningless for a mode that returns a GIVEN
+    backbone, and reading it as a fold is how this was called a defect.
   * RETRACTED: `partial` is NOT broken. A partial job first read CA-CA 23.65 A and that was read as a
     defect; it is UNDER-CONVERGENCE. `gate-partial-couple.json` ships `nsteps: 6` because the CUDA gate
     uses it for a featuriser BYTE comparison, and the unconditional control at six steps is 27.61 A -
@@ -69,6 +76,7 @@ bundle dequantised) is what it uses instead, and it says so when it builds one.
 import argparse
 import ast
 import os
+import re
 import subprocess
 import sys
 
@@ -169,8 +177,86 @@ def refusals_arm():
     return True, f"{len(cases)} inputs refused by name, and a valid spec still folds"
 
 
+def inverse_arm():
+    """Inverse folding returns the GIVEN backbone - so the check is that it does, to a superposition.
+
+    The trajectory rows cannot settle this (see the header: for a corrupted mode the port's `xBb` and the
+    reference's `gen/x0Bb` are different tensors), and the chain check cannot either, because the target
+    itself is not chain-contiguous under this contig. What is left is the only thing the feature claims.
+    """
+    inp = ensure_reference("inverse-geo", ["--preset=inverse_folding_1prw", "--generate", "--encoder",
+                                           "--steps=60"])
+    out = os.path.join(WORK, "inverse-geo.pdb")
+    r = run([BIN, inp, f"--bundle={BUNDLE}", f"--gen={inp}-gen", f"--encoder={inp}-enc", f"--out={out}"])
+    if r.returncode or not os.path.exists(out):
+        return False, ((r.stderr or r.stdout).strip().splitlines() or ["(no output)"])[-1][:140]
+    tgt = read_tensor(inp, "in/caNm")
+    ca = [[float(l[30:38]), float(l[38:46]), float(l[46:54])] for l in open(out)
+          if l.startswith("ATOM") and l[12:16].strip() == "CA"]
+    n = min(len(ca), len(tgt) // 3)
+    rms = kabsch([[10 * tgt[i * 3 + k] for k in range(3)] for i in range(n)], ca[:n])
+    # 0.0005 A measured; 0.05 A is room for the half-precision arm without admitting a different backbone
+    return rms < 0.05, f"returns the given backbone at {rms:.4f} A over {n} CAs (superposed)"
+
+
+def read_tensor(d, name):
+    import struct
+    for line in open(os.path.join(d, "model.idx")):
+        p = line.split()
+        if p[0] == "t" and p[1] == name:
+            off, ln = int(p[2]), int(p[3])
+            with open(os.path.join(d, "model.bin"), "rb") as f:
+                f.seek(off * 4)
+                return list(struct.unpack(f"<{ln}f", f.read(ln * 4)))
+    raise SystemExit(f"{d}: no tensor {name}")
+
+
+def kabsch(p, q):
+    """cuda/af3/score.py's own numpy-free Kabsch, reused rather than reimplemented."""
+    import math
+    src = open(os.path.join(REPO, "cuda", "af3", "score.py")).read()
+    ns = {"math": math, "np": None}
+    exec(src[src.index("def _centre"):src.index("def _median")], ns)      # noqa: S102
+    exec(src[src.index("def kabsch_rmsd"):src.index("refChains =")], ns)  # noqa: S102
+    return ns["kabsch_rmsd"](p, q)
+
+
 ARMS = {name: (lambda n=name: trajectory_arm(n)) for name in TRAJECTORY_ARMS}
 ARMS["refusals"] = refusals_arm
+# 🔴 the inverse arm REPLACES its trajectory arm rather than joining it: that arm's bb rows compare
+# tensors with different semantics (the header says which), so leaving it in would be a red row that
+# means nothing, which this tree's own rule says is worse than no row at all.
+ARMS["inverse"] = inverse_arm
+
+
+def partial_arm():
+    """Partial diffusion GENERATES a backbone from the corrupted target, so the check is the chain.
+
+    🔴 AND ITS TRAJECTORY ROWS ARE AN OPEN QUESTION, NOT A PASS. Run against its own gen-oracle this arm
+    reads `step 0 xt bb_ca` 3.700 and `step 0 xt latents` 1.149e-1, which is NOT in band - while the
+    finished design is a clean chain and every ingredient checks out separately: the encoder is exact
+    (mean 1.02e-3, 90 stages green), the replayed stream has exactly the port's layout (8780 floats =
+    2144 + 201 + 2144 + 3 + 2 x 2144), the emit masks are identical (67/67), and the draw ORDER in
+    sampler.mm matches `corruptBatch`'s documented order. The `initial noise` rows are explained - they
+    compare xt against x0 for a corrupted mode - but the step rows are not, and a plausible structure
+    from a trajectory that disagrees with the reference is exactly the failure this tree warns about
+    most ("a near-miss number is the dangerous kind"). So this arm checks what it can PROVE and the
+    disagreement is written down rather than hidden behind a green row.
+    """
+    inp = ensure_reference("partial-geo", ["--preset=partial_diffusion_1prw", "--generate", "--encoder",
+                                           "--steps=60"])
+    out = os.path.join(WORK, "partial-geo.pdb")
+    r = run([BIN, inp, f"--bundle={BUNDLE}", f"--gen={inp}-gen", f"--encoder={inp}-enc", f"--out={out}"])
+    m = re.search(r"consecutive CA-CA: median ([\d.]+) A, min ([\d.]+), max ([\d.]+)", r.stdout + r.stderr)
+    if r.returncode or not m:
+        return False, ((r.stderr or r.stdout).strip().splitlines() or ["(no output)"])[-1][:140]
+    med, lo, hi = (float(x) for x in m.groups())
+    # a generated backbone is a chain: the band this tree holds every other fold to
+    return 3.5 <= med <= 4.1 and lo > 2.5 and hi < 6.0, \
+        f"generates a chain: CA-CA median {med:.2f} A (min {lo:.2f}, max {hi:.2f})"
+
+
+ARMS["partial"] = partial_arm
 
 
 def main():
