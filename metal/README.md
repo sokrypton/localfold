@@ -496,6 +496,31 @@ for Metal as `weights.mm`, `chirality.mm`, `decoder.mm`, `encoder.mm`,
 | the trunk, decoder, encoder and trajectory | 86 / 84 / 86 / 90 / 100 comparisons |
 | half and float32 arithmetic | every arm runs both; `--f32` is the control |
 
+### The symbol-level audit, resolved rather than asserted
+
+Matching cuda/rfd4p's entry-point NAMES against metal/rfd4p's text leaves 28
+unmatched, and that is a measure of naming rather than of coverage - every one
+is a host helper or a small struct whose Metal counterpart is called something
+else. Resolved, one at a time:
+
+| cuda/rfd4p | metal/rfd4p |
+|---|---|
+| `loadInt8Bundle`, `readBlob` | `weights.mm` through metal/core's `loadBundle`, which reads the shards |
+| `aew`, `dwn` | the autoencoder's weight-name helpers; `decoder.mm` and `encoder.mm` build the names where they use them |
+| `biasAdd`, `biasRelu` | core's `Gemm.bias` and `Gemm.relu` epilogues |
+| `linearPlanes`, `gatePlanes`, `fromPlanes`, `mulSigmoidAddPlaneGate` | the channel-major triangle: the operand swap in `trunk.mm`, and now core's `gemmTriGate` |
+| `gateAddThenLn`, `hadamardThenLn`, `mulSigmoidAddGate` | core's `gemmGatedAdd` and `centerNorm` |
+| `pairBias` | the `to_bias` projection plus `rfd4p_bias_scale` |
+| `Corrupted`, `corruptBatch` | `drawStream` and `initialNoise` in `sampler.mm`, which draw the same two noise blocks in the same order (the comments name `corrupt_batch`) - and the partial-diffusion arm is what proves it, since a wrong corruption is a trajectory that does not match |
+| `CondPack`, `buildCondPack`, `buildCondPackT` | `precomputeCond` in `ops.mm` |
+| `adaLn`, `adaLnPacked` | `adalnPre`, `rfd4p_adaln_rows`, `rfd4p_adaln_bcast` |
+| `hadamardWrite` | `rfd4p_pair_write_h` |
+| `pairBiasAttention` | the attention - metal/core's flash kernel since this round |
+| `pairReprUpdate` | `pairUpdate` |
+| `swiGluTransition`, `swiGluTransitionT` | `transitionH` and `rfd4p_swiglu_h` |
+| `triangleT` | `triangle` |
+| `longForm` | **nothing, and nothing is needed** - see below |
+
 🔴 **AND THE ONE THING cuda/rfd4p's SOURCE HAS THAT THIS PORT DOES NOT IS
 `longForm`, which it does not need.** That is a second triangle shape taken
 above ~40,000 pairs because the short one degrades with length. This port has

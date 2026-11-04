@@ -73,6 +73,22 @@
 //   - WHAT IS LEFT IS THE CHECKPOINT'S OWN WIDTH: at K = 384 the kernel reaches ~11.7 TFLOP/s where K >= 768
 //     reaches ~12.2 (12.21 at 1536, 12.10 at 4096). That 4% is a property of a 384-channel pair track, not of
 //     this port, and P is not ours to change.
+// 🔴 AND ONE MORE PASS IS GONE, WORTH 0.9% AND HONESTLY LESS THAN HOPED. The attention's pair bias normed the
+// whole pair track into a buffer and projected that; RMSNorm is a per-row SCALE, so
+// `sum_c (z[r][c] / rms[r] * w[c]) W[h][c]` is `(1 / rms[r]) sum_c z[r][c] (w[c] W[h][c])` exactly - the
+// channel scale folds into the weight once at load (`weightTimesNorm`) and the row scale comes out of the
+// product after (`rfd4p_bias_scale`). That removes a read AND a write of `n*n x P` halves (20.9 MB each at
+// 165 tokens, 123 MB at 400) in exchange for one float a row, and removes the `tl.znh` buffer with them.
+// Measured ABAB at 165 tokens over three rounds: 13.04 / 13.45 / 13.82 s against 13.22 / 13.55 / 13.90, ahead
+// in all three but by only 0.08 to 0.18 - a mean 0.12 of 13.5, **0.9%**, against a roofline estimate of 1.8%,
+// so half of that write was already overlapped.
+// 🔴 AND AT 400 TOKENS IT CANNOT BE MEASURED ON THIS MACHINE, which is worth saying rather than rounding up.
+// Eight paired rounds of a 43 s job gave deltas +1.41, +2.05, +0.23, -0.56, -0.75, -0.85, -0.81, -2.01: a mean
+// of -0.34 s inside a spread of +/-2, because the laptop drifts **19%** over those sixteen runs (the control
+// alone goes 38.65 to 46.57 s). The ordering puts the fused arm second and so on the hotter machine, which
+// biases against it, and the mean still comes out negative - but a 1% effect under a 19% drift is not a
+// measurement. It is kept for the 165-token number, the exactness of the identity, and the buffer.
+//
 // So no kernel here is worth another tile sweep. The lever left is FEWER PASSES OVER THE PAIR TRACK - fusing an
 // elementwise pass into the epilogue of the GEMM that produced it, as the gate, the residual and the next
 // LayerNorm already are - and `gemmGatedAdd`'s own 878 MB is the measure of what one such pass costs. The

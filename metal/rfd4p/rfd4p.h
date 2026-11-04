@@ -55,6 +55,9 @@ void linH(const half* X, const std::string& w, half* Y, size_t rows, int in, int
           int ldy = 0);
 void linHF(const half* X, const std::string& w, float* Y, size_t rows, int in, int out, const float* bias = nullptr,
            bool relu = false);
+// a projection's weight with the RMSNorm before it folded in, so the normed activations never exist
+const half* weightTimesNorm(const std::string& key, const std::string& weight, const std::string& norm,
+                            int out, int in);
 // the four triangle projections packed for metal/core's fused gate (blocks of 8, quartered), built once
 const half* triGateWeight(const std::string& prefix, int T, int P);
 // that gate's per-pair-row mask, all ones: this triangle masks nothing

@@ -25,6 +25,27 @@ kernel void rfd4p_rms_norm(constant RfdRmsArgs& a [[buffer(0)]], uint3 tg [[thre
   }
 }
 
+// a simdgroup a row: the RMS reciprocal alone, for a norm whose channel scale is folded into the next weight
+kernel void rfd4p_rms_inv(constant RfdRmsInvArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
+                          uint3 ng [[threadgroups_per_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                          uint lane [[thread_index_in_simdgroup]]) {
+  const ulong row = (ulong)(tg.y * ng.x + tg.x) * 8 + sg;
+  if (row >= a.rows) return;
+  device const float* x = a.x ? a.x + row * a.C : nullptr;
+  device const half* xh = a.xh ? a.xh + row * a.C : nullptr;
+  float s = 0;
+  for (uint c = lane; c < a.C; c += 32) { const float v = x ? x[c] : (float)xh[c]; s += v * v; }
+  const float inv = rsqrt(simd_sum(s) / (float)a.C + a.eps);
+  if (lane == 0) a.inv[row] = inv;
+}
+
+// ...and that reciprocal applied down the [heads][rows] product's columns
+kernel void rfd4p_bias_scale(LF_ARGS(RfdBiasScaleArgs)) {
+  const ulong t = LF_INDEX;
+  if (t >= a.rows * (ulong)a.heads) return;
+  a.bias[t] = (half)((float)a.bias[t] * a.inv[t % a.rows]);
+}
+
 kernel void rfd4p_swiglu(LF_ARGS(RfdSwigluArgs)) {
   const ulong t = LF_INDEX;
   if (t >= a.rows * a.I) return;

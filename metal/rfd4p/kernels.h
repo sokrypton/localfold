@@ -31,6 +31,17 @@ struct RfdScaleAddArgs { DP(float) x; CP(float) y; CP(float) gamma; u64 rows; in
 // `outH`: the gated context in half as well, for the projection that reads it next
 struct RfdAttnArgs { CP(float) q; CP(float) k; CP(float) v; CP(float) bias; CP(float) g; DP(float) out;
                      uint n, heads, dimHead, ldv; u64 vOff; float scale; DP(half) outH; };
+// the pair bias's two halves, where the norm is folded into the projection's weight instead of materialised:
+// `inv[r] = rsqrt(mean(z[r]^2) + eps)` a row, and then that applied down the [H][rows] product's COLUMNS.
+//
+// 🔴 ONE PASS OVER THE PAIR TRACK INSTEAD OF THREE. RMSNorm is a per-row SCALE, so
+// `sum_c (z[r][c] / rms[r] * w[c]) W[h][c]` is `(1 / rms[r]) sum_c z[r][c] (w[c] W[h][c])` - the channel scale
+// folds into the weight once at load and the row scale comes out of the product afterwards. Materialising the
+// normed track cost a read and a write of `rows x P` halves (20.9 MB each at 165 tokens, 123 at 400) and the
+// GEMM then read it again; this reads z once for the reduction and once for the product, and what it writes in
+// between is one float a row.
+struct RfdRmsInvArgs { CP(float) x; CP(half) xh; DP(float) inv; u64 rows; uint C, pad; float eps; };
+struct RfdBiasScaleArgs { DP(half) bias; CP(float) inv; u64 rows; uint heads, pad; };
 // the pair write (`pair_write: hadamard`): z[i n + j][d] = pair[i n + j][d] + pij[j][d] * pij[i][P + d] - the
 // first half of linear_x's output indexed by the COLUMN, the second by the row (pair_update.py's pi / pj)
 // `z` may be `pair` itself: the write is elementwise at one index, so the pair track is updated in place and

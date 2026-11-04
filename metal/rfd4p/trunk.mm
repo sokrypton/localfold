@@ -129,11 +129,15 @@ void tokenLayer(int layer, float* s, Z z, const float* c, const half* cH, const 
   float* bias = HALF ? nullptr : scratch<float>("tl.bias", nn * H);
   half* biasH = HALF ? scratch<half>("tl.biasH", (size_t)H * nn) : nullptr;
   if (HALF) {
-    half* znh = scratch<half>("tl.znh", nn * P);
-    RfdRmsArgs r{};
-    r.x = z.f; r.xh = z.h; r.y = nullptr; r.yh = znh; r.w = M.f("w/" + MHA + "pair_norm.weight");
-    r.rows = nn; r.C = P; r.eps = 1e-5f;
-    run("rfd4p_rms_norm", grid1d((nn + 7) / 8, 1), 256, r);
+    // 🔴 THE NORM IS NEVER MATERIALISED: its channel scale is folded into this projection's weight once at
+    // load, and its row scale comes out of the product afterwards. RMSNorm is a per-row SCALE, so
+    // `sum_c (z[r][c] / rms[r] * w[c]) W[h][c]` is `(1 / rms[r]) sum_c z[r][c] (w[c] W[h][c])` exactly. What
+    // that saves is a read AND a write of the whole normed pair track - 20.9 MB each at 165 tokens and 123 MB
+    // at 400 - against one float a row; the GEMM below reads `z` itself.
+    float* inv = scratch<float>("tl.rmsInv", nn);
+    RfdRmsInvArgs ri{};
+    ri.x = z.f; ri.xh = z.h; ri.inv = inv; ri.rows = nn; ri.C = (uint)P; ri.eps = 1e-5f;
+    run("rfd4p_rms_inv", grid1d((nn + 7) / 8, 1), 256, ri);
     // 🔴 HEAD-MAJOR AND IN LOG2 UNITS STRAIGHT OUT OF THE PROJECTION, BY SWAPPING ITS OPERANDS. core's flash
     // attention reads the bias as [H][n][n] where this writes it pair-major with the head innermost, and the
     // obvious transpose kernel is a disaster: its read is `bias[(q n + k) H + h]`, a gather at a stride of
@@ -143,13 +147,17 @@ void tokenLayer(int layer, float* s, Z z, const float* c, const half* cH, const 
     // [H][P] and W is the normed pair track transposed, giving [H][n n] contiguous for nothing. `alpha` carries
     // the log2(e) the kernel's own `scale * log2(e)` expects of an added bias, so that is free too.
     Gemm gb2{};
-    gb2.X = M.h("w/" + MHA + "to_bias.weight"); gb2.tx = F16;
-    gb2.W = znh; gb2.tw = F16; gb2.transW = true;
+    gb2.X = weightTimesNorm(MHA + "to_bias", MHA + "to_bias.weight", MHA + "pair_norm.weight", H, P);
+    gb2.tx = F16;
+    gb2.W = z.h; gb2.tw = F16; gb2.transW = true;
     gb2.Y = biasH; gb2.ty = F16;
     gb2.rows = (size_t)H; gb2.in = P; gb2.out = nn;
-    gb2.alpha = (float)M_LOG2E; gb2.half = true;
-    gb2.label = "to_bias (head-major, log2)";
+    gb2.alpha = (float)M_LOG2E; gb2.half = true; gb2.accFloat = true;
+    gb2.label = "to_bias (head-major, log2, norm folded)";
     gemm(gb2);
+    RfdBiasScaleArgs bs{};
+    bs.bias = biasH; bs.inv = inv; bs.rows = nn; bs.heads = (uint)H;
+    run1d("rfd4p_bias_scale", (size_t)H * nn, bs);
   } else {
     float* zn = scratch<float>("tl.zn", nn * P);
     rmsNorm(z.f, zn, nn, P, M.f("w/" + MHA + "pair_norm.weight"));

@@ -188,6 +188,19 @@ const float* triGateOnes(size_t rows) {
   });
 }
 
+/** A projection's weight with the RMSNorm that precedes it folded in: `W'[o][c] = W[o][c] * w[c]`. */
+const half* weightTimesNorm(const std::string& key, const std::string& weight, const std::string& norm,
+                            int out, int in) {
+  return M.derived<half>("wxn:" + key, (size_t)out * in, [&](half* p) {
+    const float* w = M.hostF("w/" + weight);
+    const float* s = M.hostF("w/" + norm);
+    std::vector<half> h((size_t)out * in);
+    for (int o = 0; o < out; ++o)
+      for (int c = 0; c < in; ++c) h[(size_t)o * in + c] = (half)(w[(size_t)o * in + c] * s[c]);
+    upload(p, h.data(), h.size() * 2);
+  });
+}
+
 int condStride(int layers, int dim) { return layers * 4 * dim; }
 
 const float* precomputeCond(const float* c, size_t rows, int layers, int dim, int condDim) {
