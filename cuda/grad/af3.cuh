@@ -220,8 +220,7 @@ inline void gridBackwardBf(GridAttn& g, const Dialect& d, const GridSave& s, con
   real* dq = ARENA.get(nn * HD);
   real* dnb = ARENA.zeros(nn * g.H);
   sdpaBackwardBf(gridSdpa(g, n, g.transpose ? maskT : mask, s.nb, dnb), q, P, k, P, v, P, dO, HD, dq, HD,
-                 dqkvg + HD, P, dqkvg + 2 * HD, P, nullptr, HD, s.lse, Di);
-  narrowRowsK<<<blocks(nn * HD), 256, 0, STREAM>>>(dq, dqkvg, HD, P, nn);
+                 dqkvg + HD, P, dqkvg + 2 * HD, P, nullptr, HD, s.lse, Di, dqkvg, P);
   const Linear* roles[4] = {&g.q, &g.k, &g.v, &g.gate};
   for (int r = 0; r < 4; ++r)
     if (roles[r]->hasBias) colSumBf(roles[r]->b.g, dqkvg + r * HD, nn, HD, P);

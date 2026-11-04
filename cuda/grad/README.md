@@ -157,10 +157,10 @@ One block trained at the training crops, A100, random weights; the PyTorch bars 
 
 | block | float32 | TF32 | **bf16** (`--bf16`) | PyTorch eager, bf16 autocast | PyTorch `torch.compile`, pure bf16 |
 |---|---:|---:|---:|---:|---:|
-| AF2, L 256, S 128 | 38.1 | 17.6 | **7.50** | 32.6 (4.3x) | 12.7 (1.69x) |
-| AF2, L 384, S 128 | | | **15.32** | | 26.3 (1.72x) |
-| AF3 pairformer, n 384 | 46.3 | 26.1 | **11.1** | 48.0 (4.3x) | 19.6 (1.77x) |
-| AF3 pairformer, n 768 | | | **52.2** | | 128.9 (2.47x) |
+| AF2, L 256, S 128 | 38.1 | 17.6 | **7.46** | 32.6 (4.4x) | 12.7 (1.70x) |
+| AF2, L 384, S 128 | | | **15.17** | | 26.3 (1.73x) |
+| AF3 pairformer, n 384 | 46.3 | 26.1 | **10.9** | 48.0 (4.4x) | 19.6 (1.80x) |
+| AF3 pairformer, n 768 | | | **51.6** | | 128.9 (2.50x) |
 
 (AF3's float32 and TF32 columns are from before the bf16 work; eager PyTorch is 59.6 / 35.7 there on AF2 and
 81.2 / 51.3 on AF3.) A stack's AF2 backward keeps its running gradients bf16 from block to block, so the bf16 column
@@ -223,7 +223,12 @@ whole blocks to float32 by relative rms at PyTorch autocast's own error on the s
   back out of shared memory; the bias tile read by ldmatrix.trans, dS stored transposed with 32-bit stores into its
   own swizzled tile (read back for dQ by ldmatrix.trans), the clip as two per-key bounds, a query's four terms one
   128-bit load: the attention backward 0.83 -> 0.58 ms at the triangle shape, 17.6 -> 11.6 at AF3's n 768;
-  8.22 -> 7.50 ms.
+  8.22 -> 7.50 ms;
+- dQ narrowed into the projections' bf16 copy by the last of a (b, h)'s key blocks to finish, while it is in L2 (a
+  separate pass re-read the whole float dQ): 7.50 -> 7.46 ms, AF3 n 768 52.2 -> 51.6. (Counted per query tile, the
+  fences after every tile's atomics cost more than the pass: 7.57.) The bias atomics past Q or K are predicated off,
+  not pointed at one address: redirected, they serialised there whenever a length is not a multiple of 64 - the
+  triangle shape at L 300 took 12.3 ms for 1.0 (`bench-flash`'s tri300; found porting this kernel to bindcraft2).
 
 **Measured and not taken**: a CUDA graph of the whole backward (2.4%: 11.40 against 11.68 ms on AF2, bindcraft2's
 3%); a 32-row query tile for the attention backward (slower capped at 4 CTAs an SM and uncapped); unrolling its two
@@ -234,7 +239,9 @@ multiplication's gate backward over 64-row tiles or several 32-row tiles a block
 reassociation (it pays where the alignment is shallower than O = 32); the attention backward's bias gradient summed
 over two batch rows a CTA before its atomics (at a fixed register budget a CTA's keys and batch rows trade one for one
 between dQ's atomics and the bias's, and two rows' Q and dO tiles do not fit three CTAs' shared memory), and its
-Q and dO B fragments by ldmatrix.x4 (no change). `bench-flash --bf16-in` measured nothing of the bias atomics until
+Q and dO B fragments by ldmatrix.x4 (no change); the triangle-end and column attentions' transpose back folded into
+their LayerNorm backward, each row written to its transposed place (7.46 -> 7.57: the scattered rows lose the tiled
+transpose's locality); the pair-bias LayerNorm backward's register cap and grid (no change). `bench-flash --bf16-in` measured nothing of the bias atomics until
 its packed q, k, v were random: zero v made every dS 0. `Sdpa::deterministic` sums the attention's bias gradients in fixed point (bitwise
 reproducible; 5% of AF3's backward); AF2 training dropout is `Block::dropout`, its masks regenerated, never stored.
 

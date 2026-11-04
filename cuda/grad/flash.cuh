@@ -871,6 +871,10 @@ inline size_t fwdBfSmem() { return 2 * (4 * BC * ldBf<D>() + 2 * BR * LB) + 4 * 
 // (A = P^T, dS^T from the accumulators; B = dO, Q by ldmatrix.trans), dQ = dS K (A = dS, B = K by ldmatrix.trans).
 // dS takes the bias tile's place in shared memory, element by element (the thread that reads a bias writes its dS),
 // as bf16 - what a bf16 run's logits gradient is - for dQ and the bias gradients.
+__global__ void narrowDqK(const float* x, int ldx, __nv_bfloat16* y, int ldy, int C, size_t rows) {
+  const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < rows * C) y[i / C * ldy + i % C] = __float2bfloat16(x[i / C * ldx + i % C]);
+}
 constexpr double FIXED = 1099511627776.0;   // 2^40: |a gradient| to 8e6, resolved to 1e-12
 __global__ void fromFixedK(float* g, const unsigned long long* f, size_t n) {
   const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -883,7 +887,8 @@ __global__ void __launch_bounds__(THREADS, 3) bwdBf(Sdpa a, BiasTile bt, HSrc qs
                                                     const float* __restrict__ lse, const float* __restrict__ Di,
                                                     float* __restrict__ dq, int lddq, DKV* __restrict__ dk, int lddk,
                                                     DKV* __restrict__ dv, int lddv, bool accK, bool accV,
-                                                    unsigned long long* fx0, unsigned long long* fx1) {
+                                                    unsigned long long* fx0, unsigned long long* fx1,
+                                                    uint16_t* __restrict__ dqo, int ldqo, unsigned* __restrict__ cnt) {
   const int* const seqQ = GEN ? a.seqQ : nullptr;
   const int* const seqK = GEN ? a.seqK : nullptr;
   if constexpr (!GEN) { fx0 = nullptr; fx1 = nullptr; }
@@ -1027,8 +1032,8 @@ __global__ void __launch_bounds__(THREADS, 3) bwdBf(Sdpa a, BiasTile bt, HSrc qs
         }
       }
       // the bias gradients straight from the registers, together (a warp's atomic covers four rows' 32-byte
-      // sectors whole). Unconditional: a masked or padded element's dS is exactly 0, and one past Q or K is pointed
-      // at the slab's first element, where adding +0 changes nothing (a branch an element was a fifth of the issue)
+      // sectors whole). Unconditional in a full tile: a masked element's dS is exactly 0 (a branch an element was a
+      // fifth of the issue)
       if (g0 || g1) {
         // (offsets in 32 bits from the slab's (query 0, key k0): within one (b, h) slab, Q sq < 2^31)
         const int qb = q0 + hq * 32 + 2 * t;
@@ -1040,8 +1045,10 @@ __global__ void __launch_bounds__(THREADS, 3) bwdBf(Sdpa a, BiasTile bt, HSrc qs
 #pragma unroll
             for (int e = 0; e < 4; ++e) {
               const int qo = jj * 8 + (e & 1), ko = (e >> 1) * 8;
-              int o = base + qo * sq + ko;
-              if (!full && !(qb + qo < a.Q && k0 + kl0 + g + ko < a.K)) o = 0;
+              const int o = base + qo * sq + ko;
+              // (predicated, not redirected: pointing every out-of-range element at one address serialised a
+              // partial key block's atomics on it - 7x the kernel at a length 522, 10 keys past a multiple of 64)
+              if (!full && !(qb + qo < a.Q && k0 + kl0 + g + ko < a.K)) continue;
               if constexpr (sizeof(*gp) == 8)
                 atomicAdd(gp + o, (unsigned long long)__double2ll_rn((double)dpt[jj][e] * FIXED));
               else
@@ -1108,6 +1115,23 @@ __global__ void __launch_bounds__(THREADS, 3) bwdBf(Sdpa a, BiasTile bt, HSrc qs
     }
     __syncthreads();   // this stage is the one the next iteration's issue overwrites
   }
+  // dqo: the last of a (b, h)'s key blocks to finish narrows its dQ into the bf16 copy the projections read, while
+  // it is in L2 (a separate pass re-read the whole float dQ; counted per tile instead, the fences cost more)
+  if (dqo) {
+    __shared__ int last;
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) last = atomicAdd(cnt + bh, 1u) == (unsigned)(nkb - 1);
+    __syncthreads();
+    if (last) {
+      __threadfence();
+      for (int i = threadIdx.x; i < a.Q * (D / 4); i += THREADS) {
+        const int qq = i / (D / 4), c = (i % (D / 4)) * 4;
+        const float4 v = __ldcg(reinterpret_cast<const float4*>(dqb + (long long)qq * lddq + c));
+        *reinterpret_cast<uint2*>(dqo + ((size_t)b * a.Q + qq) * ldqo + h * D + c) = make_uint2(bf2(v.x, v.y), bf2(v.z, v.w));
+      }
+    }
+  }
   DKV* dkb = dk + (size_t)b * a.K * lddk + h * D;
   DKV* dvb = dv + (size_t)b * a.K * lddv + h * D;
 #pragma unroll
@@ -1158,7 +1182,7 @@ inline void forwardBf(const Sdpa& a, const X* q, int ldq, const X* k, int ldk, c
 template <int D, class X, class DKV = float, class DOT = float>
 inline void backwardBf(const Sdpa& a, const X* q, int ldq, const X* k, int ldk, const X* v, int ldv,
                        const DOT* dO, int lddo, const float* lse, const float* Di, float* dq, int lddq, DKV* dk,
-                       int lddk, DKV* dv, int lddv, bool accK, bool accV) {
+                       int lddk, DKV* dv, int lddv, bool accK, bool accV, __nv_bfloat16* dqo = nullptr, int ldqo = 0) {
   Scratch scratch;
   const int Npq = (a.Q + 63) / 64 * 64, Npk = (a.K + 63) / 64 * 64;
   const HSrc qs_ = hsrc<D>(q, ldq, a.B, a.Q, a.H), ks_ = hsrc<D>(k, ldk, a.B, a.K, a.H), vs_ = hsrc<D>(v, ldv, a.B, a.K, a.H),
@@ -1188,8 +1212,19 @@ inline void backwardBf(const Sdpa& a, const X* q, int ldq, const X* k, int ldk, 
   }
   const size_t grid = (size_t)((a.K + BC - 1) / BC) * a.H * a.B;
   const bool gen = a.seqQ || a.seqK || fx[0] || fx[1];
+  // dqo: dQ narrowed into bf16 in the kernel, a tile at a time by the last of its key blocks (counted); where the
+  // vector accesses do not align, by a pass after
+  const bool inK = dqo && lddq % 4 == 0 && ldqo % 4 == 0 && ((uintptr_t)dq & 15) == 0 && ((uintptr_t)dqo & 7) == 0;
+  unsigned* cnt = nullptr;
+  if (inK) {
+    const size_t nc = (size_t)a.B * a.H;
+    cnt = reinterpret_cast<unsigned*>(ARENA.get(nc));
+    GK(cudaMemsetAsync(cnt, 0, nc * 4, STREAM));
+  }
   (gen ? bwdBf<D, DKV, QT, true> : bwdBf<D, DKV, QT, false>)<<<(unsigned)grid, THREADS, smem, STREAM>>>(a, bt, qs_, ks_,
-      vs_, os_, lse, Di, dq, lddq, dk, lddk, dv, lddv, accK, accV, fx[0], fx[1]);
+      vs_, os_, lse, Di, dq, lddq, dk, lddk, dv, lddv, accK, accV, fx[0], fx[1],
+      inK ? reinterpret_cast<uint16_t*>(dqo) : nullptr, ldqo, cnt);
+  if (dqo && !inK) narrowDqK<<<blocks((size_t)a.B * a.Q * a.H * D), 256, 0, STREAM>>>(dq, lddq, dqo, ldqo, a.H * D, (size_t)a.B * a.Q);
   for (int j = 0; j < 2; ++j)
     if (fx[j]) fromFixedK<<<blocks(ext[j]), 256, 0, STREAM>>>(a.bias[j].grad, fx[j], ext[j]);
 }
@@ -1261,8 +1296,8 @@ template <class DKV, class DOT>
 inline bool runBackwardBfIn(const Sdpa& a, const __nv_bfloat16* q, int ldq, const __nv_bfloat16* k, int ldk,
                             const __nv_bfloat16* v, int ldv, const DOT* dO, int lddo, const float* lse,
                             const float* Di, float* dq, int lddq, DKV* dk, int lddk, DKV* dv, int lddv, bool accK,
-                            bool accV) {
-  FLASH_DISPATCH(a.D, (backwardBf<DD>(a, q, ldq, k, ldk, v, ldv, dO, lddo, lse, Di, dq, lddq, dk, lddk, dv, lddv, accK, accV)))
+                            bool accV, __nv_bfloat16* dqo = nullptr, int ldqo = 0) {
+  FLASH_DISPATCH(a.D, (backwardBf<DD>(a, q, ldq, k, ldk, v, ldv, dO, lddo, lse, Di, dq, lddq, dk, lddk, dv, lddv, accK, accV, dqo, ldqo)))
 }
 #undef FLASH_DISPATCH
 
