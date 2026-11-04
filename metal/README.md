@@ -508,7 +508,9 @@ for Metal as `weights.mm`, `chirality.mm`, `decoder.mm`, `encoder.mm`,
 | the **refolding oracle**, af3 and af2 | `--refold=af3` / `=af2` on `gate-oracle-motif-60` |
 | internal-coordinate conditioning | `yaml_5o45_binder` - its own tag, and the only case whose motif reference is a per-group fit |
 | a contig with no input structure at all | `custom_cath_monomer` - no anchors, so no alignment and no centring offset |
-| the trunk, decoder, encoder and trajectory | 86 / 84 / 86 / 90 / 100 comparisons |
+| the trunk, decoder, encoder and trajectory | 86 / 84 / 86 / 90 / 100 comparisons at 54 and 67 tokens |
+| ...and the same at **183 tokens** (33,489 pairs, 11.5x) | 86 stages, 100 with the trajectory, 86 under `--f32` |
+| length, where no oracle reaches (400 tokens) | deterministic over 3 runs, converged CA-CA 3.85 A over [3.76, 3.94] |
 | half and float32 arithmetic | every arm runs both; `--f32` is the control |
 
 ### What the mapping proves, and what the arms do

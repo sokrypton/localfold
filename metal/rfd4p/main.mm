@@ -190,6 +190,13 @@
 // inverse folding. Measured, consecutive CA-CA within a chain at 60 steps: unconditional 3.81 A over
 // [3.69, 3.92], motif 3.80, interface 3.80, small molecule 3.83, partial 3.74 - and inverse folding returns the
 // input's own backbone to 0.0005 A, the nm-to-angstrom rounding.
+// 🔴 AND THE ARITHMETIC IS HELD TO THE REFERENCE AT LENGTH NOW, NOT ONLY AT 54 AND 67 TOKENS. An oracle was
+// built at **183 tokens** - 33,489 pairs, **11.5x** the 54-token case's 2,916 - which took the CPU reference
+// 39 minutes in one Node process (the triangle is n^3, so it is 40x that case's work) and 841 MB of stages.
+// Every arm passes there: **86 stage comparisons**, 100 with the sampler's per-step trajectory beside them,
+// and 86 again under `--f32`, with step 0's sequence features at 1.9e-9 and its pair features at exactly 0.
+// So the fused gate, the flash attention and the folded pair-bias norm are all held to the reference at a
+// length where each of them is doing an order of magnitude more work than when they were written.
 // 🔴 AND AT 400 TOKENS TOO, which is 160,000 pairs and 5.9x the largest case any oracle here covers: the
 // converged backbone is **3.85 A over [3.76, 3.94]**, the same band as 54 residues, and three runs are
 // byte-identical. That is the length check that matters for the fused kernels - a tile edge case at 160,000
