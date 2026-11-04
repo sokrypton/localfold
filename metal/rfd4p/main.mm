@@ -44,7 +44,7 @@
 // step at 165 tokens:
 //
 //   kernel                  ms    GFLOP     MB   floor   of roofline
-//   tri-project          25.32    299.7      0   24.53      97%
+//   tri-project          25.32    299.7      0   24.53      97%   (now fused with the gate; see below)
 //   gated add            17.00    112.4    878   15.90      94%
 //   pair-transition-out  10.78    112.4    439   12.55     116%
 //   tri_ab_hm             8.83      0.0   1171    8.94     101%
@@ -78,27 +78,33 @@
 // LayerNorm already are - and `gemmGatedAdd`'s own 878 MB is the measure of what one such pass costs. The
 // attention no longer reaches the profile's top twenty-four.
 //
-// 🔴 AND THE ONE WORTH TAKING IS THE TRIANGLE'S GATE INTO ITS PROJECTION, PRICED AT 7.6% BY MEASUREMENT AND
-// NOT LEFT AS AN ESTIMATE. The projection writes four pair-sized planes (55.8 MB at 165 tokens), `tri_ab_hm`
-// reads all four and writes two (83.7 MB), and a fused epilogue would write the two gated planes and nothing
-// else. Measured by skipping the gate's dispatch - wrong output, purely a price - over three interleaved
-// rounds: **13.06, 13.29, 13.59 s against 14.29, 14.28, 14.62**, a mean 1.08 s of 14.4 = 7.6%, which is the
-// 8.83 ms of 115 the profile gives it.
-// metal/core already HAS the epilogue: `gemmTriGate` does a triangle's projection and gate in one dispatch and
-// writes `outA`/`outB` channel-major. Two things stop this port using it, one small and one not:
-//   * ITS HOST WRAPPER TIES THE INPUT WIDTH TO THE CHANNEL COUNT - `g.m = 4 * C; g.k = C; g.ldb = C` from one
-//     `C`, where this triangle is 384 in and 256 out. `k`, `m` and `tgC` are SEPARATE GemmArgs fields, so an
-//     overload taking `in` would set them independently and leave af3's and bioemu2's calls untouched; and
-//     `lf_tri_quarters` already separates them (its `rows` IS the input width, its `C` the channels), so the
-//     matrix units' weight rearrangement generalises for nothing.
-//   * ITS SOURCE WEIGHT IS AF3'S BLOCKS-OF-8 PACKING, which this port does not build. Reading
-//     `lf_tri_quarters` backwards, the source is `[in][C/8][4][8]` - for each group of 8 channels, the four
-//     roles' 8 columns each - where `weightStack` here builds `[4T][P]`. That is a derived weight, built once
-//     at load like the others, so it is work rather than a wall.
-// NOT TAKEN HERE, and the reason is the blast radius rather than the size: that epilogue is woven through
-// gemm.metal and gemm_tensor.metal and is what af3's and bioemu2's triangles run, and af3's own gate cannot be
-// run on this machine at all because it needs DeepMind's terms. A 7.6% win on this port is not worth an
-// unverifiable change to the kernel two other ports depend on. The recipe above is the whole of what it takes.
+// 🔴 AND THE ONE WORTH TAKING WAS THE TRIANGLE'S GATE INTO ITS PROJECTION, WHICH IS TAKEN: **5.2%**. The
+// two-step form wrote four pair-sized planes and read all four back to write two - 139.5 MB a call at 165
+// tokens against the 27.9 MB the fused form writes - and metal/core already had the epilogue, because
+// `gemmTriGate` is what af3's and bioemu2's triangles run. One thing had kept this port out of it: the host
+// wrapper set the contraction's depth from the channel count (`g.m = 4 * C; g.k = C; g.ldb = C` out of one
+// `C`), and this triangle is 384 in and 256 out. `k`, `m` and `tgC` are separate GemmArgs fields and the
+// epilogue reads only `tgC` and `m / 4`, so the depth was free all along: `gemmTriGate` takes an `in` now, 0
+// meaning C, which is every AF3-lineage call and leaves them expression-for-expression as they were.
+// The weight is the other half. The epilogue wants columns in blocks of 8 - eight channels' pa, then their ga,
+// pb and gb - so a simdgroup's four accumulators hold one channel's four values at the same lane and gate them
+// with no shuffle; read backwards out of `lf_tri_quarters` that is `[in][C / 8][4][8]`, where this port's
+// `weightStack` builds `[4T][P]`. `triGateWeight` builds it once and quarters it once rather than per dispatch.
+// Measured, ABAB over three rounds at 165 tokens and 60 steps: **13.06 / 13.51 / 13.92 s against 13.94 / 14.20
+// / 14.55**, fused ahead in all three by 0.63 to 0.88 s, mean 0.73 of 14.2. The ceiling was 7.6% (the gate's
+// dispatch skipped entirely) and the fused GEMM costs some of it back: 2.02 ms a call against the plain
+// projection's 1.81, against the 0.63 ms the gate pass took. `rfd4p_tri_ab_hm` is gone from the profile and
+// the design is the same structure, 1315 of 1315 atoms matched at 0.0095 A rms.
+// 🔴 AND THE TWO PORTS THAT SHARE THAT EPILOGUE ARE UNMOVED, which is the thing that had to be shown rather
+// than argued. With `in` 0 every expression reduces to what it was, and metal/af3's gate folds its nineteen
+// cases to the same pLDDT and pTM with the change and without it (86.18 / 0.7595, 96.59 / 0.8211, ... to the
+// second decimal). 🔴 ITS RMSD COLUMN IS EMPTY ON THIS BOX AND THAT IS NOT THIS CHANGE: the same cases read
+// the same way with core reverted, so what that gate reports is a missing crystal rather than a moved fold.
+// metal/bioemu2 was NOT run - its reference is a webgpu dump this machine has no lane for - and it takes the
+// same unchanged path.
+// `LOCALFOLD_RFD4P_TRI_FUSED=0` is the two-step control, kept because it is what the `--f32` arm and a
+// checkpoint with `tri_mult_bias` run: the epilogue's operands are half, and its bias wants a [4T] f32 in the
+// blocks-of-8 order that no released checkpoint has.
 //
 // WHAT RUNS: unconditional, motif scaffolding, protein-protein interfaces, small molecules (whose chirality is
 // re-aligned every step), coordinate groups (whose labels are permuted every step), partial diffusion and

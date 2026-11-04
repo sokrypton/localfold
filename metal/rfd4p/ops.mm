@@ -146,6 +146,48 @@ const half* weightStack(const std::string& key, const std::vector<std::string>& 
   });
 }
 
+/**
+ * The four triangle projections' weights as metal/core's fused gate wants them, built once.
+ *
+ * 🔴 ITS COLUMN ORDER IS THE EPILOGUE'S, READ BACKWARDS OUT OF `lf_tri_quarters`. That kernel maps an output
+ * column to source column `(ch / 8) * 32 + role * 8 + ch % 8`, so the source is `[in][C / 8][4][8]` - for each
+ * group of eight channels, the four roles' eight columns each, in the order pa, ga, pb, gb. The epilogue's
+ * comment says the same thing from the other end ("columns in blocks of 8 - 8 channels' pa, then their ga, pb
+ * and gb"), which is what lets a simdgroup's four accumulators hold one channel's four values at the same lane
+ * and gate them with no shuffle. This port's own `weightStack` builds `[4T][P]` instead, which is why it could
+ * not feed that kernel.
+ *
+ * Quartered here as well, once, rather than rearranged on every call: `gemmTriGate` does it per dispatch when
+ * handed a blocks-of-8 weight, and there are fourteen dispatches a step.
+ */
+const half* triGateWeight(const std::string& prefix, int T, int P) {
+  const std::vector<std::string> roles = {prefix + ".linear_a_p.weight", prefix + ".linear_a_g.weight",
+                                          prefix + ".linear_b_p.weight", prefix + ".linear_b_g.weight"};
+  const size_t total = (size_t)P * 4 * T;
+  return M.derived<half>("triQ:" + prefix, total, [&](half* out) {
+    std::vector<half> packed(total);
+    const float* w[4];
+    for (int r = 0; r < 4; ++r) w[r] = M.hostF("w/" + roles[r]);
+    for (int c = 0; c < T; ++c) {
+      for (int r = 0; r < 4; ++r) {
+        const size_t nc = (size_t)(c / 8) * 32 + (size_t)r * 8 + (size_t)(c % 8);
+        for (int p = 0; p < P; ++p) packed[(size_t)p * 4 * T + nc] = (half)w[r][(size_t)c * P + p];
+      }
+    }
+    half* src = scratch<half>("tri.packSrc", total);
+    upload(src, packed.data(), total * 2);
+    triQuarters(src, out, nullptr, nullptr, T, P);
+  });
+}
+
+/** A pair row's mask for that gate, which this triangle does not have: every row counts. */
+const float* triGateOnes(size_t rows) {
+  return M.derived<float>("triOnes:" + std::to_string(rows), rows, [&](float* p) {
+    const std::vector<float> ones(rows, 1.f);
+    upload(p, ones.data(), rows * 4);
+  });
+}
+
 int condStride(int layers, int dim) { return layers * 4 * dim; }
 
 const float* precomputeCond(const float* c, size_t rows, int layers, int dim, int condDim) {

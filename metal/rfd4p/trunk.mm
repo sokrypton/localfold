@@ -292,6 +292,22 @@ static bool triangle(const std::string& prefix, Z z, bool outgoing, const half* 
     // four [T][P] matrices stacked into one [4T][P] (derived once) make a product four times the size and a
     // quarter of the dispatches. At 54 tokens each of them alone was 2916 x 256 x 384 - small enough that the
     // launch was a third of the step - and the port issued 1184 dispatches a step before this.
+    half* aT = scratch<half>("tri.aTH", nn * T);
+    half* bT = scratch<half>("tri.bTH", nn * T);
+    // 🔴 THE PROJECTION AND THE GATE IN ONE DISPATCH, which is the one fewer-passes win this stage had left.
+    // The two-step form writes four pair-sized planes and reads all four back to write two: 139.5 MB a call at
+    // 165 tokens against the 27.9 MB the fused form writes, and the gate alone was 8.83 ms of a 115 ms step -
+    // 7.6% of a whole design, measured by skipping its dispatch. metal/core's `gemmTriGate` is that epilogue
+    // (it is what af3's and bioemu2's triangles run) and the only thing that had kept this port out of it was a
+    // host wrapper setting the contraction's depth from the channel count; it takes an input width now, so
+    // 384 in and 256 out goes through. `LOCALFOLD_RFD4P_TRI_FUSED=0` is the two-step control.
+    static const bool fused = !getenv("LOCALFOLD_RFD4P_TRI_FUSED") ||
+                              atoi(getenv("LOCALFOLD_RFD4P_TRI_FUSED")) != 0;
+    // ...and not for the bias, whose [4T] f32 order the epilogue takes but no checkpoint has, nor for `--f32`,
+    // whose whole point is that the arithmetic is float where this epilogue's operands are half.
+    if (fused && HALF && !anyBias) {
+      gemmTriGate(zn, triGateWeight(prefix, T, P), triGateOnes(nn), aT, bT, 0, nn, T, nn, n, n, nullptr, true, P);
+    } else {
     half* ab4 = scratch<half>("tri.ab4H", nn * 4 * T);
     {
       Gemm g{};
@@ -310,13 +326,12 @@ static bool triangle(const std::string& prefix, Z z, bool outgoing, const half* 
     half* bP = ab4 + 2 * nn * T;
     half* bG = ab4 + 3 * nn * T;
 
-    half* aT = scratch<half>("tri.aTH", nn * T);
-    half* bT = scratch<half>("tri.bTH", nn * T);
     RfdTriAbHArgs ab{};
     ab.aP = aP; ab.aG = aG; ab.bP = bP; ab.bG = bG; ab.aT = aT; ab.bT = bT; ab.rows = nn; ab.T = (uint)T;
     ab.baP = baP; ab.baG = baG; ab.bbP = bbP; ab.bbG = bbG;
     // channel-major in and out: a thread's read and its write are the same index, so both coalesce
     run1d(anyBias ? "rfd4p_tri_ab_hmb" : "rfd4p_tri_ab_hm", nn * T, ab);
+    }
 
     half* x = scratch<half>("tri.xH", nn * T);
     Gemm g{};

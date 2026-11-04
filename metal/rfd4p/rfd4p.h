@@ -55,6 +55,10 @@ void linH(const half* X, const std::string& w, half* Y, size_t rows, int in, int
           int ldy = 0);
 void linHF(const half* X, const std::string& w, float* Y, size_t rows, int in, int out, const float* bias = nullptr,
            bool relu = false);
+// the four triangle projections packed for metal/core's fused gate (blocks of 8, quartered), built once
+const half* triGateWeight(const std::string& prefix, int T, int P);
+// that gate's per-pair-row mask, all ones: this triangle masks nothing
+const float* triGateOnes(size_t rows);
 // a half weight [out][in] transposed to [in][out], built once and kept: what metal/core's fused gated add takes
 const half* weightT(const std::string& name);
 // several half weights of one shape stacked into [k * out][in], built once and kept: four projections that

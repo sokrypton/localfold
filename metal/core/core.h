@@ -190,13 +190,15 @@ bool gemmCouplingCombine(const half* Xq, const half* Wq, half* gated, size_t row
                          const float* P, const float* QB, bool pairs2 = false);
 bool gemmTensorOps();      // (whether the GEMMs run on the matrix units - Metal 4's tensor operations)
 bool gemmExtendedEpilogues();   // (whether the fused epilogues below run here: the matrix units, or lf_gemm on Apple9+)
+// `in` is the input width where it is not C (RFD4-Proteina's triangle is 384 in and 256 out); 0 means C, which
+// is every AF3-lineage triangle and leaves those calls exactly as they were.
 void gemmTriGate(const half* X, const half* W, const float* mask, half* a, half* b, size_t r0, size_t rows, int C,
-                 size_t pairs, int n, int np, const float* bias = nullptr, bool quartered = false);
+                 size_t pairs, int n, int np, const float* bias = nullptr, bool quartered = false, int in = 0);
 // the matrix units' layout of that weight (and bias): each 128 columns 32 channels' pa, then ga, pb, gb - where
 // triQuartersApply(C), a port builds its weight so once (triQuarters, into its own derived tensor) and passes
 // quartered; otherwise gemmTriGate rearranges the blocks-of-8 weight itself every call
 bool triQuartersApply(int C);
-void triQuarters(const half* W8, half* out, const float* bias8, float* outBias, int C);
+void triQuarters(const half* W8, half* out, const float* bias8, float* outBias, int C, int in = 0);
 
 // ---------------------------------------------------------------- gated flash attention
 // out = softmax(q k^T scale + bias + mask) v * sigmoid(g), per batch row and head; D 8, 16, 24, 32, 48 or 64. Dense

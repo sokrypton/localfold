@@ -1187,14 +1187,22 @@ bool triQuartersApply(int C) {
   static const bool reg = !getenv("LOCALFOLD_TRI_REG") || atoi(getenv("LOCALFOLD_TRI_REG")) != 0;
   return reg && C % 32 == 0 && tensorWanted();
 }
-void triQuarters(const half* W8, half* out, const float* bias8, float* outBias, int C) {
-  run1d("lf_tri_quarters", (size_t)C * 4 * C, TriQuartersArgs{W8, out, bias8, bias8 ? outBias : nullptr, (uint64_t)C, (uint)C, 0});
+void triQuarters(const half* W8, half* out, const float* bias8, float* outBias, int C, int in) {
+  const int K = in > 0 ? in : C;
+  run1d("lf_tri_quarters", (size_t)K * 4 * C, TriQuartersArgs{W8, out, bias8, bias8 ? outBias : nullptr, (uint64_t)K, (uint)C, 0});
 }
 void gemmTriGate(const half* X, const half* W, const float* mask, half* outA, half* outB, size_t r0, size_t rows, int C,
-                 size_t pairs, int n, int np, const float* bias, bool quartered) {
+                 size_t pairs, int n, int np, const float* bias, bool quartered, int in) {
+  // 🔴 THE INPUT WIDTH IS ITS OWN NUMBER NOW, AND `in` 0 KEEPS IT EQUAL TO C. Every AF3-lineage triangle
+  // projects a pair track onto the same width it came from, so one `C` said everything and `k`, `m` and `tgC`
+  // were all set from it - but they are separate GemmArgs fields and the epilogue only ever reads `tgC` and
+  // `m / 4`, so the contraction's depth was free all along. RFD4-Proteina's triangle is 384 in and 256 out,
+  // which is the whole reason metal/rfd4p could not use this kernel and ran its gate as a second pass over
+  // four pair-sized planes. `lf_tri_quarters` already took the two apart (its `rows` IS the input width).
+  const int K = in > 0 ? in : C;
   GemmArgs g{};
   g.A = (uint64_t)W; g.B = (uint64_t)X; g.C = g.D = (uint64_t)outA;
-  g.m = 4 * C; g.n = (int)rows; g.k = C; g.lda = 4 * C; g.ldb = C; g.ldc = g.ldd = 4 * C;
+  g.m = 4 * C; g.n = (int)rows; g.k = K; g.lda = 4 * C; g.ldb = K; g.ldc = g.ldd = 4 * C;
   g.epilogue = 256; g.alpha = 1.f;
   g.aux = (uint64_t)mask; g.aux2 = (uint64_t)outA; g.aux3 = (uint64_t)outB;
   g.tgR0 = (int64_t)r0; g.tgPairs = (int64_t)pairs; g.tgN = n; g.tgNp = np; g.tgC = C;
@@ -1206,9 +1214,10 @@ void gemmTriGate(const half* X, const half* W, const float* mask, half* outA, ha
     if (!triQuartersApply(C)) die("gemmTriGate: a quartered weight off the matrix units");
     g.epilogue |= 512;
   } else if (triQuartersApply(C)) {
-    static half* qw = nullptr; static float* qb = nullptr; static size_t qC = 0;
-    if ((size_t)C > qC) { qw = allocT<half>((size_t)C * 4 * C); qb = allocT<float>((size_t)4 * C); qC = C; }
-    run1d("lf_tri_quarters", (size_t)C * 4 * C, TriQuartersArgs{W, qw, bias, bias ? qb : nullptr, (uint64_t)C, (uint)C, 0});
+    // (keyed by the ELEMENT COUNT, not by C: with an input width of its own, two shapes can share a C)
+    static half* qw = nullptr; static float* qb = nullptr; static size_t qN = 0;
+    if ((size_t)K * 4 * C > qN) { qN = (size_t)K * 4 * C; qw = allocT<half>(qN); qb = allocT<float>((size_t)4 * C); }
+    run1d("lf_tri_quarters", (size_t)K * 4 * C, TriQuartersArgs{W, qw, bias, bias ? qb : nullptr, (uint64_t)K, (uint)C, 0});
     g.A = (uint64_t)qw;
     if (bias) g.bias = (uint64_t)qb;
     g.epilogue |= 512;
