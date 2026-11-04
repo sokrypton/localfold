@@ -53,7 +53,7 @@ inline void gtBackwardBf(GatedTransition& t, const GtSave& s, const real* dout, 
   linearBwdBf(t.t2, g, db, dg, rows);
   bf* dh = bfGet(rows * 2 * t.F);
   swigluBwdBfK<<<blocks(rows * t.F), 256, 0, STREAM>>>(hb, dg, dh, rows, t.F);
-  real* dxn = ARENA.get(rows * t.C);
+  bf* dxn = bfGet(rows * t.C);   // (only the LayerNorm's backward reads it)
   linearBwdBf(t.t1, xb, dh, dxn, rows);
   lnBackward(t.ln, s.ln, dxn, dx, rows, true);
 }

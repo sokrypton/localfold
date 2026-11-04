@@ -24,11 +24,17 @@ struct LayerNorm {
   real eps = 1e-5f;
 };
 
+// an element as real, from real or (float builds) bf16 storage
+__device__ __forceinline__ real ldr(const real* p) { return *p; }
+#ifndef GRAD_F64
+__device__ __forceinline__ float ldr(const bf* p) { return __bfloat162float(*p); }
+#endif
 // one warp a row; mean and rstd saved for the backward
-template <class Y>   // (Y: real, or bf where a module keeps its normalised input in bf16)
+template <class Y, class XC = Y>   // (Y: real, or bf where a module keeps its normalised input in bf16; xc, when not
+                                   // null, a bf16 copy of x for the backward)
 __global__ void lnFwdK(const real* __restrict__ x, const real* __restrict__ g, const real* __restrict__ b,
                        Y* __restrict__ y, real* __restrict__ mean, real* __restrict__ rstd, size_t rows, int C,
-                       real eps) {
+                       real eps, XC* __restrict__ xc = nullptr) {
   size_t r = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
   int lane = threadIdx.x & 31;
   if (r >= rows) return;
@@ -40,7 +46,10 @@ __global__ void lnFwdK(const real* __restrict__ x, const real* __restrict__ g, c
   for (int c = lane; c < C; c += 32) { real d = xr[c] - mu; v += d * d; }
   for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
   real rs = rsqrt(v / C + eps);
-  for (int c = lane; c < C; c += 32) y[r * C + c] = (Y)((xr[c] - mu) * rs * (g ? g[c] : (real)1) + (b ? b[c] : (real)0));
+  for (int c = lane; c < C; c += 32) {
+    y[r * C + c] = (Y)((xr[c] - mu) * rs * (g ? g[c] : (real)1) + (b ? b[c] : (real)0));
+    if (xc) xc[r * C + c] = (XC)xr[c];
+  }
   if (lane == 0) { mean[r] = mu; rstd[r] = rs; }
 }
 // dx = rstd (dxhat - mean(dxhat) - xhat mean(dxhat xhat)), dxhat = dy g; dg += dy xhat, db += dy (atomics a block)
@@ -71,13 +80,16 @@ __global__ void lnBwdK(const real* __restrict__ x, const real* __restrict__ dy, 
   for (int c = threadIdx.x; c < C; c += blockDim.x) { if (dg) atomicAdd(&dg[c], sh[c]); if (db) atomicAdd(&db[c], sh[C + c]); }
 }
 
-struct LnSave { const real* x; real* mean; real* rstd; };
+struct LnSave { const real* x; real* mean; real* rstd; const void* xb = nullptr; };   // (xb: x in bf16, the backward's)
 inline LnSave lnForward(const LayerNorm& ln, const real* x, real* y, size_t rows) {
   LnSave s{x, ARENA.get(rows), ARENA.get(rows)};
   lnFwdK<<<blocks(rows, 8), 256, 0, STREAM>>>(x, ln.g.w, ln.b.w, y, s.mean, s.rstd, rows, ln.C, ln.eps);
   return s;
 }
 #ifndef GRAD_F64
+// BF16: the normalised output in bf16. (Keeping x in bf16 too, s.xb, for the backward to read half the bytes was
+// measured: 0.1-0.7 ms off a block's backward, as much onto its forward, and a pair's worth more saved - not taken;
+// lnBackward still reads s.xb where a caller sets it.)
 inline LnSave lnForward(const LayerNorm& ln, const real* x, bf* y, size_t rows) {
   LnSave s{x, ARENA.get(rows), ARENA.get(rows)};
   lnFwdK<<<blocks(rows, 8), 256, 0, STREAM>>>(x, ln.g.w, ln.b.w, y, s.mean, s.rstd, rows, ln.C, ln.eps);
@@ -86,8 +98,8 @@ inline LnSave lnForward(const LayerNorm& ln, const real* x, bf* y, size_t rows) 
 #endif
 // the same with C = 32 N: a lane holds its N channels of the row (x and dy read once) and its own partial dg, db
 // across every row it takes; the block's warps reduce through shared memory once, at the end
-template <int N>
-__global__ void lnBwdRegK(const real* __restrict__ x, const real* __restrict__ dy, const real* __restrict__ g,
+template <int N, class X = real, class DY = real>
+__global__ void lnBwdRegK(const X* __restrict__ x, const DY* __restrict__ dy, const real* __restrict__ g,
                           const real* __restrict__ mean, const real* __restrict__ rstd, real* __restrict__ dx,
                           real* __restrict__ dg, real* __restrict__ db, size_t rows, bool accumulate) {
   constexpr int C = 32 * N;
@@ -97,12 +109,13 @@ __global__ void lnBwdRegK(const real* __restrict__ x, const real* __restrict__ d
 #pragma unroll
   for (int k = 0; k < N; ++k) { gg[k] = g ? g[lane + 32 * k] : (real)1; pg[k] = pb[k] = 0; }
   for (size_t r = (size_t)blockIdx.x * warps + warp; r < rows; r += (size_t)gridDim.x * warps) {
-    const real *xr = x + r * C, *dr = dy + r * C;
+    const X* xr = x + r * C;
+    const DY* dr = dy + r * C;
     const real mu = mean[r], rs = rstd[r];
     real xh[N], dv[N], s1 = 0, s2 = 0;
 #pragma unroll
     for (int k = 0; k < N; ++k) {
-      xh[k] = (xr[lane + 32 * k] - mu) * rs; dv[k] = dr[lane + 32 * k];
+      xh[k] = (ldr(xr + lane + 32 * k) - mu) * rs; dv[k] = ldr(dr + lane + 32 * k);
       real dh = dv[k] * gg[k];
       s1 += dh; s2 += dh * xh[k];
       pg[k] += dv[k] * xh[k]; pb[k] += dv[k];
@@ -126,7 +139,35 @@ __global__ void lnBwdRegK(const real* __restrict__ x, const real* __restrict__ d
     if (db) atomicAdd(&db[c], b);
   }
 }
+#ifndef GRAD_F64
+__global__ void bfToFK(const bf* x, float* y, size_t n);
+inline void lnBackward(LayerNorm& ln, const LnSave& s, const real* dy, real* dx, size_t rows, bool accumulate);
+// x from its bf16 copy (s.xb) and/or dy in bf16, where C is a multiple of 32 the register kernel covers
+template <class DY>
+inline bool lnBackwardBf(LayerNorm& ln, const LnSave& s, const DY* dy, real* dx, size_t rows, bool accumulate) {
+  unsigned gr = (unsigned)std::min<size_t>(blocks(rows, 8), 1024);
+  const size_t sh = 8 * 2 * ln.C * sizeof(real);
+  const bf* xb = static_cast<const bf*>(s.xb);
+#define LNREGB(N) case N: if (xb) lnBwdRegK<N, bf, DY><<<gr, 256, sh, STREAM>>>(xb, dy, ln.g.w, s.mean, s.rstd, dx, ln.g.g, ln.b.g, rows, accumulate); \
+                          else lnBwdRegK<N, real, DY><<<gr, 256, sh, STREAM>>>(s.x, dy, ln.g.w, s.mean, s.rstd, dx, ln.g.g, ln.b.g, rows, accumulate); return true;
+  if (ln.C % 32 == 0 && sh <= 48 * 1024) switch (ln.C / 32) { LNREGB(1) LNREGB(2) LNREGB(3) LNREGB(4) LNREGB(6) LNREGB(8) LNREGB(12) default: break; }
+#undef LNREGB
+  return false;
+}
+inline void lnBackward(LayerNorm& ln, const LnSave& s, const bf* dy, real* dx, size_t rows, bool accumulate) {
+  if (lnBackwardBf(ln, s, dy, dx, rows, accumulate)) return;
+  Scratch scratch;
+  real* t = ARENA.get(rows * ln.C);
+  bfToFK<<<blocks(rows * ln.C), 256, 0, STREAM>>>(dy, t, rows * ln.C);
+  LnSave f = s; f.xb = nullptr;
+  if (s.xb) { real* xf = ARENA.get(rows * ln.C); bfToFK<<<blocks(rows * ln.C), 256, 0, STREAM>>>(static_cast<const bf*>(s.xb), xf, rows * ln.C); f.x = xf; }
+  lnBackward(ln, f, t, dx, rows, accumulate);
+}
+#endif
 inline void lnBackward(LayerNorm& ln, const LnSave& s, const real* dy, real* dx, size_t rows, bool accumulate) {
+#ifndef GRAD_F64
+  if (s.xb && lnBackwardBf(ln, s, dy, dx, rows, accumulate)) return;
+#endif
   unsigned gr = (unsigned)std::min<size_t>(blocks(rows, 8), 1024);
   const size_t sh = 8 * 2 * ln.C * sizeof(real);
 #define LNREG(N) case N: lnBwdRegK<N><<<gr, 256, sh, STREAM>>>(s.x, dy, ln.g.w, s.mean, s.rstd, dx, ln.g.g, ln.b.g, rows, accumulate); return;
@@ -913,7 +954,7 @@ inline void transBackwardBf(Transition& t, const TransSave& s, const real* dout,
   const bf* db = toBf(dout, rows * t.l2.N);
   bf* dr = bfGet(n);
   linearBwdBf(t.l2, h, db, dr, rows);
-  real* dxn = ARENA.get(rows * t.ln.C);
+  bf* dxn = bfGet(rows * t.ln.C);   // (only the LayerNorm's backward reads it)
   if (t.l1.N % 2 == 0) {   // the mask and l1's bias gradient in one pass
     const int C2 = t.l1.N / 2;
     const unsigned xb = (C2 + 31) / 32;

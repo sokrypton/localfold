@@ -247,7 +247,7 @@ inline void triMulBackwardBf(TriMul& m, const TriMulSave& s, const real* mask, c
   linearFwdBf(m.out, cn, po, rows);
   bf* dpo = bfGet(rows * m.C);
   outGateBwdLdBfK<<<blocks(rows * m.C), 256, 0, STREAM>>>(dout, po, pre + 2 * I2, dpo, dpre + 2 * I2, rows, m.C, P);
-  real* dcn = ARENA.get(rows * m.I);
+  bf* dcn = bfGet(rows * m.I);   // (only the centre norm's backward reads it)
   linearBwdBf(m.out, cn, dpo, dcn, rows);
   real* dcenter = ARENA.get(rows * m.I);
   lnBackward(m.lnCenter, s.lnC, dcn, dcenter, rows, false);
@@ -279,7 +279,7 @@ inline void triMulBackwardBf(TriMul& m, const TriMulSave& s, const real* mask, c
     mmATBf(xn, dpre, dW, (int)rows, m.C, P, 0.f);
     unpackLinearGrads(roles, 3, dW);
   }
-  real* dxn = ARENA.get(rows * m.C);
+  bf* dxn = bfGet(rows * m.C);
   mmBTBf(dpre, W, dxn, (int)rows, m.C, P);
   lnBackward(m.lnIn, s.lnIn, dxn, dpair, rows, true);
 }
