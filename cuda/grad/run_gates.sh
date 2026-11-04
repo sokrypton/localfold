@@ -10,6 +10,7 @@ fail=0
 run() { echo "== $*"; "$@" 2>&1 | grep -E "PASS|FAIL|ABOVE|against|gradcheck:|worst" || true; "$@" > /dev/null 2>&1 || fail=1; }
 build() { local out=$1; shift; $NV "$@" -o "$out" -lcublas -lcublasLt -ldl -lcurand 2>&1 | grep -i -B1 -A3 " error" && fail=1; }
 build cuda/grad/test-flash -O1 cuda/grad/test_flash.cu
+build cuda/grad/test-bf16 -O1 cuda/grad/test_bf16.cu
 build cuda/grad/test-af2-block -O2 cuda/grad/test_af2_block.cu
 build cuda/grad/test-af2-block-f64 -O2 -DGRAD_F64 cuda/grad/test_af2_block.cu
 build cuda/grad/test-af2sm -O1 cuda/grad/test_af2sm.cu
@@ -67,6 +68,7 @@ build cuda/grad/test-rfd4ae-f64 -O2 -DGRAD_F64 cuda/grad/test_rfd4ae.cu
 # single blocks. (The three-block stack in float32 holds ~2.7M ReLU inputs, and a tie among them is a coin toss on
 # the arithmetic's last bit, not a defect: it moved with an unrelated change of rounding, see README.)
 run cuda/grad/test-flash                                     # the flash attention against the bmm path it replaces
+run cuda/grad/test-bf16                                      # BF16 mode (bf16 storage, bf16 tensor cores) against float32, whole blocks
 for d in cuda/grad/data/af2-*/; do run cuda/grad/test-af2-block-f64 "$d" --gradcheck; done
 for d in cuda/grad/data/af2-block*/ cuda/grad/data/af2-extra-block/; do run cuda/grad/test-af2-block "$d"; done
 run cuda/grad/test-af2sm

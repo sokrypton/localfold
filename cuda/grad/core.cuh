@@ -10,6 +10,7 @@
 // N block inputs, never N blocks of activations. Arena::reset() between blocks returns the saves.
 #pragma once
 #include <cublas_v2.h>
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <cmath>
 #include <cstdio>
@@ -274,6 +275,61 @@ struct Linear {
     }
   }
 };
+
+#ifndef GRAD_F64
+// ---------------------------------------------------------------- bf16 storage (BF16 mode)
+// Where a module keeps its large activations in bf16 - half the bytes of every read and write, which is most of what
+// a pair-track GEMM (an inner width of 128) and every elementwise pass cost - its GEMMs take bf16 operands and
+// accumulate in float: what a bf16 run's autocast computes. Parameters and their gradients stay float.
+typedef __nv_bfloat16 bf;
+template <class T> constexpr cudaDataType dtype() { return sizeof(T) == 2 ? CUDA_R_16BF : CUDA_R_32F; }
+__global__ void toBfK(const float* __restrict__ x, __nv_bfloat162* __restrict__ y, size_t n2) {
+  const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n2) { const float2 v = reinterpret_cast<const float2*>(x)[i]; y[i] = __floats2bfloat162_rn(v.x, v.y); }
+}
+__global__ void toBfTailK(const float* x, bf* y, size_t n) { if (n & 1) y[n - 1] = __float2bfloat16(x[n - 1]); }
+inline void toBf(const float* x, bf* y, size_t n) {   // (x 8-byte aligned)
+  if (n / 2) toBfK<<<blocks(n / 2), 256, 0, STREAM>>>(x, reinterpret_cast<__nv_bfloat162*>(y), n / 2);
+  if (n & 1) toBfTailK<<<1, 1, 0, STREAM>>>(x, y, n);
+}
+inline bf* bfGet(size_t n) { return reinterpret_cast<bf*>(ARENA.get((n + 1) / 2)); }
+inline bf* toBf(const float* x, size_t n) { bf* y = bfGet(n); toBf(x, y, n); return y; }
+inline void gemmEx(cublasOperation_t a, cublasOperation_t b, int m, int n, int k, const void* A, cudaDataType tA,
+                   int la, const void* B, cudaDataType tB, int lb, float beta, void* C, cudaDataType tC, int lc) {
+  const float one = 1.f;
+  GB(cublasGemmEx(BLAS, a, b, m, n, k, &one, A, tA, la, B, tB, lb, &beta, C, tC, lc, CUBLAS_COMPUTE_32F,
+                  CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+}
+// mm, mmBT, mmAT on bf16 operands (row-major, as above); y and dx float or bf16, dw float
+template <class Y> inline void mmBf(const bf* x, const bf* w, Y* y, int M, int K, int N, float beta = 0) {
+  gemmEx(CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, w, CUDA_R_16BF, N, x, CUDA_R_16BF, K, beta, y, dtype<Y>(), N);
+}
+template <class Y> inline void mmBTBf(const bf* dy, const bf* w, Y* dx, int M, int K, int N, float beta = 0) {
+  gemmEx(CUBLAS_OP_T, CUBLAS_OP_N, K, M, N, w, CUDA_R_16BF, N, dy, CUDA_R_16BF, N, beta, dx, dtype<Y>(), K);
+}
+inline void mmATBf(const bf* x, const bf* dy, float* dw, int M, int K, int N, float beta = 1) {
+  gemmEx(CUBLAS_OP_N, CUBLAS_OP_T, N, K, M, dy, CUDA_R_16BF, N, x, CUDA_R_16BF, K, beta, dw, CUDA_R_32F, N);
+}
+// Linear on bf16 operands (no bias: the modules that take this path have none)
+template <class Y> inline void linearFwdBf(const Linear& l, const bf* x, Y* y, size_t rows, float beta = 0) {
+  if (l.hasBias) { fprintf(stderr, "linearFwdBf: a bias\n"); exit(1); }
+  Scratch scratch;
+  const bf* w = toBf(l.w.w, (size_t)l.K * l.N);
+  if (l.trans) mmBTBf(x, w, y, (int)rows, l.N, l.K, beta);
+  else mmBf(x, w, y, (int)rows, l.K, l.N, beta);
+}
+template <class DX>
+inline void linearBwdBf(Linear& l, const bf* x, const bf* dy, DX* dx, size_t rows, bool accumulate = false) {
+  if (l.hasBias) { fprintf(stderr, "linearBwdBf: a bias\n"); exit(1); }
+  if (l.trans) mmATBf(dy, x, l.w.g, (int)rows, l.N, l.K);
+  else mmATBf(x, dy, l.w.g, (int)rows, l.K, l.N);
+  if (!dx) return;
+  Scratch scratch;
+  const bf* w = toBf(l.w.w, (size_t)l.K * l.N);
+  if (l.trans) mmBf(dy, w, dx, (int)rows, l.N, l.K, accumulate ? 1.f : 0.f);
+  else mmBTBf(dy, w, dx, (int)rows, l.K, l.N, accumulate ? 1.f : 0.f);
+}
+#endif
 
 // ---------------------------------------------------------------- a device dot product, in double
 __global__ void dotK(const real* a, const real* b, size_t n, double* out) {

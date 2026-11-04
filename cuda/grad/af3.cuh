@@ -26,8 +26,42 @@ struct GatedTransition {
   Linear t1, t2;
   int C = 0, F = 0;
 };
-struct GtSave { LnSave ln; real *xn, *h; size_t rows; };
+struct GtSave { LnSave ln; real *xn, *h; size_t rows; void *xb = nullptr, *hb = nullptr; };
+// BF16: the normalised input and the hidden layer kept in bf16, every GEMM on bf16 operands
+#ifndef GRAD_F64
+inline GtSave gtForwardBf(const GatedTransition& t, const real* x, real* out, size_t rows, real beta) {
+  GtSave s; s.rows = rows;
+  bf* xb = bfGet(rows * t.C);
+  s.ln = lnForward(t.ln, x, xb, rows);
+  bf* hb = bfGet(rows * 2 * t.F);
+  linearFwdBf(t.t1, xb, hb, rows);
+  s.xb = xb; s.hb = hb;
+  Scratch scratch;
+  bf* g = bfGet(rows * t.F);
+  swigluBfK<<<blocks(rows * t.F), 256, 0, STREAM>>>(hb, g, rows, t.F);
+  linearFwdBf(t.t2, g, out, rows, beta);
+  return s;
+}
+inline void gtBackwardBf(GatedTransition& t, const GtSave& s, const real* dout, real* dx) {
+  Scratch scratch;
+  const size_t rows = s.rows;
+  const bf *xb = static_cast<const bf*>(s.xb), *hb = static_cast<const bf*>(s.hb);
+  bf* g = bfGet(rows * t.F);
+  swigluBfK<<<blocks(rows * t.F), 256, 0, STREAM>>>(hb, g, rows, t.F);
+  const bf* db = toBf(dout, rows * t.C);
+  bf* dg = bfGet(rows * t.F);
+  linearBwdBf(t.t2, g, db, dg, rows);
+  bf* dh = bfGet(rows * 2 * t.F);
+  swigluBwdBfK<<<blocks(rows * t.F), 256, 0, STREAM>>>(hb, dg, dh, rows, t.F);
+  real* dxn = ARENA.get(rows * t.C);
+  linearBwdBf(t.t1, xb, dh, dxn, rows);
+  lnBackward(t.ln, s.ln, dxn, dx, rows, true);
+}
+#endif
 inline GtSave gtForward(const GatedTransition& t, const real* x, real* out, size_t rows, real beta = 0) {
+#ifndef GRAD_F64
+  if (BF16) return gtForwardBf(t, x, out, rows, beta);
+#endif
   GtSave s; s.rows = rows;
   s.xn = ARENA.get(rows * t.C);
   s.ln = lnForward(t.ln, x, s.xn, rows);
@@ -41,6 +75,9 @@ inline GtSave gtForward(const GatedTransition& t, const real* x, real* out, size
 }
 // dout -> dx (added)
 inline void gtBackward(GatedTransition& t, const GtSave& s, const real* dout, real* dx) {
+#ifndef GRAD_F64
+  if (s.xb) { gtBackwardBf(t, s, dout, dx); return; }
+#endif
   Scratch scratch;
   size_t rows = s.rows;
   real* g = ARENA.get(rows * t.F);

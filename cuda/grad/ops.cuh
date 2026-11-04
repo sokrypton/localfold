@@ -25,8 +25,9 @@ struct LayerNorm {
 };
 
 // one warp a row; mean and rstd saved for the backward
+template <class Y>   // (Y: real, or bf where a module keeps its normalised input in bf16)
 __global__ void lnFwdK(const real* __restrict__ x, const real* __restrict__ g, const real* __restrict__ b,
-                       real* __restrict__ y, real* __restrict__ mean, real* __restrict__ rstd, size_t rows, int C,
+                       Y* __restrict__ y, real* __restrict__ mean, real* __restrict__ rstd, size_t rows, int C,
                        real eps) {
   size_t r = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
   int lane = threadIdx.x & 31;
@@ -39,7 +40,7 @@ __global__ void lnFwdK(const real* __restrict__ x, const real* __restrict__ g, c
   for (int c = lane; c < C; c += 32) { real d = xr[c] - mu; v += d * d; }
   for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
   real rs = rsqrt(v / C + eps);
-  for (int c = lane; c < C; c += 32) y[r * C + c] = (xr[c] - mu) * rs * (g ? g[c] : (real)1) + (b ? b[c] : (real)0);
+  for (int c = lane; c < C; c += 32) y[r * C + c] = (Y)((xr[c] - mu) * rs * (g ? g[c] : (real)1) + (b ? b[c] : (real)0));
   if (lane == 0) { mean[r] = mu; rstd[r] = rs; }
 }
 // dx = rstd (dxhat - mean(dxhat) - xhat mean(dxhat xhat)), dxhat = dy g; dg += dy xhat, db += dy (atomics a block)
@@ -76,6 +77,13 @@ inline LnSave lnForward(const LayerNorm& ln, const real* x, real* y, size_t rows
   lnFwdK<<<blocks(rows, 8), 256, 0, STREAM>>>(x, ln.g.w, ln.b.w, y, s.mean, s.rstd, rows, ln.C, ln.eps);
   return s;
 }
+#ifndef GRAD_F64
+inline LnSave lnForward(const LayerNorm& ln, const real* x, bf* y, size_t rows) {
+  LnSave s{x, ARENA.get(rows), ARENA.get(rows)};
+  lnFwdK<<<blocks(rows, 8), 256, 0, STREAM>>>(x, ln.g.w, ln.b.w, y, s.mean, s.rstd, rows, ln.C, ln.eps);
+  return s;
+}
+#endif
 // the same with C = 32 N: a lane holds its N channels of the row (x and dy read once) and its own partial dg, db
 // across every row it takes; the block's warps reduce through shared memory once, at the end
 template <int N>
@@ -493,6 +501,26 @@ __global__ void swigluBwdK(const real* h, const real* dg, real* dh, size_t rows,
   dh[r * 2 * F + f] = dg[t] * b * (sg + a * sg * (1 - sg));
   dh[r * 2 * F + F + f] = dg[t] * a * sg;
 }
+#ifndef GRAD_F64
+// the same on bf16 storage, computed in float
+__global__ void swigluBfK(const bf* __restrict__ h, bf* __restrict__ g, size_t rows, int F) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= rows * F) return;
+  size_t r = t / F; int f = t % F;
+  const float a = __bfloat162float(h[r * 2 * F + f]), b = __bfloat162float(h[r * 2 * F + F + f]);
+  g[t] = __float2bfloat16(a / (1.f + __expf(-a)) * b);
+}
+__global__ void swigluBwdBfK(const bf* __restrict__ h, const bf* __restrict__ dg, bf* __restrict__ dh, size_t rows,
+                             int F) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= rows * F) return;
+  size_t r = t / F; int f = t % F;
+  const float a = __bfloat162float(h[r * 2 * F + f]), b = __bfloat162float(h[r * 2 * F + F + f]);
+  const float sg = 1.f / (1.f + __expf(-a)), d = __bfloat162float(dg[t]);
+  dh[r * 2 * F + f] = __float2bfloat16(d * b * (sg + a * sg * (1.f - sg)));
+  dh[r * 2 * F + F + f] = __float2bfloat16(d * a * sg);
+}
+#endif
 // the exact (erf) GELU
 __global__ void geluK(real* y, const real* x, size_t n) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
