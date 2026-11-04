@@ -157,8 +157,8 @@ One block trained at the training crops, A100, random weights; the PyTorch bars 
 
 | block | float32 | TF32 | **bf16** (`--bf16`) | PyTorch eager, bf16 autocast | PyTorch `torch.compile`, pure bf16 |
 |---|---:|---:|---:|---:|---:|
-| AF2, L 256, S 128 | 38.1 | 17.6 | **7.46** | 32.6 (4.4x) | 12.7 (1.70x) |
-| AF2, L 384, S 128 | | | **15.17** | | 26.3 (1.73x) |
+| AF2, L 256, S 128 | 38.1 | 17.6 | **7.30** | 32.6 (4.5x) | 12.7 (1.74x) |
+| AF2, L 384, S 128 | | | **14.78** | | 26.3 (1.78x) |
 | AF3 pairformer, n 384 | 46.3 | 26.1 | **10.9** | 48.0 (4.4x) | 19.6 (1.80x) |
 | AF3 pairformer, n 768 | | | **51.6** | | 128.9 (2.50x) |
 
@@ -228,7 +228,11 @@ whole blocks to float32 by relative rms at PyTorch autocast's own error on the s
   separate pass re-read the whole float dQ): 7.50 -> 7.46 ms, AF3 n 768 52.2 -> 51.6. (Counted per query tile, the
   fences after every tile's atomics cost more than the pass: 7.57.) The bias atomics past Q or K are predicated off,
   not pointed at one address: redirected, they serialised there whenever a length is not a multiple of 64 - the
-  triangle shape at L 300 took 12.3 ms for 1.0 (`bench-flash`'s tri300; found porting this kernel to bindcraft2).
+  triangle shape at L 300 took 12.3 ms for 1.0 (`bench-flash`'s tri300; found porting this kernel to bindcraft2);
+- the outer product mean's backward projection written straight in the [(i c), (j e)] layout its two GEMMs read
+  (`opmDop`: a 64 x 64 mma.sync tile over K = 128 whole, its epilogue placing each column) where cuBLAS wrote
+  [(i j), (c e)] and a 134 MB pass turned it round - 391 -> 210 us, bit-identical, and that buffer gone: 7.46 ->
+  7.30 ms, 15.17 -> 14.78 at L 384.
 
 **Measured and not taken**: a CUDA graph of the whole backward (2.4%: 11.40 against 11.68 ms on AF2, bindcraft2's
 3%); a 32-row query tile for the attention backward (slower capped at 4 CTAs an SM and uncapped); unrolling its two
@@ -245,7 +249,7 @@ transpose's locality); the pair-bias LayerNorm backward's register cap and grid 
 its packed q, k, v were random: zero v made every dS 0. `Sdpa::deterministic` sums the attention's bias gradients in fixed point (bitwise
 reproducible; 5% of AF3's backward); AF2 training dropout is `Block::dropout`, its masks regenerated, never stored.
 
-**What is left**: the flash backward is 1.5 of AF2's 7.5 ms at L 256 - latency-bound at 12 warps an SM, about twice
+**What is left**: the flash backward is 1.5 of AF2's 7.3 ms at L 256 - latency-bound at 12 warps an SM, about twice
 the forward without its atomics, and its bias gradient's atomics a quarter of it (the pair bias is shared by every
 batch row, so they grow with it; one sector-op an eight elements, the least an f32 atomic does on an A100); the rest
 is GEMMs and memory-bound passes around the float residual stream and the LayerNorms, which run near the bytes they

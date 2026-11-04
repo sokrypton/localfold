@@ -582,6 +582,93 @@ inline void outerToPair(const bf* o2, bf* op, int L, int O, bool back) {
   outerToPairBfK<<<blocks((size_t)L * L * O * O / 8), 256, 0, STREAM>>>(reinterpret_cast<const uint4*>(o2),
                                                                        reinterpret_cast<uint4*>(op), L, O, back);
 }
+// do2[(i c), (j e)] = (dab Wo^T)[(i j), (c e)] - the outer product mean's backward projection written straight in the
+// layout its two GEMMs read, where cuBLAS wrote [(i j), (c e)] and outerToPair turned it round (a 134 MB pass at
+// L 256; 391 -> 210 us together, 868 -> 428 at L 384, bit-identical). A CTA 64 rows (i j) of dab whole in shared memory
+// (K = KC), Wo's columns in chunks of 64 double-buffered by cp.async; 8 warps 4 x 2, a warp 16 rows x 32 columns,
+// mma.sync from ldmatrix. Its output column n = c O + e lands at c L O + e of row i O O L + j O: for a fixed c a
+// warp's rows are consecutive O-element runs. (64 x 64 was the fastest tile, 64-128 rows by 64-128 columns swept;
+// staging the output through shared memory for 16-byte stores changed nothing.)
+__device__ __forceinline__ void ldm4(uint32_t* r, const uint16_t* p) {
+  const unsigned a = (unsigned)__cvta_generic_to_shared(p);
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+               : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+}
+template <int KC>
+__global__ void __launch_bounds__(256) opmDopK(const bf* __restrict__ dab, const bf* __restrict__ wo,
+                                               bf* __restrict__ do2, int L, int O, int rows) {
+  constexpr int BM = 64, BN = 64, LD = KC + 8, WM = BM / 4, WN = BN / 2, NT = WN / 8;
+  extern __shared__ __align__(16) uint16_t opmSm[];
+  uint16_t* As = opmSm;              // [BM][LD]
+  uint16_t* Bs = As + BM * LD;       // [2][BN][LD]
+  const int OO = O * O, nch = OO / BN;
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+  const int wm = warp >> 1, wn = warp & 1;
+  const int r0 = blockIdx.x * BM;
+  const uint16_t* A = reinterpret_cast<const uint16_t*>(dab);
+  const uint16_t* W = reinterpret_cast<const uint16_t*>(wo);
+  for (int i = threadIdx.x; i < BM * KC / 8; i += 256) {
+    const int r = i / (KC / 8), c = (i % (KC / 8)) * 8;
+    flash::cp16(As + r * LD + c, A + (size_t)(r0 + r < rows ? r0 + r : rows - 1) * KC + c, true);
+  }
+  auto loadB = [&](int st, int n0) {
+    for (int i = threadIdx.x; i < BN * KC / 8; i += 256) {
+      const int r = i / (KC / 8), c = (i % (KC / 8)) * 8;
+      flash::cp16(Bs + st * BN * LD + r * LD + c, W + (size_t)(n0 + r) * KC + c, true);
+    }
+  };
+  loadB(0, 0);
+  flash::cpCommit();
+  size_t rb[2];   // the fragment rows' output bases (row r = i L + j -> i O O L + j O)
+#pragma unroll
+  for (int hh = 0; hh < 2; ++hh) {
+    const int r = r0 + wm * WM + g + hh * 8;
+    rb[hh] = r < rows ? (size_t)(r / L) * OO * L + (size_t)(r % L) * O : ~(size_t)0;
+  }
+  for (int ch = 0; ch < nch; ++ch) {
+    const int st = ch & 1;
+    if (ch + 1 < nch) loadB(st ^ 1, (ch + 1) * BN);
+    flash::cpCommit();
+    flash::cpWait1();
+    __syncthreads();
+    const uint16_t* B = Bs + st * BN * LD;
+    float acc[NT][4];
+#pragma unroll
+    for (int nt = 0; nt < NT; ++nt) acc[nt][0] = acc[nt][1] = acc[nt][2] = acc[nt][3] = 0.f;
+#pragma unroll
+    for (int k = 0; k < KC; k += 16) {
+      uint32_t af[4];   // (tile m: rows + (m & 1) 8, columns k + (m >> 1) 8)
+      ldm4(af, As + (wm * WM + (lane & 7) + ((lane >> 3) & 1) * 8) * LD + k + (lane >> 4) * 8);
+#pragma unroll
+      for (int np = 0; np < NT / 2; ++np) {   // (tile m: n-tile 2 np + (m >> 1), k half m & 1)
+        uint32_t bfr[4];
+        ldm4(bfr, B + (wn * WN + np * 16 + (lane & 7) + (lane >> 4) * 8) * LD + k + ((lane >> 3) & 1) * 8);
+        flash::mma16(acc[2 * np], af, bfr[0], bfr[1]);
+        flash::mma16(acc[2 * np + 1], af, bfr[2], bfr[3]);
+      }
+    }
+#pragma unroll
+    for (int nt = 0; nt < NT; ++nt) {
+      const int n = ch * BN + wn * WN + nt * 8 + 2 * t;
+      const size_t co = (size_t)(n / O) * L * O + n % O;
+#pragma unroll
+      for (int hh = 0; hh < 2; ++hh)
+        if (rb[hh] != ~(size_t)0)
+          *reinterpret_cast<uint32_t*>(do2 + rb[hh] + co) = flash::bf2(acc[nt][2 * hh], acc[nt][2 * hh + 1]);
+    }
+    __syncthreads();   // (the next chunk's load overwrites this stage)
+  }
+}
+// whether opmDop covers the shape (Cz 128; O even, O O a multiple of 64; 16-byte rows)
+inline bool opmDopFits(int Cz, int O) { return Cz == 128 && O % 2 == 0 && O * O % 64 == 0; }
+inline void opmDop(const bf* dab, const bf* wo, bf* do2, int L, int O) {
+  constexpr int KC = 128;
+  const size_t sm = (64 + 2 * 64) * (KC + 8) * 2;
+  static bool attr = false;
+  if (!attr) { GK(cudaFuncSetAttribute(opmDopK<KC>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm)); attr = true; }
+  const int rows = L * L;
+  opmDopK<KC><<<(rows + 63) / 64, 256, sm, STREAM>>>(dab, wo, do2, L, O, rows);
+}
 // the ungrouped outer product mean on bf16 storage: the normalised MSA and both projections in bf16, the outer
 // product [(i c), (j e)] and its pair layout [(i j), (c e)] in bf16, Wo a bf16 GEMM
 inline void opmProductsBf(const Opm& m, const OpmSave& s, bf* op) {
@@ -688,10 +775,13 @@ inline void opmBackwardBf(Opm& m, const OpmSave& s, const real* msaMask, const P
   }
   const bf* op = reinterpret_cast<const bf*>(s.pnorm);
   mmATBf(op, dab, m.wo.g, (int)pr, OO, m.Cz);
-  bf* dop = bfGet(pr * OO);
-  mmBTBf(dab, toBf(m.wo.w, (size_t)OO * m.Cz), dop, (int)pr, OO, m.Cz);
-  bf* do2 = bfGet((size_t)LO * LO);
-  outerToPair(dop, do2, L, m.O, true);                 // [(i c), (j e)]
+  bf* do2 = bfGet((size_t)LO * LO);                   // [(i c), (j e)]
+  if (opmDopFits(m.Cz, m.O)) opmDop(dab, toBf(m.wo.w, (size_t)OO * m.Cz), do2, L, m.O);
+  else {
+    bf* dop = bfGet(pr * OO);
+    mmBTBf(dab, toBf(m.wo.w, (size_t)OO * m.Cz), dop, (int)pr, OO, m.Cz);
+    outerToPair(dop, do2, L, m.O, true);
+  }
   real *dlm = ARENA.get(rows * m.O), *drm = ARENA.get(rows * m.O);
   mmBTBf(rm, do2, dlm, S, LO, LO);                     // dlm = rm dO2^T
   mmBf(lm, do2, drm, S, LO, LO);                       // drm = lm dO2
