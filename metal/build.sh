@@ -70,6 +70,12 @@ core_objs+=("$build/tensor-source.o")
 for port in "${ports[@]}"; do
   pdir="$here/$port"
   [ -d "$pdir" ] || { echo "no metal/$port" >&2; exit 1; }
+  # 🔴 A PORT MAY DERIVE HEADERS FROM ITS cuda/ TWIN, AT BUILD TIME AND ON EVERY BUILD. metal/rfd4p does: the
+  # design metrics and the structure writer are host-only C++ that both ports must agree on to the byte, and the
+  # file holding them includes one that carries CUDA kernels, so clang cannot read it directly. Its own derive.sh
+  # says why that is extracted rather than copied into this port or moved out of cuda/ - and because it runs here
+  # every time, a declaration that moves or changes shape fails this build instead of going quietly stale.
+  if [ -f "$pdir/derive.sh" ]; then bash "$pdir/derive.sh" "$build" "$repo"; fi
   metals=("$here/core/args.h"); [ -f "$pdir/kernels.h" ] && metals+=("$pdir/kernels.h")
   metals+=("$here/core/common.metal")
   for m in "$pdir"/*.metal; do [ -f "$m" ] && metals+=("$m"); done
@@ -111,7 +117,7 @@ for port in "${ports[@]}"; do
   # By the DIRECTORY ABOVE and not the featurise directory itself, because `tables.inc` is a name two models use -
   # cuda/featurise has its own, and putting both on the search path makes which one a port gets an accident of
   # flag order. The include names its model.
-  inc=(-I "$here/core" -I "$pdir" -I "$repo/cuda/featurise" -I "$repo/cuda")
+  inc=(-I "$here/core" -I "$pdir" -I "$build" -I "$repo/cuda/featurise" -I "$repo/cuda")
   clang++ "${flags[@]}" $opt "${inc[@]}" -x objective-c++ "${srcs[@]}" "$build/$port-source.cpp" \
     -x none "${core_objs[@]}" "${extra[@]}" "${link[@]}" -o "$pdir/localfold-$port.building"
   mv "$pdir/localfold-$port.building" "$pdir/localfold-$port"

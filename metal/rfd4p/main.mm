@@ -107,7 +107,7 @@ double checkFn(const char* label, const std::string& key, const float* ours, siz
 }  // namespace
 
 int main(int argc, char** argv) {
-  std::string input, bundle, oracle, encDir, genDir, outPath, job, workDir, seed;
+  std::string input, bundle, oracle, encDir, genDir, outPath, job, workDir, seed, metricsPath, dumpSample;
   int designs = 1;
   for (int i = 1; i < argc; ++i) {
     const char* a = argv[i];
@@ -120,6 +120,8 @@ int main(int argc, char** argv) {
     else if (!strncmp(a, "--work-dir=", 11)) workDir = a + 11;
     else if (!strncmp(a, "--seed=", 7)) seed = a + 7;
     else if (!strncmp(a, "--designs=", 10)) designs = atoi(a + 10);
+    else if (!strncmp(a, "--metrics=", 10)) metricsPath = a + 10;
+    else if (!strncmp(a, "--dump-sample=", 14)) dumpSample = a + 14;
     else if (!strcmp(a, "--f16")) HALF = true;
     else if (!strcmp(a, "--f32")) HALF = false;
     else if (a[0] != '-') input = a;
@@ -182,7 +184,8 @@ int main(int argc, char** argv) {
 
   if (input.empty() || bundle.empty()) {
     fprintf(stderr, "usage: localfold-rfd4p --job=<spec.json|.yaml> --bundle=<model-rfd4p-int8> [--out=design.pdb|.cif]\n"
-                    "         [--designs=N] [--seed=N] [--f32]\n"
+                    "         [--designs=N] [--seed=N] [--metrics=<file.json>]\n"
+                    "         [--dump-sample=<dir>] [--f32]\n"
                     "       localfold-rfd4p <input dir> --bundle=<model-rfd4p-int8> [--oracle=<dir>] "
                     "[--encoder=<dir>] [--gen=<dir>-gen] [--out=design.pdb] [--designs=N] [--f32]\n");
     return 2;
@@ -541,7 +544,8 @@ int main(int argc, char** argv) {
     // arithmetics' designs are 0.022 A RMS apart (worst 0.059) with 53 of 54 residues identical, against 13 to
     // 23 A between seeds. 3e-2 is that with room; the `--f32` arm holds every row at 1e-4.
     GATE_TRAJ_XT_BOUND = HALF ? 3e-2 : 1e-4;
-    const int ran = generate(genDir, outPath, designs, seed.empty() ? 0 : strtoull(seed.c_str(), nullptr, 10));
+    const int ran = generate(genDir, outPath, designs, seed.empty() ? 0 : strtoull(seed.c_str(), nullptr, 10),
+                             metricsPath, dumpSample);
     printf("  the sampler ran %d steps\n", ran);
     GATE_CHECK = nullptr;
   }

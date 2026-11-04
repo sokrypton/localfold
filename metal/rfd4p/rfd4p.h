@@ -180,7 +180,9 @@ Modality modalitySchedule(const char* tag, int nsteps);
 bool stochasticStep(double t, const Modality& m);
 // a whole generation from an exported `-gen` directory. When `GATE_CHECK` is set, every step's noised state and
 // clean estimate are held to the dump's own trajectory as they are produced.
-int generate(const std::string& genDir, const std::string& outPath, int designs = 1, uint64_t seed = 0);
+// `metricsPath` empty asks for no metrics; `dumpSample` empty, for no sample dump.
+int generate(const std::string& genDir, const std::string& outPath, int designs = 1, uint64_t seed = 0,
+             const std::string& metricsPath = "", const std::string& dumpSample = "");
 // the gate's comparison, set by main where there is an oracle to compare against: ours (on the device) against
 // the dump's tensor `key`, at `bound`, returning the relative RMS. Null when nothing is being held.
 extern double (*GATE_CHECK)(const char* label, const std::string& key, const float* ours, size_t n, double bound);
@@ -200,25 +202,6 @@ void alignChirality(int n, const float* caNm, const float* chirClean, const int*
 // trunk's logits over its TOKEN TYPE's allowed residues. Returns how many it filled.
 int sequenceForDecoder(int n, const float* logits, const int* condSeq, const int* tokenType, const float* emit,
                        int* seq);
-// the decoder's heads turned into a structure: the residue type, which of the 37 slots exist, and their
-// coordinates in angstrom (`decoderPostprocess` + `formatSampleLocalLatents`)
-void decoderPostprocess(int n, const float* caNm, const int* seq, const float* logits, const float* coorsFlat,
-                        const float* presence, const float* emit, const int* coordGroup, const int* attnIdx, int na,
-                        float* coors, uint8_t* atomMask, int* residueType);
-// the input's own per-token naming, where a job named a structure (the featuriser's `outputTables`): absent for
-// a de-novo design, and `present` says which
-struct OutTables {
-  bool present = false;
-  const int* atomize = nullptr; const int* hetero = nullptr; const int* resName = nullptr;
-  const int* inName = nullptr; const int* inElem = nullptr; const int* inCharge = nullptr;
-  const int* insCode = nullptr; const int* entity = nullptr;
-  // b-factor and occupancy are DOUBLES packed as two ints each (the exporter's `packDouble`)
-  const int* inB = nullptr; const int* inOcc = nullptr;
-};
-// a double the exporter packed into two ints, low word first
-double unpackDouble(const int* w);
-// the structure written - mmCIF where the path ends `.cif` (RFD4-Proteina's own format), PDB otherwise - and the
-// consecutive alpha-carbon spacing within a chain (median, min, max) as the geometry check
-int writeStructure(const std::string& path, int n, const float* coors, const uint8_t* atomMask,
-                   const int* residueType, const int* outResId, const int* outChain, const int* chainIid,
-                   double* caSpacing, const OutTables& in);
+// 🔴 THE RECORDS, THE WRITERS AND THE DESIGN METRICS LIVE IN design.h, which pulls in the host half of
+// cuda/rfd4p's own `generate.cuh` and `metrics.h` as metal/rfd4p/derive.sh extracts them at build time. Only the
+// three files that need them include it, since it carries the whole of both.

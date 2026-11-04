@@ -38,7 +38,10 @@ metal/
                  bytes identical to the JavaScript exporter's); a 54-residue design is 60 steps in 3.7 s at
                  CA-CA 3.81 A, half by default with `--f32` the 3.5x slower control. Held stage by stage to
                  cpu/rfd4p/reference.js over those same weights and step by step to its trajectory (`--oracle=`,
-                 `--gen=`; main.mm has the recipe, the speeds and the bounds)
+                 `--gen=`; main.mm has the recipe, the speeds and the bounds). `--metrics=` writes upstream's
+                 design metrics and pre-oracle verdict, `--dump-sample=` the decoded sample a checker reads;
+                 the records, both writers, the insertion grafting and the metrics themselves are cuda/rfd4p's
+                 own code, extracted from it at build time by derive.sh (design.h says why)
   af3/ af2/ ef2/ one per port, flat: the port's kernels (kernels.h, <port>.metal), its stages (*.mm), main.mm,
                  fold, gate.py, gate-baseline.<chip>.json
   bioemu2/       BioEmu2: --job= on af3-any-model's int8 blob, read as the page's bundle through a weight walk
@@ -397,3 +400,46 @@ uses more registers): no error, the output untouched.
    GEMMs' 10-12 - 37% of a 1020-token trunk. docs/M5-HANDOFF.md's last sections have the numbers and what lost.
 5. The pair LayerNorm emitted by the previous GEMM's epilogue (Gemm::lnOut, the matrix units): done for the 128-wide
    pairs on 64 x 128 tiles and the 256-wide on 32 x 256 (05c066c5).
+
+## The writer, the metrics, and the one offset no native port has
+
+`--metrics=` is upstream's own evaluation of a design - the metrics
+`shared/rfd4p/metrics.js` computes and the pre-oracle verdict - and
+`python3 tools/check-metal-rfd4p-writer.py` holds both halves of the output to
+the PAGE's: six presets in both formats against `check-writer.mjs`'s text, and
+their metrics value for value against `design-metrics.mjs`, which is
+cuda/rfd4p/gate.py's `writer` and `metrics` arms pointed at this binary. All
+twelve files and all six metric sets agree.
+
+🔴 **AND THE ARITHMETIC IS cuda/rfd4p's, DERIVED AT BUILD TIME RATHER THAN
+PORTED.** `metrics.h` is already CUDA-free and `generate.cuh` is host code but
+for three kernels, so `metal/rfd4p/derive.sh` extracts the host surface of the
+one and repoints the includes of the other on every build. A declaration that
+moves or changes shape fails the build instead of going stale, which a copy in
+this directory would not - and the copy this port HAD diverged in six separate
+ways that every geometry gate was blind to: atoms named by their atom37 **slot**
+rather than the residue's own atom order, no `HEADER`/`TITLE` and no `TER`, the
+two mmCIF annotation columns missing, coordinates through `snprintf` where the
+reference rounds with `toFixed`, no source component at all, and **no alignment
+to the input's frame**, so a motif design came out in the sampler's centred
+frame and superposed on nothing. Ten green arms and a correct CA-CA spacing
+throughout. The fold did not change when this landed: matched atom for atom, the
+internal distances are flat to the third decimal the writer prints and only the
+centroid moves (0.023 A on a motif job, 0.100 on a PPI, **0.000** on the
+small-molecule one, which has no anchors and so no alignment to do).
+
+🔴 **AND WHAT IS LEFT IS ONE TRANSLATION, AND IT IS NOT THIS PORT'S TO FIX.**
+`shared/rfd4p/output.js` adds `inputAtoms.center_shift` back after aligning -
+the centroid `centerAndFeaturizeCentroid` subtracted when it featurised the
+conditioning - and `alignToInputFrame` has no such step **because the featuriser
+does not export that offset**: `g/coords` and `g/condCoord` both come out
+already centred, measured centroids 1e-7, so there is nothing in a work
+directory to derive it from. It is the whole of what separates this writer from
+the page's - removing it from the page's side makes the two **byte-identical**,
+which is what `tools/rfd4p-writer-unshifted.mjs` asserts - and it is
+sub-milliangstrom only because a test input was already near the origin:
+`test/rfd4p-input-frame.test.js` measures `sm_sam` at over 3 A off it and
+`ppi_pdl1` at 168. It applies wherever there are anchors, so **cuda/rfd4p's
+writer carries the same gap** and `check-writer.mjs` differs there for the same
+reason. The fix is one tensor out of that featuriser and three adds in
+`alignToInputFrame`, both in cuda/.

@@ -11,6 +11,8 @@
 // is exported once. The pair track's first 30 columns - the alpha carbons' distance bins - are rebuilt on the
 // device each step from the current coordinates, which is the one feature that cannot be frozen or replayed.
 #include "rfd4p.h"
+#include "design.h"
+#include <filesystem>
 // 🔴 THE SCHEDULES AND THE RANDOM SOURCE COME FROM cuda/rfd4p's OWN HOST HEADER, not from a second transcription
 // of flow.js. `cuda/rfd4p/src/schedule.h` is plain C++ - no CUDA in it - and carries the time schedules, the
 // noise schedule, the tsr ratio, the stochastic-step rule, and an xorshift128+ whose Box-Muller goes through
@@ -276,7 +278,8 @@ double (*GATE_CHECK)(const char*, const std::string&, const float*, size_t, doub
 double GATE_TRAJ_BOUND = 1e-4;
 double GATE_TRAJ_XT_BOUND = 1e-4;
 
-int generate(const std::string& genDir, const std::string& outPath, int designs, uint64_t seed) {
+int generate(const std::string& genDir, const std::string& outPath, int designs, uint64_t seed,
+             const std::string& metricsPath, const std::string& dumpSample) {
   (void)genDir;
   const int n = D_.n, latent = DD_.latent;
   const size_t nn = (size_t)n * n;
@@ -717,37 +720,87 @@ int generate(const std::string& genDir, const std::string& outPath, int designs,
     decode(feats, attnIdx, na, sd, dLogits, dCoors, dPresence);
     sync();
 
-    std::vector<float> coors((size_t)n * 111, 0.f);
-    std::vector<uint8_t> atomMask((size_t)n * 37, 0);
-    std::vector<int> resType((size_t)n, -1);
-    decoderPostprocess(n, (const float*)host(xBb), seq.data(), (const float*)host(dLogits),
-                       (const float*)host(dCoors), (const float*)host(dPresence), emitBb,
-                       M.has("g/coordGroup") ? M.hostI("g/coordGroup") : nullptr, attn.data(), na, coors.data(),
-                       atomMask.data(), resType.data());
-    double ca[3] = {0, 0, 0};
-    OutTables in;
-    if (M.has("g/outAtomize") && M.has("g/inName")) {
-      in.present = true;
-      in.atomize = M.hostI("g/outAtomize");
-      in.hetero = M.hostI("g/outHetero");
-      in.resName = M.hostI("g/outResName");
-      in.inName = M.hostI("g/inName");
-      in.inElem = M.hostI("g/inElem");
-      in.inCharge = M.hostI("g/inCharge");
-      in.insCode = M.hostI("g/outInsCode");
-      in.entity = M.hostI("g/outEntity");
-      in.inB = M.hostI("g/inB");
-      in.inOcc = M.hostI("g/inOcc");
+    rfd4p::GenOut g = decoderPostprocess(n, (const float*)host(xBb), seq.data(), (const float*)host(dLogits),
+                                         (const float*)host(dCoors), (const float*)host(dPresence), emitBb,
+                                         M.has("g/coordGroup") ? M.hostI("g/coordGroup") : nullptr, attn.data(),
+                                         na);
+    // 🔴 THE SAMPLE, BEFORE ANY OF THE WRITER'S OWN STEPS, so the writer and the metrics can be held to the
+    // page's. `processSampleToAtoms` takes exactly these - the decoded coordinates, the atom mask, the residue
+    // types, the padding and the insertion head's logits - and does the grafting, the alignment and the naming
+    // itself, so cuda/rfd4p/check-writer.mjs and design-metrics.mjs run on this dump and are compared with
+    // what this port wrote from the same numbers. One design's worth: the first, as the NVIDIA port dumps.
+    if (!dumpSample.empty() && design == 0) {
+      std::error_code ec;
+      std::filesystem::create_directories(dumpSample, ec);
+      auto raw = [&](const char* name, const void* p, size_t bytes) {
+        FILE* f = fopen((dumpSample + "/" + name).c_str(), "wb");
+        if (!f) die("cannot write %s/%s", dumpSample.c_str(), name);
+        fwrite(p, 1, bytes, f);
+        fclose(f);
+      };
+      raw("coors.f32", g.coors.data(), g.coors.size() * 4);
+      raw("atomMask.u8", g.atomMask.data(), g.atomMask.size());
+      raw("residueType.i32", g.residueType.data(), g.residueType.size() * 4);
+      raw("pad.f32", M.hostF("in/mask"), (size_t)n * 4);
+      raw("insertion.f32", host(insertion), (size_t)n * n * 4);
     }
-    const int atoms = writeStructure(path, n, coors.data(), atomMask.data(), resType.data(),
-                               M.has("g/outResId") ? M.hostI("g/outResId") : nullptr,
-                               M.has("g/outChain") ? M.hostI("g/outChain") : nullptr,
-                               M.has("g/chainIid") ? M.hostI("g/chainIid") : nullptr, ca, in);
+    OutInput oi;
+    oi.n = n;
+    auto table = [&](const char* key) { return M.has(key) ? M.hostI(key) : nullptr; };
+    oi.outResId = table("g/outResId");
+    oi.outChain = table("g/outChain");
+    oi.chainIid = table("g/chainIid");
+    oi.condIndex = table("g/condIndex");
+    oi.resType = table("g/resType");
+    oi.coords = M.has("g/coords") ? M.hostF("g/coords") : nullptr;
+    oi.condCoord = M.has("g/condCoord") ? M.hostF("g/condCoord") : nullptr;
+    oi.condIntCrd = M.has("g/condIntCrd") ? M.hostF("g/condIntCrd") : nullptr;
+    oi.coordGroup = table("g/coordGroup");
+    // the insertion head's logits from the LAST step, which is the only pass that asked for them
+    oi.insLogits = insertion ? (const float*)host(insertion) : nullptr;
+    if (M.has("g/outAtomize") && M.has("g/inName")) {
+      oi.atomize = table("g/outAtomize");
+      oi.hetero = table("g/outHetero");
+      oi.entity = table("g/outEntity");
+      oi.insCode = table("g/outInsCode");
+      oi.resName = table("g/outResName");
+      oi.srcComp = table("g/outSrcComp");
+      oi.inName = table("g/inName");
+      oi.inElem = table("g/inElem");
+      oi.inCharge = table("g/inCharge");
+      oi.inB = table("g/inB");
+      oi.inOcc = table("g/inOcc");
+    }
+    const Design d = buildDesign(g, oi);
+    const int atoms = writeStructure(path, d);
     int emitted = 0;
     for (int i = 0; i < n; ++i) if (emitBb[i] != 0) emitted += 1;
+    if (d.grafted > 0) {
+      printf("  %d unindexed token%s grafted by the insertion head's mapping\n", d.grafted,
+             d.grafted == 1 ? "" : "s");
+    } else if (d.unindexedUnplaced) {
+      // Upstream warns and writes the design without the motif's annotations; so does this.
+      printf("  WARNING: the insertion head's mapping could not be applied to this design; the unindexed motif "
+             "is written without its annotations\n");
+    }
     printf("generated %d residues, %d atoms over %d steps (%d sequence positions read out) -> %s\n", emitted, atoms,
            steps, filled, path.c_str());
-    printf("  consecutive CA-CA: median %.2f A, min %.2f, max %.2f\n", ca[0], ca[1], ca[2]);
+    printf("  consecutive CA-CA: median %.2f A, min %.2f, max %.2f\n", d.caSpacing[0], d.caSpacing[1],
+           d.caSpacing[2]);
+    // 🔴 AND WHAT UPSTREAM'S EVALUATION WOULD SAY ABOUT IT: the design metrics under the job's own
+    // `metrics_tags`, and the pre-oracle verdict - over the records just written, not a second reading of the
+    // file. One file a design, numbered as the designs are.
+    if (!metricsPath.empty()) {
+      std::string mpath = metricsPath;
+      if (design > 0) {
+        const size_t dot = mpath.rfind('.');
+        mpath = (dot == std::string::npos ? mpath : mpath.substr(0, dot)) + "_" + std::to_string(design + 1) +
+                (dot == std::string::npos ? "" : mpath.substr(dot));
+      }
+      bool pass = false;
+      if (!writeMetrics(mpath, d, n, &pass)) die("--metrics=%s could not be written", mpath.c_str());
+      printf("  metrics -> %s (%s the pre-oracle filters)\n", mpath.c_str(), pass ? "passes" : "fails");
+    }
   }
   }
   return steps;

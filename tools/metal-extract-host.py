@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+"""The host-only declarations a Metal port needs out of a CUDA header, extracted at build time.
+
+    python3 tools/metal-extract-host.py <source> <out.h> <namespace> [--include=<path>]
+                                        [--alias=<qualified>] <symbol>...
+
+🔴 EXTRACTED, NOT COPIED, AND NOT MOVED EITHER. `cuda/rfd4p/src/metrics.h` is host-only C++ - the design metrics
+as shared/rfd4p/metrics.js computes them - and `metal/rfd4p` wants exactly that code rather than a second
+implementation of it. What stops a straight include is one line: metrics.h pulls in `generate.cuh` for
+`AtomRecord` and three helpers, and that file has CUDA kernels in it which clang cannot compile without nvcc.
+
+Three ways out, and this is the third. Copying the struct into the Metal port duplicates a declaration both
+ports must agree on, and a duplicate drifts. Moving it into its own header edits `cuda/`, which another agent is
+working in. Extracting it at BUILD TIME from the one source of truth drifts never: the generated header is
+rewritten on every build, and a symbol that moves or changes shape fails the build rather than going stale.
+
+A symbol is taken whole - from the line its definition starts on to the line its braces balance - with the
+comment block above it, because the comments are where this repository keeps its findings.
+
+🔴 AND `--alias` IS FOR THE SYMBOL THAT MUST *NOT* BE TAKEN. generate.cuh's `jsNumber` is `std::to_chars`,
+whose docstring claims JavaScript's `String(number)` and is not: measured over 800,018 values the two disagree
+on 200,025 - every magnitude below 1e-4 (`1e-05` against `0.00001`), 1e20 and up (`1e+20` against
+`100000000000000000000`), and the exponent's zero padding (`1e-07` against `1e-7`). `cuda/featurise/jsnum.h`
+implements the ECMAScript rules and is checked against V8, so the port aliases that one instead of extracting a
+function whose output would not match the JavaScript this port is held to. The divergence is reported, not
+patched: cuda/ belongs to someone else.
+"""
+import re
+import sys
+
+
+def body_span(text, start):
+    """From a declaration's start, the span through the brace-balanced body.
+
+    The body's opening brace is the first one seen at parenthesis depth 0 - NOT simply the first one, because a
+    parameter's default argument is written `= {}` and `buildRecords` has one, which a scan for the first brace
+    takes as the whole body and stops there. Strings, characters and comments are skipped, since a brace inside
+    any of them is text rather than structure.
+    """
+    i, paren, depth, opened = start, 0, 0, False
+    while i < len(text):
+        c = text[i]
+        if c == '"' or c == "'":
+            quote, i = c, i + 1
+            while i < len(text) and text[i] != quote:
+                i += 2 if text[i] == '\\' else 1
+        elif text.startswith('//', i):
+            i = text.find('\n', i)
+            if i < 0:
+                break
+        elif text.startswith('/*', i):
+            i = text.find('*/', i) + 1
+        elif c == '(':
+            paren += 1
+        elif c == ')':
+            paren -= 1
+        elif c == '{' and paren == 0:
+            depth, opened = depth + 1, True
+        elif c == '}' and paren == 0:
+            depth -= 1
+            if opened and depth == 0:
+                end = text.find('\n', i)
+                return end if end >= 0 else len(text)
+        i += 1
+    return -1
+
+
+def extract(text, symbol):
+    """`symbol`'s definition, braces balanced, with the comment block above it."""
+    m = re.search(r'^(?:inline\s+|static\s+|constexpr\s+)*(?:struct|class|[\w:<>,\s*&]+?)\s+'
+                  + re.escape(symbol) + r'\s*[({]', text, re.M)
+    if not m:
+        raise SystemExit(f'{sys.argv[1]}: no definition of {symbol}')
+    start = m.start()
+    lines = text[:start].split('\n')
+    k = len(lines) - 1
+    while k > 0 and (lines[k - 1].lstrip().startswith(('//', '*', '/*')) or lines[k - 1].strip() == '*/'):
+        k -= 1
+    start -= sum(len(l) + 1 for l in lines[k:len(lines) - 1])
+    end = body_span(text, m.start())
+    if end < 0:
+        raise SystemExit(f'{sys.argv[1]}: unbalanced braces in {symbol}')
+    return text[start:end]
+
+
+def main():
+    if len(sys.argv) < 5:
+        raise SystemExit('usage: metal-extract-host.py <source> <out.h> <namespace> '
+                         '[--include=<path>] [--alias=<qualified>] <symbol>...')
+    source, out, namespace = sys.argv[1], sys.argv[2], sys.argv[3]
+    includes, aliases, symbols = [], [], []
+    for arg in sys.argv[4:]:
+        if arg.startswith('--include='):
+            includes.append(arg[len('--include='):])
+        elif arg.startswith('--alias='):
+            aliases.append(arg[len('--alias='):])
+        else:
+            symbols.append(arg)
+    text = open(source).read()
+    parts = [extract(text, s) for s in symbols]
+    with open(out, 'w') as f:
+        f.write(f'// GENERATED by tools/metal-extract-host.py from {source} - do not edit.\n')
+        f.write('// The host-only declarations this port shares with that file; see the script for why.\n')
+        # 🔴 THE SOURCE'S OWN SYSTEM INCLUDES, not a hand-picked list: an extracted symbol uses whatever that
+        # file includes, and a list written here goes stale silently the moment one of them starts using <map>.
+        f.write('#pragma once\n')
+        for inc in sorted(set(re.findall(r'^#include <([^>]+)>', text, re.M))):
+            f.write(f'#include <{inc}>\n')
+        for extra in ('cmath', 'cstdio', 'string', 'vector'):
+            if f'#include <{extra}>' not in text:
+                f.write(f'#include <{extra}>\n')
+        for inc in includes:
+            f.write(f'#include "{inc}"\n')
+        f.write(f'\nnamespace {namespace} {{\n\n')
+        for a in aliases:
+            f.write(f'using {a};\n')
+        if aliases:
+            f.write('\n')
+        f.write('\n\n'.join(parts))
+        f.write(f'\n\n}}  // namespace {namespace}\n')
+    print(f'{out}: {len(symbols)} declarations from {source}')
+
+
+main()
