@@ -591,8 +591,8 @@ inline OpmSave opmForwardBf(const Opm& m, const real* msa, const real* msaMask, 
   }
   return s;
 }
-template <class PD>   // (PD: the pair gradient's type)
-inline void opmBackwardBf(Opm& m, const OpmSave& s, const real* msaMask, const PD* dpair, real* dmsa) {
+template <class PD, class MD>   // (PD, MD: the pair's and the MSA's gradient types)
+inline void opmBackwardBf(Opm& m, const OpmSave& s, const real* msaMask, const PD* dpair, MD* dmsa) {
   Scratch scratch;
   const int S = s.S, L = s.L, OO = m.O * m.O, LO = L * m.O;
   const size_t rows = (size_t)S * L, pr = (size_t)L * L;
@@ -692,7 +692,7 @@ inline OpmSave opmForward(const Opm& m, const real* msa, const real* msaMask, re
   return s;
 }
 #ifndef GRAD_F64
-inline void opmBackward(Opm& m, const OpmSave& s, const real* msaMask, const bf* dpair, real* dmsa) {
+inline void opmBackward(Opm& m, const OpmSave& s, const real* msaMask, const bf* dpair, bf* dmsa) {
   if (!s.bf) { fprintf(stderr, "opmBackward: a bf16 pair gradient into a float-saved OPM\n"); exit(1); }
   opmBackwardBf(m, s, msaMask, dpair, dmsa);
 }

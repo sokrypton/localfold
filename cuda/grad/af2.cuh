@@ -496,7 +496,8 @@ inline real* bfGetT(size_t n) { return ARENA.get(n); }
 #endif
 inline void toP(const real* x, real* y, size_t n) { GK(cudaMemcpyAsync(y, x, n * sizeof(real), cudaMemcpyDeviceToDevice, STREAM)); }
 inline void fromP(const real* x, real* y, size_t n) { GK(cudaMemcpyAsync(y, x, n * sizeof(real), cudaMemcpyDeviceToDevice, STREAM)); }
-// PD: the pair's running gradient's type - real, or bf16 in BF16 mode (bindcraft2's dp; the MSA's stays float)
+// PD: the running gradients' type - real, or bf16 in BF16 mode (the pair's and the MSA's: bindcraft2 keeps its MSA
+// cotangent float; test-bf16 holds this one to autocast's level)
 template <class PD>
 inline void blockBackwardT(Block& b, const BlockSave& s, const real* msaMask, const real* pairMask,
                            const real* dmsaOut, const real* dpairOut, real* dmsa, real* dpair) {
@@ -507,7 +508,8 @@ inline void blockBackwardT(Block& b, const BlockSave& s, const real* msaMask, co
   auto cloneP = [&](const PD* x, size_t n) { PD* y = getP(n); GK(cudaMemcpyAsync(y, x, n * sizeof(PD), cudaMemcpyDeviceToDevice, STREAM)); return y; };
   PD* dp = getP(pr * Cz);                     // the running gradient of the pair
   toP(dpairOut, dp, pr * Cz);
-  real* dm = clone(dmsaOut, mr * Cm);         // and of the MSA
+  PD* dm = getP(mr * Cm);                     // and of the MSA (bf16 as well in BF16 mode)
+  toP(dmsaOut, dm, mr * Cm);
   // pair transition
   { Range r("bw.pairTrans"); transBackward(b.pairTrans, s.pairT, (const PD*)dp, dp, true); }
   // ending node: pair5 = pair4 + swap(attn(enXn))
@@ -558,15 +560,17 @@ inline void blockBackwardT(Block& b, const BlockSave& s, const real* msaMask, co
   {
     Scratch scratch;
     Range r("bw.col");
-    real* dupdT = ARENA.get(mr * Cm);
+    PD* dupdT = getP(mr * Cm);
     swap01(dm, dupdT, S, L, Cm);
     real* dxn = ARENA.get(mr * Cm);
-    real* dx = ARENA.get(mr * Cm);
+    PD* dx = getP(mr * Cm);
     if (!b.extra) {
-      attnBackward(b.col.at, s.colA, s.colMask, nullptr, dupdT, dxn, nullptr, false);
+      attnBackward(b.col.at, s.colA, s.colMask, nullptr, (const PD*)dupdT, dxn, nullptr, false);
       lnBackward(b.col.qn, s.colQ, dxn, dx, mr, false);
-    } else {
-      gaBackward(b.colg.at, s.colG, s.colMask, dupdT, dxn, false);
+    } else {   // (the global column attention is float throughout)
+      const real* du;
+      if constexpr (BP) { real* t = ARENA.get(mr * Cm); fromP(dupdT, t, mr * Cm); du = t; } else du = dupdT;
+      gaBackward(b.colg.at, s.colG, s.colMask, du, dxn, false);
       lnBackward(b.colg.qn, s.colQ, dxn, dx, mr, false);
     }
     swap01(dx, dm, L, S, Cm, true);
@@ -577,8 +581,8 @@ inline void blockBackwardT(Block& b, const BlockSave& s, const real* msaMask, co
     Range r("bw.row");
     real* dnb = ARENA.zeros(pr * 8);
     real* dxn = ARENA.get(mr * Cm);
-    const real* drow = dm;
-    if (b.dropout) { real* t = clone(dm, mr * Cm); dropout(b, DROP_ROW, t, S, L, Cm, false); drow = t; }
+    const PD* drow = dm;
+    if (b.dropout) { PD* t = cloneP(dm, mr * Cm); dropout(b, DROP_ROW, t, S, L, Cm, false); drow = t; }
     attnBackward(b.row.at, s.rowA, msaMask, s.rowNb, drow, dxn, dnb, false);
     lnBackward(b.row.qn, s.rowQ, dxn, dm, mr, true);
     real* dpn = ARENA.get(pr * Cz);
@@ -586,7 +590,7 @@ inline void blockBackwardT(Block& b, const BlockSave& s, const real* msaMask, co
     lnBackward(b.row.pn, s.rowP, dpn, dp, pr, true);
   }
   if (b.opmFirst) { Range r("bw.opm"); opmBackward(b.opm, s.opm, msaMask, dp, dm); }    // pair1 = pair + opm(msa)
-  GK(cudaMemcpyAsync(dmsa, dm, mr * Cm * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
+  fromP(dm, dmsa, mr * Cm);
   fromP(dp, dpair, pr * Cz);
 }
 // dmsaOut, dpairOut -> dmsa, dpair (written). Every parameter gradient accumulates.
