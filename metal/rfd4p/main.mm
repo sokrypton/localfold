@@ -88,6 +88,27 @@
 // (floor = GFLOP / 12.22 + MB / 131, the arithmetic and the bytes each at their own ceiling and not overlapped,
 // which is why one row reads over 100%.) `tri_ab_hm` moves its 1171 MB at **133 GB/s**, i.e. at the copy
 // ceiling: it is a gate and a transpose of four pair-sized planes and there is nothing in it to speed up.
+// 🔴 AND THAT TABLE'S DENOMINATOR IS OPTIMISTIC: 12.22 TFLOP/s DOES NOT REPRODUCE, which makes every row
+// above read lower than it should. Re-measured on the projection's own shapes (`metal/bench 1024 <rows> 384
+// 0,1000000`): **10.53 TFLOP/s at 27225 rows** (the shape the 12.22 was taken on), 10.67 at 32400 and 11.90
+// at 10000. So the ceiling is shape- and thermal-dependent and the honest reading of the table is that these
+// kernels are AT it rather than 94-97% of it. Nothing in the table changes direction; the margin shrinks.
+//
+// 🔴 AND THE BIGGEST ITEM IS CONFIRMED AT THE CEILING BY A SECOND, INDEPENDENT INSTRUMENT. core's
+// `LOCALFOLD_DUP` prices the 14 triangle-gate calls of a pass at **31.2 ms** at 180 tokens (ABBA, GPU-busy a
+// pass, control sd 0.27%), against 14 x 25.48 GFLOP = 356.7 GFLOP - i.e. **11.43 TFLOP/s in situ, where the
+// standalone bench of the identical multiply reaches 10.67**. The kernel in the trunk is FASTER than the
+// isolated measurement of its own product, because the trunk keeps enough other work in flight to hide what
+// the standalone run cannot. Two instruments (buffer-per-dispatch profile 22.1%, batched marginal cost
+// 25.1%) and a roofline now agree, which is the first cross-check this port's step attribution has had.
+//
+// 🔴 AND THE ONE CHANGE THAT FOLLOWED FROM IT WAS WORTH ZERO, which is recorded in trunk.mm beside the call:
+// the same GEMM is **10.8% faster standalone** when its rows are blocked at 10800 (11.88 TFLOP/s against
+// 10.57 for one call over all 32400), it is bit-identical blocked, and in the trunk it is worth **+0.1%,
+// +0.0%, +0.0%**. The duplication number had already said so - 31.2 ms measured against a 33.4 ms standalone
+// floor means the overlap was ALREADY recovering it - so the lesson is to read the marginal cost against the
+// bench BEFORE writing the optimisation: a standalone GEMM win is not a trunk win on a GPU that is full.
+//
 // 🔴 AND THE BATCHED PROJECTION - THE BIGGEST ITEM, 22% - IS THE FASTEST FORM OF THAT PRODUCT ON THIS
 // MACHINE, which is worth setting out at length because "22% of a step" invites one more attempt at it. Every
 // lever, measured:

@@ -332,6 +332,25 @@ static bool triangle(const std::string& prefix, Z z, bool outgoing, const half* 
     // ...and not for the bias, whose [4T] f32 order the epilogue takes but no checkpoint has, nor for `--f32`,
     // whose whole point is that the arithmetic is float where this epilogue's operands are half.
     if (fused && HALF && !anyBias) {
+      // 🔴 AND ROW-BLOCKING THIS GEMM IS WORTH 10.8% STANDALONE AND **ZERO** HERE, which is the measurement
+      // that closes the biggest item in a step rather than a change to it. Its rate on this M5 is not flat in
+      // the row count: standalone on the shape itself (`metal/bench 1024 <rows> 384 0,1000000`) 4050 rows run
+      // at 11.10 TFLOP/s, 8100 at 11.82, 10800 at 11.88, 16200 at 10.34 and the whole 32400 at 10.57 - so one
+      // call over every pair looks like it leaves 11% on the table, and interleaved it really does: three
+      // rounds of 2.406/2.403/2.401 ms whole against 2.145/2.139/2.148 for 3 x 10800, **+10.8/+11.0/+10.5%**.
+      // `gemmTriGate` already takes a row RANGE (`r0`, `rows`) - its epilogue indexes the mask and both
+      // outputs by the ABSOLUTE pair index `tgR0 + jg` while the GEMM reads B at the LOCAL row - so blocking
+      // is `zn` advanced by `r0 * P` and nothing else, and it was bit-identical over a full 60-step design
+      // (same md5) and green on the oracle at n = 100, 257 and 400.
+      //
+      // In the trunk it is worth **+0.1%, +0.0%, +0.0%** a pass (ABBA, n = 180, GPU-busy a pass, control sd
+      // 0.27%). Reverted, numbers kept. AND THE REASON IS THE USEFUL PART, because it was already measured
+      // before the change: `LOCALFOLD_DUP="triangle gate"` prices these 14 calls at **31.2 ms** a pass, where
+      // 14 x 25.48 GFLOP at the standalone bench's own 10.67 TFLOP/s on this shape is **33.4 ms**. The kernel
+      // in situ was ALREADY running at 11.43 TFLOP/s - above the rate the isolated benchmark of the identical
+      // multiply achieves - because the trunk keeps enough other work in flight to hide exactly the
+      // inefficiency blocking removes. So there was nothing to recover, the duplication knob said so first,
+      // and a standalone GEMM win is not a trunk win whenever the GPU is already full.
       gemmTriGate(zn, triGateWeight(prefix, T, P), triGateOnes(nn), aT, bT, 0, nn, T, nn, n, n, nullptr, true, P);
     } else {
     half* ab4 = scratch<half>("tri.ab4H", nn * 4 * T);
