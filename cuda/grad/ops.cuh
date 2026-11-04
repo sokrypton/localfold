@@ -26,8 +26,10 @@ struct LayerNorm {
 
 // an element as real, from real or (float builds) bf16 storage
 __device__ __forceinline__ real ldr(const real* p) { return *p; }
+__device__ __forceinline__ void str(real* p, real v) { *p = v; }
 #ifndef GRAD_F64
 __device__ __forceinline__ float ldr(const bf* p) { return __bfloat162float(*p); }
+__device__ __forceinline__ void str(bf* p, float v) { *p = __float2bfloat16(v); }
 #endif
 // one warp a row; mean and rstd saved for the backward
 template <class Y, class XC = Y>   // (Y: real, or bf where a module keeps its normalised input in bf16; xc, when not
@@ -98,9 +100,9 @@ inline LnSave lnForward(const LayerNorm& ln, const real* x, bf* y, size_t rows) 
 #endif
 // the same with C = 32 N: a lane holds its N channels of the row (x and dy read once) and its own partial dg, db
 // across every row it takes; the block's warps reduce through shared memory once, at the end
-template <int N, class X = real, class DY = real>
+template <int N, class X = real, class DY = real, class DX = real>   // (DX bf16: a bf16 running gradient)
 __global__ void lnBwdRegK(const X* __restrict__ x, const DY* __restrict__ dy, const real* __restrict__ g,
-                          const real* __restrict__ mean, const real* __restrict__ rstd, real* __restrict__ dx,
+                          const real* __restrict__ mean, const real* __restrict__ rstd, DX* __restrict__ dx,
                           real* __restrict__ dg, real* __restrict__ db, size_t rows, bool accumulate) {
   constexpr int C = 32 * N;
   extern __shared__ real sh[];           // [warps][2 C]
@@ -125,8 +127,8 @@ __global__ void lnBwdRegK(const X* __restrict__ x, const DY* __restrict__ dy, co
 #pragma unroll
     for (int k = 0; k < N; ++k) {
       real v = rs * (dv[k] * gg[k] - s1 - xh[k] * s2);
-      real& o = dx[r * C + lane + 32 * k];
-      o = accumulate ? o + v : v;
+      DX* o = dx + r * C + lane + 32 * k;
+      str(o, accumulate ? ldr(o) + v : v);
     }
   }
 #pragma unroll
@@ -143,13 +145,13 @@ __global__ void lnBwdRegK(const X* __restrict__ x, const DY* __restrict__ dy, co
 __global__ void bfToFK(const bf* x, float* y, size_t n);
 inline void lnBackward(LayerNorm& ln, const LnSave& s, const real* dy, real* dx, size_t rows, bool accumulate);
 // x from its bf16 copy (s.xb) and/or dy in bf16, where C is a multiple of 32 the register kernel covers
-template <class DY>
-inline bool lnBackwardBf(LayerNorm& ln, const LnSave& s, const DY* dy, real* dx, size_t rows, bool accumulate) {
+template <class DY, class DX = real>
+inline bool lnBackwardBf(LayerNorm& ln, const LnSave& s, const DY* dy, DX* dx, size_t rows, bool accumulate) {
   unsigned gr = (unsigned)std::min<size_t>(blocks(rows, 8), 1024);
   const size_t sh = 8 * 2 * ln.C * sizeof(real);
   const bf* xb = static_cast<const bf*>(s.xb);
-#define LNREGB(N) case N: if (xb) lnBwdRegK<N, bf, DY><<<gr, 256, sh, STREAM>>>(xb, dy, ln.g.w, s.mean, s.rstd, dx, ln.g.g, ln.b.g, rows, accumulate); \
-                          else lnBwdRegK<N, real, DY><<<gr, 256, sh, STREAM>>>(s.x, dy, ln.g.w, s.mean, s.rstd, dx, ln.g.g, ln.b.g, rows, accumulate); return true;
+#define LNREGB(N) case N: if (xb) lnBwdRegK<N, bf, DY, DX><<<gr, 256, sh, STREAM>>>(xb, dy, ln.g.w, s.mean, s.rstd, dx, ln.g.g, ln.b.g, rows, accumulate); \
+                          else lnBwdRegK<N, real, DY, DX><<<gr, 256, sh, STREAM>>>(s.x, dy, ln.g.w, s.mean, s.rstd, dx, ln.g.g, ln.b.g, rows, accumulate); return true;
   if (ln.C % 32 == 0 && sh <= 48 * 1024) switch (ln.C / 32) { LNREGB(1) LNREGB(2) LNREGB(3) LNREGB(4) LNREGB(6) LNREGB(8) LNREGB(12) default: break; }
 #undef LNREGB
   return false;
@@ -162,6 +164,13 @@ inline void lnBackward(LayerNorm& ln, const LnSave& s, const bf* dy, real* dx, s
   LnSave f = s; f.xb = nullptr;
   if (s.xb) { real* xf = ARENA.get(rows * ln.C); bfToFK<<<blocks(rows * ln.C), 256, 0, STREAM>>>(static_cast<const bf*>(s.xb), xf, rows * ln.C); f.x = xf; }
   lnBackward(ln, f, t, dx, rows, accumulate);
+}
+// into a bf16 running gradient (BF16 mode's pair track)
+template <class DY>
+inline void lnBackward(LayerNorm& ln, const LnSave& s, const DY* dy, bf* dx, size_t rows, bool accumulate) {
+  if (lnBackwardBf(ln, s, dy, dx, rows, accumulate)) return;
+  fprintf(stderr, "lnBackward into bf16: C %d has no register kernel\n", ln.C);
+  exit(1);
 }
 #endif
 inline void lnBackward(LayerNorm& ln, const LnSave& s, const real* dy, real* dx, size_t rows, bool accumulate) {

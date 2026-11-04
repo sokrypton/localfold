@@ -42,12 +42,15 @@ inline GtSave gtForwardBf(const GatedTransition& t, const real* x, real* out, si
   linearFwdBf(t.t2, g, out, rows, beta);
   return s;
 }
-inline void gtBackwardBf(GatedTransition& t, const GtSave& s, const real* dout, real* dx) {
+// (PD: the running gradient's type - real, or bf16 where BF16 mode keeps the pair track's gradient so)
+template <class PD>
+inline void gtBackwardBf(GatedTransition& t, const GtSave& s, const PD* dout, PD* dx) {
   Scratch scratch;
   const size_t rows = s.rows;
   const bf *xb = static_cast<const bf*>(s.xb), *hb = static_cast<const bf*>(s.hb);
   const bf* g = static_cast<const bf*>(s.gb);
-  const bf* db = toBf(dout, rows * t.C);
+  const bf* db;
+  if constexpr (sizeof(PD) == 2) db = dout; else db = toBf(dout, rows * t.C);
   bf* dg = bfGet(rows * t.F);
   linearBwdBf(t.t2, g, db, dg, rows);
   bf* dh = bfGet(rows * 2 * t.F);
@@ -73,6 +76,9 @@ inline GtSave gtForward(const GatedTransition& t, const real* x, real* out, size
   return s;
 }
 // dout -> dx (added)
+#ifndef GRAD_F64
+inline void gtBackward(GatedTransition& t, const GtSave& s, const bf* dout, bf* dx) { gtBackwardBf(t, s, dout, dx); }
+#endif
 inline void gtBackward(GatedTransition& t, const GtSave& s, const real* dout, real* dx) {
 #ifndef GRAD_F64
   if (s.xb) { gtBackwardBf(t, s, dout, dx); return; }
@@ -183,8 +189,9 @@ inline GridSave gridForwardBf(const GridAttn& g, const Dialect& d, const real* p
   swap01(t, out, n, n, g.C, true);
   return s;
 }
+template <class PD>
 inline void gridBackwardBf(GridAttn& g, const Dialect& d, const GridSave& s, const real* mask, const real* maskT,
-                           const real* dout, real* dpair) {
+                           const PD* dout, PD* dpair) {
   Scratch scratch;
   const int n = s.n, HD = g.H * g.D;
   const size_t nn = (size_t)n * n;
@@ -192,9 +199,13 @@ inline void gridBackwardBf(GridAttn& g, const Dialect& d, const GridSave& s, con
            *qkvg = reinterpret_cast<const bf*>(s.qkvg);
   const int P = 4 * HD;
   const bf *q = qkvg, *k = q + HD, *v = k + HD, *gt = v + HD, *W = reinterpret_cast<const bf*>(s.W);
-  const real* dy = dout;
-  if (g.transpose && !g.untransposedResidual) { real* t = ARENA.get(nn * g.C); swap01(dout, t, n, n, g.C); dy = t; }
-  const bf* dyb = toBf(dy, nn * g.C);
+  const PD* dy = dout;
+  if (g.transpose && !g.untransposedResidual) {
+    PD* t = reinterpret_cast<PD*>(sizeof(PD) == 2 ? (real*)bfGet(nn * g.C) : ARENA.get(nn * g.C));
+    swap01(dout, t, n, n, g.C); dy = t;
+  }
+  const bf* dyb;
+  if constexpr (sizeof(PD) == 2) dyb = dy; else dyb = toBf(dy, nn * g.C);
   const bf* og = static_cast<const bf*>(s.og);
   real* dog = ARENA.get(nn * HD);
   linearBwdBf(g.out, og, dyb, dog, nn);
@@ -263,6 +274,12 @@ inline GridSave gridForward(const GridAttn& g, const Dialect& d, const real* pai
   swap01(t, out, n, n, g.C, true);
   return s;
 }
+#ifndef GRAD_F64
+inline void gridBackward(GridAttn& g, const Dialect& d, const GridSave& s, const real* mask, const real* maskT,
+                         const bf* dout, bf* dpair) {
+  gridBackwardBf(g, d, s, mask, maskT, dout, dpair);
+}
+#endif
 inline void gridBackward(GridAttn& g, const Dialect& d, const GridSave& s, const real* mask, const real* maskT,
                          const real* dout, real* dpair) {
 #ifndef GRAD_F64
@@ -346,8 +363,9 @@ inline SingleSave singleForward(const SingleAttn& a, const real* single, const r
   return s;
 }
 // dout [n, Cs] -> dsingle (added), dpair (added); dextra [n, n] (added, may be null)
+template <class PD>   // (PD: the pair gradient's type)
 inline void singleBackward(SingleAttn& a, const SingleSave& s, const real* seqMask, const real* dout, real* dsingle,
-                           real* dpair, real* dextra) {
+                           PD* dpair, real* dextra) {
   Scratch scratch;
   const int n = s.n, HD = a.H * a.D;
   size_t nn = (size_t)n * n;
@@ -535,6 +553,28 @@ inline void pairformerBackward(Pairformer& b, const Dialect& d, const Pairformer
     GK(cudaMemcpyAsync(dpair, dIn, nn * Cz * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
     return;
   }
+#ifndef GRAD_F64
+  if (BF16) {   // the pair track's running gradient in bf16 (bindcraft2's dp): every module reads it and adds into it
+    bf* dpb = toBf(dpairOut, nn * Cz);
+    if (b.hasSingle) {
+      Range r_("bw.single");
+      const int Cs = b.single.C;
+      real* ds = cloneR(dsingleOut, (size_t)n * Cs);
+      gtBackward(b.singleTrans, s.st, dsingleOut, ds);
+      { Scratch sc; real* dsa = cloneR(ds, (size_t)n * Cs); singleBackward(b.single, s.sa, seqMask, dsa, ds, dpb, dextra); }
+      GK(cudaMemcpyAsync(dsingle, ds, (size_t)n * Cs * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
+    }
+    { Range r_("bw.pairTrans"); gtBackward(b.pairTrans, s.pt, dpb, dpb); }
+    if (b.hasGrid) {
+      { Range r_("bw.grid2"); gridBackward(b.grid2, d, s.g2, pairMask, maskT, dpb, dpb); }
+      { Range r_("bw.grid1"); gridBackward(b.grid1, d, s.g1, pairMask, maskT, dpb, dpb); }
+    }
+    { Range r_("bw.triIn"); triMulBackward(b.triIn, s.tIn, pairMask, dpb, dpb); }
+    { Range r_("bw.triOut"); triMulBackward(b.triOut, s.tOut, pairMask, dpb, dpb); }
+    bfToFK<<<blocks(nn * Cz), 256, 0, STREAM>>>(dpb, dpair, nn * Cz);
+    return;
+  }
+#endif
   if (b.hasSingle) {
     Range r_("bw.single");
     const int Cs = b.single.C;

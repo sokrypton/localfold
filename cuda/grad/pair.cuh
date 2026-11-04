@@ -206,7 +206,8 @@ __global__ void mergeGateBwdLdBfK(const bf* __restrict__ dab, const bf* __restri
 }
 // out = pre_out * og, og at row stride P: dpre_out = dy og (contiguous), d og_pre = dy pre_out og (1 - og) at P
 // (gGating: the output gate's bias gradient, summed here: a block 32 columns x 8 row lanes, rows strided)
-__global__ void outGateBwdLdBfK(const real* dy, const real* a, const bf* og, bf* da, bf* dgl, size_t rows, int C,
+template <class DY>
+__global__ void outGateBwdLdBfK(const DY* dy, const real* a, const bf* og, bf* da, bf* dgl, size_t rows, int C,
                                 int P, float* gGating) {
   __shared__ float part[8][32];
   const int c = blockIdx.x * 32 + threadIdx.x;
@@ -214,9 +215,9 @@ __global__ void outGateBwdLdBfK(const real* dy, const real* a, const bf* og, bf*
   if (c < C)
     for (size_t r = blockIdx.y * 8 + threadIdx.y; r < rows; r += (size_t)gridDim.y * 8) {
       const size_t t = r * C + c, i = r * P + c;
-      const float s = bfv(og[i]);
-      da[t] = __float2bfloat16(dy[t] * s);
-      const bf g = __float2bfloat16(dy[t] * a[t] * s * (1.f - s));
+      const float s = bfv(og[i]), y = bfv(dy[t]);
+      da[t] = __float2bfloat16(y * s);
+      const bf g = __float2bfloat16(y * a[t] * s * (1.f - s));
       dgl[i] = g;
       acc += __bfloat162float(g);
     }
@@ -269,7 +270,8 @@ inline TriMulSave triMulForwardBf(const TriMul& m, const real* pair, const real*
   s.ab = reinterpret_cast<real*>(ab); s.cn = reinterpret_cast<real*>(cn); s.og = nullptr;
   return s;
 }
-inline void triMulBackwardBf(TriMul& m, const TriMulSave& s, const real* mask, const real* dout, real* dpair) {
+template <class PD>   // (PD: the running gradient's type)
+inline void triMulBackwardBf(TriMul& m, const TriMulSave& s, const real* mask, const PD* dout, PD* dpair) {
   Scratch scratch;
   const int L = s.L, I2 = 2 * m.I, P = 2 * I2 + m.C;
   const size_t rows = (size_t)L * L;
@@ -362,6 +364,11 @@ inline TriMulSave triMulForward(const TriMul& m, const real* pair, const real* m
   return s;
 }
 
+#ifndef GRAD_F64
+inline void triMulBackward(TriMul& m, const TriMulSave& s, const real* mask, const bf* dout, bf* dpair) {
+  triMulBackwardBf(m, s, mask, dout, dpair);
+}
+#endif
 inline void triMulBackward(TriMul& m, const TriMulSave& s, const real* mask, const real* dout, real* dpair) {
 #ifndef GRAD_F64
   if (s.bf) { triMulBackwardBf(m, s, mask, dout, dpair); return; }
