@@ -418,11 +418,19 @@ LENGTHS = [1, 2, 7, 53, 100]
 # builds one. It never builds one itself and never counts an unbuilt length as a pass: a skipped length
 # reported green is the vacuous row this tree warns about, and an unstated gap is worse than a stated one.
 LONG_LENGTHS = [257, 400]
-# 🔴 MEASURED, AND 257 WAS THE ONE WORTH THE TWO HOURS: **100 comparisons green at n = 1, 2, 7, 53, 100
-# and 257**, so the length the reference gate's own note singles out as one ulp out in ITS featuriser is
-# exact in this port's stage oracle - its `0.2f` centering scale is not a difference this port inherits.
-# With the port's own 67, 183 and 250, the arithmetic is verified at eight lengths from 1 to 257. 400's
-# reference is ~7 h of CPU forward and is the one row still unbuilt.
+# 🔴 MEASURED, AND BOTH ARE GREEN: **100 comparisons at every one of n = 1, 2, 7, 53, 100, 257 and 400** -
+# the whole of the reference gate's `FEATURISE_LENGTHS`, with nothing omitted. 257 was the one worth waiting
+# for: it is the length that gate's own note singles out as one ulp out in ITS featuriser, and this port's
+# stage oracle is exact there, so its `0.2f` centering scale is not a difference this port inherits. With
+# the port's own 67, 183 and 250 that is nine lengths from 1 to 400.
+#
+# 🔴 AND 400 FAILED FIRST, FOR A REASON THAT WAS NOT THE PORT: "cannot read .../model.bin". Its stage oracle
+# is 3,972,644,800 bytes and `pread` with a count above INT_MAX fails outright with EINVAL on Darwin rather
+# than returning a short read, so `Model::loadInput` died having read nothing - and the message reads exactly
+# like a corrupt file. Fixed in metal/core/model.cpp (1 GiB a call); no oracle over 2 GiB could be opened
+# before it, which is a ceiling on verification that nothing else here would have found, because 400 tokens
+# is the first case big enough to cross it. Peak 8.44 GB for that run (the oracle buffer plus the fold), so
+# it needs a 16 GB machine.
 
 
 def lengths_arm():

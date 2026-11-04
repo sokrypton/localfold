@@ -7,6 +7,8 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <algorithm>
+#include <cerrno>
 #include <cstring>
 #include <fstream>
 #include <sstream>
@@ -684,9 +686,17 @@ void Model::loadInput(const std::string& dir) {
   inputBuffers.push_back(buf);
   sync();                                   // (the buffer is written on the host)
   char* h = (char*)host(buf);
+  // 🔴 AT MOST 1 GiB A CALL, BECAUSE macOS REFUSES A LARGER ONE. `read`/`pread` with a count above INT_MAX
+  // fails outright with EINVAL on Darwin and the BSDs - it does not return a short read - so asking for the
+  // whole file in one call fails on the FIRST attempt for any input over 2 GiB and the loop dies having read
+  // nothing. That is why the 400-token stage oracle could not be opened at all: 3,972,644,800 bytes, and the
+  // error ("cannot read .../model.bin") looks exactly like a corrupt or truncated file rather than a limit in
+  // the reader. The offsets themselves are in WORDS (993,161,200 at that size) and fit in an int, so nothing
+  // else here overflows; it is only the byte count handed to one call.
   for (size_t got = 0; got < bytes;) {
-    ssize_t r = pread(fd, h + got, bytes - got, (off_t)got);
-    if (r <= 0) die("cannot read %s/model.bin", dir.c_str());
+    const size_t want = std::min<size_t>(bytes - got, (size_t)1 << 30);
+    ssize_t r = pread(fd, h + got, want, (off_t)got);
+    if (r <= 0) die("cannot read %s/model.bin (%zu of %zu bytes, errno %d)", dir.c_str(), got, bytes, errno);
     got += (size_t)r;
   }
   close(fd);
