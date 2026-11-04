@@ -36,12 +36,9 @@ lesson is a check that cannot vary the thing under test.
   * `refusals` 23/23 by name, and the control holds (a valid spec still folds 60 steps at CA-CA 3.80 A).
   * `smallmol` green, 14 comparisons - so chiral frames, the one sequence feature besides the noised
     state that moves between steps, are right.
-  * `inverse` is RIGHT, and getting there took retracting a conclusion twice - the record is below,
-    because both wrong readings are traps this gate will set again for the next person.
-    It reproduces the given backbone at **0.0005 A** Kabsch RMSD over 67 CAs, which is exactly what
-    inverse folding is for: the structure is handed back clean at the last step and only the sequence
-    is designed (`inverseArm` checks this, and it is the only check of that feature that means
-    anything).
+  * `inverse` returns its own target at **0.0005 A**, which is SELF-CONSISTENCY and not correctness -
+    see the unresolved item below. Two earlier conclusions about this arm were retracted on the way
+    (recorded below, because both are traps this gate will set again).
 🔴 TWO RETRACTED CONCLUSIONS, AND WHY A CHAIN CHECK CANNOT JUDGE THESE TWO MODES.
   * RETRACTED: `inverse` is not broken. Its 23.09 A chain reading is the TARGET'S OWN geometry: this
     preset's contig is `5-20,A16-35,10-25,A52-71,5-20`, so its 67 tokens are not sequential residues of
@@ -67,6 +64,37 @@ the two emit masks are identical here (`e/emit` and `g/emitLl`, 67 of 67 both wa
 identity); `g/noise` is 8780 floats = 2144 encoder eps + 201 bb + 2144 ll + 3 group + 2 x 2144 per step,
 exactly the port's own layout, so the replayed stream is not shifted; and the encoder is EXACT - mean
 1.02e-3, logScale 8.20e-4, zLatent 1.02e-3, 90 comparisons green against its own stage oracle.
+
+🔴 THE ONE THING STILL OPEN, AND IT IS THE CLEAN TARGET `x1` OF THE TWO CORRUPTED MODES. Both arms'
+`bb_ca` trajectory rows disagree with the reference (partial `step 0 xt bb_ca` 3.700, inverse 2.675)
+while their latents agree (inverse `step 0 xt latents` 2.5e-4). Ruled out, each with a measurement, so
+the next person does not pay for it twice: the draw ORDER matches `corruptBatch`'s documented order
+(encoder eps, bb x0, ll x0, per-group offsets - sampler.mm and partial.js agree line for line); the step
+COUNT matches (the oracle holds `gen/s0` and `gen/s1` only, so both sides ran 2); the SCHEDULE branch
+matches (the port's `partialSchedule` and `buildPartialSchedule` both slice the last nsteps+1 times off
+the full schedule, and the port's `ts[0] == pt` assertion passes, so `frac` was non-null on both sides);
+the ENCODER is exact (mean 1.02e-3, logScale 8.20e-4, 90 stages green); the replayed stream has exactly
+the port's layout (8780 floats = 2144 encoder eps + 201 bb + 2144 ll + 3 group + 2 x 2144 per step); and
+the emit masks are identical (`e/emit` and `g/emitLl`, 67 of 67).
+
+What is left is WHICH TENSOR IS THE CLEAN BACKBONE. The reference builds its `x1.bb_ca` from
+`batch.coords_nm` at the atom37 CA slot (`(i * 37 + 1) * 3`, cpu/rfd4p/reference.js). The port's partial
+branch reads `in/caNm`, calling it "the input's own alpha carbons" - and the exporter's own comment over
+that tensor says "`caNm` IS THE SAMPLE'S CA, NOT THE TRUNK'S OUTPUT". The two candidates in the export
+are not the same thing and neither is clearly right:
+
+  tensor                      own CA-CA chain        vs the reference's gen/s0Bb (Kabsch)
+  in/caNm                     median 22.99 A          20.30 A
+  e/coorsNm at atom37 CA      median  3.80 A          10.54 A
+
+So `in/caNm` is not a protein backbone in token order while `e/coorsNm`'s CA is - which points at the
+port reading the wrong tensor. It is NOT closed, for two reasons: substituting `e/coorsNm` still leaves
+10.5 A to the reference's own state, and the two may simply be in different TOKEN LAYOUTS (this preset's
+contig `5-20,A16-35,10-25,A52-71,5-20` expands and reorders segments, so consecutive-token distance is
+not consecutive-residue distance and 22.99 A may be correct for a clean structure in contig order).
+Settling it needs the reference's `x1.bb_ca` dumped directly, which `export_input.mjs` does not write.
+Both tensors are byte-identical between the JS exporter and the native featuriser, so this is not an
+export-versus-production split.
 
 🔴 AND IT DOES NOT ACCEPT ANYBODY'S TERMS. The exporter that builds these references reads a float32
 checkpoint, and NVIDIA's `model.safetensors` asks for terms this gate will not accept on a user's behalf;
@@ -195,8 +223,14 @@ def inverse_arm():
           if l.startswith("ATOM") and l[12:16].strip() == "CA"]
     n = min(len(ca), len(tgt) // 3)
     rms = kabsch([[10 * tgt[i * 3 + k] for k in range(3)] for i in range(n)], ca[:n])
-    # 0.0005 A measured; 0.05 A is room for the half-precision arm without admitting a different backbone
-    return rms < 0.05, f"returns the given backbone at {rms:.4f} A over {n} CAs (superposed)"
+    # 🔴 THIS IS SELF-CONSISTENCY, NOT CORRECTNESS, AND IT MUST NOT BE READ AS THE SECOND. It compares the
+    # port's output against `in/caNm` - the SAME tensor the port's partial/inverse branch takes as its clean
+    # target - so a port that took the wrong tensor and returned it faithfully scores 0.0005 A here, which is
+    # what this does score. The header says what is unresolved about that tensor. The arm is kept because a
+    # REGRESSION in the return path still shows (it reads 17.52 A against a mode that generates instead of
+    # returning, a 35,000x separation), and it is bounded loosely for the same reason.
+    return rms < 0.05, (f"returns ITS OWN target at {rms:.4f} A over {n} CAs (superposed) - "
+                        f"self-consistency only, see the header")
 
 
 def read_tensor(d, name):
