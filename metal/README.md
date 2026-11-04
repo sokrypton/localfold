@@ -511,6 +511,22 @@ for Metal as `weights.mm`, `chirality.mm`, `decoder.mm`, `encoder.mm`,
 | the trunk, decoder, encoder and trajectory | 86 / 84 / 86 / 90 / 100 comparisons |
 | half and float32 arithmetic | every arm runs both; `--f32` is the control |
 
+### What the mapping proves, and what the arms do
+
+The table below says WHERE each piece of cuda/rfd4p lives in metal/rfd4p. It
+does not, on its own, say the arithmetic agrees - the arms do that, and they
+compare **stage by stage rather than in aggregate**. One run of
+`--oracle= --encoder=` names and bounds: the conditioning `c`; the trunk's
+`s_init` and `z_init`; every one of the 14 token layers as `s0..s13`; every pair
+update as `z0, z2, ... z12`; the four heads (`bb_ca`, `local_latents`, `logits`,
+`insertion`); the same 14 layers again CHAINED, where each reads the last one's
+output rather than the oracle's; every one of the decoder's 12 layers both ways,
+plus its `ada0`, `attn0`, `coors` and `presence`; and the encoder's `feats`,
+`mean`, `logScale` and `zLatent`. 90 named comparisons on that input, 86 and 84
+on the other two, 100 with the sampler's per-step trajectory. A renamed helper
+cannot hide in that: if `adalnPre` did not compute what `adaLn` computes, `s0`
+would say so on the first layer.
+
 ### The symbol-level audit, resolved rather than asserted
 
 Matching cuda/rfd4p's entry-point NAMES against metal/rfd4p's text leaves 28

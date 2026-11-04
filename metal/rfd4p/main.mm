@@ -24,7 +24,11 @@
 // (0.9%). What remains, with what each is against: the fused triangle gate 25.0% (the matrix units' 12.22
 // TFLOP/s, which the plain projection already reached at 97%), the gated add 15.7% (106% of
 // `GFLOP / 12.22 + MB / 131`, so at the roofline once its 1.17 GB epilogue is paid), the pair transition 10.1%
-// (10.4 TFLOP/s), and then nothing above 3.6% - the centre norm, the two contractions, the pair write, the
+// (10.2 TFLOP/s, and its tile is swept too: six matrix arms interleaved on its exact shape give 1.411 ms for
+// 64 x 128 against a 1.418 default and 1.482 / 1.606 / 1.810 / 1.817 for the rest, so the default is the best
+// there as well, and the trunk's 1.573 ms a call is the 0.16 ms its gated-residual epilogue costs - three
+// extra pair-sized planes whose 62.7 MB would be 0.48 ms unoverlapped, so two thirds of it is already hidden),
+// and then nothing above 3.6% - the centre norm, the two contractions, the pair write, the
 // bias projection, the triangle's doubled input norm. The two things that would move it further are named
 // above and below: core's norm-emitting epilogue on the matrix path (<= 1.2%), and a second triangle shape,
 // which the 400-token scaling says is not needed.
