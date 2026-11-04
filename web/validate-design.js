@@ -41,6 +41,8 @@ export const FOLDERS = { af3: "af3", boltz2: "boltz2", protenix2: "protenix2", o
  * @param {object} options.device
  * @param {"webgl2"} [options.backend] fold with WebGL2 instead (no WebGPU device; `device` unused)
  * @param {number} [options.seed]
+ * @param {number} [options.recycles] trunk recycles, 3 by default as on the fold page (it was 0 here: none were asked)
+ * @param {number} [options.steps] diffusion steps, AF3_COUNTS.diffusion.preferred (25) by default
  * @param {(text: string) => void} [options.status]
  * @param {AbortSignal} [options.signal]
  * @returns {Promise<object>} the refold's confidence, its RMSD to the design, the refold in the
@@ -48,7 +50,7 @@ export const FOLDERS = { af3: "af3", boltz2: "boltz2", protenix2: "protenix2", o
  *   refoldOverlay)
  */
 export async function refoldDesign(options) {
-  const { pdb, chain, model, device, seed = 0, signal } = options;
+  const { pdb, chain, model, device, seed = 0, signal, recycles = 3, steps = AF3_COUNTS.diffusion.preferred } = options;
   const status = options.status ?? (() => {});
   if (FOLDERS[model] === undefined) {
     throw new Error(`no folding model ${model} (have ${Object.keys(FOLDERS).join(", ")})`);
@@ -65,7 +67,8 @@ export async function refoldDesign(options) {
     backend: options.backend,
     signal,
     seed,
-    calls: AF3_COUNTS.diffusion.preferred,
+    calls: steps,
+    recycles,
     onStatus: (text) => status(`refolding with ${model} · ${text}`),
     onProgress: () => {},
   });
