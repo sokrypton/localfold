@@ -442,6 +442,7 @@ struct AttnSave {
   int B, Q;
   real* lse;        // [2][B, H, Q] the logits' max and log exp-sum (the flash backward's)
   real* W;          // [C, P] the packed projection weights
+  bool bf = false;  // BF16: x, qkvg, og and W held in bf16 (o stays float: the softmax backward's row term reads it)
 };
 inline Sdpa af2Sdpa(const Attention& a, int B, int Q, const real* mask, const real* nb, real* dnb = nullptr) {
   Sdpa d;
@@ -482,9 +483,92 @@ __global__ void gateBwdLdK(const real* dog, const real* o, const real* g, real* 
   dgp[i] = dog[t] * o[t] * s * (1.f - s);
 }
 
+#ifndef GRAD_F64
+__global__ void gateFwdBfK(bf* g, const real* b, size_t rows, int HD, int ld) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= rows * HD) return;
+  bf& x = g[(t / HD) * ld + t % HD];
+  x = __float2bfloat16(1.f / (1.f + __expf(-(__bfloat162float(x) + b[t % HD]))));
+}
+__global__ void gateMulBfK(bf* og, const real* o, const bf* g, size_t rows, int HD, int ld) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t < rows * HD) og[t] = __float2bfloat16(o[t] * __bfloat162float(g[(t / HD) * ld + t % HD]));
+}
+__global__ void gateBwdLdBfK(const real* dog, const real* o, const bf* g, real* dO, real* dgp, size_t rows, int HD,
+                             int ld) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= rows * HD) return;
+  size_t i = (t / HD) * ld + t % HD;
+  const float s = __bfloat162float(g[i]);
+  dO[t] = dog[t] * s;
+  dgp[i] = dog[t] * o[t] * s * (1.f - s);
+}
+inline AttnSave attnForwardBf(const Attention& a, const real* x, const real* mask, const real* nb, real* out, int B,
+                              int Q) {
+  const int HD = a.H * a.D, roles = a.gating ? 4 : 3, P = roles * HD;
+  const size_t rows = (size_t)B * Q;
+  AttnSave s{};
+  s.B = B; s.Q = Q; s.bf = true;
+  bf* xb = toBf(x, rows * a.C);
+  bf* W = bfGet((size_t)a.C * P);
+  bf* qkvg = bfGet(rows * P);
+  s.o = ARENA.get(rows * HD);
+  bf* og = bfGet(rows * HD);
+  s.lse = ARENA.get(2 * rows * a.H);
+  {
+    Scratch scratch;
+    real* Wf = ARENA.get((size_t)a.C * P);
+    packRolesK<<<blocks((size_t)a.C * P), 256, 0, STREAM>>>(Wf, a.wq.w, a.wk.w, a.wv.w, a.gating ? a.wg.w : nullptr,
+                                                           a.C, HD, roles, false);
+    toBf(Wf, W, (size_t)a.C * P);
+  }
+  mmBf(xb, W, qkvg, (int)rows, a.C, P);
+  if (a.gating) gateFwdBfK<<<blocks(rows * HD), 256, 0, STREAM>>>(qkvg + 3 * HD, a.bg.w, rows, HD, P);
+  sdpaForwardBf(af2Sdpa(a, B, Q, mask, nb), qkvg, P, qkvg + HD, P, qkvg + 2 * HD, P, s.o, HD, s.lse);
+  if (a.gating) gateMulBfK<<<blocks(rows * HD), 256, 0, STREAM>>>(og, s.o, qkvg + 3 * HD, rows, HD, P);
+  else toBf(s.o, og, rows * HD);
+  {
+    Scratch scratch;
+    mmBf(og, toBf(a.wo.w, (size_t)HD * a.O), out, (int)rows, HD, a.O);
+  }
+  biasK<<<blocks(rows * a.O), 256, 0, STREAM>>>(out, a.bo.w, rows, a.O);
+  s.x = reinterpret_cast<const real*>(xb); s.W = reinterpret_cast<real*>(W);
+  s.qkvg = reinterpret_cast<real*>(qkvg); s.og = reinterpret_cast<real*>(og);
+  return s;
+}
+inline void attnBackwardBf(Attention& a, const AttnSave& s, const real* mask, const real* nb, const real* dout,
+                           real* dx, real* dnb, bool accumulate) {
+  Scratch scratch;
+  const int B = s.B, Q = s.Q, HD = a.H * a.D, roles = a.gating ? 4 : 3, P = roles * HD;
+  const size_t rows = (size_t)B * Q;
+  const bf *xb = reinterpret_cast<const bf*>(s.x), *W = reinterpret_cast<const bf*>(s.W),
+           *qkvg = reinterpret_cast<const bf*>(s.qkvg), *og = reinterpret_cast<const bf*>(s.og);
+  colSum(a.bo.g, dout, rows, a.O);
+  const bf* db = toBf(dout, rows * a.O);
+  mmATBf(og, db, a.wo.g, (int)rows, HD, a.O);
+  real* dog = ARENA.get(rows * HD);
+  mmBTBf(db, toBf(a.wo.w, (size_t)HD * a.O), dog, (int)rows, HD, a.O);
+  real* dqkvg = ARENA.get(rows * P);
+  real* dO = ARENA.get(rows * HD);
+  if (a.gating) gateBwdLdBfK<<<blocks(rows * HD), 256, 0, STREAM>>>(dog, s.o, qkvg + 3 * HD, dO, dqkvg + 3 * HD, rows, HD, P);
+  else GK(cudaMemcpyAsync(dO, dog, rows * HD * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
+  sdpaBackwardBf(af2Sdpa(a, B, Q, mask, nb, dnb), qkvg, P, qkvg + HD, P, qkvg + 2 * HD, P, dO, HD,
+                 dqkvg, P, dqkvg + HD, P, dqkvg + 2 * HD, P, s.o, HD, s.lse);
+  if (a.gating) colSum(a.bg.g, dqkvg + 3 * HD, rows, HD, P);
+  const bf* dqb = toBf(dqkvg, rows * P);
+  real* dW = ARENA.get((size_t)a.C * P);
+  mmATBf(xb, dqb, dW, (int)rows, a.C, P, 0.f);
+  packRolesK<<<blocks((size_t)a.C * P), 256, 0, STREAM>>>(dW, a.wq.g, a.wk.g, a.wv.g, a.gating ? a.wg.g : nullptr,
+                                                         a.C, HD, roles, true);
+  mmBTBf(dqb, W, dx, (int)rows, a.C, P, accumulate ? 1.f : 0.f);
+}
+#endif
 // x [B, Q, C] -> out [B, Q, O]; mask [B, Q] (key mask, may be null); nb [H, Q, Q] (may be null)
 inline AttnSave attnForward(const Attention& a, const real* x, const real* mask, const real* nb, real* out, int B,
                             int Q) {
+#ifndef GRAD_F64
+  if (BF16) return attnForwardBf(a, x, mask, nb, out, B, Q);
+#endif
   const int HD = a.H * a.D, roles = a.gating ? 4 : 3, P = roles * HD;
   size_t rows = (size_t)B * Q;
   AttnSave s{x, ARENA.get(rows * P), ARENA.get(rows * HD), ARENA.get(rows * HD), B, Q, ARENA.get(2 * rows * a.H),
@@ -504,6 +588,9 @@ inline AttnSave attnForward(const Attention& a, const real* x, const real* mask,
 // dout [B Q, O] -> dx [B Q, C] (written, or added with accumulate); dnb [H, Q, Q] accumulated when not null
 inline void attnBackward(Attention& a, const AttnSave& s, const real* mask, const real* nb, const real* dout,
                          real* dx, real* dnb, bool accumulate) {
+#ifndef GRAD_F64
+  if (s.bf) { attnBackwardBf(a, s, mask, nb, dout, dx, dnb, accumulate); return; }
+#endif
   Scratch scratch;
   const int B = s.B, Q = s.Q, HD = a.H * a.D, roles = a.gating ? 4 : 3, P = roles * HD;
   size_t rows = (size_t)B * Q;
@@ -692,9 +779,46 @@ struct Transition {
   LayerNorm ln;
   Linear l1, l2;
 };
-struct TransSave { LnSave ln; real* xn; real* h; size_t rows; };   // h: the hidden layer AFTER the relu
+struct TransSave { LnSave ln; real* xn; real* h; size_t rows; bool bf = false; };   // h: the hidden layer AFTER the relu
+#ifndef GRAD_F64
+__global__ void reluBfK(bf* x, size_t n) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t < n && !(__bfloat162float(x[t]) > 0.f)) x[t] = __float2bfloat16(0.f);
+}
+__global__ void reluBwdBfK(bf* d, const bf* h, size_t n) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t < n && !(__bfloat162float(h[t]) > 0.f)) d[t] = __float2bfloat16(0.f);
+}
+// BF16: the normalised input and the hidden layer in bf16, both GEMMs on bf16 operands
+inline TransSave transForwardBf(const Transition& t, const real* x, real* out, size_t rows) {
+  TransSave s; s.rows = rows; s.bf = true;
+  bf* xn = bfGet(rows * t.ln.C);
+  s.ln = lnForward(t.ln, x, xn, rows);
+  bf* h = bfGet(rows * t.l1.N);
+  linearFwdBf(t.l1, xn, h, rows);
+  reluBfK<<<blocks(rows * t.l1.N), 256, 0, STREAM>>>(h, rows * t.l1.N);
+  linearFwdBf(t.l2, h, out, rows);
+  s.xn = reinterpret_cast<real*>(xn); s.h = reinterpret_cast<real*>(h);
+  return s;
+}
+inline void transBackwardBf(Transition& t, const TransSave& s, const real* dout, real* dx, bool accumulate) {
+  Scratch scratch;
+  const size_t rows = s.rows, n = rows * t.l1.N;
+  const bf *xn = reinterpret_cast<const bf*>(s.xn), *h = reinterpret_cast<const bf*>(s.h);
+  const bf* db = toBf(dout, rows * t.l2.N);
+  bf* dr = bfGet(n);
+  linearBwdBf(t.l2, h, db, dr, rows);
+  reluBwdBfK<<<blocks(n), 256, 0, STREAM>>>(dr, h, n);
+  real* dxn = ARENA.get(rows * t.ln.C);
+  linearBwdBf(t.l1, xn, dr, dxn, rows);
+  lnBackward(t.ln, s.ln, dxn, dx, rows, accumulate);
+}
+#endif
 // (relu(h) > 0 exactly where h > 0, so the backward's mask reads the saved output and nothing recomputes it)
 inline TransSave transForward(const Transition& t, const real* x, real* out, size_t rows) {
+#ifndef GRAD_F64
+  if (BF16) return transForwardBf(t, x, out, rows);
+#endif
   TransSave s;
   s.rows = rows;
   s.xn = ARENA.get(rows * t.ln.C);
@@ -706,6 +830,9 @@ inline TransSave transForward(const Transition& t, const real* x, real* out, siz
   return s;
 }
 inline void transBackward(Transition& t, const TransSave& s, const real* dout, real* dx, bool accumulate) {
+#ifndef GRAD_F64
+  if (s.bf) { transBackwardBf(t, s, dout, dx, accumulate); return; }
+#endif
   Scratch scratch;
   size_t rows = s.rows, n = rows * t.l1.N;
   real* dr = ARENA.get(n);
