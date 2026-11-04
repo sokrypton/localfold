@@ -4,7 +4,10 @@
 
 // RMSNorm over a row: y = x / sqrt(mean(x^2) + eps) * w, w optional. x and y float32; yh the same values in float16
 // where the next GEMM wants a half operand. `ld` 0: the row stride is C.
-struct RfdRmsArgs { CP(float) x; DP(float) y; DP(half) yh; CP(float) w; u64 rows; int C, ldx, ldy; float eps; };
+// `xh`: the input in half as well (the pair track under `--f16`, which is read by the norms more than by
+// anything else) - one of `x` and `xh` is null
+struct RfdRmsArgs { CP(float) x; DP(float) y; DP(half) yh; CP(float) w; u64 rows; int C, ldx, ldy; float eps;
+                    CP(half) xh; };
 // the SwiGLU transition's middle: g[r][i] = silu(h[r][I + i]) * h[r][i], from the one [rows][2I] product
 struct RfdSwigluArgs { CP(float) h; DP(float) g; DP(half) gh; u64 rows; uint I, pad; };
 // the SwiGLU over a HALF product (the transition's first GEMM writing half), its result half for the second
@@ -16,14 +19,18 @@ struct RfdAdalnArgs { CP(float) x; DP(float) y; DP(half) yh; CP(float) gamma; CP
 // sigmoid(gamma[r]) + beta[r], the norm fused so the normalised x is never written
 // `yh`: the result in half as well, for the GEMM that reads it next - staging an f32 operand was 205 conversion
 // passes and 9.6% of a step
-struct RfdAdalnRowsArgs { CP(float) x; DP(float) y; DP(half) yh; CP(float) gamma; CP(float) beta; u64 rows; int C; float eps; };
+// `ldg`: the gamma/beta row stride, so a layer's pair can be a window into one precomputed buffer holding every
+// layer's (0 means C, the standalone case)
+struct RfdAdalnRowsArgs { CP(float) x; DP(float) y; DP(half) yh; CP(float) gamma; CP(float) beta; u64 rows; int C;
+                          float eps; int ldg; };
 // x[r][d] += y[r][d] * sigmoid(gamma[r][d]) - AdaptiveOutputScale and its residual, in one pass
 struct RfdScaleAddArgs { DP(float) x; CP(float) y; CP(float) gamma; u64 rows; int C; uint pad; };
 // pair-biased gated attention in float32, a threadgroup per (query, head): out[i][h D + d] =
 // sigmoid(g[i][h D + d]) * sum_j softmax_j(q.k * scale + bias[(i n + j) H + h]) v[j][h D + d].
 // q and k are [n][H D]; v is read with its own leading dimension (the packed to_qkv output's row).
+// `outH`: the gated context in half as well, for the projection that reads it next
 struct RfdAttnArgs { CP(float) q; CP(float) k; CP(float) v; CP(float) bias; CP(float) g; DP(float) out;
-                     uint n, heads, dimHead, ldv; u64 vOff; float scale; };
+                     uint n, heads, dimHead, ldv; u64 vOff; float scale; DP(half) outH; };
 // the pair write (`pair_write: hadamard`): z[i n + j][d] = pair[i n + j][d] + pij[j][d] * pij[i][P + d] - the
 // first half of linear_x's output indexed by the COLUMN, the second by the row (pair_update.py's pi / pj)
 // `z` may be `pair` itself: the write is elementwise at one index, so the pair track is updated in place and
@@ -37,7 +44,8 @@ struct RfdTriGatherArgs { CP(float) x; DP(float) out; u64 rows; uint T, pad; };
 // y[i] = x[i] * sigmoid(g[i])
 struct RfdMulSigmoidArgs { CP(float) x; CP(float) g; DP(float) y; u64 n; };
 // the same, with LayerNorm in place of RMSNorm (the autoencoder's two transformers are LayerNorm throughout)
-struct RfdAdalnRowsLnArgs { CP(float) x; DP(float) y; CP(float) gamma; CP(float) beta; u64 rows; int C; float eps; };
+struct RfdAdalnRowsLnArgs { CP(float) x; DP(float) y; CP(float) gamma; CP(float) beta; u64 rows; int C; float eps;
+                            int ldg; };
 // rows gathered by index (the attended tokens) and scattered back: out[r][c] = in[idx[r]][c], and the reverse
 struct RfdRowsArgs { CP(float) in; DP(float) out; CP(int) idx; u64 rows; int C; uint pad; };
 // the pair track's distance bins, rebuilt from the current alpha carbons each step: for every pair row the
@@ -59,3 +67,11 @@ struct RfdTriGatherHArgs { CP(half) x; DP(half) out; u64 rows; uint T, pad; };
 // `add` folded in: y += x * sigmoid(g), which is the triangle's whole tail - the separate residual add was 9.2%
 // of a step over 23 calls, and it reads and writes the pair track again for nothing
 struct RfdMulSigmoidHArgs { CP(half) x; CP(half) g; DP(float) y; u64 n; };
+// the pair track in half: the hadamard write, the gated add and the cycle's input, all over half buffers - the
+// track is read and written by more kernels than anything else here, so its width is the port's bandwidth
+struct RfdPairWriteHArgs { CP(half) pair; CP(float) pij; DP(half) z; u64 rows; uint n, P; };
+struct RfdMulSigmoidHHArgs { CP(half) x; CP(half) g; DP(half) y; u64 n; };
+struct RfdAddHArgs { CP(half) a; CP(float) b; DP(half) y; u64 n; };
+// a weight transposed once into its own buffer: core's fused gated add takes its weight as [in][out] where this
+// checkpoint stores [out][in], and a GEMM that fuses the gate and the residual is worth a 294 KB derived copy
+struct RfdTransposeHArgs { CP(half) in; DP(half) out; u64 rows; uint cols, pad; };

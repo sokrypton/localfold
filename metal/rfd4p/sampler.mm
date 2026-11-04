@@ -343,8 +343,6 @@ int generate(const std::string& genDir, const std::string& outPath, int designs,
   float* vLl = allocT<float>((size_t)n * latent);
   float* logits = allocT<float>((size_t)n * 147);
   float* insertion = allocT<float>(nn);
-  float* x1Bb = allocT<float>((size_t)n * 3);
-  float* x1Ll = allocT<float>((size_t)n * latent);
   // 🔴 THE STEP'S CONDITIONING IS COPIED INTO A BUFFER OF ITS OWN, NOT POINTED AT INSIDE THE BIG ONE, AND THAT
   // IS A CORRECTNESS REQUIREMENT RATHER THAN TIDINESS. metal/core's GEMM chooses its VECTOR EPILOGUE by the
   // operands' ADDRESS alignment (`al4(p, ld) = p % 16 == 0 && ld % 4 == 0`, and the bias 16-byte aligned), so
@@ -551,7 +549,12 @@ int generate(const std::string& genDir, const std::string& outPath, int designs,
     // it would be a different network.
     fill(s, 0, (size_t)n * D_.D * 4);
     fill(z, 0, nn * D_.P * 4);
-    sync();
+    // 🔴 NO `sync()` HERE, AND THAT IS WORTH A THIRD OF A STEP'S WALL CLOCK. One was added while hunting a
+    // nondeterminism that turned out to be a missing barrier in the attention; it made the host wait for the GPU
+    // to drain sixty times a generation, so the GPU idled while the next step was prepared. `fill` is already
+    // safe either way - it memsets on the host only when nothing is in flight, and queues a kernel when
+    // something is - and the determinism gate (eight runs byte-identical) is what says so rather than the
+    // argument.
     const size_t pairCondDim = M.len("g/pairCond") / (size_t)std::max(steps, 1);
     copy(cond0Buf, M.f("g/cond") + (size_t)st * n * condDim, (size_t)n * condDim * 4);
     copy(cond1Buf, M.f("g/cond1") + (size_t)st * n * condDim, (size_t)n * condDim * 4);

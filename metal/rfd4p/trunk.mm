@@ -59,7 +59,7 @@ void initPair(const float* pairFeats, const float* pairCondFeats, float* zInit) 
   run("rfd4p_adaln_bcast", grid1d((nn + 7) / 8, 1), 256, a);
 }
 
-void tokenLayer(int layer, float* s, const float* z, const float* c) {
+void tokenLayer(int layer, float* s, const float* z, const float* c, const half* cH, const float* gb) {
   const int n = D_.n, D = D_.D, P = D_.P, H = D_.H, dimHead = D_.D / D_.H;
   const size_t nn = (size_t)n * n;
   const std::string L = "nn.transformer_layers." + std::to_string(layer) + ".";
@@ -68,7 +68,9 @@ void tokenLayer(int layer, float* s, const float* z, const float* c) {
 
   // ---- 1. the pair-biased gated attention, under its adaLN and output scale
   float* xa = scratch<float>("tl.xa", (size_t)n * D);
-  adalnRows(s, c, L + "mhba.adaln", xa, n, D);
+  // the layer's window into the precomputed conditioning, where the caller has it
+  if (gb) adalnPre(s, gb, layer, 0, D_.layers, xa, n, D);
+  else adalnRows(s, c, L + "mhba.adaln", xa, n, D);
   // 🔴 THE NORM WRITES HALF WHERE THE NEXT GEMM WANTS HALF. Handing core an f32 operand with `half` asked for
   // means it stages a converted copy first: 205 such passes were 9.6% of a step.
   float* nodeN = scratch<float>("tl.nodeN", (size_t)n * D);
@@ -113,35 +115,58 @@ void tokenLayer(int layer, float* s, const float* z, const float* c) {
     lin(zn, MHA + "to_bias.weight", bias, nn, P, H);
   }
 
-  float* ctx = scratch<float>("tl.ctx", (size_t)n * D);
+  float* ctx = HALF ? nullptr : scratch<float>("tl.ctx", (size_t)n * D);
+  half* ctxH = HALF ? scratch<half>("tl.ctxH", (size_t)n * D) : nullptr;
   RfdAttnArgs at{};
-  at.q = q; at.k = k; at.v = qkv; at.bias = bias; at.g = g; at.out = ctx;
+  at.q = q; at.k = k; at.v = qkv; at.bias = bias; at.g = g; at.out = ctx; at.outH = ctxH;
   at.n = (uint)n; at.heads = (uint)H; at.dimHead = (uint)dimHead; at.ldv = (uint)(3 * D); at.vOff = 2 * D;
   at.scale = 1.f / sqrtf((float)dimHead);
   dispatch("rfd4p_attention", &at, sizeof at, Grid{(uint32_t)n, (uint32_t)H, 1}, 256, (size_t)n * 4, "rfd4p_attn");
 
-  float* attnOut = scratch<float>("tl.attnOut", (size_t)n * D);
-  lin(ctx, MHA + "to_out_node.weight", attnOut, n, D, D, M.f("w/" + MHA + "to_out_node.bias"));
-  scaleAdd(s, attnOut, c, L + "mhba.scale_output", n, D);
+  // 🔴 THE OUTPUT SCALE AND THE RESIDUAL ARE THE GEMM'S EPILOGUE WHERE THE CONDITIONING IS IN HALF: core's
+  // `pair += aux * sigmoid(X W)` is `AdaptiveOutputScale` followed by the block's residual, exactly. Two of
+  // these a layer, twenty-eight a trunk pass, each otherwise a [n][256]x[256][768] GEMM and a pass over s.
+  if (HALF && cH) {
+    half* attnOut = scratch<half>("tl.attnOutH", (size_t)n * D);
+    linH(ctxH, MHA + "to_out_node.weight", attnOut, n, D, D, M.f("w/" + MHA + "to_out_node.bias"));
+    gemmGatedAdd(cH, weightT(L + "mhba.scale_output.to_adaln_zero_gamma.0.weight"), attnOut, s, n, D_.C, D,
+                 M.f("w/" + L + "mhba.scale_output.to_adaln_zero_gamma.0.bias"));
+  } else if (HALF) {
+    float* attnOut = scratch<float>("tl.attnOut", (size_t)n * D);
+    linHF(ctxH, MHA + "to_out_node.weight", attnOut, n, D, D, M.f("w/" + MHA + "to_out_node.bias"));
+    scaleAdd(s, attnOut, c, L + "mhba.scale_output", n, D);
+  } else {
+    float* attnOut = scratch<float>("tl.attnOut", (size_t)n * D);
+    lin(ctx, MHA + "to_out_node.weight", attnOut, n, D, D, M.f("w/" + MHA + "to_out_node.bias"));
+    scaleAdd(s, attnOut, c, L + "mhba.scale_output", n, D);
+  }
 
   // ---- 2. the SwiGLU transition, under its own adaLN and output scale
-  float* tr = scratch<float>("tl.tr", (size_t)n * D);
   if (HALF) {
     half* xah = scratch<half>("tl.xah", (size_t)n * D);
-    adalnRows(s, c, L + "transition.adaln", xa, n, D, 0, false, xah);
+    if (gb) adalnPre(s, gb, layer, 1, D_.layers, xa, n, D, xah);
+    else adalnRows(s, c, L + "transition.adaln", xa, n, D, 0, false, xah);
     half* hid = scratch<half>("tl.hidh", (size_t)n * 8 * D);
     half* gated = scratch<half>("tl.gatedh", (size_t)n * 4 * D);
     half* trh = scratch<half>("tl.trh", (size_t)n * D);
     transitionH(xah, trh, n, D, 4, L + "transition.transition", hid, gated);
-    // the result back in float for the residual, which accumulates over fourteen layers
-    toFloat(trh, tr, (size_t)n * D);
+    if (cH) {
+      gemmGatedAdd(cH, weightT(L + "transition.scale_output.to_adaln_zero_gamma.0.weight"), trh, s, n, D_.C, D,
+                   M.f("w/" + L + "transition.scale_output.to_adaln_zero_gamma.0.bias"));
+    } else {
+      float* tr = scratch<float>("tl.tr", (size_t)n * D);
+      toFloat(trh, tr, (size_t)n * D);
+      scaleAdd(s, tr, c, L + "transition.scale_output", n, D);
+    }
   } else {
-    adalnRows(s, c, L + "transition.adaln", xa, n, D);
+    float* tr = scratch<float>("tl.tr", (size_t)n * D);
+    if (gb) adalnPre(s, gb, layer, 1, D_.layers, xa, n, D);
+    else adalnRows(s, c, L + "transition.adaln", xa, n, D);
     float* hid = scratch<float>("tl.hid", (size_t)n * 8 * D);
     float* gated = scratch<float>("tl.gated", (size_t)n * 4 * D);
     transition(xa, tr, n, D, 4, L + "transition.transition", hid, gated);
+    scaleAdd(s, tr, c, L + "transition.scale_output", n, D);
   }
-  scaleAdd(s, tr, c, L + "transition.scale_output", n, D);
 }
 
 // One triangle multiplication, added into `z` in place. `outgoing`: x[i][j][c] = sum_k a[i][k][c] b[j][k][c];
@@ -184,24 +209,27 @@ static void triangle(const std::string& prefix, float* z, bool outgoing) {
       if (opt(prefix + b)) die("rfd4p: %s%s is a bias the channel-major projection cannot carry", prefix.c_str(), b);
     half* zn = scratch<half>("tri.znH", nn * P);
     layerNorm(z, zn, nn, P, M.f(W + "layer_norm_in.weight"), opt(prefix + ".layer_norm_in.bias"));
-    half* aP = scratch<half>("tri.aPH", nn * T);
-    half* aG = scratch<half>("tri.aGH", nn * T);
-    half* bP = scratch<half>("tri.bPH", nn * T);
-    half* bG = scratch<half>("tri.bGH", nn * T);
-    auto projectT = [&](const char* name, half* Y) {
+    // 🔴 THE FOUR PROJECTIONS ARE ONE GEMM, because they share their input and differ only in the weight: the
+    // four [T][P] matrices stacked into one [4T][P] (derived once) make a product four times the size and a
+    // quarter of the dispatches. At 54 tokens each of them alone was 2916 x 256 x 384 - small enough that the
+    // launch was a third of the step - and the port issued 1184 dispatches a step before this.
+    half* ab4 = scratch<half>("tri.ab4H", nn * 4 * T);
+    {
       Gemm g{};
-      g.X = M.h("w/" + prefix + name); g.tx = F16;       // the weight [T][P] as the row operand
+      g.X = weightStack(prefix, {prefix + ".linear_a_p.weight", prefix + ".linear_a_g.weight",
+                                 prefix + ".linear_b_p.weight", prefix + ".linear_b_g.weight"});
+      g.tx = F16;                                        // the stacked weight [4T][P] as the row operand
       g.W = zn; g.tw = F16; g.transW = true;             // the activations [n*n][P] read as [out][in]
-      g.Y = Y; g.ty = F16;
-      g.rows = (size_t)T; g.in = P; g.out = (int)nn;
+      g.Y = ab4; g.ty = F16;
+      g.rows = (size_t)4 * T; g.in = P; g.out = (int)nn;
       g.accFloat = true;
-      g.label = name;
+      g.label = "tri-project";
       gemm(g);
-    };
-    projectT(".linear_a_p.weight", aP);
-    projectT(".linear_a_g.weight", aG);
-    projectT(".linear_b_p.weight", bP);
-    projectT(".linear_b_g.weight", bG);
+    }
+    half* aP = ab4;
+    half* aG = ab4 + nn * T;
+    half* bP = ab4 + 2 * nn * T;
+    half* bG = ab4 + 3 * nn * T;
 
     half* aT = scratch<half>("tri.aTH", nn * T);
     half* bT = scratch<half>("tri.bTH", nn * T);
@@ -231,12 +259,19 @@ static void triangle(const std::string& prefix, float* z, bool outgoing) {
     centerNorm(x, 1.f, xn, n, n, T, M.f(W + "layer_norm_out.weight"), opt(prefix + ".layer_norm_out.bias"));
 
     half* proj = scratch<half>("tri.projH", nn * P);
-    half* gate = scratch<half>("tri.gateH", nn * P);
     linH(xn, prefix + ".linear_z.weight", proj, nn, T, P, opt(prefix + ".linear_z.bias"));
-    linH(zn, prefix + ".linear_g.weight", gate, nn, P, P, opt(prefix + ".linear_g.bias"));
-    RfdMulSigmoidHArgs ms{};
-    ms.x = proj; ms.g = gate; ms.y = z; ms.n = nn * P;
-    run1d("rfd4p_mul_sigmoid_h", nn * P, ms);
+    // 🔴 THE GATE, THE PRODUCT AND THE RESIDUAL IN ONE GEMM - metal/core's own fused epilogue, which is exactly
+    // this network's triangle tail: `pair += aux * sigmoid(X W)`. It replaces a [n*n][384] GEMM for the gate and
+    // a pass over the pair track to apply it (that pass alone was 9.2% of a step, reading and writing 103 MB a
+    // call). The weight goes in as [in][out], which this checkpoint does not store, so a transposed half copy is
+    // derived ONCE - 294 KB against the 25 MB a call it saves.
+    // 🔴 ITS RETURN VALUE IS NOT "DID IT RUN". `gemmGatedAdd` hands back whether it also emitted the NEXT
+    // LayerNorm (metal/core's `Gemm::lnOut`), and reading it as a fallback flag ran the gate twice - the product
+    // applied once by the GEMM and once by the pass that was meant to replace it. It read 2.4e-2 against the
+    // reference and took longer than what it replaced, which is a useful shape of bug: a fallback that fires
+    // when nothing failed. The call always runs; off the matrix units it is lf_gemm's extended instance, which
+    // is slower there and not wrong.
+    gemmGatedAdd(zn, weightT(prefix + ".linear_g.weight"), proj, z, nn, P, P, opt(prefix + ".linear_g.bias"));
     return;
   }
 
@@ -404,11 +439,24 @@ void trunkForward(const float* seqF, const float* cond0, const float* cond1, con
   if (nRecycle > 1) condC(cond1, c1, n);
   initSingle(seqF, sInit);
   initPair(pairF, pairCondF, zInit);
+  // the conditioning in half once a trunk pass, for the fused output scales: n x 256 values, against the
+  // twenty-eight GEMMs and twenty-eight passes over `s` it saves
+  half* cH = HALF ? scratch<half>("tf.cH", (size_t)n * D_.C) : nullptr;
+  half* c1H = HALF && nRecycle > 1 ? scratch<half>("tf.c1H", (size_t)n * D_.C) : nullptr;
+  if (cH) toHalf(c, cH, (size_t)n * D_.C);
+  if (c1H) toHalf(c1, c1H, (size_t)n * D_.C);
+  // every layer's adaLN conditioning, once a cycle rather than six dispatches a layer
+  const float* gb = precomputeCond(c, n, D_.layers, D_.D, D_.C);
+
   for (int cycle = 0; cycle < nRecycle; ++cycle) {
     recycleIn(sInit, zInit, s, z);
     const float* cc = cycle == 0 ? c : c1;
+    const half* ccH = cycle == 0 ? cH : c1H;
+    // 🔴 THE SECOND CYCLE'S CONDITIONING IS A DIFFERENT `c`, so its precompute is its own: computed on entry to
+    // the cycle rather than once, because `c1` is what every later cycle uses.
+    const float* ccGb = cycle == 0 ? gb : precomputeCond(c1, n, D_.layers, D_.D, D_.C);
     for (int i = 0; i < D_.layers; ++i) {
-      tokenLayer(i, s, z, cc);
+      tokenLayer(i, s, z, cc, ccH, ccGb);
       if (i < D_.layers - 1 && i % 2 == 0) pairUpdate(i, s, z);
     }
   }

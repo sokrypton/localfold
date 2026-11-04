@@ -13,12 +13,13 @@ kernel void rfd4p_rms_norm(constant RfdRmsArgs& a [[buffer(0)]], uint3 tg [[thre
   const ulong row = (ulong)(tg.y * ng.x + tg.x) * 8 + sg;
   if (row >= a.rows) return;
   const int ldx = a.ldx ? a.ldx : a.C, ldy = a.ldy ? a.ldy : a.C;
-  device const float* x = a.x + row * ldx;
+  device const float* x = a.x ? a.x + row * ldx : nullptr;
+  device const half* xh = a.xh ? a.xh + row * ldx : nullptr;
   float s = 0;
-  for (int c = lane; c < a.C; c += 32) { const float v = x[c]; s += v * v; }
+  for (int c = lane; c < a.C; c += 32) { const float v = x ? x[c] : (float)xh[c]; s += v * v; }
   const float inv = rsqrt(simd_sum(s) / (float)a.C + a.eps);
   for (int c = lane; c < a.C; c += 32) {
-    const float v = x[c] * inv * (a.w ? a.w[c] : 1.f);
+    const float v = (x ? x[c] : (float)xh[c]) * inv * (a.w ? a.w[c] : 1.f);
     if (a.y) a.y[row * ldy + c] = v;
     if (a.yh) a.yh[row * ldy + c] = (half)v;
   }
@@ -58,8 +59,8 @@ kernel void rfd4p_adaln_rows(constant RfdAdalnRowsArgs& a [[buffer(0)]], uint3 t
   const ulong row = (ulong)(tg.y * ng.x + tg.x) * 8 + sg;
   if (row >= a.rows) return;
   device const float* x = a.x + row * a.C;
-  device const float* gm = a.gamma + row * a.C;
-  device const float* bt = a.beta + row * a.C;
+  device const float* gm = a.gamma + row * (ulong)(a.ldg ? a.ldg : a.C);
+  device const float* bt = a.beta + row * (ulong)(a.ldg ? a.ldg : a.C);
   float s = 0;
   for (int c = lane; c < a.C; c += 32) { const float v = x[c]; s += v * v; }
   const float inv = rsqrt(simd_sum(s) / (float)a.C + a.eps);
@@ -138,7 +139,9 @@ kernel void rfd4p_attention(constant RfdAttnArgs& a [[buffer(0)]], uint3 tg [[th
       acc = t;
     }
     const ulong at = (ulong)i * W + h * D + d;
-    a.out[at] = lf_sigmoid(a.g[at]) * acc;
+    const float v = lf_sigmoid(a.g[at]) * acc;
+    if (a.out) a.out[at] = v;
+    if (a.outH) a.outH[at] = (half)v;
   }
 }
 
@@ -191,8 +194,8 @@ kernel void rfd4p_adaln_rows_ln(constant RfdAdalnRowsLnArgs& a [[buffer(0)]], ui
   const ulong row = (ulong)(tg.y * ng.x + tg.x) * 8 + sg;
   if (row >= a.rows) return;
   device const float* x = a.x + row * a.C;
-  device const float* gm = a.gamma + row * a.C;
-  device const float* bt = a.beta + row * a.C;
+  device const float* gm = a.gamma + row * (ulong)(a.ldg ? a.ldg : a.C);
+  device const float* bt = a.beta + row * (ulong)(a.ldg ? a.ldg : a.C);
   float sum = 0;
   for (int c = lane; c < a.C; c += 32) sum += x[c];
   const float mean = simd_sum(sum) / (float)a.C;
@@ -332,4 +335,38 @@ kernel void rfd4p_swiglu_h(LF_ARGS(RfdSwigluHArgs)) {
   const uint r = lf_udiv((uint)(t / a.I), 1), i = (uint)(t - (ulong)r * a.I);
   device const half* h = a.h + (ulong)r * 2 * a.I;
   a.g[t] = (half)(lf_silu((float)h[a.I + i]) * (float)h[i]);
+}
+
+// the hadamard pair write over a half track (see rfd4p_pair_write for why the row is the threadgroup's)
+kernel void rfd4p_pair_write_h(constant RfdPairWriteHArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
+                               uint3 ng [[threadgroups_per_grid]], uint tid [[thread_index_in_threadgroup]],
+                               uint3 tpg [[threads_per_threadgroup]]) {
+  const ulong row = (ulong)tg.y * ng.x + tg.x;
+  if (row >= a.rows) return;
+  const uint P = a.P;
+  const uint i = (uint)lf_udiv((uint)row, a.n), j = (uint)row - i * a.n;
+  device const float* pi = a.pij + (ulong)j * 2 * P;
+  device const float* pj = a.pij + (ulong)i * 2 * P + P;
+  device const half* pair = a.pair + row * P;
+  device half* z = a.z + row * P;
+  for (uint c = tid; c < P; c += tpg.x) z[c] = (half)((float)pair[c] + pi[c] * pj[c]);
+}
+
+kernel void rfd4p_mul_sigmoid_hh(LF_ARGS(RfdMulSigmoidHHArgs)) {
+  const ulong t = LF_INDEX;
+  if (t >= a.n) return;
+  a.y[t] = (half)((float)a.y[t] + (float)a.x[t] * lf_sigmoid((float)a.g[t]));
+}
+
+kernel void rfd4p_add_h(LF_ARGS(RfdAddHArgs)) {
+  const ulong t = LF_INDEX;
+  if (t >= a.n) return;
+  a.y[t] = (half)((float)a.a[t] + a.b[t]);
+}
+
+kernel void rfd4p_transpose_h(LF_ARGS(RfdTransposeHArgs)) {
+  const ulong t = LF_INDEX;
+  if (t >= a.rows * (ulong)a.cols) return;
+  const ulong r = t / a.cols, c = t - r * a.cols;
+  a.out[c * a.rows + r] = a.in[t];
 }

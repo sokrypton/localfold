@@ -50,6 +50,11 @@ void linH(const half* X, const std::string& w, half* Y, size_t rows, int in, int
           bool relu = false);
 void linHF(const half* X, const std::string& w, float* Y, size_t rows, int in, int out, const float* bias = nullptr,
            bool relu = false);
+// a half weight [out][in] transposed to [in][out], built once and kept: what metal/core's fused gated add takes
+const half* weightT(const std::string& name);
+// several half weights of one shape stacked into [k * out][in], built once and kept: four projections that
+// share an input become one GEMM four times the size and a quarter of the dispatches
+const half* weightStack(const std::string& key, const std::vector<std::string>& names);
 // a tensor that may not be in this checkpoint (`tri_mult_bias: false` leaves the triangle's biases out, and the
 // CPU reference reads every one of them optionally): its float32 bytes, or null
 const float* opt(const std::string& name);
@@ -63,6 +68,16 @@ void transition(const float* x, float* y, size_t rows, int dim, int expansion, c
 // are that layer's projections of RMSNorm(cond, norm_cond.weight) - `prefix` is the adaLN's (e.g. "....mhba.adaln")
 void adalnRows(const float* x, const float* cond, const std::string& prefix, float* y, size_t rows, int dim,
                int condDim = 0, bool ln = false, half* yh = nullptr);
+// 🔴 EVERY LAYER'S adaLN CONDITIONING IN ONE GEMM, because none of it depends on the activations: gamma and beta
+// are projections of `c` alone, so a trunk pass can compute all twenty-eight pairs at once instead of six
+// dispatches a layer. `rms0 = c / rms(c)` is weight-free, and each adaLN's own `norm_cond` scale folds into its
+// projection - so one [n][C] norm and one [n][layers * 4 * D] product replace 168 dispatches at depth two.
+// Returns the buffer; a layer reads its window at `(layer * 4 + which * 2) * D` with a row stride of
+// `layers * 4 * D`. `which` is 0 for the attention's adaLN and 1 for the transition's.
+const float* precomputeCond(const float* c, size_t rows, int layers, int dim, int condDim);
+int condStride(int layers, int dim);
+void adalnPre(const float* x, const float* gb, int layer, int which, int layers, float* y, size_t rows, int dim,
+              half* yh = nullptr);
 // one SwiGLU transition with half operands throughout (`--f16`): the product, the gate and the projection
 void transitionH(const half* x, half* y, size_t rows, int dim, int expansion, const std::string& prefix, half* hid,
                  half* gated);
@@ -122,7 +137,10 @@ void initSingle(const float* seqFeats, float* sInit);
 void initPair(const float* pairFeats, const float* pairCondFeats, float* zInit);
 // one `MultiheadAttnAndTransition` block, in place on `s`: the pair-biased gated attention under its adaLN and
 // output scale, then the SwiGLU transition under its own, each with a residual
-void tokenLayer(int layer, float* s, const float* z, const float* c);
+// `cH`: the conditioning in half, where the caller has it - then the two output scales go through metal/core's
+// fused gated add (`x += y sigmoid(c Wg)`) instead of a GEMM and a pass of their own
+void tokenLayer(int layer, float* s, const float* z, const float* c, const half* cH = nullptr,
+                const float* gb = nullptr);
 // one `PairReprUpdate`, in place on `z`: the hadamard pair write from the single track, the outgoing and incoming
 // triangle multiplications, and the pair transition - each with a residual
 void pairUpdate(int layer, const float* s, float* z);
