@@ -90,11 +90,12 @@ void scaleAdd(float* x, const float* y, const float* cond, const std::string& pr
   run1d("rfd4p_scale_add", rows * (size_t)dim, a);
 }
 
-void linH(const half* X, const std::string& w, half* Y, size_t rows, int in, int out, const float* bias, bool relu) {
+void linH(const half* X, const std::string& w, half* Y, size_t rows, int in, int out, const float* bias, bool relu,
+          int ldy) {
   Gemm g{};
   g.X = X; g.tx = F16;
   g.W = M.h("w/" + w); g.tw = F16; g.transW = true;
-  g.Y = Y; g.ty = F16;
+  g.Y = Y; g.ty = F16; g.ldy = ldy;
   g.rows = rows; g.in = in; g.out = out;
   g.bias = bias; g.tbias = F32; g.relu = relu;
   g.label = w.c_str();

@@ -19,10 +19,29 @@
 // into the GEMM that writes the track; the four projections batched into one; every layer's adaLN conditioning
 // precomputed in a single GEMM, since none of it depends on the activations; and a pair row's index taken from
 // its threadgroup rather than from a software integer division a thread.
-// What is left, at 183 tokens: the batched projection 31.9 ms (21%, and core's tiling rather than this port's
-// layout - both orientations measure the same), the triangle's gated add 21.5, the pair transition 13.9, the
-// gate's channel-major pass 10.9, the attention 9.5. The attention is this port's own float32 kernel and
-// metal/core's flash one is the next thing to try.
+// 🔴 AND THE ATTENTION IS metal/core's FLASH KERNEL NOW, ON THE MATRIX UNITS. This port had its own scalar one
+// - a simdgroup a query, a Kahan dot product a key - which is a correct softmax and nowhere near the machine:
+// at 165 tokens with 12 heads of 64, through `metal/bench attn` with its arms interleaved, core's is **0.108 ms
+// against 0.571**. The packing is free, because core wants q | k | v | gate at 0, W, 2W, 3W of each position's
+// row with W = heads * dimHead, and W IS the token width here - so `to_qkv`'s three contiguous output blocks
+// already ARE q | k | v, and all it takes is an output row stride of 4 D with the gate's own product written at
+// 3 D. The q and k norms then run in place.
+// 🔴 THE BIAS IS WHERE IT NEARLY WENT WRONG, AND THE FIRST ANSWER WAS WORSE THAN THE PROBLEM. core reads the
+// pair bias head-major, [H][n][n], where the projection writes it pair-major with the head innermost; the
+// obvious transpose kernel reads `bias[(q n + k) H + h]`, a gather at a stride of twelve floats, and it cost
+// **22.6 ms a step against the 8.0 ms of attention it was there to save** - the step went 124 ms to 140. The
+// projection can simply be written the other way round instead, swapping which operand is the weight
+// (`Y[rows][out] = X[rows][in] W[in][out]` does not care), which gives [H][n n] contiguous for +2.2 ms on that
+// GEMM and carries the log2(e) core's `scale * log2(e)` expects in `alpha` for nothing.
+// Measured at 165 tokens: one step **124.4 ms of GPU time to 115.2**, and a whole 60-step interface design
+// 15.9 s to 15.2 - four paired rounds, ABAB, flash ahead in all four by 0.50 to 0.82 s, which the arms have to
+// be interleaved to see at all because this laptop's clock drifts 9% upward over the eight runs. It costs
+// 0.009 A RMS on the design (worst 0.071, every atom matched), and `--f32` keeps the scalar kernel.
+// What is left, at 165 tokens: the batched projection 25.3 ms (22%, and core's tiling rather than this port's
+// layout - both orientations measure the same), the triangle's gated add 17.0 (6.5 TFLOP/s against the 12.2
+// this machine's matrix units reach on the projection, so this is the clearest arithmetic gap left), the pair
+// transition 10.8, the gate's channel-major pass 8.8, the norms 6.8. The attention no longer reaches the
+// profile's top twenty-four.
 //
 // WHAT RUNS: unconditional, motif scaffolding, protein-protein interfaces, small molecules (whose chirality is
 // re-aligned every step), coordinate groups (whose labels are permuted every step), partial diffusion and

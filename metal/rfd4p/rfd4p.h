@@ -47,7 +47,8 @@ void lin(const float* X, const std::string& w, float* Y, size_t rows, int in, in
 // the same with HALF operands and a half result: the pair track's path under `--f16`, where staging an f32
 // operand would mean a conversion pass of its own (measured at 18.6% of a step before these existed)
 void linH(const half* X, const std::string& w, half* Y, size_t rows, int in, int out, const float* bias = nullptr,
-          bool relu = false);
+          bool relu = false,
+          int ldy = 0);
 void linHF(const half* X, const std::string& w, float* Y, size_t rows, int in, int out, const float* bias = nullptr,
            bool relu = false);
 // a half weight [out][in] transposed to [in][out], built once and kept: what metal/core's fused gated add takes

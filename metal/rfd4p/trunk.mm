@@ -93,31 +93,63 @@ void tokenLayer(int layer, float* s, Z z, const float* c, const half* cH, const 
     rmsNorm(xa, nodeN, n, D, M.f("w/" + MHA + "node_norm.weight"));
   }
 
-  float* qkv = scratch<float>("tl.qkv", (size_t)n * 3 * D);
-  if (HALF) linHF(nodeNh, MHA + "to_qkv.weight", qkv, n, D, 3 * D, M.f("w/" + MHA + "to_qkv.bias"));
-  else lin(nodeN, MHA + "to_qkv.weight", qkv, n, D, 3 * D, M.f("w/" + MHA + "to_qkv.bias"));
-  // q and k are normed in place out of the packed row (`use_qkln`); v is read where it lies, by stride.
-  float* q = scratch<float>("tl.q", (size_t)n * D);
-  float* k = scratch<float>("tl.k", (size_t)n * D);
-  RfdRmsArgs rq{}; rq.x = qkv; rq.y = q; rq.w = M.f("w/" + MHA + "q_layer_norm.weight");
-  rq.rows = n; rq.C = D; rq.ldx = 3 * D; rq.ldy = D; rq.eps = 1e-5f;
-  run("rfd4p_rms_norm", grid1d((size_t)(n + 7) / 8, 1), 256, rq);
-  RfdRmsArgs rk = rq; rk.x = qkv + D; rk.y = k; rk.w = M.f("w/" + MHA + "k_layer_norm.weight");
-  run("rfd4p_rms_norm", grid1d((size_t)(n + 7) / 8, 1), 256, rk);
-
-  float* g = scratch<float>("tl.g", (size_t)n * D);
-  if (HALF) linHF(nodeNh, MHA + "to_g.weight", g, n, D, D, M.f("w/" + MHA + "to_g.bias"));
-  else lin(nodeN, MHA + "to_g.weight", g, n, D, D, M.f("w/" + MHA + "to_g.bias"));
+  // 🔴 ONE PACKED [n][4 D] BUFFER UNDER `--f16`, BECAUSE THAT IS WHAT metal/core's FLASH ATTENTION READS AND
+  // THE PACKING IS FREE. It wants q | k | v | gate at 0, W, 2W, 3W of each position's row with W = heads *
+  // dimHead, which here IS D - so `to_qkv`'s three contiguous output blocks ARE q | k | v in that layout, and
+  // all the change takes is an output row stride of 4 D and the gate's own product written at 3 D. No repacking
+  // pass, and the q and k norms run in place: a lane reads and writes the one channel it reduced.
+  half* qkvg = HALF ? scratch<half>("tl.qkvg", (size_t)n * 4 * D) : nullptr;
+  float* qkv = HALF ? nullptr : scratch<float>("tl.qkv", (size_t)n * 3 * D);
+  float* q = nullptr;
+  float* k = nullptr;
+  float* g = nullptr;
+  if (HALF) {
+    linH(nodeNh, MHA + "to_qkv.weight", qkvg, n, D, 3 * D, M.f("w/" + MHA + "to_qkv.bias"), false, 4 * D);
+    linH(nodeNh, MHA + "to_g.weight", qkvg + 3 * D, n, D, D, M.f("w/" + MHA + "to_g.bias"), false, 4 * D);
+    RfdRmsArgs rq{}; rq.xh = qkvg; rq.yh = qkvg; rq.w = M.f("w/" + MHA + "q_layer_norm.weight");
+    rq.rows = n; rq.C = D; rq.ldx = 4 * D; rq.ldy = 4 * D; rq.eps = 1e-5f;
+    run("rfd4p_rms_norm", grid1d((size_t)(n + 7) / 8, 1), 256, rq);
+    RfdRmsArgs rk = rq; rk.xh = qkvg + D; rk.yh = qkvg + D; rk.w = M.f("w/" + MHA + "k_layer_norm.weight");
+    run("rfd4p_rms_norm", grid1d((size_t)(n + 7) / 8, 1), 256, rk);
+  } else {
+    lin(nodeN, MHA + "to_qkv.weight", qkv, n, D, 3 * D, M.f("w/" + MHA + "to_qkv.bias"));
+    // q and k are normed in place out of the packed row (`use_qkln`); v is read where it lies, by stride.
+    q = scratch<float>("tl.q", (size_t)n * D);
+    k = scratch<float>("tl.k", (size_t)n * D);
+    RfdRmsArgs rq{}; rq.x = qkv; rq.y = q; rq.w = M.f("w/" + MHA + "q_layer_norm.weight");
+    rq.rows = n; rq.C = D; rq.ldx = 3 * D; rq.ldy = D; rq.eps = 1e-5f;
+    run("rfd4p_rms_norm", grid1d((size_t)(n + 7) / 8, 1), 256, rq);
+    RfdRmsArgs rk = rq; rk.x = qkv + D; rk.y = k; rk.w = M.f("w/" + MHA + "k_layer_norm.weight");
+    run("rfd4p_rms_norm", grid1d((size_t)(n + 7) / 8, 1), 256, rk);
+    g = scratch<float>("tl.g", (size_t)n * D);
+    lin(nodeN, MHA + "to_g.weight", g, n, D, D, M.f("w/" + MHA + "to_g.bias"));
+  }
 
   // the pair bias: this layer's norm of the pair track, projected to one value a head
-  float* bias = scratch<float>("tl.bias", nn * H);
+  float* bias = HALF ? nullptr : scratch<float>("tl.bias", nn * H);
+  half* biasH = HALF ? scratch<half>("tl.biasH", (size_t)H * nn) : nullptr;
   if (HALF) {
     half* znh = scratch<half>("tl.znh", nn * P);
     RfdRmsArgs r{};
     r.x = z.f; r.xh = z.h; r.y = nullptr; r.yh = znh; r.w = M.f("w/" + MHA + "pair_norm.weight");
     r.rows = nn; r.C = P; r.eps = 1e-5f;
     run("rfd4p_rms_norm", grid1d((nn + 7) / 8, 1), 256, r);
-    linHF(znh, MHA + "to_bias.weight", bias, nn, P, H);
+    // 🔴 HEAD-MAJOR AND IN LOG2 UNITS STRAIGHT OUT OF THE PROJECTION, BY SWAPPING ITS OPERANDS. core's flash
+    // attention reads the bias as [H][n][n] where this writes it pair-major with the head innermost, and the
+    // obvious transpose kernel is a disaster: its read is `bias[(q n + k) H + h]`, a gather at a stride of
+    // twelve floats, and it cost 22.6 ms a step against the 8.0 ms of attention it was there to save - more
+    // than the whole kernel it replaced. The product itself can be written the other way round, because
+    // `Y[rows][out] = X[rows][in] W[in][out]` is symmetric in which operand is the weight: X is the projection
+    // [H][P] and W is the normed pair track transposed, giving [H][n n] contiguous for nothing. `alpha` carries
+    // the log2(e) the kernel's own `scale * log2(e)` expects of an added bias, so that is free too.
+    Gemm gb2{};
+    gb2.X = M.h("w/" + MHA + "to_bias.weight"); gb2.tx = F16;
+    gb2.W = znh; gb2.tw = F16; gb2.transW = true;
+    gb2.Y = biasH; gb2.ty = F16;
+    gb2.rows = (size_t)H; gb2.in = P; gb2.out = nn;
+    gb2.alpha = (float)M_LOG2E; gb2.half = true;
+    gb2.label = "to_bias (head-major, log2)";
+    gemm(gb2);
   } else {
     float* zn = scratch<float>("tl.zn", nn * P);
     rmsNorm(z.f, zn, nn, P, M.f("w/" + MHA + "pair_norm.weight"));
@@ -126,11 +158,24 @@ void tokenLayer(int layer, float* s, Z z, const float* c, const half* cH, const 
 
   float* ctx = HALF ? nullptr : scratch<float>("tl.ctx", (size_t)n * D);
   half* ctxH = HALF ? scratch<half>("tl.ctxH", (size_t)n * D) : nullptr;
-  RfdAttnArgs at{};
-  at.q = q; at.k = k; at.v = qkv; at.bias = bias; at.g = g; at.out = ctx; at.outH = ctxH;
-  at.n = (uint)n; at.heads = (uint)H; at.dimHead = (uint)dimHead; at.ldv = (uint)(3 * D); at.vOff = 2 * D;
-  at.scale = 1.f / sqrtf((float)dimHead);
-  dispatch("rfd4p_attention", &at, sizeof at, Grid{(uint32_t)n, (uint32_t)H, 1}, 256, (size_t)n * 4, "rfd4p_attn");
+  if (HALF) {
+    // 🔴 metal/core's FLASH ATTENTION, ON THE MATRIX UNITS, WHERE THIS PORT HAD ITS OWN SCALAR KERNEL. One
+    // simdgroup a query and a Kahan dot product a key is a correct softmax and nowhere near the machine: at 165
+    // tokens, 12 heads of 64, measured through `metal/bench attn` with its arms interleaved, core's kernel is
+    // 0.108 ms against this port's 0.571 - 5.3x - and the attention is 6.4% of a sampler step. The bias has to
+    // be head-major and in log2 units for it, which the projection above writes directly.
+    Attention A{};
+    A.qkvg = qkvg; A.out = ctxH; A.n = n; A.heads = H; A.D = dimHead; A.rows = 1;
+    A.scale = 1.f / sqrtf((float)dimHead);
+    A.bias = biasH; A.biasStride = n;
+    attention(A);
+  } else {
+    RfdAttnArgs at{};
+    at.q = q; at.k = k; at.v = qkv; at.bias = bias; at.g = g; at.out = ctx; at.outH = ctxH;
+    at.n = (uint)n; at.heads = (uint)H; at.dimHead = (uint)dimHead; at.ldv = (uint)(3 * D); at.vOff = 2 * D;
+    at.scale = 1.f / sqrtf((float)dimHead);
+    dispatch("rfd4p_attention", &at, sizeof at, Grid{(uint32_t)n, (uint32_t)H, 1}, 256, (size_t)n * 4, "rfd4p_attn");
+  }
 
   // 🔴 THE OUTPUT SCALE AND THE RESIDUAL ARE THE GEMM'S EPILOGUE WHERE THE CONDITIONING IS IN HALF: core's
   // `pair += aux * sigmoid(X W)` is `AdaptiveOutputScale` followed by the block's residual, exactly. Two of
