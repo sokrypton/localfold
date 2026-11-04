@@ -8,7 +8,21 @@ cd "$(dirname "$0")/../.."
 NV="nvcc -std=c++17 -arch=sm_${LOCALFOLD_SM:-80}"
 fail=0
 run() { echo "== $*"; "$@" 2>&1 | grep -E "PASS|FAIL|ABOVE|against|gradcheck:|worst" || true; "$@" > /dev/null 2>&1 || fail=1; }
-build() { local out=$1; shift; $NV "$@" -o "$out" -lcublas -lcublasLt -ldl -lcurand 2>&1 | grep -i -B1 -A3 " error" && fail=1; }
+# the builds run LOCALFOLD_JOBS at a time (16 by default): each is one nvcc of the whole header set, ~2 min, and
+# one after another the 55 of them were most of the suite's two hours with the box's other cores idle
+J=${LOCALFOLD_JOBS:-16}
+BL=$(mktemp -d)
+build() {
+  local out=$1; shift
+  while [ "$(jobs -rp | wc -l)" -ge "$J" ]; do wait -n; done
+  rm -f "$out"   # (a failed build must not leave a stale binary for the runs)
+  ( $NV "$@" -o "$out" -lcublas -lcublasLt -ldl -lcurand > "$BL/$(basename "$out").log" 2>&1 ) &
+}
+built() {   # every build finished, its errors printed
+  wait
+  for f in "$BL"/*.log; do grep -i -B1 -A3 " error" "$f" && { echo "  (in $(basename "$f" .log))"; fail=1; }; done
+  rm -rf "$BL"
+}
 build cuda/grad/test-flash -O1 cuda/grad/test_flash.cu
 build cuda/grad/test-bf16 -O1 cuda/grad/test_bf16.cu
 build cuda/grad/test-dropout-f64 -O2 -DGRAD_F64 cuda/grad/test_dropout.cu
@@ -64,6 +78,7 @@ build cuda/grad/test-rfd4trunk -O1 cuda/grad/test_rfd4trunk.cu
 build cuda/grad/test-rfd4trunk-f64 -O2 -DGRAD_F64 cuda/grad/test_rfd4trunk.cu
 build cuda/grad/test-rfd4ae -O1 cuda/grad/test_rfd4ae.cu
 build cuda/grad/test-rfd4ae-f64 -O2 -DGRAD_F64 cuda/grad/test_rfd4ae.cu
+built
 # AF2 against af3-any-model's jax.vjp: the float64 build on every dump (both sides float64 - no ReLU input can sit
 # within rounding of its kink on one side only), with the reference-free check beside it; the float32 build on the
 # single blocks. (The three-block stack in float32 holds ~2.7M ReLU inputs, and a tie among them is a coin toss on
