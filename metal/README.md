@@ -466,3 +466,41 @@ conditioned atoms sit far from the origin, which these presets are not.
 `check-writer.mjs` differed there too on any job with an anchor. The export fixes
 the half that was missing; wiring its own `alignToInputFrame` to read
 `meta/centerShift*` is the other half and is not done here.
+
+## Is it fully ported? Every capability, and the gate that exercises it
+
+"Fully ported" is a claim, so here is the checkable form. Every file under
+`cuda/rfd4p/src/` has a counterpart: `assign.h`, `schedule.h`, `superpose.h`,
+`symmetry.h` and `metrics_tags.h` are **included directly**; `metrics.h` and
+`oracle.h` and the host half of `generate.cuh` are **derived at build time**
+(derive.sh); and `bundle.cuh`, `chirality.cuh`, `decoder.cuh`, `encoder.cuh`,
+`ops.cuh`, `partial.cuh`, `rfd4p.cu`, `sampler.cuh` and `trunk.cuh` are written
+for Metal as `weights.mm`, `chirality.mm`, `decoder.mm`, `encoder.mm`,
+`ops.mm`+`rfd4p.metal`, `sampler.mm`, `main.mm`, `sampler.mm` and `trunk.mm`.
+
+| capability | what exercises it |
+|---|---|
+| unconditional design | `uncond_short` in `tools/check-metal-rfd4p-writer.py` |
+| motif scaffolding, indexed | `motif_idx_1prw`; `gate-oracle-motif` |
+| motif scaffolding, **unindexed** (insertion head and grafting) | `motif_unidx_1prw` - 40 tokens grafted, and `--no-insertion` leaves them |
+| protein-protein interfaces | `ppi_pdl1`; `gate-oracle-ppi` |
+| small molecules and chirality | `sm_sam`; `gate-oracle-sm` |
+| DNA | `dna_7m5w` |
+| coordinate groups (labels permuted every step) | `gate-crdgroups`, `gate-groups-5o45` (three groups each) |
+| partial diffusion and the encoder | `rfd4p-pd` + `--encoder=`, 90 comparisons |
+| inverse folding | the input's own backbone back to 0.0005 A |
+| hotspots, C_SEC, sequence probabilities | `gate-conditions` |
+| the writer, mmCIF and PDB | 12 of 12 files byte-identical to the page's text |
+| the design metrics and the pre-oracle verdict | 6 of 6 against `design-metrics.mjs` |
+| the **refolding oracle**, af3 and af2 | `--refold=af3` / `=af2` on `gate-oracle-motif-60` |
+| the trunk, decoder, encoder and trajectory | 86 / 84 / 86 / 90 / 100 comparisons |
+| half and float32 arithmetic | every arm runs both; `--f32` is the control |
+
+🔴 **AND THE ONE THING cuda/rfd4p's SOURCE HAS THAT THIS PORT DOES NOT IS
+`longForm`, which it does not need.** That is a second triangle shape taken
+above ~40,000 pairs because the short one degrades with length. This port has
+one shape and it is the long form's equivalent already: at 400 tokens (160,000
+pairs, 5.88x the 165-token case) a step is **626.7 ms against 113.5 - 5.52x,
+sub-linear in pairs** - and the mix is flat to a tenth of a point (triangle gate
+24.8% against 24.9%, gated add 15.6% against 15.8%). There is no crossover to
+put two shapes on either side of.

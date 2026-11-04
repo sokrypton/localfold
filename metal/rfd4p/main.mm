@@ -95,16 +95,26 @@
 // dispatch skipped entirely) and the fused GEMM costs some of it back: 2.02 ms a call against the plain
 // projection's 1.81, against the 0.63 ms the gate pass took. `rfd4p_tri_ab_hm` is gone from the profile and
 // the design is the same structure, 1315 of 1315 atoms matched at 0.0095 A rms.
-// 🔴 AND THE TWO PORTS THAT SHARE THAT EPILOGUE ARE UNMOVED, which is the thing that had to be shown rather
-// than argued. With `in` 0 every expression reduces to what it was, and metal/af3's gate folds its nineteen
-// cases to the same pLDDT and pTM with the change and without it (86.18 / 0.7595, 96.59 / 0.8211, ... to the
-// second decimal). 🔴 ITS RMSD COLUMN IS EMPTY ON THIS BOX AND THAT IS NOT THIS CHANGE: the same cases read
-// the same way with core reverted, so what that gate reports is a missing crystal rather than a moved fold.
-// metal/bioemu2 was NOT run - its reference is a webgpu dump this machine has no lane for - and it takes the
-// same unchanged path.
+// 🔴 AND THE TWO PORTS THAT SHARE THAT EPILOGUE ARE UNMOVED, shown rather than argued, and BOTH were run.
+// With `in` 0 every expression reduces to what it was; metal/af3's gate folds its nineteen cases to the same
+// pLDDT, pTM and RMSD with the change and without it, and metal/bioemu2's stage comparison against its own
+// webgpu reference is IDENTICAL on every line - the trunk's four passes, the distogram, the context and all
+// four denoise sigmas - built from `ab42d072^`'s core and from this one.
+// 🔴 AND "NO LANE FOR THE bioemu2 REFERENCE" WAS WRONG TWICE OVER. `tools/dump-bioemu2-webgpu.mjs` runs in
+// this Mac's own Chrome (adapter apple / metal-3) and wrote 31 entries in under two minutes; the input it is
+// compared against comes from `cuda/featurise/bioemu2-featurise`, which is built here - the port's own
+// `--job=` featurises into a temp directory it then REMOVES, which is what made the input look unobtainable.
 // `LOCALFOLD_RFD4P_TRI_FUSED=0` is the two-step control, kept because it is what the `--f32` arm and a
 // checkpoint with `tri_mult_bias` run: the epilogue's operands are half, and its bias wants a [4T] f32 in the
 // blocks-of-8 order that no released checkpoint has.
+//
+// 🔴 AND IT DOES NOT NEED cuda/rfd4p's `longForm`, WHICH IS THE ONE THING ITS SOURCE HAS THAT THIS PORT DOES
+// NOT. That is a second triangle shape there, taken above ~40,000 pairs because the short form degrades with
+// length; this port has one shape - channel-major, now fused with its gate - and it is the long form's
+// equivalent already. Measured rather than assumed: at 400 tokens (160,000 pairs, 5.88x the 165-token case)
+// the step is 626.7 ms against 113.5, which is 5.52x, SUB-linear in pairs, and the mix is flat to a tenth of a
+// point - triangle gate 24.8% against 24.9%, gated add 15.6% against 15.8%, the pair transition 10.7% against
+// 9.9%. There is no crossover here to put a second shape on either side of.
 //
 // WHAT RUNS: unconditional, motif scaffolding, protein-protein interfaces, small molecules (whose chirality is
 // re-aligned every step), coordinate groups (whose labels are permuted every step), partial diffusion and
