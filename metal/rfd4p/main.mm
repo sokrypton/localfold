@@ -330,6 +330,46 @@
 // a pair update is bandwidth-bound and does not scale with cores. Dividing by core count assumed the part
 // that does not divide. The direction survived and the number did not, which is the reason to run the thing.
 //
+// 🔴 AND "WHAT CAN WE BORROW FROM THEM" IS ANSWERED CANDIDATE BY CANDIDATE: FOR SPEED, NOTHING - and each
+// one is closed by a measurement rather than by reading their code and shrugging.
+//
+//   * **One compiled graph a pass** (`mx.compile` fusing the norm, gate and residual elementwise work around
+//     the GEMMs "to remove per-op dispatch") is their biggest architectural difference - this port issues
+//     ~473 dispatches a pass against their one graph - and it buys them nothing this port is losing: in a
+//     real 60-step run we are **98-99% GPU-busy at EVERY length**, n = 64 included (busy/wall a pass
+//     19.7/20.2 at 64, 37.5/38.0 at 96, 62.3/62.8 at 128, 121.5/122.0 at 180, 250.9/251.6 at 256). There is
+//     no dispatch gap to close. (The 78% busy this file would have read off a 14-pass BURST at n = 64 is the
+//     weight load inside that short span, not per-dispatch overhead - which is why the long run is the one
+//     to read.)
+//   * **Their fused triangle projections** - "one GEMM for the five triangle-multiplication projections,
+//     bit-exact, 0.999x with MLX's GEMM, pays off only with the tensor-op kernel" - is the optimisation this
+//     port already made independently (see `THE FOUR PROJECTIONS ARE ONE GEMM` in trunk.mm) and on the
+//     matrix units, where their own note says it is worth having.
+//   * **Their hand-written MPP `matmul2d` GEMM** is at parity with core's tensor GEMM per core, and this
+//     port's triangle GEMM already runs at 11.43 TFLOP/s in situ against its own standalone ceiling of
+//     10.67 on that shape. Nothing in their kernel to take.
+//   * **`recycle_strategy=low`** (upstream's 120-pass front-loaded preset), which they measure at 1.44x, is
+//     already implemented here - all nine of upstream's budget/shape files are transcribed in
+//     shared/rfd4p/flow.js and `low` is what every shipped preset names. Measured on this port at 180
+//     tokens: medium **180 passes, 21.68 s** against low **120 passes, 14.94 s** - **1.45x**, chain
+//     unchanged (CA-CA 3.84 A both). So this lever was ported before the comparison and the two ports agree
+//     on what it is worth.
+//   * **Batching designs** is 1.10x by their own measurement and cannot pay here at 98-99% busy.
+//
+// 🔴 WHAT IS WORTH BORROWING IS THEIR NEGATIVE AND QUALITY RESULTS, which cost them runs this port would
+// otherwise have to repeat:
+//   * **Skipping the pair update on later recycles is ~2.5x and destroys the designs** - 0/100 designable,
+//     median scRMSD 8.01 A, Boltz-2 pose agreement 0%. That is the ONLY large "fewer passes" lever left in
+//     this architecture and it is now a closed question rather than an open one; do not implement it.
+//   * **The `low` preset's quality cost**: binder designability unchanged (87% MLX against 84% CUDA, n = 200
+//     each) but binder-target heavy-atom clashes rise to **22% from 12%** - and CUDA at the same preset
+//     shows the same (20%), so it is the PRESET and not the port. Worth knowing here because `low` is this
+//     port's shipped default and that 1.45x is not free.
+//   * **MLX's fp32 is TF32-class on an M5** (relative error 1.0e-02 against 3.8e-03 for its own fp16) unless
+//     `MLX_ENABLE_TF32=0`. Checked against this port rather than assumed: core's f32 GEMM is genuine fp32 -
+//     selftest reads relRMS 4.6e-08 to 5.0e-08 across five widths - so `--f32` really is the high-precision
+//     control this file treats it as, and their trap is not ours.
+//
 // What is still NOT equal, and no same-machine run fixes it: the precisions differ. Their trunk is fp16
 // throughout; this one stores int8 and computes in half, so it moves less weight traffic, and part of this
 // margin is the bundle rather than the kernels. Their MLX peak at 180 tokens is 1.21 GB of MLX arrays
