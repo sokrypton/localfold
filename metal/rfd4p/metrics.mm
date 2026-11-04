@@ -13,14 +13,29 @@
 #include "rfd4p.h"
 #include "design.h"
 #include "rfd4p-metrics.h"
+#include "rfd4p-oracle.h"
 #include "rfd4p/src/metrics_tags.h"
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <mach-o/dyld.h>
 
-bool writeMetrics(const std::string& path, const Design& d, int n, bool* pass) {
+// 🔴 THE SIBLING ORACLE'S BINARY, AND `/proc/self/exe` IS THE ONE THING THAT DID NOT PORT. oracle.h's own
+// `oracleBinary` reads that link to find `cuda/<oracle>/localfold-<oracle>` beside itself; macOS has no such
+// path, so the lookup is here instead - and the relative arithmetic is identical, because
+// `metal/rfd4p/localfold-rfd4p` sits the same distance from `metal/af3/localfold-af3` as its cuda/ twin does.
+static std::string oracleBinary(const std::string& oracle) {
+  char self[4096];
+  uint32_t n = sizeof self;
+  const std::string dir = _NSGetExecutablePath(self, &n) == 0 ? std::string(self) : std::string("./localfold-rfd4p");
+  const size_t slash = dir.rfind('/');
+  return (slash == std::string::npos ? std::string(".") : dir.substr(0, slash)) + "/../" + oracle +
+         "/localfold-" + oracle;
+}
+
+bool writeMetrics(const MetricsRun& run, const Design& d, int n, bool* pass) {
   // 🔴 A WORK DIRECTORY FEATURISED WITHOUT THE METRIC TABLES IS REFUSED BY NAME, not quietly scored on
   // whatever happens to be there: every one of these is an input the metrics read the design against, and a
   // missing table would read as a design that conditions on nothing.
@@ -63,7 +78,39 @@ bool writeMetrics(const std::string& path, const Design& d, int n, bool* pass) {
     fprintf(stderr, "--metrics: %s\n", e.what());
     return false;
   }
-  std::ofstream(path) << rfd4p::metrics::toJson(r) << "\n";
+  std::ofstream(run.path) << rfd4p::metrics::toJson(r) << "\n";
   if (pass) *pass = r.pass;
+
+  // 🔴 THE ORACLE RUNS ON WHAT SURVIVES THE PRE-ORACLE FILTERS, as upstream's does - a design the filters
+  // reject is not refolded, which is most of what makes a campaign affordable.
+  if (run.refold.empty() || !r.pass) return true;
+  const std::vector<std::string> tags = rfd4p::metricsTagsFromBits((int)M.meta("meta/metricsTags", 0));
+  const size_t dot = run.designPath.rfind('.');
+  const size_t slash = run.designPath.rfind('/');
+  const std::string base = dot == std::string::npos || (slash != std::string::npos && dot < slash + 1)
+                               ? run.designPath : run.designPath.substr(0, dot);
+  rfd4p::oracle::Run o;
+  o.oracle = run.refold;
+  o.binary = oracleBinary(run.refold);
+  o.dir = base + "_refold";
+  o.name = slash == std::string::npos ? base : base.substr(slash + 1);
+  o.seed = run.seed;
+  o.components = rfd4p::oracle::readComponents(run.genDir + "/input-components.cif");
+  o.keepRaw = run.keepRaw;
+  try {
+    const rfd4p::metrics::Array full = rfd4p::metrics::designArray(d.records, in);
+    std::vector<double> cwi;
+    if (!rfd4p::metrics::coordsWithInsertion(full, in, d.proposed, cwi)) cwi.clear();
+    const rfd4p::oracle::Scores v = rfd4p::oracle::refoldDesign(full, cwi, o, tags, r.metrics);
+    if (!v.values.empty()) {
+      std::ofstream(base + ".refold.json") << rfd4p::oracle::toJson(v) << "\n";
+      printf("  refolded -> %s.refold.json\n", base.c_str());
+    } else {
+      printf("  refold: this job's tags name no %s oracle\n", run.refold.c_str());
+    }
+  } catch (const std::exception& e) {
+    fprintf(stderr, "--refold: %s\n", e.what());
+    return false;
+  }
   return true;
 }

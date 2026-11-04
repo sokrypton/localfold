@@ -62,6 +62,16 @@ rfd4p::GenOut decoderPostprocess(int n, const float* caNm, const int* seq, const
 Design buildDesign(rfd4p::GenOut& g, const OutInput& in);
 // The design written - mmCIF where the path ends `.cif` (RFD4-Proteina's own format), PDB otherwise.
 int writeStructure(const std::string& path, const Design& d);
-// Upstream's design metrics and pre-oracle verdict over those records, as `design-metrics.mjs` writes them.
+// What to write about a design: the metrics, and optionally the refolding oracle over what passes them.
+struct MetricsRun {
+  std::string path;         // the metrics JSON
+  std::string refold;       // "" for none, else "af3" or "af2" - upstream's refolding oracles
+  std::string designPath;   // the structure just written, which names the refold's files
+  std::string genDir;       // where `input-components.cif` is
+  uint32_t seed = 0;
+  bool keepRaw = false;     // keep AF2's PAE logits, which a checker reads again
+};
+// Upstream's design metrics and pre-oracle verdict over those records, as `design-metrics.mjs` writes them, and
+// then the refolding oracle on what survives the filters - as upstream runs it, and in that order.
 // Returns false and says why when the work directory was featurised without the metric tables.
-bool writeMetrics(const std::string& path, const Design& d, int n, bool* pass);
+bool writeMetrics(const MetricsRun& run, const Design& d, int n, bool* pass);

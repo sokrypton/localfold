@@ -191,7 +191,8 @@ bool stochasticStep(double t, const Modality& m);
 // clean estimate are held to the dump's own trajectory as they are produced.
 // `metricsPath` empty asks for no metrics; `dumpSample` empty, for no sample dump.
 int generate(const std::string& genDir, const std::string& outPath, int designs = 1, uint64_t seed = 0,
-             const std::string& metricsPath = "", const std::string& dumpSample = "");
+             const std::string& metricsPath = "", const std::string& dumpSample = "",
+             const std::string& refold = "");
 // the gate's comparison, set by main where there is an oracle to compare against: ours (on the device) against
 // the dump's tensor `key`, at `bound`, returning the relative RMS. Null when nothing is being held.
 extern double (*GATE_CHECK)(const char* label, const std::string& key, const float* ours, size_t n, double bound);

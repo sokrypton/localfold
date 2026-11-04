@@ -279,7 +279,8 @@ double GATE_TRAJ_BOUND = 1e-4;
 double GATE_TRAJ_XT_BOUND = 1e-4;
 
 int generate(const std::string& genDir, const std::string& outPath, int designs, uint64_t seed,
-             const std::string& metricsPath, const std::string& dumpSample) {
+             const std::string& metricsPath, const std::string& dumpSample,
+             const std::string& refold) {
   (void)genDir;
   const int n = D_.n, latent = DD_.latent;
   const size_t nn = (size_t)n * n;
@@ -797,8 +798,15 @@ int generate(const std::string& genDir, const std::string& outPath, int designs,
         mpath = (dot == std::string::npos ? mpath : mpath.substr(0, dot)) + "_" + std::to_string(design + 1) +
                 (dot == std::string::npos ? "" : mpath.substr(dot));
       }
+      MetricsRun mr;
+      mr.path = mpath;
+      mr.refold = refold;
+      mr.designPath = path;
+      mr.genDir = genDir;
+      mr.seed = (uint32_t)(seed + (uint64_t)design);
+      mr.keepRaw = !dumpSample.empty();   // a run dumped for a checker keeps what the checker reads
       bool pass = false;
-      if (!writeMetrics(mpath, d, n, &pass)) die("--metrics=%s could not be written", mpath.c_str());
+      if (!writeMetrics(mr, d, n, &pass)) die("--metrics=%s could not be written", mpath.c_str());
       printf("  metrics -> %s (%s the pre-oracle filters)\n", mpath.c_str(), pass ? "passes" : "fails");
     }
   }

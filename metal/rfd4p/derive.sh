@@ -50,3 +50,19 @@ if grep -qE '^#include "(\.\./)|^#include "(generate\.cuh|metrics_tags\.h|superp
   exit 1
 fi
 echo "$build/rfd4p-metrics.h: metrics.h with its includes repointed"
+
+# 🔴 AND `oracle.h` THE SAME WAY: upstream's REFOLDING ORACLE, which refolds each design that passes the
+# pre-oracle filters with this tree's own AlphaFold 3 and scores it as upstream does. It is host-only C++ too -
+# it reads `metrics.h`'s array and shells out to a sibling `localfold-<oracle>` - so the only thing it needed
+# was the same three includes repointed. 1491 lines this port does not have to write a second time.
+sed -e 's|#include "metrics.h"|#include "rfd4p-metrics.h"|' \
+    -e 's|#include "../featurise/cif.h"|#include "rfd4p/featurise/cif.h"|' \
+    -e 's|#include "../../featurise/json.h"|#include "featurise/json.h"|' \
+    "$src/oracle.h" > "$build/rfd4p-oracle.h"
+for w in rfd4p-metrics.h rfd4p/featurise/cif.h featurise/json.h; do
+  grep -q "^#include \"$w\"" "$build/rfd4p-oracle.h" || {
+    echo "derive.sh: $src/oracle.h no longer includes what this rewrite aims at $w" >&2
+    exit 1
+  }
+done
+echo "$build/rfd4p-oracle.h: oracle.h with its includes repointed"

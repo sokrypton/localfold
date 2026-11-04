@@ -2,6 +2,7 @@
 // model 1) natively over cuda/featurise's input, the page's bundle read through its weight walk.
 //
 //   localfold-af2 <input dir> --bundle=<dir> [--delta=<dir>] [--out=fold.pdb] [--recycles=N] [--tolerance=A]
+//   [--raw-confidences]
 #include "af2.h"
 #include "af2_weights.h"
 #include "host.h"
@@ -31,6 +32,9 @@ const char* ATOM37[37] = {"N", "CA", "C", "CB", "O", "CG", "CG1", "CG2", "OG", "
 double ms(double since) { return (now() - since) * 1e3; }
 std::string FRAMES_DIR;
 double TOLERANCE = 0;
+// `--raw-confidences`: the PAE head's logits and the unrounded pLDDT/PAE/pTM beside the PDB, for a refolding
+// oracle to reduce (cuda/rfd4p/src/oracle.h). Off by default: it is L x L x 64 floats on disk.
+bool RAW_CONF = false;
 
 void appendMatrix2(std::string& j, const float* m, int L) {
   j.reserve(j.size() + (size_t)L * L * 7 + 16);
@@ -291,6 +295,33 @@ int foldInput(const std::string& dir, const std::string& out, int recycles) {
   std::vector<float> pos = download(so.pos37, (size_t)L * 37 * 3);
   std::string text = pdbText(pos, plddt, L, aatype, asym, ri, mask37);
   writeWhole(out, text.data(), text.size());
+  // 🔴 `--raw-confidences`: THE CONFIDENCES AT FULL PRECISION, WHICH A REFOLDING ORACLE READS AND THE ROUNDED
+  // ONES CANNOT STAND IN FOR. Upstream's AF2 oracle reduces the PAE head's 64 logits a pair per chain and per
+  // chain pair (cuda/rfd4p/src/oracle.h reads `<stem>_raw_confidences.json` and `<stem>_pae_logits.f32`), where
+  // the files beside them carry the expected PAE quantised to a byte and the pLDDTs to two decimals - fine for
+  // a viewer and not for a score. cuda/af2 has had this flag; metal/rfd4p's `--refold=af2` refused by name for
+  // the want of it, which is the only reason it is here.
+  // The logits are re-projected rather than kept from the pass loop: that buffer is `scratch`, named and reused,
+  // and reading it after the loop would be trusting that nothing else asked for the same name.
+  if (RAW_CONF) {
+    const std::string stem = out.size() > 4 && out.compare(out.size() - 4, 4, ".pdb") == 0
+                                 ? out.substr(0, out.size() - 4) : out;
+    float* pl = scratch<float>("head.paeRaw", pairs * 64);
+    linearB(t.pair, "predicted_aligned_error_head/logits", -1, pl, pairs, 128, 64);
+    mt::sync();
+    const std::vector<float> logits = download(pl, pairs * 64);
+    writeWhole(stem + "_pae_logits.f32", logits.data(), logits.size() * 4);
+    std::string j = "{\"plddt\": [";
+    char b[48];
+    for (int i = 0; i < L; ++i) { snprintf(b, sizeof b, "%s%.9g", i ? ", " : "", plddt[i]); j += b; }
+    j += "], \"pae\": [";
+    for (size_t k = 0; k < pairs; ++k) { snprintf(b, sizeof b, "%s%.9g", k ? ", " : "", pae[k]); j += b; }
+    snprintf(b, sizeof b, "%.9g", ptm);
+    j += "], \"ptm\": " + std::string(b) + ", \"iptm\": ";
+    snprintf(b, sizeof b, "%.9g", iptm);
+    j += (std::isfinite(iptm) ? std::string(b) : std::string("null")) + "}\n";
+    writeWhole(stem + "_raw_confidences.json", j.data(), j.size());
+  }
   // the confidence files (AlphaFold 3's layout): atom pLDDTs in the PDB's order, the expected PAE, the contact map where
   // the weights carry the distogram head, the token layout; the summary
   {
@@ -363,6 +394,7 @@ int foldMain(int argc, char** argv) {
     else if (!strncmp(a, "--serve=", 8)) serveDir = a + 8;
     else if (!strncmp(a, "--wait-input", 12)) waitInput = true;
     else if (!strcmp(a, "--detach-output")) DETACH = true;
+    else if (!strcmp(a, "--raw-confidences")) RAW_CONF = true;
     else if (!strcmp(a, "--profile")) profile = true;
     else if (!strcmp(a, "--fast") || !strncmp(a, "--warm=", 7)) {}
     else if (!strncmp(a, "--weights=", 10)) die("--weights (DeepMind's float32 export) is not read here: --bundle");

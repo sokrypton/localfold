@@ -141,14 +141,14 @@
 // REFUSED BY NAME rather than run as something else: nothing, in this checkpoint's configuration.
 //
 // AGAINST cuda/rfd4p, FLAG BY FLAG, because "fully ported" is a claim and a claim should be checkable. Every
-// flag that port's parser accepts, and what this one does with it:
+// flag that port's parser accepts is here now, and this is what each maps to:
 //   --job= --work-dir= --out= --seed= --designs= --oracle= --encoder= --metrics= --dump-sample=
 //                      the same, and `--out=x.cif` picks mmCIF in both
 //   --int8= --weights=  `--bundle=` here: one bundle, the page's published int8, where cuda/rfd4p takes either
 //                       that or a float32 checkpoint directory
 //   --generate=         `--gen=`
-//   --recycles= --repeat= --no-insertion
-//                       the same, and all three exercised: `--recycles=2` reports two recycles, `--repeat=3`
+//   --refold[=af3|af2] --recycles= --repeat= --no-insertion
+//                       the same, and all exercised: `--recycles=2` reports two recycles, `--repeat=3`
 //                       prices a trunk pass, `--no-insertion` leaves the 40 unindexed tokens of
 //                       `motif_unidx_1prw` ungrafted and writes a different file
 //   --config= --length= --step= --spec=
@@ -158,19 +158,21 @@
 //   --gen-oracle= --enc-oracle=
 //                       the generation's and the encoder's oracle directories, which this port reads through
 //                       `--gen=` and `--encoder=` beside `--oracle=`
-// 🔴 AND ONE IS NOT HERE: `--refold[=af3|af2]`, upstream's REFOLDING ORACLE - each design that passes the
-// pre-oracle filters refolded by this tree's own AlphaFold 3 or AlphaFold 2 and scored as upstream scores it.
-// `oracle.h` itself is portable: it is host-only C++ and COMPILES CLEAN under clang against the derived
-// headers (checked), and `metal/af3/localfold-af3` and `metal/af2/localfold-af2` sit in the same relative
-// place as their cuda/ twins, so even `oracleBinary`'s path arithmetic would carry over. What does not carry
-// is the command it runs: that function drives
-//     localfold-af3 --job=<j> --out=<o> --recycles=5 --steps=200 --seed=N
-//     localfold-af2 --job=<j> --model=<m> --out=<o> --msa-mask=0 --template-pad=zero --fast --raw-confidences
-// and the Metal af3 and af2 ports take a FEATURISED INPUT DIRECTORY rather than a job, with no `--job=`,
-// `--model=`, `--msa-mask=`, `--template-pad=` or `--raw-confidences` between them. Porting it means giving
-// those two ports a job interface - the featuriser linked in, as this port has - which is work in two other
-// ports rather than in this one. 🔴 AND THE af3 HALF CANNOT BE EXERCISED HERE AT ALL: metal/af3 needs
-// DeepMind's terms, which are not ours to accept.
+// 🔴 AND `--refold[=af3|af2]` IS HERE TOO, which this file said twice that it could not be. Upstream's
+// REFOLDING ORACLE: each design that passes the pre-oracle filters refolded by this tree's own AlphaFold 3 or
+// AlphaFold 2 and scored as upstream scores it. The claim that it needed "a job interface in two other ports"
+// was simply wrong - metal/af3, metal/af2 and metal/ef2 all take `--job=` through `lf::standalone::main` (the
+// dispatch is one line: an argv[1] starting `--`), and `--model=`, `--msa-mask=` and `--template-pad=` are
+// featuriser flags that layer already forwards. Reading a port's usage line and stopping there cost two rounds.
+// `oracle.h` is 1491 lines of host-only C++ that derive.sh repoints like the others, so nothing was rewritten.
+// What it really needed was two small things: `/proc/self/exe` does not exist on macOS, so the sibling
+// binary's path is found with `_NSGetExecutablePath` in metrics.mm (the relative arithmetic is identical -
+// metal/rfd4p/localfold-rfd4p sits the same distance from metal/af3/localfold-af3 as its cuda/ twin does), and
+// AF2's oracle reads `--raw-confidences`, which metal/af2 did not write and now does.
+// Both run, on `gate-oracle-motif-60` at 60 steps: af3 gives oracle pLDDT 86.9, a refolded backbone RMSD of
+// 2.21 A and a motif all-atom RMSD of 1.10; af2 gives 73.28 and 5.27 / 4.90, with `model_1_ptm` named in the
+// output as upstream labels it. `--refold` without `--metrics=` is refused by name, because the oracle runs on
+// what the filters pass and that file is what computes them.
 //
 // THE GATE, over an exported input directory rather than a job:
 //   localfold-rfd4p <input dir> --bundle=<model-rfd4p-int8> [--oracle=<dir>] [--encoder=<dir>] [--gen=<dir>-gen]
@@ -253,6 +255,7 @@ int main(int argc, char** argv) {
   std::string input, bundle, oracle, encDir, genDir, outPath, job, workDir, seed, metricsPath, dumpSample;
   std::vector<std::string> featuriserArgs;
   int recycles = 0, repeat = 0;
+  std::string refold;
   int designs = 1;
   for (int i = 1; i < argc; ++i) {
     const char* a = argv[i];
@@ -267,6 +270,13 @@ int main(int argc, char** argv) {
     else if (!strncmp(a, "--designs=", 10)) designs = atoi(a + 10);
     else if (!strncmp(a, "--metrics=", 10)) metricsPath = a + 10;
     else if (!strncmp(a, "--dump-sample=", 14)) dumpSample = a + 14;
+    // 🔴 `--refold[=af3|af2]`: UPSTREAM'S REFOLDING ORACLE, which needs no change to the oracle ports at all -
+    // metal/af3, metal/af2 and metal/ef2 all take `--job=` through `lf::standalone::main`, and `--model=`,
+    // `--msa-mask=` and `--template-pad=` are featuriser flags that layer already forwards. `--refold=af2`
+    // additionally wants `--raw-confidences` - the PAE head's logits at full precision, which the oracle
+    // reduces per chain pair - and metal/af2 has that now, so both oracles run.
+    else if (!strcmp(a, "--refold")) refold = "af3";
+    else if (!strncmp(a, "--refold=", 9)) refold = a + 9;
     // cuda/rfd4p's own flags, so a command that drives one port drives the other
     else if (!strncmp(a, "--recycles=", 11)) recycles = atoi(a + 11);
     else if (!strncmp(a, "--repeat=", 9)) repeat = atoi(a + 9);
@@ -287,6 +297,17 @@ int main(int argc, char** argv) {
   // `npm run test:featurise`-style gates hold to the JavaScript's to the last place. The directory is still
   // written to disk, because that is what the port reads and what a second run reuses; what is gone is the
   // second process and the Node it needed. cuda/rfd4p's `jobMain` is the reading.
+  if (!refold.empty()) {
+    if (refold != "af3" && refold != "af2") {
+      fprintf(stderr, "--refold=%s: the oracles are af3 and af2\n", refold.c_str());
+      return 2;
+    }
+    if (metricsPath.empty()) {
+      fprintf(stderr, "--refold needs --metrics=<file.json>: the oracle runs on the designs that pass the "
+                      "pre-oracle filters, which is what that file computes\n");
+      return 2;
+    }
+  }
   if (!job.empty()) {
     if (bundle.empty()) { fprintf(stderr, "--job= needs --bundle=<model-rfd4p-int8>\n"); return 2; }
     if (workDir.empty()) workDir = job + ".featurised";
@@ -341,7 +362,8 @@ int main(int argc, char** argv) {
   if (input.empty() || bundle.empty()) {
     fprintf(stderr, "usage: localfold-rfd4p --job=<spec.json|.yaml> --bundle=<model-rfd4p-int8> [--out=design.pdb|.cif]\n"
                     "         [--designs=N] [--seed=N] [--metrics=<file.json>]\n"
-                    "         [--dump-sample=<dir>] [--recycles=N] [--repeat=N] [--no-insertion] [--f32]\n"
+                    "         [--dump-sample=<dir>] [--refold[=af3|af2]] [--recycles=N] [--repeat=N]\n"
+                    "         [--no-insertion] [--f32]\n"
                     "       localfold-rfd4p <input dir> --bundle=<model-rfd4p-int8> [--oracle=<dir>] "
                     "[--encoder=<dir>] [--gen=<dir>-gen] [--out=design.pdb] [--designs=N] [--f32]\n");
     return 2;
@@ -727,7 +749,7 @@ int main(int argc, char** argv) {
     // 23 A between seeds. 3e-2 is that with room; the `--f32` arm holds every row at 1e-4.
     GATE_TRAJ_XT_BOUND = HALF ? 3e-2 : 1e-4;
     const int ran = generate(genDir, outPath, designs, seed.empty() ? 0 : strtoull(seed.c_str(), nullptr, 10),
-                             metricsPath, dumpSample);
+                             metricsPath, dumpSample, refold);
     printf("  the sampler ran %d steps\n", ran);
     GATE_CHECK = nullptr;
   }
