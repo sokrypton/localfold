@@ -93,6 +93,72 @@ int main(int argc, char** argv) {
             1e-2, 3.5e-2, 8e-2);
   }
   {
+    // A STACK (af2::Stack, 3 blocks). Its BF16 backward keeps the running gradients bf16 from block to block, which a
+    // block's own blockBackward would round them to on entry anyway; its keep tiers run the last blocks' backward on
+    // their forward's saves, with no replay; and its bf16 carry rounds the residual stream to bf16 between blocks.
+    // The first two compute what they replace - not bitwise, the attention's dQ and the LayerNorms' parameter
+    // gradients being float atomics, so they are held to the stack's own run-to-run difference - and the carry is
+    // held to float32 at the bars the blocks above are.
+    curandSetPseudoRandomGeneratorSeed(gen, 5);
+    const int L = 40, S = 24, nb = 3;
+    af2::Stack st; st.blocks.resize(nb);
+    std::vector<Param*> all;
+    for (int i = 0; i < nb; ++i) {
+      af2::Block& b = st.blocks[i];
+      af2::forEachParam(b, [&](const std::string& n, Param& p, size_t len) {
+        p.name = n; p.n = len; p.w = randn(len, 0.05f); GK(cudaMalloc(&p.g, len * 4)); b.params.add(p); all.push_back(&p); });
+    }
+    size_t mr = (size_t)S * L * 256, pr = (size_t)L * L * 128;
+    float *msa = randn(mr, 1.f), *pair = randn(pr, 1.f), *ctm = randn(mr, 1.f), *ctp = randn(pr, 1.f);
+    float *mm = mask(S, L, 1), *pm = mask(L, L, 5);
+    float *dm, *dp, *mo, *po;
+    GK(cudaMalloc(&dm, mr * 4)); GK(cudaMalloc(&dp, pr * 4)); GK(cudaMalloc(&mo, mr * 4)); GK(cudaMalloc(&po, pr * 4));
+    // arms: 0 1 2 no carry, no keep: the stack, blockBackward chained by hand, the stack again; 3 no carry, keep;
+    // 4 5 carry, no keep and keep; 6 float32; 7 on a stream of its own, so the blocks' backwards are CUDA graphs
+    struct Arm { bool bf, carry, manual; size_t keep; bool stream = false; };
+    const Arm arms[8] = {{true, false, false, 0}, {true, false, true, 0}, {true, false, false, 0}, {true, false, false, SIZE_MAX},
+                         {true, true, false, 0}, {true, true, false, SIZE_MAX}, {false, false, false, 0},
+                         {true, false, false, 0, true}};
+    Run got[8];
+    for (int a = 0; a < 8; ++a) {
+      if (arms[a].stream) { GK(cudaStreamCreateWithFlags(&STREAM, cudaStreamNonBlocking)); GB(cublasSetStream(BLAS, STREAM)); }
+      setBf16(arms[a].bf);
+      st.bf16Carry = arms[a].carry; st.keepBytes = arms[a].keep;
+      for (auto& b : st.blocks) b.params.zeroGrad();
+      ARENA.reset();
+      st.forward(msa, pair, mm, pm, S, L);
+      if (arms[a].keep && st.keptBlocks() != nb - 1) { printf("  keep tiers kept %zu of %d blocks\n", st.keptBlocks(), nb - 1); fails++; }
+      GK(cudaStreamSynchronize(STREAM));   // (hostv copies on the legacy stream, which does not wait for a non-blocking one)
+      got[a].out = {hostv(st.msaIn.back(), mr), hostv(st.pairIn.back(), pr)};
+      GK(cudaMemcpy(dm, ctm, mr * 4, cudaMemcpyDeviceToDevice)); GK(cudaMemcpy(dp, ctp, pr * 4, cudaMemcpyDeviceToDevice));
+      if (!arms[a].manual) st.backward(mm, pm, dm, dp);
+      else
+        for (int i = nb; i-- > 0;) {
+          Scratch sc;
+          af2::BlockSave s = af2::blockForward(st.blocks[i], st.msaIn[i], st.pairIn[i], mm, pm, mo, po, S, L);
+          af2::blockBackward(st.blocks[i], s, mm, pm, dm, dp, dm, dp);
+        }
+      GK(cudaStreamSynchronize(STREAM)); GK(cudaGetLastError());
+      got[a].out.push_back(hostv(dm, mr)); got[a].out.push_back(hostv(dp, pr));
+      for (auto* p : all) got[a].grads.push_back(hostv(p->g, p->n));
+      if (arms[a].stream) { GK(cudaStreamSynchronize(STREAM)); STREAM = 0; GB(cublasSetStream(BLAS, STREAM)); }
+    }
+    auto worstRel = [&](const Run& x, const Run& y) {   // the worst output's or tensor's relative rms
+      double w = 0;
+      for (size_t t = 0; t < x.out.size(); ++t) w = std::max(w, rms(x.out[t], y.out[t]));
+      for (size_t t = 0; t < x.grads.size(); ++t) w = std::max(w, rms(x.grads[t], y.grads[t]));
+      return w;
+    };
+    const double self = worstRel(got[0], got[2]);
+    printf("AF2 BF16 stack (3 blocks), run to run %.2e; against it, by the same bar (2x + 1e-6):\n", self);
+    report("bf16 between blocks, against blockBackward's float", worstRel(got[0], got[1]), 2 * self + 1e-6);
+    report("keep tiers, against replaying every block", worstRel(got[0], got[3]), 2 * self + 1e-6);
+    report("keep tiers with the bf16 carry, against replaying", worstRel(got[4], got[5]), 2 * self + 1e-6);
+    report("each block's backward a CUDA graph, against launched", worstRel(got[0], got[7]), 2 * self + 1e-6);
+    const char* names[] = {"msa out", "pair out", "d msa", "d pair"};
+    compare("AF2 stack (3 blocks, L 40, S 24) with the bf16 carry", got[6], got[4], all, names, 1e-2, 3.5e-2, 8e-2);
+  }
+  {
     curandSetPseudoRandomGeneratorSeed(gen, 4);
     const int n = 80, Cz = 128, Cs = 384, Hp = 4, Dp = 32, Hs = 16, Ds = 24;
     af3::Pairformer b; af3::Dialect d; Params ps;

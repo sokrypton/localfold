@@ -397,13 +397,23 @@ inline BlockSave blockForward(Block& b, const real* msa, const real* pair, const
   s.S = S; s.L = L; s.msa0 = msa; s.pair0 = pair;
   const int Cm = b.Cm, Cz = b.Cz;
   size_t mr = (size_t)S * L, pr = (size_t)L * L;
+  // (BF16: the LayerNorms' float outputs that only the forward reads - every attention keeps its own bf16 copy of its
+  // input, and the pair biases' backward recomputes theirs - from the stream-ordered pool, freed at the end: 168 MB a
+  // block at L 256 that a kept block no longer holds)
+  std::vector<real*> tmps;
+  auto tmp = [&](size_t n) {
+#ifndef GRAD_F64
+    if (BF16) { real* p; GK(cudaMallocAsync(&p, n * sizeof(real), STREAM)); tmps.push_back(p); return p; }
+#endif
+    return ARENA.get(n);
+  };
   real* pcur = clone(pair, pr * Cz);
   if (b.opmFirst) s.opm = opmForward(b.opm, msa, msaMask, pcur, S, L);
   s.pair1 = pcur;
   // MSA row attention with pair bias
-  s.rowXn = ARENA.get(mr * Cm);
+  s.rowXn = tmp(mr * Cm);
   s.rowQ = lnForward(b.row.qn, msa, s.rowXn, mr);
-  s.rowPn = ARENA.get(pr * Cz);
+  s.rowPn = tmp(pr * Cz);
   s.rowP = lnForward(b.row.pn, s.pair1, s.rowPn, pr);
   s.rowNb = ARENA.get(pr * 8);
   pairBias(s.rowPn, b.row.feat2d.w, s.rowNb, L, Cz, 8);
@@ -418,7 +428,7 @@ inline BlockSave blockForward(Block& b, const real* msa, const real* pair, const
   swap01(s.msa1, s.colX, S, L, Cm);
   s.colMask = ARENA.get(mr);
   transpose(msaMask, s.colMask, S, L);
-  s.colXn = ARENA.get(mr * Cm);
+  s.colXn = b.extra ? ARENA.get(mr * Cm) : tmp(mr * Cm);   // (the global attention keeps a pointer to it)
   real* updT = ARENA.get(mr * Cm);
   if (!b.extra) {
     s.colQ = lnForward(b.col.qn, s.colX, s.colXn, mr);
@@ -448,7 +458,7 @@ inline BlockSave blockForward(Block& b, const real* msa, const real* pair, const
   dropout(b, DROP_TRI_IN, pu, L, L, Cz, false);
   s.pair3 = clone(s.pair2, pr * Cz); add(s.pair3, pu, pr * Cz);
   // triangle attention, starting node (per row)
-  s.stXn = ARENA.get(pr * Cz);
+  s.stXn = tmp(pr * Cz);
   s.stQ = lnForward(b.triStart.qn, s.pair3, s.stXn, pr);
   s.stNb = ARENA.get(pr * 4);
   pairBias(s.stXn, b.triStart.feat2d.w, s.stNb, L, Cz, 4);
@@ -460,7 +470,7 @@ inline BlockSave blockForward(Block& b, const real* msa, const real* pair, const
   swap01(s.pair4, s.enX, L, L, Cz);
   s.pairMaskT = ARENA.get(pr);
   transpose(pairMask, s.pairMaskT, L, L);
-  s.enXn = ARENA.get(pr * Cz);
+  s.enXn = tmp(pr * Cz);
   s.enQ = lnForward(b.triEnd.qn, s.enX, s.enXn, pr);
   s.enNb = ARENA.get(pr * 4);
   pairBias(s.enXn, b.triEnd.feat2d.w, s.enNb, L, Cz, 4);
@@ -473,6 +483,8 @@ inline BlockSave blockForward(Block& b, const real* msa, const real* pair, const
   GK(cudaMemcpyAsync(pairOut, s.pair5, pr * Cz * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
   add(pairOut, pu, pr * Cz);
   GK(cudaMemcpyAsync(msaOut, s.msa3, mr * Cm * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
+  for (real* p : tmps) GK(cudaFreeAsync(p, STREAM));
+  if (!tmps.empty()) { s.rowXn = s.rowPn = s.stXn = s.enXn = nullptr; if (!b.extra) s.colXn = nullptr; }
   return s;
 }
 
@@ -498,18 +510,15 @@ inline void toP(const real* x, real* y, size_t n) { GK(cudaMemcpyAsync(y, x, n *
 inline void fromP(const real* x, real* y, size_t n) { GK(cudaMemcpyAsync(y, x, n * sizeof(real), cudaMemcpyDeviceToDevice, STREAM)); }
 // PD: the running gradients' type - real, or bf16 in BF16 mode (the pair's and the MSA's: bindcraft2 keeps its MSA
 // cotangent float; test-bf16 holds this one to autocast's level)
+// dm, dp: the running gradients of the MSA and the pair, the block's output's in and its input's out (in place;
+// bf16 in BF16 mode, where a stack keeps them so between blocks)
 template <class PD>
-inline void blockBackwardT(Block& b, const BlockSave& s, const real* msaMask, const real* pairMask,
-                           const real* dmsaOut, const real* dpairOut, real* dmsa, real* dpair) {
+inline void blockBackwardRun(Block& b, const BlockSave& s, const real* msaMask, const real* pairMask, PD* dm, PD* dp) {
   const int S = s.S, L = s.L, Cm = b.Cm, Cz = b.Cz;
   size_t mr = (size_t)S * L, pr = (size_t)L * L;
   constexpr bool BP = sizeof(PD) == 2;
   auto getP = [&](size_t n) { return reinterpret_cast<PD*>(BP ? (real*)bfGetT(n) : ARENA.get(n)); };
   auto cloneP = [&](const PD* x, size_t n) { PD* y = getP(n); GK(cudaMemcpyAsync(y, x, n * sizeof(PD), cudaMemcpyDeviceToDevice, STREAM)); return y; };
-  PD* dp = getP(pr * Cz);                     // the running gradient of the pair
-  toP(dpairOut, dp, pr * Cz);
-  PD* dm = getP(mr * Cm);                     // and of the MSA (bf16 as well in BF16 mode)
-  toP(dmsaOut, dm, mr * Cm);
   // pair transition
   { Range r("bw.pairTrans"); transBackward(b.pairTrans, s.pairT, (const PD*)dp, dp, true); }
   // ending node: pair5 = pair4 + swap(attn(enXn))
@@ -520,11 +529,10 @@ inline void blockBackwardT(Block& b, const BlockSave& s, const real* msaMask, co
     swap01(dp, dupdT, L, L, Cz);
     dropout(b, DROP_TRI_END, dupdT, L, L, Cz, true);
     real* dnb = ARENA.zeros(pr * 4);
-    real* dxn = ARENA.get(pr * Cz);
+    PD* dxn = getP(pr * Cz);   // (bf16 in BF16 mode: only the LayerNorm's backward reads it)
     attnBackward(b.triEnd.at, s.enA, s.pairMaskT, s.enNb, dupdT, dxn, dnb, false);
-    pairBiasBackward(s.enXn, b.triEnd.feat2d, dnb, dxn, L, Cz, 4, true);
     PD* dx = getP(pr * Cz);
-    lnBackward(b.triEnd.qn, s.enQ, dxn, dx, pr, false);
+    lnBackwardPairBias(b.triEnd.qn, s.enQ, dxn, dx, pr, false, dnb, b.triEnd.feat2d, 4);
     swap01(dx, dp, L, L, Cz, true);
   }
   // starting node
@@ -532,12 +540,11 @@ inline void blockBackwardT(Block& b, const BlockSave& s, const real* msaMask, co
     Range r("bw.triStart");
     Scratch scratch;
     real* dnb = ARENA.zeros(pr * 4);
-    real* dxn = ARENA.get(pr * Cz);
+    PD* dxn = getP(pr * Cz);
     const PD* dst = dp;
     if (b.dropout) { PD* t = cloneP(dp, pr * Cz); dropout(b, DROP_TRI_START, t, L, L, Cz, false); dst = t; }
     attnBackward(b.triStart.at, s.stA, pairMask, s.stNb, dst, dxn, dnb, false);
-    pairBiasBackward(s.stXn, b.triStart.feat2d, dnb, dxn, L, Cz, 4, true);
-    lnBackward(b.triStart.qn, s.stQ, dxn, dp, pr, true);
+    lnBackwardPairBias(b.triStart.qn, s.stQ, dxn, dp, pr, true, dnb, b.triStart.feat2d, 4);
   }
   // triangle multiplications: pair3 = pair2 + tIn(pair2); pair2 = pc + tOut(pc)
   {
@@ -562,12 +569,13 @@ inline void blockBackwardT(Block& b, const BlockSave& s, const real* msaMask, co
     Range r("bw.col");
     PD* dupdT = getP(mr * Cm);
     swap01(dm, dupdT, S, L, Cm);
-    real* dxn = ARENA.get(mr * Cm);
     PD* dx = getP(mr * Cm);
     if (!b.extra) {
+      PD* dxn = getP(mr * Cm);
       attnBackward(b.col.at, s.colA, s.colMask, nullptr, (const PD*)dupdT, dxn, nullptr, false);
-      lnBackward(b.col.qn, s.colQ, dxn, dx, mr, false);
+      lnBackward(b.col.qn, s.colQ, (const PD*)dxn, dx, mr, false);
     } else {   // (the global column attention is float throughout)
+      real* dxn = ARENA.get(mr * Cm);
       const real* du;
       if constexpr (BP) { real* t = ARENA.get(mr * Cm); fromP(dupdT, t, mr * Cm); du = t; } else du = dupdT;
       gaBackward(b.colg.at, s.colG, s.colMask, du, dxn, false);
@@ -580,18 +588,28 @@ inline void blockBackwardT(Block& b, const BlockSave& s, const real* msaMask, co
     Scratch scratch;
     Range r("bw.row");
     real* dnb = ARENA.zeros(pr * 8);
-    real* dxn = ARENA.get(mr * Cm);
+    PD* dxn = getP(mr * Cm);
     const PD* drow = dm;
     if (b.dropout) { PD* t = cloneP(dm, mr * Cm); dropout(b, DROP_ROW, t, S, L, Cm, false); drow = t; }
     attnBackward(b.row.at, s.rowA, msaMask, s.rowNb, drow, dxn, dnb, false);
-    lnBackward(b.row.qn, s.rowQ, dxn, dm, mr, true);
-    real* dpn = ARENA.get(pr * Cz);
-    pairBiasBackward(s.rowPn, b.row.feat2d, dnb, dpn, L, Cz, 8, false);
-    lnBackward(b.row.pn, s.rowP, dpn, dp, pr, true);
+    lnBackward(b.row.qn, s.rowQ, (const PD*)dxn, dm, mr, true);
+    lnBackwardPairBias(b.row.pn, s.rowP, (const real*)nullptr, dp, pr, true, dnb, b.row.feat2d, 8);
   }
   if (b.opmFirst) { Range r("bw.opm"); opmBackward(b.opm, s.opm, msaMask, dp, dm); }    // pair1 = pair + opm(msa)
-  fromP(dm, dmsa, mr * Cm);
-  fromP(dp, dpair, pr * Cz);
+}
+template <class PD>
+inline void blockBackwardT(Block& b, const BlockSave& s, const real* msaMask, const real* pairMask,
+                           const real* dmsaOut, const real* dpairOut, real* dmsa, real* dpair) {
+  const size_t mr = (size_t)s.S * s.L, pr = (size_t)s.L * s.L;
+  constexpr bool BP = sizeof(PD) == 2;
+  auto getP = [&](size_t n) { return reinterpret_cast<PD*>(BP ? (real*)bfGetT(n) : ARENA.get(n)); };
+  PD* dp = getP(pr * b.Cz);                   // the running gradient of the pair
+  toP(dpairOut, dp, pr * b.Cz);
+  PD* dm = getP(mr * b.Cm);                   // and of the MSA (bf16 as well in BF16 mode)
+  toP(dmsaOut, dm, mr * b.Cm);
+  blockBackwardRun(b, s, msaMask, pairMask, dm, dp);
+  fromP(dm, dmsa, mr * b.Cm);
+  fromP(dp, dpair, pr * b.Cz);
 }
 // dmsaOut, dpairOut -> dmsa, dpair (written). Every parameter gradient accumulates.
 inline void blockBackward(Block& b, const BlockSave& s, const real* msaMask, const real* pairMask,
@@ -612,43 +630,221 @@ namespace af2 {
 // The forward keeps every block's INPUT (msa and pair, fp32) and nothing else; the backward replays block i's
 // forward with its saves straight before block i's backward, and resets the arena after. Held: n block inputs plus
 // ONE block's activations, for the price of one extra forward - AF2's own use_remat.
+// KEEP TIERS (bindcraft2's): where the device has the room, the forward keeps the LAST blocks' whole saves - the
+// first the backward reaches - and their backward runs on them with no replay. They live in the stack's own arena
+// (`keep`, swapped in for those blocks' forwards), which a caller's Scratch around forward() cannot rewind. How many:
+// keepBytes of saves, or by default what the device has free past one block's working set, measured on block 0.
+// THE BF16 CARRY (BF16 mode, bf16Carry): the blocks' inputs kept in bf16 - half the stack's saved inputs - and every
+// block, the first too, reads its input widened from that copy, so the forward and the backward's replay see the
+// same numbers: the residual stream rounded to bf16 where one block hands it to the next (bindcraft2's bf16 chain at
+// the block boundary; a pure-bf16 PyTorch block rounds it after every op). The output, msaIn/pairIn.back(), is float.
 struct Stack {
   std::vector<Block> blocks;
-  std::vector<real*> msaIn, pairIn;     // [n + 1]: block i's input, and the stack's output last
+  std::vector<real*> msaIn, pairIn;     // [n + 1]: block i's input (float; with the carry only the output, [n]), and the stack's output last
   int S = 0, L = 0;
-  size_t inputBytes() const { return (msaIn.size() * (size_t)S * L * blocks[0].Cm + pairIn.size() * (size_t)L * L * 128) * sizeof(real); }
+  size_t keepBytes = SIZE_MAX;          // the kept saves' budget (SIZE_MAX: the free memory; 0: none, every block replays)
+  bool bf16Carry = false;               // (BF16 mode only; off: at L 256 it is 1% slower and frees 1.4 of 3.1 GiB)
+  // each block's replay and backward captured as a CUDA graph and launched as one, the exec updated in place from
+  // block to block (same kernels, other pointers): 2.6% of the stack's backward at L 256. Only on a capturable STREAM
+  // - not the legacy default one.
+  bool graphs = true;
+  Arena keep;
+  std::vector<BlockSave> kept;
+  std::vector<Arena::Mark> keptAt;
+  size_t firstKept = 0;                 // blocks [firstKept, n) kept by the last forward
+  size_t keptBlocks() const { return blocks.size() - firstKept; }
+#ifndef GRAD_F64
+  std::vector<bf*> msaInB, pairInB;     // the carry: block i's input in bf16, [n]
+  real *outM = nullptr, *outP = nullptr;   // a block's float output before it is narrowed into the next's input
+  bool carry = false;
+#else
+  static constexpr bool carry = false;
+#endif
+  size_t nm() const { return (size_t)S * L * blocks[0].Cm; }
+  size_t np() const { return (size_t)L * L * 128; }
+  size_t inputBytes() const {
+    const size_t f = (size_t)(carry ? 2 : blocks.size() + 1) * (nm() + np()) * sizeof(real);
+    return carry ? f + blocks.size() * (nm() + np()) * 2 : f;
+  }
   void ensure(int S_, int L_) {
-    if (S_ == S && L_ == L && !msaIn.empty()) return;
-    for (real* p : msaIn) GK(cudaFree(p));
-    for (real* p : pairIn) GK(cudaFree(p));
-    msaIn.assign(blocks.size() + 1, nullptr); pairIn.assign(blocks.size() + 1, nullptr);
+#ifndef GRAD_F64
+    const bool c = BF16 && bf16Carry;
+#else
+    const bool c = false;
+#endif
+    if (S_ == S && L_ == L && !msaIn.empty() && c == carry) return;
+    for (real* p : msaIn) if (p) GK(cudaFree(p));
+    for (real* p : pairIn) if (p) GK(cudaFree(p));
+    const size_t n = blocks.size();
+    msaIn.assign(n + 1, nullptr); pairIn.assign(n + 1, nullptr);
     S = S_; L = L_;
-    for (size_t i = 0; i <= blocks.size(); ++i) {
-      GK(cudaMalloc(&msaIn[i], (size_t)S * L * blocks[0].Cm * sizeof(real)));
-      GK(cudaMalloc(&pairIn[i], (size_t)L * L * 128 * sizeof(real)));
+#ifndef GRAD_F64
+    for (bf* p : msaInB) GK(cudaFree(p));
+    for (bf* p : pairInB) GK(cudaFree(p));
+    msaInB.clear(); pairInB.clear();
+    if (outM) { GK(cudaFree(outM)); GK(cudaFree(outP)); outM = outP = nullptr; }
+    carry = c;
+    if (carry) {
+      msaInB.assign(n, nullptr); pairInB.assign(n, nullptr);
+      for (size_t i = 0; i < n; ++i) {
+        GK(cudaMalloc(&msaInB[i], nm() * sizeof(bf)));
+        GK(cudaMalloc(&pairInB[i], np() * sizeof(bf)));
+      }
+      GK(cudaMalloc(&outM, nm() * sizeof(real))); GK(cudaMalloc(&outP, np() * sizeof(real)));
+      GK(cudaMalloc(&msaIn[n], nm() * sizeof(real))); GK(cudaMalloc(&pairIn[n], np() * sizeof(real)));
+      return;
     }
+#endif
+    for (size_t i = 0; i <= n; ++i) {
+      GK(cudaMalloc(&msaIn[i], nm() * sizeof(real)));
+      GK(cudaMalloc(&pairIn[i], np() * sizeof(real)));
+    }
+  }
+  // block i's input as the forward and the replay both read it: in place, or widened from its bf16 copy into the
+  // arena in use (the keep arena for a kept block, whose saves point at it)
+  void input(size_t i, const real*& m, const real*& p) {
+#ifndef GRAD_F64
+    if (carry) {
+      real *a = ARENA.get(nm()), *b = ARENA.get(np());
+      fromP(msaInB[i], a, nm()); fromP(pairInB[i], b, np());
+      m = a; p = b;
+      return;
+    }
+#endif
+    m = msaIn[i]; p = pairIn[i];
+  }
+  // block i's forward, its output into the next block's input (narrowed, with the carry)
+  BlockSave run(size_t i, const real* msaMask, const real* pairMask) {
+    const size_t n = blocks.size();
+    const real *m, *p;
+    input(i, m, p);
+    if (!carry || i + 1 == n) return blockForward(blocks[i], m, p, msaMask, pairMask, msaIn[i + 1], pairIn[i + 1], S, L);
+#ifndef GRAD_F64
+    BlockSave s = blockForward(blocks[i], m, p, msaMask, pairMask, outM, outP, S, L);
+    toBf(outM, msaInB[i + 1], nm()); toBf(outP, pairInB[i + 1], np());
+    return s;
+#else
+    return BlockSave{};
+#endif
   }
   // msa/pair -> msaIn.back()/pairIn.back()
   void forward(const real* msa, const real* pair, const real* msaMask, const real* pairMask, int S_, int L_) {
     ensure(S_, L_);
-    GK(cudaMemcpyAsync(msaIn[0], msa, (size_t)S * L * blocks[0].Cm * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
-    GK(cudaMemcpyAsync(pairIn[0], pair, (size_t)L * L * 128 * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
-    for (size_t i = 0; i < blocks.size(); ++i) {
+#ifndef GRAD_F64
+    if (carry) { toBf(msa, msaInB[0], nm()); toBf(pair, pairInB[0], np()); }
+    else
+#endif
+    {
+      GK(cudaMemcpyAsync(msaIn[0], msa, nm() * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
+      GK(cudaMemcpyAsync(pairIn[0], pair, np() * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
+    }
+    const size_t n = blocks.size();
+    keep.reset();
+    kept.assign(n, BlockSave{}); keptAt.assign(n, Arena::Mark{});
+    firstKept = n;
+    size_t K = 0;
+    for (size_t i = 0; i < n; ++i) {
+      if (i >= n - K) {   // a kept block: its saves (and its widened input) into `keep`
+        std::swap(ARENA, keep);
+        keptAt[i] = ARENA.mark();
+        kept[i] = run(i, msaMask, pairMask);
+        std::swap(ARENA, keep);
+        continue;
+      }
       Scratch sc;          // (a scope, not a reset: a caller's saves in the arena outlive the stack)
-      blockForward(blocks[i], msaIn[i], pairIn[i], msaMask, pairMask, msaIn[i + 1], pairIn[i + 1], S, L);
+      if (i > 0 || keepBytes == 0) { run(i, msaMask, pairMask); continue; }
+      // block 0 sizes the tiers: its saves' bytes, and its forward's working set as the backward's stand-in
+      const Arena::Mark m = ARENA.mark();
+      const size_t high = ARENA.high;
+      ARENA.high = ARENA.used;
+      run(i, msaMask, pairMask);
+      const size_t save = ARENA.used - m.used, peak = ARENA.high - m.used;
+      ARENA.high = std::max(high, ARENA.high);
+      size_t budget = keepBytes;
+      if (budget == SIZE_MAX) {
+        size_t fr = 0, tot = 0;
+        GK(cudaMemGetInfo(&fr, &tot));
+        // the keep arena grows into what is free (and its own chunks); the backward's working set - one block's
+        // replay and backward - comes out of the main arena's spare chunks first and what is free after
+        const size_t spare = ARENA.held() - m.used, have = fr + keep.held();
+        const size_t need = (size_t)(1.5 * peak) + ((size_t)1 << 30);   // (one block's backward, cuBLAS, slack)
+        const size_t reserve = need > spare ? need - spare : 0;
+        budget = have > reserve ? have - reserve : 0;
+      }
+      K = save ? std::min(n - 1, budget / (save + save / 6 + (16u << 20))) : 0;   // (an arena chunk's tail is lost: 14% measured)
+      firstKept = n - K;
     }
   }
+  // block i's saves for its backward: kept, or replayed into the scratch the caller holds
+  BlockSave saves(size_t i, const real* msaMask, const real* pairMask) {
+    if (i >= firstKept) return kept[i];
+#ifndef GRAD_F64
+    if (carry) {
+      const real *m, *p;
+      input(i, m, p);
+      return blockForward(blocks[i], m, p, msaMask, pairMask, outM, outP, S, L);
+    }
+#endif
+    return blockForward(blocks[i], msaIn[i], pairIn[i], msaMask, pairMask, scratchM, scratchP, S, L);
+  }
+  real *scratchM = nullptr, *scratchP = nullptr;
   // gradients of the stack's output -> of its input (dmsa, dpair: in place)
   void backward(const real* msaMask, const real* pairMask, real* dmsa, real* dpair) {
-    real *om, *op;
-    GK(cudaMallocAsync(&om, (size_t)S * L * blocks[0].Cm * sizeof(real), STREAM));
-    GK(cudaMallocAsync(&op, (size_t)L * L * 128 * sizeof(real), STREAM));
-    for (size_t i = blocks.size(); i-- > 0;) {
-      Scratch sc;
-      BlockSave s = blockForward(blocks[i], msaIn[i], pairIn[i], msaMask, pairMask, om, op, S, L);
-      blockBackward(blocks[i], s, msaMask, pairMask, dmsa, dpair, dmsa, dpair);
+    GK(cudaMallocAsync(&scratchM, nm() * sizeof(real), STREAM));
+    GK(cudaMallocAsync(&scratchP, np() * sizeof(real), STREAM));
+#ifndef GRAD_F64
+    if (BF16) {   // the running gradients bf16 from block to block (each block's would round them on entry anyway)
+      bf *bm, *bp;
+      GK(cudaMallocAsync(&bm, nm() * sizeof(bf), STREAM)); GK(cudaMallocAsync(&bp, np() * sizeof(bf), STREAM));
+      toBf(dmsa, bm, nm()); toBf(dpair, bp, np());
+      cudaGraphExec_t ge = nullptr;
+      bool ranKept = false, ranReplay = false;
+      for (size_t i = blocks.size(); i-- > 0;) {
+        {
+          Scratch sc;
+          // (the first kept and the first replayed block run uncaptured: whatever a first call does once - a GEMM's
+          // timed plan, an arena chunk - it does there, where nothing is being captured)
+          bool& ran = i >= firstKept ? ranKept : ranReplay;
+          const bool cap = graphs && STREAM && ran;
+          ran = true;
+          if (cap) GK(cudaStreamBeginCapture(STREAM, cudaStreamCaptureModeThreadLocal));
+          const BlockSave s = saves(i, msaMask, pairMask);
+          blockBackwardRun<bf>(blocks[i], s, msaMask, pairMask, bm, bp);
+          if (cap) {
+            cudaGraph_t g;
+            GK(cudaStreamEndCapture(STREAM, &g));
+            cudaGraphExecUpdateResultInfo info;
+            if (ge && cudaGraphExecUpdate(ge, g, &info) != cudaSuccess) {
+              (void)cudaGetLastError();
+              GK(cudaGraphExecDestroy(ge)); ge = nullptr;
+            }
+            if (!ge) GK(cudaGraphInstantiate(&ge, g, 0));
+            GK(cudaGraphLaunch(ge, STREAM));
+            GK(cudaGraphDestroy(g));
+          }
+        }
+        if (i >= firstKept) keep.rewind(keptAt[i]);
+      }
+      if (ge) GK(cudaGraphExecDestroy(ge));
+      firstKept = blocks.size();
+      fromP(bm, dmsa, nm()); fromP(bp, dpair, np());
+      GK(cudaFreeAsync(bm, STREAM)); GK(cudaFreeAsync(bp, STREAM));
+      GK(cudaFreeAsync(scratchM, STREAM)); GK(cudaFreeAsync(scratchP, STREAM));
+      scratchM = scratchP = nullptr;
+      return;
     }
-    GK(cudaFreeAsync(om, STREAM)); GK(cudaFreeAsync(op, STREAM));
+#endif
+    for (size_t i = blocks.size(); i-- > 0;) {
+      {
+        Scratch sc;
+        const BlockSave s = saves(i, msaMask, pairMask);
+        blockBackward(blocks[i], s, msaMask, pairMask, dmsa, dpair, dmsa, dpair);
+      }
+      if (i >= firstKept) keep.rewind(keptAt[i]);
+    }
+    firstKept = blocks.size();
+    GK(cudaFreeAsync(scratchM, STREAM)); GK(cudaFreeAsync(scratchP, STREAM));
+    scratchM = scratchP = nullptr;
   }
 };
 

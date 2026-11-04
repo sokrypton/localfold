@@ -157,14 +157,39 @@ One block trained at the training crops, A100, random weights; the PyTorch bars 
 
 | block | float32 | TF32 | **bf16** (`--bf16`) | PyTorch eager, bf16 autocast | PyTorch `torch.compile`, pure bf16 |
 |---|---:|---:|---:|---:|---:|
-| AF2, L 256, S 128 | 37.9 | 17.8 | **9.6** | 32.6 (3.4x) | 12.7 (1.32x) |
-| AF2, L 384, S 128 | | | **19.6** | | 26.3 (1.34x) |
-| AF3 pairformer, n 384 | 46.3 | 26.1 | **12.9** | 48.0 (3.7x) | 19.6 (1.52x) |
-| AF3 pairformer, n 768 | | | **65.9** | | 128.9 (1.96x) |
+| AF2, L 256, S 128 | 38.1 | 17.6 | **8.22** | 32.6 (4.0x) | 12.7 (1.55x) |
+| AF2, L 384, S 128 | | | **17.35** | | 26.3 (1.52x) |
+| AF3 pairformer, n 384 | 46.3 | 26.1 | **12.5** | 48.0 (3.8x) | 19.6 (1.57x) |
+| AF3 pairformer, n 768 | | | **64.0** | | 128.9 (2.01x) |
 
-(The float32 and TF32 columns are from before the bf16 work, against eager PyTorch's 59.6 / 35.7 on AF2 and 81.2 /
-51.3 on AF3.) The AF2 forward in bf16 is 6.7 ms against compile's 7.2; one block's activations are 2.1 GiB at L 256
-(compile: 1.9) and 12 GiB for AF3 at n 768 (compile: 16.6).
+(AF3's float32 and TF32 columns are from before the bf16 work; eager PyTorch is 59.6 / 35.7 there on AF2 and
+81.2 / 51.3 on AF3.) A stack's AF2 backward keeps its running gradients bf16 from block to block, so the bf16 column
+is `blockBackwardRun`'s; `blockBackward`, converting a float cotangent in and float gradients out, is 0.1-0.2 ms
+more. The AF2 forward in bf16 is 6.6 ms against compile's 7.2 (13.4 against 16.4 at L 384); one block's activations
+are 2.0 GiB at L 256 (compile: 1.9) and 12 GiB for AF3 at n 768 (compile: 16.6).
+
+**A whole stack trained** (`bench-af2-block --bf16 --stack --graph`: AF2's 48 blocks at L 256, rematerialised,
+forward then backward; bindcraft2's stack-level tricks, `af2::Stack`):
+
+| | forward | backward | step |
+|---|---:|---:|---:|
+| every block replayed before its backward | 317 | 712 | 1029 ms |
+| ...each block's replay and backward one CUDA graph (`graphs`, on a capturable stream) | 317 | 693 | 1010 ms |
+| ...and **keep tiers** (17 of 48 blocks kept, their backward with no replay) | 318 | 585 | **903 ms** |
+
+- **Keep tiers**: the forward keeps the last blocks' whole saves - the first the backward reaches - in the stack's own
+  arena, as many as the free memory holds past one block's working set (measured on block 0; `keepBytes` sets it).
+  Exact: a kept block's backward reads what its replay would have recomputed. 1.7 GiB of saves a block at L 256,
+  after the forward-only float LayerNorm outputs moved to the stream-ordered pool (15 blocks kept to 17).
+- **Graphs**: each block's backward captured and the exec updated in place from block to block (same kernels, other
+  pointers), the first kept and first replayed block uncaptured so one-time work happens outside a capture: 2.6%.
+- **The bf16 carry** (`bf16Carry`, off by default): the blocks' inputs kept in bf16 and every block reading its input
+  widened from that copy - the residual stream rounded to bf16 between blocks, held to float32 at the blocks' bars in
+  `test-bf16`. It frees 1.4 of the 3.1 GiB of saved inputs at L 256 and costs 1% (the conversions); it is for the
+  lengths where those inputs, quadratic in L, are what limits.
+- Already so here: one arena serves the extra-MSA and the main stack (bindcraft2 shares its scratch between them).
+  Not taken: bindcraft2's fused residual + gate + narrow (it belongs to a bf16 chain inside the block, not at its
+  boundary) and one call for a whole design step (a design loop's, not a kernel's).
 
 **What BF16 mode is.** `--bf16` / `setBf16(true)`: parameters and their gradients float; the big modules - AF2's
 attention, transitions, triangle multiplications and OPM, AF3's grid attention, gated transitions and triangle
@@ -181,15 +206,27 @@ whole blocks to float32 by relative rms at PyTorch autocast's own error on the s
   term, the bias gradients summed in the kernels that write the gradients they sum, in-place gradient
   accumulation, bf16 running gradients;
 - keeping what the backward used to recompute (the OPM's pair-layout product, AF3's swish product, the triangle
-  multiplication's pre-gate output, the gated attention output).
+  multiplication's pre-gate output, the gated attention output);
+- every bf16 GEMM through cuBLASLt with its algorithm TIMED (`gemmEx`: the first call of a shape runs the 16
+  best-ranked candidates and keeps the fastest - cuBLAS's own pick for a bf16 output was often a one-stage s1688
+  kernel, 186 us against 95 on the OPM's), which also retired the hand split of the weight gradients: 9.6 -> 8.9 ms;
+- the pair bias projections' backward inside the LayerNorm backward that precedes them (`lnBackwardPairBias`:
+  dy += dnb W^T and dW from the normalised input it recomputes - no transpose, no rank-H float GEMM, no saved output
+  re-read), the running gradients bf16 between blocks, the OPM's four elementwise passes in one, the flash
+  backward with chain ids and fixed-point sums compiled out where unused (5%), the attentions' input gradient bf16
+  where only a LayerNorm reads it, and the elementwise passes eight bf16 a thread (the gate's bias summed in the
+  kernel that writes it): 8.9 -> 8.22 ms.
 
 **Measured and not taken**: a CUDA graph of the whole backward (2.4%: 11.40 against 11.68 ms on AF2, bindcraft2's
 3%); a 32-row query tile for the attention backward (slower capped at 4 CTAs an SM and uncapped); unrolling its two
 query halves; keeping a bf16 copy of each LayerNorm's input (as much forward as backward); cuBLASLt's BGRADA bias
-gradient (slower than the split GEMM and a column sum); bindcraft2's OPM reassociation (it pays where the alignment is
-shallower than O = 32). `Sdpa::deterministic` sums the attention's bias gradients in fixed point (bitwise
+gradient (a separate 104 us kernel of its own, even on the timed unsplit GEMM); cuBLASLt's RELU_AUX / DRELU epilogues
+for the transitions' mask (both GEMMs slower: the forward 6.6 -> 7.5 ms, the backward 8.7 -> 9.3); the triangle
+multiplication's gate backward over 64-row tiles or several 32-row tiles a block (152 -> 158-220 us); bindcraft2's OPM
+reassociation (it pays where the alignment is shallower than O = 32). `Sdpa::deterministic` sums the attention's bias gradients in fixed point (bitwise
 reproducible; 5% of AF3's backward); AF2 training dropout is `Block::dropout`, its masks regenerated, never stored.
 
-**What is left at L 256**: the attention backward is 2.4 of AF2's 9.6 ms - register-bound at 12 warps an SM, about
-a fifth of it the bias gradient's atomics (the pair bias is shared by every batch row) - and the rest is a long tail
-of memory-bound passes around the float residual stream and the LayerNorms.
+**What is left**: the attention backward is 2.2 of AF2's 8.2 ms at L 256 (and about 5.7 of 17.4 at L 384, the triangle
+attentions' two growing as L^3) - register-bound at 12 warps an SM, its bias gradient's atomics 13-16% of it (the
+pair bias is shared by every batch row, so they grow with it); the rest is memory-bound passes around the float
+residual stream and the LayerNorms, which run near the bytes they move.

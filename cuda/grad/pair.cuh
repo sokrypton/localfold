@@ -205,6 +205,42 @@ __global__ void mergeGateBwdLdBfK(const bf* __restrict__ dab, const bf* __restri
   if (gGate) { atomicAdd(gGate + c, acc.z); atomicAdd(gGate + c + 1, acc.w); }
 }
 // out = pre_out * og, og at row stride P: dpre_out = dy og (contiguous), d og_pre = dy pre_out og (1 - og) at P
+// outGateBwdLdBfK on a bf16 dy, eight columns a thread (C, P multiples of 8, C / 8 dividing 256, pointers 16-byte
+// aligned): a block's 256 / (C / 8) row groups, its gating sums through shared memory
+__global__ void outGateBwdLdBf8K(const uint4* __restrict__ dy, const uint4* __restrict__ a, const uint4* __restrict__ og,
+                                 uint4* __restrict__ da, uint4* __restrict__ dgl, size_t rows, int C8, int P8,
+                                 float* gGating) {
+  extern __shared__ float gs[];   // [256 / C8][8 C8]
+  const int c8 = threadIdx.x % C8, rg = threadIdx.x / C8, RG = blockDim.x / C8;
+  float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+  for (size_t r = (size_t)blockIdx.x * RG + rg; r < rows; r += (size_t)gridDim.x * RG) {
+    const size_t t = r * C8 + c8, i = r * P8 + c8;
+    const uint4 Y = dy[t], A = a[t], S = og[i];
+    const uint32_t *yw = &Y.x, *aw = &A.x, *sw = &S.x;
+    uint4 DA, DG; uint32_t *dw = &DA.x, *gw = &DG.x;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      const float2 y = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(yw + k));
+      const float2 av = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(aw + k));
+      const float2 sg = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(sw + k));
+      dw[k] = flash::bf2(y.x * sg.x, y.y * sg.y);
+      const __nv_bfloat162 g = __floats2bfloat162_rn(y.x * av.x * sg.x * (1.f - sg.x), y.y * av.y * sg.y * (1.f - sg.y));
+      gw[k] = *reinterpret_cast<const uint32_t*>(&g);
+      const float2 gf = __bfloat1622float2(g);
+      acc[2 * k] += gf.x; acc[2 * k + 1] += gf.y;
+    }
+    da[t] = DA; dgl[i] = DG;
+  }
+  if (!gGating) return;
+#pragma unroll
+  for (int k = 0; k < 8; ++k) gs[rg * 8 * C8 + 8 * c8 + k] = acc[k];
+  __syncthreads();
+  for (int c = threadIdx.x; c < 8 * C8; c += blockDim.x) {
+    float t = 0.f;
+    for (int q = 0; q < RG; ++q) t += gs[q * 8 * C8 + c];
+    atomicAdd(gGating + c, t);
+  }
+}
 // (gGating: the output gate's bias gradient, summed here: a block 32 columns x 8 row lanes, rows strided)
 template <class DY>
 __global__ void outGateBwdLdBfK(const DY* dy, const bf* a, const bf* og, bf* da, bf* dgl, size_t rows, int C,
@@ -286,7 +322,13 @@ inline void triMulBackwardBf(TriMul& m, const TriMulSave& s, const real* mask, c
   bf* dpre = bfGet(rows * P);
   const bf* po = reinterpret_cast<const bf*>(s.og);
   bf* dpo = bfGet(rows * m.C);
-  {
+  if (sizeof(PD) == 2 && m.C % 8 == 0 && P % 8 == 0 && 256 % (m.C / 8) == 0 && !((uintptr_t)dout & 15) &&
+      !((uintptr_t)(pre + 2 * I2) & 15)) {
+    const int C8 = m.C / 8;
+    outGateBwdLdBf8K<<<432, 256, 256 / C8 * m.C * sizeof(float), STREAM>>>(reinterpret_cast<const uint4*>(dout),
+        reinterpret_cast<const uint4*>(po), reinterpret_cast<const uint4*>(pre + 2 * I2), reinterpret_cast<uint4*>(dpo),
+        reinterpret_cast<uint4*>(dpre + 2 * I2), rows, C8, P / 8, m.gating.hasBias ? m.gating.b.g : nullptr);
+  } else {
     const unsigned xb = (m.C + 31) / 32;
     dim3 b8(32, 8), gr(xb, (unsigned)std::min<size_t>((rows + 7) / 8, std::max(1u, 1728 / xb)));
     outGateBwdLdBfK<<<gr, b8, 0, STREAM>>>(dout, po, pre + 2 * I2, dpo, dpre + 2 * I2, rows, m.C, P,
@@ -591,6 +633,34 @@ inline OpmSave opmForwardBf(const Opm& m, const real* msa, const real* msaMask, 
   }
   return s;
 }
+// y = x / norm[row] in bf16 and part[block][c] the float sum of the block's rows of y (sumColsK finishes it): the
+// OPM backward's bf16 -> float, divide, column sum and float -> bf16 passes in one read and one write
+template <class X>
+__global__ void divRowsBfSumK(const X* __restrict__ x, const real* __restrict__ norm, bf* __restrict__ y,
+                              real* __restrict__ part, size_t rows, int C) {
+  extern __shared__ real ps[];   // [256 / (C / 2)][C]
+  const int CP = C / 2, c2 = threadIdx.x % CP, rg = threadIdx.x / CP, RG = blockDim.x / CP;
+  real a0 = 0, a1 = 0;
+  const size_t per = (rows + gridDim.x - 1) / gridDim.x, r0 = blockIdx.x * per, r1 = r0 + per < rows ? r0 + per : rows;
+  for (size_t r = r0 + rg; r < r1; r += RG) {
+    const real inv = 1 / norm[r];
+    float v0, v1;
+    if constexpr (sizeof(X) == 2) {
+      const float2 f = __bfloat1622float2(reinterpret_cast<const __nv_bfloat162*>(x)[r * CP + c2]);
+      v0 = f.x; v1 = f.y;
+    } else { v0 = x[r * C + 2 * c2]; v1 = x[r * C + 2 * c2 + 1]; }
+    v0 *= inv; v1 *= inv;
+    a0 += v0; a1 += v1;
+    reinterpret_cast<__nv_bfloat162*>(y)[r * CP + c2] = __floats2bfloat162_rn(v0, v1);
+  }
+  ps[rg * C + 2 * c2] = a0; ps[rg * C + 2 * c2 + 1] = a1;
+  __syncthreads();
+  for (int c = threadIdx.x; c < C; c += blockDim.x) {
+    real t = 0;
+    for (int g = 0; g < RG; ++g) t += ps[g * C + c];
+    part[(size_t)blockIdx.x * C + c] = t;
+  }
+}
 template <class PD, class MD>   // (PD, MD: the pair's and the MSA's gradient types)
 inline void opmBackwardBf(Opm& m, const OpmSave& s, const real* msaMask, const PD* dpair, MD* dmsa) {
   Scratch scratch;
@@ -598,14 +668,24 @@ inline void opmBackwardBf(Opm& m, const OpmSave& s, const real* msaMask, const P
   const size_t rows = (size_t)S * L, pr = (size_t)L * L;
   const bf *xn = reinterpret_cast<const bf*>(s.xn), *lm = reinterpret_cast<const bf*>(s.lm),
            *rm = reinterpret_cast<const bf*>(s.rm);
-  real* dact = ARENA.get(pr * m.Cz);
-  if constexpr (sizeof(PD) == 2) bfToFK<<<blocks(pr * m.Cz), 256, 0, STREAM>>>(dpair, dact, pr * m.Cz);
-  else GK(cudaMemcpyAsync(dact, dpair, pr * m.Cz * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
   const bool after = m.biasAfterNorm || m.fixedCount > 0;
-  if (after) colSum(m.bo.g, dact, pr, m.Cz);
-  divRowsK<<<blocks(pr * m.Cz), 256, 0, STREAM>>>(dact, s.norm, pr, m.Cz, false, nullptr);
-  if (!after) colSum(m.bo.g, dact, pr, m.Cz);
-  const bf* dab = toBf(dact, pr * m.Cz);
+  const bf* dab;
+  if (!after && m.Cz % 2 == 0 && 256 % (m.Cz / 2) == 0) {   // (AF2's: the bias inside the normalisation)
+    bf* y = bfGet(pr * m.Cz);
+    constexpr unsigned GR = 432;
+    real* part = ARENA.get((size_t)GR * m.Cz);
+    divRowsBfSumK<<<GR, 256, 256 / (m.Cz / 2) * m.Cz * sizeof(real), STREAM>>>(dpair, s.norm, y, part, pr, m.Cz);
+    sumColsK<<<(m.Cz + 31) / 32, 256, 0, STREAM>>>(m.bo.g, part, (int)GR, m.Cz);
+    dab = y;
+  } else {
+    real* dact = ARENA.get(pr * m.Cz);
+    if constexpr (sizeof(PD) == 2) bfToFK<<<blocks(pr * m.Cz), 256, 0, STREAM>>>(dpair, dact, pr * m.Cz);
+    else GK(cudaMemcpyAsync(dact, dpair, pr * m.Cz * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
+    if (after) colSum(m.bo.g, dact, pr, m.Cz);
+    divRowsK<<<blocks(pr * m.Cz), 256, 0, STREAM>>>(dact, s.norm, pr, m.Cz, false, nullptr);
+    if (!after) colSum(m.bo.g, dact, pr, m.Cz);
+    dab = toBf(dact, pr * m.Cz);
+  }
   const bf* op = reinterpret_cast<const bf*>(s.pnorm);
   mmATBf(op, dab, m.wo.g, (int)pr, OO, m.Cz);
   bf* dop = bfGet(pr * OO);

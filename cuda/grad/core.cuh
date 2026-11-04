@@ -85,6 +85,12 @@ inline void init() {
   GB(cublasCreate(&BLAS));
   GB(cublasSetStream(BLAS, STREAM));
   GB(cublasSetMathMode(BLAS, TF32 ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_PEDANTIC_MATH));
+  // the stream-ordered pool keeps what it has handed out (by default it gives it back at every synchronisation, and
+  // the next cudaMallocAsync of the same bytes goes to the driver again: 0.9 ms on AF2's block forward)
+  int dev; GK(cudaGetDevice(&dev));
+  cudaMemPool_t pool; GK(cudaDeviceGetDefaultMemPool(&pool, dev));
+  uint64_t keepAll = UINT64_MAX;
+  GK(cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold, &keepAll));
 }
 inline void setBf16(bool on) { BF16 = on; }
 inline void setTf32(bool on) {
@@ -298,11 +304,72 @@ inline void toBf(const float* x, bf* y, size_t n) {   // (x 8-byte aligned)
 inline bf* bfGet(size_t n) { return reinterpret_cast<bf*>(ARENA.get((n + 1) / 2)); }
 inline bf* toBf(const float* x, size_t n) { bf* y = bfGet(n); toBf(x, y, n); return y; }
 inline bf* bfZeros(size_t n) { bf* y = bfGet(n); GK(cudaMemsetAsync(y, 0, n * 2, STREAM)); return y; }
+inline cublasLtHandle_t LT = nullptr;
+constexpr size_t LT_WS = 32u << 20;
+inline void* ltWorkspace() {
+  static void* ws = nullptr;
+  if (!LT) { cublasLtCreate(&LT); GK(cudaMalloc(&ws, LT_WS)); }
+  return ws;
+}
+// cublasGemmEx's contract (column-major, alpha 1, float compute) on cuBLASLt, the algorithm TIMED: the first call of
+// each shape runs cuBLASLt's 16 best-ranked candidates on a scratch output and keeps the fastest. cuBLAS's own pick
+// for a bf16 output is often an sm_75-style s1688 kernel with one pipeline stage - 186 us against 95 for the
+// timed choice on the OPM's 65,536 x 1,024 x 128 backward.
 inline void gemmEx(cublasOperation_t a, cublasOperation_t b, int m, int n, int k, const void* A, cudaDataType tA,
                    int la, const void* B, cudaDataType tB, int lb, float beta, void* C, cudaDataType tC, int lc) {
+  struct Plan { cublasLtMatmulDesc_t d; cublasLtMatrixLayout_t a, b, c; cublasLtMatmulAlgo_t algo; };
+  static std::map<std::vector<long long>, Plan> plans;
+  void* ws = ltWorkspace();
+  auto align = [](const void* p) { const uintptr_t u = (uintptr_t)p; return u % 16 == 0 ? 16 : u % 8 == 0 ? 8 : u % 4 == 0 ? 4 : 2; };
+  const std::vector<long long> key{a, b, m, n, k, tA, la, tB, lb, tC, lc, beta != 0.f, align(A), align(B), align(C)};
+  auto it = plans.find(key);
+  if (it == plans.end()) {
+    Plan p;
+    GB(cublasLtMatmulDescCreate(&p.d, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+    GB(cublasLtMatmulDescSetAttribute(p.d, CUBLASLT_MATMUL_DESC_TRANSA, &a, sizeof a));
+    GB(cublasLtMatmulDescSetAttribute(p.d, CUBLASLT_MATMUL_DESC_TRANSB, &b, sizeof b));
+    GB(cublasLtMatrixLayoutCreate(&p.a, tA, a == CUBLAS_OP_N ? m : k, a == CUBLAS_OP_N ? k : m, la));
+    GB(cublasLtMatrixLayoutCreate(&p.b, tB, b == CUBLAS_OP_N ? k : n, b == CUBLAS_OP_N ? n : k, lb));
+    GB(cublasLtMatrixLayoutCreate(&p.c, tC, m, n, lc));
+    cublasLtMatmulPreference_t pr;
+    GB(cublasLtMatmulPreferenceCreate(&pr));
+    GB(cublasLtMatmulPreferenceSetAttribute(pr, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &LT_WS, sizeof LT_WS));
+    const uint32_t al[3] = {(uint32_t)align(A), (uint32_t)align(B), (uint32_t)align(C)};
+    GB(cublasLtMatmulPreferenceSetAttribute(pr, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES, &al[0], 4));
+    GB(cublasLtMatmulPreferenceSetAttribute(pr, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_B_BYTES, &al[1], 4));
+    GB(cublasLtMatmulPreferenceSetAttribute(pr, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_C_BYTES, &al[2], 4));
+    GB(cublasLtMatmulPreferenceSetAttribute(pr, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_D_BYTES, &al[2], 4));
+    cublasLtMatmulHeuristicResult_t h[16]; int nh = 0;
+    GB(cublasLtMatmulAlgoGetHeuristic(LT, p.d, p.a, p.b, p.c, p.c, pr, 16, h, &nh));
+    cublasLtMatmulPreferenceDestroy(pr);
+    if (!nh) { fprintf(stderr, "gemmEx: no cuBLASLt algorithm for %d x %d x %d\n", m, n, k); exit(1); }
+    p.algo = h[0].algo;
+    if (nh > 1) {   // time them on a scratch C (offset as C is, for its alignment): two rounds, the minimum
+      const size_t es = tC == CUDA_R_32F ? 4 : 2, bytes = ((size_t)lc * (n - 1) + m) * es + 16;
+      char* sc; GK(cudaMallocAsync(&sc, bytes, STREAM));
+      void* tc = sc + ((uintptr_t)C % 16);
+      GK(cudaMemsetAsync(sc, 0, bytes, STREAM));
+      cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
+      const float one = 1.f;
+      float best = INFINITY;
+      for (int round = 0; round < 2; ++round)
+        for (int i = 0; i < nh; ++i) {
+          cudaEventRecord(e0, STREAM);
+          const cublasStatus_t st = cublasLtMatmul(LT, p.d, &one, A, p.a, B, p.b, &beta, tc, p.c, tc, p.c, &h[i].algo, ws, LT_WS, STREAM);
+          cudaEventRecord(e1, STREAM);
+          GK(cudaEventSynchronize(e1));
+          float t; cudaEventElapsedTime(&t, e0, e1);
+          if (st == CUBLAS_STATUS_SUCCESS && round == 1 && t < best) { best = t; p.algo = h[i].algo; }
+        }
+      cudaEventDestroy(e0); cudaEventDestroy(e1);
+      GK(cudaFreeAsync(sc, STREAM));
+    }
+    it = plans.emplace(key, p).first;
+  }
+  Plan& p = it->second;
   const float one = 1.f;
-  GB(cublasGemmEx(BLAS, a, b, m, n, k, &one, A, tA, la, B, tB, lb, &beta, C, tC, lc, CUBLAS_COMPUTE_32F,
-                  CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+  const cublasStatus_t st = cublasLtMatmul(LT, p.d, &one, A, p.a, B, p.b, &beta, C, p.c, C, p.c, &p.algo, ws, LT_WS, STREAM);
+  if (st != CUBLAS_STATUS_SUCCESS) { fprintf(stderr, "gemmEx %d x %d x %d: cublasLt %d\n", m, n, k, (int)st); exit(1); }
 }
 // mm, mmBT, mmAT on bf16 operands (row-major, as above); y and dx float or bf16, dw float
 template <class Y> inline void mmBf(const bf* x, const bf* w, Y* y, int M, int K, int N, float beta = 0) {
@@ -311,39 +378,22 @@ template <class Y> inline void mmBf(const bf* x, const bf* w, Y* y, int M, int K
 template <class Y> inline void mmBTBf(const bf* dy, const bf* w, Y* dx, int M, int K, int N, float beta = 0) {
   gemmEx(CUBLAS_OP_T, CUBLAS_OP_N, K, M, N, w, CUDA_R_16BF, N, dy, CUDA_R_16BF, N, beta, dx, dtype<Y>(), K);
 }
-// (a weight gradient's tall reduction into a few output tiles is cut into row chunks, partials summed in a fixed
-// order, as mmAT does: 147,456 pair rows into 128 x 256 is two CTAs of a 108-SM device otherwise - 0.8 ms a call)
+// (a weight gradient's tall reduction into a few output tiles: cuBLAS's own pick ran 147,456 pair rows into 128 x 256
+// as two CTAs, 0.8 ms a call, so it was cut into row chunks summed in a fixed order; gemmEx's timed cuBLASLt choice
+// splits K itself, its partials reduced in a workspace - 2.99 ms of GEMMs in AF2's backward against 3.11)
 inline void mmATBf(const bf* x, const bf* dy, float* dw, int M, int K, int N, float beta = 1) {
-  const size_t n = (size_t)K * N;
-  const int splits = n <= 512 * 512 ? std::min(64, M / 4096) : 1;
-  if (splits <= 1) {
-    gemmEx(CUBLAS_OP_N, CUBLAS_OP_T, N, K, M, dy, CUDA_R_16BF, N, x, CUDA_R_16BF, K, beta, dw, CUDA_R_32F, N);
-    return;
-  }
-  Scratch scratch;
-  const int c = M / splits, rest = M - c * splits;
-  float* p = ARENA.get(n * splits);
-  const float one = 1.f, zero = 0.f;
-  GB(cublasGemmStridedBatchedEx(BLAS, CUBLAS_OP_N, CUBLAS_OP_T, N, K, c, &one, dy, CUDA_R_16BF, N, (long long)c * N, x,
-                                CUDA_R_16BF, K, (long long)c * K, &zero, p, CUDA_R_32F, N, (long long)n, splits,
-                                CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-  if (rest)
-    gemmEx(CUBLAS_OP_N, CUBLAS_OP_T, N, K, rest, dy + (size_t)c * splits * N, CUDA_R_16BF, N, x + (size_t)c * splits * K,
-           CUDA_R_16BF, K, 1.f, p, CUDA_R_32F, N);
-  sumPartialsK<<<blocks(n), 256, 0, STREAM>>>(dw, p, splits, n, 1.f, beta);
+  gemmEx(CUBLAS_OP_N, CUBLAS_OP_T, N, K, M, dy, CUDA_R_16BF, N, x, CUDA_R_16BF, K, beta, dw, CUDA_R_32F, N);
 }
 // y[M, N] = x[M, K] W + b, (relu), on cuBLASLt with the bias - and the relu - in the GEMM's epilogue (bindcraft2's
 // lt.cuh): W [K, N], or [N, K] with trans; bf16 operands, y bf16 (then the bias must be bf16: cuBLASLt has no
 // float bias for a bf16 output) or float. Plans are cached by shape; one workspace serves every call.
-inline cublasLtHandle_t LT = nullptr;
 template <class Y>
 inline void ltLinear(const bf* x, const bf* w, bool trans, const void* bias, bool relu, Y* y, int M, int K, int N,
                      float beta) {
   struct Plan { cublasLtMatmulDesc_t d; cublasLtMatrixLayout_t a, b, c; cublasLtMatmulAlgo_t algo; };
   static std::map<std::tuple<int, int, int, bool, bool, int>, Plan> plans;
-  static void* ws = nullptr;
-  constexpr size_t WS = 32u << 20;
-  if (!LT) { cublasLtCreate(&LT); GK(cudaMalloc(&ws, WS)); }
+  void* ws = ltWorkspace();
+  constexpr size_t WS = LT_WS;
   const auto key = std::make_tuple(M, K, N, trans, relu, (int)sizeof(Y));
   auto it = plans.find(key);
   if (it == plans.end()) {

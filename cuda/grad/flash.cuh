@@ -857,13 +857,17 @@ __global__ void fromFixedK(float* g, const unsigned long long* f, size_t n) {
   const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n && f[i]) g[i] += (float)((double)(long long)f[i] / FIXED);
 }
-template <int D, class DKV = float, int QT = 64>   // (DKV: dK and dV written in bf16 for a module that consumes them so;
-                                                  // QT: the query tile, 32 or 64 rows)
+template <int D, class DKV = float, int QT = 64, bool GEN = true>   // (DKV: dK and dV written in bf16 for a module
+                                                  // that consumes them so; QT: the query tile, 32 or 64 rows; GEN false:
+                                                  // no chain ids and no fixed-point bias sums, compiled out - 5% of it)
 __global__ void __launch_bounds__(THREADS, 3) bwdBf(Sdpa a, BiasTile bt, HSrc qs_, HSrc ks_, HSrc vs_, HSrc os_,
                                                     const float* __restrict__ lse, const float* __restrict__ Di,
                                                     float* __restrict__ dq, int lddq, DKV* __restrict__ dk, int lddk,
                                                     DKV* __restrict__ dv, int lddv, bool accK, bool accV,
                                                     unsigned long long* fx0, unsigned long long* fx1) {
+  const int* const seqQ = GEN ? a.seqQ : nullptr;
+  const int* const seqK = GEN ? a.seqK : nullptr;
+  if constexpr (!GEN) { fx0 = nullptr; fx1 = nullptr; }
   constexpr int DP = padD<D>(), LK = ldBf<D>();
   extern __shared__ __align__(16) float sm[];
   uint16_t* Kb = reinterpret_cast<uint16_t*>(sm);                 // [BC][LK]
@@ -898,7 +902,7 @@ __global__ void __launch_bounds__(THREADS, 3) bwdBf(Sdpa a, BiasTile bt, HSrc qs
       cp4(qv + j, in ? lseb + q : lseb, in);
       cp4(qv + QT + j, in ? lgb + q : lgb, in);
       cp4(qv + 2 * QT + j, in ? Dib + q : Dib, in);
-      if (a.seqQ) cp4(qv + 3 * QT + j, in ? a.seqQ + q : a.seqQ, in);
+      if (seqQ) cp4(qv + 3 * QT + j, in ? seqQ + q : seqQ, in);
     }
   };
   issue(0, 0);
@@ -909,7 +913,7 @@ __global__ void __launch_bounds__(THREADS, 3) bwdBf(Sdpa a, BiasTile bt, HSrc qs
   for (int r = 0; r < 2; ++r) {
     const int k = k0 + kl0 + g + r * 8;
     kaR[r] = keyAdd(a, b, h, k);
-    ksR[r] = a.seqK && k < a.K ? a.seqK[k] : 0;
+    ksR[r] = seqK && k < a.K ? seqK[k] : 0;
   }
   uint32_t ka[DP / 16][4], va[DP / 16][4];
 #pragma unroll
@@ -963,7 +967,7 @@ __global__ void __launch_bounds__(THREADS, 3) bwdBf(Sdpa a, BiasTile bt, HSrc qs
           // into T between would otherwise make the compiler read them again: both are shared memory)
           const int ql = (hq * 4 + jj) * 8 + 2 * t + par;
           const float Lq = qv[ql], Lgq = LOG2E * qv[QT + ql], Dq = qv[2 * QT + ql];
-          const int sq = a.seqQ ? __float_as_int(qv[3 * QT + ql]) : 0;
+          const int sq = seqQ ? __float_as_int(qv[3 * QT + ql]) : 0;
           const bool qin = q0 + ql < a.Q;
           float bias[2] = {0.f, 0.f};
           if (tp) { bias[0] = bfToF(T[ql * LB + kl0 + g]); bias[1] = bfToF(T[ql * LB + kl0 + g + 8]); }
@@ -972,7 +976,7 @@ __global__ void __launch_bounds__(THREADS, 3) bwdBf(Sdpa a, BiasTile bt, HSrc qs
             const int e = hk * 2 + par, kl = kl0 + g + hk * 8;
             float add = kaR[hk];
             if (add != -INFINITY) {
-              if (a.seqQ && ksR[hk] != sq) add = -INFINITY;
+              if (seqQ && ksR[hk] != sq) add = -INFINITY;
               else add += bias[hk];
             }
             const float x = logit(sa[jj][e], add, a);
@@ -1114,8 +1118,10 @@ inline void backwardBf(const Sdpa& a, const X* q, int ldq, const X* k, int ldk, 
   static bool attr = false;
   const size_t smem = bwdBfSmem<D, QT>();
   if (!attr) {
-    GK(cudaFuncSetAttribute(bwdBf<D, DKV, QT>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
-    GK(cudaFuncSetAttribute(bwdBf<D, DKV, QT>, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+    for (auto f : {bwdBf<D, DKV, QT, true>, bwdBf<D, DKV, QT, false>}) {
+      GK(cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
+      GK(cudaFuncSetAttribute(f, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+    }
     attr = true;
   }
   const BiasTile bt = biasBf(a, Npq, Npk);
@@ -1130,8 +1136,9 @@ inline void backwardBf(const Sdpa& a, const X* q, int ldq, const X* k, int ldk, 
     GK(cudaMemsetAsync(fx[j], 0, ext[j] * 8, STREAM));
   }
   const size_t grid = (size_t)((a.K + BC - 1) / BC) * a.H * a.B;
-  bwdBf<D, DKV, QT><<<(unsigned)grid, THREADS, smem, STREAM>>>(a, bt, qs_, ks_, vs_, os_, lse, Di, dq, lddq, dk,
-                                                       lddk, dv, lddv, accK, accV, fx[0], fx[1]);
+  const bool gen = a.seqQ || a.seqK || fx[0] || fx[1];
+  (gen ? bwdBf<D, DKV, QT, true> : bwdBf<D, DKV, QT, false>)<<<(unsigned)grid, THREADS, smem, STREAM>>>(a, bt, qs_, ks_,
+      vs_, os_, lse, Di, dq, lddq, dk, lddk, dv, lddv, accK, accV, fx[0], fx[1]);
   for (int j = 0; j < 2; ++j)
     if (fx[j]) fromFixedK<<<blocks(ext[j]), 256, 0, STREAM>>>(a.bias[j].grad, fx[j], ext[j]);
 }

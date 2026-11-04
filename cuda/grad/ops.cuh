@@ -100,24 +100,48 @@ inline LnSave lnForward(const LayerNorm& ln, const real* x, bf* y, size_t rows) 
 #endif
 // the same with C = 32 N: a lane holds its N channels of the row (x and dy read once) and its own partial dg, db
 // across every row it takes; the block's warps reduce through shared memory once, at the end
-template <int N, class X = real, class DY = real, class DX = real>   // (DX bf16: a bf16 running gradient)
+// A pair bias read off this LayerNorm's output, nb[h, r] = sum_c y[r, c] w[c, h], whose backward the kernel takes
+// in passing (HB > 0): dy[r, c] += sum_h dnb[h, r] w[c, h], and dw[c, h] += sum_r y[r, c] dnb[h, r] from the y it
+// recomputes - no transpose of dnb, no rank-H GEMM writing a float [rows, C], no re-read of a saved y.
+
+
+struct LnPairBias { const real* dnb = nullptr; const real* w = nullptr; real* part = nullptr; const real* beta = nullptr; };
+template <int N, class X = real, class DY = real, class DX = real, int HB = 0>   // (DX bf16: a bf16 running gradient)
 __global__ void lnBwdRegK(const X* __restrict__ x, const DY* __restrict__ dy, const real* __restrict__ g,
                           const real* __restrict__ mean, const real* __restrict__ rstd, DX* __restrict__ dx,
-                          real* __restrict__ dg, real* __restrict__ db, size_t rows, bool accumulate) {
+                          real* __restrict__ dg, real* __restrict__ db, size_t rows, bool accumulate,
+                          LnPairBias pbias = {}) {
   constexpr int C = 32 * N;
+  constexpr int HW = HB > 0 ? HB : 1;
   extern __shared__ real sh[];           // [warps][2 C]
   const int warps = blockDim.x / 32, warp = threadIdx.x / 32, lane = threadIdx.x & 31;
   real gg[N], pg[N], pb[N];
+  real pw[N][HW], bb[N];
+  __shared__ real Ws[HW][C];   // (w transposed, a lane's channels consecutive: in registers it cost the kernel half its warps)
+  if constexpr (HB > 0)
+    for (int i = threadIdx.x; i < HB * C; i += blockDim.x) Ws[i % HB][i / HB] = pbias.w[i];
 #pragma unroll
-  for (int k = 0; k < N; ++k) { gg[k] = g ? g[lane + 32 * k] : (real)1; pg[k] = pb[k] = 0; }
-  for (size_t r = (size_t)blockIdx.x * warps + warp; r < rows; r += (size_t)gridDim.x * warps) {
+  for (int k = 0; k < N; ++k) {
+    gg[k] = g ? g[lane + 32 * k] : (real)1; pg[k] = pb[k] = 0;
+    if constexpr (HB > 0) {
+      bb[k] = pbias.beta ? pbias.beta[lane + 32 * k] : (real)0;
+#pragma unroll
+      for (int h = 0; h < HB; ++h) pw[k][h] = 0;
+    }
+  }
+  auto row = [&](size_t r, const real* nb) {
     const X* xr = x + r * C;
-    const DY* dr = dy + r * C;
     const real mu = mean[r], rs = rstd[r];
     real xh[N], dv[N], s1 = 0, s2 = 0;
 #pragma unroll
     for (int k = 0; k < N; ++k) {
-      xh[k] = (ldr(xr + lane + 32 * k) - mu) * rs; dv[k] = ldr(dr + lane + 32 * k);
+      xh[k] = (ldr(xr + lane + 32 * k) - mu) * rs;
+      if constexpr (HB > 0) {
+        dv[k] = dy ? ldr(dy + r * C + lane + 32 * k) : (real)0;
+        const real y = xh[k] * gg[k] + bb[k];
+#pragma unroll
+        for (int h = 0; h < HB; ++h) { dv[k] += nb[h] * Ws[h][lane + 32 * k]; pw[k][h] += y * nb[h]; }
+      } else dv[k] = ldr(dy + r * C + lane + 32 * k);
       real dh = dv[k] * gg[k];
       s1 += dh; s2 += dh * xh[k];
       pg[k] += dv[k] * xh[k]; pb[k] += dv[k];
@@ -130,7 +154,29 @@ __global__ void lnBwdRegK(const X* __restrict__ x, const DY* __restrict__ dy, co
       DX* o = dx + r * C + lane + 32 * k;
       str(o, accumulate ? ldr(o) + v : v);
     }
-  }
+  };
+  if constexpr (HB > 0) {
+    // a block a contiguous run of rows, 64 at a time: dnb's [H, 64] tile read coalesced into shared memory first (each
+    // row's H values are H cache lines apart, and read in the row loop they were the kernel's latency)
+    constexpr int TR = 64;
+    __shared__ real nbS[HW][TR];
+    const size_t per = (rows + gridDim.x - 1) / gridDim.x, r0 = blockIdx.x * per, r1 = r0 + per < rows ? r0 + per : rows;
+    for (size_t t0 = r0; t0 < r1; t0 += TR) {
+      __syncthreads();
+      for (int i = threadIdx.x; i < HB * TR; i += blockDim.x) {
+        const int h = i / TR, j = i % TR;
+        nbS[h][j] = t0 + j < r1 ? pbias.dnb[(size_t)h * rows + t0 + j] : (real)0;
+      }
+      __syncthreads();
+      for (int j = warp; j < TR && t0 + j < r1; j += warps) {
+        real nb[HW];
+#pragma unroll
+        for (int h = 0; h < HB; ++h) nb[h] = nbS[h][j];
+        row(t0 + j, nb);
+      }
+    }
+  } else
+    for (size_t r = (size_t)blockIdx.x * warps + warp; r < rows; r += (size_t)gridDim.x * warps) row(r, nullptr);
 #pragma unroll
   for (int k = 0; k < N; ++k) { sh[warp * 2 * C + lane + 32 * k] = pg[k]; sh[warp * 2 * C + C + lane + 32 * k] = pb[k]; }
   __syncthreads();
@@ -139,6 +185,20 @@ __global__ void lnBwdRegK(const X* __restrict__ x, const DY* __restrict__ dy, co
     for (int w = 0; w < warps; ++w) { a += sh[w * 2 * C + c]; b += sh[w * 2 * C + C + c]; }
     if (dg) atomicAdd(&dg[c], a);
     if (db) atomicAdd(&db[c], b);
+  }
+  if constexpr (HB > 0) {   // dw a head at a time through the same [warps][C] of shared memory
+#pragma unroll
+    for (int h = 0; h < HB; ++h) {
+      __syncthreads();
+#pragma unroll
+      for (int k = 0; k < N; ++k) sh[warp * C + lane + 32 * k] = pw[k][h];
+      __syncthreads();
+      for (int c = threadIdx.x; c < C; c += blockDim.x) {
+        real a = 0;
+        for (int w = 0; w < warps; ++w) a += sh[w * C + c];
+        pbias.part[(size_t)blockIdx.x * C * HB + c * HB + h] = a;   // (a block's partial: summed by sumColsK)
+      }
+    }
   }
 }
 #ifndef GRAD_F64
@@ -183,6 +243,32 @@ inline void lnBackward(LayerNorm& ln, const LnSave& s, const real* dy, real* dx,
   if (ln.C % 32 == 0 && sh <= 48 * 1024) switch (ln.C / 32) { LNREG(1) LNREG(2) LNREG(3) LNREG(4) LNREG(6) LNREG(8) LNREG(12) default: break; }
 #undef LNREG
   lnBwdK<<<gr, 256, 2 * ln.C * sizeof(real), STREAM>>>(s.x, dy, ln.g.w, s.mean, s.rstd, dx, ln.g.g, ln.b.g, rows, ln.C, accumulate);
+}
+
+// dw += the rows of part [parts, n]: a block 32 columns, its warps splitting the rows
+__global__ void sumColsK(real* dw, const real* part, int parts, int n) {
+  __shared__ real sh[8][33];
+  const int c = blockIdx.x * 32 + (threadIdx.x & 31), w = threadIdx.x >> 5;
+  real a = 0;
+  if (c < n) for (int k = w; k < parts; k += 8) a += part[(size_t)k * n + c];
+  sh[w][threadIdx.x & 31] = a;
+  __syncthreads();
+  if (w == 0 && c < n) { for (int k = 1; k < 8; ++k) a += sh[k][threadIdx.x]; dw[c] += a; }
+}
+// lnBackward with a pair bias read off its output (LnPairBias): dnb [H, rows], w [C, H] and its gradient; dy may be
+// null (the bias the LayerNorm's only reader). C 128 and H 4 or 8 - every AF2 pair bias.
+template <class DY, class DX>
+inline void lnBackwardPairBias(LayerNorm& ln, const LnSave& s, const DY* dy, DX* dx, size_t rows, bool accumulate,
+                               const real* dnb, Param& w, int H) {
+  if (ln.C != 128 || (H != 4 && H != 8) || s.xb) { fprintf(stderr, "lnBackwardPairBias: C %d H %d\n", ln.C, H); exit(1); }
+  Scratch scratch;
+  const unsigned gr = (unsigned)std::min<size_t>(blocks(rows, 8), 1024);
+  const size_t sh = 8 * 2 * ln.C * sizeof(real);
+  const int n = ln.C * H;
+  const LnPairBias pb{dnb, w.w, ARENA.get((size_t)gr * n), ln.b.w};
+  if (H == 4) lnBwdRegK<4, real, DY, DX, 4><<<gr, 256, sh, STREAM>>>(s.x, dy, ln.g.w, s.mean, s.rstd, dx, ln.g.g, ln.b.g, rows, accumulate, pb);
+  else lnBwdRegK<4, real, DY, DX, 8><<<gr, 256, sh, STREAM>>>(s.x, dy, ln.g.w, s.mean, s.rstd, dx, ln.g.g, ln.b.g, rows, accumulate, pb);
+  sumColsK<<<(n + 31) / 32, 256, 0, STREAM>>>(w.g, pb.part, (int)gr, n);
 }
 
 // an arena copy (af3.cuh keeps its own in its namespace)
@@ -497,7 +583,30 @@ __global__ void swap01BfK(const __nv_bfloat162* __restrict__ in, __nv_bfloat162*
   const size_t o = ((size_t)b * A + a) * C2 + c;
   out[o] = accumulate ? __hadd2(out[o], in[t]) : in[t];
 }
+// the same eight channels a thread (C a multiple of 8, both 16-byte aligned)
+__global__ void swap01Bf8K(const uint4* __restrict__ in, uint4* __restrict__ out, int A, int B, int C8, bool accumulate) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)A * B * C8) return;
+  int c = t % C8; size_t ab = t / C8; int b = ab % B, a = (int)(ab / B);
+  const size_t o = ((size_t)b * A + a) * C8 + c;
+  uint4 v = in[t];
+  if (accumulate) {
+    const uint4 w = out[o];
+    uint32_t* vw = &v.x; const uint32_t* ww = &w.x;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      const __nv_bfloat162 r = __hadd2(*reinterpret_cast<const __nv_bfloat162*>(ww + k), *reinterpret_cast<const __nv_bfloat162*>(vw + k));
+      vw[k] = *reinterpret_cast<const uint32_t*>(&r);
+    }
+  }
+  out[o] = v;
+}
 inline void swap01(const bf* in, bf* out, int A, int B, int C, bool accumulate = false) {   // (C even)
+  if (C % 8 == 0 && !((uintptr_t)in & 15) && !((uintptr_t)out & 15)) {
+    swap01Bf8K<<<blocks((size_t)A * B * C / 8), 256, 0, STREAM>>>(reinterpret_cast<const uint4*>(in),
+                                                                 reinterpret_cast<uint4*>(out), A, B, C / 8, accumulate);
+    return;
+  }
   swap01BfK<<<blocks((size_t)A * B * C / 2), 256, 0, STREAM>>>(reinterpret_cast<const __nv_bfloat162*>(in),
                                                               reinterpret_cast<__nv_bfloat162*>(out), A, B, C / 2, accumulate);
 }
@@ -640,6 +749,52 @@ __global__ void gateBwdLdDiBfK(const G* __restrict__ dog, const OT* __restrict__
   for (int off = 16; off; off >>= 1) acc += __shfl_xor_sync(~0u, acc, off);
   if (!lane) { const size_t b = row / Q, q = row % Q; Di[(b * H + h) * Q + q] = acc; }
 }
+// gateBwdLdDiBfK on bf16 throughout, eight channels a thread (D a multiple of 8, D / 8 a power of two to 32; H D / 8
+// dividing 256; ld a multiple of 8; every pointer 16-byte aligned): the head's D / 8 lanes reduce its row term, and a
+// thread keeps its eight columns over the rows it strides, so the gate's bias gradient is summed here too (gGate,
+// one atomic a column a block - a separate column sum re-read what this writes, 256 of every 1024 bytes of a row)
+__global__ void gateBwdLdDiBf8K(const uint4* __restrict__ dog, const uint4* __restrict__ o, const uint4* __restrict__ g,
+                                uint4* __restrict__ dO, uint4* __restrict__ dgp, float* __restrict__ Di, size_t rows,
+                                int H, int D, int ld, int Q, float* __restrict__ gGate) {
+  extern __shared__ float gsum[];   // [256 / (H D / 8)][H D]
+  const int T = D / 8, W8 = H * T;   // (a row's eight-channel groups)
+  const int cg = threadIdx.x % W8, rg = threadIdx.x / W8, RG = blockDim.x / W8;
+  const int h = cg / T, c8 = cg % T;
+  float bs[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+  for (size_t row = (size_t)blockIdx.x * RG + rg; row < rows; row += (size_t)gridDim.x * RG) {
+    const size_t t = row * W8 + cg, i = (row * ld + (size_t)h * D) / 8 + c8;
+    const uint4 G4 = dog[t], O4 = o[t], S4 = g[i];
+    const uint32_t* gw = &G4.x; const uint32_t* ow = &O4.x; const uint32_t* sw = &S4.x;
+    uint4 X4, D4; uint32_t* xw = &X4.x; uint32_t* dw = &D4.x;
+    float acc = 0.f;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      const float2 dg = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(gw + k));
+      const float2 ov = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(ow + k));
+      const float2 sg = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(sw + k));
+      const __nv_bfloat162 x = __floats2bfloat162_rn(dg.x * sg.x, dg.y * sg.y);
+      xw[k] = *reinterpret_cast<const uint32_t*>(&x);
+      const __nv_bfloat162 d = __floats2bfloat162_rn(dg.x * ov.x * sg.x * (1.f - sg.x), dg.y * ov.y * sg.y * (1.f - sg.y));
+      dw[k] = *reinterpret_cast<const uint32_t*>(&d);
+      const float2 xf = __bfloat1622float2(x), df = __bfloat1622float2(d);
+      acc += xf.x * ov.x + xf.y * ov.y;
+      bs[2 * k] += df.x; bs[2 * k + 1] += df.y;
+    }
+    dO[t] = X4;
+    dgp[i] = D4;
+    for (int off = T / 2; off; off >>= 1) acc += __shfl_xor_sync(~0u, acc, off);
+    if (c8 == 0) { const size_t b = row / Q, q = row % Q; Di[(b * H + h) * Q + q] = acc; }
+  }
+  if (!gGate) return;
+#pragma unroll
+  for (int k = 0; k < 8; ++k) gsum[rg * 8 * W8 + 8 * cg + k] = bs[k];
+  __syncthreads();
+  for (int c = threadIdx.x; c < 8 * W8; c += blockDim.x) {
+    float a = 0.f;
+    for (int q = 0; q < RG; ++q) a += gsum[q * 8 * W8 + c];
+    atomicAdd(gGate + c, a);
+  }
+}
 // Di[b, h, q] = sum_d x o over bf16 rows [B Q, H D] (a warp a row and head)
 __global__ void rowDotBfK(const bf* x, const bf* o, float* Di, size_t rows, int H, int D, int Q) {
   const size_t w = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) / 32;
@@ -662,6 +817,20 @@ __global__ void gateSigLdBfK(bf* g, size_t rows, int C, int ld) {               
 __global__ void narrowRowsK(const real* x, bf* y, int C, int ld, size_t rows) {   // y[r, 0:C] (row stride ld) = x[r]
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t < rows * C) y[(t / C) * ld + t % C] = __float2bfloat16(x[t]);
+}
+// the same eight a thread (C, ld multiples of 8; y 16-byte aligned): 54 -> 2x us on AF2's MSA rows
+__global__ void narrowRows8K(const float4* __restrict__ x, uint4* __restrict__ y, int C8, int ld8, size_t rows) {
+  const size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= rows * C8) return;
+  const float4 a = x[2 * t], b = x[2 * t + 1];
+  uint4 o;
+  o.x = flash::bf2(a.x, a.y); o.y = flash::bf2(a.z, a.w); o.z = flash::bf2(b.x, b.y); o.w = flash::bf2(b.z, b.w);
+  y[(t / C8) * ld8 + t % C8] = o;
+}
+inline void narrowRows(const real* x, bf* y, int C, int ld, size_t rows) {
+  if (C % 8 == 0 && ld % 8 == 0 && ((uintptr_t)y & 15) == 0 && ((uintptr_t)x & 15) == 0)
+    narrowRows8K<<<blocks(rows * C / 8), 256, 0, STREAM>>>(reinterpret_cast<const float4*>(x), reinterpret_cast<uint4*>(y), C / 8, ld / 8, rows);
+  else narrowRowsK<<<blocks(rows * C), 256, 0, STREAM>>>(x, y, C, ld, rows);
 }
 inline AttnSave attnForwardBf(const Attention& a, const real* x, const real* mask, const real* nb, real* out, int B,
                               int Q) {
@@ -697,9 +866,9 @@ inline AttnSave attnForwardBf(const Attention& a, const real* x, const real* mas
   s.qkvg = reinterpret_cast<real*>(qkvg); s.og = reinterpret_cast<real*>(og);
   return s;
 }
-template <class DOUT>   // (DOUT bf16: BF16 mode's pair-track gradient)
+template <class DOUT, class DX = real>   // (DX bf16: the input gradient for a LayerNorm backward that reads it once)   // (DOUT bf16: BF16 mode's pair-track gradient)
 inline void attnBackwardBf(Attention& a, const AttnSave& s, const real* mask, const real* nb, const DOUT* dout,
-                           real* dx, real* dnb, bool accumulate) {
+                           DX* dx, real* dnb, bool accumulate) {
   Scratch scratch;
   const int B = s.B, Q = s.Q, HD = a.H * a.D, roles = a.gating ? 4 : 3, P = roles * HD;
   const size_t rows = (size_t)B * Q;
@@ -715,11 +884,18 @@ inline void attnBackwardBf(Attention& a, const AttnSave& s, const real* mask, co
   // dq in float (its atomics'), dk, dv and the gate's gradient straight into the bf16 [rows, P] the GEMMs read
   bf* dqb = bfGet(rows * P);
   real* dq = ARENA.get(rows * HD);
+  bool gateSummed = false;   // (the gate's bias gradient summed by the kernel that writes it)
   if (a.gating) {   // dO in bf16, its row term formed with it
     bf* dO = bfGet(rows * HD);
     real* Di = ARENA.get(rows * a.H);
-    gateBwdLdDiBfK<<<blocks(rows * a.H * 32), 256, 0, STREAM>>>(dog, ob, qkvg + 3 * HD, dO, dqb + 3 * HD, Di, rows,
-                                                               a.H, a.D, P, Q);
+    if (a.D % 8 == 0 && a.D <= 256 && !((a.D / 8) & (a.D / 8 - 1)) && P % 8 == 0 && 256 % (HD / 8) == 0) {
+      gateSummed = true;
+      gateBwdLdDiBf8K<<<432, 256, 256 / (HD / 8) * HD * sizeof(float), STREAM>>>(reinterpret_cast<const uint4*>(dog),
+          reinterpret_cast<const uint4*>(ob), reinterpret_cast<const uint4*>(qkvg + 3 * HD), reinterpret_cast<uint4*>(dO),
+          reinterpret_cast<uint4*>(dqb + 3 * HD), Di, rows, a.H, a.D, P, Q, a.bg.g);
+    } else
+      gateBwdLdDiBfK<<<blocks(rows * a.H * 32), 256, 0, STREAM>>>(dog, ob, qkvg + 3 * HD, dO, dqb + 3 * HD, Di, rows,
+                                                                 a.H, a.D, P, Q);
     sdpaBackwardBf(af2Sdpa(a, B, Q, mask, nb, dnb), qkvg, P, qkvg + HD, P, qkvg + 2 * HD, P, dO, HD,
                    dq, HD, dqb + HD, P, dqb + 2 * HD, P, nullptr, HD, s.lse, Di);
   } else {   // ungated: dO is dog itself, its row term with o
@@ -728,8 +904,8 @@ inline void attnBackwardBf(Attention& a, const AttnSave& s, const real* mask, co
     sdpaBackwardBf(af2Sdpa(a, B, Q, mask, nb, dnb), qkvg, P, qkvg + HD, P, qkvg + 2 * HD, P, (const bf*)dog, HD,
                    dq, HD, dqb + HD, P, dqb + 2 * HD, P, nullptr, HD, s.lse, Di);
   }
-  narrowRowsK<<<blocks(rows * HD), 256, 0, STREAM>>>(dq, dqb, HD, P, rows);
-  if (a.gating) colSumBf(a.bg.g, dqb + 3 * HD, rows, HD, P);
+  narrowRows(dq, dqb, HD, P, rows);
+  if (a.gating && !gateSummed) colSumBf(a.bg.g, dqb + 3 * HD, rows, HD, P);
   real* dW = ARENA.get((size_t)a.C * P);
   mmATBf(xb, dqb, dW, (int)rows, a.C, P, 0.f);
   packRolesK<<<blocks((size_t)a.C * P), 256, 0, STREAM>>>(dW, a.wq.g, a.wk.g, a.wv.g, a.gating ? a.wg.g : nullptr,
@@ -761,6 +937,10 @@ inline AttnSave attnForward(const Attention& a, const real* x, const real* mask,
 
 #ifndef GRAD_F64
 inline void attnBackward(Attention& a, const AttnSave& s, const real* mask, const real* nb, const bf* dout, real* dx,
+                         real* dnb, bool accumulate) {
+  attnBackwardBf(a, s, mask, nb, dout, dx, dnb, accumulate);
+}
+inline void attnBackward(Attention& a, const AttnSave& s, const real* mask, const real* nb, const bf* dout, bf* dx,
                          real* dnb, bool accumulate) {
   attnBackwardBf(a, s, mask, nb, dout, dx, dnb, accumulate);
 }
@@ -892,7 +1072,36 @@ __global__ void colSumBfK(float* g, const __nv_bfloat162* d, size_t rows, int C2
   for (int y = 1; y < 8; ++y) { s.x += part[y][threadIdx.x].x; s.y += part[y][threadIdx.x].y; }
   atomicAdd(&g[2 * c], s.x); atomicAdd(&g[2 * c + 1], s.y);
 }
+// the same, eight columns a thread from one 16-byte load (C, ld multiples of 8, d 16-byte aligned, C / 8 dividing
+// 256): a block's 256 / (C / 8) row groups reduced through shared memory, one atomic a column a block
+__global__ void colSumBf8K(float* g, const uint4* __restrict__ d, size_t rows, int C8, int ld8) {
+  extern __shared__ float cs[];   // [256 / C8][8 C8]
+  const int c8 = threadIdx.x % C8, rg = threadIdx.x / C8, RG = blockDim.x / C8;
+  float a[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+  for (size_t r = (size_t)blockIdx.x * RG + rg; r < rows; r += (size_t)gridDim.x * RG) {
+    const uint4 v = d[r * ld8 + c8];
+    const uint32_t* w = &v.x;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      const float2 f = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(w + k));
+      a[2 * k] += f.x; a[2 * k + 1] += f.y;
+    }
+  }
+#pragma unroll
+  for (int k = 0; k < 8; ++k) cs[rg * 8 * C8 + 8 * c8 + k] = a[k];
+  __syncthreads();
+  for (int c = threadIdx.x; c < 8 * C8; c += blockDim.x) {
+    float t = 0.f;
+    for (int q = 0; q < RG; ++q) t += cs[q * 8 * C8 + c];
+    atomicAdd(&g[c], t);
+  }
+}
 inline void colSumBf(float* g, const bf* d, size_t rows, int C, int ld) {   // (C, ld even; d 4-byte aligned)
+  if (C % 8 == 0 && ld % 8 == 0 && ((uintptr_t)d & 15) == 0 && 256 % (C / 8) == 0) {
+    const int C8 = C / 8;
+    colSumBf8K<<<432, 256, 256 / C8 * C * sizeof(float), STREAM>>>(g, reinterpret_cast<const uint4*>(d), rows, C8, ld / 8);
+    return;
+  }
   const int C2 = C / 2;
   const unsigned xb = (C2 + 31) / 32;
   // (1728 blocks: 432 left a thread ~150 dependent rows at 65,536 x 512 - 0.15 ms where the bytes are 0.05)
