@@ -102,6 +102,13 @@ kernel void rfd4p_attention(constant RfdAttnArgs& a [[buffer(0)]], uint3 tg [[th
   threadgroup_barrier(mem_flags::mem_threadgroup);
   float m = -INFINITY;
   for (uint s = 0; s < sgs; ++s) m = max(m, red[s]);
+  // 🔴 AND A BARRIER BEFORE `red` IS WRITTEN AGAIN, WHICH IS THE ONE THAT WAS MISSING. The sum's reduction
+  // reuses this array, so without it a fast simdgroup overwrote red[k] with its partial SUM while a slow one was
+  // still reading red[k] for the MAX - a wrong maximum, a differently-scaled softmax, and a trajectory that came
+  // out a few parts in a million out. It fired on about one step in fifty: a single trunk pass was deterministic
+  // over twelve runs and a two-step trajectory over eight, while sixty steps gave four different designs in six
+  // runs. A difference between runs is a race, and a race in a reduction is a missing barrier.
+  threadgroup_barrier(mem_flags::mem_threadgroup);
   // exp and its sum
   float localSum = 0, cs = 0;
   for (uint j = tid; j < n; j += tpg.x) {
@@ -246,4 +253,30 @@ kernel void rfd4p_sim_step(LF_ARGS(RfdStepArgs)) {
   }
   a.x[t] = live != 0.f ? x + delta : 0.f;
   (void)tok;
+}
+
+// a threadgroup a channel: the channel's mean over the emitted tokens, subtracted. One group touches one channel
+// and nothing else, so the reduction needs no cross-group communication.
+kernel void rfd4p_center(constant RfdCenterArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
+                         uint tid [[thread_index_in_threadgroup]], uint3 tpg [[threads_per_threadgroup]]) {
+  const uint c = tg.x;
+  if (c >= a.dim) return;
+  threadgroup float red[8];
+  threadgroup float cnt[8];
+  float sum = 0, count = 0;
+  for (ulong t = tid; t < a.tokens; t += tpg.x) {
+    if (a.emit[t] == 0.f) continue;
+    sum += a.x[t * a.dim + c];
+    count += 1.f;
+  }
+  sum = simd_sum(sum);
+  count = simd_sum(count);
+  const uint sgs = tpg.x / 32;
+  if (tid % 32 == 0) { red[tid / 32] = sum; cnt[tid / 32] = count; }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float total = 0, n = 0;
+  for (uint s = 0; s < sgs; ++s) { total += red[s]; n += cnt[s]; }
+  const float mean = total / max(n, 1.f);
+  for (ulong t = tid; t < a.tokens; t += tpg.x)
+    a.x[t * a.dim + c] = a.emit[t] != 0.f ? a.x[t * a.dim + c] - mean : 0.f;
 }

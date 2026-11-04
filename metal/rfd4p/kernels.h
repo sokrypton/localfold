@@ -44,3 +44,5 @@ struct RfdPairDistArgs { CP(float) caNm; DP(float) pair; u64 rows; uint n, dim, 
 // vs = x vsCoef + r v is algebraically the reference's (x + (1 - t) score r) / t and avoids its cancellation
 struct RfdStepArgs { DP(float) x; DP(float) x1; CP(float) v; CP(float) eps; CP(float) emit; u64 n; uint dim, mode;
                      float t, dt, gt, std, r, vsCoef; uint stochastic, pad; };
+// `_force_zero_com`: (x - the emitted tokens' mean) * emit, a threadgroup a channel
+struct RfdCenterArgs { DP(float) x; CP(float) emit; u64 tokens; uint dim, pad; };

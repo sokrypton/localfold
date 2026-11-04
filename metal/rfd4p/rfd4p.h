@@ -142,7 +142,7 @@ Modality modalitySchedule(const char* tag, int nsteps);
 bool stochasticStep(double t, const Modality& m);
 // a whole generation from an exported `-gen` directory. When `GATE_CHECK` is set, every step's noised state and
 // clean estimate are held to the dump's own trajectory as they are produced.
-int generate(const std::string& genDir, const std::string& outPath);
+int generate(const std::string& genDir, const std::string& outPath, int designs = 1, uint64_t seed = 0);
 // the gate's comparison, set by main where there is an oracle to compare against: ours (on the device) against
 // the dump's tensor `key`, at `bound`, returning the relative RMS. Null when nothing is being held.
 extern double (*GATE_CHECK)(const char* label, const std::string& key, const float* ours, size_t n, double bound);
@@ -169,8 +169,15 @@ void decoderPostprocess(int n, const float* caNm, const int* seq, const float* l
 struct OutTables {
   bool present = false;
   const int* atomize = nullptr; const int* hetero = nullptr; const int* resName = nullptr;
-  const int* inName = nullptr; const int* inElem = nullptr;
+  const int* inName = nullptr; const int* inElem = nullptr; const int* inCharge = nullptr;
+  const int* insCode = nullptr; const int* entity = nullptr;
+  // b-factor and occupancy are DOUBLES packed as two ints each (the exporter's `packDouble`)
+  const int* inB = nullptr; const int* inOcc = nullptr;
 };
-// the PDB, and the consecutive alpha-carbon spacing within a chain (median, min, max) as the geometry check
-int writePdb(const std::string& path, int n, const float* coors, const uint8_t* atomMask, const int* residueType,
-             const int* outResId, const int* outChain, const int* chainIid, double* caSpacing, const OutTables& in);
+// a double the exporter packed into two ints, low word first
+double unpackDouble(const int* w);
+// the structure written - mmCIF where the path ends `.cif` (RFD4-Proteina's own format), PDB otherwise - and the
+// consecutive alpha-carbon spacing within a chain (median, min, max) as the geometry check
+int writeStructure(const std::string& path, int n, const float* coors, const uint8_t* atomMask,
+                   const int* residueType, const int* outResId, const int* outChain, const int* chainIid,
+                   double* caSpacing, const OutTables& in);

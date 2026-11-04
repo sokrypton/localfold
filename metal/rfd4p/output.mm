@@ -4,13 +4,15 @@
 // `formatSampleLocalLatents`, then the records. All host code - the arrays are [n, 147] and [n, 111] and the work
 // is an argmax and a table lookup, which `cuda/rfd4p/src/generate.cuh` says of its own copy for the same reason.
 //
-// 🔴 WHAT IS HERE IS THE COMMON PATH AND IT SAYS SO. A de-novo design and a motif-scaffolded one come out right:
-// every legal and present atom slot of each emitted token, named from the vocabulary, under the input's own
-// residue numbering and chain letters where there was an input. What is NOT here, and is in cuda/rfd4p: an
-// atomised token written as the input's own atom, a grafted motif atom naming the component it came from,
-// b-factors and occupancies carried over, the unindexed-insertion mapping, and mmCIF output. Those are
-// bookkeeping over the same coordinates rather than a different structure, and each needs the tables this port
-// does not read yet.
+// 🔴 THE RECORDS ARE BUILT ONCE AND RENDERED TWICE. `toPdbString` and `toCifString` in the reference are two
+// renderings of ONE list, and a design saved as a PDB and as an mmCIF has to be the same design - two formats of
+// one structure that disagree are worse than one format. The naming, the HETATM flag, the element, the b-factor
+// and the occupancy are decided in `records`; the writers only lay them out. mmCIF is what RFD4-Proteina itself
+// writes, so `--out=design.cif` is the native format and `--out=design.pdb` the convenient one.
+//
+// Not here, and in cuda/rfd4p: a grafted motif atom naming the component it came from, and the
+// unindexed-insertion mapping - both bookkeeping over the same coordinates, and both needing tables this port
+// does not read.
 #include "rfd4p.h"
 #include "rfd4p/featurise/tables.inc"
 #include <cmath>
@@ -18,6 +20,8 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <cstring>
+#include <cstdint>
 
 namespace {
 
@@ -34,24 +38,16 @@ std::string unpackString(const int* w, int words) {
   return out;
 }
 
-// a PDB atom name's column rule: a one-letter element starts in column 14, anything else in 13
-std::string pdbAtomName(const std::string& name) {
-  if (name.size() >= 4) return name;
-  return " " + name + std::string(3 - name.size(), ' ');
-}
-
-std::string padLeft(const std::string& s, int w) {
-  return s.size() >= (size_t)w ? s : std::string((size_t)(w - s.size()), ' ') + s;
-}
-
-std::string element(const std::string& atomName) {
-  // the vocabulary's names are element-plus-counter, so the first character is the element but for the
-  // two-letter metals a token never carries in atom37
-  if (atomName.empty()) return "C";
-  return std::string(1, atomName[0]);
-}
-
 }  // namespace
+
+// a double the exporter packed as two little-endian int words (`packDouble`)
+double unpackDouble(const int* w) {
+  uint32_t lo = (uint32_t)w[0], hi = (uint32_t)w[1];
+  uint64_t bits = ((uint64_t)hi << 32) | lo;
+  double v;
+  memcpy(&v, &bits, 8);
+  return v;
+}
 
 int sequenceForDecoder(int n, const float* logits, const int* condSeq, const int* tokenType, const float* emit,
                        int* seq) {
@@ -116,91 +112,222 @@ void decoderPostprocess(int n, const float* caNm, const int* seq, const float* l
   }
 }
 
-int writePdb(const std::string& path, int n, const float* coors, const uint8_t* atomMask, const int* residueType,
-             const int* outResId, const int* outChain, const int* chainIid, double* caSpacing, const OutTables& in) {
-  std::string out;
-  int serial = 0;
-  std::vector<float> prevCa;
-  std::string prevChain;
-  double worstGap = 0;
-  std::vector<double> gaps;
+namespace {
+
+struct Rec {
+  std::string atomName, resName, chain, element, insCode;
+  int resId = 0, entity = 0, charge = 0;
+  double b = NAN, occ = 1.0;
+  bool het = false, ca = false;
+  float x = 0, y = 0, z = 0;
+};
+
+// an mmCIF atom id is quoted where it carries a prime (the nucleotides' O5', C1')
+std::string cifAtomName(const std::string& name) {
+  return name.find('\'') == std::string::npos ? name : "\"" + name + "\"";
+}
+
+// `jsToFixed(round-half-to-even(x * 1000) / 1000, 3)`: the reference's own coordinate text, so two ports' files
+// of one design are the same BYTES and not merely the same numbers
+std::string cifCoord(double v) {
+  const double scaled = v * 1000.0;
+  const double fl = std::floor(scaled);
+  const double diff = scaled - fl;
+  double rounded;
+  if (std::abs(diff - 0.5) < 1e-6) rounded = std::fmod(fl, 2.0) == 0 ? fl : fl + 1;
+  else rounded = std::floor(scaled + 0.5);
+  char buf[32];
+  snprintf(buf, sizeof buf, "%.3f", rounded / 1000.0);
+  return buf;
+}
+
+std::string num(double v, int places) {
+  if (!std::isfinite(v)) return "nan";
+  char buf[48];
+  snprintf(buf, sizeof buf, "%.*f", places, v);
+  return buf;
+}
+
+// the chain a token is written under: the input's own letters where it had them, else A, B, C by instance
+std::string chainOf(int i, const int* outChain, const int* chainIid) {
+  if (outChain) {
+    std::string c;
+    for (int k = 0; k < 4; ++k) {
+      const char ch = (char)((outChain[i] >> (8 * k)) & 0xff);
+      if (ch) c += ch;
+    }
+    if (!c.empty()) return c;
+  }
+  if (chainIid) return std::string(1, (char)('A' + (chainIid[i] % 26)));
+  return "A";
+}
+
+std::string elementOf(const std::string& atomName) {
+  // the vocabulary's names are element-plus-counter, so the first character is the element - and atom37 carries
+  // no two-letter element
+  return atomName.empty() ? "C" : std::string(1, atomName[0]);
+}
+
+std::vector<Rec> records(int n, const float* coors, const uint8_t* atomMask, const int* residueType,
+                         const int* outResId, const int* outChain, const int* chainIid, const OutTables& in) {
+  std::vector<Rec> out;
   for (int i = 0; i < n; ++i) {
     const int rt = residueType[i];
-    const std::string resName = rt >= 0 ? trimName(rfd4p::tables::TOKENS[(size_t)rt]) : "UNK";
-    // the input's own numbering and chain letters where it had them: a motif's residues are deposited under
-    // their own numbers, and writing the token index renumbers them out of their target's frame
-    const int resId = outResId ? outResId[i] : i + 1;
-    std::string chain = "A";
-    if (outChain) {
-      std::string c;
-      for (int k = 0; k < 4; ++k) {
-        const char ch = (char)((outChain[i] >> (8 * k)) & 0xff);
-        if (ch) c += ch;
-      }
-      if (!c.empty()) chain = c;
-    } else if (chainIid) {
-      chain = std::string(1, (char)('A' + (chainIid[i] % 26)));
+    Rec base;
+    base.chain = chainOf(i, outChain, chainIid);
+    base.resId = outResId ? outResId[i] : i + 1;
+    if (in.present) {
+      base.insCode = unpackString(&in.insCode[i], 1);
+      base.entity = in.entity[i];
     }
     // 🔴 AN ATOMISED TOKEN IS ONE ATOM AND IT IS THE INPUT'S. A ligand's atom or an atomised residue's is
     // carried over whole - its own name, residue, element and HETATM flag - at the token's sampled position.
     // Written from the vocabulary instead it comes out `UNK CA`, element C, `ATOM`: a glycerol as six alanines.
     if (in.present && in.atomize[i]) {
       const size_t at = (size_t)i * 37 + 1;
-      const std::string atomName = unpackString(&in.inName[at], 1);
-      const std::string resName2 = unpackString(&in.resName[(size_t)i * 2], 2);
+      Rec r = base;
+      r.atomName = unpackString(&in.inName[at], 1);
+      r.resName = unpackString(&in.resName[(size_t)i * 2], 2);
       const std::string el = in.inElem[at] ? unpackString(&in.inElem[at], 1) : std::string();
-      char line[96];
-      snprintf(line, sizeof line, "%-6s%5d %s %-3s %s%4d    %8.3f%8.3f%8.3f  1.00  0.00          %2s\n",
-               in.hetero[i] ? "HETATM" : "ATOM", (serial + 1) % 100000, pdbAtomName(atomName).c_str(),
-               resName2.c_str(), chain.substr(0, 1).c_str(), resId, coors[(size_t)i * 111 + 3],
-               coors[(size_t)i * 111 + 4], coors[(size_t)i * 111 + 5],
-               padLeft(el.empty() || el == "X" ? element(atomName) : el, 2).c_str());
-      out += line;
-      serial += 1;
+      r.element = el.empty() || el == "X" ? elementOf(r.atomName) : el;
+      r.het = in.hetero[i] != 0;
+      r.b = in.inB ? unpackDouble(&in.inB[at * 2]) : NAN;
+      r.charge = in.inCharge ? in.inCharge[at] : 0;
+      r.x = coors[(size_t)i * 111 + 3];
+      r.y = coors[(size_t)i * 111 + 4];
+      r.z = coors[(size_t)i * 111 + 5];
+      out.push_back(r);
       continue;
     }
+    if (rt < 0) continue;
+    const std::string inRes = in.present ? unpackString(&in.resName[(size_t)i * 2], 2) : std::string("<M>");
+    // a token the job masked is a DESIGNED residue: it is not the input's hetero component whatever the input
+    // said, and it carries none of its b-factors
+    const bool wasMasked = inRes == "<M>" || inRes == "UNK";
     for (int a = 0; a < 37; ++a) {
       if (!atomMask[(size_t)i * 37 + a]) continue;
-      const std::string atomName = rt >= 0 ? trimName(rfd4p::tables::TOKEN_ATOMS[(size_t)rt][(size_t)a])
-                                           : trimName(rfd4p::tables::ATOM37_NAMES[(size_t)a]);
-      if (atomName.empty()) continue;
-      const float x = coors[(size_t)i * 111 + a * 3], y = coors[(size_t)i * 111 + a * 3 + 1],
-                  zc = coors[(size_t)i * 111 + a * 3 + 2];
-      char line[96];
-      snprintf(line, sizeof line, "%-6s%5d %s %-3s %s%4d    %8.3f%8.3f%8.3f  1.00  0.00          %2s\n",
-               in.present && in.hetero[i] && rt >= 0 && resName != "UNK" &&
-                       unpackString(&in.resName[(size_t)i * 2], 2) != "<M>" ? "HETATM" : "ATOM",
-               (serial + 1) % 100000, pdbAtomName(atomName).c_str(), resName.c_str(), chain.substr(0, 1).c_str(),
-               resId, x, y, zc, padLeft(element(atomName), 2).c_str());
-      out += line;
-      serial += 1;
-      if (a == 1) {
-        // 🔴 WITHIN A CHAIN ONLY. Measured across every token in order, a two-chain design reports the jump
-        // from one chain's last residue to the next chain's first as a 60 A "bond" - which is the structure
-        // being right and the measurement being wrong, and it read exactly like a broken backbone.
-        if (!prevCa.empty() && chain == prevChain) {
-          const double d = std::sqrt((double)(x - prevCa[0]) * (x - prevCa[0]) + (double)(y - prevCa[1]) * (y - prevCa[1]) +
-                                     (double)(zc - prevCa[2]) * (zc - prevCa[2]));
-          gaps.push_back(d);
-          worstGap = std::max(worstGap, d);
+      Rec r = base;
+      r.atomName = trimName(rfd4p::tables::TOKEN_ATOMS[(size_t)rt][(size_t)a]);
+      if (r.atomName.empty()) continue;
+      r.resName = trimName(rfd4p::tables::TOKENS[(size_t)rt]);
+      r.het = !wasMasked && in.present && in.hetero[i] != 0;
+      // 🔴 THE INPUT'S OWN b-FACTOR AND OCCUPANCY, FOUND BY ATOM NAME. The slots of a designed residue are not
+      // the input's slots - a motif's ASP is the input's ASP but this token's type may differ - so the carry-over
+      // is by NAME, and `OXT` and `OP3` are excluded because the vocabulary's terminal atoms are not the input's.
+      int is = -1;
+      if (in.present && in.inName && !wasMasked && r.atomName != "UNK" && r.atomName != "OXT" && r.atomName != "OP3") {
+        for (int s2 = 0; s2 < 37; ++s2) {
+          const int w = in.inName[(size_t)i * 37 + s2];
+          if (w && unpackString(&w, 1) == r.atomName) { is = s2; break; }
         }
-        prevCa = {x, y, zc};
-        prevChain = chain;
       }
+      if (is >= 0) {
+        const size_t ia = (size_t)i * 37 + (size_t)is;
+        r.b = in.inB ? unpackDouble(&in.inB[ia * 2]) : NAN;
+        const double occ = in.inOcc ? unpackDouble(&in.inOcc[ia * 2]) : 1.0;
+        r.occ = occ > 0 ? occ : 1.0;
+        r.charge = in.inCharge ? in.inCharge[ia] : 0;
+        const std::string el = in.inElem && in.inElem[ia] ? unpackString(&in.inElem[ia], 1) : std::string();
+        r.element = el.empty() || el == "X" ? elementOf(r.atomName) : el;
+      } else {
+        r.element = elementOf(r.atomName);
+      }
+      r.x = coors[(size_t)i * 111 + a * 3];
+      r.y = coors[(size_t)i * 111 + a * 3 + 1];
+      r.z = coors[(size_t)i * 111 + a * 3 + 2];
+      r.ca = a == 1;
+      out.push_back(r);
     }
   }
+  return out;
+}
+
+// a PDB atom name's column rule: a one-letter element starts in column 14, anything else in 13
+std::string pdbAtomField(const std::string& name) {
+  if (name.size() >= 4) return name.substr(0, 4);
+  return " " + name + std::string(3 - name.size(), ' ');
+}
+
+std::string padLeft(const std::string& s, int w) {
+  return s.size() >= (size_t)w ? s : std::string((size_t)(w - s.size()), ' ') + s;
+}
+
+std::string toPdb(const std::vector<Rec>& recs) {
+  std::string out;
+  for (size_t i = 0; i < recs.size(); ++i) {
+    const Rec& a = recs[i];
+    char line[128];
+    snprintf(line, sizeof line, "%-6s%5d %s %-3s %1s%4d%1s   %8.3f%8.3f%8.3f%6.2f%6.2f          %2s\n",
+             a.het ? "HETATM" : "ATOM", (int)((i + 1) % 100000), pdbAtomField(a.atomName).c_str(),
+             a.resName.c_str(), a.chain.substr(0, 1).c_str(), a.resId,
+             a.insCode.empty() ? " " : a.insCode.substr(0, 1).c_str(), a.x, a.y, a.z,
+             std::isfinite(a.occ) ? a.occ : 1.0, std::isfinite(a.b) ? a.b : 0.0,
+             padLeft(a.element, 2).c_str());
+    out += line;
+  }
   out += "END\n";
+  return out;
+}
+
+std::string toCif(const std::vector<Rec>& recs) {
+  static const char* COLUMNS[] = {
+      "group_PDB", "id", "type_symbol", "label_atom_id", "label_alt_id", "label_comp_id", "label_asym_id",
+      "label_entity_id", "label_seq_id", "pdbx_PDB_ins_code", "auth_seq_id", "auth_comp_id", "auth_asym_id",
+      "auth_atom_id", "B_iso_or_equiv", "occupancy", "pdbx_formal_charge", "Cartn_x", "Cartn_y", "Cartn_z",
+      "pdbx_PDB_model_num"};
+  std::string out = "data_rfd4p_design\n#\nloop_\n";
+  for (const char* c : COLUMNS) out += std::string("_atom_site.") + c + "\n";
+  for (size_t i = 0; i < recs.size(); ++i) {
+    const Rec& a = recs[i];
+    const std::string id = cifAtomName(a.atomName);
+    const std::string comp = a.resName.empty() ? "UNK" : a.resName;
+    const std::string charge = a.charge != 0
+        ? (a.charge > 0 ? "+" + std::to_string(a.charge) : std::to_string(a.charge))
+        : std::string("?");
+    out += (a.het ? "HETATM " : "ATOM ") + std::to_string(i + 1) + " " + a.element + " " + id + " . " + comp +
+           " " + a.chain + " " + std::to_string(a.entity) + " " + std::to_string(a.resId) + " " +
+           (a.insCode.empty() ? "." : a.insCode) + " " + std::to_string(a.resId) + " " + comp + " " + a.chain +
+           " " + id + " " + num(a.b, 2) + " " + num(std::isfinite(a.occ) ? a.occ : 1.0, 1) + " " + charge + " " +
+           cifCoord(a.x) + " " + cifCoord(a.y) + " " + cifCoord(a.z) + " 1\n";
+  }
+  out += "#\n";
+  return out;
+}
+
+}  // namespace
+
+int writeStructure(const std::string& path, int n, const float* coors, const uint8_t* atomMask,
+                   const int* residueType, const int* outResId, const int* outChain, const int* chainIid,
+                   double* caSpacing, const OutTables& in) {
+  const std::vector<Rec> recs = records(n, coors, atomMask, residueType, outResId, outChain, chainIid, in);
+  // 🔴 THE FORMAT FOLLOWS THE NAME, and mmCIF is the native one: RFD4-Proteina writes `.cif`, and a design saved
+  // as a PDB loses a four-character chain id and anything past 99,999 atoms.
+  const bool cif = path.size() > 4 && path.compare(path.size() - 4, 4, ".cif") == 0;
+  const std::string text = cif ? toCif(recs) : toPdb(recs);
   FILE* f = fopen(path.c_str(), "w");
   if (!f) die("cannot write %s", path.c_str());
-  fwrite(out.data(), 1, out.size(), f);
+  fwrite(text.data(), 1, text.size(), f);
   fclose(f);
-  if (caSpacing && !gaps.empty()) {
-    std::vector<double> s = gaps;
-    std::sort(s.begin(), s.end());
-    caSpacing[0] = s[s.size() / 2];
-    caSpacing[1] = s.front();
-    caSpacing[2] = s.back();
+
+  // the consecutive alpha-carbon spacing WITHIN A CHAIN: measured across every token in order, a two-chain
+  // design reports the jump from one chain to the next as a 60 A "bond", which reads exactly like a broken
+  // backbone and is the measurement being wrong rather than the structure
+  if (caSpacing) {
+    std::vector<double> gaps;
+    const Rec* prev = nullptr;
+    for (const Rec& r : recs) {
+      if (!r.ca) continue;
+      if (prev && prev->chain == r.chain)
+        gaps.push_back(std::sqrt((double)(r.x - prev->x) * (r.x - prev->x) + (double)(r.y - prev->y) * (r.y - prev->y) +
+                                 (double)(r.z - prev->z) * (r.z - prev->z)));
+      prev = &r;
+    }
+    if (!gaps.empty()) {
+      std::sort(gaps.begin(), gaps.end());
+      caSpacing[0] = gaps[gaps.size() / 2];
+      caSpacing[1] = gaps.front();
+      caSpacing[2] = gaps.back();
+    }
   }
-  (void)worstGap;
-  return serial;
+  return (int)recs.size();
 }

@@ -91,6 +91,7 @@ double checkFn(const char* label, const std::string& key, const float* ours, siz
 
 int main(int argc, char** argv) {
   std::string input, bundle, oracle, encDir, genDir, outPath, job, workDir, seed;
+  int designs = 1;
   for (int i = 1; i < argc; ++i) {
     const char* a = argv[i];
     if (!strncmp(a, "--bundle=", 9)) bundle = a + 9;
@@ -101,6 +102,7 @@ int main(int argc, char** argv) {
     else if (!strncmp(a, "--job=", 6)) job = a + 6;
     else if (!strncmp(a, "--work-dir=", 11)) workDir = a + 11;
     else if (!strncmp(a, "--seed=", 7)) seed = a + 7;
+    else if (!strncmp(a, "--designs=", 10)) designs = atoi(a + 10);
     else if (!strcmp(a, "--f16")) HALF = true;
     else if (a[0] != '-') input = a;
     else die("unknown flag %s", a);
@@ -161,10 +163,22 @@ int main(int argc, char** argv) {
   }
 
   if (input.empty() || bundle.empty()) {
-    fprintf(stderr, "usage: localfold-rfd4p --job=<spec.json|.yaml> --bundle=<model-rfd4p-int8> [--out=design.pdb]\n"
+    fprintf(stderr, "usage: localfold-rfd4p --job=<spec.json|.yaml> --bundle=<model-rfd4p-int8> [--out=design.pdb|.cif]\n"
+                    "         [--designs=N] [--seed=N]\n"
                     "       localfold-rfd4p <input dir> --bundle=<model-rfd4p-int8> [--oracle=<dir>] "
-                    "[--encoder=<dir>] [--gen=<dir>-gen] [--out=design.pdb] [--f16]\n");
+                    "[--encoder=<dir>] [--gen=<dir>-gen] [--out=design.pdb] [--designs=N] [--f16]\n");
     return 2;
+  }
+
+  // LOCALFOLD_RFD4P_CHURN=<MB>: host memory dirtied and freed before anything else, which is what the linked-in
+  // featuriser does to this process before the fold starts. A fold that is bit-identical with and without it does
+  // not depend on a fresh allocation's contents; one that is not, does - and that is a bug in the fold.
+  if (const char* mb = getenv("LOCALFOLD_RFD4P_CHURN")) {
+    const size_t bytes = (size_t)atof(mb) * (1u << 20);
+    std::vector<unsigned char> churn(bytes, 0xa5);
+    volatile unsigned char sink = 0;
+    for (size_t k = 0; k < bytes; k += 4096) sink = (unsigned char)(sink + churn[k]);
+    (void)sink;
   }
 
   setSource("rfd4p", PORT_SOURCE);
@@ -487,7 +501,7 @@ int main(int argc, char** argv) {
     // divides by t = 1e-3, so what a stage holds to 1e-6 arrives here multiplied; the per-step record is what
     // says whether that is amplification (the numbers grow smoothly) or a wiring fault (one step jumps).
     GATE_TRAJ_BOUND = HALF ? 1e-2 : 1e-4;
-    const int ran = generate(genDir, outPath);
+    const int ran = generate(genDir, outPath, designs, seed.empty() ? 0 : strtoull(seed.c_str(), nullptr, 10));
     printf("  the sampler ran %d steps\n", ran);
     GATE_CHECK = nullptr;
   }

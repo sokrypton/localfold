@@ -11,57 +11,21 @@
 // is exported once. The pair track's first 30 columns - the alpha carbons' distance bins - are rebuilt on the
 // device each step from the current coordinates, which is the one feature that cannot be frozen or replayed.
 #include "rfd4p.h"
+// 🔴 THE SCHEDULES AND THE RANDOM SOURCE COME FROM cuda/rfd4p's OWN HOST HEADER, not from a second transcription
+// of flow.js. `cuda/rfd4p/src/schedule.h` is plain C++ - no CUDA in it - and carries the time schedules, the
+// noise schedule, the tsr ratio, the stochastic-step rule, and an xorshift128+ whose Box-Muller goes through
+// V8's own fdlibm (`cuda/featurise/jsmath.h`): bit-exact against the page, where glibc's log differs on 2.6% of
+// arguments and one ulp in one draw is everything in a sixty-step trajectory. Two ports reading one header
+// cannot drift apart; two transcriptions of one specification can, and the first draft of this file was one.
+#include "rfd4p/src/schedule.h"
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
+#include <algorithm>
 #include <set>
 #include <vector>
 
 namespace {
-
-std::vector<double> linspace(double a, double b, int n) {
-  std::vector<double> v((size_t)n);
-  for (int i = 0; i < n; ++i) v[(size_t)i] = n == 1 ? a : a + (b - a) * i / (n - 1);
-  return v;
-}
-
-// `get_schedule_tsr_safe` (eps 1e-3, where the score is defined) and `get_schedule` (from zero)
-std::vector<double> baseSchedule(int mode, int nsteps, double p, bool tsrSafe) {
-  const double eps = tsrSafe ? 1e-3 : 0.0;
-  if (mode == 0) return linspace(eps, 1, nsteps + 1);                       // uniform
-  if (mode == 1) {                                                          // power
-    std::vector<double> v = linspace(tsrSafe ? std::pow(eps, 1 / p) : 0.0, 1, nsteps + 1);
-    for (double& x : v) x = std::pow(x, p);
-    return v;
-  }
-  if (mode == 2) {                                                          // log
-    if (!(p > 0)) die("rfd4p: p must be > 0 for the log schedule, got %g", p);
-    const std::vector<double> e = linspace(-p, tsrSafe ? eps : 0.0, nsteps + 1);
-    std::vector<double> t((size_t)nsteps + 1);
-    for (int i = 0; i <= nsteps; ++i) t[(size_t)i] = 1 - std::pow(10.0, e[(size_t)(nsteps - i)]);
-    double mn = INFINITY;
-    for (double v : t) mn = std::min(mn, v);
-    for (double& v : t) v -= mn - (tsrSafe ? eps : 0.0);
-    double mx = -INFINITY;
-    for (double v : t) mx = std::max(mx, v);
-    for (double& v : t) v /= mx;
-    return t;
-  }
-  die("rfd4p: schedule mode %d is not one this port knows", mode);
-}
-
-// `_schedule_with_tail_multiplier`: the last `tail_steps` of the base schedule at `multiplier` resolution
-std::vector<double> withTail(int mode, double p, int tailSteps, int mult, int nsteps, bool tsrSafe) {
-  const int ts = nsteps >= tailSteps * mult ? tailSteps : nsteps / (2 * std::max(1, mult));
-  if (!ts) return baseSchedule(mode, nsteps, p, tsrSafe);
-  const int baseSteps = nsteps - (mult - 1) * ts;
-  const int fine = baseSteps * mult;
-  const int tailStart = (baseSteps - ts) * mult;
-  const std::vector<double> full = baseSchedule(mode, fine, p, tsrSafe);
-  std::vector<double> out;
-  for (int i = 0; i < tailStart; i += mult) out.push_back(full[(size_t)i]);
-  for (int i = tailStart; i <= fine; ++i) out.push_back(full[(size_t)i]);
-  return out;
-}
 
 // Python's `round`, half to even (`pyRound`): the expanded step count goes through it, and
 // `round(2.5)` being 2 rather than 3 moves a whole schedule by one step.
@@ -72,62 +36,81 @@ int pyRound(double x) {
   return (int)std::round(x);
 }
 
+// 🔴 THE FEATURE'S OFFSET IS FOUND, NOT ASSUMED, AND NOT TRANSCRIBED EITHER. `coord_group_seq` is 37 of the 897
+// sequence columns and nothing in the export says where: the featuriser writes `meta/chirOff` for the chirality
+// and nothing for this one. Its place is a function of `config.nn.feats_seq` and of every earlier feature's
+// width - a table this port could copy and then watch go stale, which is what `cuda/featurise/tables.inc` exists
+// to avoid. So the block is LOCATED instead: the labels the featuriser wrote at step 0 are reconstructible from
+// `g/coordGroup` and the first row of `g/crdPerm`, and the 37 columns that hold them are searched for. A match
+// over every token and slot is the offset AND the proof that this port and the featuriser agree about the
+// feature; no match is a refusal, because a guessed offset would overwrite some other feature with group labels.
+int coordGroupOffset(int n, int seqDim, const float* seq, const int* groups, const std::vector<int>& uniq,
+                     const int* perm0) {
+  std::vector<float> want((size_t)n * 37);
+  for (size_t k = 0; k < want.size(); ++k) {
+    const int g = groups[k];
+    if (g == -1) { want[k] = -1.f; continue; }
+    const auto at = std::find(uniq.begin(), uniq.end(), g);
+    want[k] = at == uniq.end() ? -1.f : (float)perm0[at - uniq.begin()];
+  }
+  for (int off = 0; off + 37 <= seqDim; ++off) {
+    bool all = true;
+    for (int i = 0; i < n && all; ++i)
+      for (int a = 0; a < 37; ++a)
+        if (seq[(size_t)i * seqDim + off + a] != want[(size_t)i * 37 + a]) { all = false; break; }
+    if (all) return off;
+  }
+  return -1;
+}
+
 }  // namespace
 
 bool stochasticStep(double t, const Modality& m) {
-  if (m.mode == 1) return false;                                   // vf: the flow's ODE, never
-  if (m.mode == 2) return !(t > m.odeLim);                         // sc: stochastic up to its ODE tail
-  return t != 0 && !(t > m.odeLim || t < m.odeBelow);              // vf_tsr: between the two limits
+  rfd4p::StepCfg c;
+  c.mode = m.mode == 0 ? "vf_tsr" : (m.mode == 1 ? "vf" : "sc");
+  c.tLimOde = m.odeLim;
+  c.tLimOdeBelow = m.odeBelow;
+  return rfd4p::isStochastic(t, c);
 }
 
-Modality modalitySchedule(const char* tag, int nsteps) {
+// the exported sampling metadata (`samplingMeta`'s fields) as cuda/rfd4p's own config struct
+rfd4p::ModalityCfg modalityCfg(const char* tag) {
   auto meta = [&](const char* field, double fallback) {
     return M.meta(std::string("meta/samp") + tag + field, fallback);
   };
+  static const char* SCHED[] = {"uniform", "power", "log"};
+  static const char* GT[] = {"1/t", "1-t/t", "tan", "ode"};
+  static const char* MODE[] = {"vf_tsr", "vf", "sc"};
+  const int sched = (int)meta("Sched", 2), gt = (int)meta("Gt", 0), mode = (int)meta("Mode", 0);
+  if (sched < 0 || sched > 2 || gt < 0 || gt > 3 || mode < 0 || mode > 2)
+    die("rfd4p: this job's %s sampler is schedule %d, gt %d, mode %d - one of them is not a value this port "
+        "knows", tag, sched, gt, mode);
+  rfd4p::ModalityCfg c;
+  c.schedule = {SCHED[sched], meta("P", 2), (int)meta("Tail", 0), (int)meta("TailMult", 1)};
+  c.gt = {GT[gt], meta("GtP", 1), meta("HasClamp", 0) != 0, meta("Clamp", 0)};
+  c.step.mode = MODE[mode];
+  c.step.scScaleNoise = meta("Noise", 1);
+  c.step.tLimOde = meta("Ode", 1);
+  c.step.tLimOdeBelow = meta("OdeBelow", 0);
+  c.step.tsrK = meta("TsrK", 1);
+  c.step.tsrSigma = meta("TsrSigma", 1);
+  c.step.center = meta("Center", 0) != 0;
+  return c;
+}
+
+Modality modalitySchedule(const char* tag, int nsteps) {
+  const rfd4p::ModalityCfg c = modalityCfg(tag);
+  const rfd4p::Schedule sch = rfd4p::buildSchedule(c, nsteps);
   Modality m;
-  m.mode = (int)meta("Mode", 0);
-  m.tsrK = meta("TsrK", 1);
-  m.tsrSigma = meta("TsrSigma", 1);
-  m.scn = meta("Noise", 1);
-  m.odeLim = meta("Ode", 1);
-  m.odeBelow = meta("OdeBelow", 0);
-  m.center = meta("Center", 0) != 0;
-  m.ts = withTail((int)meta("Sched", 0), meta("P", 1), (int)meta("Tail", 0), (int)meta("TailMult", 1), nsteps,
-                  m.mode == 0);
-  // `get_gt`, then `transform_gt`'s power, then the clamp - and for vf_tsr divided by the tsr ratio squared
-  const int gtMode = (int)meta("Gt", 0);
-  const double gtP = meta("GtP", 1), clamp = meta("Clamp", 0);
-  const bool hasClamp = meta("HasClamp", 0) != 0;
-  m.gt.assign(m.ts.size() - 1, 0.0);
-  if (gtMode != 3) {                                               // 3: ode, no noise at all
-    for (size_t i = 0; i < m.gt.size(); ++i) {
-      const double t = std::min(std::max(m.ts[i], 0.0), 1 - 1e-5);
-      if (gtMode == 0) m.gt[i] = 1 / (t + 1e-2);
-      else if (gtMode == 1) m.gt[i] = (1 - t) / (t + 1e-2);
-      else if (gtMode == 2) m.gt[i] = (M_PI / 2) * std::sin((1 - t) * M_PI / 2) / (std::cos((1 - t) * M_PI / 2) + 1e-2);
-      else die("rfd4p: gt mode %d is not one this port knows", gtMode);
-    }
-    if (gtP != 1) {
-      double mean = 0;
-      for (double g : m.gt) mean += std::log(g);
-      mean /= (double)m.gt.size();
-      for (double& g : m.gt) {
-        const double sig = 1 / (1 + std::exp(-(std::log(g) - mean)));
-        const double q = std::min(std::max(std::pow(sig, gtP), 1e-6), 1 - 1e-6);
-        g = std::exp(std::log(q / (1 - q)) + mean);
-      }
-    }
-    for (size_t i = 0; i < m.gt.size(); ++i) {
-      double v = std::max(m.gt[i], 0.0);
-      if (hasClamp) v = std::min(v, clamp);
-      if (m.mode == 0) {
-        const double snr = (m.ts[i] * m.ts[i]) / ((1 - m.ts[i]) * (1 - m.ts[i]));
-        const double r = (snr * m.tsrSigma * m.tsrSigma + 1) / ((snr * m.tsrSigma * m.tsrSigma) / m.tsrK + 1);
-        v /= r * r;
-      }
-      m.gt[i] = v;
-    }
-  }
+  m.ts = sch.ts;
+  m.gt = sch.gt;
+  m.mode = c.step.mode == "vf_tsr" ? 0 : (c.step.mode == "vf" ? 1 : 2);
+  m.tsrK = c.step.tsrK;
+  m.tsrSigma = c.step.tsrSigma;
+  m.scn = c.step.scScaleNoise;
+  m.odeLim = c.step.tLimOde;
+  m.odeBelow = c.step.tLimOdeBelow;
+  m.center = c.step.center;
   return m;
 }
 
@@ -239,12 +222,60 @@ size_t groupOffsets(const float* noise, int n, const float* emitBb, const int* c
   return at;
 }
 
+// 🔴 A SECOND DESIGN DRAWS ITS OWN STREAM, IN THE EXPORTER'S ORDER. The first design replays what the export
+// recorded, so a trajectory gate compares two sides that drew the same numbers; every later one is seeded
+// `seed + design` and draws for itself - which is only safe because `rfd4p::Rng` is bit-exact against the page,
+// integers and Gaussians alike. The ORDER is the specification: the per-step `randperm` goes BEFORE that step's
+// noise and consumes RAW uniforms where everything else goes through Box-Muller, so modelling it as a normal
+// advances the stream by a different amount and moves every later draw of the run.
+struct Stream {
+  std::vector<float> noise;
+  std::vector<int> perm;      // [steps][groups]
+};
+Stream drawStream(uint64_t seed, int n, int latent, int steps, int groups, int crdGroups, bool partial,
+                  bool inverse, const Modality& bb, const Modality& ll) {
+  rfd4p::Rng rng(seed);
+  Stream out;
+  auto take = [&](size_t count) {
+    const size_t at = out.noise.size();
+    out.noise.resize(at + count);
+    rng.randn(out.noise.data() + at, count);
+  };
+  if (partial) {
+    take((size_t)n * latent);                       // the encoder's reparameterisation
+    take((size_t)n * 3);                            // corrupt_batch: the zero-COM backbone noise
+    take((size_t)n * latent);                       // corrupt_batch: the latent noise
+    for (int g = 0; g < groups; ++g) take(3);
+    if (inverse) {
+      take((size_t)n * 3);                          // the target backbone at ts[0]
+      for (int g = 0; g < groups; ++g) take(3);
+    }
+  } else {
+    take((size_t)n * 3);
+    for (int g = 0; g < groups; ++g) take(3);
+    take((size_t)n * latent);
+  }
+  for (int st = 0; st < steps; ++st) {
+    const std::vector<int> p = rng.randperm(crdGroups);
+    out.perm.insert(out.perm.end(), p.begin(), p.end());
+    for (int dm = 0; dm < 2; ++dm) {
+      const Modality& m = dm == 0 ? bb : ll;
+      if (stochasticStep((float)m.ts[(size_t)st], m)) take((size_t)n * (dm == 0 ? 3 : latent));
+    }
+    if (inverse && st < steps - 1) {
+      take((size_t)n * 3);
+      for (int g = 0; g < groups; ++g) take(3);
+    }
+  }
+  return out;
+}
+
 }  // namespace
 
 double (*GATE_CHECK)(const char*, const std::string&, const float*, size_t, double) = nullptr;
 double GATE_TRAJ_BOUND = 1e-4;
 
-int generate(const std::string& genDir, const std::string& outPath) {
+int generate(const std::string& genDir, const std::string& outPath, int designs, uint64_t seed) {
   (void)genDir;
   const int n = D_.n, latent = DD_.latent;
   const size_t nn = (size_t)n * n;
@@ -253,6 +284,8 @@ int generate(const std::string& genDir, const std::string& outPath) {
   const bool inverse = M.meta("meta/inverseFolding", 0) != 0;
   const double ptBb = M.meta("meta/partialTBb", 0), ptLl = M.meta("meta/partialTLl", 0);
   const int fullNsteps = (int)M.meta("meta/fullNsteps", 0);
+  // the molecule instances that take a stochastic offset: how many 3-normal draws the stream holds for them
+  const int nGroups = (int)M.meta("meta/nGroups", 0);
   // 🔴 A PER-STEP FEATURE IS RECOMPUTED OR REPLAYED AND NEVER SILENTLY FROZEN, which is the export's own rule
   // and the reason these are refusals rather than omissions. The chirality alignment fits a frame against the
   // noisy alpha carbons every step and rotates the clean vectors (`cuda/rfd4p/src/chirality.cuh`), and a
@@ -264,24 +297,32 @@ int generate(const std::string& genDir, const std::string& outPath) {
   const int frameWidth = (int)M.meta("meta/chiralFrameWidth", 0);
   if (chiral && (chirOff < 0 || frameWidth <= 2 || !M.has("g/chir") || !M.has("g/chiralFrames")))
     die("rfd4p: this job aligns chirality but its export carries no frames to align with");
-  // 🔴 A PERMUTATION OF ONE LABEL IS THE IDENTITY, which is why one group runs and two do not. The coordinate
-  // groups' labels are permuted from a replayed `randperm` at the top of every step, and this port does not
-  // apply it - so with two or more groups the feature would be FROZEN at the featuriser's own draw, which is the
-  // one thing the export's rule forbids. With one group there is nothing to permute and nothing is frozen.
-  // 🔴 AND cuda/rfd4p DOES NOT APPLY IT EITHER - `g/crdUniq` and `g/crdPerm` are exported and read by neither
-  // port, so a two-group job is frozen there without saying so. Worth a note upstream rather than copying.
-  if (M.meta("meta/nCrdGroups", 0) >= 2)
-    die("rfd4p: this job permutes %d coordinate-group labels a step and this port does not - with more than one "
-        "group that feature would be frozen rather than skipped (and cuda/rfd4p freezes it silently)",
-        (int)M.meta("meta/nCrdGroups", 0));
+  // 🔴 THE COORDINATE GROUPS' LABELS ARE PERMUTED EVERY STEP, from the replayed `randperm` the export carries -
+  // `g/crdUniq` and `g/crdPerm`, written for a consumer that until now existed in neither port (cuda/rfd4p
+  // freezes them silently, which is a note for upstream rather than a thing to copy). One group makes the
+  // permutation the identity; two or more make it the difference between the feature the model was trained on
+  // and a constant.
+  const int nCrdGroups = (int)M.meta("meta/nCrdGroups", 0);
+  int grpOff = -1;
+  std::vector<int> crdUniq, crdPerm;
+  if (nCrdGroups > 0) {
+    if (!M.has("g/crdUniq") || !M.has("g/crdPerm") || !M.has("g/coordGroup"))
+      die("rfd4p: this job has %d coordinate groups and its export carries no permutation for them", nCrdGroups);
+    crdUniq.assign(M.hostI("g/crdUniq"), M.hostI("g/crdUniq") + nCrdGroups);
+    crdPerm.assign(M.hostI("g/crdPerm"), M.hostI("g/crdPerm") + (size_t)nCrdGroups * steps);
+    grpOff = coordGroupOffset(n, D_.seqDim, M.hostF("in/seq"), M.hostI("g/coordGroup"), crdUniq, crdPerm.data());
+    if (grpOff < 0)
+      die("rfd4p: the 37 coord_group_seq columns are not in this input's %d sequence columns under the first "
+          "step's permutation - the feature's place cannot be assumed and this port will not guess it",
+          D_.seqDim);
+  }
   // 🔴 A PARTIAL RUN RUNS THE TAIL OF THE FULL SCHEDULE, NOT ITS OWN: its first time is the corruption time and
   // every later one is a time an unconditional run would also reach.
   Modality bbM = partial ? partialSchedule("Bb", steps, fullNsteps, ptBb) : modalitySchedule("Bb", steps);
   Modality llM = partial ? partialSchedule("Ll", steps, fullNsteps, ptLl) : modalitySchedule("Ll", steps);
-  if (bbM.center || llM.center)
-    die("rfd4p: center_every_step is not implemented here (the reference and cuda/rfd4p run it)");
 
-  const float* noise = M.hostF("g/noise");
+
+  const float* replayed = M.hostF("g/noise");
   const float* emitBb = M.hostF("g/emitBb");
   const float* emitLl = M.hostF("g/emitLl");
   const int* coordCond = M.hostI("g/coordCond");
@@ -290,6 +331,48 @@ int generate(const std::string& genDir, const std::string& outPath) {
   const int* stoch = M.hostI("g/stochastic");
 
   const float scale = (float)M.meta("meta/centeringScale", 0.2);
+
+  // the activations and the features, allocated ONCE: a campaign's second design pays for neither, which is
+  // what makes it a campaign rather than N runs (cuda/rfd4p measures 0.43 s for the first and 0.27 after)
+  float* seqF = allocT<float>((size_t)n * D_.seqDim);
+  float* pairF = allocT<float>(nn * D_.pairDim);
+  float* sAct = allocT<float>((size_t)n * D_.D);
+  float* zAct = allocT<float>(nn * D_.P);
+  float* vBb = allocT<float>((size_t)n * 3);
+  float* vLl = allocT<float>((size_t)n * latent);
+  float* logits = allocT<float>((size_t)n * 147);
+  float* insertion = allocT<float>(nn);
+  float* x1Bb = allocT<float>((size_t)n * 3);
+  float* x1Ll = allocT<float>((size_t)n * latent);
+  // 🔴 THE STEP'S CONDITIONING IS COPIED INTO A BUFFER OF ITS OWN, NOT POINTED AT INSIDE THE BIG ONE, AND THAT
+  // IS A CORRECTNESS REQUIREMENT RATHER THAN TIDINESS. metal/core's GEMM chooses its VECTOR EPILOGUE by the
+  // operands' ADDRESS alignment (`al4(p, ld) = p % 16 == 0 && ld % 4 == 0`, and the bias 16-byte aligned), so
+  // which kernel runs - and therefore the order the sums are stored in - depends on where a buffer happens to
+  // live. `g/cond + step * n * 609 * 4 bytes` is 8 modulo 16 on odd steps and whatever the tensor's base is
+  // modulo 16 on top of that, and Metal assigns that base per run: so the same input folded twice took
+  // different kernels from step 3 on and the designs differed in the third decimal. It showed only once the
+  // featuriser ran first in the same process, which shifts every later allocation - a difference between runs
+  // that no gate over one run could see. An allocation of its own is 256-byte aligned by construction.
+  float* cond0Buf = allocT<float>((size_t)n * D_.condDim);
+  float* cond1Buf = allocT<float>((size_t)n * D_.condDim);
+  float* pairCondBuf = allocT<float>((size_t)M.len("g/pairCond") / std::max(steps, 1));
+  float* xBb = allocT<float>((size_t)n * 3);
+  float* xLl = allocT<float>((size_t)n * latent);
+  float* eBb = uploadNew(emitBb, (size_t)n);
+  float* eLl = uploadNew(emitLl, (size_t)n);
+
+  for (int design = 0; design < std::max(designs, 1); ++design) {
+  // 🔴 DESIGN 0 REPLAYS THE EXPORT'S STREAM AND EVERY LATER ONE DRAWS ITS OWN. The replay is what lets a
+  // trajectory be compared against the reference's; a campaign's point is different proteins, so design d is
+  // seeded `seed + d` and draws in the exporter's own order.
+  Stream own;
+  const float* noise = replayed;
+  const int* perm = crdPerm.empty() ? nullptr : crdPerm.data();
+  if (design > 0) {
+    own = drawStream(seed + (uint64_t)design, n, latent, steps, nGroups, nCrdGroups, partial, inverse, bbM, llM);
+    noise = own.noise.data();
+    perm = own.perm.empty() ? nullptr : own.perm.data();
+  }
   std::vector<float> bb0((size_t)n * 3), ll0((size_t)n * latent), target;
   size_t noiseAt = 0;
   if (!partial) {
@@ -378,10 +461,11 @@ int generate(const std::string& genDir, const std::string& outPath) {
     }
     (void)pad;
   }
-  float* xBb = uploadNew(bb0.data(), bb0.size());
-  float* xLl = uploadNew(ll0.data(), ll0.size());
-  float* eBb = uploadNew(emitBb, (size_t)n);
-  float* eLl = uploadNew(emitLl, (size_t)n);
+  upload(xBb, bb0.data(), bb0.size() * 4);
+  upload(xLl, ll0.data(), ll0.size() * 4);
+  // the whole replayed stream on the device once, so no step issues an upload of its own
+  const size_t noiseLen = design > 0 ? own.noise.size() : M.len("g/noise");
+  float* noiseDev = uploadNew(noise, noiseLen);
 
   // the features: the sequence block with its 35 moving columns, and the pair block with its 30
   const int seqDim = D_.seqDim, condDim = D_.condDim, pairDim = D_.pairDim;
@@ -411,6 +495,20 @@ int generate(const std::string& genDir, const std::string& outPath) {
     // the step's own noised state into the sequence features - three columns at 0 and thirty-two at 3
     copy2d(seqF, (size_t)seqDim * 4, xBb, 3 * 4, 3 * 4, (size_t)n);
     copy2d(seqF + 3, (size_t)seqDim * 4, xLl, (size_t)latent * 4, (size_t)latent * 4, (size_t)n);
+    // this step's coordinate-group labels, from the step's own row of the replayed permutation
+    if (grpOff >= 0) {
+      std::vector<float> rows((size_t)n * 37);
+      const int* p = perm + (size_t)st * nCrdGroups;
+      const int* groups = M.hostI("g/coordGroup");
+      for (size_t k = 0; k < rows.size(); ++k) {
+        const int g = groups[k];
+        const auto at = std::find(crdUniq.begin(), crdUniq.end(), g);
+        rows[k] = (g == -1 || at == crdUniq.end()) ? -1.f : (float)p[at - crdUniq.begin()];
+      }
+      float* dev = uploadNew(rows.data(), rows.size());
+      copy2d(seqF + grpOff, (size_t)seqDim * 4, dev, 37 * 4, 37 * 4, (size_t)n);
+    }
+
     // 🔴 AND THE CHIRALITY, FITTED AGAINST THESE COORDINATES. The clean vectors rotated onto the directions
     // their frame's neighbours have now: 18 columns at `chirOff`, recomputed because they describe the state the
     // model is being shown rather than the structure the job came from.
@@ -446,8 +544,11 @@ int generate(const std::string& genDir, const std::string& outPath) {
     fill(s, 0, (size_t)n * D_.D * 4);
     fill(z, 0, nn * D_.P * 4);
     sync();
-    trunkForward(seqF, M.f("g/cond") + (size_t)st * n * condDim, M.f("g/cond1") + (size_t)st * n * condDim,
-                 pairF, M.f("g/pairCond") + (size_t)st * 512, depths[st], s, z, vBb, vLl, logits,
+    const size_t pairCondDim = M.len("g/pairCond") / (size_t)std::max(steps, 1);
+    copy(cond0Buf, M.f("g/cond") + (size_t)st * n * condDim, (size_t)n * condDim * 4);
+    copy(cond1Buf, M.f("g/cond1") + (size_t)st * n * condDim, (size_t)n * condDim * 4);
+    copy(pairCondBuf, M.f("g/pairCond") + (size_t)st * pairCondDim, pairCondDim * 4);
+    trunkForward(seqF, cond0Buf, cond1Buf, pairF, pairCondBuf, depths[st], s, z, vBb, vLl, logits,
                  st == steps - 1 ? insertion : nullptr);
 
     // one Euler(-Maruyama) step a modality, the clean estimate out beside it
@@ -479,11 +580,45 @@ int generate(const std::string& genDir, const std::string& outPath) {
       a.vsCoef = (float)vsCoef;
       a.stochastic = stochastic ? 1u : 0u;
       if (stochastic) {
-        a.eps = uploadNew(noise + noiseAt, (size_t)n * dim);
+        // 🔴 A VIEW INTO THE WHOLE STREAM, UPLOADED ONCE - NOT AN UPLOAD A STEP. A per-step `uploadNew` was a
+        // host-to-device copy issued while sixty steps of work were queued, and it made the fold
+        // NONDETERMINISTIC: six runs of one input gave four different designs, differing in the third decimal.
+        // One upload before the loop has nothing to race with, and the step reads its own slice.
+        a.eps = noiseDev + noiseAt;
         noiseAt += (size_t)n * dim;
       }
       run1d("rfd4p_sim_step", a.n, a);
+      // 🔴 AND THE RE-CENTRING AFTER IT, NOT INSIDE IT: `_force_zero_com` is a reduction over every emitted
+      // token, which a per-element step cannot see. The released sampler leaves it off and a job may ask for it.
+      if (m.center) {
+        RfdCenterArgs ca2{};
+        ca2.x = a.x; ca2.emit = a.emit; ca2.tokens = (size_t)n; ca2.dim = (uint)dim;
+        dispatch("rfd4p_center", &ca2, sizeof ca2, Grid{(uint32_t)dim, 1, 1}, 256, 0, "rfd4p_center");
+      }
     }
+    // LOCALFOLD_RFD4P_TRACE=1: a checksum of the state after every step, which is how a divergence between two
+    // runs of one input is located - the step it first appears at says whether the difference came in with the
+    // features or grew in the trunk.
+    if (st == 0 && getenv("LOCALFOLD_RFD4P_TRACE")) {
+      // the addresses themselves, because metal/core's GEMM chooses its epilogue by their alignment: a run whose
+      // buffers land differently takes different kernels, and this is how that is seen rather than inferred
+      printf("  trace addr: seqF %%16=%zu pairF %%16=%zu cond0 %%16=%zu s %%16=%zu z %%16=%zu "
+             "in/seq %%16=%zu w/first %%16=%zu\n",
+             (size_t)((uintptr_t)seqF % 16), (size_t)((uintptr_t)pairF % 16), (size_t)((uintptr_t)cond0Buf % 16),
+             (size_t)((uintptr_t)s % 16), (size_t)((uintptr_t)z % 16),
+             (size_t)((uintptr_t)M.f("in/seq") % 16),
+             (size_t)((uintptr_t)M.f("w/nn.cond_factory.linear_out.weight") % 16));
+    }
+    if (getenv("LOCALFOLD_RFD4P_TRACE")) {
+      sync();
+      const float* xb = (const float*)host(xBb);
+      const float* xl = (const float*)host(xLl);
+      double a = 0, b = 0;
+      for (size_t k = 0; k < (size_t)n * 3; ++k) a += (double)xb[k] * (k + 1);
+      for (size_t k = 0; k < (size_t)n * latent; ++k) b += (double)xl[k] * (k + 1);
+      printf("  trace step %d: bb %.17g ll %.17g\n", st, a, b);
+    }
+
     // the resampled target comes AFTER both modalities have stepped, and not after the last step, where the
     // clean target is used as it is
     if (inverse) {
@@ -533,6 +668,15 @@ int generate(const std::string& genDir, const std::string& outPath) {
   // reference decodes x - taking x1 instead would be decoding the second-to-last step's estimate.
   if (!outPath.empty()) {
     sync();
+    // 🔴 ONE FILE A DESIGN, NUMBERED FROM ONE, and the plain name kept for a single design: a campaign that
+    // overwrote its own output would report N designs and leave the last.
+    std::string path = outPath;
+    if (std::max(designs, 1) > 1) {
+      const size_t dot = outPath.find_last_of('.');
+      const std::string stem = dot == std::string::npos ? outPath : outPath.substr(0, dot);
+      const std::string ext = dot == std::string::npos ? std::string(".pdb") : outPath.substr(dot);
+      path = stem + "_" + std::to_string(design + 1) + ext;
+    }
     const int* tokenType = M.hostI("in/tokenType");
     const int* condSeq = M.hostI("g/condSeq");
     std::vector<int> seq((size_t)n);
@@ -570,16 +714,22 @@ int generate(const std::string& genDir, const std::string& outPath) {
       in.resName = M.hostI("g/outResName");
       in.inName = M.hostI("g/inName");
       in.inElem = M.hostI("g/inElem");
+      in.inCharge = M.hostI("g/inCharge");
+      in.insCode = M.hostI("g/outInsCode");
+      in.entity = M.hostI("g/outEntity");
+      in.inB = M.hostI("g/inB");
+      in.inOcc = M.hostI("g/inOcc");
     }
-    const int atoms = writePdb(outPath, n, coors.data(), atomMask.data(), resType.data(),
+    const int atoms = writeStructure(path, n, coors.data(), atomMask.data(), resType.data(),
                                M.has("g/outResId") ? M.hostI("g/outResId") : nullptr,
                                M.has("g/outChain") ? M.hostI("g/outChain") : nullptr,
                                M.has("g/chainIid") ? M.hostI("g/chainIid") : nullptr, ca, in);
     int emitted = 0;
     for (int i = 0; i < n; ++i) if (emitBb[i] != 0) emitted += 1;
     printf("generated %d residues, %d atoms over %d steps (%d sequence positions read out) -> %s\n", emitted, atoms,
-           steps, filled, outPath.c_str());
+           steps, filled, path.c_str());
     printf("  consecutive CA-CA: median %.2f A, min %.2f, max %.2f\n", ca[0], ca[1], ca[2]);
+  }
   }
   return steps;
 }
