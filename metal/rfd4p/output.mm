@@ -172,6 +172,31 @@ Design buildDesign(rfd4p::GenOut& g, const OutInput& in) {
   rfd4p::alignToInputFrame(g, n, condCoord.empty() ? nullptr : condCoord.data(),
                            condIntCrd.empty() ? nullptr : condIntCrd.data(),
                            coordGroup.empty() ? nullptr : coordGroup.data(), naming);
+  // ...and back out of the centred frame, WHERE THE EXPORT CARRIES THE OFFSET TO DO IT WITH. `meta/centerShift*`
+  // is `centerAndFeaturizeCentroid`'s own return value - the centroid it subtracted - and this is
+  // `processSampleToAtoms`' last step (output.js), on the same condition: any anchor at all, and a shift that is
+  // not zero. One anchor does not fix a frame so the alignment above declines it, and the translation still
+  // applies, which is why the count and not the fit decides. Rounded to float per component, as the reference's
+  // `Math.fround` is. A work directory written without the offset leaves this a no-op and the design in the
+  // centred frame, which is what every native port did before it was exported.
+  {
+    size_t anchors = 0;
+    for (size_t sl = 0; sl < (size_t)n * 37 && !condCoord.empty(); ++sl) {
+      if (g.atomMask[sl] && !naming.skip((int)(sl / 37)) && std::isfinite(condCoord[sl * 3])) ++anchors;
+    }
+    const double sx = M.meta("meta/centerShift0", 0.0), sy = M.meta("meta/centerShift1", 0.0),
+                 sz = M.meta("meta/centerShift2", 0.0);
+    if (anchors && (sx != 0.0 || sy != 0.0 || sz != 0.0)) {
+      for (size_t sl = 0; sl < (size_t)n * 37; ++sl) {
+        if (!g.atomMask[sl]) continue;
+        float* c = &g.coors[(sl / 37) * 111 + (sl % 37) * 3];
+        c[0] = (float)((double)c[0] + sx);
+        c[1] = (float)((double)c[1] + sy);
+        c[2] = (float)((double)c[2] + sz);
+      }
+      out.shifted = true;
+    }
+  }
   // The records the page's `processSampleToAtoms` builds, from the INPUT's conditioning as it was before any
   // grafting - which atom carried a conditioned coordinate is a fact about the input, and the grafted ones are
   // named by `crdSource`.

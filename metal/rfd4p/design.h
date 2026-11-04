@@ -50,6 +50,7 @@ struct Design {
   double caSpacing[3] = {0, 0, 0};   // consecutive CA-CA within a chain: median, min, max
   int grafted = 0;                   // unindexed tokens the mapping placed
   bool unindexedUnplaced = false;    // ...and whether there were any it could not
+  bool shifted = false;              // whether the centring offset was available and added back
 };
 
 // The decoder's heads into a structure (`formatSampleLocalLatents`), over the decoder's ATTENDED rows.
