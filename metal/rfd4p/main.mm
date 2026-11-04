@@ -18,6 +18,22 @@
 // longer input gains MORE, because everything this round removed scales with the pair track - the attention's
 // bias, the four gate planes, the normed pair copy - which is also why the 400-token case needed no separate
 // work. Measured in short runs (4 steps) so the laptop's 19% thermal drift over a long pair cannot swamp it.
+// 🔴 AND IT IS RE-MEASURED AT 183 TOKENS ON A FULL 60-STEP GENERATION: **12.9% less wall, 1.148x**, which is
+// the number to quote because it is a whole design rather than four steps. `--job=featurise/gate-structure.json`
+// through both binaries, nothing synthetic: 183 tokens, 60 steps, CA-CA median 3.80 A. The laptop was drifting
+// UPWARD through the run (a head arm read 386, 424, 438 then 466 ms a step over four consecutive runs), so the
+// arms are ordered **ABBA** rather than ABAB - a linear trend cancels within a round where an A-then-B pair
+// charges every B the extra heat. Two stable rounds, four runs an arm: head **29.64 s (sd 0.12)** against base
+// **34.04 s (sd 0.25)**, and the cooler first round agrees at 1.129x. The spread is 0.4% and 0.7% of the mean,
+// so 12.9% is an order of magnitude clear of it.
+// 🔴 AND THE FOLD IS THE SAME FOLD, which is the half a speed number cannot claim for itself: the two arms'
+// designs are **0.010 A CA RMSD** over 68 residues with CA-CA median 3.832 (min 3.727, max 3.906). A round
+// that bought 12.9% by moving the structure would have bought nothing.
+// 🔴 AND THE BASELINE CANNOT REPORT ITS OWN GPU TIME, which is why this pair is measured on the WALL:
+// `LF_GPUBUSY` was added after `4b92ef8c`, so the base arm prints no busy line at all and a comparison of
+// busy-per-step would have silently been a comparison of one arm with nothing. The wall also carries the
+// featurisation, the weight load and the trajectory comparison - a second or so, identical in both arms - so
+// it UNDERSTATES the generation's own gain rather than flattering it.
 // 🔴 ONE SAMPLER STEP AT 165 TOKENS IS **108.7 ms** AND EVERY ITEM LEFT IN IT IS AT A MEASURED CEILING. This
 // round took three: metal/core's flash attention for this port's own scalar kernel (4.4%), the triangle's gate
 // fused into its projection through `gemmTriGate` (5.2%), and the pair bias's norm folded into its weight
