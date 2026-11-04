@@ -12,6 +12,16 @@
 //
 // SPEED, on an M5 (8-core GPU), a whole job including featurisation: a 54-residue design at 60 steps is
 // **3.7 s**, a 67-token motif 3.5 s, a 165-token small molecule 17.6 s, a 183-token interface 21.0 s.
+// 🔴 ONE SAMPLER STEP AT 165 TOKENS IS **108.7 ms** AND EVERY ITEM LEFT IN IT IS AT A MEASURED CEILING. This
+// round took three: metal/core's flash attention for this port's own scalar kernel (4.4%), the triangle's gate
+// fused into its projection through `gemmTriGate` (5.2%), and the pair bias's norm folded into its weight
+// (0.9%). What remains, with what each is against: the fused triangle gate 25.0% (the matrix units' 12.22
+// TFLOP/s, which the plain projection already reached at 97%), the gated add 15.7% (106% of
+// `GFLOP / 12.22 + MB / 131`, so at the roofline once its 1.17 GB epilogue is paid), the pair transition 10.1%
+// (10.4 TFLOP/s), and then nothing above 3.6% - the centre norm, the two contractions, the pair write, the
+// bias projection, the triangle's doubled input norm. The two things that would move it further are named
+// above and below: core's norm-emitting epilogue on the matrix path (<= 1.2%), and a second triangle shape,
+// which the 400-token scaling says is not needed.
 // 🔴 HALF IS THE DEFAULT AND `--f32` IS THE CONTROL, which is 3.6x slower: 12.6 s for that first design against
 // 3.5. One sampler step at 183 tokens went **681 ms of GPU time to 151, and 618 dispatches to 419**, over this
 // port's optimisation round: the weights, the activations and the PAIR TRACK in half; the triangle's projections
@@ -88,6 +98,17 @@
 // alone goes 38.65 to 46.57 s). The ordering puts the fused arm second and so on the hotter machine, which
 // biases against it, and the mean still comes out negative - but a 1% effect under a 19% drift is not a
 // measurement. It is kept for the 165-token number, the exactness of the identity, and the buffer.
+//
+// 🔴 AND THE LAST PASS THAT COULD GO IS NOT THIS PORT'S TO REMOVE, so here is where it stands rather than a
+// promise. The triangle's input LayerNorm runs TWICE a layer - 14 calls a step for 7 pair updates, 2.58 ms,
+// 2.4% - where it should run once: `pairUpdate` asks the first triangle's gated add to emit the second's norm
+// in its epilogue (`Gemm::lnOut`, which is why `triangle` takes a `znPre`), and it never does. The reason is
+// in core's own dispatch: `lnEmit` requires the VECTOR epilogue or the 16384 gated-residual form, whose
+// comment says "gemm_tensor.metal's float tile has no other emitting form", and on the matrix units this
+// gated add is epilogue 192. The width is not the obstacle - a 384-wide output has its 64 x 128 clause - the
+// PATH is. Half of 2.58 ms is 1.2% of a step, and after the pair-bias fold measured 0.9% of wall against
+// 4.2% of profile, the wall share of this would be a few tenths. It is not worth changing the epilogue
+// selection that af3 and bioemu2 also take.
 //
 // So no kernel here is worth another tile sweep. The lever left is FEWER PASSES OVER THE PAIR TRACK - fusing an
 // elementwise pass into the epilogue of the GEMM that produced it, as the gate, the residual and the next
