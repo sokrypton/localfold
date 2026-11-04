@@ -104,7 +104,7 @@ struct GridAttn {
   bool transpose = false;
   bool untransposedResidual = false;   // chai-1's parallel block: the column pass's update added as it comes out
 };
-struct GridSave { LnSave ln; real *xn, *act, *nb, *qkvg, *o; int n; real* lse = nullptr; bool bf = false; };   // (bf: xn, act, qkvg in bf16)
+struct GridSave { LnSave ln; real *xn, *act, *nb, *qkvg, *o; int n; real* lse = nullptr; bool bf = false; real* W = nullptr; };   // (bf: xn, act, qkvg [nn, 4 HD] and W [C, 4 HD] in bf16)
 // rawBias [nn, H] -> nb [H, nn], the column direction's source transposed when swap
 __global__ void gridBiasK(const real* raw, real* nb, int n, int H, bool swap, bool back) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -123,8 +123,27 @@ inline Sdpa gridSdpa(const GridAttn& g, int n, const real* keyMask, const real* 
   return a;
 }
 #ifndef GRAD_F64
-// BF16: the normalised pair and q, k, v, gate kept in bf16, every projection a bf16 GEMM, the attention reading
-// them as they are
+// q, k, v, gate's weights packed side by side as one [C, 4 HD] bf16 matrix (each role [HD, C] when its Linear is
+// transposed, [C, HD] otherwise); back: dW [C, 4 HD] (float) added into each role's gradient in its own layout
+__global__ void packQkvgK(bf* W, float* dW, const float* w0, const float* w1, const float* w2, const float* w3,
+                          float* g0, float* g1, float* g2, float* g3, bool t0, bool t1, bool t2, bool t3, int C,
+                          int HD, bool back) {
+  const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= (size_t)C * 4 * HD) return;
+  const int col = (int)(i % (4 * HD)), c = (int)(i / (4 * HD)), r = col / HD, j = col % HD;
+  const bool tr = r == 0 ? t0 : r == 1 ? t1 : r == 2 ? t2 : t3;
+  const size_t at = tr ? (size_t)j * C + c : (size_t)c * HD + j;
+  if (back) atomicAdd((r == 0 ? g0 : r == 1 ? g1 : r == 2 ? g2 : g3) + at, dW[i]);
+  else W[i] = __float2bfloat16((r == 0 ? w0 : r == 1 ? w1 : r == 2 ? w2 : w3)[at]);
+}
+inline void packQkvg(const GridAttn& g, bf* W, float* dW, bool back) {
+  const int HD = g.H * g.D;
+  const Linear* L[4] = {&g.q, &g.k, &g.v, &g.gate};
+  packQkvgK<<<blocks((size_t)g.C * 4 * HD), 256, 0, STREAM>>>(W, dW, L[0]->w.w, L[1]->w.w, L[2]->w.w, L[3]->w.w,
+      L[0]->w.g, L[1]->w.g, L[2]->w.g, L[3]->w.g, L[0]->trans, L[1]->trans, L[2]->trans, L[3]->trans, g.C, HD, back);
+}
+// BF16: the normalised pair and q, k, v, gate kept in bf16, the four projections one bf16 GEMM into [nn, 4 HD]
+// (bindcraft2's packed Q|K|V|G), the attention reading q, k, v there in place
 inline GridSave gridForwardBf(const GridAttn& g, const Dialect& d, const real* pair, const real* mask,
                               const real* maskT, real* out, int n) {
   const size_t nn = (size_t)n * n;
@@ -141,16 +160,23 @@ inline GridSave gridForwardBf(const GridAttn& g, const Dialect& d, const real* p
   }
   bf* act = xn;
   if (g.transpose) { act = bfGet(nn * g.C); swap01(xn, act, n, n, g.C); }
-  bf* qkvg = bfGet(nn * 4 * HD);
-  bf *q = qkvg, *k = q + nn * HD, *v = k + nn * HD, *gt = v + nn * HD;
-  linearFwdBf(g.q, act, q, nn); linearFwdBf(g.k, act, k, nn); linearFwdBf(g.v, act, v, nn); linearFwdBf(g.gate, act, gt, nn);
-  sigmoidBfK<<<blocks(nn * HD), 256, 0, STREAM>>>(gt, nn * HD);
+  const int P = 4 * HD;
+  bf* W = bfGet((size_t)g.C * P);
+  packQkvg(g, W, nullptr, false);
+  bf* qkvg = bfGet(nn * P);
+  mmBf(act, W, qkvg, (int)nn, g.C, P);
+  const Linear* roles[4] = {&g.q, &g.k, &g.v, &g.gate};
+  for (int r = 0; r < 4; ++r)
+    if (roles[r]->hasBias) biasAddLdK<<<blocks(nn * HD), 256, 0, STREAM>>>(qkvg + r * HD, roles[r]->b.w, nn, HD, P);
+  bf *q = qkvg, *k = q + HD, *v = k + HD, *gt = v + HD;
+  gateSigLdBfK<<<blocks(nn * HD), 256, 0, STREAM>>>(gt, nn, HD, P);
   s.o = ARENA.get(nn * HD);
-  { const Sdpa sd_ = gridSdpa(g, n, g.transpose ? maskT : mask, s.nb); s.lse = ARENA.get((size_t)2 * sd_.B * sd_.H * sd_.Q); sdpaForwardBf(sd_, q, HD, k, HD, v, HD, s.o, HD, s.lse); }
+  { const Sdpa sd_ = gridSdpa(g, n, g.transpose ? maskT : mask, s.nb); s.lse = ARENA.get((size_t)2 * sd_.B * sd_.H * sd_.Q); sdpaForwardBf(sd_, q, P, k, P, v, P, s.o, HD, s.lse); }
   s.xn = reinterpret_cast<real*>(xn); s.act = reinterpret_cast<real*>(act); s.qkvg = reinterpret_cast<real*>(qkvg);
+  s.W = reinterpret_cast<real*>(W);
   Scratch scratch;
   bf* og = bfGet(nn * HD);
-  mulOgBfK<<<blocks(nn * HD), 256, 0, STREAM>>>(og, s.o, gt, nn * HD);
+  gateMulBfK<<<blocks(nn * HD), 256, 0, STREAM>>>(og, s.o, gt, nn, HD, P);
   if (!g.transpose || g.untransposedResidual) { linearFwdBf(g.out, og, out, nn, 1.f); return s; }
   real* t = ARENA.get(nn * g.C);
   linearFwdBf(g.out, og, t, nn);
@@ -164,28 +190,37 @@ inline void gridBackwardBf(GridAttn& g, const Dialect& d, const GridSave& s, con
   const size_t nn = (size_t)n * n;
   const bf *xn = reinterpret_cast<const bf*>(s.xn), *act = reinterpret_cast<const bf*>(s.act),
            *qkvg = reinterpret_cast<const bf*>(s.qkvg);
-  const bf *q = qkvg, *k = q + nn * HD, *v = k + nn * HD, *gt = v + nn * HD;
+  const int P = 4 * HD;
+  const bf *q = qkvg, *k = q + HD, *v = k + HD, *gt = v + HD, *W = reinterpret_cast<const bf*>(s.W);
   const real* dy = dout;
   if (g.transpose && !g.untransposedResidual) { real* t = ARENA.get(nn * g.C); swap01(dout, t, n, n, g.C); dy = t; }
   const bf* dyb = toBf(dy, nn * g.C);
   bf* og = bfGet(nn * HD);
-  mulOgBfK<<<blocks(nn * HD), 256, 0, STREAM>>>(og, s.o, gt, nn * HD);
+  gateMulBfK<<<blocks(nn * HD), 256, 0, STREAM>>>(og, s.o, gt, nn, HD, P);
   real* dog = ARENA.get(nn * HD);
   linearBwdBf(g.out, og, dyb, dog, nn);
+  // d q, k, v, gate straight into one bf16 [nn, 4 HD]: dq through float (its atomics'), dk, dv from the attention,
+  // the gate's from its backward, which also forms the softmax backward's row term
+  bf* dqkvg = bfGet(nn * P);
   real* dO = ARENA.get(nn * HD);
-  bf* dgt = bfGet(nn * HD);
-  ogBwdBfK<<<blocks(nn * HD), 256, 0, STREAM>>>(dog, s.o, gt, dO, dgt, nn * HD);
-  real* dqkv = ARENA.get(nn * 3 * HD);
-  real *dq = dqkv, *dk = dq + nn * HD, *dv = dk + nn * HD;
+  real* Di = ARENA.get(nn * g.H);
+  gateBwdLdDiBfK<<<blocks(nn * g.H * 32), 256, 0, STREAM>>>(dog, s.o, gt, dO, dqkvg + 3 * HD, Di, nn, g.H, g.D, P, n);
+  real* dq = ARENA.get(nn * HD);
   real* dnb = ARENA.zeros(nn * g.H);
-  sdpaBackwardBf(gridSdpa(g, n, g.transpose ? maskT : mask, s.nb, dnb), q, HD, k, HD, v, HD, dO, HD, dq, HD, dk, HD,
-                 dv, HD, s.o, HD, s.lse);
-  const bf* dqkvb = toBf(dqkv, nn * 3 * HD);
+  sdpaBackwardBf(gridSdpa(g, n, g.transpose ? maskT : mask, s.nb, dnb), q, P, k, P, v, P, dO, HD, dq, HD,
+                 dqkvg + HD, P, dqkvg + 2 * HD, P, s.o, HD, s.lse, Di);
+  narrowRowsK<<<blocks(nn * HD), 256, 0, STREAM>>>(dq, dqkvg, HD, P, nn);
+  const Linear* roles[4] = {&g.q, &g.k, &g.v, &g.gate};
+  for (int r = 0; r < 4; ++r)
+    if (roles[r]->hasBias) colSumBf(roles[r]->b.g, dqkvg + r * HD, nn, HD, P);
+  {
+    Scratch sc;
+    real* dW = ARENA.get((size_t)g.C * P);
+    mmATBf(act, dqkvg, dW, (int)nn, g.C, P, 0.f);
+    packQkvg(g, nullptr, dW, true);
+  }
   real* dact = ARENA.get(nn * g.C);
-  linearBwdBf(g.q, act, dqkvb, dact, nn);
-  linearBwdBf(g.k, act, dqkvb + nn * HD, dact, nn, true);
-  linearBwdBf(g.v, act, dqkvb + 2 * nn * HD, dact, nn, true);
-  linearBwdBf(g.gate, act, dgt, dact, nn, true);
+  mmBTBf(dqkvg, W, dact, (int)nn, g.C, P);
   real* dxn = dact;
   if (g.transpose) { dxn = ARENA.get(nn * g.C); swap01(dact, dxn, n, n, g.C); }
   real* draw = ARENA.zeros(nn * g.H);
@@ -509,13 +544,16 @@ inline void pairformerBackward(Pairformer& b, const Dialect& d, const Pairformer
     { Scratch sc; real* dsa = cloneR(ds, (size_t)n * Cs); singleBackward(b.single, s.sa, seqMask, dsa, ds, dp, dextra); }
     GK(cudaMemcpyAsync(dsingle, ds, (size_t)n * Cs * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
   }
-  { Range r_("bw.pairTrans"); Scratch sc; real* du = cloneR(dp, nn * Cz); gtBackward(b.pairTrans, s.pt, du, dp); }
+  // (a module's bf16 backward reads its incoming gradient whole before it adds into dpair, so in BF16 the running
+  // gradient is passed as both - bindcraft2's ACC - where float's backwards need it copied first)
+  auto cur = [&](Scratch&) { return BF16 ? dp : cloneR(dp, nn * Cz); };
+  { Range r_("bw.pairTrans"); Scratch sc; real* du = cur(sc); gtBackward(b.pairTrans, s.pt, du, dp); }
   if (b.hasGrid) {
-    { Range r_("bw.grid2"); Scratch sc; real* du = cloneR(dp, nn * Cz); gridBackward(b.grid2, d, s.g2, pairMask, maskT, du, dp); }
-    { Range r_("bw.grid1"); Scratch sc; real* du = cloneR(dp, nn * Cz); gridBackward(b.grid1, d, s.g1, pairMask, maskT, du, dp); }
+    { Range r_("bw.grid2"); Scratch sc; real* du = cur(sc); gridBackward(b.grid2, d, s.g2, pairMask, maskT, du, dp); }
+    { Range r_("bw.grid1"); Scratch sc; real* du = cur(sc); gridBackward(b.grid1, d, s.g1, pairMask, maskT, du, dp); }
   }
-  { Range r_("bw.triIn"); Scratch sc; real* du = cloneR(dp, nn * Cz); triMulBackward(b.triIn, s.tIn, pairMask, du, dp); }
-  { Range r_("bw.triOut"); Scratch sc; real* du = cloneR(dp, nn * Cz); triMulBackward(b.triOut, s.tOut, pairMask, du, dp); }
+  { Range r_("bw.triIn"); Scratch sc; real* du = cur(sc); triMulBackward(b.triIn, s.tIn, pairMask, du, dp); }
+  { Range r_("bw.triOut"); Scratch sc; real* du = cur(sc); triMulBackward(b.triOut, s.tOut, pairMask, du, dp); }
   GK(cudaMemcpyAsync(dpair, dp, nn * Cz * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
 }
 

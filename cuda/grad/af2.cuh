@@ -480,10 +480,11 @@ inline void blockBackward(Block& b, const BlockSave& s, const real* msaMask, con
   // triangle multiplications: pair3 = pair2 + tIn(pair2); pair2 = pc + tOut(pc)
   {
     Scratch scratch;
-    real* dpu = clone(dp, pr * Cz);
+    // (BF16: in place - triMulBackwardBf reads dout whole before it adds into dpair)
+    real* dpu = BF16 ? dp : clone(dp, pr * Cz);
     { Range r("bw.triIn"); triMulBackward(b.triIn, s.tIn, pairMask, dpu, dp); }
     Range r("bw.triOut");
-    dpu = clone(dp, pr * Cz);
+    if (!BF16) dpu = clone(dp, pr * Cz);
     triMulBackward(b.triOut, s.tOut, pairMask, dpu, dp);
   }
   if (!b.opmFirst) opmBackward(b.opm, s.opm, msaMask, dp, dm);    // pc = pair1 + opm(msa3)

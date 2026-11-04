@@ -9,8 +9,11 @@
 // immediately before that block's backward - AF2's own use_remat - so what is held is one block's activations plus
 // N block inputs, never N blocks of activations. Arena::reset() between blocks returns the saves.
 #pragma once
+#include <cublasLt.h>
 #include <cublas_v2.h>
 #include <cuda_bf16.h>
+#include <map>
+#include <tuple>
 #include <cuda_runtime.h>
 #include <cmath>
 #include <cstdio>
@@ -294,6 +297,7 @@ inline void toBf(const float* x, bf* y, size_t n) {   // (x 8-byte aligned)
 }
 inline bf* bfGet(size_t n) { return reinterpret_cast<bf*>(ARENA.get((n + 1) / 2)); }
 inline bf* toBf(const float* x, size_t n) { bf* y = bfGet(n); toBf(x, y, n); return y; }
+inline bf* bfZeros(size_t n) { bf* y = bfGet(n); GK(cudaMemsetAsync(y, 0, n * 2, STREAM)); return y; }
 inline void gemmEx(cublasOperation_t a, cublasOperation_t b, int m, int n, int k, const void* A, cudaDataType tA,
                    int la, const void* B, cudaDataType tB, int lb, float beta, void* C, cudaDataType tC, int lc) {
   const float one = 1.f;
@@ -328,23 +332,128 @@ inline void mmATBf(const bf* x, const bf* dy, float* dw, int M, int K, int N, fl
            CUDA_R_16BF, K, 1.f, p, CUDA_R_32F, N);
   sumPartialsK<<<blocks(n), 256, 0, STREAM>>>(dw, p, splits, n, 1.f, beta);
 }
-// Linear on bf16 operands; a bias is added in float (biasAddK, colSumBf: ops.cuh)
+// y[M, N] = x[M, K] W + b, (relu), on cuBLASLt with the bias - and the relu - in the GEMM's epilogue (bindcraft2's
+// lt.cuh): W [K, N], or [N, K] with trans; bf16 operands, y bf16 (then the bias must be bf16: cuBLASLt has no
+// float bias for a bf16 output) or float. Plans are cached by shape; one workspace serves every call.
+inline cublasLtHandle_t LT = nullptr;
+template <class Y>
+inline void ltLinear(const bf* x, const bf* w, bool trans, const void* bias, bool relu, Y* y, int M, int K, int N,
+                     float beta) {
+  struct Plan { cublasLtMatmulDesc_t d; cublasLtMatrixLayout_t a, b, c; cublasLtMatmulAlgo_t algo; };
+  static std::map<std::tuple<int, int, int, bool, bool, int>, Plan> plans;
+  static void* ws = nullptr;
+  constexpr size_t WS = 32u << 20;
+  if (!LT) { cublasLtCreate(&LT); GK(cudaMalloc(&ws, WS)); }
+  const auto key = std::make_tuple(M, K, N, trans, relu, (int)sizeof(Y));
+  auto it = plans.find(key);
+  if (it == plans.end()) {
+    Plan p;
+    GB(cublasLtMatmulDescCreate(&p.d, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+    const cublasOperation_t ta = trans ? CUBLAS_OP_T : CUBLAS_OP_N;
+    GB(cublasLtMatmulDescSetAttribute(p.d, CUBLASLT_MATMUL_DESC_TRANSA, &ta, sizeof ta));
+    const cublasLtEpilogue_t ep = relu ? CUBLASLT_EPILOGUE_RELU_BIAS : CUBLASLT_EPILOGUE_BIAS;
+    GB(cublasLtMatmulDescSetAttribute(p.d, CUBLASLT_MATMUL_DESC_EPILOGUE, &ep, sizeof ep));
+    const cudaDataType bt = dtype<Y>();
+    GB(cublasLtMatmulDescSetAttribute(p.d, CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, &bt, sizeof bt));
+    // column-major: y^T [N, M] = op(W)^T [N, K] x^T [K, M]
+    GB(cublasLtMatrixLayoutCreate(&p.a, CUDA_R_16BF, trans ? K : N, trans ? N : K, trans ? K : N));
+    GB(cublasLtMatrixLayoutCreate(&p.b, CUDA_R_16BF, K, M, K));
+    GB(cublasLtMatrixLayoutCreate(&p.c, dtype<Y>(), N, M, N));
+    cublasLtMatmulPreference_t pr;
+    GB(cublasLtMatmulPreferenceCreate(&pr));
+    GB(cublasLtMatmulPreferenceSetAttribute(pr, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &WS, sizeof WS));
+    cublasLtMatmulHeuristicResult_t h; int n = 0;
+    GB(cublasLtMatmulAlgoGetHeuristic(LT, p.d, p.a, p.b, p.c, p.c, pr, 1, &h, &n));
+    if (!n) { fprintf(stderr, "ltLinear: no algorithm for %d x %d x %d\n", M, K, N); exit(1); }
+    p.algo = h.algo;
+    cublasLtMatmulPreferenceDestroy(pr);
+    it = plans.emplace(key, p).first;
+  }
+  Plan& p = it->second;
+  GB(cublasLtMatmulDescSetAttribute(p.d, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof bias));
+  const float one = 1.f;
+  const cublasStatus_t st = cublasLtMatmul(LT, p.d, &one, w, p.a, x, p.b, &beta, y, p.c, y, p.c, &p.algo, ws, WS, STREAM);
+  if (st != CUBLAS_STATUS_SUCCESS) {
+    fprintf(stderr, "ltLinear %d x %d x %d trans %d relu %d out %zu beta %g: cublas %d (x %p w %p y %p b %p)\n", M, K, N,
+            trans, relu, sizeof(Y), beta, (int)st, (const void*)x, (const void*)w, (void*)y, bias);
+    exit(1);
+  }
+}
+// up to four Linears on one input packed side by side: W [K, sum N] bf16 (each role [N, K] when transposed, [K, N]
+// otherwise) and its bias (zero where a role has none); back: dW [K, sum N] (float) added into each role's gradient
+struct Pack4 { const float* w[4]; float* g[4]; bool trans[4]; int off[5]; int n; };
+__global__ void packLinK(Pack4 p, bf* W, const float* dW, int K, bool back) {
+  const int Nt = p.off[p.n];
+  const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= (size_t)K * Nt) return;
+  const int col = (int)(i % Nt), k = (int)(i / Nt);
+  int r = 0;
+  while (col >= p.off[r + 1]) ++r;
+  const int j = col - p.off[r], N = p.off[r + 1] - p.off[r];
+  const size_t at = p.trans[r] ? (size_t)j * K + k : (size_t)k * N + j;
+  if (back) p.g[r][at] += dW[i];
+  else W[i] = __float2bfloat16(p.w[r][at]);
+}
+__global__ void packBiasK(Pack4 p, const float* b0, const float* b1, const float* b2, const float* b3, bf* B) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= p.off[p.n]) return;
+  int r = 0;
+  while (c >= p.off[r + 1]) ++r;
+  const float* b = r == 0 ? b0 : r == 1 ? b1 : r == 2 ? b2 : b3;
+  B[c] = __float2bfloat16(b ? b[c - p.off[r]] : 0.f);
+}
+inline Pack4 pack4(const Linear* const* L, int n) {
+  Pack4 p{};
+  p.n = n;
+  for (int r = 0; r < n; ++r) { p.w[r] = L[r]->w.w; p.g[r] = L[r]->w.g; p.trans[r] = L[r]->trans; p.off[r + 1] = p.off[r] + L[r]->N; }
+  return p;
+}
+// the packed weight (and bias, null when no role has one)
+inline bf* packLinears(const Linear* const* L, int n, bf** bias) {
+  const Pack4 p = pack4(L, n);
+  const int K = L[0]->K, Nt = p.off[n];
+  bf* W = bfGet((size_t)K * Nt);
+  packLinK<<<blocks((size_t)K * Nt), 256, 0, STREAM>>>(p, W, nullptr, K, false);
+  bool any = false;
+  for (int r = 0; r < n; ++r) any |= L[r]->hasBias;
+  *bias = nullptr;
+  if (any) {
+    *bias = bfGet(Nt);
+    const float* b[4] = {nullptr, nullptr, nullptr, nullptr};
+    for (int r = 0; r < n; ++r) if (L[r]->hasBias) b[r] = L[r]->b.w;
+    packBiasK<<<blocks(Nt), 256, 0, STREAM>>>(p, b[0], b[1], b[2], b[3], *bias);
+  }
+  return W;
+}
+inline void unpackLinearGrads(const Linear* const* L, int n, const float* dW) {
+  const Pack4 p = pack4(L, n);
+  packLinK<<<blocks((size_t)L[0]->K * p.off[n]), 256, 0, STREAM>>>(p, nullptr, dW, L[0]->K, true);
+}
+
+// Linear on bf16 operands; a bf16 output's bias in the GEMM's epilogue (ltLinear), a float one's added after
+// (biasAddK), its gradient summed in float (colSumBf: ops.cuh)
 template <class Y> __global__ void biasAddK(Y* y, const float* b, size_t rows, int C);
-inline void colSumBf(float* g, const bf* d, size_t rows, int C);
-template <class Y> inline void linearFwdBf(const Linear& l, const bf* x, Y* y, size_t rows, float beta = 0) {
+inline void colSumBf(float* g, const bf* d, size_t rows, int C, int ld);
+template <class Y>
+inline void linearFwdBf(const Linear& l, const bf* x, Y* y, size_t rows, float beta = 0, bool relu = false) {
   {
     Scratch scratch;
     const bf* w = toBf(l.w.w, (size_t)l.K * l.N);
+    if (sizeof(Y) == 2 && (l.hasBias || relu)) {   // (a float output's float bias: cuBLASLt plans it, then refuses it)
+      ltLinear(x, w, l.trans, l.hasBias ? toBf(l.b.w, l.N) : bfZeros(l.N), relu, y, (int)rows, l.K, l.N, beta);
+      return;
+    }
     if (l.trans) mmBTBf(x, w, y, (int)rows, l.N, l.K, beta);
     else mmBf(x, w, y, (int)rows, l.K, l.N, beta);
   }
   if (l.hasBias) biasAddK<<<blocks(rows * l.N), 256, 0, STREAM>>>(y, l.b.w, rows, l.N);
+  if (relu) { fprintf(stderr, "linearFwdBf: relu on a float output\n"); exit(1); }
 }
 template <class DX>
 inline void linearBwdBf(Linear& l, const bf* x, const bf* dy, DX* dx, size_t rows, bool accumulate = false) {
   if (l.trans) mmATBf(dy, x, l.w.g, (int)rows, l.N, l.K);
   else mmATBf(x, dy, l.w.g, (int)rows, l.K, l.N);
-  if (l.hasBias) colSumBf(l.b.g, dy, rows, l.N);
+  if (l.hasBias) colSumBf(l.b.g, dy, rows, l.N, l.N);
   if (!dx) return;
   Scratch scratch;
   const bf* w = toBf(l.w.w, (size_t)l.K * l.N);

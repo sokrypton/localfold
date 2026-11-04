@@ -585,6 +585,30 @@ __device__ __forceinline__ void aFragH(uint32_t* f, const uint16_t* x, int r, in
 #pragma unroll
   for (int i = 0; i < 4; ++i) f[i] = word(x, (r + (i & 1) * 8) * DP + c + (i >> 1) * 8);
 }
+// where a [B, N, H, D] operand's rows are: a head-major padded copy (headsBf), or the projection's own row-major
+// bf16 output read in place (16-byte rows: ld a multiple of 8) - element (b, h, n, c) at p + b sB + h sH + n sN + c,
+// zero where n >= N or c >= W
+struct HSrc { const uint16_t* p = nullptr; long long sB = 0, sH = 0, sN = 0; int N = 0, W = 0; };
+__device__ __forceinline__ const uint16_t* hrow(const HSrc& s, int b, int h, int n) {
+  return s.p + b * s.sB + h * s.sH + (long long)n * s.sN;
+}
+// a 64-row tile of it into shared memory [64][ld] (cp.async, zero-filled past the ends)
+template <int DP>
+__device__ __forceinline__ void loadH(uint16_t* dst, int ld, const HSrc& s, int b, int h, int n0) {
+  for (int i = threadIdx.x; i < 64 * DP / 8; i += THREADS) {
+    const int r = i / (DP / 8), c = (i % (DP / 8)) * 8;
+    const bool on = n0 + r < s.N && c < s.W;
+    cp16(dst + r * ld + c, on ? hrow(s, b, h, n0 + r) + c : s.p, on);
+  }
+}
+// rows r, r + 8 and columns c .. c + 15 of it as an A fragment
+__device__ __forceinline__ void aFragS(uint32_t* f, const HSrc& s, int b, int h, int r, int c) {
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const int rr = r + (i & 1) * 8, cc = c + (i >> 1) * 8;
+    f[i] = rr < s.N && cc < s.W ? *reinterpret_cast<const uint32_t*>(hrow(s, b, h, rr) + cc) : 0u;
+  }
+}
 template <int D> __host__ __device__ constexpr int padD() { return (D + 15) / 16 * 16; }
 template <int D> __host__ __device__ constexpr int ldBf() { return padD<D>() + 8; }   // a tile's row stride (bf16)
 // x [B, N, ld] at head h's D columns -> out [B, H, Np, DP] bf16, zero past N and D (two columns a thread)
@@ -658,9 +682,8 @@ __device__ __forceinline__ float keyAdd(const Sdpa& a, int b, int h, int k) {
 constexpr int LB = BC + 8;   // a bf16 [q][k] tile's row stride
 
 template <int D>
-__global__ void __launch_bounds__(THREADS) fwdBf(Sdpa a, BiasTile bt, const uint16_t* __restrict__ qh,
-                                                 const uint16_t* __restrict__ kh, const uint16_t* __restrict__ vh,
-                                                 int Npq, int Npk, float* __restrict__ o, int ldo,
+__global__ void __launch_bounds__(THREADS) fwdBf(Sdpa a, BiasTile bt, HSrc qs_, HSrc ks_, HSrc vs_,
+                                                 float* __restrict__ o, int ldo,
                                                  float* __restrict__ lse) {
   constexpr int DP = padD<D>(), LK = ldBf<D>();
   extern __shared__ __align__(16) float sm[];
@@ -674,17 +697,10 @@ __global__ void __launch_bounds__(THREADS) fwdBf(Sdpa a, BiasTile bt, const uint
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
   const int q0 = qb * BR, qr0 = q0 + warp * 16;
   const size_t bh = (size_t)b * a.H + h;
-  const uint16_t* kp = kh + bh * Npk * DP;
-  const uint16_t* vp = vh + bh * Npk * DP;
   const uint16_t* tp = bt.p ? bt.p + b * bt.sb + h * bt.sh + (size_t)q0 * bt.ld : nullptr;
   auto issue = [&](int st, int k0) {
-    uint16_t* Ks = Kb + st * BC * LK;
-    uint16_t* Vs = Vb + st * BC * LK;
-    for (int i = threadIdx.x; i < BC * DP / 8; i += THREADS) {
-      const int r = i / (DP / 8), c = (i % (DP / 8)) * 8;
-      cp16(Ks + r * LK + c, kp + (size_t)(k0 + r) * DP + c, true);
-      cp16(Vs + r * LK + c, vp + (size_t)(k0 + r) * DP + c, true);
-    }
+    loadH<DP>(Kb + st * BC * LK, LK, ks_, b, h, k0);
+    loadH<DP>(Vb + st * BC * LK, LK, vs_, b, h, k0);
     if (tp) {
       uint16_t* T = Tb + st * BR * LB;
       for (int i = threadIdx.x; i < BR * BC / 8; i += THREADS) {
@@ -701,7 +717,7 @@ __global__ void __launch_bounds__(THREADS) fwdBf(Sdpa a, BiasTile bt, const uint
   }
   uint32_t qa[DP / 16][4];
 #pragma unroll
-  for (int s = 0; s < DP / 16; ++s) aFragH<DP>(qa[s], qh + bh * Npq * DP, qr0 + g, s * 16 + 2 * t);
+  for (int s = 0; s < DP / 16; ++s) aFragS(qa[s], qs_, b, h, qr0 + g, s * 16 + 2 * t);
   int qs[2] = {0, 0};
   if (a.seqQ)
     for (int r = 0; r < 2; ++r) qs[r] = qr0 + g + r * 8 < a.Q ? a.seqQ[qr0 + g + r * 8] : 0;
@@ -825,13 +841,15 @@ inline size_t fwdBfSmem() { return 2 * (4 * BC * ldBf<D>() + 2 * BR * LB) + 4 * 
 // (A = P^T, dS^T from the accumulators; B = dO, Q by ldmatrix.trans), dQ = dS K (A = dS, B = K by ldmatrix.trans).
 // dS takes the bias tile's place in shared memory, element by element (the thread that reads a bias writes its dS),
 // as bf16 - what a bf16 run's logits gradient is - for dQ and the bias gradients.
-template <int D>
-__global__ void __launch_bounds__(THREADS, 3) bwdBf(Sdpa a, BiasTile bt, const uint16_t* __restrict__ qh,
-                                                    const uint16_t* __restrict__ kh, const uint16_t* __restrict__ vh,
-                                                    const uint16_t* __restrict__ doh, int Npq, int Npk,
+__device__ __forceinline__ float ldOut(const float* p) { return *p; }
+__device__ __forceinline__ float ldOut(const __nv_bfloat16* p) { return __bfloat162float(*p); }
+__device__ __forceinline__ void stOut(float* p, float v) { *p = v; }
+__device__ __forceinline__ void stOut(__nv_bfloat16* p, float v) { *p = __float2bfloat16(v); }
+template <int D, class DKV = float>   // (DKV: dK and dV written in bf16 for a module that consumes them so)
+__global__ void __launch_bounds__(THREADS, 3) bwdBf(Sdpa a, BiasTile bt, HSrc qs_, HSrc ks_, HSrc vs_, HSrc os_,
                                                     const float* __restrict__ lse, const float* __restrict__ Di,
-                                                    float* __restrict__ dq, int lddq, float* __restrict__ dk, int lddk,
-                                                    float* __restrict__ dv, int lddv, bool accK, bool accV) {
+                                                    float* __restrict__ dq, int lddq, DKV* __restrict__ dk, int lddk,
+                                                    DKV* __restrict__ dv, int lddv, bool accK, bool accV) {
   constexpr int DP = padD<D>(), LK = ldBf<D>();
   extern __shared__ __align__(16) float sm[];
   uint16_t* Kb = reinterpret_cast<uint16_t*>(sm);                 // [BC][LK]
@@ -844,25 +862,14 @@ __global__ void __launch_bounds__(THREADS, 3) bwdBf(Sdpa a, BiasTile bt, const u
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
   const int k0 = kb * BC, kl0 = warp * 16;
   const size_t bh = (size_t)b * a.H + h;
-  const uint16_t* qp = qh + bh * Npq * DP;
-  const uint16_t* op = doh + bh * Npq * DP;
-  const uint16_t* kp = kh + bh * Npk * DP;
   const uint16_t* tp = bt.p ? bt.p + b * bt.sb + h * bt.sh + k0 : nullptr;
   const float* lseb = lse + bh * a.Q;
   const float* lgb = lseb + (size_t)a.B * a.H * a.Q;
   const float* Dib = Di + bh * a.Q;
-  for (int i = threadIdx.x; i < BC * DP / 8; i += THREADS) {
-    const int r = i / (DP / 8), c = (i % (DP / 8)) * 8;
-    cp16(Kb + r * LK + c, kp + (size_t)(k0 + r) * DP + c, true);
-  }
+  loadH<DP>(Kb, LK, ks_, b, h, k0);
   auto issue = [&](int st, int q0) {
-    uint16_t* Qs = Qb + st * BR * LK;
-    uint16_t* Os = Ob + st * BR * LK;
-    for (int i = threadIdx.x; i < BR * DP / 8; i += THREADS) {
-      const int r = i / (DP / 8), c = (i % (DP / 8)) * 8;
-      cp16(Qs + r * LK + c, qp + (size_t)(q0 + r) * DP + c, true);
-      cp16(Os + r * LK + c, op + (size_t)(q0 + r) * DP + c, true);
-    }
+    loadH<DP>(Qb + st * BR * LK, LK, qs_, b, h, q0);
+    loadH<DP>(Ob + st * BR * LK, LK, os_, b, h, q0);
     if (tp) {
       uint16_t* T = Tb + st * BR * LB;
       for (int i = threadIdx.x; i < BR * BC / 8; i += THREADS) {
@@ -893,8 +900,8 @@ __global__ void __launch_bounds__(THREADS, 3) bwdBf(Sdpa a, BiasTile bt, const u
   uint32_t ka[DP / 16][4], va[DP / 16][4];
 #pragma unroll
   for (int s = 0; s < DP / 16; ++s) {
-    aFragH<DP>(ka[s], kp, k0 + kl0 + g, s * 16 + 2 * t);
-    aFragH<DP>(va[s], vh + bh * Npk * DP, k0 + kl0 + g, s * 16 + 2 * t);
+    aFragS(ka[s], ks_, b, h, k0 + kl0 + g, s * 16 + 2 * t);
+    aFragS(va[s], vs_, b, h, k0 + kl0 + g, s * 16 + 2 * t);
   }
   float dka[D / 8][4], dva[D / 8][4];
 #pragma unroll
@@ -1003,8 +1010,8 @@ __global__ void __launch_bounds__(THREADS, 3) bwdBf(Sdpa a, BiasTile bt, const u
     }
     __syncthreads();   // this stage is the one the next iteration's issue overwrites
   }
-  float* dkb = dk + (size_t)b * a.K * lddk + h * D;
-  float* dvb = dv + (size_t)b * a.K * lddv + h * D;
+  DKV* dkb = dk + (size_t)b * a.K * lddk + h * D;
+  DKV* dvb = dv + (size_t)b * a.K * lddv + h * D;
 #pragma unroll
   for (int r = 0; r < 2; ++r) {
     const int kk = k0 + kl0 + g + r * 8;
@@ -1013,53 +1020,61 @@ __global__ void __launch_bounds__(THREADS, 3) bwdBf(Sdpa a, BiasTile bt, const u
     for (int n = 0; n < D / 8; ++n)
 #pragma unroll
       for (int c = 0; c < 2; ++c) {
-        float* pk = dkb + (long long)kk * lddk + n * 8 + 2 * t + c;
-        float* pv = dvb + (long long)kk * lddv + n * 8 + 2 * t + c;
+        DKV* pk = dkb + (long long)kk * lddk + n * 8 + 2 * t + c;
+        DKV* pv = dvb + (long long)kk * lddv + n * 8 + 2 * t + c;
         const float xk = dka[n][r * 2 + c] * a.scale, xv = dva[n][r * 2 + c];
-        *pk = accK ? *pk + xk : xk;
-        *pv = accV ? *pv + xv : xv;
+        stOut(pk, accK ? ldOut(pk) + xk : xk);
+        stOut(pv, accV ? ldOut(pv) + xv : xv);
       }
   }
 }
 template <int D>
 inline size_t bwdBfSmem() { return 2 * (5 * BR * ldBf<D>() + 2 * BR * LB) + 4 * (2 * 4 * BR); }
+// an operand's source: bf16 rows read in place where they are 16-byte aligned, else a head-major bf16 copy
+template <int D, class X>
+inline HSrc hsrc(const X* x, int ld, int B, int N, int H) {
+  HSrc s;
+  if (sizeof(X) == 2 && ld % 8 == 0 && ((uintptr_t)x & 15) == 0) {
+    s.p = reinterpret_cast<const uint16_t*>(x); s.sB = (long long)N * ld; s.sH = D; s.sN = ld; s.N = N; s.W = D;
+    return s;
+  }
+  constexpr int DP = padD<D>();
+  const int Np = (N + 63) / 64 * 64;
+  s.p = headsBf(x, ld, B, N, H, D, Np, DP); s.sB = (long long)H * Np * DP; s.sH = (long long)Np * DP; s.sN = DP;
+  s.N = Np; s.W = DP;
+  return s;
+}
 template <int D, class X>
 inline void forwardBf(const Sdpa& a, const X* q, int ldq, const X* k, int ldk, const X* v, int ldv,
                       float* o, int ldo, float* lse) {
   Scratch scratch;
-  constexpr int DP = padD<D>();
   const int Npq = (a.Q + 63) / 64 * 64, Npk = (a.K + 63) / 64 * 64;
-  const uint16_t* qh = headsBf(q, ldq, a.B, a.Q, a.H, D, Npq, DP);
-  const uint16_t* kh = headsBf(k, ldk, a.B, a.K, a.H, D, Npk, DP);
-  const uint16_t* vh = headsBf(v, ldv, a.B, a.K, a.H, D, Npk, DP);
+  const HSrc qs_ = hsrc<D>(q, ldq, a.B, a.Q, a.H), ks_ = hsrc<D>(k, ldk, a.B, a.K, a.H), vs_ = hsrc<D>(v, ldv, a.B, a.K, a.H);
   static bool attr = false;
   const size_t smem = fwdBfSmem<D>();
   if (!attr) { GK(cudaFuncSetAttribute(fwdBf<D>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem)); attr = true; }
   const BiasTile bt = biasBf(a, Npq, Npk);
   const size_t grid = (size_t)((a.Q + BR - 1) / BR) * a.H * a.B;
-  fwdBf<D><<<(unsigned)grid, THREADS, smem, STREAM>>>(a, bt, qh, kh, vh, Npq, Npk, o, ldo, lse);
+  fwdBf<D><<<(unsigned)grid, THREADS, smem, STREAM>>>(a, bt, qs_, ks_, vs_, o, ldo, lse);
 }
-template <int D, class X>
+template <int D, class X, class DKV = float>
 inline void backwardBf(const Sdpa& a, const X* q, int ldq, const X* k, int ldk, const X* v, int ldv,
-                       const float* dO, int lddo, const float* lse, const float* Di, float* dq, int lddq, float* dk,
-                       int lddk, float* dv, int lddv, bool accK, bool accV) {
+                       const float* dO, int lddo, const float* lse, const float* Di, float* dq, int lddq, DKV* dk,
+                       int lddk, DKV* dv, int lddv, bool accK, bool accV) {
   Scratch scratch;
-  constexpr int DP = padD<D>();
   const int Npq = (a.Q + 63) / 64 * 64, Npk = (a.K + 63) / 64 * 64;
-  const uint16_t* qh = headsBf(q, ldq, a.B, a.Q, a.H, D, Npq, DP);
-  const uint16_t* oh = headsBf(dO, lddo, a.B, a.Q, a.H, D, Npq, DP);
-  const uint16_t* kh = headsBf(k, ldk, a.B, a.K, a.H, D, Npk, DP);
-  const uint16_t* vh = headsBf(v, ldv, a.B, a.K, a.H, D, Npk, DP);
+  const HSrc qs_ = hsrc<D>(q, ldq, a.B, a.Q, a.H), ks_ = hsrc<D>(k, ldk, a.B, a.K, a.H), vs_ = hsrc<D>(v, ldv, a.B, a.K, a.H),
+             os_ = hsrc<D>(dO, lddo, a.B, a.Q, a.H);
   static bool attr = false;
   const size_t smem = bwdBfSmem<D>();
   if (!attr) {
-    GK(cudaFuncSetAttribute(bwdBf<D>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
-    GK(cudaFuncSetAttribute(bwdBf<D>, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+    GK(cudaFuncSetAttribute(bwdBf<D, DKV>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
+    GK(cudaFuncSetAttribute(bwdBf<D, DKV>, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
     attr = true;
   }
   const BiasTile bt = biasBf(a, Npq, Npk);
   const size_t grid = (size_t)((a.K + BC - 1) / BC) * a.H * a.B;
-  bwdBf<D><<<(unsigned)grid, THREADS, smem, STREAM>>>(a, bt, qh, kh, vh, oh, Npq, Npk, lse, Di, dq, lddq, dk,
+  bwdBf<D, DKV><<<(unsigned)grid, THREADS, smem, STREAM>>>(a, bt, qs_, ks_, vs_, os_, lse, Di, dq, lddq, dk,
                                                        lddk, dv, lddv, accK, accV);
 }
 
@@ -1125,9 +1140,10 @@ inline bool runForwardBfIn(const Sdpa& a, const __nv_bfloat16* q, int ldq, const
                            const __nv_bfloat16* v, int ldv, float* o, int ldo, float* lse) {
   FLASH_DISPATCH(a.D, (forwardBf<DD>(a, q, ldq, k, ldk, v, ldv, o, ldo, lse)))
 }
+template <class DKV>
 inline bool runBackwardBfIn(const Sdpa& a, const __nv_bfloat16* q, int ldq, const __nv_bfloat16* k, int ldk,
                             const __nv_bfloat16* v, int ldv, const float* dO, int lddo, const float* lse,
-                            const float* Di, float* dq, int lddq, float* dk, int lddk, float* dv, int lddv, bool accK,
+                            const float* Di, float* dq, int lddq, DKV* dk, int lddk, DKV* dv, int lddv, bool accK,
                             bool accV) {
   FLASH_DISPATCH(a.D, (backwardBf<DD>(a, q, ldq, k, ldk, v, ldv, dO, lddo, lse, Di, dq, lddq, dk, lddk, dv, lddv, accK, accV)))
 }

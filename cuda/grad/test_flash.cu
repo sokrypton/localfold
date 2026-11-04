@@ -31,7 +31,9 @@ int main() {
   for (int mode : {0, 1, 2}) {           // float32 (3xTF32), TF32, bf16
     const bool tf = mode > 0;
     setTf32(mode == 1); setBf16(mode == 2);
+    int ci = -1;
     for (auto c : cases) {
+      ++ci;
       int HD = c.H * c.D, ld = HD + 8;    // a leading dimension past the heads, as a packed qkv's
       size_t nq = (size_t)c.B * c.Q * ld, nk = (size_t)c.B * c.K * ld;
       float *q = randn(nq, c.sd), *k = randn(nk, c.sd), *v = randn(nk), *dO = randn(nq);
@@ -53,10 +55,16 @@ int main() {
         a.bias[1] = c.bias2 ? Bias{b1, (long long)c.K, 0, 0, gb[f][1]} : Bias{};
         o[f] = zeros(nq); dq[f] = randn(nq); dk[f] = zeros(nk); dv[f] = zeros(nk);
         float* lse = zeros((size_t)2 * c.B * c.H * c.Q);
-        sdpaForward(a, q, ld, k, ld, v, ld, o[f], ld, lse);
-        GK(cudaMemcpy(dk[f], dq[f], 0, cudaMemcpyDeviceToDevice));
-        sdpaBackward(a, q, ld, k, ld, v, ld, dO, ld, dq[f], ld, dk[f], ld, dv[f], ld, false, false, false,
-                     f ? o[f] : nullptr, ld, f ? lse : nullptr);
+        if (mode == 2 && f == 1 && ci % 2) {
+          // every other case with q, k, v already bf16 (a module on bf16 storage): read in place at ld, zero past D
+          const bf *qb = toBf(q, nq), *kb = toBf(k, nk), *vb = toBf(v, nk);
+          sdpaForwardBf(a, qb, ld, kb, ld, vb, ld, o[f], ld, lse);
+          sdpaBackwardBf(a, qb, ld, kb, ld, vb, ld, dO, ld, dq[f], ld, dk[f], ld, dv[f], ld, o[f], ld, lse);
+        } else {
+          sdpaForward(a, q, ld, k, ld, v, ld, o[f], ld, lse);
+          sdpaBackward(a, q, ld, k, ld, v, ld, dO, ld, dq[f], ld, dk[f], ld, dv[f], ld, false, false, false,
+                       f ? o[f] : nullptr, ld, f ? lse : nullptr);
+        }
         GK(cudaStreamSynchronize(STREAM)); GK(cudaGetLastError());
       }
       // compare only the head columns (the pad columns are never written by either)
@@ -72,7 +80,7 @@ int main() {
         double bar = mode == 2 ? (c.sd > 1 ? 0.15 : 6e-3) : tf ? 5e-3 : c.sd > 1 ? 3e-5 : 2e-6;   // (logits ~ +-36: float32's own conditioning)
         printf("  %-4s %.2e%s", n, rr, rr > bar ? " <-- ABOVE" : ""); fails += rr > bar;
       };
-      printf("%s B %d H %d Q %d K %d D %d%s%s%s%s:", mode == 2 ? "bf16" : tf ? "tf32" : "fp32", c.B, c.H, c.Q, c.K, c.D, c.mask ? " mask" : "", c.bias ? " bias" : "", c.bias2 ? " bias2" : "", c.clip ? " clip" : "");
+      printf("%s B %d H %d Q %d K %d D %d%s%s%s%s:", mode == 2 ? (ci % 2 ? "bf16 in" : "bf16") : tf ? "tf32" : "fp32", c.B, c.H, c.Q, c.K, c.D, c.mask ? " mask" : "", c.bias ? " bias" : "", c.bias2 ? " bias2" : "", c.clip ? " clip" : "");
       cmp("o", o[1], o[0], (size_t)c.B * c.Q); cmp("dq", dq[1], dq[0], (size_t)c.B * c.Q); cmp("dk", dk[1], dk[0], (size_t)c.B * c.K); cmp("dv", dv[1], dv[0], (size_t)c.B * c.K);
       const double bb = mode == 2 ? (c.sd > 1 ? 0.15 : 6e-3) : tf ? 5e-3 : c.sd > 1 ? 3e-5 : 2e-6;
       if (c.bias) { double r = (mode == 2 ? relRmsHost : rel)(gb[1][0], gb[0][0], nb); printf("  db %.2e%s", r, r > bb ? " <-- ABOVE" : ""); fails += r > bb; }

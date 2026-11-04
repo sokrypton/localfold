@@ -39,22 +39,23 @@ static void report(const char* what, double r, double bar) {
 // its parameters', 4.3e-3 / 4.9e-3 and 7.4e-3 on AF3's - that much is bf16, not a defect.
 struct Run { std::vector<std::vector<float>> out, grads; };
 static void compare(const char* name, Run& f, Run& b, const std::vector<Param*>& ps, const char* const* outNames,
-                    double outBar, double inBar) {
+                    double outBar, double inBar, double tensorBar) {
   printf("%s\n", name);
   for (size_t i = 0; i < f.out.size(); ++i) report(outNames[i], rms(b.out[i], f.out[i]), i < 2 ? outBar : inBar);
   Acc all; size_t count = 0;
   std::vector<Acc> per(ps.size());
   for (size_t i = 0; i < ps.size(); ++i) { rms(b.grads[i], f.grads[i], &per[i]); all.e += per[i].e; all.y += per[i].y; count += ps[i]->n; }
   report("every parameter gradient", sqrt(all.e / all.y), 1e-2);
-  // a tensor's own: floored at 1% of the average gradient element, since some are exactly zero in exact arithmetic
-  // (a LayerNorm offset feeding a softmax's logits only through a per-row constant) and rounding is all they hold
+  // a tensor's own: floored at 10% of the average gradient element, since some are exactly zero in exact arithmetic
+  // (a LayerNorm offset feeding a softmax's logits only through a per-row constant) and rounding is all they hold.
+  // AF2's transitions read ~5% here: bf16's rounding moves ReLU inputs across the kink (autocast's do the same)
   double worst = 0; std::string wn;
   for (size_t i = 0; i < ps.size(); ++i) {
-    double r = sqrt(per[i].e / std::max(per[i].y, 1e-4 * ps[i]->n * all.y / count));
+    double r = sqrt(per[i].e / std::max(per[i].y, 1e-2 * ps[i]->n * all.y / count));
     if (r > worst) { worst = r; wn = ps[i]->name; }
   }
   char what[160]; snprintf(what, sizeof what, "worst tensor (%s)", wn.c_str());
-  report(what, worst, 1e-1);
+  report(what, worst, tensorBar);
 }
 
 int main(int argc, char** argv) {
@@ -86,7 +87,7 @@ int main(int argc, char** argv) {
     }
     const char* names[] = {"msa out", "pair out", "d msa", "d pair"};
     compare(extra ? "AF2 extra block (L 72, S 40, Cm 64)" : "AF2 block (L 72, S 40, Cm 256)", r[0], r[1], b.params.all, names,
-            1e-2, 3.5e-2);
+            1e-2, 3.5e-2, 8e-2);
   }
   {
     curandSetPseudoRandomGeneratorSeed(gen, 4);
@@ -112,7 +113,7 @@ int main(int argc, char** argv) {
       for (auto* p : ps.all) r[arm].grads.push_back(hostv(p->g, p->n));
     }
     const char* names[] = {"pair out", "single out", "d pair", "d single"};
-    compare("AF3 pairformer block (n 80)", r[0], r[1], ps.all, names, 1e-2, 1e-2);
+    compare("AF3 pairformer block (n 80)", r[0], r[1], ps.all, names, 1e-2, 1e-2, 3e-2);
   }
   printf(fails ? "FAIL\n" : "PASS\n");
   return fails ? 1 : 0;
