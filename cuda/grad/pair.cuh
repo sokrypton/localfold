@@ -166,8 +166,12 @@ __global__ void triPrepBfK(bf* __restrict__ pre, const real* __restrict__ mask, 
 // mergeGateBwdTBf reading proj, gate and writing their gradients at row stride P: a 32-row x 64-column tile, the
 // channel-major read coalesced along rows, the row-major side a column pair (bf162) a thread
 __global__ void mergeGateBwdLdBfK(const bf* __restrict__ dab, const bf* __restrict__ pre, const real* __restrict__ mask,
-                                  bf* __restrict__ dpre, size_t rows, int I2, int P, bool inter) {
+                                  bf* __restrict__ dpre, size_t rows, int I2, int P, bool inter,
+                                  float* __restrict__ gProj, float* __restrict__ gGate) {
+  // (gProj, gGate: the two biases' gradients, summed here over the tile's rows - a separate column-sum pass each
+  // re-read what this writes)
   __shared__ float tile[32][65];
+  __shared__ float4 part[8][32];
   const size_t r0 = (size_t)blockIdx.x * 32;
   const int c0 = blockIdx.y * 64, tx = threadIdx.x, ty = threadIdx.y;
   for (int k = ty; k < 64; k += 8) {
@@ -176,28 +180,52 @@ __global__ void mergeGateBwdLdBfK(const bf* __restrict__ dab, const bf* __restri
   }
   __syncthreads();
   const int c = c0 + 2 * tx;
-  if (c >= I2) return;
-  for (int k = ty; k < 32; k += 8) {
-    const size_t r = r0 + k;
-    if (r >= rows) continue;
-    const size_t i = r * P + c;
-    const float2 pj = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(pre + i));
-    const float2 sg = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(pre + i + I2));
-    const float d0 = tile[k][2 * tx], d1 = tile[k][2 * tx + 1], m = mask ? mask[r] : 1.f;
-    *reinterpret_cast<__nv_bfloat162*>(dpre + i) = __floats2bfloat162_rn(d0 * sg.x * m, d1 * sg.y * m);
-    *reinterpret_cast<__nv_bfloat162*>(dpre + i + I2) =
-        __floats2bfloat162_rn(d0 * pj.x * sg.x * (1.f - sg.x), d1 * pj.y * sg.y * (1.f - sg.y));
-  }
+  float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
+  if (c < I2)
+    for (int k = ty; k < 32; k += 8) {
+      const size_t r = r0 + k;
+      if (r >= rows) continue;
+      const size_t i = r * P + c;
+      const float2 pj = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(pre + i));
+      const float2 sg = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(pre + i + I2));
+      const float d0 = tile[k][2 * tx], d1 = tile[k][2 * tx + 1], m = mask ? mask[r] : 1.f;
+      const __nv_bfloat162 a = __floats2bfloat162_rn(d0 * sg.x * m, d1 * sg.y * m);
+      const __nv_bfloat162 g = __floats2bfloat162_rn(d0 * pj.x * sg.x * (1.f - sg.x), d1 * pj.y * sg.y * (1.f - sg.y));
+      *reinterpret_cast<__nv_bfloat162*>(dpre + i) = a;
+      *reinterpret_cast<__nv_bfloat162*>(dpre + i + I2) = g;
+      const float2 af = __bfloat1622float2(a), gf = __bfloat1622float2(g);   // (the sums of what was written)
+      acc.x += af.x; acc.y += af.y; acc.z += gf.x; acc.w += gf.y;
+    }
+  if (!gProj && !gGate) return;
+  part[ty][tx] = acc;
+  __syncthreads();
+  if (ty || c >= I2) return;
+  for (int y = 1; y < 8; ++y) { const float4 v = part[y][tx]; acc.x += v.x; acc.y += v.y; acc.z += v.z; acc.w += v.w; }
+  if (gProj) { atomicAdd(gProj + c, acc.x); atomicAdd(gProj + c + 1, acc.y); }
+  if (gGate) { atomicAdd(gGate + c, acc.z); atomicAdd(gGate + c + 1, acc.w); }
 }
 // out = pre_out * og, og at row stride P: dpre_out = dy og (contiguous), d og_pre = dy pre_out og (1 - og) at P
+// (gGating: the output gate's bias gradient, summed here: a block 32 columns x 8 row lanes, rows strided)
 __global__ void outGateBwdLdBfK(const real* dy, const real* a, const bf* og, bf* da, bf* dgl, size_t rows, int C,
-                                int P) {
-  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= rows * C) return;
-  const size_t i = (t / C) * P + t % C;
-  const float s = bfv(og[i]);
-  da[t] = __float2bfloat16(dy[t] * s);
-  dgl[i] = __float2bfloat16(dy[t] * a[t] * s * (1.f - s));
+                                int P, float* gGating) {
+  __shared__ float part[8][32];
+  const int c = blockIdx.x * 32 + threadIdx.x;
+  float acc = 0.f;
+  if (c < C)
+    for (size_t r = blockIdx.y * 8 + threadIdx.y; r < rows; r += (size_t)gridDim.y * 8) {
+      const size_t t = r * C + c, i = r * P + c;
+      const float s = bfv(og[i]);
+      da[t] = __float2bfloat16(dy[t] * s);
+      const bf g = __float2bfloat16(dy[t] * a[t] * s * (1.f - s));
+      dgl[i] = g;
+      acc += __bfloat162float(g);
+    }
+  if (!gGating) return;
+  part[threadIdx.y][threadIdx.x] = acc;
+  __syncthreads();
+  if (threadIdx.y || c >= C) return;
+  for (int y = 1; y < 8; ++y) acc += part[y][threadIdx.x];
+  atomicAdd(gGating + c, acc);
 }
 __global__ void mulLdBfK(real* y, const bf* g, size_t rows, int C, int P) {   // y[r, c] *= g[r * P + c]
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -252,7 +280,12 @@ inline void triMulBackwardBf(TriMul& m, const TriMulSave& s, const real* mask, c
   real* po = ARENA.get(rows * m.C);
   linearFwdBf(m.out, cn, po, rows);
   bf* dpo = bfGet(rows * m.C);
-  outGateBwdLdBfK<<<blocks(rows * m.C), 256, 0, STREAM>>>(dout, po, pre + 2 * I2, dpo, dpre + 2 * I2, rows, m.C, P);
+  {
+    const unsigned xb = (m.C + 31) / 32;
+    dim3 b8(32, 8), gr(xb, (unsigned)std::min<size_t>((rows + 7) / 8, std::max(1u, 1728 / xb)));
+    outGateBwdLdBfK<<<gr, b8, 0, STREAM>>>(dout, po, pre + 2 * I2, dpo, dpre + 2 * I2, rows, m.C, P,
+                                           m.gating.hasBias ? m.gating.b.g : nullptr);
+  }
   bf* dcn = bfGet(rows * m.I);   // (only the centre norm's backward reads it)
   linearBwdBf(m.out, cn, dpo, dcn, rows);
   real* dcenter = ARENA.get(rows * m.I);
@@ -274,11 +307,9 @@ inline void triMulBackwardBf(TriMul& m, const TriMulSave& s, const real* mask, c
     bmmBf(false, true, L, L, L, A, st, dccm, st, dB, st, m.I, alpha);
   }
   dim3 g2((unsigned)((rows + 31) / 32), (I2 + 63) / 64);
-  mergeGateBwdLdBfK<<<g2, b, 0, STREAM>>>(dab, pre, m.masked ? mask : nullptr, dpre, rows, I2, P, m.interleaved);
-  const Linear* roles[3] = {&m.proj, &m.gate, &m.gating};
-  const int off[3] = {0, I2, 2 * I2};
-  for (int r = 0; r < 3; ++r)
-    if (roles[r]->hasBias) colSumBf(roles[r]->b.g, dpre + off[r], rows, roles[r]->N, P);
+  mergeGateBwdLdBfK<<<g2, b, 0, STREAM>>>(dab, pre, m.masked ? mask : nullptr, dpre, rows, I2, P, m.interleaved,
+                                          m.proj.hasBias ? m.proj.b.g : nullptr, m.gate.hasBias ? m.gate.b.g : nullptr);
+  const Linear* roles[3] = {&m.proj, &m.gate, &m.gating};   // (their bias gradients summed in the two kernels above)
   {
     Scratch sc;
     real* dW = ARENA.get((size_t)m.C * P);

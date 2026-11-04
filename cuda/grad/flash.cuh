@@ -959,19 +959,30 @@ __global__ void __launch_bounds__(THREADS, 3) bwdBf(Sdpa a, BiasTile bt, HSrc qs
 #pragma unroll
       for (int jj = 0; jj < 4; ++jj)
 #pragma unroll
-        for (int e = 0; e < 4; ++e) {
-          const int kl = kl0 + g + (e >> 1) * 8, ql = (hq * 4 + jj) * 8 + 2 * t + (e & 1);
-          float add = kaR[e >> 1];
-          if (add != -INFINITY) {
-            if (a.seqQ && ksR[e >> 1] != __float_as_int(qv[3 * QT + ql])) add = -INFINITY;
-            else if (tp) add += bfToF(T[ql * LB + kl]);
+        for (int par = 0; par < 2; ++par) {
+          // a query's row max, log sum, row term and chain id read once for the thread's two keys (the dS stores
+          // into T between would otherwise make the compiler read them again: both are shared memory)
+          const int ql = (hq * 4 + jj) * 8 + 2 * t + par;
+          const float Lq = qv[ql], Lgq = LOG2E * qv[QT + ql], Dq = qv[2 * QT + ql];
+          const int sq = a.seqQ ? __float_as_int(qv[3 * QT + ql]) : 0;
+          const bool qin = q0 + ql < a.Q;
+          float bias[2] = {0.f, 0.f};
+          if (tp) { bias[0] = bfToF(T[ql * LB + kl0 + g]); bias[1] = bfToF(T[ql * LB + kl0 + g + 8]); }
+#pragma unroll
+          for (int hk = 0; hk < 2; ++hk) {
+            const int e = hk * 2 + par, kl = kl0 + g + hk * 8;
+            float add = kaR[hk];
+            if (add != -INFINITY) {
+              if (a.seqQ && ksR[hk] != sq) add = -INFINITY;
+              else add += bias[hk];
+            }
+            const float x = logit(sa[jj][e], add, a);
+            const float p = x == -INFINITY || !qin ? 0.f : ex2(fmaf(x - Lq, LOG2E, -Lgq));
+            const float ds = p * (dpt[jj][e] - Dq);
+            T[ql * LB + kl] = (uint16_t)(bf2(ds, 0.f) & 0xffff);
+            sa[jj][e] = p;
+            dpt[jj][e] = ds;
           }
-          const float x = logit(sa[jj][e], add, a);
-          const float p = x == -INFINITY || q0 + ql >= a.Q ? 0.f : ex2(fmaf(x - qv[ql], LOG2E, -LOG2E * qv[QT + ql]));
-          const float ds = p * (dpt[jj][e] - qv[2 * QT + ql]);
-          T[ql * LB + kl] = (uint16_t)(bf2(ds, 0.f) & 0xffff);
-          sa[jj][e] = p;
-          dpt[jj][e] = ds;
         }
 #pragma unroll
       for (int u = 0; u < 2; ++u) {
@@ -990,16 +1001,22 @@ __global__ void __launch_bounds__(THREADS, 3) bwdBf(Sdpa a, BiasTile bt, HSrc qs
     }
     __syncthreads();
     if (g0 || g1)
-      for (int i = threadIdx.x; i < QT * BC; i += THREADS) {
-        const int ql = i / BC, kl = i % BC;
-        const float ds = bfToF(T[ql * LB + kl]);
-        if (ds != 0.f) {
+      for (int i = threadIdx.x; i < QT * BC / 2; i += THREADS) {   // (a key pair a thread: one 32-bit read)
+        const int ql = i / (BC / 2), kl = 2 * (i % (BC / 2));
+        if (q0 + ql >= a.Q) continue;
+        const float2 d2 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(T + ql * LB + kl));
+#pragma unroll
+        for (int c = 0; c < 2; ++c) {
+          const float ds = c ? d2.y : d2.x;
+          if (ds == 0.f) continue;
           const long long qq = q0 + ql;
-          const unsigned long long fx = (unsigned long long)__double2ll_rn((double)ds * FIXED);
-          if (f0) atomicAdd(f0 + qq * a.bias[0].sq + kl, fx);
-          else if (g0) atomicAdd(g0 + qq * a.bias[0].sq + kl, ds);
-          if (f1) atomicAdd(f1 + qq * a.bias[1].sq + kl, fx);
-          else if (g1) atomicAdd(g1 + qq * a.bias[1].sq + kl, ds);
+          if (f0 || f1) {
+            const unsigned long long fx = (unsigned long long)__double2ll_rn((double)ds * FIXED);
+            if (f0) atomicAdd(f0 + qq * a.bias[0].sq + kl + c, fx);
+            if (f1) atomicAdd(f1 + qq * a.bias[1].sq + kl + c, fx);
+          }
+          if (g0 && !f0) atomicAdd(g0 + qq * a.bias[0].sq + kl + c, ds);
+          if (g1 && !f1) atomicAdd(g1 + qq * a.bias[1].sq + kl + c, ds);
         }
       }
     // dQ for this warp's 16 queries over the block's 64 keys, added straight from the accumulators (a warp's
