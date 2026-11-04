@@ -52,6 +52,27 @@
 // (floor = GFLOP / 12.22 + MB / 131, the arithmetic and the bytes each at their own ceiling and not overlapped,
 // which is why one row reads over 100%.) `tri_ab_hm` moves its 1171 MB at **133 GB/s**, i.e. at the copy
 // ceiling: it is a gate and a transpose of four pair-sized planes and there is nothing in it to speed up.
+// 🔴 AND THE BATCHED PROJECTION - THE BIGGEST ITEM, 22% - IS THE FASTEST FORM OF THAT PRODUCT ON THIS
+// MACHINE, which is worth setting out at length because "22% of a step" invites one more attempt at it. Every
+// lever, measured:
+//   - THE KERNEL: the matrix units' GEMM is already what runs. The vector one is **3.03 TFLOP/s** against
+//     **11.7** on this exact shape, so the choice is not in doubt.
+//   - THE TILE: six matrix tiles interleaved in one run - 1.834 ms for the default, 1.829 for 64x128 (which is
+//     what it picks), 1.830 for 32x256, and 1.858, 2.233, 2.305 for the rest. Nothing beats the default.
+//   - THE TRUNK AGAINST THE BENCH: 25.32 ms over 14 calls is **1.81 ms a call** against the best isolated
+//     arm's **1.829**. There is no gap between this port's use of the GEMM and the GEMM.
+//   - THE ORIENTATION: both measured equal (167.1 ms a step against 166.6), recorded on the projection itself.
+//   - THE OPERAND REUSE: doubling M from 1024 to 2048 at the same K gives **11.77 TFLOP/s against 11.73** -
+//     the same. So the complaint that 64-row tiles re-read the whole 25.7 MB of `zn` sixteen times costs
+//     nothing measurable, and a formulation with a larger M would buy nothing.
+//   - FUSING THE TWO DIRECTIONS into one GEMM of 8T: IMPOSSIBLE, and for a reason worth writing down rather
+//     than measuring. They look like two affine functions of one normalised pair track, which would fold each
+//     norm's scale into its weight and share the standardisation - but the two triangles are SEQUENTIAL and
+//     the second reads what the first wrote. There is no shared input. The norm that genuinely could be shared
+//     already is: the GEMM that writes the pair track emits the next stage's norm in its epilogue (`znPre`).
+//   - WHAT IS LEFT IS THE CHECKPOINT'S OWN WIDTH: at K = 384 the kernel reaches ~11.7 TFLOP/s where K >= 768
+//     reaches ~12.2 (12.21 at 1536, 12.10 at 4096). That 4% is a property of a 384-channel pair track, not of
+//     this port, and P is not ours to change.
 // So no kernel here is worth another tile sweep. The lever left is FEWER PASSES OVER THE PAIR TRACK - fusing an
 // elementwise pass into the epilogue of the GEMM that produced it, as the gate, the residual and the next
 // LayerNorm already are - and `gemmGatedAdd`'s own 878 MB is the measure of what one such pass costs. The
