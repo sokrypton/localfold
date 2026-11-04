@@ -1,3 +1,4 @@
+#include <cstring>
 // flash.cuh against the bmm path it replaces: sdpaForward and sdpaBackward on random inputs, every mask and bias form,
 // both precisions (3xTF32 and TF32), shapes that do and do not fill a 64-row tile.
 //   cuda/grad/test-flash
@@ -87,6 +88,28 @@ int main() {
       if (c.bias2) { double r = (mode == 2 ? relRmsHost : rel)(gb[1][1], gb[0][1], nb2); printf("  db2 %.2e%s", r, r > bb ? " <-- ABOVE" : ""); fails += r > bb; }
       printf("\n");
     }
+  }
+  // the bf16 backward's bias gradient is summed in fixed point: bitwise the same on every run (float atomics are not)
+  {
+    setTf32(false); setBf16(true); FLASH = true;
+    const int B = 64, H = 4, Q = 96, D = 32, HD = H * D;
+    const size_t n = (size_t)B * Q * HD;
+    float *q = randn(n, 1.f), *k = randn(n, 1.f), *v = randn(n, 1.f), *dO = randn(n, 1.f), *bb = randn((size_t)H * Q * Q, 1.f);
+    float *o = zeros(n), *dq = zeros(n), *dk = zeros(n), *dv = zeros(n), *lse = zeros((size_t)2 * B * H * Q);
+    std::vector<float> g[2];
+    for (int r = 0; r < 2; ++r) {
+      float* db = zeros((size_t)H * Q * Q);
+      Sdpa a; a.B = B; a.H = H; a.Q = a.K = Q; a.D = D; a.scale = 1.f / sqrtf((float)D);
+      a.bias[0] = Bias{bb, 0, (long long)Q * Q, Q, db};
+      sdpaForward(a, q, HD, k, HD, v, HD, o, HD, lse);
+      sdpaBackward(a, q, HD, k, HD, v, HD, dO, HD, dq, HD, dk, HD, dv, HD, false, false, false, o, HD, lse);
+      GK(cudaStreamSynchronize(STREAM));
+      g[r] = hostv(db, (size_t)H * Q * Q);
+    }
+    const bool same = !memcmp(g[0].data(), g[1].data(), g[0].size() * 4);
+    printf("bf16 bias gradient over %d batch rows, twice: %s\n", B, same ? "bitwise identical" : "DIFFERS  <-- ABOVE");
+    fails += !same;
+    setBf16(false);
   }
   // both paths against a float64 forward on the host: which is closer to the truth, not only to each other
   {

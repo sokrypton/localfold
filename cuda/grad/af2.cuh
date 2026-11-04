@@ -254,6 +254,10 @@ __global__ void addMaskBiasK(real* nb, const real* pairMask, int H, size_t LL) {
 // ---------------------------------------------------------------- the block
 struct Block {
   bool extra = false, opmFirst = true;
+  // training's shared dropout (AF2's dropout_wrapper): off unless set; the masks come from a counter hash of
+  // (dropSeed, module, position), so the remat replay and the backward regenerate them and none is stored
+  bool dropout = false;
+  unsigned long long dropSeed = 0;
   int Cm = 256, Cz = 128;
   Opm opm;
   RowAttn row;
@@ -328,6 +332,37 @@ inline void allocBlock(Block& b) {
   forEachParam(b, [&](const std::string& n, Param& p, size_t len) { allocParam(p, n, len); b.params.add(p); });
 }
 
+// AF2's apply_dropout on an update [A, B, C] in place: keep / (1 - rate), one draw per position with the broadcast
+// axis (per_row: A, per_column: B) dropped. trans: the update is held [B, A, C] (an ending-node or column
+// update before it is swapped back), its draws still those of [A, B, C]. The forward scales the update, the backward
+// the update's gradient, with the same draws.
+__host__ __device__ __forceinline__ unsigned long long mix64(unsigned long long x) {
+  x += 0x9e3779b97f4a7c15ull;
+  x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ull;
+  x = (x ^ (x >> 27)) * 0x94d049bb133111ebull;
+  return x ^ (x >> 31);
+}
+__global__ void dropoutK(real* x, int A, int B, int C, bool perRow, bool trans, float rate, unsigned long long seed) {
+  const size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)A * B * C) return;
+  const int c = (int)(t % C);
+  const size_t r = t / C;
+  int a, b;
+  if (trans) { a = (int)(r % A); b = (int)(r / A); } else { a = (int)(r / B); b = (int)(r % B); }
+  const unsigned long long key = perRow ? (unsigned long long)b * C + c : ((unsigned long long)a * C + c) | (1ull << 62);
+  const float u = (float)(mix64(seed ^ mix64(key)) >> 40) * (1.f / 16777216.f);
+  x[t] = u < rate ? (real)0 : x[t] / (real)(1 - rate);
+}
+// rates by module (AF2's config): row attention 0.15 per row, the four pair modules 0.25 (the ending node per
+// column), every other 0
+enum DropMod { DROP_ROW = 1, DROP_TRI_OUT, DROP_TRI_IN, DROP_TRI_START, DROP_TRI_END };
+inline void dropout(const Block& b, DropMod m, real* x, int A, int Bd, int C, bool trans) {
+  if (!b.dropout) return;
+  const float rate = m == DROP_ROW ? 0.15f : 0.25f;
+  dropoutK<<<blocks((size_t)A * Bd * C), 256, 0, STREAM>>>(x, A, Bd, C, m != DROP_TRI_END, trans, rate,
+                                                          mix64(b.dropSeed * 8 + m));
+}
+
 // What the backward needs from the forward, per module.
 struct BlockSave {
   int S, L;
@@ -373,6 +408,7 @@ inline BlockSave blockForward(Block& b, const real* msa, const real* pair, const
   addMaskBiasK<<<blocks(pr * 8), 256, 0, STREAM>>>(s.rowNb, pairMask, 8, pr);
   real* upd = ARENA.get(mr * Cm);
   s.rowA = attnForward(b.row.at, s.rowXn, msaMask, s.rowNb, upd, S, L);
+  dropout(b, DROP_ROW, upd, S, L, Cm, false);
   s.msa1 = clone(msa, mr * Cm);
   add(s.msa1, upd, mr * Cm);
   // MSA column attention, on the transposed MSA [L, S, C]
@@ -404,8 +440,10 @@ inline BlockSave blockForward(Block& b, const real* msa, const real* pair, const
   // triangle multiplications
   real* pu = ARENA.get(pr * Cz);
   s.tOut = triMulForward(b.triOut, pc, pairMask, pu, L);
+  dropout(b, DROP_TRI_OUT, pu, L, L, Cz, false);
   s.pair2 = clone(pc, pr * Cz); add(s.pair2, pu, pr * Cz);
   s.tIn = triMulForward(b.triIn, s.pair2, pairMask, pu, L);
+  dropout(b, DROP_TRI_IN, pu, L, L, Cz, false);
   s.pair3 = clone(s.pair2, pr * Cz); add(s.pair3, pu, pr * Cz);
   // triangle attention, starting node (per row)
   s.stXn = ARENA.get(pr * Cz);
@@ -413,6 +451,7 @@ inline BlockSave blockForward(Block& b, const real* msa, const real* pair, const
   s.stNb = ARENA.get(pr * 4);
   pairBias(s.stXn, b.triStart.feat2d.w, s.stNb, L, Cz, 4);
   s.stA = attnForward(b.triStart.at, s.stXn, pairMask, s.stNb, pu, L, L);
+  dropout(b, DROP_TRI_START, pu, L, L, Cz, false);
   s.pair4 = clone(s.pair3, pr * Cz); add(s.pair4, pu, pr * Cz);
   // ending node: on the transposed pair, with the transposed mask
   s.enX = ARENA.get(pr * Cz);
@@ -425,6 +464,7 @@ inline BlockSave blockForward(Block& b, const real* msa, const real* pair, const
   pairBias(s.enXn, b.triEnd.feat2d.w, s.enNb, L, Cz, 4);
   s.enA = attnForward(b.triEnd.at, s.enXn, s.pairMaskT, s.enNb, pu, L, L);
   s.pair5 = clone(s.pair4, pr * Cz);
+  dropout(b, DROP_TRI_END, pu, L, L, Cz, true);
   swap01(pu, s.pair5, L, L, Cz, true);
   // pair transition
   s.pairT = transForward(b.pairTrans, s.pair5, pu, pr);
@@ -459,6 +499,7 @@ inline void blockBackward(Block& b, const BlockSave& s, const real* msaMask, con
     Scratch scratch;
     real* dupdT = ARENA.get(pr * Cz);
     swap01(dp, dupdT, L, L, Cz);
+    dropout(b, DROP_TRI_END, dupdT, L, L, Cz, true);
     real* dnb = ARENA.zeros(pr * 4);
     real* dxn = ARENA.get(pr * Cz);
     attnBackward(b.triEnd.at, s.enA, s.pairMaskT, s.enNb, dupdT, dxn, dnb, false);
@@ -473,7 +514,9 @@ inline void blockBackward(Block& b, const BlockSave& s, const real* msaMask, con
     Scratch scratch;
     real* dnb = ARENA.zeros(pr * 4);
     real* dxn = ARENA.get(pr * Cz);
-    attnBackward(b.triStart.at, s.stA, pairMask, s.stNb, dp, dxn, dnb, false);
+    const real* dst = dp;
+    if (b.dropout) { real* t = clone(dp, pr * Cz); dropout(b, DROP_TRI_START, t, L, L, Cz, false); dst = t; }
+    attnBackward(b.triStart.at, s.stA, pairMask, s.stNb, dst, dxn, dnb, false);
     pairBiasBackward(s.stXn, b.triStart.feat2d, dnb, dxn, L, Cz, 4, true);
     lnBackward(b.triStart.qn, s.stQ, dxn, dp, pr, true);
   }
@@ -481,10 +524,14 @@ inline void blockBackward(Block& b, const BlockSave& s, const real* msaMask, con
   {
     Scratch scratch;
     // (BF16: in place - triMulBackwardBf reads dout whole before it adds into dpair)
-    real* dpu = BF16 ? dp : clone(dp, pr * Cz);
+    // (with dropout the module's gradient is the masked copy, so nothing is in place)
+    const bool inPlace = BF16 && !b.dropout;
+    real* dpu = inPlace ? dp : clone(dp, pr * Cz);
+    dropout(b, DROP_TRI_IN, dpu, L, L, Cz, false);
     { Range r("bw.triIn"); triMulBackward(b.triIn, s.tIn, pairMask, dpu, dp); }
     Range r("bw.triOut");
-    if (!BF16) dpu = clone(dp, pr * Cz);
+    if (!inPlace) dpu = clone(dp, pr * Cz);
+    dropout(b, DROP_TRI_OUT, dpu, L, L, Cz, false);
     triMulBackward(b.triOut, s.tOut, pairMask, dpu, dp);
   }
   if (!b.opmFirst) opmBackward(b.opm, s.opm, msaMask, dp, dm);    // pc = pair1 + opm(msa3)
@@ -513,7 +560,9 @@ inline void blockBackward(Block& b, const BlockSave& s, const real* msaMask, con
     Range r("bw.row");
     real* dnb = ARENA.zeros(pr * 8);
     real* dxn = ARENA.get(mr * Cm);
-    attnBackward(b.row.at, s.rowA, msaMask, s.rowNb, dm, dxn, dnb, false);
+    const real* drow = dm;
+    if (b.dropout) { real* t = clone(dm, mr * Cm); dropout(b, DROP_ROW, t, S, L, Cm, false); drow = t; }
+    attnBackward(b.row.at, s.rowA, msaMask, s.rowNb, drow, dxn, dnb, false);
     lnBackward(b.row.qn, s.rowQ, dxn, dm, mr, true);
     real* dpn = ARENA.get(pr * Cz);
     pairBiasBackward(s.rowPn, b.row.feat2d, dnb, dpn, L, Cz, 8, false);

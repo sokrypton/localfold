@@ -593,9 +593,9 @@ __device__ __forceinline__ const uint16_t* hrow(const HSrc& s, int b, int h, int
   return s.p + b * s.sB + h * s.sH + (long long)n * s.sN;
 }
 // a 64-row tile of it into shared memory [64][ld] (cp.async, zero-filled past the ends)
-template <int DP>
+template <int DP, int ROWS = 64>
 __device__ __forceinline__ void loadH(uint16_t* dst, int ld, const HSrc& s, int b, int h, int n0) {
-  for (int i = threadIdx.x; i < 64 * DP / 8; i += THREADS) {
+  for (int i = threadIdx.x; i < ROWS * DP / 8; i += THREADS) {
     const int r = i / (DP / 8), c = (i % (DP / 8)) * 8;
     const bool on = n0 + r < s.N && c < s.W;
     cp16(dst + r * ld + c, on ? hrow(s, b, h, n0 + r) + c : s.p, on);
@@ -845,18 +845,25 @@ __device__ __forceinline__ float ldOut(const float* p) { return *p; }
 __device__ __forceinline__ float ldOut(const __nv_bfloat16* p) { return __bfloat162float(*p); }
 __device__ __forceinline__ void stOut(float* p, float v) { *p = v; }
 __device__ __forceinline__ void stOut(__nv_bfloat16* p, float v) { *p = __float2bfloat16(v); }
-template <int D, class DKV = float>   // (DKV: dK and dV written in bf16 for a module that consumes them so)
+constexpr double FIXED = 1099511627776.0;   // 2^40: |a gradient| to 8e6, resolved to 1e-12
+__global__ void fromFixedK(float* g, const unsigned long long* f, size_t n) {
+  const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n && f[i]) g[i] += (float)((double)(long long)f[i] / FIXED);
+}
+template <int D, class DKV = float, int QT = 64>   // (DKV: dK and dV written in bf16 for a module that consumes them so;
+                                                  // QT: the query tile, 32 or 64 rows)
 __global__ void __launch_bounds__(THREADS, 3) bwdBf(Sdpa a, BiasTile bt, HSrc qs_, HSrc ks_, HSrc vs_, HSrc os_,
                                                     const float* __restrict__ lse, const float* __restrict__ Di,
                                                     float* __restrict__ dq, int lddq, DKV* __restrict__ dk, int lddk,
-                                                    DKV* __restrict__ dv, int lddv, bool accK, bool accV) {
+                                                    DKV* __restrict__ dv, int lddv, bool accK, bool accV,
+                                                    unsigned long long* fx0, unsigned long long* fx1) {
   constexpr int DP = padD<D>(), LK = ldBf<D>();
   extern __shared__ __align__(16) float sm[];
   uint16_t* Kb = reinterpret_cast<uint16_t*>(sm);                 // [BC][LK]
-  uint16_t* Qb = Kb + BC * LK;                                    // [2][BR][LK]
-  uint16_t* Ob = Qb + 2 * BR * LK;                                // dO [2][BR][LK]
-  uint16_t* Tb = Ob + 2 * BR * LK;                                // [2][BR][LB]: the bias tile, then dS
-  float* QV = reinterpret_cast<float*>(Tb + 2 * BR * LB);         // [2][4][BR]: row max, log sum, Di, seqQ
+  uint16_t* Qb = Kb + BC * LK;                                    // [2][QT][LK]
+  uint16_t* Ob = Qb + 2 * QT * LK;                                // dO [2][QT][LK]
+  uint16_t* Tb = Ob + 2 * QT * LK;                                // [2][QT][LB]: the bias tile, then dS
+  float* QV = reinterpret_cast<float*>(Tb + 2 * QT * LB);         // [2][4][QT]: row max, log sum, Di, seqQ
   const int nkb = (a.K + BC - 1) / BC;
   const int kb = blockIdx.x % nkb, h = (blockIdx.x / nkb) % a.H, b = blockIdx.x / (nkb * a.H);
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
@@ -868,23 +875,23 @@ __global__ void __launch_bounds__(THREADS, 3) bwdBf(Sdpa a, BiasTile bt, HSrc qs
   const float* Dib = Di + bh * a.Q;
   loadH<DP>(Kb, LK, ks_, b, h, k0);
   auto issue = [&](int st, int q0) {
-    loadH<DP>(Qb + st * BR * LK, LK, qs_, b, h, q0);
-    loadH<DP>(Ob + st * BR * LK, LK, os_, b, h, q0);
+    loadH<DP, QT>(Qb + st * QT * LK, LK, qs_, b, h, q0);
+    loadH<DP, QT>(Ob + st * QT * LK, LK, os_, b, h, q0);
     if (tp) {
-      uint16_t* T = Tb + st * BR * LB;
-      for (int i = threadIdx.x; i < BR * BC / 8; i += THREADS) {
+      uint16_t* T = Tb + st * QT * LB;
+      for (int i = threadIdx.x; i < QT * BC / 8; i += THREADS) {
         const int r = i / (BC / 8), c = (i % (BC / 8)) * 8;
         cp16(T + r * LB + c, tp + (size_t)(q0 + r) * bt.ld + c, true);
       }
     }
-    if (threadIdx.x < BR) {
-      float* qv = QV + st * 4 * BR;
+    if (threadIdx.x < QT) {
+      float* qv = QV + st * 4 * QT;
       const int j = threadIdx.x, q = q0 + j;
       const bool in = q < a.Q;
       cp4(qv + j, in ? lseb + q : lseb, in);
-      cp4(qv + BR + j, in ? lgb + q : lgb, in);
-      cp4(qv + 2 * BR + j, in ? Dib + q : Dib, in);
-      if (a.seqQ) cp4(qv + 3 * BR + j, in ? a.seqQ + q : a.seqQ, in);
+      cp4(qv + QT + j, in ? lgb + q : lgb, in);
+      cp4(qv + 2 * QT + j, in ? Dib + q : Dib, in);
+      if (a.seqQ) cp4(qv + 3 * QT + j, in ? a.seqQ + q : a.seqQ, in);
     }
   };
   issue(0, 0);
@@ -911,19 +918,23 @@ __global__ void __launch_bounds__(THREADS, 3) bwdBf(Sdpa a, BiasTile bt, HSrc qs
   float* dqb = dq + (size_t)b * a.Q * lddq + h * D;
   real* g0 = a.bias[0].grad ? a.bias[0].grad + b * a.bias[0].sb + h * a.bias[0].sh + k0 : nullptr;
   real* g1 = a.bias[1].grad ? a.bias[1].grad + b * a.bias[1].sb + h * a.bias[1].sh + k0 : nullptr;
-  const int nq = (a.Q + BR - 1) / BR;
+  // (the bias gradients in fixed point - bindcraft2's nbbFixed: an integer sum is the same in any order, so the
+  // gradient is deterministic where float atomics differ run to run)
+  unsigned long long* f0 = fx0 && g0 ? fx0 + (g0 - a.bias[0].grad) : nullptr;
+  unsigned long long* f1 = fx1 && g1 ? fx1 + (g1 - a.bias[1].grad) : nullptr;
+  const int nq = (a.Q + QT - 1) / QT;
   for (int it = 0; it < nq; ++it) {
-    const int st = it & 1, q0 = it * BR;
-    if (it + 1 < nq) issue(st ^ 1, q0 + BR);
+    const int st = it & 1, q0 = it * QT;
+    if (it + 1 < nq) issue(st ^ 1, q0 + QT);
     cpCommit();
     cpWait1();
     __syncthreads();
-    const uint16_t* Qs = Qb + st * BR * LK;
-    const uint16_t* Os = Ob + st * BR * LK;
-    uint16_t* T = Tb + st * BR * LB;
-    const float* qv = QV + st * 4 * BR;
+    const uint16_t* Qs = Qb + st * QT * LK;
+    const uint16_t* Os = Ob + st * QT * LK;
+    uint16_t* T = Tb + st * QT * LB;
+    const float* qv = QV + st * 4 * QT;
 #pragma unroll 1
-    for (int hq = 0; hq < 2; ++hq) {
+    for (int hq = 0; hq < QT / 32; ++hq) {
       float sa[4][4], dpt[4][4];   // 16 keys x 32 queries
 #pragma unroll
       for (int jj = 0; jj < 4; ++jj)
@@ -944,12 +955,12 @@ __global__ void __launch_bounds__(THREADS, 3) bwdBf(Sdpa a, BiasTile bt, HSrc qs
           const int kl = kl0 + g + (e >> 1) * 8, ql = (hq * 4 + jj) * 8 + 2 * t + (e & 1);
           float add = kaR[e >> 1];
           if (add != -INFINITY) {
-            if (a.seqQ && ksR[e >> 1] != __float_as_int(qv[3 * BR + ql])) add = -INFINITY;
+            if (a.seqQ && ksR[e >> 1] != __float_as_int(qv[3 * QT + ql])) add = -INFINITY;
             else if (tp) add += bfToF(T[ql * LB + kl]);
           }
           const float x = logit(sa[jj][e], add, a);
-          const float p = x == -INFINITY || q0 + ql >= a.Q ? 0.f : ex2(fmaf(x - qv[ql], LOG2E, -LOG2E * qv[BR + ql]));
-          const float ds = p * (dpt[jj][e] - qv[2 * BR + ql]);
+          const float p = x == -INFINITY || q0 + ql >= a.Q ? 0.f : ex2(fmaf(x - qv[ql], LOG2E, -LOG2E * qv[QT + ql]));
+          const float ds = p * (dpt[jj][e] - qv[2 * QT + ql]);
           T[ql * LB + kl] = (uint16_t)(bf2(ds, 0.f) & 0xffff);
           sa[jj][e] = p;
           dpt[jj][e] = ds;
@@ -971,18 +982,24 @@ __global__ void __launch_bounds__(THREADS, 3) bwdBf(Sdpa a, BiasTile bt, HSrc qs
     }
     __syncthreads();
     if (g0 || g1)
-      for (int i = threadIdx.x; i < BR * BC; i += THREADS) {
+      for (int i = threadIdx.x; i < QT * BC; i += THREADS) {
         const int ql = i / BC, kl = i % BC;
         const float ds = bfToF(T[ql * LB + kl]);
         if (ds != 0.f) {
           const long long qq = q0 + ql;
-          if (g0) atomicAdd(g0 + qq * a.bias[0].sq + kl, ds);
-          if (g1) atomicAdd(g1 + qq * a.bias[1].sq + kl, ds);
+          const unsigned long long fx = (unsigned long long)__double2ll_rn((double)ds * FIXED);
+          if (f0) atomicAdd(f0 + qq * a.bias[0].sq + kl, fx);
+          else if (g0) atomicAdd(g0 + qq * a.bias[0].sq + kl, ds);
+          if (f1) atomicAdd(f1 + qq * a.bias[1].sq + kl, fx);
+          else if (g1) atomicAdd(g1 + qq * a.bias[1].sq + kl, ds);
         }
       }
     // dQ for this warp's 16 queries over the block's 64 keys, added straight from the accumulators (a warp's
     // atomics cover eight rows' 32-byte sectors whole)
-    const int qw = warp * 16;
+    // (QT 32: warps 0, 1 and 2, 3 take the tile's two 16-query halves, each pair splitting the n-tiles)
+    const int qw = QT == 64 ? warp * 16 : (warp & 1) * 16;
+    constexpr int NT = D / 8;
+    const int n0 = QT == 64 ? 0 : (warp >> 1) * (NT / 2), n1 = QT == 64 ? NT : (warp >> 1 ? NT : NT / 2);
     float dqa[D / 8][4];
 #pragma unroll
     for (int n = 0; n < D / 8; ++n) dqa[n][0] = dqa[n][1] = dqa[n][2] = dqa[n][3] = 0.f;
@@ -993,6 +1010,7 @@ __global__ void __launch_bounds__(THREADS, 3) bwdBf(Sdpa a, BiasTile bt, HSrc qs
       for (int i = 0; i < 4; ++i) A[i] = word(T, (qw + g + (i & 1) * 8) * LB + s * 16 + 2 * t + (i >> 1) * 8);
 #pragma unroll
       for (int n = 0; n < D / 8; ++n) {
+        if (n < n0 || n >= n1) continue;
         uint32_t b0, b1;
         ldT(b0, b1, Kb, s * 16, n * 8, LK);
         mma16(dqa[n], A, b0, b1);
@@ -1004,6 +1022,7 @@ __global__ void __launch_bounds__(THREADS, 3) bwdBf(Sdpa a, BiasTile bt, HSrc qs
       if (qq >= a.Q) continue;
 #pragma unroll
       for (int n = 0; n < D / 8; ++n) {
+        if (n < n0 || n >= n1) continue;
         atomicAdd(dqb + (long long)qq * lddq + n * 8 + 2 * t, dqa[n][r * 2] * a.scale);
         atomicAdd(dqb + (long long)qq * lddq + n * 8 + 2 * t + 1, dqa[n][r * 2 + 1] * a.scale);
       }
@@ -1028,8 +1047,8 @@ __global__ void __launch_bounds__(THREADS, 3) bwdBf(Sdpa a, BiasTile bt, HSrc qs
       }
   }
 }
-template <int D>
-inline size_t bwdBfSmem() { return 2 * (5 * BR * ldBf<D>() + 2 * BR * LB) + 4 * (2 * 4 * BR); }
+template <int D, int QT = 64>
+inline size_t bwdBfSmem() { return 2 * (BC * ldBf<D>() + 4 * QT * ldBf<D>() + 2 * QT * LB) + 4 * (2 * 4 * QT); }
 // an operand's source: bf16 rows read in place where they are 16-byte aligned, else a head-major bf16 copy
 template <int D, class X>
 inline HSrc hsrc(const X* x, int ld, int B, int N, int H) {
@@ -1065,17 +1084,32 @@ inline void backwardBf(const Sdpa& a, const X* q, int ldq, const X* k, int ldk, 
   const int Npq = (a.Q + 63) / 64 * 64, Npk = (a.K + 63) / 64 * 64;
   const HSrc qs_ = hsrc<D>(q, ldq, a.B, a.Q, a.H), ks_ = hsrc<D>(k, ldk, a.B, a.K, a.H), vs_ = hsrc<D>(v, ldv, a.B, a.K, a.H),
              os_ = hsrc<D>(dO, lddo, a.B, a.Q, a.H);
+  // (a 32-row query tile halves the shared memory, and lost both ways at the triangle shape: 907 us capped at 128
+  // registers for four CTAs an SM, 966 us at three, against 761 at 64 rows)
+  constexpr int QT = 64;
   static bool attr = false;
-  const size_t smem = bwdBfSmem<D>();
+  const size_t smem = bwdBfSmem<D, QT>();
   if (!attr) {
-    GK(cudaFuncSetAttribute(bwdBf<D, DKV>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
-    GK(cudaFuncSetAttribute(bwdBf<D, DKV>, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+    GK(cudaFuncSetAttribute(bwdBf<D, DKV, QT>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
+    GK(cudaFuncSetAttribute(bwdBf<D, DKV, QT>, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
     attr = true;
   }
   const BiasTile bt = biasBf(a, Npq, Npk);
+  // the fixed-point accumulators: each bias gradient's whole extent, zeroed, then added back into it
+  unsigned long long* fx[2] = {nullptr, nullptr};
+  size_t ext[2] = {0, 0};
+  for (int j = 0; j < 2; ++j) {
+    const Bias& B = a.bias[j];
+    if (!B.grad) continue;
+    ext[j] = (size_t)((B.sb ? a.B - 1 : 0) * B.sb + (B.sh ? a.H - 1 : 0) * B.sh + (long long)(a.Q - 1) * B.sq + a.K);
+    fx[j] = reinterpret_cast<unsigned long long*>(ARENA.get(2 * ext[j]));
+    GK(cudaMemsetAsync(fx[j], 0, ext[j] * 8, STREAM));
+  }
   const size_t grid = (size_t)((a.K + BC - 1) / BC) * a.H * a.B;
-  bwdBf<D, DKV><<<(unsigned)grid, THREADS, smem, STREAM>>>(a, bt, qs_, ks_, vs_, os_, lse, Di, dq, lddq, dk,
-                                                       lddk, dv, lddv, accK, accV);
+  bwdBf<D, DKV, QT><<<(unsigned)grid, THREADS, smem, STREAM>>>(a, bt, qs_, ks_, vs_, os_, lse, Di, dq, lddq, dk,
+                                                       lddk, dv, lddv, accK, accV, fx[0], fx[1]);
+  for (int j = 0; j < 2; ++j)
+    if (fx[j]) fromFixedK<<<blocks(ext[j]), 256, 0, STREAM>>>(a.bias[j].grad, fx[j], ext[j]);
 }
 
 template <int D, int MODE>

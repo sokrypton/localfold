@@ -7,7 +7,7 @@
 #include "af2.cuh"
 using namespace grad;
 int main(int argc, char** argv) {
-  int L = 256, S = 128, nblocks = 48; bool extra = false;
+  int L = 256, S = 128, nblocks = 48; bool extra = false, graph = false;
   for (int i = 1; i < argc; ++i) {
     if (!strncmp(argv[i], "--L=", 4)) L = atoi(argv[i] + 4);
     else if (!strncmp(argv[i], "--S=", 4)) S = atoi(argv[i] + 4);
@@ -15,7 +15,9 @@ int main(int argc, char** argv) {
     else if (!strcmp(argv[i], "--extra")) extra = true;
     else if (!strcmp(argv[i], "--tf32")) TF32 = true;
     else if (!strcmp(argv[i], "--bf16")) BF16 = true;
+    else if (!strcmp(argv[i], "--graph")) graph = true;   // the backward captured once as a CUDA graph and replayed
   }
+  if (graph) GK(cudaStreamCreateWithFlags(&STREAM, cudaStreamNonBlocking));   // (the legacy stream cannot be captured)
   init();
   curandGenerator_t gen; curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT); curandSetPseudoRandomGeneratorSeed(gen, 7);
   auto randn = [&](size_t n, float sd) { float* p; GK(cudaMalloc(&p, ((n + 1) & ~1) * 4)); curandGenerateNormal(gen, p, (n + 1) & ~1, 0.f, sd); return p; };
@@ -47,6 +49,26 @@ int main(int argc, char** argv) {
     cudaEventElapsedTime(&f, e0, e1); cudaEventElapsedTime(&fs, e1, e2); cudaEventElapsedTime(&bw, e2, e3);
   }
   GK(cudaGetLastError());
+  if (graph) {   // the arena is where the last replay left it, so the captured addresses hold for every replay
+    b.params.zeroGrad(); ARENA.reset();
+    af2::BlockSave s = af2::blockForward(b, msa, pair, mm_, pm, mo, po, S, L);
+    cudaGraph_t gr; cudaGraphExec_t ge;
+    GK(cudaStreamBeginCapture(STREAM, cudaStreamCaptureModeThreadLocal));
+    af2::blockBackward(b, s, mm_, pm, ctm, ctp, dm, dp);
+    GK(cudaStreamEndCapture(STREAM, &gr));
+    GK(cudaGraphInstantiate(&ge, gr, 0));
+    size_t nodes = 0; GK(cudaGraphGetNodes(gr, nullptr, &nodes));
+    float tg = 1e9, td = 1e9;
+    for (int r = 0; r < 6; ++r) {
+      float x;
+      cudaEventRecord(e0, STREAM); GK(cudaGraphLaunch(ge, STREAM)); cudaEventRecord(e1, STREAM);
+      GK(cudaStreamSynchronize(STREAM)); cudaEventElapsedTime(&x, e0, e1); if (r) tg = std::min(tg, x);
+      cudaEventRecord(e0, STREAM); af2::blockBackward(b, s, mm_, pm, ctm, ctp, dm, dp); cudaEventRecord(e1, STREAM);
+      GK(cudaStreamSynchronize(STREAM)); cudaEventElapsedTime(&x, e0, e1); if (r) td = std::min(td, x);
+    }
+    GK(cudaGetLastError());
+    printf("  backward as a CUDA graph (%zu nodes): %.2f ms, launched directly %.2f ms (min of 5, interleaved)\n", nodes, tg, td);
+  }
   double inBytes = (double)(mr + pr) * 4;
   printf("L %d S %d Cm %d (%s%s): forward %.1f ms, replay %.1f ms, backward %.1f ms -> %.1f ms a block trained (%.2f s for %d blocks)\n",
          L, S, b.Cm, extra ? "extra" : "main", BF16 ? ", bf16" : TF32 ? ", tf32" : "", f, fs, bw, f + fs + bw, (f + fs + bw) * nblocks / 1000, nblocks);
