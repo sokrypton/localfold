@@ -15,6 +15,8 @@
 // the input's, which for a binder on a big target is most of the work.
 #include "rfd4p.h"
 #include <cmath>
+#include <cstring>
+#include <vector>
 #include "rfd4p/featurise/tables.inc"
 
 DecDims DD_;
@@ -45,8 +47,11 @@ void decoderFeatures(const float* caNm, const float* zLatent, const int* tokenTy
   // as the spec line by line.
   const float* ttTab = M.hostF("w/autoencoder.decoder.init_repr_factory.feat_creators.2.embedding.weight");
   const float* seqTab = M.hostF("w/autoencoder.decoder.init_repr_factory.feat_creators.3.embedding.weight");
-  float* out = (float*)host(feats);
-  memset(out, 0, (size_t)n * fdim * 4);
+  // 🔴 BUILT IN HOST MEMORY AND UPLOADED, NOT WRITTEN THROUGH `host()`. That hands back the CPU side of a
+  // shared buffer and is documented "read them after a sync"; writing it while the queue is busy is the race
+  // that made the trunk right seven runs in eight elsewhere in this port. `upload` is in stream order.
+  std::vector<float> buf((size_t)n * fdim, 0.f);
+  float* out = buf.data();
   for (int i = 0; i < n; ++i) {
     if (pad && !pad[i]) continue;
     float* o = out + (size_t)i * fdim;
@@ -58,6 +63,7 @@ void decoderFeatures(const float* caNm, const float* zLatent, const int* tokenTy
     if (seq[i] != 0)
       for (int k = 0; k < types; ++k) o[3 + latent + 32 + k] = seqTab[(size_t)seq[i] * types + k];
   }
+  upload(feats, buf.data(), buf.size() * 4);
 }
 
 // one decoder layer, in place on `s` over `rows` gathered rows. The trunk's twin is `tokenLayer` in trunk.mm; the

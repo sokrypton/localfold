@@ -34,3 +34,13 @@ struct RfdMulSigmoidArgs { CP(float) x; CP(float) g; DP(float) y; u64 n; };
 struct RfdAdalnRowsLnArgs { CP(float) x; DP(float) y; CP(float) gamma; CP(float) beta; u64 rows; int C; float eps; };
 // rows gathered by index (the attended tokens) and scattered back: out[r][c] = in[idx[r]][c], and the reverse
 struct RfdRowsArgs { CP(float) in; DP(float) out; CP(int) idx; u64 rows; int C; uint pad; };
+// the pair track's distance bins, rebuilt from the current alpha carbons each step: for every pair row the
+// one-hot of `torch.bucketize(|ca_i - ca_j|, limits, right=False)` over `dim` columns at `off` of a `stride`-wide
+// row (the 29 limits are dist.min + (dist.max - dist.min) k / (dim - 2))
+struct RfdPairDistArgs { CP(float) caNm; DP(float) pair; u64 rows; uint n, dim, off, stride; float dmin, dmax; };
+// one Euler(-Maruyama) step of one modality, in place on x, with the clean estimate x1 out (flow.js's
+// `simulationStep`): mode 0 vf_tsr, 1 vf, 2 sc; `eps` null on a deterministic step
+// `vsCoef` is (1 - r) / t, computed on the host from the tsr ratio's closed form: the kernel's
+// vs = x vsCoef + r v is algebraically the reference's (x + (1 - t) score r) / t and avoids its cancellation
+struct RfdStepArgs { DP(float) x; DP(float) x1; CP(float) v; CP(float) eps; CP(float) emit; u64 n; uint dim, mode;
+                     float t, dt, gt, std, r, vsCoef; uint stochastic, pad; };

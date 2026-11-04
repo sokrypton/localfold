@@ -262,3 +262,31 @@ void recycleIn(const float* sInit, const float* zInit, float* s, float* z) {
   copy(z, zInit, nn * P * 4);
   add(z, zd, nn * P);
 }
+
+// The whole trunk: the three init products, `nRecycle` cycles of 14 layers with the pair update after every even
+// one but the last, and the heads. `s` and `z` are the caller's state buffers and must start at ZERO (the first
+// cycle's input is the init product because RMSNorm(0) is 0 and the projections have no bias); `insertion` may be
+// null, which is what every step but the last passes.
+void trunkForward(const float* seqF, const float* cond0, const float* cond1, const float* pairF,
+                  const float* pairCondF, int nRecycle, float* s, float* z, float* bbCa, float* latents,
+                  float* logits, float* insertion) {
+  const int n = D_.n;
+  const size_t nn = (size_t)n * n;
+  float* c = scratch<float>("tf.c", (size_t)n * D_.C);
+  float* c1 = scratch<float>("tf.c1", (size_t)n * D_.C);
+  float* sInit = scratch<float>("tf.sInit", (size_t)n * D_.D);
+  float* zInit = scratch<float>("tf.zInit", nn * D_.P);
+  condC(cond0, c, n);
+  if (nRecycle > 1) condC(cond1, c1, n);
+  initSingle(seqF, sInit);
+  initPair(pairF, pairCondF, zInit);
+  for (int cycle = 0; cycle < nRecycle; ++cycle) {
+    recycleIn(sInit, zInit, s, z);
+    const float* cc = cycle == 0 ? c : c1;
+    for (int i = 0; i < D_.layers; ++i) {
+      tokenLayer(i, s, z, cc);
+      if (i < D_.layers - 1 && i % 2 == 0) pairUpdate(i, s, z);
+    }
+  }
+  heads(s, bbCa, latents, logits, insertion);
+}

@@ -195,3 +195,55 @@ kernel void rfd4p_scatter_rows(LF_ARGS(RfdRowsArgs)) {
   const ulong r = t / a.C, c = t - r * a.C;
   a.out[(ulong)a.idx[r] * a.C + c] = a.in[t];
 }
+
+// a thread a pair row: the previous step's one-hot cleared and this step's written
+kernel void rfd4p_pair_dists(LF_ARGS(RfdPairDistArgs)) {
+  const ulong r = LF_INDEX;
+  if (r >= a.rows) return;
+  const uint i = lf_udiv((uint)r, a.n), j = (uint)r - i * a.n;
+  const float dx = a.caNm[i * 3] - a.caNm[j * 3];
+  const float dy = a.caNm[i * 3 + 1] - a.caNm[j * 3 + 1];
+  const float dz = a.caNm[i * 3 + 2] - a.caNm[j * 3 + 2];
+  const float d = sqrt(dx * dx + dy * dy + dz * dz);
+  // bucketize(right=false): the first limit NOT below d
+  const uint limits = a.dim - 1;
+  const float step = (a.dmax - a.dmin) / (float)(a.dim - 2);
+  uint bin = 0;
+  while (bin < limits && a.dmin + step * (float)bin < d) bin += 1;
+  device float* row = a.pair + r * a.stride + a.off;
+  for (uint k = 0; k < a.dim; ++k) row[k] = k == bin ? 1.f : 0.f;
+}
+
+kernel void rfd4p_sim_step(LF_ARGS(RfdStepArgs)) {
+  const ulong t = LF_INDEX;
+  if (t >= a.n) return;
+  const uint tok = lf_udiv((uint)(t / a.dim), 1);
+  const ulong token = t / a.dim;
+  const float live = a.emit[token] != 0.f ? 1.f : 0.f;
+  const float x = a.x[t], v = a.v[t];
+  a.x1[t] = live != 0.f ? x + (1.f - a.t) * v : 0.f;
+  // `vf_tsr` at t = 0 leaves x where it is (the rescaled velocity is zero there)
+  if (a.mode == 0u && a.t == 0.f) { if (live == 0.f) a.x[t] = 0.f; return; }
+  float delta;
+  if (a.mode == 1u) {
+    delta = v * a.dt;
+  } else {
+    const float score = (a.t * v - x) / (1.f - a.t);
+    if (a.mode == 2u && a.stochastic) {
+      delta = (v + a.gt * score) * a.dt + a.std * a.eps[t];
+    } else {
+      const float ss = score * a.r;
+      // 🔴 NOT `(x + (1 - t) ss) / t`, WHICH IS THE SAME NUMBER AND LOSES IT. At the first step t is 1e-3 and
+      // r is 1 to six figures, so `x + (1 - t) score r` subtracts two nearly equal quantities and then
+      // multiplies the remainder by 1000: in float32 the answer is rounding. The identity
+      //   (x + (1 - t) r (t v - x) / (1 - t)) / t = x (1 - r) / t + r v
+      // has no cancellation in it, and (1 - r) / t comes from the tsr ratio's closed form on the host, where
+      // 1 - r = A (1 - k) / k / (A / k + 1) with A = snr sigma^2 - exact for small A rather than 1 minus 1.
+      // Measured: the backbone's first step went 4.1e-4 against the reference to 5.7e-7.
+      const float vs = x * a.vsCoef + a.r * v;
+      delta = a.stochastic ? (vs + a.gt * ss) * a.dt + a.std * a.eps[t] : vs * a.dt;
+    }
+  }
+  a.x[t] = live != 0.f ? x + delta : 0.f;
+  (void)tok;
+}

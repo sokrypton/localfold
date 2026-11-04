@@ -122,3 +122,42 @@ void pairUpdate(int layer, const float* s, float* z);
 void heads(const float* s, float* bbCa, float* localLatents, float* logits, float* insertion);
 // one cycle's input: s = s_init + Lin(RMSNorm(s)), z = z_init + Lin(RMSNorm(z))
 void recycleIn(const float* sInit, const float* zInit, float* s, float* z);
+// the whole trunk over one step's features; `s` and `z` must start at zero, `insertion` may be null
+void trunkForward(const float* seqF, const float* cond0, const float* cond1, const float* pairF,
+                  const float* pairCondF, int nRecycle, float* s, float* z, float* bbCa, float* latents,
+                  float* logits, float* insertion);
+
+// ---------------------------------------------------------------- sampler.mm
+// The flow sampler: `shared/rfd4p/flow.js`'s schedules and `simulation_step`, over a generation exported by
+// `cuda/rfd4p/export_input.mjs --generate` (the features once, the noise replayed, the per-step conditioning
+// precomputed). What moves per step is 35 of the 897 sequence columns and the pair track's 30 distance bins.
+struct Modality {
+  std::vector<double> ts, gt;      // nsteps + 1 times, nsteps noise levels
+  int mode = 0;                    // 0 vf_tsr, 1 vf, 2 sc
+  double tsrK = 1, tsrSigma = 1, scn = 1, odeLim = 1, odeBelow = 0;
+  bool center = false;
+};
+// one modality's schedule, built from the exported sampling metadata (`samplingMeta`'s fields)
+Modality modalitySchedule(const char* tag, int nsteps);
+bool stochasticStep(double t, const Modality& m);
+// a whole generation from an exported `-gen` directory. When `GATE_CHECK` is set, every step's noised state and
+// clean estimate are held to the dump's own trajectory as they are produced.
+int generate(const std::string& genDir, const std::string& outPath);
+// the gate's comparison, set by main where there is an oracle to compare against: ours (on the device) against
+// the dump's tensor `key`, at `bound`, returning the relative RMS. Null when nothing is being held.
+extern double (*GATE_CHECK)(const char* label, const std::string& key, const float* ours, size_t n, double bound);
+extern double GATE_TRAJ_BOUND;
+
+// ---------------------------------------------------------------- output.mm
+// the decoder's C_SEQ: the job's conditioned residues kept, an emitted token with none taking the argmax of the
+// trunk's logits over its TOKEN TYPE's allowed residues. Returns how many it filled.
+int sequenceForDecoder(int n, const float* logits, const int* condSeq, const int* tokenType, const float* emit,
+                       int* seq);
+// the decoder's heads turned into a structure: the residue type, which of the 37 slots exist, and their
+// coordinates in angstrom (`decoderPostprocess` + `formatSampleLocalLatents`)
+void decoderPostprocess(int n, const float* caNm, const int* seq, const float* logits, const float* coorsFlat,
+                        const float* presence, const float* emit, const int* coordGroup, const int* attnIdx, int na,
+                        float* coors, uint8_t* atomMask, int* residueType);
+// the PDB, and the consecutive alpha-carbon spacing (median, min, max) as the geometry check
+int writePdb(const std::string& path, int n, const float* coors, const uint8_t* atomMask, const int* residueType,
+             const int* outResId, const int* outChain, const int* chainIid, double* caSpacing);

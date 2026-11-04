@@ -58,22 +58,28 @@ double check(const char* label, const std::string& name, const float* ours, size
   return r;
 }
 
+double checkFn(const char* label, const std::string& key, const float* ours, size_t n, double bound) {
+  return check(label, key, ours, n, bound);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
-  std::string input, bundle, oracle, encDir;
+  std::string input, bundle, oracle, encDir, genDir, outPath;
   for (int i = 1; i < argc; ++i) {
     const char* a = argv[i];
     if (!strncmp(a, "--bundle=", 9)) bundle = a + 9;
     else if (!strncmp(a, "--oracle=", 9)) oracle = a + 9;
     else if (!strncmp(a, "--encoder=", 10)) encDir = a + 10;
+    else if (!strncmp(a, "--gen=", 6)) genDir = a + 6;
+    else if (!strncmp(a, "--out=", 6)) outPath = a + 6;
     else if (!strcmp(a, "--f16")) HALF = true;
     else if (a[0] != '-') input = a;
     else die("unknown flag %s", a);
   }
   if (input.empty() || bundle.empty()) {
     fprintf(stderr, "usage: localfold-rfd4p <input dir> --bundle=<model-rfd4p-int8> [--oracle=<dir>] "
-                    "[--encoder=<dir>] [--f16]\n");
+                    "[--encoder=<dir>] [--gen=<dir>-gen] [--out=design.pdb] [--f16]\n");
     return 2;
   }
 
@@ -85,6 +91,13 @@ int main(int argc, char** argv) {
   if (!oracle.empty()) M.loadInput(oracle);
   // the encoder's own input directory and the reference's answer to it (`export_input.mjs --encoder`)
   if (!encDir.empty()) { M.loadInput(encDir); M.loadInput(encDir + "-oracle"); }
+  // a generation's exported inputs, and the reference's own trajectory over them where it was written
+  if (!genDir.empty()) {
+    M.loadInput(genDir);
+    const std::string go = genDir + "-oracle";
+    FILE* probe = fopen((go + "/model.idx").c_str(), "r");
+    if (probe) { fclose(probe); M.loadInput(go); }
+  }
   D_.n = (int)M.meta("meta/n");
   D_.nRecycle = (int)M.meta("meta/nRecycle", 1);
   const int n = D_.n;
@@ -375,7 +388,25 @@ int main(int argc, char** argv) {
       check("encoder zLatent", "e/zLatent", scatterEmitC(mean, "zl"), (size_t)n * ED_.latent, decChained);
     }
 
-    printf("%s (%.2f s)\n", FAILED ? "FAILED" : "all stages in band", now() - t0);
+    printf("%s so far (%.2f s)\n", FAILED ? "FAILED" : "every stage in band", now() - t0);
+  }
+
+  // ---- the flow sampler ---------------------------------------------------------------------------------
+  if (!genDir.empty()) {
+    checkDecoderDims();
+    GATE_CHECK = checkFn;
+    // 🔴 THE TRAJECTORY'S BOUND IS NOT A STAGE'S. Every step feeds the next, and the backbone's first step
+    // divides by t = 1e-3, so what a stage holds to 1e-6 arrives here multiplied; the per-step record is what
+    // says whether that is amplification (the numbers grow smoothly) or a wiring fault (one step jumps).
+    GATE_TRAJ_BOUND = HALF ? 1e-2 : 1e-4;
+    const int ran = generate(genDir, outPath);
+    printf("  the sampler ran %d steps\n", ran);
+    GATE_CHECK = nullptr;
+  }
+
+
+  if (!oracle.empty() || !genDir.empty()) {
+    printf("%s (%.2f s)\n", FAILED ? "FAILED" : "all green", now() - t0);
     return FAILED ? 1 : 0;
   }
   printf("the trunk's init products built in %.2f s (no --oracle= to hold them to)\n", now() - t0);
