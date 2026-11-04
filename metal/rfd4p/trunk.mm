@@ -104,8 +104,24 @@ void tokenLayer(int layer, float* s, Z z, const float* c, const half* cH, const 
   float* k = nullptr;
   float* g = nullptr;
   if (HALF) {
-    linH(nodeNh, MHA + "to_qkv.weight", qkvg, n, D, 3 * D, M.f("w/" + MHA + "to_qkv.bias"), false, 4 * D);
-    linH(nodeNh, MHA + "to_g.weight", qkvg + 3 * D, n, D, D, M.f("w/" + MHA + "to_g.bias"), false, 4 * D);
+    // 🔴 q, k, v AND THE GATE IN ONE GEMM, because they share their input and their output is one packed row.
+    // `to_qkv` is [3D][D] and `to_g` is [D][D], both reading the normed node track, and core's flash attention
+    // wants q | k | v | g contiguous at 0, D, 2D, 3D - so the two weights stacked into [4D][D] (derived once,
+    // as the triangle's four are) make ONE product whose natural layout IS that row. No output stride, no
+    // second dispatch. A dispatch costs the GPU ~0.25 ms here against this pair's ~0.6 ms of kernel, so the
+    // count is worth as much as the width: 419 dispatches a step was 46% overhead (main.mm has the measurement).
+    {
+      Gemm g2{};
+      g2.X = nodeNh; g2.tx = F16;
+      g2.W = weightStack(MHA + "qkvg", {MHA + "to_qkv.weight", MHA + "to_g.weight"});
+      g2.tw = F16; g2.transW = true;
+      g2.Y = qkvg; g2.ty = F16;
+      g2.rows = (size_t)n; g2.in = D; g2.out = 4 * D;
+      g2.bias = biasStack(MHA + "qkvg", {MHA + "to_qkv.bias", MHA + "to_g.bias"});
+      g2.tbias = F32; g2.half = true;
+      g2.label = "to_qkv+to_g";
+      gemm(g2);
+    }
     // q and k in ONE dispatch: independent, and a dispatch costs more than either (kernels.h says why)
     RfdRms2Args rqk{};
     rqk.xh = qkvg; rqk.yh = qkvg;

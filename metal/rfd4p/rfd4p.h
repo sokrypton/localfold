@@ -55,6 +55,8 @@ void linH(const half* X, const std::string& w, half* Y, size_t rows, int in, int
           int ldy = 0);
 void linHF(const half* X, const std::string& w, float* Y, size_t rows, int in, int out, const float* bias = nullptr,
            bool relu = false);
+// two or more biases concatenated, built once (the companion to `weightStack`)
+const float* biasStack(const std::string& key, const std::vector<std::string>& names);
 // a projection's weight with the RMSNorm before it folded in, so the normed activations never exist
 const half* weightTimesNorm(const std::string& key, const std::string& weight, const std::string& norm,
                             int out, int in);

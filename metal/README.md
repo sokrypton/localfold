@@ -513,6 +513,20 @@ for Metal as `weights.mm`, `chirality.mm`, `decoder.mm`, `encoder.mm`,
 | length, where no oracle reaches (400 tokens) | deterministic over 3 runs, converged CA-CA 3.85 A over [3.76, 3.94] |
 | half and float32 arithmetic | every arm runs both; `--f32` is the control |
 
+🔴 **AND THE TWO THINGS A READER WOULD ASK ABOUT THE OTHER PORTS' GATES.**
+metal/af3's RMSD column is empty for four cases - the DNA duplex, the methylated
+duplex, the kitchen sink and the glycan - and that is BY DESIGN, not an
+unexercised check: those cases are defined with `ref=None` (there is no crystal
+for a designed duplex or for AF3's kitchen sink) and the gate asserts them on
+pLDDT within `TOL_PLDDT` **and on ligand and nucleic BOND geometry within
+0.01 A**, which is the `ligand 0.043 nucleic 0.045` in those rows. metal/bioemu2
+is held to **two** webgpu reference dumps now, not one: 6mrr at 71 tokens (worst
+stage 8.4e-3) and `6mrr-gol-sep` at 86 - a glycerol and a phosphoserine, so a
+ligand and an atomised residue - at 9.3e-3, the same level. A third, 5caj at 255
+tokens, cannot be dumped at all: `tools/dump-bioemu2-webgpu.mjs` serialises the
+stages through a JSON string and V8 refuses at that size (`RangeError: Invalid
+string length`), which is the tool's limit and not the port's.
+
 ### What the mapping proves, and what the arms do
 
 The table below says WHERE each piece of cuda/rfd4p lives in metal/rfd4p. It

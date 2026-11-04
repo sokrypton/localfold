@@ -136,19 +136,33 @@
 // each dispatch a buffer of its own. It reports **228.1 ms a step over 11 buffers** against a 230.6 ms wall.
 // So the GPU is busy ~100% of the step and the port is GPU-BOUND - and the 105 ms between 228.1 and 123.2 is
 // GPU-side overhead spread over 419 dispatches, about **0.25 ms each**.
-// 🔴 SO THE LEVER IS THE DISPATCH COUNT, AND THE CENSUS SAYS WHERE: `rfd4p_rms_norm` runs **51 times for
-// 1.87 ms** of kernel, `rfd4p_adaln_rows` **28 times for 0.65 ms**. Those are not kernels to make faster, they
-// are dispatches to stop making. It also explains why the gate's fusion paid 5.2% for a kernel share that
-// looked smaller: it removed 14 dispatches as well as two passes over four planes.
-// 🔴 AND ONE MERGE IS TAKEN, WITH ITS WALL EFFECT HONESTLY UNMEASURABLE HERE. q and k are the one pair of
-// independent norms (both read `to_qkv`'s output and write different slices; the node norm before them and the
-// two adaLNs are sequential, since the transition's reads `s` after the attention), so they are one dispatch
-// now: **419 dispatches to 405 and 123.2 ms of kernel to 119.8**. The predicted wall gain is 14 x 0.25 =
-// 3.6 ms a step, 1.6%, and this laptop cannot show it: after a long benchmarking session it drifts **52%**
-// across eight runs, and consecutive runs of the SAME binary differ by 0.6 s. Both orderings were taken, and
-// the sign follows the order rather than the arm - ABAB +0.73 / +1.40 / +0.51 / +0.17 s, BABA -0.20 / -0.76 /
-// -0.44 - so whichever arm runs second loses. Kept on the dispatch count and the kernel sum, which are not
-// thermal; not claimed as a wall win.
+// 🔴 AND THE OBVIOUS INFERENCE FROM THAT - "SO REMOVING A DISPATCH SAVES 0.25 ms" - IS WRONG, TESTED. The
+// census says where they are: `rfd4p_rms_norm` ran **51 times a step for 1.87 ms** of kernel,
+// `rfd4p_adaln_rows` **28 times for 0.65 ms**. Two pairs that share an input were merged, taking **419
+// dispatches a step to 391** with the kernel sum 123.2 ms to 119.4 - so 28 dispatches went and no arithmetic
+// came back:
+//   * `to_qkv` [3D][D] and `to_g` [D][D] into one [4D][D] product, whose natural layout IS core's packed
+//     q | k | v | g row - the output stride the two-GEMM form needed went with it;
+//   * q's and k's RMSNorms into one dispatch (independent: both read `to_qkv`'s output, different slices).
+// The model predicts 28 x 0.25 = 7 ms a step, 3%. Measured in both orderings: AB -0.12 / +0.82 / +0.21 s,
+// BA -0.10 / +0.11 / +0.39 - a mean of **+0.22 s, which is nothing, or marginally worse**. So the 105 ms is
+// NOT proportional to the dispatch count over the range this port can vary it.
+// WHAT IS ESTABLISHED: the GPU is busy for essentially the whole step (228.1 against a 230.6 ms wall), so
+// there is no host-side lever; the per-dispatch profile sums 123.2 ms over all 419, none of them unlabelled;
+// and the difference is real GPU time that no kernel accounts for. WHAT IS NOT: what it is. Three
+// explanations have failed - a spurious `sync` (hoisted, no change), unlabelled work (there is none), and the
+// dispatch count (above) - and the candidate left is that the per-dispatch timestamps UNDER-report what a
+// kernel costs inside a real command buffer, in which case there is nothing between the kernels to remove and
+// the roofline table above is computed against an under-count. Telling that apart needs a GPU trace.
+// 🔴 THE MERGES ARE KEPT, AND NOT AS A SPEED WIN: one GEMM where there were two, one dispatch where there
+// were two, a stride trick gone, 28 fewer dispatches, 3.8 ms less kernel time - facts about the code rather
+// than about this laptop's temperature. What cannot merge, so the next reader does not try: the two adaLNs a
+// layer are sequential (the transition's reads `s` after the attention), the node norm precedes q and k, and
+// the triangle's `linear_z` and `linear_g` read different tensors (`xn` and `zn`).
+// 🔴 AND NOTHING BELOW A FEW PERCENT CAN BE MEASURED ON THIS MACHINE ANY MORE. After a long session the job
+// that runs in 12.8 s cool takes **22.4 s**, and consecutive runs of ONE binary differ by 0.5 s. Every number
+// in this file above 4% was taken interleaved and survived both orderings; nothing smaller should be believed
+// from here without a cold machine.
 //
 // So no kernel here is worth another tile sweep. The lever left is FEWER PASSES OVER THE PAIR TRACK - fusing an
 // elementwise pass into the epilogue of the GEMM that produced it, as the gate, the residual and the next

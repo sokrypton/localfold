@@ -201,6 +201,23 @@ const half* weightTimesNorm(const std::string& key, const std::string& weight, c
   });
 }
 
+/** Two or more biases concatenated, built once: the companion to `weightStack`. */
+const float* biasStack(const std::string& key, const std::vector<std::string>& names) {
+  size_t total = 0;
+  for (const std::string& n : names) total += M.len("w/" + n);
+  return M.derived<float>("bstack:" + key, total, [&](float* p) {
+    std::vector<float> host(total);
+    size_t at = 0;
+    for (const std::string& n : names) {
+      const size_t len = M.len("w/" + n);
+      const float* w = M.hostF("w/" + n);
+      for (size_t i = 0; i < len; ++i) host[at + i] = w[i];
+      at += len;
+    }
+    upload(p, host.data(), total * 4);
+  });
+}
+
 int condStride(int layers, int dim) { return layers * 4 * dim; }
 
 const float* precomputeCond(const float* c, size_t rows, int layers, int dim, int condDim) {
