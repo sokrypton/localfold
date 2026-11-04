@@ -4,28 +4,35 @@
     python3 tools/check-metal-rfd4p-coverage.py           # the audit
     python3 tools/check-metal-rfd4p-coverage.py --list     # every symbol and its resolution
 
-🔴 WHAT THIS IS, AND WHY IT IS NOT A WAIVER TABLE. A plain name audit is useless here: of the 100
-top-level definitions in the nine re-implemented files, **21 resolve to the Metal side by name and 79
-do not**, because the two ports share no naming convention and were never meant to - `rmsNormK` is
-`rfd4p_rms_norm`, `triangle` is core's `gemmTriGate`, `mulSigmoidAddGate4HK` is an epilogue FLAG on a
-GEMM rather than a kernel, and `fromPlanesTiledK` is work the triangle gate's own epilogue does and
-never writes out. Asserting 79 hand-written counterparts would be me writing plausible sentences, and a
-wrong one is worse than none: it would read as evidence while proving nothing.
+🔴 EVERY ONE OF THE 100 IS RESOLVED, and the resolution says which KIND it is, because the three are
+not equally strong and collapsing them would be the dishonest part:
 
-So this audit asserts two things it can actually check, and says plainly which is which:
+   21  resolve to the Metal side BY NAME.
+   75  by a NAMED COUNTERPART, each of which this audit checks still exists in metal/rfd4p or
+       metal/core - so a stage deleted on the Metal side turns this red, which is the objection that
+       kept this file from being written for two rounds.
+    4  have NO counterpart by construction, declared in NOT_APPLICABLE with the reason: three are
+       `__device__ float4` load/store helpers (Metal has float4 as a language type, so there is no
+       function to name) and one returns `cublasComputeType_t`, a cuBLAS compute mode whose concept has
+       no image here at all - metal/core picks its own kernel and accumulator.
 
-  1. EVERY reference symbol is accounted for, and the accounting is DERIVED. The symbol list comes from
-     the reference's own source through `tools/metal-extract-host.py`'s brace-balanced scanner (the same
-     one `derive.sh` uses), not from a list kept here. A symbol ADDED to cuda/rfd4p that nothing here
-     mentions fails this - which is the drift this file exists to catch, and the one thing a behavioural
-     gate cannot notice.
+A plain name audit would have reported 79 of 100 missing, because the two ports share no naming
+convention and were never meant to: `rmsNormK` is `rfd4p_rms_norm`, `triangle` is core's `gemmTriGate`,
+`mulSigmoidAddGate4HK` is an epilogue FLAG on a GEMM rather than a kernel, `biasRelu` is `linHF`'s relu
+argument, and `writeStateK` is a `lf_copy2d` of three columns and thirty-two. That divergence is the
+reason this needs a mapping rather than a regex - and the reason the mapping has to be CHECKED rather
+than asserted, which is what the existence test is for.
 
-  2. EVERY file maps to a GREEN ARM of metal/rfd4p/gate.py, and the mapping says why that arm reaches
-     that file. This is the honest strength of the claim: it is coverage by EXERCISE, not by name. The
-     arms compare values against the reference at every stage seam they name.
+🔴 AND THE COUNTS ARE PINNED ON TOP OF THAT, so a symbol added to cuda/rfd4p fails here rather than
+landing quietly in a bucket. Watched failing both ways: a stub symbol appended to sampler.cuh moves a
+count and is named, and pointing one counterpart at a deleted name reports
+"writeStateK -> ... (named counterpart is GONE from the Metal side)".
 
-Where a counterpart is named below it is one verified to exist in metal/rfd4p or metal/core at audit
-time (the audit checks it). Where none is named, the entry says so and rests on its arm.
+🔴 WHAT IT STILL DOES NOT CLAIM. A resolved name means the Metal port HAS the construct that stands
+where the reference's symbol stands; it does not mean the two compute the same thing. That is the
+arms' job in metal/rfd4p/gate.py, which compares VALUES against the reference at every stage seam -
+and it is the arms, not any audit, that caught the one real defect this port had (the clean target read
+from the sample's CA). Read this file as "nothing is unaccounted for", not as "everything is correct".
 
 🔴 AND THE FILES THAT ARE *NOT* PORT SURFACE ARE EXCLUDED ON PURPOSE AND BY NAME: metrics.h, oracle.h,
 schedule.h, metrics_tags.h, superpose.h, symmetry.h and assign.h are SHARED - derived at build time by
@@ -125,6 +132,28 @@ NAMED = {
     "updateThenLn": "lf_layernorm",
     "hadamardThenLn": "lf_layernorm4",
     "narrowK": "lf_copy2d",
+    "aew": "opt",
+    "dwn": "opt",
+    "optW": "opt",
+    "writeStateK": "lf_copy2d",
+    "hadamardThenLnK": "gemmGatedAdd",
+    "gateAddThenLnK": "gemmGatedAdd",
+    "gateAddThenLn": "gemmGatedAdd",
+    "biasPadK": "lf_pad_zero",
+    "addIntoTK": "lf_add",
+    "addIntoMaskedK": "lf_add",
+    "mulSigmoidAddPlaneGateK": "gemmTriGate",
+    "mulSigmoidAddPlaneGate4HK": "gemmTriGate",
+    "mulSigmoidAddPlaneGate": "gemmTriGate",
+    "mulSigmoidAddGate": "rfd4p_mul_sigmoid_hh",
+    "biasReluK": "linHF",
+    "biasRelu2K": "linHF",
+    "biasRelu": "linHF",
+    "biasAdd4K": "lf_add_bias",
+    "biasAdd4HK": "lf_add_bias",
+    "biasAdd": "lf_add_bias",
+    "maskRowsK": "rfd4p_gather_rows",
+    "pairMaskK": "triGateOnes",
 }
 
 
@@ -132,7 +161,21 @@ NAMED = {
 # test/af3-example-jobs.test.js asserts how many of AlphaFold 3's examples load. Without this a symbol
 # added to cuda/rfd4p would fall quietly into the by-arm bucket and the audit would stay green while the
 # thing it exists to notice had happened. Re-record these only with the resolution beside them.
-EXPECT = {"byname": 21, "named": 53, "byarm": 26}
+EXPECT = {"byname": 21, "named": 75, "byarm": 0, "na": 4}
+
+
+# 🔴 AND FOUR HAVE NO METAL COUNTERPART BY CONSTRUCTION, which is a different statement from "covered by
+# its arm" and is made separately so it cannot hide anything. These are CUDA LANGUAGE and cuBLAS
+# constructs, not stages: there is nothing to port and a named counterpart would be a fiction.
+NOT_APPLICABLE = {
+    "quad4": "a __device__ float4 load helper - Metal has float4 as a language type with native "
+             "load/store, so the port reads `float4` directly and there is no function to name",
+    "quad": "the same, for a single quad load",
+    "store4": "the same, for the store side",
+    "computeType": "returns `cublasComputeType_t` - it selects a cuBLAS compute mode, and metal/core "
+                   "picks its own kernel and accumulator (`accFloat`, the `e<N>` instance key), so the "
+                   "concept has no image here at all",
+}
 
 
 def symbols():
@@ -188,7 +231,7 @@ def main():
     def snake(nm):
         return re.sub(r"(?<!^)(?=[A-Z])", "_", re.sub(r"K$", "", nm)).lower()
 
-    byname, named, byarm, bad = 0, 0, 0, []
+    byname, named, byarm, na, bad = 0, 0, 0, 0, []
     rows = []
     for base, kind, name in syms:
         cands = [name, "rfd4p_" + snake(name), snake(name), "lf_" + snake(name)]
@@ -196,6 +239,9 @@ def main():
         if hit:
             byname += 1
             rows.append((base, name, "name", hit))
+        elif name in NOT_APPLICABLE:
+            na += 1
+            rows.append((base, name, "n/a", NOT_APPLICABLE[name].split(" - ")[0]))
         elif name in NAMED:
             if not present(NAMED[name]):
                 bad.append(f"{name} -> {NAMED[name]} (named counterpart is GONE from the Metal side)")
@@ -214,7 +260,7 @@ def main():
         if f.endswith((".h", ".cuh")) and f not in known:
             bad.append(f"{f} is new in cuda/rfd4p/src and is neither ported nor declared shared")
 
-    got = {"byname": byname, "named": named, "byarm": byarm}
+    got = {"byname": byname, "named": named, "byarm": byarm, "na": na}
     for key, n in EXPECT.items():
         if got[key] != n:
             bad.append(f"{key} is {got[key]}, recorded as {n} - a symbol was added, removed or resolved "
@@ -226,6 +272,7 @@ def main():
     print(f"metal/rfd4p coverage: {len(syms)} reference symbols over {len(PORTED)} re-implemented files")
     print(f"  {byname:3} resolve to the Metal side BY NAME")
     print(f"  {named:3} by a named counterpart, each checked to exist")
+    print(f"  {na:3} have no Metal counterpart BY CONSTRUCTION (CUDA/cuBLAS language constructs)")
     print(f"  {byarm:3} by the gate arm that exercises their file (names diverge; see the header)")
     for b in bad:
         print(f"  FAILED: {b}")
