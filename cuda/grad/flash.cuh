@@ -681,9 +681,21 @@ __device__ __forceinline__ float keyAdd(const Sdpa& a, int b, int h, int k) {
 }
 constexpr int LB = BC + 8;   // a bf16 [q][k] tile's row stride
 
-template <int D>
+__device__ __forceinline__ float ldOut(const float* p) { return *p; }
+__device__ __forceinline__ float ldOut(const __nv_bfloat16* p) { return __bfloat162float(*p); }
+__device__ __forceinline__ void stOut(float* p, float v) { *p = v; }
+__device__ __forceinline__ void stOut(__nv_bfloat16* p, float v) { *p = __float2bfloat16(v); }
+// two adjacent elements as one store where the address allows (an even column of an even row stride)
+__device__ __forceinline__ void st2(float* p, float a, float b) {
+  if (((uintptr_t)p & 7) == 0) *reinterpret_cast<float2*>(p) = make_float2(a, b); else { p[0] = a; p[1] = b; }
+}
+__device__ __forceinline__ void st2(__nv_bfloat16* p, float a, float b) {
+  if (((uintptr_t)p & 3) == 0) *reinterpret_cast<__nv_bfloat162*>(p) = __floats2bfloat162_rn(a, b);
+  else { p[0] = __float2bfloat16(a); p[1] = __float2bfloat16(b); }
+}
+template <int D, class OT = float>   // (OT: o written float, or bf16 for a module that keeps it so)
 __global__ void __launch_bounds__(THREADS) fwdBf(Sdpa a, BiasTile bt, HSrc qs_, HSrc ks_, HSrc vs_,
-                                                 float* __restrict__ o, int ldo,
+                                                 OT* __restrict__ o, int ldo,
                                                  float* __restrict__ lse) {
   constexpr int DP = padD<D>(), LK = ldBf<D>();
   extern __shared__ __align__(16) float sm[];
@@ -815,7 +827,7 @@ __global__ void __launch_bounds__(THREADS) fwdBf(Sdpa a, BiasTile bt, HSrc qs_, 
     if (it + 1 < nk && threadIdx.x < BC) { KA[(st ^ 1) * BC + threadIdx.x] = nka; KS[(st ^ 1) * BC + threadIdx.x] = nks; }
     __syncthreads();   // this stage is the one the next iteration's issue overwrites
   }
-  float* ob = o + (size_t)b * a.Q * ldo + h * D;
+  OT* ob = o + (size_t)b * a.Q * ldo + h * D;
 #pragma unroll
   for (int r = 0; r < 2; ++r) {
     const int qq = qr0 + g + r * 8;
@@ -823,8 +835,7 @@ __global__ void __launch_bounds__(THREADS) fwdBf(Sdpa a, BiasTile bt, HSrc qs_, 
     const float inv = sum[r] > 0.f ? 1.f / sum[r] : 0.f;
 #pragma unroll
     for (int n = 0; n < D / 8; ++n) {
-      ob[(long long)qq * ldo + n * 8 + 2 * t] = oacc[n][r * 2] * inv;
-      ob[(long long)qq * ldo + n * 8 + 2 * t + 1] = oacc[n][r * 2 + 1] * inv;
+      st2(ob + (long long)qq * ldo + n * 8 + 2 * t, oacc[n][r * 2] * inv, oacc[n][r * 2 + 1] * inv);
     }
     if (t == 0) {
       const size_t i = bh * a.Q + qq, N = (size_t)a.B * a.H * a.Q;
@@ -841,18 +852,6 @@ inline size_t fwdBfSmem() { return 2 * (4 * BC * ldBf<D>() + 2 * BR * LB) + 4 * 
 // (A = P^T, dS^T from the accumulators; B = dO, Q by ldmatrix.trans), dQ = dS K (A = dS, B = K by ldmatrix.trans).
 // dS takes the bias tile's place in shared memory, element by element (the thread that reads a bias writes its dS),
 // as bf16 - what a bf16 run's logits gradient is - for dQ and the bias gradients.
-__device__ __forceinline__ float ldOut(const float* p) { return *p; }
-__device__ __forceinline__ float ldOut(const __nv_bfloat16* p) { return __bfloat162float(*p); }
-__device__ __forceinline__ void stOut(float* p, float v) { *p = v; }
-__device__ __forceinline__ void stOut(__nv_bfloat16* p, float v) { *p = __float2bfloat16(v); }
-// two adjacent elements as one store where the address allows (an even column of an even row stride)
-__device__ __forceinline__ void st2(float* p, float a, float b) {
-  if (((uintptr_t)p & 7) == 0) *reinterpret_cast<float2*>(p) = make_float2(a, b); else { p[0] = a; p[1] = b; }
-}
-__device__ __forceinline__ void st2(__nv_bfloat16* p, float a, float b) {
-  if (((uintptr_t)p & 3) == 0) *reinterpret_cast<__nv_bfloat162*>(p) = __floats2bfloat162_rn(a, b);
-  else { p[0] = __float2bfloat16(a); p[1] = __float2bfloat16(b); }
-}
 constexpr double FIXED = 1099511627776.0;   // 2^40: |a gradient| to 8e6, resolved to 1e-12
 __global__ void fromFixedK(float* g, const unsigned long long* f, size_t n) {
   const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -1088,18 +1087,18 @@ inline HSrc hsrc(const X* x, int ld, int B, int N, int H) {
   s.N = Np; s.W = DP;
   return s;
 }
-template <int D, class X>
+template <int D, class X, class OT = float>
 inline void forwardBf(const Sdpa& a, const X* q, int ldq, const X* k, int ldk, const X* v, int ldv,
-                      float* o, int ldo, float* lse) {
+                      OT* o, int ldo, float* lse) {
   Scratch scratch;
   const int Npq = (a.Q + 63) / 64 * 64, Npk = (a.K + 63) / 64 * 64;
   const HSrc qs_ = hsrc<D>(q, ldq, a.B, a.Q, a.H), ks_ = hsrc<D>(k, ldk, a.B, a.K, a.H), vs_ = hsrc<D>(v, ldv, a.B, a.K, a.H);
   static bool attr = false;
   const size_t smem = fwdBfSmem<D>();
-  if (!attr) { GK(cudaFuncSetAttribute(fwdBf<D>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem)); attr = true; }
+  if (!attr) { GK(cudaFuncSetAttribute(fwdBf<D, OT>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem)); attr = true; }
   const BiasTile bt = biasBf(a, Npq, Npk);
   const size_t grid = (size_t)((a.Q + BR - 1) / BR) * a.H * a.B;
-  fwdBf<D><<<(unsigned)grid, THREADS, smem, STREAM>>>(a, bt, qs_, ks_, vs_, o, ldo, lse);
+  fwdBf<D, OT><<<(unsigned)grid, THREADS, smem, STREAM>>>(a, bt, qs_, ks_, vs_, o, ldo, lse);
 }
 template <int D, class X, class DKV = float, class DOT = float>
 inline void backwardBf(const Sdpa& a, const X* q, int ldq, const X* k, int ldk, const X* v, int ldv,
@@ -1195,8 +1194,9 @@ inline bool runBackward(const Sdpa& a, const float* q, int ldq, const float* k, 
   else { FLASH_DISPATCH(a.D, (backward<DD, 1>(a, q, ldq, k, ldk, v, ldv, dO, lddo, lse, Di, dq, lddq, dk, lddk, dv, lddv, accK, accV))) }
 }
 // q, k, v already bf16 (a module on bf16 storage): the bf16 kernels, whatever D they support (8 included, padded)
+template <class OT>
 inline bool runForwardBfIn(const Sdpa& a, const __nv_bfloat16* q, int ldq, const __nv_bfloat16* k, int ldk,
-                           const __nv_bfloat16* v, int ldv, float* o, int ldo, float* lse) {
+                           const __nv_bfloat16* v, int ldv, OT* o, int ldo, float* lse) {
   FLASH_DISPATCH(a.D, (forwardBf<DD>(a, q, ldq, k, ldk, v, ldv, o, ldo, lse)))
 }
 template <class DKV, class DOT>

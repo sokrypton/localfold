@@ -175,12 +175,13 @@ inline GridSave gridForwardBf(const GridAttn& g, const Dialect& d, const real* p
     if (roles[r]->hasBias) biasAddLdK<<<blocks(nn * HD), 256, 0, STREAM>>>(qkvg + r * HD, roles[r]->b.w, nn, HD, P);
   bf *q = qkvg, *k = q + HD, *v = k + HD, *gt = v + HD;
   gateSigLdBfK<<<blocks(nn * HD), 256, 0, STREAM>>>(gt, nn, HD, P);
-  s.o = ARENA.get(nn * HD);
-  { const Sdpa sd_ = gridSdpa(g, n, g.transpose ? maskT : mask, s.nb); s.lse = ARENA.get((size_t)2 * sd_.B * sd_.H * sd_.Q); sdpaForwardBf(sd_, q, P, k, P, v, P, s.o, HD, s.lse); }
+  bf* ob = bfGet(nn * HD);   // the attention's output in bf16
+  s.o = reinterpret_cast<real*>(ob);
+  { const Sdpa sd_ = gridSdpa(g, n, g.transpose ? maskT : mask, s.nb); s.lse = ARENA.get((size_t)2 * sd_.B * sd_.H * sd_.Q); sdpaForwardBf(sd_, q, P, k, P, v, P, ob, HD, s.lse); }
   s.xn = reinterpret_cast<real*>(xn); s.act = reinterpret_cast<real*>(act); s.qkvg = reinterpret_cast<real*>(qkvg);
   s.W = reinterpret_cast<real*>(W);
   bf* og = bfGet(nn * HD);   // (kept for the output projection's weight gradient)
-  gateMulBfK<<<blocks(nn * HD), 256, 0, STREAM>>>(og, s.o, gt, nn, HD, P);
+  gateMulBfK<<<blocks(nn * HD), 256, 0, STREAM>>>(og, ob, gt, nn, HD, P);
   s.og = og;
   Scratch scratch;
   if (!g.transpose || g.untransposedResidual) { linearFwdBf(g.out, og, out, nn, 1.f); return s; }
@@ -207,18 +208,19 @@ inline void gridBackwardBf(GridAttn& g, const Dialect& d, const GridSave& s, con
   const bf* dyb;
   if constexpr (sizeof(PD) == 2) dyb = dy; else dyb = toBf(dy, nn * g.C);
   const bf* og = static_cast<const bf*>(s.og);
-  real* dog = ARENA.get(nn * HD);
+  bf* dog = bfGet(nn * HD);
   linearBwdBf(g.out, og, dyb, dog, nn);
+  const bf* ob = reinterpret_cast<const bf*>(s.o);
   // d q, k, v, gate straight into one bf16 [nn, 4 HD]: dq through float (its atomics'), dk, dv from the attention,
   // the gate's from its backward, which also forms the softmax backward's row term
   bf* dqkvg = bfGet(nn * P);
   bf* dO = bfGet(nn * HD);   // (bf16: the attention reads it in place, and its row term is formed here)
   real* Di = ARENA.get(nn * g.H);
-  gateBwdLdDiBfK<<<blocks(nn * g.H * 32), 256, 0, STREAM>>>(dog, s.o, gt, dO, dqkvg + 3 * HD, Di, nn, g.H, g.D, P, n);
+  gateBwdLdDiBfK<<<blocks(nn * g.H * 32), 256, 0, STREAM>>>(dog, ob, gt, dO, dqkvg + 3 * HD, Di, nn, g.H, g.D, P, n);
   real* dq = ARENA.get(nn * HD);
   real* dnb = ARENA.zeros(nn * g.H);
   sdpaBackwardBf(gridSdpa(g, n, g.transpose ? maskT : mask, s.nb, dnb), q, P, k, P, v, P, dO, HD, dq, HD,
-                 dqkvg + HD, P, dqkvg + 2 * HD, P, s.o, HD, s.lse, Di);
+                 dqkvg + HD, P, dqkvg + 2 * HD, P, nullptr, HD, s.lse, Di);
   narrowRowsK<<<blocks(nn * HD), 256, 0, STREAM>>>(dq, dqkvg, HD, P, nn);
   const Linear* roles[4] = {&g.q, &g.k, &g.v, &g.gate};
   for (int r = 0; r < 4; ++r)
