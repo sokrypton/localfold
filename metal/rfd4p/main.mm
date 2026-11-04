@@ -187,6 +187,25 @@
 // What is left open is only the ATTRIBUTION - which kernel's traffic, and that needs Metal System Trace, which
 // an M5 will not give a compute encoder (the probe is in core.mm). The SHAPE is settled, and the shape is what
 // chooses the work: a pass removed from the pair track takes its profiled time AND its share of the gap.
+//
+// 🔴 AND A SYMBOL-LEVEL AUDIT OF THIS PORT'S COVERAGE IS THE WRONG INSTRUMENT, WHICH IS WORTH WRITING DOWN
+// BECAUSE IT LOOKS LIKE THE RIGHT ONE. The question it answers - "is every part of `cuda/rfd4p` ported?" -
+// is the question that matters, and an earlier pass over it by hand left 28 names unmatched and settled them
+// by assertion, which is exactly what a derived gate should replace. So it was built far enough to price:
+// extract every top-level definition from the files this port RE-IMPLEMENTS (bundle, chirality, decoder,
+// encoder, ops, partial, sampler, trunk, and generate.cuh's three kernels - metrics.h, oracle.h, schedule.h,
+// metrics_tags.h, superpose.h, symmetry.h and assign.h are SHARED, derived by derive.sh or included outright,
+// so they are not port surface at all), then look each name up on the Metal side. **15 of 100 are there.**
+// The other 85 are absent because the two ports share no naming convention and are not meant to:
+// `rmsNormK` is `rfd4p_rms_norm`, `triangle` is core's `gemmTriGate`, `mulSigmoidAddGate4HK` is an epilogue
+// FLAG on a GEMM rather than a kernel at all, and `fromPlanesTiledK` is work this port does in the triangle
+// gate's own epilogue and never writes out. A gate over those 85 is a waiver table with 85 reasons in it -
+// the same hand-assertion, in a file, wearing a tool's authority, and it would go green on a port that had
+// deleted a stage as readily as on one that kept it.
+// What settles coverage here is the oracle, because it compares VALUES at every stage seam rather than names:
+// 100 comparisons at 67 tokens and 100 at 183, each a named seam of the reference's own forward, plus the
+// trajectory arms under `--gen=`. A stage this port had dropped or mis-wired cannot pass a seam it has to
+// produce. The names are a map of two codebases; the seams are the arithmetic, and the arithmetic is the port.
 // 🔴 THE MERGES ARE KEPT, AND NOT AS A SPEED WIN: one GEMM where there were two (`to_qkv` [3D][D] and `to_g`
 // [D][D] stacked into [4D][D], whose natural layout IS core's packed q | k | v | g row, so the output stride
 // the two-GEMM form needed went with it), one dispatch where there were two (q's and k's RMSNorms, the only
