@@ -442,18 +442,41 @@ struct Device {
     // first could not, so for a family that does not fill the device the delta is a LOWER BOUND on its
     // share; for one that saturates it, the delta is its cost. Read it with the dispatch's own occupancy.
     //
-    // 🔴 MEASURED: THE MECHANISM IS VALIDATED AND THE FIRST TIMING WAS NOISE. Against metal/rfd4p's 100
-    // comparison oracle at n = 100, duplication is bit-identical for `triangle gate`, `gated add`,
-    // `pair-transition-out`, `rfd4p_adaln_rows` and `lf_center_norm` - and `rfd4p_rms_norm` FAILS it, which
-    // is correct: that kernel normalises in place, so a second pass renormalises an already-normalised row.
-    // So the check earns its place on its first run by refusing one family of six rather than mispricing it.
-    // The timing, though, is NOT yet taken: an ABBA pilot on the 183-token / 60-step job gave control arms
-    // 37.94 and 41.94 s against duplicated arms 40.70 and 42.14, then 41.65 / 39.83 against 36.34 / 41.10 -
-    // a duplicated-arm MEAN BELOW the control's, which is impossible and so is a statement about the
-    // machine, not the kernel. Two CPU-bound exporters were running and this Mac's thermal drift at this
-    // length is several seconds (main.mm records 225.7 ms a step cool against 571.7 hot). An attribution
-    // from this knob needs an idle machine and enough rounds to put the sd below the effect; the knob is
-    // committed because the mechanism and its falsification are what took the work, not the number.
+    // 🔴 AND THE FIRST REPORT FROM THIS KNOB WAS VACUOUS FOR THREE OF ITS FIVE FAMILIES - the correction is
+    // kept because it is the lesson. `LOCALFOLD_DUP="triangle gate"` matched NOTHING: the GEMM sites built
+    // their dispatch label only `if (D().profileOn)` (see `dupLabelWanted` above), so with profiling off
+    // every GEMM dispatch was unlabelled, the oracle passed trivially, and "bit-identical under duplication"
+    // was reported for three families that had never been duplicated. THE DISPATCH COUNT IS THE TELL and is
+    // now how every family is admitted: +0 of 5675 is no match, where `rfd4p_rms_norm` is +461 and a bare
+    // `gemm` is +2713, exactly the GEMM count. Checking that the arm MOVED the thing it names costs one run.
+    //
+    // 🔴 THE REAL SAFETY MAP, with the labels matching and each delta confirmed against the profile's own
+    // per-pass counts (triangle gate +196 = 14 a pass x 14 passes, gated add +588 = 42, pair-transition-out
+    // +98 = 7, attention +196 = 14): bit-identical for `triangle gate`, `attention`, `rfd4p_adaln_rows` and
+    // `lf_center_norm`; REFUSED for `gated add`, `pair-transition-out` and `rfd4p_rms_norm`. The refusals are
+    // exactly the kernels whose names say they ACCUMULATE into their output - a residual add, a transition's
+    // residual store, an in-place norm - so a second pass adds or renormalises twice. The knob prices the
+    // four and declines the three rather than mispricing them.
+    //
+    // 🔴 AND THE ATTRIBUTION, ABBA on an idle machine, 180 tokens, GPU-busy ms a PASS (sd 0.33 ms on 123.6,
+    // 0.27%, so these are resolved; the A arms drift +4% across the sweep and the ABBA brackets cancel it):
+    //
+    //     family               delta a pass    share of a 124 ms pass
+    //     triangle gate            31.2 ms            25.1%
+    //     lf_center_norm            4.3 ms             3.4%
+    //     attention                 0.2 ms             0.1%
+    //     rfd4p_adaln_rows          0.2 ms             0.1%
+    //
+    // The triangle's gate at 25.1% agrees with the profile's independent 22.1%, by a different instrument in
+    // a different form (batched marginal cost against buffer-per-dispatch GPU time), which is the first
+    // cross-check this port's step attribution has had. It confirms the lever main.mm already names.
+    //
+    // 🔴 AND READ THE 0.1% CORRECTLY, BECAUSE IT IS NOT "ATTENTION IS FREE". It is a MARGINAL cost: doubling
+    // every attention dispatch costs 0.2 ms, so there is spare capacity in whatever resource attention uses
+    // and no attention change can pay here - but it does NOT say attention is 0.1% of a pass. A starved
+    // dispatch's second copy overlaps with work the first could not. The same caveat caps the other three
+    // from below. What the table licenses is a ranking of what MORE work costs, which is exactly the question
+    // "is this worth optimising" asks, and it says: the pair track, and nothing else.
     static const char* dupWant = getenv("LOCALFOLD_DUP");
     if (dupWant && *dupWant && label && strstr(label, dupWant)) {
       static const int dupN = getenv("LOCALFOLD_DUP_N") ? atoi(getenv("LOCALFOLD_DUP_N")) : 1;
@@ -821,6 +844,19 @@ bool tensorWanted() {
   const char* e = getenv("LOCALFOLD_GEMM_TENSOR");
   return D().tensorOps && !(e && !strcmp(e, "0"));
 }
+// 🔴 THE DISPATCH LABEL MUST EXIST FOR `LOCALFOLD_DUP` TOO, NOT ONLY UNDER THE PROFILE - and this is the
+// correction to a measurement that was VACUOUS. Both GEMM sites below composed `lab` only `if
+// (D().profileOn)` and otherwise passed `nullptr`, so with profiling off every GEMM dispatch was UNLABELLED
+// and `LOCALFOLD_DUP="triangle gate"` matched nothing at all. Its oracle then passed trivially, and three
+// families were reported "bit-identical under duplication" having never been duplicated: the dispatch count
+// is the tell, +0 of 5675 where `rfd4p_rms_norm` is +461 and a bare `gemm` is +2713 (exactly the GEMM count).
+// A control that cannot vary the thing under test is not a control, which is this tree's own recurring
+// lesson and was walked into anyway. The label is cheap (one snprintf a dispatch) and only built when one of
+// the two switches asks for it.
+static bool dupLabelWanted() {
+  static const char* e = getenv("LOCALFOLD_DUP");
+  return e && *e;
+}
 bool gemmTensorRun(DT tc_, GemmArgs a, int batch, bool accFloat, const char* label) {
   static const bool floatAcc = getenv("LOCALFOLD_GEMM_FLOAT_ACC") && strcmp(getenv("LOCALFOLD_GEMM_FLOAT_ACC"), "0") != 0;
   // a half output takes a half destination even where the caller asked for float accumulation: the matrix units sum a
@@ -929,7 +965,7 @@ bool gemmTensorRun(DT tc_, GemmArgs a, int batch, bool accFloat, const char* lab
   const uint32_t gx = (lnEmit && (!(a.epilogue & 8192) || a.m == a.tgN)) ? 1u : (uint32_t)((a.m + tn - 1) / tn);
   Grid grid{gx, (uint32_t)((a.n + tm - 1) / tm), (uint32_t)batch};
   std::string lab;
-  if (D().profileOn) {
+  if (D().profileOn || dupLabelWanted()) {
     char b[160]; snprintf(b, sizeof b, "%s %s %dx%dx%d%s", label ? label : "gemm", name.c_str() + 6, a.m, a.n, a.k, batch > 1 ? " batched" : "");
     lab = b;
   }
@@ -1020,7 +1056,7 @@ bool gemmRun(DT ta_, DT tb_, DT tc_, GemmArgs a, int batch, bool halfMma, bool a
   std::string decl = "template [[host_name(\"" + name + "\")]] kernel void lf_gemm<" + targs + ">(constant GemmArgs&, uint3, uint, uint, uint);";
   Grid grid{(uint32_t)((a.m + tc - 1) / tc), (uint32_t)((a.n + tr - 1) / tr), (uint32_t)batch};
   std::string lab;
-  if (D().profileOn) {
+  if (D().profileOn || dupLabelWanted()) {
     char b[160]; snprintf(b, sizeof b, "%s %s %dx%dx%d%s", label ? label : "gemm", name.c_str() + 5, a.m, a.n, a.k, batch > 1 ? " batched" : "");
     lab = b;
   }
