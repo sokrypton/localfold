@@ -572,9 +572,10 @@ inline OpmSave opmForwardBf(const Opm& m, const real* msa, const real* msaMask, 
   s.norm = ARENA.get(pr);
   if (m.fixedCount > 0) fillCountK<<<blocks(pr), 256, 0, STREAM>>>(s.norm, m.fixedCount, pr);
   else normK<<<blocks(pr), 256, 0, STREAM>>>(msaMask, s.norm, S, L, m.biasAfterNorm || m.clampCount);
-  Scratch scratch;
-  bf* op = bfGet(pr * OO);
+  bf* op = bfGet(pr * OO);   // kept: the backward recomputed it (a 17 GFLOP GEMM and a 134 MB permute at L 256)
   opmProductsBf(m, s, op);
+  s.pnorm = reinterpret_cast<real*>(op);
+  Scratch scratch;
   real* act = ARENA.get(pr * m.Cz);
   {
     Scratch sc;
@@ -605,10 +606,9 @@ inline void opmBackwardBf(Opm& m, const OpmSave& s, const real* msaMask, const P
   divRowsK<<<blocks(pr * m.Cz), 256, 0, STREAM>>>(dact, s.norm, pr, m.Cz, false, nullptr);
   if (!after) colSum(m.bo.g, dact, pr, m.Cz);
   const bf* dab = toBf(dact, pr * m.Cz);
-  bf* op = bfGet(pr * OO);
-  opmProductsBf(m, s, op);
+  const bf* op = reinterpret_cast<const bf*>(s.pnorm);
   mmATBf(op, dab, m.wo.g, (int)pr, OO, m.Cz);
-  bf* dop = op;                                        // (op is spent: its bytes take d op)
+  bf* dop = bfGet(pr * OO);
   mmBTBf(dab, toBf(m.wo.w, (size_t)OO * m.Cz), dop, (int)pr, OO, m.Cz);
   bf* do2 = bfGet((size_t)LO * LO);
   outerToPair(dop, do2, L, m.O, true);                 // [(i c), (j e)]
