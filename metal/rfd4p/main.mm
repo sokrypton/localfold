@@ -37,11 +37,25 @@
 // 15.9 s to 15.2 - four paired rounds, ABAB, flash ahead in all four by 0.50 to 0.82 s, which the arms have to
 // be interleaved to see at all because this laptop's clock drifts 9% upward over the eight runs. It costs
 // 0.009 A RMS on the design (worst 0.071, every atom matched), and `--f32` keeps the scalar kernel.
-// What is left, at 165 tokens: the batched projection 25.3 ms (22%, and core's tiling rather than this port's
-// layout - both orientations measure the same), the triangle's gated add 17.0 (6.5 TFLOP/s against the 12.2
-// this machine's matrix units reach on the projection, so this is the clearest arithmetic gap left), the pair
-// transition 10.8, the gate's channel-major pass 8.8, the norms 6.8. The attention no longer reaches the
-// profile's top twenty-four.
+// 🔴 AND WHAT IS LEFT IS AT THE ROOFLINE, WHICH IS THE ANSWER TO "WHAT NEXT" AND NOT AN EXCUSE. Measured on
+// this M5: the matrix units reach **12.22 TFLOP/s** on the projection's own shape (`metal/bench 1024 27225 384
+// 0,1000000` - and 3.03 without them, so a kernel off the matrix units is the thing to look for), and a copy
+// reaches **131 GB/s** (`metal/bench bw 256`). Against those two numbers, the four kernels that are 54% of a
+// step at 165 tokens:
+//
+//   kernel                  ms    GFLOP     MB   floor   of roofline
+//   tri-project          25.32    299.7      0   24.53      97%
+//   gated add            17.00    112.4    878   15.90      94%
+//   pair-transition-out  10.78    112.4    439   12.55     116%
+//   tri_ab_hm             8.83      0.0   1171    8.94     101%
+//
+// (floor = GFLOP / 12.22 + MB / 131, the arithmetic and the bytes each at their own ceiling and not overlapped,
+// which is why one row reads over 100%.) `tri_ab_hm` moves its 1171 MB at **133 GB/s**, i.e. at the copy
+// ceiling: it is a gate and a transpose of four pair-sized planes and there is nothing in it to speed up.
+// So no kernel here is worth another tile sweep. The lever left is FEWER PASSES OVER THE PAIR TRACK - fusing an
+// elementwise pass into the epilogue of the GEMM that produced it, as the gate, the residual and the next
+// LayerNorm already are - and `gemmGatedAdd`'s own 878 MB is the measure of what one such pass costs. The
+// attention no longer reaches the profile's top twenty-four.
 //
 // WHAT RUNS: unconditional, motif scaffolding, protein-protein interfaces, small molecules (whose chirality is
 // re-aligned every step), coordinate groups (whose labels are permuted every step), partial diffusion and
