@@ -1096,6 +1096,17 @@ export function processSampleToAtoms({
 
   // Align generated coordinates onto the input frame (`align_atom_array_to_input_frame`)
   alignAtomsToInputFrame(outAtoms, cwiCoords, anchorIndices);
+  // 🔴 AND BACK OUT OF THE CENTRED FRAME THE CONDITIONING WAS FEATURISED IN (`centerAndFeaturizeCentroid`),
+  // or a design sits a centroid away from the structure it was designed against. Only where there are
+  // anchors: with nothing held in place the frame is the model's own and there is nothing to return to.
+  const centerShift = inputAtoms?.center_shift;
+  if (anchorIndices.length && centerShift && centerShift.some((v) => v !== 0)) {
+    for (const a of outAtoms) {
+      a.x = Math.fround(a.x + centerShift[0]);
+      a.y = Math.fround(a.y + centerShift[1]);
+      a.z = Math.fround(a.z + centerShift[2]);
+    }
+  }
 
   return {
     atoms: outAtoms,

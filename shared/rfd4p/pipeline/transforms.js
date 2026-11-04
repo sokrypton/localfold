@@ -412,18 +412,35 @@ export function realizeExpandableSegments(atoms, { segmentLengths = null, rng = 
       }
     }
 
-    const baseResId = cur.res_id[idx];
     const chainIid = cur.chain_iid ? cur.chain_iid[idx] : cur.chain_id[idx];
+    const sameChain = (i) => (cur.chain_iid ? cur.chain_iid[i] : cur.chain_id[i]) === chainIid;
+    // 🔴 A SENTINEL TUCKED UNDER THE RESIDUE BEFORE IT NUMBERS FROM THAT RESIDUE, NOT FROM ITSELF.
+    // Upstream's rule - number the new residues from the sentinel's own res_id and move the rest of the
+    // chain up by segLen - 1 - assumes the sentinel was numbered AFTER its predecessor. An insert made
+    // without renumbering the chain shares the predecessor's number under an insertion code, and then
+    // the new residues start after it and the rest moves only as far as it must to stay clear.
+    // Upstream's `4d79bb8c`, ported here. 🔴 AND IT IS INERT IN THIS TREE TODAY: nothing here inserts a
+    // residue inside a chain without renumbering (upstream's producer is its Studio's `insertSegment`,
+    // which this repository does not carry), so this is parity on a function both trees read rather
+    // than a fault measured here. When `tucked` is false it computes exactly what the line it replaced
+    // computed, which is why it is safe to carry untested by a case of our own.
+    let prevResId = null;
+    let nextResId = null;
+    if (idx > 0 && sameChain(idx - 1)) prevResId = cur.res_id[idx - 1];
+    if (idx + 1 < cur.nAtoms && sameChain(idx + 1)) nextResId = cur.res_id[idx + 1];
+    const tucked = prevResId !== null && cur.res_id[idx] <= prevResId;
+    const baseResId = tucked ? prevResId + 1 : cur.res_id[idx];
+    const shift = tucked ? (nextResId === null ? 0 : Math.max(0, baseResId + segLen - nextResId)) : segLen - 1;
 
     const afterLen = cur.nAtoms - (idx + 1);
     const prefix = idx > 0 ? sliceAtoms(cur, 0, idx) : null;
     const suffix = afterLen > 0 ? sliceAtoms(cur, idx + 1, cur.nAtoms) : null;
-    if (suffix && segLen !== 1) {
+    if (suffix && shift !== 0) {
       for (let i = 0; i < suffix.nAtoms; i++) {
         const cIid = suffix.chain_iid ? suffix.chain_iid[i] : suffix.chain_id[i];
         if (cIid === chainIid) {
-          suffix.res_id[i] += segLen - 1;
-          if (suffix.auth_seq_id) suffix.auth_seq_id[i] += segLen - 1;
+          suffix.res_id[i] += shift;
+          if (suffix.auth_seq_id) suffix.auth_seq_id[i] += shift;
         }
       }
     }
@@ -442,6 +459,7 @@ export function realizeExpandableSegments(atoms, { segmentLengths = null, rng = 
       const st = cloneAtoms(single);
       st.res_id[0] = baseResId + s;
       if (st.auth_seq_id) st.auth_seq_id[0] = baseResId + s;
+      if (tucked && st.ins_code) st.ins_code[0] = '';
       stubs.push(st);
     }
     const stubArr = stubs.length > 0 ? concatAtoms(stubs) : null;
@@ -1110,6 +1128,12 @@ export function centerAndFeaturizeCentroid(atoms) {
     }
   }
   const shift = count > 0 ? [sx / count, sy / count, sz / count] : [0, 0, 0];
+  // 🔴 KEPT, BECAUSE THE OUTPUT HAS TO UNDO IT. Everything the model is conditioned on is centred here, so a
+  // design aligned onto those coordinates lands in the CENTRED frame - a binder sitting a centroid away from
+  // the target the reader loaded, in the viewer and in the saved file alike. `processSampleToAtoms` adds it
+  // back (output.js). Non-enumerable: the atom table is iterated by key in several places and this is not a
+  // per-atom column. Upstream's `3a7cda9d`, ported here.
+  Object.defineProperty(atoms, 'center_shift', { value: shift, enumerable: false, writable: true, configurable: true });
 
   atoms.coord_to_be_noised = new Array(n);
   for (let i = 0; i < n; i++) {

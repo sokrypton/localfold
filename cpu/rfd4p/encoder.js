@@ -60,13 +60,21 @@ export function encoderSeqFeatures(batch, { n, weights, cfg }) {
         for (let k = 0; k < ttDim; k += 1) feats[o + k] = tab[tt * ttDim + k];
       } else if (f === 'x1_a37coors_nm' || f === 'x1_a37coors_nm_rel') {
         const rel = f === 'x1_a37coors_nm_rel';
-        const caMask = atomMask[i * 37 + 1] ? 1 : 0;
+        // 🔴 AN ATOM A STRUCTURE LEAVES UNMODELLED IS ABSENT HERE, NOT PRESENT AT NaN. A side chain an
+        // entry did not resolve carries the atom in `atomMask` with no coordinates, and a NaN read into
+        // one feature column spreads through the encoder's LayerNorms to EVERY latent of EVERY token -
+        // so partial diffusion of such an entry returned a design with no atoms at all. Upstream's
+        // `4240ffc8`, ported here. `webgpu/rfd4p/encoder.js` imports this function, so the GPU path is
+        // fixed by the same edit; there is no second copy to keep in step.
+        const placed = (s) => atomMask[s]
+          && Number.isFinite(coorsNm[s * 3]) && Number.isFinite(coorsNm[s * 3 + 1]) && Number.isFinite(coorsNm[s * 3 + 2]);
+        const caMask = placed(i * 37 + 1) ? 1 : 0;
         const caBase = (i * 37 + 1) * 3;
         const ca0 = rel && caMask ? coorsNm[caBase] : 0;
         const ca1 = rel && caMask ? coorsNm[caBase + 1] : 0;
         const ca2 = rel && caMask ? coorsNm[caBase + 2] : 0;
         for (let a = 0; a < 37; a += 1) {
-          const m = atomMask[i * 37 + a] ? 1 : 0;
+          const m = placed(i * 37 + a) ? 1 : 0;
           if (m) {
             const b = (i * 37 + a) * 3;
             feats[o + a * 3] = Math.fround(coorsNm[b] - ca0);
