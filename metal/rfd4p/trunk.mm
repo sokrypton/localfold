@@ -230,6 +230,12 @@ static bool triangle(const std::string& prefix, float* z, bool outgoing, const h
       zn = scratch<half>(outgoing ? "tri.znHo" : "tri.znHi", nn * P);
       layerNorm(z, zn, nn, P, M.f(W + "layer_norm_in.weight"), opt(prefix + ".layer_norm_in.bias"));
     }
+    // 🔴 AND THE OTHER ORIENTATION MEASURES THE SAME, which is worth recording because the reason to try it was
+    // good and wrong. Channel-major has an M dimension of 4T = 1024, so core's 64-row tiles re-read the whole
+    // 25.7 MB of `zn` sixteen times; pair-row-major reads it once and re-reads the 786 KB weight instead, at the
+    // cost of a tiled transpose in the gate. Built and measured both: 167.1 ms a step against 166.6 - the same.
+    // So this GEMM is not limited by its operand reuse (at 0.88 TFLOP/s it is not at the bandwidth of its 68 MB
+    // output either, and the remaining 3x is in core's tiling for a K of 384, not in this port's layout).
     // 🔴 THE FOUR PROJECTIONS ARE ONE GEMM, because they share their input and differ only in the weight: the
     // four [T][P] matrices stacked into one [4T][P] (derived once) make a product four times the size and a
     // quarter of the dispatches. At 54 tokens each of them alone was 2916 x 256 x 384 - small enough that the
