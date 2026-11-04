@@ -229,10 +229,11 @@ inline void gridBackwardBf(GridAttn& g, const Dialect& d, const GridSave& s, con
     mmATBf(act, dqkvg, dW, (int)nn, g.C, P, 0.f);
     packQkvg(g, nullptr, dW, true);
   }
-  real* dact = ARENA.get(nn * g.C);
+  // dx in bf16 (its transpose too): the LayerNorm's backward is its only reader
+  bf* dact = bfGet(nn * g.C);
   mmBTBf(dqkvg, W, dact, (int)nn, g.C, P);
-  real* dxn = dact;
-  if (g.transpose) { dxn = ARENA.get(nn * g.C); swap01(dact, dxn, n, n, g.C); }
+  bf* dxn = dact;
+  if (g.transpose) { dxn = bfGet(nn * g.C); swap01(dact, dxn, n, n, g.C); }
   real* draw = ARENA.zeros(nn * g.H);
   gridBiasK<<<blocks(nn * g.H), 256, 0, STREAM>>>(draw, dnb, n, g.H, g.transpose && d.swapTransposedBias, true);
   linearBwdBf(g.bias, xn, toBf(draw, nn * g.H), dxn, nn, true);

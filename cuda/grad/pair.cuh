@@ -207,7 +207,7 @@ __global__ void mergeGateBwdLdBfK(const bf* __restrict__ dab, const bf* __restri
 // out = pre_out * og, og at row stride P: dpre_out = dy og (contiguous), d og_pre = dy pre_out og (1 - og) at P
 // (gGating: the output gate's bias gradient, summed here: a block 32 columns x 8 row lanes, rows strided)
 template <class DY>
-__global__ void outGateBwdLdBfK(const DY* dy, const real* a, const bf* og, bf* da, bf* dgl, size_t rows, int C,
+__global__ void outGateBwdLdBfK(const DY* dy, const bf* a, const bf* og, bf* da, bf* dgl, size_t rows, int C,
                                 int P, float* gGating) {
   __shared__ float part[8][32];
   const int c = blockIdx.x * 32 + threadIdx.x;
@@ -217,7 +217,7 @@ __global__ void outGateBwdLdBfK(const DY* dy, const real* a, const bf* og, bf* d
       const size_t t = r * C + c, i = r * P + c;
       const float s = bfv(og[i]), y = bfv(dy[t]);
       da[t] = __float2bfloat16(y * s);
-      const bf g = __float2bfloat16(y * a[t] * s * (1.f - s));
+      const bf g = __float2bfloat16(y * bfv(a[t]) * s * (1.f - s));
       dgl[i] = g;
       acc += __bfloat162float(g);
     }
@@ -231,6 +231,10 @@ __global__ void outGateBwdLdBfK(const DY* dy, const real* a, const bf* og, bf* d
 __global__ void mulLdBfK(real* y, const bf* g, size_t rows, int C, int P) {   // y[r, c] *= g[r * P + c]
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t < rows * C) y[t] *= bfv(g[(t / C) * P + t % C]);
+}
+__global__ void gateOutLdBfK(real* y, const bf* a, const bf* g, size_t rows, int C, int P) {   // y = a g[r * P + c]
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t < rows * C) y[t] = bfv(a[t]) * bfv(g[(t / C) * P + t % C]);
 }
 inline TriMulSave triMulForwardBf(const TriMul& m, const real* pair, const real* mask, real* out, int L) {
   const size_t rows = (size_t)L * L;
@@ -264,10 +268,11 @@ inline TriMulSave triMulForwardBf(const TriMul& m, const real* pair, const real*
     channelsTBf<<<g2, b, 0, STREAM>>>(ccm, nullptr, s.center, rows, m.I, false, 1);
   }
   s.lnC = lnForward(m.lnCenter, s.center, cn, rows);
-  linearFwdBf(m.out, cn, out, rows);
-  mulLdBfK<<<blocks(rows * m.C), 256, 0, STREAM>>>(out, pre + 2 * I2, rows, m.C, P);
+  bf* po = bfGet(rows * m.C);   // the output projection before its gate, kept (the backward recomputed it)
+  linearFwdBf(m.out, cn, po, rows);
+  gateOutLdBfK<<<blocks(rows * m.C), 256, 0, STREAM>>>(out, po, pre + 2 * I2, rows, m.C, P);
   s.xn = reinterpret_cast<real*>(xn); s.proj = reinterpret_cast<real*>(pre); s.gate = reinterpret_cast<real*>(W);
-  s.ab = reinterpret_cast<real*>(ab); s.cn = reinterpret_cast<real*>(cn); s.og = nullptr;
+  s.ab = reinterpret_cast<real*>(ab); s.cn = reinterpret_cast<real*>(cn); s.og = reinterpret_cast<real*>(po);
   return s;
 }
 template <class PD>   // (PD: the running gradient's type)
@@ -279,8 +284,7 @@ inline void triMulBackwardBf(TriMul& m, const TriMulSave& s, const real* mask, c
            *W = reinterpret_cast<const bf*>(s.gate), *ab = reinterpret_cast<const bf*>(s.ab),
            *cn = reinterpret_cast<const bf*>(s.cn);
   bf* dpre = bfGet(rows * P);
-  real* po = ARENA.get(rows * m.C);
-  linearFwdBf(m.out, cn, po, rows);
+  const bf* po = reinterpret_cast<const bf*>(s.og);
   bf* dpo = bfGet(rows * m.C);
   {
     const unsigned xb = (m.C + 31) / 32;
