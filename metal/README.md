@@ -469,6 +469,19 @@ the half that was missing; wiring its own `alignToInputFrame` to read
 
 ## Is it fully ported? Every capability, and the gate that exercises it
 
+🔴 **AND IT IS CHECKED END TO END AGAINST THE SAME REFERENCE cuda/rfd4p IS,
+WHICH IS THE ONLY COMPARISON A MAC CAN MAKE.** There is no NVIDIA card here, so
+the two ports cannot be run against each other - but neither is held to the
+other: both are held to the PAGE. `tools/check-metal-rfd4p-writer.py` now runs
+every case `cuda/rfd4p/gate.py`'s own writer arm runs - all ten presets in both
+formats, plus the unindexed one converged at 60 steps where the insertion
+mapping actually grafts - and requires the same text from
+`shared/rfd4p/output.js` and the same values from `shared/rfd4p/metrics.js`:
+**22 of 22 files byte-identical and 11 of 11 metric sets**, with four superposed
+RMSDs agreeing to the last place of a double (2.0e-16 to 5.7e-16) and nothing
+else differing at all. That is the feature matrix: not "these files map" but
+"this port and the page produce the same bytes on every capability either has".
+
 "Fully ported" is a claim, so here is the checkable form. Every file under
 `cuda/rfd4p/src/` has a counterpart: `assign.h`, `schedule.h`, `superpose.h`,
 `symmetry.h` and `metrics_tags.h` are **included directly**; `metrics.h` and
@@ -493,6 +506,8 @@ for Metal as `weights.mm`, `chirality.mm`, `decoder.mm`, `encoder.mm`,
 | the writer, mmCIF and PDB | 12 of 12 files byte-identical to the page's text |
 | the design metrics and the pre-oracle verdict | 6 of 6 against `design-metrics.mjs` |
 | the **refolding oracle**, af3 and af2 | `--refold=af3` / `=af2` on `gate-oracle-motif-60` |
+| internal-coordinate conditioning | `yaml_5o45_binder` - its own tag, and the only case whose motif reference is a per-group fit |
+| a contig with no input structure at all | `custom_cath_monomer` - no anchors, so no alignment and no centring offset |
 | the trunk, decoder, encoder and trajectory | 86 / 84 / 86 / 90 / 100 comparisons |
 | half and float32 arithmetic | every arm runs both; `--f32` is the control |
 

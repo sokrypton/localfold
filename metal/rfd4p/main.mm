@@ -12,6 +12,12 @@
 //
 // SPEED, on an M5 (8-core GPU), a whole job including featurisation: a 54-residue design at 60 steps is
 // **3.7 s**, a 67-token motif 3.5 s, a 165-token small molecule 17.6 s, a 183-token interface 21.0 s.
+// 🔴 AND THIS ROUND IS **10.5% AT 165 TOKENS AND 12.9% AT 400**, end to end, against its own starting commit
+// (`4b92ef8c`, built in a worktree and interleaved against the current binary): four pairs at 165 giving -9.5,
+// -10.5, -10.1, -11.8%, and eight at 400 giving -15.6, -12.7, -12.8, -14.0, -12.5, -12.1, -11.9, -12.3%. The
+// longer input gains MORE, because everything this round removed scales with the pair track - the attention's
+// bias, the four gate planes, the normed pair copy - which is also why the 400-token case needed no separate
+// work. Measured in short runs (4 steps) so the laptop's 19% thermal drift over a long pair cannot swamp it.
 // 🔴 ONE SAMPLER STEP AT 165 TOKENS IS **108.7 ms** AND EVERY ITEM LEFT IN IT IS AT A MEASURED CEILING. This
 // round took three: metal/core's flash attention for this port's own scalar kernel (4.4%), the triangle's gate
 // fused into its projection through `gemmTriGate` (5.2%), and the pair bias's norm folded into its weight
@@ -99,16 +105,23 @@
 // biases against it, and the mean still comes out negative - but a 1% effect under a 19% drift is not a
 // measurement. It is kept for the 165-token number, the exactness of the identity, and the buffer.
 //
-// 🔴 AND THE LAST PASS THAT COULD GO IS NOT THIS PORT'S TO REMOVE, so here is where it stands rather than a
-// promise. The triangle's input LayerNorm runs TWICE a layer - 14 calls a step for 7 pair updates, 2.58 ms,
+// 🔴 AND THE LAST PASS THAT COULD GO IS WORTH A TENTH OF A PERCENT, MEASURED RATHER THAN ARGUED. The
+// triangle's input LayerNorm runs TWICE a layer - 14 calls a step for 7 pair updates, 2.58 ms of profile,
 // 2.4% - where it should run once: `pairUpdate` asks the first triangle's gated add to emit the second's norm
-// in its epilogue (`Gemm::lnOut`, which is why `triangle` takes a `znPre`), and it never does. The reason is
-// in core's own dispatch: `lnEmit` requires the VECTOR epilogue or the 16384 gated-residual form, whose
-// comment says "gemm_tensor.metal's float tile has no other emitting form", and on the matrix units this
-// gated add is epilogue 192. The width is not the obstacle - a 384-wide output has its 64 x 128 clause - the
-// PATH is. Half of 2.58 ms is 1.2% of a step, and after the pair-bias fold measured 0.9% of wall against
-// 4.2% of profile, the wall share of this would be a few tenths. It is not worth changing the epilogue
-// selection that af3 and bioemu2 also take.
+// in its epilogue (`Gemm::lnOut`, which is why `triangle` takes a `znPre`) and it never does, because core's
+// `lnEmit` needs the VECTOR epilogue or the 16384 gated-residual form ("gemm_tensor.metal's float tile has no
+// other emitting form") and on the matrix units this gated add is epilogue 192. The width is not the obstacle;
+// a 384-wide output has its own 64 x 128 clause.
+// What settles it is the price, taken the same way the gate's fusion was: skip ALL FOURTEEN and the wall moves
+// **-0.07, -0.16, -0.15, +0.27 s on ~14.4** - not consistent in sign, a mean of **-0.2%**. So the whole pass
+// is a fifth of a percent and the removable HALF is about a tenth, against 2.4% of profile: it is overlapped
+// almost entirely. Writing a new emitting form into the matrix tile that af3 and bioemu2 also run, for 0.1% of
+// wall, is not a trade worth making - and that is now a measurement rather than a judgement.
+// 🔴 AND THE SAME FOLD CANNOT BE USED HERE AS ON THE PAIR BIAS. A LayerNorm's channel scale folds into the
+// next weight, its mean folds into a per-output constant, and its row scale comes out after - but the
+// triangle's projection is FUSED with its gate now, and the gate applies a sigmoid to one of the four planes.
+// `sigmoid((x - m) / sd)` factors through nothing, so the fold and the fusion are mutually exclusive, and the
+// fusion is worth 5.2% against this pass's 0.2%.
 //
 // So no kernel here is worth another tile sweep. The lever left is FEWER PASSES OVER THE PAIR TRACK - fusing an
 // elementwise pass into the epilogue of the GEMM that produced it, as the gate, the residual and the next

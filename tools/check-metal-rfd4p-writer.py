@@ -43,8 +43,22 @@ MOTIF_TAGS = {
     "motif_idx_1prw": ["3d_coordinate_conditioning"],
     "motif_unidx_1prw": ["unindexed", "3d_coordinate_conditioning"],
     "dna_7m5w": ["3d_coordinate_conditioning"],
+    "yaml_5o45_binder": ["3d_coordinate_conditioning", "internal_coordinate_conditioning"],
+    "partial_diffusion_1prw": ["3d_coordinate_conditioning"],
+    "inverse_folding_1prw": ["3d_coordinate_conditioning"],
 }
-PRESETS = ["uncond_short", "ppi_pdl1", "motif_idx_1prw", "motif_unidx_1prw", "sm_sam", "dna_7m5w"]
+# 🔴 EVERY CASE cuda/rfd4p/gate.py's WRITER ARM USES, not the six this started with. The four that were
+# missing are the ones that reach what the others cannot: `yaml_5o45_binder` is the only INTERNAL-coordinate
+# conditioning case (its own tag, and the only one whose motif reference comes from a per-group fit),
+# `partial_diffusion_1prw` and `inverse_folding_1prw` start from a corrupted input rather than from noise and
+# so exercise the encoder and `corruptBatch`'s draw order end to end, and `custom_cath_monomer` is a contig
+# with no input structure at all - no anchors, so no alignment and no centring offset.
+# 🔴 AND THE UNINDEXED ONE TWICE, at 6 steps and at 60, because at 6 no mapping can be grafted and the
+# insertion head's predicted mapping goes unexercised - gate.py's own note, and this port's `--no-insertion`
+# arm is the other half of it.
+PRESETS = ["uncond_short", "ppi_pdl1", "motif_idx_1prw", "motif_unidx_1prw", "sm_sam", "dna_7m5w",
+           "yaml_5o45_binder", "partial_diffusion_1prw", "inverse_folding_1prw", "custom_cath_monomer"]
+CONVERGED = [("motif_unidx_1prw", 60)]
 
 
 def option(name, fallback):
@@ -69,7 +83,8 @@ def main():
         return 2
 
     writer_bad, metrics_bad, lastplace = [], [], []
-    for pid in presets:
+    cases = [(pid, steps) for pid in presets] + [c for c in CONVERGED if c[0] in presets]
+    for pid, steps in cases:
         r = run(["node", REPO / "cuda/rfd4p/featurise/preset-spec.mjs", pid])
         if r.returncode != 0:
             writer_bad.append(f"{pid}: {r.stderr.strip()[-120:]}")
@@ -77,16 +92,17 @@ def main():
         spec = json.loads(r.stdout)
         spec["nsteps"] = steps
         spec["metrics_tags"] = METRICS_TAGS + MOTIF_TAGS.get(pid, [])
-        job = work / f"{pid}.json"
+        tag = pid if steps == int(option("steps", "6")) else f"{pid}-{steps}"
+        job = work / f"{tag}.json"
         job.write_text(json.dumps(spec))
-        dump = work / f"dump-{pid}"
+        dump = work / f"dump-{tag}"
         for ext in ("cif", "pdb"):
-            out = work / f"{pid}.{ext}"
-            g = run([BINARY, f"--job={job}", f"--bundle={bundle}", f"--work-dir={work}/w-{pid}",
+            out = work / f"{tag}.{ext}"
+            g = run([BINARY, f"--job={job}", f"--bundle={bundle}", f"--work-dir={work}/w-{tag}",
                      f"--out={out}", "--seed=0", f"--dump-sample={dump}",
                      f"--metrics={dump}.metrics.json"])
             if g.returncode != 0:
-                writer_bad.append(f"{pid}.{ext}: {g.stderr.strip()[-160:] or g.stdout.strip()[-160:]}")
+                writer_bad.append(f"{tag}.{ext}: {g.stderr.strip()[-160:] or g.stdout.strip()[-160:]}")
                 continue
             w = run(["node", REPO / "cuda/rfd4p/check-writer.mjs", f"--spec={job}", "--seed=0", dump, out])
             if w.returncode == 0:
@@ -97,15 +113,15 @@ def main():
             d = run(["node", REPO / "tools/rfd4p-writer-unshifted.mjs", f"--spec={job}", "--seed=0", dump, out])
             why = (" - and identical with the centring offset removed, so the offset is not being added back:"
                    " check meta/centerShift* in the export" if d.returncode == 0 else "")
-            writer_bad.append(f"{pid}.{ext}: {w.stdout.strip().splitlines()[0] if w.stdout else 'failed'}{why}")
+            writer_bad.append(f"{tag}.{ext}: {w.stdout.strip().splitlines()[0] if w.stdout else 'failed'}{why}")
         # the metrics, native against the page's on the same sample: every value and the verdict
         native = Path(f"{dump}.metrics.json")
         if not native.exists():
-            metrics_bad.append(f"{pid}: no native metrics")
+            metrics_bad.append(f"{tag}: no native metrics")
             continue
         m = run(["node", REPO / "cuda/rfd4p/design-metrics.mjs", f"--spec={job}", "--seed=0", dump])
         if m.returncode != 0:
-            metrics_bad.append(f"{pid}: {m.stderr.strip()[-160:]}")
+            metrics_bad.append(f"{tag}: {m.stderr.strip()[-160:]}")
             continue
         a, b = json.loads(native.read_text()), json.loads(m.stdout)
         for k in sorted(set(a["metrics"]) | set(b["metrics"])):
@@ -116,13 +132,13 @@ def main():
             # solve, and C++ and V8 disagree in the final bit; reported with its size rather than asserted
             # equal, and the bound is tight enough (1e-12) that anything structural still fails.
             if isinstance(x, float) and isinstance(y, float) and abs(x - y) <= 1e-12 * max(1e-30, abs(y)):
-                lastplace.append(f"{pid}:{k} ({abs(x - y) / max(1e-30, abs(y)):.1e})")
+                lastplace.append(f"{tag}:{k} ({abs(x - y) / max(1e-30, abs(y)):.1e})")
                 continue
-            metrics_bad.append(f"{pid}: {k} metal {x} page {y}")
+            metrics_bad.append(f"{tag}: {k} metal {x} page {y}")
         if a["preOracle"] != b["preOracle"]:
-            metrics_bad.append(f"{pid}: the pre-oracle verdict differs")
+            metrics_bad.append(f"{tag}: the pre-oracle verdict differs")
 
-    n = len(presets)
+    n = len(cases)
     print(f"writer   {n * 2} files against the page's text   "
           f"{'ok ' if not writer_bad else 'DIFFERS: ' + '; '.join(writer_bad[:4])}")
     print(f"metrics  {n} designs against the page's metrics  "
