@@ -188,12 +188,21 @@ double relRms(const float* a, const float* b, size_t n) {
 }
 
 int FAILED = 0;
+// 🔴 AND HOW MANY COMPARISONS ACTUALLY HAPPENED, because "all green" was printed by a run that compared
+// NOTHING. `--job=` sets the generation directory, which is what the final line tests, while the stage arms
+// need `--oracle=` and the trajectory arm needs a gen-oracle - so a job run printed "all green" with no
+// reference on disk and no `check` ever reaching a bound. It was reported as a verified fold through this whole
+// optimisation round, and the probe that found it skipped the triangle's gate entirely: the design came out at
+// CA-CA median 5.26 A against 3.80, min 0.54, and the line still read "all green". A gate that cannot fail is
+// not a gate, and a gate that says it passed when it did not compare is worse than one that is absent.
+int CHECKED = 0;
 // ours (on the device, n values) against the oracle's "o/<name>". `bound` 0 or less REPORTS the number without
 // gating on it - for a stage whose residual is its INPUT's, measured, and which has its own arm that is gated.
 double check(const char* label, const std::string& name, const float* ours, size_t n, double bound) {
   // a name with its own prefix (the decoder's "d/...") is taken as it is; a bare one is the trunk's "o/..."
   const std::string key = name.find('/') == std::string::npos ? "o/" + name : name;
   if (!M.has(key)) { printf("  %-24s (not in the oracle)\n", label); return -1; }
+  CHECKED += 1;
   if (M.len(key) != n) die("the oracle's %s has %zu values, this port's %zu", key.c_str(), M.len(key), n);
   sync();
   const double r = relRms((const float*)host(ours), M.hostF(key), n);
@@ -697,7 +706,13 @@ int main(int argc, char** argv) {
 
 
   if (!oracle.empty() || !genDir.empty()) {
-    printf("%s (%.2f s)\n", FAILED ? "FAILED" : "all green", now() - t0);
+    if (FAILED) printf("FAILED (%.2f s)\n", now() - t0);
+    else if (CHECKED) printf("all green: %d comparisons (%.2f s)\n", CHECKED, now() - t0);
+    else {
+      // Nothing was compared, so there is nothing to call green. `--job=` alone folds and writes; the arms need
+      // a reference built by `cuda/rfd4p/export_input.mjs --oracle= [--generate --gen-oracle]`.
+      printf("folded; NOTHING COMPARED - no oracle on disk, so no arm ran (%.2f s)\n", now() - t0);
+    }
     return FAILED ? 1 : 0;
   }
   printf("the trunk's init products built in %.2f s (no --oracle= to hold them to)\n", now() - t0);
