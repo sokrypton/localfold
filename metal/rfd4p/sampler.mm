@@ -584,6 +584,13 @@ int generate(const std::string& genDir, const std::string& outPath, int designs,
   const int* chirOwnersHost = chiral ? M.hostI("g/chiralOwners") : nullptr;
   const float* chirCleanHost = chiral ? M.hostF("g/chir") : nullptr;
   const float* padHost = M.hostF("in/mask");
+  // 🔴 TRUNK PASSES, NOT STEPS, BECAUSE A STEP IS NOT A FIXED AMOUNT OF WORK. `depths[st]` is the step's
+  // recycle count and upstream's schedule varies it from 1 to 6 (mean 3 at the default), so "ms a step" is
+  // an average over a varying workload and cannot be compared with anything. One PASS - 14 single blocks
+  // with pair bias and 7 pair updates over the N x N x 384 track - is the unit that is the same everywhere,
+  // and it is the unit bios-labs' MLX port publishes (`benchmarks/raw/scaling_fp16.json`), so it is the
+  // only one the two ports can be held to each other in.
+  long trunkPasses = 0;
   for (int st = 0; st < steps; ++st) {
     if (st == profileStep) profileStart();
     // the step's own noised state into the sequence features - three columns at 0 and thirty-two at 3
@@ -649,6 +656,7 @@ int generate(const std::string& genDir, const std::string& outPath, int designs,
     copy(cond0Buf, M.f("g/cond") + (size_t)st * n * condDim, (size_t)n * condDim * 4);
     copy(cond1Buf, M.f("g/cond1") + (size_t)st * n * condDim, (size_t)n * condDim * 4);
     copy(pairCondBuf, M.f("g/pairCond") + (size_t)st * pairCondDim, pairCondDim * 4);
+    trunkPasses += depths[st];
     trunkForward(seqF, cond0Buf, cond1Buf, pairF, pairCondBuf, depths[st], s, z, vBb, vLl, logits,
                  st == steps - 1 ? insertion : nullptr);
 
@@ -868,9 +876,12 @@ int generate(const std::string& genDir, const std::string& outPath, int designs,
       printf("  WARNING: the insertion head's mapping could not be applied to this design; the unindexed motif "
              "is written without its annotations\n");
     }
-    printf("generated %d residues, %d atoms over %d steps (%d sequence positions read out) -> %s\n", emitted, atoms,
-           steps, filled, path.c_str());
-    if (getenv("LF_GPUBUSY")) gpuBusyReport("the whole generation", steps);
+    printf("generated %d residues, %d atoms over %d steps / %ld trunk passes (%d sequence positions read out) "
+           "-> %s\n", emitted, atoms, steps, trunkPasses, filled, path.c_str());
+    if (getenv("LF_GPUBUSY")) {
+      gpuBusyReport("the whole generation", steps);
+      gpuBusyReport("the whole generation, a PASS", (int)trunkPasses);
+    }
     printf("  consecutive CA-CA: median %.2f A, min %.2f, max %.2f\n", d.caSpacing[0], d.caSpacing[1],
            d.caSpacing[2]);
     // 🔴 AND WHAT UPSTREAM'S EVALUATION WOULD SAY ABOUT IT: the design metrics under the job's own

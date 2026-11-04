@@ -234,6 +234,56 @@
 // number in this file above 4% was taken interleaved and survived both orderings; nothing smaller should be
 // believed from here without a cold machine.
 //
+// 🔴 AND THERE IS A SECOND APPLE-SILICON PORT OF THIS MODEL NOW, SO "FAST" HAS AN OUTSIDE NUMBER AT LAST.
+// `bios-labs/RFD4-Proteina-MLX-fp16` is an independent MLX port of the same checkpoint revision, and it
+// publishes the one unit both ports can be held to: ONE TRUNK PASS - 14 single blocks with pair bias plus 7
+// pair updates over the N x N x 384 track - archived per length in its `benchmarks/raw/scaling_fp16.json`.
+// That unit is why `trunkPasses` exists in sampler.mm: this port reported `ms a step`, and a step is NOT a
+// fixed amount of work (`depths[st]` is upstream's 1-to-6 recycle schedule, mean 3.5 on the 180-token job),
+// so every per-step number in this file is an average over a varying workload and compares with nothing.
+//
+// THE HARDWARE IS NOT CLOSE TO EQUAL AND THE COMPARISON IS WORTHLESS WITHOUT SAYING SO. Theirs: Apple M5
+// **Pro, 20 GPU cores**, 48 GB, MacBook **Pro on AC**, macOS 26.4.1, trunk in **fp16**. This: Apple M5,
+// **8 GPU cores**, 16 GB, **fanless MacBook Air**, macOS 26.6.2, int8 weights with half arithmetic.
+// GPU-busy ms a pass here (forward sweep then the same lengths REVERSED, agreeing within 0.5% at every one,
+// so drift is not in these numbers) against their archived median:
+//
+//     N      ours    theirs   ratio   per core
+//     64     22.9     11.23    2.04      1.23x
+//    128     65.4     39.71    1.65      1.52x
+//    180    123.8     93.06    1.33      1.88x
+//    256    238.5    174.48    1.37      1.83x
+//    384    535.7    389.82    1.37      1.82x
+//    512    995.6    692.28    1.44      1.74x
+//
+// So **1.33-1.44x slower in absolute ms from 180 tokens up, on 2.5x fewer GPU cores** - about 1.8x the work
+// per core. The 2.04 at n = 64 falling to 1.37 is this port's fixed per-pass overhead, which only shows at
+// small n. Our us/n^2 is FLAT (3.82 at 180, 3.80 at 512) where theirs is 2.87 and 2.64, so both are n^2 and
+// the gap is a constant factor, not a scaling difference.
+//
+// 🔴 AND END TO END THE GAP IS SMALLER THAN THE PER-PASS GAP, which is the interesting part. 60 steps / 180
+// passes at 180 tokens, 3 designs: **70.35 s wall, 23.45 s a design**, CA-CA 3.84 A median, and **100%
+// GPU-busy**. Theirs: 419 s for 20 designs = 20.95 s a design on the same basis (process start and model
+// load included), of which its own docs put **0.9 s a design** outside the trunk (torch features, sampler,
+// heads, decoder at fp32). This port has no such side - it is GPU-bound end to end - so 1.33x a pass
+// becomes ~1.12x a design. Read that as ~1.25x: our three designs drifted 124.0 -> 130.1 -> 134.7 ms a pass
+// (+8.6%) where their 20-design run absorbs more of its own reported ~25% per 15 minutes.
+//
+// 🔴 AND THE SHARPEST NUMBER IS THEIR OWN PROJECTION FOR THIS MACHINE. Their `hardware_projection.md` puts
+// THEIR port on an M5 fanless Air at **15.4 min for 20 designs = 46.2 s a design** (range 42-78), assuming
+// **10** GPU cores. This port measures **23.45 s a design on 8** - about **2x their projection on 20% fewer
+// cores than it assumed**. Memory is the wider margin: peak **1.77 GB at 180 tokens** against their measured
+// 6.5 GB, and **6.03 GB at 512** against their >= 9.7 GB projection; they tested only 48 GB and say 8 GB is
+// "likely too tight".
+//
+// 🔴 WHAT IS NOT MEASURED, AND IT IS THE ONE THAT WOULD SETTLE IT: their code has NOT been run on this Mac.
+// The sandbox refused to execute the downloaded package, so every number of theirs above is as published and
+// the hardware difference is NORMALISED rather than removed. Per-core normalisation assumes linear scaling in
+// cores, which their own doc flags (~30% of a pair update is bandwidth-bound, and an M5 Pro has more
+// bandwidth), and the precisions differ - int8 weights move less than fp16, so part of this margin is the
+// bundle and not the kernels. The honest form of all of it is: comparable speed per pass, better speed per
+// core, much better memory, and one experiment still owed.
+//
 // So no kernel here is worth another tile sweep. The lever left is FEWER PASSES OVER THE PAIR TRACK - fusing an
 // elementwise pass into the epilogue of the GEMM that produced it, as the gate, the residual and the next
 // LayerNorm already are - and `gemmGatedAdd`'s own 878 MB is the measure of what one such pass costs. The
