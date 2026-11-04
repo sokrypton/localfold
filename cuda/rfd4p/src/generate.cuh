@@ -486,8 +486,28 @@ inline Insertion resolveInsertion(const GenOut& g, int n, const float* insertion
   return ok ? predicted : Insertion{};
 }
 
+/**
+ * `align_atom_array_to_input_frame`, and then back out of the centred frame.
+ *
+ * 🔴 THE SECOND HALF WAS MISSING FROM BOTH PORTS AND IS WHY NEITHER WRITER MATCHED THE PAGE'S.
+ * `centerAndFeaturizeCentroid` subtracts a centroid from everything the model is conditioned on, so a design
+ * aligned onto those coordinates lands in the CENTRED frame - a binder a centroid away from the target the
+ * reader loaded. `processSampleToAtoms` adds it back (shared/rfd4p/output.js, upstream's `3a7cda9d`) and
+ * nothing here did, because the featuriser computed that centroid and exported nothing: a motif design
+ * differed from the page's text on 337 of 612 lines. It exports `meta/centerShift*` now and `centerShift` is
+ * those three numbers, or null for a work directory written before that.
+ *
+ * 🔴 AND IT IS ADDED ON THE ANCHOR COUNT, NOT ON THE FIT. One or two anchors do not fix a frame so the
+ * rotation below declines them - and the translation still applies, as the reference's own
+ * `if (anchorIndices.length && ...)` has it. So the shift is added wherever there is an anchor at all, past
+ * the early return that the fit takes.
+ */
 inline void alignToInputFrame(GenOut& g, int n, const float* condCoord, const float* condIntCrd,
-                              const int* coordGroup, const OutNaming& naming) {
+                              const int* coordGroup, const OutNaming& naming,
+                              const double* centerShift = nullptr) {
+  // 🔴 ...AND WITH NO CONDITIONING THERE IS NO FRAME TO RETURN TO EITHER. A contig's design is the model's own
+  // frame and the centroid was taken over every atom rather than a conditioned subset; the reference gates its
+  // add-back on having anchors, which a job with no `condCoord` cannot have.
   if (!condCoord) return;
   const size_t slots = (size_t)n * 37;
   // 🔴 ONLY WHAT IS WRITTEN TAKES PART. The reference builds its records first and aligns those,
@@ -538,8 +558,19 @@ inline void alignToInputFrame(GenOut& g, int n, const float* condCoord, const fl
       }
     }
   }
-  // Three anchors or none, as upstream's `anchor_mask.sum() < 3` (output.js has the note).
-  if (anchors.size() < 3) return;
+  // ...and back out of the centred frame, on any anchor at all (see the note above).
+  const bool shiftIt = !anchors.empty() && centerShift &&
+                       (centerShift[0] != 0.0 || centerShift[1] != 0.0 || centerShift[2] != 0.0);
+  auto shift = [&]() {
+    if (!shiftIt) return;
+    for (size_t s = 0; s < slots; ++s) {
+      if (!g.atomMask[s]) continue;
+      float* c = &g.coors[(size_t)(s / 37) * 111 + (s % 37) * 3];
+      for (int k = 0; k < 3; ++k) c[k] = (float)((double)c[k] + centerShift[k]);
+    }
+  };
+  // Three anchors or none for the ROTATION, as upstream's `anchor_mask.sum() < 3` (output.js has the note).
+  if (anchors.size() < 3) { shift(); return; }
   std::vector<double> fixed, mobile;
   for (const int s : anchors) {
     for (int k = 0; k < 3; ++k) {
@@ -548,7 +579,7 @@ inline void alignToInputFrame(GenOut& g, int n, const float* condCoord, const fl
     }
   }
   const superpose::Fit f = superpose::superimpose(fixed, mobile);
-  if (!f.ok) return;
+  if (!f.ok) { shift(); return; }
   // 🔴 ROUNDED TO FLOAT AT EACH COMPONENT, as the reference's `Math.fround` is - the writer
   // prints three decimals and a double carried to the print rounds differently in the last place.
   for (size_t s = 0; s < slots; ++s) {
@@ -561,6 +592,7 @@ inline void alignToInputFrame(GenOut& g, int n, const float* condCoord, const fl
                      f.fixedCenter[r]);
     }
   }
+  shift();
 }
 
 /** A chain index as mmCIF/PDB names them: A..Z, then AA, BB, ... as the reference's own does. */

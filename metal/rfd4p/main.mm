@@ -112,6 +112,38 @@
 //
 // REFUSED BY NAME rather than run as something else: nothing, in this checkpoint's configuration.
 //
+// AGAINST cuda/rfd4p, FLAG BY FLAG, because "fully ported" is a claim and a claim should be checkable. Every
+// flag that port's parser accepts, and what this one does with it:
+//   --job= --work-dir= --out= --seed= --designs= --oracle= --encoder= --metrics= --dump-sample=
+//                      the same, and `--out=x.cif` picks mmCIF in both
+//   --int8= --weights=  `--bundle=` here: one bundle, the page's published int8, where cuda/rfd4p takes either
+//                       that or a float32 checkpoint directory
+//   --generate=         `--gen=`
+//   --recycles= --repeat= --no-insertion
+//                       the same, and all three exercised: `--recycles=2` reports two recycles, `--repeat=3`
+//                       prices a trunk pass, `--no-insertion` leaves the 40 unindexed tokens of
+//                       `motif_unidx_1prw` ungrafted and writes a different file
+//   --config= --length= --step= --spec=
+//                       forwarded to the featuriser, which is what cuda/rfd4p's own FEATURISER_ONLY list does
+//   --fast              this port's default IS the fast arithmetic - half weights, activations and pair track -
+//                       and `--f32` is the control, so the axis is here with its sense reversed
+//   --gen-oracle= --enc-oracle=
+//                       the generation's and the encoder's oracle directories, which this port reads through
+//                       `--gen=` and `--encoder=` beside `--oracle=`
+// 🔴 AND ONE IS NOT HERE: `--refold[=af3|af2]`, upstream's REFOLDING ORACLE - each design that passes the
+// pre-oracle filters refolded by this tree's own AlphaFold 3 or AlphaFold 2 and scored as upstream scores it.
+// `oracle.h` itself is portable: it is host-only C++ and COMPILES CLEAN under clang against the derived
+// headers (checked), and `metal/af3/localfold-af3` and `metal/af2/localfold-af2` sit in the same relative
+// place as their cuda/ twins, so even `oracleBinary`'s path arithmetic would carry over. What does not carry
+// is the command it runs: that function drives
+//     localfold-af3 --job=<j> --out=<o> --recycles=5 --steps=200 --seed=N
+//     localfold-af2 --job=<j> --model=<m> --out=<o> --msa-mask=0 --template-pad=zero --fast --raw-confidences
+// and the Metal af3 and af2 ports take a FEATURISED INPUT DIRECTORY rather than a job, with no `--job=`,
+// `--model=`, `--msa-mask=`, `--template-pad=` or `--raw-confidences` between them. Porting it means giving
+// those two ports a job interface - the featuriser linked in, as this port has - which is work in two other
+// ports rather than in this one. 🔴 AND THE af3 HALF CANNOT BE EXERCISED HERE AT ALL: metal/af3 needs
+// DeepMind's terms, which are not ours to accept.
+//
 // THE GATE, over an exported input directory rather than a job:
 //   localfold-rfd4p <input dir> --bundle=<model-rfd4p-int8> [--oracle=<dir>] [--encoder=<dir>] [--gen=<dir>-gen]
 //     [--out=design.pdb] [--f16]
@@ -182,6 +214,8 @@ double checkFn(const char* label, const std::string& key, const float* ours, siz
 
 int main(int argc, char** argv) {
   std::string input, bundle, oracle, encDir, genDir, outPath, job, workDir, seed, metricsPath, dumpSample;
+  std::vector<std::string> featuriserArgs;
+  int recycles = 0, repeat = 0;
   int designs = 1;
   for (int i = 1; i < argc; ++i) {
     const char* a = argv[i];
@@ -196,6 +230,16 @@ int main(int argc, char** argv) {
     else if (!strncmp(a, "--designs=", 10)) designs = atoi(a + 10);
     else if (!strncmp(a, "--metrics=", 10)) metricsPath = a + 10;
     else if (!strncmp(a, "--dump-sample=", 14)) dumpSample = a + 14;
+    // cuda/rfd4p's own flags, so a command that drives one port drives the other
+    else if (!strncmp(a, "--recycles=", 11)) recycles = atoi(a + 11);
+    else if (!strncmp(a, "--repeat=", 9)) repeat = atoi(a + 9);
+    else if (!strcmp(a, "--no-insertion")) NO_INSERTION = true;
+    // 🔴 ...AND THE FEATURISER'S OWN, FORWARDED RATHER THAN REFUSED. `--config=`, `--length=` and `--step=`
+    // are read by the featuriser and by nothing in this port, which is why cuda/rfd4p keeps a
+    // FEATURISER_ONLY list: a flag this parser rejects is a job that cannot be expressed here at all, and a
+    // flag it silently swallows is worse.
+    else if (!strncmp(a, "--config=", 9) || !strncmp(a, "--length=", 9) || !strncmp(a, "--step=", 7))
+      featuriserArgs.push_back(a);
     else if (!strcmp(a, "--f16")) HALF = true;
     else if (!strcmp(a, "--f32")) HALF = false;
     else if (a[0] != '-') input = a;
@@ -235,6 +279,7 @@ int main(int argc, char** argv) {
     }
     std::vector<std::string> fargs = {"rfd4p-featurise", workDir, "--spec=" + job, "--generate", "--int8=" + fbundle};
     if (!seed.empty()) fargs.push_back("--seed=" + seed);
+    for (const std::string& f : featuriserArgs) fargs.push_back(f);
     std::vector<char*> fargv;
     for (std::string& f : fargs) fargv.push_back(f.data());
     const double tf = now();
@@ -259,7 +304,7 @@ int main(int argc, char** argv) {
   if (input.empty() || bundle.empty()) {
     fprintf(stderr, "usage: localfold-rfd4p --job=<spec.json|.yaml> --bundle=<model-rfd4p-int8> [--out=design.pdb|.cif]\n"
                     "         [--designs=N] [--seed=N] [--metrics=<file.json>]\n"
-                    "         [--dump-sample=<dir>] [--f32]\n"
+                    "         [--dump-sample=<dir>] [--recycles=N] [--repeat=N] [--no-insertion] [--f32]\n"
                     "       localfold-rfd4p <input dir> --bundle=<model-rfd4p-int8> [--oracle=<dir>] "
                     "[--encoder=<dir>] [--gen=<dir>-gen] [--out=design.pdb] [--designs=N] [--f32]\n");
     return 2;
@@ -296,7 +341,8 @@ int main(int argc, char** argv) {
     if (probe) { fclose(probe); M.loadInput(go); }
   }
   D_.n = (int)M.meta("meta/n");
-  D_.nRecycle = (int)M.meta("meta/nRecycle", 1);
+  // `--recycles=` overrides what the input was exported with, as cuda/rfd4p's does.
+  D_.nRecycle = recycles > 0 ? recycles : (int)M.meta("meta/nRecycle", 1);
   const int n = D_.n;
   const size_t nn = (size_t)n * n;
   printf("rfd4p: %d tokens, %d recycle%s, bundle %s (%.2f GB of weights in %.2f s)\n", n, D_.nRecycle,
@@ -342,6 +388,31 @@ int main(int argc, char** argv) {
   condC(cond0, c, n);
   initSingle(seqF, sInit);
   initPair(pairF, pairCondF, zInit);
+
+  // 🔴 `--repeat=N`: THE TRUNK ON A CLOCK, as cuda/rfd4p's own arm is - it compares nothing and gates nothing,
+  // it prices a pass. The state is re-zeroed every time because the first cycle's input IS the init product
+  // (trunk.mm says why), so a pass that inherited the last one's `s` would be timing a different computation.
+  if (repeat > 0) {
+    float* rs = allocT<float>((size_t)n * D_.D);
+    Z rz;
+    if (HALF) rz.h = allocT<half>(nn * D_.P); else rz.f = allocT<float>(nn * D_.P);
+    float* rbb = allocT<float>((size_t)n * 3);
+    float* rll = allocT<float>((size_t)n * 32);
+    float* rlg = allocT<float>((size_t)n * 147);
+    double ms = 0;
+    for (int i = 0; i < repeat; ++i) {
+      fill(rs, 0, (size_t)n * D_.D * 4);
+      fill(rz.h ? (void*)rz.h : (void*)rz.f, 0, nn * D_.P * (rz.h ? 2 : 4));
+      sync();
+      const double t0 = now();
+      trunkForward(seqF, cond0, M.has("in/cond1") ? M.f("in/cond1") : cond0, pairF, pairCondF, D_.nRecycle,
+                   rs, rz, rbb, rll, rlg, nullptr);
+      sync();
+      ms += (now() - t0) * 1e3;
+    }
+    printf("trunk: %.3f ms a pass (%d tokens, %d recycle%s, %d passes)\n", ms / repeat, n, D_.nRecycle,
+           D_.nRecycle == 1 ? "" : "s", repeat);
+  }
 
   float* s = allocT<float>((size_t)n * D_.D);
 

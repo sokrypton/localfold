@@ -643,9 +643,13 @@ int generate(const Opts& o, const rfd4p::Dims& d, rfd4p::Trunk& t) {
     // 🔴 INTO THE INPUT'S FRAME BEFORE ANYTHING IS WRITTEN. A contig has no conditioned
     // coordinates, so this is a no-op there; a structure job's output is otherwise in the
     // sampler's centred frame and superposes on nothing.
+    // The centroid the featuriser subtracted, so this writer returns the design to the INPUT's frame as the
+    // page's does; absent from a work directory written before it was exported, and then zero.
+    const double centerShift[3] = {M.meta("meta/centerShift0", 0.0), M.meta("meta/centerShift1", 0.0),
+                                   M.meta("meta/centerShift2", 0.0)};
     rfd4p::alignToInputFrame(g, n, condCoordRW.empty() ? nullptr : condCoordRW.data(),
                              condIntCrdRW.empty() ? nullptr : condIntCrdRW.data(),
-                             coordGroupRW.empty() ? nullptr : coordGroupRW.data(), naming);
+                             coordGroupRW.empty() ? nullptr : coordGroupRW.data(), naming, centerShift);
     // The records the page's `processSampleToAtoms` builds, from the INPUT's conditioning as it
     // was before any grafting - which atom carried a conditioned coordinate is a fact about the
     // input, and the grafted ones are named by `crdSource`.

@@ -12,6 +12,7 @@ Dims D_;
 // 3.36 -> 1.00 s for a 183-token one. `--f32` is the exact arm and the one the oracle gate's tight bounds
 // belong to; it is one flag away and the recipe in main.mm runs both.
 bool HALF = true;
+bool NO_INSERTION = false;
 
 void loadWeights(const std::string& dir) {
   // 🔴 EVERY TENSOR FLOAT32 UNTIL A STAGE ASKS OTHERWISE. The trunk's GEMMs are held to a float64 CPU reference at

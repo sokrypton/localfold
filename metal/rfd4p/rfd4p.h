@@ -39,6 +39,10 @@ extern Dims D_;
 void loadWeights(const std::string& dir);
 void checkDims();
 extern bool HALF;
+// `--no-insertion`: the unindexed motif is NOT grafted onto the token the head names, as
+// cuda/rfd4p's own flag has it - the design is written without the motif's annotations, which is
+// also what happens when the mapping cannot be applied.
+extern bool NO_INSERTION;
 
 // ---------------------------------------------------------------- ops.mm
 // Y[rows, out] = X[rows, in] W[out, in]^T (+ bias) - torch's layout, which every tensor in this checkpoint uses
