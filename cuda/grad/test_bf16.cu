@@ -62,10 +62,12 @@ int main(int argc, char** argv) {
   init();
   if (argc > 1 && !strcmp(argv[1], "--no-flash")) FLASH = false;   // (which half of BF16 a difference comes from)
   curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT);
-  for (bool extra : {false, true}) {
+  for (int arm = 0; arm < 3; ++arm) {   // main, extra, and main with training dropout (the same masks both arms)
+    const bool extra = arm == 1;
     curandSetPseudoRandomGeneratorSeed(gen, 3);
     const int L = 72, S = 40;
     af2::Block b; b.extra = extra; b.Cm = extra ? 64 : 256;
+    b.dropout = arm == 2; b.dropSeed = 9;
     af2::forEachParam(b, [&](const std::string& n, Param& p, size_t len) {
       p.name = n; p.n = len; p.w = randn(len, 0.05f); GK(cudaMalloc(&p.g, len * 4)); b.params.add(p); });
     for (auto* p : b.params.all)
@@ -76,17 +78,18 @@ int main(int argc, char** argv) {
     float *mo, *po, *dm, *dp;
     GK(cudaMalloc(&mo, mr * 4)); GK(cudaMalloc(&po, pr * 4)); GK(cudaMalloc(&dm, mr * 4)); GK(cudaMalloc(&dp, pr * 4));
     Run r[2];
-    for (int arm = 0; arm < 2; ++arm) {
-      setBf16(arm == 1);
+    for (int bfa = 0; bfa < 2; ++bfa) {
+      setBf16(bfa == 1);
       b.params.zeroGrad(); ARENA.reset();
       af2::BlockSave s = af2::blockForward(b, msa, pair, mm, pm, mo, po, S, L);
       af2::blockBackward(b, s, mm, pm, ctm, ctp, dm, dp);
       GK(cudaStreamSynchronize(STREAM)); GK(cudaGetLastError());
-      r[arm].out = {hostv(mo, mr), hostv(po, pr), hostv(dm, mr), hostv(dp, pr)};
-      for (auto* p : b.params.all) r[arm].grads.push_back(hostv(p->g, p->n));
+      r[bfa].out = {hostv(mo, mr), hostv(po, pr), hostv(dm, mr), hostv(dp, pr)};
+      for (auto* p : b.params.all) r[bfa].grads.push_back(hostv(p->g, p->n));
     }
     const char* names[] = {"msa out", "pair out", "d msa", "d pair"};
-    compare(extra ? "AF2 extra block (L 72, S 40, Cm 64)" : "AF2 block (L 72, S 40, Cm 256)", r[0], r[1], b.params.all, names,
+    compare(arm == 1 ? "AF2 extra block (L 72, S 40, Cm 64)" : arm == 2 ? "AF2 block with dropout" : "AF2 block (L 72, S 40, Cm 256)",
+            r[0], r[1], b.params.all, names,
             1e-2, 3.5e-2, 8e-2);
   }
   {

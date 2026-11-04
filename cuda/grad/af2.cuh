@@ -342,7 +342,8 @@ __host__ __device__ __forceinline__ unsigned long long mix64(unsigned long long 
   x = (x ^ (x >> 27)) * 0x94d049bb133111ebull;
   return x ^ (x >> 31);
 }
-__global__ void dropoutK(real* x, int A, int B, int C, bool perRow, bool trans, float rate, unsigned long long seed) {
+template <class T>
+__global__ void dropoutK(T* x, int A, int B, int C, bool perRow, bool trans, float rate, unsigned long long seed) {
   const size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)A * B * C) return;
   const int c = (int)(t % C);
@@ -351,12 +352,13 @@ __global__ void dropoutK(real* x, int A, int B, int C, bool perRow, bool trans, 
   if (trans) { a = (int)(r % A); b = (int)(r / A); } else { a = (int)(r / B); b = (int)(r % B); }
   const unsigned long long key = perRow ? (unsigned long long)b * C + c : ((unsigned long long)a * C + c) | (1ull << 62);
   const float u = (float)(mix64(seed ^ mix64(key)) >> 40) * (1.f / 16777216.f);
-  x[t] = u < rate ? (real)0 : x[t] / (real)(1 - rate);
+  if (u < rate) str(x + t, 0); else str(x + t, ldr(x + t) / (1 - (real)rate));   // (real arithmetic: the f64 gate's)
 }
 // rates by module (AF2's config): row attention 0.15 per row, the four pair modules 0.25 (the ending node per
 // column), every other 0
 enum DropMod { DROP_ROW = 1, DROP_TRI_OUT, DROP_TRI_IN, DROP_TRI_START, DROP_TRI_END };
-inline void dropout(const Block& b, DropMod m, real* x, int A, int Bd, int C, bool trans) {
+template <class T>
+inline void dropout(const Block& b, DropMod m, T* x, int A, int Bd, int C, bool trans) {
   if (!b.dropout) return;
   const float rate = m == DROP_ROW ? 0.15f : 0.25f;
   dropoutK<<<blocks((size_t)A * Bd * C), 256, 0, STREAM>>>(x, A, Bd, C, m != DROP_TRI_END, trans, rate,
@@ -484,27 +486,42 @@ inline void pairBiasBackward(const real* pn, Param& w, const real* dnb, real* dp
   mmBT(t, w.w, dpn, L * L, Cz, H, accumulate ? 1.f : 0.f);
 }
 
-// dmsaOut, dpairOut -> dmsa, dpair (written). Every parameter gradient accumulates.
-inline void blockBackward(Block& b, const BlockSave& s, const real* msaMask, const real* pairMask,
-                          const real* dmsaOut, const real* dpairOut, real* dmsa, real* dpair) {
+// the pair gradient's buffers either way (blockBackwardT)
+#ifndef GRAD_F64
+inline bf* bfGetT(size_t n) { return bfGet(n); }
+inline void toP(const real* x, bf* y, size_t n) { toBf(x, y, n); }
+inline void fromP(const bf* x, real* y, size_t n) { bfToFK<<<blocks(n), 256, 0, STREAM>>>(x, y, n); }
+#else
+inline real* bfGetT(size_t n) { return ARENA.get(n); }
+#endif
+inline void toP(const real* x, real* y, size_t n) { GK(cudaMemcpyAsync(y, x, n * sizeof(real), cudaMemcpyDeviceToDevice, STREAM)); }
+inline void fromP(const real* x, real* y, size_t n) { GK(cudaMemcpyAsync(y, x, n * sizeof(real), cudaMemcpyDeviceToDevice, STREAM)); }
+// PD: the pair's running gradient's type - real, or bf16 in BF16 mode (bindcraft2's dp; the MSA's stays float)
+template <class PD>
+inline void blockBackwardT(Block& b, const BlockSave& s, const real* msaMask, const real* pairMask,
+                           const real* dmsaOut, const real* dpairOut, real* dmsa, real* dpair) {
   const int S = s.S, L = s.L, Cm = b.Cm, Cz = b.Cz;
   size_t mr = (size_t)S * L, pr = (size_t)L * L;
-  real* dp = clone(dpairOut, pr * Cz);        // the running gradient of the pair
+  constexpr bool BP = sizeof(PD) == 2;
+  auto getP = [&](size_t n) { return reinterpret_cast<PD*>(BP ? (real*)bfGetT(n) : ARENA.get(n)); };
+  auto cloneP = [&](const PD* x, size_t n) { PD* y = getP(n); GK(cudaMemcpyAsync(y, x, n * sizeof(PD), cudaMemcpyDeviceToDevice, STREAM)); return y; };
+  PD* dp = getP(pr * Cz);                     // the running gradient of the pair
+  toP(dpairOut, dp, pr * Cz);
   real* dm = clone(dmsaOut, mr * Cm);         // and of the MSA
   // pair transition
-  { Range r("bw.pairTrans"); transBackward(b.pairTrans, s.pairT, dpairOut, dp, true); }
+  { Range r("bw.pairTrans"); transBackward(b.pairTrans, s.pairT, (const PD*)dp, dp, true); }
   // ending node: pair5 = pair4 + swap(attn(enXn))
   {
     Range r("bw.triEnd");
     Scratch scratch;
-    real* dupdT = ARENA.get(pr * Cz);
+    PD* dupdT = getP(pr * Cz);
     swap01(dp, dupdT, L, L, Cz);
     dropout(b, DROP_TRI_END, dupdT, L, L, Cz, true);
     real* dnb = ARENA.zeros(pr * 4);
     real* dxn = ARENA.get(pr * Cz);
     attnBackward(b.triEnd.at, s.enA, s.pairMaskT, s.enNb, dupdT, dxn, dnb, false);
     pairBiasBackward(s.enXn, b.triEnd.feat2d, dnb, dxn, L, Cz, 4, true);
-    real* dx = ARENA.get(pr * Cz);
+    PD* dx = getP(pr * Cz);
     lnBackward(b.triEnd.qn, s.enQ, dxn, dx, pr, false);
     swap01(dx, dp, L, L, Cz, true);
   }
@@ -514,8 +531,8 @@ inline void blockBackward(Block& b, const BlockSave& s, const real* msaMask, con
     Scratch scratch;
     real* dnb = ARENA.zeros(pr * 4);
     real* dxn = ARENA.get(pr * Cz);
-    const real* dst = dp;
-    if (b.dropout) { real* t = clone(dp, pr * Cz); dropout(b, DROP_TRI_START, t, L, L, Cz, false); dst = t; }
+    const PD* dst = dp;
+    if (b.dropout) { PD* t = cloneP(dp, pr * Cz); dropout(b, DROP_TRI_START, t, L, L, Cz, false); dst = t; }
     attnBackward(b.triStart.at, s.stA, pairMask, s.stNb, dst, dxn, dnb, false);
     pairBiasBackward(s.stXn, b.triStart.feat2d, dnb, dxn, L, Cz, 4, true);
     lnBackward(b.triStart.qn, s.stQ, dxn, dp, pr, true);
@@ -526,11 +543,11 @@ inline void blockBackward(Block& b, const BlockSave& s, const real* msaMask, con
     // (BF16: in place - triMulBackwardBf reads dout whole before it adds into dpair)
     // (with dropout the module's gradient is the masked copy, so nothing is in place)
     const bool inPlace = BF16 && !b.dropout;
-    real* dpu = inPlace ? dp : clone(dp, pr * Cz);
+    PD* dpu = inPlace ? dp : cloneP(dp, pr * Cz);
     dropout(b, DROP_TRI_IN, dpu, L, L, Cz, false);
     { Range r("bw.triIn"); triMulBackward(b.triIn, s.tIn, pairMask, dpu, dp); }
     Range r("bw.triOut");
-    if (!inPlace) dpu = clone(dp, pr * Cz);
+    if (!inPlace) dpu = cloneP(dp, pr * Cz);
     dropout(b, DROP_TRI_OUT, dpu, L, L, Cz, false);
     triMulBackward(b.triOut, s.tOut, pairMask, dpu, dp);
   }
@@ -570,7 +587,15 @@ inline void blockBackward(Block& b, const BlockSave& s, const real* msaMask, con
   }
   if (b.opmFirst) { Range r("bw.opm"); opmBackward(b.opm, s.opm, msaMask, dp, dm); }    // pair1 = pair + opm(msa)
   GK(cudaMemcpyAsync(dmsa, dm, mr * Cm * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
-  GK(cudaMemcpyAsync(dpair, dp, pr * Cz * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
+  fromP(dp, dpair, pr * Cz);
+}
+// dmsaOut, dpairOut -> dmsa, dpair (written). Every parameter gradient accumulates.
+inline void blockBackward(Block& b, const BlockSave& s, const real* msaMask, const real* pairMask,
+                          const real* dmsaOut, const real* dpairOut, real* dmsa, real* dpair) {
+#ifndef GRAD_F64
+  if (BF16) { blockBackwardT<bf>(b, s, msaMask, pairMask, dmsaOut, dpairOut, dmsa, dpair); return; }
+#endif
+  blockBackwardT<real>(b, s, msaMask, pairMask, dmsaOut, dpairOut, dmsa, dpair);
 }
 
 }  // namespace af2

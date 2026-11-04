@@ -485,14 +485,17 @@ inline void sdpaBackwardBf(const Sdpa& a, const bf* q, int ldq, const bf* k, int
   }
 }
 // [A, B, C] -> [B, A, C] on bf16
-__global__ void swap01BfK(const bf* __restrict__ in, bf* __restrict__ out, int A, int B, int C) {
+__global__ void swap01BfK(const __nv_bfloat162* __restrict__ in, __nv_bfloat162* __restrict__ out, int A, int B,
+                          int C2, bool accumulate) {   // (a channel pair a thread)
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= (size_t)A * B * C) return;
-  int c = t % C; size_t ab = t / C; int b = ab % B, a = (int)(ab / B);
-  out[((size_t)b * A + a) * C + c] = in[t];
+  if (t >= (size_t)A * B * C2) return;
+  int c = t % C2; size_t ab = t / C2; int b = ab % B, a = (int)(ab / B);
+  const size_t o = ((size_t)b * A + a) * C2 + c;
+  out[o] = accumulate ? __hadd2(out[o], in[t]) : in[t];
 }
-inline void swap01(const bf* in, bf* out, int A, int B, int C) {
-  swap01BfK<<<blocks((size_t)A * B * C), 256, 0, STREAM>>>(in, out, A, B, C);
+inline void swap01(const bf* in, bf* out, int A, int B, int C, bool accumulate = false) {   // (C even)
+  swap01BfK<<<blocks((size_t)A * B * C / 2), 256, 0, STREAM>>>(reinterpret_cast<const __nv_bfloat162*>(in),
+                                                              reinterpret_cast<__nv_bfloat162*>(out), A, B, C / 2, accumulate);
 }
 // og = o * gate (bf16 out), and its backward: dO = dog gate, dgate_pre = dog o gate (1 - gate)
 __global__ void mulOgBfK(bf* og, const float* o, const bf* g, size_t n) {
@@ -676,15 +679,17 @@ inline AttnSave attnForwardBf(const Attention& a, const real* x, const real* mas
   s.qkvg = reinterpret_cast<real*>(qkvg); s.og = reinterpret_cast<real*>(og);
   return s;
 }
-inline void attnBackwardBf(Attention& a, const AttnSave& s, const real* mask, const real* nb, const real* dout,
+template <class DOUT>   // (DOUT bf16: BF16 mode's pair-track gradient)
+inline void attnBackwardBf(Attention& a, const AttnSave& s, const real* mask, const real* nb, const DOUT* dout,
                            real* dx, real* dnb, bool accumulate) {
   Scratch scratch;
   const int B = s.B, Q = s.Q, HD = a.H * a.D, roles = a.gating ? 4 : 3, P = roles * HD;
   const size_t rows = (size_t)B * Q;
   const bf *xb = reinterpret_cast<const bf*>(s.x), *W = reinterpret_cast<const bf*>(s.W),
            *qkvg = reinterpret_cast<const bf*>(s.qkvg), *og = reinterpret_cast<const bf*>(s.og);
-  colSum(a.bo.g, dout, rows, a.O);
-  const bf* db = toBf(dout, rows * a.O);
+  const bf* db;
+  if constexpr (sizeof(DOUT) == 2) { db = dout; colSumBf(a.bo.g, db, rows, a.O, a.O); }
+  else { colSum(a.bo.g, dout, rows, a.O); db = toBf(dout, rows * a.O); }
   mmATBf(og, db, a.wo.g, (int)rows, HD, a.O);
   real* dog = ARENA.get(rows * HD);
   mmBTBf(db, toBf(a.wo.w, (size_t)HD * a.O), dog, (int)rows, HD, a.O);
@@ -733,6 +738,12 @@ inline AttnSave attnForward(const Attention& a, const real* x, const real* mask,
   return s;
 }
 
+#ifndef GRAD_F64
+inline void attnBackward(Attention& a, const AttnSave& s, const real* mask, const real* nb, const bf* dout, real* dx,
+                         real* dnb, bool accumulate) {
+  attnBackwardBf(a, s, mask, nb, dout, dx, dnb, accumulate);
+}
+#endif
 // dout [B Q, O] -> dx [B Q, C] (written, or added with accumulate); dnb [H, Q, Q] accumulated when not null
 inline void attnBackward(Attention& a, const AttnSave& s, const real* mask, const real* nb, const real* dout,
                          real* dx, real* dnb, bool accumulate) {
@@ -970,11 +981,13 @@ inline TransSave transForwardBf(const Transition& t, const real* x, real* out, s
   s.xn = reinterpret_cast<real*>(xn); s.h = reinterpret_cast<real*>(h);
   return s;
 }
-inline void transBackwardBf(Transition& t, const TransSave& s, const real* dout, real* dx, bool accumulate) {
+template <class PD>   // (PD: the running gradient's type)
+inline void transBackwardBf(Transition& t, const TransSave& s, const PD* dout, PD* dx, bool accumulate) {
   Scratch scratch;
   const size_t rows = s.rows, n = rows * t.l1.N;
   const bf *xn = reinterpret_cast<const bf*>(s.xn), *h = reinterpret_cast<const bf*>(s.h);
-  const bf* db = toBf(dout, rows * t.l2.N);
+  const bf* db;
+  if constexpr (sizeof(PD) == 2) db = dout; else db = toBf(dout, rows * t.l2.N);
   bf* dr = bfGet(n);
   linearBwdBf(t.l2, h, db, dr, rows);
   bf* dxn = bfGet(rows * t.ln.C);   // (only the LayerNorm's backward reads it)
@@ -1008,6 +1021,11 @@ inline TransSave transForward(const Transition& t, const real* x, real* out, siz
   t.l2.forward(s.h, out, rows);
   return s;
 }
+#ifndef GRAD_F64
+inline void transBackward(Transition& t, const TransSave& s, const bf* dout, bf* dx, bool accumulate) {
+  transBackwardBf(t, s, dout, dx, accumulate);
+}
+#endif
 inline void transBackward(Transition& t, const TransSave& s, const real* dout, real* dx, bool accumulate) {
 #ifndef GRAD_F64
   if (s.bf) { transBackwardBf(t, s, dout, dx, accumulate); return; }
