@@ -175,6 +175,13 @@
 // inverse folding. Measured, consecutive CA-CA within a chain at 60 steps: unconditional 3.81 A over
 // [3.69, 3.92], motif 3.80, interface 3.80, small molecule 3.83, partial 3.74 - and inverse folding returns the
 // input's own backbone to 0.0005 A, the nm-to-angstrom rounding.
+// 🔴 AND AT 400 TOKENS TOO, which is 160,000 pairs and 5.9x the largest case any oracle here covers: the
+// converged backbone is **3.85 A over [3.76, 3.94]**, the same band as 54 residues, and three runs are
+// byte-identical. That is the length check that matters for the fused kernels - a tile edge case at 160,000
+// pairs would show up as a broken chain or as a run that differs from itself, and neither happens. (The
+// half-against-f32 differential is NOT the check to use there: at 8 steps the trajectory is chaotic, CA-CA
+// median 20 A, and the two arithmetics pick different residues at a few positions - 2598 of 2612 atoms
+// matched at 0.19 A rms. That is precision sensitivity on an unconverged sample, not a disagreement.)
 // 🔴 READ THOSE AT A CONVERGED STEP COUNT: the same code at 2 steps gives 11 A and at 60 gives 3.81. The
 // trajectory gate below runs at 2 steps and says nothing about geometry; they are different questions.
 // 🔴 AND HALF COSTS 0.022 A: the same seed through both arithmetics gives designs 0.022 A RMS apart (worst
