@@ -78,6 +78,28 @@
 // LayerNorm already are - and `gemmGatedAdd`'s own 878 MB is the measure of what one such pass costs. The
 // attention no longer reaches the profile's top twenty-four.
 //
+// 🔴 AND THE ONE WORTH TAKING IS THE TRIANGLE'S GATE INTO ITS PROJECTION, PRICED AT 7.6% BY MEASUREMENT AND
+// NOT LEFT AS AN ESTIMATE. The projection writes four pair-sized planes (55.8 MB at 165 tokens), `tri_ab_hm`
+// reads all four and writes two (83.7 MB), and a fused epilogue would write the two gated planes and nothing
+// else. Measured by skipping the gate's dispatch - wrong output, purely a price - over three interleaved
+// rounds: **13.06, 13.29, 13.59 s against 14.29, 14.28, 14.62**, a mean 1.08 s of 14.4 = 7.6%, which is the
+// 8.83 ms of 115 the profile gives it.
+// metal/core already HAS the epilogue: `gemmTriGate` does a triangle's projection and gate in one dispatch and
+// writes `outA`/`outB` channel-major. Two things stop this port using it, one small and one not:
+//   * ITS HOST WRAPPER TIES THE INPUT WIDTH TO THE CHANNEL COUNT - `g.m = 4 * C; g.k = C; g.ldb = C` from one
+//     `C`, where this triangle is 384 in and 256 out. `k`, `m` and `tgC` are SEPARATE GemmArgs fields, so an
+//     overload taking `in` would set them independently and leave af3's and bioemu2's calls untouched; and
+//     `lf_tri_quarters` already separates them (its `rows` IS the input width, its `C` the channels), so the
+//     matrix units' weight rearrangement generalises for nothing.
+//   * ITS SOURCE WEIGHT IS AF3'S BLOCKS-OF-8 PACKING, which this port does not build. Reading
+//     `lf_tri_quarters` backwards, the source is `[in][C/8][4][8]` - for each group of 8 channels, the four
+//     roles' 8 columns each - where `weightStack` here builds `[4T][P]`. That is a derived weight, built once
+//     at load like the others, so it is work rather than a wall.
+// NOT TAKEN HERE, and the reason is the blast radius rather than the size: that epilogue is woven through
+// gemm.metal and gemm_tensor.metal and is what af3's and bioemu2's triangles run, and af3's own gate cannot be
+// run on this machine at all because it needs DeepMind's terms. A 7.6% win on this port is not worth an
+// unverifiable change to the kernel two other ports depend on. The recipe above is the whole of what it takes.
+//
 // WHAT RUNS: unconditional, motif scaffolding, protein-protein interfaces, small molecules (whose chirality is
 // re-aligned every step), coordinate groups (whose labels are permuted every step), partial diffusion and
 // inverse folding. Measured, consecutive CA-CA within a chain at 60 steps: unconditional 3.81 A over
