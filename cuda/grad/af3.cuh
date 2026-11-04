@@ -104,7 +104,7 @@ struct GridAttn {
   bool transpose = false;
   bool untransposedResidual = false;   // chai-1's parallel block: the column pass's update added as it comes out
 };
-struct GridSave { LnSave ln; real *xn, *act, *nb, *qkvg, *o; int n; real* lse = nullptr; };
+struct GridSave { LnSave ln; real *xn, *act, *nb, *qkvg, *o; int n; real* lse = nullptr; bool bf = false; };   // (bf: xn, act, qkvg in bf16)
 // rawBias [nn, H] -> nb [H, nn], the column direction's source transposed when swap
 __global__ void gridBiasK(const real* raw, real* nb, int n, int H, bool swap, bool back) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -122,9 +122,84 @@ inline Sdpa gridSdpa(const GridAttn& g, int n, const real* keyMask, const real* 
   a.bias[0] = Bias{nb, 0, (long long)n * n, n, dnb};
   return a;
 }
+#ifndef GRAD_F64
+// BF16: the normalised pair and q, k, v, gate kept in bf16, every projection a bf16 GEMM, the attention reading
+// them as they are
+inline GridSave gridForwardBf(const GridAttn& g, const Dialect& d, const real* pair, const real* mask,
+                              const real* maskT, real* out, int n) {
+  const size_t nn = (size_t)n * n;
+  const int HD = g.H * g.D;
+  GridSave s; s.n = n; s.bf = true;
+  bf* xn = bfGet(nn * g.C);
+  s.ln = lnForward(g.ln, pair, xn, nn);
+  s.nb = ARENA.get(nn * g.H);
+  {
+    Scratch scratch;
+    real* raw = ARENA.get(nn * g.H);
+    linearFwdBf(g.bias, xn, raw, nn);
+    gridBiasK<<<blocks(nn * g.H), 256, 0, STREAM>>>(raw, s.nb, n, g.H, g.transpose && d.swapTransposedBias, false);
+  }
+  bf* act = xn;
+  if (g.transpose) { act = bfGet(nn * g.C); swap01(xn, act, n, n, g.C); }
+  bf* qkvg = bfGet(nn * 4 * HD);
+  bf *q = qkvg, *k = q + nn * HD, *v = k + nn * HD, *gt = v + nn * HD;
+  linearFwdBf(g.q, act, q, nn); linearFwdBf(g.k, act, k, nn); linearFwdBf(g.v, act, v, nn); linearFwdBf(g.gate, act, gt, nn);
+  sigmoidBfK<<<blocks(nn * HD), 256, 0, STREAM>>>(gt, nn * HD);
+  s.o = ARENA.get(nn * HD);
+  { const Sdpa sd_ = gridSdpa(g, n, g.transpose ? maskT : mask, s.nb); s.lse = ARENA.get((size_t)2 * sd_.B * sd_.H * sd_.Q); sdpaForwardBf(sd_, q, HD, k, HD, v, HD, s.o, HD, s.lse); }
+  s.xn = reinterpret_cast<real*>(xn); s.act = reinterpret_cast<real*>(act); s.qkvg = reinterpret_cast<real*>(qkvg);
+  Scratch scratch;
+  bf* og = bfGet(nn * HD);
+  mulOgBfK<<<blocks(nn * HD), 256, 0, STREAM>>>(og, s.o, gt, nn * HD);
+  if (!g.transpose || g.untransposedResidual) { linearFwdBf(g.out, og, out, nn, 1.f); return s; }
+  real* t = ARENA.get(nn * g.C);
+  linearFwdBf(g.out, og, t, nn);
+  swap01(t, out, n, n, g.C, true);
+  return s;
+}
+inline void gridBackwardBf(GridAttn& g, const Dialect& d, const GridSave& s, const real* mask, const real* maskT,
+                           const real* dout, real* dpair) {
+  Scratch scratch;
+  const int n = s.n, HD = g.H * g.D;
+  const size_t nn = (size_t)n * n;
+  const bf *xn = reinterpret_cast<const bf*>(s.xn), *act = reinterpret_cast<const bf*>(s.act),
+           *qkvg = reinterpret_cast<const bf*>(s.qkvg);
+  const bf *q = qkvg, *k = q + nn * HD, *v = k + nn * HD, *gt = v + nn * HD;
+  const real* dy = dout;
+  if (g.transpose && !g.untransposedResidual) { real* t = ARENA.get(nn * g.C); swap01(dout, t, n, n, g.C); dy = t; }
+  const bf* dyb = toBf(dy, nn * g.C);
+  bf* og = bfGet(nn * HD);
+  mulOgBfK<<<blocks(nn * HD), 256, 0, STREAM>>>(og, s.o, gt, nn * HD);
+  real* dog = ARENA.get(nn * HD);
+  linearBwdBf(g.out, og, dyb, dog, nn);
+  real* dO = ARENA.get(nn * HD);
+  bf* dgt = bfGet(nn * HD);
+  ogBwdBfK<<<blocks(nn * HD), 256, 0, STREAM>>>(dog, s.o, gt, dO, dgt, nn * HD);
+  real* dqkv = ARENA.get(nn * 3 * HD);
+  real *dq = dqkv, *dk = dq + nn * HD, *dv = dk + nn * HD;
+  real* dnb = ARENA.zeros(nn * g.H);
+  sdpaBackwardBf(gridSdpa(g, n, g.transpose ? maskT : mask, s.nb, dnb), q, HD, k, HD, v, HD, dO, HD, dq, HD, dk, HD,
+                 dv, HD, s.o, HD, s.lse);
+  const bf* dqkvb = toBf(dqkv, nn * 3 * HD);
+  real* dact = ARENA.get(nn * g.C);
+  linearBwdBf(g.q, act, dqkvb, dact, nn);
+  linearBwdBf(g.k, act, dqkvb + nn * HD, dact, nn, true);
+  linearBwdBf(g.v, act, dqkvb + 2 * nn * HD, dact, nn, true);
+  linearBwdBf(g.gate, act, dgt, dact, nn, true);
+  real* dxn = dact;
+  if (g.transpose) { dxn = ARENA.get(nn * g.C); swap01(dact, dxn, n, n, g.C); }
+  real* draw = ARENA.zeros(nn * g.H);
+  gridBiasK<<<blocks(nn * g.H), 256, 0, STREAM>>>(draw, dnb, n, g.H, g.transpose && d.swapTransposedBias, true);
+  linearBwdBf(g.bias, xn, toBf(draw, nn * g.H), dxn, nn, true);
+  lnBackward(g.ln, s.ln, dxn, dpair, nn, true);
+}
+#endif
 // pair [n, n, C] -> out (+= when beta 1), mask / maskT [n, n]
 inline GridSave gridForward(const GridAttn& g, const Dialect& d, const real* pair, const real* mask, const real* maskT,
                             real* out, int n) {
+#ifndef GRAD_F64
+  if (BF16) return gridForwardBf(g, d, pair, mask, maskT, out, n);
+#endif
   size_t nn = (size_t)n * n;
   const int HD = g.H * g.D;
   GridSave s; s.n = n;
@@ -156,6 +231,9 @@ inline GridSave gridForward(const GridAttn& g, const Dialect& d, const real* pai
 }
 inline void gridBackward(GridAttn& g, const Dialect& d, const GridSave& s, const real* mask, const real* maskT,
                          const real* dout, real* dpair) {
+#ifndef GRAD_F64
+  if (s.bf) { gridBackwardBf(g, d, s, mask, maskT, dout, dpair); return; }
+#endif
   Scratch scratch;
   const int n = s.n, HD = g.H * g.D;
   size_t nn = (size_t)n * n;
@@ -424,19 +502,20 @@ inline void pairformerBackward(Pairformer& b, const Dialect& d, const Pairformer
     return;
   }
   if (b.hasSingle) {
+    Range r_("bw.single");
     const int Cs = b.single.C;
     real* ds = cloneR(dsingleOut, (size_t)n * Cs);
     gtBackward(b.singleTrans, s.st, dsingleOut, ds);
     { Scratch sc; real* dsa = cloneR(ds, (size_t)n * Cs); singleBackward(b.single, s.sa, seqMask, dsa, ds, dp, dextra); }
     GK(cudaMemcpyAsync(dsingle, ds, (size_t)n * Cs * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
   }
-  { Scratch sc; real* du = cloneR(dp, nn * Cz); gtBackward(b.pairTrans, s.pt, du, dp); }
+  { Range r_("bw.pairTrans"); Scratch sc; real* du = cloneR(dp, nn * Cz); gtBackward(b.pairTrans, s.pt, du, dp); }
   if (b.hasGrid) {
-    { Scratch sc; real* du = cloneR(dp, nn * Cz); gridBackward(b.grid2, d, s.g2, pairMask, maskT, du, dp); }
-    { Scratch sc; real* du = cloneR(dp, nn * Cz); gridBackward(b.grid1, d, s.g1, pairMask, maskT, du, dp); }
+    { Range r_("bw.grid2"); Scratch sc; real* du = cloneR(dp, nn * Cz); gridBackward(b.grid2, d, s.g2, pairMask, maskT, du, dp); }
+    { Range r_("bw.grid1"); Scratch sc; real* du = cloneR(dp, nn * Cz); gridBackward(b.grid1, d, s.g1, pairMask, maskT, du, dp); }
   }
-  { Scratch sc; real* du = cloneR(dp, nn * Cz); triMulBackward(b.triIn, s.tIn, pairMask, du, dp); }
-  { Scratch sc; real* du = cloneR(dp, nn * Cz); triMulBackward(b.triOut, s.tOut, pairMask, du, dp); }
+  { Range r_("bw.triIn"); Scratch sc; real* du = cloneR(dp, nn * Cz); triMulBackward(b.triIn, s.tIn, pairMask, du, dp); }
+  { Range r_("bw.triOut"); Scratch sc; real* du = cloneR(dp, nn * Cz); triMulBackward(b.triOut, s.tOut, pairMask, du, dp); }
   GK(cudaMemcpyAsync(dpair, dp, nn * Cz * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
 }
 

@@ -362,6 +362,64 @@ inline void sdpaBackward(const Sdpa& a, const real* q, int ldq, const real* k, i
     fromHeadsK<<<blocks(nk), 256, 0, STREAM>>>(tmp, dk + (size_t)b0 * K * lddk, lddk, nb, K, H, D, a.scale, accK);
   }
 }
+#ifndef GRAD_F64
+// the same with q, k, v in bf16 (a module on bf16 storage): the flash kernels read them as they are; without flash
+// they are widened to float for the bmm path
+__global__ void bfToFK(const bf* x, float* y, size_t n) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t < n) y[t] = __bfloat162float(x[t]);
+}
+inline float* widen(const bf* x, size_t n) {
+  float* y = ARENA.get(n);
+  bfToFK<<<blocks(n), 256, 0, STREAM>>>(x, y, n);
+  return y;
+}
+inline void sdpaForwardBf(const Sdpa& a, const bf* q, int ldq, const bf* k, int ldk, const bf* v, int ldv, float* o,
+                          int ldo, float* lse) {
+  if (FLASH && flash::supported(a.D)) { flash::runForwardBfIn(a, q, ldq, k, ldk, v, ldv, o, ldo, lse); return; }
+  Scratch scratch;
+  sdpaForward(a, widen(q, (size_t)a.B * a.Q * ldq), ldq, widen(k, (size_t)a.B * a.K * ldk), ldk,
+              widen(v, (size_t)a.B * a.K * ldv), ldv, o, ldo, lse);
+}
+inline void sdpaBackwardBf(const Sdpa& a, const bf* q, int ldq, const bf* k, int ldk, const bf* v, int ldv,
+                           const float* dO, int lddo, float* dq, int lddq, float* dk, int lddk, float* dv, int lddv,
+                           const float* o, int ldo, const float* lse) {
+  Scratch scratch;
+  const int H = a.H, Q = a.Q, D = a.D;
+  if (FLASH && flash::supported(D)) {
+    real* Di = ARENA.get((size_t)a.B * H * Q);
+    flash::rowDot(dO, lddo, o, ldo, Di, a.B, H, Q, D);
+    if (lddq == H * D) GK(cudaMemsetAsync(dq, 0, (size_t)a.B * Q * H * D * sizeof(real), STREAM));
+    else flash::zeroColsK<<<blocks((size_t)a.B * Q * H * D), 256, 0, STREAM>>>(dq, lddq, (size_t)a.B * Q, H * D);
+    flash::runBackwardBfIn(a, q, ldq, k, ldk, v, ldv, dO, lddo, lse, Di, dq, lddq, dk, lddk, dv, lddv, false, false);
+    return;
+  }
+  sdpaBackward(a, widen(q, (size_t)a.B * a.Q * ldq), ldq, widen(k, (size_t)a.B * a.K * ldk), ldk,
+               widen(v, (size_t)a.B * a.K * ldv), ldv, dO, lddo, dq, lddq, dk, lddk, dv, lddv);
+}
+// [A, B, C] -> [B, A, C] on bf16
+__global__ void swap01BfK(const bf* __restrict__ in, bf* __restrict__ out, int A, int B, int C) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)A * B * C) return;
+  int c = t % C; size_t ab = t / C; int b = ab % B, a = (int)(ab / B);
+  out[((size_t)b * A + a) * C + c] = in[t];
+}
+inline void swap01(const bf* in, bf* out, int A, int B, int C) {
+  swap01BfK<<<blocks((size_t)A * B * C), 256, 0, STREAM>>>(in, out, A, B, C);
+}
+// og = o * gate (bf16 out), and its backward: dO = dog gate, dgate_pre = dog o gate (1 - gate)
+__global__ void mulOgBfK(bf* og, const float* o, const bf* g, size_t n) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t < n) og[t] = __float2bfloat16(o[t] * __bfloat162float(g[t]));
+}
+__global__ void ogBwdBfK(const float* dog, const float* o, const bf* g, float* dO, bf* dg, size_t n) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= n) return;
+  const float s = __bfloat162float(g[t]);
+  dO[t] = dog[t] * s;
+  dg[t] = __float2bfloat16(dog[t] * o[t] * s * (1.f - s));
+}
+#endif
 
 // ---------------------------------------------------------------- AF2's gated attention on top of it
 // per batch row b: q = x Wq * D^-1/2, k = x Wk, v = x Wv (one LN'd input for both, as every AF2 self-attention),

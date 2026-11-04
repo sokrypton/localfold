@@ -588,7 +588,10 @@ __device__ __forceinline__ void aFragH(uint32_t* f, const uint16_t* x, int r, in
 template <int D> __host__ __device__ constexpr int padD() { return (D + 15) / 16 * 16; }
 template <int D> __host__ __device__ constexpr int ldBf() { return padD<D>() + 8; }   // a tile's row stride (bf16)
 // x [B, N, ld] at head h's D columns -> out [B, H, Np, DP] bf16, zero past N and D (two columns a thread)
-__global__ void headsBfK(const float* __restrict__ x, int ld, uint32_t* __restrict__ out, int N, int H, int D, int Np,
+__device__ __forceinline__ uint32_t bfPair(const float* p) { return bf2(p[0], p[1]); }
+__device__ __forceinline__ uint32_t bfPair(const __nv_bfloat16* p) { return *reinterpret_cast<const uint32_t*>(p); }
+template <class X>   // (X: float, or bf16 where the projections wrote it)
+__global__ void headsBfK(const X* __restrict__ x, int ld, uint32_t* __restrict__ out, int N, int H, int D, int Np,
                          int DP2, size_t total) {
   const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= total) return;
@@ -597,10 +600,11 @@ __global__ void headsBfK(const float* __restrict__ x, int ld, uint32_t* __restri
   const int n = (int)(row % Np), h = (int)((row / Np) % H);
   const size_t b = row / ((size_t)Np * H);
   uint32_t r = 0;
-  if (n < N && c < D) { const float* p = x + (b * N + n) * ld + (size_t)h * D + c; r = bf2(p[0], p[1]); }
+  if (n < N && c < D) r = bfPair(x + (b * N + n) * ld + (size_t)h * D + c);
   out[i] = r;
 }
-inline const uint16_t* headsBf(const float* x, int ld, int B, int N, int H, int D, int Np, int DP) {
+template <class X>
+inline const uint16_t* headsBf(const X* x, int ld, int B, int N, int H, int D, int Np, int DP) {
   const size_t total = (size_t)B * H * Np * (DP / 2);
   uint32_t* out = reinterpret_cast<uint32_t*>(ARENA.get(total));
   headsBfK<<<blocks(total), 256, 0, STREAM>>>(x, ld, out, N, H, D, Np, DP / 2, total);
@@ -1019,8 +1023,8 @@ __global__ void __launch_bounds__(THREADS, 3) bwdBf(Sdpa a, BiasTile bt, const u
 }
 template <int D>
 inline size_t bwdBfSmem() { return 2 * (5 * BR * ldBf<D>() + 2 * BR * LB) + 4 * (2 * 4 * BR); }
-template <int D>
-inline void forwardBf(const Sdpa& a, const float* q, int ldq, const float* k, int ldk, const float* v, int ldv,
+template <int D, class X>
+inline void forwardBf(const Sdpa& a, const X* q, int ldq, const X* k, int ldk, const X* v, int ldv,
                       float* o, int ldo, float* lse) {
   Scratch scratch;
   constexpr int DP = padD<D>();
@@ -1035,8 +1039,8 @@ inline void forwardBf(const Sdpa& a, const float* q, int ldq, const float* k, in
   const size_t grid = (size_t)((a.Q + BR - 1) / BR) * a.H * a.B;
   fwdBf<D><<<(unsigned)grid, THREADS, smem, STREAM>>>(a, bt, qh, kh, vh, Npq, Npk, o, ldo, lse);
 }
-template <int D>
-inline void backwardBf(const Sdpa& a, const float* q, int ldq, const float* k, int ldk, const float* v, int ldv,
+template <int D, class X>
+inline void backwardBf(const Sdpa& a, const X* q, int ldq, const X* k, int ldk, const X* v, int ldv,
                        const float* dO, int lddo, const float* lse, const float* Di, float* dq, int lddq, float* dk,
                        int lddk, float* dv, int lddv, bool accK, bool accV) {
   Scratch scratch;
@@ -1115,6 +1119,17 @@ inline bool runBackward(const Sdpa& a, const float* q, int ldq, const float* k, 
   if (BF16) { FLASH_DISPATCH(a.D, (backwardBf<DD>(a, q, ldq, k, ldk, v, ldv, dO, lddo, lse, Di, dq, lddq, dk, lddk, dv, lddv, accK, accV))) }
   else if (TF32) { FLASH_DISPATCH(a.D, (backward<DD, 0>(a, q, ldq, k, ldk, v, ldv, dO, lddo, lse, Di, dq, lddq, dk, lddk, dv, lddv, accK, accV))) }
   else { FLASH_DISPATCH(a.D, (backward<DD, 1>(a, q, ldq, k, ldk, v, ldv, dO, lddo, lse, Di, dq, lddq, dk, lddk, dv, lddv, accK, accV))) }
+}
+// q, k, v already bf16 (a module on bf16 storage): the bf16 kernels, whatever D they support (8 included, padded)
+inline bool runForwardBfIn(const Sdpa& a, const __nv_bfloat16* q, int ldq, const __nv_bfloat16* k, int ldk,
+                           const __nv_bfloat16* v, int ldv, float* o, int ldo, float* lse) {
+  FLASH_DISPATCH(a.D, (forwardBf<DD>(a, q, ldq, k, ldk, v, ldv, o, ldo, lse)))
+}
+inline bool runBackwardBfIn(const Sdpa& a, const __nv_bfloat16* q, int ldq, const __nv_bfloat16* k, int ldk,
+                            const __nv_bfloat16* v, int ldv, const float* dO, int lddo, const float* lse,
+                            const float* Di, float* dq, int lddq, float* dk, int lddk, float* dv, int lddv, bool accK,
+                            bool accV) {
+  FLASH_DISPATCH(a.D, (backwardBf<DD>(a, q, ldq, k, ldk, v, ldv, dO, lddo, lse, Di, dq, lddq, dk, lddk, dv, lddv, accK, accV)))
 }
 #undef FLASH_DISPATCH
 
