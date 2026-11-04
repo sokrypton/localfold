@@ -142,6 +142,7 @@ __device__ __forceinline__ void loadAdd(float* T, const Sdpa& a, int b, int h, i
     bp[j] = a.bias[j].p ? a.bias[j].p + b * a.bias[j].sb + h * a.bias[j].sh + k0 + c4 : nullptr;
     vec[j] = bp[j] && k0 + c4 + 4 <= a.K && a.bias[j].sq % 4 == 0 && ((uintptr_t)bp[j] & 15) == 0;
   }
+#pragma unroll
   for (int r = r0; r < BR; r += THREADS / 16) {
     const int q = q0 + r;
     float v[4];
@@ -543,6 +544,366 @@ __global__ void __launch_bounds__(THREADS, MODE == 1 ? 2 : 3) bwdK(Sdpa a, const
   }
 }
 
+// ---- bf16: its own kernels, not MODE 2 of the ones above. The tiles are rounded to bf16 once, as they are staged
+// (MODE 2 kept them float and rounded at every fragment read), the products are m16n8k16 (twice m16n8k8's k a
+// fragment), and P and dS go from the accumulators straight into the next product's A operand - an m16n8k16 C pair
+// of n-tiles is exactly an A fragment - so P never touches shared memory. Every B operand is read as one 32-bit
+// word, which needs its contraction axis contiguous: a tile contracted over D is staged [row][D], one contracted
+// over its rows [D][row]. D pads to a multiple of 16 with zeros where it is contracted.
+__device__ __forceinline__ void mma16(float* c, const uint32_t* a, uint32_t b0, uint32_t b1) {
+  asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+               "{%0,%1,%2,%3};"
+               : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+               : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ uint32_t word(const uint16_t* s, int i) { return *reinterpret_cast<const uint32_t*>(s + i); }
+// the A fragment of rows r, r + 8 and columns c .. c + 15 of x [rows][ld] (zero past `rows` and past D)
+template <int D>
+__device__ __forceinline__ void aFrag(uint32_t* f, const float* x, long long ld, int r, int rows, int c) {
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const int rr = r + (i & 1) * 8, cc = c + (i >> 1) * 8;
+    f[i] = rr < rows && cc < D ? bf2(x[(long long)rr * ld + cc], x[(long long)rr * ld + cc + 1]) : 0u;
+  }
+}
+// two accumulator n-tiles (8 columns each) as one A fragment over their 16 columns
+__device__ __forceinline__ void cToA(uint32_t* f, const float* c0, const float* c1) {
+  f[0] = bf2(c0[0], c0[1]); f[1] = bf2(c0[2], c0[3]); f[2] = bf2(c1[0], c1[1]); f[3] = bf2(c1[2], c1[3]);
+}
+constexpr int LR = 64 + 8;                         // a [D][64 rows] tile's row stride, in bf16
+template <int D> __host__ __device__ constexpr int ldBf() { return (D + 15) / 16 * 16 + 8; }   // a [64][D] tile's, padded D + 8
+// rows [r0, r0 + 64) of x (row stride ld, D columns): S [64][ldBf] (zero past D to the pad) and/or St [D][LR],
+// two rows by two columns a thread so every store is a word
+template <int D>
+__device__ __forceinline__ void loadBf(uint16_t* S, uint16_t* St, const float* x, long long ld, int r0, int rows) {
+  constexpr int DP = (D + 15) / 16 * 16, LK = ldBf<D>();
+  const bool v2 = (ld & 1) == 0 && ((uintptr_t)x & 7) == 0;
+  constexpr int N = 32 * (DP / 2) / THREADS;       // every load issued before the first store
+  static_assert(32 * (DP / 2) % THREADS == 0, "whole passes");
+  float2 u[N], w[N];
+#pragma unroll
+  for (int j = 0; j < N; ++j) {
+    const int i = threadIdx.x + j * THREADS, r = 2 * (i / (DP / 2)), c = 2 * (i % (DP / 2));
+    u[j] = w[j] = make_float2(0.f, 0.f);
+    if (c < D) {
+      const float* p = x + (long long)(r0 + r) * ld + c;
+      if (r0 + r < rows) u[j] = v2 ? *reinterpret_cast<const float2*>(p) : make_float2(p[0], p[1]);
+      if (r0 + r + 1 < rows) w[j] = v2 ? *reinterpret_cast<const float2*>(p + ld) : make_float2(p[ld], p[ld + 1]);
+    }
+  }
+#pragma unroll
+  for (int j = 0; j < N; ++j) {
+    const int i = threadIdx.x + j * THREADS, r = 2 * (i / (DP / 2)), c = 2 * (i % (DP / 2));
+    if (S) {
+      *reinterpret_cast<uint32_t*>(S + r * LK + c) = bf2(u[j].x, u[j].y);
+      *reinterpret_cast<uint32_t*>(S + (r + 1) * LK + c) = bf2(w[j].x, w[j].y);
+    }
+    if (St && c < D) {
+      *reinterpret_cast<uint32_t*>(St + c * LR + r) = bf2(u[j].x, w[j].x);
+      *reinterpret_cast<uint32_t*>(St + (c + 1) * LR + r) = bf2(u[j].y, w[j].y);
+    }
+  }
+}
+
+template <int D>
+__global__ void __launch_bounds__(THREADS) fwdBf(Sdpa a, const float* __restrict__ q, int ldq,
+                                                 const float* __restrict__ k, int ldk, const float* __restrict__ v,
+                                                 int ldv, float* __restrict__ o, int ldo, float* __restrict__ lse) {
+  constexpr int DP = (D + 15) / 16 * 16, LK = ldBf<D>(), LT = BC + PADK;
+  extern __shared__ __align__(16) float sm[];
+  float* T = sm;                                                  // [BR][LT]: the additive terms
+  uint16_t* Ks = reinterpret_cast<uint16_t*>(T + BR * LT);        // [BC][LK]
+  uint16_t* Vt = Ks + BC * LK;                                    // [D][LR]
+  const int nqb = (a.Q + BR - 1) / BR;
+  const int qb = blockIdx.x % nqb, h = (blockIdx.x / nqb) % a.H, b = blockIdx.x / (nqb * a.H);
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+  const int q0 = qb * BR, qr0 = q0 + warp * 16;
+  const float* qb_ = q + (size_t)b * a.Q * ldq + h * D;
+  const float* kb_ = k + (size_t)b * a.K * ldk + h * D;
+  const float* vb_ = v + (size_t)b * a.K * ldv + h * D;
+  uint32_t qa[DP / 16][4];
+#pragma unroll
+  for (int s = 0; s < DP / 16; ++s) aFrag<D>(qa[s], qb_, ldq, qr0 + g, a.Q, s * 16 + 2 * t);
+  float oacc[D / 8][4];
+#pragma unroll
+  for (int n = 0; n < D / 8; ++n) oacc[n][0] = oacc[n][1] = oacc[n][2] = oacc[n][3] = 0.f;
+  float mx[2] = {-INFINITY, -INFINITY}, sum[2] = {0.f, 0.f};
+  const float* P = T + warp * 16 * LT;
+  for (int k0 = 0; k0 < a.K; k0 += BC) {
+    __syncthreads();
+    loadBf<D>(Ks, nullptr, kb_, ldk, k0, a.K);
+    loadBf<D>(nullptr, Vt, vb_, ldv, k0, a.K);
+    loadAdd(T, a, b, h, q0, k0);
+    __syncthreads();
+    float sacc[BC / 8][4];
+#pragma unroll
+    for (int j = 0; j < BC / 8; ++j) sacc[j][0] = sacc[j][1] = sacc[j][2] = sacc[j][3] = 0.f;
+#pragma unroll
+    for (int s = 0; s < DP / 16; ++s)
+#pragma unroll
+      for (int j = 0; j < BC / 8; ++j) {
+        const int i = (j * 8 + g) * LK + s * 16 + 2 * t;
+        mma16(sacc[j], qa[s], word(Ks, i), word(Ks, i + 8));
+      }
+    float rmax[2] = {-INFINITY, -INFINITY};
+#pragma unroll
+    for (int j = 0; j < BC / 8; ++j)
+#pragma unroll
+      for (int e = 0; e < 4; ++e) {
+        int r = e >> 1;
+        float x = logit(sacc[j][e], P[(g + r * 8) * LT + j * 8 + 2 * t + (e & 1)], a);
+        sacc[j][e] = x;
+        rmax[r] = fmaxf(rmax[r], x);
+      }
+#pragma unroll
+    for (int r = 0; r < 2; ++r) {
+      rmax[r] = fmaxf(rmax[r], __shfl_xor_sync(~0u, rmax[r], 1));
+      rmax[r] = fmaxf(rmax[r], __shfl_xor_sync(~0u, rmax[r], 2));
+    }
+    float alpha[2], nm[2], rs[2] = {0.f, 0.f};
+#pragma unroll
+    for (int r = 0; r < 2; ++r) {
+      nm[r] = fmaxf(mx[r], rmax[r]);
+      alpha[r] = nm[r] == -INFINITY ? 1.f : expf(mx[r] - nm[r]);
+      mx[r] = nm[r];
+    }
+#pragma unroll
+    for (int j = 0; j < BC / 8; ++j)
+#pragma unroll
+      for (int e = 0; e < 4; ++e) {
+        float p = sacc[j][e] == -INFINITY ? 0.f : expf(sacc[j][e] - nm[e >> 1]);
+        rs[e >> 1] += p;
+        sacc[j][e] = p;
+      }
+#pragma unroll
+    for (int r = 0; r < 2; ++r) {
+      rs[r] += __shfl_xor_sync(~0u, rs[r], 1);
+      rs[r] += __shfl_xor_sync(~0u, rs[r], 2);
+      sum[r] = sum[r] * alpha[r] + rs[r];
+    }
+#pragma unroll
+    for (int n = 0; n < D / 8; ++n) {
+      oacc[n][0] *= alpha[0]; oacc[n][1] *= alpha[0]; oacc[n][2] *= alpha[1]; oacc[n][3] *= alpha[1];
+    }
+#pragma unroll
+    for (int u = 0; u < BC / 16; ++u) {
+      uint32_t pa[4];
+      cToA(pa, sacc[2 * u], sacc[2 * u + 1]);
+#pragma unroll
+      for (int n = 0; n < D / 8; ++n) {
+        const int i = (n * 8 + g) * LR + u * 16 + 2 * t;
+        mma16(oacc[n], pa, word(Vt, i), word(Vt, i + 8));
+      }
+    }
+  }
+  float* ob = o + (size_t)b * a.Q * ldo + h * D;
+#pragma unroll
+  for (int r = 0; r < 2; ++r) {
+    int qq = qr0 + g + r * 8;
+    if (qq >= a.Q) continue;
+    float inv = sum[r] > 0.f ? 1.f / sum[r] : 0.f;
+#pragma unroll
+    for (int n = 0; n < D / 8; ++n) {
+      ob[(long long)qq * ldo + n * 8 + 2 * t] = oacc[n][r * 2] * inv;
+      ob[(long long)qq * ldo + n * 8 + 2 * t + 1] = oacc[n][r * 2 + 1] * inv;
+    }
+    if (t == 0) {
+      const size_t i = ((size_t)b * a.H + h) * a.Q + qq, N = (size_t)a.B * a.H * a.Q;
+      lse[i] = sum[r] > 0.f ? mx[r] : -INFINITY;
+      lse[N + i] = sum[r] > 0.f ? logf(sum[r]) : 0.f;
+    }
+  }
+}
+template <int D>
+inline size_t fwdBfSmem() { return sizeof(float) * BR * (BC + PADK) + 2 * (BC * ldBf<D>() + D * LR); }
+
+// the backward as bwdK lays it out (a CTA a key block, a warp 16 keys, the queries in halves of 32), in bf16:
+// S^T = K Q^T and dP^T = V dO^T (A = K, V from registers; B = Q, dO [query][D]); dV += P^T dO and dK += dS^T Q
+// (A = P^T, dS^T from the accumulators; B = dO^T, Q^T [D][query]); dQ = dS K (A = dS from T in float, B = K^T).
+// dS is kept in float in T for the bias gradients.
+template <int D>
+__global__ void __launch_bounds__(THREADS, D <= 32 ? 3 : 2) bwdBf(Sdpa a, const float* __restrict__ q, int ldq,
+                                                   const float* __restrict__ k, int ldk, const float* __restrict__ v,
+                                                   int ldv, const float* __restrict__ dO, int lddo,
+                                                   const float* __restrict__ lse, const float* __restrict__ Di,
+                                                   float* __restrict__ dq, int lddq, float* __restrict__ dk, int lddk,
+                                                   float* __restrict__ dv, int lddv, bool accK, bool accV) {
+  constexpr int DP = (D + 15) / 16 * 16, LK = ldBf<D>(), LT = BC + PADK, LS = D + PADK;
+  extern __shared__ __align__(16) float sm[];
+  float* T = sm;                                   // [BR][LT]: the additive terms, then dS
+  float* Ls = T + BR * LT;                         // lse [BR]
+  float* Ds = Ls + BR;                             // Di [BR]
+  float* Lg = Ds + BR;                             // log sum [BR]
+  float* St = Lg + BR;                             // [4 warps][16][LS]: dQ staged for coalesced atomics
+  uint16_t* Qs = reinterpret_cast<uint16_t*>(St + 4 * 16 * LS);   // [BR][LK]
+  uint16_t* Os = Qs + BR * LK;                                    // dO [BR][LK]
+  uint16_t* Qt = Os + BR * LK;                                    // [D][LR]
+  uint16_t* Ot = Qt + D * LR;                                     // [D][LR]
+  uint16_t* Kt = Ot + D * LR;                                     // [D][LR]
+  const int nkb = (a.K + BC - 1) / BC;
+  const int kb = blockIdx.x % nkb, h = (blockIdx.x / nkb) % a.H, b = blockIdx.x / (nkb * a.H);
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+  const int k0 = kb * BC, kl0 = warp * 16;
+  const float* qb_ = q + (size_t)b * a.Q * ldq + h * D;
+  const float* ob_ = dO + (size_t)b * a.Q * lddo + h * D;
+  const float* vb_ = v + (size_t)b * a.K * ldv + h * D;
+  const float* kb_ = k + (size_t)b * a.K * ldk + h * D;
+  loadBf<D>(nullptr, Kt, kb_, ldk, k0, a.K);
+  uint32_t ka[DP / 16][4], va[DP / 16][4];
+#pragma unroll
+  for (int s = 0; s < DP / 16; ++s) {
+    aFrag<D>(ka[s], kb_, ldk, k0 + kl0 + g, a.K, s * 16 + 2 * t);
+    aFrag<D>(va[s], vb_, ldv, k0 + kl0 + g, a.K, s * 16 + 2 * t);
+  }
+  float dka[D / 8][4], dva[D / 8][4];
+#pragma unroll
+  for (int n = 0; n < D / 8; ++n)
+#pragma unroll
+    for (int e = 0; e < 4; ++e) dka[n][e] = dva[n][e] = 0.f;
+  const float* lseb = lse + ((size_t)b * a.H + h) * a.Q;
+  const float* lgb = lseb + (size_t)a.B * a.H * a.Q;
+  const float* Dib = Di + ((size_t)b * a.H + h) * a.Q;
+  float* dqb = dq + (size_t)b * a.Q * lddq + h * D;
+  real* g0 = a.bias[0].grad ? a.bias[0].grad + b * a.bias[0].sb + h * a.bias[0].sh + k0 : nullptr;
+  real* g1 = a.bias[1].grad ? a.bias[1].grad + b * a.bias[1].sb + h * a.bias[1].sh + k0 : nullptr;
+  for (int q0 = 0; q0 < a.Q; q0 += BR) {
+    __syncthreads();
+    loadBf<D>(Qs, Qt, qb_, ldq, q0, a.Q);
+    loadBf<D>(Os, Ot, ob_, lddo, q0, a.Q);
+    loadAdd(T, a, b, h, q0, k0);
+    for (int i = threadIdx.x; i < BR; i += THREADS) {
+      Ls[i] = q0 + i < a.Q ? lseb[q0 + i] : INFINITY;
+      Lg[i] = q0 + i < a.Q ? lgb[q0 + i] : 0.f;
+      Ds[i] = q0 + i < a.Q ? Dib[q0 + i] : 0.f;
+    }
+    __syncthreads();
+#pragma unroll 1
+    for (int hq = 0; hq < 2; ++hq) {
+      float st[4][4], dpt[4][4];   // 16 keys x 32 queries
+#pragma unroll
+      for (int jj = 0; jj < 4; ++jj)
+#pragma unroll
+        for (int e = 0; e < 4; ++e) st[jj][e] = dpt[jj][e] = 0.f;
+#pragma unroll
+      for (int s = 0; s < DP / 16; ++s)
+#pragma unroll
+        for (int jj = 0; jj < 4; ++jj) {
+          const int i = ((hq * 4 + jj) * 8 + g) * LK + s * 16 + 2 * t;
+          mma16(st[jj], ka[s], word(Qs, i), word(Qs, i + 8));
+          mma16(dpt[jj], va[s], word(Os, i), word(Os, i + 8));
+        }
+#pragma unroll
+      for (int jj = 0; jj < 4; ++jj)
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+          int kl = kl0 + g + (e >> 1) * 8, ql = (hq * 4 + jj) * 8 + 2 * t + (e & 1);
+          float x = logit(st[jj][e], T[ql * LT + kl], a);
+          float p = x == -INFINITY ? 0.f : expf((x - Ls[ql]) - Lg[ql]);
+          float ds = p * (dpt[jj][e] - Ds[ql]);
+          T[ql * LT + kl] = ds;
+          st[jj][e] = p;
+          dpt[jj][e] = ds;
+        }
+#pragma unroll
+      for (int u = 0; u < 2; ++u) {
+        uint32_t pa[4], sa[4];
+        cToA(pa, st[2 * u], st[2 * u + 1]);
+        cToA(sa, dpt[2 * u], dpt[2 * u + 1]);
+#pragma unroll
+        for (int n = 0; n < D / 8; ++n) {
+          const int i = (n * 8 + g) * LR + hq * 32 + u * 16 + 2 * t;
+          mma16(dva[n], pa, word(Ot, i), word(Ot, i + 8));
+          mma16(dka[n], sa, word(Qt, i), word(Qt, i + 8));
+        }
+      }
+    }
+    __syncthreads();
+    if (g0 || g1)
+      for (int i = threadIdx.x; i < BR * BC; i += THREADS) {
+        int ql = i / BC, kl = i % BC;
+        float ds = T[ql * LT + kl];
+        if (ds != 0.f) {
+          long long qq = q0 + ql;
+          if (g0) atomicAdd(g0 + qq * a.bias[0].sq + kl, ds);
+          if (g1) atomicAdd(g1 + qq * a.bias[1].sq + kl, ds);
+        }
+      }
+    const int qw = warp * 16;
+    float dqa[D / 8][4];
+#pragma unroll
+    for (int n = 0; n < D / 8; ++n) dqa[n][0] = dqa[n][1] = dqa[n][2] = dqa[n][3] = 0.f;
+#pragma unroll
+    for (int s = 0; s < BC / 16; ++s) {
+      uint32_t A[4];
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        float2 x = *reinterpret_cast<const float2*>(T + (qw + g + (i & 1) * 8) * LT + s * 16 + 2 * t + (i >> 1) * 8);
+        A[i] = bf2(x.x, x.y);
+      }
+#pragma unroll
+      for (int n = 0; n < D / 8; ++n) {
+        const int i = (n * 8 + g) * LR + s * 16 + 2 * t;
+        mma16(dqa[n], A, word(Kt, i), word(Kt, i + 8));
+      }
+    }
+    float* stw = St + warp * 16 * LS;
+#pragma unroll
+    for (int n = 0; n < D / 8; ++n)
+#pragma unroll
+      for (int e = 0; e < 4; ++e) stw[(g + (e >> 1) * 8) * LS + n * 8 + 2 * t + (e & 1)] = dqa[n][e] * a.scale;
+    __syncwarp();
+    for (int i = lane; i < 16 * D; i += 32) {
+      int r = i / D, d = i % D, qq = q0 + qw + r;
+      if (qq < a.Q) atomicAdd(dqb + (long long)qq * lddq + d, stw[r * LS + d]);
+    }
+  }
+  float* dkb = dk + (size_t)b * a.K * lddk + h * D;
+  float* dvb = dv + (size_t)b * a.K * lddv + h * D;
+#pragma unroll
+  for (int r = 0; r < 2; ++r) {
+    int kk = k0 + kl0 + g + r * 8;
+    if (kk >= a.K) continue;
+#pragma unroll
+    for (int n = 0; n < D / 8; ++n)
+#pragma unroll
+      for (int c = 0; c < 2; ++c) {
+        float* pk = dkb + (long long)kk * lddk + n * 8 + 2 * t + c;
+        float* pv = dvb + (long long)kk * lddv + n * 8 + 2 * t + c;
+        float xk = dka[n][r * 2 + c] * a.scale, xv = dva[n][r * 2 + c];
+        *pk = accK ? *pk + xk : xk;
+        *pv = accV ? *pv + xv : xv;
+      }
+  }
+}
+template <int D>
+inline size_t bwdBfSmem() {
+  return sizeof(float) * (BR * (BC + PADK) + 3 * BR + 4 * 16 * (D + PADK)) + 2 * (2 * BR * ldBf<D>() + 3 * D * LR);
+}
+template <int D>
+inline void forwardBf(const Sdpa& a, const float* q, int ldq, const float* k, int ldk, const float* v, int ldv,
+                      float* o, int ldo, float* lse) {
+  static bool attr = false;
+  size_t smem = fwdBfSmem<D>();
+  if (!attr) { GK(cudaFuncSetAttribute(fwdBf<D>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem)); attr = true; }
+  size_t grid = (size_t)((a.Q + BR - 1) / BR) * a.H * a.B;
+  fwdBf<D><<<(unsigned)grid, THREADS, smem, STREAM>>>(a, q, ldq, k, ldk, v, ldv, o, ldo, lse);
+}
+template <int D>
+inline void backwardBf(const Sdpa& a, const float* q, int ldq, const float* k, int ldk, const float* v, int ldv,
+                       const float* dO, int lddo, const float* lse, const float* Di, float* dq, int lddq, float* dk,
+                       int lddk, float* dv, int lddv, bool accK, bool accV) {
+  static bool attr = false;
+  size_t smem = bwdBfSmem<D>();
+  if (!attr) {
+    GK(cudaFuncSetAttribute(bwdBf<D>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
+    GK(cudaFuncSetAttribute(bwdBf<D>, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+    attr = true;
+  }
+  size_t grid = (size_t)((a.K + BC - 1) / BC) * a.H * a.B;
+  bwdBf<D><<<(unsigned)grid, THREADS, smem, STREAM>>>(a, q, ldq, k, ldk, v, ldv, dO, lddo, lse, Di, dq, lddq, dk,
+                                                       lddk, dv, lddv, accK, accV);
+}
+
 template <int D, int MODE>
 inline size_t bwdSmem() { return sizeof(float) * ((MODE == 1 ? 7 : 3) * 64 * (D + PADK) + BC * (BR + PADK) + 3 * BR); }
 
@@ -587,14 +948,16 @@ inline void backward(const Sdpa& a, const float* q, int ldq, const float* k, int
 inline bool supported(int D) { return D == 8 || D == 16 || D == 24 || D == 32 || D == 48 || D == 64; }
 inline bool runForward(const Sdpa& a, const float* q, int ldq, const float* k, int ldk, const float* v, int ldv,
                        float* o, int ldo, float* lse) {
-  if (BF16) { FLASH_DISPATCH(a.D, (forward<DD, 2>(a, q, ldq, k, ldk, v, ldv, o, ldo, lse))) }
+  if (BF16 && a.D == 8) { forward<8, 2>(a, q, ldq, k, ldk, v, ldv, o, ldo, lse); return true; }   // (m16n8k8 fits D 8 unpadded)
+  if (BF16) { FLASH_DISPATCH(a.D, (forwardBf<DD>(a, q, ldq, k, ldk, v, ldv, o, ldo, lse))) }
   else if (TF32) { FLASH_DISPATCH(a.D, (forward<DD, 0>(a, q, ldq, k, ldk, v, ldv, o, ldo, lse))) }
   else { FLASH_DISPATCH(a.D, (forward<DD, 1>(a, q, ldq, k, ldk, v, ldv, o, ldo, lse))) }
 }
 inline bool runBackward(const Sdpa& a, const float* q, int ldq, const float* k, int ldk, const float* v, int ldv,
                         const float* dO, int lddo, const float* lse, const float* Di, float* dq, int lddq, float* dk,
                         int lddk, float* dv, int lddv, bool accK, bool accV) {
-  if (BF16) { FLASH_DISPATCH(a.D, (backward<DD, 2>(a, q, ldq, k, ldk, v, ldv, dO, lddo, lse, Di, dq, lddq, dk, lddk, dv, lddv, accK, accV))) }
+  if (BF16 && a.D == 8) { backward<8, 2>(a, q, ldq, k, ldk, v, ldv, dO, lddo, lse, Di, dq, lddq, dk, lddk, dv, lddv, accK, accV); return true; }
+  if (BF16) { FLASH_DISPATCH(a.D, (backwardBf<DD>(a, q, ldq, k, ldk, v, ldv, dO, lddo, lse, Di, dq, lddq, dk, lddk, dv, lddv, accK, accV))) }
   else if (TF32) { FLASH_DISPATCH(a.D, (backward<DD, 0>(a, q, ldq, k, ldk, v, ldv, dO, lddo, lse, Di, dq, lddq, dk, lddk, dv, lddv, accK, accV))) }
   else { FLASH_DISPATCH(a.D, (backward<DD, 1>(a, q, ldq, k, ldk, v, ldv, dO, lddo, lse, Di, dq, lddq, dk, lddk, dv, lddv, accK, accV))) }
 }

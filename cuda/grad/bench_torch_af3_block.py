@@ -105,11 +105,13 @@ def main():
   ap.add_argument("--n", type=int, default=384)
   ap.add_argument("--tf32", action="store_true")
   ap.add_argument("--bf16", action="store_true", help="torch.autocast(bfloat16): float32 weights, bf16 matmuls")
+  ap.add_argument("--pure-bf16", action="store_true", help="the block, its inputs and cotangents all bfloat16, no autocast")
   ap.add_argument("--compile", action="store_true")
   ap.add_argument("--reps", type=int, default=7)
   a = ap.parse_args()
   torch.backends.cuda.matmul.allow_tf32 = a.tf32
   torch.backends.cudnn.allow_tf32 = a.tf32
+  if a.pure_bf16: torch.set_default_dtype(torch.bfloat16)   # parameters, inputs and cotangents
   torch.manual_seed(7)
   blk = Pairformer().cuda()
   with torch.no_grad():
@@ -137,7 +139,7 @@ def main():
     if r >= 2:
       fw.append(ev[0].elapsed_time(ev[1])); bw.append(ev[1].elapsed_time(ev[2]))
   med = lambda v: sorted(v)[len(v) // 2]
-  print(f"torch n {a.n} (AF3 pairformer block{', bf16 autocast' if a.bf16 else ''}{', tf32' if a.tf32 else ''}{', compile' if a.compile else ''}): "
+  print(f"torch n {a.n} (AF3 pairformer block{', bf16 autocast' if a.bf16 else ''}{', pure bf16' if a.pure_bf16 else ''}{', tf32' if a.tf32 else ''}{', compile' if a.compile else ''}): "
         f"forward {med(fw):.1f} ms, backward {med(bw):.1f} ms; peak {torch.cuda.max_memory_allocated() / 2**20:.0f} MiB")
 
 

@@ -5,12 +5,14 @@
 #include "ops.cuh"
 using namespace grad;
 int main(int argc, char** argv) {
-  for (int i = 1; i < argc; ++i) if (!strcmp(argv[i], "--tf32")) TF32 = true; else if (!strcmp(argv[i], "--bf16")) BF16 = true;
+  bool noDb = false;   // --no-db: the bias without its gradient (the atomics' share of the backward)
+  for (int i = 1; i < argc; ++i)
+    if (!strcmp(argv[i], "--tf32")) TF32 = true; else if (!strcmp(argv[i], "--bf16")) BF16 = true; else if (!strcmp(argv[i], "--no-db")) noDb = true;
   init();
   curandGenerator_t gen; curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT); curandSetPseudoRandomGeneratorSeed(gen, 1);
   auto randn = [&](size_t n) { float* p; GK(cudaMalloc(&p, ((n + 1) & ~1) * 4)); curandGenerateNormal(gen, p, (n + 1) & ~1, 0.f, 1.f); return p; };
   struct Shape { const char* name; int B, H, Q, D; bool bias; };
-  for (Shape c : {Shape{"row", 128, 8, 256, 32, true}, Shape{"col", 256, 8, 128, 32, false}, Shape{"tri", 256, 4, 256, 32, true}, Shape{"xrow", 1024, 8, 256, 8, true}}) {
+  for (Shape c : {Shape{"row", 128, 8, 256, 32, true}, Shape{"col", 256, 8, 128, 32, false}, Shape{"tri", 256, 4, 256, 32, true}, Shape{"xrow", 1024, 8, 256, 8, true}, Shape{"af3tri", 384, 4, 384, 32, true}}) {
     int HD = c.H * c.D; size_t n = (size_t)c.B * c.Q * HD;
     float *q = randn(n), *k = randn(n), *v = randn(n), *dO = randn(n), *o = randn(n), *dq = randn(n), *dk = randn(n), *dv = randn(n);
     float *lse; GK(cudaMalloc(&lse, (size_t)2 * c.B * c.H * c.Q * 4));
@@ -18,7 +20,7 @@ int main(int argc, char** argv) {
     GK(cudaMemcpy(m, ones.data(), ones.size() * 4, cudaMemcpyHostToDevice));
     size_t nb = (size_t)c.H * c.Q * c.Q; float *b = randn(nb), *db = randn(nb);
     Sdpa a; a.B = c.B; a.H = c.H; a.Q = a.K = c.Q; a.D = c.D; a.scale = 1.f / sqrtf((float)c.D); a.keyMask = m; a.clip = true;
-    if (c.bias) a.bias[0] = Bias{b, 0, (long long)c.Q * c.Q, c.Q, db};
+    if (c.bias) a.bias[0] = Bias{b, 0, (long long)c.Q * c.Q, c.Q, noDb ? nullptr : db};
     cudaEvent_t e[3]; for (auto& x : e) cudaEventCreate(&x);
     for (int f = 0; f < 2; ++f) {
       FLASH = f;

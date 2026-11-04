@@ -136,11 +136,13 @@ def main():
   ap.add_argument("--tf32", action="store_true")
   ap.add_argument("--bf16", action="store_true", help="torch.autocast(bfloat16): float32 weights, bf16 matmuls")
   ap.add_argument("--sdpa", action="store_true")
+  ap.add_argument("--pure-bf16", action="store_true", help="the block, its inputs and cotangents all bfloat16, no autocast")
   ap.add_argument("--compile", action="store_true")
   ap.add_argument("--reps", type=int, default=7)
   a = ap.parse_args()
   torch.backends.cuda.matmul.allow_tf32 = a.tf32
   torch.backends.cudnn.allow_tf32 = a.tf32
+  if a.pure_bf16: torch.set_default_dtype(torch.bfloat16)   # parameters, inputs and cotangents
   torch.manual_seed(7)
   dev = "cuda"
   cm = 64 if a.extra else 256
@@ -170,7 +172,7 @@ def main():
     if r >= 2:
       fw.append(ev[0].elapsed_time(ev[1])); bw.append(ev[1].elapsed_time(ev[2]))
   med = lambda x: sorted(x)[len(x) // 2]
-  print(f"torch L {a.L} S {a.S} Cm {cm} ({'extra' if a.extra else 'main'}{', bf16 autocast' if a.bf16 else ''}{', tf32' if a.tf32 else ''}"
+  print(f"torch L {a.L} S {a.S} Cm {cm} ({'extra' if a.extra else 'main'}{', bf16 autocast' if a.bf16 else ''}{', pure bf16' if a.pure_bf16 else ''}{', tf32' if a.tf32 else ''}"
         f"{', sdpa' if a.sdpa else ''}{', compile' if a.compile else ''}): forward {med(fw):.1f} ms, "
         f"backward {med(bw):.1f} ms -> {med(fw) + med(bw):.1f} ms; peak {torch.cuda.max_memory_allocated() / 2**20:.0f} MiB")
 
