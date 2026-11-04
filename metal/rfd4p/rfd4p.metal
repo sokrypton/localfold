@@ -86,8 +86,8 @@ kernel void rfd4p_attention(constant RfdAttnArgs& a [[buffer(0)]], uint3 tg [[th
   float localMax = -INFINITY;
   for (uint j = tid; j < n; j += tpg.x) {
     device const float* kj = a.k + (ulong)j * W + h * D;
-    float dot = 0;
-    for (uint d = 0; d < D; ++d) dot += qi[d] * kj[d];
+    float dot = 0, cc = 0;
+    for (uint d = 0; d < D; ++d) { const float p = qi[d] * kj[d] - cc, t = dot + p; cc = (t - dot) - p; dot = t; }
     float s = dot * a.scale;
     if (a.bias) s += a.bias[((ulong)i * n + j) * a.heads + h];
     sc[j] = s;
@@ -103,8 +103,14 @@ kernel void rfd4p_attention(constant RfdAttnArgs& a [[buffer(0)]], uint3 tg [[th
   float m = -INFINITY;
   for (uint s = 0; s < sgs; ++s) m = max(m, red[s]);
   // exp and its sum
-  float localSum = 0;
-  for (uint j = tid; j < n; j += tpg.x) { const float e = exp(sc[j] - m); sc[j] = e; localSum += e; }
+  float localSum = 0, cs = 0;
+  for (uint j = tid; j < n; j += tpg.x) {
+    const float e = exp(sc[j] - m);
+    sc[j] = e;
+    const float p = e - cs, t = localSum + p;
+    cs = (t - localSum) - p;
+    localSum = t;
+  }
   localSum = simd_sum(localSum);
   if (tid % 32 == 0) red[tid / 32] = localSum;
   threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -114,8 +120,12 @@ kernel void rfd4p_attention(constant RfdAttnArgs& a [[buffer(0)]], uint3 tg [[th
   // the context, a thread a channel of this head
   device const float* v0 = a.v + a.vOff + h * D;
   for (uint d = tid; d < D; d += tpg.x) {
-    float acc = 0;
-    for (uint j = 0; j < n; ++j) acc += sc[j] * invSum * v0[(ulong)j * a.ldv + d];
+    float acc = 0, ca = 0;
+    for (uint j = 0; j < n; ++j) {
+      const float p = sc[j] * invSum * v0[(ulong)j * a.ldv + d] - ca, t = acc + p;
+      ca = (t - acc) - p;
+      acc = t;
+    }
     const ulong at = (ulong)i * W + h * D + d;
     a.out[at] = lf_sigmoid(a.g[at]) * acc;
   }
@@ -151,4 +161,37 @@ kernel void rfd4p_mul_sigmoid(LF_ARGS(RfdMulSigmoidArgs)) {
   const ulong t = LF_INDEX;
   if (t >= a.n) return;
   a.y[t] = a.x[t] * lf_sigmoid(a.g[t]);
+}
+
+// a simdgroup a row: LayerNorm(x) * sigmoid(gamma[row]) + beta[row] - the x-norm inside `adaptiveLayerNorm` has
+// neither scale nor offset of its own, so this is (x - mean) / sqrt(var + eps) and then the conditioning
+kernel void rfd4p_adaln_rows_ln(constant RfdAdalnRowsLnArgs& a [[buffer(0)]], uint3 tg [[threadgroup_position_in_grid]],
+                                uint3 ng [[threadgroups_per_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                                uint lane [[thread_index_in_simdgroup]]) {
+  const ulong row = (ulong)(tg.y * ng.x + tg.x) * 8 + sg;
+  if (row >= a.rows) return;
+  device const float* x = a.x + row * a.C;
+  device const float* gm = a.gamma + row * a.C;
+  device const float* bt = a.beta + row * a.C;
+  float sum = 0;
+  for (int c = lane; c < a.C; c += 32) sum += x[c];
+  const float mean = simd_sum(sum) / (float)a.C;
+  float var = 0;
+  for (int c = lane; c < a.C; c += 32) { const float d = x[c] - mean; var += d * d; }
+  const float inv = rsqrt(simd_sum(var) / (float)a.C + a.eps);
+  for (int c = lane; c < a.C; c += 32) a.y[row * a.C + c] = (x[c] - mean) * inv * lf_sigmoid(gm[c]) + bt[c];
+}
+
+kernel void rfd4p_gather_rows(LF_ARGS(RfdRowsArgs)) {
+  const ulong t = LF_INDEX;
+  if (t >= a.rows * (ulong)a.C) return;
+  const ulong r = t / a.C, c = t - r * a.C;
+  a.out[t] = a.in[(ulong)a.idx[r] * a.C + c];
+}
+
+kernel void rfd4p_scatter_rows(LF_ARGS(RfdRowsArgs)) {
+  const ulong t = LF_INDEX;
+  if (t >= a.rows * (ulong)a.C) return;
+  const ulong r = t / a.C, c = t - r * a.C;
+  a.out[(ulong)a.idx[r] * a.C + c] = a.in[t];
 }

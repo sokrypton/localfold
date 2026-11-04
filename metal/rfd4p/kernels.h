@@ -30,3 +30,7 @@ struct RfdTriAbArgs { CP(float) aP; CP(float) aG; CP(float) bP; CP(float) bG; DP
 struct RfdTriGatherArgs { CP(float) x; DP(float) out; u64 rows; uint T, pad; };
 // y[i] = x[i] * sigmoid(g[i])
 struct RfdMulSigmoidArgs { CP(float) x; CP(float) g; DP(float) y; u64 n; };
+// the same, with LayerNorm in place of RMSNorm (the autoencoder's two transformers are LayerNorm throughout)
+struct RfdAdalnRowsLnArgs { CP(float) x; DP(float) y; CP(float) gamma; CP(float) beta; u64 rows; int C; float eps; };
+// rows gathered by index (the attended tokens) and scattered back: out[r][c] = in[idx[r]][c], and the reverse
+struct RfdRowsArgs { CP(float) in; DP(float) out; CP(int) idx; u64 rows; int C; uint pad; };

@@ -55,11 +55,38 @@ void swiglu(const float* h, float* g, size_t rows, int I);
 void transition(const float* x, float* y, size_t rows, int dim, int expansion, const std::string& prefix, float* hid, float* gated);
 // AdaptiveLayerNorm against a conditioning row per row: y = RMS(x) * sigmoid(gamma) + beta, where gamma and beta
 // are that layer's projections of RMSNorm(cond, norm_cond.weight) - `prefix` is the adaLN's (e.g. "....mhba.adaln")
-void adalnRows(const float* x, const float* cond, const std::string& prefix, float* y, size_t rows, int dim);
+void adalnRows(const float* x, const float* cond, const std::string& prefix, float* y, size_t rows, int dim,
+               int condDim = 0, bool ln = false);
 // x += y * sigmoid(scale_output's gamma of `cond`) - AdaptiveOutputScale and the block's residual
-void scaleAdd(float* x, const float* y, const float* cond, const std::string& prefix, size_t rows, int dim);
+void scaleAdd(float* x, const float* y, const float* cond, const std::string& prefix, size_t rows, int dim,
+              int condDim = 0);
+// rows picked out by index, and put back: `out[r] = in[idx[r]]` and `out[idx[r]] = in[r]`
+void gatherRows(const float* in, float* out, const int* idx, size_t rows, int C);
+void scatterRows(const float* in, float* out, const int* idx, size_t rows, int C);
 // the largest n this port's float32 attention takes (its scores live in threadgroup memory)
 constexpr int LF_ATTN_MAX_N = 6144;
+
+// ---------------------------------------------------------------- decoder.mm
+// The autoencoder's decoder: latents and alpha carbons in, all-atom coordinates out. Its widths are the bundle's
+// `autoencoder_config.nn_ae.decoder` - 12 LayerNorm layers of token dim 768, conditioning width 128 and no pair
+// track at all - and `cpu/rfd4p/decoder.js` is the spec.
+struct DecDims { int layers = 12, D = 768, C = 128, H = 12, feat = 214, types = 147, latent = 32; };
+extern DecDims DD_;
+void checkDecoderDims();
+// the decoder's input features [n][214] (ca_coors_nm, z_latent_seq, the token-type embedding, the C_SEQ
+// embedding), built on the host as every other port builds them
+void decoderFeatures(const float* caNm, const float* zLatent, const int* tokenType, const int* seq, const float* pad,
+                     float* feats);
+// the three heads over the ATTENDED rows: logits [na][147], the structure's 37 relative offsets [na][111], and
+// each slot's presence [na][37]. `s` is the finished stack; `na` rows of it.
+// `sInitOut` and `perLayer` ([layers][na][D]) are the gate's taps and may be null; DEC_TAP_ADA and DEC_TAP_ATTN
+// take layer 0's adaLN and attention outputs the same way (the oracle records both).
+void decode(const float* feats, const int* attnIdx, int na, float* sOut, float* logits, float* coors, float* presence,
+            float* sInitOut = nullptr, float* perLayer = nullptr);
+extern float* DEC_TAP_ADA;
+extern float* DEC_TAP_ATTN;
+// one decoder layer in place on `rows` gathered rows - the gate's per-stage arm drives it directly
+void decoderLayerOne(int layer, float* s, const float* c, size_t rows);
 
 // ---------------------------------------------------------------- trunk.mm
 // c = transition_c_2(transition_c_1(cond_factory(features))) over `rows` conditioning rows

@@ -45,26 +45,44 @@ void transition(const float* x, float* y, size_t rows, int dim, int expansion, c
   lin(gated, prefix + ".linear_out.weight", y, rows, inner, dim);
 }
 
-void adalnRows(const float* x, const float* cond, const std::string& prefix, float* y, size_t rows, int dim) {
-  const int C = D_.C;
+void adalnRows(const float* x, const float* cond, const std::string& prefix, float* y, size_t rows, int dim,
+               int condDim, bool ln) {
+  const int C = condDim ? condDim : D_.C;
   // 🔴 THE CONDITIONING IS NORMED AGAIN HERE, by this adaLN's own `norm_cond` - `adaptiveLayerNorm` in the CPU
   // reference norms both of its inputs, so c is normed per layer and x is normed on top of whatever normed it last.
   float* cn = scratch<float>("ada.cn", rows * C);
-  rmsNorm(cond, cn, rows, C, M.f("w/" + prefix + ".norm_cond.weight"));
+  if (ln) layerNorm(cond, cn, rows, C, M.f("w/" + prefix + ".norm_cond.weight"), opt(prefix + ".norm_cond.bias"));
+  else rmsNorm(cond, cn, rows, C, M.f("w/" + prefix + ".norm_cond.weight"));
   float* gamma = scratch<float>("ada.gamma", rows * (size_t)dim);
   float* beta = scratch<float>("ada.beta", rows * (size_t)dim);
   lin(cn, prefix + ".to_gamma.0.weight", gamma, rows, C, dim, M.f("w/" + prefix + ".to_gamma.0.bias"));
   lin(cn, prefix + ".to_beta.weight", beta, rows, C, dim);
+  if (ln) {
+    RfdAdalnRowsLnArgs a{};
+    a.x = x; a.y = y; a.gamma = gamma; a.beta = beta; a.rows = rows; a.C = dim; a.eps = 1e-5f;
+    run("rfd4p_adaln_rows_ln", grid1d((rows + 7) / 8, 1), 256, a);
+    return;
+  }
   RfdAdalnRowsArgs a{};
   a.x = x; a.y = y; a.gamma = gamma; a.beta = beta; a.rows = rows; a.C = dim; a.eps = 1e-5f;
   run("rfd4p_adaln_rows", grid1d((rows + 7) / 8, 1), 256, a);
 }
 
-void scaleAdd(float* x, const float* y, const float* cond, const std::string& prefix, size_t rows, int dim) {
+void gatherRows(const float* in, float* out, const int* idx, size_t rows, int C) {
+  RfdRowsArgs a{}; a.in = in; a.out = out; a.idx = idx; a.rows = rows; a.C = C;
+  run1d("rfd4p_gather_rows", rows * (size_t)C, a);
+}
+void scatterRows(const float* in, float* out, const int* idx, size_t rows, int C) {
+  RfdRowsArgs a{}; a.in = in; a.out = out; a.idx = idx; a.rows = rows; a.C = C;
+  run1d("rfd4p_scatter_rows", rows * (size_t)C, a);
+}
+
+void scaleAdd(float* x, const float* y, const float* cond, const std::string& prefix, size_t rows, int dim,
+              int condDim) {
   // 🔴 AND THIS ONE READS THE CONDITIONING RAW. `adaptiveOutputScale` projects `cond` itself, with no norm of any
   // kind - the one adaptive module in this network that does not - so passing it a normed c is a silent 1e-1 error.
   float* gamma = scratch<float>("sc.gamma", rows * (size_t)dim);
-  lin(cond, prefix + ".to_adaln_zero_gamma.0.weight", gamma, rows, D_.C, dim,
+  lin(cond, prefix + ".to_adaln_zero_gamma.0.weight", gamma, rows, condDim ? condDim : D_.C, dim,
       M.f("w/" + prefix + ".to_adaln_zero_gamma.0.bias"));
   RfdScaleAddArgs a{};
   a.x = x; a.y = y; a.gamma = gamma; a.rows = rows; a.C = dim;

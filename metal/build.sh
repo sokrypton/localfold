@@ -84,7 +84,13 @@ for port in "${ports[@]}"; do
     fi
     extra=("$sobj" -Wl,-force_load,"$zstd_lib")
   fi
-  clang++ "${flags[@]}" $opt -I "$here/core" -I "$pdir" -I "$repo/cuda/featurise" -x objective-c++ "${srcs[@]}" "$build/$port-source.cpp" \
+  # a port may read a generated header of its own model's conventions (metal/rfd4p includes
+  # "rfd4p/featurise/tables.inc": the vocabulary and the atom37 masks derived from shared/rfd4p rather than typed).
+  # By the DIRECTORY ABOVE and not the featurise directory itself, because `tables.inc` is a name two models use -
+  # cuda/featurise has its own, and putting both on the search path makes which one a port gets an accident of
+  # flag order. The include names its model.
+  inc=(-I "$here/core" -I "$pdir" -I "$repo/cuda/featurise" -I "$repo/cuda")
+  clang++ "${flags[@]}" $opt "${inc[@]}" -x objective-c++ "${srcs[@]}" "$build/$port-source.cpp" \
     -x none "${core_objs[@]}" "${extra[@]}" "${link[@]}" -o "$pdir/localfold-$port.building"
   mv "$pdir/localfold-$port.building" "$pdir/localfold-$port"
   echo "built metal/$port/localfold-$port"
