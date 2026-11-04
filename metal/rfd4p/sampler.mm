@@ -502,6 +502,17 @@ int generate(const std::string& genDir, const std::string& outPath, int designs,
                                                   ? atoi(getenv("LOCALFOLD_RFD4P_PROFILE_STEP"))
                                                   : steps - 1)
                                       : -1;
+  // 🔴 EVERY `M.hostI`/`M.hostF` IS A `sync()`, SO ONE INSIDE THE STEP LOOP SERIALISES THE HOST AND THE GPU.
+  // `Model::hostI` is `i(name); sync(); host(p)` - it drains the queue before handing back a host pointer,
+  // which is right for a gate reading a tensor once and wrong sixty times a generation. These three are
+  // LOOP-INVARIANT (the coordinate groups, the chirality frames and their owners, and the padding mask are
+  // facts about the input, not about the step), and read once before the loop they cost one drain instead of
+  // sixty. Measured at 183 tokens: a step went from 230.6 ms to what the note below records.
+  const int* coordGroupHost = grpOff >= 0 ? M.hostI("g/coordGroup") : nullptr;
+  const int* chirFramesHost = chiral ? M.hostI("g/chiralFrames") : nullptr;
+  const int* chirOwnersHost = chiral ? M.hostI("g/chiralOwners") : nullptr;
+  const float* chirCleanHost = chiral ? M.hostF("g/chir") : nullptr;
+  const float* padHost = M.hostF("in/mask");
   for (int st = 0; st < steps; ++st) {
     if (st == profileStep) profileStart();
     // the step's own noised state into the sequence features - three columns at 0 and thirty-two at 3
@@ -511,7 +522,7 @@ int generate(const std::string& genDir, const std::string& outPath, int designs,
     if (grpOff >= 0) {
       std::vector<float> rows((size_t)n * 37);
       const int* p = perm + (size_t)st * nCrdGroups;
-      const int* groups = M.hostI("g/coordGroup");
+      const int* groups = coordGroupHost;
       for (size_t k = 0; k < rows.size(); ++k) {
         const int g = groups[k];
         const auto at = std::find(crdUniq.begin(), crdUniq.end(), g);
@@ -527,10 +538,10 @@ int generate(const std::string& genDir, const std::string& outPath, int designs,
     if (chiral) {
       sync();
       std::vector<float> chirOut(M.len("g/chir"));
-      const float* clean = M.hostF("g/chir");
+      const float* clean = chirCleanHost;
       for (size_t k = 0; k < chirOut.size(); ++k) chirOut[k] = clean[k];
-      alignChirality(n, (const float*)host(xBb), clean, M.hostI("g/chiralFrames"), M.hostI("g/chiralOwners"),
-                     M.hostF("in/mask"), frameWidth, chirOut.data());
+      alignChirality(n, (const float*)host(xBb), clean, chirFramesHost, chirOwnersHost,
+                     padHost, frameWidth, chirOut.data());
       // into the 18 columns the featuriser put them at, a row at a time
       std::vector<float> rows((size_t)n * 18);
       for (int i = 0; i < n; ++i)

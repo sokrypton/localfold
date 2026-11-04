@@ -126,21 +126,29 @@
 // the -0.07 / -0.16 / -0.15 / +0.27 s it produced was noise, as its own sign disagreement should have said.
 // A control arm that cannot vary the thing under test is not a control: CLAUDE.md's own rule, earned again.
 //
-// 🔴 AND THE LARGEST UNEXPLAINED NUMBER IN THIS PORT IS NOT A KERNEL: A STEP'S WALL IS 1.9x ITS SUMMED KERNEL
-// TIME. Measured with host timers around the step body at 165 tokens: **230.6 ms a step**, of which 219.6
-// surfaces in the FIRST call of the next step - the `copy2d` that reads the previous step's `xBb` - 11.0 in
-// `trunkForward`'s encode and 0.0 anywhere else. `sync()` accounts for **zero**: the host never blocks there,
-// it blocks on the previous step's work at the top of the next one. Against that, the profile sums **121.6 ms**
-// of kernel time over 419 dispatches, and core commits every 128 dispatches, so the real run is ~3 command
-// buffers a step rather than one a dispatch.
-// So ~110 ms a step is either GPU idle between dispatches or host encode that does not overlap - and the two
-// can be told apart, but not with a host clock. What rules the simple encode story out: the SAME ~419
-// dispatches at 54 residues give a 52 ms step (3.13 s for 60), so encoding them cannot cost 110 ms; what rules
-// the simple idle story out is that 3 command buffers should not idle 45%. It wants a Metal System Trace or
-// counter sampling, which is not something a shell here can take.
-// 🔴 IT IS ALSO WHERE THE NEXT REAL WIN IS, AND IT IS BIGGER THAN ANYTHING LEFT IN THE KERNELS. Every item in
-// the roofline table above is 1-25% of 121.6 ms; this is 110 ms of 230.6. A round that closed half of it would
-// beat every kernel change this round made put together.
+// 🔴 AND A STEP'S WALL IS 1.9x ITS SUMMED KERNEL TIME - CHASED, NOT JUST NOTED. At 183 tokens a step is
+// **230.6 ms** against the profile's **121.6 ms** over 419 dispatches. Where the 109 went, by elimination:
+//   * NOT a spurious serialisation. `Model::hostI` is `i(name); sync(); host(p)` - every one DRAINS the queue -
+//     and the step loop made three such calls (the coordinate groups, the chirality frames and owners, the
+//     padding mask), all LOOP-INVARIANT, so sixty drains a generation. They are read once before the loop now.
+//     The wall did not move (12.87 to 12.84 s): the wait was real GPU work, which just surfaces at the next
+//     blocking call instead. Worth keeping anyway - a loop-invariant read does not belong in the loop - but it
+//     is not the lever.
+//   * NOT the submission granularity. core commits every 128 encoded dispatches; swept at 8 / 32 / 128 / 512 /
+//     4096 the wall rises monotonically, which looks decisive and is THERMAL DRIFT - the sweep runs in that
+//     order on a laptop that heats up. Interleaved, 8 against 128 gives +0.59, +0.47, -0.10, -0.07 s: a wash.
+//   * AND THE PROFILE ONLY SEES WHAT IS LABELLED. `profiled.push_back` happens for a dispatch with a label;
+//     an unlabelled one is committed and never timed. So 121.6 ms is a sum over labelled dispatches, not over
+//     the step, and the gap is unmeasured GPU work plus per-dispatch launch latency (419 of them; at 54
+//     residues the same ~419 cost a 52 ms step, so latency is ~0.12 ms each, ~50 ms of it). Attributing the
+//     rest needs a GPU trace, which a shell here cannot take - but the port is GPU-BOUND, not host-bound, and
+//     that is now measured rather than assumed.
+// 🔴 AND ONE OF MY OWN EXPERIMENTS WAS INVALID, which is the useful part. "Doubling the trunk with
+// `--recycles=2` costs 1.2%" was vacuous: the SAMPLER takes its depth from `depths[st]`, the export's
+// `g/depths`, and `--recycles=` sets `D_.nRecycle`, which only the gate path reads. cuda/rfd4p is the same
+// (`o.recycles` feeds its trunk arm, its generation reads the export), so the flag's scope is consistent
+// between the ports - but the test proved nothing, and this is the second control in one round that could not
+// vary the thing under test.
 //
 // So no kernel here is worth another tile sweep. The lever left is FEWER PASSES OVER THE PAIR TRACK - fusing an
 // elementwise pass into the epilogue of the GEMM that produced it, as the gate, the residual and the next
