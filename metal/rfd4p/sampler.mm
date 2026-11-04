@@ -339,6 +339,27 @@ int generate(const std::string& genDir, const std::string& outPath, int designs,
 
   // the activations and the features, allocated ONCE: a campaign's second design pays for neither, which is
   // what makes it a campaign rather than N runs (cuda/rfd4p measures 0.43 s for the first and 0.27 after)
+  // 🔴 AND "ONCE" IS NOW TRUE OF THE FEATURES, WHICH IT WAS NOT. `seqF` and `pairF` were allocated here AND
+  // AGAIN inside the design loop, where the inner names SHADOWED these two - so these two were dead, the
+  // loop allocated a fresh pair of them every design, and nothing in this function ever releases anything.
+  // Measured on `--designs`: peak 1.28 -> 1.30 GB over four designs at n = 100 and **2.42 -> 2.54 GB at
+  // n = 257**, i.e. ~5 MB and ~30 MB a design, which is the n^2 of `pairF` (nn x pairDim x 4). At 400
+  // tokens that is 72 MB a design, so a fifty-design campaign held 3.6 GB of dead feature blocks on a 16 GB
+  // machine - O(designs x n^2) where the comment above says O(n^2). The features are copied fresh from
+  // `in/seq` and `g/pairNoDist` at the top of each design, so one buffer serves every design: only the
+  // COPY belongs in the loop, never the allocation. The fold is bit-identical (three designs, same md5s)
+  // and the peak is now FLAT in the design count: 2.39 GB at one design and at five, n = 257; 1.28 and
+  // 1.29 GB at one and at TWENTY, n = 100.
+  //
+  // 🔴 WHAT IS LEFT IS ~0.5 MB A DESIGN AND IS DELIBERATELY NOT HOISTED. That residual is `noiseDev` plus
+  // the two `uploadNew` calls in the step loop (the coordinate-group rows and the chirality rows, n x 37
+  // and n x 18 floats a step), and nothing in this function releases. They cannot move out of the loop the
+  // way the features did, because unlike the features they are RECOMPUTED from the current coordinates
+  // every step - and reusing ONE buffer across steps is worse than allocating, not better: see the note at
+  // `a.eps` below, where a per-step upload into work the GPU had already queued made the fold
+  // NONDETERMINISTIC, six runs giving four designs. A ring of buffers with a sync discipline would fix the
+  // bytes and could reintroduce that race, so it waits for a campaign large enough to measure
+  // (60,000 step-uploads - a thousand designs of sixty steps - is ~1.6 GB; five designs is 2.5 MB).
   float* seqF = allocT<float>((size_t)n * D_.seqDim);
   float* pairF = allocT<float>(nn * D_.pairDim);
   float* sAct = allocT<float>((size_t)n * D_.D);
@@ -487,11 +508,10 @@ int generate(const std::string& genDir, const std::string& outPath, int designs,
   const size_t noiseLen = design > 0 ? own.noise.size() : M.len("g/noise");
   float* noiseDev = uploadNew(noise, noiseLen);
 
-  // the features: the sequence block with its 35 moving columns, and the pair block with its 30
+  // the features: the sequence block with its 35 moving columns, and the pair block with its 30 - copied
+  // afresh each design into the buffers allocated before the loop, because the step loop MUTATES both
   const int seqDim = D_.seqDim, condDim = D_.condDim, pairDim = D_.pairDim;
-  float* seqF = allocT<float>((size_t)n * seqDim);
   copy(seqF, M.f("in/seq"), (size_t)n * seqDim * 4);
-  float* pairF = allocT<float>(nn * pairDim);
   copy(pairF, M.f("g/pairNoDist"), nn * pairDim * 4);
 
   if (GATE_CHECK) {

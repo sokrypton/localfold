@@ -950,6 +950,10 @@ int main(int argc, char** argv) {
   }
 
 
+  // the other three ports print this and rfd4p did not, so it was the one port that could not report its
+  // own peak - which is what a per-design leak shows up in
+  if (getenv("LOCALFOLD_METAL_STATS") || getenv("LOCALFOLD_PEAK")) printStats();
+
   if (!oracle.empty() || !genDir.empty()) {
     if (FAILED) printf("FAILED (%.2f s)\n", now() - t0);
     else if (CHECKED) printf("all green: %d comparisons (%.2f s)\n", CHECKED, now() - t0);

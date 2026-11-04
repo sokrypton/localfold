@@ -422,6 +422,46 @@ struct Device {
     }
     if (smem) [enc setThreadgroupMemoryLength:(smem + 15) & ~(size_t)15 atIndex:0];
     [enc dispatchThreadgroups:MTLSizeMake(g.x, g.y, g.z) threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+    // 🔴 LOCALFOLD_DUP=<substring> [LOCALFOLD_DUP_N=<k>]: THE ONE PER-FAMILY ATTRIBUTION THIS HARDWARE
+    // ALLOWS. The note above says why `sampleCountersInBuffer:` cannot time a dispatch inside the buffer a
+    // port really submits on an M5, and why the profile's buffer-per-dispatch form measures something else -
+    // which left the gap between a step's GPU-busy time and the sum of its per-dispatch times attributable
+    // only by Xcode. Duplication asks the same question from the other side: issue every dispatch whose
+    // label contains <substring> k extra times, with the SAME pipeline, the SAME arguments and the SAME
+    // threadgroup memory, in the SAME batched encoder - so the marginal wall cost of k extra passes of that
+    // family, measured ABBA against the control, is that family's cost inside the batching that ships.
+    //
+    // 🔴 AND ITS OWN FALSIFICATION IS BIT-IDENTITY, which is the whole reason it is sound. A compute
+    // encoder's dispatches are serial by default, so a second pass over the same inputs re-derives the same
+    // output for a kernel that is a function of its inputs - and a kernel that ACCUMULATES into its output
+    // (a residual add, an in-place gate) is not, and doubles it. So a duplication run whose fold is not
+    // bit-identical to the control's is REFUSED rather than read: the delta then prices a different
+    // computation. Same shape as LOCALFOLD_SCRIBBLE, which also proves itself by staying bit-identical.
+    //
+    // 🔴 AND IT IS A MARGINAL COST, NOT A TOTAL. A starved dispatch's second copy can overlap with work the
+    // first could not, so for a family that does not fill the device the delta is a LOWER BOUND on its
+    // share; for one that saturates it, the delta is its cost. Read it with the dispatch's own occupancy.
+    //
+    // 🔴 MEASURED: THE MECHANISM IS VALIDATED AND THE FIRST TIMING WAS NOISE. Against metal/rfd4p's 100
+    // comparison oracle at n = 100, duplication is bit-identical for `triangle gate`, `gated add`,
+    // `pair-transition-out`, `rfd4p_adaln_rows` and `lf_center_norm` - and `rfd4p_rms_norm` FAILS it, which
+    // is correct: that kernel normalises in place, so a second pass renormalises an already-normalised row.
+    // So the check earns its place on its first run by refusing one family of six rather than mispricing it.
+    // The timing, though, is NOT yet taken: an ABBA pilot on the 183-token / 60-step job gave control arms
+    // 37.94 and 41.94 s against duplicated arms 40.70 and 42.14, then 41.65 / 39.83 against 36.34 / 41.10 -
+    // a duplicated-arm MEAN BELOW the control's, which is impossible and so is a statement about the
+    // machine, not the kernel. Two CPU-bound exporters were running and this Mac's thermal drift at this
+    // length is several seconds (main.mm records 225.7 ms a step cool against 571.7 hot). An attribution
+    // from this knob needs an idle machine and enough rounds to put the sd below the effect; the knob is
+    // committed because the mechanism and its falsification are what took the work, not the number.
+    static const char* dupWant = getenv("LOCALFOLD_DUP");
+    if (dupWant && *dupWant && label && strstr(label, dupWant)) {
+      static const int dupN = getenv("LOCALFOLD_DUP_N") ? atoi(getenv("LOCALFOLD_DUP_N")) : 1;
+      for (int i = 0; i < dupN; ++i) {
+        ++stats.dispatches;
+        [enc dispatchThreadgroups:MTLSizeMake(g.x, g.y, g.z) threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+      }
+    }
     // LOCALFOLD_SYNC_EACH=1: every dispatch waited for and checked, a failure named by its kernel (debugging)
     static const bool syncEach = getenv("LOCALFOLD_SYNC_EACH") != nullptr;
     if (syncEach) {
