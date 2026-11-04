@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build the native Metal ports for this Mac:
 #
-#   bash metal/build.sh [ef2] [af2] [af3] [selftest]      ->  metal/<port>/localfold-<port>
+#   bash metal/build.sh [ef2] [af2] [af3] [bioemu2] [rfd4p] [selftest]   ->  metal/<port>/localfold-<port>
 #
 # A port is metal/core (the device, memory, kernels, GEMM, weight loader) and its own directory's .mm/.cpp files,
 # linked with cuda/featurise's standalone object (the native featuriser, built by clang here). Kernels are Metal
