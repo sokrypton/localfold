@@ -62,7 +62,16 @@ struct RfdStepArgs { DP(float) x; DP(float) x1; CP(float) v; CP(float) eps; CP(f
 struct RfdCenterArgs { DP(float) x; CP(float) emit; u64 tokens; uint dim, pad; };
 // the same three, over HALF buffers: the pair track's operands stay half from the norm to the contraction, so
 // nothing is converted on the way and the contraction's operands are what the matrix units want
-struct RfdTriAbHArgs { CP(half) aP; CP(half) aG; CP(half) bP; CP(half) bG; DP(half) aT; DP(half) bT; u64 rows; uint T, pad; };
+// 🔴 AND THE PROJECTIONS' OPTIONAL BIASES COME THROUGH HERE, which this port said they could not. The note on
+// the channel-major projection claimed "a bias cannot come through this way: core's bias is per output COLUMN,
+// which here is a pair row rather than a channel" - true of the GEMM's own epilogue and false of the triangle,
+// because a per-CHANNEL bias in a channel-major layout is a per-ROW constant and this gate already reads every
+// element of all four planes. One struct for both kernels, so a field cannot be added to one variant and
+// missed by the other (which has built cleanly here and died on the first dispatch, Metal compiling at run
+// time). Null where a checkpoint has no bias for that projection, as the reference's `getOptionalTensorData`
+// leaves it undefined.
+struct RfdTriAbHArgs { CP(half) aP; CP(half) aG; CP(half) bP; CP(half) bG; DP(half) aT; DP(half) bT; u64 rows;
+                       uint T, pad; CP(float) baP; CP(float) baG; CP(float) bbP; CP(float) bbG; };
 struct RfdTriGatherHArgs { CP(half) x; DP(half) out; u64 rows; uint T, pad; };
 // `add` folded in: y += x * sigmoid(g), which is the triangle's whole tail - the separate residual add was 9.2%
 // of a step over 23 calls, and it reads and writes the pair track again for nothing

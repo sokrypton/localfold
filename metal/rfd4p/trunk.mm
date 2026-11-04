@@ -265,11 +265,17 @@ static bool triangle(const std::string& prefix, Z z, bool outgoing, const half* 
     //     Y[t][r] = sum_p weight[t][p] zn[r][p]
     // is `rows = T, in = P, out = n*n` with the WEIGHT as X and the activations as a transposed W. The GEMM
     // writes the planes the contraction reads, and the gate below is elementwise in that layout.
-    // 🔴 AND A BIAS CANNOT COME THROUGH THIS WAY: core's bias is per output COLUMN, which here is a pair row
-    // rather than a channel. This checkpoint has `tri_mult_bias: false`, so there is none - and a bundle that
-    // has one is refused by name rather than silently dropped.
-    for (const char* b : {".linear_a_p.bias", ".linear_a_g.bias", ".linear_b_p.bias", ".linear_b_g.bias"})
-      if (opt(prefix + b)) die("rfd4p: %s%s is a bias the channel-major projection cannot carry", prefix.c_str(), b);
+    // 🔴 AND A BIAS DOES COME THROUGH, IN THE GATE RATHER THAN THE GEMM - which this comment used to deny. core's
+    // own bias is per output COLUMN, and the column here is a pair row rather than a channel, so the GEMM cannot
+    // carry one; but a per-channel bias in a channel-major layout is a per-ROW constant, and the gate below
+    // already touches every element of all four planes. `tri_mult_bias` is false in this checkpoint so the
+    // tensors are absent and the ordinary kernel runs; `opt` returning one picks the variant that adds it. The
+    // refusal that stood here named a reason that was not true of the triangle.
+    const float* baP = opt(prefix + ".linear_a_p.bias");
+    const float* baG = opt(prefix + ".linear_a_g.bias");
+    const float* bbP = opt(prefix + ".linear_b_p.bias");
+    const float* bbG = opt(prefix + ".linear_b_g.bias");
+    const bool anyBias = baP || baG || bbP || bbG;
     half* zn = const_cast<half*>(znPre);
     if (!zn) {
       zn = scratch<half>(outgoing ? "tri.znHo" : "tri.znHi", nn * P);
@@ -308,8 +314,9 @@ static bool triangle(const std::string& prefix, Z z, bool outgoing, const half* 
     half* bT = scratch<half>("tri.bTH", nn * T);
     RfdTriAbHArgs ab{};
     ab.aP = aP; ab.aG = aG; ab.bP = bP; ab.bG = bG; ab.aT = aT; ab.bT = bT; ab.rows = nn; ab.T = (uint)T;
+    ab.baP = baP; ab.baG = baG; ab.bbP = bbP; ab.bbG = bbG;
     // channel-major in and out: a thread's read and its write are the same index, so both coalesce
-    run1d("rfd4p_tri_ab_hm", nn * T, ab);
+    run1d(anyBias ? "rfd4p_tri_ab_hmb" : "rfd4p_tri_ab_hm", nn * T, ab);
 
     half* x = scratch<half>("tri.xH", nn * T);
     Gemm g{};

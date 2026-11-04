@@ -329,6 +329,21 @@ kernel void rfd4p_tri_ab_hm(LF_ARGS(RfdTriAbHArgs)) {
   a.bT[t] = (half)((float)a.bP[t] * lf_sigmoid((float)a.bG[t]));
 }
 
+// the same gate with the projections' biases, as a SEPARATE kernel so the common path pays nothing: a channel
+// index costs an integer division by a runtime value, and no released checkpoint has these tensors
+// (`tri_mult_bias: false`), so the variant may be the slow one as long as it is the right one
+kernel void rfd4p_tri_ab_hmb(LF_ARGS(RfdTriAbHArgs)) {
+  const ulong t = LF_INDEX;
+  if (t >= a.rows * (ulong)a.T) return;
+  const uint c = (uint)(t / a.rows);        // channel-major: the plane this element is in
+  const float ap = (float)a.aP[t] + (a.baP ? a.baP[c] : 0.f);
+  const float ag = (float)a.aG[t] + (a.baG ? a.baG[c] : 0.f);
+  const float bp = (float)a.bP[t] + (a.bbP ? a.bbP[c] : 0.f);
+  const float bg = (float)a.bG[t] + (a.bbG ? a.bbG[c] : 0.f);
+  a.aT[t] = (half)(ap * lf_sigmoid(ag));
+  a.bT[t] = (half)(bp * lf_sigmoid(bg));
+}
+
 kernel void rfd4p_swiglu_h(LF_ARGS(RfdSwigluHArgs)) {
   const ulong t = LF_INDEX;
   if (t >= a.rows * (ulong)a.I) return;

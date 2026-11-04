@@ -67,9 +67,29 @@
 // 🔴 AND HALF COSTS 0.022 A: the same seed through both arithmetics gives designs 0.022 A RMS apart (worst
 // 0.059) with 53 of 54 residues identical, against 13 to 23 A between seeds.
 //
-// REFUSED BY NAME rather than run as something else: a bias on the triangle's projections (`tri_mult_bias` is
-// false in this checkpoint and the channel-major projection cannot carry one), and a `coord_group_seq` block
-// whose place in the 897 sequence columns cannot be located.
+// 🔴 AND THIS LIST USED TO READ AS TWO UNPORTED FEATURES AND WAS NEITHER. It said "REFUSED BY NAME: a bias on
+// the triangle's projections (the channel-major projection cannot carry one), and a `coord_group_seq` block
+// whose place in the 897 sequence columns cannot be located" - and a reader (human or otherwise) takes that as
+// two things this port cannot do. Both entries were wrong, in opposite directions, and a doc that misdescribes
+// its own coverage costs more than a missing one.
+//   - `coord_group_seq` IS PORTED AND EXERCISED. The 37 columns are LOCATED (`coordGroupOffset`) from the
+//     labels the featuriser wrote at step 0, and the group labels are permuted every step; two gate jobs carry
+//     three coordinate groups each and both are green. The `die` is a GUARD - no match means the feature's
+//     place cannot be assumed, and a guessed offset would overwrite some other feature - and it does not fire
+//     on an export this featuriser wrote.
+//   - THE TRIANGLE'S BIASES NOW COME THROUGH, in the gate rather than the GEMM. The old reason was false of
+//     the triangle: core's bias is per output COLUMN, which the channel-major product cannot use, but a
+//     per-CHANNEL bias in that layout is a per-ROW constant and the gate already reads every element of all
+//     four planes. `rfd4p_tri_ab_hmb` adds them; `opt` returning a tensor picks it, so the common path is
+//     byte-identical and pays nothing for a feature no released checkpoint has.
+// 🔴 VERIFIED WITHOUT A CHECKPOINT THAT HAS THEM, because none does (`tri_mult_bias: false`) and an
+// unexercised path is a claim rather than a feature. Synthetic per-channel biases were injected, the gate's
+// operands and its result dumped, and `aT` held to `(aP + baP[c]) * sigmoid(aG + baG[c])`: the channel-major
+// mapping `c = t / (n * n)` matches to **4.9e-4** relative, which is half-precision storage of the result,
+// while `t % T`, `(t / T) % T` and "no bias at all" are out by **19x, 34x and 34x**. So the one thing that
+// could be wrong in six lines - which plane an element is in - is the thing the check discriminates.
+//
+// REFUSED BY NAME rather than run as something else: nothing, in this checkpoint's configuration.
 //
 // THE GATE, over an exported input directory rather than a job:
 //   localfold-rfd4p <input dir> --bundle=<model-rfd4p-int8> [--oracle=<dir>] [--encoder=<dir>] [--gen=<dir>-gen]
