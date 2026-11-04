@@ -508,12 +508,36 @@ int generate(const std::string& genDir, const std::string& outPath, int designs,
     // what holds this path: with the clean target read correctly they are 2.0e-3 and below on `partial`, and
     // BIT-EXACT on `inverse`'s backbone. Fixing the four would mean writing the corrupted start into
     // cuda/rfd4p's exporter, which belongs to someone else - so they are declined by name here.
-    if (!partial) {
-      GATE_CHECK("initial noise bb_ca", "gen/x0Bb", xBb, (size_t)n * 3, GATE_TRAJ_BOUND);
-      GATE_CHECK("initial noise latents", "gen/x0Ll", xLl, (size_t)n * latent, GATE_TRAJ_BOUND);
+    // `gen/cStartBb` is what tools/dump-rfd4p-corrupt-start.mjs writes into `<gen>-start`: the start the
+    // reference actually takes on a corrupted run. Where it is present these rows compare against IT and
+    // mean what they say; where it is not, the exporter's unconditional start is all there is and they are
+    // declined by name.
+    const bool startFixed = M.has("gen/cStartBb");
+    if (!partial || startFixed) {
+      GATE_CHECK(startFixed ? "corrupted start bb_ca" : "initial noise bb_ca",
+                 startFixed ? "gen/cStartBb" : "gen/x0Bb", xBb, (size_t)n * 3, GATE_TRAJ_BOUND);
+      // 🔴 AND THE LATENTS' START TAKES THE TRAJECTORY BOUND, WHICH IS NOT A BOUND WIDENED TO PASS. The
+      // unconditional row compares REPLAYED noise and is rightly held to the tight one - nothing computes
+      // it, so anything but bit-exact is a defect. A CORRUPTED start's latents are
+      // `(1 - t) x0 + t x1` where x1 is the half-precision ENCODER's reparameterised output, so the row
+      // carries the encoder's own error by construction: measured against its own stage oracle that is
+      // 1.02e-3, and this row reads 2.39e-3 - the same magnitude as every other latent row here
+      // (2.20e-3 to 2.51e-3), all of which this bound covers. The BACKBONE's start keeps the tight bound
+      // because no network touches it (replayed noise plus the input's own CA) and it reads **1.78e-08**,
+      // which is what says the looser bound on the latents is hiding nothing: the two halves of the same
+      // start are held to the two different standards their arithmetic earns.
+      GATE_CHECK(startFixed ? "corrupted start latents" : "initial noise latents",
+                 startFixed ? "gen/cStartLl" : "gen/x0Ll", xLl, (size_t)n * latent,
+                 startFixed ? GATE_TRAJ_XT_BOUND : GATE_TRAJ_BOUND);
+      // 🔴 AND THE START ROW IS ENOUGH TO PIN THE CLEAN TARGET, which is why there is no separate row for
+      // it: the start is `(1 - t) x0 + t x1` with x0 taken from the REPLAYED stream, identical on both
+      // sides by construction, and t from the input's own meta - so x1 is the only free term and the start
+      // agreeing means it agrees. The bug this arm exists for (the sample's CA read as the clean target)
+      // moves the start by 1.03 relRMS, far outside the bound.
     } else {
       printf("  initial state + step 0 features   NOT COMPARED - the reference's are an unconditional "
-             "start (export_input.mjs); the per-step rows below are the arm\n");
+             "start (export_input.mjs); build one with tools/dump-rfd4p-corrupt-start.mjs into "
+             "<gen>-start\n");
     }
   }
 

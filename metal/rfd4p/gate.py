@@ -66,36 +66,30 @@ identity); `g/noise` is 8780 floats = 2144 encoder eps + 201 bb + 2144 ll + 3 gr
 exactly the port's own layout, so the replayed stream is not shifted; and the encoder is EXACT - mean
 1.02e-3, logScale 8.20e-4, zLatent 1.02e-3, 90 comparisons green against its own stage oracle.
 
-🔴 THE ONE THING STILL OPEN, AND IT IS THE CLEAN TARGET `x1` OF THE TWO CORRUPTED MODES. Both arms'
-`bb_ca` trajectory rows disagree with the reference (partial `step 0 xt bb_ca` 3.700, inverse 2.675)
-while their latents agree (inverse `step 0 xt latents` 2.5e-4). Ruled out, each with a measurement, so
-the next person does not pay for it twice: the draw ORDER matches `corruptBatch`'s documented order
-(encoder eps, bb x0, ll x0, per-group offsets - sampler.mm and partial.js agree line for line); the step
-COUNT matches (the oracle holds `gen/s0` and `gen/s1` only, so both sides ran 2); the SCHEDULE branch
-matches (the port's `partialSchedule` and `buildPartialSchedule` both slice the last nsteps+1 times off
-the full schedule, and the port's `ts[0] == pt` assertion passes, so `frac` was non-null on both sides);
-the ENCODER is exact (mean 1.02e-3, logScale 8.20e-4, 90 stages green); the replayed stream has exactly
-the port's layout (8780 floats = 2144 encoder eps + 201 bb + 2144 ll + 3 group + 2 x 2144 per step); and
-the emit masks are identical (`e/emit` and `g/emitLl`, 67 of 67).
+🔴 THE THING THAT WAS OPEN IS CLOSED, AND IT WAS A REAL DEFECT. Both corrupted modes' `bb_ca` rows
+disagreed with the reference (partial `step 0 xt bb_ca` 3.700, inverse 2.675) while their latents agreed.
+Six causes were ruled out with measurements first - the draw ORDER matches `corruptBatch`'s; the step
+COUNT matches (the oracle holds `gen/s0` and `gen/s1` only); the SCHEDULE branch matches (both slice the
+last nsteps+1 times off the full schedule, and the port's `ts[0] == pt` assertion passes); the ENCODER is
+exact (mean 1.02e-3, 90 stages green); the replayed stream is exactly the port's layout (8780 floats =
+2144 encoder eps + 201 bb + 2144 ll + 3 group + 2 x 2144 per step); the emit masks are identical (67/67).
+What was left was the CLEAN TARGET, and the port had the wrong tensor: it read `in/caNm`, whose own
+exporter comment says "`caNm` IS THE SAMPLE'S CA, NOT THE TRUNK'S OUTPUT", where the reference builds
+`x1.bb_ca` from `batch.coords_nm` at the atom37 CA slot - which `e/coorsNm` is written from unchanged.
+Fixed in sampler.mm; `LOCALFOLD_RFD4P_X1_CANM=1` is the arm. And NO GEOMETRY CHECK COULD HAVE CAUGHT IT:
+with the bug restored, partial still folds a clean chain (CA-CA median 3.78 A) while its trajectory is
+wrong by 3.7.
 
-What is left is WHICH TENSOR IS THE CLEAN BACKBONE. The reference builds its `x1.bb_ca` from
-`batch.coords_nm` at the atom37 CA slot (`(i * 37 + 1) * 3`, cpu/rfd4p/reference.js). The port's partial
-branch reads `in/caNm`, calling it "the input's own alpha carbons" - and the exporter's own comment over
-that tensor says "`caNm` IS THE SAMPLE'S CA, NOT THE TRUNK'S OUTPUT". The two candidates in the export
-are not the same thing and neither is clearly right:
-
-  tensor                      own CA-CA chain        vs the reference's gen/s0Bb (Kabsch)
-  in/caNm                     median 22.99 A          20.30 A
-  e/coorsNm at atom37 CA      median  3.80 A          10.54 A
-
-So `in/caNm` is not a protein backbone in token order while `e/coorsNm`'s CA is - which points at the
-port reading the wrong tensor. It is NOT closed, for two reasons: substituting `e/coorsNm` still leaves
-10.5 A to the reference's own state, and the two may simply be in different TOKEN LAYOUTS (this preset's
-contig `5-20,A16-35,10-25,A52-71,5-20` expands and reorders segments, so consecutive-token distance is
-not consecutive-residue distance and 22.99 A may be correct for a clean structure in contig order).
-Settling it needs the reference's `x1.bb_ca` dumped directly, which `export_input.mjs` does not write.
-Both tensors are byte-identical between the JS exporter and the native featuriser, so this is not an
-export-versus-production split.
+🔴 AND THE FOUR DECLINED ROWS ARE COMPARED NOW, WITHOUT TOUCHING cuda/. They were declined because
+`export_input.mjs` writes `gen/x0Bb`/`gen/x0Ll` from `sampleInitialNoise` with a fresh rng - an
+unconditional start - so on a corrupted run they describe a step the run never takes, which left the
+START compared against nothing. `tools/dump-rfd4p-corrupt-start.mjs` writes the start the reference
+actually takes, by calling the reference's OWN `encodeLatentsCpu`, `corruptBatch` and (for inverse)
+`sampleNoisedTargetBackbone` with one rng in its order, under its own `gen/cStart*` keys into
+`<gen>-start`; this gate builds it per arm from the export's own `meta/baseNsteps`. The port compares
+against it where present and still declines by name where it is not. Measured: partial's start is
+**1.78e-08** on the backbone and 2.39e-3 on the latents, inverse's is 5.06e-08 and **0.000e+00** - and
+with the clean-target bug restored the START row reads **2.689**, so it sees the defect at its origin.
 
 🔴 AND IT DOES NOT ACCEPT ANYBODY'S TERMS. The exporter that builds these references reads a float32
 checkpoint, and NVIDIA's `model.safetensors` asks for terms this gate will not accept on a user's behalf;
@@ -104,6 +98,7 @@ bundle dequantised) is what it uses instead, and it says so when it builds one.
 """
 import argparse
 import ast
+import json
 import os
 import re
 import subprocess
@@ -162,9 +157,48 @@ def ensure_reference(name, flags):
     return out
 
 
+def meta_of(d, key):
+    for line in open(os.path.join(d, "model.idx")):
+        p = line.split()
+        if p[0] == "m" and p[1] == f"meta/{key}":
+            return p[2]
+    return None
+
+
+def ensure_corrupt_start(inp, flags):
+    """The reference's corrupted START, which the exporter does not write.
+
+    🔴 `export_input.mjs` writes `gen/x0Bb`/`gen/x0Ll` from `sampleInitialNoise` with a FRESH rng - an
+    unconditional start, on its own stated assumption that "nothing consumes the stream before
+    `sample_noise`". A partial or inverse run starts from `corruptBatch`'s xt (or, for inverse, the
+    re-noised target) and its encoder reparameterisation consumes n x latent normals first, so those two
+    tensors describe a step the run never takes. Without this the port had to DECLINE four rows, which left
+    the corrupted-mode start - the first place a wrong clean target shows - compared against nothing. It
+    was a wrong clean target. `--nsteps=` must be the export's own `meta/baseNsteps`, because the corruption
+    TIME is a function of it (the preset's 60 gives t_bb 0.9465 where the four-step export says 0.9633).
+    """
+    start = inp + "-gen-start"
+    if os.path.exists(os.path.join(start, "model.idx")):
+        return
+    preset = next((f[len("--preset="):] for f in flags if f.startswith("--preset=")), None)
+    if preset is None:
+        return                      # not a preset-driven corrupted mode (the monomer and sampler arms)
+    base = meta_of(inp + "-gen", "baseNsteps")
+    if base is None:
+        return
+    r = run(["node", os.path.join(REPO, "tools", "dump-rfd4p-corrupt-start.mjs"), start,
+             f"--preset={preset}", f"--nsteps={base}", f"--checkpoint={CHECKPOINT}"])
+    if r.returncode:
+        # not every preset is a corrupted start; the dumper says so and the rows stay declined
+        print(f"             (no corrupted start for {preset}: "
+              f"{(r.stderr or r.stdout).strip().splitlines()[-1][:80]})")
+
+
 def trajectory_arm(name):
     flags, needs_enc = TRAJECTORY_ARMS[name]
     inp = ensure_reference(name, flags)
+    if needs_enc:
+        ensure_corrupt_start(inp, flags)
     cmd = [BIN, inp, f"--bundle={BUNDLE}", f"--gen={inp}-gen"]
     if needs_enc:
         cmd.append(f"--encoder={inp}-enc")
@@ -306,6 +340,55 @@ def partial_arm():
 
 
 ARMS["partial"] = with_geometry("partial", partial_arm)
+
+
+def presets_arm():
+    """Every shipped preset folded through this port, enumerated from shared/rfd4p/presets.js.
+
+    🔴 THE ANSWER TO "IS THE FEATURE SURFACE COVERED" THAT A SYMBOL AUDIT CANNOT GIVE. The arms above are
+    the five the reference gate exports trajectories for; `presets.js` is the whole shipped menu, and its
+    ten entries are ten CATEGORIES - unconditional, protein binder, motif scaffolding indexed and
+    unindexed, small molecule, nucleic acid, YAML spec, partial diffusion, inverse folding,
+    fold-conditioned. Four had a trajectory arm and the writer gate renders all ten, but nothing FOLDED
+    the other six through this port. This does, at the preset's own step count, and fails on a crash, a
+    refusal, or a token count that is not the featuriser's own.
+
+    It is a reachability sweep, not a correctness one: the trajectory arms are what hold the arithmetic.
+    Said plainly because a green row here means "this feature runs", which is weaker than the arms above
+    and stronger than nothing - and nothing is what six of these had.
+    """
+    ids = json.loads(run(["node", "-e", """
+      import('./shared/rfd4p/presets.js').then(m => {
+        const all = m.RFD4P_PRESETS ?? m.default ?? [];
+        console.log(JSON.stringify(all.map(p => p.id)));
+      });"""]).stdout.strip().splitlines()[-1])
+    bad, rows = [], []
+    for pid in ids:
+        d = os.path.join(WORK, f"preset-{pid}")
+        if not os.path.exists(os.path.join(d, "model.idx")):
+            e = run(["node", "--max-old-space-size=8192", EXPORTER, d, f"--preset={pid}",
+                     "--generate", "--encoder", "--steps=60", f"--checkpoint={CHECKPOINT}"])
+            if e.returncode:
+                bad.append(f"{pid} (export)")
+                continue
+        cmd = [BIN, d, f"--bundle={BUNDLE}", f"--gen={d}-gen",
+               f"--out={os.path.join(WORK, f'preset-{pid}.pdb')}"]
+        if os.path.exists(os.path.join(d + "-enc", "model.idx")):
+            cmd.append(f"--encoder={d}-enc")
+        r = run(cmd)
+        out = r.stdout + r.stderr
+        m = re.search(r"generated (\d+) residues", out)
+        g = re.search(r"consecutive CA-CA: median ([\d.]+)", out)
+        if r.returncode or not m:
+            bad.append(pid)
+            rows.append(f"{pid}:FAILED")
+        else:
+            rows.append(f"{pid}:{m.group(1)}tok" + (f"/{float(g.group(1)):.1f}A" if g else ""))
+    return not bad, (f"{len(ids) - len(bad)}/{len(ids)} shipped presets fold  "
+                     + " ".join(rows) + (f"  FAILED: {', '.join(bad)}" if bad else ""))
+
+
+ARMS["presets"] = presets_arm
 
 
 def main():

@@ -583,6 +583,16 @@ int main(int argc, char** argv) {
     const std::string go = genDir + "-oracle";
     FILE* probe = fopen((go + "/model.idx").c_str(), "r");
     if (probe) { fclose(probe); M.loadInput(go); }
+    // 🔴 AND A CORRECTED START WHERE ONE EXISTS, loaded AFTER the oracle so it overrides it.
+    // `export_input.mjs` writes `gen/x0Bb` and `gen/x0Ll` from `sampleInitialNoise` with a fresh rng - an
+    // UNCONDITIONAL start - so on a partial or inverse run they describe a first step that run never takes,
+    // and the four initial rows had to be declined. `tools/dump-rfd4p-corrupt-start.mjs` writes the start the
+    // reference actually takes (`corruptBatch` over the encoder's latents, one rng in the reference's order)
+    // under the same two keys, and marks itself with `gen/cleanBb`. Where that directory is present the rows
+    // compare against it instead; where it is not, they are still declined by name. Loading it LAST is what
+    // makes it an override rather than a second opinion.
+    const std::string gs = genDir + "-start";
+    if (FILE* p2 = fopen((gs + "/model.idx").c_str(), "r")) { fclose(p2); M.loadInput(gs); }
   }
   D_.n = (int)M.meta("meta/n");
   // `--recycles=` overrides what the input was exported with, as cuda/rfd4p's does.
