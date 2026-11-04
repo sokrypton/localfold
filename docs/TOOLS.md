@@ -11,7 +11,7 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-437 tools. `tools/fixtures/` is data and is not listed.
+459 tools. `tools/fixtures/` is data and is not listed.
 
 ## `tools/gpu/` - the WebGPU lane (217)
 
@@ -336,7 +336,7 @@ and turning it into a bundle.
 - **`safetensors_read.py`** - Read a .safetensors file into numpy arrays, without the safetensors package.
 - **`vector-quantise.py`** - Is a codebook worth a new decoder? Scalar codes against vector ones, at 2 bits.
 
-## `tools/` - everything else (132)
+## `tools/` - everything else (154)
 
 CPU checkers, the export and quantisation pipeline, the page drivers that
 go through CDP, and the deploy.
@@ -377,6 +377,7 @@ go through CDP, and the deploy.
 - **`check-esmfold2-trunk.js`** - Does LocalFold's pairformer arithmetic compute ESMFold2's trunk?
 - **`check-job-archive.py`** - Does a fold archive describe the AlphaFold 3 job that was handed in?
 - **`check-ligand-path.mjs`** - Every AF3-lineage model folds a LIGAND, and its bonds are the right length.
+- **`check-metal-rfd4p-writer.py`** - The Metal port's structure writer and design metrics against the PAGE's, on the same sample.
 - **`check-model-pending.py`** - One fold at a time, and a model row that starts a new session.
 - **`check-model-switch.py`** - Ten models folded in ONE page, as a reader switching models does.
 - **`check-modified-path.mjs`** - Does every model fold a MODIFIED RESIDUE, and does it hold together?
@@ -449,12 +450,31 @@ go through CDP, and the deploy.
 - **`gpu-chrome.mjs`** - Run a WebGPU module in headless Chrome and print what it returns.
 - **`heatmap-panel.py`** - Do the heatmap panel's tabs appear, and does OUR map format reach them?
 - **`index-tools.py`** - Every tool in this repository, with the one line it says about itself.
+- **`metal-extract-host.py`** - The host-only declarations a Metal port needs out of a CUDA header, extracted at build time.
 - **`mobile-layout.py`** - index.html at real phone widths: it must FIT, not merely not overflow.
 - **`model-terms.py`** - The model gate: the AlphaFold 3 terms dialog, and `?model=` in the URL.
 - **`negate-bundle-tensors.py`** - Negate NAMED tensors in a float32 bundle, in place.
 - **`pack_delta_model.py`** - Store one AlphaFold 2 model as a DELTA on another, at three bits a weight.
 - **`pae-from-distogram.py`** - Can a PAE matrix be estimated from a distogram and a structure?
 - **`pae-transfer.py`** - Does EF2-fast's distogram carry the same aligned-error information?
+- **`ppi-bench/bench.js`** - In-page: one Protein Hunter attempt on an RFD4-Proteina PPI benchmark target, then the benchmark's own AF3 check (single sequence, target templated, 5 recycles, one sample, a fresh seed) and its pass criteria:
+- **`ppi-bench/bench.py`** - Drives design.html in headless Chrome through Protein Hunter attempts on the RFD4-Proteina PPI benchmark.
+- **`ppi-bench/ci.py`** - ci.py <run.jsonl> ...: mean per-target pass rate, a bootstrap 95% CI over attempts within targets, and coverage
+- **`ppi-bench/cluster.py`** - Structural clusters of passing binders, standing in for the paper's Foldseek (TM-score 0.5) clustering, which could not be installed here. A small TM-align on CA traces: gapless-threading seeds, then Needleman-Wunsch on the TM-score similarity of the current superposition, a few rounds. Two binders join when the TM-score normalised by the SHORTER is >= 0.5 - the generous side, so clusters come out
+- **`ppi-bench/disco-score.py`** - disco-score.py <run.jsonl> ...: small-molecule rows (task-bench.mjs) under the paper's OTHER small-molecule criterion, `disco` (configs/metrics/pass_criteria/all_pass_criteria.yaml): binder backbone RMSD <= 2 A, and the ligand centroid - per ligand chain, after fitting the binder's backbone, the largest over ligands - within 2 A of the design's. It reads no confidence at all. Rescored from each row's own design and refold PDBs; beside rfd4_proteina_high's
+- **`ppi-bench/engine-probe.js`** - In-page (engine-probe.py): fold fixed [binder, ...target] complexes through the page's own AF3 (web/af3-model.js foldAf3, the target templated as bench.js does) on a chosen bundle - "int5" is the page's shipped one, read through loadAf3Weights; any other value is a bundle directory read the same way loadAf3Weights reads one - and return each fold's benchmark terms (binder pTM, min interface PAE).
+- **`ppi-bench/engine-probe.py`** - engine-probe.py <out.jsonl> <calls> <recycles> <arm> [<limit>] [--source=<rows.jsonl>] [--seeds=11,12] [--attempts=0-2]:
+- **`ppi-bench/native-bench.mjs`** - Protein Hunter on the RFD4-Proteina PPI benchmark with every fold on the native CUDA port (cuda/af3/fold --serve):
+- **`ppi-bench/native_eval.py`** - The benchmark's evaluation on the native CUDA AlphaFold 3 (cuda/af3, af3-any-model's int8 weights): [binder, ...target] single sequence, the target templated, 5 recycles, 200 steps, one sample - and the paper's terms (binder-chain pTM, min interface PAE averaged both ways, target-aligned binder backbone RMSD). rescore.py and bench.py both score through here, so a page run and a native run are judged by the same model.
+- **`ppi-bench/prep-tasks.py`** - RFD4-Proteina's DNA- and small-molecule-binder benchmark targets (their repo, BSD-3) -> tasks.json dna: data/benchmarks/dna_binder/dna_binder_denovo_val/<id>_sequence_context (the paper's "unfixed" DNA: the duplex is given as sequence only and co-folded), binder 120-150 sm:  data/benchmarks/small_molecule_binder/disco_figure_2c, the 77 keys of configs/.../disco_figure_2c.yaml; each
+- **`ppi-bench/prep.py`** - Benchmark targets (RFD4-Proteina repo data/benchmarks/ppi/ppi_all_atom, BSD-3) -> targets.json
+- **`ppi-bench/rescore.py`** - Re-scores benchmark designs with the native CUDA AlphaFold 3 (cuda/af3, af3-any-model's int8 weights) instead of the page's int5 WebGPU fold - an independent evaluator for the same criteria: single sequence, target templated, 5 recycles, 200 steps, one sample.
+- **`ppi-bench/rfd4-gen.py`** - rfd4-gen.py: RFD4-Proteina's OWN designs for a task, from the benchmark's own annotated inputs, through the native port (cuda/rfd4p, "high" recycling), written as rows `task-bench.mjs --rescore` judges exactly as it judges ours.
+- **`ppi-bench/score.py`** - score.py <run.jsonl> ...: pass rates per target against the paper's (data.json, figure-2 PPI rows)
+- **`ppi-bench/task-bench.mjs`** - Protein Hunter on RFD4-Proteina's DNA- and small-molecule-binder benchmarks (tasks.json, from prep-tasks.py), every fold on the native CUDA port - native-bench.mjs's loop with the target given by an AlphaFold 3 job (DNA by sequence, a ligand by SMILES or CCD code), MPNN that sees it (NA-MPNN for DNA, LigandMPNN for a ligand), and each task's own pass criteria (the paper's S8.2):
+- **`ppi-bench/task-score.py`** - task-score.py <run.jsonl> ...: DNA-, small-molecule-binder and AME pass rates (task-bench.mjs rows) per task, mean over targets with a bootstrap 95% CI over attempts within targets, beside the paper's models on the same targets - one-shot, and RFD4-Proteina's Search pipeline. A target's variant is its prefix: "U-" is AME's unfixed-ligand set (mcsa_unfixed), "F-" a fixed target (the *_fixed datasets); none is the figure-2 dataset.
+- **`ppi-bench/xeval.py`** - Cross-evaluation: re-predicts benchmark designs with a model that took no part in designing them, under the benchmark's criteria - the answer to "AF3 designed, AF3 checked, AF3 scored".
+- **`ppi-bench/xscore.py`** - xscore.py: cross-evaluation summary - each design set's pass rate under each re-predictor, and how many of the designs that pass the AF3 evaluation also pass the other model (mean over targets, bootstrap 95% CI).
 - **`protein-hunter-in-page.py`** - Drive a REAL design run in proteinhunter.html, and check what it produced.
 - **`quantize_af3.py`** - Rewrite an exported AF3 model directory as int5, asymmetric, group 32.
 - **`quantize_model.py`** - Rewrite an exported model/ directory with quantised weight shards.
@@ -462,6 +482,8 @@ go through CDP, and the deploy.
 - **`replay_alphafold_evoformer_block.py`** - Replay and stage-capture one official AlphaFold Evoformer block on CPU.
 - **`replay_alphafold_triangle_reference.py`** - Replay a captured bundle through the official AF2 Haiku operator on CPU.
 - **`rfd4p-automorphisms.mjs`** - shared/rfd4p/symmetry.js's automorphisms of each component on stdin, for tools/check-rfd4p-automorphisms.py.
+- **`rfd4p-bundle-to-safetensors.mjs`** - The published int8 bundle written back out as a float32 `.safetensors` - what `cuda/rfd4p/export_input.mjs --checkpoint=` and `export_weights.mjs` read.
+- **`rfd4p-writer-unshifted.mjs`** - The page's writer on a dumped sample with `center_shift` taken back OUT, against a native file.
 - **`rfd4p_ccd.py`** - The dictionary entries the RFD4 page would FETCH for a structure, written from the CCD atomworks reads.
 - **`score-bioemu2-samples.mjs`** - BioEmu2 samples, scored as BioEmu2 scores them: its physicality report and its steering potentials' energies.
 - **`score_fold.py`** - Score a fold from tools/gpu/fold.js against a reference structure.

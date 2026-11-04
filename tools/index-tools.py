@@ -92,7 +92,22 @@ def header_line(path: Path) -> str | None:
             r'^\s*(?:#[^\n]*\n\s*)*(?:from __future__[^\n]*\n)?\s*("""|\'\'\')(.*?)\1',
             text, re.S,
         )
-        return _first(match.group(2)) if match else None
+        if match:
+            return _first(match.group(2))
+        # 🔴 ELSE A RUN OF LEADING `#` LINES, WHICH THE .js BRANCH BELOW HAS ALWAYS ACCEPTED AND THIS ONE DID
+        # NOT. Fourteen tracked tools in tools/ppi-bench open with `# <name>.py <args>: what it does` - a header
+        # line saying what the tool is, which is exactly what this gate asks for - and every one of them was
+        # reported as having no header at all, with the advice to "add a docstring" that was advice to rewrite a
+        # header already there. The gate was red on committed files for as long as they have existed, which also
+        # blocked `--write` and so blocked indexing any NEW tool. Same shape as the shebang note below: a reader
+        # that cannot see one of the forms it accepts reports the file, not itself.
+        match = re.match(r"(?:#![^\n]*\n)?((?:[ \t]*#[^\n]*\n)+)", text)
+        if match:
+            # past a coding declaration, which names an encoding rather than the tool
+            lines = [ln for ln in match.group(1).splitlines()
+                     if not re.match(r"[ \t]*#.*coding[:=]", ln)]
+            return _first("\n".join(lines), strip="#")
+        return None
 
     if suffix == ".html":
         match = re.search(r"<title>(.*?)</title>", text, re.S)
