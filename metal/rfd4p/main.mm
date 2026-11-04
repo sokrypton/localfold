@@ -297,13 +297,44 @@
 // 6.5 GB, and **6.03 GB at 512** against their >= 9.7 GB projection; they tested only 48 GB and say 8 GB is
 // "likely too tight".
 //
-// 🔴 WHAT IS NOT MEASURED, AND IT IS THE ONE THAT WOULD SETTLE IT: their code has NOT been run on this Mac.
-// The sandbox refused to execute the downloaded package, so every number of theirs above is as published and
-// the hardware difference is NORMALISED rather than removed. Per-core normalisation assumes linear scaling in
-// cores, which their own doc flags (~30% of a pair update is bandwidth-bound, and an M5 Pro has more
-// bandwidth), and the precisions differ - int8 weights move less than fp16, so part of this margin is the
-// bundle and not the kernels. The honest form of all of it is: comparable speed per pass, better speed per
-// core, much better memory, and one experiment still owed.
+// 🔴 AND IT IS MEASURED NOW: THEIR PORT RUN ON THIS MACHINE, which removes the hardware difference instead
+// of normalising it - and the normalisation was WRONG. `rfd4_mlx` 0.1.0 under MLX **0.32.4** (their own
+// version) with their fp16 trunk weights, driven through their own `hook._weights` / `_make_pass(W, 14, 2)`
+// and their own timing protocol from `scripts/bench_trunk_scaling.py` (same synthetic activations and
+// shapes, 3 warm passes, 12 timed `mx.eval` calls, median), with their fast path ACTIVE - it reports
+// "GEMM path: hand-written Metal 4 tensor-op kernel", which is the MPP GEMM it switches on for M5-class
+// GPUs. The only change was dropping their `assert wait_idle()` gate, which wants GPU utilisation <= 3%
+// where this Mac's desktop idles at 7-9%. Their numbers below are theirs, on this 8-core fanless Air:
+//
+//     N     ours     theirs   theirs(rev)   we are
+//    64     22.9       23.7            -     1.04x
+//    96     40.7       51.5            -     1.27x
+//   128     65.4       87.6         90.1     1.36x
+//   160     97.9      135.7            -     1.39x
+//   180    123.8      176.2        180.3     1.44x
+//   200    150.0      220.9            -     1.47x
+//   256    238.5      360.2        364.7     1.52x
+//   320    369.3      565.4            -     1.53x
+//   384    535.7      842.0        826.9     1.56x
+//
+// (ours GPU-busy a pass, theirs median `mx.eval` wall; their forward and reverse sweeps agree within 3%, so
+// drift is not in it.) And the CONSERVATIVE form, our arm HOT from a full 60-step run at 100% busy - so wall
+// and busy are the same number - against their COOL 12-rep median: at 180 tokens ours 122.0 ms against
+// 178.3, at 256 ours 251.6 against 362.5. **1.44-1.46x in this port's favour either way**, at parity at
+// n = 64 and widening with n.
+//
+// 🔴 AND THE PER-CORE NORMALISATION THAT STOOD HERE BEFORE OVER-PREDICTED IT. From their published 20-core
+// figures this file reasoned "1.33x slower in absolute ms on 2.5x fewer cores, so ~1.8x the work per core"
+// and predicted ~1.8x on one machine. Measured, it is **1.44x**. Their port does not lose 2.5x going from 20
+// cores to 8 - 93.06 ms becomes 176.2, a factor of 1.89 - which is their own doc's point that roughly 30% of
+// a pair update is bandwidth-bound and does not scale with cores. Dividing by core count assumed the part
+// that does not divide. The direction survived and the number did not, which is the reason to run the thing.
+//
+// What is still NOT equal, and no same-machine run fixes it: the precisions differ. Their trunk is fp16
+// throughout; this one stores int8 and computes in half, so it moves less weight traffic, and part of this
+// margin is the bundle rather than the kernels. Their MLX peak at 180 tokens is 1.21 GB of MLX arrays
+// (their own counter, excluding the torch side), against 1.77 GB for this port's WHOLE GPU allocation
+// including 0.87 GB of weights; their published full-process footprint on their own machine is 6.5 GB.
 //
 // So no kernel here is worth another tile sweep. The lever left is FEWER PASSES OVER THE PAIR TRACK - fusing an
 // elementwise pass into the epilogue of the GEMM that produced it, as the gate, the residual and the next
