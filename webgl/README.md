@@ -64,6 +64,7 @@ webgl/
     global-attention.js         AF2's global column attention: one query a residue, the masked
                                 mean of its column, with single-headed keys and values
   af2/
+    multimer/template.js        the multimer's nine-projection template embedder
     evoformer/block.js          a whole Evoformer block and the extra-MSA block, nine sub-layers
                                 each, sharing the six that make up the pair half
     evoformer/stack.js          the loop over blocks, for both kinds
@@ -438,8 +439,40 @@ generates its shader per scale for the same reason, and a `scaleMoves` arm asser
 (0.491) so that neither side can be ignoring it. A monomer scale on multimer weights halves every
 coordinate from the origin: a structure, just not the model's, and nothing downstream would raise.
 
-Still to come in AF2-multimer: the nine-projection template embedder, and the driver. After that:
-AF3's pairformer and diffusion, ESMFold2, bioemu2.
+**The nine-projection template embedder runs** - 1.3e-7 with a real template, 1.5e-7 with a masked
+one and 4.9e-8 at four padded slots, each at its measured floor against the WGSL multimer embedder.
+The monomer has one Linear over an 88-column concatenation; the multimer sums nine projections, and
+three of its conventions produce a plausible number when wrong, so each is its own arm:
+
+- **a masked template still contributes.** The wrapper adds this term unconditionally and the
+  biases, a one-hot of aatype zero and the query embedding all survive the mask. The reference
+  records what omitting it cost: "the pair track 30% out from the first evoformer block... shattered
+  backbones at six copies".
+- **`templates` is the DIVISOR of the mean and sits inside the relu**, so the PADDED slot count is
+  what divides - the same trap `templateFeatureMeanOnePass` records for rosettafold3, a stage exact
+  at one slot and a quarter strength at four.
+- **the pair blocks run their five operations in the OPPOSITE order to the monomer template
+  stack's.** "AF2 monomer's TemplatePairStack attends first and multiplies second; multimer's
+  TemplateEmbeddingIteration multiplies first... running one order with the other's weights is the
+  kind of mistake that produces a plausible number." `orderMoves` asserts the flag is live at
+  **0.084** before any residual is believed.
+
+🔴 **AND THIS PORT WAS MORE PERMISSIVE THAN THE REFERENCE, WHICH IS HOW THAT WAS CAUGHT.** The WGSL
+embedder REFUSES a template with no `asymId` - "AF2-multimer masks the template's geometry across
+chains, and assuming one chain lets it speak about pairs it has never seen in one coordinate frame"
+- where this port defaulted to an all-ones mask, copied from the monomer path where one chain IS
+the model. That is the exact mistake the monomer template's own comment warns about, and it
+surfaced only because the reference threw where this port would have folded. The refusal is
+matched, and the gate runs two chains.
+
+🔴 **AND THE ORDER CONTROL READ "INERT" THROUGH A DILUTION BEFORE IT READ 0.084.** The arms compare
+`pair + update`, because that is what the reference writes, and the pair is more than an order of
+magnitude larger than the update - so the same order change reads **2.6e-5 on the sum** and 0.084
+on the update itself. A control measured through a dilution reports "inert" about something that is
+not.
+
+Still to come in AF2-multimer: the driver. After that: AF3's pairformer and diffusion, ESMFold2,
+bioemu2.
 
 Every operation so far is checked against TWO references - an f64 CPU one written from the
 operation, and the WGSL kernel run in the same page - because a single reference cannot say which

@@ -490,10 +490,10 @@ export function uploadTemplatePairBlockWeights(execution, weights) {
 /**
  * One block of AF2's template pair stack: five sub-layers, each a residual.
  *
- *     pair += triangleAttention(pair, "starting")
- *     pair += triangleAttention(pair, "ending")
- *     pair += triangleMultiplication(pair, "outgoing")
- *     pair += triangleMultiplication(pair, "incoming")
+ *     pair += triangleAttention(pair, "starting")      monomer order; the
+ *     pair += triangleAttention(pair, "ending")         multimer runs the two
+ *     pair += triangleMultiplication(pair, "outgoing")  multiplications FIRST,
+ *     pair += triangleMultiplication(pair, "incoming")  under `templateOrder`
  *     pair += transition(pair)
  *
  * 🔴 IT IS NOT `pairHalf` MINUS THE OUTER PRODUCT MEAN - THE ORDER DIFFERS.
@@ -510,6 +510,8 @@ export function uploadTemplatePairBlockWeights(execution, weights) {
  * @param {{pair: Tensor, pairMask: Tensor, length: number, cZ: number,
  *   triangleHidden: number, pairHidden: number,
  *   weights: ReturnType<typeof uploadTemplatePairBlockWeights>, epsilon?: number,
+ *   templateOrder?: "monomer" | "multimer",
+ *   transitionPrecision?: "f16" | "f32",
  *   triangleAttentionPrecision?: "f16" | "f32",
  *   triangleAttentionParts?: Record<string, "f16" | "f32">,
  *   trianglePrecision?: "f16" | "f32"}} call
@@ -518,7 +520,12 @@ export function uploadTemplatePairBlockWeights(execution, weights) {
 export function templatePairBlock(execution, call) {
   const {
     pairMask, length, cZ, triangleHidden, pairHidden, weights: w, epsilon = 1e-5,
+    templateOrder = "monomer",
   } = call;
+  if (templateOrder !== "monomer" && templateOrder !== "multimer") {
+    throw new RangeError(
+      `templatePairBlock: templateOrder is "monomer" or "multimer", not \`${templateOrder}\``);
+  }
   let pair = call.pair;
   let own = false;
   const residual = (current, update) => {
@@ -529,6 +536,7 @@ export function templatePairBlock(execution, call) {
     return next;
   };
 
+  const attentions = () => {
   // 1. Triangle attention, starting node: the bias comes off the block's own
   //    normalised pair, exactly as in the main stack.
   {
@@ -563,14 +571,15 @@ export function templatePairBlock(execution, call) {
     execution.release(updateT);
     pair = residual(pair, update);
   }
+  };
 
-  // 3, 4. The two triangle multiplications, in order.
+  const multiplications = () => {
   /** @type {[("outgoing" | "incoming"), Group][]} */
-  const multiplications = [
+  const directions = [
     ["outgoing", w.triangleMultiplicationOutgoing],
     ["incoming", w.triangleMultiplicationIncoming],
   ];
-  for (const [direction, group] of multiplications) {
+  for (const [direction, group] of directions) {
     pair = residual(pair, triangleMultiplication(execution, {
       z: pair, mask: pairMask, weights: group,
       shape: { length, cZ, cHidden: triangleHidden },
@@ -578,11 +587,28 @@ export function templatePairBlock(execution, call) {
       projectionPrecision: call.trianglePrecision ?? "f32",
     }));
   }
+  };
 
-  // 5. Pair transition.
+  // 🔴 AND WHICH PAIR RUNS FIRST IS THE CHECKPOINT'S, NOT A DETAIL. The
+  // reference states it where this port could have got it wrong: "THE TWO
+  // TEMPLATE STACKS RUN THEIR OPS IN DIFFERENT ORDERS. AF2 monomer's
+  // TemplatePairStack attends first and multiplies second; multimer's
+  // TemplateEmbeddingIteration multiplies first. Same five operations, same
+  // weights, different sequence - and running one order with the other's
+  // weights is the kind of mistake that produces a plausible number."
+  if (templateOrder === "multimer") {
+    multiplications();
+    attentions();
+  } else {
+    attentions();
+    multiplications();
+  }
+
+  // The pair transition, last in both orders.
   pair = residual(pair, transition(execution, {
     activations: pair, weights: w.pairTransition,
     rows: length * length, channels: cZ, hiddenChannels: pairHidden, epsilon,
+    hiddenPrecision: call.transitionPrecision,
   }));
   pair.label = "template.pair";
   return pair;
