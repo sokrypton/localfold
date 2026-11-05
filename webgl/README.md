@@ -1088,11 +1088,30 @@ host cost is about 0.57 ms a draw. So:
 - and the **hot int5 weights do not fit at all** - `576 x 896 -> 1792` is 1.6 million codes - so the
   48.6% of a bioemu2 fold that matters most cannot use this.
 
-**Untested in a real kernel, and said so deliberately**: the packed-halves weight had an equally
-sound mechanism (32 flops a fetch against 21.33, measured, at no accuracy cost) and still lost 0.78x
-because the `unpackHalf2x16` ALU exceeded the fetches it saved. A per-read ratio is not a kernel
-result. What is established here is that **the bound below is a texture-unit bound**, and that one
-untried path exists with a measured 2.1x and a 65,536-float ceiling on what it can hold.
+🔴 **AND PRICED AGAINST THE DRAW IT COSTS, IT IS NOT WORTH BUILDING - WHICH IS WHY IT IS WRITTEN
+DOWN RATHER THAN BUILT.** A UBO that does not fit in one draw costs a draw per chunk, and `--host`
+puts this backend's draw at **0.504 ms** (466 ms of `bindMs` plus 2554 of `drawMs` over 5,989
+draws). So:
+
+| | fetches a k-step | extra draws | saved a call | cost a call | net |
+|---|---|---:|---:|---:|---:|
+| `4624x256x512` in-major, 13.05 ms a call | 8 texture + 4 uniform against 12 | +1 | 2.2 ms | 0.50 ms | **+1.7 ms** |
+| `576x896x1792` int5, 10.0 ms a call | 16 texture + 5 uniform against 21 | **+3** | 1.2 ms | 1.5 ms | **-0.3 ms** |
+
+The in-major case nets 1.7 ms over 208 calls - **340 ms of a 30.4 s fold, 1.1%** - and the int5 case,
+which is 48.6% of the fold, is a **net LOSS** because its 1.6 million codes need four draws to pass
+through 65,536 floats of uniforms and three extra draws cost more than the fetches save. So the
+honest figure for this path is **about one percent**, not the "~2.5%" a per-read ratio suggested
+before the draws were counted.
+
+**And untested in a kernel even so**: the packed-halves weight had an equally sound mechanism (32
+flops a fetch against 21.33, measured, at no accuracy cost) and still lost 0.78x because the
+`unpackHalf2x16` ALU exceeded the fetches it saved. A per-read ratio is not a kernel result, and a
+per-read ratio minus a draw count is still not one.
+
+What is established is narrower and worth keeping: **the bound below is a texture-unit bound and not
+an absolute one**, there is exactly one other path, it is 2.1x per read, it holds 65,536 floats a
+draw, and once the draws are priced it is worth about a percent on the one fold that can use it.
 
 ### What the remaining gap IS, from the WGSL kernel's own notes
 
