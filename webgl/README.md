@@ -1053,6 +1053,50 @@ sufficient one. A generalisation measured on one model is a regression on anothe
 reason this is a sentence rather than a shipped defect is that the AF2 differential runs on every
 pass.
 
+### What the remaining gap IS, from the WGSL kernel's own notes
+
+**The distance is arithmetic intensity per GLOBAL fetch, and the mechanism that buys it is the one
+thing WebGL2 does not have.** This is no longer inference: `webgpu/bioemu2/ops.js` says what its
+GEMM does and what it measured.
+
+| | WGSL `gemm2Source` | this backend's best |
+|---|---|---|
+| tile | **64 x 128**, staged in WORKGROUP MEMORY, 256 lanes of 4 x 8 | 32 output floats an invocation |
+| its own figure | *"three workgroup reads for 32 multiply-adds"* | **~23 flops a `fetch4`** with int5 weights |
+| achieved | ~2.4 TFLOP/s | **185 GFLOP/s** at **8 G fetch4/s** |
+
+A 64-by-128 block loads its two panels from global memory ONCE and then reads them from workgroup
+memory for every one of 8,192 outputs. A fragment shader has no workgroup memory, so a fragment's
+only reuse is what it holds in registers, and that is capped by `MAX_DRAW_BUFFERS * 4`. **Every
+global fetch here feeds about 23 flops; every global fetch there feeds hundreds.** That ratio is the
+gap, and it is a property of the API.
+
+🔴 **AND THE PRECISION SHORTCUT THAT WOULD PARTLY SUBSTITUTE WAS MEASURED AND DECLINED BY THE
+REFERENCE PORT ITSELF.** The obvious way past 23 flops a fetch is to pack `x` as float16 halves -
+eight k-values a texel instead of four, which would cut this kernel's dominant term almost in half.
+`webgpu/bioemu2/ops.js` built exactly that on the WGSL side and rejected it: *"FLOAT32 ON PURPOSE.
+f16 staging... was built and measured on the normalised-input GEMMs: promoted every 32 products, 266
+-> 237 ms at FIVE TIMES the shipped arm's error against a float32 reference (sigma 16: 2.8e-3 ->
+1.4e-2)... This arm keeps float32 activations and only the weights in half, which is why it is the
+more accurate of the two ports."* So it is worth 1.12x there and costs 5x the error - and this
+backend's own earlier attempt at it overflowed f16 outright and lost 7% when clamped. **Both ports
+have now measured it and both decline it.**
+
+🔴 **SO THE INT5 PROJECTIONS - 48.6% OF A bioemu2 FOLD - ARE AT THIS BACKEND'S PRACTICAL CEILING,
+and that is a measurement rather than the two bounds this file got wrong before it.** `576 x 896 ->
+1792` runs at **185 GFLOP/s on about 8 G fetch4 a second**, which is the HIGHEST rate any real kernel
+here reaches - the shaped arms of `probe-webgl-fetch-rate.js` span 4 to 9 - and its 23 flops a fetch
+is already past the 21.33 that f32 operands allow, because an RGBA32UI texel carries about 25
+five-bit codes where an RGBA32F texel carries four floats. There is no further operand to compress
+without changing the answer.
+
+What that leaves, honestly: the remaining distance on bioemu2 is **not** a kernel underperforming
+its hardware. It is 23 flops a global fetch against several hundred, and closing it needs workgroup
+memory. Every control arm in this file was re-measured on the finished tree and every shipped
+default is still the faster one (`--no-row-fastest` 11.6 s against 6.1, `--no-int5-weights` 13.1,
+`--no-contract-block` 9.7, `--no-stride-pad` 8.5, `--no-half-weights` 6.4), so there is no knob left
+set the wrong way either.
+
 ### 🔴 OPEN DEFECT: ESMFold2's RECYCLING MAKES ITS FOLD WORSE, AND NOTHING GATED THE SEAM
 
 **This is a correctness finding, not a speed one, and it was surfaced by being asked for a
