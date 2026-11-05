@@ -53,7 +53,8 @@ describe("a delta family runs its base's graph", () => {
   // `chosen` and `row` for exactly that reason.
   it("no page or source file tests a resolved family name for a graph", () => {
     const offenders = [];
-    const files = ["shared", "cpu", "webgpu", "web"].flatMap((tree) => sourceFiles(`${ROOT}${tree}`));
+    const files = ["shared", "cpu", "webgpu", "webgl", "web"]
+      .flatMap((tree) => sourceFiles(`${ROOT}${tree}`));
     const pattern = /\b(family|model|choice)\s*[!=]==\s*"(monomer|multimer)"/g;
     // ...over the CODE, not the comments. This rule is worth stating in prose
     // where it is broken most easily, and a gate that forbids describing it is

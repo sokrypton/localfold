@@ -21,41 +21,31 @@
  *     the same algorithm in two languages, but the same MATHS under two
  *     different sets of constraints.
  *
- * WIDTH IS A POWER OF TWO on purpose. A texel is addressed as
- * (index % width, index / width), and with an arbitrary width that is an
- * integer division per access, twice per inner-loop step. A power of two lets
- * the compiler shift and mask instead.
+ * The texture layout - a power-of-two row width, four floats to a texel - is
+ * `webgl/runtime/context.js`, shared with every kernel here.
  *
- * 🔴 AND NOTHING IMPORTS THIS FILE, WHICH IS DELIBERATE AND NOT DEAD CODE. Both
- * WebGL2 kernels - this one and its sibling - **exist for comparison, not as a
- * fallback anything selects**, and a census of `src/` finds them immediately:
- * 701 lines, zero importers, alongside `webgpu/index.js` and `webgpu/node.js`, which
- * are entry points. What they bought is written down in docs/DEVELOPING.md and
- * is worth more than they cost: WebGL2 has no compute shaders, so it has no
- * workgroup memory and no barriers, and porting the attention kernel to it is
- * **what exposed how much the WGSL kernel was paying in barriers - the 11.4x**.
- * On a fair fight they are about 1.4x behind on the contraction and about 1.55x
- * ahead on attention, computing the same numbers.
+ * 🔴 NOTHING ON THE PAGE SELECTS THIS BACKEND YET, WHICH IS DELIBERATE AND NOT
+ * DEAD CODE. This file and its sibling were written as SPIKES - two kernels
+ * ported to answer whether a WebGL2 fallback is possible at all - and for a
+ * long while they sat in `webgpu/kernels/` with a `webgl2` in their names and
+ * zero importers, where a dead-code sweep finds them immediately. They are the
+ * first two kernels of `webgl/` now, exported by `webgl/index.js`, which is a
+ * home rather than a verdict: `webgl/README.md` is what this backend is and is
+ * not.
+ *
+ * What they bought is worth more than they cost. WebGL2 has no compute shaders,
+ * so it has no workgroup memory and no barriers, and porting the attention
+ * kernel to it is **what exposed how much the WGSL kernel was paying in
+ * barriers - the 11.4x**. On a fair fight they are about 1.4x behind on the
+ * contraction and about 1.55x ahead on attention, computing the same numbers.
  *
  * Delete them and the next person to ask "would a barrier-free formulation
  * help?" starts from nothing.
  */
 
-/** Texel rows this wide; see the note above. Must be a power of two. */
-const TEXTURE_WIDTH = 2048;
-
-/**
- * 🔴 FOUR FLOATS TO A TEXEL, AND NO REPACKING TO GET THERE. The tensors are
- * laid out with channel fastest, so four consecutive channels are already four
- * consecutive floats - exactly one RGBA32F texel. The same Float32Array uploads
- * as RGBA without being rearranged, and the shader gets four values per fetch.
- */
-const CHANNELS_PER_TEXEL = 4;
-
-function textureShape(elements) {
-  const texels = Math.ceil(elements / CHANNELS_PER_TEXEL);
-  return { width: TEXTURE_WIDTH, height: Math.ceil(texels / TEXTURE_WIDTH), texels };
-}
+import {
+  CHANNELS_PER_TEXEL, FULLSCREEN_TRIANGLE, TEXTURE_WIDTH, linkProgram, textureShape,
+} from "../runtime/context.js";
 
 /**
  * Channel-minor [pair][channel] to channel-major [channel/4][pair], four to a
@@ -75,22 +65,6 @@ function toChannelMajor(values, pairs, channels) {
   }
   return out;
 }
-
-function compile(gl, type, source) {
-  const shader = gl.createShader(type);
-  gl.shaderSource(shader, source);
-  gl.compileShader(shader);
-  if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
-    const log = gl.getShaderInfoLog(shader);
-    gl.deleteShader(shader);
-    throw new Error(`WebGL2 shader failed to compile: ${log}`);
-  }
-  return shader;
-}
-
-const VERTEX_SHADER = `#version 300 es
-in vec2 position;
-void main() { gl_Position = vec4(position, 0.0, 1.0); }`;
 
 /**
  * The contraction, with the shape baked in.
@@ -161,22 +135,6 @@ void main() {
 }`;
 }
 
-/**
- * A WebGL2 context that can render to float textures, or an explanation.
- *
- * EXT_color_buffer_float is what makes an R32F framebuffer legal to draw into.
- * Without it the whole approach is unavailable, and saying so by name is more
- * use than a link error deep in a draw call.
- */
-export function createWebGL2Context(canvas) {
-  const gl = (canvas ?? new OffscreenCanvas(1, 1)).getContext("webgl2");
-  if (gl === null) throw new Error("this browser has no WebGL2");
-  if (gl.getExtension("EXT_color_buffer_float") === null) {
-    throw new Error("WebGL2 here cannot render to float textures (EXT_color_buffer_float)");
-  }
-  return gl;
-}
-
 export class TriangleContractWebGL2 {
   gl;
   #programs = new Map();
@@ -188,14 +146,8 @@ export class TriangleContractWebGL2 {
     const cached = this.#programs.get(key);
     if (cached !== undefined) return cached;
     const gl = this.gl;
-    const program = gl.createProgram();
-    gl.attachShader(program, compile(gl, gl.VERTEX_SHADER, VERTEX_SHADER));
-    gl.attachShader(program, compile(gl, gl.FRAGMENT_SHADER,
-      contractShader(length, channels, TEXTURE_WIDTH, direction, layout)));
-    gl.linkProgram(program);
-    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
-      throw new Error(`WebGL2 program failed to link: ${gl.getProgramInfoLog(program)}`);
-    }
+    const program = linkProgram(gl,
+      contractShader(length, channels, TEXTURE_WIDTH, direction, layout));
     const entry = {
       program,
       aTex: gl.getUniformLocation(program, "aTex"),
@@ -278,7 +230,7 @@ export class TriangleContractWebGL2 {
     gl.bindBuffer(gl.ARRAY_BUFFER, vertices);
     // ONE TRIANGLE, not two: a single oversized triangle covers the viewport
     // without the seam down the diagonal that two of them share.
-    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+    gl.bufferData(gl.ARRAY_BUFFER, FULLSCREEN_TRIANGLE, gl.STATIC_DRAW);
     const position = gl.getAttribLocation(shader.program, "position");
     const vao = gl.createVertexArray();
     gl.bindVertexArray(vao);
