@@ -492,3 +492,168 @@ void main() {
   if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
   result = fetch4(aTex, texel) + fetch4(bTex, texel);
 }`;
+
+/**
+ * The per-block attention biases, for every block of an atom stack at once.
+ *
+ * 🔴 ONE LAYERNORM AND ONE PROJECTION SERVE THE WHOLE STACK UNDER AF3, "which is
+ * why the projection's output is (blocks, heads) rather than heads. Recomputing
+ * it per block would read the same weights and give the same answer; splitting
+ * it the wrong way round gives every block the biases meant for another."
+ *
+ * 🔴 ...AND OpenDDE NORMALISES AND PROJECTS PER BLOCK, with its own scale and
+ * its own matrix each time: "`pair_input_layer_norm/scale` is [3, 16] there and
+ * [16] here, and the projection [3, 16, 4] against [16, 12]. The MEAN and
+ * VARIANCE are the same either way (they come from the pair, which does not
+ * change), so the difference is entirely in which scale and which matrix a block
+ * reads. That makes it invisible to every shape check and to any test that runs
+ * one block."
+ *
+ * The output is one tensor a block, each already in the
+ * `[subset][head][query][key]` order the attention kernel reads - because the
+ * flat projection is `[subset][query][key][block][head]` and the transpose is
+ * exactly the sort of thing that is easy to get backwards.
+ */
+export const pairLogitsLayoutSource = (shape) => {
+  const { subsets, queries, keys, heads, blocks, block } = shape;
+  return `${PRELUDE}${ONE_TARGET}
+const int QUERIES = ${queries};
+const int KEYS = ${keys};
+const int HEADS = ${heads};
+const int BLOCKS = ${blocks};
+const int BLOCK = ${block};
+const int ELEMENTS = ${subsets * heads * queries * keys};
+uniform sampler2D flatTex;
+
+float at(int element) {
+  int key = element % KEYS;
+  int rest = element / KEYS;
+  int query = rest % QUERIES;
+  int rest2 = rest / QUERIES;
+  int head = rest2 % HEADS;
+  int subset = rest2 / HEADS;
+  int source = (((subset * QUERIES + query) * KEYS) + key) * BLOCKS * HEADS
+    + BLOCK * HEADS + head;
+  return fetch1(flatTex, source);
+}
+
+void main() {
+  int base = linearTexel() * 4;
+  if (base >= ELEMENTS) { result = vec4(0.0); return; }
+  result = vec4(
+    at(base),
+    base + 1 < ELEMENTS ? at(base + 1) : 0.0,
+    base + 2 < ELEMENTS ? at(base + 2) : 0.0,
+    base + 3 < ELEMENTS ? at(base + 3) : 0.0);
+}`;
+};
+
+/**
+ * @param {import("../../runtime/execution.js").Execution} execution
+ * @param {{pair: Tensor, subsets: number, queries: number, keys: number,
+ *   pairChannels: number, heads: number, blocks: number, weights: any,
+ *   pairNormPerBlock: boolean, epsilon?: number}} call
+ * @returns {Tensor[]} one bias tensor a block, in the attention's own order
+ */
+export function atomPairLogits(execution, call) {
+  const {
+    pair, subsets, queries, keys, pairChannels, heads, blocks, weights: w,
+    epsilon = 1e-5,
+  } = call;
+  if (typeof call.pairNormPerBlock !== "boolean") {
+    throw new Error(
+      "af3 atom pair logits: pairNormPerBlock has no default - AF3 normalises the"
+      + " atom-pair conditioning once for the stack and OpenDDE once per block, and"
+      + " the difference is which scale and which matrix a block reads");
+  }
+  const pairRows = subsets * queries * keys;
+
+  // The flat `[row][blocks * heads]` projection, however it was produced.
+  let flat;
+  if (call.pairNormPerBlock) {
+    flat = execution.allocate(pairRows * blocks * heads, "af3.atom.logits-flat");
+    const perBlock = [];
+    for (let block = 0; block < blocks; block += 1) {
+      const normalised = layerNorm(execution, {
+        x: pair, weight: w.pairInputLayerNormScales[block],
+        rows: pairRows, channels: pairChannels, epsilon,
+      });
+      perBlock.push(linear(execution, {
+        x: normalised, weight: w.pairLogitsProjections[block], rows: pairRows,
+        inChannels: pairChannels, outChannels: heads, weightLayout: "in-major",
+      }));
+      execution.release(normalised);
+    }
+    execution.dispatch({
+      source: interleaveBlocksSource(pairRows, blocks, heads),
+      output: flat,
+      inputs: Object.fromEntries(perBlock.map((t, b) => [`block${b}`, t])),
+      label: `af3.atom.logits-interleave:${pairRows}x${blocks}x${heads}`,
+    });
+    for (const tensor of perBlock) execution.release(tensor);
+  } else {
+    const normalised = layerNorm(execution, {
+      x: pair, weight: w.pairInputLayerNormScale,
+      rows: pairRows, channels: pairChannels, epsilon,
+    });
+    flat = linear(execution, {
+      x: normalised, weight: w.pairLogitsProjection, rows: pairRows,
+      inChannels: pairChannels, outChannels: blocks * heads, weightLayout: "in-major",
+    });
+    execution.release(normalised);
+  }
+
+  const out = [];
+  for (let block = 0; block < blocks; block += 1) {
+    const perBlock = execution.allocate(
+      subsets * heads * queries * keys, `af3.atom.logits${block}`);
+    execution.dispatch({
+      source: pairLogitsLayoutSource({ subsets, queries, keys, heads, blocks, block }),
+      output: perBlock,
+      inputs: { flatTex: flat },
+      label: `af3.atom.logits-layout:${subsets}x${heads}x${queries}x${keys}`,
+    });
+    out.push(perBlock);
+  }
+  execution.release(flat);
+  return out;
+}
+
+/**
+ * `flat[row][block * heads + head] = perBlock[block][row][head]`.
+ *
+ * Only the per-block arm needs it: there the projections are separate tensors
+ * and the attention reads one interleaved array, so the two have to meet
+ * somewhere. GLSL ES forbids a dynamic sampler index, so the select is unrolled
+ * - the same reason `interleavePlanesSource` in the flash kernel is.
+ */
+export const interleaveBlocksSource = (rows, blocks, heads) => {
+  const declarations = Array.from({ length: blocks },
+    (_, b) => `uniform sampler2D block${b};`).join("\n");
+  const select = Array.from({ length: blocks - 1 },
+    (_, b) => `  if (block == ${b}) return fetch1(block${b}, row * HEADS + head);`).join("\n");
+  return `${PRELUDE}${ONE_TARGET}
+const int HEADS = ${heads};
+const int BLOCKS = ${blocks};
+const int ELEMENTS = ${rows * blocks * heads};
+${declarations}
+
+float at(int element) {
+  int head = element % HEADS;
+  int rest = element / HEADS;
+  int block = rest % BLOCKS;
+  int row = rest / BLOCKS;
+${select}
+  return fetch1(block${blocks - 1}, row * HEADS + head);
+}
+
+void main() {
+  int base = linearTexel() * 4;
+  if (base >= ELEMENTS) { result = vec4(0.0); return; }
+  result = vec4(
+    at(base),
+    base + 1 < ELEMENTS ? at(base + 1) : 0.0,
+    base + 2 < ELEMENTS ? at(base + 2) : 0.0,
+    base + 3 < ELEMENTS ? at(base + 3) : 0.0);
+}`;
+};

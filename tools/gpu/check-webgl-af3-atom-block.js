@@ -49,10 +49,10 @@
  * claim is that a real batch's gathers hold no case this one misses.
  */
 import {
-  crossAttentionBlock as cpuBlock, layerNormSlow,
+  atomPairLogits as cpuPairLogits, crossAttentionBlock as cpuBlock,
 } from "../../cpu/af3/diffusion/atom-encoder.js";
 import {
-  crossAttentionBlock, gather,
+  atomPairLogits, crossAttentionBlock, gather,
 } from "../../webgl/af3/diffusion/atom-attention.js";
 import { Execution } from "../../webgl/runtime/execution.js";
 import { createWebGL2Context } from "../../webgl/index.js";
@@ -223,6 +223,77 @@ export async function main(device, args) {
     if (!ok) failures.push(`${name}: relRMS ${relative.toExponential(3)} over ${bar}`);
   }
 
+  // --- the per-block attention biases ------------------------------------
+  //
+  // 🔴 BOTH ARRANGEMENTS, BECAUSE THE DIFFERENCE IS INVISIBLE TO A ONE-BLOCK
+  // TEST. AF3 normalises and projects ONCE for the whole stack with a
+  // `blocks * heads` output; OpenDDE does it per block with its own scale and
+  // its own matrix. "The MEAN and VARIANCE are the same either way (they come
+  // from the pair, which does not change), so the difference is entirely in
+  // which scale and which matrix a block reads." Three blocks, so a wrong
+  // block offset lands somewhere.
+  {
+    const blocks = 3;
+    const pairChannels = 8;
+    const pairRows = subsets * queries * keys;
+    const pairCond = noise(pairRows * pairChannels, 1);
+    // 🔴 THE PAIR CONDITIONING NEEDS ITS OWN SKEW: these two arms read it and
+    // nothing else, so the control on the query activation cannot move them -
+    // which is how they first reported "4 of 6". Half of each row, because the
+    // first thing the conditioning meets is a LayerNorm.
+    const pairTensor = upload(falsify
+      ? Float32Array.from(pairCond,
+        (v, i) => (i % pairChannels < pairChannels / 2 ? v * 1.01 + 0.01 : v))
+      : pairCond, "af3.atom.pair-cond");
+    for (const perBlock of [false, true]) {
+      const logitWeights = perBlock
+        ? {
+          pairNormPerBlock: true,
+          pairInputLayerNormScales: Array.from(
+            { length: blocks }, () => noise(pairChannels, 0.2, 1)),
+          pairLogitsProjections: Array.from({ length: blocks },
+            () => noise(pairChannels * heads, 1 / Math.sqrt(pairChannels))),
+        }
+        : {
+          pairNormPerBlock: false,
+          pairInputLayerNormScale: noise(pairChannels, 0.2, 1),
+          pairLogitsProjection: noise(
+            pairChannels * blocks * heads, 1 / Math.sqrt(pairChannels)),
+        };
+      const uploadedLogits = perBlock
+        ? {
+          pairInputLayerNormScales: logitWeights.pairInputLayerNormScales.map(
+            (v, b) => upload(v, `w.af3.atom.pairScale${b}`)),
+          pairLogitsProjections: logitWeights.pairLogitsProjections.map(
+            (v, b) => upload(v, `w.af3.atom.pairProj${b}`)),
+        }
+        : {
+          pairInputLayerNormScale: upload(
+            logitWeights.pairInputLayerNormScale, "w.af3.atom.pairScale"),
+          pairLogitsProjection: upload(
+            logitWeights.pairLogitsProjection, "w.af3.atom.pairProj"),
+        };
+      const mineBlocks = atomPairLogits(execution, {
+        pair: pairTensor, subsets, queries, keys, pairChannels, heads, blocks,
+        weights: uploadedLogits, pairNormPerBlock: perBlock,
+      });
+      const theirBlocks = cpuPairLogits(
+        pairCond, { subsets, queries, keys, pairChannels, heads, blocks }, logitWeights);
+      let worst = 0;
+      for (let block = 0; block < blocks; block += 1) {
+        worst = Math.max(worst, relativeRms(
+          Float32Array.from(execution.read(mineBlocks[block])), theirBlocks[block],
+          `logits.${perBlock}.${block}`));
+        execution.release(mineBlocks[block]);
+      }
+      const name = `pair logits, ${perBlock ? "per block (OpenDDE)" : "shared (AF3)"}`;
+      const ok = worst <= bar;
+      arms.push({ arm: `${name} vs the f64 reference`,
+        relativeRms: Number(worst.toPrecision(4)), bar, ok });
+      if (!ok) failures.push(`${name}: relRMS ${worst.toExponential(3)} over ${bar}`);
+    }
+  }
+
   // 🔴 AND EVERY DIALECT MUST MOVE THE ANSWER, or the four arms above are one arm
   // four times. Each is compared against AF3's, which is the configuration they
   // each differ from by exactly one choice (boltz2's by a term, not a choice).
@@ -256,7 +327,7 @@ export async function main(device, args) {
         ? `ok: all ${arms.length} arms go red on a 1% perturbation`
         : `VACUOUS: only ${red} of ${arms.length} arms noticed it`)
       : (failures.length === 0
-        ? `ok: ${arms.length} dialects against the f64 reference, each moving the answer`
+        ? `ok: ${arms.length} arms against the f64 reference, every dialect moving the answer`
         : `FAILED: ${failures.join("; ")}`),
   };
 }
