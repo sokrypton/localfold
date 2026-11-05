@@ -40,6 +40,7 @@ import {
   RELATIVE_WIDTH, recycleProjection, relativeEncodingSource, tokenIdentity, zInit,
 } from "../../webgl/esmfold2/pair-features.js";
 import { foldingTrunk } from "../../webgl/esmfold2/trunk.js";
+import { sumSource } from "../../webgl/esmfold2/atom-transformer.js";
 import { uploadTriangleWeights, releaseTriangleWeights }
   from "../../webgl/af3/trunk/triangle.js";
 import { uploadTransitionWeights, releaseTransitionWeights }
@@ -220,8 +221,9 @@ export async function main(device, args) {
     pair: initTensor, mask: maskTensor, tokens, channels, blocks: uploadedBlocks,
   });
   const ourTrunk = Float32Array.from(execution.read(trunkTensor));
-  const theirTrunk = (() => {
-    const pair = Float32Array.from(theirInit);
+  /** The reference trunk over an arbitrary input, so the loop arm can reuse it. */
+  const cpuTrunkOf = (from) => {
+    const pair = Float32Array.from(from);
     const add = (delta) => {
       for (let i = 0; i < pair.length; i += 1) pair[i] += delta[i];
     };
@@ -233,7 +235,8 @@ export async function main(device, args) {
       add(cpuTransition(pair, pairs, channels, block.pairTransition));
     }
     return pair;
-  })();
+  };
+  const theirTrunk = cpuTrunkOf(theirInit);
   report(`the trunk, ${blocks} blocks`, ourTrunk, theirTrunk);
 
   // --- the recycle projection -------------------------------------------
@@ -243,6 +246,55 @@ export async function main(device, args) {
   report("pair_loop_proj", Float32Array.from(execution.read(recycled)),
     cpuRecycle(theirTrunk, pairs, channels, recycleWeights));
   execution.release(recycled);
+
+  // --- the COMPOSED LOOP, which is what a fold runs and what nothing gated --
+  //
+  // 🔴 THE SEAM, NOT THE KERNELS EITHER SIDE OF IT. Every arm above is one
+  // stage against the f64 reference, and all of them were green while a whole
+  // ESMFold2 fold read mean pLDDT 57.5 against the WGSL fold's 88.1 and got
+  // WORSE with every recycle (69.5, 58.8, 57.5 at one, two and four loops).
+  // webgl/README.md records that as an open defect. A stage gate cannot see it
+  // because the fault is in the COMPOSITION: `z = trunk(z_init + proj(z))`,
+  // started from zero and iterated, which no gate here has ever run.
+  //
+  // This arm runs exactly that, `loops` times, on both sides. The reference
+  // starts `z` at ZEROS and applies the projection on EVERY loop including the
+  // first - `pair_loop_proj(0)` is not zero, because the LayerNorm in front of
+  // it has an offset - which is the convention webgpu/esmfold2/fold.js states
+  // and which this driver got wrong until it was measured.
+  {
+    const loops = Number(option(args, "loops", "2"));
+    let ours = execution.zeros(pairs * channels, "ef2.check.z0");
+    for (let loop = 0; loop < loops; loop += 1) {
+      const update = recycleProjection(execution, {
+        pair: ours, pairs, channels,
+        weights: uploadTree(recycleWeights, "w.ef2.recycle"),
+      });
+      const input = execution.allocate(pairs * channels, "ef2.check.input");
+      execution.dispatch({
+        source: sumSource(pairs * channels),
+        output: input,
+        inputs: { aTex: initTensor, bTex: update },
+        label: `ef2.check.recycle-add:${pairs}x${channels}`,
+      });
+      execution.release(update);
+      execution.release(ours);
+      ours = foldingTrunk(execution, {
+        pair: input, mask: maskTensor, tokens, channels, blocks: uploadedBlocks,
+      });
+      execution.release(input);
+    }
+    let theirs = new Float32Array(pairs * channels);
+    for (let loop = 0; loop < loops; loop += 1) {
+      const update = cpuRecycle(theirs, pairs, channels, recycleWeights);
+      const input = Float32Array.from(theirInit);
+      for (let i = 0; i < input.length; i += 1) input[i] += update[i];
+      theirs = cpuTrunkOf(input);
+    }
+    report(`the composed loop, ${loops} loops`,
+      Float32Array.from(execution.read(ours)), theirs);
+    execution.release(ours);
+  }
 
   // --- the distogram head, both ways ------------------------------------
   const weightTensor = upload(distogramWeights, "w.ef2.distogram");

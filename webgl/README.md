@@ -1167,11 +1167,33 @@ comparable on the measures that do not go through the confidence head: median CA
 3.826, long-range contacts 126 against 117. So the trunk is probably not where the rest of it is,
 and the calibration or the head is.
 
-**Not fixed here.** The next step is a whole-fold differential for ESMFold2 - the two drivers on one
-input, compared seam by seam across the recycle AND into the confidence head - which is the
-instrument this model has never had. `check-webgl-esmfold2-confidence.js` is green against the f64
-reference, so it will not find it either; what is missing is a comparison of the two BACKENDS'
-composed folds, exactly as `check-webgl-bioemu2-trunk.js` does over two passes.
+🔴 **AND THE COMPOSED LOOP IS NOW GATED AND IT IS CORRECT, WHICH NARROWS THE HUNT A LOT.**
+`check-webgl-esmfold2-trunk.js` has a new arm that runs the fold's own composition -
+`z = trunk(z_init + pair_loop_proj(z))`, from zeros, `--loops` times - on both the device and the
+f64 reference, and it reads **1.281e-07** at two loops (green at one, two and three, red on a 1%
+perturbation). So the seam is not the fault either.
+
+What the hunt has now ELIMINATED, each against the f64 reference:
+
+| stage | arm | relRMS |
+|---|---|---:|
+| ESM-C tower, **36 of 36 blocks** | `check-webgl-esmc-tower.js --blocks=36` | 2.5e-6 |
+| `z_init`, every term | the trunk gate | 3.5e-8 |
+| the trunk, 2 blocks | the trunk gate | 9.1e-8 |
+| `pair_loop_proj` | the trunk gate | 1.5e-7 |
+| **the composed loop, 2 loops** | **the trunk gate (new)** | **1.3e-7** |
+| the distogram, both ways | the trunk gate | 1.4e-7 |
+| the atom encoder, the diffusion, the confidence head | their own gates | all green |
+
+**So no stage and no seam reproduces it at the gates' shapes** - and that is the clue. Every one of
+those arms drives 8 tokens and 64 atoms of synthetic input, where a fold is 75 tokens and 608
+atoms. This file has already recorded one bug of exactly that kind: "the confidence gate now drives
+a single at the trunk's own magnitude WITH A HEAVY TAIL, since a uniform draw at std 200 never
+reaches 512 and left the arm green with the bug restored."
+
+**So the next step is no longer a differential across the recycle - that is done and clean - but a
+SHAPE sweep**: the same arms at the fold's real token and atom counts, where the windowed atom
+attention runs five windows rather than one and the magnitudes are the model's own. Not done here.
 
 ### The threshold that chose between two projection kernels was fitted with the wrong dtype
 
