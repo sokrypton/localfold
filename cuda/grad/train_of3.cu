@@ -70,7 +70,11 @@ struct Example {
   struct Slot { double repeat = 0; std::vector<int> aatype, bin; std::vector<float> pb, uv, bb; bool geo = false; };
   std::vector<Slot> slots; int templates = 0;
   std::vector<double> xt, gm;                  // the truth [atoms * 3] and its resolved mask [atoms]
-  std::string permsPath, set = "pdb";        // OpenFold3's dataset: pdb, monomer, rna (distillation), disordered
+  std::string permsPath, confsPath, set = "pdb";
+  // OpenFold3's fresh conformers (make_of3_example.py's conformers.txt: RDKit ETKDGv3 runs, random seeds, per component):
+  // a component instance (asym, residue) -> its code, and a code -> conformers, each atom name -> position
+  std::map<std::pair<int, int>, std::string> componentOf;
+  std::shared_ptr<std::map<std::string, std::vector<std::map<std::string, std::array<float, 3>>>>> conformers;        // OpenFold3's dataset: pdb, monomer, rna (distillation), disordered
   of3::PermInput perm;                         // the whole entry, for the truth's permutation (of3perm.h)
   size_t atoms() const { return (size_t)n * dense; }
 };
@@ -101,6 +105,7 @@ static void applyFields(Example& e, const std::string& line) {
     else if (k == "weight") e.weight = atof(v.c_str());
     else if (k == "preferred") { std::stringstream ss(v); std::string x; while (std::getline(ss, x, ',')) e.preferred.push_back(atoi(x.c_str())); }
     else if (k == "perms") e.permsPath = v;
+    else if (k == "conformers") e.confsPath = v;
     else if (k == "set") {
       e.set = v;
       if (v != "pdb" && v != "monomer" && v != "rna" && v != "disordered") { fprintf(stderr, "example %s: set=%s is not pdb, monomer, rna or disordered\n", e.input.c_str(), v.c_str()); exit(1); }
@@ -226,6 +231,21 @@ static Example loadExample(const std::string& line, bool padded, bool qblock) {
       }
     }
   }
+  // the conformer pool: `component chain residue code` lines, then `conformer code k n` and n `name x y z` lines
+  if (!e.confsPath.empty()) {
+    std::ifstream f(e.confsPath);
+    if (!f) { fprintf(stderr, "cannot read %s\n", e.confsPath.c_str()); exit(1); }
+    e.conformers = std::make_shared<std::map<std::string, std::vector<std::map<std::string, std::array<float, 3>>>>>();
+    std::string tag;
+    while (f >> tag) {
+      if (tag == "component") { int c, r; std::string code; f >> c >> r >> code; e.componentOf[{c, r}] = code; }
+      else if (tag == "conformer") {
+        std::string code; int k, na; f >> code >> k >> na;
+        auto& list = (*e.conformers)[code]; list.emplace_back();
+        for (int i = 0; i < na; ++i) { std::string nm; float x, y, z; f >> nm >> x >> y >> z; list.back()[nm] = {x, y, z}; }
+      } else { fprintf(stderr, "%s: unknown line %s\n", e.confsPath.c_str(), tag.c_str()); exit(1); }
+    }
+  }
   // its atom windows rebuilt here against the featuriser's own (the function a crop calls)
   {
     lf::Batch w = windows(e, padded, qblock);
@@ -251,6 +271,7 @@ static Example subset(const Example& e, const std::vector<int>& keep, bool whole
   Example o;
   o.input = e.input; o.truthPath = e.truthPath; o.resolution = e.resolution; o.weight = e.weight; o.preferred = e.preferred;
   o.dense = e.dense; o.profW = e.profW; o.P = e.P; o.templates = e.templates; o.permsPath = e.permsPath; o.set = e.set;
+  o.confsPath = e.confsPath; o.componentOf = e.componentOf; o.conformers = e.conformers;
   o.slots.resize(e.slots.size());
   for (size_t k = 0; k < e.slots.size(); ++k) { o.slots[k].repeat = e.slots[k].repeat; o.slots[k].geo = e.slots[k].geo; }
   const int m = (int)keep.size(), D = e.dense;
@@ -347,6 +368,27 @@ static void sampleTemplates(Example& e, std::mt19937_64& rng) {
 // translation - every featurisation, so a fresh pose each step
 static void augmentConformers(Example& e, std::mt19937_64& rng) {
   std::normal_distribution<double> nd(0, 1);
+  // first a fresh conformer for every component the pool has (OpenFold3: ETKDGv3 at each featurisation): one of its
+  // runs at random, by atom name; an atom the run lacks keeps the featuriser's position
+  if (e.conformers) {
+    std::map<std::pair<int, int>, int> pick;
+    for (int t = 0; t < e.n; ++t) {
+      auto c = e.componentOf.find({e.asym[t], e.ri[t]});
+      if (c == e.componentOf.end()) continue;
+      auto pool = e.conformers->find(c->second);
+      if (pool == e.conformers->end() || pool->second.empty()) continue;
+      auto it = pick.find(c->first);
+      if (it == pick.end()) it = pick.emplace(c->first, std::uniform_int_distribution<int>(0, (int)pool->second.size() - 1)(rng)).first;
+      const auto& conf = pool->second[it->second];
+      for (int k = 0; k < e.dense; ++k) {
+        const size_t i = (size_t)t * e.dense + k;
+        if (!(e.predMask[i] > 0)) continue;
+        std::string nm; for (int q = 0; q < 4; ++q) { int ch = e.names[i * 4 + q]; if (ch > 0) nm += (char)(ch + 32); }
+        auto at = conf.find(nm);
+        if (at != conf.end()) for (int q = 0; q < 3; ++q) e.refPos[i * 3 + q] = at->second[q];
+      }
+    }
+  }
   std::map<int, std::vector<size_t>> spaces;
   for (size_t i = 0; i < e.atoms(); ++i) if (e.predMask[i] > 0) spaces[e.uid[i]].push_back(i);
   for (auto& [uid, atoms] : spaces) {
@@ -566,7 +608,7 @@ static of3::Layout layoutOf(const Example& e) {
 
 int main(int argc, char** argv) {
   std::string bundle = "model-openbind0-f32", family = "openbind0", examplesPath, savePath, resumePath;
-  int steps = 30, samples = 48, batch = 1, crop = 384, saveEvery = 0, checkCkpt = -1, checkPerm = -1, checkBf16 = -1; std::string init = "bundle";
+  int steps = 30, samples = 48, batch = 1, crop = 384, saveEvery = 0, checkCkpt = -1, checkPerm = -1, checkBf16 = -1, checkConfs = -1; std::string init = "bundle";
   bool dropout = true, dropInFixed = false, bf16Trunk = false;
   int world = 1, rank = 0; std::string dp = "nccl", rendezvous;      // data parallel (of3dist.cuh)
   bool sameDraws = false;   // --same-draws: every rank rank 0's examples and draws (the averaging's check: one process's step)   // (dropInFixed: --check-ckpt's fixed draws with the masks on)
@@ -600,6 +642,7 @@ int main(int argc, char** argv) {
     else if (auto v = opt("--check-ckpt=")) checkCkpt = atoi(v);
     else if (auto v = opt("--check-perm=")) checkPerm = atoi(v);
     else if (auto v = opt("--check-bf16=")) checkBf16 = atoi(v);
+    else if (auto v = opt("--check-conformers=")) checkConfs = atoi(v);
     else if (auto v = opt("--init=")) init = v;
     else if (auto v = opt("--val=")) valPath = v;
     else if (auto v = opt("--val-every=")) valEvery = atoi(v);
@@ -1302,6 +1345,43 @@ int main(int argc, char** argv) {
     const bool ok = e < 0.05;
     printf("bf16 trunk: every gradient against float32's, relRMS %.3e (two float runs: %.3e)  %s\n", e, floor, ok ? "PASS" : "FAIL");
     bf16Trunk = false; dropInFixed = false;
+    if (!ok) return 1;
+  }
+  // --check-conformers=k: example k's conformers drawn from its pool - how many atoms the pool placed, and every pair
+  // bonded in the featuriser's conformer (one reference space, under 1.75 A) measured again: a fresh conformer moves the
+  // torsions, never the bonds
+  if (checkConfs >= 0) {
+    const Example& E = examples.at(checkConfs);
+    if (!E.conformers) { fprintf(stderr, "--check-conformers: example %d has no conformers= pool\n", checkConfs); return 1; }
+    Example x = E; std::mt19937_64 gen(3);
+    augmentConformers(x, gen);
+    size_t moved = 0, live = 0; double s2 = 0, worst = 0; size_t pairs = 0;
+    for (size_t i = 0; i < E.atoms(); ++i) {
+      if (!(E.predMask[i] > 0) || !(E.refMask[i] > 0)) continue;
+      ++live;
+      for (size_t j = i + 1; j < E.atoms() && j < i + 64; ++j) {
+        if (!(E.predMask[j] > 0) || !(E.refMask[j] > 0) || E.uid[j] != E.uid[i]) continue;
+        double d0 = 0, d1 = 0;
+        for (int q = 0; q < 3; ++q) { double a = E.refPos[i * 3 + q] - E.refPos[j * 3 + q], b = x.refPos[i * 3 + q] - x.refPos[j * 3 + q]; d0 += a * a; d1 += b * b; }
+        d0 = std::sqrt(d0); d1 = std::sqrt(d1);
+        if (d0 >= 1.75) continue;
+        s2 += (d1 - d0) * (d1 - d0); worst = std::max(worst, std::fabs(d1 - d0)); ++pairs;
+      }
+    }
+    // (moved: an atom whose intra-space position changed beyond the rigid pose - its distance to the space's first atom)
+    std::map<int, size_t> first;
+    for (size_t i = 0; i < E.atoms(); ++i) if (E.predMask[i] > 0 && E.refMask[i] > 0 && !first.count(E.uid[i])) first[E.uid[i]] = i;
+    for (size_t i = 0; i < E.atoms(); ++i) {
+      if (!(E.predMask[i] > 0) || !(E.refMask[i] > 0)) continue;
+      const size_t f0 = first[E.uid[i]];
+      double d0 = 0, d1 = 0;
+      for (int q = 0; q < 3; ++q) { double a = E.refPos[i * 3 + q] - E.refPos[f0 * 3 + q], b = x.refPos[i * 3 + q] - x.refPos[f0 * 3 + q]; d0 += a * a; d1 += b * b; }
+      moved += std::fabs(std::sqrt(d1) - std::sqrt(d0)) > 0.05;
+    }
+    const double rms = std::sqrt(s2 / std::max<size_t>(1, pairs));
+    const bool ok = pairs > 0 && rms < 0.05 && worst < 0.2 && moved > live / 10;
+    printf("conformers: %zu of %zu atoms placed differently from the featuriser's conformer; %zu bonded pairs, rms %.4f A, worst %.3f A  %s\n",
+           moved, live, pairs, rms, worst, ok ? "PASS" : "FAIL");
     if (!ok) return 1;
   }
   // --check-perm=k: example k whole, its truth disguised - each repeated molecule's copies relabelled cyclically, every

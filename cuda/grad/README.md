@@ -83,9 +83,19 @@ one-hot one - the MSA stack, the pairformer, the distogram, the denoiser, the co
   tokens, 35 chains, 98 datapoints) trains at ~8.6 s a 384-token step with 4 samples, 0.7 s of it the host's crops. The crop
   cuts the host arrays and REBUILDS the atom windows with the featuriser's own `atomGathers` - held, on every example
   at load, to the windows the featuriser wrote.
-- **conformers** - every conformer's `ref_pos` centred, randomly rotated and moved each draw, as OpenFold3's
-  featurisation does (`centre_random_augmentation` on each reference space); the conformers themselves are the
-  featuriser's (OpenFold3 embeds a fresh RDKit ETKDGv3 conformer, which is not done here).
+- **the set** - `cuda/grad/make_of3_dataset.py --ids=... --val=... --out=<dir> --search` builds a training set from PDB
+  entries as AF3 SI 2.5 does: fetched from RCSB, resolution at most 9 A and released before `--released-before`
+  (AF3's 2021-09-30), AF3's structure filters (crystallisation aids, polymer chains of under 4 resolved residues,
+  all-unknown chains, clashing chains), the featuriser's MMseqs2 alignments, and templates from RCSB's sequence search
+  released at least 60 days before the entry and never the entry itself (SI 2.4: the featuriser's own template pick has
+  no date, so it would hand an entry its own structure). Chains are clustered (proteins at 40% identity - an affine-gap
+  alignment at 80% coverage, as MMseqs2 would; peptides and nucleic chains at 100%; ligands by their components) and
+  every datapoint's weight divided by its cluster's size, N_clust. 9 entries -> 54 datapoints in 16 clusters (the six
+  haemoglobin chains one), 7BNY left out by its date, four entries with templates.
+- **conformers** - a fresh conformer every draw, as OpenFold3 embeds one per featurisation: the example builder runs
+  RDKit's ETKDGv3 (hydrogens on, random seeds, then off) 8 times on each component's CCD graph and the trainer draws
+  one per component instance (`--check-conformers`: on 1STP 593 of 1,181 atoms placed differently, every bonded pair
+  within 0.02 A rms); then each reference space centred, randomly rotated and moved (`centre_random_augmentation`).
 - **templates** - drawn per chain each step as OpenFold3's training draws them (`sample_templates`, AF3 SI 2.4: k =
   min(U{0..l}, n) of a chain's l templates, at random, where inference takes the top k), over the slots the input
   carries: each new slot assembled a chain at a time from the slot that chain drew, its cross-chain pairs masked, the
