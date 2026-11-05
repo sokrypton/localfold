@@ -66,6 +66,7 @@ webgl/
     structure/geometry.js       atom coordinates from frames and torsions - atom14 and atom37
     structure/ipa.js            invariant point attention: the one attention whose logits are
                                 a distance - eight draws plus five projections
+    structure/iteration.js      the IPA update folded in, a transition, and the frame advanced
   heads/
     distogram.js                P(d < 8 A) for every pair - the contact map the page draws
     confidence.js               pLDDT, PAE and the pTM term
@@ -248,9 +249,20 @@ update of the right shape when broken:
 Its three feature blocks get their own tensors and a gather assembles the row, because they occupy
 disjoint ranges whose boundaries are not texel-aligned.
 
-Still to come in AF2: the iteration core that wraps the IPA (the post-attention transition and the
-backbone frame update), the input embedder, the template stack and the multimer. After that: AF3's
-pairformer and diffusion, ESMFold2, bioemu2.
+**AF2's structure module is complete** - all five stages ported and cross-checked: the starting
+point, invariant point attention, the iteration that folds its update in and advances the frame, the
+sidechain torsion head, and atom geometry.
+
+🔴 **AND THE FRAME UPDATE IS THE ERROR THAT WOULD HAVE DEGRADED A FOLD RATHER THAN BREAKING
+IT.** The update's first three floats are a VECTOR, and the increment is the product of `q` with
+`(1, v)` less `q` - `(-dot(q.yzw, v), q.x * v + cross(q.yzw, v))` - added and then NORMALISED.
+Reading those three as a rotation, or skipping the normalise, gives frames that drift off the unit
+sphere over eight iterations: a structure that gets worse with length rather than one that fails.
+The gate asserts the quaternion IS a unit as well as comparing it, because a comparison would not
+catch both sides drifting the same way.
+
+Still to come in AF2: the input embedder, the template stack, the multimer variant, and reading a
+weight bundle. After that: AF3's pairformer and diffusion, ESMFold2, bioemu2.
 
 Every operation so far is checked against TWO references - an f64 CPU one written from the
 operation, and the WGSL kernel run in the same page - because a single reference cannot say which
