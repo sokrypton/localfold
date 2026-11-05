@@ -36,15 +36,25 @@ import { ONE_TARGET, PRELUDE } from "../runtime/execution.js";
 /** @typedef {import("../runtime/storage.js").Tensor} Tensor */
 
 
+/**
+ * 🔴 AND THE SCALE AND THE OFFSET ARE BOTH OPTIONAL, BECAUSE AF3'S ADAPTIVE
+ * LAYERNORM HAS NEITHER. `layerNormSlow(x, rows, channels, null, null)` is what
+ * `cpu/af3/diffusion/atom-encoder.js` calls before the conditioning supplies a
+ * scale and a shift of its own - and the conditioning's own norm takes a scale
+ * with NO offset. Passing ones and zeros would compute the same thing and bind
+ * two textures to say nothing; a missing sampler is refused by name, so the
+ * source is generated without them instead.
+ */
 export const layerNormSource = (
   rows, channels, roundHalf = false, variance = "two-pass",
+  hasWeight = true, hasBias = true,
 ) => `${PRELUDE}${ONE_TARGET}
 const int ROWS = ${rows};
 const int CHANNELS = ${channels};
 const int CH4 = ${channels / 4};
 uniform sampler2D xTex;
-uniform sampler2D weightTex;
-uniform sampler2D biasTex;
+${hasWeight ? "uniform sampler2D weightTex;" : ""}
+${hasBias ? "uniform sampler2D biasTex;" : ""}
 uniform float epsilon;
 
 void main() {
@@ -81,8 +91,7 @@ ${variance === "fast"
   float inverseStd = inversesqrt(spread / float(CHANNELS) + epsilon);`}
 
   vec4 value = fetch4(xTex, texel);
-  vec4 normalised = (value - mean) * inverseStd * fetch4(weightTex, group)
-    + fetch4(biasTex, group);
+  vec4 normalised = (value - mean) * inverseStd${hasWeight ? " * fetch4(weightTex, group)" : ""}${hasBias ? "\n    + fetch4(biasTex, group)" : ""};
   // The shipped AF2 attention stores this tensor in f16 (normalizedStorage);
   // see half4 in webgl/runtime/execution.js. No backticks in a GLSL comment -
   // it lives inside a JS template literal and one would end it.
@@ -91,7 +100,7 @@ ${variance === "fast"
 
 /**
  * @param {import("../runtime/execution.js").Execution} execution
- * @param {{x: Tensor, weight: Tensor, bias: Tensor, rows: number, channels: number,
+ * @param {{x: Tensor, weight?: Tensor, bias?: Tensor, rows: number, channels: number,
  *   epsilon?: number, roundHalf?: boolean,
  *   variance?: "two-pass" | "fast"}} call
  * @param {Tensor} [into]
@@ -117,7 +126,8 @@ export function layerNorm(
       `layerNorm: x holds ${x.elements} floats, not ${rows} x ${channels}`);
   }
   /** @type {[string, Tensor][]} */
-  const parameters = [["weight", weight], ["bias", bias]];
+  const parameters = /** @type {[string, Tensor][]} */ (
+    [["weight", weight], ["bias", bias]].filter(([, t]) => t !== undefined));
   for (const [name, tensor] of parameters) {
     if (tensor.elements !== channels) {
       throw new RangeError(`layerNorm: ${name} holds ${tensor.elements}, not ${channels}`);
@@ -128,11 +138,17 @@ export function layerNorm(
     throw new Error("layerNorm: a fragment shader cannot read the texture it draws into");
   }
   return execution.dispatch({
-    source: layerNormSource(rows, channels, roundHalf, variance),
+    source: layerNormSource(
+      rows, channels, roundHalf, variance, weight !== undefined, bias !== undefined),
     output,
-    inputs: { xTex: x, weightTex: weight, biasTex: bias },
+    inputs: {
+      xTex: x,
+      ...(weight === undefined ? {} : { weightTex: weight }),
+      ...(bias === undefined ? {} : { biasTex: bias }),
+    },
     floats: { epsilon },
     label: `layer-norm:${rows}x${channels}${roundHalf ? ":half" : ""}`
-      + `${variance === "fast" ? ":fast" : ""}`,
+      + `${variance === "fast" ? ":fast" : ""}`
+      + `${weight === undefined ? ":no-scale" : ""}${bias === undefined ? ":no-offset" : ""}`,
   });
 }

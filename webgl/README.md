@@ -76,6 +76,7 @@ webgl/
     trunk/embedder.js           the trunk's inputs; 139 one-hots as four weight rows
     trunk/template.js           the module everyone skips: an empty slot is not a no-op
     trunk/trunk.js              the assembly, and the distogram head's SUM symmetry
+    diffusion/atom-attention.js the AdaLN block that is 98% of the diffusion head
   af2/
     multimer/template.js        the multimer's nine-projection template embedder
     evoformer/block.js          a whole Evoformer block and the extra-MSA block, nine sub-layers
