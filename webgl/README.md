@@ -2368,6 +2368,21 @@ fold, x in float16, that narrowing extended to aligned shapes - and the 4x8x1 co
 the fold to 21.7 s. The sections after this one carry the current numbers; this one is the standing
 argument about the CEILING, which has not changed.
 
+🔴 **AND THE DECOMPOSITION RE-MEASURED, BECAUSE THE GAP HAS MOVED FROM THE TRUNK TO THE DENOISER.**
+Same job, same 68 tokens and 573 atoms, same mode, same 20 steps, one sample - checked field by
+field, since this tree has twice recorded a false regression from a mismatched configuration:
+
+| | WebGL2 | WGSL | |
+|---|---:|---:|---:|
+| trunk | **8.91 s** | 2.31 s | **3.86x** (was 7.9x) |
+| 20 denoiser calls | **12.11 s** | 1.18 s | **10.3x** (was 17.5x) |
+
+So this campaign halved the trunk's gap and the denoiser is now **56% of the fold at 10.3x** - which
+is where a reader should start, and is NOT where the whole-fold profile points, because that profile
+mixes the two. Differencing `--steps=2` against `--steps=12` by label is the attribution: per step
+the projections are 31.5% of the denoiser, `pad-stride` **9.9%** over 362 calls and `linear.repack`
+**8.8%** over 361, with the remaining 38% spread over 36 kernels.
+
 🔴 **AND THERE IS AN ARITHMETIC FLOOR UNDER THAT NUMBER, WHICH IS WORTH STATING BEFORE THE NEXT
 OPTIMISATION RATHER THAN AFTER.** An invocation writes at most `MAX_DRAW_BUFFERS * 4` = **32 output
 floats**. Produce those 32 from a k loop as a register tile of R by C, and a k step costs `R + C`
