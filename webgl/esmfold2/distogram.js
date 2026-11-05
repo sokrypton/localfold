@@ -42,11 +42,21 @@ void main() {
 /**
  * @param {import("../runtime/execution.js").Execution} execution
  * @param {{pair: Tensor, tokens: number, channels: number, bins: number,
- *   weights: Tensor, bias?: Tensor, symmetrise?: boolean}} call
+ *   weights: Tensor, bias?: Tensor, symmetrise?: boolean,
+ *   weightLayout?: "in-major" | "out-major"}} call
+ *   🔴 `weightLayout` IS A PARAMETER BECAUSE BIOEMU2 READS THIS HEAD TOO and its
+ *   checkpoint is OUT-major throughout where ESMFold2's is in-major - the same
+ *   `[64, 256]` against `[256, 128]` the rest of that port turns on. A head given
+ *   the wrong layout returns a tensor of the right shape and a distogram that is
+ *   a transpose of the arithmetic asked for, so the default is the caller this
+ *   file is named for and the other one says so.
  * @returns {Tensor} `tokens^2 * bins` of logits
  */
 export function distogramLogits(execution, call) {
-  const { pair, tokens, channels, bins, weights, bias, symmetrise = true } = call;
+  const {
+    pair, tokens, channels, bins, weights, bias, symmetrise = true,
+    weightLayout = "in-major",
+  } = call;
   let source = pair;
   if (symmetrise) {
     source = execution.allocate(tokens * tokens * channels, "ef2.distogram.symmetric");
@@ -60,7 +70,7 @@ export function distogramLogits(execution, call) {
   const logits = linear(execution, {
     x: source, weight: weights, ...(bias === undefined ? {} : { bias }),
     rows: tokens * tokens, inChannels: channels, outChannels: bins,
-    weightLayout: "in-major",
+    weightLayout,
   });
   if (source !== pair) execution.release(source);
   logits.label = "ef2.distogram.logits";

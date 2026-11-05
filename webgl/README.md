@@ -118,7 +118,10 @@ webgl/
   bioemu2/
     denoiser.js                 the dual stream: 16 layers coupled through every centre atom
     embedder.js                 three windowed atom layers and a token mean, giving s_inputs
+    sequence.js                 z_init, s_init and m0 - four relative blocks, four conditions
     trunk.js                    the PairMixer: four MSA layers and 48 pair-only blocks
+    context.js                  the denoiser's static context - the pairwise conditioner, q0 and p
+    model/fold.js               the whole BioEmu2 fold, 1.6 GiB of f32 denoiser weights
   heads/
     distogram.js                P(d < 8 A) for every pair - the contact map the page draws
     confidence.js               pLDDT, PAE and the pTM term
@@ -512,8 +515,9 @@ not.
 AF2 is done, both graphs, and so is AF3 - and AF3 FOLDS: a 59-residue chain through the whole
 48-block trunk and 25 diffusion steps is **21.0 s** here against the WGSL fold's 1.26 s, with a
 median CA-CA of **3.855 A**, mean pLDDT 57.076 against the WGSL fold's 57.048, and the worst atom
-**0.078 A** from it. ESMFold2 folds too (below), and bioemu2's denoiser is ported - what is left of
-bioemu2 is its input embedder, its trunk and a fold driver.
+**0.078 A** from it. ESMFold2 folds (below), and **so does bioemu2**: all five of its stages are
+ported, and 6MRR at 20 steps lands on **RMSD 1.595 A, TM 0.9083** - the WGSL fold's own numbers to
+four digits, from the same seed. So all four models in the goal fold in WebGL2.
 
 🔴 **AND THE FOLD FOUND A BUG NO STAGE GATE COULD.** The confidence head CLAMPED the trunk's single
 to +/-512 on the branch where AF3 uses it raw - protenix2 is the model that normalises there - which
@@ -691,11 +695,37 @@ matmul: AF2's transition (30208x256x1024) 9.05 against 14.70, the diffusion's `q
 **And `grid.attend`, the transition and the diffusion attention all depend on workgroup memory**,
 which does not exist here at all.
 
-## What is left of bioemu2
+## bioemu2, all five stages
 
-The DENOISER, the INPUT EMBEDDER and the TRUNK PASS are ported and gated. What is left is the
-SEQUENCE EMBEDDER - `z_init`, `s_init` and the MSA input `m0`, which the trunk gate takes from the
-WGSL side - and a fold driver that strings the four together.
+The DENOISER, the INPUT EMBEDDER, the SEQUENCE EMBEDDER, the TRUNK PASS and the DISTOGRAM are
+ported and gated, and `tools/gpu/fold-bioemu2-webgl.js` strings them into a fold.
+
+🔴 **THE SEQUENCE EMBEDDER'S THREE OUTPUTS READ EXACTLY ZERO AGAINST THE WGSL ONE, AND THAT IS NOT
+AN INSTRUMENT FAULT.** `check-webgl-bioemu2-sequence.js` compares `z_init`, `s_init` and `m0` and
+all three are bit-identical at 8 tokens and at 12: there is no accumulation here and no regrouping -
+both backends add the same five terms of `z_init` in the same order, from the same host projections -
+so the two land on the same f32 bits. This repository's own rule is that a suspiciously perfect
+number is a reason to check the instrument, so the gate carries four SEPARATIONS through the same
+`relativeRms`, each flattening one input group: the contact conditioning moves `z_init` by **0.83**,
+the chain and entity blocks by **0.16**, the token bonds by **0.098** and the method by **0.027**. A
+1% skew of `s_inputs` reads 1.6e-2 / 6.6e-2 / 3.8e-2. The bar is 1e-6 all the same, because another
+device may contract a multiply and an add into one fma.
+
+🔴 **AND THE STAGE'S FEATURES HAVE TO REACH BRANCHES A PLAIN FOLD DOES NOT.** The relative encoding's
+four blocks fall back on four DIFFERENT conditions - a different CHAIN for the residue block, not the
+same chain AND residue for the token block, a different ENTITY for the chain block, and the same
+entity for `embed_same_entity` - so the gate runs two chains and two entities. And the contact
+conditioning has three kinds: class 0 (`encoding_unspecified`, which every pair of a restraint-free
+fold gets, so leaving it out drops a constant the model was trained with), class 1, and a real
+contact, which runs a fourier embedding of its THRESHOLD and an encoder per pair. The gate REFUSES to
+run if no pair reached class 2.
+
+🔴 **AND THE SAMPLER MOVED RATHER THAN BEING WRITTEN TWICE**, the second time this family has done
+it: `cpu/bioemu2/sampler.js` now holds the schedule, the random rigid augmentation, the churn, the
+realignment and the Euler step, and `webgpu/bioemu2/fold.js` re-exports them so its behaviour cannot
+change - the same treatment `host.js` got, and verified the same way (`moved[n] === reexported[n]`
+for all five). A walk re-derived for the second backend is how two backends come to anneal
+differently, and nothing errors on a wrong constant: the walk simply returns a plausible structure.
 
 🔴 **AND THE TRUNK'S BOUND IS LOOSER THAN A STAGE GATE'S, FOR A REASON WORTH KNOWING.** Two f32
 implementations through 52 pair-track blocks - each an O(L) contraction summed in a different order,
@@ -724,10 +754,72 @@ The trunk is composition over kernels this tree already has - the pair-only bloc
 `foldingTrunk` and the MSA layer's outer product mean is AF2's generalised one - and its reference
 is the same WGSL path in the same page.
 
-## What it would take, and what to measure before starting
+### The fold, and why it is a differential and not a geometry floor
 
-`webgpu/` is **250 `@compute` entry points**. Two are ported. Before the third is written, three
-measurements decide whether any of it is worth doing, and each can kill it cheaply:
+`fold-bioemu2-webgl.js` on `6mrr-68.json`, 68 tokens and 573 atoms, four trunk passes, all 52 pair
+blocks, 20 steps, seed 1, against the 6MRR crystal:
+
+```
+                     WebGL2        WGSL (same job, same seed, same steps)
+rmsd / TM            1.595 / 0.9083    1.595 / 0.9083
+CA-CA median         3.8540558         3.8539739      (a relative 2.1e-5)
+worst CA-CA          3.904             3.904
+bond rms  main       0.042             0.042
+          side       0.056             0.056
+          peptide    0.028             0.028
+contacts (P > 0.5)   201
+wall                 968 s             3.9 s
+  trunk              277.7 s           2.3 s
+  20 denoiser calls  658 s             1.2 s
+weights/activations  1656 MiB peak     815 MiB weights + 135 activations
+```
+
+🔴 **THE SAME SEED THROUGH BOTH BACKENDS LANDS ON THE SAME STRUCTURE, which makes this a WHOLE-FOLD
+DIFFERENTIAL and not a plausibility check.** The sampler's draws come from one generator consumed in
+one order, so the walk is identical given a denoiser that computes the same function - and the two
+agree on every scored quantity to the digits reported, with the CA-CA median differing by 2.1e-5
+relative. A geometry floor would have accepted a port that was wrong by 10%; this does not. It is
+also why the AF3-style "worst atom" figure is not quoted here: it needs both PDBs, and the WebGL2
+side is sixteen minutes a fold.
+
+🔴 **AND IT IS 246x THE WGSL FOLD, WHICH IS THE HONEST NUMBER AND NOT A TUNING GAP.** The trunk is
+121x and the diffusion 560x, and the diffusion is where the asymmetry lives: the WGSL denoiser
+batches S samples through one compiled program and halves its weights, and this one carries 1.6 GiB
+of f32 because WebGL2 has no f16 without an extension nobody can rely on. 32.9 s a denoiser call at
+573 atoms is also why the tool's default is 20 steps where the model's is 200 - at 200 it is 1.8
+hours - and why a fold at 20 steps is a plumbing answer that happens to score well rather than a
+converged sample.
+
+🔴 **AND THE DEFAULT ORDER OF THE WEIGHT UPLOADS IS LOAD-BEARING.** `structure_module` is 424.6 M of
+the checkpoint's 511.7 M parameters - 1.62 GiB in f32, ~101 MiB a layer over 16 layers - where the
+trunk's 52 pair blocks are 288 MiB. The driver releases the trunk's weights before it reads the
+denoiser's, which costs nothing because no sampler step touches the trunk, and keeps the peak at
+**1656 MiB** instead of 2.3 GiB.
+
+🔴 **AND THE COMPOSITION FOUND A BUG FIVE STAGE GATES COULD NOT**, which is the same argument the AF3
+driver made: `concatSource` had only an ALIGNED path, so the real single conditioning - `[s_trunk |
+s_inputs]`, 384 + 455 - compiled `const int R4 = 113.75` and failed with "cannot convert from const
+float to const highp int". 455 is the featuriser's 384 pooled channels plus 71 one-hots, a number
+with no reason to be a multiple of anything, and every gate in this family drives the stage at
+synthetic widths that are multiples of four. It has a ragged path now. The ragged/aligned split is
+the fourth kernel in this tree to need one.
+
+🔴 **AND TWO TRAPS COST A FOURTEEN-MINUTE RUN EACH, BOTH RECORDED IN THE TOOL'S HEADER.**
+`gpu-chrome.mjs` gives a module **ten minutes** (`LOCALFOLD_GPU_TIMEOUT_MS`), so the first fold died
+with no JSON at all; and piping the run through `tail` reports that timeout as a SUCCESS, because the
+pipe's exit status is tail's. Then `6mrr.json` is 71 residues where the shipped crystal resolves 68,
+so the second fold finished and died in the scorer - the crystal is counted BEFORE the fold now,
+since `alphaCarbonSpacings`'s centres depend on the atom keys and the topology rather than on the
+coordinates.
+
+## What it would take to ship it, and what is still unmeasured
+
+🔴 **THIS SECTION IS THE QUESTION AS IT WAS ASKED BEFORE ANY OF IT WAS WRITTEN, AND ITS FIRST
+SENTENCE HAS GONE STALE ONCE ALREADY.** It said "`webgpu/` is 250 `@compute` entry points. Two are
+ported", which was true when two were; all four models in the goal fold now, and this tree does not
+mirror those entry points one for one - a fragment shader replaces whole families of them, and one
+68-token bioemu2 fold compiles **144** programs in total. What the three measurements below decide is
+no longer whether to start but whether to SHIP, and all three are still open:
 
 1. **Coverage.** What fraction of the no-WebGPU population actually has WebGL2 *and*
    `EXT_color_buffer_float` *and* `MAX_TEXTURE_SIZE` large enough *and* the vertex output budget?

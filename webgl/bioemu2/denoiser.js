@@ -133,8 +133,24 @@ void main() {
   result = fetch4(xTex, row * C4 + FROM4 + group);
 }`;
 
-/** `out[row] = [left[row] | right[row]]`, two widths that need not match. */
-export const concatSource = (rows, leftWidth, rightWidth) => `${PRELUDE}${ONE_TARGET}
+/**
+ * `out[row] = [left[row] | right[row]]`, two widths that need not match.
+ *
+ * 🔴 AND IT HAS A RAGGED PATH, BECAUSE THE REAL SINGLE CONDITIONING IS 839 WIDE.
+ * `[s_trunk | s_inputs]` is 384 + 455 - and 455 is the featuriser's 384 pooled
+ * channels plus 71 one-hots, a number with no reason to be a multiple of
+ * anything. A fragment owns four consecutive channels of ONE row only where
+ * every width here is a multiple of four; at 455 the four cross a row boundary
+ * and belong to two rows. The aligned path is one texel fetch a fragment and the
+ * ragged one resolves each element on its own, the same split
+ * `gatherRowsSource` below documents - and the aligned form alone compiled
+ * `const int R4 = 113.75` and failed with "cannot convert from const float to
+ * const highp int" on the first real fold, where every gate at synthetic widths
+ * was green.
+ */
+export const concatSource = (rows, leftWidth, rightWidth) => (
+  leftWidth % 4 === 0 && rightWidth % 4 === 0
+    ? `${PRELUDE}${ONE_TARGET}
 const int L4 = ${leftWidth / 4};
 const int R4 = ${rightWidth / 4};
 const int W4 = ${(leftWidth + rightWidth) / 4};
@@ -150,7 +166,33 @@ void main() {
   result = group < L4
     ? fetch4(leftTex, row * L4 + group)
     : fetch4(rightTex, row * R4 + group - L4);
-}`;
+}`
+    : `${PRELUDE}${ONE_TARGET}
+const int LEFT = ${leftWidth};
+const int RIGHT = ${rightWidth};
+const int WIDTH = ${leftWidth + rightWidth};
+const int ELEMENTS = ${rows * (leftWidth + rightWidth)};
+uniform sampler2D leftTex;
+uniform sampler2D rightTex;
+
+float at(int element) {
+  int row = element / WIDTH;
+  int c = element - row * WIDTH;
+  return c < LEFT
+    ? fetch1(leftTex, row * LEFT + c)
+    : fetch1(rightTex, row * RIGHT + c - LEFT);
+}
+
+void main() {
+  int texel = linearTexel();
+  int base = texel * 4;
+  if (base >= ELEMENTS) { result = vec4(0.0); return; }
+  result = vec4(
+    at(base),
+    base + 1 < ELEMENTS ? at(base + 1) : 0.0,
+    base + 2 < ELEMENTS ? at(base + 2) : 0.0,
+    base + 3 < ELEMENTS ? at(base + 3) : 0.0);
+}`);
 
 /**
  * `out[row][c] = index[row] < 0 ? 0 : source[index[row]][c]`.

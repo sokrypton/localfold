@@ -11,9 +11,9 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-517 tools. `tools/fixtures/` is data and is not listed.
+519 tools. `tools/fixtures/` is data and is not listed.
 
-## `tools/gpu/` - the WebGPU lane (272)
+## `tools/gpu/` - the WebGPU lane (274)
 
 Each exports `async function main(device, args)` and is run as
 `node tools/gpu-chrome.mjs tools/gpu/<module>.js [--flags]`.
@@ -163,6 +163,7 @@ Each exports `async function main(device, args)` and is run as
 - **`check-webgl-attention.js`** - Gated attention for every head width this port runs, against a CPU reference and against the kernel it replaces.
 - **`check-webgl-bioemu2-denoiser.js`** - BioEmu2's denoiser in WebGL2 against `cpu/bioemu2/denoiser.js`.
 - **`check-webgl-bioemu2-embedder.js`** - BioEmu2's input embedder in WebGL2 against the WGSL one, in the same page.
+- **`check-webgl-bioemu2-sequence.js`** - BioEmu2's sequence embedder in WebGL2 against the WGSL one, in the same page.
 - **`check-webgl-bioemu2-trunk.js`** - BioEmu2's trunk pass in WebGL2 against the WGSL one, in the same page.
 - **`check-webgl-confidence.js`** - pLDDT, PAE and pTM in WebGL2 against the WGSL confidence head.
 - **`check-webgl-distogram.js`** - The contact map in WebGL2 against the shipped host reference.
@@ -195,6 +196,7 @@ Each exports `async function main(device, args)` and is run as
 - **`fold-af2-webgl.js`** - Fold AlphaFold 2's monomer in WebGL2, from a real weight bundle, beside the WGSL fold of the same weights.
 - **`fold-af2.js`** - An AlphaFold 2 monomer fold, end to end, so a kernel change can be compared against the tree before it.
 - **`fold-af3-webgl.js`** - Fold AlphaFold 3 in WebGL2, from a real weight bundle.
+- **`fold-bioemu2-webgl.js`** - A whole BioEmu2 fold in WebGL2: an AlphaFold 3 job in, a structure out.
 - **`fold-bioemu2.js`** - A whole BioEmu2 fold on the GPU: an AlphaFold 3 job in, samples out.
 - **`fold-complex.js`** - Fold a MULTI-CHAIN target and score every chain in ONE frame.
 - **`fold-crosslinks.js`** - Crosslinks folded: the page's path for a `crosslink` row (web/entities.js expandEntities: a built-in bridge ligand bonded to its two residues) end to end on WebGPU, and whether the fold honours it.
