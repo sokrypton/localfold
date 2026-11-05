@@ -1053,6 +1053,57 @@ sufficient one. A generalisation measured on one model is a regression on anothe
 reason this is a sentence rather than a shipped defect is that the AF2 differential runs on every
 pass.
 
+### 🔴 OPEN DEFECT: ESMFold2's RECYCLING MAKES ITS FOLD WORSE, AND NOTHING GATED THE SEAM
+
+**This is a correctness finding, not a speed one, and it was surfaced by being asked for a
+comparison this file had never made.** Every ESMFold2 number here - 253 s, then 65 s, then 9.5 s -
+was taken against ITSELF. The WGSL fold of the same weights was never run, on the belief that its
+bundle was absent; it is not. `fold-esmfold2.js` merely DEFAULTS to `/model-esmfold2-trunk-f32`,
+which this box lacks, and takes `--bundle=` - so the comparison was one flag away the whole time.
+
+Same bundle (`/model-esmfold2-int5`), same tower (`/model-esmc-600m-int3`), same model
+(`esmfold2-fast-600m`), same 75-residue sequence, same seed 0, same four trunk loops, same eleven
+sampler steps:
+
+| | WebGL2 | WGSL |
+|---|---:|---:|
+| mean pLDDT | **57.33** | **88.08** |
+| pTM | **0.411** | **0.883** |
+| median CA-CA | 3.636 A | 3.826 A |
+| fold | 9.53 s | 1.53 s |
+
+🔴 **AND THE DECISIVE EVIDENCE NEEDS NO SECOND BACKEND AT ALL: MORE RECYCLING MAKES IT WORSE,
+MONOTONICALLY.**
+
+| trunk loops | 1 | 2 | 4 |
+|---|---:|---:|---:|
+| mean pLDDT | **69.49** | 58.80 | **57.33** |
+| pTM | **0.548** | 0.424 | **0.411** |
+
+Recycling exists to improve the structure. A fold that gets worse every time it recycles is wrong
+however fast it is, and the one-loop number being the best says the seam - not the trunk - is where
+to look.
+
+🔴 **AND EVERY STAGE GATE PASSES, INCLUDING THE RECYCLE PROJECTION ITSELF.**
+`check-webgl-esmfold2-trunk.js` compares `recycleProjection` against `cpu/esmfold2`'s and is green,
+the layout matches the reference's `(in, out)` default, and the loop runs `num_loops + 1` times with
+`z` starting at zero as the driver's own comment requires. So the kernel is right and the
+composition is not - which is this file's own argument for whole-fold drivers, turned on a model
+where the driver was only ever compared with itself.
+
+**bioemu2 does not have this problem and that is why**: `check-webgl-bioemu2-trunk.js` drives TWO
+PASSES against the WGSL trunk, so its recycle seam is gated across backends. ESMFold2's is gated
+only per-kernel against the CPU reference. One gate's inputs, again.
+
+**What this costs the speed claims above**: ESMFold2's 62.9 s to 9.53 s is real and measured, but it
+is 6.6x on a fold whose answer does not match the WGSL one's, so it is NOT a like-for-like narrowing
+of the gap and must not be read as one. bioemu2's and AF3's numbers are unaffected - both are gated
+against the WGSL path across passes.
+
+**Not fixed here.** The next step is a whole-fold differential for ESMFold2 - the WGSL and WebGL2
+drivers on one input, compared seam by seam across the recycle - which is the instrument this model
+has never had.
+
 ### The threshold that chose between two projection kernels was fitted with the wrong dtype
 
 🔴 **`bench-webgl-linear.js` UPLOADED ITS WEIGHTS WITH `upload`, AND EVERY FOLD USES
