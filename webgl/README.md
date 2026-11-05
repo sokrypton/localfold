@@ -45,6 +45,10 @@ webgl/
                                 wide, plus the gather back into one interleaved tensor
     attention-block.js          the whole block - LayerNorm, q/k/v/gate projections, the flash
                                 core, the output projection; what an Evoformer layer calls
+    pair-bias.js                the pair track's logit bias, head-major: the only place the
+                                MSA and pair tracks meet before the outer product mean
+    transition.js               LayerNorm, expand with a ReLU, contract back
+    outer-product-mean.js       the MSA's path INTO the pair track, in two draws
     layer-norm.js   row-wise LayerNorm, about ten times a block
     linear.js       the dense projection, with bias and activation folded in - where the FLOPs are
     triangle-contract.js        the contraction, one source shared by the stage and the benchmark
@@ -80,11 +84,22 @@ that side to be measured against. It confirmed four conventions rather than assu
 `[in][out]` (the triangle's are `[out][in]`, same model), q/k/v with no bias against a gate with
 one, the `1/sqrt(head_dim)` scale on the logit here against the query there, and the plane gather.
 
-Still to come, in the order they are needed: the pair-bias projection (the block takes a
-pre-projected bias today; the WGSL one computes it from the pair activations); AF2's separate GLOBAL
-attention for the extra-MSA stack; the outer product mean; the transition; triangle ATTENTION; then
-the Evoformer block that drives them, the stack, the structure module, and the confidence and
-distogram heads. After AF2: AF3's pairformer and diffusion, ESMFold2, bioemu2. After AF2: AF3's pairformer and diffusion, ESMFold2, bioemu2. Nothing is wired to a weight
+**AF2's MSA row attention with pair bias is complete and verified end to end** - the attention
+block driven with a bias projected out of a separate pair tensor, which is the only place the two
+tracks meet before the outer product mean sends information the other way. So are the transition
+and the outer product mean, each cross-checked against its WGSL twin and an f64 reference.
+
+Still to come, in the order they are needed: MSA COLUMN attention (the same block over the sequence
+axis); AF2's separate GLOBAL attention for the extra-MSA stack; triangle ATTENTION; then the
+Evoformer block that drives all of them, the stack, the structure module, and the confidence and
+distogram heads. After AF2: AF3's pairformer and diffusion, ESMFold2, bioemu2.
+
+Every operation so far is checked against TWO references - an f64 CPU one written from the
+operation, and the WGSL kernel run in the same page - because a single reference cannot say which
+side is wrong. That has already paid for itself twice: the triangle contraction's incoming
+direction was the pair-transpose of itself and only the WGSL arm could see it, and the attention
+block read 1e-3 against WGSL while reading 2.5e-7 against f64, which was an unpinned precision axis
+on the WGSL side rather than a defect here. After AF2: AF3's pairformer and diffusion, ESMFold2, bioemu2. Nothing is wired to a weight
 bundle yet - every kernel takes its operands as plain arrays, and reading
 `model-af2-monomer-int5` is its own stage with its own differential, because a transposed weight is
 a plausible-looking wrong answer.

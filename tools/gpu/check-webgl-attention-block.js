@@ -18,6 +18,17 @@
  * `1/sqrt(head_dim)` scale is applied to the query there and to the logit here,
  * which is the same number and worth confirming rather than asserting.
  *
+ * 🔴 THE PAIR-BIAS ARMS ARE AF2's MSA ROW ATTENTION, WHICH IS THE ONLY PLACE
+ * THE TWO TRACKS MEET before the outer product mean sends information back. The
+ * bias is projected out of a separate pair tensor with its own LayerNorm
+ * (`pairBias: {source: "separate", ...}` on the WGSL side), lands head-major,
+ * and is read by the flash core as `(head * Q + q) * Q + k`. Three things could
+ * be independently wrong - the projection's `[c][heads]` weight, the
+ * pair-major-to-head-major transpose, and which of the attention's two axes the
+ * bias indexes - and an i/j transpose in the last of them is invisible to any
+ * reference that builds the bias the way the kernel does, so the WGSL arm is
+ * what covers it.
+ *
  * 🔴 AND THE WGSL SIDE HAS FOUR PRECISION AXES, WHICH THIS GATE LEARNED BY
  * MEASURING 1e-3 TWICE WITH THE WRONG ONES PINNED. `flashPrecision`,
  * `projectPrecision`, `outputPrecision` and `storage` are separate, they all
@@ -40,6 +51,9 @@
  * that happens the instrument is wrong, not the kernel.
  */
 import { AttentionGpu } from "../../webgpu/kernels/attention.js";
+import {
+  pairBias as computePairBias, releasePairBiasWeights, uploadPairBiasWeights,
+} from "../../webgl/kernels/pair-bias.js";
 import {
   attentionBlock, releaseAttentionBlockWeights, uploadAttentionBlockWeights,
 } from "../../webgl/kernels/attention-block.js";
@@ -176,6 +190,10 @@ export async function main(device, args) {
     { batch: 2, queryLength: 10, channels: 64, heads: 2 },
     { batch: 3, queryLength: 8, channels: 32, heads: 4 },
     { batch: 1, queryLength: 12, channels: 128, heads: 4 },
+    // ...with a pair bias: AF2's MSA row attention, 8 heads. The pair channel
+    // width is independent of the MSA's, as it is in the model.
+    { batch: 3, queryLength: 7, channels: 64, heads: 8, pairChannels: 32 },
+    { batch: 2, queryLength: 9, channels: 32, heads: 4, pairChannels: 16 },
   ];
   const built = [];
 
@@ -201,7 +219,47 @@ export async function main(device, args) {
     };
     for (let b = 0; b < batch; b += 1) input.mask[b * queryLength + queryLength - 1] = 0;
 
-    const label = `b=${batch} q=${queryLength} c=${channels} h=${heads}`;
+    const pairChannels = shape.pairChannels;
+    const withPair = pairChannels !== undefined;
+    const pairInput = withPair ? {
+      activations: noise(queryLength * queryLength * pairChannels, 1.5, random),
+      layerNormScale: noise(pairChannels, 0.2, random, 1),
+      layerNormOffset: noise(pairChannels, 0.1, random),
+      projectionWeight: noise(pairChannels * heads, 1 / Math.sqrt(pairChannels), random),
+      channels: pairChannels,
+      source: "separate",
+    } : undefined;
+    if (withPair) {
+      // The CPU reference takes the bias pre-projected and head-major, so build
+      // it the way the WGSL kernel stores it: normalise each pair row, project
+      // with a [c][heads] weight, write [head][pair].
+      const pairs = queryLength * queryLength;
+      const bias = new Float32Array(heads * pairs);
+      for (let pair = 0; pair < pairs; pair += 1) {
+        const at = pair * pairChannels;
+        let mean = 0;
+        for (let c = 0; c < pairChannels; c += 1) mean += pairInput.activations[at + c];
+        mean /= pairChannels;
+        let spread = 0;
+        for (let c = 0; c < pairChannels; c += 1) {
+          spread += (pairInput.activations[at + c] - mean) ** 2;
+        }
+        const inverseStd = 1 / Math.sqrt(spread / pairChannels + 1e-5);
+        for (let h = 0; h < heads; h += 1) {
+          let sum = 0;
+          for (let c = 0; c < pairChannels; c += 1) {
+            const value = (pairInput.activations[at + c] - mean) * inverseStd
+              * pairInput.layerNormScale[c] + pairInput.layerNormOffset[c];
+            sum += value * pairInput.projectionWeight[c * heads + h];
+          }
+          bias[h * pairs + pair] = sum;
+        }
+      }
+      input.pairBias = bias;
+    }
+
+    const label = `b=${batch} q=${queryLength} c=${channels} h=${heads}`
+      + (withPair ? ` pairC=${pairChannels}` : "");
     const weights = uploadAttentionBlockWeights(execution, input.weights);
     // 🔴 THE PERTURBATION GOES TO THE WEBGL SIDE ONLY, or it moves both
     // references with the kernel and every difference stays where it was.
@@ -211,7 +269,20 @@ export async function main(device, args) {
       : input.activations, "activations");
     const mask = execution.upload(input.mask, "mask");
 
-    const output = attentionBlock(execution, { ...shape, activations, mask, weights });
+    let pairWeights;
+    let pairTensor;
+    let bias;
+    if (withPair) {
+      pairWeights = uploadPairBiasWeights(execution, pairInput);
+      pairTensor = execution.upload(pairInput.activations, "pair");
+      bias = computePairBias(execution, {
+        pair: pairTensor, weights: pairWeights, length: queryLength, pairChannels, heads,
+      });
+    }
+
+    const output = attentionBlock(execution, {
+      ...shape, activations, mask, weights, pairBias: bias,
+    });
     const ours = execution.read(output).slice();
     execution.release(output);
 
@@ -227,6 +298,7 @@ export async function main(device, args) {
     }).run({
       batch, queryLength, channels, heads,
       activations: input.activations, mask: input.mask, weights: input.weights,
+      ...(withPair ? { pairBias: pairInput } : {}),
     });
     arm(`vs WGSL block ${label}`, ours, wgsl);
     built.push({ shape: label, storage: wgsl.storage, shaders: wgsl.shaders });
@@ -234,6 +306,11 @@ export async function main(device, args) {
     releaseAttentionBlockWeights(execution, weights);
     execution.release(activations);
     execution.release(mask);
+    if (withPair) {
+      releasePairBiasWeights(execution, pairWeights);
+      execution.release(pairTensor);
+      execution.release(bias);
+    }
   }
 
   const stats = execution.stats();
