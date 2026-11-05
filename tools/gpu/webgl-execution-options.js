@@ -78,6 +78,10 @@
  *                         still leaves FRAGMENT_FLOOR fragments, because a
  *                         short projection is starved rather than
  *                         traffic-bound; this is how that is swept.
+ *   --no-linear-aspect    The in-major projection blocked on the old
+ *                         `in * out >= 65536` threshold rather than on the
+ *                         aspect ratio - a threshold fitted with f32 weights
+ *                         where every fold uses float16.
  *   --no-contract-tile    The contraction's channel group taken from the texel
  *                         INDEX rather than from the fragment's x range, so a
  *                         rasterisation tile spans about a hundred channel
@@ -145,6 +149,7 @@ export function webglExecutionOptions(args) {
     noContractCeiling: flag(args, "no-contract-ceiling"),
     noContractPad: flag(args, "no-contract-pad"),
     noContractTile: flag(args, "no-contract-tile"),
+    noLinearAspect: flag(args, "no-linear-aspect"),
     linearBlockRows: Number(option(args, "block-rows", "0")),
     noPairBiasFast: flag(args, "no-pair-bias-fast"),
     noAttendDot4: flag(args, "no-attend-dot4"),

@@ -312,10 +312,40 @@ export const ROW_FASTEST_X_FLOATS = 1 << 20;
  */
 export const CACHE_RESIDENT_WEIGHT_FLOATS = 65536;
 
-export const blockedApplies = (rows, inChannels, outChannels, weightLayout = "out-major") => (
-  rows >= 64 && inChannels % 4 === 0 && outChannels % 4 === 0
-  && (weightLayout === "out-major"
-    || inChannels * outChannels >= CACHE_RESIDENT_WEIGHT_FLOATS));
+export const blockedApplies = (rows, inChannels, outChannels, weightLayout = "out-major",
+  aspect = true) => {
+  if (!(rows >= 64 && inChannels % 4 === 0 && outChannels % 4 === 0)) return false;
+  if (weightLayout === "out-major") return true;
+  if (!aspect) return inChannels * outChannels >= CACHE_RESIDENT_WEIGHT_FLOATS;
+  // 🔴 AND FOR `[in][out]` THE OLD `in * out` THRESHOLD IS WRONG, BECAUSE IT WAS
+  // FITTED WITH THE WRONG DTYPE. `bench-webgl-linear.js` uploaded its weights
+  // with `upload`, which keeps f32, where every fold uses `uploadWeight` and
+  // gets FLOAT16 above 65536 elements - and f16 halves the one-texel path's
+  // weight traffic, which helps it far more than it helps the blocked one. So
+  // the threshold was fitted on a kernel pair that no fold runs. With the bench
+  // on `uploadWeight` and four interleaved rounds, the two largest in-major
+  // labels in a bioemu2 fold come out on the ONE-TEXEL side:
+  //
+  //   4624 x 256 -> 512    one-texel 226-240 GFLOP/s   blocked 157-159   ONE 1.43-1.53x
+  //   4624 x 256 -> 256    one-texel 239-244           blocked 186-188   ONE 1.29-1.30x
+  //   4624 x 1024 -> 256   one-texel 153               blocked 179       blocked 1.17x
+  //   4624 x 256 -> 2048   one-texel 231-234           blocked 475-481   blocked 2.03-2.09x
+  //
+  // 🔴 AND `in * out` IS NOT THE DISCRIMINATOR AT ALL: 384x512 and 256x768 are
+  // the same 196,608 and disagree, as do 512x512 and 256x1024 at 262,144. What
+  // fits ten of eleven measured shapes is the ASPECT RATIO - blocking wins when
+  // one dimension is at least four times the other, which is what an 8-by-4
+  // register tile should prefer, and the one-texel kernel's 1-by-4 suits a
+  // balanced shape. The eleventh is 256x768, where the one-texel arm collapses
+  // to 68 GFLOP/s because its weight stride is 192 texels and 192 does not
+  // divide the texture width - the row-wrap fault of
+  // webgl/runtime/pad-stride.js, in the weight this time - so that case takes
+  // the block too.
+  //
+  // `--no-linear-aspect` restores the `in * out` threshold.
+  const wide = Math.max(inChannels, outChannels) >= 4 * Math.min(inChannels, outChannels);
+  return wide || !strideDividesWidth(outChannels / 4);
+};
 
 export const blockedSource = (
   rows, inChannels, outChannels, activation, useBias, weightLayout, roundHalf,
@@ -590,7 +620,8 @@ export function linear(execution, call, into) {
     int5 = false;
   }
   if (!execution.noLinearBlock
-    && blockedApplies(rows, inChannels, outChannels, weightLayout)) {
+    && blockedApplies(rows, inChannels, outChannels, weightLayout,
+      !execution.noLinearAspect)) {
     const blockRows = blockRowsFor(execution);
     const rowQuads = Math.ceil(rows / blockRows);
     // Row block fastest only where it is measured: the int5 path, whose codes

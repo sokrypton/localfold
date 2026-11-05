@@ -1053,6 +1053,53 @@ sufficient one. A generalisation measured on one model is a regression on anothe
 reason this is a sentence rather than a shipped defect is that the AF2 differential runs on every
 pass.
 
+### The threshold that chose between two projection kernels was fitted with the wrong dtype
+
+🔴 **`bench-webgl-linear.js` UPLOADED ITS WEIGHTS WITH `upload`, AND EVERY FOLD USES
+`uploadWeight`.** That is the difference between an f32 weight and a **float16** one above 65,536
+elements - and f16 halves the one-texel path's weight traffic, which helps it far more than it helps
+the blocked one. So `blockedApplies`' `in * out >= 65536` rule for `[in][out]` was fitted on a
+kernel pair that no fold runs. With the bench on `uploadWeight` and four interleaved rounds, the two
+largest in-major labels in a bioemu2 fold come out on the **one-texel** side:
+
+| `[in][out]` shape | one-texel | blocked | |
+|---|---:|---:|---|
+| 4624 x 256 -> 512 | **226-240 GFLOP/s** | 157-159 | **one-texel 1.43-1.53x** |
+| 4624 x 256 -> 256 | **239-244** | 186-188 | **one-texel 1.29-1.30x** |
+| 4624 x 1024 -> 256 | 153 | **179** | blocked 1.17x |
+| 4624 x 256 -> 2048 | 231-234 | **475-481** | blocked 2.03-2.09x |
+
+| | before | after | |
+|---|---:|---:|---:|
+| **bioemu2**, 20-step 6MRR-68 | 33.0 s | **30.4 s** | **1.08x** |
+| bioemu2's trunk | 13.4 s | **10.7 s** | **1.26x** |
+| **ESMFold2**, full configuration | 11.2 s | **9.53 s** | **1.17x** |
+| AlphaFold 3 | 2.36 s | 2.35 s | 1.00x |
+
+Every reported quantity holds - rmsd 1.595, 201 contacts, bond rms 0.042 / 0.056 / 0.028, 412 MiB;
+ESMFold2 at pLDDT 57.405, pTM 0.4132, 126 contacts and median CA-CA 3.637. The two kernels sum in
+different orders, so the fold's CA-CA moves in the **seventh** figure (3.8540768 against 3.8540761)
+and the bench's cross-path `relRms` is 1.46e-7 against a 1e-6 bar.
+
+🔴 **AND `in * out` IS NOT THE DISCRIMINATOR AT ALL, WHICH IS WHY NO THRESHOLD ON IT COULD BE
+RIGHT.** 384x512 and 256x768 are the same 196,608 and disagree; so do 512x512 and 256x1024 at
+262,144. What fits ten of eleven measured shapes is the **aspect ratio** - blocking wins when one
+dimension is at least four times the other, which is what an 8-by-4 register tile should prefer
+while the one-texel kernel's 1-by-4 suits a balanced shape. The eleventh is 256x768, where the
+one-texel arm collapses to **68 GFLOP/s** because its weight stride is 192 texels and 192 does not
+divide the texture width - `pad-stride.js`'s row-wrap fault, in the weight this time - so that case
+takes the block as well.
+
+🔴 **AND THE BENCH NEEDED ROUNDS BEFORE ANY OF IT WAS TRUE.** Run single-shot it read 4624x256x512
+at 155.7 GFLOP/s and then 112.6 - the same shape 1.38x apart - which is how a two-parameter rule
+very nearly got fitted to noise: an early pass of this table had 256x768 and 384x512 disagreeing in
+one direction and 512x512 and 256x1024 in the other, with no artefact to explain either. Each arm's
+MINIMUM over four interleaved rounds now, with `spreadOneTexel` and `spreadBlocked` beside it
+(1.00 to 1.13 here). **This is the second instrument in this file to have published numbers before it
+was checked against itself, and the second threshold fitted to them.** `--no-linear-aspect` restores
+the old rule, and the aspect rule is empirical: eleven shapes on one device, confirmed on two whole
+folds, which is the evidence it has.
+
 ### A rasterisation tile is two-dimensional and a texel index is not
 
 🔴 **THE ANSWER TO THE OPEN QUESTION, AFTER SEVEN NULLS: 3.29x ON THE CONTRACTION, BIT-IDENTICAL.**

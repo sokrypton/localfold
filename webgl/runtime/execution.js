@@ -212,6 +212,12 @@ export class Execution {
      */
     this.noContractTile = options.noContractTile ?? false;
     /**
+     * The control arm for the in-major projection's ASPECT rule
+     * (`blockedApplies`): the old `in * out >= 65536` threshold, which was
+     * fitted with f32 weights where every fold uses float16.
+     */
+    this.noLinearAspect = options.noLinearAspect ?? false;
+    /**
      * The blocked projection's rows a fragment, forced - the control arm for
      * `blockRowsFor`'s fragment floor, and the way to sweep it. 0 leaves the
      * resolver alone.
@@ -336,6 +342,7 @@ export class Execution {
   /** An int5 weight left as codes, or null if this one cannot be. */
   uploadInt5Weight(source, label) { return this.storage.uploadInt5Weight(source, label); }
   allocateHalf(elements, label) { return this.storage.allocateHalf(elements, label); }
+
   upload(values, label) { return this.storage.upload(values, label); }
   read(tensor) { return this.storage.read(tensor); }
   release(tensor) { return this.storage.release(tensor); }

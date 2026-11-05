@@ -33,6 +33,7 @@ import { createWebGL2Context } from "../../webgl/index.js";
 import { linear } from "../../webgl/kernels/linear.js";
 import { relativeRms } from "./relative-rms.js";
 
+const flag = (args, name) => (args ?? []).includes(`--${name}`);
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
   return (args ?? []).find((a) => a.startsWith(prefix))?.slice(prefix.length) ?? fallback;
@@ -77,6 +78,7 @@ const fill = (count, seed) => {
 
 export async function main(device, args) {
   const iterations = Number(option(args, "iterations", "8"));
+  const rounds = Number(option(args, "rounds", "4"));
   // 🔴 THE BALLAST ARM: a bioemu2 fold holds about 2 GB of textures against an
   // AF2 fold's 466 MB, so "is a dispatch paying for what is RESIDENT" had to be
   // asked. Measured at 0, 512 and 1536 MiB of dead textures: no systematic
@@ -85,7 +87,10 @@ export async function main(device, args) {
   const gl = createWebGL2Context();
   // No `getError` after each draw: it is a synchronous round trip, worth 4% of
   // an AF2 fold, and a benchmark that pays it measures the round trip.
-  const execution = new Execution(gl, { checkErrors: false });
+  const execution = new Execution(gl, {
+    checkErrors: !flag(args, "no-check-errors"),
+    noLinearAspect: flag(args, "no-linear-aspect"),
+  });
   const rows = [];
   const ballast = [];
   for (let held = 0; held < ballastMegabytes; held += 16) {
@@ -109,7 +114,13 @@ export async function main(device, args) {
   for (const shape of shapes) {
     const { rows: n, inChannels, outChannels, weightLayout, activation = "none" } = shape;
     const x = execution.upload(fill(n * inChannels, 7 + n), "bench.x");
-    const weight = execution.upload(fill(inChannels * outChannels, 11 + inChannels), "bench.w");
+    // 🔴 `uploadWeight` AND NOT `upload`, so the float16 and PACKED-HALVES paths
+    // are reachable from here at all. With a plain `upload` the weight is f32,
+    // `weightTensor.half` is false, and the packed projection silently never
+    // fires - which is how its first measurement came out identical in both
+    // arms and looked like a null.
+    const weight = execution.uploadWeight(
+      fill(inChannels * outChannels, 11 + inChannels), "bench.w");
     const bias = execution.upload(fill(outChannels, 13), "bench.b");
     const call = {
       x, weight, bias, rows: n, inChannels, outChannels, activation, weightLayout,
@@ -118,6 +129,8 @@ export async function main(device, args) {
     /** @type {Record<string, Float32Array>} */
     const answers = {};
     const timings = {};
+    /** @type {Record<string, number>} */
+    const spreads = {};
     for (const arm of ["one-texel", "blocked"]) {
       execution.noLinearBlock = arm === "one-texel";
       // A ring of outputs, one per iteration: see the header - a target written
@@ -130,12 +143,27 @@ export async function main(device, args) {
         linear(execution, call, ring[i % ring.length]);
         execution.read(ring[i % ring.length]);
       }
-      const start = performance.now();
-      for (let i = 0; i < iterations; i += 1) linear(execution, call, ring[i]);
-      // One sync for the whole loop, which is the point: a readback per
-      // iteration measures the readback.
-      answers[arm] = Float32Array.from(execution.read(ring[iterations - 1]));
-      timings[arm] = (performance.now() - start) / iterations;
+      // 🔴 ROUNDS, BECAUSE ONE ROUND OF THIS IS NOT A MEASUREMENT. Run
+      // single-shot, this bench read `4624x256x512` at 155.7 GFLOP/s and then
+      // 112.6 minutes later - the same shape 1.38x apart - because an Apple
+      // GPU's clock ramps under a load that lasts tens of milliseconds and this
+      // machine has other work on it. Thresholds were fitted to numbers like
+      // those. Each arm's MINIMUM over several interleaved rounds, with the
+      // spread reported so a reader can see whether it settled.
+      /** @type {number[]} */
+      const samples = [];
+      for (let round = 0; round < rounds; round += 1) {
+        const start = performance.now();
+        for (let i = 0; i < iterations; i += 1) {
+          linear(execution, call, ring[i % ring.length]);
+        }
+        // One sync for the whole loop, which is the point: a readback per
+        // iteration measures the readback.
+        answers[arm] = Float32Array.from(execution.read(ring[0]));
+        samples.push((performance.now() - start) / iterations);
+      }
+      timings[arm] = Math.min(...samples);
+      spreads[arm] = Math.max(...samples) / Math.min(...samples);
       for (const out of ring) execution.release(out);
     }
     execution.noLinearBlock = false;
@@ -148,6 +176,8 @@ export async function main(device, args) {
       oneTexelMs: Number(timings["one-texel"].toFixed(3)),
       blockedMs: Number(timings.blocked.toFixed(3)),
       speedup: Number((timings["one-texel"] / timings.blocked).toFixed(2)),
+      spreadOneTexel: Number(spreads["one-texel"].toFixed(2)),
+      spreadBlocked: Number(spreads.blocked.toFixed(2)),
       oneTexelGflops: Number((flops / timings["one-texel"] / 1e6).toFixed(1)),
       blockedGflops: Number((flops / timings.blocked / 1e6).toFixed(1)),
       relRms: Number(relativeRms(answers["one-texel"], answers.blocked).toExponential(2)),
