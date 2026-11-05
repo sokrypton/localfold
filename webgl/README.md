@@ -1100,9 +1100,34 @@ is 6.6x on a fold whose answer does not match the WGSL one's, so it is NOT a lik
 of the gap and must not be read as one. bioemu2's and AF3's numbers are unaffected - both are gated
 against the WGSL path across passes.
 
-**Not fixed here.** The next step is a whole-fold differential for ESMFold2 - the WGSL and WebGL2
-drivers on one input, compared seam by seam across the recycle - which is the instrument this model
-has never had.
+🔴 **ONE CONTRIBUTING BUG IS FIXED AND IT IS NOT THE MAIN ONE.** This driver SKIPPED the recycle
+projection on the first loop, on the comment "z starts at zero and the projection is
+zero-initialised upstream, so the first iteration is exactly `folding_trunk(z_init)`" - and
+`webgpu/esmfold2/fold.js` names exactly that error: *"`pair_loop_proj(0)` IS NOT ZERO. Its Linear is
+zero-initialised upstream and then TRAINED, and the LayerNorm in front of it has an offset...
+Skipping the projection on the first loop is the natural shortcut and a different model."* Fixed -
+`z` is an explicit zero pair now and the projection runs every loop - and it is worth **0.18 of
+pLDDT**: 57.33 to 57.50. A real defect, measured, and not the cause.
+
+🔴 **AND THE RESIDUAL IS A SHIFT, NOT A COLLAPSE, WHICH IS WHAT `minPlddt` AND `maxPlddt` ARE FOR.**
+This tool reported only the MEAN, so "mean pLDDT 57.4" sat in this file for a whole campaign without
+anyone asking whether the per-residue values varied at all. They do:
+
+| | mean | min | max | spread |
+|---|---:|---:|---:|---:|
+| WebGL2 (rescaled from 0-1) | 57.50 | 34.9 | 73.9 | 39 |
+| WGSL | 88.08 | 51.86 | 94.78 | 43 |
+
+**A uniform downward shift of twenty-odd points with the same spread width** - and the structures are
+comparable on the measures that do not go through the confidence head: median CA-CA 3.637 against
+3.826, long-range contacts 126 against 117. So the trunk is probably not where the rest of it is,
+and the calibration or the head is.
+
+**Not fixed here.** The next step is a whole-fold differential for ESMFold2 - the two drivers on one
+input, compared seam by seam across the recycle AND into the confidence head - which is the
+instrument this model has never had. `check-webgl-esmfold2-confidence.js` is green against the f64
+reference, so it will not find it either; what is missing is a comparison of the two BACKENDS'
+composed folds, exactly as `check-webgl-bioemu2-trunk.js` does over two passes.
 
 ### The threshold that chose between two projection kernels was fitted with the wrong dtype
 

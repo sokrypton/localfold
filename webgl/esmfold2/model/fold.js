@@ -219,10 +219,26 @@ export function foldEsmfold2(execution, call) {
       return out;
     })(), "ef2.pair-mask");
 
-  let pair;
+  // 🔴 `z` STARTS AT ZERO AND `pair_loop_proj(0)` IS NOT ZERO, SO THE FIRST LOOP
+  // RUNS IT TOO. The projection's Linear is zero-INITIALISED upstream and then
+  // trained, and the LayerNorm in front of it has an OFFSET - so
+  // `pair_loop_proj(0)` is a real vector and the first loop's input is
+  // `z_init + pair_loop_proj(0)`, not `z_init`.
+  //
+  // 🔴 THIS DRIVER SKIPPED IT, AND webgpu/esmfold2/fold.js NAMES THAT MISTAKE:
+  // "Skipping the projection on the first loop is the natural shortcut and a
+  // different model." It is, and the fold measured it: against the WGSL fold on
+  // the same bundle, sequence, seed, loops and steps, this path read mean pLDDT
+  // **57.33 against 88.08** and pTM **0.411 against 0.883** - and its quality
+  // got WORSE with every extra loop (69.49, 58.80, 57.33 at one, two and four),
+  // which is the signature, because recycling exists to improve a structure.
+  //
+  // 🔴 AND EVERY STAGE GATE PASSED THROUGHOUT, including `recycleProjection`
+  // against `cpu/esmfold2`'s. The kernel was right and the COMPOSITION was not;
+  // what caught it was running the two whole folds against each other, which
+  // nothing had ever done for this model - see webgl/README.md.
+  let pair = execution.zeros(pairs * channels, "ef2.trunk.z0");
   for (let loop = 0; loop <= loops; loop += 1) {
-    // 🔴 `z` STARTS AT ZERO AND THE PROJECTION IS ZERO-INITIALISED UPSTREAM, so
-    // the first iteration is exactly `folding_trunk(z_init)`.
     let input = initial;
     if (pair !== undefined) {
       const update = recycleProjection(execution, {

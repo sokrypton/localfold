@@ -311,6 +311,15 @@ export async function main(device, args) {
       count: spacings.length,
     },
     meanPlddt: Number.isFinite(result.meanPlddt) ? Number(result.meanPlddt.toFixed(3)) : null,
+    // 🔴 THE RANGE AND NOT ONLY THE MEAN, because a mean cannot tell a
+    // confident fold from a kernel returning a constant. `fold-esmfold2.js`
+    // reports min and max and this did not, which is why "mean pLDDT 57.4" sat
+    // in webgl/README.md for a whole campaign without anyone asking whether the
+    // per-residue values varied at all.
+    minPlddt: result.plddt.length === 0 ? null
+      : Number(Math.min(...result.plddt).toFixed(3)),
+    maxPlddt: result.plddt.length === 0 ? null
+      : Number(Math.max(...result.plddt).toFixed(3)),
     ptm: Number.isFinite(result.ptm) ? Number(result.ptm.toFixed(4)) : null,
     iptm: Number.isFinite(result.iptm) ? Number(result.iptm.toFixed(4)) : null,
     contactsOverHalf: contacts,
