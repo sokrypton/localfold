@@ -66,6 +66,10 @@
  *   --no-contract-block   AF3's contraction one pair a fragment, which reads
  *                         both operands' rows for every pair rather than
  *                         sharing them across a block of two i and four j.
+ *   --no-row-fastest      The int5 projection's fragments ordered by output
+ *                         group rather than row block, so neighbours walk
+ *                         different weight rows and the weight is streamed
+ *                         again for every row block.
  *   --skip-draws          Issue no draws at all. The fold is garbage; what it
  *                         times is everything this backend does APART from
  *                         drawing, which is the arm that settles whether the
@@ -102,6 +106,7 @@ export function webglExecutionOptions(args) {
     noTriangleSplit: flag(args, "no-triangle-split"),
     noTriangleCoalesce: flag(args, "no-triangle-coalesce"),
     noContractBlock: flag(args, "no-contract-block"),
+    noRowFastest: flag(args, "no-row-fastest"),
     poolLabelPattern: pattern("pool-labels"),
     profile: flag(args, "profile") ? new Map() : null,
   };

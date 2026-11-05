@@ -163,6 +163,12 @@ export class Execution {
      */
     this.noContractBlock = options.noContractBlock ?? false;
     /**
+     * The control arm for the row-block-fastest fragment order in the int5
+     * projection (`webgl/kernels/linear.js`): ordered by output group, as the
+     * float32 and float16 paths are.
+     */
+    this.noRowFastest = options.noRowFastest ?? false;
+    /**
      * Where the HOST time inside `dispatch` goes, when asked for.
      *
      * 🔴 BECAUSE THE GPU IS 3% OF AN AF2 WebGL FOLD AND NOTHING SAID SO.

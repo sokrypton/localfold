@@ -247,6 +247,38 @@ export const BLOCK_ROWS = 4;
 export const blockRowsFor = (execution) => Math.min(8, execution.maxDrawBuffers);
 
 /**
+ * Order fragments ROW BLOCK FASTEST when x is no bigger than this, and by
+ * output group otherwise.
+ *
+ * 🔴 THE ORDER DECIDES WHICH OPERAND STREAMS AND WHICH ONE STAYS IN CACHE, AND
+ * GETTING IT THE WRONG WAY ROUND IS WORTH FIVE TIMES. Ordered by output group,
+ * neighbouring fragments share x and walk different weight rows, so the WEIGHT
+ * streams - once per row block, which for a 576-row projection is 72 times.
+ * Ordered row block fastest they share the weight rows and x streams instead.
+ * So the right order is whichever operand is smaller:
+ *
+ *   - bioemu2's atom projection is 576 x 896: x is 2 MiB, the weight 1.4 to
+ *     3.2 MiB, and row-block-fastest is **1.23x** (6414 ms to 5212 on the cheap
+ *     fold, with the fold's answer identical).
+ *   - the trunk's pair projection is 4624 x 256: x is **4.7 MiB** and the
+ *     weight 262 KiB, and row-block-fastest is **5.1x WORSE** (the trunk stage
+ *     5190 ms to 26456).
+ *
+ * A million floats is the threshold, which is the same number
+ * `sokrypton/rfd4-proteina-webgpu` picks for the same decision (`cmLimit`); its
+ * own note is that ordered by columns "each row block streamed the whole weight
+ * matrix again... about 0.2 TFLOP/s, 350 ms of a trunk pass".
+ *
+ * 🔴 AND THIS IS WHAT THE INT5 KERNEL WAS REALLY WAITING FOR. Its diagnostic:
+ * make every chunk read the SAME four code texels and a bioemu2 fold goes 6664
+ * ms to 3476, so the kernel was bound by code-fetch MISSES - not by bandwidth
+ * (float16 at 2.3x the bytes took the same time), not by the x reads (14%), and
+ * not by occupancy (fewer live registers measured 2% worse). Three wrong guesses
+ * before the cache.
+ */
+export const ROW_FASTEST_X_FLOATS = 1 << 20;
+
+/**
  * Whether the row block is worth its repack, measured by
  * tools/gpu/bench-webgl-linear.js at the shapes four models fold at.
  *
@@ -275,7 +307,7 @@ export const blockedApplies = (rows, inChannels, outChannels, weightLayout = "ou
 
 export const blockedSource = (
   rows, inChannels, outChannels, activation, useBias, weightLayout, roundHalf,
-  blockRows = BLOCK_ROWS,
+  blockRows = BLOCK_ROWS, orderRowFastest = false,
 ) => {
   const each = (template) => Array.from(
     { length: blockRows }, (_, i) => template(i)).join("\n");
@@ -329,8 +361,11 @@ ${useBias ? "uniform sampler2D biasTex;" : ""}
 
 void main() {
   int texel = linearTexel();
-  int q = texel / OUT4;
-  int group = texel - q * OUT4;
+${orderRowFastest
+    ? `  int group = texel / RQ;
+  int q = texel - group * RQ;`
+    : `  int q = texel / OUT4;
+  int group = texel - q * OUT4;`}
   // 🔴 THE TAIL IS CLAMPED, NOT SKIPPED. A row block that runs past the row
   // count still writes every target, because a target left unwritten is a texel
   // nothing wrote - the fault Storage.fillFresh exists to catch. Clamping to
@@ -362,6 +397,7 @@ ${each((i) => `  result${i} = ${value(i)};`)}
  */
 export const blockedInt5Source = (
   rows, inChannels, outChannels, activation, useBias, roundHalf, blockRows = BLOCK_ROWS,
+  orderRowFastest = true,
 ) => {
   const each = (template) => Array.from(
     { length: blockRows }, (_, i) => template(i)).join("\n");
@@ -383,8 +419,21 @@ ${INT5_DECODE8}
 
 void main() {
   int texel = linearTexel();
-  int q = texel / OUT4;
-  int group = texel - q * OUT4;
+  // 🔴 ROW BLOCK FASTEST, WHICH IS WORTH MORE THAN THE BYTES ARE. Ordered by
+  // output group (q = texel / OUT4) neighbouring fragments walk DIFFERENT
+  // weight rows and the weight is streamed again for every one of the 72 row
+  // blocks a 576-row projection has. Ordered row block fastest they share the
+  // same four rows, which for int5 codes is 2.2 KiB and stays in cache for the
+  // whole column. The diagnostic that found it: make every chunk read the SAME
+  // four code texels and the fold goes 6664 ms to 3476 - so this kernel was
+  // bound by code-fetch MISSES, not by bandwidth (float16 at 2.3x the bytes
+  // took the same time) and not by the x reads (worth 14%) or by occupancy
+  // (fewer live registers measured 2% worse).
+${orderRowFastest
+    ? `  int group = texel / RQ;
+  int q = texel - group * RQ;`
+    : `  int q = texel / OUT4;
+  int group = texel - q * OUT4;`}
   int o0 = group * 4;
   int base = texel < RQ * OUT4 ? q * ${blockRows} : 0;
 ${each((i) => `  int xBase${i} = min(base + ${i}, ROWS - 1) * IN4;`)}
@@ -422,9 +471,10 @@ ${each((i) => `  result${i} = ${value(i)};`)}
 };
 
 /** Four row planes back into `[rows][outChannels]`: plane `row % 4`, texel `(row / 4) * OUT4 + group`. */
-export const blockRepackSource = (blockRows = BLOCK_ROWS) => `${PRELUDE}${ONE_TARGET}
+export const blockRepackSource = (blockRows = BLOCK_ROWS, orderRowFastest = false) => `${PRELUDE}${ONE_TARGET}
 uniform int ROWS;
 uniform int OUT4;
+uniform int RQ;
 ${Array.from({ length: blockRows }, (_, i) => `uniform sampler2D plane${i};`).join("\n")}
 
 void main() {
@@ -432,7 +482,9 @@ void main() {
   if (texel >= ROWS * OUT4) { result = vec4(0.0); return; }
   int row = texel / OUT4;
   int group = texel - row * OUT4;
-  int source = (row / ${blockRows}) * OUT4 + group;
+  int source = ${orderRowFastest
+    ? "group * RQ + (row / " + blockRows + ")"
+    : "(row / " + blockRows + ") * OUT4 + group"};
   int plane = row - (row / ${blockRows}) * ${blockRows};
 ${Array.from({ length: blockRows - 1 }, (_, i) =>
   `  if (plane == ${i}) { result = fetch4(plane${i}, source); return; }`).join("\n")}
@@ -521,15 +573,27 @@ export function linear(execution, call, into) {
     && blockedApplies(rows, inChannels, outChannels, weightLayout)) {
     const blockRows = blockRowsFor(execution);
     const rowQuads = Math.ceil(rows / blockRows);
+    // Row block fastest only where it is measured: the int5 path, whose codes
+    // are small enough per output group to stay in cache across a column.
+    // 🔴 THE INT5 PATH ONLY, AND THAT IS A MEASUREMENT AND NOT CAUTION. Applied
+    // to the float paths as well this cost AF2 **3.7x** - 1264 ms to 4698 - and
+    // the reason is the REPACK, not the matmul: ordered row block fastest, the
+    // repack's source index strides by the row-block count, which is 72 for
+    // bioemu2's atom projection and **436** for AF2's pair track, so every
+    // output texel lands on its own cache line. The order is only worth having
+    // where the block count is small enough that the repack survives it.
+    const rowFastest = int5 && !execution.noRowFastest
+      && rows * inChannels <= ROW_FASTEST_X_FLOATS;
     const planes = Array.from({ length: blockRows },
       (_, i) => execution.allocate(rowQuads * outChannels, `linear.plane${i}`));
     execution.dispatch({
       source: int5
         ? blockedInt5Source(
-          rows, inChannels, outChannels, activation, bias !== undefined, roundHalf, blockRows)
+          rows, inChannels, outChannels, activation, bias !== undefined, roundHalf, blockRows,
+          rowFastest)
         : blockedSource(
           rows, inChannels, outChannels, activation, bias !== undefined, weightLayout, roundHalf,
-          blockRows),
+          blockRows, rowFastest),
       outputs: planes,
       inputs: int5
         ? (bias === undefined
@@ -547,10 +611,10 @@ export function linear(execution, call, into) {
         + `:${activation}:${weightLayout}${roundHalf ? ":half" : ""}`,
     });
     execution.dispatch({
-      source: blockRepackSource(blockRows),
+      source: blockRepackSource(blockRows, rowFastest),
       output,
       inputs: Object.fromEntries(planes.map((plane, i) => [`plane${i}`, plane])),
-      optionalInts: { ROWS: rows, OUT4: Math.ceil(outChannels / 4) },
+      optionalInts: { ROWS: rows, OUT4: Math.ceil(outChannels / 4), RQ: rowQuads },
       label: `linear.repack:${rows}x${outChannels}`,
     });
     for (const plane of planes) execution.release(plane);

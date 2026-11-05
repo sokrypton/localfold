@@ -167,6 +167,40 @@ vec2 int5ScaleZero(sampler2D tableTex, int group) {
  * is always 0, 8, 16 or 24 and the span is always exactly two words.
  */
 export const INT5_DECODE8 = `
+// The forty bits of a chunk, aligned: the low word and the eight bits above it.
+// Split out from the decode so a caller can hold EIGHT codes as two uints (two
+// registers) rather than as eight floats, and widen each half only while it is
+// being used.
+uvec2 int5Bits(highp usampler2D codeTex, int element) {
+  int group = element >> 5;
+  int bit = group * 160 + (element & 31) * 5;
+  int word = bit >> 5;
+  int channel = word & 3;
+  int texel = word >> 2;
+  uvec4 first = int5Texel(codeTex, texel);
+  uvec4 second = channel == 3 ? int5Texel(codeTex, texel + 1) : first;
+  uint w0 = int5Pick(first, channel);
+  uint w1 = channel == 3 ? second.x : int5Pick(first, channel + 1);
+  int shift = bit & 31;
+  return shift == 0 ? uvec2(w0, w1) : uvec2((w0 >> shift) | (w1 << (32 - shift)), w1 >> shift);
+}
+
+vec4 int5Low(uvec2 bits, float scale, float zero) {
+  return vec4(
+    float(bits.x & 31u),
+    float((bits.x >> 5) & 31u),
+    float((bits.x >> 10) & 31u),
+    float((bits.x >> 15) & 31u)) * scale + zero;
+}
+
+vec4 int5High(uvec2 bits, float scale, float zero) {
+  return vec4(
+    float((bits.x >> 20) & 31u),
+    float((bits.x >> 25) & 31u),
+    float(((bits.x >> 30) | (bits.y << 2)) & 31u),
+    float((bits.y >> 3) & 31u)) * scale + zero;
+}
+
 void decodeInt5x8(highp usampler2D codeTex, int element, float scale, float zero,
     out vec4 lo, out vec4 hi) {
   int group = element >> 5;

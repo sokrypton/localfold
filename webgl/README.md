@@ -26,7 +26,7 @@ This file began as the spike that answered *can WebGL2 do this work at all*: the
 decide it, moved out of `webgpu/kernels/` where they sat with `webgl2` in their names and no
 importer, plus the texture layout and the limit arithmetic they shared by copy. The honest summary
 of the sections below: the numerics are **checked and correct**, the speed is **4.6x off the WebGPU
-path on AF2 and 18x on bioemu2** - it was 17x and 246x - and the shapes are **worse**.
+path on AF2 and 15x on bioemu2** - it was 17x and 246x - and the shapes are **worse**.
 
 🔴 **AND THEY WERE UNGATED FOR AS LONG AS THEY EXISTED, WHICH IS WHY THE FIRST THING THIS TREE
 GOT WAS A DIFFERENTIAL.** AGENTS.md requires every GPU kernel to have "a deterministic differential
@@ -630,13 +630,20 @@ second machine, and it is not an old one either: an M5 through ANGLE's Metal bac
 ## Closing the gap, and the two instruments that lied about where it was
 
 The question was whether the tricks in `sokrypton/rfd4-proteina-webgpu`'s own WebGL2 port close the
-distance to WGSL here. It has three: a blocked matmul into several render targets, operands as
-float16 packed eight to a texel, and narrow texture rows (384 texels, where this tree uses 2048).
-The first is worth **6.3x to 7.9x** on the projections bioemu2 is made of. The second is taken too,
-in two forms - float16 in RGBA16F (**1.4x and nearly half the peak**) and then the bundle's own
-five-bit codes decoded in the kernel (**another 2.08x of memory**, and the only one of these that
-is more accurate than what it replaced). The third is measured
-now and is **a loss on this device**, which is the one place this port and that one disagree.
+distance to WGSL here. It has **four** - a blocked matmul into several render targets, operands as
+float16 packed eight to a texel, narrow texture rows (384 texels, where this tree uses 2048), and
+the fragment ORDER its `cmLimit` decides - and this file first looked for three of them, which is
+why the fourth arrives at the bottom of this section by a different route.
+
+- **The blocked matmul** is worth **6.3x to 7.9x** on the projections bioemu2 is made of.
+- **Packed half-precision operands** are taken twice over: float16 in RGBA16F (**1.4x and nearly
+  half the peak**) and then the bundle's own five-bit codes decoded in the kernel (**another 2.08x
+  of memory**, and the only optimisation here that is more accurate than what it replaced).
+- **The fragment order** is **1.23x** where it applies, and **5.1x against** where it does not -
+  see "Which operand streams" below, which is also the reason the int5 kernel was two and a half
+  times off its own model.
+- **Narrow texture rows** are measured and are **a loss on this device**, which is the one place
+  this port and that one genuinely disagree.
 
 🔴 **NARROW ROWS ARE 1.6x FOR THEM AND 3.8x AGAINST US, AND THE REASON IS THE ADDRESSING.** Their
 measurement is a trunk pass at 2.35 s with 3072-texel rows and 1.47 s with 384. Here, with the same
@@ -789,9 +796,9 @@ Every fold is the same job, the same seed and the same settings either side; `--
 
 | fold | before | after | |
 |---|---:|---:|---:|
-| bioemu2, 6MRR 68 tokens, 4 passes, 20 steps | 968 s | **68.9 s** | **14.0x** |
-| ...its trunk | 277.7 s | **21.3 s** | 13.0x |
-| ...its 20 denoiser calls | 658 s | **46.8 s** | 14.1x |
+| bioemu2, 6MRR 68 tokens, 4 passes, 20 steps | 968 s | **57.6 s** | **16.8x** |
+| ...its trunk | 277.7 s | **21.6 s** | 12.8x |
+| ...its 20 denoiser calls | 658 s | **35.1 s** | 18.7x |
 | ESMFold2, 75 residues, 36-block tower, 3 loops, 15 steps | 253 s | **65.0 s** | **3.9x** |
 | ESMFold2 at the tool's defaults | 2.82 s | **1.37 s** | 2.1x |
 | AF3, 59 tokens | 4.68 s | **3.39 s** | 1.4x |
@@ -899,6 +906,53 @@ differential rather than a floor because a quantised decoder that is wrong stays
 **104,170 of 131,072 elements** at int5 group 64, and it was the HOST that was wrong. Its
 `--falsify` arm reads a code as a multiple of the scale rather than an offset from the zero, which
 is that same real fault, and turns 7,077,888 elements red.
+
+### Which operand streams, which stays in cache - and three wrong guesses first
+
+The int5 projection sat at **26 ms a call where its traffic model said 12 and its fetch model said
+10**, and the three obvious explanations were all wrong:
+
+- not bandwidth: float16 at **2.3x the bytes** took the same 27 ms;
+- not the x reads: replacing them with a held value is worth **14%**;
+- not occupancy: holding eight codes as two uints instead of eight floats, which frees 24
+  registers, measured **2% worse**, and a four-row block measured 1.5x worse than the eight-row one.
+
+The diagnostic that found it: make every chunk read **the same four code texels**, so they are
+always cache hits, and the fold goes **6664 ms to 3476**. The kernel was bound by code-fetch
+MISSES.
+
+🔴 **AND THE FIX IS THE FRAGMENT ORDER, WHICH DECIDES WHICH OPERAND STREAMS.** A fragment's texel
+index decodes into a row block and an output group, and which one varies fastest decides what its
+neighbours share. Ordered by output group - `q = texel / OUT4`, what every kernel here did -
+neighbours share x and walk DIFFERENT weight rows, so the weight streams once per row block, which
+for a 576-row projection is seventy-two times. Ordered row block fastest they share the weight rows
+and x streams instead.
+
+So the right order is whichever operand is smaller, and getting it the wrong way round is worth
+five times:
+
+| projection | x | weight | row-block-fastest |
+|---|---:|---:|---|
+| bioemu2 atom, 576 x 896 -> 1792 | 2.0 MiB | 1.4 MiB (int5) | **1.23x** |
+| trunk pair, 4624 x 256 -> 512 | **4.7 MiB** | 262 KiB | **5.1x WORSE** |
+
+`ROW_FASTEST_X_FLOATS` is a million floats, which is the same number
+`sokrypton/rfd4-proteina-webgpu` picks for the same decision (its `cmLimit`) - and this is the
+third of its three tricks, arriving by a different route than the one this file first looked for.
+Its own note on getting it wrong: ordered by columns "each row block streamed the whole weight
+matrix again... about 0.2 TFLOP/s, 350 ms of a trunk pass". `--no-row-fastest` is the control arm,
+and the fold's answer is identical either way - this moves where a texel is read, not what is
+computed.
+
+🔴 **AND IT IS THE INT5 PATH ONLY, WHICH THE AF2 ARM OF THE VERIFICATION CAUGHT.** Applied to the
+float paths as well it cost AF2 **3.7x - 1264 ms to 4698** - and the reason is the REPACK rather
+than the matmul: ordered row block fastest, the repack's source index strides by the row-block
+count, which is 72 for bioemu2's atom projection and **436** for AF2's pair track, so every output
+texel lands on its own cache line. The order is worth having only where the block count is small
+enough that the repack survives it, so the threshold above is a necessary condition and not a
+sufficient one. A generalisation measured on one model is a regression on another, and the only
+reason this is a sentence rather than a shipped defect is that the AF2 differential runs on every
+pass.
 
 ### A texture pool, and the bug it found
 
@@ -1092,16 +1146,16 @@ bond rms  main       0.042            0.042            0.042
           side       0.056            0.056            0.056
           peptide    0.028            0.028            0.028
 contacts (P > 0.5)   201              201
-wall                 968 s            68.9 s           3.9 s
-  trunk              277.7 s          21.3 s           2.3 s
+wall                 968 s            57.6 s           3.9 s
+  trunk              277.7 s          21.6 s           2.3 s
   distogram                           0.7 s
-  20 denoiser calls  658 s            46.8 s           1.2 s
+  20 denoiser calls  658 s            35.1 s           1.2 s
 weights/activations  1656 MiB peak    409 MiB peak     815 MiB weights + 135 activations
 ```
 
-🔴 **968 s TO 68.9 s ON A QUARTER OF THE MEMORY, AND NOT ONE REPORTED QUANTITY MOVES.** The 14.0x
-is the row block, the contraction split, coalesced, transposed and pair-blocked, and the weights
-held as the bundle's own five-bit codes from "Closing the gap" above, and every figure in
+🔴 **968 s TO 57.6 s ON A QUARTER OF THE MEMORY, AND NOT ONE REPORTED QUANTITY MOVES.** The 16.8x
+is the row block and its fragment order, the contraction split, coalesced, transposed and
+pair-blocked, and the weights held as the bundle's own five-bit codes from "Closing the gap" above, and every figure in
 the middle column is the left column's - the same rmsd, the same TM, the same CA-CA median to eight
 digits, the same 201 contacts - while the peak HALVES. Four kernels reordered or re-quantised and
 the fold does not notice; the weights are within 36 MiB of what the WGSL fold holds.
@@ -1119,8 +1173,8 @@ relative. A geometry floor would have accepted a port that was wrong by 10%; thi
 also why the AF3-style "worst atom" figure is not quoted here: it needs both PDBs, and the WebGL2
 side is sixteen minutes a fold.
 
-🔴 **AND IT IS 18x THE WGSL FOLD - WAS 246x - ON LESS MEMORY THAN THAT FOLD USES.** The trunk is
-9x and the diffusion 39x, and the diffusion is where the remaining asymmetry lives: the WGSL denoiser
+🔴 **AND IT IS 15x THE WGSL FOLD - WAS 246x - ON LESS MEMORY THAN THAT FOLD USES.** The trunk is
+9x and the diffusion 30x, and the diffusion is where the remaining asymmetry lives: the WGSL denoiser
 batches S samples through one compiled program, which this one does not. **The half-precision
 weights this file once called "the next multiplicative factor" are taken** - see "Float16 weights"
 above - so the denoiser's 1.6 GiB is 0.8 and a call is **2.5 s where it was 32.9**. That is also
@@ -1257,7 +1311,7 @@ and the page requires WebGPU rather than choosing a backend.
 🔴 **THE PRECONDITION IS NOW MET AND THE DECISION IS STILL NOT AUTOMATIC.** This section used to say
 neither line should move "before a fold actually runs here", and one does. What has not been
 settled is whether a backend **4.6x slower on AF2 and 23x on bioemu2** should be offered: a
-59-residue AF2 fold is 1.29 s against 0.28 s, 68-token bioemu2 is 69 s against 3.9 s on 409 MiB
+59-residue AF2 fold is 1.29 s against 0.28 s, 68-token bioemu2 is 58 s against 3.9 s on 409 MiB
 against 950, and a
 255-residue fold has not been measured at all. A visitor with no WebGPU gets a fold
 instead of a refusal, which is the whole point of the tree; a visitor who waits four minutes for
