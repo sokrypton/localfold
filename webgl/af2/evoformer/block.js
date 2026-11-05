@@ -1,6 +1,16 @@
 /**
  * An AlphaFold 2 Evoformer block: nine sub-layers, each a residual.
  *
+ * 🔴 AND THE TWO GRAPHS DISAGREE ABOUT MORE THAN THE ORDER. Two options here are
+ * per-CHECKPOINT and not per-device: `outerProductMeanFirst`, which is the
+ * multimer's order, and `transitionPrecision`, because
+ * `webgpu/af2/evoformer/block.js` stores a transition's hidden row in f16
+ * whenever its width is a multiple of four while `webgpu/af2/multimer/block.js`
+ * passes `"f32"` at the same seam. Neither is switchable in the reference, so
+ * both are stated here rather than defaulted - and the multimer comparison read
+ * 1e-4 against a 1e-7 floor until the second one was found, which is what an
+ * unpinned precision axis looks like from the outside.
+ *
  * `webgpu/af2/evoformer/block.js`'s `encodeEvoformerBlock` is the order, and it
  * is not negotiable - the MSA half feeds the pair half through the outer product
  * mean, and the pair half's four sub-layers run on a representation the previous
@@ -157,6 +167,8 @@ export function releaseEvoformerBlockWeights(execution, weights) {
  *   sequences: number, length: number, cM: number, cZ: number, cOuter: number,
  *   triangleHidden: number, msaHidden: number, pairHidden: number,
  *   weights: BlockWeights, epsilon?: number,
+ *   outerProductMeanFirst?: boolean,
+ *   transitionPrecision?: "f16" | "f32",
  *   msaAttentionPrecision?: "f16" | "f32",
  *   triangleAttentionPrecision?: "f16" | "f32",
  *   trianglePrecision?: "f16" | "f32"}} call
@@ -180,6 +192,22 @@ export function evoformerBlock(execution, call) {
     if (own) execution.release(current);
     return next;
   };
+
+  // 🔴 0. THE OUTER PRODUCT MEAN FIRST, WHICH IS AF2-MULTIMER'S ORDER AND NOT
+  // AN OPTIMISATION. `webgpu/af2/multimer/block.js` runs it before the MSA row
+  // attention under `outerProductMeanFirst`, where the monomer runs it after the
+  // MSA transition - so on the multimer graph the pair receives the mean of the
+  // MSA as the block RECEIVED it, and on the monomer graph the mean of the MSA
+  // the block has already updated three times. The two are different models
+  // sharing one kernel, and the flag is per checkpoint.
+  if (call.outerProductMeanFirst === true) {
+    const update = outerProductMean(execution, {
+      activations: msa, mask: msaMask, weights: w.outerProductMean,
+      sequences, length, cM, cOuter, cZ, layerNormEpsilon: epsilon,
+    });
+    pair = residual(pair, update, ownPair);
+    ownPair = true;
+  }
 
   // 1. MSA row attention, biased by the pair.
   {
@@ -223,12 +251,15 @@ export function evoformerBlock(execution, call) {
     const update = transition(execution, {
       activations: msa, weights: w.msaTransition,
       rows: sequences * length, channels: cM, hiddenChannels: msaHidden, epsilon,
+      hiddenPrecision: call.transitionPrecision,
     });
     msa = residual(msa, update, ownMsa);
     ownMsa = true;
   }
 
-  pair = pairHalf(execution, call, msa, pair, ownPair, residual);
+  pair = pairHalf(
+    execution, { ...call, outerProductMeanDone: call.outerProductMeanFirst === true },
+    msa, pair, ownPair, residual);
   msa.label = "block.msa";
   pair.label = "block.pair";
   return { msa, pair };
@@ -248,8 +279,10 @@ function pairHalf(execution, call, msa, pairIn, ownPairIn, residual) {
   let pair = pairIn;
   let ownPair = ownPairIn;
 
-  // 1. The MSA's one path into the pair track.
-  {
+  // 1. The MSA's one path into the pair track - unless it has already run, which
+  //    is the multimer graph's order. `encodeEvoformerPairBlock` takes the same
+  //    flag under the same name for the same reason.
+  if (call.outerProductMeanDone !== true) {
     const update = outerProductMean(execution, {
       activations: msa, mask: msaMask, weights: w.outerProductMean,
       sequences, length, cM, cOuter, cZ, layerNormEpsilon: epsilon,
@@ -318,6 +351,7 @@ function pairHalf(execution, call, msa, pairIn, ownPairIn, residual) {
     const update = transition(execution, {
       activations: pair, weights: w.pairTransition,
       rows: pairs, channels: cZ, hiddenChannels: pairHidden, epsilon,
+      hiddenPrecision: call.transitionPrecision,
     });
     pair = residual(pair, update, ownPair);
   }
@@ -342,6 +376,7 @@ export function extraMsaBlock(execution, call) {
   let msa = call.msa;
   let pair = call.pair;
   let ownMsa = false;
+  let ownPair = false;
 
   const residual = (current, update, own) => {
     const next = add(execution, current, update);
@@ -349,6 +384,17 @@ export function extraMsaBlock(execution, call) {
     if (own) execution.release(current);
     return next;
   };
+
+  // 0. The outer product mean first, on the multimer graph; see the note in
+  //    `evoformerBlock`. `encodeExtraMsaBlock` takes the same flag.
+  if (call.outerProductMeanFirst === true) {
+    const update = outerProductMean(execution, {
+      activations: msa, mask: msaMask, weights: w.outerProductMean,
+      sequences, length, cM, cOuter: call.cOuter, cZ: call.cZ, layerNormEpsilon: epsilon,
+    });
+    pair = residual(pair, update, ownPair);
+    ownPair = true;
+  }
 
   // 1. MSA row attention, biased by the pair - the same as the main stack's.
   {
@@ -382,11 +428,14 @@ export function extraMsaBlock(execution, call) {
     const update = transition(execution, {
       activations: msa, weights: w.msaTransition,
       rows: sequences * length, channels: cM, hiddenChannels: msaHidden, epsilon,
+      hiddenPrecision: call.transitionPrecision,
     });
     msa = residual(msa, update, ownMsa);
   }
 
-  pair = pairHalf(execution, call, msa, pair, false, residual);
+  pair = pairHalf(
+    execution, { ...call, outerProductMeanDone: call.outerProductMeanFirst === true },
+    msa, pair, ownPair, residual);
   msa.label = "extra.msa";
   pair.label = "extra.pair";
   return { msa, pair };

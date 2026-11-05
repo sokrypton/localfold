@@ -382,8 +382,39 @@ are `fold-af2.js`'s own.
 from an accumulation: one block agreeing and forty-eight not is an accumulating difference, where a
 disagreement at the first block is a defect in the block.
 
-Still to come in AF2: the multimer variant. After that: AF3's pairformer and diffusion, ESMFold2,
-bioemu2.
+## The multimer graph, so far
+
+Both block kinds run in multimer order, at **8.2e-8 / 1.1e-7** (main) and **8.0e-8 / 1.1e-7**
+(extra) against the WGSL multimer block, each at its own measured floor, and the same in monomer
+order under `--order=monomer`. `outerProductMeanFirst` is the flag: the mean runs BEFORE the MSA
+row attention, so the pair receives the mean of the MSA as the block received it where the monomer
+gets the mean of an MSA already updated three times.
+
+🔴 **IT IS GATED IN BOTH BLOCK KINDS BECAUSE THE REFERENCE SHIPPED WITH IT WORKING IN ONE.**
+`webgpu/af2/multimer/block.js` says so at `encodeExtraMsaBlock`: "Only the main evoformer honoured
+the flag before; this stack read it and did nothing, which left every multimer fold running one of
+its two stacks in the monomer order." This port writes the branch twice because the two blocks do
+not share their MSA half, so both are compared.
+
+🔴 **AND THE FLAG IS PROVED NOT TO BE INERT BEFORE ANY RESIDUAL IS BELIEVED.** CLAUDE.md's rule -
+"a control arm that cannot vary the thing under test is not a control" - so four `orderMoves` arms
+run this port with the flag off and assert the answer moves: **0.054 and 0.008 on the main block's
+pair and MSA, 0.043 and 0.007 on the extra block's**, against a 1e-3 bar. Without them, both sides
+ignoring the flag would read as perfect agreement.
+
+🔴 **AND THE TWO GRAPHS DIFFER IN THREE PRECISION DECISIONS BESIDES THE ORDER, NONE OF THEM A
+KNOB - WHICH COST THREE ROUNDS OF 1e-4.** The multimer block's transitions keep their hidden row in
+**f32** where the monomer's round it to f16 whenever the width is a multiple of four; its attention
+targets are **all f32** ("AND THE MULTIMER'S TARGETS ARE ALL f32, which is the SIMPLER of the two",
+in its own words) where the monomer's store the normalised input, the projections and the output in
+f16; and its outer product mean and triangle contraction take f16 ARITHMETIC from device tuning,
+which `setHalfPrecision` does not reach - `opmVectorArithmetic` and `triangleContractArithmetic`
+are the controls. Each one was found by the residual refusing to move, and each is a property of
+the graph rather than of the device: `transitionPrecision`, `msaAttentionPrecision` and
+`triangleAttentionPrecision` are how this port states them.
+
+Still to come in AF2-multimer: the 73-row relative encoding, the nine-projection template embedder,
+and `position_scale` 20. After that: AF3's pairformer and diffusion, ESMFold2, bioemu2.
 
 Every operation so far is checked against TWO references - an f64 CPU one written from the
 operation, and the WGSL kernel run in the same page - because a single reference cannot say which
