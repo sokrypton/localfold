@@ -487,7 +487,7 @@ ${tileWidth > 0
   // every row block there is - 918 KiB of x under one tile at bioemu2's
   // 576x896x1792 against ${tileWidth} * ${blockRows} rows. The same mapping, and the same
   // reason, as blockedContractSource; measured by
-  // probe-webgl-linear-operand.js, where x binds at 6.5x and the codes at 1.0.
+  // probe-webgl-linear-operand.js, where x binds at 3.44x and the codes at 1.09.
   const int TILEW = ${tileWidth};
   int lane = texel % TILEW;
   int group = (texel % W) / TILEW;

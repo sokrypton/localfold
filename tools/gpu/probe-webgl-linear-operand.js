@@ -35,12 +35,16 @@
  * still bind despite `orderRowFastest`; both small means neither stream is the
  * constraint and the kernel is issue-bound.
  *
- * 🔴 MEASURED AT 576x896x1792, THE FOLD'S LARGEST ROW: x BINDS AT 6.4-6.7x
- * AND THE CODES COST NOTHING AT ALL. 19.24 ms shipped at 96 GFLOP/s, 2.94 ms
- * x-aliased at 630. Over three runs the x factor is 6.41, 6.62, 6.68 and the
- * code factor 1.01, 0.85 - and 0.85 means the aliased arm came out SLOWER,
- * which is how a figure inside the shipped arm's own 1.22-1.34 spread reads.
- * The code arm is a null, not a small win. So `orderRowFastest` finished the weight side and
+ * 🔴 MEASURED AT 576x896x1792, THE FOLD'S LARGEST ROW: x BINDS AT 3.44x AND
+ * THE CODES COST NOTHING (1.09x). 10.06 ms shipped at 184 GFLOP/s against 2.93
+ * ms x-aliased at 632 and 9.25 ms w-aliased at 200. So `orderRowFastest`
+ * finished the weight side and every remaining factor is on the x side - and
+ * two of them are taken: x in float16 is 1.31x on its own (7.68 ms) and the
+ * tile-aware order below is 1.96x (5.13 ms), 2.56x together (3.94 ms at 470
+ * GFLOP/s).
+ *
+ * 🔴 AND THE FIRST VERSION OF THESE FIGURES READ 6.62x AND IS RETRACTED - see
+ * the straw-baseline note at the end of this header. So `orderRowFastest` finished the weight side and
  * every remaining factor in this kernel is on the x side.
  *
  * 🔴 AND THE OBVIOUS CONCLUSION FROM THAT IS WRONG, WHICH IS WHY THE ASPECT
@@ -95,6 +99,8 @@ import {
   INT5_DECODE, INT5_DECODE8, INT5_GROUP, INT5_GROUP_WORDS,
 } from "../../webgl/runtime/int5.js";
 
+const TEXTURE_W = 2048;
+const flag = (args, name) => (args ?? []).includes(`--${name}`);
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
   return (args ?? []).find((a) => a.startsWith(prefix))?.slice(prefix.length) ?? fallback;
@@ -123,7 +129,7 @@ const compile = (gl, kind, source) => {
  * a comment here ends the string. That has happened eight times in this tree.
  */
 const shader = (inChannels, outChannels, rowsPerFragment, outsPerFragment,
-  rowBlocks, arm, tileWidth = 0) => {
+  rowBlocks, arm, tileWidth = 0, xStride4 = inChannels / 4, halfX = false) => {
   const R = rowsPerFragment;
   const C = outsPerFragment;
   const quads = C / 4;
@@ -139,7 +145,7 @@ const int IN = ${inChannels};
 const int GPR = ${inChannels / INT5_GROUP};
 const int OUTC = ${outChannels / C};
 const int RQ = ${rowBlocks};
-const int XSTRIDE4 = ${inChannels / 4};
+const int XSTRIDE4 = ${xStride4};
 uniform sampler2D xTex;
 uniform highp usampler2D codeTex;
 uniform sampler2D tableTex;
@@ -278,6 +284,20 @@ export async function main(device, args) {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
     return t;
   };
+  // x in float16, which is what the WGSL path keeps its intermediates in and
+  // what this backend does NOT - half the bytes of the stream that binds.
+  const halfTexture = (values) => {
+    const t = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, t);
+    const texels = Math.ceil(values.length / 4);
+    const height = Math.max(1, Math.ceil(texels / W));
+    const padded = new Float32Array(W * height * 4);
+    padded.set(values);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, W, height, 0, gl.RGBA, gl.FLOAT, padded);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    return t;
+  };
   const wordTexture = (values) => {
     const t = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, t);
@@ -293,7 +313,27 @@ export async function main(device, args) {
   };
 
   const groups = (inChannels / INT5_GROUP) * outChannels;
-  const xTex = floatTexture(fill(rows * inChannels, 7));
+  // 🔴 x AT THE STRIDE A FOLD GIVES IT, which is what this probe got wrong and
+  // what made its first `tiled-2` reading 1.87x where the fold's is 1.12x. A
+  // row of `in/4` texels wraps onto the next texture row unless that divides W,
+  // so `linear` runs `padStride` over x - 4.08x on its own - and a probe laying
+  // x out unpadded measures a kernel nothing dispatches. `--no-stride-pad` is
+  // the arm that prices it here as it does in a fold.
+  const unpadded = inChannels / 4;
+  const divides = TEXTURE_W % unpadded === 0;
+  const padStride = !flag(args, "no-stride-pad") && !divides;
+  const xStride4 = padStride
+    ? 2 ** Math.ceil(Math.log2(unpadded))
+    : unpadded;
+  const xValues = new Float32Array(rows * xStride4 * 4);
+  {
+    const source = fill(rows * inChannels, 7);
+    for (let r = 0; r < rows; r += 1) {
+      xValues.set(source.subarray(r * inChannels, (r + 1) * inChannels), r * xStride4 * 4);
+    }
+  }
+  const xTex = floatTexture(xValues);
+  const xHalfTex = halfTexture(xValues);
   const codeTex = wordTexture(words(groups * INT5_GROUP_WORDS, 11));
   // The scale/zero table is two floats a group, as `int5ScaleZero` reads it.
   const tableTex = floatTexture(fill(groups * 2, 13));
@@ -341,18 +381,24 @@ export async function main(device, args) {
         + `${outChannels / C} output groups`);
     refusals.push(...(spec === "8x4" ? refused : []));
     const armNames = spec === "8x4"
-      ? ["shipped", "x-aliased", "w-aliased", ...legal.map((t) => `tiled-${t}`)]
+      ? ["shipped", "x-aliased", "w-aliased", "half-x",
+        ...legal.map((t) => `tiled-${t}`),
+        ...legal.map((t) => `tiled-${t}-half-x`)]
       : ["shipped"];
    for (const arm of armNames) {
-    const tileWidth = arm.startsWith("tiled-") ? Number(arm.slice(6)) : 0;
+    const tileWidth = arm.startsWith("tiled-") ? Number(arm.slice(6).split("-")[0]) : 0;
+    const halfX = arm.endsWith("half-x");
     const extent = extentFor(R, C, tileWidth);
+    // `half-x` alone is the shipped order with a narrower x, so its grid is the
+    // shipped one; `tiled-N-half-x` is the tiled grid with a narrower x.
+
     // 🔴 USEFUL FLOPS, NOT DISPATCHED ONES: a padded grid is charged its real
     // milliseconds and credited only the work the kernel would keep.
     const flops = extent.useful * R * C * inChannels * 2;
     const program = gl.createProgram();
     gl.attachShader(program, compile(gl, gl.VERTEX_SHADER, VERTEX_SHADER));
     gl.attachShader(program, compile(gl, gl.FRAGMENT_SHADER,
-      shader(inChannels, outChannels, R, C, rowBlocks, arm, tileWidth)));
+      shader(inChannels, outChannels, R, C, rowBlocks, arm, tileWidth, xStride4, halfX)));
     gl.linkProgram(program);
     if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
       throw new Error(`link ${spec} ${arm}: ${gl.getProgramInfoLog(program)}`);
@@ -365,7 +411,7 @@ export async function main(device, args) {
     gl.enableVertexAttribArray(position);
     gl.vertexAttribPointer(position, 2, gl.FLOAT, false, 0, 0);
     gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, xTex);
+    gl.bindTexture(gl.TEXTURE_2D, halfX ? xHalfTex : xTex);
     gl.uniform1i(gl.getUniformLocation(program, "xTex"), 0);
     gl.activeTexture(gl.TEXTURE1);
     gl.bindTexture(gl.TEXTURE_2D, codeTex);
@@ -403,7 +449,7 @@ export async function main(device, args) {
       milliseconds: Number(ms.toFixed(3)),
       spread: Number((Math.max(...samples) / Math.min(...samples)).toFixed(2)),
       gigaflops: Number((flops / ms / 1e6).toFixed(0)),
-      xMegabytes: Number((xBytes / 1048576).toFixed(1)),
+      xMegabytes: Number((xBytes * (halfX ? 0.5 : 1) / 1048576).toFixed(1)),
       codeMegabytes: Number((codeBytes / 1048576).toFixed(1)),
       witnessFinite: Number.isFinite(witness),
     });
@@ -417,7 +463,8 @@ export async function main(device, args) {
   const binds = xFactor >= 1.3 || wFactor >= 1.3
     ? (xFactor >= wFactor ? "x" : "the weight codes")
     : "neither stream";
-  const sweep = arms.filter((a) => a.arm === "shipped" || a.arm.startsWith("tiled-"))
+  const sweep = arms.filter((a) => a.arm === "shipped" || a.arm.startsWith("tiled-")
+    || a.arm === "half-x")
     .map((a) => ({ arm: a.arm, tile: a.tile, milliseconds: a.milliseconds,
       gigaflops: a.gigaflops, wastedFragments: a.wastedFragments,
       factorOverShipped: Number((shipped / a.milliseconds).toFixed(2)) }));
@@ -427,6 +474,8 @@ export async function main(device, args) {
     renderer: gl.getParameter(gl.RENDERER),
     maxDrawBuffers: targets,
     shape: `${rows}x${inChannels}x${outChannels}`,
+    xStride4,
+    xStridePadded: padStride,
     budget: `${budget} output floats a fragment`,
     arms,
     refusedTileWidths: refusals,

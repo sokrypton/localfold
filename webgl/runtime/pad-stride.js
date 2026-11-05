@@ -78,13 +78,34 @@ void main() {
 export function padStride(execution, { x, rows, inChannels, label = "x-stride" }) {
   const in4 = inChannels / 4;
   const stride4 = strideFor(in4);
-  const tensor = execution.allocate(rows * stride4 * 4, label);
+  // 🔴 AND THIS IS THE ONE PLACE x CAN BE NARROWED, which is worth 1.31x on its
+  // own and 2.56x beside the tile-aware order - measured by
+  // probe-webgl-linear-operand.js, where x is the stream that binds the
+  // projection and the weight codes cost nothing. `Storage.uploadWeight`'s
+  // comment says why it is only offered for weights - "an activation is written
+  // by a kernel drawing into it, which would need an RGBA16F render target and
+  // the rounding discipline that goes with one" - and this pass IS that kernel:
+  // it already rewrites every element of x, and `linear.int5-decoded` is
+  // already an RGBA16F target this backend draws into, so the render target is
+  // not the obstacle and never was.
+  //
+  // 🔴 IT IS A PRECISION CHANGE AND THE ONLY ONE ON THE ACTIVATION PATH, so it
+  // is OFF in `Execution` and ON in the fold drivers, exactly as `halfWeights`
+  // is: the stage gates hold these kernels to f32 references at bars down to
+  // 1e-7 and an f16 x would re-bar every one of them. It is also what the
+  // PRIMARY path does - webgpu/af2/evoformer/block.js sets `normalizedStorage`
+  // to f16 outright - so this is matching the reference rather than departing
+  // from it.
+  const tensor = execution.halfActivations
+    ? execution.allocateHalf(rows * stride4 * 4, label)
+    : execution.allocate(rows * stride4 * 4, label);
   execution.dispatch({
     source: padStrideSource(inChannels, stride4),
     output: tensor,
     inputs: { xTex: x },
     ints: { ROWS: rows },
-    label: `pad-stride:${rows}x${inChannels}->${stride4 * 4}`,
+    label: `pad-stride:${rows}x${inChannels}->${stride4 * 4}`
+      + `${execution.halfActivations ? ":half" : ""}`,
   });
   return { tensor, stride4 };
 }

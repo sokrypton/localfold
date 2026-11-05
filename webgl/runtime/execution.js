@@ -218,6 +218,9 @@ export class Execution {
      */
     this.noLinearAspect = options.noLinearAspect ?? false;
     this.noLinearTile = options.noLinearTile ?? false;
+    // 🔴 OFF HERE AND ON IN THE FOLD DRIVERS, as `halfWeights` is - see
+    // `padStride`, the only pass it reaches.
+    this.halfActivations = options.halfActivations ?? false;
     this.linearTileWidth = options.linearTileWidth ?? 0;
     /**
      * The blocked projection's rows a fragment, forced - the control arm for

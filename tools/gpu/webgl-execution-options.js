@@ -38,6 +38,26 @@
  *                         a backend-wide default would have to re-bar every one
  *                         of them, which is the work it would take to make this
  *                         the shipped precision rather than the folding one.
+ *   --no-half-x           x at float32 through `padStride`, where a FOLD now
+ *                         narrows it to float16. x is the stream that binds the
+ *                         dense projection - `probe-webgl-linear-operand.js`
+ *                         measures 3.44x between the shipped kernel and one
+ *                         whose x is in cache, against 1.09x for the weight
+ *                         codes - and halving its bytes is **1.31x** on that
+ *                         kernel alone and **2.56x** beside the tile-aware
+ *                         order. It reaches only the shapes `padStride` runs
+ *                         on, which is every one whose row width does not
+ *                         divide the texture width.
+ *
+ *                         🔴 THE SECOND OPTIMISATION HERE THAT IS NOT
+ *                         BIT-IDENTICAL, and like `--no-half-weights` it is a
+ *                         default of the FOLD DRIVERS and not of `Execution`:
+ *                         the stage gates build their own `new Execution(gl)`
+ *                         and hold these kernels to f32 references at bars down
+ *                         to 1e-7. It is also what the PRIMARY path does -
+ *                         webgpu/af2/evoformer/block.js sets
+ *                         `normalizedStorage` to f16 outright - so this is the
+ *                         arm that compares f32 with f32.
  *   --nan-watch           Fill every fresh texture with NaN and read every
  *                         output back, refusing at the first non-finite value.
  *                         Names the kernel that reads a texel nothing wrote -
@@ -89,7 +109,7 @@
  *                         TILEW consecutive row blocks at one output group.
  *                         1.74-1.87x on that shape in
  *                         `probe-webgl-linear-operand.js`, which also measures
- *                         WHY: x binds at 6.5x and the weight codes at 1.0.
+ *                         WHY: x binds at 3.44x and the weight codes at 1.09.
  *                         Bit-identical, so this prices the addressing.
  *   --linear-tile-width=<n>
  *                         That tile width, forced. The resolver takes the
@@ -146,6 +166,7 @@ export function webglExecutionOptions(args) {
   return {
     pooling: flag(args, "pool"),
     halfWeights: !flag(args, "no-half-weights"),
+    halfActivations: !flag(args, "no-half-x"),
     int5Weights: !flag(args, "no-int5-weights"),
     checkErrors: !flag(args, "no-check-errors"),
     noLinearBlock: flag(args, "no-linear-block"),

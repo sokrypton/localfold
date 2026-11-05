@@ -825,7 +825,7 @@ Every fold is the same job, the same seed and the same settings either side; `--
 
 | fold | before | after | |
 |---|---:|---:|---:|
-| bioemu2, 6MRR 68 tokens, 4 passes, 20 steps | 968 s | **28.1 s** | **34.4x** |
+| bioemu2, 6MRR 68 tokens, 4 passes, 20 steps | 968 s | **25.7 s** | **37.7x** |
 | ...its trunk | 277.7 s | **21.6 s** | 12.8x |
 | ...its 20 denoiser calls | 658 s | **23.3 s** | 28.2x |
 | ESMFold2, 75 residues, 36-block tower, 3 loops, 15 steps | 253 s | **65.0 s** | **3.9x** |
@@ -1555,7 +1555,7 @@ same shape runs at **10.63 ms in the fold** as int5 out-major against float in-m
 codes are 0.625 bytes a weight against four, and the layout is the float path's problem. Reading the
 layout table as a 5x waiting to be taken would have been a wasted kernel rewrite.
 
-🔴 **SO WHICH OPERAND BINDS? x, AT 6.4-6.7x, AND THE CODES COST NOTHING AT ALL.**
+🔴 **SO WHICH OPERAND BINDS? x, AT 3.44x, AND THE CODES COST NOTHING AT ALL (1.09x).**
 `probe-webgl-linear-operand.js` is the diagnostic `linear.js` already ran once on the other operand -
 its own comment records "make every chunk read the SAME four code texels and the fold goes 6664 ms to
 3476", which is what chose `orderRowFastest`. The x-side twin had never been run. Three arms, same
@@ -1564,13 +1564,25 @@ fragment addresses:
 
 | arm | ms | GFLOP/s | factor |
 |---|---:|---:|---:|
-| shipped | 19.24 | 96 | - |
-| **x-aliased** (every fragment reads row block 0) | **2.94** | **630** | **6.62x** |
-| w-aliased (every fragment reads output group 0) | 19.24 | 96 | **1.01x** |
+| shipped | 10.06 | 184 | - |
+| **x-aliased** (every fragment reads row block 0) | **2.93** | **632** | **3.44x** |
+| w-aliased (every fragment reads output group 0) | 9.25 | 200 | **1.09x** |
+| **half-x** (x in float16) | **7.68** | **241** | **1.31x** |
+| **tiled-2** (the fragment order below) | **5.13** | **361** | **1.96x** |
+| tiled-4 | 5.73 | 323 | 1.76x |
+| tiled-2 + half-x | 4.16 | 444 | 2.42x |
+| **tiled-4 + half-x** | **3.94** | **470** | **2.56x** |
 
-Over three runs the x factor is **6.41, 6.62, 6.68** and the code factor **1.01, 0.85** - the second
-meaning the aliased arm came out SLOWER, which is what a figure inside the shipped arm's own
-1.22-1.34 spread looks like. The code arm is a null, not a small win.
+🔴 **AND THE FIRST VERSION OF THIS TABLE READ 19.24 / 2.94 / 19.24 ms AND IS RETRACTED, BECAUSE THE
+PROBE LAID x OUT UNPADDED WHERE A FOLD DOES NOT.** 576x896 is 224 texels a row and 224 does not
+divide 2048, so `linear` runs `padStride` over x - the 4.08x recorded further up this file - and
+without it the probe's shipped arm read **18.76 ms where the fold's own profile says 10.63 for the
+same shape**, 1.77x apart. Every lever it found was measured against misaligned x and so overstated:
+x binding read **6.62x and is 3.44x**, `tiled-2` read **1.87x and is 1.96x** (that one went up), and
+the aspect arm `4x8` read 0.84x where it is a **tie at 1.01x**. The probe stride-pads x now and its
+shipped arm lands on the fold's own figure. **A probe that does not reproduce the shipped kernel's own
+addressing prices every mechanism against a kernel nobody dispatches**, and the lesson cost a
+published table.
 
 **`orderRowFastest` finished the weight side.** Every remaining factor in this kernel is on the x
 side, and 630 GFLOP/s is what the arithmetic reaches once x is in cache.
@@ -1582,13 +1594,13 @@ monotonically:
 
 | tile | ms | GFLOP/s | x MB | code MB | factor |
 |---|---:|---:|---:|---:|---:|
-| **8x4** (shipped) | **19.24** | **96** | 882 | 68.9 | **1.00** |
-| 4x8 | 22.95 | 81 | 441 | 137.8 | 0.84 |
-| 2x16 | 27.04 | 68 | 220.5 | 275.6 | 0.71 |
-| 1x32 | 35.73 | 52 | 110.3 | 551.3 | 0.54 |
+| **8x4** (shipped) | **10.06** | **184** | 882 | 68.9 | **1.00** |
+| 4x8 | 9.93 | 186 | 441 | 137.8 | 1.01 |
+| 2x16 | 16.43 | 113 | 220.5 | 275.6 | 0.61 |
+| 1x32 | 33.00 | 56 | 110.3 | 551.3 | 0.30 |
 
-**Halving x's bytes makes the kernel slower**, which is the whole finding: what binds is not x's
-VOLUME but its fetch LOCALITY. Aliasing x does not merely read less - it makes every concurrent
+**Quartering x's bytes makes the kernel 1.6x slower and halving them buys nothing**, which is the
+whole finding: what binds is not x's VOLUME, read once per output group, but its fetch LOCALITY. Aliasing x does not merely read less - it makes every concurrent
 fragment read the SAME eight rows - while a wider output tile keeps the scattered pattern and
 multiplies the decode work and the live accumulators. **The shipped 8x4 is the best aspect of its
 budget, and the traffic model that predicted 1.9x for 2x16 is retracted.** The lever is a fragment
@@ -1619,6 +1631,50 @@ unchanged to the digit: ESMFold2 9497/9671 ms against 9668/9671 at the same pLDD
 0.4147, AF3 2351 ms both ways at pLDDT 66.525, AF2's three recycles 57.938/57.937/57.941 both ways.
 `linear.repack` pays 347 ms of the gain back, reading a plane 2.29x sparser.
 
+### x in float16, the second mechanism on the stream that binds
+
+The arm table above prices it at **1.31x on its own and 2.56x beside the tile order**, and it is the
+same operand from the other end: the tile order makes concurrent fragments read NEARBY x, and this
+makes each of those reads half the bytes. `Storage.uploadWeight`'s comment says why it had never been
+offered for an activation - *"an activation is written by a kernel drawing into it, which would need
+an RGBA16F render target and the rounding discipline that goes with one"* - and `padStride` **is**
+that kernel: it already rewrites every element of x to fix the row stride, and `linear.int5-decoded`
+is already an RGBA16F target this backend draws into, so the render target was never the obstacle.
+
+Measured on the fold, three arms interleaved, two rounds:
+
+| | fold | rmsd | CA-CA | contacts |
+|---|---:|---:|---:|---:|
+| neither | 30.40 / 30.46 s | 1.595 | 3.8540767531771998 | 201 |
+| the tile order | 28.11 / 28.13 s | 1.595 | 3.8540767531771998 | 201 |
+| **and x in float16** | **25.70 / 25.69 s** | **1.595** | 3.853090267294919 | **201** |
+
+**1.18x in all**, bit-identical through the tile order and **0.00099 A of CA-CA** at the float16 step,
+with rmsd and the contact count unmoved. ESMFold2 is **1.029x** (9420 ms against 9693) at pLDDT
+57.573 against 57.579 and pTM 0.4146 against 0.4147. AlphaFold 3 (2367 against 2377 ms, pLDDT 66.525
+and pTM 0.242 both ways) and AlphaFold 2 (57.938 / 57.937 / 57.941 both ways) are unchanged to the
+digit, because neither reaches `padStride` - this pass runs only where a row width does NOT divide the
+texture width, so a shape already aligned gets no narrowing and no rounding.
+
+🔴 **IT IS THE SECOND OPTIMISATION HERE THAT IS NOT BIT-IDENTICAL, AND IT IS A DEFAULT OF THE FOLD
+DRIVERS AND NOT OF `Execution`** - exactly as `halfWeights` is, and for the same reason: the stage
+gates build their own `new Execution(gl)` and hold these kernels to f32 references at bars down to
+1e-7, so a backend-wide default would re-bar every one of them. All **48 check-webgl gates are ok**
+with it in the tree. `--no-half-x` is the arm that compares f32 with f32.
+
+🔴 **AND IT IS WHAT THE PRIMARY PATH ALREADY DOES**, which is the part that makes it a correction
+rather than a trade: `webgpu/af2/evoformer/block.js` sets `normalizedStorage` to f16 outright, asks
+its flash kernel for f16 input and output, and sets the transition's `hiddenStorage` to f16 for every
+width that is a multiple of four - none of it gated by a tuning knob. The PRELUDE in
+`webgl/runtime/execution.js` has said so since it was written. A port keeping f32 at those points
+disagrees with the path it is matching.
+
+🔴 **AND f16 OVERFLOWS AT 65504, SO THE NaN WATCH IS THE ARM THAT SAYS IT IS SAFE.** `--nan-watch`
+fills every fresh texture with NaN and reads every output back, refusing at the first non-finite
+value: the fold is **ok in both arms**, so nothing on this activation path reaches f16's ceiling at
+this shape. Run it on a new model before trusting the default there - a pre-norm activation is the
+one that could.
+
 ### The threshold that chose between two projection kernels was fitted with the wrong dtype
 
 🔴 **`bench-webgl-linear.js` UPLOADED ITS WEIGHTS WITH `upload`, AND EVERY FOLD USES
@@ -1639,6 +1695,7 @@ largest in-major labels in a bioemu2 fold come out on the **one-texel** side:
 |---|---:|---:|---:|
 | **bioemu2**, 20-step 6MRR-68 | 33.0 s | **30.4 s** | **1.08x** |
 | ...and again, on the tile-aware fragment order below | 30.4 s | **28.1 s** | **1.08x** |
+| ...and on x in float16 beside it | 28.1 s | **25.7 s** | **1.09x** |
 | bioemu2's trunk | 13.4 s | **10.7 s** | **1.26x** |
 | **ESMFold2**, full configuration | 11.2 s | **9.53 s** | **1.17x** |
 | AlphaFold 3 | 2.36 s | 2.35 s | 1.00x |
