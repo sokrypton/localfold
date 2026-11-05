@@ -1294,11 +1294,29 @@ chain.
 **1.034e-8**, which is a bar too tight for 75 tokens rather than a defect - but it is green at the
 default 6 and nobody had run it at a fold's shape.
 
-**Still open**, and now narrowed to: the confidence head's score in the composed fold, given that the
-head is correct on its own inputs and the structure it is scoring agrees with the reference's to 1.84
-A. The next step is to feed the WebGL2 head the WGSL fold's own pair, single and coordinates and see
-whether it reproduces 88 - which separates a wrong input from a wrong composition, and is the last
-thing this hunt has not done.
+**And four more of the head's inputs are eliminated, each checked against the WGSL driver's or the
+reference's own code rather than assumed:**
+
+- **the pLDDT bin convention** - both backends call the identical
+  `categoricalMean(logits, atoms, bins, 0, 1)` and both average per-atom over a token weighted by
+  `atomMask`, so the 0-1 scale and the per-token reduction are shared;
+- **the per-slot pLDDT table** - `intraTokenSlots` matches `cpu/esmfold2/confidence.js`'s running
+  count exactly, and `maxAtomsPerToken` is **23** where ubiquitin's largest residue has about
+  eleven atoms, so nothing collides at the cap. (The reference's own comment warns about this: *"Indexing
+  it by the atom's global position instead reads a different residue's weights and still returns a
+  number."*);
+- **the representative atoms** - both drivers call the same `shared/esmfold2/representative-atoms.js`;
+- **the token mask** - the WGSL driver passes an explicit all-ones array where this one passes
+  `features.tokenMask`, which looked like the difference and is not: patched to all ones, the fold
+  returns pLDDT **57.503** and pTM **0.4127**, to the digit. That mask is already all ones for a
+  plain chain.
+
+**Still open**, and now narrowed to one function's inputs: the confidence head's score in the
+composed fold, given that the head is correct on its own inputs, the structure it scores agrees with
+the reference's to 1.84 A, and every input listed above matches. The one step not taken is the
+cross-backend differential - feed the WebGL2 head the WGSL fold's own pair, single and coordinates
+in one page and see whether it reproduces 88. Both backends' modules already load together in these
+gates, so it is a tool rather than a research question, and it is the next thing to build.
 
 ### The threshold that chose between two projection kernels was fitted with the wrong dtype
 
