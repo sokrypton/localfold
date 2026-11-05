@@ -29,8 +29,10 @@
  * compiler fuses a `dot` and a chain of multiply-adds differently.
  */
 import {
-  blockedContractSource, contractRepackSource, splitContractSource,
+  CONTRACT_BLOCK_MAX_PAIR_FLOATS, blockedContractSource, contractRepackSource,
+  splitContractSource,
 } from "../../webgl/af3/trunk/triangle.js";
+
 import { Execution } from "../../webgl/runtime/execution.js";
 import { createWebGL2Context } from "../../webgl/index.js";
 import { relativeRms } from "./relative-rms.js";
@@ -146,6 +148,13 @@ export async function main(device, args) {
       blockedGfetches: Number((blockedFetches / timings.blocked / 1e6).toFixed(2)),
       onePairFlopsPerFetch: Number((flops / oneTexelFetches).toFixed(1)),
       blockedFlopsPerFetch: Number((flops / blockedFetches).toFixed(1)),
+      // 🔴 THE SHIPPED RULE'S OWN VERDICT, so this bench GATES the threshold
+      // rather than only measuring beside it: `blocks` is what the driver would
+      // pick here, and `rulePicksFaster` is whether that was the faster arm.
+      pairFloats: pairs * channels,
+      blocks: pairs * channels <= CONTRACT_BLOCK_MAX_PAIR_FLOATS,
+      rulePicksFaster: (pairs * channels <= CONTRACT_BLOCK_MAX_PAIR_FLOATS)
+        === (timings.blocked <= timings["one-pair"]),
       relRms: Number(relativeRms(answers["one-pair"], answers.blocked).toExponential(2)),
       // The two orders compute the same products in the same order and differ
       // only in which fragment owns which output, so this one is EXACTLY zero.
@@ -155,6 +164,7 @@ export async function main(device, args) {
   }
 
   const worst = Math.max(...rows.map((row) => row.relRms));
+  const misPicked = rows.filter((row) => !row.rulePicksFaster);
   // A fused multiply-add's worth. Never widen it: at 1e-3 the two kernels are
   // summing different products, not the same ones in a different shape.
   const bar = 1e-6;
@@ -166,10 +176,18 @@ export async function main(device, args) {
     rows,
     worstRelRms: Number(worst.toExponential(2)),
     bar,
+    ceiling: CONTRACT_BLOCK_MAX_PAIR_FLOATS,
+    misPicked: misPicked.map((row) =>
+      `${row.length}x${row.channels}: the rule ${row.blocks ? "blocks" : "does not block"} `
+      + `and blocking is ${row.speedup.toFixed(2)}x`),
     verdict: worst > bar
       ? `FAILED: the pair-blocked contraction disagrees with the one-pair one at `
         + `${worst.toExponential(2)}, past ${bar} - that is not a reordering`
-      : `ok: the pair-blocked contraction agrees to ${worst.toExponential(2)} and runs at `
-        + `${rows.map((r) => `${r.blockedGflops} GFLOP/s on ${r.blockedGfetches} G fetches/s`).join(", ")}`,
+      : misPicked.length > 0
+        ? `FAILED: CONTRACT_BLOCK_MAX_PAIR_FLOATS picks the slower kernel at `
+          + `${misPicked.length} of ${rows.length} shapes - see misPicked`
+        : `ok: the two contractions agree to ${worst.toExponential(2)}, the ceiling picks the `
+          + `faster one at all ${rows.length} shapes, and the block runs at `
+          + `${rows.map((r) => `${r.blockedGflops} GFLOP/s`).join(", ")}`,
   };
 }

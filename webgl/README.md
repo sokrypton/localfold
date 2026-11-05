@@ -1092,14 +1092,59 @@ fold 75 and 59 tokens. Those lengths take the one-pair-a-fragment fallback, wher
 and so no order to get wrong. A knob's worth is a property of the configuration, and here the
 configuration is the protein's length.
 
-🔴 **AND THE SAME BENCH SAYS THE BLOCK ITSELF IS NOT UNCONDITIONALLY RIGHT, WHICH IS NOT RESOLVED.**
-Swept over length at 256 channels, the blocked kernel is 4.09x the one-pair one at 68 and **0.26x at
-128** - and the order's own worth inverts there too (0.57x), which fits the cache argument above,
-since one channel's operands are 131 KiB at 128 tokens. But the sweep does not repeat cleanly past
-68 (the one-pair arm reads 21.4 GFLOP/s at 128 and 4.7 at 160, and the outputs alone are 26 to 41
-MiB a ring entry), so no threshold is fitted to it here. `contractStrided` enables the block on
-`L % 4 === 0` and eight draw buffers with **no length ceiling**, and whether it wants one is the
-open question this bench was built to answer next.
+🔴 **AND THE BLOCK HAD NO CEILING AND WAS THE WRONG KERNEL ABOVE ONE, BY UP TO 4.8x - NOW CLOSED.**
+Swept over a grid of length and channels with the two kernels' answers identical, the blocked
+kernel's time over the one-pair kernel's (under one means the block LOSES):
+
+| `L * L * channels` | 296K | 590K | 592K | 1.05M | 1.18M | 2.10M | 2.36M | 4.19M |
+|---|---|---|---|---|---|---|---|---|
+| blocked / one-pair | 5.10 | 1.71 | 4.62 | 1.12 | 3.95 | **0.38** | **0.59** | **0.21** |
+
+Nine points over three lengths and three channel widths, and **`L * L * channels` separates them
+completely**: every one at or below 1,183,744 wins and every one at or above 2,097,152 loses, with
+no overlap either way - so the threshold is that ONE quantity and not a pair of them, and
+`CONTRACT_BLOCK_MAX_PAIR_FLOATS` is set between the two where nothing is measured. The mechanism is
+the REPACK ROUND TRIP, which is why it is the tensor and not the length: the block's saving is
+fetches, and its cost is writing `L * L * channels` floats across eight planes and reading all of
+them back to interleave, which is proportional to the tensor where the saving is not.
+
+**bioemu2 at 68 tokens and 256 channels is 1,183,744** - the largest measured win and the top of the
+range - so this costs that fold nothing and is worth **1.18x on a 128-token AF3 fold** (4764 / 4767
+ms against 5612 / 5655, pLDDT identical at 70.559). AF3's 128-channel pair track crosses at 128
+tokens and bioemu2's 256-channel one at about 86, so it is every input above those.
+`--no-contract-ceiling` is the control arm, and `bench-webgl-contract.js` GATES the threshold rather
+than only measuring beside it: it reports what the shipped rule would pick at each shape and FAILS
+when that is not the faster arm.
+
+🔴 **AND FOUR HYPOTHESES FOR THE CONTRACTION'S REMAINING 20x ARE MEASURED AND DEAD**, which is worth
+more than another guess. It sits at 7.6 GFLOP/s in a fold and about 1 G fetches a second against the
+projection's 6.8, on only 2x less arithmetic a fetch, and it is **not**:
+
+- **short of fragments** - GFLOP/s FALLS as the channel count rises, 11.7 at 64 channels to 6.5 at
+  512, where more channels is strictly more fragments;
+- **short of memory-level parallelism** - fusing the four channel blocks into one k loop, which
+  quadruples the fetches in flight per thread for the same fetches in total, is **1.25x WORSE** (16.07
+  ms at one loop apiece, 17.95 fused in pairs, 20.07 fused in fours), so the register pressure costs
+  more than the latency it hides;
+- **row alignment** - and this is the sharpest of the four, because it needed no padding code to
+  test: pick a length whose row is ALREADY a power of two. L=64 is 16 texels and runs at **8.9
+  GFLOP/s**, the slowest of the sweep, where L=68 at 17 texels runs at 12.1. The aligned lengths are
+  the slow ones, which is independently why the padded stride above lost;
+- **bandwidth** - after the fragment order fix one channel's 37 KiB is resident, and the operands are
+  9.4 MiB read against 242 MB before.
+
+What is left is the 2x in arithmetic intensity, and the pair block cannot be widened past 32 output
+floats while a vec4 holds four CHANNELS: four channels times eight pairs is already the budget, and
+a tile of four i by eight j reaches the projection's 21.3 flops a fetch only by making the output
+vec4 hold four j instead, which costs the repack four reads per output texel. That trade is
+unmeasured and is the next thing to try.
+
+🔴 **AND ONE RUN IS NOT A MEASUREMENT, ON A MACHINE SOMEBODY ELSE IS ALSO USING.** The first
+128-token AF3 pair read **199191 ms against 5557** - the ceiling arm 36x SLOWER, the opposite of
+every bench point - and at one trunk block the two arms were 11149 and 11768. Repeated, they are
+4764 / 4767 against 5612 / 5655 and the ceiling wins. The tell was that the numbers did not compose:
+a one-block fold cannot be slower than a four-block one. Nothing was changed to fix it, because
+there was nothing wrong.
 
 ### How close can this get, and why not closer
 

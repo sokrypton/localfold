@@ -359,6 +359,40 @@ ${[0, 1, 2, 3].map(channelBlock).join("\n")}
 };
 
 /**
+ * The largest pair tensor, in FLOATS, for which the pair block beats the
+ * one-pair-a-fragment kernel.
+ *
+ * 🔴 THE BLOCK HAD NO CEILING AND IS THE WRONG KERNEL ABOVE ONE, by up to 4.8x.
+ * `tools/gpu/bench-webgl-contract.js` over a grid of length and channels, with
+ * the two kernels' answers identical, gives the blocked kernel's time divided
+ * by the one-pair kernel's - under one means the block LOSES:
+ *
+ * | `L * L * channels` | 296K | 590K | 592K | 1.05M | 1.18M | 2.10M | 2.36M | 4.19M |
+ * |---|---|---|---|---|---|---|---|---|
+ * | blocked / one-pair | 5.10 | 1.71 | 4.62 | 1.12 | 3.95 | **0.38** | **0.59** | **0.21** |
+ *
+ * Nine points over three lengths and three channel widths, and `L * L *
+ * channels` SEPARATES THEM COMPLETELY: every one at or below 1,183,744 wins and
+ * every one at or above 2,097,152 loses, with no overlap on either side. So the
+ * threshold is the one quantity and not a pair of them, and it is set between
+ * the two, where nothing is measured.
+ *
+ * 🔴 AND THE MECHANISM IS THE REPACK ROUND TRIP, WHICH IS WHY IT IS THE TENSOR
+ * AND NOT THE LENGTH. The block's saving is fetches - 10.7 flops a fetch where
+ * the one-pair kernel asks for the same texel four times - and its cost is that
+ * it writes `L * L * channels` floats across eight planes and then reads all of
+ * them back to interleave. That cost is proportional to the tensor while the
+ * saving is not, so a big enough pair track spends more on the round trip than
+ * the fetches were worth.
+ *
+ * bioemu2 at 68 tokens and 256 channels is **1,183,744** - the largest
+ * measured win, and the top of the range - so this costs that fold nothing and
+ * is worth 1.7x to 2.6x on the lengths above it. AF3's 128-channel pair track
+ * crosses at 128 tokens and bioemu2's 256-channel one at about 86.
+ */
+export const CONTRACT_BLOCK_MAX_PAIR_FLOATS = 1572864;
+
+/**
  * The eight pair planes back into `[pair][channel]`.
  *
  * Plane `(i & 1) * 4 + (j & 3)` holds the pair at
@@ -438,7 +472,9 @@ function contractInto(execution, output, a, b, length, channels, divideByLength,
   // eight render targets; `MAX_DRAW_BUFFERS` is at least four everywhere, so
   // the one-pair kernel stays for a context that has only four.
   const blocked = length % 4 === 0 && execution.maxDrawBuffers >= 8
-    && !execution.noContractBlock;
+    && !execution.noContractBlock
+    && (execution.noContractCeiling
+      || length * length * channels <= CONTRACT_BLOCK_MAX_PAIR_FLOATS);
   if (!blocked) {
     execution.dispatch({
       source: splitContractSource(length, channels, direction === "incoming" ? "incoming" : "outgoing",

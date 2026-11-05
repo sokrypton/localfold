@@ -191,20 +191,11 @@ export class Execution {
      */
     this.noContractChannelSlowest = options.noContractChannelSlowest ?? false;
     /**
-     * The control arm for the pair-blocked contraction's fragment order
-     * (`webgl/af3/trunk/triangle.js`): the CHANNEL group varying fastest, as it
-     * did, rather than the pair block.
-     *
-     * 🔴 THE SAME PROPERTY `ROW_FASTEST_X_FLOATS` NAMES IN THE PROJECTION, in
-     * the kernel where it is worth more. A contraction is 256 INDEPENDENT
-     * matmuls, one a channel, and one channel's operands at 68 tokens are
-     * 2 * 68 * 68 * 4 = 37 KiB - small enough to stay in cache for the whole
-     * 68x68x68 product. With the channel varying fastest, neighbouring
-     * fragments work on DIFFERENT channels, so 64 channel groups are in flight
-     * together and none of their planes stays; with it varying slowest they
-     * share one. Measured 1.49x at 68 tokens, bit-identical.
+     * The control arm for the pair block's SIZE CEILING
+     * (`CONTRACT_BLOCK_MAX_PAIR_FLOATS`): block at every pair tensor size, as
+     * it did, which is up to 4.8x the wrong kernel above the ceiling.
      */
-    this.noContractChannelSlowest = options.noContractChannelSlowest ?? false;
+    this.noContractCeiling = options.noContractCeiling ?? false;
     /**
      * Where the HOST time inside `dispatch` goes, when asked for.
      *
