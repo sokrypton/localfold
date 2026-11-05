@@ -221,6 +221,10 @@ export class Execution {
     // 🔴 OFF HERE AND ON IN THE FOLD DRIVERS, as `halfWeights` is - see
     // `padStride`, the only pass it reaches.
     this.halfActivations = options.halfActivations ?? false;
+    // Narrow x on shapes whose row stride ALREADY divides the texture width,
+    // where `padStride` would not otherwise run. A per-model trade - see
+    // `linear`'s note and `webglExecutionOptions`.
+    this.narrowAlignedX = options.narrowAlignedX ?? false;
     this.linearTileWidth = options.linearTileWidth ?? 0;
     /**
      * The blocked projection's rows a fragment, forced - the control arm for

@@ -712,7 +712,26 @@ export function linear(execution, call, into) {
       : 0;
     const tileHeight = tileWidth > 0 ? Math.ceil(rowQuads / tileWidth) : 0;
     const padX = !execution.noStridePad && !strideDividesWidth(inChannels / 4);
-    const padded = padX
+    // 🔴 AND THE PASS RUNS FOR THE NARROWING ALONE, NOT ONLY FOR THE STRIDE -
+    // BUT ONLY WHERE A DRIVER ASKS, BECAUSE IT IS A PER-MODEL TRADE AND THE
+    // MEASUREMENT SAYS SO. Beyond `padStride`'s own shapes it is worth 1.18x on
+    // a bioemu2 fold (26.55 s to 22.45) and 1.10x on ESMFold2 (9672 ms to
+    // 8785), and on the other two it is a LOSS: AlphaFold 3 is 1.04x SLOWER
+    // (2460-2487 ms against 2365-2393) with its pLDDT moved, and AlphaFold 2
+    // gains no time at all while its worst atom against the WGSL fold goes
+    // **0.0353 A to 0.0904** - reproducible to the digit over two rounds, and
+    // past the 0.0355 A dither floor this tree measured, so a real loss of
+    // agreement rather than noise. `narrowAlignedX` is therefore a default of
+    // the two drivers it pays for; see `webglExecutionOptions`.
+    // `strideFor` returns the row width unchanged when it already divides the
+    // texture width, so on such a shape this pass is a pure copy - and with
+    // `halfActivations` a pure NARROW. Without it the shapes that were already
+    // aligned got no float16 x at all, which is most of what the projection
+    // still costs: `linear.block:4624x1024x256` reads 1024/4 = 256 texels a
+    // row, 2048 divides it, so it ran at 129 GFLOP/s on an f32 x it re-reads
+    // once per output group - 64 times 18.9 MiB. One pass over x against that.
+    const narrowX = execution.halfActivations && execution.narrowAlignedX && !padX;
+    const padded = (padX || narrowX)
       ? padStride(execution, { x, rows, inChannels, label: "linear.x-stride" })
       : null;
     const xUse = padded?.tensor ?? x;
@@ -763,15 +782,30 @@ export function linear(execution, call, into) {
       `linear: an int5 weight only has the blocked path, and ${rows}x${inChannels}x`
       + `${outChannels} does not take it (blockedApplies says no)`);
   }
-  return execution.dispatch({
+  // 🔴 AND THE UNBLOCKED PATH NARROWS x TOO, WHERE IT CAN DO SO WITHOUT MOVING
+  // IT. `linearSource` takes no stride, so this pass may only run where the row
+  // width already divides the texture width and `strideFor` returns it
+  // unchanged - which is exactly where the unblocked path's cost is:
+  // `linear:4624x256x512` is 64 texels a row, the largest single row of a
+  // bioemu2 fold at 4752 ms and 212 GFLOP/s, and it re-reads an f32 x once per
+  // output group. A shape that is NOT aligned here keeps its f32 x rather than
+  // getting a silent re-layout the kernel cannot address.
+  const narrowUnblocked = execution.halfActivations && execution.narrowAlignedX
+    && strideDividesWidth(inChannels / 4);
+  const narrowed = narrowUnblocked
+    ? padStride(execution, { x, rows, inChannels, label: "linear.x-narrow" })
+    : null;
+  const result = execution.dispatch({
     source: linearSource(
       rows, inChannels, outChannels, activation, bias !== undefined, weightLayout, roundHalf),
     output,
     inputs: bias === undefined
-      ? { xTex: x, weightTex: weightTensor }
-      : { xTex: x, weightTex: weightTensor, biasTex: bias },
+      ? { xTex: narrowed?.tensor ?? x, weightTex: weightTensor }
+      : { xTex: narrowed?.tensor ?? x, weightTex: weightTensor, biasTex: bias },
     optionalInts: shapeInts(rows, inChannels, outChannels),
     label: `linear:${rows}x${inChannels}x${outChannels}:${activation}:${weightLayout}`
-      + `${roundHalf ? ":half" : ""}`,
+      + `${roundHalf ? ":half" : ""}${narrowUnblocked ? ":half-x" : ""}`,
   });
+  if (narrowed !== null) execution.release(narrowed.tensor);
+  return result;
 }

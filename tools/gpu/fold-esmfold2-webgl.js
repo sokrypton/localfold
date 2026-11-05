@@ -172,7 +172,13 @@ export async function main(device, args) {
   const features = featuriseForEsmfold2(sequence);
 
   const gl = createWebGL2Context();
-  const execution = webglExecution(gl, args ?? []);
+  // 🔴 `narrowAlignedX` IS ON FOR THIS MODEL AND OFF FOR AlphaFold 2 AND 3,
+  // WHICH IS A MEASUREMENT AND NOT A PREFERENCE. Narrowing x on shapes whose
+  // stride already divides the texture width is **1.10x (9672 ms to 8785)** here, and on
+  // AlphaFold 2 it is no faster at all while the worst atom against the WGSL
+  // fold goes 0.0353 A to 0.0904 - past that comparison's own 0.0355 A dither
+  // floor. `--no-narrow-aligned-x` is the arm.
+  const execution = webglExecution(gl, args ?? [], { narrowAlignedX: true });
   const held = [];
   const upload = (values, label) => {
     const tensor = execution.upload(Float32Array.from(values), label);

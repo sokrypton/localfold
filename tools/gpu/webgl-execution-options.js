@@ -58,6 +58,22 @@
  *                         webgpu/af2/evoformer/block.js sets
  *                         `normalizedStorage` to f16 outright - so this is the
  *                         arm that compares f32 with f32.
+ *   --no-narrow-aligned-x / --narrow-aligned-x
+ *                         Whether x is narrowed to float16 on shapes whose row
+ *                         stride ALREADY divides the texture width, where
+ *                         `padStride` would not otherwise run - a pass whose
+ *                         only purpose is the narrowing.
+ *
+ *                         🔴 IT IS A DEFAULT OF THE TWO DRIVERS IT PAYS FOR AND
+ *                         NOT OF THE BACKEND, WHICH IS A MEASUREMENT.
+ *                         bioemu2 **1.18x** (26.55 s to 22.45) and ESMFold2
+ *                         **1.10x** (9672 ms to 8785); AlphaFold 3 **1.04x
+ *                         SLOWER** (2460-2487 against 2365-2393 ms) with its
+ *                         pLDDT moved, and AlphaFold 2 no faster at all while
+ *                         its worst atom against the WGSL fold goes **0.0353 A
+ *                         to 0.0904** - reproducible to the digit over two
+ *                         rounds, and past the 0.0355 A dither floor, so a real
+ *                         loss of agreement. Either flag overrides the driver.
  *   --nan-watch           Fill every fresh texture with NaN and read every
  *                         output back, refusing at the first non-finite value.
  *                         Names the kernel that reads a texel nothing wrote -
@@ -160,13 +176,17 @@ const option = (args, name, fallback) => {
 };
 
 /** @param {string[]} args */
-export function webglExecutionOptions(args) {
+export function webglExecutionOptions(args, defaults = {}) {
   const pattern = (name) => (option(args, name, null) === null
     ? null : new RegExp(option(args, name, "")));
   return {
     pooling: flag(args, "pool"),
     halfWeights: !flag(args, "no-half-weights"),
     halfActivations: !flag(args, "no-half-x"),
+    // 🔴 A DRIVER DEFAULT, BECAUSE THE MEASUREMENT DIFFERS BY MODEL. See
+    // `--no-narrow-aligned-x` below; a driver opts in and either flag wins.
+    narrowAlignedX: flag(args, "narrow-aligned-x")
+      || ((defaults.narrowAlignedX ?? false) && !flag(args, "no-narrow-aligned-x")),
     int5Weights: !flag(args, "no-int5-weights"),
     checkErrors: !flag(args, "no-check-errors"),
     noLinearBlock: flag(args, "no-linear-block"),
@@ -202,8 +222,8 @@ export function webglExecutionOptions(args) {
  * @param {WebGL2RenderingContext} gl
  * @param {string[]} args
  */
-export function webglExecution(gl, args) {
-  return new Execution(gl, webglExecutionOptions(args));
+export function webglExecution(gl, args, defaults = {}) {
+  return new Execution(gl, webglExecutionOptions(args, defaults));
 }
 
 /** The profile table a `--profile` run produced, or null. */

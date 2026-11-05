@@ -825,7 +825,7 @@ Every fold is the same job, the same seed and the same settings either side; `--
 
 | fold | before | after | |
 |---|---:|---:|---:|
-| bioemu2, 6MRR 68 tokens, 4 passes, 20 steps | 968 s | **23.8 s** | **40.7x** |
+| bioemu2, 6MRR 68 tokens, 4 passes, 20 steps | 968 s | **22.5 s** | **43.0x** |
 | ...its trunk | 277.7 s | **21.6 s** | 12.8x |
 | ...its 20 denoiser calls | 658 s | **23.3 s** | 28.2x |
 | ESMFold2, 75 residues, 36-block tower, 3 loops, 15 steps | 253 s | **65.0 s** | **3.9x** |
@@ -1690,6 +1690,47 @@ fills every fresh texture with NaN and reads every output back, refusing at the 
 value: the fold is **ok in both arms**, so nothing on this activation path reaches f16's ceiling at
 this shape. Run it on a new model before trusting the default there - a pre-norm activation is the
 one that could.
+
+### Narrowing x where nothing had to move it, and why two models decline it
+
+`padStride` runs only where a row width does NOT divide the texture width, so every already-aligned
+shape kept an f32 x - and after the three changes above those were most of what the projection still
+cost. Re-profiled: `linear:4624x256x512` at **4752 ms and 212 GFLOP/s** (the largest single row, and
+the unblocked path, which had no such pass at all) and `linear.block:4624x1024x256` at **3897 ms and
+129 GFLOP/s**, both reading 256 or 64 texels a row that 2048 divides exactly. `strideFor` returns a
+row width unchanged when it already divides, so on such a shape `padStride` is a pure copy - and with
+`halfActivations`, a pure NARROW. Two conditions widened, and the unblocked path given the pass:
+
+| | fold | against |
+|---|---:|---:|
+| **bioemu2** | **22.45 / 22.46 s** | 26.55 s | **1.18x** |
+| **ESMFold2** | **8.79 s** | 9.53 s | **1.10x** |
+| AlphaFold 3 | 2460-2487 ms | 2365-2393 | **0.96x** |
+| AlphaFold 2 | no change | - | **1.00x** |
+
+🔴 **AND THE LAST TWO ROWS ARE WHY IT IS A DRIVER DEFAULT AND NOT A BACKEND ONE.** AlphaFold 3 is
+**1.04x SLOWER** with its pLDDT moved 66.533 against 66.525, and AlphaFold 2 gains no time at all
+while **its worst atom against the WGSL fold goes 0.0353 A to 0.0904** - reproducible to the digit
+over two rounds, and past the **0.0355 A dither floor** that comparison measures for itself, so a
+real loss of agreement rather than noise. AF2's cross-backend differential is the one quality number
+this backend has that is not its own reference, and spending it for no speed would be the worst trade
+available.
+
+So `narrowAlignedX` is a default of the two drivers it pays for. `webglExecution` takes driver
+defaults now, `--narrow-aligned-x` and `--no-narrow-aligned-x` override either way, and with the
+split in place AF2 reads **0.0353 / 0.0308 / 0.0285 A** and AF3 **2365 ms at pLDDT 66.525** - both
+exactly their figures before any of this. All 48 check-webgl gates are ok.
+
+**This session's four projection changes, end to end:**
+
+| | before | after | |
+|---|---:|---:|---:|
+| **bioemu2**, 20-step 6MRR-68 | 30.40 s | **22.45 s** | **1.354x** |
+| **ESMFold2**, full configuration | 9.70 s | **8.79 s** | **1.103x** |
+| AlphaFold 3 | 2.37 s | 2.37 s | 1.00x |
+| AlphaFold 2 | unchanged, 0.0353 A | - | 1.00x |
+
+rmsd 1.595 and 201 contacts on every bioemu2 arm; the device peak 416 MiB to 411.
 
 ### The threshold that chose between two projection kernels was fitted with the wrong dtype
 
