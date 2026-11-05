@@ -974,6 +974,38 @@ narrow-row experiment above measured a 3.8x LOSS and was read as closing the que
 narrowing `W` makes MORE rows wrap, not fewer. The condition was never the width's size, and that
 negative result had the answer in it.
 
+🔴 **AND THE CONTRACTION WALKS A ROW TOO AND DOES NOT WANT IT - MEASURED, AND DECLINED.** AF3's
+triangle contraction reads operands laid `[c][i][j]` with j contiguous, so at 68 tokens a row is
+**17 texels**, which is exactly the condition above and does not divide 2048. Padding both operands
+to 32 texels (a pad pass each, the transposed incoming direction absorbing it into its own pass) is
+a **LOSS at both scales**, on the bioemu2 trunk at 68 tokens with the fold bit-identical in every
+arm:
+
+| mixer blocks | padded | at its own stride |
+|---|---:|---:|
+| 4 | 3090 / 3074 ms | **2978 / 3004 ms** |
+| 48 | 21918 / 21896 ms | **21511 / 21580 ms** |
+
+**So the condition is necessary and not sufficient, and the difference is HOW MANY STREAMS walk the
+rows.** The projection's blocked kernel walks twelve rows at once and they evict each other, which
+is what made a wrap catastrophic there. The contraction's fragment walks its six rows (two `a` and
+four `b`) ALONG k, contiguously, so a wrapped row costs one miss when the row is entered rather than
+one per fetch - and against that, padding 17 texels to 32 is **1.88x the operand bytes** plus two
+passes over 4.7 MiB. The 4.08x and this 0.98x are the same addressing property read at two
+arithmetic intensities.
+
+🔴 **AND THE CHECKER WAS GREEN ON THREE KERNELS IT HAD NEVER RUN, WHICH IS THE REAL FINDING HERE.**
+`check-webgl-af3-triangle.js` swept lengths **5 and 11** - chosen for the odd-width bug that the
+WGSL triangle once had - and the WebGL2 contraction selects its kernel on `L % 4 === 0`: the
+pair-blocked one, the coalesced `fetch4` along k, and the transposed incoming path are all
+unreachable at an odd length, so twenty-four green arms had only ever exercised the
+one-float-at-a-time fallback. The padding above is what exposed it, by reddening 12 and 68 at relRMS
+1.4 while 5, 11, 16 and 32 stayed green - **a gate that passes at every length the gate drives and
+fails at every length a fold uses**. The default is `5,11,12,68` now and the shipped kernels are
+green at all four and under all five control arms. The lesson is the one this tree keeps relearning
+in a new place: a gate whose inputs cannot reach the code path is not a gate, and here the
+unreachability was arithmetic rather than a flag.
+
 ### Which operand streams, which stays in cache - and three wrong guesses first
 
 The int5 projection sat at **26 ms a call where its traffic model said 12 and its fetch model said

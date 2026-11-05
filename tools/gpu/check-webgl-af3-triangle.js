@@ -31,6 +31,20 @@
  * protein and a kernel that is right at one length can be wrong at another -
  * which is how the WGSL triangle's odd-width bug was found, by a sweep rather
  * than by a fold.
+ *
+ * 🔴 AND THE LENGTHS ARE CHOSEN SO THAT EVERY PATH RUNS, WHICH 5 AND 11 ALONE
+ * DID NOT DO. The WebGL2 contraction picks its kernel by the length: the
+ * pair-BLOCKED one (two i and four j into eight render targets) and the
+ * coalesced `fetch4` along k both need `L % 4 === 0`, and the transposed
+ * incoming path needs it too. At 5 and 11 not one of the three is reachable, so
+ * every arm this checker ran took the general one-float-at-a-time loop - the
+ * fallback for an odd width - and the three kernels a fold actually uses were
+ * gated by nothing.
+ *
+ * It was caught by a change that reddened 12 and 68 while 5, 11, 16 and 32 all
+ * stayed green, which is the wrong way round to find it. So: 5 and 11 for the
+ * odd tails, 12 and 68 for the block and the coalesced reads, and 68 because it
+ * is the width the trunk folds.
  */
 import { triangleMultiplication as cpuTriangle } from "../../cpu/af3/trunk/pairformer.js";
 import { af3TriangleWeights } from "../../webgpu/af3/trunk/triangle.js";
@@ -56,7 +70,7 @@ export async function main(device, args) {
   const bar = Number(option(args, "bar", "5e-6"));
   const channels = Number(option(args, "channels", "32"));
   const divideByLength = flag(args, "over-length");
-  const lengths = option(args, "lengths", "5,11").split(",").map(Number);
+  const lengths = option(args, "lengths", "5,11,12,68").split(",").map(Number);
 
   const random = generator(27182);
   const noise = (count, spread, centre = 0) => {
