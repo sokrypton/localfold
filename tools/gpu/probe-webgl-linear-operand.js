@@ -73,7 +73,18 @@
  * Declined. **The binding constraint is how many fragments share an operand,
  * and at 256 outputs no fragment order can raise that above 64** - the only
  * remedy is more output channels per fragment, which the 32-float budget
- * forbids and the aspect sweep above measured as a loss. So `orderRowFastest` finished the weight side and
+ * forbids and the aspect sweep above measured as a loss.
+ *
+ * 🔴 AND `--float-tiles=` RULES THE ORDERING SPACE OUT FOR THAT SHAPE
+ * OUTRIGHT, which the fold-level 0.92x could not, since it bundled every float
+ * shape with a forced `rowFastest`. On 4624x1024x256 alone: **tiled-4 24.58 ms
+ * against the shipped 23.14** and tiled-8, 16 and 32 at **58.5-62.1 ms**, which
+ * is 0.37-0.40x. `tiled-32` wastes the SAME 1920 fragments the shipped arm
+ * does, so it is not the padding - the mapping itself is worse here. The tile
+ * order is worth 1.96x where the sharer count is high (bioemu2's 1792-output
+ * projections) and a loss where it is low, and nothing in between helps. So for
+ * this shape the measured options are exhausted: x binds at 5.9x, making it
+ * resident reaches 620 GF/s, and no ordering, tiling or k split gets there. So `orderRowFastest` finished the weight side and
  * every remaining factor in this kernel is on the x side.
  *
  * 🔴 AND THE OBVIOUS CONCLUSION FROM THAT IS WRONG, WHICH IS WHY THE ASPECT
@@ -169,7 +180,7 @@ const compile = (gl, kind, source) => {
  * which is this probe's own retracted mistake in another form.
  */
 const floatShader = (inChannels, outChannels, rowsPerFragment, outsPerFragment,
-  rowBlocks, arm, xStride4, kSplits = 1) => {
+  rowBlocks, arm, xStride4, kSplits = 1, tileWidth = 0) => {
   const R = rowsPerFragment;
   const C = outsPerFragment;
   const quads = C / 4;
@@ -204,9 +215,22 @@ void main() {
   int split = texel / (RQ * OUT4);
   int within = texel - split * (RQ * OUT4);
   split = split % SPLITS;
-  // Group fastest, as the float blocked path ships past the rowFastest cap.
+${tileWidth > 0
+    ? `  // Tile-aware: a TILEW-wide run covers TILEW consecutive row blocks at
+  // ONE output group, so a 2D rasterisation tile sees few x blocks instead of
+  // one per texel row it spans.
+  const int TILEW = ${tileWidth};
+  int lane = within % TILEW;
+  int group = (within % W) / TILEW;
+  int q = (within / W) * TILEW + lane;
+  if (q >= RQ || group >= OUT4) {
+${Array.from({ length: rowsPerFragment * (outsPerFragment / 4) }, (_, i) =>
+      `    result${i} = vec4(0.0);`).join("\n")}
+    return;
+  }`
+    : `  // Group fastest, as the float blocked path ships past the rowFastest cap.
   int q = within / OUT4;
-  int group = within - q * OUT4;
+  int group = within - q * OUT4;`}
   int kStart = split * KCHUNK;
   ${arm === "w-aliased" ? "group = 0;" : "group = group % OUT4;"}
   ${arm === "x-aliased" ? "q = 0;" : "q = q % RQ;"}
@@ -485,13 +509,17 @@ export async function main(device, args) {
     const weightHalf = halfTexture(fill(inChannels * outChannels, 23));
     const splitArms = (option(args, "k-splits", "1,2,4,8") || "1")
       .split(",").map(Number).filter((n) => n >= 1 && inChannels % n === 0);
-    for (const spec of [...["shipped", "x-aliased", "w-aliased"].map((a) => [a, 1]),
-      ...splitArms.filter((n) => n > 1).map((n) => [`k-split-${n}`, n])]) {
-      const [arm, kSplits] = spec;
+    const floatTiles = (option(args, "float-tiles", "4,8,16,32") || "")
+      .split(",").map(Number).filter((t) => t >= 2 && Math.floor(W / t) >= outChannels / C);
+    for (const spec of [...["shipped", "x-aliased", "w-aliased"].map((a) => [a, 1, 0]),
+      ...splitArms.filter((n) => n > 1).map((n) => [`k-split-${n}`, n, 0]),
+      ...floatTiles.map((t) => [`tiled-${t}`, 1, t])]) {
+      const [arm, kSplits, floatTile] = spec;
       const program = gl.createProgram();
       gl.attachShader(program, compile(gl, gl.VERTEX_SHADER, VERTEX_SHADER));
       gl.attachShader(program, compile(gl, gl.FRAGMENT_SHADER,
-        floatShader(inChannels, outChannels, R, C, rowBlocks, arm, xStride4, kSplits)));
+        floatShader(inChannels, outChannels, R, C, rowBlocks, arm, xStride4,
+          kSplits, floatTile)));
       gl.linkProgram(program);
       if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
         throw new Error(`link float ${arm}: ${gl.getProgramInfoLog(program)}`);
@@ -510,7 +538,9 @@ export async function main(device, args) {
       gl.bindTexture(gl.TEXTURE_2D, weightHalf);
       gl.uniform1i(gl.getUniformLocation(program, "weightTex"), 1);
       const useful = rowBlocks * (outChannels / C) * kSplits;
-      const height = Math.ceil(useful / W);
+      const height = floatTile > 0
+        ? Math.ceil(rowBlocks / floatTile) * kSplits
+        : Math.ceil(useful / W);
       if (height > gl.getParameter(gl.MAX_TEXTURE_SIZE)) {
         refusals.push(`${arm}: ${height} texel rows is past MAX_TEXTURE_SIZE`);
         continue;

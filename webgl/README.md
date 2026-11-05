@@ -1784,10 +1784,20 @@ cuts the per-fragment x block to the fast shape's size: at four splits it is 4 K
 fragments sharing it, which is still 64 - and it would still owe a reduce pass over four sets of
 partials. Declined, and it is the second time split-K has been measured and rejected here.
 
+🔴 **AND THE TILE ORDER ON THAT SHAPE ALONE IS 0.94x AT BEST AND 0.37x AT WORST**, which the
+fold-level 0.92x could not establish because it bundled every float shape with a forced `rowFastest`.
+Probed on `4624x1024x256` by itself: **tiled-4 24.58 ms against the shipped 23.14**, and tiled-8, 16
+and 32 at **58.5-62.1 ms**. `tiled-32` wastes the same 1920 fragments the shipped arm does, so it is
+not the padding - the mapping itself is worse here. **The tile order is worth 1.96x where the sharer
+count is high and a loss where it is low, with nothing in between.**
+
 **So the binding constraint on this kernel is how many fragments share an operand, and at 256 outputs
 no fragment order can raise that above 64.** The only remedy is more output channels per fragment,
-which `MAX_DRAW_BUFFERS * 4` forbids and the aspect sweep measured as a loss. That is the clearest
-statement this backend has of where its remaining gap lives.
+which `MAX_DRAW_BUFFERS * 4` forbids and the aspect sweep measured as a loss. For this shape the
+measured options are exhausted: x binds at 5.9x, making it resident reaches 620 GF/s, and no
+ordering, tiling or k split gets there. That is the clearest statement this backend has of where its
+remaining gap lives - and it is the one thing a fragment shader cannot express, since sharing an
+operand across fragments is what workgroup memory is for and WebGL2 has none.
 
 **This session's four projection changes, end to end:**
 
