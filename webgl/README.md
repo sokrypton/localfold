@@ -1350,12 +1350,45 @@ reference's own code rather than assumed:**
   returns pLDDT **57.503** and pTM **0.4127**, to the digit. That mask is already all ones for a
   plain chain.
 
-**Still open**, and now narrowed to one function's inputs: the confidence head's score in the
-composed fold, given that the head is correct on its own inputs, the structure it scores agrees with
-the reference's to 1.84 A, and every input listed above matches. The one step not taken is the
-cross-backend differential - feed the WebGL2 head the WGSL fold's own pair, single and coordinates
-in one page and see whether it reproduces 88. Both backends' modules already load together in these
-gates, so it is a tool rather than a research question, and it is the next thing to build.
+🔴 **AND pLDDT IS NOT A FUNCTION OF THE STRUCTURE IN THIS MODEL, WHICH IS WHAT FINALLY LOCALISED
+IT.** The WGSL fold at `diffusion-8` produces a **collapsed chain** - median CA-CA **52.3 A** - and
+scores it **pLDDT 84.47**, three and a half points below its good fold's 88.08. So the head is
+reading the PAIR, almost not the coordinates, and the thirty points cannot be a structural
+difference. Which agrees with the superposition: the structures were never the problem.
+
+🔴 **SO THE PAIR BIAS WAS TESTED DIRECTLY, AND PASSING IT MAKES THE FOLD WORSE.** Zeroing the
+`pairBias` this driver hands the confidence head:
+
+| | mean pLDDT | pTM |
+|---|---:|---:|
+| with the relative encoding as `pairBias` | 57.50 | 0.4127 |
+| **with it zeroed** | **59.42** | **0.5167** |
+
+`webgpu/esmfold2/fold.js` measures the CORRECT bias as worth **+13.8 pLDDT** ("Measured absent: 13.8
+pLDDT and a PAE 2.4x rougher"). **A term that should help by fourteen points and hurts by two is
+wrong**, and that is where the defect is.
+
+🔴 **AND THE KERNEL THAT PRODUCES IT WAS IMPORTED BY ITS GATE AND NEVER DISPATCHED.**
+`check-webgl-esmfold2-trunk.js` brought in `relativeEncodingSource` and never ran it: the arms that
+mention the relative encoding compare `relativePositionEncoding` - the CPU function - against ITSELF
+with one field moved, which is a separation check and not a comparison. `z_init` covered only the
+SUM of five terms, where a wrong relative encoding hides under the other four. **Gated now, as its
+own arm: relRMS exactly 0.** So the kernel is right, the tensor is right, and the sampler uses the
+same tensor to produce a structure that agrees to 1.84 A.
+
+**So what is left is WHERE the confidence head adds it** - the head is gated against
+`cpu/esmfold2/confidence.js`, and a head and a reference that add a bias at the same wrong point
+agree perfectly, which is this file's own recorded failure mode. **The next step is to audit the
+head's bias placement against the VENDOR's forward pass rather than against the CPU reference**, which
+is the one comparison neither backend's gates make.
+
+🔴 **AND THE NEW ARM WAS VACUOUS ON ITS FIRST TRY, WHICH THE GATE ITSELF CAUGHT.** `--falsify` skews
+`xInputs` and the language model pair, and this arm reads neither, so it stayed green under
+falsification and the verdict reported **"VACUOUS: only 7 of 8 arms noticed it"**. Skewing the
+identity does not reach it either - relRMS stays 0, which says the kernel does not depend on the
+identity's magnitudes. It is falsified on the WEIGHT now, which is what it actually consumes. **An
+arm is only a gate if the falsification perturbs something it reads**, and a verdict that counts
+which arms noticed is how that gets found rather than assumed.
 
 ### The threshold that chose between two projection kernels was fitted with the wrong dtype
 

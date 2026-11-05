@@ -196,6 +196,49 @@ export async function main(device, args) {
   };
   report("z_init, every term", ourInit, theirInit);
 
+  // --- the relative encoding ALONE, which the confidence head reads --------
+  //
+  // 🔴 THIS KERNEL WAS IMPORTED BY THIS GATE AND NEVER DISPATCHED. Line 40
+  // brings in `relativeEncodingSource` and nothing ran it: the arms below
+  // compare `relativePositionEncoding` - the CPU function - against ITSELF with
+  // one field moved, which is a separation check and not a comparison. So the
+  // device kernel that produces the confidence head's `pairBias` was gated by
+  // nothing, while `z_init` covered only the SUM of five terms, where a wrong
+  // relative encoding can hide under the other four.
+  //
+  // It is not hiding: zeroing that bias in a real fold makes the answer BETTER -
+  // mean pLDDT 57.50 to 59.42 and pTM 0.4127 to 0.5167 - where
+  // webgpu/esmfold2/fold.js measures the correct bias as worth **+13.8 pLDDT**
+  // ("Measured absent: 13.8 pLDDT and a PAE 2.4x rougher"). A term that should
+  // help by fourteen points and hurts by two is wrong, and this is the arm that
+  // says so.
+  {
+    const standalone = execution.allocate(pairs * channels, "ef2.check.relative");
+    execution.dispatch({
+      source: relativeEncodingSource(tokens, channels),
+      output: standalone,
+      inputs: {
+        identityTex: inputs.identity,
+        // 🔴 FALSIFIED ON THE WEIGHT, BECAUSE THAT IS WHAT THIS ARM READS. The
+        // gate's `--falsify` skews `xInputs` and the language model pair, and
+        // this arm reads neither - so it stayed green under falsification and
+        // the verdict rightly called the run VACUOUS. Skewing the identity does
+        // not reach it either: the arm reads relRMS 0 with a skewed identity,
+        // which says this kernel does not depend on the identity's magnitudes.
+        // An arm is only a gate if the falsification perturbs something it
+        // actually consumes.
+        weightTex: falsify
+          ? upload(skew(hostWeights.relativePosition, channels), "w.ef2.relative.skewed")
+          : uploaded.relativePosition,
+      },
+      label: `ef2.check.relative:${tokens}x${channels}`,
+    });
+    report("the relative encoding alone",
+      Float32Array.from(execution.read(standalone)),
+      relativePositionEncoding(features, tokens, channels, hostWeights.relativePosition));
+    execution.release(standalone);
+  }
+
   // --- the relative encoding's chain polarity ---------------------------
   // The reference with the chain block's polarity SWAPPED, which is what says
   // this layout can see it at all.
