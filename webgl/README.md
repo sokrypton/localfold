@@ -84,6 +84,7 @@ webgl/
     diffusion/head.js           the decoder and the whole denoise step: a BLEND, not a prediction
     diffusion/sampler.js        the walk: every constant imported, never restated
     confidence/confidence.js    pLDDT per ATOM SLOT, PAE, PDE, and rf3's masked global norm
+    model/fold.js               the whole AF3 fold: target_feat, trunk, the walk, confidence
   af2/
     multimer/template.js        the multimer's nine-projection template embedder
     evoformer/block.js          a whole Evoformer block and the extra-MSA block, nine sub-layers
@@ -493,8 +494,24 @@ magnitude larger than the update - so the same order change reads **2.6e-5 on th
 on the update itself. A control measured through a dilution reports "inert" about something that is
 not.
 
-AF2 is done, both graphs, and so is AF3: the trunk, the diffusion head, the sampler and the
-confidence head. Still to come: ESMFold2 and bioemu2.
+AF2 is done, both graphs, and so is AF3 - and AF3 FOLDS: a 59-residue chain through the whole
+48-block trunk and 25 diffusion steps is **21.0 s** here against the WGSL fold's 1.26 s, with a
+median CA-CA of **3.855 A**, mean pLDDT 57.076 against the WGSL fold's 57.048, and the worst atom
+**0.078 A** from it. Still to come: ESMFold2 and bioemu2.
+
+🔴 **AND THE FOLD FOUND A BUG NO STAGE GATE COULD.** The confidence head CLAMPED the trunk's single
+to +/-512 on the branch where AF3 uses it raw - protenix2 is the model that normalises there - which
+is invisible at the noise scale every stage gate drives it with and took a real fold's pLDDT from
+75 to 6 while PAE and the coordinates stayed in band, because the pair half of a pairformer block
+never reads the single. The confidence gate now drives a single at the trunk's own magnitude WITH A
+HEAVY TAIL, since a uniform draw at std 200 never reaches 512 and left the arm green with the bug
+restored.
+
+🔴 **AND 61% OF A DENOISER CALL IS THE 24-BLOCK TRANSFORMER**: 425 ms of 695 at 59 tokens
+(`profile-webgl-af3-head.js`), with the atom encoder's stack at 55 and the pair conditioning at 51.
+Hoisting that pair conditioning out of the walk - it does not depend on the noise level, so 25 steps
+recomputed one tensor 25 times - is correct and measures **2%** (436 against 445 ms a step), which
+is worth knowing before anyone spends a day on it: the transformer is the lever.
 
 Every operation so far is checked against TWO references - an f64 CPU one written from the
 operation, and the WGSL kernel run in the same page - because a single reference cannot say which

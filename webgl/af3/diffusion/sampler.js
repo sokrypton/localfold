@@ -41,11 +41,12 @@ import { weightedRigidAlign } from "../../../cpu/af3/diffusion/rigid-align.js";
 import { steerDenoised } from "../../../cpu/af3/diffusion/steering.js";
 import { inpaintDenoised } from "../../../cpu/af3/diffusion/inpaint.js";
 import { diffusionHead } from "./head.js";
+import { pairConditioning } from "./conditioning.js";
 
 /** @typedef {import("../../runtime/storage.js").Tensor} Tensor */
 /**
- * @typedef {Omit<import("./head.js").HeadCall, "positionsNoisy" | "noiseLevel">}
- *   DenoiserInput
+ * @typedef {Omit<import("./head.js").HeadCall, "positionsNoisy" | "noiseLevel">
+ *   & {conditioningPair?: Tensor, hoistPairConditioning?: boolean}} DenoiserInput
  */
 /**
  * @typedef {{binder: number[], pocket: number[], weight: number,
@@ -64,11 +65,27 @@ import { diffusionHead } from "./head.js";
  * @param {DenoiserInput} input everything `diffusionHead` takes but
  *   `positionsNoisy` and `noiseLevel`
  * @returns {(positions: Float32Array, noiseLevel: number) => Float32Array}
+ *   with a `release()` the CALLER must call when the walk is over: the denoiser
+ *   holds the hoisted pair conditioning for its whole life, and
+ *   `sampleOnWebGl2` releases only a denoiser it built itself.
  */
 export function denoiserFromHead(execution, input) {
   const { tokens, dense } = input.shape;
   const atoms = tokens * dense;
-  return (positions, noiseLevel) => {
+  // 🔴 THE PAIR CONDITIONING ONCE FOR THE WHOLE WALK, because it does not depend
+  // on the noise level - see `pairConditioning`. The caller may pass its own
+  // (`input.conditioningPair`); otherwise this builds one and the denoiser owns
+  // it for as long as the walk, which is the point.
+  // `hoistPairConditioning: false` is the arm that prices it, and nothing else
+  // should pass it: the hoisted and the recomputed pair are the same draws on
+  // the same inputs, so the only difference is how many times they run.
+  const conditioningPair = input.hoistPairConditioning === false ? undefined
+    : input.conditioningPair ?? pairConditioning(execution, {
+      trunkPair: input.trunkPair, identity: input.identity, tokens,
+      weights: input.weights.conditioning, relativeWidth: input.relativeWidth,
+      epsilon: input.epsilon,
+    });
+  const denoise = (positions, noiseLevel) => {
     if (positions.length !== atoms * 3) {
       throw new RangeError(
         `af3 sampler: ${positions.length} coordinates, not ${atoms} x 3`);
@@ -78,12 +95,20 @@ export function denoiserFromHead(execution, input) {
       "af3.sampler.noisy");
     const out = diffusionHead(execution, {
       ...input, positionsNoisy: uploaded, noiseLevel,
+      ...(conditioningPair === undefined ? {} : { conditioningPair }),
     });
     const values = Float32Array.from(execution.read(out));
     execution.release(out);
     execution.release(uploaded);
     return values;
   };
+  // ...and the walk's own copy goes back when the walk does.
+  denoise.release = () => {
+    if (input.conditioningPair === undefined && conditioningPair !== undefined) {
+      execution.release(conditioningPair);
+    }
+  };
+  return denoise;
 }
 
 /**
@@ -130,6 +155,7 @@ export function sampleOnWebGl2(execution, input, options) {
   // THING: a tail can add a step, so the loop runs what the LEVELS hold.
   const stopAfter = Math.min(options.stopAfter ?? Infinity, levels.length - 1);
   const denoise = options.denoise ?? denoiserFromHead(execution, input);
+  const ownsDenoiser = options.denoise === undefined;
 
   // 🔴 A WARM START SKIPS THE LARGE NOISE, IT DOES NOT RESCALE THE SCHEDULE: the
   // walk joins the same levels a cold run visits, at the first one at or below
@@ -195,5 +221,6 @@ export function sampleOnWebGl2(execution, input, options) {
       denoised: Float32Array.from(denoised),
     });
   }
+  if (ownsDenoiser) /** @type {any} */ (denoise).release?.();
   return positions;
 }

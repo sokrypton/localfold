@@ -376,7 +376,18 @@ ${hasAbsent ? `  value += fetch4(absentTex, group) + fetch4(absentTex, C4 + grou
   result = value;
 }`;
 
-/** `out = clamp(x, -512, 512)`, which AF3 applies before the single's LayerNorm. */
+/** `out = x`, for the branch that takes the trunk's single unchanged. */
+export const copyRowsSource = (elements) => `${PRELUDE}${ONE_TARGET}
+const int ELEMENTS = ${elements};
+uniform sampler2D xTex;
+
+void main() {
+  int texel = linearTexel();
+  if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
+  result = fetch4(xTex, texel);
+}`;
+
+/** `out = clamp(x, -512, 512)`, which protenix2 applies before its LayerNorm. */
 export const clampSource = (elements, limit) => `${PRELUDE}${ONE_TARGET}
 const int ELEMENTS = ${elements};
 uniform sampler2D xTex;
@@ -652,9 +663,16 @@ export function confidenceHead(execution, call) {
   // pairformer and every head read the normalised one.
   let single;
   if (w.inputSingleNormScale === undefined) {
+    // 🔴 NO NORM MEANS NO CLAMP EITHER, AND THE CLAMP ALONE IS A WRECKING BALL.
+    // The clamp exists because protenix2 normalises here; AF3 uses the trunk's
+    // single RAW, and that single runs to a standard deviation of 211 with peaks
+    // far past 512. The first version of this branch clamped and copied - which
+    // is a no-op at the noise scale every gate drove it with and, on a real
+    // fold, took pLDDT from 75 to 6 while PAE and the coordinates stayed in
+    // band, because the pair half of a pairformer block never reads the single.
     single = execution.allocate(tokens * singleChannels, "af3.conf.single");
     execution.dispatch({
-      source: clampSource(tokens * singleChannels, 512),
+      source: copyRowsSource(tokens * singleChannels),
       output: single,
       inputs: { xTex: singleSource },
       label: `af3.conf.single-copy:${tokens}x${singleChannels}`,

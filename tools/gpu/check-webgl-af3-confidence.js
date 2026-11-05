@@ -15,8 +15,9 @@
  * broadcasting gives plausible per-residue numbers, so a check that compares
  * token-wise means would pass on it."
  *
- * 🔴 FOUR DIALECTS, EACH OF WHICH CHANGES THE ANSWER WITHOUT CHANGING A SHAPE:
- * stock AF3, rf3 (a masked GLOBAL norm over every detached trunk input, 40
+ * 🔴 FIVE DIALECTS, EACH OF WHICH CHANGES THE ANSWER WITHOUT CHANGING A SHAPE:
+ * stock AF3, AF3 with no `input_single_norm` (its own branch, and the one a
+ * clamp bug lived in), rf3 (a masked GLOBAL norm over every detached trunk input, 40
  * distogram BOUNDARIES rather than 39 edges, two absent s_inputs columns, and
  * the per-atom heads read by RANK), protenix2 (a second, UNBINNED distance term
  * beside the binned one) and boltz2's pair heads (split intra/inter, and
@@ -102,7 +103,22 @@ export async function main(device, args) {
   }
 
   const pair = noise(pairs * pairChannels, 1);
-  const single = noise(tokens * singleChannels, 1);
+  // 🔴 THE SINGLE AT THE TRUNK'S OWN MAGNITUDE, NOT AT NOISE SCALE. AF3's trunk
+  // single "reaches 1.7e5" and enters this head at a standard deviation of 211,
+  // and the head's two input branches differ by a CLAMP at +/-512 - which is a
+  // no-op on values of order one. Driven at noise scale, a port that clamped
+  // where it should copy agreed with the reference to 3e-6 here and took a real
+  // fold's pLDDT from 75 to 6, with PAE and the coordinates still in band
+  // because the pair half of a pairformer block never reads the single.
+  // 🔴 AND WITH A TAIL PAST 512, WHICH A UNIFORM DRAW AT std 200 DOES NOT HAVE.
+  // The first version of this arm scaled the single to 200 and the clamp was
+  // STILL a no-op, because nothing a uniform +/-200 produces reaches the
+  // threshold: the gate stayed green with the bug restored. A real single's
+  // distribution is heavy-tailed, so every eighth channel here is six times the
+  // bulk - which is what makes the two branches differ at all.
+  const singleScale = Number(option(args, "single-scale", "200"));
+  const single = Float32Array.from(noise(tokens * singleChannels, singleScale),
+    (value, index) => (index % 8 === 0 ? value * 6 : value));
   const targetFeat = noise(tokens * targetFeatWidth, 1);
   // Coordinates on a realistic scale, so the 39 distogram bins are exercised
   // rather than all falling in the catch-all.
@@ -160,6 +176,17 @@ export async function main(device, args) {
       dialect: {
         confidenceGlobalNorm: true, confidenceCaDgram: true, perAtomHeadsByRank: true,
       },
+    },
+    {
+      // 🔴 AF3's OWN BRANCH: no `input_single_norm` at all, so the trunk's single
+      // is used RAW. That tensor is protenix2's - "every other model gets the
+      // trunk's single unchanged, which is what `undefined` means" - and this is
+      // the arm the clamp bug lived in.
+      name: "AF3 with no input_single_norm (the trunk's single raw)",
+      weights: Object.fromEntries(Object.entries({
+        ...base, distogramFeatProject: af3Dgram,
+      }).filter(([key]) => !key.startsWith("inputSingleNorm"))),
+      dialect: {},
     },
     {
       name: "protenix2 (a second, unbinned distance term)",
@@ -355,7 +382,8 @@ export async function main(device, args) {
         ? `ok: all ${arms.length} arms go red on a 1% perturbation`
         : `VACUOUS: only ${red} of ${arms.length} arms noticed it`)
       : (failures.length === 0
-        ? `ok: ${arms.length} arms over four dialects, ${refusals.length} refusals`
+        ? `ok: ${arms.length} arms over ${CASES.length} dialects,`
+          + ` ${refusals.length} refusals`
         : `FAILED: ${failures.join("; ")}`),
   };
 }

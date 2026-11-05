@@ -189,20 +189,26 @@ void main() {
  *   onStage?: (stage: string, tensor: Tensor) => void}} call
  * @returns {{single: Tensor, pair: Tensor}} the caller owns both
  */
-export function diffusionConditioning(execution, call) {
-  const {
-    trunkSingle, trunkPair, targetFeat, identity, noiseLevel, tokens,
-    weights: w, relativeWidth, epsilon = 1e-5,
-  } = call;
-  if (typeof call.padUnknownDna !== "boolean") {
-    throw new Error(
-      "af3 diffusion conditioning: padUnknownDna has no default - stock AF3 is false"
-      + " and the openfold3 lineage true, and the LayerNorm's length is what asserts"
-      + " the dialect and the weights agree");
-  }
+/**
+ * The PAIR half alone, which does not depend on the noise level.
+ *
+ * 🔴 AND THAT IS WHY IT IS ITS OWN FUNCTION: a sampler calls the head once a
+ * STEP, and only the single track reads sigma - through the Fourier embedding.
+ * The pair half is the trunk pair, the relative encoding, a joint LayerNorm over
+ * the concatenation and two transitions, every one of them a function of the
+ * TRUNK, so recomputing it 200 times computes the same tensor 200 times. At 59
+ * tokens that is a 3481x267 ragged LayerNorm and a 267-wide projection a step.
+ *
+ * @param {import("../../runtime/execution.js").Execution} execution
+ * @param {{trunkPair: Tensor, identity: Tensor, tokens: number, weights: any,
+ *   relativeWidth: number, epsilon?: number,
+ *   onStage?: (stage: string, tensor: Tensor) => void}} call
+ * @returns {Tensor} `tokens^2 * pairChannels`, the caller's to release
+ */
+export function pairConditioning(execution, call) {
+  const { trunkPair, identity, tokens, weights: w, relativeWidth, epsilon = 1e-5 } = call;
   const pairs = tokens * tokens;
   const pairChannels = w.pairChannels;
-  const seqChannels = w.seqChannels;
   const trunkPairChannels = w.trunkPairChannels ?? pairChannels;
 
   const split = w.zTrunkProjection !== undefined;
@@ -314,6 +320,36 @@ export function diffusionConditioning(execution, call) {
     pair = next;
   }
 
+  pair.label = "af3.diffcond.pair";
+  return pair;
+}
+
+/**
+ * @param {import("../../runtime/execution.js").Execution} execution
+ * @param {{trunkSingle: Tensor, trunkPair: Tensor, targetFeat: Tensor,
+ *   identity: Tensor, noiseLevel: number, tokens: number, weights: any,
+ *   relativeWidth: number, fourierWeight: Float32Array, fourierBias: Float32Array,
+ *   padUnknownDna: boolean, reusePair?: Tensor, epsilon?: number,
+ *   onStage?: (stage: string, tensor: Tensor) => void}} call
+ *   `reusePair` is a pair conditioning computed earlier - see `pairConditioning`
+ *   for why a sampler has one - and is BORROWED: the result says so, and
+ *   releasing it is the caller's.
+ * @returns {{single: Tensor, pair: Tensor, pairIsBorrowed: boolean}}
+ */
+export function diffusionConditioning(execution, call) {
+  const {
+    trunkSingle, targetFeat, noiseLevel, tokens, weights: w, epsilon = 1e-5,
+  } = call;
+  if (typeof call.padUnknownDna !== "boolean") {
+    throw new Error(
+      "af3 diffusion conditioning: padUnknownDna has no default - stock AF3 is false"
+      + " and the openfold3 lineage true, and the LayerNorm's length is what asserts"
+      + " the dialect and the weights agree");
+  }
+  const seqChannels = w.seqChannels;
+  const pair = call.reusePair ?? pairConditioning(execution, call);
+  const pairIsBorrowed = call.reusePair !== undefined;
+
   // ...and the trunk single with target_feat.
   const trunkSingleChannels = w.trunkSingleChannels ?? seqChannels;
   const targetFeatWidth = w.targetFeatWidth;
@@ -394,8 +430,7 @@ export function diffusionConditioning(execution, call) {
   }
 
   single.label = "af3.diffcond.single";
-  pair.label = "af3.diffcond.pair";
-  return { single, pair };
+  return { single, pair, pairIsBorrowed };
 }
 
 /**

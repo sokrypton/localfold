@@ -424,6 +424,11 @@ export async function main(device, args) {
   refuses("positions of the wrong length handed to the device denoiser", "not 16 x 3",
     () => gpuDenoise(new Float32Array(9), 4.5));
 
+  // 🔴 THE DENOISER HOLDS THE HOISTED PAIR CONDITIONING, so whoever BUILDS one
+  // releases it - `sampleOnWebGl2` releases only a denoiser it built itself, and
+  // this gate builds its own to drive two loops over it. Without this the gate
+  // read "1 tensors left live", which is the pair conditioning of the whole walk.
+  /** @type {any} */ (gpuDenoise).release?.();
   for (const tensor of held) execution.release(tensor);
   if (execution.stats().live !== 0) {
     failures.push(`${execution.stats().live} tensors left live`);

@@ -296,7 +296,7 @@ void main() {
  *   keysUidFromQueriesLayout: boolean, keyMaskedAtomAttention: boolean,
  *   chainedAtomLayerNorm: boolean, diffusionNoResidual: boolean,
  *   pairNormPerBlock: boolean, maskAtomActPerBlock: boolean,
- *   preTrunkQuery?: boolean, epsilon?: number,
+ *   preTrunkQuery?: boolean, epsilon?: number, conditioningPair?: Tensor,
  *   onStage?: (stage: string, tensor: Tensor) => void}} HeadCall
  */
 
@@ -325,10 +325,15 @@ export function diffusionHead(execution, call) {
     maskAtomActPerBlock: call.maskAtomActPerBlock,
   };
 
+  // 🔴 THE PAIR CONDITIONING IS NOISE-INDEPENDENT AND A SAMPLER HOISTS IT. Only
+  // the single track reads sigma, so a caller that denoises 200 times passes the
+  // pair in and this computes it once - see `pairConditioning`. Borrowed, so it
+  // is not released here.
   const cond = diffusionConditioning(execution, {
     trunkSingle, trunkPair, targetFeat, identity, noiseLevel, tokens,
     weights: w.conditioning, relativeWidth, fourierWeight, fourierBias,
     padUnknownDna: call.padUnknownDna, epsilon,
+    ...(call.conditioningPair === undefined ? {} : { reusePair: call.conditioningPair }),
     onStage: call.onStage,
   });
   call.onStage?.("conditioning.single", cond.single);
@@ -409,7 +414,7 @@ export function diffusionHead(execution, call) {
     execution.release(encoded[key]);
   }
   execution.release(cond.single);
-  execution.release(cond.pair);
+  if (!cond.pairIsBorrowed) execution.release(cond.pair);
 
   const output = execution.allocate(atoms * 3, "af3.head.output");
   execution.dispatch({

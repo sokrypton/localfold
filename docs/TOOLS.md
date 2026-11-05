@@ -11,9 +11,9 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-506 tools. `tools/fixtures/` is data and is not listed.
+508 tools. `tools/fixtures/` is data and is not listed.
 
-## `tools/gpu/` - the WebGPU lane (261)
+## `tools/gpu/` - the WebGPU lane (263)
 
 Each exports `async function main(device, args)` and is run as
 `node tools/gpu-chrome.mjs tools/gpu/<module>.js [--flags]`.
@@ -186,6 +186,7 @@ Each exports `async function main(device, args)` and is run as
 - **`dump-bioemu2-stages.js`** - webgpu/bioemu2's stages, handed back as one base64 blob for tools/dump-bioemu2-webgpu.mjs to write as a cuda/featurise input directory - the oracle metal/bioemu2 reads with --oracle=.
 - **`fold-af2-webgl.js`** - Fold AlphaFold 2's monomer in WebGL2, from a real weight bundle, beside the WGSL fold of the same weights.
 - **`fold-af2.js`** - An AlphaFold 2 monomer fold, end to end, so a kernel change can be compared against the tree before it.
+- **`fold-af3-webgl.js`** - Fold AlphaFold 3 in WebGL2, from a real weight bundle.
 - **`fold-bioemu2.js`** - A whole BioEmu2 fold on the GPU: an AlphaFold 3 job in, samples out.
 - **`fold-complex.js`** - Fold a MULTI-CHAIN target and score every chain in ONE frame.
 - **`fold-crosslinks.js`** - Crosslinks folded: the page's path for a `crosslink` row (web/entities.js expandEntities: a built-in bridge ligand bonded to its two residues) end to end on WebGPU, and whether the fold honours it.
@@ -273,6 +274,7 @@ Each exports `async function main(device, args)` and is run as
 - **`profile-bioemu2.js`** - Where webgpu/bioemu2's time goes on a real input: the trunk by wall clock, the denoiser call per dispatch.
 - **`profile-esmc-block.js`** - Where does an ESM-C block's time actually go?
 - **`profile-rfd4p.js`** - Detailed GPU kernel + host pipeline profiler for RFD4-Proteina (`Rfd4pTrunkGpu`, `Rfd4pDecoderGpu`, `Rfd4pEncoderGpu`, and full 60-step `Rfd4pGeneratorGpu`).
+- **`profile-webgl-af3-head.js`** - Where a real-shape AF3 denoiser call spends its time in WebGL2.
 - **`profile.js`** - Per-pass GPU time, by wrapping the device rather than editing the kernels.
 - **`relative-rms.js`** - One relative-RMS, guarded, because fifty-five tools each wrote their own.
 - **`sidechain-geometry.js`** - How close is a predicted structure to the chemistry it was given?

@@ -44,6 +44,7 @@ import {
 } from "../../cpu/af3/diffusion/atom-encoder.js";
 import { diffusionHead as cpuHead, scalings } from "../../cpu/af3/diffusion/diffusion.js";
 import { diffusionHead } from "../../webgl/af3/diffusion/head.js";
+import { pairConditioning } from "../../webgl/af3/diffusion/conditioning.js";
 import { RELATIVE_WIDTH, tokenIdentity } from "../../webgl/af3/trunk/embedder.js";
 import { Execution } from "../../webgl/runtime/execution.js";
 import { createWebGL2Context } from "../../webgl/index.js";
@@ -268,6 +269,45 @@ export async function main(device, args) {
       if (!(stageRms <= bar)) {
         failures.push(`stage ${stage}: relRMS ${stageRms.toExponential(3)} over ${bar}`);
       }
+    }
+  }
+
+  // 🔴 THE HOISTED PAIR CONDITIONING MUST CHANGE NOTHING, AND "NOTHING" MEANS
+  // EXACTLY ZERO. Only the single track reads the noise level, so a sampler
+  // computes the pair half once for the walk and hands it to every step - the
+  // same draws on the same inputs, so the head's output is bit-identical or the
+  // hoist is not a hoist.
+  {
+    const pair = pairConditioning(execution, {
+      trunkPair: inputs.trunkPair, identity: inputs.identity, tokens,
+      weights: uploaded.conditioning, relativeWidth: RELATIVE_WIDTH,
+    });
+    const common = {
+      ...inputs, gathers, noiseLevel: stageLevel,
+      shape: { tokens, dense, subsets, queries, keys },
+      weights: uploaded, relativeWidth: RELATIVE_WIDTH,
+      fourierWeight, fourierBias, padUnknownDna: padDna,
+      maskPaddedKeys: false, keysUidFromQueriesLayout: false,
+      keyMaskedAtomAttention: false, chainedAtomLayerNorm: false,
+      diffusionNoResidual: false, pairNormPerBlock: false, maskAtomActPerBlock: false,
+    };
+    const plain = diffusionHead(execution, common);
+    const hoisted = diffusionHead(execution, { ...common, conditioningPair: pair });
+    const difference = relativeRms(
+      Float32Array.from(execution.read(hoisted)),
+      Float32Array.from(execution.read(plain)), "hoist");
+    execution.release(plain);
+    execution.release(hoisted);
+    execution.release(pair);
+    arms.push({
+      arm: "the hoisted pair conditioning, against recomputing it",
+      relativeRms: difference, bar: 0, ok: difference === 0,
+      falsifiable: false,
+      reason: "both arms are this port's own head, so a skewed input moves both;"
+        + " what it asserts is that hoisting is a no-op, which is exact or wrong",
+    });
+    if (difference !== 0) {
+      failures.push(`hoisting the pair conditioning moved the answer by ${difference}`);
     }
   }
 
