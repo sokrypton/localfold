@@ -342,6 +342,31 @@ static void sampleTemplates(Example& e, std::mt19937_64& rng) {
   e.slots = std::move(real);
 }
 
+// OpenFold3's conformer augmentation (featurization/conformer.py: centre_random_augmentation on each conformer's
+// ref_pos): every reference space centred over its live atoms, then a uniform random rotation and an N(0, 1)
+// translation - every featurisation, so a fresh pose each step
+static void augmentConformers(Example& e, std::mt19937_64& rng) {
+  std::normal_distribution<double> nd(0, 1);
+  std::map<int, std::vector<size_t>> spaces;
+  for (size_t i = 0; i < e.atoms(); ++i) if (e.predMask[i] > 0) spaces[e.uid[i]].push_back(i);
+  for (auto& [uid, atoms] : spaces) {
+    double c[3] = {0, 0, 0}, live = 0;
+    for (size_t i : atoms) if (e.refMask[i] > 0) { for (int q = 0; q < 3; ++q) c[q] += e.refPos[i * 3 + q]; live += 1; }
+    if (live == 0) continue;
+    for (double& v : c) v /= live;
+    double q4[4], qn = 0; for (double& v : q4) { v = nd(rng); qn += v * v; } qn = std::sqrt(qn); for (double& v : q4) v /= qn;
+    const double R[3][3] = {{1 - 2 * (q4[2] * q4[2] + q4[3] * q4[3]), 2 * (q4[1] * q4[2] - q4[0] * q4[3]), 2 * (q4[1] * q4[3] + q4[0] * q4[2])},
+                            {2 * (q4[1] * q4[2] + q4[0] * q4[3]), 1 - 2 * (q4[1] * q4[1] + q4[3] * q4[3]), 2 * (q4[2] * q4[3] - q4[0] * q4[1])},
+                            {2 * (q4[1] * q4[3] - q4[0] * q4[2]), 2 * (q4[2] * q4[3] + q4[0] * q4[1]), 1 - 2 * (q4[1] * q4[1] + q4[2] * q4[2])}};
+    const double t[3] = {nd(rng), nd(rng), nd(rng)};
+    for (size_t i : atoms) {
+      if (!(e.refMask[i] > 0)) { for (int q = 0; q < 3; ++q) e.refPos[i * 3 + q] = 0; continue; }   // (masked: 0, as there)
+      double p[3]; for (int q = 0; q < 3; ++q) p[q] = e.refPos[i * 3 + q] - c[q];
+      for (int q = 0; q < 3; ++q) { double v = t[q]; for (int u = 0; u < 3; ++u) v += R[q][u] * p[u]; e.refPos[i * 3 + q] = (float)v; }
+    }
+  }
+}
+
 // ---- OpenFold3's crops (core/data/primitives/structure/cropping.py), over the token centre atoms (CA, C1', an
 // atomised token's atom) the truth resolves
 struct CropWeights { double contiguous = 0.2, spatial = 0.4, interface = 0.4; };
@@ -1050,6 +1075,7 @@ int main(int argc, char** argv) {
     for (size_t k = 0; k < tm.blocks.size(); ++k) { tm.blocks[k].dropRate = on ? 0.25f : 0; tm.blocks[k].dropSeed = base * 1000 + 300 + k; }
     for (size_t k = 0; k < ch.blocks.size(); ++k) { ch.blocks[k].dropRate = on ? 0.25f : 0; ch.blocks[k].dropSeed = base * 1000 + 400 + k; }
   };
+  long stepIndex = 0;   // (an example's index in the run, all ranks alike: the synced recycle draw's key)
   auto runExample = [&](const Example& full, bool train, bool fixed, int nSamples, std::mt19937_64& gen) {
     Losses L;
     setDropout(train && (!fixed || dropInFixed) && dropout, gen());
@@ -1074,7 +1100,7 @@ int main(int argc, char** argv) {
     // (the crop from the whole entry, its tokens mapped through the chain crop)
     std::vector<int> keepFull(keep.size()); for (size_t k = 0; k < keep.size(); ++k) keepFull[k] = keepC[keep[k]];
     Example e = subset(full, keepFull);
-    if (!fixed) sampleTemplates(e, gen);
+    if (!fixed) { sampleTemplates(e, gen); augmentConformers(e, gen); }
     const of3::Layout Lay = layoutOf(e);
     const int n = e.n; const size_t nn = (size_t)n * n, A = e.atoms();
     const int S = std::min(1024, e.P);
@@ -1082,7 +1108,9 @@ int main(int argc, char** argv) {
     Acts a = makeActs(n, S);
     const bool confOn = full.resolution >= 0.1 && full.resolution <= 4.0 && (full.set == "pdb");
     // the trunk
-    const int c = fixed ? 4 : 1 + (int)(gen() % 4);
+    // (model.py: the recycle count from a generator every rank shares - the same number on every rank a step)
+    std::mt19937_64 synced(seed * 1000003ull + (uint64_t)stepIndex);
+    const int c = fixed ? 4 : 1 + (int)(synced() % 4);
     cycles(d, a, c, [&] { drawMsa(d, e, gen); });
     const auto t1 = now();
     // the mini-rollout, and on it the truth's permutation (model.py: before every loss of the step)
@@ -1348,6 +1376,7 @@ int main(int argc, char** argv) {
       std::vector<int> keep(full.n); for (int t = 0; t < full.n; ++t) keep[t] = t;
       if (full.n > valCrop) keep = cropTokens(full, layoutOf(full), valCrop, CropWeights{0, 1, 0}, gen, strategy);
       Example e = subset(full, keep);
+      augmentConformers(e, gen);
       const of3::Layout Lay = layoutOf(e);
       const int n = e.n; const size_t nn = (size_t)n * n, A = e.atoms();
       Dev d; upload(d, e, padded, qblock, std::min(1024, e.P));
@@ -1408,6 +1437,7 @@ int main(int argc, char** argv) {
   for (auto& e : examples) { totalW += e.weight; cum.push_back(totalW); }
   int inBatch = 0;
   for (int step = 0; step < steps; ++step) {
+    stepIndex = opt.step * batch + inBatch;
     cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1); cudaEventRecord(e0, STREAM);
     const double u = std::uniform_real_distribution<double>(0, totalW)(rng);
     const size_t pick = std::lower_bound(cum.begin(), cum.end(), u) - cum.begin();

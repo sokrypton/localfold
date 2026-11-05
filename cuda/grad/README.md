@@ -83,6 +83,9 @@ one-hot one - the MSA stack, the pairformer, the distogram, the denoiser, the co
   tokens, 35 chains, 98 datapoints) trains at ~8.6 s a 384-token step with 4 samples, 0.7 s of it the host's crops. The crop
   cuts the host arrays and REBUILDS the atom windows with the featuriser's own `atomGathers` - held, on every example
   at load, to the windows the featuriser wrote.
+- **conformers** - every conformer's `ref_pos` centred, randomly rotated and moved each draw, as OpenFold3's
+  featurisation does (`centre_random_augmentation` on each reference space); the conformers themselves are the
+  featuriser's (OpenFold3 embeds a fresh RDKit ETKDGv3 conformer, which is not done here).
 - **templates** - drawn per chain each step as OpenFold3's training draws them (`sample_templates`, AF3 SI 2.4: k =
   min(U{0..l}, n) of a chain's l templates, at random, where inference takes the top k), over the slots the input
   carries: each new slot assembled a chain at a time from the slot that chain drew, its cross-chain pairs masked, the
@@ -94,7 +97,8 @@ one-hot one - the MSA stack, the pairformer, the distogram, the denoiser, the co
   module, position), so a recomputed block and the backward regenerate them; `test-af3-f64` gradchecks both blocks with
   it on (1.1e-6, 3.9e-7) and `--check-ckpt` holds the recomputation to the kept saves with it on. Off for measurements
   and validation, as OpenFold3's eval mode; `--no-dropout` turns it off for training.
-- **the trunk** - 1 + U{0..3} cycles, the gradient through the last; each cycle's MSA a fresh 1024 rows, the valid ones
+- **the trunk** - 1 + U{0..3} cycles (drawn from a generator every rank shares, `synced_generator`), the gradient
+  through the last; each cycle's MSA a fresh 1024 rows, the valid ones
   in a random order then invalid ones (`_subsample_all_msa`). Every MSA and pairformer block's saves are dropped as it
   finishes and recomputed before its backward (OpenFold3's `blocks_per_ckpt` 1): `--check-ckpt` holds every gradient so
   computed to the one with the saves kept - 2.6e-5, against 2.3e-5 between two identical runs (the backward's atomics).
