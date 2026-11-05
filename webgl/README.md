@@ -1053,6 +1053,45 @@ sufficient one. A generalisation measured on one model is a regression on anothe
 reason this is a sentence rather than a shipped defect is that the AF2 differential runs on every
 pass.
 
+### The fold's whole arithmetic, and why 670 GFLOP/s is not a ceiling it can be held to
+
+**The one calculation that decides whether the remaining gap is structural, and it needed counting
+rather than arguing.** Summed from a bioemu2 fold's own profile - every `linear*` label's
+`2 * rows * in * out` times its call count, plus the contraction's `2 * L^3 * channels`:
+
+| label | GFLOP | achieved |
+|---|---:|---:|
+| `linear.block.int5:576x896x1792` out-major | 1184 | **175 GFLOP/s** |
+| `linear:4624x256x512` in-major, one-texel | 1008 | 323 |
+| `linear.block:4624x256x2048` in-major | 1008 | **670** |
+| `linear.block.int5:576x768x1920` | 544 | 169 |
+| `linear.block:4624x1024x256` in-major | 504 | 186 |
+| **the countable total** | **5081** | **167 average, in 30.4 s** |
+
+🔴 **SO ONE SHAPE REACHES 670 GFLOP/s AND THE FOLD AVERAGES 167, AND THE FIRST READING OF THAT WAS
+WRONG.** Dividing 5081 by 670 gives 7.6 s and the appearance of a 4x of headroom - and the fragment
+counts seemed to explain it, since the 670 shape has **295,936** fragments where
+`576 x 896 -> 1792` has **32,256**, a 9.2x deficit at a 3.8x deficit in rate.
+
+**Built and measured: a k split, folded into the fragment index so it costs no extra draw, which
+multiplies the fragments by four or eight. It is 1.5x SLOWER** - the cheap bioemu2 fold 6073 ms to
+9265, the sample stage 3824 to 6245. The reason is what the split must buy the fragments with: more
+fragments in ONE draw needs more output slots, so `splits` times the intermediate planes, and at
+`576 x 896 -> 1792` that is **132 MB of partials written and read back per call** against an output
+of 4 MB. Accumulating across draws with `EXT_float_blend` instead does not help, because each of
+those draws still has the same 32,256 fragments - the parallelism only rises if the splits are
+concurrent, and then they need the planes.
+
+🔴 **AND THAT SETTLES WHAT 670 MEANS: IT IS A SHAPE'S RATE, NOT THE BACKEND'S.** The 670 kernel is
+`[in][out]` float16 with an aspect ratio of 8, which is exactly the case the blocked geometry suits;
+the int5 kernels are balanced shapes whose cost includes the DECODE - about fifteen integer
+operations of address arithmetic per eight weights, which this file records as the reason the first
+int5 projection was 23% slower than the float16 it replaced. **Those kernels are ALU-limited on the
+decode, not fetch-limited, so no fragment count reaches 670 for them.** The honest floor is therefore
+the sum over labels of each label's own achievable rate - which is what the fold already is. **5081
+GFLOP in 30.4 s is at the floor for this mix of kernels, and the 7.6 s figure above is an artefact of
+applying one shape's rate to all of them.**
+
 ### 🔴 A UNIFORM BLOCK READ IS 2.1x A `texelFetch`, SO THE CEILING IS A TEXTURE CEILING
 
 **This corrects the section below, which says the texture unit is the only path. It is not.** GLSL ES
