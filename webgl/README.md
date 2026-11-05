@@ -29,11 +29,36 @@ webgl/
                     shares (a power-of-two row width, four floats to an RGBA32F texel), the
                     full-framebuffer triangle that stands in for a dispatch, program linking
     limits.js       what a context MUST provide, and the ceilings that follow from what it
-                    reports - `pairTokenCeiling` is the one that decides feasibility
+                    reports; `pairTokenCeiling` bounds a 2D operand, `tensorCapacity` in
+                    storage.js bounds a linear one, and they differ eightfold
+    storage.js      tensors in textures, addressed LINEARLY - allocate, upload, read, release,
+                    every allocation counted so peak memory is measurable
+    execution.js    what stands in for a dispatch: one draw, one fragment per output texel,
+                    banded when a viewport cannot cover the target; the shared GLSL prelude
+                    and the program cache, keyed by source
+    elementwise.js  residuals: add, multiply, scale
   kernels/
     triangle.js     the triangle contraction (22% of an Evoformer block at 221 residues)
     attention.js    gated flash attention with pair bias (58% of one), eight render targets
+    layer-norm.js   row-wise LayerNorm, about ten times a block
+    linear.js       the dense projection, with bias and activation folded in - where the FLOPs are
 ```
+
+## AF2, which is what this tree is being built for
+
+`webgpu/`'s AF2 path is **75 `@compute` entry points** (32 in `webgpu/af2/`, 34 in
+`webgpu/kernels/`, 2 in `webgpu/heads/`, 1 in `webgpu/input/`, 6 in `webgpu/runtime/`) over about
+18,000 lines. Five are ported here, and they are deliberately the load-bearing ones rather than the
+easy ones: the triangle contraction and flash attention are 80% of an Evoformer block's GPU time
+between them, and LayerNorm, the dense projection and the residual add are what the other 70
+kernels are mostly made of.
+
+Still to come, in the order they are needed: the MSA row and column attentions (the existing
+attention kernel generalised off its fixed 32-channel head), the outer product mean, the
+transition, the triangle's four projections and its gating, then the Evoformer block that drives
+them, then the stack, the structure module, and the confidence and distogram heads. Nothing is
+wired to a weight bundle yet - every kernel so far takes its operands as plain arrays, and reading
+`model-af2-monomer-int5` is its own stage.
 
 ## No compute shaders, and everything follows from that
 
@@ -108,10 +133,23 @@ nothing about the 1.4x/1.55x speed comparison, which remains a single hand-run.
 
 ## The walls, which are shapes and not speed
 
-**The pair track stops fitting a texture axis.** `MAX_TEXTURE_SIZE` is 32,768 on that card and the
-pair tensor has `tokens * tokens` rows, so an operand stops fitting at **181 tokens**. AF3's
-pair-transition, 40000x128x512, **cannot be expressed at all**. WebGPU has no such limit: a buffer
-is one-dimensional and `maxStorageBufferBindingSize` is 2 GB there.
+🔴 **THE "181 TOKENS" CEILING IS A PROPERTY OF ONE LAYOUT AND NOT OF THIS BACKEND - CORRECTED
+HERE, HAVING BEEN WRITTEN DOWN TWICE.** docs/A100.md measures a GEMM whose operand is a 2D texture
+of `(K/4) x M` with `M = tokens^2`, so the pair COUNT must fit one texture axis and stops at
+`sqrt(MAX_TEXTURE_SIZE)` - 181 on that card, 128 on the M5 here. Real, for that layout.
+
+Addressed **linearly** - what `runtime/storage.js` does, and what the triangle kernel has always
+done - the bound is the total element count, `2048 * MAX_TEXTURE_SIZE * 4`: **134,217,728 floats on
+this M5, which is 1024 tokens** at AF2's 128-channel pair width. Measured, not argued: a 400-token
+pair tensor of 20,480,000 floats round-trips with 0 differing. So the wall this file described in
+its first version is eight times further out than it said, and AF3's pair-transition is
+expressible after all. The 2,047-residue storage-binding ceiling the WebGPU port hits is the next
+wall, not this one.
+
+What remains true: WebGPU has no shape-dependent limit at all (a buffer is one-dimensional and
+`maxStorageBufferBindingSize` is 2 GB), and a 2D-operand kernel written for speed would still meet
+the axis limit - so the layout is a real constraint on how a fast GEMM gets written here, just not
+on whether a fold is expressible.
 
     MAX_TEXTURE_SIZE 32768 -> 181 tokens      16384 -> 128      8192 -> 90      2048 -> 45
 

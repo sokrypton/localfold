@@ -2,22 +2,28 @@
  * What a WebGL2 context has to provide for this backend, and the ceilings that
  * follow from what it reports.
  *
- * 🔴 THE LIMITS ARE THE WHOLE FEASIBILITY QUESTION HERE, WHICH IS NOT TRUE OF
- * WebGPU. A WebGPU buffer is one-dimensional and 2 GB on the cards measured, so
- * a tensor's SHAPE never decides whether a kernel can be written. A WebGL2
- * tensor lives in a TEXTURE with a maximum axis, so `MAX_TEXTURE_SIZE` decides
- * what is expressible at all - and AF3's pair-transition, 40000x128x512, is not
- * expressible on a card reporting 32,768 (docs/A100.md, "WebGL2 reaches 48% of
- * this device"). A kernel that is 1.6x slower is a trade; a kernel that cannot
- * be written is a wall, and this module is where the wall is computed rather
- * than discovered in a link error.
+ * 🔴 A CEILING HERE IS A PROPERTY OF A LAYOUT, NOT OF THE API - AND THE ONE
+ * THIS REPOSITORY QUOTED IS THE WRONG ONE FOR ITS OWN KERNELS. docs/A100.md
+ * concludes that the pair track "stops fitting a texture axis at 181 tokens"
+ * and that AF3's pair-transition "cannot be expressed". That is measured on a
+ * GEMM whose operand is a 2D texture of `(K/4) x M` with `M = tokens^2`, so the
+ * pair COUNT has to fit one texture axis: a real ceiling for that layout, and
+ * `pairTokenCeiling` below is it.
+ *
+ * It is not the ceiling for a tensor addressed LINEARLY, which is what
+ * `webgl/runtime/storage.js` does and what the triangle kernel has always done.
+ * There the bound is the total element count - `2048 * MAX_TEXTURE_SIZE * 4` -
+ * which on the M5 measured here is 134,217,728 floats, or **1024 tokens** at
+ * AF2's 128-channel pair width. Checked rather than argued: a 400-token pair
+ * tensor of 20,480,000 floats round-trips with 0 of them differing
+ * (`tools/gpu/check-webgl-runtime.js`). Both numbers are right; only one of
+ * them bounds this tree.
  *
  * 🔴 AND THE CARDS THAT NEED THIS BACKEND REPORT SMALLER NUMBERS THAN THE ONE
- * THAT MEASURED IT. Every figure in docs/A100.md comes off an A100 reporting
- * `MAX_TEXTURE_SIZE` 32,768. The machines a WebGL2 fallback EXISTS for are the
- * ones without WebGPU, which are older, and the WebGL2 specification floor is
- * 2,048 - a pair-track ceiling of 45 tokens rather than 181. So the ceiling is
- * a function of the context, never a constant, and `pairTokenCeiling` is it.
+ * THAT MEASURED IT, whichever layout is used. Every figure in docs/A100.md comes
+ * off an A100 reporting `MAX_TEXTURE_SIZE` 32,768; this M5 reports 16,384, which
+ * halves both ceilings. The machines a WebGL2 fallback EXISTS for are older
+ * still, and the specification floor is 2,048.
  *
  * `tools/gpu/probe-webgl2-limits.js` REPORTS what a context says. This module
  * DECIDES what that means for a fold. Two jobs, deliberately apart: a probe
@@ -49,9 +55,12 @@ export const OPTIONAL_EXTENSIONS = Object.freeze({
 });
 
 /**
- * The longest chain whose PAIR track fits one texture axis.
+ * The longest chain whose PAIR track fits one texture AXIS - the ceiling for a
+ * kernel that wants a 2D operand, and NOT the ceiling for a linearly addressed
+ * tensor, which is `tensorCapacity` in ./storage.js and is eight times longer
+ * here. Read that module before quoting this number as a limit on a fold.
  *
- * The pair tensor has `tokens * tokens` rows, so the operand stops fitting at
+ * The pair tensor has `tokens * tokens` rows, so a 2D operand stops fitting at
  * `sqrt(MAX_TEXTURE_SIZE)`. Measured against docs/A100.md's own table:
  *
  *     MAX_TEXTURE_SIZE 32768 -> 181 tokens   (32,761 rows fit, 200 -> 40,000 does not)
@@ -59,10 +68,10 @@ export const OPTIONAL_EXTENSIONS = Object.freeze({
  *                       8192 ->  90
  *                       2048 ->  45          (the WebGL2 specification floor)
  *
- * Past it every pair-track kernel would need its row index tiled across two
- * texture dimensions, with the address arithmetic that implies. That is work,
- * not an impossibility - but it is work no kernel here has done, so the ceiling
- * is real for anything in this tree today.
+ * Past it a 2D-operand kernel needs its row index tiled across two texture
+ * dimensions, with the address arithmetic that implies - which is precisely
+ * what the linear layout already does, and why the triangle kernel has never
+ * had this ceiling.
  */
 export function pairTokenCeiling(maxTextureSize) {
   return Math.floor(Math.sqrt(maxTextureSize));

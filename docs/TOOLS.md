@@ -11,9 +11,9 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-463 tools. `tools/fixtures/` is data and is not listed.
+464 tools. `tools/fixtures/` is data and is not listed.
 
-## `tools/gpu/` - the WebGPU lane (218)
+## `tools/gpu/` - the WebGPU lane (219)
 
 Each exports `async function main(device, args)` and is run as
 `node tools/gpu-chrome.mjs tools/gpu/<module>.js [--flags]`.
@@ -140,6 +140,7 @@ Each exports `async function main(device, args)` and is run as
 - **`check-trunk.js`** - GPU trunk vs the PyTorch oracle, with the released weights.
 - **`check-webapp.js`** - End-to-end browser verification of `index.html` (AtomWorks Studio + `web/app.js`) in headless Chrome:
 - **`check-webgl-kernels.js`** - The two WebGL2 kernels against independent CPU references - the gate they have never had.
+- **`check-webgl-runtime.js`** - The WebGL2 backend's runtime and its first three AF2 primitives, against CPU references - and the expressibility question the headline ceiling gets wrong.
 - **`clash-geometry.js`** - Do a fold's atoms overlap each other? The question bonds cannot answer.
 - **`compare-rfd4p-arms.mjs`** - Compare two `check-rfd4p-length.js --arm=` runs on the host.
 - **`dump-bioemu2-stages.js`** - webgpu/bioemu2's stages, handed back as one base64 blob for tools/dump-bioemu2-webgpu.mjs to write as a cuda/featurise input directory - the oracle metal/bioemu2 reads with --oracle=.
