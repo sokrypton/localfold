@@ -68,6 +68,9 @@ webgl/
   af3/
     trunk/transition.js         AF3's SwiGLU transition, a BLOCKED split
     trunk/triangle.js           AF3's triangle multiplication, an INTERLEAVED split
+    trunk/grid-attention.js     triangle (grid) self-attention, both directions
+    trunk/single-attention.js   the single track, biased by the pair
+    trunk/pairformer-block.js   seven sub-layers threaded, not seven parallel deltas
   af2/
     multimer/template.js        the multimer's nine-projection template embedder
     evoformer/block.js          a whole Evoformer block and the extra-MSA block, nine sub-layers
