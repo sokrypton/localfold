@@ -1251,9 +1251,54 @@ atoms. This file has already recorded one bug of exactly that kind: "the confide
 a single at the trunk's own magnitude WITH A HEAVY TAIL, since a uniform draw at std 200 never
 reaches 512 and left the arm green with the bug restored."
 
-**So the next step is no longer a differential across the recycle - that is done and clean - but a
-SHAPE sweep**: the same arms at the fold's real token and atom counts, where the windowed atom
-attention runs five windows rather than one and the magnitudes are the model's own. Not done here.
+🔴 **AND THE SHAPE SWEEP IS DONE, AND SO IS THE STRUCTURAL COMPARISON - THE STRUCTURES AGREE AND THE
+CONFIDENCE HEAD IS THE WHOLE OF IT.** `fold-esmfold2-webgl.js` reports `alphaCarbons` now, which is
+the one thing two BACKENDS can be compared on without either tool's confidence head in the way.
+Superposed against the WGSL fold's own PDB through `tools/gpu/superpose.js`:
+
+| | |
+|---|---:|
+| CA RMSD, 75 residues | **1.842 A** |
+| TM | **0.862** |
+| per-residue deviation | mostly 0.3 to 2 A |
+| the worst two | the LAST two residues, 7.13 and 10.06 A |
+
+**Two folds agreeing at TM 0.862 cannot differ by thirty points of predicted confidence.** The
+trunk, the recycle and the sampler are right; the head's score is not.
+
+🔴 **AND IT IS SYSTEMATIC, NOT A SAMPLE** - which had to be excluded before any of this counted as a
+defect, because the two backends' sampler RNGs differ, so these are different draws. Four seeds:
+**57.503, 57.563, 57.342, 57.552**. Pinned to a tenth while the structure moves.
+
+🔴 **AND THE RANGE IS COMPRESSED RATHER THAN THE SCORE MERELY LOW.** Varying only the sampler:
+
+| sampler steps | 5 | 15 | 40 |
+|---|---:|---:|---:|
+| median CA-CA | **227.8 A** (a collapsed chain) | 3.637 | 3.719 |
+| mean pLDDT | **51.41** | 57.50 | 57.28 |
+
+A head that sees the structure properly scores a 227-angstrom chain near 25, not 51. So the
+structural term is present - pLDDT is not a constant - but its dynamic range is squeezed, and the
+whole distribution sits about 0.2 below the WGSL fold's with a similar spread (0.35-0.74 against
+0.52-0.95 on the per-residue 0-1 scale).
+
+**What is eliminated, each measured:** the ESM-C tower at 36 of 36 blocks; `z_init`; the trunk; the
+composed recycle loop; the distogram; the atom encoder, the diffusion and the confidence head on
+their own gates, at 6 tokens AND at the fold's 75; the representative-atom choice (both drivers call
+the same `shared/esmfold2/representative-atoms.js`); and the confidence pair bias, whose only WGSL
+addend this driver omits is the token-bond encoding - *"absmax 0.0 over a 59-mer"*, zero on a plain
+chain.
+
+**One shape-dependent gate failure did surface and is not the cause**:
+`check-webgl-esmfold2-confidence.js --tokens=75` fails "pTM and ipTM off the PAE logits" by
+**1.034e-8**, which is a bar too tight for 75 tokens rather than a defect - but it is green at the
+default 6 and nobody had run it at a fold's shape.
+
+**Still open**, and now narrowed to: the confidence head's score in the composed fold, given that the
+head is correct on its own inputs and the structure it is scoring agrees with the reference's to 1.84
+A. The next step is to feed the WebGL2 head the WGSL fold's own pair, single and coordinates and see
+whether it reproduces 88 - which separates a wrong input from a wrong composition, and is the last
+thing this hunt has not done.
 
 ### The threshold that chose between two projection kernels was fitted with the wrong dtype
 

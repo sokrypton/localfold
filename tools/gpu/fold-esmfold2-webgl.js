@@ -45,6 +45,33 @@ const option = (args, name, fallback) => {
 };
 
 /** Consecutive CA-CA distances, which is what says a chain is a chain. */
+/**
+ * The alpha carbons, in order - the one thing two BACKENDS' folds can be
+ * compared on without either tool's confidence head in the way.
+ *
+ * 🔴 ADDED BECAUSE "pLDDT 57.5 HERE AGAINST 88.1 THERE" DOES NOT SAY WHETHER THE
+ * STRUCTURE OR THE HEAD IS WRONG, and every stage gate is green. A superposition
+ * of these against `fold-esmfold2.js`'s PDB answers it in one number: agreement
+ * means the trunk and the sampler are right and the confidence head is not;
+ * disagreement means the fold is.
+ */
+function alphaCarbons(coordinates, features) {
+  const out = [];
+  for (let atom = 0; atom < features.atoms; atom += 1) {
+    if (!(features.mask[atom] > 0)) continue;
+    let isAlpha = true;
+    for (const [index, code] of [..."CA"].entries()) {
+      if (features.refAtomNameChars[atom * 4 + index] !== code.charCodeAt(0) - 32) {
+        isAlpha = false;
+      }
+    }
+    if (features.refAtomNameChars[atom * 4 + 2] !== 0) isAlpha = false;
+    if (!isAlpha) continue;
+    out.push(coordinates[atom * 3], coordinates[atom * 3 + 1], coordinates[atom * 3 + 2]);
+  }
+  return out;
+}
+
 function backboneSpacing(coordinates, features) {
   const spacings = [];
   let previous = null;
@@ -316,6 +343,8 @@ export async function main(device, args) {
     // reports min and max and this did not, which is why "mean pLDDT 57.4" sat
     // in webgl/README.md for a whole campaign without anyone asking whether the
     // per-residue values varied at all.
+    alphaCarbons: alphaCarbons(result.coordinates, features)
+      .map((v) => Number(v.toFixed(3))),
     minPlddt: result.plddt.length === 0 ? null
       : Number(Math.min(...result.plddt).toFixed(3)),
     maxPlddt: result.plddt.length === 0 ? null
