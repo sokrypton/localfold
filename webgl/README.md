@@ -1053,6 +1053,54 @@ sufficient one. A generalisation measured on one model is a regression on anothe
 reason this is a sentence rather than a shipped defect is that the AF2 differential runs on every
 pass.
 
+### The contraction is 256 matmuls, and the fragment order decides whether one fits in cache
+
+🔴 **THE SAME PROPERTY AS THE PROJECTION'S ROW ORDER, IN THE KERNEL WHERE IT IS WORTH MORE.** The
+pair-blocked contraction was the third-largest kernel in a bioemu2 fold - **1591 ms of 7074, 22.5%,
+in only 64 calls** - at **6.2 GFLOP/s** on a device whose padded projections reach 95 to 113. It is
+not fetch-RATE bound: `tools/gpu/bench-webgl-contract.js` measures it at **0.58 G fetches a second**
+where this context does about ten.
+
+It is bound by TRAFFIC, and the arithmetic says where from. `out[i][j][c] = sum_k a[c][i][k] *
+b[c][j][k]` is `channels` INDEPENDENT matmuls, one per channel, and at 68 tokens one channel's two
+operands are `2 * 68 * 68 * 4` = **37 KiB** - small enough to stay in cache for that channel's whole
+68x68x68 product. With a block of two i and four j, operand `a` is wanted by `L / 4` = 17 j-blocks
+and `b` by `L / 2` = 34 i-blocks, so the 9.4 MiB of operands are read about **25 times each, 242 MB
+a call** - and the measured 9.3 GB/s says that is exactly what is happening.
+
+🔴 **AND THE FRAGMENT ORDER WAS SPENDING IT.** A fragment's texel index decoded with the CHANNEL
+group varying fastest (`cgroup = texel % C4`), so neighbouring fragments worked on different
+channels: 64 channel groups in flight together, 256 planes live, and not one of them resident. With
+the pair block varying fastest they share one channel's 37 KiB. Measured, the answer identical to
+all sixteen digits of the reported CA-CA in every arm:
+
+| | contraction at 68x256 | bioemu2 trunk, 48 blocks | the 20-step fold |
+|---|---:|---:|---:|
+| channel fastest | 24.7 ms | 21628 / 21577 ms | 45.9 s |
+| **pair block fastest** | **16.5 ms** | **18139 / 18129 ms** | **42.4 s** |
+| | **1.49x** | **1.19x** | **1.08x** |
+
+`--no-contract-channel-slowest` is the control arm. This is `ROW_FASTEST_X_FLOATS`' finding in a
+second kernel, and it was found by writing the bench rather than by reading the fold: the fold's own
+profile had the contraction at 14.9% and `linear.repack` at 9.6%, and the repack turned out to be
+**barrier and not kernel**.
+
+🔴 **AND IT IS WORTH NOTHING ON ESMFold2 OR AF3, FOR A REASON WORTH WRITING DOWN.** Both are
+**exactly** unchanged - ESMFold2's full configuration 62256 ms against 62419, same pTM 0.4132, same
+126 contacts; AF3 identical at pLDDT 66.525 - because the pair block needs `L % 4 === 0` and they
+fold 75 and 59 tokens. Those lengths take the one-pair-a-fragment fallback, where there is no block
+and so no order to get wrong. A knob's worth is a property of the configuration, and here the
+configuration is the protein's length.
+
+🔴 **AND THE SAME BENCH SAYS THE BLOCK ITSELF IS NOT UNCONDITIONALLY RIGHT, WHICH IS NOT RESOLVED.**
+Swept over length at 256 channels, the blocked kernel is 4.09x the one-pair one at 68 and **0.26x at
+128** - and the order's own worth inverts there too (0.57x), which fits the cache argument above,
+since one channel's operands are 131 KiB at 128 tokens. But the sweep does not repeat cleanly past
+68 (the one-pair arm reads 21.4 GFLOP/s at 128 and 4.7 at 160, and the outputs alone are 26 to 41
+MiB a ring entry), so no threshold is fitted to it here. `contractStrided` enables the block on
+`L % 4 === 0` and eight draw buffers with **no length ceiling**, and whether it wants one is the
+open question this bench was built to answer next.
+
 ### How close can this get, and why not closer
 
 The campaign above took a bioemu2 fold from **968 s to 57.6 s** and its device peak from 1656 MiB

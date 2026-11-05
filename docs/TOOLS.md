@@ -11,9 +11,9 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-525 tools. `tools/fixtures/` is data and is not listed.
+526 tools. `tools/fixtures/` is data and is not listed.
 
-## `tools/gpu/` - the WebGPU lane (280)
+## `tools/gpu/` - the WebGPU lane (281)
 
 Each exports `async function main(device, args)` and is run as
 `node tools/gpu-chrome.mjs tools/gpu/<module>.js [--flags]`.
@@ -53,6 +53,7 @@ Each exports `async function main(device, args)` and is run as
 - **`bench-triangle-project.js`** - The two triangle projection kernels alone, at several register blocks.
 - **`bench-triangle.js`** - Time triangle multiplication at the sizes AF3 actually has to run.
 - **`bench-trunk.js`** - Where a trunk pass's time goes.
+- **`bench-webgl-contract.js`** - What AF3's triangle CONTRACTION costs in WebGL2, and whether it is bound by fetches, by arithmetic or by neither.
 - **`bench-webgl-linear.js`** - What the WebGL2 dense projection costs, at the shapes the models fold at.
 - **`bench-webgl-tf-linear.js`** - The dense projection through TRANSFORM FEEDBACK, at the shape a bioemu2 fold is made of, against the fragment kernel that ships.
 - **`bench-webgl-upload.js`** - What it costs to get weight bytes into a WebGL2 texture, and to read any back.

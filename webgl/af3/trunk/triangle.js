@@ -299,7 +299,8 @@ void main() {
  * The channel loop is unrolled so only eight accumulators are live at a time
  * rather than thirty-two, and so that a `vec4` is never indexed by a variable.
  */
-export const blockedContractSource = (length, channels, direction, divideByLength) => {
+export const blockedContractSource = (length, channels, direction, divideByLength,
+  channelSlowest = true) => {
   const planes = 8;
   const component = ["x", "y", "z", "w"];
   // For the outgoing direction a row is `a[i][k]`, contiguous in k; for the
@@ -330,6 +331,7 @@ const int PAIRS = ${length * length};
 const int C4 = ${channels / 4};
 const int IBLOCKS = ${length / 2};
 const int JBLOCKS = ${length / 4};
+const int BLOCKS = ${(length / 2) * (length / 4)};
 uniform sampler2D aTex;
 uniform sampler2D bTex;
 
@@ -339,10 +341,13 @@ void main() {
 ${Array.from({ length: planes }, (_, p) => `    result${p} = vec4(0.0);`).join("\n")}
     return;
   }
-  int cgroup = texel % C4;
-  int rest = texel / C4;
-  int jblock = rest % JBLOCKS;
-  int iblock = rest / JBLOCKS;
+${channelSlowest
+  ? `  int block = texel % BLOCKS;
+  int cgroup = texel / BLOCKS;`
+  : `  int cgroup = texel % C4;
+  int block = texel / C4;`}
+  int jblock = block % JBLOCKS;
+  int iblock = block / JBLOCKS;
   int i0 = iblock * 2;
   int i1 = i0 + 1;
   int j0 = jblock * 4;
@@ -359,10 +364,11 @@ ${[0, 1, 2, 3].map(channelBlock).join("\n")}
  * Plane `(i & 1) * 4 + (j & 3)` holds the pair at
  * `((i >> 1) * JBLOCKS + (j >> 2)) * C4 + cgroup`.
  */
-export const contractRepackSource = (length, channels) => `${PRELUDE}${ONE_TARGET}
+export const contractRepackSource = (length, channels, channelSlowest = true) => `${PRELUDE}${ONE_TARGET}
 const int L = ${length};
 const int C4 = ${channels / 4};
 const int JBLOCKS = ${length / 4};
+const int BLOCKS = ${(length / 2) * (length / 4)};
 const int ELEMENTS = ${length * length * channels};
 ${Array.from({ length: 8 }, (_, p) => `uniform sampler2D plane${p};`).join("\n")}
 
@@ -373,7 +379,8 @@ void main() {
   int pair = texel / C4;
   int i = pair / L;
   int j = pair - i * L;
-  int source = ((i >> 1) * JBLOCKS + (j >> 2)) * C4 + cgroup;
+  int block = (i >> 1) * JBLOCKS + (j >> 2);
+  int source = ${channelSlowest ? "cgroup * BLOCKS + block" : "block * C4 + cgroup"};
   int plane = (i & 1) * 4 + (j & 3);
 ${Array.from({ length: 7 }, (_, p) =>
   `  if (plane == ${p}) { result = fetch4(plane${p}, source); return; }`).join("\n")}
@@ -447,14 +454,16 @@ function contractInto(execution, output, a, b, length, channels, divideByLength,
   const planes = Array.from({ length: 8 },
     (_, p) => execution.allocate(planeTexels * 4, `af3.triangle.pair-plane${p}`));
   execution.dispatch({
-    source: blockedContractSource(length, channels, direction, divideByLength),
+    source: blockedContractSource(length, channels, direction, divideByLength,
+      !execution.noContractChannelSlowest),
     outputs: planes,
     inputs: { aTex: a, bTex: b },
     label: `af3.triangle.contract-block:${direction}:${length}x${channels}`
       + `${divideByLength ? ":over-length" : ""}`,
   });
   execution.dispatch({
-    source: contractRepackSource(length, channels),
+    source: contractRepackSource(length, channels,
+      !execution.noContractChannelSlowest),
     output,
     inputs: Object.fromEntries(planes.map((plane, p) => [`plane${p}`, plane])),
     label: `af3.triangle.contract-repack:${length}x${channels}`,

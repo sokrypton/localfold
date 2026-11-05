@@ -66,6 +66,11 @@
  *   --no-contract-block   AF3's contraction one pair a fragment, which reads
  *                         both operands' rows for every pair rather than
  *                         sharing them across a block of two i and four j.
+ *   --no-contract-channel-slowest
+ *                         The pair-blocked contraction's fragments ordered by
+ *                         CHANNEL group rather than pair block, so neighbours
+ *                         work on different channel planes and none of them
+ *                         stays in cache. Bit-identical.
  *   --no-row-fastest      The int5 projection's fragments ordered by output
  *                         group rather than row block, so neighbours walk
  *                         different weight rows and the weight is streamed
@@ -113,6 +118,7 @@ export function webglExecutionOptions(args) {
     noContractBlock: flag(args, "no-contract-block"),
     noRowFastest: flag(args, "no-row-fastest"),
     noStridePad: flag(args, "no-stride-pad"),
+    noContractChannelSlowest: flag(args, "no-contract-channel-slowest"),
     poolLabelPattern: pattern("pool-labels"),
     profile: flag(args, "profile") ? new Map() : null,
   };

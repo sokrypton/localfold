@@ -176,6 +176,36 @@ export class Execution {
      */
     this.noStridePad = options.noStridePad ?? false;
     /**
+     * The control arm for the pair-blocked contraction's fragment order
+     * (`webgl/af3/trunk/triangle.js`): the CHANNEL group varying fastest, as it
+     * did, rather than the pair block.
+     *
+     * 🔴 THE SAME PROPERTY `ROW_FASTEST_X_FLOATS` NAMES IN THE PROJECTION, in
+     * the kernel where it is worth more. A contraction is `channels`
+     * INDEPENDENT matmuls, one a channel, and one channel's operands at 68
+     * tokens are 2 * 68 * 68 * 4 = 37 KiB - small enough to stay in cache for
+     * the whole 68x68x68 product. With the channel varying fastest,
+     * neighbouring fragments work on DIFFERENT channels, so 64 channel groups
+     * are in flight together and none of their planes stays; with it varying
+     * slowest they share one. Measured 1.49x at 68 tokens, bit-identical.
+     */
+    this.noContractChannelSlowest = options.noContractChannelSlowest ?? false;
+    /**
+     * The control arm for the pair-blocked contraction's fragment order
+     * (`webgl/af3/trunk/triangle.js`): the CHANNEL group varying fastest, as it
+     * did, rather than the pair block.
+     *
+     * 🔴 THE SAME PROPERTY `ROW_FASTEST_X_FLOATS` NAMES IN THE PROJECTION, in
+     * the kernel where it is worth more. A contraction is 256 INDEPENDENT
+     * matmuls, one a channel, and one channel's operands at 68 tokens are
+     * 2 * 68 * 68 * 4 = 37 KiB - small enough to stay in cache for the whole
+     * 68x68x68 product. With the channel varying fastest, neighbouring
+     * fragments work on DIFFERENT channels, so 64 channel groups are in flight
+     * together and none of their planes stays; with it varying slowest they
+     * share one. Measured 1.49x at 68 tokens, bit-identical.
+     */
+    this.noContractChannelSlowest = options.noContractChannelSlowest ?? false;
+    /**
      * Where the HOST time inside `dispatch` goes, when asked for.
      *
      * 🔴 BECAUSE THE GPU IS 3% OF AN AF2 WebGL FOLD AND NOTHING SAID SO.
