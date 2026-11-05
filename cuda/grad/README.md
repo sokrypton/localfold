@@ -68,7 +68,11 @@ against its crystal, 30 steps: diffusion 0.0285 -> 0.0046, denoised RMSD at sigm
 -> 0.32; ~1.05 s a step at 68 tokens in float32. Recycling as AF3 trains it: a step runs 1-4 trunk passes
 (`--cycles=`, uniform), the earlier ones without a gradient, each handing its pair and single to the next; three passes
 against the port's own recycle read pair 3.4e-7, single 1.6e-7, and a cycle costs ~65 ms (one pass 478 ms a step, four
-672, at `--samples=4`). Not yet: smooth LDDT and the bond loss, the confidence
+672, at `--samples=4`). AF3's smooth LDDT (Algorithm 27: pairs under 15 A, eps the mean of sigmoid(c - |d - d_true|)
+over c in 0.5, 1, 2, 4) on each sample's denoised atoms, its gradient by hand (4.7e-8 against finite differences) and
+weighted as the diffusion term's; it cannot reach zero - a perfect pair's eps is 0.804 - so the smoke test asks the
+loss ABOVE that floor to halve (20 steps: 0.474 -> 0.154, smooth LDDT 0.273 -> 0.220 against a floor of 0.196). The
+bond loss is over ligand-polymer bonds alone, so zero on a protein. Not yet: the confidence
 head's losses, BF16 and the stack's memory machinery, more than one target.
 
 🔴 **THE DENOISER'S 4e-4 IS THE PORT'S ROUNDING, AND IT WAS SHOWN RATHER THAN ASSUMED.** boltz2 reads 4.1e-4 against

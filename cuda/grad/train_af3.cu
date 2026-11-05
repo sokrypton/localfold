@@ -11,7 +11,8 @@
 // The template term runs whatever the input: a target with no template still has padded slots, and in this lineage they
 // weigh (a padded slot's restype is zero, and a one-hot of zero is a one) - 0.54 of the pair here when it was left out.
 //
-// Recycling: a step runs 1..--cycles passes (uniform), the gradient through the last only. Not yet: smooth LDDT and the bond loss, the confidence head and its losses, mixed precision, more than one target.
+// Recycling: a step runs 1..--cycles passes (uniform), the gradient through the last only. Smooth LDDT (Algorithm 27).
+// Not yet: the bond loss (ligand-polymer bonds only: zero on a protein), the confidence head and its losses, mixed precision, more than one target.
 //
 // Before training it holds its own trunk to cuda/af3's runTrunk on the same input (pass 0): the composition this file
 // writes, against the port's.
@@ -434,6 +435,7 @@ int main(int argc, char** argv) {
   std::vector<double> w(atoms);
   for (size_t i = 0; i < atoms; ++i) w[i] = xm[i];
   size_t nAt = 0; for (double v : w) nAt += v > 0;
+  std::vector<size_t> live; for (size_t i = 0; i < atoms; ++i) if (w[i] > 0) live.push_back(i);
   // pass -1 and the last only measure, on a fixed sigma ladder, so the two are comparable
   for (int step = -1; step <= steps; ++step) {
     const bool train = step >= 0 && step < steps;
@@ -462,7 +464,7 @@ int main(int argc, char** argv) {
     // the diffusion loss, a sample at a time (each sample's denoiser saves freed before the next)
     GK(cudaMemset(dTs, 0, (size_t)n * Cs * sizeof(g::real))); GK(cudaMemset(dTp, 0, nn * Cz * sizeof(g::real)));
     GK(cudaMemset(dTf, 0, (size_t)n * te.F * sizeof(g::real)));
-    double lDiff = 0, rmsdLow = 0; int nLow = 0;
+    double lDiff = 0, lLddt = 0, rmsdLow = 0; int nLow = 0;
     for (int smp = 0; smp < samples; ++smp) {
       g::Scratch sc;
       // sigma (the last pass: a fixed ladder, so a step's number is comparable), the augmented truth, the noise
@@ -501,6 +503,38 @@ int main(int argc, char** argv) {
           dg[i * 3 + p] = 4.0 * lam * 2 * e / (3.0 * nAt) / samples;
         }
       }
+      // AF3's smooth LDDT (its Algorithm 27): over atom pairs whose true distance is under 15 A (30 for a nucleotide:
+      // none here), eps = mean over c in {0.5, 1, 2, 4} of sigmoid(c - |d - d_true|), the loss 1 - its mean - frame
+      // free, so on the prediction and the unaugmented truth, and its gradient into the denoised atoms by hand
+      double num = 0, den = 0;
+      std::vector<std::pair<std::pair<size_t, size_t>, double>> terms;   // (l, m) and d eps / d d
+      for (size_t l : live) for (size_t m : live) {
+        if (l == m) continue;
+        double dt2 = 0, dp2 = 0;
+        for (int p = 0; p < 3; ++p) {
+          const double et = xt[l * 3 + p] - xt[m * 3 + p], ep = xp[l * 3 + p] - xp[m * 3 + p];
+          dt2 += et * et; dp2 += ep * ep;
+        }
+        const double dtr = sqrt(dt2);
+        if (dtr >= 15) continue;
+        const double dpr = sqrt(dp2), del = fabs(dtr - dpr);
+        double eps = 0, deps = 0;
+        for (double c : {0.5, 1.0, 2.0, 4.0}) {
+          const double sg = 1 / (1 + exp(-(c - del)));
+          eps += sg / 4; deps -= sg * (1 - sg) / 4;          // d eps / d del
+        }
+        num += eps; den += 1;
+        terms.push_back({{l, m}, deps * (dpr > dtr ? 1 : -1) / std::max(dpr, 1e-8)});   // d eps / d dpr, over dpr
+      }
+      const double lddt = den ? num / den : 1;
+      for (auto& [lm, gd] : terms) {
+        const size_t l = lm.first, m = lm.second;
+        for (int p = 0; p < 3; ++p) {          // d(1 - lddt)/dx_l = -(1/den) d eps/d d (x_l - x_m)/d, both ends
+          const double v = -4.0 * gd * (xp[l * 3 + p] - xp[m * 3 + p]) / den / samples;
+          dg[l * 3 + p] += v; dg[m * 3 + p] -= v;
+        }
+      }
+      lLddt += (1 - lddt) / samples;
       lDiff += lam * mse / samples;
       if (sigma < 4) { rmsdLow += sqrt(mse * 3); ++nLow; }
       if (train) {
@@ -511,13 +545,17 @@ int main(int argc, char** argv) {
         g::add(dTs, ts, (size_t)n * Cs); g::add(dTp, tp, nn * Cz); g::add(dTf, tfd, (size_t)n * te.F);
       }
     }
-    const double loss = 4 * lDiff + 0.03 * lDist;
+    const double loss = 4 * (lDiff + lLddt) + 0.03 * lDist;
     if (!train) {
-      printf("%s  loss %.4f  (diffusion %.4f, distogram %.4f; the fixed sigma ladder, rmsd at sigma < 4: %.3f A)\n",
-             step < 0 ? "before  " : "after   ", loss, lDiff, lDist, nLow ? rmsdLow / nLow : -1.0);
-      if (step < 0) { before = loss; continue; }
-      // the smoke test's verdict: on the same sigmas, the loss must have come down by half
-      const bool ok = loss < 0.5 * before;
+      printf("%s  loss %.4f  (diffusion %.4f, smooth lddt %.4f, distogram %.4f; the fixed sigma ladder, rmsd at sigma < 4: %.3f A)\n",
+             step < 0 ? "before  " : "after   ", loss, lDiff, lLddt, lDist, nLow ? rmsdLow / nLow : -1.0);
+      // the smoke test's verdict: on the same sigmas, the loss above its floor must have come down by half - smooth
+      // LDDT cannot reach zero (a perfect pair's eps is the mean of sigmoid(c), 0.804, so its loss floor is 0.196)
+      double floor = 0; for (double cc : {0.5, 1.0, 2.0, 4.0}) floor += 4 * (1 - 1 / (1 + exp(-cc))) / 4;
+      const double above = loss - floor;
+      if (step < 0) { before = above; continue; }
+      printf("above the floor (%.4f): %.4f -> %.4f\n", floor, before, above);
+      const bool ok = above < 0.5 * before;
       printf("%s\n", ok ? "PASS" : "FAIL: the loss did not halve");
       return ok ? 0 : 1;
     }
@@ -554,7 +592,7 @@ int main(int argc, char** argv) {
     const double gn = opt.lastNorm;
     cudaEventRecord(e1, STREAM); CK(cudaStreamSynchronize(STREAM));
     float ms; cudaEventElapsedTime(&ms, e0, e1);
-    printf("step %3d  loss %.4f  (diffusion %.4f, distogram %.4f)  cycles %d  |grad| %.3e  %.0f ms\n", step, loss, lDiff, lDist, c, gn, ms);
+    printf("step %3d  loss %.4f  (diffusion %.4f, smooth lddt %.4f, distogram %.4f)  cycles %d  |grad| %.3e  %.0f ms\n", step, loss, lDiff, lLddt, lDist, c, gn, ms);
     (void)trunkMark;
   }
   return 0;
