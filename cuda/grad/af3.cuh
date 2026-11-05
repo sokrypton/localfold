@@ -420,21 +420,39 @@ __host__ __device__ __forceinline__ unsigned long long dropMix(unsigned long lon
   x = (x ^ (x >> 27)) * 0x94d049bb133111ebull;
   return x ^ (x >> 31);
 }
-__global__ void dropK(real* x, int A, int B, int C, bool perRow, float rate, unsigned long long seed) {
-  const size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= (size_t)A * B * C) return;
+__device__ __forceinline__ float dropKeep(size_t t, int B, int C, bool perRow, float rate, unsigned long long seed) {
   const int c = (int)(t % C);
   const size_t rr = t / C;
   const int a = (int)(rr / B), b = (int)(rr % B);
   const unsigned long long key = perRow ? (unsigned long long)b * C + c : ((unsigned long long)a * C + c) | (1ull << 62);
   const float u = (float)(dropMix(seed ^ dropMix(key)) >> 40) * (1.f / 16777216.f);
-  x[t] = u < rate ? (real)0 : x[t] / (1 - (real)rate);
+  return u < rate ? 0.f : 1.f;
 }
+__global__ void dropK(real* x, int A, int B, int C, bool perRow, float rate, unsigned long long seed) {
+  const size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)A * B * C) return;
+  x[t] = dropKeep(t, B, C, perRow, rate, seed) == 0.f ? (real)0 : x[t] / (1 - (real)rate);
+}
+#ifndef GRAD_F64
+// (the bf16 backward's: y = mask(x) / (1 - rate) from a bf16 running gradient, into a fresh bf16 copy)
+__global__ void dropCopyBfK(const bf* x, bf* y, int A, int B, int C, bool perRow, float rate, unsigned long long seed) {
+  const size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)A * B * C) return;
+  y[t] = __float2bfloat16(dropKeep(t, B, C, perRow, rate, seed) * __bfloat162float(x[t]) / (1 - rate));
+}
+#endif
 enum { DROP3_TRI_OUT = 1, DROP3_TRI_IN, DROP3_START, DROP3_END, DROP3_MSA };
 inline void drop3(real* x, int A, int B, int C, bool perRow, float rate, unsigned long long seed, int module) {
   if (rate <= 0) return;
   dropK<<<blocks((size_t)A * B * C), 256, 0, STREAM>>>(x, A, B, C, perRow, rate, dropMix(seed * 8 + module));
 }
+#ifndef GRAD_F64
+inline bf* drop3Bf(const bf* x, int A, int B, int C, bool perRow, float rate, unsigned long long seed, int module) {
+  bf* y = bfGet((size_t)A * B * C);
+  dropCopyBfK<<<blocks((size_t)A * B * C), 256, 0, STREAM>>>(x, y, A, B, C, perRow, rate, dropMix(seed * 8 + module));
+  return y;
+}
+#endif
 struct PairformerSave {
   const real *pair0, *single0;
   real *p1, *p2, *p3, *p4, *pair5, *s1;
@@ -537,9 +555,6 @@ inline PairformerSave pairformerForward(Pairformer& b, const Dialect& d, const r
     s.pair5 = acc;
   } else {
     const float rate = b.dropRate;
-#ifndef GRAD_F64
-    if (rate > 0 && BF16) { fprintf(stderr, "the AF3 pairformer's dropout is not written for its bf16 path\n"); exit(1); }
-#endif
     s.p1 = cloneR(pair, nn * Cz);
     s.tOut = triMulForward(b.triOut, pair, pairMask, u, n); drop3(u, n, n, Cz, true, rate, b.dropSeed, DROP3_TRI_OUT); add(s.p1, u, nn * Cz);
     s.p2 = cloneR(s.p1, nn * Cz);
@@ -611,12 +626,15 @@ inline void pairformerBackward(Pairformer& b, const Dialect& d, const Pairformer
       GK(cudaMemcpyAsync(dsingle, ds, (size_t)n * Cs * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
     }
     { Range r_("bw.pairTrans"); gtBackward(b.pairTrans, s.pt, dpb, dpb); }
+    // (dropout: an update's gradient is a masked copy of the running one, so the in-place pass reads the copy)
+    const float rate = b.dropRate;
+    auto du = [&](bool perRow, int module) -> const bf* { return rate > 0 ? drop3Bf(dpb, n, n, Cz, perRow, rate, b.dropSeed, module) : dpb; };
     if (b.hasGrid) {
-      { Range r_("bw.grid2"); gridBackward(b.grid2, d, s.g2, pairMask, maskT, dpb, dpb); }
-      { Range r_("bw.grid1"); gridBackward(b.grid1, d, s.g1, pairMask, maskT, dpb, dpb); }
+      { Range r_("bw.grid2"); Scratch sc; gridBackward(b.grid2, d, s.g2, pairMask, maskT, du(false, DROP3_END), dpb); }
+      { Range r_("bw.grid1"); Scratch sc; gridBackward(b.grid1, d, s.g1, pairMask, maskT, du(true, DROP3_START), dpb); }
     }
-    { Range r_("bw.triIn"); triMulBackward(b.triIn, s.tIn, pairMask, dpb, dpb); }
-    { Range r_("bw.triOut"); triMulBackward(b.triOut, s.tOut, pairMask, dpb, dpb); }
+    { Range r_("bw.triIn"); Scratch sc; triMulBackward(b.triIn, s.tIn, pairMask, du(true, DROP3_TRI_IN), dpb); }
+    { Range r_("bw.triOut"); Scratch sc; triMulBackward(b.triOut, s.tOut, pairMask, du(true, DROP3_TRI_OUT), dpb); }
     bfToFK<<<blocks(nn * Cz), 256, 0, STREAM>>>(dpb, dpair, nn * Cz);
     return;
   }

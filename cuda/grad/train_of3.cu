@@ -28,7 +28,9 @@
 //   nvcc -O2 -std=c++17 -arch=sm_80 --default-stream per-thread -o cuda/grad/train-of3 cuda/grad/train_of3.cu -lcublas -lcublasLt -ldl -lcurand
 //   cuda/grad/train-of3 --bundle=model-openbind0-f32 --family=openbind0 --examples=<file> [--steps=N] [--batch=1]
 //       [--crop=384] [--samples=48] [--lr=1.8e-3] [--warmup=1000] [--bond=0] [--save=<ckpt>] [--save-every=N]
-//       [--resume=<ckpt>] [--seed=1] [--init=bundle|of3] [--smoke]
+//       [--resume=<ckpt>] [--seed=1] [--init=bundle|of3] [--tf32] [--bf16] [--no-dropout] [--val=<file>] [--smoke]
+// --check-ckpt=k / --check-perm=k / --check-bf16=k: the recomputation, the truth's permutation and the bf16 trunk held
+// to their references on example k.
 // --init=of3: OpenFold3's from-scratch initialisation instead of the bundle's weights.
 // --smoke: the gate's short run - before and after, on the first example whole and on fixed draws, the loss above its
 // floor (smooth LDDT's 0.196 a weight) must halve.
@@ -480,8 +482,8 @@ static of3::Layout layoutOf(const Example& e) {
 
 int main(int argc, char** argv) {
   std::string bundle = "model-openbind0-f32", family = "openbind0", examplesPath, savePath, resumePath;
-  int steps = 30, samples = 48, batch = 1, crop = 384, saveEvery = 0, checkCkpt = -1, checkPerm = -1; std::string init = "bundle";
-  bool dropout = true, dropInFixed = false;   // (dropInFixed: --check-ckpt's fixed draws with the masks on)
+  int steps = 30, samples = 48, batch = 1, crop = 384, saveEvery = 0, checkCkpt = -1, checkPerm = -1, checkBf16 = -1; std::string init = "bundle";
+  bool dropout = true, dropInFixed = false, bf16Trunk = false;   // (dropInFixed: --check-ckpt's fixed draws with the masks on)
   std::string valPath; int valEvery = 0, valSamples = 5, valSteps = 200, valCrop = 1536; unsigned seed = 1; bool smoke = false, ckpt = true;
   double lrMax = 1.8e-3, bondWeight = 0; long warmup = 1000;
   for (int i = 1; i < argc; ++i) {
@@ -503,8 +505,10 @@ int main(int argc, char** argv) {
     else if (!strcmp(argv[i], "--smoke")) smoke = true;
     else if (!strcmp(argv[i], "--no-ckpt")) ckpt = false;
     else if (!strcmp(argv[i], "--no-dropout")) dropout = false;
+    else if (!strcmp(argv[i], "--bf16")) bf16Trunk = true;
     else if (auto v = opt("--check-ckpt=")) checkCkpt = atoi(v);
     else if (auto v = opt("--check-perm=")) checkPerm = atoi(v);
+    else if (auto v = opt("--check-bf16=")) checkBf16 = atoi(v);
     else if (auto v = opt("--init=")) init = v;
     else if (auto v = opt("--val=")) valPath = v;
     else if (auto v = opt("--val-every=")) valEvery = atoi(v);
@@ -743,12 +747,16 @@ int main(int argc, char** argv) {
       if (ckpt) g::ARENA.rewind(mk);
     }
     if (doubleAdd) g::add(a.pairs[nMsa], a.zIn, nn * Cz);
+    // (--bf16: the pairformer's bf16 kernels, OpenFold3's bf16-mixed for the bulk of the trunk; its pair and single
+    // between blocks stay float32)
+    const bool prevBf = g::BF16; g::BF16 = bf16Trunk;
     for (int k = 0; k < nPf; ++k) {
       const g::Arena::Mark mk = g::ARENA.mark();
       pfS[k] = g::af3::pairformerForward(pf[k], dl, a.pairs[nMsa + k], a.singles[k], d.pairMask, d.pairMaskT, d.seqMask, nullptr,
                                          a.pairs[nMsa + k + 1], a.singles[k + 1], n);
       if (ckpt) g::ARENA.rewind(mk);
     }
+    g::BF16 = prevBf;
     g::af3::distogramForward(dh, a.pairs[nMsa + nPf], n, a.logits);
   };
   // `c` cycles (model.py run_trunk): the first c - 1 without a gradient, each handing its pair and single on; `draw`
@@ -771,6 +779,7 @@ int main(int argc, char** argv) {
   // larger than a crop (both trunks side by side, uncropped, are what this check costs)
   if (examples[0].n > crop) printf("the composition check skipped: the first example (%d tokens) is larger than a crop\n", examples[0].n);
   else {
+    const bool bfWas = bf16Trunk; bf16Trunk = false;     // (the composition is float32's, against the float32 port)
     MSA_DRAW = "prefix";
     const float* refTf = buildTargetFeat();
     Trunk t = makeTrunk(nullptr, 64, false, refTf);
@@ -820,6 +829,7 @@ int main(int argc, char** argv) {
     cmp("pair (three passes)", a.pairs[nMsa + nPf], t.pair, nn * Cz); cmp("single (three passes)", a.singles[nPf], t.single, (size_t)n * Cs);
     if (!ok) { printf("FAIL: the composed trunk is not the port's\n"); return 1; }
     a.release(); d.release();
+    bf16Trunk = bfWas;
   }
 
   // ---- the sampler (the mini-rollout) and the confidence and diffusion steps
@@ -1100,10 +1110,12 @@ int main(int argc, char** argv) {
       for (int k = nPf; k-- > 0;) {
         g::Scratch sc;
         g::real *op = g::ARENA.get(nn * Cz), *os = g::ARENA.get((size_t)n * Cs);   // (the recomputed block's outputs)
+        const bool prevBf = g::BF16; g::BF16 = bf16Trunk;
         auto save = ckpt ? g::af3::pairformerForward(pf[k], dl, a.pairs[nMsa + k], a.singles[k], d.pairMask, d.pairMaskT, d.seqMask, nullptr, op, os, n)
                          : pfS[k];
         g::real *dpi = g::ARENA.zeros(nn * Cz), *dsi = g::ARENA.zeros((size_t)n * Cs);
         g::af3::pairformerBackward(pf[k], dl, save, d.pairMask, d.pairMaskT, d.seqMask, dp, dsg, dpi, dsi, nullptr);
+        g::BF16 = prevBf;
         GK(cudaMemcpyAsync(dp, dpi, nn * Cz * sizeof(g::real), cudaMemcpyDeviceToDevice, STREAM));
         GK(cudaMemcpyAsync(dsg, dsi, (size_t)n * Cs * sizeof(g::real), cudaMemcpyDeviceToDevice, STREAM));
       }
@@ -1157,6 +1169,29 @@ int main(int argc, char** argv) {
     printf("activation checkpointing: every gradient recomputed against kept saves, relRMS %.3e (two identical runs: %.3e)  %s\n",
            e, floor, ok ? "PASS" : "FAIL");
     ckpt = true; dropInFixed = false;
+    if (!ok) return 1;
+  }
+  // --check-bf16=k: example k (whole, fixed draws, dropout on) with the trunk's pairformer in bf16 and in float32 -
+  // every gradient compared: the bf16 kernels' error (bf16 keeps 8 bits), against the float runs' own floor
+  if (checkBf16 >= 0) {
+    dropInFixed = true;
+    auto grads = [&](bool on) {
+      bf16Trunk = on; ps.zeroGrad();
+      std::mt19937_64 gen(99);
+      runExample(examples.at(checkBf16), true, true, 2, gen);
+      std::vector<double> all;
+      for (auto* p : ps.all) { auto h = g::host(p->g, p->n); all.insert(all.end(), h.begin(), h.end()); }
+      return all;
+    };
+    const auto a = grads(true), b = grads(false), c = grads(false);
+    auto rel = [](const std::vector<double>& x, const std::vector<double>& y) {
+      double num = 0, den = 0; for (size_t i = 0; i < x.size(); ++i) { num += (x[i] - y[i]) * (x[i] - y[i]); den += y[i] * y[i]; }
+      return std::sqrt(num / std::max(den, 1e-300));
+    };
+    const double e = rel(a, b), floor = rel(c, b);
+    const bool ok = e < 0.05;
+    printf("bf16 trunk: every gradient against float32's, relRMS %.3e (two float runs: %.3e)  %s\n", e, floor, ok ? "PASS" : "FAIL");
+    bf16Trunk = false; dropInFixed = false;
     if (!ok) return 1;
   }
   // --check-perm=k: example k whole, its truth disguised - each repeated molecule's copies relabelled cyclically, every

@@ -130,8 +130,16 @@ and final zeros, a gating bias 1 and an adaptive-zero gate's -2, LayerNorms 1 an
 its name is, its fan-in recorded where the module builds the linear). The heads' final projections being zero, every
 cross entropy starts at log(bins) exactly - distogram, PAE and PDE 4.1589, pLDDT 3.912, resolved 0.693, as read - and
 from there 6MRR's mse goes 33.3 -> 12.8 in 40 steps. The Fourier noise embedding is a BUFFER in OpenFold3 (N(0, 1), U(0,
-1), never trained): it is frozen here, under either start. Not yet: BF16, and the denoiser's 48 samples batched (one at a time here: a 384-token,
-48-sample step is ~14 s on this A100, 6.3 s of it the denoiser).
+1), never trained): it is frozen here, under either start. - **precision** - float32 by default; `--tf32` puts the GEMMs on the tensor cores (the losses agree to three digits)
+  and `--bf16` runs the trunk's 48 pairformer blocks on their bf16 kernels - OpenFold3 trains under bf16 autocast - the
+  pair and single between blocks staying float32. `--check-bf16` holds every gradient so computed to float32's: 8.9e-3
+  (bf16's 8 bits), against 1.2e-5 between two float32 runs; the composition check always runs in float32. A 384-token,
+  48-sample step on 7BNY: 13.8 s float32, 8.2 s `--tf32`, 6.9 s `--tf32 --bf16`.
+- **validation** - `--val=<file>` (`--val-every`): OpenFold3's validation on the EMA weights, 1 + 3 cycles, a full
+  rollout of 5 x 200 steps, each sample's truth permuted, all-atom lDDT (mean, best, the confidence head's top-ranked).
+  The pretrained bundle reads 0.831 on 6MRR and 0.846 on 5K9P from their sequences alone.
+
+Not yet: the denoiser's 48 samples batched (one at a time here: 3.5 s of the 6.9).
 
 🔴 **THE DENOISER'S 4e-4 IS THE PORT'S ROUNDING, AND IT WAS SHOWN RATHER THAN ASSUMED.** boltz2 reads 4.1e-4 against
 `denoise()` and openbind0 2.0e-4, where every seam up to the encoder's skip is 1e-6 or under. Three measurements put it
