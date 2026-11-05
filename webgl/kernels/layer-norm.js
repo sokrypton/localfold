@@ -38,6 +38,7 @@
  * the same split for AF2's 50 pLDDT bins.
  */
 import { ONE_TARGET, PRELUDE } from "../runtime/execution.js";
+
 /** @typedef {import("../runtime/storage.js").Tensor} Tensor */
 
 
@@ -106,6 +107,39 @@ void main() {
   result = ${roundHalf ? "half4(value)" : "value"};
 }`;
 
+/**
+ * 🔴 SPLITTING THE ROW STATISTICS INTO THEIR OWN PASS IS A MEASURED NULL, AND
+ * THE ARITHMETIC THAT PREDICTED IT WAS COUNTING THE WRONG BYTES.
+ *
+ * Every fragment of the aligned kernel sweeps its whole row, and there are
+ * `CH4` fragments a row - so the row is read 192 times over at 768 channels,
+ * 384 two-pass. At 576 x 768 that is 42.5 M texel reads for an output of
+ * 110,592, which read as **2.4 GB/s** against the 290 GB/s
+ * `probe-webgl-draw-floor.js` clocks for a copy, and looked like a 40x
+ * inefficiency with an obvious fix: statistics once a row, then applied.
+ *
+ * Built, measured on the fold: **21063-21848 ms against the fused kernel's
+ * 21769-21815**, which is nothing, over two rounds. And the reason is that a
+ * 768-float row is **3 KiB**: it is cache-resident for the whole column of
+ * fragments that share it, so those 191 extra sweeps were already free and the
+ * 42.5 M figure was LOGICAL reads, not traffic. The same mistake as reading the
+ * contraction's "53 GB/s looks like DRAM" as a bandwidth bound - an amplified
+ * read count is not a bandwidth measurement, and only an arm says which.
+ *
+ * 🔴 AND IT WAS NOT BIT-IDENTICAL EITHER, WHICH THE FIRST VERSION OF THIS NOTE
+ * CLAIMED IT WOULD BE. The reduction runs over the same elements in the same
+ * order, so the statistics ought to be the same floats - but this compiler
+ * contracts the sums differently in a shader that then applies them and one
+ * that only writes them, and a 20-step sampler amplifies that: `caca`
+ * 3.8533516926432423 against 3.8531561311027773, with rmsd 1.595 and 201
+ * contacts unmoved either way. A change that costs arithmetic and buys nothing
+ * is a revert, so the split is gone and only this note is kept.
+ *
+ * What remains unexplained is the kernel's absolute cost: `layer-norm:576x768`
+ * is about 0.45 ms a call once the profile's wait is discounted, against the
+ * ~25 us a 110,592-texel draw costs, and neither its traffic nor its redundant
+ * reduction accounts for the difference.
+ */
 export const alignedLayerNormSource = (
   rows, channels, roundHalf, variance, hasWeight, hasBias,
 ) => `${PRELUDE}${ONE_TARGET}
