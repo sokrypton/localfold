@@ -25,8 +25,75 @@ struct GatedTransition {
   LayerNorm ln;
   Linear t1, t2;
   int C = 0, F = 0;
+  // chunkElems > 0: rows taken a chunk at a time (chunkElems / 2F rows: the hidden layer's elements a chunk) and nothing
+  // saved but the input, which the backward recomputes each chunk's hidden layer from - OpenFold3's
+  // transition_ckpt_chunk_size. The input must outlive the backward (a block's saved residual stream does).
+  size_t chunkElems = 0;
 };
-struct GtSave { LnSave ln; real *xn, *h; size_t rows; void *xb = nullptr, *hb = nullptr, *gb = nullptr; };   // (gb: swish(h1) h2, kept)
+struct GtSave { LnSave ln; real *xn, *h; size_t rows; void *xb = nullptr, *hb = nullptr, *gb = nullptr; const real* x = nullptr; bool bf = false; };   // (gb: swish(h1) h2, kept; x: the chunked form's input, bf its precision)
+inline size_t gtChunkRows(const GatedTransition& t, size_t rows) {
+  return t.chunkElems ? std::max<size_t>(1, std::min(rows, t.chunkElems / (2 * (size_t)t.F))) : rows;
+}
+// the chunked forward: each chunk's LN, hidden layer and output, its scratch returned before the next
+inline GtSave gtForwardChunked(const GatedTransition& t, const real* x, real* out, size_t rows, real beta) {
+  GtSave s; s.rows = rows; s.x = x;
+#ifndef GRAD_F64
+  s.bf = BF16;
+#endif
+  const size_t R = gtChunkRows(t, rows);
+  for (size_t r0 = 0; r0 < rows; r0 += R) {
+    Scratch scratch;
+    const size_t r = std::min(R, rows - r0);
+#ifndef GRAD_F64
+    if (BF16) {
+      bf* xb = bfGet(r * t.C); lnForward(t.ln, x + r0 * t.C, xb, r);
+      bf* hb = bfGet(r * 2 * t.F); linearFwdBf(t.t1, xb, hb, r);
+      bf* g = bfGet(r * t.F); swigluBfK<<<blocks(r * t.F), 256, 0, STREAM>>>(hb, g, r, t.F);
+      linearFwdBf(t.t2, g, out + r0 * t.C, r, beta);
+      continue;
+    }
+#endif
+    real* xn = ARENA.get(r * t.C); lnForward(t.ln, x + r0 * t.C, xn, r);
+    real* h = ARENA.get(r * 2 * t.F); t.t1.forward(xn, h, r);
+    real* g = ARENA.get(r * t.F); swigluK<<<blocks(r * t.F), 256, 0, STREAM>>>(h, g, r, t.F);
+    t.t2.forward(g, out + r0 * t.C, r, beta);
+  }
+  return s;
+}
+// ...and its backward, a chunk at a time: the chunk's forward again, then its backward (rows are independent, so dout
+// and dx may be one buffer: a chunk reads its rows of dout before it adds into its rows of dx)
+template <class PD>
+inline void gtBackwardChunked(GatedTransition& t, const GtSave& s, const PD* dout, PD* dx) {
+  const size_t rows = s.rows, R = gtChunkRows(t, rows);
+  for (size_t r0 = 0; r0 < rows; r0 += R) {
+    Scratch scratch;
+    const size_t r = std::min(R, rows - r0);
+    const real* x = s.x + r0 * t.C;
+#ifndef GRAD_F64
+    if (s.bf || sizeof(PD) == 2) {
+      bf* xb = bfGet(r * t.C); LnSave ls = lnForward(t.ln, x, xb, r);
+      bf* hb = bfGet(r * 2 * t.F); linearFwdBf(t.t1, xb, hb, r);
+      bf* g = bfGet(r * t.F); swigluBfK<<<blocks(r * t.F), 256, 0, STREAM>>>(hb, g, r, t.F);
+      const bf* db;
+      if constexpr (sizeof(PD) == 2) db = dout + r0 * t.C; else db = toBf(dout + r0 * t.C, r * t.C);
+      bf* dg = bfGet(r * t.F); linearBwdBf(t.t2, g, db, dg, r);
+      bf* dh = bfGet(r * 2 * t.F); swigluBwdBfK<<<blocks(r * t.F), 256, 0, STREAM>>>(hb, dg, dh, r, t.F);
+      bf* dxn = bfGet(r * t.C); linearBwdBf(t.t1, xb, dh, dxn, r);
+      lnBackward(t.ln, ls, dxn, dx + r0 * t.C, r, true);
+      continue;
+    }
+#endif
+    if constexpr (sizeof(PD) != 2) {
+      real* xn = ARENA.get(r * t.C); LnSave ls = lnForward(t.ln, x, xn, r);
+      real* h = ARENA.get(r * 2 * t.F); t.t1.forward(xn, h, r);
+      real* g = ARENA.get(r * t.F); swigluK<<<blocks(r * t.F), 256, 0, STREAM>>>(h, g, r, t.F);
+      real* dg = ARENA.get(r * t.F); t.t2.backward(g, dout + r0 * t.C, dg, r);
+      real* dh = ARENA.get(r * 2 * t.F); swigluBwdK<<<blocks(r * t.F), 256, 0, STREAM>>>(h, dg, dh, r, t.F);
+      real* dxn = ARENA.get(r * t.C); t.t1.backward(xn, dh, dxn, r);
+      lnBackward(t.ln, ls, dxn, dx + r0 * t.C, r, true);
+    }
+  }
+}
 // BF16: the normalised input and the hidden layer kept in bf16, every GEMM on bf16 operands
 #ifndef GRAD_F64
 inline GtSave gtForwardBf(const GatedTransition& t, const real* x, real* out, size_t rows, real beta) {
@@ -61,6 +128,7 @@ inline void gtBackwardBf(GatedTransition& t, const GtSave& s, const PD* dout, PD
 }
 #endif
 inline GtSave gtForward(const GatedTransition& t, const real* x, real* out, size_t rows, real beta = 0) {
+  if (gtChunkRows(t, rows) < rows) return gtForwardChunked(t, x, out, rows, beta);
 #ifndef GRAD_F64
   if (BF16) return gtForwardBf(t, x, out, rows, beta);
 #endif
@@ -77,9 +145,10 @@ inline GtSave gtForward(const GatedTransition& t, const real* x, real* out, size
 }
 // dout -> dx (added)
 #ifndef GRAD_F64
-inline void gtBackward(GatedTransition& t, const GtSave& s, const bf* dout, bf* dx) { gtBackwardBf(t, s, dout, dx); }
+inline void gtBackward(GatedTransition& t, const GtSave& s, const bf* dout, bf* dx) { if (s.x) gtBackwardChunked(t, s, dout, dx); else gtBackwardBf(t, s, dout, dx); }
 #endif
 inline void gtBackward(GatedTransition& t, const GtSave& s, const real* dout, real* dx) {
+  if (s.x) { gtBackwardChunked(t, s, dout, dx); return; }
 #ifndef GRAD_F64
   if (s.xb) { gtBackwardBf(t, s, dout, dx); return; }
 #endif

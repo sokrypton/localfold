@@ -14,6 +14,7 @@
 #include <cuda_bf16.h>
 #include <map>
 #include <tuple>
+#include <cuda.h>
 #include <cuda_runtime.h>
 #include <cmath>
 #include <cstdio>
@@ -103,11 +104,74 @@ inline unsigned blocks(size_t n, int t = 256) { return (unsigned)((n + t - 1) / 
 // ---------------------------------------------------------------- device memory
 // The arena holds one block's saves and scratch; reset() between blocks. Chunks are kept, so after the first
 // block nothing is allocated again.
+// growable(): one contiguous range of virtual addresses instead, physical memory mapped onto its end as the high-water
+// mark rises - a stack that never fragments, so what it holds is its peak. (Chunks fragment: a request larger than a
+// chunk's tail skips it, and after a rewind the next pattern of sizes skips others - 13 GB held for a 9.1 GB peak in
+// train-of3's 384-token step.) The driver's virtual memory calls come through the runtime's entry points, so nothing
+// links libcuda.
+struct VmCalls {
+  CUresult (*reserve)(CUdeviceptr*, size_t, size_t, CUdeviceptr, unsigned long long);
+  CUresult (*create)(CUmemGenericAllocationHandle*, size_t, const CUmemAllocationProp*, unsigned long long);
+  CUresult (*map)(CUdeviceptr, size_t, size_t, CUmemGenericAllocationHandle, unsigned long long);
+  CUresult (*access)(CUdeviceptr, size_t, const CUmemAccessDesc*, size_t);
+  CUresult (*granularity)(size_t*, const CUmemAllocationProp*, CUmemAllocationGranularity_flags);
+};
+inline const VmCalls& vmCalls() {
+  static VmCalls c = [] {
+    VmCalls v{};
+    auto get = [](const char* name, void** fn) {
+      cudaDriverEntryPointQueryResult q;
+      GK(cudaGetDriverEntryPoint(name, fn, cudaEnableDefault, &q));
+      if (q != cudaDriverEntryPointSuccess || !*fn) { fprintf(stderr, "the driver has no %s\n", name); exit(1); }
+    };
+    get("cuMemAddressReserve", (void**)&v.reserve); get("cuMemCreate", (void**)&v.create); get("cuMemMap", (void**)&v.map);
+    get("cuMemSetAccess", (void**)&v.access); get("cuMemGetAllocationGranularity", (void**)&v.granularity);
+    return v;
+  }();
+  return c;
+}
+#define GV(x)                                                                                              \
+  do {                                                                                                     \
+    CUresult r_ = (x);                                                                                     \
+    if (r_ != CUDA_SUCCESS) { fprintf(stderr, "%s:%d %s (driver %d)\n", __FILE__, __LINE__, r_ == CUDA_ERROR_OUT_OF_MEMORY ? "out of memory" : "virtual memory call failed", (int)r_); exit(1); } \
+  } while (0)
 struct Arena {
   std::vector<std::pair<char*, size_t>> chunks;
   size_t chunk = 0, at = 0, used = 0, high = 0;
+  // growable(): base .. base + reserved addressed, base .. base + mapped backed
+  char* base = nullptr;
+  size_t reserved = 0, mapped = 0, step = 0;
+  CUmemAllocationProp prop{};
+  void growable() {
+    if (base || !chunks.empty()) { fprintf(stderr, "Arena::growable: the arena is already in use\n"); exit(1); }
+    int dev; GK(cudaGetDevice(&dev));
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED; prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE; prop.location.id = dev;
+    size_t gran; GV(vmCalls().granularity(&gran, &prop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED));
+    size_t freeB, total; GK(cudaMemGetInfo(&freeB, &total));
+    step = ((size_t)64 << 20) / gran * gran;           // (mapped 64 MiB at a time)
+    reserved = (total + step - 1) / step * step;       // (more addresses than the device has memory)
+    CUdeviceptr p; GV(vmCalls().reserve(&p, reserved, 0, 0, 0));
+    base = (char*)p;
+  }
+  void mapTo(size_t end) {
+    if (end > reserved) { fprintf(stderr, "Arena: %zu bytes asked of a %zu-byte reservation\n", end, reserved); exit(1); }
+    const size_t want = (end + step - 1) / step * step;
+    if (want <= mapped) return;
+    const size_t bytes = want - mapped;
+    CUmemGenericAllocationHandle h; GV(vmCalls().create(&h, bytes, &prop, 0));
+    GV(vmCalls().map((CUdeviceptr)(base + mapped), bytes, 0, h, 0));
+    CUmemAccessDesc acc{}; acc.location = prop.location; acc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    GV(vmCalls().access((CUdeviceptr)(base + mapped), bytes, &acc, 1));
+    mapped = want;
+  }
   real* get(size_t n) {
     size_t bytes = (n * sizeof(real) + 255) & ~(size_t)255;
+    if (base) {
+      mapTo(at + bytes);
+      real* p = (real*)(base + at);
+      at += bytes; used += bytes; high = std::max(high, used);
+      return p;
+    }
     while (chunk < chunks.size() && at + bytes > chunks[chunk].second) { ++chunk; at = 0; }
     if (chunk == chunks.size()) {
       size_t size = std::max(bytes, (size_t)256 << 20);
@@ -124,9 +188,10 @@ struct Arena {
   struct Mark { size_t chunk, at, used; };
   Mark mark() const { return {chunk, at, used}; }
   void rewind(const Mark& m) { chunk = m.chunk; at = m.at; used = m.used; }
-  size_t held() const { size_t s = 0; for (auto& c : chunks) s += c.second; return s; }
+  size_t held() const { size_t s = mapped; for (auto& c : chunks) s += c.second; return s; }
   void release() {
     GK(cudaStreamSynchronize(STREAM));
+    if (base) { reset(); return; }   // (a growable arena keeps its mapping: its peak is what the next step needs)
     for (auto& c : chunks) GK(cudaFree(c.first));
     chunks.clear(); reset();
   }

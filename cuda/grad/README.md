@@ -159,10 +159,48 @@ its name is, its fan-in recorded where the module builds the linear). The heads'
 cross entropy starts at log(bins) exactly - distogram, PAE and PDE 4.1589, pLDDT 3.912, resolved 0.693, as read - and
 from there 6MRR's mse goes 33.3 -> 12.8 in 40 steps. The Fourier noise embedding is a BUFFER in OpenFold3 (N(0, 1), U(0,
 1), never trained): it is frozen here, under either start. - **precision** - float32 by default; `--tf32` puts the GEMMs on the tensor cores (the losses agree to three digits)
-  and `--bf16` runs the trunk's 48 pairformer blocks on their bf16 kernels - OpenFold3 trains under bf16 autocast - the
-  pair and single between blocks staying float32. `--check-bf16` holds every gradient so computed to float32's: 8.9e-3
-  (bf16's 8 bits), against 1.2e-5 between two float32 runs; the composition check always runs in float32. A 384-token,
-  48-sample step on 7BNY: 13.8 s float32, 8.2 s `--tf32`, 6.9 s `--tf32 --bf16`, ~5.1 s with the samples batched.
+  and `--bf16` runs the trunk's 4 MSA blocks and 48 pairformer blocks on their bf16 kernels - OpenFold3 trains under
+  bf16 autocast over both - the pair, MSA and single between blocks staying float32. `--check-bf16` holds every gradient
+  so computed to float32's: 1.3e-2 to 1.8e-2 (bf16's 8 bits; 8.9e-3 with the pairformer alone), against 1e-5 between two
+  float32 runs; the composition check always runs in float32. `--bf16-confidence` puts the confidence head's four
+  blocks on them too, which OpenFold3 does not (it turns autocast off around the head in training): 2.3 GB less at 640
+  tokens, the losses unchanged to four digits. A 384-token, 48-sample step on 7BNY: 13.8 s float32, 8.2 s `--tf32`,
+  6.9 s `--tf32 --bf16`, ~5.1 s with the samples batched.
+- **memory** - `--mem` prints, after each phase of a step, the arena's high-water mark over the phase, what the arena
+  and the stream pool hold, and the device's use. What a 40 GB A100 holds, in order of what each change bought (1AON's
+  8,533 tokens cropped, 1024 MSA rows, 48 samples, `--tf32 --bf16`):
+  - **the arena is one growable range** (`Arena::growable`, core.cuh: CUDA's virtual memory, physical pages mapped onto
+    its end as the high-water mark rises). 256 MB chunks fragmented - a request larger than a chunk's tail skips it -
+    so it held 13 GB for a 9.1 GB peak; now it holds its peak. 384 tokens: 31.9 -> 26.3 GiB.
+  - **the MSA blocks in bf16** (above): 1.9 GB at 384 tokens; one MSA block's float32 saves were 5.6 GB.
+  - **`--offload-pairs`**: the 53 block inputs the backward recomputes from - n^2 x 128 floats each, 16 GB at 768
+    tokens - in pinned host memory, copied out on a second stream while the next block runs and back one block
+    ahead of the backward; three on the device in a ring. Identical losses, the same step time (the first step pins
+    the host buffer). 384 tokens: 26.3 -> 22.8 GiB.
+  - **the transitions in row chunks** (`--transition-chunk=64`, millions of hidden elements a chunk; OpenFold3's
+    `transition_ckpt_chunk_size`): the pair transition's hidden layer is 8 pairs wide; chunked, nothing is saved but
+    its input and the backward recomputes each chunk's. `--check-chunk` holds every gradient to the whole form's:
+    2.1e-14 in float64. 640 tokens: 37.5 -> 34.9 GiB, and faster (16.7 -> 13.6 s).
+  - **one allocation a kind**: the parameters and gradients from a growable range, Adam's moments, the accumulator and
+    the EMA four slabs (the data-parallel sum reads the accumulator in place, without the flat copy it had), and the
+    bundle's device copy given back once read: 14.5 -> 9.8 GB before the first step.
+  - `--sample-batch=4` instead of 8: 3 GB less at 640 tokens for 0.6 s a step.
+
+  The longest crop that trains, 48 samples, OpenFold3's PyTorch (`bench_of3_torch.py`, bf16-mixed) beside it (each
+  row measured as its changes landed: the A100's 384 and 512 before the chunked transitions and the slabs):
+
+  | | 384 | 512 | 640 | 768 | 896 | 1024 |
+  |---|---|---|---|---|---|---|
+  | A100 40 GB, before | 5.7 s, 31.9 GiB | out of memory | | | | |
+  | A100 40 GB, now (`--offload-pairs --bf16-confidence --sample-batch=4`) | 6.0 s, 22.8 GiB | 9.0 s | 13.3 s, 32.6 GiB | 23.3 s, 32.2 GiB | 30.3 s, 38.3 GiB | |
+  | A100, OpenFold3 PyTorch | 12.0 s, ~29 GiB | out of memory | | | | |
+  | GH200 96 GB, before | 3.1 s, 31.7 GB | 4.6 s | 7.0 s | 9.9 s, 76.4 GB | | out of memory |
+  | GH200 96 GB, `--offload-pairs` | | | | 9.5 s, 47.3 GB | | 16.7 s, 72.4 GB |
+  | GH200, OpenFold3 PyTorch | 6.2 s, 27.3 GiB | 10.0 s, 45.7 GiB | 16.2 s, 70.1 GiB | out of memory | | |
+
+  What is left at 640 tokens on the A100 (28.9 GB): 9.8 GB the parameters, Adam and the EMA; 2.3 GB the step's
+  activations; 0.9 GB the stream pool; the arena's 14.3 GB - the MSA block's backward, the confidence head, a
+  diffusion chunk, and 3.6 GB the embedder keeps for the whole step.
 - **data parallel** - `--world=N --rank=r --rendezvous=<dir> [--dp=nccl|files]` (`of3dist.cuh`): each rank clips and
   accumulates its own examples, then every rank's accumulators and participation counts are summed before the one Adam
   step (`_sync_and_average_grads`), so the weights stay one set without being exchanged. NCCL for a GPU a rank; a file

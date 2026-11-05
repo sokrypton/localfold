@@ -49,11 +49,18 @@ struct Of3Optimizer {
   int examples = 0;
   double* norm = nullptr;
   double lastNorm = 0, lastLr = 0;
+  // m, v, the accumulator and the EMA each one allocation, every parameter's at its offset (64-element aligned): four
+  // slabs instead of a cudaMalloc a tensor (3760 of them in OpenBind-0, each rounded up - 2 GB of rounding over the
+  // four), and the accumulators one contiguous range the data-parallel sum reads in place
+  real *mSlab = nullptr, *vSlab = nullptr, *accSlab = nullptr, *emaSlab = nullptr; size_t slabN = 0;
   void init(const Params& ps) {
-    auto zeros = [](size_t k) { real* p; GK(cudaMalloc(&p, k * sizeof(real))); GK(cudaMemset(p, 0, k * sizeof(real))); return p; };
-    for (auto* p : ps.all) {
-      m.push_back(zeros(p->n)); v.push_back(zeros(p->n)); acc.push_back(zeros(p->n));
-      real* e = zeros(p->n); GK(cudaMemcpy(e, p->w, p->n * sizeof(real), cudaMemcpyDeviceToDevice)); ema.push_back(e);
+    std::vector<size_t> off;
+    for (auto* p : ps.all) { off.push_back(slabN); slabN += (p->n + 63) / 64 * 64; }
+    auto zeros = [&] { real* p; GK(cudaMalloc(&p, std::max<size_t>(slabN, 1) * sizeof(real))); GK(cudaMemset(p, 0, std::max<size_t>(slabN, 1) * sizeof(real))); return p; };
+    mSlab = zeros(); vSlab = zeros(); accSlab = zeros(); emaSlab = zeros();
+    for (size_t i = 0; i < ps.all.size(); ++i) {
+      m.push_back(mSlab + off[i]); v.push_back(vSlab + off[i]); acc.push_back(accSlab + off[i]); ema.push_back(emaSlab + off[i]);
+      GK(cudaMemcpy(ema[i], ps.all[i]->w, ps.all[i]->n * sizeof(real), cudaMemcpyDeviceToDevice));
     }
     participation.assign(ps.all.size(), 0);
     frozen.assign(ps.all.size(), 0);
@@ -87,18 +94,11 @@ struct Of3Optimizer {
     return lastNorm;
   }
   // the optimiser step over the accumulated examples, then the EMA; the accumulator cleared
-  real* flat = nullptr; size_t flatN = 0;
   void apply(Params& ps, Comm* comm = nullptr) {
     // (data-parallel: every rank's accumulators and participation counts summed first - the same global average, the
-    // same step, on every rank)
+    // same step, on every rank; the slab's alignment padding is zero on every rank, so it sums to zero)
     if (comm && comm->world > 1) {
-      size_t total = 0; for (auto* p : ps.all) total += p->n;
-      if (!flat) { GK(cudaMalloc(&flat, total * sizeof(real))); flatN = total; }
-      size_t at = 0;
-      for (size_t i = 0; i < ps.all.size(); ++i) { GK(cudaMemcpyAsync(flat + at, acc[i], ps.all[i]->n * sizeof(real), cudaMemcpyDeviceToDevice, STREAM)); at += ps.all[i]->n; }
-      comm->sumReals(flat, flatN);
-      at = 0;
-      for (size_t i = 0; i < ps.all.size(); ++i) { GK(cudaMemcpyAsync(acc[i], flat + at, ps.all[i]->n * sizeof(real), cudaMemcpyDeviceToDevice, STREAM)); at += ps.all[i]->n; }
+      comm->sumReals(accSlab, slabN);
       comm->sumInts(participation);
     }
     lastLr = lr(step);             // (the scheduler's lr for this step, then stepped)

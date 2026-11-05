@@ -28,8 +28,8 @@
 //   nvcc -O2 -std=c++17 -arch=sm_80 --default-stream per-thread -o cuda/grad/train-of3 cuda/grad/train_of3.cu -lcublas -lcublasLt -ldl -lcurand
 //   cuda/grad/train-of3 --bundle=model-openbind0-f32 --family=openbind0 --examples=<file> [--steps=N] [--batch=1]
 //       [--crop=384] [--samples=48] [--lr=1.8e-3] [--warmup=1000] [--bond=0] [--save=<ckpt>] [--save-every=N]
-//       [--resume=<ckpt>] [--seed=1] [--init=bundle|of3] [--tf32] [--bf16] [--no-dropout] [--val=<file>] [--smoke]
-// --check-ckpt=k / --check-perm=k / --check-bf16=k: the recomputation, the truth's permutation and the bf16 trunk held
+//       [--resume=<ckpt>] [--seed=1] [--init=bundle|of3] [--tf32] [--bf16] [--bf16-confidence] [--mem] [--offload-pairs] [--transition-chunk=64] [--no-dropout] [--val=<file>] [--smoke]
+// --check-ckpt=k / --check-perm=k / --check-bf16=k / --check-chunk=k: the recomputation, the truth's permutation, the bf16 trunk and the chunked transitions held
 // to their references on example k.
 // --init=of3: OpenFold3's from-scratch initialisation instead of the bundle's weights.
 // --smoke: the gate's short run - before and after, on the first example whole and on fixed draws, the loss above its
@@ -57,6 +57,19 @@
 namespace g = grad;
 
 static g::real* dzeros(size_t n) { g::real* p; GK(cudaMalloc(&p, std::max<size_t>(n, 1) * sizeof(g::real))); GK(cudaMemset(p, 0, std::max<size_t>(n, 1) * sizeof(g::real))); return p; }
+
+// --mem: after each phase of a step, the arena's high-water mark over the phase, what it holds, and the device's use
+static bool MEM_REPORT = false;
+static void memPhase(const char* what) {
+  if (!MEM_REPORT) return;
+  GK(cudaDeviceSynchronize());
+  size_t f, t; GK(cudaMemGetInfo(&f, &t));
+  int dev; GK(cudaGetDevice(&dev)); cudaMemPool_t pool; GK(cudaDeviceGetDefaultMemPool(&pool, dev));
+  uint64_t pooled = 0; GK(cudaMemPoolGetAttribute(pool, cudaMemPoolAttrReservedMemCurrent, &pooled));
+  fprintf(stderr, "  mem %-26s arena: phase high %6.2f GB, held %6.2f GB; stream pool %5.2f GB; device %6.2f GB\n", what,
+          grad::ARENA.high / 1e9, grad::ARENA.held() / 1e9, pooled / 1e9, (t - f) / 1e9);
+  grad::ARENA.high = grad::ARENA.used;
+}
 
 // ---- an example, on the host, at its full size
 struct Example {
@@ -611,8 +624,9 @@ int main(int argc, char** argv) {
   int sampleBatch = 8;   // the diffusion samples a denoiser pass (--sample-batch)
   int maxRecycles = 3;   // OpenFold3's num_recycles: a step runs 1 + U{0..max} cycles (--max-recycles)
   int checkBatch = -1;
-  int steps = 30, samples = 48, batch = 1, crop = 384, saveEvery = 0, checkCkpt = -1, checkPerm = -1, checkBf16 = -1, checkConfs = -1; std::string init = "bundle";
-  bool dropout = true, dropInFixed = false, bf16Trunk = false;
+  int steps = 30, samples = 48, batch = 1, crop = 384, saveEvery = 0, checkCkpt = -1, checkPerm = -1, checkBf16 = -1, checkConfs = -1, checkChunk = -1; std::string init = "bundle";
+  bool dropout = true, dropInFixed = false, bf16Trunk = false, bf16Confidence = false, offloadPairs = false;
+  double transitionChunkM = 64;
   int world = 1, rank = 0; std::string dp = "nccl", rendezvous;      // data parallel (of3dist.cuh)
   bool sameDraws = false;   // --same-draws: every rank rank 0's examples and draws (the averaging's check: one process's step)   // (dropInFixed: --check-ckpt's fixed draws with the masks on)
   std::string valPath; int valEvery = 0, valSamples = 5, valSteps = 200, valCrop = 1536; unsigned seed = 1; bool smoke = false, ckpt = true;
@@ -640,6 +654,10 @@ int main(int argc, char** argv) {
     else if (!strcmp(argv[i], "--no-ckpt")) ckpt = false;
     else if (!strcmp(argv[i], "--no-dropout")) dropout = false;
     else if (!strcmp(argv[i], "--bf16")) bf16Trunk = true;
+    else if (!strcmp(argv[i], "--bf16-confidence")) bf16Confidence = true;
+    else if (!strcmp(argv[i], "--mem")) MEM_REPORT = true;
+    else if (!strcmp(argv[i], "--offload-pairs")) offloadPairs = true;
+    else if (auto v = opt("--transition-chunk=")) transitionChunkM = atof(v);
     else if (auto v = opt("--world=")) world = atoi(v);
     else if (auto v = opt("--rank=")) rank = atoi(v);
     else if (auto v = opt("--dp=")) dp = v;
@@ -648,6 +666,7 @@ int main(int argc, char** argv) {
     else if (auto v = opt("--check-ckpt=")) checkCkpt = atoi(v);
     else if (auto v = opt("--check-perm=")) checkPerm = atoi(v);
     else if (auto v = opt("--check-bf16=")) checkBf16 = atoi(v);
+    else if (auto v = opt("--check-chunk=")) checkChunk = atoi(v);
     else if (auto v = opt("--check-conformers=")) checkConfs = atoi(v);
     else if (auto v = opt("--init=")) init = v;
     else if (auto v = opt("--val=")) valPath = v;
@@ -678,6 +697,8 @@ int main(int argc, char** argv) {
   CB(cublasCreate(&H)); CB(cublasSetStream(H, STREAM));
   g::STREAM = STREAM;
   g::init();
+  g::ARENA.growable();   // (one contiguous range that grows: the arena holds its peak, never a fragmented multiple of it)
+  if (offloadPairs && (!ckpt || checkCkpt >= 0)) { fprintf(stderr, "--offload-pairs keeps block inputs only: it needs the blocks recomputed (not --no-ckpt or --check-ckpt)\n"); return 1; }
   std::unique_ptr<g::Comm> comm;
   if (world > 1) {
     if (dp == "nccl") comm.reset(new g::NcclComm(rank, world, rendezvous));
@@ -686,6 +707,7 @@ int main(int argc, char** argv) {
   M.loadBundle(bundle, "", [&](const std::map<std::string, std::vector<long long>>& shapes) {
     lf::weights::Shapes S; S.shape = shapes; return lf::weights::af3WeightLines(family, S); });
   const lf::FamilyFlags& FF = lf::familyFor(family);
+  memPhase("bundle loaded");
   const bool padded = FF.paddedAtomKeys, qblock = FF.qblockAtomKeys;
   std::vector<Example> examples;
   examples.push_back(loadExample(lines[0], padded, qblock));        // (the first in M while the modules read its metas)
@@ -696,8 +718,10 @@ int main(int argc, char** argv) {
   const int dense0 = examples[0].dense;
   auto has = [&](const std::string& k) { return M.has(k); };
   g::Params ps;
+  // the parameters and their gradients from one growable range (a cudaMalloc a tensor rounds each of 3760 up)
+  g::Arena paramSlab; paramSlab.growable();
   auto load = [&](const std::string& nm, g::Param& p, size_t len) {
-    g::allocParam(p, nm, len); ps.add(p);
+    p.name = nm; p.n = len; p.w = paramSlab.get(len); p.g = paramSlab.zeros(len); ps.add(p);
     if (M.at(nm).length != len) { fprintf(stderr, "%s: %zu in the bundle, %zu expected\n", nm.c_str(), M.at(nm).length, len); exit(1); }
     std::vector<float> h(len); GK(cudaMemcpy(h.data(), W(nm), len * 4, cudaMemcpyDeviceToHost));
     std::vector<g::real> r(h.begin(), h.end());
@@ -839,6 +863,19 @@ int main(int argc, char** argv) {
   // (runner.py _get_sample_disabled_param_names); they were the last added
   const size_t confFrom = [&] { size_t k = 0; for (auto* p : ps.all) { if (!p->name.compare(0, 11, "confidence.")) break; ++k; } return k; }();
   size_t nparams = 0; for (auto* p : ps.all) nparams += p->n;
+  // the transitions a chunk of rows at a time, their hidden layers recomputed in the backward (--transition-chunk:
+  // millions of hidden elements a chunk; OpenFold3's transition_ckpt_chunk_size): the pair transition's hidden layer
+  // is 8 pairs wide, the largest single save of a pair-stack block
+  auto chunkTransitions = [&](double millions) {
+    const size_t ce = (size_t)(millions * 1e6);
+    auto chunk = [&](g::af3::Pairformer& b) { b.pairTrans.chunkElems = ce; };
+    for (auto& b : pf) chunk(b);
+    for (auto& b : msaB) { chunk(b.pairHalf); b.trans.chunkElems = ce; }
+    for (auto& b : ch.blocks) chunk(b);
+    for (auto& b : tm.blocks) chunk(b);
+  };
+  chunkTransitions(transitionChunkM);
+  memPhase("parameters");
   printf("%s (%s): %d MSA blocks, %d pairformer blocks; %zu tensors, %.1f M parameters (%zu in the confidence head)\n",
          family.c_str(), bundle.c_str(), nMsa, nPf, ps.all.size(), nparams / 1e6, ps.all.size() - confFrom);
   const int Cz = te.C, Cs = te.Cs, Cm = te.Cm;
@@ -859,20 +896,49 @@ int main(int argc, char** argv) {
   loadExample(lines[0], padded, qblock);                                   // (M is the first example's again: the port reads it)
 
   // ---- the activations, sized per step
+  // --offload-pairs: the trunk's block inputs (the pair each MSA and pairformer block starts from - what the backward
+  // recomputes the block from) kept in pinned host memory instead of on the device. The device holds three of them in
+  // a ring: block j reads ring[j % 3] and writes ring[(j + 1) % 3], and its input is copied out on a second stream while
+  // block j + 1 runs (block j + 2 overwrites that slot, so it waits for the copy); the backward copies block j - 1's
+  // input back while block j's recomputation and backward run. The last block's output - what the heads and the
+  // denoiser read - stays on the device. 53 pairs of n^2 x 128 floats: 4 GB at 384 tokens, 16 GB at 768, 28 GB at 1024.
+  struct PairOffload {
+    g::real* host = nullptr; size_t cap = 0;
+    cudaStream_t copy = nullptr;
+    std::vector<cudaEvent_t> out, in;     // block j's input: copied to the host, copied back
+    void need(size_t elems, int blocks) {
+      if (!copy) GK(cudaStreamCreateWithFlags(&copy, cudaStreamNonBlocking));
+      while ((int)out.size() < blocks) { cudaEvent_t a, b; GK(cudaEventCreateWithFlags(&a, cudaEventDisableTiming)); GK(cudaEventCreateWithFlags(&b, cudaEventDisableTiming)); out.push_back(a); in.push_back(b); }
+      if (elems <= cap) return;
+      if (host) GK(cudaFreeHost(host));
+      GK(cudaHostAlloc((void**)&host, elems * sizeof(g::real), cudaHostAllocDefault)); cap = elems;
+    }
+    // the copy stream after everything already on the compute stream
+    void after(cudaStream_t s) { cudaEvent_t e; GK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming)); GK(cudaEventRecord(e, s)); GK(cudaStreamWaitEvent(copy, e, 0)); GK(cudaEventDestroy(e)); }
+    // the compute stream after everything already on the copy stream
+    void join(cudaStream_t s) { cudaEvent_t e; GK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming)); GK(cudaEventRecord(e, copy)); GK(cudaStreamWaitEvent(s, e, 0)); GK(cudaEventDestroy(e)); }
+  } offload;
   struct Acts {
     int n = 0, S = 0;
+    bool off = false;
     g::real *tf, *zEmb, *prevPair, *prevSingle, *logits, *zIn;
     std::vector<g::real*> pairs, msas, singles;
     std::vector<void*> owned;
     g::real* z(size_t k) { g::real* p = dzeros(k); owned.push_back(p); return p; }
     void release() { for (void* p : owned) GK(cudaFree(p)); owned.clear(); }
   };
-  auto makeActs = [&](int n, int S) {
-    Acts a; a.n = n; a.S = S;
+  auto makeActs = [&](int n, int S, bool off = false) {
+    Acts a; a.n = n; a.S = S; a.off = off;
     const size_t nn = (size_t)n * n;
     a.tf = a.z((size_t)n * te.F); a.zEmb = a.z(nn * Cz); a.prevPair = a.z(nn * Cz); a.prevSingle = a.z((size_t)n * Cs);
     a.logits = a.z(nn * dh.bins); a.zIn = doubleAdd ? a.z(nn * Cz) : nullptr;
-    for (int k = 0; k <= nMsa + nPf; ++k) a.pairs.push_back(a.z(nn * Cz));
+    if (off) {
+      offload.need((size_t)(nMsa + nPf) * nn * Cz, nMsa + nPf);
+      g::real* ring[3] = {a.z(nn * Cz), a.z(nn * Cz), a.z(nn * Cz)};
+      for (int k = 0; k < nMsa + nPf; ++k) a.pairs.push_back(ring[k % 3]);
+      a.pairs.push_back(a.z(nn * Cz));
+    } else
+      for (int k = 0; k <= nMsa + nPf; ++k) a.pairs.push_back(a.z(nn * Cz));
     for (int k = 0; k <= nMsa; ++k) a.msas.push_back(a.z((size_t)S * n * Cm));
     for (int k = 0; k <= nPf; ++k) a.singles.push_back(a.z((size_t)n * Cs));
     return a;
@@ -884,30 +950,57 @@ int main(int argc, char** argv) {
   auto embedBatch = [&](Dev& d) {
     return g::af3::EmbedBatch{d.ri, d.ti, d.asym, d.ent, d.sym, d.bonds, d.orders, d.msaRows, d.deletion, d.n, d.S};
   };
+  // --offload-pairs: block j's input out to the host once block j is queued; block j waits for block j - 2's (whose
+  // slot it writes)
+  auto pairOut = [&](Acts& a, int j) {
+    if (!a.off) return;
+    const size_t nn = (size_t)a.n * a.n;
+    offload.after(STREAM);
+    GK(cudaMemcpyAsync(offload.host + (size_t)j * nn * Cz, a.pairs[j], nn * Cz * sizeof(g::real), cudaMemcpyDeviceToHost, offload.copy));
+    GK(cudaEventRecord(offload.out[j], offload.copy));
+  };
+  auto pairSlot = [&](Acts& a, int j) { if (a.off && j >= 2) GK(cudaStreamWaitEvent(STREAM, offload.out[j - 2], 0)); };
+  // ...and back for the backward: block j's input fetched (once everything queued before is past its slot)
+  auto pairIn = [&](Acts& a, int j) {
+    if (!a.off || j < 0) return;
+    const size_t nn = (size_t)a.n * a.n;
+    offload.after(STREAM);
+    GK(cudaMemcpyAsync(a.pairs[j], offload.host + (size_t)j * nn * Cz, nn * Cz * sizeof(g::real), cudaMemcpyHostToDevice, offload.copy));
+    GK(cudaEventRecord(offload.in[j], offload.copy));
+  };
+  auto pairReady = [&](Acts& a, int j) { if (a.off) GK(cudaStreamWaitEvent(STREAM, offload.in[j], 0)); };
   auto trunkForward = [&](Dev& d, Acts& a) {
     const int n = d.n, S = d.S; const size_t nn = (size_t)n * n;
+    if (a.off) offload.join(STREAM);    // (the last pass's copies out of the ring done before it is written again)
     auto eb = embedBatch(d);
     tfS = g::af3::targetFeatForward(tfm, d.b, d.aatype, d.profile, d.delMean, a.tf);
     emS = g::af3::trunkEmbedForward(te, eb, a.tf, a.prevPair, a.prevSingle, a.zEmb, a.singles[0], a.msas[0]);
     GK(cudaMemcpyAsync(a.pairs[0], a.zEmb, nn * Cz * sizeof(g::real), cudaMemcpyDeviceToDevice, STREAM));
     tmS = g::af3::templateForward(tm, d.slots, d.templates, a.zEmb, d.pairMask, n, a.pairs[0]);
+    memPhase("embed, templates");
     if (doubleAdd) GK(cudaMemcpyAsync(a.zIn, a.pairs[0], nn * Cz * sizeof(g::real), cudaMemcpyDeviceToDevice, STREAM));
     // each block's saves discarded as it finishes (OpenFold3's blocks_per_ckpt 1): the backward recomputes them from
     // the block's input, which pairs/msas/singles keep
     // (--no-ckpt keeps them, for --check-ckpt to hold the recomputation to)
+    // (--bf16: the MSA blocks' and the pairformer's bf16 kernels, OpenFold3's bf16-mixed autocast over the MSA module
+    // and the pairformer stack; the pair, MSA and single between blocks stay float32)
+    const bool prevBf = g::BF16; g::BF16 = bf16Trunk;
     for (int k = 0; k < nMsa; ++k) {
       const g::Arena::Mark mk = g::ARENA.mark();
+      pairSlot(a, k);
       msaS[k] = g::af3::msaForward(msaB[k], dl, a.msas[k], a.pairs[k], d.msaMask, d.pairMask, d.pairMaskT, d.seqMask, a.msas[k + 1], a.pairs[k + 1], S, n);
+      pairOut(a, k);
+      if (k == 0) memPhase("MSA block, forward");
       if (ckpt) g::ARENA.rewind(mk);
     }
     if (doubleAdd) g::add(a.pairs[nMsa], a.zIn, nn * Cz);
-    // (--bf16: the pairformer's bf16 kernels, OpenFold3's bf16-mixed for the bulk of the trunk; its pair and single
-    // between blocks stay float32)
-    const bool prevBf = g::BF16; g::BF16 = bf16Trunk;
     for (int k = 0; k < nPf; ++k) {
       const g::Arena::Mark mk = g::ARENA.mark();
+      pairSlot(a, nMsa + k);
       pfS[k] = g::af3::pairformerForward(pf[k], dl, a.pairs[nMsa + k], a.singles[k], d.pairMask, d.pairMaskT, d.seqMask, nullptr,
                                          a.pairs[nMsa + k + 1], a.singles[k + 1], n);
+      pairOut(a, nMsa + k);
+      if (k == 0) memPhase("pairformer block, forward");
       if (ckpt) g::ARENA.rewind(mk);
     }
     g::BF16 = prevBf;
@@ -1104,6 +1197,7 @@ int main(int argc, char** argv) {
     printf("OpenFold3's initialisation:"); for (auto& [k, c] : kinds) printf(" %s %d", k.c_str(), c); printf("\n");
   }
   g::Of3Optimizer opt; opt.maxLr = lrMax; opt.warmup = warmup; opt.init(ps);
+  memPhase("optimizer");
   // the Fourier noise embedding is a buffer in OpenFold3: held, never trained
   for (size_t i = 0; i < ps.all.size(); ++i) if (ps.all[i]->name.find("fourier") != std::string::npos) opt.frozen[i] = 1;
   if (!resumePath.empty()) { opt.load(ps, resumePath); printf("resumed %s at step %ld\n", resumePath.c_str(), opt.step); }
@@ -1153,8 +1247,11 @@ int main(int argc, char** argv) {
     const of3::Layout Lay = layoutOf(e);
     const int n = e.n; const size_t nn = (size_t)n * n, A = e.atoms();
     const int S = std::min(1024, e.P);
+    memPhase("step start");
     Dev d; upload(d, e, padded, qblock, S);
-    Acts a = makeActs(n, S);
+    memPhase("example uploaded");
+    Acts a = makeActs(n, S, offloadPairs);
+    memPhase("activations");
     const bool confOn = full.resolution >= 0.1 && full.resolution <= 4.0 && (full.set == "pdb");
     // the trunk
     // (model.py: the recycle count from a generator every rank shares - the same number on every rank a step)
@@ -1167,6 +1264,7 @@ int main(int argc, char** argv) {
     {
       g::Scratch sc;
       xp = rollout(d, a, e, gen, 20);
+      memPhase("rollout");
     }
     of3::permuteTruth(gtPerm, keep, xp, e.xt, e.gm, nullptr);
     // the distogram: its loss on the host, its cotangent kept for the backward
@@ -1188,7 +1286,11 @@ int main(int argc, char** argv) {
       { std::vector<g::real> rr(beta.begin(), beta.end()); GK(cudaMemcpy(betaD, rr.data(), rr.size() * sizeof(g::real), cudaMemcpyHostToDevice)); }
       g::af3::ConfidenceBatch cb{d.ri, d.ti, d.asym, d.ent, d.sym, d.bonds, d.orders};
       g::af3::ConfidenceLogits o{};
+      // (--bf16-confidence: the head's blocks on their bf16 kernels too - OpenFold3 runs the head in float32 in
+      // training, autocast off around it)
+      const bool prevBf = g::BF16; g::BF16 = bf16Confidence;
       auto cs = g::af3::confidenceForward(ch, a.pairs[nMsa + nPf], a.singles[nPf], a.tf, betaD, d.seqMask, d.pairMask, d.pairMaskT, n, o, cb);
+      g::BF16 = prevBf;
       const double w = confOn ? confWeight : 0;
       auto lPl = g::host(o.plddt, A * ch.PB), lPde = g::host(o.pde, nn * ch.NB), lPae = g::host(o.pae, nn * ch.NB);
       std::vector<double> gPl(lPl.size(), 0), gPde(lPde.size(), 0), gPae(lPae.size(), 0), gRs;
@@ -1204,10 +1306,13 @@ int main(int argc, char** argv) {
           g::real* p = g::ARENA.get(h.size()); std::vector<g::real> r(h.begin(), h.end());
           GK(cudaMemcpy(p, r.data(), r.size() * sizeof(g::real), cudaMemcpyHostToDevice)); return p;
         };
+        g::BF16 = bf16Confidence;
         g::af3::confidenceBackward(ch, cs, a.pairs[nMsa + nPf], a.singles[nPf], a.tf, d.seqMask, d.pairMask, d.pairMaskT,
                                    g::af3::ConfidenceLogits{put(gPde), put(gPae), put(gPl), gRs.empty() ? nullptr : put(gRs)},
                                    nullptr, nullptr, nullptr, cb);
+        g::BF16 = prevBf;
       }
+      memPhase("confidence");
     }
     const auto t2 = now();
     // the diffusion samples (model.py _train_diffusion), each its own denoiser pass
@@ -1222,6 +1327,7 @@ int main(int argc, char** argv) {
     }
     std::vector<double> gmLoss(e.gm); if (!lossAtom.empty()) for (size_t i = 0; i < A; ++i) gmLoss[i] *= lossAtom[i];
     of3dev::SmoothLddt sl; sl.init(Lay, e.xt, gmLoss);   // (smooth LDDT, quadratic in atoms, on the device)
+    memPhase("smooth LDDT set up");
     // the samples in chunks of --sample-batch: one batched denoiser pass a chunk (af3denoise.cuh's denoiseBatchForward:
     // one pair conditioning, the transformer over the chunk's samples at once), each sample's draws as they were
     const int SB = std::max(1, sampleBatch);
@@ -1280,6 +1386,7 @@ int main(int argc, char** argv) {
         }
         g::add(dTs, ts, (size_t)n * Cs); g::add(dTp, tp, nn * Cz); g::add(dTf, tfd, (size_t)n * te.F);
       }
+      if (s0 == 0) memPhase("diffusion chunk");
     }
     L.total = L.diffusion + distWeight * L.distogram + (confOn ? confWeight * (L.plddt + L.pde + L.pae + L.resolved) : 0);
     sl.release();
@@ -1290,8 +1397,10 @@ int main(int argc, char** argv) {
       g::real *dp = g::ARENA.zeros(nn * Cz), *dsg = g::ARENA.zeros((size_t)n * Cs);
       g::af3::distogramBackward(dh, a.pairs[nMsa + nPf], n, dLog, dp);
       g::add(dp, dTp, nn * Cz); g::add(dsg, dTs, (size_t)n * Cs);
+      pairIn(a, nMsa + nPf - 1);
       for (int k = nPf; k-- > 0;) {
         g::Scratch sc;
+        pairReady(a, nMsa + k); pairIn(a, nMsa + k - 1);
         g::real *op = g::ARENA.get(nn * Cz), *os = g::ARENA.get((size_t)n * Cs);   // (the recomputed block's outputs)
         const bool prevBf = g::BF16; g::BF16 = bf16Trunk;
         auto save = ckpt ? g::af3::pairformerForward(pf[k], dl, a.pairs[nMsa + k], a.singles[k], d.pairMask, d.pairMaskT, d.seqMask, nullptr, op, os, n)
@@ -1301,18 +1410,23 @@ int main(int argc, char** argv) {
         g::BF16 = prevBf;
         GK(cudaMemcpyAsync(dp, dpi, nn * Cz * sizeof(g::real), cudaMemcpyDeviceToDevice, STREAM));
         GK(cudaMemcpyAsync(dsg, dsi, (size_t)n * Cs * sizeof(g::real), cudaMemcpyDeviceToDevice, STREAM));
+        if (k == nPf - 1) memPhase("pairformer block, backward");
       }
       g::real* dzIn = doubleAdd ? g::cloneR(dp, nn * Cz) : nullptr;
       g::real* dm = g::ARENA.zeros((size_t)S * n * Cm);
       for (int k = nMsa; k-- > 0;) {
         g::Scratch sc;
+        pairReady(a, k); pairIn(a, k - 1);
         g::real *om = g::ARENA.get((size_t)S * n * Cm), *op = g::ARENA.get(nn * Cz);
+        const bool prevBf = g::BF16; g::BF16 = bf16Trunk;
         auto save = ckpt ? g::af3::msaForward(msaB[k], dl, a.msas[k], a.pairs[k], d.msaMask, d.pairMask, d.pairMaskT, d.seqMask, om, op, S, n)
                          : msaS[k];
         g::real *dpi = g::ARENA.zeros(nn * Cz), *dmi = g::ARENA.zeros((size_t)S * n * Cm);
         g::af3::msaBackward(msaB[k], dl, save, d.msaMask, d.pairMask, d.pairMaskT, d.seqMask, dm, dp, dmi, dpi);
+        g::BF16 = prevBf;
         GK(cudaMemcpyAsync(dp, dpi, nn * Cz * sizeof(g::real), cudaMemcpyDeviceToDevice, STREAM));
         GK(cudaMemcpyAsync(dm, dmi, (size_t)S * n * Cm * sizeof(g::real), cudaMemcpyDeviceToDevice, STREAM));
+        if (k == nMsa - 1) memPhase("MSA block, backward");
       }
       if (dzIn) g::add(dp, dzIn, nn * Cz);
       g::real* dz = g::cloneR(dp, nn * Cz);
@@ -1321,11 +1435,13 @@ int main(int argc, char** argv) {
       g::af3::trunkEmbedBackward(te, eb, emS, a.tf, dz, dsg, dm, dtf, g::ARENA.zeros(nn * Cz), g::ARENA.zeros((size_t)n * Cs));
       g::add(dtf, dTf, (size_t)n * te.F);
       g::af3::targetFeatBackward(tfm, d.b, tfS, dtf);
+      memPhase("templates, embed backward");
     }
     const auto t4 = now();
     int withTemplates = 0; for (auto& sl : e.slots) if (sl.geo) withTemplates += (int)std::lround(sl.repeat);
     if (!fixed) printf("  %s: %d of %d tokens (%s), %d cycles, %d MSA rows, %d templates; ms: trunk %.0f, rollout+confidence %.0f, diffusion %.0f (host losses %.0f), trunk backward %.0f\n",
                        full.input.c_str(), n, full.n, strategy.c_str(), c, S, withTemplates, msOf(t0, t1), msOf(t1, t2), msOf(t2, t3), tLoss, msOf(t3, t4));
+    if (a.off) GK(cudaStreamSynchronize(offload.copy));
     a.release(); d.release();
     return std::make_pair(L, confOn);
   };
@@ -1355,7 +1471,7 @@ int main(int argc, char** argv) {
     ckpt = true; dropInFixed = false;
     if (!ok) return 1;
   }
-  // --check-bf16=k: example k (whole, fixed draws, dropout on) with the trunk's pairformer in bf16 and in float32 -
+  // --check-bf16=k: example k (whole, fixed draws, dropout on) with the trunk's MSA blocks and pairformer in bf16 and in float32 -
   // every gradient compared: the bf16 kernels' error (bf16 keeps 8 bits), against the float runs' own floor
   if (checkBf16 >= 0) {
     dropInFixed = true;
@@ -1376,6 +1492,30 @@ int main(int argc, char** argv) {
     const bool ok = e < 0.05;
     printf("bf16 trunk: every gradient against float32's, relRMS %.3e (two float runs: %.3e)  %s\n", e, floor, ok ? "PASS" : "FAIL");
     bf16Trunk = false; dropInFixed = false;
+    if (!ok) return 1;
+  }
+  // --check-chunk=k: example k (whole, fixed draws, dropout on) with the transitions in chunks of 1000 hidden elements
+  // (a handful of rows each) and whole - every gradient compared: the same arithmetic, the weight gradients summed
+  // over the chunks in another order
+  if (checkChunk >= 0) {
+    dropInFixed = true;
+    auto grads = [&](double millions) {
+      chunkTransitions(millions); ps.zeroGrad();
+      std::mt19937_64 gen(99);
+      runExample(examples.at(checkChunk), true, true, 2, gen);
+      std::vector<double> all;
+      for (auto* p : ps.all) { auto h = g::host(p->g, p->n); all.insert(all.end(), h.begin(), h.end()); }
+      return all;
+    };
+    const auto a = grads(0.001), b = grads(0), c = grads(0);
+    auto rel = [](const std::vector<double>& x, const std::vector<double>& y) {
+      double num = 0, den = 0; for (size_t i = 0; i < x.size(); ++i) { num += (x[i] - y[i]) * (x[i] - y[i]); den += y[i] * y[i]; }
+      return std::sqrt(num / std::max(den, 1e-300));
+    };
+    const double e = rel(a, b), floor = rel(c, b);
+    const bool ok = e < std::max(1e-10, 100 * floor);
+    printf("chunked transitions: every gradient against whole ones', relRMS %.3e (two whole runs: %.3e)  %s\n", e, floor, ok ? "PASS" : "FAIL");
+    chunkTransitions(transitionChunkM); dropInFixed = false;
     if (!ok) return 1;
   }
   // --check-conformers=k: example k's conformers drawn from its pool - how many atoms the pool placed, and every pair
@@ -1518,7 +1658,7 @@ int main(int argc, char** argv) {
       const of3::Layout Lay = layoutOf(e);
       const int n = e.n; const size_t nn = (size_t)n * n, A = e.atoms();
       Dev d; upload(d, e, padded, qblock, std::min(1024, e.P));
-      Acts a = makeActs(n, d.S);
+      Acts a = makeActs(n, d.S, offloadPairs);
       cycles(d, a, 4, [&] { drawMsa(d, e, gen); });
       std::vector<double> scores, plddts;
       for (int s = 0; s < valSamples; ++s) {
@@ -1552,6 +1692,7 @@ int main(int argc, char** argv) {
       printf("  val %s (%d tokens, %s): lDDT mean %.4f, best %.4f, top-ranked %.4f (pLDDT %.1f)\n", full.input.c_str(), n,
              strategy.c_str(), mean, best, scores[top], plddts[top]);
       sumMean += mean; sumTop += scores[top];
+      if (a.off) GK(cudaStreamSynchronize(offload.copy));
       a.release(); d.release();
     }
     opt.swapEma(ps);
@@ -1571,6 +1712,12 @@ int main(int argc, char** argv) {
   };
   const double before = smoke ? measure("before ") : 0;
   // ---- training
+  // (the bundle's device copy was read once, into the parameters, and by the composition check: given back, as is the
+  // scratch cuda/af3's runTrunk drew from its pool)
+  GK(cudaDeviceSynchronize());
+  for (auto& sg : M.segs) if (sg.bundle && sg.device) { GK(cudaFree(sg.device)); sg.device = nullptr; }
+  trimPool();
+  memPhase("training starts");
   std::vector<double> cum; double totalW = 0;
   for (auto& e : examples) { totalW += e.weight; cum.push_back(totalW); }
   int inBatch = 0;
