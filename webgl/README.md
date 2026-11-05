@@ -1533,6 +1533,68 @@ identity's magnitudes. It is falsified on the WEIGHT now, which is what it actua
 arm is only a gate if the falsification perturbs something it reads**, and a verdict that counts
 which arms noticed is how that gets found rather than assumed.
 
+### The dense projection is bound by x's fetch locality, and the output tile is not the lever
+
+Re-profiled after this campaign's wins, **the projection IS the fold**: at 68 tokens and 20 steps
+`linear*` is **27.0 s of the 37.1 s** of labelled GPU time in a bioemu2 fold (72.8%) at an aggregate
+**219 GFLOP/s**, where `probe-webgl-gemm-ceiling.js` measures a best-case fragment GEMM at 1958-2003.
+The contraction that used to dominate is **11.8%**. So the next factor is here, and the spread within
+the family is 13x - every fast row is `in-major` and every slow one `out-major` int5, which the fold
+cannot separate because the two always coincide there.
+
+`bench-webgl-linear.js --layout=` separates them on the float path, same weights laid out two ways:
+
+| shape | out-major | in-major | ratio |
+|---|---:|---:|---:|
+| 576x896x1792 | 63.5 ms (29.1 GFLOP/s) | **12.7 ms (145.5)** | **5.0x** |
+| 576x768x1920 | 66.9 ms (25.4) | **11.9 ms (142.7)** | **5.6x** |
+| 4624x256x2048 | 29.3 ms (165.7) | **9.9 ms (487.9)** | **2.9x** |
+
+🔴 **AND THAT IS NOT A LEVER ON THE FOLD, BECAUSE int5 OUT-MAJOR ALREADY BEATS FLOAT IN-MAJOR.** The
+same shape runs at **10.63 ms in the fold** as int5 out-major against float in-major's 12.71 - the
+codes are 0.625 bytes a weight against four, and the layout is the float path's problem. Reading the
+layout table as a 5x waiting to be taken would have been a wasted kernel rewrite.
+
+🔴 **SO WHICH OPERAND BINDS? x, AT 6.4-6.7x, AND THE CODES COST NOTHING AT ALL.**
+`probe-webgl-linear-operand.js` is the diagnostic `linear.js` already ran once on the other operand -
+its own comment records "make every chunk read the SAME four code texels and the fold goes 6664 ms to
+3476", which is what chose `orderRowFastest`. The x-side twin had never been run. Three arms, same
+fragment count, same fetch count, same decode, same multiply-adds, differing only in which texels a
+fragment addresses:
+
+| arm | ms | GFLOP/s | factor |
+|---|---:|---:|---:|
+| shipped | 19.24 | 96 | - |
+| **x-aliased** (every fragment reads row block 0) | **2.94** | **630** | **6.62x** |
+| w-aliased (every fragment reads output group 0) | 19.24 | 96 | **1.01x** |
+
+Over three runs the x factor is **6.41, 6.62, 6.68** and the code factor **1.01, 0.85** - the second
+meaning the aliased arm came out SLOWER, which is what a figure inside the shipped arm's own
+1.22-1.34 spread looks like. The code arm is a null, not a small win.
+
+**`orderRowFastest` finished the weight side.** Every remaining factor in this kernel is on the x
+side, and 630 GFLOP/s is what the arithmetic reaches once x is in cache.
+
+🔴 **AND THE OBVIOUS CONCLUSION FROM THAT IS FALSE - FOUR ARMS, THREE OF THEM NULLS.** x is re-read
+once per OUTPUT GROUP, so a wider output tile of the same `MAX_DRAW_BUFFERS * 4` budget reads
+proportionally less x, and the extra codes it reads were just measured free. Every one is SLOWER,
+monotonically:
+
+| tile | ms | GFLOP/s | x MB | code MB | factor |
+|---|---:|---:|---:|---:|---:|
+| **8x4** (shipped) | **19.24** | **96** | 882 | 68.9 | **1.00** |
+| 4x8 | 22.95 | 81 | 441 | 137.8 | 0.84 |
+| 2x16 | 27.04 | 68 | 220.5 | 275.6 | 0.71 |
+| 1x32 | 35.73 | 52 | 110.3 | 551.3 | 0.54 |
+
+**Halving x's bytes makes the kernel slower**, which is the whole finding: what binds is not x's
+VOLUME but its fetch LOCALITY. Aliasing x does not merely read less - it makes every concurrent
+fragment read the SAME eight rows - while a wider output tile keeps the scattered pattern and
+multiplies the decode work and the live accumulators. **The shipped 8x4 is the best aspect of its
+budget, and the traffic model that predicted 1.9x for 2x16 is retracted.** The lever is a fragment
+ORDER that brings nearby x under one rasterisation tile, which is exactly what was worth 3.29x on the
+contraction; it is not a reshaped output tile, and it is not the weight layout.
+
 ### The threshold that chose between two projection kernels was fitted with the wrong dtype
 
 🔴 **`bench-webgl-linear.js` UPLOADED ITS WEIGHTS WITH `upload`, AND EVERY FOLD USES
