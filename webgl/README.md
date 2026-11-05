@@ -2635,6 +2635,33 @@ and buys about a tenth, and raising the flops a fetch4 by packing the operands t
 loss** because the unpack costs more than the fetch it saves. The 32-float budget is not just the
 API's limit here; it is the profitable one.
 
+🔴 **AND THE DRAW COUNT IS NOT THE LEVER: A DRAW COSTS 22.9 us AND THE FOLD'S 54,381 OF THEM ARE
+5.7%.** The denoiser's per-step profile is **41 kernels and about 1500 draws**, most of them small -
+`bioemu2.cond-slice` alone is 192 calls a step - so the obvious suspicion is that the fold pays for
+draws rather than for work, which only FUSING would fix. `probe-webgl-draw-floor.js` prices one:
+
+| output texels | us a draw | effective |
+|---:|---:|---:|
+| 1 | 22.9 | - |
+| 1,024 | 23.8 | 1.4 GB/s |
+| 16,384 | 23.6 | 22.2 GB/s |
+| 65,536 | 23.6 | **88.7 GB/s** |
+| 262,144 | 28.9 | 290.2 GB/s |
+
+**A draw of 65,536 texels costs what a draw of ONE texel costs** - up to about that size the work is
+free and the cost is entirely fixed, which is the regime those small kernels live in. So the whole
+draw bill is `54,381 x 22.9 us` = **1245 ms, 5.7% of a 20.5 s fold**, and fusing every small kernel in
+the backend has a ceiling of **1.06x**.
+
+🔴 **AND ELIMINATING 192 DRAWS A STEP CONFIRMS IT DIRECTLY: A WASH.** `bioemu2.cond-slice` is a copy -
+the conditioning is one tensor of `6 * channels`, each consumer wanted its own piece, so
+`piece(index)` allocated `rows * channels` and copied into it, six times a layer across 32 layers. The
+pieces sit at a known offset in a known stride, so a consumer can address them in place; built, that
+removed 192 slice draws a step plus the gate's separate product and sum. Four interleaved rounds:
+**20529/20460/20474/20468 ms against 20572/20520/20451/20513** - 0.15% apart. Reverted. The draws
+overlapped the GPU and the copies were cache-served, which is the same answer the framebuffer reuse
+gave from the host side.
+
 🔴 **AND SEVEN HYPOTHESES FOR THE REST CAME BACK NULL, WHICH IS THE EVIDENCE THAT THERE IS NO
 EIGHTH IN THIS SHAPE OF KERNEL.** Each was built and measured, and each is a tool or a control arm
 in the tree now rather than a note:
