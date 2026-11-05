@@ -1018,7 +1018,30 @@ memory, so its only reuse is what ONE invocation holds in registers, and that is
 those 32 floats better, and the row block spends all of them: 23 flops a fetch against the 21.3
 docs/A100.md measures as an eight-target fragment GEMM's ceiling.
 
-So the floor follows from two measured numbers rather than from a feature list. The best fetch rate
+🔴 **AND SEVEN HYPOTHESES FOR THE REST CAME BACK NULL, WHICH IS THE EVIDENCE THAT THERE IS NO
+EIGHTH IN THIS SHAPE OF KERNEL.** Each was built and measured, and each is a tool or a control arm
+in the tree now rather than a note:
+
+| hypothesis | arm | result |
+|---|---|---|
+| weight bytes | `--no-int5-weights`, `--no-half-weights` | 1.16x, 1.40x - **taken** |
+| fragment order | `--no-row-fastest` | 1.23x - **taken** |
+| weight cache misses | every chunk reads one texel | **1.02x** - no headroom left |
+| x fetch count | x packed eight halves to a texel | **0.93x**, and it overflows f16 |
+| accumulator registers | eight codes as two uints | **0.98x** |
+| rows a fragment owns | R = 4 against R = 8 | **0.66x** |
+| texture layout | `probe-webgl-2d-weight.js`, one matrix row per texture row | **1.01x** |
+| too few fragments | the same probe's split-K, 2/4/8 | **1.01x** at 8x the fragments |
+| output budget | `bench-webgl-tf-linear.js`, transform feedback | **1.00x** at 32 floats, 0.54x at 112 |
+
+🔴 **AND THE ONE THING THAT DOES MOVE IT IS THE SHAPE, WHICH IS NOT A LEVER.** The same kernel is
+**24 GFLOP/s at 576 x 896 -> 1792 and 254 at 2048 x 2048 x 2048** - a tenfold difference in fetch
+rate at identical intensity, identical layout and identical code. bioemu2's projections are the
+small shape and the model decides that. It is why `bench-webgl2-tf-matmul.js`'s 1.6 TFLOP/s was
+never a figure this backend could inherit: that is a square-2048 GEMM, and its timing is real (12.8
+ms at one iteration, 10.7 at sixteen), but no fold dispatches one.
+
+So the floor follows from measured numbers rather than from a feature list. The best fetch rate
 observed here is **37 G/s**, on the one kernel whose whole weight (64 KiB) sits in L1; at the
 fragment path's 21.3 flops a fetch that is **790 GFLOP/s**, which is **3x below** the 2.4 TFLOP/s
 WGSL reaches on the same fold. The vertex path's four-times-larger output budget would double the
