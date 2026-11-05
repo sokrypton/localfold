@@ -42,23 +42,33 @@ webgl/
     attention.js    gated flash attention with pair bias (58% of one), eight render targets
     layer-norm.js   row-wise LayerNorm, about ten times a block
     linear.js       the dense projection, with bias and activation folded in - where the FLOPs are
+    triangle-contract.js        the contraction, one source shared by the stage and the benchmark
+    triangle-multiplication.js  the whole operation, nine draws: LayerNorm, four projections,
+                                two gates, the mask, the contraction, the output gate
 ```
 
 ## AF2, which is what this tree is being built for
 
 `webgpu/`'s AF2 path is **75 `@compute` entry points** (32 in `webgpu/af2/`, 34 in
 `webgpu/kernels/`, 2 in `webgpu/heads/`, 1 in `webgpu/input/`, 6 in `webgpu/runtime/`) over about
-18,000 lines. Five are ported here, and they are deliberately the load-bearing ones rather than the
+18,000 lines. The primitives ported so far are deliberately the load-bearing ones rather than the
 easy ones: the triangle contraction and flash attention are 80% of an Evoformer block's GPU time
-between them, and LayerNorm, the dense projection and the residual add are what the other 70
-kernels are mostly made of.
+between them, and LayerNorm, the dense projection, the residual add and the row mask are what the
+other 70 kernels are mostly made of.
+
+**Triangle multiplication is complete and checked in both directions** - the first whole AlphaFold
+operation here rather than a primitive. It is nine draws where the WGSL side fuses into fewer, and
+every intermediate is released as its last reader finishes, so a 400-token block does not hold nine
+pair tensors at once.
 
 Still to come, in the order they are needed: the MSA row and column attentions (the existing
-attention kernel generalised off its fixed 32-channel head), the outer product mean, the
-transition, the triangle's four projections and its gating, then the Evoformer block that drives
-them, then the stack, the structure module, and the confidence and distogram heads. Nothing is
-wired to a weight bundle yet - every kernel so far takes its operands as plain arrays, and reading
-`model-af2-monomer-int5` is its own stage.
+attention kernel generalised off its fixed 32-channel head, plus AF2's separate GLOBAL attention
+for the extra-MSA stack), the outer product mean, the transition, triangle ATTENTION, then the
+Evoformer block that drives them, the stack, the structure module, and the confidence and distogram
+heads. After AF2: AF3's pairformer and diffusion, ESMFold2, bioemu2. Nothing is wired to a weight
+bundle yet - every kernel takes its operands as plain arrays, and reading
+`model-af2-monomer-int5` is its own stage with its own differential, because a transposed weight is
+a plausible-looking wrong answer.
 
 ## No compute shaders, and everything follows from that
 
@@ -125,7 +135,21 @@ which moves both sides equally: it reported "only 4 of 18 arms noticed", the 4 b
 that compare two kernel runs and were already one-sided. A control that feeds both arms is this
 repository's "comparing something with itself" trap wearing the clothes of a control.
 
-**What this does NOT verify.** It is numerics on two kernels at small shapes, nothing else. It does
+`node tools/gpu-chrome.mjs tools/gpu/check-webgl-triangle.js` - **12 arms**, the whole operation
+against TWO references over four shapes: the f64 CPU reference, and the WGSL kernel driven in the
+same page at its own f32/two-pass defaults. 2e-7 against the first, 3-5e-7 against the second.
+
+🔴 **AND THAT SECOND REFERENCE IS WHY THE INCOMING DIRECTION IS NOT STILL WRONG.** The
+contraction's incoming arm kept `a` on the `i` side in both directions, where the WGSL kernel -
+gated against OpenFold and AlphaFold fixtures - swaps the operands: `sum_k b[k,i] a[k,j]`, not
+`sum_k a[k,i] b[k,j]`. That is the pair-TRANSPOSE of the right answer and it measured **relRMS
+1.3**, no signal at all, on all four shapes. It survived because the CPU reference it had been
+checked against was written FROM the shader's own index arithmetic, so it encoded the same
+convention and agreed to 1e-7 while both were wrong. The operation's own CPU reference covers
+outgoing only, so nothing else here could have seen it. **Independence has to mean a second
+implementation of the operation, not a second transcription of the code.**
+
+**What these do NOT verify.** Numerics at small shapes, nothing else. It does
 not check the banded output path (a framebuffer is at most `MAX_TEXTURE_SIZE` on a side, so long
 tensors are drawn in several passes with a row offset, and no arm here is large enough to need a
 second band); it does not touch transform feedback, which is where the 47.8% comes from; and it says

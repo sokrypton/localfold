@@ -85,3 +85,46 @@ export function scale(execution, a, factor, into) {
     floats: { scale: factor }, label: "elementwise.scale",
   });
 }
+
+/**
+ * `out[row][c] = x[row][c] * mask[row]` - one mask value broadcast over a row.
+ *
+ * AF2 and AF3 both mask the pair track constantly (a padded residue contributes
+ * nothing to a contraction), and the mask is one float a PAIR against `channels`
+ * floats of activation, so it cannot be an ordinary elementwise multiply. The
+ * WebGPU side folds this into whichever kernel is adjacent; here it is its own
+ * draw until something measures that as a cost.
+ */
+export const maskRowsSource = (rows, channels) => `${PRELUDE}
+const int ROWS = ${rows};
+const int CH4 = ${channels / 4};
+uniform sampler2D xTex;
+uniform sampler2D maskTex;
+void main() {
+  int texel = linearTexel();
+  if (texel >= ROWS * CH4) { result = vec4(0.0); return; }
+  int row = texel / CH4;
+  result = fetch4(xTex, texel) * fetch1(maskTex, row);
+}`;
+
+export function maskRows(execution, { x, mask, rows, channels }, into) {
+  if (channels % 4 !== 0) {
+    throw new RangeError(`maskRows: channels must be a multiple of 4, got ${channels}`);
+  }
+  if (x.elements !== rows * channels) {
+    throw new RangeError(`maskRows: x holds ${x.elements} floats, not ${rows} x ${channels}`);
+  }
+  if (mask.elements !== rows) {
+    throw new RangeError(`maskRows: mask holds ${mask.elements} floats, not ${rows}`);
+  }
+  const output = into ?? execution.allocate(rows * channels, "maskRows");
+  if (output === x) {
+    throw new Error("maskRows: a fragment shader cannot read the texture it draws into");
+  }
+  return execution.dispatch({
+    source: maskRowsSource(rows, channels),
+    output,
+    inputs: { xTex: x, maskTex: mask },
+    label: `elementwise.maskRows:${rows}x${channels}`,
+  });
+}

@@ -38,6 +38,7 @@
 import { AttentionFlashWebGL2, HEAD_DIM } from "../../webgl/kernels/attention.js";
 import { TriangleContractWebGL2 } from "../../webgl/kernels/triangle.js";
 import { createWebGL2Context, webgl2Capability } from "../../webgl/index.js";
+import { Execution } from "../../webgl/runtime/execution.js";
 import { relativeRms } from "./relative-rms.js";
 
 const option = (args, name, fallback) => {
@@ -65,10 +66,19 @@ const noise = (count, scale, random) => {
 };
 
 /**
- * The contraction, from the shader's own indices.
+ * The contraction, in the convention the WGSL kernel defines.
  *
  * outgoing: out[(i,j),h] = sum_k a[(i,k),h] * b[(j,k),h]
- * incoming: out[(i,j),h] = sum_k a[(k,i),h] * b[(k,j),h]
+ * incoming: out[(i,j),h] = sum_k b[(k,i),h] * a[(k,j),h]
+ *
+ * 🔴 THE INCOMING LINE USED TO READ `a[(k,i)] * b[(k,j)]` AND THAT WAS WRONG,
+ * WITH THIS FILE AS THE REASON IT SURVIVED. This reference was written from the
+ * kernel's own index arithmetic, so it encoded the kernel's convention and the
+ * two agreed to 1e-7 while both disagreed with the model - the pair-TRANSPOSE
+ * of the right answer. `check-webgl-triangle.js` runs the WGSL kernel on the
+ * same input in the same page and read **relRMS 1.3**, which is no signal at
+ * all. Independence has to mean a second implementation of the OPERATION, not
+ * a second transcription of the code.
  */
 function contractReference(a, b, length, channels, direction) {
   const out = new Float32Array(length * length * channels);
@@ -77,10 +87,9 @@ function contractReference(a, b, length, channels, direction) {
       for (let h = 0; h < channels; h += 1) {
         let sum = 0;
         for (let k = 0; k < length; k += 1) {
-          const [left, right] = direction === "outgoing"
-            ? [(i * length + k) * channels + h, (j * length + k) * channels + h]
-            : [(k * length + i) * channels + h, (k * length + j) * channels + h];
-          sum += a[left] * b[right];
+          sum += direction === "outgoing"
+            ? a[(i * length + k) * channels + h] * b[(j * length + k) * channels + h]
+            : b[(k * length + i) * channels + h] * a[(k * length + j) * channels + h];
         }
         out[(i * length + j) * channels + h] = sum;
       }
@@ -143,6 +152,9 @@ export async function main(device, args) {
     : values);
   const gl = createWebGL2Context();
   const capability = webgl2Capability(gl);
+  // The contraction is a driver over `webgl/kernels/triangle-contract.js` now,
+  // so it takes the execution that owns the allocator rather than a raw context.
+  const execution = new Execution(gl);
   const rows = [];
   const failures = [];
 
@@ -155,7 +167,7 @@ export async function main(device, args) {
   };
 
   // --- the contraction -----------------------------------------------------
-  const contract = new TriangleContractWebGL2(gl);
+  const contract = new TriangleContractWebGL2(execution);
   for (const [length, channels] of [[8, 4], [13, 8], [24, 32], [31, 12]]) {
     const random = generator(length * 1000 + channels);
     const a = noise(length * length * channels, 1, random);
