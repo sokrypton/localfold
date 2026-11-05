@@ -144,7 +144,9 @@ from there 6MRR's mse goes 33.3 -> 12.8 in 40 steps. The Fourier noise embedding
   step (`_sync_and_average_grads`), so the weights stay one set without being exchanged. NCCL for a GPU a rank; a file
   transport (through a tmpfs) for ranks sharing a GPU, which is how it is tested here on one A100: two ranks stay in
   sync (checksums equal to the last digit), and two ranks on the same draws (`--same-draws`) land 1.2e-7 from one
-  process's step - the backward's atomics. Rank 0 writes the log, the checkpoint and the validation.
+  process's step - the backward's atomics. Rank 0 writes the log, the checkpoint and the validation. 🔴 The NCCL
+  transport has run only at one rank here (its id exchange, init and both all-reduces): this box has one GPU, and NCCL
+  refuses two ranks on one device.
 - **validation** - `--val=<file>` (`--val-every`): OpenFold3's validation on the EMA weights, 1 + 3 cycles, a full
   rollout of 5 x 200 steps, each sample's truth permuted, all-atom lDDT (mean, best, the confidence head's top-ranked).
   The pretrained bundle reads 0.831 on 6MRR and 0.846 on 5K9P from their sequences alone.
