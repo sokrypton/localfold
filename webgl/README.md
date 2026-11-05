@@ -531,6 +531,20 @@ restored.
 trunk loops of 24 blocks and eleven denoiser calls is **240 s** here, median CA-CA **3.637 A**, mean
 pLDDT 57.4, pTM 0.413, 126 contacts over 0.5, peak 2978 MiB. At 20 residues it is 4.2 s.
 
+🔴 **AND IT TAKES ALL FIVE FLAGS, BECAUSE EVERY DEFAULT IN THAT TOOL IS A TRUNCATION:**
+
+```
+node tools/gpu-chrome.mjs tools/gpu/fold-esmfold2-webgl.js \
+  --length=75 --tower-blocks=36 --trunk-blocks=24 --loops=3 --steps=15
+```
+
+Re-measured at this commit: **3.637 A, pTM 0.4133, 126 contacts, 253 s** - the line above, four
+digits of it. Leave a flag out and the tool folds a prefix of the model and the geometry gate rightly
+calls it "not a chain": `--loops=0 --trunk-blocks=4` (the defaults) reads **2.478 A** at the full
+tower, and a 3-block tower reads 3.292. All three of those were read as a REGRESSION here before the
+flags were checked, twice from a log line that had truncated `--tower-blocks=36` to `3`. A number
+quoted without its configuration is a number the next reader cannot reproduce.
+
 🔴 **AND 92% OF THAT IS THE TRUNK**: 4 x 55 s against the tower's 1.7, the shim's 0.3 and the atom
 transformer's 1.1 (the stage clock is in the fold tool's own report). The pair track's triangle
 contraction is O(L^3) a block and there are 24 of them a loop, so the trunk is the lever for this
