@@ -24,13 +24,18 @@
  * approximation to be avoided - on that path it is the right answer, and the
  * centred form is the wrong one.
  *
- * 🔴 AND A TEXEL MAY NOT STRADDLE TWO ROWS, which is why `channels % 4` is
- * refused up front. A fragment owns four consecutive channels; if a row's
- * length were not a multiple of four, the four would belong to two different
- * rows with two different means, and every shape this port actually runs
- * (cZ 128, cM 256, cHidden 32, 384) is a multiple of four. Refusing is better
- * than a kernel that is quietly wrong for cZ 7 - which is exactly the shape
- * that broke the WGSL triangle kernel, found by a sweep over widths.
+ * 🔴 AND A RAGGED WIDTH NEEDS A DIFFERENT KERNEL, BECAUSE A TEXEL THEN
+ * STRADDLES TWO ROWS. The aligned kernel below has a fragment own four
+ * consecutive channels of ONE row and share that row's mean; where the width is
+ * not a multiple of four the four can belong to two rows with two different
+ * means, so each element resolves its own row and sweeps it.
+ *
+ * That is not a hypothetical shape: AF3's diffusion conditioning normalises a
+ * concatenation of the trunk pair with the RAW 139-column relative encoding,
+ * which is **267** channels. Refusing it outright - as this kernel first did -
+ * would have meant that stage could not run at all. Four row sweeps a fragment
+ * is the cost, on a path nothing else here takes; `kernels/linear.js` documents
+ * the same split for AF2's 50 pLDDT bins.
  */
 import { ONE_TARGET, PRELUDE } from "../runtime/execution.js";
 /** @typedef {import("../runtime/storage.js").Tensor} Tensor */
@@ -48,6 +53,61 @@ import { ONE_TARGET, PRELUDE } from "../runtime/execution.js";
 export const layerNormSource = (
   rows, channels, roundHalf = false, variance = "two-pass",
   hasWeight = true, hasBias = true,
+) => (channels % 4 === 0
+  ? alignedLayerNormSource(rows, channels, roundHalf, variance, hasWeight, hasBias)
+  : raggedLayerNormSource(rows, channels, roundHalf, variance, hasWeight, hasBias));
+
+/** The ragged form: every element resolves its own row and sweeps it. */
+export const raggedLayerNormSource = (
+  rows, channels, roundHalf, variance, hasWeight, hasBias,
+) => `${PRELUDE}${ONE_TARGET}
+const int CHANNELS = ${channels};
+const int ELEMENTS = ${rows * channels};
+uniform sampler2D xTex;
+${hasWeight ? "uniform sampler2D weightTex;" : ""}
+${hasBias ? "uniform sampler2D biasTex;" : ""}
+uniform float epsilon;
+
+float normalised(int element) {
+  int row = element / CHANNELS;
+  int channel = element - row * CHANNELS;
+  int base = row * CHANNELS;
+  float total = 0.0;
+${variance === "fast" ? `  float totalSquares = 0.0;
+  for (int c = 0; c < CHANNELS; ++c) {
+    float v = fetch1(xTex, base + c);
+    total += v;
+    totalSquares += v * v;
+  }
+  float mean = total / float(CHANNELS);
+  float inverseStd = inversesqrt(totalSquares / float(CHANNELS) - mean * mean + epsilon);`
+    : `  for (int c = 0; c < CHANNELS; ++c) total += fetch1(xTex, base + c);
+  float mean = total / float(CHANNELS);
+  float spread = 0.0;
+  for (int c = 0; c < CHANNELS; ++c) {
+    float centred = fetch1(xTex, base + c) - mean;
+    spread += centred * centred;
+  }
+  float inverseStd = inversesqrt(spread / float(CHANNELS) + epsilon);`}
+  float value = (fetch1(xTex, element) - mean) * inverseStd;
+${hasWeight ? "  value *= fetch1(weightTex, channel);" : ""}
+${hasBias ? "  value += fetch1(biasTex, channel);" : ""}
+  return value;
+}
+
+void main() {
+  int base = linearTexel() * 4;
+  if (base >= ELEMENTS) { result = vec4(0.0); return; }
+  vec4 value = vec4(
+    normalised(base),
+    base + 1 < ELEMENTS ? normalised(base + 1) : 0.0,
+    base + 2 < ELEMENTS ? normalised(base + 2) : 0.0,
+    base + 3 < ELEMENTS ? normalised(base + 3) : 0.0);
+  result = ${roundHalf ? "half4(value)" : "value"};
+}`;
+
+export const alignedLayerNormSource = (
+  rows, channels, roundHalf, variance, hasWeight, hasBias,
 ) => `${PRELUDE}${ONE_TARGET}
 const int ROWS = ${rows};
 const int CHANNELS = ${channels};
@@ -117,9 +177,6 @@ export function layerNorm(
   if (variance !== "two-pass" && variance !== "fast") {
     throw new RangeError(
       `layerNorm: variance is "two-pass" (AF2) or "fast" (AF3), not \`${variance}\``);
-  }
-  if (channels % 4 !== 0) {
-    throw new RangeError(`layerNorm: channels must be a multiple of 4, got ${channels}`);
   }
   if (x.elements !== rows * channels) {
     throw new RangeError(

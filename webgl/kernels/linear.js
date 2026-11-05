@@ -98,11 +98,34 @@ export const linearSource = (
     }
   }`;
   const ragged = outChannels % 4 !== 0;
+  // 🔴 AND A RAGGED **INPUT** WIDTH NEEDS ITS OWN SWEEP, WHICH AF3 FORCED.
+  // The aligned kernel reads whole texels of the input row, which only works
+  // when the row starts on a texel boundary - and AF3's diffusion conditioning
+  // projects a 267-channel concatenation (the trunk pair plus the RAW 139-column
+  // relative encoding) down to the pair width. Refusing it, as this kernel first
+  // did, would have meant that stage could not run. Element-by-element reads:
+  // four times the input fetches on a path nothing else here takes.
+  const raggedInput = inChannels % 4 !== 0;
+  if (raggedInput && ragged) {
+    throw new RangeError(
+      `linear: ${inChannels} in and ${outChannels} out are both ragged, which no model`
+      + " in this tree has - the two sweeps would need a third kernel");
+  }
+  const inMajorRagged = `  for (int i = 0; i < IN; ++i) {
+    sum += fetch1(xTex, xBase + i) * fetch4(weightTex, i * OUT4 + group);
+  }`;
+  const outMajorRagged = `  for (int i = 0; i < IN; ++i) {
+    float x = fetch1(xTex, xBase + i);
+    sum.x += x * fetch1(weightTex, (group * 4) * IN + i);
+    sum.y += x * fetch1(weightTex, (group * 4 + 1) * IN + i);
+    sum.z += x * fetch1(weightTex, (group * 4 + 2) * IN + i);
+    sum.w += x * fetch1(weightTex, (group * 4 + 3) * IN + i);
+  }`;
 
   return `${PRELUDE}${ONE_TARGET}
 const int ROWS = ${rows};
 const int IN = ${inChannels};
-const int IN4 = ${inChannels / 4};
+const int IN4 = ${Math.ceil(inChannels / 4)};
 const int OUT = ${outChannels};
 const int OUT4 = ${Math.ceil(outChannels / 4)};
 uniform sampler2D xTex;
@@ -118,10 +141,12 @@ ${[0, 1, 2, 3].map(perComponent).join("\n")}
   if (texel >= ROWS * OUT4) { result = vec4(0.0); return; }
   int row = texel / OUT4;
   int group = texel - row * OUT4;
-  int xBase = row * IN4;
+  int xBase = row * ${raggedInput ? "IN" : "IN4"};
 
   vec4 sum = vec4(0.0);
-${weightLayout === "in-major" ? inMajor : outMajor}
+${raggedInput
+    ? (weightLayout === "in-major" ? inMajorRagged : outMajorRagged)
+    : (weightLayout === "in-major" ? inMajor : outMajor)}
   vec4 value = sum${useBias ? " + fetch4(biasTex, group)" : ""};`}
   result = ${roundHalf ? ROUND_HALF(ACTIVATIONS[activation]) : ACTIVATIONS[activation]};
 }`;
@@ -148,12 +173,9 @@ export function linear(execution, call, into) {
       `linear: weightLayout is "out-major" ([out][in]) or "in-major" ([in][out]), `
       + `not \`${weightLayout}\``);
   }
-  // The INPUT width must be a multiple of four - every input read is a whole
-  // texel - and every shape in these models is. The OUTPUT width need not be:
-  // see the ragged kernel, which AF2's 50 pLDDT bins require.
-  if (inChannels % 4 !== 0) {
-    throw new RangeError(`linear: inChannels must be a multiple of 4, got ${inChannels}`);
-  }
+  // Neither width has to be a multiple of four: AF2's 50 pLDDT bins made the
+  // OUTPUT ragged and AF3's 267-channel diffusion conditioning the INPUT. Both
+  // at once is refused inside `linearSource`, because no model here needs it.
   if (x.elements !== rows * inChannels) {
     throw new RangeError(`linear: x holds ${x.elements} floats, not ${rows} x ${inChannels}`);
   }

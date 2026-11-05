@@ -80,6 +80,7 @@ webgl/
     diffusion/atom-conditioning.js  chemistry in: the reference conformer, and arcsinh
     diffusion/transformer.js    the 24 blocks, nested six by four
     diffusion/atom-encoder.js   the five gathers, the pair, and seven stage taps
+    diffusion/conditioning.js   three pair shapes, and a refusal where the width disagrees
   af2/
     multimer/template.js        the multimer's nine-projection template embedder
     evoformer/block.js          a whole Evoformer block and the extra-MSA block, nine sub-layers

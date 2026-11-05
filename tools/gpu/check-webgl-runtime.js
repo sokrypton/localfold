@@ -275,11 +275,66 @@ export async function main(device, args) {
       }));
   }
 
-  refuses("layerNorm on a width that is not a multiple of four", "multiple of 4",
-    () => layerNorm(execution, {
-      x: execution.allocate(7 * 7, "x7"), weight: execution.allocate(7, "w7"),
-      bias: execution.allocate(7, "b7"), rows: 7, channels: 7,
+  // 🔴 AND A RAGGED **INPUT** WIDTH TOO, which AF3's diffusion conditioning
+  // forced for the same reason: it projects a 267-channel concatenation down to
+  // the pair width. Both layouts, because the two sweeps read the weight
+  // differently and only one of them can be right.
+  for (const weightLayout of ["in-major", "out-major"]) {
+    const n = 4;
+    const inChannels = 267;
+    const outChannels = 16;
+    const random = generator(inChannels + outChannels);
+    const x = noise(n * inChannels, 1, random);
+    const weight = noise(inChannels * outChannels, 0.2, random);
+    const bias = noise(outChannels, 0.1, random);
+    const want = new Float32Array(n * outChannels);
+    for (let row = 0; row < n; row += 1) {
+      for (let out = 0; out < outChannels; out += 1) {
+        let total = bias[out];
+        for (let i = 0; i < inChannels; i += 1) {
+          total += x[row * inChannels + i] * (weightLayout === "in-major"
+            ? weight[i * outChannels + out] : weight[out * inChannels + i]);
+        }
+        want[row * outChannels + out] = total;
+      }
+    }
+    const got = Float32Array.from(execution.read(linear(execution, {
+      x: execution.upload(skew(x), `ri-x-${weightLayout}`),
+      weight: execution.upload(weight, `ri-w-${weightLayout}`),
+      bias: execution.upload(bias, `ri-b-${weightLayout}`),
+      rows: n, inChannels, outChannels, weightLayout,
+    })));
+    arm(`linear ragged input ${n}x${inChannels}x${outChannels} ${weightLayout}`,
+      got, want, 3e-6);
+  }
+  refuses("a linear with both widths ragged", "both ragged",
+    () => linear(execution, {
+      x: execution.allocate(7 * 7, "bothx"), weight: execution.allocate(7 * 5, "bothw"),
+      rows: 7, inChannels: 7, outChannels: 5, weightLayout: "in-major",
     }));
+
+  // 🔴 A RAGGED WIDTH IS AN ARM NOW, NOT A REFUSAL - BECAUSE AF3 HAS ONE. This
+  // kernel refused `channels % 4 !== 0` on the grounds that "every shape this
+  // port actually runs is a multiple of four", and that was true until AF3's
+  // diffusion conditioning turned up: it normalises the trunk pair concatenated
+  // with the RAW 139-column relative encoding, which is **267** channels.
+  // Refusing would have meant that stage could not run. 7 and 267 are both
+  // compared against the same f64 formula, and 267 is the shape that matters.
+  for (const [n, channels] of [[5, 7], [3, 267]]) {
+    const random = generator(n * 1000 + channels);
+    const values = noise(n * channels, 1.5, random);
+    const weight = Float32Array.from(noise(channels, 0.2, generator(channels)),
+      (v) => v + 1);
+    const bias = noise(channels, 0.1, generator(channels + 1));
+    const got = Float32Array.from(execution.read(layerNorm(execution, {
+      x: execution.upload(skew(values), `ragged-x${channels}`),
+      weight: execution.upload(weight, `ragged-w${channels}`),
+      bias: execution.upload(bias, `ragged-b${channels}`),
+      rows: n, channels,
+    })));
+    arm(`layerNorm ragged ${n}x${channels}`, got,
+      layerNormReference(values, n, channels, weight, bias, 1e-5), 2e-6);
+  }
 
   // --- the dense projection ------------------------------------------------
   for (const [n, inChannels, outChannels] of [[16, 32, 64], [13, 128, 32], [5, 64, 128]]) {
