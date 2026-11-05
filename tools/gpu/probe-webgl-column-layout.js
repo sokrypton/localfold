@@ -4,15 +4,20 @@
  *
  *     node tools/gpu-chrome.mjs tools/gpu/probe-webgl-column-layout.js
  *
- * 🔴 WRITTEN BECAUSE TWO READINGS OF THE SHADER BOTH FAILED. `source_row(row)`
- * in the normalise shader maps a destination row to a source row under
- * `transpose`, and `mask_index` re-indexes the mask - so a column attention
- * ought to take AF2's `[sequence][residue]` activations and return
- * `[residue][sequence]`. Feeding it either order read relRMS ~1.3 against this
- * backend's output. Rather than guess a third time, this scores EVERY
- * combination of input order and output order against one f64 reference and
- * prints the whole table. The combination that lands at 1e-7 is the contract;
- * the rest are the evidence that it is the only one.
+ * 🔴 WRITTEN BECAUSE TWO READINGS OF THE SHADER BOTH FAILED, AND KEPT BECAUSE
+ * OF WHAT IT FOUND. `source_row(row)` in the normalise shader maps a
+ * destination row to a source row under `transpose`, `mask_index` re-indexes
+ * the mask, and `run` does plumb the flag into both - so `transpose: true` with
+ * AF2's `[sequence][residue]` activations and `[sequence][residue]` mask ought
+ * to be column attention, returning `[residue][sequence]`. It is not: that
+ * combination reads relRMS ~1.3.
+ *
+ * So rather than guess a fourth time, this enumerates the whole space -
+ * activation order, MASK order, the flag, and the output taken as-given or
+ * swapped - against one f64 reference under both mask conventions, and prints
+ * the table. The combination that lands at 1e-7 is the contract; the rest are
+ * the evidence that it is the only one, and whether any `transpose: true`
+ * combination lands at all is the question this tool exists to answer.
  */
 import { AttentionGpu } from "../../webgpu/kernels/attention.js";
 import { relativeRms } from "./relative-rms.js";
@@ -165,17 +170,25 @@ export async function main(device) {
     });
   }
 
+  // The mask, in AF2's [sequence][residue] order and transposed.
+  const maskByResidue = new Float32Array(rows).fill(1);
+  for (let s = 0; s < sequences; s += 1) {
+    for (let i = 0; i < length; i += 1) maskByResidue[i * sequences + s] = mask[s * length + i];
+  }
+
   const table = [];
   for (const [inputName, activations] of [["bySequence", bySequence], ["byResidue", byResidue]]) {
+   for (const [maskName, maskValues] of [["bySequence", mask], ["byResidue", maskByResidue]]) {
     for (const transpose of [true, false]) {
       let got;
       try {
         got = await new AttentionGpu(device, options).run({
           batch: length, queryLength: sequences, channels, heads,
-          activations, mask, weights, transpose,
+          activations, mask: maskValues, weights, transpose,
         });
       } catch (error) {
-        table.push({ input: inputName, transpose, error: String(error.message).slice(0, 90) });
+        table.push({ input: inputName, mask: maskName, transpose,
+          error: String(error.message).slice(0, 90) });
         continue;
       }
       const asGiven = got.output;
@@ -184,19 +197,27 @@ export async function main(device) {
         for (const maskOrder of ["key-major", "batch-major"]) {
           table.push({
             input: inputName,
+            mask: maskName,
             transpose,
             output: outputName,
-            maskOrder,
+            reference: maskOrder,
             relativeRms: Number(relativeRms(values, expected[maskOrder], "probe").toPrecision(4)),
           });
         }
       }
     }
+   }
   }
   table.sort((a, b) => (a.relativeRms ?? 9) - (b.relativeRms ?? 9));
+  const agreeing = table.filter((row) => (row.relativeRms ?? 9) < 1e-5);
   return {
     shape: { sequences, length, channels, heads },
+    combinations: table.length,
+    agreeing,
+    // 🔴 THE ANSWER THIS TOOL EXISTS FOR: does ANY `transpose: true` arrangement
+    // reproduce column attention through this class?
+    anyTransposeTrueAgrees: agreeing.some((row) => row.transpose === true),
     best: table[0],
-    table: table.slice(0, 8),
+    worstAgreeing: agreeing.length === 0 ? null : agreeing[agreeing.length - 1],
   };
 }

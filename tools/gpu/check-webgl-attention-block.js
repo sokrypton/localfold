@@ -415,15 +415,23 @@ export async function main(device, args) {
   // `transpose` flag as `k * BATCH + b`. That path agrees with the f64 reference
   // at 2.0e-7, so the flag is verified independently.
   //
-  // `AttentionGpu` with `transpose: true` is NOT the same contract, and two
-  // readings of its shader both failed: its `mask_index` becomes
-  // `key_index * p.batch + batch` and its `source_row(row)` becomes
-  // `q * p.batch + b`, which ought to mean "give it AF2's order and it
-  // transposes on the way in" - but feeding it either order, under either mask
-  // convention, with the output taken either as-given or swapped, read relRMS
-  // 1.26 to 1.30 across **all eight combinations**.
-  // `tools/gpu/probe-webgl-column-layout.js` is that table, kept because the
-  // negative result is what justifies the configuration below.
+  // `AttentionGpu` with `transpose: true` does not reproduce column attention at
+  // all, which took a sweep to establish rather than a third reading. Its
+  // `mask_index` becomes `key_index * p.batch + batch`, its `source_row(row)`
+  // becomes `q * p.batch + b`, the norm shader does use `source_row` for its
+  // input, and `run` does plumb the flag into both - so AF2's
+  // `[sequence][residue]` activations with a `[sequence][residue]` mask ought to
+  // be exactly it. `tools/gpu/probe-webgl-column-layout.js` enumerates all **32**
+  // arrangements of activation order, mask order, the flag, and the output taken
+  // as-given or swapped, against an f64 reference under both mask conventions:
+  // **two agree and both have `transpose: false`**. Sixteen of the thirty-two
+  // have the flag set and not one of them lands.
+  //
+  // That is a defect in the standalone class rather than in the fold, which
+  // drives column attention through `encodeAttention` directly - and CLAUDE.md
+  // already records this same class being checked in "a configuration nothing
+  // runs" on its storage axis. It is reported, not worked around: the probe is
+  // the evidence and this gate uses the arrangement that agrees.
   //
   // What the probe found agreeing, at 2.056e-7, is `transpose: false` with BOTH
   // inputs pre-transposed - residue-major activations and a `[residue][sequence]`
