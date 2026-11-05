@@ -1024,12 +1024,21 @@ So the ceiling is structural, and the measurements say where it is:
 - **The kernel is at the fragment path's intensity ceiling.** 512 flops per 22 fetches is **23
   flops a fetch**, against the 21.3 that docs/A100.md measures as the ceiling of an eight-target
   fragment GEMM. More outputs an invocation is the only way up and there are no more targets.
-- **But it is NOT at this device's fetch rate**, and that is the honest remaining headroom: 79.5 M
-  fetches in 19.5 ms is **4.1 G/s**, which is an L2 rate, against the 37 G/s the L1-resident kernel
-  reaches. With the fragment order fixed, the operand that streams is **x** - 2 MiB, L2-resident -
-  and packing it as halves eight to a texel would cut this kernel's fetches from 22 a chunk to 14,
-  about **1.5x**. It is not done because x is written by every other kernel in the tree, so that is
-  a change of tensor FORMAT rather than of one kernel.
+- **It is not at this device's fetch rate**, which looked like the remaining headroom: 79.5 M
+  fetches in 19.5 ms is **4.1 G/s**, an L2 rate, against the 37 G/s the L1-resident kernel reaches.
+  With the fragment order fixed the operand that streams is **x**, two thirds of the kernel's
+  fetches, so packing it as halves eight to a texel should have cut 22 fetches a chunk to 14.
+
+🔴 **IT WAS BUILT AND IT IS A LOSS TWICE OVER, SO THE "1.5x STILL AVAILABLE" THAT USED TO BE WRITTEN
+HERE IS WITHDRAWN.** A conversion pass over x before each projection - one read and one write of
+2 MiB, against 8 fetches a chunk saved - measures **7% SLOWER** (5763 ms against 5384 on the cheap
+fold): the pass is paid per MATMUL, and the denoiser dispatches many with their own x, so it never
+amortises the way a per-output-group saving suggests. 🔴 **AND IT OVERFLOWS float16 BEFORE IT IS
+EVEN SLOW**: a transition's pre-activation at `576 x 1792 -> 128` packs to **-Infinity**, which
+`--nan-watch` named on the first run. Weights are safe in f16 and were measured so; ACTIVATIONS are
+not, and holding them there needs a per-tensor scale - a reduction pass, which would cost more than
+the fetches it saves. The code is not kept, because a measured loss with an accuracy hazard is not
+a control arm worth maintaining; the measurement is kept so the next reader does not rebuild it.
 - **The one path with a bigger budget is the vertex one**, whose 128 interleaved components are
   four times a fragment's - docs/A100.md puts transform feedback at 8.64 TFLOP/s against the
   fragment path's 3.99 and WebGPU compute's 13.22, so **65% of WebGPU at best**. No kernel here
