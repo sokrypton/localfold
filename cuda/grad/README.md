@@ -114,9 +114,12 @@ one-hot one - the MSA stack, the pairformer, the distogram, the denoiser, the co
   computed to the one with the saves kept - 2.6e-5, against 2.3e-5 between two identical runs (the backward's atomics).
 - **losses** - `of3loss.h`, OpenFold3's nine (mse with the per-type weights and Algorithm 28's weighted alignment, bond,
   smooth LDDT, the diffusion weighting; distogram; pLDDT, PDE, PAE, experimentally resolved) with their gradients, held
-  by `test-of3loss` + `of3_loss_oracle.py` - a line-by-line torch transcription of `openfold3/core/loss` and its atom
-  selections (representative atoms, token frames with the 25-degree rule for an atomised token) - to **1.4e-14** on
-  every value and gradient, on the kitchen sink, where every branch is reached. The confidence head gained its
+  by `test-of3loss` + `of3_loss_reference.py` - **OpenFold3's own loss functions**, imported from a checkout and
+  called, the case laid out in OpenFold3's flat atom order (its canonical atoms a token, a dropped leaving atom a masked
+  padding atom) - to **1.4e-14** on every value and gradient, on the kitchen sink, where every branch is reached
+  (`of3_loss_oracle.py`, a line-by-line transcription, is the check that needs no checkout). 🔴 It found one thing the
+  transcription had copied wrongly: OpenFold3 sums five of its counts in float32, where the eps vanishes against the
+  count - the bond loss over the kitchen sink's one bonded pair read 1.0e-8 off until the C++ did the same. The confidence head gained its
   experimentally-resolved output (LayerNorm and a [Cs, dense x 2] projection; `test-af3conf-f64` gradchecks it).
 - **the rollout** - AF3's sampler, 20 steps, one sample, no gradient; the confidence head on it with every input
   detached, its losses 1e-4 each and zero (its head out of the step) outside 0.1-4.0 A.
