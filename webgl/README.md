@@ -1152,6 +1152,41 @@ What is established is narrower and worth keeping: **the bound below is a textur
 an absolute one**, there is exactly one other path, it is 2.1x per read, it holds 65,536 floats a
 draw, and once the draws are priced it is worth about a percent on the one fold that can use it.
 
+### 🔴 RETRACTED: A FRAGMENT GEMM REACHES 2 TFLOP/s HERE, SO THE API IS NOT THE LIMIT
+
+**Everything below this heading that calls the remaining gap structural is wrong, and this is the
+measurement that settles it.** `tools/gpu/probe-webgl-gemm-ceiling.js` runs a GEMM in the best case
+this backend admits - the optimal 8-by-4 tile into 8 render targets, 32 output floats, L1-resident
+operands, power-of-two strides, a long k loop, 262,144 fragments - and measures what the fragment
+pipeline can actually do:
+
+| | |
+|---|---:|
+| **best-case fragment GEMM** | **1958 - 2003 GFLOP/s** (spread 1.02 - 1.18 over three runs and k = 256, 512, 1024) |
+| its fetch rate | **91.8 G fetch4/s** at exactly 21.33 flops a fetch |
+| what parity needs | 5,081 GFLOP of bioemu2 arithmetic in the WGSL fold's 3.9 s = **1,303 GFLOP/s** |
+| what the fold averages | **167 GFLOP/s** |
+
+**So the output budget is not the binding constraint, the fetch issue rate is not the binding
+constraint, and parity is not ruled out by anything in the API.** The hardware will do two teraflops
+through a fragment shader with the 32-float tile. The fold does 167. **The entire remaining gap is
+LOCALITY** - a real GEMM's fragments must read disjoint rows, and that is worth a factor of twelve
+here.
+
+🔴 **AND THIS IS THE THIRD BOUND IN THIS FILE TO BE RETRACTED, EACH FOR THE SAME REASON: THE NUMBER
+MULTIPLIED BY THE ARITHMETIC WAS NEVER MEASURED.** The first inferred the fetch rate from the
+shipped kernels (6x too low). The second measured it under locality no GEMM can have and read the
+difference as headroom (over-read). The third - mine, above - concluded from the same figures that
+the gap was a property of WebGL2 and said so repeatedly. **The arithmetic was right every time and
+the factor it was multiplied by was guessed every time.** The probe is cheap; it should have been the
+first thing written, not the last.
+
+What this redirects the work to: the two changes that moved these kernels most were already
+locality - the contraction's fragment order (1.49x) and its tile-aware mapping (3.29x) - and the
+fetch-rate probe says scattered reads get **19 to 32 G fetch4/s** where this best case gets **92**.
+That is a 3 to 4x on the fetch side alone, before any arithmetic changes, and it is where the
+remaining factor lives.
+
 ### What the remaining gap IS, from the WGSL kernel's own notes
 
 **The distance is arithmetic intensity per GLOBAL fetch, and the mechanism that buys it is the one
