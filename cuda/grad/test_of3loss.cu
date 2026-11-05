@@ -57,6 +57,18 @@ int main(int argc, char** argv) {
   const double t = 5.0;
   std::vector<double> dx(A * 3, 0);
   auto D = of3::diffusionLoss(L, x, xt, gm, t, W, &dx);
+  {
+    // the device's smooth LDDT against the host's (the trainer's path)
+    of3dev::SmoothLddt sl; sl.init(L, xt, gm);
+    std::vector<double> dx2(A * 3, 0);
+    auto D2 = of3::diffusionLoss(L, x, xt, gm, t, W, &dx2, 1,
+                                 [&](double sc, std::vector<double>* g) { return sl.run(x, sc, g, 0); });
+    double num = 0, den = 0; for (size_t i = 0; i < A * 3; ++i) { num += (dx2[i] - dx[i]) * (dx2[i] - dx[i]); den += dx[i] * dx[i]; }
+    const double ev = fabs(D2.lddt - D.lddt) / D.lddt, eg = sqrt(num / den);
+    printf("device smooth LDDT against the host's: value %.2e, the whole diffusion gradient %.2e  %s\n", ev, eg, ev < 1e-12 && eg < 1e-12 ? "PASS" : "FAIL");
+    if (!(ev < 1e-12 && eg < 1e-12)) return 1;
+    sl.release();
+  }
   std::vector<double> gDg(lDg.size(), 0), gPl(lPl.size(), 0), gPde(lPde.size(), 0), gPae(lPae.size(), 0), gRs(lRs.size(), 0);
   const double dg = of3::distogramLoss(L, xt, gm, lDg.data(), K, 1, gDg.data());
   const double pl = of3::plddtLoss(L, x, xt, gm, lPl.data(), 50, 1, gPl.data());

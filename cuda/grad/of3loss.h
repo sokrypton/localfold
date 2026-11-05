@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -131,9 +132,11 @@ struct Diffusion { double mse = 0, bond = 0, lddt = 0, total = 0; };
 struct DiffusionWeights { double mse = 4, bond = 0, lddt = 4, dna = 5, rna = 5, ligand = 10, sigmaData = 16; };
 
 // one diffusion sample: x the denoised positions, xt/gm the truth and its resolved mask; dx += d total / d x * scale
+// `smoothLddt` (null: the host's below) computes 1 - lddt and adds its scaled gradient - of3dev::SmoothLddt on the device
 inline Diffusion diffusionLoss(const Layout& L, const std::vector<double>& x, const std::vector<double>& xt,
                                const std::vector<double>& gm, double t, const DiffusionWeights& W, std::vector<double>* dx,
-                               double scale = 1) {
+                               double scale = 1,
+                               const std::function<double(double, std::vector<double>*)>& smoothLddt = {}) {
   Diffusion D;
   const size_t A = L.atoms();
   const double wt = (t * t + W.sigmaData * W.sigmaData) / ((t * W.sigmaData) * (t * W.sigmaData));
@@ -184,7 +187,8 @@ inline Diffusion diffusionLoss(const Layout& L, const std::vector<double>& x, co
     }
   }
   // smooth LDDT
-  {
+  if (smoothLddt) D.lddt = smoothLddt(scale * W.lddt, dx);
+  else {
     double num = 0, den = 0;
     struct T { size_t l, m; double g; };
     std::vector<T> terms;
@@ -369,3 +373,87 @@ template <class R> inline double resolvedLoss(const Layout& L, const std::vector
 }
 
 }  // namespace of3
+
+#ifdef __CUDACC__
+// ---- smooth LDDT on the device (diffusionLoss's quadratic part: at a 384-token crop ~3,000 atoms, 9 M pairs a
+// sample, 48 samples a step). The same arithmetic in float64; held to the host's by test-of3loss.
+namespace of3dev {
+// pass 1: num = sum c e, den = sum c over pairs l != m, both resolved (`live`), the cutoff by l's type
+__global__ void smoothLddtK(const double* __restrict__ x, const double* __restrict__ xt, const int* __restrict__ live,
+                            const char* __restrict__ nuc, int L, double* __restrict__ sums) {
+  double num = 0, den = 0;
+  for (size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x; t < (size_t)L * L; t += (size_t)gridDim.x * blockDim.x) {
+    const int a = (int)(t / L), b = (int)(t % L);
+    if (a == b) continue;
+    const int l = live[a], m = live[b];
+    double g2 = of3::EPS, p2 = of3::EPS;
+    for (int q = 0; q < 3; ++q) { const double e = xt[l * 3 + q] - xt[m * 3 + q], f = x[l * 3 + q] - x[m * 3 + q]; g2 += e * e; p2 += f * f; }
+    const double dg = sqrt(g2);
+    if (!(dg < (nuc[a] ? 30.0 : 15.0))) continue;
+    const double del = fabs(dg - sqrt(p2));
+    double e = 0;
+    for (double c : {0.5, 1.0, 2.0, 4.0}) e += 0.25 / (1 + exp(-(c - del)));
+    num += e; den += 1;
+  }
+  for (int o = 16; o; o >>= 1) { num += __shfl_xor_sync(~0u, num, o); den += __shfl_xor_sync(~0u, den, o); }
+  if ((threadIdx.x & 31) == 0) { atomicAdd(sums, num); atomicAdd(sums + 1, den); }
+}
+// pass 2: dx_l += -scale * de/dd (x_l - x_m) / d / den over m, a thread a row l (no atomics: l's own sum)
+__global__ void smoothLddtGradK(const double* __restrict__ x, const double* __restrict__ xt, const int* __restrict__ live,
+                                const char* __restrict__ nuc, int L, const double* __restrict__ sums, double scale,
+                                double* __restrict__ dx) {
+  const int a = blockIdx.x * blockDim.x + threadIdx.x;
+  if (a >= L) return;
+  const int l = live[a];
+  const double inv = scale / (sums[1] + of3::EPS);
+  double g[3] = {0, 0, 0};
+  for (int b = 0; b < L; ++b) {
+    if (a == b) continue;
+    const int m = live[b];
+    // (l, m) and (m, l) are both terms, each with its own cutoff by its first atom's type
+    double dvec[3], g2 = of3::EPS, p2 = of3::EPS;
+    for (int q = 0; q < 3; ++q) { const double e = xt[l * 3 + q] - xt[m * 3 + q]; dvec[q] = x[l * 3 + q] - x[m * 3 + q]; g2 += e * e; p2 += dvec[q] * dvec[q]; }
+    const double dg = sqrt(g2), dp = sqrt(p2), del = fabs(dg - dp);
+    double de = 0;
+    for (double c : {0.5, 1.0, 2.0, 4.0}) { const double s = 1 / (1 + exp(-(c - del))); de -= 0.25 * s * (1 - s); }
+    const double k = de * (dp > dg ? 1 : -1) / dp;
+    const int terms = (dg < (nuc[a] ? 30.0 : 15.0)) + (dg < (nuc[b] ? 30.0 : 15.0));
+    for (int q = 0; q < 3; ++q) g[q] -= terms * k * dvec[q];
+  }
+  for (int q = 0; q < 3; ++q) dx[l * 3 + q] += inv * g[q];
+}
+struct SmoothLddt {
+  int L = 0; int* live = nullptr; char* nuc = nullptr; double *x = nullptr, *xt = nullptr, *dx = nullptr, *sums = nullptr; size_t A = 0;
+  // once an example: its resolved atoms and their types, and the truth
+  void init(const of3::Layout& Lay, const std::vector<double>& xtH, const std::vector<double>& gm) {
+    release();
+    A = Lay.atoms();
+    std::vector<int> lv; std::vector<char> nc;
+    for (size_t i = 0; i < A; ++i) if (Lay.exists[i] && gm[i] > 0) { lv.push_back((int)i); nc.push_back(Lay.nucleotide((int)(i / Lay.dense))); }
+    L = (int)lv.size();
+    cudaMalloc(&live, std::max(1, L) * sizeof(int)); cudaMalloc(&nuc, std::max(1, L));
+    cudaMalloc(&x, A * 3 * 8); cudaMalloc(&xt, A * 3 * 8); cudaMalloc(&dx, A * 3 * 8); cudaMalloc(&sums, 16);
+    cudaMemcpy(live, lv.data(), L * sizeof(int), cudaMemcpyHostToDevice); cudaMemcpy(nuc, nc.data(), L, cudaMemcpyHostToDevice);
+    cudaMemcpy(xt, xtH.data(), A * 3 * 8, cudaMemcpyHostToDevice);
+  }
+  // 1 - lddt, and scale * d(1 - lddt)/dx added into dxH
+  double run(const std::vector<double>& xH, double scale, std::vector<double>* dxH, cudaStream_t s) {
+    cudaMemcpyAsync(x, xH.data(), A * 3 * 8, cudaMemcpyHostToDevice, s);
+    cudaMemsetAsync(sums, 0, 16, s);
+    smoothLddtK<<<std::min<size_t>(((size_t)L * L + 255) / 256, 4096), 256, 0, s>>>(x, xt, live, nuc, L, sums);
+    if (dxH) {
+      cudaMemsetAsync(dx, 0, A * 3 * 8, s);
+      smoothLddtGradK<<<(L + 127) / 128, 128, 0, s>>>(x, xt, live, nuc, L, sums, scale, dx);
+      std::vector<double> h(A * 3);
+      cudaMemcpyAsync(h.data(), dx, A * 3 * 8, cudaMemcpyDeviceToHost, s);
+      double sh[2]; cudaMemcpyAsync(sh, sums, 16, cudaMemcpyDeviceToHost, s); cudaStreamSynchronize(s);
+      for (size_t i = 0; i < A * 3; ++i) (*dxH)[i] += h[i];
+      return 1 - sh[0] / (sh[1] + of3::EPS);
+    }
+    double sh[2]; cudaMemcpyAsync(sh, sums, 16, cudaMemcpyDeviceToHost, s); cudaStreamSynchronize(s);
+    return 1 - sh[0] / (sh[1] + of3::EPS);
+  }
+  void release() { for (void* p : {(void*)live, (void*)nuc, (void*)x, (void*)xt, (void*)dx, (void*)sums}) if (p) cudaFree(p); live = nullptr; nuc = nullptr; x = xt = dx = sums = nullptr; }
+};
+}  // namespace of3dev
+#endif

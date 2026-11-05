@@ -618,8 +618,10 @@ int main(int argc, char** argv) {
     }
   };
 
-  // ---- the composition, against the port: the first example whole, the port's own (prefix) MSA rows
-  {
+  // ---- the composition, against the port: the first example whole, the port's own (prefix) MSA rows - when it is no
+  // larger than a crop (both trunks side by side, uncropped, are what this check costs)
+  if (examples[0].n > crop) printf("the composition check skipped: the first example (%d tokens) is larger than a crop\n", examples[0].n);
+  else {
     MSA_DRAW = "prefix";
     const float* refTf = buildTargetFeat();
     Trunk t = makeTrunk(nullptr, 64, false, refTf);
@@ -736,6 +738,10 @@ int main(int argc, char** argv) {
   auto runExample = [&](const Example& full, bool train, bool fixed, int nSamples, std::mt19937_64& gen) {
     Losses L;
     std::string strategy = "whole";
+    auto now = [] { CK(cudaStreamSynchronize(STREAM)); return std::chrono::steady_clock::now(); };
+    auto msOf = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+    double tLoss = 0;
+    const auto t0 = now();
     const of3::Layout Lfull = layoutOf(full);
     const Example e = fixed ? full : subset(full, cropTokens(full, Lfull, crop, CropWeights{}, gen, strategy));
     const of3::Layout Lay = layoutOf(e);
@@ -747,6 +753,7 @@ int main(int argc, char** argv) {
     // the trunk
     const int c = fixed ? 4 : 1 + (int)(gen() % 4);
     cycles(d, a, c, [&] { drawMsa(d, e, gen); });
+    const auto t1 = now();
     // the distogram: its loss on the host, its cotangent kept for the backward
     g::real* dLog = nullptr;
     {
@@ -788,10 +795,12 @@ int main(int argc, char** argv) {
                                    nullptr, nullptr, nullptr, cb);
       }
     }
+    const auto t2 = now();
     // the diffusion samples (model.py _train_diffusion), each its own denoiser pass
     g::real *dTs = d.zeros((size_t)n * Cs), *dTp = d.zeros(nn * Cz), *dTf = d.zeros((size_t)n * te.F);
     g::real *xD = d.zeros(A * 3), *xo = d.zeros(A * 3), *dxo = d.zeros(A * 3);
     size_t nRes = 0; for (size_t i = 0; i < A; ++i) nRes += e.gm[i] > 0;
+    of3dev::SmoothLddt sl; sl.init(Lay, e.xt, e.gm);   // (smooth LDDT, quadratic in atoms, on the device)
     for (int smp = 0; smp < nSamples; ++smp) {
       g::Scratch sc;
       const double sigma = fixed ? sd * exp(-1.2 + 1.5 * (-1.0 + 2.0 * smp / std::max(1, nSamples - 1))) : sd * exp(-1.2 + 1.5 * N01(gen));
@@ -812,7 +821,10 @@ int main(int argc, char** argv) {
       auto ds = g::af3::denoiseForward(dn, d.b, a.singles[nPf], a.pairs[nMsa + nPf], a.tf, d.seqMask, xD, (g::real)sigma, d.ri, d.ti, d.asym, d.ent, d.sym, xo);
       auto xh = g::host(xo, A * 3);
       std::vector<double> xp(xh.begin(), xh.end()), dx(A * 3, 0);
-      auto D = of3::diffusionLoss(Lay, xp, e.xt, e.gm, sigma, DW, &dx, 1.0 / nSamples);
+      const auto tl = std::chrono::steady_clock::now();
+      auto D = of3::diffusionLoss(Lay, xp, e.xt, e.gm, sigma, DW, &dx, 1.0 / nSamples,
+                                  [&](double sc, std::vector<double>* g) { return sl.run(xp, sc, train ? g : nullptr, STREAM); });
+      tLoss += msOf(tl, std::chrono::steady_clock::now());
       L.mse += D.mse / nSamples; L.bond += D.bond / nSamples; L.lddt += D.lddt / nSamples; L.diffusion += D.total / nSamples;
       if (train) {
         std::vector<g::real> r(dx.begin(), dx.end());
@@ -823,6 +835,8 @@ int main(int argc, char** argv) {
       }
     }
     L.total = L.diffusion + distWeight * L.distogram + (confOn ? confWeight * (L.plddt + L.pde + L.pae + L.resolved) : 0);
+    sl.release();
+    const auto t3 = now();
     // the backward: the distogram's and the denoiser's gradients into the trunk, block by block
     if (train) {
       auto eb = embedBatch(d);
@@ -859,8 +873,9 @@ int main(int argc, char** argv) {
       g::add(dtf, dTf, (size_t)n * te.F);
       g::af3::targetFeatBackward(tfm, d.b, tfS, dtf);
     }
-    CK(cudaStreamSynchronize(STREAM));
-    if (!fixed) printf("  %s: %d of %d tokens (%s), %d cycles, %d MSA rows\n", full.input.c_str(), n, full.n, strategy.c_str(), c, S);
+    const auto t4 = now();
+    if (!fixed) printf("  %s: %d of %d tokens (%s), %d cycles, %d MSA rows; ms: trunk %.0f, rollout+confidence %.0f, diffusion %.0f (host losses %.0f), trunk backward %.0f\n",
+                       full.input.c_str(), n, full.n, strategy.c_str(), c, S, msOf(t0, t1), msOf(t1, t2), msOf(t2, t3), tLoss, msOf(t3, t4));
     a.release(); d.release();
     return std::make_pair(L, confOn);
   };
