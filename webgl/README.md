@@ -1105,12 +1105,33 @@ exists for.
 🔴 **THAT WALL MOVED, THOUGH, AND THE NEXT MOVE IS IDENTIFIED AND NOT TAKEN.** Half-precision
 weights put a bioemu2 fold's device peak at **851 MiB** where it was 1656, which is within 36 MiB
 of what the WGSL fold holds - so the memory question is no longer the binding one for that model.
-The next factor is the bundle's own quantisation: `model-bioemu2-int5` ships five-bit CODES, this
-backend decodes them to f32 on the host and uploads four bytes a weight (two, now), and decoding
-them in the shader instead would be **bit-identical** - the decoded value is the same f32 number -
-while cutting the weight traffic that bounds every big projection by another factor of three. That
-is what the WGSL side's device packer already does, and it is the largest measured-but-untaken item
-in this file.
+The next factor is the bundle's own quantisation, and it is worth writing out because the format is
+already settled and the plumbing already exists. `model-bioemu2-int5` ships five-bit CODES; this
+backend decodes them to f32 on the host and uploads the result (two bytes a weight since the
+float16 work above). Decoding them in the shader instead would be **bit-identical** - the decoded
+value is the same f32 number the host computes - and would cut the fetch count that bounds every
+big projection again:
+
+- the format is **group 32, asymmetric**: 32 codes in 20 bytes (32 x 5 bits is exactly 160), one
+  float16 `scale` and one float16 `zero` a group, and a value is `zero + code * scale`. A code
+  never spans more than two bytes. `readTensor`'s int5 branch in `shared/weights/dtype.js` is the
+  reference, and its own comments record that a bundle at any other group decodes into "a finite,
+  plausible, wrong tensor".
+- `HttpTensorStore.tensorSource(name)` exists for exactly this - "THIS IS WHAT LETS A DECODER RUN
+  SOMEWHERE ELSE... a caller that wants to decode on the GPU needs the CODES, and the scale and
+  zero tables beside them".
+- the arithmetic favours it. A weight's codes run along its CONTIGUOUS axis, which for an
+  `[out][in]` weight is the k direction a fragment sweeps, so a k-step of 32 reads one group: two
+  RGBA32UI texels (five 32-bit words padded to eight) plus one for the scale and zero, against
+  float16's **eight** texels for the same 32 values. **2.7x fewer fetches**, and this kernel is
+  fetch-bound.
+- it needs a differential before it needs a benchmark. `tools/gpu/check-quantised-upload.js` found
+  the WGSL device decoder and the host one disagreeing on **104,170 of 131,072 elements** at int5
+  group 64, and it was the HOST that was wrong - so the gate is "every element equal to
+  `readTensor`'s", not a tolerance.
+
+That is what the WGSL side's device packer already does, and it is the largest
+measured-but-untaken item in this file.
 
 ## Three measurement traps, each of which reported a confident wrong number
 
