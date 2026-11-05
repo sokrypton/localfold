@@ -58,7 +58,7 @@ export function attentionFlashPlan(headDim, maxDrawBuffers) {
 }
 
 export const attentionFlashSource = (
-  { batch, queries, heads, headDim, targets, hasPairBias },
+  { batch, queries, heads, headDim, targets, hasPairBias, roundHalf = false },
 ) => {
   const groups = headDim / 4;
   const register = (name, body) => Array.from({ length: groups },
@@ -127,7 +127,12 @@ ${hasPairBias ? "    logit += fetch1(pairTex, (head * Q + q) * Q + k);" : ""}
 ${perTarget((t) => `acc${t} = acc${t} * previousScale + weight * fetch4(valueTex, keyBase + groupBase + ${t});`)}
   }
 
-${perTarget((t) => `result${t} = (acc${t} / runningSum) * fetch4(gateTex, queryBase + groupBase + ${t});`)}
+${perTarget((t) => {
+    const value = `(acc${t} / runningSum) * fetch4(gateTex, queryBase + groupBase + ${t})`;
+    // The shipped AF2 attention asks its flash kernel for an f16 output; see
+    // half4 in webgl/runtime/execution.js.
+    return `result${t} = ${roundHalf ? `half4(${value})` : value};`;
+  })}
 }`;
 };
 
@@ -165,7 +170,7 @@ ${select}
  * @param {import("../runtime/execution.js").Execution} execution
  * @param {{query: Tensor, key: Tensor, value: Tensor, gate: Tensor, mask: Tensor,
  *   pairBias?: Tensor, batch: number, queries: number, heads: number, headDim: number,
- *   transpose?: boolean, scale?: number}} call
+ *   transpose?: boolean, scale?: number, roundHalf?: boolean}} call
  * @returns {{planes: Tensor[], plan: {groups: number, targets: number, draws: number,
  *   redundancy: number}}} the caller owns the planes
  */
@@ -175,6 +180,7 @@ export function attentionFlashPlanes(execution, call) {
     batch, queries, heads, headDim, transpose = false,
   } = call;
   const scale = call.scale ?? 1 / Math.sqrt(headDim);
+  const roundHalf = call.roundHalf === true;
   const plan = attentionFlashPlan(headDim, execution.maxDrawBuffers);
   const elements = batch * queries * heads * headDim;
   /** @type {[string, Tensor][]} */
@@ -206,7 +212,8 @@ export function attentionFlashPlanes(execution, call) {
     const span = Math.min(plan.targets, plan.groups - base);
     execution.dispatch({
       source: attentionFlashSource({
-        batch, queries, heads, headDim, targets: span, hasPairBias: pairBias !== undefined,
+        batch, queries, heads, headDim, targets: span,
+        hasPairBias: pairBias !== undefined, roundHalf,
       }),
       outputs: planes.slice(base, base + span),
       inputs,

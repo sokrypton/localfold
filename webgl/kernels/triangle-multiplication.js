@@ -74,11 +74,16 @@ export function releaseTriangleWeights(execution, weights) {
  * @param {import("../runtime/execution.js").Execution} execution
  * @param {{z: Tensor, mask: Tensor, weights: Record<string, Tensor>,
  *   shape: {length: number, cZ: number, cHidden: number},
- *   direction?: "outgoing" | "incoming", epsilon?: number}} call
+ *   direction?: "outgoing" | "incoming", epsilon?: number,
+ *   projectionPrecision?: "f32" | "f16"}} call
  * @returns {Tensor} the output, `pairs x cZ`; the caller owns it
  */
 export function triangleMultiplication(execution, call) {
-  const { z, mask, weights: w, shape, direction = "outgoing", epsilon = 1e-5 } = call;
+  const {
+    z, mask, weights: w, shape, direction = "outgoing", epsilon = 1e-5,
+    projectionPrecision = "f32",
+  } = call;
+  const halfProjections = projectionPrecision === "f16";
   const { length, cZ, cHidden } = shape;
   const pairs = length * length;
   if (z.elements !== pairs * cZ) {
@@ -97,11 +102,12 @@ export function triangleMultiplication(execution, call) {
   const side = (projectWeight, projectBias, gateWeight, gateBias, label) => {
     const projected = linear(execution, {
       x: zn, weight: projectWeight, bias: projectBias,
-      rows: pairs, inChannels: cZ, outChannels: cHidden,
+      rows: pairs, inChannels: cZ, outChannels: cHidden, roundHalf: halfProjections,
     });
     const gate = linear(execution, {
       x: zn, weight: gateWeight, bias: gateBias,
       rows: pairs, inChannels: cZ, outChannels: cHidden, activation: "sigmoid",
+      roundHalf: halfProjections,
     });
     const gated = multiply(execution, projected, gate);
     execution.release(projected);

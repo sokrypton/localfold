@@ -18,6 +18,17 @@
  * `1/sqrt(head_dim)` scale is applied to the query there and to the logit here,
  * which is the same number and worth confirming rather than asserting.
  *
+ * 🔴 EVERY ARM HERE ASKS FOR `storagePrecision: "f32"`, WHICH IS NOT THE
+ * DEFAULT AND NOT WHAT AF2 RUNS. `AttentionGpu`'s standalone path keeps its
+ * normalised tensor, its projections and its output in f32
+ * (`projectedStorage = effective.input ?? "f32"`); the shipped Evoformer block
+ * sets all three to f16 outright, so `attentionBlock` defaults to f16 to match
+ * the block. Comparing the default against this class reads ~1e-4 - which is
+ * the trap CLAUDE.md records about this very class, "checking a configuration
+ * nothing runs", seen from the other side. The f32 arms below are what this
+ * class can be compared against; `check-webgl-evoformer-block.js` is what
+ * covers the configuration a fold takes.
+ *
  * 🔴 THE PAIR-BIAS ARMS ARE AF2's MSA ROW ATTENTION, WHICH IS THE ONLY PLACE
  * THE TWO TRACKS MEET before the outer product mean sends information back. The
  * bias is projected out of a separate pair tensor with its own LayerNorm
@@ -303,7 +314,7 @@ export async function main(device, args) {
     }
 
     const output = attentionBlock(execution, {
-      ...shape, activations, mask, weights, pairBias: bias,
+      ...shape, activations, mask, weights, pairBias: bias, storagePrecision: "f32",
     });
     const ours = execution.read(output).slice();
     execution.release(output);
@@ -376,7 +387,7 @@ export async function main(device, args) {
     const output = attentionBlock(execution, {
       activations, mask: maskTensor, weights: uploaded,
       batch: length, queryLength: length, channels, heads,
-      pairBiasProjection: projection,
+      pairBiasProjection: projection, storagePrecision: "f32",
     });
     const ours = execution.read(output).slice();
 
@@ -497,6 +508,7 @@ export async function main(device, args) {
     const output = attentionBlock(execution, {
       activations: transposed, mask: maskTensor, weights: uploaded,
       batch: length, queryLength: sequences, channels, heads, transpose: true,
+      storagePrecision: "f32",
     });
     const ours = execution.read(output).slice();
 

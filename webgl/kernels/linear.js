@@ -41,8 +41,11 @@ const ACTIVATIONS = {
   sigmoid: "vec4(1.0) / (vec4(1.0) + exp(-value))",
 };
 
+/** `half4` is in the prelude; see `webgl/runtime/execution.js` for why. */
+const ROUND_HALF = (expression) => `half4(${expression})`;
+
 export const linearSource = (
-  rows, inChannels, outChannels, activation, useBias, weightLayout,
+  rows, inChannels, outChannels, activation, useBias, weightLayout, roundHalf = false,
 ) => {
   // `[out][in]`: four weight rows, each IN long and each starting on a texel
   // boundary because IN is a multiple of four, against one shared input texel.
@@ -84,7 +87,7 @@ void main() {
   vec4 sum = vec4(0.0);
 ${weightLayout === "in-major" ? inMajor : outMajor}
   vec4 value = sum${useBias ? " + fetch4(biasTex, group)" : ""};
-  result = ${ACTIVATIONS[activation]};
+  result = ${roundHalf ? ROUND_HALF(ACTIVATIONS[activation]) : ACTIVATIONS[activation]};
 }`;
 };
 
@@ -92,14 +95,14 @@ ${weightLayout === "in-major" ? inMajor : outMajor}
  * @param {import("../runtime/execution.js").Execution} execution
  * @param {{x: Tensor, weight: Tensor, bias?: Tensor, rows: number, inChannels: number,
  *   outChannels: number, activation?: "none" | "relu" | "sigmoid",
- *   weightLayout?: "out-major" | "in-major"}} call
+ *   weightLayout?: "out-major" | "in-major", roundHalf?: boolean}} call
  * @param {Tensor} [into]
  * @returns {Tensor}
  */
 export function linear(execution, call, into) {
   const {
     x, weight, bias, rows, inChannels, outChannels,
-    activation = "none", weightLayout = "out-major",
+    activation = "none", weightLayout = "out-major", roundHalf = false,
   } = call;
   if (!(activation in ACTIVATIONS)) {
     throw new RangeError(`linear: no activation \`${activation}\``);
@@ -130,11 +133,12 @@ export function linear(execution, call, into) {
   }
   return execution.dispatch({
     source: linearSource(
-      rows, inChannels, outChannels, activation, bias !== undefined, weightLayout),
+      rows, inChannels, outChannels, activation, bias !== undefined, weightLayout, roundHalf),
     output,
     inputs: bias === undefined
       ? { xTex: x, weightTex: weight }
       : { xTex: x, weightTex: weight, biasTex: bias },
-    label: `linear:${rows}x${inChannels}x${outChannels}:${activation}:${weightLayout}`,
+    label: `linear:${rows}x${inChannels}x${outChannels}:${activation}:${weightLayout}`
+      + `${roundHalf ? ":half" : ""}`,
   });
 }

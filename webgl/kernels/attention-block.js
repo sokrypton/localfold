@@ -85,14 +85,24 @@ export function releaseAttentionBlockWeights(execution, weights) {
  * @param {{activations: Tensor, mask: Tensor, weights: Record<string, Tensor>,
  *   batch: number, queryLength: number, channels: number, heads: number,
  *   pairBias?: Tensor, pairBiasProjection?: Tensor, transpose?: boolean,
- *   epsilon?: number}} call
+ *   epsilon?: number, storagePrecision?: "f16" | "f32"}} call
  * @returns {Tensor} `rows x channels`; the caller owns it
  */
 export function attentionBlock(execution, call) {
   const {
     activations, mask, weights: w, batch, queryLength, channels, heads,
     pairBias, pairBiasProjection, transpose = false, epsilon = 1e-5,
+    storagePrecision = "f16",
   } = call;
+  // 🔴 f16 BY DEFAULT, BECAUSE THE SHIPPED AF2 BLOCK IS. It sets
+  // `normalizedStorage = "f16"` outright, derives `projectedStorage` as f16 for
+  // any channel width that is even, and asks its flash kernel for
+  // `{input: "f16", ..., output: "f16"}` - none of it behind
+  // `halfPrecisionAvailable` or a knob. An f32 chain disagrees with it by ~1e-4
+  // on every attention, which a whole-block comparison measured against a
+  // 1.9e-8 floor. `"f32"` is the arm for pricing the rounding; it is not the
+  // configuration the primary path runs.
+  const half = storagePrecision === "f16";
   if (pairBias !== undefined && pairBiasProjection !== undefined) {
     throw new Error(
       "attention block: a bias is either pre-projected (pairBias) or projected from "
@@ -118,20 +128,23 @@ export function attentionBlock(execution, call) {
 
   const normalised = layerNorm(execution, {
     x: activations, weight: w.queryNormScale, bias: w.queryNormOffset,
-    rows, channels, epsilon,
+    rows, channels, epsilon, roundHalf: half,
   });
 
   const project = (weight, bias, activation) => linear(execution, {
     x: normalised, weight, bias, rows, inChannels: channels, outChannels: channels,
-    activation, weightLayout: "in-major",
+    activation, weightLayout: "in-major", roundHalf: half,
   });
 
   // ...projected off the SAME normalised tensor, before it is released.
   let ownBias;
   if (pairBiasProjection !== undefined) {
+    // ...the block's `pairBiasStorage` is `normalizedStorage` for a bias
+    // projected from the normalised input, and f32 only for a separate one.
     const pairMajor = linear(execution, {
       x: normalised, weight: pairBiasProjection,
       rows, inChannels: channels, outChannels: heads, weightLayout: "in-major",
+      roundHalf: half,
     });
     ownBias = execution.allocate(rows * heads, "attention.bias");
     execution.dispatch({
@@ -151,7 +164,7 @@ export function attentionBlock(execution, call) {
 
   const { output: attended } = attentionFlash(execution, {
     query, key, value, gate, mask, pairBias: pairBias ?? ownBias,
-    batch, queries: queryLength, heads, headDim, transpose,
+    batch, queries: queryLength, heads, headDim, transpose, roundHalf: half,
   });
   for (const tensor of [query, key, value, gate]) execution.release(tensor);
   if (ownBias !== undefined) execution.release(ownBias);

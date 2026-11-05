@@ -16,6 +16,15 @@
  * take `[in][out]` and one takes `[out][in]`, which is why `linear` refuses to
  * have a default.
  *
+ * 🔴 THE HIDDEN ACTIVATION IS ROUNDED TO HALF, BECAUSE THE SHIPPED PATH DOES.
+ * `webgpu/af2/evoformer/block.js` sets `hiddenStorage` to `"f16"` whenever the
+ * hidden width is a multiple of four - every AF2 shape - and that is not gated
+ * by `halfPrecisionAvailable` or by any knob, so a port that keeps f32 there
+ * disagrees with the primary path by ~1e-4 on every transition. Measured
+ * exactly that: a whole-block comparison read 1.045e-4 with this off, against a
+ * 1.9e-8 floor. `hiddenPrecision: "f32"` is the arm for asking what the rounding
+ * costs; the default matches.
+ *
  * 🔴 AND THE RESIDUAL IS THE CALLER'S. `TransitionGpu` returns the transition's
  * own output, not the input plus it, and so does this - a block adds it. Worth
  * stating because a fragment shader cannot add in place (see
@@ -53,11 +62,15 @@ export function releaseTransitionWeights(execution, weights) {
 /**
  * @param {import("../runtime/execution.js").Execution} execution
  * @param {{activations: Tensor, weights: Record<string, Tensor>, rows: number,
- *   channels: number, hiddenChannels: number, epsilon?: number}} call
+ *   channels: number, hiddenChannels: number, epsilon?: number,
+ *   hiddenPrecision?: "f16" | "f32"}} call
  * @returns {Tensor} `rows x channels`; the caller owns it
  */
 export function transition(execution, call) {
-  const { activations, weights: w, rows, channels, hiddenChannels, epsilon = 1e-5 } = call;
+  const {
+    activations, weights: w, rows, channels, hiddenChannels, epsilon = 1e-5,
+    hiddenPrecision = hiddenChannels % 4 === 0 ? "f16" : "f32",
+  } = call;
   if (activations.elements !== rows * channels) {
     throw new RangeError(
       `transition: activations hold ${activations.elements} floats, not ${rows} x ${channels}`);
@@ -71,6 +84,7 @@ export function transition(execution, call) {
     x: normalised, weight: w.firstWeight, bias: w.firstBias,
     rows, inChannels: channels, outChannels: hiddenChannels,
     activation: "relu", weightLayout: "in-major",
+    roundHalf: hiddenPrecision === "f16",
   });
   execution.release(normalised);
   const output = linear(execution, {

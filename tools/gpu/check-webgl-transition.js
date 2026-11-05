@@ -9,6 +9,16 @@
  * where the triangle's reference is `[out][in]`), and that the output is the
  * transition's own rather than the input plus it.
  *
+ * 🔴 THE ARMS ASK FOR `hiddenPrecision: "f32"`, WHICH IS NOT THE DEFAULT. The
+ * shipped Evoformer block keeps the transition's hidden activation in f16 -
+ * `hiddenStorage = hiddenChannels % 4 === 0 ? "f16" : "f32"`, not gated by any
+ * knob - and `webgl/kernels/transition.js` defaults to matching that.
+ * `TransitionGpu`, the standalone class this gate compares against, keeps f32.
+ * So the default and this class differ by exactly the rounding, and the last
+ * arm MEASURES that rather than hiding it: **1.8e-4 to 2.0e-4**, which is what
+ * an f16 hidden activation costs a transition and which is the number a
+ * whole-block comparison has to account for.
+ *
  * 🔴 BOTH REFERENCES, BECAUSE ONE CANNOT TELL WHICH SIDE IS WRONG. The attention
  * block's cross-check read 1e-3 against WGSL and 2.5e-7 against f64 for the same
  * tensor, and the answer was that the WGSL side had defaulted to f16 arithmetic
@@ -87,6 +97,7 @@ export async function main(device, args) {
   const execution = new Execution(gl);
   const rows = [];
   const failures = [];
+  const halfCost = [];
   const arm = (name, got, want) => {
     const relative = relativeRms(got, want, name);
     const ok = relative <= bar;
@@ -125,13 +136,27 @@ export async function main(device, args) {
       ? Float32Array.from(input.activations,
         (v, i) => (i === (input.activations.length >> 1) ? v * 1.01 + 0.01 : v))
       : input.activations, "activations");
-    const output = transition(execution, { ...shape, activations, weights });
+    const output = transition(execution, {
+      ...shape, activations, weights, hiddenPrecision: "f32",
+    });
     const ours = execution.read(output).slice();
     execution.release(output);
 
     arm(`vs CPU reference ${label}`, ours, transitionReference(input));
     const wgsl = await new TransitionGpu(device, { precision: "f32" }).run(input);
     arm(`vs WGSL transition ${label}`, ours, wgsl);
+
+    // ...and what the shipped block's f16 hidden activation costs, reported
+    // rather than asserted: it is a property of the reference being matched,
+    // not of this port.
+    const halved = transition(execution, {
+      ...shape, activations, weights, hiddenPrecision: "f16",
+    });
+    halfCost.push({
+      shape: label,
+      relativeRms: Number(relativeRms(execution.read(halved), ours, "half").toPrecision(3)),
+    });
+    execution.release(halved);
 
     releaseTransitionWeights(execution, weights);
     execution.release(activations);
@@ -143,6 +168,8 @@ export async function main(device, args) {
     bar,
     falsify,
     arms: rows,
+    // What an f16 hidden activation costs - the shipped block's choice.
+    f16HiddenCost: halfCost,
     liveTensorsAfter: stats.live,
     verdict: falsify
       ? (red === rows.length

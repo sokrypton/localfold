@@ -11,9 +11,9 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-470 tools. `tools/fixtures/` is data and is not listed.
+471 tools. `tools/fixtures/` is data and is not listed.
 
-## `tools/gpu/` - the WebGPU lane (225)
+## `tools/gpu/` - the WebGPU lane (226)
 
 Each exports `async function main(device, args)` and is run as
 `node tools/gpu-chrome.mjs tools/gpu/<module>.js [--flags]`.
@@ -141,6 +141,7 @@ Each exports `async function main(device, args)` and is run as
 - **`check-webapp.js`** - End-to-end browser verification of `index.html` (AtomWorks Studio + `web/app.js`) in headless Chrome:
 - **`check-webgl-attention-block.js`** - The whole attention block in WebGL2 against the WGSL block and a CPU reference - the cross-API differential this backend's attention has lacked.
 - **`check-webgl-attention.js`** - Gated attention for every head width this port runs, against a CPU reference and against the kernel it replaces.
+- **`check-webgl-evoformer-block.js`** - A whole AF2 Evoformer block in WebGL2 against the WGSL block.
 - **`check-webgl-kernels.js`** - The two WebGL2 kernels against independent CPU references - the gate they have never had.
 - **`check-webgl-opm.js`** - The outer product mean in WebGL2 against the WGSL one and a CPU reference - four conventions and a two-stage contraction.
 - **`check-webgl-runtime.js`** - The WebGL2 backend's runtime and its first three AF2 primitives, against CPU references - and the expressibility question the headline ceiling gets wrong.

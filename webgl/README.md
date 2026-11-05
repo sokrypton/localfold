@@ -55,6 +55,8 @@ webgl/
     triangle-contract.js        the contraction, one source shared by the stage and the benchmark
     triangle-multiplication.js  the whole operation, nine draws: LayerNorm, four projections,
                                 two gates, the mask, the contraction, the output gate
+  af2/
+    evoformer/block.js          a whole Evoformer block: nine sub-layers, each a residual
 ```
 
 ## AF2, which is what this tree is being built for
@@ -95,10 +97,26 @@ transpose draw plus the flash core's mask flag, where the WGSL side folds the tr
 normalise. So an Evoformer block's MSA half is complete: row attention with pair bias, column
 attention, and the transition.
 
-Still to come, in the order they are needed: triangle ATTENTION; AF2's separate GLOBAL attention
-for the extra-MSA stack; then the Evoformer block that drives all of them, the stack, the structure
-module, and the confidence and distogram heads. After AF2: AF3's pairformer and diffusion,
-ESMFold2, bioemu2.
+**A whole Evoformer block runs**, and `tools/gpu/check-webgl-evoformer-block.js` compares both
+representations against `EvoformerBlockGpu`. The **MSA half matches at its floor** (5.8e-8, against
+a 1.3e-8 floor measured by nudging one input element by 1e-7); the pair half carries a **7e-5 gap
+that is recorded, not absorbed** - `--strict` fails on it, and the header lists what has been ruled
+out by measurement.
+
+🔴 **AND THAT GATE FOUND SOMETHING NO OPERATION GATE COULD: THE SHIPPED AF2 BLOCK KEEPS ITS
+INTERMEDIATES IN f16 WHERE NO SWITCH REACHES.** `normalizedStorage = "f16"` in the attention,
+`{input: "f16", ..., output: "f16"}` asked of its flash kernel, and
+`hiddenStorage = hiddenChannels % 4 === 0 ? "f16" : "f32"` in the transition - none of it behind
+`halfPrecisionAvailable` or a tuning knob. The STANDALONE classes every operation gate compares
+against default to f32, so each of those gates was passing at 2e-7 on a configuration AF2 never
+runs: CLAUDE.md's "checking a configuration nothing runs", from the other side. This tree now
+reproduces all three with an exact `packHalf2x16` round trip, which buys it nothing (its tensors are
+RGBA32F either way) and is done because a fallback whose folds cannot be compared with the primary
+path's is not much of a fallback. Worth 5.8e-8 against 9.5e-5 on the MSA half.
+
+Still to come: AF2's separate GLOBAL attention for the extra-MSA stack, then the stack itself, the
+structure module, and the confidence and distogram heads. After AF2: AF3's pairformer and
+diffusion, ESMFold2, bioemu2.
 
 Every operation so far is checked against TWO references - an f64 CPU one written from the
 operation, and the WGSL kernel run in the same page - because a single reference cannot say which

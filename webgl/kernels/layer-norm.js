@@ -27,7 +27,7 @@ import { ONE_TARGET, PRELUDE } from "../runtime/execution.js";
 /** @typedef {import("../runtime/storage.js").Tensor} Tensor */
 
 
-export const layerNormSource = (rows, channels) => `${PRELUDE}${ONE_TARGET}
+export const layerNormSource = (rows, channels, roundHalf = false) => `${PRELUDE}${ONE_TARGET}
 const int ROWS = ${rows};
 const int CHANNELS = ${channels};
 const int CH4 = ${channels / 4};
@@ -58,17 +58,24 @@ void main() {
   float inverseStd = inversesqrt(spread / float(CHANNELS) + epsilon);
 
   vec4 value = fetch4(xTex, texel);
-  result = (value - mean) * inverseStd * fetch4(weightTex, group) + fetch4(biasTex, group);
+  vec4 normalised = (value - mean) * inverseStd * fetch4(weightTex, group)
+    + fetch4(biasTex, group);
+  // The shipped AF2 attention stores this tensor in f16 (normalizedStorage);
+  // see half4 in webgl/runtime/execution.js. No backticks in a GLSL comment -
+  // it lives inside a JS template literal and one would end it.
+  result = ${roundHalf ? "half4(normalised)" : "normalised"};
 }`;
 
 /**
  * @param {import("../runtime/execution.js").Execution} execution
  * @param {{x: Tensor, weight: Tensor, bias: Tensor, rows: number, channels: number,
- *   epsilon?: number}} call
+ *   epsilon?: number, roundHalf?: boolean}} call
  * @param {Tensor} [into]
  * @returns {Tensor}
  */
-export function layerNorm(execution, { x, weight, bias, rows, channels, epsilon = 1e-5 }, into) {
+export function layerNorm(
+  execution, { x, weight, bias, rows, channels, epsilon = 1e-5, roundHalf = false }, into,
+) {
   if (channels % 4 !== 0) {
     throw new RangeError(`layerNorm: channels must be a multiple of 4, got ${channels}`);
   }
@@ -88,10 +95,10 @@ export function layerNorm(execution, { x, weight, bias, rows, channels, epsilon 
     throw new Error("layerNorm: a fragment shader cannot read the texture it draws into");
   }
   return execution.dispatch({
-    source: layerNormSource(rows, channels),
+    source: layerNormSource(rows, channels, roundHalf),
     output,
     inputs: { xTex: x, weightTex: weight, biasTex: bias },
     floats: { epsilon },
-    label: `layer-norm:${rows}x${channels}`,
+    label: `layer-norm:${rows}x${channels}${roundHalf ? ":half" : ""}`,
   });
 }

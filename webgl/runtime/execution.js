@@ -56,6 +56,24 @@ float fetch1(sampler2D tex, int index) {
        : component == 1 ? texel.y
        : component == 2 ? texel.z : texel.w;
 }
+
+// An exact f32 -> f16 -> f32 round trip, two channels to a word.
+//
+// HERE BECAUSE THE SHIPPED AF2 PATH KEEPS ITS INTERMEDIATES IN f16 AND NOTHING
+// SWITCHES THAT OFF. webgpu/af2/evoformer/block.js sets normalizedStorage to
+// f16 outright, asks its flash kernel for input and output f16, and sets the
+// transition's hiddenStorage to f16 for every width that is a multiple of four
+// - none of it gated by halfPrecisionAvailable or by a tuning knob. A port that
+// keeps f32 at those points disagrees with the primary path by ~1e-4
+// everywhere, which is what a whole-block comparison measured. This buys
+// nothing here (the tensor is still an RGBA32F texture) and it is not an
+// accuracy choice this backend is making: it is the one being matched, and a
+// fallback whose folds cannot be compared with the primary path's is not much
+// of a fallback. (No backticks in here - this comment is inside a JS template
+// literal and one would end it. It has happened twice.)
+vec4 half4(vec4 v) {
+  return vec4(unpackHalf2x16(packHalf2x16(v.xy)), unpackHalf2x16(packHalf2x16(v.zw)));
+}
 `;
 
 /** The single-target `result` declaration, which most kernels want. */
