@@ -11,9 +11,9 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-533 tools. `tools/fixtures/` is data and is not listed.
+534 tools. `tools/fixtures/` is data and is not listed.
 
-## `tools/gpu/` - the WebGPU lane (288)
+## `tools/gpu/` - the WebGPU lane (289)
 
 Each exports `async function main(device, args)` and is run as
 `node tools/gpu-chrome.mjs tools/gpu/<module>.js [--flags]`.
@@ -282,6 +282,7 @@ Each exports `async function main(device, args)` and is run as
 - **`probe-warm.js`** - What the sampler's first call is made of, and how much of it a warm covers.
 - **`probe-webgl-2d-weight.js`** - Whether a tensor's TEXTURE SHAPE is what the projections have been waiting for: one matrix row per texture row, against this tree's linear index.
 - **`probe-webgl-column-layout.js`** - Which activation order, and which OUTPUT order, does the WGSL attention block use when `transpose` is set?
+- **`probe-webgl-draw-floor.js`** - What a draw costs before it computes anything, and what that is worth over a whole fold.
 - **`probe-webgl-feedback-gemm.js`** - A GEMM in a VERTEX shader through transform feedback, against the same GEMM in a fragment shader - because the output budget is what binds this backend.
 - **`probe-webgl-fetch-rate.js`** - What `fetch4` RATE does this device give a fragment of a given shape?
 - **`probe-webgl-gemm-ceiling.js`** - The MOST a fragment-shader GEMM can do on this device, measured.
