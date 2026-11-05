@@ -609,6 +609,7 @@ static of3::Layout layoutOf(const Example& e) {
 int main(int argc, char** argv) {
   std::string bundle = "model-openbind0-f32", family = "openbind0", examplesPath, savePath, resumePath;
   int sampleBatch = 8;   // the diffusion samples a denoiser pass (--sample-batch)
+  int maxRecycles = 3;   // OpenFold3's num_recycles: a step runs 1 + U{0..max} cycles (--max-recycles)
   int checkBatch = -1;
   int steps = 30, samples = 48, batch = 1, crop = 384, saveEvery = 0, checkCkpt = -1, checkPerm = -1, checkBf16 = -1, checkConfs = -1; std::string init = "bundle";
   bool dropout = true, dropInFixed = false, bf16Trunk = false;
@@ -624,6 +625,7 @@ int main(int argc, char** argv) {
     else if (auto v = opt("--steps=")) steps = atoi(v);
     else if (auto v = opt("--samples=")) samples = atoi(v);
     else if (auto v = opt("--sample-batch=")) sampleBatch = std::max(1, atoi(v));
+    else if (auto v = opt("--max-recycles=")) maxRecycles = std::max(0, atoi(v));
     else if (auto v = opt("--check-batch=")) checkBatch = atoi(v);
     else if (auto v = opt("--batch=")) batch = std::max(1, atoi(v));
     else if (auto v = opt("--crop=")) crop = atoi(v);
@@ -1157,7 +1159,7 @@ int main(int argc, char** argv) {
     // the trunk
     // (model.py: the recycle count from a generator every rank shares - the same number on every rank a step)
     std::mt19937_64 synced(seed * 1000003ull + (uint64_t)stepIndex);
-    const int c = fixed ? 4 : 1 + (int)(synced() % 4);
+    const int c = fixed ? 4 : 1 + (int)(synced() % (uint64_t)(maxRecycles + 1));
     cycles(d, a, c, [&] { drawMsa(d, e, gen); });
     const auto t1 = now();
     // the mini-rollout, and on it the truth's permutation (model.py: before every loss of the step)
