@@ -198,6 +198,10 @@ from there 6MRR's mse goes 33.3 -> 12.8 in 40 steps. The Fourier noise embedding
   | GH200 96 GB, `--offload-pairs` | | | | 9.5 s, 47.3 GB | | 16.7 s, 72.4 GB |
   | GH200, OpenFold3 PyTorch | 6.2 s, 27.3 GiB | 10.0 s, 45.7 GiB | 16.2 s, 70.1 GiB | out of memory | | |
 
+  And on the GH200 with every change (`--offload-pairs --bf16-confidence --sample-batch=4`): 1024 tokens 16.7 s and
+  49.2 GB, 1280 tokens 27.1 s and 71.0 GB, 1536 tokens 43.4 s and 94.0 GB - twice the crop it took before, and 2.4x
+  OpenFold3's 640.
+
   What is left at 640 tokens on the A100 (28.9 GB): 9.8 GB the parameters, Adam and the EMA; 2.3 GB the step's
   activations; 0.9 GB the stream pool; the arena's 14.3 GB - the MSA block's backward, the confidence head, a
   diffusion chunk, and 3.6 GB the embedder keeps for the whole step.
