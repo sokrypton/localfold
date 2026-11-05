@@ -1761,6 +1761,34 @@ which is explicit and cannot go stale. That is a change across several model fil
 is written down with its number instead of built. **The better fix is upstream of it anyway** - three
 projections of one x should be one projection of a concatenated weight, which saves the draws too.
 
+🔴 **AND THE LAST TWO BIG ROWS ARE X-BOUND BY THEIR SHAPE, WHICH `--float` ON THE PROBE SETTLES.**
+`linear.block:4624x1024x256` runs at 144.5 GFLOP/s in a fold and its transpose `4624x256x2048` at
+461.8, at the **same 0.19 fetches a flop** - a 3.2x spread no arithmetic here explains. The probe's
+float arms (an f16 weight sampled `in-major`, ordered group fastest, as that path ships):
+
+| shape | shipped | x-aliased | w-aliased |
+|---|---|---|---|
+| 4624x1024x256 | 23.21 ms, **104 GF/s** | **4.00 ms, 606** | 22.51, 108 |
+| 4624x256x2048 | **7.25 ms, 669 GF/s** | 1.04x | 1.03x |
+
+The wide-output shape is **at its arithmetic limit with neither operand binding**; the narrow-output
+one is x-bound at **5.76x**. The difference is the **sharer count**, and it is a property of the
+shape, not of the kernel: ordered group fastest, the fragments sharing one row block's x are exactly
+the output groups, so 2048 outputs give 512 of them and 256 outputs give **64**. The fast shape's x
+block is 4 KiB read by 512 fragments; the slow one's is 16 KiB read by 64.
+
+🔴 **AND SPLITTING k IS 1.30x - THE HYPOTHESIS HALF RIGHT AND THE CONCLUSION WRONG.** `--k-splits=`
+cuts the per-fragment x block to the fast shape's size: at four splits it is 4 KiB, exactly
+`4624x256x2048`'s. **17.90 ms at 135 GF/s against 23.21 at 104**, plateauing there (eight splits is
+17.98) and nowhere near 606 - because a split changes the block's SIZE and not the number of
+fragments sharing it, which is still 64 - and it would still owe a reduce pass over four sets of
+partials. Declined, and it is the second time split-K has been measured and rejected here.
+
+**So the binding constraint on this kernel is how many fragments share an operand, and at 256 outputs
+no fragment order can raise that above 64.** The only remedy is more output channels per fragment,
+which `MAX_DRAW_BUFFERS * 4` forbids and the aspect sweep measured as a loss. That is the clearest
+statement this backend has of where its remaining gap lives.
+
 **This session's four projection changes, end to end:**
 
 | | before | after | |
