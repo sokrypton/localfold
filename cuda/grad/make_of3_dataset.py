@@ -11,7 +11,7 @@ Writes <out>/train.txt (the --examples file: a line a chain and a line an interf
 an entry, for --val), and <out>/clusters.txt (each chain's cluster).
 
 Clusters (AF3 SI 2.5.3): a protein chain of 10 or more residues at 40% sequence identity, a shorter one (a peptide) and
-a nucleic chain at 100%, a ligand by its components. AF3 clusters with MMseqs2, which this box lacks: identity here is
+a nucleic chain at 100%, a ligand by its components. AF3 and OpenFold3 cluster with MMseqs2 - given --mmseqs=<binary>, OpenFold3's own command - and without it identity is
 an affine-gap semi-global alignment's identical pairs over its aligned pairs at 80% coverage of the shorter chain,
 greedily against cluster representatives, longest
 first - the same threshold, a simpler aligner. An interface's cluster is the pair of its chains' clusters, unordered.
@@ -87,6 +87,9 @@ def main():
     ap.add_argument("--max-resolution", type=float, default=9.0)
     ap.add_argument("--released-before", default="", help="YYYY-MM-DD: AF3's training cutoff is 2021-09-30")
     ap.add_argument("--reuse", action="store_true", help="keep an entry already built under --out (re-cluster only)")
+    ap.add_argument("--mmseqs", default="", help="an MMseqs2 binary: the proteins clustered by OpenFold3's own command "
+                    "(clustering.py: easy-cluster --min-seq-id 0.4 -c 0.8 --cov-mode 0 -s 8 --max-seqs 1000 --cluster-mode 0) "
+                    "instead of this script's aligner")
     a = ap.parse_args()
     ids = open(a.ids).read().split() if os.path.exists(a.ids) else [x for x in a.ids.split(",") if x]
     val = [x for x in a.val.split(",") if x]
@@ -122,7 +125,21 @@ def main():
             kind, body = next(iter(s.items()))
             chains[(pdb, i)] = (kind, body.get("sequence") or "+".join(body.get("ccdCodes", [])))
     reps, cluster = [], {}
-    order = sorted(chains, key=lambda k: -len(chains[k][1]))
+    if a.mmseqs:
+        # OpenFold3's clustering (core/data/primitives/caches/clustering.py), its command and settings
+        import tempfile, csv
+        prots = {f"{p}_{i}": chains[(p, i)][1] for (p, i) in chains if chains[(p, i)][0] == "protein" and len(chains[(p, i)][1]) >= 10}
+        with tempfile.TemporaryDirectory() as tmp:
+            fa = os.path.join(tmp, "seqs.fa")
+            with open(fa, "w") as f:
+                for k in sorted(prots): f.write(f">{k}\n{prots[k]}\n")
+            subprocess.run([a.mmseqs, "easy-cluster", fa, os.path.join(tmp, "clusterRes"), tmp, "--min-seq-id", "0.4", "-c", "0.8",
+                            "--cov-mode", "0", "-s", "8", "--max-seqs", "1000", "--cluster-mode", "0", "-v", "1"], check=True)
+            rep_of = {row[1]: row[0] for row in csv.reader(open(os.path.join(tmp, "clusterRes_cluster.tsv")), delimiter="\t")}
+        for (p, i), (kind, seq) in chains.items():
+            key = f"{p}_{i}"
+            cluster[(p, i)] = f"p:{rep_of[key]}" if key in rep_of else f"{kind}:{seq}"
+    order = [] if a.mmseqs else sorted(chains, key=lambda k: -len(chains[k][1]))
     for k in order:
         kind, seq = chains[k]
         if kind == "protein" and len(seq) >= 10:
