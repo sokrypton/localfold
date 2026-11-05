@@ -2581,6 +2581,11 @@ default                     foldMs 3941   diffusion 1178
 --tune=matrixLinear=false   foldMs 3934   diffusion 1179
 ```
 
+Re-measured on this tree with every matrix knob off at once - `matrixLinear`,
+`attentionMatrix`, `attentionProjectMatrix`, `gridAttendMatrix`, `gridProjectMatrix`,
+`opmMatrixContract` - **3928 ms against the default's 4130, at the same atom checksum 9506259**. Still
+nothing, and now nothing across all six rather than one.
+
 **Taking the matrix units away changes that fold by nothing.** It never used them. A probe that
 shows a feature exists says nothing about whether the code under test reaches it - which is this
 repository's own rule ("a control arm that cannot vary the thing under test is not a control"), and
@@ -2594,6 +2599,24 @@ memory, so its only reuse is what ONE invocation holds in registers, and that is
 `MAX_DRAW_BUFFERS x 4 = 32 output floats`. Every optimisation in this section is a way of spending
 those 32 floats better, and the row block spends all of them: 23 flops a fetch against the 21.3
 docs/A100.md measures as an eight-target fragment GEMM's ceiling.
+
+🔴 **AND THAT CLAIM HAS NOW BEEN TESTED DIRECTLY RATHER THAN RESTED ON, BECAUSE WebGL2 HAS A SECOND
+OUTPUT BUDGET.** If the cap is `MAX_DRAW_BUFFERS * 4`, then a path with a bigger budget should break
+it - and `probe-webgl-limits.js` finds one: `MAX_TRANSFORM_FEEDBACK_INTERLEAVED_COMPONENTS` is
+**128** on this device, four times 32, with `MAX_VERTEX_TEXTURE_IMAGE_UNITS` 16 so a VERTEX shader
+can read its operands. `probe-webgl-feedback-gemm.js` runs the same k loop in both stages at 8 by 12
+against 8 by 4, and at the projection's own working set it is **1.06-1.13x** over five runs - 543-560
+GFLOP/s at 14.6 G fetch4/s against 494-507 at 23.1. **So the claim is confirmed in direction and
+small in size**: the budget really is what caps the intensity (38.4 flops a fetch4 against 21.33,
+exactly as predicted), and the vertex stage gives back 1.6x of issue rate to get it - 4.4x at a 256
+KiB working set, where it is 0.41x. See "How close can this get" above for the sweep, and note that
+transform feedback writes a BUFFER that nothing in WebGL2 samples, so each kernel would owe a
+buffer-to-texture copy on top.
+
+**Both halves of the cap are therefore measured, not argued**: raising the output budget is possible
+and buys about a tenth, and raising the flops a fetch4 by packing the operands tighter is a **3.4x
+loss** because the unpack costs more than the fetch it saves. The 32-float budget is not just the
+API's limit here; it is the profitable one.
 
 🔴 **AND SEVEN HYPOTHESES FOR THE REST CAME BACK NULL, WHICH IS THE EVIDENCE THAT THERE IS NO
 EIGHTH IN THIS SHAPE OF KERNEL.** Each was built and measured, and each is a tool or a control arm
