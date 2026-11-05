@@ -729,6 +729,12 @@ export function fullAttention(execution, call) {
 /** The atom stream's windowed attention, with its gate and output projection. */
 export function windowAttention(execution, call) {
   const { x, pair, pad, atoms, channels, heads, weights: w, epsilon = 1e-5 } = call;
+  // 🔴 THE BIAS MAY ARRIVE READY-MADE, which is not an optimisation: the input
+  // embedder's window bias is computed ONCE a fold on the host - the windowed
+  // pair geometry and its three-layer MLP are per atom-window pair and happen
+  // before any layer runs - while the denoiser reads its own `ctx.p` every
+  // layer. One kernel either way; what differs is who built the bias.
+  const given = call.bias;
   const { qkv, query, gate } = projections(execution, {
     x, rows: atoms, channels, weights: w,
   });
@@ -743,7 +749,7 @@ export function windowAttention(execution, call) {
   });
   execution.release(qkv);
   const windows = atoms / WINDOW_QUERIES;
-  const bias = pairBias(execution, {
+  const bias = given ?? pairBias(execution, {
     pair, rows: windows * WINDOW_QUERIES * WINDOW_KEYS,
     channels: pair.elements / (windows * WINDOW_QUERIES * WINDOW_KEYS),
     heads, weights: w, epsilon,
@@ -755,7 +761,8 @@ export function windowAttention(execution, call) {
     inputs: { qTex: query, kvTex: kv, biasTex: bias, padTex: pad },
     label: `bioemu2.atom-attend:${atoms}x${channels}:${heads}`,
   });
-  for (const tensor of [query, kv, bias]) execution.release(tensor);
+  for (const tensor of [query, kv]) execution.release(tensor);
+  if (bias !== given) execution.release(bias);
   const gated = execution.allocate(atoms * channels, "bioemu2.atom-gated");
   execution.dispatch({
     source: productSource(atoms * channels),

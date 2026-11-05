@@ -117,6 +117,7 @@ webgl/
     model/fold.js               the whole ESMFold2 fold, from two checkpoints
   bioemu2/
     denoiser.js                 the dual stream: 16 layers coupled through every centre atom
+    embedder.js                 three windowed atom layers and a token mean, giving s_inputs
   heads/
     distogram.js                P(d < 8 A) for every pair - the contact map the page draws
     confidence.js               pLDDT, PAE and the pTM term
@@ -689,28 +690,30 @@ matmul: AF2's transition (30208x256x1024) 9.05 against 14.70, the diffusion's `q
 **And `grid.attend`, the transition and the diffusion attention all depend on workgroup memory**,
 which does not exist here at all.
 
-## What is left of bioemu2, and why it stops where it does
+## What is left of bioemu2
 
-The DENOISER is ported and gated (`check-webgl-bioemu2-denoiser.js`): the dual stream, the coupling
-through every centre atom, the vendor's atom window, and the out-major weight layout that no other
-model here uses. What is not ported is the INPUT EMBEDDER (three windowed atom layers and a token
-mean, giving `s_inputs`) and the TRUNK (a PairMixer: four MSA layers and 48 pair-only blocks, run
-four times).
+The DENOISER and the INPUT EMBEDDER are ported and gated. What is not is the TRUNK: a PairMixer of
+four MSA layers and 48 pair-only blocks, run four times.
 
-🔴 **AND THE REASON IS A LAYERING PROBLEM RATHER THAN AN ARITHMETIC ONE.** Both stages' host half -
-the 455 atom features, the atom-pair tail, the window biases - lives in `webgpu/bioemu2/host.js`,
-which is backend-agnostic code sitting inside a backend. `webgl/` must not import `webgpu/`, so
-those helpers want moving to `shared/bioemu2/` first. That move is small and its gate is not: the
-only thing that checks those two stages anywhere is `check-bioemu2-network.js` against
-`tools/oracle/dump_bioemu2.py`'s dump, and **that dump is not on this box** (`oracle-dumps/` holds
-`af3-6mrr.json` and one a3m). Moving code whose only gate cannot be run here is how a working
-backend breaks quietly, so it is written down instead of done.
+🔴 **AND THE HOST HALF MOVED RATHER THAN BEING WRITTEN TWICE.** The 455 atom features, the atom-pair
+tail, the window biases and the `s_inputs` assembly were in `webgpu/bioemu2/host.js` -
+backend-agnostic host arithmetic inside one backend - and `webgl/` must not import `webgpu/`. They
+live in `cpu/bioemu2/host.js` now, with `webgpu/bioemu2/host.js` RE-EXPORTING them, so that
+backend's behaviour cannot change: every caller there gets the same function objects it had before.
+That is the one move whose correctness needs no gate, which matters because the only thing checking
+those stages anywhere is `check-bioemu2-network.js` against `dump_bioemu2.py`'s dump and **that dump
+is not on this box**.
 
-What that leaves, in order: move those helpers to `shared/` ON A MACHINE WITH THE DUMP and re-run
-`check-bioemu2-network.js` both sides of the move; then the two stages here are composition over
-kernels this tree already has - the pair-only block is ESMFold2's `foldingTrunk`, the MSA layer's
-outer product mean is AF2's generalised one, and the windowed atom layer is the denoiser's own
-`conditionedLayer`.
+🔴 **AND THE EMBEDDER'S REFERENCE IS THE OTHER BACKEND, IN THE SAME PAGE.** `cpu/bioemu2/` holds the
+denoiser and its tape and nothing else, so `check-webgl-bioemu2-embedder.js` drives the WGSL
+embedder - f16 weights off, same int5 bundle, same features - and reads **4.2e-7** on `s_inputs`.
+Splitting that arm is what found the one bug: the host's `windowBias` is **head-MAJOR** and this
+port's attention reads head-MINOR, which showed as relRMS 0.118 on the pooled half with the 71
+featuriser columns exact.
+
+The trunk is composition over kernels this tree already has - the pair-only block is ESMFold2's
+`foldingTrunk` and the MSA layer's outer product mean is AF2's generalised one - and its reference
+is the same WGSL path in the same page.
 
 ## What it would take, and what to measure before starting
 

@@ -11,9 +11,9 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-515 tools. `tools/fixtures/` is data and is not listed.
+516 tools. `tools/fixtures/` is data and is not listed.
 
-## `tools/gpu/` - the WebGPU lane (270)
+## `tools/gpu/` - the WebGPU lane (271)
 
 Each exports `async function main(device, args)` and is run as
 `node tools/gpu-chrome.mjs tools/gpu/<module>.js [--flags]`.
@@ -162,6 +162,7 @@ Each exports `async function main(device, args)` and is run as
 - **`check-webgl-attention-block.js`** - The whole attention block in WebGL2 against the WGSL block and a CPU reference - the cross-API differential this backend's attention has lacked.
 - **`check-webgl-attention.js`** - Gated attention for every head width this port runs, against a CPU reference and against the kernel it replaces.
 - **`check-webgl-bioemu2-denoiser.js`** - BioEmu2's denoiser in WebGL2 against `cpu/bioemu2/denoiser.js`.
+- **`check-webgl-bioemu2-embedder.js`** - BioEmu2's input embedder in WebGL2 against the WGSL one, in the same page.
 - **`check-webgl-confidence.js`** - pLDDT, PAE and pTM in WebGL2 against the WGSL confidence head.
 - **`check-webgl-distogram.js`** - The contact map in WebGL2 against the shipped host reference.
 - **`check-webgl-esmc-tower.js`** - ESM-C's tower in WebGL2 against `cpu/esmc/tower.js`, on a REAL checkpoint.
