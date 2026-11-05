@@ -118,6 +118,7 @@ webgl/
   bioemu2/
     denoiser.js                 the dual stream: 16 layers coupled through every centre atom
     embedder.js                 three windowed atom layers and a token mean, giving s_inputs
+    trunk.js                    the PairMixer: four MSA layers and 48 pair-only blocks
   heads/
     distogram.js                P(d < 8 A) for every pair - the contact map the page draws
     confidence.js               pLDDT, PAE and the pTM term
@@ -692,8 +693,16 @@ which does not exist here at all.
 
 ## What is left of bioemu2
 
-The DENOISER and the INPUT EMBEDDER are ported and gated. What is not is the TRUNK: a PairMixer of
-four MSA layers and 48 pair-only blocks, run four times.
+The DENOISER, the INPUT EMBEDDER and the TRUNK PASS are ported and gated. What is left is the
+SEQUENCE EMBEDDER - `z_init`, `s_init` and the MSA input `m0`, which the trunk gate takes from the
+WGSL side - and a fold driver that strings the four together.
+
+🔴 **AND THE TRUNK'S BOUND IS LOOSER THAN A STAGE GATE'S, FOR A REASON WORTH KNOWING.** Two f32
+implementations through 52 pair-track blocks - each an O(L) contraction summed in a different order,
+this port's fragment loops against the reference's GEMMs - diverge by accumulation: **3.6e-4** on
+pass one at 8 tokens, 3.8e-4 on pass two, 7.7e-4 at 12 tokens, while the SINGLE reads **6.1e-8** at
+every shape because nothing but the recycle touches it. Upstream's own gate holds a trunk pass to
+5e-4 where it holds the stages either side to 1e-4.
 
 🔴 **AND THE HOST HALF MOVED RATHER THAN BEING WRITTEN TWICE.** The 455 atom features, the atom-pair
 tail, the window biases and the `s_inputs` assembly were in `webgpu/bioemu2/host.js` -
