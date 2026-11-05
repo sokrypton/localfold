@@ -31,6 +31,7 @@
 import { Execution } from "../../webgl/runtime/execution.js";
 import { add, multiply, scale } from "../../webgl/runtime/elementwise.js";
 import { layerNorm } from "../../webgl/kernels/layer-norm.js";
+import { transposeLeading } from "../../webgl/runtime/transpose.js";
 import { linear } from "../../webgl/kernels/linear.js";
 import { createWebGL2Context } from "../../webgl/index.js";
 import { relativeRms } from "./relative-rms.js";
@@ -203,6 +204,24 @@ export async function main(device, args) {
       source: `${require_nothing()}`, output: execution.allocate(4, "out"),
       inputs: { absentTex: execution.allocate(4, "in") },
     }));
+
+  // --- the leading-axis transpose, which is what column attention is -------
+  for (const [outer, inner, channels] of [[4, 6, 8], [7, 3, 32], [1, 5, 16]]) {
+    const random = generator(outer * 61 + inner * 13 + channels);
+    const values = noise(outer * inner * channels, 1, random);
+    const want = new Float32Array(values.length);
+    for (let o = 0; o < outer; o += 1) {
+      for (let i = 0; i < inner; i += 1) {
+        for (let c = 0; c < channels; c += 1) {
+          want[(i * outer + o) * channels + c] = values[(o * inner + i) * channels + c];
+        }
+      }
+    }
+    const x = execution.upload(skew(values), "x");
+    const got = execution.read(transposeLeading(execution, { x, outer, inner, channels }));
+    // A permutation moves no value, so this is bit-exact or the index is wrong.
+    arm(`transpose ${outer}x${inner}x${channels}`, got, want, 0);
+  }
 
   // --- the banded draw, forced -------------------------------------------
   {

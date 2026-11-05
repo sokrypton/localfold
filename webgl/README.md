@@ -37,6 +37,7 @@ webgl/
                     banded when a viewport cannot cover the target; the shared GLSL prelude
                     and the program cache, keyed by source
     elementwise.js  residuals: add, multiply, scale, and the per-row mask broadcast
+    transpose.js    swapping the two leading axes - which is what MSA column attention is
   kernels/
     triangle.js     the triangle contraction (22% of an Evoformer block at 221 residues)
     attention.js    the original spike's flash attention, 32-channel heads, as a benchmark
@@ -89,10 +90,15 @@ block driven with a bias projected out of a separate pair tensor, which is the o
 tracks meet before the outer product mean sends information the other way. So are the transition
 and the outer product mean, each cross-checked against its WGSL twin and an f64 reference.
 
-Still to come, in the order they are needed: MSA COLUMN attention (the same block over the sequence
-axis); AF2's separate GLOBAL attention for the extra-MSA stack; triangle ATTENTION; then the
-Evoformer block that drives all of them, the stack, the structure module, and the confidence and
-distogram heads. After AF2: AF3's pairformer and diffusion, ESMFold2, bioemu2.
+**MSA column attention works too** - the same block over the other axis, which here is an explicit
+transpose draw plus the flash core's mask flag, where the WGSL side folds the transpose into its
+normalise. So an Evoformer block's MSA half is complete: row attention with pair bias, column
+attention, and the transition.
+
+Still to come, in the order they are needed: triangle ATTENTION; AF2's separate GLOBAL attention
+for the extra-MSA stack; then the Evoformer block that drives all of them, the stack, the structure
+module, and the confidence and distogram heads. After AF2: AF3's pairformer and diffusion,
+ESMFold2, bioemu2.
 
 Every operation so far is checked against TWO references - an f64 CPU one written from the
 operation, and the WGSL kernel run in the same page - because a single reference cannot say which

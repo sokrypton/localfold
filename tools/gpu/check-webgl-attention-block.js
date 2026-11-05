@@ -58,6 +58,7 @@ import {
   attentionBlock, releaseAttentionBlockWeights, uploadAttentionBlockWeights,
 } from "../../webgl/kernels/attention-block.js";
 import { Execution } from "../../webgl/runtime/execution.js";
+import { transposeLeading } from "../../webgl/runtime/transpose.js";
 import { createWebGL2Context } from "../../webgl/index.js";
 import { relativeRms } from "./relative-rms.js";
 
@@ -134,7 +135,12 @@ function blockReference(input) {
           const kAt = (b * queryLength + k) * channels + head * headDim;
           let score = 0;
           for (let d = 0; d < headDim; d += 1) score += query[qAt + d] * key[kAt + d];
-          let logit = score * scale + 1e9 * (mask[b * queryLength + k] - 1);
+          // ...AF2's column attention leaves the mask in `[key][batch]` order
+          // and reads it through the transpose flag; with batch == queryLength
+          // the two layouts coincide, which is why the column arm's shape has
+          // sequences != length.
+          const maskIndex = input.transpose ? k * batch + b : b * queryLength + k;
+          let logit = score * scale + 1e9 * (mask[maskIndex] - 1);
           if (input.pairBias !== undefined) {
             logit += input.pairBias[(head * queryLength + q) * queryLength + k];
           }
@@ -311,6 +317,115 @@ export async function main(device, args) {
       execution.release(pairTensor);
       execution.release(bias);
     }
+  }
+
+  // --- MSA COLUMN attention: the same block over the other axis ------------
+  //
+  // 🔴 THE THREE SIDES ARE DRIVEN THROUGH THREE DIFFERENT DOORS ON PURPOSE,
+  // AND WORKING OUT WHICH TOOK A PROBE RATHER THAN A THIRD GUESS.
+  //
+  // This backend transposes the activations with a kernel and leaves the mask in
+  // AF2's `[sequence][residue]` order, reading it through the flash core's
+  // `transpose` flag as `k * BATCH + b`. That path agrees with the f64 reference
+  // at 2.0e-7, so the flag is verified independently.
+  //
+  // `AttentionGpu` with `transpose: true` is NOT the same contract, and two
+  // readings of its shader both failed: its `mask_index` becomes
+  // `key_index * p.batch + batch` and its `source_row(row)` becomes
+  // `q * p.batch + b`, which ought to mean "give it AF2's order and it
+  // transposes on the way in" - but feeding it either order, under either mask
+  // convention, with the output taken either as-given or swapped, read relRMS
+  // 1.26 to 1.30 across **all eight combinations**.
+  // `tools/gpu/probe-webgl-column-layout.js` is that table, kept because the
+  // negative result is what justifies the configuration below.
+  //
+  // What the probe found agreeing, at 2.056e-7, is `transpose: false` with BOTH
+  // inputs pre-transposed - residue-major activations and a `[residue][sequence]`
+  // mask. So that is how the WGSL arm is driven here. The comparison still
+  // covers the whole composition; what it does not cover is that class's
+  // `transpose: true`, which nothing in this tree needs.
+  //
+  // The shape deliberately has sequences != length: with `batch == queryLength`
+  // the two mask layouts coincide and the flag would be untested.
+  {
+    const sequences = 5;
+    const length = 9;
+    const channels = 32;
+    const heads = 4;
+    const random = generator(777);
+    const rowCount = sequences * length;
+    const bySequence = noise(rowCount * channels, 1.5, random);
+    // [sequence][residue][channels] -> [residue][sequence][channels], in JS, for
+    // the two references.
+    const byResidue = new Float32Array(bySequence.length);
+    for (let s = 0; s < sequences; s += 1) {
+      for (let i = 0; i < length; i += 1) {
+        for (let c = 0; c < channels; c += 1) {
+          byResidue[(i * sequences + s) * channels + c]
+            = bySequence[(s * length + i) * channels + c];
+        }
+      }
+    }
+    // AF2's mask order, [sequence][residue], for this backend's flag...
+    const mask = new Float32Array(rowCount).fill(1);
+    mask[(sequences - 1) * length + 2] = 0;
+    mask[1 * length + (length - 1)] = 0;
+    // ...and the same mask transposed, for the WGSL arm, which is driven
+    // flagless.
+    const maskByResidue = new Float32Array(rowCount).fill(1);
+    for (let s = 0; s < sequences; s += 1) {
+      for (let i = 0; i < length; i += 1) {
+        maskByResidue[i * sequences + s] = mask[s * length + i];
+      }
+    }
+
+    const weights = {
+      queryNormScale: noise(channels, 0.2, random, 1),
+      queryNormOffset: noise(channels, 0.1, random),
+      queryWeight: noise(channels * channels, 1 / Math.sqrt(channels), random),
+      keyWeight: noise(channels * channels, 1 / Math.sqrt(channels), random),
+      valueWeight: noise(channels * channels, 1 / Math.sqrt(channels), random),
+      gatingWeight: noise(channels * channels, 1 / Math.sqrt(channels), random),
+      gatingBias: noise(channels, 0.1, random, 1),
+      outputWeight: noise(channels * channels, 1 / Math.sqrt(channels), random),
+      outputBias: noise(channels, 0.05, random),
+    };
+
+    const uploaded = uploadAttentionBlockWeights(execution, weights);
+    const source = execution.upload(falsify
+      ? Float32Array.from(bySequence,
+        (v, i) => (i === (bySequence.length >> 1) ? v * 1.01 + 0.01 : v))
+      : bySequence, "msa");
+    const transposed = transposeLeading(execution, {
+      x: source, outer: sequences, inner: length, channels,
+    });
+    const maskTensor = execution.upload(mask, "mask");
+    const output = attentionBlock(execution, {
+      activations: transposed, mask: maskTensor, weights: uploaded,
+      batch: length, queryLength: sequences, channels, heads, transpose: true,
+    });
+    const ours = execution.read(output).slice();
+
+    const label = `column s=${sequences} L=${length} c=${channels} h=${heads}`;
+    arm(`vs CPU reference ${label}`, ours, blockReference({
+      activations: byResidue, mask, weights, batch: length, queryLength: sequences,
+      channels, heads, transpose: true,
+    }));
+    const wgsl = await new AttentionGpu(device, {
+      flashPrecision: "f32",
+      projectPrecision: "f32",
+      outputPrecision: "f32",
+      storage: { input: "f32", value: "f32", output: "f32" },
+    }).run({
+      batch: length, queryLength: sequences, channels, heads,
+      // Both inputs pre-transposed and NO flag - the one configuration of the
+      // eight probed that agrees. See the note above.
+      activations: byResidue, mask: maskByResidue, weights,
+    });
+    arm(`vs WGSL block ${label}`, ours, wgsl);
+
+    releaseAttentionBlockWeights(execution, uploaded);
+    for (const tensor of [source, transposed, maskTensor, output]) execution.release(tensor);
   }
 
   const stats = execution.stats();

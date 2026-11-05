@@ -17,9 +17,17 @@ export {
 } from "./runtime/limits.js";
 export { Storage, storageBytes, tensorCapacity } from "./runtime/storage.js";
 export { Execution, PRELUDE } from "./runtime/execution.js";
-export { add, multiply, scale } from "./runtime/elementwise.js";
+export { add, maskRows, multiply, scale } from "./runtime/elementwise.js";
+export { transposeLeading } from "./runtime/transpose.js";
 
 export { TriangleContractWebGL2 } from "./kernels/triangle.js";
 export { AttentionFlashWebGL2, HEAD_DIM } from "./kernels/attention.js";
 export { layerNorm, layerNormSource } from "./kernels/layer-norm.js";
 export { linear, linearSource } from "./kernels/linear.js";
+export { triangleContract } from "./kernels/triangle-contract.js";
+export { triangleMultiplication, uploadTriangleWeights } from "./kernels/triangle-multiplication.js";
+export { attentionBlock, uploadAttentionBlockWeights } from "./kernels/attention-block.js";
+export { attentionFlash, attentionFlashPlan } from "./kernels/attention-flash.js";
+export { pairBias, uploadPairBiasWeights } from "./kernels/pair-bias.js";
+export { transition, uploadTransitionWeights } from "./kernels/transition.js";
+export { outerProductMean, uploadOuterProductMeanWeights } from "./kernels/outer-product-mean.js";
