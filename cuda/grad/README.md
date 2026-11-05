@@ -90,7 +90,9 @@ one-hot one - the MSA stack, the pairformer, the distogram, the denoiser, the co
   released at least 60 days before the entry and never the entry itself (SI 2.4: the featuriser's own template pick has
   no date, so it would hand an entry its own structure). Chains are clustered (proteins at 40% identity - an affine-gap
   alignment at 80% coverage, as MMseqs2 would; peptides and nucleic chains at 100%; ligands by their components) and
-  every datapoint's weight divided by its cluster's size, N_clust. 9 entries -> 54 datapoints in 16 clusters (the six
+  every datapoint's weight divided by its cluster's size, N_clust. `--mmseqs=<binary>` clusters the proteins with
+  OpenFold3's own command (`clustering.py`: `easy-cluster --min-seq-id 0.4 -c 0.8 --cov-mode 0 -s 8 --max-seqs 1000
+  --cluster-mode 0`); on the set below it gives the same 16 clusters and the same 54 weights as the aligner. 9 entries -> 54 datapoints in 16 clusters (the six
   haemoglobin chains one), 7BNY left out by its date, four entries with templates.
 - **conformers** - a fresh conformer every draw, as OpenFold3 embeds one per featurisation: the example builder runs
   RDKit's ETKDGv3 (hydrogens on, random seeds, then off) 8 times on each component's CCD graph and the trainer draws
