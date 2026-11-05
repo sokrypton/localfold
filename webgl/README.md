@@ -706,12 +706,24 @@ divide by R. Measured at R = 8, which is `MAX_DRAW_BUFFERS` here:
 | af2 pair 3481 x 128 -> 128, `[out][in]` | 2.16 | 0.86 | 2.5x |
 | af2 pair 3481 x 128 -> 128, `[in][out]` | 0.65 | 1.06 | **0.6x** |
 
-🔴 **AND THE LAST ROW IS WHY `blockedApplies` IS A MEASUREMENT AND NOT A RULE OF THUMB.** The gain
-is however much weight traffic there is to divide, and the pair track's 128 x 128 weight is 64 KiB
-- it sits in cache however many times it is read, so there is nothing to save and the repack pass
-is pure cost. At that size the `[in][out]` layout is repeatably **0.44x to 0.65x** and keeps the
-one-texel kernel; `[out][in]` at the same size still wins. Nothing about the geometry decides this;
-only the weight's size does.
+🔴 **AND FOR `[in][out]` THE RULE IS EMPIRICAL AND NON-MONOTONIC, WHICH AN ATTEMPT TO SIMPLIFY IT
+PROVED.** The gain is however much weight traffic there is to divide, and the three in-major sizes
+these models use do not line up:
+
+| `[in][out]` weight | | blocked |
+|---|---:|---|
+| 128 x 128 | 64 KiB | **0.44x to 0.65x** - a loss, repeatably |
+| 128 x 512 | 256 KiB | **a win** - 1.18x to 1.38x on the bench, and removing it made an ESMFold2 fold **9.5% slower** (63.6 s to 69.7) |
+| 256 x 512 | 512 KiB | **a loss** - removing it took a bioemu2 trunk **5245 ms to 4152** and `linear.repack` from 9.2% of that fold to nothing |
+
+Loss, win, loss. 🔴 **SO "IN-MAJOR NEVER BLOCKS" WAS TRIED AND IS A NET LOSS ACROSS THE MODELS**: it
+bought bioemu2 2.5% of a fold and cost ESMFold2 9.5% of one, so it was reverted. That is the whole
+argument for folding four models on every verification pass rather than the one being optimised -
+and the second time in this section that a rule fitted to one model regressed another. The
+65,536-float threshold is fitted to those three points and is **not a model of anything**; a fourth
+shape could fall either way and would need measuring. `[out][in]` wins at every size these models
+use, because its four weight rows are read per OUTPUT GROUP rather than shared across one, so there
+is traffic to divide even at 64 KiB.
 
 **And then the whole thing was reading both operands' rows for every pair.** The split contraction
 runs at **four flops a fetch where the projection reaches twenty-three**: a fragment owning four
@@ -798,7 +810,7 @@ Every fold is the same job, the same seed and the same settings either side; `--
 |---|---:|---:|---:|
 | bioemu2, 6MRR 68 tokens, 4 passes, 20 steps | 968 s | **57.6 s** | **16.8x** |
 | ...its trunk | 277.7 s | **21.6 s** | 12.8x |
-| ...its 20 denoiser calls | 658 s | **35.1 s** | 18.7x |
+| ...its 20 denoiser calls | 658 s | **35.2 s** | 18.7x |
 | ESMFold2, 75 residues, 36-block tower, 3 loops, 15 steps | 253 s | **65.0 s** | **3.9x** |
 | ESMFold2 at the tool's defaults | 2.82 s | **1.37 s** | 2.1x |
 | AF3, 59 tokens | 4.68 s | **3.39 s** | 1.4x |
@@ -1149,7 +1161,7 @@ contacts (P > 0.5)   201              201
 wall                 968 s            57.6 s           3.9 s
   trunk              277.7 s          21.6 s           2.3 s
   distogram                           0.7 s
-  20 denoiser calls  658 s            35.1 s           1.2 s
+  20 denoiser calls  658 s            35.2 s           1.2 s
 weights/activations  1656 MiB peak    409 MiB peak     815 MiB weights + 135 activations
 ```
 

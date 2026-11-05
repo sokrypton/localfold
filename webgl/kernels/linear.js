@@ -287,16 +287,26 @@ export const ROW_FASTEST_X_FLOATS = 1 << 20;
  * multiples of four or a texel straddles two rows and the shared weight read is
  * not shared.
  *
- * 🔴 AND ONE CASE IS A LOSS, WHICH IS WHY THIS IS A MEASUREMENT AND NOT A RULE
- * OF THUMB. The gain tracks how much weight DRAM traffic there is to divide, so
- * it runs from **6.2x to 8.4x** on bioemu2's atom and token projections (1.5 to
- * 3.5 million weight floats, streamed once per row block) down to a wash on the
- * pair track, whose 128 x 128 weight is 64 KiB and sits in cache however many
- * times it is read. At that size the `[in][out]` layout is **0.44x to 0.65x**,
- * repeatably: there is no traffic to save and the repack is pure cost. So a
- * cache-resident weight read in-major keeps the one-texel kernel. `[out][in]`
- * at the same size still wins (1.2x to 2.5x), which is why the test is not just
- * on size.
+ * 🔴 AND FOR `[in][out]` THE RULE IS EMPIRICAL AND NON-MONOTONIC, WHICH AN
+ * ATTEMPT TO SIMPLIFY IT PROVED. The gain tracks how much weight DRAM traffic
+ * there is to divide, so it runs from **6.2x to 8.4x** on bioemu2's atom and
+ * token projections (1.5 to 3.5 million weight floats, streamed once per row
+ * block) down to a loss where the weight sits in cache and the repack is pure
+ * cost. For `[in][out]` the three sizes these models use do not line up:
+ *
+ *   - 128 x 128, 64 KiB: **0.44x to 0.65x**, a loss, repeatably;
+ *   - 128 x 512, 256 KiB: a WIN - 1.18x to 1.38x on the bench, and removing it
+ *     made an ESMFold2 fold **9.5% slower** (63.6 s to 69.7);
+ *   - 256 x 512, 512 KiB: a loss - removing it took a bioemu2 trunk **5245 ms
+ *     to 4152** and `linear.repack` from 9.2% of that fold to nothing.
+ *
+ * Loss, win, loss. 🔴 **SO "IN-MAJOR NEVER BLOCKS" WAS TRIED AND IS A NET LOSS
+ * ACROSS THE MODELS**: it bought bioemu2 2.5% of a fold and cost ESMFold2 9.5%
+ * of one, which is the whole argument for running four models' folds on every
+ * verification pass rather than the one being optimised. The 65,536-float
+ * threshold below is fitted to those three points and is not a model of
+ * anything; a fourth shape could fall either way and would need measuring.
+ * `[out][in]` wins at every size these models use.
  */
 export const CACHE_RESIDENT_WEIGHT_FLOATS = 65536;
 
