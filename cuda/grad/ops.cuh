@@ -22,6 +22,10 @@ struct LayerNorm {
   Param g, b;
   int C = 0;
   real eps = 1e-5f;
+  // BF16: the forward saves x - mean in bf16 for the backward instead of pointing at the float x, which the caller may
+  // then free (af2's block: the residual states, ~10% of a block's saves). Centred, so bf16's rounding is relative to
+  // the row's spread, not to its mean.
+  bool saveBf = false;
 };
 
 // an element as real, from real or (float builds) bf16 storage
@@ -32,25 +36,27 @@ __device__ __forceinline__ float ldr(const bf* p) { return __bfloat162float(*p);
 __device__ __forceinline__ void str(bf* p, float v) { *p = __float2bfloat16(v); }
 #endif
 // one warp a row; mean and rstd saved for the backward
-template <class Y, class XC = Y>   // (Y: real, or bf where a module keeps its normalised input in bf16; xc, when not
-                                   // null, a bf16 copy of x for the backward)
-__global__ void lnFwdK(const real* __restrict__ x, const real* __restrict__ g, const real* __restrict__ b,
+template <class Y, class XC = Y, class X = real>   // (Y: real, or bf where a module keeps its normalised input in
+                                                   // bf16; xc, when not null, x - mean in bf16 for the backward; X: x
+                                                   // real, or bf - a block's bf16 residual chain)
+__global__ void lnFwdK(const X* __restrict__ x, const real* __restrict__ g, const real* __restrict__ b,
                        Y* __restrict__ y, real* __restrict__ mean, real* __restrict__ rstd, size_t rows, int C,
                        real eps, XC* __restrict__ xc = nullptr) {
   size_t r = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
   int lane = threadIdx.x & 31;
   if (r >= rows) return;
-  const real* xr = x + r * C;
+  const X* xr = x + r * C;
   real s = 0;
-  for (int c = lane; c < C; c += 32) s += xr[c];
+  for (int c = lane; c < C; c += 32) s += ldr(xr + c);
   for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
   real mu = s / C, v = 0;
-  for (int c = lane; c < C; c += 32) { real d = xr[c] - mu; v += d * d; }
+  for (int c = lane; c < C; c += 32) { real d = ldr(xr + c) - mu; v += d * d; }
   for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(~0u, v, o);
   real rs = rsqrt(v / C + eps);
   for (int c = lane; c < C; c += 32) {
-    y[r * C + c] = (Y)((xr[c] - mu) * rs * (g ? g[c] : (real)1) + (b ? b[c] : (real)0));
-    if (xc) xc[r * C + c] = (XC)xr[c];
+    const real xv = ldr(xr + c);
+    y[r * C + c] = (Y)((xv - mu) * rs * (g ? g[c] : (real)1) + (b ? b[c] : (real)0));
+    if (xc) xc[r * C + c] = (XC)(xv - mu);   // (centred: see LayerNorm::saveBf)
   }
   if (lane == 0) { mean[r] = mu; rstd[r] = rs; }
 }
@@ -82,19 +88,49 @@ __global__ void lnBwdK(const real* __restrict__ x, const real* __restrict__ dy, 
   for (int c = threadIdx.x; c < C; c += blockDim.x) { if (dg) atomicAdd(&dg[c], sh[c]); if (db) atomicAdd(&db[c], sh[C + c]); }
 }
 
-struct LnSave { const real* x; real* mean; real* rstd; const void* xb = nullptr; };   // (xb: x in bf16, the backward's)
+struct LnSave { const real* x; real* mean; real* rstd; const void* xb = nullptr; };   // (xb: x - mean in bf16, the
+                                                                                     // backward's, x then null)
 inline LnSave lnForward(const LayerNorm& ln, const real* x, real* y, size_t rows) {
   LnSave s{x, ARENA.get(rows), ARENA.get(rows)};
+#ifndef GRAD_F64
+  if (BF16 && ln.saveBf) {
+    bf* xb = reinterpret_cast<bf*>(ARENA.get((rows * ln.C + 1) / 2));
+    lnFwdK<real, bf><<<blocks(rows, 8), 256, 0, STREAM>>>(x, ln.g.w, ln.b.w, y, s.mean, s.rstd, rows, ln.C, ln.eps, xb);
+    s.xb = xb; s.x = nullptr;
+    return s;
+  }
+#endif
   lnFwdK<<<blocks(rows, 8), 256, 0, STREAM>>>(x, ln.g.w, ln.b.w, y, s.mean, s.rstd, rows, ln.C, ln.eps);
   return s;
 }
 #ifndef GRAD_F64
-// BF16: the normalised output in bf16. (Keeping x in bf16 too, s.xb, for the backward to read half the bytes was
-// measured: 0.1-0.7 ms off a block's backward, as much onto its forward, and a pair's worth more saved - not taken;
-// lnBackward still reads s.xb where a caller sets it.)
-inline LnSave lnForward(const LayerNorm& ln, const real* x, bf* y, size_t rows) {
+// BF16: the normalised output in bf16; with ln.saveBf x - mean in bf16 as well, in the same pass, and no pointer to x.
+// (Kept IN ADDITION to the float x it was 0.1-0.7 ms off a block's backward and as much onto its forward; replacing it,
+// written by the kernel that reads x anyway, it is the float x's memory that goes.)
+inline LnSave lnForward(const LayerNorm& ln, const real* x, bf* y, size_t rows, bool saveBf = false) {
   LnSave s{x, ARENA.get(rows), ARENA.get(rows)};
+  if (BF16 && (ln.saveBf || saveBf)) {   // (saveBf: the caller frees x whatever the module's setting)
+    bf* xb = bfGet(rows * ln.C);
+    lnFwdK<bf, bf><<<blocks(rows, 8), 256, 0, STREAM>>>(x, ln.g.w, ln.b.w, y, s.mean, s.rstd, rows, ln.C, ln.eps, xb);
+    s.xb = xb; s.x = nullptr;
+    return s;
+  }
   lnFwdK<<<blocks(rows, 8), 256, 0, STREAM>>>(x, ln.g.w, ln.b.w, y, s.mean, s.rstd, rows, ln.C, ln.eps);
+  return s;
+}
+// x in bf16 (a block's bf16 residual chain): the backward's copy is always the centred one - x is a temporary
+inline LnSave lnForward(const LayerNorm& ln, const bf* x, bf* y, size_t rows, bool = false) {
+  LnSave s{nullptr, ARENA.get(rows), ARENA.get(rows)};
+  bf* xb = bfGet(rows * ln.C);
+  lnFwdK<bf, bf, bf><<<blocks(rows, 8), 256, 0, STREAM>>>(x, ln.g.w, ln.b.w, y, s.mean, s.rstd, rows, ln.C, ln.eps, xb);
+  s.xb = xb;
+  return s;
+}
+inline LnSave lnForward(const LayerNorm& ln, const bf* x, real* y, size_t rows) {
+  LnSave s{nullptr, ARENA.get(rows), ARENA.get(rows)};
+  bf* xb = bfGet(rows * ln.C);
+  lnFwdK<real, bf, bf><<<blocks(rows, 8), 256, 0, STREAM>>>(x, ln.g.w, ln.b.w, y, s.mean, s.rstd, rows, ln.C, ln.eps, xb);
+  s.xb = xb;
   return s;
 }
 #endif
@@ -131,7 +167,7 @@ __global__ void lnBwdRegK(const X* __restrict__ x, const DY* __restrict__ dy, co
   }
   auto row = [&](size_t r, const real* nb) {
     const X* xr = x + r * C;
-    const real mu = mean[r], rs = rstd[r];
+    const real mu = mean ? mean[r] : (real)0, rs = rstd[r];   // (mean null: x is centred, LayerNorm::saveBf)
     real xh[N], dv[N], s1 = 0, s2 = 0;
 #pragma unroll
     for (int k = 0; k < N; ++k) {
@@ -210,7 +246,7 @@ inline bool lnBackwardBf(LayerNorm& ln, const LnSave& s, const DY* dy, DX* dx, s
   unsigned gr = (unsigned)std::min<size_t>(blocks(rows, 8), 1024);
   const size_t sh = 8 * 2 * ln.C * sizeof(real);
   const bf* xb = static_cast<const bf*>(s.xb);
-#define LNREGB(N) case N: if (xb) lnBwdRegK<N, bf, DY, DX><<<gr, 256, sh, STREAM>>>(xb, dy, ln.g.w, s.mean, s.rstd, dx, ln.g.g, ln.b.g, rows, accumulate); \
+#define LNREGB(N) case N: if (xb) lnBwdRegK<N, bf, DY, DX><<<gr, 256, sh, STREAM>>>(xb, dy, ln.g.w, nullptr, s.rstd, dx, ln.g.g, ln.b.g, rows, accumulate); \
                           else lnBwdRegK<N, real, DY, DX><<<gr, 256, sh, STREAM>>>(s.x, dy, ln.g.w, s.mean, s.rstd, dx, ln.g.g, ln.b.g, rows, accumulate); return true;
   if (ln.C % 32 == 0 && sh <= 48 * 1024) switch (ln.C / 32) { LNREGB(1) LNREGB(2) LNREGB(3) LNREGB(4) LNREGB(6) LNREGB(8) LNREGB(12) default: break; }
 #undef LNREGB
@@ -222,7 +258,10 @@ inline void lnBackward(LayerNorm& ln, const LnSave& s, const bf* dy, real* dx, s
   real* t = ARENA.get(rows * ln.C);
   bfToFK<<<blocks(rows * ln.C), 256, 0, STREAM>>>(dy, t, rows * ln.C);
   LnSave f = s; f.xb = nullptr;
-  if (s.xb) { real* xf = ARENA.get(rows * ln.C); bfToFK<<<blocks(rows * ln.C), 256, 0, STREAM>>>(static_cast<const bf*>(s.xb), xf, rows * ln.C); f.x = xf; }
+  if (s.xb) {   // (centred: a zero mean)
+    real* xf = ARENA.get(rows * ln.C); bfToFK<<<blocks(rows * ln.C), 256, 0, STREAM>>>(static_cast<const bf*>(s.xb), xf, rows * ln.C);
+    f.x = xf; f.mean = ARENA.zeros(rows);
+  }
   lnBackward(ln, f, t, dx, rows, accumulate);
 }
 // into a bf16 running gradient (BF16 mode's pair track)
@@ -260,12 +299,19 @@ __global__ void sumColsK(real* dw, const real* part, int parts, int n) {
 template <class DY, class DX>
 inline void lnBackwardPairBias(LayerNorm& ln, const LnSave& s, const DY* dy, DX* dx, size_t rows, bool accumulate,
                                const real* dnb, Param& w, int H) {
-  if (ln.C != 128 || (H != 4 && H != 8) || s.xb) { fprintf(stderr, "lnBackwardPairBias: C %d H %d\n", ln.C, H); exit(1); }
+  if (ln.C != 128 || (H != 4 && H != 8)) { fprintf(stderr, "lnBackwardPairBias: C %d H %d\n", ln.C, H); exit(1); }
   Scratch scratch;
   const unsigned gr = (unsigned)std::min<size_t>(blocks(rows, 8), 1024);
   const size_t sh = 8 * 2 * ln.C * sizeof(real);
   const int n = ln.C * H;
   const LnPairBias pb{dnb, w.w, ARENA.get((size_t)gr * n), ln.b.w};
+#ifndef GRAD_F64
+  if (s.xb) {   // (x - mean in bf16: a zero mean)
+    const bf* xb = static_cast<const bf*>(s.xb);
+    if (H == 4) lnBwdRegK<4, bf, DY, DX, 4><<<gr, 256, sh, STREAM>>>(xb, dy, ln.g.w, nullptr, s.rstd, dx, ln.g.g, ln.b.g, rows, accumulate, pb);
+    else lnBwdRegK<4, bf, DY, DX, 8><<<gr, 256, sh, STREAM>>>(xb, dy, ln.g.w, nullptr, s.rstd, dx, ln.g.g, ln.b.g, rows, accumulate, pb);
+  } else
+#endif
   if (H == 4) lnBwdRegK<4, real, DY, DX, 4><<<gr, 256, sh, STREAM>>>(s.x, dy, ln.g.w, s.mean, s.rstd, dx, ln.g.g, ln.b.g, rows, accumulate, pb);
   else lnBwdRegK<4, real, DY, DX, 8><<<gr, 256, sh, STREAM>>>(s.x, dy, ln.g.w, s.mean, s.rstd, dx, ln.g.g, ln.b.g, rows, accumulate, pb);
   sumColsK<<<(n + 31) / 32, 256, 0, STREAM>>>(w.g, pb.part, (int)gr, n);
@@ -308,31 +354,36 @@ __global__ void reluBwdK(real* d, const real* pre, size_t n) {
   if (t < n && pre[t] <= 0.f) d[t] = 0.f;
 }
 // [A, B, C] -> [B, A, C]  (accumulate: out += )
-__global__ void swap01K(const real* __restrict__ in, real* __restrict__ out, int A, int B, int C, bool accumulate) {
+__global__ void swap01K(const real* __restrict__ in, real* __restrict__ out, int A, int B, int C, bool accumulate,
+                        const real* __restrict__ base) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   size_t n = (size_t)A * B * C;
   if (t >= n) return;
   int c = t % C; size_t ab = t / C; int b = ab % B, a = (int)(ab / B);
   size_t o = ((size_t)b * A + a) * C + c;
-  out[o] = accumulate ? out[o] + in[t] : in[t];
+  out[o] = base ? base[o] + in[t] : accumulate ? out[o] + in[t] : in[t];
 }
 // (four channels a thread where C allows: one float a thread ran a pair transpose at ~450 GB/s)
-__global__ void swap01V4K(const float4* __restrict__ in, float4* __restrict__ out, int A, int B, int C4, bool accumulate) {
+__global__ void swap01V4K(const float4* __restrict__ in, float4* __restrict__ out, int A, int B, int C4, bool accumulate,
+                          const float4* __restrict__ base) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)A * B * C4) return;
   int c = t % C4; size_t ab = t / C4; int b = ab % B, a = (int)(ab / B);
   size_t o = ((size_t)b * A + a) * C4 + c;
   float4 v = in[t];
-  if (accumulate) { const float4 w = out[o]; v.x += w.x; v.y += w.y; v.z += w.z; v.w += w.w; }
+  if (base || accumulate) { const float4 w = base ? base[o] : out[o]; v.x += w.x; v.y += w.y; v.z += w.z; v.w += w.w; }
   out[o] = v;
 }
-inline void swap01(const real* in, real* out, int A, int B, int C, bool accumulate = false) {
-  if (sizeof(real) == 4 && C % 4 == 0 && ((uintptr_t)in & 15) == 0 && ((uintptr_t)out & 15) == 0) {
+// base: out = base + swap(in), out of place (a residual link without copying base into out first)
+inline void swap01(const real* in, real* out, int A, int B, int C, bool accumulate = false, const real* base = nullptr) {
+  if (sizeof(real) == 4 && C % 4 == 0 && ((uintptr_t)in & 15) == 0 && ((uintptr_t)out & 15) == 0 &&
+      ((uintptr_t)base & 15) == 0) {
     swap01V4K<<<blocks((size_t)A * B * C / 4), 256, 0, STREAM>>>(reinterpret_cast<const float4*>(in),
-                                                                reinterpret_cast<float4*>(out), A, B, C / 4, accumulate);
+                                                                reinterpret_cast<float4*>(out), A, B, C / 4, accumulate,
+                                                                reinterpret_cast<const float4*>(base));
     return;
   }
-  swap01K<<<blocks((size_t)A * B * C), 256, 0, STREAM>>>(in, out, A, B, C, accumulate);
+  swap01K<<<blocks((size_t)A * B * C), 256, 0, STREAM>>>(in, out, A, B, C, accumulate, base);
 }
 // [R, C] <-> [C, R]
 inline void transpose(const real* in, real* out, int R, int C, bool accumulate = false) { swap01(in, out, R, C, 1, accumulate); }
@@ -651,10 +702,17 @@ __global__ void ogBwdBfK(const float* dog, const float* o, const bf* g, float* d
 // per batch row b: q = x Wq * D^-1/2, k = x Wk, v = x Wv (one LN'd input for both, as every AF2 self-attention),
 // logits = q k^T + maskBias[b, k] + nb[h, q, k], softmax over k, o = P v, o *= sigmoid(x Wg + bg), out = o Wo + bo.
 // The four projections are separate parameters, each written to its own slab of qkvg ([4][rows][HD]).
+struct Arena;
 struct Attention {
   Param wq, wk, wv, wg, bg, wo, bo;
   int C = 0, H = 0, D = 0, O = 0;
   bool gating = true;
+  // a stack's graded keep (af2::Stack): with recordTo the BF16 forward puts its output O and lse there and remembers
+  // them; with them cached the next forward - the backward's replay - reads them and skips the flash forward (the
+  // projections are still recomputed: the backward reads them)
+  mutable Arena* recordTo = nullptr;
+  mutable real* cachedO = nullptr;
+  mutable real* cachedLse = nullptr;
 };
 // The projections are interleaved, qkvg [B Q, P] with q, k, v, g at columns 0, HD, 2 HD, 3 HD (P = 3 or 4 HD), from
 // one GEMM against the four weights packed side by side; the backward is then one GEMM for the four weight gradients
@@ -826,10 +884,15 @@ inline AttnSave attnForwardBf(const Attention& a, const real* x, const real* mas
   bf* xb = toBf(x, rows * a.C);
   bf* W = bfGet((size_t)a.C * P);
   bf* qkvg = bfGet(rows * P);
-  bf* ob = bfGet(rows * HD);   // the attention's output in bf16 (the gate and the softmax's row term its readers)
+  const bool cached = a.cachedO != nullptr;
+  bf* ob;   // the attention's output in bf16 (the gate and the softmax's row term its readers)
+  if (cached) { ob = reinterpret_cast<bf*>(a.cachedO); s.lse = a.cachedLse; }
+  else if (a.recordTo) {
+    ob = reinterpret_cast<bf*>(a.recordTo->get((rows * HD + 1) / 2)); s.lse = a.recordTo->get(2 * rows * a.H);
+    a.cachedO = reinterpret_cast<real*>(ob); a.cachedLse = s.lse;
+  } else { ob = bfGet(rows * HD); s.lse = ARENA.get(2 * rows * a.H); }
   s.o = reinterpret_cast<real*>(ob);
   bf* og = bfGet(rows * HD);
-  s.lse = ARENA.get(2 * rows * a.H);
   {
     Scratch scratch;
     real* Wf = ARENA.get((size_t)a.C * P);
@@ -839,7 +902,7 @@ inline AttnSave attnForwardBf(const Attention& a, const real* x, const real* mas
   }
   mmBf(xb, W, qkvg, (int)rows, a.C, P);
   if (a.gating) gateFwdBfK<<<blocks(rows * HD), 256, 0, STREAM>>>(qkvg + 3 * HD, a.bg.w, rows, HD, P);
-  sdpaForwardBf(af2Sdpa(a, B, Q, mask, nb), qkvg, P, qkvg + HD, P, qkvg + 2 * HD, P, ob, HD, s.lse);
+  if (!cached) sdpaForwardBf(af2Sdpa(a, B, Q, mask, nb), qkvg, P, qkvg + HD, P, qkvg + 2 * HD, P, ob, HD, s.lse);
   if (a.gating) gateMulBfK<<<blocks(rows * HD), 256, 0, STREAM>>>(og, ob, qkvg + 3 * HD, rows, HD, P);
   else GK(cudaMemcpyAsync(og, ob, rows * HD * 2, cudaMemcpyDeviceToDevice, STREAM));
   {
@@ -1186,7 +1249,8 @@ __global__ void reluBwdSumBfK(__nv_bfloat162* d, const __nv_bfloat162* h, float*
   atomicAdd(&g[2 * c], s.x); atomicAdd(&g[2 * c + 1], s.y);
 }
 // BF16: the normalised input and the hidden layer in bf16, both GEMMs on bf16 operands
-inline TransSave transForwardBf(const Transition& t, const real* x, real* out, size_t rows) {
+template <class X>   // (X: real, or bf - a block's bf16 residual chain)
+inline TransSave transForwardBf(const Transition& t, const X* x, real* out, size_t rows) {
   TransSave s; s.rows = rows; s.bf = true;
   bf* xn = bfGet(rows * t.ln.C);
   s.ln = lnForward(t.ln, x, xn, rows);

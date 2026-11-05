@@ -216,6 +216,22 @@ __global__ void addK(real* y, const real* x, size_t n) {           // y += x
   if (t < n) y[t] += x[t];
 }
 inline void add(real* y, const real* x, size_t n) { if (n) addK<<<blocks(n), 256, 0, STREAM>>>(y, x, n); }
+// y = a + b, out of place: a residual link in three passes where a copy and then an add were five
+__global__ void add3K(real* __restrict__ y, const real* __restrict__ a, const real* __restrict__ b, size_t n) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t < n) y[t] = a[t] + b[t];
+}
+__global__ void add3V4K(float4* __restrict__ y, const float4* __restrict__ a, const float4* __restrict__ b, size_t n4) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t < n4) { const float4 u = a[t], v = b[t]; y[t] = make_float4(u.x + v.x, u.y + v.y, u.z + v.z, u.w + v.w); }
+}
+inline void add3(real* y, const real* a, const real* b, size_t n) {
+  if (!n) return;
+  if (sizeof(real) == 4 && n % 4 == 0 && !(((uintptr_t)y | (uintptr_t)a | (uintptr_t)b) & 15))
+    add3V4K<<<blocks(n / 4), 256, 0, STREAM>>>(reinterpret_cast<float4*>(y), reinterpret_cast<const float4*>(a),
+                                               reinterpret_cast<const float4*>(b), n / 4);
+  else add3K<<<blocks(n), 256, 0, STREAM>>>(y, a, b, n);
+}
 
 __global__ void biasK(real* y, const real* b, size_t rows, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;

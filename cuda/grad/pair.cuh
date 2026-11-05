@@ -22,7 +22,8 @@ struct TriMulSave {
   LnSave lnIn, lnC;
   real *xn, *proj, *gate, *ab, *center, *cn, *og;   // og: sigmoid of the output gate
   int L;
-  bool bf = false;   // BF16: xn, proj, gate, ab, cn, og held in bf16 (the pointers' bytes are bf16), center in float
+  bool bf = false;   // BF16: xn, ab, cn, og held in bf16 (the pointers' bytes are bf16), proj the two sigmoids
+                     // [rows][2 I + C] (gate, output gate), gate the packed weights; center not kept (lnC holds it)
 };
 // [L, L, C2] -> channel-major [C2][L][L]; interleaved, column 2p goes to plane p and 2p + 1 to plane C2/2 + p
 __device__ inline int planeOf(int c, int C2, bool inter) { return inter ? (c & 1) * (C2 / 2) + (c >> 1) : c; }
@@ -142,7 +143,9 @@ __global__ void mergeGateBwdTBf(const bf* __restrict__ dab, const bf* __restrict
 // sigmoids in place and writes the gated a, b channel-major. pre is the save: [proj masked | sigmoid gate | sigmoid
 // output gate]; the backward is one weight-gradient GEMM and one dx GEMM over the packed d pre.
 __global__ void triPrepBfK(bf* __restrict__ pre, const real* __restrict__ mask, bf* __restrict__ ab, size_t rows,
-                           int I2, int P, bool inter, bool masked) {
+                           int I2, int P, bool inter, bool masked, bf* __restrict__ gs = nullptr, int GS = 0) {
+  // (gs: the sigmoid gate into the compact [rows][GS] the backward keeps, and the masked projection not written back:
+  // the backward needs only the gate and ab = pj g, dgate_pre = dab ab (1 - g), so the 640-wide pre is a temporary)
   __shared__ float tile[32][33];
   const size_t r0 = (size_t)blockIdx.x * 32;
   const int c0 = blockIdx.y * 32, tx = threadIdx.x, ty = threadIdx.y;
@@ -152,9 +155,15 @@ __global__ void triPrepBfK(bf* __restrict__ pre, const real* __restrict__ mask, 
       bf* p = pre + r * P + c;
       const float pj = __bfloat162float(p[0]) * (masked ? mask[r] : 1.f);
       const float sg = 1.f / (1.f + __expf(-__bfloat162float(p[I2])));
-      p[0] = __float2bfloat16(pj);
-      p[I2] = __float2bfloat16(sg);
-      tile[k][tx] = __bfloat162float(p[0]) * __bfloat162float(p[I2]);   // (from the rounded saves: the backward's)
+      if (gs) {
+        const bf sgb = __float2bfloat16(sg);
+        gs[r * GS + c] = sgb;
+        tile[k][tx] = pj * __bfloat162float(sgb);
+      } else {
+        p[0] = __float2bfloat16(pj);
+        p[I2] = __float2bfloat16(sg);
+        tile[k][tx] = __bfloat162float(p[0]) * __bfloat162float(p[I2]);   // (from the rounded saves: the backward's)
+      }
     }
   }
   __syncthreads();
@@ -165,18 +174,23 @@ __global__ void triPrepBfK(bf* __restrict__ pre, const real* __restrict__ mask, 
 }
 // mergeGateBwdTBf reading proj, gate and writing their gradients at row stride P: a 32-row x 64-column tile, the
 // channel-major read coalesced along rows, the row-major side a column pair (bf162) a thread
-__global__ void mergeGateBwdLdBfK(const bf* __restrict__ dab, const bf* __restrict__ pre, const real* __restrict__ mask,
-                                  bf* __restrict__ dpre, size_t rows, int I2, int P, bool inter,
-                                  float* __restrict__ gProj, float* __restrict__ gGate) {
+__global__ void mergeGateBwdLdBfK(const bf* __restrict__ dab, const bf* __restrict__ ab, const bf* __restrict__ gs,
+                                  int GS, const real* __restrict__ mask, bf* __restrict__ dpre, size_t rows, int I2,
+                                  int P, bool inter, float* __restrict__ gProj, float* __restrict__ gGate) {
   // (gProj, gGate: the two biases' gradients, summed here over the tile's rows - a separate column-sum pass each
-  // re-read what this writes)
-  __shared__ float tile[32][65];
+  // re-read what this writes. From ab = pj g and the gate g [rows][GS]: dproj = dab g m, dgate_pre = dab ab (1 - g),
+  // so the masked projection itself is never kept)
+  __shared__ float tile[32][65], tab[32][65];
   __shared__ float4 part[8][32];
   const size_t r0 = (size_t)blockIdx.x * 32;
   const int c0 = blockIdx.y * 64, tx = threadIdx.x, ty = threadIdx.y;
   for (int k = ty; k < 64; k += 8) {
     const int c = c0 + k; const size_t r = r0 + tx;
-    if (r < rows && c < I2) tile[tx][k] = bfv(dab[(size_t)planeOf(c, I2, inter) * rows + r]);
+    if (r < rows && c < I2) {
+      const size_t o = (size_t)planeOf(c, I2, inter) * rows + r;
+      tile[tx][k] = bfv(dab[o]);
+      tab[tx][k] = bfv(ab[o]);
+    }
   }
   __syncthreads();
   const int c = c0 + 2 * tx;
@@ -186,11 +200,11 @@ __global__ void mergeGateBwdLdBfK(const bf* __restrict__ dab, const bf* __restri
       const size_t r = r0 + k;
       if (r >= rows) continue;
       const size_t i = r * P + c;
-      const float2 pj = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(pre + i));
-      const float2 sg = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(pre + i + I2));
+      const float2 sg = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(gs + r * GS + c));
       const float d0 = tile[k][2 * tx], d1 = tile[k][2 * tx + 1], m = mask ? mask[r] : 1.f;
+      const float a0 = tab[k][2 * tx], a1 = tab[k][2 * tx + 1];
       const __nv_bfloat162 a = __floats2bfloat162_rn(d0 * sg.x * m, d1 * sg.y * m);
-      const __nv_bfloat162 g = __floats2bfloat162_rn(d0 * pj.x * sg.x * (1.f - sg.x), d1 * pj.y * sg.y * (1.f - sg.y));
+      const __nv_bfloat162 g = __floats2bfloat162_rn(d0 * a0 * (1.f - sg.x), d1 * a1 * (1.f - sg.y));
       *reinterpret_cast<__nv_bfloat162*>(dpre + i) = a;
       *reinterpret_cast<__nv_bfloat162*>(dpre + i + I2) = g;
       const float2 af = __bfloat1622float2(a), gf = __bfloat1622float2(g);   // (the sums of what was written)
@@ -209,13 +223,13 @@ __global__ void mergeGateBwdLdBfK(const bf* __restrict__ dab, const bf* __restri
 // aligned): a block's 256 / (C / 8) row groups, its gating sums through shared memory
 __global__ void outGateBwdLdBf8K(const uint4* __restrict__ dy, const uint4* __restrict__ a, const uint4* __restrict__ og,
                                  uint4* __restrict__ da, uint4* __restrict__ dgl, size_t rows, int C8, int P8,
-                                 float* gGating) {
+                                 float* gGating, int G8) {   // (G8: og's row stride, in eights; dgl's is P8)
   extern __shared__ float gs[];   // [256 / C8][8 C8]
   const int c8 = threadIdx.x % C8, rg = threadIdx.x / C8, RG = blockDim.x / C8;
   float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
   for (size_t r = (size_t)blockIdx.x * RG + rg; r < rows; r += (size_t)gridDim.x * RG) {
     const size_t t = r * C8 + c8, i = r * P8 + c8;
-    const uint4 Y = dy[t], A = a[t], S = og[i];
+    const uint4 Y = dy[t], A = a[t], S = og[r * G8 + c8];
     const uint32_t *yw = &Y.x, *aw = &A.x, *sw = &S.x;
     uint4 DA, DG; uint32_t *dw = &DA.x, *gw = &DG.x;
 #pragma unroll
@@ -244,14 +258,14 @@ __global__ void outGateBwdLdBf8K(const uint4* __restrict__ dy, const uint4* __re
 // (gGating: the output gate's bias gradient, summed here: a block 32 columns x 8 row lanes, rows strided)
 template <class DY>
 __global__ void outGateBwdLdBfK(const DY* dy, const bf* a, const bf* og, bf* da, bf* dgl, size_t rows, int C,
-                                int P, float* gGating) {
+                                int P, float* gGating, int G) {   // (G: og's row stride; dgl's is P)
   __shared__ float part[8][32];
   const int c = blockIdx.x * 32 + threadIdx.x;
   float acc = 0.f;
   if (c < C)
     for (size_t r = blockIdx.y * 8 + threadIdx.y; r < rows; r += (size_t)gridDim.y * 8) {
       const size_t t = r * C + c, i = r * P + c;
-      const float s = bfv(og[i]), y = bfv(dy[t]);
+      const float s = bfv(og[r * G + c]), y = bfv(dy[t]);
       da[t] = __float2bfloat16(y * s);
       const bf g = __float2bfloat16(y * bfv(a[t]) * s * (1.f - s));
       dgl[i] = g;
@@ -268,11 +282,16 @@ __global__ void mulLdBfK(real* y, const bf* g, size_t rows, int C, int P) {   //
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t < rows * C) y[t] *= bfv(g[(t / C) * P + t % C]);
 }
+__global__ void gateSigCopyBfK(const bf* __restrict__ x, int ldx, bf* __restrict__ y, int ldy, size_t rows, int C) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;   // y[r, c] = sigmoid(x[r, c])
+  if (t < rows * C) y[(t / C) * ldy + t % C] = __float2bfloat16(1.f / (1.f + __expf(-bfv(x[(t / C) * ldx + t % C]))));
+}
 __global__ void gateOutLdBfK(real* y, const bf* a, const bf* g, size_t rows, int C, int P) {   // y = a g[r * P + c]
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t < rows * C) y[t] = bfv(a[t]) * bfv(g[(t / C) * P + t % C]);
 }
-inline TriMulSave triMulForwardBf(const TriMul& m, const real* pair, const real* mask, real* out, int L) {
+template <class X>   // (X: real, or bf - a block's bf16 residual chain)
+inline TriMulSave triMulForwardBf(const TriMul& m, const X* pair, const real* mask, real* out, int L) {
   const size_t rows = (size_t)L * L;
   const int I2 = 2 * m.I, P = 2 * I2 + m.C;
   TriMulSave s;
@@ -282,14 +301,21 @@ inline TriMulSave triMulForwardBf(const TriMul& m, const real* pair, const real*
   const Linear* roles[3] = {&m.proj, &m.gate, &m.gating};
   bf* bias;
   bf* W = packLinears(roles, 3, &bias);
-  bf* pre = bfGet(rows * P);
+  bf* pre;   // (a temporary: the backward keeps the two sigmoids, gs [rows][I2 + C], and ab)
+  GK(cudaMallocAsync(&pre, rows * P * sizeof(bf), STREAM));
   if (bias) ltLinear(xn, W, false, bias, false, pre, (int)rows, m.C, P, 0.f);
   else mmBf(xn, W, pre, (int)rows, m.C, P);
+  const int GS = I2 + m.C;
+  bf* gs = bfGet(rows * GS);
   bf* ab = bfGet(rows * I2);                                      // channel-major a then b
   dim3 b(32, 8), g((unsigned)((rows + 31) / 32), (I2 + 31) / 32);
-  triPrepBfK<<<g, b, 0, STREAM>>>(pre, mask, ab, rows, I2, P, m.interleaved, m.masked);
-  gateSigLdBfK<<<blocks(rows * m.C), 256, 0, STREAM>>>(pre + 2 * I2, rows, m.C, P);
-  s.center = ARENA.get(rows * m.I);
+  triPrepBfK<<<g, b, 0, STREAM>>>(pre, mask, ab, rows, I2, P, m.interleaved, m.masked, gs, GS);
+  gateSigCopyBfK<<<blocks(rows * m.C), 256, 0, STREAM>>>(pre + 2 * I2, P, gs + I2, GS, rows, m.C);
+  GK(cudaFreeAsync(pre, STREAM));
+  // (the centre is a temporary: its LayerNorm saves it centred in bf16 - nothing else in the backward reads it)
+  real* center;
+  GK(cudaMallocAsync(&center, rows * m.I * sizeof(real), STREAM));
+  s.center = center;
   bf* cn = bfGet(rows * m.I);
   {
     Scratch scratch;
@@ -303,11 +329,13 @@ inline TriMulSave triMulForwardBf(const TriMul& m, const real* pair, const real*
     dim3 g2((unsigned)((rows + 31) / 32), (m.I + 31) / 32);
     channelsTBf<<<g2, b, 0, STREAM>>>(ccm, nullptr, s.center, rows, m.I, false, 1);
   }
-  s.lnC = lnForward(m.lnCenter, s.center, cn, rows);
+  s.lnC = lnForward(m.lnCenter, s.center, cn, rows, true);
+  GK(cudaFreeAsync(center, STREAM));
+  s.center = nullptr;
   bf* po = bfGet(rows * m.C);   // the output projection before its gate, kept (the backward recomputed it)
   linearFwdBf(m.out, cn, po, rows);
-  gateOutLdBfK<<<blocks(rows * m.C), 256, 0, STREAM>>>(out, po, pre + 2 * I2, rows, m.C, P);
-  s.xn = reinterpret_cast<real*>(xn); s.proj = reinterpret_cast<real*>(pre); s.gate = reinterpret_cast<real*>(W);
+  gateOutLdBfK<<<blocks(rows * m.C), 256, 0, STREAM>>>(out, po, gs + I2, rows, m.C, GS);
+  s.xn = reinterpret_cast<real*>(xn); s.proj = reinterpret_cast<real*>(gs); s.gate = reinterpret_cast<real*>(W);
   s.ab = reinterpret_cast<real*>(ab); s.cn = reinterpret_cast<real*>(cn); s.og = reinterpret_cast<real*>(po);
   return s;
 }
@@ -316,23 +344,24 @@ inline void triMulBackwardBf(TriMul& m, const TriMulSave& s, const real* mask, c
   Scratch scratch;
   const int L = s.L, I2 = 2 * m.I, P = 2 * I2 + m.C;
   const size_t rows = (size_t)L * L;
-  const bf *xn = reinterpret_cast<const bf*>(s.xn), *pre = reinterpret_cast<const bf*>(s.proj),
+  const int GS = I2 + m.C;   // (s.proj is the two sigmoids, [rows][I2 + C])
+  const bf *xn = reinterpret_cast<const bf*>(s.xn), *gs = reinterpret_cast<const bf*>(s.proj),
            *W = reinterpret_cast<const bf*>(s.gate), *ab = reinterpret_cast<const bf*>(s.ab),
            *cn = reinterpret_cast<const bf*>(s.cn);
   bf* dpre = bfGet(rows * P);
   const bf* po = reinterpret_cast<const bf*>(s.og);
   bf* dpo = bfGet(rows * m.C);
   if (sizeof(PD) == 2 && m.C % 8 == 0 && P % 8 == 0 && 256 % (m.C / 8) == 0 && !((uintptr_t)dout & 15) &&
-      !((uintptr_t)(pre + 2 * I2) & 15)) {
+      GS % 8 == 0 && !((uintptr_t)(gs + I2) & 15)) {
     const int C8 = m.C / 8;
     outGateBwdLdBf8K<<<432, 256, 256 / C8 * m.C * sizeof(float), STREAM>>>(reinterpret_cast<const uint4*>(dout),
-        reinterpret_cast<const uint4*>(po), reinterpret_cast<const uint4*>(pre + 2 * I2), reinterpret_cast<uint4*>(dpo),
-        reinterpret_cast<uint4*>(dpre + 2 * I2), rows, C8, P / 8, m.gating.hasBias ? m.gating.b.g : nullptr);
+        reinterpret_cast<const uint4*>(po), reinterpret_cast<const uint4*>(gs + I2), reinterpret_cast<uint4*>(dpo),
+        reinterpret_cast<uint4*>(dpre + 2 * I2), rows, C8, P / 8, m.gating.hasBias ? m.gating.b.g : nullptr, GS / 8);
   } else {
     const unsigned xb = (m.C + 31) / 32;
     dim3 b8(32, 8), gr(xb, (unsigned)std::min<size_t>((rows + 7) / 8, std::max(1u, 1728 / xb)));
-    outGateBwdLdBfK<<<gr, b8, 0, STREAM>>>(dout, po, pre + 2 * I2, dpo, dpre + 2 * I2, rows, m.C, P,
-                                           m.gating.hasBias ? m.gating.b.g : nullptr);
+    outGateBwdLdBfK<<<gr, b8, 0, STREAM>>>(dout, po, gs + I2, dpo, dpre + 2 * I2, rows, m.C, P,
+                                           m.gating.hasBias ? m.gating.b.g : nullptr, GS);
   }
   bf* dcn = bfGet(rows * m.I);   // (only the centre norm's backward reads it)
   linearBwdBf(m.out, cn, dpo, dcn, rows);
@@ -355,7 +384,7 @@ inline void triMulBackwardBf(TriMul& m, const TriMulSave& s, const real* mask, c
     bmmBf(false, true, L, L, L, A, st, dccm, st, dB, st, m.I, alpha);
   }
   dim3 g2((unsigned)((rows + 31) / 32), (I2 + 63) / 64);
-  mergeGateBwdLdBfK<<<g2, b, 0, STREAM>>>(dab, pre, m.masked ? mask : nullptr, dpre, rows, I2, P, m.interleaved,
+  mergeGateBwdLdBfK<<<g2, b, 0, STREAM>>>(dab, ab, gs, GS, m.masked ? mask : nullptr, dpre, rows, I2, P, m.interleaved,
                                           m.proj.hasBias ? m.proj.b.g : nullptr, m.gate.hasBias ? m.gate.b.g : nullptr);
   const Linear* roles[3] = {&m.proj, &m.gate, &m.gating};   // (their bias gradients summed in the two kernels above)
   {
@@ -679,7 +708,8 @@ inline void opmProductsBf(const Opm& m, const OpmSave& s, bf* op) {
          reinterpret_cast<const bf*>(s.lm), CUDA_R_16BF, LO, 0.f, o2, CUDA_R_16BF, LO);    // o2 = lm^T rm
   outerToPair(o2, op, L, m.O, false);
 }
-inline OpmSave opmForwardBf(const Opm& m, const real* msa, const real* msaMask, real* pair, int S, int L) {
+template <class X>   // (X: real, or bf - a block's bf16 residual chain)
+inline OpmSave opmForwardBf(const Opm& m, const X* msa, const real* msaMask, real* pair, int S, int L) {
   const size_t rows = (size_t)S * L, pr = (size_t)L * L;
   const int OO = m.O * m.O;
   OpmSave s{}; s.S = S; s.L = L; s.bf = true;

@@ -1,14 +1,14 @@
 // The AF2 training block's cost at a training shape: forward with saves, backward, and what the arena holds -
 // against a stack's input saves. Random weights and inputs (no oracle: cuda/grad/test_af2_block.cu is the gate).
 //   cuda/grad/bench-af2-block [--L=256] [--S=128] [--extra] [--tf32] [--bf16] [--blocks=48] [--graph]
-//   ... --stack [--keep-mb=N] [--carry] [--no-graphs]   (a whole stack trained, keep tiers off and on)
+//   ... --stack [--keep-mb=N] [--carry] [--no-graphs] [--no-graded] [--bf16-res]   (a whole stack trained, keep tiers off and on)
 #include <cstring>
 #include <curand.h>
 #include <cuda_profiler_api.h>
 #include "af2.cuh"
 using namespace grad;
 int main(int argc, char** argv) {
-  bool stack = false, carry = false, noGraphs = false;
+  bool stack = false, carry = false, noGraphs = false, noGraded = false, bfRes = false;
   size_t keepMb = SIZE_MAX;
   int L = 256, S = 128, nblocks = 48; bool extra = false, graph = false;
   for (int i = 1; i < argc; ++i) {
@@ -22,7 +22,9 @@ int main(int argc, char** argv) {
     else if (!strcmp(argv[i], "--stack")) stack = true;   // a whole --blocks stack trained, with keep tiers and without
     else if (!strncmp(argv[i], "--keep-mb=", 10)) keepMb = (size_t)atol(argv[i] + 10) << 20;   // (--stack: the tiers' budget)
     else if (!strcmp(argv[i], "--carry")) carry = true;          // (--stack: the bf16 carry between blocks)
-    else if (!strcmp(argv[i], "--no-graphs")) noGraphs = true;   // (--stack --graph: the stream, not the graphs)
+    else if (!strcmp(argv[i], "--no-graphs")) noGraphs = true;
+    else if (!strcmp(argv[i], "--no-graded")) noGraded = true;
+    else if (!strcmp(argv[i], "--bf16-res")) bfRes = true;   // (the blocks' residual states in bf16: Block::bf16Res)   // (--stack: keep whole blocks only, no graded keep)   // (--stack --graph: the stream, not the graphs)
   }
   if (graph) GK(cudaStreamCreateWithFlags(&STREAM, cudaStreamNonBlocking));   // (the legacy stream cannot be captured)
   init();
@@ -31,6 +33,7 @@ int main(int argc, char** argv) {
   if (stack) {   // a stack of --blocks blocks: forward, then backward, keep tiers on (the default) and off
     af2::Stack st; st.blocks.resize(nblocks);
     for (auto& b : st.blocks) {
+      b.bf16Res = bfRes;
       b.extra = extra; b.Cm = extra ? 64 : 256;
       af2::forEachParam(b, [&](const std::string& n, Param& p, size_t len) {
         p.name = n; p.n = len; p.w = randn(len, 0.05f); GK(cudaMalloc(&p.g, len * 4)); b.params.add(p); });
@@ -50,23 +53,25 @@ int main(int argc, char** argv) {
       st.bf16Carry = carry;
       for (auto& b : st.blocks) b.params.zeroGrad();
       ARENA.reset();
-      GK(cudaMemcpy(dm, ctm, mr * 4, cudaMemcpyDeviceToDevice)); GK(cudaMemcpy(dp, ctp, pr * 4, cudaMemcpyDeviceToDevice));
+      GK(cudaMemcpyAsync(dm, ctm, mr * 4, cudaMemcpyDeviceToDevice, STREAM));   // (on STREAM: a legacy-stream
+      GK(cudaMemcpyAsync(dp, ctp, pr * 4, cudaMemcpyDeviceToDevice, STREAM));   // copy does not order against it)
+      st.gradedKeep = !noGraded;
       cudaEventRecord(e0, STREAM);
       st.forward(msa, pair, mm_, pm, S, L);
       cudaEventRecord(e1, STREAM);
-      const size_t k = st.keptBlocks();
+      const size_t k = st.keptBlocks(), g = st.graded;
       st.backward(mm_, pm, dm, dp);
       cudaEventRecord(e2, STREAM);
       GK(cudaStreamSynchronize(STREAM)); GK(cudaGetLastError());
       float f, bw; cudaEventElapsedTime(&f, e0, e1); cudaEventElapsedTime(&bw, e1, e2);
       size_t fr, tot; cudaMemGetInfo(&fr, &tot);
-      printf("stack of %d (L %d S %d%s), keep tiers %s: forward %.1f ms, backward %.1f ms -> %.1f ms; %zu blocks kept "
-             "(%.0f MiB), %.1f GiB free after\n", nblocks, L, S, BF16 ? ", bf16" : "", arm % 2 ? "on " : "off", f, bw, f + bw,
-             k, st.keep.held() / 1048576.0, fr / 1073741824.0);
+      printf("stack of %d (L %d S %d%s), keep tiers %s: forward %.1f ms, backward %.1f ms -> %.1f ms; %zu blocks kept, %zu "
+             "graded (%.0f MiB), %.1f GiB free after\n", nblocks, L, S, BF16 ? ", bf16" : "", arm % 2 ? "on " : "off", f, bw,
+             f + bw, k, g, st.keep.held() / 1048576.0, fr / 1073741824.0);
     }
     return 0;
   }
-  af2::Block b; b.extra = extra; b.Cm = extra ? 64 : 256;
+  af2::Block b; b.extra = extra; b.Cm = extra ? 64 : 256; b.bf16Res = bfRes;
   af2::forEachParam(b, [&](const std::string& n, Param& p, size_t len) {
     p.name = n; p.n = len; p.w = randn(len, 0.05f); GK(cudaMalloc(&p.g, len * 4)); b.params.add(p); });
   for (auto* p : b.params.all) if (p->name.find("/scale") != std::string::npos) { std::vector<float> one(p->n, 1.f); GK(cudaMemcpy(p->w, one.data(), p->n * 4, cudaMemcpyHostToDevice)); }
