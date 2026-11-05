@@ -178,7 +178,7 @@ export async function main(device, args) {
   // AlphaFold 2 it is no faster at all while the worst atom against the WGSL
   // fold goes 0.0353 A to 0.0904 - past that comparison's own 0.0355 A dither
   // floor. `--no-narrow-aligned-x` is the arm.
-  const execution = webglExecution(gl, args ?? [], { narrowAlignedX: true });
+  const execution = webglExecution(gl, args ?? [], { narrowAlignedX: true, narrowUnblockedX: true });
   const held = [];
   const upload = (values, label) => {
     const tensor = execution.upload(Float32Array.from(values), label);

@@ -225,6 +225,13 @@ export class Execution {
     // where `padStride` would not otherwise run. A per-model trade - see
     // `linear`'s note and `webglExecutionOptions`.
     this.narrowAlignedX = options.narrowAlignedX ?? false;
+    // 🔴 THE SAME NARROWING ON THE UNBLOCKED PATH, AND A SEPARATE OPTION
+    // BECAUSE THE TWO WERE MEASURED TOGETHER AND ONLY ONE MAY PAY. Combined
+    // they read 1.016x on a bioemu2 fold, which is near the run-to-run spread,
+    // while the profile has `linear:4624x256x512` going 212 to 189 GFLOP/s and
+    // `pad-stride` from 5284 calls to 9502 - so the unblocked half adds a pass
+    // per call and may be a net loss. Split so each can be priced.
+    this.narrowUnblockedX = options.narrowUnblockedX ?? false;
     this.linearTileWidth = options.linearTileWidth ?? 0;
     /**
      * The blocked projection's rows a fragment, forced - the control arm for

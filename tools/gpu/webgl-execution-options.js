@@ -187,6 +187,8 @@ export function webglExecutionOptions(args, defaults = {}) {
     // `--no-narrow-aligned-x` below; a driver opts in and either flag wins.
     narrowAlignedX: flag(args, "narrow-aligned-x")
       || ((defaults.narrowAlignedX ?? false) && !flag(args, "no-narrow-aligned-x")),
+    narrowUnblockedX: flag(args, "narrow-unblocked-x")
+      || ((defaults.narrowUnblockedX ?? false) && !flag(args, "no-narrow-unblocked-x")),
     int5Weights: !flag(args, "no-int5-weights"),
     checkErrors: !flag(args, "no-check-errors"),
     noLinearBlock: flag(args, "no-linear-block"),

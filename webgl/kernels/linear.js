@@ -668,7 +668,7 @@ export function linear(execution, call, into) {
     // bioemu2's atom projection and **436** for AF2's pair track, so every
     // output texel lands on its own cache line. The order is only worth having
     // where the block count is small enough that the repack survives it.
-    const rowFastest = int5 && !execution.noRowFastest
+    const rowFastestClassic = int5 && !execution.noRowFastest
       && rows * inChannels <= ROW_FASTEST_X_FLOATS;
     // 🔴 x's ROW STRIDE PADDED TO DIVIDE THE TEXTURE WIDTH, which is 4.08x on
     // every shape whose input width does not - see webgl/runtime/pad-stride.js.
@@ -705,11 +705,24 @@ export function linear(execution, call, into) {
     const tilePadding = (width) => Math.floor(TEXTURE_WIDTH / width) / out4;
     const legal = (width) => Math.floor(TEXTURE_WIDTH / width) >= out4;
     const wanted = Number(execution.linearTileWidth) || 0;
-    const tileWidth = (!execution.noLinearTile && rowFastest)
+    const candidate = !execution.noLinearTile
       ? (wanted > 0
         ? (legal(wanted) ? wanted : 0)
         : ([4, 2, 8, 16, 32].find((w) => legal(w) && tilePadding(w) <= TILE_PADDING_CAP) ?? 0))
       : 0;
+    // 🔴 AND OFFERING IT PAST THAT CAP IS A MEASURED LOSS - THE REASONING I HAD
+    // AND THE ANSWER I DID NOT. The note above declines the row-block order for
+    // a large x because "the repack's source index strides by the row-block
+    // count"; tiled, that index strides by TILEW instead - 4 rather than 578 at
+    // `4624x1024x256` - so the objection really is gone, and the order was
+    // offered to the float path and past the x-floats cap to find out.
+    // **0.92x**: a bioemu2 fold 24784/24214 ms against 22510/22382 over two
+    // rounds, bit-identical. The tile buys no locality where x is 18.9 MiB, far
+    // past anything a rasterisation tile holds, and still pays for its padded
+    // fragments. **Removing the reason a thing was declined is not evidence
+    // that it now pays.** Reverted, flag and all.
+    const rowFastest = rowFastestClassic;
+    const tileWidth = rowFastest ? candidate : 0;
     const tileHeight = tileWidth > 0 ? Math.ceil(rowQuads / tileWidth) : 0;
     const padX = !execution.noStridePad && !strideDividesWidth(inChannels / 4);
     // 🔴 AND THE PASS RUNS FOR THE NARROWING ALONE, NOT ONLY FOR THE STRIDE -
@@ -790,7 +803,7 @@ export function linear(execution, call, into) {
   // bioemu2 fold at 4752 ms and 212 GFLOP/s, and it re-reads an f32 x once per
   // output group. A shape that is NOT aligned here keeps its f32 x rather than
   // getting a silent re-layout the kernel cannot address.
-  const narrowUnblocked = execution.halfActivations && execution.narrowAlignedX
+  const narrowUnblocked = execution.halfActivations && execution.narrowUnblockedX
     && strideDividesWidth(inChannels / 4);
   const narrowed = narrowUnblocked
     ? padStride(execution, { x, rows, inChannels, label: "linear.x-narrow" })

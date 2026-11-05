@@ -1701,12 +1701,22 @@ the unblocked path, which had no such pass at all) and `linear.block:4624x1024x2
 row width unchanged when it already divides, so on such a shape `padStride` is a pure copy - and with
 `halfActivations`, a pure NARROW. Two conditions widened, and the unblocked path given the pass:
 
-| | fold | against |
-|---|---:|---:|
+| | fold | against | |
+|---|---:|---:|---:|
 | **bioemu2** | **22.45 / 22.46 s** | 26.55 s | **1.18x** |
 | **ESMFold2** | **8.79 s** | 9.53 s | **1.10x** |
 | AlphaFold 3 | 2460-2487 ms | 2365-2393 | **0.96x** |
 | AlphaFold 2 | no change | - | **1.00x** |
+
+🔴 **AND THE TWO HALVES WERE MEASURED TOGETHER UNDER ONE FLAG, WHICH IS NOT A MEASUREMENT OF EITHER.**
+Widening the blocked path's condition and giving the unblocked path its own pass are different
+mechanisms, and combined they read 1.016x - near the run-to-run spread - while the profile had
+`linear:4624x256x512` going 212 to 189 GFLOP/s and `pad-stride` from 5284 calls to 9502, which looks
+exactly like the second one being a net loss. Split into `narrowAlignedX` and `narrowUnblockedX` and
+measured, two rounds each: **neither 23867/23895 ms, blocked-only 22781/22674 (1.05x), unblocked-only
+23658/23643 (1.01x), both 22457/22492 (1.06x)**. Both pay, the blocked half by far the more, and the
+profile's hint was the `--profile` wait artefact its own header warns about. Two mechanisms behind one
+flag is one number that describes neither.
 
 🔴 **AND THE LAST TWO ROWS ARE WHY IT IS A DRIVER DEFAULT AND NOT A BACKEND ONE.** AlphaFold 3 is
 **1.04x SLOWER** with its pLDDT moved 66.533 against 66.525, and AlphaFold 2 gains no time at all
@@ -1721,11 +1731,27 @@ defaults now, `--narrow-aligned-x` and `--no-narrow-aligned-x` override either w
 split in place AF2 reads **0.0353 / 0.0308 / 0.0285 A** and AF3 **2365 ms at pLDDT 66.525** - both
 exactly their figures before any of this. All 48 check-webgl gates are ok.
 
+🔴 **AND THE TILE ORDER PAST ITS `rowFastest` CAP IS 0.92x - THE REASONING I HAD AND THE ANSWER I DID
+NOT.** The two worst rows left are `linear:4624x256x512` at 188.7 GFLOP/s and
+`linear.block:4624x1024x256` at **144.5**, both float `in-major` at 4624 rows and both without the
+tile order, because `rowFastest` is declined above a million x floats. The reason it is declined is
+stated in `linear.js` and is about the REPACK: "the repack's source index strides by the row-block
+count, which is 72 for bioemu2's atom projection and **436** for AF2's pair track". Tiled, that index
+strides by **TILEW** - 4 rather than 578 at that shape - so the objection really is gone, and the
+order was offered to the float path and past the cap to find out.
+
+**0.92x**: a bioemu2 fold **24784/24214 ms against 22510/22382** over two rounds, bit-identical, with
+AF2's differential unmoved at 0.0353 A. The tile buys no locality where x is **18.9 MiB** - far past
+anything a rasterisation tile holds - and still pays for its padded fragments. Reverted, flag and
+all. **Removing the reason a thing was declined is not evidence that it now pays**, and the cap
+happens to be right for a second reason nobody had written down: a tile cannot hold a large x
+whatever the repack does.
+
 **This session's four projection changes, end to end:**
 
 | | before | after | |
 |---|---:|---:|---:|
-| **bioemu2**, 20-step 6MRR-68 | 30.40 s | **22.45 s** | **1.354x** |
+| **bioemu2**, 20-step 6MRR-68 | 30.40 s | **22.39-22.49 s** | **1.354x** |
 | **ESMFold2**, full configuration | 9.70 s | **8.79 s** | **1.103x** |
 | AlphaFold 3 | 2.37 s | 2.37 s | 1.00x |
 | AlphaFold 2 | unchanged, 0.0353 A | - | 1.00x |
