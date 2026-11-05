@@ -64,6 +64,8 @@ webgl/
     structure/initialize.js     the single representation and the identity frame
     structure/sidechain.js      seven torsions a residue, as normalised (x, y) pairs
     structure/geometry.js       atom coordinates from frames and torsions - atom14 and atom37
+    structure/ipa.js            invariant point attention: the one attention whose logits are
+                                a distance - eight draws plus five projections
   heads/
     distogram.js                P(d < 8 A) for every pair - the contact map the page draws
     confidence.js               pLDDT, PAE and the pTM term
@@ -229,8 +231,26 @@ is the fourth column; the quaternion is `(w, x, y, z)` and is used UNNORMALISED;
 translation carries a factor of **10**; only groups 5, 6 and 7 chain; and the torsion mixes columns
 1 and 2 with `(sine, cosine)` in that order.
 
-Still to come in it: the iteration core - invariant point attention, 7 kernels, the last AF2 stage.
-After AF2: AF3's pairformer and diffusion, ESMFold2, bioemu2.
+**Invariant point attention matches at 2.14e-7** - the hardest kernel group in AF2 and the stage
+with the most ways to be plausibly wrong, since every one of its conventions produces a finite
+update of the right shape when broken:
+
+- the point term is **subtracted** and is a **squared** distance, scaled by a **softplus** of a
+  trained per-head parameter, so the weight is positive however it trained and the logit falls as
+  the points separate
+- the three scale factors are `sqrt(1/(3*scalarQk))`, `sqrt(1/(3*pointQk*4.5))` and `sqrt(1/3)`,
+  and the **4.5** cannot be guessed
+- the local point layout is `[residue][component][head][point]` - the three components a plane
+  apart, not adjacent - while the global one is `[residue][head][point][xyz]`
+- the point feature is summed in global space and rotated back into the **query's** frame, which is
+  what makes it invariant, with a fourth plane holding the vector's norm guarded at 1e-8
+
+Its three feature blocks get their own tensors and a gather assembles the row, because they occupy
+disjoint ranges whose boundaries are not texel-aligned.
+
+Still to come in AF2: the iteration core that wraps the IPA (the post-attention transition and the
+backbone frame update), the input embedder, the template stack and the multimer. After that: AF3's
+pairformer and diffusion, ESMFold2, bioemu2.
 
 Every operation so far is checked against TWO references - an f64 CPU one written from the
 operation, and the WGSL kernel run in the same page - because a single reference cannot say which
