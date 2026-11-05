@@ -198,9 +198,22 @@ from there 6MRR's mse goes 33.3 -> 12.8 in 40 steps. The Fourier noise embedding
   | GH200 96 GB, `--offload-pairs` | | | | 9.5 s, 47.3 GB | | 16.7 s, 72.4 GB |
   | GH200, OpenFold3 PyTorch | 6.2 s, 27.3 GiB | 10.0 s, 45.7 GiB | 16.2 s, 70.1 GiB | out of memory | | |
 
-  And on the GH200 with every change (`--offload-pairs --bf16-confidence --sample-batch=4`): 1024 tokens 16.7 s and
-  49.2 GB, 1280 tokens 27.1 s and 71.0 GB, 1536 tokens 43.4 s and 94.0 GB - twice the crop it took before, and 2.4x
-  OpenFold3's 640.
+  On the GH200 (96 GB), a training step at each crop: OpenFold3's PyTorch (`bench_of3_torch.py --precision=bf16`,
+  its allocator's peak) against train-of3 (`--tf32 --bf16 --offload-pairs --bf16-confidence --sample-batch=4`, the
+  device's peak as the driver reports it, context included), 1024 MSA rows, 48 samples, no recycles:
+
+  | tokens | OpenFold3 PyTorch | train-of3 | speedup |
+  |---|---|---|---|
+  | 256 | 4.3 s, 14.1 GiB | 2.0 s, 12.9 GiB | 2.1x |
+  | 384 | 6.2 s, 27.3 GiB | 3.1 s, 16.2 GiB | 2.0x |
+  | 512 | 10.0 s, 45.7 GiB | 4.6 s, 20.4 GiB | 2.2x |
+  | 640 | 16.2 s, 70.1 GiB | 6.9 s, 25.7 GiB | 2.3x |
+  | 768 | out of memory | 9.7 s, 31.5 GiB | |
+  | 896 | out of memory | 12.9 s, 39.2 GiB | |
+  | 1024 | | 16.7 s, 48.0 GiB | |
+  | 1280 | | 27.1 s, 69.3 GiB | |
+  | 1536 | | 43.4 s, 91.8 GiB | |
+  | 1792 | | out of memory | |
 
   What is left at 640 tokens on the A100 (28.9 GB): 9.8 GB the parameters, Adam and the EMA; 2.3 GB the step's
   activations; 0.9 GB the stream pool; the arena's 14.3 GB - the MSA block's backward, the confidence head, a
