@@ -110,7 +110,7 @@ def main():
     for k in oh:
         ours_by_bare.setdefault(k[2:] if k.startswith("w/") else k, k)
 
-    both, only_theirs, shape_diff, rows = 0, [], [], []
+    both, only_theirs, shape_diff, rows, degenerate = 0, [], [], [], []
     for name, entry in sorted(th.items()):
         ok = ours_by_bare.get(name)
         if ok is None:
@@ -127,7 +127,17 @@ def main():
             continue
         num = sum((x - y) * (x - y) for x, y in zip(a, b))
         den = sum(y * y for y in b)
-        rel = (num / den) ** 0.5 if den > 0 else 0.0
+        # 🔴 A ZERO DENOMINATOR IS REPORTED, NOT SCORED 0.0. `rel = ... if den > 0 else 0.0` hands a
+        # PERFECT score to a tensor that was never compared - an empty one, or one whose sampled values
+        # are all zero (a zeroed bias is ordinary) - which is this tree's own documented trap, "an
+        # unguarded relRMS over a non-array returns exactly 0". Checked against the checkpoint this was
+        # run on: 0 of 558 tensors are empty and 0 are all-zero, so no reported number changes; the guard
+        # is for the next checkpoint, where silence would read as agreement.
+        if den <= 0:
+            degenerate.append(f"{name}: denominator 0 over {len(a)} sampled "
+                              f"({'empty' if not a else 'all-zero'}) - NOT scored")
+            continue
+        rel = (num / den) ** 0.5
         both += 1
         rows.append((rel, name, len(a)))
 
@@ -142,6 +152,10 @@ def main():
         print(f"  !! {len(only_theirs)} of theirs not found on our side: {', '.join(only_theirs[:6])}")
     if shape_diff:
         print(f"  !! {len(shape_diff)} shape mismatches: {shape_diff[0]}")
+    if degenerate:
+        print(f"  !! {len(degenerate)} not comparable (a zero denominator is not a score):")
+        for d in degenerate[:5]:
+            print(f"       {d}")
     if not rows:
         return 1
     for name, label in (("float32", "our F32 vs their fp16 -> THEIR conversion error"),
