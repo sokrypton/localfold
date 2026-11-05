@@ -133,7 +133,12 @@ one-hot one - the MSA stack, the pairformer, the distogram, the denoiser, the co
   and it must come back: 1BRS (three barnase/barstar pairs) 21.7 A as labelled, **0.175 A** permuted; 7BNY (four
   chains, nine sulfates) 37.3 A to 0.174.
 - **diffusion** - `--samples` (48) noised copies of the truth, centred over its resolved atoms, rotated and moved,
-  sigma = 16 exp(-1.2 + 1.5 N(0, 1)).
+  sigma = 16 exp(-1.2 + 1.5 N(0, 1)), batched as OpenFold3 batches them: `--sample-batch` (8) samples a denoiser pass
+  (`denoiseBatchForward`/`Backward`: one pair conditioning - its gradient summed over the samples and backed once -
+  each sample's own noise level in its single conditioning, its atom encoder and decoder, and ONE transformer pass over
+  the samples' tokens, the attention batched with the pair logits shared). `--check-batch` holds it to the samples one
+  at a time: **1.4e-14** in float64 (`train-of3-f64`), the same function; 2e-5 in float32, the batched sums' order. At
+  384 tokens the 48 samples go 3.52 s -> 1.82 s (8 a pass), 1.68 s (16).
 - **the update** - `of3train.cuh`: each example's gradient clipped to norm 10 and accumulated (`grad_manager.py`), each
   parameter averaged over the examples it took part in, Adam (0.9, 0.95, eps 1e-8, no decay) after `--batch` examples
   with `AlphaFoldLRScheduler` (1.8e-3, a 1000-step warmup from 0, x0.95 every 50k past 50k), the EMA (0.999);
@@ -174,7 +179,7 @@ from there 6MRR's mse goes 33.3 -> 12.8 in 40 steps. The Fourier noise embedding
   rollout of 5 x 200 steps, each sample's truth permuted, all-atom lDDT (mean, best, the confidence head's top-ranked).
   The pretrained bundle reads 0.831 on 6MRR and 0.846 on 5K9P from their sequences alone.
 
-Not yet: the denoiser's 48 samples batched (one at a time here: 3.5 s of the 6.9).
+
 
 🔴 **THE DENOISER'S 4e-4 IS THE PORT'S ROUNDING, AND IT WAS SHOWN RATHER THAN ASSUMED.** boltz2 reads 4.1e-4 against
 `denoise()` and openbind0 2.0e-4, where every seam up to the encoder's skip is 1e-6 or under. Three measurements put it

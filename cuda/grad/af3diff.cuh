@@ -167,9 +167,10 @@ struct DiffBlockSave {
   AzSave z1, z2;
   real* lse = nullptr;   // the attention's logit max and log-sum, kept for its backward
 };
-inline Sdpa tokenSdpa(const DiffBlock& b, int n, const real* mask, const real* pl, real* dpl = nullptr) {
+// (S samples batched: queries [S n] rows, the key mask [S n], the pair logits one set every sample reads)
+inline Sdpa tokenSdpa(const DiffBlock& b, int n, const real* mask, const real* pl, real* dpl = nullptr, int S = 1) {
   Sdpa a;
-  a.B = 1; a.H = b.H; a.Q = n; a.K = n; a.D = b.D; a.scale = 1 / sqrt((real)b.D);
+  a.B = S; a.H = b.H; a.Q = n; a.K = n; a.D = b.D; a.scale = 1 / sqrt((real)b.D);
   a.keyMask = mask;
   a.bias[0] = Bias{pl, 0, (long long)n * n, n, dpl};
   return a;
@@ -193,10 +194,11 @@ __global__ void swigluUpBwdK(const real* wide, const real* up, const real* dg, r
   if (dup) dup[t] = d * a * s * b;
 }
 
-// act [n, C] -> out [n, C]
+// act [n, C] -> out [n, C]; S samples batched: act, cond and mask [S n, ...], one set of pair logits
 inline DiffBlockSave diffBlockForward(const DiffTransformer& t, const DiffBlock& b, const real* act, const real* cond,
-                                      const real* mask, const real* pl, real* out, int n) {
+                                      const real* mask, const real* pl, real* out, int nTok, int S = 1) {
   const int C = b.C, HD = b.H * b.D, I = b.I;
+  const int n = nTok * S;     // (the rows every row-wise operation runs over)
   DiffBlockSave s{};
   real* x = ARENA.get((size_t)n * C);
   s.a1 = adaForward(b.ln1, act, cond, x, n);
@@ -210,7 +212,7 @@ inline DiffBlockSave diffBlockForward(const DiffTransformer& t, const DiffBlock&
   b.v.forward(x, v, n); b.gate.forward(x, g, n);
   sigmoidK<<<blocks((size_t)n * HD), 256, 0, STREAM>>>(g, (size_t)n * HD);
   s.o = ARENA.get((size_t)n * HD);
-  { const Sdpa sd_ = tokenSdpa(b, n, mask, pl); s.lse = ARENA.get((size_t)2 * sd_.B * sd_.H * sd_.Q); sdpaForward(sd_, q, HD, k, HD, v, HD, s.o, HD, s.lse); }
+  { const Sdpa sd_ = tokenSdpa(b, nTok, mask, pl, nullptr, S); s.lse = ARENA.get((size_t)2 * sd_.B * sd_.H * sd_.Q); sdpaForward(sd_, q, HD, k, HD, v, HD, s.o, HD, s.lse); }
   s.og = ARENA.get((size_t)n * HD);
   mulK<<<blocks((size_t)n * HD), 256, 0, STREAM>>>(s.og, s.o, g, (size_t)n * HD);
   s.x1 = ARENA.get((size_t)n * C);
@@ -230,9 +232,10 @@ inline DiffBlockSave diffBlockForward(const DiffTransformer& t, const DiffBlock&
 // dout -> dact (written), dcond (added), dpl (added)
 inline void diffBlockBackward(const DiffTransformer& t, DiffBlock& b, const DiffBlockSave& s, const real* act,
                               const real* cond, const real* mask, const real* pl, const real* dout, real* dact,
-                              real* dcond, real* dpl, int n) {
+                              real* dcond, real* dpl, int nTok, int S = 1) {
   Scratch scratch;
   const int C = b.C, HD = b.H * b.D, I = b.I;
+  const int n = nTok * S;
   real* dx1 = ARENA.get((size_t)n * C);
   GK(cudaMemcpyAsync(dx1, dout, (size_t)n * C * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
   real* dact0 = ARENA.zeros((size_t)n * C);       // rf3: the transition's route to the block input
@@ -260,7 +263,7 @@ inline void diffBlockBackward(const DiffTransformer& t, DiffBlock& b, const Diff
   real *dq = dqkvg, *dk = dq + (size_t)n * HD, *dv = dk + (size_t)n * HD, *dgt = dv + (size_t)n * HD;
   real* dO = ARENA.get((size_t)n * HD);
   gateBwdK<<<blocks((size_t)n * HD), 256, 0, STREAM>>>(dog, s.o, g, dO, dgt, (size_t)n * HD);
-  sdpaBackward(tokenSdpa(b, n, mask, pl, dpl), q, HD, k, HD, v, HD, dO, HD, dq, HD, dk, HD, dv, HD, false, false, false, s.o, HD, s.lse);
+  sdpaBackward(tokenSdpa(b, nTok, mask, pl, dpl, S), q, HD, k, HD, v, HD, dO, HD, dq, HD, dk, HD, dv, HD, false, false, false, s.o, HD, s.lse);
   real* x = ARENA.get((size_t)n * C);
   {
     real* sh = ARENA.get((size_t)n * C);
@@ -298,21 +301,23 @@ struct DiffRun {
   std::vector<real*> acts;         // [blocks + 1]
   real *pn = nullptr, *pl = nullptr;   // LN'd pair [nn, Cz]; every block's logits [blocks][H, n, n]
   LnSave pln;
-  int n = 0;
+  int n = 0, S = 1;     // tokens, and samples batched
 };
+// S samples batched: act, cond, mask and out [S n, ...] (each sample's own noise level in its cond rows), the pair
+// conditioning one for all - its logits computed once and read by every sample
 inline void transformerForward(DiffTransformer& t, DiffRun& r, const real* act, const real* cond, const real* mask,
-                               const real* pairCond, real* out, int n) {
+                               const real* pairCond, real* out, int n, int S = 1) {
   const Arena::Mark m0 = ARENA.mark();   // the caller's arena is kept: this scopes its own use
-  const size_t nn = (size_t)n * n;
+  const size_t nn = (size_t)n * n, rows = (size_t)n * S;
   const int nb = (int)t.blocks.size();
-  if (r.n != n || r.acts.empty()) {
+  if (r.n != n || r.S != S || r.acts.empty()) {
     for (real* p : r.acts) GK(cudaFree(p));
     if (r.pn) { GK(cudaFree(r.pn)); GK(cudaFree(r.pl)); }
     r.acts.assign(nb + 1, nullptr);
-    for (auto& p : r.acts) GK(cudaMalloc(&p, (size_t)n * t.C * sizeof(real)));
+    for (auto& p : r.acts) GK(cudaMalloc(&p, rows * t.C * sizeof(real)));
     GK(cudaMalloc(&r.pn, nn * t.Cz * sizeof(real)));
     GK(cudaMalloc(&r.pl, (size_t)nb * t.H * nn * sizeof(real)));
-    r.n = n;
+    r.n = n; r.S = S;
   }
   ARENA.rewind(m0);
   {
@@ -324,31 +329,31 @@ inline void transformerForward(DiffTransformer& t, DiffRun& r, const real* act, 
       superBiasK<<<blocks(nn * t.H), 256, 0, STREAM>>>(flat, r.pl + (size_t)b * t.H * nn, n, t.H, t.perSuper, b % t.perSuper, false);
     }
   }
-  GK(cudaMemcpyAsync(r.acts[0], act, (size_t)n * t.C * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
+  GK(cudaMemcpyAsync(r.acts[0], act, rows * t.C * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
   for (int b = 0; b < nb; ++b) {
     ARENA.rewind(m0);
-    diffBlockForward(t, t.blocks[b], r.acts[b], cond, mask, r.pl + (size_t)b * t.H * nn, r.acts[b + 1], n);
+    diffBlockForward(t, t.blocks[b], r.acts[b], cond, mask, r.pl + (size_t)b * t.H * nn, r.acts[b + 1], n, S);
   }
   ARENA.rewind(m0);
-  GK(cudaMemcpyAsync(out, r.acts[nb], (size_t)n * t.C * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
+  GK(cudaMemcpyAsync(out, r.acts[nb], rows * t.C * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
 }
 // dout -> dact (written), dcond (added), dpairCond (added)
 inline void transformerBackward(DiffTransformer& t, DiffRun& r, const real* cond, const real* mask,
                                 const real* pairCond, const real* dout, real* dact, real* dcond, real* dpairCond) {
   const Arena::Mark m0 = ARENA.mark();
-  const int n = r.n, nb = (int)t.blocks.size();
-  const size_t nn = (size_t)n * n;
+  const int n = r.n, S = r.S, nb = (int)t.blocks.size();
+  const size_t nn = (size_t)n * n, rows = (size_t)n * S;
   real *dx, *dpl, *tmp;
-  GK(cudaMalloc(&dx, (size_t)n * t.C * sizeof(real)));
-  GK(cudaMalloc(&tmp, (size_t)n * t.C * sizeof(real)));
+  GK(cudaMalloc(&dx, rows * t.C * sizeof(real)));
+  GK(cudaMalloc(&tmp, rows * t.C * sizeof(real)));
   GK(cudaMalloc(&dpl, (size_t)nb * t.H * nn * sizeof(real)));
   GK(cudaMemsetAsync(dpl, 0, (size_t)nb * t.H * nn * sizeof(real), STREAM));
-  GK(cudaMemcpyAsync(dx, dout, (size_t)n * t.C * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
+  GK(cudaMemcpyAsync(dx, dout, rows * t.C * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
   for (int b = nb; b-- > 0;) {
     ARENA.rewind(m0);
     const real* pl = r.pl + (size_t)b * t.H * nn;
-    DiffBlockSave s = diffBlockForward(t, t.blocks[b], r.acts[b], cond, mask, pl, tmp, n);
-    diffBlockBackward(t, t.blocks[b], s, r.acts[b], cond, mask, pl, dx, dx, dcond, dpl + (size_t)b * t.H * nn, n);
+    DiffBlockSave s = diffBlockForward(t, t.blocks[b], r.acts[b], cond, mask, pl, tmp, n, S);
+    diffBlockBackward(t, t.blocks[b], s, r.acts[b], cond, mask, pl, dx, dx, dcond, dpl + (size_t)b * t.H * nn, n, S);
   }
   ARENA.rewind(m0);
   {
@@ -366,7 +371,7 @@ inline void transformerBackward(DiffTransformer& t, DiffRun& r, const real* cond
     lnBackward(t.pairNorm, ls, dpn, dpairCond, nn, true);
   }
   ARENA.rewind(m0);
-  GK(cudaMemcpyAsync(dact, dx, (size_t)n * t.C * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
+  GK(cudaMemcpyAsync(dact, dx, rows * t.C * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
   GK(cudaStreamSynchronize(STREAM));
   GK(cudaFree(dx)); GK(cudaFree(tmp)); GK(cudaFree(dpl));
 }

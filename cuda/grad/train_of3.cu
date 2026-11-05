@@ -608,6 +608,8 @@ static of3::Layout layoutOf(const Example& e) {
 
 int main(int argc, char** argv) {
   std::string bundle = "model-openbind0-f32", family = "openbind0", examplesPath, savePath, resumePath;
+  int sampleBatch = 8;   // the diffusion samples a denoiser pass (--sample-batch)
+  int checkBatch = -1;
   int steps = 30, samples = 48, batch = 1, crop = 384, saveEvery = 0, checkCkpt = -1, checkPerm = -1, checkBf16 = -1, checkConfs = -1; std::string init = "bundle";
   bool dropout = true, dropInFixed = false, bf16Trunk = false;
   int world = 1, rank = 0; std::string dp = "nccl", rendezvous;      // data parallel (of3dist.cuh)
@@ -621,6 +623,8 @@ int main(int argc, char** argv) {
     else if (auto v = opt("--examples=")) examplesPath = v;
     else if (auto v = opt("--steps=")) steps = atoi(v);
     else if (auto v = opt("--samples=")) samples = atoi(v);
+    else if (auto v = opt("--sample-batch=")) sampleBatch = std::max(1, atoi(v));
+    else if (auto v = opt("--check-batch=")) checkBatch = atoi(v);
     else if (auto v = opt("--batch=")) batch = std::max(1, atoi(v));
     else if (auto v = opt("--crop=")) crop = atoi(v);
     else if (auto v = opt("--seed=")) seed = (unsigned)atoi(v);
@@ -1216,37 +1220,62 @@ int main(int argc, char** argv) {
     }
     std::vector<double> gmLoss(e.gm); if (!lossAtom.empty()) for (size_t i = 0; i < A; ++i) gmLoss[i] *= lossAtom[i];
     of3dev::SmoothLddt sl; sl.init(Lay, e.xt, gmLoss);   // (smooth LDDT, quadratic in atoms, on the device)
-    for (int smp = 0; smp < nSamples; ++smp) {
+    // the samples in chunks of --sample-batch: one batched denoiser pass a chunk (af3denoise.cuh's denoiseBatchForward:
+    // one pair conditioning, the transformer over the chunk's samples at once), each sample's draws as they were
+    const int SB = std::max(1, sampleBatch);
+    for (int s0 = 0; s0 < nSamples; s0 += SB) {
       g::Scratch sc;
-      const double sigma = fixed ? sd * exp(-1.2 + 1.5 * (-1.0 + 2.0 * smp / std::max(1, nSamples - 1))) : sd * exp(-1.2 + 1.5 * N01(gen));
-      // centre_random_augmentation over the resolved atoms (the unresolved at the origin), then the noise
-      double R[3][3]; std::normal_distribution<double> nd(0, 1); rotation(nd, gen, R);
-      double cen[3] = {0, 0, 0}; for (size_t i = 0; i < A; ++i) if (e.gm[i] > 0) for (int q = 0; q < 3; ++q) cen[q] += e.xt[i * 3 + q] / std::max<size_t>(nRes, 1);
-      const double tr[3] = {nd(gen), nd(gen), nd(gen)};
-      std::vector<double> xn(A * 3, 0);
-      for (size_t i = 0; i < A; ++i) {
-        if (!(e.predMask[i] > 0)) continue;
-        for (int p = 0; p < 3; ++p) {
-          double v = 0;
-          if (e.gm[i] > 0) { v = tr[p]; for (int q = 0; q < 3; ++q) v += R[p][q] * (e.xt[i * 3 + q] - cen[q]); }
-          xn[i * 3 + p] = v + sigma * nd(gen);
+      const int S = std::min(SB, nSamples - s0);
+      std::vector<double> sig(S);
+      std::vector<g::real*> xin(S), xout(S), dxd(S);
+      for (int k = 0; k < S; ++k) {
+        const int smp = s0 + k;
+        const double sigma = fixed ? sd * exp(-1.2 + 1.5 * (-1.0 + 2.0 * smp / std::max(1, nSamples - 1))) : sd * exp(-1.2 + 1.5 * N01(gen));
+        sig[k] = sigma;
+        // centre_random_augmentation over the resolved atoms (the unresolved at the origin), then the noise
+        double R[3][3]; std::normal_distribution<double> nd(0, 1); rotation(nd, gen, R);
+        double cen[3] = {0, 0, 0}; for (size_t i = 0; i < A; ++i) if (e.gm[i] > 0) for (int q = 0; q < 3; ++q) cen[q] += e.xt[i * 3 + q] / std::max<size_t>(nRes, 1);
+        const double tr[3] = {nd(gen), nd(gen), nd(gen)};
+        std::vector<g::real> xn(A * 3, 0);
+        for (size_t i = 0; i < A; ++i) {
+          if (!(e.predMask[i] > 0)) continue;
+          for (int p = 0; p < 3; ++p) {
+            double v = 0;
+            if (e.gm[i] > 0) { v = tr[p]; for (int q = 0; q < 3; ++q) v += R[p][q] * (e.xt[i * 3 + q] - cen[q]); }
+            xn[i * 3 + p] = (g::real)(v + sigma * nd(gen));
+          }
         }
+        xin[k] = g::ARENA.get(A * 3); xout[k] = g::ARENA.get(A * 3); dxd[k] = g::ARENA.get(A * 3);
+        GK(cudaMemcpy(xin[k], xn.data(), xn.size() * sizeof(g::real), cudaMemcpyHostToDevice));
       }
-      { std::vector<g::real> r(xn.begin(), xn.end()); GK(cudaMemcpy(xD, r.data(), r.size() * sizeof(g::real), cudaMemcpyHostToDevice)); }
-      auto ds = g::af3::denoiseForward(dn, d.b, a.singles[nPf], a.pairs[nMsa + nPf], a.tf, d.seqMask, xD, (g::real)sigma, d.ri, d.ti, d.asym, d.ent, d.sym, xo);
-      auto xh = g::host(xo, A * 3);
-      std::vector<double> xp(xh.begin(), xh.end()), dx(A * 3, 0);
-      const auto tl = std::chrono::steady_clock::now();
-      auto D = of3::diffusionLoss(Lay, xp, e.xt, e.gm, sigma, DW, &dx, 1.0 / nSamples,
-                                  [&](double sc, std::vector<double>* g) { return sl.run(xp, sc, train ? g : nullptr, STREAM); },
-                                  lossAtom.empty() ? nullptr : &lossAtom);
-      tLoss += msOf(tl, std::chrono::steady_clock::now());
-      L.mse += D.mse / nSamples; L.bond += D.bond / nSamples; L.lddt += D.lddt / nSamples; L.diffusion += D.total / nSamples;
-      if (train) {
+      // (--sample-batch=1: the one-sample path, denoiseForward - the batched path's reference)
+      g::af3::DenoiseSave one{};
+      g::af3::DenoiseBatch batch;
+      if (SB == 1) one = g::af3::denoiseForward(dn, d.b, a.singles[nPf], a.pairs[nMsa + nPf], a.tf, d.seqMask, xin[0], (g::real)sig[0], d.ri, d.ti, d.asym, d.ent, d.sym, xout[0]);
+      else {
+        std::vector<const g::real*> xs(xin.begin(), xin.end());
+        std::vector<g::real> sg(sig.begin(), sig.end());
+        batch = g::af3::denoiseBatchForward(dn, d.b, a.singles[nPf], a.pairs[nMsa + nPf], a.tf, d.seqMask, xs, sg, d.ri, d.ti, d.asym, d.ent, d.sym, xout);
+      }
+      for (int k = 0; k < S; ++k) {
+        auto xh = g::host(xout[k], A * 3);
+        std::vector<double> xp(xh.begin(), xh.end()), dx(A * 3, 0);
+        const auto tl = std::chrono::steady_clock::now();
+        auto D = of3::diffusionLoss(Lay, xp, e.xt, e.gm, sig[k], DW, &dx, 1.0 / nSamples,
+                                    [&](double sc_, std::vector<double>* g) { return sl.run(xp, sc_, train ? g : nullptr, STREAM); },
+                                    lossAtom.empty() ? nullptr : &lossAtom);
+        tLoss += msOf(tl, std::chrono::steady_clock::now());
+        L.mse += D.mse / nSamples; L.bond += D.bond / nSamples; L.lddt += D.lddt / nSamples; L.diffusion += D.total / nSamples;
         std::vector<g::real> r(dx.begin(), dx.end());
-        GK(cudaMemcpy(dxo, r.data(), r.size() * sizeof(g::real), cudaMemcpyHostToDevice));
+        GK(cudaMemcpy(dxd[k], r.data(), r.size() * sizeof(g::real), cudaMemcpyHostToDevice));
+      }
+      if (train) {
         g::real *ts = g::ARENA.zeros((size_t)n * Cs), *tp = g::ARENA.zeros(nn * Cz), *tfd = g::ARENA.zeros((size_t)n * te.F);
-        g::af3::denoiseBackward(dn, d.b, ds, a.singles[nPf], d.seqMask, dxo, ts, tp, tfd, nullptr);
+        if (SB == 1) g::af3::denoiseBackward(dn, d.b, one, a.singles[nPf], d.seqMask, dxd[0], ts, tp, tfd, nullptr);
+        else {
+          std::vector<const g::real*> douts(dxd.begin(), dxd.end());
+          g::af3::denoiseBatchBackward(dn, d.b, batch, a.singles[nPf], douts, ts, tp, tfd, {});
+        }
         g::add(dTs, ts, (size_t)n * Cs); g::add(dTp, tp, nn * Cz); g::add(dTf, tfd, (size_t)n * te.F);
       }
     }
@@ -1382,6 +1411,33 @@ int main(int argc, char** argv) {
     const bool ok = pairs > 0 && rms < 0.05 && worst < 0.2 && moved > live / 10;
     printf("conformers: %zu of %zu atoms placed differently from the featuriser's conformer; %zu bonded pairs, rms %.4f A, worst %.3f A  %s\n",
            moved, live, pairs, rms, worst, ok ? "PASS" : "FAIL");
+    if (!ok) return 1;
+  }
+  // --check-batch=k: example k (whole, fixed draws) with its diffusion samples one at a time and --sample-batch at once:
+  // the loss and every gradient compared - the batched pass must be the same function
+  if (checkBatch >= 0) {
+    auto grads = [&](int sbv, double& loss) {
+      const int keep = sampleBatch; sampleBatch = sbv; ps.zeroGrad();
+      std::mt19937_64 gen(99);
+      loss = runExample(examples.at(checkBatch), true, true, 8, gen).first.diffusion;
+      sampleBatch = keep;
+      std::vector<double> all;
+      for (auto* p : ps.all) { auto h = g::host(p->g, p->n); all.insert(all.end(), h.begin(), h.end()); }
+      return all;
+    };
+    double l1, lb, l1b;
+    const auto a1 = grads(1, l1), ab = grads(std::max(2, sampleBatch), lb), a1b = grads(1, l1b);
+    auto rel = [](const std::vector<double>& x, const std::vector<double>& y) {
+      double num = 0, den = 0; for (size_t i = 0; i < x.size(); ++i) { num += (x[i] - y[i]) * (x[i] - y[i]); den += y[i] * y[i]; }
+      return std::sqrt(num / std::max(den, 1e-300));
+    };
+    const double e = rel(ab, a1), floor = rel(a1b, a1);
+    // (the same function: in float64 the two agree to 1.4e-14; in float32 the batched GEMMs and atomics sum in another
+    // order, 2e-5 on 6MRR, so the bar there is a reordering's)
+    const double bar = sizeof(g::real) == 8 ? std::max(4 * floor, 1e-12) : std::max(4 * floor, 1e-4);
+    const bool ok = std::fabs(lb - l1) <= 1e-5 * std::fabs(l1) && e < bar;
+    printf("batched diffusion samples (%d a pass): loss %.8f against one at a time %.8f; every gradient relRMS %.3e (two one-at-a-time runs: %.3e)  %s\n",
+           std::max(2, sampleBatch), lb, l1, e, floor, ok ? "PASS" : "FAIL");
     if (!ok) return 1;
   }
   // --check-perm=k: example k whole, its truth disguised - each repeated molecule's copies relabelled cyclically, every

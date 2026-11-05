@@ -37,6 +37,7 @@ build cuda/grad/test-af2model -O1 cuda/grad/test_af2model.cu
 build cuda/grad/test-af2model-f64 -O2 -DGRAD_F64 cuda/grad/test_af2model.cu
 build cuda/grad/train-af2-smoke -O2 cuda/grad/train_af2_smoke.cu
 build cuda/grad/train-of3 -O2 --default-stream per-thread cuda/grad/train_of3.cu -lnccl
+build cuda/grad/train-of3-f64 -O2 -DGRAD_F64 --default-stream per-thread cuda/grad/train_of3.cu -lnccl
 build cuda/grad/test-of3loss -O2 cuda/grad/test_of3loss.cu
 build cuda/grad/test-af2tmpl-f64 -O2 -DGRAD_F64 cuda/grad/test_af2tmpl.cu
 build cuda/grad/test-plm -O2 cuda/grad/test_plm.cu
@@ -155,6 +156,9 @@ for fb in "model-af3-full-f32 af3" "model-boltz2-f32 boltz2" "model-protenix2-f3
       tools/fixtures/6mrr-crystal.pdb > $ex/truth.txt
     echo "$in $ex/truth.txt resolution=1.18" > $ex/example.txt
     run cuda/grad/train-of3 --bundle=$1 --family=$2 --examples=$ex/example.txt --steps=20 --samples=4 --lr=1e-4 --warmup=1 --check-ckpt=0 --smoke
+    # the batched diffusion samples against one at a time: the same function to 1e-14 in float64, a reordering in float32
+    run cuda/grad/train-of3-f64 --bundle=$1 --family=$2 --examples=$ex/example.txt --steps=0 --check-batch=0 --sample-batch=8
+    run cuda/grad/train-of3 --bundle=$1 --family=$2 --examples=$ex/example.txt --steps=0 --check-batch=0 --sample-batch=8
     # the truth's permutation (AF3 SI 4.2) on 1BRS - three barnase/barstar pairs - disguised and recovered; the example
     # builder wants gemmi and RDKit (~/venv)
     if [ -x "$HOME/venv/bin/python" ]; then
