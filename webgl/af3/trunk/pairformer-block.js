@@ -132,6 +132,63 @@ export function releasePairformerBlockWeights(execution, weights) {
 }
 
 /**
+ * The five PAIR sub-layers, in order - which is also the whole of a TEMPLATE
+ * stack block.
+ *
+ * 🔴 THE TEMPLATE STACK'S BLOCK IS THIS, NOT A FOURTH VARIANT. `templateBlock`
+ * in `cpu/af3/trunk/template.js` runs exactly these five on exactly this order,
+ * at the template stack's own channel width and its own transition factor - so
+ * it is one function rather than a copy, and the one thing that differs (the
+ * factor, 2 for the template stack against 4 for the trunk) is derived from the
+ * weight inside `transition`.
+ *
+ * Note this is NOT the AF2 template stack's order: that one attends first. The
+ * two models disagree, and `webgl/af2/evoformer/block.js` carries the switch.
+ *
+ * @param {import("../../runtime/execution.js").Execution} execution
+ * @param {{pair: Tensor, pairMask: Tensor, tokens: number, channels: number,
+ *   weights: any, swapTransposedBias?: boolean, divideByLength?: boolean,
+ *   epsilon?: number}} call
+ * @param {boolean} [ownsPair] true when the caller's `pair` may be released
+ * @returns {Tensor}
+ */
+export function pairHalf(execution, call, ownsPair = false) {
+  const {
+    pairMask, tokens, channels, weights: w,
+    swapTransposedBias = false, divideByLength = false, epsilon = 1e-5,
+  } = call;
+  let pair = call.pair;
+  let own = ownsPair;
+  const residual = (current, update) => {
+    const next = add(execution, current, update);
+    execution.release(update);
+    if (own) execution.release(current);
+    own = true;
+    return next;
+  };
+  for (const direction of ["outgoing", "incoming"]) {
+    const group = direction === "outgoing"
+      ? w.triangleMultiplicationOutgoing : w.triangleMultiplicationIncoming;
+    pair = residual(pair, triangleMultiplication(execution, {
+      pair, mask: pairMask, weights: group,
+      length: tokens, channels,
+      direction: /** @type {any} */ (direction), divideByLength, epsilon,
+    }));
+  }
+  for (const [group, transpose] of [[w.pairAttention1, false], [w.pairAttention2, true]]) {
+    pair = residual(pair, gridSelfAttention(execution, {
+      pair, mask: pairMask, weights: group,
+      length: tokens, channels,
+      transpose: /** @type {any} */ (transpose), swapTransposedBias, epsilon,
+    }));
+  }
+  pair = residual(pair, transition(execution, {
+    x: pair, weights: w.pairTransition, rows: tokens * tokens, channels, epsilon,
+  }));
+  return pair;
+}
+
+/**
  * @param {import("../../runtime/execution.js").Execution} execution
  * @param {{pair: Tensor, single: Tensor, pairMask: Tensor, seqMask: Tensor,
  *   tokens: number, weights: ReturnType<typeof uploadPairformerBlockWeights>,
@@ -158,27 +215,10 @@ export function pairformerBlock(execution, call) {
     return next;
   };
 
-  for (const direction of ["outgoing", "incoming"]) {
-    const group = direction === "outgoing"
-      ? w.triangleMultiplicationOutgoing : w.triangleMultiplicationIncoming;
-    pair = residual(pair, triangleMultiplication(execution, {
-      pair, mask: pairMask, weights: group,
-      length: tokens, channels: pairChannels,
-      direction: /** @type {any} */ (direction), divideByLength, epsilon,
-    }), ownPair);
-    ownPair = true;
-  }
-  for (const [group, transpose] of [[w.pairAttention1, false], [w.pairAttention2, true]]) {
-    pair = residual(pair, gridSelfAttention(execution, {
-      pair, mask: pairMask, weights: group,
-      length: tokens, channels: pairChannels,
-      transpose: /** @type {any} */ (transpose), swapTransposedBias, epsilon,
-    }), ownPair);
-    ownPair = true;
-  }
-  pair = residual(pair, transition(execution, {
-    x: pair, weights: w.pairTransition, rows: pairs, channels: pairChannels, epsilon,
-  }), ownPair);
+  pair = pairHalf(execution, {
+    pair, pairMask, tokens, channels: pairChannels, weights: w,
+    swapTransposedBias, divideByLength, epsilon,
+  }, ownPair);
   ownPair = true;
 
   // The single track reads the pair AFTER all five pair updates.
