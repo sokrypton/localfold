@@ -82,6 +82,21 @@
  *                         `in * out >= 65536` threshold rather than on the
  *                         aspect ratio - a threshold fitted with f32 weights
  *                         where every fold uses float16.
+ *   --no-linear-tile      The int5 blocked projection's fragments in the 1D
+ *                         `texel / RQ` order, so a rasterisation tile spans
+ *                         every row block there is - 918 KiB of x under one
+ *                         tile at bioemu2's largest projection - rather than
+ *                         TILEW consecutive row blocks at one output group.
+ *                         1.74-1.87x on that shape in
+ *                         `probe-webgl-linear-operand.js`, which also measures
+ *                         WHY: x binds at 6.5x and the weight codes at 1.0.
+ *                         Bit-identical, so this prices the addressing.
+ *   --linear-tile-width=<n>
+ *                         That tile width, forced. The resolver takes the
+ *                         NARROWEST inside a 2.5x plane-padding budget, because
+ *                         the mapping pads the output group axis to `W / TILEW`
+ *                         and the measured best width would pad AF2's 256
+ *                         outputs sixteenfold; this is how it is swept.
  *   --no-contract-tile    The contraction's channel group taken from the texel
  *                         INDEX rather than from the fragment's x range, so a
  *                         rasterisation tile spans about a hundred channel
@@ -150,6 +165,8 @@ export function webglExecutionOptions(args) {
     noContractPad: flag(args, "no-contract-pad"),
     noContractTile: flag(args, "no-contract-tile"),
     noLinearAspect: flag(args, "no-linear-aspect"),
+    noLinearTile: flag(args, "no-linear-tile"),
+    linearTileWidth: Number(option(args, "linear-tile-width", "0")),
     linearBlockRows: Number(option(args, "block-rows", "0")),
     noPairBiasFast: flag(args, "no-pair-bias-fast"),
     noAttendDot4: flag(args, "no-attend-dot4"),

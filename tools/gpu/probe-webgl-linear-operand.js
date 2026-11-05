@@ -65,6 +65,19 @@
  * ORDER that puts nearby x under one rasterisation tile, which is what was
  * worth 3.29x on the contraction, and NOT a reshaped output tile.
  *
+ * 🔴 AND ITS OWN BASELINE IS A STRAW ONE: READ THE RATIOS, NEVER THE
+ * MILLISECONDS. This probe lays x out UNPADDED where a fold stride-pads it -
+ * 576x896 is 224 texels a row and 224 does not divide 2048, so `linear`'s
+ * `padStride` repacks it and that alone is the 4.08x this tree has measured. So
+ * the shipped arm here reads 18.76 ms where the fold's own profile says 10.63
+ * for the same shape, 1.77x apart, and its `tiled-2` arm's **1.87x was measured
+ * against a baseline whose x reads were misaligned**: the tiling was recovering
+ * an alignment the real kernel already has. Implemented in `linear.js` and
+ * measured in the fold, the same mapping is **1.12x and 1.19x** on the two
+ * kernels and **1.082x** on the whole bioemu2 fold - 30.40 s to 28.10 s,
+ * bit-identical. Real, and half what this probe promised. A probe that does not
+ * reproduce the shipped kernel's own addressing overstates every lever it finds.
+ *
  * 🔴 THE CODE BITS ARE ARBITRARY AND THIS IS NOT A DIFFERENTIAL. It measures
  * TIME at the shipped kernel's exact traffic and arithmetic; the weights decode
  * to whatever those bits mean. `witnessFinite` is there so a run that decoded
@@ -110,7 +123,7 @@ const compile = (gl, kind, source) => {
  * a comment here ends the string. That has happened eight times in this tree.
  */
 const shader = (inChannels, outChannels, rowsPerFragment, outsPerFragment,
-  rowBlocks, arm) => {
+  rowBlocks, arm, tileWidth = 0) => {
   const R = rowsPerFragment;
   const C = outsPerFragment;
   const quads = C / 4;
@@ -141,9 +154,29 @@ vec4 fetch4(sampler2D tex, int texel) {
 
 void main() {
   int texel = int(gl_FragCoord.y) * W + int(gl_FragCoord.x);
-  // Row block fastest, as the int5 path ships.
+${tileWidth > 0
+    ? `  // 🔴 TILE-AWARE: a rasterisation tile is 2D and linearTexel() is 1D, so a
+  // TILEW-wide run covers TILEW consecutive ROW BLOCKS at ONE output group
+  // instead of ${rowBlocks} of them - the same mapping that was worth 3.29x on
+  // the contraction. ${tileWidth} row blocks is ${tileWidth} * ${rowsPerFragment} rows of x a tile.
+  const int TILEW = ${tileWidth};
+  int lane = texel % TILEW;
+  int group = (texel % W) / TILEW;
+  int q = (texel / W) * TILEW + lane;
+  // 🔴 AND THIS GRID IS PADDED WHERE THE SHIPPED ONE IS NOT, so the arm must
+  // PAY for its padding or it is not comparable: q advances by TILEW a texel
+  // row, so covering ${rowBlocks} row blocks takes ceil(${rowBlocks}/TILEW) rows of W and
+  // the leftover fragments are real draws. They return here instead of wrapping
+  // with a modulo, because wrapping would make them do a second copy of real
+  // work and flatter the arm from the other side.
+  if (q >= RQ || group >= ${outChannels / outsPerFragment}) {
+${Array.from({ length: rowsPerFragment * (outsPerFragment / 4) }, (_, i) =>
+      `    result${i} = vec4(0.0);`).join("\n")}
+    return;
+  }`
+    : `  // Row block fastest, as the int5 path ships.
   int group = texel / RQ;
-  int q = texel - group * RQ;
+  int q = texel - group * RQ;`}
   ${arm === "w-aliased" ? "group = 0;" : "group = group % OUTC;"}
   ${arm === "x-aliased" ? "q = 0;" : "q = q % RQ;"}
   int o0 = group * ${C};
@@ -190,6 +223,19 @@ export async function main(device, args) {
   // comparable: `MAX_DRAW_BUFFERS * 4` output floats a fragment, so R rows by C
   // output channels with R*C = 32 and C a multiple of four. 8x4 is what ships.
   const budget = targets * 4;
+  // 🔴 THE TILE-AWARE ARMS, which the aspect sweep's nulls point at. A tile must
+  // hold every output group the mapping gives a texel ROW, so TILEW is at most
+  // `W / outputGroups`; a wider one would alias two groups onto one texel.
+  const tileWidths = (option(args, "tile-widths", "") !== ""
+    ? option(args, "tile-widths", "").split(",").map(Number)
+    : [2, 4, 8]).filter((t) => t > 0);
+  // 🔴 AND THE BOUND IS ENFORCED, NOT STATED. Written as a comment alone it let
+  // `tiled-8` through at 1792 outputs: W/8 is 256 group slots against 448
+  // output groups, so the mapping capped `group` at 255 and the arm computed
+  // 57% of the work and reported 104 GFLOP/s as though it were comparable. The
+  // tell was `wastedFragments` going NEGATIVE - an arm whose grid is smaller
+  // than its own useful work is not a measurement.
+  const outputGroups = Math.ceil(outChannels / 4);
   const aspects = (option(args, "tiles", "") !== ""
     ? option(args, "tiles", "").split(",")
     : ["8x4", "4x8", "2x16", "1x32"]).map((spec) => {
@@ -254,9 +300,16 @@ export async function main(device, args) {
 
   // A viewport that covers the widest arm's fragments in the backend's own
   // 2048 rows; a narrower arm draws the same grid and masks with `% RQ`.
-  const maxFragments = Math.max(...aspects.map(
-    (a) => Math.ceil(rows / a.R) * (outChannels / a.C)));
-  const height = Math.ceil(maxFragments / W);
+  const extentFor = (R, C, tileWidth) => {
+    const rowBlocks = Math.ceil(rows / R);
+    const height = tileWidth > 0
+      ? Math.ceil(rowBlocks / tileWidth)
+      : Math.ceil(rowBlocks * (outChannels / C) / W);
+    return { height, fragments: height * W, useful: rowBlocks * (outChannels / C) };
+  };
+  const height = Math.max(...aspects.map((a) => extentFor(a.R, a.C, 0).height),
+    ...tileWidths.map((t) => extentFor(8, 4, t).height));
+  if (!(outputGroups > 0)) throw new Error("no output groups");
   const ring = Array.from({ length: iterations }, () => {
     const framebuffer = gl.createFramebuffer();
     gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
@@ -275,20 +328,31 @@ export async function main(device, args) {
   });
 
   const arms = [];
+  const refusals = [];
   for (const { spec, R, C } of aspects) {
     const rowBlocks = Math.ceil(rows / R);
-    const fragments = rowBlocks * (outChannels / C);
-    const flops = fragments * R * C * inChannels * 2;
     const xBytes = (outChannels / C) * rows * inChannels * 4;
     const codeBytes = rowBlocks * groups * INT5_GROUP_WORDS * 4;
     // The aliasing arms only ever run on the shipped aspect: they answer which
     // STREAM binds, and the sweep answers what to do about it.
-    const armNames = spec === "8x4" ? ["shipped", "x-aliased", "w-aliased"] : ["shipped"];
+    const legal = tileWidths.filter((t) => Math.floor(W / t) >= outChannels / C);
+    const refused = tileWidths.filter((t) => !legal.includes(t))
+      .map((t) => `tiled-${t}: W/${t} is ${Math.floor(W / t)} group slots against `
+        + `${outChannels / C} output groups`);
+    refusals.push(...(spec === "8x4" ? refused : []));
+    const armNames = spec === "8x4"
+      ? ["shipped", "x-aliased", "w-aliased", ...legal.map((t) => `tiled-${t}`)]
+      : ["shipped"];
    for (const arm of armNames) {
+    const tileWidth = arm.startsWith("tiled-") ? Number(arm.slice(6)) : 0;
+    const extent = extentFor(R, C, tileWidth);
+    // 🔴 USEFUL FLOPS, NOT DISPATCHED ONES: a padded grid is charged its real
+    // milliseconds and credited only the work the kernel would keep.
+    const flops = extent.useful * R * C * inChannels * 2;
     const program = gl.createProgram();
     gl.attachShader(program, compile(gl, gl.VERTEX_SHADER, VERTEX_SHADER));
     gl.attachShader(program, compile(gl, gl.FRAGMENT_SHADER,
-      shader(inChannels, outChannels, R, C, rowBlocks, arm)));
+      shader(inChannels, outChannels, R, C, rowBlocks, arm, tileWidth)));
     gl.linkProgram(program);
     if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
       throw new Error(`link ${spec} ${arm}: ${gl.getProgramInfoLog(program)}`);
@@ -309,7 +373,7 @@ export async function main(device, args) {
     gl.activeTexture(gl.TEXTURE2);
     gl.bindTexture(gl.TEXTURE_2D, tableTex);
     gl.uniform1i(gl.getUniformLocation(program, "tableTex"), 2);
-    gl.viewport(0, 0, W, height);
+    gl.viewport(0, 0, W, extent.height);
 
     const draw = (i) => {
       gl.bindFramebuffer(gl.FRAMEBUFFER, ring[i % ring.length]);
@@ -334,6 +398,8 @@ export async function main(device, args) {
     arms.push({
       tile: `${R}x${C}`,
       arm,
+      fragments: extent.fragments,
+      wastedFragments: extent.fragments - extent.useful,
       milliseconds: Number(ms.toFixed(3)),
       spread: Number((Math.max(...samples) / Math.min(...samples)).toFixed(2)),
       gigaflops: Number((flops / ms / 1e6).toFixed(0)),
@@ -351,27 +417,31 @@ export async function main(device, args) {
   const binds = xFactor >= 1.3 || wFactor >= 1.3
     ? (xFactor >= wFactor ? "x" : "the weight codes")
     : "neither stream";
-  const sweep = arms.filter((a) => a.arm === "shipped")
-    .map((a) => ({ tile: a.tile, milliseconds: a.milliseconds, gigaflops: a.gigaflops,
+  const sweep = arms.filter((a) => a.arm === "shipped" || a.arm.startsWith("tiled-"))
+    .map((a) => ({ arm: a.arm, tile: a.tile, milliseconds: a.milliseconds,
+      gigaflops: a.gigaflops, wastedFragments: a.wastedFragments,
       factorOverShipped: Number((shipped / a.milliseconds).toFixed(2)) }));
   const best = sweep.reduce((a, b) => (b.milliseconds < a.milliseconds ? b : a));
+  const bestName = best.arm === "shipped" ? `the shipped ${best.tile}` : `${best.arm} at ${best.tile}`;
   return {
     renderer: gl.getParameter(gl.RENDERER),
     maxDrawBuffers: targets,
     shape: `${rows}x${inChannels}x${outChannels}`,
     budget: `${budget} output floats a fragment`,
     arms,
+    refusedTileWidths: refusals,
     sweep,
     xAliasedFactor: Number(xFactor.toFixed(2)),
     wAliasedFactor: Number(wFactor.toFixed(2)),
     binds,
     bestTile: best.tile,
+    bestArm: best.arm,
     bestFactor: best.factorOverShipped,
     verdict: binds === "neither stream"
       ? `NEITHER OPERAND BINDS: aliasing x is ${xFactor.toFixed(2)}x and aliasing the codes `
         + `${wFactor.toFixed(2)}x, so this kernel is issue-bound`
       : `${binds} BINDS at ${xFactor.toFixed(2)}x against the codes' ${wFactor.toFixed(2)}x, `
-        + `and the best aspect of the same budget is ${best.tile} at `
+        + `and the best arm of the same budget is ${bestName} at `
         + `${best.factorOverShipped.toFixed(2)}x the shipped 8x4`,
   };
 }

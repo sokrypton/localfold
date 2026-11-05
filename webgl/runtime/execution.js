@@ -217,6 +217,8 @@ export class Execution {
      * fitted with f32 weights where every fold uses float16.
      */
     this.noLinearAspect = options.noLinearAspect ?? false;
+    this.noLinearTile = options.noLinearTile ?? false;
+    this.linearTileWidth = options.linearTileWidth ?? 0;
     /**
      * The blocked projection's rows a fragment, forced - the control arm for
      * `blockRowsFor`'s fragment floor, and the way to sweep it. 0 leaves the

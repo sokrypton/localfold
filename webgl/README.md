@@ -825,7 +825,7 @@ Every fold is the same job, the same seed and the same settings either side; `--
 
 | fold | before | after | |
 |---|---:|---:|---:|
-| bioemu2, 6MRR 68 tokens, 4 passes, 20 steps | 968 s | **45.9 s** | **21.1x** |
+| bioemu2, 6MRR 68 tokens, 4 passes, 20 steps | 968 s | **28.1 s** | **34.4x** |
 | ...its trunk | 277.7 s | **21.6 s** | 12.8x |
 | ...its 20 denoiser calls | 658 s | **23.3 s** | 28.2x |
 | ESMFold2, 75 residues, 36-block tower, 3 loops, 15 steps | 253 s | **65.0 s** | **3.9x** |
@@ -1595,6 +1595,30 @@ budget, and the traffic model that predicted 1.9x for 2x16 is retracted.** The l
 ORDER that brings nearby x under one rasterisation tile, which is exactly what was worth 3.29x on the
 contraction; it is not a reshaped output tile, and it is not the weight layout.
 
+🔴 **AND THE FRAGMENT ORDER IS 1.082x ON THE FOLD, BIT-IDENTICAL - HALF WHAT THE PROBE PROMISED, AND
+THE SHORTFALL IS THE PROBE'S OWN BASELINE.** `blockedInt5Source` takes a tile width now: ordered
+row-block fastest a TILEW-wide run of texels covers TILEW consecutive row blocks at ONE output group,
+where the 1D `texel / RQ` order gave a rasterisation tile every row block there is. In the probe that
+reads **1.74x and 1.87x** over the shipped order; in the fold it is **1.12x** on `576x896x1792` and
+**1.19x** on `576x768x1920`, and the whole fold goes **30.40 s to 28.10 s** - interleaved, two rounds
+each, spreads of 1.0006, and `caca` 3.8540767531771998 on all four runs.
+
+**The probe overstated it because the probe lays x out UNPADDED and a fold does not.** 576x896 is 224
+texels a row and 224 does not divide 2048, so `linear` runs `padStride` over x - the 4.08x recorded
+further up this file - and the probe's shipped arm reads 18.76 ms where the fold's reads 10.63 for
+the same shape. The tiling was recovering an alignment the shipped kernel already has. **A probe that
+does not reproduce the shipped kernel's own addressing overstates every lever it finds**, and its
+header says so now; read its ratios and never its milliseconds.
+
+The width is the NARROWEST inside a 2.5x plane-padding budget rather than the measured best, because
+the mapping pads the output-group axis to `W / TILEW`: TILEW 2 pads bioemu2's 1792 outputs 2.29x and
+would pad AF2's 256 outputs **sixteenfold**, 4.7 MiB of planes to 75.8. It applies only where
+`rowFastest` already does, which is the order the gain is measured against. `--no-linear-tile` is the
+control arm and `--linear-tile-width=` sweeps it. The other three models do not reach it and are
+unchanged to the digit: ESMFold2 9497/9671 ms against 9668/9671 at the same pLDDT 57.579 and pTM
+0.4147, AF3 2351 ms both ways at pLDDT 66.525, AF2's three recycles 57.938/57.937/57.941 both ways.
+`linear.repack` pays 347 ms of the gain back, reading a plane 2.29x sparser.
+
 ### The threshold that chose between two projection kernels was fitted with the wrong dtype
 
 🔴 **`bench-webgl-linear.js` UPLOADED ITS WEIGHTS WITH `upload`, AND EVERY FOLD USES
@@ -1614,6 +1638,7 @@ largest in-major labels in a bioemu2 fold come out on the **one-texel** side:
 | | before | after | |
 |---|---:|---:|---:|
 | **bioemu2**, 20-step 6MRR-68 | 33.0 s | **30.4 s** | **1.08x** |
+| ...and again, on the tile-aware fragment order below | 30.4 s | **28.1 s** | **1.08x** |
 | bioemu2's trunk | 13.4 s | **10.7 s** | **1.26x** |
 | **ESMFold2**, full configuration | 11.2 s | **9.53 s** | **1.17x** |
 | AlphaFold 3 | 2.36 s | 2.35 s | 1.00x |

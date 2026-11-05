@@ -32,6 +32,7 @@
  * revisit once a block folds.
  */
 import { ONE_TARGET, PRELUDE, targetDeclarations } from "../runtime/execution.js";
+import { TEXTURE_WIDTH } from "../runtime/context.js";
 import {
   INT5_DECODE, INT5_DECODE8, INT5_GROUP, int5DecodeSource,
 } from "../runtime/int5.js";
@@ -443,7 +444,7 @@ ${each((i) => `  result${i} = ${value(i)};`)}
  */
 export const blockedInt5Source = (
   rows, inChannels, outChannels, activation, useBias, roundHalf, blockRows = BLOCK_ROWS,
-  orderRowFastest = true, xStride4 = 0,
+  orderRowFastest = true, xStride4 = 0, tileWidth = 0,
 ) => {
   const each = (template) => Array.from(
     { length: blockRows }, (_, i) => template(i)).join("\n");
@@ -479,13 +480,33 @@ void main() {
   // bound by code-fetch MISSES, not by bandwidth (float16 at 2.3x the bytes
   // took the same time) and not by the x reads (worth 14%) or by occupancy
   // (fewer live registers measured 2% worse).
-${orderRowFastest
-    ? `  int group = texel / RQ;
+${tileWidth > 0
+    ? `  // 🔴 TILE-AWARE, BECAUSE A RASTERISATION TILE IS 2D AND linearTexel() IS 1D.
+  // Ordered row block fastest a TILEW-wide run of texels covers TILEW
+  // consecutive row blocks at ONE output group, where the 1D order gave a tile
+  // every row block there is - 918 KiB of x under one tile at bioemu2's
+  // 576x896x1792 against ${tileWidth} * ${blockRows} rows. The same mapping, and the same
+  // reason, as blockedContractSource; measured by
+  // probe-webgl-linear-operand.js, where x binds at 6.5x and the codes at 1.0.
+  const int TILEW = ${tileWidth};
+  int lane = texel % TILEW;
+  int group = (texel % W) / TILEW;
+  int q = (texel / W) * TILEW + lane;
+  // 🔴 AND THIS GRID IS PADDED, so the tail must write rather than wrap: q
+  // advances by TILEW a texel row, so RQ row blocks take ceil(RQ/TILEW) rows of
+  // W and the leftover fragments are real draws. Wrapping them with a modulo
+  // would make them compute a second copy of real work.
+  if (q >= RQ || group >= OUT4) {
+${each((i) => `    result${i} = vec4(0.0);`)}
+    return;
+  }`
+    : orderRowFastest
+      ? `  int group = texel / RQ;
   int q = texel - group * RQ;`
-    : `  int q = texel / OUT4;
+      : `  int q = texel / OUT4;
   int group = texel - q * OUT4;`}
   int o0 = group * 4;
-  int base = texel < RQ * OUT4 ? q * ${blockRows} : 0;
+  int base = ${tileWidth > 0 ? `q * ${blockRows}` : `texel < RQ * OUT4 ? q * ${blockRows} : 0`};
 ${each((i) => `  int xBase${i} = min(base + ${i}, ROWS - 1) * XSTRIDE4;`)}
 ${each((i) => `  vec4 acc${i} = vec4(0.0);`)}
   for (int g = 0; g < GPR; ++g) {
@@ -521,7 +542,8 @@ ${each((i) => `  result${i} = ${value(i)};`)}
 };
 
 /** Four row planes back into `[rows][outChannels]`: plane `row % 4`, texel `(row / 4) * OUT4 + group`. */
-export const blockRepackSource = (blockRows = BLOCK_ROWS, orderRowFastest = false) => `${PRELUDE}${ONE_TARGET}
+export const blockRepackSource = (blockRows = BLOCK_ROWS, orderRowFastest = false,
+  tileWidth = 0) => `${PRELUDE}${ONE_TARGET}
 uniform int ROWS;
 uniform int OUT4;
 uniform int RQ;
@@ -532,9 +554,12 @@ void main() {
   if (texel >= ROWS * OUT4) { result = vec4(0.0); return; }
   int row = texel / OUT4;
   int group = texel - row * OUT4;
-  int source = ${orderRowFastest
-    ? "group * RQ + (row / " + blockRows + ")"
-    : "(row / " + blockRows + ") * OUT4 + group"};
+  int source = ${tileWidth > 0
+    ? "((row / " + blockRows + ") / " + tileWidth + ") * W + group * " + tileWidth
+      + " + ((row / " + blockRows + ") % " + tileWidth + ")"
+    : orderRowFastest
+      ? "group * RQ + (row / " + blockRows + ")"
+      : "(row / " + blockRows + ") * OUT4 + group"};
   int plane = row - (row / ${blockRows}) * ${blockRows};
 ${Array.from({ length: blockRows - 1 }, (_, i) =>
   `  if (plane == ${i}) { result = fetch4(plane${i}, source); return; }`).join("\n")}
@@ -639,19 +664,45 @@ export function linear(execution, call, into) {
     // every shape whose input width does not - see webgl/runtime/pad-stride.js.
     // One pass over x against sixty milliseconds of cache misses; measured, the
     // WEIGHT does not want this (0.94x) and only x does.
+    // 🔴 THE TILE-AWARE FRAGMENT ORDER, AND ITS WIDTH IS A MEMORY DECISION AS
+    // MUCH AS A LOCALITY ONE. The mapping gives a texel ROW every output group,
+    // so the planes are padded to `W / TILEW` groups where only `OUT4` are
+    // real: at bioemu2's 1792 outputs TILEW 2 pads 2.29x and is what
+    // probe-webgl-linear-operand.js measures at **1.74-1.87x** over the shipped
+    // 1D order, but the same TILEW at AF2's 256 outputs would pad SIXTEENFOLD -
+    // 4.7 MiB of planes to 75.8 - which is not a trade this backend should make
+    // silently. So the width is the NARROWEST that stays inside a 2.5x padding
+    // budget, which prefers the measured 2 and widens for a narrow output
+    // rather than declining to tile at all.
+    //
+    // 🔴 AND ONLY WHERE `rowFastest` ALREADY APPLIES, because that is the order
+    // the 1.87x is measured AGAINST. Pointed at the group-fastest float paths
+    // it would be an unmeasured change to the arm that cost AF2 3.7x.
+    const out4 = Math.ceil(outChannels / 4);
+    const tilePadding = (width) => Math.floor(TEXTURE_WIDTH / width) / out4;
+    const wanted = Number(execution.linearTileWidth) || 0;
+    const tileWidth = (!execution.noLinearTile && rowFastest)
+      ? (wanted > 0
+        ? (tilePadding(wanted) >= 1 ? wanted : 0)
+        : ([2, 4, 8, 16, 32].find((w) => tilePadding(w) >= 1 && tilePadding(w) <= 2.5) ?? 0))
+      : 0;
+    const tileHeight = tileWidth > 0 ? Math.ceil(rowQuads / tileWidth) : 0;
     const padX = !execution.noStridePad && !strideDividesWidth(inChannels / 4);
     const padded = padX
       ? padStride(execution, { x, rows, inChannels, label: "linear.x-stride" })
       : null;
     const xUse = padded?.tensor ?? x;
     const xStride4 = padded?.stride4 ?? 0;
+    const planeFloats = tileWidth > 0
+      ? tileHeight * TEXTURE_WIDTH * 4
+      : rowQuads * outChannels;
     const planes = Array.from({ length: blockRows },
-      (_, i) => execution.allocate(rowQuads * outChannels, `linear.plane${i}`));
+      (_, i) => execution.allocate(planeFloats, `linear.plane${i}`));
     execution.dispatch({
       source: int5
         ? blockedInt5Source(
           rows, inChannels, outChannels, activation, bias !== undefined, roundHalf, blockRows,
-          rowFastest, xStride4)
+          rowFastest, xStride4, tileWidth)
         : blockedSource(
           rows, inChannels, outChannels, activation, bias !== undefined, weightLayout, roundHalf,
           blockRows, rowFastest, xStride4),
@@ -669,10 +720,11 @@ export function linear(execution, call, into) {
         ...(int5 ? { GPR: inChannels / INT5_GROUP } : {}),
       },
       label: `linear.block${int5 ? ".int5" : ""}:${rows}x${inChannels}x${outChannels}`
-        + `:${activation}:${weightLayout}${roundHalf ? ":half" : ""}`,
+        + `:${activation}:${weightLayout}${roundHalf ? ":half" : ""}`
+        + `${tileWidth > 0 ? `:tiled${tileWidth}` : ""}`,
     });
     execution.dispatch({
-      source: blockRepackSource(blockRows, rowFastest),
+      source: blockRepackSource(blockRows, rowFastest, tileWidth),
       output,
       inputs: Object.fromEntries(planes.map((plane, i) => [`plane${i}`, plane])),
       optionalInts: { ROWS: rows, OUT4: Math.ceil(outChannels / 4), RQ: rowQuads },
