@@ -1053,6 +1053,39 @@ sufficient one. A generalisation measured on one model is a regression on anothe
 reason this is a sentence rather than a shipped defect is that the AF2 differential runs on every
 pass.
 
+### A short projection is slow and neither lever moves it
+
+🔴 **ESMFold2's SINGLE TRACK IS 436 CALLS OF A FOLD AT 55 GFLOP/s, where the pair track beside it
+reaches 198 to 523 - AND TWO PLAUSIBLE EXPLANATIONS ARE BOTH MEASURED WRONG.** The shape is 75 rows
+by 768 to 768, so an eight-row block leaves `ceil(75 / 8) * 768 / 4` = **1920 fragments**, which
+looks exactly like the starved dispatch CLAUDE.md documents on the WGSL side.
+
+| | ESMFold2, 36 tower blocks, 1 loop, 4 steps |
+|---|---:|
+| rows a fragment: **8** (shipped) | **5009 ms** |
+| 4 | 5214 ms |
+| 2 | 5725 ms |
+| a floor of 8192 fragments, so 2 for this shape | 6019 ms |
+
+**Monotone the wrong way**: more fragments is strictly worse, so the kernel is not short of work to
+issue, and the R = 4 against R = 8 measurement in "How close can this get" holds at a 75-row shape
+too. `--block-rows=<n>` is kept as the sweep.
+
+🔴 **AND NEITHER IS IT THE FRAGMENT ORDER, THOUGH THE SHIPPED RULE SAYS IT SHOULD BE.** Row-block
+fastest is gated to the int5 path because it once cost AF2 3.7x through the REPACK, whose source
+stride is the row-block count - 436 for AF2's pair track. This shape has **ten**, so the repack
+would survive it, and `rows * inChannels` is 57,600 floats against the rule's million, so the rule
+would select it. Measured: **5253 ms against 5012**, a loss. The traffic model says why, and it is
+the one the "whichever operand is smaller" phrasing hides - what matters is the streaming operand
+times the number of times it is re-streamed. Output-group fastest re-streams the weight once a row
+block, `2.3 MiB * 10` = 23 MiB; row-block fastest re-streams x once an output group, `0.23 MiB *
+192` = 44 MiB. The shipped order is already the cheaper one, and the int5 gate was not the proxy it
+looked like.
+
+So what limits that kernel is neither its block nor its order, and 55 GFLOP/s at 21.3 flops a fetch
+is 2.8 G fetches a second against the 6.8 the long projections reach. It is the same unexplained
+factor as the contraction's, in a second kernel, and it is the open question.
+
 ### `fetch1` is a whole texelFetch, and five attentions walked their head with it
 
 🔴 **A SCALAR WALK ALONG A CONTIGUOUS AXIS COSTS FOUR TIMES WHAT IT NEEDS TO, AND IT WAS IN EVERY

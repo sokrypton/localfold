@@ -245,7 +245,8 @@ export const BLOCK_ROWS = 4;
  * four wherever WebGL2 is and eight on this context, and a fragment writes one
  * texel of each - the planes are interleaved back by `blockRepackSource`.
  */
-export const blockRowsFor = (execution) => Math.min(8, execution.maxDrawBuffers);
+export const blockRowsFor = (execution) =>
+  (execution.linearBlockRows || Math.min(8, execution.maxDrawBuffers));
 
 /**
  * Order fragments ROW BLOCK FASTEST when x is no bigger than this, and by

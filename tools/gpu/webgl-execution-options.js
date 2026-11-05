@@ -73,6 +73,11 @@
  *                         statistics once per HEAD, and reading every operand
  *                         through fetch1 - 3584 texelFetch a fragment against
  *                         512. Bit-identical.
+ *   --block-rows=<n>      The blocked projection's rows a fragment, forced.
+ *                         The resolver picks the largest power of two that
+ *                         still leaves FRAGMENT_FLOOR fragments, because a
+ *                         short projection is starved rather than
+ *                         traffic-bound; this is how that is swept.
  *   --no-contract-pad     The contraction's pair axes left at an odd length,
  *                         so neither the coalesced reads nor the pair block is
  *                         legal and the scalar loop runs. 66% of an ESMFold2
@@ -135,6 +140,7 @@ export function webglExecutionOptions(args) {
     noContractChannelSlowest: flag(args, "no-contract-channel-slowest"),
     noContractCeiling: flag(args, "no-contract-ceiling"),
     noContractPad: flag(args, "no-contract-pad"),
+    linearBlockRows: Number(option(args, "block-rows", "0")),
     noPairBiasFast: flag(args, "no-pair-bias-fast"),
     noAttendDot4: flag(args, "no-attend-dot4"),
     poolLabelPattern: pattern("pool-labels"),

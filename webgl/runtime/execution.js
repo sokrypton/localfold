@@ -204,6 +204,12 @@ export class Execution {
      */
     this.noContractPad = options.noContractPad ?? false;
     /**
+     * The blocked projection's rows a fragment, forced - the control arm for
+     * `blockRowsFor`'s fragment floor, and the way to sweep it. 0 leaves the
+     * resolver alone.
+     */
+    this.linearBlockRows = options.linearBlockRows ?? 0;
+    /**
      * The control arm for bioemu2's pair bias normalising a row ONCE
      * (`webgl/bioemu2/denoiser.js`): the statistics recomputed per head, at
      * 3584 texelFetch a fragment rather than 512. Bit-identical.
