@@ -78,6 +78,7 @@ webgl/
     trunk/trunk.js              the assembly, and the distogram head's SUM symmetry
     diffusion/atom-attention.js the AdaLN block that is 98% of the diffusion head
     diffusion/atom-conditioning.js  chemistry in: the reference conformer, and arcsinh
+    diffusion/transformer.js    the 24 blocks, nested six by four
   af2/
     multimer/template.js        the multimer's nine-projection template embedder
     evoformer/block.js          a whole Evoformer block and the extra-MSA block, nine sub-layers
