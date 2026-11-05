@@ -11,9 +11,9 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-504 tools. `tools/fixtures/` is data and is not listed.
+506 tools. `tools/fixtures/` is data and is not listed.
 
-## `tools/gpu/` - the WebGPU lane (259)
+## `tools/gpu/` - the WebGPU lane (261)
 
 Each exports `async function main(device, args)` and is run as
 `node tools/gpu-chrome.mjs tools/gpu/<module>.js [--flags]`.
@@ -21,6 +21,7 @@ Each exports `async function main(device, args)` and is run as
 - **`af2-synthetic-block.js`** - Synthetic AF2 Evoformer weights, in the structure both backends read.
 - **`af2-synthetic-structure.js`** - Synthetic AF2 structure-module weights and geometry tables, in the structure both backends read.
 - **`af3-synthetic-head.js`** - A synthetic AF3 diffusion head - weights, layout and inputs - in the shape both `webgl/af3/diffusion/head.js` and `cpu/af3/diffusion/diffusion.js` read.
+- **`af3-synthetic-pairformer.js`** - Synthetic AF3 pairformer weights, in the structure both backends read.
 - **`bench-ab.js`** - Interleaved A/B for the AF3 pairformer, in one process.
 - **`bench-af2-warm.js`** - One AF2 trunk pass, COLD AND WARM, at the shape another port is measured on.
 - **`bench-attention-project.js`** - AF2's q/k/v/gate projection alone, at several register blocks, in one process.
@@ -146,6 +147,7 @@ Each exports `async function main(device, args)` and is run as
 - **`check-webgl-af3-atom-conditioning.js`** - AF3's per-atom conditioning in WebGL2 against `cpu/af3/diffusion/atom-conditioning.js`.
 - **`check-webgl-af3-atom-encoder.js`** - AF3's atom cross-attention encoder in WebGL2 against `cpu/af3/diffusion/atom-encoder.js`.
 - **`check-webgl-af3-block.js`** - One AF3 pairformer block in WebGL2, against TWO references.
+- **`check-webgl-af3-confidence.js`** - AF3's confidence head in WebGL2 against `cpu/af3/confidence/confidence.js`.
 - **`check-webgl-af3-diffusion-conditioning.js`** - AF3's diffusion conditioning in WebGL2 against `cpu/af3/diffusion/diffusion.js`.
 - **`check-webgl-af3-diffusion-head.js`** - AF3's whole diffusion head - one denoising step - in WebGL2 against `cpu/af3/diffusion/diffusion.js`.
 - **`check-webgl-af3-diffusion-transformer.js`** - AF3's 24-block diffusion transformer in WebGL2 against `cpu/af3/diffusion/diffusion.js`.

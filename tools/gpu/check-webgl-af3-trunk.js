@@ -55,6 +55,10 @@ import { Execution } from "../../webgl/runtime/execution.js";
 import { createWebGL2Context } from "../../webgl/index.js";
 import { DGRAM_BINS } from "../../shared/af3/featurise/template-features.js";
 import { generator } from "./af2-synthetic-block.js";
+import {
+  gridGroup as sharedGridGroup, pairHalfGroups as sharedPairHalfGroups,
+  transitionGroup as sharedTransitionGroup, triangleGroup as sharedTriangleGroup,
+} from "./af3-synthetic-pairformer.js";
 import { relativeRms } from "./relative-rms.js";
 
 const flag = (args, name) => (args ?? []).includes(`--${name}`);
@@ -88,43 +92,14 @@ export async function main(device, args) {
     for (let i = 0; i < n; i += 1) out[i] = centre + (random() * 2 - 1) * spread;
     return out;
   };
-  const triangleGroup = (channels) => ({
-    leftNormInputScale: noise(channels, 0.2, 1),
-    leftNormInputOffset: noise(channels, 0.1),
-    projection: noise(channels * channels * 2, 0.3 / Math.sqrt(channels)),
-    gate: noise(channels * channels * 2, 0.3 / Math.sqrt(channels)),
-    centerNormScale: noise(channels, 0.2, 1),
-    centerNormOffset: noise(channels, 0.1),
-    outputProjection: noise(channels * channels, 0.3 / Math.sqrt(channels)),
-    gatingLinear: noise(channels * channels, 0.3 / Math.sqrt(channels)),
-  });
-  const gridGroup = (channels, heads, dimension) => {
-    const width = heads * dimension;
-    return {
-      heads, dimension,
-      actNormScale: noise(channels, 0.2, 1),
-      actNormOffset: noise(channels, 0.1),
-      pairBiasProjection: noise(channels * heads, 1 / Math.sqrt(channels)),
-      qProjection: noise(width * channels, 1 / Math.sqrt(channels)),
-      kProjection: noise(width * channels, 1 / Math.sqrt(channels)),
-      vProjection: noise(channels * width, 1 / Math.sqrt(channels)),
-      gatingQuery: noise(width * channels, 1 / Math.sqrt(channels)),
-      outputProjection: noise(width * channels, 0.3 / Math.sqrt(width)),
-    };
-  };
-  const transitionGroup = (channels, factor) => ({
-    inputLayerNormScale: noise(channels, 0.2, 1),
-    inputLayerNormOffset: noise(channels, 0.1),
-    transition1: noise(channels * channels * factor * 2, 1 / Math.sqrt(channels)),
-    transition2: noise(channels * factor * channels, 0.3 / Math.sqrt(channels * factor)),
-  });
-  const pairHalfGroups = (channels, factor) => ({
-    triangleMultiplicationOutgoing: triangleGroup(channels),
-    triangleMultiplicationIncoming: triangleGroup(channels),
-    pairAttention1: gridGroup(channels, 4, 8),
-    pairAttention2: gridGroup(channels, 4, 8),
-    pairTransition: transitionGroup(channels, factor),
-  });
+  // The pair half, the grid groups and the transitions come from
+  // af3-synthetic-pairformer.js, with THIS gate's `noise` so the draw order is
+  // unchanged - four stacks here share that weight list.
+  const triangleGroup = (channels) => sharedTriangleGroup(noise, channels);
+  const gridGroup = (channels, heads, dimension) =>
+    sharedGridGroup(noise, channels, heads, dimension);
+  const transitionGroup = (channels, factor) => sharedTransitionGroup(noise, channels, factor);
+  const pairHalfGroups = (channels, factor) => sharedPairHalfGroups(noise, channels, factor);
 
   const embedderWeights = {
     pairChannels, singleChannels, msaChannels, targetFeatWidth: featureWidth,
