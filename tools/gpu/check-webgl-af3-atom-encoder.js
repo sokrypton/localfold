@@ -69,6 +69,21 @@ export async function main(device, args) {
   const withTrunk = flag(args, "trunk");
   const trunkSingleChannels = 12;
   const trunkPairChannels = 8;
+  // 🔴 THE ATOM STACK'S WIDTH MUST BE SQUARE, BECAUSE THE REFERENCE'S
+  // `adaptiveZeroInit` READS THE GATHERED ATTENTION AT `channels`. At
+  // `--channels=12` with two heads of eight every stage up to the pair MLP is
+  // exact and `encoder.stackOut` reads 1.2e-2 - the reference being asked the
+  // wrong question, not a wrong kernel, which `check-webgl-af3-atom-block.js`
+  // refuses by name for the same reason. The real model is square here (128 =
+  // 4 x 32); only the TOKEN transformer's conditioning differs from its
+  // activation, and that axis is `seq-channels` against `per-token`.
+  if (heads * dimension !== channels) {
+    throw new RangeError(
+      `af3 atom encoder gate: heads * dimension is ${heads * dimension} and the atom`
+      + ` channels ${channels}. The f64 reference's \`adaptiveZeroInit\` reads the`
+      + " gathered attention at `channels`, so the two must match for it to be"
+      + " answering the same question.");
+  }
   const queryRows = subsets * queries;
   const keyRows = subsets * keys;
   const atoms = tokens * dense;

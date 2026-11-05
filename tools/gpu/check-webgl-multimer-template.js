@@ -42,7 +42,7 @@ import { WebGpuExecution } from "../../webgpu/runtime/execution.js";
 import { setDeviceTuning, setHalfPrecision } from "../../webgpu/runtime/device-profile.js";
 import {
   multimerTemplateEmbedding, multimerTemplateFeatures, releaseMultimerTemplateWeights,
-  templateAatypeTerms, uploadMultimerTemplateWeights,
+  uploadMultimerTemplateWeights,
 } from "../../webgl/af2/multimer/template.js";
 import { uploadTemplatePairBlockWeights } from "../../webgl/af2/evoformer/block.js";
 import { releaseEvoformerBlockWeights } from "../../webgl/af2/evoformer/block.js";
@@ -189,17 +189,17 @@ export async function main(device, args) {
   const run = (weightSet, { withTemplate, templates, order, dither }) => {
     const features = multimerTemplateFeatures(
       { template: withTemplate ? template : undefined, length, asymId });
-    const terms = templateAatypeTerms(
-      weightSet, withTemplate ? aatype : new Int32Array(length), length);
     const geometry = upload(features.geometry, "mt.geometry");
-    const aatypeRow = upload(terms.row, "mt.aatype-row");
-    const aatypeColumn = upload(terms.column, "mt.aatype-column");
+    // The aatype itself, which the shader indexes - the reference gathers the
+    // two weight rows on the host instead, so this arm compares a GPU gather
+    // against a host one as well as the arithmetic around it.
+    const aatypeTensor = upload(features.aatype, "mt.aatype");
     const uploaded = uploadMultimerTemplateWeights(execution, weightSet);
     const blockWeights = weightSet.stack.map(
       (block) => uploadTemplatePairBlockWeights(execution, block));
     execution.halfDither = dither;
     const update = multimerTemplateEmbedding(execution, {
-      pair: pairTensor, geometry, aatypeRow, aatypeColumn, pairMask,
+      pair: pairTensor, geometry, aatype: aatypeTensor, pairMask,
       weights: uploaded, blockWeights,
       length, pairChannels, templateChannels: TEMPLATE_CHANNELS,
       triangleHidden, pairHidden, templates,
@@ -209,7 +209,7 @@ export async function main(device, args) {
     const updated = add(execution, pairTensor, update);
     const values = Float32Array.from(execution.read(updated));
     const updateValues = Float32Array.from(execution.read(update));
-    for (const tensor of [geometry, aatypeRow, aatypeColumn, update, updated]) {
+    for (const tensor of [geometry, aatypeTensor, update, updated]) {
       execution.release(tensor);
     }
     releaseMultimerTemplateWeights(execution, uploaded);

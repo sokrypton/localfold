@@ -181,7 +181,7 @@ void main() {
 /**
  * @param {import("../../runtime/execution.js").Execution} execution
  * @param {{conditioning: Tensor, atomMask: Tensor, refPos: Tensor, refSpaceUid: Tensor,
- *   pairCondRowSource: Tensor, trunkSingleCond?: Tensor, trunkPairCond?: Tensor,
+ *   trunkSingleCond?: Tensor, trunkPairCond?: Tensor,
  *   tokenAtomsAct?: Tensor,
  *   gathers: {tokenAtomsToQueries: {indices: Tensor, mask: Tensor},
  *     queriesToKeys: {indices: Tensor, mask: Tensor},
