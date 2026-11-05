@@ -391,6 +391,9 @@ int generate(const std::string& genDir, const std::string& outPath, int designs,
   float* eLl = uploadNew(emitLl, (size_t)n);
 
   for (int design = 0; design < std::max(designs, 1); ++design) {
+    // the GPU-busy spans are global and this design's report divides by this design's steps, so they are
+    // cleared per design - after a drain, or a buffer still in flight lands in the wrong design's total
+    if (getenv("LF_GPUBUSY")) { sync(); gpuBusyReset(); }
   // 🔴 DESIGN 0 REPLAYS THE EXPORT'S STREAM AND EVERY LATER ONE DRAWS ITS OWN. The replay is what lets a
   // trajectory be compared against the reference's; a campaign's point is different proteins, so design d is
   // seeded `seed + d` and draws in the exporter's own order.

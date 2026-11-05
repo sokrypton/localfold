@@ -555,6 +555,18 @@ void gpuBusySnapshot(double* gpu, double* kern, long* n, double* span) {
 // attributed from code on this Mac; it wants Xcode's Metal System Trace. The attempt was written and is not
 // kept: a branch that cannot run on the hardware it was written for is how a port grows a second, wrong
 // implementation.
+// 🔴 AND IT IS RESET PER DESIGN, because the spans are GLOBAL and the divisor is not. `GPU_SPANS` is
+// appended to for the life of the process while `gpuBusyReport`'s `over` is one design's steps or passes, so
+// a campaign's SECOND design was divided by BOTH designs' spans: a 3-design run at 180 tokens read 124.0,
+// then 254.1, then 388.9 ms a pass, which is the running total over 180 and looks exactly like catastrophic
+// thermal drift. The real per-design figures are 124.0, 130.1, 134.7. This was worked around by hand once
+// (subtracting the previous line) before being fixed, which is how a reporting bug becomes a wrong number in
+// a note. The caller resets at the top of each design, after a drain so no span lands in the wrong one.
+void gpuBusyReset() {
+  std::lock_guard<std::mutex> g(GPU_BUSY_MU);
+  GPU_SPANS.clear();
+  GPU_BUSY_MS = 0; GPU_KERNEL_MS = 0; GPU_BUSY_N = 0;
+}
 void gpuBusyReport(const char* what, int over) {
   double gpu = 0, kern = 0, span = 0; long n = 0;
   gpuBusySnapshot(&gpu, &kern, &n, &span);
