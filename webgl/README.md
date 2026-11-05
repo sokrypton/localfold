@@ -26,7 +26,7 @@ This file began as the spike that answered *can WebGL2 do this work at all*: the
 decide it, moved out of `webgpu/kernels/` where they sat with `webgl2` in their names and no
 importer, plus the texture layout and the limit arithmetic they shared by copy. The honest summary
 of the sections below: the numerics are **checked and correct**, the speed is **4.6x off the WebGPU
-path on AF2 and 23x on bioemu2** - it was 17x and 246x - and the shapes are **worse**.
+path on AF2 and 22x on bioemu2** - it was 17x and 246x - and the shapes are **worse**.
 
 🔴 **AND THEY WERE UNGATED FOR AS LONG AS THEY EXISTED, WHICH IS WHY THE FIRST THING THIS TREE
 GOT WAS A DIFFERENTIAL.** AGENTS.md requires every GPU kernel to have "a deterministic differential
@@ -633,7 +633,9 @@ The question was whether the tricks in `sokrypton/rfd4-proteina-webgpu`'s own We
 distance to WGSL here. It has three: a blocked matmul into several render targets, operands as
 float16 packed eight to a texel, and narrow texture rows (384 texels, where this tree uses 2048).
 The first is worth **6.3x to 7.9x** on the projections bioemu2 is made of. The second is taken too,
-in the simplest form it has here - **1.4x and nearly half the peak memory**. The third is measured
+in two forms - float16 in RGBA16F (**1.4x and nearly half the peak**) and then the bundle's own
+five-bit codes decoded in the kernel (**another 2.08x of memory**, and the only one of these that
+is more accurate than what it replaced). The third is measured
 now and is **a loss on this device**, which is the one place this port and that one disagree.
 
 🔴 **NARROW ROWS ARE 1.6x FOR THEM AND 3.8x AGAINST US, AND THE REASON IS THE ADDRESSING.** Their
@@ -760,14 +762,14 @@ Every fold is the same job, the same seed and the same settings either side; `--
 
 | fold | before | after | |
 |---|---:|---:|---:|
-| bioemu2, 6MRR 68 tokens, 4 passes, 20 steps | 968 s | **89.7 s** | **10.8x** |
-| ...its trunk | 277.7 s | **36.4 s** | 7.6x |
-| ...its 20 denoiser calls | 658 s | **50.8 s** | 13.0x |
+| bioemu2, 6MRR 68 tokens, 4 passes, 20 steps | 968 s | **84.8 s** | **11.4x** |
+| ...its trunk | 277.7 s | **36.5 s** | 7.6x |
+| ...its 20 denoiser calls | 658 s | **46.9 s** | 14.0x |
 | ESMFold2, 75 residues, 36-block tower, 3 loops, 15 steps | 253 s | **65.0 s** | **3.9x** |
 | ESMFold2 at the tool's defaults | 2.82 s | **1.37 s** | 2.1x |
 | AF3, 59 tokens | 4.68 s | **3.39 s** | 1.4x |
 | AF2 monomer, 59 residues | 1.40 s | **1.29 s** | 1.1x |
-| peak, bioemu2 | 1656 MiB | **851 MiB** | 1.95x |
+| peak, bioemu2 | 1656 MiB | **409 MiB** | **4.05x** |
 
 🔴 **AF2 MOVES LEAST BECAUSE IT IS NOT DOING THE ARITHMETIC.** Its pair weights are 64 KiB and sit
 in cache, so there is no traffic to divide, and 1122 ms of its 1400 is shader compilation. The
@@ -823,6 +825,53 @@ largest magnitude is past float16's 65504 stays in f32 and says so (`halfRefusal
 point is named by what the caller calls a weight, and an index table is not a weight in that sense
 - ESMFold2's `atomToToken` goes through a helper that looks identical and must never be converted,
 since f16 represents integers exactly only to 2048.
+
+### The bundle's five-bit codes, decoded in the shader
+
+Float16 weights were two bytes where the bundle ships **five-bit codes plus a group's scale and
+zero - 0.875 bytes a weight**. Decoding them in the kernel instead of on the host is the only
+optimisation in this section that costs nothing at all in accuracy: the value decoded is the
+float32 number the host would have produced, so it is faster *and* more accurate than the float16
+it replaces.
+
+| | f16 weights | int5 codes | |
+|---|---:|---:|---:|
+| bioemu2, 6MRR 68 tokens, 20 steps | 89.7 s | **84.8 s** | 1.06x |
+| ...peak | 851 MiB | **409 MiB** | **2.08x** |
+| bioemu2's cheap fold (4 blocks, 2 steps) | 7.94 s | **6.83 s** | 1.16x |
+
+🔴 **409 MiB IS LESS THAN THE WGSL BACKEND HOLDS**, which is 815 MiB of weights plus 135 of
+activations for the same fold. This backend began the session at 1656 MiB and four times slower per
+byte; it is now the more memory-efficient of the two, because it keeps the checkpoint in the form
+the checkpoint ships in and the WGSL side expands it to float16.
+
+🔴 **AND THE FIRST VERSION WAS 23% SLOWER THAN THE FLOAT16 IT REPLACED, WHICH IS THE WHOLE LESSON.**
+It moved 2.3x fewer weight bytes and still lost, because a decode is about **fifteen integer
+operations of address arithmetic for two texel reads** against float16's four for one - and the
+blocked projection calls it once per output row per k-step, so at four codes a call that arithmetic
+is paid eight times a group per row. The kernel is not purely traffic-bound, and quadrupling its
+integer work spent more than the bytes saved. Decoding **eight codes at a time** halves it and is
+where the win comes from: forty bits is exactly five bytes, every chunk's offset within a group is a
+multiple of forty, so the shift is always 0, 8, 16 or 24 and the span is always exactly two words -
+no running bit counter and no third read.
+
+🔴 **TWO SHAPES CANNOT TAKE THE FAST PATH AND bioemu2 HAS BOTH.** The inner loop needs the codes to
+run along the axis a fragment sweeps, which means `[out][in]` with an input width that is a whole
+number of groups - and bioemu2's single conditioner is **839** wide (384 trunk channels plus 455
+featuriser columns, a number with no reason to be a multiple of anything) while its pair
+projections are read `[in][out]`. The uploader cannot tell which way a caller will read a tensor, so
+`linear` decodes such a weight ONCE into float16 and memoises it on the weight object. That is why
+the trunk stage grows slightly (619 ms to 843 at four mixer blocks) while the sampler, which is all
+`[out][in]`, is where the gain lands.
+
+🔴 **AND THE GATE IS EQUALITY, NOT A TOLERANCE.** `tools/gpu/check-webgl-int5-decode.js` holds the
+shader to `readTensor` element by element on the largest int5 tensors bioemu2 ships: **0 of
+10,616,832 elements differ**, not even by the fused multiply-add the compiler is allowed. It is a
+differential rather than a floor because a quantised decoder that is wrong stays plausible -
+`check-quantised-upload.js` once found the WGSL device decoder and the host one disagreeing on
+**104,170 of 131,072 elements** at int5 group 64, and it was the HOST that was wrong. Its
+`--falsify` arm reads a code as a multiple of the scale rather than an offset from the zero, which
+is that same real fault, and turns 7,077,888 elements red.
 
 ### A texture pool, and the bug it found
 
@@ -1016,15 +1065,16 @@ bond rms  main       0.042            0.042            0.042
           side       0.056            0.056            0.056
           peptide    0.028            0.028            0.028
 contacts (P > 0.5)   201              201
-wall                 968 s            89.7 s           3.9 s
+wall                 968 s            84.8 s           3.9 s
   trunk              277.7 s          36.4 s           2.3 s
   distogram                           1.3 s
-  20 denoiser calls  658 s            50.8 s           1.2 s
-weights/activations  1656 MiB peak    851 MiB peak     815 MiB weights + 135 activations
+  20 denoiser calls  658 s            46.9 s           1.2 s
+weights/activations  1656 MiB peak    409 MiB peak     815 MiB weights + 135 activations
 ```
 
-🔴 **968 s TO 89.7 s, AND NOT ONE REPORTED QUANTITY MOVES.** The 10.8x is the row block, the
-split, coalesced and transposed contraction and the float16 weights from "Closing the gap" above, and every figure in
+🔴 **968 s TO 84.8 s ON A QUARTER OF THE MEMORY, AND NOT ONE REPORTED QUANTITY MOVES.** The 11.4x
+is the row block, the split, coalesced and transposed contraction, and the weights held as the
+bundle's own five-bit codes from "Closing the gap" above, and every figure in
 the middle column is the left column's - the same rmsd, the same TM, the same CA-CA median to eight
 digits, the same 201 contacts - while the peak HALVES. Four kernels reordered or re-quantised and
 the fold does not notice; the weights are within 36 MiB of what the WGSL fold holds.
@@ -1042,8 +1092,8 @@ relative. A geometry floor would have accepted a port that was wrong by 10%; thi
 also why the AF3-style "worst atom" figure is not quoted here: it needs both PDBs, and the WebGL2
 side is sixteen minutes a fold.
 
-🔴 **AND IT IS 23x THE WGSL FOLD - WAS 246x - WHICH IS STILL NOT A TUNING GAP.** The trunk is 16x
-and the diffusion 42x, and the diffusion is where the remaining asymmetry lives: the WGSL denoiser
+🔴 **AND IT IS 22x THE WGSL FOLD - WAS 246x - ON LESS MEMORY THAN THAT FOLD USES.** The trunk is
+16x and the diffusion 39x, and the diffusion is where the remaining asymmetry lives: the WGSL denoiser
 batches S samples through one compiled program, which this one does not. **The half-precision
 weights this file once called "the next multiplicative factor" are taken** - see "Float16 weights"
 above - so the denoiser's 1.6 GiB is 0.8 and a call is **2.5 s where it was 32.9**. That is also
@@ -1102,9 +1152,11 @@ to 2.1 GiB (`model-rfd4p-int8`), and an old machine with 4-8 GiB of RAM is not f
 large end whatever the kernels do. Only the small end is browser-shaped on the hardware this tree
 exists for.
 
-🔴 **THAT WALL MOVED, THOUGH, AND THE NEXT MOVE IS IDENTIFIED AND NOT TAKEN.** Half-precision
-weights put a bioemu2 fold's device peak at **851 MiB** where it was 1656, which is within 36 MiB
-of what the WGSL fold holds - so the memory question is no longer the binding one for that model.
+🔴 **THAT WALL MOVED FURTHEST OF ANYTHING HERE.** A bioemu2 fold's device peak was 1656 MiB; the
+float16 weights took it to 851, which is within 36 MiB of what the WGSL fold holds, and the
+bundle's own five-bit codes decoded in the kernel take it to **409 MiB - less than half what the
+WGSL backend uses for the same fold**. The memory question is no longer the binding one for that
+model, and on this axis the fallback backend is now the efficient one.
 The next factor is the bundle's own quantisation, and it is worth writing out because the format is
 already settled and the plumbing already exists. `model-bioemu2-int5` ships five-bit CODES; this
 backend decodes them to f32 on the host and uploads the result (two bytes a weight since the
@@ -1158,6 +1210,7 @@ node tools/gpu-chrome.mjs tools/gpu/bench-webgl2-tf-matmul.js  the vertex path: 
 node tools/gpu-chrome.mjs tools/gpu/check-webgl-kernels.js     both kernels against independent CPU references; --falsify
 node tools/gpu-chrome.mjs tools/gpu/bench-webgl-linear.js      the dense projection at the shapes four models fold at, one texel a fragment against eight rows
 node tools/gpu-chrome.mjs tools/gpu/bench-webgl-upload.js      what weight bytes cost on the way into a texture, and a readback the other way
+node tools/gpu-chrome.mjs tools/gpu/check-webgl-int5-decode.js the in-shader five-bit decoder against readTensor, element by element; --falsify
 ```
 
 Every fold driver here takes the diagnostic switches in `tools/gpu/webgl-execution-options.js`,
@@ -1166,7 +1219,8 @@ settles what the GPU is costing), `--double=<regex>` (a family's draws issued tw
 header before trusting it**), `--nan-watch` (names the kernel that reads a texel nothing wrote),
 `--host` (where the host time inside a dispatch goes), `--no-pool`, `--no-check-errors`, and the
 three control arms for the optimisations above: `--no-linear-block`, `--no-triangle-split`,
-`--no-triangle-transpose`.
+`--no-triangle-coalesce`, `--no-triangle-transpose`, `--no-half-weights` and `--no-int5-weights`
+(which nest: dropping the codes falls back to float16, dropping both to float32).
 
 ## Making it selectable
 
@@ -1176,7 +1230,8 @@ and the page requires WebGPU rather than choosing a backend.
 🔴 **THE PRECONDITION IS NOW MET AND THE DECISION IS STILL NOT AUTOMATIC.** This section used to say
 neither line should move "before a fold actually runs here", and one does. What has not been
 settled is whether a backend **4.6x slower on AF2 and 23x on bioemu2** should be offered: a
-59-residue AF2 fold is 1.29 s against 0.28 s, 68-token bioemu2 is 90 s against 3.9 s, and a
+59-residue AF2 fold is 1.29 s against 0.28 s, 68-token bioemu2 is 85 s against 3.9 s on 409 MiB
+against 950, and a
 255-residue fold has not been measured at all. A visitor with no WebGPU gets a fold
 instead of a refusal, which is the whole point of the tree; a visitor who waits four minutes for
 something the other path does in fifteen seconds may not thank anyone. The multimer is also still

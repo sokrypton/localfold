@@ -98,7 +98,8 @@ export class Execution {
     this.storage = new Storage(gl, { pooling: options.pooling ?? false,
       poolLabelPattern: options.poolLabelPattern ?? null,
       fillFresh: options.fillFresh ?? null,
-      halfWeights: options.halfWeights ?? false });
+      halfWeights: options.halfWeights ?? false,
+      int5Weights: options.int5Weights ?? false });
     /**
      * Read every output back and refuse at the first non-finite value.
      *
@@ -107,6 +108,8 @@ export class Execution {
      * a NaN reaches everything downstream.
      */
     this.nanWatch = options.nanWatch ?? false;
+    /** Targets `nanWatch` could not read back, which are float16 or packed codes. */
+    this.nanWatchSkipped = 0;
     /**
      * The control arm for the blocked projection (`webgl/kernels/linear.js`):
      * one output texel a fragment, as this backend did before it had a block.
@@ -257,6 +260,9 @@ export class Execution {
   zeros(elements, label) { return this.storage.zeros(elements, label); }
   /** A weight, in float16 if this execution is holding large ones that way. */
   uploadWeight(values, label) { return this.storage.uploadWeight(values, label); }
+  /** An int5 weight left as codes, or null if this one cannot be. */
+  uploadInt5Weight(source, label) { return this.storage.uploadInt5Weight(source, label); }
+  allocateHalf(elements, label) { return this.storage.allocateHalf(elements, label); }
   upload(values, label) { return this.storage.upload(values, label); }
   read(tensor) { return this.storage.read(tensor); }
   release(tensor) { return this.storage.release(tensor); }
@@ -504,6 +510,16 @@ export class Execution {
     }
     if (this.nanWatch) {
       for (const tensor of targets) {
+        // 🔴 A float16 OR PACKED-CODE TARGET CANNOT BE READ BACK AS FLOATS, and
+        // this instrument says how many it therefore did not check rather than
+        // reporting a clean run it did not have. The only such target is the
+        // one-off int5 decode (`webgl/kernels/linear.js`), whose own gate -
+        // tools/gpu/check-webgl-int5-decode.js - compares every element of it
+        // against `readTensor`, which is a stronger check than this one.
+        if (tensor.half === true || tensor.words === true) {
+          this.nanWatchSkipped += 1;
+          continue;
+        }
         const values = this.storage.read(tensor);
         for (let i = 0; i < values.length; i += 1) {
           if (!Number.isFinite(values[i])) {
@@ -559,6 +575,7 @@ export class Execution {
     return {
       dispatches: this.dispatches, draws: this.draws, programs: this.programs.size,
       framebuffers: this.framebuffers.size, framebufferBuilds: this.framebufferBuilds,
+      ...(this.nanWatch ? { nanWatchSkipped: this.nanWatchSkipped } : {}),
       ...(this.host === null ? {} : { host: Object.fromEntries(
         Object.entries(this.host).map(([k, v]) => [k, Math.round(v)])) }),
       maxBandRows: this.maxBandRows, maxDrawBuffers: this.maxDrawBuffers,

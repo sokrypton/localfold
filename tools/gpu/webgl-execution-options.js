@@ -13,6 +13,13 @@
  *                         whether a kernel reads texels nothing wrote: a pooled
  *                         texture carries the last tensor's bytes, so a fold
  *                         with and without it must agree to the last bit.
+ *   --no-int5-weights     Decode the bundle's five-bit weights on the HOST and
+ *                         upload the result, as this backend used to. On by
+ *                         default because it is strictly better where it
+ *                         applies: the decoded value is the float32 the host
+ *                         would have produced AND the codes are 0.875 bytes a
+ *                         weight against float16's two. See
+ *                         `webgl/runtime/int5.js`.
  *   --no-half-weights     Every weight in float32. A FOLD holds a weight of
  *                         65,536 floats or more in float16 (RGBA16F) by
  *                         default, which halves the bytes a big projection
@@ -80,6 +87,7 @@ export function webglExecutionOptions(args) {
   return {
     pooling: flag(args, "pool"),
     halfWeights: !flag(args, "no-half-weights"),
+    int5Weights: !flag(args, "no-int5-weights"),
     checkErrors: !flag(args, "no-check-errors"),
     noLinearBlock: flag(args, "no-linear-block"),
     fillFresh: flag(args, "nan-watch") ? NaN : null,

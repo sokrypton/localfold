@@ -35,6 +35,7 @@
  */
 import { CHANNELS_PER_TEXEL, TEXTURE_WIDTH, textureShape } from "./context.js";
 import { float32ToFloat16Array } from "../../shared/weights/float16.js";
+import { int5WeightSource } from "./int5.js";
 
 /**
  * A weight of at least this many floats is held in float16 when
@@ -62,7 +63,13 @@ export function storageBytes(elements) {
 
 /**
  * @typedef {{texture: WebGLTexture, elements: number, width: number, height: number,
- *   label: string, bytes: number, half?: boolean}} Tensor
+ *   label: string, bytes: number, half?: boolean, words?: boolean}} Tensor
+ *
+ * An int5 weight is NOT one of these: it is a pair of textures and a count, and
+ * only `linear` knows how to read it. See `uploadInt5Weight`.
+ *
+ * @typedef {{int5: true, codes: Tensor, table: Tensor, elements: number,
+ *   groups: number, decoded?: Tensor, free: () => void}} Int5Weight
  */
 
 export class Storage {
@@ -192,6 +199,16 @@ export class Storage {
     /** How many tensors were held in float16, and how many were too large for it. */
     this.halfWeightTensors = 0;
     this.halfRefusals = 0;
+    /**
+     * Leave a large int5 weight as CODES for the kernel to decode.
+     *
+     * Strictly better than `halfWeights` where it applies - the decoded value
+     * is the float32 the host would have produced, and the codes are 0.875
+     * bytes a weight against float16's two - so a fold turns both on and the
+     * int5 path wins when a tensor qualifies. See `webgl/runtime/int5.js`.
+     */
+    this.int5Weights = options.int5Weights ?? false;
+    this.int5WeightTensors = 0;
   }
 
   /**
@@ -283,6 +300,11 @@ export class Storage {
    * `--nan-watch` on the fold drivers is what found them and is what finds the
    * next one; a caller that wants zeros asks for zeros.
    */
+  /** An uninitialised float16 tensor, for a kernel that writes rounded halves. */
+  allocateHalf(elements, label = "half") {
+    return this.allocate(elements, label, true);
+  }
+
   zeros(elements, label = "zeros") {
     return this.upload(new Float32Array(elements), label);
   }
@@ -320,6 +342,94 @@ export class Storage {
     this.halfWeightTensors += 1;
     const tensor = this.allocate(values.length, label, true);
     this.write(tensor, values instanceof Float32Array ? values : Float32Array.from(values));
+    return tensor;
+  }
+
+  /**
+   * An int5 weight, left as CODES for the kernel to decode.
+   *
+   * 🔴 THE RESULT IS NOT A `Tensor`, IT IS A PAIR OF THEM PLUS A COUNT, and
+   * that is deliberate: a caller that does not know about it cannot pass it to
+   * a kernel that cannot read it. `linear` checks for `int5` by name and every
+   * other path sees an object with no `.texture` and fails loudly rather than
+   * sampling something plausible.
+   *
+   * Returns null when the tensor is not int5 at group 32, which is every
+   * float32 and int3 bundle - the caller falls back to `uploadWeight`.
+   *
+   * @param {{record: object, buffer: ArrayBuffer, byteOffset: number}} source
+   *   what `read.source(name)` / `HttpTensorStore.tensorSource(name)` returns
+   */
+  uploadInt5Weight(source, label = "weight") {
+    if (!this.int5Weights) return null;
+    const extracted = int5WeightSource(source.record, source.buffer, source.byteOffset);
+    if (extracted === null) return null;
+    const { words, scaleZero, groups, elements } = extracted;
+    if (elements < HALF_WEIGHT_FLOOR) return null;
+    const codes = this.allocateWords(words.length, `${label}.codes`);
+    this.writeWords(codes, words);
+    const table = this.upload(scaleZero, `${label}.scale-zero`);
+    this.int5WeightTensors += 1;
+    const held = { int5: true, codes, table, elements, groups };
+    held.free = () => {
+      this.release(codes);
+      this.release(table);
+      if (held.decoded !== undefined) this.release(held.decoded);
+    };
+    return held;
+  }
+
+  /**
+   * A tensor of 32-bit WORDS (RGBA32UI), four to a texel.
+   *
+   * The same rectangle arithmetic as a float tensor, so `W` addresses it the
+   * same way; only the format differs. Used for packed codes, which are not
+   * numbers until a kernel decodes them.
+   */
+  allocateWords(words, label = "words") {
+    const texels = Math.ceil(words / CHANNELS_PER_TEXEL);
+    const width = TEXTURE_WIDTH;
+    const height = Math.max(1, Math.ceil(texels / width));
+    if (height > this.gl.getParameter(this.gl.MAX_TEXTURE_SIZE)) {
+      throw new RangeError(`${label}: ${words} words is past this context's textures`);
+    }
+    const gl = this.gl;
+    const texture = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32UI, width, height, 0,
+      gl.RGBA_INTEGER, gl.UNSIGNED_INT, null);
+    for (const p of [gl.TEXTURE_MIN_FILTER, gl.TEXTURE_MAG_FILTER]) {
+      gl.texParameteri(gl.TEXTURE_2D, p, gl.NEAREST);
+    }
+    for (const p of [gl.TEXTURE_WRAP_S, gl.TEXTURE_WRAP_T]) {
+      gl.texParameteri(gl.TEXTURE_2D, p, gl.CLAMP_TO_EDGE);
+    }
+    const bytes = width * height * CHANNELS_PER_TEXEL * 4;
+    /** @type {Tensor} */
+    const tensor = { texture, elements: words, width, height, label, bytes, words: true };
+    this.live.add(tensor);
+    this.allocations += 1;
+    this.bytes += bytes;
+    this.peakBytes = Math.max(this.peakBytes, this.bytes + this.pooledBytes);
+    return tensor;
+  }
+
+  /** Fill a word tensor, padding to its rectangle. */
+  writeWords(tensor, words) {
+    const gl = this.gl;
+    const needed = tensor.width * tensor.height * CHANNELS_PER_TEXEL;
+    const padded = words.length === needed ? words : (() => {
+      const out = new Uint32Array(needed);
+      out.set(words);
+      return out;
+    })();
+    const startedAt = performance.now();
+    gl.bindTexture(gl.TEXTURE_2D, tensor.texture);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, tensor.width, tensor.height,
+      gl.RGBA_INTEGER, gl.UNSIGNED_INT, padded);
+    this.timing.uploadMs += performance.now() - startedAt;
+    this.timing.uploadBytes += padded.length * 4;
+    this.timing.uploads += 1;
     return tensor;
   }
 
@@ -365,6 +475,9 @@ export class Storage {
    */
   read(tensor) {
     const gl = this.gl;
+    if (tensor.words) {
+      throw new Error(`${tensor.label}: a packed-code tensor is not readable as floats`);
+    }
     if (tensor.half) {
       // A weight is written once and never read back, and reading an RGBA16F
       // attachment as floats is another format question nothing here needs
@@ -431,6 +544,7 @@ export class Storage {
       allocationLabels: this.allocationLabels,
       halfWeightTensors: this.halfWeightTensors,
       halfRefusals: this.halfRefusals,
+      int5WeightTensors: this.int5WeightTensors,
       timing: Object.fromEntries(
         Object.entries(this.timing).map(([key, value]) => [key, Math.round(value)])),
     };

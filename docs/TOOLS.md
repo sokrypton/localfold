@@ -11,9 +11,9 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-522 tools. `tools/fixtures/` is data and is not listed.
+523 tools. `tools/fixtures/` is data and is not listed.
 
-## `tools/gpu/` - the WebGPU lane (277)
+## `tools/gpu/` - the WebGPU lane (278)
 
 Each exports `async function main(device, args)` and is run as
 `node tools/gpu-chrome.mjs tools/gpu/<module>.js [--flags]`.
@@ -178,6 +178,7 @@ Each exports `async function main(device, args)` and is run as
 - **`check-webgl-evoformer-stack.js`** - Two Evoformer blocks in a row, both stacks, against their WGSL counterparts.
 - **`check-webgl-geometry.js`** - Atom coordinates against the WGSL geometry stage.
 - **`check-webgl-input-embedder.js`** - The input embedder against the WGSL one - three embeddings and the recycle.
+- **`check-webgl-int5-decode.js`** - The WebGL2 in-shader int5 decoder against `readTensor`, element by element.
 - **`check-webgl-ipa.js`** - Invariant point attention against the WGSL one.
 - **`check-webgl-kernels.js`** - The two WebGL2 kernels against independent CPU references - the gate they have never had.
 - **`check-webgl-multimer-block.js`** - AF2-MULTIMER's two block kinds in WebGL2 against the WGSL multimer block.

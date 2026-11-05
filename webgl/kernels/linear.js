@@ -32,7 +32,11 @@
  * revisit once a block folds.
  */
 import { ONE_TARGET, PRELUDE, targetDeclarations } from "../runtime/execution.js";
+import {
+  INT5_DECODE, INT5_DECODE8, INT5_GROUP, int5DecodeSource,
+} from "../runtime/int5.js";
 /** @typedef {import("../runtime/storage.js").Tensor} Tensor */
+/** @typedef {import("../runtime/storage.js").Int5Weight} Int5Weight */
 
 
 const ACTIVATIONS = {
@@ -339,6 +343,84 @@ ${each((i) => `  result${i} = ${value(i)};`)}
 }`;
 };
 
+/**
+ * The blocked projection with its weight DECODED FROM FIVE-BIT CODES.
+ *
+ * 🔴 THE SAME GEOMETRY AS `blockedSource`, AND THE ONLY DIFFERENCE IS WHERE THE
+ * WEIGHT COMES FROM. A big projection is bound by streaming its weight, and the
+ * codes are **0.875 bytes a weight against float16's two** while also being
+ * fewer texels (an RGBA32UI texel holds 25.6 codes) - and the value decoded is
+ * the float32 the host would have produced, so this is faster AND more accurate
+ * than the f16 path it replaces. See webgl/runtime/int5.js for the format.
+ *
+ * 🔴 THE LOOP IS NESTED BY GROUP BECAUSE THE SCALE AND ZERO ARE PER GROUP. A
+ * group is 32 elements, so one fetch of (scale, zero) per output row serves
+ * eight sub-steps of four - written flat it would fetch the table once per four
+ * weights and the table would cost more than the codes. `[out][in]` only: the
+ * codes run along the tensor's contiguous axis, which is `in` for that layout
+ * and is the axis a fragment sweeps.
+ */
+export const blockedInt5Source = (
+  rows, inChannels, outChannels, activation, useBias, roundHalf, blockRows = BLOCK_ROWS,
+) => {
+  const each = (template) => Array.from(
+    { length: blockRows }, (_, i) => template(i)).join("\n");
+  const value = (i) => {
+    const sum = useBias ? `acc${i} + fetch4(biasTex, group)` : `acc${i}`;
+    const activated = ACTIVATIONS[activation].replace(/\bvalue\b/g, `(${sum})`);
+    return roundHalf ? `half4(${activated})` : activated;
+  };
+  return `${PRELUDE}${targetDeclarations(blockRows)}
+${SHAPE_UNIFORMS}
+uniform int RQ;
+uniform int GPR;
+uniform sampler2D xTex;
+uniform highp usampler2D codeTex;
+uniform sampler2D tableTex;
+${useBias ? "uniform sampler2D biasTex;" : ""}
+${INT5_DECODE}
+${INT5_DECODE8}
+
+void main() {
+  int texel = linearTexel();
+  int q = texel / OUT4;
+  int group = texel - q * OUT4;
+  int o0 = group * 4;
+  int base = texel < RQ * OUT4 ? q * ${blockRows} : 0;
+${each((i) => `  int xBase${i} = min(base + ${i}, ROWS - 1) * IN4;`)}
+${each((i) => `  vec4 acc${i} = vec4(0.0);`)}
+  for (int g = 0; g < GPR; ++g) {
+    // The group index of output row o at its group g is o * GPR + g, because
+    // every row is a whole number of groups (int5WeightSource refuses otherwise).
+    vec2 sz0 = int5ScaleZero(tableTex, (o0 + 0) * GPR + g);
+    vec2 sz1 = int5ScaleZero(tableTex, (o0 + 1) * GPR + g);
+    vec2 sz2 = int5ScaleZero(tableTex, (o0 + 2) * GPR + g);
+    vec2 sz3 = int5ScaleZero(tableTex, (o0 + 3) * GPR + g);
+    // Four chunks of eight codes a group: forty bits each, two words each, and
+    // the address arithmetic paid once per eight weights instead of per four.
+    for (int chunk = 0; chunk < ${INT5_GROUP / 8}; ++chunk) {
+      int k = g * ${INT5_GROUP} + chunk * 8;
+      vec4 w0a, w0b, w1a, w1b, w2a, w2b, w3a, w3b;
+      decodeInt5x8(codeTex, (o0 + 0) * IN + k, sz0.x, sz0.y, w0a, w0b);
+      decodeInt5x8(codeTex, (o0 + 1) * IN + k, sz1.x, sz1.y, w1a, w1b);
+      decodeInt5x8(codeTex, (o0 + 2) * IN + k, sz2.x, sz2.y, w2a, w2b);
+      decodeInt5x8(codeTex, (o0 + 3) * IN + k, sz3.x, sz3.y, w3a, w3b);
+      int kq = k >> 2;
+${each((i) => `      {
+        vec4 xa = fetch4(xTex, xBase${i} + kq);
+        vec4 xb = fetch4(xTex, xBase${i} + kq + 1);
+        acc${i} += vec4(
+          dot(xa, w0a) + dot(xb, w0b),
+          dot(xa, w1a) + dot(xb, w1b),
+          dot(xa, w2a) + dot(xb, w2b),
+          dot(xa, w3a) + dot(xb, w3b));
+      }`)}
+    }
+  }
+${each((i) => `  result${i} = ${value(i)};`)}
+}`;
+};
+
 /** Four row planes back into `[rows][outChannels]`: plane `row % 4`, texel `(row / 4) * OUT4 + group`. */
 export const blockRepackSource = (blockRows = BLOCK_ROWS) => `${PRELUDE}${ONE_TARGET}
 uniform int ROWS;
@@ -358,8 +440,36 @@ ${Array.from({ length: blockRows - 1 }, (_, i) =>
 }`;
 
 /**
+ * An int5 weight as an ordinary float16 tensor, decoded once and memoised on
+ * the weight object so a stacked layer pays for it only on its first block.
+ *
  * @param {import("../runtime/execution.js").Execution} execution
- * @param {{x: Tensor, weight: Tensor, bias?: Tensor, rows: number, inChannels: number,
+ */
+/**
+ * @param {import("../runtime/execution.js").Execution} execution
+ * @param {Int5Weight} weight
+ * @param {string} shape
+ * @returns {Tensor}
+ */
+function decodedInt5(execution, weight, shape) {
+  if (weight.decoded !== undefined) return weight.decoded;
+  const decoded = execution.allocateHalf(weight.elements, "linear.int5-decoded");
+  execution.dispatch({
+    source: int5DecodeSource(PRELUDE, ONE_TARGET, true),
+    output: decoded,
+    inputs: { codeTex: weight.codes, tableTex: weight.table },
+    ints: { ELEMENTS: weight.elements },
+    label: `linear.int5-decode:${weight.elements}:${shape}`,
+  });
+  weight.decoded = decoded;
+  // The codes are dead once it is decoded, and a stacked weight holds both
+  // otherwise; `free` on the weight object releases whichever exist.
+  return decoded;
+}
+
+/**
+ * @param {import("../runtime/execution.js").Execution} execution
+ * @param {{x: Tensor, weight: Tensor | Int5Weight, bias?: Tensor, rows: number, inChannels: number,
  *   outChannels: number, activation?: "none" | "relu" | "sigmoid",
  *   weightLayout?: "out-major" | "in-major", roundHalf?: boolean}} call
  * @param {Tensor} [into]
@@ -395,6 +505,18 @@ export function linear(execution, call, into) {
   if (output === x) {
     throw new Error("linear: a fragment shader cannot read the texture it draws into");
   }
+  // An int5 weight decodes in the kernel; it has no single texture to sample.
+  // A shape the inner loop cannot address is decoded once instead - see
+  // `int5DecodeSource` for which shapes those are and why the uploader cannot
+  // tell them apart.
+  let int5 = /** @type {Int5Weight} */ (weight).int5 === true;
+  /** @type {any} */
+  let weightTensor = weight;
+  const codeWeight = /** @type {Int5Weight} */ (weight);
+  if (int5 && (weightLayout !== "out-major" || inChannels % INT5_GROUP !== 0)) {
+    weightTensor = decodedInt5(execution, codeWeight, `${rows}x${inChannels}x${outChannels}`);
+    int5 = false;
+  }
   if (!execution.noLinearBlock
     && blockedApplies(rows, inChannels, outChannels, weightLayout)) {
     const blockRows = blockRowsFor(execution);
@@ -402,16 +524,27 @@ export function linear(execution, call, into) {
     const planes = Array.from({ length: blockRows },
       (_, i) => execution.allocate(rowQuads * outChannels, `linear.plane${i}`));
     execution.dispatch({
-      source: blockedSource(
-        rows, inChannels, outChannels, activation, bias !== undefined, weightLayout, roundHalf,
-        blockRows),
+      source: int5
+        ? blockedInt5Source(
+          rows, inChannels, outChannels, activation, bias !== undefined, roundHalf, blockRows)
+        : blockedSource(
+          rows, inChannels, outChannels, activation, bias !== undefined, weightLayout, roundHalf,
+          blockRows),
       outputs: planes,
-      inputs: bias === undefined
-        ? { xTex: x, weightTex: weight }
-        : { xTex: x, weightTex: weight, biasTex: bias },
-      optionalInts: { ...shapeInts(rows, inChannels, outChannels), RQ: rowQuads },
-      label: `linear.block:${rows}x${inChannels}x${outChannels}:${activation}:${weightLayout}`
-        + `${roundHalf ? ":half" : ""}`,
+      inputs: int5
+        ? (bias === undefined
+          ? { xTex: x, codeTex: codeWeight.codes, tableTex: codeWeight.table }
+          : { xTex: x, codeTex: codeWeight.codes, tableTex: codeWeight.table, biasTex: bias })
+        : (bias === undefined
+          ? { xTex: x, weightTex: weightTensor }
+          : { xTex: x, weightTex: weightTensor, biasTex: bias }),
+      optionalInts: {
+        ...shapeInts(rows, inChannels, outChannels),
+        RQ: rowQuads,
+        ...(int5 ? { GPR: inChannels / INT5_GROUP } : {}),
+      },
+      label: `linear.block${int5 ? ".int5" : ""}:${rows}x${inChannels}x${outChannels}`
+        + `:${activation}:${weightLayout}${roundHalf ? ":half" : ""}`,
     });
     execution.dispatch({
       source: blockRepackSource(blockRows),
@@ -423,13 +556,18 @@ export function linear(execution, call, into) {
     for (const plane of planes) execution.release(plane);
     return output;
   }
+  if (int5) {
+    throw new Error(
+      `linear: an int5 weight only has the blocked path, and ${rows}x${inChannels}x`
+      + `${outChannels} does not take it (blockedApplies says no)`);
+  }
   return execution.dispatch({
     source: linearSource(
       rows, inChannels, outChannels, activation, bias !== undefined, weightLayout, roundHalf),
     output,
     inputs: bias === undefined
-      ? { xTex: x, weightTex: weight }
-      : { xTex: x, weightTex: weight, biasTex: bias },
+      ? { xTex: x, weightTex: weightTensor }
+      : { xTex: x, weightTex: weightTensor, biasTex: bias },
     optionalInts: shapeInts(rows, inChannels, outChannels),
     label: `linear:${rows}x${inChannels}x${outChannels}:${activation}:${weightLayout}`
       + `${roundHalf ? ":half" : ""}`,

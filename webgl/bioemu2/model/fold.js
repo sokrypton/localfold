@@ -73,16 +73,32 @@ const attentionNames = (prefix) => ({
  * stage's are read. One shared list would hold all of them to the end.
  *
  * @param {import("../../runtime/execution.js").Execution} execution
- * @param {(name: string) => Promise<ArrayLike<number>>} read
+ * @param {any} read a bundle reader, with its `.source(name)` for the codes
  */
 function group(execution, read) {
   const held = [];
   return {
-    /** One tensor, by its full name. */
+    /**
+     * One tensor, by its full name, in the narrowest form the kernels can read.
+     *
+     * 🔴 THREE FORMS, IN ORDER OF HOW MANY BYTES A PROJECTION HAS TO STREAM.
+     * First the bundle's five-bit CODES left as codes for the kernel to decode
+     * (0.875 bytes a weight, and the decoded value is exactly what the host
+     * would have produced - `webgl/runtime/int5.js`); then float16 (two bytes,
+     * and the first thing here that is not bit-identical); then float32. The
+     * first two apply only to a weight of 65,536 floats or more, which is where
+     * a weight stops fitting in cache and starts being the thing a projection
+     * waits for.
+     *
+     * `--no-int5-weights` and `--no-half-weights` are the control arms, and they
+     * nest: dropping the first falls back to the second.
+     */
     up: async (name, label) => {
-      // `uploadWeight`, not `upload`: with `--half-weights` a weight of 65,536
-      // floats or more is held in float16, which halves what a big projection
-      // streams. Off by default; see `Storage.halfWeights`.
+      const codes = execution.uploadInt5Weight(await read.source(name), label ?? name);
+      if (codes !== null) {
+        held.push(codes);
+        return codes;
+      }
       const tensor = execution.uploadWeight(
         Float32Array.from(await read(name)), label ?? name);
       held.push(tensor);
@@ -97,7 +113,11 @@ function group(execution, read) {
       return out;
     },
     release: () => {
-      for (const tensor of held) execution.release(tensor);
+      // An int5 weight is a pair of tensors behind a `free`, not one tensor.
+      for (const tensor of held) {
+        if (tensor.int5 === true) tensor.free();
+        else execution.release(tensor);
+      }
       held.length = 0;
     },
     get count() { return held.length; },
@@ -106,7 +126,7 @@ function group(execution, read) {
 
 /**
  * @param {import("../../runtime/execution.js").Execution} execution
- * @param {(name: string) => Promise<ArrayLike<number>>} read a bundle reader
+ * @param {any} read a bundle reader, with its `.source(name)` for the codes a bundle reader
  * @param {any} features `shared/bioemu2/featurise.js`'s
  * @param {{steps?: number, samples?: number, seed?: number, passes?: number,
  *   mode?: "structure" | "equilibrium", stepScale?: number, epsilon?: number,
@@ -321,7 +341,11 @@ export async function foldBioemu2OnWebGl2(execution, read, features, options = {
     const bias = await head.up("distogram_module/distogram/bias", "dg.bias");
     const out = distogramLogits(execution, {
       pair: trunk.pair, tokens, channels: BIOEMU2.pair,
-      bins: BIOEMU2.distogramBins, weights, bias, weightLayout: "out-major",
+      bins: BIOEMU2.distogramBins,
+      // The distogram head is not `linear`, so it needs a plain tensor: its
+      // weight is 64 x 256, which `uploadInt5Weight` declines anyway.
+      weights: /** @type {any} */ (weights), bias: /** @type {any} */ (bias),
+      weightLayout: "out-major",
     });
     const values = Float32Array.from(execution.read(out));
     execution.release(out);
