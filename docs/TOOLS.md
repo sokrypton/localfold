@@ -11,13 +11,14 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-471 tools. `tools/fixtures/` is data and is not listed.
+473 tools. `tools/fixtures/` is data and is not listed.
 
-## `tools/gpu/` - the WebGPU lane (226)
+## `tools/gpu/` - the WebGPU lane (228)
 
 Each exports `async function main(device, args)` and is run as
 `node tools/gpu-chrome.mjs tools/gpu/<module>.js [--flags]`.
 
+- **`af2-synthetic-block.js`** - Synthetic AF2 Evoformer weights, in the structure both backends read.
 - **`bench-ab.js`** - Interleaved A/B for the AF3 pairformer, in one process.
 - **`bench-af2-warm.js`** - One AF2 trunk pass, COLD AND WARM, at the shape another port is measured on.
 - **`bench-attention-project.js`** - AF2's q/k/v/gate projection alone, at several register blocks, in one process.
@@ -142,6 +143,7 @@ Each exports `async function main(device, args)` and is run as
 - **`check-webgl-attention-block.js`** - The whole attention block in WebGL2 against the WGSL block and a CPU reference - the cross-API differential this backend's attention has lacked.
 - **`check-webgl-attention.js`** - Gated attention for every head width this port runs, against a CPU reference and against the kernel it replaces.
 - **`check-webgl-evoformer-block.js`** - A whole AF2 Evoformer block in WebGL2 against the WGSL block.
+- **`check-webgl-evoformer-stack.js`** - Two Evoformer blocks in a row, both stacks, against their WGSL counterparts.
 - **`check-webgl-kernels.js`** - The two WebGL2 kernels against independent CPU references - the gate they have never had.
 - **`check-webgl-opm.js`** - The outer product mean in WebGL2 against the WGSL one and a CPU reference - four conventions and a two-stage contraction.
 - **`check-webgl-runtime.js`** - The WebGL2 backend's runtime and its first three AF2 primitives, against CPU references - and the expressibility question the headline ceiling gets wrong.

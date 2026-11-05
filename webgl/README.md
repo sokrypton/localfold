@@ -60,6 +60,7 @@ webgl/
   af2/
     evoformer/block.js          a whole Evoformer block and the extra-MSA block, nine sub-layers
                                 each, sharing the six that make up the pair half
+    evoformer/stack.js          the loop over blocks, for both kinds
 ```
 
 ## AF2, which is what this tree is being built for
@@ -151,8 +152,35 @@ them, and exactly one lands: **the bias in f32 gives 9.2e-8**, where `attended` 
 Both handles are kept. A gate that can bisect itself is worth more than one that only reports a
 number.
 
-Still to come: the Evoformer STACK over both block kinds, the structure module, and the confidence
-and distogram heads. After AF2: AF3's pairformer and diffusion, ESMFold2, bioemu2.
+🔴 **AND THE STACK HAS A DIVERGENCE THAT IS RECORDED AND NOT YET EXPLAINED.** Both whole
+blocks match at their floors, and so does a ONE-block stack (9.3e-8). Over two blocks the main
+stack's MSA reaches **2.5e-5** and over three **5.4e-5**.
+`tools/gpu/check-webgl-evoformer-stack.js` carries the evidence and the handles that produced it:
+
+- it is **MSA column attention** - `--disable=msa-column` takes the two-block arm from 2.5e-5 to
+  9.0e-8, and no other sub-layer moves it
+- column attention **alone** is innocent: with everything else silenced it is 4.8e-8 at one block
+  and 7.3e-8 at three, so the kernel is right and what it receives in composition is what matters
+- it is **not the loop**: `--identity-after=1` zeroes the second block's output projections on BOTH
+  sides, making it an identity, and reproduces the one-block numbers exactly
+- it is **not amplification**, which is the surprising part: a one-f32-step jitter at the block
+  BOUNDARY - where the two implementations actually differ - moves it by 9.0e-8. The extra stack's
+  arms ARE amplification and sit at their floors; the main stack's are not
+- it is **weight-dependent**: one weight set is at the floor on all four arms where another is not
+
+The standing hypothesis, untested: the shipped block rounds its normalised tensor to f16, and two
+f32 values 1e-7 apart that straddle an f16 boundary round 5e-4 apart. A coarse grid turns a tiny
+difference into a large one for the few elements that straddle - and a jitter of one f32 step is too
+small to make any of 320 elements straddle, which would explain a floor probe reading 9e-8 beside a
+real divergence of 2.5e-5. Confirming it needs a probe that counts straddles rather than one that
+jitters.
+
+The gate asserts a 2e-4 allowance - still 2.5x tighter than f16's own precision - and REPORTS every
+arm above its own measured floor, so neither a pass nor a failure can be read off it by mistake.
+`--strict` fails on them.
+
+Still to come: the structure module and the confidence and distogram heads. After AF2: AF3's
+pairformer and diffusion, ESMFold2, bioemu2.
 
 Every operation so far is checked against TWO references - an f64 CPU one written from the
 operation, and the WGSL kernel run in the same page - because a single reference cannot say which
