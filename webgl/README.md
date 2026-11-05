@@ -104,6 +104,8 @@ webgl/
     structure/module.js         the four stages composed, eight iterations, one hoisted pair norm
     model/fold.js               the fold, both graphs: the stages in order, with recycling,
                                 from a real bundle
+  esmc/
+    tower.js                    ESM-C's 36 blocks and ESMFold2's shim, mixed as they are produced
   heads/
     distogram.js                P(d < 8 A) for every pair - the contact map the page draws
     confidence.js               pLDDT, PAE and the pTM term
@@ -506,6 +508,12 @@ is invisible at the noise scale every stage gate drives it with and took a real 
 never reads the single. The confidence gate now drives a single at the trunk's own magnitude WITH A
 HEAVY TAIL, since a uniform draw at std 200 never reaches 512 and left the arm green with the bug
 restored.
+
+ESMFold2's language model is next and its TOWER is done: 36 ESM-C blocks and the shim, verified on
+the real 600M int3 checkpoint at **1.3e-7 to 4.8e-7** on block 0's four matmul inputs, the block's
+output, the mixed single and the pair representation. The two conventions that are silent - the qk
+LayerNorm over the whole 1152 rather than per head, and RoPE as SPLIT HALVES rather than
+interleaved - are what those four arms are for.
 
 🔴 **AND 61% OF A DENOISER CALL IS THE 24-BLOCK TRANSFORMER**: 425 ms of 695 at 59 tokens
 (`profile-webgl-af3-head.js`), with the atom encoder's stack at 55 and the pair conditioning at 51.
