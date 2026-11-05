@@ -73,6 +73,7 @@ webgl/
     trunk/pairformer-block.js   seven sub-layers threaded, not seven parallel deltas
     trunk/msa-attention.js      pair-weighted averaging: no queries, no keys
     trunk/msa-block.js          ...and the two crossing lines, with no default
+    trunk/embedder.js           the trunk's inputs; 139 one-hots as four weight rows
   af2/
     multimer/template.js        the multimer's nine-projection template embedder
     evoformer/block.js          a whole Evoformer block and the extra-MSA block, nine sub-layers

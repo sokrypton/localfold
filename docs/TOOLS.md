@@ -11,9 +11,9 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-493 tools. `tools/fixtures/` is data and is not listed.
+494 tools. `tools/fixtures/` is data and is not listed.
 
-## `tools/gpu/` - the WebGPU lane (248)
+## `tools/gpu/` - the WebGPU lane (249)
 
 Each exports `async function main(device, args)` and is run as
 `node tools/gpu-chrome.mjs tools/gpu/<module>.js [--flags]`.
@@ -142,6 +142,7 @@ Each exports `async function main(device, args)` and is run as
 - **`check-trunk.js`** - GPU trunk vs the PyTorch oracle, with the released weights.
 - **`check-webapp.js`** - End-to-end browser verification of `index.html` (AtomWorks Studio + `web/app.js`) in headless Chrome:
 - **`check-webgl-af3-block.js`** - One AF3 pairformer block in WebGL2, against TWO references.
+- **`check-webgl-af3-embedder.js`** - AF3's trunk embedder in WebGL2, against TWO references.
 - **`check-webgl-af3-grid-attention.js`** - AF3's triangle (grid) self-attention in WebGL2, against TWO references.
 - **`check-webgl-af3-msa-block.js`** - One AF3 MSA block in WebGL2, against TWO references.
 - **`check-webgl-af3-transition.js`** - AF3's transition block in WebGL2, against TWO references.
