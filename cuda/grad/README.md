@@ -160,7 +160,7 @@ from there 6MRR's mse goes 33.3 -> 12.8 in 40 steps. The Fourier noise embedding
   and `--bf16` runs the trunk's 48 pairformer blocks on their bf16 kernels - OpenFold3 trains under bf16 autocast - the
   pair and single between blocks staying float32. `--check-bf16` holds every gradient so computed to float32's: 8.9e-3
   (bf16's 8 bits), against 1.2e-5 between two float32 runs; the composition check always runs in float32. A 384-token,
-  48-sample step on 7BNY: 13.8 s float32, 8.2 s `--tf32`, 6.9 s `--tf32 --bf16`.
+  48-sample step on 7BNY: 13.8 s float32, 8.2 s `--tf32`, 6.9 s `--tf32 --bf16`, ~5.1 s with the samples batched.
 - **data parallel** - `--world=N --rank=r --rendezvous=<dir> [--dp=nccl|files]` (`of3dist.cuh`): each rank clips and
   accumulates its own examples, then every rank's accumulators and participation counts are summed before the one Adam
   step (`_sync_and_average_grads`), so the weights stay one set without being exchanged. NCCL for a GPU a rank; a file
