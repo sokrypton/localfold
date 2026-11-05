@@ -1068,6 +1068,11 @@ rather than arguing.** Summed from a bioemu2 fold's own profile - every `linear*
 | `linear.block:4624x1024x256` in-major | 504 | 186 |
 | **the countable total** | **5081** | **167 average, in 30.4 s** |
 
+🔴 **THIS TABLE IS OF ITS DATE AND THE FIRST TWO ROWS ARE SUPERSEDED** - `576x896x1792` is **375
+GFLOP/s** now and `576x768x1920` **394**, both tiled and on a float16 x. The rates here were also
+taken under `--profile`, whose per-call wait is most of what it measures, so they compare within a run
+and not across them.
+
 🔴 **SO ONE SHAPE REACHES 670 GFLOP/s AND THE FOLD AVERAGES 167, AND THE FIRST READING OF THAT WAS
 WRONG.** Dividing 5081 by 670 gives 7.6 s and the appearance of a 4x of headroom - and the fragment
 counts seemed to explain it, since the 670 shape has **295,936** fragments where
@@ -1086,11 +1091,27 @@ concurrent, and then they need the planes.
 `[in][out]` float16 with an aspect ratio of 8, which is exactly the case the blocked geometry suits;
 the int5 kernels are balanced shapes whose cost includes the DECODE - about fifteen integer
 operations of address arithmetic per eight weights, which this file records as the reason the first
-int5 projection was 23% slower than the float16 it replaced. **Those kernels are ALU-limited on the
-decode, not fetch-limited, so no fragment count reaches 670 for them.** The honest floor is therefore
-the sum over labels of each label's own achievable rate - which is what the fold already is. **5081
-GFLOP in 30.4 s is at the floor for this mix of kernels, and the 7.6 s figure above is an artefact of
-applying one shape's rate to all of them.**
+int5 projection was 23% slower than the float16 it replaced.
+
+🔴 **AND THE TWO CONCLUSIONS THAT USED TO FOLLOW HERE ARE BOTH RETRACTED, BY MEASUREMENT.** They
+read: *"Those kernels are ALU-limited on the decode, not fetch-limited, so no fragment count reaches
+670 for them"* and *"5081 GFLOP in 30.4 s is at the floor for this mix of kernels"*.
+
+**The decode is not the limit.** `probe-webgl-linear-operand.js` aliases the weight codes so every
+fragment reads the SAME four code texels - removing every code-fetch miss while leaving every decode
+instruction in place - and the kernel does not move: **1.09x, and 1.01 and 0.85 on other runs**, all
+inside its own spread. Meanwhile the arm that aliases **x**, doing the identical decode, goes from
+10.06 ms to 2.93 and from 184 GFLOP/s to **632**. A kernel that reaches 632 GFLOP/s with the same
+decode arithmetic is not ALU-limited on that decode; it is limited by x's fetch locality, and the
+inference from "the decode is expensive" to "the decode is the limit" was never measured.
+
+**And 30.4 s was not the floor**: the same mix of kernels, same weights, same step count, folds in
+**22.4 s** after a tile-aware fragment order and x in float16, with `576x896x1792` going **175 to 375
+GFLOP/s** and `576x768x1920` to 394. See "The dense projection is bound by x's fetch locality" below
+for all of it. What was right in the retracted paragraph is narrower and still holds: **670 is a
+shape's rate rather than the backend's**, and the honest floor is the sum over labels of each label's
+own achievable rate - it is just that two of those rates were 2.1x higher than this section assumed,
+and a floor computed from unmeasured rates is an estimate wearing a floor's clothes.
 
 ### 🔴 A UNIFORM BLOCK READ IS 2.1x A `texelFetch`, SO THE CEILING IS A TEXTURE CEILING
 
