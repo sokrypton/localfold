@@ -75,7 +75,7 @@ template <class A> void run1d(const char* kernel, size_t n, const A& a) {
 void dispatchInstance(const std::string& name, const std::string& decl, const void* args, size_t argBytes, Grid groups,
                       uint32_t threads, size_t smem = 0, const char* label = nullptr);
 // LF_GPUBUSY: the GPU-busy and kernel time of every committed command buffer, summed, with batching left ON
-void gpuBusyReport(const char* what, int over = 0);
+void gpuBusyReport(const char* what, int over = 0, const char* unit = "step");
 void gpuBusyReset();                        // (the spans are global; a per-design report must clear them)
 void precompile();                          // the instances a previous run used, compiled now in parallel
 // the name of the list of GEMM instances a port's folds use (~/.cache/localfold/metal/<name>; a wheel ships one beside

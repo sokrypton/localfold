@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """This tree's int8 RFD4-Proteina trunk against bios-labs' MLX fp16 trunk, tensor by tensor.
 
-    python3 tools/compare-rfd4p-mlx-weights.py <ours.safetensors> <theirs_fp16.safetensors>
+    python3 tools/compare-rfd4p-mlx-weights.py <ours.safetensors> <theirs_fp16.safetensors> [<manifest.json>] [--sample=N]
 
 🔴 WHY THIS IS WORTH A TOOL. `bios-labs/RFD4-Proteina-MLX-fp16` is an independent Apple-silicon port of
 the same model - its own kernels, its own runtime (MLX), its own conversion script - built from the SAME
@@ -95,7 +95,11 @@ def main():
     # Read together they gave a median of 2.5e-4 that looked like a flattering int8 figure and was really
     # the fp16 group holding the average down.
     codec = {}
-    mpath = sys.argv[3] if len(sys.argv) > 3 and not sys.argv[3].startswith("--") else None
+    # 🔴 THE MANIFEST IS TAKEN FROM ANY POSITION, because keyed on argv[3] alone the DOCUMENTED form plus the
+    # DOCUMENTED flag - `<ours> <theirs> --sample=50000` - silently dropped the partition and printed the one
+    # median this file's own header calls misleading ("looks like a flattering int8 figure"). A tool whose
+    # usage line omits the argument that decides whether its number means anything is a trap.
+    mpath = next((a for a in sys.argv[3:] if not a.startswith("--")), None)
     if mpath:
         man = json.load(open(mpath))
         tt = man.get("tensors") or man
@@ -158,9 +162,18 @@ def main():
             print(f"       {d}")
     if not rows:
         return 1
-    for name, label in (("float32", "our F32 vs their fp16 -> THEIR conversion error"),
-                        ("int8", "our INT8 vs their fp16 -> OUR quantisation"),
-                        ("unknown", "codec unknown (no manifest passed)")):
+    # 🔴 EVERY GROUP PRESENT, NOT THREE NAMED ONES. `codec` takes whatever string the manifest holds, so a
+    # bundle with `int4`, `bfloat16` or a renamed `f32` put a whole group into a key this loop never printed
+    # while "matched by name and shape: 558" still printed - the allow-list trap CLAUDE.md records, where a
+    # key the producer has and the consumer does not name is silently thrown away.
+    LABELS = {"float32": "our F32 vs their fp16 -> THEIR conversion error",
+              "int8": "our INT8 vs their fp16 -> OUR quantisation",
+              "unknown": "codec unknown (no manifest passed)"}
+    order = [k for k in ("float32", "int8") if k in groups] + \
+            sorted(k for k in groups if k not in ("float32", "int8", "unknown")) + \
+            (["unknown"] if "unknown" in groups else [])
+    for name in order:
+        label = LABELS.get(name, f"codec {name!r} (not one this tool has a reading for - check the manifest)")
         g = groups.get(name)
         if not g:
             continue

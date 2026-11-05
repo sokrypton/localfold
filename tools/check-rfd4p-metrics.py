@@ -157,7 +157,7 @@ def main() -> int:
             "  default dumps are on disk (cuda/rfd4p/gate-writer-*, gate-metrics-5o45, gate-groups-5o45,\n"
             "  gate-partial-1brs, each needing its own coors.f32). Build them with cuda/rfd4p/gate.py's\n"
             "  writer and metrics arms, or name a dump written by `localfold-rfd4p --dump-sample=<dir>`.")
-    bad = 0
+    bad, compared = 0, 0
     for spec, dump in pairs:
         spec, dump = Path(spec), Path(dump)
         if "input" not in json.loads(spec.read_text()):
@@ -186,11 +186,28 @@ def main() -> int:
         if up["filters"] != got["filters"]:
             problems.append(f"filters: upstream {up['filters']}, here {got['filters']}")
         bad += bool(problems)
+        compared += 1
         print(f"  {dump.name:42s} {len(up['metrics'])} metrics, {len(up['bonds'])} bonds  "
               f"{'ok' if not problems else 'DIFFERS'}")
         for p in problems[:8]:
             print(f"      {p}")
-    print(f"{len(pairs)} designs, {bad} differing")
+    # 🔴 AND THE COUNT THAT MATTERS IS WHAT WAS COMPARED, NOT WHAT WAS LISTED. The empty-`pairs` refusal
+    # above does not cover a run where every pair is SKIPPED - the `"input" not in spec` branch `continue`s -
+    # so three dumps with no `input:` printed "3 designs, 0 differing" and returned 0, which is the same
+    # vacuous green one door along. cuda/rfd4p/gate.py's `upstream m` row tests only `returncode == 0` and
+    # that this line parses, so it read `ok` having compared nothing.
+    # 🔴 AND THE WORDING IS cuda/rfd4p/gate.py's, WHICH GREPS THIS LINE. Its `upstream m` row parses
+    # `(\d+) designs, (\d+) differing`, so "N designs compared of M listed" - tried first - made a run that
+    # compared everything and agreed read DIFFERS, because the regex no longer matched. The count is now the
+    # COMPARED one (not `len(pairs)`, which was the vacuous part) in the phrasing that gate already reads,
+    # and anything skipped is said on its own line.
+    print(f"{compared} designs, {bad} differing")
+    if compared != len(pairs):
+        print(f"  ({len(pairs) - compared} of {len(pairs)} listed were skipped and are NOT in that count)")
+    if not compared:
+        raise SystemExit(f"check-rfd4p-metrics: {len(pairs)} pair(s) listed and NONE compared - every one was "
+                         "skipped (a spec with no `input:` has no upstream condition_spec form). Nothing was "
+                         "checked, so this is not a pass.")
     return 1 if bad else 0
 
 

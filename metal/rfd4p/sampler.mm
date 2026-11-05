@@ -351,15 +351,26 @@ int generate(const std::string& genDir, const std::string& outPath, int designs,
   // and the peak is now FLAT in the design count: 2.39 GB at one design and at five, n = 257; 1.28 and
   // 1.29 GB at one and at TWENTY, n = 100.
   //
-  // 🔴 WHAT IS LEFT IS ~0.5 MB A DESIGN AND IS DELIBERATELY NOT HOISTED. That residual is `noiseDev` plus
-  // the two `uploadNew` calls in the step loop (the coordinate-group rows and the chirality rows, n x 37
-  // and n x 18 floats a step), and nothing in this function releases. They cannot move out of the loop the
-  // way the features did, because unlike the features they are RECOMPUTED from the current coordinates
-  // every step - and reusing ONE buffer across steps is worse than allocating, not better: see the note at
-  // `a.eps` below, where a per-step upload into work the GPU had already queued made the fold
-  // NONDETERMINISTIC, six runs giving four designs. A ring of buffers with a sync discipline would fix the
-  // bytes and could reintroduce that race, so it waits for a campaign large enough to measure
-  // (60,000 step-uploads - a thousand designs of sixty steps - is ~1.6 GB; five designs is 2.5 MB).
+  // 🔴 WHAT IS LEFT IS ~0.5 MB A DESIGN, AND THE FIRST VERSION OF THIS NOTE NAMED THE WRONG BUFFERS.
+  // Nothing in this function releases anything, and counted properly the design loop allocates **8 a
+  // design** on an unconditional run - `noiseDev` (the whole replayed stream) and the DECODER's seven
+  // (`attnIdx`, `seqDev`, `feats`, `sd`, `dLogits`, `dCoors`, `dPresence`) - plus **4 more** on a partial or
+  // inverse run (`attnDev`, `ef`, `meanDev`, `lsDev`, the encoder's), and **2 a STEP** (the coordinate-group
+  // rows and the chirality rows, n x 37 and n x 18 floats). Eight is exactly the `+8 allocations a design`
+  // the stats line reports, so the arithmetic closes; the earlier note credited the whole residual to
+  // `noiseDev` and the two step uploads and so explained 3 of the 8.
+  //
+  // The REASON differs per group, which is why only one of them is left on purpose:
+  //   * the two per-STEP uploads genuinely cannot be hoisted - unlike the features they are recomputed from
+  //     the current coordinates every step, and reusing ONE buffer across steps is worse than allocating:
+  //     see the note at `a.eps` below, where a per-step upload into work the GPU had already queued made
+  //     the fold NONDETERMINISTIC, six runs giving four designs. A ring with a sync discipline would fix
+  //     the bytes and could reintroduce that race.
+  //   * the decoder's seven and the encoder's four have no such excuse. They are per-DESIGN, not per-step,
+  //     and could be hoisted exactly as the features were. They are O(n) and O(na) rather than the features'
+  //     O(n^2), which is why the measured growth is ~0.5 MB a design at n = 100 against the 30 MB the
+  //     features cost before the hoist - small enough that it has not been worth a second bit-identity run,
+  //     and large enough to say so rather than imply the residual is unavoidable.
   float* seqF = allocT<float>((size_t)n * D_.seqDim);
   float* pairF = allocT<float>(nn * D_.pairDim);
   float* sAct = allocT<float>((size_t)n * D_.D);
@@ -440,12 +451,14 @@ int generate(const std::string& genDir, const std::string& outPath, int designs,
     sync();
     const float* mean = (const float*)host(meanDev);
     const float* ls = (const float*)host(lsDev);
-    std::vector<float> x1Ll((size_t)n * latent, 0.f);
+    // named apart from the DEVICE buffer `x1Ll` above: -Wall does not warn on a shadow, and the commit
+    // that hoisted this function's feature buffers was fixing a leak caused by exactly this pattern
+    std::vector<float> x1LlHost((size_t)n * latent, 0.f);
     for (size_t e = 0; e < emitIdx.size(); ++e) {
       const int tok = emitIdx[e], row = within[e];
       for (int k = 0; k < latent; ++k) {
         const float m = mean[(size_t)row * latent + k], l = ls[(size_t)row * latent + k];
-        x1Ll[(size_t)tok * latent + k] = (float)(m + (float)(noise[noiseAt + (size_t)tok * latent + k] * (float)std::exp(l)));
+        x1LlHost[(size_t)tok * latent + k] = (float)(m + (float)(noise[noiseAt + (size_t)tok * latent + k] * (float)std::exp(l)));
       }
     }
     noiseAt += (size_t)n * latent;
@@ -463,11 +476,11 @@ int generate(const std::string& genDir, const std::string& outPath, int designs,
                                      && atoi(getenv("LOCALFOLD_RFD4P_X1_CANM")) != 0;
     const float* caNm = x1FromSample ? M.hostF("in/caNm") : nullptr;
     const float* coorsNm = x1FromSample ? nullptr : M.hostF("e/coorsNm");
-    std::vector<float> x1Bb((size_t)n * 3, 0.f);
+    std::vector<float> x1BbHost((size_t)n * 3, 0.f);
     for (int i = 0; i < n; ++i)
       if (emitBb[i] != 0)
         for (int k = 0; k < 3; ++k)
-          x1Bb[(size_t)i * 3 + k] = x1FromSample ? caNm[i * 3 + k] : coorsNm[((size_t)i * 37 + 1) * 3 + k];
+          x1BbHost[(size_t)i * 3 + k] = x1FromSample ? caNm[i * 3 + k] : coorsNm[((size_t)i * 37 + 1) * 3 + k];
 
     // and the corruption: (1 - t) x0 + t x1, the backbone's x0 offset per molecule first
     std::vector<float> x0Bb((size_t)n * 3), x0Ll((size_t)n * latent);
@@ -482,17 +495,17 @@ int generate(const std::string& genDir, const std::string& outPath, int designs,
       if (emitBb[i] != 0)
         for (int k = 0; k < 3; ++k)
           bb0[(size_t)i * 3 + k] = (float)((float)((1.f - tB) * x0Bb[(size_t)i * 3 + k]) +
-                                           (float)(tB * x1Bb[(size_t)i * 3 + k]));
+                                           (float)(tB * x1BbHost[(size_t)i * 3 + k]));
       if (emitLl[i] != 0)
         for (int k = 0; k < latent; ++k)
           ll0[(size_t)i * latent + k] = (float)((float)((1.f - tL) * x0Ll[(size_t)i * latent + k]) +
-                                                (float)(tL * x1Ll[(size_t)i * latent + k]));
+                                                (float)(tL * x1LlHost[(size_t)i * latent + k]));
     }
     // 🔴 INVERSE FOLDING KEEPS THE CLEAN BACKBONE AND RE-NOISES IT EVERY STEP (the resampled forward marginal):
     // the structure is given and only the sequence is designed, so the backbone is never integrated - it is
     // drawn afresh at each step's time and handed back clean at the last.
     if (inverse) {
-      target = x1Bb;
+      target = x1BbHost;
       std::vector<float> xb((size_t)n * 3);
       noiseAt += noisedBackbone(noise + noiseAt, n, emitBb, xb.data());
       noiseAt += groupOffsets(noise + noiseAt, n, emitBb, coordCond, moleculeIid, scale, xb.data());
@@ -883,7 +896,7 @@ int generate(const std::string& genDir, const std::string& outPath, int designs,
            "-> %s\n", emitted, atoms, steps, trunkPasses, filled, path.c_str());
     if (getenv("LF_GPUBUSY")) {
       gpuBusyReport("the whole generation", steps);
-      gpuBusyReport("the whole generation, a PASS", (int)trunkPasses);
+      gpuBusyReport("the whole generation, a PASS", (int)trunkPasses, "pass");
     }
     printf("  consecutive CA-CA: median %.2f A, min %.2f, max %.2f\n", d.caSpacing[0], d.caSpacing[1],
            d.caSpacing[2]);

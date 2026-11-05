@@ -477,8 +477,17 @@ struct Device {
     // dispatch's second copy overlaps with work the first could not. The same caveat caps the other three
     // from below. What the table licenses is a ranking of what MORE work costs, which is exactly the question
     // "is this worth optimising" asks, and it says: the pair track, and nothing else.
+    // 🔴 AND NOT UNDER THE PROFILE, WHICH WOULD CORRUPT THE OTHER INSTRUMENT SILENTLY. The profile path
+    // below gives each dispatch a command buffer and attributes that buffer's whole GPU time to the one
+    // label - and a duplicate is encoded into the SAME buffer, so `LOCALFOLD_PROFILE=1 LOCALFOLD_DUP=x`
+    // would report x at (1 + dupN)x its real time with nothing to say so. main.mm presents the two as an
+    // INDEPENDENT cross-check (22.1% profiled against 25.1% duplicated), which is only true if they are run
+    // in separate processes; this makes that structural rather than a convention a reader has to know.
+    // (and `!profileOn` is evaluated PER DISPATCH, not folded into the static: `profileOn` is true only for
+    //  the one profiled step, so a static initialised on the first dispatch would answer for the whole run -
+    //  which is how the first version of this guard passed its own test while duplicating 196 dispatches)
     static const char* dupWant = getenv("LOCALFOLD_DUP");
-    if (dupWant && *dupWant && label && strstr(label, dupWant)) {
+    if (dupWant && *dupWant && !profileOn && label && strstr(label, dupWant)) {
       static const int dupN = getenv("LOCALFOLD_DUP_N") ? atoi(getenv("LOCALFOLD_DUP_N")) : 1;
       for (int i = 0; i < dupN; ++i) {
         ++stats.dispatches;
@@ -567,13 +576,15 @@ void gpuBusyReset() {
   GPU_SPANS.clear();
   GPU_BUSY_MS = 0; GPU_KERNEL_MS = 0; GPU_BUSY_N = 0;
 }
-void gpuBusyReport(const char* what, int over) {
+void gpuBusyReport(const char* what, int over, const char* unit) {
   double gpu = 0, kern = 0, span = 0; long n = 0;
   gpuBusySnapshot(&gpu, &kern, &n, &span);
   if (!n) return;
   fprintf(stderr, "%s: %ld command buffers, GPU busy %.1f ms of a %.1f ms span (%.0f%% busy)", what, n, gpu,
           span, span > 0 ? 100 * gpu / span : 0.0);
-  if (over > 0) fprintf(stderr, ", %.1f ms a step over %d", gpu / over, over);
+  // the unit is the caller's, because this is called once a STEP and once a PASS and a fixed "a step" made
+  // the per-pass line contradict its own label
+  if (over > 0) fprintf(stderr, ", %.1f ms a %s over %d", gpu / over, unit ? unit : "step", over);
   fprintf(stderr, "\n");
 }
 
@@ -1564,6 +1575,14 @@ bool matrixUnits() { return tensorWanted(); }
 void profileStart() {
   Device& d = D();
   if (!profiling()) return;
+  // 🔴 REFUSED TOGETHER, because they measure the same thing two ways and one corrupts the other: a
+  // duplicate is encoded into the SAME command buffer the profile attributes wholly to one label, so a
+  // profiled duplicated run reports that label at (1 + dupN)x its real GPU time with nothing to say so.
+  // main.mm reads the two as an INDEPENDENT cross-check, which is only true run separately.
+  if (const char* dup = getenv("LOCALFOLD_DUP"))
+    if (*dup)
+      die("LOCALFOLD_PROFILE and LOCALFOLD_DUP measure the same thing two ways and corrupt each other (a "
+          "duplicate lands in the command buffer the profile attributes to one label) - run them separately");
   d.sync(); d.profiled.clear(); d.profileOn = true;
 }
 // The triangle's contraction stored in half, scaled by 2^-10, where the matrix units run (LOCALFOLD_HALF_PROD=0 the

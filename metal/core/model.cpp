@@ -696,7 +696,11 @@ void Model::loadInput(const std::string& dir) {
   for (size_t got = 0; got < bytes;) {
     const size_t want = std::min<size_t>(bytes - got, (size_t)1 << 30);
     ssize_t r = pread(fd, h + got, want, (off_t)got);
-    if (r <= 0) die("cannot read %s/model.bin (%zu of %zu bytes, errno %d)", dir.c_str(), got, bytes, errno);
+    // r == 0 is EOF - a file shorter than `stat` reported - and carries no errno, so printing one there
+    // would be a stale number in the one message this change exists to stop being misleading
+    if (r == 0) die("cannot read %s/model.bin: ended at %zu of %zu bytes", dir.c_str(), got, bytes);
+    if (r < 0) die("cannot read %s/model.bin (%zu of %zu bytes, errno %d: %s)", dir.c_str(), got, bytes,
+                   errno, strerror(errno));
     got += (size_t)r;
   }
   close(fd);
