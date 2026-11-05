@@ -92,7 +92,21 @@ export async function main(device, args) {
     ballast.push(execution.allocate(4 << 20, "bench.ballast"));
   }
 
-  for (const shape of SHAPES) {
+  // 🔴 `--shapes=RxIxO,...` REPLACES THE TABLE, which is how the WORKING SET is
+  // swept at constant arithmetic: `4624x256x512`, `9248x256x256` and
+  // `18496x256x128` all do the same 1.21 GFLOP with a weight of 512, 256 and
+  // 128 KiB. If the rate rises as the weight shrinks, these kernels are bound
+  // by what they MISS rather than by the 21.33 flops a fetch the output budget
+  // allows - see webgl/README.md's retraction of the old floor.
+  const chosen = option(args, "shapes", "");
+  const shapes = chosen === "" ? SHAPES : chosen.split(",").map((text) => {
+    const [rows, inChannels, outChannels] = text.split("x").map(Number);
+    return {
+      name: text, rows, inChannels, outChannels,
+      weightLayout: option(args, "layout", "out-major"),
+    };
+  });
+  for (const shape of shapes) {
     const { rows: n, inChannels, outChannels, weightLayout, activation = "none" } = shape;
     const x = execution.upload(fill(n * inChannels, 7 + n), "bench.x");
     const weight = execution.upload(fill(inChannels * outChannels, 11 + inChannels), "bench.w");

@@ -1402,20 +1402,44 @@ projections were AT the hardware's limit and the fold could not go below about 2
 cap is real. The rate was wrong by a factor of six.
 
 `tools/gpu/probe-webgl-fetch-rate.js --ceiling-window=<texels>` measures the issue rate directly,
-with a non-hoistable stride through a window of a chosen size and nothing else in the loop:
+with a non-hoistable stride through a window of a chosen size and nothing else in the loop. Four
+interleaved rounds, each arm's minimum, and `spreadWithinArm` beside it so a reader can see whether
+the number settled:
 
-| window | | issue rate | `x 21.33` |
-|---|---|---:|---:|
-| 64 texels, 1 KiB | registers and L1 | **52.1 G fetch4/s** | 1112 GFLOP/s |
-| 1024, 16 KiB | | 19.4 | 413 |
-| 4096, 64 KiB | a realistic tile | **23.1** | **494** |
-| 65536, 1 MiB | a streamed weight | 14.3 | 305 |
+| window | | issue rate | spread | `x 21.33` |
+|---|---|---:|---:|---:|
+| 256 texels, 4 KiB | | 82.6 | **1.45** | 1762 |
+| 1024, 16 KiB | | **32.5** | 1.07 | **693** |
+| 4096, 64 KiB | a realistic tile | **24.3** | 1.07 | **519** |
+| 16384, 256 KiB | | 19.0 | 1.12 | 404 |
+| 65536, 1 MiB | a streamed weight | 19.2 | 1.13 | 410 |
 
-**So the backend's ceiling is 305 to 1112 GFLOP/s depending on the WORKING SET, and the projections
-at 137 to 198 are at 28 to 40% of the realistic one.** They are not at the hardware's limit; they
-are missing. What caps this backend is the output budget TIMES the miss rate, and only the first
-factor is fixed - which is why the two wins that moved these kernels most were both LOCALITY
-(the fragment order, 1.49x, and the tile-aware mapping, 3.29x) and not arithmetic.
+The two smallest windows do not settle - at 4 KiB the loop is probably being hoisted into registers -
+so read the four from 16 KiB down. **The backend's ceiling at a realistic working set is 400 to 700
+GFLOP/s, and the projections at 105 to 198 are at a QUARTER TO A HALF of it.** They are not at the
+hardware's limit; they are missing. What caps this backend is the output budget TIMES the miss rate,
+and only the first factor is fixed - which is why the two changes that moved these kernels most were
+both LOCALITY (the fragment order at 1.49x, the tile-aware mapping at 3.29x) and neither was
+arithmetic.
+
+🔴 **AND THE INSTRUMENT ITSELF HAD TO BE FIXED TWICE BEFORE ANY OF THAT WAS TRUE.** Its first
+version walked `i` modulo 16 through a 64-texel window, which a compiler that unrolls sixteen
+iterations can hoist entirely - an "issue rate" that is really a register read. Its second ran each
+arm once after two warm-up dispatches and reported **7.54, 16.88 and 17.04 G fetch4/s for the same
+arm on three consecutive runs**, because an Apple GPU's clock ramps over a load that lasts fifty
+milliseconds. Both numbers were quoted in this file before the rounds existed. A probe is an
+instrument, and an instrument that has not been checked against itself is a number generator.
+
+🔴 **AND THE SEARCH FOR WHAT THEY ARE MISSING ON HAS FOUR MORE NULLS.** Neither operand's size is
+the limiter - swept at constant arithmetic through `bench-webgl-linear.js --shapes=`, a **16x**
+range of weight (1 MiB to 64 KiB) moves the rate by 1.12x and a **16x** range of x (0.56 to 9 MiB)
+by 1.12x, both flat at 102 to 140 GFLOP/s. Nor is it the render-target count, which is the opposite
+of the obvious guess: eight RGBA32F targets is 128 bytes a pixel of tile memory, and the ceiling arm
+measures **the same rate at one target and at eight**. Nor the row block, nor the fragment order,
+nor a tile-aware mapping - those three are measured above. What is left is the STREAM COUNT: the
+projection reads twelve rows per k-step where the ceiling arm reads four, and the probe's own
+`2x4x1` arm (six streams) is 1.3x the rate of `8x4x1` (twelve) - the right sign, not the right size.
+That is where the remaining 2 to 4x is, and it is unresolved.
 
 The first version of this paragraph is the mistake this file warns about everywhere else, made in
 the place where it does the most damage: **an estimate presented as a bound, used to argue that

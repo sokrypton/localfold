@@ -24,6 +24,16 @@
  *     four blocks read four DIFFERENT planes, as four channels do.
  *   - `4x4x2` and `2x4x1` interpolate.
  *
+ * 🔴 AND IT NEEDS ROUNDS, BECAUSE ONE ROUND OF IT IS NOT A MEASUREMENT. The
+ * first version ran each arm once after two warm-up dispatches and reported
+ * 7.54, 16.88 and 17.04 G fetch4/s for the SAME arm on three consecutive runs -
+ * a 2.3x spread, which is an Apple GPU's clock ramping under a load that lasts
+ * fifty milliseconds, on a machine with another process on it. A bound founded
+ * on the low sample understates the hardware and a bound founded on the high one
+ * overstates it; `--rounds` interleaves the arms several times over and keeps
+ * each arm's MINIMUM, and `spreadWithinArm` reports how far apart the rounds
+ * were so a reader can see whether the number settled.
+ *
  * 🔴 READ THE RATE, NOT THE TIME. The arms do different amounts of arithmetic
  * on purpose - what is held constant is the fragment count and the data - so
  * `gigaFetchesPerSecond` is the comparable column and `milliseconds` is not.
@@ -115,14 +125,15 @@ ${Array.from({ length: blocks }, (_, b) => block(b)).join("\n")}
  * dead, and the texel index varies with the fragment so the compiler cannot
  * hoist the whole loop.
  */
-const ceilingSource = (count, window) => `#version 300 es
+const ceilingSource = (count, window, targets = 1) => `#version 300 es
 precision highp float;
 precision highp int;
 precision highp sampler2D;
 const int W = 2048;
 const int COUNT = ${count};
 const int WINDOW = ${window};
-layout(location = 0) out vec4 result;
+${Array.from({ length: targets }, (_, t) =>
+    `layout(location = ${t}) out vec4 result${t};`).join("\n")}
 uniform sampler2D aTex;
 
 vec4 fetch4(sampler2D tex, int texel) {
@@ -145,11 +156,13 @@ void main() {
     total += fetch4(aTex, base + (i * 53 + 2027) % WINDOW);
     total += fetch4(aTex, base + (i * 53 + 3041) % WINDOW);
   }
-  result = total;
+${Array.from({ length: targets }, (_, t) =>
+    `  result${t} = total * float(${t + 1});`).join("\n")}
 }`;
 
 export async function main(device, args) {
-  const iterations = Number(option(args, "iterations", "8"));
+  const iterations = Number(option(args, "iterations", "24"));
+  const rounds = Number(option(args, "rounds", "4"));
   const k = Number(option(args, "k", "68"));
   const fragments = Number(option(args, "fragments", "36992"));
   const arms = option(args, "arms", "8x4x1,4x4x2,2x4x4,2x4x1")
@@ -172,33 +185,49 @@ export async function main(device, args) {
   // The texel window the ceiling arm walks, in TEXELS: 4096 is 64 KiB, which is
   // resident but far too big to hoist or to hold in registers.
   const ceilingWindow = Number(option(args, "ceiling-window", "4096"));
+  const ceilingTargets = option(args, "ceiling-targets", "1,2,4,8")
+    .split(",").map(Number);
   const ceilingFragments = 65536;
   {
-    const ring = Array.from({ length: iterations },
-      () => execution.allocate(ceilingFragments * 4, "probe.ceiling"));
-    const text = ceilingSource(ceilingCount, ceilingWindow);
-    const run = (out) => execution.dispatch({
-      source: text, output: out, inputs: { aTex: a }, label: "probe.ceiling",
-    });
-    for (let i = 0; i < 2; i += 1) {
-      run(ring[i % ring.length]);
-      execution.read(ring[i % ring.length]);
+    // 🔴 AND THE SAME LOOP AT ONE, TWO, FOUR AND EIGHT RENDER TARGETS. Eight
+    // RGBA32F targets is 128 bytes a pixel of TILE MEMORY, and tile memory is
+    // what bounds how many fragments a core keeps in flight - so the register
+    // tile that buys arithmetic intensity may be spending the occupancy that
+    // hides the fetch latency. Nothing else in the loop changes.
+    for (const targets of ceilingTargets) {
+      /** @type {number[]} */
+      const samples = [];
+      const ring = Array.from({ length: iterations }, () =>
+        Array.from({ length: targets },
+          () => execution.allocate(ceilingFragments * 4, "probe.ceiling")));
+      const text = ceilingSource(ceilingCount, ceilingWindow, targets);
+      const run = (outs) => execution.dispatch({
+        source: text, outputs: outs, inputs: { aTex: a }, label: `probe.ceiling:${targets}`,
+      });
+      for (let i = 0; i < 2; i += 1) {
+        run(ring[i % ring.length]);
+        execution.read(ring[i % ring.length][0]);
+      }
+      for (let round = 0; round < rounds; round += 1) {
+        const start = performance.now();
+        for (let i = 0; i < iterations; i += 1) run(ring[i % ring.length]);
+        execution.read(ring[0][0]);
+        samples.push((performance.now() - start) / iterations);
+      }
+      const ms = Math.min(...samples);
+      for (const set of ring) for (const out of set) execution.release(out);
+      rows.push({
+        arm: `ceiling:${targets}`,
+        outputs: targets * 4,
+        fetchesPerStep: 4,
+        milliseconds: Number(ms.toFixed(2)),
+        gigaFetchesPerSecond:
+          Number((ceilingFragments * ceilingCount / ms / 1e6).toFixed(2)),
+        gigaflops: 0,
+        flopsPerFetch: 0,
+        spreadWithinArm: Number((Math.max(...samples) / Math.min(...samples)).toFixed(2)),
+      });
     }
-    const start = performance.now();
-    for (let i = 0; i < iterations; i += 1) run(ring[i]);
-    execution.read(ring[iterations - 1]);
-    const ms = (performance.now() - start) / iterations;
-    for (const out of ring) execution.release(out);
-    rows.push({
-      arm: "ceiling",
-      outputs: 4,
-      fetchesPerStep: 4,
-      milliseconds: Number(ms.toFixed(2)),
-      gigaFetchesPerSecond:
-        Number((ceilingFragments * ceilingCount / ms / 1e6).toFixed(2)),
-      gigaflops: 0,
-      flopsPerFetch: 0,
-    });
   }
 
   for (const [r, c, blocks] of arms) {
@@ -216,10 +245,15 @@ export async function main(device, args) {
       dispatch(ring[i % ring.length]);
       execution.read(ring[i % ring.length][0]);
     }
-    const start = performance.now();
-    for (let i = 0; i < iterations; i += 1) dispatch(ring[i]);
-    execution.read(ring[iterations - 1][0]);
-    const ms = (performance.now() - start) / iterations;
+    /** @type {number[]} */
+    const samples = [];
+    for (let round = 0; round < rounds; round += 1) {
+      const start = performance.now();
+      for (let i = 0; i < iterations; i += 1) dispatch(ring[i % ring.length]);
+      execution.read(ring[0][0]);
+      samples.push((performance.now() - start) / iterations);
+    }
+    const ms = Math.min(...samples);
     for (const set of ring) for (const out of set) execution.release(out);
     const fetches = fragments * blocks * (r + c) * (k / 4);
     const flops = fragments * blocks * r * c * k * 2;
@@ -231,12 +265,14 @@ export async function main(device, args) {
       gigaFetchesPerSecond: Number((fetches / ms / 1e6).toFixed(2)),
       gigaflops: Number((flops / ms / 1e6).toFixed(1)),
       flopsPerFetch: Number((flops / fetches).toFixed(1)),
+      spreadWithinArm: Number((Math.max(...samples) / Math.min(...samples)).toFixed(2)),
     });
   }
   execution.release(a);
   execution.release(b);
-  const shaped = rows.filter((row) => row.arm !== "ceiling");
-  const ceiling = rows.find((row) => row.arm === "ceiling");
+  const shaped = rows.filter((row) => !row.arm.startsWith("ceiling"));
+  const ceiling = rows.filter((row) => row.arm.startsWith("ceiling"))
+    .reduce((x, y) => (y.gigaFetchesPerSecond > x.gigaFetchesPerSecond ? y : x));
   const best = shaped.reduce((x, y) =>
     (y.gigaFetchesPerSecond > x.gigaFetchesPerSecond ? y : x));
   const worst = shaped.reduce((x, y) =>
