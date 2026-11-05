@@ -8,9 +8,10 @@ operating systems that the WebGPU path refuses outright.
 
 🔴 **ALPHAFOLD 2 FOLDS HERE NOW - BOTH GRAPHS - AND NOTHING SELECTS IT YET.** 59 residues from
 `model-af2-monomer-int5`, 4 extra-MSA blocks and 48 Evoformer blocks, the template stack, eight
-structure iterations and both confidence heads: **consecutive alpha carbons 3.834 A, pLDDT 57.941
-against the WGSL fold's 57.938, and the worst atom 0.0705 A away** against a measured floor of
-0.0785 A. The MULTIMER folds from `model-multimer` on the same driver, and agrees far more closely
+structure iterations and both confidence heads: **consecutive alpha carbons 3.834 A, pLDDT 57.937
+against the WGSL fold's 57.938, and the worst atom 0.0565 A away** against a measured floor of
+0.0355 A - that residual and that floor are both float16 weights' (see "Closing the gap"); at
+`--no-half-weights` they are 0.0291 and 0.0973. The MULTIMER folds from `model-multimer` on the same driver, and agrees far more closely
 - **0.0005 A at the worst atom** - because that graph is f32 throughout.
 `tools/gpu/fold-af2-webgl.js` is both folds and both comparisons. The SPEED is **1.25 s where the
 WGSL fold of the same weights is 0.27 s**, a 4.6x gap of which 1.1 s is shader compilation - see
@@ -27,6 +28,13 @@ decide it, moved out of `webgpu/kernels/` where they sat with `webgl2` in their 
 importer, plus the texture layout and the limit arithmetic they shared by copy. The honest summary
 of the sections below: the numerics are **checked and correct**, the speed is **4.6x off the WebGPU
 path on AF2 and 15x on bioemu2** - it was 17x and 246x - and the shapes are **worse**.
+
+🔴 **AND ON MEMORY IT IS NOW THE EFFICIENT ONE.** A 68-token bioemu2 fold holds **409 MiB** here
+against the WGSL fold's 815 MiB of weights plus 135 of activations, because this path keeps the
+checkpoint in the five-bit form the bundle ships in and decodes it in the kernel while the WGSL
+side expands it to float16. The same fold was 1656 MiB and 968 s at the start of that work and is
+**57.6 s** now. Nothing about the sections below is a projection: every figure is a fold that ran,
+and the ones that are losses are in there too.
 
 🔴 **AND THEY WERE UNGATED FOR AS LONG AS THEY EXISTED, WHICH IS WHY THE FIRST THING THIS TREE
 GOT WAS A DIFFERENTIAL.** AGENTS.md requires every GPU kernel to have "a deterministic differential
