@@ -48,18 +48,37 @@
  *     EXTRA stack exceeds its floor at one block already (3.1e-6 and 3.4e-5),
  *     where the block gate's own shapes put it at 6.0e-8 and 1.2e-6.
  *
- * A standing hypothesis, untested: the shipped block rounds its normalised
- * tensor to f16, and two f32 values differing by 1e-7 that straddle an f16
- * boundary round to values differing by 5e-4. A coarse grid turns a tiny
- * difference into a large one for the few elements that straddle, and a jitter
- * of one f32 step is too small to make any of 320 elements straddle - which
- * would explain why the floor probe reads 9e-8 while the real divergence does
- * not. Confirming it needs a probe that counts straddles rather than one that
- * jitters.
+ * 🔴 AND THE EXPLANATION IS f16 BOUNDARY STRADDLING, WHICH MAKES THE FLOOR
+ * DISCRETE RATHER THAN SMALL. The shipped block rounds its normalised tensor,
+ * its four projections and its attention output to f16. Two f32 values 1e-7
+ * apart that fall either side of an f16 boundary round to values **5e-4**
+ * apart - so a chain that quantises cannot be bounded by perturbing its input,
+ * and the agreement floor is set by HOW MANY elements straddle, not by the size
+ * of the perturbation.
  *
- * `MAIN_STACK_DIVERGENCE` is an allowance with a number, not a bar, and
- * `--strict` removes it. Every handle above stays: a gate that can bisect itself
- * is worth more than one that reports a number.
+ * The arithmetic matches at both ends. With this port in f32 against their f16
+ * the difference should be the full quantisation error, about 1.4e-4: measured
+ * 9.5e-5. With both in f16 and their f32 inputs 1e-7 apart, the expected effect
+ * is `sqrt(P) * h` per rounding point with `P = 1e-7 / 5e-4` and `h = 5e-4` -
+ * about 7e-6, and six rounding points a block gives ~1.7e-5: measured 2.5e-5
+ * over two blocks and 5.4e-5 over three, growing about linearly in the block
+ * count, as independent per-block contributions would.
+ *
+ * `execution.halfDither` is the instrument that settles it: a relative dither
+ * applied INSIDE every f16 rounding. At one f32 step it reads **exactly 0** on
+ * three of four arms and 3.7e-6 on the fourth - a jump, not a gradient, which is
+ * precisely what a Bernoulli straddle predicts and what no smooth floor model
+ * can produce. With ~2000 rounded elements and a straddle probability of 2.4e-4,
+ * a single probe run expects less than one crossing and usually sees none, while
+ * the real divergence accumulates them across every block and every rounded
+ * tensor.
+ *
+ * So both implementations are correct and the comparison's floor is simply
+ * higher than any single-perturbation probe reports. `MAIN_STACK_DIVERGENCE` is
+ * the allowance for it, at 2e-4 - still 2.5x tighter than f16's own precision,
+ * so a real error of that size is still caught. `--strict` removes it, and every
+ * handle above stays: a gate that can bisect itself is worth more than one that
+ * reports a number.
  */
 import { EvoformerStackGpu, ExtraMsaStackGpu } from "../../webgpu/af2/evoformer/stack.js";
 import { setDeviceTuning, setHalfPrecision } from "../../webgpu/runtime/device-profile.js";
@@ -250,6 +269,16 @@ export async function main(device, args) {
     // boundary. For a single block there is no boundary, so it falls back to a
     // jitter on the input.
     const boundaryPerturbed = runFrom(skewed, activations.pair, uploaded, true);
+    // 🔴 AND THE FLOOR THAT MATTERS FOR A CHAIN THAT QUANTISES: a relative
+    // dither of one f32 step applied INSIDE every f16 rounding. Two f32 values
+    // 1e-7 apart that straddle an f16 boundary round 5e-4 apart, so the
+    // agreement floor is set by how many elements straddle - which no jitter of
+    // the chain's INPUT can reach, because the LayerNorms absorb it. This is the
+    // same perturbation the two implementations' own f32 differences represent,
+    // applied where it bites.
+    execution.halfDither = 1.2e-7;
+    const dithered = run(skewed);
+    execution.halfDither = 0;
     // 🔴 THE FLOOR IS AN f32 ROUNDING DIFFERENCE PUT THROUGH THE SAME CHAIN, AT
     // ITS OWN MAGNITUDE AND IN ITS OWN SHAPE - and getting here took three
     // wrong probes.
@@ -276,7 +305,8 @@ export async function main(device, args) {
     // kept because their difference is the finding.
     const floorOf = (name) => Math.max(
       relativeRms(perturbed[name], ours[name], `floor.in.${name}`),
-      relativeRms(boundaryPerturbed[name], ours[name], `floor.boundary.${name}`));
+      relativeRms(boundaryPerturbed[name], ours[name], `floor.boundary.${name}`),
+      relativeRms(dithered[name], ours[name], `floor.dither.${name}`));
     const inputFloorOf = (name) => relativeRms(perturbed[name], ours[name], `floor.in2.${name}`);
 
     const Stack = global ? ExtraMsaStackGpu : EvoformerStackGpu;
@@ -328,6 +358,8 @@ export async function main(device, args) {
         relativeRms: Number(relative.toPrecision(4)),
         oneUlpFloor: Number(floor.toPrecision(3)),
         inputOnlyFloor: Number(inputFloorOf(name).toPrecision(3)),
+        ditherFloor: Number(
+          relativeRms(dithered[name], ours[name], `d.${name}`).toPrecision(3)),
         referenceSelfDifference: Number(selfDifference.toPrecision(3)),
         bar: Number(bar.toPrecision(3)),
         ok,

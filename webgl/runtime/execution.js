@@ -71,8 +71,16 @@ float fetch1(sampler2D tex, int index) {
 // fallback whose folds cannot be compared with the primary path's is not much
 // of a fallback. (No backticks in here - this comment is inside a JS template
 // literal and one would end it. It has happened twice.)
+// A relative dither applied before the rounding, zero unless a probe sets it.
+// It exists to MEASURE the comparison's real floor, which is not an f32 step: two
+// values 1e-7 apart that straddle an f16 boundary round 5e-4 apart, so a chain
+// that quantises cannot be bounded by jittering its input. Set it to 1e-7 and
+// the output moves by what two correct implementations of this chain differ by.
+uniform float halfDither;
+
 vec4 half4(vec4 v) {
-  return vec4(unpackHalf2x16(packHalf2x16(v.xy)), unpackHalf2x16(packHalf2x16(v.zw)));
+  vec4 d = v * (1.0 + halfDither);
+  return vec4(unpackHalf2x16(packHalf2x16(d.xy)), unpackHalf2x16(packHalf2x16(d.zw)));
 }
 `;
 
@@ -95,6 +103,12 @@ export class Execution {
     this.compiles = 0;
     /** Each draw checks for a GL error. Cheap, and off for a benchmark. */
     this.checkErrors = options.checkErrors ?? true;
+    /**
+     * A relative dither applied inside every f16 rounding; see `half4` in
+     * PRELUDE. Zero in use - it is an instrument for measuring what a
+     * quantising chain's agreement floor actually is.
+     */
+    this.halfDither = options.halfDither ?? 0;
     this.maxBandRows = Math.min(
       gl.getParameter(gl.MAX_VIEWPORT_DIMS)[1], gl.getParameter(gl.MAX_TEXTURE_SIZE));
     /**
@@ -244,6 +258,13 @@ export class Execution {
       const location = this.#uniform(entry, name);
       if (location === null) throw new Error(`${label}: no float uniform \`${name}\``);
       gl.uniform1f(location, value);
+    }
+
+    if (this.halfDither !== 0) {
+      // Set where the kernel has it and skip where it does not: a kernel that
+      // never rounds has no such uniform, and that is not an error.
+      const location = this.#uniform(entry, "halfDither");
+      if (location !== null) gl.uniform1f(location, this.halfDither);
     }
 
     this.dispatches += 1;

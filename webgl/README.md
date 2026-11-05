@@ -168,12 +168,22 @@ stack's MSA reaches **2.5e-5** and over three **5.4e-5**.
   arms ARE amplification and sit at their floors; the main stack's are not
 - it is **weight-dependent**: one weight set is at the floor on all four arms where another is not
 
-The standing hypothesis, untested: the shipped block rounds its normalised tensor to f16, and two
-f32 values 1e-7 apart that straddle an f16 boundary round 5e-4 apart. A coarse grid turns a tiny
-difference into a large one for the few elements that straddle - and a jitter of one f32 step is too
-small to make any of 320 elements straddle, which would explain a floor probe reading 9e-8 beside a
-real divergence of 2.5e-5. Confirming it needs a probe that counts straddles rather than one that
-jitters.
+🔴 **AND THE EXPLANATION IS f16 BOUNDARY STRADDLING, WHICH MAKES THE FLOOR DISCRETE RATHER THAN
+SMALL.** Two f32 values 1e-7 apart that fall either side of an f16 boundary round **5e-4** apart, so
+a chain that quantises cannot be bounded by perturbing its input: the floor is set by how many
+elements straddle. The arithmetic matches at both ends - this port in f32 against their f16 should
+differ by the full quantisation error of ~1.4e-4 and measures 9.5e-5; both in f16 with f32 inputs
+1e-7 apart gives `sqrt(P) * h` per rounding point, about 7e-6, and six points a block gives ~1.7e-5
+against 2.5e-5 measured over two blocks and 5.4e-5 over three, growing linearly in the block count.
+
+`execution.halfDither` settles it - a relative dither applied INSIDE every f16 rounding. At one f32
+step it reads **exactly 0** on three of four arms and 3.7e-6 on the fourth: a jump, not a gradient,
+which is what a Bernoulli straddle predicts and what no smooth floor model can produce. With ~2000
+rounded elements and a straddle probability of 2.4e-4, one probe run expects less than one crossing
+and usually sees none, while the real divergence accumulates them across every block.
+
+So both implementations are correct and the floor is simply higher than any single-perturbation
+probe reports.
 
 The gate asserts a 2e-4 allowance - still 2.5x tighter than f16's own precision - and REPORTS every
 arm above its own measured floor, so neither a pass nor a failure can be read off it by mistake.
