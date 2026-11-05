@@ -5,7 +5,8 @@ atoms are, and the featurised input the trainer reads.
     ~/venv/bin/python tools/make_of3_example.py <entry.cif> <out dir> --family=openbind0 [--a3m-dir=<dir>] [--search]
 
 Writes <out dir>/job.json, <out dir>/truth.txt and <out dir>/input/ (cuda/featurise/af3-featurise's output), and
-<out dir>/example.txt - the trainer's one line, `input truth [resolution=X]`.
+<out dir>/example.txt - the trainer's lines, `input truth [resolution=X] perms=... set=... preferred=... weight=...`: one
+a chain and one an interface (chains within 5 A), weighted as AF3 SI 2.5.1 weighs them (--whole: one line, none preferred).
 
 The job: the first model's chains by label_asym_id, waters and hydrogens left out. A polymer is its entity's FULL
 sequence (_entity_poly_seq, so an unresolved residue is in the job and masked in the truth, as OpenFold3 trains), a
@@ -95,6 +96,11 @@ def main():
     ap.add_argument("--a3m-dir", default="")
     ap.add_argument("--search", action="store_true")
     ap.add_argument("--ccd", default=os.path.join(REPO, "ccd", "components.cif"))
+    ap.add_argument("--set", default="pdb", choices=["pdb", "monomer", "rna", "disordered"],
+                    help="OpenFold3's dataset the entry belongs to: its loss weights and crops (dataset_configs.py)")
+    ap.add_argument("--n-clust", type=float, default=1.0,
+                    help="the entry's cluster size, AF3 SI 2.5.1's N_clust (OpenFold3 counts the datapoints in a 40%%-identity cluster)")
+    ap.add_argument("--whole", action="store_true", help="one line for the entry, no preferred chain or interface")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
 
@@ -114,6 +120,7 @@ def main():
     kind_of = {e.name: e.polymer_type for e in st.entities}
 
     sequences, truth = [], []
+    kinds, heavy = [], []    # each job chain's molecule type, and its resolved heavy atoms (for the interfaces)
     components = []          # (chain index, residue index, component code): what the permutations are written for
     ids = chain_ids()
     # label_asym_id chains (a gemmi subchain is one), polymers first and then the rest, each in file order: the
@@ -153,6 +160,7 @@ def main():
                 elif kind == "rna" and not a.search:
                     entry["unpairedMsa"] = ""
                 sequences.append({kind: entry})
+                kinds.append("nuc" if kind in ("dna", "rna") else "prot"); heavy.append([])
                 for pos in sorted(mons): components.append((index, pos, mons[pos]))
                 for res in sub:
                     if res.label_seq is None: continue
@@ -160,15 +168,18 @@ def main():
                         if atom.altloc not in ("\0", "A") or atom.occ <= 0: continue
                         p = atom.pos
                         truth.append(f"{index} {res.label_seq} {atom.name} {p.x:.3f} {p.y:.3f} {p.z:.3f}")
+                        heavy[-1].append((p.x, p.y, p.z))
             else:
                 codes = [res.name for res in sub]
                 sequences.append({"ligand": {"id": jid, "ccdCodes": codes}})
+                kinds.append("ligand"); heavy.append([])
                 for k, res in enumerate(sub, start=1):
                     components.append((index, k, res.name))
                     for atom in res:
                         if atom.altloc not in ("\0", "A") or atom.occ <= 0: continue
                         p = atom.pos
                         truth.append(f"{index} {k} {atom.name} {p.x:.3f} {p.y:.3f} {p.z:.3f}")
+                        heavy[-1].append((p.x, p.y, p.z))
     job = {"name": os.path.basename(a.cif).split(".")[0], "modelSeeds": [1], "sequences": sequences,
            "dialect": "alphafold3", "version": 2}
     with open(os.path.join(a.out, "job.json"), "w") as f: json.dump(job, f, indent=1)
@@ -190,9 +201,27 @@ def main():
             if p: f.write(f"{chain} {res} " + " | ".join(",".join(x) for x in p) + "\n")
     # the resolution, which gates the confidence losses (OpenFold3: 0.1 to 4.0 A, none outside or without one)
     res = st.resolution if st.resolution and st.resolution > 0 else None
+    # the datapoints (AF3 SI 2.5.1, OpenFold3's WeightedPDBDataset): every chain, and every pair of chains with heavy
+    # atoms within 5 A, each weighted (w_type / N_clust) (3 n_prot + 3 n_nuc + 1 n_ligand) and preferred by the crop
+    import numpy as np
+    base = (f"{os.path.abspath(os.path.join(a.out, 'input'))} {os.path.abspath(os.path.join(a.out, 'truth.txt'))}"
+            + (f" resolution={res:.2f}" if res else "") + f" perms={os.path.abspath(os.path.join(a.out, 'perms.txt'))} set={a.set}")
+    a_of = {"prot": 3.0, "nuc": 3.0, "ligand": 1.0}
+    lines = []
+    if a.whole:
+        lines.append(base)
+    else:
+        for i, k in enumerate(kinds):
+            if heavy[i]: lines.append(f"{base} preferred={i + 1} weight={0.5 / a.n_clust * a_of[k]:.4g}")
+        xyz = [np.array(h) if h else np.zeros((0, 3)) for h in heavy]
+        for i in range(len(kinds)):
+            for j in range(i + 1, len(kinds)):
+                if not len(xyz[i]) or not len(xyz[j]): continue
+                d = np.sqrt(((xyz[i][:, None, :] - xyz[j][None, :, :]) ** 2).sum(-1)).min()
+                if d < 5.0:
+                    lines.append(f"{base} preferred={i + 1},{j + 1} weight={1.0 / a.n_clust * (a_of[kinds[i]] + a_of[kinds[j]]):.4g}")
     with open(os.path.join(a.out, "example.txt"), "w") as f:
-        f.write(f"{os.path.abspath(os.path.join(a.out, 'input'))} {os.path.abspath(os.path.join(a.out, 'truth.txt'))}"
-                + (f" resolution={res:.2f}" if res else "") + f" perms={os.path.abspath(os.path.join(a.out, 'perms.txt'))}\n")
+        f.write("\n".join(lines) + "\n")
     print(f"{len(sequences)} chains, {len(truth)} resolved atoms -> {a.out}")
 
 

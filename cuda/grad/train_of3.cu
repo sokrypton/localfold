@@ -66,7 +66,7 @@ struct Example {
   struct Slot { double repeat = 0; std::vector<int> aatype, bin; std::vector<float> pb, uv, bb; bool geo = false; };
   std::vector<Slot> slots; int templates = 0;
   std::vector<double> xt, gm;                  // the truth [atoms * 3] and its resolved mask [atoms]
-  std::string permsPath;
+  std::string permsPath, set = "pdb";        // OpenFold3's dataset: pdb, monomer, rna (distillation), disordered
   of3::PermInput perm;                         // the whole entry, for the truth's permutation (of3perm.h)
   size_t atoms() const { return (size_t)n * dense; }
 };
@@ -84,11 +84,12 @@ static lf::Batch windows(const Example& e, bool padded, bool qblock) {
 
 // one line of --examples into M and out of it: the input's keys replace the last example's whole (an input's
 // `batch.`, `template.` and `job.` keys - a key one input has and the next lacks must not survive), then its arrays
-static Example loadExample(const std::string& line, bool padded, bool qblock) {
-  Example e;
+// a line's own fields (resolution, weight, preferred, perms, set) onto an example
+static void applyFields(Example& e, const std::string& line) {
   std::istringstream ls(line);
-  ls >> e.input >> e.truthPath;
-  std::string kv;
+  std::string skip, kv;
+  ls >> skip >> skip;
+  e.preferred.clear();
   while (ls >> kv) {
     const size_t eq = kv.find('=');
     const std::string k = kv.substr(0, eq), v = eq == std::string::npos ? "" : kv.substr(eq + 1);
@@ -96,8 +97,17 @@ static Example loadExample(const std::string& line, bool padded, bool qblock) {
     else if (k == "weight") e.weight = atof(v.c_str());
     else if (k == "preferred") { std::stringstream ss(v); std::string x; while (std::getline(ss, x, ',')) e.preferred.push_back(atoi(x.c_str())); }
     else if (k == "perms") e.permsPath = v;
+    else if (k == "set") {
+      e.set = v;
+      if (v != "pdb" && v != "monomer" && v != "rna" && v != "disordered") { fprintf(stderr, "example %s: set=%s is not pdb, monomer, rna or disordered\n", e.input.c_str(), v.c_str()); exit(1); }
+    }
     else { fprintf(stderr, "example %s: unknown field %s\n", e.input.c_str(), kv.c_str()); exit(1); }
   }
+}
+static Example loadExample(const std::string& line, bool padded, bool qblock) {
+  Example e;
+  { std::istringstream ls(line); ls >> e.input >> e.truthPath; }
+  applyFields(e, line);
   for (auto it = M.index.begin(); it != M.index.end();) {
     const std::string& k = it->first;
     if (!k.compare(0, 6, "batch.") || !k.compare(0, 9, "template.") || !k.compare(0, 4, "job.") || !k.compare(0, 7, "oracle."))
@@ -232,8 +242,13 @@ static Example loadExample(const std::string& line, bool padded, bool qblock) {
 // the example restricted to tokens `keep` (ascending): every per-token, per-atom and per-pair array and the MSA
 // pool's columns cut to them, the identifiers (residue and token index, asym, entity) kept as they were - OpenFold3
 // crops the structure and featurises the crop, and these are the arrays that featurisation reads
-static Example subset(const Example& e, const std::vector<int>& keep) {
-  Example o = e;
+static Example subset(const Example& e, const std::vector<int>& keep, bool whole = true) {
+  // (the crop's arrays only: a copy of the whole entry first would move its pair arrays, gigabytes on a large one)
+  Example o;
+  o.input = e.input; o.truthPath = e.truthPath; o.resolution = e.resolution; o.weight = e.weight; o.preferred = e.preferred;
+  o.dense = e.dense; o.profW = e.profW; o.P = e.P; o.templates = e.templates; o.permsPath = e.permsPath; o.set = e.set;
+  o.slots.resize(e.slots.size());
+  for (size_t k = 0; k < e.slots.size(); ++k) { o.slots[k].repeat = e.slots[k].repeat; o.slots[k].geo = e.slots[k].geo; }
   const int m = (int)keep.size(), D = e.dense;
   o.n = m;
   auto tok = [&](const auto& v, size_t w) { std::remove_cv_t<std::remove_reference_t<decltype(v)>> r((size_t)m * w);
@@ -248,6 +263,7 @@ static Example subset(const Example& e, const std::vector<int>& keep) {
   o.refPos = tok(e.refPos, (size_t)D * 3); o.refMask = tok(e.refMask, D); o.refCharge = tok(e.refCharge, D);
   o.predMask = tok(e.predMask, D); o.refElement = tok(e.refElement, D); o.names = tok(e.names, (size_t)D * 4); o.uid = tok(e.uid, D);
   o.xt = tok(e.xt, (size_t)D * 3); o.gm = tok(e.gm, D);
+  if (!whole) return o;     // (per token and per atom alone: what a crop reads to choose)
   if (!e.bonds.empty()) o.bonds = pair(e.bonds, 1);
   if (!e.orders.empty()) o.orders = pair(e.orders, 1);
   o.msaCode.assign((size_t)e.P * m, 0); o.msaDel.assign((size_t)e.P * m, 0); o.msaMask.assign((size_t)e.P * m, 0);
@@ -316,6 +332,73 @@ static std::vector<int> cropTokens(const Example& e, const of3::Layout& L, int b
     for (int k = 0; k < std::min<int>(budget, (int)by.size()); ++k) in[by[k].second] = 1;
   }
   std::vector<int> keep; for (int t = 0; t < n; ++t) if (in[t]) keep.push_back(t);
+  return keep;
+}
+
+// the permutation's input restricted to tokens `keep` - each token's position in its molecule kept as the whole
+// entry numbers it, so a chain-cropped truth's copies still align position by position
+static of3::PermInput subsetPerm(const of3::PermInput& P, const std::vector<int>& keep) {
+  of3::PermInput o; o.n = (int)keep.size(); o.dense = P.dense; o.perms = P.perms;
+  for (int t : keep) {
+    o.ent.push_back(P.ent[t]); o.sym.push_back(P.sym[t]); o.asym.push_back(P.asym[t]); o.molTok.push_back(P.molTok[t]);
+    o.ri.push_back(P.ri[t]); o.ligand.push_back(P.ligand[t]);
+    o.centre.push_back(P.centre[t] < 0 ? -1 : P.centre[t] - t * P.dense + (int)(o.ent.size() - 1) * P.dense);
+    for (int s = 0; s < P.dense; ++s) {
+      const size_t i = (size_t)t * P.dense + s;
+      o.name.push_back(P.name[i]); o.gm.push_back(P.gm[i]);
+      for (int q = 0; q < 3; ++q) o.xt.push_back(P.xt[i * 3 + q]);
+    }
+  }
+  return o;
+}
+// OpenFold3's chain crop (crop_chainwise, AF3 SI 2.5.4): past 20 polymer chains, the 20 nearest a random preferred
+// (interface) centre - chains by the first of their centres in distance order, ligands held out - plus the preferred
+// chains and every ligand chain within 5 A of a kept one (any atoms); all tokens when there are no more than 20
+static std::vector<int> chainCrop(const Example& e, const of3::Layout& L, std::mt19937_64& rng, int nChains = 20) {
+  std::vector<int> all(e.n); for (int t = 0; t < e.n; ++t) all[t] = t;
+  std::set<int> poly, lig;
+  for (int t = 0; t < e.n; ++t) (e.isLigand[t] ? lig : poly).insert(e.asym[t]);
+  for (int c : lig) poly.erase(c);
+  if ((int)poly.size() <= nChains) return all;
+  auto centre = [&](int t) { return L.atomized[t] ? L.start[t] : L.lddtRep[t]; };
+  std::vector<int> centres;
+  for (int t = 0; t < e.n; ++t) { const int a = centre(t); if (a >= 0 && e.gm[a] > 0) centres.push_back(t); }
+  auto d2 = [&](int s, int t) { double v = 0; for (int q = 0; q < 3; ++q) { double x = e.xt[centre(s) * 3 + q] - e.xt[centre(t) * 3 + q]; v += x * x; } return v; };
+  std::vector<int> pref;
+  for (int t : centres) if (e.preferred.empty() || std::count(e.preferred.begin(), e.preferred.end(), e.asym[t])) pref.push_back(t);
+  if (pref.empty()) pref = centres;
+  if (e.preferred.size() == 2) {
+    std::vector<int> face;
+    for (int s : pref) for (int t : pref) if (e.asym[s] != e.asym[t] && d2(s, t) < 15.0 * 15.0) { face.push_back(s); break; }
+    if (!face.empty()) pref = face;
+  }
+  const int ref = pref[std::uniform_int_distribution<size_t>(0, pref.size() - 1)(rng)];
+  std::vector<std::pair<double, int>> by;
+  for (int t : centres) if (!e.isLigand[t]) by.push_back({d2(ref, t), t});
+  std::stable_sort(by.begin(), by.end());
+  std::vector<int> chosen; std::set<int> seen;
+  for (auto& [d, t] : by) if (seen.insert(e.asym[t]).second) { chosen.push_back(e.asym[t]); if ((int)chosen.size() == nChains) break; }
+  std::set<int> keepChains(chosen.begin(), chosen.end());
+  for (int c : e.preferred) keepChains.insert(c);
+  for (int c : lig) {          // a ligand within 5 A of a kept polymer chain (resolved atoms)
+    bool near = false;
+    for (int t = 0; t < e.n && !near; ++t) {
+      if (e.asym[t] != c) continue;
+      for (int s = 0; s < e.n && !near; ++s) {
+        if (!std::count(chosen.begin(), chosen.end(), e.asym[s])) continue;
+        for (int a = 0; a < e.dense && !near; ++a) {
+          const size_t i = (size_t)t * e.dense + a; if (!(e.gm[i] > 0)) continue;
+          for (int b = 0; b < e.dense && !near; ++b) {
+            const size_t j = (size_t)s * e.dense + b; if (!(e.gm[j] > 0)) continue;
+            double v = 0; for (int q = 0; q < 3; ++q) { double x = e.xt[i * 3 + q] - e.xt[j * 3 + q]; v += x * x; }
+            near = v <= 25.0;
+          }
+        }
+      }
+    }
+    if (near) keepChains.insert(c);
+  }
+  std::vector<int> keep; for (int t = 0; t < e.n; ++t) if (keepChains.count(e.asym[t])) keep.push_back(t);
   return keep;
 }
 
@@ -592,7 +675,18 @@ int main(int argc, char** argv) {
          family.c_str(), bundle.c_str(), nMsa, nPf, ps.all.size(), nparams / 1e6, ps.all.size() - confFrom);
   const int Cz = te.C, Cs = te.Cs, Cm = te.Cm;
 
-  for (size_t k = 1; k < lines.size(); ++k) examples.push_back(loadExample(lines[k], padded, qblock));
+  // (lines naming the same input and truth - an entry's chains and interfaces - share one load, their own fields apart)
+  for (size_t k = 1; k < lines.size(); ++k) {
+    std::string in, tr; { std::istringstream ls(lines[k]); ls >> in >> tr; }
+    size_t same = examples.size();
+    for (size_t j = 0; j < examples.size(); ++j) if (examples[j].input == in && examples[j].truthPath == tr) { same = j; break; }
+    if (same == examples.size()) { examples.push_back(loadExample(lines[k], padded, qblock)); continue; }
+    Example e = examples[same];
+    const std::string oldPerms = e.permsPath;
+    applyFields(e, lines[k]);
+    if (e.permsPath != oldPerms) { fprintf(stderr, "%s: one input, two perms files\n", in.c_str()); return 1; }
+    examples.push_back(std::move(e));
+  }
   printf("every example's atom windows rebuilt as the featuriser built them\n");
   loadExample(lines[0], padded, qblock);                                   // (M is the first example's again: the port reads it)
 
@@ -853,15 +947,27 @@ int main(int argc, char** argv) {
     double tLoss = 0;
     const auto t0 = now();
     const of3::Layout Lfull = layoutOf(full);
-    std::vector<int> keep(full.n); for (int t = 0; t < full.n; ++t) keep[t] = t;
-    if (!fixed) keep = cropTokens(full, Lfull, crop, CropWeights{}, gen, strategy);
-    Example e = subset(full, keep);
+    // the dataset's settings (dataset_configs.py): the distillation sets crop 0.25 contiguous / 0.75 spatial with no
+    // chain crop and no confidence losses; the disordered set's diffusion terms over protein alone
+    const bool distil = full.set == "monomer" || full.set == "rna";
+    CropWeights cw; if (distil) cw = CropWeights{0.25, 0.75, 0.0};
+    // the chain crop first (the truth becomes the chain-cropped entry, as there), then the token crop
+    std::vector<int> keepC(full.n); for (int t = 0; t < full.n; ++t) keepC[t] = t;
+    if (!fixed && !distil) keepC = chainCrop(full, Lfull, gen);
+    const Example base = keepC.size() == (size_t)full.n ? full : subset(full, keepC, false);
+    const of3::PermInput gtPerm = keepC.size() == (size_t)full.n ? full.perm : subsetPerm(full.perm, keepC);
+    std::vector<int> keep(base.n); for (int t = 0; t < base.n; ++t) keep[t] = t;
+    if (!fixed) keep = cropTokens(base, keepC.size() == (size_t)full.n ? Lfull : layoutOf(base), crop, cw, gen, strategy);
+    if (keepC.size() != (size_t)full.n) strategy = "chains " + std::to_string(base.n) + "/" + std::to_string(full.n) + ", " + strategy;
+    // (the crop from the whole entry, its tokens mapped through the chain crop)
+    std::vector<int> keepFull(keep.size()); for (size_t k = 0; k < keep.size(); ++k) keepFull[k] = keepC[keep[k]];
+    Example e = subset(full, keepFull);
     const of3::Layout Lay = layoutOf(e);
     const int n = e.n; const size_t nn = (size_t)n * n, A = e.atoms();
     const int S = std::min(1024, e.P);
     Dev d; upload(d, e, padded, qblock, S);
     Acts a = makeActs(n, S);
-    const bool confOn = full.resolution >= 0.1 && full.resolution <= 4.0;
+    const bool confOn = full.resolution >= 0.1 && full.resolution <= 4.0 && (full.set == "pdb");
     // the trunk
     const int c = fixed ? 4 : 1 + (int)(gen() % 4);
     cycles(d, a, c, [&] { drawMsa(d, e, gen); });
@@ -872,7 +978,7 @@ int main(int argc, char** argv) {
       g::Scratch sc;
       xp = rollout(d, a, e, gen, 20);
     }
-    of3::permuteTruth(full.perm, keep, xp, e.xt, e.gm, nullptr);
+    of3::permuteTruth(gtPerm, keep, xp, e.xt, e.gm, nullptr);
     // the distogram: its loss on the host, its cotangent kept for the backward
     g::real* dLog = nullptr;
     {
@@ -918,7 +1024,14 @@ int main(int argc, char** argv) {
     g::real *dTs = d.zeros((size_t)n * Cs), *dTp = d.zeros(nn * Cz), *dTf = d.zeros((size_t)n * te.F);
     g::real *xD = d.zeros(A * 3), *xo = d.zeros(A * 3), *dxo = d.zeros(A * 3);
     size_t nRes = 0; for (size_t i = 0; i < A; ++i) nRes += e.gm[i] > 0;
-    of3dev::SmoothLddt sl; sl.init(Lay, e.xt, e.gm);   // (smooth LDDT, quadratic in atoms, on the device)
+    // (the disordered set: OpenFold3's loss_token_mask, protein tokens alone in the mse and smooth LDDT)
+    std::vector<double> lossAtom;
+    if (full.set == "disordered") {
+      lossAtom.assign(A, 0);
+      for (int t = 0; t < n; ++t) if (!e.isDna[t] && !e.isRna[t] && !e.isLigand[t]) for (int k = 0; k < e.dense; ++k) lossAtom[(size_t)t * e.dense + k] = 1;
+    }
+    std::vector<double> gmLoss(e.gm); if (!lossAtom.empty()) for (size_t i = 0; i < A; ++i) gmLoss[i] *= lossAtom[i];
+    of3dev::SmoothLddt sl; sl.init(Lay, e.xt, gmLoss);   // (smooth LDDT, quadratic in atoms, on the device)
     for (int smp = 0; smp < nSamples; ++smp) {
       g::Scratch sc;
       const double sigma = fixed ? sd * exp(-1.2 + 1.5 * (-1.0 + 2.0 * smp / std::max(1, nSamples - 1))) : sd * exp(-1.2 + 1.5 * N01(gen));
@@ -941,7 +1054,8 @@ int main(int argc, char** argv) {
       std::vector<double> xp(xh.begin(), xh.end()), dx(A * 3, 0);
       const auto tl = std::chrono::steady_clock::now();
       auto D = of3::diffusionLoss(Lay, xp, e.xt, e.gm, sigma, DW, &dx, 1.0 / nSamples,
-                                  [&](double sc, std::vector<double>* g) { return sl.run(xp, sc, train ? g : nullptr, STREAM); });
+                                  [&](double sc, std::vector<double>* g) { return sl.run(xp, sc, train ? g : nullptr, STREAM); },
+                                  lossAtom.empty() ? nullptr : &lossAtom);
       tLoss += msOf(tl, std::chrono::steady_clock::now());
       L.mse += D.mse / nSamples; L.bond += D.bond / nSamples; L.lddt += D.lddt / nSamples; L.diffusion += D.total / nSamples;
       if (train) {

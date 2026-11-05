@@ -68,10 +68,19 @@ one-hot one - the MSA stack, the pairformer, the distogram, the denoiser, the co
 - **data** - `tools/make_of3_example.py <entry.cif> <dir>` turns a deposited structure into an example: the AF3 job of its
   chains (each polymer its entity's FULL sequence, modified residues as modifications, every other chain a ligand of its
   components; polymers first, the order the featuriser gives asymId), the truth keyed by chain, residue and atom name,
-  the resolution, and the featurised input. `--examples=<file>` lists them (`input truth [resolution=X] [weight=W]
-  [preferred=i[,j]]`), drawn by weight.
-- **cropping** - to `--crop` tokens (384) by OpenFold3's three strategies (contiguous 0.2, spatial 0.4, spatial-interface
-  0.4; whole when it fits), over the resolved token centre atoms, the preferred chain or interface honoured. The crop
+  the resolution, the RDKit permutations, and the featurised input - and OpenFold3's datapoints: a line a chain and a
+  line an interface (chains with heavy atoms within 5 A), each weighted as AF3 SI 2.5.1's Algorithm 1 weighs it,
+  (w_chain 0.5 or w_interface 1) / N_clust x (3 n_prot + 3 n_nuc + 1 n_ligand), and naming it `preferred` for the crop.
+  `--examples=<file>` lists them (`input truth [resolution=X] [weight=W] [preferred=i[,j]] [perms=P] [set=S]`), drawn by
+  weight; lines naming one input share one load. `set=` is OpenFold3's dataset (`dataset_configs.py`): `pdb` (the
+  weighted PDB set), `monomer`/`rna` (the distillation sets: no confidence losses, no chain crop, crops 0.25 contiguous
+  0.75 spatial) and `disordered` (no confidence losses, the mse and smooth LDDT over protein tokens alone, the
+  alignment still over every resolved atom).
+- **cropping** - first OpenFold3's chain crop (AF3 SI 2.5.4: past 20 polymer chains, the 20 nearest a random preferred
+  centre, the preferred chains and every ligand within 5 A of a kept chain - the truth becomes that subset, as there),
+  then to `--crop` tokens (384) by the three strategies (contiguous 0.2, spatial 0.4, spatial-interface 0.4; whole when
+  it fits), over the resolved token centre atoms, the preferred chain or interface honoured. GroEL-GroES (1AON: 8,533
+  tokens, 35 chains, 98 datapoints) trains at ~8.6 s a 384-token step with 4 samples, 0.7 s of it the host's crops. The crop
   cuts the host arrays and REBUILDS the atom windows with the featuriser's own `atomGathers` - held, on every example
   at load, to the windows the featuriser wrote.
 - **the trunk** - 1 + U{0..3} cycles, the gradient through the last; each cycle's MSA a fresh 1024 rows, the valid ones

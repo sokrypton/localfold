@@ -136,7 +136,10 @@ struct DiffusionWeights { double mse = 4, bond = 0, lddt = 4, dna = 5, rna = 5, 
 inline Diffusion diffusionLoss(const Layout& L, const std::vector<double>& x, const std::vector<double>& xt,
                                const std::vector<double>& gm, double t, const DiffusionWeights& W, std::vector<double>* dx,
                                double scale = 1,
-                               const std::function<double(double, std::vector<double>*)>& smoothLddt = {}) {
+                               const std::function<double(double, std::vector<double>*)>& smoothLddt = {},
+                               const std::vector<double>* lossAtom = nullptr) {
+  // (lossAtom: OpenFold3's loss_token_mask on atoms - the disordered set's protein-only diffusion terms; the alignment
+  // still weighs every resolved atom)
   Diffusion D;
   const size_t A = L.atoms();
   const double wt = (t * t + W.sigmaData * W.sigmaData) / ((t * W.sigmaData) * (t * W.sigmaData));
@@ -147,7 +150,7 @@ inline Diffusion diffusionLoss(const Layout& L, const std::vector<double>& x, co
     const int tk = (int)(i / L.dense);
     w[i] = 1 + W.dna * L.dna[tk] + W.rna * L.rna[tk] + W.ligand * L.ligand[tk];
     m[i] = gm[i] > 0;
-    if (m[i]) live.push_back(i);
+    if (m[i] && (!lossAtom || (*lossAtom)[i] > 0)) live.push_back(i);
   }
   // mse: the truth aligned onto the prediction (detached)
   {
