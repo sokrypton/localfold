@@ -140,6 +140,65 @@ void main() {
  * ~25 us a 110,592-texel draw costs, and neither its traffic nor its redundant
  * reduction accounts for the difference.
  */
+export const layerNormStatsSource = (rows, channels, variance) => `${PRELUDE}${ONE_TARGET}
+const int ROWS = ${rows};
+const int CHANNELS = ${channels};
+const int CH4 = ${channels / 4};
+uniform sampler2D xTex;
+uniform float epsilon;
+
+void main() {
+  int row = linearTexel();
+  if (row >= ROWS) { result = vec4(0.0); return; }
+  int base = row * CH4;
+${variance === "fast"
+    ? `  float total = 0.0;
+  float totalSquares = 0.0;
+  for (int i = 0; i < CH4; ++i) {
+    vec4 v = fetch4(xTex, base + i);
+    total += v.x + v.y + v.z + v.w;
+    totalSquares += dot(v, v);
+  }
+  float mean = total / float(CHANNELS);
+  float inverseStd = inversesqrt(totalSquares / float(CHANNELS) - mean * mean + epsilon);`
+    : `  float total = 0.0;
+  for (int i = 0; i < CH4; ++i) {
+    vec4 v = fetch4(xTex, base + i);
+    total += v.x + v.y + v.z + v.w;
+  }
+  float mean = total / float(CHANNELS);
+
+  float spread = 0.0;
+  for (int i = 0; i < CH4; ++i) {
+    vec4 centred = fetch4(xTex, base + i) - mean;
+    spread += dot(centred, centred);
+  }
+  float inverseStd = inversesqrt(spread / float(CHANNELS) + epsilon);`}
+  result = vec4(mean, inverseStd, 0.0, 0.0);
+}`;
+
+/** The aligned kernel with the statistics read rather than swept. */
+export const splitLayerNormSource = (
+  rows, channels, roundHalf, hasWeight, hasBias,
+) => `${PRELUDE}${ONE_TARGET}
+const int ROWS = ${rows};
+const int CH4 = ${channels / 4};
+uniform sampler2D xTex;
+uniform sampler2D statsTex;
+${hasWeight ? "uniform sampler2D weightTex;" : ""}
+${hasBias ? "uniform sampler2D biasTex;" : ""}
+
+void main() {
+  int texel = linearTexel();
+  if (texel >= ROWS * CH4) { result = vec4(0.0); return; }
+  int row = texel / CH4;
+  int group = texel - row * CH4;
+  vec2 stats = fetch4(statsTex, row).xy;
+  vec4 value = fetch4(xTex, texel);
+  vec4 normalised = (value - stats.x) * stats.y${hasWeight ? " * fetch4(weightTex, group)" : ""}${hasBias ? "\n    + fetch4(biasTex, group)" : ""};
+  result = ${roundHalf ? "half4(normalised)" : "normalised"};
+}`;
+
 export const alignedLayerNormSource = (
   rows, channels, roundHalf, variance, hasWeight, hasBias,
 ) => `${PRELUDE}${ONE_TARGET}
@@ -227,6 +286,57 @@ export function layerNorm(
   const output = into ?? execution.allocate(rows * channels, "layerNorm");
   if (output === x) {
     throw new Error("layerNorm: a fragment shader cannot read the texture it draws into");
+  }
+  // 🔴 THE STATISTICS IN THEIR OWN PASS, AT 768 CHANNELS AND WIDER - WHICH IS A
+  // MEASURED BAND AND NOT A DERIVED ONE, BECAUSE THE DERIVED ONE WAS WRONG
+  // TWICE. The fused kernel has every fragment sweep its whole row and there are
+  // `CH4` fragments a row, so the row is read `CH4` times over (twice that
+  // two-pass); split, it is read once for the statistics and once to apply
+  // them. `bench-webgl-norm.js`, fused against split:
+  //
+  //   | shape | CH4 | factor |   | shape | CH4 | factor |
+  //   |---|---|---|   |---|---|---|
+  //   | 576x1024 | 256 | **3.65x** |   | 576x256 | 64 | 1.19x |
+  //   | 576x768 | 192 | **4.84x** |   | 240x512 | 128 | **0.96x** |
+  //   | 240x768 | 192 | **2.83x** |   | 3481x128 | 32 | **0.92x** |
+  //   | 68x768 | 192 | **1.82x** |   | 59x384 | 96 | **0.50x** |
+  //   | 576x512 | 128 | 1.92x |   | 59x128 | 32 | **0.33x** |
+  //
+  // The saving scales with `CH4` and the cost does not: one extra draw at the
+  // 22.9 us `probe-webgl-draw-floor.js` charges, plus a statistics pass of ONE
+  // fragment a row that is badly under-occupied at any row count this backend
+  // sees. So a narrow row loses - 0.33x at 128 channels - and `CH4 >= 192` is
+  // the only band with no measured loss at any row count from 68 to 576.
+  //
+  // 🔴 AND THE FIRST THRESHOLD WAS `CH4 >= 8`, WHICH COST A WHOLE ROUND. At 32
+  // channels it enabled the split everywhere, and the folds said so: bioemu2
+  // +2.9% but ESMFold2 **-4%** and AlphaFold 3 **-31%**. A threshold derived
+  // from "the split trades CH4 sweeps for one draw" is the right shape and 24x
+  // out on the number, and the shapes are what say where it turns.
+  if (channels % 4 === 0 && !execution.noNormSplit && channels >= 768) {
+    const stats = execution.allocate(rows * 4, "layerNorm.stats");
+    execution.dispatch({
+      source: layerNormStatsSource(rows, channels, variance),
+      output: stats,
+      inputs: { xTex: x },
+      floats: { epsilon },
+      label: `layer-norm.stats:${rows}x${channels}${variance === "fast" ? ":fast" : ""}`,
+    });
+    const applied = execution.dispatch({
+      source: splitLayerNormSource(
+        rows, channels, roundHalf, weight !== undefined, bias !== undefined),
+      output,
+      inputs: {
+        xTex: x,
+        statsTex: stats,
+        ...(weight === undefined ? {} : { weightTex: weight }),
+        ...(bias === undefined ? {} : { biasTex: bias }),
+      },
+      label: `layer-norm.apply:${rows}x${channels}${roundHalf ? ":half" : ""}`
+        + `${weight === undefined ? ":no-scale" : ""}${bias === undefined ? ":no-offset" : ""}`,
+    });
+    execution.release(stats);
+    return applied;
   }
   return execution.dispatch({
     source: layerNormSource(

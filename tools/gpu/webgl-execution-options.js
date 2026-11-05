@@ -152,6 +152,19 @@
  *                         the mapping pads the output group axis to `W / TILEW`
  *                         and the measured best width would pad AF2's 256
  *                         outputs sixteenfold; this is how it is swept.
+ *   --no-norm-split       LayerNorm's row statistics computed by every fragment
+ *                         that needs them rather than once a row. The fused
+ *                         kernel has each fragment sweep its whole row and
+ *                         there are `CH4` fragments a row, so the row is read
+ *                         `CH4` times over - 192 at 768 channels, twice that
+ *                         two-pass - and `bench-webgl-norm.js` prices
+ *                         `576x768` at **968.8 us against the split's 200**.
+ *                         Only at 768 channels and wider, which is the band
+ *                         with no measured loss at any row count: the saving
+ *                         scales with `CH4` and the cost does not, so a narrow
+ *                         row pays an extra draw plus an under-occupied
+ *                         statistics pass for nothing and reads **0.33x** at
+ *                         128 channels.
  *   --no-contract-wide    AF3's contraction on the 2 i x 4 j x 4 channel pair
  *                         block rather than 4 i x 8 j x ONE channel. Channels a
  *                         fragment cost locality and buy no intensity: the
@@ -238,6 +251,7 @@ export function webglExecutionOptions(args, defaults = {}) {
     noContractPad: flag(args, "no-contract-pad"),
     noContractTile: flag(args, "no-contract-tile"),
     noContractWide: flag(args, "no-contract-wide"),
+    noNormSplit: flag(args, "no-norm-split"),
     noLinearAspect: flag(args, "no-linear-aspect"),
     noFramebufferReuse: flag(args, "no-framebuffer-reuse"),
     noLinearTile: flag(args, "no-linear-tile"),
