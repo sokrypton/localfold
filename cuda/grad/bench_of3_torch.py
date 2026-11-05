@@ -28,6 +28,7 @@ ap.add_argument("--msa", type=int, default=1024)
 ap.add_argument("--templates", type=int, default=4)
 ap.add_argument("--precision", default="fp32", choices=["fp32", "tf32", "bf16"])
 ap.add_argument("--steps", type=int, default=5)
+ap.add_argument("--cueq", action="store_true", help="cuEquivariance's triangle kernels (settings.memory.train.use_cueq_triangle_kernels)")
 a = ap.parse_args()
 
 torch.backends.cuda.matmul.allow_tf32 = a.precision == "tf32"
@@ -36,6 +37,7 @@ config = copy.deepcopy(of3_model_config)   # (OF3ProjectEntry's default, no pres
 config.settings.blocks_per_ckpt = 1
 config.settings.ckpt_intermediate_steps = True
 config.architecture.shared.num_recycles = 0
+config.settings.memory.train.use_cueq_triangle_kernels = a.cueq
 config.architecture.loss_module.diffusion.chunk_size = 16   # (as test_of3_model.py: the diffusion losses a chunk of samples at a time)
 import openfold3.projects.of3_all_atom.model as of3_model_module
 
@@ -55,7 +57,7 @@ batch = random_of3_features(batch_size=1, n_token=a.tokens, n_msa=a.msa, n_templ
 batch = tensor_tree_map(lambda t: t.cuda(), batch)
 n_atom = int(batch["num_atoms_per_token"].sum().item())
 print(f"OpenFold3 (PyTorch {torch.__version__}), {n_params / 1e6:.1f} M parameters; {a.tokens} tokens, {n_atom} atoms, "
-      f"{a.msa} MSA rows, {a.templates} templates; {a.precision}")
+      f"{a.msa} MSA rows, {a.templates} templates; {a.precision}{' cueq' if a.cueq else ''}")
 times = []
 for step in range(a.steps):
     b = tensor_tree_map(lambda t: t.clone(), batch)
