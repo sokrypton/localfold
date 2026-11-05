@@ -59,7 +59,14 @@ Every CUDA model's forward now has a backward here; what is not is said in each 
 constant input to the denoiser, a template's geometry and a sampler's coordinates take no gradient).
 
 Also: AdamW (`adam.cuh`); `train-af2-smoke` - real weights perturbed 10% and trained back, loss 918 -> 14.7 in 60
-steps.
+steps. `train-af3` - the AF3 lineage's training loop, first form (OpenBind-0): the family's whole training network
+composed from its bundle (target_feat, the trunk embedder, the template term - which weighs even with no template,
+its padded slots' restype zero being a one-hot one - the MSA stack, the pairformer, the distogram, the denoiser), held
+to cuda/af3's runTrunk before it trains (pair 3.5e-7, single 1.6e-7), then AF3's diffusion loss (log-normal sigma,
+augmented truth, an alignment without gradient, EDM's weight) and distogram loss into every parameter by AdamW. On 6MRR
+against its crystal, 30 steps: diffusion 0.0285 -> 0.0046, denoised RMSD at sigma < 4 0.685 -> 0.255 A, distogram 1.83
+-> 0.32; ~1.05 s a step at 68 tokens in float32. Not yet: recycling, smooth LDDT and the bond loss, the confidence
+head's losses, BF16 and the stack's memory machinery, more than one target.
 
 🔴 **THE DENOISER'S 4e-4 IS THE PORT'S ROUNDING, AND IT WAS SHOWN RATHER THAN ASSUMED.** boltz2 reads 4.1e-4 against
 `denoise()` and openbind0 2.0e-4, where every seam up to the encoder's skip is 1e-6 or under. Three measurements put it

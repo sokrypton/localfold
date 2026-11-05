@@ -36,6 +36,7 @@ build cuda/grad/test-af2tmpl -O1 cuda/grad/test_af2tmpl.cu
 build cuda/grad/test-af2model -O1 cuda/grad/test_af2model.cu
 build cuda/grad/test-af2model-f64 -O2 -DGRAD_F64 cuda/grad/test_af2model.cu
 build cuda/grad/train-af2-smoke -O2 cuda/grad/train_af2_smoke.cu
+build cuda/grad/train-af3 -O2 --default-stream per-thread cuda/grad/train_af3.cu
 build cuda/grad/test-af2tmpl-f64 -O2 -DGRAD_F64 cuda/grad/test_af2tmpl.cu
 build cuda/grad/test-plm -O2 cuda/grad/test_plm.cu
 build cuda/grad/test-plm-f64 -O2 -DGRAD_F64 cuda/grad/test_plm.cu
@@ -131,6 +132,8 @@ for fb in "model-af3-full-f32 af3" "model-boltz2-f32 boltz2" "model-protenix2-f3
              *) run cuda/grad/test-af3conf --bundle=$1 --family=$2 --input=$in
                 run cuda/grad/test-af3conf-f64 --bundle=$1 --family=$2 --input=$in ;; esac
   for E in diffusion.encoder diffusion.decoder targetFeat.encoder; do run cuda/grad/test-atom --bundle=$1 --family=$2 --stack=$E; done
+  # the training loop (the trunk composed against runTrunk, then 6MRR against its crystal: the loss must halve)
+  case $2 in openbind0) run cuda/grad/train-af3 --bundle=$1 --family=$2 --input=$in --truth=tools/fixtures/6mrr-crystal.pdb:A --steps=20 ;; esac
 done
 run cuda/grad/test-atom-f64
 run cuda/grad/test-af3 --bundle=model-mol1-f32 --family=mol1 --prefix=trunk.pairMixerBlocks.
