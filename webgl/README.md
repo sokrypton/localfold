@@ -985,21 +985,36 @@ to 409. The gap to the WGSL fold of the same weights is **15x** - it was 246x - 
 | 20 denoiser calls | 35.1 s | 1.2 s | 29x |
 | peak memory | **409 MiB** | 950 MiB | **0.43x** |
 
-🔴 **AND THE REMAINING GAP IS A HARDWARE FEATURE WebGL2 CANNOT REACH, WHICH IS WORTH STATING
-PLAINLY RATHER THAN LEAVING AS A TUNING BACKLOG.** `tools/gpu/probe-subgroup-matrix.js` on this
-device:
+🔴 **AND THE FIRST EXPLANATION WRITTEN HERE WAS WRONG, FROM EXACTLY THE MISTAKE THIS FILE WARNS
+ABOUT EVERYWHERE ELSE.** It said the gap was the subgroup MATRIX units, on the evidence that
+`tools/gpu/probe-subgroup-matrix.js` reports them present (f32 and f16 at 8x8x8). That is a
+CAPABILITY PROBE, not a measurement, and `--tune=matrixLinear=false` on the WGSL fold settles it:
 
 ```
-subgroupMatrixAvailable: true
-configs: f32 8x8x8, f16 8x8x8
+default                     foldMs 3941   diffusion 1178
+--tune=matrixLinear=false   foldMs 3934   diffusion 1179
 ```
 
-WebGPU's projections can issue `subgroupMatrixMultiplyAccumulate` against those units and stage a
-weight tile in workgroup memory for a whole workgroup to reuse. **A WebGL2 fragment shader has
-neither.** There are no subgroups, no workgroup memory, and no matrix instruction; a fragment's
-only reuse is what it holds in its own registers, and that is capped by its OUTPUT BUDGET -
-`MAX_DRAW_BUFFERS` x 4 = **32 floats an invocation**. Every optimisation in this section is a way of
-spending those 32 floats better, and the row block spends all of them.
+**Taking the matrix units away changes that fold by nothing.** It never used them. A probe that
+shows a feature exists says nothing about whether the code under test reaches it - which is this
+repository's own rule ("a control arm that cannot vary the thing under test is not a control"), and
+the `--tune` hook on `fold-bioemu2.js` exists now because nothing could reach that fold's knobs.
+
+🔴 **THE GAP IS AN ARITHMETIC RATE, AND THE CAP IS THE OUTPUT BUDGET.** Summed over the shapes one
+denoiser call dispatches, a call is about **143 GFLOP**. WGSL does it in 59 ms - **2.4 TFLOP/s** -
+and this backend in 1.76 s, **81 GFLOP/s**. A compute kernel reaches that rate by staging a tile in
+workgroup memory so a whole workgroup reads it at L1 speed; a fragment shader has no workgroup
+memory, so its only reuse is what ONE invocation holds in registers, and that is capped by
+`MAX_DRAW_BUFFERS x 4 = 32 output floats`. Every optimisation in this section is a way of spending
+those 32 floats better, and the row block spends all of them: 23 flops a fetch against the 21.3
+docs/A100.md measures as an eight-target fragment GEMM's ceiling.
+
+So the floor follows from two measured numbers rather than from a feature list. The best fetch rate
+observed here is **37 G/s**, on the one kernel whose whole weight (64 KiB) sits in L1; at the
+fragment path's 21.3 flops a fetch that is **790 GFLOP/s**, which is **3x below** the 2.4 TFLOP/s
+WGSL reaches on the same fold. The vertex path's four-times-larger output budget would double the
+intensity and halve that to ~1.5x. **Neither is parity**, and the 3x is a lower bound that assumes
+L1 residency this fold's 409 MiB of weights cannot have.
 
 So the ceiling is structural, and the measurements say where it is:
 
@@ -1009,13 +1024,20 @@ So the ceiling is structural, and the measurements say where it is:
 - **The kernel is at the fragment path's intensity ceiling.** 512 flops per 22 fetches is **23
   flops a fetch**, against the 21.3 that docs/A100.md measures as the ceiling of an eight-target
   fragment GEMM. More outputs an invocation is the only way up and there are no more targets.
+- **But it is NOT at this device's fetch rate**, and that is the honest remaining headroom: 79.5 M
+  fetches in 19.5 ms is **4.1 G/s**, which is an L2 rate, against the 37 G/s the L1-resident kernel
+  reaches. With the fragment order fixed, the operand that streams is **x** - 2 MiB, L2-resident -
+  and packing it as halves eight to a texel would cut this kernel's fetches from 22 a chunk to 14,
+  about **1.5x**. It is not done because x is written by every other kernel in the tree, so that is
+  a change of tensor FORMAT rather than of one kernel.
 - **The one path with a bigger budget is the vertex one**, whose 128 interleaved components are
   four times a fragment's - docs/A100.md puts transform feedback at 8.64 TFLOP/s against the
   fragment path's 3.99 and WebGPU compute's 13.22, so **65% of WebGPU at best**. No kernel here
   uses it, and this file's own note is that "old drivers are exactly where transform feedback gets
   flaky" - which is this backend's entire audience.
 
-🔴 **SO "AS FAST AS WebGPU" IS NOT AVAILABLE, AND THE USEFUL QUESTION IS WHETHER 15x IS SHIPPABLE.**
+🔴 **SO "AS FAST AS WebGPU" IS NOT AVAILABLE - BY A MEASURED 3x AT BEST - AND THE USEFUL QUESTION
+IS WHETHER 15x IS SHIPPABLE.**
 A 68-token fold is 58 s where WebGPU is 3.9; a 59-residue AF2 fold is 1.3 s where WebGPU is 0.28,
 and most of that 1.3 s is shader compilation rather than arithmetic. For a visitor whose browser
 refuses the WebGPU path outright, those are folds instead of refusals, on less memory than the other
