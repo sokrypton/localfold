@@ -239,6 +239,46 @@ void main() {
 };
 
 /**
+ * Swap the two PAIR axes inside every channel plane: `out[c][i][j] = in[c][j][i]`.
+ *
+ * 🔴 THIS IS WHAT LETS THE INCOMING CONTRACTION READ WHOLE TEXELS. Outgoing
+ * walks `a[c][i][k]` as k advances - a stride of one float, so four k are one
+ * RGBA texel - while incoming walks `a[c][k][j]`, a stride of L, and no two of
+ * its reads share anything. Transposed, incoming IS outgoing with i and j
+ * exchanged: `sum_k a[c][k][j] * b[c][k][i]` is `sum_k aT[c][j][k] * bT[c][i][k]`,
+ * which is the outgoing kernel handed bT and aT.
+ *
+ * One pass over the tensor pays for L passes of strided reads. A fragment owns
+ * four consecutive j of one (c, i), which are four different source texels, so
+ * this kernel has the bad pattern - once, over L^2 * C elements, where the
+ * contraction had it L times over.
+ */
+export const planeTransposeSource = (length, channels) => `${PRELUDE}${ONE_TARGET}
+const int L = ${length};
+const int PAIRS = ${length * length};
+const int C4 = ${channels / 4};
+const int ELEMENTS = ${length * length * channels};
+uniform sampler2D xTex;
+
+void main() {
+  int texel = linearTexel();
+  if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
+  // Four consecutive elements of the plane-major tensor are four consecutive j
+  // of one (c, i), and each comes from its own row of the source plane.
+  int element = texel * 4;
+  int plane = element / PAIRS;
+  int within = element - plane * PAIRS;
+  int i = within / L;
+  int j = within - i * L;
+  int base = plane * PAIRS + i;
+  result = vec4(
+    fetch1(xTex, base + j * L),
+    fetch1(xTex, base + (j + 1) * L),
+    fetch1(xTex, base + (j + 2) * L),
+    fetch1(xTex, base + (j + 3) * L));
+}`;
+
+/**
  * The centre norm over an already-contracted pair-major tensor.
  *
  * The statistics are accumulated group by group and then component by
@@ -354,14 +394,47 @@ export function triangleMultiplication(execution, call) {
     });
   } else {
     const contracted = execution.allocate(pairs * channels, "af3.triangle.contracted");
-    execution.dispatch({
-      source: splitContractSource(length, channels, direction, divideByLength,
-        !execution.noTriangleCoalesce),
-      output: contracted,
-      inputs: { aTex: a, bTex: b },
-      label: `af3.triangle.contract-only:${direction}:${length}x${channels}`
-        + `${divideByLength ? ":over-length" : ""}`,
-    });
+    // 🔴 THE INCOMING CONTRACTION IS RUN AS AN OUTGOING ONE OVER TRANSPOSED
+    // PLANES, so it can read whole texels too - see `planeTransposeSource`. Two
+    // transposes are two passes over the tensor against L passes of
+    // single-float reads: measured, the incoming direction was the slower half
+    // of this stage even after the outgoing one was coalesced.
+    const transposeIncoming = direction === "incoming" && length % 4 === 0
+      && !execution.noTriangleCoalesce && !execution.noTriangleTranspose;
+    if (transposeIncoming) {
+      const aT = execution.allocate(pairs * channels, "af3.triangle.aT");
+      const bT = execution.allocate(pairs * channels, "af3.triangle.bT");
+      /** @type {[Tensor, Tensor, string][]} */
+      const planes = [[a, aT, "a"], [b, bT, "b"]];
+      for (const [source, target, name] of planes) {
+        execution.dispatch({
+          source: planeTransposeSource(length, channels),
+          output: target,
+          inputs: { xTex: source },
+          label: `af3.triangle.transpose-${name}:${length}x${channels}`,
+        });
+      }
+      execution.dispatch({
+        // outgoing(bT, aT) is sum_k bT[c][i][k] * aT[c][j][k], which is
+        // incoming(a, b) = sum_k a[c][k][j] * b[c][k][i].
+        source: splitContractSource(length, channels, "outgoing", divideByLength, true),
+        output: contracted,
+        inputs: { aTex: bT, bTex: aT },
+        label: `af3.triangle.contract-only:incoming-transposed:${length}x${channels}`
+          + `${divideByLength ? ":over-length" : ""}`,
+      });
+      execution.release(aT);
+      execution.release(bT);
+    } else {
+      execution.dispatch({
+        source: splitContractSource(length, channels, direction, divideByLength,
+          !execution.noTriangleCoalesce),
+        output: contracted,
+        inputs: { aTex: a, bTex: b },
+        label: `af3.triangle.contract-only:${direction}:${length}x${channels}`
+          + `${divideByLength ? ":over-length" : ""}`,
+      });
+    }
     execution.dispatch({
       source: centreNormSource(length, channels),
       output: centred,
