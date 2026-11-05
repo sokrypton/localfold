@@ -215,6 +215,26 @@ from there 6MRR's mse goes 33.3 -> 12.8 in 40 steps. The Fourier noise embedding
   | 1536 | | 43.4 s, 91.8 GiB | |
   | 1792 | | out of memory | |
 
+  And inference, beside it: OpenFold3's PyTorch (`bench_of3_infer_torch.py`: eval, bf16 autocast, its Triton triangle
+  kernels) against cuda/af3's `localfold-af3 --model=openbind0 --fast`, both at OpenFold3's inference settings - 1 + 3
+  cycles, 5 samples x 200 diffusion steps, the confidence heads - on one random chain with a 1024-row alignment; a warm
+  run each, the device's peak from the driver for both (weights and context included):
+
+  | tokens | OpenFold3 PyTorch | localfold-af3 | speedup |
+  |---|---|---|---|
+  | 256 | 13.4 s, 5.1 GiB | 0.60 s, 5.7 GiB | 22x |
+  | 384 | 14.6 s, 8.7 GiB | 1.01 s, 7.1 GiB | 14x |
+  | 512 | 16.9 s, 13.7 GiB | 1.62 s, 8.7 GiB | 10x |
+  | 768 | 32.1 s, 12.0 GiB | 3.25 s, 7.4 GiB | 9.9x |
+  | 1024 | 54.3 s, 19.5 GiB | 5.65 s, 8.9 GiB | 9.6x |
+  | 1536 | 120.8 s, 41.2 GiB | 13.6 s, 15.9 GiB | 8.8x |
+  | 2048 | 219.6 s, 71.1 GiB | 27.3 s, 24.5 GiB | 8.1x |
+  | 3072 | out of memory | 75.5 s, 50.5 GiB | |
+  | 4096 | | 160.4 s, 46.9 GiB | |
+  | 5120 | | 295.3 s, 41.2 GiB | |
+
+  (The port's peak falls past 3072: its big-input path takes over, the pair parked and its stages a block at a time.)
+
   What is left at 640 tokens on the A100 (28.9 GB): 9.8 GB the parameters, Adam and the EMA; 2.3 GB the step's
   activations; 0.9 GB the stream pool; the arena's 14.3 GB - the MSA block's backward, the confidence head, a
   diffusion chunk, and 3.6 GB the embedder keeps for the whole step.
