@@ -36,10 +36,13 @@ webgl/
     execution.js    what stands in for a dispatch: one draw, one fragment per output texel,
                     banded when a viewport cannot cover the target; the shared GLSL prelude
                     and the program cache, keyed by source
-    elementwise.js  residuals: add, multiply, scale
+    elementwise.js  residuals: add, multiply, scale, and the per-row mask broadcast
   kernels/
     triangle.js     the triangle contraction (22% of an Evoformer block at 221 residues)
-    attention.js    gated flash attention with pair bias (58% of one), eight render targets
+    attention.js    the original spike's flash attention, 32-channel heads, as a benchmark
+    attention-flash.js          gated attention for ANY head width: `min(D/4, MAX_DRAW_BUFFERS)`
+                                planes an invocation, drawn more than once when a head is too
+                                wide, plus the gather back into one interleaved tensor
     layer-norm.js   row-wise LayerNorm, about ten times a block
     linear.js       the dense projection, with bias and activation folded in - where the FLOPs are
     triangle-contract.js        the contraction, one source shared by the stage and the benchmark
@@ -61,9 +64,18 @@ operation here rather than a primitive. It is nine draws where the WGSL side fus
 every intermediate is released as its last reader finishes, so a 400-token block does not hold nine
 pair tensors at once.
 
-Still to come, in the order they are needed: the MSA row and column attentions (the existing
-attention kernel generalised off its fixed 32-channel head, plus AF2's separate GLOBAL attention
-for the extra-MSA stack), the outer product mean, the transition, triangle ATTENTION, then the
+**Attention is generalised off the fixed 32-channel head**, which was the other thing blocking
+every model: `targets = min(D/4, MAX_DRAW_BUFFERS)` is derived, a head too wide for one draw is
+drawn in several (D = 64 takes two, each recomputing its own dot products, and the redundancy is
+reported rather than hidden), and the `1/sqrt(head_dim)` scaling is now explicit - the original
+applied none, so it was correct only for a caller that had pre-scaled its queries and nothing said
+so. Checked at D = 4, 8, 16, 32 and 64, with and without a pair bias, with both mask layouts, and
+against the kernel it replaces at that kernel's own convention.
+
+Still to come, in the order they are needed: the whole attention BLOCK (LayerNorm, the q/k/v/gate
+projections, the flash core, the output projection), which is what `AttentionGpu` on the WGSL side
+is and so is what makes a cross-API differential possible for it; AF2's separate GLOBAL attention
+for the extra-MSA stack; the outer product mean; the transition; triangle ATTENTION; then the
 Evoformer block that drives them, the stack, the structure module, and the confidence and distogram
 heads. After AF2: AF3's pairformer and diffusion, ESMFold2, bioemu2. Nothing is wired to a weight
 bundle yet - every kernel takes its operands as plain arrays, and reading

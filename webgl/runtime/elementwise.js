@@ -13,7 +13,9 @@
  * a stage that wants to accumulate ping-pongs between two tensors. Writing
  * `add(x, y, x)` would be the WebGPU habit silently producing undefined output.
  */
-import { PRELUDE } from "./execution.js";
+import { ONE_TARGET, PRELUDE } from "./execution.js";
+/** @typedef {import("./storage.js").Tensor} Tensor */
+
 
 const guard = (elements) => `
 const int ELEMENTS = ${elements};
@@ -22,7 +24,7 @@ void main() {
   if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }`;
 
 /** `a + b`, elementwise. */
-export const addSource = (elements) => `${PRELUDE}
+export const addSource = (elements) => `${PRELUDE}${ONE_TARGET}
 uniform sampler2D aTex;
 uniform sampler2D bTex;
 ${guard(elements)}
@@ -30,7 +32,7 @@ ${guard(elements)}
 }`;
 
 /** `a * b`, elementwise - a gate applied to an activation. */
-export const multiplySource = (elements) => `${PRELUDE}
+export const multiplySource = (elements) => `${PRELUDE}${ONE_TARGET}
 uniform sampler2D aTex;
 uniform sampler2D bTex;
 ${guard(elements)}
@@ -38,7 +40,7 @@ ${guard(elements)}
 }`;
 
 /** `a * scale`. */
-export const scaleSource = (elements) => `${PRELUDE}
+export const scaleSource = (elements) => `${PRELUDE}${ONE_TARGET}
 uniform sampler2D aTex;
 uniform float scale;
 ${guard(elements)}
@@ -47,6 +49,10 @@ ${guard(elements)}
 
 /**
  * @param {import("./execution.js").Execution} execution
+ * @param {Tensor} a
+ * @param {Tensor} b
+ * @param {Tensor} [into] an existing tensor to draw into, instead of a new one
+ * @returns {Tensor}
  */
 export function add(execution, a, b, into) {
   if (a.elements !== b.elements) {
@@ -61,6 +67,13 @@ export function add(execution, a, b, into) {
   });
 }
 
+/**
+ * @param {import("./execution.js").Execution} execution
+ * @param {Tensor} a
+ * @param {Tensor} b
+ * @param {Tensor} [into]
+ * @returns {Tensor}
+ */
 export function multiply(execution, a, b, into) {
   if (a.elements !== b.elements) {
     throw new RangeError(`multiply: ${a.elements} and ${b.elements} elements do not match`);
@@ -75,6 +88,13 @@ export function multiply(execution, a, b, into) {
   });
 }
 
+/**
+ * @param {import("./execution.js").Execution} execution
+ * @param {Tensor} a
+ * @param {number} factor
+ * @param {Tensor} [into]
+ * @returns {Tensor}
+ */
 export function scale(execution, a, factor, into) {
   const output = into ?? execution.allocate(a.elements, "scale");
   if (output === a) {
@@ -95,7 +115,7 @@ export function scale(execution, a, factor, into) {
  * WebGPU side folds this into whichever kernel is adjacent; here it is its own
  * draw until something measures that as a cost.
  */
-export const maskRowsSource = (rows, channels) => `${PRELUDE}
+export const maskRowsSource = (rows, channels) => `${PRELUDE}${ONE_TARGET}
 const int ROWS = ${rows};
 const int CH4 = ${channels / 4};
 uniform sampler2D xTex;
@@ -107,6 +127,12 @@ void main() {
   result = fetch4(xTex, texel) * fetch1(maskTex, row);
 }`;
 
+/**
+ * @param {import("./execution.js").Execution} execution
+ * @param {{x: Tensor, mask: Tensor, rows: number, channels: number}} call
+ * @param {Tensor} [into]
+ * @returns {Tensor}
+ */
 export function maskRows(execution, { x, mask, rows, channels }, into) {
   if (channels % 4 !== 0) {
     throw new RangeError(`maskRows: channels must be a multiple of 4, got ${channels}`);

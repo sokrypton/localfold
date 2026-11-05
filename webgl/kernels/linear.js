@@ -25,7 +25,9 @@
  * before optimizing performance" - and the geometry is the first thing to
  * revisit once a block folds.
  */
-import { PRELUDE } from "../runtime/execution.js";
+import { ONE_TARGET, PRELUDE } from "../runtime/execution.js";
+/** @typedef {import("../runtime/storage.js").Tensor} Tensor */
+
 
 const ACTIVATIONS = {
   none: "value",
@@ -33,7 +35,7 @@ const ACTIVATIONS = {
   sigmoid: "vec4(1.0) / (vec4(1.0) + exp(-value))",
 };
 
-export const linearSource = (rows, inChannels, outChannels, activation, useBias) => `${PRELUDE}
+export const linearSource = (rows, inChannels, outChannels, activation, useBias) => `${PRELUDE}${ONE_TARGET}
 const int ROWS = ${rows};
 const int IN = ${inChannels};
 const int IN4 = ${inChannels / 4};
@@ -67,13 +69,19 @@ void main() {
 
 /**
  * @param {import("../runtime/execution.js").Execution} execution
+ * @param {{x: Tensor, weight: Tensor, bias?: Tensor, rows: number, inChannels: number,
+ *   outChannels: number, activation?: "none" | "relu" | "sigmoid"}} call
+ * @param {Tensor} [into]
+ * @returns {Tensor}
  */
 export function linear(execution, call, into) {
   const { x, weight, bias, rows, inChannels, outChannels, activation = "none" } = call;
   if (!(activation in ACTIVATIONS)) {
     throw new RangeError(`linear: no activation \`${activation}\``);
   }
-  for (const [name, value] of [["inChannels", inChannels], ["outChannels", outChannels]]) {
+  /** @type {[string, number][]} */
+  const widths = [["inChannels", inChannels], ["outChannels", outChannels]];
+  for (const [name, value] of widths) {
     if (value % 4 !== 0) throw new RangeError(`linear: ${name} must be a multiple of 4, got ${value}`);
   }
   if (x.elements !== rows * inChannels) {

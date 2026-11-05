@@ -23,9 +23,11 @@
  * than a kernel that is quietly wrong for cZ 7 - which is exactly the shape
  * that broke the WGSL triangle kernel, found by a sweep over widths.
  */
-import { PRELUDE } from "../runtime/execution.js";
+import { ONE_TARGET, PRELUDE } from "../runtime/execution.js";
+/** @typedef {import("../runtime/storage.js").Tensor} Tensor */
 
-export const layerNormSource = (rows, channels) => `${PRELUDE}
+
+export const layerNormSource = (rows, channels) => `${PRELUDE}${ONE_TARGET}
 const int ROWS = ${rows};
 const int CHANNELS = ${channels};
 const int CH4 = ${channels / 4};
@@ -61,6 +63,10 @@ void main() {
 
 /**
  * @param {import("../runtime/execution.js").Execution} execution
+ * @param {{x: Tensor, weight: Tensor, bias: Tensor, rows: number, channels: number,
+ *   epsilon?: number}} call
+ * @param {Tensor} [into]
+ * @returns {Tensor}
  */
 export function layerNorm(execution, { x, weight, bias, rows, channels, epsilon = 1e-5 }, into) {
   if (channels % 4 !== 0) {
@@ -70,7 +76,9 @@ export function layerNorm(execution, { x, weight, bias, rows, channels, epsilon 
     throw new RangeError(
       `layerNorm: x holds ${x.elements} floats, not ${rows} x ${channels}`);
   }
-  for (const [name, tensor] of [["weight", weight], ["bias", bias]]) {
+  /** @type {[string, Tensor][]} */
+  const parameters = [["weight", weight], ["bias", bias]];
+  for (const [name, tensor] of parameters) {
     if (tensor.elements !== channels) {
       throw new RangeError(`layerNorm: ${name} holds ${tensor.elements}, not ${channels}`);
     }

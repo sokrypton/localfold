@@ -42,7 +42,6 @@ precision highp float;
 precision highp int;
 precision highp sampler2D;
 const int W = ${TEXTURE_WIDTH};
-out vec4 result;
 
 int linearTexel() { return int(gl_FragCoord.y) * W + int(gl_FragCoord.x); }
 
@@ -59,6 +58,13 @@ float fetch1(sampler2D tex, int index) {
 }
 `;
 
+/** The single-target `result` declaration, which most kernels want. */
+export const ONE_TARGET = "out vec4 result;\n";
+
+/** `count` render targets named result0..result{count-1}, for a wide kernel. */
+export const targetDeclarations = (count) => Array.from(
+  { length: count }, (_, t) => `layout(location = ${t}) out vec4 result${t};`).join("\n") + "\n";
+
 export class Execution {
   /** @param {WebGL2RenderingContext} gl */
   constructor(gl, options = {}) {
@@ -73,6 +79,17 @@ export class Execution {
     this.checkErrors = options.checkErrors ?? true;
     this.maxBandRows = Math.min(
       gl.getParameter(gl.MAX_VIEWPORT_DIMS)[1], gl.getParameter(gl.MAX_TEXTURE_SIZE));
+    /**
+     * How many `vec4`s one invocation can write, which is the whole reason
+     * attention is affordable here.
+     *
+     * 🔴 THIS IS THE BUDGET docs/A100.md's WHOLE ARGUMENT TURNS ON. A fragment
+     * writing one texel has to recompute every q.k dot product once per group
+     * of four channels it owns - 4.5x the arithmetic at a 32-channel head. With
+     * `MAX_DRAW_BUFFERS` attachments it computes each dot product exactly once.
+     * Eight here, four guaranteed by the specification.
+     */
+    this.maxDrawBuffers = gl.getParameter(gl.MAX_DRAW_BUFFERS);
 
     this.vertices = gl.createBuffer();
     gl.bindBuffer(gl.ARRAY_BUFFER, this.vertices);
@@ -124,25 +141,63 @@ export class Execution {
    * and `uniform1i` on a float uniform is a silent GL error on some drivers and
    * a wrong value on others.
    *
-   * @param {{source: string, output: import("./storage.js").Tensor,
+   * `outputs` draws into several tensors at once - what a kernel declares as
+   * `layout(location = t) out vec4`. They must be the same shape, because they
+   * share one viewport, and there may be at most `maxDrawBuffers` of them.
+   *
+   * @param {{source: string, output?: import("./storage.js").Tensor,
+   *   outputs?: import("./storage.js").Tensor[],
    *   inputs?: Record<string, import("./storage.js").Tensor>,
    *   ints?: Record<string, number>, floats?: Record<string, number>,
    *   label?: string}} call
    */
   dispatch(call) {
     const gl = this.gl;
-    const { source, output, inputs = {}, ints = {}, floats = {}, label = "kernel" } = call;
+    const { source, inputs = {}, ints = {}, floats = {}, label = "kernel" } = call;
+    const targets = call.outputs ?? [call.output];
+    if (targets.length === 0 || targets.some((tensor) => tensor === undefined)) {
+      throw new Error(`${label}: a dispatch needs an output`);
+    }
+    if (targets.length > this.maxDrawBuffers) {
+      throw new RangeError(
+        `${label}: ${targets.length} render targets, this context allows ${this.maxDrawBuffers}`);
+    }
+    const output = targets[0];
+    for (const tensor of targets) {
+      if (tensor.width !== output.width || tensor.height !== output.height) {
+        throw new RangeError(
+          `${label}: render targets share one viewport, so ${tensor.label} `
+          + `(${tensor.width}x${tensor.height}) cannot join ${output.label} `
+          + `(${output.width}x${output.height})`);
+      }
+    }
+    // 🔴 A TENSOR BOUND BOTH WAYS IS UNDEFINED AND MUST BE REFUSED BY NAME. The
+    // one-output path checks this at each kernel's door; with several targets the
+    // chance of an alias rises and the symptom - a "feedback loop" framebuffer,
+    // or silently stale texels - names nothing.
+    const bound = new Set(Object.values(inputs));
+    for (const tensor of targets) {
+      if (bound.has(tensor)) {
+        throw new Error(`${label}: ${tensor.label} is both an input and a render target`);
+      }
+    }
     const entry = this.program(source);
     gl.useProgram(entry.program);
     gl.bindVertexArray(this.vao);
 
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.target);
-    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D,
-      output.texture, 0);
-    gl.drawBuffers([gl.COLOR_ATTACHMENT0]);
+    for (let t = 0; t < this.maxDrawBuffers; t += 1) {
+      // Detach anything a previous dispatch left on a higher attachment: a
+      // framebuffer is reused, and an attachment nobody writes is still an
+      // attachment whose completeness the driver checks.
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0 + t, gl.TEXTURE_2D,
+        t < targets.length ? targets[t].texture : null, 0);
+    }
+    gl.drawBuffers(targets.map((_, t) => gl.COLOR_ATTACHMENT0 + t));
     const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
     if (status !== gl.FRAMEBUFFER_COMPLETE) {
-      throw new Error(`${label}: cannot draw into ${output.label} (0x${status.toString(16)})`);
+      throw new Error(`${label}: cannot draw into `
+        + `${targets.map((tensor) => tensor.label).join(", ")} (0x${status.toString(16)})`);
     }
 
     let unit = 0;
@@ -195,7 +250,8 @@ export class Execution {
   stats() {
     return {
       dispatches: this.dispatches, draws: this.draws, programs: this.programs.size,
-      maxBandRows: this.maxBandRows, ...this.storage.stats(),
+      maxBandRows: this.maxBandRows, maxDrawBuffers: this.maxDrawBuffers,
+      ...this.storage.stats(),
     };
   }
 

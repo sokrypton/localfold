@@ -16,8 +16,10 @@
  * bound is known when the shader is optimised. That is also why the program
  * cache in execution.js is keyed by SOURCE - the shapes ARE the source.
  */
-import { PRELUDE } from "../runtime/execution.js";
+import { ONE_TARGET, PRELUDE } from "../runtime/execution.js";
 import { CHANNELS_PER_TEXEL } from "../runtime/context.js";
+/** @typedef {import("../runtime/storage.js").Tensor} Tensor */
+
 
 /**
  * Channel-minor [pair][channel] to channel-major [channel/4][pair], four to a
@@ -75,7 +77,7 @@ export function contractSource(length, channels, direction, layout = "channel-mi
     ? "int texel(int x, int y, int c) { return c * (L * L) + x * L + y; }"
     : "int texel(int x, int y, int c) { return (x * L + y) * CH4 + c; }";
 
-  return `${PRELUDE}
+  return `${PRELUDE}${ONE_TARGET}
 const int L = ${length};
 const int CH4 = ${channels / CHANNELS_PER_TEXEL};
 uniform sampler2D aTex;
@@ -111,6 +113,10 @@ void main() {
 
 /**
  * @param {import("../runtime/execution.js").Execution} execution
+ * @param {{a: Tensor, b: Tensor, length: number, channels: number,
+ *   direction?: "outgoing" | "incoming", layout?: "channel-minor" | "channel-major"}} call
+ * @param {Tensor} [into]
+ * @returns {Tensor}
  */
 export function triangleContract(execution, call, into) {
   const { a, b, length, channels, direction = "outgoing", layout = "channel-minor" } = call;
@@ -118,7 +124,9 @@ export function triangleContract(execution, call, into) {
   if (channels % CHANNELS_PER_TEXEL !== 0) {
     throw new RangeError(`triangleContract: channels must be a multiple of 4, got ${channels}`);
   }
-  for (const [name, tensor] of [["a", a], ["b", b]]) {
+  /** @type {[string, Tensor][]} */
+  const operands = [["a", a], ["b", b]];
+  for (const [name, tensor] of operands) {
     if (tensor.elements !== elements) {
       throw new RangeError(
         `triangleContract: ${name} holds ${tensor.elements} floats, not ${length}^2 x ${channels}`);

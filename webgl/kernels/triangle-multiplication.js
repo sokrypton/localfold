@@ -38,6 +38,8 @@ import { layerNorm } from "./layer-norm.js";
 import { linear } from "./linear.js";
 import { triangleContract } from "./triangle-contract.js";
 import { maskRows, multiply } from "../runtime/elementwise.js";
+/** @typedef {import("../runtime/storage.js").Tensor} Tensor */
+
 
 /** The weight names this operation reads, in the reference's own spelling. */
 export const TRIANGLE_WEIGHTS = [
@@ -54,6 +56,7 @@ export const TRIANGLE_WEIGHTS = [
  * @param {import("../runtime/execution.js").Execution} execution
  */
 export function uploadTriangleWeights(execution, weights) {
+  /** @type {Record<string, Tensor>} */
   const out = {};
   for (const name of TRIANGLE_WEIGHTS) {
     const values = weights[name];
@@ -69,10 +72,10 @@ export function releaseTriangleWeights(execution, weights) {
 
 /**
  * @param {import("../runtime/execution.js").Execution} execution
- * @param {{z: object, mask: object, weights: object,
+ * @param {{z: Tensor, mask: Tensor, weights: Record<string, Tensor>,
  *   shape: {length: number, cZ: number, cHidden: number},
  *   direction?: "outgoing" | "incoming", epsilon?: number}} call
- * @returns the output tensor, `pairs x cZ`; the caller owns it
+ * @returns {Tensor} the output, `pairs x cZ`; the caller owns it
  */
 export function triangleMultiplication(execution, call) {
   const { z, mask, weights: w, shape, direction = "outgoing", epsilon = 1e-5 } = call;
