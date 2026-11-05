@@ -11,14 +11,14 @@
 // The template term runs whatever the input: a target with no template still has padded slots, and in this lineage they
 // weigh (a padded slot's restype is zero, and a one-hot of zero is a one) - 0.54 of the pair here when it was left out.
 //
-// Not yet: recycling (one pass, the recycled pair and single zero), smooth LDDT and the bond loss, the confidence head and its losses, mixed precision, more than one target.
+// Recycling: a step runs 1..--cycles passes (uniform), the gradient through the last only. Not yet: smooth LDDT and the bond loss, the confidence head and its losses, mixed precision, more than one target.
 //
 // Before training it holds its own trunk to cuda/af3's runTrunk on the same input (pass 0): the composition this file
 // writes, against the port's.
 //
 //   nvcc -O2 -std=c++17 -arch=sm_80 --default-stream per-thread -o cuda/grad/train-af3 cuda/grad/train_af3.cu -lcublas -lcublasLt -ldl -lcurand
 //   cuda/grad/train-af3 --bundle=model-openbind0-f32 --family=openbind0 --input=cuda/grad/data/af3-in-openbind0 \
-//       --truth=tools/fixtures/6mrr-crystal.pdb:A [--steps=30] [--lr=1e-4] [--samples=4] [--seed=1]
+//       --truth=tools/fixtures/6mrr-crystal.pdb:A [--steps=30] [--lr=1e-4] [--samples=4] [--cycles=4] [--seed=1]
 #include <array>
 #include <cstring>
 #include <fstream>
@@ -117,7 +117,7 @@ static void kabsch(const std::vector<double>& a, const std::vector<double>& b, c
 int main(int argc, char** argv) {
   std::string bundle = "model-openbind0-f32", family = "openbind0", input = "cuda/grad/data/af3-in-openbind0",
               truth = "tools/fixtures/6mrr-crystal.pdb:A";
-  int steps = 30, samples = 4; unsigned seed = 1; double lr = 1e-4;
+  int steps = 30, samples = 4, cycles = 4; unsigned seed = 1; double lr = 1e-4;
   for (int i = 1; i < argc; ++i) {
     if (!strncmp(argv[i], "--bundle=", 9)) bundle = argv[i] + 9;
     else if (!strncmp(argv[i], "--family=", 9)) family = argv[i] + 9;
@@ -125,6 +125,7 @@ int main(int argc, char** argv) {
     else if (!strncmp(argv[i], "--truth=", 8)) truth = argv[i] + 8;
     else if (!strncmp(argv[i], "--steps=", 8)) steps = atoi(argv[i] + 8);
     else if (!strncmp(argv[i], "--samples=", 10)) samples = atoi(argv[i] + 10);
+    else if (!strncmp(argv[i], "--cycles=", 9)) cycles = std::max(1, atoi(argv[i] + 9));
     else if (!strncmp(argv[i], "--seed=", 7)) seed = (unsigned)atoi(argv[i] + 7);
     else if (!strncmp(argv[i], "--lr=", 5)) lr = atof(argv[i] + 5);
     else if (!strcmp(argv[i], "--tf32")) g::TF32 = true;
@@ -375,8 +376,21 @@ int main(int argc, char** argv) {
                                          pairs[nMsa + k + 1], singles[k + 1], n);
     g::af3::distogramForward(dh, pairs[nMsa + nPf], n, logits);
   };
-  g::ARENA.reset();
-  trunkForward();
+  // `c` passes of the trunk: the first c - 1 without a gradient, each handing its pair and single to the next as the
+  // recycled state (AF3's training: the gradient through the last pass only); the last pass's saves in the arena
+  auto recycledTrunk = [&](int c) {
+    GK(cudaMemsetAsync(prevPair, 0, nn * Cz * sizeof(g::real), STREAM));
+    GK(cudaMemsetAsync(prevSingle, 0, (size_t)n * Cs * sizeof(g::real), STREAM));
+    for (int pass = 0; pass + 1 < c; ++pass) {
+      g::ARENA.reset();
+      trunkForward();
+      GK(cudaMemcpyAsync(prevPair, pairs[nMsa + nPf], nn * Cz * sizeof(g::real), cudaMemcpyDeviceToDevice, STREAM));
+      GK(cudaMemcpyAsync(prevSingle, singles[nPf], (size_t)n * Cs * sizeof(g::real), cudaMemcpyDeviceToDevice, STREAM));
+    }
+    g::ARENA.reset();
+    trunkForward();
+  };
+  recycledTrunk(1);
   CK(cudaStreamSynchronize(STREAM));
   {
     auto cmp = [&](const char* what, const g::real* mine, const float* port, size_t len) {
@@ -391,6 +405,22 @@ int main(int argc, char** argv) {
     }
     const bool ok = cmp("pair", pairs[nMsa + nPf], t.pair, nn * Cz) & cmp("single", singles[nPf], t.single, (size_t)n * Cs);
     if (!ok) { printf("FAIL: the composed trunk is not the port's\n"); return 1; }
+    // and recycled: three passes against the port's own recycle (af3.cu's recyclePass)
+    const size_t pairsN = nn;
+    for (int pass = 1; pass < 3; ++pass) {
+      if (!t.inPlaceRecycle)
+        CK(cudaMemcpyAsync(t.prevPair, t.pair, pairsN * t.C * (t.p16 ? 2 : 4), cudaMemcpyDeviceToDevice, STREAM));
+      CK(cudaMemcpyAsync(t.prevSingle, t.single, (size_t)t.n * t.Cs * 4, cudaMemcpyDeviceToDevice, STREAM));
+      runTrunk<float>(t, [](const char*, const float*, size_t) {});
+    }
+    recycledTrunk(3);
+    CK(cudaStreamSynchronize(STREAM));
+    const double ep = g::relRms(g::host(pairs[nMsa + nPf], nn * Cz), [&] { std::vector<float> h(nn * Cz);
+      GK(cudaMemcpy(h.data(), t.pair, h.size() * 4, cudaMemcpyDeviceToHost)); return h; }());
+    const double es = g::relRms(g::host(singles[nPf], (size_t)n * Cs), [&] { std::vector<float> h((size_t)n * Cs);
+      GK(cudaMemcpy(h.data(), t.single, h.size() * 4, cudaMemcpyDeviceToHost)); return h; }());
+    printf("  trunk pair     against the port's, 3 passes: %.3e\n  trunk single   against the port's, 3 passes: %.3e\n", ep, es);
+    if (!(ep < 1e-3 && es < 1e-3)) { printf("FAIL: the recycled trunk is not the port's\n"); return 1; }
   }
   // ---- the training loop
   g::AdamW opt; opt.lr = (g::real)lr; opt.clip = 10.f; opt.init(ps);
@@ -409,8 +439,9 @@ int main(int argc, char** argv) {
     const bool train = step >= 0 && step < steps;
     cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1); cudaEventRecord(e0, STREAM);
     ps.zeroGrad();
-    g::ARENA.reset();
-    trunkForward();
+    // a training step's cycle count uniform in [1, cycles]; the two measuring passes all of them
+    const int c = train ? 1 + (int)(rng() % (unsigned)cycles) : cycles;
+    recycledTrunk(c);
     const g::Arena::Mark trunkMark = g::ARENA.mark();
     // the distogram loss and its gradient
     double lDist = 0;
@@ -523,7 +554,7 @@ int main(int argc, char** argv) {
     const double gn = opt.lastNorm;
     cudaEventRecord(e1, STREAM); CK(cudaStreamSynchronize(STREAM));
     float ms; cudaEventElapsedTime(&ms, e0, e1);
-    printf("step %3d  loss %.4f  (diffusion %.4f, distogram %.4f)  |grad| %.3e  %.0f ms\n", step, loss, lDiff, lDist, gn, ms);
+    printf("step %3d  loss %.4f  (diffusion %.4f, distogram %.4f)  cycles %d  |grad| %.3e  %.0f ms\n", step, loss, lDiff, lDist, c, gn, ms);
     (void)trunkMark;
   }
   return 0;

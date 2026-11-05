@@ -65,7 +65,10 @@ its padded slots' restype zero being a one-hot one - the MSA stack, the pairform
 to cuda/af3's runTrunk before it trains (pair 3.5e-7, single 1.6e-7), then AF3's diffusion loss (log-normal sigma,
 augmented truth, an alignment without gradient, EDM's weight) and distogram loss into every parameter by AdamW. On 6MRR
 against its crystal, 30 steps: diffusion 0.0285 -> 0.0046, denoised RMSD at sigma < 4 0.685 -> 0.255 A, distogram 1.83
--> 0.32; ~1.05 s a step at 68 tokens in float32. Not yet: recycling, smooth LDDT and the bond loss, the confidence
+-> 0.32; ~1.05 s a step at 68 tokens in float32. Recycling as AF3 trains it: a step runs 1-4 trunk passes
+(`--cycles=`, uniform), the earlier ones without a gradient, each handing its pair and single to the next; three passes
+against the port's own recycle read pair 3.4e-7, single 1.6e-7, and a cycle costs ~65 ms (one pass 478 ms a step, four
+672, at `--samples=4`). Not yet: smooth LDDT and the bond loss, the confidence
 head's losses, BF16 and the stack's memory machinery, more than one target.
 
 🔴 **THE DENOISER'S 4e-4 IS THE PORT'S ROUNDING, AND IT WAS SHOWN RATHER THAN ASSUMED.** boltz2 reads 4.1e-4 against
