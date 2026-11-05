@@ -199,6 +199,41 @@ export async function main(device, args) {
     arm(`linear ${n}x${inChannels}x${outChannels} no bias`, noBias,
       linearReference(x, weight, undefined, n, inChannels, outChannels, "none"), 1e-6);
   }
+  // --- a ragged output width, which AF2's pLDDT head has ------------------
+  //
+  // 🔴 50 BINS MEANS A TEXEL STRADDLES TWO ROWS, so `linear` compiles a
+  // different kernel for it: row r occupies elements [50r, 50r + 50), and a
+  // fragment's four consecutive elements can belong to two rows with two
+  // different input vectors. The aligned kernel shares one input sweep across
+  // its four outputs and cannot. Both layouts are checked at a ragged width
+  // because the index arithmetic differs between them.
+  for (const [n, inChannels, outChannels] of [[5, 32, 50], [3, 16, 7], [9, 8, 13]]) {
+    const random = generator(n * 7919 + outChannels);
+    const x = noise(n * inChannels, 1, random);
+    const weight = noise(inChannels * outChannels, 1 / Math.sqrt(inChannels), random);
+    const bias = noise(outChannels, 0.1, random);
+    const xT = execution.upload(skew(x), "x");
+    const wT = execution.upload(weight, "w");
+    const bT = execution.upload(bias, "b");
+    for (const weightLayout of ["in-major", "out-major"]) {
+      const got = execution.read(linear(execution, {
+        x: xT, weight: wT, bias: bT, rows: n, inChannels, outChannels, weightLayout,
+      }));
+      const want = new Float32Array(n * outChannels);
+      for (let row = 0; row < n; row += 1) {
+        for (let o = 0; o < outChannels; o += 1) {
+          let sum = bias[o];
+          for (let i = 0; i < inChannels; i += 1) {
+            sum += x[row * inChannels + i] * (weightLayout === "in-major"
+              ? weight[i * outChannels + o] : weight[o * inChannels + i]);
+          }
+          want[row * outChannels + o] = sum;
+        }
+      }
+      arm(`linear ragged ${n}x${inChannels}x${outChannels} ${weightLayout}`, got, want, 1e-6);
+    }
+  }
+
   refuses("a sampler the kernel does not declare", "no sampler named",
     () => execution.dispatch({
       source: `${require_nothing()}`, output: execution.allocate(4, "out"),

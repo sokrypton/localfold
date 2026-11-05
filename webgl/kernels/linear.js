@@ -67,18 +67,54 @@ export const linearSource = (
     sum += x.z * fetch4(weightTex, wRow + 2 * OUT4);
     sum += x.w * fetch4(weightTex, wRow + 3 * OUT4);
   }`;
+  // 🔴 AND A WIDTH THAT IS NOT A MULTIPLE OF FOUR NEEDS A DIFFERENT KERNEL,
+  // BECAUSE A TEXEL THEN STRADDLES TWO ROWS. AF2's pLDDT head projects onto **50**
+  // bins: row r occupies elements [50r, 50r + 50), so a fragment's four
+  // consecutive elements can belong to two different rows with two different
+  // input vectors. The aligned kernel above shares one input sweep across its
+  // four outputs and cannot; this one resolves each component separately, four
+  // dot products for four outputs. Four times the reads, on a projection whose
+  // output is `rows * 50` floats - and the alternative is refusing a shape the
+  // model actually has.
+  const perComponent = (component) => `
+  {
+    int element = base + ${component};
+    if (element < ROWS * OUT) {
+      int row = element / OUT;
+      int o = element - row * OUT;
+      int xBase = row * IN4;
+      float sum = ${useBias ? "fetch1(biasTex, o)" : "0.0"};
+      for (int i = 0; i < IN4; ++i) {
+        vec4 x = fetch4(xTex, xBase + i);
+        int w = ${weightLayout === "in-major" ? "(i * 4) * OUT + o" : "o * IN + i * 4"};
+        ${weightLayout === "in-major"
+    ? `sum += x.x * fetch1(weightTex, w);
+        sum += x.y * fetch1(weightTex, w + OUT);
+        sum += x.z * fetch1(weightTex, w + 2 * OUT);
+        sum += x.w * fetch1(weightTex, w + 3 * OUT);`
+    : "sum += dot(x, fetch4(weightTex, (o * IN4) + i));"}
+      }
+      values[${component}] = sum;
+    }
+  }`;
+  const ragged = outChannels % 4 !== 0;
+
   return `${PRELUDE}${ONE_TARGET}
 const int ROWS = ${rows};
 const int IN = ${inChannels};
 const int IN4 = ${inChannels / 4};
 const int OUT = ${outChannels};
-const int OUT4 = ${outChannels / 4};
+const int OUT4 = ${Math.ceil(outChannels / 4)};
 uniform sampler2D xTex;
 uniform sampler2D weightTex;
 ${useBias ? "uniform sampler2D biasTex;" : ""}
 
 void main() {
-  int texel = linearTexel();
+${ragged ? `  int base = linearTexel() * 4;
+  if (base >= ROWS * OUT) { result = vec4(0.0); return; }
+  vec4 values = vec4(0.0);
+${[0, 1, 2, 3].map(perComponent).join("\n")}
+  vec4 value = values;` : `  int texel = linearTexel();
   if (texel >= ROWS * OUT4) { result = vec4(0.0); return; }
   int row = texel / OUT4;
   int group = texel - row * OUT4;
@@ -86,7 +122,7 @@ void main() {
 
   vec4 sum = vec4(0.0);
 ${weightLayout === "in-major" ? inMajor : outMajor}
-  vec4 value = sum${useBias ? " + fetch4(biasTex, group)" : ""};
+  vec4 value = sum${useBias ? " + fetch4(biasTex, group)" : ""};`}
   result = ${roundHalf ? ROUND_HALF(ACTIVATIONS[activation]) : ACTIVATIONS[activation]};
 }`;
 };
@@ -112,10 +148,11 @@ export function linear(execution, call, into) {
       `linear: weightLayout is "out-major" ([out][in]) or "in-major" ([in][out]), `
       + `not \`${weightLayout}\``);
   }
-  /** @type {[string, number][]} */
-  const widths = [["inChannels", inChannels], ["outChannels", outChannels]];
-  for (const [name, value] of widths) {
-    if (value % 4 !== 0) throw new RangeError(`linear: ${name} must be a multiple of 4, got ${value}`);
+  // The INPUT width must be a multiple of four - every input read is a whole
+  // texel - and every shape in these models is. The OUTPUT width need not be:
+  // see the ragged kernel, which AF2's 50 pLDDT bins require.
+  if (inChannels % 4 !== 0) {
+    throw new RangeError(`linear: inChannels must be a multiple of 4, got ${inChannels}`);
   }
   if (x.elements !== rows * inChannels) {
     throw new RangeError(`linear: x holds ${x.elements} floats, not ${rows} x ${inChannels}`);

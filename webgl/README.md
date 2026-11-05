@@ -63,6 +63,7 @@ webgl/
     evoformer/stack.js          the loop over blocks, for both kinds
   heads/
     distogram.js                P(d < 8 A) for every pair - the contact map the page draws
+    confidence.js               pLDDT, PAE and the pTM term
 ```
 
 ## AF2, which is what this tree is being built for
@@ -197,8 +198,20 @@ it is a second implementation rather than a transcription. It pins three convent
 produce a plausible map: the pair is symmetrised, the bias is therefore counted twice, and the bin
 straddling the threshold is excluded.
 
-Still to come: the structure module and the confidence head. After AF2: AF3's pairformer and
-diffusion, ESMFold2, bioemu2.
+**The confidence head is done too** - pLDDT at 1.1e-7, PAE **bit-identical**, the pTM term at
+2.4e-7 against the shared host implementation, and pTM itself exact against the WGSL head and 1.4e-9
+against the host reduction. It pins two bin-centre rules that are different and neither obvious:
+pLDDT's are `(bin + 0.5) / bins * 100` while PAE's come from the model's own breaks as
+`breaks[bin] + step / 2`, with the last bin CLOSED rather than open.
+
+🔴 **AND AF2's 50 pLDDT BINS FORCED A SECOND LINEAR KERNEL.** A width that is not a multiple
+of four means a texel straddles two rows - row r occupies elements `[50r, 50r + 50)` - so a
+fragment's four consecutive outputs can belong to two rows with two different input vectors. The
+aligned kernel shares one input sweep across its four outputs and cannot. `linear` compiles a ragged
+variant that resolves each component separately: four times the reads, on a projection whose whole
+output is `rows * 50` floats, and the alternative was refusing a shape the model actually has.
+
+Still to come: the structure module. After AF2: AF3's pairformer and diffusion, ESMFold2, bioemu2.
 
 Every operation so far is checked against TWO references - an f64 CPU one written from the
 operation, and the WGSL kernel run in the same page - because a single reference cannot say which
