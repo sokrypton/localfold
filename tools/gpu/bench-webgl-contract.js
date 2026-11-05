@@ -27,6 +27,39 @@
  * 🔴 AND EVERY ARM IS COMPARED AGAINST THE SHIPPED KERNEL, to a reordering's
  * bar - the blocked path sums the same products in the same order, but the
  * compiler fuses a `dot` and a chain of multiply-adds differently.
+ *
+ * 🔴 WHAT BINDS IT: NOT REUSE, NOT BYTES, NOT ARITHMETIC, AND NOT THE RUN
+ * LENGTH. The shipped tiled kernel is **4.85 ms at 33.2 GFLOP/s** at 68 tokens
+ * and 256 channels, where the dense projection reaches 375. Four arms, each
+ * removing one candidate:
+ *
+ * | arm | factor | what it rules out |
+ * |---|---|---|
+ * | `aliased-tiled` - both operands one texture | **1.05-1.14x** | operand reuse |
+ * | `half-tiled` - both operands float16 | **0.97-1.06x** | bandwidth |
+ * | (probe-alu's vec4 ceiling is 5034 GFLOP/s) | 142x headroom | arithmetic |
+ * | `--lengths=68,128,256` - the k run is L/4 | 33.2 / 40.6 / 19.3 GF/s | the run length |
+ *
+ * 🔴 AND `aliased` ALONE WAS THE WRONG ARM FOR FIVE MONTHS, which is why
+ * `aliased-tiled` is here. The shipped contraction is TILE-MAPPED and aliasing
+ * had only ever been measured against the untiled block, so "aliasing is 1.11x"
+ * was a statement about a kernel nothing dispatches. Same mistake in shape as
+ * `probe-webgl-linear-operand.js`'s straw baseline: **a diagnostic arm has to
+ * sit beside the kernel that ships**, and the tiled answer happens to agree
+ * (1.08x) only by luck.
+ *
+ * So the contraction's 33 GFLOP/s is not explained by any of the four, and the
+ * remaining candidate nothing here can vary is OCCUPANCY: 36,992 fragments
+ * where `probe-webgl-gemm-ceiling.js` needs 262,144 to reach 2000 GFLOP/s, and
+ * the fragment count is `pairs * channels / 32` - fixed by the output budget.
+ *
+ * 🔴 AND THE VERDICT IS RED AT `--lengths=256` AND WAS BEFORE THIS NOTE. The
+ * ceiling declines blocking at 16.8M pair floats and blocking is **1.12x**
+ * there (268.52 ms against the split kernel's 301.01), while at 128 it is
+ * rightly declined (187.86 against 42.18) - so the relation is NOT monotone in
+ * the pair size and a single size threshold cannot express it. Pre-existing,
+ * reproduced on the committed bench, and at a length the current work does not
+ * fold; it wants a rule over the shape rather than the size.
  */
 import {
   CONTRACT_BLOCK_MAX_PAIR_FLOATS, blockedContractSource, contractRepackSource,
@@ -106,6 +139,17 @@ export async function main(device, args) {
     const pairs = length * length;
     const a = execution.upload(fill(channels * pairs, 7 + length), "bench.a");
     const b = execution.upload(fill(channels * pairs, 11 + length), "bench.b");
+    // 🔴 THE SAME OPERANDS IN FLOAT16, because the arithmetic says this kernel
+    // is bandwidth-bound and neither aliasing arm moves it. Two 4.7 MiB
+    // operands at 68 tokens and 256 channels, 408 fetch4 a fragment over 36,992
+    // fragments: 15.1 M fetch4 in 4.55 ms is **3.32 G fetch4/s, about 53 GB/s**,
+    // where the dense projection reaches 17.6 G fetch4/s and 282 - which is far
+    // past DRAM and so must be cache-served. Aliasing is 1.08x because halving
+    // 9.4 MiB to 4.7 is still past the cache, and that is the tell: the fix is
+    // fewer BYTES, not better reuse. `uploadWeight` gives float16 above its
+    // floor, which both operands clear.
+    const aHalf = execution.uploadWeight(fill(channels * pairs, 7 + length), "bench.a16");
+    const bHalf = execution.uploadWeight(fill(channels * pairs, 11 + length), "bench.b16");
     // Every output element is a dot product over k, so two flops a k.
     const flops = 2 * pairs * channels * length;
     /** @type {Record<string, Float32Array>} */
@@ -120,12 +164,25 @@ export async function main(device, args) {
     // resident weight. If aliasing is much faster, the misses are conflicts; if
     // it is the same, they are not, and that hypothesis dies with the other
     // five in webgl/README.md.
-    for (const arm of ["one-pair", "channel-fastest", "blocked", "aliased", "tiled"]) {
+    // 🔴 AND `aliased-tiled` IS THE ARM THAT WAS MISSING, BECAUSE `aliased`
+    // ALONE ANSWERS ABOUT A KERNEL NOTHING DISPATCHES. The shipped contraction
+    // is TILE-MAPPED, and aliasing was only ever measured against the untiled
+    // block - so "aliasing is 1.11x" said the UNTILED kernel is not conflict-
+    // bound and said nothing at all about the one that folds. Same mistake in
+    // shape as `probe-webgl-linear-operand.js`'s straw baseline: a diagnostic
+    // arm has to sit beside the kernel that ships.
+    for (const arm of ["one-pair", "channel-fastest", "blocked", "aliased", "tiled",
+      "aliased-tiled", "half-tiled"]) {
       const blocked = arm !== "one-pair";
+      const half = arm === "half-tiled";
       const call = {
-        a, b: arm === "aliased" ? a : b, length, channels, blocked,
+        a: half ? aHalf : a,
+        b: arm.startsWith("aliased") ? a : (half ? bHalf : b),
+        length,
+        channels,
+        blocked,
         channelSlowest: arm !== "channel-fastest",
-        tileMapped: arm === "tiled",
+        tileMapped: arm.endsWith("tiled"),
       };
       const ring = Array.from({ length: iterations },
         () => execution.allocate(pairs * channels, "bench.out"));
@@ -156,9 +213,19 @@ export async function main(device, args) {
       blockedMs: Number(timings.blocked.toFixed(2)),
       channelFastestMs: Number(timings["channel-fastest"].toFixed(2)),
       aliasedMs: Number(timings.aliased.toFixed(2)),
+      aliasedTiledMs: Number(timings["aliased-tiled"].toFixed(2)),
+      halfTiledMs: Number(timings["half-tiled"].toFixed(2)),
       tiledMs: Number(timings.tiled.toFixed(2)),
       tiledSpeedup: Number((timings.blocked / timings.tiled).toFixed(2)),
       aliasedSpeedup: Number((timings.blocked / timings.aliased).toFixed(2)),
+      // The one that matters: the SHIPPED tiled kernel against the same kernel
+      // with both operands in one texture.
+      aliasedTiledSpeedup: Number((timings.tiled / timings["aliased-tiled"]).toFixed(2)),
+      tiledGflops: Number((2 * length * length * length * channels
+        / timings.tiled / 1e6).toFixed(1)),
+      halfTiledSpeedup: Number((timings.tiled / timings["half-tiled"]).toFixed(2)),
+      halfTiledGflops: Number((2 * length * length * length * channels
+        / timings["half-tiled"] / 1e6).toFixed(1)),
       channelFastestGflops:
         Number((flops / timings["channel-fastest"] / 1e6).toFixed(1)),
       orderSpeedup:
