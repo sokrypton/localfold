@@ -39,6 +39,7 @@ import { pairBias as projectPairBias } from "../../kernels/pair-bias.js";
 import { transition } from "../../kernels/transition.js";
 import { triangleMultiplication } from "../../kernels/triangle-multiplication.js";
 import { add } from "../../runtime/elementwise.js";
+import { globalAttention } from "../../kernels/global-attention.js";
 import { transposeLeading } from "../../runtime/transpose.js";
 
 /** @typedef {import("../../runtime/storage.js").Tensor} Tensor */
@@ -50,6 +51,8 @@ import { transposeLeading } from "../../runtime/transpose.js";
  *   triangleMultiplicationOutgoing: Group, triangleMultiplicationIncoming: Group,
  *   triangleAttentionStarting: AttentionGroup, triangleAttentionEnding: AttentionGroup,
  *   pairTransition: Group}} BlockWeights
+ * @typedef {Omit<BlockWeights, "msaColumnAttention">
+ *   & {msaColumnGlobalAttention: Group & {heads: number}}} ExtraBlockWeights
  */
 
 const ATTENTION_NAMES = [
@@ -95,13 +98,25 @@ export function uploadEvoformerBlockWeights(execution, weights) {
     attention: group(ATTENTION_NAMES, source.attention, `${label}.attention`),
     pairBias: group(biasNames, source.pairBias, `${label}.pairBias`),
   });
+  // The extra stack's column attention is GLOBAL and its weights are a flat
+  // group rather than `{heads, attention}`, because that kernel has no separate
+  // pair-bias or per-head key and value; see encodeExtraMsaBlock.
+  const column = weights.msaColumnGlobalAttention !== undefined
+    ? {
+      msaColumnGlobalAttention: Object.assign(
+        group(ATTENTION_NAMES, weights.msaColumnGlobalAttention, "msa-column-global"),
+        { heads: weights.msaColumnGlobalAttention.heads }),
+    }
+    : {
+      msaColumnAttention: {
+        heads: weights.msaColumnAttention.heads,
+        attention: group(ATTENTION_NAMES, weights.msaColumnAttention.attention, "msa-column"),
+      },
+    };
   return {
     msaRowAttention: attention(weights.msaRowAttention, "msa-row",
       ["layerNormScale", "layerNormOffset", "projectionWeight"]),
-    msaColumnAttention: {
-      heads: weights.msaColumnAttention.heads,
-      attention: group(ATTENTION_NAMES, weights.msaColumnAttention.attention, "msa-column"),
-    },
+    ...column,
     msaTransition: group(TRANSITION_NAMES, weights.msaTransition, "msa-transition"),
     outerProductMean: group(OPM_NAMES, weights.outerProductMean, "opm"),
     triangleMultiplicationOutgoing: group(
@@ -213,7 +228,27 @@ export function evoformerBlock(execution, call) {
     ownMsa = true;
   }
 
-  // 4. The MSA's one path into the pair track.
+  pair = pairHalf(execution, call, msa, pair, ownPair, residual);
+  msa.label = "block.msa";
+  pair.label = "block.pair";
+  return { msa, pair };
+}
+
+/**
+ * The six sub-layers from the outer product mean down, shared by the main stack
+ * and the extra one - `encodeEvoformerPairBlock` is the same split on the WGSL
+ * side, and for the same reason: the extra stack differs only in its MSA half.
+ */
+function pairHalf(execution, call, msa, pairIn, ownPairIn, residual) {
+  const {
+    msaMask, pairMask, sequences, length, cM, cZ, cOuter,
+    triangleHidden, pairHidden, weights: w, epsilon = 1e-5,
+  } = call;
+  const pairs = length * length;
+  let pair = pairIn;
+  let ownPair = ownPairIn;
+
+  // 1. The MSA's one path into the pair track.
   {
     const update = outerProductMean(execution, {
       activations: msa, mask: msaMask, weights: w.outerProductMean,
@@ -223,7 +258,7 @@ export function evoformerBlock(execution, call) {
     ownPair = true;
   }
 
-  // 5, 6. The two triangle multiplications, in order: the second reads what the
+  // 2, 3. The two triangle multiplications, in order: the second reads what the
   //       first wrote.
   /** @type {[("outgoing" | "incoming"), Group][]} */
   const multiplications = [
@@ -241,7 +276,7 @@ export function evoformerBlock(execution, call) {
     ownPair = true;
   }
 
-  // 7. Triangle attention, starting node: the bias comes off the block's own
+  // 4. Triangle attention, starting node: the bias comes off the block's own
   //    normalised pair.
   {
     const starting = w.triangleAttentionStarting;
@@ -255,7 +290,7 @@ export function evoformerBlock(execution, call) {
     ownPair = true;
   }
 
-  // 8. Triangle attention, ending node: the other pair axis.
+  // 5. Triangle attention, ending node: the other pair axis.
   {
     const ending = w.triangleAttentionEnding;
     const transposed = transposeLeading(execution, {
@@ -276,17 +311,81 @@ export function evoformerBlock(execution, call) {
     ownPair = true;
   }
 
-  // 9. Pair transition.
+  // 6. Pair transition.
   {
     const update = transition(execution, {
       activations: pair, weights: w.pairTransition,
       rows: pairs, channels: cZ, hiddenChannels: pairHidden, epsilon,
     });
     pair = residual(pair, update, ownPair);
-    ownPair = true;
+  }
+  return pair;
+}
+
+/**
+ * The EXTRA-MSA block: the same thing with global column attention in place of
+ * ordinary column attention, which is the only difference
+ * (`encodeExtraMsaBlock`). The extra stack runs thousands of alignment rows, so
+ * attending over the sequences pairwise is unaffordable and its query is a
+ * masked column mean instead; see `webgl/kernels/global-attention.js`.
+ *
+ * @param {Omit<Parameters<typeof evoformerBlock>[1], "weights">
+ *   & {weights: ExtraBlockWeights}} call
+ * @returns {{msa: Tensor, pair: Tensor}}
+ */
+export function extraMsaBlock(execution, call) {
+  const {
+    msaMask, pairMask, sequences, length, cM, msaHidden, weights: w, epsilon = 1e-5,
+  } = call;
+  let msa = call.msa;
+  let pair = call.pair;
+  let ownMsa = false;
+
+  const residual = (current, update, own) => {
+    const next = add(execution, current, update);
+    execution.release(update);
+    if (own) execution.release(current);
+    return next;
+  };
+
+  // 1. MSA row attention, biased by the pair - the same as the main stack's.
+  {
+    const row = w.msaRowAttention;
+    const bias = projectPairBias(execution, {
+      pair, weights: row.pairBias, length, pairChannels: call.cZ, heads: row.heads, epsilon,
+    });
+    const update = attentionBlock(execution, {
+      activations: msa, mask: msaMask, weights: row.attention,
+      batch: sequences, queryLength: length, channels: cM, heads: row.heads,
+      pairBias: bias, epsilon, storagePrecision: call.msaAttentionPrecision ?? "f16",
+    });
+    execution.release(bias);
+    msa = residual(msa, update, ownMsa);
+    ownMsa = true;
   }
 
-  msa.label = "block.msa";
-  pair.label = "block.pair";
+  // 2. Global column attention, which transposes and transposes back itself.
+  {
+    const global = w.msaColumnGlobalAttention;
+    const update = globalAttention(execution, {
+      msa, mask: msaMask, weights: global,
+      sequences, length, channels: cM, heads: global.heads, epsilon,
+    });
+    msa = residual(msa, update, ownMsa);
+    ownMsa = true;
+  }
+
+  // 3. MSA transition.
+  {
+    const update = transition(execution, {
+      activations: msa, weights: w.msaTransition,
+      rows: sequences * length, channels: cM, hiddenChannels: msaHidden, epsilon,
+    });
+    msa = residual(msa, update, ownMsa);
+  }
+
+  pair = pairHalf(execution, call, msa, pair, false, residual);
+  msa.label = "extra.msa";
+  pair.label = "extra.pair";
   return { msa, pair };
 }

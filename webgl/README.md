@@ -55,8 +55,11 @@ webgl/
     triangle-contract.js        the contraction, one source shared by the stage and the benchmark
     triangle-multiplication.js  the whole operation, nine draws: LayerNorm, four projections,
                                 two gates, the mask, the contraction, the output gate
+    global-attention.js         AF2's global column attention: one query a residue, the masked
+                                mean of its column, with single-headed keys and values
   af2/
-    evoformer/block.js          a whole Evoformer block: nine sub-layers, each a residual
+    evoformer/block.js          a whole Evoformer block and the extra-MSA block, nine sub-layers
+                                each, sharing the six that make up the pair half
 ```
 
 ## AF2, which is what this tree is being built for
@@ -114,9 +117,17 @@ reproduces all three with an exact `packHalf2x16` round trip, which buys it noth
 RGBA32F either way) and is done because a fallback whose folds cannot be compared with the primary
 path's is not much of a fallback. Worth 5.8e-8 against 9.5e-5 on the MSA half.
 
-Still to come: AF2's separate GLOBAL attention for the extra-MSA stack, then the stack itself, the
-structure module, and the confidence and distogram heads. After AF2: AF3's pairformer and
-diffusion, ESMFold2, bioemu2.
+**Both block kinds run**: the main Evoformer block and the extra-MSA block, which differ only in
+their column attention - the extra stack runs thousands of alignment rows, so attending over the
+sequences pairwise is unaffordable and its query is a masked column mean instead. Global attention's
+four conventions are confirmed at the floor (`extra.msa` at 6.0e-8), and that block is the ONLY
+cross-check it can have, because `encodeGlobalAttention` is not exposed as a class.
+
+The pair gap shows up identically in both blocks - 7.0e-5 and 6.4e-5 - which places it in the six
+sub-layers they share rather than in either MSA half.
+
+Still to come: the Evoformer STACK over both block kinds, the structure module, and the confidence
+and distogram heads. After AF2: AF3's pairformer and diffusion, ESMFold2, bioemu2.
 
 Every operation so far is checked against TWO references - an f64 CPU one written from the
 operation, and the WGSL kernel run in the same page - because a single reference cannot say which

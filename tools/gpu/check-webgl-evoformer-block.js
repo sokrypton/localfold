@@ -76,9 +76,10 @@
  * error in composition would not stop at one half.
  */
 import { EvoformerBlockGpu } from "../../webgpu/af2/evoformer/block.js";
+import { ExtraMsaStackGpu } from "../../webgpu/af2/evoformer/stack.js";
 import { setDeviceTuning, setHalfPrecision } from "../../webgpu/runtime/device-profile.js";
 import {
-  evoformerBlock, releaseEvoformerBlockWeights, uploadEvoformerBlockWeights,
+  evoformerBlock, extraMsaBlock, releaseEvoformerBlockWeights, uploadEvoformerBlockWeights,
 } from "../../webgl/af2/evoformer/block.js";
 import { Execution } from "../../webgl/runtime/execution.js";
 import { createWebGL2Context } from "../../webgl/index.js";
@@ -123,6 +124,22 @@ export async function main(device, args) {
     const out = new Float32Array(count);
     for (let i = 0; i < count; i += 1) out[i] = centre + (random() * 2 - 1) * spread;
     return out;
+  };
+  /** Global attention's weights: a flat group, single-headed keys and values. */
+  const globalAttentionGroup = (channels, headCount) => {
+    const headDim = channels / headCount;
+    const gates = headCount * headDim;
+    return {
+      queryNormScale: noise(channels, 0.2, 1),
+      queryNormOffset: noise(channels, 0.1),
+      queryWeight: noise(channels * gates, 1 / Math.sqrt(channels)),
+      keyWeight: noise(channels * headDim, 1 / Math.sqrt(channels)),
+      valueWeight: noise(channels * headDim, 1 / Math.sqrt(channels)),
+      gatingWeight: noise(channels * gates, 1 / Math.sqrt(channels)),
+      gatingBias: noise(gates, 0.1, 1),
+      outputWeight: noise(gates * channels, 1 / Math.sqrt(gates)),
+      outputBias: noise(channels, 0.05),
+    };
   };
   const attentionGroup = (channels) => ({
     heads,
@@ -285,24 +302,70 @@ export async function main(device, args) {
   // ruled out; `--strict` removes it.
   const KNOWN_PAIR_GAP = 1e-4;
   const strict = flag(args, "strict");
+  // --- and the EXTRA-MSA block, whose only difference is global attention ---
+  //
+  // 🔴 THIS IS THE ONLY CROSS-CHECK GLOBAL ATTENTION CAN HAVE, because
+  // `encodeGlobalAttention` is not exposed as a class - so its four conventions
+  // (a 1e-10 masked-mean denominator, a query pre-scaled by
+  // inversesqrt(headDim), a masked logit set to -1e9 OUTRIGHT rather than
+  // added, and single-headed keys and values shared by every head) are only
+  // confirmed by a block that runs it. `ExtraMsaStackGpu` takes `blockWeights`
+  // as an array, so one block is one entry.
+  const extraWeights = {
+    ...weights,
+    msaColumnGlobalAttention: Object.assign(globalAttentionGroup(cM, heads), { heads }),
+  };
+  delete extraWeights.msaColumnAttention;
+  const extraUploaded = uploadEvoformerBlockWeights(execution, extraWeights);
+  const extraMsaTensor = execution.upload(skewed, "extra.msa");
+  const extraPair = execution.upload(pairValues, "extra.pair");
+  const extraMask = execution.upload(msaMaskValues, "extra.msa-mask");
+  const extraPairMask = execution.upload(pairMaskValues, "extra.pair-mask");
+  const extra = extraMsaBlock(execution, {
+    msa: extraMsaTensor, pair: extraPair, msaMask: extraMask, pairMask: extraPairMask,
+    ...shape, msaHidden, pairHidden, weights: extraUploaded,
+    msaAttentionPrecision: option(args, "msa-attention-precision", "f16"),
+    triangleAttentionPrecision: option(args, "triangle-attention-precision", "f16"),
+  });
+  const oursExtra = {
+    msa: execution.read(extra.msa).slice(), pair: execution.read(extra.pair).slice(),
+  };
+  execution.release(extra.msa);
+  execution.release(extra.pair);
+  releaseEvoformerBlockWeights(execution, extraUploaded);
+  for (const tensor of [extraMsaTensor, extraPair, extraMask, extraPairMask]) {
+    execution.release(tensor);
+  }
+  const theirsExtra = await new ExtraMsaStackGpu(device).run({
+    msa: msaValues, pair: pairValues,
+    msaMask: msaMaskValues, pairMask: pairMaskValues,
+    ...shape, blockWeights: [extraWeights],
+  });
+
   const rows = [];
   const failures = [];
   const gaps = [];
-  for (const name of ["msa", "pair"]) {
-    const relative = relativeRms(ours[name], theirs[name], name);
+  /** @type {[string, any, any][]} */
+  const comparisons = [
+    ["msa", ours, theirs], ["pair", ours, theirs],
+    ["extra.msa", oursExtra, theirsExtra], ["extra.pair", oursExtra, theirsExtra],
+  ];
+  for (const [label, mine, reference] of comparisons) {
+    const name = label.replace("extra.", "");
+    const relative = relativeRms(mine[name], reference[name], label);
     const allowance = name === "pair" && !strict ? KNOWN_PAIR_GAP : bar;
     const ok = relative <= allowance;
     const known = name === "pair" && !strict && relative > bar && ok;
     rows.push({
-      arm: `${name} vs WGSL block`,
+      arm: `${label} vs WGSL block`,
       relativeRms: Number(relative.toPrecision(4)),
       bar,
       ...(allowance === bar ? {} : { allowance }),
       ok,
       ...(known ? { knownGap: true } : {}),
     });
-    if (!ok) failures.push(`${name}: relRMS ${relative.toExponential(3)} over ${allowance}`);
-    if (known) gaps.push(`${name} at ${relative.toExponential(2)}`);
+    if (!ok) failures.push(`${label}: relRMS ${relative.toExponential(3)} over ${allowance}`);
+    if (known) gaps.push(`${label} at ${relative.toExponential(2)}`);
   }
 
   const red = rows.filter((row) => !row.ok).length;
@@ -332,7 +395,7 @@ export async function main(device, args) {
           .join("; ")}`
         : gaps.length === 0
           ? `ok: msa and pair both match at the floor, no tensor left live`
-          : `ok with ${gaps.length} known gap: ${gaps.join(", ")}`
+          : `ok with ${gaps.length} known gap(s): ${gaps.join(", ")}`
             + ` - the msa half is at its floor; see the header, and --strict to fail on it`),
   };
 }
