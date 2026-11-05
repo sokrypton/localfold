@@ -1441,6 +1441,25 @@ projection reads twelve rows per k-step where the ceiling arm reads four, and th
 `2x4x1` arm (six streams) is 1.3x the rate of `8x4x1` (twelve) - the right sign, not the right size.
 That is where the remaining 2 to 4x is, and it is unresolved.
 
+🔴 **AND "2 TO 4x OF HEADROOM" IS ITSELF AN OVER-READING OF THE CEILING, WHICH IS THE THIRD TIME
+THIS FILE HAS MADE THAT MISTAKE.** The ceiling arm has **every fragment reading the same 64 KiB
+band**, which is the best locality a kernel can have and not a locality a GEMM can have: different
+fragments MUST read different rows, or they would be computing the same output. So 24 G fetch4/s
+bounds what the hardware can ISSUE, and says nothing about what a kernel whose fragments read
+disjoint rows can reach. The measured facts are:
+
+- the output budget caps intensity at 21.33 flops a `fetch4`, arithmetically;
+- the issue rate with perfect locality is 19 to 32 G fetch4/s, measured;
+- a 12-stream GEMM with per-fragment rows reaches 4 to 9, measured;
+- and the distance between the last two is locality that is partly INHERENT to the access pattern
+  rather than a defect to be fixed.
+
+How much of it is inherent is not known. **The honest form of this section is therefore: the old 6x
+floor was wrong because it multiplied by an unmeasured rate, the projections are not at the
+hardware's issue limit, and how much of the remainder is reachable is an open question - not a
+quantity this file can state.** Every attempt on it so far (the row block, the fragment order, a
+tile-aware mapping, both operand sizes, the target count) has come back null or negative.
+
 The first version of this paragraph is the mistake this file warns about everywhere else, made in
 the place where it does the most damage: **an estimate presented as a bound, used to argue that
 further work was pointless.** It was also the reason the ESMFold2 contraction sat at 0.4 GFLOP/s
