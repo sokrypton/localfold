@@ -1365,8 +1365,25 @@ difference. Which agrees with the superposition: the structures were never the p
 | **with it zeroed** | **59.42** | **0.5167** |
 
 `webgpu/esmfold2/fold.js` measures the CORRECT bias as worth **+13.8 pLDDT** ("Measured absent: 13.8
-pLDDT and a PAE 2.4x rougher"). **A term that should help by fourteen points and hurts by two is
-wrong**, and that is where the defect is.
+pLDDT and a PAE 2.4x rougher"). A term that should help by fourteen points and hurts by two says
+something is wrong here.
+
+🔴 **BUT NOT NECESSARILY THE BIAS, AND SAYING SO WAS AN OVERCLAIM.** The kernel that makes it is
+exact - relRMS **0** against the reference, newly gated - the weight is the same
+`featuriser.relPos` the WGSL driver uses, the width matches the head's 256, and the sampler reads
+the SAME tensor to produce a structure agreeing to 1.84 A. What the zeroing test actually shows is
+that the head's **assembled pair** is wrong, and that removing one correct addend happens to improve
+the score. The head assembles
+
+```
+out = normed + bias + rows[i] + columns[j] + product + distanceTable[bucket(d)]
+```
+
+and any of those six being wrong would do it. Adding a correct bias on top of a wrong base need not
+help. So the defect is somewhere in that assembly, which is gated against
+`cpu/esmfold2/confidence.js` and green - **and a head and a reference that share a mistake agree
+perfectly**, which is this file's own recorded failure mode and why the next comparison has to be
+against the vendor's forward pass rather than against the CPU side.
 
 🔴 **AND THE KERNEL THAT PRODUCES IT WAS IMPORTED BY ITS GATE AND NEVER DISPATCHED.**
 `check-webgl-esmfold2-trunk.js` brought in `relativeEncodingSource` and never ran it: the arms that
@@ -1376,11 +1393,12 @@ SUM of five terms, where a wrong relative encoding hides under the other four. *
 own arm: relRMS exactly 0.** So the kernel is right, the tensor is right, and the sampler uses the
 same tensor to produce a structure that agrees to 1.84 A.
 
-**So what is left is WHERE the confidence head adds it** - the head is gated against
-`cpu/esmfold2/confidence.js`, and a head and a reference that add a bias at the same wrong point
-agree perfectly, which is this file's own recorded failure mode. **The next step is to audit the
-head's bias placement against the VENDOR's forward pass rather than against the CPU reference**, which
-is the one comparison neither backend's gates make.
+**So what is left is the head's six-term assembly** - `normed + bias + rows + columns + product +
+distanceTable` - of which the bias is now proven exact and the other five are gated only against the
+CPU reference. **The next step is to audit those five against the VENDOR's forward pass**, or to feed
+the WebGL2 head the WGSL fold's own pair and single in one page and see which term diverges; both
+backends' modules already load together in these gates, so it is a tool rather than a research
+question.
 
 🔴 **AND THE NEW ARM WAS VACUOUS ON ITS FIRST TRY, WHICH THE GATE ITSELF CAUGHT.** `--falsify` skews
 `xInputs` and the language model pair, and this arm reads neither, so it stayed green under
