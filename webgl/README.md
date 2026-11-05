@@ -1184,8 +1184,36 @@ first thing written, not the last.
 What this redirects the work to: the two changes that moved these kernels most were already
 locality - the contraction's fragment order (1.49x) and its tile-aware mapping (3.29x) - and the
 fetch-rate probe says scattered reads get **19 to 32 G fetch4/s** where this best case gets **92**.
-That is a 3 to 4x on the fetch side alone, before any arithmetic changes, and it is where the
-remaining factor lives.
+
+🔴 **AND THE 2D FRAGMENT ORDER WAS THEN BUILT FOR THE PROJECTION AND DOES NOT PAY.** A
+`TILE_BLOCK x TILE_BLOCK` block of fragments covering that many row blocks and output groups, the
+repack inverting it (the fold's CA-CA identical throughout, so the mapping is right), swept over the
+block size against the fragments the tiling rounds up:
+
+| | waste | sample stage | fold |
+|---|---:|---:|---:|
+| flat (shipped) | 1.00x | **3824 ms** | **6523 ms** |
+| `TILE_BLOCK` 8 | **1.02x** | 4981 | 8291 |
+| `TILE_BLOCK` 16 | 2.03x | **3725** | 6716 |
+| `TILE_BLOCK` 32 | 2.03x | 4083 | 7163 |
+
+**The locality gain is real and small**: at 16 the sample stage beats the flat order by 1.03x while
+paying 2x the plane memory, and the fold loses anyway. At 8, where the waste is almost nothing, it is
+much WORSE - which says the rasterisation tile is bigger than eight fragments square, so a block that
+small buys no sharing and pays the indexing. Reverted.
+
+🔴 **SO THE SYNTHESIS, STATED AS AN INFERENCE AND NOT A BOUND THIS TIME.** The 2 TFLOP/s ceiling is
+reached only because **every fragment reads the same operands**, and a GEMM's fragments must read
+disjoint rows. Four mechanisms for recovering that have now been built and measured - the fragment
+ORDER in one dimension (1.49x on the contraction, a 1.28x loss on the projection), the TILE-AWARE
+mapping (3.29x on the contraction), the 2D BLOCK (above), and a k SPLIT to raise the fragment count
+(1.5x slower) - and what is left after them is a factor of about twelve. **The fragment pipeline has
+no mechanism for sharing a loaded operand between invocations**, which is exactly what workgroup
+memory is, and the measured cost of not having it is that twelve.
+
+That is a claim about four tried mechanisms, not a proof that no fifth exists - the last three
+"bounds" in this file were each overturned by one measurement, and this paragraph should be read with
+that history in front of it.
 
 ### What the remaining gap IS, from the WGSL kernel's own notes
 
