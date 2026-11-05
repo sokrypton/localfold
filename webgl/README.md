@@ -1488,6 +1488,43 @@ invisible to all of them; the comparison that would find it is the two backends'
 in one page, which both modules already support because these gates load them together. **That is a
 tool, not a research question, and it is the one thing this hunt did not build.**
 
+🔴 **BUILT, AND IT ELIMINATES THE REFERENCES: THE TWO HEADS AGREE.**
+`check-webgl-esmfold2-confidence.js` runs `esmfold2ConfidenceFold` from
+`webgpu/esmfold2/confidence.js` beside this backend's head, on ONE set of synthetic weights and ONE
+set of inputs, at `--tokens=8 --pair-channels=128 --single-channels=128 --single-inputs=128`:
+
+| | pLDDT per token | PAE |
+|---|---:|---:|
+| WebGL2 against the f64 reference | **5.17e-08** | 1.43e-07 |
+| WGSL against the same reference | **1.02e-05** | 4.54e-05 |
+| the two heads against each other | **1.01e-05** | 4.54e-05 |
+
+The WGSL figures are that path's own f16/bf16 rounding, not a disagreement - it lands at the same
+~1e-5 against the reference and against this head, which is what it means for the difference to be
+its own arithmetic and nothing else. **So both references are right, every stage of both heads is
+right on synthetic data, and "a head and a reference sharing a mistake" is dead** - the possibility
+twelve eliminations could not see, because each was measured against that pair of references. The
+fold's divergence is thirty points of pLDDT and these heads differ at 1e-5, three to four orders of
+magnitude too small, so what remains is **something the drivers do differently at a fold's real
+magnitudes** - which is the base the bias is added to, from the other end.
+
+🔴 **AND IT RUNS ONLY WHERE THE WGSL TRUNK COMPILES, WHICH THIS GATE'S DEFAULTS ARE NOT.** The WGSL
+pair transition falls back to chunking its WHOLE intermediate when its preferred chunk does not
+divide it, and then refuses a chunk that is not a multiple of its 128-lane workgroup - so 16 pair
+channels cannot compile there however right the head is. The arm is skipped on **that refusal by
+name** and the verdict says so; every other error is rethrown, because a swallowed exception is how a
+WGSL regression would come to read as a skip. Sweeping `--tokens` does not help: the constraint is on
+the CHANNEL widths, not the token count, which cost a run to learn.
+
+🔴 **AND THE FIRST VERSION OF BOTH NEW ARMS WAS VACUOUS FOR A REASON WORTH KEEPING.** `--falsify`
+skewed the inputs inside the WebGL2 UPLOAD, so the WGSL head read the originals - and "WGSL against
+the f64 reference" then compared an unskewed head with an unskewed reference and read 1.015e-05 under
+falsification exactly as without it. The skew is hoisted so both heads read the same numbers, and all
+ten arms go red. **The head-to-head is reported rather than gated for the same reason inverted**: no
+input skew can falsify it, because a skew moves both heads together. It is not lost - each head is
+pinned to the f64 reference, which bounds their difference between them, and is the stronger
+statement of the two.
+
 🔴 **AND THE NEW ARM WAS VACUOUS ON ITS FIRST TRY, WHICH THE GATE ITSELF CAUGHT.** `--falsify` skews
 `xInputs` and the language model pair, and this arm reads neither, so it stayed green under
 falsification and the verdict reported **"VACUOUS: only 7 of 8 arms noticed it"**. Skewing the
