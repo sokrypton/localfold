@@ -11,9 +11,9 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-495 tools. `tools/fixtures/` is data and is not listed.
+496 tools. `tools/fixtures/` is data and is not listed.
 
-## `tools/gpu/` - the WebGPU lane (250)
+## `tools/gpu/` - the WebGPU lane (251)
 
 Each exports `async function main(device, args)` and is run as
 `node tools/gpu-chrome.mjs tools/gpu/<module>.js [--flags]`.
@@ -148,6 +148,7 @@ Each exports `async function main(device, args)` and is run as
 - **`check-webgl-af3-template.js`** - AF3's template embedder in WebGL2, against TWO references.
 - **`check-webgl-af3-transition.js`** - AF3's transition block in WebGL2, against TWO references.
 - **`check-webgl-af3-triangle.js`** - AF3's triangle multiplication in WebGL2, against TWO references.
+- **`check-webgl-af3-trunk.js`** - AF3's whole trunk in WebGL2 against `cpu/af3/trunk/trunk.js`.
 - **`check-webgl-attention-block.js`** - The whole attention block in WebGL2 against the WGSL block and a CPU reference - the cross-API differential this backend's attention has lacked.
 - **`check-webgl-attention.js`** - Gated attention for every head width this port runs, against a CPU reference and against the kernel it replaces.
 - **`check-webgl-confidence.js`** - pLDDT, PAE and pTM in WebGL2 against the WGSL confidence head.
