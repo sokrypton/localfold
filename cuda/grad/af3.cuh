@@ -405,7 +405,36 @@ struct Pairformer {
   bool hasSingle = true;              // the template stack and the MSA module's pair half have no single track
   bool hasGrid = true;                // Mol-1's PairMixer blocks carry no triangle attention
   bool parallel = false;              // chai-1: every update reads the block's input, and they are summed
+  // training's dropout (OpenFold3's pair_dropout, AF3 Algorithm 17): the two triangle multiplications' and the
+  // starting attention's updates rowwise, the ending attention's columnwise, at dropRate (0: off, inference). The
+  // masks come from a counter hash of (dropSeed, module, position), so a recomputed forward and the backward regenerate
+  // them and none is stored.
+  float dropRate = 0;
+  unsigned long long dropSeed = 0;
 };
+// the dropout itself (af2.cuh's dropoutK, the same draws): an update [A, B, C] in place, keep / (1 - rate); perRow, the
+// mask shared over A (DropoutRowwise, batch_dim -3), else over B (columnwise)
+__host__ __device__ __forceinline__ unsigned long long dropMix(unsigned long long x) {
+  x += 0x9e3779b97f4a7c15ull;
+  x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ull;
+  x = (x ^ (x >> 27)) * 0x94d049bb133111ebull;
+  return x ^ (x >> 31);
+}
+__global__ void dropK(real* x, int A, int B, int C, bool perRow, float rate, unsigned long long seed) {
+  const size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)A * B * C) return;
+  const int c = (int)(t % C);
+  const size_t rr = t / C;
+  const int a = (int)(rr / B), b = (int)(rr % B);
+  const unsigned long long key = perRow ? (unsigned long long)b * C + c : ((unsigned long long)a * C + c) | (1ull << 62);
+  const float u = (float)(dropMix(seed ^ dropMix(key)) >> 40) * (1.f / 16777216.f);
+  x[t] = u < rate ? (real)0 : x[t] / (1 - (real)rate);
+}
+enum { DROP3_TRI_OUT = 1, DROP3_TRI_IN, DROP3_START, DROP3_END, DROP3_MSA };
+inline void drop3(real* x, int A, int B, int C, bool perRow, float rate, unsigned long long seed, int module) {
+  if (rate <= 0) return;
+  dropK<<<blocks((size_t)A * B * C), 256, 0, STREAM>>>(x, A, B, C, perRow, rate, dropMix(seed * 8 + module));
+}
 struct PairformerSave {
   const real *pair0, *single0;
   real *p1, *p2, *p3, *p4, *pair5, *s1;
@@ -496,6 +525,7 @@ inline PairformerSave pairformerForward(Pairformer& b, const Dialect& d, const r
   b.triOut.divideByLength = b.triIn.divideByLength = d.divideByLength;
   real* u = ARENA.get(nn * Cz);                 // a triangle update's output, before its residual
   if (b.parallel) {
+    if (b.dropRate > 0) { fprintf(stderr, "the parallel pairformer's dropout is not written\n"); exit(1); }
     real* acc = cloneR(pair, nn * Cz);
     s.tOut = triMulForward(b.triOut, pair, pairMask, u, n); add(acc, u, nn * Cz);
     s.tIn = triMulForward(b.triIn, pair, pairMask, u, n); add(acc, u, nn * Cz);
@@ -506,16 +536,30 @@ inline PairformerSave pairformerForward(Pairformer& b, const Dialect& d, const r
     s.pt = gtForward(b.pairTrans, pair, acc, nn, 1);
     s.pair5 = acc;
   } else {
+    const float rate = b.dropRate;
+#ifndef GRAD_F64
+    if (rate > 0 && BF16) { fprintf(stderr, "the AF3 pairformer's dropout is not written for its bf16 path\n"); exit(1); }
+#endif
     s.p1 = cloneR(pair, nn * Cz);
-    s.tOut = triMulForward(b.triOut, pair, pairMask, u, n); add(s.p1, u, nn * Cz);
+    s.tOut = triMulForward(b.triOut, pair, pairMask, u, n); drop3(u, n, n, Cz, true, rate, b.dropSeed, DROP3_TRI_OUT); add(s.p1, u, nn * Cz);
     s.p2 = cloneR(s.p1, nn * Cz);
-    s.tIn = triMulForward(b.triIn, s.p1, pairMask, u, n); add(s.p2, u, nn * Cz);
+    s.tIn = triMulForward(b.triIn, s.p1, pairMask, u, n); drop3(u, n, n, Cz, true, rate, b.dropSeed, DROP3_TRI_IN); add(s.p2, u, nn * Cz);
     s.p4 = s.p2;
     if (b.hasGrid) {
       s.p3 = cloneR(s.p2, nn * Cz);
-      s.g1 = gridForward(b.grid1, d, s.p2, pairMask, maskT, s.p3, n);
-      s.p4 = cloneR(s.p3, nn * Cz);
-      s.g2 = gridForward(b.grid2, d, s.p3, pairMask, maskT, s.p4, n);
+      if (rate > 0) {   // (the attentions add into their output: an update alone, masked, then added)
+        real* gu = ARENA.zeros(nn * Cz);
+        s.g1 = gridForward(b.grid1, d, s.p2, pairMask, maskT, gu, n);
+        drop3(gu, n, n, Cz, true, rate, b.dropSeed, DROP3_START); add(s.p3, gu, nn * Cz);
+        s.p4 = cloneR(s.p3, nn * Cz);
+        GK(cudaMemsetAsync(gu, 0, nn * Cz * sizeof(real), STREAM));
+        s.g2 = gridForward(b.grid2, d, s.p3, pairMask, maskT, gu, n);
+        drop3(gu, n, n, Cz, false, rate, b.dropSeed, DROP3_END); add(s.p4, gu, nn * Cz);
+      } else {
+        s.g1 = gridForward(b.grid1, d, s.p2, pairMask, maskT, s.p3, n);
+        s.p4 = cloneR(s.p3, nn * Cz);
+        s.g2 = gridForward(b.grid2, d, s.p3, pairMask, maskT, s.p4, n);
+      }
     }
     s.pair5 = cloneR(s.p4, nn * Cz);
     s.pt = gtForward(b.pairTrans, s.p4, s.pair5, nn, 1);
@@ -588,13 +632,16 @@ inline void pairformerBackward(Pairformer& b, const Dialect& d, const Pairformer
   // (a module's bf16 backward reads its incoming gradient whole before it adds into dpair, so in BF16 the running
   // gradient is passed as both - bindcraft2's ACC - where float's backwards need it copied first)
   auto cur = [&](Scratch&) { return BF16 ? dp : cloneR(dp, nn * Cz); };
+  // (with dropout an update's gradient is the running gradient under the forward's mask: always a masked copy)
+  const float rate = b.dropRate;
+  auto masked = [&](Scratch&, bool perRow, int module) { real* du = cloneR(dp, nn * Cz); drop3(du, n, n, Cz, perRow, rate, b.dropSeed, module); return du; };
   { Range r_("bw.pairTrans"); Scratch sc; real* du = cur(sc); gtBackward(b.pairTrans, s.pt, du, dp); }
   if (b.hasGrid) {
-    { Range r_("bw.grid2"); Scratch sc; real* du = cur(sc); gridBackward(b.grid2, d, s.g2, pairMask, maskT, du, dp); }
-    { Range r_("bw.grid1"); Scratch sc; real* du = cur(sc); gridBackward(b.grid1, d, s.g1, pairMask, maskT, du, dp); }
+    { Range r_("bw.grid2"); Scratch sc; real* du = rate > 0 ? masked(sc, false, DROP3_END) : cur(sc); gridBackward(b.grid2, d, s.g2, pairMask, maskT, du, dp); }
+    { Range r_("bw.grid1"); Scratch sc; real* du = rate > 0 ? masked(sc, true, DROP3_START) : cur(sc); gridBackward(b.grid1, d, s.g1, pairMask, maskT, du, dp); }
   }
-  { Range r_("bw.triIn"); Scratch sc; real* du = cur(sc); triMulBackward(b.triIn, s.tIn, pairMask, du, dp); }
-  { Range r_("bw.triOut"); Scratch sc; real* du = cur(sc); triMulBackward(b.triOut, s.tOut, pairMask, du, dp); }
+  { Range r_("bw.triIn"); Scratch sc; real* du = rate > 0 ? masked(sc, true, DROP3_TRI_IN) : cur(sc); triMulBackward(b.triIn, s.tIn, pairMask, du, dp); }
+  { Range r_("bw.triOut"); Scratch sc; real* du = rate > 0 ? masked(sc, true, DROP3_TRI_OUT) : cur(sc); triMulBackward(b.triOut, s.tOut, pairMask, du, dp); }
   GK(cudaMemcpyAsync(dpair, dp, nn * Cz * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
 }
 
@@ -736,6 +783,10 @@ struct MsaBlock {
   GatedTransition trans;
   Pairformer pairHalf;
   bool updateFirst = false, chai = false;
+  // training's MSA dropout (OpenFold3's msa_dropout): the pair-weighted averaging's update rowwise (shared over the
+  // MSA's rows), at dropRate; the pair half's own in pairHalf
+  float dropRate = 0;
+  unsigned long long dropSeed = 0;
 };
 struct MsaSave {
   OpmSave opm;
@@ -754,6 +805,7 @@ inline MsaSave msaForward(MsaBlock& b, const Dialect& d, const real* msa, const 
   MsaSave s{}; s.S = S; s.n = n;
   real* p = cloneR(pair, nn * Cz);
   if (b.chai) {
+    if (b.dropRate > 0 || b.pairHalf.dropRate > 0) { fprintf(stderr, "chai-1's MSA block's dropout is not written\n"); exit(1); }
     s.opm = opmForward(b.opm, msa, msaMask, p, S, n);
     GK(cudaMemcpyAsync(msaOut, msa, rows * Cm * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
     s.tr = gtForward(b.trans, msa, msaOut, rows, 1);
@@ -777,7 +829,12 @@ inline MsaSave msaForward(MsaBlock& b, const Dialect& d, const real* msa, const 
   s.pairA = p;
   s.msaA = cloneR(msa, rows * Cm);
   // (update first: the attention reads the incoming pair, which p is about to stop being - a save keeps a pointer)
-  s.att = pwaForward(b.att, msa, msaMask, seqMask, b.updateFirst ? pair : p, s.msaA, S, n);
+  if (b.dropRate > 0) {
+    real* mu = ARENA.zeros(rows * Cm);
+    s.att = pwaForward(b.att, msa, msaMask, seqMask, b.updateFirst ? pair : p, mu, S, n);
+    drop3(mu, S, n, Cm, true, b.dropRate, b.dropSeed, DROP3_MSA); add(s.msaA, mu, rows * Cm);
+  } else
+    s.att = pwaForward(b.att, msa, msaMask, seqMask, b.updateFirst ? pair : p, s.msaA, S, n);
   GK(cudaMemcpyAsync(msaOut, s.msaA, rows * Cm * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
   s.tr = gtForward(b.trans, s.msaA, msaOut, rows, 1);
   if (b.updateFirst) { s.pairA = p; s.opm = opmForward(b.opm, msaOut, msaMask, p, S, n); }
@@ -810,7 +867,7 @@ inline void msaBackward(MsaBlock& b, const Dialect& d, const MsaSave& s, const r
     pairformerBackward(b.pairHalf, d, s.ph, pairMask, maskT, seqMask, dpairOut, nullptr, dp, nullptr, nullptr);
     if (b.updateFirst) opmBackward(b.opm, s.opm, msaMask, dp, dm);    // p = pairA + OPM(msaOut)
     { Scratch sc; real* du = cloneR(dm, rows * Cm); gtBackward(b.trans, s.tr, du, dm); }   // msaOut = msaA + T(msaA)
-    { Scratch sc; real* du = cloneR(dm, rows * Cm); pwaBackward(b.att, s.att, msaMask, du, dm, dp); }
+    { Scratch sc; real* du = cloneR(dm, rows * Cm); drop3(du, S, n, Cm, true, b.dropRate, b.dropSeed, DROP3_MSA); pwaBackward(b.att, s.att, msaMask, du, dm, dp); }
     if (!b.updateFirst) opmBackward(b.opm, s.opm, msaMask, dp, dm);   // pairA = pair + OPM(msa)
   }
   GK(cudaMemcpyAsync(dmsa, dm, rows * Cm * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));

@@ -219,6 +219,21 @@ inline Diffusion diffusionLoss(const Layout& L, const std::vector<double>& x, co
   return D;
 }
 
+// lDDT (all atoms, as a validation metric): over resolved atom pairs l != m within 15 A in the truth (30 where m is a
+// nucleotide's), the mean over thresholds 0.5, 1, 2, 4 of |d - d_true| below it, averaged over the pairs
+inline double lddt(const Layout& L, const std::vector<double>& x, const std::vector<double>& xt, const std::vector<double>& gm) {
+  std::vector<size_t> live; for (size_t i = 0; i < L.atoms(); ++i) if (L.exists[i] && gm[i] > 0) live.push_back(i);
+  double num = 0, den = 0;
+  for (size_t l : live) for (size_t m : live) {
+    if (l == m) continue;
+    const double dg = dist(xt, l, m);
+    if (!(dg < (L.nucleotide((int)(m / L.dense)) ? 30 : 15))) continue;
+    const double d = std::fabs(dist(x, l, m) - dg);
+    num += 0.25 * ((d < 0.5) + (d < 1) + (d < 2) + (d < 4)); den += 1;
+  }
+  return den > 0 ? num / den : 0;
+}
+
 // cross entropy against a one-hot bin; its gradient (softmax - onehot) * scale added into g
 template <class R> inline double crossEntropy(const R* lg, int K, int bin, double scale, double* g) {
   double mx = -1e300; for (int k = 0; k < K; ++k) mx = std::max(mx, (double)lg[k]);

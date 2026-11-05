@@ -104,13 +104,14 @@ static int msaParity(int blk, int n, const std::string& family, const std::strin
 
 #ifdef GRAD_F64
 static int checkBlock(const char* what, g::af3::Dialect d, bool gridBiases, bool extra, bool single, unsigned seed,
-                      bool hasGrid = true, bool parallel = false) {
+                      bool hasGrid = true, bool parallel = false, float drop = 0) {
   const int n = 13, pad = 2, Cz = 16, Cs = 24, Hp = 2, Dp = 8, Hs = 2, Ds = 12;
   g::af3::Pairformer b;
   g::Params ps;
   g::af3::forEachParam(b, "blk", Cz, Cs, Hp, Dp, Hs, Ds, 4, 4, gridBiases, single,
                        [&](const std::string& nm, g::Param& p, size_t len) { g::allocParam(p, nm, len); ps.add(p); },
                        hasGrid, parallel);
+  b.dropRate = drop; b.dropSeed = 4242;      // (training's dropout: the same masks every forward, so a function still)
   unsigned k = seed;
   for (auto* p : ps.all) {
     bool scale = p->name.find("Scale") != std::string::npos;
@@ -151,7 +152,7 @@ static int checkBlock(const char* what, g::af3::Dialect d, bool gridBiases, bool
   return gc.run([&] { g::ARENA.reset(); g::af3::pairformerForward(b, d, pair, sing, dPm, dPt, dSeq, ex, po, so, n); });
 }
 static int checkMsa(const char* what, g::af3::Dialect d, bool updateFirst, bool afterNorm, bool opmBiases, bool chai,
-                    unsigned seed) {
+                    unsigned seed, float drop = 0) {
   const int n = 11, pad = 2, S = 5, Cz = 16, Cm = 12, Hp = 2, Dp = 8, Ha = 2, Da = 6, O = 8, G = chai ? 2 : 1;
   g::af3::MsaBlock b;
   b.updateFirst = updateFirst; b.chai = chai;
@@ -159,6 +160,7 @@ static int checkMsa(const char* what, g::af3::Dialect d, bool updateFirst, bool 
   g::af3::forEachParam(b, "msa", Cz, Cm, Hp, Dp, Ha, Da, O, G, opmBiases, false,
                        [&](const std::string& nm, g::Param& p, size_t len) { g::allocParam(p, nm, len); ps.add(p); });
   b.opm.biasAfterNorm = afterNorm;
+  b.dropRate = drop * 0.6f; b.dropSeed = 777; b.pairHalf.dropRate = drop; b.pairHalf.dropSeed = 778;   // (0.15 and 0.25)
   unsigned k = seed;
   for (auto* p : ps.all) {
     bool scale = p->name.find("Scale") != std::string::npos;
@@ -212,6 +214,9 @@ int main(int argc, char** argv) {
   failed += checkMsa("MSA block, the update first and the bias after the count (Boltz-2)", {true, false}, true, true, false, false, 12);
   failed += checkMsa("MSA block, RoseTTAFold3 (projection biases, 1/n)", {false, true}, false, false, true, false, 13);
   failed += checkMsa("MSA block, chai-1 (grouped outer product, parallel pair stages)", {}, false, false, false, true, 14);
+  // OpenFold3's training dropout (pair 0.25: the triangle updates rowwise, the ending attention columnwise; MSA 0.15)
+  failed += checkBlock("training dropout 0.25 (OpenFold3's pairformer)", {}, false, false, true, 8, true, false, 0.25f);
+  failed += checkMsa("training dropout 0.15 / 0.25 (OpenFold3's MSA block)", {}, false, false, false, false, 15, 0.25f);
 #else
   std::string bundle = "model-af3-full-f32", family = "af3";
   int blk = 0, n = 37;

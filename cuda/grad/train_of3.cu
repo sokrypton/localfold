@@ -6,6 +6,8 @@
 //   the example   one of --examples (a line each: `input truth [resolution=X] [weight=W] [preferred=i[,j]]`, as
 //                 tools/make_of3_example.py writes them), drawn by weight; cropped to --crop tokens (384) by OpenFold3's
 //                 three strategies (contiguous 0.2, spatial 0.4, spatial-interface 0.4; whole when it fits)
+//   dropout       pair 0.25 (the triangle updates rowwise, the ending attention columnwise) in every pairformer-style
+//                 stack and MSA 0.15 on the pair-weighted averaging, fresh masks a step (--no-dropout: off)
 //   the trunk     1 + U{0..3} cycles, the gradient through the last; each cycle's MSA a fresh 1024 rows (the valid
 //                 rows in a random order, then invalid ones: MSAModuleEmbedder._subsample_all_msa)
 //   the rollout   AF3's sampler, 20 steps, one sample, no gradient; on it the truth's permutation (of3perm.h: which
@@ -478,7 +480,9 @@ static of3::Layout layoutOf(const Example& e) {
 
 int main(int argc, char** argv) {
   std::string bundle = "model-openbind0-f32", family = "openbind0", examplesPath, savePath, resumePath;
-  int steps = 30, samples = 48, batch = 1, crop = 384, saveEvery = 0, checkCkpt = -1, checkPerm = -1; std::string init = "bundle"; unsigned seed = 1; bool smoke = false, ckpt = true;
+  int steps = 30, samples = 48, batch = 1, crop = 384, saveEvery = 0, checkCkpt = -1, checkPerm = -1; std::string init = "bundle";
+  bool dropout = true, dropInFixed = false;   // (dropInFixed: --check-ckpt's fixed draws with the masks on)
+  std::string valPath; int valEvery = 0, valSamples = 5, valSteps = 200, valCrop = 1536; unsigned seed = 1; bool smoke = false, ckpt = true;
   double lrMax = 1.8e-3, bondWeight = 0; long warmup = 1000;
   for (int i = 1; i < argc; ++i) {
     auto opt = [&](const char* k) { const size_t l = strlen(k); return !strncmp(argv[i], k, l) ? argv[i] + l : nullptr; };
@@ -498,9 +502,15 @@ int main(int argc, char** argv) {
     else if (auto v = opt("--resume=")) resumePath = v;
     else if (!strcmp(argv[i], "--smoke")) smoke = true;
     else if (!strcmp(argv[i], "--no-ckpt")) ckpt = false;
+    else if (!strcmp(argv[i], "--no-dropout")) dropout = false;
     else if (auto v = opt("--check-ckpt=")) checkCkpt = atoi(v);
     else if (auto v = opt("--check-perm=")) checkPerm = atoi(v);
     else if (auto v = opt("--init=")) init = v;
+    else if (auto v = opt("--val=")) valPath = v;
+    else if (auto v = opt("--val-every=")) valEvery = atoi(v);
+    else if (auto v = opt("--val-samples=")) valSamples = atoi(v);
+    else if (auto v = opt("--val-steps=")) valSteps = atoi(v);
+    else if (auto v = opt("--val-crop=")) valCrop = atoi(v);
     else if (!strcmp(argv[i], "--tf32")) g::TF32 = true;
     else { fprintf(stderr, "train-of3: unknown argument %s\n", argv[i]); return 1; }
   }
@@ -939,8 +949,20 @@ int main(int argc, char** argv) {
 
   // one example through the whole network: its losses, and (train) its gradients in the parameters. `fixed` draws
   // everything from a seeded generator and the noise levels from a fixed ladder - a measurement, comparable run to run.
+  // training's dropout (OpenFold3: pair 0.25 in every pairformer-style stack - trunk, MSA module, template, confidence -
+  // MSA 0.15), fresh masks a step; off (eval) for a measurement and validation
+  auto setDropout = [&](bool on, uint64_t base) {
+    for (size_t k = 0; k < pf.size(); ++k) { pf[k].dropRate = on ? 0.25f : 0; pf[k].dropSeed = base * 1000 + k; }
+    for (size_t k = 0; k < msaB.size(); ++k) {
+      msaB[k].dropRate = on ? 0.15f : 0; msaB[k].dropSeed = base * 1000 + 100 + k;
+      msaB[k].pairHalf.dropRate = on ? 0.25f : 0; msaB[k].pairHalf.dropSeed = base * 1000 + 200 + k;
+    }
+    for (size_t k = 0; k < tm.blocks.size(); ++k) { tm.blocks[k].dropRate = on ? 0.25f : 0; tm.blocks[k].dropSeed = base * 1000 + 300 + k; }
+    for (size_t k = 0; k < ch.blocks.size(); ++k) { ch.blocks[k].dropRate = on ? 0.25f : 0; ch.blocks[k].dropSeed = base * 1000 + 400 + k; }
+  };
   auto runExample = [&](const Example& full, bool train, bool fixed, int nSamples, std::mt19937_64& gen) {
     Losses L;
+    setDropout(train && (!fixed || dropInFixed) && dropout, gen());
     std::string strategy = "whole";
     auto now = [] { CK(cudaStreamSynchronize(STREAM)); return std::chrono::steady_clock::now(); };
     auto msOf = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
@@ -1115,6 +1137,7 @@ int main(int argc, char** argv) {
   // --check-ckpt=k: example k (whole, fixed draws) backward twice - recomputing each block's saves, and keeping them -
   // and every parameter's gradient compared: the recomputation must change nothing
   if (checkCkpt >= 0) {
+    dropInFixed = true;     // (the recomputation must regenerate the dropout masks too)
     auto grads = [&](bool on) {
       ckpt = on; ps.zeroGrad();
       std::mt19937_64 gen(99);
@@ -1133,7 +1156,7 @@ int main(int argc, char** argv) {
     const bool ok = e < std::max(4 * floor, 1e-6);
     printf("activation checkpointing: every gradient recomputed against kept saves, relRMS %.3e (two identical runs: %.3e)  %s\n",
            e, floor, ok ? "PASS" : "FAIL");
-    ckpt = true;
+    ckpt = true; dropInFixed = false;
     if (!ok) return 1;
   }
   // --check-perm=k: example k whole, its truth disguised - each repeated molecule's copies relabelled cyclically, every
@@ -1187,6 +1210,71 @@ int main(int argc, char** argv) {
            relabelled, renamed, asLabelled, permuted, rep.empty() ? " identity" : rep.c_str(), ok ? "PASS" : "FAIL");
     if (!ok) return 1;
   }
+  // ---- validation (runner.py's validation_step): the EMA's weights, 1 + 3 cycles, a full rollout of --val-samples
+  // (5) x --val-steps (200), each sample's truth permuted and scored by all-atom lDDT; the sample the confidence head
+  // ranks first (its mean pLDDT) reported beside the mean and the best. An entry larger than --val-crop is cropped
+  // spatially from a seeded draw.
+  std::vector<Example> valExamples;
+  if (!valPath.empty()) {
+    std::ifstream f(valPath); std::string l;
+    if (!f) { fprintf(stderr, "cannot read %s\n", valPath.c_str()); return 1; }
+    while (std::getline(f, l)) if (!l.empty() && l[0] != '#') valExamples.push_back(loadExample(l, padded, qblock));
+    loadExample(lines[0], padded, qblock);
+  }
+  auto validate = [&](long atStep) {
+    opt.swapEma(ps);
+    setDropout(false, 0);
+    double sumMean = 0, sumTop = 0;
+    for (const Example& full : valExamples) {
+      std::mt19937_64 gen(777);
+      std::string strategy = "whole";
+      std::vector<int> keep(full.n); for (int t = 0; t < full.n; ++t) keep[t] = t;
+      if (full.n > valCrop) keep = cropTokens(full, layoutOf(full), valCrop, CropWeights{0, 1, 0}, gen, strategy);
+      Example e = subset(full, keep);
+      const of3::Layout Lay = layoutOf(e);
+      const int n = e.n; const size_t nn = (size_t)n * n, A = e.atoms();
+      Dev d; upload(d, e, padded, qblock, std::min(1024, e.P));
+      Acts a = makeActs(n, d.S);
+      cycles(d, a, 4, [&] { drawMsa(d, e, gen); });
+      std::vector<double> scores, plddts;
+      for (int s = 0; s < valSamples; ++s) {
+        g::Scratch sc;
+        auto xp = rollout(d, a, e, gen, valSteps);
+        std::vector<double> xt, gm;
+        of3::permuteTruth(full.perm, keep, xp, xt, gm, nullptr);
+        scores.push_back(of3::lddt(Lay, xp, xt, gm));
+        // the head's mean pLDDT on this sample (its ranking)
+        std::vector<double> beta(n * 3, 0);
+        for (int t = 0; t < n; ++t) if (e.pbSlot[t] >= 0) for (int p = 0; p < 3; ++p) beta[t * 3 + p] = xp[((size_t)t * e.dense + e.pbSlot[t]) * 3 + p];
+        g::real* betaD = g::ARENA.get(n * 3);
+        { std::vector<g::real> rr(beta.begin(), beta.end()); GK(cudaMemcpy(betaD, rr.data(), rr.size() * sizeof(g::real), cudaMemcpyHostToDevice)); }
+        g::af3::ConfidenceBatch cb{d.ri, d.ti, d.asym, d.ent, d.sym, d.bonds, d.orders};
+        g::af3::ConfidenceLogits o{};
+        g::af3::confidenceForward(ch, a.pairs[nMsa + nPf], a.singles[nPf], a.tf, betaD, d.seqMask, d.pairMask, d.pairMaskT, n, o, cb);
+        auto lg = g::host(o.plddt, A * ch.PB);
+        double pl = 0, cnt = 0;
+        for (size_t i = 0; i < A; ++i) {
+          if (!(e.predMask[i] > 0)) continue;
+          double mx = -1e300; for (int k = 0; k < ch.PB; ++k) mx = std::max(mx, (double)lg[i * ch.PB + k]);
+          double z = 0, ex = 0; for (int k = 0; k < ch.PB; ++k) { const double p = exp(lg[i * ch.PB + k] - mx); z += p; ex += p * (k + 0.5) / ch.PB; }
+          pl += ex / z; cnt += 1;
+        }
+        plddts.push_back(100 * pl / std::max(1.0, cnt));
+      }
+      (void)nn;
+      const size_t top = std::max_element(plddts.begin(), plddts.end()) - plddts.begin();
+      double mean = 0; for (double v : scores) mean += v / scores.size();
+      const double best = *std::max_element(scores.begin(), scores.end());
+      printf("  val %s (%d tokens, %s): lDDT mean %.4f, best %.4f, top-ranked %.4f (pLDDT %.1f)\n", full.input.c_str(), n,
+             strategy.c_str(), mean, best, scores[top], plddts[top]);
+      sumMean += mean; sumTop += scores[top];
+      a.release(); d.release();
+    }
+    opt.swapEma(ps);
+    printf("validation at step %ld (EMA weights): lDDT mean %.4f, top-ranked %.4f over %zu entries\n", atStep,
+           sumMean / std::max<size_t>(1, valExamples.size()), sumTop / std::max<size_t>(1, valExamples.size()), valExamples.size());
+  };
+
   // the smoke test's measurement: the first example whole, every draw seeded, the noise levels on a ladder
   const double lddtFloor = [] { double f = 0; for (double c : {0.5, 1.0, 2.0, 4.0}) f += (1 - 1 / (1 + exp(-c))) / 4; return f; }();
   auto measure = [&](const char* tag) {
@@ -1218,8 +1306,10 @@ int main(int argc, char** argv) {
            L.distogram, L.plddt + L.pde + L.pae + L.resolved, confOn ? "" : " off", norm,
            stepped ? (std::string("  lr ") + std::to_string(opt.lastLr).substr(0, 8)).c_str() : "", ms);
     if (!savePath.empty() && saveEvery > 0 && stepped && opt.step % saveEvery == 0) { opt.save(ps, savePath); printf("saved %s (step %ld)\n", savePath.c_str(), opt.step); }
+    if (!valExamples.empty() && valEvery > 0 && stepped && opt.step % valEvery == 0) validate(opt.step);
   }
   if (!savePath.empty()) { opt.save(ps, savePath); printf("saved %s (step %ld)\n", savePath.c_str(), opt.step); }
+  if (!valExamples.empty() && (valEvery == 0 || opt.step % valEvery != 0)) validate(opt.step);
   if (smoke) {
     const double after = measure("after  ");
     printf("above the floor: %.4f -> %.4f\n", before, after);
