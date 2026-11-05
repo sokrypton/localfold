@@ -31,7 +31,21 @@
  * arm is `probe-webgl-gemm-ceiling.js`'s kernel at this tile, and the feedback
  * arm is the same k loop in a vertex shader with `RASTERIZER_DISCARD` on.
  *
- * 🔴 ITS OPERANDS ARE TINY AND SHARED BY EVERY INVOCATION, as that probe's are.
+ * 🔴 MEASURED: 1.06-1.13x AT A 64 KiB WORKING SET AND A LOSS EVERYWHERE ELSE.
+ * Five runs at `--window=4096` read 1.13, 1.06, 1.07, 1.07 and 1.10 - feedback
+ * 543-560 GFLOP/s at 14.6 G fetch4/s against the fragment path's 494-507 at
+ * 23.1, each arm's own spread 1.04-1.16. With shared operands it is **0.54x**
+ * (1074 against 1986, because the fragment stage reaches 93.1 G fetch4/s there
+ * and the vertex stage 28.0), and at 256 KiB **0.41x** (197 against 482). The
+ * intensity gain is real; the vertex stage's issue rate is where it goes, 1.6x
+ * lower at 64 KiB and 4.4x at 256. The band where it wins is the one that
+ * matters - the shipped projection's working set is about 75 KiB - so the
+ * output budget IS the binding constraint, raising it is possible, and raising
+ * it buys about a tenth before the buffer-to-texture copy every kernel would
+ * owe, since nothing in WebGL2 samples a buffer.
+ *
+ * 🔴 ITS SHARED-OPERAND ARM IS TINY AND READ BY EVERY INVOCATION, as that
+ * probe's is.
  * This measures the ISSUE CEILING, not a real kernel: a real GEMM's operands do
  * not fit in cache and webgl/README.md records the three points of that curve
  * (about 88 G fetch4/s shared, 34 through 4 KiB, 25.7 through 64 KiB). What

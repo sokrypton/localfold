@@ -2414,7 +2414,7 @@ not an impossibility proof: it bounds the dominant family on this device at this
 rules out is closing a 5x gap by making these kernels better, because there is 1.26x in them.
 
 🔴 **AND THE OUTPUT BUDGET ITSELF IS NOT 32 FLOATS EVERYWHERE IN WebGL2 - TRANSFORM FEEDBACK CARRIES
-128, WHICH WAS BUILT AND IS WORTH 1.13x AT THE WORKING SET THAT MATTERS.** Every mechanism this
+128, WHICH WAS BUILT AND IS WORTH 1.06-1.13x AT THE WORKING SET THAT MATTERS.** Every mechanism this
 campaign measured moves a kernel WITHIN the fragment path's ceiling, so the question left over is
 whether WebGL2 has a different ceiling anywhere. `probe-webgl-limits.js` says it does:
 `MAX_TRANSFORM_FEEDBACK_INTERLEAVED_COMPONENTS` is **128** on this device against
@@ -2429,17 +2429,19 @@ sweeps the working set because that is what decided every other question here:
 | working set | transform feedback | fragment | ratio |
 |---|---|---|---:|
 | shared, a few KiB | 1074 GF/s at **28.0** G fetch4/s | 1986 at **93.1** | **0.54x** |
-| **64 KiB** | **560 GF/s at 14.6** | 494 at 23.1 | **1.13x** |
+| **64 KiB** | **543-560 GF/s at 14.6** | 494-507 at 23.1 | **1.06-1.13x** |
 | 256 KiB | 197 GF/s at 5.1 | 482 at 22.6 | **0.41x** |
 
 **The intensity gain is real and the issue rate is where it goes.** The vertex stage reads 1.6x more
 slowly than the fragment stage at 64 KiB and **4.4x** more slowly at 256, so the 1.8x of intensity
 only nets out ahead in one band - and that band happens to be the projection's own working set of
-about 75 KiB, where feedback reaches **560 GFLOP/s against the fragment path's 494**. The fragment
-arm's 494 is the check on this whole section: the shipped projection measures **476** at that
-locality.
+about 75 KiB, where feedback reaches **543-560 GFLOP/s against the fragment path's 494-507**. Five
+runs read **1.13, 1.06, 1.07, 1.07 and 1.10**, so the figure is 1.06-1.13 and not the 1.13 the first
+run alone would have published - the third time in this session a single run nearly became a number.
+The fragment arm is the check on this whole section: the shipped projection measures **476** at that
+locality against this arm's 494-507.
 
-So the answer to "is there a different ceiling in WebGL2" is **yes, and it is 1.13x**, before paying
+So the answer to "is there a different ceiling in WebGL2" is **yes, and it is 1.06-1.13x**, before paying
 for the thing that makes it unusable: transform feedback writes a BUFFER, nothing in WebGL2 samples a
 buffer, and every kernel here feeds the next one through a texture - so each dispatch would owe a
 buffer-to-texture copy of its whole output, which at 1.13x of the matmul is not a trade. **The output
