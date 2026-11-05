@@ -1747,6 +1747,20 @@ all. **Removing the reason a thing was declined is not evidence that it now pays
 happens to be right for a second reason nobody had written down: a tile cannot hold a large x
 whatever the repack does.
 
+🔴 **AND THE REDUNDANT `padStride` CALLS ARE 29.8% OF THEM, SIZED AND DECLINED.** That pass is 9.4%
+of a fold's labelled GPU time across **9502 calls** now, roughly one per projection, so an instrument
+counted how many repeat the same `(tensor, rows, inChannels)`: **2832 of 9502 are repeats** - 2000
+pairs called twice and 416 three times - which is several projections reading one x, as q, k and v do.
+Memoising them would be **about 2.8% of GPU time, call it 1.03x**.
+
+Not taken, and the reason is the hazard rather than the size. The census keys on a tensor OBJECT and
+`Storage` POOLS textures, so a recycled object is a different tensor later and a memo keyed that way
+would serve the previous tensor's bytes - the exact failure `--pool` exists to detect, bought for 3%.
+The safe form is an API change: let a caller pad once and hand the result to several projections,
+which is explicit and cannot go stale. That is a change across several model files for 1.03x, so it
+is written down with its number instead of built. **The better fix is upstream of it anyway** - three
+projections of one x should be one projection of a concatenated weight, which saves the draws too.
+
 **This session's four projection changes, end to end:**
 
 | | before | after | |
