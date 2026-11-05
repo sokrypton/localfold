@@ -324,7 +324,80 @@ void main() {
  * out-major, which is why this is its own kernel rather than a LayerNorm and a
  * `linear`.
  */
-export const pairBiasSource = (rows, channels, heads) => `${PRELUDE}${ONE_TARGET}
+export const pairBiasSource = (rows, channels, heads, perHead = false) => {
+  // 🔴 THE STATISTICS WERE COMPUTED ONCE A HEAD AND THE ROW IS SHARED BY FOUR,
+  // so this kernel issued SEVEN TIMES the texelFetch it needs. `at` normalises
+  // the pair row before projecting it, and the mean and the spread depend on
+  // the ROW only - yet it was called once per output element, four times a
+  // fragment, each time sweeping the channel axis twice over again. And with
+  // `heads` a multiple of four all four of a fragment's elements are the same
+  // row (`base` is a multiple of four and `head` is `base % HEADS`), so the row
+  // is normalised ONCE here and projected onto the fragment's four heads.
+  //
+  // The projection loop also read every operand through `fetch1`, which is a
+  // whole texelFetch and a component select: 256 channels times three operands
+  // times four heads. Read as `fetch4` along the channel axis that is 6 fetches
+  // a four-channel step instead of 12 - and the pair row and the scale are
+  // fetched once for all four heads rather than once each.
+  //
+  //   per fragment, at 256 channels and 16 heads:
+  //     4 * (64 + 64 + 768) = 3584  ->  64 + 64 + 384 = 512
+  //
+  // 🔴 AND IT IS BIT-IDENTICAL ON PURPOSE, WHICH TOOK TWO TRIES. The products
+  // accumulate in ASCENDING CHANNEL ORDER, one scalar at a time inside each
+  // four, exactly as the loop over `c` did - not as a `dot`, which would
+  // associate four at a time. The normalisation is scalar per component for the
+  // same reason: as a vec4 chain the compiler contracts it differently and a
+  // 4-step fold's CA-CA moved in the fourth digit. The variance stays the
+  // two-pass form the reference uses and is NOT replaced by the fast one.
+  //
+  // `--no-pair-bias-fast` is the control arm.
+  const fast = !perHead && heads % 4 === 0 && channels % 4 === 0;
+  const head = (h) => `    vec4 p${h} = fetch4(projectTex, (head0 + ${h}) * C4 + i);
+    s${h} += n0 * p${h}.x; s${h} += n1 * p${h}.y;
+    s${h} += n2 * p${h}.z; s${h} += n3 * p${h}.w;`;
+  const body = fast
+    ? `  int row = base / HEADS;
+  int head0 = base - row * HEADS;
+  float total = 0.0;
+  for (int i = 0; i < C4; ++i) {
+    vec4 v = fetch4(pairTex, row * C4 + i);
+    total += v.x + v.y + v.z + v.w;
+  }
+  float mean = total / float(CHANNELS);
+  float spread = 0.0;
+  for (int i = 0; i < C4; ++i) {
+    vec4 centred = fetch4(pairTex, row * C4 + i) - mean;
+    spread += dot(centred, centred);
+  }
+  float inverse = inversesqrt(spread / float(CHANNELS) + epsilon);
+  float s0 = 0.0, s1 = 0.0, s2 = 0.0, s3 = 0.0;
+  for (int i = 0; i < C4; ++i) {
+    // 🔴 SCALAR, NOT A vec4 MULTIPLY. Written as one vec4 chain - subtract the
+    // mean, scale by the inverse, multiply by the scale texel - this kernel
+    // stopped being bit-identical, because the compiler contracts a vec4 chain
+    // differently from the scalar one the loop over c wrote, and a 4-step
+    // fold's CA-CA moved from 1327.714 to 1324.144. Per component it is the
+    // same expression as before. (No backticks in here: it is inside a JS
+    // template literal and one would end it. It has happened six times.)
+    vec4 v = fetch4(pairTex, row * C4 + i);
+    vec4 sc = fetch4(scaleTex, i);
+    float n0 = (v.x - mean) * inverse * sc.x;
+    float n1 = (v.y - mean) * inverse * sc.y;
+    float n2 = (v.z - mean) * inverse * sc.z;
+    float n3 = (v.w - mean) * inverse * sc.w;
+${[0, 1, 2, 3].map(head).join("\n")}
+  }
+  result = vec4(s0,
+    base + 1 < ELEMENTS ? s1 : 0.0,
+    base + 2 < ELEMENTS ? s2 : 0.0,
+    base + 3 < ELEMENTS ? s3 : 0.0);`
+    : `  result = vec4(
+    at(base),
+    base + 1 < ELEMENTS ? at(base + 1) : 0.0,
+    base + 2 < ELEMENTS ? at(base + 2) : 0.0,
+    base + 3 < ELEMENTS ? at(base + 3) : 0.0);`;
+  return `${PRELUDE}${ONE_TARGET}
 const int CHANNELS = ${channels};
 const int C4 = ${channels / 4};
 const int HEADS = ${heads};
@@ -333,7 +406,7 @@ uniform sampler2D pairTex;
 uniform sampler2D scaleTex;
 uniform sampler2D projectTex;
 uniform float epsilon;
-
+${fast ? "" : `
 float at(int element) {
   int row = element / HEADS;
   int head = element - row * HEADS;
@@ -357,16 +430,13 @@ float at(int element) {
   }
   return sum;
 }
-
+`}
 void main() {
   int base = linearTexel() * 4;
   if (base >= ELEMENTS) { result = vec4(0.0); return; }
-  result = vec4(
-    at(base),
-    base + 1 < ELEMENTS ? at(base + 1) : 0.0,
-    base + 2 < ELEMENTS ? at(base + 2) : 0.0,
-    base + 3 < ELEMENTS ? at(base + 3) : 0.0);
+${body}
 }`;
+};
 
 /**
  * Full attention over tokens, biased per (i, j, head) and masked by the pad.
@@ -711,7 +781,7 @@ void main() {
 export function pairBias(execution, { pair, rows, channels, heads, weights: w, epsilon = 1e-5 }) {
   const out = execution.allocate(rows * heads, "bioemu2.pair-bias");
   execution.dispatch({
-    source: pairBiasSource(rows, channels, heads),
+    source: pairBiasSource(rows, channels, heads, execution.noPairBiasFast),
     output: out,
     inputs: { pairTex: pair, scaleTex: w.normZ, projectTex: w.projZ },
     floats: { epsilon },

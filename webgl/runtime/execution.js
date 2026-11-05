@@ -197,6 +197,12 @@ export class Execution {
      */
     this.noContractCeiling = options.noContractCeiling ?? false;
     /**
+     * The control arm for bioemu2's pair bias normalising a row ONCE
+     * (`webgl/bioemu2/denoiser.js`): the statistics recomputed per head, at
+     * 3584 texelFetch a fragment rather than 512. Bit-identical.
+     */
+    this.noPairBiasFast = options.noPairBiasFast ?? false;
+    /**
      * Where the HOST time inside `dispatch` goes, when asked for.
      *
      * 🔴 BECAUSE THE GPU IS 3% OF AN AF2 WebGL FOLD AND NOTHING SAID SO.

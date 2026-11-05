@@ -104,10 +104,19 @@ export async function main(device, args) {
     const answers = {};
     /** @type {Record<string, number>} */
     const timings = {};
-    for (const arm of ["one-pair", "channel-fastest", "blocked"]) {
+    // 🔴 `aliased` IS A DIAGNOSTIC AND NOT A KERNEL: it hands the blocked
+    // contraction the SAME texture as both operands, which computes the wrong
+    // answer and is never compared for one. It exists to ask whether the two
+    // 4.7 MiB operands are CONFLICTING in the texture cache - the one structural
+    // difference left from the projection, whose second operand is a small
+    // resident weight. If aliasing is much faster, the misses are conflicts; if
+    // it is the same, they are not, and that hypothesis dies with the other
+    // five in webgl/README.md.
+    for (const arm of ["one-pair", "channel-fastest", "blocked", "aliased"]) {
       const blocked = arm !== "one-pair";
       const call = {
-        a, b, length, channels, blocked, channelSlowest: arm === "blocked",
+        a, b: arm === "aliased" ? a : b, length, channels, blocked,
+        channelSlowest: arm !== "channel-fastest",
       };
       const ring = Array.from({ length: iterations },
         () => execution.allocate(pairs * channels, "bench.out"));
@@ -137,6 +146,8 @@ export async function main(device, args) {
       onePairMs: Number(timings["one-pair"].toFixed(2)),
       blockedMs: Number(timings.blocked.toFixed(2)),
       channelFastestMs: Number(timings["channel-fastest"].toFixed(2)),
+      aliasedMs: Number(timings.aliased.toFixed(2)),
+      aliasedSpeedup: Number((timings.blocked / timings.aliased).toFixed(2)),
       channelFastestGflops:
         Number((flops / timings["channel-fastest"] / 1e6).toFixed(1)),
       orderSpeedup:

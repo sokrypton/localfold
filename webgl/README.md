@@ -1146,15 +1146,60 @@ every bench point - and at one trunk block the two arms were 11149 and 11768. Re
 a one-block fold cannot be slower than a four-block one. Nothing was changed to fix it, because
 there was nothing wrong.
 
+### A row normalised once a head, where four heads share the row
+
+🔴 **bioemu2's PAIR BIAS ISSUED SEVEN TIMES THE `texelFetch` IT NEEDED, AND IT WAS 4.4% OF A FOLD.**
+`pairBias` normalises a pair row and projects it onto each attention head, and its `at(element)`
+recomputed the LayerNorm mean AND spread - two full sweeps of the channel axis - **once per output
+element**, four times a fragment. The statistics depend on the ROW only; and with `heads` a multiple
+of four all four of a fragment's elements ARE one row, because `base` is a multiple of four and the
+head is `base % HEADS`. Its projection loop also read all three operands through `fetch1`, which is
+a whole `texelFetch` plus a component select, 256 channels times three operands times four heads.
+
+```
+per fragment, at 256 channels and 16 heads:
+  4 * (64 + 64 + 768) = 3584 texelFetch   ->   64 + 64 + 384 = 512
+```
+
+Measured on the 6MRR-68 fold, with `--no-pair-bias-fast` as the control arm:
+
+| | sample stage, per step | the 20-step fold |
+|---|---:|---:|
+| a row normalised per head | 1167 - 1176 ms | 42315 ms |
+| **once per fragment** | **1052 - 1064 ms** | **40101 ms** |
+| | **1.11x** | **1.055x** |
+
+Every reported quantity holds - rmsd 1.595, 201 contacts, bond rms 0.042 / 0.056 / 0.028, peak 412
+MiB - and CA-CA moves in the SEVENTH figure (3.8540761 against 3.8540776), which is the reordering
+and not the fix.
+
+🔴 **AND "BIT-IDENTICAL" WAS CLAIMED TWICE AND WAS WRONG BOTH TIMES.** The products accumulate in
+ascending channel order, one scalar at a time, exactly as the loop over `c` did - deliberately not a
+`dot`, which would associate four at a time. That was not enough: written as one `vec4` chain the
+normalisation contracts differently, so it was rewritten scalar per component - and it STILL differs,
+because the compiler vectorises the scalar adds back at this channel width. The evidence that it is a
+reordering rather than a defect is that `check-webgl-bioemu2-denoiser.js` reports **identical
+residuals to every digit in both arms** (1.854e-07, 8.898e-08, 7.506e-10 against the f64 reference).
+Claim a reordering and prove it with the gate; do not claim bit-identity without reading the digits.
+
+🔴 **AND THE FIRST MEASUREMENT OF IT SAID ZERO, BECAUSE THE CONTROL ARM WAS NOT RUN.** A loop over
+two arms built the flag into the printing and not into the command, so both "arms" were the fast one
+and the full fold read 40058 against 40105 - a convincing null. The tell was that it contradicted a
+reproducible 1.11x at a cheaper configuration; the two configurations differed in two variables at
+once, and isolating them (48 blocks at 4 steps, 4 blocks at 20) put the per-step cost at 1052-1064
+against 1167-1176 in every cell. **A null that disagrees with a reproducible positive is a bug in the
+harness until proven otherwise**, and `--host` ruled out the obvious alternative first: the whole
+fold compiles for 186 ms, so no shader-compilation story could have explained 467.
+
 ### How close can this get, and why not closer
 
-The campaign above took a bioemu2 fold from **968 s to 42.4 s** and its device peak from 1656 MiB
-to 412. The gap to the WGSL fold of the same weights is **10.9x** - it was 246x - and it decomposes:
+The campaign above took a bioemu2 fold from **968 s to 40.1 s** and its device peak from 1656 MiB
+to 412. The gap to the WGSL fold of the same weights is **10.3x** - it was 246x - and it decomposes:
 
 | | WebGL2 | WGSL | |
 |---|---:|---:|---:|
-| trunk, 4 passes x 52 blocks | 18.1 s | 2.3 s | 7.9x |
-| 20 denoiser calls | 23.4 s | 1.2 s | 19.5x |
+| trunk, 4 passes x 52 blocks | 18.2 s | 2.3 s | 7.9x |
+| 20 denoiser calls | 21.0 s | 1.2 s | 17.5x |
 | peak memory | **412 MiB** | 950 MiB | **0.43x** |
 
 🔴 **AND THERE IS AN ARITHMETIC FLOOR UNDER THAT NUMBER, WHICH IS WORTH STATING BEFORE THE NEXT
@@ -1172,6 +1217,18 @@ compute shader is past it by staging a tile in workgroup memory, where a whole w
 load and no invocation's output count constrains anything; and it has f16 ARITHMETIC, where WebGL2's
 RGBA16F is storage only. Neither has a WebGL2 equivalent, which is why the remaining distance is a
 property of the API rather than of this port.
+
+🔴 **AND THE f16 HALF OF THAT IS MEASURED NOW RATHER THAN ASSERTED.** GLSL ES 300 has no f16 type
+but it has PRECISION QUALIFIERS, and a translator over Metal could map `mediump float` to `half` -
+real 16-bit arithmetic at half the register pressure, which is exactly the lever the WGSL side has.
+Nothing here had ever asked, because `PRELUDE` pins `highp` on float, int and sampler, so every
+kernel in this backend is f32 whatever its storage. `tools/gpu/probe-webgl-precision.js` runs the
+shipped eight-row projection geometry both ways and the answer is **the qualifier is PROMOTED**:
+`relRms` is **exactly 0** over 4624x256->512, so the two arms are one kernel. **Read the relRms and
+not the time** - the ratio came out 1.072, 1.068 and 0.992 over three runs, which is ordering noise
+on two identical kernels, and reading that 1.07 as a win is the trap the probe's own header warns
+about. So half arithmetic is not reachable from GLSL ES here, and the floor's first leg is a
+measurement.
 
 🔴 **AND THE FIRST EXPLANATION WRITTEN HERE WAS WRONG, FROM EXACTLY THE MISTAKE THIS FILE WARNS
 ABOUT EVERYWHERE ELSE.** It said the gap was the subgroup MATRIX units, on the evidence that

@@ -66,6 +66,10 @@
  *   --no-contract-block   AF3's contraction one pair a fragment, which reads
  *                         both operands' rows for every pair rather than
  *                         sharing them across a block of two i and four j.
+ *   --no-pair-bias-fast   bioemu2's pair bias recomputing its LayerNorm
+ *                         statistics once per HEAD, and reading every operand
+ *                         through fetch1 - 3584 texelFetch a fragment against
+ *                         512. Bit-identical.
  *   --no-contract-ceiling The contraction pair-blocked at EVERY pair tensor
  *                         size, with no ceiling - which is up to 4.8x the wrong
  *                         kernel above 1.5M floats. Bit-identical.
@@ -123,6 +127,7 @@ export function webglExecutionOptions(args) {
     noStridePad: flag(args, "no-stride-pad"),
     noContractChannelSlowest: flag(args, "no-contract-channel-slowest"),
     noContractCeiling: flag(args, "no-contract-ceiling"),
+    noPairBiasFast: flag(args, "no-pair-bias-fast"),
     poolLabelPattern: pattern("pool-labels"),
     profile: flag(args, "profile") ? new Map() : null,
   };
