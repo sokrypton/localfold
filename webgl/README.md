@@ -1148,14 +1148,30 @@ there was nothing wrong.
 
 ### How close can this get, and why not closer
 
-The campaign above took a bioemu2 fold from **968 s to 57.6 s** and its device peak from 1656 MiB
-to 409. The gap to the WGSL fold of the same weights is **15x** - it was 246x - and it decomposes:
+The campaign above took a bioemu2 fold from **968 s to 42.4 s** and its device peak from 1656 MiB
+to 412. The gap to the WGSL fold of the same weights is **10.9x** - it was 246x - and it decomposes:
 
 | | WebGL2 | WGSL | |
 |---|---:|---:|---:|
-| trunk, 4 passes x 52 blocks | 21.8 s | 2.3 s | 9.5x |
-| 20 denoiser calls | 23.3 s | 1.2 s | 19x |
-| peak memory | **409 MiB** | 950 MiB | **0.43x** |
+| trunk, 4 passes x 52 blocks | 18.1 s | 2.3 s | 7.9x |
+| 20 denoiser calls | 23.4 s | 1.2 s | 19.5x |
+| peak memory | **412 MiB** | 950 MiB | **0.43x** |
+
+🔴 **AND THERE IS AN ARITHMETIC FLOOR UNDER THAT NUMBER, WHICH IS WORTH STATING BEFORE THE NEXT
+OPTIMISATION RATHER THAN AFTER.** An invocation writes at most `MAX_DRAW_BUFFERS * 4` = **32 output
+floats**. Produce those 32 from a k loop as a register tile of R by C, and a k step costs `R + C`
+`fetch4` for `32 * 4 * 2` = 256 flops - so the intensity is `256 / (R + C)`, and with `R * C = 32`
+the smallest `R + C` is **12** at 4 by 8 or 8 by 4. **21.33 flops a fetch is therefore the ceiling
+for ANY kernel in this backend**, not a property of these kernels.
+
+The two dense projections reach exactly it, and they run at **145 and 189 GFLOP/s** - and they are
+**57% of the fold** (30.4% and 26.8% of its corrected profile). So if every other kernel in the fold
+became free, the fold would still be about **24 s against the WGSL fold's 3.9** - a **6x floor**
+that no further kernel work removes, because it is the output budget and not the arithmetic. A
+compute shader is past it by staging a tile in workgroup memory, where a whole workgroup reuses one
+load and no invocation's output count constrains anything; and it has f16 ARITHMETIC, where WebGL2's
+RGBA16F is storage only. Neither has a WebGL2 equivalent, which is why the remaining distance is a
+property of the API rather than of this port.
 
 🔴 **AND THE FIRST EXPLANATION WRITTEN HERE WAS WRONG, FROM EXACTLY THE MISTAKE THIS FILE WARNS
 ABOUT EVERYWHERE ELSE.** It said the gap was the subgroup MATRIX units, on the evidence that
@@ -1196,6 +1212,34 @@ in the tree now rather than a note:
 | texture layout | `probe-webgl-2d-weight.js`, one matrix row per texture row | **1.01x** |
 | too few fragments | the same probe's split-K, 2/4/8 | **1.01x** at 8x the fragments |
 | output budget | `bench-webgl-tf-linear.js`, transform feedback | **1.00x** at 32 floats, 0.54x at 112 |
+
+🔴 **AND SIX MORE CAME BACK NULL IN THE CONTRACTION, THE ONE KERNEL THAT IS NOT AT THE CEILING.** It
+runs at **7.6 GFLOP/s** in a fold - 16.4% of it - and about 1 G fetches a second against the
+projections' 6.8, on only 2x less arithmetic a fetch. The six, each with a measurement rather than
+an argument:
+
+| hypothesis | arm | result |
+|---|---|---|
+| fragment order | `--no-contract-channel-slowest` | **1.49x** - taken |
+| the pair block's size | `--no-contract-ceiling` | **up to 4.8x** at the wrong size - taken |
+| row alignment | a padded row stride, and lengths already aligned | **0.98x**, and L=64 is the SLOWEST |
+| too few fragments | the channel sweep, 64 to 512 | GFLOP/s **FALLS** as fragments rise |
+| fetches in flight | the four channel blocks fused into one k loop | **0.80x** - registers cost more |
+| the operands pass's fetches | twenty `texelFetch` an output texel cut to nine | **1.00x** - not fetch-bound |
+
+The alignment arm is the one to copy: it needed no padding code at all, because a length whose row is
+ALREADY a power of two tests the same thing. **L=64 is 16 texels and runs at 8.9 GFLOP/s, the slowest
+of the sweep, where L=68 at 17 texels runs at 12.1** - so the aligned lengths are the slow ones, and
+that is independently why padding the contraction's stride lost.
+
+🔴 **AND ITS 10.7 FLOPS A FETCH IS FORCED BY THE OUTPUT LAYOUT, WHICH CLOSES THE RETILING QUESTION.**
+Its 32 floats must be four CHANNELS of eight pairs, because every consumer - the repack and the
+centre norm - reads a pair's channels contiguously. Four channels of 2 by 4 pairs costs `4 * (2 + 4)`
+= 24 fetches a k step where the projection's 8 by 4 costs 12, and 2 by 4 is already the best split of
+eight pairs. Reaching 21.3 means one channel's 4 by 8 pairs with the output `vec4` over j - and then
+the repack and the centre norm each read four texels an output instead of one, which is 1804 ms of
+consumer going to about 7200 against 4400 saved. **So the retiling is a net loss before it is
+written**, and the contraction's intensity is as high as this output layout permits.
 
 🔴 **AND THE ONE THING THAT DOES MOVE IT IS THE SHAPE, WHICH IS NOT A LEVER.** The same kernel is
 **24 GFLOP/s at 576 x 896 -> 1792 and 254 at 2048 x 2048 x 2048** - a tenfold difference in fetch
