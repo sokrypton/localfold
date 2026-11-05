@@ -153,7 +153,21 @@ void main() {
  * - the same buffer shape, which is why the projection after it reads it
  * directly.
  */
-export const attentionSource = (rows, heads, headDim) => `${PRELUDE}${ONE_TARGET}
+/**
+ * The head's dot product, four channels at a time where the head dimension
+ * allows it.
+ *
+ * 🔴 `fetch1` IS A WHOLE `texelFetch` PLUS A COMPONENT SELECT, AND THIS LOOP IS
+ * RUN TWICE - once for the softmax's maximum and once for the weight. At a head
+ * dimension of 64 that is 128 scalar fetches a key where 32 `fetch4` carry the
+ * same numbers. Both bases are a row offset plus `head * HEAD_DIM`, so when four
+ * divides the head dimension and the row stride the division is exact. The
+ * products still accumulate in ascending `d` order, one scalar at a time,
+ * rather than as a `dot`. `--no-attend-dot4` is the control arm.
+ */
+export const attentionSource = (rows, heads, headDim, lanewise = false) => {
+  const wide = !lanewise && headDim % 4 === 0;
+  return `${PRELUDE}${ONE_TARGET}
 const int ROWS = ${rows};
 const int HEADS = ${heads};
 const int HEAD_DIM = ${headDim};
@@ -176,9 +190,16 @@ void main() {
   for (int j = 0; j < ROWS; ++j) {
     int kBase = (j * HEADS + head) * HEAD_DIM;
     float dot = 0.0;
-    for (int d = 0; d < HEAD_DIM; ++d) {
+${wide
+    ? `    for (int d4 = 0; d4 < HEAD_DIM / 4; ++d4) {
+      vec4 q4 = fetch4(qTex, qBase / 4 + d4);
+      vec4 k4 = fetch4(kTex, kBase / 4 + d4);
+      dot += q4.x * k4.x; dot += q4.y * k4.y;
+      dot += q4.z * k4.z; dot += q4.w * k4.w;
+    }`
+    : `    for (int d = 0; d < HEAD_DIM; ++d) {
       dot += fetch1(qTex, qBase + d) * fetch1(kTex, kBase + d);
-    }
+    }`}
     largest = max(largest, dot * SCALE);
   }
   float total = 0.0;
@@ -186,9 +207,16 @@ void main() {
   for (int j = 0; j < ROWS; ++j) {
     int kBase = (j * HEADS + head) * HEAD_DIM;
     float dot = 0.0;
-    for (int d = 0; d < HEAD_DIM; ++d) {
+${wide
+    ? `    for (int d4 = 0; d4 < HEAD_DIM / 4; ++d4) {
+      vec4 q4 = fetch4(qTex, qBase / 4 + d4);
+      vec4 k4 = fetch4(kTex, kBase / 4 + d4);
+      dot += q4.x * k4.x; dot += q4.y * k4.y;
+      dot += q4.z * k4.z; dot += q4.w * k4.w;
+    }`
+    : `    for (int d = 0; d < HEAD_DIM; ++d) {
       dot += fetch1(qTex, qBase + d) * fetch1(kTex, kBase + d);
-    }
+    }`}
     float weight = exp(dot * SCALE - largest);
     total += weight;
     // Both terms are multiples of four - kBase steps by HEAD_DIM and the
@@ -197,6 +225,8 @@ void main() {
   }
   result = gathered / total;
 }`;
+};
+
 
 /** `out[row][c] = silu(wide[row][c]) * wide[row][ffn + c]`, the BLOCKED split. */
 export const swiGluSource = (rows, ffn) => `${PRELUDE}${ONE_TARGET}
@@ -404,7 +434,7 @@ export function esmcBlock(execution, call) {
 
   const gathered = execution.allocate(rows * model, "esmc.attention");
   execution.dispatch({
-    source: attentionSource(rows, heads, headDim),
+    source: attentionSource(rows, heads, headDim, execution.noAttendDot4),
     output: gathered,
     inputs: { qTex: query, kTex: key, vTex: value },
     label: `esmc.attend:${rows}x${heads}x${headDim}`,

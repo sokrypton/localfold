@@ -211,9 +211,15 @@ export function gather(execution, call) {
  * registers - the same formulation the flash kernel uses, without its
  * multi-target spread, because `keys` here is 128 at most.
  */
-export const atomAttentionSource = (shape, keyMasked) => {
+export const atomAttentionSource = (shape, keyMasked, lanewise = false) => {
   const { subsets, queries, keys, heads, dimension } = shape;
   const width = heads * dimension;
+  // 🔴 `fetch1` IS A WHOLE `texelFetch` PLUS A COMPONENT SELECT. Both bases are
+  // a row offset plus `head * D`, and `D4` below already states that four
+  // divides the dimension, so four channels come in one fetch. The products
+  // still accumulate in ascending `d` order, one scalar at a time, rather than
+  // as a `dot`. `--no-attend-dot4` is the control arm.
+  const wide = !lanewise && dimension % 4 === 0 && width % 4 === 0;
   return `${PRELUDE}${ONE_TARGET}
 const int QUERIES = ${queries};
 const int KEYS = ${keys};
@@ -252,9 +258,16 @@ void main() {
     int keyIndex = subset * KEYS + key;
     int keyBase = keyIndex * WIDTH + head * D;
     float dot = 0.0;
-    for (int d = 0; d < D; ++d) {
+${wide
+    ? `    for (int dd = 0; dd < D4; ++dd) {
+      vec4 q4 = fetch4(qTex, queryBase / 4 + dd);
+      vec4 k4 = fetch4(kTex, keyBase / 4 + dd);
+      dot += q4.x * k4.x; dot += q4.y * k4.y;
+      dot += q4.z * k4.z; dot += q4.w * k4.w;
+    }`
+    : `    for (int d = 0; d < D; ++d) {
       dot += fetch1(qTex, queryBase + d) * fetch1(kTex, keyBase + d);
-    }
+    }`}
     float keyMask = fetch1(keyMaskTex, keyIndex);
     // The product form penalises a pair only when BOTH are padded; the sum form
     // is an OR. Neither has a default.
@@ -370,7 +383,8 @@ export function crossAttentionBlock(execution, call) {
   const gathered = execution.allocate(queryRows * width, "af3.atom.gathered");
   execution.dispatch({
     source: atomAttentionSource(
-      { subsets, queries, keys, heads, dimension }, call.keyMaskedAtomAttention),
+      { subsets, queries, keys, heads, dimension }, call.keyMaskedAtomAttention,
+      execution.noAttendDot4),
     output: gathered,
     inputs: {
       qTex: query, kTex: key, vTex: value,

@@ -274,7 +274,17 @@ void main() {
  * because it is one scan of `atoms` numbers and a fragment that recomputed it
  * would sweep the mask once per output element.
  */
-export const attentionSource = (atoms, heads, headDim, halfWindow) => `${PRELUDE}${ONE_TARGET}
+/**
+ * `fetch1` IS A WHOLE `texelFetch` PLUS A COMPONENT SELECT, AND THIS DOT IS RUN
+ * TWICE - once for the softmax's maximum and once for the weight. Read four
+ * channels at a time where the head dimension and the row strides allow it, the
+ * products still accumulating in ascending `d` order one scalar at a time.
+ * `--no-attend-dot4` is the control arm.
+ */
+export const attentionSource = (atoms, heads, headDim, halfWindow,
+  lanewise = false) => {
+  const wide = !lanewise && headDim % 4 === 0;
+  return `${PRELUDE}${ONE_TARGET}
 const int ATOMS = ${atoms};
 const int HEADS = ${heads};
 const int HEAD_DIM = ${headDim};
@@ -305,9 +315,16 @@ void main() {
     if (!allowed) continue;
     int kBase = (j * HEADS + head) * HEAD_DIM;
     float total = 0.0;
-    for (int d = 0; d < HEAD_DIM; ++d) {
+${wide
+    ? `    for (int d4 = 0; d4 < HEAD_DIM / 4; ++d4) {
+      vec4 q4 = fetch4(qTex, qBase / 4 + d4);
+      vec4 k4 = fetch4(kTex, kBase / 4 + d4);
+      total += q4.x * k4.x; total += q4.y * k4.y;
+      total += q4.z * k4.z; total += q4.w * k4.w;
+    }`
+    : `    for (int d = 0; d < HEAD_DIM; ++d) {
       total += fetch1(qTex, qBase + d) * fetch1(kTex, kBase + d);
-    }
+    }`}
     largest = max(largest, total * SCALE);
   }
   float sum = 0.0;
@@ -319,15 +336,23 @@ void main() {
     if (!allowed) continue;
     int kBase = (j * HEADS + head) * HEAD_DIM;
     float total = 0.0;
-    for (int d = 0; d < HEAD_DIM; ++d) {
+${wide
+    ? `    for (int d4 = 0; d4 < HEAD_DIM / 4; ++d4) {
+      vec4 q4 = fetch4(qTex, qBase / 4 + d4);
+      vec4 k4 = fetch4(kTex, kBase / 4 + d4);
+      total += q4.x * k4.x; total += q4.y * k4.y;
+      total += q4.z * k4.z; total += q4.w * k4.w;
+    }`
+    : `    for (int d = 0; d < HEAD_DIM; ++d) {
       total += fetch1(qTex, qBase + d) * fetch1(kTex, kBase + d);
-    }
+    }`}
     float weight = exp(total * SCALE - largest);
     sum += weight;
     gathered += weight * fetch4(vTex, (kBase + base % HEAD_DIM) / 4);
   }
   result = gathered / sum;
 }`;
+};
 
 /** `out = context * valid * sigmoid(gate)`, the gate being of the block's INPUT. */
 export const gateSource = (atoms, channels) => `${PRELUDE}${ONE_TARGET}
@@ -554,7 +579,8 @@ export function slidingWindowAttention(execution, call) {
 
   const context = execution.allocate(atoms * channels, "ef2.atom.context");
   execution.dispatch({
-    source: attentionSource(atoms, heads, headDim, halfWindow),
+    source: attentionSource(atoms, heads, headDim, halfWindow,
+      execution.noAttendDot4),
     output: context,
     inputs: {
       qTex: query, kTex: key, vTex: value, validTex: valid, rankTex: rank,

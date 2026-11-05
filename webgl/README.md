@@ -1053,6 +1053,39 @@ sufficient one. A generalisation measured on one model is a regression on anothe
 reason this is a sentence rather than a shipped defect is that the AF2 differential runs on every
 pass.
 
+### `fetch1` is a whole texelFetch, and five attentions walked their head with it
+
+🔴 **A SCALAR WALK ALONG A CONTIGUOUS AXIS COSTS FOUR TIMES WHAT IT NEEDS TO, AND IT WAS IN EVERY
+ATTENTION IN THE TREE.** `fetch1(tex, i)` fetches the texel at `i >> 2` and selects a component, so
+four consecutive scalars are four `texelFetch` of one or two distinct texels. Every attention kernel
+here computed `q . k` with `for (d) dot += fetch1(qTex, qBase + d) * fetch1(kTex, kBase + d)` - and
+computed it **twice**, once for the softmax's maximum and once for the weight. At a head dimension
+of 64 that is 128 scalar fetches a key where 32 `fetch4` carry the same numbers.
+
+Both bases are a row offset plus `head * HEAD_DIM`, and every head dimension in play is a multiple
+of four, so the division is exact. Fixed in five kernels - bioemu2's full and windowed attentions,
+ESM-C's tower, ESMFold2's atom transformer and diffusion, and AF3's atom attention:
+
+| | before | after | |
+|---|---:|---:|---:|
+| bioemu2, the 20-step 6MRR-68 fold | 40.1 s | **37.8 s** | **1.06x** |
+| bioemu2's sample stage, per step | 1062 ms | **957 ms** | **1.11x** |
+| ESMFold2, the full configuration | 16.2 s | **15.2 s** | **1.06x** |
+| AF3 | 2.46 s | 2.47 s | 1.00x |
+
+bioemu2's CA-CA is identical to all sixteen digits and ESMFold2 holds pLDDT 57.405, pTM 0.4132 and
+126 contacts; AF3's atom attention is too small a share of its fold to move it. `--no-attend-dot4`
+is the control arm for all five, and each kernel's own gate reports identical residuals both ways.
+
+🔴 **AND THE SEARCH THAT FOUND THEM IS WORTH MORE THAN THE FIX.** A dozen lines of Python over
+`webgl/` for a `fetch1` whose index is a loop variable plus a base turned up **seventy-odd sites**,
+and ranking them against the profiles picked out the five that matter. Two near-misses in the same
+sweep: `layer-norm` already dispatches to an aligned `fetch4` form when four divides the channels,
+which is every hot case; and `af3.triangle.operands` went from twenty `texelFetch` an output texel
+to nine and measured **exactly nothing**, because that kernel is bound by its writes rather than its
+reads. A pattern that is wrong in seventy places is worth a script; which seventy are worth fixing
+is a question only the profile answers.
+
 ### Four does not divide 75, and that was two thirds of an ESMFold2 fold
 
 🔴 **THE BIGGEST SINGLE FACTOR IN THIS WHOLE CAMPAIGN, AND IT WAS A DIVISIBILITY

@@ -188,7 +188,16 @@ void main() {
  * 🔴 AND THE VALUE IS THE SECOND HALF OF kv, so it starts a whole `channels`
  * further along the row.
  */
-export const attentionSource = (tokens, channels, heads) => `${PRELUDE}${ONE_TARGET}
+/**
+ * `fetch1` IS A WHOLE `texelFetch` PLUS A COMPONENT SELECT, AND THIS DOT IS RUN
+ * TWICE - once for the softmax's maximum and once for the weight. Read four
+ * channels at a time where the head dimension and the row strides allow it, the
+ * products still accumulating in ascending `d` order one scalar at a time.
+ * `--no-attend-dot4` is the control arm.
+ */
+export const attentionSource = (tokens, channels, heads, lanewise = false) => {
+  const wide = !lanewise && (channels / heads) % 4 === 0 && channels % 2 === 0;
+  return `${PRELUDE}${ONE_TARGET}
 const int TOKENS = ${tokens};
 const int CHANNELS = ${channels};
 const int HEADS = ${heads};
@@ -211,9 +220,16 @@ void main() {
   for (int j = 0; j < TOKENS; ++j) {
     int keyBase = j * CHANNELS * 2 + head * HEAD_DIM;
     float total = 0.0;
-    for (int d = 0; d < HEAD_DIM; ++d) {
+${wide
+    ? `    for (int d4 = 0; d4 < HEAD_DIM / 4; ++d4) {
+      vec4 q4 = fetch4(queryTex, queryBase / 4 + d4);
+      vec4 k4 = fetch4(kvTex, keyBase / 4 + d4);
+      total += q4.x * k4.x; total += q4.y * k4.y;
+      total += q4.z * k4.z; total += q4.w * k4.w;
+    }`
+    : `    for (int d = 0; d < HEAD_DIM; ++d) {
       total += fetch1(queryTex, queryBase + d) * fetch1(kvTex, keyBase + d);
-    }
+    }`}
     largest = max(largest, total * SCALE + fetch1(biasTex, (i * TOKENS + j) * HEADS + head));
   }
   float sum = 0.0;
@@ -221,9 +237,16 @@ void main() {
   for (int j = 0; j < TOKENS; ++j) {
     int keyBase = j * CHANNELS * 2 + head * HEAD_DIM;
     float total = 0.0;
-    for (int d = 0; d < HEAD_DIM; ++d) {
+${wide
+    ? `    for (int d4 = 0; d4 < HEAD_DIM / 4; ++d4) {
+      vec4 q4 = fetch4(queryTex, queryBase / 4 + d4);
+      vec4 k4 = fetch4(kvTex, keyBase / 4 + d4);
+      total += q4.x * k4.x; total += q4.y * k4.y;
+      total += q4.z * k4.z; total += q4.w * k4.w;
+    }`
+    : `    for (int d = 0; d < HEAD_DIM; ++d) {
       total += fetch1(queryTex, queryBase + d) * fetch1(kvTex, keyBase + d);
-    }
+    }`}
     float weight = exp(total * SCALE
       + fetch1(biasTex, (i * TOKENS + j) * HEADS + head) - largest);
     sum += weight;
@@ -233,6 +256,7 @@ void main() {
   }
   result = gathered / sum;
 }`;
+};
 
 /** `out = keep * noisy + take * update`, the EDM preconditioning. */
 export const preconditionSource = (elements) => `${PRELUDE}${ONE_TARGET}
@@ -508,7 +532,7 @@ export function attentionPairBias(execution, call) {
 
   const context = execution.allocate(tokens * channels, "ef2.diffusion.context");
   execution.dispatch({
-    source: attentionSource(tokens, channels, heads),
+    source: attentionSource(tokens, channels, heads, execution.noAttendDot4),
     output: context,
     inputs: { queryTex: query, kvTex: kv, biasTex: bias },
     label: `ef2.diffusion.attend:${tokens}x${channels}:${heads}`,
