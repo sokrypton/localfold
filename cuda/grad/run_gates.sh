@@ -36,7 +36,7 @@ build cuda/grad/test-af2tmpl -O1 cuda/grad/test_af2tmpl.cu
 build cuda/grad/test-af2model -O1 cuda/grad/test_af2model.cu
 build cuda/grad/test-af2model-f64 -O2 -DGRAD_F64 cuda/grad/test_af2model.cu
 build cuda/grad/train-af2-smoke -O2 cuda/grad/train_af2_smoke.cu
-build cuda/grad/train-of3 -O2 --default-stream per-thread cuda/grad/train_of3.cu
+build cuda/grad/train-of3 -O2 --default-stream per-thread cuda/grad/train_of3.cu -lnccl
 build cuda/grad/test-of3loss -O2 cuda/grad/test_of3loss.cu
 build cuda/grad/test-af2tmpl-f64 -O2 -DGRAD_F64 cuda/grad/test_af2tmpl.cu
 build cuda/grad/test-plm -O2 cuda/grad/test_plm.cu
@@ -158,6 +158,12 @@ for fb in "model-af3-full-f32 af3" "model-boltz2-f32 boltz2" "model-protenix2-f3
                                  "$HOME/venv/bin/python" tools/make_of3_example.py $b/1brs.cif $b --family=$2 > /dev/null; }
       run cuda/grad/train-of3 --bundle=$1 --family=$2 --examples=$b/example.txt --steps=0 --check-perm=0
     else echo "== the truth's permutation: no ~/venv (gemmi, RDKit) here"; fi
+    # data parallel (of3dist.cuh), two ranks sharing this GPU through the file transport: their weights must stay one set
+    rdv=$(mktemp -d /dev/shm/of3-rdv-XXXX)
+    for r in 0 1; do cuda/grad/train-of3 --bundle=$1 --family=$2 --examples=$ex/example.txt --steps=2 --samples=2 --lr=1e-4 --warmup=1 \
+      --world=2 --rank=$r --dp=files --rendezvous=$rdv > /dev/null 2> $rdv.r$r & done
+    wait; grep -h "checksum" $rdv.r0 $rdv.r1; grep -q "OUT OF SYNC" $rdv.r0 $rdv.r1 && fail=1; grep -q "in sync" $rdv.r0 || fail=1
+    rm -rf $rdv $rdv.r0 $rdv.r1
   fi
 done
 run cuda/grad/test-atom-f64

@@ -16,6 +16,7 @@
 #include <fstream>
 #include <set>
 #include "adam.cuh"
+#include "of3dist.cuh"
 
 namespace grad {
 
@@ -86,7 +87,20 @@ struct Of3Optimizer {
     return lastNorm;
   }
   // the optimiser step over the accumulated examples, then the EMA; the accumulator cleared
-  void apply(Params& ps) {
+  real* flat = nullptr; size_t flatN = 0;
+  void apply(Params& ps, Comm* comm = nullptr) {
+    // (data-parallel: every rank's accumulators and participation counts summed first - the same global average, the
+    // same step, on every rank)
+    if (comm && comm->world > 1) {
+      size_t total = 0; for (auto* p : ps.all) total += p->n;
+      if (!flat) { GK(cudaMalloc(&flat, total * sizeof(real))); flatN = total; }
+      size_t at = 0;
+      for (size_t i = 0; i < ps.all.size(); ++i) { GK(cudaMemcpyAsync(flat + at, acc[i], ps.all[i]->n * sizeof(real), cudaMemcpyDeviceToDevice, STREAM)); at += ps.all[i]->n; }
+      comm->sumReals(flat, flatN);
+      at = 0;
+      for (size_t i = 0; i < ps.all.size(); ++i) { GK(cudaMemcpyAsync(acc[i], flat + at, ps.all[i]->n * sizeof(real), cudaMemcpyDeviceToDevice, STREAM)); at += ps.all[i]->n; }
+      comm->sumInts(participation);
+    }
     lastLr = lr(step);             // (the scheduler's lr for this step, then stepped)
     ++step;
     const real c1 = (real)(1 - std::pow(b1, (double)step)), c2 = (real)(1 - std::pow(b2, (double)step));

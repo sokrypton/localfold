@@ -542,7 +542,9 @@ static of3::Layout layoutOf(const Example& e) {
 int main(int argc, char** argv) {
   std::string bundle = "model-openbind0-f32", family = "openbind0", examplesPath, savePath, resumePath;
   int steps = 30, samples = 48, batch = 1, crop = 384, saveEvery = 0, checkCkpt = -1, checkPerm = -1, checkBf16 = -1; std::string init = "bundle";
-  bool dropout = true, dropInFixed = false, bf16Trunk = false;   // (dropInFixed: --check-ckpt's fixed draws with the masks on)
+  bool dropout = true, dropInFixed = false, bf16Trunk = false;
+  int world = 1, rank = 0; std::string dp = "nccl", rendezvous;      // data parallel (of3dist.cuh)
+  bool sameDraws = false;   // --same-draws: every rank rank 0's examples and draws (the averaging's check: one process's step)   // (dropInFixed: --check-ckpt's fixed draws with the masks on)
   std::string valPath; int valEvery = 0, valSamples = 5, valSteps = 200, valCrop = 1536; unsigned seed = 1; bool smoke = false, ckpt = true;
   double lrMax = 1.8e-3, bondWeight = 0; long warmup = 1000;
   for (int i = 1; i < argc; ++i) {
@@ -565,6 +567,11 @@ int main(int argc, char** argv) {
     else if (!strcmp(argv[i], "--no-ckpt")) ckpt = false;
     else if (!strcmp(argv[i], "--no-dropout")) dropout = false;
     else if (!strcmp(argv[i], "--bf16")) bf16Trunk = true;
+    else if (auto v = opt("--world=")) world = atoi(v);
+    else if (auto v = opt("--rank=")) rank = atoi(v);
+    else if (auto v = opt("--dp=")) dp = v;
+    else if (auto v = opt("--rendezvous=")) rendezvous = v;
+    else if (!strcmp(argv[i], "--same-draws")) sameDraws = true;
     else if (auto v = opt("--check-ckpt=")) checkCkpt = atoi(v);
     else if (auto v = opt("--check-perm=")) checkPerm = atoi(v);
     else if (auto v = opt("--check-bf16=")) checkBf16 = atoi(v);
@@ -585,9 +592,23 @@ int main(int argc, char** argv) {
     while (std::getline(f, l)) if (!l.empty() && l[0] != '#') lines.push_back(l);
     if (lines.empty()) { fprintf(stderr, "%s names no example\n", examplesPath.c_str()); return 1; }
   }
+  // data parallel: a rank's GPU (NCCL: one each), its own draws, rank 0 alone writing the log and the checkpoint
+  if (world > 1) {
+    if (rank < 0 || rank >= world || rendezvous.empty() || (dp != "nccl" && dp != "files")) {
+      fprintf(stderr, "train-of3: --world=%d needs --rank in [0, world), --rendezvous=<dir> and --dp=nccl|files\n", world); return 1;
+    }
+    int devices = 1; GK(cudaGetDeviceCount(&devices));
+    if (dp == "nccl") GK(cudaSetDevice(rank % devices));
+    if (rank > 0) { if (!freopen("/dev/null", "w", stdout)) return 1; }
+  }
   CB(cublasCreate(&H)); CB(cublasSetStream(H, STREAM));
   g::STREAM = STREAM;
   g::init();
+  std::unique_ptr<g::Comm> comm;
+  if (world > 1) {
+    if (dp == "nccl") comm.reset(new g::NcclComm(rank, world, rendezvous));
+    else comm.reset(new g::FileComm(rank, world, rendezvous));
+  }
   M.loadBundle(bundle, "", [&](const std::map<std::string, std::vector<long long>>& shapes) {
     lf::weights::Shapes S; S.shape = shapes; return lf::weights::af3WeightLines(family, S); });
   const lf::FamilyFlags& FF = lf::familyFor(family);
@@ -1012,7 +1033,7 @@ int main(int argc, char** argv) {
   // the Fourier noise embedding is a buffer in OpenFold3: held, never trained
   for (size_t i = 0; i < ps.all.size(); ++i) if (ps.all[i]->name.find("fourier") != std::string::npos) opt.frozen[i] = 1;
   if (!resumePath.empty()) { opt.load(ps, resumePath); printf("resumed %s at step %ld\n", resumePath.c_str(), opt.step); }
-  std::mt19937_64 rng(seed + 7919 * (uint64_t)opt.step);
+  std::mt19937_64 rng(seed + 7919 * (uint64_t)opt.step + 104729ull * (sameDraws ? 0 : rank));   // (each rank its own examples and draws)
   std::normal_distribution<double> N01(0, 1);
   const double sd = 16;
 
@@ -1395,17 +1416,36 @@ int main(int argc, char** argv) {
     const Losses& L = run.first; const bool confOn = run.second;
     const double norm = opt.clipAndAccumulate(ps, [&](size_t i) { return !confOn && i >= confFrom; });
     bool stepped = false;
-    if (++inBatch == batch) { opt.apply(ps); inBatch = 0; stepped = true; }
+    if (++inBatch == batch) { opt.apply(ps, comm.get()); inBatch = 0; stepped = true; }
     cudaEventRecord(e1, STREAM); CK(cudaStreamSynchronize(STREAM));
     float ms; cudaEventElapsedTime(&ms, e0, e1);
     printf("step %4d  loss %.4f (diffusion %.4f, distogram %.4f, confidence %.3f%s)  |grad| %.3e%s  %.0f ms\n", step, L.total, L.diffusion,
            L.distogram, L.plddt + L.pde + L.pae + L.resolved, confOn ? "" : " off", norm,
            stepped ? (std::string("  lr ") + std::to_string(opt.lastLr).substr(0, 8)).c_str() : "", ms);
-    if (!savePath.empty() && saveEvery > 0 && stepped && opt.step % saveEvery == 0) { opt.save(ps, savePath); printf("saved %s (step %ld)\n", savePath.c_str(), opt.step); }
-    if (!valExamples.empty() && valEvery > 0 && stepped && opt.step % valEvery == 0) validate(opt.step);
+    if (rank == 0 && !savePath.empty() && saveEvery > 0 && stepped && opt.step % saveEvery == 0) { opt.save(ps, savePath); printf("saved %s (step %ld)\n", savePath.c_str(), opt.step); }
+    if (rank == 0 && !valExamples.empty() && valEvery > 0 && stepped && opt.step % valEvery == 0) validate(opt.step);
   }
-  if (!savePath.empty()) { opt.save(ps, savePath); printf("saved %s (step %ld)\n", savePath.c_str(), opt.step); }
-  if (!valExamples.empty() && (valEvery == 0 || opt.step % valEvery != 0)) validate(opt.step);
+  if (rank == 0 && !savePath.empty()) { opt.save(ps, savePath); printf("saved %s (step %ld)\n", savePath.c_str(), opt.step); }
+  if (rank == 0 && !valExamples.empty() && (valEvery == 0 || opt.step % valEvery != 0)) validate(opt.step);
+  if (world > 1) {
+    // the ranks' weights must be one set: a checksum of every weight, every rank's, compared through the same exchange
+    double sum = 0, abs = 0;
+    for (auto* p : ps.all) { auto h = g::host(p->w, p->n); for (double v : h) { sum += v; abs += std::fabs(v); } }
+    std::vector<double> mine{sum, abs};
+    g::real* dv; GK(cudaMalloc(&dv, 2 * sizeof(g::real)));
+    std::vector<g::real> hv(mine.begin(), mine.end()), all0(hv);
+    GK(cudaMemcpy(dv, hv.data(), 2 * sizeof(g::real), cudaMemcpyHostToDevice));
+    comm->sumReals(dv, 2);
+    GK(cudaMemcpy(hv.data(), dv, 2 * sizeof(g::real), cudaMemcpyDeviceToHost));
+    const bool same = std::fabs(hv[0] - world * all0[0]) <= 1e-6 * std::fabs(hv[0]) + 1e-6 && std::fabs(hv[1] - world * all0[1]) <= 1e-6 * hv[1];
+    fprintf(stderr, "rank %d: weights checksum %.9e (|w| %.9e), the ranks' mean %.9e  %s\n", rank, all0[0], all0[1], hv[0] / world,
+            same ? "in sync" : "OUT OF SYNC");
+    if (!same) return 1;
+  } else if (sameDraws) {
+    double sum = 0, abs = 0;
+    for (auto* p : ps.all) { auto h = g::host(p->w, p->n); for (double v : h) { sum += v; abs += std::fabs(v); } }
+    fprintf(stderr, "one process: weights checksum %.9e (|w| %.9e)\n", sum, abs);
+  }
   if (smoke) {
     const double after = measure("after  ");
     printf("above the floor: %.4f -> %.4f\n", before, after);
