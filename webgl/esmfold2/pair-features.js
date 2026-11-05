@@ -167,14 +167,15 @@ export function zInit(execution, call) {
   const {
     xInputs, identity, tokens, inputChannels, channels, weights: w,
   } = call;
-  // 🔴 THE TWO PER-TOKEN PROJECTIONS ARE OPTIONAL, BECAUSE THE SHIPPED
-  // CHECKPOINT HAS NEITHER. `esmfold2-fast-600m`'s bundle carries
-  // `featuriser/relPos` and `featuriser/tokenBonds` and no z_init projection at
-  // all, so for that model the pair starts from the relative encoding, the bonds
-  // and the language model's own pair. Absent is not zero to a kernel - a
-  // missing sampler is refused by name - so the draw is skipped, and a bundle
-  // that HAS them gets the term. Allocated zero either way, which
-  // `Storage.allocate` guarantees.
+  // 🔴 THE TWO PER-TOKEN PROJECTIONS ARE OPTIONAL, AND THE SHIPPED CHECKPOINT
+  // HAS THEM. (An earlier version of this comment said it did not, from a
+  // listing that collapsed `featuriser/zInit1` and `zInit2` out of view - they
+  // are both [451, 256] in `model-esmfold2-int5`. A false claim in a comment is
+  // worse than no comment, so: they are there.) They stay optional because
+  // absent is not zero to a kernel - a missing sampler is refused by name - so a
+  // bundle without them skips the draw rather than binding zeros, and the pair
+  // then starts from the relative encoding, the bonds and the language model's
+  // own pair. Allocated zero either way, which `Storage.allocate` guarantees.
   let pair = execution.allocate(tokens * tokens * channels, "ef2.z-init");
   if (w.zInit1 !== undefined && w.zInit2 !== undefined) {
     const rows = linear(execution, {

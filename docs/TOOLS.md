@@ -11,9 +11,9 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-513 tools. `tools/fixtures/` is data and is not listed.
+514 tools. `tools/fixtures/` is data and is not listed.
 
-## `tools/gpu/` - the WebGPU lane (268)
+## `tools/gpu/` - the WebGPU lane (269)
 
 Each exports `async function main(device, args)` and is run as
 `node tools/gpu-chrome.mjs tools/gpu/<module>.js [--flags]`.
@@ -195,6 +195,7 @@ Each exports `async function main(device, args)` and is run as
 - **`fold-bioemu2.js`** - A whole BioEmu2 fold on the GPU: an AlphaFold 3 job in, samples out.
 - **`fold-complex.js`** - Fold a MULTI-CHAIN target and score every chain in ONE frame.
 - **`fold-crosslinks.js`** - Crosslinks folded: the page's path for a `crosslink` row (web/entities.js expandEntities: a built-in bridge ligand bonded to its two residues) end to end on WebGPU, and whether the fold honours it.
+- **`fold-esmfold2-webgl.js`** - Fold ESMFold2 in WebGL2, from the two real weight bundles.
 - **`fold-esmfold2.js`** - A whole ESMFold2 fold on the GPU: a sequence in, a structure out.
 - **`fold-opendde.js`** - OpenDDE, sequence in and a structure out.
 - **`fold.js`** - Fold a protein with AF3 on the GPU, end to end, and write a PDB.

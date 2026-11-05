@@ -114,6 +114,7 @@ webgl/
     diffusion.js                the conditioning, twelve token blocks, and the EDM step
     sampler.js                  the walk, with the pair conditioning cached across it
     confidence.js               pLDDT, PAE, pTM - and the stack added to its own input
+    model/fold.js               the whole ESMFold2 fold, from two checkpoints
   heads/
     distogram.js                P(d < 8 A) for every pair - the contact map the page draws
     confidence.js               pLDDT, PAE and the pTM term
@@ -517,11 +518,19 @@ never reads the single. The confidence gate now drives a single at the trunk's o
 HEAVY TAIL, since a uniform draw at std 200 never reaches 512 and left the arm green with the bug
 restored.
 
-ESMFold2's language model is next and its TOWER is done: 36 ESM-C blocks and the shim, verified on
-the real 600M int3 checkpoint at **1.3e-7 to 4.8e-7** on block 0's four matmul inputs, the block's
-output, the mixed single and the pair representation. The two conventions that are silent - the qk
-LayerNorm over the whole 1152 rather than per head, and RoPE as SPLIT HALVES rather than
-interleaved - are what those four arms are for.
+**AND ESMFold2 FOLDS TOO**: ubiquitin's 75 residues through the whole 36-block ESM-C tower, four
+trunk loops of 24 blocks and eleven denoiser calls is **240 s** here, median CA-CA **3.637 A**, mean
+pLDDT 57.4, pTM 0.413, 126 contacts over 0.5, peak 2978 MiB. At 20 residues it is 4.2 s.
+
+🔴 **AND 92% OF THAT IS THE TRUNK**: 4 x 55 s against the tower's 1.7, the shim's 0.3 and the atom
+transformer's 1.1 (the stage clock is in the fold tool's own report). The pair track's triangle
+contraction is O(L^3) a block and there are 24 of them a loop, so the trunk is the lever for this
+model exactly as the 24-block transformer is for AF3's denoiser.
+
+🔴 **AND THE SAMPLER'S CONSTANTS ARE THE MODEL'S, NOT AF3's.** ESMFold2 wants sMax 160, rho 8,
+gamma_min 1.107, noise scale 0.901 and step scale 1.638; with the AF3-shaped sMax 16 the 256 cap
+drops NOTHING, so "15 scheduled run 11" silently became 16 - the fold tool holds the two backends'
+constants against each other for that reason.
 
 🔴 **AND 61% OF A DENOISER CALL IS THE 24-BLOCK TRANSFORMER**: 425 ms of 695 at 59 tokens
 (`profile-webgl-af3-head.js`), with the atom encoder's stack at 55 and the pair conditioning at 51.

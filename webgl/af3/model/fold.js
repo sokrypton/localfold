@@ -182,6 +182,10 @@ export function uploadAf3Weights(execution, weights) {
       return tensor;
     }
     if (Array.isArray(value)) return value.map((v, i) => uploadTree(v, `${label}.${i}`));
+    // 🔴 A STRING IS NOT A TREE: `Object.entries("abc")` is three
+    // single-character strings, so a generic walk recurses on one for ever and
+    // dies with "Maximum call stack size exceeded", naming nothing. A weight
+    // tree that carries a `source` string is enough to do it.
     if (typeof value !== "object") return value;
     return Object.fromEntries(Object.entries(value)
       .map(([key, v]) => [key, uploadTree(v, `${label}.${key}`)])

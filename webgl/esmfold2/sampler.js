@@ -40,6 +40,22 @@ import { denoiseStep } from "./diffusion.js";
 /** @typedef {import("../runtime/storage.js").Tensor} Tensor */
 
 /**
+ * ESMFold2's OWN EDM constants, which are not AF3's.
+ *
+ * 🔴 EVERY ONE OF THESE DIFFERS FROM THE AF3-SHAPED DEFAULTS A PORT REACHES FOR:
+ * sMax 160 rather than 16, rho 8 rather than 7, gamma_min 1.107 rather than 1,
+ * the noise scale 0.901 rather than 1.003 and the step scale 1.638 rather than
+ * 1.5. Nothing errors on the wrong set - the walk anneals differently and
+ * returns a plausible structure - and with sMax 16 the 256 cap drops NOTHING, so
+ * "15 scheduled run 11" silently becomes 16. Held against
+ * `webgpu/esmfold2/fold.js`'s SAMPLER_DEFAULTS by the fold tool.
+ */
+export const SAMPLER_DEFAULTS = Object.freeze({
+  sigmaData: 16, gamma0: 0.605, gammaMin: 1.107, noiseScale: 0.901,
+  stepScale: 1.638, sMax: 160, sMin: 4e-4, p: 8, steps: 15, maxSigma: 256,
+});
+
+/**
  * @param {import("../runtime/execution.js").Execution} execution
  * @param {{shape: any, weights: any, sInputs: Tensor, zTrunk: Tensor,
  *   relPos: Tensor, hostFourier: {weights: Float32Array, offsets: Float32Array},
@@ -56,14 +72,18 @@ import { denoiseStep } from "./diffusion.js";
 export function sampleOnWebGl2(execution, call) {
   const {
     shape, weights, atomMask, atoms, hostFourier,
-    stepScale = 1.5, update = "euler", schedule = "karras",
-    sMax = 16, sMin = 4e-4, p = 7, maxSigma = 256,
-    gammaMin = 1, gamma0 = 0.605, noiseScale = 1.003,
+    update = "euler", schedule = "karras",
+    stepScale = SAMPLER_DEFAULTS.stepScale,
+    sMax = SAMPLER_DEFAULTS.sMax, sMin = SAMPLER_DEFAULTS.sMin,
+    p = SAMPLER_DEFAULTS.p, maxSigma = SAMPLER_DEFAULTS.maxSigma,
+    gammaMin = SAMPLER_DEFAULTS.gammaMin, gamma0 = SAMPLER_DEFAULTS.gamma0,
+    noiseScale = SAMPLER_DEFAULTS.noiseScale,
   } = call;
-  const sigmaData = shape.sigmaData ?? 16;
+  const sigmaData = shape.sigmaData ?? SAMPLER_DEFAULTS.sigmaData;
   const draw = gaussians(call.seed ?? 42);
   const levels = noiseSchedule({
-    steps: call.steps ?? 15, sMax, sMin, p, sigmaData, maxSigma, schedule,
+    steps: call.steps ?? SAMPLER_DEFAULTS.steps, sMax, sMin, p, sigmaData,
+    maxSigma, schedule,
   });
   const gammas = churnFactors(levels, gammaMin, gamma0);
   const hats = noiseLevels(levels, gammas);
