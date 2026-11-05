@@ -125,6 +125,22 @@ function blockReference(input) {
   const value = project(w.valueWeight, undefined, false);
   const gate = project(w.gatingWeight, w.gatingBias, true);
 
+  // The triangle attentions project their bias off this same normalised tensor
+  // with a [channels][heads] weight, head-major.
+  let bias = input.pairBias;
+  if (input.pairBiasProjection !== undefined) {
+    bias = new Float64Array(heads * queryLength * queryLength);
+    for (let row = 0; row < rows; row += 1) {
+      for (let h = 0; h < heads; h += 1) {
+        let sum = 0;
+        for (let c = 0; c < channels; c += 1) {
+          sum += normalised[row * channels + c] * input.pairBiasProjection[c * heads + h];
+        }
+        bias[h * rows + row] = sum;
+      }
+    }
+  }
+
   const attended = new Float64Array(rows * channels);
   for (let b = 0; b < batch; b += 1) {
     for (let head = 0; head < heads; head += 1) {
@@ -141,8 +157,8 @@ function blockReference(input) {
           // sequences != length.
           const maskIndex = input.transpose ? k * batch + b : b * queryLength + k;
           let logit = score * scale + 1e9 * (mask[maskIndex] - 1);
-          if (input.pairBias !== undefined) {
-            logit += input.pairBias[(head * queryLength + q) * queryLength + k];
+          if (bias !== undefined) {
+            logit += bias[(head * queryLength + q) * queryLength + k];
           }
           logits[k] = Math.min(Math.max(logit, -1e8), 1e8);
         }
@@ -316,6 +332,76 @@ export async function main(device, args) {
       releasePairBiasWeights(execution, pairWeights);
       execution.release(pairTensor);
       execution.release(bias);
+    }
+  }
+
+  // --- TRIANGLE attention: the bias projected off the block's own input ----
+  //
+  // 🔴 THE DIFFERENCE FROM THE MSA ROW ARMS IS WHERE THE BIAS COMES FROM, and it
+  // is the whole reason the WGSL side has two pair-bias paths. Here the bias and
+  // the q/k/v are projections of ONE normalised tensor - the pair - so a second
+  // LayerNorm would compute the same statistics twice. `batch == queryLength`
+  // because the activations are a square pair matrix, which is also the only
+  // shape for which a `[head][query][key]` bias over `queryLength^2` has the
+  // right length; the block refuses the rest.
+  {
+    const length = 7;
+    const channels = 32;
+    const heads = 4;
+    const random = generator(31337);
+    const rowCount = length * length;
+    const pair = noise(rowCount * channels, 1.5, random);
+    const mask = new Float32Array(rowCount).fill(1);
+    mask[3] = 0;
+    mask[rowCount - 2] = 0;
+    const weights = {
+      queryNormScale: noise(channels, 0.2, random, 1),
+      queryNormOffset: noise(channels, 0.1, random),
+      queryWeight: noise(channels * channels, 1 / Math.sqrt(channels), random),
+      keyWeight: noise(channels * channels, 1 / Math.sqrt(channels), random),
+      valueWeight: noise(channels * channels, 1 / Math.sqrt(channels), random),
+      gatingWeight: noise(channels * channels, 1 / Math.sqrt(channels), random),
+      gatingBias: noise(channels, 0.1, random, 1),
+      outputWeight: noise(channels * channels, 1 / Math.sqrt(channels), random),
+      outputBias: noise(channels, 0.05, random),
+    };
+    const projectionWeight = noise(channels * heads, 1 / Math.sqrt(channels), random);
+
+    const uploaded = uploadAttentionBlockWeights(execution, weights);
+    const activations = execution.upload(falsify
+      ? Float32Array.from(pair, (v, i) => (i === (pair.length >> 1) ? v * 1.01 + 0.01 : v))
+      : pair, "pair");
+    const maskTensor = execution.upload(mask, "mask");
+    const projection = execution.upload(projectionWeight, "w.pairProjection");
+    const output = attentionBlock(execution, {
+      activations, mask: maskTensor, weights: uploaded,
+      batch: length, queryLength: length, channels, heads,
+      pairBiasProjection: projection,
+    });
+    const ours = execution.read(output).slice();
+
+    const label = `triangle L=${length} c=${channels} h=${heads}`;
+    arm(`vs CPU reference ${label}`, ours, blockReference({
+      activations: pair, mask, weights, batch: length, queryLength: length,
+      channels, heads, pairBiasProjection: projectionWeight,
+    }));
+    const wgsl = await new AttentionGpu(device, {
+      flashPrecision: "f32",
+      projectPrecision: "f32",
+      outputPrecision: "f32",
+      storage: { input: "f32", value: "f32", output: "f32" },
+    }).run({
+      batch: length, queryLength: length, channels, heads,
+      activations: pair, mask, weights,
+      // ...no `source`, so the WGSL side projects it off its own normalised
+      // input with `pair_channels` set to `channels`.
+      pairBias: { projectionWeight },
+    });
+    arm(`vs WGSL block ${label}`, ours, wgsl);
+
+    releaseAttentionBlockWeights(execution, uploaded);
+    for (const tensor of [activations, maskTensor, projection, output]) {
+      execution.release(tensor);
     }
   }
 

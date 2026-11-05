@@ -28,14 +28,29 @@
  * same number up to f32 rounding, and saying so is cheaper than someone later
  * finding the two kernels "disagree about where the scale goes".
  *
- * The pair bias is taken PRE-PROJECTED, as `[heads][queries][queries]`. The
- * WGSL block computes it from the pair activations with their own LayerNorm and
- * projection; that stage is not ported yet, and until it is, a caller with pair
- * activations has to project them itself. Nothing here guesses.
+ * 🔴 THE PAIR BIAS ARRIVES TWO WAYS, WHICH IS WHAT SEPARATES AF2's MSA ROW
+ * ATTENTION FROM ITS TRIANGLE ATTENTIONS.
+ *
+ *   - `pairBias`: already projected, `[heads][queries][queries]`. The MSA row
+ *     attention's bias comes from the PAIR tensor while the attention runs over
+ *     the MSA, so it is produced by `./pair-bias.js` with its own LayerNorm and
+ *     handed in. The WGSL side calls this `source: "separate"`.
+ *   - `pairBiasProjection`: a `[channels][heads]` weight, and the bias is
+ *     projected from THIS block's own normalised activations. That is the
+ *     triangle attentions, where the bias and the q/k/v come from the same
+ *     tensor - which is why fusing a second LayerNorm there would compute the
+ *     same statistics twice. The WGSL side's non-separate path, with
+ *     `pair_channels` set to `input.channels`.
+ *
+ * The second only means anything when the activations are a SQUARE pair matrix,
+ * because the bias it produces is indexed `[head][query][key]` over
+ * `queries^2` - so `batch` must equal `queryLength` and that is refused rather
+ * than silently producing a bias of the wrong length.
  */
 import { layerNorm } from "./layer-norm.js";
 import { linear } from "./linear.js";
 import { attentionFlash } from "./attention-flash.js";
+import { toHeadMajorSource } from "./pair-bias.js";
 
 /** @typedef {import("../runtime/storage.js").Tensor} Tensor */
 
@@ -69,14 +84,27 @@ export function releaseAttentionBlockWeights(execution, weights) {
  * @param {import("../runtime/execution.js").Execution} execution
  * @param {{activations: Tensor, mask: Tensor, weights: Record<string, Tensor>,
  *   batch: number, queryLength: number, channels: number, heads: number,
- *   pairBias?: Tensor, transpose?: boolean, epsilon?: number}} call
+ *   pairBias?: Tensor, pairBiasProjection?: Tensor, transpose?: boolean,
+ *   epsilon?: number}} call
  * @returns {Tensor} `rows x channels`; the caller owns it
  */
 export function attentionBlock(execution, call) {
   const {
     activations, mask, weights: w, batch, queryLength, channels, heads,
-    pairBias, transpose = false, epsilon = 1e-5,
+    pairBias, pairBiasProjection, transpose = false, epsilon = 1e-5,
   } = call;
+  if (pairBias !== undefined && pairBiasProjection !== undefined) {
+    throw new Error(
+      "attention block: a bias is either pre-projected (pairBias) or projected from "
+      + "this block's own normalised activations (pairBiasProjection), not both");
+  }
+  if (pairBiasProjection !== undefined && batch !== queryLength) {
+    throw new RangeError(
+      `attention block: a bias projected from the normalised input indexes `
+      + `[head][query][key] over queryLength^2, so batch (${batch}) must equal `
+      + `queryLength (${queryLength}) - which is true of a square pair matrix and `
+      + "is what the triangle attentions pass");
+  }
   if (channels % heads !== 0) {
     throw new RangeError(`attention block: ${channels} channels over ${heads} heads`);
   }
@@ -98,6 +126,23 @@ export function attentionBlock(execution, call) {
     activation, weightLayout: "in-major",
   });
 
+  // ...projected off the SAME normalised tensor, before it is released.
+  let ownBias;
+  if (pairBiasProjection !== undefined) {
+    const pairMajor = linear(execution, {
+      x: normalised, weight: pairBiasProjection,
+      rows, inChannels: channels, outChannels: heads, weightLayout: "in-major",
+    });
+    ownBias = execution.allocate(rows * heads, "attention.bias");
+    execution.dispatch({
+      source: toHeadMajorSource(rows, heads),
+      output: ownBias,
+      inputs: { sourceTex: pairMajor },
+      label: `attention.bias.head-major:${heads}x${rows}`,
+    });
+    execution.release(pairMajor);
+  }
+
   const query = project(w.queryWeight, undefined, "none");
   const key = project(w.keyWeight, undefined, "none");
   const value = project(w.valueWeight, undefined, "none");
@@ -105,10 +150,11 @@ export function attentionBlock(execution, call) {
   execution.release(normalised);
 
   const { output: attended } = attentionFlash(execution, {
-    query, key, value, gate, mask, pairBias,
+    query, key, value, gate, mask, pairBias: pairBias ?? ownBias,
     batch, queries: queryLength, heads, headDim, transpose,
   });
   for (const tensor of [query, key, value, gate]) execution.release(tensor);
+  if (ownBias !== undefined) execution.release(ownBias);
 
   const output = linear(execution, {
     x: attended, weight: w.outputWeight, bias: w.outputBias,
