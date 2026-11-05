@@ -240,8 +240,10 @@ export function inputEmbedder(execution, call) {
     aatype, residueIndex, weights: w, length, msaSequences, extraSequences,
     targetChannels, msaFeatureChannels, msaChannels, pairChannels, extraMsaChannels,
   } = call;
-  for (const [name, value] of [["msaChannels", msaChannels], ["pairChannels", pairChannels],
-    ["extraMsaChannels", extraMsaChannels]]) {
+  /** @type {[string, number][]} */
+  const widths = [["msaChannels", msaChannels], ["pairChannels", pairChannels],
+    ["extraMsaChannels", extraMsaChannels]];
+  for (const [name, value] of widths) {
     if (value % 4 !== 0) {
       throw new RangeError(`inputEmbedder: ${name} must be a multiple of 4, got ${value}`);
     }

@@ -17,6 +17,13 @@
  * The arms include a glycine at a known residue and residue indices with a jump
  * of more than 32, because neither branch is reached by a plain sequence - and a
  * gate that never reaches a branch says nothing about it.
+ *
+ * 🔴 AND THE PERTURBATION HAS TO REACH ALL THREE EMBEDDINGS, which the first
+ * version did not: it skewed the TARGET features only, and the extra-MSA
+ * embedding does not read them - that arm came back identical and the inverse
+ * verdict said "only 2 of 3". The extra-MSA path takes a code, a deletion flag
+ * and a deletion value and nothing else, so the control skews the deletion value
+ * too.
  */
 import { InputEmbedderGpu } from "../../webgpu/af2/evoformer/input-embedder.js";
 import { setHalfPrecision } from "../../webgpu/runtime/device-profile.js";
@@ -123,7 +130,9 @@ export async function main(device, args) {
     msaFeatures: upload(input.msaFeatures, "msa-features"),
     extraMsa: upload(input.extraMsa, "extra-codes"),
     extraHasDeletion: upload(input.extraHasDeletion, "has-deletion"),
-    extraDeletionValue: upload(input.extraDeletionValue, "deletion-value"),
+    extraDeletionValue: upload(falsify
+      ? Float32Array.from(input.extraDeletionValue, (v) => v * 1.01 + 0.01)
+      : input.extraDeletionValue, "deletion-value"),
     previousMsaFirstRow: upload(input.previousMsaFirstRow, "previous-msa"),
     previousPair: upload(input.previousPair, "previous-pair"),
     previousPositions: upload(input.previousPositions, "previous-positions"),
