@@ -106,6 +106,10 @@ webgl/
                                 from a real bundle
   esmc/
     tower.js                    ESM-C's 36 blocks and ESMFold2's shim, mixed as they are produced
+  esmfold2/
+    pair-features.js            z_init's five terms, and the chain block's inverted polarity
+    trunk.js                    24 blocks of the pair track alone - AF3's block, less three parts
+    distogram.js                the head whose symmetrisation IS the head
   heads/
     distogram.js                P(d < 8 A) for every pair - the contact map the page draws
     confidence.js               pLDDT, PAE and the pTM term
