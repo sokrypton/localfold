@@ -1106,8 +1106,8 @@ decode arithmetic is not ALU-limited on that decode; it is limited by x's fetch 
 inference from "the decode is expensive" to "the decode is the limit" was never measured.
 
 **And 30.4 s was not the floor**: the same mix of kernels, same weights, same step count, folds in
-**22.4 s** after a tile-aware fragment order and x in float16, with `576x896x1792` going **175 to 375
-GFLOP/s** and `576x768x1920` to 394. See "The dense projection is bound by x's fetch locality" below
+**21.7 s** - 22.4 s with the projection work alone, then the 4x8x1 contraction block - with
+`576x896x1792` going **175 to 375 GFLOP/s** and `576x768x1920` to 394. See "The dense projection is bound by x's fetch locality" below
 for all of it. What was right in the retracted paragraph is narrower and still holds: **670 is a
 shape's rate rather than the backend's**, and the honest floor is the sum over labels of each label's
 own achievable rate - it is just that two of those rates were 2.1x higher than this section assumed,
@@ -2005,6 +2005,8 @@ largest in-major labels in a bioemu2 fold come out on the **one-texel** side:
 | ...and again, on the tile-aware fragment order below | 30.4 s | **28.1 s** | **1.08x** |
 | ...and on x in float16 beside it | 28.1 s | **25.7 s** | **1.09x** |
 | ...and on the tile width, swept on the fold | 25.7 s | **23.8 s** | **1.08x** |
+| ...and on narrowing x where nothing had to move it | 23.8 s | **22.4 s** | **1.06x** |
+| ...and on the 4x8x1 contraction block | 22.4 s | **21.7 s** | **1.03x** |
 | bioemu2's trunk | 13.4 s | **10.7 s** | **1.26x** |
 | **ESMFold2**, full configuration | 11.2 s | **9.53 s** | **1.17x** |
 | AlphaFold 3 | 2.36 s | 2.35 s | 1.00x |
@@ -2356,14 +2358,15 @@ fold compiles for 186 ms, so no shader-compilation story could have explained 46
 
 ### How close can this get, and why not closer
 
-The campaign above took a bioemu2 fold from **968 s to 40.1 s** and its device peak from 1656 MiB
-to 412. The gap to the WGSL fold of the same weights is **10.3x** - it was 246x - and it decomposes:
+The campaign above took a bioemu2 fold from **968 s to 21.7 s** and its device peak from 1656 MiB
+to 411. The gap to the WGSL fold of the same weights is **5.57x** - it was 246x.
 
-| | WebGL2 | WGSL | |
-|---|---:|---:|---:|
-| trunk, 4 passes x 52 blocks | 18.2 s | 2.3 s | 7.9x |
-| 20 denoiser calls | 21.0 s | 1.2 s | 17.5x |
-| peak memory | **412 MiB** | 950 MiB | **0.43x** |
+🔴 **THE 40.1 s AND 10.3x THIS SECTION OPENED WITH ARE SUPERSEDED, and so is the decomposition that
+followed them** (a trunk at 18.2 s against 2.3, and 20 denoiser calls at 21.0 against 1.2). They were
+true when written; the projection work below - a tile-aware fragment order, its width swept on the
+fold, x in float16, that narrowing extended to aligned shapes - and the 4x8x1 contraction block took
+the fold to 21.7 s. The sections after this one carry the current numbers; this one is the standing
+argument about the CEILING, which has not changed.
 
 🔴 **AND THERE IS AN ARITHMETIC FLOOR UNDER THAT NUMBER, WHICH IS WORTH STATING BEFORE THE NEXT
 OPTIMISATION RATHER THAN AFTER.** An invocation writes at most `MAX_DRAW_BUFFERS * 4` = **32 output
@@ -2372,8 +2375,17 @@ floats**. Produce those 32 from a k loop as a register tile of R by C, and a k s
 the smallest `R + C` is **12** at 4 by 8 or 8 by 4. **21.33 flops a fetch is therefore the ceiling
 for ANY kernel in this backend**, not a property of these kernels.
 
-The two dense projections reach exactly that intensity, and they run at **137 to 198 GFLOP/s** -
-and they are **70% of a bioemu2 fold** now that the contraction has been fixed twice.
+The two dense projections reach exactly that intensity, and the int5 ones now run at **375 to 394
+GFLOP/s** where this line used to read 137 to 198 - the tile-aware order and a float16 x, measured in
+"The dense projection is bound by x's fetch locality" above. They are **49%** of a bioemu2 fold, not
+the 70% recorded here before the contraction was fixed a third time.
+
+🔴 **AND THE INTENSITY CAP IS EXACTLY WHY THE 4x8x1 CONTRACTION BLOCK PAID.** 21.33 flops a fetch4 at
+`R + C = 12` is the ceiling for any kernel here, and the contraction's 2 i x 4 j x 4 channel block
+reached only **10.7** - because its four channels a fragment are not part of the register tile at
+all, they are four separate k loops. One channel a fragment makes the tile 4 by 8 and the intensity
+**21.33**, which is this paragraph's own ceiling, reached at last by the kernel that was furthest
+from it.
 
 🔴 **AND THE "6x FLOOR" THIS SECTION USED TO DERIVE FROM THAT IS RETRACTED, BECAUSE THE OTHER HALF
 OF THE PRODUCT WAS NEVER MEASURED.** The old text multiplied 21.33 flops a fetch by a fetch rate of
