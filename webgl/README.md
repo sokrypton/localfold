@@ -2413,6 +2413,38 @@ That is the clearest statement this file can make about why the gap does not clo
 not an impossibility proof: it bounds the dominant family on this device at this working set. What it
 rules out is closing a 5x gap by making these kernels better, because there is 1.26x in them.
 
+🔴 **AND THE OUTPUT BUDGET ITSELF IS NOT 32 FLOATS EVERYWHERE IN WebGL2 - TRANSFORM FEEDBACK CARRIES
+128, WHICH WAS BUILT AND IS WORTH 1.13x AT THE WORKING SET THAT MATTERS.** Every mechanism this
+campaign measured moves a kernel WITHIN the fragment path's ceiling, so the question left over is
+whether WebGL2 has a different ceiling anywhere. `probe-webgl-limits.js` says it does:
+`MAX_TRANSFORM_FEEDBACK_INTERLEAVED_COMPONENTS` is **128** on this device against
+`MAX_DRAW_BUFFERS * 4`'s 32, and `MAX_VERTEX_TEXTURE_IMAGE_UNITS` is 16, so a VERTEX shader can read
+its operands and write four times as much. At 96 outputs an invocation (8 by 12, inside
+`MAX_VERTEX_OUTPUT_COMPONENTS`'s 120) the intensity is **38.4 flops a fetch4** against the fragment
+path's 21.33.
+
+`probe-webgl-feedback-gemm.js` runs the SAME k loop in both stages, each at its own best tile, and
+sweeps the working set because that is what decided every other question here:
+
+| working set | transform feedback | fragment | ratio |
+|---|---|---|---:|
+| shared, a few KiB | 1074 GF/s at **28.0** G fetch4/s | 1986 at **93.1** | **0.54x** |
+| **64 KiB** | **560 GF/s at 14.6** | 494 at 23.1 | **1.13x** |
+| 256 KiB | 197 GF/s at 5.1 | 482 at 22.6 | **0.41x** |
+
+**The intensity gain is real and the issue rate is where it goes.** The vertex stage reads 1.6x more
+slowly than the fragment stage at 64 KiB and **4.4x** more slowly at 256, so the 1.8x of intensity
+only nets out ahead in one band - and that band happens to be the projection's own working set of
+about 75 KiB, where feedback reaches **560 GFLOP/s against the fragment path's 494**. The fragment
+arm's 494 is the check on this whole section: the shipped projection measures **476** at that
+locality.
+
+So the answer to "is there a different ceiling in WebGL2" is **yes, and it is 1.13x**, before paying
+for the thing that makes it unusable: transform feedback writes a BUFFER, nothing in WebGL2 samples a
+buffer, and every kernel here feeds the next one through a texture - so each dispatch would owe a
+buffer-to-texture copy of its whole output, which at 1.13x of the matmul is not a trade. **The output
+budget is the binding constraint, raising it is possible, and raising it does not pay.**
+
 🔴 **AND THE ONE WAY TO BREAK THE INTENSITY FACTOR WAS BUILT AND IS A 3.4x LOSS.** The cap assumes
 **four floats a fetch**, and that is an assumption about the FORMAT rather than the API: the int5
 weights have packed about twenty-five codes into one RGBA32UI texel since they were written, and x
