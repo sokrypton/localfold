@@ -283,6 +283,65 @@ static Example subset(const Example& e, const std::vector<int>& keep, bool whole
   return o;
 }
 
+// ---- OpenFold3's training templates (sample_templates, AF3 SI 2.4): for each chain, k = min(U{0..l}, n) of the l
+// templates it has, drawn at random (not the top k inference takes) - here over the slots the input carries. Each new
+// slot is assembled a chain at a time from the slot that chain drew (its intra-chain block; pairs across chains masked,
+// as the features are), the rest padding (the gap restype, no geometry); all-padding slots folded into one pass.
+static void sampleTemplates(Example& e, std::mt19937_64& rng) {
+  const int n = e.n; const size_t nn = (size_t)n * n;
+  std::vector<int> concrete;                 // each of the e.templates slots -> its pass
+  for (size_t k = 0; k < e.slots.size(); ++k) for (int r = 0; r < (int)std::lround(e.slots[k].repeat); ++r) concrete.push_back((int)k);
+  const int total = (int)concrete.size();
+  if (total == 0) return;
+  std::vector<int> chains; for (int t = 0; t < n; ++t) if (std::find(chains.begin(), chains.end(), e.asym[t]) == chains.end()) chains.push_back(e.asym[t]);
+  const int GAP = 21;
+  // per chain: the concrete slots that carry it (a pass with geometry and a residue of it not a gap)
+  std::map<int, std::vector<int>> drawn;
+  bool any = false;
+  for (int c : chains) {
+    std::vector<int> avail;
+    for (int j = 0; j < total; ++j) {
+      const auto& sl = e.slots[concrete[j]];
+      if (!sl.geo) continue;
+      bool has = false; for (int t = 0; t < n && !has; ++t) has = e.asym[t] == c && sl.aatype[t] != GAP;
+      if (has) avail.push_back(j);
+    }
+    const int l = (int)avail.size();
+    const int k = std::min(std::uniform_int_distribution<int>(0, l)(rng), total);
+    std::shuffle(avail.begin(), avail.end(), rng);
+    avail.resize(k);
+    drawn[c] = avail;
+    any |= l > 0;
+  }
+  if (!any) return;                          // (no chain has a template: the input's padding stands)
+  std::vector<Example::Slot> real; int padding = 0;
+  for (int j = 0; j < total; ++j) {
+    Example::Slot o; o.aatype.assign(n, GAP);
+    bool filled = false;
+    for (int c : chains) filled |= (int)drawn[c].size() > j;
+    if (!filled) { ++padding; continue; }
+    o.geo = true; o.repeat = 1;
+    o.bin.assign(nn, -1); o.pb.assign(nn, 0); o.uv.assign(nn * 3, 0); o.bb.assign(nn, 0);
+    for (int c : chains) {
+      if ((int)drawn[c].size() <= j) continue;
+      const auto& src = e.slots[concrete[drawn[c][j]]];
+      for (int a = 0; a < n; ++a) {
+        if (e.asym[a] != c) continue;
+        o.aatype[a] = src.aatype[a];
+        for (int b = 0; b < n; ++b) {
+          if (e.asym[b] != c) continue;
+          const size_t ab = (size_t)a * n + b;
+          o.bin[ab] = src.bin[ab]; o.pb[ab] = src.pb[ab]; o.bb[ab] = src.bb[ab];
+          for (int q = 0; q < 3; ++q) o.uv[ab * 3 + q] = src.uv[ab * 3 + q];
+        }
+      }
+    }
+    real.push_back(std::move(o));
+  }
+  if (padding) { Example::Slot pad; pad.aatype.assign(n, GAP); pad.repeat = padding; real.push_back(std::move(pad)); }
+  e.slots = std::move(real);
+}
+
 // ---- OpenFold3's crops (core/data/primitives/structure/cropping.py), over the token centre atoms (CA, C1', an
 // atomised token's atom) the truth resolves
 struct CropWeights { double contiguous = 0.2, spatial = 0.4, interface = 0.4; };
@@ -994,6 +1053,7 @@ int main(int argc, char** argv) {
     // (the crop from the whole entry, its tokens mapped through the chain crop)
     std::vector<int> keepFull(keep.size()); for (size_t k = 0; k < keep.size(); ++k) keepFull[k] = keepC[keep[k]];
     Example e = subset(full, keepFull);
+    if (!fixed) sampleTemplates(e, gen);
     const of3::Layout Lay = layoutOf(e);
     const int n = e.n; const size_t nn = (size_t)n * n, A = e.atoms();
     const int S = std::min(1024, e.P);
@@ -1140,8 +1200,9 @@ int main(int argc, char** argv) {
       g::af3::targetFeatBackward(tfm, d.b, tfS, dtf);
     }
     const auto t4 = now();
-    if (!fixed) printf("  %s: %d of %d tokens (%s), %d cycles, %d MSA rows; ms: trunk %.0f, rollout+confidence %.0f, diffusion %.0f (host losses %.0f), trunk backward %.0f\n",
-                       full.input.c_str(), n, full.n, strategy.c_str(), c, S, msOf(t0, t1), msOf(t1, t2), msOf(t2, t3), tLoss, msOf(t3, t4));
+    int withTemplates = 0; for (auto& sl : e.slots) if (sl.geo) withTemplates += (int)std::lround(sl.repeat);
+    if (!fixed) printf("  %s: %d of %d tokens (%s), %d cycles, %d MSA rows, %d templates; ms: trunk %.0f, rollout+confidence %.0f, diffusion %.0f (host losses %.0f), trunk backward %.0f\n",
+                       full.input.c_str(), n, full.n, strategy.c_str(), c, S, withTemplates, msOf(t0, t1), msOf(t1, t2), msOf(t2, t3), tLoss, msOf(t3, t4));
     a.release(); d.release();
     return std::make_pair(L, confOn);
   };

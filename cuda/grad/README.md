@@ -83,6 +83,10 @@ one-hot one - the MSA stack, the pairformer, the distogram, the denoiser, the co
   tokens, 35 chains, 98 datapoints) trains at ~8.6 s a 384-token step with 4 samples, 0.7 s of it the host's crops. The crop
   cuts the host arrays and REBUILDS the atom windows with the featuriser's own `atomGathers` - held, on every example
   at load, to the windows the featuriser wrote.
+- **templates** - drawn per chain each step as OpenFold3's training draws them (`sample_templates`, AF3 SI 2.4: k =
+  min(U{0..l}, n) of a chain's l templates, at random, where inference takes the top k), over the slots the input
+  carries: each new slot assembled a chain at a time from the slot that chain drew, its cross-chain pairs masked, the
+  rest padding (the gap restype), the all-padding slots folded into one pass. A self-templated 6MRR draws 0, 1 or 2.
 - **dropout** - OpenFold3 trains with it and the AF3 blocks had none: `pair_dropout` 0.25 on the triangle
   multiplications' and the starting attention's updates rowwise and the ending attention's columnwise (the transposed
   pair's rowwise, as there), in every pairformer-style stack - trunk, MSA module, template, confidence head - and
