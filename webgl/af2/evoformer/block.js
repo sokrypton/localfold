@@ -391,3 +391,150 @@ export function extraMsaBlock(execution, call) {
   pair.label = "extra.pair";
   return { msa, pair };
 }
+
+const TEMPLATE_BLOCK_GROUPS = [
+  "triangleAttentionStarting", "triangleAttentionEnding",
+  "triangleMultiplicationOutgoing", "triangleMultiplicationIncoming", "pairTransition",
+];
+
+/**
+ * A TEMPLATE pair block's weights: the pair half of an Evoformer block's,
+ * without the outer product mean.
+ *
+ * It is here rather than in `template.js` so that the four name lists above
+ * stay the one statement of what a group holds - `releaseEvoformerBlockWeights`
+ * walks whatever it is given and releases both kinds.
+ */
+export function uploadTemplatePairBlockWeights(execution, weights) {
+  /** @type {(names: string[], source: any, label: string) => Group} */
+  const group = (names, source, label) => {
+    /** @type {Record<string, Tensor>} */
+    const out = {};
+    for (const name of names) {
+      const values = source[name];
+      if (values === undefined) throw new Error(`${label}: ${name} is missing`);
+      out[name] = execution.upload(values, `w.${label}.${name}`);
+    }
+    return out;
+  };
+  const attention = (source, label) => ({
+    heads: source.heads,
+    attention: group(ATTENTION_NAMES, source.attention, `${label}.attention`),
+    pairBias: group(["projectionWeight"], source.pairBias, `${label}.pairBias`),
+  });
+  for (const name of TEMPLATE_BLOCK_GROUPS) {
+    if (weights[name] === undefined) throw new Error(`template block weights: ${name} is missing`);
+  }
+  return {
+    triangleAttentionStarting: attention(
+      weights.triangleAttentionStarting, "template.tri-att-start"),
+    triangleAttentionEnding: attention(
+      weights.triangleAttentionEnding, "template.tri-att-end"),
+    triangleMultiplicationOutgoing: group(
+      TRIANGLE_NAMES, weights.triangleMultiplicationOutgoing, "template.tri-out"),
+    triangleMultiplicationIncoming: group(
+      TRIANGLE_NAMES, weights.triangleMultiplicationIncoming, "template.tri-in"),
+    pairTransition: group(TRANSITION_NAMES, weights.pairTransition, "template.pair-transition"),
+  };
+}
+
+/**
+ * One block of AF2's template pair stack: five sub-layers, each a residual.
+ *
+ *     pair += triangleAttention(pair, "starting")
+ *     pair += triangleAttention(pair, "ending")
+ *     pair += triangleMultiplication(pair, "outgoing")
+ *     pair += triangleMultiplication(pair, "incoming")
+ *     pair += transition(pair)
+ *
+ * 🔴 IT IS NOT `pairHalf` MINUS THE OUTER PRODUCT MEAN - THE ORDER DIFFERS.
+ * `encodeTemplatePairBlock` runs both ATTENTIONS first and the two
+ * multiplications after, where `encodeEvoformerPairBlock` runs the
+ * multiplications first. Every sub-layer reads what the previous one wrote, so
+ * the two orders compute different tensors from the same weights, and reusing
+ * `pairHalf` with the mean deleted would have been a plausible wrong answer.
+ *
+ * The pair track is `templateChannels` wide here (64, not 128), and there is no
+ * MSA: the template's own representation is what the stack refines.
+ *
+ * @param {import("../../runtime/execution.js").Execution} execution
+ * @param {{pair: Tensor, pairMask: Tensor, length: number, cZ: number,
+ *   triangleHidden: number, pairHidden: number,
+ *   weights: ReturnType<typeof uploadTemplatePairBlockWeights>, epsilon?: number,
+ *   triangleAttentionPrecision?: "f16" | "f32",
+ *   triangleAttentionParts?: Record<string, "f16" | "f32">,
+ *   trianglePrecision?: "f16" | "f32"}} call
+ * @returns {Tensor} a new tensor; the caller's `pair` is untouched
+ */
+export function templatePairBlock(execution, call) {
+  const {
+    pairMask, length, cZ, triangleHidden, pairHidden, weights: w, epsilon = 1e-5,
+  } = call;
+  let pair = call.pair;
+  let own = false;
+  const residual = (current, update) => {
+    const next = add(execution, current, update);
+    execution.release(update);
+    if (own) execution.release(current);
+    own = true;
+    return next;
+  };
+
+  // 1. Triangle attention, starting node: the bias comes off the block's own
+  //    normalised pair, exactly as in the main stack.
+  {
+    const starting = w.triangleAttentionStarting;
+    pair = residual(pair, attentionBlock(execution, {
+      activations: pair, mask: pairMask, weights: starting.attention,
+      batch: length, queryLength: length, channels: cZ, heads: starting.heads,
+      pairBiasProjection: starting.pairBias.projectionWeight, epsilon,
+      storagePrecision: call.triangleAttentionPrecision ?? "f16",
+      ...(call.triangleAttentionParts ?? {}),
+    }));
+  }
+
+  // 2. Triangle attention, ending node: the other pair axis, so transpose in
+  //    and transpose the update back.
+  {
+    const ending = w.triangleAttentionEnding;
+    const transposed = transposeLeading(execution, {
+      x: pair, outer: length, inner: length, channels: cZ,
+    });
+    const updateT = attentionBlock(execution, {
+      activations: transposed, mask: pairMask, weights: ending.attention,
+      batch: length, queryLength: length, channels: cZ, heads: ending.heads,
+      transpose: true, pairBiasProjection: ending.pairBias.projectionWeight, epsilon,
+      storagePrecision: call.triangleAttentionPrecision ?? "f16",
+      ...(call.triangleAttentionParts ?? {}),
+    });
+    execution.release(transposed);
+    const update = transposeLeading(execution, {
+      x: updateT, outer: length, inner: length, channels: cZ,
+    });
+    execution.release(updateT);
+    pair = residual(pair, update);
+  }
+
+  // 3, 4. The two triangle multiplications, in order.
+  /** @type {[("outgoing" | "incoming"), Group][]} */
+  const multiplications = [
+    ["outgoing", w.triangleMultiplicationOutgoing],
+    ["incoming", w.triangleMultiplicationIncoming],
+  ];
+  for (const [direction, group] of multiplications) {
+    pair = residual(pair, triangleMultiplication(execution, {
+      z: pair, mask: pairMask, weights: group,
+      shape: { length, cZ, cHidden: triangleHidden },
+      direction, epsilon,
+      projectionPrecision: call.trianglePrecision ?? "f32",
+    }));
+  }
+
+  // 5. Pair transition.
+  pair = residual(pair, transition(execution, {
+    activations: pair, weights: w.pairTransition,
+    rows: length * length, channels: cZ, hiddenChannels: pairHidden, epsilon,
+  }));
+  pair.label = "template.pair";
+  return pair;
+}

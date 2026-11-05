@@ -62,6 +62,8 @@ webgl/
                                 each, sharing the six that make up the pair half
     evoformer/stack.js          the loop over blocks, for both kinds
     evoformer/input-embedder.js the MSA, extra-MSA and pair embeddings, and the recycle
+    evoformer/template.js       the template stack: one Linear over 88 geometry columns, the pair
+                                blocks, and a pointwise attention that is two projections
     structure/initialize.js     the single representation and the identity frame
     structure/sidechain.js      seven torsions a residue, as normalised (x, y) pairs
     structure/geometry.js       atom coordinates from frames and torsions - atom14 and atom37
@@ -276,7 +278,36 @@ the recycled tensors raw is a plausible embedding whose scale drifts with every 
 error that degrades a long fold and leaves a short one looking fine, and one that three kernels each
 looking complete would never reveal.
 
-Still to come in AF2: the template stack, the multimer variant, and reading a weight bundle. After
+**The template stack is done** - the 88-column `embedding2d` at **4.6e-8** against an f64
+reference, and the whole stage at its measured floor against `QueryOnlyTemplateGpu` on five arms.
+Three conventions are pinned, and none of them is reached by a plain template: the whole 88 is
+multiplied by the BACKBONE mask rather than each feature by its own, so the monomer's distogram
+survives at a pair whose pseudo-beta is missing - the opposite of what AF3 and the multimer do;
+the bias is OUTSIDE that mask, so a masked template leaves the bias to run the whole stack and both
+projections rather than producing a zero update; and `use_template_unit_vector` is false in every
+shipped monomer config, which this port bakes into the source and gates as its own arm rather than
+leaving as an untested branch.
+
+🔴 **AND A TEMPLATE PAIR BLOCK IS NOT THE EVOFORMER'S PAIR HALF WITH THE OUTER PRODUCT MEAN
+DELETED.** It runs both triangle ATTENTIONS first and the two multiplications after, where the
+Evoformer block runs the multiplications first. Every sub-layer reads what the previous one wrote,
+so the two orders compute different tensors from the same weights and nothing at the operation
+level can see it. Swapping them in this port measures **relRMS 0.47 to 0.88** against a bar of
+6e-4, which is what the gate was built for; two blocks rather than one, because a single block
+cannot separate an error in the block from an error in carrying its output into the next.
+
+🔴 **AND THE FLOOR HERE IS f16 STRADDLING, NOT f32 AMPLIFICATION - A CONDITION NUMBER IS THE WRONG
+INSTRUMENT AND SAID SO CONFIDENTLY.** Nudging the embedding bias gives a tidy ratio of 0.42 on the
+no-template arm, i.e. "contractive", while two blocks disagree 27x more than one: a bias nudge is
+UNIFORM over the pairs and a rounding difference is not, and with no template every pair carries the
+same value, so the uniform mode is all such a probe can excite. `execution.halfDither` is the
+instrument that fits, the same one the stack gate had to reach for, and the no-template arm then
+sits at **7.98e-6 against a measured floor of 7.9e-6**. That the floor is f16 at all is measured
+rather than assumed: `--tri-att-f32` lifts this port's rounding in the triangle attentions and the
+arm gets eighty times WORSE, 6.8e-6 to 5.4e-4, so the WGSL template block stores its attentions in
+f16 exactly as the main block does. `--tri-f32` moves nothing, which is the control.
+
+Still to come in AF2: the multimer variant, and reading a weight bundle. After
 that: AF3's pairformer and diffusion, ESMFold2, bioemu2.
 
 Every operation so far is checked against TWO references - an f64 CPU one written from the
@@ -284,7 +315,7 @@ operation, and the WGSL kernel run in the same page - because a single reference
 side is wrong. That has already paid for itself twice: the triangle contraction's incoming
 direction was the pair-transpose of itself and only the WGSL arm could see it, and the attention
 block read 1e-3 against WGSL while reading 2.5e-7 against f64, which was an unpinned precision axis
-on the WGSL side rather than a defect here. After AF2: AF3's pairformer and diffusion, ESMFold2, bioemu2. Nothing is wired to a weight
+on the WGSL side rather than a defect here. Nothing is wired to a weight
 bundle yet - every kernel takes its operands as plain arrays, and reading
 `model-af2-monomer-int5` is its own stage with its own differential, because a transposed weight is
 a plausible-looking wrong answer.
