@@ -11,9 +11,9 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-488 tools. `tools/fixtures/` is data and is not listed.
+490 tools. `tools/fixtures/` is data and is not listed.
 
-## `tools/gpu/` - the WebGPU lane (243)
+## `tools/gpu/` - the WebGPU lane (245)
 
 Each exports `async function main(device, args)` and is run as
 `node tools/gpu-chrome.mjs tools/gpu/<module>.js [--flags]`.
@@ -141,6 +141,8 @@ Each exports `async function main(device, args)` and is run as
 - **`check-triangle.js`** - Differential-test triangle multiplication on the Chrome GPU lane.
 - **`check-trunk.js`** - GPU trunk vs the PyTorch oracle, with the released weights.
 - **`check-webapp.js`** - End-to-end browser verification of `index.html` (AtomWorks Studio + `web/app.js`) in headless Chrome:
+- **`check-webgl-af3-transition.js`** - AF3's transition block in WebGL2, against TWO references.
+- **`check-webgl-af3-triangle.js`** - AF3's triangle multiplication in WebGL2, against TWO references.
 - **`check-webgl-attention-block.js`** - The whole attention block in WebGL2 against the WGSL block and a CPU reference - the cross-API differential this backend's attention has lacked.
 - **`check-webgl-attention.js`** - Gated attention for every head width this port runs, against a CPU reference and against the kernel it replaces.
 - **`check-webgl-confidence.js`** - pLDDT, PAE and pTM in WebGL2 against the WGSL confidence head.

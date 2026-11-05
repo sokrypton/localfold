@@ -180,6 +180,101 @@ export async function main(device, args) {
     arm(`layerNorm ${n}x${channels}`, got,
       layerNormReference(x, n, channels, weight, bias, 1e-5), 1e-6);
   }
+  // 🔴 AND AF3'S VARIANCE IS A DIFFERENT NUMBER, NOT A CHEAPER ONE. AF3 takes
+  // `E[x^2] - E[x]^2` where AF2 centres first - "algebraically the same and
+  // numerically not", in cpu/af3/trunk/pairformer.js's words - so the fast arm
+  // is compared against its OWN reference formula and the two are asserted to
+  // DIFFER on a row whose mean dwarfs its spread, which is the case that
+  // separates them. A fast mode that silently computed the centred form would
+  // pass a shared reference and be wrong on AF3's single track, which reaches
+  // 1.7e5.
+  {
+    const n = 12;
+    const channels = 64;
+    const random = generator(9001);
+    // 🔴 A MEAN OF 100 AGAINST A SPREAD OF 1, AND THE FIRST TRY WAS 1e4 AGAINST
+    // 1e-2 AND READ NaN. That is not a defect in the kernel - it is the formula:
+    // at a mean of 1e4 the two expectations are both ~1e8 and their f32
+    // difference goes NEGATIVE, so `inversesqrt(variance + eps)` is NaN. AF3
+    // ships this formula and lives with it, which is worth knowing before
+    // anybody reads a NaN in a trunk as a port bug. At a mean of 100 the
+    // cancellation is a factor of 1e4, so the variance keeps about three digits
+    // and the two formulas separate by ~5e-4 without either collapsing.
+    const values = Float32Array.from(
+      { length: n * channels }, () => 100 + (random() * 2 - 1));
+    const weight = Float32Array.from(noise(channels, 0.2, generator(7)), (v) => v + 1);
+    const bias = noise(channels, 0.1, generator(8));
+    const xT = execution.upload(skew(values), "fast-x");
+    const weightT = execution.upload(weight, "fast-w");
+    const biasT = execution.upload(bias, "fast-b");
+    const want = (fast) => {
+      const out = new Float32Array(n * channels);
+      for (let row = 0; row < n; row += 1) {
+        const base = row * channels;
+        let sum = 0;
+        let sumSquares = 0;
+        for (let c = 0; c < channels; c += 1) {
+          sum += values[base + c];
+          sumSquares += values[base + c] * values[base + c];
+        }
+        const mean = sum / channels;
+        let variance = sumSquares / channels - mean * mean;
+        if (!fast) {
+          variance = 0;
+          for (let c = 0; c < channels; c += 1) {
+            variance += (values[base + c] - mean) ** 2;
+          }
+          variance /= channels;
+        }
+        const inverse = 1 / Math.sqrt(variance + 1e-5);
+        for (let c = 0; c < channels; c += 1) {
+          out[base + c] = (values[base + c] - mean) * inverse * weight[c] + bias[c];
+        }
+      }
+      return out;
+    };
+    const fast = Float32Array.from(execution.read(layerNorm(execution, {
+      x: xT, weight: weightT, bias: biasT, rows: n, channels, variance: "fast",
+    })));
+    const twoPass = Float32Array.from(execution.read(layerNorm(execution, {
+      x: xT, weight: weightT, bias: biasT, rows: n, channels,
+    })));
+    // 🔴 AND THE BAR HERE IS LOOSE ON PURPOSE, WHICH IS THE FINDING. The
+    // reference computes `E[x^2] - E[x]^2` in f64 and the kernel in f32, and the
+    // cancellation at a mean of 100 costs about three digits of the variance -
+    // so 5e-3 is what a CORRECT f32 implementation of this formula reaches, and
+    // a tight bar here would be asking the kernel to be better than the
+    // arithmetic AF3 chose.
+    arm(`layerNorm fast variance ${n}x${channels}`, fast, want(true), 5e-3);
+    // ...and the two formulas disagree here by far more than that bar, which is
+    // the whole reason the option exists.
+    const separation = relativeRms(twoPass, fast, "variance.separation");
+    // 🔴 `falsifiable: false`, WITH THE REASON. This row compares two of this
+    // port's own kernels on ONE input, so the control moves both sides together
+    // and it can never go red - the "comparing something with itself" trap in a
+    // control's clothes. Declaring it is better than inventing a perturbation
+    // that only looks like it works; what makes the row worth having is that it
+    // is a LOWER bound, asserting the two formulas are far apart rather than
+    // close.
+    rows.push({
+      arm: "the two variances differ on a large-mean row",
+      relativeRms: Number(separation.toPrecision(4)),
+      bar: "> 1e-4",
+      ok: separation > 1e-4,
+      falsifiable: false,
+      reason: "compares two of this port's own kernels on one input",
+    });
+    if (!(separation > 1e-4)) {
+      failures.push(`the two variance formulas agree to ${separation.toExponential(3)}`
+        + " - this arm cannot tell them apart");
+    }
+    refuses("a variance mode that is neither", "two-pass",
+      () => layerNorm(execution, {
+        x: xT, weight: weightT, bias: biasT, rows: n, channels,
+        variance: /** @type {any} */ ("welford"),
+      }));
+  }
+
   refuses("layerNorm on a width that is not a multiple of four", "multiple of 4",
     () => layerNorm(execution, {
       x: execution.allocate(7 * 7, "x7"), weight: execution.allocate(7, "w7"),
@@ -296,7 +391,8 @@ export async function main(device, args) {
 
   const stats = execution.stats();
   const numerical = rows.length;
-  const red = rows.filter((row) => !row.ok).length;
+  const falsifiableRows = rows.filter((row) => row.falsifiable !== false);
+  const red = falsifiableRows.filter((row) => !row.ok).length;
   return {
     maxTextureSize: gl.getParameter(gl.MAX_TEXTURE_SIZE),
     maxViewportDims: [...gl.getParameter(gl.MAX_VIEWPORT_DIMS)],
@@ -308,9 +404,9 @@ export async function main(device, args) {
     refusals,
     stats,
     verdict: falsify
-      ? (red === numerical
-        ? `ok: all ${numerical} numerical arms go red on a 1% perturbation`
-        : `VACUOUS: only ${red} of ${numerical} numerical arms noticed a 1% perturbation`)
+      ? (red === falsifiableRows.length
+        ? `ok: all ${falsifiableRows.length} falsifiable arms go red on a 1% perturbation`
+        : `VACUOUS: only ${red} of ${falsifiableRows.length} falsifiable arms noticed it`)
       : (failures.length === 0 ? `ok: ${numerical} arms, ${refusals.length} refusals`
         : `FAILED: ${failures.join("; ")}`),
   };

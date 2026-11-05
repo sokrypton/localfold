@@ -8,12 +8,21 @@
  *     variance   = sum((x - mean)^2) / channels          (biased)
  *     out[c]     = (x[c] - mean) * inversesqrt(variance + epsilon) * w[c] + b[c]
  *
- * 🔴 TWO PASSES OVER THE ROW, NOT `E[x^2] - E[x]^2`. The one-pass form is one
- * loop instead of two and it loses the top bits where the mean is large next to
- * the spread: a pair row whose values sit around 10 with a spread of 1e-3 has
- * `E[x^2]` and `E[x]^2` agreeing to six digits, and f32 keeps seven. The
- * reference centres first and so does this, which also makes the two
- * bit-comparable rather than merely close.
+ * 🔴 TWO PASSES OVER THE ROW FOR AF2, AND `E[x^2] - E[x]^2` FOR AF3 - BECAUSE
+ * THE TWO MODELS GENUINELY DIFFER HERE. The one-pass form is one loop instead
+ * of two and it loses the top bits where the mean is large next to the spread:
+ * a pair row whose values sit around 10 with a spread of 1e-3 has `E[x^2]` and
+ * `E[x]^2` agreeing to six digits, and f32 keeps seven. AF2's reference centres
+ * first, so `variance: "two-pass"` is the default and the two are bit-comparable
+ * rather than merely close.
+ *
+ * AF3 does NOT. `cpu/af3/trunk/pairformer.js` states it: "`use_fast_variance` IS
+ * THE DEFAULT AND IT IS NOT THE TWO-PASS FORMULA: AF3 takes E[x^2] - E[x]^2,
+ * which is algebraically the same and numerically is not. The trunk's single
+ * representation reaches 1.7e5, where the two expectations agree to about six
+ * digits and their difference does not." So `variance: "fast"` is not a cheaper
+ * approximation to be avoided - on that path it is the right answer, and the
+ * centred form is the wrong one.
  *
  * 🔴 AND A TEXEL MAY NOT STRADDLE TWO ROWS, which is why `channels % 4` is
  * refused up front. A fragment owns four consecutive channels; if a row's
@@ -27,7 +36,9 @@ import { ONE_TARGET, PRELUDE } from "../runtime/execution.js";
 /** @typedef {import("../runtime/storage.js").Tensor} Tensor */
 
 
-export const layerNormSource = (rows, channels, roundHalf = false) => `${PRELUDE}${ONE_TARGET}
+export const layerNormSource = (
+  rows, channels, roundHalf = false, variance = "two-pass",
+) => `${PRELUDE}${ONE_TARGET}
 const int ROWS = ${rows};
 const int CHANNELS = ${channels};
 const int CH4 = ${channels / 4};
@@ -43,7 +54,19 @@ void main() {
   int group = texel - row * CH4;
   int base = row * CH4;
 
+${variance === "fast"
+    ? `  // AF3's own: one pass, E[x^2] - E[x]^2. See the note at the top for why
+  // this is the right answer on that path rather than a cheaper one.
   float total = 0.0;
+  float totalSquares = 0.0;
+  for (int i = 0; i < CH4; ++i) {
+    vec4 v = fetch4(xTex, base + i);
+    total += v.x + v.y + v.z + v.w;
+    totalSquares += dot(v, v);
+  }
+  float mean = total / float(CHANNELS);
+  float inverseStd = inversesqrt(totalSquares / float(CHANNELS) - mean * mean + epsilon);`
+    : `  float total = 0.0;
   for (int i = 0; i < CH4; ++i) {
     vec4 v = fetch4(xTex, base + i);
     total += v.x + v.y + v.z + v.w;
@@ -55,7 +78,7 @@ void main() {
     vec4 centred = fetch4(xTex, base + i) - mean;
     spread += dot(centred, centred);
   }
-  float inverseStd = inversesqrt(spread / float(CHANNELS) + epsilon);
+  float inverseStd = inversesqrt(spread / float(CHANNELS) + epsilon);`}
 
   vec4 value = fetch4(xTex, texel);
   vec4 normalised = (value - mean) * inverseStd * fetch4(weightTex, group)
@@ -69,13 +92,23 @@ void main() {
 /**
  * @param {import("../runtime/execution.js").Execution} execution
  * @param {{x: Tensor, weight: Tensor, bias: Tensor, rows: number, channels: number,
- *   epsilon?: number, roundHalf?: boolean}} call
+ *   epsilon?: number, roundHalf?: boolean,
+ *   variance?: "two-pass" | "fast"}} call
  * @param {Tensor} [into]
  * @returns {Tensor}
  */
 export function layerNorm(
-  execution, { x, weight, bias, rows, channels, epsilon = 1e-5, roundHalf = false }, into,
+  execution,
+  {
+    x, weight, bias, rows, channels, epsilon = 1e-5, roundHalf = false,
+    variance = "two-pass",
+  },
+  into,
 ) {
+  if (variance !== "two-pass" && variance !== "fast") {
+    throw new RangeError(
+      `layerNorm: variance is "two-pass" (AF2) or "fast" (AF3), not \`${variance}\``);
+  }
   if (channels % 4 !== 0) {
     throw new RangeError(`layerNorm: channels must be a multiple of 4, got ${channels}`);
   }
@@ -95,10 +128,11 @@ export function layerNorm(
     throw new Error("layerNorm: a fragment shader cannot read the texture it draws into");
   }
   return execution.dispatch({
-    source: layerNormSource(rows, channels, roundHalf),
+    source: layerNormSource(rows, channels, roundHalf, variance),
     output,
     inputs: { xTex: x, weightTex: weight, biasTex: bias },
     floats: { epsilon },
-    label: `layer-norm:${rows}x${channels}${roundHalf ? ":half" : ""}`,
+    label: `layer-norm:${rows}x${channels}${roundHalf ? ":half" : ""}`
+      + `${variance === "fast" ? ":fast" : ""}`,
   });
 }

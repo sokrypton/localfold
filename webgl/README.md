@@ -65,6 +65,9 @@ webgl/
                                 two gates, the mask, the contraction, the output gate
     global-attention.js         AF2's global column attention: one query a residue, the masked
                                 mean of its column, with single-headed keys and values
+  af3/
+    trunk/transition.js         AF3's SwiGLU transition, a BLOCKED split
+    trunk/triangle.js           AF3's triangle multiplication, an INTERLEAVED split
   af2/
     multimer/template.js        the multimer's nine-projection template embedder
     evoformer/block.js          a whole Evoformer block and the extra-MSA block, nine sub-layers
