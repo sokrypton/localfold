@@ -342,9 +342,12 @@ export async function foldAf2(execution, call) {
     execution.release(templateAatype);
   }
 
-  let previousMsa = execution.allocate(length * msaChannels, "monomer.recycle-msa");
-  let previousPair = execution.allocate(pairs * pairChannels, "monomer.recycle-pair");
-  let previousPositions = execution.allocate(length * 37 * 3, "monomer.recycle-positions");
+  // 🔴 ZEROS, NOT AN ALLOCATION. The first pass has no previous activations and
+  // the embedder reads all three, so a fresh texture's contents ARE the answer
+  // here - and `allocate` does not promise any. See `Storage.zeros`.
+  let previousMsa = execution.zeros(length * msaChannels, "monomer.recycle-msa");
+  let previousPair = execution.zeros(pairs * pairChannels, "monomer.recycle-pair");
+  let previousPositions = execution.zeros(length * 37 * 3, "monomer.recycle-positions");
   let previousAtom37 = new Float32Array(length * 37 * 3);
 
   // The regime the page passes for multimer, verbatim - "it is not defaults,

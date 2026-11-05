@@ -440,12 +440,19 @@ export function foldAf3(execution, call) {
   // 🔴 THE RECYCLED STATE IS ZEROS ON PASS ONE AND IT STILL CONTRIBUTES, so it
   // is a real tensor rather than an absent one: the embedder LayerNorms it and
   // the norm's OFFSET is non-zero, so a pass-one fold that skipped the term is
-  // not the same fold. `Storage.allocate` zero-initialises every texture, so
-  // this costs one texImage2D each and no kernel.
+  // not the same fold.
+  //
+  // 🔴 AND THIS COMMENT USED TO END "`Storage.allocate` zero-initialises every
+  // texture, so this costs one texImage2D each and no kernel", WHICH WAS NOT
+  // TRUE. `texImage2D` with a null pointer leaves the contents UNDEFINED;
+  // Chrome on Metal happens to hand back zeros, so the belief held here and
+  // would not hold on a driver that recycles. `Storage.zeros` writes them, and
+  // `--nan-watch` is what found this - it named `layer-norm:3481x128:fast`
+  // inside the embedder. Three of the four fold drivers had the same fault.
   const singleChannels = hostWeights.trunk.embedder.singleChannels;
-  let previousPair = execution.allocate(
+  let previousPair = execution.zeros(
     tokens * tokens * pairChannels, "af3.recycle.pair");
-  let previousSingle = execution.allocate(
+  let previousSingle = execution.zeros(
     tokens * singleChannels, "af3.recycle.single");
   let trunk;
   for (let pass = 0; pass <= recycles; pass += 1) {

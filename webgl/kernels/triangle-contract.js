@@ -18,6 +18,7 @@
  */
 import { ONE_TARGET, PRELUDE } from "../runtime/execution.js";
 import { CHANNELS_PER_TEXEL } from "../runtime/context.js";
+import { transposeLeading } from "../runtime/transpose.js";
 /** @typedef {import("../runtime/storage.js").Tensor} Tensor */
 
 
@@ -135,6 +136,37 @@ export function triangleContract(execution, call, into) {
   const output = into ?? execution.allocate(elements, "triangle.contract");
   if (output === a || output === b) {
     throw new Error("triangleContract: a fragment shader cannot read the texture it draws into");
+  }
+  // 🔴 THE INCOMING DIRECTION READS A COLUMN AND THAT IS A 69 KiB STRIDE A STEP.
+  // Both directions do the same arithmetic over the same number of texels, and
+  // one of them is four and a half times slower: `outgoing` reads `a[i][k]` as
+  // k advances, a stride of CH4 texels - one kilobyte at 256 channels - while
+  // `incoming` reads `a[k][i]`, a stride of L*CH4, which at 68 tokens and 256
+  // channels is **69 KiB**. Nothing is reused and every fetch is its own cache
+  // line. Measured inside a bioemu2 fold's own profile, at 68 tokens: outgoing
+  // 236 ms a call, incoming **1055**.
+  //
+  // Transposing both operands first turns the column into a row, so the
+  // incoming contraction becomes the outgoing one on swapped pair axes - the
+  // same products in the same k order, which is why the result is BIT-IDENTICAL
+  // and `--no-triangle-transpose` is a control arm rather than a precision
+  // trade. Two transposes are two passes over L^2 x CH floats, which is a tenth
+  // of what the stride costs.
+  if (direction === "incoming" && layout === "channel-minor"
+    && !execution.noTriangleTranspose) {
+    const aT = transposeLeading(execution, { x: a, outer: length, inner: length, channels });
+    const bT = transposeLeading(execution, { x: b, outer: length, inner: length, channels });
+    execution.dispatch({
+      // `outgoing` on the transposed pair reads bT[i][k] * aT[j][k], where
+      // incoming reads b[k][i] * a[k][j] - the same two elements.
+      source: contractSource(length, channels, "outgoing", layout),
+      output,
+      inputs: { aTex: bT, bTex: aT },
+      label: `triangle.contract:incoming-transposed:${length}x${channels}`,
+    });
+    execution.release(aT);
+    execution.release(bT);
+    return output;
   }
   return execution.dispatch({
     source: contractSource(length, channels, direction, layout),

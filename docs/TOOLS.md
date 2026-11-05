@@ -11,9 +11,9 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-519 tools. `tools/fixtures/` is data and is not listed.
+522 tools. `tools/fixtures/` is data and is not listed.
 
-## `tools/gpu/` - the WebGPU lane (274)
+## `tools/gpu/` - the WebGPU lane (277)
 
 Each exports `async function main(device, args)` and is run as
 `node tools/gpu-chrome.mjs tools/gpu/<module>.js [--flags]`.
@@ -53,6 +53,8 @@ Each exports `async function main(device, args)` and is run as
 - **`bench-triangle-project.js`** - The two triangle projection kernels alone, at several register blocks.
 - **`bench-triangle.js`** - Time triangle multiplication at the sizes AF3 actually has to run.
 - **`bench-trunk.js`** - Where a trunk pass's time goes.
+- **`bench-webgl-linear.js`** - What the WebGL2 dense projection costs, at the shapes the models fold at.
+- **`bench-webgl-upload.js`** - What it costs to get weight bytes into a WebGL2 texture, and to read any back.
 - **`bench-webgl2-matmul.js`** - What WebGL2 can ACTUALLY do for a matmul on this device.
 - **`bench-webgl2-tf-matmul.js`** - A WebGL2 matmul through TRANSFORM FEEDBACK, which has four times the fragment path's output budget.
 - **`bench-weights.js`** - How long the AF3 checkpoint takes to reach usable Float32Arrays, and why.
@@ -292,6 +294,7 @@ Each exports `async function main(device, args)` and is run as
 - **`superpose.js`** - Superposing a model on a crystal, and the two numbers that come out of it.
 - **`trunk-opendde.js`** - OpenDDE's trunk, sequence in and contact map out.
 - **`trunk-oracle.js`** - af3-any-model's own trunk seams, compared against ours on the same batch.
+- **`webgl-execution-options.js`** - The WebGL2 backend's diagnostic switches, read off a tool's own arguments.
 
 ## `tools/oracle/` - the reference side (66)
 

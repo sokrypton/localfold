@@ -12,15 +12,21 @@ structure iterations and both confidence heads: **consecutive alpha carbons 3.83
 against the WGSL fold's 57.938, and the worst atom 0.0705 A away** against a measured floor of
 0.0785 A. The MULTIMER folds from `model-multimer` on the same driver, and agrees far more closely
 - **0.0005 A at the worst atom** - because that graph is f32 throughout.
-`tools/gpu/fold-af2-webgl.js` is both folds and both comparisons. What is still missing before this
-could ship is the SPEED: 7.1 s where WebGPU is 0.42 s on this M5, which is not a correctness
-question.
+`tools/gpu/fold-af2-webgl.js` is both folds and both comparisons. The SPEED is **1.25 s where the
+WGSL fold of the same weights is 0.27 s**, a 4.6x gap of which 1.1 s is shader compilation - see
+"Closing the gap".
+
+🔴 **THIS LINE USED TO READ "7.1 s where WebGPU is 0.42 s", A 17x GAP, AND THE 7.1 WAS ALMOST
+CERTAINLY A COLD CLOCK.** The identical command measured **6256 ms on the first run of a session
+and 1446-1465 ms on every run after it**, on an idle Apple GPU that ramps its clocks under load.
+Nothing about the tree changed between those runs. So the first number any of these tools prints
+on a quiet machine is not the number - take the second.
 
 This file began as the spike that answered *can WebGL2 do this work at all*: the two kernels that
 decide it, moved out of `webgpu/kernels/` where they sat with `webgl2` in their names and no
 importer, plus the texture layout and the limit arithmetic they shared by copy. The honest summary
-of the sections below: the numerics are **checked and correct**, the speed is **17x off the WebGPU
-path and was better than anyone here expected per kernel**, and the shapes are **worse**.
+of the sections below: the numerics are **checked and correct**, the speed is **4.6x off the WebGPU
+path on AF2 and 48x on bioemu2** - it was 17x and 246x - and the shapes are **worse**.
 
 🔴 **AND THEY WERE UNGATED FOR AS LONG AS THEY EXISTED, WHICH IS WHY THE FIRST THING THIS TREE
 GOT WAS A DIFFERENTIAL.** AGENTS.md requires every GPU kernel to have "a deterministic differential
@@ -538,8 +544,9 @@ node tools/gpu-chrome.mjs tools/gpu/fold-esmfold2-webgl.js \
   --length=75 --tower-blocks=36 --trunk-blocks=24 --loops=3 --steps=15
 ```
 
-Re-measured at this commit: **3.637 A, pTM 0.4133, 126 contacts, 253 s** - the line above, four
-digits of it. Leave a flag out and the tool folds a prefix of the model and the geometry gate rightly
+Re-measured at this commit: **pTM 0.4133, 126 contacts, 67.7 s** - the same answer as the 253 s
+line above, four digits of it, **3.7x faster** since the row-blocked projection and the split
+contraction landed ("Closing the gap"). Leave a flag out and the tool folds a prefix of the model and the geometry gate rightly
 calls it "not a chain": `--loops=0 --trunk-blocks=4` (the defaults) reads **2.478 A** at the full
 tower, and a 3-block tower reads 3.292. All three of those were read as a REGRESSION here before the
 flags were checked, twice from a log line that had truncated `--tower-blocks=36` to `3`. A number
@@ -619,6 +626,141 @@ without WebGPU are older machines, and no speed here has been measured on one. O
 exactly where transform feedback gets flaky, so the 47.8% is the figure most at risk of not
 transferring - and it is the figure the whole case rests on. The two kernels have now been run on a
 second machine, and it is not an old one either: an M5 through ANGLE's Metal backend.
+
+## Closing the gap, and the two instruments that lied about where it was
+
+The question was whether the tricks in `sokrypton/rfd4-proteina-webgpu`'s own WebGL2 port close the
+distance to WGSL here. It has three: a blocked matmul into several render targets, operands as
+float16 packed eight to a texel, and narrow texture rows (384 texels, where this tree uses 2048).
+The first is worth **6.3x to 7.9x** on the projections bioemu2 is made of and is taken below. The
+second is untaken and is the largest thing left. The third is **untested here** - `TEXTURE_WIDTH`
+is a one-line change and nobody has run it; their own measurement is 2.35 s at 3072 texels against
+1.47 at 384, so it is worth asking.
+
+And the two biggest wins were not on that list at all - one of them a kernel doing sixty-four times
+the work it needed to - while the first two attempts to find them both reported confident wrong
+numbers.
+
+🔴 **A FRAGMENT PROFILE ON THIS API MEASURES THE INSTRUMENT.** WebGL2 has no timestamp query, so
+`Execution.profile` times a kernel by WAITING for it - a one-texel `readPixels` of its output,
+which cannot return until that draw has run. Over an AF2 fold's 5,187 draws the wait is most of
+what it measures: the profiled fold is **3862 ms where the fold is 1410**, and every label's share
+came out within a few points of its share of the DISPATCH COUNT. `linear` read 49.7% for that
+reason and not because it is half the arithmetic.
+
+🔴 **AND THE OBVIOUS FIX IS DEFEATED BY HIDDEN-SURFACE REMOVAL.** `Execution.doubleLabels` issues
+every matching draw twice: the kernels are pure, so nothing it computes changes, and the fold's
+wall should grow by exactly that family's GPU time. It grows by **2%** on a bioemu2 fold - and the
+same fold with `--skip-draws`, which issues no draws at all, is **895 ms against 28.7 s**. The
+draws are 97% of that fold and doubling them is free, because an Apple GPU is tile-based and does
+hidden-surface removal: the same full-viewport triangle drawn twice into one target with no read
+between has its earlier fragments discarded before they are shaded. The same trap had
+`tools/gpu/bench-webgl-linear.js` reading `linear.block:576x896x1792` at 11.25 ms a call where the
+fold's own profile says 87 - a factor of eight, which was the iteration count. **A ring of distinct
+outputs is the fix**, and `--skip-draws` is the arm that settles any argument between the other
+two.
+
+### What the gap turned out to be
+
+**A big projection is bound by streaming its weight from DRAM, and the model is exact.** bioemu2's
+atom projection is 576 rows x 896 in x 1792 out. One output texel a fragment reads the whole
+6.4 MiB weight once per ROW - 3.7 GB - and this context moves about 10 GB/s: 438 ms measured
+against 370 predicted. A block of R rows reads it once per R rows, so both the traffic and the time
+divide by R. Measured at R = 8, which is `MAX_DRAW_BUFFERS` here:
+
+| projection | one texel a fragment | 8 rows a fragment | |
+|---|---:|---:|---:|
+| bioemu2 atom 576 x 896 -> 1792 | 444.8 ms | 68.3 ms | **6.5x** |
+| bioemu2 atom 576 x 768 -> 1920 | 423.9 | 67.4 | **6.3x** |
+| bioemu2 token 68 x 768 -> 4608 | 158.3 | 22.7 | **7.0x** |
+| bioemu2 token 68 x 3072 -> 768 | 56.7 | 7.2 | **7.9x** |
+| af2 pair 3481 x 128 -> 128, `[out][in]` | 2.16 | 0.86 | 2.5x |
+| af2 pair 3481 x 128 -> 128, `[in][out]` | 0.65 | 1.06 | **0.6x** |
+
+🔴 **AND THE LAST ROW IS WHY `blockedApplies` IS A MEASUREMENT AND NOT A RULE OF THUMB.** The gain
+is however much weight traffic there is to divide, and the pair track's 128 x 128 weight is 64 KiB
+- it sits in cache however many times it is read, so there is nothing to save and the repack pass
+is pure cost. At that size the `[in][out]` layout is repeatably **0.44x to 0.65x** and keeps the
+one-texel kernel; `[out][in]` at the same size still wins. Nothing about the geometry decides this;
+only the weight's size does.
+
+**AF3's triangle contraction was doing sixty-four times the work it needed to.** Its fragment owns
+four channels of one pair, the centre norm needs that pair's whole channel axis, so the fragment
+contracted ALL 256 channels and kept four - and the 64 fragments of one pair each contracted the
+same 256 channels again. That is `C * L * 2` = 34,816 texel reads a fragment over 295,936
+fragments, **10.3 billion fetches**, which at ~10 G fetches a second is the **1055 ms a call** a
+bioemu2 fold's profile measures: the most expensive kernel in that fold, 35% of it. The kernel's
+own comment defended the fused form as what let "the centre norm see the channel axis at all
+without a second pass over a channel-major intermediate" - and the second pass costs one read and
+one write per texel. Split, the contraction writes a pair-major intermediate and the centre norm
+reads it: bit-identical, because the statistics accumulate in the same order, and
+`--no-triangle-split` is the control arm. The bioemu2 trunk-and-distogram phase goes **10.9 s to
+3.6 s**.
+
+**A baked shape is a shader, and a shader is a compile.** Every kernel here is generated with its
+sizes as `const int`, so `linear` at 576x896x1792 and `linear` at 68x768x3072 were two programs -
+and bioemu2 has eleven distinct projection shapes, so it compiled **168**. With the sizes in
+uniforms one program serves every size and only the STRUCTURE forks the source: **109** programs
+and `programMs` from 3927 ms to 478, at no measurable cost to the kernels, which are fetch-bound
+rather than issue-bound.
+
+🔴 **AND IT MOVED THE bioemu2 FOLD BY NOTHING, WHICH IS WORTH RECORDING BECAUSE IT WAS THE
+SUSPECT.** Compilation looked like the answer precisely because the draw-doubling instrument said
+the GPU was 2%; once `--skip-draws` put the draws at 97%, 59 fewer compiles was below noise. It is
+where the SMALL models' time is, though: **1122 ms of an AF2 fold's 1400 is its 120 programs**, so
+a first fold there is a compile queue and nothing else - the same thing docs/PERF.md records of the
+WGSL side.
+
+**`getError` after every draw is a synchronous round trip** - 4% of an AF2 fold - and
+`checkFramebufferStatus` per dispatch is another. A framebuffer per attachment SET, bound rather
+than rebuilt, removes the second; a fold reuses 65 of them because the textures are pooled.
+
+### What it is worth, end to end
+
+Every fold is the same job, the same seed and the same settings either side; `--no-linear-block` and
+`--no-triangle-split` are the control arms, and every one of the 47 stage gates is green both ways.
+
+| fold | before | after | |
+|---|---:|---:|---:|
+| bioemu2, 6MRR 68 tokens, 4 passes, 20 steps | 968 s | **186 s** | **5.2x** |
+| ESMFold2, 75 residues, 36-block tower, 3 loops, 15 steps | 253 s | **67.7 s** | **3.7x** |
+| ESMFold2 at the tool's defaults | 2.82 s | **1.44 s** | 2.0x |
+| AF2 monomer, 59 residues | 1.40 s | **1.25 s** | 1.1x |
+| bioemu2's own distogram phase (the trunk's queued work) | 10.9 s | **2.8 s** | 3.9x |
+
+🔴 **AF2 MOVES LEAST BECAUSE IT IS NOT DOING THE ARITHMETIC.** Its pair weights are 64 KiB and sit
+in cache, so there is no traffic to divide, and 1122 ms of its 1400 is shader compilation. The
+models that gained are the ones with big weights - which is the same sentence from the other end.
+
+### A texture pool, and the bug it found
+
+Pooling released textures by rectangle is worth **1%** of an AF2 fold and costs **4% more peak**
+(465.9 MiB to 483.8), because a pooled texture is held rather than deleted - texture creation is
+simply not what this backend waits for. On the fold that matters it is worse on both counts:
+bioemu2 at 68 tokens is **185.8 s and 1656 MiB without it against 188.5 s and 2158 MiB with**. So
+it is **off by default** and `--pool` turns it on, for a driver that allocates more slowly than
+this one.
+
+It is kept at all because it is an INSTRUMENT, and it found a real defect in TWO models the first
+times it ran: the AF2 fold's answer changed, pLDDT 57.941 to 54.774, and bioemu2's TM moved 0.9083
+to 0.9081. That is a
+kernel reading texels nothing wrote, and `texImage2D` with a null pointer leaves the contents
+UNDEFINED: Chrome on Metal happens to hand back zeros, and this backend's whole audience is drivers
+nobody has tested. `Storage.fillFresh` fills every fresh texture with NaN and `Execution.nanWatch`
+reads every output back and refuses at the first non-finite value, which named it in one run: the
+first recycle pass has no previous activations and `webgl/af2/model/fold.js` expressed that by
+ALLOCATING the three tensors and handing them to the embedder. `Storage.zeros` is what a caller
+that wants zeros asks for now.
+
+🔴 **AND THE SECOND MODEL HAD THE SAME FAULT IN THE SAME SHAPE.** bioemu2's first trunk pass has no
+previous activations either, and `webgl/bioemu2/model/fold.js` allocated its `z_prev` and `s_prev`
+and handed them to a pass that LayerNorms both - `--nan-watch` named `layer-norm:68x384` inside the
+first pass. Two models, one habit: a first recycle is where this mistake lives, so the other two
+drivers are checked under the same arm.
+
+🔴 **A BISECT OVER WHICH ALLOCATION LABEL MAY REUSE A TEXTURE FOUND NOTHING**, because every label
+was clean on its own and only the whole set together moved the answer - an allocation-order
+coincidence, not a property of any one kernel. The NaN fill is what made the question local.
 
 ## Verified
 
@@ -774,19 +916,30 @@ is the same WGSL path in the same page.
 blocks, 20 steps, seed 1, against the 6MRR crystal:
 
 ```
-                     WebGL2        WGSL (same job, same seed, same steps)
-rmsd / TM            1.595 / 0.9083    1.595 / 0.9083
-CA-CA median         3.8540558         3.8539739      (a relative 2.1e-5)
-worst CA-CA          3.904             3.904
-bond rms  main       0.042             0.042
-          side       0.056             0.056
-          peptide    0.028             0.028
-contacts (P > 0.5)   201
-wall                 968 s             3.9 s
-  trunk              277.7 s           2.3 s
-  20 denoiser calls  658 s             1.2 s
-weights/activations  1656 MiB peak     815 MiB weights + 135 activations
+                     WebGL2 (ported)  WebGL2 (now)  WGSL (same job, seed, steps)
+rmsd / TM            1.595 / 0.9083   1.595 / 0.9081   1.595 / 0.9083
+CA-CA median         3.8540558        3.8539638        3.8539739
+                     (rel 2.1e-5)     (rel 2.6e-6)
+worst CA-CA          3.904            3.905            3.904
+bond rms  main       0.042            0.042            0.042
+          side       0.056            0.056            0.056
+          peptide    0.028            0.029            0.028
+contacts (P > 0.5)   201              209
+wall                 968 s            188 s            3.9 s
+  trunk              277.7 s          61.2 s           2.3 s
+  distogram                           19.8 s
+  20 denoiser calls  658 s            106.7 s          1.2 s
+weights/activations  1656 MiB peak    2158 MiB peak    815 MiB weights + 135 activations
 ```
+
+🔴 **968 s TO 188 s, AND THE STRUCTURE IS THE SAME STRUCTURE.** The 5.1x is the row-blocked
+projection and the split contraction from "Closing the gap" above; the fold lands on the same
+rmsd to three digits and its CA-CA median moves CLOSER to the WGSL fold's, 2.1e-5 relative to
+**2.6e-6**. What did move is the contact COUNT, 201 to 209: that is a threshold on the distogram
+head's probabilities, the head is one of the projections whose sum is now shaped differently for
+the compiler to fuse, and a pair either side of P = 0.5 crosses it. The peak is **up 30%** - the
+blocked path holds eight row planes while it runs and the split contraction holds its intermediate
+- which on this backend's intended audience is a real price and is why both have a control arm.
 
 🔴 **THE SAME SEED THROUGH BOTH BACKENDS LANDS ON THE SAME STRUCTURE, which makes this a WHOLE-FOLD
 DIFFERENTIAL and not a plausibility check.** The sampler's draws come from one generator consumed in
@@ -796,19 +949,24 @@ relative. A geometry floor would have accepted a port that was wrong by 10%; thi
 also why the AF3-style "worst atom" figure is not quoted here: it needs both PDBs, and the WebGL2
 side is sixteen minutes a fold.
 
-🔴 **AND IT IS 246x THE WGSL FOLD, WHICH IS THE HONEST NUMBER AND NOT A TUNING GAP.** The trunk is
-121x and the diffusion 560x, and the diffusion is where the asymmetry lives: the WGSL denoiser
+🔴 **AND IT IS 48x THE WGSL FOLD - WAS 246x - WHICH IS STILL NOT A TUNING GAP.** The trunk is 27x
+now and the diffusion 89x, and the diffusion is where the asymmetry lives: the WGSL denoiser
 batches S samples through one compiled program and halves its weights, and this one carries 1.6 GiB
-of f32 because WebGL2 has no f16 without an extension nobody can rely on. 32.9 s a denoiser call at
-573 atoms is also why the tool's default is 20 steps where the model's is 200 - at 200 it is 1.8
-hours - and why a fold at 20 steps is a plumbing answer that happens to score well rather than a
-converged sample.
+of f32 because WebGL2 has no f16 without an extension nobody can rely on. **Halving those bytes is
+the next multiplicative factor and it is the one trick from `sokrypton/rfd4-proteina-webgpu` that
+has NOT been taken here**: a big projection's time is its weight traffic divided by the rows a
+fragment owns (see "Closing the gap"), and float16 operands packed eight to an RGBA32UI texel halve
+the traffic and the fetch count both. 5.3 s a denoiser call at 573 atoms - it was 32.9 - is also why
+the tool's default is 20 steps where the model's is 200, and why a fold at 20 steps is a plumbing
+answer that happens to score well rather than a converged sample.
 
 🔴 **AND THE DEFAULT ORDER OF THE WEIGHT UPLOADS IS LOAD-BEARING.** `structure_module` is 424.6 M of
 the checkpoint's 511.7 M parameters - 1.62 GiB in f32, ~101 MiB a layer over 16 layers - where the
 trunk's 52 pair blocks are 288 MiB. The driver releases the trunk's weights before it reads the
 denoiser's, which costs nothing because no sampler step touches the trunk, and keeps the peak at
-**1656 MiB** instead of 2.3 GiB.
+**1656 MiB** instead of 2.3 GiB. (The peak is **2158 MiB** since the row block and the split
+contraction landed, for the reason the table above gives: both hold an intermediate while they run.
+The release ordering is what stops it being 3 GiB.)
 
 🔴 **AND THE COMPOSITION FOUND A BUG FIVE STAGE GATES COULD NOT**, which is the same argument the AF3
 driver made: `concatSource` had only an ALIGNED path, so the real single conditioning - `[s_trunk |
@@ -832,7 +990,8 @@ coordinates.
 SENTENCE HAS GONE STALE ONCE ALREADY.** It said "`webgpu/` is 250 `@compute` entry points. Two are
 ported", which was true when two were; all four models in the goal fold now, and this tree does not
 mirror those entry points one for one - a fragment shader replaces whole families of them, and one
-68-token bioemu2 fold compiles **144** programs in total. What the three measurements below decide is
+68-token bioemu2 fold compiles **110** programs in total (it was 144, then 168 as more shapes
+arrived, and the projection's shapes are uniforms now - see "Closing the gap"). What the three measurements below decide is
 no longer whether to start but whether to SHIP, and all three are still open:
 
 1. **Coverage.** What fraction of the no-WebGPU population actually has WebGL2 *and*
@@ -875,7 +1034,17 @@ node tools/gpu-chrome.mjs tools/gpu/probe-webgl2-tf.js         the smallest tran
 node tools/gpu-chrome.mjs tools/gpu/bench-webgl2-matmul.js     the fragment path: fetch-rate bound, intensity capped at 21.3
 node tools/gpu-chrome.mjs tools/gpu/bench-webgl2-tf-matmul.js  the vertex path: 2.2x, and where it stops being fetch-bound
 node tools/gpu-chrome.mjs tools/gpu/check-webgl-kernels.js     both kernels against independent CPU references; --falsify
+node tools/gpu-chrome.mjs tools/gpu/bench-webgl-linear.js      the dense projection at the shapes four models fold at, one texel a fragment against eight rows
+node tools/gpu-chrome.mjs tools/gpu/bench-webgl-upload.js      what weight bytes cost on the way into a texture, and a readback the other way
 ```
+
+Every fold driver here takes the diagnostic switches in `tools/gpu/webgl-execution-options.js`,
+which is where they are documented: `--skip-draws` (everything but the drawing - the arm that
+settles what the GPU is costing), `--double=<regex>` (a family's draws issued twice; **read its
+header before trusting it**), `--nan-watch` (names the kernel that reads a texel nothing wrote),
+`--host` (where the host time inside a dispatch goes), `--no-pool`, `--no-check-errors`, and the
+three control arms for the optimisations above: `--no-linear-block`, `--no-triangle-split`,
+`--no-triangle-transpose`.
 
 ## Making it selectable
 
@@ -884,8 +1053,9 @@ and the page requires WebGPU rather than choosing a backend.
 
 🔴 **THE PRECONDITION IS NOW MET AND THE DECISION IS STILL NOT AUTOMATIC.** This section used to say
 neither line should move "before a fold actually runs here", and one does. What has not been
-settled is whether a backend **17x slower** should be offered: a 59-residue fold is 7.1 s against
-0.42 s, and a 255-residue one has not been measured at all. A visitor with no WebGPU gets a fold
+settled is whether a backend **4.6x slower on AF2 and 48x on bioemu2** should be offered: a
+59-residue AF2 fold is 1.25 s against 0.27 s, 68-token bioemu2 is 188 s against 3.9 s, and a
+255-residue fold has not been measured at all. A visitor with no WebGPU gets a fold
 instead of a refusal, which is the whole point of the tree; a visitor who waits four minutes for
 something the other path does in fifteen seconds may not thank anyone. The multimer is also still
 absent, so the page would have to offer a monomer-only backend. Those are product questions, so

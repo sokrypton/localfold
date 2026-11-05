@@ -111,12 +111,18 @@ void main() {
 /**
  * The contraction and the centre norm in one draw, writing pair-major.
  *
- * A fragment owns four consecutive CHANNELS of one pair, so it needs the whole
- * channel axis of that pair to normalise - which means contracting all
- * `channels` of it. That is `channels * length` multiply-adds a fragment where
- * the contraction alone would be `4 * length`, and it is what lets the centre
- * norm see the channel axis at all without a second pass over a channel-major
- * intermediate.
+ * 🔴 KEPT ONLY AS THE CONTROL ARM FOR `splitContractSource` BELOW, BECAUSE IT
+ * DOES SIXTY-FOUR TIMES THE WORK IT NEEDS TO. A fragment owns four consecutive
+ * CHANNELS of one pair and the centre norm needs that pair's whole channel
+ * axis, so this fragment contracts ALL `channels` of the pair and keeps four -
+ * and the sixty-four fragments of one pair each contract the same 256 channels
+ * again. At 68 tokens and 256 channels that is `C * L * 2` = 34,816 texel reads
+ * a fragment over 295,936 fragments, **10.3 billion fetches**, which at this
+ * context's ~10 G fetches a second is the 1055 ms a call a bioemu2 fold's own
+ * profile measures - the single most expensive kernel in that fold, 35% of it.
+ * The comment this replaces said the fused form was what let "the centre norm
+ * see the channel axis at all without a second pass over a channel-major
+ * intermediate", and the second pass costs one read and one write per texel.
  */
 export const contractSource = (length, channels, direction, divideByLength) => `${PRELUDE}${ONE_TARGET}
 const int L = ${length};
@@ -156,6 +162,84 @@ void main() {
   for (int g = 0; g < C4; ++g) {
     vec4 v = vec4(contract(g * 4, i, j), contract(g * 4 + 1, i, j),
       contract(g * 4 + 2, i, j), contract(g * 4 + 3, i, j));
+    total += v.x + v.y + v.z + v.w;
+    totalSquares += dot(v, v);
+    if (g == group) mine = v;
+  }
+  // AF3's fast variance, as everywhere else in this trunk.
+  float mean = total / float(C);
+  float inverseStd = inversesqrt(totalSquares / float(C) - mean * mean + epsilon);
+  result = (mine - mean) * inverseStd * fetch4(scaleTex, group) + fetch4(offsetTex, group);
+}`;
+
+/**
+ * The contraction alone: a fragment owns four channels of one pair and
+ * contracts exactly those four.
+ *
+ * 🔴 FOUR CONTRACTIONS A FRAGMENT RATHER THAN `channels` OF THEM, which is the
+ * whole saving - 544 texel reads where the fused kernel does 34,816, at 68
+ * tokens and 256 channels. The sum over `k` is in the same order and the same
+ * products, so the intermediate is exactly what the fused kernel computed and
+ * then threw away sixty-three sixty-fourths of.
+ */
+export const splitContractSource = (length, channels, direction, divideByLength) => `${PRELUDE}${ONE_TARGET}
+const int L = ${length};
+const int PAIRS = ${length * length};
+const int C4 = ${channels / 4};
+const int ELEMENTS = ${length * length * channels};
+uniform sampler2D aTex;
+uniform sampler2D bTex;
+
+float contract(int c, int i, int j) {
+  float total = 0.0;
+  int plane = c * PAIRS;
+  for (int k = 0; k < L; ++k) {
+    ${direction === "outgoing"
+    ? "total += fetch1(aTex, plane + i * L + k) * fetch1(bTex, plane + j * L + k);"
+    : "total += fetch1(aTex, plane + k * L + j) * fetch1(bTex, plane + k * L + i);"}
+  }
+  return ${divideByLength ? "total / float(L)" : "total"};
+}
+
+void main() {
+  int texel = linearTexel();
+  if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
+  int group = texel % C4;
+  int pair = texel / C4;
+  int i = pair / L;
+  int j = pair - i * L;
+  int c = group * 4;
+  result = vec4(contract(c, i, j), contract(c + 1, i, j),
+    contract(c + 2, i, j), contract(c + 3, i, j));
+}`;
+
+/**
+ * The centre norm over an already-contracted pair-major tensor.
+ *
+ * The statistics are accumulated group by group and then component by
+ * component, which is the order the fused kernel used - so the mean, the fast
+ * variance and the result are BIT-IDENTICAL and `--no-triangle-split` prices a
+ * pass count rather than a precision.
+ */
+export const centreNormSource = (length, channels) => `${PRELUDE}${ONE_TARGET}
+const int C = ${channels};
+const int C4 = ${channels / 4};
+const int ELEMENTS = ${length * length * channels};
+uniform sampler2D xTex;
+uniform sampler2D scaleTex;
+uniform sampler2D offsetTex;
+uniform float epsilon;
+
+void main() {
+  int texel = linearTexel();
+  if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
+  int group = texel % C4;
+  int base = texel - group;
+  float total = 0.0;
+  float totalSquares = 0.0;
+  vec4 mine = vec4(0.0);
+  for (int g = 0; g < C4; ++g) {
+    vec4 v = fetch4(xTex, base + g);
     total += v.x + v.y + v.z + v.w;
     totalSquares += dot(v, v);
     if (g == group) mine = v;
@@ -232,16 +316,37 @@ export function triangleMultiplication(execution, call) {
   execution.release(gate);
 
   const centred = execution.allocate(pairs * channels, "af3.triangle.centred");
-  execution.dispatch({
-    source: contractSource(length, channels, direction, divideByLength),
-    output: centred,
-    inputs: {
-      aTex: a, bTex: b, scaleTex: w.centerNormScale, offsetTex: w.centerNormOffset,
-    },
-    floats: { epsilon },
-    label: `af3.triangle.contract:${direction}:${length}x${channels}`
-      + `${divideByLength ? ":over-length" : ""}`,
-  });
+  if (execution.noTriangleSplit) {
+    execution.dispatch({
+      source: contractSource(length, channels, direction, divideByLength),
+      output: centred,
+      inputs: {
+        aTex: a, bTex: b, scaleTex: w.centerNormScale, offsetTex: w.centerNormOffset,
+      },
+      floats: { epsilon },
+      label: `af3.triangle.contract:${direction}:${length}x${channels}`
+        + `${divideByLength ? ":over-length" : ""}`,
+    });
+  } else {
+    const contracted = execution.allocate(pairs * channels, "af3.triangle.contracted");
+    execution.dispatch({
+      source: splitContractSource(length, channels, direction, divideByLength),
+      output: contracted,
+      inputs: { aTex: a, bTex: b },
+      label: `af3.triangle.contract-only:${direction}:${length}x${channels}`
+        + `${divideByLength ? ":over-length" : ""}`,
+    });
+    execution.dispatch({
+      source: centreNormSource(length, channels),
+      output: centred,
+      inputs: {
+        xTex: contracted, scaleTex: w.centerNormScale, offsetTex: w.centerNormOffset,
+      },
+      floats: { epsilon },
+      label: `af3.triangle.centre-norm:${length}x${channels}`,
+    });
+    execution.release(contracted);
+  }
   execution.release(a);
   execution.release(b);
 

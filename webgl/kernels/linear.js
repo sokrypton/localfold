@@ -31,7 +31,7 @@
  * before optimizing performance" - and the geometry is the first thing to
  * revisit once a block folds.
  */
-import { ONE_TARGET, PRELUDE } from "../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, targetDeclarations } from "../runtime/execution.js";
 /** @typedef {import("../runtime/storage.js").Tensor} Tensor */
 
 
@@ -43,6 +43,48 @@ const ACTIVATIONS = {
 
 /** `half4` is in the prelude; see `webgl/runtime/execution.js` for why. */
 const ROUND_HALF = (expression) => `half4(${expression})`;
+
+/**
+ * The shapes, as UNIFORMS rather than baked constants.
+ *
+ * 🔴 A BAKED SHAPE IS A SHADER, AND A SHADER IS A COMPILE. Every kernel here is
+ * generated with its sizes as `const int`, so `linear` at 576x896x1792 and
+ * `linear` at 68x768x3072 were two source texts and two programs - and a
+ * bioemu2 fold has ELEVEN distinct projection shapes, so it compiled **168**
+ * programs where it now compiles 109, and `programMs` went 3927 ms to 478.
+ *
+ * 🔴 AND THAT BOUGHT NOTHING ON THAT FOLD, WHICH IS WHY IT IS RECORDED AS A
+ * SMALL RESULT. Compilation was the suspect for bioemu2's 28 s because the
+ * draw-doubling instrument said the GPU was 2% - and that instrument was wrong
+ * (`Execution.doubleLabels`); the draws are 97%, so removing 59 compiles moved
+ * the fold by less than noise. It is still worth having, and it is worth
+ * everything on the small models: **1122 ms of an AF2 fold's 1400 is its 120
+ * programs**, so a first fold there is a compile queue and nothing else.
+ *
+ * With the sizes in uniforms one program serves every size, and only the
+ * STRUCTURE - the weight layout, the activation, whether there is a bias,
+ * whether a width is ragged - still forks the source. The cost is that the k
+ * loop's bound is no longer a constant, so the compiler cannot unroll it;
+ * tools/gpu/bench-webgl-linear.js says that costs nothing measurable, because
+ * these kernels are fetch-bound rather than issue-bound.
+ *
+ * `IN4` and `OUT4` are passed rather than computed in the shader: they are
+ * needed per fragment and an integer division is not free.
+ */
+const SHAPE_UNIFORMS = `uniform int ROWS;
+uniform int IN;
+uniform int IN4;
+uniform int OUT;
+uniform int OUT4;`;
+
+/** The shape uniforms' values, as `optionalInts` (a branch may not read one). */
+export const shapeInts = (rows, inChannels, outChannels) => ({
+  ROWS: rows,
+  IN: inChannels,
+  IN4: Math.ceil(inChannels / 4),
+  OUT: outChannels,
+  OUT4: Math.ceil(outChannels / 4),
+});
 
 export const linearSource = (
   rows, inChannels, outChannels, activation, useBias, weightLayout, roundHalf = false,
@@ -123,11 +165,7 @@ export const linearSource = (
   }`;
 
   return `${PRELUDE}${ONE_TARGET}
-const int ROWS = ${rows};
-const int IN = ${inChannels};
-const int IN4 = ${Math.ceil(inChannels / 4)};
-const int OUT = ${outChannels};
-const int OUT4 = ${Math.ceil(outChannels / 4)};
+${SHAPE_UNIFORMS}
 uniform sampler2D xTex;
 uniform sampler2D weightTex;
 ${useBias ? "uniform sampler2D biasTex;" : ""}
@@ -151,6 +189,173 @@ ${raggedInput
   result = ${roundHalf ? ROUND_HALF(ACTIVATIONS[activation]) : ACTIVATIONS[activation]};
 }`;
 };
+
+
+/**
+ * The BLOCKED projection: one fragment computes `R` rows x four output
+ * channels, writing one render target per row.
+ *
+ * 🔴 THIS IS THE GEOMETRY THE HEADER ABOVE SAYS TO REVISIT, AND IT IS WORTH
+ * FIVE TIMES THE ARITHMETIC INTENSITY. A fragment that owns four outputs of ONE
+ * row reads five texels for sixteen multiply-adds - 3.2 flops a fetch, where
+ * docs/A100.md measures the fragment path saturating at 21.3. A fragment that
+ * owns four rows of the same four outputs reads the SAME four weight texels
+ * once and four input texels against them: **eight fetches for sixty-four
+ * multiply-adds**, 16 flops a fetch, because the weight read is amortised over
+ * the row block instead of being repeated for every row.
+ *
+ * The four results cannot share a texel - they belong to four different rows of
+ * the output - so they go to four render targets, and a second pass interleaves
+ * them back into `[rows][outChannels]`. `MAX_DRAW_BUFFERS` is at least four
+ * everywhere WebGL2 is, and eight here.
+ *
+ * 🔴 AND THE REPACK IS NOT FREE BUT IT IS CHEAP. It is one texel read and one
+ * texel write per output texel, against the matmul's `IN4 * 2` reads for the
+ * same texel, so at the narrowest width any model here uses (in = 32) it is 6%
+ * of the fetches and at in = 128 it is 1.5%. A consumer that could read the
+ * four planes directly would save it; none here can, and a plane layout that
+ * leaks into every caller is how the reference port's `linear` grew six return
+ * shapes.
+ */
+/**
+ * Four, which is the floor `MAX_DRAW_BUFFERS` is guaranteed to reach wherever
+ * WebGL2 is, and the default for a source generated without an `Execution` to
+ * ask. `blockRowsFor` below is what a dispatch actually uses.
+ */
+export const BLOCK_ROWS = 4;
+
+/**
+ * Rows a fragment owns, which is a WEIGHT TRAFFIC divisor and nothing else.
+ *
+ * 🔴 A BIG PROJECTION HERE IS BOUND BY STREAMING ITS WEIGHT FROM DRAM, AND THE
+ * ARITHMETIC MODEL IS EXACT. bioemu2's atom projection is 576 rows x 896 in x
+ * 1792 out: one output texel a fragment reads the whole 6.4 MiB weight once per
+ * ROW, which is 3.7 GB, and this context streams about 10 GB/s - 438 ms
+ * measured against 370 predicted. A block of R rows reads it once per R rows,
+ * so the traffic, and the time, divide by R: at R = 4 the same projection is
+ * 92.3 ms where the model says 92. Nothing else about the kernel matters at
+ * this size.
+ *
+ * So R is as large as the render targets allow. `MAX_DRAW_BUFFERS` is at least
+ * four wherever WebGL2 is and eight on this context, and a fragment writes one
+ * texel of each - the planes are interleaved back by `blockRepackSource`.
+ */
+export const blockRowsFor = (execution) => Math.min(8, execution.maxDrawBuffers);
+
+/**
+ * Whether the row block is worth its repack, measured by
+ * tools/gpu/bench-webgl-linear.js at the shapes four models fold at.
+ *
+ * `rows >= 64` because a block of R rows costs a 1/R of the fragments, and
+ * below that there are too few left to fill the device; the widths must both be
+ * multiples of four or a texel straddles two rows and the shared weight read is
+ * not shared.
+ *
+ * 🔴 AND ONE CASE IS A LOSS, WHICH IS WHY THIS IS A MEASUREMENT AND NOT A RULE
+ * OF THUMB. The gain tracks how much weight DRAM traffic there is to divide, so
+ * it runs from **6.2x to 8.4x** on bioemu2's atom and token projections (1.5 to
+ * 3.5 million weight floats, streamed once per row block) down to a wash on the
+ * pair track, whose 128 x 128 weight is 64 KiB and sits in cache however many
+ * times it is read. At that size the `[in][out]` layout is **0.44x to 0.65x**,
+ * repeatably: there is no traffic to save and the repack is pure cost. So a
+ * cache-resident weight read in-major keeps the one-texel kernel. `[out][in]`
+ * at the same size still wins (1.2x to 2.5x), which is why the test is not just
+ * on size.
+ */
+export const CACHE_RESIDENT_WEIGHT_FLOATS = 65536;
+
+export const blockedApplies = (rows, inChannels, outChannels, weightLayout = "out-major") => (
+  rows >= 64 && inChannels % 4 === 0 && outChannels % 4 === 0
+  && (weightLayout === "out-major"
+    || inChannels * outChannels >= CACHE_RESIDENT_WEIGHT_FLOATS));
+
+export const blockedSource = (
+  rows, inChannels, outChannels, activation, useBias, weightLayout, roundHalf,
+  blockRows = BLOCK_ROWS,
+) => {
+  const each = (template) => Array.from(
+    { length: blockRows }, (_, i) => template(i)).join("\n");
+  // 🔴 UNROLLED BY HAND, BECAUSE AN INDEXED LOCAL ARRAY COST 7x. The first
+  // version of this kernel held its accumulators in `vec4 acc[4]` and its row
+  // offsets in `int xBase[4]`, written against `for (int i = 0; i < 4; ++i)` -
+  // the shape the arithmetic is naturally in, and the shape the reference port
+  // this geometry comes from uses. Measured through
+  // tools/gpu/bench-webgl-linear.js it ran at **7.3 G fetches a second against
+  // the device's 110**: this compiler puts an array that any loop indexes into
+  // scratch memory rather than registers, so every accumulate became a
+  // round trip to memory and the kernel was 5-7x SLOWER than the one-texel path
+  // it was meant to beat. Named variables are the same arithmetic and
+  // measure 2.4x FASTER than that path. A loop whose bound is a constant is not
+  // a promise that the compiler will unroll it.
+  const accumulate = weightLayout === "in-major"
+    // `[in][out]`: four weight texels, one per input channel of this k group,
+    // each already holding the four outputs this fragment owns - and all four
+    // ROWS want the same four, which is the whole saving.
+    ? `  for (int k = 0; k < IN4; ++k) {
+    int wRow = (k * 4) * OUT4 + group;
+    vec4 wa = fetch4(weightTex, wRow);
+    vec4 wb = fetch4(weightTex, wRow + OUT4);
+    vec4 wc = fetch4(weightTex, wRow + 2 * OUT4);
+    vec4 wd = fetch4(weightTex, wRow + 3 * OUT4);
+${each((i) => `    vec4 x${i} = fetch4(xTex, xBase${i} + k);
+    acc${i} += x${i}.x * wa + x${i}.y * wb + x${i}.z * wc + x${i}.w * wd;`)}
+  }`
+    // `[out][in]`: four weight rows of this output group, one texel each per k
+    // group, dotted against each row's input texel.
+    : `  int wBase = group * 4 * IN4;
+  for (int k = 0; k < IN4; ++k) {
+    vec4 w0 = fetch4(weightTex, wBase + k);
+    vec4 w1 = fetch4(weightTex, wBase + IN4 + k);
+    vec4 w2 = fetch4(weightTex, wBase + 2 * IN4 + k);
+    vec4 w3 = fetch4(weightTex, wBase + 3 * IN4 + k);
+${each((i) => `    vec4 x${i} = fetch4(xTex, xBase${i} + k);
+    acc${i} += vec4(dot(x${i}, w0), dot(x${i}, w1), dot(x${i}, w2), dot(x${i}, w3));`)}
+  }`;
+  const value = (i) => {
+    const sum = useBias ? `acc${i} + fetch4(biasTex, group)` : `acc${i}`;
+    const activated = ACTIVATIONS[activation].replace(/\bvalue\b/g, `(${sum})`);
+    return roundHalf ? `half4(${activated})` : activated;
+  };
+  return `${PRELUDE}${targetDeclarations(blockRows)}
+${SHAPE_UNIFORMS}
+uniform int RQ;
+uniform sampler2D xTex;
+uniform sampler2D weightTex;
+${useBias ? "uniform sampler2D biasTex;" : ""}
+
+void main() {
+  int texel = linearTexel();
+  int q = texel / OUT4;
+  int group = texel - q * OUT4;
+  // 🔴 THE TAIL IS CLAMPED, NOT SKIPPED. A row block that runs past the row
+  // count still writes every target, because a target left unwritten is a texel
+  // nothing wrote - the fault Storage.fillFresh exists to catch. Clamping to
+  // the last real row keeps the value FINITE and the repack never reads it.
+  int base = texel < RQ * OUT4 ? q * ${blockRows} : 0;
+${each((i) => `  int xBase${i} = min(base + ${i}, ROWS - 1) * IN4;`)}
+${each((i) => `  vec4 acc${i} = vec4(0.0);`)}
+${accumulate}
+${each((i) => `  result${i} = ${value(i)};`)}
+}`;
+};
+
+/** Four row planes back into `[rows][outChannels]`: plane `row % 4`, texel `(row / 4) * OUT4 + group`. */
+export const blockRepackSource = (blockRows = BLOCK_ROWS) => `${PRELUDE}${ONE_TARGET}
+uniform int ROWS;
+uniform int OUT4;
+${Array.from({ length: blockRows }, (_, i) => `uniform sampler2D plane${i};`).join("\n")}
+
+void main() {
+  int texel = linearTexel();
+  if (texel >= ROWS * OUT4) { result = vec4(0.0); return; }
+  int row = texel / OUT4;
+  int group = texel - row * OUT4;
+  int source = (row / ${blockRows}) * OUT4 + group;
+  int plane = row - (row / ${blockRows}) * ${blockRows};
+${Array.from({ length: blockRows - 1 }, (_, i) =>
+  `  if (plane == ${i}) { result = fetch4(plane${i}, source); return; }`).join("\n")}
+  result = fetch4(plane${blockRows - 1}, source);
+}`;
 
 /**
  * @param {import("../runtime/execution.js").Execution} execution
@@ -190,6 +395,34 @@ export function linear(execution, call, into) {
   if (output === x) {
     throw new Error("linear: a fragment shader cannot read the texture it draws into");
   }
+  if (!execution.noLinearBlock
+    && blockedApplies(rows, inChannels, outChannels, weightLayout)) {
+    const blockRows = blockRowsFor(execution);
+    const rowQuads = Math.ceil(rows / blockRows);
+    const planes = Array.from({ length: blockRows },
+      (_, i) => execution.allocate(rowQuads * outChannels, `linear.plane${i}`));
+    execution.dispatch({
+      source: blockedSource(
+        rows, inChannels, outChannels, activation, bias !== undefined, weightLayout, roundHalf,
+        blockRows),
+      outputs: planes,
+      inputs: bias === undefined
+        ? { xTex: x, weightTex: weight }
+        : { xTex: x, weightTex: weight, biasTex: bias },
+      optionalInts: { ...shapeInts(rows, inChannels, outChannels), RQ: rowQuads },
+      label: `linear.block:${rows}x${inChannels}x${outChannels}:${activation}:${weightLayout}`
+        + `${roundHalf ? ":half" : ""}`,
+    });
+    execution.dispatch({
+      source: blockRepackSource(blockRows),
+      output,
+      inputs: Object.fromEntries(planes.map((plane, i) => [`plane${i}`, plane])),
+      optionalInts: { ROWS: rows, OUT4: Math.ceil(outChannels / 4) },
+      label: `linear.repack:${rows}x${outChannels}`,
+    });
+    for (const plane of planes) execution.release(plane);
+    return output;
+  }
   return execution.dispatch({
     source: linearSource(
       rows, inChannels, outChannels, activation, bias !== undefined, weightLayout, roundHalf),
@@ -197,6 +430,7 @@ export function linear(execution, call, into) {
     inputs: bias === undefined
       ? { xTex: x, weightTex: weight }
       : { xTex: x, weightTex: weight, biasTex: bias },
+    optionalInts: shapeInts(rows, inChannels, outChannels),
     label: `linear:${rows}x${inChannels}x${outChannels}:${activation}:${weightLayout}`
       + `${roundHalf ? ":half" : ""}`,
   });

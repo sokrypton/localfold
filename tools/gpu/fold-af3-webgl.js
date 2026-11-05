@@ -31,7 +31,7 @@ import { HttpTensorStore } from "../../shared/bundles/http-tensor-store.js";
 import { af3BatchFromA3m } from "../../shared/af3/featurise/batch.js";
 import { af3Dialect, openAf3Store } from "../../shared/af3/weights/weights.js";
 import { foldWeights } from "../../shared/af3/weights/diffusion-weights.js";
-import { Execution } from "../../webgl/runtime/execution.js";
+import { webglExecution } from "./webgl-execution-options.js";
 import { createWebGL2Context } from "../../webgl/index.js";
 import {
   foldAf3, releaseAf3Weights, SAMPLER_DEFAULTS, uploadAf3Weights,
@@ -113,7 +113,7 @@ export async function main(device, args) {
   const { tokens, dense } = batch;
 
   const gl = createWebGL2Context();
-  const execution = new Execution(gl);
+  const execution = webglExecution(gl, args ?? []);
   const uploadStart = performance.now();
   const uploaded = uploadAf3Weights(execution, weights);
   const uploadMs = Math.round(performance.now() - uploadStart);

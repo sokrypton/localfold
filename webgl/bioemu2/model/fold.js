@@ -273,9 +273,15 @@ export async function foldBioemu2OnWebGl2(execution, read, features, options = {
     const sInit = execution.upload(embedded.sInit, "bioemu2.s-init");
     const pairMask = execution.upload(
       new Float32Array(pairs).fill(1), "bioemu2.pair-mask");
+    // 🔴 ZEROS, NOT AN ALLOCATION. The first trunk pass has no previous
+    // activations and `trunkPass` normalises both of these, so a fresh
+    // texture's contents ARE the answer here - and `allocate` does not promise
+    // any (`texImage2D` with a null pointer leaves them undefined). Found by
+    // `--nan-watch`, which named `layer-norm:68x384` inside the first pass; the
+    // same fault in `webgl/af2/model/fold.js` moved that fold's pLDDT by 3.
     let previous = {
-      pair: execution.allocate(pairs * BIOEMU2.pair, "bioemu2.z-prev"),
-      single: execution.allocate(tokens * BIOEMU2.single, "bioemu2.s-prev"),
+      pair: execution.zeros(pairs * BIOEMU2.pair, "bioemu2.z-prev"),
+      single: execution.zeros(tokens * BIOEMU2.single, "bioemu2.s-prev"),
     };
     const passes = options.passes ?? BIOEMU2.trunkPasses;
     for (let pass = 0; pass < passes; pass += 1) {

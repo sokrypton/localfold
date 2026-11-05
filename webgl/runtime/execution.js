@@ -95,7 +95,71 @@ export class Execution {
   /** @param {WebGL2RenderingContext} gl */
   constructor(gl, options = {}) {
     this.gl = gl;
-    this.storage = new Storage(gl);
+    this.storage = new Storage(gl, { pooling: options.pooling ?? false,
+      poolLabelPattern: options.poolLabelPattern ?? null,
+      fillFresh: options.fillFresh ?? null });
+    /**
+     * Read every output back and refuse at the first non-finite value.
+     *
+     * With `fillFresh: NaN` this names the kernel that reads a texel
+     * nothing wrote - the FIRST one, which is the only useful one, since
+     * a NaN reaches everything downstream.
+     */
+    this.nanWatch = options.nanWatch ?? false;
+    /**
+     * The control arm for the blocked projection (`webgl/kernels/linear.js`):
+     * one output texel a fragment, as this backend did before it had a block.
+     * A geometry is only worth what it is measured against.
+     */
+    this.noLinearBlock = options.noLinearBlock ?? false;
+    /**
+     * Draw every dispatch whose label matches TWICE, into the same output.
+     *
+     * 🔴 THE HONEST ATTRIBUTION INSTRUMENT, AND THE REASON `profile` IS NOT
+     * ONE. A kernel timed by waiting for it is timed with the wait: every
+     * label's share of a profiled AF2 fold came out within a few points of its
+     * share of the DISPATCH COUNT, which is a measurement of the instrument.
+     * Drawing a family a second time changes nothing it computes - these
+     * kernels are pure, so the second draw writes the same texels - and the
+     * fold's WALL grows by exactly that family's GPU time. Subtract the
+     * baseline and that is the answer, with no sync anywhere.
+     *
+     * Only the draws are repeated, not the program and uniform setup, so what
+     * it prices is the GPU work and not the host's.
+     *
+     * @type {RegExp | null}
+     */
+    this.doubleLabels = options.doubleLabels ?? null;
+    /** Issue no draws at all; see the comment at the draw loop. */
+    this.skipDraws = options.skipDraws ?? false;
+    /**
+     * The control arm for the transposed incoming contraction
+     * (`webgl/kernels/triangle-contract.js`): read the column directly, as this
+     * backend did before. Bit-identical, so this prices a LAYOUT and nothing
+     * else.
+     */
+    this.noTriangleTranspose = options.noTriangleTranspose ?? false;
+    /**
+     * The control arm for the split contraction and centre norm
+     * (`webgl/af3/trunk/triangle.js`): both in one draw, where a fragment
+     * contracts every channel of its pair to normalise four of them.
+     * Bit-identical, so this prices the pass count.
+     */
+    this.noTriangleSplit = options.noTriangleSplit ?? false;
+    /**
+     * Where the HOST time inside `dispatch` goes, when asked for.
+     *
+     * 🔴 BECAUSE THE GPU IS 3% OF AN AF2 WebGL FOLD AND NOTHING SAID SO.
+     * `doubleLabels` over every label - every draw issued twice - costs 40 ms
+     * of a 1400 ms fold, so the arithmetic is not what this backend is waiting
+     * for and no amount of arithmetic intensity moves it. The rest is this
+     * side of the API: generating a kernel's source, looking it up, binding,
+     * and the host arithmetic between dispatches. `insideMs` against the fold's
+     * own wall is what separates the last of those from the first three.
+     */
+    this.host = options.host ? {
+      insideMs: 0, programMs: 0, bindMs: 0, drawMs: 0, sourceBytes: 0,
+    } : null;
     /** @type {Map<string, {program: WebGLProgram, uniforms: Map<string, WebGLUniformLocation>}>} */
     this.programs = new Map();
     this.dispatches = 0;
@@ -123,14 +187,67 @@ export class Execution {
      */
     this.maxDrawBuffers = gl.getParameter(gl.MAX_DRAW_BUFFERS);
 
+    /**
+     * Per-label GPU time, in milliseconds, when a caller sets this to a `Map`.
+     *
+     * 🔴 A ONE-TEXEL READ IS THE ONLY TIMER THIS API HAS. There are no
+     * timestamp queries in WebGL2 - `EXT_disjoint_timer_query_webgl2` was
+     * removed from Chrome over a side channel - so a kernel's time is measured
+     * by WAITING for it: a `readPixels` of one texel of the output cannot
+     * return until that draw has run, and the wall clock either side of it is
+     * the draw. That makes profiling INTRUSIVE (every kernel is a pipeline
+     * flush, so a profiled fold is slower than the one it describes and the
+     * kernels that would have overlapped no longer do) and it is why this is
+     * off unless asked for. What it is good for is the RANKING, which is the
+     * question "where does the gap live" needs answered.
+     *
+     * @type {Map<string, number> | null}
+     */
+    this.profile = options.profile ?? null;
+    /** How many times each label was dispatched, counted whenever profiling. */
+    this.counts = new Map();
+    this.profileAt = 0;
+    this.profilePixel = new Float32Array(4);
+
     this.vertices = gl.createBuffer();
     gl.bindBuffer(gl.ARRAY_BUFFER, this.vertices);
     gl.bufferData(gl.ARRAY_BUFFER, FULLSCREEN_TRIANGLE, gl.STATIC_DRAW);
     this.vao = gl.createVertexArray();
-    this.target = gl.createFramebuffer();
+    /**
+     * Framebuffers by the textures attached to them.
+     *
+     * 🔴 ONE FRAMEBUFFER, REATTACHED EVERY DISPATCH, WAS THE SINGLE LARGEST
+     * COST IN THIS BACKEND - AND IT IS WHY THE BLOCKED PROJECTION LOOKED SLOWER
+     * THAN THE KERNEL IT BEATS. Each dispatch called `framebufferTexture2D` for
+     * all eight attachment points and then `checkFramebufferStatus`, and
+     * changing an attachment makes the driver revalidate the whole
+     * framebuffer - a synchronous query. Measured through
+     * tools/gpu/bench-webgl-linear.js: the blocked matmul alone is 2-3x the
+     * one-texel kernel, its repack pass is a texel in and a texel out, and
+     * the two together came out 2-7x SLOWER than the one kernel, because the
+     * attachment set now alternated between four planes and one output and so
+     * was revalidated twice a projection. Timed in isolation, where the
+     * attachments never change between iterations, both halves were fast. The
+     * configuration is the cost, not the arithmetic.
+     *
+     * A framebuffer per attachment SET, bound rather than rebuilt, is the whole
+     * fix: a fold reuses a handful of them because `Storage` pools its textures,
+     * so the key repeats. Capped, because a fold that never repeats a set would
+     * otherwise leak one per dispatch.
+     *
+     * @type {Map<string, WebGLFramebuffer>}
+     */
+    this.framebuffers = new Map();
+    /** Stable small ids for textures, so an attachment set has a short key. */
+    this.textureIds = new WeakMap();
+    this.nextTextureId = 1;
+    this.framebufferBuilds = 0;
+    /** How many attachment sets to keep. A fold uses tens; the cap is slack. */
+    this.maxFramebuffers = options.maxFramebuffers ?? 256;
   }
 
   allocate(elements, label) { return this.storage.allocate(elements, label); }
+  zeros(elements, label) { return this.storage.zeros(elements, label); }
   upload(values, label) { return this.storage.upload(values, label); }
   read(tensor) { return this.storage.read(tensor); }
   release(tensor) { return this.storage.release(tensor); }
@@ -157,6 +274,53 @@ export class Execution {
     return entry;
   }
 
+  /**
+   * Bind the framebuffer these targets are attached to, building it once.
+   *
+   * The attachment set and `drawBuffers` are both per-framebuffer state in
+   * WebGL2, so a cached framebuffer needs neither re-attaching nor re-asking
+   * for its completeness: binding it is one call.
+   */
+  #bindTargets(targets, label) {
+    const gl = this.gl;
+    let key = "";
+    for (const tensor of targets) {
+      let id = this.textureIds.get(tensor.texture);
+      if (id === undefined) {
+        id = this.nextTextureId;
+        this.nextTextureId += 1;
+        this.textureIds.set(tensor.texture, id);
+      }
+      key += `${id},`;
+    }
+    const cached = this.framebuffers.get(key);
+    if (cached !== undefined) {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, cached);
+      return;
+    }
+    if (this.framebuffers.size >= this.maxFramebuffers) {
+      // Oldest first: a Map keeps insertion order, and the set least recently
+      // BUILT is the best guess at the one least likely to come back.
+      const oldest = this.framebuffers.keys().next().value;
+      gl.deleteFramebuffer(this.framebuffers.get(oldest));
+      this.framebuffers.delete(oldest);
+    }
+    const framebuffer = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+    for (let t = 0; t < targets.length; t += 1) {
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0 + t, gl.TEXTURE_2D,
+        targets[t].texture, 0);
+    }
+    gl.drawBuffers(targets.map((_, t) => gl.COLOR_ATTACHMENT0 + t));
+    const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+    if (status !== gl.FRAMEBUFFER_COMPLETE) {
+      throw new Error(`${label}: cannot draw into `
+        + `${targets.map((tensor) => tensor.label).join(", ")} (0x${status.toString(16)})`);
+    }
+    this.framebuffers.set(key, framebuffer);
+    this.framebufferBuilds += 1;
+  }
+
   #uniform(entry, name) {
     if (!entry.uniforms.has(name)) {
       entry.uniforms.set(name, this.gl.getUniformLocation(entry.program, name));
@@ -181,11 +345,13 @@ export class Execution {
    *   outputs?: import("./storage.js").Tensor[],
    *   inputs?: Record<string, import("./storage.js").Tensor>,
    *   ints?: Record<string, number>, floats?: Record<string, number>,
-   *   label?: string}} call
+   *   optionalInts?: Record<string, number>, label?: string}} call
    */
   dispatch(call) {
     const gl = this.gl;
-    const { source, inputs = {}, ints = {}, floats = {}, label = "kernel" } = call;
+    const {
+      source, inputs = {}, ints = {}, floats = {}, optionalInts = {}, label = "kernel",
+    } = call;
     const targets = call.outputs ?? [call.output];
     if (targets.length === 0 || targets.some((tensor) => tensor === undefined)) {
       throw new Error(`${label}: a dispatch needs an output`);
@@ -213,24 +379,32 @@ export class Execution {
         throw new Error(`${label}: ${tensor.label} is both an input and a render target`);
       }
     }
+    // 🔴 AND A RELEASED TENSOR IS STILL A `Tensor` OBJECT WITH A TEXTURE FIELD,
+    // WHICH IS WHY THIS HAS TO BE ASKED. Reading one back worked by accident for
+    // as long as `release` deleted the texture: a deleted texture samples as
+    // zeros rather than failing, so a stage that read past a release got a
+    // plausible answer. The moment textures are POOLED the same read returns
+    // another tensor's live contents, and the fold is wrong by an amount that
+    // depends on allocation order. `Storage.live` is the only thing that knows,
+    // so the dispatch asks it.
+    if (this.checkErrors) {
+      for (const [name, tensor] of Object.entries(inputs)) {
+        if (!this.storage.live.has(tensor)) {
+          throw new Error(`${label}: input \`${name}\` (${tensor.label}) has been released`);
+        }
+      }
+      for (const tensor of targets) {
+        if (!this.storage.live.has(tensor)) {
+          throw new Error(`${label}: render target ${tensor.label} has been released`);
+        }
+      }
+    }
+    const enteredAt = this.host === null ? 0 : performance.now();
     const entry = this.program(source);
+    const compiledAt = this.host === null ? 0 : performance.now();
     gl.useProgram(entry.program);
     gl.bindVertexArray(this.vao);
-
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.target);
-    for (let t = 0; t < this.maxDrawBuffers; t += 1) {
-      // Detach anything a previous dispatch left on a higher attachment: a
-      // framebuffer is reused, and an attachment nobody writes is still an
-      // attachment whose completeness the driver checks.
-      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0 + t, gl.TEXTURE_2D,
-        t < targets.length ? targets[t].texture : null, 0);
-    }
-    gl.drawBuffers(targets.map((_, t) => gl.COLOR_ATTACHMENT0 + t));
-    const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
-    if (status !== gl.FRAMEBUFFER_COMPLETE) {
-      throw new Error(`${label}: cannot draw into `
-        + `${targets.map((tensor) => tensor.label).join(", ")} (0x${status.toString(16)})`);
-    }
+    this.#bindTargets(targets, label);
 
     let unit = 0;
     for (const [name, tensor] of Object.entries(inputs)) {
@@ -259,6 +433,17 @@ export class Execution {
       if (location === null) throw new Error(`${label}: no float uniform \`${name}\``);
       gl.uniform1f(location, value);
     }
+    // 🔴 A SHAPE UNIFORM MAY BE OPTIMISED AWAY, AND THAT IS NOT AN ERROR. The
+    // shapes are uniforms rather than baked constants so that one program
+    // serves every size (see `webgl/kernels/linear.js`) - but a kernel whose
+    // branch does not read `ROWS` loses it in the compiler, `getUniformLocation`
+    // returns null, and the strict check above would refuse a correct kernel.
+    // Everything that is NOT a shape stays strict, because a silently ignored
+    // uniform is how a kernel comes to read whatever was bound before it.
+    for (const [name, value] of Object.entries(optionalInts)) {
+      const location = this.#uniform(entry, name);
+      if (location !== null) gl.uniform1i(location, value);
+    }
 
     if (this.halfDither !== 0) {
       // Set where the kernel has it and skip where it does not: a kernel that
@@ -268,6 +453,22 @@ export class Execution {
     }
 
     this.dispatches += 1;
+    if (this.profile !== null) {
+      this.counts.set(label, (this.counts.get(label) ?? 0) + 1);
+      // The clock starts where the PREVIOUS kernel's wait ended, so the whole
+      // of the wall is attributed and a kernel carries its own host setup.
+      if (this.profileAt === 0) this.profileAt = performance.now();
+    }
+    const boundAt = this.host === null ? 0 : performance.now();
+    // 🔴 THE OTHER HALF OF `doubleLabels`, AND THE ONE THAT SETTLES AN ARGUMENT.
+    // Doubling every draw said the GPU was 2% of a bioemu2 fold; profiling with
+    // a barrier after each dispatch said it was 90%. They cannot both be right,
+    // and the arm that decides is the fold with NO draws at all: whatever is
+    // left is everything this backend does APART from drawing. The answer is a
+    // fold of garbage, so it is a timing probe only.
+    const passes = this.skipDraws ? 0
+      : this.doubleLabels !== null && this.doubleLabels.test(label) ? 2 : 1;
+    for (let pass = 0; pass < passes; pass += 1) {
     for (let row = 0; row < output.height; row += this.maxBandRows) {
       const rows = Math.min(this.maxBandRows, output.height - row);
       // The viewport's ORIGIN is the band's first row, so gl_FragCoord.y is
@@ -277,18 +478,80 @@ export class Execution {
       gl.drawArrays(gl.TRIANGLES, 0, 3);
       this.draws += 1;
     }
+    }
     if (this.checkErrors) {
       const error = gl.getError();
       if (error !== gl.NO_ERROR) {
         throw new Error(`${label}: GL error 0x${error.toString(16)} after the draw`);
       }
     }
+    if (this.host !== null) {
+      const now = performance.now();
+      this.host.programMs += compiledAt - enteredAt;
+      this.host.bindMs += boundAt - compiledAt;
+      this.host.drawMs += now - boundAt;
+      this.host.insideMs += now - enteredAt;
+      this.host.sourceBytes += source.length;
+    }
+    if (this.nanWatch) {
+      for (const tensor of targets) {
+        const values = this.storage.read(tensor);
+        for (let i = 0; i < values.length; i += 1) {
+          if (!Number.isFinite(values[i])) {
+            throw new Error(`${label}: ${tensor.label}[${i}] is ${values[i]} - `
+              + "this kernel read a texel nothing wrote");
+          }
+        }
+      }
+    }
+    if (this.profile !== null) {
+      // The framebuffer is still bound with the targets attached, so one texel
+      // of the first one is the cheapest thing that waits for the draw.
+      gl.readBuffer(gl.COLOR_ATTACHMENT0);
+      gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.FLOAT, this.profilePixel);
+      const now = performance.now();
+      this.profile.set(label, (this.profile.get(label) ?? 0) + now - this.profileAt);
+      this.profileAt = now;
+    }
     return output;
+  }
+
+  /**
+   * The profile as a sorted table: the `top` slowest labels, each with its
+   * dispatch count, and what they add up to.
+   *
+   * `kernel` is the label up to its first colon, which is how the kernels here
+   * are named (`linear:59x128x128:none:out-major`), so the per-kernel rollup
+   * answers "which KERNEL is the fold" where the per-label rows answer "at
+   * which shape".
+   */
+  profileTable(top = 20) {
+    if (this.profile === null) return null;
+    const rows = [...this.profile.entries()]
+      .map(([label, ms]) => ({ label, ms: Number(ms.toFixed(1)), calls: this.counts.get(label) ?? 0 }))
+      .sort((a, b) => b.ms - a.ms);
+    const byKernel = new Map();
+    for (const row of rows) {
+      const kernel = row.label.split(":")[0];
+      const seen = byKernel.get(kernel) ?? { kernel, ms: 0, calls: 0 };
+      byKernel.set(kernel, { kernel, ms: seen.ms + row.ms, calls: seen.calls + row.calls });
+    }
+    const totalMs = rows.reduce((sum, row) => sum + row.ms, 0);
+    return {
+      totalMs: Number(totalMs.toFixed(1)),
+      kernels: [...byKernel.values()]
+        .map((row) => ({ ...row, ms: Number(row.ms.toFixed(1)), percent: Number((100 * row.ms / totalMs).toFixed(1)) }))
+        .sort((a, b) => b.ms - a.ms),
+      labels: rows.slice(0, top),
+    };
   }
 
   stats() {
     return {
       dispatches: this.dispatches, draws: this.draws, programs: this.programs.size,
+      framebuffers: this.framebuffers.size, framebufferBuilds: this.framebufferBuilds,
+      ...(this.host === null ? {} : { host: Object.fromEntries(
+        Object.entries(this.host).map(([k, v]) => [k, Math.round(v)])) }),
       maxBandRows: this.maxBandRows, maxDrawBuffers: this.maxDrawBuffers,
       ...this.storage.stats(),
     };
@@ -301,6 +564,7 @@ export class Execution {
     this.programs.clear();
     gl.deleteBuffer(this.vertices);
     gl.deleteVertexArray(this.vao);
-    gl.deleteFramebuffer(this.target);
+    for (const framebuffer of this.framebuffers.values()) gl.deleteFramebuffer(framebuffer);
+    this.framebuffers.clear();
   }
 }

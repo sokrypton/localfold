@@ -26,7 +26,7 @@ import {
   atomDecoderWeights, atomEncoderWeights, confidenceHeadWeights,
   conditioningWeights, denoiserWeights, featuriserWeights, trunkBlockWeights,
 } from "../../shared/esmfold2/weights.js";
-import { Execution } from "../../webgl/runtime/execution.js";
+import { webglExecution } from "./webgl-execution-options.js";
 import { createWebGL2Context } from "../../webgl/index.js";
 import { foldEsmfold2 } from "../../webgl/esmfold2/model/fold.js";
 import { SAMPLER_DEFAULTS } from "../../webgl/esmfold2/sampler.js";
@@ -145,7 +145,7 @@ export async function main(device, args) {
   const features = featuriseForEsmfold2(sequence);
 
   const gl = createWebGL2Context();
-  const execution = new Execution(gl);
+  const execution = webglExecution(gl, args ?? []);
   const held = [];
   const upload = (values, label) => {
     const tensor = execution.upload(Float32Array.from(values), label);

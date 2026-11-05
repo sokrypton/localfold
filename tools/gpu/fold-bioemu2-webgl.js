@@ -40,7 +40,7 @@ import { bundleReader } from "../../shared/bioemu2/weights.js";
 import { bioemu2Pdb, alphaCarbonSpacings } from "../../shared/bioemu2/structure.js";
 import { fetchComponents, smilesTemplates } from "../../shared/bioemu2/inputs.js";
 import { foldBioemu2OnWebGl2 } from "../../webgl/bioemu2/model/fold.js";
-import { Execution } from "../../webgl/runtime/execution.js";
+import { webglExecution, webglProfile } from "./webgl-execution-options.js";
 import { createWebGL2Context } from "../../webgl/index.js";
 import { superpose } from "./superpose.js";
 import { bondGeometry } from "./bond-geometry.js";
@@ -100,7 +100,7 @@ export async function main(device, args) {
   const read = bundleReader(model);
   await read.prefetch();
   const gl = createWebGL2Context();
-  const execution = new Execution(gl);
+  const execution = webglExecution(gl, args ?? []);
   const t1 = performance.now();
   const result = await foldBioemu2OnWebGl2(execution, read, features, {
     steps: Number(option(args, "steps", "20")),
@@ -180,6 +180,7 @@ export async function main(device, args) {
       return count;
     })(),
     memory: execution.stats(),
+    profile: webglProfile(execution, args ?? []),
   };
   if (args.includes("--pdb")) out.pdb = scored[0].pdb;
   out.verdict = `ok: ${tokens} tokens folded in WebGL2 at ${out.steps} steps`;

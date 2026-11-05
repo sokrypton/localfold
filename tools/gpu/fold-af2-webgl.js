@@ -35,7 +35,7 @@ import { AlphaFoldMonomerGpu } from "../../webgpu/af2/model/monomer.js";
 import { AlphaFoldUnifiedGpu } from "../../webgpu/af2/multimer/model.js";
 import { AlphaFoldFixture } from "../../shared/bundles/alphafold-fixture.js";
 import { HttpTensorStore } from "../../shared/bundles/http-tensor-store.js";
-import { Execution } from "../../webgl/runtime/execution.js";
+import { webglExecution, webglProfile } from "./webgl-execution-options.js";
 import { createWebGL2Context } from "../../webgl/index.js";
 import {
   foldAf2, releaseAf2Weights, uploadAf2Weights,
@@ -143,7 +143,11 @@ export async function main(device, args) {
 
   // --- the WebGL2 fold ----------------------------------------------------
   const gl = createWebGL2Context();
-  const execution = new Execution(gl);
+  const execution = webglExecution(gl, args ?? []);
+  // 🔴 A PROFILED FOLD IS NOT THE FOLD IT DESCRIBES. Every kernel is waited for
+  // (webgl/runtime/execution.js, `profile`), so the wall grows and whatever
+  // overlapped stops overlapping. Read the RANKING, never the total.
+  if (flag(args, "profile")) execution.profile = new Map();
   const uploadStart = performance.now();
   const uploaded = uploadAf2Weights(execution, weights, graph);
   const uploadMs = Math.round(performance.now() - uploadStart);
@@ -153,6 +157,7 @@ export async function main(device, args) {
     featuresByRecycle: features, weights: uploaded, paeBreaks, graph,
   });
   const webglMs = Math.round(performance.now() - foldStart);
+  const profile = webglProfile(execution, args ?? []);
   const memory = execution.stats();
   // 🔴 THE FLOOR, BECAUSE "0.07 A APART" MEANS NOTHING ON ITS OWN. The trunk
   // keeps three intermediates in f16 with no switch to reach them - the
@@ -315,9 +320,18 @@ export async function main(device, args) {
     memory: {
       draws: memory.draws,
       programs: memory.programs,
+      allocations: memory.allocations,
+      textureReuses: memory.reuses,
+      framebuffers: memory.framebuffers,
+      framebufferBuilds: memory.framebufferBuilds,
+      host: memory.host,
+      ...(flag(args, "allocation-labels")
+        ? { allocationLabels: [...memory.allocationLabels.entries()]
+          .sort((a, b) => b[1] - a[1]) } : {}),
       peakMegabytes: Number((memory.peakBytes / (1 << 20)).toFixed(1)),
       liveTensorsAfter: liveAfter,
     },
+    profile,
     verdict: !chainOk
       ? `FAILED: the fold is not a chain - consecutive CA median ${median.toFixed(3)} A, `
         + `worst ${worst.toFixed(2)} A, against 3.80 expected. pLDDT says `

@@ -528,7 +528,10 @@ export function towerSingle(execution, call) {
   execution.release(idsTensor);
 
   // Starts at zero, which `Storage.allocate` guarantees.
-  let accumulated = execution.allocate(rows * pair, "esmc.shim.accumulator");
+  // 🔴 ZEROS, NOT AN ALLOCATION: the first `mixIn` ADDS into this, so a fresh
+  // texture's contents are part of the answer and `allocate` does not promise
+  // any. `--nan-watch` named `esmc.shim.mix:22x256:0`.
+  let accumulated = execution.zeros(rows * pair, "esmc.shim.accumulator");
   /** Norm, project, scale and add one state - then it can go. */
   const mixIn = (values, index, isLast) => {
     const source = isLast
