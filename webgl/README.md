@@ -1053,6 +1053,47 @@ sufficient one. A generalisation measured on one model is a regression on anothe
 reason this is a sentence rather than a shipped defect is that the AF2 differential runs on every
 pass.
 
+### 🔴 A UNIFORM BLOCK READ IS 2.1x A `texelFetch`, SO THE CEILING IS A TEXTURE CEILING
+
+**This corrects the section below, which says the texture unit is the only path. It is not.** GLSL ES
+300 has UNIFORM BLOCKS, they are dynamically indexable, and they are a different memory path - a
+constant cache rather than the texture unit. Nothing in this backend has ever used one: every
+operand of every kernel here arrives through `texelFetch`.
+
+`tools/gpu/probe-webgl-uniform-reads.js` runs the identical loop over the identical data both ways,
+with its own GL setup so none of the runtime is in the way. Three consecutive runs, eight
+interleaved rounds each, minimum per arm:
+
+| | G reads/s | spread |
+|---|---:|---:|
+| `texelFetch` | 83.2 / 83.6 / 84.9 | 1.04-1.07 |
+| **uniform block** | **179.0 / 177.5 / 179.0** | 1.09-1.35 |
+| | **2.11x to 2.15x** | |
+
+So **21.33 flops a fetch is the ceiling for a kernel whose operands all come through the TEXTURE
+unit**, which is every kernel here, and not an absolute one. A projection whose shared operand sat in
+uniforms would fetch only the streaming one.
+
+🔴 **AND THE CONSTRAINTS ARE WHAT MAKE IT MODEST RATHER THAN DECISIVE, so they are stated before the
+mechanism is believed.** This context reports `MAX_UNIFORM_BLOCK_SIZE` 16384 bytes and
+`MAX_FRAGMENT_UNIFORM_BLOCKS` 16, so **65,536 floats** can sit in uniforms for one draw - and the
+operand has to be CONSTANT across that draw, because a UBO update costs a draw, and this backend's
+host cost is about 0.57 ms a draw. So:
+
+- bioemu2's `[in][out]` projections (13.1% of its fold) have weights of 131,072 floats: they fit in
+  **two** draws, and per k-step the kernel would do eight texture fetches and four uniform reads
+  instead of twelve fetches - about **1.2x** on those kernels, **~2.5% of the fold**;
+- an operand that changes per row block does NOT work: x would need 72 UBO updates a projection,
+  which is 41 ms of draw overhead against the 10 ms the projection takes;
+- and the **hot int5 weights do not fit at all** - `576 x 896 -> 1792` is 1.6 million codes - so the
+  48.6% of a bioemu2 fold that matters most cannot use this.
+
+**Untested in a real kernel, and said so deliberately**: the packed-halves weight had an equally
+sound mechanism (32 flops a fetch against 21.33, measured, at no accuracy cost) and still lost 0.78x
+because the `unpackHalf2x16` ALU exceeded the fetches it saved. A per-read ratio is not a kernel
+result. What is established here is that **the bound below is a texture-unit bound**, and that one
+untried path exists with a measured 2.1x and a 65,536-float ceiling on what it can hold.
+
 ### What the remaining gap IS, from the WGSL kernel's own notes
 
 **The distance is arithmetic intensity per GLOBAL fetch, and the mechanism that buys it is the one

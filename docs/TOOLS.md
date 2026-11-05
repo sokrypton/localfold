@@ -11,9 +11,9 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-528 tools. `tools/fixtures/` is data and is not listed.
+529 tools. `tools/fixtures/` is data and is not listed.
 
-## `tools/gpu/` - the WebGPU lane (283)
+## `tools/gpu/` - the WebGPU lane (284)
 
 Each exports `async function main(device, args)` and is run as
 `node tools/gpu-chrome.mjs tools/gpu/<module>.js [--flags]`.
@@ -284,6 +284,7 @@ Each exports `async function main(device, args)` and is run as
 - **`probe-webgl-column-layout.js`** - Which activation order, and which OUTPUT order, does the WGSL attention block use when `transpose` is set?
 - **`probe-webgl-fetch-rate.js`** - What `fetch4` RATE does this device give a fragment of a given shape?
 - **`probe-webgl-precision.js`** - Does `mediump` reach this device's HALF arithmetic, and is it faster?
+- **`probe-webgl-uniform-reads.js`** - Is a UNIFORM BLOCK read cheaper than a `texelFetch` on this device?
 - **`probe-webgl2-limits.js`** - The WebGL2 limits that bound a GPGPU kernel, including the ones a fragment shader does not have but transform feedback might.
 - **`probe-webgl2-tf.js`** - The smallest transform feedback that works, and where the error comes from.
 - **`probe-webgl2.js`** - What WebGL2 exposes on this device, and whether any of it is compute.
