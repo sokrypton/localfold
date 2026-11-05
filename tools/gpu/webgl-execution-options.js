@@ -63,6 +63,9 @@
  *   --no-triangle-coalesce
  *                         The outgoing contraction reading one float per
  *                         `fetch1`, which asks for the same texel four times.
+ *   --no-contract-block   AF3's contraction one pair a fragment, which reads
+ *                         both operands' rows for every pair rather than
+ *                         sharing them across a block of two i and four j.
  *   --skip-draws          Issue no draws at all. The fold is garbage; what it
  *                         times is everything this backend does APART from
  *                         drawing, which is the arm that settles whether the
@@ -98,6 +101,7 @@ export function webglExecutionOptions(args) {
     noTriangleTranspose: flag(args, "no-triangle-transpose"),
     noTriangleSplit: flag(args, "no-triangle-split"),
     noTriangleCoalesce: flag(args, "no-triangle-coalesce"),
+    noContractBlock: flag(args, "no-contract-block"),
     poolLabelPattern: pattern("pool-labels"),
     profile: flag(args, "profile") ? new Map() : null,
   };

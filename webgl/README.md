@@ -26,7 +26,7 @@ This file began as the spike that answered *can WebGL2 do this work at all*: the
 decide it, moved out of `webgpu/kernels/` where they sat with `webgl2` in their names and no
 importer, plus the texture layout and the limit arithmetic they shared by copy. The honest summary
 of the sections below: the numerics are **checked and correct**, the speed is **4.6x off the WebGPU
-path on AF2 and 22x on bioemu2** - it was 17x and 246x - and the shapes are **worse**.
+path on AF2 and 18x on bioemu2** - it was 17x and 246x - and the shapes are **worse**.
 
 🔴 **AND THEY WERE UNGATED FOR AS LONG AS THEY EXISTED, WHICH IS WHY THE FIRST THING THIS TREE
 GOT WAS A DIFFERENTIAL.** AGENTS.md requires every GPU kernel to have "a deterministic differential
@@ -706,7 +706,28 @@ is pure cost. At that size the `[in][out]` layout is repeatably **0.44x to 0.65x
 one-texel kernel; `[out][in]` at the same size still wins. Nothing about the geometry decides this;
 only the weight's size does.
 
-**And its outgoing direction then asked for the same texel four times.** Four consecutive k of
+**And then the whole thing was reading both operands' rows for every pair.** The split contraction
+runs at **four flops a fetch where the projection reaches twenty-three**: a fragment owning four
+channels of one pair reads `a[i][*][c]` and `b[j][*][c]` for each of those four channels, and in
+this trunk's channel-major layout those four channels live in four different planes - 136 texel
+reads for 272 multiply-adds. Measured inside a real 48-block trunk the contraction is about half of
+it, at roughly **1.8 GFLOP/s** where the same device's projections reach 70.
+
+Nothing about the sweep can be made cheaper; the operands can be REUSED. A block of **two i and
+four j** computes eight pairs from two `a` rows and four `b` rows, so a k-step costs six fetches
+instead of eight for four times the arithmetic - **10.7 flops a fetch**. Eight pairs of four
+channels is exactly `MAX_DRAW_BUFFERS` targets. Measured at 48 mixer blocks, which is the
+configuration a fold uses: **the trunk goes 8.49 s to 5.31 s, 1.60x**, with the fold's `caca`
+identical to eight digits. `--no-contract-block` is the control arm, and a context with only the
+four draw buffers the specification guarantees keeps the one-pair kernel.
+
+🔴 **AND IT NEEDS A TOKEN COUNT DIVISIBLE BY FOUR, WHICH ONE OF THE TWO MODELS THAT USE THIS TRUNK
+DOES NOT HAVE.** The block is two i and four j, so L must be even and a multiple of four -
+bioemu2's 68 is, and ESMFold2's ubiquitin at **75** is not, which is why its full configuration
+reads 64.9 s and 67.4 s either side of this change: unchanged within the variance, because it never
+takes the path. A j block of two would reach it at any even length and is not written.
+
+**And its outgoing direction asked for the same texel four times.** Four consecutive k of
 `a[c][i][k]` are four consecutive floats, which is one RGBA texel, and `fetch1` fetches a texel to
 select one component - so the loop issued four fetches where one would do. The texture cache
 absorbs the BYTES, but this kernel is bound by the fetch RATE (~10 G a second) and not by
@@ -719,8 +740,14 @@ run as an outgoing contraction over transposed planes**, which is an identity ra
 approximation: `sum_k a[c][k][j] * b[c][k][i]` is `sum_k aT[c][j][k] * bT[c][i][k]`, the outgoing
 kernel handed bT and aT. Two transposes are two passes over the tensor where the strided form pays
 L passes, and the incoming direction - the slower half of this stage once outgoing was coalesced -
-goes from 126 ms a call to 64, the bioemu2 trunk stage 710 ms to 617 at four mixer blocks, and
-the real trunk **47.9 s to 36.4**. `--no-triangle-coalesce` and
+goes from 126 ms a call to 64.
+
+🔴 **AND THE FOUR-BLOCK MEASUREMENT UNDERSTATED THIS BADLY, WHICH IS WORTH RECORDING.** Read at
+`--mixer-blocks=4` the coalescing and the transpose together are worth 1.15x on the trunk stage
+(710 ms to 617); read at **48**, which is what a fold runs, they are worth **2.08x** (17.58 s to
+8.47). A trunk at a twelfth of its blocks is not a twelfth of a trunk - the contraction scales with
+the block count where the embedding and the sampler's share do not - so a cheap configuration
+flatters whatever is NOT the pair track. Every trunk figure in this section is a 48-block one now. `--no-triangle-coalesce` and
 `--no-triangle-transpose` are the control arms, the second of which also covers the same trick in
 AF2's own contraction (`webgl/kernels/triangle-contract.js`).
 
@@ -762,9 +789,9 @@ Every fold is the same job, the same seed and the same settings either side; `--
 
 | fold | before | after | |
 |---|---:|---:|---:|
-| bioemu2, 6MRR 68 tokens, 4 passes, 20 steps | 968 s | **84.8 s** | **11.4x** |
-| ...its trunk | 277.7 s | **36.5 s** | 7.6x |
-| ...its 20 denoiser calls | 658 s | **46.9 s** | 14.0x |
+| bioemu2, 6MRR 68 tokens, 4 passes, 20 steps | 968 s | **68.9 s** | **14.0x** |
+| ...its trunk | 277.7 s | **21.3 s** | 13.0x |
+| ...its 20 denoiser calls | 658 s | **46.8 s** | 14.1x |
 | ESMFold2, 75 residues, 36-block tower, 3 loops, 15 steps | 253 s | **65.0 s** | **3.9x** |
 | ESMFold2 at the tool's defaults | 2.82 s | **1.37 s** | 2.1x |
 | AF3, 59 tokens | 4.68 s | **3.39 s** | 1.4x |
@@ -1065,16 +1092,16 @@ bond rms  main       0.042            0.042            0.042
           side       0.056            0.056            0.056
           peptide    0.028            0.028            0.028
 contacts (P > 0.5)   201              201
-wall                 968 s            84.8 s           3.9 s
-  trunk              277.7 s          36.4 s           2.3 s
-  distogram                           1.3 s
-  20 denoiser calls  658 s            46.9 s           1.2 s
+wall                 968 s            68.9 s           3.9 s
+  trunk              277.7 s          21.3 s           2.3 s
+  distogram                           0.7 s
+  20 denoiser calls  658 s            46.8 s           1.2 s
 weights/activations  1656 MiB peak    409 MiB peak     815 MiB weights + 135 activations
 ```
 
-🔴 **968 s TO 84.8 s ON A QUARTER OF THE MEMORY, AND NOT ONE REPORTED QUANTITY MOVES.** The 11.4x
-is the row block, the split, coalesced and transposed contraction, and the weights held as the
-bundle's own five-bit codes from "Closing the gap" above, and every figure in
+🔴 **968 s TO 68.9 s ON A QUARTER OF THE MEMORY, AND NOT ONE REPORTED QUANTITY MOVES.** The 14.0x
+is the row block, the contraction split, coalesced, transposed and pair-blocked, and the weights
+held as the bundle's own five-bit codes from "Closing the gap" above, and every figure in
 the middle column is the left column's - the same rmsd, the same TM, the same CA-CA median to eight
 digits, the same 201 contacts - while the peak HALVES. Four kernels reordered or re-quantised and
 the fold does not notice; the weights are within 36 MiB of what the WGSL fold holds.
@@ -1092,8 +1119,8 @@ relative. A geometry floor would have accepted a port that was wrong by 10%; thi
 also why the AF3-style "worst atom" figure is not quoted here: it needs both PDBs, and the WebGL2
 side is sixteen minutes a fold.
 
-🔴 **AND IT IS 22x THE WGSL FOLD - WAS 246x - ON LESS MEMORY THAN THAT FOLD USES.** The trunk is
-16x and the diffusion 39x, and the diffusion is where the remaining asymmetry lives: the WGSL denoiser
+🔴 **AND IT IS 18x THE WGSL FOLD - WAS 246x - ON LESS MEMORY THAN THAT FOLD USES.** The trunk is
+9x and the diffusion 39x, and the diffusion is where the remaining asymmetry lives: the WGSL denoiser
 batches S samples through one compiled program, which this one does not. **The half-precision
 weights this file once called "the next multiplicative factor" are taken** - see "Float16 weights"
 above - so the denoiser's 1.6 GiB is 0.8 and a call is **2.5 s where it was 32.9**. That is also
@@ -1230,7 +1257,7 @@ and the page requires WebGPU rather than choosing a backend.
 🔴 **THE PRECONDITION IS NOW MET AND THE DECISION IS STILL NOT AUTOMATIC.** This section used to say
 neither line should move "before a fold actually runs here", and one does. What has not been
 settled is whether a backend **4.6x slower on AF2 and 23x on bioemu2** should be offered: a
-59-residue AF2 fold is 1.29 s against 0.28 s, 68-token bioemu2 is 85 s against 3.9 s on 409 MiB
+59-residue AF2 fold is 1.29 s against 0.28 s, 68-token bioemu2 is 69 s against 3.9 s on 409 MiB
 against 950, and a
 255-residue fold has not been measured at all. A visitor with no WebGPU gets a fold
 instead of a refusal, which is the whole point of the tree; a visitor who waits four minutes for

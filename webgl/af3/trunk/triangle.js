@@ -41,7 +41,7 @@
  * 🔴 AND NOTHING HERE HAS A BIAS. One `bias` in the whole pairformer block, on
  * the single track's query projection; these four Linears are bias-free.
  */
-import { ONE_TARGET, PRELUDE } from "../../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, targetDeclarations } from "../../runtime/execution.js";
 import { layerNorm } from "../../kernels/layer-norm.js";
 import { linear } from "../../kernels/linear.js";
 import { multiply } from "../../runtime/elementwise.js";
@@ -279,6 +279,108 @@ void main() {
 }`;
 
 /**
+ * The contraction with a PAIR BLOCK: two i and four j a fragment, into eight
+ * render targets.
+ *
+ * 🔴 THE SPLIT CONTRACTION RUNS AT FOUR FLOPS A FETCH WHERE THE PROJECTION
+ * REACHES TWENTY-THREE, AND SHARING THE OPERANDS IS THE ONLY WAY UP. A fragment
+ * owning four channels of one pair reads `a[i][*][c]` and `b[j][*][c]` for each
+ * of those four channels - and the four channels live in four different planes,
+ * so that is 136 texel reads for 272 multiply-adds. Measured inside a 48-block
+ * trunk the contraction is about half of it, at roughly **1.8 GFLOP/s** where
+ * the same device's projections reach 70.
+ *
+ * Nothing about the sweep can be made cheaper; the operands can be REUSED. A
+ * block of two i and four j computes eight pairs from two `a` rows and four `b`
+ * rows, so a k-step costs six fetches instead of eight for four times the
+ * arithmetic: **10.7 flops a fetch, 2.7x**. Eight pairs of four channels is
+ * exactly `MAX_DRAW_BUFFERS` targets, and `blockRepackSource` interleaves them.
+ *
+ * The channel loop is unrolled so only eight accumulators are live at a time
+ * rather than thirty-two, and so that a `vec4` is never indexed by a variable.
+ */
+export const blockedContractSource = (length, channels, direction, divideByLength) => {
+  const planes = 8;
+  const component = ["x", "y", "z", "w"];
+  // For the outgoing direction a row is `a[i][k]`, contiguous in k; for the
+  // incoming one the caller has already transposed both operands, so it is the
+  // same expression.
+  const row = (tex, pair) => `(plane + ${pair} * L) / 4 + k4`;
+  const channelBlock = (c4) => `  {
+    float s00 = 0.0, s01 = 0.0, s02 = 0.0, s03 = 0.0;
+    float s10 = 0.0, s11 = 0.0, s12 = 0.0, s13 = 0.0;
+    int plane = (cgroup * 4 + ${c4}) * PAIRS;
+    for (int k4 = 0; k4 < L / 4; ++k4) {
+      vec4 a0 = fetch4(aTex, ${row("aTex", "i0")});
+      vec4 a1 = fetch4(aTex, ${row("aTex", "i1")});
+      vec4 b0 = fetch4(bTex, ${row("bTex", "j0")});
+      vec4 b1 = fetch4(bTex, ${row("bTex", "j1")});
+      vec4 b2 = fetch4(bTex, ${row("bTex", "j2")});
+      vec4 b3 = fetch4(bTex, ${row("bTex", "j3")});
+      s00 += dot(a0, b0); s01 += dot(a0, b1); s02 += dot(a0, b2); s03 += dot(a0, b3);
+      s10 += dot(a1, b0); s11 += dot(a1, b1); s12 += dot(a1, b2); s13 += dot(a1, b3);
+    }
+${[0, 1].map((di) => [0, 1, 2, 3].map((dj) =>
+  `    result${di * 4 + dj}.${component[c4]} = s${di}${dj}${divideByLength ? " / float(L)" : ""};`)
+  .join("\n")).join("\n")}
+  }`;
+  return `${PRELUDE}${targetDeclarations(planes)}
+const int L = ${length};
+const int PAIRS = ${length * length};
+const int C4 = ${channels / 4};
+const int IBLOCKS = ${length / 2};
+const int JBLOCKS = ${length / 4};
+uniform sampler2D aTex;
+uniform sampler2D bTex;
+
+void main() {
+  int texel = linearTexel();
+  if (texel >= IBLOCKS * JBLOCKS * C4) {
+${Array.from({ length: planes }, (_, p) => `    result${p} = vec4(0.0);`).join("\n")}
+    return;
+  }
+  int cgroup = texel % C4;
+  int rest = texel / C4;
+  int jblock = rest % JBLOCKS;
+  int iblock = rest / JBLOCKS;
+  int i0 = iblock * 2;
+  int i1 = i0 + 1;
+  int j0 = jblock * 4;
+  int j1 = j0 + 1;
+  int j2 = j0 + 2;
+  int j3 = j0 + 3;
+${[0, 1, 2, 3].map(channelBlock).join("\n")}
+}`;
+};
+
+/**
+ * The eight pair planes back into `[pair][channel]`.
+ *
+ * Plane `(i & 1) * 4 + (j & 3)` holds the pair at
+ * `((i >> 1) * JBLOCKS + (j >> 2)) * C4 + cgroup`.
+ */
+export const contractRepackSource = (length, channels) => `${PRELUDE}${ONE_TARGET}
+const int L = ${length};
+const int C4 = ${channels / 4};
+const int JBLOCKS = ${length / 4};
+const int ELEMENTS = ${length * length * channels};
+${Array.from({ length: 8 }, (_, p) => `uniform sampler2D plane${p};`).join("\n")}
+
+void main() {
+  int texel = linearTexel();
+  if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
+  int cgroup = texel % C4;
+  int pair = texel / C4;
+  int i = pair / L;
+  int j = pair - i * L;
+  int source = ((i >> 1) * JBLOCKS + (j >> 2)) * C4 + cgroup;
+  int plane = (i & 1) * 4 + (j & 3);
+${Array.from({ length: 7 }, (_, p) =>
+  `  if (plane == ${p}) { result = fetch4(plane${p}, source); return; }`).join("\n")}
+  result = fetch4(plane7, source);
+}`;
+
+/**
  * The centre norm over an already-contracted pair-major tensor.
  *
  * The statistics are accumulated group by group and then component by
@@ -314,6 +416,52 @@ void main() {
   float inverseStd = inversesqrt(totalSquares / float(C) - mean * mean + epsilon);
   result = (mine - mean) * inverseStd * fetch4(scaleTex, group) + fetch4(offsetTex, group);
 }`;
+
+/**
+ * One contraction into `output`: the pair-blocked kernel where the shape takes
+ * it, the one-pair-a-fragment kernel otherwise.
+ *
+ * `direction` is only a label here - the caller has already transposed the
+ * incoming case into an outgoing one.
+ *
+ * @param {import("../../runtime/execution.js").Execution} execution
+ */
+function contractInto(execution, output, a, b, length, channels, divideByLength, direction) {
+  // The pair block needs L divisible by four (two i and four j a fragment) and
+  // eight render targets; `MAX_DRAW_BUFFERS` is at least four everywhere, so
+  // the one-pair kernel stays for a context that has only four.
+  const blocked = length % 4 === 0 && execution.maxDrawBuffers >= 8
+    && !execution.noContractBlock;
+  if (!blocked) {
+    execution.dispatch({
+      source: splitContractSource(length, channels, direction === "incoming" ? "incoming" : "outgoing",
+        divideByLength, !execution.noTriangleCoalesce),
+      output,
+      inputs: { aTex: a, bTex: b },
+      label: `af3.triangle.contract-only:${direction}:${length}x${channels}`
+        + `${divideByLength ? ":over-length" : ""}`,
+    });
+    return output;
+  }
+  const planeTexels = (length / 2) * (length / 4) * (channels / 4);
+  const planes = Array.from({ length: 8 },
+    (_, p) => execution.allocate(planeTexels * 4, `af3.triangle.pair-plane${p}`));
+  execution.dispatch({
+    source: blockedContractSource(length, channels, direction, divideByLength),
+    outputs: planes,
+    inputs: { aTex: a, bTex: b },
+    label: `af3.triangle.contract-block:${direction}:${length}x${channels}`
+      + `${divideByLength ? ":over-length" : ""}`,
+  });
+  execution.dispatch({
+    source: contractRepackSource(length, channels),
+    output,
+    inputs: Object.fromEntries(planes.map((plane, p) => [`plane${p}`, plane])),
+    label: `af3.triangle.contract-repack:${length}x${channels}`,
+  });
+  for (const plane of planes) execution.release(plane);
+  return output;
+}
 
 /**
  * @param {import("../../runtime/execution.js").Execution} execution
@@ -414,26 +562,12 @@ export function triangleMultiplication(execution, call) {
           label: `af3.triangle.transpose-${name}:${length}x${channels}`,
         });
       }
-      execution.dispatch({
-        // outgoing(bT, aT) is sum_k bT[c][i][k] * aT[c][j][k], which is
-        // incoming(a, b) = sum_k a[c][k][j] * b[c][k][i].
-        source: splitContractSource(length, channels, "outgoing", divideByLength, true),
-        output: contracted,
-        inputs: { aTex: bT, bTex: aT },
-        label: `af3.triangle.contract-only:incoming-transposed:${length}x${channels}`
-          + `${divideByLength ? ":over-length" : ""}`,
-      });
+      contractInto(execution, contracted, bT, aT, length, channels, divideByLength,
+        "incoming-transposed");
       execution.release(aT);
       execution.release(bT);
     } else {
-      execution.dispatch({
-        source: splitContractSource(length, channels, direction, divideByLength,
-          !execution.noTriangleCoalesce),
-        output: contracted,
-        inputs: { aTex: a, bTex: b },
-        label: `af3.triangle.contract-only:${direction}:${length}x${channels}`
-          + `${divideByLength ? ":over-length" : ""}`,
-      });
+      contractInto(execution, contracted, a, b, length, channels, divideByLength, direction);
     }
     execution.dispatch({
       source: centreNormSource(length, channels),

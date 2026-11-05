@@ -157,6 +157,12 @@ export class Execution {
      */
     this.noTriangleCoalesce = options.noTriangleCoalesce ?? false;
     /**
+     * The control arm for the pair-blocked contraction
+     * (`webgl/af3/trunk/triangle.js`): one pair a fragment, which reads both
+     * operands' rows for every pair instead of sharing them across a block.
+     */
+    this.noContractBlock = options.noContractBlock ?? false;
+    /**
      * Where the HOST time inside `dispatch` goes, when asked for.
      *
      * 🔴 BECAUSE THE GPU IS 3% OF AN AF2 WebGL FOLD AND NOTHING SAID SO.
