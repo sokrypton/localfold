@@ -31,6 +31,12 @@ import { linear } from "../../kernels/linear.js";
 import { add, relu } from "../../runtime/elementwise.js";
 
 /** @typedef {import("../../runtime/storage.js").Tensor} Tensor */
+/** @typedef {{weight: Tensor, bias: Tensor}} Projection */
+/**
+ * @typedef {{inputWeight: Tensor, inputBias: Tensor, initialInputWeight: Tensor,
+ *   initialInputBias: Tensor, angleWeight: Tensor, angleBias: Tensor,
+ *   residual1: Projection[], residual2: Projection[]}} SidechainWeights
+ */
 
 export const SIDECHAIN_WEIGHTS = [
   "inputWeight", "inputBias", "initialInputWeight", "initialInputBias",
@@ -63,7 +69,7 @@ void main() {
  * @param {import("../../runtime/execution.js").Execution} execution
  */
 export function uploadSidechainWeights(execution, weights) {
-  /** @type {Record<string, Tensor>} */
+  /** @type {any} */
   const out = {};
   for (const name of SIDECHAIN_WEIGHTS) {
     const values = weights[name];
@@ -84,6 +90,7 @@ export function uploadSidechainWeights(execution, weights) {
 
 export function releaseSidechainWeights(execution, weights) {
   for (const name of SIDECHAIN_WEIGHTS) execution.release(weights[name]);
+  /** @type {Projection[][]} */
   for (const group of [weights.residual1, weights.residual2]) {
     for (const { weight, bias } of group) {
       execution.release(weight);
@@ -94,7 +101,7 @@ export function releaseSidechainWeights(execution, weights) {
 
 /**
  * @param {import("../../runtime/execution.js").Execution} execution
- * @param {{activations: Tensor, initialActivations: Tensor, weights: object,
+ * @param {{activations: Tensor, initialActivations: Tensor, weights: SidechainWeights,
  *   length: number, inputChannels: number, hiddenChannels: number}} call
  * @returns {{angles: Tensor, unnormalizedAngles: Tensor}} the caller owns both
  */
@@ -102,8 +109,9 @@ export function sidechainAngles(execution, call) {
   const {
     activations, initialActivations, weights: w, length, inputChannels, hiddenChannels,
   } = call;
-  for (const [name, tensor] of [["activations", activations],
-    ["initialActivations", initialActivations]]) {
+  /** @type {[string, Tensor][]} */
+  const inputs = [["activations", activations], ["initialActivations", initialActivations]];
+  for (const [name, tensor] of inputs) {
     if (tensor.elements !== length * inputChannels) {
       throw new RangeError(
         `sidechainAngles: ${name} holds ${tensor.elements} floats, not `
