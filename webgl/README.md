@@ -115,6 +115,8 @@ webgl/
     sampler.js                  the walk, with the pair conditioning cached across it
     confidence.js               pLDDT, PAE, pTM - and the stack added to its own input
     model/fold.js               the whole ESMFold2 fold, from two checkpoints
+  bioemu2/
+    denoiser.js                 the dual stream: 16 layers coupled through every centre atom
   heads/
     distogram.js                P(d < 8 A) for every pair - the contact map the page draws
     confidence.js               pLDDT, PAE and the pTM term
@@ -508,7 +510,8 @@ not.
 AF2 is done, both graphs, and so is AF3 - and AF3 FOLDS: a 59-residue chain through the whole
 48-block trunk and 25 diffusion steps is **21.0 s** here against the WGSL fold's 1.26 s, with a
 median CA-CA of **3.855 A**, mean pLDDT 57.076 against the WGSL fold's 57.048, and the worst atom
-**0.078 A** from it. Still to come: ESMFold2 and bioemu2.
+**0.078 A** from it. ESMFold2 folds too (below), and bioemu2's denoiser is ported - what is left of
+bioemu2 is its input embedder, its trunk and a fold driver.
 
 🔴 **AND THE FOLD FOUND A BUG NO STAGE GATE COULD.** The confidence head CLAMPED the trunk's single
 to +/-512 on the branch where AF3 uses it raw - protenix2 is the model that normalises there - which
