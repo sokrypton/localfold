@@ -23,6 +23,14 @@
  *   - `outputBias` is added BEFORE the division, so the bias is divided too:
  *     `(output[index] + weights[p.output_bias + z]) / (p.normalization_epsilon
  *     + count)`. Adding it after is a different function of the mask.
+ *
+ *     🔴 AND boltz2 ADDS IT AFTER, AND CLAMPS RATHER THAN NUDGES.
+ *     `cpu/af3/trunk/msa.js` prices it: "AF3 is `(product @ W + b) / (1e-3 +
+ *     count)`; boltz2 is `product @ W / max(count, 1) + b`. The difference is
+ *     worth exactly `(1 - 1/n) * b` - a per-channel CONSTANT on every pair - so
+ *     it is invisible at MSA depth 1, where it is zero, and worth 15/16 of the
+ *     bias at depth 16." That is why `biasAfterNorm` is an option and why a
+ *     depth-1 gate could never see it.
  *   - The normalisation epsilon is **1e-3**, not the LayerNorm's 1e-5, and they
  *     are separate inputs on the WGSL side for that reason.
  *
@@ -86,7 +94,9 @@ void main() {
  * `out[i][j][z] = (sum_s sum_cr intermediate[s][i][cr][z] * right[s][j][cr]
  *                  + outputBias[z]) / (epsilon + sum_s mask[s][i] * mask[s][j])`
  */
-export const opmContractSource = (sequences, length, cOuter, cZ) => `${PRELUDE}${ONE_TARGET}
+export const opmContractSource = (
+  sequences, length, cOuter, cZ, biasAfterNorm = false,
+) => `${PRELUDE}${ONE_TARGET}
 const int SEQUENCES = ${sequences};
 const int L = ${length};
 const int C_OUTER = ${cOuter};
@@ -119,7 +129,9 @@ void main() {
   }
   // ...the bias is inside the division, which is the WGSL side's arrangement
   // and not an obvious one.
-  result = (sum + fetch4(biasTex, z4)) / (normalizationEpsilon + count);
+${biasAfterNorm
+    ? "  result = sum / max(count, 1.0) + fetch4(biasTex, z4);"
+    : "  result = (sum + fetch4(biasTex, z4)) / (normalizationEpsilon + count);"}
 }`;
 
 /**
@@ -144,13 +156,19 @@ export function releaseOuterProductMeanWeights(execution, weights) {
  * @param {import("../runtime/execution.js").Execution} execution
  * @param {{activations: Tensor, mask: Tensor, weights: Record<string, Tensor>,
  *   sequences: number, length: number, cM: number, cOuter: number, cZ: number,
- *   layerNormEpsilon?: number, normalizationEpsilon?: number}} call
+ *   layerNormEpsilon?: number, normalizationEpsilon?: number,
+ *   variance?: "two-pass" | "fast", biasAfterNorm?: boolean}} call
  * @returns {Tensor} `length^2 x cZ`; the caller owns it
  */
 export function outerProductMean(execution, call) {
   const {
     activations, mask, weights: w, sequences, length, cM, cOuter, cZ,
     layerNormEpsilon = 1e-5, normalizationEpsilon = 1e-3,
+    // 🔴 AF2 CENTRES AND AF3 DOES NOT - see kernels/layer-norm.js. The default
+    // is AF2's, because this kernel was written for AF2 and a silent change of
+    // formula is the kind of thing that moves a fold by 1e-4 and nothing else.
+    variance = "two-pass",
+    biasAfterNorm = false,
   } = call;
   const rows = sequences * length;
   if (activations.elements !== rows * cM) {
@@ -171,7 +189,7 @@ export function outerProductMean(execution, call) {
 
   const normalised = layerNorm(execution, {
     x: activations, weight: w.layerNormScale, bias: w.layerNormOffset,
-    rows, channels: cM, epsilon: layerNormEpsilon,
+    rows, channels: cM, epsilon: layerNormEpsilon, variance,
   });
 
   /** Project, then mask - the order the WGSL shader applies them in. */
@@ -200,12 +218,16 @@ export function outerProductMean(execution, call) {
 
   const output = execution.allocate(length * length * cZ, "opm.output");
   execution.dispatch({
-    source: opmContractSource(sequences, length, cOuter, cZ),
+    source: opmContractSource(sequences, length, cOuter, cZ, biasAfterNorm),
     output,
     inputs: {
       intermediateTex: intermediate, rightTex: right, maskTex: mask, biasTex: w.outputBias,
     },
-    floats: { normalizationEpsilon },
+    // 🔴 NOT PASSED IN boltz2's FORM, BECAUSE THE SHADER NO LONGER READS IT.
+    // That variant clamps the count rather than nudging it, so the compiler
+    // strips the uniform and `dispatch` refuses it by name - which is the check
+    // working: "no float uniform `normalizationEpsilon`".
+    ...(biasAfterNorm ? {} : { floats: { normalizationEpsilon } }),
     label: `opm.contract:${sequences}x${length}x${cOuter}x${cZ}`,
   });
   execution.release(intermediate);

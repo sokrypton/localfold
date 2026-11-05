@@ -71,6 +71,8 @@ webgl/
     trunk/grid-attention.js     triangle (grid) self-attention, both directions
     trunk/single-attention.js   the single track, biased by the pair
     trunk/pairformer-block.js   seven sub-layers threaded, not seven parallel deltas
+    trunk/msa-attention.js      pair-weighted averaging: no queries, no keys
+    trunk/msa-block.js          ...and the two crossing lines, with no default
   af2/
     multimer/template.js        the multimer's nine-projection template embedder
     evoformer/block.js          a whole Evoformer block and the extra-MSA block, nine sub-layers
