@@ -72,7 +72,12 @@ against the port's own recycle read pair 3.4e-7, single 1.6e-7, and a cycle cost
 over c in 0.5, 1, 2, 4) on each sample's denoised atoms, its gradient by hand (4.7e-8 against finite differences) and
 weighted as the diffusion term's; it cannot reach zero - a perfect pair's eps is 0.804 - so the smoke test asks the
 loss ABOVE that floor to halve (20 steps: 0.474 -> 0.154, smooth LDDT 0.273 -> 0.220 against a floor of 0.196). The
-bond loss is over ligand-polymer bonds alone, so zero on a protein. Not yet: the confidence
+bond loss is over ligand-polymer bonds alone, so zero on a protein. The confidence head (af3conf.cuh) on AF3's 20-step
+mini-rollout of the denoiser being trained, its inputs detached: pLDDT, PDE and PAE targets measured against the crystal
+(token centres CA, frames N-CA-C as Algorithm 30), weight 1e-4. 🔴 **THE TARGETS ARE THE ONES THE HEAD WAS TRAINED ON,
+CHECKED RATHER THAN ASSUMED**: before any step the pretrained head's expectations read pLDDT 0.854 against a measured 0.837,
+PAE 3.18 against 2.92 A, PDE 0.71 against 0.51 A - a wrong bin width, frame or neighbour set would put them far apart.
+20 steps: pLDDT CE 2.54 -> 0.94, PDE 0.87 -> 0.14, PAE 1.98 -> 1.18; the rollout and head add ~310 ms a step. Not yet: the confidence
 head's losses, BF16 and the stack's memory machinery, more than one target.
 
 🔴 **THE DENOISER'S 4e-4 IS THE PORT'S ROUNDING, AND IT WAS SHOWN RATHER THAN ASSUMED.** boltz2 reads 4.1e-4 against

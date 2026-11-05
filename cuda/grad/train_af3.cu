@@ -2,7 +2,7 @@
 // the trunk embedder, the MSA stack, the pairformer, the distogram head and the denoiser (af3embed.cuh, af3.cuh,
 // af3denoise.cuh) - trained on one featurised target against its crystal, every parameter updated by AdamW (adam.cuh).
 //
-//   loss = 4 L_diffusion + 0.03 L_distogram        (AF3's weights; supplement section 4)
+//   loss = 4 (L_diffusion + L_smooth_lddt) + 0.03 L_distogram + 1e-4 L_confidence        (AF3's weights; supplement section 4)
 //   L_diffusion: per step `--samples` noise levels, sigma = 16 exp(-1.2 + 1.5 N(0, 1)); the crystal centred, randomly
 //     rotated and translated (1 A), noised, denoised; the crystal rigidly aligned onto the prediction (no gradient) and
 //     (sigma^2 + 16^2) / (16 sigma)^2 * mean over atoms of |x - x_aligned|^2 / 3
@@ -12,7 +12,10 @@
 // weigh (a padded slot's restype is zero, and a one-hot of zero is a one) - 0.54 of the pair here when it was left out.
 //
 // Recycling: a step runs 1..--cycles passes (uniform), the gradient through the last only. Smooth LDDT (Algorithm 27).
-// Not yet: the bond loss (ligand-polymer bonds only: zero on a protein), the confidence head and its losses, mixed precision, more than one target.
+// The confidence head on AF3's 20-step mini-rollout (no gradient), its inputs detached: pLDDT (each atom's LDDT against
+// the token centres within 15 A, 50 bins), PDE (centre-distance error, 64 bins of 0.5 A) and PAE (j's centre in i's
+// N-CA-C frame, Algorithm 30), weight 1e-4 - protein tokens only. Not yet: the bond loss (ligand-polymer bonds only:
+// zero on a protein), the experimentally-resolved head, nucleotide and ligand frames, mixed precision, more than one target.
 //
 // Before training it holds its own trunk to cuda/af3's runTrunk on the same input (pass 0): the composition this file
 // writes, against the port's.
@@ -27,8 +30,10 @@
 #include <sstream>
 #include "../af3/src/trunk.cuh"
 #include "../af3/src/diffusion.cuh"
+#include "../af3/src/sampler.cuh"
 #include "../featurise/af3_weights.h"
 #include "adam.cuh"
+#include "af3conf.cuh"
 #include "af3denoise.cuh"
 #include "af3embed.cuh"
 #include "af3tmpl.cuh"
@@ -281,6 +286,26 @@ int main(int argc, char** argv) {
     stackFlags(e.stack, E + ".blocks.0");
     stackFlags(dn.decStack, Dd + ".blocks.0");
   }
+  // ---- the confidence head (test_af3conf.cu's setup)
+  g::af3::ConfidenceHead ch;
+  {
+    const std::string P = "confidence";
+    ch.C = (int)M.meta(P + ".pairChannels"); ch.Cs = (int)M.meta(P + ".singleChannels"); ch.F = (int)M.meta(P + ".targetFeatWidth");
+    ch.reembed = M.flag("trunk.dialect.reembedConfidencePair"); ch.globalNorm = M.flag("trunk.dialect.confidenceGlobalNorm");
+    ch.binMode = M.flag("trunk.dialect.confidenceCaDgram") ? g::af3::BIN_CA : g::af3::BIN_AF3;
+    ch.bins = ch.reembed ? 64 : (int)(M.at(P + ".distogramFeatProject").length / ch.C); ch.dense = sh.dense;
+    ch.preSym = M.flag("trunk.dialect.preSymmetrisedPde");
+    ch.d = g::af3::Dialect{M.flag("trunk.dialect.swapTransposedBias"), M.flag("trunk.dialect.triangleMulDivideByLength")};
+    int nb = 0; while (M.has(P + ".blocks." + std::to_string(nb) + ".singleChannels")) ++nb;
+    const std::string B0 = P + ".blocks.0";
+    const bool hasGrid = M.has(B0 + ".pairAttention1.heads");
+    g::af3::forEachParam(ch, nb, hasGrid ? (int)M.meta(B0 + ".pairAttention1.heads") : 0,
+                         hasGrid ? (int)M.meta(B0 + ".pairAttention1.dimension") : 0, (int)M.meta(B0 + ".singleAttention.heads"),
+                         (int)M.meta(B0 + ".singleAttention.dimension"),
+                         (int)(M.at(B0 + ".pairTransition.transition1").length / (2 * (size_t)ch.C * ch.C)),
+                         (int)(M.at(B0 + ".singleTransition.transition1").length / (2 * (size_t)ch.Cs * ch.Cs)),
+                         M.has(B0 + ".pairAttention1.gatingQueryBias"), hasGrid, M.flag("trunk.dialect.parallelPairformer"), has, load);
+  }
   size_t nparams = 0; for (auto* p : ps.all) nparams += p->n;
   printf("%s (%s): %d tokens, %zu atom slots; %d MSA blocks, %d pairformer blocks, distogram %d bins; %zu tensors, %.1f M parameters\n",
          family.c_str(), bundle.c_str(), n, atoms, nMsa, nPf, dh.bins, ps.all.size(), nparams / 1e6);
@@ -335,10 +360,11 @@ int main(int argc, char** argv) {
   }
   const int Cz = te.C, Cs = te.Cs, Cm = te.Cm, bins = dh.bins;
   std::vector<int> binOf(nn, -1);
+  std::vector<int> pbI(n); std::vector<float> pbM(n);
   {
     const ::Gather pbG = gatherOf("batch.tokenAtomsToPseudoBeta");
-    std::vector<int> pbI(n); GK(cudaMemcpy(pbI.data(), pbG.idx, n * 4, cudaMemcpyDeviceToHost));
-    std::vector<float> pbM(n); GK(cudaMemcpy(pbM.data(), pbG.mask, n * 4, cudaMemcpyDeviceToHost));
+    GK(cudaMemcpy(pbI.data(), pbG.idx, n * 4, cudaMemcpyDeviceToHost));
+    GK(cudaMemcpy(pbM.data(), pbG.mask, n * 4, cudaMemcpyDeviceToHost));
     std::vector<double> bounds(bins - 1);
     for (int k = 0; k < bins - 1; ++k) bounds[k] = 2.3125 + (21.6875 - 2.3125) * k / (bins - 2);
     for (int i = 0; i < n; ++i) for (int j = 0; j < n; ++j) {
@@ -436,6 +462,165 @@ int main(int argc, char** argv) {
   for (size_t i = 0; i < atoms; ++i) w[i] = xm[i];
   size_t nAt = 0; for (double v : w) nAt += v > 0;
   std::vector<size_t> live; for (size_t i = 0; i < atoms; ++i) if (w[i] > 0) live.push_back(i);
+  // ---- the confidence losses' pieces: each token's N, CA and C dense slots (a protein token's frame and centre; any
+  // other token has none and is left out of the three targets - not yet AF3's nucleotide and ligand frames)
+  std::vector<int> slotN(n, -1), slotCA(n, -1), slotC(n, -1);
+  {
+    const int* names = M.i("batch.refAtomNameChars"); const float* pm = M.f("batch.predDenseAtomMask");
+    for (int tk = 0; tk < n; ++tk) for (int k = 0; k < sh.dense; ++k) {
+      const size_t i = (size_t)tk * sh.dense + k;
+      if (!pm[i]) continue;
+      std::string nm; for (int c = 0; c < 4; ++c) { int ch_ = names[i * 4 + c]; if (ch_ > 0) nm += (char)(ch_ + 32); }
+      if (nm == "N") slotN[tk] = (int)i; else if (nm == "CA") slotCA[tk] = (int)i; else if (nm == "C") slotC[tk] = (int)i;
+    }
+  }
+  std::vector<double> predMask(atoms);
+  { const float* pm = M.f("batch.predDenseAtomMask"); for (size_t i = 0; i < atoms; ++i) predMask[i] = pm[i]; }
+  g::af3::ConfidenceBatch cb{ri, ti, asym, ent, sym, eb.bonds, eb.bondOrders};
+  // AF3's mini-rollout (its training's 20 sampler steps, no gradient): the structure the confidence head is scored on
+  double gamma0 = 0.8, gammaMin = 1.0, noiseScale = 1.003, stepScale = 1.5, sMin = 4e-4, sMax = 160, rho = 7;
+  {
+    const std::string S = "trunk.dialect.sampler.";
+    if (M.has(S + "gamma0")) {
+      gamma0 = M.meta(S + "gamma0"); gammaMin = M.meta(S + "gammaMin"); noiseScale = M.meta(S + "noiseScale");
+      stepScale = M.meta(S + "stepScale"); rho = M.meta(S + "rho"); sMin = M.meta(S + "sigmaMin"); sMax = M.meta(S + "sigmaMax");
+    }
+  }
+  auto rollout = [&](std::mt19937_64& gen, int nsteps) {
+    std::normal_distribution<double> nd(0, 1);
+    auto level = [&](int k) { return noiseSchedule((double)k / nsteps, 16, sMin, sMax, rho); };
+    std::vector<double> xs(atoms * 3, 0);
+    for (size_t i = 0; i < atoms; ++i) if (predMask[i]) for (int p = 0; p < 3; ++p) xs[i * 3 + p] = level(0) * nd(gen);
+    g::real *xd = g::ARENA.get(atoms * 3), *od = g::ARENA.get(atoms * 3);
+    size_t live_ = 0; for (double v : predMask) live_ += v > 0;
+    for (int k = 1; k <= nsteps; ++k) {
+      const double prev = level(k - 1), lv = level(k), tHat = prev * (1 + (lv > gammaMin ? gamma0 : 0));
+      // centred, randomly rotated and translated, then noised up to tHat
+      double q[4], qn = 0; for (double& v : q) { v = nd(gen); qn += v * v; } qn = sqrt(qn); for (double& v : q) v /= qn;
+      const double R[3][3] = {{1 - 2 * (q[2] * q[2] + q[3] * q[3]), 2 * (q[1] * q[2] - q[0] * q[3]), 2 * (q[1] * q[3] + q[0] * q[2])},
+                              {2 * (q[1] * q[2] + q[0] * q[3]), 1 - 2 * (q[1] * q[1] + q[3] * q[3]), 2 * (q[2] * q[3] - q[0] * q[1])},
+                              {2 * (q[1] * q[3] - q[0] * q[2]), 2 * (q[2] * q[3] + q[0] * q[1]), 1 - 2 * (q[1] * q[1] + q[2] * q[2])}};
+      double cen[3] = {0, 0, 0}; for (size_t i = 0; i < atoms; ++i) for (int c = 0; c < 3; ++c) cen[c] += predMask[i] * xs[i * 3 + c] / live_;
+      const double tr[3] = {nd(gen), nd(gen), nd(gen)};
+      const double inj = noiseScale * sqrt(std::max(0.0, tHat * tHat - prev * prev));
+      std::vector<double> noisy(atoms * 3, 0);
+      for (size_t i = 0; i < atoms; ++i) {
+        if (!predMask[i]) continue;
+        for (int p = 0; p < 3; ++p) {
+          double v = tr[p]; for (int c = 0; c < 3; ++c) v += R[p][c] * (xs[i * 3 + c] - cen[c]);
+          noisy[i * 3 + p] = v + inj * nd(gen);
+        }
+      }
+      { std::vector<g::real> rr(noisy.begin(), noisy.end()); GK(cudaMemcpy(xd, rr.data(), rr.size() * sizeof(g::real), cudaMemcpyHostToDevice)); }
+      {
+        g::Scratch sc;
+        g::af3::denoiseForward(dn, b, singles[nPf], pairs[nMsa + nPf], tf, seqMask, xd, (g::real)tHat, ri, ti, asym, ent, sym, od);
+      }
+      auto dh_ = g::host(od, atoms * 3);
+      const double coef = stepScale * (lv - tHat) / tHat;
+      for (size_t i = 0; i < atoms * 3; ++i) xs[i] = noisy[i] + coef * (noisy[i] - dh_[i]);
+    }
+    return xs;
+  };
+  // the three confidence losses (AF3 supplement 4.3.1) on a rolled-out structure: their values, and the logits'
+  // cotangents (scaled by `wt`) on the device
+  struct ConfLoss { double plddt = 0, pde = 0, pae = 0, ePl = 0, tPl = 0, ePde = 0, tPde = 0, ePae = 0, tPae = 0; };
+  auto confLoss = [&](const std::vector<double>& xp, const g::af3::ConfidenceLogits& o, double wt, g::real* dPl, g::real* dPde,
+                      g::real* dPae) {
+    ConfLoss L;
+    const int PB = ch.PB, NB = ch.NB;
+    auto dist = [](const std::vector<double>& x, size_t a, size_t c) {
+      double d2 = 0; for (int p = 0; p < 3; ++p) { double e = x[a * 3 + p] - x[c * 3 + p]; d2 += e * e; } return sqrt(d2);
+    };
+    // cross entropy of `bin` over logits at `lg`, its gradient (softmax - one-hot) * scale into `g`
+    auto ce = [](const g::real* lg, int K, int bin, double scale, double* g) {
+      double mx = -1e30; for (int k = 0; k < K; ++k) mx = std::max(mx, (double)lg[k]);
+      double z = 0; for (int k = 0; k < K; ++k) z += exp(lg[k] - mx);
+      for (int k = 0; k < K; ++k) g[k] += scale * (exp(lg[k] - mx) / z - (k == bin));
+      return -(lg[bin] - mx - log(z));
+    };
+    auto valid = [&](int tk) { int a = slotCA[tk]; return a >= 0 && xm[a] > 0; };
+    // (the head's expectation over its bins, centres (k + 0.5) * width - against the measured value, a calibration)
+    auto expect = [](const g::real* lg, int K, double width) {
+      double mx = -1e30; for (int k = 0; k < K; ++k) mx = std::max(mx, (double)lg[k]);
+      double z = 0, e = 0; for (int k = 0; k < K; ++k) { double p = exp(lg[k] - mx); z += p; e += p * (k + 0.5) * width; }
+      return e / z;
+    };
+    // pLDDT: each resolved atom's LDDT against the token centres within 15 A of it, 50 bins over [0, 1]
+    {
+      auto lg = g::host(o.plddt, atoms * PB);
+      std::vector<double> gr(atoms * PB, 0);
+      std::vector<std::pair<size_t, int>> tg;
+      for (size_t l = 0; l < atoms; ++l) {
+        if (!xm[l] || !predMask[l]) continue;
+        double acc = 0; int cnt = 0;
+        for (int m = 0; m < n; ++m) {
+          if (!valid(m) || (size_t)slotCA[m] == l) continue;
+          const double dt = dist(xt, l, slotCA[m]);
+          if (dt >= 15) continue;
+          const double e = fabs(dist(xp, l, slotCA[m]) - dt);
+          for (double c : {0.5, 1.0, 2.0, 4.0}) acc += (e < c) / 4.0;
+          ++cnt;
+        }
+        if (cnt) { tg.push_back({l, std::min(PB - 1, (int)(acc / cnt * PB))}); L.tPl += acc / cnt; L.ePl += expect(&lg[l * PB], PB, 1.0 / PB); }
+      }
+      if (!tg.empty()) { L.tPl /= tg.size(); L.ePl /= tg.size(); }
+      for (auto& [l, bin] : tg) L.plddt += ce(&lg[l * PB], PB, bin, wt / tg.size(), &gr[l * PB]) / tg.size();
+      std::vector<g::real> rr(gr.begin(), gr.end()); GK(cudaMemcpy(dPl, rr.data(), rr.size() * sizeof(g::real), cudaMemcpyHostToDevice));
+    }
+    // PDE: the error in each pair of token centres' distance, 64 bins of 0.5 A
+    {
+      auto lg = g::host(o.pde, nn * NB);
+      std::vector<double> gr(nn * NB, 0);
+      size_t cnt = 0; for (int i = 0; i < n; ++i) for (int j = 0; j < n; ++j) cnt += valid(i) && valid(j);
+      for (int i = 0; i < n; ++i) for (int j = 0; j < n; ++j) {
+        if (!valid(i) || !valid(j)) continue;
+        const double e = fabs(dist(xp, slotCA[i], slotCA[j]) - dist(xt, slotCA[i], slotCA[j]));
+        const size_t ij = (size_t)i * n + j;
+        L.pde += ce(&lg[ij * NB], NB, std::min(NB - 1, (int)(e / 0.5)), wt / cnt, &gr[ij * NB]) / cnt;
+        L.tPde += e / cnt; L.ePde += expect(&lg[ij * NB], NB, 0.5) / cnt;
+      }
+      std::vector<g::real> rr(gr.begin(), gr.end()); GK(cudaMemcpy(dPde, rr.data(), rr.size() * sizeof(g::real), cudaMemcpyHostToDevice));
+    }
+    // PAE: token j's centre in token i's frame (N, CA, C as AF3's Algorithm 30 builds it), predicted against true
+    {
+      auto frame = [&](const std::vector<double>& x, int tk, double o_[3], double e[3][3]) {
+        double w1[3], w2[3], n1 = 0, n2 = 0;
+        for (int p = 0; p < 3; ++p) { o_[p] = x[slotCA[tk] * 3 + p]; w1[p] = x[slotN[tk] * 3 + p] - o_[p]; w2[p] = x[slotC[tk] * 3 + p] - o_[p]; }
+        for (int p = 0; p < 3; ++p) { n1 += w1[p] * w1[p]; n2 += w2[p] * w2[p]; }
+        for (int p = 0; p < 3; ++p) { w1[p] /= sqrt(n1); w2[p] /= sqrt(n2); }
+        double a = 0, c = 0;
+        for (int p = 0; p < 3; ++p) { e[0][p] = w1[p] + w2[p]; e[1][p] = w2[p] - w1[p]; a += e[0][p] * e[0][p]; c += e[1][p] * e[1][p]; }
+        for (int p = 0; p < 3; ++p) { e[0][p] /= sqrt(a); e[1][p] /= sqrt(c); }
+        e[2][0] = e[0][1] * e[1][2] - e[0][2] * e[1][1]; e[2][1] = e[0][2] * e[1][0] - e[0][0] * e[1][2]; e[2][2] = e[0][0] * e[1][1] - e[0][1] * e[1][0];
+      };
+      auto framed = [&](int tk) { return valid(tk) && slotN[tk] >= 0 && slotC[tk] >= 0 && xm[slotN[tk]] && xm[slotC[tk]]; };
+      auto lg = g::host(o.pae, nn * NB);
+      std::vector<double> gr(nn * NB, 0);
+      size_t cnt = 0; for (int i = 0; i < n; ++i) for (int j = 0; j < n; ++j) cnt += framed(i) && valid(j);
+      for (int i = 0; i < n; ++i) {
+        if (!framed(i)) continue;
+        double op[3], ep[3][3], ot[3], et[3][3];
+        frame(xp, i, op, ep); frame(xt, i, ot, et);
+        for (int j = 0; j < n; ++j) {
+          if (!valid(j)) continue;
+          double e2 = 1e-8;
+          for (int a = 0; a < 3; ++a) {
+            double vp = 0, vt = 0;
+            for (int p = 0; p < 3; ++p) { vp += ep[a][p] * (xp[slotCA[j] * 3 + p] - op[p]); vt += et[a][p] * (xt[slotCA[j] * 3 + p] - ot[p]); }
+            e2 += (vp - vt) * (vp - vt);
+          }
+          const size_t ij = (size_t)i * n + j;
+          L.pae += ce(&lg[ij * NB], NB, std::min(NB - 1, (int)(sqrt(e2) / 0.5)), wt / cnt, &gr[ij * NB]) / cnt;
+          L.tPae += sqrt(e2) / cnt; L.ePae += expect(&lg[ij * NB], NB, 0.5) / cnt;
+        }
+      }
+      std::vector<g::real> rr(gr.begin(), gr.end()); GK(cudaMemcpy(dPae, rr.data(), rr.size() * sizeof(g::real), cudaMemcpyHostToDevice));
+    }
+    return L;
+  };
+  const double confWeight = 1e-4;          // AF3's alpha_confidence
+  g::real *dPl = dzeros(atoms * ch.PB), *dPde = dzeros(nn * ch.NB), *dPae = dzeros(nn * ch.NB);
   // pass -1 and the last only measure, on a fixed sigma ladder, so the two are comparable
   for (int step = -1; step <= steps; ++step) {
     const bool train = step >= 0 && step < steps;
@@ -545,10 +730,32 @@ int main(int argc, char** argv) {
         g::add(dTs, ts, (size_t)n * Cs); g::add(dTp, tp, nn * Cz); g::add(dTf, tfd, (size_t)n * te.F);
       }
     }
-    const double loss = 4 * (lDiff + lLddt) + 0.03 * lDist;
+    // the confidence head on a mini-rollout: its inputs detached (AF3 trains it on a stop-gradient copy of the trunk's
+    // pair and single and of the structure), so its losses reach its own parameters alone
+    ConfLoss lc;
+    {
+      g::Scratch sc;
+      std::mt19937_64 gen(train ? rng() : 12345);
+      auto xp = rollout(gen, 20);
+      std::vector<double> beta(n * 3, 0);
+      for (int tk = 0; tk < n; ++tk) if (pbM[tk]) for (int p = 0; p < 3; ++p) beta[tk * 3 + p] = xp[(size_t)pbI[tk] * 3 + p];
+      g::real* betaD = g::ARENA.get(n * 3);
+      { std::vector<g::real> rr(beta.begin(), beta.end()); GK(cudaMemcpy(betaD, rr.data(), rr.size() * sizeof(g::real), cudaMemcpyHostToDevice)); }
+      g::af3::ConfidenceLogits o{};
+      auto cs = g::af3::confidenceForward(ch, pairs[nMsa + nPf], singles[nPf], tf, betaD, seqMask, pairMask, pairMaskT, n, o, cb);
+      lc = confLoss(xp, o, confWeight, dPl, dPde, dPae);
+      if (train)
+        g::af3::confidenceBackward(ch, cs, pairs[nMsa + nPf], singles[nPf], tf, seqMask, pairMask, pairMaskT,
+                                   g::af3::ConfidenceLogits{dPde, dPae, dPl}, nullptr, nullptr, nullptr, cb);
+    }
+    const double lConf = lc.plddt + lc.pde + lc.pae;
+    const double loss = 4 * (lDiff + lLddt) + 0.03 * lDist + confWeight * lConf;
     if (!train) {
-      printf("%s  loss %.4f  (diffusion %.4f, smooth lddt %.4f, distogram %.4f; the fixed sigma ladder, rmsd at sigma < 4: %.3f A)\n",
-             step < 0 ? "before  " : "after   ", loss, lDiff, lLddt, lDist, nLow ? rmsdLow / nLow : -1.0);
+      printf("%s  loss %.4f  (diffusion %.4f, smooth lddt %.4f, distogram %.4f; the fixed sigma ladder, rmsd at sigma < 4: %.3f A)\n"
+             "          confidence on a 20-step rollout: pLDDT %.4f, PDE %.4f, PAE %.4f\n"
+             "          (the head's mean against the measured: pLDDT %.3f / %.3f, PDE %.2f / %.2f A, PAE %.2f / %.2f A)\n",
+             step < 0 ? "before  " : "after   ", loss, lDiff, lLddt, lDist, nLow ? rmsdLow / nLow : -1.0, lc.plddt, lc.pde, lc.pae,
+             lc.ePl, lc.tPl, lc.ePde, lc.tPde, lc.ePae, lc.tPae);
       // the smoke test's verdict: on the same sigmas, the loss above its floor must have come down by half - smooth
       // LDDT cannot reach zero (a perfect pair's eps is the mean of sigmoid(c), 0.804, so its loss floor is 0.196)
       double floor = 0; for (double cc : {0.5, 1.0, 2.0, 4.0}) floor += 4 * (1 - 1 / (1 + exp(-cc))) / 4;
@@ -592,7 +799,8 @@ int main(int argc, char** argv) {
     const double gn = opt.lastNorm;
     cudaEventRecord(e1, STREAM); CK(cudaStreamSynchronize(STREAM));
     float ms; cudaEventElapsedTime(&ms, e0, e1);
-    printf("step %3d  loss %.4f  (diffusion %.4f, smooth lddt %.4f, distogram %.4f)  cycles %d  |grad| %.3e  %.0f ms\n", step, loss, lDiff, lLddt, lDist, c, gn, ms);
+    printf("step %3d  loss %.4f  (diffusion %.4f, smooth lddt %.4f, distogram %.4f, confidence %.3f)  cycles %d  |grad| %.3e  %.0f ms\n",
+           step, loss, lDiff, lLddt, lDist, lConf, c, gn, ms);
     (void)trunkMark;
   }
   return 0;
