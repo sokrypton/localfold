@@ -1831,38 +1831,51 @@ operand across fragments is what workgroup memory is for and WebGL2 has none.
 
 rmsd 1.595 and 201 contacts on every bioemu2 arm; the device peak 416 MiB to 411.
 
-### What binds the triangle contraction: not reuse, not bytes, not arithmetic, not the run length
+### What binds the triangle contraction: operand locality, at 3.91x - and four arms that missed it
 
 The contraction is the second-largest family in a bioemu2 fold at **17.3% of labelled GPU time**, and
 the shipped tiled kernel runs at **4.85 ms and 33.2 GFLOP/s** at 68 tokens and 256 channels where the
 dense projection reaches 375. Four arms in `bench-webgl-contract.js`, each removing one candidate:
 
-| arm | factor | what it rules out |
+| arm | factor | what it says |
 |---|---|---|
-| `aliased-tiled` - both operands one texture | **1.05-1.14x** | operand reuse |
-| `half-tiled` - both operands float16 | **0.97-1.06x** | bandwidth |
-| probe-alu's vec4 ceiling, 5034 GFLOP/s | 142x headroom | arithmetic |
-| `--lengths=68,128,256`, whose k run is L/4 | 33.2 / 40.6 / **19.3** GF/s | the run length |
+| **`resident-tiled`** - every fragment on pair block 0 | **3.91x** | **locality binds** |
+| `aliased-tiled` - both operands one texture | 1.05-1.14x | two operands rather than one: no |
+| `half-tiled` - both operands float16 | 0.96-1.08x | bytes: no |
+| probe-alu's vec4 ceiling, 5034 GFLOP/s | 142x headroom | arithmetic: no |
+| `--lengths=68,128,256`, whose k run is L/4 | 33.2 / 40.6 / **19.3** GF/s | run length: no |
+| gemm-ceiling `--side=128`, 16,384 fragments | **1867 GFLOP/s** | occupancy: no |
 
-**All four are nulls.** The bytes one is the sharpest: the arithmetic said this kernel reads 15.1 M
-`fetch4` a call over 36,992 fragments, which in 4.85 ms is 3.32 G fetch4/s or about **53 GB/s** - DRAM
-speed, where the projection's 282 GB/s must be cache-served - and halving the operands to float16
-changes **nothing** - 0.97x, 1.00x and 1.06x over three runs, a range straddling one, which is a
-null and not a small win. A kernel at DRAM speed that does not care how many bytes it reads is not
-bandwidth-bound, and the inference from "53 GB/s looks like DRAM" to "it is waiting on DRAM" was mine
-and was wrong.
+**`resident-tiled` is 1.26 ms against 4.94 and 127.5 GFLOP/s against 32.6.** So the contraction is
+operand-locality-bound, the same shape of answer the dense projection gives at 3.44x.
 
-🔴 **AND `aliased` ALONE HAD BEEN THE WRONG ARM ALL ALONG.** The shipped contraction is TILE-MAPPED
-and aliasing had only ever been measured against the untiled block, so this file's "aliasing is 1.11x"
-was a statement about a kernel nothing dispatches - the same mistake as the operand probe's straw
-baseline, two sections up. The tiled answer happens to agree at 1.08x, which is luck and not
-vindication: **a diagnostic arm has to sit beside the kernel that ships.**
+🔴 **AND THE FIRST VERSION OF THIS SECTION CLAIMED FOUR NULLS AND NO CAUSE, WHICH IS RETRACTED. The
+mistake is worth more than the number.** `aliased` hands the kernel ONE texture as both operands,
+which halves the **distinct footprint** and leaves every fragment reading its own pair rows - so the
+working set stays past the cache, and the arm's 1.08x says only that having two 4.7 MiB operands
+rather than one is not the constraint. I read it as "reuse is not the constraint", which is a far
+larger claim than the arm supports, and `half-tiled`'s null said the same thing from the byte side:
+**neither footprint nor bytes matter, and locality matters by 3.91x.** The projection's equivalent arm
+had been right all along because it collapses the WORKING SET rather than the footprint. A diagnostic
+arm has to remove the thing you mean to test - and this is the second time in this session that an arm
+measured beside the wrong kernel, after the operand probe's straw baseline.
 
-What is left is the one thing no arm here can vary: **occupancy**. The kernel dispatches 36,992
-fragments where `probe-webgl-gemm-ceiling.js` needs **262,144** to reach 2000 GFLOP/s, and that count
-is `pairs * channels / 32` - fixed by `MAX_DRAW_BUFFERS * 4`, the same budget that caps the
-projection. Which is the same wall from the other side: this backend's two largest kernel families
-are both short of fragments, and the only knob that would add them is more output per invocation.
+The occupancy line is retracted too, and by its own probe: `probe-webgl-gemm-ceiling.js --side=` was a
+literal and had never been swept. Swept, it reads **1867 GFLOP/s on 16,384 fragments**, 1022 on
+32,761, 1444 on 65,536, 1347 on 131,044, 1847 on 262,144 and 1903 on 524,176 - flat within noise. A
+kernel with 36,992 fragments is not short of them.
+
+🔴 **AND THE WORKING SET IS 148 KiB A TILE BECAUSE THE TILE MAPPING SPANS EVERY CHANNEL GROUP.** With
+`TILEW = 2048 / (channels / 4)` = 32 at 256 channels, a 32-wide run of texels is ONE channel group
+and 32 pair blocks, so a rasterisation tile covers about every block there is at that group - 136 pair
+rows of 4 channels and LP values, **148 KiB**. Collapsing that to six rows is the 3.91x. The mapping
+bought its 3.38x by fixing the one-dimensional neighbour and left this untouched, which is where the
+contraction's remaining factor lives.
+
+🔴 **AND `aliased` HAD ALSO BEEN MEASURED AGAINST THE WRONG KERNEL.** The shipped contraction is
+TILE-MAPPED and aliasing had only ever been run against the untiled block, so this file's "aliasing is
+1.11x" was a statement about a kernel nothing dispatches. The tiled answer agrees at 1.08x, which is
+luck rather than vindication - and the arm was asking the wrong question either way.
 
 🔴 **AND THE BENCH IS RED AT `--lengths=256`, PRE-EXISTING.** `CONTRACT_BLOCK_MAX_PAIR_FLOATS`
 declines blocking above 1.57M pair floats, and at L=256 (16.8M) blocking is **1.12x** anyway - 268.52

@@ -28,17 +28,44 @@
  * bar - the blocked path sums the same products in the same order, but the
  * compiler fuses a `dot` and a chain of multiply-adds differently.
  *
- * 🔴 WHAT BINDS IT: NOT REUSE, NOT BYTES, NOT ARITHMETIC, AND NOT THE RUN
- * LENGTH. The shipped tiled kernel is **4.85 ms at 33.2 GFLOP/s** at 68 tokens
+ * 🔴 WHAT BINDS IT: OPERAND LOCALITY, AT 3.91x - AND THE FOUR ARMS THAT SAID
+ * OTHERWISE WERE ALL ASKING THE WRONG QUESTION BUT ONE. `resident-tiled` puts
+ * every fragment on pair block ZERO, so the operand working set collapses from
+ * 148 KiB a rasterisation tile to 6.5: **1.26 ms against 4.94, and 127.5
+ * GFLOP/s against 32.6**. That is the same shape of answer the dense projection
+ * gives (3.44x) and it supersedes the "four nulls" this header used to claim.
+ *
+ * 🔴 THE MISTAKE IS WORTH MORE THAN THE NUMBER. `aliased` hands the kernel ONE
+ * texture as both operands, which halves the DISTINCT footprint and leaves
+ * every fragment reading its own pair rows - so the working set stays past the
+ * cache and the arm reads 1.08-1.14x. I read that as "reuse is not the
+ * constraint". It says only that having two 4.7 MiB operands rather than one is
+ * not the constraint, which is a far smaller claim, and `half-tiled`'s null
+ * (0.96-1.08x) says the same thing from the byte side: **neither footprint nor
+ * bytes matter, and locality matters by 3.91x.** The projection's equivalent
+ * arm had been right all along because it collapses the working set rather than
+ * the footprint. A diagnostic arm has to remove the thing you mean to test.
+ *
+ * What the other three arms still rule out, correctly: arithmetic (probe-alu's
+ * vec4 ceiling is 5034 GFLOP/s, 142x the achieved rate), the k run length
+ * (33.2 / 40.6 / 19.3 GF/s at L = 68 / 128 / 256, not monotone), and occupancy
+ * (`probe-webgl-gemm-ceiling.js --side=128` reaches **1867 GFLOP/s on 16,384
+ * fragments**, where this kernel has 36,992 - so the fragment count is not the
+ * ceiling and the sweep that looked like a plateau was flat all along).
+ *
+ * The old claim, for the record, was: NOT REUSE, NOT BYTES, NOT ARITHMETIC, AND
+ * NOT THE RUN LENGTH. The shipped tiled kernel is **4.85 ms at 33.2 GFLOP/s** at 68 tokens
  * and 256 channels, where the dense projection reaches 375. Four arms, each
  * removing one candidate:
  *
- * | arm | factor | what it rules out |
+ * | arm | factor | what it says |
  * |---|---|---|
- * | `aliased-tiled` - both operands one texture | **1.05-1.14x** | operand reuse |
- * | `half-tiled` - both operands float16 | **0.97-1.06x** | bandwidth |
- * | (probe-alu's vec4 ceiling is 5034 GFLOP/s) | 142x headroom | arithmetic |
- * | `--lengths=68,128,256` - the k run is L/4 | 33.2 / 40.6 / 19.3 GF/s | the run length |
+ * | **`resident-tiled`** - every fragment on block 0 | **3.91x** | **locality binds** |
+ * | `aliased-tiled` - both operands one texture | 1.05-1.14x | two operands vs one: no |
+ * | `half-tiled` - both operands float16 | 0.96-1.08x | bytes: no |
+ * | probe-alu's vec4 ceiling, 5034 GFLOP/s | 142x headroom | arithmetic: no |
+ * | `--lengths=68,128,256`, the k run is L/4 | 33.2 / 40.6 / 19.3 GF/s | run length: no |
+ * | gemm-ceiling `--side=128`, 16,384 fragments | 1867 GFLOP/s | occupancy: no |
  *
  * 🔴 AND `aliased` ALONE WAS THE WRONG ARM FOR FIVE MONTHS, which is why
  * `aliased-tiled` is here. The shipped contraction is TILE-MAPPED and aliasing
@@ -48,10 +75,12 @@
  * sit beside the kernel that ships**, and the tiled answer happens to agree
  * (1.08x) only by luck.
  *
- * So the contraction's 33 GFLOP/s is not explained by any of the four, and the
- * remaining candidate nothing here can vary is OCCUPANCY: 36,992 fragments
- * where `probe-webgl-gemm-ceiling.js` needs 262,144 to reach 2000 GFLOP/s, and
- * the fragment count is `pairs * channels / 32` - fixed by the output budget.
+ * 🔴 AND THE WORKING SET IS 148 KiB A TILE BECAUSE THE TILE MAPPING SPANS EVERY
+ * CHANNEL GROUP. With `TILEW = 2048 / (channels / 4)` = 32 at 256 channels, a
+ * 32-wide run of texels is ONE channel group and 32 blocks, so a tile covers
+ * about every block there is at that group: 136 pair rows of 4 channels and LP
+ * values, 148 KiB. Collapsing it to six rows is the 3.91x. The mapping bought
+ * 3.38x by fixing the 1D neighbour and left this.
  *
  * 🔴 AND THE VERDICT IS RED AT `--lengths=256` AND WAS BEFORE THIS NOTE. The
  * ceiling declines blocking at 16.8M pair floats and blocking is **1.12x**
@@ -92,7 +121,8 @@ const fill = (count, seed) => {
  * separate dispatches and separate questions.
  */
 function contract(execution,
-  { a, b, length, channels, blocked, channelSlowest, tileMapped }, output) {
+  { a, b, length, channels, blocked, channelSlowest, tileMapped,
+    residentOperands = false }, output) {
   if (!blocked) {
     execution.dispatch({
       source: splitContractSource(length, channels, "outgoing", false, true),
@@ -113,7 +143,7 @@ function contract(execution,
     (_, p) => execution.allocate(planeTexels * 4, `bench.pair-plane${p}`));
   execution.dispatch({
     source: blockedContractSource(length, channels, "outgoing", false, channelSlowest,
-      length, tileMapped),
+      length, tileMapped, residentOperands),
     outputs: planes,
     inputs: { aTex: a, bTex: b },
     label: `bench.contract-block:${length}x${channels}`,
@@ -172,7 +202,7 @@ export async function main(device, args) {
     // shape as `probe-webgl-linear-operand.js`'s straw baseline: a diagnostic
     // arm has to sit beside the kernel that ships.
     for (const arm of ["one-pair", "channel-fastest", "blocked", "aliased", "tiled",
-      "aliased-tiled", "half-tiled"]) {
+      "aliased-tiled", "half-tiled", "resident-tiled"]) {
       const blocked = arm !== "one-pair";
       const half = arm === "half-tiled";
       const call = {
@@ -183,6 +213,7 @@ export async function main(device, args) {
         blocked,
         channelSlowest: arm !== "channel-fastest",
         tileMapped: arm.endsWith("tiled"),
+        residentOperands: arm === "resident-tiled",
       };
       const ring = Array.from({ length: iterations },
         () => execution.allocate(pairs * channels, "bench.out"));
@@ -215,6 +246,7 @@ export async function main(device, args) {
       aliasedMs: Number(timings.aliased.toFixed(2)),
       aliasedTiledMs: Number(timings["aliased-tiled"].toFixed(2)),
       halfTiledMs: Number(timings["half-tiled"].toFixed(2)),
+      residentTiledMs: Number(timings["resident-tiled"].toFixed(2)),
       tiledMs: Number(timings.tiled.toFixed(2)),
       tiledSpeedup: Number((timings.blocked / timings.tiled).toFixed(2)),
       aliasedSpeedup: Number((timings.blocked / timings.aliased).toFixed(2)),
@@ -224,6 +256,11 @@ export async function main(device, args) {
       tiledGflops: Number((2 * length * length * length * channels
         / timings.tiled / 1e6).toFixed(1)),
       halfTiledSpeedup: Number((timings.tiled / timings["half-tiled"]).toFixed(2)),
+      // 🔴 THE ARM `aliased` SHOULD HAVE BEEN: every fragment on pair block
+      // zero, so the operand working set is a few KiB instead of 9.4 MiB.
+      residentTiledSpeedup: Number((timings.tiled / timings["resident-tiled"]).toFixed(2)),
+      residentTiledGflops: Number((2 * length * length * length * channels
+        / timings["resident-tiled"] / 1e6).toFixed(1)),
       halfTiledGflops: Number((2 * length * length * length * channels
         / timings["half-tiled"] / 1e6).toFixed(1)),
       channelFastestGflops:

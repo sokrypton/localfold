@@ -119,7 +119,16 @@ export async function main(device, args) {
   const xTex = texture(fill(rows * k, 7));
   const wTex = texture(fill(outs * k, 11));
 
-  const side = 512;
+  // 🔴 `--side` IS HERE TO ASK WHETHER THE FRAGMENT COUNT IS THE CEILING. Both
+  // of this backend's largest families dispatch about 32,000-37,000 fragments -
+  // the dense projection 32,256 and the triangle contraction 36,992 - because
+  // the count is the output's float count over `MAX_DRAW_BUFFERS * 4`, and this
+  // probe reaches its 2000 GFLOP/s at 512 squared, which is **262,144**. If the
+  // rate falls off steeply below that, then the output budget caps the fragment
+  // count, the fragment count caps occupancy, and occupancy caps both families
+  // at once - which is one structural statement instead of two unexplained
+  // kernels. Nothing had swept it: the side was a literal.
+  const side = Number(option(args, "side", "512"));
   const fragments = side * side;
   const ring = Array.from({ length: iterations }, () => {
     const framebuffer = gl.createFramebuffer();

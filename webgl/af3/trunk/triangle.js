@@ -363,8 +363,25 @@ void main() {
  * The channel loop is unrolled so only eight accumulators are live at a time
  * rather than thirty-two, and so that a `vec4` is never indexed by a variable.
  */
+/**
+ * @param residentOperands a DIAGNOSTIC ONLY, and never a kernel: it forces every
+ *   fragment onto pair block ZERO, so all of them read the same two rows and
+ *   four columns and the operand working set collapses from 9.4 MiB to a few
+ *   KiB. It computes the wrong answer and `bench-webgl-contract.js` never
+ *   compares it for one.
+ *
+ *   🔴 IT EXISTS BECAUSE THE `aliased` ARM DOES NOT ASK WHAT IT CLAIMS TO.
+ *   Handing the kernel one texture as both operands halves the DISTINCT
+ *   footprint and leaves every fragment reading its own pair rows, so the
+ *   working set is still 4.7 MiB and still past the cache - which is why that
+ *   arm reads 1.05-1.14x and rules out far less than it appears to. The
+ *   projection's equivalent (`x-aliased` in probe-webgl-linear-operand.js)
+ *   makes every fragment read the SAME rows, and there it is 3.44x. This is
+ *   that arm for the contraction.
+ */
 export const blockedContractSource = (length, channels, direction, divideByLength,
-  channelSlowest = true, paddedLength = length, tileMapped = false) => {
+  channelSlowest = true, paddedLength = length, tileMapped = false,
+  residentOperands = false) => {
   const planes = 8;
   const component = ["x", "y", "z", "w"];
   // For the outgoing direction a row is `a[i][k]`, contiguous in k; for the
@@ -430,8 +447,8 @@ ${tileMapped
   int cgroup = texel / BLOCKS;`
     : `  int cgroup = texel % C4;
   int block = texel / C4;`}
-  int jblock = block % JBLOCKS;
-  int iblock = block / JBLOCKS;
+  int jblock = ${residentOperands ? "0" : "block % JBLOCKS"};
+  int iblock = ${residentOperands ? "0" : "block / JBLOCKS"};
   int i0 = iblock * 2;
   int i1 = i0 + 1;
   int j0 = jblock * 4;
