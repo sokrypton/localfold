@@ -39,7 +39,7 @@
  * this port be handed the same ones.
  */
 import { ONE_TARGET, PRELUDE } from "../runtime/execution.js";
-import { layerNorm } from "../kernels/layer-norm.js";
+import { layerNorm, layerNormStatsSource } from "../kernels/layer-norm.js";
 import { linear } from "../kernels/linear.js";
 
 /** @typedef {import("../runtime/storage.js").Tensor} Tensor */
@@ -287,6 +287,60 @@ void main() {
  * passes its input through unscaled. Adding it on the other side is the same
  * arithmetic only when alpha is zero.
  */
+/** Whether adaLN splits its statistics out at this width - see `splitAdaLnSource`. */
+export const adaLnSplits = (execution, channels) =>
+  channels % 4 === 0 && !execution.noNormSplit && channels >= 768;
+
+/** adaLN in two passes: the row statistics once a row, then the modulation. */
+export function adaLnSplit(execution, { x, alpha, beta, rows, channels, epsilon }, into) {
+  const stats = execution.allocate(rows * 4, "bioemu2.adaln.stats");
+  execution.dispatch({
+    source: layerNormStatsSource(rows, channels, "two-pass"),
+    output: stats,
+    inputs: { xTex: x },
+    floats: { epsilon },
+    label: `bioemu2.adaln-stats:${rows}x${channels}`,
+  });
+  execution.dispatch({
+    source: splitAdaLnSource(rows, channels),
+    output: into,
+    inputs: { xTex: x, statsTex: stats, alphaTex: alpha, betaTex: beta },
+    label: `bioemu2.adaln-apply:${rows}x${channels}`,
+  });
+  execution.release(stats);
+  return into;
+}
+
+/**
+ * adaLN with the row statistics READ rather than swept, for the pass above.
+ *
+ * 🔴 THE SAME 1.03x MECHANISM AS `layerNorm`'s, AND THE SAME MEASURED BAND.
+ * `adaLnSource` below has every fragment sweep its whole row twice - once for
+ * the mean and once for the spread - and there are `C4` fragments a row, so the
+ * row is read `2 * C4` times over: 448 at 896 channels. `bench-webgl-norm.js`
+ * prices the identical shape of kernel at **4.84x** split at 768 channels, and
+ * at **0.33x** at 128, because the saving scales with `C4` while the cost - one
+ * extra draw and a statistics pass of one fragment a row - does not. So this
+ * runs only where that bench measured no loss at any row count, 768 channels
+ * and wider, and `--no-norm-split` is the arm for both.
+ */
+export const splitAdaLnSource = (rows, channels) => `${PRELUDE}${ONE_TARGET}
+const int C4 = ${channels / 4};
+const int ELEMENTS = ${rows * channels};
+uniform sampler2D xTex;
+uniform sampler2D statsTex;
+uniform sampler2D alphaTex;
+uniform sampler2D betaTex;
+
+void main() {
+  int texel = linearTexel();
+  if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
+  int row = texel / C4;
+  vec2 stats = fetch4(statsTex, row).xy;
+  vec4 normalised = (fetch4(xTex, texel) - vec4(stats.x)) * stats.y;
+  result = normalised * (vec4(1.0) + fetch4(alphaTex, texel)) + fetch4(betaTex, texel);
+}`;
+
 export const adaLnSource = (rows, channels) => `${PRELUDE}${ONE_TARGET}
 const int C4 = ${channels / 4};
 const int CHANNELS = ${channels};
@@ -642,13 +696,17 @@ export function conditionedLayer(execution, call) {
     const alpha = piece(alphaIndex);
     const beta = piece(betaIndex);
     const out = execution.allocate(rows * channels, "bioemu2.adaln");
-    execution.dispatch({
-      source: adaLnSource(rows, channels),
-      output: out,
-      inputs: { xTex: input, alphaTex: alpha, betaTex: beta },
-      floats: { epsilon },
-      label: `bioemu2.adaln:${rows}x${channels}`,
-    });
+    if (adaLnSplits(execution, channels)) {
+      adaLnSplit(execution, { x: input, alpha, beta, rows, channels, epsilon }, out);
+    } else {
+      execution.dispatch({
+        source: adaLnSource(rows, channels),
+        output: out,
+        inputs: { xTex: input, alphaTex: alpha, betaTex: beta },
+        floats: { epsilon },
+        label: `bioemu2.adaln:${rows}x${channels}`,
+      });
+    }
     execution.release(alpha);
     execution.release(beta);
     return out;
@@ -1168,13 +1226,18 @@ export function bioemu2Denoise(execution, call) {
       const alpha = slice(0, width, "alpha");
       const beta = slice(width, width, "beta");
       const modulated = execution.allocate(rows * width, "bioemu2.mix-adaln");
-      execution.dispatch({
-        source: adaLnSource(rows, width),
-        output: modulated,
-        inputs: { xTex: joinedMix, alphaTex: alpha, betaTex: beta },
-        floats: { epsilon },
-        label: `bioemu2.mix-adaln:${rows}x${width}`,
-      });
+      if (adaLnSplits(execution, width)) {
+        adaLnSplit(execution,
+          { x: joinedMix, alpha, beta, rows, channels: width, epsilon }, modulated);
+      } else {
+        execution.dispatch({
+          source: adaLnSource(rows, width),
+          output: modulated,
+          inputs: { xTex: joinedMix, alphaTex: alpha, betaTex: beta },
+          floats: { epsilon },
+          label: `bioemu2.mix-adaln:${rows}x${width}`,
+        });
+      }
       execution.release(joinedMix);
       execution.release(alpha);
       execution.release(beta);

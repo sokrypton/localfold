@@ -825,7 +825,7 @@ Every fold is the same job, the same seed and the same settings either side; `--
 
 | fold | before | after | |
 |---|---:|---:|---:|
-| bioemu2, 6MRR 68 tokens, 4 passes, 20 steps | 968 s | **21.0 s** | **46.1x** |
+| bioemu2, 6MRR 68 tokens, 4 passes, 20 steps | 968 s | **20.7 s** | **46.8x** |
 | ...its trunk | 277.7 s | **21.6 s** | 12.8x |
 | ...its 20 denoiser calls | 658 s | **23.3 s** | 28.2x |
 | ESMFold2, 75 residues, 36-block tower, 3 loops, 15 steps | 253 s | **65.0 s** | **3.9x** |
@@ -2008,6 +2008,7 @@ largest in-major labels in a bioemu2 fold come out on the **one-texel** side:
 | ...and on narrowing x where nothing had to move it | 23.8 s | **22.4 s** | **1.06x** |
 | ...and on the 4x8x1 contraction block | 22.4 s | **21.7 s** | **1.03x** |
 | ...and on the LayerNorm statistics in their own pass | 21.7 s | **21.0 s** | **1.03x** |
+| ...and on adaLN's, the same mechanism and the same band | 21.0 s | **20.7 s** | **1.02x** |
 | bioemu2's trunk | 13.4 s | **10.7 s** | **1.26x** |
 | **ESMFold2**, full configuration | 11.2 s | **9.53 s** | **1.17x** |
 | AlphaFold 3 | 2.36 s | 2.35 s | 1.00x |
