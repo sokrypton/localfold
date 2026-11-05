@@ -6,13 +6,19 @@ backend and needs Chrome/Edge 113+ or Safari 26+ - which the page says in those 
 fold"). WebGL2 has been in Safari since 15 and in Chrome since 56, so it reaches machines and
 operating systems that the WebGPU path refuses outright.
 
-🔴 **THIS TREE IS TWO KERNELS AND A RUNTIME, AND NOTHING SELECTS IT.** It is not a working
-backend and this file is not a plan to pretend otherwise. What is here is the spike that answered
-*can WebGL2 do this work at all* - the two kernels that decide the question, moved out of
-`webgpu/kernels/` where they sat with `webgl2` in their names and no importer - plus the texture
-layout and the limit arithmetic they shared by copy. The honest summary is in the sections below:
-the numerics are **now checked and correct**, the speed is **better than anyone here expected**,
-and the shapes are **worse**.
+🔴 **ALPHAFOLD 2 FOLDS HERE NOW, AND NOTHING SELECTS IT YET.** A 59-residue monomer from
+`model-af2-monomer-int5`, 4 extra-MSA blocks and 48 Evoformer blocks, the template stack, eight
+structure iterations and both confidence heads: **consecutive alpha carbons 3.834 A, pLDDT 57.941
+against the WGSL fold's 57.938, and the worst atom 0.0705 A away** against a measured f16 floor of
+0.0554 A. `tools/gpu/fold-af2-webgl.js` is that fold and that comparison. The two things still
+missing before it could ship are the MULTIMER and the SPEED - it is 7.1 s where WebGPU is 0.42 s on
+this M5 - and neither is a correctness question.
+
+This file began as the spike that answered *can WebGL2 do this work at all*: the two kernels that
+decide it, moved out of `webgpu/kernels/` where they sat with `webgl2` in their names and no
+importer, plus the texture layout and the limit arithmetic they shared by copy. The honest summary
+of the sections below: the numerics are **checked and correct**, the speed is **17x off the WebGPU
+path and was better than anyone here expected per kernel**, and the shapes are **worse**.
 
 🔴 **AND THEY WERE UNGATED FOR AS LONG AS THEY EXISTED, WHICH IS WHY THE FIRST THING THIS TREE
 GOT WAS A DIFFERENTIAL.** AGENTS.md requires every GPU kernel to have "a deterministic differential
@@ -71,6 +77,7 @@ webgl/
                                 a distance - eight draws plus five projections
     structure/iteration.js      the IPA update folded in, a transition, and the frame advanced
     structure/module.js         the four stages composed, eight iterations, one hoisted pair norm
+    model/monomer.js            the fold: the stages in order, with recycling, from a real bundle
   heads/
     distogram.js                P(d < 8 A) for every pair - the contact map the page draws
     confidence.js               pLDDT, PAE and the pTM term
@@ -305,8 +312,8 @@ same value, so the uniform mode is all such a probe can excite. `execution.halfD
 instrument that fits, the same one the stack gate had to reach for, and the no-template arm then
 sits at **7.98e-6 against a measured floor of 7.9e-6**. That the floor is f16 at all is measured
 rather than assumed: `--tri-att-f32` lifts this port's rounding in the triangle attentions and the
-arm gets eighty times WORSE, 6.8e-6 to 5.4e-4, so the WGSL template block stores its attentions in
-f16 exactly as the main block does. `--tri-f32` moves nothing, which is the control.
+arm gets seventy times WORSE, 7.98e-6 to 5.40e-4, so the WGSL template block stores its attentions
+in f16 exactly as the main block does. `--tri-f32` moves nothing, which is the control.
 
 **The structure module composes** - all six outputs against `StructureModuleGpu` at their measured
 floors (coordinates 3.3e-7, representation 3.0e-7, frames 1.6e-7, angles 4-6e-7), which is the
@@ -331,18 +338,62 @@ the variance and the shift cancels in the mean. Half of each row's channels is n
 row and all six arms go red. **A control has to be checked against the FIRST operation its tensor
 meets**, which is now the second time in this campaign that cost a run.
 
-Still to come in AF2: the multimer variant, and reading a weight bundle. After
-that: AF3's pairformer and diffusion, ESMFold2, bioemu2.
+## It folds
+
+```
+node tools/gpu-chrome.mjs tools/gpu/fold-af2-webgl.js
+node tools/gpu-chrome.mjs tools/gpu/fold-af2-webgl.js --recycles=1 --no-reference
+```
+
+`webgl/af2/model/monomer.js` is the driver: the template stack once, then every pass through the
+input embedder, the extra-MSA stack, the Evoformer stack, the structure module, the confidence
+heads and the contact map, carrying the MSA's first row, the pair and the atom37 forward. 59
+residues, one pass, from `model-af2-monomer-int5`:
+
+| | WebGL2 | WGSL |
+|---|---|---|
+| consecutive CA, median | 3.834 A | - |
+| mean pLDDT | 57.941 | 57.938 |
+| atom37, relRMS | 2.45e-3 | - |
+| worst atom apart | 0.0705 A | - |
+| f16 dither floor, worst atom | 0.0554 A | - |
+| fold | 7111 ms | 417 ms |
+| weights resident | 446.4 MiB | - |
+| draws | 5187 | - |
+
+🔴 **AND "0.07 A APART" IS MEANINGLESS WITHOUT ITS FLOOR, WHICH IS WHY THE TOOL MEASURES ONE.** The
+trunk keeps three intermediates in f16 with no switch to reach them, so both backends quantise, and
+two f32 values one step apart that straddle an f16 boundary round 5e-4 apart - compounded over 48
+blocks and eight structure iterations that reaches the coordinates. `execution.halfDither`
+perturbs by one f32 step INSIDE every one of those roundings and the fold is run again: **0.0554 A
+at the worst atom**, the same order as the cross-backend 0.0705, so the disagreement is
+quantisation and not a defect. `atFloor` is that comparison and the verdict fails on it. With a
+recycle at 24 residues the two agree to **0.0154 A against a 0.0347 A floor** and pLDDT to all
+three decimals.
+
+🔴 **AND THE CHAIN GEOMETRY IS A GATE HERE TOO, FOR THE REASON `fold-af2.js` HAS ONE.** pLDDT reads
+**92.50 on a fold truncated to one Evoformer block whose chain has collapsed to 0.774 A between
+consecutive alpha carbons** - measured, in this tool, on the way to the working fold. Both backends
+produce that same collapsed structure from one block, agreeing to 0.0365 A, so it is the model at
+depth one and not a port error; what it is NOT is detectable from the confidence number. The bands
+are `fold-af2.js`'s own.
+
+🔴 **`--main-blocks=` AND `--extra-blocks=` TRUNCATE BOTH SIDES**, which is how a divergence is told
+from an accumulation: one block agreeing and forty-eight not is an accumulating difference, where a
+disagreement at the first block is a defect in the block.
+
+Still to come in AF2: the multimer variant. After that: AF3's pairformer and diffusion, ESMFold2,
+bioemu2.
 
 Every operation so far is checked against TWO references - an f64 CPU one written from the
 operation, and the WGSL kernel run in the same page - because a single reference cannot say which
 side is wrong. That has already paid for itself twice: the triangle contraction's incoming
 direction was the pair-transpose of itself and only the WGSL arm could see it, and the attention
 block read 1e-3 against WGSL while reading 2.5e-7 against f64, which was an unpinned precision axis
-on the WGSL side rather than a defect here. Nothing is wired to a weight
-bundle yet - every kernel takes its operands as plain arrays, and reading
-`model-af2-monomer-int5` is its own stage with its own differential, because a transposed weight is
-a plausible-looking wrong answer.
+on the WGSL side rather than a defect here. And since `model/monomer.js` there is a third
+reference that none of them is: **a real checkpoint**. docs/AF2.md records why that matters - "a
+packing that moved the real model 4e-4 read 6e-7 on noise" - because real weights are not uniform,
+so a layout or a transpose that noise forgives shows up in a fold.
 
 ## No compute shaders, and everything follows from that
 
@@ -531,7 +582,14 @@ node tools/gpu-chrome.mjs tools/gpu/check-webgl-kernels.js     both kernels agai
 
 ## Making it selectable
 
-Two lines, neither of which should move before a fold actually runs here: `tools/build_site.py`'s
-`DIRECTORIES` does not copy this tree, so it is not on the site; and the page requires WebGPU
-rather than choosing a backend. A backend on the site that cannot fold is worse than no backend,
-because the page would offer it.
+Two lines: `tools/build_site.py`'s `DIRECTORIES` does not copy this tree, so it is not on the site;
+and the page requires WebGPU rather than choosing a backend.
+
+🔴 **THE PRECONDITION IS NOW MET AND THE DECISION IS STILL NOT AUTOMATIC.** This section used to say
+neither line should move "before a fold actually runs here", and one does. What has not been
+settled is whether a backend **17x slower** should be offered: a 59-residue fold is 7.1 s against
+0.42 s, and a 255-residue one has not been measured at all. A visitor with no WebGPU gets a fold
+instead of a refusal, which is the whole point of the tree; a visitor who waits four minutes for
+something the other path does in fifteen seconds may not thank anyone. The multimer is also still
+absent, so the page would have to offer a monomer-only backend. Those are product questions, so
+they are written down here rather than decided in a commit.

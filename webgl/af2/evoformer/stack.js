@@ -27,7 +27,8 @@ import { evoformerBlock, extraMsaBlock } from "./block.js";
 /**
  * @param {import("../../runtime/execution.js").Execution} execution
  * @param {Omit<Parameters<typeof evoformerBlock>[1], "weights">
- *   & {blockWeights: Parameters<typeof evoformerBlock>[1]["weights"][]}} call
+ *   & {blockWeights: Parameters<typeof evoformerBlock>[1]["weights"][],
+ *      onBlock?: (block: number, blocks: number) => void}} call
  * @returns {{msa: Tensor, pair: Tensor, blocks: number}}
  */
 export function evoformerStack(execution, call) {
@@ -37,7 +38,8 @@ export function evoformerStack(execution, call) {
 /**
  * @param {import("../../runtime/execution.js").Execution} execution
  * @param {Omit<Parameters<typeof extraMsaBlock>[1], "weights">
- *   & {blockWeights: Parameters<typeof extraMsaBlock>[1]["weights"][]}} call
+ *   & {blockWeights: Parameters<typeof extraMsaBlock>[1]["weights"][],
+ *      onBlock?: (block: number, blocks: number) => void}} call
  * @returns {{msa: Tensor, pair: Tensor, blocks: number}}
  */
 export function extraMsaStack(execution, call) {
@@ -52,8 +54,15 @@ function runStack(execution, call, block, label) {
   let msa = call.msa;
   let pair = call.pair;
   let own = false;
-  for (const weights of blockWeights) {
+  for (const [index, weights] of blockWeights.entries()) {
     const next = block(execution, { ...call, msa, pair, weights });
+    // 🔴 AFTER THE BLOCK, NOT BEFORE IT, AND SYNCHRONOUS. A caller counting
+    // progress wants to hear that a block is DONE; the WebGPU stack's own note
+    // says the same thing about its `onBlockDone` ("when the device finishes a
+    // block, not when one is queued"). Here a draw is issued as it is encoded,
+    // so returning from `block` is as close to done as this API gets - the GPU
+    // may still be behind, and a count of blocks ISSUED is what this reports.
+    call.onBlock?.(index, blockWeights.length);
     // The caller's two tensors are never released; everything this loop
     // produced is, as soon as the next block has replaced it.
     if (own) {

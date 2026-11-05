@@ -189,3 +189,53 @@ export function maskRows(execution, { x, mask, rows, channels }, into) {
     label: `elementwise.maskRows:${rows}x${channels}`,
   });
 }
+
+/**
+ * `out[i] = x[i]` for the first `elements` of `x` - the leading prefix, copied.
+ *
+ * 🔴 IT EXISTS BECAUSE A TENSOR HERE CANNOT BE A VIEW OF ANOTHER. AF2's
+ * structure module reads the trunk MSA's FIRST ROW, which on the WebGPU side is
+ * `copyBufferToBuffer` of the leading `length * 256` floats out of a buffer that
+ * holds every alignment row. A texture cannot be aliased with a smaller element
+ * count and a fragment shader cannot sample the texture it draws into, so the
+ * prefix is a draw.
+ *
+ * The copy is EXACT and not merely close: both tensors are addressed linearly
+ * from element zero, so when the prefix is a multiple of four every destination
+ * texel is one source texel fetched whole. A prefix that is not a multiple of
+ * four would straddle, so it is refused rather than silently rounded - every
+ * caller in this model has a channel count that is a multiple of four.
+ */
+export const prefixSource = (elements) => `${PRELUDE}${ONE_TARGET}
+const int ELEMENTS = ${elements};
+uniform sampler2D aTex;
+
+void main() {
+  int texel = linearTexel();
+  if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
+  result = fetch4(aTex, texel);
+}`;
+
+/**
+ * @param {import("./execution.js").Execution} execution
+ * @param {Tensor} a
+ * @param {number} elements how many leading floats to copy; a multiple of four
+ * @param {Tensor} [into]
+ * @returns {Tensor}
+ */
+export function prefix(execution, a, elements, into) {
+  if (elements % 4 !== 0) {
+    throw new RangeError(`prefix: elements must be a multiple of 4, got ${elements}`);
+  }
+  if (elements > a.elements) {
+    throw new RangeError(`prefix: asked for ${elements} of a tensor holding ${a.elements}`);
+  }
+  const output = into ?? execution.allocate(elements, "prefix");
+  if (output === a) {
+    throw new Error("prefix: a fragment shader cannot read the texture it draws into");
+  }
+  return execution.dispatch({
+    source: prefixSource(elements), output, inputs: { aTex: a },
+    label: `elementwise.prefix:${elements}`,
+  });
+}

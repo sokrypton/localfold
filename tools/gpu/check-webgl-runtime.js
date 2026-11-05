@@ -29,7 +29,7 @@
  * must throw rather than silently read whatever was on unit 0.
  */
 import { Execution } from "../../webgl/runtime/execution.js";
-import { add, multiply, scale } from "../../webgl/runtime/elementwise.js";
+import { add, multiply, prefix, scale } from "../../webgl/runtime/elementwise.js";
 import { layerNorm } from "../../webgl/kernels/layer-norm.js";
 import { transposeLeading } from "../../webgl/runtime/transpose.js";
 import { linear } from "../../webgl/kernels/linear.js";
@@ -153,6 +153,16 @@ export async function main(device, args) {
       want((x) => Math.fround(x * 0.375)), 0);
     refuses("add into its own input", "cannot read the texture it draws into",
       () => add(execution, aT, bT, aT));
+    // The leading prefix, which has to be a COPY and not merely close: it is how
+    // the structure module gets the trunk MSA's first row out of a tensor
+    // holding every alignment row. 4096 rather than 2048 because the control
+    // skews element 2054 and a prefix that stops short of it cannot go red.
+    arm("elementwise prefix", execution.read(prefix(execution, aT, 4096)),
+      a.slice(0, 4096), 0);
+    refuses("a prefix that is not a multiple of four", "multiple of 4",
+      () => prefix(execution, aT, 10));
+    refuses("a prefix longer than its tensor", "of a tensor holding",
+      () => prefix(execution, aT, elements + 4));
   }
 
   // --- LayerNorm ----------------------------------------------------------

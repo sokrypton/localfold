@@ -222,7 +222,7 @@ export async function main(device, args) {
   //
   // 🔴 AND THE f16 IS THE REFERENCE'S CHOICE, MEASURED NOT ASSUMED.
   // `--tri-att-f32` lifts this port's rounding in the triangle attentions and
-  // the no-template arm goes from 6.8e-6 to **5.4e-4**, eighty times WORSE - so
+  // the no-template arm goes from 7.98e-6 to **5.40e-4**, seventy times WORSE - so
   // the WGSL template block stores its attentions in f16 exactly as the main
   // block does, and matching it is what the agreement rests on. `--tri-f32`
   // moves nothing, which is the control: the triangle multiplications are f32 on
