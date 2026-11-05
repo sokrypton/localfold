@@ -46,6 +46,18 @@
  * 🔴 AND THE FIRST VERSION OF THESE FIGURES READ 6.62x AND IS RETRACTED - see
  * the straw-baseline note at the end of this header.
  *
+ * 🔴 `packed-x` ASKS WHETHER THE INTENSITY CAP CAN BE BROKEN, AND THE ANSWER IS
+ * NO - A 3.4x LOSS. The cap of 21.33-23.3 flops a fetch4 assumes FOUR floats a
+ * fetch, which is a property of the format rather than of the API: the int5
+ * weights pack about twenty-five codes into one RGBA32UI texel. x packed as
+ * eight float16s a texel, unpacked with `unpackHalf2x16`, takes the intensity to
+ * **36.6** - and the rate from 20.2 to **1.4 G fetch4/s**, so 10.14 ms becomes
+ * **35.39** and `tiled-2`'s 5.11 becomes 9.88. Four unpacks a texel cost more
+ * than the fetch they save; the codes get away with it because `decodeInt5x8`
+ * pays one unpack for EIGHT weights where this pays four for eight x values, and
+ * the x side is read `R` times a chunk where the weight side is read `C`. So
+ * 23.3 is not only the API's cap but the profitable maximum on this device.
+ *
  * 🔴 `--float` IS THE SAME THREE ARMS FOR THE FLOAT BLOCKED PATH, AND IT
  * EXPLAINS A 3.2x SPREAD BETWEEN TWO TRANSPOSED SHAPES THAT NO ARITHMETIC DOES.
  * `linear.block:4624x1024x256` runs at 144.5 GFLOP/s in a fold and
@@ -257,7 +269,8 @@ ${rows((i) => Array.from({ length: quads }, (_, c) =>
 };
 
 const shader = (inChannels, outChannels, rowsPerFragment, outsPerFragment,
-  rowBlocks, arm, tileWidth = 0, xStride4 = inChannels / 4, halfX = false) => {
+  rowBlocks, arm, tileWidth = 0, xStride4 = inChannels / 4, halfX = false,
+  packedX = false) => {
   const R = rowsPerFragment;
   const C = outsPerFragment;
   const quads = C / 4;
@@ -274,7 +287,13 @@ const int GPR = ${inChannels / INT5_GROUP};
 const int OUTC = ${outChannels / C};
 const int RQ = ${rowBlocks};
 const int XSTRIDE4 = ${xStride4};
-uniform sampler2D xTex;
+// 🔴 PACKED x: EIGHT float16s IN ONE RGBA32UI TEXEL, so one fetch covers eight
+// k where an RGBA16F fetch4 covers four. The int5 WEIGHTS have done this since
+// they were written - about twenty-five codes a texel - and the intensity cap
+// this backend derives (21.33 flops a fetch4 at R + C = 12) assumes FOUR floats
+// a fetch for both operands. Packing x doubles its side of that.
+const int XSTRIDE8 = ${Math.ceil(inChannels / 8)};
+${packedX ? "uniform highp usampler2D xPackTex;" : "uniform sampler2D xTex;"}
 uniform highp usampler2D codeTex;
 uniform sampler2D tableTex;
 ${Array.from({ length: R * quads }, (_, i) =>
@@ -315,7 +334,9 @@ ${Array.from({ length: rowsPerFragment * (outsPerFragment / 4) }, (_, i) =>
   ${arm === "x-aliased" ? "q = 0;" : "q = q % RQ;"}
   int o0 = group * ${C};
   int base = q * ${R};
-${rows((i) => `  int xBase${i} = (base + ${i}) * XSTRIDE4;`)}
+${rows((i) => packedX
+    ? `  int xBase${i} = (base + ${i}) * XSTRIDE8;`
+    : `  int xBase${i} = (base + ${i}) * XSTRIDE4;`)}
 ${rows((i) => Array.from({ length: quads }, (_, c) =>
   `  vec4 acc${i}_${c} = vec4(0.0);`).join("\n"))}
   for (int g = 0; g < GPR; ++g) {
@@ -326,8 +347,12 @@ ${chans((o) => `      vec4 w${o}a, w${o}b;
       decodeInt5x8(codeTex, (o0 + ${o}) * IN + k, sz${o}.x, sz${o}.y, w${o}a, w${o}b);`)}
       int kq = k >> 2;
 ${rows((i) => `      {
-        vec4 xa = fetch4(xTex, xBase${i} + kq);
-        vec4 xb = fetch4(xTex, xBase${i} + kq + 1);
+${packedX ? `        int at${i} = xBase${i} + (k >> 3);
+        uvec4 bits${i} = texelFetch(xPackTex, ivec2(at${i} % W, at${i} / W), 0);
+        vec4 xa = vec4(unpackHalf2x16(bits${i}.x), unpackHalf2x16(bits${i}.y));
+        vec4 xb = vec4(unpackHalf2x16(bits${i}.z), unpackHalf2x16(bits${i}.w));`
+    : `        vec4 xa = fetch4(xTex, xBase${i} + kq);
+        vec4 xb = fetch4(xTex, xBase${i} + kq + 1);`}
 ${Array.from({ length: quads }, (_, c) => `        acc${i}_${c} += vec4(
           dot(xa, w${c * 4 + 0}a) + dot(xb, w${c * 4 + 0}b),
           dot(xa, w${c * 4 + 1}a) + dot(xb, w${c * 4 + 1}b),
@@ -462,6 +487,33 @@ export async function main(device, args) {
   }
   const xTex = floatTexture(xValues);
   const xHalfTex = halfTexture(xValues);
+  // x as eight float16s a texel. `Math.fround` is not the rounding a GPU does
+  // to f16, but this arm is timed and not compared, and the bit pattern only
+  // has to be a legal half for `unpackHalf2x16` to cost what it costs.
+  const xPackTex = (() => {
+    const stride8 = Math.ceil(inChannels / 8);
+    const words = new Uint32Array(rows * stride8 * 4);
+    const half = (v) => {
+      // A minimal float32 -> float16 bit conversion; normals only, which every
+      // value here is (the fill is +/-0.125).
+      const buf = new DataView(new ArrayBuffer(4));
+      buf.setFloat32(0, v);
+      const bits = buf.getUint32(0);
+      const sign = (bits >>> 16) & 0x8000;
+      const exponent = ((bits >>> 23) & 0xff) - 127 + 15;
+      const mantissa = (bits >>> 13) & 0x3ff;
+      if (exponent <= 0) return sign;
+      return sign | (exponent << 10) | mantissa;
+    };
+    for (let r = 0; r < rows; r += 1) {
+      for (let k = 0; k < inChannels; k += 2) {
+        const lo = half(xValues[r * xStride4 * 4 + k]);
+        const hi = half(xValues[r * xStride4 * 4 + k + 1]);
+        words[r * stride8 * 4 + (k >> 1)] = (lo | (hi << 16)) >>> 0;
+      }
+    }
+    return wordTexture(words);
+  })();
   const codeTex = wordTexture(words(groups * INT5_GROUP_WORDS, 11));
   // The scale/zero table is two floats a group, as `int5ScaleZero` reads it.
   const tableTex = floatTexture(fill(groups * 2, 13));
@@ -596,11 +648,13 @@ export async function main(device, args) {
     const armNames = spec === "8x4"
       ? ["shipped", "x-aliased", "w-aliased", "half-x",
         ...legal.map((t) => `tiled-${t}`),
-        ...legal.map((t) => `tiled-${t}-half-x`)]
+        ...legal.map((t) => `tiled-${t}-half-x`),
+        "packed-x", ...legal.map((t) => `tiled-${t}-packed-x`)]
       : ["shipped"];
    for (const arm of armNames) {
     const tileWidth = arm.startsWith("tiled-") ? Number(arm.slice(6).split("-")[0]) : 0;
     const halfX = arm.endsWith("half-x");
+    const packedX = arm.endsWith("packed-x");
     const extent = extentFor(R, C, tileWidth);
     // 🔴 THE FETCH COUNT, EXACTLY AS THE SHADER ISSUES IT, so the achieved rate
     // can be put beside `probe-webgl-fetch-rate.js --ceiling-window=`'s measured
@@ -613,7 +667,7 @@ export async function main(device, args) {
     // beside it rather than hidden in a single figure.
     const groupsOfK = inChannels / INT5_GROUP;
     const chunks = INT5_GROUP / 8;
-    const perGroup = (perDecode) => C + chunks * (C * perDecode + R * 2);
+    const perGroup = (perDecode) => C + chunks * (C * perDecode + R * (packedX ? 1 : 2));
     const fetchesTypical = extent.useful * groupsOfK * perGroup(1.25);
     const fetchesUpper = extent.useful * groupsOfK * perGroup(2);
     // `half-x` alone is the shipped order with a narrower x, so its grid is the
@@ -625,7 +679,8 @@ export async function main(device, args) {
     const program = gl.createProgram();
     gl.attachShader(program, compile(gl, gl.VERTEX_SHADER, VERTEX_SHADER));
     gl.attachShader(program, compile(gl, gl.FRAGMENT_SHADER,
-      shader(inChannels, outChannels, R, C, rowBlocks, arm, tileWidth, xStride4, halfX)));
+      shader(inChannels, outChannels, R, C, rowBlocks, arm, tileWidth, xStride4,
+        halfX, packedX)));
     gl.linkProgram(program);
     if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
       throw new Error(`link ${spec} ${arm}: ${gl.getProgramInfoLog(program)}`);
@@ -638,8 +693,8 @@ export async function main(device, args) {
     gl.enableVertexAttribArray(position);
     gl.vertexAttribPointer(position, 2, gl.FLOAT, false, 0, 0);
     gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, halfX ? xHalfTex : xTex);
-    gl.uniform1i(gl.getUniformLocation(program, "xTex"), 0);
+    gl.bindTexture(gl.TEXTURE_2D, packedX ? xPackTex : (halfX ? xHalfTex : xTex));
+    gl.uniform1i(gl.getUniformLocation(program, packedX ? "xPackTex" : "xTex"), 0);
     gl.activeTexture(gl.TEXTURE1);
     gl.bindTexture(gl.TEXTURE_2D, codeTex);
     gl.uniform1i(gl.getUniformLocation(program, "codeTex"), 1);

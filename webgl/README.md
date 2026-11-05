@@ -2413,6 +2413,27 @@ That is the clearest statement this file can make about why the gap does not clo
 not an impossibility proof: it bounds the dominant family on this device at this working set. What it
 rules out is closing a 5x gap by making these kernels better, because there is 1.26x in them.
 
+🔴 **AND THE ONE WAY TO BREAK THE INTENSITY FACTOR WAS BUILT AND IS A 3.4x LOSS.** The cap assumes
+**four floats a fetch**, and that is an assumption about the FORMAT rather than the API: the int5
+weights have packed about twenty-five codes into one RGBA32UI texel since they were written, and x
+gets four. Packing x as **eight float16s a texel** and unpacking with `unpackHalf2x16` halves its
+side of `R + C`, which by this section's own arithmetic takes the intensity from 23.3 to **36.6** and
+the ceiling from ~600 to ~940 GFLOP/s. Measured:
+
+| arm | ms | GFLOP/s | G fetch4/s | flops a fetch4 |
+|---|---:|---:|---:|---:|
+| the shipped kernel | 10.14 | 182 | 7.8 | 23.3 |
+| **`packed-x`** | **35.39** | **52** | **1.4** | **36.6** |
+| `tiled-2` | 5.11 | 362 | 15.5 | 23.3 |
+| **`tiled-2-packed-x`** | **9.88** | **187** | **5.1** | 36.6 |
+
+**The intensity went up exactly as predicted and the rate fell by 3-11x.** Four `unpackHalf2x16` a
+texel cost far more than the fetch they save - the codes get away with it because `decodeInt5x8` pays
+its unpack once for EIGHT weights against this paying four unpacks for eight x values, while the x
+side is read `R` times a chunk where the weight side is read `C`. So the 23.3 flops a fetch4 is not
+merely the API's cap; on this device it is also the profitable maximum, and the ~600 GFLOP/s ceiling
+stands with both of its factors measured and the obvious route around one of them closed.
+
 🔴 **AND IT RECONCILES WITH `probe-webgl-gemm-ceiling.js`'s 1958-2003 GFLOP/s, WHICH IS NOT A
 CONTRADICTION BUT THE SAME CURVE AT THE OTHER END.** That probe's operands are 32 KiB shared by every
 fragment, so its fetches are served from the smallest cache and it reaches **87-89 G fetch4/s** - far
