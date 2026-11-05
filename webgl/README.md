@@ -61,6 +61,8 @@ webgl/
     evoformer/block.js          a whole Evoformer block and the extra-MSA block, nine sub-layers
                                 each, sharing the six that make up the pair half
     evoformer/stack.js          the loop over blocks, for both kinds
+  heads/
+    distogram.js                P(d < 8 A) for every pair - the contact map the page draws
 ```
 
 ## AF2, which is what this tree is being built for
@@ -189,8 +191,14 @@ The gate asserts a 2e-4 allowance - still 2.5x tighter than f16's own precision 
 arm above its own measured floor, so neither a pass nor a failure can be read off it by mistake.
 `--strict` fails on them.
 
-Still to come: the structure module and the confidence and distogram heads. After AF2: AF3's
-pairformer and diffusion, ESMFold2, bioemu2.
+**The contact map head is done**, at 1.0e-7 to 1.7e-7 against `shared/heads/distogram.js` - the
+page's own host implementation, which keeps f64 accumulators and was written before any of this, so
+it is a second implementation rather than a transcription. It pins three conventions that would each
+produce a plausible map: the pair is symmetrised, the bias is therefore counted twice, and the bin
+straddling the threshold is excluded.
+
+Still to come: the structure module and the confidence head. After AF2: AF3's pairformer and
+diffusion, ESMFold2, bioemu2.
 
 Every operation so far is checked against TWO references - an f64 CPU one written from the
 operation, and the WGSL kernel run in the same page - because a single reference cannot say which
