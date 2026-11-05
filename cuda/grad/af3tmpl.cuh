@@ -31,7 +31,7 @@ inline void forEachParam(TemplateEmbedder& m, int Cq, int Ct, int width, int bin
                          const std::function<void(const std::string&, Param&, size_t)>& f) {
   const std::string P = "trunk.template.";
   m.Cq = Cq; m.Ct = Ct; m.width = width; m.bins = bins;
-  auto lin = [&](const std::string& n, Linear& l, int K, int N) { l.K = K; l.N = N; l.hasBias = false; f(P + n, l.w, (size_t)K * N); };
+  auto lin = [&](const std::string& n, Linear& l, int K, int N) { l.K = K; l.N = N; l.hasBias = false; l.w.fanIn = K; f(P + n, l.w, (size_t)K * N); };
   m.qln.C = Cq; f(P + "queryEmbeddingNormScale", m.qln.g, Cq); f(P + "queryEmbeddingNormOffset", m.qln.b, Cq);
   if (m.fused) {
     lin("zProjection", m.query, Cq, Ct);

@@ -145,6 +145,7 @@ struct Param {
   real* w = nullptr;
   real* g = nullptr;
   size_t n = 0;
+  int fanIn = 0;      // a linear weight's input width (set where the module knows it; 0 elsewhere) - what an initialiser scales by
 };
 struct Params {
   std::vector<Param*> all;

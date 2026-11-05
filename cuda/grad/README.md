@@ -108,8 +108,13 @@ first example whole with every draw seeded) asks the loss above its floor - smoo
 pair's eps being 0.804 - to halve: 6MRR, 20 steps at 1e-4, **0.491 -> 0.206** (mse 0.555 -> 0.095, distogram 1.70 ->
 0.75, pLDDT CE 2.56 -> 0.82), ~1 s a step at 68 tokens and 4 samples. 🔴 **THE CONFIDENCE TARGETS ARE THE ONES THE HEAD
 WAS TRAINED ON, CHECKED RATHER THAN ASSUMED**: before any step the pretrained head's expectations read pLDDT 0.854
-against a measured 0.837, PAE 3.18 against 2.92 A, PDE 0.71 against 0.51 A. Not yet: BF16, OpenFold3's from-scratch
-initialisation (the weights start from the bundle), and the denoiser's 48 samples batched (one at a time here: a 384-token,
+against a measured 0.837, PAE 3.18 against 2.92 A, PDE 0.71 against 0.51 A. `--init=of3` starts from OpenFold3's initialisation
+instead of the bundle (`linear_init_config.py` and `Linear`'s schemes: LeCun and He fan-in truncated normals, gating
+and final zeros, a gating bias 1 and an adaptive-zero gate's -2, LayerNorms 1 and 0 - each weight's kind from the module
+its name is, its fan-in recorded where the module builds the linear). The heads' final projections being zero, every
+cross entropy starts at log(bins) exactly - distogram, PAE and PDE 4.1589, pLDDT 3.912, resolved 0.693, as read - and
+from there 6MRR's mse goes 33.3 -> 12.8 in 40 steps. The Fourier noise embedding is a BUFFER in OpenFold3 (N(0, 1), U(0,
+1), never trained): it is frozen here, under either start. Not yet: BF16, and the denoiser's 48 samples batched (one at a time here: a 384-token,
 48-sample step is ~14 s on this A100, 6.3 s of it the denoiser).
 
 🔴 **THE DENOISER'S 4e-4 IS THE PORT'S ROUNDING, AND IT WAS SHOWN RATHER THAN ASSUMED.** boltz2 reads 4.1e-4 against

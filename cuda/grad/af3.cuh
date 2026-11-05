@@ -423,7 +423,7 @@ inline void forEachParam(Pairformer& b, const std::string& pre, int Cz, int Cs, 
                          bool parallel = false, const std::string& sep = ".") {
   auto ln = [&](const std::string& n, LayerNorm& l, int C) { l.C = C; f(n + "Scale", l.g, C); f(n + "Offset", l.b, C); };
   auto lin = [&](const std::string& n, Linear& l, int K, int N, bool trans = false, bool bias = false) {
-    l.K = K; l.N = N; l.trans = trans; l.hasBias = bias; f(n, l.w, (size_t)K * N);
+    l.K = K; l.N = N; l.trans = trans; l.hasBias = bias; l.w.fanIn = K; f(n, l.w, (size_t)K * N);
   };
   b.hasSingle = hasSingle; b.hasGrid = hasGrid; b.parallel = parallel;
   for (auto* t : {&b.triOut, &b.triIn}) {
@@ -822,7 +822,7 @@ inline void forEachParam(MsaBlock& b, const std::string& pre, int Cz, int Cm, in
                          bool opmBiases, bool gridBiases, const std::function<void(const std::string&, Param&, size_t)>& f) {
   auto ln = [&](const std::string& n, LayerNorm& l, int C) { l.C = C; f(n + "Scale", l.g, C); f(n + "Offset", l.b, C); };
   auto lin = [&](const std::string& n, Linear& l, int K, int N, bool bias = false, const std::string& bn = "") {
-    l.K = K; l.N = N; l.hasBias = bias; f(n, l.w, (size_t)K * N); if (bias) f(bn, l.b, N);
+    l.K = K; l.N = N; l.hasBias = bias; l.w.fanIn = K; f(n, l.w, (size_t)K * N); if (bias) f(bn, l.b, N);
   };
   const std::string O_ = pre + ".outerProductMean";
   b.opm.C = Cm; b.opm.O = O; b.opm.Cz = Cz; b.opm.grouped = b.chai; b.opm.G = G;

@@ -44,6 +44,7 @@ struct Of3Optimizer {
   long step = 0;                         // optimiser steps taken (the scheduler's last_epoch)
   std::vector<real *> m, v, acc, ema;
   std::vector<int> participation;        // examples a parameter took part in since the last step
+  std::vector<char> frozen;              // a buffer in OpenFold3 (the Fourier noise embedding): never updated, never clipped
   int examples = 0;
   double* norm = nullptr;
   double lastNorm = 0, lastLr = 0;
@@ -54,6 +55,7 @@ struct Of3Optimizer {
       real* e = zeros(p->n); GK(cudaMemcpy(e, p->w, p->n * sizeof(real), cudaMemcpyDeviceToDevice)); ema.push_back(e);
     }
     participation.assign(ps.all.size(), 0);
+    frozen.assign(ps.all.size(), 0);
     GK(cudaMalloc(&norm, sizeof(double)));
   }
   double lr(long s) const {
@@ -66,7 +68,7 @@ struct Of3Optimizer {
   template <class F> double clipAndAccumulate(const Params& ps, F disabled) {
     GK(cudaMemsetAsync(norm, 0, sizeof(double), STREAM));
     for (size_t i = 0; i < ps.all.size(); ++i) {
-      if (disabled(i)) continue;
+      if (disabled(i) || frozen[i]) continue;
       Param* p = ps.all[i];
       sqSumK<<<(unsigned)std::min<size_t>(blocks(p->n), 1024), 256, 0, STREAM>>>(p->g, p->n, norm);
     }
@@ -75,7 +77,7 @@ struct Of3Optimizer {
     lastNorm = std::sqrt(h);
     const double coef = clip / std::max(lastNorm, clip);
     for (size_t i = 0; i < ps.all.size(); ++i) {
-      if (disabled(i)) continue;
+      if (disabled(i) || frozen[i]) continue;
       Param* p = ps.all[i];
       scaleAddK<<<blocks(p->n), 256, 0, STREAM>>>(acc[i], p->g, (real)coef, p->n);
       ++participation[i];
@@ -90,6 +92,7 @@ struct Of3Optimizer {
     const real c1 = (real)(1 - std::pow(b1, (double)step)), c2 = (real)(1 - std::pow(b2, (double)step));
     for (size_t i = 0; i < ps.all.size(); ++i) {
       Param* p = ps.all[i];
+      if (frozen[i]) continue;
       const real inv = (real)(1.0 / std::max(1, participation[i]));
       adamOf3K<<<blocks(p->n), 256, 0, STREAM>>>(p->w, acc[i], m[i], v[i], p->n, (real)lastLr, (real)b1, (real)b2, (real)eps, c1, c2, inv);
       emaK<<<blocks(p->n), 256, 0, STREAM>>>(ema[i], p->w, (real)emaDecay, p->n);

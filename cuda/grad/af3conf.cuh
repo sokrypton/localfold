@@ -282,7 +282,7 @@ inline void forEachParam(ConfidenceHead& h, int nb, int Hp, int Dp, int Hs, int 
   auto ln = [&](const std::string& n, LayerNorm& l, int C) {
     l.C = C; f(n + "Scale", l.g, C); if (has(n + "Offset")) f(n + "Offset", l.b, C);
   };
-  auto lin = [&](const std::string& n, Linear& l, int K, int N) { l.K = K; l.N = N; l.hasBias = false; f(n, l.w, (size_t)K * N); };
+  auto lin = [&](const std::string& n, Linear& l, int K, int N) { l.K = K; l.N = N; l.hasBias = false; l.w.fanIn = K; f(n, l.w, (size_t)K * N); };
   if (h.reembed) {
     const std::string R = P + "reembed.";
     ln(R + "sInputsNorm", h.sInLn, h.F); ln(R + "sNorm", h.sLn, h.Cs); ln(R + "zNorm", h.zLn, h.C);

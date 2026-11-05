@@ -722,7 +722,7 @@ inline void forEachParam(DiffEncoder& e, const std::string& E, const std::string
   auto ln = [&](const std::string& n, LayerNorm& l, int C) {
     l.C = C; f(n + "Scale", l.g, C); if (has(n + "Offset")) f(n + "Offset", l.b, C);
   };
-  auto lin = [&](const std::string& n, Linear& l, int K, int N) { l.K = K; l.N = N; l.hasBias = false; f(n, l.w, (size_t)K * N); };
+  auto lin = [&](const std::string& n, Linear& l, int K, int N) { l.K = K; l.N = N; l.hasBias = false; l.w.fanIn = K; f(n, l.w, (size_t)K * N); };
   const int C = e.C, Cp = e.Cp;
   f(R + ".embedRefPos", e.wPos, (size_t)3 * C); f(R + ".embedRefMask", e.wMask, C);
   f(R + ".embedRefElement", e.wElem, (size_t)128 * C); f(R + ".embedRefCharge", e.wCharge, C);
@@ -760,7 +760,7 @@ inline void forEachParam(Denoiser& m, int nbEnc, int nbDec, int nSuper, bool per
     l.C = C; f(n + "Scale", l.g, C); if (has(n + "Offset")) f(n + "Offset", l.b, C);
   };
   auto lin = [&](const std::string& n, Linear& l, int K, int N, const std::string& bias = "") {
-    l.K = K; l.N = N; l.hasBias = !bias.empty() && has(bias); f(n, l.w, (size_t)K * N); if (l.hasBias) f(bias, l.b, N);
+    l.K = K; l.N = N; l.hasBias = !bias.empty() && has(bias); l.w.fanIn = K; f(n, l.w, (size_t)K * N); if (l.hasBias) f(bias, l.b, N);
   };
   auto gt = [&](const std::string& n, GatedTransition& t, int C) {
     t.C = C; t.F = 2 * C; ln(n + ".ffwLayerNorm", t.ln, C);

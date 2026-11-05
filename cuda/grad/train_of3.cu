@@ -26,7 +26,8 @@
 //   nvcc -O2 -std=c++17 -arch=sm_80 --default-stream per-thread -o cuda/grad/train-of3 cuda/grad/train_of3.cu -lcublas -lcublasLt -ldl -lcurand
 //   cuda/grad/train-of3 --bundle=model-openbind0-f32 --family=openbind0 --examples=<file> [--steps=N] [--batch=1]
 //       [--crop=384] [--samples=48] [--lr=1.8e-3] [--warmup=1000] [--bond=0] [--save=<ckpt>] [--save-every=N]
-//       [--resume=<ckpt>] [--seed=1] [--smoke]
+//       [--resume=<ckpt>] [--seed=1] [--init=bundle|of3] [--smoke]
+// --init=of3: OpenFold3's from-scratch initialisation instead of the bundle's weights.
 // --smoke: the gate's short run - before and after, on the first example whole and on fixed draws, the loss above its
 // floor (smooth LDDT's 0.196 a weight) must halve.
 #include <array>
@@ -394,7 +395,7 @@ static of3::Layout layoutOf(const Example& e) {
 
 int main(int argc, char** argv) {
   std::string bundle = "model-openbind0-f32", family = "openbind0", examplesPath, savePath, resumePath;
-  int steps = 30, samples = 48, batch = 1, crop = 384, saveEvery = 0, checkCkpt = -1, checkPerm = -1; unsigned seed = 1; bool smoke = false, ckpt = true;
+  int steps = 30, samples = 48, batch = 1, crop = 384, saveEvery = 0, checkCkpt = -1, checkPerm = -1; std::string init = "bundle"; unsigned seed = 1; bool smoke = false, ckpt = true;
   double lrMax = 1.8e-3, bondWeight = 0; long warmup = 1000;
   for (int i = 1; i < argc; ++i) {
     auto opt = [&](const char* k) { const size_t l = strlen(k); return !strncmp(argv[i], k, l) ? argv[i] + l : nullptr; };
@@ -416,6 +417,7 @@ int main(int argc, char** argv) {
     else if (!strcmp(argv[i], "--no-ckpt")) ckpt = false;
     else if (auto v = opt("--check-ckpt=")) checkCkpt = atoi(v);
     else if (auto v = opt("--check-perm=")) checkPerm = atoi(v);
+    else if (auto v = opt("--init=")) init = v;
     else if (!strcmp(argv[i], "--tf32")) g::TF32 = true;
     else { fprintf(stderr, "train-of3: unknown argument %s\n", argv[i]); return 1; }
   }
@@ -770,7 +772,72 @@ int main(int argc, char** argv) {
   struct Losses { double mse = 0, bond = 0, lddt = 0, diffusion = 0, distogram = 0, plddt = 0, pde = 0, pae = 0, resolved = 0, total = 0; };
   of3::DiffusionWeights DW; DW.bond = bondWeight;
   const double distWeight = 3e-2, confWeight = 1e-4;
+  // --init=of3: OpenFold3's initialisation in place of the bundle's weights (linear_init_config.py and Linear's
+  // schemes): default LeCun and relu He fan-in truncated normals, gating and final zeros (a gating bias 1, an
+  // adaptive-zero gate's bias -2), LayerNorms 1 and 0, the Fourier embedding N(0, 1) and U(0, 1). Each weight's kind
+  // from its name, as OpenFold3's config assigns it to the module it is.
+  if (init == "of3") {
+    std::mt19937_64 ig(seed * 7919 + 17);
+    auto ends = [](const std::string& s, const std::string& t) { return s.size() >= t.size() && !s.compare(s.size() - t.size(), t.size(), t); };
+    auto has = [](const std::string& s, const std::string& t) { return s.find(t) != std::string::npos; };
+    // the direct weights' input widths (registered without a Linear): what they embed
+    auto directFanIn = [&](const std::string& nm, size_t n) -> int {
+      for (auto& [suffix, in] : std::vector<std::pair<std::string, int>>{
+             {".embedRefPos", 3}, {".embedRefMask", 1}, {".embedRefElement", 128}, {".embedRefCharge", 1}, {".embedRefAtomName", 256},
+             {".embedPairOffsets", 3}, {".embedPairDistances", 1}, {".embedPairOffsetsValid", 1}, {"bondEmbedding", 1},
+             {"templatePairEmbedding1", 1}, {"templatePairEmbedding4", 1}, {"templatePairEmbedding5", 1}, {"templatePairEmbedding6", 1},
+             {"templatePairEmbedding7", 1}, {"msaActivations", te.msaWidth}}) if (ends(nm, suffix)) return in;
+      if (ends(nm, "templatePairEmbedding0")) return (int)(n / M.meta("trunk.template.channels"));
+      if (ends(nm, "distogramFeatProject")) return (int)(n / ch.C);
+      return 0;
+    };
+    std::normal_distribution<double> tn(0, 1); std::uniform_real_distribution<double> uni(0, 1);
+    std::map<std::string, int> kinds;
+    for (size_t i = 0; i < ps.all.size(); ++i) {
+      g::Param* p = ps.all[i];
+      const std::string& nm = p->name;
+      const std::string leaf = nm.substr(nm.rfind('.') + 1);
+      std::string kind;
+      if (has(nm, "fourierWeight")) kind = "fourier-normal";
+      else if (has(nm, "fourierBias")) kind = "fourier-uniform";
+      else if (ends(leaf, "Scale")) kind = "one";
+      else if (ends(leaf, "Offset") || leaf == "qBias" || leaf == "outputB" || ends(leaf, "SingleCondScaleBias") || leaf == "SingleCondScaleBias") kind = "zero";
+      else if (ends(leaf, "AdaptiveZeroCondBias")) kind = "minus-two";                      // gating_ada_zero's bias
+      else if (ends(leaf, "AdaptiveZeroCondWeights")) kind = "zero";                        // ...its weights
+      else if (ends(leaf, "SingleCondBias") || ends(leaf, "SingleCondScaleWeights")) kind = "zero";   // ada_ln: linear_s, linear_g final
+      else if (leaf == "gatingQuery" || leaf == "gate" || leaf == "gatingLinear") kind = "zero";      // gating
+      else if (leaf == "transition2" || leaf == "outputW" || leaf == "pairMlp3" || leaf == "atomFeaturesToPositionUpdate" ||
+               leaf == "embedTrunkSingleCond" || leaf == "embedTrunkPairCond" || leaf == "singleCondEmbeddingProjection" ||
+               leaf == "halfLogits" || leaf == "paeLogits" || leaf == "leftHalfDistanceLogits" || leaf == "plddtLogits" ||
+               leaf == "experimentallyResolvedLogits" || leaf == "prevEmbedding" || leaf == "prevSingleEmbedding" ||
+               (leaf == "outputProjection") || (leaf == "ffwTransition2" && has(nm, "diffusion.conditioning")))
+        kind = "zero";                                                                         // final
+      else if (leaf == "transition1" || leaf == "ffwTransition1" || leaf == "pairMlp1" || leaf == "pairMlp2" ||
+               leaf == "templatePairEmbedding8")
+        kind = "relu";
+      else kind = "default";                                                                   // LeCun (Transition2 / ffwTransition2 of an ada block included)
+      ++kinds[kind];
+      std::vector<double> h(p->n);
+      if (kind == "one") std::fill(h.begin(), h.end(), 1.0);
+      else if (kind == "zero") std::fill(h.begin(), h.end(), 0.0);
+      else if (kind == "minus-two") std::fill(h.begin(), h.end(), -2.0);
+      else if (kind == "fourier-normal") for (double& v : h) v = tn(ig);
+      else if (kind == "fourier-uniform") for (double& v : h) v = uni(ig);
+      else {
+        const int fan = p->fanIn > 0 ? p->fanIn : directFanIn(nm, p->n);
+        if (fan <= 0) { fprintf(stderr, "--init=of3: no input width for %s\n", nm.c_str()); return 1; }
+        // trunc_normal_init_: N(0, std) truncated to [-2, 2] standard deviations, std = sqrt(scale / fan) / 0.87962566
+        const double sd = std::sqrt((kind == "relu" ? 2.0 : 1.0) / std::max(1, fan)) / 0.87962566103423978;
+        for (double& v : h) { double z; do z = tn(ig); while (z < -2 || z > 2); v = z * sd; }
+      }
+      std::vector<g::real> r(h.begin(), h.end());
+      GK(cudaMemcpy(p->w, r.data(), r.size() * sizeof(g::real), cudaMemcpyHostToDevice));
+    }
+    printf("OpenFold3's initialisation:"); for (auto& [k, c] : kinds) printf(" %s %d", k.c_str(), c); printf("\n");
+  }
   g::Of3Optimizer opt; opt.maxLr = lrMax; opt.warmup = warmup; opt.init(ps);
+  // the Fourier noise embedding is a buffer in OpenFold3: held, never trained
+  for (size_t i = 0; i < ps.all.size(); ++i) if (ps.all[i]->name.find("fourier") != std::string::npos) opt.frozen[i] = 1;
   if (!resumePath.empty()) { opt.load(ps, resumePath); printf("resumed %s at step %ld\n", resumePath.c_str(), opt.step); }
   std::mt19937_64 rng(seed + 7919 * (uint64_t)opt.step);
   std::normal_distribution<double> N01(0, 1);

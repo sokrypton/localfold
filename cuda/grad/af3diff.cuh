@@ -123,7 +123,7 @@ inline void forEachParam(DiffTransformer& t, const std::string& Tn, int nSuper, 
   t.superProj.assign(nSuper, Linear{});
   t.blocks.assign((size_t)nSuper * t.perSuper, DiffBlock{});
   auto lin = [&](const std::string& n, Linear& l, int K, int N, const std::string& bias = "") {
-    l.K = K; l.N = N; l.hasBias = !bias.empty(); f(n, l.w, (size_t)K * N); if (!bias.empty()) f(bias, l.b, N);
+    l.K = K; l.N = N; l.hasBias = !bias.empty(); l.w.fanIn = K; f(n, l.w, (size_t)K * N); if (!bias.empty()) f(bias, l.b, N);
   };
   auto ada = [&](const std::string& B, AdaLn& a) {
     a.C = C; a.Cc = Cc; a.chai = t.chai; a.xNorm.C = C;
@@ -605,7 +605,7 @@ inline void forEachParam(AtomStack& st, const std::string& P, int nb, bool perBl
   const int C = st.C, Cp = st.Cp, H = st.H, HD = H * st.D, I = 2 * C;
   st.perBlock = perBlock;
   auto lin = [&](const std::string& n, Linear& l, int K, int N, const std::string& bias = "") {
-    l.K = K; l.N = N; l.hasBias = !bias.empty(); f(n, l.w, (size_t)K * N); if (!bias.empty()) f(bias, l.b, N);
+    l.K = K; l.N = N; l.hasBias = !bias.empty(); l.w.fanIn = K; f(n, l.w, (size_t)K * N); if (!bias.empty()) f(bias, l.b, N);
   };
   if (perBlock) {
     st.pns.assign(nb, LayerNorm{}); st.projs.assign(nb, Linear{});
