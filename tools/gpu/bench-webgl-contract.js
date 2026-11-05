@@ -58,7 +58,8 @@ const fill = (count, seed) => {
  * whose operands are already in place - the transpose and the centre norm are
  * separate dispatches and separate questions.
  */
-function contract(execution, { a, b, length, channels, blocked, channelSlowest }, output) {
+function contract(execution,
+  { a, b, length, channels, blocked, channelSlowest, tileMapped }, output) {
   if (!blocked) {
     execution.dispatch({
       source: splitContractSource(length, channels, "outgoing", false, true),
@@ -68,17 +69,24 @@ function contract(execution, { a, b, length, channels, blocked, channelSlowest }
     });
     return;
   }
-  const planeTexels = (length / 2) * (length / 4) * (channels / 4);
+  // The tiled mapping lays the fragment grid as whole texture rows, so its
+  // planes are `ceil(BLOCKS / TILEW)` rows of W rather than BLOCKS * C4 texels.
+  const tileWidth = Math.max(1, Math.floor(2048 / (channels / 4)));
+  const blocks = (length / 2) * (length / 4);
+  const planeTexels = tileMapped
+    ? Math.ceil(blocks / tileWidth) * 2048
+    : blocks * (channels / 4);
   const planes = Array.from({ length: 8 },
     (_, p) => execution.allocate(planeTexels * 4, `bench.pair-plane${p}`));
   execution.dispatch({
-    source: blockedContractSource(length, channels, "outgoing", false, channelSlowest),
+    source: blockedContractSource(length, channels, "outgoing", false, channelSlowest,
+      length, tileMapped),
     outputs: planes,
     inputs: { aTex: a, bTex: b },
     label: `bench.contract-block:${length}x${channels}`,
   });
   execution.dispatch({
-    source: contractRepackSource(length, channels, channelSlowest),
+    source: contractRepackSource(length, channels, channelSlowest, length, tileMapped),
     output,
     inputs: Object.fromEntries(planes.map((plane, p) => [`plane${p}`, plane])),
     label: `bench.contract-repack:${length}x${channels}`,
@@ -112,11 +120,12 @@ export async function main(device, args) {
     // resident weight. If aliasing is much faster, the misses are conflicts; if
     // it is the same, they are not, and that hypothesis dies with the other
     // five in webgl/README.md.
-    for (const arm of ["one-pair", "channel-fastest", "blocked", "aliased"]) {
+    for (const arm of ["one-pair", "channel-fastest", "blocked", "aliased", "tiled"]) {
       const blocked = arm !== "one-pair";
       const call = {
         a, b: arm === "aliased" ? a : b, length, channels, blocked,
         channelSlowest: arm !== "channel-fastest",
+        tileMapped: arm === "tiled",
       };
       const ring = Array.from({ length: iterations },
         () => execution.allocate(pairs * channels, "bench.out"));
@@ -147,6 +156,8 @@ export async function main(device, args) {
       blockedMs: Number(timings.blocked.toFixed(2)),
       channelFastestMs: Number(timings["channel-fastest"].toFixed(2)),
       aliasedMs: Number(timings.aliased.toFixed(2)),
+      tiledMs: Number(timings.tiled.toFixed(2)),
+      tiledSpeedup: Number((timings.blocked / timings.tiled).toFixed(2)),
       aliasedSpeedup: Number((timings.blocked / timings.aliased).toFixed(2)),
       channelFastestGflops:
         Number((flops / timings["channel-fastest"] / 1e6).toFixed(1)),
@@ -171,6 +182,10 @@ export async function main(device, args) {
       // only in which fragment owns which output, so this one is EXACTLY zero.
       orderRelRms: Number(
         relativeRms(answers["channel-fastest"], answers.blocked).toExponential(2)),
+      // The tiled mapping moves which fragment owns which output and nothing
+      // else, so this is exactly zero or the mapping does not invert.
+      tiledRelRms: Number(
+        relativeRms(answers.tiled, answers.blocked).toExponential(2)),
     });
   }
 

@@ -204,6 +204,14 @@ export class Execution {
      */
     this.noContractPad = options.noContractPad ?? false;
     /**
+     * The control arm for the contraction's TILE-AWARE fragment mapping
+     * (`blockedContractSource`): the channel group chosen from the texel index
+     * rather than from the fragment's x range, so a rasterisation tile - a
+     * square of (x, y), whose rows are W apart in the index - spans about a
+     * hundred channel planes instead of one. Worth 3.29x, and bit-identical.
+     */
+    this.noContractTile = options.noContractTile ?? false;
+    /**
      * The blocked projection's rows a fragment, forced - the control arm for
      * `blockRowsFor`'s fragment floor, and the way to sweep it. 0 leaves the
      * resolver alone.

@@ -1053,6 +1053,65 @@ sufficient one. A generalisation measured on one model is a regression on anothe
 reason this is a sentence rather than a shipped defect is that the AF2 differential runs on every
 pass.
 
+### A rasterisation tile is two-dimensional and a texel index is not
+
+🔴 **THE ANSWER TO THE OPEN QUESTION, AFTER SEVEN NULLS: 3.29x ON THE CONTRACTION, BIT-IDENTICAL.**
+Every kernel here decodes its work from `linearTexel()` - `y * W + x` - and reasons about which
+*consecutive indices* share an operand. But fragments are not rasterised in index order: a tile is
+a SQUARE of (x, y), so its rows are **W apart in the index**. With 578 pair blocks per channel, a
+32-row tile therefore spans `32 * 2048 / 578` = **about a hundred channel planes**, each with its
+own 37 KiB of operands - and "order the channel slowest" fixes only the one-dimensional neighbour.
+
+The fix is to take the channel group from the fragment's **x range** instead:
+
+```
+TILEW = W / C4                   // 32 at 256 channels, and C4 divides W for every power of two
+cgroup = (texel % W) / TILEW     // every fragment in an x range shares a channel
+block  = (texel / W) * TILEW + texel % TILEW
+```
+
+A tile is a range of x crossed with a range of y, so a whole tile now shares one channel's
+operands. Measured at 68 tokens and 256 channels, with the cross-arm `relRms` **exactly 0**:
+
+| contraction at 68x256 | |
+|---|---:|
+| channel fastest | 24.59 ms |
+| channel slowest (the previous fix) | 16.21 ms |
+| **tile-mapped** | **4.93 ms** |
+
+| | before | after | |
+|---|---:|---:|---:|
+| **bioemu2**, 20-step 6MRR-68 | 37.8 s | **33.1 s** | **1.14x** |
+| bioemu2's trunk | 18.1 s | **13.5 s** | **1.34x** |
+| **ESMFold2**, full configuration | 15.1 s | **11.3 s** | **1.34x** |
+| AlphaFold 3 (a 4-block trunk prefix) | 2.63 s | 2.58 s | 1.02x |
+
+bioemu2's CA-CA is identical to all sixteen digits and every other quantity holds.
+`--no-contract-tile` is the control arm. The price is 5% more fragments, because the tiled grid is
+whole texture rows.
+
+🔴 **AND THE PROBE THAT FOUND IT WORKS BY ELIMINATION, WHICH IS WHY IT TOOK SEVEN NULLS TO GET
+HERE.** `tools/gpu/probe-webgl-fetch-rate.js` measures the achieved `fetch4` rate as a function of
+the fragment's SHAPE with everything else nailed down - one fragment count, one pair of textures,
+one k axis, 32 output floats - and the contraction's shape is **not** the slow one:
+
+| arm | fetches a k-step | G fetch4/s |
+|---|---:|---:|
+| `8x4x1`, the projection's shape | 12 | 2.55 |
+| `4x4x2` | 16 | 2.98 |
+| **`2x4x4`, the contraction's shape** | 24 | **3.60** |
+
+**So the shape was innocent and the access PATTERN was the whole of it** - which is what turned the
+search from "what is wrong with this kernel" to "what does the hardware actually schedule". Its
+absolute numbers are not the real kernels' (its own neighbours read different rows on purpose), and
+the header says so; what it establishes is a comparison.
+
+🔴 **AND THE SAME QUESTION IS NOW OPEN FOR THE PROJECTION, WHICH IS 34% OF A bioemu2 FOLD.** Its
+decode has the same one-dimensional assumption: neighbouring indices share the eight x rows, and a
+tile's rows are W apart, so a tile spans `W / OUT4` = 16 row blocks and 128 rows of x rather than
+eight. A 2D-tiled mapping there wants a fragment block of 32 by 4 to cover 128 output groups, at
+about 11% more fragments. Unmeasured, and the obvious next thing.
+
 ### A short projection is slow and neither lever moves it
 
 🔴 **ESMFold2's SINGLE TRACK IS 436 CALLS OF A FOLD AT 55 GFLOP/s, where the pair track beside it

@@ -78,6 +78,10 @@
  *                         still leaves FRAGMENT_FLOOR fragments, because a
  *                         short projection is starved rather than
  *                         traffic-bound; this is how that is swept.
+ *   --no-contract-tile    The contraction's channel group taken from the texel
+ *                         INDEX rather than from the fragment's x range, so a
+ *                         rasterisation tile spans about a hundred channel
+ *                         planes instead of one. 3.29x, bit-identical.
  *   --no-contract-pad     The contraction's pair axes left at an odd length,
  *                         so neither the coalesced reads nor the pair block is
  *                         legal and the scalar loop runs. 66% of an ESMFold2
@@ -140,6 +144,7 @@ export function webglExecutionOptions(args) {
     noContractChannelSlowest: flag(args, "no-contract-channel-slowest"),
     noContractCeiling: flag(args, "no-contract-ceiling"),
     noContractPad: flag(args, "no-contract-pad"),
+    noContractTile: flag(args, "no-contract-tile"),
     linearBlockRows: Number(option(args, "block-rows", "0")),
     noPairBiasFast: flag(args, "no-pair-bias-fast"),
     noAttendDot4: flag(args, "no-attend-dot4"),

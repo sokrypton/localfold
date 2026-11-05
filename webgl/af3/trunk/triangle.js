@@ -42,6 +42,7 @@
  * the single track's query projection; these four Linears are bias-free.
  */
 import { ONE_TARGET, PRELUDE, targetDeclarations } from "../../runtime/execution.js";
+import { TEXTURE_WIDTH } from "../../runtime/context.js";
 import { layerNorm } from "../../kernels/layer-norm.js";
 import { linear } from "../../kernels/linear.js";
 import { multiply } from "../../runtime/elementwise.js";
@@ -363,7 +364,7 @@ void main() {
  * rather than thirty-two, and so that a `vec4` is never indexed by a variable.
  */
 export const blockedContractSource = (length, channels, direction, divideByLength,
-  channelSlowest = true, paddedLength = length) => {
+  channelSlowest = true, paddedLength = length, tileMapped = false) => {
   const planes = 8;
   const component = ["x", "y", "z", "w"];
   // For the outgoing direction a row is `a[i][k]`, contiguous in k; for the
@@ -398,19 +399,36 @@ const int C4 = ${channels / 4};
 const int IBLOCKS = ${paddedLength / 2};
 const int JBLOCKS = ${paddedLength / 4};
 const int BLOCKS = ${(paddedLength / 2) * (paddedLength / 4)};
+const int TILEW = ${Math.max(1, Math.floor(2048 / (channels / 4)))};
 uniform sampler2D aTex;
 uniform sampler2D bTex;
 
 void main() {
   int texel = linearTexel();
-  if (texel >= IBLOCKS * JBLOCKS * C4) {
+  if (${tileMapped ? "(texel / W) * TILEW + (texel % TILEW) >= BLOCKS"
+    : "texel >= IBLOCKS * JBLOCKS * C4"}) {
 ${Array.from({ length: planes }, (_, p) => `    result${p} = vec4(0.0);`).join("\n")}
     return;
   }
-${channelSlowest
-  ? `  int block = texel % BLOCKS;
+${tileMapped
+  ? `  // 🔴 A TILE-AWARE MAPPING, BECAUSE A RASTERISATION TILE IS TWO-DIMENSIONAL
+  // AND THE TEXEL INDEX IS NOT. A tile covers a square of (x, y) and the texel
+  // index is y * W + x, so consecutive ROWS of a tile are W apart in the index -
+  // and with BLOCKS of them per channel a 32-row tile spans 32 * W / BLOCKS
+  // channel groups, about a hundred at 68 tokens. Ordering the channel slowest
+  // fixes the one-dimensional neighbour and leaves that untouched.
+  //
+  // Here the channel group is chosen by x / TILEW with TILEW = W / C4, so every
+  // fragment sharing an x RANGE shares a channel - and a tile is a range of x
+  // crossed with a range of y, so a whole tile shares one channel's operands.
+  // It needs C4 to divide W, which every power-of-two channel count does.
+  int lane = texel % TILEW;
+  int cgroup = (texel % W) / TILEW;
+  int block = (texel / W) * TILEW + lane;`
+  : channelSlowest
+    ? `  int block = texel % BLOCKS;
   int cgroup = texel / BLOCKS;`
-  : `  int cgroup = texel % C4;
+    : `  int cgroup = texel % C4;
   int block = texel / C4;`}
   int jblock = block % JBLOCKS;
   int iblock = block / JBLOCKS;
@@ -465,13 +483,14 @@ export const CONTRACT_BLOCK_MAX_PAIR_FLOATS = 1572864;
  * `((i >> 1) * JBLOCKS + (j >> 2)) * C4 + cgroup`.
  */
 export const contractRepackSource = (length, channels, channelSlowest = true,
-  paddedLength = length) => `${PRELUDE}${ONE_TARGET}
+  paddedLength = length, tileMapped = false) => `${PRELUDE}${ONE_TARGET}
 const int L = ${length};
 const int C4 = ${channels / 4};
 // Its OUTPUT is the true L * L pairs and its SOURCE is the padded grid, which
 // is the one place both lengths appear.
 const int JBLOCKS = ${paddedLength / 4};
 const int BLOCKS = ${(paddedLength / 2) * (paddedLength / 4)};
+const int TILEW = ${Math.max(1, Math.floor(2048 / (channels / 4)))};
 const int ELEMENTS = ${length * length * channels};
 ${Array.from({ length: 8 }, (_, p) => `uniform sampler2D plane${p};`).join("\n")}
 
@@ -483,7 +502,9 @@ void main() {
   int i = pair / L;
   int j = pair - i * L;
   int block = (i >> 1) * JBLOCKS + (j >> 2);
-  int source = ${channelSlowest ? "cgroup * BLOCKS + block" : "block * C4 + cgroup"};
+  int source = ${tileMapped
+    ? "(block / TILEW) * W + cgroup * TILEW + (block % TILEW)"
+    : channelSlowest ? "cgroup * BLOCKS + block" : "block * C4 + cgroup"};
   int plane = (i & 1) * 4 + (j & 3);
 ${Array.from({ length: 7 }, (_, p) =>
   `  if (plane == ${p}) { result = fetch4(plane${p}, source); return; }`).join("\n")}
@@ -558,20 +579,33 @@ function contractInto(execution, output, a, b, length, channels, divideByLength,
     });
     return output;
   }
-  const planeTexels = (padded / 2) * (padded / 4) * (channels / 4);
+  // 🔴 THE TILE-AWARE MAPPING WHERE THE CHANNEL GROUPS DIVIDE THE TEXTURE
+  // WIDTH, which is 3.29x and is what the fragment ORDER was a one-dimensional
+  // approximation of. It needs `channels / 4` to divide W, which every
+  // power-of-two channel width does; `TILEW` is then `W / C4` and a whole
+  // rasterisation tile shares one channel's operands.
+  const groups = channels / 4;
+  const tileMapped = !execution.noContractTile && TEXTURE_WIDTH % groups === 0;
+  const tileWidth = TEXTURE_WIDTH / groups;
+  const blocks = (padded / 2) * (padded / 4);
+  // The tiled grid is whole texture rows, which is 5% more fragments at 68
+  // tokens and the price of the mapping.
+  const planeTexels = tileMapped
+    ? Math.ceil(blocks / tileWidth) * TEXTURE_WIDTH
+    : blocks * groups;
   const planes = Array.from({ length: 8 },
     (_, p) => execution.allocate(planeTexels * 4, `af3.triangle.pair-plane${p}`));
   execution.dispatch({
     source: blockedContractSource(length, channels, direction, divideByLength,
-      !execution.noContractChannelSlowest, padded),
+      !execution.noContractChannelSlowest, padded, tileMapped),
     outputs: planes,
     inputs: { aTex: a, bTex: b },
     label: `af3.triangle.contract-block:${direction}:${length}x${channels}${tag}`
-      + `${divideByLength ? ":over-length" : ""}`,
+      + `${tileMapped ? ":tiled" : ""}${divideByLength ? ":over-length" : ""}`,
   });
   execution.dispatch({
     source: contractRepackSource(length, channels,
-      !execution.noContractChannelSlowest, padded),
+      !execution.noContractChannelSlowest, padded, tileMapped),
     output,
     inputs: Object.fromEntries(planes.map((plane, p) => [`plane${p}`, plane])),
     label: `af3.triangle.contract-repack:${length}x${channels}${tag}`,
