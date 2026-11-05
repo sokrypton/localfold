@@ -285,6 +285,7 @@ function pairHalf(execution, call, msa, pairIn, ownPairIn, residual) {
       batch: length, queryLength: length, channels: cZ, heads: starting.heads,
       pairBiasProjection: starting.pairBias.projectionWeight, epsilon,
       storagePrecision: call.triangleAttentionPrecision ?? "f16",
+      ...(call.triangleAttentionParts ?? {}),
     });
     pair = residual(pair, update, ownPair);
     ownPair = true;
@@ -301,6 +302,7 @@ function pairHalf(execution, call, msa, pairIn, ownPairIn, residual) {
       batch: length, queryLength: length, channels: cZ, heads: ending.heads,
       transpose: true, pairBiasProjection: ending.pairBias.projectionWeight, epsilon,
       storagePrecision: call.triangleAttentionPrecision ?? "f16",
+      ...(call.triangleAttentionParts ?? {}),
     });
     execution.release(transposed);
     const update = transposeLeading(execution, {

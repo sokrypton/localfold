@@ -52,28 +52,22 @@
  * **5.8e-8 against 9.5e-5** - that is the whole MSA half, and it now sits at its
  * floor. The triangle attentions' is worth 7.0e-5 against 9.9e-5.
  *
- * 🔴 AND THE PAIR HALF STILL CARRIES ~7e-5 THAT IS NOT ACCOUNTED FOR, REPORTED
- * RATHER THAN ABSORBED. `KNOWN_PAIR_GAP` below is an allowance with a number,
- * not a bar: `--strict` removes it and the arm goes red, which is the gate for
- * whoever closes it. What has been ruled out, each by measurement rather than
- * by reading:
+ * 🔴 AND A 6e-5 PAIR GAP WAS CLOSED BY TWO BISECTS AND NO MORE READING, which
+ * is worth recording because reading the source is what got it wrong. The
+ * shipped block's `pairBiasStorage = options.pairBias?.source === "separate" ?
+ * "f32" : normalizedStorage` reads as "a bias projected from the normalised
+ * input is stored f16", so this port rounded it - and the pair arms sat at
+ * 6.0e-5 with each triangle attention contributing about 3e-5.
  *
- *   - accumulation: a 1e-7 nudge to one input element moves this output by
- *     1.3e-8, so the chain is CONTRACTIVE and cannot amplify rounding to 7e-5
- *   - the triangle multiplication's projections in f16: makes it WORSE
- *     (7.0e-5 -> 9.6e-5)
- *   - the triangle attentions' storage: f16 is better than f32 but not enough
- *   - the transition's hidden activation: matched, worth 1.8e-4 on a transition
- *     in isolation (`check-webgl-transition.js` measures it)
- *   - a length-dependent threshold: the gap is absent at length 1 and 2 and
- *     present from 3 onwards, flat at 5e-5 to 7e-5 through length 7, so it is
- *     not a tile or chunk boundary
- *
- * What remains unexamined is the outer product mean's and the triangle
- * multiplication's own intermediates on the WGSL side, whose allocations carry
- * no storage argument and so ought to be f32. The MSA half reaching its floor
- * is what makes the gap worth stating precisely rather than guessing at: an
- * error in composition would not stop at one half.
+ * `--disable=` zeroes a sub-layer's output projection on BOTH sides, which makes
+ * that residual an identity without either implementation knowing, and put the
+ * gap in the triangle attentions and nowhere else: with only the outer product
+ * mean live the pair arm is 4.4e-8, with both triangle multiplications 6.8e-8,
+ * and it jumps to 3.5e-5 the moment the first triangle attention is let back in.
+ * Then `--tri-att-f32=` sweeps the four rounding points inside them, and only
+ * one lands: **bias in f32 gives 9.2e-8**, where `attended` gives 5.3e-5,
+ * `normalised` 9.2e-5 and `projections` 8.4e-5. Both handles are kept - a gate
+ * that can bisect itself is worth more than one that only reports a number.
  */
 import { EvoformerBlockGpu } from "../../webgpu/af2/evoformer/block.js";
 import { ExtraMsaStackGpu } from "../../webgpu/af2/evoformer/stack.js";
@@ -104,11 +98,6 @@ function generator(seed) {
 
 export async function main(device, args) {
   const falsify = flag(args, "falsify");
-  // 🔴 THE BAR IS THE MEASURED FLOOR, NOT A ROUND NUMBER. A 1e-7 nudge to one
-  // input element moves this output by about 1.3e-8, so two correct f32
-  // implementations of this chain should agree to ~1e-7; 1e-6 is a generous
-  // margin over that and still thirty times tighter than f16.
-  const bar = Number(option(args, "bar", "1e-6"));
   const sequences = Number(option(args, "sequences", "4"));
   const length = Number(option(args, "length", "6"));
   const cM = Number(option(args, "cm", "16"));
@@ -217,6 +206,18 @@ export async function main(device, args) {
     pairTransition: transitionGroup(cZ, pairHidden),
   };
 
+  // 🔴 DISABLING A SUB-LAYER BY ZEROING ITS OUTPUT PROJECTION, ON BOTH SIDES.
+  // A residual whose update is identically zero is an identity, so this turns
+  // the nine-sub-layer chain into any subset of itself WITHOUT either
+  // implementation knowing - both are handed the same zeroed weights, so the
+  // comparison stays exact. It is how the standing pair gap gets localised to a
+  // sub-layer instead of guessed at: `--disable=tri-out,tri-in,tri-att,pair-transition`
+  // leaves the outer product mean as the only live pair sub-layer.
+  const disabled = new Set((option(args, "disable", "") || "").split(",").filter(Boolean));
+  const silence = (group, names) => {
+    for (const name of names) group[name] = new Float32Array(group[name].length);
+  };
+
   const msaValues = noise(sequences * length * cM, 1.5);
   const pairValues = noise(length * length * cZ, 1.5);
   const msaMaskValues = new Float32Array(sequences * length).fill(1);
@@ -224,6 +225,32 @@ export async function main(device, args) {
   const pairMaskValues = new Float32Array(length * length).fill(1);
   pairMaskValues[2] = 0;
   pairMaskValues[length * length - 3] = 0;
+
+  // ...applied after every weight is built, so the shapes are unchanged.
+  const SILENCERS = {
+    "msa-row": () => silence(weights.msaRowAttention.attention, ["outputWeight", "outputBias"]),
+    "msa-column": () => silence(weights.msaColumnAttention.attention,
+      ["outputWeight", "outputBias"]),
+    "msa-transition": () => silence(weights.msaTransition, ["secondWeight", "secondBias"]),
+    opm: () => silence(weights.outerProductMean, ["outputWeight", "outputBias"]),
+    "tri-out": () => silence(weights.triangleMultiplicationOutgoing,
+      ["linearZWeight", "linearZBias"]),
+    "tri-in": () => silence(weights.triangleMultiplicationIncoming,
+      ["linearZWeight", "linearZBias"]),
+    "tri-att-start": () => silence(weights.triangleAttentionStarting.attention,
+      ["outputWeight", "outputBias"]),
+    "tri-att-end": () => silence(weights.triangleAttentionEnding.attention,
+      ["outputWeight", "outputBias"]),
+    "pair-transition": () => silence(weights.pairTransition, ["secondWeight", "secondBias"]),
+  };
+  for (const name of disabled) {
+    const silencer = SILENCERS[name];
+    if (silencer === undefined) {
+      throw new RangeError(
+        `--disable: no sub-layer \`${name}\`; one of ${Object.keys(SILENCERS).join(", ")}`);
+    }
+    silencer();
+  }
 
   const shape = {
     sequences, length, cM, cZ, cOuter, triangleHidden,
@@ -249,6 +276,11 @@ export async function main(device, args) {
       trianglePrecision: option(args, "triangle-precision", "f32"),
       msaAttentionPrecision: option(args, "msa-attention-precision", "f16"),
       triangleAttentionPrecision: option(args, "triangle-attention-precision", "f16"),
+      // A bisect handle: --tri-att-f32=bias,attended keeps the parts named in
+      // f32 and rounds the rest. See the note on the standing pair gap.
+      triangleAttentionParts: Object.fromEntries(
+        (option(args, "tri-att-f32", "") || "").split(",").filter(Boolean)
+          .map((part) => [`${part}Precision`, "f32"])),
     });
     const values = {
       msa: execution.read(out.msa).slice(), pair: execution.read(out.pair).slice(),
@@ -260,22 +292,33 @@ export async function main(device, args) {
   const ours = runOurs(msa);
   const stats = execution.stats();
 
-  // 🔴 WHAT AGREEMENT IS EVEN POSSIBLE: THE CHAIN'S OWN AMPLIFICATION, MEASURED.
+  // 🔴 WHAT AGREEMENT IS EVEN POSSIBLE: THE CHAIN'S CONDITION NUMBER, MEASURED.
   // Nine sub-layers of LayerNorms, GEMMs and a triangle multiplication that
-  // squares its operands' magnitudes. Two correct f32 implementations differ by
-  // whatever this chain does to a rounding difference, so nudging ONE input
-  // element by 1e-7 - about one f32 step - and re-running says what the floor
-  // is. A bar below it would be unmeetable by any correct implementation; a bar
-  // far above it would pass a real error. This is measured rather than assumed
-  // because the alternative is widening a bound until it goes green.
-  const nudged = Float32Array.from(skewed, (v, i) => (i === 0 ? v * (1 + 1e-7) : v));
-  const nudgedTensor = execution.upload(nudged, "msa-nudged");
-  const perturbed = runOurs(nudgedTensor);
-  execution.release(nudgedTensor);
-  const amplification = {
-    msa: Number(relativeRms(perturbed.msa, ours.msa, "amp.msa").toPrecision(3)),
-    pair: Number(relativeRms(perturbed.pair, ours.pair, "amp.pair").toPrecision(3)),
+  // multiplies two projections of its own input. Two correct f32
+  // implementations differ by whatever this chain does to a rounding
+  // difference, so the floor is that amplification times an f32 step.
+  //
+  // 🔴 AND IT IS A RATIO FROM A MEASURABLE NUDGE, NOT ONE f32 STEP. The first
+  // version perturbed one element by 1e-7 - about one step - and the extra
+  // block's pair output came back **exactly** unchanged, because the change was
+  // below the output's own ULP everywhere. A floor of zero is not a floor. A
+  // 1e-5 nudge is far enough above the noise to divide by, and the condition
+  // number it gives is what the bar is set from: `relative change out / in`,
+  // times f32's 1.2e-7.
+  const NUDGE = 1e-5;
+  const conditionOf = (run, baseline, label) => {
+    const nudged = execution.upload(
+      Float32Array.from(skewed, (v, i) => (i === 0 ? v * (1 + NUDGE) : v)), `${label}-nudged`);
+    const perturbed = run(nudged);
+    execution.release(nudged);
+    const inputChange = relativeRms(
+      Float32Array.from(skewed, (v, i) => (i === 0 ? v * (1 + NUDGE) : v)), skewed, "amp.in");
+    const ratio = (name) => Number(
+      (relativeRms(perturbed[name], baseline[name], `amp.${label}.${name}`)
+        / Math.max(inputChange, 1e-30)).toPrecision(3));
+    return { msa: ratio("msa"), pair: ratio("pair") };
   };
+  const amplification = conditionOf(runOurs, ours, "block");
   releaseEvoformerBlockWeights(execution, uploaded);
   for (const tensor of [msa, pair, msaMask, pairMask]) execution.release(tensor);
 
@@ -298,10 +341,20 @@ export async function main(device, args) {
     ...shape, weights,
   });
 
-  // An allowance with a number, not a bar. See the header for what has been
-  // ruled out; `--strict` removes it.
-  const KNOWN_PAIR_GAP = 1e-4;
-  const strict = flag(args, "strict");
+  // 🔴 THE BAR IS EACH ARM'S OWN MEASURED FLOOR, NOT A SHARED CONSTANT. The
+  // condition numbers above differ by three orders of magnitude between the two
+  // blocks - the main block is CONTRACTIVE (0.94 and 0.50) while the extra
+  // block's pair amplifies by about 200, because global attention divides by a
+  // masked count that can be small. So one bar cannot serve both: tight enough
+  // for the main block it is unmeetable for the extra one, and loose enough for
+  // the extra block it would pass a real 1e-5 error in the main one.
+  //
+  // `condition * 1.2e-7` is what two correct f32 implementations can reach; the
+  // factor of three is margin, and the 2e-7 floor keeps a contractive arm from
+  // being held to less than f32 can represent. `--bar=` overrides the lot.
+  const barFor = (condition) => (option(args, "bar", null) !== null
+    ? Number(option(args, "bar", "0"))
+    : Math.max(2e-7, condition * 1.2e-7 * 3));
   // --- and the EXTRA-MSA block, whose only difference is global attention ---
   //
   // 🔴 THIS IS THE ONLY CROSS-CHECK GLOBAL ATTENTION CAN HAVE, because
@@ -321,17 +374,28 @@ export async function main(device, args) {
   const extraPair = execution.upload(pairValues, "extra.pair");
   const extraMask = execution.upload(msaMaskValues, "extra.msa-mask");
   const extraPairMask = execution.upload(pairMaskValues, "extra.pair-mask");
-  const extra = extraMsaBlock(execution, {
-    msa: extraMsaTensor, pair: extraPair, msaMask: extraMask, pairMask: extraPairMask,
+  const runExtra = (msaTensor) => {
+    const out = extraMsaBlock(execution, {
+      msa: msaTensor, pair: extraPair, msaMask: extraMask, pairMask: extraPairMask,
     ...shape, msaHidden, pairHidden, weights: extraUploaded,
     msaAttentionPrecision: option(args, "msa-attention-precision", "f16"),
-    triangleAttentionPrecision: option(args, "triangle-attention-precision", "f16"),
-  });
-  const oursExtra = {
-    msa: execution.read(extra.msa).slice(), pair: execution.read(extra.pair).slice(),
+      triangleAttentionPrecision: option(args, "triangle-attention-precision", "f16"),
+      triangleAttentionParts: Object.fromEntries(
+        (option(args, "tri-att-f32", "") || "").split(",").filter(Boolean)
+          .map((part) => [`${part}Precision`, "f32"])),
+    });
+    const values = {
+      msa: execution.read(out.msa).slice(), pair: execution.read(out.pair).slice(),
+    };
+    execution.release(out.msa);
+    execution.release(out.pair);
+    return values;
   };
-  execution.release(extra.msa);
-  execution.release(extra.pair);
+  const oursExtra = runExtra(extraMsaTensor);
+  // ...and the extra block's own condition number, which is not the main
+  // block's: its MSA half is global attention, whose masked column mean divides
+  // by a count.
+  const extraAmplification = conditionOf(runExtra, oursExtra, "extra");
   releaseEvoformerBlockWeights(execution, extraUploaded);
   for (const tensor of [extraMsaTensor, extraPair, extraMask, extraPairMask]) {
     execution.release(tensor);
@@ -344,7 +408,7 @@ export async function main(device, args) {
 
   const rows = [];
   const failures = [];
-  const gaps = [];
+
   /** @type {[string, any, any][]} */
   const comparisons = [
     ["msa", ours, theirs], ["pair", ours, theirs],
@@ -352,39 +416,43 @@ export async function main(device, args) {
   ];
   for (const [label, mine, reference] of comparisons) {
     const name = label.replace("extra.", "");
+    const condition = label.startsWith("extra.")
+      ? extraAmplification[name] : amplification[name];
+    const armBar = Number(barFor(condition).toPrecision(3));
     const relative = relativeRms(mine[name], reference[name], label);
-    const allowance = name === "pair" && !strict ? KNOWN_PAIR_GAP : bar;
-    const ok = relative <= allowance;
-    const known = name === "pair" && !strict && relative > bar && ok;
+    const ok = relative <= armBar;
     rows.push({
       arm: `${label} vs WGSL block`,
       relativeRms: Number(relative.toPrecision(4)),
-      bar,
-      ...(allowance === bar ? {} : { allowance }),
+      condition,
+      bar: armBar,
       ok,
-      ...(known ? { knownGap: true } : {}),
     });
-    if (!ok) failures.push(`${label}: relRMS ${relative.toExponential(3)} over ${allowance}`);
-    if (known) gaps.push(`${label} at ${relative.toExponential(2)}`);
+    if (!ok) failures.push(`${label}: relRMS ${relative.toExponential(3)} over ${armBar}`);
   }
 
   const red = rows.filter((row) => !row.ok).length;
   return {
     shape: { ...shape, heads, msaHidden, pairHidden },
-    bar,
+    disabled: [...disabled],
     falsify,
     arms: rows,
     // What this backend spent: nine residuals each costing a destination, plus
     // six draws of transposition for the two axis-swapping sub-layers.
     // How far a 1e-7 nudge to one input element travels - the floor any two
     // correct f32 implementations of this chain can agree to.
-    amplificationOfOneUlp: amplification,
+    // Relative output change per relative input change. The floor any two
+    // correct f32 implementations can reach is about this times 1.2e-7.
+    conditionNumber: { block: amplification, extraBlock: extraAmplification },
+    floorImplied: {
+      block: Number((Math.max(amplification.msa, amplification.pair) * 1.2e-7).toPrecision(2)),
+      extraBlock: Number(
+        (Math.max(extraAmplification.msa, extraAmplification.pair) * 1.2e-7).toPrecision(2)),
+    },
     draws: stats.draws,
     programs: stats.programs,
     peakMegabytes: Number((stats.peakBytes / 2 ** 20).toFixed(2)),
     liveTensorsAfter: execution.storage.live.size,
-    strict,
-    knownGaps: gaps,
     verdict: falsify
       ? (red === rows.length
         ? `ok: both representations go red on a 1% perturbation`
@@ -393,9 +461,6 @@ export async function main(device, args) {
         ? `FAILED: ${[...failures,
           ...(execution.storage.live.size ? [`${execution.storage.live.size} leaked`] : [])]
           .join("; ")}`
-        : gaps.length === 0
-          ? `ok: msa and pair both match at the floor, no tensor left live`
-          : `ok with ${gaps.length} known gap(s): ${gaps.join(", ")}`
-            + ` - the msa half is at its floor; see the header, and --strict to fail on it`),
+        : `ok: both blocks match at each arm's measured floor, no tensor left live`),
   };
 }

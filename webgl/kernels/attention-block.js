@@ -54,6 +54,32 @@ import { toHeadMajorSource } from "./pair-bias.js";
 
 /** @typedef {import("../runtime/storage.js").Tensor} Tensor */
 
+/**
+ * Which tensors the shipped block keeps in f16, settled by SWEEPING each one
+ * against the WGSL block rather than by reading its source.
+ *
+ * 🔴 THE BIAS IS f32 AND THE OTHER THREE ARE f16, AND READING THE SOURCE GOT
+ * THIS WRONG. `pairBiasStorage = options.pairBias?.source === "separate" ?
+ * "f32" : normalizedStorage` looks like it says a bias projected from the
+ * normalised input is stored f16 - so this port rounded it, and a whole-block
+ * comparison sat at **6.0e-5** with the two triangle attentions contributing
+ * about 3e-5 each. Keeping the bias in f32 and rounding the other three takes
+ * the same comparison to **9.2e-8**, which is its floor.
+ *
+ * Localising it took two bisects and no further reading: disabling sub-layers by
+ * zeroing their output projections on BOTH sides (a residual whose update is
+ * zero is an identity) put the gap in the triangle attentions and nowhere else -
+ * the outer product mean and both triangle multiplications sit at 4e-8 to 7e-8 -
+ * and then sweeping the four rounding points inside them named the bias. Of the
+ * four, only the bias moves it to the floor: `attended` f32 gives 5.3e-5,
+ * `normalised` f32 gives 9.2e-5, `projections` f32 gives 8.4e-5.
+ *
+ * So a per-tensor default, not a per-group one. Each entry here is a
+ * measurement; `storagePrecision` still sets the group for a caller that wants
+ * to price the whole thing.
+ */
+const DEFAULT_PART = { bias: "f32" };
+
 /** The weights this block reads, in the WGSL side's own spelling. */
 export const ATTENTION_BLOCK_WEIGHTS = [
   "queryNormScale", "queryNormOffset",
@@ -85,7 +111,9 @@ export function releaseAttentionBlockWeights(execution, weights) {
  * @param {{activations: Tensor, mask: Tensor, weights: Record<string, Tensor>,
  *   batch: number, queryLength: number, channels: number, heads: number,
  *   pairBias?: Tensor, pairBiasProjection?: Tensor, transpose?: boolean,
- *   epsilon?: number, storagePrecision?: "f16" | "f32"}} call
+ *   epsilon?: number, storagePrecision?: "f16" | "f32",
+ *   normalisedPrecision?: "f16" | "f32", projectionsPrecision?: "f16" | "f32",
+ *   biasPrecision?: "f16" | "f32", attendedPrecision?: "f16" | "f32"}} call
  * @returns {Tensor} `rows x channels`; the caller owns it
  */
 export function attentionBlock(execution, call) {
@@ -94,6 +122,13 @@ export function attentionBlock(execution, call) {
     pairBias, pairBiasProjection, transpose = false, epsilon = 1e-5,
     storagePrecision = "f16",
   } = call;
+  // 🔴 EACH ROUNDING POINT SEPARATELY, BECAUSE THE SHIPPED BLOCK'S CHOICES ARE
+  // PER TENSOR AND A BLOCK COMPARISON CANNOT SAY WHICH ONE IT DISAGREES ABOUT.
+  // `storagePrecision` sets all four; the individual options are what a bisect
+  // sweeps. Defaults follow the group, so a caller that does not care sees one
+  // switch.
+  const partPrecision = (part) => call[`${part}Precision`] ?? DEFAULT_PART[part]
+    ?? storagePrecision;
   // 🔴 f16 BY DEFAULT, BECAUSE THE SHIPPED AF2 BLOCK IS. It sets
   // `normalizedStorage = "f16"` outright, derives `projectedStorage` as f16 for
   // any channel width that is even, and asks its flash kernel for
@@ -103,6 +138,10 @@ export function attentionBlock(execution, call) {
   // 1.9e-8 floor. `"f32"` is the arm for pricing the rounding; it is not the
   // configuration the primary path runs.
   const half = storagePrecision === "f16";
+  const halfNormalised = partPrecision("normalised") === "f16";
+  const halfProjections = partPrecision("projections") === "f16";
+  const halfBias = partPrecision("bias") === "f16";
+  const halfAttended = partPrecision("attended") === "f16";
   if (pairBias !== undefined && pairBiasProjection !== undefined) {
     throw new Error(
       "attention block: a bias is either pre-projected (pairBias) or projected from "
@@ -128,12 +167,12 @@ export function attentionBlock(execution, call) {
 
   const normalised = layerNorm(execution, {
     x: activations, weight: w.queryNormScale, bias: w.queryNormOffset,
-    rows, channels, epsilon, roundHalf: half,
+    rows, channels, epsilon, roundHalf: halfNormalised,
   });
 
   const project = (weight, bias, activation) => linear(execution, {
     x: normalised, weight, bias, rows, inChannels: channels, outChannels: channels,
-    activation, weightLayout: "in-major", roundHalf: half,
+    activation, weightLayout: "in-major", roundHalf: halfProjections,
   });
 
   // ...projected off the SAME normalised tensor, before it is released.
@@ -144,7 +183,7 @@ export function attentionBlock(execution, call) {
     const pairMajor = linear(execution, {
       x: normalised, weight: pairBiasProjection,
       rows, inChannels: channels, outChannels: heads, weightLayout: "in-major",
-      roundHalf: half,
+      roundHalf: halfBias,
     });
     ownBias = execution.allocate(rows * heads, "attention.bias");
     execution.dispatch({
@@ -164,7 +203,7 @@ export function attentionBlock(execution, call) {
 
   const { output: attended } = attentionFlash(execution, {
     query, key, value, gate, mask, pairBias: pairBias ?? ownBias,
-    batch, queries: queryLength, heads, headDim, transpose, roundHalf: half,
+    batch, queries: queryLength, heads, headDim, transpose, roundHalf: halfAttended,
   });
   for (const tensor of [query, key, value, gate]) execution.release(tensor);
   if (ownBias !== undefined) execution.release(ownBias);

@@ -100,11 +100,23 @@ transpose draw plus the flash core's mask flag, where the WGSL side folds the tr
 normalise. So an Evoformer block's MSA half is complete: row attention with pair bias, column
 attention, and the transition.
 
-**A whole Evoformer block runs**, and `tools/gpu/check-webgl-evoformer-block.js` compares both
-representations against `EvoformerBlockGpu`. The **MSA half matches at its floor** (5.8e-8, against
-a 1.3e-8 floor measured by nudging one input element by 1e-7); the pair half carries a **7e-5 gap
-that is recorded, not absorbed** - `--strict` fails on it, and the header lists what has been ruled
-out by measurement.
+**Both whole blocks match**, at every arm's own measured floor:
+
+| arm | relRMS | condition | floor-derived bar |
+|---|---:|---:|---:|
+| main block, msa | 5.8e-8 | 0.94 | 3.4e-7 |
+| main block, pair | 9.1e-8 | 0.50 | 2.0e-7 |
+| extra block, msa | 6.0e-8 | 0.97 | 3.5e-7 |
+| extra block, pair | 1.2e-6 | 198 | 7.1e-5 |
+
+🔴 **AND THE BAR IS EACH ARM'S CONDITION NUMBER TIMES AN f32 STEP, BECAUSE ONE CONSTANT CANNOT
+SERVE BOTH BLOCKS.** The main block is CONTRACTIVE - a relative nudge comes out smaller than it went
+in - while the extra block's pair amplifies by about **200**, because global attention divides by a
+masked column count that can be small. A bar tight enough for the main block is unmeetable for the
+extra one; a bar loose enough for the extra block would pass a real 1e-5 error in the main one. The
+gate measures the ratio with a 1e-5 nudge and derives both. (Its first version used a single f32
+step and the extra block's pair came back EXACTLY unchanged - below its own ULP everywhere. A floor
+of zero is not a floor.)
 
 🔴 **AND THAT GATE FOUND SOMETHING NO OPERATION GATE COULD: THE SHIPPED AF2 BLOCK KEEPS ITS
 INTERMEDIATES IN f16 WHERE NO SWITCH REACHES.** `normalizedStorage = "f16"` in the attention,
@@ -123,8 +135,21 @@ sequences pairwise is unaffordable and its query is a masked column mean instead
 four conventions are confirmed at the floor (`extra.msa` at 6.0e-8), and that block is the ONLY
 cross-check it can have, because `encodeGlobalAttention` is not exposed as a class.
 
-The pair gap shows up identically in both blocks - 7.0e-5 and 6.4e-5 - which places it in the six
-sub-layers they share rather than in either MSA half.
+🔴 **A 6e-5 PAIR GAP WAS CLOSED BY TWO BISECTS AND NO MORE READING - AND READING THE SOURCE IS
+WHAT GOT IT WRONG.** `pairBiasStorage = options.pairBias?.source === "separate" ? "f32" :
+normalizedStorage` reads as "a bias projected from the normalised input is stored f16", so this port
+rounded it; both pair arms sat at ~6e-5 with each triangle attention contributing about 3e-5.
+
+`--disable=` zeroes a sub-layer's output projection on BOTH sides, which makes that residual an
+identity without either implementation knowing: with only the outer product mean live the pair arm
+is 4.4e-8, with both triangle multiplications 6.8e-8, and it jumps to 3.5e-5 the moment the first
+triangle attention is let back in. Then `--tri-att-f32=` sweeps the four rounding points inside
+them, and exactly one lands: **the bias in f32 gives 9.2e-8**, where `attended` gives 5.3e-5,
+`normalised` 9.2e-5 and `projections` 8.4e-5. So the f16 choices are per TENSOR, not per group, and
+`DEFAULT_PART` in `kernels/attention-block.js` records each one as a measurement.
+
+Both handles are kept. A gate that can bisect itself is worth more than one that only reports a
+number.
 
 Still to come: the Evoformer STACK over both block kinds, the structure module, and the confidence
 and distogram heads. After AF2: AF3's pairformer and diffusion, ESMFold2, bioemu2.
