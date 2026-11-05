@@ -63,6 +63,7 @@ webgl/
     evoformer/stack.js          the loop over blocks, for both kinds
     structure/initialize.js     the single representation and the identity frame
     structure/sidechain.js      seven torsions a residue, as normalised (x, y) pairs
+    structure/geometry.js       atom coordinates from frames and torsions - atom14 and atom37
   heads/
     distogram.js                P(d < 8 A) for every pair - the contact map the page draws
     confidence.js               pLDDT, PAE and the pTM term
@@ -220,7 +221,15 @@ translation with the identity at `(1, 0, 0, 0)`, the torsion head reads the INIT
 representation rather than the activations, and the angle normalisation guards at 1e-12 so a zero
 torsion comes out `(0, 0)` rather than NaN.
 
-Still to come in it: the iteration core (invariant point attention, 7 kernels) and atom geometry.
+**Atom geometry is done and BIT-IDENTICAL** - atom14 and atom37 both at relRMS 0 against the WGSL
+stage, which matters because this stage is almost all convention and almost no arithmetic. Five
+choices decide whether the output is a structure or a plausible cloud, and every one of them
+produces finite coordinates when wrong: a default frame is a 4x4 ROW-MAJOR matrix whose translation
+is the fourth column; the quaternion is `(w, x, y, z)` and is used UNNORMALISED; the backbone
+translation carries a factor of **10**; only groups 5, 6 and 7 chain; and the torsion mixes columns
+1 and 2 with `(sine, cosine)` in that order.
+
+Still to come in it: the iteration core - invariant point attention, 7 kernels, the last AF2 stage.
 After AF2: AF3's pairformer and diffusion, ESMFold2, bioemu2.
 
 Every operation so far is checked against TWO references - an f64 CPU one written from the

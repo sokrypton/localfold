@@ -11,9 +11,9 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-477 tools. `tools/fixtures/` is data and is not listed.
+478 tools. `tools/fixtures/` is data and is not listed.
 
-## `tools/gpu/` - the WebGPU lane (232)
+## `tools/gpu/` - the WebGPU lane (233)
 
 Each exports `async function main(device, args)` and is run as
 `node tools/gpu-chrome.mjs tools/gpu/<module>.js [--flags]`.
@@ -146,6 +146,7 @@ Each exports `async function main(device, args)` and is run as
 - **`check-webgl-distogram.js`** - The contact map in WebGL2 against the shipped host reference.
 - **`check-webgl-evoformer-block.js`** - A whole AF2 Evoformer block in WebGL2 against the WGSL block.
 - **`check-webgl-evoformer-stack.js`** - Two Evoformer blocks in a row, both stacks, against their WGSL counterparts.
+- **`check-webgl-geometry.js`** - Atom coordinates against the WGSL geometry stage.
 - **`check-webgl-kernels.js`** - The two WebGL2 kernels against independent CPU references - the gate they have never had.
 - **`check-webgl-opm.js`** - The outer product mean in WebGL2 against the WGSL one and a CPU reference - four conventions and a two-stage contraction.
 - **`check-webgl-runtime.js`** - The WebGL2 backend's runtime and its first three AF2 primitives, against CPU references - and the expressibility question the headline ceiling gets wrong.
