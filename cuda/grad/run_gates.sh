@@ -155,7 +155,7 @@ for fb in "model-af3-full-f32 af3" "model-boltz2-f32 boltz2" "model-protenix2-f3
     if [ -x "$HOME/venv/bin/python" ]; then
       b=cuda/grad/data/of3-1brs
       [ -f $b/example.txt ] || { mkdir -p $b && zstd -dqf tools/fixtures/rcsb/1brs.cif.zst -o $b/1brs.cif &&
-                                 "$HOME/venv/bin/python" tools/make_of3_example.py $b/1brs.cif $b --family=$2 > /dev/null; }
+                                 "$HOME/venv/bin/python" cuda/grad/make_of3_example.py $b/1brs.cif $b --family=$2 > /dev/null; }
       run cuda/grad/train-of3 --bundle=$1 --family=$2 --examples=$b/example.txt --steps=0 --check-perm=0
     else echo "== the truth's permutation: no ~/venv (gemmi, RDKit) here"; fi
     # data parallel (of3dist.cuh), two ranks sharing this GPU through the file transport: their weights must stay one set

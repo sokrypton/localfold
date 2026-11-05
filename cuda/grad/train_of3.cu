@@ -4,7 +4,7 @@
 //
 // A step, an example at a time (model.py OpenFold3.forward, runner.py _training_step_manual_clip):
 //   the example   one of --examples (a line each: `input truth [resolution=X] [weight=W] [preferred=i[,j]]`, as
-//                 tools/make_of3_example.py writes them), drawn by weight; cropped to --crop tokens (384) by OpenFold3's
+//                 cuda/grad/make_of3_example.py writes them), drawn by weight; cropped to --crop tokens (384) by OpenFold3's
 //                 three strategies (contiguous 0.2, spatial 0.4, spatial-interface 0.4; whole when it fits)
 //   dropout       pair 0.25 (the triangle updates rowwise, the ending attention columnwise) in every pairformer-style
 //                 stack and MSA 0.15 on the pair-weighted averaging, fresh masks a step (--no-dropout: off)

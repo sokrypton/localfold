@@ -11,7 +11,7 @@
 //                 by centroid (the predicted molecules with the most resolved truth first); the candidate whose
 //                 matched centroids are nearest wins (find_greedy_optimal_mol_permutation)
 //   atoms         the prediction aligned onto the permuted truth's centres, then within each component the RDKit
-//                 automorphism (tools/make_of3_example.py's perms.txt) nearest over the resolved atoms
+//                 automorphism (cuda/grad/make_of3_example.py's perms.txt) nearest over the resolved atoms
 //                 (get_final_atom_permutation_index)
 //
 // The prediction is the crop and the truth the whole entry, as there: a cropped copy of chain A may be matched to

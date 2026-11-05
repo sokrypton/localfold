@@ -65,7 +65,7 @@ the trunk embedder, the template term - which weighs even with no template, its 
 one-hot one - the MSA stack, the pairformer, the distogram, the denoiser, the confidence head) and trained as
 `projects/of3_all_atom` trains it:
 
-- **data** - `tools/make_of3_example.py <entry.cif> <dir>` turns a deposited structure into an example: the AF3 job of its
+- **data** - `cuda/grad/make_of3_example.py <entry.cif> <dir>` turns a deposited structure into an example: the AF3 job of its
   chains (each polymer its entity's FULL sequence, modified residues as modifications, every other chain a ligand of its
   components; polymers first, the order the featuriser gives asymId), the truth keyed by chain, residue and atom name,
   the resolution, the RDKit permutations, and the featurised input - and OpenFold3's datapoints: a line a chain and a

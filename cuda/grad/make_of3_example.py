@@ -2,7 +2,7 @@
 """A training example for cuda/grad/train-of3 from a deposited structure: the AF3 job its chains are, the truth its
 atoms are, and the featurised input the trainer reads.
 
-    ~/venv/bin/python tools/make_of3_example.py <entry.cif> <out dir> --family=openbind0 [--a3m-dir=<dir>] [--search]
+    ~/venv/bin/python cuda/grad/make_of3_example.py <entry.cif> <out dir> --family=openbind0 [--a3m-dir=<dir>] [--search]
 
 Writes <out dir>/job.json, <out dir>/truth.txt and <out dir>/input/ (cuda/featurise/af3-featurise's output), and
 <out dir>/example.txt - the trainer's lines, `input truth [resolution=X] perms=... set=... preferred=... weight=...`: one
@@ -33,7 +33,7 @@ from rdkit import Chem, RDLogger
 
 RDLogger.DisableLog("rdApp.*")
 
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def chain_ids():
