@@ -974,6 +974,54 @@ sufficient one. A generalisation measured on one model is a regression on anothe
 reason this is a sentence rather than a shipped defect is that the AF2 differential runs on every
 pass.
 
+### How close can this get, and why not closer
+
+The campaign above took a bioemu2 fold from **968 s to 57.6 s** and its device peak from 1656 MiB
+to 409. The gap to the WGSL fold of the same weights is **15x** - it was 246x - and it decomposes:
+
+| | WebGL2 | WGSL | |
+|---|---:|---:|---:|
+| trunk, 4 passes x 52 blocks | 21.6 s | 2.3 s | 9.4x |
+| 20 denoiser calls | 35.1 s | 1.2 s | 29x |
+| peak memory | **409 MiB** | 950 MiB | **0.43x** |
+
+🔴 **AND THE REMAINING GAP IS A HARDWARE FEATURE WebGL2 CANNOT REACH, WHICH IS WORTH STATING
+PLAINLY RATHER THAN LEAVING AS A TUNING BACKLOG.** `tools/gpu/probe-subgroup-matrix.js` on this
+device:
+
+```
+subgroupMatrixAvailable: true
+configs: f32 8x8x8, f16 8x8x8
+```
+
+WebGPU's projections can issue `subgroupMatrixMultiplyAccumulate` against those units and stage a
+weight tile in workgroup memory for a whole workgroup to reuse. **A WebGL2 fragment shader has
+neither.** There are no subgroups, no workgroup memory, and no matrix instruction; a fragment's
+only reuse is what it holds in its own registers, and that is capped by its OUTPUT BUDGET -
+`MAX_DRAW_BUFFERS` x 4 = **32 floats an invocation**. Every optimisation in this section is a way of
+spending those 32 floats better, and the row block spends all of them.
+
+So the ceiling is structural, and the measurements say where it is:
+
+- **The weight-reuse headroom is gone.** Forcing every weight read in the dominant kernel to hit
+  cache - the diagnostic that found the fragment order - now changes a fold by **2%** (4757 ms
+  against 4856). There is no more traffic to save.
+- **The kernel is at the fragment path's intensity ceiling.** 512 flops per 22 fetches is **23
+  flops a fetch**, against the 21.3 that docs/A100.md measures as the ceiling of an eight-target
+  fragment GEMM. More outputs an invocation is the only way up and there are no more targets.
+- **The one path with a bigger budget is the vertex one**, whose 128 interleaved components are
+  four times a fragment's - docs/A100.md puts transform feedback at 8.64 TFLOP/s against the
+  fragment path's 3.99 and WebGPU compute's 13.22, so **65% of WebGPU at best**. No kernel here
+  uses it, and this file's own note is that "old drivers are exactly where transform feedback gets
+  flaky" - which is this backend's entire audience.
+
+🔴 **SO "AS FAST AS WebGPU" IS NOT AVAILABLE, AND THE USEFUL QUESTION IS WHETHER 15x IS SHIPPABLE.**
+A 68-token fold is 58 s where WebGPU is 3.9; a 59-residue AF2 fold is 1.3 s where WebGPU is 0.28,
+and most of that 1.3 s is shader compilation rather than arithmetic. For a visitor whose browser
+refuses the WebGPU path outright, those are folds instead of refusals, on less memory than the other
+backend needs. That is the trade this tree exists to make, and it is a product question rather than
+a kernel one - see "Making it selectable".
+
 ### A texture pool, and the bug it found
 
 Pooling released textures by rectangle is worth **1%** of an AF2 fold and costs **4% more peak**
@@ -1242,7 +1290,10 @@ no longer whether to start but whether to SHIP, and all three are still open:
    machines. Nobody here has the number.
 2. **The 47.8% on old hardware.** Re-run `tools/gpu/bench-webgl2-tf-matmul.js` on an actual old
    integrated GPU rather than the A100. This is the measurement the case rests on and the one
-   least likely to transfer.
+   least likely to transfer. 🔴 **AND IT IS NOW THE ONLY REMAINING SPEED LEVER**, because the
+   fragment path is at its intensity ceiling - see "How close can this get". Transform feedback is
+   65% of WebGPU where the fragment path is 30%, so it is the difference between a 1.5x gap and a
+   3.3x one; it is also the path old drivers are worst at, which is the whole tension.
 3. **Whether the pair track can dodge the texture axis** - tiling `tokens^2` across array layers
    (`MAX_ARRAY_TEXTURE_LAYERS`, which the limits probe already reads). If it can, the ceiling
    moves and a length-generous goal is possible; if not, this backend is capped near a small
