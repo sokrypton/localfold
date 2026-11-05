@@ -1872,6 +1872,29 @@ rows of 4 channels and LP values, **148 KiB**. Collapsing that to six rows is th
 bought its 3.38x by fixing the one-dimensional neighbour and left this untouched, which is where the
 contraction's remaining factor lives.
 
+🔴 **AND THE BLOCK SHAPE TAKES 1.6-2.8x OF IT, MEASURED.** The working set is `rows * channels * LP`
+and the arithmetic intensity is `8 * I * J / (I + J)`, so **channels a fragment cost locality and buy
+no intensity**. The shipped block is 2 i x 4 j x 4 channels: 148 KiB a tile and 10.7 flops a fetch4.
+One channel a fragment makes the same 32-float budget buy a **4 i x 8 j** block - 37 KiB a tile and
+**21.3 flops a fetch4**, two factors from one change. `wide-block` in the bench:
+
+| L | shipped tiled | wide 4x8x1 | factor | tiled GF/s | wide GF/s |
+|---|---:|---:|---:|---:|---:|
+| 64 | 3.47 ms | **2.16** | **1.61x** | 38.6 | 62.1 |
+| 72 | 6.80 | **2.46** | **2.76x** | 28.1 | 77.6 |
+| 128 | 26.65 | **13.34** | **2.00x** | 40.3 | 80.5 |
+
+**On the fold's own shape it is about 2x**: 68 tokens pad to 72 for a 4x8 block, and 2.46 ms there
+against the shipped kernel's 4.85 ms at 68 is 1.97x after paying for the 1.19x of extra padded work.
+
+🔴 **AND IT NEEDS THE PAIR AXES PADDED TO A MULTIPLE OF EIGHT, where `padPairPlanesSource` pads to
+four.** At 68 tokens `JBLOCKS` is 8.5 and the shader does not compile - "cannot convert from const
+float to const highp int", which is what a non-integer in a `const int` looks like - so the arm is
+skipped in the arm LIST rather than inside the dispatch helper, because that helper's loop records a
+timing for whatever it runs and an arm issuing no draw would be reported as the fastest of them all.
+It also writes its 32 outputs as (i, j) quads rather than channel components, so it needs its own
+repack and is timed rather than compared.
+
 🔴 **AND `aliased` HAD ALSO BEEN MEASURED AGAINST THE WRONG KERNEL.** The shipped contraction is
 TILE-MAPPED and aliasing had only ever been run against the untiled block, so this file's "aliasing is
 1.11x" was a statement about a kernel nothing dispatches. The tiled answer agrees at 1.08x, which is

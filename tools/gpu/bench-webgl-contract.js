@@ -95,7 +95,7 @@ import {
   splitContractSource,
 } from "../../webgl/af3/trunk/triangle.js";
 
-import { Execution } from "../../webgl/runtime/execution.js";
+import { Execution, PRELUDE, targetDeclarations } from "../../webgl/runtime/execution.js";
 import { createWebGL2Context } from "../../webgl/index.js";
 import { relativeRms } from "./relative-rms.js";
 
@@ -120,9 +120,76 @@ const fill = (count, seed) => {
  * whose operands are already in place - the transpose and the centre norm are
  * separate dispatches and separate questions.
  */
+/**
+ * A DIAGNOSTIC contraction with a 4 i x 8 j x 1 channel block, against the
+ * shipped 2 x 4 x 4.
+ *
+ * 🔴 IT IS HERE BECAUSE THE WORKING SET SCALES WITH CHANNELS A FRAGMENT AND
+ * THE ARITHMETIC INTENSITY DOES NOT. `resident-tiled` says this kernel is
+ * locality-bound at 3.91x and the per-tile working set is `rows * channels * LP`
+ * - 136 pair rows by 4 channels by LP values, 148 KiB. One channel a fragment
+ * makes that **37 KiB**, and the same 32-float budget then buys a 4 x 8 pair
+ * block whose intensity is `8 * I * J / (I + J)` = **21.3 flops a fetch4**
+ * against the shipped block's 10.7. Two factors in the same change, which is
+ * why it is worth a diagnostic before a kernel.
+ *
+ * It writes its 32 outputs as (i, j) quads rather than channel components, so
+ * its plane layout is NOT the shipped repack's and it is never compared for an
+ * answer - only for time. A real version needs its own repack.
+ */
+const wideBlockSource = (length, channels, paddedLength, tileWidth) => {
+  const I = 4;
+  const J = 8;
+  const acc = [];
+  for (let i = 0; i < I; i += 1) {
+    for (let j = 0; j < J; j += 1) acc.push(`s${i}_${j}`);
+  }
+  return `${PRELUDE}${targetDeclarations(8)}
+const int L = ${length};
+const int LP = ${paddedLength};
+const int PLANE = ${paddedLength * paddedLength};
+const int C = ${channels};
+const int IBLOCKS = ${paddedLength / I};
+const int JBLOCKS = ${paddedLength / J};
+const int BLOCKS = ${(paddedLength / I) * (paddedLength / J)};
+const int TILEW = ${tileWidth};
+uniform sampler2D aTex;
+uniform sampler2D bTex;
+
+void main() {
+  int texel = linearTexel();
+  int lane = texel % TILEW;
+  int channel = (texel % W) / TILEW;
+  int block = (texel / W) * TILEW + lane;
+  if (block >= BLOCKS || channel >= C) {
+${Array.from({ length: 8 }, (_, p) => `    result${p} = vec4(0.0);`).join("\n")}
+    return;
+  }
+  int jblock = block % JBLOCKS;
+  int iblock = block / JBLOCKS;
+  int plane = channel * PLANE;
+${acc.map((a) => `  float ${a} = 0.0;`).join("\n")}
+  for (int k4 = 0; k4 < LP / 4; ++k4) {
+${Array.from({ length: I }, (_, i) =>
+  `    vec4 a${i} = fetch4(aTex, (plane + (iblock * ${I} + ${i}) * LP) / 4 + k4);`).join("\n")}
+${Array.from({ length: J }, (_, j) =>
+  `    vec4 b${j} = fetch4(bTex, (plane + (jblock * ${J} + ${j}) * LP) / 4 + k4);`).join("\n")}
+${Array.from({ length: I }, (_, i) => Array.from({ length: J }, (_, j) =>
+    `    s${i}_${j} += dot(a${i}, b${j});`).join("\n")).join("\n")}
+  }
+${Array.from({ length: 8 }, (_, p) => {
+    const base = p * 4;
+    return `  result${p} = vec4(${[0, 1, 2, 3].map((c) => {
+      const flat = base + c;
+      return acc[flat];
+    }).join(", ")});`;
+  }).join("\n")}
+}`;
+};
+
 function contract(execution,
   { a, b, length, channels, blocked, channelSlowest, tileMapped,
-    residentOperands = false }, output) {
+    residentOperands = false, wideBlock = false }, output) {
   if (!blocked) {
     execution.dispatch({
       source: splitContractSource(length, channels, "outgoing", false, true),
@@ -139,6 +206,32 @@ function contract(execution,
   const planeTexels = tileMapped
     ? Math.ceil(blocks / tileWidth) * 2048
     : blocks * (channels / 4);
+  if (wideBlock) {
+    // 🔴 A 4 x 8 BLOCK NEEDS THE PAIR AXES PADDED TO A MULTIPLE OF EIGHT, where
+    // `padPairPlanesSource` pads to four - so at the fold's 68 tokens JBLOCKS
+    // would be 8.5 and the shader does not compile ("cannot convert from const
+    // float to const highp int", which is what a non-integer in a `const int`
+    // looks like). The arm is skipped rather than approximated, and lengths
+    // that are a multiple of eight say whether the SHAPE is worth the padding.
+    if (length % 8 !== 0) throw new Error(`wide-block needs length % 8, not ${length}`);
+    // 🔴 ITS OWN GRID: one channel a fragment and a 4 x 8 pair block, so the
+    // fragment count is `BLOCKS * channels` where the shipped one is
+    // `BLOCKS * channels / 4` over a 2 x 4 block - the same 32 outputs either
+    // way. Time only; the plane layout is not the repack's.
+    const wideBlocks = (length / 4) * (length / 8);
+    const wideTile = Math.max(1, Math.floor(2048 / channels));
+    const wideTexels = Math.ceil(wideBlocks / wideTile) * 2048;
+    const widePlanes = Array.from({ length: 8 },
+      (_, p) => execution.allocate(wideTexels * 4, `bench.wide-plane${p}`));
+    execution.dispatch({
+      source: wideBlockSource(length, channels, length, wideTile),
+      outputs: widePlanes,
+      inputs: { aTex: a, bTex: b },
+      label: `bench.contract-wide:${length}x${channels}`,
+    });
+    for (const plane of widePlanes) execution.release(plane);
+    return;
+  }
   const planes = Array.from({ length: 8 },
     (_, p) => execution.allocate(planeTexels * 4, `bench.pair-plane${p}`));
   execution.dispatch({
@@ -202,7 +295,11 @@ export async function main(device, args) {
     // shape as `probe-webgl-linear-operand.js`'s straw baseline: a diagnostic
     // arm has to sit beside the kernel that ships.
     for (const arm of ["one-pair", "channel-fastest", "blocked", "aliased", "tiled",
-      "aliased-tiled", "half-tiled", "resident-tiled"]) {
+      "aliased-tiled", "half-tiled", "resident-tiled",
+      // 🔴 SKIPPED IN THE LIST AND NOT INSIDE `contract`, because the loop
+      // records a timing for whatever it runs - an arm that issues no draw
+      // would be reported as the fastest of them all.
+      ...(length % 8 === 0 ? ["wide-block"] : [])]) {
       const blocked = arm !== "one-pair";
       const half = arm === "half-tiled";
       const call = {
@@ -214,6 +311,7 @@ export async function main(device, args) {
         channelSlowest: arm !== "channel-fastest",
         tileMapped: arm.endsWith("tiled"),
         residentOperands: arm === "resident-tiled",
+        wideBlock: arm === "wide-block",
       };
       const ring = Array.from({ length: iterations },
         () => execution.allocate(pairs * channels, "bench.out"));
@@ -247,6 +345,8 @@ export async function main(device, args) {
       aliasedTiledMs: Number(timings["aliased-tiled"].toFixed(2)),
       halfTiledMs: Number(timings["half-tiled"].toFixed(2)),
       residentTiledMs: Number(timings["resident-tiled"].toFixed(2)),
+      wideBlockMs: timings["wide-block"] === undefined
+        ? null : Number(timings["wide-block"].toFixed(2)),
       tiledMs: Number(timings.tiled.toFixed(2)),
       tiledSpeedup: Number((timings.blocked / timings.tiled).toFixed(2)),
       aliasedSpeedup: Number((timings.blocked / timings.aliased).toFixed(2)),
@@ -261,6 +361,11 @@ export async function main(device, args) {
       residentTiledSpeedup: Number((timings.tiled / timings["resident-tiled"]).toFixed(2)),
       residentTiledGflops: Number((2 * length * length * length * channels
         / timings["resident-tiled"] / 1e6).toFixed(1)),
+      wideBlockSpeedup: timings["wide-block"] === undefined
+        ? null : Number((timings.tiled / timings["wide-block"]).toFixed(2)),
+      wideBlockGflops: timings["wide-block"] === undefined
+        ? null : Number((2 * length * length * length * channels
+          / timings["wide-block"] / 1e6).toFixed(1)),
       halfTiledGflops: Number((2 * length * length * length * channels
         / timings["half-tiled"] / 1e6).toFixed(1)),
       channelFastestGflops:
