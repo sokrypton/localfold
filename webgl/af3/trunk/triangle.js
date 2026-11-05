@@ -460,6 +460,142 @@ ${[0, 1, 2, 3].map(channelBlock).join("\n")}
 };
 
 /**
+ * The contraction with a 4 i x 8 j x ONE channel block, against the 2 x 4 x 4
+ * one above.
+ *
+ * 🔴 CHANNELS A FRAGMENT COST LOCALITY AND BUY NO INTENSITY, which is the whole
+ * reason this shape exists. `bench-webgl-contract.js`'s `resident-tiled` arm
+ * puts the contraction at **3.91x off its own operand-resident rate** - 1.26 ms
+ * against 4.94, 127 GFLOP/s against 32 - and the working set a rasterisation
+ * tile touches is `rows * channels * LP`: 136 pair rows by 4 channels by LP
+ * values is **148 KiB** at 68 tokens and 256 channels. One channel a fragment
+ * makes it **37 KiB**. And the same 32-float output budget then buys a wider
+ * pair block, whose intensity is `8 * I * J / (I + J)`: **21.3 flops a fetch4**
+ * at 4 x 8 against the 2 x 4 block's 10.7. Two factors from one change.
+ *
+ * Measured in the bench, block AND repack against block and repack:
+ *
+ * | L | 2x4x4 | 4x8x1 | factor |
+ * |---|---|---|---|
+ * | 64 | 3.49 ms | **2.61** | **1.33x** |
+ * | 72 | 6.63 | **3.30** | **2.01x** |
+ * | 128 | 25.84 | **14.64** | **1.77x** |
+ *
+ * 🔴 ITS x AXIS IS THE CHANNEL AND NOT THE CHANNEL GROUP, so `TILEW` is
+ * `W / channels` where the other kernel's is `W / (channels / 4)` - 8 rather
+ * than 32 at 256 channels. A TILEW-wide run of texels is one channel and TILEW
+ * pair blocks, and a tile then holds one channel's operands.
+ *
+ * 🔴 AND IT NEEDS THE PAIR AXES PADDED TO A MULTIPLE OF EIGHT, where
+ * `paddedPairLength` pads to four: at 68 tokens `JBLOCKS` would be 8.5 and the
+ * shader does not compile - "cannot convert from const float to const highp
+ * int", which is what a non-integer in a `const int` looks like. So this kernel
+ * asks for its own padding and 68 tokens become 72, which is 1.19x the padded
+ * arithmetic and is already inside the figures above.
+ */
+export const widePairBlockSource = (length, channels, divideByLength,
+  paddedLength = length, tileWidth = 8) => {
+  const I = 4;
+  const J = 8;
+  const slots = [];
+  for (let i = 0; i < I; i += 1) {
+    for (let j = 0; j < J; j += 1) slots.push(`s${i}_${j}`);
+  }
+  const value = (name) => (divideByLength ? `${name} / float(L)` : name);
+  return `${PRELUDE}${targetDeclarations(8)}
+const int L = ${length};
+const int LP = ${paddedLength};
+const int PLANE = ${paddedLength * paddedLength};
+const int C = ${channels};
+const int JBLOCKS = ${paddedLength / J};
+const int BLOCKS = ${(paddedLength / I) * (paddedLength / J)};
+const int TILEW = ${tileWidth};
+uniform sampler2D aTex;
+uniform sampler2D bTex;
+
+void main() {
+  int texel = linearTexel();
+  int lane = texel % TILEW;
+  int channel = (texel % W) / TILEW;
+  int block = (texel / W) * TILEW + lane;
+  // The grid is whole texture rows, so its tail is real draws and must write
+  // rather than wrap - a target left unwritten is a texel nothing wrote.
+  if (block >= BLOCKS || channel >= C) {
+${Array.from({ length: 8 }, (_, p) => `    result${p} = vec4(0.0);`).join("\n")}
+    return;
+  }
+  int jblock = block % JBLOCKS;
+  int iblock = block / JBLOCKS;
+  int plane = channel * PLANE;
+${slots.map((a) => `  float ${a} = 0.0;`).join("\n")}
+  for (int k4 = 0; k4 < LP / 4; ++k4) {
+${Array.from({ length: I }, (_, i) =>
+  `    vec4 a${i} = fetch4(aTex, (plane + (iblock * ${I} + ${i}) * LP) / 4 + k4);`).join("\n")}
+${Array.from({ length: J }, (_, j) =>
+  `    vec4 b${j} = fetch4(bTex, (plane + (jblock * ${J} + ${j}) * LP) / 4 + k4);`).join("\n")}
+${Array.from({ length: I }, (_, i) => Array.from({ length: J }, (_, j) =>
+    `    s${i}_${j} += dot(a${i}, b${j});`).join("\n")).join("\n")}
+  }
+${Array.from({ length: 8 }, (_, p) =>
+  `  result${p} = vec4(${[0, 1, 2, 3].map((c) => value(slots[p * 4 + c])).join(", ")});`).join("\n")}
+}`;
+};
+
+/**
+ * The wide block's planes back into `[pair][channel group]`.
+ *
+ * 🔴 IT IS FOUR `fetch4` WHERE THE 2 x 4 x 4 REPACK IS ONE, AND THAT IS THE
+ * SHAPE'S REAL PRICE. An output texel is four CHANNELS of one pair, and a wide
+ * fragment holds one channel of thirty-two pairs - so the four channels come
+ * from four different fragments, which are four source texels of the SAME
+ * plane, and (i, j) picks the plane and the component. That cost is inside the
+ * bench figures above, which time block and repack together; timing the block
+ * alone read 2.76x at L = 72 where the pair reads 2.01x.
+ */
+export const wideRepackSource = (length, channels, paddedLength = length,
+  tileWidth = 8) => `${PRELUDE}${ONE_TARGET}
+const int L = ${length};
+const int C4 = ${channels / 4};
+const int JBLOCKS = ${paddedLength / 8};
+const int TILEW = ${tileWidth};
+const int ELEMENTS = ${length * length * channels};
+${Array.from({ length: 8 }, (_, p) => `uniform sampler2D plane${p};`).join("\n")}
+
+float pick(vec4 v, int c) {
+  return c == 0 ? v.x : c == 1 ? v.y : c == 2 ? v.z : v.w;
+}
+
+void main() {
+  int texel = linearTexel();
+  if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
+  int cgroup = texel % C4;
+  int pair = texel / C4;
+  int i = pair / L;
+  int j = pair - i * L;
+  int block = (i / 4) * JBLOCKS + (j / 8);
+  // Not named flat: that is a GLSL interpolation qualifier and a reserved word.
+  int slot = (i % 4) * 8 + (j % 8);
+  int plane = slot / 4;
+  int component = slot - plane * 4;
+  int lane = block % TILEW;
+  int y = block / TILEW;
+  vec4 gathered = vec4(0.0);
+  for (int c = 0; c < 4; ++c) {
+    int source = y * W + (cgroup * 4 + c) * TILEW + lane;
+    vec4 v =
+${Array.from({ length: 7 }, (_, p) =>
+    `      plane == ${p} ? fetch4(plane${p}, source) :`).join("\n")}
+      fetch4(plane7, source);
+    float picked = pick(v, component);
+    if (c == 0) gathered.x = picked;
+    else if (c == 1) gathered.y = picked;
+    else if (c == 2) gathered.z = picked;
+    else gathered.w = picked;
+  }
+  result = gathered;
+}`;
+
+/**
  * The largest pair tensor, in FLOATS, for which the pair block beats the
  * one-pair-a-fragment kernel.
  *
@@ -596,6 +732,35 @@ function contractInto(execution, output, a, b, length, channels, divideByLength,
     });
     return output;
   }
+  // 🔴 THE WIDE PAIR BLOCK FIRST, WHERE IT IS LEGAL: 4 i x 8 j x ONE channel
+  // instead of 2 x 4 x 4, which is 1.33-2.01x in the bench because channels a
+  // fragment cost locality and buy no intensity. See `widePairBlockSource`. It
+  // needs the padded length divisible by EIGHT and `W / channels` to be at
+  // least one TILEW, so a channel width past 2048 falls back.
+  const wideTile = Math.floor(TEXTURE_WIDTH / channels);
+  const wide = !execution.noContractWide && padded % 8 === 0 && wideTile >= 1
+    && execution.maxDrawBuffers >= 8;
+  if (wide) {
+    const wideBlocks = (padded / 4) * (padded / 8);
+    const wideTexels = Math.ceil(wideBlocks / wideTile) * TEXTURE_WIDTH;
+    const widePlanes = Array.from({ length: 8 },
+      (_, p) => execution.allocate(wideTexels * 4, `af3.triangle.wide-plane${p}`));
+    execution.dispatch({
+      source: widePairBlockSource(length, channels, divideByLength, padded, wideTile),
+      outputs: widePlanes,
+      inputs: { aTex: a, bTex: b },
+      label: `af3.triangle.contract-wide:${direction}:${length}x${channels}${tag}`
+        + `${divideByLength ? ":over-length" : ""}`,
+    });
+    execution.dispatch({
+      source: wideRepackSource(length, channels, padded, wideTile),
+      output,
+      inputs: Object.fromEntries(widePlanes.map((plane, p) => [`plane${p}`, plane])),
+      label: `af3.triangle.wide-repack:${length}x${channels}${tag}`,
+    });
+    for (const plane of widePlanes) execution.release(plane);
+    return output;
+  }
   // 🔴 THE TILE-AWARE MAPPING WHERE THE CHANNEL GROUPS DIVIDE THE TEXTURE
   // WIDTH, which is 3.29x and is what the fragment ORDER was a one-dimensional
   // approximation of. It needs `channels / 4` to divide W, which every
@@ -631,9 +796,23 @@ function contractInto(execution, output, a, b, length, channels, divideByLength,
   return output;
 }
 
-/** The pair axes rounded up to a multiple of four, or the length itself. */
-const paddedPairLength = (execution, length) =>
-  (length % 4 === 0 || execution.noContractPad ? length : Math.ceil(length / 4) * 4);
+/**
+ * The pair axes rounded up to a multiple of four - or EIGHT where the wide pair
+ * block will run, since its 8 j a fragment needs it.
+ *
+ * 🔴 PADDING TO EIGHT IS 1.19x THE PADDED ARITHMETIC AT 68 TOKENS (72 cubed
+ * against 68 cubed) AND THE WIDE BLOCK PAYS FOR IT TWICE OVER - 3.30 ms at 72
+ * against the 2 x 4 x 4 kernel's 4.85 at 68. Asked for only when that kernel
+ * can actually run, so a context without eight draw buffers or with
+ * `--no-contract-wide` keeps the four-padding and the smaller tensors.
+ */
+const paddedPairLength = (execution, length, channels = 0) => {
+  if (execution.noContractPad) return length;
+  const wideWanted = !execution.noContractWide && channels > 0
+    && Math.floor(TEXTURE_WIDTH / channels) >= 1 && execution.maxDrawBuffers >= 8;
+  const multiple = wideWanted ? 8 : 4;
+  return length % multiple === 0 ? length : Math.ceil(length / multiple) * multiple;
+};
 
 /**
  * @param {import("../../runtime/execution.js").Execution} execution
@@ -725,7 +904,7 @@ export function triangleMultiplication(execution, call) {
     // `padPairPlanesSource`. Both of them need four to divide the length, so at
     // ESMFold2's 75 tokens this stage ran the scalar loop and was 66% of the
     // whole fold. The padding is zeros, so the k loop's tail adds exactly zero.
-    const padded = paddedPairLength(execution, length);
+    const padded = paddedPairLength(execution, length, channels);
     const transposeIncoming = direction === "incoming" && padded % 4 === 0
       && !execution.noTriangleCoalesce && !execution.noTriangleTranspose;
     const paddedPlane = channels * padded * padded;

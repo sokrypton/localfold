@@ -211,6 +211,8 @@ export class Execution {
      * hundred channel planes instead of one. Worth 3.29x, and bit-identical.
      */
     this.noContractTile = options.noContractTile ?? false;
+    // The 4 i x 8 j x 1 channel pair block - see `widePairBlockSource`.
+    this.noContractWide = options.noContractWide ?? false;
     /**
      * The control arm for the in-major projection's ASPECT rule
      * (`blockedApplies`): the old `in * out >= 65536` threshold, which was

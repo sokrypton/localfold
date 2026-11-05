@@ -825,7 +825,7 @@ Every fold is the same job, the same seed and the same settings either side; `--
 
 | fold | before | after | |
 |---|---:|---:|---:|
-| bioemu2, 6MRR 68 tokens, 4 passes, 20 steps | 968 s | **22.5 s** | **43.0x** |
+| bioemu2, 6MRR 68 tokens, 4 passes, 20 steps | 968 s | **21.7 s** | **44.6x** |
 | ...its trunk | 277.7 s | **21.6 s** | 12.8x |
 | ...its 20 denoiser calls | 658 s | **23.3 s** | 28.2x |
 | ESMFold2, 75 residues, 36-block tower, 3 loops, 15 steps | 253 s | **65.0 s** | **3.9x** |
@@ -1824,8 +1824,8 @@ operand across fragments is what workgroup memory is for and WebGL2 has none.
 
 | | before | after | |
 |---|---:|---:|---:|
-| **bioemu2**, 20-step 6MRR-68 | 30.40 s | **22.39-22.49 s** | **1.354x** |
-| **ESMFold2**, full configuration | 9.70 s | **8.79 s** | **1.103x** |
+| **bioemu2**, 20-step 6MRR-68 | 30.37 s | **21.74 s** | **1.397x** |
+| **ESMFold2**, full configuration | 9.63 s | **8.32 s** | **1.157x** |
 | AlphaFold 3 | 2.37 s | 2.37 s | 1.00x |
 | AlphaFold 2 | unchanged, 0.0353 A | - | 1.00x |
 
@@ -1889,11 +1889,36 @@ against the shipped kernel's 4.85 ms at 68 is 1.97x after paying for the 1.19x o
 
 🔴 **AND IT NEEDS THE PAIR AXES PADDED TO A MULTIPLE OF EIGHT, where `padPairPlanesSource` pads to
 four.** At 68 tokens `JBLOCKS` is 8.5 and the shader does not compile - "cannot convert from const
-float to const highp int", which is what a non-integer in a `const int` looks like - so the arm is
-skipped in the arm LIST rather than inside the dispatch helper, because that helper's loop records a
-timing for whatever it runs and an arm issuing no draw would be reported as the fastest of them all.
-It also writes its 32 outputs as (i, j) quads rather than channel components, so it needs its own
-repack and is timed rather than compared.
+float to const highp int", which is what a non-integer in a `const int` looks like - so `JBLOCKS`
+asks for its own padding and 68 tokens become 72, which is 1.19x the padded arithmetic and is already
+inside the figures above. It also writes its 32 outputs as (i, j) quads rather than channel
+components, so it needs its own repack: four `fetch4` where the 2x4x4 repack is one, because an
+output texel is four CHANNELS of one pair and a wide fragment holds one channel of thirty-two pairs.
+Timing the block alone read **2.76x** at L=72 where the pair reads 2.01x, which is what that repack
+costs - and the bench arm times them together for exactly that reason.
+
+🔴 **BUILT AND SHIPPED: 1.03x ON bioemu2 AND 1.05x ON ESMFold2, BIT-IDENTICAL.** `widePairBlockSource`
+and `wideRepackSource` are in `webgl/af3/trunk/triangle.js` and `contractInto` prefers them wherever
+`padded % 8 === 0` and `W / channels` is at least one tile:
+
+| | wide | 2x4x4 | |
+|---|---:|---:|---:|
+| **bioemu2**, 20-step 6MRR-68 | **21.74 / 21.74 s** | 22.42 / 22.37 | **1.03x** |
+| **ESMFold2**, full configuration | **8.32 s** | 8.75 | **1.05x** |
+| AlphaFold 3 (59 tokens) | 2274 / 2321 ms | 2273 / 2305 | 1.00x |
+| AlphaFold 2 | unchanged | - | 1.00x |
+
+Every arm bit-identical: bioemu2 at rmsd 1.595, 201 contacts, `caca` 3.8531561311027773 and 411 MiB
+on both; ESMFold2 at pLDDT 57.593 and pTM 0.4148; AF3 at 66.525 and 0.242; AF2's worst atom 0.0353 /
+0.0308 / 0.0285 A. The 24-arm triangle gate passes on both paths and `--falsify` turns all 16
+falsifiable arms red. `--no-contract-wide` is the control arm.
+
+🔴 **AND AlphaFold 3 READ 0.83x ON ONE RUN AND IT WAS AN OUTLIER, WHICH NEARLY BOUGHT A PER-MODEL
+RULE NOBODY NEEDED.** 2752 ms against 2292 looked like the eight-padding costing more than the block
+saves - 59 tokens pad from 60 to 64, so every pair tensor is 1.14x bigger and that cost spreads
+across a trunk whose contraction is a smaller share than bioemu2's. The reasoning was sound and the
+measurement was one run: repeated, it is **2274/2321 against 2273/2305**, identical. One run is not a
+measurement, and a plausible mechanism is not evidence that the mechanism is what you saw.
 
 🔴 **AND `aliased` HAD ALSO BEEN MEASURED AGAINST THE WRONG KERNEL.** The shipped contraction is
 TILE-MAPPED and aliasing had only ever been run against the untiled block, so this file's "aliasing is

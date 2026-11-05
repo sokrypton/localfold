@@ -152,6 +152,17 @@
  *                         the mapping pads the output group axis to `W / TILEW`
  *                         and the measured best width would pad AF2's 256
  *                         outputs sixteenfold; this is how it is swept.
+ *   --no-contract-wide    AF3's contraction on the 2 i x 4 j x 4 channel pair
+ *                         block rather than 4 i x 8 j x ONE channel. Channels a
+ *                         fragment cost locality and buy no intensity: the
+ *                         working set a rasterisation tile touches is
+ *                         `rows * channels * LP`, 148 KiB at four channels and
+ *                         **37 at one**, and the same 32-float budget then buys
+ *                         a wider pair block at **21.3 flops a fetch4** against
+ *                         10.7. Block and repack together, 1.33x at L=64, 2.01x
+ *                         at 72 and 1.77x at 128. It also keeps the pair axes
+ *                         padded to FOUR rather than eight, which is the
+ *                         smaller tensor and the slower kernel.
  *   --no-contract-tile    The contraction's channel group taken from the texel
  *                         INDEX rather than from the fragment's x range, so a
  *                         rasterisation tile spans about a hundred channel
@@ -226,6 +237,7 @@ export function webglExecutionOptions(args, defaults = {}) {
     noContractCeiling: flag(args, "no-contract-ceiling"),
     noContractPad: flag(args, "no-contract-pad"),
     noContractTile: flag(args, "no-contract-tile"),
+    noContractWide: flag(args, "no-contract-wide"),
     noLinearAspect: flag(args, "no-linear-aspect"),
     noFramebufferReuse: flag(args, "no-framebuffer-reuse"),
     noLinearTile: flag(args, "no-linear-tile"),
