@@ -602,6 +602,20 @@ export async function main(device, args) {
     const tileWidth = arm.startsWith("tiled-") ? Number(arm.slice(6).split("-")[0]) : 0;
     const halfX = arm.endsWith("half-x");
     const extent = extentFor(R, C, tileWidth);
+    // 🔴 THE FETCH COUNT, EXACTLY AS THE SHADER ISSUES IT, so the achieved rate
+    // can be put beside `probe-webgl-fetch-rate.js --ceiling-window=`'s measured
+    // issue rate instead of beside an estimate. Per group of 32 input channels:
+    // `C` scale/zero reads (one texelFetch each - `int5ScaleZero` reads ONE
+    // texel and picks a half), then `INT5_GROUP / 8` chunks, each decoding `C`
+    // output channels and reading `R` rows of x twice. `decodeInt5x8` reads one
+    // code texel, and a second only when its word lands on channel 3, which is
+    // one chunk in four - so 1.25 on average, and the upper bound is reported
+    // beside it rather than hidden in a single figure.
+    const groupsOfK = inChannels / INT5_GROUP;
+    const chunks = INT5_GROUP / 8;
+    const perGroup = (perDecode) => C + chunks * (C * perDecode + R * 2);
+    const fetchesTypical = extent.useful * groupsOfK * perGroup(1.25);
+    const fetchesUpper = extent.useful * groupsOfK * perGroup(2);
     // `half-x` alone is the shipped order with a narrower x, so its grid is the
     // shipped one; `tiled-N-half-x` is the tiled grid with a narrower x.
 
@@ -663,6 +677,9 @@ export async function main(device, args) {
       spread: Number((Math.max(...samples) / Math.min(...samples)).toFixed(2)),
       gigaflops: Number((flops / ms / 1e6).toFixed(0)),
       xMegabytes: Number((xBytes * (halfX ? 0.5 : 1) / 1048576).toFixed(1)),
+      gigaFetchesPerSecond: Number((fetchesTypical / ms / 1e6).toFixed(1)),
+      gigaFetchesUpperBound: Number((fetchesUpper / ms / 1e6).toFixed(1)),
+      flopsPerFetch: Number((flops / fetchesTypical).toFixed(1)),
       codeMegabytes: Number((codeBytes / 1048576).toFixed(1)),
       witnessFinite: Number.isFinite(witness),
     });

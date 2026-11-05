@@ -2380,6 +2380,48 @@ GFLOP/s** where this line used to read 137 to 198 - the tile-aware order and a f
 "The dense projection is bound by x's fetch locality" above. They are **49%** of a bioemu2 fold, not
 the 70% recorded here before the contraction was fixed a third time.
 
+🔴 **AND WITH THE ISSUE RATE MEASURED ON ONE SIDE AND THE PROJECTION'S OWN RATE ON THE OTHER, THE
+CEILING IS A PRODUCT OF TWO MEASUREMENTS RATHER THAN AN ESTIMATE.** `probe-webgl-linear-operand.js`
+counts the fetches its shader issues exactly - `C` scale/zero reads a group of 32 input channels, then
+four chunks each decoding `C` channels and reading `R` rows of x twice, with `decodeInt5x8` taking a
+second code texel only when its word lands on channel 3, one chunk in four - and reports the rate
+beside the flops:
+
+| arm | ms | GFLOP/s | G fetch4/s | flops a fetch4 |
+|---|---:|---:|---:|---:|
+| the shipped kernel at the start of this work | 10.08 | 184 | 7.9 | 23.3 |
+| **the shipped kernel now** (tiled-4, float16 x) | **3.89** | **476** | **20.4** | 23.3 |
+| `x-aliased`, perfect operand locality | 2.91 | 635 | **27.3** | 23.3 |
+
+And `probe-webgl-fetch-rate.js --ceiling-window=` puts this device's issue rate at **34.1 G fetch4/s
+through a 4 KiB window, 25.7 through 64 KiB, 19.5 through 256 KiB and 19.4 through 1 MiB** (four
+rounds each, spreads 1.03-1.14). The projection's working set under its tile mapping is about **75
+KiB** - four row blocks of eight rows of float16 x, 57 KiB, plus eight output groups of codes, 18 -
+so the rate it is entitled to is the 64 KiB figure, **25.7**.
+
+**It achieves 20.4 of 25.7: 79% of this device's fetch issue rate at its own working set.** The
+`x-aliased` arm's 27.3 is the 4 KiB regime, which is what a few KiB of operands buys and what no real
+GEMM has.
+
+🔴 **SO THE CEILING FOR THIS KERNEL FAMILY IS 23.3 x 25.7 = ABOUT 600 GFLOP/s, AND PARITY WITH THE
+WGSL FOLD NEEDS 1303.** Both factors are measured: the intensity by the output budget this section
+derives, the rate by a probe whose loop cannot be hoisted. At 476 the projections have **about 1.26x**
+left in them, which on 49% of the fold is 1.12x - and a fold that captured all of it would be **19.5
+s against the WGSL fold's 3.9**.
+
+That is the clearest statement this file can make about why the gap does not close here, and it is
+not an impossibility proof: it bounds the dominant family on this device at this working set. What it
+rules out is closing a 5x gap by making these kernels better, because there is 1.26x in them.
+
+🔴 **AND IT RECONCILES WITH `probe-webgl-gemm-ceiling.js`'s 1958-2003 GFLOP/s, WHICH IS NOT A
+CONTRADICTION BUT THE SAME CURVE AT THE OTHER END.** That probe's operands are 32 KiB shared by every
+fragment, so its fetches are served from the smallest cache and it reaches **87-89 G fetch4/s** - far
+above the windowed probe's 34, because the windowed probe is built not to be hoistable. Three figures,
+one curve: ~88 G fetch4/s when every fragment reads the same tiny operands, 34 through 4 KiB
+non-hoistably, 25.7 through 64 KiB, 19.5 through 256. **A ceiling is a function of the working set,
+and quoting the shared-operand end of it as "the backend's ceiling" is what made this section's
+earlier 6x floor wrong in the first place.**
+
 🔴 **AND THE INTENSITY CAP IS EXACTLY WHY THE 4x8x1 CONTRACTION BLOCK PAID.** 21.33 flops a fetch4 at
 `R + C = 12` is the ceiling for any kernel here, and the contraction's 2 i x 4 j x 4 channel block
 reached only **10.7** - because its four channels a fragment are not part of the register tile at
