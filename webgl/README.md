@@ -26,7 +26,7 @@ This file began as the spike that answered *can WebGL2 do this work at all*: the
 decide it, moved out of `webgpu/kernels/` where they sat with `webgl2` in their names and no
 importer, plus the texture layout and the limit arithmetic they shared by copy. The honest summary
 of the sections below: the numerics are **checked and correct**, the speed is **4.6x off the WebGPU
-path on AF2 and 48x on bioemu2** - it was 17x and 246x - and the shapes are **worse**.
+path on AF2 and 26x on bioemu2** - it was 17x and 246x - and the shapes are **worse**.
 
 🔴 **AND THEY WERE UNGATED FOR AS LONG AS THEY EXISTED, WHICH IS WHY THE FIRST THING THIS TREE
 GOT WAS A DIFFERENTIAL.** AGENTS.md requires every GPU kernel to have "a deterministic differential
@@ -632,10 +632,10 @@ second machine, and it is not an old one either: an M5 through ANGLE's Metal bac
 The question was whether the tricks in `sokrypton/rfd4-proteina-webgpu`'s own WebGL2 port close the
 distance to WGSL here. It has three: a blocked matmul into several render targets, operands as
 float16 packed eight to a texel, and narrow texture rows (384 texels, where this tree uses 2048).
-The first is worth **6.3x to 7.9x** on the projections bioemu2 is made of and is taken below. The
-second is untaken and is the largest thing left. The third is **untested here** - `TEXTURE_WIDTH`
-is a one-line change and nobody has run it; their own measurement is 2.35 s at 3072 texels against
-1.47 at 384, so it is worth asking.
+The first is worth **6.3x to 7.9x** on the projections bioemu2 is made of. The second is taken too,
+in the simplest form it has here - **1.4x and nearly half the peak memory**. The third is
+**untested here**: `TEXTURE_WIDTH` is a one-line change and nobody has run it; their own
+measurement is 2.35 s at 3072 texels against 1.47 at 384, so it is worth asking.
 
 And the two biggest wins were not on that list at all - one of them a kernel doing sixty-four times
 the work it needed to - while the first two attempts to find them both reported confident wrong
@@ -684,6 +684,18 @@ is pure cost. At that size the `[in][out]` layout is repeatably **0.44x to 0.65x
 one-texel kernel; `[out][in]` at the same size still wins. Nothing about the geometry decides this;
 only the weight's size does.
 
+**And its outgoing direction then asked for the same texel four times.** Four consecutive k of
+`a[c][i][k]` are four consecutive floats, which is one RGBA texel, and `fetch1` fetches a texel to
+select one component - so the loop issued four fetches where one would do. The texture cache
+absorbs the BYTES, but this kernel is bound by the fetch RATE (~10 G a second) and not by
+bandwidth, so the instruction count is the cost: one `dot` per four k is worth **1.25x on the
+bioemu2 trunk stage** at four mixer blocks (1026 ms to 822), and **1.64x on the real trunk** -
+78.4 s to 47.9 at 48 blocks and four passes, the largest single factor in this section after the
+row block itself. The INCOMING direction
+cannot do this - it walks a stride of L floats, so no two reads share a texel - and turning it into
+an outgoing contraction over transposed planes is the obvious next step and is not done.
+`--no-triangle-coalesce` is the control arm.
+
 **AF3's triangle contraction was doing sixty-four times the work it needed to.** Its fragment owns
 four channels of one pair, the centre norm needs that pair's whole channel axis, so the fragment
 contracted ALL 256 channels and kept four - and the 64 fragments of one pair each contracted the
@@ -722,15 +734,69 @@ Every fold is the same job, the same seed and the same settings either side; `--
 
 | fold | before | after | |
 |---|---:|---:|---:|
-| bioemu2, 6MRR 68 tokens, 4 passes, 20 steps | 968 s | **186 s** | **5.2x** |
-| ESMFold2, 75 residues, 36-block tower, 3 loops, 15 steps | 253 s | **67.7 s** | **3.7x** |
-| ESMFold2 at the tool's defaults | 2.82 s | **1.44 s** | 2.0x |
-| AF2 monomer, 59 residues | 1.40 s | **1.25 s** | 1.1x |
-| bioemu2's own distogram phase (the trunk's queued work) | 10.9 s | **2.8 s** | 3.9x |
+| bioemu2, 6MRR 68 tokens, 4 passes, 20 steps | 968 s | **102 s** | **9.5x** |
+| ...its trunk | 277.7 s | **47.9 s** | 5.8x |
+| ...its 20 denoiser calls | 658 s | **51.6 s** | 12.8x |
+| ESMFold2, 75 residues, 36-block tower, 3 loops, 15 steps | 253 s | **64.4 s** | **3.9x** |
+| ESMFold2 at the tool's defaults | 2.82 s | **1.37 s** | 2.1x |
+| AF3, 59 tokens | 4.68 s | **3.39 s** | 1.4x |
+| AF2 monomer, 59 residues | 1.40 s | **1.29 s** | 1.1x |
+| peak, bioemu2 | 1656 MiB | **851 MiB** | 1.95x |
 
 🔴 **AF2 MOVES LEAST BECAUSE IT IS NOT DOING THE ARITHMETIC.** Its pair weights are 64 KiB and sit
 in cache, so there is no traffic to divide, and 1122 ms of its 1400 is shader compilation. The
 models that gained are the ones with big weights - which is the same sentence from the other end.
+
+### Float16 weights, which need no kernel change at all
+
+The sibling port packs float16 operands eight to an RGBA32UI texel and unpacks them in the shader.
+That is not necessary here: **RGBA16F holds the same four values a texel in the same texel order**,
+and a `sampler2D` returns them as a `vec4` of floats because the hardware converts on the read. So
+`fetch4` and every kernel built on it are untouched, and only the internal format and the bytes on
+the bus change. A big projection's time is its weight traffic, so halving the bytes halves the
+traffic.
+
+| fold | f32 weights | f16 weights | | peak |
+|---|---:|---:|---:|---|
+| bioemu2, 6MRR 68 tokens, 20 steps | 186 s | **133 s** | 1.40x | 1656 -> **851 MiB** |
+| ...its 20 denoiser calls | 104.1 s | **50.9 s** | 2.05x | |
+| AF3, 59 tokens | 4.68 s | **3.39 s** | 1.38x | 937 -> **509 MiB** |
+| AF2 monomer, 59 residues | 1.31 s | 1.27 s | 1.03x | 469 -> **332 MiB** |
+| ESMFold2, 75 residues, full config | 65.1 s | 64.4 s | 1.01x | |
+
+🔴 **AND IT PAYS EXACTLY WHERE THE WEIGHTS ARE BIG, WHICH IS THE ROW BLOCK'S SENTENCE AGAIN.**
+ESMFold2 and AF2 gain 1% and 3% because their per-block weights stay in cache, so there is no
+traffic to halve; bioemu2's structure module is 424.6 M parameters and gains 1.4x. Two
+optimisations, one rule - and it is why neither of them is a default anybody could have guessed.
+
+🔴 **AND bioemu2's FOLD DOES NOT MOVE: rmsd 1.595, TM 0.9083, CA-CA 3.854, worst 3.904, bond rms
+0.042/0.056/0.028, 201 contacts** - every reported quantity identical to the f32 fold and to the
+WGSL fold. AF3's pTM is identical to four digits. So at these depths the models are insensitive to
+eleven bits of weight mantissa, which is the same conclusion the WGSL path reached when it chose to
+hold the same tensors in f16.
+
+🔴 **IT IS STILL THE FIRST THING HERE THAT IS NOT BIT-IDENTICAL, AND AF2 IS WHERE THAT SHOWS.** Its
+differential against the WGSL fold of the same weights - forced to f32 on the reference side, as
+that driver has always done - goes from **0.0291 A at the worst atom to 0.0565**, against a
+measured floor that itself moves 0.0973 to 0.0355. Both arms pass the gate's own `3 x floor` rule,
+but the margin is five times tighter and the difference is a real precision change rather than
+noise, so `--no-half-weights` is the arm that compares f32 with f32 and is the one to quote when
+the question is correctness.
+
+🔴 **AND THE DEFAULT IS THE FOLD DRIVERS', NOT `Execution`'s.** The 47 stage gates build their
+weights through the same `upload*Weights` helpers and hold the kernels to f32 references at bars
+down to 1e-7; a backend-wide default would have to re-bar every one of them. So a FOLD holds large
+weights in f16 and a GATE does not, which is a split worth being explicit about: making f16 the
+backend's precision rather than the folding one is work this has not done.
+
+Two guards it needed. The conversion happens on the HOST through `float32ToFloat16Array` (round to
+nearest, ties to even) rather than by handing f32 bytes to an RGBA16F texture, because the sibling
+port records that ANGLE's Metal backend TRUNCATES on the way in and that truncation's bias
+accumulated over a trunk pass cost it 6e-3 relative where rounding cost 4e-4. And a tensor whose
+largest magnitude is past float16's 65504 stays in f32 and says so (`halfRefusals`): this entry
+point is named by what the caller calls a weight, and an index table is not a weight in that sense
+- ESMFold2's `atomToToken` goes through a helper that looks identical and must never be converted,
+since f16 represents integers exactly only to 2048.
 
 ### A texture pool, and the bug it found
 
@@ -917,29 +983,30 @@ blocks, 20 steps, seed 1, against the 6MRR crystal:
 
 ```
                      WebGL2 (ported)  WebGL2 (now)  WGSL (same job, seed, steps)
-rmsd / TM            1.595 / 0.9083   1.595 / 0.9081   1.595 / 0.9083
-CA-CA median         3.8540558        3.8539638        3.8539739
-                     (rel 2.1e-5)     (rel 2.6e-6)
-worst CA-CA          3.904            3.905            3.904
+rmsd / TM            1.595 / 0.9083   1.595 / 0.9083   1.595 / 0.9083
+CA-CA median         3.8540558        3.8540558        3.8539739   (a relative 2.1e-5)
+worst CA-CA          3.904            3.904            3.904
 bond rms  main       0.042            0.042            0.042
           side       0.056            0.056            0.056
-          peptide    0.028            0.029            0.028
-contacts (P > 0.5)   201              209
-wall                 968 s            188 s            3.9 s
-  trunk              277.7 s          61.2 s           2.3 s
-  distogram                           19.8 s
-  20 denoiser calls  658 s            106.7 s          1.2 s
-weights/activations  1656 MiB peak    2158 MiB peak    815 MiB weights + 135 activations
+          peptide    0.028            0.028            0.028
+contacts (P > 0.5)   201              201
+wall                 968 s            102 s            3.9 s
+  trunk              277.7 s          47.9 s           2.3 s
+  distogram                           1.7 s
+  20 denoiser calls  658 s            51.6 s           1.2 s
+weights/activations  1656 MiB peak    851 MiB peak     815 MiB weights + 135 activations
 ```
 
-🔴 **968 s TO 188 s, AND THE STRUCTURE IS THE SAME STRUCTURE.** The 5.1x is the row-blocked
-projection and the split contraction from "Closing the gap" above; the fold lands on the same
-rmsd to three digits and its CA-CA median moves CLOSER to the WGSL fold's, 2.1e-5 relative to
-**2.6e-6**. What did move is the contact COUNT, 201 to 209: that is a threshold on the distogram
-head's probabilities, the head is one of the projections whose sum is now shaped differently for
-the compiler to fuse, and a pair either side of P = 0.5 crosses it. The peak is **up 30%** - the
-blocked path holds eight row planes while it runs and the split contraction holds its intermediate
-- which on this backend's intended audience is a real price and is why both have a control arm.
+🔴 **968 s TO 102 s, AND NOT ONE REPORTED QUANTITY MOVES.** The 9.5x is the row block, the split
+and coalesced contraction and the float16 weights from "Closing the gap" above, and every figure in
+the middle column is the left column's - the same rmsd, the same TM, the same CA-CA median to eight
+digits, the same 201 contacts - while the peak HALVES. Four kernels reordered or re-quantised and
+the fold does not notice; the weights are within 36 MiB of what the WGSL fold holds.
+
+🔴 **AND A MIDDLE COLUMN THAT DID NOT MATCH IS WHAT FOUND A BUG.** Before `Storage.zeros` landed
+this read TM 0.9081 and **209** contacts, which looked like a tolerable consequence of a reordered
+sum and was not: bioemu2's first trunk pass was reading texels nothing had written. The 201 is the
+evidence that it is fixed - see "A texture pool, and the bug it found".
 
 🔴 **THE SAME SEED THROUGH BOTH BACKENDS LANDS ON THE SAME STRUCTURE, which makes this a WHOLE-FOLD
 DIFFERENTIAL and not a plausibility check.** The sampler's draws come from one generator consumed in
@@ -949,24 +1016,22 @@ relative. A geometry floor would have accepted a port that was wrong by 10%; thi
 also why the AF3-style "worst atom" figure is not quoted here: it needs both PDBs, and the WebGL2
 side is sixteen minutes a fold.
 
-🔴 **AND IT IS 48x THE WGSL FOLD - WAS 246x - WHICH IS STILL NOT A TUNING GAP.** The trunk is 27x
-now and the diffusion 89x, and the diffusion is where the asymmetry lives: the WGSL denoiser
-batches S samples through one compiled program and halves its weights, and this one carries 1.6 GiB
-of f32 because WebGL2 has no f16 without an extension nobody can rely on. **Halving those bytes is
-the next multiplicative factor and it is the one trick from `sokrypton/rfd4-proteina-webgpu` that
-has NOT been taken here**: a big projection's time is its weight traffic divided by the rows a
-fragment owns (see "Closing the gap"), and float16 operands packed eight to an RGBA32UI texel halve
-the traffic and the fetch count both. 5.3 s a denoiser call at 573 atoms - it was 32.9 - is also why
-the tool's default is 20 steps where the model's is 200, and why a fold at 20 steps is a plumbing
-answer that happens to score well rather than a converged sample.
+🔴 **AND IT IS 26x THE WGSL FOLD - WAS 246x - WHICH IS STILL NOT A TUNING GAP.** The trunk is 21x
+and the diffusion 43x, and the diffusion is where the remaining asymmetry lives: the WGSL denoiser
+batches S samples through one compiled program, which this one does not. **The half-precision
+weights this file once called "the next multiplicative factor" are taken** - see "Float16 weights"
+above - so the denoiser's 1.6 GiB is 0.8 and a call is **2.6 s where it was 32.9**. That is also
+why the tool's default is 20 steps where the model's is 200, and why a fold at 20 steps is a
+plumbing answer that happens to score well rather than a converged sample.
 
 🔴 **AND THE DEFAULT ORDER OF THE WEIGHT UPLOADS IS LOAD-BEARING.** `structure_module` is 424.6 M of
 the checkpoint's 511.7 M parameters - 1.62 GiB in f32, ~101 MiB a layer over 16 layers - where the
 trunk's 52 pair blocks are 288 MiB. The driver releases the trunk's weights before it reads the
 denoiser's, which costs nothing because no sampler step touches the trunk, and keeps the peak at
-**1656 MiB** instead of 2.3 GiB. (The peak is **2158 MiB** since the row block and the split
-contraction landed, for the reason the table above gives: both hold an intermediate while they run.
-The release ordering is what stops it being 3 GiB.)
+**1656 MiB** instead of 2.3 GiB - and at **851 MiB** since the weights went to float16, which is
+within 36 MiB of what the WGSL fold holds. The row block and the split contraction each hold an
+intermediate while they run and pushed it to 2158 MiB in between, which is why that figure appears
+in this file's history; the release ordering is what stops it being 3 GiB either way.
 
 🔴 **AND THE COMPOSITION FOUND A BUG FIVE STAGE GATES COULD NOT**, which is the same argument the AF3
 driver made: `concatSource` had only an ALIGNED path, so the real single conditioning - `[s_trunk |
@@ -1053,8 +1118,8 @@ and the page requires WebGPU rather than choosing a backend.
 
 🔴 **THE PRECONDITION IS NOW MET AND THE DECISION IS STILL NOT AUTOMATIC.** This section used to say
 neither line should move "before a fold actually runs here", and one does. What has not been
-settled is whether a backend **4.6x slower on AF2 and 48x on bioemu2** should be offered: a
-59-residue AF2 fold is 1.25 s against 0.27 s, 68-token bioemu2 is 188 s against 3.9 s, and a
+settled is whether a backend **4.6x slower on AF2 and 26x on bioemu2** should be offered: a
+59-residue AF2 fold is 1.29 s against 0.28 s, 68-token bioemu2 is 102 s against 3.9 s, and a
 255-residue fold has not been measured at all. A visitor with no WebGPU gets a fold
 instead of a refusal, which is the whole point of the tree; a visitor who waits four minutes for
 something the other path does in fifteen seconds may not thank anyone. The multimer is also still

@@ -143,7 +143,7 @@ export function uploadOuterProductMeanWeights(execution, weights) {
   for (const name of OUTER_PRODUCT_MEAN_WEIGHTS) {
     const values = weights[name];
     if (values === undefined) throw new Error(`outer product mean weights: ${name} is missing`);
-    out[name] = execution.upload(values, `w.opm.${name}`);
+    out[name] = execution.uploadWeight(values, `w.opm.${name}`);
   }
   return out;
 }

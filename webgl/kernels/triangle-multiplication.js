@@ -61,7 +61,7 @@ export function uploadTriangleWeights(execution, weights) {
   for (const name of TRIANGLE_WEIGHTS) {
     const values = weights[name];
     if (values === undefined) throw new Error(`triangle weights: ${name} is missing`);
-    out[name] = execution.upload(values, `w.triangle.${name}`);
+    out[name] = execution.uploadWeight(values, `w.triangle.${name}`);
   }
   return out;
 }

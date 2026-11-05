@@ -13,6 +13,24 @@
  *                         whether a kernel reads texels nothing wrote: a pooled
  *                         texture carries the last tensor's bytes, so a fold
  *                         with and without it must agree to the last bit.
+ *   --no-half-weights     Every weight in float32. A FOLD holds a weight of
+ *                         65,536 floats or more in float16 (RGBA16F) by
+ *                         default, which halves the bytes a big projection
+ *                         streams - 1.4x and 1.95x less peak on bioemu2, with
+ *                         its rmsd, TM, CA-CA, bond rms and contact count all
+ *                         unchanged. It is the one optimisation here that is
+ *                         not bit-identical (see `Storage.halfWeights`), so
+ *                         this is the arm that compares f32 with f32: AF2's
+ *                         differential against the WGSL fold reads 0.0291 A at
+ *                         the worst atom with it and 0.0565 without.
+ *
+ *                         🔴 AND IT IS A DEFAULT OF THE FOLD DRIVERS, NOT OF
+ *                         `Execution`, deliberately. The 47 stage gates build
+ *                         their own weights through `upload*Weights` and hold
+ *                         the kernels to f32 references at bars down to 1e-7;
+ *                         a backend-wide default would have to re-bar every one
+ *                         of them, which is the work it would take to make this
+ *                         the shipped precision rather than the folding one.
  *   --nan-watch           Fill every fresh texture with NaN and read every
  *                         output back, refusing at the first non-finite value.
  *                         Names the kernel that reads a texel nothing wrote -
@@ -35,6 +53,9 @@
  *                         as they were - which contracts every channel of a
  *                         pair to normalise four of them, sixty-four times
  *                         over. Bit-identical, so this prices a pass count.
+ *   --no-triangle-coalesce
+ *                         The outgoing contraction reading one float per
+ *                         `fetch1`, which asks for the same texel four times.
  *   --skip-draws          Issue no draws at all. The fold is garbage; what it
  *                         times is everything this backend does APART from
  *                         drawing, which is the arm that settles whether the
@@ -58,6 +79,7 @@ export function webglExecutionOptions(args) {
     ? null : new RegExp(option(args, name, "")));
   return {
     pooling: flag(args, "pool"),
+    halfWeights: !flag(args, "no-half-weights"),
     checkErrors: !flag(args, "no-check-errors"),
     noLinearBlock: flag(args, "no-linear-block"),
     fillFresh: flag(args, "nan-watch") ? NaN : null,
@@ -67,6 +89,7 @@ export function webglExecutionOptions(args) {
     skipDraws: flag(args, "skip-draws"),
     noTriangleTranspose: flag(args, "no-triangle-transpose"),
     noTriangleSplit: flag(args, "no-triangle-split"),
+    noTriangleCoalesce: flag(args, "no-triangle-coalesce"),
     poolLabelPattern: pattern("pool-labels"),
     profile: flag(args, "profile") ? new Map() : null,
   };

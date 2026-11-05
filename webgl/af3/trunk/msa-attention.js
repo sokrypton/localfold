@@ -157,7 +157,7 @@ export function uploadMsaAttentionWeights(execution, weights) {
   for (const name of MSA_ATTENTION_WEIGHTS) {
     const values = weights[name];
     if (values === undefined) throw new Error(`af3 msa attention weights: ${name} is missing`);
-    out[name] = execution.upload(values, `w.af3.msa.${name}`);
+    out[name] = execution.uploadWeight(values, `w.af3.msa.${name}`);
   }
   return out;
 }

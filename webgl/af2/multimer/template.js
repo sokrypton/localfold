@@ -224,19 +224,19 @@ export function uploadMultimerTemplateWeights(execution, weights) {
   for (const name of TEMPLATE_WEIGHTS) {
     const values = weights[name];
     if (values === undefined) throw new Error(`multimer template weights: ${name} is missing`);
-    out[name] = execution.upload(values, `w.mt.${name}`);
+    out[name] = execution.uploadWeight(values, `w.mt.${name}`);
   }
   const query = weights.pairEmbeddings[QUERY_FEATURE];
-  out.queryWeight = execution.upload(query.weight, "w.mt.queryWeight");
-  out.queryBias = execution.upload(query.bias, "w.mt.queryBias");
-  out.dgramWeight = execution.upload(
+  out.queryWeight = execution.uploadWeight(query.weight, "w.mt.queryWeight");
+  out.queryBias = execution.uploadWeight(query.bias, "w.mt.queryBias");
+  out.dgramWeight = execution.uploadWeight(
     weights.pairEmbeddings[GEOMETRY_FEATURES[0]].weight, "w.mt.dgramWeight");
-  out.scalarWeight = execution.upload(scalarGeometryWeights(weights), "w.mt.scalarWeight");
-  out.aatypeRowWeight = execution.upload(
+  out.scalarWeight = execution.uploadWeight(scalarGeometryWeights(weights), "w.mt.scalarWeight");
+  out.aatypeRowWeight = execution.uploadWeight(
     weights.pairEmbeddings[AATYPE_FEATURES[0]].weight, "w.mt.aatypeRowWeight");
-  out.aatypeColumnWeight = execution.upload(
+  out.aatypeColumnWeight = execution.uploadWeight(
     weights.pairEmbeddings[AATYPE_FEATURES[1]].weight, "w.mt.aatypeColumnWeight");
-  out.constant = execution.upload(templateConstantTerm(weights), "w.mt.constant");
+  out.constant = execution.uploadWeight(templateConstantTerm(weights), "w.mt.constant");
   return out;
 }
 

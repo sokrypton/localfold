@@ -104,12 +104,12 @@ export function uploadConfidenceWeights(execution, lddtWeights, paeWeights) {
   for (const name of LDDT_WEIGHTS) {
     const values = lddtWeights[name];
     if (values === undefined) throw new Error(`confidence weights: lddt ${name} is missing`);
-    out.lddt[name] = execution.upload(values, `w.confidence.lddt.${name}`);
+    out.lddt[name] = execution.uploadWeight(values, `w.confidence.lddt.${name}`);
   }
   for (const name of ["logitsWeight", "logitsBias"]) {
     const values = paeWeights[name];
     if (values === undefined) throw new Error(`confidence weights: pae ${name} is missing`);
-    out.pae[name] = execution.upload(values, `w.confidence.pae.${name}`);
+    out.pae[name] = execution.uploadWeight(values, `w.confidence.pae.${name}`);
   }
   return out;
 }

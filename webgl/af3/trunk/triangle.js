@@ -182,7 +182,35 @@ void main() {
  * products, so the intermediate is exactly what the fused kernel computed and
  * then threw away sixty-three sixty-fourths of.
  */
-export const splitContractSource = (length, channels, direction, divideByLength) => `${PRELUDE}${ONE_TARGET}
+export const splitContractSource = (length, channels, direction, divideByLength,
+  coalesce = true) => {
+  // 🔴 THE OUTGOING DIRECTION WALKS k ALONG THE CONTIGUOUS AXIS, SO IT CAN READ
+  // WHOLE TEXELS - AND `fetch1` WAS ASKING FOR THE SAME TEXEL FOUR TIMES. Four
+  // consecutive k of `a[c][i][k]` are four consecutive floats, which is one
+  // RGBA texel; `fetch1` fetches that texel and selects one component, so the
+  // loop issued four fetches where one would do. The texture cache absorbs the
+  // BYTES, but this kernel is bound by the fetch RATE - about 10 G a second -
+  // not by bandwidth, so the instruction count is the cost. One `dot` per four
+  // k instead of four multiply-adds.
+  //
+  // `plane` is `c * L * L` and the row offset is `i * L`, so both are multiples
+  // of four whenever L is, which is the only case this takes; the general loop
+  // stays for an odd length.
+  //
+  // 🔴 THE INCOMING DIRECTION CANNOT: it walks `a[c][k][j]`, a stride of L
+  // floats, so no two of its reads share a texel. Turning it into an outgoing
+  // contraction over transposed planes would, and is not done here.
+  const coalesced = coalesce && direction === "outgoing" && length % 4 === 0;
+  const body = coalesced
+    ? `  for (int k4 = 0; k4 < L / 4; ++k4) {
+    total += dot(fetch4(aTex, (plane + i * L) / 4 + k4), fetch4(bTex, (plane + j * L) / 4 + k4));
+  }`
+    : `  for (int k = 0; k < L; ++k) {
+    ${direction === "outgoing"
+    ? "total += fetch1(aTex, plane + i * L + k) * fetch1(bTex, plane + j * L + k);"
+    : "total += fetch1(aTex, plane + k * L + j) * fetch1(bTex, plane + k * L + i);"}
+  }`;
+  return `${PRELUDE}${ONE_TARGET}
 const int L = ${length};
 const int PAIRS = ${length * length};
 const int C4 = ${channels / 4};
@@ -193,11 +221,7 @@ uniform sampler2D bTex;
 float contract(int c, int i, int j) {
   float total = 0.0;
   int plane = c * PAIRS;
-  for (int k = 0; k < L; ++k) {
-    ${direction === "outgoing"
-    ? "total += fetch1(aTex, plane + i * L + k) * fetch1(bTex, plane + j * L + k);"
-    : "total += fetch1(aTex, plane + k * L + j) * fetch1(bTex, plane + k * L + i);"}
-  }
+${body}
   return ${divideByLength ? "total / float(L)" : "total"};
 }
 
@@ -212,6 +236,7 @@ void main() {
   result = vec4(contract(c, i, j), contract(c + 1, i, j),
     contract(c + 2, i, j), contract(c + 3, i, j));
 }`;
+};
 
 /**
  * The centre norm over an already-contracted pair-major tensor.
@@ -259,7 +284,7 @@ export function uploadTriangleWeights(execution, weights) {
   for (const name of TRIANGLE_WEIGHTS) {
     const values = weights[name];
     if (values === undefined) throw new Error(`af3 triangle weights: ${name} is missing`);
-    out[name] = execution.upload(values, `w.af3.triangle.${name}`);
+    out[name] = execution.uploadWeight(values, `w.af3.triangle.${name}`);
   }
   return out;
 }
@@ -330,7 +355,8 @@ export function triangleMultiplication(execution, call) {
   } else {
     const contracted = execution.allocate(pairs * channels, "af3.triangle.contracted");
     execution.dispatch({
-      source: splitContractSource(length, channels, direction, divideByLength),
+      source: splitContractSource(length, channels, direction, divideByLength,
+        !execution.noTriangleCoalesce),
       output: contracted,
       inputs: { aTex: a, bTex: b },
       label: `af3.triangle.contract-only:${direction}:${length}x${channels}`

@@ -97,7 +97,7 @@ export function uploadAttentionBlockWeights(execution, weights) {
   for (const name of ATTENTION_BLOCK_WEIGHTS) {
     const values = weights[name];
     if (values === undefined) throw new Error(`attention block weights: ${name} is missing`);
-    out[name] = execution.upload(values, `w.attention.${name}`);
+    out[name] = execution.uploadWeight(values, `w.attention.${name}`);
   }
   return out;
 }

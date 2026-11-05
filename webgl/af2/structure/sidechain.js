@@ -74,16 +74,16 @@ export function uploadSidechainWeights(execution, weights) {
   for (const name of SIDECHAIN_WEIGHTS) {
     const values = weights[name];
     if (values === undefined) throw new Error(`sidechain weights: ${name} is missing`);
-    out[name] = execution.upload(values, `w.sidechain.${name}`);
+    out[name] = execution.uploadWeight(values, `w.sidechain.${name}`);
   }
   // Two residual blocks, two projections each, as arrays on the WGSL side.
   out.residual1 = weights.residual1Weights.map((value, index) => ({
-    weight: execution.upload(value, `w.sidechain.r1w${index}`),
-    bias: execution.upload(weights.residual1Biases[index], `w.sidechain.r1b${index}`),
+    weight: execution.uploadWeight(value, `w.sidechain.r1w${index}`),
+    bias: execution.uploadWeight(weights.residual1Biases[index], `w.sidechain.r1b${index}`),
   }));
   out.residual2 = weights.residual2Weights.map((value, index) => ({
-    weight: execution.upload(value, `w.sidechain.r2w${index}`),
-    bias: execution.upload(weights.residual2Biases[index], `w.sidechain.r2b${index}`),
+    weight: execution.uploadWeight(value, `w.sidechain.r2w${index}`),
+    bias: execution.uploadWeight(weights.residual2Biases[index], `w.sidechain.r2b${index}`),
   }));
   return out;
 }

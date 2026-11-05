@@ -124,11 +124,11 @@ export function uploadConditioningWeights(execution, weights) {
     if (values === undefined) {
       throw new Error(`af3 atom conditioning weights: ${name} is missing`);
     }
-    out[name] = execution.upload(values, `w.af3.cond.${name}`);
+    out[name] = execution.uploadWeight(values, `w.af3.cond.${name}`);
   }
   if (weights.embedAtomFeaturesBias !== undefined
       && weights.embedAtomFeaturesBias !== null) {
-    out.embedAtomFeaturesBias = execution.upload(
+    out.embedAtomFeaturesBias = execution.uploadWeight(
       weights.embedAtomFeaturesBias, "w.af3.cond.embedAtomFeaturesBias");
   }
   return out;

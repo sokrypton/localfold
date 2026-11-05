@@ -78,7 +78,7 @@ export function uploadPairBiasWeights(execution, weights) {
   for (const name of PAIR_BIAS_WEIGHTS) {
     const values = weights[name];
     if (values === undefined) throw new Error(`pair bias weights: ${name} is missing`);
-    out[name] = execution.upload(values, `w.pairBias.${name}`);
+    out[name] = execution.uploadWeight(values, `w.pairBias.${name}`);
   }
   return out;
 }

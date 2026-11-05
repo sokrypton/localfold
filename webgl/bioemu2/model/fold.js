@@ -80,7 +80,10 @@ function group(execution, read) {
   return {
     /** One tensor, by its full name. */
     up: async (name, label) => {
-      const tensor = execution.upload(
+      // `uploadWeight`, not `upload`: with `--half-weights` a weight of 65,536
+      // floats or more is held in float16, which halves what a big projection
+      // streams. Off by default; see `Storage.halfWeights`.
+      const tensor = execution.uploadWeight(
         Float32Array.from(await read(name)), label ?? name);
       held.push(tensor);
       return tensor;

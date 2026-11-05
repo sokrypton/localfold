@@ -89,11 +89,11 @@ export function uploadIterationWeights(execution, weights) {
   for (const name of ITERATION_WEIGHTS) {
     const values = weights[name];
     if (values === undefined) throw new Error(`iteration weights: ${name} is missing`);
-    out[name] = execution.upload(values, `w.iteration.${name}`);
+    out[name] = execution.uploadWeight(values, `w.iteration.${name}`);
   }
   out.transition = weights.transitionWeights.map((value, index) => ({
-    weight: execution.upload(value, `w.iteration.t${index}`),
-    bias: execution.upload(weights.transitionBiases[index], `w.iteration.tb${index}`),
+    weight: execution.uploadWeight(value, `w.iteration.t${index}`),
+    bias: execution.uploadWeight(weights.transitionBiases[index], `w.iteration.tb${index}`),
   }));
   return out;
 }

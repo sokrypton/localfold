@@ -210,7 +210,7 @@ export function uploadTemplateWeights(execution, weights) {
   for (const name of TEMPLATE_WEIGHTS) {
     const values = weights[name];
     if (values === undefined) throw new Error(`af3 template weights: ${name} is missing`);
-    out[name] = execution.upload(values, `w.af3.template.${name}`);
+    out[name] = execution.uploadWeight(values, `w.af3.template.${name}`);
   }
   out.blocks = weights.blocks.map((block) => ({
     triangleMultiplicationOutgoing: uploadTriangleWeights(

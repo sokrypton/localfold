@@ -106,11 +106,11 @@ export function uploadPairformerBlockWeights(execution, weights) {
     pairAttention1: uploadGridAttentionWeights(execution, weights.pairAttention1),
     pairAttention2: uploadGridAttentionWeights(execution, weights.pairAttention2),
     pairTransition: uploadTransitionWeights(execution, weights.pairTransition),
-    singlePairLogitsNormScale: execution.upload(
+    singlePairLogitsNormScale: execution.uploadWeight(
       weights.singlePairLogitsNormScale, "w.af3.block.logitsNormScale"),
-    singlePairLogitsNormOffset: execution.upload(
+    singlePairLogitsNormOffset: execution.uploadWeight(
       weights.singlePairLogitsNormOffset, "w.af3.block.logitsNormOffset"),
-    singlePairLogitsProjection: execution.upload(
+    singlePairLogitsProjection: execution.uploadWeight(
       weights.singlePairLogitsProjection, "w.af3.block.logitsProjection"),
     singleAttention: uploadSingleAttentionWeights(execution, weights.singleAttention),
     singleTransition: uploadTransitionWeights(execution, weights.singleTransition),

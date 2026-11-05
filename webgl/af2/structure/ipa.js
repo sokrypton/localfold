@@ -394,7 +394,7 @@ export function uploadIpaWeights(execution, weights) {
   for (const name of IPA_WEIGHTS) {
     const values = weights[name];
     if (values === undefined) throw new Error(`ipa weights: ${name} is missing`);
-    out[name] = execution.upload(values, `w.ipa.${name}`);
+    out[name] = execution.uploadWeight(values, `w.ipa.${name}`);
   }
   return out;
 }

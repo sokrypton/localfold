@@ -242,7 +242,7 @@ export function uploadEmbedderWeights(execution, weights) {
   for (const name of EMBEDDER_WEIGHTS) {
     const values = weights[name];
     if (values === undefined) throw new Error(`af3 embedder weights: ${name} is missing`);
-    out[name] = execution.upload(values, `w.af3.embed.${name}`);
+    out[name] = execution.uploadWeight(values, `w.af3.embed.${name}`);
   }
   return out;
 }

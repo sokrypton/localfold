@@ -152,7 +152,7 @@ export function uploadGlobalAttentionWeights(execution, weights) {
   for (const name of GLOBAL_ATTENTION_WEIGHTS) {
     const values = weights[name];
     if (values === undefined) throw new Error(`global attention weights: ${name} is missing`);
-    out[name] = execution.upload(values, `w.global.${name}`);
+    out[name] = execution.uploadWeight(values, `w.global.${name}`);
   }
   return out;
 }

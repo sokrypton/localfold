@@ -50,7 +50,7 @@ export function uploadTransitionWeights(execution, weights) {
   for (const name of TRANSITION_WEIGHTS) {
     const values = weights[name];
     if (values === undefined) throw new Error(`transition weights: ${name} is missing`);
-    out[name] = execution.upload(values, `w.transition.${name}`);
+    out[name] = execution.uploadWeight(values, `w.transition.${name}`);
   }
   return out;
 }

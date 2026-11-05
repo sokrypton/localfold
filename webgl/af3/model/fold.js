@@ -172,12 +172,12 @@ export function uploadAf3Weights(execution, weights) {
   const uploadTree = (value, label) => {
     if (value === undefined || value === null) return undefined;
     if (value instanceof Float32Array) {
-      const tensor = execution.upload(value, label);
+      const tensor = execution.uploadWeight(value, label);
       seen.push(tensor);
       return tensor;
     }
     if (value instanceof Int32Array || value instanceof Uint8Array) {
-      const tensor = execution.upload(Float32Array.from(value), label);
+      const tensor = execution.uploadWeight(Float32Array.from(value), label);
       seen.push(tensor);
       return tensor;
     }

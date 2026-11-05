@@ -197,9 +197,9 @@ export function uploadAf2Weights(execution, weights, graph = "monomer") {
     distogramHead: weights.distogramHead === undefined || weights.distogramHead === null
       ? null
       : {
-        logitsWeight: execution.upload(
+        logitsWeight: execution.uploadWeight(
           weights.distogramHead.halfLogitsWeights, "w.distogram.halfLogitsWeights"),
-        logitsBias: execution.upload(
+        logitsBias: execution.uploadWeight(
           weights.distogramHead.halfLogitsBias, "w.distogram.halfLogitsBias"),
         bins: weights.distogramHead.bins,
         firstBreak: weights.distogramHead.firstBreak,

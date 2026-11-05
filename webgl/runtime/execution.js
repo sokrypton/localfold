@@ -97,7 +97,8 @@ export class Execution {
     this.gl = gl;
     this.storage = new Storage(gl, { pooling: options.pooling ?? false,
       poolLabelPattern: options.poolLabelPattern ?? null,
-      fillFresh: options.fillFresh ?? null });
+      fillFresh: options.fillFresh ?? null,
+      halfWeights: options.halfWeights ?? false });
     /**
      * Read every output back and refuse at the first non-finite value.
      *
@@ -146,6 +147,12 @@ export class Execution {
      * Bit-identical, so this prices the pass count.
      */
     this.noTriangleSplit = options.noTriangleSplit ?? false;
+    /**
+     * The control arm for the coalesced outgoing contraction
+     * (`webgl/af3/trunk/triangle.js`): one `fetch1` per k, which asks for the
+     * same texel four times over.
+     */
+    this.noTriangleCoalesce = options.noTriangleCoalesce ?? false;
     /**
      * Where the HOST time inside `dispatch` goes, when asked for.
      *
@@ -248,6 +255,8 @@ export class Execution {
 
   allocate(elements, label) { return this.storage.allocate(elements, label); }
   zeros(elements, label) { return this.storage.zeros(elements, label); }
+  /** A weight, in float16 if this execution is holding large ones that way. */
+  uploadWeight(values, label) { return this.storage.uploadWeight(values, label); }
   upload(values, label) { return this.storage.upload(values, label); }
   read(tensor) { return this.storage.read(tensor); }
   release(tensor) { return this.storage.release(tensor); }

@@ -505,7 +505,7 @@ export function uploadConfidenceHeadWeights(execution, weights) {
     if (SCALARS.has(name) || typeof value === "number") {
       out[name] = value;
     } else if (value instanceof Float32Array) {
-      out[name] = execution.upload(value, `w.af3.conf.${name}`);
+      out[name] = execution.uploadWeight(value, `w.af3.conf.${name}`);
     }
   }
   // The absent rows stay on the HOST: they are read as numbers to build one

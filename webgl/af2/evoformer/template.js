@@ -170,7 +170,7 @@ export function uploadTemplateWeights(execution, weights) {
   for (const name of TEMPLATE_WEIGHTS) {
     const values = weights[name];
     if (values === undefined) throw new Error(`template weights: ${name} is missing`);
-    out[name] = execution.upload(values, `w.template.${name}`);
+    out[name] = execution.uploadWeight(values, `w.template.${name}`);
   }
   return out;
 }

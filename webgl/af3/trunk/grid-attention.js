@@ -119,13 +119,13 @@ export function uploadGridAttentionWeights(execution, weights) {
   for (const name of GRID_ATTENTION_WEIGHTS) {
     const values = weights[name];
     if (values === undefined) throw new Error(`af3 grid attention weights: ${name} is missing`);
-    out[name] = execution.upload(values, `w.af3.grid.${name}`);
+    out[name] = execution.uploadWeight(values, `w.af3.grid.${name}`);
   }
   // Absent means the term does not exist, which is not the same as zero: a
   // zero gate bias is a gate at sigmoid(0), and rf3's is bias-dominated.
   for (const name of GRID_ATTENTION_OPTIONAL) {
     if (weights[name] !== undefined && weights[name] !== null) {
-      out[name] = execution.upload(weights[name], `w.af3.grid.${name}`);
+      out[name] = execution.uploadWeight(weights[name], `w.af3.grid.${name}`);
     }
   }
   return out;

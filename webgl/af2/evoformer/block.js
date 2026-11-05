@@ -99,7 +99,7 @@ export function uploadEvoformerBlockWeights(execution, weights) {
     for (const name of names) {
       const values = source[name];
       if (values === undefined) throw new Error(`${label}: ${name} is missing`);
-      out[name] = execution.upload(values, `w.${label}.${name}`);
+      out[name] = execution.uploadWeight(values, `w.${label}.${name}`);
     }
     return out;
   };
@@ -462,7 +462,7 @@ export function uploadTemplatePairBlockWeights(execution, weights) {
     for (const name of names) {
       const values = source[name];
       if (values === undefined) throw new Error(`${label}: ${name} is missing`);
-      out[name] = execution.upload(values, `w.${label}.${name}`);
+      out[name] = execution.uploadWeight(values, `w.${label}.${name}`);
     }
     return out;
   };

@@ -72,7 +72,7 @@ export function uploadTransitionWeights(execution, weights) {
   for (const name of TRANSITION_WEIGHTS) {
     const values = weights[name];
     if (values === undefined) throw new Error(`af3 transition weights: ${name} is missing`);
-    out[name] = execution.upload(values, `w.af3.transition.${name}`);
+    out[name] = execution.uploadWeight(values, `w.af3.transition.${name}`);
   }
   return out;
 }

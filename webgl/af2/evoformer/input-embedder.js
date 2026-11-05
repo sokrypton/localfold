@@ -305,7 +305,7 @@ export function uploadInputEmbedderWeights(execution, weights) {
   for (const name of INPUT_EMBEDDER_WEIGHTS) {
     const values = weights[name];
     if (values === undefined) throw new Error(`input embedder weights: ${name} is missing`);
-    out[name] = execution.upload(values, `w.embedder.${name}`);
+    out[name] = execution.uploadWeight(values, `w.embedder.${name}`);
   }
   return out;
 }

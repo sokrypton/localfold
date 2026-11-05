@@ -55,7 +55,7 @@ export function uploadStructureInitializeWeights(execution, weights) {
   for (const name of STRUCTURE_INITIALIZE_WEIGHTS) {
     const values = weights[name];
     if (values === undefined) throw new Error(`structure initialize weights: ${name} is missing`);
-    out[name] = execution.upload(values, `w.structure.init.${name}`);
+    out[name] = execution.uploadWeight(values, `w.structure.init.${name}`);
   }
   return out;
 }

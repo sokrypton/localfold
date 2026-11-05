@@ -34,6 +34,20 @@
  * it is a fallback for.
  */
 import { CHANNELS_PER_TEXEL, TEXTURE_WIDTH, textureShape } from "./context.js";
+import { float32ToFloat16Array } from "../../shared/weights/float16.js";
+
+/**
+ * A weight of at least this many floats is held in float16 when
+ * `Storage.halfWeights` is on.
+ *
+ * 🔴 THE FLOOR IS WHERE THE WEIGHT STOPS FITTING IN CACHE, which is the same
+ * boundary `blockedApplies` turns on and for the same reason: a projection
+ * whose weight is read from cache does not care what it costs to read, and one
+ * whose weight streams from DRAM is bound by nothing else. 65,536 floats is
+ * 256 KiB in f32. The sibling port (`sokrypton/rfd4-proteina-webgpu`) picks the
+ * same number for the same decision.
+ */
+export const HALF_WEIGHT_FLOOR = 65536;
 
 /** Floats one texture can hold on this context, laid out linearly. */
 export function tensorCapacity(gl) {
@@ -48,7 +62,7 @@ export function storageBytes(elements) {
 
 /**
  * @typedef {{texture: WebGLTexture, elements: number, width: number, height: number,
- *   label: string, bytes: number}} Tensor
+ *   label: string, bytes: number, half?: boolean}} Tensor
  */
 
 export class Storage {
@@ -147,6 +161,37 @@ export class Storage {
      * @type {number | null}
      */
     this.fillFresh = options.fillFresh ?? null;
+    /**
+     * Hold a large WEIGHT in float16 (RGBA16F) rather than float32.
+     *
+     * 🔴 THE LAST FACTOR THE PROJECTION HAS, AND IT NEEDS NO KERNEL CHANGE AT
+     * ALL. A big projection's time is its weight traffic (see
+     * `webgl/kernels/linear.js`): bioemu2's 576 x 896 -> 1792 streams 460 MB of
+     * weight per call even blocked eight rows deep, and halving the bytes
+     * halves that. RGBA16F holds the SAME four values a texel in the SAME texel
+     * order, and a `sampler2D` returns them as a `vec4` of floats - the
+     * hardware converts on the read - so `fetch4` and every kernel built on it
+     * are untouched. Only the texture's internal format and the bytes on the
+     * bus change.
+     *
+     * 🔴 AND IT IS NOT FREE IN ACCURACY, WHICH IS WHY IT IS A FLAG AND NOT A
+     * LAYOUT. A float16 weight has eleven bits of mantissa, so this is the
+     * first optimisation in this backend that is not bit-identical - every
+     * other one reorders a sum. The conversion is done HERE, on the host, by
+     * `float32ToFloat16Array` (round to nearest, ties to even) rather than by
+     * handing f32 bytes to an RGBA16F texture and letting the driver choose:
+     * the sibling port records that ANGLE's Metal backend TRUNCATES on the way
+     * in, and truncation's bias accumulated over a trunk pass cost it 6e-3
+     * relative where rounding cost 4e-4.
+     *
+     * It is what the WGSL path does with the same tensors, which is why the
+     * fold drivers' differentials pass `setHalfPrecision(device, false)` to
+     * force the reference to f32 and compare like with like.
+     */
+    this.halfWeights = options.halfWeights ?? false;
+    /** How many tensors were held in float16, and how many were too large for it. */
+    this.halfWeightTensors = 0;
+    this.halfRefusals = 0;
   }
 
   /**
@@ -157,7 +202,7 @@ export class Storage {
    * that names nothing, and the caller's question is always "how long a chain
    * does this hold".
    */
-  allocate(elements, label = "tensor") {
+  allocate(elements, label = "tensor", half = false) {
     if (!Number.isInteger(elements) || elements <= 0) {
       throw new RangeError(`${label}: a tensor needs a positive integer element count, got ${elements}`);
     }
@@ -171,9 +216,13 @@ export class Storage {
     const gl = this.gl;
     const { width, height } = textureShape(elements);
     this.allocationLabels.set(label, (this.allocationLabels.get(label) ?? 0) + 1);
+    // 🔴 THE POOL KEY CARRIES THE FORMAT, because a texture comes back only as
+    // the format it was made in: handing an RGBA16F texture to an f32 tensor is
+    // a silent halving of everything written into it.
+    const key = `${width}x${height}:${half ? "f16" : "f32"}`;
     const free = this.poolLabelPattern === null || this.poolLabelPattern.test(label)
-      ? this.pool.get(`${width}x${height}`) : undefined;
-    const bytes = width * height * CHANNELS_PER_TEXEL * 4;
+      ? this.pool.get(key) : undefined;
+    const bytes = width * height * CHANNELS_PER_TEXEL * (half ? 2 : 4);
     let texture;
     if (free !== undefined && free.length > 0) {
       texture = free.pop();
@@ -183,7 +232,8 @@ export class Storage {
       const createdAt = performance.now();
       texture = gl.createTexture();
       gl.bindTexture(gl.TEXTURE_2D, texture);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, width, height, 0, gl.RGBA, gl.FLOAT, null);
+      gl.texImage2D(gl.TEXTURE_2D, 0, half ? gl.RGBA16F : gl.RGBA32F, width, height, 0,
+        gl.RGBA, half ? gl.HALF_FLOAT : gl.FLOAT, null);
       // NEAREST and CLAMP_TO_EDGE: every read is a texelFetch, so filtering and
       // wrapping are never consulted - but an incomplete texture samples as
       // black, and a mip-filtered RGBA32F texture with no mips IS incomplete.
@@ -199,7 +249,7 @@ export class Storage {
       }
     }
     /** @type {Tensor} */
-    const tensor = { texture, elements, width, height, label, bytes };
+    const tensor = { texture, elements, width, height, label, bytes, half };
     this.live.add(tensor);
     this.allocations += 1;
     this.bytes += bytes;
@@ -237,6 +287,42 @@ export class Storage {
     return this.upload(new Float32Array(elements), label);
   }
 
+  /**
+   * A WEIGHT tensor, in float16 when `halfWeights` is on and it is large
+   * enough to be streaming from DRAM rather than sitting in cache.
+   *
+   * Weights are the only tensors this is offered for: an activation is written
+   * by a kernel drawing into it, which would need an RGBA16F render target and
+   * the rounding discipline that goes with one, and a weight is written once by
+   * the host.
+   */
+  uploadWeight(values, label = "weight") {
+    let half = this.halfWeights && values.length >= HALF_WEIGHT_FLOOR;
+    if (half) {
+      // 🔴 AND A TENSOR THAT DOES NOT FIT IN float16 STAYS IN float32 RATHER
+      // THAN BECOMING Inf. A checkpoint's weights are all well inside the
+      // format's 65504, but this entry point is named by what the CALLER calls
+      // a weight, and an index table or a precomputed bin edge is not a weight
+      // in that sense. Checking the maximum costs one pass over a buffer that
+      // is about to be converted anyway, and the alternative failure is a fold
+      // full of infinities with nothing to point at.
+      let largest = 0;
+      for (let i = 0; i < values.length; i += 1) {
+        const magnitude = Math.abs(values[i]);
+        if (magnitude > largest) largest = magnitude;
+      }
+      if (!(largest <= 65504)) {
+        half = false;
+        this.halfRefusals += 1;
+      }
+    }
+    if (!half) return this.upload(values, label);
+    this.halfWeightTensors += 1;
+    const tensor = this.allocate(values.length, label, true);
+    this.write(tensor, values instanceof Float32Array ? values : Float32Array.from(values));
+    return tensor;
+  }
+
   /** Replace a tensor's contents, which must be exactly its element count. */
   write(tensor, values) {
     if (values.length !== tensor.elements) {
@@ -252,10 +338,20 @@ export class Storage {
     })();
     const startedAt = performance.now();
     gl.bindTexture(gl.TEXTURE_2D, tensor.texture);
-    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, tensor.width, tensor.height,
-      gl.RGBA, gl.FLOAT, padded);
+    if (tensor.half) {
+      // Rounded HERE, to nearest and ties to even, rather than by handing f32
+      // bytes to an RGBA16F texture: see `halfWeights` for what truncation on
+      // the way in cost the sibling port.
+      const halves = float32ToFloat16Array(padded);
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, tensor.width, tensor.height,
+        gl.RGBA, gl.HALF_FLOAT, halves);
+      this.timing.uploadBytes += halves.length * 2;
+    } else {
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, tensor.width, tensor.height,
+        gl.RGBA, gl.FLOAT, padded);
+      this.timing.uploadBytes += padded.length * 4;
+    }
     this.timing.uploadMs += performance.now() - startedAt;
-    this.timing.uploadBytes += padded.length * 4;
     this.timing.uploads += 1;
     return tensor;
   }
@@ -269,6 +365,12 @@ export class Storage {
    */
   read(tensor) {
     const gl = this.gl;
+    if (tensor.half) {
+      // A weight is written once and never read back, and reading an RGBA16F
+      // attachment as floats is another format question nothing here needs
+      // answered. Refusing by name beats returning something plausible.
+      throw new Error(`${tensor.label}: a float16 weight tensor is not readable`);
+    }
     if (this.readback === null) this.readback = gl.createFramebuffer();
     const previous = gl.getParameter(gl.FRAMEBUFFER_BINDING);
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.readback);
@@ -295,7 +397,7 @@ export class Storage {
       this.gl.deleteTexture(tensor.texture);
       return;
     }
-    const key = `${tensor.width}x${tensor.height}`;
+    const key = `${tensor.width}x${tensor.height}:${tensor.half ? "f16" : "f32"}`;
     const free = this.pool.get(key);
     if (free === undefined) this.pool.set(key, [tensor.texture]);
     else free.push(tensor.texture);
@@ -327,6 +429,8 @@ export class Storage {
       reuses: this.reuses,
       capacityFloats: this.capacity,
       allocationLabels: this.allocationLabels,
+      halfWeightTensors: this.halfWeightTensors,
+      halfRefusals: this.halfRefusals,
       timing: Object.fromEntries(
         Object.entries(this.timing).map(([key, value]) => [key, Math.round(value)])),
     };
