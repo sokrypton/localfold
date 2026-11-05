@@ -622,10 +622,19 @@ ceiling of the FRAGMENT path).
 | WebGL2, naive fragment | 1.01 | 5.6% |
 | jax-js, WebGL | 0.08 | 0.4% |
 
-The vertex path is 2.2x the fragment path and the whole difference is **output budget** - a
-fragment writes `MAX_DRAW_BUFFERS` x RGBA = 32 floats, a vertex shader with rasterisation
-discarded writes up to `MAX_VERTEX_OUTPUT_COMPONENTS`, and more outputs an invocation is more
-arithmetic per fetch. This is the vertex shader used as a compute kernel, which is what people did
+The vertex path is 2.2x the fragment path there and the whole difference was read as **output
+budget** - a fragment writes `MAX_DRAW_BUFFERS` x RGBA = 32 floats, a vertex shader with
+rasterisation discarded writes up to `MAX_VERTEX_OUTPUT_COMPONENTS`, and more outputs an invocation
+is more arithmetic per fetch.
+
+🔴 **THAT READING IS WRONG ON THIS DEVICE, AND THE 2.2x IS NOT THE BUDGET.**
+`tools/gpu/bench-webgl-tf-linear.js` runs one real projection both ways: at the same 32-float
+budget transform feedback is **1.00x** the fragment kernel and bit-identical (`relRms` 0), and at
+112 floats - the budget that was supposed to be the point - it is **1.85x slower**, because that
+many accumulators spill out of the register file. The table's own winning arm (`8x1`) writes 32
+floats, the same as a fragment, so the 2.2x was never evidence for the budget; it is a property of
+a square-2048 GEMM, whose operands stream perfectly where a projection's do not. **The binding
+constraint is registers.** This is the vertex shader used as a compute kernel, which is what people did
 before compute shaders existed. See `vertexOutputFloats` in `runtime/limits.js` for why the
 advertised limit is not the real one.
 
@@ -1039,11 +1048,12 @@ EVEN SLOW**: a transition's pre-activation at `576 x 1792 -> 128` packs to **-In
 not, and holding them there needs a per-tensor scale - a reduction pass, which would cost more than
 the fetches it saves. The code is not kept, because a measured loss with an accuracy hazard is not
 a control arm worth maintaining; the measurement is kept so the next reader does not rebuild it.
-- **The one path with a bigger budget is the vertex one**, whose 128 interleaved components are
-  four times a fragment's - docs/A100.md puts transform feedback at 8.64 TFLOP/s against the
-  fragment path's 3.99 and WebGPU compute's 13.22, so **65% of WebGPU at best**. No kernel here
-  uses it, and this file's own note is that "old drivers are exactly where transform feedback gets
-  flaky" - which is this backend's entire audience.
+- **The vertex path's bigger budget cannot be spent, and that is measured now.**
+  `tools/gpu/bench-webgl-tf-linear.js` runs the same projection both ways at 576 x 896 -> 1792: at
+  the SAME 32-float budget a fragment has, transform feedback is **1.00x** - 70.2 ms against 70.3,
+  with `relRms` **exactly 0** - and at **112** floats, the budget that was supposed to be the
+  advantage, it is **1.85x SLOWER**, because 112 accumulators do not fit in a register file and
+  spill. The binding constraint is REGISTERS, not outputs.
 
 🔴 **SO "AS FAST AS WebGPU" IS NOT AVAILABLE - BY A MEASURED 3x AT BEST - AND THE USEFUL QUESTION
 IS WHETHER 15x IS SHIPPABLE.**
