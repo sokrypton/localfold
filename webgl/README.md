@@ -61,6 +61,7 @@ webgl/
     evoformer/block.js          a whole Evoformer block and the extra-MSA block, nine sub-layers
                                 each, sharing the six that make up the pair half
     evoformer/stack.js          the loop over blocks, for both kinds
+    evoformer/input-embedder.js the MSA, extra-MSA and pair embeddings, and the recycle
     structure/initialize.js     the single representation and the identity frame
     structure/sidechain.js      seven torsions a residue, as normalised (x, y) pairs
     structure/geometry.js       atom coordinates from frames and torsions - atom14 and atom37
@@ -261,8 +262,22 @@ sphere over eight iterations: a structure that gets worse with length rather tha
 The gate asserts the quaternion IS a unit as well as comparing it, because a comparison would not
 catch both sides drifting the same way.
 
-Still to come in AF2: the input embedder, the template stack, the multimer variant, and reading a
-weight bundle. After that: AF3's pairformer and diffusion, ESMFold2, bioemu2.
+**The input embedder is done** - msa 6.5e-8, extra msa bit-exact, pair 6.4e-8 - with four
+conventions pinned that each produce a plausible embedding when wrong: the recycled MSA enters on
+row ZERO only; the pseudo-beta is CB except for glycine, which uses CA; a distance below the first
+bin's lower edge lands in NO bin while the last bin's upper edge is `maxBin + binWidth`; and the
+relative position is CLAMPED, so every separation past 32 shares one bin. Its arms plant a glycine
+and an index jump of 100, because neither branch is reached by a plain sequence.
+
+🔴 **AND THE CROSS-CHECK CAUGHT A MISSING STAGE BY REFUSING TO RUN.** Both recycled tensors
+are LayerNormalised before being added - four weights with nowhere else to go - and this port did
+not do it. `packWeights` reads all eighteen tensors and threw on the four that were absent. Adding
+the recycled tensors raw is a plausible embedding whose scale drifts with every pass: the kind of
+error that degrades a long fold and leaves a short one looking fine, and one that three kernels each
+looking complete would never reveal.
+
+Still to come in AF2: the template stack, the multimer variant, and reading a weight bundle. After
+that: AF3's pairformer and diffusion, ESMFold2, bioemu2.
 
 Every operation so far is checked against TWO references - an f64 CPU one written from the
 operation, and the WGSL kernel run in the same page - because a single reference cannot say which
