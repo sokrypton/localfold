@@ -302,6 +302,25 @@ export function layerNorm(
   //   | 68x768 | 192 | **1.82x** |   | 59x384 | 96 | **0.50x** |
   //   | 576x512 | 128 | 1.92x |   | 59x128 | 32 | **0.33x** |
   //
+  // 🔴 AND THAT TABLE IS `two-pass`, WHICH IS NOT THE VARIANCE THE FOLD'S
+  // LARGEST NORM USES. AF3's `fast` takes E[x^2] - E[x]^2 in ONE sweep where
+  // the centred form takes two, so the fused kernel reads its row `CH4` times
+  // rather than `2 * CH4` and the split saves half as much. The fold's biggest
+  // excluded shape is `layer-norm:4624x256:fast`, 1240 ms over 624 calls, and
+  // re-priced under its own variance:
+  //
+  //   | shape | two-pass | fast |
+  //   |---|---|---|
+  //   | 576x768 | 4.33x | **3.00x** |
+  //   | 68x384 | 1.11x | **2.00x** |
+  //   | 4624x256 | 1.00x | **0.80x** |
+  //
+  // So 4624x256 is a LOSS at the variance it actually runs, and excluding it is
+  // right - while the 1.27x an earlier sweep read for it was noise at spreads
+  // of 1.31 and 1.38. The threshold holds under both forms; the lesson is that
+  // a sweep has to use the variance the caller does, which is the same mistake
+  // as benching a kernel without the stride padding its caller applies.
+  //
   // The saving scales with `CH4` and the cost does not: one extra draw at the
   // 22.9 us `probe-webgl-draw-floor.js` charges, plus a statistics pass of ONE
   // fragment a row that is badly under-occupied at any row count this backend

@@ -39,6 +39,13 @@ export async function main(device, args) {
       const [rows, channels] = spec.split("x").map(Number);
       return { rows, channels };
     });
+  // 🔴 THE VARIANCE FORM MATTERS TO THE SPLIT AND THE FIRST SWEEP MISSED IT.
+  // AF3's `fast` takes E[x^2] - E[x]^2 in ONE pass where AF2's `two-pass`
+  // centres first, so the fused kernel reads its row `CH4` times rather than
+  // `2 * CH4` - and the split therefore saves half as much. The fold's largest
+  // excluded norm is `layer-norm:4624x256:fast`, 1240 ms over 624 calls, and
+  // benching it two-pass priced a kernel nothing dispatches.
+  const variance = option(args, "variance", "two-pass");
   const iterations = Number(option(args, "iterations", "16"));
   const rounds = Number(option(args, "rounds", "4"));
   const gl = createWebGL2Context();
@@ -61,7 +68,7 @@ export async function main(device, args) {
     const bias = execution.upload(fill(channels, 13), "bench.b");
     const ring = Array.from({ length: iterations },
       () => execution.allocate(n * channels, "bench.out"));
-    const call = { x, weight, bias, rows: n, channels };
+    const call = { x, weight, bias, rows: n, channels, variance };
     // 🔴 BOTH ARMS AT THE KERNEL, because the fold measurement that first called
     // the split a null had a 3.7% spread WITHIN its own arm (21848 and 21063 ms)
     // and the difference it was looking for is about 4% of a fold. A bench with
@@ -88,6 +95,7 @@ export async function main(device, args) {
     const issuedBytes = n * channels * 4 * (2 * (channels / 4)) + n * channels * 4;
     rows.push({
       shape: `${n}x${channels}`,
+      variance,
       arm: split ? "split" : "fused",
       outputTexels,
       microsecondsPerCall: Number((ms * 1000).toFixed(1)),
