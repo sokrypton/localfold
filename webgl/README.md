@@ -43,6 +43,8 @@ webgl/
     attention-flash.js          gated attention for ANY head width: `min(D/4, MAX_DRAW_BUFFERS)`
                                 planes an invocation, drawn more than once when a head is too
                                 wide, plus the gather back into one interleaved tensor
+    attention-block.js          the whole block - LayerNorm, q/k/v/gate projections, the flash
+                                core, the output projection; what an Evoformer layer calls
     layer-norm.js   row-wise LayerNorm, about ten times a block
     linear.js       the dense projection, with bias and activation folded in - where the FLOPs are
     triangle-contract.js        the contraction, one source shared by the stage and the benchmark
@@ -72,12 +74,17 @@ applied none, so it was correct only for a caller that had pre-scaled its querie
 so. Checked at D = 4, 8, 16, 32 and 64, with and without a pair bias, with both mask layouts, and
 against the kernel it replaces at that kernel's own convention.
 
-Still to come, in the order they are needed: the whole attention BLOCK (LayerNorm, the q/k/v/gate
-projections, the flash core, the output projection), which is what `AttentionGpu` on the WGSL side
-is and so is what makes a cross-API differential possible for it; AF2's separate GLOBAL attention
-for the extra-MSA stack; the outer product mean; the transition; triangle ATTENTION; then the
-Evoformer block that drives them, the stack, the structure module, and the confidence and distogram
-heads. After AF2: AF3's pairformer and diffusion, ESMFold2, bioemu2. Nothing is wired to a weight
+**The whole attention block is done and cross-checked against the WGSL one** at 2.3e-7, which is
+the comparison that matters: `AttentionGpu` is the block, so the flash core alone had nothing on
+that side to be measured against. It confirmed four conventions rather than assuming them - weights
+`[in][out]` (the triangle's are `[out][in]`, same model), q/k/v with no bias against a gate with
+one, the `1/sqrt(head_dim)` scale on the logit here against the query there, and the plane gather.
+
+Still to come, in the order they are needed: the pair-bias projection (the block takes a
+pre-projected bias today; the WGSL one computes it from the pair activations); AF2's separate GLOBAL
+attention for the extra-MSA stack; the outer product mean; the transition; triangle ATTENTION; then
+the Evoformer block that drives them, the stack, the structure module, and the confidence and
+distogram heads. After AF2: AF3's pairformer and diffusion, ESMFold2, bioemu2. After AF2: AF3's pairformer and diffusion, ESMFold2, bioemu2. Nothing is wired to a weight
 bundle yet - every kernel takes its operands as plain arrays, and reading
 `model-af2-monomer-int5` is its own stage with its own differential, because a transposed weight is
 a plausible-looking wrong answer.
@@ -160,6 +167,17 @@ checked against was written FROM the shader's own index arithmetic, so it encode
 convention and agreed to 1e-7 while both were wrong. The operation's own CPU reference covers
 outgoing only, so nothing else here could have seen it. **Independence has to mean a second
 implementation of the operation, not a second transcription of the code.**
+
+🔴 **AND PINNING THE WGSL SIDE TOOK FOUR TRIES, WHICH IS WORTH KNOWING BEFORE WRITING THE NEXT
+CROSS-CHECK.** `AttentionGpu` has FOUR precision axes - `flashPrecision`, `projectPrecision`,
+`outputPrecision` and `storage` - all defaulting to `"auto"`, and `"auto"` on a device with
+`shader-f16` is f16, a 1e-3 floor. Worse, `storage` is READ as `{input, value, output}` and
+REPORTED back as `{projected, value, weighted}`, so passing the reported spelling sets nothing and
+raises nothing: the run answered `projected: "f32"` - which it already was - and the number did not
+move. The tell throughout was that two references disagreed by four orders of magnitude about the
+same tensor (2.5e-7 against f64, 1e-3 against WGSL); when that happens the instrument is wrong, not
+the kernel. Every cross-API arm here prints the `storage` and `shaders` keys the run reports, so
+"the option worked" and "the option was ignored and the default agreed" are distinguishable.
 
 **What these do NOT verify.** Numerics at small shapes, nothing else. It does
 not check the banded output path (a framebuffer is at most `MAX_TEXTURE_SIZE` on a side, so long

@@ -6,15 +6,21 @@
  * projections, both halves of a transition, the triangle's four projections -
  * and it is where the FLOPs are.
  *
- * 🔴 WEIGHT IS `[out][in]`, ROW-MAJOR, AND THAT IS A CHOICE THE CALLER MUST
- * MATCH. A fragment owns four consecutive OUTPUT channels of one row, so it
- * walks four weight rows against one input row; with `[out][in]` those four
- * reads are four contiguous texels and the input's are shared. `[in][out]`
- * would make the weight reads strided by `out` and the input's unshared. The
- * bundles on disk are not necessarily in this order - wiring them is the next
- * stage's job, and a transposed weight is a plausible-looking wrong answer, so
- * `check-webgl-kernels.js` compares against a reference that indexes the same
- * way and nothing here guesses.
+ * 🔴 BOTH WEIGHT LAYOUTS ARE SUPPORTED BECAUSE THIS MODEL USES BOTH, AND A
+ * TRANSPOSED WEIGHT IS A PLAUSIBLE-LOOKING WRONG ANSWER. The triangle's
+ * reference projects with `weight[out * inChannels + in]` (`project` in
+ * webgpu/kernels/triangle/cpu-reference.js) while AF2's attention projects with
+ * `weight[in * outChannels + out]` - `let weight_row = weight_c * projected;`
+ * then `weight_row + output_hd` in webgpu/kernels/attention.js. Same model,
+ * opposite conventions, and nothing in either tensor's SHAPE distinguishes them
+ * because both are `in * out` floats. So `weightLayout` is explicit and has no
+ * safe default: `"out-major"` is `[out][in]` and `"in-major"` is `[in][out]`.
+ *
+ * Neither costs more than the other here. A fragment owns four consecutive
+ * OUTPUT channels of one row: with `[out][in]` it reads four contiguous texels
+ * of four different weight rows against one shared input texel, and with
+ * `[in][out]` it reads one texel per input channel, each already holding the
+ * four outputs it wants. Five fetches for sixteen multiply-adds either way.
  *
  * 🔴 AND THE INTENSITY IS 3.2 FLOPS A FETCH, WHICH IS A QUARTER OF WHAT THIS
  * API REACHES. Four outputs a fragment is four weight texels plus one input
@@ -35,7 +41,30 @@ const ACTIVATIONS = {
   sigmoid: "vec4(1.0) / (vec4(1.0) + exp(-value))",
 };
 
-export const linearSource = (rows, inChannels, outChannels, activation, useBias) => `${PRELUDE}${ONE_TARGET}
+export const linearSource = (
+  rows, inChannels, outChannels, activation, useBias, weightLayout,
+) => {
+  // `[out][in]`: four weight rows, each IN long and each starting on a texel
+  // boundary because IN is a multiple of four, against one shared input texel.
+  const outMajor = `  int wBase = group * 4 * IN4;
+  for (int i = 0; i < IN4; ++i) {
+    vec4 x = fetch4(xTex, xBase + i);
+    sum.x += dot(x, fetch4(weightTex, wBase + i));
+    sum.y += dot(x, fetch4(weightTex, wBase + IN4 + i));
+    sum.z += dot(x, fetch4(weightTex, wBase + 2 * IN4 + i));
+    sum.w += dot(x, fetch4(weightTex, wBase + 3 * IN4 + i));
+  }`;
+  // `[in][out]`: one texel per input channel, already holding the four outputs
+  // this fragment owns, scaled by that channel's input value.
+  const inMajor = `  for (int i = 0; i < IN4; ++i) {
+    vec4 x = fetch4(xTex, xBase + i);
+    int wRow = (i * 4) * OUT4 + group;
+    sum += x.x * fetch4(weightTex, wRow);
+    sum += x.y * fetch4(weightTex, wRow + OUT4);
+    sum += x.z * fetch4(weightTex, wRow + 2 * OUT4);
+    sum += x.w * fetch4(weightTex, wRow + 3 * OUT4);
+  }`;
+  return `${PRELUDE}${ONE_TARGET}
 const int ROWS = ${rows};
 const int IN = ${inChannels};
 const int IN4 = ${inChannels / 4};
@@ -51,33 +80,34 @@ void main() {
   int row = texel / OUT4;
   int group = texel - row * OUT4;
   int xBase = row * IN4;
-  // Four output channels: four weight rows, each IN long, each starting on a
-  // texel boundary because IN is a multiple of four.
-  int wBase = group * 4 * IN4;
 
   vec4 sum = vec4(0.0);
-  for (int i = 0; i < IN4; ++i) {
-    vec4 x = fetch4(xTex, xBase + i);
-    sum.x += dot(x, fetch4(weightTex, wBase + i));
-    sum.y += dot(x, fetch4(weightTex, wBase + IN4 + i));
-    sum.z += dot(x, fetch4(weightTex, wBase + 2 * IN4 + i));
-    sum.w += dot(x, fetch4(weightTex, wBase + 3 * IN4 + i));
-  }
+${weightLayout === "in-major" ? inMajor : outMajor}
   vec4 value = sum${useBias ? " + fetch4(biasTex, group)" : ""};
   result = ${ACTIVATIONS[activation]};
 }`;
+};
 
 /**
  * @param {import("../runtime/execution.js").Execution} execution
  * @param {{x: Tensor, weight: Tensor, bias?: Tensor, rows: number, inChannels: number,
- *   outChannels: number, activation?: "none" | "relu" | "sigmoid"}} call
+ *   outChannels: number, activation?: "none" | "relu" | "sigmoid",
+ *   weightLayout?: "out-major" | "in-major"}} call
  * @param {Tensor} [into]
  * @returns {Tensor}
  */
 export function linear(execution, call, into) {
-  const { x, weight, bias, rows, inChannels, outChannels, activation = "none" } = call;
+  const {
+    x, weight, bias, rows, inChannels, outChannels,
+    activation = "none", weightLayout = "out-major",
+  } = call;
   if (!(activation in ACTIVATIONS)) {
     throw new RangeError(`linear: no activation \`${activation}\``);
+  }
+  if (weightLayout !== "out-major" && weightLayout !== "in-major") {
+    throw new RangeError(
+      `linear: weightLayout is "out-major" ([out][in]) or "in-major" ([in][out]), `
+      + `not \`${weightLayout}\``);
   }
   /** @type {[string, number][]} */
   const widths = [["inChannels", inChannels], ["outChannels", outChannels]];
@@ -99,11 +129,12 @@ export function linear(execution, call, into) {
     throw new Error("linear: a fragment shader cannot read the texture it draws into");
   }
   return execution.dispatch({
-    source: linearSource(rows, inChannels, outChannels, activation, bias !== undefined),
+    source: linearSource(
+      rows, inChannels, outChannels, activation, bias !== undefined, weightLayout),
     output,
     inputs: bias === undefined
       ? { xTex: x, weightTex: weight }
       : { xTex: x, weightTex: weight, biasTex: bias },
-    label: `linear:${rows}x${inChannels}x${outChannels}:${activation}`,
+    label: `linear:${rows}x${inChannels}x${outChannels}:${activation}:${weightLayout}`,
   });
 }

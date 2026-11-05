@@ -1,0 +1,256 @@
+/**
+ * The whole attention block in WebGL2 against the WGSL block and a CPU
+ * reference - the cross-API differential this backend's attention has lacked.
+ *
+ *     node tools/gpu-chrome.mjs tools/gpu/check-webgl-attention-block.js [--falsify]
+ *
+ * 🔴 WHY THE BLOCK AND NOT THE CORE. `AttentionGpu` on the WGSL side is the
+ * whole operation - LayerNorm, the q/k/v/gate projections, the attention, the
+ * output projection - so the flash core alone has nothing on that side to be
+ * compared against. Porting the block is what makes the comparison possible,
+ * and that comparison is what caught the triangle contraction computing the
+ * pair-transpose of itself: a convention error is invisible to a reference
+ * transcribed from the same shader and obvious to a second implementation.
+ *
+ * Two conventions are being checked here as much as the arithmetic. The weights
+ * are `[in][out]` - read off `let weight_row = weight_c * projected;` in the
+ * WGSL shader, where the triangle's reference uses `[out][in]` - and the
+ * `1/sqrt(head_dim)` scale is applied to the query there and to the logit here,
+ * which is the same number and worth confirming rather than asserting.
+ *
+ * 🔴 AND THE WGSL SIDE HAS FOUR PRECISION AXES, WHICH THIS GATE LEARNED BY
+ * MEASURING 1e-3 TWICE WITH THE WRONG ONES PINNED. `flashPrecision`,
+ * `projectPrecision`, `outputPrecision` and `storage` are separate, they all
+ * default to "auto", and "auto" on a device with `shader-f16` is f16 - which is
+ * a 1e-3 floor and exactly what the arms read. The one that mattered was
+ * `projectPrecision`, the arithmetic of the q/k/v/gate GEMM, and it was the
+ * last one tried.
+ *
+ * 🔴 AND THE OPTION NAMES ARE NOT THE REPORTED NAMES, WHICH COST THE FIRST
+ * ATTEMPT. `storage` is read as `{input, value, output}`
+ * (`effective.input ?? "f32"`) and reported back as
+ * `{projected, value, weighted}`. Passing the reported spelling sets nothing
+ * and raises no error: the run came back saying `projected: "f32"` - which it
+ * already was - and the number did not move by a digit. A gate that cannot tell
+ * "the option worked" from "the option was ignored and the default agreed" is
+ * why the arms print the `storage` and `shaders` keys the run reports.
+ *
+ * The tell throughout was that the two references disagreed by four orders of
+ * magnitude about the SAME tensor - 2.5e-7 against f64, 1e-3 against WGSL. When
+ * that happens the instrument is wrong, not the kernel.
+ */
+import { AttentionGpu } from "../../webgpu/kernels/attention.js";
+import {
+  attentionBlock, releaseAttentionBlockWeights, uploadAttentionBlockWeights,
+} from "../../webgl/kernels/attention-block.js";
+import { Execution } from "../../webgl/runtime/execution.js";
+import { createWebGL2Context } from "../../webgl/index.js";
+import { relativeRms } from "./relative-rms.js";
+
+const flag = (args, name) => (args ?? []).includes(`--${name}`);
+const option = (args, name, fallback) => {
+  const prefix = `--${name}=`;
+  return (args ?? []).find((a) => a.startsWith(prefix))?.slice(prefix.length) ?? fallback;
+};
+
+function generator(seed) {
+  let state = seed >>> 0;
+  return () => {
+    state += 0x6d2b79f5;
+    let value = state;
+    value = Math.imul(value ^ (value >>> 15), value | 1);
+    value ^= value + Math.imul(value ^ (value >>> 7), value | 61);
+    return ((value ^ (value >>> 14)) >>> 0) / 0x1_0000_0000;
+  };
+}
+const noise = (count, spread, random, centre = 0) => {
+  const out = new Float32Array(count);
+  for (let i = 0; i < count; i += 1) out[i] = centre + (random() * 2 - 1) * spread;
+  return out;
+};
+
+/** The block, from the operation. Weights are `[in][out]`. */
+function blockReference(input) {
+  const { activations, mask, weights: w, batch, queryLength, channels, heads } = input;
+  const headDim = channels / heads;
+  const rows = batch * queryLength;
+  const epsilon = input.epsilon ?? 1e-5;
+  const scale = 1 / Math.sqrt(headDim);
+
+  const normalised = new Float64Array(rows * channels);
+  for (let row = 0; row < rows; row += 1) {
+    const at = row * channels;
+    let mean = 0;
+    for (let c = 0; c < channels; c += 1) mean += activations[at + c];
+    mean /= channels;
+    let spread = 0;
+    for (let c = 0; c < channels; c += 1) spread += (activations[at + c] - mean) ** 2;
+    const inverseStd = 1 / Math.sqrt(spread / channels + epsilon);
+    for (let c = 0; c < channels; c += 1) {
+      normalised[at + c] = (activations[at + c] - mean) * inverseStd * w.queryNormScale[c]
+        + w.queryNormOffset[c];
+    }
+  }
+
+  const project = (weight, bias, sigmoid) => {
+    const out = new Float64Array(rows * channels);
+    for (let row = 0; row < rows; row += 1) {
+      for (let o = 0; o < channels; o += 1) {
+        let sum = bias === undefined ? 0 : bias[o];
+        for (let i = 0; i < channels; i += 1) {
+          sum += normalised[row * channels + i] * weight[i * channels + o];
+        }
+        out[row * channels + o] = sigmoid ? 1 / (1 + Math.exp(-sum)) : sum;
+      }
+    }
+    return out;
+  };
+  const query = project(w.queryWeight, undefined, false);
+  const key = project(w.keyWeight, undefined, false);
+  const value = project(w.valueWeight, undefined, false);
+  const gate = project(w.gatingWeight, w.gatingBias, true);
+
+  const attended = new Float64Array(rows * channels);
+  for (let b = 0; b < batch; b += 1) {
+    for (let head = 0; head < heads; head += 1) {
+      for (let q = 0; q < queryLength; q += 1) {
+        const qAt = (b * queryLength + q) * channels + head * headDim;
+        const logits = new Float64Array(queryLength);
+        for (let k = 0; k < queryLength; k += 1) {
+          const kAt = (b * queryLength + k) * channels + head * headDim;
+          let score = 0;
+          for (let d = 0; d < headDim; d += 1) score += query[qAt + d] * key[kAt + d];
+          let logit = score * scale + 1e9 * (mask[b * queryLength + k] - 1);
+          if (input.pairBias !== undefined) {
+            logit += input.pairBias[(head * queryLength + q) * queryLength + k];
+          }
+          logits[k] = Math.min(Math.max(logit, -1e8), 1e8);
+        }
+        let top = -Infinity;
+        for (const logit of logits) top = Math.max(top, logit);
+        let total = 0;
+        const weight = new Float64Array(queryLength);
+        for (let k = 0; k < queryLength; k += 1) {
+          weight[k] = Math.exp(logits[k] - top);
+          total += weight[k];
+        }
+        for (let d = 0; d < headDim; d += 1) {
+          let acc = 0;
+          for (let k = 0; k < queryLength; k += 1) {
+            acc += weight[k] * value[(b * queryLength + k) * channels + head * headDim + d];
+          }
+          attended[qAt + d] = (acc / total) * gate[qAt + d];
+        }
+      }
+    }
+  }
+
+  const out = new Float32Array(rows * channels);
+  for (let row = 0; row < rows; row += 1) {
+    for (let o = 0; o < channels; o += 1) {
+      let sum = w.outputBias[o];
+      for (let i = 0; i < channels; i += 1) {
+        sum += attended[row * channels + i] * w.outputWeight[i * channels + o];
+      }
+      out[row * channels + o] = sum;
+    }
+  }
+  return out;
+}
+
+export async function main(device, args) {
+  const falsify = flag(args, "falsify");
+  const bar = Number(option(args, "bar", "1e-5"));
+  const gl = createWebGL2Context();
+  const execution = new Execution(gl);
+  const rows = [];
+  const failures = [];
+  const arm = (name, got, want) => {
+    const relative = relativeRms(got, want, name);
+    const ok = relative <= bar;
+    rows.push({ arm: name, relativeRms: Number(relative.toPrecision(4)), bar, ok });
+    if (!ok) failures.push(`${name}: relRMS ${relative.toExponential(3)} over ${bar}`);
+  };
+
+  const cases = [
+    { batch: 2, queryLength: 10, channels: 64, heads: 2 },
+    { batch: 3, queryLength: 8, channels: 32, heads: 4 },
+    { batch: 1, queryLength: 12, channels: 128, heads: 4 },
+  ];
+  const built = [];
+
+  for (const shape of cases) {
+    const { batch, queryLength, channels, heads } = shape;
+    const random = generator(batch * 131 + queryLength * 17 + channels + heads);
+    const rowCount = batch * queryLength;
+    const input = {
+      ...shape,
+      activations: noise(rowCount * channels, 1.5, random),
+      mask: new Float32Array(rowCount).fill(1),
+      weights: {
+        queryNormScale: noise(channels, 0.2, random, 1),
+        queryNormOffset: noise(channels, 0.1, random),
+        queryWeight: noise(channels * channels, 1 / Math.sqrt(channels), random),
+        keyWeight: noise(channels * channels, 1 / Math.sqrt(channels), random),
+        valueWeight: noise(channels * channels, 1 / Math.sqrt(channels), random),
+        gatingWeight: noise(channels * channels, 1 / Math.sqrt(channels), random),
+        gatingBias: noise(channels, 0.1, random, 1),
+        outputWeight: noise(channels * channels, 1 / Math.sqrt(channels), random),
+        outputBias: noise(channels, 0.05, random),
+      },
+    };
+    for (let b = 0; b < batch; b += 1) input.mask[b * queryLength + queryLength - 1] = 0;
+
+    const label = `b=${batch} q=${queryLength} c=${channels} h=${heads}`;
+    const weights = uploadAttentionBlockWeights(execution, input.weights);
+    // 🔴 THE PERTURBATION GOES TO THE WEBGL SIDE ONLY, or it moves both
+    // references with the kernel and every difference stays where it was.
+    const activations = execution.upload(falsify
+      ? Float32Array.from(input.activations,
+        (v, i) => (i === (input.activations.length >> 1) ? v * 1.01 + 0.01 : v))
+      : input.activations, "activations");
+    const mask = execution.upload(input.mask, "mask");
+
+    const output = attentionBlock(execution, { ...shape, activations, mask, weights });
+    const ours = execution.read(output).slice();
+    execution.release(output);
+
+    arm(`vs CPU reference ${label}`, ours, blockReference(input));
+
+    const wgsl = await new AttentionGpu(device, {
+      flashPrecision: "f32",
+      projectPrecision: "f32",
+      outputPrecision: "f32",
+      // ...the keys this option is READ with; it reports them back under three
+      // different names, and the reported spelling sets nothing.
+      storage: { input: "f32", value: "f32", output: "f32" },
+    }).run({
+      batch, queryLength, channels, heads,
+      activations: input.activations, mask: input.mask, weights: input.weights,
+    });
+    arm(`vs WGSL block ${label}`, ours, wgsl);
+    built.push({ shape: label, storage: wgsl.storage, shaders: wgsl.shaders });
+
+    releaseAttentionBlockWeights(execution, weights);
+    execution.release(activations);
+    execution.release(mask);
+  }
+
+  const stats = execution.stats();
+  const red = rows.filter((row) => !row.ok).length;
+  return {
+    bar,
+    falsify,
+    arms: rows,
+    wgslPaths: built,
+    liveTensorsAfter: stats.live,
+    drawsPerBlock: Math.round(stats.draws / cases.length),
+    verdict: falsify
+      ? (red === rows.length
+        ? `ok: all ${rows.length} arms go red on a 1% perturbation`
+        : `VACUOUS: only ${red} of ${rows.length} arms noticed a 1% perturbation`)
+      : (failures.length === 0 && stats.live === 0
+        ? `ok: ${rows.length} arms, no tensor left live`
+        : `FAILED: ${[...failures, ...(stats.live ? [`${stats.live} tensors leaked`] : [])].join("; ")}`),
+  };
+}
