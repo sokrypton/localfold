@@ -1392,14 +1392,40 @@ floats**. Produce those 32 from a k loop as a register tile of R by C, and a k s
 the smallest `R + C` is **12** at 4 by 8 or 8 by 4. **21.33 flops a fetch is therefore the ceiling
 for ANY kernel in this backend**, not a property of these kernels.
 
-The two dense projections reach exactly it, and they run at **145 and 189 GFLOP/s** - and they are
-**57% of the fold** (30.4% and 26.8% of its corrected profile). So if every other kernel in the fold
-became free, the fold would still be about **24 s against the WGSL fold's 3.9** - a **6x floor**
-that no further kernel work removes, because it is the output budget and not the arithmetic. A
-compute shader is past it by staging a tile in workgroup memory, where a whole workgroup reuses one
-load and no invocation's output count constrains anything; and it has f16 ARITHMETIC, where WebGL2's
-RGBA16F is storage only. Neither has a WebGL2 equivalent, which is why the remaining distance is a
-property of the API rather than of this port.
+The two dense projections reach exactly that intensity, and they run at **137 to 198 GFLOP/s** -
+and they are **70% of a bioemu2 fold** now that the contraction has been fixed twice.
+
+🔴 **AND THE "6x FLOOR" THIS SECTION USED TO DERIVE FROM THAT IS RETRACTED, BECAUSE THE OTHER HALF
+OF THE PRODUCT WAS NEVER MEASURED.** The old text multiplied 21.33 flops a fetch by a fetch rate of
+about nine billion a second - inferred from the kernels themselves - and concluded that the
+projections were AT the hardware's limit and the fold could not go below about 24 s. The intensity
+cap is real. The rate was wrong by a factor of six.
+
+`tools/gpu/probe-webgl-fetch-rate.js --ceiling-window=<texels>` measures the issue rate directly,
+with a non-hoistable stride through a window of a chosen size and nothing else in the loop:
+
+| window | | issue rate | `x 21.33` |
+|---|---|---:|---:|
+| 64 texels, 1 KiB | registers and L1 | **52.1 G fetch4/s** | 1112 GFLOP/s |
+| 1024, 16 KiB | | 19.4 | 413 |
+| 4096, 64 KiB | a realistic tile | **23.1** | **494** |
+| 65536, 1 MiB | a streamed weight | 14.3 | 305 |
+
+**So the backend's ceiling is 305 to 1112 GFLOP/s depending on the WORKING SET, and the projections
+at 137 to 198 are at 28 to 40% of the realistic one.** They are not at the hardware's limit; they
+are missing. What caps this backend is the output budget TIMES the miss rate, and only the first
+factor is fixed - which is why the two wins that moved these kernels most were both LOCALITY
+(the fragment order, 1.49x, and the tile-aware mapping, 3.29x) and not arithmetic.
+
+The first version of this paragraph is the mistake this file warns about everywhere else, made in
+the place where it does the most damage: **an estimate presented as a bound, used to argue that
+further work was pointless.** It was also the reason the ESMFold2 contraction sat at 0.4 GFLOP/s
+unexamined for a whole campaign. A floor is a measurement or it is nothing.
+
+A compute shader is still past this backend by staging a tile in workgroup memory, where a whole
+workgroup reuses one load and no invocation's output count constrains anything; and it has f16
+ARITHMETIC, where WebGL2's RGBA16F is storage only. Those remain real advantages - but they are
+worth the distance between 198 GFLOP/s and about 2.4 TFLOP/s, not the distance this file claimed.
 
 🔴 **AND THE f16 HALF OF THAT IS MEASURED NOW RATHER THAN ASSERTED.** GLSL ES 300 has no f16 type
 but it has PRECISION QUALIFIERS, and a translator over Metal could map `mediump float` to `half` -
@@ -1410,8 +1436,8 @@ shipped eight-row projection geometry both ways and the answer is **the qualifie
 `relRms` is **exactly 0** over 4624x256->512, so the two arms are one kernel. **Read the relRms and
 not the time** - the ratio came out 1.072, 1.068 and 0.992 over three runs, which is ordering noise
 on two identical kernels, and reading that 1.07 as a win is the trap the probe's own header warns
-about. So half arithmetic is not reachable from GLSL ES here, and the floor's first leg is a
-measurement.
+about. So half arithmetic is not reachable from GLSL ES here - which is a real difference from the
+WGSL side, and the one leg of the old floor argument that survives measurement.
 
 🔴 **AND THE FIRST EXPLANATION WRITTEN HERE WAS WRONG, FROM EXACTLY THE MISTAKE THIS FILE WARNS
 ABOUT EVERYWHERE ELSE.** It said the gap was the subgroup MATRIX units, on the evidence that

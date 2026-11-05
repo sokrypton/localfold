@@ -101,6 +101,53 @@ ${Array.from({ length: blocks }, (_, b) => block(b)).join("\n")}
 }`;
 };
 
+/**
+ * The ISSUE CEILING: `count` fetches a fragment from one small texture, so every
+ * one after the first is an L1 hit, and nothing else is in the loop.
+ *
+ * 🔴 THIS IS WHAT webgl/README.md's FLOOR ARGUMENT RESTS ON AND IT WAS NEVER
+ * MEASURED. The floor says a fragment kernel caps at 21.33 flops a `fetch4`
+ * because 32 output floats is `MAX_DRAW_BUFFERS * 4`; multiply that by the
+ * fetch RATE and you have the backend's ceiling in GFLOP/s. The rate had only
+ * ever been inferred from kernels that also miss, stream and compute.
+ *
+ * The four reads are independent and their results are combined so nothing is
+ * dead, and the texel index varies with the fragment so the compiler cannot
+ * hoist the whole loop.
+ */
+const ceilingSource = (count, window) => `#version 300 es
+precision highp float;
+precision highp int;
+precision highp sampler2D;
+const int W = 2048;
+const int COUNT = ${count};
+const int WINDOW = ${window};
+layout(location = 0) out vec4 result;
+uniform sampler2D aTex;
+
+vec4 fetch4(sampler2D tex, int texel) {
+  return texelFetch(tex, ivec2(texel % W, texel / W), 0);
+}
+
+void main() {
+  int texel = int(gl_FragCoord.y) * W + int(gl_FragCoord.x);
+  // 🔴 THE INDEX MUST NOT BE HOISTABLE. A first version walked i modulo 16 inside
+  // a window of 64 texels, and a compiler that unrolls sixteen iterations can
+  // hoist every one of those fetches out of the loop - which would report an
+  // issue rate that is really a register read. The stride below has period
+  // WINDOW, so hoisting it would mean unrolling the whole loop. (No backticks in
+  // here: it is inside a JS template literal and one would end it.)
+  int base = texel % 1024;
+  vec4 total = vec4(0.0);
+  for (int i = 0; i < COUNT / 4; ++i) {
+    total += fetch4(aTex, base + (i * 53) % WINDOW);
+    total += fetch4(aTex, base + (i * 53 + 1013) % WINDOW);
+    total += fetch4(aTex, base + (i * 53 + 2027) % WINDOW);
+    total += fetch4(aTex, base + (i * 53 + 3041) % WINDOW);
+  }
+  result = total;
+}`;
+
 export async function main(device, args) {
   const iterations = Number(option(args, "iterations", "8"));
   const k = Number(option(args, "k", "68"));
@@ -119,6 +166,41 @@ export async function main(device, args) {
   const b = execution.upload(fill(operand, 11), "probe.b");
 
   const rows = [];
+
+  // The issue ceiling first, so every shaped arm below can be read against it.
+  const ceilingCount = Number(option(args, "ceiling-fetches", "1024"));
+  // The texel window the ceiling arm walks, in TEXELS: 4096 is 64 KiB, which is
+  // resident but far too big to hoist or to hold in registers.
+  const ceilingWindow = Number(option(args, "ceiling-window", "4096"));
+  const ceilingFragments = 65536;
+  {
+    const ring = Array.from({ length: iterations },
+      () => execution.allocate(ceilingFragments * 4, "probe.ceiling"));
+    const text = ceilingSource(ceilingCount, ceilingWindow);
+    const run = (out) => execution.dispatch({
+      source: text, output: out, inputs: { aTex: a }, label: "probe.ceiling",
+    });
+    for (let i = 0; i < 2; i += 1) {
+      run(ring[i % ring.length]);
+      execution.read(ring[i % ring.length]);
+    }
+    const start = performance.now();
+    for (let i = 0; i < iterations; i += 1) run(ring[i]);
+    execution.read(ring[iterations - 1]);
+    const ms = (performance.now() - start) / iterations;
+    for (const out of ring) execution.release(out);
+    rows.push({
+      arm: "ceiling",
+      outputs: 4,
+      fetchesPerStep: 4,
+      milliseconds: Number(ms.toFixed(2)),
+      gigaFetchesPerSecond:
+        Number((ceilingFragments * ceilingCount / ms / 1e6).toFixed(2)),
+      gigaflops: 0,
+      flopsPerFetch: 0,
+    });
+  }
+
   for (const [r, c, blocks] of arms) {
     const outputs = r * c * blocks;
     const ring = Array.from({ length: iterations }, () =>
@@ -153,9 +235,11 @@ export async function main(device, args) {
   }
   execution.release(a);
   execution.release(b);
-  const best = rows.reduce((x, y) =>
+  const shaped = rows.filter((row) => row.arm !== "ceiling");
+  const ceiling = rows.find((row) => row.arm === "ceiling");
+  const best = shaped.reduce((x, y) =>
     (y.gigaFetchesPerSecond > x.gigaFetchesPerSecond ? y : x));
-  const worst = rows.reduce((x, y) =>
+  const worst = shaped.reduce((x, y) =>
     (y.gigaFetchesPerSecond < x.gigaFetchesPerSecond ? y : x));
   const renderer = gl.getParameter(gl.RENDERER);
   execution.destroy();
@@ -166,7 +250,15 @@ export async function main(device, args) {
     iterations,
     rows,
     spread: Number((best.gigaFetchesPerSecond / worst.gigaFetchesPerSecond).toFixed(2)),
-    verdict: `${best.arm} reaches ${best.gigaFetchesPerSecond} G fetch4/s and ${worst.arm} `
+    // 🔴 THE BACKEND'S CEILING IN GFLOP/s, measured rather than inferred: the
+    // issue rate times the 21.33 flops a `fetch4` that 32 output floats allow.
+    issueCeilingGigaFetches: ceiling?.gigaFetchesPerSecond ?? null,
+    backendCeilingGflops: ceiling
+      ? Number((ceiling.gigaFetchesPerSecond * 21.333).toFixed(0)) : null,
+    verdict: `the issue ceiling is ${ceiling?.gigaFetchesPerSecond} G fetch4/s, so a fragment `
+      + `kernel at the 21.33 flops a fetch that 32 output floats allow caps at about `
+      + `${ceiling ? Math.round(ceiling.gigaFetchesPerSecond * 21.333) : "?"} GFLOP/s; `
+      + `${best.arm} reaches ${best.gigaFetchesPerSecond} G fetch4/s and ${worst.arm} `
       + `${worst.gigaFetchesPerSecond} - a ${(best.gigaFetchesPerSecond / worst.gigaFetchesPerSecond).toFixed(2)}x `
       + `spread at one fragment count on one pair of textures, so the rate is a property of the `
       + `fragment's SHAPE`,
