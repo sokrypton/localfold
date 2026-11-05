@@ -109,8 +109,22 @@ void main() {
   result = vec4(vector, 0.0);
 }`;
 
-export const atom14Source = (length) => `${PRELUDE}${ONE_TARGET}
+/**
+ * 🔴 `position_scale` IS A PER-MODEL FACT, NOT A CONSTANT. The structure module
+ * works in units the frames are scaled by on the way out - **10 angstroms for
+ * the monomer models and 20 for multimer** - and the weights were trained
+ * against their own value. `webgpu/af2/multimer/geometry.js` exists for exactly
+ * this: it generates the shader per scale rather than carrying the 10.0 the
+ * monomer shader had written into it, "which keeps the binding list alone". A
+ * monomer scale on multimer weights halves every coordinate from the origin,
+ * which is a structure, just not the model's.
+ */
+export const MONOMER_POSITION_SCALE = 10;
+export const MULTIMER_POSITION_SCALE = 20;
+
+export const atom14Source = (length, positionScale = MONOMER_POSITION_SCALE) => `${PRELUDE}${ONE_TARGET}
 const int L = ${length};
+const float POSITION_SCALE = ${positionScale.toFixed(1)};
 const int ELEMENTS = ${length * 14 * 3};
 uniform sampler2D affineTex;
 uniform sampler2D aatypeTex;
@@ -155,8 +169,9 @@ float coordinateOf(int element) {
     fetch1(affineTex, affineBase + 2), fetch1(affineTex, affineBase + 3));
   vec3 b0; vec3 b1; vec3 b2;
   quaternionRows(q, b0, b1, b2);
-  // The backbone translation carries AF2's factor of ten.
-  vec3 backboneT = 10.0 * vec3(
+  // The backbone translation carries AF2's position_scale - ten for the monomer
+  // models, twenty for multimer.
+  vec3 backboneT = POSITION_SCALE * vec3(
     fetch1(affineTex, affineBase + 4), fetch1(affineTex, affineBase + 5),
     fetch1(affineTex, affineBase + 6));
   vec3 global = vec3(dot(b0, inGroup), dot(b1, inGroup), dot(b2, inGroup)) + backboneT;
@@ -203,11 +218,14 @@ void main() {
  * @param {{affine: Tensor, angles: Tensor, aatype: Tensor, atom37ToAtom14: Tensor,
  *   atom37Mask: Tensor, length: number,
  *   tables: {defaultFrames: Tensor, atom14ToGroup: Tensor, atom14Positions: Tensor,
- *     atom14Mask: Tensor}}} call
+ *     atom14Mask: Tensor}, positionScale?: number}} call
  * @returns {{atom14: Tensor, atom37: Tensor, frames: Tensor}} the caller owns all three
  */
 export function atomGeometry(execution, call) {
-  const { affine, angles, aatype, atom37ToAtom14, atom37Mask, length, tables } = call;
+  const {
+    affine, angles, aatype, atom37ToAtom14, atom37Mask, length, tables,
+    positionScale = MONOMER_POSITION_SCALE,
+  } = call;
   if (affine.elements !== length * 7) {
     throw new RangeError(`atomGeometry: affine holds ${affine.elements} floats, not ${length} x 7`);
   }
@@ -227,14 +245,14 @@ export function atomGeometry(execution, call) {
 
   const atom14 = execution.allocate(length * 14 * 3, "geometry.atom14");
   execution.dispatch({
-    source: atom14Source(length),
+    source: atom14Source(length, positionScale),
     output: atom14,
     inputs: {
       affineTex: affine, aatypeTex: aatype, framesTex: frames,
       atomGroupsTex: tables.atom14ToGroup, literatureTex: tables.atom14Positions,
       atomMaskTex: tables.atom14Mask,
     },
-    label: `geometry.atom14:${length}`,
+    label: `geometry.atom14:${length}:${positionScale}`,
   });
 
   const atom37 = execution.allocate(length * 37 * 3, "geometry.atom37");

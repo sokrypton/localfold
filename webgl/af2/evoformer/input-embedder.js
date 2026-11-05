@@ -58,8 +58,60 @@ export const INPUT_EMBEDDER_WEIGHTS = [
   "extraMsaWeight", "extraMsaBias",
 ];
 
+/**
+ * The per-residue identity the multimer relative encoding reads: `[4, length]`
+ * holding the residue index, then the asymmetric-unit, entity and symmetry ids.
+ *
+ * All three default to zero, which is what a monomer IS: one chain, one entity,
+ * one symmetry copy - so a monomer's identity lights none of the eight trailing
+ * features and the chains kernel reproduces the monomer one exactly.
+ */
+export function residueIdentity(input) {
+  const { length } = input;
+  const identity = new Float32Array(length * 4);
+  identity.set(Float32Array.from(input.residueIndex).subarray(0, length), 0);
+  const lanes = [input.asymId, input.entityId, input.symId];
+  for (const [index, lane] of lanes.entries()) {
+    if (lane === undefined) continue;
+    if (lane.length !== length) {
+      throw new RangeError(`residueIdentity: chain identity must have one value per residue`);
+    }
+    identity.set(Float32Array.from(lane), length * (index + 1));
+  }
+  return identity;
+}
+
+/**
+ * The relative-position table, widened from the monomer's 65 rows to the
+ * multimer graph's 73.
+ *
+ * Widening here rather than at export means the shipped monomer weights stay
+ * the bytes on disk: no re-quantisation, no new manifest, no re-download. The
+ * reference does exactly this and says so.
+ */
+export function widenRelativePositionWeight(weight, pairChannels) {
+  const rows = weight.length / pairChannels;
+  if (rows === MULTIMER_RELATIVE_ROWS) return weight;
+  if (rows !== MONOMER_RELATIVE_ROWS) {
+    throw new RangeError(
+      `relative position table has ${rows} rows; expected `
+      + `${MONOMER_RELATIVE_ROWS} or ${MULTIMER_RELATIVE_ROWS}`);
+  }
+  const widened = new Float32Array(MULTIMER_RELATIVE_ROWS * pairChannels);
+  widened.set(weight);
+  return widened;
+}
+
 export const DGRAM_BINS = 15;
 export const MAX_RELATIVE = 32;
+/** AF2-multimer's relative-CHAIN clamp, which the monomer graph has no use for. */
+export const MAX_RELATIVE_CHAIN = 2;
+/** 65 rows for the monomer lookup, 73 for the multimer one. */
+export const MONOMER_RELATIVE_ROWS = 2 * MAX_RELATIVE + 1;
+// 66 offset bins (the last meaning "a different chain") + 1 entity-same + 6
+// relative-chain bins (the last meaning "a different entity") = 73.
+export const MULTIMER_RELATIVE_ROWS =
+  (2 * MAX_RELATIVE + 2) + 1 + (2 * MAX_RELATIVE_CHAIN + 2);
 export const MIN_BIN = 3.25;
 export const MAX_BIN = 20.75;
 
@@ -130,8 +182,52 @@ void main() {
 }`;
 };
 
+/**
+ * 🔴 TWO RELATIVE ENCODINGS, AND THE MULTIMER ONE IS A SUPERSET - WHICH THE
+ * REFERENCE SAYS IS THE END STATE. `webgpu/af2/multimer/input-embedder.js`: "THE
+ * MULTIMER GRAPH IS THE ONE GRAPH, and monomer is its single-chain case. 73 = 66
+ * offset bins (the last meaning 'different chain') + 1 entity-same + 6
+ * relative-chain bins. A monomer never lights any of the 8 trailing features:
+ * one chain makes asym_same and entity_same true everywhere and the symmetry
+ * delta zero. So zero rows there reproduce the 65-row result EXACTLY, and the
+ * shader needs no monomer branch."
+ *
+ * Both are kept here for now, as the reference keeps them, and
+ * `check-webgl-multimer-embedder.js` asserts the claim rather than quoting it:
+ * one arm runs a monomer's features through the CHAINS kernel with widened
+ * weights and holds it BIT-IDENTICAL to the monomer kernel. Unifying without
+ * that measurement would change a path that folds today.
+ *
+ * The chains form reads a `[4][length]` identity - the residue index, then the
+ * asymmetric-unit, entity and symmetry ids - where the monomer form reads the
+ * residue index alone.
+ */
+const relativeBlockFor = (chains) => (chains
+  ? `  // The multimer relative encoding: the offset, whether the two residues are
+  // the same ENTITY, and how far apart their symmetry copies are.
+  bool asymSame = fetch1(identityTex, L + i) == fetch1(identityTex, L + j);
+  bool entitySame = fetch1(identityTex, 2 * L + i) == fetch1(identityTex, 2 * L + j);
+  int rawOffset = int(fetch1(identityTex, i)) - int(fetch1(identityTex, j)) + MAX_RELATIVE;
+  // Clamped, not wrapped: every separation past MAX_RELATIVE shares one bin.
+  int clipped = clamp(rawOffset, 0, 2 * MAX_RELATIVE);
+  // ...and the bin past the last offset means "a different chain entirely".
+  int offsetRow = asymSame ? clipped : 2 * MAX_RELATIVE + 1;
+  int entityRow = 2 * MAX_RELATIVE + 2;
+  int symmetryDelta = int(fetch1(identityTex, 3 * L + i)) - int(fetch1(identityTex, 3 * L + j));
+  int clippedChain = clamp(symmetryDelta + MAX_RELATIVE_CHAIN, 0, 2 * MAX_RELATIVE_CHAIN);
+  int chainRow = entitySame ? clippedChain : 2 * MAX_RELATIVE_CHAIN + 1;
+  total += fetch4(relativeBiasTex, group)
+    + fetch4(relativeWeightTex, offsetRow * PAIR_C4 + group)
+    + (entitySame ? fetch4(relativeWeightTex, entityRow * PAIR_C4 + group) : vec4(0.0))
+    + fetch4(relativeWeightTex, (entityRow + 1 + chainRow) * PAIR_C4 + group);`
+  : `  int rawOffset = int(fetch1(residueIndexTex, i)) - int(fetch1(residueIndexTex, j)) + MAX_RELATIVE;
+  // Clamped, not wrapped: every separation past MAX_RELATIVE shares one bin.
+  int relative = clamp(rawOffset, 0, 2 * MAX_RELATIVE);
+  total += fetch4(relativeBiasTex, group) + fetch4(relativeWeightTex, relative * PAIR_C4 + group);`);
+
 export const pairEmbedSource = (shape) => {
-  const { length, targetChannels, pairChannels } = shape;
+  const { length, targetChannels, pairChannels, chains = false } = shape;
+  const relativeBlock = relativeBlockFor(chains);
   return `${PRELUDE}${ONE_TARGET}
 const int L = ${length};
 const int TARGET_C = ${targetChannels};
@@ -139,13 +235,14 @@ const int PAIR_C4 = ${pairChannels / 4};
 const int ELEMENTS = ${length * length * pairChannels};
 const int DGRAM_BINS = ${DGRAM_BINS};
 const int MAX_RELATIVE = ${MAX_RELATIVE};
+const int MAX_RELATIVE_CHAIN = ${MAX_RELATIVE_CHAIN};
 const float MIN_BIN = ${MIN_BIN};
 const float MAX_BIN = ${MAX_BIN};
 uniform sampler2D targetTex;
 uniform sampler2D previousPairTex;
 uniform sampler2D previousPositionsTex;
 uniform sampler2D aatypeTex;
-uniform sampler2D residueIndexTex;
+uniform sampler2D ${chains ? "identityTex" : "residueIndexTex"};
 uniform sampler2D leftWeightTex;
 uniform sampler2D leftBiasTex;
 uniform sampler2D rightWeightTex;
@@ -194,10 +291,7 @@ void main() {
 
   total += fetch4(previousPairTex, texel);
 
-  int rawOffset = int(fetch1(residueIndexTex, i)) - int(fetch1(residueIndexTex, j)) + MAX_RELATIVE;
-  // Clamped, not wrapped: every separation past MAX_RELATIVE shares one bin.
-  int relative = clamp(rawOffset, 0, 2 * MAX_RELATIVE);
-  total += fetch4(relativeBiasTex, group) + fetch4(relativeWeightTex, relative * PAIR_C4 + group);
+${relativeBlock}
   result = total;
 }`;
 };
@@ -225,7 +319,7 @@ export function releaseInputEmbedderWeights(execution, weights) {
  * @param {{targetFeatures: Tensor, msaFeatures: Tensor, extraMsa: Tensor,
  *   extraHasDeletion: Tensor, extraDeletionValue: Tensor, previousMsaFirstRow: Tensor,
  *   previousPair: Tensor, previousPositions: Tensor, aatype: Tensor,
- *   residueIndex: Tensor, weights: Record<string, Tensor>,
+ *   residueIndex: Tensor, residueIdentity?: Tensor, weights: Record<string, Tensor>,
  *   length: number, msaSequences: number, extraSequences: number,
  *   targetChannels: number, msaFeatureChannels: number, msaChannels: number,
  *   pairChannels: number, extraMsaChannels: number}} call
@@ -288,14 +382,21 @@ export function inputEmbedder(execution, call) {
     label: `embed.extra:${extraSequences}x${length}x${extraMsaChannels}`,
   });
 
+  const chains = call.residueIdentity !== undefined;
   const pair = execution.allocate(length * length * pairChannels, "embed.pair");
   execution.dispatch({
-    source: pairEmbedSource({ length, targetChannels, pairChannels }),
+    source: pairEmbedSource({ length, targetChannels, pairChannels, chains }),
     output: pair,
     inputs: {
       targetTex: targetFeatures, previousPairTex: normalisedPair,
       previousPositionsTex: previousPositions, aatypeTex: aatype,
-      residueIndexTex: residueIndex,
+      // 🔴 THE PRESENCE OF THE IDENTITY IS THE SWITCH, and `dispatch` refuses a
+      // binding the compiled source does not declare by name - so passing the
+      // identity to the monomer kernel, or the residue index alone to the chains
+      // kernel, raises rather than silently reading the wrong lane.
+      ...(chains
+        ? { identityTex: call.residueIdentity }
+        : { residueIndexTex: residueIndex }),
       leftWeightTex: w.leftSingleWeight, leftBiasTex: w.leftSingleBias,
       rightWeightTex: w.rightSingleWeight, rightBiasTex: w.rightSingleBias,
       positionWeightTex: w.previousPositionWeight, positionBiasTex: w.previousPositionBias,

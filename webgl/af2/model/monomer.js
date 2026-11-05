@@ -92,6 +92,8 @@ export const MONOMER_SHAPE = {
   templateChannels: 64,
   structureChannels: 384,
   distogramBins: 64,
+  // Ten for every monomer checkpoint; the multimer graph trains against twenty.
+  positionScale: 10,
 };
 
 /**
@@ -202,7 +204,7 @@ export async function foldMonomer(execution, call) {
   }
   const {
     msaChannels, extraMsaChannels, pairChannels, templateChannels,
-    structureChannels, distogramBins,
+    structureChannels, distogramBins, positionScale,
   } = { ...MONOMER_SHAPE, ...(call.shape ?? {}) };
   const length = featuresByRecycle[0].aatype.length;
   const tolerance = validatedRecycleTolerance(call.tolerance);
@@ -340,7 +342,7 @@ export async function foldMonomer(execution, call) {
       msaFirstRow: msaFirstRowTensor, pair: trunk.pair, mask: maskTensor,
       aatype, atom37ToAtom14, atom37Mask, length,
       weights: w.structure, tables: w.tables,
-      shape: { msaChannels, pairChannels, structureChannels },
+      shape: { msaChannels, pairChannels, structureChannels, positionScale },
     });
     execution.release(maskTensor);
     await yieldTo?.();

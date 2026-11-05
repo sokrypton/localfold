@@ -70,6 +70,8 @@ webgl/
     evoformer/input-embedder.js the MSA, extra-MSA and pair embeddings, and the recycle
     evoformer/template.js       the template stack: one Linear over 88 geometry columns, the pair
                                 blocks, and a pointwise attention that is two projections
+    evoformer/input-embedder.js ...and the multimer's 73-row relative encoding, which is a superset
+                                of the monomer's 65 and is held bit-identical to it on one chain
     structure/initialize.js     the single representation and the identity frame
     structure/sidechain.js      seven torsions a residue, as normalised (x, y) pairs
     structure/geometry.js       atom coordinates from frames and torsions - atom14 and atom37
@@ -413,8 +415,31 @@ are the controls. Each one was found by the residual refusing to move, and each 
 the graph rather than of the device: `transitionPrecision`, `msaAttentionPrecision` and
 `triangleAttentionPrecision` are how this port states them.
 
-Still to come in AF2-multimer: the 73-row relative encoding, the nine-projection template embedder,
-and `position_scale` 20. After that: AF3's pairformer and diffusion, ESMFold2, bioemu2.
+**The 73-row relative encoding runs** - 6.8e-8 on the pair against the WGSL multimer embedder with
+a real three-chain complex, two chains being copies of one entity at different symmetry ids, so
+every branch is reached: same chain, same entity across chains, different entity, and symmetry
+deltas of 0, +1 and -1. The monomer looks up ONE row; the multimer sums three - the clamped offset
+(or row 65, "a different chain entirely"), row 66 when the two share an ENTITY, and one of six
+relative-chain rows.
+
+🔴 **AND THE REFERENCE'S CLAIM THAT THE MULTIMER FORM IS A SUPERSET IS NOW MEASURED RATHER THAN
+QUOTED.** It says "THE MULTIMER GRAPH IS THE ONE GRAPH, and monomer is its single-chain case...
+zero rows there reproduce the 65-row result EXACTLY, and the shader needs no monomer branch." One
+arm runs a monomer's features through the CHAINS kernel with a widened weight table and holds it to
+**relRMS exactly 0** against the monomer kernel, and to 6.9e-8 against the WGSL monomer embedder.
+That is the claim that would justify deleting the monomer form, so it is measured before anyone
+acts on it - and it is declared `falsifiable: false`, because it compares two of this port's own
+kernels on one input and no perturbation of that input can move one side without the other.
+
+**`position_scale` is a parameter now**, not the 10.0 that was written into the atom14 shader: ten
+for the monomer checkpoints and twenty for multimer, because the weights were trained against their
+own value. Both are **bit-exact** (relRMS 0) against `webgpu/af2/multimer/geometry.js`, which
+generates its shader per scale for the same reason, and a `scaleMoves` arm asserts the two differ
+(0.491) so that neither side can be ignoring it. A monomer scale on multimer weights halves every
+coordinate from the origin: a structure, just not the model's, and nothing downstream would raise.
+
+Still to come in AF2-multimer: the nine-projection template embedder, and the driver. After that:
+AF3's pairformer and diffusion, ESMFold2, bioemu2.
 
 Every operation so far is checked against TWO references - an f64 CPU one written from the
 operation, and the WGSL kernel run in the same page - because a single reference cannot say which

@@ -15,12 +15,20 @@
  * The arms compare atom14 AND atom37, because the second is a gather through two
  * index tables and an error there is invisible in the first.
  *
+ * 🔴 AND `position_scale` IS SWEPT, BECAUSE IT IS A PER-MODEL FACT AND NOT A
+ * CONSTANT. Ten for the monomer checkpoints and twenty for multimer - the
+ * weights were trained against their own value - so both are compared, against
+ * `webgpu/af2/multimer/geometry.js`, which generates its shader per scale for
+ * the same reason. A monomer scale on multimer weights halves every coordinate
+ * from the origin: a structure, just not the model's, and nothing downstream
+ * would raise. `--position-scale=` runs one value alone.
+ *
  * 🔴 AND THE AFFINE IS DELIBERATELY NOT A UNIT QUATERNION. The reference does
  * not normalise it, so a port that does would agree on normalised input and
  * differ on anything else - and the iteration core upstream does not guarantee
  * one either. A random quaternion is the arm that can see that.
  */
-import { AtomGeometryGpu } from "../../webgpu/af2/structure/geometry.js";
+import { AtomGeometryGpu } from "../../webgpu/af2/multimer/geometry.js";
 import { atomGeometry } from "../../webgl/af2/structure/geometry.js";
 import { Execution } from "../../webgl/runtime/execution.js";
 import { createWebGL2Context } from "../../webgl/index.js";
@@ -68,10 +76,16 @@ export async function main(device, args) {
   const atom37ToAtom14 = integers(length * 37, 14);
   const atom37Mask = integers(length * 37, 2);
 
+  // Both of AF2's scales unless one is named. The multimer class is the
+  // reference for both: it takes `positionScale` where the monomer's has 10.0
+  // written into its shader, and at 10 the two generate the same kernel.
+  const scaleArg = option(args, "position-scale", null);
+  const scales = scaleArg === null ? [10, 20] : [Number(scaleArg)];
+
   const gl = createWebGL2Context();
   const execution = new Execution(gl);
   const upload = (values, label) => execution.upload(values, label);
-  const ours = atomGeometry(execution, {
+  const inputs = {
     affine: upload(falsify
       ? Float32Array.from(affine, (v, i) => (i % 7 < 3 ? v * 1.01 + 0.01 : v))
       : affine, "affine"),
@@ -79,18 +93,13 @@ export async function main(device, args) {
     aatype: upload(aatype, "aatype"),
     atom37ToAtom14: upload(atom37ToAtom14, "map"),
     atom37Mask: upload(atom37Mask, "mask37"),
-    length,
     tables: {
       defaultFrames: upload(tables.defaultFrames, "default-frames"),
       atom14ToGroup: upload(tables.atom14ToGroup, "atom-groups"),
       atom14Positions: upload(tables.atom14Positions, "literature"),
       atom14Mask: upload(tables.atom14Mask, "atom-mask"),
     },
-  });
-
-  const theirs = await new AtomGeometryGpu(device).run({
-    affine, angles, aatype, atom37ToAtom14, atom37Mask, length, tables,
-  });
+  };
 
   const rows = [];
   const failures = [];
@@ -100,8 +109,32 @@ export async function main(device, args) {
     rows.push({ arm: name, relativeRms: Number(relative.toPrecision(4)), bar, ok });
     if (!ok) failures.push(`${name}: relRMS ${relative.toExponential(3)} over ${bar}`);
   };
-  arm("atom14", execution.read(ours.atom14), theirs.atom14);
-  arm("atom37", execution.read(ours.atom37), theirs.atom37);
+  /** @type {Record<string, Float32Array>} */
+  const byScale = {};
+  let ours;
+  for (const positionScale of scales) {
+    if (ours !== undefined) {
+      execution.release(ours.atom14);
+      execution.release(ours.atom37);
+      execution.release(ours.frames);
+    }
+    ours = atomGeometry(execution, { ...inputs, length, positionScale });
+    const theirs = await new AtomGeometryGpu(device).run({
+      affine, angles, aatype, atom37ToAtom14, atom37Mask, length, tables, positionScale,
+    });
+    arm(`atom14 at scale ${positionScale}`, execution.read(ours.atom14), theirs.atom14);
+    arm(`atom37 at scale ${positionScale}`, execution.read(ours.atom37), theirs.atom37);
+    byScale[positionScale] = Float32Array.from(execution.read(ours.atom37));
+  }
+
+  // 🔴 AND THE SCALE MUST MOVE THE ANSWER, or both sides could be ignoring it.
+  // The two differ only in the backbone translation, so the coordinates shift
+  // and the relRMS between them is large - measured, it is of order one.
+  const scaleMoves = scales.length < 2 ? undefined : Number(
+    relativeRms(byScale[scales[0]], byScale[scales[1]], "scale.moves").toPrecision(3));
+  if (scaleMoves !== undefined && scaleMoves < 1e-3) {
+    failures.push(`position_scale is INERT: 10 and 20 agree to ${scaleMoves}`);
+  }
 
   // Every coordinate finite, and every masked-out slot exactly zero - two
   // readings a structure has to satisfy whatever the tables say.
@@ -124,6 +157,8 @@ export async function main(device, args) {
     bar,
     falsify,
     arms: rows,
+    positionScales: scales,
+    scaleMoves,
     draws: execution.stats().draws,
     verdict: falsify
       ? (red === rows.length

@@ -65,6 +65,12 @@ export const STRUCTURE_SHAPE = {
   pairChannels: 128,
   sidechainHidden: 128,
   iterations: 8,
+  // 🔴 TEN FOR THE MONOMER MODELS, TWENTY FOR MULTIMER - see geometry.js. It
+  // belongs in this table because the structure module is where it is read and
+  // because it is the one shape in it that is NOT a channel count: a wrong
+  // value halves or doubles every coordinate from the origin, which is a
+  // structure and not the model's.
+  positionScale: 10,
   heads: 12,
   scalarQk: 16,
   scalarV: 16,
@@ -132,7 +138,7 @@ export function structureModule(execution, call) {
   } = call;
   const {
     msaChannels, structureChannels, pairChannels, sidechainHidden, iterations,
-    heads, scalarQk, scalarV, pointQk, pointV,
+    heads, scalarQk, scalarV, pointQk, pointV, positionScale,
   } = { ...STRUCTURE_SHAPE, ...(call.shape ?? {}) };
 
   const initialized = structureInitialize(execution, {
@@ -174,6 +180,7 @@ export function structureModule(execution, call) {
 
   const geometry = atomGeometry(execution, {
     affine, angles: sidechain.angles, aatype, atom37ToAtom14, atom37Mask, length, tables,
+    positionScale,
   });
   // The composed frames are an intermediate of the geometry stage; the
   // reference's module returns the coordinates and not the frames.
