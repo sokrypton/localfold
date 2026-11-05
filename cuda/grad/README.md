@@ -161,6 +161,12 @@ from there 6MRR's mse goes 33.3 -> 12.8 in 40 steps. The Fourier noise embedding
   process's step - the backward's atomics. Rank 0 writes the log, the checkpoint and the validation. 🔴 The NCCL
   transport has run only at one rank here (its id exchange, init and both all-reduces): this box has one GPU, and NCCL
   refuses two ranks on one device.
+- **end to end** - the whole recipe at OpenFold3's own settings (lr 1.8e-3 and its 1000-step warmup, 48 samples, 384-token
+  crops, `--tf32 --bf16`) on the set above, from the bundle: 150 steps over the 54 datapoints, the EMA validated and
+  checkpointed every 50 - 6MRR and 1CRN at lDDT 0.8862, 0.8869, 0.8874 (the EMA moving as slowly as a 0.999 decay
+  under a warmup at 2.7e-4 should) - and resumed from the step-150 checkpoint at step 150, the schedule continuing
+  (lr 2.70e-4 -> 2.86e-4 by step 160). A checkpoint is 5.9 GB (weights, two moments, the EMA): put it on a volume
+  with room, such as a tmpfs.
 - **validation** - `--val=<file>` (`--val-every`): OpenFold3's validation on the EMA weights, 1 + 3 cycles, a full
   rollout of 5 x 200 steps, each sample's truth permuted, all-atom lDDT (mean, best, the confidence head's top-ranked).
   The pretrained bundle reads 0.831 on 6MRR and 0.846 on 5K9P from their sequences alone.
