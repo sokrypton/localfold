@@ -21,3 +21,5 @@ test-atom
 test-atom-f64
 test-*
 bench-*
+train-of3
+test-of3loss

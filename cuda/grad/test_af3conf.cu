@@ -180,7 +180,9 @@ int main(int argc, char** argv) {
 #else
   auto ctD = gauss(nn * 64, 81, 1), ctA = gauss(nn * 64, 82, 1), ctL = gauss((size_t)n * dense * 50, 83, 1);
   g::real *ctPde = devReal(ctD), *ctPae = devReal(ctA), *ctPl = devReal(ctL);
-  g::real *oPde, *oPae, *oPl, *dz, *ds, *dtf;
+  g::real* ctRs = h.hasResolved ? devReal(gauss((size_t)n * dense * 2, 84, 1)) : nullptr;   // (the resolved head, where it is)
+  g::real *oPde, *oPae, *oPl, *oRs = nullptr, *dz, *ds, *dtf;
+  if (h.hasResolved) GK(cudaMalloc(&oRs, (size_t)n * dense * 2 * sizeof(g::real)));
   GK(cudaMalloc(&oPde, nn * 64 * sizeof(g::real))); GK(cudaMalloc(&oPae, nn * 64 * sizeof(g::real)));
   GK(cudaMalloc(&oPl, (size_t)n * dense * 50 * sizeof(g::real)));
   GK(cudaMalloc(&dz, nn * h.C * sizeof(g::real))); GK(cudaMalloc(&ds, (size_t)n * h.Cs * sizeof(g::real)));
@@ -194,18 +196,20 @@ int main(int argc, char** argv) {
     GK(cudaMemcpyAsync(oPde, o.pde, nn * 64 * sizeof(g::real), cudaMemcpyDeviceToDevice, g::STREAM));
     GK(cudaMemcpyAsync(oPae, o.pae, nn * 64 * sizeof(g::real), cudaMemcpyDeviceToDevice, g::STREAM));
     GK(cudaMemcpyAsync(oPl, o.plddt, (size_t)n * dense * 50 * sizeof(g::real), cudaMemcpyDeviceToDevice, g::STREAM));
+    if (oRs) GK(cudaMemcpyAsync(oRs, o.resolved, (size_t)n * dense * 2 * sizeof(g::real), cudaMemcpyDeviceToDevice, g::STREAM));
   };
   ps.zeroGrad();
   g::ARENA.reset();
   g::af3::ConfidenceLogits o{};
   auto s = g::af3::confidenceForward(h, z, sg, tf, beta, sm, pm, pm, n, o, cb);
-  g::af3::confidenceBackward(h, s, z, sg, tf, sm, pm, pm, g::af3::ConfidenceLogits{ctPde, ctPae, ctPl}, dz, ds, dtf, cb);
+  g::af3::confidenceBackward(h, s, z, sg, tf, sm, pm, pm, g::af3::ConfidenceLogits{ctPde, ctPae, ctPl, ctRs}, dz, ds, dtf, cb);
   g::GradCheck gc;
   gc.add("in/trunkPair", z, dz, nn * h.C);
   gc.add("in/trunkSingle", sg, ds, (size_t)n * h.Cs);
   gc.add("in/targetFeat", tf, dtf, (size_t)n * h.F);
   for (auto* p : ps.all) gc.add(*p);
   gc.output(oPde, ctPde, nn * 64); gc.output(oPae, ctPae, nn * 64); gc.output(oPl, ctPl, (size_t)n * dense * 50);
+  if (oRs) gc.output(oRs, ctRs, (size_t)n * dense * 2);
   failed += gc.run(fwd);
 #endif
   printf("%s\n", failed ? "FAIL" : "PASS");

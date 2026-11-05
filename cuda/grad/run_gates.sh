@@ -36,7 +36,8 @@ build cuda/grad/test-af2tmpl -O1 cuda/grad/test_af2tmpl.cu
 build cuda/grad/test-af2model -O1 cuda/grad/test_af2model.cu
 build cuda/grad/test-af2model-f64 -O2 -DGRAD_F64 cuda/grad/test_af2model.cu
 build cuda/grad/train-af2-smoke -O2 cuda/grad/train_af2_smoke.cu
-build cuda/grad/train-af3 -O2 --default-stream per-thread cuda/grad/train_af3.cu
+build cuda/grad/train-of3 -O2 --default-stream per-thread cuda/grad/train_of3.cu
+build cuda/grad/test-of3loss -O2 cuda/grad/test_of3loss.cu
 build cuda/grad/test-af2tmpl-f64 -O2 -DGRAD_F64 cuda/grad/test_af2tmpl.cu
 build cuda/grad/test-plm -O2 cuda/grad/test_plm.cu
 build cuda/grad/test-plm-f64 -O2 -DGRAD_F64 cuda/grad/test_plm.cu
@@ -132,8 +133,24 @@ for fb in "model-af3-full-f32 af3" "model-boltz2-f32 boltz2" "model-protenix2-f3
              *) run cuda/grad/test-af3conf --bundle=$1 --family=$2 --input=$in
                 run cuda/grad/test-af3conf-f64 --bundle=$1 --family=$2 --input=$in ;; esac
   for E in diffusion.encoder diffusion.decoder targetFeat.encoder; do run cuda/grad/test-atom --bundle=$1 --family=$2 --stack=$E; done
-  # the training loop (the trunk composed against runTrunk, then 6MRR against its crystal: the loss must halve)
-  case $2 in openbind0) run cuda/grad/train-af3 --bundle=$1 --family=$2 --input=$in --truth=tools/fixtures/6mrr-crystal.pdb:A --steps=20 ;; esac
+  # OpenFold3's training (OpenBind-0 is OpenFold3 v0.5.0): its losses held to a transcription of openfold3/core/loss on
+  # the kitchen sink (every branch: modified residues, DNA, RNA, ligands, a ligand-polymer bond), then train-of3 - the
+  # trunk composed against runTrunk, activation checkpointing against kept saves, 6MRR against its crystal (the loss
+  # above its floor must halve)
+  if [ $2 = openbind0 ]; then
+    ks=cuda/grad/data/of3-kitchen-sink
+    [ -d $ks/input ] || cuda/featurise/af3-featurise $ks/input --no-weights --family=$2 --job=tools/fixtures/kitchen-sink-relabelled.json > /dev/null
+    mkdir -p $ks/case && run cuda/grad/test-of3loss --input=$ks/input --out=$ks/case
+    if [ -x "$HOME/venv_ef2/bin/python" ]; then run "$HOME/venv_ef2/bin/python" cuda/grad/of3_loss_oracle.py $ks/case
+    else echo "== of3_loss_oracle.py: no torch at ~/venv_ef2 here"; fi
+    ex=cuda/grad/data/of3-6mrr
+    mkdir -p $ex
+    awk '/^ATOM/ && substr($0,22,1)=="A" && (substr($0,17,1)==" " || substr($0,17,1)=="A") {
+           n=substr($0,13,4); gsub(/ /,"",n); printf "1 %d %s %s %s %s\n", substr($0,23,4), n, substr($0,31,8), substr($0,39,8), substr($0,47,8) }' \
+      tools/fixtures/6mrr-crystal.pdb > $ex/truth.txt
+    echo "$in $ex/truth.txt resolution=1.18" > $ex/example.txt
+    run cuda/grad/train-of3 --bundle=$1 --family=$2 --examples=$ex/example.txt --steps=20 --samples=4 --lr=1e-4 --warmup=1 --check-ckpt=0 --smoke
+  fi
 done
 run cuda/grad/test-atom-f64
 run cuda/grad/test-af3 --bundle=model-mol1-f32 --family=mol1 --prefix=trunk.pairMixerBlocks.

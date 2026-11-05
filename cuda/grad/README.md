@@ -59,26 +59,49 @@ Every CUDA model's forward now has a backward here; what is not is said in each 
 constant input to the denoiser, a template's geometry and a sampler's coordinates take no gradient).
 
 Also: AdamW (`adam.cuh`); `train-af2-smoke` - real weights perturbed 10% and trained back, loss 918 -> 14.7 in 60
-steps. `train-af3` - the AF3 lineage's training loop, first form (OpenBind-0): the family's whole training network
-composed from its bundle (target_feat, the trunk embedder, the template term - which weighs even with no template,
-its padded slots' restype zero being a one-hot one - the MSA stack, the pairformer, the distogram, the denoiser), held
-to cuda/af3's runTrunk before it trains (pair 3.5e-7, single 1.6e-7), then AF3's diffusion loss (log-normal sigma,
-augmented truth, an alignment without gradient, EDM's weight) and distogram loss into every parameter by AdamW. On 6MRR
-against its crystal, 30 steps: diffusion 0.0285 -> 0.0046, denoised RMSD at sigma < 4 0.685 -> 0.255 A, distogram 1.83
--> 0.32; ~1.05 s a step at 68 tokens in float32. Recycling as AF3 trains it: a step runs 1-4 trunk passes
-(`--cycles=`, uniform), the earlier ones without a gradient, each handing its pair and single to the next; three passes
-against the port's own recycle read pair 3.4e-7, single 1.6e-7, and a cycle costs ~65 ms (one pass 478 ms a step, four
-672, at `--samples=4`). AF3's smooth LDDT (Algorithm 27: pairs under 15 A, eps the mean of sigmoid(c - |d - d_true|)
-over c in 0.5, 1, 2, 4) on each sample's denoised atoms, its gradient by hand (4.7e-8 against finite differences) and
-weighted as the diffusion term's; it cannot reach zero - a perfect pair's eps is 0.804 - so the smoke test asks the
-loss ABOVE that floor to halve (20 steps: 0.474 -> 0.154, smooth LDDT 0.273 -> 0.220 against a floor of 0.196). The
-bond loss is over ligand-polymer bonds alone, so zero on a protein. The confidence head (af3conf.cuh) on AF3's 20-step
-mini-rollout of the denoiser being trained, its inputs detached: pLDDT, PDE and PAE targets measured against the crystal
-(token centres CA, frames N-CA-C as Algorithm 30), weight 1e-4. 🔴 **THE TARGETS ARE THE ONES THE HEAD WAS TRAINED ON,
-CHECKED RATHER THAN ASSUMED**: before any step the pretrained head's expectations read pLDDT 0.854 against a measured 0.837,
-PAE 3.18 against 2.92 A, PDE 0.71 against 0.51 A - a wrong bin width, frame or neighbour set would put them far apart.
-20 steps: pLDDT CE 2.54 -> 0.94, PDE 0.87 -> 0.14, PAE 1.98 -> 1.18; the rollout and head add ~310 ms a step. Not yet: the confidence
-head's losses, BF16 and the stack's memory machinery, more than one target.
+steps. `train-of3` - **OpenFold3's training, in CUDA** (OpenBind-0 is OpenFold3 v0.5.0, so the recipe is its own, read from
+aqlaboratory/openfold-3 at `~/beta/of3-src`): the family's whole training network composed from its bundle (target_feat,
+the trunk embedder, the template term - which weighs even with no template, its padded slots' restype zero being a
+one-hot one - the MSA stack, the pairformer, the distogram, the denoiser, the confidence head) and trained as
+`projects/of3_all_atom` trains it:
+
+- **data** - `tools/make_of3_example.py <entry.cif> <dir>` turns a deposited structure into an example: the AF3 job of its
+  chains (each polymer its entity's FULL sequence, modified residues as modifications, every other chain a ligand of its
+  components; polymers first, the order the featuriser gives asymId), the truth keyed by chain, residue and atom name,
+  the resolution, and the featurised input. `--examples=<file>` lists them (`input truth [resolution=X] [weight=W]
+  [preferred=i[,j]]`), drawn by weight.
+- **cropping** - to `--crop` tokens (384) by OpenFold3's three strategies (contiguous 0.2, spatial 0.4, spatial-interface
+  0.4; whole when it fits), over the resolved token centre atoms, the preferred chain or interface honoured. The crop
+  cuts the host arrays and REBUILDS the atom windows with the featuriser's own `atomGathers` - held, on every example
+  at load, to the windows the featuriser wrote.
+- **the trunk** - 1 + U{0..3} cycles, the gradient through the last; each cycle's MSA a fresh 1024 rows, the valid ones
+  in a random order then invalid ones (`_subsample_all_msa`). Every MSA and pairformer block's saves are dropped as it
+  finishes and recomputed before its backward (OpenFold3's `blocks_per_ckpt` 1): `--check-ckpt` holds every gradient so
+  computed to the one with the saves kept - 2.6e-5, against 2.3e-5 between two identical runs (the backward's atomics).
+- **losses** - `of3loss.h`, OpenFold3's nine (mse with the per-type weights and Algorithm 28's weighted alignment, bond,
+  smooth LDDT, the diffusion weighting; distogram; pLDDT, PDE, PAE, experimentally resolved) with their gradients, held
+  by `test-of3loss` + `of3_loss_oracle.py` - a line-by-line torch transcription of `openfold3/core/loss` and its atom
+  selections (representative atoms, token frames with the 25-degree rule for an atomised token) - to **1.4e-14** on
+  every value and gradient, on the kitchen sink, where every branch is reached. The confidence head gained its
+  experimentally-resolved output (LayerNorm and a [Cs, dense x 2] projection; `test-af3conf-f64` gradchecks it).
+- **the rollout** - AF3's sampler, 20 steps, one sample, no gradient; the confidence head on it with every input
+  detached, its losses 1e-4 each and zero (its head out of the step) outside 0.1-4.0 A.
+- **diffusion** - `--samples` (48) noised copies of the truth, centred over its resolved atoms, rotated and moved,
+  sigma = 16 exp(-1.2 + 1.5 N(0, 1)).
+- **the update** - `of3train.cuh`: each example's gradient clipped to norm 10 and accumulated (`grad_manager.py`), each
+  parameter averaged over the examples it took part in, Adam (0.9, 0.95, eps 1e-8, no decay) after `--batch` examples
+  with `AlphaFoldLRScheduler` (1.8e-3, a 1000-step warmup from 0, x0.95 every 50k past 50k), the EMA (0.999);
+  `--save`/`--save-every`/`--resume` checkpoint all of it by parameter name.
+
+Before training it holds its trunk to cuda/af3's runTrunk on the first example, pass 0 and three recycled passes (1STP
+with its biotin: pair 6.5e-7 / 1.3e-6; 6MRR 3.5e-7 / 3.4e-7). The gate's smoke test (`--smoke`: before and after, on the
+first example whole with every draw seeded) asks the loss above its floor - smooth LDDT cannot reach zero, a perfect
+pair's eps being 0.804 - to halve: 6MRR, 20 steps at 1e-4, **0.491 -> 0.206** (mse 0.555 -> 0.095, distogram 1.70 ->
+0.75, pLDDT CE 2.56 -> 0.82), ~1 s a step at 68 tokens and 4 samples. 🔴 **THE CONFIDENCE TARGETS ARE THE ONES THE HEAD
+WAS TRAINED ON, CHECKED RATHER THAN ASSUMED**: before any step the pretrained head's expectations read pLDDT 0.854
+against a measured 0.837, PAE 3.18 against 2.92 A, PDE 0.71 against 0.51 A. Not yet: the multi-chain permutation
+alignment and symmetric-atom renaming, BF16, and OpenFold3's from-scratch initialisation (the weights start from the
+bundle).
 
 🔴 **THE DENOISER'S 4e-4 IS THE PORT'S ROUNDING, AND IT WAS SHOWN RATHER THAN ASSUMED.** boltz2 reads 4.1e-4 against
 `denoise()` and openbind0 2.0e-4, where every seam up to the encoder's skip is 1e-6 or under. Three measurements put it

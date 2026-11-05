@@ -254,12 +254,13 @@ __global__ void absentK(real* out, const real* w, real v, size_t n, int C) {
 struct ConfidenceHead {
   int C = 0, Cs = 0, F = 0, bins = 39, dense = 24, NB = 64, PB = 50;
   bool preSym = false, singleNorm = false, hasDist = false, hasLogitsLn = false, hasPaeLn = false, hasPlddtLn = false;
+  bool hasResolved = false, hasResolvedLn = false;   // the experimentally-resolved head (2 logits a dense slot), where a bundle has it
   int binMode = BIN_AF3;
   bool unmasked = false;            // chai-1: the distance embedding over every pair
   bool reembed = false, globalNorm = false, split = false, absent = false;
-  Linear leftTf, rightTf, pde, pae, plddt, pdeInter, paeInter;
+  Linear leftTf, rightTf, pde, pae, plddt, pdeInter, paeInter, resolved;
   Param distW, distF;
-  LayerNorm logitsLn, paeLn, plddtLn, inSingleLn;
+  LayerNorm logitsLn, paeLn, plddtLn, inSingleLn, resolvedLn;
   // boltz2's re-embedding
   LayerNorm sInLn, sLn, zLn;
   Linear sInToS, relPos, prodIn1, prodIn2, prodOut;
@@ -323,6 +324,11 @@ inline void forEachParam(ConfidenceHead& h, int nb, int Hp, int Dp, int Hs, int 
   if (h.split) { lin(P + "interHalfDistanceLogits", h.pdeInter, h.C, h.NB); lin(P + "paeInterLogits", h.paeInter, h.C, h.NB); }
   h.hasPlddtLn = has(P + "plddtLnScale"); if (h.hasPlddtLn) ln(P + "plddtLn", h.plddtLn, h.Cs);
   lin(P + "plddtLogits", h.plddt, h.Cs, h.dense * h.PB);
+  h.hasResolved = has(P + "experimentallyResolvedLogits");
+  if (h.hasResolved) {
+    h.hasResolvedLn = has(P + "resolvedLnScale"); if (h.hasResolvedLn) ln(P + "resolvedLn", h.resolvedLn, h.Cs);
+    lin(P + "experimentallyResolvedLogits", h.resolved, h.Cs, h.dense * 2);
+  }
 }
 __global__ void sumIntoK(real* y, const real* a, const real* b, size_t n) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -361,7 +367,8 @@ struct ConfidenceSave {
   real *l, *r, *sq, *pair0, *single0, *clamped, *sym, *xn, *pn, *sn;
   int* bin;
   std::vector<real*> pairs, singles;     // each block's input (and the last one's output)
-  LnSave lin_, lx, lp, ls;
+  LnSave lin_, lx, lp, ls, lr;
+  real* rn = nullptr;            // the resolved head's normalised single
   // the re-embedding's
   real *sIn, *p1, *p2, *zn;
   LnSave lsIn, lsS, lz;
@@ -370,7 +377,7 @@ struct ConfidenceSave {
   GlobalNorm gz, gs, gt;
   int n;
 };
-struct ConfidenceLogits { real *pde, *pae, *plddt; };    // [pairs, 64] (symmetrised), [pairs, 64], [n, dense * 50]
+struct ConfidenceLogits { real *pde, *pae, *plddt, *resolved = nullptr; };    // [pairs, 64] (symmetrised), [pairs, 64], [n, dense * 50], [n, dense * 2]
 inline ConfidenceSave confidenceForward(ConfidenceHead& h, const real* trunkPair, const real* trunkSingle, const real* tf,
                                         const real* beta, const real* seqMask, const real* pairMask, const real* maskT, int n,
                                         ConfidenceLogits& o, const ConfidenceBatch& cb = {}) {
@@ -449,6 +456,11 @@ inline ConfidenceSave confidenceForward(ConfidenceHead& h, const real* trunkPair
   s.sn = const_cast<real*>(sg);
   if (h.hasPlddtLn) { s.sn = ARENA.get((size_t)n * h.Cs); s.ls = lnForward(h.plddtLn, sg, s.sn, n); }
   o.plddt = ARENA.get((size_t)n * h.dense * h.PB); h.plddt.forward(s.sn, o.plddt, n);
+  if (h.hasResolved) {
+    s.rn = const_cast<real*>(sg);
+    if (h.hasResolvedLn) { s.rn = ARENA.get((size_t)n * h.Cs); s.lr = lnForward(h.resolvedLn, sg, s.rn, n); }
+    o.resolved = ARENA.get((size_t)n * h.dense * 2); h.resolved.forward(s.rn, o.resolved, n);
+  }
   return s;
 }
 // the logits' cotangents (any null) -> every parameter; dtrunkPair, dtrunkSingle, dtf (added; any may be null)
@@ -472,6 +484,10 @@ inline void confidenceBackward(ConfidenceHead& h, const ConfidenceSave& s, const
   if (d.plddt) {
     real* dsn = ARENA.get((size_t)n * h.Cs); h.plddt.backward(s.sn, d.plddt, dsn, n);
     if (h.hasPlddtLn) lnBackward(h.plddtLn, s.ls, dsn, dsg, n, true); else add(dsg, dsn, (size_t)n * h.Cs);
+  }
+  if (d.resolved && h.hasResolved) {
+    real* drn = ARENA.get((size_t)n * h.Cs); h.resolved.backward(s.rn, d.resolved, drn, n);
+    if (h.hasResolvedLn) lnBackward(h.resolvedLn, s.lr, drn, dsg, n, true); else add(dsg, drn, (size_t)n * h.Cs);
   }
   if (d.pae) {
     real* dpn = ARENA.get(nn * h.C); head(h.pae, h.paeInter, s.pn, d.pae, dpn);
