@@ -150,6 +150,14 @@ for fb in "model-af3-full-f32 af3" "model-boltz2-f32 boltz2" "model-protenix2-f3
       tools/fixtures/6mrr-crystal.pdb > $ex/truth.txt
     echo "$in $ex/truth.txt resolution=1.18" > $ex/example.txt
     run cuda/grad/train-of3 --bundle=$1 --family=$2 --examples=$ex/example.txt --steps=20 --samples=4 --lr=1e-4 --warmup=1 --check-ckpt=0 --smoke
+    # the truth's permutation (AF3 SI 4.2) on 1BRS - three barnase/barstar pairs - disguised and recovered; the example
+    # builder wants gemmi and RDKit (~/venv)
+    if [ -x "$HOME/venv/bin/python" ]; then
+      b=cuda/grad/data/of3-1brs
+      [ -f $b/example.txt ] || { mkdir -p $b && zstd -dqf tools/fixtures/rcsb/1brs.cif.zst -o $b/1brs.cif &&
+                                 "$HOME/venv/bin/python" tools/make_of3_example.py $b/1brs.cif $b --family=$2 > /dev/null; }
+      run cuda/grad/train-of3 --bundle=$1 --family=$2 --examples=$b/example.txt --steps=0 --check-perm=0
+    else echo "== the truth's permutation: no ~/venv (gemmi, RDKit) here"; fi
   fi
 done
 run cuda/grad/test-atom-f64

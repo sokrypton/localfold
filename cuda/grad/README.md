@@ -86,6 +86,15 @@ one-hot one - the MSA stack, the pairformer, the distogram, the denoiser, the co
   experimentally-resolved output (LayerNorm and a [Cs, dense x 2] projection; `test-af3conf-f64` gradchecks it).
 - **the rollout** - AF3's sampler, 20 steps, one sample, no gradient; the confidence head on it with every input
   detached, its losses 1e-4 each and zero (its head out of the step) outside 0.1-4.0 A.
+- **the truth's permutation** - `of3perm.h`, OpenFold3's `permutation_alignment.py` (AF3 SI 4.2) on the rollout, before
+  every loss: the least ambiguous molecule as anchor, a candidate alignment a predicted copy of its entity, greedy
+  centroid matching of every predicted molecule to an unused truth copy, then each component's naming chosen among its
+  RDKit automorphisms (`GetSubstructMatches(mol, mol, uniquify=False, useChirality=False)` on the CCD graph, written by
+  the example builder as `perms.txt`: Val, Leu, Phe, Tyr and a sulfate swap; Asp, Glu and Arg do not, their CCD bond
+  orders telling the oxygens apart). The prediction is the crop and the truth the whole entry. `--check-perm` disguises
+  an entry - every repeated molecule's copies relabelled, every symmetric component renamed, moved and perturbed 0.1 A -
+  and it must come back: 1BRS (three barnase/barstar pairs) 21.7 A as labelled, **0.175 A** permuted; 7BNY (four
+  chains, nine sulfates) 37.3 A to 0.174.
 - **diffusion** - `--samples` (48) noised copies of the truth, centred over its resolved atoms, rotated and moved,
   sigma = 16 exp(-1.2 + 1.5 N(0, 1)).
 - **the update** - `of3train.cuh`: each example's gradient clipped to norm 10 and accumulated (`grad_manager.py`), each
@@ -99,9 +108,9 @@ first example whole with every draw seeded) asks the loss above its floor - smoo
 pair's eps being 0.804 - to halve: 6MRR, 20 steps at 1e-4, **0.491 -> 0.206** (mse 0.555 -> 0.095, distogram 1.70 ->
 0.75, pLDDT CE 2.56 -> 0.82), ~1 s a step at 68 tokens and 4 samples. 🔴 **THE CONFIDENCE TARGETS ARE THE ONES THE HEAD
 WAS TRAINED ON, CHECKED RATHER THAN ASSUMED**: before any step the pretrained head's expectations read pLDDT 0.854
-against a measured 0.837, PAE 3.18 against 2.92 A, PDE 0.71 against 0.51 A. Not yet: the multi-chain permutation
-alignment and symmetric-atom renaming, BF16, and OpenFold3's from-scratch initialisation (the weights start from the
-bundle).
+against a measured 0.837, PAE 3.18 against 2.92 A, PDE 0.71 against 0.51 A. Not yet: BF16, OpenFold3's from-scratch
+initialisation (the weights start from the bundle), and the denoiser's 48 samples batched (one at a time here: a 384-token,
+48-sample step is ~14 s on this A100, 6.3 s of it the denoiser).
 
 🔴 **THE DENOISER'S 4e-4 IS THE PORT'S ROUNDING, AND IT WAS SHOWN RATHER THAN ASSUMED.** boltz2 reads 4.1e-4 against
 `denoise()` and openbind0 2.0e-4, where every seam up to the encoder's skip is 1e-6 or under. Three measurements put it

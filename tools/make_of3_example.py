@@ -22,11 +22,15 @@ Without --a3m-dir or --search every chain folds from its own sequence (an empty 
 import argparse
 import json
 import os
+import re
 import string
 import subprocess
 import sys
 
 import gemmi
+from rdkit import Chem, RDLogger
+
+RDLogger.DisableLog("rdApp.*")
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -37,6 +41,51 @@ def chain_ids():
     for a in string.ascii_uppercase:
         for b in string.ascii_uppercase:
             yield a + b
+
+
+def ccd_blocks(path, codes):
+    """the CCD's data blocks for `codes` (a scan for each `data_X` line rather than a parse of 50,000 components)"""
+    text = open(path).read()
+    out = {}
+    for code in codes:
+        m = re.search(r"^data_" + re.escape(code) + r"\s*$", text, re.M)
+        if not m: continue
+        end = text.find("\ndata_", m.end())
+        out[code] = gemmi.cif.read_string(text[m.start(): end if end >= 0 else len(text)]).sole_block()
+    return out
+
+
+def symmetry_permutations(block, max_permutations=1000):
+    """OpenFold3's conformer permutations (core/data/primitives/structure/conformer.py get_cropped_permutations): RDKit's
+    GetSubstructMatches of the component against itself, uniquify off, chirality ignored, at most 1000 - over its heavy
+    atoms as the CCD gives them (elements, charges, bond orders, aromaticity). Each permutation as atom names: perm[i]
+    the name atom i maps to. None when only the identity."""
+    atoms = block.find("_chem_comp_atom.", ["atom_id", "type_symbol", "charge", "pdbx_aromatic_flag"])
+    bonds = block.find("_chem_comp_bond.", ["atom_id_1", "atom_id_2", "value_order", "pdbx_aromatic_flag"])
+    names, idx = [], {}
+    mol = Chem.RWMol()
+    for row in atoms:
+        el = row[1].strip().capitalize()
+        if el in ("H", "D"): continue
+        a = Chem.Atom(el if el != "X" else "C")
+        try: a.SetFormalCharge(int(row[2]))
+        except ValueError: pass
+        a.SetIsAromatic(row[3] == "Y")
+        idx[row[0].strip('"')] = mol.AddAtom(a); names.append(row[0].strip('"'))
+    order = {"SING": Chem.BondType.SINGLE, "DOUB": Chem.BondType.DOUBLE, "TRIP": Chem.BondType.TRIPLE}
+    for row in bonds if bonds else []:
+        a, b = row[0].strip('"'), row[1].strip('"')
+        if a not in idx or b not in idx: continue
+        bt = Chem.BondType.AROMATIC if row[3] == "Y" else order.get(row[2].upper(), Chem.BondType.SINGLE)
+        mol.AddBond(idx[a], idx[b], bt)
+        if bt == Chem.BondType.AROMATIC: mol.GetBondBetweenAtoms(idx[a], idx[b]).SetIsAromatic(True)
+    m = mol.GetMol()
+    try: m.UpdatePropertyCache(strict=False)
+    except Exception: pass
+    perms = m.GetSubstructMatches(m, uniquify=False, maxMatches=max_permutations, useChirality=False)
+    perms = [p for p in perms if list(p) != list(range(len(names)))]
+    if not perms: return None
+    return [names] + [[names[j] for j in p] for p in perms]
 
 
 def main():
@@ -65,6 +114,7 @@ def main():
     kind_of = {e.name: e.polymer_type for e in st.entities}
 
     sequences, truth = [], []
+    components = []          # (chain index, residue index, component code): what the permutations are written for
     ids = chain_ids()
     # label_asym_id chains (a gemmi subchain is one), polymers first and then the rest, each in file order: the
     # featuriser orders a job's chains that way, and the truth's chain index is the batch's asymId
@@ -103,6 +153,7 @@ def main():
                 elif kind == "rna" and not a.search:
                     entry["unpairedMsa"] = ""
                 sequences.append({kind: entry})
+                for pos in sorted(mons): components.append((index, pos, mons[pos]))
                 for res in sub:
                     if res.label_seq is None: continue
                     for atom in res:
@@ -113,6 +164,7 @@ def main():
                 codes = [res.name for res in sub]
                 sequences.append({"ligand": {"id": jid, "ccdCodes": codes}})
                 for k, res in enumerate(sub, start=1):
+                    components.append((index, k, res.name))
                     for atom in res:
                         if atom.altloc not in ("\0", "A") or atom.occ <= 0: continue
                         p = atom.pos
@@ -128,11 +180,19 @@ def main():
     r = subprocess.run(cmd, capture_output=True, text=True)
     sys.stdout.write(r.stdout); sys.stderr.write(r.stderr)
     if r.returncode: sys.exit(r.returncode)
+    # the symmetric-atom permutations of every component that has any (AF3 SI 4.2: the truth's atoms renamed to the
+    # prediction's best match), `chain residue identity-names | permuted-names | ...`
+    blocks = ccd_blocks(a.ccd, sorted({c for _, _, c in components})) if os.path.exists(a.ccd) else {}
+    perm_of = {code: symmetry_permutations(b) for code, b in blocks.items()}
+    with open(os.path.join(a.out, "perms.txt"), "w") as f:
+        for chain, res, code in components:
+            p = perm_of.get(code)
+            if p: f.write(f"{chain} {res} " + " | ".join(",".join(x) for x in p) + "\n")
     # the resolution, which gates the confidence losses (OpenFold3: 0.1 to 4.0 A, none outside or without one)
     res = st.resolution if st.resolution and st.resolution > 0 else None
     with open(os.path.join(a.out, "example.txt"), "w") as f:
         f.write(f"{os.path.abspath(os.path.join(a.out, 'input'))} {os.path.abspath(os.path.join(a.out, 'truth.txt'))}"
-                + (f" resolution={res:.2f}" if res else "") + "\n")
+                + (f" resolution={res:.2f}" if res else "") + f" perms={os.path.abspath(os.path.join(a.out, 'perms.txt'))}\n")
     print(f"{len(sequences)} chains, {len(truth)} resolved atoms -> {a.out}")
 
 

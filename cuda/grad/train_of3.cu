@@ -8,8 +8,9 @@
 //                 three strategies (contiguous 0.2, spatial 0.4, spatial-interface 0.4; whole when it fits)
 //   the trunk     1 + U{0..3} cycles, the gradient through the last; each cycle's MSA a fresh 1024 rows (the valid
 //                 rows in a random order, then invalid ones: MSAModuleEmbedder._subsample_all_msa)
-//   the rollout   AF3's sampler, 20 steps, one sample, no gradient; the confidence head on it with every input
-//                 detached (pLDDT, PDE, PAE, experimentally resolved)
+//   the rollout   AF3's sampler, 20 steps, one sample, no gradient; on it the truth's permutation (of3perm.h: which
+//                 copy of a repeated molecule, which naming of a symmetric component), used by every loss after; the
+//                 confidence head on it with every input detached (pLDDT, PDE, PAE, experimentally resolved)
 //   diffusion     --samples (48) noised copies of the augmented truth, sigma = 16 exp(-1.2 + 1.5 N(0, 1))
 //   the losses    of3loss.h, held to a transcription of openfold3/core/loss (of3_loss_oracle.py, 1e-14):
 //                 4 (w(t) mse + smooth LDDT) + bond, 0.03 distogram, 1e-4 each confidence term - the confidence terms
@@ -17,6 +18,7 @@
 //   the update    of3train.cuh: the example's gradient clipped to norm 10 and accumulated, Adam (0.9, 0.95) after
 //                 --batch examples with OpenFold3's warmup and decay, the EMA (0.999); --save / --resume
 //
+// --check-perm=k disguises example k (copies relabelled, symmetric components renamed) and the permutation must undo it.
 // Before training it holds its trunk to cuda/af3's runTrunk on the first example (pass 0 and three recycled passes)
 // - the composition this file writes, against the port's - and every example's recomputed atom windows to the
 // featuriser's own (the windows a crop rebuilds are the same function).
@@ -44,6 +46,7 @@
 #include "af3embed.cuh"
 #include "af3tmpl.cuh"
 #include "of3loss.h"
+#include "of3perm.h"
 #include "of3train.cuh"
 
 namespace g = grad;
@@ -62,6 +65,8 @@ struct Example {
   struct Slot { double repeat = 0; std::vector<int> aatype, bin; std::vector<float> pb, uv, bb; bool geo = false; };
   std::vector<Slot> slots; int templates = 0;
   std::vector<double> xt, gm;                  // the truth [atoms * 3] and its resolved mask [atoms]
+  std::string permsPath;
+  of3::PermInput perm;                         // the whole entry, for the truth's permutation (of3perm.h)
   size_t atoms() const { return (size_t)n * dense; }
 };
 
@@ -89,6 +94,7 @@ static Example loadExample(const std::string& line, bool padded, bool qblock) {
     if (k == "resolution") e.resolution = atof(v.c_str());
     else if (k == "weight") e.weight = atof(v.c_str());
     else if (k == "preferred") { std::stringstream ss(v); std::string x; while (std::getline(ss, x, ',')) e.preferred.push_back(atoi(x.c_str())); }
+    else if (k == "perms") e.permsPath = v;
     else { fprintf(stderr, "example %s: unknown field %s\n", e.input.c_str(), kv.c_str()); exit(1); }
   }
   for (auto it = M.index.begin(); it != M.index.end();) {
@@ -168,6 +174,42 @@ static Example loadExample(const std::string& line, bool padded, bool qblock) {
     printf("example %s: %d tokens, %d of %d atoms resolved, %d MSA rows, %zu template slot(s)%s\n", e.input.c_str(), n, found,
            wanted, e.P, e.slots.size(), e.resolution > 0 ? (", resolution " + std::to_string(e.resolution).substr(0, 4) + " A").c_str() : ", no resolution");
     if (found < wanted / 4) { fprintf(stderr, "%s: the truth names %d of the batch's %d atoms - not this input's structure?\n", e.truthPath.c_str(), found, wanted); exit(1); }
+  }
+  // what the truth's permutation reads (of3perm.h): the whole entry's molecules, centres, names and symmetric namings
+  {
+    of3::PermInput& P = e.perm;
+    P.n = n; P.dense = e.dense; P.ent = e.ent; P.sym = e.sym; P.asym = e.asym; P.ri = e.ri; P.xt = e.xt; P.gm = e.gm;
+    const of3::Layout L = of3::makeLayout(n, e.dense, e.predMask.data(), e.names.data(), e.isDna.data(), e.isRna.data(),
+                                          e.isLigand.data(), e.isMod.data(), e.asym.data(), nullptr);
+    P.molTok.assign(n, 0); P.centre.assign(n, -1); P.ligand.assign(n, 0);
+    std::map<int, int> at;
+    for (int t = 0; t < n; ++t) {
+      P.molTok[t] = at[e.asym[t]]++;
+      P.centre[t] = L.atomized[t] ? L.start[t] : L.lddtRep[t];
+      P.ligand[t] = e.isLigand[t] != 0;
+    }
+    P.name.assign(e.atoms(), "");
+    for (size_t i = 0; i < e.atoms(); ++i) {
+      if (!(e.predMask[i] > 0)) continue;
+      for (int q = 0; q < 4; ++q) { int ch = e.names[i * 4 + q]; if (ch > 0) P.name[i] += (char)(ch + 32); }
+    }
+    if (!e.permsPath.empty()) {
+      std::ifstream f(e.permsPath);
+      if (!f) { fprintf(stderr, "cannot read %s\n", e.permsPath.c_str()); exit(1); }
+      std::string line;
+      while (std::getline(f, line)) {
+        std::istringstream ls2(line); int c, r; ls2 >> c >> r;
+        std::string rest; std::getline(ls2, rest);
+        std::vector<std::vector<std::string>> namings;
+        std::stringstream ps(rest); std::string part;
+        while (std::getline(ps, part, '|')) {
+          std::vector<std::string> names; std::stringstream ns(part); std::string x;
+          while (std::getline(ns, x, ',')) { x.erase(0, x.find_first_not_of(' ')); x.erase(x.find_last_not_of(' ') + 1); names.push_back(x); }
+          namings.push_back(names);
+        }
+        P.perms[{c, r}] = namings;
+      }
+    }
   }
   // its atom windows rebuilt here against the featuriser's own (the function a crop calls)
   {
@@ -352,7 +394,7 @@ static of3::Layout layoutOf(const Example& e) {
 
 int main(int argc, char** argv) {
   std::string bundle = "model-openbind0-f32", family = "openbind0", examplesPath, savePath, resumePath;
-  int steps = 30, samples = 48, batch = 1, crop = 384, saveEvery = 0, checkCkpt = -1; unsigned seed = 1; bool smoke = false, ckpt = true;
+  int steps = 30, samples = 48, batch = 1, crop = 384, saveEvery = 0, checkCkpt = -1, checkPerm = -1; unsigned seed = 1; bool smoke = false, ckpt = true;
   double lrMax = 1.8e-3, bondWeight = 0; long warmup = 1000;
   for (int i = 1; i < argc; ++i) {
     auto opt = [&](const char* k) { const size_t l = strlen(k); return !strncmp(argv[i], k, l) ? argv[i] + l : nullptr; };
@@ -373,6 +415,7 @@ int main(int argc, char** argv) {
     else if (!strcmp(argv[i], "--smoke")) smoke = true;
     else if (!strcmp(argv[i], "--no-ckpt")) ckpt = false;
     else if (auto v = opt("--check-ckpt=")) checkCkpt = atoi(v);
+    else if (auto v = opt("--check-perm=")) checkPerm = atoi(v);
     else if (!strcmp(argv[i], "--tf32")) g::TF32 = true;
     else { fprintf(stderr, "train-of3: unknown argument %s\n", argv[i]); return 1; }
   }
@@ -743,7 +786,9 @@ int main(int argc, char** argv) {
     double tLoss = 0;
     const auto t0 = now();
     const of3::Layout Lfull = layoutOf(full);
-    const Example e = fixed ? full : subset(full, cropTokens(full, Lfull, crop, CropWeights{}, gen, strategy));
+    std::vector<int> keep(full.n); for (int t = 0; t < full.n; ++t) keep[t] = t;
+    if (!fixed) keep = cropTokens(full, Lfull, crop, CropWeights{}, gen, strategy);
+    Example e = subset(full, keep);
     const of3::Layout Lay = layoutOf(e);
     const int n = e.n; const size_t nn = (size_t)n * n, A = e.atoms();
     const int S = std::min(1024, e.P);
@@ -754,6 +799,13 @@ int main(int argc, char** argv) {
     const int c = fixed ? 4 : 1 + (int)(gen() % 4);
     cycles(d, a, c, [&] { drawMsa(d, e, gen); });
     const auto t1 = now();
+    // the mini-rollout, and on it the truth's permutation (model.py: before every loss of the step)
+    std::vector<double> xp;
+    {
+      g::Scratch sc;
+      xp = rollout(d, a, e, gen, 20);
+    }
+    of3::permuteTruth(full.perm, keep, xp, e.xt, e.gm, nullptr);
     // the distogram: its loss on the host, its cotangent kept for the backward
     g::real* dLog = nullptr;
     {
@@ -764,10 +816,9 @@ int main(int argc, char** argv) {
       dLog = d.zeros(nn * dh.bins);
       GK(cudaMemcpy(dLog, r.data(), r.size() * sizeof(g::real), cudaMemcpyHostToDevice));
     }
-    // the mini-rollout and the confidence head, its inputs detached
+    // the confidence head on the rollout, its inputs detached
     {
       g::Scratch sc;
-      auto xp = rollout(d, a, e, gen, 20);
       std::vector<double> beta(n * 3, 0);
       for (int t = 0; t < n; ++t) if (e.pbSlot[t] >= 0) for (int p = 0; p < 3; ++p) beta[t * 3 + p] = xp[((size_t)t * e.dense + e.pbSlot[t]) * 3 + p];
       g::real* betaD = g::ARENA.get(n * 3);
@@ -902,6 +953,57 @@ int main(int argc, char** argv) {
     printf("activation checkpointing: every gradient recomputed against kept saves, relRMS %.3e (two identical runs: %.3e)  %s\n",
            e, floor, ok ? "PASS" : "FAIL");
     ckpt = true;
+    if (!ok) return 1;
+  }
+  // --check-perm=k: example k whole, its truth disguised - each repeated molecule's copies relabelled cyclically, every
+  // component with a symmetric naming given its first alternative, all rotated, moved and perturbed 0.1 A - must come
+  // back: the permuted truth within the noise of the disguise, where the truth as labelled is far
+  if (checkPerm >= 0) {
+    const Example& E = examples.at(checkPerm);
+    const of3::PermInput& P = E.perm;
+    std::mt19937_64 gen(5); std::normal_distribution<double> nd(0, 1);
+    std::map<int, std::vector<int>> copies; for (int t = 0; t < P.n; ++t) copies[P.ent[t]].push_back(P.sym[t]);
+    std::map<std::pair<int, int>, int> shift;   // (entity, sym) -> the sym whose coordinates it shows
+    for (auto& [en, ss] : copies) {
+      std::vector<int> u(ss); std::sort(u.begin(), u.end()); u.erase(std::unique(u.begin(), u.end()), u.end());
+      for (size_t q = 0; q < u.size(); ++q) shift[{en, u[q]}] = u[(q + 1) % u.size()];
+    }
+    std::map<std::tuple<int, int, int>, int> tokOf; for (int t = 0; t < P.n; ++t) tokOf[{P.ent[t], P.sym[t], P.molTok[t]}] = t;
+    std::vector<double> xp(E.atoms() * 3, 0);
+    double R[3][3]; rotation(nd, gen, R);
+    int relabelled = 0, renamed = 0;
+    for (int t = 0; t < P.n; ++t) {
+      const int src = tokOf.at({P.ent[t], shift.at({P.ent[t], P.sym[t]}), P.molTok[t]});
+      relabelled += src != t;
+      auto pit = P.perms.find({P.asym[src], P.ri[src]});
+      std::map<std::string, std::string> rename;
+      if (pit != P.perms.end() && pit->second.size() > 1) for (size_t i = 0; i < pit->second[0].size(); ++i) rename[pit->second[0][i]] = pit->second[1][i];
+      for (int s2 = 0; s2 < P.dense; ++s2) {
+        const size_t i = (size_t)t * P.dense + s2;
+        if (P.name[i].empty()) continue;
+        std::string nm = rename.count(P.name[i]) ? rename[P.name[i]] : P.name[i];
+        renamed += nm != P.name[i];
+        int from = -1; for (int u = 0; u < P.dense; ++u) if (P.name[(size_t)src * P.dense + u] == nm) from = src * P.dense + u;
+        if (from < 0) for (int u = 0; u < P.dense; ++u) if (P.name[(size_t)src * P.dense + u] == P.name[i]) from = src * P.dense + u;
+        for (int c = 0; c < 3; ++c) {
+          double v = 3.0 * (c + 1); for (int q = 0; q < 3; ++q) v += R[c][q] * P.xt[from * 3 + q];
+          xp[i * 3 + c] = v + 0.1 * nd(gen);
+        }
+      }
+    }
+    std::vector<int> all(P.n); for (int t = 0; t < P.n; ++t) all[t] = t;
+    std::vector<double> xo, go; std::string rep;
+    of3::permuteTruth(P, all, xp, xo, go, &rep);
+    auto rmsdTo = [&](const std::vector<double>& x, const std::vector<double>& m) {
+      std::vector<double> w(m); double Rr[3][3], tr[3]; of3::weightedAlign(xp, x, w, Rr, tr);
+      double s2 = 0, c = 0;
+      for (size_t i = 0; i < m.size(); ++i) if (m[i] > 0) { for (int q = 0; q < 3; ++q) { double v = tr[q] - x[i * 3 + q]; for (int u = 0; u < 3; ++u) v += Rr[q][u] * xp[i * 3 + u]; s2 += v * v; } c += 1; }
+      return std::sqrt(s2 / c);
+    };
+    const double asLabelled = rmsdTo(E.xt, E.gm), permuted = rmsdTo(xo, go);
+    const bool ok = permuted < 0.25 && (relabelled + renamed == 0 || asLabelled > 2 * permuted);
+    printf("truth permutation: %d tokens relabelled, %d atoms renamed; RMSD to the truth as labelled %.3f A, permuted %.3f A (matched:%s)  %s\n",
+           relabelled, renamed, asLabelled, permuted, rep.empty() ? " identity" : rep.c_str(), ok ? "PASS" : "FAIL");
     if (!ok) return 1;
   }
   // the smoke test's measurement: the first example whole, every draw seeded, the noise levels on a ladder
