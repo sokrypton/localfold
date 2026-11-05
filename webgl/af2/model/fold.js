@@ -1,5 +1,6 @@
 /**
- * AlphaFold 2 monomer, end to end: the driver that makes the stages a fold.
+ * AlphaFold 2 end to end: the driver that makes the stages a fold, on either
+ * graph.
  *
  *     once:        templateUpdate = templateEmbedding(geometry features)
  *     every pass:  msa, extra, pair = inputEmbedder(features, recycled state)
@@ -9,9 +10,30 @@
  *                  structure module, confidence heads, contact map
  *                  carry the MSA's first row, the pair and the atom37 forward
  *
- * `webgpu/af2/model/monomer.js` is the order and the conventions; this is the
- * same graph without the command-buffer windowing, which has no counterpart
- * here because a draw is submitted as it is issued.
+ * `webgpu/af2/model/monomer.js` is the order and the conventions and
+ * `webgpu/af2/multimer/model.js` is the unified driver this follows - "AF2
+ * monomer and multimer through one path... it differs in three imports and two
+ * options". There is no command-buffer windowing here, because a draw is
+ * submitted as it is issued.
+ *
+ * 🔴 AND THE TWO GRAPHS DIFFER IN SIX PLACES, EVERY ONE OF WHICH IS THE
+ * CHECKPOINT'S AND NOT A TUNING CHOICE. `graph: "multimer"` sets all six:
+ *
+ *   - the outer product mean runs FIRST in both block stacks;
+ *   - the relative encoding reads a `[4, length]` chain identity over 73 rows
+ *     rather than the residue index over 65, so the monomer table is WIDENED at
+ *     upload (the shipped bytes stay the bytes on disk);
+ *   - `position_scale` is 20 rather than 10;
+ *   - the transitions keep their hidden row in f32 where the monomer's round it
+ *     to f16, and the attention targets are all f32 where the monomer's are f16;
+ *   - the template embedder is the NINE-PROJECTION one, and it runs EVERY PASS
+ *     rather than once, because it reads the pair through a LayerNorm and so is
+ *     a function of the pair rather than a constant;
+ *   - and its template needs the chain ids, which it refuses to guess.
+ *
+ * Getting any of them wrong produces a fold rather than an error. The reference
+ * says what dropping the regime once cost: it "ran multimer WEIGHTS on the
+ * monomer graph", and that reached a visitor.
  *
  * 🔴 THE RECYCLED STATE NEVER LEAVES THE DEVICE, WHICH THE WebGPU DRIVER HAD TO
  * BE TAUGHT. Its own comment records the cost of the other way: the pair track
@@ -45,7 +67,8 @@ import { confidenceHeads, releaseConfidenceWeights, uploadConfidenceWeights } fr
 import { distogramContacts } from "../../heads/distogram.js";
 import { evoformerStack, extraMsaStack } from "../evoformer/stack.js";
 import {
-  inputEmbedder, releaseInputEmbedderWeights, uploadInputEmbedderWeights,
+  inputEmbedder, releaseInputEmbedderWeights, residueIdentity, uploadInputEmbedderWeights,
+  widenRelativePositionWeight,
 } from "../evoformer/input-embedder.js";
 import { prefix } from "../../runtime/elementwise.js";
 import { add } from "../../runtime/elementwise.js";
@@ -56,6 +79,10 @@ import {
 import {
   releaseTemplateWeights, templateEmbedding, templateFeatures, uploadTemplateWeights,
 } from "../evoformer/template.js";
+import {
+  multimerTemplateEmbedding, multimerTemplateFeatures, releaseMultimerTemplateWeights,
+  uploadMultimerTemplateWeights,
+} from "../multimer/template.js";
 import {
   releaseEvoformerBlockWeights, uploadEvoformerBlockWeights, uploadTemplatePairBlockWeights,
 } from "../evoformer/block.js";
@@ -78,14 +105,16 @@ import {
  *   extraHasDeletion: ArrayLike<number>, extraDeletionValue: ArrayLike<number>,
  *   atom37ToAtom14: ArrayLike<number>, atom37Mask: ArrayLike<number>,
  *   msaSequences: number, extraSequences: number,
- *   targetChannels: number, msaFeatureChannels: number}} RecycleFeatures
+ *   targetChannels: number, msaFeatureChannels: number,
+ *   asymId?: ArrayLike<number>, entityId?: ArrayLike<number>,
+ *   symId?: ArrayLike<number>}} RecycleFeatures
  */
 
 /**
  * AF2 monomer's widths, which are the checkpoint's and not ours to choose.
  * `webgpu/af2/model/monomer.js` passes the same numbers as literals.
  */
-export const MONOMER_SHAPE = {
+export const AF2_SHAPE = {
   msaChannels: 256,
   extraMsaChannels: 64,
   pairChannels: 128,
@@ -95,6 +124,9 @@ export const MONOMER_SHAPE = {
   // Ten for every monomer checkpoint; the multimer graph trains against twenty.
   positionScale: 10,
 };
+
+/** ...and what `graph: "multimer"` changes about it. */
+export const MULTIMER_SHAPE = { ...AF2_SHAPE, positionScale: 20 };
 
 /**
  * Every tensor a monomer fold reads, uploaded once.
@@ -112,13 +144,37 @@ export const MONOMER_SHAPE = {
  * else missing is a fold that cannot run, and the per-section upload throws
  * naming the tensor.
  */
-export function uploadMonomerWeights(execution, weights) {
+export function uploadAf2Weights(execution, weights, graph = "monomer") {
+  const multimer = graph === "multimer";
   const hidden = (group) => ({
     triangleHidden: group.triangleMultiplicationOutgoing.linearAPBias.length,
     pairHidden: group.pairTransition.firstBias.length,
   });
+  // 🔴 THE RELATIVE TABLE IS WIDENED HERE RATHER THAN AT EXPORT, so the shipped
+  // monomer weights stay the bytes on disk: no re-quantisation, no new manifest,
+  // no re-download. A monomer's eight trailing rows are zero and the chains
+  // kernel then computes exactly what the 65-row lookup does - which
+  // `check-webgl-multimer-embedder.js` holds bit-identical rather than assuming.
+  const embedding = multimer
+    ? {
+      ...weights.embedding,
+      relativePositionWeight: widenRelativePositionWeight(
+        weights.embedding.relativePositionWeight, AF2_SHAPE.pairChannels),
+    }
+    : weights.embedding;
   return {
-    embedding: uploadInputEmbedderWeights(execution, weights.embedding),
+    embedding: uploadInputEmbedderWeights(execution, embedding),
+    // The multimer's nine-projection embedder, which runs every pass.
+    templateEmbedding: weights.templateEmbedding === undefined
+      ? undefined
+      : {
+        stage: uploadMultimerTemplateWeights(execution, weights.templateEmbedding),
+        blocks: weights.templateEmbedding.stack.map(
+          (block) => uploadTemplatePairBlockWeights(execution, block)),
+        triangleHidden:
+          weights.templateEmbedding.stack[0].triangleMultiplicationOutgoing.linearAPBias.length,
+        pairHidden: weights.templateEmbedding.stack[0].pairTransition.firstBias.length,
+      },
     template: weights.template === null || weights.template === undefined ? null : {
       stage: uploadTemplateWeights(execution, weights.template),
       blocks: weights.template.blockWeights.map(
@@ -152,8 +208,14 @@ export function uploadMonomerWeights(execution, weights) {
   };
 }
 
-export function releaseMonomerWeights(execution, weights) {
+export function releaseAf2Weights(execution, weights) {
   releaseInputEmbedderWeights(execution, weights.embedding);
+  if (weights.templateEmbedding !== undefined) {
+    releaseMultimerTemplateWeights(execution, weights.templateEmbedding.stage);
+    for (const block of weights.templateEmbedding.blocks) {
+      releaseEvoformerBlockWeights(execution, block);
+    }
+  }
   if (weights.template !== null) {
     releaseTemplateWeights(execution, weights.template.stage);
     for (const block of weights.template.blocks) {
@@ -173,20 +235,27 @@ export function releaseMonomerWeights(execution, weights) {
 }
 
 /**
- * @param {{featuresByRecycle: readonly RecycleFeatures[],
- *   weights: ReturnType<typeof uploadMonomerWeights>,
+ * @param {{featuresByRecycle: readonly RecycleFeatures[], graph?: "monomer" | "multimer",
+ *   weights: ReturnType<typeof uploadAf2Weights>,
  *   paeBreaks: ArrayLike<number>,
  *   template?: Parameters<typeof templateFeatures>[0]["template"],
- *   useTemplateUnitVector?: boolean,
+ *   useTemplateUnitVector?: boolean, templates?: number,
  *   tolerance?: number, pairHost?: boolean, contactMap?: boolean,
- *   shape?: Partial<typeof MONOMER_SHAPE>,
+ *   shape?: Partial<typeof AF2_SHAPE>,
  *   onRecycle?: (result: object, recycle: number) => void,
  *   onBlock?: (stack: "extra" | "main", block: number, blocks: number) => void,
  *   yieldTo?: () => Promise<void>}} call
  * @param {import("../../runtime/execution.js").Execution} execution
  * @returns {Promise<{recycles: object[], final: object}>}
  */
-export async function foldMonomer(execution, call) {
+export async function foldAf2(execution, call) {
+  const multimer = (call.graph ?? "monomer") === "multimer";
+  if (multimer && call.weights.templateEmbedding === undefined) {
+    throw new Error(
+      "foldAf2: the multimer graph needs `templateEmbedding` weights - its embedder runs"
+      + " whether or not there is a template, and skipping it leaves the pair track"
+      + " about 30% out from the first Evoformer block");
+  }
   const {
     featuresByRecycle, weights: w, paeBreaks,
     pairHost = false, contactMap = true, onRecycle, yieldTo,
@@ -197,15 +266,15 @@ export async function foldMonomer(execution, call) {
   // `() => new Promise(requestAnimationFrame)` and gets its frames back. A
   // caller in a tool passes nothing and the awaits cost one microtask each.
   if (featuresByRecycle.length === 0) {
-    throw new RangeError("foldMonomer: at least one feature set is required");
+    throw new RangeError("foldAf2: at least one feature set is required");
   }
   if (w.extraStack.length === 0 || w.mainStack.length === 0) {
-    throw new RangeError("foldMonomer: the extra and main Evoformer stacks cannot be empty");
+    throw new RangeError("foldAf2: the extra and main Evoformer stacks cannot be empty");
   }
   const {
     msaChannels, extraMsaChannels, pairChannels, templateChannels,
     structureChannels, distogramBins, positionScale,
-  } = { ...MONOMER_SHAPE, ...(call.shape ?? {}) };
+  } = { ...(multimer ? MULTIMER_SHAPE : AF2_SHAPE), ...(call.shape ?? {}) };
   const length = featuresByRecycle[0].aatype.length;
   const tolerance = validatedRecycleTolerance(call.tolerance);
   const pairs = length * length;
@@ -225,10 +294,37 @@ export async function foldMonomer(execution, call) {
   const atom37MaskValues = Float32Array.from(featuresByRecycle[0].atom37Mask);
   const atom37Mask = execution.upload(atom37MaskValues, "monomer.atom37-mask");
   const residueIndex = execution.upload(
-    Float32Array.from(featuresByRecycle[0].residueIndex), "monomer.residue-index");
+    Float32Array.from(featuresByRecycle[0].residueIndex), "af2.residue-index");
+  // 🔴 THE CHAIN IDENTITY, AND A MONOMER'S IS ALL ZEROS RATHER THAN ABSENT. One
+  // chain, one entity, one symmetry copy is what a monomer IS, so the chains
+  // kernel lights none of its eight trailing rows and reproduces the monomer
+  // lookup exactly. `makeA3mFeatures` emits the three lanes under `chainAware`.
+  const identity = multimer
+    ? execution.upload(residueIdentity({
+      length,
+      residueIndex: featuresByRecycle[0].residueIndex,
+      asymId: featuresByRecycle[0].asymId,
+      entityId: featuresByRecycle[0].entityId,
+      symId: featuresByRecycle[0].symId,
+    }), "af2.residue-identity")
+    : undefined;
 
-  // The template update is computed from the sequence alone, so it is computed
-  // ONCE and added to every pass's pair.
+  // 🔴 THE MULTIMER TEMPLATE'S FEATURES ARE CONSTANT ACROSS PASSES EVEN THOUGH
+  // ITS EMBEDDING IS NOT. The geometry and the template's aatype depend on the
+  // template alone; only the query term reads the pair. So these two are
+  // uploaded once and the embedder runs every pass over them.
+  let templateGeometry;
+  let templateAatype;
+  if (multimer) {
+    const features = multimerTemplateFeatures({
+      template: call.template, length, asymId: featuresByRecycle[0].asymId,
+    });
+    templateGeometry = execution.upload(features.geometry, "af2.mt-geometry");
+    templateAatype = execution.upload(features.aatype, "af2.mt-aatype");
+  }
+
+  // The monomer template update is computed from the sequence alone, so it is
+  // computed ONCE and added to every pass's pair.
   let templateUpdate = null;
   if (w.template !== null && w.template !== undefined) {
     const features = templateFeatures({ template: call.template, length });
@@ -251,11 +347,24 @@ export async function foldMonomer(execution, call) {
   let previousPositions = execution.allocate(length * 37 * 3, "monomer.recycle-positions");
   let previousAtom37 = new Float32Array(length * 37 * 3);
 
+  // The regime the page passes for multimer, verbatim - "it is not defaults,
+  // and dropping it once ran multimer WEIGHTS on the monomer graph".
+  /** @type {{outerProductMeanFirst?: boolean, transitionPrecision?: "f32",
+   *   msaAttentionPrecision?: "f32", triangleAttentionPrecision?: "f32"}} */
+  const multimerRegime = multimer
+    ? {
+      outerProductMeanFirst: true,
+      transitionPrecision: "f32",
+      msaAttentionPrecision: "f32",
+      triangleAttentionPrecision: "f32",
+    }
+    : {};
+
   const results = [];
   for (let recycle = 0; recycle < featuresByRecycle.length; recycle += 1) {
     const features = featuresByRecycle[recycle];
     if (features.aatype.length !== length) {
-      throw new RangeError("foldMonomer: all recycle feature lengths must match");
+      throw new RangeError("foldAf2: all recycle feature lengths must match");
     }
     const msaMask = execution.upload(
       Float32Array.from(features.msaMask), `monomer.msa-mask-${recycle}`);
@@ -278,6 +387,7 @@ export async function foldMonomer(execution, call) {
       previousPair,
       previousPositions,
       aatype, residueIndex,
+      ...(identity === undefined ? {} : { residueIdentity: identity }),
       weights: w.embedding,
       length,
       msaSequences: features.msaSequences,
@@ -292,6 +402,29 @@ export async function foldMonomer(execution, call) {
     execution.release(previousPositions);
 
     let pair = embedding.pairWithoutTemplates;
+    // 🔴 AF2-MULTIMER'S TEMPLATE EMBEDDER RUNS EVERY PASS, templates or not: it
+    // reads the pair through a LayerNorm, so it is a function of the pair rather
+    // than a constant that could be folded in once the way the monomer's is.
+    // 🔴 THE GRAPH DECIDES, NOT THE PRESENCE OF THE WEIGHTS. Reading only
+    // `w.templateEmbedding` let a monomer-graph call run the multimer embedder
+    // over geometry this function never built - which is how the tool's dither
+    // fold, which had forgotten to pass `graph`, failed with "cannot read
+    // properties of undefined". A graph is a property of the call, and a weight
+    // set that carries more than the graph needs is normal.
+    if (multimer && w.templateEmbedding !== undefined) {
+      const update = multimerTemplateEmbedding(execution, {
+        pair, geometry: templateGeometry, aatype: templateAatype, pairMask,
+        weights: w.templateEmbedding.stage, blockWeights: w.templateEmbedding.blocks,
+        length, pairChannels, templateChannels,
+        triangleHidden: w.templateEmbedding.triangleHidden,
+        pairHidden: w.templateEmbedding.pairHidden,
+        templates: call.templates ?? 1,
+      });
+      const withTemplates = add(execution, pair, update);
+      execution.release(update);
+      execution.release(pair);
+      pair = withTemplates;
+    }
     if (templateUpdate !== null) {
       const withTemplate = add(execution, pair, templateUpdate);
       execution.release(pair);
@@ -308,6 +441,7 @@ export async function foldMonomer(execution, call) {
       msaHidden: w.extraStack[0].msaTransition.firstBias.elements,
       pairHidden: w.extraStack[0].pairTransition.firstBias.elements,
       blockWeights: w.extraStack,
+      ...multimerRegime,
       onBlock: call.onBlock === undefined
         ? undefined : (block, blocks) => call.onBlock("extra", block, blocks),
     });
@@ -324,6 +458,7 @@ export async function foldMonomer(execution, call) {
       msaHidden: w.mainStack[0].msaTransition.firstBias.elements,
       pairHidden: w.mainStack[0].pairTransition.firstBias.elements,
       blockWeights: w.mainStack,
+      ...multimerRegime,
       onBlock: call.onBlock === undefined
         ? undefined : (block, blocks) => call.onBlock("main", block, blocks),
     });
@@ -405,6 +540,9 @@ export async function foldMonomer(execution, call) {
   for (const tensor of [previousMsa, previousPair, previousPositions, pairMask,
     aatype, atom37ToAtom14, atom37Mask, residueIndex]) {
     execution.release(tensor);
+  }
+  for (const tensor of [identity, templateGeometry, templateAatype]) {
+    if (tensor !== undefined) execution.release(tensor);
   }
   if (templateUpdate !== null) execution.release(templateUpdate);
   return { recycles: results, final: results[results.length - 1] };

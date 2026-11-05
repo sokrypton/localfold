@@ -6,13 +6,15 @@ backend and needs Chrome/Edge 113+ or Safari 26+ - which the page says in those 
 fold"). WebGL2 has been in Safari since 15 and in Chrome since 56, so it reaches machines and
 operating systems that the WebGPU path refuses outright.
 
-🔴 **ALPHAFOLD 2 FOLDS HERE NOW, AND NOTHING SELECTS IT YET.** A 59-residue monomer from
+🔴 **ALPHAFOLD 2 FOLDS HERE NOW - BOTH GRAPHS - AND NOTHING SELECTS IT YET.** 59 residues from
 `model-af2-monomer-int5`, 4 extra-MSA blocks and 48 Evoformer blocks, the template stack, eight
 structure iterations and both confidence heads: **consecutive alpha carbons 3.834 A, pLDDT 57.941
-against the WGSL fold's 57.938, and the worst atom 0.0705 A away** against a measured f16 floor of
-0.0554 A. `tools/gpu/fold-af2-webgl.js` is that fold and that comparison. The two things still
-missing before it could ship are the MULTIMER and the SPEED - it is 7.1 s where WebGPU is 0.42 s on
-this M5 - and neither is a correctness question.
+against the WGSL fold's 57.938, and the worst atom 0.0705 A away** against a measured floor of
+0.0785 A. The MULTIMER folds from `model-multimer` on the same driver, and agrees far more closely
+- **0.0005 A at the worst atom** - because that graph is f32 throughout.
+`tools/gpu/fold-af2-webgl.js` is both folds and both comparisons. What is still missing before this
+could ship is the SPEED: 7.1 s where WebGPU is 0.42 s on this M5, which is not a correctness
+question.
 
 This file began as the spike that answered *can WebGL2 do this work at all*: the two kernels that
 decide it, moved out of `webgpu/kernels/` where they sat with `webgl2` in their names and no
@@ -80,7 +82,8 @@ webgl/
                                 a distance - eight draws plus five projections
     structure/iteration.js      the IPA update folded in, a transition, and the frame advanced
     structure/module.js         the four stages composed, eight iterations, one hoisted pair norm
-    model/monomer.js            the fold: the stages in order, with recycling, from a real bundle
+    model/fold.js               the fold, both graphs: the stages in order, with recycling,
+                                from a real bundle
   heads/
     distogram.js                P(d < 8 A) for every pair - the contact map the page draws
     confidence.js               pLDDT, PAE and the pTM term

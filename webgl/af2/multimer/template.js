@@ -79,25 +79,17 @@ export function templateConstantTerm(weights) {
 }
 
 /**
- * The two aatype terms, gathered on the host: `[length, 64]` each, the row one
- * read at j and the column one at i.
+ * 🔴 THE TWO AATYPE TERMS ARE GATHERED IN THE SHADER HERE, WHERE THE REFERENCE
+ * GATHERS THEM ON THE HOST. `templateAatypeTerms` builds two `[length, 64]`
+ * buffers because the WGSL shader's binding list was already eight deep; a
+ * fragment shader indexes a sampler freely, so this port reads
+ * `W_aatype[clamp(aatype[j])][channel]` directly. Two fewer buffers, nothing
+ * rebuilt per pass, and the clamp is the reference's own:
+ * `min(max(aatype, 0), 21)`.
+ *
+ * It is also why there is no host helper left to drift: the one thing that could
+ * differ is the clamp, and the gate compares against the reference's gather.
  */
-export function templateAatypeTerms(weights, aatype, length) {
-  const row = new Float32Array(length * TEMPLATE_CHANNELS);
-  const column = new Float32Array(length * TEMPLATE_CHANNELS);
-  /** @type {[number, Float32Array][]} */
-  const axes = [[AATYPE_FEATURES[0], row], [AATYPE_FEATURES[1], column]];
-  for (const [index, into] of axes) {
-    const { weight } = weights.pairEmbeddings[index];
-    for (let residue = 0; residue < length; residue += 1) {
-      const code = Math.min(Math.max(aatype[residue] ?? 0, 0), AATYPE_CLASSES - 1);
-      for (let c = 0; c < TEMPLATE_CHANNELS; c += 1) {
-        into[residue * TEMPLATE_CHANNELS + c] = weight[code * TEMPLATE_CHANNELS + c];
-      }
-    }
-  }
-  return { row, column };
-}
 
 /**
  * The five scalar geometry weights as one `[5, 64]` tensor, in the order the
@@ -172,13 +164,15 @@ const int PAIR_C = ${pairChannels};
 const int CT4 = ${templateChannels / 4};
 const int STRIDE = ${GEOMETRY_STRIDE};
 const int SCALARS = ${GEOMETRY_FEATURES.length - 1};
+const int AATYPE_CLASSES = ${AATYPE_CLASSES};
 const int ELEMENTS = ${length * length * templateChannels};
 uniform sampler2D normalisedTex;
 uniform sampler2D constantTex;
 uniform sampler2D queryWeightTex;
 uniform sampler2D queryBiasTex;
-uniform sampler2D aatypeRowTex;
-uniform sampler2D aatypeColumnTex;
+uniform sampler2D aatypeTex;
+uniform sampler2D aatypeRowWeightTex;
+uniform sampler2D aatypeColumnWeightTex;
 uniform sampler2D geometryTex;
 uniform sampler2D dgramWeightTex;
 uniform sampler2D scalarWeightTex;
@@ -198,9 +192,12 @@ void main() {
       * fetch4(queryWeightTex, c * CT4 + group);
   }
 
-  // Embeddings 2 and 3: the template's aatype along j, then along i.
-  total += fetch4(aatypeRowTex, j * CT4 + group);
-  total += fetch4(aatypeColumnTex, i * CT4 + group);
+  // Embeddings 2 and 3: the template's aatype along j, then along i, each a
+  // one-hot over 22 classes and so a single weight row.
+  int rowType = int(clamp(fetch1(aatypeTex, j), 0.0, float(AATYPE_CLASSES - 1)));
+  int columnType = int(clamp(fetch1(aatypeTex, i), 0.0, float(AATYPE_CLASSES - 1)));
+  total += fetch4(aatypeRowWeightTex, rowType * CT4 + group);
+  total += fetch4(aatypeColumnWeightTex, columnType * CT4 + group);
 
   // Embedding 0, the distogram: the bin is stored PLUS ONE, so zero means no
   // bin at all - which is what a masked template and a pair closer than the
@@ -235,20 +232,24 @@ export function uploadMultimerTemplateWeights(execution, weights) {
   out.dgramWeight = execution.upload(
     weights.pairEmbeddings[GEOMETRY_FEATURES[0]].weight, "w.mt.dgramWeight");
   out.scalarWeight = execution.upload(scalarGeometryWeights(weights), "w.mt.scalarWeight");
+  out.aatypeRowWeight = execution.upload(
+    weights.pairEmbeddings[AATYPE_FEATURES[0]].weight, "w.mt.aatypeRowWeight");
+  out.aatypeColumnWeight = execution.upload(
+    weights.pairEmbeddings[AATYPE_FEATURES[1]].weight, "w.mt.aatypeColumnWeight");
   out.constant = execution.upload(templateConstantTerm(weights), "w.mt.constant");
   return out;
 }
 
 export function releaseMultimerTemplateWeights(execution, weights) {
   for (const name of [...TEMPLATE_WEIGHTS, "queryWeight", "queryBias", "dgramWeight",
-    "scalarWeight", "constant"]) {
+    "scalarWeight", "constant", "aatypeRowWeight", "aatypeColumnWeight"]) {
     execution.release(weights[name]);
   }
 }
 
 /**
  * @param {import("../../runtime/execution.js").Execution} execution
- * @param {{pair: Tensor, geometry: Tensor, aatypeRow: Tensor, aatypeColumn: Tensor,
+ * @param {{pair: Tensor, geometry: Tensor, aatype: Tensor,
  *   pairMask: Tensor, weights: any, blockWeights: any[],
  *   length: number, pairChannels: number, templateChannels: number,
  *   triangleHidden: number, pairHidden: number, templates?: number,
@@ -260,7 +261,7 @@ export function releaseMultimerTemplateWeights(execution, weights) {
  */
 export function multimerTemplateEmbedding(execution, call) {
   const {
-    pair, geometry, aatypeRow, aatypeColumn, pairMask, weights: w, blockWeights,
+    pair, geometry, aatype, pairMask, weights: w, blockWeights,
     length, pairChannels, templateChannels, triangleHidden, pairHidden,
     templates = 1, epsilon = 1e-5,
   } = call;
@@ -287,7 +288,8 @@ export function multimerTemplateEmbedding(execution, call) {
     inputs: {
       normalisedTex: normalised, constantTex: w.constant,
       queryWeightTex: w.queryWeight, queryBiasTex: w.queryBias,
-      aatypeRowTex: aatypeRow, aatypeColumnTex: aatypeColumn,
+      aatypeTex: aatype, aatypeRowWeightTex: w.aatypeRowWeight,
+      aatypeColumnWeightTex: w.aatypeColumnWeight,
       geometryTex: geometry, dgramWeightTex: w.dgramWeight,
       scalarWeightTex: w.scalarWeight,
     },

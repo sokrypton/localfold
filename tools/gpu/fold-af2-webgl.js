@@ -32,13 +32,14 @@
  * the other one.
  */
 import { AlphaFoldMonomerGpu } from "../../webgpu/af2/model/monomer.js";
+import { AlphaFoldUnifiedGpu } from "../../webgpu/af2/multimer/model.js";
 import { AlphaFoldFixture } from "../../shared/bundles/alphafold-fixture.js";
 import { HttpTensorStore } from "../../shared/bundles/http-tensor-store.js";
 import { Execution } from "../../webgl/runtime/execution.js";
 import { createWebGL2Context } from "../../webgl/index.js";
 import {
-  foldMonomer, releaseMonomerWeights, uploadMonomerWeights,
-} from "../../webgl/af2/model/monomer.js";
+  foldAf2, releaseAf2Weights, uploadAf2Weights,
+} from "../../webgl/af2/model/fold.js";
 import { makeA3mFeatures } from "../../shared/input/a3m-features.js";
 import { setDeviceTuning, setHalfPrecision } from "../../webgpu/runtime/device-profile.js";
 import { relativeRms } from "./relative-rms.js";
@@ -52,9 +53,28 @@ const option = (args, name, fallback) => {
 };
 
 export async function main(device, args) {
-  const bundle = option(args, "bundle", "/model-af2-monomer-int5").replace(/\/$/, "");
+  // 🔴 THE GRAPH DECIDES SIX THINGS AND THE BUNDLE DECIDES THE GRAPH, which is
+  // the order `fold-af2.js` had to learn: typing neither "used to run MULTIMER
+  // WEIGHTS ON THE MONOMER GRAPH, which is how the page's own bug reached a
+  // visitor". Here `--family=multimer` names both.
+  const family = option(args, "family", "monomer");
+  if (family !== "monomer" && family !== "multimer") {
+    throw new RangeError(`--family is monomer or multimer, not \`${family}\``);
+  }
+  const graph = family;
+  const defaultBundle = family === "multimer" ? "/model-multimer" : "/model-af2-monomer-int5";
+  const bundle = option(args, "bundle", defaultBundle).replace(/\/$/, "");
   const length = Number(option(args, "length", "0"));
   const sequence = length > 0 ? DEFAULT_SEQUENCE.slice(0, length) : DEFAULT_SEQUENCE;
+  // `--chains=30,29` splits the one residue axis a multimer folds over. One
+  // chain is a legal multimer and is the arm that should reproduce a monomer.
+  const chains = option(args, "chains", null) === null
+    ? [sequence.length]
+    : option(args, "chains", "").split(",").map(Number);
+  if (chains.reduce((a, b) => a + b, 0) !== sequence.length) {
+    throw new RangeError(
+      `--chains sums to ${chains.reduce((a, b) => a + b, 0)}, not ${sequence.length}`);
+  }
   const recycles = Number(option(args, "recycles", "0"));
   const seed = Number(option(args, "seed", "42"));
   const reference = !flag(args, "no-reference");
@@ -65,10 +85,19 @@ export async function main(device, args) {
   const loadStart = performance.now();
   const store = await HttpTensorStore.open(`${bundle}/manifest.json`);
   const fixture = AlphaFoldFixture.fromStore(store);
-  const [embedding, template, extraStack, mainStack, structure, confidence,
+  const multimer = graph === "multimer";
+  const [embedding, template, templateEmbedding, extraStack, mainStack, structure, confidence,
     geometry, featureTables, paeBreaks] = await Promise.all([
     fixture.embeddingWeights(),
-    fixture.templateWeights(),
+    // ...the same split web/model.js makes: the multimer's embedder runs its own
+    // nine-projection template term and has no monomer template stack at all.
+    // 🔴 UNDEFINED, NOT NULL. The unified WGSL driver tests `weights.template`
+    // for undefined and hands a null straight to `QueryOnlyTemplateGpu`, which
+    // reads `.embeddingBias` off it - so a null here is a TypeError inside the
+    // reference rather than a skipped stage. `fold-af2.js` passes undefined for
+    // the same reason, and this port treats both as absent.
+    multimer ? Promise.resolve(undefined) : fixture.templateWeights(),
+    multimer ? fixture.templateEmbeddingWeights() : Promise.resolve(undefined),
     fixture.extraStackWeights(),
     fixture.mainStackWeights(),
     fixture.structureWeights(),
@@ -82,8 +111,21 @@ export async function main(device, args) {
   // a divergence is separated from an accumulation: a fold that agrees at one
   // block and not at forty-eight is an accumulating difference, and one that
   // disagrees at the first block is a defect in the block.
+  // 🔴 `--no-template` IS THE ARM THAT PROVES THE TEMPLATE STAGE RAN AT ALL.
+  // model_3, model_4 and model_5 are AF2's template-free checkpoints, so the
+  // path is real rather than hypothetical - and a template stage that is wired
+  // to nothing issues the same draws whether or not its weights are there,
+  // which is exactly what a draw count that does not move says.
+  const noTemplate = flag(args, "no-template");
+  if (noTemplate && multimer) {
+    throw new RangeError(
+      "--no-template is a monomer arm: the multimer embedder runs whether or not there is a"
+      + " template, and dropping it leaves the pair track about 30% out");
+  }
   const weights = {
-    embedding, template,
+    embedding,
+    template: noTemplate ? null : template,
+    templateEmbedding,
     extraStack: extraBlocks > 0 ? extraStack.slice(0, extraBlocks) : extraStack,
     mainStack: mainBlocks > 0 ? mainStack.slice(0, mainBlocks) : mainStack,
     structure, lddt: confidence.lddt, pae: confidence.pae, geometry, distogramHead,
@@ -93,6 +135,9 @@ export async function main(device, args) {
   const a3m = `>query\n${sequence}\n`;
   const featureOptions = {
     recycles, randomSeed: seed, maxMsaSequences: 1, maxExtraSequences: 1,
+    // `chainAware` is what makes the featuriser emit the asym, entity and
+    // symmetry lanes the 73-row relative encoding reads.
+    ...(multimer ? { chainAware: true, chainSequences: chains } : {}),
   };
   const features = makeA3mFeatures(a3m, featureTables, featureOptions);
 
@@ -100,12 +145,12 @@ export async function main(device, args) {
   const gl = createWebGL2Context();
   const execution = new Execution(gl);
   const uploadStart = performance.now();
-  const uploaded = uploadMonomerWeights(execution, weights);
+  const uploaded = uploadAf2Weights(execution, weights, graph);
   const uploadMs = Math.round(performance.now() - uploadStart);
   const weightMegabytes = Number((execution.stats().bytes / (1 << 20)).toFixed(1));
   const foldStart = performance.now();
-  const ours = await foldMonomer(execution, {
-    featuresByRecycle: features, weights: uploaded, paeBreaks,
+  const ours = await foldAf2(execution, {
+    featuresByRecycle: features, weights: uploaded, paeBreaks, graph,
   });
   const webglMs = Math.round(performance.now() - foldStart);
   const memory = execution.stats();
@@ -121,15 +166,43 @@ export async function main(device, args) {
   // arithmetic represents. Folding twice with and without it gives the spread
   // two CORRECT implementations must be allowed, in angstroms, measured on this
   // fold rather than argued from the kernel widths.
+  //
+  // 🔴 AND THE DITHER ALONE IS NOT A FLOOR ON EVERY GRAPH, WHICH THE MULTIMER
+  // PROVED BY READING EXACTLY ZERO. That graph's attention targets and
+  // transitions are all f32, so there is no f16 rounding for a dither to sit
+  // inside and `halfDither` moves nothing - a bar of `0 * 3` then fails a fold
+  // agreeing to 0.0001 A. So the floor is the LARGER of two measurements: the
+  // dither, which prices quantisation where there is any, and one f32 step of
+  // jitter on the EMBEDDING weights, which prices f32 accumulation through the
+  // whole trunk. The embedder is where both representations come from, so a step
+  // there reaches every kernel after it - and it is a few hundred kilobytes
+  // rather than the 446 MiB a jitter of every weight would re-upload.
   let dithered;
+  let jittered;
   if (floor) {
     execution.halfDither = 1.2e-7;
-    dithered = await foldMonomer(execution, {
-      featuresByRecycle: features, weights: uploaded, paeBreaks,
+    dithered = await foldAf2(execution, {
+      featuresByRecycle: features, weights: uploaded, paeBreaks, graph,
     });
     execution.halfDither = 0;
+    const ULP = 1.2e-7;
+    let state = 20260104;
+    const next = () => {
+      state = (Math.imul(state, 1103515245) + 12345) >>> 0;
+      return state / 0x1_0000_0000;
+    };
+    const jitteredEmbedding = Object.fromEntries(
+      Object.entries(weights.embedding).map(([name, values]) => [name,
+        Float32Array.from(/** @type {Float32Array} */ (values),
+          (v) => v * (1 + ULP * (next() * 2 - 1)))]));
+    const shifted = uploadAf2Weights(
+      execution, { ...weights, embedding: jitteredEmbedding }, graph);
+    jittered = await foldAf2(execution, {
+      featuresByRecycle: features, weights: shifted, paeBreaks, graph,
+    });
+    releaseAf2Weights(execution, shifted);
   }
-  releaseMonomerWeights(execution, uploaded);
+  releaseAf2Weights(execution, uploaded);
   const liveAfter = execution.stats().live;
 
   // --- the WGSL fold of the same weights ----------------------------------
@@ -140,15 +213,30 @@ export async function main(device, args) {
     // f32 throughout, or this compares an f32 backend against an f16 one.
     setHalfPrecision(device, false);
     const referenceStart = performance.now();
-    theirs = await new AlphaFoldMonomerGpu(device).predict(
-      features, weights, paeBreaks, undefined, undefined, {});
+    theirs = await new (multimer ? AlphaFoldUnifiedGpu : AlphaFoldMonomerGpu)(device).predict(
+      features, weights, paeBreaks, undefined, undefined,
+      // The regime the page passes for multimer, verbatim.
+      multimer
+        ? {
+          outerProductMeanFirst: true, positionScale: 20,
+          chainAware: true, chainSequences: chains,
+        }
+        : {});
     webgpuMs = Math.round(performance.now() - referenceStart);
   }
 
   // --- is it a chain? -----------------------------------------------------
   const atom37 = ours.final.atom37;
+  // 🔴 THE CHAIN JUNCTIONS ARE SKIPPED, OR THE METRIC MEASURES NOTHING. Two
+  // chains are not bonded to each other, so the step across the boundary is
+  // whatever the fold placed them at and would sit in `worst` for ever looking
+  // like a broken backbone. `fold-af2.js` makes the same point.
+  const breaks = new Set();
+  let boundary = 0;
+  for (const chain of chains.slice(0, -1)) { boundary += chain; breaks.add(boundary - 1); }
   const distances = [];
   for (let residue = 0; residue + 1 < sequence.length; residue += 1) {
+    if (breaks.has(residue)) continue;
     const a = (residue * 37 + 1) * 3;
     const b = ((residue + 1) * 37 + 1) * 3;
     distances.push(Math.hypot(
@@ -176,6 +264,13 @@ export async function main(device, args) {
     worstAtomAngstroms: round(worstAtom(dithered.final.atom37, atom37), 4),
     meanPlddt: round(dithered.final.confidence.meanPlddt, 3),
   };
+  const jitterFloor = jittered === undefined ? undefined : {
+    atom37: round(relativeRms(jittered.final.atom37, atom37, "floor.jitter.atom37"), 8),
+    worstAtomAngstroms: round(worstAtom(jittered.final.atom37, atom37), 4),
+    meanPlddt: round(jittered.final.confidence.meanPlddt, 3),
+  };
+  const floorAngstroms = ditherFloor === undefined ? undefined
+    : Math.max(ditherFloor.worstAtomAngstroms, jitterFloor.worstAtomAngstroms);
   const comparison = theirs === undefined ? undefined : {
     atom37: round(relativeRms(atom37, theirs.final.structure.atom37, "atom37"), 8),
     // The number a reader of a structure cares about: how far the two backends
@@ -192,11 +287,19 @@ export async function main(device, args) {
   };
 
   return {
+    family,
     bundle,
+    chains,
     sequence: sequence.length > 24 ? `${sequence.slice(0, 24)}...(${sequence.length})` : sequence,
     length: sequence.length,
     blocks: { extra: weights.extraStack.length, main: weights.mainStack.length },
-    template: weights.template === null ? "absent from this checkpoint" : "present",
+    templateArm: noTemplate ? "dropped by --no-template" : "present",
+    template: multimer
+      ? (templateEmbedding === undefined
+        ? "MISSING: the multimer graph needs a template embedder"
+        : `the multimer embedder, ${templateEmbedding.stack.length} pair blocks, every pass`)
+      : (weights.template === null || weights.template === undefined
+        ? "absent from this checkpoint" : "the monomer stack, hoisted out of the loop"),
     distogramHead: distogramHead === null ? "absent from this bundle" : "present",
     recycles, passesRun: ours.recycles.length, seed,
     milliseconds: { weightLoad: loadMs, weightUpload: uploadMs, webgl: webglMs, webgpu: webgpuMs },
@@ -205,8 +308,10 @@ export async function main(device, args) {
     caca: { median: round(median, 3), worst: round(worst, 2), ok: chainOk },
     comparison,
     ditherFloor,
-    atFloor: ditherFloor === undefined || comparison === undefined ? undefined
-      : comparison.worstAtomAngstroms <= ditherFloor.worstAtomAngstroms * 3,
+    jitterFloor,
+    floorAngstroms,
+    atFloor: floorAngstroms === undefined || comparison === undefined ? undefined
+      : comparison.worstAtomAngstroms <= floorAngstroms * 3,
     memory: {
       draws: memory.draws,
       programs: memory.programs,
@@ -220,18 +325,18 @@ export async function main(device, args) {
       : liveAfter !== 0
         ? `FAILED: ${liveAfter} tensors left live after the fold`
         : theirs === undefined
-          ? `ok: AlphaFold 2 folds in WebGL2 - ${sequence.length} residues, `
+          ? `ok: AlphaFold 2 ${family} folds in WebGL2 - ${sequence.length} residues, `
             + `consecutive CA ${median.toFixed(3)} A (no WGSL arm asked for)`
-          : ditherFloor === undefined
-            ? `ok: AlphaFold 2 folds in WebGL2 - ${sequence.length} residues, consecutive CA `
+          : floorAngstroms === undefined
+            ? `ok: AlphaFold 2 ${family} folds in WebGL2 - ${sequence.length} residues, consecutive CA `
               + `${median.toFixed(3)} A, worst atom ${comparison.worstAtomAngstroms} A from `
               + "the WGSL fold of the same weights (no floor measured)"
-            : comparison.worstAtomAngstroms <= ditherFloor.worstAtomAngstroms * 3
-              ? `ok: AlphaFold 2 folds in WebGL2 - ${sequence.length} residues, consecutive CA `
+            : comparison.worstAtomAngstroms <= floorAngstroms * 3
+              ? `ok: AlphaFold 2 ${family} folds in WebGL2 - ${sequence.length} residues, consecutive CA `
                 + `${median.toFixed(3)} A, worst atom ${comparison.worstAtomAngstroms} A from the `
-                + `WGSL fold against an f16 floor of ${ditherFloor.worstAtomAngstroms} A`
+                + `WGSL fold against a measured floor of ${round(floorAngstroms, 4)} A`
               : `FAILED: the two backends put an atom ${comparison.worstAtomAngstroms} A apart `
-                + `where one f32 step inside this fold's f16 roundings moves it `
-                + `${ditherFloor.worstAtomAngstroms} A - more than quantisation explains`,
+                + `where one f32 step through this fold moves it ${round(floorAngstroms, 4)} A `
+                + "- more than rounding explains",
   };
 }
