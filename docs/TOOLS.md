@@ -11,14 +11,15 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-482 tools. `tools/fixtures/` is data and is not listed.
+484 tools. `tools/fixtures/` is data and is not listed.
 
-## `tools/gpu/` - the WebGPU lane (237)
+## `tools/gpu/` - the WebGPU lane (239)
 
 Each exports `async function main(device, args)` and is run as
 `node tools/gpu-chrome.mjs tools/gpu/<module>.js [--flags]`.
 
 - **`af2-synthetic-block.js`** - Synthetic AF2 Evoformer weights, in the structure both backends read.
+- **`af2-synthetic-structure.js`** - Synthetic AF2 structure-module weights and geometry tables, in the structure both backends read.
 - **`bench-ab.js`** - Interleaved A/B for the AF3 pairformer, in one process.
 - **`bench-af2-warm.js`** - One AF2 trunk pass, COLD AND WARM, at the shape another port is measured on.
 - **`bench-attention-project.js`** - AF2's q/k/v/gate projection alone, at several register blocks, in one process.
@@ -155,6 +156,7 @@ Each exports `async function main(device, args)` and is run as
 - **`check-webgl-sidechain.js`** - The sidechain torsion head against the WGSL one.
 - **`check-webgl-structure-initialize.js`** - The structure module's starting point, against the WGSL one.
 - **`check-webgl-structure-iteration.js`** - One structure-module iteration against the WGSL one - and the frame update is the point of it.
+- **`check-webgl-structure-module.js`** - AF2's whole structure module in WebGL2 against the WGSL one.
 - **`check-webgl-template.js`** - AF2-monomer's template stack in WebGL2 against the WGSL one.
 - **`check-webgl-transition.js`** - The transition in WebGL2 against the WGSL one and a CPU reference.
 - **`check-webgl-triangle.js`** - Triangle multiplication in WebGL2 against the CPU reference AND against the WGSL kernel, in one page - the first whole AlphaFold operation in this backend.

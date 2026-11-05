@@ -70,6 +70,7 @@ webgl/
     structure/ipa.js            invariant point attention: the one attention whose logits are
                                 a distance - eight draws plus five projections
     structure/iteration.js      the IPA update folded in, a transition, and the frame advanced
+    structure/module.js         the four stages composed, eight iterations, one hoisted pair norm
   heads/
     distogram.js                P(d < 8 A) for every pair - the contact map the page draws
     confidence.js               pLDDT, PAE and the pTM term
@@ -306,6 +307,29 @@ sits at **7.98e-6 against a measured floor of 7.9e-6**. That the floor is f16 at
 rather than assumed: `--tri-att-f32` lifts this port's rounding in the triangle attentions and the
 arm gets eighty times WORSE, 6.8e-6 to 5.4e-4, so the WGSL template block stores its attentions in
 f16 exactly as the main block does. `--tri-f32` moves nothing, which is the control.
+
+**The structure module composes** - all six outputs against `StructureModuleGpu` at their measured
+floors (coordinates 3.3e-7, representation 3.0e-7, frames 1.6e-7, angles 4-6e-7), which is the
+first arm that covers the structure side's three seams. None of the five per-stage gates can see
+them, because each hands its stage an input it built itself: the pair LayerNorm is HOISTED out of
+the eight iterations, the sidechain head reads the FIRST representation and the eighth rather than
+the eighth twice, and each iteration's attention reads the frames the previous one wrote. Handing
+the sidechain head the current activations twice measures **relRMS 0.50 to 0.77** on four arms
+while the representation and the frames stay green at 3e-7 - which is why there are six arms and
+not one.
+
+🔴 **AND THE AFFINE UPDATE'S WEIGHT HAS TO BE SMALL FOR THE GATE TO MEAN ANYTHING.** At the usual
+`1/sqrt(channels)` scale the update winds the frames around several times over eight iterations,
+and the comparison then measures how two implementations diverge along a chaotic trajectory rather
+than whether they compute the same thing. `--affine-scale=` is the handle; the checkpoint's own
+weight is small for the same reason.
+
+🔴 **AND ITS FIRST CONTROL WAS VACUOUS FOR A REASON THIS FILE ALREADY RECORDS.** `v * 1.01 + 0.01`
+over the whole pair reported "0 of 6 arms noticed": the pair's ONLY path into this module is
+`normalisePair`, and a whole-row affine change is invisible to a LayerNorm - the scale cancels in
+the variance and the shift cancels in the mean. Half of each row's channels is not affine over the
+row and all six arms go red. **A control has to be checked against the FIRST operation its tensor
+meets**, which is now the second time in this campaign that cost a run.
 
 Still to come in AF2: the multimer variant, and reading a weight bundle. After
 that: AF3's pairformer and diffusion, ESMFold2, bioemu2.
