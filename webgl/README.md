@@ -825,7 +825,7 @@ Every fold is the same job, the same seed and the same settings either side; `--
 
 | fold | before | after | |
 |---|---:|---:|---:|
-| bioemu2, 6MRR 68 tokens, 4 passes, 20 steps | 968 s | **25.7 s** | **37.7x** |
+| bioemu2, 6MRR 68 tokens, 4 passes, 20 steps | 968 s | **23.8 s** | **40.7x** |
 | ...its trunk | 277.7 s | **21.6 s** | 12.8x |
 | ...its 20 denoiser calls | 658 s | **23.3 s** | 28.2x |
 | ESMFold2, 75 residues, 36-block tower, 3 loops, 15 steps | 253 s | **65.0 s** | **3.9x** |
@@ -1646,15 +1646,31 @@ Measured on the fold, three arms interleaved, two rounds:
 | | fold | rmsd | CA-CA | contacts |
 |---|---:|---:|---:|---:|
 | neither | 30.40 / 30.46 s | 1.595 | 3.8540767531771998 | 201 |
-| the tile order | 28.11 / 28.13 s | 1.595 | 3.8540767531771998 | 201 |
-| **and x in float16** | **25.70 / 25.69 s** | **1.595** | 3.853090267294919 | **201** |
+| the tile order (at its first width rule) | 28.11 / 28.13 s | 1.595 | 3.8540767531771998 | 201 |
+| and x in float16 | 25.70 / 25.69 s | 1.595 | 3.853090267294919 | 201 |
+| **and the tile width swept** | **23.80 / 23.87 s** | **1.595** | 3.853090267294919 | **201** |
 
-**1.18x in all**, bit-identical through the tile order and **0.00099 A of CA-CA** at the float16 step,
-with rmsd and the contact count unmoved. ESMFold2 is **1.029x** (9420 ms against 9693) at pLDDT
-57.573 against 57.579 and pTM 0.4146 against 0.4147. AlphaFold 3 (2367 against 2377 ms, pLDDT 66.525
-and pTM 0.242 both ways) and AlphaFold 2 (57.938 / 57.937 / 57.941 both ways) are unchanged to the
-digit, because neither reaches `padStride` - this pass runs only where a row width does NOT divide the
-texture width, so a shape already aligned gets no narrowing and no rounding.
+**1.275x in all** and 416 MiB down to 411, bit-identical through the tile order and **0.00099 A of
+CA-CA** at the float16 step, with rmsd and the contact count unmoved on every arm. ESMFold2 is
+**1.037x** (9397 ms against 9747) at pLDDT 57.573 against 57.579 and pTM 0.4146 against 0.4147.
+AlphaFold 3 (2384 against 2372 ms, pLDDT 66.525 and pTM 0.242 both ways) and AlphaFold 2 are
+unchanged to the digit - AF2 to the point that **its worst-atom differential against the WGSL fold is
+0.0353 / 0.0308 / 0.0285 A on both arms**, which is the sharpest statement available that the
+precision change does not reach it. Neither model's shapes meet `padStride`, which runs only where a
+row width does NOT divide the texture width, so a shape already aligned gets no narrowing and no
+rounding.
+
+🔴 **AND THE TILE WIDTH IS 4, MEASURED ON THE FOLD, WHERE THE FIRST RULE DERIVED 2.** The planes pad
+to `W / TILEW` output groups, so a narrower tile is better locality and worse memory, and the first
+rule took the NARROWEST inside a 2.5x padding budget - 2 for a wide output, 8 or 16 for a narrow one.
+Swept, two rounds each, every arm bit-identical: **width 4 is 24132/24119 ms**, that rule
+25650/25628, width 8 26769/26808, width 16 27256/26902, and forcing 2 everywhere **26641/27180** -
+slower than the rule that chose it, because forcing it pads a narrow output eightfold. Uniform 4 is
+also the LEANER arm, 411 MiB against 416: the budget rule spent its padding on the big planes to save
+it on small ones, which is backwards. **And the resolver preferring 4 beats forcing 4** -
+23803/23873 against 24150/24151 - because 4 is illegal where `W / 4` is fewer groups than the shape
+has (ESMFold2's 3072 outputs, bioemu2's `68x768x3072`) and it falls to 2 there instead of not tiling
+at all. So the order is 4, then 2, then wider, subject to legality and a `TILE_PADDING_CAP` of 8.
 
 🔴 **IT IS THE SECOND OPTIMISATION HERE THAT IS NOT BIT-IDENTICAL, AND IT IS A DEFAULT OF THE FOLD
 DRIVERS AND NOT OF `Execution`** - exactly as `halfWeights` is, and for the same reason: the stage
@@ -1696,6 +1712,7 @@ largest in-major labels in a bioemu2 fold come out on the **one-texel** side:
 | **bioemu2**, 20-step 6MRR-68 | 33.0 s | **30.4 s** | **1.08x** |
 | ...and again, on the tile-aware fragment order below | 30.4 s | **28.1 s** | **1.08x** |
 | ...and on x in float16 beside it | 28.1 s | **25.7 s** | **1.09x** |
+| ...and on the tile width, swept on the fold | 25.7 s | **23.8 s** | **1.08x** |
 | bioemu2's trunk | 13.4 s | **10.7 s** | **1.26x** |
 | **ESMFold2**, full configuration | 11.2 s | **9.53 s** | **1.17x** |
 | AlphaFold 3 | 2.36 s | 2.35 s | 1.00x |

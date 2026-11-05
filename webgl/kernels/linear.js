@@ -282,6 +282,16 @@ export const blockRowsFor = (execution) =>
 export const ROW_FASTEST_X_FLOATS = 1 << 20;
 
 /**
+ * The most the tile-aware projection may pad its planes, as a factor.
+ *
+ * The mapping gives a texel ROW every output group, so a shape with few of them
+ * pads hard: eight is `OUT4` of 64, which is 512 outputs, and the planes of
+ * such a shape are small. Below that the padding grows as `512 / OUT4` and the
+ * order is declined rather than paid for.
+ */
+export const TILE_PADDING_CAP = 8;
+
+/**
  * Whether the row block is worth its repack, measured by
  * tools/gpu/bench-webgl-linear.js at the shapes four models fold at.
  *
@@ -664,27 +674,41 @@ export function linear(execution, call, into) {
     // every shape whose input width does not - see webgl/runtime/pad-stride.js.
     // One pass over x against sixty milliseconds of cache misses; measured, the
     // WEIGHT does not want this (0.94x) and only x does.
-    // 🔴 THE TILE-AWARE FRAGMENT ORDER, AND ITS WIDTH IS A MEMORY DECISION AS
-    // MUCH AS A LOCALITY ONE. The mapping gives a texel ROW every output group,
-    // so the planes are padded to `W / TILEW` groups where only `OUT4` are
-    // real: at bioemu2's 1792 outputs TILEW 2 pads 2.29x and is what
-    // probe-webgl-linear-operand.js measures at **1.74-1.87x** over the shipped
-    // 1D order, but the same TILEW at AF2's 256 outputs would pad SIXTEENFOLD -
-    // 4.7 MiB of planes to 75.8 - which is not a trade this backend should make
-    // silently. So the width is the NARROWEST that stays inside a 2.5x padding
-    // budget, which prefers the measured 2 and widens for a narrow output
-    // rather than declining to tile at all.
+    // 🔴 THE TILE-AWARE FRAGMENT ORDER. The mapping gives a texel ROW every
+    // output group, so a TILEW-wide run of texels covers TILEW consecutive row
+    // blocks at ONE output group where the 1D order gave a rasterisation tile
+    // every row block there is - 918 KiB of x under one tile at bioemu2's
+    // 576x896x1792. The same mapping, and the same reason, as
+    // blockedContractSource.
+    //
+    // 🔴 AND THE WIDTH IS 4, MEASURED ON THE FOLD AND NOT DERIVED. The planes
+    // are padded to `W / TILEW` output groups where only `OUT4` are real, so a
+    // narrower tile is better locality and worse memory, and the first rule
+    // here took the NARROWEST inside a 2.5x padding budget - which picks 2 for
+    // a wide output and 8 or 16 for a narrow one. Swept on the fold, two rounds
+    // each, every arm bit-identical: **4 is 24132/24119 ms**, the old rule
+    // 25650/25628, 8 is 26769/26808 and 16 is 27256/26902. Uniform 4 is also
+    // the LEANER arm - 411 MiB against 416 - because the budget rule spent its
+    // padding on the big planes (2.29x at 1792 outputs) to save it on small
+    // ones, which is backwards. `--linear-tile-width=` is the sweep.
+    //
+    // So the preference order is 4, then 2, then wider, subject to two things:
+    // LEGALITY, since `W / TILEW` must be at least `OUT4` or two output groups
+    // alias onto one texel (ESMFold2's 3072 outputs admit only 2), and a
+    // padding CAP, since a shape with very few output groups would otherwise
+    // pad its planes a hundredfold.
     //
     // 🔴 AND ONLY WHERE `rowFastest` ALREADY APPLIES, because that is the order
-    // the 1.87x is measured AGAINST. Pointed at the group-fastest float paths
-    // it would be an unmeasured change to the arm that cost AF2 3.7x.
+    // the gain is measured AGAINST. Pointed at the group-fastest float paths it
+    // would be an unmeasured change to the arm that cost AF2 3.7x.
     const out4 = Math.ceil(outChannels / 4);
     const tilePadding = (width) => Math.floor(TEXTURE_WIDTH / width) / out4;
+    const legal = (width) => Math.floor(TEXTURE_WIDTH / width) >= out4;
     const wanted = Number(execution.linearTileWidth) || 0;
     const tileWidth = (!execution.noLinearTile && rowFastest)
       ? (wanted > 0
-        ? (tilePadding(wanted) >= 1 ? wanted : 0)
-        : ([2, 4, 8, 16, 32].find((w) => tilePadding(w) >= 1 && tilePadding(w) <= 2.5) ?? 0))
+        ? (legal(wanted) ? wanted : 0)
+        : ([4, 2, 8, 16, 32].find((w) => legal(w) && tilePadding(w) <= TILE_PADDING_CAP) ?? 0))
       : 0;
     const tileHeight = tileWidth > 0 ? Math.ceil(rowQuads / tileWidth) : 0;
     const padX = !execution.noStridePad && !strideDividesWidth(inChannels / 4);
