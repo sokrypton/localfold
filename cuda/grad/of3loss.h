@@ -29,6 +29,9 @@
 namespace of3 {
 
 constexpr double EPS = 1e-8;
+// a count OpenFold3 sums in float32 (`torch.sum(mask, dtype=torch.float32) + eps`): there the eps is below the
+// count's precision and vanishes - the bond loss over one bonded pair shows it at 1e-8
+inline double den32(double count) { return (double)((float)count + 1e-8f); }
 
 struct Layout {
   int n = 0, dense = 0;
@@ -182,9 +185,9 @@ inline Diffusion diffusionLoss(const Layout& L, const std::vector<double>& x, co
     }
     for (auto [l, mm] : pairs) {
       const double dp = dist(x, l, mm), dg = dist(xt, l, mm), e = dp - dg;
-      D.bond += e * e / (pairs.size() + EPS);
+      D.bond += e * e / den32((double)pairs.size());
       if (dx) for (int p = 0; p < 3; ++p) {
-        const double g = scale * wt * W.bond * 2 * e / (pairs.size() + EPS) * (x[l * 3 + p] - x[mm * 3 + p]) / dp;
+        const double g = scale * wt * W.bond * 2 * e / den32((double)pairs.size()) * (x[l * 3 + p] - x[mm * 3 + p]) / dp;
         (*dx)[l * 3 + p] += g; (*dx)[mm * 3 + p] -= g;
       }
     }
@@ -265,9 +268,9 @@ template <class R> inline double distogramLoss(const Layout& L, const std::vecto
     if (!ok[i] || !ok[j]) continue;
     double d2 = 0; for (int p = 0; p < 3; ++p) { double e = xt[ri[i] * 3 + p] - xt[ri[j] * 3 + p]; d2 += e * e; }
     const size_t ij = (size_t)i * L.n + j;
-    sum += crossEntropy(logits + ij * K, K, nearestBin(std::sqrt(d2), 2, 22, K), scale / (cnt + EPS), g ? g + ij * K : nullptr);
+    sum += crossEntropy(logits + ij * K, K, nearestBin(std::sqrt(d2), 2, 22, K), scale / den32(cnt), g ? g + ij * K : nullptr);
   }
-  return sum / (cnt + EPS);
+  return sum / den32(cnt);
 }
 
 // pLDDT: logits [atoms * K] (dense slots, K 50)
@@ -288,10 +291,10 @@ template <class R> inline double plddtLoss(const Layout& L, const std::vector<do
       const double d = std::fabs(dg - dist(x, l, mm));
       acc += 0.25 * ((d < 0.5) + (d < 1) + (d < 2) + (d < 4)); cnt += 1;
     }
-    const double lddt = acc / (cnt + EPS);
-    sum += crossEntropy(logits + l * K, K, nearestBin(lddt, 0, 1, K), scale / (live.size() + EPS), g ? g + l * K : nullptr);
+    const double lddt = acc / den32(cnt);
+    sum += crossEntropy(logits + l * K, K, nearestBin(lddt, 0, 1, K), scale / den32((double)live.size()), g ? g + l * K : nullptr);
   }
-  return sum / (live.size() + EPS);
+  return sum / den32((double)live.size());
 }
 
 // PDE: logits [n * n * K]; the prediction's representatives under every existing atom
@@ -304,9 +307,9 @@ template <class R> inline double pdeLoss(const Layout& L, const std::vector<doub
     if (!ok[i] || !ok[j]) continue;
     const double e = std::fabs(dist(x, ri[i], ri[j]) - dist(xt, ri[i], ri[j]));
     const size_t ij = (size_t)i * L.n + j;
-    sum += crossEntropy(logits + ij * K, K, nearestBin(e, 0, 32, K), scale / (cnt + EPS), g ? g + ij * K : nullptr);
+    sum += crossEntropy(logits + ij * K, K, nearestBin(e, 0, 32, K), scale / den32(cnt), g ? g + ij * K : nullptr);
   }
-  return sum / (cnt + EPS);
+  return sum / den32(cnt);
 }
 
 // a structure's token frames (get_token_frame_atoms): (a, b, c) slots and validity
@@ -386,8 +389,8 @@ template <class R> inline double resolvedLoss(const Layout& L, const std::vector
   double sum = 0, cnt = 0;
   for (size_t i = 0; i < L.atoms(); ++i) cnt += L.exists[i];
   for (size_t i = 0; i < L.atoms(); ++i)
-    if (L.exists[i]) sum += crossEntropy(logits + i * 2, 2, gm[i] > 0, scale / (cnt + EPS), g ? g + i * 2 : nullptr);
-  return sum / (cnt + EPS);
+    if (L.exists[i]) sum += crossEntropy(logits + i * 2, 2, gm[i] > 0, scale / den32(cnt), g ? g + i * 2 : nullptr);
+  return sum / den32(cnt);
 }
 
 }  // namespace of3

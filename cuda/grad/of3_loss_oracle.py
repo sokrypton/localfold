@@ -85,7 +85,7 @@ def bond_loss(x):
     bm = token_bonds * (is_polymer[None, :] * is_ligand[:, None])
     bm = bm[torch.tensor(token_of)][:, torch.tensor(token_of)]
     mask = (bm * (gm[:, None] * gm[None])).bool()
-    return torch.sum((dx - dg) ** 2 * mask) / (torch.sum(mask) + EPS)
+    return torch.sum((dx - dg) ** 2 * mask) / (torch.sum(mask, dtype=torch.float32) + EPS)
 
 
 def smooth_lddt_loss(x):
@@ -181,7 +181,7 @@ def distogram(lg):
     rx, ok = representative(xgt, gm)
     d = torch.sqrt(torch.sum((rx[:, None] - rx[None]) ** 2, -1))
     pm = (ok[:, None] * ok[None]).bool()
-    return torch.sum(ce(lg, binned(d, 2, 22, 64)) * pm) / (torch.sum(pm) + EPS)
+    return torch.sum(ce(lg, binned(d, 2, 22, 64)) * pm) / (torch.sum(pm, dtype=torch.float32) + EPS)
 
 
 def plddt(x, lg):
@@ -195,8 +195,8 @@ def plddt(x, lg):
         if std_nuc[t] and has_c1p[t]: rep[start[t] + off_c1p[t]] = 1
     rep = rep * gm
     pm = (pm * (gm[:, None] * rep[None]) * (1 - torch.eye(A))).bool()
-    lddt = torch.sum(0.25 * ((d < 0.5).int() + (d < 1).int() + (d < 2).int() + (d < 4).int()) * pm, -1) / (torch.sum(pm, -1) + EPS)
-    return torch.sum(ce(lg, binned(lddt, 0, 1, 50)) * gm) / (torch.sum(gm) + EPS)
+    lddt = torch.sum(0.25 * ((d < 0.5).int() + (d < 1).int() + (d < 2).int() + (d < 4).int()) * pm, -1) / (torch.sum(pm, -1, dtype=torch.float32) + EPS)
+    return torch.sum(ce(lg, binned(lddt, 0, 1, 50)) * gm) / (torch.sum(gm, dtype=torch.float32) + EPS)
 
 
 def pde(x, lg):
@@ -205,7 +205,7 @@ def pde(x, lg):
     d = torch.sqrt(EPS + torch.sum((rx[:, None] - rx[None]) ** 2, -1))
     dg = torch.sqrt(EPS + torch.sum((rg[:, None] - rg[None]) ** 2, -1))
     pm = (okg[:, None] * okg[None]).bool()
-    return torch.sum(ce(lg, binned(torch.abs(d - dg), 0, 32, 64)) * pm) / (torch.sum(pm) + EPS)
+    return torch.sum(ce(lg, binned(torch.abs(d - dg), 0, 32, 64)) * pm) / (torch.sum(pm, dtype=torch.float32) + EPS)
 
 
 def pae(x, lg):
@@ -220,7 +220,7 @@ def pae(x, lg):
 
 def resolved(lg):
     y = torch.nn.functional.one_hot(gm.long(), 2).double()
-    return torch.sum(ce(lg, y)) / (A + EPS)
+    return torch.sum(ce(lg, y)) / (torch.tensor(float(A), dtype=torch.float32) + EPS)
 
 
 # ---- evaluate, with autograd, against the C++ side

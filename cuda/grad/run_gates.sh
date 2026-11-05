@@ -143,6 +143,11 @@ for fb in "model-af3-full-f32 af3" "model-boltz2-f32 boltz2" "model-protenix2-f3
     mkdir -p $ks/case && run cuda/grad/test-of3loss --input=$ks/input --out=$ks/case
     if [ -x "$HOME/venv_ef2/bin/python" ]; then run "$HOME/venv_ef2/bin/python" cuda/grad/of3_loss_oracle.py $ks/case
     else echo "== of3_loss_oracle.py: no torch at ~/venv_ef2 here"; fi
+    # ...and against OpenFold3 itself: its loss functions imported from a checkout and called (~/beta/of3-src, run in
+    # ~/venv_protenix, which has torch, gemmi and biotite)
+    if [ -d "$HOME/beta/of3-src/openfold3" ] && [ -x "$HOME/venv_protenix/bin/python" ]; then
+      run env PYTHONPATH=$HOME/beta/of3-src "$HOME/venv_protenix/bin/python" -W ignore cuda/grad/of3_loss_reference.py $ks/case
+    else echo "== of3_loss_reference.py: no OpenFold3 checkout (~/beta/of3-src) or ~/venv_protenix here"; fi
     ex=cuda/grad/data/of3-6mrr
     mkdir -p $ex
     awk '/^ATOM/ && substr($0,22,1)=="A" && (substr($0,17,1)==" " || substr($0,17,1)=="A") {
