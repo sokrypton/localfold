@@ -487,18 +487,21 @@ inline BlockSave blockForwardT(Block& b, const real* msa, const real* pair, cons
   resAdd(msa1, msa, upd, mr * Cm);
   s.msa1 = keep(msa1);
   // MSA column attention, on the transposed MSA [L, S, C]
-  T* colX = st(mr * Cm);
-  swap01(msa1, colX, S, L, Cm);
+  // (BF16: no transposed copy - the column LayerNorm reads msa1's rows in [L, S] order itself, its saved copy in that
+  // order; float keeps the copy, the backward's x)
+  const bool tr = BF16;
+  T* colX = msa1;
+  if (!tr) { colX = st(mr * Cm); swap01(msa1, colX, S, L, Cm); }
   s.colX = keep(colX);
   s.colMask = ARENA.get(mr);
   transpose(msaMask, s.colMask, S, L);
   s.colXn = b.extra ? ARENA.get(mr * Cm) : tmp(mr * Cm);   // (the global attention keeps a pointer to it)
   real* updT = ARENA.get(mr * Cm);
   if (!b.extra) {
-    s.colQ = lnForward(b.col.qn, colX, s.colXn, mr);
+    s.colQ = lnForward(b.col.qn, colX, s.colXn, mr, tr ? S : 0);
     s.colA = attnForward(b.col.at, s.colXn, s.colMask, nullptr, updT, L, S);
   } else {
-    s.colQ = lnForward(b.colg.qn, colX, s.colXn, mr);
+    s.colQ = lnForward(b.colg.qn, colX, s.colXn, mr, tr ? S : 0);
     s.colG = gaForward(b.colg.at, s.colXn, s.colMask, updT, L, S);
   }
   T* msa2 = st(mr * Cm);
@@ -533,12 +536,12 @@ inline BlockSave blockForwardT(Block& b, const real* msa, const real* pair, cons
   dropout(b, DROP_TRI_START, pu, L, L, Cz, false);
   T* pair4 = st(pr * Cz); resAdd(pair4, pair3, pu, pr * Cz);
   // ending node: on the transposed pair, with the transposed mask
-  T* enX = st(pr * Cz);
-  swap01(pair4, enX, L, L, Cz);
+  T* enX = pair4;   // (BF16: read transposed by the LayerNorm, as colX)
+  if (!tr) { enX = st(pr * Cz); swap01(pair4, enX, L, L, Cz); }
   s.pairMaskT = ARENA.get(pr);
   transpose(pairMask, s.pairMaskT, L, L);
   s.enXn = tmp(pr * Cz);
-  s.enQ = lnForward(b.triEnd.qn, enX, s.enXn, pr);
+  s.enQ = lnForward(b.triEnd.qn, enX, s.enXn, pr, tr ? L : 0);
   s.enNb = ARENA.get(pr * 4);
   pairBias(s.enXn, b.triEnd.feat2d.w, s.enNb, L, Cz, 4);
   s.enA = attnForward(b.triEnd.at, s.enXn, s.pairMaskT, s.enNb, pu, L, L);

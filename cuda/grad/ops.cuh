@@ -41,11 +41,13 @@ template <class Y, class XC = Y, class X = real>   // (Y: real, or bf where a mo
                                                    // real, or bf - a block's bf16 residual chain)
 __global__ void lnFwdK(const X* __restrict__ x, const real* __restrict__ g, const real* __restrict__ b,
                        Y* __restrict__ y, real* __restrict__ mean, real* __restrict__ rstd, size_t rows, int C,
-                       real eps, XC* __restrict__ xc = nullptr) {
+                       real eps, XC* __restrict__ xc = nullptr, int inner = 0) {
+  // (inner: row r is read from x's row (r % inner) (rows / inner) + r / inner - the [A, B] -> [B, A] transpose a caller
+  // would otherwise make of x in a pass of its own; y and xc in r's order)
   size_t r = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
   int lane = threadIdx.x & 31;
   if (r >= rows) return;
-  const X* xr = x + r * C;
+  const X* xr = x + (inner ? (r % inner) * (rows / inner) + r / inner : r) * C;
   real s = 0;
   for (int c = lane; c < C; c += 32) s += ldr(xr + c);
   for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
@@ -90,16 +92,19 @@ __global__ void lnBwdK(const real* __restrict__ x, const real* __restrict__ dy, 
 
 struct LnSave { const real* x; real* mean; real* rstd; const void* xb = nullptr; };   // (xb: x - mean in bf16, the
                                                                                      // backward's, x then null)
-inline LnSave lnForward(const LayerNorm& ln, const real* x, real* y, size_t rows) {
+// inner: x read transposed ([inner, rows / inner] rows as [rows / inner, inner]; BF16 with saveBf only - the backward
+// then reads the centred copy, never x)
+inline LnSave lnForward(const LayerNorm& ln, const real* x, real* y, size_t rows, int inner = 0) {
   LnSave s{x, ARENA.get(rows), ARENA.get(rows)};
 #ifndef GRAD_F64
   if (BF16 && ln.saveBf) {
     bf* xb = reinterpret_cast<bf*>(ARENA.get((rows * ln.C + 1) / 2));
-    lnFwdK<real, bf><<<blocks(rows, 8), 256, 0, STREAM>>>(x, ln.g.w, ln.b.w, y, s.mean, s.rstd, rows, ln.C, ln.eps, xb);
+    lnFwdK<real, bf><<<blocks(rows, 8), 256, 0, STREAM>>>(x, ln.g.w, ln.b.w, y, s.mean, s.rstd, rows, ln.C, ln.eps, xb, inner);
     s.xb = xb; s.x = nullptr;
     return s;
   }
 #endif
+  if (inner) { fprintf(stderr, "lnForward: a transposed read needs BF16 and saveBf\n"); exit(1); }
   lnFwdK<<<blocks(rows, 8), 256, 0, STREAM>>>(x, ln.g.w, ln.b.w, y, s.mean, s.rstd, rows, ln.C, ln.eps);
   return s;
 }
@@ -126,10 +131,10 @@ inline LnSave lnForward(const LayerNorm& ln, const bf* x, bf* y, size_t rows, bo
   s.xb = xb;
   return s;
 }
-inline LnSave lnForward(const LayerNorm& ln, const bf* x, real* y, size_t rows) {
+inline LnSave lnForward(const LayerNorm& ln, const bf* x, real* y, size_t rows, int inner = 0) {
   LnSave s{nullptr, ARENA.get(rows), ARENA.get(rows)};
   bf* xb = bfGet(rows * ln.C);
-  lnFwdK<real, bf, bf><<<blocks(rows, 8), 256, 0, STREAM>>>(x, ln.g.w, ln.b.w, y, s.mean, s.rstd, rows, ln.C, ln.eps, xb);
+  lnFwdK<real, bf, bf><<<blocks(rows, 8), 256, 0, STREAM>>>(x, ln.g.w, ln.b.w, y, s.mean, s.rstd, rows, ln.C, ln.eps, xb, inner);
   s.xb = xb;
   return s;
 }

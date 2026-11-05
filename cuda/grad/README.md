@@ -165,8 +165,7 @@ One block trained at the training crops, A100, random weights; the PyTorch bars 
 (AF3's float32 and TF32 columns are from before the bf16 work; eager PyTorch is 59.6 / 35.7 there on AF2 and
 81.2 / 51.3 on AF3.) A stack's AF2 backward keeps its running gradients bf16 from block to block, so the bf16 column
 is `blockBackwardRun`'s; `blockBackward`, converting a float cotangent in and float gradients out, is 0.1-0.2 ms
-more. The AF2 forward in bf16 is 6.4 ms against compile's 7.2 (12.8 against 16.4 at L 384; 6.1 with the opt-in bf16
-residual states); one block's activations are 1.6 GiB at L 256 (compile: 1.9) and 12 GiB for AF3 at n 768 (compile: 16.6).
+more. The AF2 forward in bf16 is 6.0 ms against compile's 7.2 (12.8 against 16.4 at L 384, before the fused projection); one block's activations are 1.6 GiB at L 256 (compile: 1.9) and 12 GiB for AF3 at n 768 (compile: 16.6).
 
 **A whole stack trained** (`bench-af2-block --bf16 --stack --graph`: AF2's 48 blocks at L 256, rematerialised,
 forward then backward; bindcraft2's stack-level tricks, `af2::Stack`):
@@ -177,8 +176,9 @@ forward then backward; bindcraft2's stack-level tricks, `af2::Stack`):
 | ...each block's replay and backward one CUDA graph (`graphs`, on a capturable stream) | 318 | 657 | 975 ms |
 | ...and **keep tiers** (17 of 48 blocks kept, their backward with no replay) | 318 | 549 | 867 ms |
 | ...out-of-place residual links, bf16 LayerNorm-input saves, the trimul's smaller save (20 kept) | 306 | 510 | 816 ms |
-| ...and the **graded keep** (19 whole blocks kept, the other 28 keep their attentions' outputs) | 306 | 495 | **801 ms** |
-| ...and the opt-in **bf16 residual states** (`Block::bf16Res`) | 294 | 488 | 782 ms |
+| ...and the **graded keep** (19 whole blocks kept, the other 28 keep their attentions' outputs) | 306 | 495 | 801 ms |
+| ...the triangle multiplication's projection fused with its prep; the LayerNorms read their transposes | 289 | 485 | **774 ms** |
+| ...and the opt-in **bf16 residual states** (`Block::bf16Res`) | 280 | 479 | 759 ms |
 
 - **Keep tiers**: the forward keeps the last blocks' whole saves - the first the backward reaches - in the stack's own
   arena, as many as the free memory holds past one block's working set (measured on block 0; `keepBytes` sets it).
@@ -199,6 +199,12 @@ forward then backward; bindcraft2's stack-level tricks, `af2::Stack`):
   The triangle multiplication keeps its two sigmoids and ab = pj g (dgate_pre = dab ab (1 - g), no division) rather
   than the 640-wide pre-activation, and its centre only through its LayerNorm: 20 kept. Not taken: bindcraft2's
   uint8 sigmoids - with weight gradients a small gate's rounding reaches dW of the projection.
+- **The triangle multiplication's projection fused with its prep** (bindcraft2's `projGateK`; `triProjK`): xn W on
+  mma.sync, its epilogue writing ab channel-major (staged through shared memory) and the two sigmoids from the
+  accumulators, so the 640-wide pre-activation never reaches memory - bit-identical to cuBLASLt + the two prep passes,
+  377 -> 252 us at L 256 (a 128-row tile, halving the weight's re-reads, was slower: 287). And the column and
+  ending-node LayerNorms read their rows transposed (`lnForward`'s `inner`) instead of a transposed copy being made for
+  them: the AF2 forward 6.35 -> 6.02 ms, AF3's pairformer 8.5 -> 7.9.
 - **The bf16 residual states** (`Block::bf16Res`, off by default): inside a block the states between the links in bf16
   (each added in float and rounded once; the block's input and output stay float), as a pure-bf16 PyTorch block
   holds them. The forward 6.36 -> 6.11 ms; against float32 the outputs move (pair out 1.3e-4 -> 2.9e-3) and the

@@ -286,6 +286,122 @@ __global__ void gateSigCopyBfK(const bf* __restrict__ x, int ldx, bf* __restrict
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;   // y[r, c] = sigmoid(x[r, c])
   if (t < rows * C) y[(t / C) * ldy + t % C] = __float2bfloat16(1.f / (1.f + __expf(-bfv(x[(t / C) * ldx + t % C]))));
 }
+// THE PROJECTION AND ITS PREP IN ONE KERNEL (bindcraft2's projGateK): xn W (+ bias) on mma.sync, the epilogue writing ab
+// (channel-major, staged through shared memory) and the two sigmoids gs straight from the accumulators - the 640-wide
+// pre-activation never reaches memory. Bit-identical to ltLinear + triPrepBfK + gateSigCopyBfK (the same bf16
+// roundings at the same places); 377 -> 252 us at L 256. (A 128-row tile, halving the weight's re-reads, was slower.)
+
+__device__ __forceinline__ void tpLd4(uint32_t* r, const uint16_t* p) {
+  const unsigned a = (unsigned)__cvta_generic_to_shared(p);
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];" : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+}
+__device__ __forceinline__ void tpLdT2(uint32_t& b0, uint32_t& b1, const uint16_t* s, int k, int n, int ld) {
+  const unsigned a = (unsigned)__cvta_generic_to_shared(s + (k + (threadIdx.x & 15)) * ld + n);
+  asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];" : "=r"(b0), "=r"(b1) : "r"(a));
+}
+__device__ __forceinline__ float tpBfr(float x) { return __bfloat162float(__float2bfloat16(x)); }
+__device__ __forceinline__ float tpSig(float x) { return 1.f / (1.f + __expf(-x)); }
+// a CTA 64 rows of xn (K = KC whole in shared memory); chunks of 64 W columns double-buffered by cp.async: first the
+// I2 / 32 pair chunks (proj columns 32 q .. 32 q + 31 beside gate columns I2 + 32 q ..), then the C / 64 output-gate
+// chunks. 8 warps, 4 (16 rows each) x 2 (halves of the chunk's columns, so a thread holds proj and gate of one
+// (row, channel)).
+template <int KC, int BM>
+__global__ void __launch_bounds__(256) triProjK(const bf* __restrict__ xn, const bf* __restrict__ W, const bf* __restrict__ bias,
+                                               const real* __restrict__ mask, bf* __restrict__ ab, bf* __restrict__ gs,
+                                               size_t rows, int I2, int C, bool inter) {
+  constexpr int BN = 64, LA = KC + 8, LB2 = BN + 8, WN = BM == 64 ? 2 : 1, NT = 8 / WN, HALF = NT / 2;
+  extern __shared__ __align__(16) uint16_t tsm[];
+  uint16_t* As = tsm;                       // [BM][LA]
+  uint16_t* Bs = As + BM * LA;              // [2][KC][LB2]
+  uint16_t* Ts = Bs + 2 * KC * LB2;         // [32 channels][BM + 8]: ab staged for its channel-major write
+  const int P = 2 * I2 + C, GS = I2 + C, nPair = I2 / 32, nch = nPair + C / BN;
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+  const int wm = WN == 2 ? warp >> 1 : warp, wn = WN == 2 ? warp & 1 : 0;
+  const size_t r0 = (size_t)blockIdx.x * BM;
+  const uint16_t* X = reinterpret_cast<const uint16_t*>(xn);
+  const uint16_t* Wp = reinterpret_cast<const uint16_t*>(W);
+  for (int i = threadIdx.x; i < BM * KC / 8; i += 256) {
+    const int r = i / (KC / 8), c = (i % (KC / 8)) * 8;
+    flash::cp16(As + r * LA + c, X + (r0 + r < rows ? r0 + r : rows - 1) * KC + c, true);
+  }
+  auto loadB = [&](int st, int ch) {
+    for (int i = threadIdx.x; i < KC * BN / 8; i += 256) {
+      const int k = i / (BN / 8), c = (i % (BN / 8)) * 8;
+      const int col = ch < nPair ? (c < 32 ? 32 * ch + c : I2 + 32 * ch + c - 32) : 2 * I2 + (ch - nPair) * BN + c;
+      flash::cp16(Bs + st * KC * LB2 + k * LB2 + c, Wp + (size_t)k * P + col, true);
+    }
+  };
+  loadB(0, 0);
+  flash::cpCommit();
+  float mk[2];
+  for (int h = 0; h < 2; ++h) {
+    const size_t r = r0 + wm * 16 + g + h * 8;
+    mk[h] = mask && r < rows ? mask[r] : 1.f;
+  }
+  for (int ch = 0; ch < nch; ++ch) {
+    const int st = ch & 1;
+    if (ch + 1 < nch) loadB(st ^ 1, ch + 1);
+    flash::cpCommit();
+    flash::cpWait1();
+    __syncthreads();
+    const uint16_t* B = Bs + st * KC * LB2;
+    const bool pair = ch < nPair;
+    float acc[NT][4];
+#pragma unroll
+    for (int j = 0; j < NT; ++j) acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0.f;
+    // n-tile j's column in the chunk: pair: 16 wn + 8 j (proj, j < 2), 32 + 16 wn + 8 (j - 2) (gate); else 32 wn + 8 j
+    auto ncol = [&](int j) { return pair ? (j < HALF ? 8 * HALF * wn + 8 * j : 32 + 8 * HALF * wn + 8 * (j - HALF)) : (BN / WN) * wn + 8 * j; };
+#pragma unroll
+    for (int k = 0; k < KC; k += 16) {
+      uint32_t af[4];
+      tpLd4(af, As + (wm * 16 + (lane & 7) + ((lane >> 3) & 1) * 8) * LA + k + (lane >> 4) * 8);
+#pragma unroll
+      for (int j = 0; j < NT; ++j) {
+        uint32_t b0, b1;
+        tpLdT2(b0, b1, B, k, ncol(j), LB2);
+        flash::mma16(acc[j], af, b0, b1);
+      }
+    }
+    if (pair) {
+#pragma unroll
+      for (int j = 0; j < HALF; ++j)
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+          const int h = e >> 1, cl = 8 * HALF * wn + 8 * j + 2 * t + (e & 1);   // (the chunk's channel, 0..31)
+          const int c = 32 * ch + cl;
+          const int row = wm * 16 + g + h * 8;
+          const float pre = tpBfr(acc[j][e] + (bias ? __bfloat162float(bias[c]) : 0.f));
+          const float sgb = tpBfr(tpSig(tpBfr(acc[j + HALF][e] + (bias ? __bfloat162float(bias[I2 + c]) : 0.f))));
+          const float abv = pre * mk[h] * sgb;
+          const size_t r = r0 + row;
+          if (r < rows) gs[r * GS + c] = __float2bfloat16(sgb);
+          reinterpret_cast<bf*>(Ts)[cl * (BM + 8) + row] = __float2bfloat16(abv);
+        }
+      __syncthreads();
+      for (int i = threadIdx.x; i < 32 * BM; i += 256) {   // a channel's 64 rows contiguous
+        const int cl = i / BM, row = i % BM;
+        const size_t r = r0 + row;
+        if (r < rows) ab[(size_t)planeOf(32 * ch + cl, I2, inter) * rows + r] = reinterpret_cast<const bf*>(Ts)[cl * (BM + 8) + row];
+      }
+    } else {
+#pragma unroll
+      for (int j = 0; j < NT; ++j)
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+          const size_t r = r0 + wm * 16 + g + h * 8;
+          const int n = (ch - nPair) * BN + (BN / WN) * wn + 8 * j + 2 * t;
+          if (r >= rows) continue;
+          float v[2];
+          for (int q = 0; q < 2; ++q)
+            v[q] = tpBfr(tpSig(tpBfr(acc[j][2 * h + q] + (bias ? __bfloat162float(bias[2 * I2 + n + q]) : 0.f))));
+          *reinterpret_cast<__nv_bfloat162*>(gs + r * GS + I2 + n) = __floats2bfloat162_rn(v[0], v[1]);
+        }
+    }
+    __syncthreads();
+  }
+}
+template <int KC, int BM>
+inline size_t triProjSmem() { return 2 * (BM * (KC + 8) + 2 * KC * (64 + 8) + 32 * (BM + 8)); }
 __global__ void gateOutLdBfK(real* y, const bf* a, const bf* g, size_t rows, int C, int P) {   // y = a g[r * P + c]
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t < rows * C) y[t] = bfv(a[t]) * bfv(g[(t / C) * P + t % C]);
@@ -301,17 +417,25 @@ inline TriMulSave triMulForwardBf(const TriMul& m, const X* pair, const real* ma
   const Linear* roles[3] = {&m.proj, &m.gate, &m.gating};
   bf* bias;
   bf* W = packLinears(roles, 3, &bias);
-  bf* pre;   // (a temporary: the backward keeps the two sigmoids, gs [rows][I2 + C], and ab)
-  GK(cudaMallocAsync(&pre, rows * P * sizeof(bf), STREAM));
-  if (bias) ltLinear(xn, W, false, bias, false, pre, (int)rows, m.C, P, 0.f);
-  else mmBf(xn, W, pre, (int)rows, m.C, P);
   const int GS = I2 + m.C;
   bf* gs = bfGet(rows * GS);
   bf* ab = bfGet(rows * I2);                                      // channel-major a then b
-  dim3 b(32, 8), g((unsigned)((rows + 31) / 32), (I2 + 31) / 32);
-  triPrepBfK<<<g, b, 0, STREAM>>>(pre, mask, ab, rows, I2, P, m.interleaved, m.masked, gs, GS);
-  gateSigCopyBfK<<<blocks(rows * m.C), 256, 0, STREAM>>>(pre + 2 * I2, P, gs + I2, GS, rows, m.C);
-  GK(cudaFreeAsync(pre, STREAM));
+  dim3 b(32, 8);
+  if (m.C == 128 && I2 % 32 == 0) {   // (the fused projection: triProjK)
+    static bool attr = false;
+    if (!attr) { GK(cudaFuncSetAttribute(triProjK<128, 64>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)triProjSmem<128, 64>())); attr = true; }
+    triProjK<128, 64><<<(unsigned)((rows + 63) / 64), 256, triProjSmem<128, 64>(), STREAM>>>(xn, W, bias,
+        m.masked ? mask : nullptr, ab, gs, rows, I2, m.C, m.interleaved);
+  } else {
+    bf* pre;   // (a temporary: the backward keeps the two sigmoids, gs [rows][I2 + C], and ab)
+    GK(cudaMallocAsync(&pre, rows * P * sizeof(bf), STREAM));
+    if (bias) ltLinear(xn, W, false, bias, false, pre, (int)rows, m.C, P, 0.f);
+    else mmBf(xn, W, pre, (int)rows, m.C, P);
+    dim3 g((unsigned)((rows + 31) / 32), (I2 + 31) / 32);
+    triPrepBfK<<<g, b, 0, STREAM>>>(pre, mask, ab, rows, I2, P, m.interleaved, m.masked, gs, GS);
+    gateSigCopyBfK<<<blocks(rows * m.C), 256, 0, STREAM>>>(pre + 2 * I2, P, gs + I2, GS, rows, m.C);
+    GK(cudaFreeAsync(pre, STREAM));
+  }
   // (the centre is a temporary: its LayerNorm saves it centred in bf16 - nothing else in the backward reads it)
   real* center;
   GK(cudaMallocAsync(&center, rows * m.I * sizeof(real), STREAM));
