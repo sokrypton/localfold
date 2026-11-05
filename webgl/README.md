@@ -1907,6 +1907,57 @@ ms against the split kernel's 301.01 - while at L=128 (4.19M) it is rightly decl
 it.** Reproduced on the committed bench, so it is not from this work; it is at a length the current
 folds do not reach, and it wants a rule over the shape rather than the size.
 
+### The host side is not the lever, and a framebuffer cache that never hit
+
+With the kernels taken as far as the measured arms allow, the remaining named family was everything
+that is NOT drawing. `--skip-draws` puts it at **5925 ms of a 22434 ms fold** - 26% - and `--host`
+splits what happens inside `dispatch`:
+
+| | ms | per dispatch |
+|---|---:|---:|
+| `drawMs` | 14947 | 275 us |
+| **`bindMs`** | **4398** | **81 us** |
+| `readMs`, 24 reads | 2148 | 89 ms a read |
+| `programMs` | 266 | 5 us |
+
+🔴 **AND `bindMs` SPLIT THREE WAYS SAYS IT IS ALL ONE CALL**: of 4398 ms, `#bindTargets` is **4334**
+and the input and uniform loops together are **64**. The split is in the tool because guessing which
+part it was had already cost three wrong hypotheses in this session.
+
+🔴 **THE FRAMEBUFFER CACHE NEVER HIT - 0 HITS AND 54,381 MISSES**, which is every dispatch in the
+fold. Its key is the texture OBJECTS, and `Storage` only pools textures under `--pool`, so every
+allocation is a fresh texture, a fresh key and a fresh framebuffer: a `createFramebuffer`, its
+attachments, a `drawBuffers`, a `checkFramebufferStatus` and a `deleteFramebuffer` at the 256 cap,
+per draw. Raising the cap to 4096 changes nothing, because the misses are not evictions. **A cache
+whose key can never repeat is pure overhead wearing a cache's name.**
+
+Reusing **one framebuffer per target COUNT** and re-attaching takes `#bindTargets` from **4285 ms to
+92** - 47x - bit-identical, with the completeness query kept but asked once per count and rectangle
+rather than once per draw. The keyed cache stays for the case it was built for, a fold under `--pool`.
+
+🔴 **AND IT IS NOT A SPEEDUP, WHICH IS THE POINT.** The fold is **22411/22441 ms with it against
+22459/22470 without**. Four seconds of host time vanished and the wall did not move, because that
+time was OVERLAPPED with the GPU - the host runs ahead and blocks in `drawArrays` when the queue is
+full, which is why `drawMs` is 275 us a dispatch. **So `bindMs` being 19.5% of the wall never meant
+it was ON the wall**, and the inference from "19.5% of the fold is in binding" to "there is 19.5% to
+win" was mine and was wrong. It is kept because it removes 54,381 create/delete pairs and would
+matter on a slower CPU, not because it folds faster. `--no-framebuffer-reuse` is the arm.
+
+🔴 **AND CACHING THE REST OF THE GL STATE IS WORTH NOTHING AND BREAKS THE FOLD.** `useProgram` and
+the VAO cached is **1.004x** (22355 ms against 22434), which the split above predicts, since those
+calls are inside the 64 ms. Caching the texture UNITS fails outright with `GL error 0x502` - a
+feedback loop, because a cached binding lets a texture linger on a unit that a later dispatch makes a
+render target, and clearing the conflict in `#bindTargets` does not save it: `bioemu2.slice:68x768`
+still refuses. Reverted, and with it the hypothesis that 54,381 dispatches of redundant state were
+costing anything.
+
+🔴 **AND `--pool` FAILS FOR A REAL REASON WORTH RECORDING: `bioemu2.m0:1x68: GL error 0x502`.** A
+pooled texture is handed out for a new tensor while a kernel still names it as an input, so the draw
+reads and writes one texture. That is a use-after-release in the caller, which is exactly what this
+tree's own note says pooling is the arm for - "whether a kernel reads texels nothing wrote" - and it
+is why pooling is on the measured-loss list. Not fixed here; it is a defect in a caller, not in the
+allocator, and it is the thing standing between this backend and a framebuffer cache that hits.
+
 ### The threshold that chose between two projection kernels was fitted with the wrong dtype
 
 🔴 **`bench-webgl-linear.js` UPLOADED ITS WEIGHTS WITH `upload`, AND EVERY FOLD USES

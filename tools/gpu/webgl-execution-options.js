@@ -74,6 +74,25 @@
  *                         to 0.0904** - reproducible to the digit over two
  *                         rounds, and past the 0.0355 A dither floor, so a real
  *                         loss of agreement. Either flag overrides the driver.
+ *   --no-framebuffer-reuse
+ *                         Build a framebuffer per dispatch, as this backend
+ *                         used to. Its keyed cache never hit - **0 hits and
+ *                         54,381 misses** in a bioemu2 fold, because the key is
+ *                         the texture OBJECTS and nothing pools them by default
+ *                         - so every draw paid a createFramebuffer, its
+ *                         attachments, a `drawBuffers`, a
+ *                         `checkFramebufferStatus` and a deleteFramebuffer at
+ *                         the cap. Reusing one framebuffer per target COUNT
+ *                         takes `#bindTargets` from **4218 ms to 101**, 42x,
+ *                         bit-identical.
+ *
+ *                         🔴 AND IT IS NOT A SPEEDUP: the fold is 22441 ms
+ *                         against 22414. That host time was OVERLAPPED with the
+ *                         GPU, which `--skip-draws` says is 16.5 s of the 22.4 -
+ *                         so `bindMs` being 19.5% of the wall never meant it was
+ *                         ON the wall. Kept because it removes 54,381
+ *                         create/delete pairs and would matter on a slower CPU,
+ *                         not because it folds faster.
  *   --nan-watch           Fill every fresh texture with NaN and read every
  *                         output back, refusing at the first non-finite value.
  *                         Names the kernel that reads a texel nothing wrote -
@@ -208,6 +227,7 @@ export function webglExecutionOptions(args, defaults = {}) {
     noContractPad: flag(args, "no-contract-pad"),
     noContractTile: flag(args, "no-contract-tile"),
     noLinearAspect: flag(args, "no-linear-aspect"),
+    noFramebufferReuse: flag(args, "no-framebuffer-reuse"),
     noLinearTile: flag(args, "no-linear-tile"),
     linearTileWidth: Number(option(args, "linear-tile-width", "0")),
     linearBlockRows: Number(option(args, "block-rows", "0")),

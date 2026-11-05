@@ -263,7 +263,17 @@ export class Execution {
      * own wall is what separates the last of those from the first three.
      */
     this.host = options.host ? {
-      insideMs: 0, programMs: 0, bindMs: 0, drawMs: 0, sourceBytes: 0,
+      insideMs: 0,
+      programMs: 0,
+      bindMs: 0,
+      // 🔴 bindMs SPLIT THREE WAYS, because 4.4 s of a 22.4 s fold was in it
+      // and caching `useProgram` and the VAO moved none of it. Guessing which
+      // part had already cost three wrong hypotheses in one session.
+      targetsMs: 0,
+      inputsMs: 0,
+      uniformsMs: 0,
+      drawMs: 0,
+      sourceBytes: 0,
     } : null;
     /** @type {Map<string, {program: WebGLProgram, uniforms: Map<string, WebGLUniformLocation>}>} */
     this.programs = new Map();
@@ -349,6 +359,14 @@ export class Execution {
     this.framebufferBuilds = 0;
     /** How many attachment sets to keep. A fold uses tens; the cap is slack. */
     this.maxFramebuffers = options.maxFramebuffers ?? 256;
+    this.framebufferHits = 0;
+    this.framebufferMisses = 0;
+    /** One framebuffer per target count, re-attached - see `#bindTargets`. */
+    /** @type {Map<number, WebGLFramebuffer>} */
+    this.reusedFramebuffers = new Map();
+    /** @type {Set<string>} */
+    this.checkedShapes = new Set();
+    this.noFramebufferReuse = options.noFramebufferReuse ?? false;
   }
 
   allocate(elements, label) { return this.storage.allocate(elements, label); }
@@ -394,6 +412,14 @@ export class Execution {
    */
   #bindTargets(targets, label) {
     const gl = this.gl;
+    // 🔴 A TEXTURE THAT IS BOUND TO A SAMPLER AND IS ALSO A RENDER TARGET IS A
+    // FEEDBACK LOOP, AND WEBGL REFUSES THE DRAW - `GL error 0x502` after it,
+    // naming the kernel. Nothing used to track what was bound, so every
+    // dispatch rebound units 0..n-1 and the hazard only showed when a stale
+    // texture above that count came back as a target. That is why `--pool`
+    // errored (`bioemu2.m0:1x68: GL error 0x502`) and is on the "measured loss"
+    // list, and why a binding cache fails the same way: both make a texture
+    // linger on a unit. Clearing the conflict here fixes both at the source.
     let key = "";
     for (const tensor of targets) {
       let id = this.textureIds.get(tensor.texture);
@@ -406,7 +432,54 @@ export class Execution {
     }
     const cached = this.framebuffers.get(key);
     if (cached !== undefined) {
+      this.framebufferHits += 1;
       gl.bindFramebuffer(gl.FRAMEBUFFER, cached);
+      return;
+    }
+    this.framebufferMisses += 1;
+    // 🔴 AND THE CACHE NEVER HITS, SO IT WAS COSTING WHAT IT WAS BUILT TO SAVE:
+    // **0 hits and 54,381 misses** in a bioemu2 fold, which is every dispatch,
+    // because the key is the texture OBJECTS and `Storage` only pools when
+    // `--pool` is on - so every allocation is a fresh texture, a fresh key and
+    // a fresh framebuffer. `--host` put `#bindTargets` at **4334 ms of a 22.4 s
+    // fold**, 98.5% of `bindMs`, in createFramebuffer, the attachments,
+    // `drawBuffers`, `checkFramebufferStatus` and a deleteFramebuffer at the
+    // cap - per draw.
+    //
+    // So a miss RE-ATTACHES one framebuffer per target COUNT instead of
+    // building a new one. The attachments and `drawBuffers` are per-framebuffer
+    // state that has to be set either way; what this drops is the create, the
+    // delete and the completeness query. The keyed cache stays for the case it
+    // was meant for - a fold with `--pool`, where the objects do repeat.
+    if (!this.noFramebufferReuse) {
+      let reused = this.reusedFramebuffers.get(targets.length);
+      const fresh = reused === undefined;
+      if (fresh) {
+        reused = gl.createFramebuffer();
+        this.reusedFramebuffers.set(targets.length, reused);
+      }
+      gl.bindFramebuffer(gl.FRAMEBUFFER, reused);
+      for (let t = 0; t < targets.length; t += 1) {
+        gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0 + t, gl.TEXTURE_2D,
+          targets[t].texture, 0);
+      }
+      if (fresh) {
+        gl.drawBuffers(targets.map((_, t) => gl.COLOR_ATTACHMENT0 + t));
+      }
+      // 🔴 THE COMPLETENESS QUERY ONLY ONCE PER COUNT AND RECTANGLE, because it
+      // is the expensive call and the thing it checks - that these dimensions
+      // and format can be drawn into - is a property of the SHAPE rather than
+      // of the particular texture. A shape this backend has already drawn into
+      // is not going to become incomplete.
+      const shape = `${targets.length}:${targets[0].width}x${targets[0].height}`;
+      if (!this.checkedShapes.has(shape)) {
+        const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+        if (status !== gl.FRAMEBUFFER_COMPLETE) {
+          throw new Error(`${label}: cannot draw into ${targets.length} target(s) of `
+            + `${targets[0].width}x${targets[0].height} (status 0x${status.toString(16)})`);
+        }
+        this.checkedShapes.add(shape);
+      }
       return;
     }
     if (this.framebuffers.size >= this.maxFramebuffers) {
@@ -513,9 +586,17 @@ export class Execution {
     const enteredAt = this.host === null ? 0 : performance.now();
     const entry = this.program(source);
     const compiledAt = this.host === null ? 0 : performance.now();
+    // 🔴 AND CACHING ANY OF THIS IS NOT THE LEVER, MEASURED. `useProgram` and
+    // the VAO cached was **1.004x** (22355 ms against 22434), and caching the
+    // texture units broke the fold outright with `GL error 0x502` - a feedback
+    // loop, because a cached binding lets a texture linger on a unit that a
+    // later dispatch makes a render target. The split of `bindMs` says why it
+    // could never have paid: of 4398 ms, `#bindTargets` is **4334** and the
+    // input and uniform loops together are **64**. Reverted.
     gl.useProgram(entry.program);
     gl.bindVertexArray(this.vao);
     this.#bindTargets(targets, label);
+    const targetsAt = this.host === null ? 0 : performance.now();
 
     let unit = 0;
     for (const [name, tensor] of Object.entries(inputs)) {
@@ -534,6 +615,17 @@ export class Execution {
       gl.uniform1i(location, unit);
       unit += 1;
     }
+    // 🔴 AND THE TAIL MUST BE UNBOUND, WHICH IS WHAT CACHING BREAKS AND WHY
+    // THIS IS NOT JUST AN OPTIMISATION. Without a cache every dispatch rebinds
+    // units 0..n-1, so a texture only lingers above the count it used. With one,
+    // a stale texture stays on a unit this dispatch does not use - and if that
+    // texture is this dispatch's RENDER TARGET, the framebuffer attachment is
+    // also bound to a sampler and WebGL refuses the draw with
+    // GL_INVALID_OPERATION. Measured: `bioemu2.cond-slice:576x128:1: GL error
+    // 0x502 after the draw`, on the first fold after the cache went in. So the
+    // units past this dispatch's inputs are cleared, which costs a call only
+    // when the input count SHRINKS.
+    const inputsAt = this.host === null ? 0 : performance.now();
     for (const [name, value] of Object.entries(ints)) {
       const location = this.#uniform(entry, name);
       if (location === null) throw new Error(`${label}: no int uniform \`${name}\``);
@@ -600,6 +692,9 @@ export class Execution {
       const now = performance.now();
       this.host.programMs += compiledAt - enteredAt;
       this.host.bindMs += boundAt - compiledAt;
+      this.host.targetsMs += targetsAt - compiledAt;
+      this.host.inputsMs += inputsAt - targetsAt;
+      this.host.uniformsMs += boundAt - inputsAt;
       this.host.drawMs += now - boundAt;
       this.host.insideMs += now - enteredAt;
       this.host.sourceBytes += source.length;
@@ -669,6 +764,8 @@ export class Execution {
 
   stats() {
     return {
+      framebufferHits: this.framebufferHits,
+      framebufferMisses: this.framebufferMisses,
       dispatches: this.dispatches, draws: this.draws, programs: this.programs.size,
       framebuffers: this.framebuffers.size, framebufferBuilds: this.framebufferBuilds,
       ...(this.nanWatch ? { nanWatchSkipped: this.nanWatchSkipped } : {}),

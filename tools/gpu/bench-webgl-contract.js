@@ -95,7 +95,9 @@ import {
   splitContractSource,
 } from "../../webgl/af3/trunk/triangle.js";
 
-import { Execution, PRELUDE, targetDeclarations } from "../../webgl/runtime/execution.js";
+import {
+  Execution, ONE_TARGET, PRELUDE, targetDeclarations,
+} from "../../webgl/runtime/execution.js";
 import { createWebGL2Context } from "../../webgl/index.js";
 import { relativeRms } from "./relative-rms.js";
 
@@ -187,6 +189,57 @@ ${Array.from({ length: 8 }, (_, p) => {
 }`;
 };
 
+/**
+ * The wide block's planes back into `[pair][channel group]`.
+ *
+ * Output texel `pair * C4 + cgroup` wants channels `cgroup * 4 + 0..3` of pair
+ * (i, j). In the wide layout a fragment is one (block, channel) and its 32
+ * values are (i, j) quads, so (i, j) picks ONE plane and one component of it,
+ * and the four channels are four source texels of that plane.
+ */
+const wideRepackSource = (length, channels, paddedLength, tileWidth) => `${PRELUDE}${ONE_TARGET}
+const int L = ${length};
+const int C4 = ${channels / 4};
+const int JBLOCKS = ${paddedLength / 8};
+const int TILEW = ${tileWidth};
+const int ELEMENTS = ${length * length * channels};
+${Array.from({ length: 8 }, (_, p) => `uniform sampler2D plane${p};`).join("\n")}
+
+float pick(vec4 v, int c) {
+  return c == 0 ? v.x : c == 1 ? v.y : c == 2 ? v.z : v.w;
+}
+
+void main() {
+  int texel = linearTexel();
+  if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
+  int cgroup = texel % C4;
+  int pair = texel / C4;
+  int i = pair / L;
+  int j = pair - i * L;
+  int block = (i / 4) * JBLOCKS + (j / 8);
+  // Not named flat: that is a GLSL interpolation qualifier and a reserved
+  // word. (And no backticks in here - this is a JS template literal.)
+  int slot = (i % 4) * 8 + (j % 8);
+  int plane = slot / 4;
+  int component = slot - plane * 4;
+  int lane = block % TILEW;
+  int y = block / TILEW;
+  vec4 out4 = vec4(0.0);
+  for (int c = 0; c < 4; ++c) {
+    int source = y * W + (cgroup * 4 + c) * TILEW + lane;
+    vec4 v =
+${Array.from({ length: 7 }, (_, p) =>
+    `      plane == ${p} ? fetch4(plane${p}, source) :`).join("\n")}
+      fetch4(plane7, source);
+    float picked = pick(v, component);
+    if (c == 0) out4.x = picked;
+    else if (c == 1) out4.y = picked;
+    else if (c == 2) out4.z = picked;
+    else out4.w = picked;
+  }
+  result = out4;
+}`;
+
 function contract(execution,
   { a, b, length, channels, blocked, channelSlowest, tileMapped,
     residentOperands = false, wideBlock = false }, output) {
@@ -228,6 +281,24 @@ function contract(execution,
       outputs: widePlanes,
       inputs: { aTex: a, bTex: b },
       label: `bench.contract-wide:${length}x${channels}`,
+    });
+    // 🔴 AND ITS REPACK, BECAUSE THE SHIPPED ARM PAYS FOR ONE AND THE FIRST
+    // VERSION OF THIS ARM DID NOT. `tiledMs` is a block dispatch PLUS
+    // `contractRepackSource`, so timing the wide block alone against it
+    // overstated the shape by whatever the repack costs - the straw-baseline
+    // mistake a third time, caught here rather than in a committed number.
+    //
+    // 🔴 AND THE WIDE LAYOUT MAKES THAT REPACK FOUR TIMES THE FETCHES. An
+    // output texel is four CHANNELS of one pair, and a wide fragment holds one
+    // channel of thirty-two pairs - so the four channels come from four
+    // different fragments, in the same plane, and the gather is four `fetch4`
+    // and four component picks where the shipped repack does one `fetch4`. That
+    // is the shape's real cost and it is why the arm is timed with it.
+    execution.dispatch({
+      source: wideRepackSource(length, channels, length, wideTile),
+      output,
+      inputs: Object.fromEntries(widePlanes.map((plane, p) => [`plane${p}`, plane])),
+      label: `bench.contract-wide-repack:${length}x${channels}`,
     });
     for (const plane of widePlanes) execution.release(plane);
     return;
