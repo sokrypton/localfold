@@ -455,8 +455,7 @@ static int foldMain(int argc, char** argv) {
   t.drawSeed = seedList[0];
   // (its atom encoder's scratch given back at once where the pair is large - nothing reads it once target_feat is
   // built, and held into the template stack it was 3.4 GB of a simulated rank of 4's out-of-memory at 10,868 tokens)
-  if (tightPair((size_t)tokens * tokens, (int)M.meta("trunk.embedder.pairChannels")))
-    releaseScratch({ "targetFeat.encoder.", "enc.", "apl." });
+  releaseScratch({ "targetFeat.encoder.", "enc.", "apl." });
   if (mg::WORLD > 1) {
     // several GPUs (LOCALFOLD_GPUS, multigpu.cuh): the trunk pair in a buffer every rank can read, the pair updates'
     // work split between them; the rest of the fold on rank 0
@@ -718,17 +717,16 @@ static int foldMain(int argc, char** argv) {
       // (a large input's trunk scratch given back BEFORE the expansion, not after: its structural pair - ~2 tokens a
       // residue - takes two f32 [pairs, C] buffers of its own, 6.8 GB each at 1080 residues, which beside the trunk's
       // ordinary-path scratch ran out of a 40 GB card)
-      if (tightPair(pairs, t.C)) releaseScratch();
+      releaseScratch();
       st = expandStructural(t.single, t.pair, t.targetFeat, t.n, fast);
       swapBatch();
       dS = st.single; dP = st.pair; dTf = st.targetFeat; dSeq = st.seqMask; nD = st.n;
     }
     int dense = (int)M.meta("batch.dense");
     std::vector<float> mask(M.f("batch.predDenseAtomMask"), M.f("batch.predDenseAtomMask") + (size_t)nD * dense);
-    // a large input gives each phase the whole card: a pair over 128 MB, 512 tokens at 128 channels
-    // (at 1 GB, 1044 tokens peaked at 21.3 GB with the trunk's 8 GB of scratch held to the end)
-    bool tight = tightPair(pairs, t.C);
-    if (tight) releaseScratch();
+    // each phase gets the whole card: the trunk's scratch given back before the diffusion (held to the end, 1044 tokens
+    // peaked at 21.3 GB with the trunk's 8 GB of it)
+    releaseScratch();
     // on a card short of room the trunk's pair waits in host memory from here to the confidence head: the
     // streamed preparation reads it a chunk of rows at a time and the sampler not at all
     // (only where the preparation streams: the f16 path, and an encoder that takes the pair's projection)
@@ -764,7 +762,7 @@ static int foldMain(int argc, char** argv) {
     // ...and the encoder's per-token-pair projection and its pair MLP's temporaries, which only its preparation
     // reads (folded into the atom pairs' conditioning): held through every step they were 8.8 GB of the
     // sampler's peak at 10761 tokens (branch tier2-host-pair)
-    if (tight) releaseScratch({ "dt.pn", "dt.flat", "enc.tpln", "enc.tp", "enc.h1", "enc.h2" });
+    releaseScratch({ "dt.pn", "dt.flat", "enc.tpln", "enc.tp", "enc.h1", "enc.h2" });
     // ...and on a card short of room the conditioning pair itself: the steps read the precomputed
     // single conditioning, the prepared encoder and the cached logits, never the pair (DCACHE stays
     // ready - its single base is what a later batch's precompute reads)
@@ -861,7 +859,7 @@ static int foldMain(int argc, char** argv) {
     // nothing after the sampler - the next batch makes its own - and held to the end it left the confidence
     // head short of room (freed here, before the sharded head too, not after it)
     if (df.preSingle) {
-      if (tight || sharded(t)) releaseScratch({ "pre." });
+      releaseScratch({ "pre." });
       df.preSingle = df.preSnProj = nullptr;
     }
     if (SHARE_PARKED) { releaseScratch(); unparkShare(t); }     // (the share home, for the heads)
@@ -994,7 +992,7 @@ static int foldMain(int argc, char** argv) {
     NS = 1;
     releaseConcatCopies(); memReport("diffusion");
     diffMs += ms(s0, clock());
-    if (tight) releaseScratch();
+    releaseScratch();
     size_t atoms3 = mask.size() * 3;
     // the confidence head reads the pseudo-beta of the token space it runs in
     std::vector<int> pbIdx(M.i("batch.tokenAtomsToPseudoBeta.indices"), M.i("batch.tokenAtomsToPseudoBeta.indices") + nD);
@@ -1146,7 +1144,7 @@ static int foldMain(int argc, char** argv) {
     }
     if (df.graph) CK(cudaGraphExecDestroy(df.graph));
     df.preSingle = df.preSnProj = nullptr;
-    if (tight) releaseScratch();      // the next fold's trunk starts from the card it had
+    releaseScratch();      // the next fold's trunk starts from the card it had
     if (lastGroup && fi + 1 == folds) return 0;
   }
   std::function<void(const char*, const float*, size_t)> seam = [&](const char* name, const float* d, size_t n) {

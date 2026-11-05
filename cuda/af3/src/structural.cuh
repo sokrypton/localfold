@@ -189,7 +189,7 @@ inline Structural expandStructural(const float* trunkSingle, const float* trunkP
   // the two f32 [pairs, C] work buffers read by nothing past the scatter: given back before the refiner, whose
   // pairformer blocks over the same structural pair need the room (9.8 GB each at 1300 residues, 2530 subtokens,
   // which is what the refiner's triangle ran out beside) - cheap through the scratch pool
-  if (tightPair(pairs, C)) releaseScratch({ "st.gathered", "st.projected", "st.order" });
+  releaseScratch({ "st.gathered", "st.projected", "st.order" });
   // the masks, from the structural batch's own seq mask
   s.seqMask = dalloc(n); s.pairMask = dalloc(pairs);
   CK(cudaMemcpyAsync(s.seqMask, M.f("sbatch.seqMask"), n * sizeof(float), cudaMemcpyHostToDevice, STREAM));

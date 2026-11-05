@@ -1244,12 +1244,13 @@ inline void releaseScratch() {
   CK(lfDeviceSynchronize());
   for (auto& [name, slot] : SCRATCH) { if (slot.first) CK(cudaFreeAsync(slot.first, STREAM)); slot = {nullptr, 0}; }
 }
-// A large input's pair is over 128 MB (512 tokens at 128 channels): there each phase gets the card
-// to itself, and a stage's own scratch is given back when the stage is done.
+// Each phase gets the card to itself: a stage's own scratch is given back when the stage is done, at every size. (It
+// was only where the pair was over 128 MB - 512 tokens at 128 channels - so a 512-token fold held its trunk's scratch
+// through the diffusion and peaked 2 GB above a 768-token one; given back always, warm folds at 68, 256 and 512 tokens
+// are the same time within 0.3%: the scratch pool hands it out again.)
 // LOCALFOLD_BIG=1: every big-input path at any size (shortPair true, roomFor false) - how they are checked
 // against the ordinary ones on an input small enough to fold both ways
 inline const bool BIG_FORCED = getenv("LOCALFOLD_BIG") != nullptr;
-inline bool tightPair(size_t pairs, int C) { return pairs * C * 4 > ((size_t)128 << 20); }
 // ...and short of room. AF3 (SHORT_PAIR_TIMES, set by af3.cu): when SHORT_PAIR_TIMES times the f32 pair does not
 // fit the room this process had at its first ask - free memory, held scratch counted, a 20th of the card spare,
 // fixed then so a warm fold decides as a cold one does (and a second process holding memory moves it, which a card

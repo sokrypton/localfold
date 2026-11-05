@@ -1870,7 +1870,7 @@ inline void precomputeConditioning(DiffusionFold& f, const std::vector<float>& l
   float* sn = scratch<float>("pre.sn", rows * Cs);
   singleCondEmbeddingNorm(f.preSingle, sn, rows, Cs);
   linear<float, float>(sn, f.preSnProj, rows, Cs, perToken, "diffusion.singleCondEmbeddingProjection");
-  if (tightPair((size_t)n * n, 128)) releaseScratch({ "pre.lv", "pre.e", "pre.en", "pre.proj", "pre.sn" });
+  releaseScratch({ "pre.lv", "pre.e", "pre.en", "pre.proj", "pre.sn" });
   scratch<float>("dc.single", (size_t)n * Cs); scratch<float>("dn.snProj", (size_t)n * perToken);   // a step's slices land here
   f.preLevels = levels; f.usePre = true;
   // 🔴 NOT the transformer's two conditioning GEMMs over every step too: held for the schedule they
