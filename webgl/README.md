@@ -1106,11 +1106,18 @@ search from "what is wrong with this kernel" to "what does the hardware actually
 absolute numbers are not the real kernels' (its own neighbours read different rows on purpose), and
 the header says so; what it establishes is a comparison.
 
-🔴 **AND THE SAME QUESTION IS NOW OPEN FOR THE PROJECTION, WHICH IS 34% OF A bioemu2 FOLD.** Its
-decode has the same one-dimensional assumption: neighbouring indices share the eight x rows, and a
-tile's rows are W apart, so a tile spans `W / OUT4` = 16 row blocks and 128 rows of x rather than
-eight. A 2D-tiled mapping there wants a fragment block of 32 by 4 to cover 128 output groups, at
-about 11% more fragments. Unmeasured, and the obvious next thing.
+🔴 **AND THE SAME MAPPING ON THE PROJECTION IS A 1.28x LOSS, WHICH IS THE USEFUL HALF OF THE
+RESULT.** Its decode has the same one-dimensional assumption - neighbouring indices share the eight
+x rows, and a tile's rows are W apart, so a tile spans about 512 row blocks rather than one - so it
+looked like the same bug. Built and measured on bioemu2's cheap fold, with the answer identical:
+**10042 ms against 7870**.
+
+**Tile-awareness pays when the shared operand is SMALL AND FULLY REUSED and costs when the tile is
+forced to sweep a large STREAMING one.** The contraction shares one channel's 37 KiB and reuses all
+of it; the projection's flat mapping already gives a tile ROW one row block (`OUT4` = 128
+consecutive texels covers a 32-wide segment), and forcing a whole tile onto one row block makes that
+tile sweep every output group - which streams the entire 0.5 to 2.3 MiB weight inside one tile. The
+locality it buys is worth less than the locality it spends. Reverted; the contraction keeps it.
 
 ### A short projection is slow and neither lever moves it
 
