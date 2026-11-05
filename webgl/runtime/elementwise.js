@@ -39,6 +39,41 @@ ${guard(elements)}
   result = fetch4(aTex, texel) * fetch4(bTex, texel);
 }`;
 
+/**
+ * `max(a, 0)`.
+ *
+ * 🔴 A STANDALONE ReLU, BECAUSE AF2's SIDECHAIN HEAD APPLIES IT TO A LINEAR'S
+ * INPUT RATHER THAN ITS OUTPUT. Everywhere else in these models the activation
+ * belongs to the projection that produced the value and `linear` folds it into
+ * the epilogue for free; the torsion head is `Linear(relu(x))` repeatedly, where
+ * `x` is the output of an ADD. Folding it into the previous linear would be
+ * wrong - the add comes between them.
+ */
+export const reluSource = (elements) => `${PRELUDE}${ONE_TARGET}
+const int ELEMENTS = ${elements};
+uniform sampler2D aTex;
+void main() {
+  int texel = linearTexel();
+  if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
+  result = max(fetch4(aTex, texel), vec4(0.0));
+}`;
+
+/**
+ * @param {import("./execution.js").Execution} execution
+ * @param {Tensor} a
+ * @param {Tensor} [into]
+ * @returns {Tensor}
+ */
+export function relu(execution, a, into) {
+  const output = into ?? execution.allocate(a.elements, "relu");
+  if (output === a) {
+    throw new Error("relu: a fragment shader cannot read the texture it draws into");
+  }
+  return execution.dispatch({
+    source: reluSource(a.elements), output, inputs: { aTex: a }, label: "elementwise.relu",
+  });
+}
+
 /** `a * scale`. */
 export const scaleSource = (elements) => `${PRELUDE}${ONE_TARGET}
 uniform sampler2D aTex;

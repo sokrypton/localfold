@@ -11,9 +11,9 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-476 tools. `tools/fixtures/` is data and is not listed.
+477 tools. `tools/fixtures/` is data and is not listed.
 
-## `tools/gpu/` - the WebGPU lane (231)
+## `tools/gpu/` - the WebGPU lane (232)
 
 Each exports `async function main(device, args)` and is run as
 `node tools/gpu-chrome.mjs tools/gpu/<module>.js [--flags]`.
@@ -149,6 +149,7 @@ Each exports `async function main(device, args)` and is run as
 - **`check-webgl-kernels.js`** - The two WebGL2 kernels against independent CPU references - the gate they have never had.
 - **`check-webgl-opm.js`** - The outer product mean in WebGL2 against the WGSL one and a CPU reference - four conventions and a two-stage contraction.
 - **`check-webgl-runtime.js`** - The WebGL2 backend's runtime and its first three AF2 primitives, against CPU references - and the expressibility question the headline ceiling gets wrong.
+- **`check-webgl-sidechain.js`** - The sidechain torsion head against the WGSL one.
 - **`check-webgl-structure-initialize.js`** - The structure module's starting point, against the WGSL one.
 - **`check-webgl-transition.js`** - The transition in WebGL2 against the WGSL one and a CPU reference.
 - **`check-webgl-triangle.js`** - Triangle multiplication in WebGL2 against the CPU reference AND against the WGSL kernel, in one page - the first whole AlphaFold operation in this backend.

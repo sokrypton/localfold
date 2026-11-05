@@ -61,6 +61,8 @@ webgl/
     evoformer/block.js          a whole Evoformer block and the extra-MSA block, nine sub-layers
                                 each, sharing the six that make up the pair half
     evoformer/stack.js          the loop over blocks, for both kinds
+    structure/initialize.js     the single representation and the identity frame
+    structure/sidechain.js      seven torsions a residue, as normalised (x, y) pairs
   heads/
     distogram.js                P(d < 8 A) for every pair - the contact map the page draws
     confidence.js               pLDDT, PAE and the pTM term
@@ -211,7 +213,15 @@ aligned kernel shares one input sweep across its four outputs and cannot. `linea
 variant that resolves each component separately: four times the reads, on a projection whose whole
 output is `rows * 50` floats, and the alternative was refusing a shape the model actually has.
 
-Still to come: the structure module. After AF2: AF3's pairformer and diffusion, ESMFold2, bioemu2.
+**The structure module is under way**: its starting point (the single representation and the
+identity frame, `single` bit-exact) and its sidechain torsion head (1.0e-7 to 1.1e-7) are done and
+cross-checked. Both pin conventions a fold could not reveal - an affine is a quaternion THEN a
+translation with the identity at `(1, 0, 0, 0)`, the torsion head reads the INITIAL normalised
+representation rather than the activations, and the angle normalisation guards at 1e-12 so a zero
+torsion comes out `(0, 0)` rather than NaN.
+
+Still to come in it: the iteration core (invariant point attention, 7 kernels) and atom geometry.
+After AF2: AF3's pairformer and diffusion, ESMFold2, bioemu2.
 
 Every operation so far is checked against TWO references - an f64 CPU one written from the
 operation, and the WGSL kernel run in the same page - because a single reference cannot say which
