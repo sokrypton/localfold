@@ -54,13 +54,21 @@ void main() { gl_Position = vec4(position, 0.0, 1.0); }`;
  * x stays linear in both arms, so the only difference is the weight's
  * addressing - which is the question.
  */
-const FRAGMENT = (rows, inChannels, outChannels, shaped, splits = 1) => `#version 300 es
+const FRAGMENT = (rows, inChannels, outChannels, shaped, splits = 1, xStride4 = 0, wStride4 = 0) => `#version 300 es
 precision highp float;
 precision highp int;
 precision highp sampler2D;
 const int W = ${TEXTURE_WIDTH};
 const int ROWS = ${rows};
 const int IN4 = ${inChannels / 4};
+// 🔴 THE ROW STRIDE, WHICH IS WHAT HAS TO DIVIDE THE TEXTURE WIDTH. A logical
+// row of IN4 texels starting at row * IN4 wraps onto the next texture row at an
+// irregular point unless IN4 divides W - and a texture is stored swizzled, so a
+// row that wraps is a row whose neighbours are not neighbours. Padding the
+// STRIDE to a power of two fixes the addressing without computing one extra
+// multiply-add: the loop still runs IN4 steps.
+const int XSTRIDE4 = ${xStride4 || inChannels / 4};
+const int WSTRIDE4 = ${wStride4 || inChannels / 4};
 const int OUT4 = ${outChannels / 4};
 const int RQ = ${Math.ceil(rows / ROWS_PER_FRAGMENT)};
 const int SPLITS = ${splits};
@@ -75,7 +83,7 @@ vec4 fetchLinear(sampler2D tex, int texel) {
 }
 ${shaped
     ? "vec4 weightAt(int o, int k) { return texelFetch(weightTex, ivec2(k, o), 0); }"
-    : "vec4 weightAt(int o, int k) { return fetchLinear(weightTex, o * IN4 + k); }"}
+    : "vec4 weightAt(int o, int k) { return fetchLinear(weightTex, o * WSTRIDE4 + k); }"}
 
 void main() {
   int texel = int(gl_FragCoord.y) * W + int(gl_FragCoord.x);
@@ -89,7 +97,7 @@ void main() {
   int base = texel < SPLITS * RQ * OUT4 ? q * ${ROWS_PER_FRAGMENT} : 0;
   int kStart = split * KLEN;
 ${Array.from({ length: ROWS_PER_FRAGMENT },
-    (_, i) => `  int xBase${i} = min(base + ${i}, ROWS - 1) * IN4;`).join("\n")}
+    (_, i) => `  int xBase${i} = min(base + ${i}, ROWS - 1) * XSTRIDE4;`).join("\n")}
 ${Array.from({ length: ROWS_PER_FRAGMENT },
     (_, i) => `  vec4 acc${i} = vec4(0.0);`).join("\n")}
   for (int k = kStart; k < kStart + KLEN; ++k) {
@@ -148,6 +156,16 @@ export async function main(device, args) {
     return { width: TEXTURE_WIDTH, height: Math.max(1, Math.ceil(texels / TEXTURE_WIDTH)) };
   };
 
+  // The next power of two at or above IN4, which is what divides W.
+  const in4 = inChannels / 4;
+  const stride4 = 2 ** Math.ceil(Math.log2(in4));
+  const padRows = (values, count, width) => {
+    const out = new Float32Array(count * stride4 * 4);
+    for (let r = 0; r < count; r += 1) {
+      out.set(values.subarray(r * width, (r + 1) * width), r * stride4 * 4);
+    }
+    return out;
+  };
   const xValues = fill(rows * inChannels, 7);
   const weightValues = fill(inChannels * outChannels, 11);
   const xShape = linearShape(xValues.length);
@@ -164,10 +182,11 @@ export async function main(device, args) {
   gl.bindBuffer(gl.ARRAY_BUFFER, vertices);
   gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
 
-  const run = (shaped, splits = 1) => {
+  const run = (shaped, splits = 1, xStride4 = 0, wStride4 = 0) => {
     const program = gl.createProgram();
     for (const [type, source] of [[gl.VERTEX_SHADER, VERTEX],
-      [gl.FRAGMENT_SHADER, FRAGMENT(rows, inChannels, outChannels, shaped, splits)]]) {
+      [gl.FRAGMENT_SHADER,
+        FRAGMENT(rows, inChannels, outChannels, shaped, splits, xStride4, wStride4)]]) {
       const shader = gl.createShader(type);
       gl.shaderSource(shader, source);
       gl.compileShader(shader);
@@ -187,6 +206,15 @@ export async function main(device, args) {
     const rings = Array.from({ length: iterations }, () => Array.from(
       { length: ROWS_PER_FRAGMENT },
       () => makeTexture(splitShape.width, splitShape.height, new Float32Array(0))));
+    // 🔴 THE UNIFORM LOCATIONS ARE RESOLVED ONCE. `getUniformLocation` is a
+    // SYNCHRONOUS query - a round trip to the GPU process - and calling it
+    // inside the draw loop put a fixed cost on every iteration that swamped
+    // what this probe measures. The tell was two shapes 9.3x apart in work
+    // taking 77 ms and 68: a rate that does not move with the work is not a
+    // rate. `Execution` has always cached these (`#uniform`); this probe drives
+    // raw GL and did not.
+    const xLocation = gl.getUniformLocation(program, "xTex");
+    const weightLocation = gl.getUniformLocation(program, "weightTex");
     const draw = (planes) => {
       gl.useProgram(program);
       gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
@@ -194,11 +222,12 @@ export async function main(device, args) {
         gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0 + i, gl.TEXTURE_2D, plane, 0));
       gl.drawBuffers(planes.map((_, i) => gl.COLOR_ATTACHMENT0 + i));
       gl.activeTexture(gl.TEXTURE0);
-      gl.bindTexture(gl.TEXTURE_2D, xTexture);
-      gl.uniform1i(gl.getUniformLocation(program, "xTex"), 0);
+      gl.bindTexture(gl.TEXTURE_2D, xStride4 ? xPadded : xTexture);
+      gl.uniform1i(xLocation, 0);
       gl.activeTexture(gl.TEXTURE1);
-      gl.bindTexture(gl.TEXTURE_2D, shaped ? weightShaped : weightLinear);
-      gl.uniform1i(gl.getUniformLocation(program, "weightTex"), 1);
+      gl.bindTexture(gl.TEXTURE_2D,
+        wStride4 ? weightPadded : (shaped ? weightShaped : weightLinear));
+      gl.uniform1i(weightLocation, 1);
       gl.bindBuffer(gl.ARRAY_BUFFER, vertices);
       gl.enableVertexAttribArray(0);
       gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
@@ -221,9 +250,20 @@ export async function main(device, args) {
     return { ms, plane0: out.subarray(0, rowQuads * outChannels) };
   };
 
+  const xPaddedValues = padRows(xValues, rows, inChannels);
+  const weightPaddedValues = padRows(weightValues, outChannels, inChannels);
+  const xPaddedShape = linearShape(xPaddedValues.length);
+  const weightPaddedShape = linearShape(weightPaddedValues.length);
+  const xPadded = makeTexture(xPaddedShape.width, xPaddedShape.height, xPaddedValues);
+  const weightPadded = makeTexture(
+    weightPaddedShape.width, weightPaddedShape.height, weightPaddedValues);
+
   const linearArm = run(false);
   const shapedArm = run(true);
   const splitArms = [2, 4, 8].map((splits) => ({ splits, ...run(false, splits) }));
+  const bothArm = stride4 === in4 ? null : run(false, 1, stride4, stride4);
+  const weightOnlyArm = stride4 === in4 ? null : run(false, 1, 0, stride4);
+  const xOnlyArm = stride4 === in4 ? null : run(false, 1, stride4, 0);
   const flops = 2 * rows * inChannels * outChannels;
   const residual = relativeRms(linearArm.plane0, shapedArm.plane0);
   gl.deleteTexture(xTexture);
@@ -260,6 +300,22 @@ export async function main(device, args) {
       speedup: Number((linearArm.ms / ms).toFixed(2)),
       fragments: splits * Math.ceil(rows / ROWS_PER_FRAGMENT) * (outChannels / 4),
     })),
+    paddedStride: bothArm === null ? "in4 is already a power of two" : {
+      in4,
+      stride4,
+      extraMemoryPercent: Number((100 * (stride4 / in4 - 1)).toFixed(1)),
+      // 🔴 WHICH OPERAND MATTERS DECIDES WHAT THIS COSTS TO SHIP. A weight is
+      // uploaded once by this tree's own code, so padding it is free and
+      // cascades nowhere; x is written by whatever kernel produced it, so
+      // padding x is a conversion pass per projection.
+      arms: Object.fromEntries([["both", bothArm], ["weight only", weightOnlyArm],
+        ["x only", xOnlyArm]].map(([name, arm]) => [name, {
+        ms: Number(arm.ms.toFixed(3)),
+        gflops: Number((2 * rows * inChannels * outChannels / arm.ms / 1e6).toFixed(1)),
+        speedup: Number((linearArm.ms / arm.ms).toFixed(2)),
+        relRms: Number(relativeRms(linearArm.plane0, arm.plane0).toExponential(2)),
+      }])),
+    },
     relRms: Number(residual.toExponential(2)),
     verdict: residual > 1e-6
       ? `FAILED: the two layouts disagree at ${residual.toExponential(2)} - one of them is `

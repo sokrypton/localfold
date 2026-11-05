@@ -27,7 +27,7 @@ This file began as the spike that answered *can WebGL2 do this work at all*: the
 decide it, moved out of `webgpu/kernels/` where they sat with `webgl2` in their names and no
 importer, plus the texture layout and the limit arithmetic they shared by copy. The honest summary
 of the sections below: the numerics are **checked and correct**, the speed is **4.6x off the WebGPU
-path on AF2 and 15x on bioemu2** - it was 17x and 246x - and the shapes are **worse**.
+path on AF2 and 12x on bioemu2** - it was 17x and 246x - and the shapes are **worse**.
 
 🔴 **AND ON MEMORY IT IS NOW THE EFFICIENT ONE.** A 68-token bioemu2 fold holds **409 MiB** here
 against the WGSL fold's 815 MiB of weights plus 135 of activations, because this path keeps the
@@ -825,9 +825,9 @@ Every fold is the same job, the same seed and the same settings either side; `--
 
 | fold | before | after | |
 |---|---:|---:|---:|
-| bioemu2, 6MRR 68 tokens, 4 passes, 20 steps | 968 s | **57.6 s** | **16.8x** |
+| bioemu2, 6MRR 68 tokens, 4 passes, 20 steps | 968 s | **45.9 s** | **21.1x** |
 | ...its trunk | 277.7 s | **21.6 s** | 12.8x |
-| ...its 20 denoiser calls | 658 s | **35.2 s** | 18.7x |
+| ...its 20 denoiser calls | 658 s | **23.3 s** | 28.2x |
 | ESMFold2, 75 residues, 36-block tower, 3 loops, 15 steps | 253 s | **65.0 s** | **3.9x** |
 | ESMFold2 at the tool's defaults | 2.82 s | **1.37 s** | 2.1x |
 | AF3, 59 tokens | 4.68 s | **3.39 s** | 1.4x |
@@ -936,6 +936,44 @@ differential rather than a floor because a quantised decoder that is wrong stays
 `--falsify` arm reads a code as a multiple of the scale rather than an offset from the zero, which
 is that same real fault, and turns 7,077,888 elements red.
 
+### A row that wraps, which was the largest factor in the whole campaign
+
+🔴 **A LOGICAL ROW MUST START WHERE A TEXTURE ROW DOES, AND NOTHING HERE MADE IT.** A row of `IN4`
+texels begins at `row * IN4`, and `fetch4` puts that at `(t % 2048, t / 2048)` - so unless `IN4`
+divides 2048 the row WRAPS onto the next texture row at a different offset for every row. A texture
+is stored swizzled for two-dimensional locality, so a row that wraps is a row whose neighbours are
+not neighbours, and the twelve streams a blocked projection walks defeat the cache together.
+
+Swept at bioemu2's dominant shape, 576 x 896 -> 1792, with the answer identical in every arm:
+
+| `in` | `IN4` | GFLOP/s |
+|---|---:|---:|
+| 768 | 192 | 31.5 |
+| 896 | 224 | **25.0** |
+| **1024** | **256** | **95.2** |
+| 1152 | 288 | 25.6 |
+| 1280 | 320 | 23.0 |
+| 1792 | 448 | 21.1 |
+| **2048** | **512** | **113.3** |
+
+**Only the powers of two are fast**, 2048 being one, and `in = 1024` does MORE arithmetic than 896
+while running four times faster. So the fix is a **stride and not a width**: lay the row at 256
+texels and keep the loop at 224, and not one extra multiply-add is done. **14% more memory for
+4.08x**, bit-identical - `webgl/runtime/pad-stride.js`, `--no-stride-pad`.
+
+🔴 **AND IT IS x, NOT THE WEIGHT, WHICH IS WHY IT IS CHEAP.** Padding x alone is the whole **4.08x**
+and padding the weight alone is **0.94x** - so it is one conversion pass over the activation, 0.2 ms
+against 60 of cache misses, and it cascades into nothing. (The same plumbing packed as float16
+halves was a 0.93x loss; the transform is what differs, not the machinery.)
+
+🔴 **AND IT IS THE SIBLING PORT'S `TW = 384` FROM THE OTHER SIDE, WHICH THIS FILE HAD ALREADY READ
+AND MISUNDERSTOOD.** Its width is 384 "because the row widths the fast paths walk (24, 48, 64, 96,
+128, 192, 384 texels) divide it, so no such row wraps onto the next texture row". It chose the WIDTH
+to suit its rows; this chooses the ROW to suit the width, and they are the same property. The
+narrow-row experiment above measured a 3.8x LOSS and was read as closing the question - but
+narrowing `W` makes MORE rows wrap, not fewer. The condition was never the width's size, and that
+negative result had the answer in it.
+
 ### Which operand streams, which stays in cache - and three wrong guesses first
 
 The int5 projection sat at **26 ms a call where its traffic model said 12 and its fetch model said
@@ -990,8 +1028,8 @@ to 409. The gap to the WGSL fold of the same weights is **15x** - it was 246x - 
 
 | | WebGL2 | WGSL | |
 |---|---:|---:|---:|
-| trunk, 4 passes x 52 blocks | 21.6 s | 2.3 s | 9.4x |
-| 20 denoiser calls | 35.1 s | 1.2 s | 29x |
+| trunk, 4 passes x 52 blocks | 21.8 s | 2.3 s | 9.5x |
+| 20 denoiser calls | 23.3 s | 1.2 s | 19x |
 | peak memory | **409 MiB** | 950 MiB | **0.43x** |
 
 🔴 **AND THE FIRST EXPLANATION WRITTEN HERE WAS WRONG, FROM EXACTLY THE MISTAKE THIS FILE WARNS
@@ -1278,15 +1316,15 @@ bond rms  main       0.042            0.042            0.042
           side       0.056            0.056            0.056
           peptide    0.028            0.028            0.028
 contacts (P > 0.5)   201              201
-wall                 968 s            57.6 s           3.9 s
+wall                 968 s            45.9 s           3.9 s
   trunk              277.7 s          21.6 s           2.3 s
   distogram                           0.7 s
-  20 denoiser calls  658 s            35.2 s           1.2 s
+  20 denoiser calls  658 s            23.3 s           1.2 s
 weights/activations  1656 MiB peak    409 MiB peak     815 MiB weights + 135 activations
 ```
 
-🔴 **968 s TO 57.6 s ON A QUARTER OF THE MEMORY, AND NOT ONE REPORTED QUANTITY MOVES.** The 16.8x
-is the row block and its fragment order, the contraction split, coalesced, transposed and
+🔴 **968 s TO 45.9 s ON A QUARTER OF THE MEMORY, AND NOT ONE REPORTED QUANTITY MOVES.** The 21.1x
+is the row block, its fragment order, x's padded row stride, the contraction split, coalesced, transposed and
 pair-blocked, and the weights held as the bundle's own five-bit codes from "Closing the gap" above, and every figure in
 the middle column is the left column's - the same rmsd, the same TM, the same CA-CA median to eight
 digits, the same 201 contacts - while the peak HALVES. Four kernels reordered or re-quantised and
@@ -1305,8 +1343,8 @@ relative. A geometry floor would have accepted a port that was wrong by 10%; thi
 also why the AF3-style "worst atom" figure is not quoted here: it needs both PDBs, and the WebGL2
 side is sixteen minutes a fold.
 
-🔴 **AND IT IS 15x THE WGSL FOLD - WAS 246x - ON LESS MEMORY THAN THAT FOLD USES.** The trunk is
-9x and the diffusion 30x, and the diffusion is where the remaining asymmetry lives: the WGSL denoiser
+🔴 **AND IT IS 12x THE WGSL FOLD - WAS 246x - ON LESS MEMORY THAN THAT FOLD USES.** The trunk is
+9x and the diffusion 19x, and the diffusion is where the remaining asymmetry lives: the WGSL denoiser
 batches S samples through one compiled program, which this one does not. **The half-precision
 weights this file once called "the next multiplicative factor" are taken** - see "Float16 weights"
 above - so the denoiser's 1.6 GiB is 0.8 and a call is **2.5 s where it was 32.9**. That is also
@@ -1446,7 +1484,7 @@ and the page requires WebGPU rather than choosing a backend.
 🔴 **THE PRECONDITION IS NOW MET AND THE DECISION IS STILL NOT AUTOMATIC.** This section used to say
 neither line should move "before a fold actually runs here", and one does. What has not been
 settled is whether a backend **4.6x slower on AF2 and 23x on bioemu2** should be offered: a
-59-residue AF2 fold is 1.29 s against 0.28 s, 68-token bioemu2 is 58 s against 3.9 s on 409 MiB
+59-residue AF2 fold is 1.29 s against 0.28 s, 68-token bioemu2 is 46 s against 3.9 s on 412 MiB
 against 950, and a
 255-residue fold has not been measured at all. A visitor with no WebGPU gets a fold
 instead of a refusal, which is the whole point of the tree; a visitor who waits four minutes for

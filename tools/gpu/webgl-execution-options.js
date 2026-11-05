@@ -70,6 +70,11 @@
  *                         group rather than row block, so neighbours walk
  *                         different weight rows and the weight is streamed
  *                         again for every row block.
+ *   --no-stride-pad       x laid at its own row width rather than padded to a
+ *                         stride that divides the texture width. Worth 4.08x
+ *                         on a shape whose width does not - the single largest
+ *                         factor found in this backend after the row block.
+ *                         Bit-identical, so it prices the addressing.
  *   --skip-draws          Issue no draws at all. The fold is garbage; what it
  *                         times is everything this backend does APART from
  *                         drawing, which is the arm that settles whether the
@@ -107,6 +112,7 @@ export function webglExecutionOptions(args) {
     noTriangleCoalesce: flag(args, "no-triangle-coalesce"),
     noContractBlock: flag(args, "no-contract-block"),
     noRowFastest: flag(args, "no-row-fastest"),
+    noStridePad: flag(args, "no-stride-pad"),
     poolLabelPattern: pattern("pool-labels"),
     profile: flag(args, "profile") ? new Map() : null,
   };

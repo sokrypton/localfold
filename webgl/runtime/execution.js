@@ -169,6 +169,13 @@ export class Execution {
      */
     this.noRowFastest = options.noRowFastest ?? false;
     /**
+     * The control arm for x's padded row stride
+     * (`webgl/runtime/pad-stride.js`): a row of `IN4` texels laid at its own
+     * width, which wraps across texture rows whenever `IN4` does not divide the
+     * texture width. Bit-identical, so this prices the ADDRESSING.
+     */
+    this.noStridePad = options.noStridePad ?? false;
+    /**
      * Where the HOST time inside `dispatch` goes, when asked for.
      *
      * 🔴 BECAUSE THE GPU IS 3% OF AN AF2 WebGL FOLD AND NOTHING SAID SO.

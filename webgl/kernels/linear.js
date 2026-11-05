@@ -35,6 +35,7 @@ import { ONE_TARGET, PRELUDE, targetDeclarations } from "../runtime/execution.js
 import {
   INT5_DECODE, INT5_DECODE8, INT5_GROUP, int5DecodeSource,
 } from "../runtime/int5.js";
+import { padStride, strideDividesWidth } from "../runtime/pad-stride.js";
 /** @typedef {import("../runtime/storage.js").Tensor} Tensor */
 /** @typedef {import("../runtime/storage.js").Int5Weight} Int5Weight */
 
@@ -317,7 +318,7 @@ export const blockedApplies = (rows, inChannels, outChannels, weightLayout = "ou
 
 export const blockedSource = (
   rows, inChannels, outChannels, activation, useBias, weightLayout, roundHalf,
-  blockRows = BLOCK_ROWS, orderRowFastest = false,
+  blockRows = BLOCK_ROWS, orderRowFastest = false, xStride4 = 0,
 ) => {
   const each = (template) => Array.from(
     { length: blockRows }, (_, i) => template(i)).join("\n");
@@ -365,6 +366,10 @@ ${each((i) => `    vec4 x${i} = fetch4(xTex, xBase${i} + k);
   return `${PRELUDE}${targetDeclarations(blockRows)}
 ${SHAPE_UNIFORMS}
 uniform int RQ;
+// 🔴 x's ROW STRIDE, which must divide the texture width or every logical row
+// wraps at a different offset and the cache cannot follow twelve such streams.
+// See webgl/runtime/pad-stride.js: padding it is 4.08x and costs no arithmetic.
+const int XSTRIDE4 = ${xStride4 || inChannels / 4};
 uniform sampler2D xTex;
 uniform sampler2D weightTex;
 ${useBias ? "uniform sampler2D biasTex;" : ""}
@@ -381,7 +386,7 @@ ${orderRowFastest
   // nothing wrote - the fault Storage.fillFresh exists to catch. Clamping to
   // the last real row keeps the value FINITE and the repack never reads it.
   int base = texel < RQ * OUT4 ? q * ${blockRows} : 0;
-${each((i) => `  int xBase${i} = min(base + ${i}, ROWS - 1) * IN4;`)}
+${each((i) => `  int xBase${i} = min(base + ${i}, ROWS - 1) * XSTRIDE4;`)}
 ${each((i) => `  vec4 acc${i} = vec4(0.0);`)}
 ${accumulate}
 ${each((i) => `  result${i} = ${value(i)};`)}
@@ -407,7 +412,7 @@ ${each((i) => `  result${i} = ${value(i)};`)}
  */
 export const blockedInt5Source = (
   rows, inChannels, outChannels, activation, useBias, roundHalf, blockRows = BLOCK_ROWS,
-  orderRowFastest = true,
+  orderRowFastest = true, xStride4 = 0,
 ) => {
   const each = (template) => Array.from(
     { length: blockRows }, (_, i) => template(i)).join("\n");
@@ -419,6 +424,10 @@ export const blockedInt5Source = (
   return `${PRELUDE}${targetDeclarations(blockRows)}
 ${SHAPE_UNIFORMS}
 uniform int RQ;
+// 🔴 x's ROW STRIDE, which must divide the texture width or every logical row
+// wraps at a different offset and the cache cannot follow twelve such streams.
+// See webgl/runtime/pad-stride.js: padding it is 4.08x and costs no arithmetic.
+const int XSTRIDE4 = ${xStride4 || inChannels / 4};
 uniform int GPR;
 uniform sampler2D xTex;
 uniform highp usampler2D codeTex;
@@ -446,7 +455,7 @@ ${orderRowFastest
   int group = texel - q * OUT4;`}
   int o0 = group * 4;
   int base = texel < RQ * OUT4 ? q * ${blockRows} : 0;
-${each((i) => `  int xBase${i} = min(base + ${i}, ROWS - 1) * IN4;`)}
+${each((i) => `  int xBase${i} = min(base + ${i}, ROWS - 1) * XSTRIDE4;`)}
 ${each((i) => `  vec4 acc${i} = vec4(0.0);`)}
   for (int g = 0; g < GPR; ++g) {
     // The group index of output row o at its group g is o * GPR + g, because
@@ -594,24 +603,34 @@ export function linear(execution, call, into) {
     // where the block count is small enough that the repack survives it.
     const rowFastest = int5 && !execution.noRowFastest
       && rows * inChannels <= ROW_FASTEST_X_FLOATS;
+    // 🔴 x's ROW STRIDE PADDED TO DIVIDE THE TEXTURE WIDTH, which is 4.08x on
+    // every shape whose input width does not - see webgl/runtime/pad-stride.js.
+    // One pass over x against sixty milliseconds of cache misses; measured, the
+    // WEIGHT does not want this (0.94x) and only x does.
+    const padX = !execution.noStridePad && !strideDividesWidth(inChannels / 4);
+    const padded = padX
+      ? padStride(execution, { x, rows, inChannels, label: "linear.x-stride" })
+      : null;
+    const xUse = padded?.tensor ?? x;
+    const xStride4 = padded?.stride4 ?? 0;
     const planes = Array.from({ length: blockRows },
       (_, i) => execution.allocate(rowQuads * outChannels, `linear.plane${i}`));
     execution.dispatch({
       source: int5
         ? blockedInt5Source(
           rows, inChannels, outChannels, activation, bias !== undefined, roundHalf, blockRows,
-          rowFastest)
+          rowFastest, xStride4)
         : blockedSource(
           rows, inChannels, outChannels, activation, bias !== undefined, weightLayout, roundHalf,
-          blockRows, rowFastest),
+          blockRows, rowFastest, xStride4),
       outputs: planes,
       inputs: int5
         ? (bias === undefined
-          ? { xTex: x, codeTex: codeWeight.codes, tableTex: codeWeight.table }
-          : { xTex: x, codeTex: codeWeight.codes, tableTex: codeWeight.table, biasTex: bias })
+          ? { xTex: xUse, codeTex: codeWeight.codes, tableTex: codeWeight.table }
+          : { xTex: xUse, codeTex: codeWeight.codes, tableTex: codeWeight.table, biasTex: bias })
         : (bias === undefined
-          ? { xTex: x, weightTex: weightTensor }
-          : { xTex: x, weightTex: weightTensor, biasTex: bias }),
+          ? { xTex: xUse, weightTex: weightTensor }
+          : { xTex: xUse, weightTex: weightTensor, biasTex: bias }),
       optionalInts: {
         ...shapeInts(rows, inChannels, outChannels),
         RQ: rowQuads,
@@ -628,6 +647,7 @@ export function linear(execution, call, into) {
       label: `linear.repack:${rows}x${outChannels}`,
     });
     for (const plane of planes) execution.release(plane);
+    if (padded !== null) execution.release(padded.tensor);
     return output;
   }
   if (int5) {
