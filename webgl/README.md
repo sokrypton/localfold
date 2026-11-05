@@ -82,6 +82,7 @@ webgl/
     diffusion/atom-encoder.js   the five gathers, the pair, and seven stage taps
     diffusion/conditioning.js   three pair shapes, and a refusal where the width disagrees
     diffusion/head.js           the decoder and the whole denoise step: a BLEND, not a prediction
+    diffusion/sampler.js        the walk: every constant imported, never restated
   af2/
     multimer/template.js        the multimer's nine-projection template embedder
     evoformer/block.js          a whole Evoformer block and the extra-MSA block, nine sub-layers
@@ -491,9 +492,9 @@ magnitude larger than the update - so the same order change reads **2.6e-5 on th
 on the update itself. A control measured through a dilution reports "inert" about something that is
 not.
 
-AF2 is done, both graphs. AF3's trunk is done and its diffusion HEAD is done - one denoise step,
-noisy positions in, the model's estimate of clean ones out. Still to come: AF3's sampler and its
-confidence head, then ESMFold2 and bioemu2.
+AF2 is done, both graphs. AF3's trunk, its diffusion head and its sampler are done - so this
+backend can walk a structure out of noise. Still to come: AF3's confidence head, then ESMFold2 and
+bioemu2.
 
 Every operation so far is checked against TWO references - an f64 CPU one written from the
 operation, and the WGSL kernel run in the same page - because a single reference cannot say which

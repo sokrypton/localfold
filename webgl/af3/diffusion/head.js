@@ -284,8 +284,7 @@ void main() {
 }`;
 
 /**
- * @param {import("../../runtime/execution.js").Execution} execution
- * @param {{positionsNoisy: Tensor, noiseLevel: number, atomMask: Tensor,
+ * @typedef {{positionsNoisy: Tensor, noiseLevel: number, atomMask: Tensor,
  *   seqMask: Tensor, trunkSingle: Tensor, trunkPair: Tensor, targetFeat: Tensor,
  *   conditioning: Tensor, refPos: Tensor, refSpaceUid: Tensor, identity: Tensor,
  *   gathers: Gathers,
@@ -298,7 +297,12 @@ void main() {
  *   chainedAtomLayerNorm: boolean, diffusionNoResidual: boolean,
  *   pairNormPerBlock: boolean, maskAtomActPerBlock: boolean,
  *   preTrunkQuery?: boolean, epsilon?: number,
- *   onStage?: (stage: string, tensor: Tensor) => void}} call
+ *   onStage?: (stage: string, tensor: Tensor) => void}} HeadCall
+ */
+
+/**
+ * @param {import("../../runtime/execution.js").Execution} execution
+ * @param {HeadCall} call
  * @returns {Tensor} `tokens * dense * 3`, the denoised positions
  */
 export function diffusionHead(execution, call) {

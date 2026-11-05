@@ -11,15 +11,16 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-502 tools. `tools/fixtures/` is data and is not listed.
+504 tools. `tools/fixtures/` is data and is not listed.
 
-## `tools/gpu/` - the WebGPU lane (257)
+## `tools/gpu/` - the WebGPU lane (259)
 
 Each exports `async function main(device, args)` and is run as
 `node tools/gpu-chrome.mjs tools/gpu/<module>.js [--flags]`.
 
 - **`af2-synthetic-block.js`** - Synthetic AF2 Evoformer weights, in the structure both backends read.
 - **`af2-synthetic-structure.js`** - Synthetic AF2 structure-module weights and geometry tables, in the structure both backends read.
+- **`af3-synthetic-head.js`** - A synthetic AF3 diffusion head - weights, layout and inputs - in the shape both `webgl/af3/diffusion/head.js` and `cpu/af3/diffusion/diffusion.js` read.
 - **`bench-ab.js`** - Interleaved A/B for the AF3 pairformer, in one process.
 - **`bench-af2-warm.js`** - One AF2 trunk pass, COLD AND WARM, at the shape another port is measured on.
 - **`bench-attention-project.js`** - AF2's q/k/v/gate projection alone, at several register blocks, in one process.
@@ -151,6 +152,7 @@ Each exports `async function main(device, args)` and is run as
 - **`check-webgl-af3-embedder.js`** - AF3's trunk embedder in WebGL2, against TWO references.
 - **`check-webgl-af3-grid-attention.js`** - AF3's triangle (grid) self-attention in WebGL2, against TWO references.
 - **`check-webgl-af3-msa-block.js`** - One AF3 MSA block in WebGL2, against TWO references.
+- **`check-webgl-af3-sampler.js`** - AF3's diffusion sampler in WebGL2: a whole walk, against the f64 reference's.
 - **`check-webgl-af3-template.js`** - AF3's template embedder in WebGL2, against TWO references.
 - **`check-webgl-af3-transition.js`** - AF3's transition block in WebGL2, against TWO references.
 - **`check-webgl-af3-triangle.js`** - AF3's triangle multiplication in WebGL2, against TWO references.
