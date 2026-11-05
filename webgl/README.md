@@ -1393,12 +1393,37 @@ SUM of five terms, where a wrong relative encoding hides under the other four. *
 own arm: relRMS exactly 0.** So the kernel is right, the tensor is right, and the sampler uses the
 same tensor to produce a structure that agrees to 1.84 A.
 
-**So what is left is the head's six-term assembly** - `normed + bias + rows + columns + product +
-distanceTable` - of which the bias is now proven exact and the other five are gated only against the
-CPU reference. **The next step is to audit those five against the VENDOR's forward pass**, or to feed
-the WebGL2 head the WGSL fold's own pair and single in one page and see which term diverges; both
-backends' modules already load together in these gates, so it is a tool rather than a research
-question.
+🔴 **SO EACH OF THE SIX ADDENDS WAS ZEROED IN TURN, AND THE BIAS IS THE ONLY ONE THAT HURTS.** One
+fold per arm, the term multiplied by zero so the sampler stays referenced (removing it outright trips
+`dispatch`'s guard against an input the kernel does not name - the same guard that caught a stale
+`biasTex` binding earlier):
+
+| zeroed | mean pLDDT | pTM |
+|---|---:|---:|
+| nothing (as shipped) | 57.50 | 0.413 |
+| **the pair bias** | **59.42** | **0.517** |
+| the row term | 48.80 | 0.407 |
+| the column term | 53.73 | 0.373 |
+| the outer product | 56.58 | 0.420 |
+| the distance table | 51.63 | 0.335 |
+
+Five of the six earn their place; the bias is net harmful. **So the first reading was right and the
+correction above was too cautious** - though "the bias is wrong" is still not what the evidence says,
+because:
+
+🔴 **THE BIAS TENSOR IS NUMERICALLY THE WGSL'S.** `webgpu/esmfold2/fold.js` states its magnitude off
+the vendor's own forward pre-hook - *"the relative encoding is 12.97"* - and this backend's is
+**absmax 12.9752**. Same weight (`featuriser.relPos`), same width, same placement (added to the
+normalised pair, after the norm), and the sampler reads the same tensor to produce a structure
+agreeing to 1.84 A. The head's own `zNormScale` / `zNormOffset` exist in the bundle under
+`confidence/zNorm/*`, so the base is not being normalised unweighted either.
+
+**So the same tensor, in the same place, helps by 13.8 points there and hurts by 1.9 here** - which
+leaves the base it is added to, and that is where the next person should look. Every gate on this
+head supplies its OWN synthetic weights, so any mis-wiring between the bundle and the head is
+invisible to all of them; the comparison that would find it is the two backends' heads on one input
+in one page, which both modules already support because these gates load them together. **That is a
+tool, not a research question, and it is the one thing this hunt did not build.**
 
 🔴 **AND THE NEW ARM WAS VACUOUS ON ITS FIRST TRY, WHICH THE GATE ITSELF CAUGHT.** `--falsify` skews
 `xInputs` and the language model pair, and this arm reads neither, so it stayed green under
