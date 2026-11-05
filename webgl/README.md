@@ -111,6 +111,9 @@ webgl/
     trunk.js                    24 blocks of the pair track alone - AF3's block, less three parts
     distogram.js                the head whose symmetrisation IS the head
     atom-transformer.js         the windowed atom transformer with 3D RoPE - no AF3 analogue
+    diffusion.js                the conditioning, twelve token blocks, and the EDM step
+    sampler.js                  the walk, with the pair conditioning cached across it
+    confidence.js               pLDDT, PAE, pTM - and the stack added to its own input
   heads/
     distogram.js                P(d < 8 A) for every pair - the contact map the page draws
     confidence.js               pLDDT, PAE and the pTM term

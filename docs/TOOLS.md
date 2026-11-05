@@ -11,9 +11,9 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-511 tools. `tools/fixtures/` is data and is not listed.
+513 tools. `tools/fixtures/` is data and is not listed.
 
-## `tools/gpu/` - the WebGPU lane (266)
+## `tools/gpu/` - the WebGPU lane (268)
 
 Each exports `async function main(device, args)` and is run as
 `node tools/gpu-chrome.mjs tools/gpu/<module>.js [--flags]`.
@@ -165,6 +165,8 @@ Each exports `async function main(device, args)` and is run as
 - **`check-webgl-distogram.js`** - The contact map in WebGL2 against the shipped host reference.
 - **`check-webgl-esmc-tower.js`** - ESM-C's tower in WebGL2 against `cpu/esmc/tower.js`, on a REAL checkpoint.
 - **`check-webgl-esmfold2-atom.js`** - ESMFold2's atom transformer in WebGL2 against `cpu/esmfold2/atom-transformer.js`.
+- **`check-webgl-esmfold2-confidence.js`** - Synthyra's ESMFold2 confidence head in WebGL2 against `cpu/esmfold2/confidence.js`.
+- **`check-webgl-esmfold2-diffusion.js`** - ESMFold2's diffusion head in WebGL2 against `cpu/esmfold2/diffusion.js`.
 - **`check-webgl-esmfold2-trunk.js`** - ESMFold2's pair features, folding trunk and distogram head in WebGL2 against `cpu/esmfold2/`.
 - **`check-webgl-evoformer-block.js`** - A whole AF2 Evoformer block in WebGL2 against the WGSL block.
 - **`check-webgl-evoformer-stack.js`** - Two Evoformer blocks in a row, both stacks, against their WGSL counterparts.

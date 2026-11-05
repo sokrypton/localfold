@@ -295,11 +295,17 @@ export async function main(device, args) {
     const theirs = scoresOf(expected.paeLogits);
     const worst = Math.max(
       Math.abs(ours.ptm - theirs.ptm), Math.abs(ours.iptm - theirs.iptm));
-    const tmOk = worst <= 1e-5;
+    // 🔴 THE pTM BAR IS THE MEASURED FLOOR AND NOT A ROUND NUMBER, because pTM
+    // ATTENUATES: it is a max over anchors of a masked row mean of
+    // probabilities, so a 1% perturbation of the logits reaches it as single
+    // digits of 1e-6 - which a 1e-5 bar swallows. Measured here at 1e-9 to
+    // 1e-10; ESMFold2's own confidence gate had exactly that control come back
+    // green at 1e-5.
+    const tmOk = worst <= 1e-8;
     arms.push({
       arm: `${name}, pTM and ipTM`,
       ptm: Number(ours.ptm.toPrecision(6)), iptm: Number(ours.iptm.toPrecision(6)),
-      relativeRms: Number(worst.toPrecision(3)), bar: 1e-5, ok: tmOk,
+      relativeRms: Number(worst.toPrecision(3)), bar: 1e-8, ok: tmOk,
     });
     if (!tmOk) {
       failures.push(`${name}: pTM differs by ${worst.toExponential(3)}`);
