@@ -689,6 +689,29 @@ matmul: AF2's transition (30208x256x1024) 9.05 against 14.70, the diffusion's `q
 **And `grid.attend`, the transition and the diffusion attention all depend on workgroup memory**,
 which does not exist here at all.
 
+## What is left of bioemu2, and why it stops where it does
+
+The DENOISER is ported and gated (`check-webgl-bioemu2-denoiser.js`): the dual stream, the coupling
+through every centre atom, the vendor's atom window, and the out-major weight layout that no other
+model here uses. What is not ported is the INPUT EMBEDDER (three windowed atom layers and a token
+mean, giving `s_inputs`) and the TRUNK (a PairMixer: four MSA layers and 48 pair-only blocks, run
+four times).
+
+🔴 **AND THE REASON IS A LAYERING PROBLEM RATHER THAN AN ARITHMETIC ONE.** Both stages' host half -
+the 455 atom features, the atom-pair tail, the window biases - lives in `webgpu/bioemu2/host.js`,
+which is backend-agnostic code sitting inside a backend. `webgl/` must not import `webgpu/`, so
+those helpers want moving to `shared/bioemu2/` first. That move is small and its gate is not: the
+only thing that checks those two stages anywhere is `check-bioemu2-network.js` against
+`tools/oracle/dump_bioemu2.py`'s dump, and **that dump is not on this box** (`oracle-dumps/` holds
+`af3-6mrr.json` and one a3m). Moving code whose only gate cannot be run here is how a working
+backend breaks quietly, so it is written down instead of done.
+
+What that leaves, in order: move those helpers to `shared/` ON A MACHINE WITH THE DUMP and re-run
+`check-bioemu2-network.js` both sides of the move; then the two stages here are composition over
+kernels this tree already has - the pair-only block is ESMFold2's `foldingTrunk`, the MSA layer's
+outer product mean is AF2's generalised one, and the windowed atom layer is the denoiser's own
+`conditionedLayer`.
+
 ## What it would take, and what to measure before starting
 
 `webgpu/` is **250 `@compute` entry points**. Two are ported. Before the third is written, three
