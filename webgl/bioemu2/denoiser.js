@@ -445,7 +445,34 @@ ${body}
  * one `3 * d` projection - in CHANNEL order here, because the token stream's
  * slices are `[q | k | v]`.
  */
-export const fullAttentionSource = (rows, channels, heads) => `${PRELUDE}${ONE_TARGET}
+/**
+ * The head's dot product, read four channels at a time where the layout allows.
+ *
+ * 🔴 BOTH ATTENTIONS WALKED THEIR HEAD DIMENSION WITH `fetch1`, WHICH IS A WHOLE
+ * `texelFetch` AND A COMPONENT SELECT - and they walked it TWICE, once for the
+ * softmax's maximum and once for the weight. At 768 channels in 16 heads that is
+ * 48 scalar fetches a key where twelve `fetch4` carry the same numbers, so the
+ * dominant term of these kernels was four times the fetches it needed.
+ *
+ * `qBase` and `kBase` are both a row offset plus `head * HEAD_DIM`, and every
+ * width in play - 768 and 128 channels, 48 and 32 head dimensions - is a
+ * multiple of four, so the division is exact. The products still accumulate in
+ * ascending `d` order, one scalar at a time, rather than as a `dot`.
+ *
+ * `--no-attend-dot4` is the control arm.
+ */
+const headDot = (keyTex, wide) => wide
+  ? `    for (int d4 = 0; d4 < HEAD_DIM / 4; ++d4) {
+      vec4 q4 = fetch4(qTex, qBase / 4 + d4);
+      vec4 k4 = fetch4(${keyTex}, kBase / 4 + d4);
+      dot += q4.x * k4.x; dot += q4.y * k4.y;
+      dot += q4.z * k4.z; dot += q4.w * k4.w;
+    }`
+  : `    for (int d = 0; d < HEAD_DIM; ++d) {
+      dot += fetch1(qTex, qBase + d) * fetch1(${keyTex}, kBase + d);
+    }`;
+
+export const fullAttentionSource = (rows, channels, heads, wide = true) => `${PRELUDE}${ONE_TARGET}
 const int ROWS = ${rows};
 const int CHANNELS = ${channels};
 const int HEADS = ${heads};
@@ -471,9 +498,7 @@ void main() {
     if (fetch1(padTex, j) == 0.0) continue;
     int kBase = j * CHANNELS + head * HEAD_DIM;
     float dot = 0.0;
-    for (int d = 0; d < HEAD_DIM; ++d) {
-      dot += fetch1(qTex, qBase + d) * fetch1(kTex, kBase + d);
-    }
+${headDot("kTex", wide)}
     largest = max(largest, dot * SCALE + fetch1(biasTex, (i * ROWS + j) * HEADS + head));
   }
   float sum = 0.0;
@@ -482,9 +507,7 @@ void main() {
     if (fetch1(padTex, j) == 0.0) continue;
     int kBase = j * CHANNELS + head * HEAD_DIM;
     float dot = 0.0;
-    for (int d = 0; d < HEAD_DIM; ++d) {
-      dot += fetch1(qTex, qBase + d) * fetch1(kTex, kBase + d);
-    }
+${headDot("kTex", wide)}
     float weight = exp(dot * SCALE
       + fetch1(biasTex, (i * ROWS + j) * HEADS + head) - largest);
     sum += weight;
@@ -500,7 +523,7 @@ void main() {
  * head h is at `d + h * headDim` and its value at `2 * d + h * headDim` - see
  * the note at the top.
  */
-export const windowAttentionSource = (atoms, channels, heads) => `${PRELUDE}${ONE_TARGET}
+export const windowAttentionSource = (atoms, channels, heads, wide = true) => `${PRELUDE}${ONE_TARGET}
 const int ATOMS = ${atoms};
 const int CHANNELS = ${channels};
 const int HEADS = ${heads};
@@ -532,9 +555,7 @@ void main() {
     if (fetch1(padTex, j) == 0.0) continue;
     int kBase = j * 2 * CHANNELS + head * HEAD_DIM;
     float dot = 0.0;
-    for (int d = 0; d < HEAD_DIM; ++d) {
-      dot += fetch1(qTex, qBase + d) * fetch1(kvTex, kBase + d);
-    }
+${headDot("kvTex", wide)}
     float bias = fetch1(biasTex,
       ((window * W_Q + inWindow) * W_K + slot) * HEADS + head);
     largest = max(largest, dot * SCALE + bias);
@@ -547,9 +568,7 @@ void main() {
     if (fetch1(padTex, j) == 0.0) continue;
     int kBase = j * 2 * CHANNELS + head * HEAD_DIM;
     float dot = 0.0;
-    for (int d = 0; d < HEAD_DIM; ++d) {
-      dot += fetch1(qTex, qBase + d) * fetch1(kvTex, kBase + d);
-    }
+${headDot("kvTex", wide)}
     float bias = fetch1(biasTex,
       ((window * W_Q + inWindow) * W_K + slot) * HEADS + head);
     float weight = exp(dot * SCALE + bias - largest);
@@ -815,7 +834,8 @@ export function fullAttention(execution, call) {
   });
   const attended = execution.allocate(tokens * channels, "bioemu2.token-attended");
   execution.dispatch({
-    source: fullAttentionSource(tokens, channels, heads),
+    source: fullAttentionSource(tokens, channels, heads,
+      !execution.noAttendDot4 && channels % (heads * 4) === 0),
     output: attended,
     inputs: { qTex: query, kTex: key, vTex: value, biasTex: bias, padTex: pad },
     label: `bioemu2.token-attend:${tokens}x${channels}:${heads}`,
@@ -868,7 +888,8 @@ export function windowAttention(execution, call) {
   });
   const attended = execution.allocate(atoms * channels, "bioemu2.atom-attended");
   execution.dispatch({
-    source: windowAttentionSource(atoms, channels, heads),
+    source: windowAttentionSource(atoms, channels, heads,
+      !execution.noAttendDot4 && channels % (heads * 4) === 0),
     output: attended,
     inputs: { qTex: query, kvTex: kv, biasTex: bias, padTex: pad },
     label: `bioemu2.atom-attend:${atoms}x${channels}:${heads}`,

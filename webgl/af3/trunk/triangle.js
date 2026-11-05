@@ -173,6 +173,57 @@ void main() {
 }`;
 
 /**
+ * The pair axes padded to a multiple of four with zeros: `[c][L][L]` laid out
+ * as `[c][LP][LP]`.
+ *
+ * 🔴 THIS IS WHAT UNLOCKS EVERY FAST CONTRACTION AT AN ODD LENGTH, AND IT WAS
+ * 66% OF AN ESMFold2 FOLD. Both fast paths need four to divide the length: the
+ * coalesced `fetch4` along k because a row must start on a texel boundary, and
+ * the pair block because a fragment owns four j. At 75 tokens neither is
+ * reachable, so ESMFold2 ran the scalar one-float-at-a-time loop - 272 ms a
+ * call, **0.4 GFLOP/s**, where the same kernel blocked at 68 tokens reaches
+ * 10. Its own profile puts that one kernel at **15.3 s of a 23.2 s fold**.
+ *
+ * Padding to 76 costs `(76/75)^3` = 4% more multiply-adds and two passes over
+ * the operands, and buys the whole factor. The padding is ZEROS, so the k loop
+ * running to LP adds exactly `0.0 * 0.0` for the tail - not an approximation,
+ * and the sum is the same sum.
+ *
+ * 🔴 AND IT IS NOT THE PADDED ROW STRIDE THAT WAS MEASURED AND DECLINED. That
+ * one laid an ALREADY-ALIGNED row at a wider stride to buy cache locality and
+ * lost (webgl/README.md, "A row that wraps"); this one makes an UNALIGNED row
+ * aligned so that a different kernel becomes legal. Same machinery, different
+ * question - and at a length divisible by four it does nothing at all, which is
+ * why bioemu2's 68 tokens are untouched.
+ */
+export const padPairPlanesSource = (length, channels, paddedLength) => `${PRELUDE}${ONE_TARGET}
+const int L = ${length};
+const int LP = ${paddedLength};
+const int PAIRS = ${length * length};
+const int PLANE = ${paddedLength * paddedLength};
+const int ELEMENTS = ${channels * paddedLength * paddedLength};
+uniform sampler2D xTex;
+
+void main() {
+  int texel = linearTexel();
+  if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
+  // LP is a multiple of four and so is PLANE, so all four lanes share one
+  // plane and one row i - only j advances.
+  int base = texel * 4;
+  int c = base / PLANE;
+  int rest = base - c * PLANE;
+  int i = rest / LP;
+  int j = rest - i * LP;
+  if (i >= L) { result = vec4(0.0); return; }
+  int from = c * PAIRS + i * L;
+  result = vec4(
+    j + 0 < L ? fetch1(xTex, from + j + 0) : 0.0,
+    j + 1 < L ? fetch1(xTex, from + j + 1) : 0.0,
+    j + 2 < L ? fetch1(xTex, from + j + 2) : 0.0,
+    j + 3 < L ? fetch1(xTex, from + j + 3) : 0.0);
+}`;
+
+/**
  * The contraction alone: a fragment owns four channels of one pair and
  * contracts exactly those four.
  *
@@ -183,7 +234,7 @@ void main() {
  * then threw away sixty-three sixty-fourths of.
  */
 export const splitContractSource = (length, channels, direction, divideByLength,
-  coalesce = true) => {
+  coalesce = true, paddedLength = length) => {
   // 🔴 THE OUTGOING DIRECTION WALKS k ALONG THE CONTIGUOUS AXIS, SO IT CAN READ
   // WHOLE TEXELS - AND `fetch1` WAS ASKING FOR THE SAME TEXEL FOUR TIMES. Four
   // consecutive k of `a[c][i][k]` are four consecutive floats, which is one
@@ -200,19 +251,22 @@ export const splitContractSource = (length, channels, direction, divideByLength,
   // 🔴 THE INCOMING DIRECTION CANNOT: it walks `a[c][k][j]`, a stride of L
   // floats, so no two of its reads share a texel. Turning it into an outgoing
   // contraction over transposed planes would, and is not done here.
-  const coalesced = coalesce && direction === "outgoing" && length % 4 === 0;
+  const coalesced = coalesce && direction === "outgoing" && paddedLength % 4 === 0;
   const body = coalesced
-    ? `  for (int k4 = 0; k4 < L / 4; ++k4) {
-    total += dot(fetch4(aTex, (plane + i * L) / 4 + k4), fetch4(bTex, (plane + j * L) / 4 + k4));
+    ? `  for (int k4 = 0; k4 < LP / 4; ++k4) {
+    total += dot(fetch4(aTex, (plane + i * LP) / 4 + k4), fetch4(bTex, (plane + j * LP) / 4 + k4));
   }`
     : `  for (int k = 0; k < L; ++k) {
     ${direction === "outgoing"
-    ? "total += fetch1(aTex, plane + i * L + k) * fetch1(bTex, plane + j * L + k);"
-    : "total += fetch1(aTex, plane + k * L + j) * fetch1(bTex, plane + k * L + i);"}
+    ? "total += fetch1(aTex, plane + i * LP + k) * fetch1(bTex, plane + j * LP + k);"
+    : "total += fetch1(aTex, plane + k * LP + j) * fetch1(bTex, plane + k * LP + i);"}
   }`;
   return `${PRELUDE}${ONE_TARGET}
 const int L = ${length};
-const int PAIRS = ${length * length};
+// The operands' pair axes, padded to a multiple of four so the coalesced loop
+// is legal; equal to L whenever nothing needed padding.
+const int LP = ${paddedLength};
+const int PLANE = ${paddedLength * paddedLength};
 const int C4 = ${channels / 4};
 const int ELEMENTS = ${length * length * channels};
 uniform sampler2D aTex;
@@ -220,7 +274,7 @@ uniform sampler2D bTex;
 
 float contract(int c, int i, int j) {
   float total = 0.0;
-  int plane = c * PAIRS;
+  int plane = c * PLANE;
 ${body}
   return ${divideByLength ? "total / float(L)" : "total"};
 }
@@ -253,29 +307,38 @@ void main() {
  * this kernel has the bad pattern - once, over L^2 * C elements, where the
  * contraction had it L times over.
  */
-export const planeTransposeSource = (length, channels) => `${PRELUDE}${ONE_TARGET}
+export const planeTransposeSource = (length, channels, paddedLength = length) =>
+  `${PRELUDE}${ONE_TARGET}
 const int L = ${length};
+// It reads the SOURCE at its own pair axes and writes at the PADDED ones, so
+// the transpose and the padding are one pass rather than two. Reading the
+// destination's stride here is what reddened the incoming direction at every
+// padded length while the aligned ones stayed green.
+const int LP = ${paddedLength};
 const int PAIRS = ${length * length};
+const int PLANE = ${paddedLength * paddedLength};
 const int C4 = ${channels / 4};
-const int ELEMENTS = ${length * length * channels};
+const int ELEMENTS = ${channels * paddedLength * paddedLength};
 uniform sampler2D xTex;
 
 void main() {
   int texel = linearTexel();
   if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
   // Four consecutive elements of the plane-major tensor are four consecutive j
-  // of one (c, i), and each comes from its own row of the source plane.
+  // of one (c, i), and each comes from its own row of the source plane. LP is a
+  // multiple of four, so the four share one plane and one i.
   int element = texel * 4;
-  int plane = element / PAIRS;
-  int within = element - plane * PAIRS;
-  int i = within / L;
-  int j = within - i * L;
+  int plane = element / PLANE;
+  int within = element - plane * PLANE;
+  int i = within / LP;
+  int j = within - i * LP;
+  if (i >= L) { result = vec4(0.0); return; }
   int base = plane * PAIRS + i;
   result = vec4(
-    fetch1(xTex, base + j * L),
-    fetch1(xTex, base + (j + 1) * L),
-    fetch1(xTex, base + (j + 2) * L),
-    fetch1(xTex, base + (j + 3) * L));
+    j + 0 < L ? fetch1(xTex, base + (j + 0) * L) : 0.0,
+    j + 1 < L ? fetch1(xTex, base + (j + 1) * L) : 0.0,
+    j + 2 < L ? fetch1(xTex, base + (j + 2) * L) : 0.0,
+    j + 3 < L ? fetch1(xTex, base + (j + 3) * L) : 0.0);
 }`;
 
 /**
@@ -300,18 +363,18 @@ void main() {
  * rather than thirty-two, and so that a `vec4` is never indexed by a variable.
  */
 export const blockedContractSource = (length, channels, direction, divideByLength,
-  channelSlowest = true) => {
+  channelSlowest = true, paddedLength = length) => {
   const planes = 8;
   const component = ["x", "y", "z", "w"];
   // For the outgoing direction a row is `a[i][k]`, contiguous in k; for the
   // incoming one the caller has already transposed both operands, so it is the
   // same expression.
-  const row = (tex, pair) => `(plane + ${pair} * L) / 4 + k4`;
+  const row = (tex, pair) => `(plane + ${pair} * LP) / 4 + k4`;
   const channelBlock = (c4) => `  {
     float s00 = 0.0, s01 = 0.0, s02 = 0.0, s03 = 0.0;
     float s10 = 0.0, s11 = 0.0, s12 = 0.0, s13 = 0.0;
-    int plane = (cgroup * 4 + ${c4}) * PAIRS;
-    for (int k4 = 0; k4 < L / 4; ++k4) {
+    int plane = (cgroup * 4 + ${c4}) * PLANE;
+    for (int k4 = 0; k4 < LP / 4; ++k4) {
       vec4 a0 = fetch4(aTex, ${row("aTex", "i0")});
       vec4 a1 = fetch4(aTex, ${row("aTex", "i1")});
       vec4 b0 = fetch4(bTex, ${row("bTex", "j0")});
@@ -327,11 +390,14 @@ ${[0, 1].map((di) => [0, 1, 2, 3].map((dj) =>
   }`;
   return `${PRELUDE}${targetDeclarations(planes)}
 const int L = ${length};
-const int PAIRS = ${length * length};
+// The padded pair axes: the block sweeps the PADDED grid, whose tail rows and
+// columns are zeros, and the repack reads only the true L of them.
+const int LP = ${paddedLength};
+const int PLANE = ${paddedLength * paddedLength};
 const int C4 = ${channels / 4};
-const int IBLOCKS = ${length / 2};
-const int JBLOCKS = ${length / 4};
-const int BLOCKS = ${(length / 2) * (length / 4)};
+const int IBLOCKS = ${paddedLength / 2};
+const int JBLOCKS = ${paddedLength / 4};
+const int BLOCKS = ${(paddedLength / 2) * (paddedLength / 4)};
 uniform sampler2D aTex;
 uniform sampler2D bTex;
 
@@ -398,11 +464,14 @@ export const CONTRACT_BLOCK_MAX_PAIR_FLOATS = 1572864;
  * Plane `(i & 1) * 4 + (j & 3)` holds the pair at
  * `((i >> 1) * JBLOCKS + (j >> 2)) * C4 + cgroup`.
  */
-export const contractRepackSource = (length, channels, channelSlowest = true) => `${PRELUDE}${ONE_TARGET}
+export const contractRepackSource = (length, channels, channelSlowest = true,
+  paddedLength = length) => `${PRELUDE}${ONE_TARGET}
 const int L = ${length};
 const int C4 = ${channels / 4};
-const int JBLOCKS = ${length / 4};
-const int BLOCKS = ${(length / 2) * (length / 4)};
+// Its OUTPUT is the true L * L pairs and its SOURCE is the padded grid, which
+// is the one place both lengths appear.
+const int JBLOCKS = ${paddedLength / 4};
+const int BLOCKS = ${(paddedLength / 2) * (paddedLength / 4)};
 const int ELEMENTS = ${length * length * channels};
 ${Array.from({ length: 8 }, (_, p) => `uniform sampler2D plane${p};`).join("\n")}
 
@@ -467,46 +536,53 @@ void main() {
  *
  * @param {import("../../runtime/execution.js").Execution} execution
  */
-function contractInto(execution, output, a, b, length, channels, divideByLength, direction) {
-  // The pair block needs L divisible by four (two i and four j a fragment) and
-  // eight render targets; `MAX_DRAW_BUFFERS` is at least four everywhere, so
-  // the one-pair kernel stays for a context that has only four.
-  const blocked = length % 4 === 0 && execution.maxDrawBuffers >= 8
+function contractInto(execution, output, a, b, length, channels, divideByLength,
+  direction, padded = length) {
+  // The pair block needs the PADDED length divisible by four - two i and four j
+  // a fragment - and eight render targets; `MAX_DRAW_BUFFERS` is at least four
+  // everywhere, so the one-pair kernel stays for a context that has only four.
+  // The size ceiling is on the TRUE tensor, which is what the repack moves.
+  const blocked = padded % 4 === 0 && execution.maxDrawBuffers >= 8
     && !execution.noContractBlock
     && (execution.noContractCeiling
       || length * length * channels <= CONTRACT_BLOCK_MAX_PAIR_FLOATS);
+  const tag = padded === length ? "" : `:padded${padded}`;
   if (!blocked) {
     execution.dispatch({
       source: splitContractSource(length, channels, direction === "incoming" ? "incoming" : "outgoing",
-        divideByLength, !execution.noTriangleCoalesce),
+        divideByLength, !execution.noTriangleCoalesce, padded),
       output,
       inputs: { aTex: a, bTex: b },
-      label: `af3.triangle.contract-only:${direction}:${length}x${channels}`
+      label: `af3.triangle.contract-only:${direction}:${length}x${channels}${tag}`
         + `${divideByLength ? ":over-length" : ""}`,
     });
     return output;
   }
-  const planeTexels = (length / 2) * (length / 4) * (channels / 4);
+  const planeTexels = (padded / 2) * (padded / 4) * (channels / 4);
   const planes = Array.from({ length: 8 },
     (_, p) => execution.allocate(planeTexels * 4, `af3.triangle.pair-plane${p}`));
   execution.dispatch({
     source: blockedContractSource(length, channels, direction, divideByLength,
-      !execution.noContractChannelSlowest),
+      !execution.noContractChannelSlowest, padded),
     outputs: planes,
     inputs: { aTex: a, bTex: b },
-    label: `af3.triangle.contract-block:${direction}:${length}x${channels}`
+    label: `af3.triangle.contract-block:${direction}:${length}x${channels}${tag}`
       + `${divideByLength ? ":over-length" : ""}`,
   });
   execution.dispatch({
     source: contractRepackSource(length, channels,
-      !execution.noContractChannelSlowest),
+      !execution.noContractChannelSlowest, padded),
     output,
     inputs: Object.fromEntries(planes.map((plane, p) => [`plane${p}`, plane])),
-    label: `af3.triangle.contract-repack:${length}x${channels}`,
+    label: `af3.triangle.contract-repack:${length}x${channels}${tag}`,
   });
   for (const plane of planes) execution.release(plane);
   return output;
 }
+
+/** The pair axes rounded up to a multiple of four, or the length itself. */
+const paddedPairLength = (execution, length) =>
+  (length % 4 === 0 || execution.noContractPad ? length : Math.ceil(length / 4) * 4);
 
 /**
  * @param {import("../../runtime/execution.js").Execution} execution
@@ -592,25 +668,49 @@ export function triangleMultiplication(execution, call) {
     // transposes are two passes over the tensor against L passes of
     // single-float reads: measured, the incoming direction was the slower half
     // of this stage even after the outgoing one was coalesced.
-    const transposeIncoming = direction === "incoming" && length % 4 === 0
+    //
+    // 🔴 AND THE PAIR AXES ARE PADDED TO A MULTIPLE OF FOUR FIRST, WHICH IS
+    // WHAT MAKES EITHER FAST PATH LEGAL AT AN ODD LENGTH - see
+    // `padPairPlanesSource`. Both of them need four to divide the length, so at
+    // ESMFold2's 75 tokens this stage ran the scalar loop and was 66% of the
+    // whole fold. The padding is zeros, so the k loop's tail adds exactly zero.
+    const padded = paddedPairLength(execution, length);
+    const transposeIncoming = direction === "incoming" && padded % 4 === 0
       && !execution.noTriangleCoalesce && !execution.noTriangleTranspose;
+    const paddedPlane = channels * padded * padded;
     if (transposeIncoming) {
-      const aT = execution.allocate(pairs * channels, "af3.triangle.aT");
-      const bT = execution.allocate(pairs * channels, "af3.triangle.bT");
+      // The transpose writes at the padded axes in the same pass.
+      const aT = execution.allocate(paddedPlane, "af3.triangle.aT");
+      const bT = execution.allocate(paddedPlane, "af3.triangle.bT");
       /** @type {[Tensor, Tensor, string][]} */
       const planes = [[a, aT, "a"], [b, bT, "b"]];
       for (const [source, target, name] of planes) {
         execution.dispatch({
-          source: planeTransposeSource(length, channels),
+          source: planeTransposeSource(length, channels, padded),
           output: target,
           inputs: { xTex: source },
           label: `af3.triangle.transpose-${name}:${length}x${channels}`,
         });
       }
       contractInto(execution, contracted, bT, aT, length, channels, divideByLength,
-        "incoming-transposed");
+        "incoming-transposed", padded);
       execution.release(aT);
       execution.release(bT);
+    } else if (padded !== length) {
+      /** @type {Tensor[]} */
+      const pads = [a, b].map((operand, index) => {
+        const target = execution.allocate(paddedPlane, `af3.triangle.padded${index}`);
+        execution.dispatch({
+          source: padPairPlanesSource(length, channels, padded),
+          output: target,
+          inputs: { xTex: operand },
+          label: `af3.triangle.pad-planes:${length}->${padded}x${channels}`,
+        });
+        return target;
+      });
+      contractInto(execution, contracted, pads[0], pads[1], length, channels,
+        divideByLength, direction, padded);
+      for (const operand of pads) execution.release(operand);
     } else {
       contractInto(execution, contracted, a, b, length, channels, divideByLength, direction);
     }

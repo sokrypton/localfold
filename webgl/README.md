@@ -1053,6 +1053,57 @@ sufficient one. A generalisation measured on one model is a regression on anothe
 reason this is a sentence rather than a shipped defect is that the AF2 differential runs on every
 pass.
 
+### Four does not divide 75, and that was two thirds of an ESMFold2 fold
+
+🔴 **THE BIGGEST SINGLE FACTOR IN THIS WHOLE CAMPAIGN, AND IT WAS A DIVISIBILITY
+CONDITION.** The contraction has two fast paths and BOTH need four to divide the pair length: the
+coalesced `fetch4` along k, because a row must begin on a texel boundary, and the pair block,
+because a fragment owns four j. ESMFold2 folds **75 tokens**, so neither was reachable and it ran
+the scalar one-float-at-a-time loop - the fallback written for an odd width. Its own profile, with
+`--profile` finally wired into `fold-esmfold2-webgl.js`:
+
+```
+af3.triangle.contract-only   15252 ms   56 calls   65.9%   272.35 ms each
+linear.block                  3545 ms 1139 calls   15.3%     3.11 ms each
+```
+
+**272 ms a call at 0.4 GFLOP/s**, where the same kernel pair-blocked at 68 tokens reaches 10 - and
+**15.3 s of a 23.2 s fold in one kernel**. Padding both pair axes to 76 with zeros makes both fast
+paths legal:
+
+| | WebGL2 before | after | |
+|---|---:|---:|---:|
+| **ESMFold2**, 36 tower blocks, 4 loops of 24, 11 steps | 62.9 s | **16.2 s** | **3.88x** |
+| **AlphaFold 3**, 59 tokens padded to 60 | 3.67 s | **2.86 s** | **1.28x** |
+| bioemu2, 68 tokens - already a multiple of four | 7.21 s | 7.30 s | 1.00x |
+
+Every reported quantity holds: ESMFold2 at pLDDT 57.405, pTM 0.4132, 126 contacts and median CA-CA
+3.637 **in both arms**, AF3 at pLDDT 66.525 and pTM 0.242, bioemu2's CA-CA identical to sixteen
+digits. `--no-contract-pad` is the control arm.
+
+🔴 **AND THE PADDING IS EXACT, NOT AN APPROXIMATION.** The tail is ZEROS, so the k loop running to
+76 adds `0.0 * 0.0` - the same sum, not a nearly-equal one - and the repack reads only the true 75
+of the padded grid, so nothing downstream sees a different shape. The cost is `(76/75)^3` = **4%
+more multiply-adds** plus two passes over the operands, against a factor of four.
+
+🔴 **AND IT IS NOT THE PADDED ROW STRIDE THAT WAS MEASURED AND DECLINED ABOVE.** That one laid an
+ALREADY-ALIGNED row at a wider stride to buy cache locality, and lost. This one makes an UNALIGNED
+row aligned so that a different kernel becomes legal. Same machinery, opposite question - and the
+reason the first result did not predict the second is that a cache experiment at 68 tokens cannot
+see a kernel that 68 tokens already reaches.
+
+🔴 **AND THE GATE FOUND IT READY, BECAUSE ITS LENGTHS WERE WIDENED EARLIER FOR AN UNRELATED REASON.**
+`check-webgl-af3-triangle.js` drives 5, 11, 12 and 68 - the first two ODD, so the padded path is
+exercised by the default gate from the moment it exists (5 pads to 8, 11 to 12), and `12` and `68`
+hold the unpadded one. The commit that widened those lengths was about a gate that had never run
+three of its kernels; it paid for itself twice.
+
+🔴 **AND `--profile` WAS BUILT INTO THE ESMFold2 TOOL AND NEVER PRINTED.** `webglExecution` honours
+the flag, so every dispatch in that tool had been paying the one-texel readback barrier and
+reporting nothing - on the model whose trunk is 53 s of a 62 s fold, which is the one most worth
+ranking. One line. **The kernel that was two thirds of a fold was invisible because nobody had asked
+that tool where its time went.**
+
 ### The contraction is 256 matmuls, and the fragment order decides whether one fits in cache
 
 🔴 **THE SAME PROPERTY AS THE PROJECTION'S ROW ORDER, IN THE KERNEL WHERE IT IS WORTH MORE.** The

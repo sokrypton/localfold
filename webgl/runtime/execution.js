@@ -197,11 +197,24 @@ export class Execution {
      */
     this.noContractCeiling = options.noContractCeiling ?? false;
     /**
+     * The control arm for the contraction's PAIR AXES padded to a multiple of
+     * four (`padPairPlanesSource`), which is what makes the coalesced reads and
+     * the pair block legal at a length four does not divide - 66% of an
+     * ESMFold2 fold at 75 tokens. Off, the odd lengths run the scalar loop.
+     */
+    this.noContractPad = options.noContractPad ?? false;
+    /**
      * The control arm for bioemu2's pair bias normalising a row ONCE
      * (`webgl/bioemu2/denoiser.js`): the statistics recomputed per head, at
      * 3584 texelFetch a fragment rather than 512. Bit-identical.
      */
     this.noPairBiasFast = options.noPairBiasFast ?? false;
+    /**
+     * The control arm for bioemu2's attentions reading their head dimension
+     * four channels at a time (`headDot`): one `fetch1` a channel, twice over,
+     * which is four times the texelFetch for the same numbers.
+     */
+    this.noAttendDot4 = options.noAttendDot4 ?? false;
     /**
      * Where the HOST time inside `dispatch` goes, when asked for.
      *

@@ -26,7 +26,7 @@ import {
   atomDecoderWeights, atomEncoderWeights, confidenceHeadWeights,
   conditioningWeights, denoiserWeights, featuriserWeights, trunkBlockWeights,
 } from "../../shared/esmfold2/weights.js";
-import { webglExecution } from "./webgl-execution-options.js";
+import { webglExecution, webglProfile } from "./webgl-execution-options.js";
 import { createWebGL2Context } from "../../webgl/index.js";
 import { foldEsmfold2 } from "../../webgl/esmfold2/model/fold.js";
 import { SAMPLER_DEFAULTS } from "../../webgl/esmfold2/sampler.js";
@@ -316,6 +316,14 @@ export async function main(device, args) {
     contactsOverHalf: contacts,
     stages,
     memory,
+    // 🔴 `--profile` BUILT THE TABLE AND NOBODY PRINTED IT. `webglExecution`
+    // honours the flag, so every dispatch in this tool has been paying the
+    // one-texel readback barrier under `--profile` and reporting nothing - and
+    // this is the model whose trunk is 53 s of a 62 s fold, so it is the one
+    // most worth ranking. Read it with the barrier in mind: it is about 0.9 ms
+    // a call here, so a kernel's share must be corrected for its CALL COUNT
+    // before it is believed (see webgl/README.md's note on `linear.repack`).
+    profile: webglProfile(execution, args ?? []),
     verdict: failures.length === 0
       ? `ok: ${result.tokens} tokens folded in WebGL2`
         + `${towerBlocks >= towerManifest.layers ? "" : " (a tower PREFIX)"}`
