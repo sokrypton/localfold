@@ -13,7 +13,7 @@
  * a stage that wants to accumulate ping-pongs between two tensors. Writing
  * `add(x, y, x)` would be the WebGPU habit silently producing undefined output.
  */
-import { ONE_TARGET, PRELUDE, sized } from "./execution.js";
+import { ONE_TARGET, PRELUDE, sized, part } from "./execution.js";
 /** @typedef {import("./storage.js").Tensor} Tensor */
 
 
@@ -29,19 +29,17 @@ void main() {
  * that draw them directly.
  */
 const OPS = { add: 0, multiply: 1, scale: 2, relu: 3, copy: 4 };
-export const elementwiseSource = (elements) => sized({ ELEMENTS: elements }, `${PRELUDE}${ONE_TARGET}
-uniform sampler2D aTex;
-uniform sampler2D bTex;
-uniform int OP;
-uniform float scale;
-${guard}
+export const elementwiseSource = (elements) => part({ ELEMENTS: elements }, {
+  uniforms: ["sampler2D aTex", "sampler2D bTex", "int OP", "float scale"],
+  body: `  int texel = linearTexel();
+  if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
   vec4 a = fetch4(aTex, texel);
   if (OP == ${OPS.add}) result = a + fetch4(bTex, texel);
   else if (OP == ${OPS.multiply}) result = a * fetch4(bTex, texel);
   else if (OP == ${OPS.scale}) result = a * scale;
   else if (OP == ${OPS.relu}) result = max(a, vec4(0.0));
-  else result = a;
-}`);
+  else result = a;`,
+});
 
 /**
  * The shared program as one operation, for a kernel module whose own `a + b`, `a * b` or copy was
@@ -53,8 +51,8 @@ ${guard}
  * @param {number} elements
  */
 export const elementwiseOpSource = (op, elements) => {
-  const { code, sizes } = elementwiseSource(elements);
-  return { code, sizes: { ...sizes, OP: OPS[op] } };
+  const source = elementwiseSource(elements);
+  return { ...source, sizes: { ...source.sizes, OP: OPS[op] } };
 };
 
 /** `a + b`, elementwise. */
@@ -185,16 +183,13 @@ export function scale(execution, a, factor, into) {
  * WebGPU side folds this into whichever kernel is adjacent; here it is its own
  * draw until something measures that as a cost.
  */
-export const maskRowsSource = (rows, channels) => sized({ ROWS: rows }, `${PRELUDE}${ONE_TARGET}
-const int CH4 = ${channels / 4};
-uniform sampler2D xTex;
-uniform sampler2D maskTex;
-void main() {
-  int texel = linearTexel();
+export const maskRowsSource = (rows, channels) => part({ ROWS: rows, CH4: channels / 4 }, {
+  uniforms: ["sampler2D xTex", "sampler2D maskTex"],
+  body: `  int texel = linearTexel();
   if (texel >= ROWS * CH4) { result = vec4(0.0); return; }
   int row = texel / CH4;
-  result = fetch4(xTex, texel) * fetch1(maskTex, row);
-}`);
+  result = fetch4(xTex, texel) * fetch1(maskTex, row);`,
+});
 
 /**
  * @param {import("./execution.js").Execution} execution

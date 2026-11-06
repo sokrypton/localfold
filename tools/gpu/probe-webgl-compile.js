@@ -25,13 +25,35 @@ export async function main(_device, args = []) {
   const { batch } = af3BatchFromA3m("PIAQIHILEGRSDEQKETLIREVSEAISRSLDAPLTSVRVMKVLLTGAGSRAAELVRKAGH".repeat(8).slice(0, length), null, {});
   mark("uploaded");
   let t = performance.now();
-  const { programs, groups: sliceGroups } = await foldPrograms(execution, {
+  const { programs, groups: sliceGroups, sliceMs } = await foldPrograms(execution, {
     batch, weights: uploaded, hostWeights: weights, steps: 1, seed: 1,
     msa: { codes: Float32Array.from(batch.msa), deletions: Float32Array.from(batch.deletionMatrix), mask: Float32Array.from(batch.msaMask), sequences: 1 },
   });
   const dryRunMs = Math.round(performance.now() - t);
   mark("dry run done");
   const gl = execution.gl;
+  // ...and as a fold packages them: each slice group's parts as one program (Execution.combine)
+  for (const group of sliceGroups) execution.combine(group);
+  const packagedGroups = sliceGroups.map((group) => [...new Set(group.map((source) => execution.packaged(source)))]);
+  const packagedLink = (codes) => {
+    const fresh = createWebGL2Context();
+    const at = performance.now();
+    for (const code of codes) linkProgram(fresh, code);
+    return Math.round(performance.now() - at);
+  };
+  const firstPrograms = new Map();
+  for (const source of sliceGroups[0]) {
+    const code = execution.packaged(source);
+    if (!firstPrograms.has(code)) firstPrograms.set(code, []);
+    firstPrograms.get(code).push(programs.get(source).split(":")[0]);
+  }
+  const packaged = {
+    firstGroupPrograms: [...firstPrograms.values()].map((labels) => labels.join("+")),
+    programs: new Set(packagedGroups.flat()).size,
+    groups: packagedGroups.map((g) => g.length),
+    firstGroupLinkMs: packagedLink(packagedGroups[0]),
+    allLinkMs: packagedLink([...new Set(packagedGroups.flat())]),
+  };
   const timed = [];
   const linkMsOf = new Map();
   // `--shared-vs=1`: one compiled vertex shader attached to every program, instead of one each.
@@ -75,7 +97,7 @@ export async function main(_device, args = []) {
   const merged = {};
   for (const labels of groups.values()) if (labels.length > 1) merged[labels[0]] = (merged[labels[0]] ?? 0) + labels.length - 1;
   return {
-    withWidthsAsUniforms: groups.size, mergedAway: merged,
+    dryRunSlices: sliceMs.filter(([, ms]) => ms >= 3).map(([stage, ms]) => `${stage} ${ms}`), packaged, withWidthsAsUniforms: groups.size, mergedAway: merged,
     perFamily: Object.entries(timed.reduce((a, { label }) => { const f = label.split(":")[0]; a[f] = (a[f] ?? 0) + 1; return a; }, {}))
       .filter(([, n]) => n > 1).sort((a, b) => b[1] - a[1]).map(([f, n]) => `${n} ${f}`),
     labelsOf: Object.fromEntries((option("labels", "") ? option("labels", "").split(",") : []).map((f) => [f, timed.filter(({ label }) => label.split(":")[0] === f).map(({ label }) => label)])),

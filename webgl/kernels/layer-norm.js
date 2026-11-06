@@ -37,7 +37,7 @@
  * is the cost, on a path nothing else here takes; `kernels/linear.js` documents
  * the same split for AF2's 50 pLDDT bins.
  */
-import { ONE_TARGET, PRELUDE, sized } from "../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, sized, part } from "../runtime/execution.js";
 
 /** @typedef {import("../runtime/storage.js").Tensor} Tensor */
 
@@ -61,15 +61,9 @@ export const layerNormSource = (
 /** The ragged form: every element resolves its own row and sweeps it. */
 export const raggedLayerNormSource = (
   rows, channels, roundHalf, variance, hasWeight, hasBias,
-) => sized({ ELEMENTS: rows * channels, CHANNELS: channels }, `${PRELUDE}${ONE_TARGET}
-uniform sampler2D xTex;
-uniform sampler2D weightTex;
-uniform sampler2D biasTex;
-uniform int HAS_WEIGHT;
-uniform int HAS_BIAS;
-uniform float epsilon;
-
-float normalised(int element) {
+) => part({ ELEMENTS: rows * channels, CHANNELS: channels }, {
+  uniforms: ["sampler2D xTex", "sampler2D weightTex", "sampler2D biasTex", "int HAS_WEIGHT", "int HAS_BIAS", "float epsilon"],
+  helpers: `float raggedNormalised(int element) {
   int row = element / CHANNELS;
   int channel = element - row * CHANNELS;
   int base = row * CHANNELS;
@@ -94,18 +88,16 @@ ${variance === "fast" ? `  float totalSquares = 0.0;
   if (HAS_WEIGHT == 1) value *= fetch1(weightTex, channel);
   if (HAS_BIAS == 1) value += fetch1(biasTex, channel);
   return value;
-}
-
-void main() {
-  int base = linearTexel() * 4;
+}`,
+  body: `  int base = linearTexel() * 4;
   if (base >= ELEMENTS) { result = vec4(0.0); return; }
   vec4 value = vec4(
-    normalised(base),
-    base + 1 < ELEMENTS ? normalised(base + 1) : 0.0,
-    base + 2 < ELEMENTS ? normalised(base + 2) : 0.0,
-    base + 3 < ELEMENTS ? normalised(base + 3) : 0.0);
-  result = ${roundHalf ? "half4(value)" : "value"};
-}`);
+    raggedNormalised(base),
+    base + 1 < ELEMENTS ? raggedNormalised(base + 1) : 0.0,
+    base + 2 < ELEMENTS ? raggedNormalised(base + 2) : 0.0,
+    base + 3 < ELEMENTS ? raggedNormalised(base + 3) : 0.0);
+  result = ${roundHalf ? "half4(value)" : "value"};`,
+});
 
 /**
  * 🔴 SPLITTING THE ROW STATISTICS INTO THEIR OWN PASS IS A MEASURED NULL, AND
@@ -140,12 +132,9 @@ void main() {
  * ~25 us a 110,592-texel draw costs, and neither its traffic nor its redundant
  * reduction accounts for the difference.
  */
-export const layerNormStatsSource = (rows, channels, variance) => sized({ ROWS: rows, CHANNELS: channels, CH4: channels / 4 }, `${PRELUDE}${ONE_TARGET}
-uniform sampler2D xTex;
-uniform float epsilon;
-
-void main() {
-  int row = linearTexel();
+export const layerNormStatsSource = (rows, channels, variance) => part({ ROWS: rows, CHANNELS: channels, CH4: channels / 4 }, {
+  uniforms: ["sampler2D xTex", "float epsilon"],
+  body: `  int row = linearTexel();
   if (row >= ROWS) { result = vec4(0.0); return; }
   int base = row * CH4;
 ${variance === "fast"
@@ -171,8 +160,8 @@ ${variance === "fast"
     spread += dot(centred, centred);
   }
   float inverseStd = inversesqrt(spread / float(CHANNELS) + epsilon);`}
-  result = vec4(mean, inverseStd, 0.0, 0.0);
-}`);
+  result = vec4(mean, inverseStd, 0.0, 0.0);`,
+});
 
 /**
  * The aligned kernel with the statistics read rather than swept.
@@ -182,16 +171,9 @@ ${variance === "fast"
  */
 export const splitLayerNormSource = (
   rows, channels, roundHalf, hasWeight, hasBias,
-) => sized({ ROWS: rows, CH4: channels / 4 }, `${PRELUDE}${ONE_TARGET}
-uniform sampler2D xTex;
-uniform sampler2D statsTex;
-uniform sampler2D weightTex;
-uniform sampler2D biasTex;
-uniform int HAS_WEIGHT;
-uniform int HAS_BIAS;
-
-void main() {
-  int texel = linearTexel();
+) => part({ ROWS: rows, CH4: channels / 4 }, {
+  uniforms: ["sampler2D xTex", "sampler2D statsTex", "sampler2D weightTex", "sampler2D biasTex", "int HAS_WEIGHT", "int HAS_BIAS"],
+  body: `  int texel = linearTexel();
   if (texel >= ROWS * CH4) { result = vec4(0.0); return; }
   int row = texel / CH4;
   int group = texel - row * CH4;
@@ -201,21 +183,14 @@ void main() {
   vec4 w = HAS_WEIGHT == 1 ? fetch4(weightTex, group) : vec4(1.0);
   vec4 b = HAS_BIAS == 1 ? fetch4(biasTex, group) : vec4(0.0);
   vec4 normalised = (value - stats.x) * stats.y * w + b;
-  result = ${roundHalf ? "half4(normalised)" : "normalised"};
-}`);
+  result = ${roundHalf ? "half4(normalised)" : "normalised"};`,
+});
 
 export const alignedLayerNormSource = (
   rows, channels, roundHalf, variance, hasWeight, hasBias,
-) => sized({ ROWS: rows, CHANNELS: channels, CH4: channels / 4 }, `${PRELUDE}${ONE_TARGET}
-uniform sampler2D xTex;
-uniform sampler2D weightTex;
-uniform sampler2D biasTex;
-uniform int HAS_WEIGHT;
-uniform int HAS_BIAS;
-uniform float epsilon;
-
-void main() {
-  int texel = linearTexel();
+) => part({ ROWS: rows, CHANNELS: channels, CH4: channels / 4 }, {
+  uniforms: ["sampler2D xTex", "sampler2D weightTex", "sampler2D biasTex", "int HAS_WEIGHT", "int HAS_BIAS", "float epsilon"],
+  body: `  int texel = linearTexel();
   if (texel >= ROWS * CH4) { result = vec4(0.0); return; }
   int row = texel / CH4;
   int group = texel - row * CH4;
@@ -255,8 +230,8 @@ ${variance === "fast"
   // The shipped AF2 attention stores this tensor in f16 (normalizedStorage);
   // see half4 in webgl/runtime/execution.js. No backticks in a GLSL comment -
   // it lives inside a JS template literal and one would end it.
-  result = ${roundHalf ? "half4(normalised)" : "normalised"};
-}`);
+  result = ${roundHalf ? "half4(normalised)" : "normalised"};`,
+});
 
 /**
  * @param {import("../runtime/execution.js").Execution} execution

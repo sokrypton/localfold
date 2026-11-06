@@ -32,7 +32,7 @@
  * than matrix products - which is also why `kernels/linear.js` cannot serve
  * here: its input widths would be 128 and 64 one-hot columns.
  */
-import { ONE_TARGET, PRELUDE, sized } from "../../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, sized, part } from "../../runtime/execution.js";
 import { linear } from "../../kernels/linear.js";
 import { relu } from "../../runtime/elementwise.js";
 
@@ -50,23 +50,9 @@ export const PAIR_CONDITIONING_WEIGHTS = [
   "singleToPairCondRow", "singleToPairCondCol", "embedPairOffsets", "embedPairDistances",
 ];
 
-export const perAtomSource = (rows, channels, rawCharge, hasBias) => sized({ ELEMENTS: rows * channels }, `${PRELUDE}${ONE_TARGET}
-const int C4 = ${channels / 4};
-const int C = ${channels};
-uniform sampler2D positionsTex;
-uniform sampler2D maskTex;
-uniform sampler2D chargeTex;
-uniform sampler2D elementTex;
-uniform sampler2D nameTex;
-uniform sampler2D posWeightTex;
-uniform sampler2D maskWeightTex;
-uniform sampler2D chargeWeightTex;
-uniform sampler2D elementWeightTex;
-uniform sampler2D nameWeightTex;
-${hasBias ? "uniform sampler2D biasTex;" : ""}
-
-void main() {
-  int texel = linearTexel();
+export const perAtomSource = (rows, channels, rawCharge, hasBias) => part({ ELEMENTS: rows * channels, C4: channels / 4, C: channels }, {
+  uniforms: ["sampler2D positionsTex", "sampler2D maskTex", "sampler2D chargeTex", "sampler2D elementTex", "sampler2D nameTex", "sampler2D posWeightTex", "sampler2D maskWeightTex", "sampler2D chargeWeightTex", "sampler2D elementWeightTex", "sampler2D nameWeightTex", "sampler2D biasTex"],
+  body: `  int texel = linearTexel();
   if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
   int group = texel % C4;
   int row = texel / C4;
@@ -105,8 +91,8 @@ ${rawCharge ? "" : "  charge = log(charge + sqrt(charge * charge + 1.0));"}
   value += nameSum;
 
   // ...and masked LAST.
-  result = value * mask;
-}`);
+  result = value * mask;`,
+});
 
 /**
  * @param {import("../../runtime/execution.js").Execution} execution

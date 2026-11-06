@@ -108,6 +108,53 @@ vec4 half4(vec4 v) {
 /** The single-target `result` declaration, which most kernels want. */
 export const ONE_TARGET = "out vec4 result;\n";
 
+/**
+ * A kernel as a PART: its uniforms, helpers and the body of its `main`, rather than a finished
+ * text, so that the runtime can put several into ONE program (`Execution.combine`), each body a
+ * function chosen by a `KERNEL` uniform. On its own a part assembles into exactly the program it
+ * would have been. Safari 16.3 links a program in ~19 ms on the page's thread whatever its size -
+ * 8 small kernels linked in 158-185 ms as 8 programs and 26-33 ms as one
+ * (tools/gpu/probe-webgl-uber.js) - so the fold's light kernels are parts.
+ *
+ * A part has ONE target (`result`), declares every uniform it reads in `uniforms`
+ * ("sampler2D xTex", "float scale"; its `sizes` are declared for it), no module-scope `const`
+ * (a width is a size), and helpers named for the kernel, since parts share one namespace.
+ *
+ * @param {Record<string, number>} sizes the uniforms `dispatch` sets, as `sized`'s
+ * @param {{uniforms: string[], helpers?: string, body: string}} definition `body` writes
+ *   `result` and may `return`
+ * @returns {{code: string, sizes: Record<string, number>, part: object}}
+ */
+export function part(sizes, { uniforms, helpers = "", body }) {
+  const piece = Object.freeze({ sizes: Object.keys(sizes), uniforms, helpers, body });
+  return { code: assembleParts([piece]), sizes, part: piece };
+}
+
+/**
+ * One program from parts: their uniforms once each (the same name declared two ways is an error,
+ * and those parts are not put together), their helpers, and each body as a function `main`
+ * chooses by `KERNEL` - or, for one part, as `main` itself.
+ */
+export function assembleParts(pieces) {
+  const declarations = new Map();
+  const declare = (name, line) => {
+    const held = declarations.get(name);
+    if (held !== undefined && held !== line) throw new Error(`${name} is declared both "${held}" and "${line}"`);
+    declarations.set(name, line);
+  };
+  for (const piece of pieces) {
+    for (const name of piece.sizes) declare(name, `uniform highp int ${name};`);
+    for (const uniform of piece.uniforms) declare(uniform.split(/\s+/).at(-1), `uniform ${uniform};`);
+  }
+  const head = `${PRELUDE}${ONE_TARGET}${[...declarations.values()].join("\n")}\n`;
+  const helpers = pieces.map((piece) => piece.helpers).filter(Boolean).join("\n");
+  if (pieces.length === 1) return `${head}${helpers}\nvoid main() {\n${pieces[0].body}\n}`;
+  if (declarations.has("KERNEL")) throw new Error("a part may not declare KERNEL");
+  return `${head}uniform highp int KERNEL;\n${helpers}\n`
+    + pieces.map((piece, index) => `void kernel${index}() {\n${piece.body}\n}`).join("\n")
+    + `\nvoid main() {\n${pieces.map((_, index) => `  ${index ? "else " : ""}if (KERNEL == ${index}) kernel${index}();`).join("\n")}\n}`;
+}
+
 /** `count` render targets named result0..result{count-1}, for a wide kernel. */
 export const targetDeclarations = (count) => Array.from(
   { length: count }, (_, t) => `layout(location = ${t}) out vec4 result${t};`).join("\n") + "\n";
@@ -304,6 +351,9 @@ export class Execution {
     this.programs = new Map();
     /** While a Map, `dispatch` only records each kernel's source in it, with its label (see `prepare`). */
     this.collect = null;
+    /** The parts (`part`) dispatch has met, by their own code, and those put in a combined program. */
+    this.parts = new Map();
+    this.combined = new Map();
 
     this.dispatches = 0;
     this.draws = 0;
@@ -434,8 +484,57 @@ export class Execution {
    *
    * @param {Iterable<string>} sources fragment sources
    */
+  /**
+   * Put the parts among these sources into as few programs as they fit in (`assembleParts`), for
+   * draws of them to use from now on; a part already in one, or that cannot join any (a uniform
+   * declared another way), stays as it is. Nothing is compiled here.
+   *
+   * @param {Iterable<string>} sources
+   */
+  combine(sources) {
+    // ...packed into programs of at most MAX_TEXTURE_IMAGE_UNITS samplers each (16 here: one
+    // part alone, the per-atom conditioning, reads 11), a part that does not fit opening the next.
+    const units = this.gl.getParameter(this.gl.MAX_TEXTURE_IMAGE_UNITS);
+    const samplers = (pieces) => new Set(pieces.flatMap((piece) => piece.uniforms
+      .filter((uniform) => /sampler/.test(uniform)).map((uniform) => uniform.split(/\s+/).at(-1)))).size;
+    const bins = [];
+    for (const source of new Set(sources)) {
+      const piece = this.parts.get(source);
+      if (piece === undefined || this.combined.has(source)) continue;
+      const fits = (bin) => {
+        const pieces = [...bin.map(([, held]) => held), piece];
+        if (samplers(pieces) > units) return false;
+        try {
+          assembleParts(pieces);
+          return true;
+        } catch {
+          return false; // declared differently from one already in
+        }
+      };
+      const bin = bins.find(fits);
+      if (bin === undefined) bins.push([[source, piece]]);
+      else bin.push([source, piece]);
+    }
+    for (const bin of bins) {
+      if (bin.length < 2) continue;
+      const pieces = bin.map(([, piece]) => piece);
+      const code = assembleParts(pieces);
+      const names = [...new Set(pieces.flatMap((piece) => piece.uniforms
+        .filter((uniform) => /sampler/.test(uniform)).map((uniform) => uniform.split(/\s+/).at(-1))))];
+      bin.forEach(([source], index) => this.combined.set(source, { code, index, samplers: names }));
+    }
+  }
+
+  /** The program a kernel's source is drawn with: the combined one it is in, or its own. */
+  packaged(source) {
+    return this.combined.get(source)?.code ?? source;
+  }
+
   async prepare(sources) {
     const gl = this.gl;
+    sources = [...sources];
+    this.combine(sources);
+    sources = sources.map((source) => this.packaged(source));
     const parallel = gl.getExtension("KHR_parallel_shader_compile");
     const nextTask = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
     const pending = [];
@@ -624,7 +723,7 @@ export class Execution {
     } = call;
     // A `sized` source: one program text at every length, and the lengths as uniforms.
     const source = typeof call.source === "string" ? call.source : call.source.code;
-    const optionalInts = call.source.sizes === undefined ? (call.optionalInts ?? {})
+    const optionalInts = call.source.sizes === undefined ? { ...call.optionalInts }
       : { ...call.optionalInts, ...call.source.sizes };
     const targets = call.outputs ?? [call.output];
     if (targets.length === 0 || targets.some((tensor) => tensor === undefined)) {
@@ -673,13 +772,17 @@ export class Execution {
         }
       }
     }
+    if (call.source.part !== undefined && !this.parts.has(source)) this.parts.set(source, call.source.part);
     // A dry run (`collect` a Set): the program this draw needs, and no draw.
     if (this.collect !== null) {
       this.collect.set(source, label);
       return output;
     }
     const enteredAt = this.host === null ? 0 : performance.now();
-    const entry = this.program(source);
+    // ...the combined program its part is in, choosing it by KERNEL.
+    const combined = this.combined.get(source);
+    const entry = this.program(combined?.code ?? source);
+    if (combined !== undefined) optionalInts.KERNEL = combined.index;
     const compiledAt = this.host === null ? 0 : performance.now();
     // 🔴 AND CACHING ANY OF THIS IS NOT THE LEVER, MEASURED. `useProgram` and
     // the VAO cached was **1.004x** (22355 ms against 22434), and caching the
@@ -712,6 +815,30 @@ export class Execution {
       // unit so it can release a texture that is about to be drawn into.
       this.boundUnits[unit] = tensor.texture;
       unit += 1;
+    }
+    // 🔴 A COMBINED PROGRAM'S OTHER SAMPLERS ARE STILL ITS SAMPLERS: they keep the units an earlier
+    // draw gave them, and one holding this draw's target is a feedback loop (GL error 0x502) though
+    // nothing reads it. They are pointed at a one-texel texture of their own.
+    if (combined !== undefined) {
+      const spare = combined.samplers.filter((name) => !(name in inputs));
+      if (spare.length > 0) {
+        // ...on its own unit, made there: binding it while the last input's unit was active
+        // replaced that input (every combined draw read a one-texel texture for its mask).
+        gl.activeTexture(gl.TEXTURE0 + unit);
+        if (this.placeholder === undefined) {
+          this.placeholder = gl.createTexture();
+          gl.bindTexture(gl.TEXTURE_2D, this.placeholder);
+          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, 1, 1, 0, gl.RGBA, gl.FLOAT, null);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+        }
+        gl.bindTexture(gl.TEXTURE_2D, this.placeholder);
+        this.boundUnits[unit] = this.placeholder;
+        for (const name of spare) {
+          const location = this.#uniform(entry, name);
+          if (location !== null) gl.uniform1i(location, unit);
+        }
+      }
     }
     const inputsAt = this.host === null ? 0 : performance.now();
     for (const [name, value] of Object.entries(ints)) {

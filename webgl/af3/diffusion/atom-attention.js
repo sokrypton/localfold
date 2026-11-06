@@ -43,7 +43,7 @@
  * Every one of those four has no default on either side.
  */
 import { elementwiseOpSource } from "../../runtime/elementwise.js";
-import { ONE_TARGET, PRELUDE, sized } from "../../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, sized, part } from "../../runtime/execution.js";
 import { layerNorm } from "../../kernels/layer-norm.js";
 import { linear } from "../../kernels/linear.js";
 
@@ -55,18 +55,14 @@ import { linear } from "../../kernels/linear.js";
  * The LayerNorm takes neither a scale nor an offset - the conditioning supplies
  * both - and the conditioning's own norm takes a scale with NO offset.
  */
-export const adaptiveBlendSource = (rows, channels) => sized({ ELEMENTS: rows * channels }, `${PRELUDE}${ONE_TARGET}
-uniform sampler2D normalisedTex;
-uniform sampler2D scaleTex;
-uniform sampler2D shiftTex;
-
-void main() {
-  int texel = linearTexel();
+export const adaptiveBlendSource = (rows, channels) => part({ ELEMENTS: rows * channels }, {
+  uniforms: ["sampler2D normalisedTex", "sampler2D scaleTex", "sampler2D shiftTex"],
+  body: `  int texel = linearTexel();
   if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
   vec4 scale = fetch4(scaleTex, texel);
   result = (vec4(1.0) / (vec4(1.0) + exp(-scale))) * fetch4(normalisedTex, texel)
-    + fetch4(shiftTex, texel);
-}`);
+    + fetch4(shiftTex, texel);`,
+});
 
 /**
  * @param {import("../../runtime/execution.js").Execution} execution
@@ -148,20 +144,16 @@ export const elementwiseProductSource = (elements) => elementwiseOpSource("multi
  * 🔴 WHERE THE MASK IS FALSE THE DESTINATION IS ZERO rather than whatever index
  * 0 holds, "which matters because padded slots index 0 legitimately".
  */
-export const gatherSource = (count, channels) => sized({ ELEMENTS: count * channels, C4: channels / 4 }, `${PRELUDE}${ONE_TARGET}
-uniform sampler2D sourceTex;
-uniform sampler2D indicesTex;
-uniform sampler2D maskTex;
-
-void main() {
-  int texel = linearTexel();
+export const gatherSource = (count, channels) => part({ ELEMENTS: count * channels, C4: channels / 4 }, {
+  uniforms: ["sampler2D sourceTex", "sampler2D indicesTex", "sampler2D maskTex"],
+  body: `  int texel = linearTexel();
   if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
   int group = texel % C4;
   int row = texel / C4;
   if (fetch1(maskTex, row) == 0.0) { result = vec4(0.0); return; }
   int from = int(fetch1(indicesTex, row));
-  result = fetch4(sourceTex, from * C4 + group);
-}`);
+  result = fetch4(sourceTex, from * C4 + group);`,
+});
 
 /**
  * @param {import("../../runtime/execution.js").Execution} execution
@@ -272,34 +264,27 @@ ${wide
 };
 
 /** `out[i] = base[i] + attended[i] + transition[i] * sigmoid(gate[i])`. */
-export const blockOutputSource = (elements) => sized({ ELEMENTS: elements }, `${PRELUDE}${ONE_TARGET}
-uniform sampler2D baseTex;
-uniform sampler2D attendedTex;
-uniform sampler2D transitionTex;
-uniform sampler2D gateTex;
-
-void main() {
-  int texel = linearTexel();
+export const blockOutputSource = (elements) => part({ ELEMENTS: elements }, {
+  uniforms: ["sampler2D baseTex", "sampler2D attendedTex", "sampler2D transitionTex", "sampler2D gateTex"],
+  body: `  int texel = linearTexel();
   if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
   vec4 gate = fetch4(gateTex, texel);
   result = fetch4(baseTex, texel) + fetch4(attendedTex, texel)
-    + fetch4(transitionTex, texel) * (vec4(1.0) / (vec4(1.0) + exp(-gate)));
-}`);
+    + fetch4(transitionTex, texel) * (vec4(1.0) / (vec4(1.0) + exp(-gate)));`,
+});
 
 /** `swish(wide[i]) * wide[intermediate + i]`, the SwiGLU over a blocked row. */
-export const swiGluSource = (rows, intermediate) => sized({ ELEMENTS: rows * intermediate, INTER4: intermediate / 4 }, `${PRELUDE}${ONE_TARGET}
-uniform sampler2D wideTex;
-
-void main() {
-  int texel = linearTexel();
+export const swiGluSource = (rows, intermediate) => part({ ELEMENTS: rows * intermediate, INTER4: intermediate / 4 }, {
+  uniforms: ["sampler2D wideTex"],
+  body: `  int texel = linearTexel();
   if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
   int group = texel % INTER4;
   int row = texel / INTER4;
   int base = row * 2 * INTER4;
   vec4 gate = fetch4(wideTex, base + group);
   vec4 value = fetch4(wideTex, base + INTER4 + group);
-  result = (gate / (vec4(1.0) + exp(-gate))) * value;
-}`);
+  result = (gate / (vec4(1.0) + exp(-gate))) * value;`,
+});
 
 /**
  * @param {import("../../runtime/execution.js").Execution} execution
@@ -500,10 +485,9 @@ export const sumSource = (elements) => elementwiseOpSource("add", elements);
  */
 export const pairLogitsLayoutSource = (shape) => {
   const { subsets, queries, keys, heads, blocks, block } = shape;
-  return sized({ BLOCKS: blocks, ELEMENTS: subsets * heads * queries * keys, QUERIES: queries, KEYS: keys, HEADS: heads, BLOCK: block }, `${PRELUDE}${ONE_TARGET}
-uniform sampler2D flatTex;
-
-float at(int element) {
+  return part({ BLOCKS: blocks, ELEMENTS: subsets * heads * queries * keys, QUERIES: queries, KEYS: keys, HEADS: heads, BLOCK: block }, {
+  uniforms: ["sampler2D flatTex"],
+  helpers: `float logitsLayoutAt(int element) {
   int key = element % KEYS;
   int rest = element / KEYS;
   int query = rest % QUERIES;
@@ -513,17 +497,15 @@ float at(int element) {
   int source = (((subset * QUERIES + query) * KEYS) + key) * BLOCKS * HEADS
     + BLOCK * HEADS + head;
   return fetch1(flatTex, source);
-}
-
-void main() {
-  int base = linearTexel() * 4;
+}`,
+  body: `  int base = linearTexel() * 4;
   if (base >= ELEMENTS) { result = vec4(0.0); return; }
   result = vec4(
-    at(base),
-    base + 1 < ELEMENTS ? at(base + 1) : 0.0,
-    base + 2 < ELEMENTS ? at(base + 2) : 0.0,
-    base + 3 < ELEMENTS ? at(base + 3) : 0.0);
-}`);
+    logitsLayoutAt(base),
+    base + 1 < ELEMENTS ? logitsLayoutAt(base + 1) : 0.0,
+    base + 2 < ELEMENTS ? logitsLayoutAt(base + 2) : 0.0,
+    base + 3 < ELEMENTS ? logitsLayoutAt(base + 3) : 0.0);`,
+});
 };
 
 /**

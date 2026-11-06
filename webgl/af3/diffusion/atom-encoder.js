@@ -45,7 +45,7 @@
  * 🔴 AND THE AGGREGATION AVERAGES OVER A TOKEN'S REAL ATOMS ONLY, after a relu -
  * so a token with three atoms of a 24-slot row divides by three.
  */
-import { ONE_TARGET, PRELUDE, sized } from "../../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, sized, part } from "../../runtime/execution.js";
 import {
   atomPairLogits, crossAttentionBlock, gather, sumSource,
 } from "./atom-attention.js";
@@ -56,16 +56,13 @@ import { relu } from "../../runtime/elementwise.js";
 /** @typedef {import("../../runtime/storage.js").Tensor} Tensor */
 
 /** `out[row][c] = x[row][c] * mask[row]` - the mask-before-gather step. */
-export const maskRowsSource = (rows, channels) => sized({ ELEMENTS: rows * channels, C4: channels / 4 }, `${PRELUDE}${ONE_TARGET}
-uniform sampler2D xTex;
-uniform sampler2D maskTex;
-
-void main() {
-  int texel = linearTexel();
+export const maskRowsSource = (rows, channels) => part({ ELEMENTS: rows * channels, C4: channels / 4 }, {
+  uniforms: ["sampler2D xTex", "sampler2D maskTex"],
+  body: `  int texel = linearTexel();
   if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
   int row = texel / C4;
-  result = fetch4(xTex, texel) * fetch1(maskTex, row);
-}`);
+  result = fetch4(xTex, texel) * fetch1(maskTex, row);`,
+});
 
 /**
  * The atom pair conditioning: five terms, each with its own masking rule.
@@ -148,12 +145,9 @@ ${hasTrunkPair ? `  // The trunk's pair, indexed by the two atoms' TOKENS - both
  * with three atoms of a 24-slot row divides by three" - and a token with none
  * stays zero rather than dividing by zero.
  */
-export const aggregateSource = (tokens, dense, channels) => sized({ ELEMENTS: tokens * channels, DENSE: dense, C4: channels / 4 }, `${PRELUDE}${ONE_TARGET}
-uniform sampler2D projectedTex;
-uniform sampler2D maskTex;
-
-void main() {
-  int texel = linearTexel();
+export const aggregateSource = (tokens, dense, channels) => part({ ELEMENTS: tokens * channels, DENSE: dense, C4: channels / 4 }, {
+  uniforms: ["sampler2D projectedTex", "sampler2D maskTex"],
+  body: `  int texel = linearTexel();
   if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
   int group = texel % C4;
   int token = texel / C4;
@@ -165,8 +159,8 @@ void main() {
     count += 1.0;
     total += max(fetch4(projectedTex, slot * C4 + group), vec4(0.0));
   }
-  result = count > 0.0 ? total / count : vec4(0.0);
-}`);
+  result = count > 0.0 ? total / count : vec4(0.0);`,
+});
 
 /**
  * @param {import("../../runtime/execution.js").Execution} execution
@@ -575,25 +569,20 @@ export function atomCrossAttentionEncoder(execution, call) {
 }
 
 /** A one-channel gather; `gather` needs a multiple of four. */
-export const scalarGatherSource = (count) => sized({ ELEMENTS: count }, `${PRELUDE}${ONE_TARGET}
-uniform sampler2D sourceTex;
-uniform sampler2D indicesTex;
-uniform sampler2D maskTex;
-
-float at(int row) {
+export const scalarGatherSource = (count) => part({ ELEMENTS: count }, {
+  uniforms: ["sampler2D sourceTex", "sampler2D indicesTex", "sampler2D maskTex"],
+  helpers: `float scalarGatherAt(int row) {
   if (fetch1(maskTex, row) == 0.0) return 0.0;
   return fetch1(sourceTex, int(fetch1(indicesTex, row)));
-}
-
-void main() {
-  int base = linearTexel() * 4;
+}`,
+  body: `  int base = linearTexel() * 4;
   if (base >= ELEMENTS) { result = vec4(0.0); return; }
   result = vec4(
-    at(base),
-    base + 1 < ELEMENTS ? at(base + 1) : 0.0,
-    base + 2 < ELEMENTS ? at(base + 2) : 0.0,
-    base + 3 < ELEMENTS ? at(base + 3) : 0.0);
-}`);
+    scalarGatherAt(base),
+    base + 1 < ELEMENTS ? scalarGatherAt(base + 1) : 0.0,
+    base + 2 < ELEMENTS ? scalarGatherAt(base + 2) : 0.0,
+    base + 3 < ELEMENTS ? scalarGatherAt(base + 3) : 0.0);`,
+});
 
 /**
  * The same, with the index CLAMPED to the source - "a gather whose indices are
@@ -629,19 +618,15 @@ void main() {
  * pair's own read at stride 3 (relRMS 0.716) and then this one (0.450), each
  * found by the stage taps while every neighbouring stage stayed exact.
  */
-export const vec3GatherSource = (count, sourceStride) => sized({ COUNT: count, STRIDE: sourceStride }, `${PRELUDE}${ONE_TARGET}
-uniform sampler2D sourceTex;
-uniform sampler2D indicesTex;
-uniform sampler2D maskTex;
-
-void main() {
-  int texel = linearTexel();
+export const vec3GatherSource = (count, sourceStride) => part({ COUNT: count, STRIDE: sourceStride }, {
+  uniforms: ["sampler2D sourceTex", "sampler2D indicesTex", "sampler2D maskTex"],
+  body: `  int texel = linearTexel();
   if (texel >= COUNT) { result = vec4(0.0); return; }
   if (fetch1(maskTex, texel) == 0.0) { result = vec4(0.0); return; }
   int from = int(fetch1(indicesTex, texel)) * STRIDE;
   result = vec4(fetch1(sourceTex, from), fetch1(sourceTex, from + 1),
-    fetch1(sourceTex, from + 2), 0.0);
-}`);
+    fetch1(sourceTex, from + 2), 0.0);`,
+});
 
 /** `act[row][c] += Linear(position)[row][c] * mask[row]`. */
 export const positionToFeaturesSource = (rows, channels) => sized({ ELEMENTS: rows * channels, C4: channels / 4 }, `${PRELUDE}${ONE_TARGET}
@@ -663,11 +648,9 @@ void main() {
 }`);
 
 /** `out[i] = x[i]` - a copy, because a fragment cannot read its own target. */
-export const copySource = (elements) => sized({ ELEMENTS: elements }, `${PRELUDE}${ONE_TARGET}
-uniform sampler2D xTex;
-
-void main() {
-  int texel = linearTexel();
+export const copySource = (elements) => part({ ELEMENTS: elements }, {
+  uniforms: ["sampler2D xTex"],
+  body: `  int texel = linearTexel();
   if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
-  result = fetch4(xTex, texel);
-}`);
+  result = fetch4(xTex, texel);`,
+});

@@ -415,19 +415,22 @@ export async function foldAf3Async(execution, call) {
   // them; and before it goes on, the whole group its next slice first draws with (the earliest
   // group not yet compiled), so that slice does not link a dozen programs inside itself - which
   // the GPU's wait alone did not always cover at the trunk's start (417 ms on Safari 16.3).
+  // ...each slice group's parts as one program (Execution.combine), the first's done by prepare.
+  for (const group of groups) execution.combine(group);
   const later = groups.flat();
   const groupEnd = [];
   for (const group of groups) groupEnd.push((groupEnd.at(-1) ?? 0) + group.length);
   let next = 0;
+  const compiled = (source) => execution.programs.has(execution.packaged(source));
   const compileNext = () => {
-    while (next < later.length && execution.programs.has(later[next])) next += 1;
+    while (next < later.length && compiled(later[next])) next += 1;
     if (next === later.length) return false;
-    execution.program(later[next]);
+    execution.program(execution.packaged(later[next]));
     next += 1;
     return true;
   };
   const pause = async () => {
-    while (next < later.length && execution.programs.has(later[next])) next += 1;
+    while (next < later.length && compiled(later[next])) next += 1;
     const needed = groupEnd.find((end) => end > next) ?? 0;
     await gpuIdle(execution.gl, compileNext);
     while (next < needed && compileNext()) {
@@ -480,19 +483,33 @@ export async function foldPrograms(execution, call) {
   execution.collect = new Map();
   execution.storage.virtual = true;
   const ends = [];
+  // ...and what each slice of it cost the host, by the stage that ended it (probe-webgl-compile.js)
+  const sliceMs = [];
+  let sliceFrom = performance.now();
+  let taskFrom = sliceFrom;
   try {
     await drainAsync(foldAf3Steps(execution, {
       ...call, weights: trimmed, recycles: 0, steps: 1, readTrunk: false,
       onStage: undefined, onStep: undefined,
-    }), () => {
+    }), (yielded) => {
+      const now = performance.now();
+      sliceMs.push([yielded?.stage, Math.round((now - sliceFrom) * 10) / 10]);
+      sliceFrom = now;
       if (execution.collect.size > (ends.at(-1) ?? 0)) ends.push(execution.collect.size);
-      return new Promise((resolve) => { setTimeout(resolve, 0); });
+      // 🔴 THE PAGE A TASK EVERY ~16 ms OF IT, NOT EVERY SLICE: its slices are a few ms of host
+      // work each and a nested setTimeout(0) waits >= 4 ms, so yielding at all ~20 of them was
+      // most of the dry run (107 ms in Chrome, of which ~10 work).
+      if (now - taskFrom < 16) return undefined;
+      return new Promise((resolve) => { setTimeout(resolve, 0); }).then(() => {
+        taskFrom = performance.now();
+        sliceFrom = taskFrom;
+      });
     }, call.signal);
     const programs = execution.collect;
     const ordered = [...programs.keys()];
     if (ordered.length > (ends.at(-1) ?? 0)) ends.push(ordered.length);
     const groups = ends.map((end, index) => ordered.slice(ends[index - 1] ?? 0, end));
-    return { programs, groups };
+    return { programs, groups, sliceMs };
   } finally {
     execution.collect = null;
     execution.storage.virtual = false;

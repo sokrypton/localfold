@@ -268,6 +268,18 @@ export async function main(device, args) {
   ];
   const ourStages = {};
   const theirStages = {};
+  // `--combine=1`: the encoder's parts first met in a warm-up run, then drawn from combined
+  // programs (Execution.combine), as a page's fold draws them.
+  if ((args ?? []).includes("--combine=1")) {
+    const warm = atomCrossAttentionEncoder(execution, {
+      ...inputs, shape: { tokens, dense, subsets, queries, keys }, weights: uploadedWeights,
+      maskPaddedKeys: CASES[0].maskPaddedKeys, keysUidFromQueriesLayout: CASES[0].keysUid,
+      keyMaskedAtomAttention: false, chainedAtomLayerNorm: false, diffusionNoResidual: false,
+      pairNormPerBlock: false, maskAtomActPerBlock: false,
+    });
+    for (const tensor of Object.values(warm)) execution.release(tensor);
+    execution.combine([...execution.parts.keys()]);
+  }
   for (const { name, maskPaddedKeys, keysUid } of CASES) {
     const out = atomCrossAttentionEncoder(execution, {
       ...inputs,
