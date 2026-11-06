@@ -422,6 +422,15 @@ export async function foldAf3Async(execution, call) {
  * (`Execution.collect`), one block of each stack and one denoiser call, which reach every kernel.
  */
 async function prepareFoldPrograms(execution, call) {
+  const sources = await foldPrograms(execution, call);
+  await execution.prepare(sources.keys());
+}
+
+/**
+ * The programs a fold of this batch draws with, as source -> kernel label: a dry run with no
+ * draws (`Execution.collect`), one block of each stack and one denoiser call.
+ */
+export async function foldPrograms(execution, call) {
   const { weights } = call;
   const trimmed = {
     ...weights,
@@ -430,18 +439,16 @@ async function prepareFoldPrograms(execution, call) {
     ...(weights.confidence === undefined ? {}
       : { confidence: { ...weights.confidence, blocks: weights.confidence.blocks.slice(0, 1) } }),
   };
-  execution.collect = new Set();
-  let sources;
+  execution.collect = new Map();
   try {
     await drainAsync(foldAf3Steps(execution, {
       ...call, weights: trimmed, recycles: 0, steps: 1, readTrunk: false,
       onStage: undefined, onStep: undefined,
     }), () => new Promise((resolve) => { setTimeout(resolve, 0); }), call.signal);
+    return execution.collect;
   } finally {
-    sources = execution.collect;
     execution.collect = null;
   }
-  await execution.prepare(sources);
 }
 
 /** `foldAf3` as a generator (see `foldAf3Async`): yields at each trunk block and denoiser call. */

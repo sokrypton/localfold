@@ -281,7 +281,7 @@ export class Execution {
     } : null;
     /** @type {Map<string, {program: WebGLProgram, uniforms: Map<string, WebGLUniformLocation>}>} */
     this.programs = new Map();
-    /** While a Set, `dispatch` only records each kernel's source in it (see `prepare`). */
+    /** While a Map, `dispatch` only records each kernel's source in it, with its label (see `prepare`). */
     this.collect = null;
     this.dispatches = 0;
     this.draws = 0;
@@ -648,7 +648,7 @@ export class Execution {
     }
     // A dry run (`collect` a Set): the program this draw needs, and no draw.
     if (this.collect !== null) {
-      this.collect.add(source);
+      this.collect.set(source, label);
       return output;
     }
     const enteredAt = this.host === null ? 0 : performance.now();
