@@ -1780,6 +1780,13 @@ inline size_t diffusionPrepBytes(size_t pairs) {
   size_t heads = (size_t)M.meta(T + ".heads"), perSuper = (size_t)M.meta(T + ".blocksPerSuperBlock");
   return pairs * (Cz * 2 + Cp * 4 + perSuper * heads * 2);
 }
+// every block's pair logits held whole (what diff.biasesHeld asks): bf16, `heads` per block, rows padded to 8
+inline size_t diffusionBiasBytes(size_t n) {
+  const std::string T = "diffusion.transformer";
+  size_t heads = (size_t)M.meta(T + ".heads"), perSuper = (size_t)M.meta(T + ".blocksPerSuperBlock"), nSB = 0;
+  while (hasW(T + ".superBlocks." + std::to_string(nSB) + ".pairLogitsProjection")) ++nSB;
+  return nSB * perSuper * heads * n * ((n + 7) / 8 * 8) * 2;
+}
 inline DiffusionFold prepareDiffusion(const float* trunkSingle, const float* trunkPair, const float* targetFeat,
                                       const float* seqMask, int n) {
   DiffusionFold f{ trunkSingle, trunkPair, targetFeat, seqMask, n, {}, {} };

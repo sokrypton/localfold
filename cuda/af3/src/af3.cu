@@ -748,11 +748,16 @@ static int foldMain(int argc, char** argv) {
     // on a card short of room the trunk's pair waits in host memory from here to the confidence head: the
     // streamed preparation reads it a chunk of rows at a time and the sampler not at all
     // (only where the preparation streams: the f16 path, and an encoder that takes the pair's projection)
+    // ...and where parking it would make room for every block's biases held whole and keeping it would not, it is
+    // parked for them: the biases are worth more (8,192 tokens on the GH200: diffusion 82.4 -> 42.9 s with the pair
+    // parked and the biases held, where the pair kept had left the biases a super block at a time)
+    const size_t pairB = pairs * t.C * (TRUNK_PAIR16 ? 2 : 4), prepB = diffusionPrepBytes(pairs), biasB = diffusionBiasBytes(nD);
+    const bool biasesIfParked = roomFor(othersReserved("diff.pairOnCard") + prepB + (biasB > pairB ? biasB - pairB : 0));
     if (!structural && !sharded(t) && keptLo < 0 && DIFF_HALF && hasW("diffusion.encoder.embedTrunkPairCond") && shortPair("lean.diffusion", pairs, t.C) &&
-        parkWorthIt("diff.pairOnCard", pairs * t.C * (TRUNK_PAIR16 ? 2 : 4) + diffusionPrepBytes(pairs))) {
+        parkWorthIt("diff.pairOnCard", pairB + prepB + (biasesIfParked ? biasB : 0))) {
       // (the room asked for is the pair's AND what the preparation will hold beside it - asked for the pair alone, a
       // 6,916-token fold kept its 12.2 GB bf16 pair on the device and ran out in the preparation)
-      parkToHost(t.pair, pairs * t.C * (TRUNK_PAIR16 ? 2 : 4)); dP = nullptr;
+      parkToHost(t.pair, pairB); dP = nullptr;
     }
     if (sharded(t)) {                    // the diffusion's conditioning and token attention on this rank's rows
       if (structural) { fprintf(stderr, "a sharded pair: not OpenDDE\n"); return 1; }
