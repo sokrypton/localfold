@@ -92,6 +92,7 @@ static int foldMain(int argc, char** argv) {
   bool waitForever = false; // ...for as long as it takes: --wait-input=0, which the standalone mode passes - its featuriser
                             // is a thread of this process that always ends in model.idx or model.failed, and an MMseqs2
                             // queue can outlast any timeout
+  bool planReport = false;
   std::string serveDir;     // --serve=DIR: stay up, the weights resident, folding each job dropped in DIR
   for (int i = 2; i < argc; ++i) {
     if (!strcmp(argv[i], "--fast")) fast = DIFF_HALF = ATOM_HALF = CONF_HALF = F32_TF32 = true;
@@ -113,6 +114,12 @@ static int foldMain(int argc, char** argv) {
     else if (!strncmp(argv[i], "--folds=", 8)) folds = atoi(argv[i] + 8);
     else if (!strncmp(argv[i], "--steps=", 8)) steps = atoi(argv[i] + 8);
     else if (!strncmp(argv[i], "--recycles=", 11)) recycles = atoi(argv[i] + 11);
+    else if (!strcmp(argv[i], "--plan")) planReport = true;      // the memory levers each fold took (common.cuh, lever)
+    else if (!strncmp(argv[i], "--lever=", 8)) {                 // --lever=<name>=0|1: one forced (to measure its worth)
+      const char* eq = strrchr(argv[i] + 8, '=');
+      if (!eq || (eq[1] != '0' && eq[1] != '1') || eq[2]) { fprintf(stderr, "%s: --lever=<name>=0|1\n", argv[i]); return 1; }
+      LEVER_FORCED[std::string(argv[i] + 8, (size_t)(eq - (argv[i] + 8)))] = eq[1] == '1';
+    }
     else if (!strncmp(argv[i], "--recycle-tolerance=", 20)) recycleTolerance = atof(argv[i] + 20);   // angstroms; 0 off
     else if (!strncmp(argv[i], "--samples=", 10)) samples = atoi(argv[i] + 10);
     else if (!strcmp(argv[i], "--af3-defaults")) af3Defaults = true;
@@ -481,6 +488,7 @@ static int foldMain(int argc, char** argv) {
     }
   }
   memReport("trunk built");
+  MEM_PHASE = "trunk";
   printf("trunk: %d tokens, %d MSA rows, pair %d, single %d, msa %d; %s path\n", t.n, t.S, t.C, t.Cs, t.Cm,
          fast ? "f16" : "f32");
   if (t.native && t.drawn) printf("trunk: protenix's MSA draw - a count of 1 to %d rows %s\n", t.P, t.drawMode == "once" ? "once, for every pass" : "afresh each pass");
@@ -588,6 +596,7 @@ static int foldMain(int argc, char** argv) {
       passesRun = pass + 1;
       return true;
     };
+    LEVERS.clear(); MEM_PHASE = "trunk";
     ROOM_ANSWERED.clear();     // (a fold's own eager answers only: a resident server's last job asked on another card state)
     bool recycledEagerly = false, graphRefused = false;     // (a capture is sized by an eager recycle pass before it)
     for (int pass = 0; pass <= lastPass; ++pass) {
@@ -729,12 +738,13 @@ static int foldMain(int argc, char** argv) {
     std::vector<float> mask(M.f("batch.predDenseAtomMask"), M.f("batch.predDenseAtomMask") + (size_t)nD * dense);
     // each phase gets the whole card: the trunk's scratch given back before the diffusion (held to the end, 1044 tokens
     // peaked at 21.3 GB with the trunk's 8 GB of it)
+    MEM_PHASE = "diffusion";
     releaseScratch();
     // on a card short of room the trunk's pair waits in host memory from here to the confidence head: the
     // streamed preparation reads it a chunk of rows at a time and the sampler not at all
     // (only where the preparation streams: the f16 path, and an encoder that takes the pair's projection)
     if (!structural && !sharded(t) && keptLo < 0 && DIFF_HALF && hasW("diffusion.encoder.embedTrunkPairCond") && shortPair(pairs, t.C) &&
-        parkWorthIt(pairs * t.C * (TRUNK_PAIR16 ? 2 : 4) + diffusionPrepBytes(pairs))) {
+        parkWorthIt("diff.pairOnCard", pairs * t.C * (TRUNK_PAIR16 ? 2 : 4) + diffusionPrepBytes(pairs))) {
       // (the room asked for is the pair's AND what the preparation will hold beside it - asked for the pair alone, a
       // 6,916-token fold kept its 12.2 GB bf16 pair on the device and ran out in the preparation)
       parkToHost(t.pair, pairs * t.C * (TRUNK_PAIR16 ? 2 : 4)); dP = nullptr;
@@ -774,7 +784,7 @@ static int foldMain(int argc, char** argv) {
       // ...the preparation's chunk buffers (a fixed cost that matters only here), and the trunk's pair: the
       // sampler never reads it, so on a card short of room it waits in host memory for the confidence head
       releaseScratch({ "dc.f2", "dc.f2n", "dc.pairChunk", "dc.rel", "dc.relProj", "dc.tln", "dc.tproj", "pt." });
-      if (!structural && !sharded(t) && keptLo < 0 && t.pair && parkWorthIt(pairs * t.C * (TRUNK_PAIR16 ? 2 : 4))) {
+      if (!structural && !sharded(t) && keptLo < 0 && t.pair && parkWorthIt("diff.pairOnCardAfter", pairs * t.C * (TRUNK_PAIR16 ? 2 : 4))) {
         parkToHost(t.pair, pairs * t.C * (TRUNK_PAIR16 ? 2 : 4)); df.trunkPair = nullptr;
       }
     }
@@ -995,6 +1005,7 @@ static int foldMain(int argc, char** argv) {
     NS = 1;
     releaseConcatCopies(); memReport("diffusion");
     diffMs += ms(s0, clock());
+    MEM_PHASE = "confidence";
     releaseScratch();
     size_t atoms3 = mask.size() * 3;
     // the confidence head reads the pseudo-beta of the token space it runs in
@@ -1142,6 +1153,7 @@ static int foldMain(int argc, char** argv) {
     printf("fold %d: trunk %.1f ms (%d passes%s), diffusion %.1f ms (%d steps x %d%s), confidence %.1f ms, total %.1f ms\n",
            fi + 1, trunkMs, passesRun, G > 1 ? (" x " + std::to_string(G) + " trunks").c_str() : "", diffMs, steps, samples,
            seedList.size() > 1 ? (" x " + std::to_string(seedList.size()) + " seeds").c_str() : "", confMs, ms(foldStart, f3));
+    if (planReport) { fflush(stdout); leverPlanReport(); }
     if (profiling) prof::stop(40);
     if (fi == 0 && which == 0 && serveDir.empty() && getenv("LOCALFOLD_UNREAD")) unreadWeights();
     }

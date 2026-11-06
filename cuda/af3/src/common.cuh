@@ -1275,7 +1275,31 @@ inline size_t shortPairRoomHere() {
   for (auto& [name, slot] : SCRATCH) f += slot.second;
   return f > t / 20 ? f - t / 20 : 0;
 }
+// (the memory levers' record: see lever, below)
+struct LeverAsk { std::string phase; size_t most = 0; int yes = 0, no = 0; };
+inline LF_TLS std::map<std::string, LeverAsk> LEVERS;
+inline LF_TLS std::map<std::string, bool> LEVER_FORCED;
+inline LF_TLS const char* MEM_PHASE = "setup";
+inline bool leverForced(const char* name, bool& yes) {
+  auto f = LEVER_FORCED.find(name);
+  if (f == LEVER_FORCED.end()) return false;
+  yes = f->second; return true;
+}
+inline void leverNote(const char* name, size_t bytes, bool yes) {
+  LeverAsk& l = LEVERS[name];
+  if (l.phase.empty()) l.phase = MEM_PHASE;
+  l.most = std::max(l.most, bytes); (yes ? l.yes : l.no)++;
+}
+inline bool shortPairRule(size_t pairs, int C);
+// the ordinary paths (a lever: --lever=ordinary=0 takes every short-of-room path, as LOCALFOLD_BIG=1 does without
+// declining the whole forms the room allows)
 inline bool shortPair(size_t pairs, int C) {
+  bool ordinary;
+  if (!leverForced("ordinary", ordinary)) ordinary = !shortPairRule(pairs, C);
+  leverNote("ordinary", (size_t)((double)pairs * C * 4 * SHORT_PAIR_TIMES), ordinary);
+  return !ordinary;
+}
+inline bool shortPairRule(size_t pairs, int C) {
   if (BIG_FORCED) return true;
   if (SHORT_PAIR_TIMES > 0) {
     static LF_TLS size_t own = 0;
@@ -1361,6 +1385,38 @@ inline bool roomFor(size_t bytes, std::initializer_list<const char*> held = {}) 
   if (gen != MEM_GEN) { deviceMemInfo(&f, &t); gen = MEM_GEN; }
   return ROOM_ANSWERED[asked] = f > bytes + t / 8;
 }
+// ---------------------------------------------------------------- the fold's memory levers
+// Every memory-for-speed choice a fold makes, by name: a whole form or its chunks (lever: roomFor's answer), a block or
+// chunk sized by what is free (leverRows), the pair parked in host memory. Each records the phase that asked, the most
+// it asked for and how it answered - `--plan` prints the table at the fold's end - and `--lever=<name>=0|1` forces one,
+// which is how a lever's worth is measured (the time it saves against the memory it holds)
+// the whole form (true) or its chunks: `bytes` more on the card, what `held` already holds counted
+inline bool lever(const char* name, size_t bytes, std::initializer_list<const char*> held = {}) {
+  bool yes;
+  if (!leverForced(name, yes)) yes = roomFor(bytes, held);
+  leverNote(name, bytes, yes);
+  return yes;
+}
+// how many rows of `perRow` bytes (up to `most`) what is free allows, `keep` of the card left spare - forced on, `most`;
+// off, none (the caller's own floor)
+inline size_t leverRows(const char* name, size_t perRow, size_t most, size_t keep) {
+  bool yes; size_t rows;
+  if (leverForced(name, yes)) rows = yes ? most : 0;
+  else {
+    size_t f, t; deviceMemInfo(&f, &t);
+    const size_t spare = f > keep ? f - keep : 0;
+    rows = std::min(spare / std::max<size_t>(perRow, 1), most);
+  }
+  leverNote(name, rows * perRow, rows >= most);
+  return rows;
+}
+inline size_t cardBytes() { size_t f, t; deviceMemInfo(&f, &t); return t; }
+inline void leverPlanReport() {
+  fprintf(stderr, "memory levers (phase, name, most asked, whole/chunked):\n");
+  for (auto& [name, l] : LEVERS)
+    fprintf(stderr, "  %-12s %-24s %9.3f GB  %4d / %-4d%s\n", l.phase.c_str(), name.c_str(), l.most / 1e9, l.yes, l.no,
+            LEVER_FORCED.count(name) ? (LEVER_FORCED[name] ? "  forced on" : "  forced off") : "");
+}
 // what holds the device when an allocation is refused: the largest scratch buffers, and the free memory
 inline void scratchReportOOM(const char* what, size_t bytes) {
   cudaGetLastError();
@@ -1381,7 +1437,7 @@ inline LF_TLS float* PARK_HOST = nullptr; inline LF_TLS size_t PARK_HAVE = 0;
 // the trunk's pair kept in bf16 past the trunk (af3.cu, a card short of room): wherever it is - on the device or
 // parked - its readers take bf16 rows, so the f32 pair (51 GB at 10,000 tokens) never exists
 inline LF_TLS bool TRUNK_PAIR16 = false;
-inline bool parkWorthIt(size_t bytes) { return !roomFor(bytes); }
+inline bool parkWorthIt(const char* name, size_t bytes) { return !lever(name, bytes); }   // (kept on the card: the lever's yes)
 inline void parkToHost(float*& dev, size_t bytes) {
   if (PARK_HAVE < bytes) {
     if (PARK_HOST) CK(lfFreeHost(PARK_HOST));

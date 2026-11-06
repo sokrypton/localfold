@@ -1077,7 +1077,7 @@ void templateEmbedding(Trunk& t, float* out) {
   // a card short of room it waits in host memory while the stack runs - parked BEFORE the activation is made, the query
   // read from the parked copy (pinned, a kernel reads it over the bus, once): made beside the pair, the f32 activation
   // was the card's limit (9,200 tokens on 40 GB: 21.7 GB of it beside the 21.7 GB pair)
-  const bool parked = live == 1 && tight && out == t.pair && !sharded(t) && parkWorthIt(pairs * (size_t)(Cq + Ct) * 4);
+  const bool parked = live == 1 && tight && out == t.pair && !sharded(t) && parkWorthIt("tmpl.pairOnCard", pairs * (size_t)(Cq + Ct) * 4);
   if (parked) { parkToHost(t.pair, pairs * Cq * (t.p16 ? 2 : 4)); out = nullptr; }
   const float* pairSrc = parked ? PARK_HOST : t.pair;
   auto queryInto = [&](float* dst) {
@@ -2534,7 +2534,7 @@ void runTrunk(Trunk& t, const std::function<void(const char*, const float*, size
     // found 6.7 GB free beside it and par.base
     const size_t beside = sharded(t) ? sh::wholeFormBytes(t.n, t.C, t.p16 ? 2 : 4)
       : (size_t)t.n * t.n * t.C * 2 + (M.flag("trunk.dialect.groupedOuterProduct") ? zBytes : 0);
-    zHost = !roomFor(zBytes + beside);
+    zHost = !lever("msa.prePairOnCard", zBytes + beside);
     if (zHost) {
       static LF_TLS void* host = nullptr; static LF_TLS size_t have = 0;
       if (have < zBytes) {

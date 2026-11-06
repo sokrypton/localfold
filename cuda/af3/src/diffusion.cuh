@@ -1025,7 +1025,7 @@ inline void prepareTransformer(const float* pairCond, int n) {
     // (what is held counts toward what is needed only for what the need includes: a streamed preparation's pn16 is
     // handed in, not part of the need, and counting it admitted 12.2 GB of biases that did not fit at 6,916 tokens)
     for (auto& [k, v] : SCRATCH) if (!k.compare(0, 5, "dt.bh") || (!given && k == "dt.pn16")) held += v.second;
-    auto fits = [&](size_t need) { return roomFor(need > held ? need - held : 0); };
+    auto fits = [&](size_t need) { return lever("diff.biasesHeld", need > held ? need - held : 0); };
     int kept = fits((size_t)tc.nblocks * heads * heldRows * tc.stride * 2) ? nSB : 0;
     if (kept < nSB) while (kept + 1 < nSB && fits((size_t)(kept + 2) * sbBytes + pnBytes)) ++kept;   // kept + the shared set
     bool lazy = kept < nSB;
@@ -1849,7 +1849,7 @@ inline void precomputeConditioning(DiffusionFold& f, const std::vector<float>& l
   // every step's at once is steps x tokens rows - 1.8 GB at 100 steps and 2900 tokens - so where that does
   // not fit with room to spare each step makes its own (denoiseCore's !usePre path; a few small kernels)
   f.preSingle = f.preSnProj = nullptr;
-  if (!roomFor((size_t)S * n * (2 * Cs + perToken) * 4, { "pre.single", "pre.snProj", "pre.sn" })) {
+  if (!lever("diff.precompute", (size_t)S * n * (2 * Cs + perToken) * 4, { "pre.single", "pre.snProj", "pre.sn" })) {
     releaseScratch({ "pre." }); f.usePre = false; return;
   }
   size_t nc = lenW(P + ".fourierWeight");

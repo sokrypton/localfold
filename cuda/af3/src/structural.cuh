@@ -164,7 +164,7 @@ inline Structural expandStructural(const float* trunkSingle, const float* trunkP
   // the sorted pairs whole, or - where two f32 [pairs, C] work buffers do not fit beside the pair they build (12.2 GB
   // each at 1450 residues) - in chunks of the sorted order, each role's GEMM over its part of the chunk (a GEMM of
   // other rows may round differently, so only there)
-  const size_t per = roomFor(2 * pairs * C * 4) ? pairs : std::max<size_t>(1, CHUNK / C);
+  const size_t per = lever("struct.whole", 2 * pairs * C * 4) ? pairs : std::max<size_t>(1, CHUNK / C);
   float* gathered = scratch<float>("st.gathered", per * C);
   float* projected = scratch<float>("st.projected", per * C);
   for (size_t a = 0; a < pairs; a += per) {

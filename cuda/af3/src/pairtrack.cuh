@@ -943,9 +943,8 @@ inline void triangleBlockedTN(float* pair, const float* mask, int n, int C, cons
   TQ* b = scratch<TQ>("trib.bq", cs * C);
   int width = (int)std::max<size_t>(16, std::min<size_t>(np, (CHUNK / C) / np / 16 * 16));
   {
-    size_t f, t; deviceMemInfo(&f, &t);
-    size_t perRow = (size_t)np * C * (sizeof(TQ) + 4), spare = f > t / 16 ? f - t / 16 : 0;   // a, the product, t2
-    width = (int)std::max<size_t>(width, std::min<size_t>(np, std::min<size_t>(spare / perRow, 1024) / 16 * 16));
+    const size_t perRow = (size_t)np * C * (sizeof(TQ) + 4);   // a, the product, t2
+    width = (int)std::max<size_t>(width, std::min<size_t>(np, leverRows("tri.blockRows", perRow, 1024, cardBytes() / 16) / 16 * 16));
   }
   TQ* a = scratch<TQ>("trib.aq", (size_t)width * np * C);
   B16* prod = scratch<B16>("trib.pbf", (size_t)width * np * C);
@@ -1011,9 +1010,8 @@ inline void triangleBlockedFused(float* pair, const float* mask, int n, int C, c
   // cuBLAS's small tiles, 238.7 s of them a pass against 60.5 at 7,800)
   int width = (int)std::max<size_t>(8, std::min<size_t>(np, (CHUNK / C) / np / 8 * 8));
   {
-    size_t f, t; deviceMemInfo(&f, &t);
-    size_t perRow = (size_t)np * C * 6, spare = f > t / 64 ? f - t / 64 : 0;
-    width = (int)std::max<size_t>(width, std::min<size_t>(np, std::min<size_t>(spare / perRow, 1024) / 8 * 8));
+    const size_t perRow = (size_t)np * C * 6;
+    width = (int)std::max<size_t>(width, std::min<size_t>(np, leverRows("tri.blockRows", perRow, 1024, cardBytes() / 64) / 8 * 8));
   }
   // ...and narrower where the card refuses that: the free memory counts the pool's idle pages, and pages idle among a
   // stage's live buffers cannot be one block's - OpenDDE's refiner at 1,768 residues (3,384 structural tokens) on a
@@ -1088,9 +1086,8 @@ void triangleBlocked(float* pair, const float* mask, int n, int C, const std::st
   // memory traffic for 1.1 s of arithmetic
   int width = (int)std::max<size_t>(8, std::min<size_t>(np, (CHUNK / C) / np / 8 * 8));
   {
-    size_t f, t; deviceMemInfo(&f, &t);
-    size_t perRow = (size_t)np * C * (sizeof(T) + 4), spare = f > t / 16 ? f - t / 16 : 0;    // a and prod, a row each
-    width = (int)std::max<size_t>(width, std::min<size_t>(np, std::min<size_t>(spare / perRow, 1024) / 8 * 8));
+    const size_t perRow = (size_t)np * C * (sizeof(T) + 4);    // a and prod, a row each
+    width = (int)std::max<size_t>(width, std::min<size_t>(np, leverRows("tri.blockRows", perRow, 1024, cardBytes() / 16) / 8 * 8));
   }
   T* a = scratch<T>("trib.a", (size_t)width * np * C);
   float* prod = scratch<float>("trib.prod", (size_t)width * np * C);
@@ -1144,7 +1141,7 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
     // (TIGHT_STACK: a narrower stack - the template's 64 channels - on a trunk short of room, where its own pair is
     // under the threshold but the card is not: its whole form, 1.5 GB at 1530 tokens, was what ran out)
     // (multi-GPU: the blocked form, whose blocks the ranks share)
-    if (TIGHT_STACK || mg::splitting(pair) || !roomFor(5 * cs * C * 2, { "tri.a", "tri.b", "tri.prod", "tri.norm", "tri.abf", "tri.bbf", "tri.pbf", "tri.t2whole" })) {
+    if (TIGHT_STACK || mg::splitting(pair) || !lever("tri.whole", 5 * cs * C * 2, { "tri.a", "tri.b", "tri.prod", "tri.norm", "tri.abf", "tri.bbf", "tri.pbf", "tri.t2whole" })) {
       releaseScratch({ "tri.a", "tri.b", "tri.prod", "tri.norm", "tri.abf", "tri.bbf", "tri.pbf", "tri.t2whole" });
       triangleBlocked<T>(pair, mask, n, C, pre, outgoing, divideByLength, np);
       return;
@@ -1297,7 +1294,7 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
     }
   }
   size_t rowsPer = std::max<size_t>(1, CHUNK / (4 * C));
-  if (pairs > rowsPer && roomFor(pairs * 4 * C * sizeof(T), {"tri.pg"})) rowsPer = pairs;   // (as the transition's)
+  if (pairs > rowsPer && lever("tri.pgWhole", pairs * 4 * C * sizeof(T), {"tri.pg"})) rowsPer = pairs;   // (as the transition's)
   buffers(std::is_same_v<T, half> && rowsPer >= pairs && (C & 31) == 0 && (np & 1) == 0);
   T* norm = scratch<T>("tri.norm", pairs * C);
   T* pgOut = scratch<T>("tri.pg", std::min(rowsPer, pairs) * 4 * C);
@@ -1368,7 +1365,7 @@ void transition(float* x, size_t rows, int C, int factor, const std::string& pre
           constexpr int WU = decltype(wuTag)::value, NC = decltype(ncTag)::value, XR = decltype(xrTag)::value, R = 16 * WU;
           constexpr size_t smem = transitionUpSmem<CC, WU, NC, XR>();
           const size_t full = std::min<size_t>(rows * I, (size_t)1 << 29);
-          const size_t budget = (!shortPair(rows, C) && roomFor(full * 2, {"tr.gated", "tr.gatedbf"})) ? full : CHUNK / 2;
+          const size_t budget = (!shortPair(rows, C) && lever("tr.upWhole", full * 2, {"tr.gated", "tr.gatedbf"})) ? full : CHUNK / 2;
           size_t rowsPer = transitionUpChunkRows<CC, WU, NC, XR>(smem, std::max<size_t>(R, budget / I));
           if (PAIR16) {
             // a bf16 pair: the gated rows in bf16 and the second GEMM bf16 throughout, accumulating straight into the
@@ -1420,7 +1417,7 @@ void transition(float* x, size_t rows, int C, int factor, const std::string& pre
   // every row in one pass where the card has the room (OpenDDE at 255 tokens: the trunk's transitions 370 -> 353
   // ms for 0.6 GB; chunks of 1-8k rows, small enough for L2 to hold the widening, are 397-615 - the GEMMs lose more)
   size_t rowsPer = std::max<size_t>(1, CHUNK / (2 * I));
-  if (rows > rowsPer && roomFor(rows * (C + 3 * (size_t)I) * sizeof(T), {"tr.x", "tr.wide", "tr.gated"})) rowsPer = rows;
+  if (rows > rowsPer && lever("tr.whole", rows * (C + 3 * (size_t)I) * sizeof(T), {"tr.x", "tr.wide", "tr.gated"})) rowsPer = rows;
   T* xn = xnGiven ? xnGiven : scratch<T>("tr.x", std::min(rowsPer, rows) * C);
   T* wide = scratch<T>("tr.wide", std::min(rowsPer, rows) * 2 * I);
   T* gated = scratch<T>("tr.gated", std::min(rowsPer, rows) * I);
@@ -1823,7 +1820,7 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
       // (the room asked for includes the triangle multiplication's whole form, five planes, which these
       // buffers would otherwise starve into its blocked form - see cuda/af2's twin)
       size_t triPlane = (size_t)((n + 7) / 8 * 8) * ((n + 7) / 8 * 8);
-      if (!mg::splitting(pair) && roomFor(((pairs + 128) * 4 * Wd + pairs * Wd) * 2 + pairs * f8Row + 5 * triPlane * C * 2,
+      if (!mg::splitting(pair) && lever("grid.whole", ((pairs + 128) * 4 * Wd + pairs * Wd) * 2 + pairs * f8Row + 5 * triPlane * C * 2,
                   {"grid.qkvg", "grid.gathered", "grid.kv8", "attn.vt8", "tri.a", "tri.b", "tri.prod", "tri.norm", "tri.abf", "tri.bbf",
                    "tri.pbf", "tri.t2whole"})) {
         // every row in one pass (this card has the memory): the bias written by the same kernel
@@ -1863,10 +1860,9 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
       // flash launches a trunk pass become 3,136, the grid attention 166.2 -> 163.2 s and gridInK 7.2 -> 6.3 of a 6,916-
       // token pass (LOCALFOLD_BIG=1 keeps the 64M-element chunks, so a small input still crosses chunk boundaries)
       if (!BIG_FORCED) {
-        size_t f, t; deviceMemInfo(&f, &t);
-        size_t perRow = (size_t)n * (5 * Wd * 2 + f8Row), spare = f > t / 16 ? f - t / 16 : 0;
+        const size_t perRow = (size_t)n * (5 * Wd * 2 + f8Row);
         size_t maxR = shortPair(pairs, C) ? 256 : std::max<size_t>(256, ((size_t)1 << 19) / std::max(n, 1));
-        R = std::max<size_t>(R, std::min<size_t>(n, std::min<size_t>(spare / perRow, maxR)));
+        R = std::max<size_t>(R, std::min<size_t>(n, leverRows("grid.rows", perRow, maxR, cardBytes() / 16)));
       }
       int glo, ghi; mg::myShare(pair, n, 1, glo, ghi);          // (multi-GPU: this rank's rows or columns)
       for (size_t r0 = glo; r0 < (size_t)ghi; r0 += R) {
@@ -1932,10 +1928,9 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
   // into 256 + 5 rows and OpenDDE's n = 522 structural subtokens into 256 + 256 + 10 rows (protenix2 trunk 747.8 -> 704.3 ms,
   // opendde trunk 1288.2 -> 1228.1 ms, intellifold2 trunk 1937.3 -> 1891.9 ms; LOCALFOLD_BIG=1 keeps the 64M-element chunks)
   if (!BIG_FORCED) {
-    size_t f, t; deviceMemInfo(&f, &t);
-    size_t perRow = (size_t)n * (5 * Wd * sizeof(T) + C * (sizeof(T) + 8)), spare = f > t / 16 ? f - t / 16 : 0;
+    const size_t perRow = (size_t)n * (5 * Wd * sizeof(T) + C * (sizeof(T) + 8));
     size_t maxR = shortPair(pairs, C) ? 256 : std::max<size_t>(256, ((size_t)1 << 19) / std::max(n, 1));
-    R = std::max<size_t>(R, std::min<size_t>(n, std::min<size_t>(spare / perRow, maxR)));
+    R = std::max<size_t>(R, std::min<size_t>(n, leverRows("grid.rows", perRow, maxR, cardBytes() / 16)));
   }
   float scale = 1.f / sqrtf((float)D);
   int glo, ghi; mg::myShare(pair, n, 1, glo, ghi);            // (multi-GPU: this rank's rows or columns)
