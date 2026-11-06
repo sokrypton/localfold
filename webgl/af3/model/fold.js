@@ -56,7 +56,7 @@ import { normalFrom } from "../../../shared/af3/random.js";
 import { Execution } from "../../runtime/execution.js";
 import { atomCrossAttentionEncoder } from "../diffusion/atom-encoder.js";
 import { perAtomConditioning } from "../diffusion/atom-conditioning.js";
-import { confidenceHead, errorBinCentres, MAX_ERROR_BIN, NUM_BINS } from "../confidence/confidence.js";
+import { confidenceHeadSteps, errorBinCentres, MAX_ERROR_BIN, NUM_BINS } from "../confidence/confidence.js";
 import { embed, RELATIVE_WIDTH, tokenIdentity } from "../trunk/embedder.js";
 import { binEdges, runTrunkSteps } from "../trunk/trunk.js";
 import { sampleOnWebGl2Steps } from "../diffusion/sampler.js";
@@ -652,7 +652,7 @@ export function* foldAf3Steps(execution, call) {
       },
       label: `af3.conf.pseudo-beta:${tokens}`,
     });
-    const out = confidenceHead(execution, {
+    const out = yield* confidenceHeadSteps(execution, {
       pair: trunk.pair, single: trunk.single, targetFeat: targetFeatTensor,
       pseudoBeta, seqMask: batchTensors.seqMask,
       asymId: batchTensors.asymId,

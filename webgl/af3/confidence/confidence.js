@@ -64,6 +64,7 @@
  * disagree about where the bins sit.
  */
 import { ONE_TARGET, PRELUDE } from "../../runtime/execution.js";
+import { drain } from "../../runtime/steps.js";
 import { multiply, scale } from "../../runtime/elementwise.js";
 import { layerNorm } from "../../kernels/layer-norm.js";
 import { linear } from "../../kernels/linear.js";
@@ -541,6 +542,11 @@ export function releaseConfidenceHeadWeights(execution, weights) {
  *   owns all seven
  */
 export function confidenceHead(execution, call) {
+  return drain(confidenceHeadSteps(execution, call));
+}
+
+/** `confidenceHead` as a generator: yields after the embedding and each of its pairformer blocks. */
+export function* confidenceHeadSteps(execution, call) {
   const {
     pair: pairIn, single: singleIn, targetFeat: targetFeatIn, pseudoBeta, seqMask,
     tokens, dense, weights: w, blocks, epsilon = 1e-5,
@@ -692,6 +698,7 @@ export function confidenceHead(execution, call) {
     execution.release(clamped);
   }
   call.onStage?.("embed.single", single);
+  yield { stage: "confidence.embed" };
 
   // Four pairformer blocks, the same module the trunk runs 48 of.
   for (const [index, block] of blocks.entries()) {
@@ -706,6 +713,7 @@ export function confidenceHead(execution, call) {
     single = next.single;
     call.onStage?.(`block${index}.pair`, pair);
     call.onStage?.(`block${index}.single`, single);
+    yield { stage: "confidence.block", index };
   }
 
   const headNorm = (x, rows, channels, scaleWeight, offset) => (scaleWeight === undefined
