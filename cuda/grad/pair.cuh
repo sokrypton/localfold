@@ -406,8 +406,33 @@ __global__ void gateOutLdBfK(real* y, const bf* a, const bf* g, size_t rows, int
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t < rows * C) y[t] = bfv(a[t]) * bfv(g[(t / C) * P + t % C]);
 }
+// out = r.in + drop(a g[r * P + c]): the output gate, the dropout and the residual link in one pass (gateOutLdBfK then
+// dropAddK's arithmetic), four channels a thread
+__global__ void gateResid4K(float4* __restrict__ out, const float4* __restrict__ in, const uint2* __restrict__ a,
+                            const bf* __restrict__ g, const unsigned char* __restrict__ keep, int A, int B, int C, int P,
+                            bool perRow, float rate) {
+  const size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t * 4 >= (size_t)A * B * C) return;
+  const size_t r = t * 4 / C; const int c = (int)(t * 4 % C);
+  const uint2 av = a[t], gv = *reinterpret_cast<const uint2*>(g + r * P + c);
+  const uint32_t aw[2] = {av.x, av.y}, gw[2] = {gv.x, gv.y};
+  float v[4];
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const uint32_t x = aw[i >> 1], y = gw[i >> 1];
+    v[i] = __uint_as_float(i & 1 ? x & 0xffff0000u : x << 16) * __uint_as_float(i & 1 ? y & 0xffff0000u : y << 16);
+  }
+  if (keep) {
+    const unsigned kw = *reinterpret_cast<const unsigned*>(keep + dropAt(t * 4, B, C, perRow));
+#pragma unroll
+    for (int i = 0; i < 4; ++i) v[i] = ((kw >> (8 * i)) & 0xff) == 0 ? 0.f : v[i] / (1 - rate);
+  }
+  const float4 x = in[t];
+  out[t] = make_float4(x.x + v[0], x.y + v[1], x.z + v[2], x.w + v[3]);
+}
+// (rs: out = rs.in + drop(the update) - the residual link written here - where rs.in is set)
 template <class X>   // (X: real, or bf - a block's bf16 residual chain)
-inline TriMulSave triMulForwardBf(const TriMul& m, const X* pair, const real* mask, real* out, int L) {
+inline TriMulSave triMulForwardBf(const TriMul& m, const X* pair, const real* mask, real* out, int L, const Resid& rs = Resid{}) {
   const size_t rows = (size_t)L * L;
   const int I2 = 2 * m.I, P = 2 * I2 + m.C;
   TriMulSave s;
@@ -458,7 +483,14 @@ inline TriMulSave triMulForwardBf(const TriMul& m, const X* pair, const real* ma
   s.center = nullptr;
   bf* po = bfGet(rows * m.C);   // the output projection before its gate, kept (the backward recomputed it)
   linearFwdBf(m.out, cn, po, rows);
-  gateOutLdBfK<<<blocks(rows * m.C), 256, 0, STREAM>>>(out, po, gs + I2, rows, m.C, GS);
+  if (rs.in && m.C % 4 == 0 && GS % 4 == 0 && ((uintptr_t)out | (uintptr_t)rs.in) % 16 == 0 && (uintptr_t)po % 8 == 0 &&
+      (uintptr_t)(gs + I2) % 8 == 0)
+    gateResid4K<<<blocks(rows * m.C / 4), 256, 0, STREAM>>>(reinterpret_cast<float4*>(out), reinterpret_cast<const float4*>(rs.in),
+        reinterpret_cast<const uint2*>(po), gs + I2, rs.keep, L, L, m.C, GS, rs.perRow, rs.rate);
+  else {
+    gateOutLdBfK<<<blocks(rows * m.C), 256, 0, STREAM>>>(out, po, gs + I2, rows, m.C, GS);
+    if (rs.in) residAdd(out, rs, out, L, L, m.C);
+  }
   s.xn = reinterpret_cast<real*>(xn); s.proj = reinterpret_cast<real*>(gs); s.gate = reinterpret_cast<real*>(W);
   s.ab = reinterpret_cast<real*>(ab); s.cn = reinterpret_cast<real*>(cn); s.og = reinterpret_cast<real*>(po);
   return s;
@@ -523,9 +555,9 @@ inline void triMulBackwardBf(TriMul& m, const TriMulSave& s, const real* mask, c
 }
 #endif
 
-inline TriMulSave triMulForward(const TriMul& m, const real* pair, const real* mask, real* out, int L) {
+inline TriMulSave triMulForward(const TriMul& m, const real* pair, const real* mask, real* out, int L, const Resid& rs = Resid{}) {
 #ifndef GRAD_F64
-  if (BF16) return triMulForwardBf(m, pair, mask, out, L);
+  if (BF16) return triMulForwardBf(m, pair, mask, out, L, rs);
 #endif
   size_t rows = (size_t)L * L;
   const int I2 = 2 * m.I;
@@ -560,6 +592,7 @@ inline TriMulSave triMulForward(const TriMul& m, const real* pair, const real* m
   m.gating.forward(s.xn, s.og, rows);
   sigmoidK<<<blocks(rows * m.C), 256, 0, STREAM>>>(s.og, rows * m.C);
   mulK<<<blocks(rows * m.C), 256, 0, STREAM>>>(out, out, s.og, rows * m.C);
+  if (rs.in) residAdd(out, rs, out, L, L, m.C);
   return s;
 }
 

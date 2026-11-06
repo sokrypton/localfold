@@ -48,7 +48,7 @@ inline GtSave gtForwardChunked(const GatedTransition& t, const real* x, real* ou
     if (BF16) {
       bf* xb = bfGet(r * t.C); lnForward(t.ln, x + r0 * t.C, xb, r);
       bf* hb = bfGet(r * 2 * t.F); linearFwdBf(t.t1, xb, hb, r);
-      bf* g = bfGet(r * t.F); swigluBfK<<<blocks(r * t.F), 256, 0, STREAM>>>(hb, g, r, t.F);
+      bf* g = bfGet(r * t.F); swigluBf(hb, g, r, t.F);
       linearFwdBf(t.t2, g, out + r0 * t.C, r, beta);
       continue;
     }
@@ -73,11 +73,11 @@ inline void gtBackwardChunked(GatedTransition& t, const GtSave& s, const PD* dou
     if (s.bf || sizeof(PD) == 2) {
       bf* xb = bfGet(r * t.C); LnSave ls = lnForward(t.ln, x, xb, r);
       bf* hb = bfGet(r * 2 * t.F); linearFwdBf(t.t1, xb, hb, r);
-      bf* g = bfGet(r * t.F); swigluBfK<<<blocks(r * t.F), 256, 0, STREAM>>>(hb, g, r, t.F);
+      bf* g = bfGet(r * t.F); swigluBf(hb, g, r, t.F);
       const bf* db;
       if constexpr (sizeof(PD) == 2) db = dout + r0 * t.C; else db = toBf(dout + r0 * t.C, r * t.C);
       bf* dg = bfGet(r * t.F); linearBwdBf(t.t2, g, db, dg, r);
-      bf* dh = bfGet(r * 2 * t.F); swigluBwdBfK<<<blocks(r * t.F), 256, 0, STREAM>>>(hb, dg, dh, r, t.F);
+      bf* dh = bfGet(r * 2 * t.F); swigluBwdBf(hb, dg, dh, r, t.F);
       bf* dxn = bfGet(r * t.C); linearBwdBf(t.t1, xb, dh, dxn, r);
       lnBackward(t.ln, ls, dxn, dx + r0 * t.C, r, true);
       continue;
@@ -104,7 +104,7 @@ inline GtSave gtForwardBf(const GatedTransition& t, const real* x, real* out, si
   linearFwdBf(t.t1, xb, hb, rows);
   s.xb = xb; s.hb = hb;
   bf* g = bfGet(rows * t.F);   // (kept for t2's weight gradient: recomputing it was 0.25 ms of AF3's backward)
-  swigluBfK<<<blocks(rows * t.F), 256, 0, STREAM>>>(hb, g, rows, t.F);
+  swigluBf(hb, g, rows, t.F);
   s.gb = g;
   linearFwdBf(t.t2, g, out, rows, beta);
   return s;
@@ -121,7 +121,7 @@ inline void gtBackwardBf(GatedTransition& t, const GtSave& s, const PD* dout, PD
   bf* dg = bfGet(rows * t.F);
   linearBwdBf(t.t2, g, db, dg, rows);
   bf* dh = bfGet(rows * 2 * t.F);
-  swigluBwdBfK<<<blocks(rows * t.F), 256, 0, STREAM>>>(hb, dg, dh, rows, t.F);
+  swigluBwdBf(hb, dg, dh, rows, t.F);
   bf* dxn = bfGet(rows * t.C);   // (only the LayerNorm's backward reads it)
   linearBwdBf(t.t1, xb, dh, dxn, rows);
   lnBackward(t.ln, s.ln, dxn, dx, rows, true);
@@ -218,8 +218,9 @@ inline void packQkvg(const GridAttn& g, bf* W, float* dW, bool back) {
 }
 // BF16: the normalised pair and q, k, v, gate kept in bf16, the four projections one bf16 GEMM into [nn, 4 HD]
 // (bindcraft2's packed Q|K|V|G), the attention reading q, k, v there in place
+// (rs: out = rs.in + drop(the update) where rs.in is set, out written whole; else the update added into out)
 inline GridSave gridForwardBf(const GridAttn& g, const Dialect& d, const real* pair, const real* mask,
-                              const real* maskT, real* out, int n) {
+                              const real* maskT, real* out, int n, const Resid& rs = Resid{}) {
   const size_t nn = (size_t)n * n;
   const int HD = g.H * g.D;
   GridSave s; s.n = n; s.bf = true;
@@ -243,20 +244,34 @@ inline GridSave gridForwardBf(const GridAttn& g, const Dialect& d, const real* p
   for (int r = 0; r < 4; ++r)
     if (roles[r]->hasBias) biasAddLdK<<<blocks(nn * HD), 256, 0, STREAM>>>(qkvg + r * HD, roles[r]->b.w, nn, HD, P);
   bf *q = qkvg, *k = q + HD, *v = k + HD, *gt = v + HD;
-  gateSigLdBfK<<<blocks(nn * HD), 256, 0, STREAM>>>(gt, nn, HD, P);
   bf* ob = bfGet(nn * HD);   // the attention's output in bf16
   s.o = reinterpret_cast<real*>(ob);
-  { const Sdpa sd_ = gridSdpa(g, n, g.transpose ? maskT : mask, s.nb); s.lse = ARENA.get((size_t)2 * sd_.B * sd_.H * sd_.Q); sdpaForwardBf(sd_, q, P, k, P, v, P, ob, HD, s.lse); }
+  bf* og = bfGet(nn * HD);   // (kept for the output projection's weight gradient)
+  {
+    // the gate's sigmoid (over the raw gate, in place) and its product with the output in the attention's epilogue
+    // (flash::gridForwardBf), where the shape has that kernel
+    const Sdpa sd_ = gridSdpa(g, n, g.transpose ? maskT : mask, s.nb);
+    s.lse = ARENA.get((size_t)2 * sd_.B * sd_.H * sd_.Q);
+    if (!FLASH || !flash::gridForwardBf(sd_, q, P, k, P, v, P, ob, HD, s.lse, gt, P, og, HD)) {
+      gateSigLdBfK<<<blocks(nn * HD), 256, 0, STREAM>>>(gt, nn, HD, P);
+      sdpaForwardBf(sd_, q, P, k, P, v, P, ob, HD, s.lse);
+      gateMulBfK<<<blocks(nn * HD), 256, 0, STREAM>>>(og, ob, gt, nn, HD, P);
+    }
+  }
   s.xn = reinterpret_cast<real*>(xn); s.act = reinterpret_cast<real*>(act); s.qkvg = reinterpret_cast<real*>(qkvg);
   s.W = reinterpret_cast<real*>(W);
-  bf* og = bfGet(nn * HD);   // (kept for the output projection's weight gradient)
-  gateMulBfK<<<blocks(nn * HD), 256, 0, STREAM>>>(og, ob, gt, nn, HD, P);
   s.og = og;
   Scratch scratch;
-  if (!g.transpose || g.untransposedResidual) { linearFwdBf(g.out, og, out, nn, 1.f); return s; }
+  if (!g.transpose || g.untransposedResidual) {
+    if (!rs.in) { linearFwdBf(g.out, og, out, nn, 1.f); return s; }
+    linearFwdBf(g.out, og, out, nn);
+    residAdd(out, rs, out, n, n, g.C);
+    return s;
+  }
   real* t = ARENA.get(nn * g.C);
   linearFwdBf(g.out, og, t, nn);
-  swap01(t, out, n, n, g.C, true);
+  if (rs.in) swapResid(t, out, rs, n, n, g.C);
+  else swap01(t, out, n, n, g.C, true);
   return s;
 }
 template <class PD>
@@ -312,9 +327,9 @@ inline void gridBackwardBf(GridAttn& g, const Dialect& d, const GridSave& s, con
 #endif
 // pair [n, n, C] -> out (+= when beta 1), mask / maskT [n, n]
 inline GridSave gridForward(const GridAttn& g, const Dialect& d, const real* pair, const real* mask, const real* maskT,
-                            real* out, int n) {
+                            real* out, int n, const Resid& rs = Resid{}) {
 #ifndef GRAD_F64
-  if (BF16) return gridForwardBf(g, d, pair, mask, maskT, out, n);
+  if (BF16) return gridForwardBf(g, d, pair, mask, maskT, out, n, rs);
 #endif
   size_t nn = (size_t)n * n;
   const int HD = g.H * g.D;
@@ -339,10 +354,16 @@ inline GridSave gridForward(const GridAttn& g, const Dialect& d, const real* pai
   Scratch scratch;
   real* og = ARENA.get(nn * HD);
   mulK<<<blocks(nn * HD), 256, 0, STREAM>>>(og, s.o, gt, nn * HD);
-  if (!g.transpose || g.untransposedResidual) { g.out.forward(og, out, nn, 1); return s; }
+  if (!g.transpose || g.untransposedResidual) {
+    if (!rs.in) { g.out.forward(og, out, nn, 1); return s; }
+    g.out.forward(og, out, nn);
+    residAdd(out, rs, out, n, n, g.C);
+    return s;
+  }
   real* t = ARENA.get(nn * g.C);
   g.out.forward(og, t, nn);
-  swap01(t, out, n, n, g.C, true);
+  if (rs.in) swapResid(t, out, rs, n, n, g.C);
+  else swap01(t, out, n, n, g.C, true);
   return s;
 }
 #ifndef GRAD_F64
@@ -481,55 +502,33 @@ struct Pairformer {
   float dropRate = 0;
   unsigned long long dropSeed = 0;
 };
-// the dropout itself (af2.cuh's dropoutK, the same draws): an update [A, B, C] in place, keep / (1 - rate); perRow, the
-// mask shared over A (DropoutRowwise, batch_dim -3), else over B (columnwise)
-__host__ __device__ __forceinline__ unsigned long long dropMix(unsigned long long x) {
-  x += 0x9e3779b97f4a7c15ull;
-  x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ull;
-  x = (x ^ (x >> 27)) * 0x94d049bb133111ebull;
-  return x ^ (x >> 31);
-}
-__device__ __forceinline__ float dropKeep(size_t t, int B, int C, bool perRow, float rate, unsigned long long seed) {
-  const int c = (int)(t % C);
-  const size_t rr = t / C;
-  const int a = (int)(rr / B), b = (int)(rr % B);
-  const unsigned long long key = perRow ? (unsigned long long)b * C + c : ((unsigned long long)a * C + c) | (1ull << 62);
-  const float u = (float)(dropMix(seed ^ dropMix(key)) >> 40) * (1.f / 16777216.f);
-  return u < rate ? 0.f : 1.f;
-}
-__global__ void dropK(real* x, int A, int B, int C, bool perRow, float rate, unsigned long long seed) {
-  const size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= (size_t)A * B * C) return;
-  x[t] = dropKeep(t, B, C, perRow, rate, seed) == 0.f ? (real)0 : x[t] / (1 - (real)rate);
-}
-#ifndef GRAD_F64
-// (the bf16 backward's: y = mask(x) / (1 - rate) from a bf16 running gradient, into a fresh bf16 copy)
-__global__ void dropCopyBfK(const bf* x, bf* y, int A, int B, int C, bool perRow, float rate, unsigned long long seed) {
-  const size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= (size_t)A * B * C) return;
-  y[t] = __float2bfloat16(dropKeep(t, B, C, perRow, rate, seed) * __bfloat162float(x[t]) / (1 - rate));
-}
-#endif
-enum { DROP3_TRI_OUT = 1, DROP3_TRI_IN, DROP3_START, DROP3_END, DROP3_MSA };
-// a residual update in one pass: out = in + drop(u) (u's dropout as drop3 draws it, rate 0 none) - in place of a clone of
-// `in`, drop3 on u and an add, which read and wrote the pair three times over
-__global__ void dropAddK(real* out, const real* in, const real* u, int A, int B, int C, bool perRow, float rate, unsigned long long seed) {
-  const size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= (size_t)A * B * C) return;
-  const real v = rate <= 0 ? u[t] : dropKeep(t, B, C, perRow, rate, seed) == 0.f ? (real)0 : u[t] / (1 - (real)rate);
-  out[t] = in[t] + v;
-}
 inline void dropAdd(real* out, const real* in, const real* u, int A, int B, int C, bool perRow, float rate, unsigned long long seed, int module) {
-  dropAddK<<<blocks((size_t)A * B * C), 256, 0, STREAM>>>(out, in, u, A, B, C, perRow, rate, dropMix(seed * 8 + module));
+  Scratch sc;
+  const unsigned char* keep = rate > 0 ? dropTable(A, B, C, perRow, rate, dropMix(seed * 8 + module)) : nullptr;
+  const size_t n = (size_t)A * B * C;
+#ifndef GRAD_F64
+  if (C % 4 == 0 && ((uintptr_t)out | (uintptr_t)in | (uintptr_t)u) % 16 == 0) {
+    dropAdd4K<<<blocks(n / 4), 256, 0, STREAM>>>(reinterpret_cast<float4*>(out), reinterpret_cast<const float4*>(in),
+                                                  reinterpret_cast<const float4*>(u), keep, A, B, C, perRow, rate);
+    return;
+  }
+#endif
+  dropAddK<<<blocks(n), 256, 0, STREAM>>>(out, in, u, keep, A, B, C, perRow, rate);
 }
 inline void drop3(real* x, int A, int B, int C, bool perRow, float rate, unsigned long long seed, int module) {
   if (rate <= 0) return;
-  dropK<<<blocks((size_t)A * B * C), 256, 0, STREAM>>>(x, A, B, C, perRow, rate, dropMix(seed * 8 + module));
+  Scratch sc;
+  const unsigned char* keep = dropTable(A, B, C, perRow, rate, dropMix(seed * 8 + module));
+  dropK<<<blocks((size_t)A * B * C), 256, 0, STREAM>>>(x, keep, A, B, C, perRow, rate);
 }
 #ifndef GRAD_F64
 inline bf* drop3Bf(const bf* x, int A, int B, int C, bool perRow, float rate, unsigned long long seed, int module) {
-  bf* y = bfGet((size_t)A * B * C);
-  dropCopyBfK<<<blocks((size_t)A * B * C), 256, 0, STREAM>>>(x, y, A, B, C, perRow, rate, dropMix(seed * 8 + module));
+  const size_t n = (size_t)A * B * C;
+  bf* y = bfGet(n);
+  const unsigned char* keep = dropTable(A, B, C, perRow, rate, dropMix(seed * 8 + module));   // (in the caller's scratch)
+  if (C % 8 == 0 && ((uintptr_t)x | (uintptr_t)y) % 16 == 0)
+    dropCopyBf8K<<<blocks(n / 8), 256, 0, STREAM>>>(reinterpret_cast<const uint4*>(x), reinterpret_cast<uint4*>(y), keep, A, B, C, perRow, rate);
+  else dropCopyBfK<<<blocks(n), 256, 0, STREAM>>>(x, y, keep, A, B, C, perRow, rate);
   return y;
 }
 #endif
@@ -621,8 +620,8 @@ inline PairformerSave pairformerForward(Pairformer& b, const Dialect& d, const r
   PairformerSave s{};
   s.n = n; s.pair0 = pair; s.single0 = single;
   b.triOut.divideByLength = b.triIn.divideByLength = d.divideByLength;
-  real* u = ARENA.get(nn * Cz);                 // a triangle update's output, before its residual
   if (b.parallel) {
+    real* u = ARENA.get(nn * Cz);               // a triangle update's output, before its residual
     if (b.dropRate > 0) { fprintf(stderr, "the parallel pairformer's dropout is not written\n"); exit(1); }
     real* acc = cloneR(pair, nn * Cz);
     s.tOut = triMulForward(b.triOut, pair, pairMask, u, n); add(acc, u, nn * Cz);
@@ -634,28 +633,21 @@ inline PairformerSave pairformerForward(Pairformer& b, const Dialect& d, const r
     s.pt = gtForward(b.pairTrans, pair, acc, nn, 1);
     s.pair5 = acc;
   } else {
+    // each update linked into the next pair by the module that makes it (Resid: the input, and the dropout's mask table)
     const float rate = b.dropRate;
+    auto link = [&](const real* in, bool perRow, int module) {
+      return Resid{in, rate > 0 ? dropTable(n, n, Cz, perRow, rate, dropMix(b.dropSeed * 8 + module)) : nullptr, perRow, rate};
+    };
     s.p1 = ARENA.get(nn * Cz);
-    s.tOut = triMulForward(b.triOut, pair, pairMask, u, n); dropAdd(s.p1, pair, u, n, n, Cz, true, rate, b.dropSeed, DROP3_TRI_OUT);
+    s.tOut = triMulForward(b.triOut, pair, pairMask, s.p1, n, link(pair, true, DROP3_TRI_OUT));
     s.p2 = ARENA.get(nn * Cz);
-    s.tIn = triMulForward(b.triIn, s.p1, pairMask, u, n); dropAdd(s.p2, s.p1, u, n, n, Cz, true, rate, b.dropSeed, DROP3_TRI_IN);
+    s.tIn = triMulForward(b.triIn, s.p1, pairMask, s.p2, n, link(s.p1, true, DROP3_TRI_IN));
     s.p4 = s.p2;
     if (b.hasGrid) {
-      if (rate > 0) {   // (the attentions add into their output: an update alone, masked, then added)
-        s.p3 = ARENA.get(nn * Cz);
-        real* gu = ARENA.zeros(nn * Cz);
-        s.g1 = gridForward(b.grid1, d, s.p2, pairMask, maskT, gu, n);
-        dropAdd(s.p3, s.p2, gu, n, n, Cz, true, rate, b.dropSeed, DROP3_START);
-        s.p4 = ARENA.get(nn * Cz);
-        GK(cudaMemsetAsync(gu, 0, nn * Cz * sizeof(real), STREAM));
-        s.g2 = gridForward(b.grid2, d, s.p3, pairMask, maskT, gu, n);
-        dropAdd(s.p4, s.p3, gu, n, n, Cz, false, rate, b.dropSeed, DROP3_END);
-      } else {
-        s.p3 = cloneR(s.p2, nn * Cz);
-        s.g1 = gridForward(b.grid1, d, s.p2, pairMask, maskT, s.p3, n);
-        s.p4 = cloneR(s.p3, nn * Cz);
-        s.g2 = gridForward(b.grid2, d, s.p3, pairMask, maskT, s.p4, n);
-      }
+      s.p3 = ARENA.get(nn * Cz);
+      s.g1 = gridForward(b.grid1, d, s.p2, pairMask, maskT, s.p3, n, link(s.p2, true, DROP3_START));
+      s.p4 = ARENA.get(nn * Cz);
+      s.g2 = gridForward(b.grid2, d, s.p3, pairMask, maskT, s.p4, n, link(s.p3, false, DROP3_END));
     }
     s.pair5 = cloneR(s.p4, nn * Cz);
     s.pt = gtForward(b.pairTrans, s.p4, s.pair5, nn, 1);

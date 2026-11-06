@@ -450,29 +450,45 @@ __global__ void smoothLddtK(const double* __restrict__ x, const double* __restri
   for (int o = 16; o; o >>= 1) { num += __shfl_xor_sync(~0u, num, o); den += __shfl_xor_sync(~0u, den, o); }
   if ((threadIdx.x & 31) == 0) { atomicAdd(sums, num); atomicAdd(sums + 1, den); }
 }
-// pass 2: dx_l += -scale * de/dd (x_l - x_m) / d / den over m, a thread a row l (no atomics: l's own sum)
+// pass 2: dx_l += -scale * de/dd (x_l - x_m) / d / den over m: a block a row l, its threads over m, reduced in the
+// block (no atomics: l's own sum). A pair beyond both cutoffs is no term and skipped before its exponentials.
 __global__ void smoothLddtGradK(const double* __restrict__ x, const double* __restrict__ xt, const int* __restrict__ live,
                                 const char* __restrict__ nuc, int L, const double* __restrict__ sums, double scale,
                                 double* __restrict__ dx) {
-  const int a = blockIdx.x * blockDim.x + threadIdx.x;
-  if (a >= L) return;
+  const int a = blockIdx.x;
   const int l = live[a];
-  const double inv = scale / (sums[1] + of3::EPS);
+  const double cut = nuc[a] ? 30.0 : 15.0;
+  double xl[3], tl[3];
+  for (int q = 0; q < 3; ++q) { xl[q] = x[l * 3 + q]; tl[q] = xt[l * 3 + q]; }
   double g[3] = {0, 0, 0};
-  for (int b = 0; b < L; ++b) {
+  for (int b = threadIdx.x; b < L; b += blockDim.x) {
     if (a == b) continue;
     const int m = live[b];
     // (l, m) and (m, l) are both terms, each with its own cutoff by its first atom's type
-    double dvec[3], g2 = of3::EPS, p2 = of3::EPS;
-    for (int q = 0; q < 3; ++q) { const double e = xt[l * 3 + q] - xt[m * 3 + q]; dvec[q] = x[l * 3 + q] - x[m * 3 + q]; g2 += e * e; p2 += dvec[q] * dvec[q]; }
-    const double dg = sqrt(g2), dp = sqrt(p2), del = fabs(dg - dp);
+    double dvec[3], g2 = of3::EPS;
+    for (int q = 0; q < 3; ++q) { const double e = tl[q] - xt[m * 3 + q]; g2 += e * e; }
+    const double dg = sqrt(g2);
+    const int terms = (dg < cut) + (dg < (nuc[b] ? 30.0 : 15.0));
+    if (!terms) continue;
+    double p2 = of3::EPS;
+    for (int q = 0; q < 3; ++q) { dvec[q] = xl[q] - x[m * 3 + q]; p2 += dvec[q] * dvec[q]; }
+    const double dp = sqrt(p2), del = fabs(dg - dp);
     double de = 0;
     for (double c : {0.5, 1.0, 2.0, 4.0}) { const double s = 1 / (1 + exp(-(c - del))); de -= 0.25 * s * (1 - s); }
     const double k = de * (dp > dg ? 1 : -1) / dp;
-    const int terms = (dg < (nuc[a] ? 30.0 : 15.0)) + (dg < (nuc[b] ? 30.0 : 15.0));
     for (int q = 0; q < 3; ++q) g[q] -= terms * k * dvec[q];
   }
-  for (int q = 0; q < 3; ++q) dx[l * 3 + q] += inv * g[q];
+  __shared__ double part[3][32];
+  for (int q = 0; q < 3; ++q) {
+    for (int o = 16; o; o >>= 1) g[q] += __shfl_xor_sync(~0u, g[q], o);
+    if ((threadIdx.x & 31) == 0) part[q][threadIdx.x >> 5] = g[q];
+  }
+  __syncthreads();
+  if (threadIdx.x < 3) {
+    double t = 0;
+    for (int w = 0; w < (int)(blockDim.x >> 5); ++w) t += part[threadIdx.x][w];
+    dx[l * 3 + threadIdx.x] += scale / (sums[1] + of3::EPS) * t;
+  }
 }
 struct SmoothLddt {
   int L = 0; int* live = nullptr; char* nuc = nullptr; double *x = nullptr, *xt = nullptr, *dx = nullptr, *sums = nullptr; size_t A = 0;
@@ -495,7 +511,7 @@ struct SmoothLddt {
     smoothLddtK<<<std::min<size_t>(((size_t)L * L + 255) / 256, 4096), 256, 0, s>>>(x, xt, live, nuc, L, sums);
     if (dxH) {
       cudaMemsetAsync(dx, 0, A * 3 * 8, s);
-      smoothLddtGradK<<<(L + 127) / 128, 128, 0, s>>>(x, xt, live, nuc, L, sums, scale, dx);
+      if (L) smoothLddtGradK<<<L, 256, 0, s>>>(x, xt, live, nuc, L, sums, scale, dx);
       std::vector<double> h(A * 3);
       cudaMemcpyAsync(h.data(), dx, A * 3 * 8, cudaMemcpyDeviceToHost, s);
       double sh[2]; cudaMemcpyAsync(sh, sums, 16, cudaMemcpyDeviceToHost, s); cudaStreamSynchronize(s);

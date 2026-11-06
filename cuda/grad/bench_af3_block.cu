@@ -1,18 +1,19 @@
 // The AF3 training pairformer block's cost at a training shape (384 tokens, AF3's widths: Cz 128, Cs 384, pair
 // attention 4 x 32, single attention 16 x 24): forward, the replay with saves, the backward. Random weights and
 // inputs, all masks one (cuda/grad/test_af3.cu is the gate). bench_torch_af3_block.py is the same block in PyTorch.
-//   cuda/grad/bench-af3-block [--n=384] [--tf32]
+//   cuda/grad/bench-af3-block [--n=384] [--tf32] [--bf16] [--drop=0.25]
 #include <cstring>
 #include <curand.h>
 #include <cuda_profiler_api.h>
 #include "af3.cuh"
 using namespace grad;
 int main(int argc, char** argv) {
-  int n = 384;
+  int n = 384; float drop = 0;
   for (int i = 1; i < argc; ++i) {
     if (!strncmp(argv[i], "--n=", 4)) n = atoi(argv[i] + 4);
     else if (!strcmp(argv[i], "--tf32")) TF32 = true;
     else if (!strcmp(argv[i], "--bf16")) BF16 = true;
+    else if (!strncmp(argv[i], "--drop=", 7)) drop = atof(argv[i] + 7);
   }
   init();
   curandGenerator_t gen; curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT); curandSetPseudoRandomGeneratorSeed(gen, 7);
@@ -21,6 +22,7 @@ int main(int argc, char** argv) {
   af3::Pairformer b; af3::Dialect d; Params ps;
   af3::forEachParam(b, "blk", Cz, Cs, Hp, Dp, Hs, Ds, 4, 4, false, true, [&](const std::string& nm, Param& p, size_t len) {
     p.name = nm; p.n = len; p.w = randn(len, 0.05f); GK(cudaMalloc(&p.g, len * 4)); ps.add(p); });
+  b.dropRate = drop; b.dropSeed = 11;
   for (auto* p : ps.all) if (p->name.find("Scale") != std::string::npos) { std::vector<float> one(p->n, 1.f); GK(cudaMemcpy(p->w, one.data(), p->n * 4, cudaMemcpyHostToDevice)); }
   size_t nn = (size_t)n * n;
   float *pair = randn(nn * Cz, 1.f), *sing = randn((size_t)n * Cs, 1.f), *ctp = randn(nn * Cz, 1.f), *cts = randn((size_t)n * Cs, 1.f);
@@ -48,6 +50,6 @@ int main(int argc, char** argv) {
   }
   GK(cudaGetLastError());
   auto med = [](std::vector<float> v) { std::sort(v.begin(), v.end()); return v[v.size() / 2]; };
-  printf("n %d (AF3 pairformer block%s): forward %.1f ms, replay %.1f ms, backward %.1f ms; arena high water %.0f MiB\n",
-         n, BF16 ? ", bf16" : TF32 ? ", tf32" : "", med(fv), med(rv), med(bv), ARENA.high / 1048576.0);
+  printf("n %d (AF3 pairformer block%s%s): forward %.1f ms, replay %.1f ms, backward %.1f ms; arena high water %.0f MiB\n",
+         n, BF16 ? ", bf16" : TF32 ? ", tf32" : "", drop > 0 ? ", dropout" : "", med(fv), med(rv), med(bv), ARENA.high / 1048576.0);
 }

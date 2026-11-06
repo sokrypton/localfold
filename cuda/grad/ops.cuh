@@ -393,6 +393,135 @@ inline void swap01(const real* in, real* out, int A, int B, int C, bool accumula
 // [R, C] <-> [C, R]
 inline void transpose(const real* in, real* out, int R, int C, bool accumulate = false) { swap01(in, out, R, C, 1, accumulate); }
 
+// the dropout itself (af2.cuh's dropoutK, the same draws): an update [A, B, C] in place, keep / (1 - rate); perRow, the
+// mask shared over A (DropoutRowwise, batch_dim -3), else over B (columnwise)
+__host__ __device__ __forceinline__ unsigned long long dropMix(unsigned long long x) {
+  x += 0x9e3779b97f4a7c15ull;
+  x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ull;
+  x = (x ^ (x >> 27)) * 0x94d049bb133111ebull;
+  return x ^ (x >> 31);
+}
+// the mask is a function of (b, c) rowwise and (a, c) columnwise: drawn once into a table of R x C bytes (R = B or A),
+// which the elementwise passes read from cache - the two hashes an element were most of a pass (a 512-token pair
+// update's masked copy 402 us, its bandwidth ~90)
+__global__ void dropTableK(unsigned char* keep, int R, int C, bool perRow, float rate, unsigned long long seed) {
+  const size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)R * C) return;
+  const unsigned long long key = perRow ? (unsigned long long)t : (unsigned long long)t | (1ull << 62);
+  const float u = (float)(dropMix(seed ^ dropMix(key)) >> 40) * (1.f / 16777216.f);
+  keep[t] = u < rate ? 0 : 1;
+}
+inline const unsigned char* dropTable(int A, int B, int C, bool perRow, float rate, unsigned long long seed) {
+  const size_t m = (size_t)(perRow ? B : A) * C;
+  unsigned char* k = reinterpret_cast<unsigned char*>(ARENA.get((m + sizeof(real) - 1) / sizeof(real)));
+  dropTableK<<<blocks(m), 256, 0, STREAM>>>(k, perRow ? B : A, C, perRow, rate, seed);
+  return k;
+}
+// element t's entry of the table
+__device__ __forceinline__ size_t dropAt(size_t t, int B, int C, bool perRow) {
+  const int c = (int)(t % C);
+  const size_t rr = t / C;
+  return (perRow ? rr % B : rr / B) * C + c;
+}
+__global__ void dropK(real* x, const unsigned char* keep, int A, int B, int C, bool perRow, float rate) {
+  const size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)A * B * C) return;
+  x[t] = keep[dropAt(t, B, C, perRow)] == 0 ? (real)0 : x[t] / (1 - (real)rate);
+}
+#ifndef GRAD_F64
+// (the bf16 backward's: y = mask(x) / (1 - rate) from a bf16 running gradient, into a fresh bf16 copy; eight elements a
+// thread where C is a multiple of 8)
+__global__ void dropCopyBf8K(const uint4* x, uint4* y, const unsigned char* keep, int A, int B, int C, bool perRow, float rate) {
+  const size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t * 8 >= (size_t)A * B * C) return;
+  const uint4 v = x[t];
+  const uint2 kk = *reinterpret_cast<const uint2*>(keep + dropAt(t * 8, B, C, perRow));
+  const unsigned kw[2] = {kk.x, kk.y};
+  const uint32_t w[4] = {v.x, v.y, v.z, v.w};
+  uint32_t o[4];
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const unsigned k2 = kw[i >> 1] >> (16 * (i & 1));
+    const __nv_bfloat162 x2 = *reinterpret_cast<const __nv_bfloat162*>(&w[i]);
+    const __nv_bfloat162 r = __floats2bfloat162_rn((float)(k2 & 0xff) * __low2float(x2) / (1 - rate),
+                                                   (float)((k2 >> 8) & 0xff) * __high2float(x2) / (1 - rate));
+    o[i] = *reinterpret_cast<const uint32_t*>(&r);
+  }
+  y[t] = make_uint4(o[0], o[1], o[2], o[3]);
+}
+__global__ void dropCopyBfK(const bf* x, bf* y, const unsigned char* keep, int A, int B, int C, bool perRow, float rate) {
+  const size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)A * B * C) return;
+  y[t] = __float2bfloat16((float)keep[dropAt(t, B, C, perRow)] * __bfloat162float(x[t]) / (1 - rate));
+}
+#endif
+enum { DROP3_TRI_OUT = 1, DROP3_TRI_IN, DROP3_START, DROP3_END, DROP3_MSA };
+// a residual update in one pass: out = in + drop(u) (u's dropout as drop3 draws it; keep null: none) - in place of a
+// clone of `in`, drop3 on u and an add, which read and wrote the pair three times over
+__global__ void dropAddK(real* out, const real* in, const real* u, const unsigned char* keep, int A, int B, int C, bool perRow, float rate) {
+  const size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)A * B * C) return;
+  const real v = !keep ? u[t] : keep[dropAt(t, B, C, perRow)] == 0 ? (real)0 : u[t] / (1 - (real)rate);
+  out[t] = in[t] + v;
+}
+#ifndef GRAD_F64
+__global__ void dropAdd4K(float4* out, const float4* in, const float4* u, const unsigned char* keep, int A, int B, int C, bool perRow, float rate) {
+  const size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t * 4 >= (size_t)A * B * C) return;
+  const float4 x = in[t], y = u[t];
+  float v[4] = {y.x, y.y, y.z, y.w};
+  if (keep) {
+    const unsigned kw = *reinterpret_cast<const unsigned*>(keep + dropAt(t * 4, B, C, perRow));
+#pragma unroll
+    for (int i = 0; i < 4; ++i) v[i] = ((kw >> (8 * i)) & 0xff) == 0 ? 0.f : v[i] / (1 - rate);
+  }
+  out[t] = make_float4(x.x + v[0], x.y + v[1], x.z + v[2], x.w + v[3]);
+}
+#endif
+// a residual update's link, for a module that writes its update straight into the next pair: out = in + drop(update)
+// (keep: dropTable's, null for no dropout; perRow and rate as it was drawn)
+struct Resid { const real* in = nullptr; const unsigned char* keep = nullptr; bool perRow = true; float rate = 0; };
+// out = r.in + drop(u) in one pass (u may be out)
+inline void residAdd(real* out, const Resid& r, const real* u, int A, int B, int C) {
+  const size_t n = (size_t)A * B * C;
+#ifndef GRAD_F64
+  if (C % 4 == 0 && ((uintptr_t)out | (uintptr_t)r.in | (uintptr_t)u) % 16 == 0) {
+    dropAdd4K<<<blocks(n / 4), 256, 0, STREAM>>>(reinterpret_cast<float4*>(out), reinterpret_cast<const float4*>(r.in),
+                                                  reinterpret_cast<const float4*>(u), r.keep, A, B, C, r.perRow, r.rate);
+    return;
+  }
+#endif
+  dropAddK<<<blocks(n), 256, 0, STREAM>>>(out, r.in, u, r.keep, A, B, C, r.perRow, r.rate);
+}
+// out = r.in + drop(swap(u)): u [A, B, C], out and r.in [B, A, C] - the transposed attention's update linked in the
+// pass that transposes it back
+__global__ void swapResidV4K(const float4* __restrict__ u, float4* __restrict__ out, const float4* __restrict__ base,
+                             const unsigned char* __restrict__ keep, int A, int B, int C4, bool perRow, float rate) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)A * B * C4) return;
+  int c = t % C4; size_t ab = t / C4; int b = ab % B, a = (int)(ab / B);
+  size_t o = ((size_t)b * A + a) * C4 + c;
+  const float4 x = u[t];
+  float v[4] = {x.x, x.y, x.z, x.w};
+  if (keep) {
+    const unsigned kw = *reinterpret_cast<const unsigned*>(keep + dropAt(o * 4, A, 4 * C4, perRow));
+#pragma unroll
+    for (int i = 0; i < 4; ++i) v[i] = ((kw >> (8 * i)) & 0xff) == 0 ? 0.f : v[i] / (1 - rate);
+  }
+  const float4 w = base[o];
+  out[o] = make_float4(w.x + v[0], w.y + v[1], w.z + v[2], w.w + v[3]);
+}
+inline void swapResid(const real* u, real* out, const Resid& r, int A, int B, int C) {
+  if (sizeof(real) == 4 && C % 4 == 0 && ((uintptr_t)u | (uintptr_t)out | (uintptr_t)r.in) % 16 == 0) {
+    swapResidV4K<<<blocks((size_t)A * B * C / 4), 256, 0, STREAM>>>(reinterpret_cast<const float4*>(u), reinterpret_cast<float4*>(out),
+        reinterpret_cast<const float4*>(r.in), r.keep, A, B, C / 4, r.perRow, r.rate);
+    return;
+  }
+  real* t = ARENA.get((size_t)A * B * C);   // (the general case: transposed, then linked)
+  swap01(u, t, A, B, C);
+  residAdd(out, r, t, B, A, C);
+}
+
 // ---------------------------------------------------------------- scaled dot-product attention, any bias
 // q [B, Q, ldq], k [B, K, ldk], v [B, K, ldv]: head h at columns h D .. h D + D (so a packed qkv is read in place);
 // o [B, Q, ldo]. logits = scale q k^T + 1e9 (keyMask[b, k] - 1) + sum of up to two biases, each addressed with
@@ -1077,6 +1206,56 @@ __global__ void swigluBwdBfK(const bf* __restrict__ h, const bf* __restrict__ dg
   const float sg = 1.f / (1.f + __expf(-a)), d = __bfloat162float(dg[t]);
   dh[r * 2 * F + f] = __float2bfloat16(d * b * (sg + a * sg * (1.f - sg)));
   dh[r * 2 * F + F + f] = __float2bfloat16(d * a * sg);
+}
+// ...eight columns a thread (F a multiple of 8): the same arithmetic in 16-byte loads and stores, where one element a
+// thread ran a 512-token pair transition's at a third of the bandwidth (879 and 1288 us against ~300 and ~450)
+__device__ __forceinline__ void bf8(const uint4& v, float* f) {
+  const uint32_t w[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+  for (int i = 0; i < 4; ++i) { f[2 * i] = __uint_as_float(w[i] << 16); f[2 * i + 1] = __uint_as_float(w[i] & 0xffff0000u); }
+}
+__device__ __forceinline__ uint4 bf8(const float* f) {
+  uint32_t w[4];
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const __nv_bfloat162 r = __floats2bfloat162_rn(f[2 * i], f[2 * i + 1]);
+    w[i] = *reinterpret_cast<const uint32_t*>(&r);
+  }
+  return make_uint4(w[0], w[1], w[2], w[3]);
+}
+__global__ void swigluBf8K(const uint4* __restrict__ h, uint4* __restrict__ g, size_t rows, int F) {
+  const size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x, F8 = F / 8;
+  if (t >= rows * F8) return;
+  const size_t r = t / F8, f = t % F8;
+  float a[8], b[8], o[8];
+  bf8(h[r * 2 * F8 + f], a); bf8(h[r * 2 * F8 + F8 + f], b);
+#pragma unroll
+  for (int i = 0; i < 8; ++i) o[i] = a[i] / (1.f + __expf(-a[i])) * b[i];
+  g[t] = bf8(o);
+}
+__global__ void swigluBwdBf8K(const uint4* __restrict__ h, const uint4* __restrict__ dg, uint4* __restrict__ dh, size_t rows, int F) {
+  const size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x, F8 = F / 8;
+  if (t >= rows * F8) return;
+  const size_t r = t / F8, f = t % F8;
+  float a[8], b[8], d[8], da[8], db[8];
+  bf8(h[r * 2 * F8 + f], a); bf8(h[r * 2 * F8 + F8 + f], b); bf8(dg[t], d);
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    const float sg = 1.f / (1.f + __expf(-a[i]));
+    da[i] = d[i] * b[i] * (sg + a[i] * sg * (1.f - sg)); db[i] = d[i] * a[i] * sg;
+  }
+  dh[r * 2 * F8 + f] = bf8(da); dh[r * 2 * F8 + F8 + f] = bf8(db);
+}
+inline void swigluBf(const bf* h, bf* g, size_t rows, int F) {
+  if (F % 8 == 0 && ((uintptr_t)h | (uintptr_t)g) % 16 == 0)
+    swigluBf8K<<<blocks(rows * F / 8), 256, 0, STREAM>>>(reinterpret_cast<const uint4*>(h), reinterpret_cast<uint4*>(g), rows, F);
+  else swigluBfK<<<blocks(rows * F), 256, 0, STREAM>>>(h, g, rows, F);
+}
+inline void swigluBwdBf(const bf* h, const bf* dg, bf* dh, size_t rows, int F) {
+  if (F % 8 == 0 && ((uintptr_t)h | (uintptr_t)dg | (uintptr_t)dh) % 16 == 0)
+    swigluBwdBf8K<<<blocks(rows * F / 8), 256, 0, STREAM>>>(reinterpret_cast<const uint4*>(h), reinterpret_cast<const uint4*>(dg),
+                                                             reinterpret_cast<uint4*>(dh), rows, F);
+  else swigluBwdBfK<<<blocks(rows * F), 256, 0, STREAM>>>(h, dg, dh, rows, F);
 }
 #endif
 #ifndef GRAD_F64

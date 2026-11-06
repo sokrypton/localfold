@@ -11,6 +11,7 @@
 // float32's accuracy (the dropped lo*lo is 2^-22 of the product) at well past the SIMT throughput.
 #pragma once
 #include <cstdint>
+#include <type_traits>
 
 namespace grad {
 namespace flash {
@@ -943,6 +944,7 @@ __global__ void __launch_bounds__(THREADS, 3) bwdBf(Sdpa a, BiasTile bt, HSrc qs
   // the clip as two bounds, the lower one -inf for a key that is out (so that the clip cannot bring it back)
   const float hiC = a.clip ? 1e8f : INFINITY;
   const float loC[2] = {kaR[0] == -INFINITY || !a.clip ? -INFINITY : -1e8f, kaR[1] == -INFINITY || !a.clip ? -INFINITY : -1e8f};
+  const float ckL[2] = {kaR[0] * LOG2E, kaR[1] * LOG2E}, sl2 = a.scale * LOG2E;
   // dS^T's element (k, q): a row a key, its 16-byte chunks permuted by the row (the stores and ldmatrix both clean)
   auto sOff = [](int k, int q) { return k * QT + (((q >> 3) ^ (k & (QT / 8 - 1))) << 3) + (q & 7); };
   uint32_t ka[DP / 16][4], va[DP / 16][4];
@@ -1011,6 +1013,11 @@ __global__ void __launch_bounds__(THREADS, 3) bwdBf(Sdpa a, BiasTile bt, HSrc qs
           Dq[par] = v.z;
           sq[par] = __float_as_int(v.w);
         }
+        float cq[2];   // (!GEN: the query's log-sum-exp in base 2, folded into one subtraction a score)
+        if constexpr (!GEN) {
+#pragma unroll
+          for (int par = 0; par < 2; ++par) cq[par] = fmaf(Lq[par], LOG2E, Lgq[par]);
+        }
 #pragma unroll
         for (int hk = 0; hk < 2; ++hk) {
           const int kl = kl0 + g + hk * 8;
@@ -1020,9 +1027,14 @@ __global__ void __launch_bounds__(THREADS, 3) bwdBf(Sdpa a, BiasTile bt, HSrc qs
           for (int par = 0; par < 2; ++par) {
             const int e = hk * 2 + par;
             const float bias = __uint_as_float(par ? bb & 0xffff0000u : bb << 16);
-            float x = fminf(fmaxf(fmaf(sa[jj][e], a.scale, kaR[hk] + bias), loC[hk]), hiC);
-            if (seqQ && ksR[hk] != sq[par]) x = -INFINITY;
-            const float p = ex2(fmaf(x - Lq[par], LOG2E, -Lgq[par]));
+            float p;
+            if constexpr (!GEN) {   // (no clip, no chain ids: 2^(s scale log2e + (key term + bias) log2e - c_q), two FMAs)
+              p = ex2(fmaf(sa[jj][e], sl2, fmaf(bias, LOG2E, ckL[hk] - cq[par])));
+            } else {
+              float x = fminf(fmaxf(fmaf(sa[jj][e], a.scale, kaR[hk] + bias), loC[hk]), hiC);
+              if (seqQ && ksR[hk] != sq[par]) x = -INFINITY;
+              p = ex2(fmaf(x - Lq[par], LOG2E, -Lgq[par]));
+            }
             const float ds = p * (dpt[jj][e] - Dq[par]);
             sa[jj][e] = p;
             dpt[jj][e] = ds;
@@ -1179,6 +1191,254 @@ inline void forwardBf(const Sdpa& a, const X* q, int ldq, const X* k, int ldk, c
   const size_t grid = (size_t)((a.Q + BR - 1) / BR) * a.H * a.B;
   fwdBf<D, OT><<<(unsigned)grid, THREADS, smem, STREAM>>>(a, bt, qs_, ks_, vs_, o, ldo, lse);
 }
+// ---- the grid ("triangle") attention's forward: fwdBf with the per-score work cut to what it needs. fwdBf issued ~37
+// instructions a score (a shared load of the key term and of the bias for each, the clip and -inf branches, the scale
+// and log2(e) as separate multiplies) and was bound by issue, not by its MMAs - 1.51 ms a call at 512 tokens, 4 heads
+// of 32. Here a score is two FMAs into base 2 (the key terms pre-multiplied, built once a call by keyTermsK and copied
+// with each key tile), a max, a subtraction, an exponential and a sum; the bias tile goes by ldmatrix straight into
+// the accumulators' layout, K and V by ldmatrix; every copy walks a running pointer. The epilogue takes the gate:
+// g = sigmoid(raw) written back over the raw gate (gateSigLdBfK's), og = o g (gateMulBfK's). 1.33 ms with both
+// gate passes inside, against 2.0 for the three kernels; float scores as before (the logits' roundings move by an
+// ulp: the scale folded into one FMA). Needs: no chain ids, no clip, the [q][k] bias the same for every row (sb 0).
+__device__ __forceinline__ void ldsm2(uint32_t* r, const uint16_t* p) {
+  const unsigned a = (unsigned)__cvta_generic_to_shared(p);
+  asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];" : "=r"(r[0]), "=r"(r[1]) : "r"(a));
+}
+__device__ __forceinline__ void ldsm4(uint32_t* r, const uint16_t* p) {
+  const unsigned a = (unsigned)__cvta_generic_to_shared(p);
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];" : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+}
+template <int D, int GR, int WQ>
+inline size_t gridFwdSmem() { return 2 * ((size_t)2 * GR * BC * ldBf<D>() * 2 + (size_t)16 * WQ * LB * 2 + GR * BC * 4); }
+// GR: grid rows a block, WQ: warps a row (16 queries each; the row's query tile GQ = 16 WQ)
+template <int D, int GR, int WQ>
+__global__ void __launch_bounds__(32 * GR * WQ, 512 / (32 * GR * WQ)) gridFwdBf(Sdpa a, BiasTile bt, HSrc qs_, HSrc ks_, HSrc vs_,
+                                                        __nv_bfloat16* __restrict__ o, int ldo, float* __restrict__ lse,
+                                                        __nv_bfloat16* __restrict__ gate, int ldg,
+                                                        __nv_bfloat16* __restrict__ og, int ldog,
+                                                        const float* __restrict__ ka2, int kpad) {
+  constexpr int DP = padD<D>(), LK = ldBf<D>();
+  constexpr size_t KV = (size_t)BC * LK;                                   // one row's K (or V) tile, in halves
+  constexpr int GQ = 16 * WQ, NT = 32 * GR * WQ, MT = 1;
+  constexpr size_t STAGE = (2 * GR * KV * 2 + (size_t)GQ * LB * 2 + GR * BC * 4);   // bytes
+  extern __shared__ __align__(16) unsigned char gsm[];
+  auto Ks = [&](int st, int r) { return reinterpret_cast<uint16_t*>(gsm + st * STAGE) + r * 2 * KV; };
+  auto Vs = [&](int st, int r) { return Ks(st, r) + KV; };
+  auto Ts = [&](int st) { return reinterpret_cast<uint16_t*>(gsm + st * STAGE) + GR * 2 * KV; };
+  auto KAs = [&](int st) { return reinterpret_cast<float*>(gsm + st * STAGE + 2 * GR * KV * 2 + (size_t)GQ * LB * 2); };
+  const int nqb = (a.Q + GQ - 1) / GQ;
+  const int qb = blockIdx.x % nqb, h = (blockIdx.x / nqb) % a.H, bp = blockIdx.x / (nqb * a.H);
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+  const int rg = warp / WQ, wq = warp % WQ;
+  const int b = bp * GR + rg, bl = b < a.B ? b : a.B - 1;                  // (a last block's spare row: computes, stores nothing)
+  const int q0 = qb * GQ, qw = q0 + wq * 16 * MT;
+  const float sl2 = (float)a.scale * LOG2E;
+  const uint16_t* tp = bt.p ? bt.p + h * bt.sh + (size_t)q0 * bt.ld : nullptr;
+  // each thread's copies, as running pointers a key tile on (the generic loaders' address arithmetic was most of
+  // the loop's integer issue): KC chunks of K and of V a row, 4 of the bias tile, and the row's key terms
+  constexpr int CH = DP / 8, KC = (BC * CH + NT - 1) / NT;
+  const uint16_t *kp[GR][KC], *vp[GR][KC];
+  int kr[KC];
+#pragma unroll
+  for (int j = 0; j < KC; ++j) {
+    const int i = threadIdx.x + j * NT, r = i / CH, c = (i % CH) * 8;
+    kr[j] = (BC * CH % NT == 0 || i < BC * CH) && c < ks_.W ? r : 1 << 30;
+#pragma unroll
+    for (int g2 = 0; g2 < GR; ++g2) {
+      const int br = bp * GR + g2 < a.B ? bp * GR + g2 : a.B - 1;
+      kp[g2][j] = hrow(ks_, br, h, r) + c; vp[g2][j] = hrow(vs_, br, h, r) + c;
+    }
+  }
+  const uint16_t* bsrc = tp ? tp + (size_t)(threadIdx.x / (BC / 8)) * bt.ld + (threadIdx.x % (BC / 8)) * 8 : nullptr;
+  const int kaR = threadIdx.x / (BC / 4), kaC = (threadIdx.x % (BC / 4)) * 4;   // (threads 0 .. GR * 16 - 1)
+  const float* kasrc = ka2 + (size_t)(bp * GR + kaR < a.B ? bp * GR + kaR : a.B - 1) * kpad + kaC;
+  auto issue = [&](int st, int k0) {
+#pragma unroll
+    for (int g2 = 0; g2 < GR; ++g2)
+#pragma unroll
+      for (int j = 0; j < KC; ++j) {
+        if (kr[j] == 1 << 30) continue;
+        const int i = threadIdx.x + j * NT, off = (i / CH) * LK + (i % CH) * 8;
+        const bool on = k0 + kr[j] < ks_.N;
+        cp16(Ks(st, g2) + off, on ? kp[g2][j] + (long long)k0 * ks_.sN : ks_.p, on);
+        cp16(Vs(st, g2) + off, on ? vp[g2][j] + (long long)k0 * vs_.sN : vs_.p, on);
+      }
+    if (tp) {
+      uint16_t* T = Ts(st) + (threadIdx.x / (BC / 8)) * LB + (threadIdx.x % (BC / 8)) * 8;
+#pragma unroll
+      for (int j = 0; j < GQ * BC / 8 / NT; ++j) cp16(T + j * (NT / (BC / 8)) * LB, bsrc + (size_t)j * (NT / (BC / 8)) * bt.ld + k0, true);
+    }
+    if (threadIdx.x < GR * (BC / 4)) cp16(KAs(st) + kaR * BC + kaC, kasrc + k0, true);
+  };
+  issue(0, 0);
+  cpCommit();
+  uint32_t qa[MT][DP / 16][4];
+#pragma unroll
+  for (int mt = 0; mt < MT; ++mt)
+#pragma unroll
+    for (int s = 0; s < DP / 16; ++s) aFragS(qa[mt][s], qs_, bl, h, qw + mt * 16 + g, s * 16 + 2 * t);
+  float oacc[MT][D / 8][4];
+#pragma unroll
+  for (int mt = 0; mt < MT; ++mt)
+#pragma unroll
+    for (int n = 0; n < D / 8; ++n) oacc[mt][n][0] = oacc[mt][n][1] = oacc[mt][n][2] = oacc[mt][n][3] = 0.f;
+  float mx[MT][2], sum[MT][2];
+#pragma unroll
+  for (int mt = 0; mt < MT; ++mt) mx[mt][0] = mx[mt][1] = -INFINITY, sum[mt][0] = sum[mt][1] = 0.f;
+  const int nk = (a.K + BC - 1) / BC;
+  for (int it = 0; it < nk; ++it) {
+    const int st = it & 1, k0 = it * BC;
+    if (it + 1 < nk) issue(st ^ 1, k0 + BC);
+    cpCommit();
+    cpWait1();
+    __syncthreads();
+    const uint16_t *K = Ks(st, rg), *V = Vs(st, rg), *T = Ts(st);
+    const float* ka = KAs(st) + rg * BC;
+    // a tile's 16 x 64 scores at a time, one query tile after the other (both at once held 64 more registers and spilled)
+#pragma unroll
+    for (int mt = 0; mt < MT; ++mt) {
+      float sacc[BC / 8][4];
+#pragma unroll
+      for (int j = 0; j < BC / 8; ++j) sacc[j][0] = sacc[j][1] = sacc[j][2] = sacc[j][3] = 0.f;
+#pragma unroll
+      for (int j = 0; j < BC / 8; ++j)
+#pragma unroll
+        for (int s = 0; s < DP / 16; ++s) {
+          uint32_t kb[2];
+          ldsm2(kb, K + (j * 8 + (lane & 7)) * LK + s * 16 + ((lane >> 3) & 1) * 8);
+          mma16(sacc[j], qa[mt][s], kb[0], kb[1]);
+        }
+      // the logits in base 2: x = s scale log2(e) + (key term + bias) log2(e) - two FMAs (a key out is -inf in the key
+      // term, and stays so); the bias tile read straight into the accumulators' layout (pairs of columns 2t, 2t + 1)
+      const uint16_t* rowp = T + (wq * 16 * MT + mt * 16 + (lane & 7) + ((lane >> 3) & 1) * 8) * LB + (lane >> 4) * 8;
+      float rmax[2] = {-INFINITY, -INFINITY};
+#pragma unroll
+      for (int j = 0; j < BC / 8; j += 2) {
+        uint32_t r4[4] = {0u, 0u, 0u, 0u};
+        if (tp) ldsm4(r4, rowp + j * 8);
+#pragma unroll
+        for (int jj = 0; jj < 2; ++jj) {
+          const float2 kk = *reinterpret_cast<const float2*>(ka + (j + jj) * 8 + 2 * t);
+#pragma unroll
+          for (int e = 0; e < 4; ++e) {
+            const uint32_t w = r4[jj * 2 + (e >> 1)];
+            const float bias = __uint_as_float(e & 1 ? w & 0xffff0000u : w << 16);
+            const float x = fmaf(sacc[j + jj][e], sl2, fmaf(bias, LOG2E, (e & 1) ? kk.y : kk.x));
+            sacc[j + jj][e] = x;
+            rmax[e >> 1] = fmaxf(rmax[e >> 1], x);
+          }
+        }
+      }
+#pragma unroll
+      for (int r = 0; r < 2; ++r) {
+        rmax[r] = fmaxf(rmax[r], __shfl_xor_sync(~0u, rmax[r], 1));
+        rmax[r] = fmaxf(rmax[r], __shfl_xor_sync(~0u, rmax[r], 2));
+      }
+      float alpha[2], nm[2], rs[2] = {0.f, 0.f};
+#pragma unroll
+      for (int r = 0; r < 2; ++r) {
+        const float m = fmaxf(mx[mt][r], rmax[r]);
+        alpha[r] = m == -INFINITY ? 1.f : ex2(mx[mt][r] - m);
+        mx[mt][r] = m;
+        nm[r] = m == -INFINITY ? 0.f : m;   // (a row with every key out so far: its p are 2^-inf = 0)
+      }
+#pragma unroll
+      for (int j = 0; j < BC / 8; ++j)
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+          const float p = ex2(sacc[j][e] - nm[e >> 1]);
+          rs[e >> 1] += p;
+          sacc[j][e] = p;
+        }
+#pragma unroll
+      for (int r = 0; r < 2; ++r) {
+        rs[r] += __shfl_xor_sync(~0u, rs[r], 1);
+        rs[r] += __shfl_xor_sync(~0u, rs[r], 2);
+        sum[mt][r] = sum[mt][r] * alpha[r] + rs[r];
+      }
+#pragma unroll
+      for (int n = 0; n < D / 8; ++n) {
+        oacc[mt][n][0] *= alpha[0]; oacc[mt][n][1] *= alpha[0]; oacc[mt][n][2] *= alpha[1]; oacc[mt][n][3] *= alpha[1];
+      }
+#pragma unroll
+      for (int u = 0; u < BC / 16; ++u) {
+        uint32_t pa[4];
+        cToA(pa, sacc[2 * u], sacc[2 * u + 1]);
+#pragma unroll
+        for (int n = 0; n < D / 8; ++n) {
+          uint32_t b0, b1;
+          ldT(b0, b1, V, u * 16, n * 8, LK);
+          mma16(oacc[mt][n], pa, b0, b1);
+        }
+      }
+    }
+    __syncthreads();   // this stage is the one the next iteration's issue overwrites
+  }
+  if (b >= a.B) return;
+  const size_t bh = (size_t)b * a.H + h, N = (size_t)a.B * a.H * a.Q;
+#pragma unroll
+  for (int mt = 0; mt < MT; ++mt)
+#pragma unroll
+    for (int r = 0; r < 2; ++r) {
+      const int qq = qw + mt * 16 + g + r * 8;
+      if (qq >= a.Q) continue;
+      const float inv = sum[mt][r] > 0.f ? 1.f / sum[mt][r] : 0.f;
+      const size_t row = (size_t)b * a.Q + qq;
+#pragma unroll
+      for (int n = 0; n < D / 8; ++n) {
+        const int c = h * D + n * 8 + 2 * t;
+        const uint32_t ow = bf2(oacc[mt][n][r * 2] * inv, oacc[mt][n][r * 2 + 1] * inv);
+        *reinterpret_cast<uint32_t*>(o + row * ldo + c) = ow;
+        if (gate) {
+          uint32_t* gp = reinterpret_cast<uint32_t*>(gate + row * ldg + c);
+          const uint32_t gw = *gp;
+          const float s0 = __bfloat162float(__float2bfloat16(1.f / (1.f + __expf(-__uint_as_float(gw << 16))))),
+                      s1 = __bfloat162float(__float2bfloat16(1.f / (1.f + __expf(-__uint_as_float(gw & 0xffff0000u)))));
+          *gp = bf2(s0, s1);
+          *reinterpret_cast<uint32_t*>(og + row * ldog + c) = bf2(__uint_as_float(ow << 16) * s0, __uint_as_float(ow & 0xffff0000u) * s1);
+        }
+      }
+      if (t == 0) {
+        const size_t i = bh * a.Q + qq;
+        lse[i] = sum[mt][r] > 0.f ? mx[mt][r] / LOG2E : -INFINITY;
+        lse[N + i] = sum[mt][r] > 0.f ? logf(sum[mt][r]) : 0.f;
+      }
+    }
+}
+// every row's per-key terms (keyAdd - the key mask, -inf past K - in base 2) [B][Kp], for gridFwdBf's tiles
+__global__ void keyTermsK(Sdpa a, float* __restrict__ out, int Kp) {
+  const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < (size_t)a.B * Kp) out[i] = keyAdd(a, (int)(i / Kp), 0, (int)(i % Kp)) * LOG2E;
+}
+// the grid attention's forward through gridFwdBf where its shape allows (false: the caller takes the general path)
+inline bool gridForwardBf(const Sdpa& a, const __nv_bfloat16* q, int ldq, const __nv_bfloat16* k, int ldk,
+                          const __nv_bfloat16* v, int ldv, __nv_bfloat16* o, int ldo, float* lse,
+                          __nv_bfloat16* gate = nullptr, int ldg = 0, __nv_bfloat16* og = nullptr, int ldog = 0) {
+  if (a.seqQ || a.seqK || a.clip || (a.D != 16 && a.D != 32) || a.bias[1].p) return false;
+  if (a.bias[0].p && (a.bias[0].sb != 0 || a.bias[0].sq == 0)) return false;
+  if (ldo % 2 || (gate && (ldg % 2 || ldog % 2))) return false;
+  Scratch scratch;
+  const int Npq = (a.Q + 63) / 64 * 64, Npk = (a.K + 63) / 64 * 64;
+  const BiasTile bt = biasBf(a, Npq, Npk);
+  float* ka2 = ARENA.get((size_t)a.B * Npk);   // (no per-key bias here: keyAdd is the same for every head)
+  keyTermsK<<<blocks((size_t)a.B * Npk), 256, 0, STREAM>>>(a, ka2, Npk);
+  // (one row of 64 queries a block: two rows sharing the bias tile, or 128 queries sharing K and V, measured the same
+  // at 512 tokens - 11.6, 11.6 and 11.5 ms a pairformer block's forward - though the kernel reads L2 at 74% of its
+  // throughput: what is left is latency, ~15 instructions a score at 4 blocks of 4 warps an SM)
+  constexpr int GR = 1, WQ = 4, GQ = 16 * WQ;
+  const size_t grid = (size_t)((a.Q + GQ - 1) / GQ) * a.H * ((a.B + GR - 1) / GR);
+  auto run = [&](auto Dc) {
+    constexpr int DD = decltype(Dc)::value;
+    const HSrc qs_ = hsrc<DD>(q, ldq, a.B, a.Q, a.H), ks_ = hsrc<DD>(k, ldk, a.B, a.K, a.H), vs_ = hsrc<DD>(v, ldv, a.B, a.K, a.H);
+    static bool attr = false;
+    const size_t smem = gridFwdSmem<DD, GR, WQ>();
+    if (!attr) { GK(cudaFuncSetAttribute(gridFwdBf<DD, GR, WQ>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem)); attr = true; }
+    gridFwdBf<DD, GR, WQ><<<(unsigned)grid, 32 * GR * WQ, smem, STREAM>>>(a, bt, qs_, ks_, vs_, o, ldo, lse, gate, ldg, og, ldog, ka2, Npk);
+  };
+  if (a.D == 32) run(std::integral_constant<int, 32>{}); else run(std::integral_constant<int, 16>{});
+  return true;
+}
+
 template <int D, class X, class DKV = float, class DOT = float>
 inline void backwardBf(const Sdpa& a, const X* q, int ldq, const X* k, int ldk, const X* v, int ldv,
                        const DOT* dO, int lddo, const float* lse, const float* Di, float* dq, int lddq, DKV* dk,
@@ -1211,7 +1471,7 @@ inline void backwardBf(const Sdpa& a, const X* q, int ldq, const X* k, int ldk, 
     GK(cudaMemsetAsync(fx[j], 0, ext[j] * 8, STREAM));
   }
   const size_t grid = (size_t)((a.K + BC - 1) / BC) * a.H * a.B;
-  const bool gen = a.seqQ || a.seqK || fx[0] || fx[1];
+  const bool gen = a.seqQ || a.seqK || fx[0] || fx[1] || a.clip;   // (!gen: bwdBf's short form, which has no clip)
   // dqo: dQ narrowed into bf16 in the kernel, a tile at a time by the last of its key blocks (counted); where the
   // vector accesses do not align, by a pass after
   const bool inK = dqo && lddq % 4 == 0 && ldqo % 4 == 0 && ((uintptr_t)dq & 15) == 0 && ((uintptr_t)dqo & 7) == 0;
