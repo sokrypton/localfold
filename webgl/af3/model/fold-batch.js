@@ -14,7 +14,8 @@
  */
 import { createWebGL2Context } from "../../runtime/context.js";
 import { Execution } from "../../runtime/execution.js";
-import { foldAf3Async, releaseAf3Weights, uploadAf3Weights } from "./fold.js";
+import { foldAf3Async, releaseAf3Weights, uploadAf3WeightsSteps } from "./fold.js";
+import { drainAsync, gpuIdle } from "../../runtime/steps.js";
 import { chainPairTmScores, perChainTmScores, reduceTmScore, tmPerBinFor, tmScoreD0, tmTermFromLogits }
   from "../../../shared/heads/tm-score.js";
 import { errorBinCentres, MAX_ERROR_BIN, NUM_BINS } from "../confidence/confidence.js";
@@ -33,17 +34,24 @@ export function webgl2FoldAvailable() {
 // One context for the page, and the last family's weights on it: a second family's upload
 // replaces the first's (each is ~800 MB as halves), the same family's is kept.
 let execution = null;
-let resident = null; // { weights, uploaded }
+let resident = null; // { weights, ready: Promise<uploaded> }
 
-function executionFor(weights) {
+/** The weights on the GPU, uploaded a module at a time with the thread let go in between. */
+function uploadedFor(weights) {
   // The configuration fold-af3-webgl.js gates against the WGSL fold: half weights and activations.
   execution ??= new Execution(createWebGL2Context(),
     { halfWeights: true, halfActivations: true, int5Weights: true });
   if (resident?.weights !== weights) {
-    if (resident !== null) releaseAf3Weights(execution, resident.uploaded);
-    resident = { weights, uploaded: uploadAf3Weights(execution, weights) };
+    const previous = resident;
+    resident = {
+      weights,
+      ready: (async () => {
+        if (previous !== null) releaseAf3Weights(execution, await previous.ready);
+        return drainAsync(uploadAf3WeightsSteps(execution, weights), () => gpuIdle(execution.gl));
+      })(),
+    };
   }
-  return resident.uploaded;
+  return resident.ready;
 }
 
 /**
@@ -69,7 +77,7 @@ export async function foldBatchWebGl2(batch, weights, options) {
   if (rows > cap || (native && rows > 1)) {
     throw new Error(`the WebGL2 fold does not draw from an alignment (${rows} rows)`);
   }
-  const uploaded = executionFor(weights);
+  const uploaded = await uploadedFor(weights);
   const fold = await foldAf3Async(execution, {
     batch, weights: uploaded, hostWeights: weights,
     msa: {

@@ -40,7 +40,7 @@ import {
 import { weightedRigidAlign } from "../../../cpu/af3/diffusion/rigid-align.js";
 import { steerDenoised } from "../../../cpu/af3/diffusion/steering.js";
 import { inpaintDenoised } from "../../../cpu/af3/diffusion/inpaint.js";
-import { diffusionHead } from "./head.js";
+import { diffusionHeadSteps } from "./head.js";
 import { pairConditioning } from "./conditioning.js";
 import { drain } from "../../runtime/steps.js";
 
@@ -86,9 +86,10 @@ export function denoiserFromHead(execution, input) {
       weights: input.weights.conditioning, relativeWidth: input.relativeWidth,
       epsilon: input.epsilon,
     });
-  // `issue` draws the head and returns its read: a caller that waits for the GPU in between
-  // (sampleOnWebGl2Steps' yield) reads a finished result instead of blocking on the whole head.
-  const issue = (positions, noiseLevel) => {
+  // `issueSteps` draws the head, yielding between its pieces, and returns its read: a caller that
+  // waits for the GPU at each yield (sampleOnWebGl2Steps) hands the head over in pieces and reads a
+  // finished result instead of blocking on the whole head.
+  const issueSteps = function* (positions, noiseLevel) {
     if (positions.length !== atoms * 3) {
       throw new RangeError(
         `af3 sampler: ${positions.length} coordinates, not ${atoms} x 3`);
@@ -96,7 +97,7 @@ export function denoiserFromHead(execution, input) {
     const uploaded = execution.upload(
       positions instanceof Float32Array ? positions : Float32Array.from(positions),
       "af3.sampler.noisy");
-    const out = diffusionHead(execution, {
+    const out = yield* diffusionHeadSteps(execution, {
       ...input, positionsNoisy: uploaded, noiseLevel,
       ...(conditioningPair === undefined ? {} : { conditioningPair }),
     });
@@ -107,8 +108,8 @@ export function denoiserFromHead(execution, input) {
       return values;
     };
   };
-  const denoise = (positions, noiseLevel) => issue(positions, noiseLevel)();
-  denoise.issue = issue;
+  const denoise = (positions, noiseLevel) => drain(issueSteps(positions, noiseLevel))();
+  denoise.issueSteps = issueSteps;
   // ...and the walk's own copy goes back when the walk does.
   denoise.release = () => {
     if (input.conditioningPair === undefined && conditioningPair !== undefined) {
@@ -217,11 +218,11 @@ export function* sampleOnWebGl2Steps(execution, input, options) {
 
     // The head drawn, then a yield (the GPU waited on there, not in the read), then its result.
     let raw;
-    if (denoise.issue === undefined) {
+    if (denoise.issueSteps === undefined) {
       yield { stage: "step", step };
       raw = denoise(noisy, tHat);
     } else {
-      const read = denoise.issue(noisy, tHat);
+      const read = yield* denoise.issueSteps(noisy, tHat);
       yield { stage: "step", step };
       raw = read();
     }

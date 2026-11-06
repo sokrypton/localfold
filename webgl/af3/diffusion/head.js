@@ -39,7 +39,8 @@ import { ONE_TARGET, PRELUDE } from "../../runtime/execution.js";
 import { atomCrossAttentionEncoder } from "./atom-encoder.js";
 import { atomPairLogits, crossAttentionBlock, gather, sumSource } from "./atom-attention.js";
 import { diffusionConditioning, scalings } from "./conditioning.js";
-import { diffusionTransformer } from "./transformer.js";
+import { diffusionTransformerSteps } from "./transformer.js";
+import { drain } from "../../runtime/steps.js";
 import { layerNorm } from "../../kernels/layer-norm.js";
 import { linear } from "../../kernels/linear.js";
 
@@ -306,6 +307,11 @@ void main() {
  * @returns {Tensor} `tokens * dense * 3`, the denoised positions
  */
 export function diffusionHead(execution, call) {
+  return drain(diffusionHeadSteps(execution, call));
+}
+
+/** `diffusionHead` as a generator: yields after the atom encoder and each transformer super-block. */
+export function* diffusionHeadSteps(execution, call) {
   const {
     positionsNoisy, noiseLevel, atomMask, seqMask, trunkSingle, trunkPair, targetFeat,
     conditioning, refPos, refSpaceUid, identity, gathers, weights: w,
@@ -368,6 +374,7 @@ export function diffusionHead(execution, call) {
   call.onStage?.("encoder.pairCond", encoded.pairCond);
   call.onStage?.("encoder.keysCond", encoded.keysCond);
   call.onStage?.("encoder.queriesMask", encoded.queriesMask);
+  yield { stage: "encoder" };
 
   const normalisedSingle = layerNorm(execution, {
     x: cond.single, weight: w.singleCondEmbeddingNormScale,
@@ -390,7 +397,7 @@ export function diffusionHead(execution, call) {
   execution.release(encoded.tokenAct);
   call.onStage?.("after single projection", act);
 
-  const transformed = diffusionTransformer(execution, {
+  const transformed = yield* diffusionTransformerSteps(execution, {
     act, cond: cond.single, pairCond: cond.pair, mask: seqMask, tokens,
     weights: w.transformer, epsilon,
   });

@@ -163,6 +163,15 @@ export function pairMaskOf(seqMask, tokens) {
  *   targetFeat: any}} weights as `foldWeights` returns them
  */
 export function uploadAf3Weights(execution, weights) {
+  return drain(uploadAf3WeightsSteps(execution, weights));
+}
+
+/**
+ * `uploadAf3Weights` as a generator: yields after each module's weights (the embedder, each
+ * trunk block, the heads), so a page can upload ~800 MB of them without holding the thread
+ * for seconds (`drainAsync`).
+ */
+export function* uploadAf3WeightsSteps(execution, weights) {
   const seen = [];
   // 🔴 AN ABSENT WEIGHT MUST ARRIVE AS ABSENT, NOT AS null. The loaders write
   // `null` for a tensor a bundle does not carry - chai1's single-cond embedding
@@ -193,6 +202,42 @@ export function uploadAf3Weights(execution, weights) {
       .filter(([, v]) => v !== undefined));
   };
   const trunk = weights.trunk;
+  const piece = { stage: "weights" };
+  const embedder = uploadEmbedderWeights(execution, trunk.embedder);
+  yield piece;
+  const template = trunk.template === undefined || trunk.template === null
+    ? undefined : uploadTemplateWeights(execution, trunk.template);
+  const msaBlocks = [];
+  for (const block of trunk.msaBlocks) {
+    msaBlocks.push(uploadMsaBlockWeights(execution, block));
+    yield piece;
+  }
+  const pairformerBlocks = [];
+  for (const block of trunk.pairformerBlocks) {
+    pairformerBlocks.push(uploadPairformerBlockWeights(execution, block));
+    yield piece;
+  }
+  const distogram = uploadTree(trunk.distogram, "w.af3.distogram");
+  const diffusion = uploadTree(weights.diffusion, "w.af3.diffusion");
+  yield piece;
+  const atomReference = uploadConditioningWeights(execution, weights.atomReference);
+  const targetFeat = {
+    ...uploadTree(
+      { ...weights.targetFeat, reference: undefined }, "w.af3.target-feat"),
+    reference: uploadConditioningWeights(execution, weights.targetFeat.reference),
+    dialect: weights.targetFeat.dialect,
+  };
+  yield piece;
+  let confidence;
+  if (weights.confidence !== undefined) {
+    const head = uploadConfidenceHeadWeights(execution, weights.confidence);
+    const blocks = [];
+    for (const block of weights.confidence.blocks) {
+      blocks.push(uploadPairformerBlockWeights(execution, block));
+      yield piece;
+    }
+    confidence = { head, blocks };
+  }
   const uploaded = {
     dialect: trunk.dialect,
     // 🔴 THE MODULES THAT HAVE THEIR OWN UPLOADER KEEP IT, and the MSA block's
@@ -201,33 +246,16 @@ export function uploadAf3Weights(execution, weights) {
     // fills in the two projection biases rosettafold3 has and AF3 does not.
     // Uploading that tree generically compiles and then refuses with "cOuter
     // must be a multiple of 4, got undefined".
-    embedder: uploadEmbedderWeights(execution, trunk.embedder),
-    template: trunk.template === undefined || trunk.template === null
-      ? undefined : uploadTemplateWeights(execution, trunk.template),
-    msaBlocks: trunk.msaBlocks.map((block) => uploadMsaBlockWeights(execution, block)),
-    pairformerBlocks: trunk.pairformerBlocks.map(
-      (block) => uploadPairformerBlockWeights(execution, block)),
-    distogram: uploadTree(trunk.distogram, "w.af3.distogram"),
+    embedder, template, msaBlocks, pairformerBlocks, distogram,
     // The diffusion head's own tree, and the per-atom conditioning's reference
     // table, which `targetFeat` and the head both read.
-    diffusion: uploadTree(weights.diffusion, "w.af3.diffusion"),
+    diffusion,
     // 🔴 THE DIFFUSION HAS ITS OWN REFERENCE TABLE, and it is not target_feat's.
     // `atomReference` is "the diffusion head's own copy of it" - same five
     // projections, different trained values, and a bias target_feat's does not
     // carry. Using one for both runs, folds, and conditions every atom on the
     // wrong table.
-    atomReference: uploadConditioningWeights(execution, weights.atomReference),
-    targetFeat: {
-      ...uploadTree(
-        { ...weights.targetFeat, reference: undefined }, "w.af3.target-feat"),
-      reference: uploadConditioningWeights(execution, weights.targetFeat.reference),
-      dialect: weights.targetFeat.dialect,
-    },
-    confidence: weights.confidence === undefined ? undefined : {
-      head: uploadConfidenceHeadWeights(execution, weights.confidence),
-      blocks: weights.confidence.blocks.map(
-        (block) => uploadPairformerBlockWeights(execution, block)),
-    },
+    atomReference, targetFeat, confidence,
     // The host keeps these: the Fourier embedding is one row and the absent
     // target_feat rows are read as numbers after the global norm.
     hostFourier: {

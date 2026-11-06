@@ -34,6 +34,7 @@
  * collapses to the key position and its bias layout is already `[head][i][j]`.
  */
 import { ONE_TARGET, PRELUDE } from "../../runtime/execution.js";
+import { drain } from "../../runtime/steps.js";
 import { adaptiveLayerNorm, adaptiveZeroInit, elementwiseProductSource, sumSource }
   from "./atom-attention.js";
 import { attentionFlash } from "../../kernels/attention-flash.js";
@@ -227,6 +228,15 @@ export function conditionedSelfAttention(execution, call) {
  * @returns {Tensor} a new activation; the caller's `act` is untouched
  */
 export function diffusionTransformer(execution, call) {
+  return drain(diffusionTransformerSteps(execution, call));
+}
+
+/**
+ * `diffusionTransformer` as a generator: yields after each super-block's draws, so a caller that
+ * waits for the GPU there (sampleOnWebGl2Steps) hands it the head in pieces rather than as one
+ * submission every other WebGL context on the page has to wait behind.
+ */
+export function* diffusionTransformerSteps(execution, call) {
   const { act, cond, pairCond, mask, tokens, weights: w, epsilon = 1e-5 } = call;
   const channels = w.channels;
   const condChannels = w.condChannels;
@@ -290,6 +300,7 @@ export function diffusionTransformer(execution, call) {
       call.onBlock?.(superBlock, inner);
     }
     execution.release(flat);
+    yield { stage: "transformer", superBlock };
   }
   execution.release(normalisedPair);
   current.label = "af3.difftx";
