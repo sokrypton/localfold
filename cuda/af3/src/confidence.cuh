@@ -587,7 +587,7 @@ inline ConfidenceOut confidenceHead(const float* trunkPair, const float* trunkSi
   // a bf16 trunk pair (TRUNK_PAIR16, a card short of room): the head's pair is bf16 too, its blocks run under PAIR16
   // and its heads widen a chunk of rows at a time (af3.cu keeps it only for a head that takes it: no re-embedding)
   const bool p16 = TRUNK_PAIR16;
-  if (p16 && !shortPair(pairs, C)) {
+  if (p16 && !shortPair("lean.pair16", pairs, C)) {
     fprintf(stderr, "the confidence head was handed a bf16 pair it does not take\n"); exit(1);
   }
   const size_t pairBytes = pairs * C * (p16 ? 2 : 4);
@@ -658,7 +658,7 @@ inline ConfidenceOut confidenceHead(const float* trunkPair, const float* trunkSi
   }
   // on a card short of room the stack's scratch goes before the heads allocate theirs, so the two peak
   // apart rather than together
-  if (shortPair(pairs, C)) releaseScratch({ "tri.", "trib.", "grid.", "tr.", "st." });
+  if (shortPair("lean.release", pairs, C)) releaseScratch({ "tri.", "trib.", "grid.", "tr.", "st." });
   memReport("confidence: blocks done");
   // the error bins: 64 of them up to 31 A, the last one step past the second-to-last
   const int NB = 64; double step = 31.0 / (NB - 2);
@@ -678,7 +678,7 @@ inline ConfidenceOut confidenceHead(const float* trunkPair, const float* trunkSi
   const float* dCentres = dTables;
   const float* dPerBin = dTables + NB;
   // on a card short of room the heads' LayerNorm (and the symmetrised pair it reads) run in row chunks
-  bool chunked = shortPair(pairs, C);
+  bool chunked = shortPair("lean.confidence", pairs, C);
   size_t rowsPer = chunked ? std::max<size_t>(1, std::min(pairs, CHUNK / C)) : pairs;
   float* ln = scratch<float>("conf.ln", rowsPer * C);
   // chunked, each chunk's logits are taken down to their expectations at once, so they are a chunk's and not the
@@ -830,7 +830,7 @@ inline ConfidenceOut confidenceSharded(const mg::Shared& trunkZ, int lo, int row
   if (hp) confidencePairInitK<__nv_bfloat16><<<blocks((C & 3) == 0 ? (hp * (C >> 2)) : (hp * C)), 256, 0, STREAM>>>(base, left, right, binOf, sqOf, pairMask,
     W(P + ".distogramFeatProject"), n, C, Wopt(P + ".distanceFeatProject"), caDgram, false, hf * C, (hf + hp) * C);
   // (every pair's bin and distance, read by that init alone: 2.4 GB of whole-pair tables a rank at 17,290 tokens on 8)
-  if (shortPair(pairs, C)) releaseScratch({ "conf.bin", "conf.sq" });
+  if (shortPair("lean.release", pairs, C)) releaseScratch({ "conf.bin", "conf.sq" });
   if (hasW(P + ".inputSingleNormScale")) {
     clampK<<<blocks((size_t)n * Cs), 256, 0, STREAM>>>(single, 512.f, (size_t)n * Cs);
     float* sn = scratch<float>("conf.singleNorm", (size_t)n * Cs);

@@ -33,10 +33,10 @@ inline bool pairStays16(int n, int C, bool fast) {
   if (widen) return false;
   size_t pairs = (size_t)n * n;
   Trunk probe{}; probe.n = n; probe.C = C;
-  return fast && DIFF_HALF && CONF_HALF && pair16Eligible(probe) && shortPair(pairs, C) &&
+  return fast && DIFF_HALF && CONF_HALF && pair16Eligible(probe) && shortPair("lean.pair16", pairs, C) &&
          !M.flag("trunk.dialect.structuralTokens") &&
          hasW("diffusion.encoder.embedTrunkPairCond") &&
-         shortPair(pairs, (int)M.meta("diffusion.conditioning.pairChannels")) && (int)M.meta("confidence.pairChannels") == C;
+         shortPair("lean.pair16", pairs, (int)M.meta("diffusion.conditioning.pairChannels")) && (int)M.meta("confidence.pairChannels") == C;
 }
 
 // several GPUs on a sharded pair, at the trunk's or the sampler's end: every rank's rows onto rank 0 into a whole bf16
@@ -64,6 +64,8 @@ static int foldMain(int argc, char** argv) {
   // the big-input paths when 18x the f32 pair does not fit the room (common.cuh, shortPair);
   // LOCALFOLD_SHORT_PAIR_TIMES=0 is the old 64th-of-the-card rule
   SHORT_PAIR_TIMES = getenv("LOCALFOLD_SHORT_PAIR_TIMES") ? atof(getenv("LOCALFOLD_SHORT_PAIR_TIMES")) : 18;
+  // a fixed amount kept spare beside a whole form, not a fraction of the card (common.cuh, MEM_RESERVE)
+  MEM_RESERVE = (size_t)1 << 30;
   // the trunk's modules' large scratch shared between them (common.cuh, SHARED SCRATCH): every family below proved by a
   // scribbled fold bit-identical to the unshared one - one GPU and sharded, the big-input paths, boltz2, MSA, template
   SHARED_FAMILIES = { "tri.", "grid.", "tr.", "msaatt.", "opm.", "st.", "emb.", "p16.", "tmpl." };
@@ -92,7 +94,7 @@ static int foldMain(int argc, char** argv) {
   bool waitForever = false; // ...for as long as it takes: --wait-input=0, which the standalone mode passes - its featuriser
                             // is a thread of this process that always ends in model.idx or model.failed, and an MMseqs2
                             // queue can outlast any timeout
-  bool planReport = false;
+  bool planReport = false; double memoryGB = 0;
   std::string serveDir;     // --serve=DIR: stay up, the weights resident, folding each job dropped in DIR
   for (int i = 2; i < argc; ++i) {
     if (!strcmp(argv[i], "--fast")) fast = DIFF_HALF = ATOM_HALF = CONF_HALF = F32_TF32 = true;
@@ -114,7 +116,8 @@ static int foldMain(int argc, char** argv) {
     else if (!strncmp(argv[i], "--folds=", 8)) folds = atoi(argv[i] + 8);
     else if (!strncmp(argv[i], "--steps=", 8)) steps = atoi(argv[i] + 8);
     else if (!strncmp(argv[i], "--recycles=", 11)) recycles = atoi(argv[i] + 11);
-    else if (!strcmp(argv[i], "--plan")) planReport = true;      // the memory levers each fold took (common.cuh, lever)
+    else if (!strcmp(argv[i], "--plan")) planReport = true;
+    else if (!strncmp(argv[i], "--memory=", 9)) memoryGB = atof(argv[i] + 9);   // GB this process may hold (common.cuh, MEM_BUDGET)      // the memory levers each fold took (common.cuh, lever)
     else if (!strncmp(argv[i], "--lever=", 8)) {                 // --lever=<name>=0|1: one forced (to measure its worth)
       const char* eq = strrchr(argv[i] + 8, '=');
       if (!eq || (eq[1] != '0' && eq[1] != '1') || eq[2]) { fprintf(stderr, "%s: --lever=<name>=0|1\n", argv[i]); return 1; }
@@ -144,6 +147,7 @@ static int foldMain(int argc, char** argv) {
              !strncmp(argv[i], "--bench-", 8)) {}                                 // (read by their own loops below)
     else { fprintf(stderr, "unknown flag %s\n", argv[i]); return 1; }     // (as af2 and ef2 refuse one)
   }
+  if (memoryGB > 0) memBudget((size_t)(memoryGB * 1e9));     // (before the weights: they count)
   auto t0 = std::chrono::steady_clock::now();
   // a batch: `af3 dir1,dir2,... --out=a.pdb,b.pdb` folds each input in this one process, the weights
   // loaded once and every kernel, weight copy and cuBLAS plan warm after the first
@@ -422,7 +426,7 @@ static int foldMain(int argc, char** argv) {
     const double C = M.meta("trunk.embedder.pairChannels");
     size_t f, t; deviceMemInfo(&f, &t);
     for (auto& [name, slot] : SCRATCH) f += slot.second;
-    const double pairs = 6 * C * ((double)ns * ns + (double)tokens * tokens), spare = (double)t / 20;
+    const double pairs = 6 * C * ((double)ns * ns + (double)tokens * tokens), spare = (double)spareKept(t, 20);
     if (pairs + spare > (double)f) {
       const int most = (double)f > spare ? (int)(tokens * std::sqrt(((double)f - spare) / pairs)) : 0;
       fprintf(stderr, "%d tokens do not fit this card: OpenDDE folds them on %d structural tokens, which needs ~%.1f GB "
@@ -443,7 +447,7 @@ static int foldMain(int argc, char** argv) {
   // 10,344-token fold fit an 80 GB A100 and its whole diffusion wanted ~85 GB; sharded, several samples batch as well
   const auto wholeDiffusionFits = [](int n, int C) {
     size_t f, t; deviceMemInfo(&f, &t);
-    return (double)n * n * C * 4 * 1.5 + (double)t / 20 <= (double)f;
+    return (double)n * n * C * 4 * 1.5 + (double)spareKept(t, 20) <= (double)f;
   };
   const bool oneCardPast = mg::WORLD > 1 && sh::ON && (shardDiff ? !atoi(shardDiff) : tokens < 512 || !oneSample) &&
     foldFits(tokens, (int)M.meta("trunk.embedder.pairChannels"), doFold && pairStays16(tokens, (int)M.meta("trunk.embedder.pairChannels"), fast), true) &&
@@ -597,6 +601,7 @@ static int foldMain(int argc, char** argv) {
       return true;
     };
     LEVERS.clear(); MEM_PHASE = "trunk";
+    SCRATCH_DIRECT = shortPairRule((size_t)t.n * t.n, t.C);
     ROOM_ANSWERED.clear();     // (a fold's own eager answers only: a resident server's last job asked on another card state)
     bool recycledEagerly = false, graphRefused = false;     // (a capture is sized by an eager recycle pass before it)
     for (int pass = 0; pass <= lastPass; ++pass) {
@@ -614,7 +619,7 @@ static int foldMain(int argc, char** argv) {
       // the ranks have a GPU each; a rank's kernels are an eighth as long, so the launches are a larger share)
       const bool shardGraph = sharded(t) && !noGraphs && !mg::SHARED_DEVICE;
       // (nor protenix's: its MSA's row count and its dropout's key change pass to pass, which a replayed graph would fix)
-      if (!(GRAPHS || shardGraph) || STAGES || !(lastPass >= 7 || t.n >= 200) || shortPair((size_t)t.n * t.n, t.C) || t.native || t.mcOn ||
+      if (!(GRAPHS || shardGraph) || STAGES || !(lastPass >= 7 || t.n >= 200) || shortPair("lean.graph", (size_t)t.n * t.n, t.C) || t.native || t.mcOn ||
           (!trunkGraph && (!recycledEagerly || graphRefused || (graphRefused = !sizeScratchForCapture())))) {
         SCRATCH_ASKED.clear();
         recyclePass(); recycledEagerly = true; afterPass(pass); if (converged(pass)) break; continue;
@@ -743,7 +748,7 @@ static int foldMain(int argc, char** argv) {
     // on a card short of room the trunk's pair waits in host memory from here to the confidence head: the
     // streamed preparation reads it a chunk of rows at a time and the sampler not at all
     // (only where the preparation streams: the f16 path, and an encoder that takes the pair's projection)
-    if (!structural && !sharded(t) && keptLo < 0 && DIFF_HALF && hasW("diffusion.encoder.embedTrunkPairCond") && shortPair(pairs, t.C) &&
+    if (!structural && !sharded(t) && keptLo < 0 && DIFF_HALF && hasW("diffusion.encoder.embedTrunkPairCond") && shortPair("lean.diffusion", pairs, t.C) &&
         parkWorthIt("diff.pairOnCard", pairs * t.C * (TRUNK_PAIR16 ? 2 : 4) + diffusionPrepBytes(pairs))) {
       // (the room asked for is the pair's AND what the preparation will hold beside it - asked for the pair alone, a
       // 6,916-token fold kept its 12.2 GB bf16 pair on the device and ran out in the preparation)
@@ -757,7 +762,7 @@ static int foldMain(int argc, char** argv) {
       // ...and short of room, this rank's share of the trunk pair waits in host memory from here: the streamed
       // preparation reads it a chunk of rows at a time from there and the sampler not at all (the one-GPU park's twin;
       // 9 GB a rank at 11,856 tokens on 4) - back for the contacts and the confidence head
-      if (keptLo < 0 && shortPair(pairs, t.C)) {
+      if (keptLo < 0 && shortPair("lean.diffusion", pairs, t.C)) {
         parkShare(t); dP = nullptr;
       }
     }
@@ -779,7 +784,7 @@ static int foldMain(int argc, char** argv) {
     // ...and on a card short of room the conditioning pair itself: the steps read the precomputed
     // single conditioning, the prepared encoder and the cached logits, never the pair (DCACHE stays
     // ready - its single base is what a later batch's precompute reads)
-    if (shortPair((size_t)nD * nD, (int)M.meta("diffusion.conditioning.pairChannels"))) {
+    if (shortPair("lean.diffusion", (size_t)nD * nD, (int)M.meta("diffusion.conditioning.pairChannels"))) {
       releaseScratch({ "dc.pair" }); DCACHE.pair = nullptr;
       // ...the preparation's chunk buffers (a fixed cost that matters only here), and the trunk's pair: the
       // sampler never reads it, so on a card short of room it waits in host memory for the confidence head
@@ -973,7 +978,7 @@ static int foldMain(int argc, char** argv) {
         const size_t pc = (size_t)t.n * t.n * t.C, nn = (size_t)t.n * t.n;
         const int W = mg::WORLD;
         SHORT_PAIR_SHARE = 1;                 // (the one-GPU head, the whole pair: bf16 only where it is short of room)
-        const bool p16 = shortPair(nn, t.C);
+        const bool p16 = shortPair("lean.pair16", nn, t.C);
         float* head = whole;
         if (!p16) { head = dalloc(pc); fromBf16K<<<blocks(pc), 256, 0, STREAM>>>(reinterpret_cast<const __nv_bfloat16*>(whole), head, pc); }
         const bool was16 = TRUNK_PAIR16; TRUNK_PAIR16 = p16;
@@ -1081,7 +1086,7 @@ static int foldMain(int argc, char** argv) {
         // the last confidence call of a fold short of room works in the trunk's pair (nothing reads it after)
         bool last = c0 + k + 1 == runs.size();
         ck = confidenceHead(t.pair, t.single, t.targetFeat, dBeta, t.seqMask, t.pairMask, t.n,
-                            last && shortPair((size_t)t.n * t.n, t.C));
+                            last && shortPair("lean.confidence", (size_t)t.n * t.n, t.C));
         releaseConcatCopies(); memReport("confidence");
         }
       }

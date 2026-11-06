@@ -944,7 +944,7 @@ inline void triangleBlockedTN(float* pair, const float* mask, int n, int C, cons
   int width = (int)std::max<size_t>(16, std::min<size_t>(np, (CHUNK / C) / np / 16 * 16));
   {
     const size_t perRow = (size_t)np * C * (sizeof(TQ) + 4);   // a, the product, t2
-    width = (int)std::max<size_t>(width, std::min<size_t>(np, leverRows("tri.blockRows", perRow, 1024, cardBytes() / 16) / 16 * 16));
+    width = (int)std::max<size_t>(width, std::min<size_t>(np, leverRows("tri.blockRows", perRow, 1024, spareKept(cardBytes(), 16)) / 16 * 16));
   }
   TQ* a = scratch<TQ>("trib.aq", (size_t)width * np * C);
   B16* prod = scratch<B16>("trib.pbf", (size_t)width * np * C);
@@ -1011,7 +1011,7 @@ inline void triangleBlockedFused(float* pair, const float* mask, int n, int C, c
   int width = (int)std::max<size_t>(8, std::min<size_t>(np, (CHUNK / C) / np / 8 * 8));
   {
     const size_t perRow = (size_t)np * C * 6;
-    width = (int)std::max<size_t>(width, std::min<size_t>(np, leverRows("tri.blockRows", perRow, 1024, cardBytes() / 64) / 8 * 8));
+    width = (int)std::max<size_t>(width, std::min<size_t>(np, leverRows("tri.blockRows", perRow, 1024, spareKept(cardBytes(), 64)) / 8 * 8));
   }
   // ...and narrower where the card refuses that: the free memory counts the pool's idle pages, and pages idle among a
   // stage's live buffers cannot be one block's - OpenDDE's refiner at 1,768 residues (3,384 structural tokens) on a
@@ -1087,7 +1087,7 @@ void triangleBlocked(float* pair, const float* mask, int n, int C, const std::st
   int width = (int)std::max<size_t>(8, std::min<size_t>(np, (CHUNK / C) / np / 8 * 8));
   {
     const size_t perRow = (size_t)np * C * (sizeof(T) + 4);    // a and prod, a row each
-    width = (int)std::max<size_t>(width, std::min<size_t>(np, leverRows("tri.blockRows", perRow, 1024, cardBytes() / 16) / 8 * 8));
+    width = (int)std::max<size_t>(width, std::min<size_t>(np, leverRows("tri.blockRows", perRow, 1024, spareKept(cardBytes(), 16)) / 8 * 8));
   }
   T* a = scratch<T>("trib.a", (size_t)width * np * C);
   float* prod = scratch<float>("trib.prod", (size_t)width * np * C);
@@ -1137,7 +1137,7 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
   // product and gate, five planes, would not fit with room to spare)
   // (whichever form runs gives back the other's buffers first: scratch outlives the call, so a whole form
   // taken while there was room would otherwise sit beside the blocks of the next call, which had none)
-  if (shortPair(pairs, C) || TIGHT_STACK || mg::splitting(pair)) {
+  if (shortPair("lean.triangle", pairs, C) || TIGHT_STACK || mg::splitting(pair)) {
     // (TIGHT_STACK: a narrower stack - the template's 64 channels - on a trunk short of room, where its own pair is
     // under the threshold but the card is not: its whole form, 1.5 GB at 1530 tokens, was what ran out)
     // (multi-GPU: the blocked form, whose blocks the ranks share)
@@ -1365,7 +1365,7 @@ void transition(float* x, size_t rows, int C, int factor, const std::string& pre
           constexpr int WU = decltype(wuTag)::value, NC = decltype(ncTag)::value, XR = decltype(xrTag)::value, R = 16 * WU;
           constexpr size_t smem = transitionUpSmem<CC, WU, NC, XR>();
           const size_t full = std::min<size_t>(rows * I, (size_t)1 << 29);
-          const size_t budget = (!shortPair(rows, C) && lever("tr.upWhole", full * 2, {"tr.gated", "tr.gatedbf"})) ? full : CHUNK / 2;
+          const size_t budget = (!shortPair("lean.transition", rows, C) && lever("tr.upWhole", full * 2, {"tr.gated", "tr.gatedbf"})) ? full : CHUNK / 2;
           size_t rowsPer = transitionUpChunkRows<CC, WU, NC, XR>(smem, std::max<size_t>(R, budget / I));
           if (PAIR16) {
             // a bf16 pair: the gated rows in bf16 and the second GEMM bf16 throughout, accumulating straight into the
@@ -1838,7 +1838,7 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
         else gridOut128(gathered, pre + ".outputProjection", into(pair), n, 0, pairs, tr, outBias);
         return;
       }
-      if (shortPair(pairs, C)) {
+      if (shortPair("lean.grid", pairs, C)) {
         // on a card short of room the 16-column projection in chunks of pairs, each laid into the bias
         size_t per = std::max<size_t>(1, std::min(pairs, CHUNK / 16));
         float* raw = scratch<float>("grid.raw16", per * 16);
@@ -1861,8 +1861,8 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
       // token pass (LOCALFOLD_BIG=1 keeps the 64M-element chunks, so a small input still crosses chunk boundaries)
       if (!BIG_FORCED) {
         const size_t perRow = (size_t)n * (5 * Wd * 2 + f8Row);
-        size_t maxR = shortPair(pairs, C) ? 256 : std::max<size_t>(256, ((size_t)1 << 19) / std::max(n, 1));
-        R = std::max<size_t>(R, std::min<size_t>(n, leverRows("grid.rows", perRow, maxR, cardBytes() / 16)));
+        size_t maxR = shortPair("lean.grid", pairs, C) ? 256 : std::max<size_t>(256, ((size_t)1 << 19) / std::max(n, 1));
+        R = std::max<size_t>(R, std::min<size_t>(n, leverRows("grid.rows", perRow, maxR, spareKept(cardBytes(), 16))));
       }
       int glo, ghi; mg::myShare(pair, n, 1, glo, ghi);          // (multi-GPU: this rank's rows or columns)
       for (size_t r0 = glo; r0 < (size_t)ghi; r0 += R) {
@@ -1885,7 +1885,7 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
   // each chunk's q/k/v/gate take it again from the pair (a column chunk gathered transposed first). In
   // place that is safe: a row chunk writes only its own rows, a column chunk only its own columns, and the
   // bias is all taken before any is written.
-  const bool streamNorm = shortPair(pairs, C);
+  const bool streamNorm = shortPair("lean.grid", pairs, C);
   T* norm = streamNorm ? nullptr : scratch<T>("grid.norm", pairs * C);
   float* raw = scratch<float>("grid.rawbias", pairs * heads);
   bool headMajor = false, normTransposed = false;
@@ -1929,8 +1929,8 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
   // opendde trunk 1288.2 -> 1228.1 ms, intellifold2 trunk 1937.3 -> 1891.9 ms; LOCALFOLD_BIG=1 keeps the 64M-element chunks)
   if (!BIG_FORCED) {
     const size_t perRow = (size_t)n * (5 * Wd * sizeof(T) + C * (sizeof(T) + 8));
-    size_t maxR = shortPair(pairs, C) ? 256 : std::max<size_t>(256, ((size_t)1 << 19) / std::max(n, 1));
-    R = std::max<size_t>(R, std::min<size_t>(n, leverRows("grid.rows", perRow, maxR, cardBytes() / 16)));
+    size_t maxR = shortPair("lean.grid", pairs, C) ? 256 : std::max<size_t>(256, ((size_t)1 << 19) / std::max(n, 1));
+    R = std::max<size_t>(R, std::min<size_t>(n, leverRows("grid.rows", perRow, maxR, spareKept(cardBytes(), 16))));
   }
   float scale = 1.f / sqrtf((float)D);
   int glo, ghi; mg::myShare(pair, n, 1, glo, ghi);            // (multi-GPU: this rank's rows or columns)

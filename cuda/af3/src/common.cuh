@@ -12,6 +12,7 @@
 #include <unistd.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <cuda.h>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -91,22 +92,122 @@ inline size_t poolIdle() {
   return last = reserved > used ? reserved - used : 0;
 }
 inline LF_TLS uint64_t MEM_GEN = 1;
+// ---------------------------------------------------------------- scratch pages
+// 🔴 A LARGE SCRATCH BUFFER ON A CARD SHORT OF ROOM IS PAGES, NOT ONE ALLOCATION. The pool keeps what it is given back
+// in the pieces it was cut into: with live blocks among them, 5.2 GB of a pool's idle pages could not hold one 0.60 GB
+// buffer (1,536 tokens with 11.3 GiB of a 40 GB A100 free); and from cudaMalloc each stage's buffers cost more than
+// the fragments did (32.1 s against 25.9). Here physical memory is held in PAGE-sized pieces, and a buffer is a range
+// of addresses with as many pieces mapped onto it as it needs: given back, its pieces are any later buffer's - nothing
+// fragments, and reuse is a few mappings. The driver's calls come through the runtime's entry points (nothing links
+// libcuda). Idle pieces count as free memory (deviceMemInfo) and are released when the card is asked for more.
+namespace pages {
+constexpr size_t PAGE = (size_t)32 << 20;
+struct Calls {
+  CUresult (*reserve)(CUdeviceptr*, size_t, size_t, CUdeviceptr, unsigned long long);
+  CUresult (*addrFree)(CUdeviceptr, size_t);
+  CUresult (*create)(CUmemGenericAllocationHandle*, size_t, const CUmemAllocationProp*, unsigned long long);
+  CUresult (*release)(CUmemGenericAllocationHandle);
+  CUresult (*map)(CUdeviceptr, size_t, size_t, CUmemGenericAllocationHandle, unsigned long long);
+  CUresult (*unmap)(CUdeviceptr, size_t);
+  CUresult (*access)(CUdeviceptr, size_t, const CUmemAccessDesc*, size_t);
+};
+inline const Calls& calls() {
+  static Calls c = [] {
+    Calls v{};
+    auto get = [](const char* name, void** fn) {
+      cudaDriverEntryPointQueryResult q;
+#if CUDART_VERSION >= 12050
+      CK(cudaGetDriverEntryPointByVersion(name, fn, 12000, cudaEnableDefault, &q));
+#else
+      CK(cudaGetDriverEntryPoint(name, fn, cudaEnableDefault, &q));
+#endif
+      if (q != cudaDriverEntryPointSuccess || !*fn) { fprintf(stderr, "the driver has no %s\n", name); exit(1); }
+    };
+    get("cuMemAddressReserve", (void**)&v.reserve); get("cuMemAddressFree", (void**)&v.addrFree);
+    get("cuMemCreate", (void**)&v.create); get("cuMemRelease", (void**)&v.release);
+    get("cuMemMap", (void**)&v.map); get("cuMemUnmap", (void**)&v.unmap); get("cuMemSetAccess", (void**)&v.access);
+    return v;
+  }();
+  return c;
+}
+struct Buf { size_t span; std::vector<CUmemGenericAllocationHandle> held; };
+inline LF_TLS std::vector<CUmemGenericAllocationHandle> IDLE;     // pieces no buffer holds
+inline LF_TLS std::map<void*, Buf> BUFS;
+inline size_t idle() { return IDLE.size() * PAGE; }
+inline void trim() {     // (the idle pieces back to the card)
+  for (auto h : IDLE) calls().release(h);
+  if (!IDLE.empty()) ++MEM_GEN;
+  IDLE.clear();
+}
+inline void giveBack(void* p) {    // (the caller has waited for the device: nothing reads it)
+  auto it = BUFS.find(p);
+  const Calls& c = calls();
+  c.unmap((CUdeviceptr)p, it->second.span); c.addrFree((CUdeviceptr)p, it->second.span);
+  for (auto h : it->second.held) IDLE.push_back(h);
+  BUFS.erase(it); ++MEM_GEN;
+}
+// `bytes` as pages, or cudaErrorMemoryAllocation with nothing kept
+inline cudaError_t take(void** p, size_t bytes) {
+  const Calls& c = calls();
+  const size_t n = (bytes + PAGE - 1) / PAGE, span = n * PAGE;
+  CUmemAllocationProp prop{};
+  prop.type = CU_MEM_ALLOCATION_TYPE_PINNED; prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+  int dev; CK(cudaGetDevice(&dev)); prop.location.id = dev;
+  Buf b{span, {}};
+  while (b.held.size() < n) {
+    if (!IDLE.empty()) { b.held.push_back(IDLE.back()); IDLE.pop_back(); continue; }
+    CUmemGenericAllocationHandle h;
+    CUresult r = c.create(&h, PAGE, &prop, 0);
+    if (r == CUDA_ERROR_OUT_OF_MEMORY) { CK(lfDeviceSynchronize()); CK(cudaMemPoolTrimTo(scratchPool(), 0)); r = c.create(&h, PAGE, &prop, 0); }
+    if (r != CUDA_SUCCESS) { for (auto k : b.held) IDLE.push_back(k); return cudaErrorMemoryAllocation; }
+    b.held.push_back(h);
+  }
+  CUdeviceptr base = 0;
+  if (c.reserve(&base, span, PAGE, 0, 0) != CUDA_SUCCESS) { for (auto k : b.held) IDLE.push_back(k); return cudaErrorMemoryAllocation; }
+  for (size_t i = 0; i < n; ++i)
+    if (c.map(base + i * PAGE, PAGE, 0, b.held[i], 0) != CUDA_SUCCESS) { fprintf(stderr, "scratch pages: map failed\n"); exit(1); }
+  CUmemAccessDesc a{}; a.location = prop.location; a.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+  if (c.access(base, span, &a, 1) != CUDA_SUCCESS) { fprintf(stderr, "scratch pages: access failed\n"); exit(1); }
+  *p = (void*)base; BUFS[*p] = std::move(b); ++MEM_GEN;
+  return cudaSuccess;
+}
+}  // namespace pages
+// a scratch buffer given back, whichever way it was made
+inline void scratchFree(void* p) {
+  if (pages::BUFS.count(p)) pages::giveBack(p); else CK(cudaFreeAsync(p, STREAM));
+}
 // 🔴 inside a capture, the answer the eager pass last got: a captured pass must choose what its eager pass chose, and
 // cudaMemGetInfo is the CARD's free memory, which another process moves between the two - a chunk sized larger in
 // the capture than in the pass that sized its scratch killed the fold ("scratch slot.0 grows inside a graph
 // capture", rosettafold3 beside three other folding processes, 2026-10-31; alone the same fold is clean)
+// The memory a fold may use (AF3's --memory=GB, memBudget): every question of free memory is asked of it - what this
+// process holds counted from the card's free memory when the budget was set - so a fold on a large card decides as it
+// would on a card of that size. 0: the card's
+inline LF_TLS size_t MEM_BUDGET = 0, MEM_FREE0 = 0;
+// ...and what is kept spare beside a whole form: a fixed amount where a port sets one (AF3), the card's fractions where
+// it does not (AF2, ESMFold2) - an eighth of the card kept 5 GB spare on a 40 GB A100 and 12 on a 96 GB card, which at
+// 256 tokens declined three whole forms of under 1 GB together with 4 GB free (1.03x that fold)
+inline LF_TLS size_t MEM_RESERVE = 0;
+inline size_t spareKept(size_t total, int fraction) { return MEM_RESERVE ? MEM_RESERVE : total / fraction; }
 inline void deviceMemInfo(size_t* f, size_t* t) {
   static LF_TLS size_t lastF = 0, lastT = 0;
   cudaStreamCaptureStatus capturing; CK(cudaStreamIsCapturing(STREAM, &capturing));
   if (capturing != cudaStreamCaptureStatusNone && lastT != 0) { *f = lastF; *t = lastT; return; }
-  CK(cudaMemGetInfo(f, t)); *f += poolIdle();
+  CK(cudaMemGetInfo(f, t));
+  const size_t idle = poolIdle() + pages::idle();
+  if (MEM_BUDGET) {     // (what this process holds, its pool's idle pages among it)
+    const size_t held = MEM_FREE0 > *f ? MEM_FREE0 - *f : 0;
+    *f = std::min(*f, MEM_BUDGET > held ? MEM_BUDGET - held : 0);
+  }
+  *f += idle;
   lastF = *f; lastT = *t;
 }
+inline void memBudget(size_t bytes) { size_t f, t; CK(cudaMemGetInfo(&f, &t)); MEM_FREE0 = f; MEM_BUDGET = bytes; }
 inline void trimPool() { ++MEM_GEN; CK(lfDeviceSynchronize()); CK(cudaMemPoolTrimTo(scratchPool(), 0)); }
 template <class P> cudaError_t devMalloc(P** p, size_t bytes) {
   ++MEM_GEN;
   cudaError_t e = lfMalloc((void**)p, bytes);
-  if (e == cudaErrorMemoryAllocation && poolIdle()) { cudaGetLastError(); trimPool(); e = lfMalloc((void**)p, bytes); }
+  if (e == cudaErrorMemoryAllocation && (poolIdle() || pages::idle())) { cudaGetLastError(); trimPool(); pages::trim(); e = lfMalloc((void**)p, bytes); }
   return e;
 }
 
@@ -1242,7 +1343,7 @@ inline LF_TLS uint64_t SCRATCH_RELEASES = 0;   // bumped by every give-back: a b
 inline void releaseScratch() {
   ++SCRATCH_RELEASES; ++MEM_GEN;
   CK(lfDeviceSynchronize());
-  for (auto& [name, slot] : SCRATCH) { if (slot.first) CK(cudaFreeAsync(slot.first, STREAM)); slot = {nullptr, 0}; }
+  for (auto& [name, slot] : SCRATCH) { if (slot.first) scratchFree(slot.first); slot = {nullptr, 0}; }
 }
 // Each phase gets the card to itself: a stage's own scratch is given back when the stage is done, at every size. (It
 // was only where the pair was over 128 MB - 512 tokens at 128 channels - so a 512-token fold held its trunk's scratch
@@ -1273,10 +1374,15 @@ inline LF_TLS int SHORT_PAIR_SHARE = 1;
 inline size_t shortPairRoomHere() {
   size_t f, t; deviceMemInfo(&f, &t);
   for (auto& [name, slot] : SCRATCH) f += slot.second;
-  return f > t / 20 ? f - t / 20 : 0;
+  const size_t keep = spareKept(t, 20);
+  return f > keep ? f - keep : 0;
 }
 // (the memory levers' record: see lever, below)
-struct LeverAsk { std::string phase; size_t most = 0; int yes = 0, no = 0; };
+struct LeverAsk {
+  std::string phase; size_t most = 0; int yes = 0, no = 0;
+  // the fold's decision (lever): taken for up to `reserved` bytes, held under these scratch names
+  bool decided = false, taken = false; size_t reserved = 0; std::vector<std::string> held;
+};
 inline LF_TLS std::map<std::string, LeverAsk> LEVERS;
 inline LF_TLS std::map<std::string, bool> LEVER_FORCED;
 inline LF_TLS const char* MEM_PHASE = "setup";
@@ -1297,6 +1403,15 @@ inline bool shortPair(size_t pairs, int C) {
   bool ordinary;
   if (!leverForced("ordinary", ordinary)) ordinary = !shortPairRule(pairs, C);
   leverNote("ordinary", (size_t)((double)pairs * C * 4 * SHORT_PAIR_TIMES), ordinary);
+  return !ordinary;
+}
+// ...and one of its groups by name (AF3: lean.release, lean.msa, lean.triangle, ... - the sites that must agree share
+// one), the ordinary path a lever of its own: --lever=lean.<group>=1 keeps that group's ordinary form, =0 its short-of-
+// room one, whatever the rest takes
+inline bool shortPair(const char* group, size_t pairs, int C) {
+  bool ordinary;
+  if (!leverForced(group, ordinary) && !leverForced("ordinary", ordinary)) ordinary = !shortPairRule(pairs, C);
+  leverNote(group, (size_t)((double)pairs * C * 4 * SHORT_PAIR_TIMES), ordinary);
   return !ordinary;
 }
 inline bool shortPairRule(size_t pairs, int C) {
@@ -1347,7 +1462,7 @@ inline void releaseScratch(std::initializer_list<const char*> names) {
     if (!slot.first) continue;
     if (!scratchNameMatches(name, names) && !slots.count(name)) continue;
     if (!synced) { CK(lfDeviceSynchronize()); synced = true; ++SCRATCH_RELEASES; ++MEM_GEN; }
-    CK(cudaFreeAsync(slot.first, STREAM)); slot = {nullptr, 0};
+    scratchFree(slot.first); slot = {nullptr, 0};
   }
 }
 // Whether `bytes` more would fit on the card now with an eighth of it to spare - for the memory levers that
@@ -1383,7 +1498,7 @@ inline bool roomFor(size_t bytes, std::initializer_list<const char*> held = {}) 
   static LF_TLS size_t f = 0, t = 0;
   static LF_TLS uint64_t gen = 0;
   if (gen != MEM_GEN) { deviceMemInfo(&f, &t); gen = MEM_GEN; }
-  return ROOM_ANSWERED[asked] = f > bytes + t / 8;
+  return ROOM_ANSWERED[asked] = f > bytes + spareKept(t, 8);
 }
 // ---------------------------------------------------------------- the fold's memory levers
 // Every memory-for-speed choice a fold makes, by name: a whole form or its chunks (lever: roomFor's answer), a block or
@@ -1391,9 +1506,36 @@ inline bool roomFor(size_t bytes, std::initializer_list<const char*> held = {}) 
 // it asked for and how it answered - `--plan` prints the table at the fold's end - and `--lever=<name>=0|1` forces one,
 // which is how a lever's worth is measured (the time it saves against the memory it holds)
 // the whole form (true) or its chunks: `bytes` more on the card, what `held` already holds counted
+// 🔴 ONE DECISION A FOLD, AGAINST WHAT THE PHASE'S OTHER WHOLE FORMS WILL HOLD. A whole form taken is the phase's
+// until it ends: the bytes it reserved count against every later ask in the phase while its buffers are given back
+// between stages (the short-of-room paths do), and a form declined stays declined - asked each time of what was free
+// at that moment, 3,072 tokens on a 40 GB A100 took the grid attention's (24 GB), the triangle's (12) and the
+// transition's (8.5) each alone, and then re-made them every block at the card's limit: 168 s, where any one of them
+// declined was 116-119 (and on a 96 GB GH200, all three whole: 76 s)
+inline size_t othersReserved(const std::string& name) {
+  size_t out = 0;
+  for (auto& [k, l] : LEVERS) {
+    if (k == name || !l.taken || l.held.empty() || l.phase != MEM_PHASE) continue;
+    size_t live = 0;
+    std::set<std::string> seen;
+    for (auto& h : l.held) {
+      auto it = SCRATCH.find(heldAs(h));
+      if (it != SCRATCH.end() && seen.insert(it->first).second) live += it->second.second;
+    }
+    out += l.reserved > live ? l.reserved - live : 0;
+  }
+  return out;
+}
 inline bool lever(const char* name, size_t bytes, std::initializer_list<const char*> held = {}) {
   bool yes;
-  if (!leverForced(name, yes)) yes = roomFor(bytes, held);
+  LeverAsk& l = LEVERS[name];
+  if (leverForced(name, yes)) {}
+  else if (l.decided && (!l.taken || bytes <= l.reserved)) yes = l.taken;
+  else yes = roomFor(bytes + othersReserved(name), held);
+  if (!l.decided || yes) {
+    l.decided = true; l.taken = yes;
+    if (yes) { l.reserved = std::max(l.reserved, bytes); for (const char* h : held) l.held.push_back(h); }
+  }
   leverNote(name, bytes, yes);
   return yes;
 }
@@ -1404,7 +1546,8 @@ inline size_t leverRows(const char* name, size_t perRow, size_t most, size_t kee
   if (leverForced(name, yes)) rows = yes ? most : 0;
   else {
     size_t f, t; deviceMemInfo(&f, &t);
-    const size_t spare = f > keep ? f - keep : 0;
+    const size_t taken = keep + othersReserved(name);
+    const size_t spare = f > taken ? f - taken : 0;
     rows = std::min(spare / std::max<size_t>(perRow, 1), most);
   }
   leverNote(name, rows * perRow, rows >= most);
@@ -1480,6 +1623,7 @@ inline bool fp8Tensor() {
 // The most each scratch buffer (a shared slot by its slot) has been asked for since the fold's trunk began - what a
 // recycle pass captured after those passes must find already there (sizeScratchForCapture)
 inline LF_TLS std::map<std::string, size_t> SCRATCH_ASKED;
+inline LF_TLS bool SCRATCH_DIRECT = false;     // (AF3: a fold on its short-of-room paths - scratchNamed)
 // (fatal false: a refusal returns null and leaves the slot empty, for a caller that can ask for less)
 template <class T> T* scratchNamed(const std::string& name, size_t n, bool fatal = true) {
   { size_t& most = SCRATCH_ASKED[name]; most = std::max(most, std::max<size_t>(n, 1) * sizeof(T)); }
@@ -1498,11 +1642,16 @@ template <class T> T* scratchNamed(const std::string& name, size_t n, bool fatal
               name.c_str(), wanted.c_str(), have, bytes);
       fflush(stderr); _exit(1);
     }
-    if (p) { CK(lfDeviceSynchronize()); CK(cudaFreeAsync(p, STREAM)); p = nullptr; }
+    if (p) { CK(lfDeviceSynchronize()); scratchFree(p); p = nullptr; }
+    // (on a card short of room a large buffer comes from the card itself, not the pool: given back it is the card's
+    // again whole, where the pool's idle pages lay among live blocks in pieces - 1,536 tokens with 11.3 GiB of an A100
+    // free ran out at 0.60 GB with 5.2 GB of the pool idle)
+    const bool direct = SCRATCH_DIRECT && bytes >= ((size_t)64 << 20);
     cudaError_t e = capturing != cudaStreamCaptureStatusNone ? lfMalloc(&p, bytes)
-                                                             : cudaMallocFromPoolAsync(&p, bytes, scratchPool(), STREAM);
+                  : direct ? pages::take(&p, bytes) : cudaMallocFromPoolAsync(&p, bytes, scratchPool(), STREAM);
     if (e != cudaSuccess && capturing == cudaStreamCaptureStatusNone) {     // (fragmented idle pages: trimmed, asked again)
-      cudaGetLastError(); trimPool(); e = cudaMallocFromPoolAsync(&p, bytes, scratchPool(), STREAM);
+      cudaGetLastError(); trimPool(); pages::trim();
+      e = direct ? pages::take(&p, bytes) : cudaMallocFromPoolAsync(&p, bytes, scratchPool(), STREAM);
     }
     // ...and from the card itself where the pool still refuses: a pool's refusal is not the card's. rosettafold3 at 3,060
     // tokens, the template stack's transition: the pool (21.8 GB reserved, 16.1 used, its idle pages among live blocks)
