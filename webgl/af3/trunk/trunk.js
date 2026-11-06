@@ -31,6 +31,7 @@ import { embed } from "./embedder.js";
 import { linear } from "../../kernels/linear.js";
 import { msaBlock } from "./msa-block.js";
 import { pairformerBlock } from "./pairformer-block.js";
+import { drain } from "../../runtime/steps.js";
 
 /** @typedef {import("../../runtime/storage.js").Tensor} Tensor */
 
@@ -156,7 +157,17 @@ export function distogramHead(execution, call) {
  * @returns {{pair: Tensor, single: Tensor, logits: Tensor, contactProbs: Tensor}}
  *   the caller owns these four and NOTHING from `embedded`, which this consumes
  */
+/** `runTrunkSteps`, run straight through: the trunk's tensors. */
 export function runTrunk(execution, call) {
+  return drain(runTrunkSteps(execution, call));
+}
+
+/**
+ * The trunk as a generator: yields `{ stage, index }` after each MSA and
+ * pairformer block, so a page can let go of its thread between blocks
+ * (webgl/runtime/steps.js); returns what `runTrunk` returns.
+ */
+export function* runTrunkSteps(execution, call) {
   const {
     embedded, templateUpdate, msaMask, pairMask, seqMask, contactBins, halfLogits,
     msaBlocks, pairformerBlocks, tokens, sequences, pairChannels,
@@ -197,6 +208,7 @@ export function runTrunk(execution, call) {
     ownMsa = true;
     ownPair = true;
     call.onBlock?.("msa", index);
+    yield { stage: "msa", index };
   }
   execution.release(msa);
 
@@ -222,6 +234,7 @@ export function runTrunk(execution, call) {
     ownPair = true;
     ownSingle = true;
     call.onBlock?.("pairformer", index);
+    yield { stage: "pairformer", index };
   }
 
   const { logits, contactProbs } = distogramHead(execution, {

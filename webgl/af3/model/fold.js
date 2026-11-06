@@ -58,8 +58,9 @@ import { atomCrossAttentionEncoder } from "../diffusion/atom-encoder.js";
 import { perAtomConditioning } from "../diffusion/atom-conditioning.js";
 import { confidenceHead, errorBinCentres, MAX_ERROR_BIN, NUM_BINS } from "../confidence/confidence.js";
 import { embed, RELATIVE_WIDTH, tokenIdentity } from "../trunk/embedder.js";
-import { binEdges, runTrunk } from "../trunk/trunk.js";
-import { sampleOnWebGl2 } from "../diffusion/sampler.js";
+import { binEdges, runTrunkSteps } from "../trunk/trunk.js";
+import { sampleOnWebGl2Steps } from "../diffusion/sampler.js";
+import { drain, drainAsync, gpuIdle } from "../../runtime/steps.js";
 import {
   slotCodes, slotGeometry, templateEmbedding, uploadTemplateWeights,
   releaseTemplateWeights,
@@ -355,6 +356,24 @@ export function buildTargetFeat(execution, { batch, weights, flags, onStage }) {
  *   ptm: number, iptm: number, trunkPasses: number, steps: number}}
  */
 export function foldAf3(execution, call) {
+  return drain(foldAf3Steps(execution, call));
+}
+
+/**
+ * `foldAf3` without holding the thread: the same fold, awaiting the GPU (a
+ * fence, not a read) after every trunk block and before every denoiser call, and
+ * stopping at the next of those when `signal` aborts. What a page calls; the
+ * tools and gates keep `foldAf3`, which runs the same steps straight through.
+ *
+ * @param {Execution} execution
+ * @param {Parameters<typeof foldAf3>[1] & {signal?: AbortSignal}} call
+ */
+export function foldAf3Async(execution, call) {
+  return drainAsync(foldAf3Steps(execution, call), () => gpuIdle(execution.gl), call.signal);
+}
+
+/** `foldAf3` as a generator (see `foldAf3Async`): yields at each trunk block and denoiser call. */
+export function* foldAf3Steps(execution, call) {
   const { batch, weights, hostWeights, msa } = call;
   const recycles = call.recycles ?? 0;
   const steps = call.steps ?? 200;
@@ -416,6 +435,7 @@ export function foldAf3(execution, call) {
   });
   const targetFeatTensor = upload(targetFeat.values, "af3.target-feat");
   call.onStage?.("target-feat", { width: targetFeat.width });
+  yield { stage: "target-feat" };
 
   const msaCodes = upload(msa.codes, "af3.msa.codes");
   const deletions = upload(msa.deletions, "af3.msa.deletions");
@@ -468,6 +488,7 @@ export function foldAf3(execution, call) {
       msaPairedQueryRow: flags.msaPairedQueryRow,
     });
     call.onStage?.("embed", { pass });
+    yield { stage: "embed", pass };
     // 🔴 THE TEMPLATE STACK RUNS WHETHER OR NOT THERE IS A TEMPLATE, because
     // "an empty slot is not a no-op": the query term and the bias are outside
     // the slot mask, so a template-free fold still gets a pair update.
@@ -480,8 +501,9 @@ export function foldAf3(execution, call) {
         divideByLength: flags.divideByLength,
       });
       call.onStage?.("template", { pass, templates });
+      yield { stage: "template", pass };
     }
-    const next = runTrunk(execution, {
+    const next = yield* runTrunkSteps(execution, {
       embedded, templateUpdate,
       msaMask, pairMask: batchTensors.pairMask, seqMask: batchTensors.seqMask,
       contactBins: batchTensors.contactBins,
@@ -555,7 +577,7 @@ export function foldAf3(execution, call) {
   });
   headInput.conditioning = conditioning;
 
-  const positions = sampleOnWebGl2(execution, headInput, {
+  const positions = yield* sampleOnWebGl2Steps(execution, headInput, {
     steps, mask: batch.refMask, normal: call.normal ?? normalFrom(seed),
     ...SAMPLER_DEFAULTS,
     ...(call.sampler ?? {}),
@@ -570,6 +592,8 @@ export function foldAf3(execution, call) {
   // pseudo-beta gather.
   let plddt = new Float32Array(atoms);
   let pae = new Float32Array(tokens * tokens);
+  // ...and the PAE's logits, which a caller needs for any per-chain or per-interface score
+  let paeLogits;
   let pde = new Float32Array(tokens * tokens);
   let scores = { ptm: NaN, iptm: NaN };
   if (weights.confidence !== undefined) {
@@ -603,7 +627,7 @@ export function foldAf3(execution, call) {
     plddt = Float32Array.from(execution.read(out.plddt));
     pae = Float32Array.from(execution.read(out.pae));
     pde = Float32Array.from(execution.read(out.pde));
-    const paeLogits = Float32Array.from(execution.read(out.paeLogits));
+    paeLogits = Float32Array.from(execution.read(out.paeLogits));
     for (const tensor of Object.values(out)) execution.release(tensor);
     execution.release(pseudoBeta);
     scores = predictedTmScores({
@@ -631,7 +655,7 @@ export function foldAf3(execution, call) {
     live += 1;
   }
   return {
-    positions, plddt, pae, pde, contactProbs, trunkSingle, trunkPair,
+    positions, plddt, pae, pde, paeLogits, contactProbs, trunkSingle, trunkPair,
     meanPlddt: live === 0 ? NaN : total / live,
     ptm: scores.ptm, iptm: scores.iptm,
     trunkPasses: recycles + 1, steps,

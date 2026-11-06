@@ -102,14 +102,25 @@ export function noiseEmbedding(scaledNoiseLevel, weight, bias) {
  */
 export const singleConcatSource = (rows, leftWidth, rightWidth, padding) => {
   const width = leftWidth + rightWidth + padding.length;
-  // The per-channel source, resolved on the host and written out as a select -
-  // one line a channel, so nothing here can disagree with `singleCondSource`.
-  const cases = Array.from({ length: width }, (_, channel) => {
+  // The per-channel source, resolved on the host from `singleCondSource` and
+  // written out as one branch per RUN of channels that read the same tensor at
+  // the same offset, so nothing here can disagree with it.
+  // 🔴 NOT ONE LINE A CHANNEL: that was an 833-way select, inlined four times
+  // by `at` below, and ANGLE's Metal compiler on an M2 never finished linking
+  // it - the first diffusion step of every fold hung the tab.
+  const runs = [];
+  for (let channel = 0; channel < width; channel += 1) {
     const source = singleCondSource(padding, channel);
-    if (source < 0) return `  if (channel == ${channel}) return 0.0;`;
-    return source < leftWidth
-      ? `  if (channel == ${channel}) return fetch1(leftTex, row * ${leftWidth} + ${source});`
-      : `  if (channel == ${channel}) return fetch1(rightTex, row * ${rightWidth} + ${source - leftWidth});`;
+    const tex = source < 0 ? null : source < leftWidth ? "left" : "right";
+    const offset = tex === null ? 0 : (tex === "left" ? source : source - leftWidth) - channel;
+    const last = runs[runs.length - 1];
+    if (last !== undefined && last.tex === tex && last.offset === offset) last.end = channel + 1;
+    else runs.push({ tex, offset, end: channel + 1 });
+  }
+  const cases = runs.map(({ tex, offset, end }) => {
+    if (tex === null) return `  if (channel < ${end}) return 0.0;`;
+    const stride = tex === "left" ? leftWidth : rightWidth;
+    return `  if (channel < ${end}) return fetch1(${tex}Tex, row * ${stride} + channel + (${offset}));`;
   }).join("\n");
   return `${PRELUDE}${ONE_TARGET}
 const int WIDTH = ${width};

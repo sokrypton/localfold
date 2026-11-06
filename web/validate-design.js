@@ -39,6 +39,7 @@ export const FOLDERS = { af3: "af3", boltz2: "boltz2", protenix2: "protenix2", o
  * @param {{chain: string, residues: number[]}[]} [options.partial] designed chains to template on their
  *   kept residues only (an antibody's framework around redesigned loops); see keptTemplates
  * @param {object} options.device
+ * @param {"webgl2"} [options.backend] fold with WebGL2 instead (no WebGPU device; `device` unused)
  * @param {number} [options.seed]
  * @param {(text: string) => void} [options.status]
  * @param {AbortSignal} [options.signal]
@@ -61,6 +62,7 @@ export async function refoldDesign(options) {
     templates,
     weights,
     device,
+    backend: options.backend,
     signal,
     seed,
     calls: AF3_COUNTS.diffusion.preferred,

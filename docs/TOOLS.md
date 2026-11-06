@@ -192,6 +192,7 @@ Each exports `async function main(device, args)` and is run as
 - **`check-webgl-sidechain.js`** - The sidechain torsion head against the WGSL one.
 - **`check-webgl-structure-initialize.js`** - The structure module's starting point, against the WGSL one.
 - **`check-webgl-structure-iteration.js`** - One structure-module iteration against the WGSL one - and the frame update is the point of it.
+- **`check-af3-webgl-page.js`** - The page's fold (web/af3-model.js `foldAf3`) with `backend: "webgl2"` against its WebGPU one: Cα RMSD, pLDDT, pTM, ipTM, per-chain pTM, PAE.
 - **`check-webgl-structure-module.js`** - AF2's whole structure module in WebGL2 against the WGSL one.
 - **`check-webgl-template.js`** - AF2-monomer's template stack in WebGL2 against the WGSL one.
 - **`check-webgl-transition.js`** - The transition in WebGL2 against the WGSL one and a CPU reference.

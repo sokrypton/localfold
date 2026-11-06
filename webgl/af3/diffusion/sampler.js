@@ -42,6 +42,7 @@ import { steerDenoised } from "../../../cpu/af3/diffusion/steering.js";
 import { inpaintDenoised } from "../../../cpu/af3/diffusion/inpaint.js";
 import { diffusionHead } from "./head.js";
 import { pairConditioning } from "./conditioning.js";
+import { drain } from "../../runtime/steps.js";
 
 /** @typedef {import("../../runtime/storage.js").Tensor} Tensor */
 /**
@@ -134,6 +135,15 @@ export function denoiserFromHead(execution, input) {
  * @returns {Float32Array} `atoms * 3`, the sample
  */
 export function sampleOnWebGl2(execution, input, options) {
+  return drain(sampleOnWebGl2Steps(execution, input, options));
+}
+
+/**
+ * The walk as a generator: yields `{ stage: "step", step }` before each denoiser
+ * call, so a page can paint and take a Stop between calls
+ * (webgl/runtime/steps.js); returns what `sampleOnWebGl2` returns.
+ */
+export function* sampleOnWebGl2Steps(execution, input, options) {
   const { normal, mask } = options;
   const { tokens, dense } = input.shape;
   const atoms = tokens * dense;
@@ -186,6 +196,7 @@ export function sampleOnWebGl2(execution, input, options) {
   let previous = levels[first];
 
   for (let step = first + 1; step <= stopAfter; step += 1) {
+    yield { stage: "step", step };
     const level = levels[step];
     positions = randomAugmentation(positions, mask, atoms, normal);
 
