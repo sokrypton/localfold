@@ -382,12 +382,21 @@ __global__ void superBiasK(real* flat, real* pl, int n, int H, int perSuper, int
 }
 
 // The whole transformer, every block's input kept and each replayed before its backward.
+// (grow-only: a size change reallocated it - and every backward allocated and freed its three buffers behind a stream
+// sync - which the device waited out each time; the caller gives it back with releaseRun)
 struct DiffRun {
   std::vector<real*> acts;         // [blocks + 1]
   real *pn = nullptr, *pl = nullptr;   // LN'd pair [nn, Cz]; every block's logits [blocks][H, n, n]
+  real *dx = nullptr, *tmp = nullptr, *dpl = nullptr;   // the backward's
   LnSave pln;
   int n = 0, S = 1;     // tokens, and samples batched
+  size_t capRows = 0, capNn = 0;
 };
+inline void releaseRun(DiffRun& r) {
+  for (real* p : r.acts) GK(cudaFree(p));
+  for (real* p : {r.pn, r.pl, r.dx, r.tmp, r.dpl}) if (p) GK(cudaFree(p));
+  r = DiffRun{};
+}
 // S samples batched: act, cond, mask and out [S n, ...] (each sample's own noise level in its cond rows), the pair
 // conditioning one for all - its logits computed once and read by every sample
 // (logitsKept: r's pair logits are already pairCond's - a sampler's steps after its first, one pair for every step)
@@ -396,16 +405,18 @@ inline void transformerForward(DiffTransformer& t, DiffRun& r, const real* act, 
   const Arena::Mark m0 = ARENA.mark();   // the caller's arena is kept: this scopes its own use
   const size_t nn = (size_t)n * n, rows = (size_t)n * S;
   const int nb = (int)t.blocks.size();
-  if (r.n != n || r.S != S || r.acts.empty()) {
+  if (r.n != n) logitsKept = false;
+  if (r.acts.empty() || rows > r.capRows || nn > r.capNn) {
     logitsKept = false;
-    for (real* p : r.acts) GK(cudaFree(p));
-    if (r.pn) { GK(cudaFree(r.pn)); GK(cudaFree(r.pl)); }
+    const size_t capRows = std::max(rows, r.capRows), capNn = std::max(nn, r.capNn);
+    releaseRun(r);
     r.acts.assign(nb + 1, nullptr);
-    for (auto& p : r.acts) GK(cudaMalloc(&p, rows * t.C * sizeof(real)));
-    GK(cudaMalloc(&r.pn, nn * t.Cz * sizeof(real)));
-    GK(cudaMalloc(&r.pl, (size_t)nb * t.H * nn * sizeof(real)));
-    r.n = n; r.S = S;
+    for (auto& p : r.acts) GK(cudaMalloc(&p, capRows * t.C * sizeof(real)));
+    GK(cudaMalloc(&r.pn, capNn * t.Cz * sizeof(real)));
+    GK(cudaMalloc(&r.pl, (size_t)nb * t.H * capNn * sizeof(real)));
+    r.capRows = capRows; r.capNn = capNn;
   }
+  r.n = n; r.S = S;
   ARENA.rewind(m0);
   if (!logitsKept) {
     real* mean = ARENA.get(nn); real* rstd = ARENA.get(nn);
@@ -430,10 +441,12 @@ inline void transformerBackward(DiffTransformer& t, DiffRun& r, const real* cond
   const Arena::Mark m0 = ARENA.mark();
   const int n = r.n, S = r.S, nb = (int)t.blocks.size();
   const size_t nn = (size_t)n * n, rows = (size_t)n * S;
-  real *dx, *dpl, *tmp;
-  GK(cudaMalloc(&dx, rows * t.C * sizeof(real)));
-  GK(cudaMalloc(&tmp, rows * t.C * sizeof(real)));
-  GK(cudaMalloc(&dpl, (size_t)nb * t.H * nn * sizeof(real)));
+  if (!r.dx) {
+    GK(cudaMalloc(&r.dx, r.capRows * t.C * sizeof(real)));
+    GK(cudaMalloc(&r.tmp, r.capRows * t.C * sizeof(real)));
+    GK(cudaMalloc(&r.dpl, (size_t)nb * t.H * r.capNn * sizeof(real)));
+  }
+  real *dx = r.dx, *dpl = r.dpl, *tmp = r.tmp;
   GK(cudaMemsetAsync(dpl, 0, (size_t)nb * t.H * nn * sizeof(real), STREAM));
   GK(cudaMemcpyAsync(dx, dout, rows * t.C * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
   for (int b = nb; b-- > 0;) {
@@ -459,8 +472,6 @@ inline void transformerBackward(DiffTransformer& t, DiffRun& r, const real* cond
   }
   ARENA.rewind(m0);
   GK(cudaMemcpyAsync(dact, dx, rows * t.C * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
-  GK(cudaStreamSynchronize(STREAM));
-  GK(cudaFree(dx)); GK(cudaFree(tmp)); GK(cudaFree(dpl));
 }
 
 

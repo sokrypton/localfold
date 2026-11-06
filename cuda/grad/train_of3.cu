@@ -1229,6 +1229,17 @@ int main(int argc, char** argv) {
     for (size_t k = 0; k < ch.blocks.size(); ++k) { ch.blocks[k].dropRate = on ? 0.25f : 0; ch.blocks[k].dropSeed = base * 1000 + 400 + k; }
   };
   long stepIndex = 0;   // (an example's index in the run, all ranks alike: the synced recycle draw's key)
+  // pinned host buffers that grow to the largest call's (the confidence logits and their gradients), and the event their
+  // losses' thread waits on
+  struct Pinned {
+    g::real* p = nullptr; size_t cap = 0;
+    g::real* get(size_t n) {
+      if (n > cap) { if (p) GK(cudaFreeHost(p)); GK(cudaMallocHost(&p, n * sizeof(g::real))); cap = n; }
+      return p;
+    }
+  };
+  std::vector<Pinned> pinned(8);
+  cudaEvent_t confCopied; GK(cudaEventCreateWithFlags(&confCopied, cudaEventDisableTiming));
   auto runExample = [&](const Example& full, bool train, bool fixed, int nSamples, std::mt19937_64& gen) {
     Losses L;
     setDropout(train && (!fixed || dropInFixed) && dropout, gen());
@@ -1308,47 +1319,78 @@ int main(int argc, char** argv) {
       GK(cudaMemcpyAsync(dLog, r.data(), r.size() * sizeof(g::real), cudaMemcpyHostToDevice, STREAM));
       GK(cudaStreamSynchronize(STREAM));
     };
-    // the confidence head on the rollout, its inputs detached
-    {
-      g::Scratch sc;
-      std::vector<double> beta(n * 3, 0);
-      for (int t = 0; t < n; ++t) if (e.pbSlot[t] >= 0) for (int p = 0; p < 3; ++p) beta[t * 3 + p] = xp[((size_t)t * e.dense + e.pbSlot[t]) * 3 + p];
+    // the confidence head on the rollout, its inputs detached (no gradient into the trunk: its backward can wait): its
+    // logits to the host and their losses on a host thread while the device runs the diffusion samples, then after
+    // them the head again, with its saves, and its backward (confidenceStep) - its forward is ~50 ms of the device at
+    // 512 tokens, the losses ~430 ms of the host the device used to wait out
+    std::vector<g::real> betaH(n * 3, 0);
+    for (int t = 0; t < n; ++t) if (e.pbSlot[t] >= 0) for (int p = 0; p < 3; ++p) betaH[t * 3 + p] = xp[((size_t)t * e.dense + e.pbSlot[t]) * 3 + p];
+    g::af3::ConfidenceBatch cb{d.ri, d.ti, d.asym, d.ent, d.sym, d.bonds, d.orders};
+    // the head's forward (saves kept in the caller's scratch); its logits into o
+    auto confidenceRun = [&](g::af3::ConfidenceLogits& o) {
       g::real* betaD = g::ARENA.get(n * 3);
-      { std::vector<g::real> rr(beta.begin(), beta.end()); GK(cudaMemcpy(betaD, rr.data(), rr.size() * sizeof(g::real), cudaMemcpyHostToDevice)); }
-      g::af3::ConfidenceBatch cb{d.ri, d.ti, d.asym, d.ent, d.sym, d.bonds, d.orders};
-      g::af3::ConfidenceLogits o{};
+      GK(cudaMemcpyAsync(betaD, betaH.data(), betaH.size() * sizeof(g::real), cudaMemcpyHostToDevice, STREAM));
       // (--bf16-confidence: the head's blocks on their bf16 kernels too - OpenFold3 runs the head in float32 in
       // training, autocast off around it)
       const bool prevBf = g::BF16; g::BF16 = bf16Confidence;
-      std::optional<g::Range> rC_; rC_.emplace("conf.fwd");
       auto cs = g::af3::confidenceForward(ch, a.pairs[nMsa + nPf], a.singles[nPf], a.tf, betaD, d.seqMask, d.pairMask, d.pairMaskT, n, o, cb);
       g::BF16 = prevBf;
-      rC_.reset(); rC_.emplace("conf.loss");
+      return cs;
+    };
+    std::future<void> confFuture;
+    {
+      // the logits to pinned host memory by the stream (in order before anything after them reuses their arena), the
+      // losses' thread waiting on that copy's event, its gradients narrowed into pinned memory beside it - the device
+      // waited ~100 ms on the pageable copies and ~70 on the conversions
+      g::Scratch sc;
+      g::af3::ConfidenceLogits o{};
+      { g::Range r_("conf.fwd"); confidenceRun(o); }
+      g::Range r_("conf.loss");
+      const size_t nPl = A * ch.PB, nPd = nn * ch.NB, nRs = ch.hasResolved ? A * 2 : 0;
+      g::real *hPl = pinned[0].get(nPl), *hPde = pinned[1].get(nPd), *hPae = pinned[2].get(nPd), *hRs = pinned[3].get(nRs);
+      GK(cudaMemcpyAsync(hPl, o.plddt, nPl * sizeof(g::real), cudaMemcpyDeviceToHost, STREAM));
+      GK(cudaMemcpyAsync(hPde, o.pde, nPd * sizeof(g::real), cudaMemcpyDeviceToHost, STREAM));
+      GK(cudaMemcpyAsync(hPae, o.pae, nPd * sizeof(g::real), cudaMemcpyDeviceToHost, STREAM));
+      if (nRs) GK(cudaMemcpyAsync(hRs, o.resolved, nRs * sizeof(g::real), cudaMemcpyDeviceToHost, STREAM));
+      GK(cudaEventRecord(confCopied, STREAM));
       const double w = confOn ? confWeight : 0;
-      auto lPl = g::host(o.plddt, A * ch.PB), lPde = g::host(o.pde, nn * ch.NB), lPae = g::host(o.pae, nn * ch.NB);
-      std::vector<double> gPl(lPl.size(), 0), gPde(lPde.size(), 0), gPae(lPae.size(), 0), gRs;
-      L.plddt = of3::plddtLoss(Lay, xp, e.xt, e.gm, lPl.data(), ch.PB, w, gPl.data());
-      L.pde = of3::pdeLoss(Lay, xp, e.xt, e.gm, lPde.data(), ch.NB, w, gPde.data());
-      L.pae = of3::paeLoss(Lay, xp, e.xt, e.gm, lPae.data(), ch.NB, w, gPae.data());
-      if (ch.hasResolved) {
-        auto lRs = g::host(o.resolved, A * 2); gRs.assign(lRs.size(), 0);
-        L.resolved = of3::resolvedLoss(Lay, e.gm, lRs.data(), w, gRs.data());
-      }
-      rC_.reset();
-      if (train && confOn) {
-        g::Range r_("conf.bwd");
-        auto put = [&](const std::vector<double>& h) {
-          g::real* p = g::ARENA.get(h.size()); std::vector<g::real> r(h.begin(), h.end());
-          GK(cudaMemcpy(p, r.data(), r.size() * sizeof(g::real), cudaMemcpyHostToDevice)); return p;
-        };
-        g::BF16 = bf16Confidence;
-        g::af3::confidenceBackward(ch, cs, a.pairs[nMsa + nPf], a.singles[nPf], a.tf, d.seqMask, d.pairMask, d.pairMaskT,
-                                   g::af3::ConfidenceLogits{put(gPde), put(gPae), put(gPl), gRs.empty() ? nullptr : put(gRs)},
-                                   nullptr, nullptr, nullptr, cb);
-        g::BF16 = prevBf;
-      }
-      memPhase("confidence");
+      confFuture = std::async(std::launch::async, [&, hPl, hPde, hPae, hRs, nPl, nPd, nRs, w] {
+        GK(cudaEventSynchronize(confCopied));
+        std::vector<double> gPl(nPl, 0), gPde(nPd, 0), gPae(nPd, 0), gRs(nRs, 0);
+        L.plddt = of3::plddtLoss(Lay, xp, e.xt, e.gm, hPl, ch.PB, w, gPl.data());
+        L.pde = of3::pdeLoss(Lay, xp, e.xt, e.gm, hPde, ch.NB, w, gPde.data());
+        L.pae = of3::paeLoss(Lay, xp, e.xt, e.gm, hPae, ch.NB, w, gPae.data());
+        if (nRs) L.resolved = of3::resolvedLoss(Lay, e.gm, hRs, w, gRs.data());
+        const std::vector<double>* src[4] = {&gPl, &gPde, &gPae, &gRs};
+        for (int i = 0; i < 4; ++i) {
+          g::real* dst = pinned[4 + i].get(src[i]->size());
+          const double* sp = src[i]->data();
+          of3::rowsInParallel(src[i]->size(), [&](size_t i0, size_t i1) { for (size_t j = i0; j < i1; ++j) dst[j] = (g::real)sp[j]; return 0.0; });
+        }
+      });
     }
+    auto confidenceStep = [&] {
+      if (!confFuture.valid()) return;
+      confFuture.get();
+      if (!(train && confOn)) return;
+      g::Scratch sc;
+      g::af3::ConfidenceLogits o{};
+      std::optional<g::Range> r_; r_.emplace("conf.fwd");
+      auto cs = confidenceRun(o);
+      r_.reset(); r_.emplace("conf.bwd");
+      auto put = [&](int i, size_t len) -> g::real* {
+        if (!len) return nullptr;
+        g::real* p = g::ARENA.get(len);
+        GK(cudaMemcpyAsync(p, pinned[4 + i].p, len * sizeof(g::real), cudaMemcpyHostToDevice, STREAM)); return p;
+      };
+      const size_t nPd = nn * ch.NB;
+      const bool prevBf = g::BF16; g::BF16 = bf16Confidence;
+      g::af3::confidenceBackward(ch, cs, a.pairs[nMsa + nPf], a.singles[nPf], a.tf, d.seqMask, d.pairMask, d.pairMaskT,
+                                 g::af3::ConfidenceLogits{put(1, nPd), put(2, nPd), put(0, A * ch.PB), put(3, ch.hasResolved ? A * 2 : 0)},
+                                 nullptr, nullptr, nullptr, cb);
+      g::BF16 = prevBf;
+      memPhase("confidence");
+    };
     const auto t2 = now();
     // the diffusion samples (model.py _train_diffusion), each its own denoiser pass
     g::real *dTs = d.zeros((size_t)n * Cs), *dTp = d.zeros(nn * Cz), *dTf = d.zeros((size_t)n * te.F);
@@ -1446,8 +1488,10 @@ int main(int argc, char** argv) {
       g::ARENA.high = std::max(high0, g::ARENA.high);
     }
     if (autoSB) g::ARENA.trim(mapped0);
+    g::af3::releaseRun(dn.run);   // (the transformer's buffers, its widest batch's: given back before the trunk's backward)
     widestBatch = widest;
     distogramReady();
+    confidenceStep();
     L.total = L.diffusion + distWeight * L.distogram + (confOn ? confWeight * (L.plddt + L.pde + L.pae + L.resolved) : 0);
     sl.release();
     const auto t3 = now();
