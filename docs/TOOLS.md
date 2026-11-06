@@ -192,6 +192,8 @@ Each exports `async function main(device, args)` and is run as
 - **`check-webgl-sidechain.js`** - The sidechain torsion head against the WGSL one.
 - **`check-webgl-structure-initialize.js`** - The structure module's starting point, against the WGSL one.
 - **`check-webgl-structure-iteration.js`** - One structure-module iteration against the WGSL one - and the frame update is the point of it.
+- **`probe-webgl-uber.js`** - Do several small kernels as one program (chosen by a uniform) link faster than as separate programs? Safari 16.3: 8 separate 158-185 ms, one combined 26-33 ms.
+- **`probe-webgl-upload-compile.js`** - Can the WebGL2 AF3 fold's compile hide behind its weight upload? Safari 16.3: no (0.11 s of 1.37 hidden; both are the page thread's).
 - **`probe-webgl-compile.js`** - What the WebGL2 AF3 fold's shader compile costs, program by program (slowest first, by family, grouped by the slice that first needs them), and how many programs would remain with every width a uniform. Runs in Chrome and, through a page calling `main`, in Safari.
 - **`probe-webgl-af3-programs.js`** - Which of the WebGL2 AF3 fold's programs depend on the sequence length (each one a page compiles again per new length): a dry run at several lengths, the differing kernels by name.
 - **`check-af3-webgl-page.js`** - The page's fold (web/af3-model.js `foldAf3`) with `backend: "webgl2"` against its WebGPU one: Cα RMSD, pLDDT, pTM, ipTM, per-chain pTM, PAE.

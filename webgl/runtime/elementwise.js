@@ -28,7 +28,7 @@ void main() {
  * one-input operations bind their input twice). The per-operation sources below stay for callers
  * that draw them directly.
  */
-const OPS = { add: 0, multiply: 1, scale: 2, relu: 3 };
+const OPS = { add: 0, multiply: 1, scale: 2, relu: 3, copy: 4 };
 export const elementwiseSource = (elements) => sized({ ELEMENTS: elements }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D aTex;
 uniform sampler2D bTex;
@@ -39,8 +39,23 @@ ${guard}
   if (OP == ${OPS.add}) result = a + fetch4(bTex, texel);
   else if (OP == ${OPS.multiply}) result = a * fetch4(bTex, texel);
   else if (OP == ${OPS.scale}) result = a * scale;
-  else result = max(a, vec4(0.0));
+  else if (OP == ${OPS.relu}) result = max(a, vec4(0.0));
+  else result = a;
 }`);
+
+/**
+ * The shared program as one operation, for a kernel module whose own `a + b`, `a * b` or copy was
+ * otherwise its own program: OP travels with the sizes, so every draw sets it (a uniform keeps its
+ * value between draws of a program, and other draws of this one set other operations). Bind both
+ * `aTex` and `bTex` (the input twice for a copy).
+ *
+ * @param {"add" | "multiply" | "copy"} op
+ * @param {number} elements
+ */
+export const elementwiseOpSource = (op, elements) => {
+  const { code, sizes } = elementwiseSource(elements);
+  return { code, sizes: { ...sizes, OP: OPS[op] } };
+};
 
 /** `a + b`, elementwise. */
 export const addSource = (elements) => sized({ ELEMENTS: elements }, `${PRELUDE}${ONE_TARGET}

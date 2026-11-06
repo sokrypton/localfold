@@ -42,6 +42,7 @@
  *
  * Every one of those four has no default on either side.
  */
+import { elementwiseOpSource } from "../../runtime/elementwise.js";
 import { ONE_TARGET, PRELUDE, sized } from "../../runtime/execution.js";
 import { layerNorm } from "../../kernels/layer-norm.js";
 import { linear } from "../../kernels/linear.js";
@@ -139,15 +140,7 @@ export function adaptiveZeroInit(execution, call) {
 }
 
 /** `out[i] = a[i] * b[i]`, declared here so the gate's name says what it gates. */
-export const elementwiseProductSource = (elements) => sized({ ELEMENTS: elements }, `${PRELUDE}${ONE_TARGET}
-uniform sampler2D aTex;
-uniform sampler2D bTex;
-
-void main() {
-  int texel = linearTexel();
-  if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
-  result = fetch4(aTex, texel) * fetch4(bTex, texel);
-}`);
+export const elementwiseProductSource = (elements) => elementwiseOpSource("multiply", elements);
 
 /**
  * One of AF3's atom-layout gathers.
@@ -482,15 +475,7 @@ export function crossAttentionBlock(execution, call) {
 
 /** `out[i] = a[i] + b[i]` - here rather than `runtime/elementwise.js` only
  * because this file's other fused writes read the same way. */
-export const sumSource = (elements) => sized({ ELEMENTS: elements }, `${PRELUDE}${ONE_TARGET}
-uniform sampler2D aTex;
-uniform sampler2D bTex;
-
-void main() {
-  int texel = linearTexel();
-  if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
-  result = fetch4(aTex, texel) + fetch4(bTex, texel);
-}`);
+export const sumSource = (elements) => elementwiseOpSource("add", elements);
 
 /**
  * The per-block attention biases, for every block of an atom stack at once.

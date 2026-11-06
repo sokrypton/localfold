@@ -65,7 +65,7 @@
  */
 import { ONE_TARGET, PRELUDE, sized } from "../../runtime/execution.js";
 import { drain } from "../../runtime/steps.js";
-import { multiply, scale } from "../../runtime/elementwise.js";
+import { elementwiseOpSource, multiply, scale } from "../../runtime/elementwise.js";
 import { layerNorm } from "../../kernels/layer-norm.js";
 import { linear } from "../../kernels/linear.js";
 import { pairformerBlock } from "../trunk/pairformer-block.js";
@@ -370,14 +370,7 @@ ${hasAbsent ? `  value += fetch4(absentTex, group) + fetch4(absentTex, C4 + grou
 }`);
 
 /** `out = x`, for the branch that takes the trunk's single unchanged. */
-export const copyRowsSource = (elements) => sized({ ELEMENTS: elements }, `${PRELUDE}${ONE_TARGET}
-uniform sampler2D xTex;
-
-void main() {
-  int texel = linearTexel();
-  if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
-  result = fetch4(xTex, texel);
-}`);
+export const copyRowsSource = (elements) => elementwiseOpSource("copy", elements);
 
 /** `out = clamp(x, -512, 512)`, which protenix2 applies before its LayerNorm. */
 export const clampSource = (elements, limit) => sized({ ELEMENTS: elements }, `${PRELUDE}${ONE_TARGET}
@@ -665,7 +658,7 @@ export function* confidenceHeadSteps(execution, call) {
     execution.dispatch({
       source: copyRowsSource(tokens * singleChannels),
       output: single,
-      inputs: { xTex: singleSource },
+      inputs: { aTex: singleSource, bTex: singleSource },
       label: `af3.conf.single-copy:${tokens}x${singleChannels}`,
     });
   } else {
