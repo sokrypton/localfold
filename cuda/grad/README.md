@@ -235,6 +235,43 @@ from there 6MRR's mse goes 33.3 -> 12.8 in 40 steps. The Fourier noise embedding
 
   (The port's peak falls past 3072: its big-input path takes over, the pair parked and its stages a block at a time.)
 
+  Across cards (2026-11-06, after aaa722a1 gave every phase's scratch back at every size), localfold-af3 at the same
+  settings - each card's driver-sampled peak, which on a large card includes what the port takes because it is free;
+  the A100 column is what 40 GB is enough for:
+
+  | tokens | GH200 96 GB | RTX PRO 6000 Blackwell 96 GB (Colab G4) | A100 40 GB |
+  |---|---|---|---|
+  | 256 | 0.61 s, 4.4 GiB | 0.90 s, 4.4 GiB | 1.41 s, 4.7 GiB |
+  | 384 | 1.02 s, 5.2 GiB | 1.33 s, 5.1 GiB | 2.21 s, 5.4 GiB |
+  | 512 | 1.63 s, 5.8 GiB | 1.98 s, 5.8 GiB | 3.17 s, 6.0 GiB |
+  | 768 | 3.24 s, 7.2 GiB | 3.58 s, 7.3 GiB | 6.03 s, 7.7 GiB |
+  | 1024 | 5.68 s, 8.7 GiB | | 10.2 s, 9.2 GiB |
+  | 1536 | 13.7 s, 15.9 GiB | | 23.0 s |
+  | 2048 | 27.3 s, 24.5 GiB | | 43.4 s, 17.7 GiB |
+  | 3072 | 75.6 s, 48.2 GiB | 58.4 s, 48.3 GiB | 167 s, 27.9 GiB |
+  | 4096 | 161 s, 47.0 GiB | 116 s, 46.9 GiB | 245 s, 33.8 GiB |
+  | 5120 | 295 s, 41.0 GiB | 206 s, 56.3 GiB | 462 s, 38.1 GiB |
+  | 6144 | 486 s, 58.3 GiB | 330 s, 60.0 GiB | 764 s, 39.3 GiB |
+  | 7168 | 750 s, 76.7 GiB | | out of memory (13.2 GB short in the trunk; foldFits had admitted it) |
+  | 8192 | 1108 s, 90.1 GiB | | |
+
+  The Blackwell card is 10-45% behind the GH200 at short lengths (its diffusion) and 25-30% ahead from 3072 (its trunk);
+  an H100 80 GB ran within 1% of the GH200 to 2048. train-of3's step on each (`--tf32 --bf16 --offload-pairs
+  --bf16-confidence --sample-batch=4`, 48 samples, the int8 blob on the Blackwell card, the float32 bundle on the others):
+
+  | tokens | GH200 | RTX PRO 6000 Blackwell | A100 40 GB |
+  |---|---|---|---|
+  | 256 | 2.0 s | 2.5 s | 3.9 s |
+  | 384 | 3.1 s | 4.1 s | 6.1 s |
+  | 512 | 4.6 s | 6.5 s | 9.2 s |
+  | 640 | 6.9 s | 9.3 s | 13.4 s |
+  | 768 | 9.7 s | 12.9 s | 18.6 s |
+  | 896 | 12.9 s | 17.4 s | 24.9 s, 38.3 GiB |
+  | 1024 | 16.7 s | 22.5 s | out of memory |
+  | 1280 | 27.1 s | 35.9 s | |
+  | 1536 | 43.4 s, 91.8 GiB | 52.9 s, 92.2 GiB | |
+  | 1792 | out of memory | out of memory | |
+
   What is left at 640 tokens on the A100 (28.9 GB): 9.8 GB the parameters, Adam and the EMA; 2.3 GB the step's
   activations; 0.9 GB the stream pool; the arena's 14.3 GB - the MSA block's backward, the confidence head, a
   diffusion chunk, and 3.6 GB the embedder keeps for the whole step.
