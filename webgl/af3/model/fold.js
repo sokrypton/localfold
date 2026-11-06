@@ -53,6 +53,7 @@ import { predictedTmScores } from "../../../cpu/af3/confidence/ptm.js";
 // structure". A second Box-Muller here would make every fold a different sample
 // from the same distribution and leave nothing to compare.
 import { normalFrom } from "../../../shared/af3/random.js";
+import { af3BatchFromA3m } from "../../../shared/af3/featurise/batch.js";
 import { Execution } from "../../runtime/execution.js";
 import { atomCrossAttentionEncoder } from "../diffusion/atom-encoder.js";
 import { perAtomConditioning } from "../diffusion/atom-conditioning.js";
@@ -423,8 +424,37 @@ export async function foldAf3Async(execution, call) {
  */
 async function prepareFoldPrograms(execution, call) {
   const sources = await foldPrograms(execution, call);
+  // 🔴 AND WHICH OF THEIR CONSTANTS ARE THE LENGTH, LEARNED ON THE FIRST FOLD, so that fold already
+  // compiles length-generic programs and every later length compiles none (./length-generic.js):
+  // the same dry run on a stand-in chain 67 tokens longer - odd and past every padding multiple
+  // the kernels round to, so each padded size moves too - compared with this one.
+  // ...and every later fold against the one before it, which reaches the kernels a size threshold
+  // switches to (the unblocked triangle contraction past ~128 tokens) that the stand-in did not.
+  let byWeights = lastFoldPrograms.get(execution);
+  if (byWeights === undefined) lastFoldPrograms.set(execution, byWeights = new WeakMap());
+  const previous = byWeights.get(call.weights);
+  if (previous === undefined) {
+    const { batch } = af3BatchFromA3m("A".repeat(call.batch.tokens + LONGER), null, {});
+    const longer = await foldPrograms(execution, {
+      ...call, batch, templateSlots: undefined,
+      msa: { codes: Float32Array.from(batch.msa), deletions: Float32Array.from(batch.deletionMatrix),
+        mask: Float32Array.from(batch.msaMask), sequences: 1 },
+    });
+    execution.learnLengths(sources.keys(), longer.keys());
+  } else {
+    execution.learnLengths(previous, sources.keys());
+  }
+  byWeights.set(call.weights, [...sources.keys()]);
   await execution.prepare(sources.keys());
 }
+
+/** Per execution and uploaded weights, the sources of the last fold (see prepareFoldPrograms). */
+const lastFoldPrograms = new WeakMap();
+
+/** How much longer the stand-in chain is (see prepareFoldPrograms). */
+const LONGER = 67;
+
+
 
 /**
  * The programs a fold of this batch draws with, as source -> kernel label: a dry run with no

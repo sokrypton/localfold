@@ -644,13 +644,14 @@ void main() {
  */
 export const vec3GatherSource = (count, sourceStride) => `${PRELUDE}${ONE_TARGET}
 const int STRIDE = ${sourceStride};
+const int COUNT = ${count};
 uniform sampler2D sourceTex;
 uniform sampler2D indicesTex;
 uniform sampler2D maskTex;
 
 void main() {
   int texel = linearTexel();
-  if (texel >= ${count}) { result = vec4(0.0); return; }
+  if (texel >= COUNT) { result = vec4(0.0); return; }
   if (fetch1(maskTex, texel) == 0.0) { result = vec4(0.0); return; }
   int from = int(fetch1(indicesTex, texel)) * STRIDE;
   result = vec4(fetch1(sourceTex, from), fetch1(sourceTex, from + 1),

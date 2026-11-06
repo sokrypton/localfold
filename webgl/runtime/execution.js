@@ -27,6 +27,7 @@
  * distinguishes two instances, and it is what the cache indexes.
  */
 import { FULLSCREEN_TRIANGLE, TEXTURE_WIDTH, finishProgram, linkProgram, startProgram } from "./context.js";
+import { genericSource, learnLengthNames, lengthSkeleton } from "./length-generic.js";
 import { Storage } from "./storage.js";
 
 /**
@@ -283,6 +284,12 @@ export class Execution {
     this.programs = new Map();
     /** While a Map, `dispatch` only records each kernel's source in it, with its label (see `prepare`). */
     this.collect = null;
+    /**
+     * Length-generic programs (./length-generic.js): per kernel skeleton, the constants that
+     * move between lengths (`learnLengths`), and the skeletons whose generic program did not link.
+     */
+    this.lengthNames = new Map();
+    this.genericRefused = new Set();
     this.dispatches = 0;
     this.draws = 0;
     this.compiles = 0;
@@ -396,6 +403,42 @@ export class Execution {
     return this.#adopt(source, linkProgram(this.gl, source));
   }
 
+  /** Which constants follow the length: the same fold's sources at two lengths (./length-generic.js). */
+  learnLengths(atOne, atOther) {
+    learnLengthNames(atOne, atOther, this.lengthNames);
+    this.#resolved.clear();
+  }
+
+  #resolved = new Map();
+
+  /**
+   * The program a kernel's source is drawn with: its group's generic program and the values this
+   * member sets, or the source itself.
+   *
+   * @returns {{key: string, values: [string, number][] | null, skeleton: string | null}}
+   */
+  #resolve(source) {
+    let resolved = this.#resolved.get(source);
+    if (resolved !== undefined) return resolved;
+    resolved = { key: source, values: null, skeleton: null };
+    if (this.lengthNames.size > 0) {
+      const { skeleton } = lengthSkeleton(source);
+      const names = this.lengthNames.get(skeleton);
+      if (names !== undefined && !this.genericRefused.has(skeleton)) {
+        const generic = genericSource(source, names);
+        if (generic !== null) resolved = { key: generic.source, values: generic.values, skeleton };
+      }
+    }
+    this.#resolved.set(source, resolved);
+    return resolved;
+  }
+
+  /** A generic program that did not link: its group is drawn specialised from now on. */
+  #refuse(skeleton) {
+    this.genericRefused.add(skeleton);
+    this.#resolved.clear();
+  }
+
   /**
    * Compile these kernels' programs ahead of the draws that need them, without holding the
    * thread for long: links are started in batches of ~16 ms of the thread, a task each, and
@@ -416,9 +459,12 @@ export class Execution {
     const parallel = gl.getExtension("KHR_parallel_shader_compile");
     const nextTask = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
     const pending = [];
+    const wanted = [...new Set(sources)];
+    const skeletonOf = new Map();
     let batchFrom = performance.now();
-    for (const source of new Set(sources)) {
-      if (this.programs.has(source)) continue;
+    for (const { key: source, skeleton } of wanted.map((one) => this.#resolve(one))) {
+      if (this.programs.has(source) || skeletonOf.has(source)) continue;
+      skeletonOf.set(source, skeleton);
       pending.push([source, startProgram(gl, source)]);
       if (performance.now() - batchFrom > 16) {
         await nextTask(0);
@@ -432,10 +478,22 @@ export class Execution {
       }
     }
     // Without the extension the status is asked for one program a task (each waits for its link).
+    let refused = false;
     for (const [source, started] of pending) {
-      if (!this.programs.has(source)) this.#adopt(source, finishProgram(gl, started));
+      if (!this.programs.has(source)) {
+        try {
+          this.#adopt(source, finishProgram(gl, started));
+        } catch (error) {
+          const skeleton = skeletonOf.get(source);
+          if (skeleton === null) throw error;
+          this.#refuse(skeleton);
+          refused = true;
+        }
+      }
       if (parallel === null) await nextTask(0);
     }
+    // ...and the members of a refused group, specialised.
+    if (refused) await this.prepare(wanted);
   }
 
   /** A linked program into the cache, with its one attribute bound. */
@@ -652,7 +710,16 @@ export class Execution {
       return output;
     }
     const enteredAt = this.host === null ? 0 : performance.now();
-    const entry = this.program(source);
+    let resolved = this.#resolve(source);
+    let entry;
+    try {
+      entry = this.program(resolved.key);
+    } catch (error) {
+      if (resolved.skeleton === null) throw error;
+      this.#refuse(resolved.skeleton);
+      resolved = this.#resolve(source);
+      entry = this.program(resolved.key);
+    }
     const compiledAt = this.host === null ? 0 : performance.now();
     // 🔴 AND CACHING ANY OF THIS IS NOT THE LEVER, MEASURED. `useProgram` and
     // the VAO cached was **1.004x** (22355 ms against 22434), and caching the
@@ -707,6 +774,14 @@ export class Execution {
     for (const [name, value] of Object.entries(optionalInts)) {
       const location = this.#uniform(entry, name);
       if (location !== null) gl.uniform1i(location, value);
+    }
+
+    // A length-generic program's moving constants, as this member has them.
+    if (resolved.values !== null) {
+      for (const [name, value] of resolved.values) {
+        const location = this.#uniform(entry, name);
+        if (location !== null) gl.uniform1i(location, value);
+      }
     }
 
     if (this.halfDither !== 0) {
