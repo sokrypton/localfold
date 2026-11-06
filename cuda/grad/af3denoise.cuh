@@ -15,6 +15,7 @@
 // are af3diff.cuh's. rf3's chirality term enters as a constant input feature (its finite-difference gradient of the
 // positions is not differentiated; the term's weight is).
 #pragma once
+#include <optional>
 #include "af3diff.cuh"
 
 namespace grad {
@@ -465,8 +466,10 @@ struct DenoiseSave {
   int n;
 };
 
-inline EncSave encForward(DiffEncoder& e, const AtomBatch& b, const real* trunkSingle, const real* condPair,
-                          const real* positions, const real* snProj, real* tokenAct) {
+// The encoder in two parts: what every sample of a diffusion batch shares - the reference embedding, the trunk's single
+// and pair terms, the atom pair and its MLP, the masks; nothing of it reads the noisy positions - once a batch
+// (encShared), and each sample's own queries, atom stack and aggregation (encSample). encForward is the two in turn.
+inline EncSave encShared(DiffEncoder& e, const AtomBatch& b, const real* trunkSingle, const real* condPair) {
   const int C = e.C, Cp = e.Cp, n = b.tokens;
   const size_t atoms = (size_t)b.tokens * b.dense, Rq = (size_t)b.subsets * b.Q, Rk = (size_t)b.subsets * b.K, rows = Rq * b.K;
   EncSave s{}; s.n = n;
@@ -532,8 +535,17 @@ inline EncSave encForward(DiffEncoder& e, const AtomBatch& b, const real* trunkS
     reluK<<<blocks(rows * Cp), 256, 0, STREAM>>>(r, s.h2, rows * Cp); e.mlp3.forward(r, s.pair, rows, 1);
   }
   }
+  s.mb = ARENA.get(rows);
+  atomMaskBiasK<<<blocks(rows), 256, 0, STREAM>>>(s.qMask, s.kMask, s.mb, b.subsets, b.Q, b.K, e.stack.blocks[0].keyMasked);
+  if (e.chai) chaiRefMaskK<<<blocks(rows), 256, 0, STREAM>>>(s.mb, s.qUid, b.tq.mask, s.kUid, b.tk.mask, b.subsets, b.Q, b.K);
+  s.ctx = AtomCtx{b.q2k, s.qMask, s.kMask, s.qCond, s.kCond, s.mb, b.subsets, b.Q, b.K};
+  return s;
+}
+inline EncSave encSample(DiffEncoder& e, const AtomBatch& b, EncSave s, const real* positions, const real* snProj, real* tokenAct) {
+  const int C = e.C, n = b.tokens;
+  const size_t Rq = (size_t)b.subsets * b.Q;
   // the queries: the start (cond, or its masked pre-trunk copy - chai's always), plus the positions' projection, masked
-  const bool preStart = e.preTrunkQuery && (trunkSingle || e.chai);
+  const bool preStart = e.preTrunkQuery && (s.tsn || e.chai);   // (s.tsn: a trunk single was given)
   s.act0 = cloneR(preStart ? s.qCond0 : s.qCond, Rq * C);
   if (preStart) rowMaskK<<<blocks(Rq * C), 256, 0, STREAM>>>(s.act0, s.qMask, Rq, C);
   if (positions) {
@@ -543,10 +555,6 @@ inline EncSave encForward(DiffEncoder& e, const AtomBatch& b, const real* trunkS
     rowMaskK<<<blocks(Rq * C), 256, 0, STREAM>>>(pp, s.qMask, Rq, C);
     add(s.act0, pp, Rq * C);
   }
-  s.mb = ARENA.get(rows);
-  atomMaskBiasK<<<blocks(rows), 256, 0, STREAM>>>(s.qMask, s.kMask, s.mb, b.subsets, b.Q, b.K, e.stack.blocks[0].keyMasked);
-  if (e.chai) chaiRefMaskK<<<blocks(rows), 256, 0, STREAM>>>(s.mb, s.qUid, b.tq.mask, s.kUid, b.tk.mask, b.subsets, b.Q, b.K);
-  s.ctx = AtomCtx{b.q2k, s.qMask, s.kMask, s.qCond, s.kCond, s.mb, b.subsets, b.Q, b.K};
   s.skip = ARENA.get(Rq * C);
   stackForward(e.stack, s.ctx, s.pair, s.act0, s.skip, s.run);
   rowMaskK<<<blocks(Rq * C), 256, 0, STREAM>>>(s.skip, s.qMask, Rq, C);
@@ -555,23 +563,35 @@ inline EncSave encForward(DiffEncoder& e, const AtomBatch& b, const real* trunkS
                                                                   b.dense, e.perToken);
   return s;
 }
-// dtokenAct, dskip (from the decoder), dpair (from the decoder's pair logits), dqCondDec (the decoder's conditioning)
-//   -> dtrunkSingle, dcondPair, dpositions (added; may be null)
-inline void encBackward(DiffEncoder& e, const AtomBatch& b, const EncSave& s, const real* trunkSingle, const real* positions,
-                        const real* dtokenAct, real* dskipIn, real* dpairIn, real* dqCondIn, real* dtrunkSingle,
-                        real* dcondPair, real* dpositions) {
+inline EncSave encForward(DiffEncoder& e, const AtomBatch& b, const real* trunkSingle, const real* condPair,
+                          const real* positions, const real* snProj, real* tokenAct) {
+  return encSample(e, b, encShared(e, b, trunkSingle, condPair), positions, snProj, tokenAct);
+}
+// The backward in the forward's two parts. The shared tensors' gradients (EncGrads: the conditioning queries and keys,
+// the start's, the atom pair) are summed over a batch's samples by encSampleBackward and backed once by
+// encSharedBackward - the shared part is linear in them, so once is the sum of each sample's.
+struct EncGrads { real *dqCond, *dqCond0, *dkCond, *dpair; };
+inline EncGrads encGrads(const DiffEncoder& e, const AtomBatch& b) {
+  const size_t Rq = (size_t)b.subsets * b.Q, Rk = (size_t)b.subsets * b.K, rows = Rq * b.K;
+  return EncGrads{ARENA.zeros(Rq * e.C), ARENA.zeros(Rq * e.C), ARENA.zeros(Rk * e.C), ARENA.zeros(rows * e.Cp)};
+}
+// one sample: dtokenAct, dskip (from the decoder), dpair (from the decoder's pair logits), dqCondDec (the decoder's
+// conditioning) -> dpositions (added; may be null), and the shared tensors' gradients into g (added)
+inline void encSampleBackward(DiffEncoder& e, const AtomBatch& b, const EncSave& s, const real* trunkSingle, const real* positions,
+                              const real* dtokenAct, real* dskipIn, real* dpairIn, real* dqCondIn, real* dpositions, EncGrads& g) {
   Scratch scratch;
   const int C = e.C, Cp = e.Cp, n = s.n;
-  const size_t atoms = (size_t)b.tokens * b.dense, Rq = (size_t)b.subsets * b.Q, Rk = (size_t)b.subsets * b.K, rows = Rq * b.K;
+  const size_t Rq = (size_t)b.subsets * b.Q, rows = Rq * b.K;
   real* dproj = ARENA.zeros(Rq * e.perToken);
   aggregateBwdK<<<blocks((size_t)n * e.perToken), 256, 0, STREAM>>>(s.proj, b.q2t.idx, b.q2t.mask, b.refMask, dtokenAct, dproj,
                                                                      n, b.dense, e.perToken);
   real* dskip = cloneR(dskipIn, Rq * C);
   e.aggr.backward(s.skip, dproj, dskip, Rq, true);
   rowMaskK<<<blocks(Rq * C), 256, 0, STREAM>>>(dskip, s.qMask, Rq, C);
-  real *dact0 = ARENA.get(Rq * C), *dqCond = cloneR(dqCondIn, Rq * C), *dkCond = ARENA.zeros(Rk * C);
-  real* dpair = cloneR(dpairIn, rows * Cp);
-  stackBackward(e.stack, s.ctx, s.pair, s.run, dskip, dact0, dqCond, dkCond, dpair);
+  real* dact0 = ARENA.get(Rq * C);
+  if (dqCondIn) add(g.dqCond, dqCondIn, Rq * C);
+  if (dpairIn) add(g.dpair, dpairIn, rows * Cp);
+  stackBackward(e.stack, s.ctx, s.pair, s.run, dskip, dact0, g.dqCond, g.dkCond, g.dpair);
   if (positions) {
     real* dpp = cloneR(dact0, Rq * C);
     rowMaskK<<<blocks(Rq * C), 256, 0, STREAM>>>(dpp, s.qMask, Rq, C);
@@ -580,10 +600,17 @@ inline void encBackward(DiffEncoder& e, const AtomBatch& b, const EncSave& s, co
     if (e.hasChiral && b.chiral) { real* cg = ARENA.get(Rq * 3); gather(b.t2q, b.chiral, cg, 3); e.chiralProj.backward(cg, dpp, nullptr, Rq); }
     if (dpositions) scatter(b.t2q, dpos, dpositions, 3);
   }
-  real* dqCond0 = ARENA.zeros(Rq * C);
   if (e.preTrunkQuery && (trunkSingle || e.chai)) {
-    real* t = cloneR(dact0, Rq * C); rowMaskK<<<blocks(Rq * C), 256, 0, STREAM>>>(t, s.qMask, Rq, C); add(dqCond0, t, Rq * C);
-  } else add(dqCond, dact0, Rq * C);
+    real* t = cloneR(dact0, Rq * C); rowMaskK<<<blocks(Rq * C), 256, 0, STREAM>>>(t, s.qMask, Rq, C); add(g.dqCond0, t, Rq * C);
+  } else add(g.dqCond, dact0, Rq * C);
+}
+// ...and the shared part's, once: g -> dtrunkSingle, dcondPair (added; may be null) and the encoder's parameters
+inline void encSharedBackward(DiffEncoder& e, const AtomBatch& b, const EncSave& s, const real* trunkSingle, EncGrads& g,
+                              real* dtrunkSingle, real* dcondPair) {
+  Scratch scratch;
+  const int C = e.C, Cp = e.Cp, n = s.n;
+  const size_t atoms = (size_t)b.tokens * b.dense, Rq = (size_t)b.subsets * b.Q, Rk = (size_t)b.subsets * b.K, rows = Rq * b.K;
+  real *dqCond = g.dqCond, *dqCond0 = g.dqCond0, *dkCond = g.dkCond, *dpair = g.dpair;
   // the pair: MLP residual, then its features
   if (e.chai) {
     real *r = ARENA.get(rows * Cp), *dr = ARENA.get(rows * Cp), *dh = ARENA.get(rows * Cp);
@@ -641,6 +668,16 @@ inline void encBackward(DiffEncoder& e, const AtomBatch& b, const EncSave& s, co
   perAtomBwdK<<<blocks(atoms * C), 256, 0, STREAM>>>(b.refPos, b.refMask, b.refElement, b.refCharge, b.nameChars, dcond, e.wPos.g,
       e.wMask.g, e.wElem.g, e.wCharge.g, e.wName.g, e.hasBias ? e.bias.g : nullptr, (int)atoms, C, e.rawCharge);
 }
+// dtokenAct, dskip (from the decoder), dpair (from the decoder's pair logits), dqCondDec (the decoder's conditioning)
+//   -> dtrunkSingle, dcondPair, dpositions (added; may be null)
+inline void encBackward(DiffEncoder& e, const AtomBatch& b, const EncSave& s, const real* trunkSingle, const real* positions,
+                        const real* dtokenAct, real* dskipIn, real* dpairIn, real* dqCondIn, real* dtrunkSingle,
+                        real* dcondPair, real* dpositions) {
+  Scratch scratch;
+  EncGrads g = encGrads(e, b);
+  encSampleBackward(e, b, s, trunkSingle, positions, dtokenAct, dskipIn, dpairIn, dqCondIn, dpositions, g);
+  encSharedBackward(e, b, s, trunkSingle, g, dtrunkSingle, dcondPair);
+}
 
 // the whole denoiser: trunk single [n, Cst], trunk pair [nn, Czt], target_feat [n, F], noisy positions [atoms, 3] -> out
 // The denoiser in two per-sample halves around the transformer (denoisePre: the scaled positions, the single's
@@ -652,7 +689,9 @@ inline void denoiseScales(DenoiseSave& s, real sigma) {
   const real d = sigma * sigma + 256;
   s.sk = 256 / d; s.ou = sigma * 16 / sqrt(d); s.in = 1 / sqrt(d);
 }
-inline void denoisePre(Denoiser& m, const AtomBatch& b, DenoiseSave& s, const real* trunkSingle, const real* x, real* tok) {
+// (shared: the encoder's batch-shared part, made once by the caller - encForward's whole otherwise)
+inline void denoisePre(Denoiser& m, const AtomBatch& b, DenoiseSave& s, const real* trunkSingle, const real* x, real* tok,
+                       const EncSave* shared = nullptr) {
   const int n = b.tokens; const size_t atoms = (size_t)n * b.dense;
   s.scaled = ARENA.get(atoms * 3);
   scaleMaskK<<<blocks(atoms * 3), 256, 0, STREAM>>>(x, b.atomMask, s.scaled, atoms, s.in);
@@ -661,7 +700,7 @@ inline void denoisePre(Denoiser& m, const AtomBatch& b, DenoiseSave& s, const re
   if (m.hasSnLn) { s.sn = ARENA.get((size_t)n * Cs); s.lsn = lnForward(m.snLn, s.cs.sFinal, s.sn, n); }
   s.snP = ARENA.get((size_t)n * P); m.snProj.forward(s.sn, s.snP, n);
   s.tok = tok;
-  s.es = encForward(m.enc, b, trunkSingle, s.cs.pairOut, s.scaled, s.snP, s.tok);
+  s.es = shared ? encSample(m.enc, b, *shared, s.scaled, s.snP, s.tok) : encForward(m.enc, b, trunkSingle, s.cs.pairOut, s.scaled, s.snP, s.tok);
 }
 inline void denoisePost(Denoiser& m, const AtomBatch& b, DenoiseSave& s, const real* x, const real* trOut, real* out) {
   const int n = b.tokens; const size_t atoms = (size_t)n * b.dense, Rq = (size_t)b.subsets * b.Q;
@@ -737,14 +776,17 @@ inline DenoiseGrads denoiseBackPost(Denoiser& m, const AtomBatch& b, const Denoi
   return g;
 }
 // dtok, the transformer input's gradient; dsF [n, Cs] the conditioning single's (added to); dpc the pair conditioning's
+// (shared: the encoder's batch-shared gradients, summed here and backed by the caller once - dpc and dtrunkSingle then
+// untouched by this sample)
 inline void denoiseBackPre(Denoiser& m, const AtomBatch& b, const DenoiseSave& s, const DenoiseGrads& g, const real* trunkSingle,
-                           const real* dtok, real* dsF, real* dpc, real* dtrunkSingle, real* dx) {
+                           const real* dtok, real* dsF, real* dpc, real* dtrunkSingle, real* dx, EncGrads* shared = nullptr) {
   const int n = s.n, Cs = m.cond.Cs, P = m.enc.perToken;
   const size_t atoms = (size_t)n * b.dense;
   // the encoder (its tokenAct = aggregated + snProj)
   real* dsnP = cloneR(dtok, (size_t)n * P);
   real* dscaled = dx ? ARENA.zeros(atoms * 3) : nullptr;
-  encBackward(m.enc, b, s.es, trunkSingle, s.scaled, dtok, g.dskip, g.dpairDec, g.dqCondDec, dtrunkSingle, dpc, dscaled);
+  if (shared) encSampleBackward(m.enc, b, s.es, trunkSingle, s.scaled, dtok, g.dskip, g.dpairDec, g.dqCondDec, dscaled, *shared);
+  else encBackward(m.enc, b, s.es, trunkSingle, s.scaled, dtok, g.dskip, g.dpairDec, g.dqCondDec, dtrunkSingle, dpc, dscaled);
   if (dx) {                                          // scaled = x mask in
     real* t = ARENA.get(atoms * 3);
     scaleMaskK<<<blocks(atoms * 3), 256, 0, STREAM>>>(dscaled, b.atomMask, t, atoms, s.in);
@@ -772,6 +814,7 @@ inline void denoiseBackward(Denoiser& m, const AtomBatch& b, const DenoiseSave& 
 // read by all. outs[k] = D(xs[k], sigmas[k]); the saves kept in the arena for denoiseBatchBackward.
 struct DenoiseBatch {
   CondSave pair;                          // (sample 0's conditioning: its pair half everyone's)
+  EncSave enc;                            // (the encoder's shared part: everyone's)
   std::vector<DenoiseSave> per;
   real *tokS = nullptr, *condS = nullptr, *maskS = nullptr, *trOutS = nullptr;
   int S = 0, n = 0;
@@ -782,23 +825,27 @@ inline DenoiseBatch denoiseBatchForward(Denoiser& m, const AtomBatch& b, const r
                                         const int* ent, const int* sym, const std::vector<real*>& outs) {
   DenoiseBatch B; B.S = (int)xs.size(); B.n = b.tokens;
   const int n = b.tokens, P = m.enc.perToken, Cs = m.cond.Cs, S = B.S;
+  std::optional<Range> r_; r_.emplace("dn.cond");
   B.pair = condForward(m.cond, trunkSingle, trunkPair, targetFeat, ri, ti, asym, ent, sym, sigmas[0], n);
+  r_.reset(); r_.emplace("dn.encShared");
+  B.enc = encShared(m.enc, b, trunkSingle, B.pair.pairOut);
+  r_.reset();
   B.tokS = ARENA.get((size_t)S * n * P); B.condS = ARENA.get((size_t)S * n * Cs); B.maskS = ARENA.get((size_t)S * n);
   B.trOutS = ARENA.get((size_t)S * n * P);
   B.per.resize(S);
   for (int k = 0; k < S; ++k) {
     DenoiseSave& s = B.per[k];
     s.n = n; denoiseScales(s, sigmas[k]);
-    s.cs = k == 0 ? B.pair : condSingleForward(m.cond, B.pair, sigmas[k]);
-    denoisePre(m, b, s, trunkSingle, xs[k], B.tokS + (size_t)k * n * P);
+    { Range rc_("dn.condSingle"); s.cs = k == 0 ? B.pair : condSingleForward(m.cond, B.pair, sigmas[k]); }
+    { Range rp_("dn.pre"); denoisePre(m, b, s, trunkSingle, xs[k], B.tokS + (size_t)k * n * P, &B.enc); }
     GK(cudaMemcpyAsync(B.condS + (size_t)k * n * Cs, s.cs.sFinal, (size_t)n * Cs * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
     GK(cudaMemcpyAsync(B.maskS + (size_t)k * n, seqMask, (size_t)n * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
   }
   {
-    Scratch sc;
+    Scratch sc; Range rt_("dn.transformer");
     transformerForward(m.tr, m.run, B.tokS, B.condS, B.maskS, B.pair.pairOut, B.trOutS, n, S);
   }
-  for (int k = 0; k < S; ++k) denoisePost(m, b, B.per[k], xs[k], B.trOutS + (size_t)k * n * P, outs[k]);
+  for (int k = 0; k < S; ++k) { Range rq_("dn.post"); denoisePost(m, b, B.per[k], xs[k], B.trOutS + (size_t)k * n * P, outs[k]); }
   return B;
 }
 // douts[k] -> every parameter; dtrunkSingle, dtrunkPair, dtargetFeat and dxs[k] (added; any may be null, dxs empty)
@@ -809,19 +856,21 @@ inline void denoiseBatchBackward(Denoiser& m, const AtomBatch& b, const DenoiseB
   const int n = B.n, S = B.S, P = m.enc.perToken, Cs = m.cond.Cs;
   const size_t nn = (size_t)n * n;
   std::vector<DenoiseGrads> g(S);
+  EncGrads eg = encGrads(m.enc, b);
   real* dtrOutS = ARENA.get((size_t)S * n * P);
   for (int k = 0; k < S; ++k) {
-    g[k] = denoiseBackPost(m, b, B.per[k], douts[k], dxs.empty() ? nullptr : dxs[k]);
+    { Range rb_("dnb.post"); g[k] = denoiseBackPost(m, b, B.per[k], douts[k], dxs.empty() ? nullptr : dxs[k]); }
     GK(cudaMemcpyAsync(dtrOutS + (size_t)k * n * P, g[k].dtrOut, (size_t)n * P * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
   }
   real *dtokS = ARENA.get((size_t)S * n * P), *dsFS = ARENA.zeros((size_t)S * n * Cs), *dpc = ARENA.zeros(nn * m.cond.Cz);
-  transformerBackward(m.tr, m.run, B.condS, B.maskS, B.pair.pairOut, dtrOutS, dtokS, dsFS, dpc);
+  { Range rt_("dnb.transformer"); transformerBackward(m.tr, m.run, B.condS, B.maskS, B.pair.pairOut, dtrOutS, dtokS, dsFS, dpc); }
   for (int k = 0; k < S; ++k) {
     real* dsF = dsFS + (size_t)k * n * Cs;
-    denoiseBackPre(m, b, B.per[k], g[k], trunkSingle, dtokS + (size_t)k * n * P, dsF, dpc, dtrunkSingle, dxs.empty() ? nullptr : dxs[k]);
-    condBackward(m.cond, B.per[k].cs, nullptr, dsF, dtrunkSingle, nullptr, dtargetFeat);     // (each sample's single half)
+    { Range rb_("dnb.pre"); denoiseBackPre(m, b, B.per[k], g[k], trunkSingle, dtokS + (size_t)k * n * P, dsF, dpc, dtrunkSingle, dxs.empty() ? nullptr : dxs[k], &eg); }
+    { Range rc_("dnb.condSingle"); condBackward(m.cond, B.per[k].cs, nullptr, dsF, dtrunkSingle, nullptr, dtargetFeat); }     // (each sample's single half)
   }
-  condBackward(m.cond, B.pair, dpc, nullptr, nullptr, dtrunkPair, nullptr);                  // (the one pair half)
+  { Range re_("dnb.encShared"); encSharedBackward(m.enc, b, B.enc, trunkSingle, eg, dtrunkSingle, dpc); }
+  { Range rc_("dnb.cond"); condBackward(m.cond, B.pair, dpc, nullptr, nullptr, dtrunkPair, nullptr); }                  // (the one pair half)
 }
 
 
