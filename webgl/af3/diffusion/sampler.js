@@ -86,7 +86,9 @@ export function denoiserFromHead(execution, input) {
       weights: input.weights.conditioning, relativeWidth: input.relativeWidth,
       epsilon: input.epsilon,
     });
-  const denoise = (positions, noiseLevel) => {
+  // `issue` draws the head and returns its read: a caller that waits for the GPU in between
+  // (sampleOnWebGl2Steps' yield) reads a finished result instead of blocking on the whole head.
+  const issue = (positions, noiseLevel) => {
     if (positions.length !== atoms * 3) {
       throw new RangeError(
         `af3 sampler: ${positions.length} coordinates, not ${atoms} x 3`);
@@ -98,11 +100,15 @@ export function denoiserFromHead(execution, input) {
       ...input, positionsNoisy: uploaded, noiseLevel,
       ...(conditioningPair === undefined ? {} : { conditioningPair }),
     });
-    const values = Float32Array.from(execution.read(out));
-    execution.release(out);
-    execution.release(uploaded);
-    return values;
+    return () => {
+      const values = Float32Array.from(execution.read(out));
+      execution.release(out);
+      execution.release(uploaded);
+      return values;
+    };
   };
+  const denoise = (positions, noiseLevel) => issue(positions, noiseLevel)();
+  denoise.issue = issue;
   // ...and the walk's own copy goes back when the walk does.
   denoise.release = () => {
     if (input.conditioningPair === undefined && conditioningPair !== undefined) {
@@ -139,9 +145,10 @@ export function sampleOnWebGl2(execution, input, options) {
 }
 
 /**
- * The walk as a generator: yields `{ stage: "step", step }` before each denoiser
- * call, so a page can paint and take a Stop between calls
- * (webgl/runtime/steps.js); returns what `sampleOnWebGl2` returns.
+ * The walk as a generator: yields `{ stage: "step", step }` once each denoiser
+ * call is drawn and before it is read, so a page can wait for the GPU without
+ * holding the thread, paint, and take a Stop (webgl/runtime/steps.js); returns
+ * what `sampleOnWebGl2` returns.
  */
 export function* sampleOnWebGl2Steps(execution, input, options) {
   const { normal, mask } = options;
@@ -196,7 +203,6 @@ export function* sampleOnWebGl2Steps(execution, input, options) {
   let previous = levels[first];
 
   for (let step = first + 1; step <= stopAfter; step += 1) {
-    yield { stage: "step", step };
     const level = levels[step];
     positions = randomAugmentation(positions, mask, atoms, normal);
 
@@ -209,7 +215,16 @@ export function* sampleOnWebGl2Steps(execution, input, options) {
       noisy[index] = positions[index] + injected * normal();
     }
 
-    const raw = denoise(noisy, tHat);
+    // The head drawn, then a yield (the GPU waited on there, not in the read), then its result.
+    let raw;
+    if (denoise.issue === undefined) {
+      yield { stage: "step", step };
+      raw = denoise(noisy, tHat);
+    } else {
+      const read = denoise.issue(noisy, tHat);
+      yield { stage: "step", step };
+      raw = read();
+    }
     // 🔴 A RESTRAINT DISPLACES THE PREDICTION, NOT THE WALK: the update moves
     // toward what it is handed, so the descent step goes in here and the
     // denoiser itself is untouched.

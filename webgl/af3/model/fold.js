@@ -530,6 +530,7 @@ export function* foldAf3Steps(execution, call) {
     trunk = next;
     call.onStage?.("trunk", { pass });
   }
+  yield { stage: "contacts" };
   const contactProbs = Float32Array.from(execution.read(trunk.contactProbs));
   execution.release(trunk.logits);
   execution.release(trunk.contactProbs);
@@ -624,6 +625,7 @@ export function* foldAf3Steps(execution, call) {
       swapTransposedBias: flags.swapTransposedBias,
       divideByLength: flags.divideByLength,
     });
+    yield { stage: "confidence" };
     plddt = Float32Array.from(execution.read(out.plddt));
     pae = Float32Array.from(execution.read(out.pae));
     pde = Float32Array.from(execution.read(out.pde));
