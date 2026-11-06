@@ -37,7 +37,7 @@
  * is the cost, on a path nothing else here takes; `kernels/linear.js` documents
  * the same split for AF2's 50 pLDDT bins.
  */
-import { ONE_TARGET, PRELUDE } from "../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, sized } from "../runtime/execution.js";
 
 /** @typedef {import("../runtime/storage.js").Tensor} Tensor */
 
@@ -61,9 +61,8 @@ export const layerNormSource = (
 /** The ragged form: every element resolves its own row and sweeps it. */
 export const raggedLayerNormSource = (
   rows, channels, roundHalf, variance, hasWeight, hasBias,
-) => `${PRELUDE}${ONE_TARGET}
+) => sized({ ELEMENTS: rows * channels }, `${PRELUDE}${ONE_TARGET}
 const int CHANNELS = ${channels};
-const int ELEMENTS = ${rows * channels};
 uniform sampler2D xTex;
 ${hasWeight ? "uniform sampler2D weightTex;" : ""}
 ${hasBias ? "uniform sampler2D biasTex;" : ""}
@@ -105,7 +104,7 @@ void main() {
     base + 2 < ELEMENTS ? normalised(base + 2) : 0.0,
     base + 3 < ELEMENTS ? normalised(base + 3) : 0.0);
   result = ${roundHalf ? "half4(value)" : "value"};
-}`;
+}`);
 
 /**
  * 🔴 SPLITTING THE ROW STATISTICS INTO THEIR OWN PASS IS A MEASURED NULL, AND
@@ -140,8 +139,7 @@ void main() {
  * ~25 us a 110,592-texel draw costs, and neither its traffic nor its redundant
  * reduction accounts for the difference.
  */
-export const layerNormStatsSource = (rows, channels, variance) => `${PRELUDE}${ONE_TARGET}
-const int ROWS = ${rows};
+export const layerNormStatsSource = (rows, channels, variance) => sized({ ROWS: rows }, `${PRELUDE}${ONE_TARGET}
 const int CHANNELS = ${channels};
 const int CH4 = ${channels / 4};
 uniform sampler2D xTex;
@@ -175,13 +173,12 @@ ${variance === "fast"
   }
   float inverseStd = inversesqrt(spread / float(CHANNELS) + epsilon);`}
   result = vec4(mean, inverseStd, 0.0, 0.0);
-}`;
+}`);
 
 /** The aligned kernel with the statistics read rather than swept. */
 export const splitLayerNormSource = (
   rows, channels, roundHalf, hasWeight, hasBias,
-) => `${PRELUDE}${ONE_TARGET}
-const int ROWS = ${rows};
+) => sized({ ROWS: rows }, `${PRELUDE}${ONE_TARGET}
 const int CH4 = ${channels / 4};
 uniform sampler2D xTex;
 uniform sampler2D statsTex;
@@ -197,12 +194,11 @@ void main() {
   vec4 value = fetch4(xTex, texel);
   vec4 normalised = (value - stats.x) * stats.y${hasWeight ? " * fetch4(weightTex, group)" : ""}${hasBias ? "\n    + fetch4(biasTex, group)" : ""};
   result = ${roundHalf ? "half4(normalised)" : "normalised"};
-}`;
+}`);
 
 export const alignedLayerNormSource = (
   rows, channels, roundHalf, variance, hasWeight, hasBias,
-) => `${PRELUDE}${ONE_TARGET}
-const int ROWS = ${rows};
+) => sized({ ROWS: rows }, `${PRELUDE}${ONE_TARGET}
 const int CHANNELS = ${channels};
 const int CH4 = ${channels / 4};
 uniform sampler2D xTex;
@@ -249,7 +245,7 @@ ${variance === "fast"
   // see half4 in webgl/runtime/execution.js. No backticks in a GLSL comment -
   // it lives inside a JS template literal and one would end it.
   result = ${roundHalf ? "half4(normalised)" : "normalised"};
-}`;
+}`);
 
 /**
  * @param {import("../runtime/execution.js").Execution} execution

@@ -30,7 +30,7 @@
  * rather than padded, because a padded head is a head whose bias is garbage and
  * which the attention would then read.
  */
-import { ONE_TARGET, PRELUDE } from "../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, sized } from "../runtime/execution.js";
 import { layerNorm } from "./layer-norm.js";
 import { linear } from "./linear.js";
 
@@ -46,10 +46,8 @@ export const PAIR_BIAS_WEIGHTS = ["layerNormScale", "layerNormOffset", "projecti
  * whenever the chain length is - so a fragment's four can straddle two heads
  * and each one has to resolve its own (head, pair).
  */
-export const toHeadMajorSource = (pairs, heads) => `${PRELUDE}${ONE_TARGET}
-const int PAIRS = ${pairs};
+export const toHeadMajorSource = (pairs, heads) => sized({ PAIRS: pairs, ELEMENTS: pairs * heads }, `${PRELUDE}${ONE_TARGET}
 const int HEADS = ${heads};
-const int ELEMENTS = ${pairs * heads};
 uniform sampler2D sourceTex;
 
 float at(int element) {
@@ -67,7 +65,7 @@ void main() {
     base + 1 < ELEMENTS ? at(base + 1) : 0.0,
     base + 2 < ELEMENTS ? at(base + 2) : 0.0,
     base + 3 < ELEMENTS ? at(base + 3) : 0.0);
-}`;
+}`);
 
 /**
  * @param {import("../runtime/execution.js").Execution} execution

@@ -18,13 +18,11 @@
  * indexing instead - an option a fragment shader writing one texel does not
  * have.
  */
-import { ONE_TARGET, PRELUDE } from "./execution.js";
+import { ONE_TARGET, PRELUDE, sized } from "./execution.js";
 
 /** @typedef {import("./storage.js").Tensor} Tensor */
 
-export const transposeLeadingSource = (outer, inner, channels) => `${PRELUDE}${ONE_TARGET}
-const int OUTER = ${outer};
-const int INNER = ${inner};
+export const transposeLeadingSource = (outer, inner, channels) => sized({ OUTER: outer, INNER: inner }, `${PRELUDE}${ONE_TARGET}
 const int C4 = ${channels / 4};
 uniform sampler2D xTex;
 
@@ -36,7 +34,7 @@ void main() {
   int o = row % OUTER;
   int i = row / OUTER;
   result = fetch4(xTex, (o * INNER + i) * C4 + c4);
-}`;
+}`);
 
 /**
  * @param {import("./execution.js").Execution} execution

@@ -29,7 +29,7 @@
  * adds the same one. No other pairformer in this tree has it." `extraPairBias`
  * is that term, and absent means it does not exist.
  */
-import { ONE_TARGET, PRELUDE } from "../../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, sized } from "../../runtime/execution.js";
 import { add } from "../../runtime/elementwise.js";
 import { gridSelfAttention, releaseGridAttentionWeights, uploadGridAttentionWeights }
   from "./grid-attention.js";
@@ -54,10 +54,8 @@ import {
  * in here rather than being a separate draw: the relayout already visits every
  * (head, pair) once.
  */
-export const pairLogitsSource = (tokens, heads, hasExtra) => `${PRELUDE}${ONE_TARGET}
-const int PAIRS = ${tokens * tokens};
+export const pairLogitsSource = (tokens, heads, hasExtra) => sized({ PAIRS: tokens * tokens, ELEMENTS: heads * tokens * tokens }, `${PRELUDE}${ONE_TARGET}
 const int HEADS = ${heads};
-const int ELEMENTS = ${heads * tokens * tokens};
 uniform sampler2D flatTex;
 ${hasExtra ? "uniform sampler2D extraTex;" : ""}
 
@@ -79,7 +77,7 @@ void main() {
     else value.w = v;
   }
   result = value;
-}`;
+}`);
 
 export const BLOCK_GROUPS = [
   "triangleMultiplicationOutgoing", "triangleMultiplicationIncoming",

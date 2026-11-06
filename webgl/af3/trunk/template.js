@@ -44,7 +44,7 @@
  * went unnoticed because every check had a ONE-CHAIN query, where all-ones and
  * per-chain are the same array."
  */
-import { ONE_TARGET, PRELUDE } from "../../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, sized } from "../../runtime/execution.js";
 import { drain } from "../../runtime/steps.js";
 import { add, relu, scale } from "../../runtime/elementwise.js";
 import { layerNorm } from "../../kernels/layer-norm.js";
@@ -84,11 +84,9 @@ export const TEMPLATE_WEIGHTS = [
  * (`packTemplateGeometry`), with the distogram bin stored PLUS ONE so that a
  * zeroed buffer is an empty slot.
  */
-export const slotInputSource = (tokens, channels, occupied) => `${PRELUDE}${ONE_TARGET}
-const int L = ${tokens};
+export const slotInputSource = (tokens, channels, occupied) => sized({ L: tokens, ELEMENTS: tokens * tokens * channels }, `${PRELUDE}${ONE_TARGET}
 const int C4 = ${channels / 4};
 const int STRIDE = ${GEOMETRY_STRIDE};
-const int ELEMENTS = ${tokens * tokens * channels};
 uniform sampler2D queryTex;
 uniform sampler2D codeTex;
 uniform sampler2D rowWeightTex;
@@ -132,7 +130,7 @@ ${occupied ? `  // Feature 0, the distogram: the bin is stored plus one, so zero
   total += fetch1(geometryTex, g + 5) * fetch4(backboneWeightTex, group);`
     : "  // An empty slot has no geometry: every one of the six is exactly zero."}
   result = total;
-}`;
+}`);
 
 /**
  * The per-token restype code for one slot, on the host.

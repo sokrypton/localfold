@@ -27,7 +27,7 @@
  * module is built not to do, and the softmax would then have to be recomputed
  * per row.
  */
-import { ONE_TARGET, PRELUDE } from "../../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, sized } from "../../runtime/execution.js";
 import { layerNorm } from "../../kernels/layer-norm.js";
 import { linear } from "../../kernels/linear.js";
 import { multiply } from "../../runtime/elementwise.js";
@@ -40,9 +40,8 @@ export const MSA_ATTENTION_WEIGHTS = [
 ];
 
 /** `keyMask[t] = max over sequences of msaMask[s][t]`. */
-export const keyMaskSource = (sequences, tokens) => `${PRELUDE}${ONE_TARGET}
+export const keyMaskSource = (sequences, tokens) => sized({ L: tokens }, `${PRELUDE}${ONE_TARGET}
 const int SEQUENCES = ${sequences};
-const int L = ${tokens};
 uniform sampler2D maskTex;
 
 float largestAt(int token) {
@@ -61,7 +60,7 @@ void main() {
     base + 1 < L ? largestAt(base + 1) : 0.0,
     base + 2 < L ? largestAt(base + 2) : 0.0,
     base + 3 < L ? largestAt(base + 3) : 0.0);
-}`;
+}`);
 
 /**
  * The softmaxed weights, `[heads][i][j]`, from the flat `[pairs][heads]` logits.
@@ -70,10 +69,8 @@ void main() {
  * whole j row - so it sweeps the row twice, once for the maximum and once for
  * the sum. Four j a fragment rather than one keeps that sweep shared.
  */
-export const msaWeightsSource = (tokens, heads) => `${PRELUDE}${ONE_TARGET}
-const int L = ${tokens};
+export const msaWeightsSource = (tokens, heads) => sized({ L: tokens, ELEMENTS: heads * tokens * tokens }, `${PRELUDE}${ONE_TARGET}
 const int HEADS = ${heads};
-const int ELEMENTS = ${heads * tokens * tokens};
 uniform sampler2D flatTex;
 uniform sampler2D keyMaskTex;
 
@@ -107,7 +104,7 @@ void main() {
     else value.w = v;
   }
   result = value;
-}`;
+}`);
 
 /**
  * `averaged[s][i][h][d] = sum_j weights[h][i][j] * value[s][j][h][d]`.
@@ -115,13 +112,11 @@ void main() {
  * One fragment owns four consecutive d of one (s, i, head), so the four share
  * the weight row they sweep.
  */
-export const averageSource = (sequences, tokens, heads, dimension) => `${PRELUDE}${ONE_TARGET}
-const int L = ${tokens};
+export const averageSource = (sequences, tokens, heads, dimension) => sized({ L: tokens, ELEMENTS: sequences * tokens * heads * dimension }, `${PRELUDE}${ONE_TARGET}
 const int HEADS = ${heads};
 const int D = ${dimension};
 const int D4 = ${dimension / 4};
 const int WIDTH = ${heads * dimension};
-const int ELEMENTS = ${sequences * tokens * heads * dimension};
 uniform sampler2D weightsTex;
 uniform sampler2D valueTex;
 
@@ -146,7 +141,7 @@ void main() {
       fetch1(valueTex, valueBase + 2), fetch1(valueTex, valueBase + 3));
   }
   result = total;
-}`;
+}`);
 
 /**
  * @param {import("../../runtime/execution.js").Execution} execution

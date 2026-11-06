@@ -42,7 +42,7 @@
  *
  * Every one of those four has no default on either side.
  */
-import { ONE_TARGET, PRELUDE } from "../../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, sized } from "../../runtime/execution.js";
 import { layerNorm } from "../../kernels/layer-norm.js";
 import { linear } from "../../kernels/linear.js";
 
@@ -54,8 +54,7 @@ import { linear } from "../../kernels/linear.js";
  * The LayerNorm takes neither a scale nor an offset - the conditioning supplies
  * both - and the conditioning's own norm takes a scale with NO offset.
  */
-export const adaptiveBlendSource = (rows, channels) => `${PRELUDE}${ONE_TARGET}
-const int ELEMENTS = ${rows * channels};
+export const adaptiveBlendSource = (rows, channels) => sized({ ELEMENTS: rows * channels }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D normalisedTex;
 uniform sampler2D scaleTex;
 uniform sampler2D shiftTex;
@@ -66,7 +65,7 @@ void main() {
   vec4 scale = fetch4(scaleTex, texel);
   result = (vec4(1.0) / (vec4(1.0) + exp(-scale))) * fetch4(normalisedTex, texel)
     + fetch4(shiftTex, texel);
-}`;
+}`);
 
 /**
  * @param {import("../../runtime/execution.js").Execution} execution
@@ -140,8 +139,7 @@ export function adaptiveZeroInit(execution, call) {
 }
 
 /** `out[i] = a[i] * b[i]`, declared here so the gate's name says what it gates. */
-export const elementwiseProductSource = (elements) => `${PRELUDE}${ONE_TARGET}
-const int ELEMENTS = ${elements};
+export const elementwiseProductSource = (elements) => sized({ ELEMENTS: elements }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D aTex;
 uniform sampler2D bTex;
 
@@ -149,7 +147,7 @@ void main() {
   int texel = linearTexel();
   if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
   result = fetch4(aTex, texel) * fetch4(bTex, texel);
-}`;
+}`);
 
 /**
  * One of AF3's atom-layout gathers.
@@ -157,9 +155,8 @@ void main() {
  * 🔴 WHERE THE MASK IS FALSE THE DESTINATION IS ZERO rather than whatever index
  * 0 holds, "which matters because padded slots index 0 legitimately".
  */
-export const gatherSource = (count, channels) => `${PRELUDE}${ONE_TARGET}
+export const gatherSource = (count, channels) => sized({ ELEMENTS: count * channels }, `${PRELUDE}${ONE_TARGET}
 const int C4 = ${channels / 4};
-const int ELEMENTS = ${count * channels};
 uniform sampler2D sourceTex;
 uniform sampler2D indicesTex;
 uniform sampler2D maskTex;
@@ -172,7 +169,7 @@ void main() {
   if (fetch1(maskTex, row) == 0.0) { result = vec4(0.0); return; }
   int from = int(fetch1(indicesTex, row));
   result = fetch4(sourceTex, from * C4 + group);
-}`;
+}`);
 
 /**
  * @param {import("../../runtime/execution.js").Execution} execution
@@ -220,14 +217,13 @@ export const atomAttentionSource = (shape, keyMasked, lanewise = false) => {
   // still accumulate in ascending `d` order, one scalar at a time, rather than
   // as a `dot`. `--no-attend-dot4` is the control arm.
   const wide = !lanewise && dimension % 4 === 0 && width % 4 === 0;
-  return `${PRELUDE}${ONE_TARGET}
+  return sized({ ELEMENTS: subsets * queries * width }, `${PRELUDE}${ONE_TARGET}
 const int QUERIES = ${queries};
 const int KEYS = ${keys};
 const int HEADS = ${heads};
 const int D = ${dimension};
 const int D4 = ${dimension / 4};
 const int WIDTH = ${width};
-const int ELEMENTS = ${subsets * queries * width};
 uniform sampler2D qTex;
 uniform sampler2D kTex;
 uniform sampler2D vTex;
@@ -286,12 +282,11 @@ ${wide
       fetch1(vTex, valueBase + 2), fetch1(vTex, valueBase + 3));
   }
   result = acc / runningSum;
-}`;
+}`);
 };
 
 /** `out[i] = base[i] + attended[i] + transition[i] * sigmoid(gate[i])`. */
-export const blockOutputSource = (elements) => `${PRELUDE}${ONE_TARGET}
-const int ELEMENTS = ${elements};
+export const blockOutputSource = (elements) => sized({ ELEMENTS: elements }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D baseTex;
 uniform sampler2D attendedTex;
 uniform sampler2D transitionTex;
@@ -303,12 +298,11 @@ void main() {
   vec4 gate = fetch4(gateTex, texel);
   result = fetch4(baseTex, texel) + fetch4(attendedTex, texel)
     + fetch4(transitionTex, texel) * (vec4(1.0) / (vec4(1.0) + exp(-gate)));
-}`;
+}`);
 
 /** `swish(wide[i]) * wide[intermediate + i]`, the SwiGLU over a blocked row. */
-export const swiGluSource = (rows, intermediate) => `${PRELUDE}${ONE_TARGET}
+export const swiGluSource = (rows, intermediate) => sized({ ELEMENTS: rows * intermediate }, `${PRELUDE}${ONE_TARGET}
 const int INTER4 = ${intermediate / 4};
-const int ELEMENTS = ${rows * intermediate};
 uniform sampler2D wideTex;
 
 void main() {
@@ -320,7 +314,7 @@ void main() {
   vec4 gate = fetch4(wideTex, base + group);
   vec4 value = fetch4(wideTex, base + INTER4 + group);
   result = (gate / (vec4(1.0) + exp(-gate))) * value;
-}`;
+}`);
 
 /**
  * @param {import("../../runtime/execution.js").Execution} execution
@@ -496,8 +490,7 @@ export function crossAttentionBlock(execution, call) {
 
 /** `out[i] = a[i] + b[i]` - here rather than `runtime/elementwise.js` only
  * because this file's other fused writes read the same way. */
-export const sumSource = (elements) => `${PRELUDE}${ONE_TARGET}
-const int ELEMENTS = ${elements};
+export const sumSource = (elements) => sized({ ELEMENTS: elements }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D aTex;
 uniform sampler2D bTex;
 
@@ -505,7 +498,7 @@ void main() {
   int texel = linearTexel();
   if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
   result = fetch4(aTex, texel) + fetch4(bTex, texel);
-}`;
+}`);
 
 /**
  * The per-block attention biases, for every block of an atom stack at once.
@@ -530,13 +523,11 @@ void main() {
  */
 export const pairLogitsLayoutSource = (shape) => {
   const { subsets, queries, keys, heads, blocks, block } = shape;
-  return `${PRELUDE}${ONE_TARGET}
+  return sized({ BLOCKS: blocks, ELEMENTS: subsets * heads * queries * keys }, `${PRELUDE}${ONE_TARGET}
 const int QUERIES = ${queries};
 const int KEYS = ${keys};
 const int HEADS = ${heads};
-const int BLOCKS = ${blocks};
 const int BLOCK = ${block};
-const int ELEMENTS = ${subsets * heads * queries * keys};
 uniform sampler2D flatTex;
 
 float at(int element) {
@@ -559,7 +550,7 @@ void main() {
     base + 1 < ELEMENTS ? at(base + 1) : 0.0,
     base + 2 < ELEMENTS ? at(base + 2) : 0.0,
     base + 3 < ELEMENTS ? at(base + 3) : 0.0);
-}`;
+}`);
 };
 
 /**
@@ -646,10 +637,8 @@ export const interleaveBlocksSource = (rows, blocks, heads) => {
     (_, b) => `uniform sampler2D block${b};`).join("\n");
   const select = Array.from({ length: blocks - 1 },
     (_, b) => `  if (block == ${b}) return fetch1(block${b}, row * HEADS + head);`).join("\n");
-  return `${PRELUDE}${ONE_TARGET}
+  return sized({ BLOCKS: blocks, ELEMENTS: rows * blocks * heads }, `${PRELUDE}${ONE_TARGET}
 const int HEADS = ${heads};
-const int BLOCKS = ${blocks};
-const int ELEMENTS = ${rows * blocks * heads};
 ${declarations}
 
 float at(int element) {
@@ -669,5 +658,5 @@ void main() {
     base + 1 < ELEMENTS ? at(base + 1) : 0.0,
     base + 2 < ELEMENTS ? at(base + 2) : 0.0,
     base + 3 < ELEMENTS ? at(base + 3) : 0.0);
-}`;
+}`);
 };

@@ -33,7 +33,7 @@
  * the same reuse AF3's single-track attention gets: that kernel's mask index
  * collapses to the key position and its bias layout is already `[head][i][j]`.
  */
-import { ONE_TARGET, PRELUDE } from "../../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, sized } from "../../runtime/execution.js";
 import { drain } from "../../runtime/steps.js";
 import { adaptiveLayerNorm, adaptiveZeroInit, elementwiseProductSource, sumSource }
   from "./atom-attention.js";
@@ -44,9 +44,8 @@ import { linear } from "../../kernels/linear.js";
 /** @typedef {import("../../runtime/storage.js").Tensor} Tensor */
 
 /** `swish(wide[i]) * wide[intermediate + i]` over a blocked row. */
-export const swiGluSource = (rows, intermediate) => `${PRELUDE}${ONE_TARGET}
+export const swiGluSource = (rows, intermediate) => sized({ ELEMENTS: rows * intermediate }, `${PRELUDE}${ONE_TARGET}
 const int INTER4 = ${intermediate / 4};
-const int ELEMENTS = ${rows * intermediate};
 uniform sampler2D wideTex;
 
 void main() {
@@ -58,7 +57,7 @@ void main() {
   vec4 gate = fetch4(wideTex, base + group);
   vec4 value = fetch4(wideTex, base + INTER4 + group);
   result = (gate / (vec4(1.0) + exp(-gate))) * value;
-}`;
+}`);
 
 /**
  * `logits[head][i][j] = flat[(i * tokens + j) * perSuper * heads + inner * heads + head]`
@@ -66,12 +65,9 @@ void main() {
  * The nesting made explicit: a super-block's projection carries `perSuper`
  * blocks' biases interleaved by head, and this pulls out one block's.
  */
-export const superBlockLogitsSource = (tokens, heads, perSuper, inner) => `${PRELUDE}${ONE_TARGET}
-const int L = ${tokens};
+export const superBlockLogitsSource = (tokens, heads, perSuper, inner) => sized({ L: tokens, INNER: inner, ELEMENTS: heads * tokens * tokens }, `${PRELUDE}${ONE_TARGET}
 const int HEADS = ${heads};
 const int PER_SUPER = ${perSuper};
-const int INNER = ${inner};
-const int ELEMENTS = ${heads * tokens * tokens};
 uniform sampler2D flatTex;
 
 float at(int element) {
@@ -91,7 +87,7 @@ void main() {
     base + 1 < ELEMENTS ? at(base + 1) : 0.0,
     base + 2 < ELEMENTS ? at(base + 2) : 0.0,
     base + 3 < ELEMENTS ? at(base + 3) : 0.0);
-}`;
+}`);
 
 /**
  * A transition block with AdaLN conditioning, or none.

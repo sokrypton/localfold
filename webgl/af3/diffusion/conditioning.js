@@ -42,7 +42,7 @@
  * model of the lineage trained its own - so a table compiled in here would be
  * correct for exactly one checkpoint."
  */
-import { ONE_TARGET, PRELUDE } from "../../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, sized } from "../../runtime/execution.js";
 import { conditionedTransition } from "./transformer.js";
 import { layerNorm } from "../../kernels/layer-norm.js";
 import { linear } from "../../kernels/linear.js";
@@ -122,9 +122,8 @@ export const singleConcatSource = (rows, leftWidth, rightWidth, padding) => {
     const stride = tex === "left" ? leftWidth : rightWidth;
     return `  if (channel < ${end}) return fetch1(${tex}Tex, row * ${stride} + channel + (${offset}));`;
   }).join("\n");
-  return `${PRELUDE}${ONE_TARGET}
+  return sized({ ELEMENTS: rows * width }, `${PRELUDE}${ONE_TARGET}
 const int WIDTH = ${width};
-const int ELEMENTS = ${rows * width};
 uniform sampler2D leftTex;
 uniform sampler2D rightTex;
 
@@ -147,15 +146,14 @@ void main() {
     base + 1 < ELEMENTS ? at(base + 1) : 0.0,
     base + 2 < ELEMENTS ? at(base + 2) : 0.0,
     base + 3 < ELEMENTS ? at(base + 3) : 0.0);
-}`;
+}`);
 };
 
 /** `out[row][c] = c < leftWidth ? left[row][c] : right[row][c - leftWidth]`. */
-export const concatenateSource = (rows, leftWidth, rightWidth) => `${PRELUDE}${ONE_TARGET}
+export const concatenateSource = (rows, leftWidth, rightWidth) => sized({ ELEMENTS: rows * (leftWidth + rightWidth) }, `${PRELUDE}${ONE_TARGET}
 const int LEFT = ${leftWidth};
 const int RIGHT = ${rightWidth};
 const int WIDTH = ${leftWidth + rightWidth};
-const int ELEMENTS = ${rows * (leftWidth + rightWidth)};
 uniform sampler2D leftTex;
 uniform sampler2D rightTex;
 
@@ -175,12 +173,11 @@ void main() {
     base + 1 < ELEMENTS ? at(base + 1) : 0.0,
     base + 2 < ELEMENTS ? at(base + 2) : 0.0,
     base + 3 < ELEMENTS ? at(base + 3) : 0.0);
-}`;
+}`);
 
 /** `out[row][c] = x[row][c] + row0[c]` - the noise term, broadcast per token. */
-export const broadcastRowSource = (rows, channels) => `${PRELUDE}${ONE_TARGET}
+export const broadcastRowSource = (rows, channels) => sized({ ELEMENTS: rows * channels }, `${PRELUDE}${ONE_TARGET}
 const int C4 = ${channels / 4};
-const int ELEMENTS = ${rows * channels};
 uniform sampler2D xTex;
 uniform sampler2D rowTex;
 
@@ -188,7 +185,7 @@ void main() {
   int texel = linearTexel();
   if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
   result = fetch4(xTex, texel) + fetch4(rowTex, texel % C4);
-}`;
+}`);
 
 /**
  * @param {import("../../runtime/execution.js").Execution} execution
@@ -452,13 +449,11 @@ export function diffusionConditioning(execution, call) {
  * columns have to exist as columns. `trunk/embedder.js` folds the same four
  * one-hots into a projection instead, which is right there and wrong here.
  */
-export const rawRelativeSource = (tokens, relativeWidth) => `${PRELUDE}${ONE_TARGET}
-const int L = ${tokens};
+export const rawRelativeSource = (tokens, relativeWidth) => sized({ L: tokens, ELEMENTS: tokens * tokens * relativeWidth }, `${PRELUDE}${ONE_TARGET}
 const int WIDTH = ${relativeWidth};
 const int MAX_IDX = 32;
 const int MAX_CHAIN = 2;
 const int POSITION_BINS = 66;
-const int ELEMENTS = ${tokens * tokens * relativeWidth};
 uniform sampler2D identityTex;
 
 float at(int element) {
@@ -500,4 +495,4 @@ void main() {
     base + 1 < ELEMENTS ? at(base + 1) : 0.0,
     base + 2 < ELEMENTS ? at(base + 2) : 0.0,
     base + 3 < ELEMENTS ? at(base + 3) : 0.0);
-}`;
+}`);

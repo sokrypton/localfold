@@ -44,7 +44,7 @@
  * matrix. Where it is set, the single embedding is the SAME tensor rather than a
  * second projection - "sharing is what says the two really are one embedding".
  */
-import { ONE_TARGET, PRELUDE } from "../../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, sized } from "../../runtime/execution.js";
 import { add } from "../../runtime/elementwise.js";
 import { layerNorm } from "../../kernels/layer-norm.js";
 import { linear } from "../../kernels/linear.js";
@@ -93,9 +93,8 @@ export function tokenIdentity(features, tokens) {
  * the oracle's bond_embedding output is 0.0000 on this input. It is a real term
  * for ligands."
  */
-export const bondEmbeddingSource = (tokens, pairChannels) => `${PRELUDE}${ONE_TARGET}
+export const bondEmbeddingSource = (tokens, pairChannels) => sized({ ELEMENTS: tokens * tokens * pairChannels }, `${PRELUDE}${ONE_TARGET}
 const int C4 = ${pairChannels / 4};
-const int ELEMENTS = ${tokens * tokens * pairChannels};
 uniform sampler2D pairTex;
 uniform sampler2D bondTex;
 uniform sampler2D weightTex;
@@ -106,13 +105,11 @@ void main() {
   int group = texel % C4;
   int pair = texel / C4;
   result = fetch4(pairTex, texel) + fetch1(bondTex, pair) * fetch4(weightTex, group);
-}`;
+}`);
 
 /** `pair[i][j][c] = left[i][c] + right[j][c]`. */
-export const pairInitSource = (tokens, pairChannels) => `${PRELUDE}${ONE_TARGET}
-const int L = ${tokens};
+export const pairInitSource = (tokens, pairChannels) => sized({ L: tokens, ELEMENTS: tokens * tokens * pairChannels }, `${PRELUDE}${ONE_TARGET}
 const int C4 = ${pairChannels / 4};
-const int ELEMENTS = ${tokens * tokens * pairChannels};
 uniform sampler2D leftTex;
 uniform sampler2D rightTex;
 
@@ -124,7 +121,7 @@ void main() {
   int i = pair / L;
   int j = pair - i * L;
   result = fetch4(leftTex, i * C4 + group) + fetch4(rightTex, j * C4 + group);
-}`;
+}`);
 
 /**
  * The relative encoding, as four weight rows summed rather than 139 columns
@@ -135,13 +132,11 @@ void main() {
  * same-entity flag, and the relative symmetry copy (or an extra bin for a
  * different entity). Everything else in the 139 is zero.
  */
-export const relativeEncodingSource = (tokens, pairChannels) => `${PRELUDE}${ONE_TARGET}
-const int L = ${tokens};
+export const relativeEncodingSource = (tokens, pairChannels) => sized({ L: tokens, ELEMENTS: tokens * tokens * pairChannels }, `${PRELUDE}${ONE_TARGET}
 const int C4 = ${pairChannels / 4};
 const int MAX_IDX = ${MAX_RELATIVE_IDX};
 const int MAX_CHAIN = ${MAX_RELATIVE_CHAIN};
 const int POSITION_BINS = ${POSITION_BINS};
-const int ELEMENTS = ${tokens * tokens * pairChannels};
 uniform sampler2D identityTex;
 uniform sampler2D weightTex;
 
@@ -183,7 +178,7 @@ void main() {
     + fetch4(weightTex, chainRow * C4 + group);
   if (sameEntity) total += fetch4(weightTex, (POSITION_BINS * 2) * C4 + group);
   result = total;
-}`;
+}`);
 
 /**
  * The MSA embedding, with the 34 (or 35) feature columns folded in.
@@ -197,11 +192,9 @@ void main() {
  */
 export const msaEmbedSource = (
   sequences, tokens, width, msaChannels, pairedQueryRow,
-) => `${PRELUDE}${ONE_TARGET}
-const int L = ${tokens};
+) => sized({ L: tokens, ELEMENTS: sequences * tokens * msaChannels }, `${PRELUDE}${ONE_TARGET}
 const int C4 = ${msaChannels / 4};
 const int WIDTH = ${width};
-const int ELEMENTS = ${sequences * tokens * msaChannels};
 uniform sampler2D codeTex;
 uniform sampler2D deletionTex;
 uniform sampler2D weightTex;
@@ -226,7 +219,7 @@ ${width > 34 && pairedQueryRow
     ? "  if (sequence == 0) total += fetch4(weightTex, 34 * C4 + group);"
     : "  // no is_paired column, or the query row does not carry it."}
   result = total;
-}`;
+}`);
 
 /**
  * @param {import("../../runtime/execution.js").Execution} execution

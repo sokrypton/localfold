@@ -35,7 +35,7 @@
  * **ENCODER'S** PAIR CONDITIONING: "the atom geometry did not change between
  * them."
  */
-import { ONE_TARGET, PRELUDE } from "../../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, sized } from "../../runtime/execution.js";
 import { atomCrossAttentionEncoder } from "./atom-encoder.js";
 import { atomPairLogits, crossAttentionBlock, gather, sumSource } from "./atom-attention.js";
 import { diffusionConditioning, scalings } from "./conditioning.js";
@@ -47,10 +47,9 @@ import { linear } from "../../kernels/linear.js";
 /** @typedef {import("../../runtime/storage.js").Tensor} Tensor */
 
 /** `out[token][atom][c] = projected[token][c]` - one token's features to its atoms. */
-export const broadcastToAtomsSource = (tokens, dense, channels) => `${PRELUDE}${ONE_TARGET}
+export const broadcastToAtomsSource = (tokens, dense, channels) => sized({ ELEMENTS: tokens * dense * channels }, `${PRELUDE}${ONE_TARGET}
 const int DENSE = ${dense};
 const int C4 = ${channels / 4};
-const int ELEMENTS = ${tokens * dense * channels};
 uniform sampler2D projectedTex;
 
 void main() {
@@ -60,12 +59,11 @@ void main() {
   int slot = texel / C4;
   int token = slot / DENSE;
   result = fetch4(projectedTex, token * C4 + group);
-}`;
+}`);
 
 /** `out[row][c] = (a[row][c] + b[row][c]) * mask[row]`. */
-export const sumAndMaskSource = (rows, channels) => `${PRELUDE}${ONE_TARGET}
+export const sumAndMaskSource = (rows, channels) => sized({ ELEMENTS: rows * channels }, `${PRELUDE}${ONE_TARGET}
 const int C4 = ${channels / 4};
-const int ELEMENTS = ${rows * channels};
 uniform sampler2D aTex;
 uniform sampler2D bTex;
 uniform sampler2D maskTex;
@@ -75,11 +73,10 @@ void main() {
   if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
   int row = texel / C4;
   result = (fetch4(aTex, texel) + fetch4(bTex, texel)) * fetch1(maskTex, row);
-}`;
+}`);
 
 /** `out[row][c] = x[row][c] * mask[row]`, over a 3-wide row stored at stride 4. */
-export const scalePositionsSource = (atoms) => `${PRELUDE}${ONE_TARGET}
-const int ELEMENTS = ${atoms * 3};
+export const scalePositionsSource = (atoms) => sized({ ELEMENTS: atoms * 3 }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D positionsTex;
 uniform sampler2D maskTex;
 uniform float factor;
@@ -97,15 +94,14 @@ void main() {
     base + 1 < ELEMENTS ? at(base + 1) : 0.0,
     base + 2 < ELEMENTS ? at(base + 2) : 0.0,
     base + 3 < ELEMENTS ? at(base + 3) : 0.0);
-}`;
+}`);
 
 /**
  * `out[i] = (skip * noisy[i] + out * update[i]) * atomMask[atom]`
  *
  * The blend, which is the whole output of the head - see the note at the top.
  */
-export const blendSource = (atoms) => `${PRELUDE}${ONE_TARGET}
-const int ELEMENTS = ${atoms * 3};
+export const blendSource = (atoms) => sized({ ELEMENTS: atoms * 3 }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D noisyTex;
 uniform sampler2D updateTex;
 uniform sampler2D maskTex;
@@ -126,11 +122,10 @@ void main() {
     base + 1 < ELEMENTS ? at(base + 1) : 0.0,
     base + 2 < ELEMENTS ? at(base + 2) : 0.0,
     base + 3 < ELEMENTS ? at(base + 3) : 0.0);
-}`;
+}`);
 
 /** A three-channel gather with both strides given; see the encoder's note. */
-export const positionGatherSource = (count, sourceStride, outStride) => `${PRELUDE}${ONE_TARGET}
-const int ELEMENTS = ${count * outStride};
+export const positionGatherSource = (count, sourceStride, outStride) => sized({ ELEMENTS: count * outStride }, `${PRELUDE}${ONE_TARGET}
 const int OUT = ${outStride};
 const int STRIDE = ${sourceStride};
 uniform sampler2D sourceTex;
@@ -153,7 +148,7 @@ void main() {
     base + 1 < ELEMENTS ? at(base + 1) : 0.0,
     base + 2 < ELEMENTS ? at(base + 2) : 0.0,
     base + 3 < ELEMENTS ? at(base + 3) : 0.0);
-}`;
+}`);
 
 /** @typedef {{indices: Tensor, mask: Tensor}} Gather */
 /**
@@ -272,9 +267,8 @@ export function atomDecoder(execution, call) {
 }
 
 /** `out[row][c] = x[row][c] * mask[row]`. */
-export const maskOnlySource = (rows, channels) => `${PRELUDE}${ONE_TARGET}
+export const maskOnlySource = (rows, channels) => sized({ ELEMENTS: rows * channels }, `${PRELUDE}${ONE_TARGET}
 const int C4 = ${channels / 4};
-const int ELEMENTS = ${rows * channels};
 uniform sampler2D xTex;
 uniform sampler2D maskTex;
 
@@ -282,7 +276,7 @@ void main() {
   int texel = linearTexel();
   if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
   result = fetch4(xTex, texel) * fetch1(maskTex, texel / C4);
-}`;
+}`);
 
 /**
  * @typedef {{positionsNoisy: Tensor, noiseLevel: number, atomMask: Tensor,

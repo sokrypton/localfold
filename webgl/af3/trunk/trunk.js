@@ -25,7 +25,7 @@
  * head does use a mean, and swapping the two silently sharpens or flattens every
  * contact probability.)"
  */
-import { ONE_TARGET, PRELUDE } from "../../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, sized } from "../../runtime/execution.js";
 import { add } from "../../runtime/elementwise.js";
 import { embed } from "./embedder.js";
 import { linear } from "../../kernels/linear.js";
@@ -52,10 +52,8 @@ export function binEdges() {
 /**
  * `logits[i][j][b] = half[i][j][b] + half[j][i][b]` - the sum, not the mean.
  */
-export const symmetriseSource = (tokens) => `${PRELUDE}${ONE_TARGET}
-const int L = ${tokens};
+export const symmetriseSource = (tokens) => sized({ L: tokens, ELEMENTS: tokens * tokens * DISTOGRAM_BINS }, `${PRELUDE}${ONE_TARGET}
 const int B4 = ${DISTOGRAM_BINS / 4};
-const int ELEMENTS = ${tokens * tokens * DISTOGRAM_BINS};
 uniform sampler2D halfTex;
 
 void main() {
@@ -67,7 +65,7 @@ void main() {
   int j = pair - i * L;
   result = fetch4(halfTex, (i * L + j) * B4 + group)
     + fetch4(halfTex, (j * L + i) * B4 + group);
-}`;
+}`);
 
 /**
  * `contactProbs[i][j] = pairMask[i][j] * sum(softmax(logits)[b] for b < bins[i][j])`
@@ -76,10 +74,8 @@ void main() {
  * one class a token and gives each pair its own threshold, so the kernel reads
  * a per-pair count rather than baking one in.
  */
-export const contactSource = (tokens) => `${PRELUDE}${ONE_TARGET}
-const int L = ${tokens};
+export const contactSource = (tokens) => sized({ L: tokens, ELEMENTS: tokens * tokens }, `${PRELUDE}${ONE_TARGET}
 const int BINS = ${DISTOGRAM_BINS};
-const int ELEMENTS = ${tokens * tokens};
 uniform sampler2D logitsTex;
 uniform sampler2D maskTex;
 uniform sampler2D binsTex;
@@ -107,7 +103,7 @@ void main() {
     base + 1 < ELEMENTS ? contactAt(base + 1) : 0.0,
     base + 2 < ELEMENTS ? contactAt(base + 2) : 0.0,
     base + 3 < ELEMENTS ? contactAt(base + 3) : 0.0);
-}`;
+}`);
 
 /**
  * @param {import("../../runtime/execution.js").Execution} execution

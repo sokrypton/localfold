@@ -22,13 +22,12 @@
  * would redo that sweep `bins / 4` times. The intermediate is `L^2 * bins`
  * floats, released as soon as the second draw is done.
  */
-import { ONE_TARGET, PRELUDE } from "../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, sized } from "../runtime/execution.js";
 import { distogramBreaks, FIRST_BREAK, LAST_BREAK } from "../../shared/heads/distogram.js";
 
 /** @typedef {import("../runtime/storage.js").Tensor} Tensor */
 
-export const distogramLogitsSource = (length, channels, bins) => `${PRELUDE}${ONE_TARGET}
-const int L = ${length};
+export const distogramLogitsSource = (length, channels, bins) => sized({ L: length }, `${PRELUDE}${ONE_TARGET}
 const int C4 = ${channels / 4};
 const int B4 = ${bins / 4};
 uniform sampler2D pairTex;
@@ -56,10 +55,9 @@ void main() {
     sum += symmetrised.w * fetch4(weightTex, w + 3 * B4);
   }
   result = sum;
-}`;
+}`);
 
-export const distogramContactSource = (length, bins, counted) => `${PRELUDE}${ONE_TARGET}
-const int PAIRS = ${length * length};
+export const distogramContactSource = (length, bins, counted) => sized({ PAIRS: length * length }, `${PRELUDE}${ONE_TARGET}
 const int BINS = ${bins};
 const int B4 = ${bins / 4};
 const int COUNTED = ${counted};
@@ -88,7 +86,7 @@ void main() {
     base + 1 < PAIRS ? contactOf(base + 1) : 0.0,
     base + 2 < PAIRS ? contactOf(base + 2) : 0.0,
     base + 3 < PAIRS ? contactOf(base + 3) : 0.0);
-}`;
+}`);
 
 /** How many bins lie strictly under the threshold, by the host's rule. */
 export function countedBins(bins, threshold = 8, first = FIRST_BREAK, last = LAST_BREAK) {

@@ -5,9 +5,9 @@
  *
  *     node tools/gpu-chrome.mjs tools/gpu/probe-webgl-af3-programs.js [--lengths=60,100,101]
  *
- * `compilesPerLength`: with length-generic programs (webgl/runtime/length-generic.js) learned as
- * the page's first fold learns them (its length and 67 longer), how many programs each length
- * in turn actually compiles (`Execution.prepare`).
+ * `compilesPerLength`: how many programs each length in turn actually compiles
+ * (`Execution.prepare`), with the kernels' lengths as uniforms (`sized`): the first length
+ * compiles the fold's programs, a later one what it alone reaches (a size threshold's kernel).
  */
 import { openAf3Store } from "../../shared/af3/weights/weights.js";
 import { foldWeights } from "../../shared/af3/weights/diffusion-weights.js";
@@ -50,29 +50,15 @@ export async function main(_device, args) {
   for (const [, label] of [...first.programs].filter(([source]) => runs.every((r) => r.programs.has(source)))) {
     sizeIndependent[family(label)] = (sizeIndependent[family(label)] ?? 0) + 1;
   }
-  // The page's way: learn from the first length and 67 longer, then compile length after length.
-  const callFor = (length) => {
-    const { batch } = af3BatchFromA3m(SEQUENCE.slice(0, length), null, {});
-    return { batch, weights: uploaded, hostWeights: weights, steps: 1, seed: 1,
-      msa: { codes: Float32Array.from(batch.msa), deletions: Float32Array.from(batch.deletionMatrix), mask: Float32Array.from(batch.msaMask), sequences: 1 } };
-  };
-  const longer = await foldPrograms(execution, callFor(first.length + 67));
-  execution.learnLengths(first.programs.keys(), longer.keys());
   const compilesPerLength = [];
-  let previous = null;
   for (const { length, programs } of runs) {
-    // ...and each length against the one before, as prepareFoldPrograms learns on later folds.
-    if (previous !== null) execution.learnLengths(previous.keys(), programs.keys());
-    previous = programs;
     const before = execution.compiles;
     const had = new Set(execution.programs.keys());
     const t = performance.now();
     await execution.prepare(programs.keys());
     const added = [...execution.programs.keys()].filter((key) => !had.has(key));
     compilesPerLength.push({ length, compiled: execution.compiles - before, ms: Math.round(performance.now() - t),
-      refusedGroups: execution.genericRefused.size,
-      specialised: added.map((key) => programs.get(key)).filter(Boolean),
-      generic: added.filter((key) => !programs.has(key)).length });
+      kernels: added.map((key) => programs.get(key)) });
   }
   return { lengths, programs: runs.map((r) => r.programs.size), comparisons: comparisons.map(({ recompiledByKernel, ...rest }) => rest),
     sharedByKernel: sizeIndependent, compilesPerLength };

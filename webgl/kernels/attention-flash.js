@@ -37,7 +37,7 @@
  * a mask of 1 keeps a key and 0 withholds it, and `transpose` switches the mask
  * between `[batch][key]` and `[key][batch]`.
  */
-import { PRELUDE, targetDeclarations } from "../runtime/execution.js";
+import { PRELUDE, targetDeclarations, sized } from "../runtime/execution.js";
 /** @typedef {import("../runtime/storage.js").Tensor} Tensor */
 
 
@@ -68,10 +68,8 @@ export const attentionFlashSource = (
   const dot = Array.from({ length: groups },
     (_, g) => `    score += dot(q${g}, fetch4(keyTex, keyBase + ${g}));`).join("\n");
 
-  return `${PRELUDE}
+  return sized({ BATCH: batch, Q: queries }, `${PRELUDE}
 ${targetDeclarations(targets)}
-const int BATCH = ${batch};
-const int Q = ${queries};
 const int HEADS = ${heads};
 const int HD4 = ${groups};
 uniform sampler2D queryTex;
@@ -133,7 +131,7 @@ ${perTarget((t) => {
     // half4 in webgl/runtime/execution.js.
     return `result${t} = ${roundHalf ? `half4(${value})` : value};`;
   })}
-}`;
+}`);
 };
 
 /**
@@ -150,9 +148,8 @@ export const interleavePlanesSource = (elements, headDim) => {
     (_, g) => `uniform sampler2D plane${g};`).join("\n");
   const select = Array.from({ length: groups - 1 },
     (_, g) => `  if (group == ${g}) { result = fetch4(plane${g}, bqh); return; }`).join("\n");
-  return `${PRELUDE}
+  return sized({ ELEMENTS: elements }, `${PRELUDE}
 out vec4 result;
-const int ELEMENTS = ${elements};
 const int HD4 = ${groups};
 ${declarations}
 
@@ -163,7 +160,7 @@ void main() {
   int bqh = texel / HD4;
 ${select}
   result = fetch4(plane${groups - 1}, bqh);
-}`;
+}`);
 };
 
 /**

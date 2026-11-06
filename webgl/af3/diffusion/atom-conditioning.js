@@ -32,7 +32,7 @@
  * than matrix products - which is also why `kernels/linear.js` cannot serve
  * here: its input widths would be 128 and 64 one-hot columns.
  */
-import { ONE_TARGET, PRELUDE } from "../../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, sized } from "../../runtime/execution.js";
 import { linear } from "../../kernels/linear.js";
 import { relu } from "../../runtime/elementwise.js";
 
@@ -50,10 +50,9 @@ export const PAIR_CONDITIONING_WEIGHTS = [
   "singleToPairCondRow", "singleToPairCondCol", "embedPairOffsets", "embedPairDistances",
 ];
 
-export const perAtomSource = (rows, channels, rawCharge, hasBias) => `${PRELUDE}${ONE_TARGET}
+export const perAtomSource = (rows, channels, rawCharge, hasBias) => sized({ ELEMENTS: rows * channels }, `${PRELUDE}${ONE_TARGET}
 const int C4 = ${channels / 4};
 const int C = ${channels};
-const int ELEMENTS = ${rows * channels};
 uniform sampler2D positionsTex;
 uniform sampler2D maskTex;
 uniform sampler2D chargeTex;
@@ -107,7 +106,7 @@ ${rawCharge ? "" : "  charge = log(charge + sqrt(charge * charge + 1.0));"}
 
   // ...and masked LAST.
   result = value * mask;
-}`;
+}`);
 
 /**
  * @param {import("../../runtime/execution.js").Execution} execution
@@ -185,10 +184,9 @@ export function perAtomConditioning(execution, call) {
  * 🔴 THROUGH A RELU FIRST, "which is not a detail: the single conditioning is
  * signed and roughly centred, so the relu discards about half of it".
  */
-export const pairConditioningSource = (tokens, dense, pairChannels) => `${PRELUDE}${ONE_TARGET}
+export const pairConditioningSource = (tokens, dense, pairChannels) => sized({ ELEMENTS: tokens * dense * dense * pairChannels }, `${PRELUDE}${ONE_TARGET}
 const int DENSE = ${dense};
 const int P4 = ${pairChannels / 4};
-const int ELEMENTS = ${tokens * dense * dense * pairChannels};
 uniform sampler2D rowTex;
 uniform sampler2D columnTex;
 uniform sampler2D positionsTex;
@@ -224,7 +222,7 @@ void main() {
   // squared distance is the obvious reading and grows instead.
   total += fetch4(distanceWeightTex, group) / (1.0 + dot(offset, offset));
   result = total;
-}`;
+}`);
 
 /**
  * @param {import("../../runtime/execution.js").Execution} execution

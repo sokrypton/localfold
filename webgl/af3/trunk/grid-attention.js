@@ -43,7 +43,7 @@
  * halves the gate, and this runs 96 times in an rf3 trunk." No other checkpoint
  * has a slot for either, and absent means the term does not exist.
  */
-import { ONE_TARGET, PRELUDE } from "../../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, sized } from "../../runtime/execution.js";
 import { attentionFlash } from "../../kernels/attention-flash.js";
 import { layerNorm } from "../../kernels/layer-norm.js";
 import { linear } from "../../kernels/linear.js";
@@ -67,11 +67,8 @@ export const GRID_ATTENTION_OPTIONAL = ["gatingQueryBias", "outputProjectionBias
  * is a draw of its own. Doing the swap here rather than downstream keeps it next
  * to the comment that explains it.
  */
-export const biasPlanesSource = (length, heads, swap) => `${PRELUDE}${ONE_TARGET}
-const int L = ${length};
-const int PAIRS = ${length * length};
+export const biasPlanesSource = (length, heads, swap) => sized({ L: length, PAIRS: length * length, ELEMENTS: heads * length * length }, `${PRELUDE}${ONE_TARGET}
 const int HEADS = ${heads};
-const int ELEMENTS = ${heads * length * length};
 uniform sampler2D rawTex;
 
 void main() {
@@ -95,12 +92,11 @@ void main() {
     else value.w = v;
   }
   result = value;
-}`;
+}`);
 
 /** `out[row][w] += bias[w]`, the one AF3 variant that has a projection bias. */
-export const addRowBiasSource = (rows, width) => `${PRELUDE}${ONE_TARGET}
+export const addRowBiasSource = (rows, width) => sized({ ELEMENTS: rows * width }, `${PRELUDE}${ONE_TARGET}
 const int W4 = ${width / 4};
-const int ELEMENTS = ${rows * width};
 uniform sampler2D xTex;
 uniform sampler2D biasTex;
 
@@ -108,7 +104,7 @@ void main() {
   int texel = linearTexel();
   if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
   result = fetch4(xTex, texel) + fetch4(biasTex, texel % W4);
-}`;
+}`);
 
 /**
  * @param {import("../../runtime/execution.js").Execution} execution
@@ -262,8 +258,7 @@ export function gridSelfAttention(execution, call) {
 }
 
 /** `sigmoid(x)`, needed only where a bias sits between the projection and it. */
-export const logisticSource = (elements) => `${PRELUDE}${ONE_TARGET}
-const int ELEMENTS = ${elements};
+export const logisticSource = (elements) => sized({ ELEMENTS: elements }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D xTex;
 
 void main() {
@@ -271,4 +266,4 @@ void main() {
   if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
   vec4 x = fetch4(xTex, texel);
   result = vec4(1.0) / (vec4(1.0) + exp(-x));
-}`;
+}`);

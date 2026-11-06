@@ -63,7 +63,7 @@
  * `shared/heads/tm-score.js`, and a second copy would be a second chance to
  * disagree about where the bins sit.
  */
-import { ONE_TARGET, PRELUDE } from "../../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, sized } from "../../runtime/execution.js";
 import { drain } from "../../runtime/steps.js";
 import { multiply, scale } from "../../runtime/elementwise.js";
 import { layerNorm } from "../../kernels/layer-norm.js";
@@ -105,9 +105,7 @@ export function plddtBinCentres(bins = PLDDT_BINS) {
 }
 
 /** `pairMask[i][j] = seqMask[i] * seqMask[j]`. */
-export const pairMaskSource = (tokens) => `${PRELUDE}${ONE_TARGET}
-const int L = ${tokens};
-const int ELEMENTS = ${tokens * tokens};
+export const pairMaskSource = (tokens) => sized({ L: tokens, ELEMENTS: tokens * tokens }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D seqMaskTex;
 
 float at(int pair) {
@@ -123,12 +121,11 @@ void main() {
     base + 1 < ELEMENTS ? at(base + 1) : 0.0,
     base + 2 < ELEMENTS ? at(base + 2) : 0.0,
     base + 3 < ELEMENTS ? at(base + 3) : 0.0);
-}`;
+}`);
 
 /** Per-row partial sums of `x`, over the rows the mask keeps. */
-export const rowSumSource = (rows, channels) => `${PRELUDE}${ONE_TARGET}
+export const rowSumSource = (rows, channels) => sized({ ROWS: rows }, `${PRELUDE}${ONE_TARGET}
 const int CHANNELS = ${channels};
-const int ROWS = ${rows};
 uniform sampler2D xTex;
 uniform sampler2D maskTex;
 
@@ -148,12 +145,11 @@ void main() {
     base + 1 < ROWS ? at(base + 1) : 0.0,
     base + 2 < ROWS ? at(base + 2) : 0.0,
     base + 3 < ROWS ? at(base + 3) : 0.0);
-}`;
+}`);
 
 /** Per-row partial sums of `(x - mean)^2`, over the rows the mask keeps. */
-export const rowSquaredSource = (rows, channels) => `${PRELUDE}${ONE_TARGET}
+export const rowSquaredSource = (rows, channels) => sized({ ROWS: rows }, `${PRELUDE}${ONE_TARGET}
 const int CHANNELS = ${channels};
-const int ROWS = ${rows};
 uniform sampler2D xTex;
 uniform sampler2D maskTex;
 uniform float mean;
@@ -177,11 +173,10 @@ void main() {
     base + 1 < ROWS ? at(base + 1) : 0.0,
     base + 2 < ROWS ? at(base + 2) : 0.0,
     base + 3 < ROWS ? at(base + 3) : 0.0);
-}`;
+}`);
 
 /** The live row count and the sum of the per-row partials, in one texel. */
-export const combineRowsSource = (rows) => `${PRELUDE}${ONE_TARGET}
-const int ROWS = ${rows};
+export const combineRowsSource = (rows) => sized({ ROWS: rows }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D partialTex;
 uniform sampler2D maskTex;
 
@@ -193,11 +188,10 @@ void main() {
     if (fetch1(maskTex, row) > 0.0) live += 1.0;
   }
   result = vec4(total, live, 0.0, 0.0);
-}`;
+}`);
 
 /** `out = (x - mean) * inverse`, everywhere - padded rows included, as the reference does. */
-export const affineAllSource = (elements) => `${PRELUDE}${ONE_TARGET}
-const int ELEMENTS = ${elements};
+export const affineAllSource = (elements) => sized({ ELEMENTS: elements }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D xTex;
 uniform float mean;
 uniform float inverse;
@@ -206,7 +200,7 @@ void main() {
   int texel = linearTexel();
   if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
   result = (fetch4(xTex, texel) - vec4(mean)) * vec4(inverse);
-}`;
+}`);
 
 /**
  * rf3's parameter-free LayerNorm over a WHOLE tensor, real rows only.
@@ -316,11 +310,9 @@ export function absentTargetFeatTerms(weights, stats, pairChannels) {
  */
 export const assemblePairSource = (
   tokens, channels, bins, caStyle, hasDistance, hasAbsent,
-) => `${PRELUDE}${ONE_TARGET}
-const int L = ${tokens};
+) => sized({ L: tokens, ELEMENTS: tokens * tokens * channels }, `${PRELUDE}${ONE_TARGET}
 const int C4 = ${channels / 4};
 const int BINS = ${bins};
-const int ELEMENTS = ${tokens * tokens * channels};
 const float DGRAM_MIN = ${DGRAM_MIN.toFixed(6)};
 const float DGRAM_MAX = ${DGRAM_MAX.toFixed(6)};
 uniform sampler2D pairTex;
@@ -375,35 +367,31 @@ ${caStyle
 ${hasDistance ? `  value += sqrt(squared + 1e-10) * fetch4(distanceWeightTex, group);` : ""}
 ${hasAbsent ? `  value += fetch4(absentTex, group) + fetch4(absentTex, C4 + group);` : ""}
   result = value;
-}`;
+}`);
 
 /** `out = x`, for the branch that takes the trunk's single unchanged. */
-export const copyRowsSource = (elements) => `${PRELUDE}${ONE_TARGET}
-const int ELEMENTS = ${elements};
+export const copyRowsSource = (elements) => sized({ ELEMENTS: elements }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D xTex;
 
 void main() {
   int texel = linearTexel();
   if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
   result = fetch4(xTex, texel);
-}`;
+}`);
 
 /** `out = clamp(x, -512, 512)`, which protenix2 applies before its LayerNorm. */
-export const clampSource = (elements, limit) => `${PRELUDE}${ONE_TARGET}
-const int ELEMENTS = ${elements};
+export const clampSource = (elements, limit) => sized({ ELEMENTS: elements }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D xTex;
 
 void main() {
   int texel = linearTexel();
   if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
   result = clamp(fetch4(xTex, texel), vec4(${(-limit).toFixed(1)}), vec4(${limit.toFixed(1)}));
-}`;
+}`);
 
 /** `out[i][j] = pair[i][j] + pair[j][i]`, boltz2's pre-symmetrised PDE source. */
-export const symmetrisePairSource = (tokens, channels) => `${PRELUDE}${ONE_TARGET}
-const int L = ${tokens};
+export const symmetrisePairSource = (tokens, channels) => sized({ L: tokens, ELEMENTS: tokens * tokens * channels }, `${PRELUDE}${ONE_TARGET}
 const int C4 = ${channels / 4};
-const int ELEMENTS = ${tokens * tokens * channels};
 uniform sampler2D pairTex;
 
 void main() {
@@ -415,7 +403,7 @@ void main() {
   int j = pair - i * L;
   result = fetch4(pairTex, (i * L + j) * C4 + group)
     + fetch4(pairTex, (j * L + i) * C4 + group);
-}`;
+}`);
 
 /**
  * boltz2's split pair heads: intra-chain logits where the two tokens share an
@@ -423,10 +411,8 @@ void main() {
  * blended - so on a MONOMER the inter head never fires and a single-chain gate
  * cannot see whether it is there at all.
  */
-export const selectByChainSource = (tokens, bins) => `${PRELUDE}${ONE_TARGET}
-const int L = ${tokens};
+export const selectByChainSource = (tokens, bins) => sized({ L: tokens, ELEMENTS: tokens * tokens * bins }, `${PRELUDE}${ONE_TARGET}
 const int B4 = ${bins / 4};
-const int ELEMENTS = ${tokens * tokens * bins};
 uniform sampler2D intraTex;
 uniform sampler2D interTex;
 uniform sampler2D asymTex;
@@ -439,7 +425,7 @@ void main() {
   int j = pair - i * L;
   bool same = fetch1(asymTex, i) == fetch1(asymTex, j);
   result = same ? fetch4(intraTex, texel) : fetch4(interTex, texel);
-}`;
+}`);
 
 /**
  * The per-atom heads read by the atom's RANK among its token's real atoms, not
@@ -449,9 +435,8 @@ void main() {
  * 0, so every atom read its neighbour's logit (rna pLDDT corr 0.43 against stock
  * RF3, 0.9996 by rank)." A slot is real when its name is not empty.
  */
-export const byRankSource = (tokens, dense) => `${PRELUDE}${ONE_TARGET}
+export const byRankSource = (tokens, dense) => sized({ ELEMENTS: tokens * dense }, `${PRELUDE}${ONE_TARGET}
 const int DENSE = ${dense};
-const int ELEMENTS = ${tokens * dense};
 uniform sampler2D valuesTex;
 uniform sampler2D nameCharsTex;
 
@@ -482,7 +467,7 @@ void main() {
     base + 1 < ELEMENTS ? at(base + 1) : 0.0,
     base + 2 < ELEMENTS ? at(base + 2) : 0.0,
     base + 3 < ELEMENTS ? at(base + 3) : 0.0);
-}`;
+}`);
 
 const SCALARS = new Set(["targetFeatWidth", "pairChannels", "singleChannels", "dense"]);
 

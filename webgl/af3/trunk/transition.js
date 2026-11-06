@@ -27,7 +27,7 @@
  * that helpfully added the missing biases would open every gate and be wrong
  * everywhere" - and so would a port.
  */
-import { ONE_TARGET, PRELUDE } from "../../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, sized } from "../../runtime/execution.js";
 import { layerNorm } from "../../kernels/layer-norm.js";
 import { linear } from "../../kernels/linear.js";
 
@@ -44,9 +44,8 @@ export const TRANSITION_WEIGHTS = [
  * owns four OUTPUT channels and sweeps the whole intermediate axis, so it would
  * recompute the swish `channels / 4` times over.
  */
-export const swiGluSource = (rows, intermediate) => `${PRELUDE}${ONE_TARGET}
+export const swiGluSource = (rows, intermediate) => sized({ ELEMENTS: rows * intermediate }, `${PRELUDE}${ONE_TARGET}
 const int INTER4 = ${intermediate / 4};
-const int ELEMENTS = ${rows * intermediate};
 uniform sampler2D wideTex;
 
 void main() {
@@ -61,7 +60,7 @@ void main() {
   vec4 gate = fetch4(wideTex, base + group);
   vec4 value = fetch4(wideTex, base + INTER4 + group);
   result = (gate / (vec4(1.0) + exp(-gate))) * value;
-}`;
+}`);
 
 /**
  * @param {import("../../runtime/execution.js").Execution} execution

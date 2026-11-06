@@ -16,7 +16,7 @@
  * bound is known when the shader is optimised. That is also why the program
  * cache in execution.js is keyed by SOURCE - the shapes ARE the source.
  */
-import { ONE_TARGET, PRELUDE } from "../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, sized } from "../runtime/execution.js";
 import { CHANNELS_PER_TEXEL } from "../runtime/context.js";
 import { transposeLeading } from "../runtime/transpose.js";
 /** @typedef {import("../runtime/storage.js").Tensor} Tensor */
@@ -78,8 +78,7 @@ export function contractSource(length, channels, direction, layout = "channel-mi
     ? "int texel(int x, int y, int c) { return c * (L * L) + x * L + y; }"
     : "int texel(int x, int y, int c) { return (x * L + y) * CH4 + c; }";
 
-  return `${PRELUDE}${ONE_TARGET}
-const int L = ${length};
+  return sized({ L: length }, `${PRELUDE}${ONE_TARGET}
 const int CH4 = ${channels / CHANNELS_PER_TEXEL};
 uniform sampler2D aTex;
 uniform sampler2D bTex;
@@ -109,7 +108,7 @@ void main() {
     sum += ${product};
   }
   result = sum + bias;
-}`;
+}`);
 }
 
 /**

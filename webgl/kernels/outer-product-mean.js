@@ -47,7 +47,7 @@
  * 2.1 M floats at 8 sequences, 64 residues, cOuter 32, cZ 128 - and it is
  * released as soon as the second draw is done.
  */
-import { PRELUDE, ONE_TARGET } from "../runtime/execution.js";
+import { PRELUDE, ONE_TARGET, sized } from "../runtime/execution.js";
 import { layerNorm } from "./layer-norm.js";
 import { linear } from "./linear.js";
 import { maskRows } from "../runtime/elementwise.js";
@@ -62,8 +62,7 @@ export const OUTER_PRODUCT_MEAN_WEIGHTS = [
 /**
  * `intermediate[s][i][cr][z] = sum_cl left[s][i][cl] * outputWeight[(cl*cOuter+cr)*cZ+z]`
  */
-export const opmIntermediateSource = (rows, cOuter, cZ) => `${PRELUDE}${ONE_TARGET}
-const int ROWS = ${rows};
+export const opmIntermediateSource = (rows, cOuter, cZ) => sized({ ROWS: rows }, `${PRELUDE}${ONE_TARGET}
 const int C_OUTER = ${cOuter};
 const int CZ4 = ${cZ / 4};
 uniform sampler2D leftTex;
@@ -88,7 +87,7 @@ void main() {
       * fetch4(weightTex, (cl * C_OUTER + cr) * CZ4 + z4);
   }
   result = sum;
-}`;
+}`);
 
 /**
  * `out[i][j][z] = (sum_s sum_cr intermediate[s][i][cr][z] * right[s][j][cr]
@@ -96,9 +95,8 @@ void main() {
  */
 export const opmContractSource = (
   sequences, length, cOuter, cZ, biasAfterNorm = false,
-) => `${PRELUDE}${ONE_TARGET}
+) => sized({ L: length }, `${PRELUDE}${ONE_TARGET}
 const int SEQUENCES = ${sequences};
-const int L = ${length};
 const int C_OUTER = ${cOuter};
 const int CZ4 = ${cZ / 4};
 uniform sampler2D intermediateTex;
@@ -132,7 +130,7 @@ void main() {
 ${biasAfterNorm
     ? "  result = sum / max(count, 1.0) + fetch4(biasTex, z4);"
     : "  result = (sum + fetch4(biasTex, z4)) / (normalizationEpsilon + count);"}
-}`;
+}`);
 
 /**
  * @param {import("../runtime/execution.js").Execution} execution

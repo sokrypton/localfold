@@ -35,7 +35,7 @@
  * whole reason this is affordable - and is why there is a broadcast kernel here
  * rather than an elementwise multiply.
  */
-import { ONE_TARGET, PRELUDE } from "../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, sized } from "../runtime/execution.js";
 import { layerNorm } from "./layer-norm.js";
 import { linear } from "./linear.js";
 import { transposeLeading } from "../runtime/transpose.js";
@@ -53,9 +53,8 @@ export const GLOBAL_ATTENTION_WEIGHTS = [
  * bias-free and homogeneous, so scaling here is the same number and one draw
  * fewer.
  */
-export const columnMeanSource = (sequences, length, channels) => `${PRELUDE}${ONE_TARGET}
+export const columnMeanSource = (sequences, length, channels) => sized({ L: length }, `${PRELUDE}${ONE_TARGET}
 const int SEQUENCES = ${sequences};
-const int L = ${length};
 const int C4 = ${channels / 4};
 uniform sampler2D xTex;
 uniform sampler2D maskTex;
@@ -75,15 +74,14 @@ void main() {
     total += keep * fetch4(xTex, (column * SEQUENCES + s) * C4 + c4);
   }
   result = total * (scale / (1e-10 + count));
-}`;
+}`);
 
 /**
  * `out[i][h][d] = softmax_s(q[i][h] . k[i][s]) . v[i][s][d]`, one head's keys
  * and values shared by every head.
  */
-export const globalAttendSource = (sequences, length, heads, headDim) => `${PRELUDE}${ONE_TARGET}
+export const globalAttendSource = (sequences, length, heads, headDim) => sized({ L: length }, `${PRELUDE}${ONE_TARGET}
 const int SEQUENCES = ${sequences};
-const int L = ${length};
 const int HEADS = ${heads};
 const int HD = ${headDim};
 const int HD4 = ${headDim / 4};
@@ -121,15 +119,14 @@ void main() {
     runningMax = newMax;
   }
   result = acc / runningSum;
-}`;
+}`);
 
 /**
  * `out[i][s][slot] = attended[i][slot] * gate[i][s][slot]` - one value per
  * residue against every sequence's gate.
  */
-export const broadcastOverSequencesSource = (sequences, length, gates) => `${PRELUDE}${ONE_TARGET}
+export const broadcastOverSequencesSource = (sequences, length, gates) => sized({ L: length }, `${PRELUDE}${ONE_TARGET}
 const int SEQUENCES = ${sequences};
-const int L = ${length};
 const int G4 = ${gates / 4};
 uniform sampler2D attendedTex;
 uniform sampler2D gateTex;
@@ -141,7 +138,7 @@ void main() {
   int row = texel / G4;
   int column = row / SEQUENCES;
   result = fetch4(attendedTex, column * G4 + g4) * fetch4(gateTex, texel);
-}`;
+}`);
 
 /**
  * @param {import("../runtime/execution.js").Execution} execution

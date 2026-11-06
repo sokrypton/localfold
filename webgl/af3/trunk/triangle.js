@@ -41,7 +41,7 @@
  * 🔴 AND NOTHING HERE HAS A BIAS. One `bias` in the whole pairformer block, on
  * the single track's query projection; these four Linears are bias-free.
  */
-import { ONE_TARGET, PRELUDE, targetDeclarations } from "../../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, targetDeclarations, sized } from "../../runtime/execution.js";
 import { TEXTURE_WIDTH } from "../../runtime/context.js";
 import { layerNorm } from "../../kernels/layer-norm.js";
 import { linear } from "../../kernels/linear.js";
@@ -62,13 +62,10 @@ export const TRIANGLE_WEIGHTS = [
  * written by one draw to two draw buffers - the gate's sigmoid is computed once
  * for both halves of the pair of channels.
  */
-export const operandsSource = (length, channels) => `${PRELUDE}
+export const operandsSource = (length, channels) => sized({ L: length, PAIRS: length * length, ELEMENTS: channels * length * length }, `${PRELUDE}
 layout(location = 0) out vec4 aOut;
 layout(location = 1) out vec4 bOut;
-const int L = ${length};
-const int PAIRS = ${length * length};
 const int C = ${channels};
-const int ELEMENTS = ${channels * length * length};
 uniform sampler2D projectionTex;
 uniform sampler2D gateTex;
 uniform sampler2D maskTex;
@@ -107,7 +104,7 @@ void main() {
   }
   aOut = a;
   bOut = b;
-}`;
+}`);
 
 /**
  * The contraction and the centre norm in one draw, writing pair-major.
@@ -125,12 +122,9 @@ void main() {
  * see the channel axis at all without a second pass over a channel-major
  * intermediate", and the second pass costs one read and one write per texel.
  */
-export const contractSource = (length, channels, direction, divideByLength) => `${PRELUDE}${ONE_TARGET}
-const int L = ${length};
-const int PAIRS = ${length * length};
+export const contractSource = (length, channels, direction, divideByLength) => sized({ L: length, PAIRS: length * length, ELEMENTS: length * length * channels }, `${PRELUDE}${ONE_TARGET}
 const int C = ${channels};
 const int C4 = ${channels / 4};
-const int ELEMENTS = ${length * length * channels};
 uniform sampler2D aTex;
 uniform sampler2D bTex;
 uniform sampler2D scaleTex;
@@ -171,7 +165,7 @@ void main() {
   float mean = total / float(C);
   float inverseStd = inversesqrt(totalSquares / float(C) - mean * mean + epsilon);
   result = (mine - mean) * inverseStd * fetch4(scaleTex, group) + fetch4(offsetTex, group);
-}`;
+}`);
 
 /**
  * The pair axes padded to a multiple of four with zeros: `[c][L][L]` laid out
@@ -197,12 +191,7 @@ void main() {
  * question - and at a length divisible by four it does nothing at all, which is
  * why bioemu2's 68 tokens are untouched.
  */
-export const padPairPlanesSource = (length, channels, paddedLength) => `${PRELUDE}${ONE_TARGET}
-const int L = ${length};
-const int LP = ${paddedLength};
-const int PAIRS = ${length * length};
-const int PLANE = ${paddedLength * paddedLength};
-const int ELEMENTS = ${channels * paddedLength * paddedLength};
+export const padPairPlanesSource = (length, channels, paddedLength) => sized({ L: length, LP: paddedLength, PAIRS: length * length, PLANE: paddedLength * paddedLength, ELEMENTS: channels * paddedLength * paddedLength }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D xTex;
 
 void main() {
@@ -222,7 +211,7 @@ void main() {
     j + 1 < L ? fetch1(xTex, from + j + 1) : 0.0,
     j + 2 < L ? fetch1(xTex, from + j + 2) : 0.0,
     j + 3 < L ? fetch1(xTex, from + j + 3) : 0.0);
-}`;
+}`);
 
 /**
  * The contraction alone: a fragment owns four channels of one pair and
@@ -262,14 +251,10 @@ export const splitContractSource = (length, channels, direction, divideByLength,
     ? "total += fetch1(aTex, plane + i * LP + k) * fetch1(bTex, plane + j * LP + k);"
     : "total += fetch1(aTex, plane + k * LP + j) * fetch1(bTex, plane + k * LP + i);"}
   }`;
-  return `${PRELUDE}${ONE_TARGET}
-const int L = ${length};
+  return sized({ L: length, LP: paddedLength, PLANE: paddedLength * paddedLength, ELEMENTS: length * length * channels }, `${PRELUDE}${ONE_TARGET}
 // The operands' pair axes, padded to a multiple of four so the coalesced loop
 // is legal; equal to L whenever nothing needed padding.
-const int LP = ${paddedLength};
-const int PLANE = ${paddedLength * paddedLength};
 const int C4 = ${channels / 4};
-const int ELEMENTS = ${length * length * channels};
 uniform sampler2D aTex;
 uniform sampler2D bTex;
 
@@ -290,7 +275,7 @@ void main() {
   int c = group * 4;
   result = vec4(contract(c, i, j), contract(c + 1, i, j),
     contract(c + 2, i, j), contract(c + 3, i, j));
-}`;
+}`);
 };
 
 /**
@@ -309,17 +294,12 @@ void main() {
  * contraction had it L times over.
  */
 export const planeTransposeSource = (length, channels, paddedLength = length) =>
-  `${PRELUDE}${ONE_TARGET}
-const int L = ${length};
+  sized({ L: length, LP: paddedLength, PAIRS: length * length, PLANE: paddedLength * paddedLength, ELEMENTS: channels * paddedLength * paddedLength }, `${PRELUDE}${ONE_TARGET}
 // It reads the SOURCE at its own pair axes and writes at the PADDED ones, so
 // the transpose and the padding are one pass rather than two. Reading the
 // destination's stride here is what reddened the incoming direction at every
 // padded length while the aligned ones stayed green.
-const int LP = ${paddedLength};
-const int PAIRS = ${length * length};
-const int PLANE = ${paddedLength * paddedLength};
 const int C4 = ${channels / 4};
-const int ELEMENTS = ${channels * paddedLength * paddedLength};
 uniform sampler2D xTex;
 
 void main() {
@@ -340,7 +320,7 @@ void main() {
     j + 1 < L ? fetch1(xTex, base + (j + 1) * L) : 0.0,
     j + 2 < L ? fetch1(xTex, base + (j + 2) * L) : 0.0,
     j + 3 < L ? fetch1(xTex, base + (j + 3) * L) : 0.0);
-}`;
+}`);
 
 /**
  * The contraction with a PAIR BLOCK: two i and four j a fragment, into eight
@@ -406,17 +386,11 @@ ${[0, 1].map((di) => [0, 1, 2, 3].map((dj) =>
   `    result${di * 4 + dj}.${component[c4]} = s${di}${dj}${divideByLength ? " / float(L)" : ""};`)
   .join("\n")).join("\n")}
   }`;
-  return `${PRELUDE}${targetDeclarations(planes)}
-const int L = ${length};
+  return sized({ L: length, LP: paddedLength, PLANE: paddedLength * paddedLength, JBLOCKS: paddedLength / 4, BLOCKS: (paddedLength / 2) * (paddedLength / 4), TILEW: Math.max(1, Math.floor(2048 / (channels / 4))) }, `${PRELUDE}${targetDeclarations(planes)}
 // The padded pair axes: the block sweeps the PADDED grid, whose tail rows and
 // columns are zeros, and the repack reads only the true L of them.
-const int LP = ${paddedLength};
-const int PLANE = ${paddedLength * paddedLength};
 const int C4 = ${channels / 4};
 const int IBLOCKS = ${paddedLength / 2};
-const int JBLOCKS = ${paddedLength / 4};
-const int BLOCKS = ${(paddedLength / 2) * (paddedLength / 4)};
-const int TILEW = ${Math.max(1, Math.floor(2048 / (channels / 4)))};
 uniform sampler2D aTex;
 uniform sampler2D bTex;
 
@@ -456,7 +430,7 @@ ${tileMapped
   int j2 = j0 + 2;
   int j3 = j0 + 3;
 ${[0, 1, 2, 3].map(channelBlock).join("\n")}
-}`;
+}`);
 };
 
 /**
@@ -502,14 +476,8 @@ export const widePairBlockSource = (length, channels, divideByLength,
     for (let j = 0; j < J; j += 1) slots.push(`s${i}_${j}`);
   }
   const value = (name) => (divideByLength ? `${name} / float(L)` : name);
-  return `${PRELUDE}${targetDeclarations(8)}
-const int L = ${length};
-const int LP = ${paddedLength};
-const int PLANE = ${paddedLength * paddedLength};
+  return sized({ L: length, LP: paddedLength, PLANE: paddedLength * paddedLength, JBLOCKS: paddedLength / J, BLOCKS: (paddedLength / I) * (paddedLength / J), TILEW: tileWidth }, `${PRELUDE}${targetDeclarations(8)}
 const int C = ${channels};
-const int JBLOCKS = ${paddedLength / J};
-const int BLOCKS = ${(paddedLength / I) * (paddedLength / J)};
-const int TILEW = ${tileWidth};
 uniform sampler2D aTex;
 uniform sampler2D bTex;
 
@@ -538,7 +506,7 @@ ${Array.from({ length: I }, (_, i) => Array.from({ length: J }, (_, j) =>
   }
 ${Array.from({ length: 8 }, (_, p) =>
   `  result${p} = vec4(${[0, 1, 2, 3].map((c) => value(slots[p * 4 + c])).join(", ")});`).join("\n")}
-}`;
+}`);
 };
 
 /**
@@ -553,12 +521,8 @@ ${Array.from({ length: 8 }, (_, p) =>
  * alone read 2.76x at L = 72 where the pair reads 2.01x.
  */
 export const wideRepackSource = (length, channels, paddedLength = length,
-  tileWidth = 8) => `${PRELUDE}${ONE_TARGET}
-const int L = ${length};
+  tileWidth = 8) => sized({ L: length, JBLOCKS: paddedLength / 8, TILEW: tileWidth, ELEMENTS: length * length * channels }, `${PRELUDE}${ONE_TARGET}
 const int C4 = ${channels / 4};
-const int JBLOCKS = ${paddedLength / 8};
-const int TILEW = ${tileWidth};
-const int ELEMENTS = ${length * length * channels};
 ${Array.from({ length: 8 }, (_, p) => `uniform sampler2D plane${p};`).join("\n")}
 
 float pick(vec4 v, int c) {
@@ -593,7 +557,7 @@ ${Array.from({ length: 7 }, (_, p) =>
     else gathered.w = picked;
   }
   result = gathered;
-}`;
+}`);
 
 /**
  * The largest pair tensor, in FLOATS, for which the pair block beats the
@@ -636,15 +600,10 @@ export const CONTRACT_BLOCK_MAX_PAIR_FLOATS = 1572864;
  * `((i >> 1) * JBLOCKS + (j >> 2)) * C4 + cgroup`.
  */
 export const contractRepackSource = (length, channels, channelSlowest = true,
-  paddedLength = length, tileMapped = false) => `${PRELUDE}${ONE_TARGET}
-const int L = ${length};
+  paddedLength = length, tileMapped = false) => sized({ L: length, JBLOCKS: paddedLength / 4, BLOCKS: (paddedLength / 2) * (paddedLength / 4), TILEW: Math.max(1, Math.floor(2048 / (channels / 4))), ELEMENTS: length * length * channels }, `${PRELUDE}${ONE_TARGET}
 const int C4 = ${channels / 4};
 // Its OUTPUT is the true L * L pairs and its SOURCE is the padded grid, which
 // is the one place both lengths appear.
-const int JBLOCKS = ${paddedLength / 4};
-const int BLOCKS = ${(paddedLength / 2) * (paddedLength / 4)};
-const int TILEW = ${Math.max(1, Math.floor(2048 / (channels / 4)))};
-const int ELEMENTS = ${length * length * channels};
 ${Array.from({ length: 8 }, (_, p) => `uniform sampler2D plane${p};`).join("\n")}
 
 void main() {
@@ -662,7 +621,7 @@ void main() {
 ${Array.from({ length: 7 }, (_, p) =>
   `  if (plane == ${p}) { result = fetch4(plane${p}, source); return; }`).join("\n")}
   result = fetch4(plane7, source);
-}`;
+}`);
 
 /**
  * The centre norm over an already-contracted pair-major tensor.
@@ -672,10 +631,9 @@ ${Array.from({ length: 7 }, (_, p) =>
  * variance and the result are BIT-IDENTICAL and `--no-triangle-split` prices a
  * pass count rather than a precision.
  */
-export const centreNormSource = (length, channels) => `${PRELUDE}${ONE_TARGET}
+export const centreNormSource = (length, channels) => sized({ ELEMENTS: length * length * channels }, `${PRELUDE}${ONE_TARGET}
 const int C = ${channels};
 const int C4 = ${channels / 4};
-const int ELEMENTS = ${length * length * channels};
 uniform sampler2D xTex;
 uniform sampler2D scaleTex;
 uniform sampler2D offsetTex;
@@ -699,7 +657,7 @@ void main() {
   float mean = total / float(C);
   float inverseStd = inversesqrt(totalSquares / float(C) - mean * mean + epsilon);
   result = (mine - mean) * inverseStd * fetch4(scaleTex, group) + fetch4(offsetTex, group);
-}`;
+}`);
 
 /**
  * One contraction into `output`: the pair-blocked kernel where the shape takes

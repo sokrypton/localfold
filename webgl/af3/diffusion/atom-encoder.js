@@ -45,7 +45,7 @@
  * 🔴 AND THE AGGREGATION AVERAGES OVER A TOKEN'S REAL ATOMS ONLY, after a relu -
  * so a token with three atoms of a 24-slot row divides by three.
  */
-import { ONE_TARGET, PRELUDE } from "../../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, sized } from "../../runtime/execution.js";
 import {
   atomPairLogits, crossAttentionBlock, gather, sumSource,
 } from "./atom-attention.js";
@@ -56,9 +56,8 @@ import { relu } from "../../runtime/elementwise.js";
 /** @typedef {import("../../runtime/storage.js").Tensor} Tensor */
 
 /** `out[row][c] = x[row][c] * mask[row]` - the mask-before-gather step. */
-export const maskRowsSource = (rows, channels) => `${PRELUDE}${ONE_TARGET}
+export const maskRowsSource = (rows, channels) => sized({ ELEMENTS: rows * channels }, `${PRELUDE}${ONE_TARGET}
 const int C4 = ${channels / 4};
-const int ELEMENTS = ${rows * channels};
 uniform sampler2D xTex;
 uniform sampler2D maskTex;
 
@@ -67,7 +66,7 @@ void main() {
   if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
   int row = texel / C4;
   result = fetch4(xTex, texel) * fetch1(maskTex, row);
-}`;
+}`);
 
 /**
  * The atom pair conditioning: five terms, each with its own masking rule.
@@ -77,12 +76,10 @@ void main() {
  */
 export const atomPairSource = (shape, maskPaddedKeys, hasTrunkPair) => {
   const { subsets, queries, keys, pairChannels, tokens } = shape;
-  return `${PRELUDE}${ONE_TARGET}
+  return sized({ TOKENS: tokens, ELEMENTS: subsets * queries * keys * pairChannels }, `${PRELUDE}${ONE_TARGET}
 const int QUERIES = ${queries};
 const int KEYS = ${keys};
 const int P4 = ${pairChannels / 4};
-const int TOKENS = ${tokens};
-const int ELEMENTS = ${subsets * queries * keys * pairChannels};
 uniform sampler2D rowTex;
 uniform sampler2D columnTex;
 uniform sampler2D queryPosTex;
@@ -145,7 +142,7 @@ ${hasTrunkPair ? `  // The trunk's pair, indexed by the two atoms' TOKENS - both
     total += fetch4(trunkPairTex, from * P4 + group);
   }` : "  // The trunk's encoder runs before there is a pair to condition on."}
   result = total;
-}`;
+}`);
 };
 
 /**
@@ -155,10 +152,9 @@ ${hasTrunkPair ? `  // The trunk's pair, indexed by the two atoms' TOKENS - both
  * with three atoms of a 24-slot row divides by three" - and a token with none
  * stays zero rather than dividing by zero.
  */
-export const aggregateSource = (tokens, dense, channels) => `${PRELUDE}${ONE_TARGET}
+export const aggregateSource = (tokens, dense, channels) => sized({ ELEMENTS: tokens * channels }, `${PRELUDE}${ONE_TARGET}
 const int DENSE = ${dense};
 const int C4 = ${channels / 4};
-const int ELEMENTS = ${tokens * channels};
 uniform sampler2D projectedTex;
 uniform sampler2D maskTex;
 
@@ -176,7 +172,7 @@ void main() {
     total += max(fetch4(projectedTex, slot * C4 + group), vec4(0.0));
   }
   result = count > 0.0 ? total / count : vec4(0.0);
-}`;
+}`);
 
 /**
  * @param {import("../../runtime/execution.js").Execution} execution
@@ -585,8 +581,7 @@ export function atomCrossAttentionEncoder(execution, call) {
 }
 
 /** A one-channel gather; `gather` needs a multiple of four. */
-export const scalarGatherSource = (count) => `${PRELUDE}${ONE_TARGET}
-const int ELEMENTS = ${count};
+export const scalarGatherSource = (count) => sized({ ELEMENTS: count }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D sourceTex;
 uniform sampler2D indicesTex;
 uniform sampler2D maskTex;
@@ -604,14 +599,13 @@ void main() {
     base + 1 < ELEMENTS ? at(base + 1) : 0.0,
     base + 2 < ELEMENTS ? at(base + 2) : 0.0,
     base + 3 < ELEMENTS ? at(base + 3) : 0.0);
-}`;
+}`);
 
 /**
  * The same, with the index CLAMPED to the source - "a gather whose indices are
  * written for another array", which is what stock AF3's key uid is.
  */
-export const clampedGatherSource = (count, sourceLength) => `${PRELUDE}${ONE_TARGET}
-const int ELEMENTS = ${count};
+export const clampedGatherSource = (count, sourceLength) => sized({ ELEMENTS: count }, `${PRELUDE}${ONE_TARGET}
 const int SOURCE = ${sourceLength};
 uniform sampler2D sourceTex;
 uniform sampler2D indicesTex;
@@ -630,7 +624,7 @@ void main() {
     base + 1 < ELEMENTS ? at(base + 1) : 0.0,
     base + 2 < ELEMENTS ? at(base + 2) : 0.0,
     base + 3 < ELEMENTS ? at(base + 3) : 0.0);
-}`;
+}`);
 
 /**
  * A three-channel gather, written four to a texel so the reads stay aligned.
@@ -642,9 +636,8 @@ void main() {
  * pair's own read at stride 3 (relRMS 0.716) and then this one (0.450), each
  * found by the stage taps while every neighbouring stage stayed exact.
  */
-export const vec3GatherSource = (count, sourceStride) => `${PRELUDE}${ONE_TARGET}
+export const vec3GatherSource = (count, sourceStride) => sized({ COUNT: count }, `${PRELUDE}${ONE_TARGET}
 const int STRIDE = ${sourceStride};
-const int COUNT = ${count};
 uniform sampler2D sourceTex;
 uniform sampler2D indicesTex;
 uniform sampler2D maskTex;
@@ -656,12 +649,11 @@ void main() {
   int from = int(fetch1(indicesTex, texel)) * STRIDE;
   result = vec4(fetch1(sourceTex, from), fetch1(sourceTex, from + 1),
     fetch1(sourceTex, from + 2), 0.0);
-}`;
+}`);
 
 /** `act[row][c] += Linear(position)[row][c] * mask[row]`. */
-export const positionToFeaturesSource = (rows, channels) => `${PRELUDE}${ONE_TARGET}
+export const positionToFeaturesSource = (rows, channels) => sized({ ELEMENTS: rows * channels }, `${PRELUDE}${ONE_TARGET}
 const int C4 = ${channels / 4};
-const int ELEMENTS = ${rows * channels};
 uniform sampler2D positionsTex;
 uniform sampler2D weightTex;
 uniform sampler2D maskTex;
@@ -677,15 +669,14 @@ void main() {
     + p.y * fetch4(weightTex, C4 + group)
     + p.z * fetch4(weightTex, 2 * C4 + group);
   result = fetch4(actTex, texel) + projected * fetch1(maskTex, row);
-}`;
+}`);
 
 /** `out[i] = x[i]` - a copy, because a fragment cannot read its own target. */
-export const copySource = (elements) => `${PRELUDE}${ONE_TARGET}
-const int ELEMENTS = ${elements};
+export const copySource = (elements) => sized({ ELEMENTS: elements }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D xTex;
 
 void main() {
   int texel = linearTexel();
   if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
   result = fetch4(xTex, texel);
-}`;
+}`);

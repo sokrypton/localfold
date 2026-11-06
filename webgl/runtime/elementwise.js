@@ -13,31 +13,30 @@
  * a stage that wants to accumulate ping-pongs between two tensors. Writing
  * `add(x, y, x)` would be the WebGPU habit silently producing undefined output.
  */
-import { ONE_TARGET, PRELUDE } from "./execution.js";
+import { ONE_TARGET, PRELUDE, sized } from "./execution.js";
 /** @typedef {import("./storage.js").Tensor} Tensor */
 
 
-const guard = (elements) => `
-const int ELEMENTS = ${elements};
+const guard = `
 void main() {
   int texel = linearTexel();
   if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }`;
 
 /** `a + b`, elementwise. */
-export const addSource = (elements) => `${PRELUDE}${ONE_TARGET}
+export const addSource = (elements) => sized({ ELEMENTS: elements }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D aTex;
 uniform sampler2D bTex;
-${guard(elements)}
+${guard}
   result = fetch4(aTex, texel) + fetch4(bTex, texel);
-}`;
+}`);
 
 /** `a * b`, elementwise - a gate applied to an activation. */
-export const multiplySource = (elements) => `${PRELUDE}${ONE_TARGET}
+export const multiplySource = (elements) => sized({ ELEMENTS: elements }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D aTex;
 uniform sampler2D bTex;
-${guard(elements)}
+${guard}
   result = fetch4(aTex, texel) * fetch4(bTex, texel);
-}`;
+}`);
 
 /**
  * `max(a, 0)`.
@@ -49,14 +48,13 @@ ${guard(elements)}
  * `x` is the output of an ADD. Folding it into the previous linear would be
  * wrong - the add comes between them.
  */
-export const reluSource = (elements) => `${PRELUDE}${ONE_TARGET}
-const int ELEMENTS = ${elements};
+export const reluSource = (elements) => sized({ ELEMENTS: elements }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D aTex;
 void main() {
   int texel = linearTexel();
   if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
   result = max(fetch4(aTex, texel), vec4(0.0));
-}`;
+}`);
 
 /**
  * @param {import("./execution.js").Execution} execution
@@ -75,12 +73,12 @@ export function relu(execution, a, into) {
 }
 
 /** `a * scale`. */
-export const scaleSource = (elements) => `${PRELUDE}${ONE_TARGET}
+export const scaleSource = (elements) => sized({ ELEMENTS: elements }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D aTex;
 uniform float scale;
-${guard(elements)}
+${guard}
   result = fetch4(aTex, texel) * scale;
-}`;
+}`);
 
 /**
  * @param {import("./execution.js").Execution} execution
@@ -150,8 +148,7 @@ export function scale(execution, a, factor, into) {
  * WebGPU side folds this into whichever kernel is adjacent; here it is its own
  * draw until something measures that as a cost.
  */
-export const maskRowsSource = (rows, channels) => `${PRELUDE}${ONE_TARGET}
-const int ROWS = ${rows};
+export const maskRowsSource = (rows, channels) => sized({ ROWS: rows }, `${PRELUDE}${ONE_TARGET}
 const int CH4 = ${channels / 4};
 uniform sampler2D xTex;
 uniform sampler2D maskTex;
@@ -160,7 +157,7 @@ void main() {
   if (texel >= ROWS * CH4) { result = vec4(0.0); return; }
   int row = texel / CH4;
   result = fetch4(xTex, texel) * fetch1(maskTex, row);
-}`;
+}`);
 
 /**
  * @param {import("./execution.js").Execution} execution
@@ -206,15 +203,14 @@ export function maskRows(execution, { x, mask, rows, channels }, into) {
  * four would straddle, so it is refused rather than silently rounded - every
  * caller in this model has a channel count that is a multiple of four.
  */
-export const prefixSource = (elements) => `${PRELUDE}${ONE_TARGET}
-const int ELEMENTS = ${elements};
+export const prefixSource = (elements) => sized({ ELEMENTS: elements }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D aTex;
 
 void main() {
   int texel = linearTexel();
   if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
   result = fetch4(aTex, texel);
-}`;
+}`);
 
 /**
  * @param {import("./execution.js").Execution} execution
