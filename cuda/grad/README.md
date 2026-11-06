@@ -206,7 +206,7 @@ from there 6MRR's mse goes 33.3 -> 12.8 in 40 steps. The Fourier noise embedding
 
   | tokens | train-of3 A100 (s) | train-of3 GH200 (s) | OpenBind-0 PyTorch A100 (s) | OpenBind-0 PyTorch GH200 (s) | speedup (GH200) | train-of3 A100 (GiB) | train-of3 GH200 (GiB) | OpenBind-0 PyTorch A100 (GiB) | OpenBind-0 PyTorch GH200 (GiB) |
   |---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-  | 256 | 3.93 | 2.00 | | 4.3 | 2.1x | 13.0 | 12.9 | | 14.1 |
+  | 256 | 3.93 | 2.00 | 6.3 | 4.3 | 2.1x | 13.0 | 12.9 | 14.1 | 14.1 |
   | 384 | 6.08 | 3.06 | 12.0 | 6.2 | 2.0x | 16.4 | 16.2 | 29 | 27.3 |
   | 512 | 9.29 | 4.61 | out of memory | 10.0 | 2.2x | 20.6 | 20.4 | | 45.7 |
   | 640 | 13.5 | 6.86 | | 16.2 | 2.4x | 25.9 | 25.7 | | 70.1 |
