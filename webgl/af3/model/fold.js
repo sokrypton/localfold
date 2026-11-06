@@ -218,7 +218,21 @@ export function* uploadAf3WeightsSteps(execution, weights) {
     yield piece;
   }
   const distogram = uploadTree(trunk.distogram, "w.af3.distogram");
-  const diffusion = uploadTree(weights.diffusion, "w.af3.diffusion");
+  // The diffusion transformer is nearly all of the checkpoint (757 MB as floats): a block at a time.
+  const diffusion = uploadTree({ ...weights.diffusion, transformer: undefined }, "w.af3.diffusion");
+  const hostTransformer = weights.diffusion.transformer;
+  if (hostTransformer !== undefined && hostTransformer !== null) {
+    const label = "w.af3.diffusion.transformer";
+    diffusion.transformer = { ...uploadTree({ ...hostTransformer, superBlocks: undefined }, label), superBlocks: [] };
+    for (const [index, group] of hostTransformer.superBlocks.entries()) {
+      const uploadedGroup = { ...uploadTree({ ...group, blocks: undefined }, `${label}.superBlocks.${index}`), blocks: [] };
+      for (const [inner, block] of group.blocks.entries()) {
+        uploadedGroup.blocks.push(uploadTree(block, `${label}.superBlocks.${index}.blocks.${inner}`));
+        yield piece;
+      }
+      diffusion.transformer.superBlocks.push(uploadedGroup);
+    }
+  }
   yield piece;
   const atomReference = uploadConditioningWeights(execution, weights.atomReference);
   const targetFeat = {
