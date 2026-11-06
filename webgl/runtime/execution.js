@@ -158,62 +158,116 @@ export function assembleParts(pieces) {
 /** The PRELUDE without its `#version` line, which is where `sized` injects its uniforms. */
 const PRELUDE_BODY = PRELUDE.slice(PRELUDE.indexOf("\n") + 1);
 
+/** A stable 32-bit digest, for naming one kernel's declarations apart from another's. */
+function digestOf(text) {
+  let hash = 2166136261;
+  for (let at = 0; at < text.length; at += 1) hash = Math.imul(hash ^ text.charCodeAt(at), 16777619);
+  return (hash >>> 0).toString(36);
+}
+
+/**
+ * A kernel's module-scope declarations, split: each statement and each function definition, or
+ * null if anything is left over that is neither.
+ */
+function headStatements(head) {
+  const items = [];
+  let depth = 0;
+  let from = 0;
+  for (let at = 0; at < head.length; at += 1) {
+    const character = head[at];
+    if (character === "{") depth += 1;
+    else if (character === "}") {
+      depth -= 1;
+      if (depth < 0) return null;
+      if (depth === 0) { items.push(head.slice(from, at + 1)); from = at + 1; }
+    } else if (character === ";" && depth === 0) {
+      items.push(head.slice(from, at + 1));
+      from = at + 1;
+    }
+  }
+  return depth === 0 && head.slice(from).trim() === ""
+    ? items.map((item) => item.trim()).filter(Boolean) : null;
+}
+
 /**
  * The same kernel as a PART, read off a finished source - or null if it cannot be one.
  *
- * 🔴 BECAUSE THE BLOCKER WAS ONE LINE OF GLSL IN 106 KERNELS OF 135, NOT THE SHAPE OF `part`.
- * Classified over a cold AF2 and ESMFold2 fold, every kernel between the PRELUDE and its
- * `void main` is uniform declarations, a single `result` target and `const int` WIDTHS - and the
- * widths are what `sized` deliberately leaves as constants so a loop over the channels keeps its
- * compile-time bound. Two parts cannot both declare `const int CH4` at module scope with
- * different values, but a const INSIDE a function is still a compile-time constant and still
- * unrolls the loop, so they move into the body and the collision is gone. Nothing is rewritten
- * by hand and no kernel loses a bound.
+ * 🔴 BECAUSE THE BLOCKER WAS NEVER THE SHAPE OF `part`, IT WAS THAT PARTS SHARE ONE NAMESPACE.
+ * Seven of this tree's ~150 kernels are written as parts; the rest are finished strings carrying
+ * their widths as `const int` - which `sized` deliberately leaves as constants so a loop keeps its
+ * compile-time bound - and their own helper functions, and two kernels cannot both declare `CH4`
+ * or `coordinateOf` in one program. So each kernel's own declarations are RENAMED by a digest of
+ * its source, along with every reference to them in its uniforms, helpers and body. The UNIFORMS
+ * keep their names, which is what lets two kernels share a sampler unit. Nothing is rewritten by
+ * hand and no kernel loses a bound.
  *
- * Refused, by design rather than as a limitation: a kernel that declares a HELPER FUNCTION (parts
- * share one namespace, so its name would have to be mangled), one with SEVERAL render targets
- * (a part writes `result`), and one whose uniform array is sized by its own const (moving the
- * const would move it out of scope).
+ * Refused, by design rather than as a limitation: a kernel with SEVERAL render targets, since a
+ * part writes `result` - which is what keeps the heavy projections and attentions out - and one
+ * whose module scope holds anything but uniforms, constants and functions (a struct, a global).
  *
  * @param {string} code a finished fragment source built on PRELUDE
  * @returns {{sizes: string[], uniforms: string[], helpers: string, body: string} | null}
  */
-export function partFromSource(code, { loops = true } = {}) {
+export function partFromSource(code) {
   const mainAt = code.indexOf("void main()");
   if (mainAt < 0 || !code.includes(PRELUDE_BODY)) return null;
   const head = code.slice(0, mainAt).replace(/^#version[^\n]*\n/, "").replace(PRELUDE_BODY, "")
-    // GLSL has no strings, so comments can go before anything else is read.
+    // GLSL has no strings, so the comments can come out before anything else is read.
     .replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
-  // A brace in the declarations is a function body or a struct, which this cannot namespace.
-  if (/[{}]/.test(head)) return null;
+  const items = headStatements(head);
+  if (items === null) return null;
   const uniforms = [];
-  const constants = [];
+  const declarations = [];
+  const names = [];
   let targets = 0;
-  for (const statement of head.split(";").map((part_) => part_.trim()).filter(Boolean)) {
-    if (statement === "out vec4 result") targets += 1;
-    else if (statement.startsWith("uniform ")) uniforms.push(statement.slice("uniform ".length));
-    else if (statement.startsWith("const ")) constants.push(`  ${statement};`);
-    else return null;
+  for (const item of items) {
+    if (item === "out vec4 result;") targets += 1;
+    else if (item.startsWith("uniform ")) uniforms.push(item.slice("uniform ".length, -1));
+    else if (item.startsWith("const ")) {
+      const name = item.match(/^const\s+\S+\s+([A-Za-z_]\w*)/)?.[1];
+      if (name === undefined) return null;
+      names.push(name);
+      declarations.push(item);
+    } else if (item.endsWith("}")) {
+      // A function definition, named by the first identifier that an open bracket follows.
+      const name = item.match(/([A-Za-z_]\w*)\s*\(/)?.[1];
+      if (name === undefined) return null;
+      names.push(name);
+      declarations.push(item);
+    } else return null;
   }
   if (targets !== 1) return null;
-  // A uniform whose array length is one of those constants would lose it: `uniform float t[N]`.
-  const names = constants.map((statement) => statement.match(/const\s+\S+\s+(\w+)/)?.[1]);
-  if (uniforms.some((uniform) => names.some((name) => name !== undefined
-    && new RegExp(`\\b${name}\\b`).test(uniform)))) return null;
-  // 🔴 AND A KERNEL THAT LOOPS IS LEFT ALONE, MEASURED. A link's fixed cost is ~40 ms on this
-  // M2's Chrome whatever the program holds, so merging ought to be free - and AF2's compile went
-  // 514 ms to 1223 as its 53 programs became 36 while ESMFold2's went 719 to 275 as its 82 became
-  // 23. The difference is what is in them: AF2's partable kernels are loops over channel counts
-  // that the compiler UNROLLS, and a dozen unrolled bodies in one program cost the driver more
-  // than a dozen programs. ESMFold2's are elementwise. A byte cap does not separate them (AF2's
-  // compile rises monotonically with every cap swept); a `for` does.
-  if (!loops && /\bfor\s*\(/.test(code.slice(mainAt))) return null;
   const opens = code.indexOf("{", mainAt);
   const closes = code.lastIndexOf("}");
   if (opens < 0 || closes < opens) return null;
-  return { sizes: [], uniforms, helpers: "",
-           body: `${constants.join("\n")}\n${code.slice(opens + 1, closes)}` };
+  let rename = (text) => text;
+  if (names.length > 0) {
+    const prefix = `p${digestOf(code)}_`;
+    // 🔴 NO LOOKBEHIND: Safari before 16.4 fails a whole MODULE that contains one at load, which
+    // `npm run check:safari` exists to catch. The character before the name is matched and put
+    // back instead, so that a field or a swizzle - `.x`, `.count` - is never renamed.
+    const pattern = new RegExp(`(^|[^.\\w])(${names.join("|")})\\b`, "g");
+    rename = (text) => text.replace(pattern, `$1${prefix}$2`);
+  }
+  return {
+    sizes: [],
+    uniforms: uniforms.map(rename),
+    helpers: declarations.map(rename).join("\n"),
+    body: rename(code.slice(opens + 1, closes)),
+  };
 }
+
+/**
+ * A part's samplers, each with whether it is an INTEGER one (`usampler2D`, for packed codes).
+ *
+ * 🔴 THE TYPE IS CARRIED BECAUSE ONE PLACEHOLDER CANNOT SERVE BOTH. A combined draw points the
+ * samplers it does not use at a one-texel texture of its own, and two samplers of different types
+ * on one texture unit is GL_INVALID_OPERATION - which arrived as
+ * `bioemu2.fourier-add:68x768: GL error 0x502 after the draw` the moment a bin held an int5
+ * kernel's `usampler2D` beside a float kernel's `sampler2D`.
+ */
+const samplersOf = (piece) => piece.uniforms.filter((uniform) => /sampler/.test(uniform))
+  .map((uniform) => ({ name: uniform.split(/\s+/).at(-1), integer: /\busampler|\bisampler/.test(uniform) }));
 
 /** `count` render targets named result0..result{count-1}, for a wide kernel. */
 export const targetDeclarations = (count) => Array.from(
@@ -400,8 +454,6 @@ export class Execution {
      * is swept rather than argued - `--combine-bytes=`.
      */
     this.combineBytes = options.combineBytes ?? 0;
-    /** Leave a kernel that loops out of the combined programs; an arm of the rule above. */
-    this.combineNoLoops = options.combineNoLoops ?? false;
     /**
      * Where the HOST time inside `dispatch` goes, when asked for.
      *
@@ -433,6 +485,8 @@ export class Execution {
     /** The parts (`part`) dispatch has met, by their own code, and those put in a combined program. */
     this.parts = new Map();
     this.combined = new Map();
+    /** The one-texel textures a combined draw's unused samplers are pointed at, by type. */
+    this.placeholders = {};
 
     this.dispatches = 0;
     this.draws = 0;
@@ -574,15 +628,14 @@ export class Execution {
     if (this.noCombine) return;
     // ...packed into programs of at most MAX_TEXTURE_IMAGE_UNITS samplers each (16 here: one
     // part alone, the per-atom conditioning, reads 11), a part that does not fit opening the next.
-    const units = this.gl.getParameter(this.gl.MAX_TEXTURE_IMAGE_UNITS);
-    const samplers = (pieces) => new Set(pieces.flatMap((piece) => piece.uniforms
-      .filter((uniform) => /sampler/.test(uniform)).map((uniform) => uniform.split(/\s+/).at(-1)))).size;
+    // ...and one unit kept back for the placeholders the draws point their spare samplers at.
+    const units = this.gl.getParameter(this.gl.MAX_TEXTURE_IMAGE_UNITS) - 2;
+    const samplers = (pieces) => new Set(pieces.flatMap(samplersOf).map(({ name }) => name)).size;
     const bins = [];
     for (const source of new Set(sources)) {
       if (this.combined.has(source)) continue;
       // A kernel written as a part, else the same kernel read off its finished source.
-      const piece = this.parts.get(source)
-        ?? partFromSource(source, { loops: !this.combineNoLoops });
+      const piece = this.parts.get(source) ?? partFromSource(source);
       if (piece === undefined || piece === null) continue;
       const fits = (bin) => {
         const pieces = [...bin.map(([, held]) => held), piece];
@@ -602,8 +655,8 @@ export class Execution {
       if (bin.length < 2) continue;
       const pieces = bin.map(([, piece]) => piece);
       const code = assembleParts(pieces);
-      const names = [...new Set(pieces.flatMap((piece) => piece.uniforms
-        .filter((uniform) => /sampler/.test(uniform)).map((uniform) => uniform.split(/\s+/).at(-1))))];
+      const held = new Map(pieces.flatMap(samplersOf).map((sampler) => [sampler.name, sampler]));
+      const names = [...held.values()];
       bin.forEach(([source], index) => this.combined.set(source, { code, index, samplers: names }));
     }
   }
@@ -925,24 +978,36 @@ export class Execution {
     // draw gave them, and one holding this draw's target is a feedback loop (GL error 0x502) though
     // nothing reads it. They are pointed at a one-texel texture of their own.
     if (combined !== undefined) {
-      const spare = combined.samplers.filter((name) => !(name in inputs));
-      if (spare.length > 0) {
+      const spare = combined.samplers.filter(({ name }) => !(name in inputs));
+      // One placeholder unit per sampler TYPE in use, since a float and an integer sampler cannot
+      // share a unit; `samplersOf` says why.
+      for (const integer of [false, true]) {
+        const named = spare.filter((sampler) => sampler.integer === integer);
+        if (named.length === 0) continue;
         // ...on its own unit, made there: binding it while the last input's unit was active
         // replaced that input (every combined draw read a one-texel texture for its mask).
         gl.activeTexture(gl.TEXTURE0 + unit);
-        if (this.placeholder === undefined) {
-          this.placeholder = gl.createTexture();
-          gl.bindTexture(gl.TEXTURE_2D, this.placeholder);
-          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, 1, 1, 0, gl.RGBA, gl.FLOAT, null);
+        const kind = integer ? "words" : "floats";
+        if (this.placeholders[kind] === undefined) {
+          const texture = gl.createTexture();
+          gl.bindTexture(gl.TEXTURE_2D, texture);
+          if (integer) {
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32UI, 1, 1, 0,
+              gl.RGBA_INTEGER, gl.UNSIGNED_INT, null);
+          } else {
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, 1, 1, 0, gl.RGBA, gl.FLOAT, null);
+          }
           gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
           gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+          this.placeholders[kind] = texture;
         }
-        gl.bindTexture(gl.TEXTURE_2D, this.placeholder);
-        this.boundUnits[unit] = this.placeholder;
-        for (const name of spare) {
+        gl.bindTexture(gl.TEXTURE_2D, this.placeholders[kind]);
+        this.boundUnits[unit] = this.placeholders[kind];
+        for (const { name } of named) {
           const location = this.#uniform(entry, name);
           if (location !== null) gl.uniform1i(location, unit);
         }
+        unit += 1;
       }
     }
     const inputsAt = this.host === null ? 0 : performance.now();

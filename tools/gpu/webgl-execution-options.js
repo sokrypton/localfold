@@ -268,7 +268,6 @@ export function webglExecutionOptions(args, defaults = {}) {
     noAttendDot4: flag(args, "no-attend-dot4"),
     noCombine: flag(args, "no-combine"),
     combineBytes: Number(option(args, "combine-bytes", "0")),
-    combineNoLoops: flag(args, "combine-no-loops"),
     poolLabelPattern: pattern("pool-labels"),
     profile: flag(args, "profile") ? new Map() : null,
   };

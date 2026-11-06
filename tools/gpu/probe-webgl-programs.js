@@ -28,7 +28,7 @@
  * Every flag after `--tool` is passed to the tool untouched, so a gate does not stop being a gate
  * when it is measured.
  */
-import { Execution, ONE_TARGET, PRELUDE } from "../../webgl/runtime/execution.js";
+import { Execution, ONE_TARGET, PRELUDE, partFromSource } from "../../webgl/runtime/execution.js";
 import { createWebGL2Context, linkProgram } from "../../webgl/runtime/context.js";
 
 const option = (args, name, fallback) => {
@@ -70,6 +70,9 @@ export function instrumentPrograms({ cold = false } = {}) {
   const lookups = { hits: 0, hitMs: 0 };
   rows.lookups = lookups;
   rows.prepared = new Set();
+  rows.left = new Map();
+  rows.declarations = new Map();
+  rows.leftLabels = new Map();
   rows.state = state;
   const dispatch = Execution.prototype.dispatch;
   Execution.prototype.dispatch = function instrumentedDispatch(call) {
@@ -100,6 +103,29 @@ export function instrumentPrograms({ cold = false } = {}) {
     // The programs it linked, which `program` never sees: what a browser without
     // KHR_parallel_shader_compile has to link one at a time on its own thread.
     for (const source of asked) rows.prepared.add(this.packaged(source));
+    // 🔴 AND WHAT IS LEFT OUT, WHICH IS THE NEXT ROUND'S LIST. A source not in a combined program
+    // is either one `partFromSource` refused (and `partable` says which rule) or one it read as a
+    // part that found no bin to join - a uniform declared another way, or sixteen samplers used up.
+    for (const source of asked) {
+      if (this.combined.has(source)) continue;
+      const piece = this.parts.has(source) ? undefined : partFromSource(source);
+      if (piece !== undefined && piece !== null) {
+        // It reads as a part and still found no bin: a uniform declared another way, or sixteen
+        // sampler units used up. Which name, and declared how, is what the next round needs.
+        for (const uniform of piece.uniforms) {
+          const name = uniform.split(/\s+/).at(-1);
+          const held = rows.declarations.get(name) ?? new Set();
+          held.add(uniform);
+          rows.declarations.set(name, held);
+        }
+      }
+      const why = this.parts.has(source) ? "a part, unbinned"
+        : (piece === null ? partable(source) : "a part, unbinned");
+      rows.left.set(why, (rows.left.get(why) ?? 0) + 1);
+      const held = rows.leftLabels.get(why) ?? [];
+      held.push(String(labels.get(source) ?? "?").split(":")[0]);
+      rows.leftLabels.set(why, held);
+    }
     const held = new Map();
     for (const [source, { code }] of this.combined) {
       const bin = held.get(code) ?? { bytes: code.length, kernels: [] };
@@ -133,33 +159,20 @@ export function instrumentPrograms({ cold = false } = {}) {
 }
 
 /**
- * Could this finished source be a `part` without being rewritten by hand - that is, is everything
- * between the shared PRELUDE and its `void main` only uniform declarations and the one `result`
- * target? A kernel that also declares a helper, a module-scope `const` or several targets cannot
- * join a combined program as it stands, and the reason says which.
- *
- * This is the measurement that decides between converting ~150 kernels by hand and teaching the
- * runtime to convert the simple ones itself.
+ * Why a finished kernel is not in a combined program, for the one-program-each rows: the rules
+ * `partFromSource` applies, in its order, so that a reader is told which one it broke rather than
+ * left to guess. "partable" means the runtime took it and it found no bin to join - a uniform
+ * declared another way, or the sampler units used up.
  */
 export function partable(source) {
-  const at = source.indexOf("void main()");
-  if (at < 0) return "no main";
-  const head = source.slice(0, at);
+  if (partFromSource(source) !== null) return "partable";
+  if (source.indexOf("void main()") < 0) return "no main";
+  const head = source.slice(0, source.indexOf("void main()"));
   const targets = head.match(/^\s*(layout\(location[^)]*\)\s*)?out\s+/gm) ?? [];
   if (targets.length !== 1 || !head.includes(ONE_TARGET.trim())) return "not one `result` target";
-  // The prelude, the size uniforms `sized` injects into it, and the target are all expected.
-  const rest = head
-    .replace(PRELUDE, "")
-    .replace(/#version 300 es\n/, "")
-    .replace(ONE_TARGET.trim(), "")
-    .replace(/^\s*uniform\s+[^;]+;$/gm, "")
-    .replace(/^\s*\/\/.*$/gm, "")
-    .replace(/\/\*[\s\S]*?\*\//g, "")
-    .trim();
-  if (rest === "") return "partable";
-  if (/\bconst\b/.test(rest)) return "module-scope const";
-  if (/\w+\s*\([^)]*\)\s*\{/.test(rest)) return "declares a helper";
-  return "other declarations";
+  // The PRELUDE without its `#version` line, since `sized` injects its uniforms between the two.
+  if (!source.includes(PRELUDE.slice(PRELUDE.indexOf("\n") + 1))) return "not built on PRELUDE";
+  return "something else at module scope";
 }
 
 export async function main(device, args) {
@@ -208,6 +221,12 @@ export async function main(device, args) {
       const why = row.kernels !== undefined ? "already combined" : partable(row.source);
       return { ...held, [why]: (held[why] ?? 0) + 1 };
     }, {}),
+    // A uniform the unbinned parts declare in more than one way, which is what stops them sharing.
+    conflicts: Object.fromEntries([...rows.declarations.entries()]
+      .filter(([, ways]) => ways.size > 1).map(([name, ways]) => [name, [...ways]])),
+    // Every program still on its own, by the reason - the next round's list.
+    notCombined: Object.fromEntries([...rows.left.entries()]
+      .map(([why, count]) => [why, { count, labels: [...new Set(rows.leftLabels.get(why))] }])),
     // Each combined program: how much GLSL it holds and which kernels chose to share it.
     bins: rows.bins.map(({ bytes, kernels }) => ({ bytes, kernels: kernels.length,
       labels: kernels.map((label) => String(label).split(":")[0]) })),

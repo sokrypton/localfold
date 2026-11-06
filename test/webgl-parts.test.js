@@ -34,33 +34,46 @@ test("a uniform declared two ways cannot join", () => {
 const finished = (declarations, body) => sized({ ROWS: 4 },
   `${PRELUDE}${ONE_TARGET}${declarations}\nvoid main() {\n${body}\n}`);
 
-test("a finished kernel becomes a part, its widths moved into the body", () => {
-  const piece = partFromSource(finished("uniform sampler2D xTex;\nconst int CH4 = 32;",
-    "  result = fetch4(xTex, linearTexel() * CH4);").code);
+test("a finished kernel becomes a part, its own names renamed apart", () => {
+  const piece = partFromSource(finished(
+    "uniform sampler2D xTex;\nconst int CH4 = 32;\nfloat twice(float v) { return v + v; }",
+    "  result = vec4(twice(fetch4(xTex, linearTexel() * CH4).x));").code);
   // `sized` injects its own after the version line, so a read-back part declares them first.
   assert.deepEqual(piece.uniforms, ["highp int ROWS", "sampler2D xTex"]);
-  // The const is a LOCAL one now: still compile-time, and no longer a name two parts share.
-  assert.match(piece.body, /^ {2}const int CH4 = 32;$/m);
-  assert.match(piece.body, /result = fetch4\(xTex, linearTexel\(\) \* CH4\);/);
-  // And it assembles beside another part without either losing a declaration.
-  const code = assembleParts([add.part, piece]);
-  assert.equal(code.match(/^uniform highp int ROWS;$/gm).length, 1);
-  assert.match(code, /^void kernel1\(\) \{\n {2}const int CH4 = 32;$/m);
+  // The const and the helper keep module scope and lose their names, which is what lets a second
+  // kernel declare `CH4` too; the uniform keeps its, which is what lets the two share a unit.
+  const [, prefix] = piece.helpers.match(/const int (p\w+_)CH4 = 32;/);
+  assert.match(piece.helpers, new RegExp(`float ${prefix}twice\\(float v\\)`));
+  assert.match(piece.body, new RegExp(`${prefix}twice\\(fetch4\\(xTex, linearTexel\\(\\) \\* ${prefix}CH4\\)`));
 });
 
-test("a kernel the runtime will not read as a part says which rule it broke", () => {
-  // A helper would have to be renamed: parts share one namespace.
-  assert.equal(partFromSource(finished("float twice(float v) { return v + v; }",
-    "  result = vec4(twice(1.0));").code), null);
+test("two finished kernels that both declare CH4 share one program", () => {
+  const ours = (width, body) => partFromSource(finished(
+    `uniform sampler2D xTex;\nconst int CH4 = ${width};`, body).code);
+  const code = assembleParts([
+    ours(32, "  result = vec4(float(CH4));"),
+    ours(8, "  result = vec4(float(CH4) * 2.0);"),
+  ]);
+  assert.equal(code.match(/^uniform sampler2D xTex;$/gm).length, 1);
+  assert.equal(code.match(/^const int p\w+_CH4 = (32|8);$/gm).length, 2);
+});
+
+test("a field is not a name: `.x` survives a rename", () => {
+  const piece = partFromSource(finished("const int x = 3;",
+    "  vec4 v = vec4(1.0);\n  result = vec4(v.x * float(x));").code);
+  assert.match(piece.body, /v\.x \* float\(p\w+_x\)/);
+});
+
+test("a kernel the runtime will not read as a part is refused", () => {
   // Several render targets: a part writes `result`.
   assert.equal(partFromSource(`${PRELUDE}${targetDeclarations(2)}
 void main() {
   result0 = vec4(0.0);
   result1 = vec4(1.0);
 }`), null);
-  // A uniform array whose length is one of the consts, which moving the const would take away.
-  assert.equal(partFromSource(finished("const int BINS = 4;\nuniform float edges[BINS];",
-    "  result = vec4(edges[0]);").code), null);
+  // A struct at module scope, which is neither a uniform, a constant nor a function.
+  assert.equal(partFromSource(finished("struct Frame { vec3 t; };",
+    "  result = vec4(0.0);").code), null);
   // Something that is not one of PRELUDE's kernels at all.
   assert.equal(partFromSource("#version 300 es\nvoid main() {}"), null);
 });

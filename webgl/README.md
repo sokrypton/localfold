@@ -838,50 +838,76 @@ Cold, through `probe-webgl-uber.js`: 4 small kernels as 4 programs are 151 ms an
 COUNT times a constant, which is the same shape Safari 16.3 shows at ~19 ms a link - and it is why
 the lever is combining kernels rather than shortening them.
 
-**So every model's light kernels now share programs, and every fold tool asks for them up front.**
+**So every model's single-target kernels now share programs, and every fold tool asks for them up
+front.**
 Two mechanisms, both already here for AF3: a dry run on virtual tensors says which programs a fold
 draws with (`Execution.collectPrograms`: no textures, no draws, reads are zeros), and
 `Execution.prepare` combines the parts among them (`Execution.combine`) and links what is left.
 Measured cold, with the fold's programs linked ONE AT A TIME in a fresh context - which is what a
 browser that links on its own thread pays, and what Chrome's `KHR_parallel_shader_compile` hides:
 
-| fold | programs | linked one at a time | | and combined | |
+| fold | programs | linked one at a time | and combined | | |
 |---|---:|---:|---:|---:|---:|
-| AlphaFold 2 monomer, 59 residues | 53 | 2177 ms | | **36** / **1557 ms** | 1.40x |
-| AlphaFold 3 / OpenBind-0, 59 tokens | 83 | 3325 ms | | **41** / **1798 ms** | 1.85x |
-| ESMFold2, 59 residues | 82 | 3247 ms | | **23** / **1023 ms** | 3.17x |
-| bioemu2, 68 tokens | 114 | 4866 ms | | **27** / **1429 ms** | 3.40x |
+| AlphaFold 2 monomer, 59 residues | 53 | 2177 ms | **16** | **806 ms** | 2.70x |
+| AlphaFold 3 / OpenBind-0, 59 tokens | 83 | 3325 ms | **23** | **1108 ms** | 3.00x |
+| ESMFold2, 59 residues | 82 | 3247 ms | **10** | **532 ms** | 6.10x |
+| bioemu2, 68 tokens | 114 | 4866 ms | **14** | **922 ms** | 5.28x |
 
-Nothing any of them computes moves: AF2's worst atom against the WGSL fold is **0.0353 A** either
-way (its own dither floor is 0.0308), AF3 is pLDDT **66.525**, ESMFold2 **83.632** with identical
-CA spacings, and a whole 20-step bioemu2 fold is **rmsd 1.595, TM 0.9083, 201 contacts** to every
-digit printed. `--no-combine` is the control arm in all four.
+What is left in every one of them is the kernels a part cannot be: the heavy projections and
+attentions, which write SEVERAL render targets where a part writes `result` (8, 11, 3 and 9 of
+them). Everything else is in a combined program. The draws are a little cheaper too - 5 to 14% off
+each fold's own clock, from the program switches a dispatch no longer makes.
 
-🔴 **AND THE BLOCKER WAS ONE LINE OF GLSL IN 106 KERNELS OF 135, NOT THE SHAPE OF `part`.** Written
-as a part a kernel can share a program; this tree has ~150 kernels and seven of them were parts, so
-the round looked like 150 hand conversions. Classified over a cold AF2 and ESMFold2 fold, what
-actually stood in the way was a module-scope `const int` - the WIDTHS that `sized` deliberately
-leaves as constants so a loop over the channels keeps its compile-time bound - in 37 of AF2's 53
-programs and 69 of ESMFold2's 82. Two parts cannot both declare `const int CH4` at module scope,
-and a const INSIDE a function is still a compile-time constant and still unrolls the loop. So
-`partFromSource` reads a finished kernel back as a part and moves its consts into the body, **and
-not one kernel was rewritten**. What it still refuses, by design: a kernel that declares a HELPER
-(parts share one namespace, so the name would have to be mangled), one with SEVERAL render targets
-(a part writes `result` - this is what keeps the heavy projections and attentions out), and one
-whose uniform array is sized by its own const.
+Nothing any of them computes moves. AF2's worst atom against the WGSL fold is **0.0353 A** either
+way (its own dither floor is 0.0308); AF3's whole comparison is identical to the digit in both arms
+- worst atom 0.0301 A, relative rms 0.002689, trunk pair 4.72e-4 - at pLDDT **66.525**; ESMFold2 is
+**83.632** with identical CA spacings; and a 20-step bioemu2 fold is **rmsd 1.595, TM 0.9083, 201
+contacts** at a 411 MiB peak, every digit the same. `--no-combine` is the control arm in all four,
+and `check-af3-webgl-page.js` - the page's own WebGL2 fold against its WebGPU one - reads the same
+0.1371 A either way.
 
-🔴 **AND ON CHROME COMBINING IS A LOSS FOR ONE OF THE FOUR, WHICH IS THE PARALLEL COMPILE AND NOT A
-CONTRADICTION.** `prepare` starts every link at once, and with `KHR_parallel_shader_compile` Chrome
-runs them off the thread: AF2's 53 programs come back in **519 ms**, under 10 ms each, and its 36
-combined ones take **1226**, because merging reduces the parallelism and lengthens the longest job.
-ESMFold2 goes the other way (719 ms to 275) and bioemu2 and AF3 improve as well. The serial column
-above is the one this backend is for - a visitor on Chrome has WebGPU, and the browsers that bring
-anyone here link inside `linkProgram` on the page's thread, which is where a 3.4x shows up as a tab
-that does not freeze. Two arms were measured and rejected: `--combine-bytes=<n>`, a cap on how much
-GLSL one program may hold, because AF2's compile rises monotonically with every cap swept (514 ms
-at 53 programs, 739 at 38, 968 at 37, 1223 at 36) while ESMFold2 is best with no cap at all; and
-`--combine-no-loops`, which leaves the looping kernels out, because it is worse serially in both
-(AF2 1758 ms against 1557, ESMFold2 1443 against 1023).
+🔴 **AND THE BLOCKER WAS NEVER THE SHAPE OF `part`, IT WAS THAT PARTS SHARE ONE NAMESPACE.**
+Written as a part a kernel can share a program; this tree has ~150 kernels and seven of them were
+parts, so the round looked like 150 hand conversions. What actually stood in the way was that a
+finished kernel carries its own names: the WIDTHS `sized` deliberately leaves as `const int` so a
+loop keeps its compile-time bound (in 37 of AF2's 53 programs and 69 of ESMFold2's 82), and its own
+helper functions - and two kernels cannot both declare `CH4`, or `coordinateOf`, in one program. So
+`partFromSource` reads a finished kernel back as a part and RENAMES its own declarations by a
+digest of its source, with every reference to them in its uniforms, helpers and body; the uniforms
+keep their names, which is what lets two kernels share a sampler unit. **Not one kernel was
+rewritten and none lost a bound.** 🔴 The first version moved the consts into the body instead,
+which is also correct and also keeps them compile-time - and it cannot touch a kernel with a
+HELPER, which is most of the interesting ones: AF2 went to 36 programs that way and to **16** with
+the names renamed. What it refuses now is a kernel with SEVERAL render targets, since a part writes
+`result`, and one whose module scope holds anything else at all - a struct, a global.
+
+🔴 **AND A COMBINED DRAW'S SPARE SAMPLERS NEED A PLACEHOLDER PER TYPE.** The samplers a combined
+program has but this draw does not use are pointed at a one-texel texture, because one left on a
+unit holding this draw's render target is a feedback loop. Two samplers of DIFFERENT types on one
+texture unit is `GL_INVALID_OPERATION`, and the moment a bin held an int5 kernel's `usampler2D`
+beside a float kernel's `sampler2D` the fold died at `bioemu2.fourier-add:68x768: GL error 0x502
+after the draw` - the same error as the pool bug, and again from a binding rather than from
+arithmetic. There is a float placeholder and a words one now, on their own units, which is also why
+`combine` keeps two sampler units back from `MAX_TEXTURE_IMAGE_UNITS`.
+
+🔴 **AND HALF-COMBINING WAS A LOSS ON CHROME, WHICH IS THE PARALLEL COMPILE AND WORTH KNOWING.**
+`prepare` starts every link at once, and with `KHR_parallel_shader_compile` Chrome runs them off
+the thread: AF2's 53 programs come back in **519 ms**, under 10 ms each. At 36 programs - the
+consts-into-the-body version, which left every helper-declaring kernel on its own - it took
+**1226**, because merging reduces the parallelism and lengthens the longest job while saving a
+fixed cost the parallelism had already hidden. At **16** it is **292 ms**, so the count had to fall
+far enough; every model now improves on both paths (ESMFold2 719 to 183, AF3 779 to 371, bioemu2
+1167 to 591). The serial column above is still the one this backend is for - a visitor on Chrome
+has WebGPU, and the browsers that bring anyone here link inside `linkProgram` on the page's thread,
+which is where a 6x shows up as a tab that does not freeze. `--no-combine` is the control arm.
+
+Two arms were measured and rejected on the way: `--combine-bytes=<n>`, a cap on how much GLSL one
+program may hold, because AF2's compile rose monotonically with every cap swept (514 ms at 53
+programs, 739 at 38, 968 at 37, 1223 at 36) while ESMFold2 was best with no cap at all; and leaving
+the LOOPING kernels out, on the theory that a dozen unrolled bodies in one program is what costs
+the driver, because it was worse serially in both (AF2 1758 ms against 1557, ESMFold2 1443 against
+1023). Both were measuring the half-combined state, and what the second round says is that neither
+was the mechanism: the cost is per program, and the cure is fewer of them.
 
 **`getError` after every draw is a synchronous round trip** - 4% of an AF2 fold - and
 `checkFramebufferStatus` per dispatch is another. A framebuffer per attachment SET, bound rather
