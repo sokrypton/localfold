@@ -1976,12 +1976,46 @@ render target, and clearing the conflict in `#bindTargets` does not save it: `bi
 still refuses. Reverted, and with it the hypothesis that 54,381 dispatches of redundant state were
 costing anything.
 
-🔴 **AND `--pool` FAILS FOR A REAL REASON WORTH RECORDING: `bioemu2.m0:1x68: GL error 0x502`.** A
-pooled texture is handed out for a new tensor while a kernel still names it as an input, so the draw
-reads and writes one texture. That is a use-after-release in the caller, which is exactly what this
-tree's own note says pooling is the arm for - "whether a kernel reads texels nothing wrote" - and it
-is why pooling is on the measured-loss list. Not fixed here; it is a defect in a caller, not in the
-allocator, and it is the thing standing between this backend and a framebuffer cache that hits.
+🔴 **AND `--pool` FAILED WITH `bioemu2.m0:1x68: GL error 0x502` - WHICH WAS THE POOL KEY MISSING A
+FORMAT, NOT A USE-AFTER-RELEASE.** This section first guessed a pooled texture was handed out while a
+kernel still named it as an input. It is not: the error path says so outright now - *"no input shares
+a target's texture"* - and so does the arm that checks whether an EARLIER dispatch left a target
+bound to a sampler unit, which finds nothing either.
+
+The pool keys a free texture by its RECTANGLE and its FORMAT, and `allocate`'s own comment has said
+why since f16 arrived - "a texture comes back only as the format it was made in: handing an RGBA16F
+texture to an f32 tensor is a silent halving of everything written into it". Then `allocateWords`
+added a **third** format, RGBA32UI for the int5 codes, and the key never learned about it. So
+`release` filed every words texture under `f32` and the next float allocation of that rectangle was
+handed an integer texture: drawing into RGBA32UI as though it were RGBA32F is `GL_INVALID_OPERATION`,
+and reading one through a `sampler2D` rather than a `usampler2D` is undefined - so the quiet version
+of this bug is a wrong answer, and `--no-check-errors` turns the loud one into the quiet one. **The
+rule was right, stated, and applied to two formats of three.**
+
+🔴 **FIXED, AND POOLING IS BIT-IDENTICAL AND 1.04x.** `poolKey` carries the format for all three and
+`allocateWords` takes from the pool rather than only filling it - it had been stranding every words
+texture it released, bytes `pooledBytes` counted and nothing could use. A 20-step bioemu2 fold:
+
+| | fold | caca | peak | creates | framebuffer hits |
+|---|---:|---:|---:|---:|---:|
+| `--pool` | **19.76 s** | 3.8540435712892709 | 799 MiB | **1,606** | **57,142** |
+| default | 20.47 s | 3.8540435712892709 | **411 MiB** | 117,366 | 0 |
+
+`caca` agrees to all sixteen digits, which is what pooling demands - a pooled texture carries the
+last tensor's bytes, so a fold that agrees bit for bit also says **no kernel here reads a texel
+nothing wrote**, which is the diagnostic pooling exists to be and which has never run before. All 48
+gates pass with `--pool` as well as without.
+
+**It stays OFF by default on the memory**: 799 MiB against 411 is the "measured loss" this file's
+pooling note refers to, and 1.04x is not worth doubling the peak on a device that has WebGL2 because
+it has little else. What changes is that the trade is now a choice rather than a crash.
+
+🔴 **AND IT MAKES THE FRAMEBUFFER CACHE WORK, WHICH WAS THE OTHER HALF.** With fresh textures the
+keyed cache cannot hit (0 of 57,397) and re-attaching one framebuffer per target COUNT is 47x better;
+with pooling the objects repeat, the cache hits **57,142 of 57,397** and is the cheaper of the two
+(69 ms against 89). So `#bindTargets` takes the reuse path only when pooling is off - which is also
+what stops the keyed cache being dead code under a comment claiming it is kept for exactly this
+case.
 
 ### The threshold that chose between two projection kernels was fitted with the wrong dtype
 

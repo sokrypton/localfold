@@ -72,6 +72,31 @@ export function storageBytes(elements) {
  *   groups: number, decoded?: Tensor, free: () => void}} Int5Weight
  */
 
+/**
+ * A pooled texture's key: its rectangle AND its FORMAT.
+ *
+ * 🔴 THE FORMAT IS IN THE KEY BECAUSE A TEXTURE COMES BACK ONLY AS THE FORMAT
+ * IT WAS MADE IN, AND THE THIRD FORMAT WAS MISSING FROM IT. `allocate` has said
+ * so since f16 arrived - "handing an RGBA16F texture to an f32 tensor is a
+ * silent halving of everything written into it" - and then `allocateWords`
+ * added **RGBA32UI** for the int5 codes and the key never learned about it. So
+ * `release` filed every words texture under `f32`, and the next float
+ * allocation of that rectangle was handed an integer texture:
+ *
+ *     --pool: bioemu2.m0:1x68: GL error 0x502 after the draw
+ *
+ * which is `GL_INVALID_OPERATION` for drawing into RGBA32UI as though it were
+ * RGBA32F. Reading one through a `sampler2D` rather than a `usampler2D` is
+ * undefined too, so the quiet version of this bug is a wrong answer rather than
+ * a refused draw - and `--no-check-errors` turns the loud one into the quiet
+ * one. The rule was right, stated, and applied to two of the three formats.
+ */
+const poolKey = (width, height, format) => `${width}x${height}:${format}`;
+
+/** Which format a tensor's texture actually is - see `poolKey`. */
+const tensorFormat = (tensor) =>
+  (tensor.words === true ? "u32" : tensor.half === true ? "f16" : "f32");
+
 export class Storage {
   /** @param {WebGL2RenderingContext} gl */
   constructor(gl, options = {}) {
@@ -233,10 +258,7 @@ export class Storage {
     const gl = this.gl;
     const { width, height } = textureShape(elements);
     this.allocationLabels.set(label, (this.allocationLabels.get(label) ?? 0) + 1);
-    // 🔴 THE POOL KEY CARRIES THE FORMAT, because a texture comes back only as
-    // the format it was made in: handing an RGBA16F texture to an f32 tensor is
-    // a silent halving of everything written into it.
-    const key = `${width}x${height}:${half ? "f16" : "f32"}`;
+    const key = poolKey(width, height, half ? "f16" : "f32");
     const free = this.poolLabelPattern === null || this.poolLabelPattern.test(label)
       ? this.pool.get(key) : undefined;
     const bytes = width * height * CHANNELS_PER_TEXEL * (half ? 2 : 4);
@@ -394,17 +416,32 @@ export class Storage {
       throw new RangeError(`${label}: ${words} words is past this context's textures`);
     }
     const gl = this.gl;
-    const texture = gl.createTexture();
-    gl.bindTexture(gl.TEXTURE_2D, texture);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32UI, width, height, 0,
-      gl.RGBA_INTEGER, gl.UNSIGNED_INT, null);
-    for (const p of [gl.TEXTURE_MIN_FILTER, gl.TEXTURE_MAG_FILTER]) {
-      gl.texParameteri(gl.TEXTURE_2D, p, gl.NEAREST);
-    }
-    for (const p of [gl.TEXTURE_WRAP_S, gl.TEXTURE_WRAP_T]) {
-      gl.texParameteri(gl.TEXTURE_2D, p, gl.CLAMP_TO_EDGE);
-    }
     const bytes = width * height * CHANNELS_PER_TEXEL * 4;
+    // 🔴 AND IT TAKES FROM THE POOL, WHICH IT DID NOT, so a words texture was
+    // released into the pool and never taken out of it - stranded bytes that
+    // `pooledBytes` counts and nothing can use. Now it has its own `u32` key
+    // and can only ever come back as what it is.
+    const key = poolKey(width, height, "u32");
+    const free = this.poolLabelPattern === null || this.poolLabelPattern.test(label)
+      ? this.pool.get(key) : undefined;
+    let texture;
+    if (free !== undefined && free.length > 0) {
+      texture = free.pop();
+      this.pooledBytes -= bytes;
+      this.reuses += 1;
+      gl.bindTexture(gl.TEXTURE_2D, texture);
+    } else {
+      texture = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, texture);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32UI, width, height, 0,
+        gl.RGBA_INTEGER, gl.UNSIGNED_INT, null);
+      for (const p of [gl.TEXTURE_MIN_FILTER, gl.TEXTURE_MAG_FILTER]) {
+        gl.texParameteri(gl.TEXTURE_2D, p, gl.NEAREST);
+      }
+      for (const p of [gl.TEXTURE_WRAP_S, gl.TEXTURE_WRAP_T]) {
+        gl.texParameteri(gl.TEXTURE_2D, p, gl.CLAMP_TO_EDGE);
+      }
+    }
     /** @type {Tensor} */
     const tensor = { texture, elements: words, width, height, label, bytes, words: true };
     this.live.add(tensor);
@@ -510,7 +547,7 @@ export class Storage {
       this.gl.deleteTexture(tensor.texture);
       return;
     }
-    const key = `${tensor.width}x${tensor.height}:${tensor.half ? "f16" : "f32"}`;
+    const key = poolKey(tensor.width, tensor.height, tensorFormat(tensor));
     const free = this.pool.get(key);
     if (free === undefined) this.pool.set(key, [tensor.texture]);
     else free.push(tensor.texture);

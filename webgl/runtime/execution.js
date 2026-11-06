@@ -363,6 +363,8 @@ export class Execution {
     this.framebufferBuilds = 0;
     /** How many attachment sets to keep. A fold uses tens; the cap is slack. */
     this.maxFramebuffers = options.maxFramebuffers ?? 256;
+    /** @type {(WebGLTexture | null)[]} The texture on each sampler unit. */
+    this.boundUnits = [];
     this.framebufferHits = 0;
     this.framebufferMisses = 0;
     /** One framebuffer per target count, re-attached - see `#bindTargets`. */
@@ -453,9 +455,18 @@ export class Execution {
     // So a miss RE-ATTACHES one framebuffer per target COUNT instead of
     // building a new one. The attachments and `drawBuffers` are per-framebuffer
     // state that has to be set either way; what this drops is the create, the
-    // delete and the completeness query. The keyed cache stays for the case it
-    // was meant for - a fold with `--pool`, where the objects do repeat.
-    if (!this.noFramebufferReuse) {
+    // delete and the completeness query.
+    // 🔴 EACH PATH SERVES THE CONFIGURATION IT IS BETTER FOR, AND BOTH ARE
+    // REACHABLE. Without pooling every allocation is a fresh texture, so the
+    // keyed cache cannot hit - 0 hits and 54,381 misses - and re-attaching one
+    // framebuffer per target COUNT takes this call from 4285 ms to 92. With
+    // pooling the objects repeat, the keyed cache hits **57,142 times against
+    // 255 misses** and is the cheaper of the two (69 ms against 89), because a
+    // hit is one `bindFramebuffer` where a reuse is that plus the attachments.
+    // Gating on `pooling` rather than preferring one outright is what keeps the
+    // keyed cache from being dead code with a comment claiming otherwise, which
+    // is what it became when the reuse path first went in.
+    if (!this.noFramebufferReuse && !this.storage.pooling) {
       let reused = this.reusedFramebuffers.get(targets.length);
       const fresh = reused === undefined;
       if (fresh) {
@@ -617,18 +628,11 @@ export class Execution {
       gl.activeTexture(gl.TEXTURE0 + unit);
       gl.bindTexture(gl.TEXTURE_2D, tensor.texture);
       gl.uniform1i(location, unit);
+      // Recorded, not cached: `#bindTargets` needs to know what is bound to a
+      // unit so it can release a texture that is about to be drawn into.
+      this.boundUnits[unit] = tensor.texture;
       unit += 1;
     }
-    // 🔴 AND THE TAIL MUST BE UNBOUND, WHICH IS WHAT CACHING BREAKS AND WHY
-    // THIS IS NOT JUST AN OPTIMISATION. Without a cache every dispatch rebinds
-    // units 0..n-1, so a texture only lingers above the count it used. With one,
-    // a stale texture stays on a unit this dispatch does not use - and if that
-    // texture is this dispatch's RENDER TARGET, the framebuffer attachment is
-    // also bound to a sampler and WebGL refuses the draw with
-    // GL_INVALID_OPERATION. Measured: `bioemu2.cond-slice:576x128:1: GL error
-    // 0x502 after the draw`, on the first fold after the cache went in. So the
-    // units past this dispatch's inputs are cleared, which costs a call only
-    // when the input count SHRINKS.
     const inputsAt = this.host === null ? 0 : performance.now();
     for (const [name, value] of Object.entries(ints)) {
       const location = this.#uniform(entry, name);
@@ -689,7 +693,32 @@ export class Execution {
     if (this.checkErrors) {
       const error = gl.getError();
       if (error !== gl.NO_ERROR) {
-        throw new Error(`${label}: GL error 0x${error.toString(16)} after the draw`);
+        // 🔴 AND IT SAYS WHETHER AN INPUT IS ALSO A TARGET, because
+        // GL_INVALID_OPERATION after a draw is almost always that - a texture
+        // bound to a sampler while the framebuffer draws into it - and the
+        // message without this named a kernel and left the reader to guess.
+        // It is the pooling allocator's characteristic failure: a released
+        // texture handed out for a new tensor while a kernel still names the
+        // old one, which `--pool` is partly there to expose.
+        const names = Object.entries(inputs)
+          .filter(([, tensor]) => targets.some((t) => t.texture === tensor.texture))
+          .map(([name]) => name);
+        const stale = this.boundUnits
+          .map((texture, u) => [texture, u])
+          .filter(([texture, u]) => texture !== null && texture !== undefined
+            && u >= unit && targets.some((t) => t.texture === texture))
+          .map(([, u]) => u);
+        if (names.length === 0 && stale.length > 0) {
+          throw new Error(`${label}: GL error 0x${error.toString(16)} after the draw - a `
+            + `target texture is still bound to sampler unit(s) ${stale.join(", ")} from an `
+            + "EARLIER dispatch, which is a feedback loop this dispatch did not create");
+        }
+        throw new Error(`${label}: GL error 0x${error.toString(16)} after the draw`
+          + (names.length === 0
+            ? ` (no input shares a target's texture; ${targets.length} target(s), `
+              + `inputs ${Object.keys(inputs).join(", ") || "none"})`
+            : ` - the input(s) ${names.join(", ")} are drawn into by this same `
+              + "dispatch, which is a feedback loop"));
       }
     }
     if (this.host !== null) {
