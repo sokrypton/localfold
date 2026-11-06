@@ -26,7 +26,7 @@
  * its shapes baked in as `const int`, so the source is the only thing that
  * distinguishes two instances, and it is what the cache indexes.
  */
-import { FULLSCREEN_TRIANGLE, TEXTURE_WIDTH, linkProgram } from "./context.js";
+import { FULLSCREEN_TRIANGLE, TEXTURE_WIDTH, finishProgram, linkProgram, startProgram } from "./context.js";
 import { Storage } from "./storage.js";
 
 /**
@@ -281,6 +281,8 @@ export class Execution {
     } : null;
     /** @type {Map<string, {program: WebGLProgram, uniforms: Map<string, WebGLUniformLocation>}>} */
     this.programs = new Map();
+    /** While a Set, `dispatch` only records each kernel's source in it (see `prepare`). */
+    this.collect = null;
     this.dispatches = 0;
     this.draws = 0;
     this.compiles = 0;
@@ -391,8 +393,54 @@ export class Execution {
   program(source) {
     const cached = this.programs.get(source);
     if (cached !== undefined) return cached;
+    return this.#adopt(source, linkProgram(this.gl, source));
+  }
+
+  /**
+   * Compile these kernels' programs ahead of the draws that need them, without holding the
+   * thread for long: links are started in batches of ~16 ms of the thread, a task each, and
+   * then waited for (KHR_parallel_shader_compile's completion status, polled between tasks) and
+   * adopted. A first fold at a new size links ~150 programs, ~2.6 s on Safari 16.3, which all
+   * fell inside a few of the fold's slices; `foldAf3Async` collects them with a dry run
+   * (`collect`) and calls this first.
+   *
+   * 🔴 THE BATCHES ARE TIMED, NOT COUNTED, because the extension does not mean the same thing
+   * everywhere: Chrome links off the thread and starts all ~150 in one batch, while Safari 16.3
+   * offers the extension and still links inside `linkProgram` (up to 61 ms each) - started all at
+   * once there, they were one 3.1 s stall.
+   *
+   * @param {Iterable<string>} sources fragment sources
+   */
+  async prepare(sources) {
     const gl = this.gl;
-    const program = linkProgram(gl, source);
+    const parallel = gl.getExtension("KHR_parallel_shader_compile");
+    const nextTask = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
+    const pending = [];
+    let batchFrom = performance.now();
+    for (const source of new Set(sources)) {
+      if (this.programs.has(source)) continue;
+      pending.push([source, startProgram(gl, source)]);
+      if (performance.now() - batchFrom > 16) {
+        await nextTask(0);
+        batchFrom = performance.now();
+      }
+    }
+    if (parallel !== null) {
+      while (pending.some(([, { program }]) =>
+        !gl.getProgramParameter(program, parallel.COMPLETION_STATUS_KHR))) {
+        await nextTask(8);
+      }
+    }
+    // Without the extension the status is asked for one program a task (each waits for its link).
+    for (const [source, started] of pending) {
+      if (!this.programs.has(source)) this.#adopt(source, finishProgram(gl, started));
+      if (parallel === null) await nextTask(0);
+    }
+  }
+
+  /** A linked program into the cache, with its one attribute bound. */
+  #adopt(source, program) {
+    const gl = this.gl;
     // The attribute is bound once per program, into this execution's one VAO.
     gl.bindVertexArray(this.vao);
     gl.bindBuffer(gl.ARRAY_BUFFER, this.vertices);
@@ -597,6 +645,11 @@ export class Execution {
           throw new Error(`${label}: render target ${tensor.label} has been released`);
         }
       }
+    }
+    // A dry run (`collect` a Set): the program this draw needs, and no draw.
+    if (this.collect !== null) {
+      this.collect.add(source);
+      return output;
     }
     const enteredAt = this.host === null ? 0 : performance.now();
     const entry = this.program(source);

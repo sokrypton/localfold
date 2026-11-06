@@ -45,6 +45,7 @@
  * per-chain are the same array."
  */
 import { ONE_TARGET, PRELUDE } from "../../runtime/execution.js";
+import { drain } from "../../runtime/steps.js";
 import { add, relu, scale } from "../../runtime/elementwise.js";
 import { layerNorm } from "../../kernels/layer-norm.js";
 import { linear } from "../../kernels/linear.js";
@@ -246,6 +247,11 @@ export function releaseTemplateWeights(execution, weights) {
  *   gets ADDED - the caller adds it, because the stack read the pair before it
  */
 export function templateEmbedding(execution, call) {
+  return drain(templateEmbeddingSteps(execution, call));
+}
+
+/** `templateEmbedding` as a generator: yields after each template slot (its own pairformer blocks). */
+export function* templateEmbeddingSteps(execution, call) {
   const {
     pair, pairMask, tokens, templates, weights: w, codes, geometry,
     swapTransposedBias = false, divideByLength = false, epsilon = 1e-5,
@@ -326,6 +332,7 @@ export function templateEmbedding(execution, call) {
       execution.release(embedded);
       summed = next;
     }
+    yield { stage: "template", slot };
   }
   execution.release(queryTerm);
   if (summed === undefined) {

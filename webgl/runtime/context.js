@@ -86,6 +86,35 @@ export function linkProgram(gl, fragmentSource) {
 }
 
 /**
+ * `linkProgram` without asking how it went: compile and link are only REQUESTED, and asking for
+ * a status is what waits for them. With KHR_parallel_shader_compile the driver does them off the
+ * thread until `finishProgram` asks; see `Execution.prepare`.
+ */
+export function startProgram(gl, fragmentSource) {
+  const program = gl.createProgram();
+  const shaders = [[gl.VERTEX_SHADER, VERTEX_SHADER], [gl.FRAGMENT_SHADER, fragmentSource]]
+    .map(([type, source]) => {
+      const shader = gl.createShader(type);
+      gl.shaderSource(shader, source);
+      gl.compileShader(shader);
+      gl.attachShader(program, shader);
+      return shader;
+    });
+  gl.linkProgram(program);
+  return { program, shaders };
+}
+
+/** The status `startProgram` did not ask for; throws as `linkProgram` and `compile` would. */
+export function finishProgram(gl, { program, shaders }) {
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+    const logs = shaders.map((shader) => gl.getShaderInfoLog(shader)).filter(Boolean).join(" ");
+    throw new Error(`WebGL2 program failed to link: ${gl.getProgramInfoLog(program)} ${logs}`);
+  }
+  for (const shader of shaders) gl.deleteShader(shader);
+  return program;
+}
+
+/**
  * A WebGL2 context that can render to float textures, or an explanation.
  *
  * EXT_color_buffer_float is what makes an R32F or RGBA32F framebuffer legal to

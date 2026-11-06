@@ -62,7 +62,7 @@ import { binEdges, runTrunkSteps } from "../trunk/trunk.js";
 import { sampleOnWebGl2Steps } from "../diffusion/sampler.js";
 import { drain, drainAsync, gpuIdle } from "../../runtime/steps.js";
 import {
-  slotCodes, slotGeometry, templateEmbedding, uploadTemplateWeights,
+  slotCodes, slotGeometry, templateEmbeddingSteps, uploadTemplateWeights,
   releaseTemplateWeights,
 } from "../trunk/template.js";
 import { uploadPairformerBlockWeights, releasePairformerBlockWeights }
@@ -410,8 +410,38 @@ export function foldAf3(execution, call) {
  * @param {Execution} execution
  * @param {Parameters<typeof foldAf3>[1] & {signal?: AbortSignal}} call
  */
-export function foldAf3Async(execution, call) {
+export async function foldAf3Async(execution, call) {
+  await prepareFoldPrograms(execution, call);
   return drainAsync(foldAf3Steps(execution, call), () => gpuIdle(execution.gl), call.signal);
+}
+
+/**
+ * Every program this fold will draw with, compiled before it starts (`Execution.prepare`): a fold
+ * at a new size links ~150 programs, specialised to it, and they took 2.6 s of the thread on
+ * Safari 16.3 in stalls of up to a second. Found by a dry run of the same batch with no draws
+ * (`Execution.collect`), one block of each stack and one denoiser call, which reach every kernel.
+ */
+async function prepareFoldPrograms(execution, call) {
+  const { weights } = call;
+  const trimmed = {
+    ...weights,
+    msaBlocks: weights.msaBlocks.slice(0, 1),
+    pairformerBlocks: weights.pairformerBlocks.slice(0, 1),
+    ...(weights.confidence === undefined ? {}
+      : { confidence: { ...weights.confidence, blocks: weights.confidence.blocks.slice(0, 1) } }),
+  };
+  execution.collect = new Set();
+  let sources;
+  try {
+    await drainAsync(foldAf3Steps(execution, {
+      ...call, weights: trimmed, recycles: 0, steps: 1, readTrunk: false,
+      onStage: undefined, onStep: undefined,
+    }), () => new Promise((resolve) => { setTimeout(resolve, 0); }), call.signal);
+  } finally {
+    sources = execution.collect;
+    execution.collect = null;
+  }
+  await execution.prepare(sources);
 }
 
 /** `foldAf3` as a generator (see `foldAf3Async`): yields at each trunk block and denoiser call. */
@@ -536,7 +566,7 @@ export function* foldAf3Steps(execution, call) {
     // the slot mask, so a template-free fold still gets a pair update.
     let templateUpdate;
     if (weights.template !== undefined) {
-      templateUpdate = templateEmbedding(execution, {
+      templateUpdate = yield* templateEmbeddingSteps(execution, {
         pair: embedded.pair, pairMask: batchTensors.pairMask,
         tokens, templates, weights: weights.template, codes, geometry,
         swapTransposedBias: flags.swapTransposedBias,
