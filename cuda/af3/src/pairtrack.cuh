@@ -1812,33 +1812,15 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
       // k and v never written
       const bool f8 = D == 32 && (MASK_ALL_ONES || !mask) && fp8Attn();
       const size_t f8Row = f8 ? (size_t)3 * Wd : 0;          // (k8, v8 and the transposed v: bytes an element)
-      // 🔴 every row in one pass whenever the card has the room for it (what its buffers already hold
-      // counted, so every pass decides alike): whole is 3.3% of the trunk faster at 262 tokens and 4.8% at
-      // 1048 (465 against 481 ms, 7.82 against 8.20 s on an A100) for 1.13 GB the chunks do not hold - it
-      // was capped at a fixed 32nd of the card, which chunked from ~1,100 tokens on 40 GB with 25 GB free.
-      // The chunks only where the memory is short (LOCALFOLD_BIG=1 forces them, roomFor)
-      // (the room asked for includes the triangle multiplication's whole form, five planes, which these
-      // buffers would otherwise starve into its blocked form - see cuda/af2's twin)
-      size_t triPlane = (size_t)((n + 7) / 8 * 8) * ((n + 7) / 8 * 8);
-      if (!mg::splitting(pair) && lever("grid.whole", ((pairs + 128) * 4 * Wd + pairs * Wd) * 2 + pairs * f8Row + 5 * triPlane * C * 2,
-                  {"grid.qkvg", "grid.gathered", "grid.kv8", "attn.vt8", "tri.a", "tri.b", "tri.prod", "tri.norm", "tri.abf", "tri.bbf",
-                   "tri.pbf", "tri.t2whole"})) {
-        // every row in one pass (this card has the memory): the bias written by the same kernel
-        CK(cudaMemsetAsync(bias, 0, (size_t)heads * n * stride * 2, STREAM));    // the padding columns
-        half* qkvgOut = scratch<half>("grid.qkvg", (pairs + 128) * 4 * Wd);
-        uint8_t* kv8 = f8 ? scratch<uint8_t>("grid.kv8", pairs * 2 * Wd) : nullptr;
-        gridIn128(pair, pre, qkvg, qkvgOut, n, 0, pairs, tr, Wh(wb), bias, heads, stride, tr && swapBias, kv8, gateBias);
-        half* gathered = scratch<half>("grid.gathered", pairs * Wd);
-        if (f8) flash8Run(qkvgOut, kv8, kv8 + pairs * Wd, bias, stride, gathered, n, heads, n, scale, nullptr);
-        else flashGrid<half>(qkvgOut, bias, stride, MASK_ALL_ONES ? nullptr : mask, gathered, n, heads, D, 0, n, tr, scale);
-        // (a bf16 pair takes the output kernel in both directions, adding its f32 accumulators into the pair: the
-        // GEMM into f16 and an add pass - cuBLAS takes no f16-in, bf16-out GEMM - were 0.8% more of a 988-token trunk,
-        // and an f16 rounding more; 5CAJ with its alignment 0.009 A, 1BRS templated 0.008 A from that form)
-        if (!tr && !PAIR16 && !outBias) linear<half, float>(gathered, into(pair), pairs, Wd, C, pre + ".outputProjection", false, 1.f);
-        else gridOut128(gathered, pre + ".outputProjection", into(pair), n, 0, pairs, tr, outBias);
-        return;
-      }
-      if (shortPair("lean.grid", pairs, C)) {
+      // 🔴 THE BIAS IS MADE BY THE FIRST CHUNK'S PROJECTION, NOT A PASS OF ITS OWN: that kernel reads every pair once - its
+      // LN, the bias from it, and q, k, v and gate for the chunk's rows alone (gridInK's window) - so a fold whose rows
+      // fit one chunk runs exactly the old whole form (every row in one pass, the bias in the same kernel), and a larger
+      // one keeps that form's single read of the pair for the bias without its buffers for every row. The whole form
+      // was its own branch and lever (grid.whole): 1.6-2.0% of a fold at 256-1,536 tokens, and at 3,072 and 4,096 on a
+      // GH200 1.3% and 1.0% for 11 and 15 GB (and on a 40 GB A100 at 3,072 the 24 GB that crowded the card: 168 s
+      // against 117)
+      const bool lean = shortPair("lean.grid", pairs, C) || mg::splitting(pair);
+      if (lean) {
         // on a card short of room the 16-column projection in chunks of pairs, each laid into the bias
         size_t per = std::max<size_t>(1, std::min(pairs, CHUNK / 16));
         float* raw = scratch<float>("grid.raw16", per * 16);
@@ -1849,19 +1831,14 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
           biasFromRawRowsK<half><<<blocks((size_t)heads * r), 256, 0, STREAM>>>(raw, bias, r0, r, n, stride, heads,
                                                                               tr && swapBias, LOG2E);
         }
-      } else {
-      float* raw = scratch<float>("grid.raw16", pairs * 16);
-      lnHeads128<16>(pair, pre + ".actNormScale", pre + ".actNormOffset", wb, raw, pairs);
-      biasLayoutHeadMajorK<half><<<blocks((size_t)heads * n * stride), 256, 0, STREAM>>>(
-        raw, bias, n, stride, heads, tr && swapBias, LOG2E);
-      }
+      } else CK(cudaMemsetAsync(bias, 0, (size_t)heads * n * stride * 2, STREAM));    // (the padding columns)
       size_t R = std::max<size_t>(1, std::min<size_t>(n, CHUNK / ((size_t)n * 4 * Wd)));
       // as many rows a chunk (up to 256) as what is free allows, where 64M elements is ~18 rows at 6,916 tokens: 43,120
       // flash launches a trunk pass become 3,136, the grid attention 166.2 -> 163.2 s and gridInK 7.2 -> 6.3 of a 6,916-
       // token pass (LOCALFOLD_BIG=1 keeps the 64M-element chunks, so a small input still crosses chunk boundaries)
       if (!BIG_FORCED) {
         const size_t perRow = (size_t)n * (5 * Wd * 2 + f8Row);
-        size_t maxR = shortPair("lean.grid", pairs, C) ? 256 : std::max<size_t>(256, ((size_t)1 << 19) / std::max(n, 1));
+        size_t maxR = lean ? 256 : std::max<size_t>(256, ((size_t)1 << 19) / std::max(n, 1));
         R = std::max<size_t>(R, std::min<size_t>(n, leverRows("grid.rows", perRow, maxR, spareKept(cardBytes(), 16))));
       }
       int glo, ghi; mg::myShare(pair, n, 1, glo, ghi);          // (multi-GPU: this rank's rows or columns)
@@ -1869,14 +1846,18 @@ void gridAttention(float* pair, const float* mask, int n, int C, int heads, int 
         size_t rows = std::min(R, (size_t)ghi - r0), prs = rows * n;
         half* qkvgOut = scratch<half>("grid.qkvg", (std::min(R, (size_t)n) * n + 128) * 4 * Wd);   // padding: the last query block
         uint8_t* kv8 = f8 ? scratch<uint8_t>("grid.kv8", std::min(R, (size_t)n) * n * 2 * Wd) : nullptr;
-        gridIn128(pair, pre, qkvg, qkvgOut, n, r0 * n, prs, tr, nullptr, nullptr, 0, 0, false, kv8, gateBias);
+        if (!lean && r0 == (size_t)glo)     // (every pair's LN and bias, this chunk's q, k, v and gate)
+          gridIn128(pair, pre, qkvg, qkvgOut, n, 0, pairs, tr, Wh(wb), bias, heads, stride, tr && swapBias, kv8, gateBias,
+                    false, nullptr, r0 * n, r0 * n + prs);
+        else gridIn128(pair, pre, qkvg, qkvgOut, n, r0 * n, prs, tr, nullptr, nullptr, 0, 0, false, kv8, gateBias);
         half* gathered = scratch<half>("grid.gathered", std::min(R, (size_t)n) * n * Wd);
         if (f8) flash8Run(qkvgOut, kv8, kv8 + prs * Wd, bias, stride, gathered, n, heads, rows, scale, nullptr);
         else flashGrid<half>(qkvgOut, bias, stride, MASK_ALL_ONES ? nullptr : mask, gathered, n, heads, D, r0, rows, tr, scale);
         if (!tr && !PAIR16 && !outBias) linear<half, float>(gathered, into(pair) + r0 * n * C, prs, Wd, C, pre + ".outputProjection", false, 1.f);
         else gridOut128(gathered, pre + ".outputProjection", into(pair), n, r0 * n, prs, tr, outBias);
       }
-      releaseScratch({ "grid.qkvg", "grid.gathered", "grid.kv8", "attn.vt8" });   // (the next triangle's blocks size themselves by what is free)
+      // (on a card short of room given back: the next triangle's blocks size themselves by what is free)
+      if (lean) releaseScratch({ "grid.qkvg", "grid.gathered", "grid.kv8", "attn.vt8" });
       if (mg::splitting(pair)) mg::exchange(tr, n, C, PAIR16 ? 2 : 4, n, 1);
       return;
     }

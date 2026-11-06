@@ -130,21 +130,34 @@ inline const Calls& calls() {
   }();
   return c;
 }
-struct Buf { size_t span; std::vector<CUmemGenericAllocationHandle> held; };
+// 🔴 A BUFFER GIVEN BACK STAYS MAPPED until its pages are wanted: a stage on the short-of-room paths gives its buffers
+// back and the next pass asks for the same sizes again, and unmapped and mapped afresh each time the pages cost 10%
+// of a fold (1,024 tokens with 10.5 GiB of an A100 free: 11.45 s against the pool's 10.36). Kept, a buffer of the same
+// span comes back as it was; another size takes the idle pages first, then a kept buffer's (unmapped), then the card's
+struct Buf { size_t span; std::vector<CUmemGenericAllocationHandle> held; bool kept = false; };
 inline LF_TLS std::vector<CUmemGenericAllocationHandle> IDLE;     // pieces no buffer holds
 inline LF_TLS std::map<void*, Buf> BUFS;
-inline size_t idle() { return IDLE.size() * PAGE; }
-inline void trim() {     // (the idle pieces back to the card)
+inline LF_TLS std::multimap<size_t, void*> KEPT;                   // given back, still mapped: span -> address
+inline size_t idle() {
+  size_t kept = 0; for (auto& [span, p] : KEPT) kept += span;
+  return IDLE.size() * PAGE + kept;
+}
+inline void unmapKept(std::multimap<size_t, void*>::iterator k) {
+  auto it = BUFS.find(k->second);
+  const Calls& c = calls();
+  c.unmap((CUdeviceptr)k->second, it->second.span); c.addrFree((CUdeviceptr)k->second, it->second.span);
+  for (auto h : it->second.held) IDLE.push_back(h);
+  BUFS.erase(it); KEPT.erase(k);
+}
+inline void trim() {     // (every kept buffer unmapped, and the idle pieces back to the card)
+  if (!KEPT.empty() || !IDLE.empty()) ++MEM_GEN;
+  while (!KEPT.empty()) unmapKept(KEPT.begin());
   for (auto h : IDLE) calls().release(h);
-  if (!IDLE.empty()) ++MEM_GEN;
   IDLE.clear();
 }
 inline void giveBack(void* p) {    // (the caller has waited for the device: nothing reads it)
-  auto it = BUFS.find(p);
-  const Calls& c = calls();
-  c.unmap((CUdeviceptr)p, it->second.span); c.addrFree((CUdeviceptr)p, it->second.span);
-  for (auto h : it->second.held) IDLE.push_back(h);
-  BUFS.erase(it); ++MEM_GEN;
+  Buf& b = BUFS[p];
+  b.kept = true; KEPT.emplace(b.span, p); ++MEM_GEN;
 }
 // `bytes` as pages, or cudaErrorMemoryAllocation with nothing kept
 inline cudaError_t take(void** p, size_t bytes) {
@@ -153,11 +166,17 @@ inline cudaError_t take(void** p, size_t bytes) {
   CUmemAllocationProp prop{};
   prop.type = CU_MEM_ALLOCATION_TYPE_PINNED; prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
   int dev; CK(cudaGetDevice(&dev)); prop.location.id = dev;
+  auto same = KEPT.find(span);
+  if (same != KEPT.end()) {     // (one of this span, still mapped)
+    *p = same->second; BUFS[*p].kept = false; KEPT.erase(same); ++MEM_GEN;
+    return cudaSuccess;
+  }
   Buf b{span, {}};
   while (b.held.size() < n) {
     if (!IDLE.empty()) { b.held.push_back(IDLE.back()); IDLE.pop_back(); continue; }
     CUmemGenericAllocationHandle h;
     CUresult r = c.create(&h, PAGE, &prop, 0);
+    if (r == CUDA_ERROR_OUT_OF_MEMORY && !KEPT.empty()) { unmapKept(std::prev(KEPT.end())); continue; }   // (the largest kept one's)
     if (r == CUDA_ERROR_OUT_OF_MEMORY) { CK(lfDeviceSynchronize()); CK(cudaMemPoolTrimTo(scratchPool(), 0)); r = c.create(&h, PAGE, &prop, 0); }
     if (r != CUDA_SUCCESS) { for (auto k : b.held) IDLE.push_back(k); return cudaErrorMemoryAllocation; }
     b.held.push_back(h);
