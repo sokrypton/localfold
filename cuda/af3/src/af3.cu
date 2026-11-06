@@ -589,6 +589,7 @@ static int foldMain(int argc, char** argv) {
       return true;
     };
     ROOM_ANSWERED.clear();     // (a fold's own eager answers only: a resident server's last job asked on another card state)
+    bool recycledEagerly = false, graphRefused = false;     // (a capture is sized by an eager recycle pass before it)
     for (int pass = 0; pass <= lastPass; ++pass) {
       drawMsa(t);                   // (this pass's MSA rows, before - never inside - the captured graph)
       if (pass == 0) {
@@ -604,8 +605,10 @@ static int foldMain(int argc, char** argv) {
       // the ranks have a GPU each; a rank's kernels are an eighth as long, so the launches are a larger share)
       const bool shardGraph = sharded(t) && !noGraphs && !mg::SHARED_DEVICE;
       // (nor protenix's: its MSA's row count and its dropout's key change pass to pass, which a replayed graph would fix)
-      if (!(GRAPHS || shardGraph) || STAGES || !(lastPass >= 7 || t.n >= 200) || shortPair((size_t)t.n * t.n, t.C) || t.native || t.mcOn) {
-        recyclePass(); afterPass(pass); if (converged(pass)) break; continue;
+      if (!(GRAPHS || shardGraph) || STAGES || !(lastPass >= 7 || t.n >= 200) || shortPair((size_t)t.n * t.n, t.C) || t.native || t.mcOn ||
+          (!trunkGraph && (!recycledEagerly || graphRefused || (graphRefused = !sizeScratchForCapture())))) {
+        SCRATCH_ASKED.clear();
+        recyclePass(); recycledEagerly = true; afterPass(pass); if (converged(pass)) break; continue;
       }
       if (!trunkGraph) {
         cudaGraph_t g;

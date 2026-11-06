@@ -1309,6 +1309,9 @@ inline std::string heldAs(const std::string& name) {
   return it == SHARED_SLOT.end() ? name : "slot." + std::to_string(it->second);
 }
 inline void releaseScratch(std::initializer_list<const char*> names) {
+  // (inside a capture nothing is given back: what it releases it could not make again - sizeScratchForCapture)
+  cudaStreamCaptureStatus capturing; CK(cudaStreamIsCapturing(STREAM, &capturing));
+  if (capturing != cudaStreamCaptureStatusNone) return;
   bool synced = false;
   std::set<std::string> slots, kept;
   for (auto& [name, k] : SHARED_SLOT) {
@@ -1418,8 +1421,12 @@ inline bool fp8Tensor() {
   }();
   return on;
 }
+// The most each scratch buffer (a shared slot by its slot) has been asked for since the fold's trunk began - what a
+// recycle pass captured after those passes must find already there (sizeScratchForCapture)
+inline LF_TLS std::map<std::string, size_t> SCRATCH_ASKED;
 // (fatal false: a refusal returns null and leaves the slot empty, for a caller that can ask for less)
 template <class T> T* scratchNamed(const std::string& name, size_t n, bool fatal = true) {
+  { size_t& most = SCRATCH_ASKED[name]; most = std::max(most, std::max<size_t>(n, 1) * sizeof(T)); }
   auto& [p, have] = SCRATCH[name];
   if (have < n * sizeof(T)) {
     // (from the pool, stream-ordered - and freed only after the device is idle, as cudaFree was: the frame tap's
@@ -1529,6 +1536,22 @@ inline void zeroPlanePad(half* x, int L, int Lp, int C) {
   const size_t e = sizeof(half);
   CK(cudaMemset2DAsync(x + L, (size_t)Lp * e, 0, (size_t)(Lp - L) * e, (size_t)C * Lp, STREAM));                // columns
   CK(cudaMemset2DAsync(x + (size_t)L * Lp, (size_t)Lp * Lp * e, 0, (size_t)(Lp - L) * Lp * e, (size_t)C, STREAM)); // rows
+}
+// 🔴 Before a recycle pass is captured: every buffer the last eager recycle pass asked for, held at the most it asked of
+// it (SCRATCH_ASKED, cleared before that pass) - a capture can neither grow nor make one. Where a stage gives its
+// buffers back mid-pass (the grid attention's chunks, on a card with room for the ordinary paths but not their whole
+// forms) a shared slot was freed and re-grown smaller by the next family to take it, so the pass ended holding
+// p16.tmp's slot at tr.wide's 1.5 MB chunk and the capture's first ask for 33.5 MB killed a 256-token fold with
+// 5.8-7.7 GiB of a 40 GB A100 free, where 5.1 GiB (every big-input path) and 8.9 (the whole forms) both folded; and
+// a private one given back inside the capture could not be made again. False where the card cannot hold them all at
+// once: the passes run eagerly, giving back as they go
+inline bool sizeScratchForCapture() {
+  for (auto& [name, most] : SCRATCH_ASKED) {
+    auto it = SCRATCH.find(name);
+    if (it != SCRATCH.end() && it->second.second >= most) continue;
+    if (!scratchNamed<char>(name, most, false)) return false;
+  }
+  return true;
 }
 template <class T> T* scratch(const std::string& name, size_t n, bool fatal = true) {
   const char* family = sharedFamily(name, n * sizeof(T));
