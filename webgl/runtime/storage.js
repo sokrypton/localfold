@@ -559,6 +559,12 @@ export class Storage {
   }
 
   release(tensor) {
+    // 🔴 A DRY RUN MUST NOT FREE A REAL TEXTURE. Everything it allocates is virtual, so the only
+    // tensors with a texture while `virtual` are the ones that existed BEFORE it - the weights and
+    // the features - and a fold that releases one of its inputs at the end would delete it out
+    // from under the real fold that follows. Its own virtual tensors are released as ever, or the
+    // dry run ends with every tensor it ever named still live.
+    if (this.virtual && tensor.texture !== null) return;
     if (!this.live.delete(tensor)) return;
     if (tensor.texture === null) return;
     this.bytes -= tensor.bytes;

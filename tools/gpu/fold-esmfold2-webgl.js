@@ -264,9 +264,7 @@ export async function main(device, args) {
   const uploadMs = Math.round(performance.now() - uploadStart);
   const weightMegabytes = Number((execution.stats().bytes / (1 << 20)).toFixed(1));
 
-  const stages = [];
-  const foldStart = performance.now();
-  const result = foldEsmfold2(execution, {
+  const call = {
     features,
     shape: {
       pairChannels: M.pairChannels, singleInputs: M.singleInputs,
@@ -289,6 +287,21 @@ export async function main(device, args) {
     towerBlocks,
     weights,
     loops, steps, seed,
+  };
+  // 🔴 THE PROGRAMS FIRST, TOGETHER: a dry run on virtual tensors says which this fold draws
+  // with, `prepare` packs the light ones into combined programs and links them off the thread.
+  // A link is ~40 ms on this M2's Chrome whatever the program holds, so 82 programs were 3.3 s
+  // of a 5.7 s first fold and nearly all of it was the per-program cost. `--no-combine` is the
+  // control arm; `probe-webgl-programs.js --cold` is how it is measured, because the driver
+  // answers a repeated shader out of a cache the fresh Chrome profile does not own.
+  const prepareStart = performance.now();
+  await execution.prepare(
+    (await execution.collectPrograms(() => foldEsmfold2(execution, call))).keys());
+  const prepareMs = Math.round(performance.now() - prepareStart);
+  const stages = [];
+  const foldStart = performance.now();
+  const result = foldEsmfold2(execution, {
+    ...call,
     onStage: (name, detail) => stages.push({
       name, ...detail, at: Math.round(performance.now() - foldStart),
     }),
@@ -335,7 +348,7 @@ export async function main(device, args) {
       fullTower: towerBlocks >= towerManifest.layers,
       fullTrunk: trunk.length >= M.blocks,
     },
-    milliseconds: { load: loadMs, upload: uploadMs, fold: foldMs },
+    milliseconds: { load: loadMs, upload: uploadMs, prepare: prepareMs, fold: foldMs },
     weightMegabytes,
     caSpacing: spacings.length === 0 ? null : {
       median: Number(median.toFixed(3)),

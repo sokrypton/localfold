@@ -11,9 +11,9 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-535 tools. `tools/fixtures/` is data and is not listed.
+540 tools. `tools/fixtures/` is data and is not listed.
 
-## `tools/gpu/` - the WebGPU lane (290)
+## `tools/gpu/` - the WebGPU lane (295)
 
 Each exports `async function main(device, args)` and is run as
 `node tools/gpu-chrome.mjs tools/gpu/<module>.js [--flags]`.
@@ -89,6 +89,7 @@ Each exports `async function main(device, args)` and is run as
 - **`check-af3-transition.js`** - AF3's transition block: GPU against cpu/af3/trunk/pairformer.js.
 - **`check-af3-triangle.js`** - AF3 triangle multiplication: GPU against cpu/af3/trunk/pairformer.js.
 - **`check-af3-trunk.js`** - AF3's whole trunk on the GPU, against cpu/af3/trunk/trunk.js.
+- **`check-af3-webgl-page.js`** - The page's fold (web/af3-model.js `foldAf3`) on its WebGL2 backend against its WebGPU one: the same sequence, seed and schedule through `backend: "webgl2"` and through `foldBatch`, compared on what a refold reports - Cα RMSD between the two structures, mean pLDDT, pTM, ipTM and per-chain pTM - with the local bundle (no download).
 - **`check-attention-packing.js`** - What does packing the attention KEY cost, and what does packing the VALUE?
 - **`check-attention-project-matrix.js`** - Does AF2's matrix q/k/v/gate projection compute the vector one's answer?
 - **`check-attention-variants.js`** - Every flash-attention variant against the same input, on this device.
@@ -192,11 +193,6 @@ Each exports `async function main(device, args)` and is run as
 - **`check-webgl-sidechain.js`** - The sidechain torsion head against the WGSL one.
 - **`check-webgl-structure-initialize.js`** - The structure module's starting point, against the WGSL one.
 - **`check-webgl-structure-iteration.js`** - One structure-module iteration against the WGSL one - and the frame update is the point of it.
-- **`probe-webgl-uber.js`** - Do several small kernels as one program (chosen by a uniform) link faster than as separate programs? Safari 16.3: 8 separate 158-185 ms, one combined 26-33 ms.
-- **`probe-webgl-upload-compile.js`** - Can the WebGL2 AF3 fold's compile hide behind its weight upload? Safari 16.3: no (0.11 s of 1.37 hidden; both are the page thread's).
-- **`probe-webgl-compile.js`** - What the WebGL2 AF3 fold's shader compile costs, program by program (slowest first, by family, grouped by the slice that first needs them), and how many programs would remain with every width a uniform. Runs in Chrome and, through a page calling `main`, in Safari.
-- **`probe-webgl-af3-programs.js`** - Which of the WebGL2 AF3 fold's programs depend on the sequence length (each one a page compiles again per new length): a dry run at several lengths, the differing kernels by name.
-- **`check-af3-webgl-page.js`** - The page's fold (web/af3-model.js `foldAf3`) with `backend: "webgl2"` against its WebGPU one: Cα RMSD, pLDDT, pTM, ipTM, per-chain pTM, PAE.
 - **`check-webgl-structure-module.js`** - AF2's whole structure module in WebGL2 against the WGSL one.
 - **`check-webgl-template.js`** - AF2-monomer's template stack in WebGL2 against the WGSL one.
 - **`check-webgl-transition.js`** - The transition in WebGL2 against the WGSL one and a CPU reference.
@@ -287,7 +283,9 @@ Each exports `async function main(device, args)` and is run as
 - **`probe-upload-path.js`** - How fast can host bytes reach a STORAGE buffer on this device, and by which route?
 - **`probe-warm.js`** - What the sampler's first call is made of, and how much of it a warm covers.
 - **`probe-webgl-2d-weight.js`** - Whether a tensor's TEXTURE SHAPE is what the projections have been waiting for: one matrix row per texture row, against this tree's linear index.
+- **`probe-webgl-af3-programs.js`** - Which of the WebGL2 AF3 fold's programs depend on the sequence length: the programs a fold draws with (`foldPrograms`, a dry run, no draws) at several lengths, and the kernels whose source differs between them - each of which a page compiles again for every new length.
 - **`probe-webgl-column-layout.js`** - Which activation order, and which OUTPUT order, does the WGSL attention block use when `transpose` is set?
+- **`probe-webgl-compile.js`** - What the WebGL2 AF3 fold's shader compile costs, program by program: the programs a fold at `--length` draws with (`foldPrograms`, a dry run), each compiled and linked on its own and timed, slowest first, with the dry run's own time. Runs under tools/gpu-chrome.mjs and, through a page that calls `main(null, args)`, in Safari.
 - **`probe-webgl-draw-floor.js`** - What a draw costs before it computes anything, and what that is worth over a whole fold.
 - **`probe-webgl-feedback-gemm.js`** - A GEMM in a VERTEX shader through transform feedback, against the same GEMM in a fragment shader - because the output budget is what binds this backend.
 - **`probe-webgl-fetch-rate.js`** - What `fetch4` RATE does this device give a fragment of a given shape?
@@ -295,7 +293,9 @@ Each exports `async function main(device, args)` and is run as
 - **`probe-webgl-limits.js`** - The WebGL2 limits that decide what shape a kernel in this backend can be.
 - **`probe-webgl-linear-operand.js`** - Which OPERAND binds the WebGL2 dense projection - x, or the weight codes?
 - **`probe-webgl-precision.js`** - Does `mediump` reach this device's HALF arithmetic, and is it faster?
+- **`probe-webgl-uber.js`** - Does one program holding several small kernels (an "uber-shader", the kernel chosen by a uniform) link faster than the kernels as separate programs? Safari 16.3 links each program in ~19 ms on the page's thread whatever its size, so it would if that cost is per program. Small elementwise kernels in the fold's own style, linked both ways in fresh contexts.
 - **`probe-webgl-uniform-reads.js`** - Is a UNIFORM BLOCK read cheaper than a `texelFetch` on this device?
+- **`probe-webgl-upload-compile.js`** - Can the WebGL2 AF3 fold's shader compile hide behind its weight upload? The programs found by a dry run on a VIRTUAL upload (shapes, no textures - so before any real upload), then: the real upload alone; the real upload with those programs compiled between its pieces (each piece's GPU wait); and the programs alone. Hidden means upload-with-compile < upload + compile.
 - **`probe-webgl2-limits.js`** - The WebGL2 limits that bound a GPGPU kernel, including the ones a fragment shader does not have but transform feedback might.
 - **`probe-webgl2-tf.js`** - The smallest transform feedback that works, and where the error comes from.
 - **`probe-webgl2.js`** - What WebGL2 exposes on this device, and whether any of it is compute.

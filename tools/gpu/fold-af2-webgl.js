@@ -152,10 +152,18 @@ export async function main(device, args) {
   const uploaded = uploadAf2Weights(execution, weights, graph);
   const uploadMs = Math.round(performance.now() - uploadStart);
   const weightMegabytes = Number((execution.stats().bytes / (1 << 20)).toFixed(1));
+  // 🔴 THE PROGRAMS FIRST, TOGETHER. A dry run on virtual tensors (no textures, no draws) says
+  // which programs this fold draws with; `prepare` packs the light ones into combined programs
+  // (`Execution.combine`) and links them off the thread. Measured cold - `probe-webgl-programs.js
+  // --cold`, because a repeated shader comes back out of the driver's own cache - 53 programs were
+  // 2.2 s of a 4.4 s first fold, and a link costs ~40 ms whatever it holds. `--no-combine` is the
+  // control arm.
+  const call = { featuresByRecycle: features, weights: uploaded, paeBreaks, graph };
+  const prepareStart = performance.now();
+  await execution.prepare((await execution.collectPrograms(() => foldAf2(execution, call))).keys());
+  const prepareMs = Math.round(performance.now() - prepareStart);
   const foldStart = performance.now();
-  const ours = await foldAf2(execution, {
-    featuresByRecycle: features, weights: uploaded, paeBreaks, graph,
-  });
+  const ours = await foldAf2(execution, call);
   const webglMs = Math.round(performance.now() - foldStart);
   const profile = webglProfile(execution, args ?? []);
   const memory = execution.stats();
@@ -307,7 +315,8 @@ export async function main(device, args) {
         ? "absent from this checkpoint" : "the monomer stack, hoisted out of the loop"),
     distogramHead: distogramHead === null ? "absent from this bundle" : "present",
     recycles, passesRun: ours.recycles.length, seed,
-    milliseconds: { weightLoad: loadMs, weightUpload: uploadMs, webgl: webglMs, webgpu: webgpuMs },
+    milliseconds: { weightLoad: loadMs, weightUpload: uploadMs, prepare: prepareMs,
+                    webgl: webglMs, webgpu: webgpuMs },
     weightMegabytes,
     meanPlddt: round(ours.final.confidence.meanPlddt, 3),
     caca: { median: round(median, 3), worst: round(worst, 2), ok: chainOk },

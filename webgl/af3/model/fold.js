@@ -448,7 +448,7 @@ export async function foldAf3Async(execution, call) {
  * first fold links ~100 programs, ~20 ms each on Safari 16.3 on the page's thread; the kernels
  * take their lengths as uniforms (`sized`), so a later fold at another length finds them compiled.
  */
-async function prepareFoldPrograms(execution, call) {
+export async function prepareFoldPrograms(execution, call) {
   // ...on the first fold with these weights only: the programs serve every length, so a later
   // fold finds them compiled and the dry run (0.2-0.35 s) would find nothing; the odd kernel a
   // size threshold brings in is compiled at its draw.

@@ -812,7 +812,76 @@ SUSPECT.** Compilation looked like the answer precisely because the draw-doublin
 the GPU was 2%; once `--skip-draws` put the draws at 97%, 59 fewer compiles was below noise. It is
 where the SMALL models' time is, though: **1122 ms of an AF2 fold's 1400 is its 120 programs**, so
 a first fold there is a compile queue and nothing else - the same thing docs/PERF.md records of the
-WGSL side.
+WGSL side. 🔴 **READ THAT `programMs` AS A FIRST VISIT AND NOT AS A PROPERTY OF THE FOLD**: the same
+measurement on a machine that has built those shaders before is 70 ms, for the reason the next
+section opens with.
+
+### Four models' worth of programs, and what a link costs
+
+🔴 **EVERY COMPILE NUMBER IN THIS FILE TAKEN AFTER THE FIRST RUN OF A SHADER ON THIS MACHINE IS A
+RETURNING VISITOR'S, AND THAT IS A FACTOR OF THIRTY.** An AF2 WebGL fold compiled its 53 programs
+in **1507 ms** the first time those shaders had ever been built here and in **70 ms** on every run
+after - through a FRESH Chrome profile each time, because `gpu-chrome.mjs` makes one per run and
+throws it away. Metal keeps its compiled shaders per USER, outside that profile, so the profile
+wipe this repository relies on to measure a first visit does not reach the thing that matters.
+`tools/gpu/probe-webgl-programs.js --cold` is the honest number: it salts every shader text so no
+cache can answer. 🔴 **AND THE SALT HAS TO BE SEMANTIC** - the first version prepended a COMMENT
+and measured exactly the warm number, because ANGLE translates GLSL to MSL and a comment does not
+survive the translator. A `discard` guarded by a unique constant against `gl_FragCoord.x` does, and
+never runs. `probe-webgl-uber.js` had the same hole: its salts were `rep * 0.001`, so its second
+run asked for shaders its first run had built - 20 kernels in one program read **50 ms on the first
+run of the probe and 2 ms on the next**, with nothing changed.
+
+**A link costs ~41 ms a program on this M2's Chrome, and almost nothing extra for what is in it.**
+Cold, through `probe-webgl-uber.js`: 4 small kernels as 4 programs are 151 ms and as one program
+41; 8 are 306 and 43; **20 are 762 and 51**. So the shader cost of a first fold is the program
+COUNT times a constant, which is the same shape Safari 16.3 shows at ~19 ms a link - and it is why
+the lever is combining kernels rather than shortening them.
+
+**So every model's light kernels now share programs, and every fold tool asks for them up front.**
+Two mechanisms, both already here for AF3: a dry run on virtual tensors says which programs a fold
+draws with (`Execution.collectPrograms`: no textures, no draws, reads are zeros), and
+`Execution.prepare` combines the parts among them (`Execution.combine`) and links what is left.
+Measured cold, with the fold's programs linked ONE AT A TIME in a fresh context - which is what a
+browser that links on its own thread pays, and what Chrome's `KHR_parallel_shader_compile` hides:
+
+| fold | programs | linked one at a time | | and combined | |
+|---|---:|---:|---:|---:|---:|
+| AlphaFold 2 monomer, 59 residues | 53 | 2177 ms | | **36** / **1557 ms** | 1.40x |
+| AlphaFold 3 / OpenBind-0, 59 tokens | 83 | 3325 ms | | **41** / **1798 ms** | 1.85x |
+| ESMFold2, 59 residues | 82 | 3247 ms | | **23** / **1023 ms** | 3.17x |
+| bioemu2, 68 tokens | 114 | 4866 ms | | **27** / **1429 ms** | 3.40x |
+
+Nothing any of them computes moves: AF2's worst atom against the WGSL fold is **0.0353 A** either
+way (its own dither floor is 0.0308), AF3 is pLDDT **66.525**, ESMFold2 **83.632** with identical
+CA spacings, and a whole 20-step bioemu2 fold is **rmsd 1.595, TM 0.9083, 201 contacts** to every
+digit printed. `--no-combine` is the control arm in all four.
+
+🔴 **AND THE BLOCKER WAS ONE LINE OF GLSL IN 106 KERNELS OF 135, NOT THE SHAPE OF `part`.** Written
+as a part a kernel can share a program; this tree has ~150 kernels and seven of them were parts, so
+the round looked like 150 hand conversions. Classified over a cold AF2 and ESMFold2 fold, what
+actually stood in the way was a module-scope `const int` - the WIDTHS that `sized` deliberately
+leaves as constants so a loop over the channels keeps its compile-time bound - in 37 of AF2's 53
+programs and 69 of ESMFold2's 82. Two parts cannot both declare `const int CH4` at module scope,
+and a const INSIDE a function is still a compile-time constant and still unrolls the loop. So
+`partFromSource` reads a finished kernel back as a part and moves its consts into the body, **and
+not one kernel was rewritten**. What it still refuses, by design: a kernel that declares a HELPER
+(parts share one namespace, so the name would have to be mangled), one with SEVERAL render targets
+(a part writes `result` - this is what keeps the heavy projections and attentions out), and one
+whose uniform array is sized by its own const.
+
+🔴 **AND ON CHROME COMBINING IS A LOSS FOR ONE OF THE FOUR, WHICH IS THE PARALLEL COMPILE AND NOT A
+CONTRADICTION.** `prepare` starts every link at once, and with `KHR_parallel_shader_compile` Chrome
+runs them off the thread: AF2's 53 programs come back in **519 ms**, under 10 ms each, and its 36
+combined ones take **1226**, because merging reduces the parallelism and lengthens the longest job.
+ESMFold2 goes the other way (719 ms to 275) and bioemu2 and AF3 improve as well. The serial column
+above is the one this backend is for - a visitor on Chrome has WebGPU, and the browsers that bring
+anyone here link inside `linkProgram` on the page's thread, which is where a 3.4x shows up as a tab
+that does not freeze. Two arms were measured and rejected: `--combine-bytes=<n>`, a cap on how much
+GLSL one program may hold, because AF2's compile rises monotonically with every cap swept (514 ms
+at 53 programs, 739 at 38, 968 at 37, 1223 at 36) while ESMFold2 is best with no cap at all; and
+`--combine-no-loops`, which leaves the looping kernels out, because it is worse serially in both
+(AF2 1758 ms against 1557, ESMFold2 1443 against 1023).
 
 **`getError` after every draw is a synchronous round trip** - 4% of an AF2 fold - and
 `checkFramebufferStatus` per dispatch is another. A framebuffer per attachment SET, bound rather

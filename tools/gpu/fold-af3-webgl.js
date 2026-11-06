@@ -34,7 +34,7 @@ import { foldWeights } from "../../shared/af3/weights/diffusion-weights.js";
 import { webglExecution } from "./webgl-execution-options.js";
 import { createWebGL2Context } from "../../webgl/index.js";
 import {
-  foldAf3, releaseAf3Weights, SAMPLER_DEFAULTS, uploadAf3Weights,
+  foldAf3, prepareFoldPrograms, releaseAf3Weights, SAMPLER_DEFAULTS, uploadAf3Weights,
 } from "../../webgl/af3/model/fold.js";
 import { DIFFUSION_DEFAULTS, foldBatch } from "../../webgpu/af3/fold.js";
 import { relativeRms } from "./relative-rms.js";
@@ -119,9 +119,7 @@ export async function main(device, args) {
   const uploadMs = Math.round(performance.now() - uploadStart);
   const weightMegabytes = Number((execution.stats().bytes / (1 << 20)).toFixed(1));
 
-  const stages = [];
-  const foldStart = performance.now();
-  const result = foldAf3(execution, {
+  const call = {
     batch, weights: uploaded, hostWeights: weights,
     msa: {
       codes: Float32Array.from(batch.msa),
@@ -132,6 +130,18 @@ export async function main(device, args) {
     recycles, steps: trunkOnly ? 0 : steps, seed, templates,
     readTrunk: reference,
     ...(hoist ? {} : { hoistPairConditioning: false }),
+  };
+  // 🔴 THE PROGRAMS FIRST, AS THE PAGE DOES THEM. `foldAf3Async` prepares and combines; `foldAf3`
+  // is the straight-through version the tools call, so without this a tool measured a path no
+  // visitor takes - 83 programs where the page links 23. Every group here, since a tool has no
+  // GPU waits to spread the rest over.
+  const prepareStart = performance.now();
+  await execution.prepare((await prepareFoldPrograms(execution, call)).flat());
+  const prepareMs = Math.round(performance.now() - prepareStart);
+  const stages = [];
+  const foldStart = performance.now();
+  const result = foldAf3(execution, {
+    ...call,
     onStage: (name, detail) => stages.push({
       name, ...detail, at: Math.round(performance.now() - foldStart),
     }),
@@ -321,7 +331,7 @@ export async function main(device, args) {
     dialect: Object.fromEntries(
       Object.entries(dialect).filter(([, value]) => value === true)),
     milliseconds: {
-      load: loadMs, upload: uploadMs, fold: foldMs,
+      load: loadMs, upload: uploadMs, prepare: prepareMs, fold: foldMs,
       ...(referenceMs === null ? {} : { reference: referenceMs }),
     },
     againstWgsl: coordinates,

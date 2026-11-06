@@ -107,15 +107,27 @@ export async function main(device, args) {
   // fold goes 0.0353 A to 0.0904 - past that comparison's own 0.0355 A dither
   // floor. `--no-narrow-aligned-x` is the arm.
   const execution = webglExecution(gl, args ?? [], { narrowAlignedX: true, narrowUnblockedX: true });
-  const t1 = performance.now();
-  const result = await foldBioemu2OnWebGl2(execution, read, features, {
+  const settings = {
     steps: Number(option(args, "steps", "20")),
     samples: Number(option(args, "samples", "1")),
     seed: Number(option(args, "seed", "1")),
     passes: Number(option(args, "passes", "4")),
     mixerBlocks: Number(option(args, "mixer-blocks", "48")),
     mode,
-  });
+  };
+  // 🔴 THE PROGRAMS FIRST, TOGETHER. A dry run on virtual tensors - no textures, no draws - says
+  // which programs this fold draws with, and `prepare` packs the light ones into combined ones
+  // (`Execution.combine`) and links them. On a browser that links on its own thread it is ~41 ms
+  // a program whatever the program holds, and this fold wanted 114 of them. `--no-combine` is the
+  // control arm, and `probe-webgl-programs.js --cold --no-serial` is how both are measured.
+  const prepareStart = performance.now();
+  await execution.prepare((await execution.collectPrograms(
+    // Two steps and one sample: the fewest the sampler takes, and every program a longer
+    // schedule draws with (a step is the same slice again).
+    () => foldBioemu2OnWebGl2(execution, read, features, { ...settings, steps: 2, samples: 1 }))).keys());
+  const prepareMs = Math.round(performance.now() - prepareStart);
+  const t1 = performance.now();
+  const result = await foldBioemu2OnWebGl2(execution, read, features, settings);
   const foldMs = Math.round(performance.now() - t1);
 
   const conformers = await (await fetch("/tools/oracle/reference-conformers.json")).json();
@@ -162,7 +174,7 @@ export async function main(device, args) {
     steps: Number(option(args, "steps", "20")),
     samples: result.samples.length,
     denoiserCalls: result.calls,
-    ms: { featurise: featuriseMs, fold: foldMs },
+    ms: { featurise: featuriseMs, prepare: prepareMs, fold: foldMs },
     stages: result.stages,
     peakMiB: result.peakMiB,
     perSample: scored.map((s) => ({

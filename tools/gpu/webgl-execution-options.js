@@ -124,6 +124,13 @@
  *   --no-attend-dot4      bioemu2's two attentions walking their head
  *                         dimension with one fetch1 a channel, twice over -
  *                         four times the texelFetch for the same numbers.
+ *   --no-combine          Every kernel its own program, where a fold packs the
+ *                         light ones into combined programs (`Execution.combine`).
+ *                         A link costs ~40 ms on this M2's Chrome whatever the
+ *                         program holds, so this is the arm that prices them.
+ *   --combine-bytes=<n>   How much GLSL one combined program may hold; 0 is no
+ *                         cap. What a bin costs is its CONTENT, not the kernels
+ *                         in it - see `Execution.combineBytes`.
  *   --no-pair-bias-fast   bioemu2's pair bias recomputing its LayerNorm
  *                         statistics once per HEAD, and reading every operand
  *                         through fetch1 - 3584 texelFetch a fragment against
@@ -259,6 +266,9 @@ export function webglExecutionOptions(args, defaults = {}) {
     linearBlockRows: Number(option(args, "block-rows", "0")),
     noPairBiasFast: flag(args, "no-pair-bias-fast"),
     noAttendDot4: flag(args, "no-attend-dot4"),
+    noCombine: flag(args, "no-combine"),
+    combineBytes: Number(option(args, "combine-bytes", "0")),
+    combineNoLoops: flag(args, "combine-no-loops"),
     poolLabelPattern: pattern("pool-labels"),
     profile: flag(args, "profile") ? new Map() : null,
   };

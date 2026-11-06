@@ -155,6 +155,66 @@ export function assembleParts(pieces) {
     + `\nvoid main() {\n${pieces.map((_, index) => `  ${index ? "else " : ""}if (KERNEL == ${index}) kernel${index}();`).join("\n")}\n}`;
 }
 
+/** The PRELUDE without its `#version` line, which is where `sized` injects its uniforms. */
+const PRELUDE_BODY = PRELUDE.slice(PRELUDE.indexOf("\n") + 1);
+
+/**
+ * The same kernel as a PART, read off a finished source - or null if it cannot be one.
+ *
+ * 🔴 BECAUSE THE BLOCKER WAS ONE LINE OF GLSL IN 106 KERNELS OF 135, NOT THE SHAPE OF `part`.
+ * Classified over a cold AF2 and ESMFold2 fold, every kernel between the PRELUDE and its
+ * `void main` is uniform declarations, a single `result` target and `const int` WIDTHS - and the
+ * widths are what `sized` deliberately leaves as constants so a loop over the channels keeps its
+ * compile-time bound. Two parts cannot both declare `const int CH4` at module scope with
+ * different values, but a const INSIDE a function is still a compile-time constant and still
+ * unrolls the loop, so they move into the body and the collision is gone. Nothing is rewritten
+ * by hand and no kernel loses a bound.
+ *
+ * Refused, by design rather than as a limitation: a kernel that declares a HELPER FUNCTION (parts
+ * share one namespace, so its name would have to be mangled), one with SEVERAL render targets
+ * (a part writes `result`), and one whose uniform array is sized by its own const (moving the
+ * const would move it out of scope).
+ *
+ * @param {string} code a finished fragment source built on PRELUDE
+ * @returns {{sizes: string[], uniforms: string[], helpers: string, body: string} | null}
+ */
+export function partFromSource(code, { loops = true } = {}) {
+  const mainAt = code.indexOf("void main()");
+  if (mainAt < 0 || !code.includes(PRELUDE_BODY)) return null;
+  const head = code.slice(0, mainAt).replace(/^#version[^\n]*\n/, "").replace(PRELUDE_BODY, "")
+    // GLSL has no strings, so comments can go before anything else is read.
+    .replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
+  // A brace in the declarations is a function body or a struct, which this cannot namespace.
+  if (/[{}]/.test(head)) return null;
+  const uniforms = [];
+  const constants = [];
+  let targets = 0;
+  for (const statement of head.split(";").map((part_) => part_.trim()).filter(Boolean)) {
+    if (statement === "out vec4 result") targets += 1;
+    else if (statement.startsWith("uniform ")) uniforms.push(statement.slice("uniform ".length));
+    else if (statement.startsWith("const ")) constants.push(`  ${statement};`);
+    else return null;
+  }
+  if (targets !== 1) return null;
+  // A uniform whose array length is one of those constants would lose it: `uniform float t[N]`.
+  const names = constants.map((statement) => statement.match(/const\s+\S+\s+(\w+)/)?.[1]);
+  if (uniforms.some((uniform) => names.some((name) => name !== undefined
+    && new RegExp(`\\b${name}\\b`).test(uniform)))) return null;
+  // 🔴 AND A KERNEL THAT LOOPS IS LEFT ALONE, MEASURED. A link's fixed cost is ~40 ms on this
+  // M2's Chrome whatever the program holds, so merging ought to be free - and AF2's compile went
+  // 514 ms to 1223 as its 53 programs became 36 while ESMFold2's went 719 to 275 as its 82 became
+  // 23. The difference is what is in them: AF2's partable kernels are loops over channel counts
+  // that the compiler UNROLLS, and a dozen unrolled bodies in one program cost the driver more
+  // than a dozen programs. ESMFold2's are elementwise. A byte cap does not separate them (AF2's
+  // compile rises monotonically with every cap swept); a `for` does.
+  if (!loops && /\bfor\s*\(/.test(code.slice(mainAt))) return null;
+  const opens = code.indexOf("{", mainAt);
+  const closes = code.lastIndexOf("}");
+  if (opens < 0 || closes < opens) return null;
+  return { sizes: [], uniforms, helpers: "",
+           body: `${constants.join("\n")}\n${code.slice(opens + 1, closes)}` };
+}
+
 /** `count` render targets named result0..result{count-1}, for a wide kernel. */
 export const targetDeclarations = (count) => Array.from(
   { length: count }, (_, t) => `layout(location = ${t}) out vec4 result${t};`).join("\n") + "\n";
@@ -324,6 +384,25 @@ export class Execution {
      */
     this.noAttendDot4 = options.noAttendDot4 ?? false;
     /**
+     * The control arm for the combined programs (`combine`, `part`, `partFromSource`): every
+     * kernel its own program, as this backend did before it had any. A link costs ~40 ms on this
+     * M2's Chrome whatever the program holds, so what it measures is the SIZE of that win and
+     * whether sharing one program cost the draws anything.
+     */
+    this.noCombine = options.noCombine ?? false;
+    /**
+     * How much GLSL one combined program may hold, in characters.
+     *
+     * 🔴 BECAUSE A BIN IS NOT FREE TO FILL: on this M2's Chrome 53 AF2 programs link in 519 ms
+     * and the same kernels in 36 programs take 1226, where ESMFold2's 82 in 5 bins go 719 to 274.
+     * The fixed cost of a link is ~40 ms either way; what differs is the CONTENT, and a bin that
+     * merges a dozen loop-heavy kernels costs the driver more than the twelve separately. The cap
+     * is swept rather than argued - `--combine-bytes=`.
+     */
+    this.combineBytes = options.combineBytes ?? 0;
+    /** Leave a kernel that loops out of the combined programs; an arm of the rule above. */
+    this.combineNoLoops = options.combineNoLoops ?? false;
+    /**
      * Where the HOST time inside `dispatch` goes, when asked for.
      *
      * 🔴 BECAUSE THE GPU IS 3% OF AN AF2 WebGL FOLD AND NOTHING SAID SO.
@@ -492,6 +571,7 @@ export class Execution {
    * @param {Iterable<string>} sources
    */
   combine(sources) {
+    if (this.noCombine) return;
     // ...packed into programs of at most MAX_TEXTURE_IMAGE_UNITS samplers each (16 here: one
     // part alone, the per-atom conditioning, reads 11), a part that does not fit opening the next.
     const units = this.gl.getParameter(this.gl.MAX_TEXTURE_IMAGE_UNITS);
@@ -499,14 +579,17 @@ export class Execution {
       .filter((uniform) => /sampler/.test(uniform)).map((uniform) => uniform.split(/\s+/).at(-1)))).size;
     const bins = [];
     for (const source of new Set(sources)) {
-      const piece = this.parts.get(source);
-      if (piece === undefined || this.combined.has(source)) continue;
+      if (this.combined.has(source)) continue;
+      // A kernel written as a part, else the same kernel read off its finished source.
+      const piece = this.parts.get(source)
+        ?? partFromSource(source, { loops: !this.combineNoLoops });
+      if (piece === undefined || piece === null) continue;
       const fits = (bin) => {
         const pieces = [...bin.map(([, held]) => held), piece];
         if (samplers(pieces) > units) return false;
         try {
-          assembleParts(pieces);
-          return true;
+          const assembled = assembleParts(pieces);
+          return this.combineBytes === 0 || assembled.length <= this.combineBytes;
         } catch {
           return false; // declared differently from one already in
         }
@@ -522,6 +605,28 @@ export class Execution {
       const names = [...new Set(pieces.flatMap((piece) => piece.uniforms
         .filter((uniform) => /sampler/.test(uniform)).map((uniform) => uniform.split(/\s+/).at(-1))))];
       bin.forEach(([source], index) => this.combined.set(source, { code, index, samplers: names }));
+    }
+  }
+
+  /**
+   * The programs `run` would draw with, in the order it first draws with them, and nothing else:
+   * a dry run on VIRTUAL tensors (`Storage.virtual`), so no texture is created, no draw is issued
+   * and every read returns zeros. What `prepare` wants, for a model whose fold is one call.
+   *
+   * @param {() => void | Promise<void>} run the fold, or a stage of it; awaited if it returns a
+   *   promise, since two of the four drivers here yield to the page
+   * @returns {Promise<Map<string, string>>} source -> the label of the first dispatch that wanted it
+   */
+  async collectPrograms(run) {
+    const held = this.collect;
+    this.collect = new Map();
+    this.storage.virtual = true;
+    try {
+      await run();
+      return this.collect;
+    } finally {
+      this.collect = held;
+      this.storage.virtual = false;
     }
   }
 
@@ -1007,6 +1112,10 @@ export class Execution {
       framebufferHits: this.framebufferHits,
       framebufferMisses: this.framebufferMisses,
       dispatches: this.dispatches, draws: this.draws, programs: this.programs.size,
+      // Kernels sharing a program, and how many programs they share (`combine`): the two numbers
+      // that say what the compile queue was spared, since a link costs the same whatever it holds.
+      combinedKernels: this.combined.size,
+      combinedPrograms: new Set([...this.combined.values()].map(({ code }) => code)).size,
       framebuffers: this.framebuffers.size, framebufferBuilds: this.framebufferBuilds,
       ...(this.nanWatch ? { nanWatchSkipped: this.nanWatchSkipped } : {}),
       ...(this.host === null ? {} : { host: Object.fromEntries(

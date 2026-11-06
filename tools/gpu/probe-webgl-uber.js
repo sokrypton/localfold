@@ -5,6 +5,13 @@
  * elementwise kernels in the fold's own style, linked both ways in fresh contexts.
  *
  *     node tools/gpu-chrome.mjs tools/gpu/probe-webgl-uber.js [--kernels=8] [--reps=3]
+ *
+ * 🔴 EVERY SALT IS FRESH PER RUN, BECAUSE A REPEATED ONE IS A CACHE HIT AND NOT A LINK. The
+ * salts were `rep * 0.001`, so the second run of this probe asked for shaders the first run had
+ * already built - and Metal keeps its compiled shaders per USER, outside the fresh Chrome profile
+ * `gpu-chrome.mjs` makes each run. Measured here: 20 kernels linked as one program read 50 ms on
+ * the first run of the probe and 2 ms on the next, with nothing changed. A random base now, so a
+ * run always asks for code no cache has seen; see probe-webgl-programs.js --cold.
  */
 import { createWebGL2Context, linkProgram } from "../../webgl/runtime/context.js";
 import { ONE_TARGET, PRELUDE } from "../../webgl/runtime/execution.js";
@@ -46,14 +53,16 @@ export async function main(_device, args = []) {
   const reps = option("reps", 3);
   const separate = [];
   const merged = [];
+  // The base every rep's salt is offset from: fresh per run, so no cache can answer.
+  const base = Math.random() * 1e3;
   for (let rep = 0; rep < reps; rep += 1) {
     let gl = createWebGL2Context();
     let t = performance.now();
-    for (let k = 0; k < n; k += 1) linkProgram(gl, single(k, rep * 0.001));
+    for (let k = 0; k < n; k += 1) linkProgram(gl, single(k, base + rep * 0.001));
     separate.push(Math.round(performance.now() - t));
     gl = createWebGL2Context();
     t = performance.now();
-    linkProgram(gl, uber(n, rep * 0.001 + 0.0005));
+    linkProgram(gl, uber(n, base + rep * 0.001 + 0.0005));
     merged.push(Math.round(performance.now() - t));
   }
   return { kernels: n, separateMs: separate, uberMs: merged };
