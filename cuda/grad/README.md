@@ -201,27 +201,33 @@ from there 6MRR's mse goes 33.3 -> 12.8 in 40 steps. The Fourier noise embedding
   | GH200 96 GB, `--offload-pairs` | | | | 9.5 s, 47.3 GB | | 16.7 s, 72.4 GB |
   | GH200, OpenFold3 PyTorch | 6.2 s, 27.3 GiB | 10.0 s, 45.7 GiB | 16.2 s, 70.1 GiB | out of memory | | |
 
-  A training step at each crop, on the A100 (40 GB), the GH200 (96 GB) and the RTX PRO 6000 Blackwell (96 GB, Colab's G4): OpenBind-0's own PyTorch training (OpenFold3
-  v0.5.0, the OpenBind release; `bench_of3_torch.py --precision=bf16`, its model and loss on its test batch, its
-  allocator's peak, which leaves out the CUDA context) against train-of3 at 335808bf (`--tf32 --bf16 --offload-pairs
-  --bf16-confidence --sample-batch=4`, the device's peak as the driver reports it, context included); one step after a
-  warm-up - forward, loss and backward - 1024 MSA rows, 48 diffusion samples, no recycles:
+  **Test:** one training step after a warm-up (forward, loss and backward) on 1AON cropped to each length, 1024 MSA rows,
+  48 diffusion samples, no recycles. OpenBind-0's own PyTorch training (OpenFold3 v0.5.0, the OpenBind release;
+  `bench_of3_torch.py --precision=bf16`, its model and loss on its test batch, its allocator's peak, which leaves out
+  the CUDA context) against train-of3 (`--tf32 --bf16 --offload-pairs --bf16-confidence --sample-batch=auto`, the
+  device's peak as the driver reports it, context included - and `auto` sizes the diffusion batches to the free
+  memory, so a larger card's peak is what it was given, not what it needs). train-of3 at 8e2d6c2b on the A100 and the
+  GH200, at 18e0a18e (two rounds earlier) on the RTX PRO 6000 Blackwell (Colab's G4):
 
-  | tokens | train-of3 A100 (s) | OpenBind-0 PyTorch A100 (s) | speedup A100 | train-of3 GH200 (s) | OpenBind-0 PyTorch GH200 (s) | speedup GH200 | train-of3 RTX PRO 6000 (s) | OpenBind-0 PyTorch RTX PRO 6000 (s) | speedup RTX PRO 6000 | train-of3 A100 (GiB) | OpenBind-0 PyTorch A100 (GiB) | train-of3 GH200 (GiB) | OpenBind-0 PyTorch GH200 (GiB) | train-of3 RTX PRO 6000 (GiB) | OpenBind-0 PyTorch RTX PRO 6000 (GiB) |
+  | tokens | A100 OpenBind-0 (s) | A100 train-of3 (s) | A100 speedup | GH200 OpenBind-0 (s) | GH200 train-of3 (s) | GH200 speedup | RTX PRO 6000 OpenBind-0 (s) | RTX PRO 6000 train-of3 (s) | RTX PRO 6000 speedup | A100 OpenBind-0 (GiB) | A100 train-of3 (GiB) | GH200 OpenBind-0 (GiB) | GH200 train-of3 (GiB) | RTX PRO 6000 OpenBind-0 (GiB) | RTX PRO 6000 train-of3 (GiB) |
   |---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-  | 256 | 3.93 | 6.3 | 1.6x | 2.00 | 4.3 | 2.1x | 2.60 | 3.24 | 1.2x | 13.0 | 14.1 | 12.9 | 14.1 | 12.8 | 14.3 |
-  | 384 | 6.08 | 12.0 | 2.0x | 3.06 | 6.2 | 2.0x | 4.08 | 6.88 | 1.7x | 16.4 | 29 | 16.2 | 27.3 | 16.1 | 27.1 |
-  | 512 | 9.29 | out of memory |  | 4.61 | 10.0 | 2.2x | 6.45 | 13.0 | 2.0x | 20.6 |  | 20.4 | 45.7 | 20.3 | 46.5 |
-  | 640 | 13.5 |  |  | 6.86 | 16.2 | 2.4x | 9.34 | 22.1 | 2.4x | 25.9 |  | 25.7 | 70.1 | 25.6 | 66.7 |
-  | 768 | 18.6 |  |  | 9.53 | out of memory |  | 12.9 | out of memory |  | 32.2 |  | 32.0 |  | 31.9 |  |
-  | 896 | 24.9 |  |  | 13.0 |  |  | 17.4 |  |  | 38.3 |  | 39.2 |  | 39.1 |  |
-  | 1024 | out of memory |  |  | 16.5 |  |  | 22.5 |  |  |  |  | 48.0 |  | 48.0 |  |
-  | 1280 |  |  |  | 27.0 |  |  | 35.9 |  |  |  |  | 69.3 |  | 69.3 |  |
-  | 1536 |  |  |  | 43.5 |  |  | 52.9 |  |  |  |  | 91.8 |  | 92.2 |  |
-  | 1792 |  |  |  | out of memory |  |  | out of memory |  |  |  |  |  |  |  |  |
+  | 256 | 6.3 | 2.02 | 3.1x | 4.3 | 1.19 | 3.6x | 3.24 | 2.09 | 1.6x | 14.1 | 15.5 | 14.1 | 15.2 | 14.3 | 22.6 |
+  | 384 | 12.0 | 3.24 | 3.7x | 6.2 | 1.71 | 3.6x | 6.88 | 3.33 | 2.1x | 29 | 18.3 | 27.3 | 19.5 | 27.1 | 32.1 |
+  | 512 | out of memory | 5.13 | | 10.0 | 2.61 | 3.8x | 13.0 | 5.35 | 2.4x | | 21.5 | 45.7 | 24.2 | 46.5 | 42.0 |
+  | 640 | | 7.69 | | 16.2 | 3.91 | 4.1x | 22.1 | 7.87 | 2.8x | | 26.9 | 70.1 | 28.7 | 66.7 | 45.9 |
+  | 768 | | 11.0 | | out of memory | 5.54 | | out of memory | 10.9 | | | 32.8 | | 32.9 | | 47.6 |
+  | 896 | | 16.0 | | | 7.70 | | | 14.7 | | | 38.9 | | 40.0 | | 62.0 |
+  | 1024 | | out of memory | | | 9.80 | | | 18.9 | | | | | 49.2 | | 72.8 |
+  | 1280 | | | | | 16.8 | | | 30.4 | | | | | 69.6 | | 82.5 |
+  | 1536 | | | | | 30.5 | | | 47.1 | | | | | 93.2 | | 92.2 |
+  | 1792 | | | | | out of memory | | | out of memory | | | | | | | |
 
   train-of3 trains 896-token crops on the A100 against PyTorch's 384, and 1536 against 640 on both 96 GB cards. (The
-  Blackwell card's train-of3 reads the int8 blob, the others the float32 bundle.)
+  Blackwell card's train-of3 reads the int8 blob, the others the float32 bundle.) The A100 at 512 tokens across this
+  file's speed rounds: 9.29 s, 6.60 s, then 5.13 s - the pairformer's kernels (the grid attention's forward, dropout
+  tables, the residual links fused, SwiGLU vectorised), the smooth LDDT and confidence weight-gradient kernels spread
+  over the device, the atom stacks' shared half once a diffusion batch, and the device's idle time (the confidence
+  losses on a host thread beside the diffusion samples, no allocation churn).
 
   And inference, beside it: OpenFold3's PyTorch (`bench_of3_infer_torch.py`: eval, bf16 autocast, its Triton triangle
   kernels) against cuda/af3's `localfold-af3 --model=openbind0 --fast`, both at OpenFold3's inference settings - 1 + 3
