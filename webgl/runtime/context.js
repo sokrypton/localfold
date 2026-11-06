@@ -95,7 +95,18 @@ export function linkProgram(gl, fragmentSource) {
  * assumed - see `./limits.js` for what else a context has to have.
  */
 export function createWebGL2Context(canvas) {
-  const gl = (canvas ?? new OffscreenCanvas(1, 1)).getContext("webgl2");
+  // An OffscreenCanvas where there is one that gives WebGL2, else a detached document canvas:
+  // Safari has no OffscreenCanvas before 16.4, and no WebGL on one before 17.
+  let gl = canvas?.getContext("webgl2") ?? null;
+  if (canvas === undefined && typeof OffscreenCanvas === "function") {
+    gl = new OffscreenCanvas(1, 1).getContext("webgl2");
+  }
+  if (canvas === undefined && gl === null && typeof document !== "undefined") {
+    const element = document.createElement("canvas");
+    element.width = 1;
+    element.height = 1;
+    gl = element.getContext("webgl2");
+  }
   if (gl === null) throw new Error("this browser has no WebGL2");
   if (gl.getExtension("EXT_color_buffer_float") === null) {
     throw new Error("WebGL2 here cannot render to float textures (EXT_color_buffer_float)");
