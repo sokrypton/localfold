@@ -245,9 +245,9 @@ from there 6MRR's mse goes 33.3 -> 12.8 in 40 steps. The Fourier noise embedding
   | 384 | 1.02 s, 5.2 GiB | 1.33 s, 5.1 GiB | 2.21 s, 5.4 GiB |
   | 512 | 1.63 s, 5.8 GiB | 1.98 s, 5.8 GiB | 3.17 s, 6.0 GiB |
   | 768 | 3.24 s, 7.2 GiB | 3.58 s, 7.3 GiB | 6.03 s, 7.7 GiB |
-  | 1024 | 5.68 s, 8.7 GiB | | 10.2 s, 9.2 GiB |
-  | 1536 | 13.7 s, 15.9 GiB | | 23.0 s |
-  | 2048 | 27.3 s, 24.5 GiB | | 43.4 s, 17.7 GiB |
+  | 1024 | 5.68 s, 8.7 GiB | 6.00 s, 8.9 GiB | 10.2 s, 9.2 GiB |
+  | 1536 | 13.7 s, 15.9 GiB | 12.8 s, 16.0 GiB | 23.0 s |
+  | 2048 | 27.3 s, 24.5 GiB | 23.2 s, 24.5 GiB | 43.4 s, 17.7 GiB |
   | 3072 | 75.6 s, 48.2 GiB | 58.4 s, 48.3 GiB | 167 s, 27.9 GiB |
   | 4096 | 161 s, 47.0 GiB | 116 s, 46.9 GiB | 245 s, 33.8 GiB |
   | 5120 | 295 s, 41.0 GiB | 206 s, 56.3 GiB | 462 s, 38.1 GiB |
@@ -255,7 +255,8 @@ from there 6MRR's mse goes 33.3 -> 12.8 in 40 steps. The Fourier noise embedding
   | 7168 | 750 s, 76.7 GiB | | out of memory (13.2 GB short in the trunk; foldFits had admitted it) |
   | 8192 | 1108 s, 90.1 GiB | | |
 
-  The Blackwell card is 10-45% behind the GH200 at short lengths (its diffusion) and 25-30% ahead from 3072 (its trunk);
+  The Blackwell card is behind the GH200 below ~1100 tokens (its diffusion: 10-45%) and ahead from 1536 (its trunk:
+  7% at 1536, 15% at 2048, 25-30% from 3072);
   an H100 80 GB ran within 1% of the GH200 to 2048. train-of3's step on each (`--tf32 --bf16 --offload-pairs
   --bf16-confidence --sample-batch=4`, 48 samples, the int8 blob on the Blackwell card, the float32 bundle on the others):
 
