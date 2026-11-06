@@ -244,6 +244,19 @@ export class Storage {
    * that names nothing, and the caller's question is always "how long a chain
    * does this hold".
    */
+  /**
+   * While true, tensors are VIRTUAL: their shape and no texture - writes skipped, reads zeros,
+   * release a no-op. What a dry run (`Execution.collect`) allocates: it draws nothing, so the
+   * textures it used to create and read back were ~0.2 s of a first fold's wait on Safari 16.3.
+   */
+  virtual = false;
+
+  #virtualTensor(fields) {
+    const tensor = { texture: null, bytes: 0, half: false, ...fields };
+    this.live.add(tensor);
+    return tensor;
+  }
+
   allocate(elements, label = "tensor", half = false) {
     if (!Number.isInteger(elements) || elements <= 0) {
       throw new RangeError(`${label}: a tensor needs a positive integer element count, got ${elements}`);
@@ -257,6 +270,7 @@ export class Storage {
     }
     const gl = this.gl;
     const { width, height } = textureShape(elements);
+    if (this.virtual) return this.#virtualTensor({ elements, width, height, label, half });
     this.allocationLabels.set(label, (this.allocationLabels.get(label) ?? 0) + 1);
     const key = poolKey(width, height, half ? "f16" : "f32");
     const free = this.poolLabelPattern === null || this.poolLabelPattern.test(label)
@@ -342,7 +356,7 @@ export class Storage {
    */
   uploadWeight(values, label = "weight") {
     let half = this.halfWeights && values.length >= HALF_WEIGHT_FLOOR;
-    if (half) {
+    if (half && !this.virtual) {
       // 🔴 AND A TENSOR THAT DOES NOT FIT IN float16 STAYS IN float32 RATHER
       // THAN BECOMING Inf. A checkpoint's weights are all well inside the
       // format's 65504, but this entry point is named by what the CALLER calls
@@ -415,6 +429,7 @@ export class Storage {
     if (height > this.gl.getParameter(this.gl.MAX_TEXTURE_SIZE)) {
       throw new RangeError(`${label}: ${words} words is past this context's textures`);
     }
+    if (this.virtual) return this.#virtualTensor({ elements: words, width, height, label, words: true });
     const gl = this.gl;
     const bytes = width * height * CHANNELS_PER_TEXEL * 4;
     // 🔴 AND IT TAKES FROM THE POOL, WHICH IT DID NOT, so a words texture was
@@ -453,6 +468,7 @@ export class Storage {
 
   /** Fill a word tensor, padding to its rectangle. */
   writeWords(tensor, words) {
+    if (tensor.texture === null) return tensor;
     const gl = this.gl;
     const needed = tensor.width * tensor.height * CHANNELS_PER_TEXEL;
     const padded = words.length === needed ? words : (() => {
@@ -476,6 +492,7 @@ export class Storage {
       throw new RangeError(
         `${tensor.label}: holds ${tensor.elements} floats, given ${values.length}`);
     }
+    if (tensor.texture === null) return tensor;
     const gl = this.gl;
     const needed = tensor.width * tensor.height * CHANNELS_PER_TEXEL;
     const padded = values.length === needed ? values : (() => {
@@ -521,6 +538,7 @@ export class Storage {
       // answered. Refusing by name beats returning something plausible.
       throw new Error(`${tensor.label}: a float16 weight tensor is not readable`);
     }
+    if (tensor.texture === null) return new Float32Array(tensor.elements);
     if (this.readback === null) this.readback = gl.createFramebuffer();
     const previous = gl.getParameter(gl.FRAMEBUFFER_BINDING);
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.readback);
@@ -542,6 +560,7 @@ export class Storage {
 
   release(tensor) {
     if (!this.live.delete(tensor)) return;
+    if (tensor.texture === null) return;
     this.bytes -= tensor.bytes;
     if (!this.pooling) {
       this.gl.deleteTexture(tensor.texture);

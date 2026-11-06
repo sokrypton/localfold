@@ -9,28 +9,52 @@
 import { openAf3Store } from "../../shared/af3/weights/weights.js";
 import { foldWeights } from "../../shared/af3/weights/diffusion-weights.js";
 import { af3BatchFromA3m } from "../../shared/af3/featurise/batch.js";
-import { createWebGL2Context, linkProgram } from "../../webgl/runtime/context.js";
+import { VERTEX_SHADER, createWebGL2Context, linkProgram } from "../../webgl/runtime/context.js";
 import { Execution } from "../../webgl/runtime/execution.js";
 import { foldPrograms, uploadAf3Weights } from "../../webgl/af3/model/fold.js";
 
 export async function main(_device, args = []) {
   const option = (name, fallback) => (args.find((a) => a.startsWith(`--${name}=`)) ?? `--${name}=${fallback}`).split("=")[1];
   const length = Number(option("length", "100"));
+  const mark = (stage) => { globalThis.__progress = `${stage} at ${Math.round(performance.now())} ms`; };
+  mark("loading");
   const weights = await foldWeights(await openAf3Store(`${option("bundle", "/model-openbind0-int5")}/manifest.json`), { blocks: 1, msaBlocks: 1 });
+  mark("loaded");
   const execution = new Execution(createWebGL2Context(), { halfWeights: true, halfActivations: true, int5Weights: true });
   const uploaded = uploadAf3Weights(execution, weights);
   const { batch } = af3BatchFromA3m("PIAQIHILEGRSDEQKETLIREVSEAISRSLDAPLTSVRVMKVLLTGAGSRAAELVRKAGH".repeat(8).slice(0, length), null, {});
+  mark("uploaded");
   let t = performance.now();
   const { programs, groups: sliceGroups } = await foldPrograms(execution, {
     batch, weights: uploaded, hostWeights: weights, steps: 1, seed: 1,
     msa: { codes: Float32Array.from(batch.msa), deletions: Float32Array.from(batch.deletionMatrix), mask: Float32Array.from(batch.msaMask), sequences: 1 },
   });
   const dryRunMs = Math.round(performance.now() - t);
+  mark("dry run done");
   const gl = execution.gl;
   const timed = [];
+  // `--shared-vs=1`: one compiled vertex shader attached to every program, instead of one each.
+  let vertex = null;
+  if (option("shared-vs", "0") === "1") {
+    vertex = gl.createShader(gl.VERTEX_SHADER);
+    gl.shaderSource(vertex, VERTEX_SHADER);
+    gl.compileShader(vertex);
+    gl.getShaderParameter(vertex, gl.COMPILE_STATUS);
+  }
   for (const [source, label] of programs) {
     t = performance.now();
-    linkProgram(gl, source);
+    if (vertex === null) {
+      linkProgram(gl, source);
+    } else {
+      const program = gl.createProgram();
+      const fragment = gl.createShader(gl.FRAGMENT_SHADER);
+      gl.shaderSource(fragment, source);
+      gl.compileShader(fragment);
+      gl.attachShader(program, vertex);
+      gl.attachShader(program, fragment);
+      gl.linkProgram(program);
+      if (!gl.getProgramParameter(program, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(program));
+    }
     timed.push({ label, ms: performance.now() - t, chars: source.length });
   }
   timed.sort((a, b) => b.ms - a.ms);
@@ -53,7 +77,8 @@ export async function main(_device, args = []) {
     perFamily: Object.entries(timed.reduce((a, { label }) => { const f = label.split(":")[0]; a[f] = (a[f] ?? 0) + 1; return a; }, {}))
       .filter(([, n]) => n > 1).sort((a, b) => b[1] - a[1]).map(([f, n]) => `${n} ${f}`),
     labelsOf: Object.fromEntries((option("labels", "") ? option("labels", "").split(",") : []).map((f) => [f, timed.filter(({ label }) => label.split(":")[0] === f).map(({ label }) => label)])),
-    renderer: gl.getParameter(gl.RENDERER), programs: timed.length, groups: sliceGroups.map((g) => g.length), dryRunMs, linkTotalMs: Math.round(total),
+    renderer: gl.getParameter(gl.RENDERER), programs: timed.length, groups: sliceGroups.map((g) => g.length),
+    firstGroup: sliceGroups[0].map((source) => programs.get(source)), dryRunMs, linkTotalMs: Math.round(total),
     top: timed.slice(0, Number(option("top", "25"))).map(({ label, ms, chars }) => `${ms.toFixed(1)} ms ${chars}c ${label}`),
     families: Object.entries(byFamily).sort((a, b) => b[1] - a[1]).slice(0, 15).map(([f, ms]) => `${Math.round(ms)} ms ${f}`),
   };

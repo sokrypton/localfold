@@ -478,6 +478,7 @@ export async function foldPrograms(execution, call) {
       : { confidence: { ...weights.confidence, blocks: weights.confidence.blocks.slice(0, 1) } }),
   };
   execution.collect = new Map();
+  execution.storage.virtual = true;
   const ends = [];
   try {
     await drainAsync(foldAf3Steps(execution, {
@@ -494,6 +495,7 @@ export async function foldPrograms(execution, call) {
     return { programs, groups };
   } finally {
     execution.collect = null;
+    execution.storage.virtual = false;
   }
 }
 
