@@ -27,7 +27,7 @@ export async function main(_device, args) {
   const runs = [];
   for (const length of lengths) {
     const { batch } = af3BatchFromA3m(SEQUENCE.slice(0, length), null, {});
-    const programs = await foldPrograms(execution, {
+    const { programs } = await foldPrograms(execution, {
       batch, weights: uploaded, hostWeights: weights,
       msa: { codes: Float32Array.from(batch.msa), deletions: Float32Array.from(batch.deletionMatrix), mask: Float32Array.from(batch.msaMask), sequences: 1 },
       steps: 1, seed: 1,

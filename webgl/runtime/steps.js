@@ -42,7 +42,7 @@ export async function drainAsync(steps, pause, signal) {
  * polled from timers, so the thread is free while the queue drains. A read
  * after this returns at once instead of blocking.
  */
-export async function gpuIdle(gl) {
+export async function gpuIdle(gl, work) {
   const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
   gl.flush();
   try {
@@ -50,7 +50,10 @@ export async function gpuIdle(gl) {
       const status = gl.clientWaitSync(sync, 0, 0);
       if (status === gl.ALREADY_SIGNALED || status === gl.CONDITION_SATISFIED
         || status === gl.WAIT_FAILED) return;
-      await new Promise((resolve) => { setTimeout(resolve, 4); });
+      // ...and the time the GPU takes is the caller's to use: one piece of `work` a task (a
+      // shader compile the fold will need later), else a short sleep.
+      const busy = work?.() === true;
+      await new Promise((resolve) => { setTimeout(resolve, busy ? 0 : 4); });
     }
   } finally {
     gl.deleteSync(sync);

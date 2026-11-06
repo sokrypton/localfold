@@ -411,7 +411,7 @@ uniform int RQ;
 // 🔴 x's ROW STRIDE, which must divide the texture width or every logical row
 // wraps at a different offset and the cache cannot follow twelve such streams.
 // See webgl/runtime/pad-stride.js: padding it is 4.08x and costs no arithmetic.
-const int XSTRIDE4 = ${xStride4 || inChannels / 4};
+uniform int XSTRIDE4;
 uniform sampler2D xTex;
 uniform sampler2D weightTex;
 ${useBias ? "uniform sampler2D biasTex;" : ""}
@@ -469,7 +469,7 @@ uniform int RQ;
 // 🔴 x's ROW STRIDE, which must divide the texture width or every logical row
 // wraps at a different offset and the cache cannot follow twelve such streams.
 // See webgl/runtime/pad-stride.js: padding it is 4.08x and costs no arithmetic.
-const int XSTRIDE4 = ${xStride4 || inChannels / 4};
+uniform int XSTRIDE4;
 uniform int GPR;
 uniform sampler2D xTex;
 uniform highp usampler2D codeTex;
@@ -773,6 +773,9 @@ export function linear(execution, call, into) {
       optionalInts: {
         ...shapeInts(rows, inChannels, outChannels),
         RQ: rowQuads,
+        // x's row stride, a uniform like the shapes: as a constant it split this kernel into one
+        // program per input width (10 of an AF3 fold's 125), ~20 ms a link on Safari 16.3
+        XSTRIDE4: xStride4 || inChannels / 4,
         ...(int5 ? { GPR: inChannels / INT5_GROUP } : {}),
       },
       label: `linear.block${int5 ? ".int5" : ""}:${rows}x${inChannels}x${outChannels}`

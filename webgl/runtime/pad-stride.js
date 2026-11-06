@@ -40,7 +40,7 @@
  * LOSS (webgl/README.md) because it makes more rows wrap, not fewer - the
  * condition was never the width's size.
  */
-import { ONE_TARGET, PRELUDE } from "./execution.js";
+import { ONE_TARGET, PRELUDE, sized } from "./execution.js";
 
 /** The next power of two at or above `n`, which is what divides `TEXTURE_WIDTH`. */
 export const strideFor = (texelsPerRow) => 2 ** Math.ceil(Math.log2(texelsPerRow));
@@ -55,9 +55,7 @@ export const strideDividesWidth = (texelsPerRow) => strideFor(texelsPerRow) === 
  * width, which it does not - they exist so the texture has no undefined texels,
  * which `Storage.fillFresh` would otherwise catch.
  */
-export const padStrideSource = (inChannels, stride4) => `${PRELUDE}${ONE_TARGET}
-const int IN4 = ${inChannels / 4};
-const int STRIDE4 = ${stride4};
+export const padStrideSource = (inChannels, stride4) => sized({ IN4: inChannels / 4, STRIDE4: stride4 }, `${PRELUDE}${ONE_TARGET}
 uniform int ROWS;
 uniform sampler2D xTex;
 
@@ -67,7 +65,7 @@ void main() {
   int row = texel / STRIDE4;
   int k = texel - row * STRIDE4;
   result = k < IN4 ? fetch4(xTex, row * IN4 + k) : vec4(0.0);
-}`;
+}`);
 
 /**
  * @param {import("./execution.js").Execution} execution

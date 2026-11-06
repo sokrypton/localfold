@@ -155,8 +155,7 @@ void main() {
  * 🔴 WHERE THE MASK IS FALSE THE DESTINATION IS ZERO rather than whatever index
  * 0 holds, "which matters because padded slots index 0 legitimately".
  */
-export const gatherSource = (count, channels) => sized({ ELEMENTS: count * channels }, `${PRELUDE}${ONE_TARGET}
-const int C4 = ${channels / 4};
+export const gatherSource = (count, channels) => sized({ ELEMENTS: count * channels, C4: channels / 4 }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D sourceTex;
 uniform sampler2D indicesTex;
 uniform sampler2D maskTex;
@@ -217,13 +216,7 @@ export const atomAttentionSource = (shape, keyMasked, lanewise = false) => {
   // still accumulate in ascending `d` order, one scalar at a time, rather than
   // as a `dot`. `--no-attend-dot4` is the control arm.
   const wide = !lanewise && dimension % 4 === 0 && width % 4 === 0;
-  return sized({ ELEMENTS: subsets * queries * width }, `${PRELUDE}${ONE_TARGET}
-const int QUERIES = ${queries};
-const int KEYS = ${keys};
-const int HEADS = ${heads};
-const int D = ${dimension};
-const int D4 = ${dimension / 4};
-const int WIDTH = ${width};
+  return sized({ ELEMENTS: subsets * queries * width, QUERIES: queries, KEYS: keys, HEADS: heads, D: dimension, D4: dimension / 4, WIDTH: width }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D qTex;
 uniform sampler2D kTex;
 uniform sampler2D vTex;
@@ -301,8 +294,7 @@ void main() {
 }`);
 
 /** `swish(wide[i]) * wide[intermediate + i]`, the SwiGLU over a blocked row. */
-export const swiGluSource = (rows, intermediate) => sized({ ELEMENTS: rows * intermediate }, `${PRELUDE}${ONE_TARGET}
-const int INTER4 = ${intermediate / 4};
+export const swiGluSource = (rows, intermediate) => sized({ ELEMENTS: rows * intermediate, INTER4: intermediate / 4 }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D wideTex;
 
 void main() {
@@ -523,11 +515,7 @@ void main() {
  */
 export const pairLogitsLayoutSource = (shape) => {
   const { subsets, queries, keys, heads, blocks, block } = shape;
-  return sized({ BLOCKS: blocks, ELEMENTS: subsets * heads * queries * keys }, `${PRELUDE}${ONE_TARGET}
-const int QUERIES = ${queries};
-const int KEYS = ${keys};
-const int HEADS = ${heads};
-const int BLOCK = ${block};
+  return sized({ BLOCKS: blocks, ELEMENTS: subsets * heads * queries * keys, QUERIES: queries, KEYS: keys, HEADS: heads, BLOCK: block }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D flatTex;
 
 float at(int element) {
@@ -637,8 +625,7 @@ export const interleaveBlocksSource = (rows, blocks, heads) => {
     (_, b) => `uniform sampler2D block${b};`).join("\n");
   const select = Array.from({ length: blocks - 1 },
     (_, b) => `  if (block == ${b}) return fetch1(block${b}, row * HEADS + head);`).join("\n");
-  return sized({ BLOCKS: blocks, ELEMENTS: rows * blocks * heads }, `${PRELUDE}${ONE_TARGET}
-const int HEADS = ${heads};
+  return sized({ BLOCKS: blocks, ELEMENTS: rows * blocks * heads, HEADS: heads }, `${PRELUDE}${ONE_TARGET}
 ${declarations}
 
 float at(int element) {

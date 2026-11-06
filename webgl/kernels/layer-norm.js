@@ -61,8 +61,7 @@ export const layerNormSource = (
 /** The ragged form: every element resolves its own row and sweeps it. */
 export const raggedLayerNormSource = (
   rows, channels, roundHalf, variance, hasWeight, hasBias,
-) => sized({ ELEMENTS: rows * channels }, `${PRELUDE}${ONE_TARGET}
-const int CHANNELS = ${channels};
+) => sized({ ELEMENTS: rows * channels, CHANNELS: channels }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D xTex;
 ${hasWeight ? "uniform sampler2D weightTex;" : ""}
 ${hasBias ? "uniform sampler2D biasTex;" : ""}
@@ -139,9 +138,7 @@ void main() {
  * ~25 us a 110,592-texel draw costs, and neither its traffic nor its redundant
  * reduction accounts for the difference.
  */
-export const layerNormStatsSource = (rows, channels, variance) => sized({ ROWS: rows }, `${PRELUDE}${ONE_TARGET}
-const int CHANNELS = ${channels};
-const int CH4 = ${channels / 4};
+export const layerNormStatsSource = (rows, channels, variance) => sized({ ROWS: rows, CHANNELS: channels, CH4: channels / 4 }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D xTex;
 uniform float epsilon;
 
@@ -178,8 +175,7 @@ ${variance === "fast"
 /** The aligned kernel with the statistics read rather than swept. */
 export const splitLayerNormSource = (
   rows, channels, roundHalf, hasWeight, hasBias,
-) => sized({ ROWS: rows }, `${PRELUDE}${ONE_TARGET}
-const int CH4 = ${channels / 4};
+) => sized({ ROWS: rows, CH4: channels / 4 }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D xTex;
 uniform sampler2D statsTex;
 ${hasWeight ? "uniform sampler2D weightTex;" : ""}
@@ -198,9 +194,7 @@ void main() {
 
 export const alignedLayerNormSource = (
   rows, channels, roundHalf, variance, hasWeight, hasBias,
-) => sized({ ROWS: rows }, `${PRELUDE}${ONE_TARGET}
-const int CHANNELS = ${channels};
-const int CH4 = ${channels / 4};
+) => sized({ ROWS: rows, CHANNELS: channels, CH4: channels / 4 }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D xTex;
 ${hasWeight ? "uniform sampler2D weightTex;" : ""}
 ${hasBias ? "uniform sampler2D biasTex;" : ""}

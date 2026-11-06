@@ -22,8 +22,7 @@ import { ONE_TARGET, PRELUDE, sized } from "./execution.js";
 
 /** @typedef {import("./storage.js").Tensor} Tensor */
 
-export const transposeLeadingSource = (outer, inner, channels) => sized({ OUTER: outer, INNER: inner }, `${PRELUDE}${ONE_TARGET}
-const int C4 = ${channels / 4};
+export const transposeLeadingSource = (outer, inner, channels) => sized({ OUTER: outer, INNER: inner, C4: channels / 4 }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D xTex;
 
 void main() {

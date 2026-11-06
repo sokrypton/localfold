@@ -56,8 +56,7 @@ import { relu } from "../../runtime/elementwise.js";
 /** @typedef {import("../../runtime/storage.js").Tensor} Tensor */
 
 /** `out[row][c] = x[row][c] * mask[row]` - the mask-before-gather step. */
-export const maskRowsSource = (rows, channels) => sized({ ELEMENTS: rows * channels }, `${PRELUDE}${ONE_TARGET}
-const int C4 = ${channels / 4};
+export const maskRowsSource = (rows, channels) => sized({ ELEMENTS: rows * channels, C4: channels / 4 }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D xTex;
 uniform sampler2D maskTex;
 
@@ -76,10 +75,7 @@ void main() {
  */
 export const atomPairSource = (shape, maskPaddedKeys, hasTrunkPair) => {
   const { subsets, queries, keys, pairChannels, tokens } = shape;
-  return sized({ TOKENS: tokens, ELEMENTS: subsets * queries * keys * pairChannels }, `${PRELUDE}${ONE_TARGET}
-const int QUERIES = ${queries};
-const int KEYS = ${keys};
-const int P4 = ${pairChannels / 4};
+  return sized({ TOKENS: tokens, ELEMENTS: subsets * queries * keys * pairChannels, QUERIES: queries, KEYS: keys, P4: pairChannels / 4 }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D rowTex;
 uniform sampler2D columnTex;
 uniform sampler2D queryPosTex;
@@ -152,9 +148,7 @@ ${hasTrunkPair ? `  // The trunk's pair, indexed by the two atoms' TOKENS - both
  * with three atoms of a 24-slot row divides by three" - and a token with none
  * stays zero rather than dividing by zero.
  */
-export const aggregateSource = (tokens, dense, channels) => sized({ ELEMENTS: tokens * channels }, `${PRELUDE}${ONE_TARGET}
-const int DENSE = ${dense};
-const int C4 = ${channels / 4};
+export const aggregateSource = (tokens, dense, channels) => sized({ ELEMENTS: tokens * channels, DENSE: dense, C4: channels / 4 }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D projectedTex;
 uniform sampler2D maskTex;
 
@@ -605,8 +599,7 @@ void main() {
  * The same, with the index CLAMPED to the source - "a gather whose indices are
  * written for another array", which is what stock AF3's key uid is.
  */
-export const clampedGatherSource = (count, sourceLength) => sized({ ELEMENTS: count }, `${PRELUDE}${ONE_TARGET}
-const int SOURCE = ${sourceLength};
+export const clampedGatherSource = (count, sourceLength) => sized({ ELEMENTS: count, SOURCE: sourceLength }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D sourceTex;
 uniform sampler2D indicesTex;
 uniform sampler2D maskTex;
@@ -636,8 +629,7 @@ void main() {
  * pair's own read at stride 3 (relRMS 0.716) and then this one (0.450), each
  * found by the stage taps while every neighbouring stage stayed exact.
  */
-export const vec3GatherSource = (count, sourceStride) => sized({ COUNT: count }, `${PRELUDE}${ONE_TARGET}
-const int STRIDE = ${sourceStride};
+export const vec3GatherSource = (count, sourceStride) => sized({ COUNT: count, STRIDE: sourceStride }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D sourceTex;
 uniform sampler2D indicesTex;
 uniform sampler2D maskTex;
@@ -652,8 +644,7 @@ void main() {
 }`);
 
 /** `act[row][c] += Linear(position)[row][c] * mask[row]`. */
-export const positionToFeaturesSource = (rows, channels) => sized({ ELEMENTS: rows * channels }, `${PRELUDE}${ONE_TARGET}
-const int C4 = ${channels / 4};
+export const positionToFeaturesSource = (rows, channels) => sized({ ELEMENTS: rows * channels, C4: channels / 4 }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D positionsTex;
 uniform sampler2D weightTex;
 uniform sampler2D maskTex;

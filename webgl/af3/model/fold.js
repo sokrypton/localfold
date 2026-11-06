@@ -410,25 +410,63 @@ export function foldAf3(execution, call) {
  * @param {Parameters<typeof foldAf3>[1] & {signal?: AbortSignal}} call
  */
 export async function foldAf3Async(execution, call) {
-  await prepareFoldPrograms(execution, call);
-  return drainAsync(foldAf3Steps(execution, call), () => gpuIdle(execution.gl), call.signal);
+  const groups = await prepareFoldPrograms(execution, call);
+  // The rest compile while the fold waits on the GPU, one a task, in the order it first needs
+  // them; and before it goes on, the whole group its next slice first draws with (the earliest
+  // group not yet compiled), so that slice does not link a dozen programs inside itself - which
+  // the GPU's wait alone did not always cover at the trunk's start (417 ms on Safari 16.3).
+  const later = groups.flat();
+  const groupEnd = [];
+  for (const group of groups) groupEnd.push((groupEnd.at(-1) ?? 0) + group.length);
+  let next = 0;
+  const compileNext = () => {
+    while (next < later.length && execution.programs.has(later[next])) next += 1;
+    if (next === later.length) return false;
+    execution.program(later[next]);
+    next += 1;
+    return true;
+  };
+  const pause = async () => {
+    while (next < later.length && execution.programs.has(later[next])) next += 1;
+    const needed = groupEnd.find((end) => end > next) ?? 0;
+    await gpuIdle(execution.gl, compileNext);
+    while (next < needed && compileNext()) {
+      await new Promise((resolve) => { setTimeout(resolve, 0); });
+    }
+  };
+  return drainAsync(foldAf3Steps(execution, call), pause, call.signal);
 }
 
 /**
- * Every program this fold will draw with, compiled before it starts (`Execution.prepare`): a
- * first fold links ~120 programs, and they took 2.6 s of the thread on Safari 16.3 in stalls of up
- * to a second. Found by a dry run of the same batch with no draws (`Execution.collect`), one block
- * of each stack and one denoiser call, which reach every kernel. The kernels take their lengths
- * as uniforms (`sized`), so a later fold at another length finds them compiled.
+ * The programs this fold will draw with, found by a dry run of the same batch with no draws
+ * (`Execution.collect`, one block of each stack and one denoiser call, which reach every kernel):
+ * those its first slice draws with compiled now (`Execution.prepare`), the rest returned grouped
+ * by the slice that first draws with them, for `foldAf3Async` to compile while it waits on the GPU. A
+ * first fold links ~100 programs, ~20 ms each on Safari 16.3 on the page's thread; the kernels
+ * take their lengths as uniforms (`sized`), so a later fold at another length finds them compiled.
  */
 async function prepareFoldPrograms(execution, call) {
-  const sources = await foldPrograms(execution, call);
-  await execution.prepare(sources.keys());
+  // ...on the first fold with these weights only: the programs serve every length, so a later
+  // fold finds them compiled and the dry run (0.2-0.35 s) would find nothing; the odd kernel a
+  // size threshold brings in is compiled at its draw.
+  let prepared = preparedWeights.get(execution);
+  if (prepared === undefined) preparedWeights.set(execution, prepared = new WeakSet());
+  if (prepared.has(call.weights)) return [];
+  const { groups } = await foldPrograms(execution, call);
+  await execution.prepare(groups[0]);
+  prepared.add(call.weights);
+  return groups.slice(1);
 }
 
+/** Per execution, the uploaded weights a fold has already prepared programs for. */
+const preparedWeights = new WeakMap();
+
 /**
- * The programs a fold of this batch draws with, as source -> kernel label: a dry run with no
- * draws (`Execution.collect`), one block of each stack and one denoiser call.
+ * The programs a fold of this batch draws with, as source -> kernel label in the order the fold
+ * first draws with them, and grouped by the slice (between two yields) that first draws with them:
+ * a dry run with no draws (`Execution.collect`), one block of each stack and one denoiser call.
+ *
+ * @returns {Promise<{programs: Map<string, string>, groups: string[][]}>}
  */
 export async function foldPrograms(execution, call) {
   const { weights } = call;
@@ -440,12 +478,20 @@ export async function foldPrograms(execution, call) {
       : { confidence: { ...weights.confidence, blocks: weights.confidence.blocks.slice(0, 1) } }),
   };
   execution.collect = new Map();
+  const ends = [];
   try {
     await drainAsync(foldAf3Steps(execution, {
       ...call, weights: trimmed, recycles: 0, steps: 1, readTrunk: false,
       onStage: undefined, onStep: undefined,
-    }), () => new Promise((resolve) => { setTimeout(resolve, 0); }), call.signal);
-    return execution.collect;
+    }), () => {
+      if (execution.collect.size > (ends.at(-1) ?? 0)) ends.push(execution.collect.size);
+      return new Promise((resolve) => { setTimeout(resolve, 0); });
+    }, call.signal);
+    const programs = execution.collect;
+    const ordered = [...programs.keys()];
+    if (ordered.length > (ends.at(-1) ?? 0)) ends.push(ordered.length);
+    const groups = ends.map((end, index) => ordered.slice(ends[index - 1] ?? 0, end));
+    return { programs, groups };
   } finally {
     execution.collect = null;
   }

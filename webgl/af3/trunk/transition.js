@@ -44,8 +44,7 @@ export const TRANSITION_WEIGHTS = [
  * owns four OUTPUT channels and sweeps the whole intermediate axis, so it would
  * recompute the swish `channels / 4` times over.
  */
-export const swiGluSource = (rows, intermediate) => sized({ ELEMENTS: rows * intermediate }, `${PRELUDE}${ONE_TARGET}
-const int INTER4 = ${intermediate / 4};
+export const swiGluSource = (rows, intermediate) => sized({ ELEMENTS: rows * intermediate, INTER4: intermediate / 4 }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D wideTex;
 
 void main() {
