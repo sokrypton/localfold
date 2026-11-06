@@ -848,15 +848,20 @@ browser that links on its own thread pays, and what Chrome's `KHR_parallel_shade
 
 | fold | programs | linked one at a time | and combined | | |
 |---|---:|---:|---:|---:|---:|
-| AlphaFold 2 monomer, 59 residues | 53 | 2177 ms | **16** | **806 ms** | 2.70x |
-| AlphaFold 3 / OpenBind-0, 59 tokens | 83 | 3325 ms | **23** | **1108 ms** | 3.00x |
-| ESMFold2, 59 residues | 82 | 3247 ms | **10** | **532 ms** | 6.10x |
-| bioemu2, 68 tokens | 114 | 4866 ms | **14** | **922 ms** | 5.28x |
+| AlphaFold 2 monomer, 59 residues | 53 | 2178 ms | **16** | **807 ms** | 2.70x |
+| AlphaFold 3 / OpenBind-0, 59 tokens | 83 | 3291 ms | **23** | **1108 ms** | 2.97x |
+| ESMFold2, 59 residues | 82 | 3247 ms | **10** | **535 ms** | 6.07x |
+| bioemu2, 68 tokens | 114 | 4707 ms | **14** | **938 ms** | 5.02x |
+
+Both arms, two interleaved rounds, the minimum of each; the spread is under 7% on every row but
+AF2's own 807/862. A first reading had bioemu2 at 4866 ms and 5.28x from one run.
 
 What is left in every one of them is the kernels a part cannot be: the heavy projections and
 attentions, which write SEVERAL render targets where a part writes `result` (8, 11, 3 and 9 of
-them). Everything else is in a combined program. The draws are a little cheaper too - 5 to 14% off
-each fold's own clock, from the program switches a dispatch no longer makes.
+them), and AF2's `geometry.frames`, which declares a struct. Everything else is in a combined
+program. The draws are cheaper too - **6 to 16%** off each fold's own clock (AF2 1909 ms to 1784,
+AF3 3031 to 2843, ESMFold2 1986 to 1675, bioemu2 2759 to 2421), from the program switches a
+dispatch no longer makes.
 
 Nothing any of them computes moves. AF2's worst atom against the WGSL fold is **0.0353 A** either
 way (its own dither floor is 0.0308); AF3's whole comparison is identical to the digit in both arms
@@ -890,14 +895,25 @@ after the draw` - the same error as the pool bug, and again from a binding rathe
 arithmetic. There is a float placeholder and a words one now, on their own units, which is also why
 `combine` keeps two sampler units back from `MAX_TEXTURE_IMAGE_UNITS`.
 
+🔴 **AND A KERNEL THAT LEANED ON A UNIFORM'S ZERO WOULD HAVE READ ANOTHER KERNEL'S VALUE.** On its
+own a program's scalar uniforms start at zero and a kernel may rely on that: `triangle.contract`
+ends `result = sum + bias` and **no caller has ever set `bias`**. Sharing a program takes that zero
+away - the uniform keeps whatever the last draw of that program left in it - and the symptom is a
+wrong number with nothing to point at. Measured rather than assumed: **112 to 1159 draws a fold**
+leave one of their own declared scalars unset (mostly `scale`, which the shared elementwise part reads in
+one branch of five, and `bias`), so `dispatch` gives every one of them its zero back and `stats`
+reports the count by kernel and name. The folds are identical either way, which says this was
+LATENT and not live - `bias` is the only `bias` in its bin, so nothing had ever written it - and
+latent by luck of which kernels happened to share a program.
+
 🔴 **AND HALF-COMBINING WAS A LOSS ON CHROME, WHICH IS THE PARALLEL COMPILE AND WORTH KNOWING.**
 `prepare` starts every link at once, and with `KHR_parallel_shader_compile` Chrome runs them off
 the thread: AF2's 53 programs come back in **519 ms**, under 10 ms each. At 36 programs - the
 consts-into-the-body version, which left every helper-declaring kernel on its own - it took
 **1226**, because merging reduces the parallelism and lengthens the longest job while saving a
 fixed cost the parallelism had already hidden. At **16** it is **292 ms**, so the count had to fall
-far enough; every model now improves on both paths (ESMFold2 719 to 183, AF3 779 to 371, bioemu2
-1167 to 591). The serial column above is still the one this backend is for - a visitor on Chrome
+far enough; every model now improves on both paths (ESMFold2 740 ms to 194, AF3 720 to 383,
+bioemu2 1200 to 595). The serial column above is still the one this backend is for - a visitor on Chrome
 has WebGPU, and the browsers that bring anyone here link inside `linkProgram` on the page's thread,
 which is where a 6x shows up as a tab that does not freeze. `--no-combine` is the control arm.
 

@@ -329,6 +329,8 @@ export async function main(device, args) {
     memory: {
       draws: memory.draws,
       programs: memory.programs,
+      // Only when there are any: a combined draw that leaves its own scalar uniform unset.
+      ...(memory.unsetUniforms === undefined ? {} : { unsetUniforms: memory.unsetUniforms }),
       allocations: memory.allocations,
       textureReuses: memory.reuses,
       framebuffers: memory.framebuffers,

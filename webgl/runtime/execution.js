@@ -487,6 +487,8 @@ export class Execution {
     this.combined = new Map();
     /** The one-texel textures a combined draw's unused samplers are pointed at, by type. */
     this.placeholders = {};
+    /** Draws given back the zero an unset scalar uniform has on its own, by kernel and name. */
+    this.unsetUniforms = new Map();
 
     this.dispatches = 0;
     this.draws = 0;
@@ -657,7 +659,12 @@ export class Execution {
       const code = assembleParts(pieces);
       const held = new Map(pieces.flatMap(samplersOf).map((sampler) => [sampler.name, sampler]));
       const names = [...held.values()];
-      bin.forEach(([source], index) => this.combined.set(source, { code, index, samplers: names }));
+      bin.forEach(([source], index) => this.combined.set(source, { code, index, samplers: names,
+        // ...and the SCALAR uniforms this part itself declares, with their type: a draw of it that
+        // does not set one gets a zero rather than the last kernel's value (see `dispatch`).
+        reads: bin[index][1].uniforms.filter((uniform) => !/sampler/.test(uniform))
+          .map((uniform) => ({ name: uniform.split(/\s+/).at(-1),
+                               integer: /\bu?int\b/.test(uniform) })) }));
     }
   }
 
@@ -1033,6 +1040,26 @@ export class Execution {
       if (location !== null) gl.uniform1i(location, value);
     }
 
+    // 🔴 A COMBINED PROGRAM'S SCALAR UNIFORMS PERSIST BETWEEN DRAWS, SO A KERNEL THAT LEAVES ONE
+    // UNSET WOULD READ ANOTHER KERNEL'S VALUE. On its own a program's uniforms start at zero and a
+    // kernel may lean on that - `triangle.contract` ends `result = sum + bias` and no caller has
+    // ever set `bias` - so sharing a program takes that zero away, and the symptom is a wrong
+    // number with nothing to point at. Measured over the four folds, 112 to 1159 draws a fold
+    // leave one of their own scalars unset (mostly `scale`, which the shared elementwise part reads
+    // in one branch of five), so this is not hypothetical: each is given its zero back. The folds
+    // are identical either way, so it was latent - and latent by luck of the bin composition.
+    // `halfDither` is excepted - it is this class's, and already set where it is not zero.
+    if (combined !== undefined) {
+      for (const { name, integer } of combined.reads) {
+        if (name === "halfDither" || name in ints || name in floats || name in optionalInts) continue;
+        const location = this.#uniform(entry, name);
+        if (location === null) continue; // the compiler removed it: nothing in here reads it
+        if (integer) gl.uniform1i(location, 0);
+        else gl.uniform1f(location, 0);
+        const key = `${label.split(":")[0]}:${name}`;
+        this.unsetUniforms.set(key, (this.unsetUniforms.get(key) ?? 0) + 1);
+      }
+    }
     if (this.halfDither !== 0) {
       // Set where the kernel has it and skip where it does not: a kernel that
       // never rounds has no such uniform, and that is not an error.
@@ -1179,6 +1206,8 @@ export class Execution {
       dispatches: this.dispatches, draws: this.draws, programs: this.programs.size,
       // Kernels sharing a program, and how many programs they share (`combine`): the two numbers
       // that say what the compile queue was spared, since a link costs the same whatever it holds.
+      ...(this.unsetUniforms.size === 0 ? {}
+        : { unsetUniforms: Object.fromEntries(this.unsetUniforms) }),
       combinedKernels: this.combined.size,
       combinedPrograms: new Set([...this.combined.values()].map(({ code }) => code)).size,
       framebuffers: this.framebuffers.size, framebufferBuilds: this.framebufferBuilds,

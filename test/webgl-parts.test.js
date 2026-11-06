@@ -3,6 +3,9 @@ import assert from "node:assert/strict";
 import {
   assembleParts, part, partFromSource, sized, targetDeclarations, ONE_TARGET, PRELUDE,
 } from "../webgl/runtime/execution.js";
+import { ipaSoftmaxSource, transformPointsSource } from "../webgl/af2/structure/ipa.js";
+import { atom37Source } from "../webgl/af2/structure/geometry.js";
+import { contractSource } from "../webgl/kernels/triangle-contract.js";
 
 const add = part({ ELEMENTS: 8 }, { uniforms: ["sampler2D aTex", "sampler2D bTex"], body: "  result = vec4(1.0);" });
 const scale = part({ ELEMENTS: 8, C4: 2 }, { uniforms: ["sampler2D aTex", "float scale"], helpers: "float scaleHelper() { return scale; }", body: "  result = vec4(scaleHelper());" });
@@ -76,4 +79,28 @@ void main() {
     "  result = vec4(0.0);").code), null);
   // Something that is not one of PRELUDE's kernels at all.
   assert.equal(partFromSource("#version 300 es\nvoid main() {}"), null);
+});
+
+// 🔴 AND THE RENAME IS CHECKED AGAINST REAL KERNELS, NOT ONLY MADE-UP ONES. Stripping the digest
+// prefix back out of the assembled program must give the kernel it came from, line for line: that
+// is what says the conversion is a RENAME and not a rewrite. Four kernels from three models, two
+// of them with helper functions and one a 2048-element table.
+test("a real kernel, converted and stripped back, is the kernel it came from", () => {
+  const sources = [
+    transformPointsSource(59, 12, 4),
+    contractSource(59, 128, "outgoing"),
+    atom37Source(59),
+    ipaSoftmaxSource(59, 12),
+  ];
+  for (const source of sources) {
+    // A `sized` kernel hands back {code, sizes}; the older ones are the text itself.
+    const code = typeof source === "string" ? source : source.code;
+    const piece = partFromSource(code);
+    assert.notEqual(piece, null);
+    // Comments excepted: parsing the declarations takes them out, which no compiler can see.
+    const lines = (text) => text.replace(/p[0-9a-z]{4,}_/g, "")
+      .split("\n").map((line) => line.trim())
+      .filter((line) => line !== "" && !line.startsWith("//")).sort();
+    assert.deepEqual(lines(assembleParts([piece])), lines(code));
+  }
 });
