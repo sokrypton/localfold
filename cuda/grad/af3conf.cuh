@@ -83,17 +83,33 @@ __global__ void confPairInitBwdLRK(const real* d, real* dl, real* dr, int n, int
   for (int o = 0; o < n; ++o) { sl += d[((size_t)o * n + k) * C + c]; sr += d[((size_t)k * n + o) * C + c]; }
   dl[t] = sl; dr[t] = sr;
 }
-// by channel: the distogram's rows and the distance weight
-__global__ void confPairInitBwdWK(const real* d, const int* bin, const real* sq, const real* pm, real* dWd, real* dWdist, int n, int C) {
-  int c = blockIdx.x * blockDim.x + threadIdx.x;
-  if (c >= C) return;
+// by channel: the distogram's rows and the distance weight - a block a slab of pairs and of 128 channels, each bin's sum
+// in shared memory, added in once a block (one thread a channel over all n^2 pairs was 129 ms at 512 tokens: 2 blocks)
+__global__ void confPairInitBwdWK(const real* d, const int* bin, const real* sq, const real* pm, real* dWd, real* dWdist, int n,
+                                  int C, int bins) {
+  extern __shared__ __align__(16) unsigned char cpiSm[];
+  real* acc = reinterpret_cast<real*>(cpiSm);   // [bins][128]
+  const int tc = threadIdx.x, c = blockIdx.y * 128 + tc;
+  for (int i = tc; i < bins * 128; i += 128) acc[i] = 0;
+  __syncthreads();
+  const size_t nn = (size_t)n * n, per = (nn + gridDim.x - 1) / gridDim.x, i0 = blockIdx.x * per, i1 = i0 + per < nn ? i0 + per : nn;
   real sd = 0;
-  for (size_t ij = 0; ij < (size_t)n * n; ++ij) {
-    real g = d[ij * C + c];
-    if (bin[ij] >= 0) dWd[(size_t)bin[ij] * C + c] += g * (pm ? pm[ij] : (real)1);
-    if (dWdist) sd += g * sqrt(sq[ij] + (real)1e-10);
-  }
-  if (dWdist) dWdist[c] += sd;
+  if (c < C)
+    for (size_t ij = i0; ij < i1; ++ij) {
+      const real g = d[ij * C + c];
+      const int b = bin[ij];
+      if (b >= 0) acc[b * 128 + tc] += g * (pm ? pm[ij] : (real)1);
+      if (dWdist) sd += g * sqrt(sq[ij] + (real)1e-10);
+    }
+  if (c >= C) return;
+  for (int b = 0; b < bins; ++b) if (acc[b * 128 + tc] != 0) atomicAdd(&dWd[(size_t)b * C + c], acc[b * 128 + tc]);
+  if (dWdist) atomicAdd(&dWdist[c], sd);
+}
+inline void confPairInitBwdW(const real* d, const int* bin, const real* sq, const real* pm, real* dWd, real* dWdist, int n, int C, int bins) {
+  const size_t smem = (size_t)bins * 128 * sizeof(real);
+  static bool attr = false;
+  if (!attr) { GK(cudaFuncSetAttribute(confPairInitBwdWK, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024)); attr = true; }
+  confPairInitBwdWK<<<dim3(432, (C + 127) / 128), 128, smem, STREAM>>>(d, bin, sq, pm, dWd, dWdist, n, C, bins);
 }
 __global__ void clampFwdK(const real* x, real* y, real lim, size_t n) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -121,21 +137,27 @@ __global__ void reembedTermsK(real* pair, const real* bonds, const real* orders,
   if (o < 0 || o >= 7) o = 0;
   pair[t] += (bonds ? bonds[ij] * wb[c] : 0) + wbt[(size_t)o * C + c] + un[c];
 }
+// (a block a slab of pairs and of 128 channels, the 7 bond types' sums in shared memory: one thread a channel over all
+// pairs was confPairInitBwdWK's 129 ms at 512 tokens)
 __global__ void reembedTermsBwdK(const real* d, const real* bonds, const real* orders, real* dwb, real* dwbt, real* dun,
                                  size_t pairs, int C) {
-  int c = blockIdx.x * blockDim.x + threadIdx.x;
+  __shared__ real acc[7][128];
+  const int tc = threadIdx.x, c = blockIdx.y * 128 + tc;
+  for (int o = 0; o < 7; ++o) acc[o][tc] = 0;
+  const size_t per = (pairs + gridDim.x - 1) / gridDim.x, i0 = blockIdx.x * per, i1 = i0 + per < pairs ? i0 + per : pairs;
   if (c >= C) return;
   real sb = 0, su = 0;
-  for (size_t ij = 0; ij < pairs; ++ij) {
+  for (size_t ij = i0; ij < i1; ++ij) {
     real g = d[ij * C + c];
     int o = orders ? (int)orders[ij] : 0;
     if (o < 0 || o >= 7) o = 0;
-    dwbt[(size_t)o * C + c] += g;
+    acc[o][tc] += g;
     if (bonds) sb += bonds[ij] * g;
     su += g;
   }
-  if (bonds) dwb[c] += sb;
-  dun[c] += su;
+  for (int o = 0; o < 7; ++o) if (acc[o][tc] != 0) atomicAdd(&dwbt[(size_t)o * C + c], acc[o][tc]);
+  if (bonds) atomicAdd(&dwb[c], sb);
+  atomicAdd(&dun[c], su);
 }
 // pair[i, j] += a[i] * b[j] (by channel), and back
 __global__ void outerRowsK(const real* a, const real* b, real* out, int n, int C) {
@@ -512,8 +534,8 @@ inline void confidenceBackward(ConfidenceHead& h, const ConfidenceSave& s, const
   real *dl = ARENA.get((size_t)n * h.C), *dr = ARENA.get((size_t)n * h.C);
   confPairInitBwdLRK<<<blocks((size_t)n * h.C), 256, 0, STREAM>>>(dz, dl, dr, n, h.C);
   if (h.reembed) {
-    confPairInitBwdWK<<<blocks(h.C, 64), 64, 0, STREAM>>>(dz, s.bin, s.sq, pairMask, h.distW.g, nullptr, n, h.C);
-    reembedTermsBwdK<<<blocks(h.C, 64), 64, 0, STREAM>>>(dz, cb.bonds, cb.orders, h.bondW.g, h.bondType.g, h.unspecified.g, nn, h.C);
+    confPairInitBwdW(dz, s.bin, s.sq, pairMask, h.distW.g, nullptr, n, h.C, h.bins);
+    reembedTermsBwdK<<<dim3(432, (h.C + 127) / 128), 128, 0, STREAM>>>(dz, cb.bonds, cb.orders, h.bondW.g, h.bondType.g, h.unspecified.g, nn, h.C);
     {
       Scratch sc;
       real* prod = ARENA.get(nn * h.C);
@@ -539,8 +561,7 @@ inline void confidenceBackward(ConfidenceHead& h, const ConfidenceSave& s, const
     else { Scratch sc; real* t = ARENA.get(nn * h.C); lnBackward(h.zLn, s.lz, dz, t, nn, false); }
     return;
   }
-  confPairInitBwdWK<<<blocks(h.C, 64), 64, 0, STREAM>>>(dz, s.bin, s.sq, h.unmasked ? nullptr : pairMask, h.distW.g,
-                                                        h.hasDist ? h.distF.g : nullptr, n, h.C);
+  confPairInitBwdW(dz, s.bin, s.sq, h.unmasked ? nullptr : pairMask, h.distW.g, h.hasDist ? h.distF.g : nullptr, n, h.C, h.bins);
   // the single's input
   if (h.globalNorm) { if (dtrunkSingle) gnBackward(s.gs, trunkSingle, seqMask, n, dsg, dtrunkSingle, true); }
   else if (h.singleNorm) {
