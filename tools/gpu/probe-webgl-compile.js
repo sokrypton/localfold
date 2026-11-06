@@ -33,6 +33,7 @@ export async function main(_device, args = []) {
   mark("dry run done");
   const gl = execution.gl;
   const timed = [];
+  const linkMsOf = new Map();
   // `--shared-vs=1`: one compiled vertex shader attached to every program, instead of one each.
   let vertex = null;
   if (option("shared-vs", "0") === "1") {
@@ -56,6 +57,7 @@ export async function main(_device, args = []) {
       if (!gl.getProgramParameter(program, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(program));
     }
     timed.push({ label, ms: performance.now() - t, chars: source.length });
+    linkMsOf.set(source, performance.now() - t);
   }
   timed.sort((a, b) => b.ms - a.ms);
   const total = timed.reduce((a, x) => a + x.ms, 0);
@@ -78,7 +80,8 @@ export async function main(_device, args = []) {
       .filter(([, n]) => n > 1).sort((a, b) => b[1] - a[1]).map(([f, n]) => `${n} ${f}`),
     labelsOf: Object.fromEntries((option("labels", "") ? option("labels", "").split(",") : []).map((f) => [f, timed.filter(({ label }) => label.split(":")[0] === f).map(({ label }) => label)])),
     renderer: gl.getParameter(gl.RENDERER), programs: timed.length, groups: sliceGroups.map((g) => g.length),
-    firstGroup: sliceGroups[0].map((source) => programs.get(source)), dryRunMs, linkTotalMs: Math.round(total),
+    firstGroup: sliceGroups[0].map((source) => programs.get(source)),
+    firstGroupLinkMs: Math.round(sliceGroups[0].reduce((a, source) => a + (linkMsOf.get(source) ?? 0), 0)), dryRunMs, linkTotalMs: Math.round(total),
     top: timed.slice(0, Number(option("top", "25"))).map(({ label, ms, chars }) => `${ms.toFixed(1)} ms ${chars}c ${label}`),
     families: Object.entries(byFamily).sort((a, b) => b[1] - a[1]).slice(0, 15).map(([f, ms]) => `${Math.round(ms)} ms ${f}`),
   };

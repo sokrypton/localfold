@@ -47,6 +47,20 @@ const ACTIVATIONS = {
   sigmoid: "vec4(1.0) / (vec4(1.0) + exp(-value))",
 };
 
+/**
+ * The activation as a UNIFORM, like the shapes: a constant one forked every kernel here in three
+ * (an AF3 fold drew 6 `linear` programs where 3 now serve it), and on Safari 16.3 a program is a
+ * ~19 ms link on the page's thread. The same expressions, chosen by a branch every fragment takes
+ * the same way.
+ */
+const ACTIVATION_CODES = { none: 0, relu: 1, sigmoid: 2 };
+const ACTIVATE = `uniform int ACT;
+vec4 activate(vec4 value) {
+  if (ACT == ${ACTIVATION_CODES.relu}) return ${ACTIVATIONS.relu};
+  if (ACT == ${ACTIVATION_CODES.sigmoid}) return ${ACTIVATIONS.sigmoid};
+  return ${ACTIVATIONS.none};
+}`;
+
 /** `half4` is in the prelude; see `webgl/runtime/execution.js` for why. */
 const ROUND_HALF = (expression) => `half4(${expression})`;
 
@@ -131,7 +145,7 @@ export const linearSource = (
       int row = element / OUT;
       int o = element - row * OUT;
       int xBase = row * IN4;
-      float sum = ${useBias ? "fetch1(biasTex, o)" : "0.0"};
+      float sum = HAS_BIAS == 1 ? fetch1(biasTex, o) : 0.0;
       for (int i = 0; i < IN4; ++i) {
         vec4 x = fetch4(xTex, xBase + i);
         int w = ${weightLayout === "in-major" ? "(i * 4) * OUT + o" : "o * IN + i * 4"};
@@ -172,9 +186,11 @@ export const linearSource = (
 
   return `${PRELUDE}${ONE_TARGET}
 ${SHAPE_UNIFORMS}
+${ACTIVATE}
 uniform sampler2D xTex;
 uniform sampler2D weightTex;
-${useBias ? "uniform sampler2D biasTex;" : ""}
+uniform sampler2D biasTex;
+uniform int HAS_BIAS;
 
 void main() {
 ${ragged ? `  int base = linearTexel() * 4;
@@ -191,8 +207,8 @@ ${[0, 1, 2, 3].map(perComponent).join("\n")}
 ${raggedInput
     ? (weightLayout === "in-major" ? inMajorRagged : outMajorRagged)
     : (weightLayout === "in-major" ? inMajor : outMajor)}
-  vec4 value = sum${useBias ? " + fetch4(biasTex, group)" : ""};`}
-  result = ${roundHalf ? ROUND_HALF(ACTIVATIONS[activation]) : ACTIVATIONS[activation]};
+  vec4 value = HAS_BIAS == 1 ? sum + fetch4(biasTex, group) : sum;`}
+  result = ${roundHalf ? ROUND_HALF("activate(value)") : "activate(value)"};
 }`;
 };
 
@@ -401,12 +417,13 @@ ${each((i) => `    vec4 x${i} = fetch4(xTex, xBase${i} + k);
     acc${i} += vec4(dot(x${i}, w0), dot(x${i}, w1), dot(x${i}, w2), dot(x${i}, w3));`)}
   }`;
   const value = (i) => {
-    const sum = useBias ? `acc${i} + fetch4(biasTex, group)` : `acc${i}`;
-    const activated = ACTIVATIONS[activation].replace(/\bvalue\b/g, `(${sum})`);
+    const sum = `(HAS_BIAS == 1 ? acc${i} + fetch4(biasTex, group) : acc${i})`;
+    const activated = `activate(${sum})`;
     return roundHalf ? `half4(${activated})` : activated;
   };
   return `${PRELUDE}${targetDeclarations(blockRows)}
 ${SHAPE_UNIFORMS}
+${ACTIVATE}
 uniform int RQ;
 // 🔴 x's ROW STRIDE, which must divide the texture width or every logical row
 // wraps at a different offset and the cache cannot follow twelve such streams.
@@ -414,7 +431,8 @@ uniform int RQ;
 uniform int XSTRIDE4;
 uniform sampler2D xTex;
 uniform sampler2D weightTex;
-${useBias ? "uniform sampler2D biasTex;" : ""}
+uniform sampler2D biasTex;
+uniform int HAS_BIAS;
 
 void main() {
   int texel = linearTexel();
@@ -459,12 +477,13 @@ export const blockedInt5Source = (
   const each = (template) => Array.from(
     { length: blockRows }, (_, i) => template(i)).join("\n");
   const value = (i) => {
-    const sum = useBias ? `acc${i} + fetch4(biasTex, group)` : `acc${i}`;
-    const activated = ACTIVATIONS[activation].replace(/\bvalue\b/g, `(${sum})`);
+    const sum = `(HAS_BIAS == 1 ? acc${i} + fetch4(biasTex, group) : acc${i})`;
+    const activated = `activate(${sum})`;
     return roundHalf ? `half4(${activated})` : activated;
   };
   return `${PRELUDE}${targetDeclarations(blockRows)}
 ${SHAPE_UNIFORMS}
+${ACTIVATE}
 uniform int RQ;
 // 🔴 x's ROW STRIDE, which must divide the texture width or every logical row
 // wraps at a different offset and the cache cannot follow twelve such streams.
@@ -474,7 +493,8 @@ uniform int GPR;
 uniform sampler2D xTex;
 uniform highp usampler2D codeTex;
 uniform sampler2D tableTex;
-${useBias ? "uniform sampler2D biasTex;" : ""}
+uniform sampler2D biasTex;
+uniform int HAS_BIAS;
 ${INT5_DECODE}
 ${INT5_DECODE8}
 
@@ -763,15 +783,15 @@ export function linear(execution, call, into) {
           rows, inChannels, outChannels, activation, bias !== undefined, weightLayout, roundHalf,
           blockRows, rowFastest, xStride4),
       outputs: planes,
+      // ...the bias always bound, x standing in where there is none (HAS_BIAS 0, never read), so
+      // a projection with and without one is the same program
       inputs: int5
-        ? (bias === undefined
-          ? { xTex: xUse, codeTex: codeWeight.codes, tableTex: codeWeight.table }
-          : { xTex: xUse, codeTex: codeWeight.codes, tableTex: codeWeight.table, biasTex: bias })
-        : (bias === undefined
-          ? { xTex: xUse, weightTex: weightTensor }
-          : { xTex: xUse, weightTex: weightTensor, biasTex: bias }),
+        ? { xTex: xUse, codeTex: codeWeight.codes, tableTex: codeWeight.table, biasTex: bias ?? xUse }
+        : { xTex: xUse, weightTex: weightTensor, biasTex: bias ?? xUse },
       optionalInts: {
         ...shapeInts(rows, inChannels, outChannels),
+        ACT: ACTIVATION_CODES[activation],
+        HAS_BIAS: bias === undefined ? 0 : 1,
         RQ: rowQuads,
         // x's row stride, a uniform like the shapes: as a constant it split this kernel into one
         // program per input width (10 of an AF3 fold's 125), ~20 ms a link on Safari 16.3
@@ -815,10 +835,11 @@ export function linear(execution, call, into) {
     source: linearSource(
       rows, inChannels, outChannels, activation, bias !== undefined, weightLayout, roundHalf),
     output,
-    inputs: bias === undefined
-      ? { xTex: narrowed?.tensor ?? x, weightTex: weightTensor }
-      : { xTex: narrowed?.tensor ?? x, weightTex: weightTensor, biasTex: bias },
-    optionalInts: shapeInts(rows, inChannels, outChannels),
+    inputs: { xTex: narrowed?.tensor ?? x, weightTex: weightTensor, biasTex: bias ?? narrowed?.tensor ?? x },
+    optionalInts: {
+      ...shapeInts(rows, inChannels, outChannels), ACT: ACTIVATION_CODES[activation],
+      HAS_BIAS: bias === undefined ? 0 : 1,
+    },
     label: `linear:${rows}x${inChannels}x${outChannels}:${activation}:${weightLayout}`
       + `${roundHalf ? ":half" : ""}${narrowUnblocked ? ":half-x" : ""}`,
   });

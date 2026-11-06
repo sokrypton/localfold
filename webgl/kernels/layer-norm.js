@@ -63,8 +63,10 @@ export const raggedLayerNormSource = (
   rows, channels, roundHalf, variance, hasWeight, hasBias,
 ) => sized({ ELEMENTS: rows * channels, CHANNELS: channels }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D xTex;
-${hasWeight ? "uniform sampler2D weightTex;" : ""}
-${hasBias ? "uniform sampler2D biasTex;" : ""}
+uniform sampler2D weightTex;
+uniform sampler2D biasTex;
+uniform int HAS_WEIGHT;
+uniform int HAS_BIAS;
 uniform float epsilon;
 
 float normalised(int element) {
@@ -89,8 +91,8 @@ ${variance === "fast" ? `  float totalSquares = 0.0;
   }
   float inverseStd = inversesqrt(spread / float(CHANNELS) + epsilon);`}
   float value = (fetch1(xTex, element) - mean) * inverseStd;
-${hasWeight ? "  value *= fetch1(weightTex, channel);" : ""}
-${hasBias ? "  value += fetch1(biasTex, channel);" : ""}
+  if (HAS_WEIGHT == 1) value *= fetch1(weightTex, channel);
+  if (HAS_BIAS == 1) value += fetch1(biasTex, channel);
   return value;
 }
 
@@ -172,14 +174,21 @@ ${variance === "fast"
   result = vec4(mean, inverseStd, 0.0, 0.0);
 }`);
 
-/** The aligned kernel with the statistics read rather than swept. */
+/**
+ * The aligned kernel with the statistics read rather than swept.
+ *
+ * (In all three, weight and bias are flags, HAS_WEIGHT / HAS_BIAS, rather than forks of the source:
+ * with and without them were separate programs, ~19 ms a link on Safari 16.3's page thread.)
+ */
 export const splitLayerNormSource = (
   rows, channels, roundHalf, hasWeight, hasBias,
 ) => sized({ ROWS: rows, CH4: channels / 4 }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D xTex;
 uniform sampler2D statsTex;
-${hasWeight ? "uniform sampler2D weightTex;" : ""}
-${hasBias ? "uniform sampler2D biasTex;" : ""}
+uniform sampler2D weightTex;
+uniform sampler2D biasTex;
+uniform int HAS_WEIGHT;
+uniform int HAS_BIAS;
 
 void main() {
   int texel = linearTexel();
@@ -188,7 +197,10 @@ void main() {
   int group = texel - row * CH4;
   vec2 stats = fetch4(statsTex, row).xy;
   vec4 value = fetch4(xTex, texel);
-  vec4 normalised = (value - stats.x) * stats.y${hasWeight ? " * fetch4(weightTex, group)" : ""}${hasBias ? "\n    + fetch4(biasTex, group)" : ""};
+  // ...one expression, as before the flags, so the compiler fuses it as it did
+  vec4 w = HAS_WEIGHT == 1 ? fetch4(weightTex, group) : vec4(1.0);
+  vec4 b = HAS_BIAS == 1 ? fetch4(biasTex, group) : vec4(0.0);
+  vec4 normalised = (value - stats.x) * stats.y * w + b;
   result = ${roundHalf ? "half4(normalised)" : "normalised"};
 }`);
 
@@ -196,8 +208,10 @@ export const alignedLayerNormSource = (
   rows, channels, roundHalf, variance, hasWeight, hasBias,
 ) => sized({ ROWS: rows, CHANNELS: channels, CH4: channels / 4 }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D xTex;
-${hasWeight ? "uniform sampler2D weightTex;" : ""}
-${hasBias ? "uniform sampler2D biasTex;" : ""}
+uniform sampler2D weightTex;
+uniform sampler2D biasTex;
+uniform int HAS_WEIGHT;
+uniform int HAS_BIAS;
 uniform float epsilon;
 
 void main() {
@@ -234,7 +248,10 @@ ${variance === "fast"
   float inverseStd = inversesqrt(spread / float(CHANNELS) + epsilon);`}
 
   vec4 value = fetch4(xTex, texel);
-  vec4 normalised = (value - mean) * inverseStd${hasWeight ? " * fetch4(weightTex, group)" : ""}${hasBias ? "\n    + fetch4(biasTex, group)" : ""};
+  // ...one expression, as before the flags, so the compiler fuses it as it did
+  vec4 w = HAS_WEIGHT == 1 ? fetch4(weightTex, group) : vec4(1.0);
+  vec4 b = HAS_BIAS == 1 ? fetch4(biasTex, group) : vec4(0.0);
+  vec4 normalised = (value - mean) * inverseStd * w + b;
   // The shipped AF2 attention stores this tensor in f16 (normalizedStorage);
   // see half4 in webgl/runtime/execution.js. No backticks in a GLSL comment -
   // it lives inside a JS template literal and one would end it.
@@ -338,9 +355,11 @@ export function layerNorm(
       inputs: {
         xTex: x,
         statsTex: stats,
-        ...(weight === undefined ? {} : { weightTex: weight }),
-        ...(bias === undefined ? {} : { biasTex: bias }),
+        // ...weight and bias always bound, x standing in for one that is absent (never read)
+        weightTex: weight ?? x,
+        biasTex: bias ?? x,
       },
+      ints: { HAS_WEIGHT: weight === undefined ? 0 : 1, HAS_BIAS: bias === undefined ? 0 : 1 },
       label: `layer-norm.apply:${rows}x${channels}${roundHalf ? ":half" : ""}`
         + `${weight === undefined ? ":no-scale" : ""}${bias === undefined ? ":no-offset" : ""}`,
     });
@@ -353,9 +372,10 @@ export function layerNorm(
     output,
     inputs: {
       xTex: x,
-      ...(weight === undefined ? {} : { weightTex: weight }),
-      ...(bias === undefined ? {} : { biasTex: bias }),
+      weightTex: weight ?? x,
+      biasTex: bias ?? x,
     },
+    ints: { HAS_WEIGHT: weight === undefined ? 0 : 1, HAS_BIAS: bias === undefined ? 0 : 1 },
     floats: { epsilon },
     label: `layer-norm:${rows}x${channels}${roundHalf ? ":half" : ""}`
       + `${variance === "fast" ? ":fast" : ""}`

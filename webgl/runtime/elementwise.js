@@ -22,6 +22,26 @@ void main() {
   int texel = linearTexel();
   if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }`;
 
+/**
+ * `add`, `multiply`, `scale` and `relu` in ONE program, the operation a uniform: as four programs
+ * they were four links of ~19 ms on Safari 16.3's page thread for the same few lines (the
+ * one-input operations bind their input twice). The per-operation sources below stay for callers
+ * that draw them directly.
+ */
+const OPS = { add: 0, multiply: 1, scale: 2, relu: 3 };
+export const elementwiseSource = (elements) => sized({ ELEMENTS: elements }, `${PRELUDE}${ONE_TARGET}
+uniform sampler2D aTex;
+uniform sampler2D bTex;
+uniform int OP;
+uniform float scale;
+${guard}
+  vec4 a = fetch4(aTex, texel);
+  if (OP == ${OPS.add}) result = a + fetch4(bTex, texel);
+  else if (OP == ${OPS.multiply}) result = a * fetch4(bTex, texel);
+  else if (OP == ${OPS.scale}) result = a * scale;
+  else result = max(a, vec4(0.0));
+}`);
+
 /** `a + b`, elementwise. */
 export const addSource = (elements) => sized({ ELEMENTS: elements }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D aTex;
@@ -68,7 +88,8 @@ export function relu(execution, a, into) {
     throw new Error("relu: a fragment shader cannot read the texture it draws into");
   }
   return execution.dispatch({
-    source: reluSource(a.elements), output, inputs: { aTex: a }, label: "elementwise.relu",
+    source: elementwiseSource(a.elements), output, inputs: { aTex: a, bTex: a },
+    ints: { OP: OPS.relu }, label: "elementwise.relu",
   });
 }
 
@@ -96,7 +117,8 @@ export function add(execution, a, b, into) {
     throw new Error("add: a fragment shader cannot read the texture it draws into");
   }
   return execution.dispatch({
-    source: addSource(a.elements), output, inputs: { aTex: a, bTex: b }, label: "elementwise.add",
+    source: elementwiseSource(a.elements), output, inputs: { aTex: a, bTex: b },
+    ints: { OP: OPS.add }, label: "elementwise.add",
   });
 }
 
@@ -116,8 +138,8 @@ export function multiply(execution, a, b, into) {
     throw new Error("multiply: a fragment shader cannot read the texture it draws into");
   }
   return execution.dispatch({
-    source: multiplySource(a.elements), output, inputs: { aTex: a, bTex: b },
-    label: "elementwise.multiply",
+    source: elementwiseSource(a.elements), output, inputs: { aTex: a, bTex: b },
+    ints: { OP: OPS.multiply }, label: "elementwise.multiply",
   });
 }
 
@@ -134,8 +156,8 @@ export function scale(execution, a, factor, into) {
     throw new Error("scale: a fragment shader cannot read the texture it draws into");
   }
   return execution.dispatch({
-    source: scaleSource(a.elements), output, inputs: { aTex: a },
-    floats: { scale: factor }, label: "elementwise.scale",
+    source: elementwiseSource(a.elements), output, inputs: { aTex: a, bTex: a },
+    ints: { OP: OPS.scale }, floats: { scale: factor }, label: "elementwise.scale",
   });
 }
 
