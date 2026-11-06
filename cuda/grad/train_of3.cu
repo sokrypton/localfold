@@ -1112,6 +1112,9 @@ int main(int argc, char** argv) {
     std::vector<double> xs(A * 3, 0);
     for (size_t i = 0; i < A; ++i) if (e.predMask[i] > 0) for (int p = 0; p < 3; ++p) xs[i * 3 + p] = level(0) * nd(gen);
     g::real *xd = g::ARENA.get(A * 3), *od = g::ARENA.get(A * 3);
+    // (the conditioning's pair half and the encoder's shared part once for the 20 steps: only the noise level changes)
+    const g::af3::CondSave pairC = g::af3::condForward(dn.cond, a.singles[nPf], a.pairs[nMsa + nPf], a.tf, d.ri, d.ti, d.asym, d.ent, d.sym, (g::real)level(0), d.n);
+    const g::af3::EncSave encC = g::af3::encShared(dn.enc, d.b, a.singles[nPf], pairC.pairOut);
     size_t live = 0; for (size_t i = 0; i < A; ++i) live += e.predMask[i] > 0;
     for (int k = 1; k <= nsteps; ++k) {
       const double prev = level(k - 1), lv = level(k), tHat = prev * (1 + (lv > gammaMin ? gamma0 : 0));
@@ -1128,10 +1131,7 @@ int main(int argc, char** argv) {
         }
       }
       { std::vector<g::real> rr(noisy.begin(), noisy.end()); GK(cudaMemcpy(xd, rr.data(), rr.size() * sizeof(g::real), cudaMemcpyHostToDevice)); }
-      {
-        g::Scratch sc;
-        g::af3::denoiseForward(dn, d.b, a.singles[nPf], a.pairs[nMsa + nPf], a.tf, d.seqMask, xd, (g::real)tHat, d.ri, d.ti, d.asym, d.ent, d.sym, od);
-      }
+      g::af3::denoiseStepForward(dn, d.b, pairC, encC, a.singles[nPf], d.seqMask, xd, (g::real)tHat, od, k == 1);
       auto den = g::host(od, A * 3);
       const double coef = stepScale * (lv - tHat) / tHat;
       for (size_t i = 0; i < A * 3; ++i) xs[i] = noisy[i] + coef * (noisy[i] - den[i]);

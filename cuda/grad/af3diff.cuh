@@ -305,12 +305,14 @@ struct DiffRun {
 };
 // S samples batched: act, cond, mask and out [S n, ...] (each sample's own noise level in its cond rows), the pair
 // conditioning one for all - its logits computed once and read by every sample
+// (logitsKept: r's pair logits are already pairCond's - a sampler's steps after its first, one pair for every step)
 inline void transformerForward(DiffTransformer& t, DiffRun& r, const real* act, const real* cond, const real* mask,
-                               const real* pairCond, real* out, int n, int S = 1) {
+                               const real* pairCond, real* out, int n, int S = 1, bool logitsKept = false) {
   const Arena::Mark m0 = ARENA.mark();   // the caller's arena is kept: this scopes its own use
   const size_t nn = (size_t)n * n, rows = (size_t)n * S;
   const int nb = (int)t.blocks.size();
   if (r.n != n || r.S != S || r.acts.empty()) {
+    logitsKept = false;
     for (real* p : r.acts) GK(cudaFree(p));
     if (r.pn) { GK(cudaFree(r.pn)); GK(cudaFree(r.pl)); }
     r.acts.assign(nb + 1, nullptr);
@@ -320,7 +322,7 @@ inline void transformerForward(DiffTransformer& t, DiffRun& r, const real* act, 
     r.n = n; r.S = S;
   }
   ARENA.rewind(m0);
-  {
+  if (!logitsKept) {
     real* mean = ARENA.get(nn); real* rstd = ARENA.get(nn);
     lnFwdK<<<blocks(nn, 8), 256, 0, STREAM>>>(pairCond, t.pairNorm.g.w, nullptr, r.pn, mean, rstd, nn, t.Cz, t.pairNorm.eps);
     real* flat = ARENA.get(nn * t.perSuper * t.H);

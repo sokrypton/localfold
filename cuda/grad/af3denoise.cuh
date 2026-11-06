@@ -749,6 +749,24 @@ inline DenoiseSave denoiseForward(Denoiser& m, const AtomBatch& b, const real* t
   denoisePost(m, b, s, x, trOut, out);
   return s;
 }
+// a sampler's step (no gradient): D(x, sigma) on a conditioning's pair half and an encoder's shared part made once for
+// every step (pair: condForward's, enc: encShared's) - only the noise level's single half and the sample's own parts
+// made again, as denoiseBatchForward's sample k is; after the first step (first false) the transformer's pair logits too
+inline void denoiseStepForward(Denoiser& m, const AtomBatch& b, const CondSave& pair, const EncSave& enc, const real* trunkSingle,
+                               const real* seqMask, const real* x, real sigma, real* out, bool first) {
+  Scratch sc;
+  const int n = b.tokens, P = m.enc.perToken;
+  DenoiseSave s{}; s.n = n;
+  denoiseScales(s, sigma);
+  s.cs = condSingleForward(m.cond, pair, sigma);
+  denoisePre(m, b, s, trunkSingle, x, ARENA.get((size_t)n * P), &enc);
+  real* trOut = ARENA.get((size_t)n * P);
+  {
+    Scratch st;
+    transformerForward(m.tr, m.run, s.tok, s.cs.sFinal, seqMask, s.cs.pairOut, trOut, n, 1, !first);
+  }
+  denoisePost(m, b, s, x, trOut, out);
+}
 // the backward's halves: after the transformer (dout -> the transformer output's gradient, and what the encoder's
 // backward reads), then before it (the transformer input's gradient -> the encoder, the single's projection)
 struct DenoiseGrads { real *dtrOut, *dskip, *dpairDec, *dqCondDec; };
