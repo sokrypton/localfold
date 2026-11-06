@@ -29,6 +29,7 @@
 //   cuda/grad/train-of3 --bundle=model-openbind0-f32 --family=openbind0 --examples=<file> [--steps=N] [--batch=1]
 //       [--crop=384] [--samples=48] [--lr=1.8e-3] [--warmup=1000] [--bond=0] [--save=<ckpt>] [--save-every=N]
 //       [--resume=<ckpt>] [--seed=1] [--init=bundle|of3] [--tf32] [--bf16] [--bf16-confidence] [--mem] [--offload-pairs] [--transition-chunk=64] [--no-dropout] [--val=<file>] [--smoke]
+//       [--sample-batch=8|auto]
 // --check-ckpt=k / --check-perm=k / --check-bf16=k / --check-chunk=k: the recomputation, the truth's permutation, the bf16 trunk and the chunked transitions held
 // to their references on example k.
 // --init=of3: OpenFold3's from-scratch initialisation instead of the bundle's weights.
@@ -37,6 +38,9 @@
 #include <array>
 #include <cstring>
 #include <fstream>
+#include <future>
+#include <memory>
+#include <optional>
 #include <random>
 #include <sstream>
 #include "../af3/src/trunk.cuh"
@@ -614,14 +618,16 @@ static void drawMsa(Dev& d, const Example& e, std::mt19937_64& rng) {
   GK(cudaMemcpy(d.deletion, del.data(), del.size() * sizeof(g::real), cudaMemcpyHostToDevice));
   GK(cudaMemcpy(d.msaMask, mask.data(), mask.size() * sizeof(g::real), cudaMemcpyHostToDevice));
 }
-static of3::Layout layoutOf(const Example& e) {
+// (bonds false: without the token-bond matrix, which only the bond loss reads - n x n doubles, 580 MB and ~370 ms on a
+// whole 8,500-token entry, where a crop's choice reads the per-token fields alone)
+static of3::Layout layoutOf(const Example& e, bool bonds = true) {
   return of3::makeLayout(e.n, e.dense, e.predMask.data(), e.names.data(), e.isDna.data(), e.isRna.data(), e.isLigand.data(),
-                         e.isMod.data(), e.asym.data(), e.bonds.empty() ? nullptr : e.bonds.data());
+                         e.isMod.data(), e.asym.data(), !bonds || e.bonds.empty() ? nullptr : e.bonds.data());
 }
 
 int main(int argc, char** argv) {
   std::string bundle = "model-openbind0-f32", family = "openbind0", examplesPath, savePath, resumePath;
-  int sampleBatch = 8;   // the diffusion samples a denoiser pass (--sample-batch)
+  int sampleBatch = 8;   // the diffusion samples a denoiser pass (--sample-batch; 0, --sample-batch=auto: as many as the room holds)
   int maxRecycles = 3;   // OpenFold3's num_recycles: a step runs 1 + U{0..max} cycles (--max-recycles)
   int checkBatch = -1;
   int steps = 30, samples = 48, batch = 1, crop = 384, saveEvery = 0, checkCkpt = -1, checkPerm = -1, checkBf16 = -1, checkConfs = -1, checkChunk = -1; std::string init = "bundle";
@@ -638,7 +644,7 @@ int main(int argc, char** argv) {
     else if (auto v = opt("--examples=")) examplesPath = v;
     else if (auto v = opt("--steps=")) steps = atoi(v);
     else if (auto v = opt("--samples=")) samples = atoi(v);
-    else if (auto v = opt("--sample-batch=")) sampleBatch = std::max(1, atoi(v));
+    else if (auto v = opt("--sample-batch=")) sampleBatch = !strcmp(v, "auto") ? 0 : std::max(1, atoi(v));
     else if (auto v = opt("--max-recycles=")) maxRecycles = std::max(0, atoi(v));
     else if (auto v = opt("--check-batch=")) checkBatch = atoi(v);
     else if (auto v = opt("--batch=")) batch = std::max(1, atoi(v));
@@ -973,6 +979,7 @@ int main(int argc, char** argv) {
     const int n = d.n, S = d.S; const size_t nn = (size_t)n * n;
     if (a.off) offload.join(STREAM);    // (the last pass's copies out of the ring done before it is written again)
     auto eb = embedBatch(d);
+    g::Range rEmb_("tr.embed");
     tfS = g::af3::targetFeatForward(tfm, d.b, d.aatype, d.profile, d.delMean, a.tf);
     emS = g::af3::trunkEmbedForward(te, eb, a.tf, a.prevPair, a.prevSingle, a.zEmb, a.singles[0], a.msas[0]);
     GK(cudaMemcpyAsync(a.pairs[0], a.zEmb, nn * Cz * sizeof(g::real), cudaMemcpyDeviceToDevice, STREAM));
@@ -986,6 +993,7 @@ int main(int argc, char** argv) {
     // and the pairformer stack; the pair, MSA and single between blocks stay float32)
     const bool prevBf = g::BF16; g::BF16 = bf16Trunk;
     for (int k = 0; k < nMsa; ++k) {
+      g::Range r_("tr.msa");
       const g::Arena::Mark mk = g::ARENA.mark();
       pairSlot(a, k);
       msaS[k] = g::af3::msaForward(msaB[k], dl, a.msas[k], a.pairs[k], d.msaMask, d.pairMask, d.pairMaskT, d.seqMask, a.msas[k + 1], a.pairs[k + 1], S, n);
@@ -995,6 +1003,7 @@ int main(int argc, char** argv) {
     }
     if (doubleAdd) g::add(a.pairs[nMsa], a.zIn, nn * Cz);
     for (int k = 0; k < nPf; ++k) {
+      g::Range r_("tr.pairformer");
       const g::Arena::Mark mk = g::ARENA.mark();
       pairSlot(a, nMsa + k);
       pfS[k] = g::af3::pairformerForward(pf[k], dl, a.pairs[nMsa + k], a.singles[k], d.pairMask, d.pairMaskT, d.seqMask, nullptr,
@@ -1227,28 +1236,38 @@ int main(int argc, char** argv) {
     auto msOf = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
     double tLoss = 0;
     const auto t0 = now();
-    const of3::Layout Lfull = layoutOf(full);
+    std::optional<g::Range> rPrep_; rPrep_.emplace("step.prep");
+    std::optional<g::Range> rL_; rL_.emplace("prep.layoutFull");
+    const of3::Layout Lfull = layoutOf(full, false);
+    rL_.reset();
     // the dataset's settings (dataset_configs.py): the distillation sets crop 0.25 contiguous / 0.75 spatial with no
     // chain crop and no confidence losses; the disordered set's diffusion terms over protein alone
     const bool distil = full.set == "monomer" || full.set == "rna";
     CropWeights cw; if (distil) cw = CropWeights{0.25, 0.75, 0.0};
     // the chain crop first (the truth becomes the chain-cropped entry, as there), then the token crop
     std::vector<int> keepC(full.n); for (int t = 0; t < full.n; ++t) keepC[t] = t;
-    if (!fixed && !distil) keepC = chainCrop(full, Lfull, gen);
+    { g::Range r_("prep.chainCrop"); if (!fixed && !distil) keepC = chainCrop(full, Lfull, gen); }
+    std::optional<g::Range> rS_; rS_.emplace("prep.subsetC");
     const Example base = keepC.size() == (size_t)full.n ? full : subset(full, keepC, false);
+    rS_.reset();
     const of3::PermInput gtPerm = keepC.size() == (size_t)full.n ? full.perm : subsetPerm(full.perm, keepC);
     std::vector<int> keep(base.n); for (int t = 0; t < base.n; ++t) keep[t] = t;
-    if (!fixed) keep = cropTokens(base, keepC.size() == (size_t)full.n ? Lfull : layoutOf(base), crop, cw, gen, strategy);
+    rS_.emplace("prep.cropTokens");
+    if (!fixed) keep = cropTokens(base, keepC.size() == (size_t)full.n ? Lfull : layoutOf(base, false), crop, cw, gen, strategy);
     if (keepC.size() != (size_t)full.n) strategy = "chains " + std::to_string(base.n) + "/" + std::to_string(full.n) + ", " + strategy;
     // (the crop from the whole entry, its tokens mapped through the chain crop)
     std::vector<int> keepFull(keep.size()); for (size_t k = 0; k < keep.size(); ++k) keepFull[k] = keepC[keep[k]];
+    rS_.reset(); rS_.emplace("prep.subset");
     Example e = subset(full, keepFull);
+    rS_.reset(); rS_.emplace("prep.tmplConf");
     if (!fixed) { sampleTemplates(e, gen); augmentConformers(e, gen); }
+    rS_.reset();
     const of3::Layout Lay = layoutOf(e);
     const int n = e.n; const size_t nn = (size_t)n * n, A = e.atoms();
     const int S = std::min(1024, e.P);
     memPhase("step start");
-    Dev d; upload(d, e, padded, qblock, S);
+    rPrep_.reset();
+    Dev d; { g::Range r_("step.upload"); upload(d, e, padded, qblock, S); }
     memPhase("example uploaded");
     Acts a = makeActs(n, S, offloadPairs);
     memPhase("activations");
@@ -1263,20 +1282,31 @@ int main(int argc, char** argv) {
     std::vector<double> xp;
     {
       g::Scratch sc;
+      g::Range r_("rollout");
       xp = rollout(d, a, e, gen, 20);
       memPhase("rollout");
     }
     of3::permuteTruth(gtPerm, keep, xp, e.xt, e.gm, nullptr);
     // the distogram: its loss on the host, its cotangent kept for the backward
-    g::real* dLog = nullptr;
+    // (its loss and cotangent on a host thread, beside the confidence head and the diffusion samples on the device:
+    // the backward is the first to read them)
+    g::real* dLog = d.zeros(nn * dh.bins);
+    std::future<std::vector<g::real>> distFuture;
     {
-      auto lg = g::host(a.logits, nn * dh.bins);
-      std::vector<double> gd(nn * dh.bins, 0);
-      L.distogram = of3::distogramLoss(Lay, e.xt, e.gm, lg.data(), dh.bins, distWeight, gd.data());
-      std::vector<g::real> r(gd.begin(), gd.end());
-      dLog = d.zeros(nn * dh.bins);
-      GK(cudaMemcpy(dLog, r.data(), r.size() * sizeof(g::real), cudaMemcpyHostToDevice));
+      g::Range r_("distogram.loss");
+      auto lg = std::make_shared<std::vector<g::real>>(g::host(a.logits, nn * dh.bins));
+      distFuture = std::async(std::launch::async, [&L, &Lay, &e, lg, nn, bins = dh.bins, distWeight] {
+        std::vector<double> gd(nn * bins, 0);
+        L.distogram = of3::distogramLoss(Lay, e.xt, e.gm, lg->data(), bins, distWeight, gd.data());
+        return std::vector<g::real>(gd.begin(), gd.end());
+      });
     }
+    auto distogramReady = [&] {
+      if (!distFuture.valid()) return;
+      const auto r = distFuture.get();
+      GK(cudaMemcpyAsync(dLog, r.data(), r.size() * sizeof(g::real), cudaMemcpyHostToDevice, STREAM));
+      GK(cudaStreamSynchronize(STREAM));
+    };
     // the confidence head on the rollout, its inputs detached
     {
       g::Scratch sc;
@@ -1289,8 +1319,10 @@ int main(int argc, char** argv) {
       // (--bf16-confidence: the head's blocks on their bf16 kernels too - OpenFold3 runs the head in float32 in
       // training, autocast off around it)
       const bool prevBf = g::BF16; g::BF16 = bf16Confidence;
+      std::optional<g::Range> rC_; rC_.emplace("conf.fwd");
       auto cs = g::af3::confidenceForward(ch, a.pairs[nMsa + nPf], a.singles[nPf], a.tf, betaD, d.seqMask, d.pairMask, d.pairMaskT, n, o, cb);
       g::BF16 = prevBf;
+      rC_.reset(); rC_.emplace("conf.loss");
       const double w = confOn ? confWeight : 0;
       auto lPl = g::host(o.plddt, A * ch.PB), lPde = g::host(o.pde, nn * ch.NB), lPae = g::host(o.pae, nn * ch.NB);
       std::vector<double> gPl(lPl.size(), 0), gPde(lPde.size(), 0), gPae(lPae.size(), 0), gRs;
@@ -1301,7 +1333,9 @@ int main(int argc, char** argv) {
         auto lRs = g::host(o.resolved, A * 2); gRs.assign(lRs.size(), 0);
         L.resolved = of3::resolvedLoss(Lay, e.gm, lRs.data(), w, gRs.data());
       }
+      rC_.reset();
       if (train && confOn) {
+        g::Range r_("conf.bwd");
         auto put = [&](const std::vector<double>& h) {
           g::real* p = g::ARENA.get(h.size()); std::vector<g::real> r(h.begin(), h.end());
           GK(cudaMemcpy(p, r.data(), r.size() * sizeof(g::real), cudaMemcpyHostToDevice)); return p;
@@ -1326,14 +1360,24 @@ int main(int argc, char** argv) {
       for (int t = 0; t < n; ++t) if (!e.isDna[t] && !e.isRna[t] && !e.isLigand[t]) for (int k = 0; k < e.dense; ++k) lossAtom[(size_t)t * e.dense + k] = 1;
     }
     std::vector<double> gmLoss(e.gm); if (!lossAtom.empty()) for (size_t i = 0; i < A; ++i) gmLoss[i] *= lossAtom[i];
+    int widestBatch = 0;
     of3dev::SmoothLddt sl; sl.init(Lay, e.xt, gmLoss);   // (smooth LDDT, quadratic in atoms, on the device)
     memPhase("smooth LDDT set up");
     // the samples in chunks of --sample-batch: one batched denoiser pass a chunk (af3denoise.cuh's denoiseBatchForward:
     // one pair conditioning, the transformer over the chunk's samples at once), each sample's draws as they were
-    const int SB = std::max(1, sampleBatch);
-    for (int s0 = 0; s0 < nSamples; s0 += SB) {
+    // (auto: the first chunk 4 samples, measured - its arena peak a sample, the shared part included, so an over-
+    // estimate - and each chunk after as many as the device's free memory and the arena's mapped slack hold, less a
+    // reserve; what the larger chunks mapped given back after the last, so the room is the diffusion's alone)
+    const bool autoSB = sampleBatch == 0;
+    const int SB = autoSB ? 0 : std::max(1, sampleBatch);
+    int nextS = autoSB ? 4 : SB, widest = 0;
+    const size_t mapped0 = g::ARENA.mapped;
+    for (int s0 = 0, S = 0; s0 < nSamples; s0 += S) {
       g::Scratch sc;
-      const int S = std::min(SB, nSamples - s0);
+      S = std::min(nextS, nSamples - s0); widest = std::max(widest, S);
+      const size_t used0 = g::ARENA.used, high0 = g::ARENA.high, at0 = g::ARENA.at;
+      g::ARENA.high = used0;
+      std::optional<g::Range> rD_; rD_.emplace("diff.noise");
       std::vector<double> sig(S);
       std::vector<g::real*> xin(S), xout(S), dxd(S);
       for (int k = 0; k < S; ++k) {
@@ -1357,6 +1401,7 @@ int main(int argc, char** argv) {
         GK(cudaMemcpy(xin[k], xn.data(), xn.size() * sizeof(g::real), cudaMemcpyHostToDevice));
       }
       // (--sample-batch=1: the one-sample path, denoiseForward - the batched path's reference)
+      rD_.reset(); rD_.emplace("diff.fwd");
       g::af3::DenoiseSave one{};
       g::af3::DenoiseBatch batch;
       if (SB == 1) one = g::af3::denoiseForward(dn, d.b, a.singles[nPf], a.pairs[nMsa + nPf], a.tf, d.seqMask, xin[0], (g::real)sig[0], d.ri, d.ti, d.asym, d.ent, d.sym, xout[0]);
@@ -1365,6 +1410,7 @@ int main(int argc, char** argv) {
         std::vector<g::real> sg(sig.begin(), sig.end());
         batch = g::af3::denoiseBatchForward(dn, d.b, a.singles[nPf], a.pairs[nMsa + nPf], a.tf, d.seqMask, xs, sg, d.ri, d.ti, d.asym, d.ent, d.sym, xout);
       }
+      rD_.reset(); rD_.emplace("diff.loss");
       for (int k = 0; k < S; ++k) {
         auto xh = g::host(xout[k], A * 3);
         std::vector<double> xp(xh.begin(), xh.end()), dx(A * 3, 0);
@@ -1377,7 +1423,9 @@ int main(int argc, char** argv) {
         std::vector<g::real> r(dx.begin(), dx.end());
         GK(cudaMemcpy(dxd[k], r.data(), r.size() * sizeof(g::real), cudaMemcpyHostToDevice));
       }
+      rD_.reset();
       if (train) {
+        g::Range r_("diff.bwd");
         g::real *ts = g::ARENA.zeros((size_t)n * Cs), *tp = g::ARENA.zeros(nn * Cz), *tfd = g::ARENA.zeros((size_t)n * te.F);
         if (SB == 1) g::af3::denoiseBackward(dn, d.b, one, a.singles[nPf], d.seqMask, dxd[0], ts, tp, tfd, nullptr);
         else {
@@ -1387,7 +1435,18 @@ int main(int argc, char** argv) {
         g::add(dTs, ts, (size_t)n * Cs); g::add(dTp, tp, nn * Cz); g::add(dTf, tfd, (size_t)n * te.F);
       }
       if (s0 == 0) memPhase("diffusion chunk");
+      if (autoSB) {
+        const size_t perSample = (g::ARENA.high - used0 + S - 1) / S;
+        size_t freeB, total; GK(cudaMemGetInfo(&freeB, &total));
+        const size_t slack = g::ARENA.mapped > at0 ? g::ARENA.mapped - at0 : 0, reserve = std::max<size_t>((size_t)1 << 30, total / 20);
+        const size_t room = freeB + slack > reserve ? freeB + slack - reserve : 0;
+        nextS = (int)std::max<size_t>(1, std::min<size_t>(room / std::max<size_t>(perSample, 1), (size_t)nSamples));
+      }
+      g::ARENA.high = std::max(high0, g::ARENA.high);
     }
+    if (autoSB) g::ARENA.trim(mapped0);
+    widestBatch = widest;
+    distogramReady();
     L.total = L.diffusion + distWeight * L.distogram + (confOn ? confWeight * (L.plddt + L.pde + L.pae + L.resolved) : 0);
     sl.release();
     const auto t3 = now();
@@ -1403,8 +1462,10 @@ int main(int argc, char** argv) {
         pairReady(a, nMsa + k); pairIn(a, nMsa + k - 1);
         g::real *op = g::ARENA.get(nn * Cz), *os = g::ARENA.get((size_t)n * Cs);   // (the recomputed block's outputs)
         const bool prevBf = g::BF16; g::BF16 = bf16Trunk;
+        std::optional<g::Range> rB_; rB_.emplace("bw.pf.recompute");
         auto save = ckpt ? g::af3::pairformerForward(pf[k], dl, a.pairs[nMsa + k], a.singles[k], d.pairMask, d.pairMaskT, d.seqMask, nullptr, op, os, n)
                          : pfS[k];
+        rB_.reset(); rB_.emplace("bw.pf.backward");
         g::real *dpi = g::ARENA.zeros(nn * Cz), *dsi = g::ARENA.zeros((size_t)n * Cs);
         g::af3::pairformerBackward(pf[k], dl, save, d.pairMask, d.pairMaskT, d.seqMask, dp, dsg, dpi, dsi, nullptr);
         g::BF16 = prevBf;
@@ -1415,6 +1476,7 @@ int main(int argc, char** argv) {
       g::real* dzIn = doubleAdd ? g::cloneR(dp, nn * Cz) : nullptr;
       g::real* dm = g::ARENA.zeros((size_t)S * n * Cm);
       for (int k = nMsa; k-- > 0;) {
+        g::Range r_("bw.msa");
         g::Scratch sc;
         pairReady(a, k); pairIn(a, k - 1);
         g::real *om = g::ARENA.get((size_t)S * n * Cm), *op = g::ARENA.get(nn * Cz);
@@ -1429,6 +1491,7 @@ int main(int argc, char** argv) {
         if (k == nMsa - 1) memPhase("MSA block, backward");
       }
       if (dzIn) g::add(dp, dzIn, nn * Cz);
+      g::Range rT_("bw.tmpl.embed");
       g::real* dz = g::cloneR(dp, nn * Cz);
       g::af3::templateBackward(tm, d.slots, tmS, d.pairMask, dp, dz);
       g::real* dtf = g::ARENA.zeros((size_t)n * te.F);
@@ -1439,8 +1502,8 @@ int main(int argc, char** argv) {
     }
     const auto t4 = now();
     int withTemplates = 0; for (auto& sl : e.slots) if (sl.geo) withTemplates += (int)std::lround(sl.repeat);
-    if (!fixed) printf("  %s: %d of %d tokens (%s), %d cycles, %d MSA rows, %d templates; ms: trunk %.0f, rollout+confidence %.0f, diffusion %.0f (host losses %.0f), trunk backward %.0f\n",
-                       full.input.c_str(), n, full.n, strategy.c_str(), c, S, withTemplates, msOf(t0, t1), msOf(t1, t2), msOf(t2, t3), tLoss, msOf(t3, t4));
+    if (!fixed) printf("  %s: %d of %d tokens (%s), %d cycles, %d MSA rows, %d templates; ms: trunk %.0f, rollout+confidence %.0f, diffusion %.0f (host losses %.0f, %d samples a batch at most), trunk backward %.0f\n",
+                       full.input.c_str(), n, full.n, strategy.c_str(), c, S, withTemplates, msOf(t0, t1), msOf(t1, t2), msOf(t2, t3), tLoss, widestBatch, msOf(t3, t4));
     if (a.off) GK(cudaStreamSynchronize(offload.copy));
     a.release(); d.release();
     return std::make_pair(L, confOn);
@@ -1652,7 +1715,7 @@ int main(int argc, char** argv) {
       std::mt19937_64 gen(777);
       std::string strategy = "whole";
       std::vector<int> keep(full.n); for (int t = 0; t < full.n; ++t) keep[t] = t;
-      if (full.n > valCrop) keep = cropTokens(full, layoutOf(full), valCrop, CropWeights{0, 1, 0}, gen, strategy);
+      if (full.n > valCrop) keep = cropTokens(full, layoutOf(full, false), valCrop, CropWeights{0, 1, 0}, gen, strategy);
       Example e = subset(full, keep);
       augmentConformers(e, gen);
       const of3::Layout Lay = layoutOf(e);

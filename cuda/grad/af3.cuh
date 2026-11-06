@@ -511,6 +511,17 @@ __global__ void dropCopyBfK(const bf* x, bf* y, int A, int B, int C, bool perRow
 }
 #endif
 enum { DROP3_TRI_OUT = 1, DROP3_TRI_IN, DROP3_START, DROP3_END, DROP3_MSA };
+// a residual update in one pass: out = in + drop(u) (u's dropout as drop3 draws it, rate 0 none) - in place of a clone of
+// `in`, drop3 on u and an add, which read and wrote the pair three times over
+__global__ void dropAddK(real* out, const real* in, const real* u, int A, int B, int C, bool perRow, float rate, unsigned long long seed) {
+  const size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)A * B * C) return;
+  const real v = rate <= 0 ? u[t] : dropKeep(t, B, C, perRow, rate, seed) == 0.f ? (real)0 : u[t] / (1 - (real)rate);
+  out[t] = in[t] + v;
+}
+inline void dropAdd(real* out, const real* in, const real* u, int A, int B, int C, bool perRow, float rate, unsigned long long seed, int module) {
+  dropAddK<<<blocks((size_t)A * B * C), 256, 0, STREAM>>>(out, in, u, A, B, C, perRow, rate, dropMix(seed * 8 + module));
+}
 inline void drop3(real* x, int A, int B, int C, bool perRow, float rate, unsigned long long seed, int module) {
   if (rate <= 0) return;
   dropK<<<blocks((size_t)A * B * C), 256, 0, STREAM>>>(x, A, B, C, perRow, rate, dropMix(seed * 8 + module));
@@ -624,22 +635,23 @@ inline PairformerSave pairformerForward(Pairformer& b, const Dialect& d, const r
     s.pair5 = acc;
   } else {
     const float rate = b.dropRate;
-    s.p1 = cloneR(pair, nn * Cz);
-    s.tOut = triMulForward(b.triOut, pair, pairMask, u, n); drop3(u, n, n, Cz, true, rate, b.dropSeed, DROP3_TRI_OUT); add(s.p1, u, nn * Cz);
-    s.p2 = cloneR(s.p1, nn * Cz);
-    s.tIn = triMulForward(b.triIn, s.p1, pairMask, u, n); drop3(u, n, n, Cz, true, rate, b.dropSeed, DROP3_TRI_IN); add(s.p2, u, nn * Cz);
+    s.p1 = ARENA.get(nn * Cz);
+    s.tOut = triMulForward(b.triOut, pair, pairMask, u, n); dropAdd(s.p1, pair, u, n, n, Cz, true, rate, b.dropSeed, DROP3_TRI_OUT);
+    s.p2 = ARENA.get(nn * Cz);
+    s.tIn = triMulForward(b.triIn, s.p1, pairMask, u, n); dropAdd(s.p2, s.p1, u, n, n, Cz, true, rate, b.dropSeed, DROP3_TRI_IN);
     s.p4 = s.p2;
     if (b.hasGrid) {
-      s.p3 = cloneR(s.p2, nn * Cz);
       if (rate > 0) {   // (the attentions add into their output: an update alone, masked, then added)
+        s.p3 = ARENA.get(nn * Cz);
         real* gu = ARENA.zeros(nn * Cz);
         s.g1 = gridForward(b.grid1, d, s.p2, pairMask, maskT, gu, n);
-        drop3(gu, n, n, Cz, true, rate, b.dropSeed, DROP3_START); add(s.p3, gu, nn * Cz);
-        s.p4 = cloneR(s.p3, nn * Cz);
+        dropAdd(s.p3, s.p2, gu, n, n, Cz, true, rate, b.dropSeed, DROP3_START);
+        s.p4 = ARENA.get(nn * Cz);
         GK(cudaMemsetAsync(gu, 0, nn * Cz * sizeof(real), STREAM));
         s.g2 = gridForward(b.grid2, d, s.p3, pairMask, maskT, gu, n);
-        drop3(gu, n, n, Cz, false, rate, b.dropSeed, DROP3_END); add(s.p4, gu, nn * Cz);
+        dropAdd(s.p4, s.p3, gu, n, n, Cz, false, rate, b.dropSeed, DROP3_END);
       } else {
+        s.p3 = cloneR(s.p2, nn * Cz);
         s.g1 = gridForward(b.grid1, d, s.p2, pairMask, maskT, s.p3, n);
         s.p4 = cloneR(s.p3, nn * Cz);
         s.g2 = gridForward(b.grid2, d, s.p3, pairMask, maskT, s.p4, n);

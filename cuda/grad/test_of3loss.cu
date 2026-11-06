@@ -75,7 +75,7 @@ int main(int argc, char** argv) {
   const double pde = of3::pdeLoss(L, x, xt, gm, lPde.data(), K, 1, gPde.data());
   const double pae = of3::paeLoss(L, x, xt, gm, lPae.data(), K, 1, gPae.data());
   const double rs = of3::resolvedLoss(L, gm, lRs.data(), 1, gRs.data());
-  size_t nb = 0; for (int i = 0; i < n; ++i) for (int j = 0; j < n; ++j) nb += L.ligand[i] && !L.ligand[j] && L.bondTok[(size_t)i * n + j];
+  size_t nb = 0; for (int i = 0; i < n; ++i) for (int j = 0; j < n; ++j) nb += L.ligand[i] && !L.ligand[j] && !L.bondTok.empty() && L.bondTok[(size_t)i * n + j];
   int at = 0, nu = 0, li = 0; for (int i = 0; i < n; ++i) { at += L.atomized[i]; nu += L.nucleotide(i); li += L.ligand[i]; }
   printf("%d tokens (%d atomised, %d nucleotide, %d ligand), %zu ligand-polymer token bonds\n", n, at, nu, li, nb);
   printf("mse %.6f bond %.6f smooth_lddt %.6f total %.6f | distogram %.6f plddt %.6f pde %.6f pae %.6f resolved %.6f\n",
@@ -89,7 +89,7 @@ int main(int argc, char** argv) {
     tok[i * 7 + 3] = M.i("batch.isModified")[i]; tok[i * 7 + 4] = M.i("batch.features.asymId")[i]; tok[i * 7 + 5] = aat[i];
     tok[i * 7 + 6] = 0;
   }
-  std::vector<double> bonds((size_t)n * n); for (size_t i = 0; i < bonds.size(); ++i) bonds[i] = L.bondTok[i];
+  std::vector<double> bonds((size_t)n * n); for (size_t i = 0; i < bonds.size(); ++i) bonds[i] = L.bondTok.empty() ? 0 : L.bondTok[i];
   put(out + "/x.bin", x); put(out + "/xt.bin", xt); put(out + "/gm.bin", gm); put(out + "/exists.bin", exists);
   put(out + "/names.bin", names); put(out + "/tok.bin", tok); put(out + "/bonds.bin", bonds);
   put(out + "/lDg.bin", lDg); put(out + "/lPl.bin", lPl); put(out + "/lPde.bin", lPde); put(out + "/lPae.bin", lPae); put(out + "/lRs.bin", lRs);

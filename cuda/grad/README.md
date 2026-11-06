@@ -135,7 +135,10 @@ one-hot one - the MSA stack, the pairformer, the distogram, the denoiser, the co
   and it must come back: 1BRS (three barnase/barstar pairs) 21.7 A as labelled, **0.175 A** permuted; 7BNY (four
   chains, nine sulfates) 37.3 A to 0.174.
 - **diffusion** - `--samples` (48) noised copies of the truth, centred over its resolved atoms, rotated and moved,
-  sigma = 16 exp(-1.2 + 1.5 N(0, 1)), batched as OpenFold3 batches them: `--sample-batch` (8) samples a denoiser pass
+  sigma = 16 exp(-1.2 + 1.5 N(0, 1)), batched as OpenFold3 batches them: `--sample-batch` (8) samples a denoiser pass -
+  `--sample-batch=auto` as many as the device's free memory holds (the first pass 4, its peak a sample measured, the
+  mapping it grew given back after the last, so the room is the diffusion's alone: 4 -> 28 a pass at 512 tokens on the
+  A100, 9.3 -> 7.0 s a step with this round's other changes)
   (`denoiseBatchForward`/`Backward`: one pair conditioning - its gradient summed over the samples and backed once -
   each sample's own noise level in its single conditioning, its atom encoder and decoder, and ONE transformer pass over
   the samples' tokens, the attention batched with the pair logits shared). `--check-batch` holds it to the samples one

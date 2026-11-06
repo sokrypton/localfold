@@ -24,6 +24,7 @@
 #include <cmath>
 #include <functional>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace of3 {
@@ -32,6 +33,19 @@ constexpr double EPS = 1e-8;
 // a count OpenFold3 sums in float32 (`torch.sum(mask, dtype=torch.float32) + eps`): there the eps is below the
 // count's precision and vanishes - the bond loss over one bonded pair shows it at 1e-8
 inline double den32(double count) { return (double)((float)count + 1e-8f); }
+// rows [0, n) in LOSS_THREADS fixed contiguous parts, each on its own thread, each part's sum returned in order (so a
+// loss is the same sum whatever the machine): f(begin, end) adds its rows' terms and returns their sum
+constexpr int LOSS_THREADS = 16;
+inline double rowsInParallel(size_t n, const std::function<double(size_t, size_t)>& f) {
+  const int T = (int)std::min<size_t>(LOSS_THREADS, std::max<size_t>(n, 1));
+  std::vector<double> part(T, 0);
+  std::vector<std::thread> th;
+  for (int t = 1; t < T; ++t) th.emplace_back([&, t] { part[t] = f(n * t / T, n * (t + 1) / T); });
+  part[0] = f(0, n / T);
+  for (auto& h : th) h.join();
+  double sum = 0; for (double v : part) sum += v;
+  return sum;
+}
 
 struct Layout {
   int n = 0, dense = 0;
@@ -41,7 +55,7 @@ struct Layout {
   std::vector<int> rep, lddtRep;                    // [n]: the representative and the LDDT reference slot, -1 none
   std::vector<std::array<int, 3>> frame;            // [n]: a polymer token's (a, b, c) slots; atomised: chosen per structure
   std::vector<int> start;                           // [n]: an atomised token's atom (its first existing slot)
-  std::vector<double> bondTok;                      // [n * n]: the token bonds (token_bonds), 0/1
+  std::vector<double> bondTok;                      // [n * n]: the token bonds (token_bonds), 0/1; empty without any
   size_t atoms() const { return (size_t)n * dense; }
   bool nucleotide(int t) const { return dna[t] || rna[t]; }
 };
@@ -55,8 +69,9 @@ inline Layout makeLayout(int n, int dense, const float* exists, const int* names
   L.protein.assign(n, 0); L.dna.assign(n, 0); L.rna.assign(n, 0); L.ligand.assign(n, 0); L.atomized.assign(n, 0);
   L.asym.assign(asym, asym + n); L.rep.assign(n, -1); L.lddtRep.assign(n, -1); L.start.assign(n, -1);
   L.frame.assign(n, {-1, -1, -1});
-  L.bondTok.assign((size_t)n * n, 0);
-  if (bonds) for (size_t i = 0; i < (size_t)n * n; ++i) L.bondTok[i] = bonds[i] > 0;
+  // (only with bonds to hold: n x n doubles is 580 MB at 8,500 tokens, ~300 ms of page faults for a layout whose
+  // reader only wants the per-token fields)
+  if (bonds) { L.bondTok.assign((size_t)n * n, 0); for (size_t i = 0; i < (size_t)n * n; ++i) L.bondTok[i] = bonds[i] > 0; }
   for (int t = 0; t < n; ++t) {
     L.dna[t] = isDna && isDna[t] > 0; L.rna[t] = isRna && isRna[t] > 0; L.ligand[t] = isLigand && isLigand[t] > 0;
     L.protein[t] = !L.dna[t] && !L.rna[t] && !L.ligand[t];
@@ -176,7 +191,7 @@ inline Diffusion diffusionLoss(const Layout& L, const std::vector<double>& x, co
     for (int i = 0; i < L.n; ++i) {
       if (!L.ligand[i]) continue;
       for (int j = 0; j < L.n; ++j) {
-        if (L.ligand[j] || !L.bondTok[(size_t)i * L.n + j]) continue;
+        if (L.ligand[j] || L.bondTok.empty() || !L.bondTok[(size_t)i * L.n + j]) continue;
         for (int a = 0; a < L.dense; ++a) for (int b = 0; b < L.dense; ++b) {
           const size_t l = (size_t)i * L.dense + a, mm = (size_t)j * L.dense + b;
           if (L.exists[l] && L.exists[mm] && m[l] && m[mm]) pairs.push_back({l, mm});
@@ -264,12 +279,16 @@ template <class R> inline double distogramLoss(const Layout& L, const std::vecto
   std::vector<int> ri; std::vector<char> ok; reps(L, gm, ri, ok);
   double sum = 0, cnt = 0;
   for (int i = 0; i < L.n; ++i) for (int j = 0; j < L.n; ++j) cnt += ok[i] && ok[j];
-  for (int i = 0; i < L.n; ++i) for (int j = 0; j < L.n; ++j) {
-    if (!ok[i] || !ok[j]) continue;
-    double d2 = 0; for (int p = 0; p < 3; ++p) { double e = xt[ri[i] * 3 + p] - xt[ri[j] * 3 + p]; d2 += e * e; }
-    const size_t ij = (size_t)i * L.n + j;
-    sum += crossEntropy(logits + ij * K, K, nearestBin(std::sqrt(d2), 2, 22, K), scale / den32(cnt), g ? g + ij * K : nullptr);
-  }
+  sum = rowsInParallel(L.n, [&](size_t i0, size_t i1) {
+    double part = 0;
+    for (int i = (int)i0; i < (int)i1; ++i) for (int j = 0; j < L.n; ++j) {
+      if (!ok[i] || !ok[j]) continue;
+      double d2 = 0; for (int p = 0; p < 3; ++p) { double e = xt[ri[i] * 3 + p] - xt[ri[j] * 3 + p]; d2 += e * e; }
+      const size_t ij = (size_t)i * L.n + j;
+      part += crossEntropy(logits + ij * K, K, nearestBin(std::sqrt(d2), 2, 22, K), scale / den32(cnt), g ? g + ij * K : nullptr);
+    }
+    return part;
+  });
   return sum / den32(cnt);
 }
 
@@ -281,8 +300,10 @@ template <class R> inline double plddtLoss(const Layout& L, const std::vector<do
   std::vector<std::pair<size_t, bool>> refs;    // the reference atoms m, and whether a nucleotide's
   for (int t = 0; t < L.n; ++t)
     if (!L.atomized[t] && L.lddtRep[t] >= 0 && gm[L.lddtRep[t]] > 0) refs.push_back({(size_t)L.lddtRep[t], L.nucleotide(t)});
-  double sum = 0;
-  for (size_t l : live) {
+  const double sum = rowsInParallel(live.size(), [&](size_t k0, size_t k1) {
+  double part = 0;
+  for (size_t k = k0; k < k1; ++k) {
+    const size_t l = live[k];
     double acc = 0, cnt = 0;
     for (auto [mm, nuc] : refs) {
       if (mm == l) continue;
@@ -292,8 +313,10 @@ template <class R> inline double plddtLoss(const Layout& L, const std::vector<do
       acc += 0.25 * ((d < 0.5) + (d < 1) + (d < 2) + (d < 4)); cnt += 1;
     }
     const double lddt = acc / den32(cnt);
-    sum += crossEntropy(logits + l * K, K, nearestBin(lddt, 0, 1, K), scale / den32((double)live.size()), g ? g + l * K : nullptr);
+    part += crossEntropy(logits + l * K, K, nearestBin(lddt, 0, 1, K), scale / den32((double)live.size()), g ? g + l * K : nullptr);
   }
+  return part;
+  });
   return sum / den32((double)live.size());
 }
 
@@ -303,12 +326,16 @@ template <class R> inline double pdeLoss(const Layout& L, const std::vector<doub
   std::vector<int> ri; std::vector<char> ok; reps(L, gm, ri, ok);
   double sum = 0, cnt = 0;
   for (int i = 0; i < L.n; ++i) for (int j = 0; j < L.n; ++j) cnt += ok[i] && ok[j];
-  for (int i = 0; i < L.n; ++i) for (int j = 0; j < L.n; ++j) {
-    if (!ok[i] || !ok[j]) continue;
-    const double e = std::fabs(dist(x, ri[i], ri[j]) - dist(xt, ri[i], ri[j]));
-    const size_t ij = (size_t)i * L.n + j;
-    sum += crossEntropy(logits + ij * K, K, nearestBin(e, 0, 32, K), scale / den32(cnt), g ? g + ij * K : nullptr);
-  }
+  sum = rowsInParallel(L.n, [&](size_t i0, size_t i1) {
+    double part = 0;
+    for (int i = (int)i0; i < (int)i1; ++i) for (int j = 0; j < L.n; ++j) {
+      if (!ok[i] || !ok[j]) continue;
+      const double e = std::fabs(dist(x, ri[i], ri[j]) - dist(xt, ri[i], ri[j]));
+      const size_t ij = (size_t)i * L.n + j;
+      part += crossEntropy(logits + ij * K, K, nearestBin(e, 0, 32, K), scale / den32(cnt), g ? g + ij * K : nullptr);
+    }
+    return part;
+  });
   return sum / den32(cnt);
 }
 
@@ -369,7 +396,9 @@ template <class R> inline double paeLoss(const Layout& L, const std::vector<doub
   std::vector<int> rp, rg; std::vector<char> op, og; reps(L, all, rp, op); reps(L, gm, rg, og);
   double sum = 0, cnt = 0;
   for (int i = 0; i < L.n; ++i) for (int j = 0; j < L.n; ++j) cnt += vp[i] && op[j] && vg[i] && og[j];
-  for (int i = 0; i < L.n; ++i) {
+  sum = rowsInParallel(L.n, [&](size_t i0, size_t i1) {
+  double part = 0;
+  for (int i = (int)i0; i < (int)i1; ++i) {
     if (!vp[i] || !vg[i]) continue;
     for (int j = 0; j < L.n; ++j) {
       if (!op[j] || !og[j]) continue;
@@ -377,9 +406,11 @@ template <class R> inline double paeLoss(const Layout& L, const std::vector<doub
       inFrame(x, fp[i], &x[(size_t)rp[j] * 3], a); inFrame(xt, fg[i], &xt[(size_t)rg[j] * 3], b);
       const double e = std::sqrt(EPS + (a[0] - b[0]) * (a[0] - b[0]) + (a[1] - b[1]) * (a[1] - b[1]) + (a[2] - b[2]) * (a[2] - b[2]));
       const size_t ij = (size_t)i * L.n + j;
-      sum += crossEntropy(logits + ij * K, K, nearestBin(e, 0, 32, K), scale / (cnt + EPS), g ? g + ij * K : nullptr);
+      part += crossEntropy(logits + ij * K, K, nearestBin(e, 0, 32, K), scale / (cnt + EPS), g ? g + ij * K : nullptr);
     }
   }
+  return part;
+  });
   return sum / (cnt + EPS);
 }
 
