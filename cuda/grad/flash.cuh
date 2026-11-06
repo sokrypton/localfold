@@ -1489,6 +1489,421 @@ inline void backwardBf(const Sdpa& a, const X* q, int ldq, const X* k, int ldk, 
     if (fx[j]) fromFixedK<<<blocks(ext[j]), 256, 0, STREAM>>>(a.bias[j].grad, fx[j], ext[j]);
 }
 
+// The TF32 forward in its common case - one bias, no clip, no chain ids (the diffusion transformer's token attention,
+// 16 heads of 48 over [S n] rows): fwdK<D, 0> was latency-bound at 13 TFLOP/s (7.9 cycles an issue, three warps a
+// scheduler for its 44 KB of shared memory, every tile loaded and rounded by plain loads before the barrier, P handed
+// between the products through shared memory). Here K and V are double-buffered by cp.async and rounded to tf32 in
+// shared memory once, by the thread that loaded them; each warp fetches its own 16 rows of the bias tile, one tile
+// ahead; the key mask is a term a key; the logits stay in natural units (exp2 of (x - max) log2 e: a max in log2
+// units is off by ~100 at a row masked whole, -1.4e9, which the backward's natural replay turns into e^100); and P
+// stays in registers: the P V product sums over keys, so within each 8 keys the A fragment's column t is key 2t and
+// t + 4 is 2t + 1 - which is where the score accumulator already holds them - and V's rows are read in that order.
+template <int D>
+__global__ void __launch_bounds__(THREADS, 2) fwdT(Sdpa a, const float* __restrict__ q, int ldq, const float* __restrict__ k,
+                                                   int ldk, const float* __restrict__ v, int ldv, float* __restrict__ o,
+                                                   int ldo, float* __restrict__ lse) {
+  constexpr int DK = D + PADK, BS = BC + 8;        // K and V's row stride; the bias tile's (a float2 a half-warp conflict-free)
+  constexpr int KV = 2 * BC * DK + BC;             // a stage: K, V, the key terms
+  constexpr int C4 = D / 4;
+  extern __shared__ __align__(16) float sm[];
+  float* Bs = sm + 2 * KV;                         // [BR][BS]
+  const int nqb = (a.Q + BR - 1) / BR;
+  const int qb = blockIdx.x % nqb, h = (blockIdx.x / nqb) % a.H, b = blockIdx.x / (nqb * a.H);
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+  const int q0 = qb * BR, qr0 = q0 + warp * 16;
+  const float* kb_ = k + (size_t)b * a.K * ldk + h * D;
+  const float* vb_ = v + (size_t)b * a.K * ldv + h * D;
+  const float* bb_ = a.bias[0].p + b * a.bias[0].sb + h * a.bias[0].sh;
+  const long long bsq = a.bias[0].sq;
+  const float* km_ = a.keyMask ? a.keyMask + (size_t)b * a.K : nullptr;
+  const float sc = a.scale;
+  const int nkt = (a.K + BC - 1) / BC;
+  auto issueKV = [&](int kt) {
+    float* Ks = sm + (kt & 1) * KV;
+    float* Vs = Ks + BC * DK;
+    const int k0 = kt * BC;
+    for (int i = threadIdx.x; i < BC * C4; i += THREADS) {
+      const int r = i / C4, c = (i % C4) * 4;
+      const bool in = k0 + r < a.K;
+      const long long rr = in ? k0 + r : 0;
+      cp16(Ks + r * DK + c, kb_ + rr * ldk + c, in);
+      cp16(Vs + r * DK + c, vb_ + rr * ldv + c, in);
+    }
+    if (threadIdx.x < BC) cp4(Vs + BC * DK + threadIdx.x, km_ ? km_ + k0 + threadIdx.x : kb_, km_ && k0 + threadIdx.x < a.K);
+  };
+  // this warp's 16 rows of the bias tile (rows past Q read row Q - 1: written nowhere)
+  auto issueBias = [&](int kt) {
+    const int k0 = kt * BC;
+    for (int i = lane; i < 16 * BC / 4; i += 32) {
+      const int r = warp * 16 + i / (BC / 4), c = (i % (BC / 4)) * 4;
+      const bool in = k0 + c < a.K;
+      cp16(Bs + r * BS + c, bb_ + (long long)min(q0 + r, a.Q - 1) * bsq + (in ? k0 + c : 0), in);
+    }
+  };
+  issueKV(0);
+  issueBias(0);
+  cpCommit();
+  uint32_t qa[D / 8][4];
+  {
+    const float* qb_ = q + (size_t)b * a.Q * ldq + h * D;
+#pragma unroll
+    for (int s = 0; s < D / 8; ++s)
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const int r = qr0 + g + (i & 1) * 8, c = s * 8 + t + (i >> 1) * 4;
+        qa[s][i] = tf32(r < a.Q ? qb_[(long long)r * ldq + c] : 0.f);
+      }
+  }
+  float oacc[D / 8][4];
+#pragma unroll
+  for (int n = 0; n < D / 8; ++n) oacc[n][0] = oacc[n][1] = oacc[n][2] = oacc[n][3] = 0.f;
+  float mx[2] = {-INFINITY, -INFINITY}, sum[2] = {0.f, 0.f};
+  for (int kt = 0; kt < nkt; ++kt) {
+    if (kt + 1 < nkt) issueKV(kt + 1);
+    cpCommit();
+    cpWait1();
+    float* Ks = sm + (kt & 1) * KV;
+    float* Vs = Ks + BC * DK;
+    float* Ms = Vs + BC * DK;
+    {   // (what this thread loaded: rounded to tf32; the key terms)
+      const int k0 = kt * BC;
+      for (int i = threadIdx.x; i < BC * C4; i += THREADS) {
+        const int r = i / C4, c = (i % C4) * 4;
+        float4* pk = reinterpret_cast<float4*>(Ks + r * DK + c);
+        float4* pv = reinterpret_cast<float4*>(Vs + r * DK + c);
+        float4 x = *pk, y = *pv;
+        x.x = __uint_as_float(tf32(x.x)); x.y = __uint_as_float(tf32(x.y)); x.z = __uint_as_float(tf32(x.z)); x.w = __uint_as_float(tf32(x.w));
+        y.x = __uint_as_float(tf32(y.x)); y.y = __uint_as_float(tf32(y.y)); y.z = __uint_as_float(tf32(y.z)); y.w = __uint_as_float(tf32(y.w));
+        *pk = x; *pv = y;
+      }
+      if (threadIdx.x < BC)
+        Ms[threadIdx.x] = k0 + threadIdx.x >= a.K ? -INFINITY : km_ ? 1e9f * (Ms[threadIdx.x] - 1.f) : 0.f;
+    }
+    __syncthreads();
+    float sacc[BC / 8][4];
+#pragma unroll
+    for (int j = 0; j < BC / 8; ++j) sacc[j][0] = sacc[j][1] = sacc[j][2] = sacc[j][3] = 0.f;
+#pragma unroll
+    for (int s = 0; s < D / 8; ++s)
+#pragma unroll
+      for (int j = 0; j < BC / 8; ++j)
+        mmaTf32(sacc[j], qa[s][0], qa[s][1], qa[s][2], qa[s][3], __float_as_uint(Ks[(j * 8 + g) * DK + s * 8 + t]),
+                __float_as_uint(Ks[(j * 8 + g) * DK + s * 8 + t + 4]));
+    float rmax[2] = {-INFINITY, -INFINITY};
+    {
+      const float* B0 = Bs + (warp * 16 + g) * BS + 2 * t;
+#pragma unroll
+      for (int j = 0; j < BC / 8; ++j) {
+        const float2 m2 = *reinterpret_cast<const float2*>(Ms + j * 8 + 2 * t);
+        const float2 c0 = *reinterpret_cast<const float2*>(B0 + j * 8);
+        const float2 c1 = *reinterpret_cast<const float2*>(B0 + 8 * BS + j * 8);
+        sacc[j][0] = fmaf(sacc[j][0], sc, m2.x + c0.x);
+        sacc[j][1] = fmaf(sacc[j][1], sc, m2.y + c0.y);
+        sacc[j][2] = fmaf(sacc[j][2], sc, m2.x + c1.x);
+        sacc[j][3] = fmaf(sacc[j][3], sc, m2.y + c1.y);
+        rmax[0] = fmaxf(rmax[0], fmaxf(sacc[j][0], sacc[j][1]));
+        rmax[1] = fmaxf(rmax[1], fmaxf(sacc[j][2], sacc[j][3]));
+      }
+    }
+    __syncwarp();
+    if (kt + 1 < nkt) issueBias(kt + 1);   // (into this warp's rows, read above; waited on with the next K and V)
+    cpCommit();
+    float alpha[2], nm[2], rs[2] = {0.f, 0.f};
+#pragma unroll
+    for (int r = 0; r < 2; ++r) {
+      rmax[r] = fmaxf(rmax[r], __shfl_xor_sync(~0u, rmax[r], 1));
+      rmax[r] = fmaxf(rmax[r], __shfl_xor_sync(~0u, rmax[r], 2));
+      nm[r] = fmaxf(mx[r], rmax[r]);
+      alpha[r] = ex2((mx[r] - nm[r]) * LOG2E);   // (the first tile: ex2(-inf) = 0, onto zeros)
+      mx[r] = nm[r];
+    }
+#pragma unroll
+    for (int j = 0; j < BC / 8; ++j)
+#pragma unroll
+      for (int e = 0; e < 4; ++e) {
+        sacc[j][e] = ex2((sacc[j][e] - nm[e >> 1]) * LOG2E);
+        rs[e >> 1] += sacc[j][e];
+      }
+#pragma unroll
+    for (int r = 0; r < 2; ++r) sum[r] = sum[r] * alpha[r] + rs[r];   // (the quad's partial sums: reduced at the end)
+#pragma unroll
+    for (int n = 0; n < D / 8; ++n) {
+      oacc[n][0] *= alpha[0]; oacc[n][1] *= alpha[0]; oacc[n][2] *= alpha[1]; oacc[n][3] *= alpha[1];
+    }
+#pragma unroll
+    for (int s = 0; s < BC / 8; ++s) {
+      const uint32_t a0 = tf32(sacc[s][0]), a1 = tf32(sacc[s][2]), a2 = tf32(sacc[s][1]), a3 = tf32(sacc[s][3]);
+#pragma unroll
+      for (int n = 0; n < D / 8; ++n)
+        mmaTf32(oacc[n], a0, a1, a2, a3, __float_as_uint(Vs[(s * 8 + 2 * t) * DK + n * 8 + g]),
+                __float_as_uint(Vs[(s * 8 + 2 * t + 1) * DK + n * 8 + g]));
+    }
+    __syncthreads();   // (this stage's K and V are the next issue's)
+  }
+  float* ob = o + (size_t)b * a.Q * ldo + h * D;
+#pragma unroll
+  for (int r = 0; r < 2; ++r) {
+    sum[r] += __shfl_xor_sync(~0u, sum[r], 1);
+    sum[r] += __shfl_xor_sync(~0u, sum[r], 2);
+    const int qq = qr0 + g + r * 8;
+    if (qq >= a.Q) continue;
+    const float inv = sum[r] > 0.f ? 1.f / sum[r] : 0.f;
+#pragma unroll
+    for (int n = 0; n < D / 8; ++n)
+      *reinterpret_cast<float2*>(ob + (long long)qq * ldo + n * 8 + 2 * t) = make_float2(oacc[n][r * 2] * inv, oacc[n][r * 2 + 1] * inv);
+    if (t == 0) {
+      const size_t i = ((size_t)b * a.H + h) * a.Q + qq, N = (size_t)a.B * a.H * a.Q;
+      lse[i] = sum[r] > 0.f ? mx[r] : -INFINITY;
+      lse[N + i] = sum[r] > 0.f ? logf(sum[r]) : 0.f;
+    }
+  }
+}
+template <int D>
+inline bool forwardT(const Sdpa& a, const float* q, int ldq, const float* k, int ldk, const float* v, int ldv, float* o,
+                     int ldo, float* lse) {
+  const Bias& bi = a.bias[0];
+  auto al = [](const void* p) { return ((uintptr_t)p & 15) == 0; };
+  if (a.clip || a.seqQ || a.seqK || a.bias[1].p || !bi.p || D % 8 || a.K % 4 || bi.sq % 4 || bi.sb % 4 || bi.sh % 4 ||
+      ldq % 4 || ldk % 4 || ldv % 4 || ldo % 2 || !al(bi.p) || !al(k) || !al(v))
+    return false;
+  constexpr size_t smem = sizeof(float) * (2 * (2 * BC * (D + PADK) + BC) + BR * (BC + 8));
+  static bool attr = false;
+  if (!attr) { GK(cudaFuncSetAttribute(fwdT<D>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem)); attr = true; }
+  const size_t grid = (size_t)((a.Q + BR - 1) / BR) * a.H * a.B;
+  fwdT<D><<<(unsigned)grid, THREADS, smem, STREAM>>>(a, q, ldq, k, ldk, v, ldv, o, ldo, lse);
+  return true;
+}
+
+// fwdT's backward (the same case): a CTA 64 keys, a warp 16 of them, the queries in tiles of 32 - Q, dO, the tile's
+// bias and its rows' log-sum-exp and Di double-buffered by cp.async, Q and dO rounded to tf32 in shared memory by the
+// thread that loaded them; K and V as tf32 A fragments in registers. P and dS go from the S^T and dP^T accumulators
+// straight into dV += P^T dO and dK += dS^T Q (fwdT's key permutation, here over queries); dS also replaces the bias
+// tile in place, for dQ += dS K (its keys permuted the same way, which keeps K's fragment reads conflict-free) and
+// the bias gradient's coalesced atomics. bwdK<D, 0> was 4.0 ms at the diffusion transformer's shape: 12.5% occupancy
+// for 58 KB of shared memory, every tile loaded by plain loads, P and dS through shared memory.
+template <int D>
+__global__ void __launch_bounds__(THREADS, 2) bwdT(Sdpa a, const float* __restrict__ q, int ldq, const float* __restrict__ k,
+                                                   int ldk, const float* __restrict__ v, int ldv,
+                                                   const float* __restrict__ dO, int lddo, const float* __restrict__ lse,
+                                                   const float* __restrict__ Di, float* __restrict__ dq, int lddq,
+                                                   float* __restrict__ dk, int lddk, float* __restrict__ dv, int lddv,
+                                                   bool accK, bool accV) {
+  constexpr int LD = D + PADK, LT = BC + PADK, QT = 32, C4 = D / 4, NT = D / 8;
+  constexpr int ST = 2 * QT * LD + QT * LT + 3 * QT;   // a stage: Q, dO, the bias tile (then dS), lse, log-sum, Di
+  extern __shared__ __align__(16) float sm[];
+  float* Ks = sm + 2 * ST;                             // [BC][LD], tf32
+  const int nkb = (a.K + BC - 1) / BC;
+  const int kb = blockIdx.x % nkb, h = (blockIdx.x / nkb) % a.H, b = blockIdx.x / (nkb * a.H);
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+  const int k0 = kb * BC, kl0 = warp * 16;
+  const float* qb_ = q + (size_t)b * a.Q * ldq + h * D;
+  const float* ob_ = dO + (size_t)b * a.Q * lddo + h * D;
+  const float* kb_ = k + (size_t)b * a.K * ldk + h * D;
+  const float* vb_ = v + (size_t)b * a.K * ldv + h * D;
+  const float* bb_ = a.bias[0].p + b * a.bias[0].sb + h * a.bias[0].sh + k0;
+  const long long bsq = a.bias[0].sq;
+  const size_t bh = (size_t)b * a.H + h;
+  const float* lseb = lse + bh * a.Q;
+  const float* lgb = lseb + (size_t)a.B * a.H * a.Q;
+  const float* Dib = Di + bh * a.Q;
+  float* dqb = dq + (size_t)b * a.Q * lddq + h * D;
+  float* g0 = a.bias[0].grad ? a.bias[0].grad + b * a.bias[0].sb + h * a.bias[0].sh + k0 : nullptr;
+  const int nqt = (a.Q + QT - 1) / QT;
+  auto issue = [&](int qt) {
+    float* Qs = sm + (qt & 1) * ST;
+    float* Os = Qs + QT * LD;
+    float* Ts = Os + QT * LD;
+    float* Ls = Ts + QT * LT;
+    const int q0 = qt * QT;
+    for (int i = threadIdx.x; i < QT * C4; i += THREADS) {
+      const int r = i / C4, c = (i % C4) * 4;
+      const bool in = q0 + r < a.Q;
+      const long long rr = in ? q0 + r : 0;
+      cp16(Qs + r * LD + c, qb_ + rr * ldq + c, in);
+      cp16(Os + r * LD + c, ob_ + rr * lddo + c, in);
+    }
+    for (int i = threadIdx.x; i < QT * BC / 4; i += THREADS) {
+      const int r = i / (BC / 4), c = (i % (BC / 4)) * 4;
+      const bool in = q0 + r < a.Q && k0 + c < a.K;
+      cp16(Ts + r * LT + c, in ? bb_ + (long long)(q0 + r) * bsq + c : bb_, in);
+    }
+    if (threadIdx.x < QT) {
+      const bool in = q0 + threadIdx.x < a.Q;
+      cp4(Ls + threadIdx.x, lseb + (in ? q0 + threadIdx.x : 0), in);
+      cp4(Ls + QT + threadIdx.x, lgb + (in ? q0 + threadIdx.x : 0), in);
+      cp4(Ls + 2 * QT + threadIdx.x, Dib + (in ? q0 + threadIdx.x : 0), in);
+    }
+  };
+  for (int i = threadIdx.x; i < BC * C4; i += THREADS) {
+    const int r = i / C4, c = (i % C4) * 4;
+    const bool in = k0 + r < a.K;
+    cp16(Ks + r * LD + c, kb_ + (long long)(in ? k0 + r : 0) * ldk + c, in);
+  }
+  issue(0);
+  cpCommit();
+  uint32_t ka[NT][4], va[NT][4];
+  float kmR[2];
+#pragma unroll
+  for (int s = 0; s < NT; ++s)
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const int r = k0 + kl0 + g + (i & 1) * 8, c = s * 8 + t + (i >> 1) * 4;
+      ka[s][i] = tf32(r < a.K ? kb_[(long long)r * ldk + c] : 0.f);
+      va[s][i] = tf32(r < a.K ? vb_[(long long)r * ldv + c] : 0.f);
+    }
+#pragma unroll
+  for (int hk = 0; hk < 2; ++hk) {
+    const int kk = k0 + kl0 + g + hk * 8;
+    kmR[hk] = kk >= a.K ? -INFINITY : a.keyMask ? 1e9f * (a.keyMask[(size_t)b * a.K + kk] - 1.f) : 0.f;
+  }
+  float dka[NT][4], dva[NT][4];
+#pragma unroll
+  for (int n = 0; n < NT; ++n)
+#pragma unroll
+    for (int e = 0; e < 4; ++e) dka[n][e] = dva[n][e] = 0.f;
+  const float sc = a.scale;
+  for (int qt = 0; qt < nqt; ++qt) {
+    if (qt + 1 < nqt) issue(qt + 1);
+    cpCommit();
+    cpWait1();
+    float* Qs = sm + (qt & 1) * ST;
+    float* Os = Qs + QT * LD;
+    float* Ts = Os + QT * LD;
+    float* Ls = Ts + QT * LT;
+    const int q0 = qt * QT;
+    {   // (what this thread loaded, rounded to tf32: Q and dO, and K the first time)
+      auto round4 = [](float* p) {
+        float4 x = *reinterpret_cast<float4*>(p);
+        x.x = __uint_as_float(tf32(x.x)); x.y = __uint_as_float(tf32(x.y)); x.z = __uint_as_float(tf32(x.z)); x.w = __uint_as_float(tf32(x.w));
+        *reinterpret_cast<float4*>(p) = x;
+      };
+      for (int i = threadIdx.x; i < QT * C4; i += THREADS) {
+        const int r = i / C4, c = (i % C4) * 4;
+        round4(Qs + r * LD + c);
+        round4(Os + r * LD + c);
+      }
+      if (qt == 0)
+        for (int i = threadIdx.x; i < BC * C4; i += THREADS) round4(Ks + (i / C4) * LD + (i % C4) * 4);
+    }
+    __syncthreads();
+    float st[4][4], dpt[4][4];   // 16 keys x 32 queries: S^T and dP^T
+#pragma unroll
+    for (int jj = 0; jj < 4; ++jj)
+#pragma unroll
+      for (int e = 0; e < 4; ++e) st[jj][e] = dpt[jj][e] = 0.f;
+#pragma unroll
+    for (int s = 0; s < NT; ++s)
+#pragma unroll
+      for (int jj = 0; jj < 4; ++jj) {
+        const int i0 = (jj * 8 + g) * LD + s * 8 + t;
+        mmaTf32(st[jj], ka[s][0], ka[s][1], ka[s][2], ka[s][3], __float_as_uint(Qs[i0]), __float_as_uint(Qs[i0 + 4]));
+        mmaTf32(dpt[jj], va[s][0], va[s][1], va[s][2], va[s][3], __float_as_uint(Os[i0]), __float_as_uint(Os[i0 + 4]));
+      }
+#pragma unroll
+    for (int jj = 0; jj < 4; ++jj) {
+      const int ql = jj * 8 + 2 * t;
+      const float2 L = *reinterpret_cast<const float2*>(Ls + ql), Lg = *reinterpret_cast<const float2*>(Ls + QT + ql),
+                   Dq = *reinterpret_cast<const float2*>(Ls + 2 * QT + ql);
+#pragma unroll
+      for (int e = 0; e < 4; ++e) {
+        const int hk = e >> 1, par = e & 1;
+        float* tp = Ts + (ql + par) * LT + kl0 + g + hk * 8;
+        const float x = fmaf(st[jj][e], sc, kmR[hk] + *tp);
+        const float p = ex2(fmaf(x - (par ? L.y : L.x), LOG2E, -LOG2E * (par ? Lg.y : Lg.x)));
+        const float ds = p * (dpt[jj][e] - (par ? Dq.y : Dq.x));
+        st[jj][e] = p;
+        dpt[jj][e] = ds;
+        *tp = ds;
+      }
+    }
+    // dV += P^T dO, dK += dS^T Q: A from the accumulators (query column t is query 2t, t + 4 is 2t + 1)
+#pragma unroll
+    for (int jj = 0; jj < 4; ++jj) {
+      const uint32_t p0 = tf32(st[jj][0]), p1 = tf32(st[jj][2]), p2 = tf32(st[jj][1]), p3 = tf32(st[jj][3]);
+      const uint32_t d0 = tf32(dpt[jj][0]), d1 = tf32(dpt[jj][2]), d2 = tf32(dpt[jj][1]), d3 = tf32(dpt[jj][3]);
+#pragma unroll
+      for (int n = 0; n < NT; ++n) {
+        const int i0 = (jj * 8 + 2 * t) * LD + n * 8 + g;
+        mmaTf32(dva[n], p0, p1, p2, p3, __float_as_uint(Os[i0]), __float_as_uint(Os[i0 + LD]));
+        mmaTf32(dka[n], d0, d1, d2, d3, __float_as_uint(Qs[i0]), __float_as_uint(Qs[i0 + LD]));
+      }
+    }
+    __syncthreads();   // (the whole tile's dS in Ts; Q and dO read for the last time)
+    if (g0)
+      for (int i = threadIdx.x; i < QT * BC; i += THREADS) {
+        const int ql = i / BC, kl = i % BC;
+        const float ds = Ts[ql * LT + kl];
+        if (ds != 0.f && q0 + ql < a.Q) atomicAdd(g0 + (long long)(q0 + ql) * a.bias[0].sq + kl, ds);
+      }
+    {   // dQ for 16 of the tile's queries and every other n-tile, into Qs (scaled), then coalesced atomics
+      const int qr = (warp & 1) * 16;
+      constexpr int NH = (NT + 1) / 2;
+      float dqa[NH][4];
+#pragma unroll
+      for (int u = 0; u < NH; ++u) dqa[u][0] = dqa[u][1] = dqa[u][2] = dqa[u][3] = 0.f;
+#pragma unroll
+      for (int s = 0; s < BC / 8; ++s) {
+        const int c = s * 8 + 2 * t;
+        const uint32_t a0 = tf32(Ts[(qr + g) * LT + c]), a1 = tf32(Ts[(qr + g + 8) * LT + c]),
+                       a2 = tf32(Ts[(qr + g) * LT + c + 1]), a3 = tf32(Ts[(qr + g + 8) * LT + c + 1]);
+#pragma unroll
+        for (int u = 0; u < NH; ++u) {
+          const int n = (warp >> 1) + 2 * u;
+          if (n < NT)
+            mmaTf32(dqa[u], a0, a1, a2, a3, __float_as_uint(Ks[c * LD + n * 8 + g]), __float_as_uint(Ks[(c + 1) * LD + n * 8 + g]));
+        }
+      }
+#pragma unroll
+      for (int u = 0; u < NH; ++u) {
+        const int n = (warp >> 1) + 2 * u;
+        if (n >= NT) continue;
+        *reinterpret_cast<float2*>(Qs + (qr + g) * LD + n * 8 + 2 * t) = make_float2(dqa[u][0] * sc, dqa[u][1] * sc);
+        *reinterpret_cast<float2*>(Qs + (qr + g + 8) * LD + n * 8 + 2 * t) = make_float2(dqa[u][2] * sc, dqa[u][3] * sc);
+      }
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < QT * D; i += THREADS) {
+      const int r = i / D, d = i % D;
+      if (q0 + r < a.Q) atomicAdd(dqb + (long long)(q0 + r) * lddq + d, Qs[r * LD + d]);
+    }
+    __syncthreads();   // (this stage is the next issue's)
+  }
+  float* dkb = dk + (size_t)b * a.K * lddk + h * D;
+  float* dvb = dv + (size_t)b * a.K * lddv + h * D;
+#pragma unroll
+  for (int r = 0; r < 2; ++r) {
+    const int kk = k0 + kl0 + g + r * 8;
+    if (kk >= a.K) continue;
+#pragma unroll
+    for (int n = 0; n < NT; ++n)
+#pragma unroll
+      for (int c = 0; c < 2; ++c) {
+        float* pk = dkb + (long long)kk * lddk + n * 8 + 2 * t + c;
+        float* pv = dvb + (long long)kk * lddv + n * 8 + 2 * t + c;
+        const float xk = dka[n][r * 2 + c] * sc, xv = dva[n][r * 2 + c];
+        *pk = accK ? *pk + xk : xk;
+        *pv = accV ? *pv + xv : xv;
+      }
+  }
+}
+template <int D>
+inline bool backwardT(const Sdpa& a, const float* q, int ldq, const float* k, int ldk, const float* v, int ldv,
+                      const float* dO, int lddo, const float* lse, const float* Di, float* dq, int lddq, float* dk,
+                      int lddk, float* dv, int lddv, bool accK, bool accV) {
+  const Bias& bi = a.bias[0];
+  auto al = [](const void* p) { return ((uintptr_t)p & 15) == 0; };
+  if (a.clip || a.seqQ || a.seqK || a.bias[1].p || !bi.p || D % 8 || a.K % 4 || bi.sq % 4 || bi.sb % 4 || bi.sh % 4 ||
+      ldq % 4 || lddo % 4 || !al(bi.p) || !al(q) || !al(dO))
+    return false;
+  constexpr size_t smem = sizeof(float) * (2 * (2 * 32 * (D + PADK) + 32 * (BC + PADK) + 3 * 32) + BC * (D + PADK));
+  static bool attr = false;
+  if (!attr) { GK(cudaFuncSetAttribute(bwdT<D>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem)); attr = true; }
+  const size_t grid = (size_t)((a.K + BC - 1) / BC) * a.H * a.B;
+  bwdT<D><<<(unsigned)grid, THREADS, smem, STREAM>>>(a, q, ldq, k, ldk, v, ldv, dO, lddo, lse, Di, dq, lddq, dk, lddk,
+                                                     dv, lddv, accK, accV);
+  return true;
+}
+
 template <int D, int MODE>
 inline size_t bwdSmem() { return sizeof(float) * ((MODE == 1 ? 7 : 3) * 64 * (D + PADK) + BC * (BR + PADK) + 3 * BR); }
 
@@ -1535,7 +1950,7 @@ inline bool runForward(const Sdpa& a, const float* q, int ldq, const float* k, i
                        float* o, int ldo, float* lse) {
   if (BF16 && a.D == 8) { forward<8, 2>(a, q, ldq, k, ldk, v, ldv, o, ldo, lse); return true; }   // (m16n8k8 fits D 8 unpadded)
   if (BF16) { FLASH_DISPATCH(a.D, (forwardBf<DD>(a, q, ldq, k, ldk, v, ldv, o, ldo, lse))) }
-  else if (TF32) { FLASH_DISPATCH(a.D, (forward<DD, 0>(a, q, ldq, k, ldk, v, ldv, o, ldo, lse))) }
+  else if (TF32) { FLASH_DISPATCH(a.D, (forwardT<DD>(a, q, ldq, k, ldk, v, ldv, o, ldo, lse) || (forward<DD, 0>(a, q, ldq, k, ldk, v, ldv, o, ldo, lse), true))) }
   else { FLASH_DISPATCH(a.D, (forward<DD, 1>(a, q, ldq, k, ldk, v, ldv, o, ldo, lse))) }
 }
 inline bool runBackward(const Sdpa& a, const float* q, int ldq, const float* k, int ldk, const float* v, int ldv,
@@ -1543,7 +1958,7 @@ inline bool runBackward(const Sdpa& a, const float* q, int ldq, const float* k, 
                         int lddk, float* dv, int lddv, bool accK, bool accV) {
   if (BF16 && a.D == 8) { backward<8, 2>(a, q, ldq, k, ldk, v, ldv, dO, lddo, lse, Di, dq, lddq, dk, lddk, dv, lddv, accK, accV); return true; }
   if (BF16) { FLASH_DISPATCH(a.D, (backwardBf<DD>(a, q, ldq, k, ldk, v, ldv, dO, lddo, lse, Di, dq, lddq, dk, lddk, dv, lddv, accK, accV))) }
-  else if (TF32) { FLASH_DISPATCH(a.D, (backward<DD, 0>(a, q, ldq, k, ldk, v, ldv, dO, lddo, lse, Di, dq, lddq, dk, lddk, dv, lddv, accK, accV))) }
+  else if (TF32) { FLASH_DISPATCH(a.D, (backwardT<DD>(a, q, ldq, k, ldk, v, ldv, dO, lddo, lse, Di, dq, lddq, dk, lddk, dv, lddv, accK, accV) || (backward<DD, 0>(a, q, ldq, k, ldk, v, ldv, dO, lddo, lse, Di, dq, lddq, dk, lddk, dv, lddv, accK, accV), true))) }
   else { FLASH_DISPATCH(a.D, (backward<DD, 1>(a, q, ldq, k, ldk, v, ldv, dO, lddo, lse, Di, dq, lddq, dk, lddk, dv, lddv, accK, accV))) }
 }
 // q, k, v already bf16 (a module on bf16 storage): the bf16 kernels, whatever D they support (8 included, padded)

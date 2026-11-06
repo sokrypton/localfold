@@ -383,7 +383,9 @@ __global__ void superBiasK(real* flat, real* pl, int n, int H, int perSuper, int
 
 // The whole transformer, every block's input kept and each replayed before its backward.
 // (grow-only: a size change reallocated it - and every backward allocated and freed its three buffers behind a stream
-// sync - which the device waited out each time; the caller gives it back with releaseRun)
+// sync - which the device waited out each time; the caller gives it back with releaseRun. Stream-ordered: a training
+// step grows it three times - the rollout's one sample, then each wider batch - and cudaFree's implicit device sync
+// left the device idle 10-50 ms each time)
 struct DiffRun {
   std::vector<real*> acts;         // [blocks + 1]
   real *pn = nullptr, *pl = nullptr;   // LN'd pair [nn, Cz]; every block's logits [blocks][H, n, n]
@@ -392,10 +394,18 @@ struct DiffRun {
   int n = 0, S = 1;     // tokens, and samples batched
   size_t capRows = 0, capNn = 0;
 };
-inline void releaseRun(DiffRun& r) {
-  for (real* p : r.acts) GK(cudaFree(p));
-  for (real* p : {r.pn, r.pl, r.dx, r.tmp, r.dpl}) if (p) GK(cudaFree(p));
+inline void freeRun(DiffRun& r) {
+  for (real* p : r.acts) GK(cudaFreeAsync(p, STREAM));
+  for (real* p : {r.pn, r.pl, r.dx, r.tmp, r.dpl}) if (p) GK(cudaFreeAsync(p, STREAM));
   r = DiffRun{};
+}
+// (and the pool's bytes back to the driver: the pool keeps what it is given, and the trunk's backward wants the room)
+inline void releaseRun(DiffRun& r) {
+  freeRun(r);
+  GK(cudaStreamSynchronize(STREAM));
+  int dev; GK(cudaGetDevice(&dev));
+  cudaMemPool_t pool; GK(cudaDeviceGetDefaultMemPool(&pool, dev));
+  GK(cudaMemPoolTrimTo(pool, 0));
 }
 // S samples batched: act, cond, mask and out [S n, ...] (each sample's own noise level in its cond rows), the pair
 // conditioning one for all - its logits computed once and read by every sample
@@ -409,11 +419,11 @@ inline void transformerForward(DiffTransformer& t, DiffRun& r, const real* act, 
   if (r.acts.empty() || rows > r.capRows || nn > r.capNn) {
     logitsKept = false;
     const size_t capRows = std::max(rows, r.capRows), capNn = std::max(nn, r.capNn);
-    releaseRun(r);
+    freeRun(r);
     r.acts.assign(nb + 1, nullptr);
-    for (auto& p : r.acts) GK(cudaMalloc(&p, capRows * t.C * sizeof(real)));
-    GK(cudaMalloc(&r.pn, capNn * t.Cz * sizeof(real)));
-    GK(cudaMalloc(&r.pl, (size_t)nb * t.H * capNn * sizeof(real)));
+    for (auto& p : r.acts) GK(cudaMallocAsync(&p, capRows * t.C * sizeof(real), STREAM));
+    GK(cudaMallocAsync(&r.pn, capNn * t.Cz * sizeof(real), STREAM));
+    GK(cudaMallocAsync(&r.pl, (size_t)nb * t.H * capNn * sizeof(real), STREAM));
     r.capRows = capRows; r.capNn = capNn;
   }
   r.n = n; r.S = S;
@@ -442,9 +452,9 @@ inline void transformerBackward(DiffTransformer& t, DiffRun& r, const real* cond
   const int n = r.n, S = r.S, nb = (int)t.blocks.size();
   const size_t nn = (size_t)n * n, rows = (size_t)n * S;
   if (!r.dx) {
-    GK(cudaMalloc(&r.dx, r.capRows * t.C * sizeof(real)));
-    GK(cudaMalloc(&r.tmp, r.capRows * t.C * sizeof(real)));
-    GK(cudaMalloc(&r.dpl, (size_t)nb * t.H * r.capNn * sizeof(real)));
+    GK(cudaMallocAsync(&r.dx, r.capRows * t.C * sizeof(real), STREAM));
+    GK(cudaMallocAsync(&r.tmp, r.capRows * t.C * sizeof(real), STREAM));
+    GK(cudaMallocAsync(&r.dpl, (size_t)nb * t.H * r.capNn * sizeof(real), STREAM));
   }
   real *dx = r.dx, *dpl = r.dpl, *tmp = r.tmp;
   GK(cudaMemsetAsync(dpl, 0, (size_t)nb * t.H * nn * sizeof(real), STREAM));

@@ -60,6 +60,41 @@
 
 namespace g = grad;
 
+// the rollout's step on the device (train-of3's rollout): the centre of the live atoms; the augmented, noised positions
+// (as the host made them: R (x - centre) + t + inj noise, zero where an atom is not predicted); the Euler update
+struct RolloutStep { double R[9], tr[3], tHat, inj, coef; };
+__global__ void rolloutCentreK(const double* xs, const float* mask, int A, double invLive, double* cen) {
+  __shared__ double s[3][256];
+  double a[3] = {0, 0, 0};
+  for (int i = threadIdx.x; i < A; i += blockDim.x)
+    if (mask[i] > 0) for (int c = 0; c < 3; ++c) a[c] += xs[(size_t)i * 3 + c] * invLive;
+  for (int c = 0; c < 3; ++c) s[c][threadIdx.x] = a[c];
+  __syncthreads();
+  for (int w = blockDim.x / 2; w; w >>= 1) {
+    if ((int)threadIdx.x < w) for (int c = 0; c < 3; ++c) s[c][threadIdx.x] += s[c][threadIdx.x + w];
+    __syncthreads();
+  }
+  if (threadIdx.x < 3) cen[threadIdx.x] = s[threadIdx.x][0];
+}
+__global__ void rolloutNoiseK(const double* xs, const float* mask, const double* noise, const double* cen, RolloutStep st,
+                              int A, double* noisy, g::real* xd) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= A) return;
+  for (int p = 0; p < 3; ++p) {
+    double v = 0;
+    if (mask[i] > 0) {
+      v = st.tr[p];
+      for (int c = 0; c < 3; ++c) v += st.R[p * 3 + c] * (xs[(size_t)i * 3 + c] - cen[c]);
+      v += st.inj * noise[(size_t)i * 3 + p];
+    }
+    noisy[(size_t)i * 3 + p] = v;
+    xd[(size_t)i * 3 + p] = (g::real)v;
+  }
+}
+__global__ void rolloutUpdateK(const double* noisy, const g::real* den, double coef, size_t n, double* xs) {
+  const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) xs[i] = noisy[i] + coef * (noisy[i] - (double)den[i]);
+}
 static g::real* dzeros(size_t n) { g::real* p; GK(cudaMalloc(&p, std::max<size_t>(n, 1) * sizeof(g::real))); GK(cudaMemset(p, 0, std::max<size_t>(n, 1) * sizeof(g::real))); return p; }
 
 // --mem: after each phase of a step, the arena's high-water mark over the phase, what it holds, and the device's use
@@ -1105,12 +1140,37 @@ int main(int argc, char** argv) {
     for (int p = 0; p < 3; ++p) for (int c = 0; c < 3; ++c) R[p][c] = Rm[p][c];
   };
   // AF3's Algorithm 18 (OpenFold3's sample_diffusion), one sample, no gradient: the rolled-out positions
+  // (every draw made first, in the order the steps made them - only the centring reads the positions - and the steps
+  // on the device: each step's positions to the host and back stalled the device on the host 20 times a rollout)
   auto rollout = [&](Dev& d, Acts& a, const Example& e, std::mt19937_64& gen, int nsteps) {
     std::normal_distribution<double> nd(0, 1);
     const size_t A = e.atoms();
     auto level = [&](int k) { return noiseSchedule((double)k / nsteps, 16, sMin, sMax, rho); };
     std::vector<double> xs(A * 3, 0);
     for (size_t i = 0; i < A; ++i) if (e.predMask[i] > 0) for (int p = 0; p < 3; ++p) xs[i * 3 + p] = level(0) * nd(gen);
+    std::vector<RolloutStep> steps(nsteps);
+    std::vector<double> noise((size_t)nsteps * A * 3, 0);
+    for (int k = 1; k <= nsteps; ++k) {
+      RolloutStep& st = steps[k - 1];
+      const double prev = level(k - 1), lv = level(k);
+      st.tHat = prev * (1 + (lv > gammaMin ? gamma0 : 0));
+      double R[3][3]; rotation(nd, gen, R);
+      for (int p = 0; p < 3; ++p) for (int c = 0; c < 3; ++c) st.R[p * 3 + c] = R[p][c];
+      for (int p = 0; p < 3; ++p) st.tr[p] = nd(gen);
+      st.inj = noiseScale * sqrt(std::max(0.0, st.tHat * st.tHat - prev * prev));
+      st.coef = stepScale * (lv - st.tHat) / st.tHat;
+      double* nz = noise.data() + (size_t)(k - 1) * A * 3;
+      for (size_t i = 0; i < A; ++i) if (e.predMask[i] > 0) for (int p = 0; p < 3; ++p) nz[i * 3 + p] = nd(gen);
+    }
+    g::Scratch sc_;
+    double* xsD = reinterpret_cast<double*>(g::ARENA.get(A * 3 * 2));
+    double* noisyD = reinterpret_cast<double*>(g::ARENA.get(A * 3 * 2));
+    double* noiseD = reinterpret_cast<double*>(g::ARENA.get(noise.size() * 2));
+    double* cenD = reinterpret_cast<double*>(g::ARENA.get(8));
+    float* maskD = reinterpret_cast<float*>(g::ARENA.get(A * sizeof(float) / sizeof(g::real) + 1));
+    GK(cudaMemcpy(xsD, xs.data(), xs.size() * sizeof(double), cudaMemcpyHostToDevice));
+    GK(cudaMemcpy(noiseD, noise.data(), noise.size() * sizeof(double), cudaMemcpyHostToDevice));
+    GK(cudaMemcpy(maskD, e.predMask.data(), A * sizeof(float), cudaMemcpyHostToDevice));
     g::real *xd = g::ARENA.get(A * 3), *od = g::ARENA.get(A * 3);
     // (the conditioning's pair half and the encoder's shared part once for the 20 steps: only the noise level changes)
     const g::af3::CondSave pairC = g::af3::condForward(dn.cond, a.singles[nPf], a.pairs[nMsa + nPf], a.tf, d.ri, d.ti, d.asym, d.ent, d.sym, (g::real)level(0), d.n);
@@ -1118,25 +1178,13 @@ int main(int argc, char** argv) {
     const g::af3::DecPre decC = g::af3::decShared(dn, d.b, encC);
     size_t live = 0; for (size_t i = 0; i < A; ++i) live += e.predMask[i] > 0;
     for (int k = 1; k <= nsteps; ++k) {
-      const double prev = level(k - 1), lv = level(k), tHat = prev * (1 + (lv > gammaMin ? gamma0 : 0));
-      double R[3][3]; rotation(nd, gen, R);
-      double cen[3] = {0, 0, 0}; for (size_t i = 0; i < A; ++i) if (e.predMask[i] > 0) for (int c = 0; c < 3; ++c) cen[c] += xs[i * 3 + c] / live;
-      const double tr[3] = {nd(gen), nd(gen), nd(gen)};
-      const double inj = noiseScale * sqrt(std::max(0.0, tHat * tHat - prev * prev));
-      std::vector<double> noisy(A * 3, 0);
-      for (size_t i = 0; i < A; ++i) {
-        if (!(e.predMask[i] > 0)) continue;
-        for (int p = 0; p < 3; ++p) {
-          double v = tr[p]; for (int c = 0; c < 3; ++c) v += R[p][c] * (xs[i * 3 + c] - cen[c]);
-          noisy[i * 3 + p] = v + inj * nd(gen);
-        }
-      }
-      { std::vector<g::real> rr(noisy.begin(), noisy.end()); GK(cudaMemcpy(xd, rr.data(), rr.size() * sizeof(g::real), cudaMemcpyHostToDevice)); }
-      g::af3::denoiseStepForward(dn, d.b, pairC, encC, decC, a.singles[nPf], d.seqMask, xd, (g::real)tHat, od, k == 1);
-      auto den = g::host(od, A * 3);
-      const double coef = stepScale * (lv - tHat) / tHat;
-      for (size_t i = 0; i < A * 3; ++i) xs[i] = noisy[i] + coef * (noisy[i] - den[i]);
+      const RolloutStep& st = steps[k - 1];
+      rolloutCentreK<<<1, 256, 0, g::STREAM>>>(xsD, maskD, (int)A, 1.0 / std::max<size_t>(live, 1), cenD);
+      rolloutNoiseK<<<g::blocks(A), 256, 0, g::STREAM>>>(xsD, maskD, noiseD + (size_t)(k - 1) * A * 3, cenD, st, (int)A, noisyD, xd);
+      g::af3::denoiseStepForward(dn, d.b, pairC, encC, decC, a.singles[nPf], d.seqMask, xd, (g::real)st.tHat, od, k == 1);
+      rolloutUpdateK<<<g::blocks(A * 3), 256, 0, g::STREAM>>>(noisyD, od, st.coef, A * 3, xsD);
     }
+    GK(cudaMemcpy(xs.data(), xsD, xs.size() * sizeof(double), cudaMemcpyDeviceToHost));
     return xs;
   };
 
@@ -1238,8 +1286,11 @@ int main(int argc, char** argv) {
       return p;
     }
   };
-  std::vector<Pinned> pinned(8);
+  // (the confidence logits, their gradients; the distogram's logits, its gradient; a diffusion batch's noised inputs,
+  // its predictions, their cotangents)
+  std::vector<Pinned> pinned(13);
   cudaEvent_t confCopied; GK(cudaEventCreateWithFlags(&confCopied, cudaEventDisableTiming));
+  cudaEvent_t distCopied; GK(cudaEventCreateWithFlags(&distCopied, cudaEventDisableTiming));
   auto runExample = [&](const Example& full, bool train, bool fixed, int nSamples, std::mt19937_64& gen) {
     Losses L;
     setDropout(train && (!fixed || dropInFixed) && dropout, gen());
@@ -1298,26 +1349,19 @@ int main(int argc, char** argv) {
       xp = rollout(d, a, e, gen, 20);
       memPhase("rollout");
     }
-    of3::permuteTruth(gtPerm, keep, xp, e.xt, e.gm, nullptr);
     // the distogram: its loss on the host, its cotangent kept for the backward
     // (its loss and cotangent on a host thread, beside the confidence head and the diffusion samples on the device:
-    // the backward is the first to read them)
+    // the backward is the first to read them. The logits out and the cotangent back through pinned memory: pageable,
+    // the copy back was 35 ms the device waited out, behind a stream synchronisation)
     g::real* dLog = d.zeros(nn * dh.bins);
-    std::future<std::vector<g::real>> distFuture;
-    {
-      g::Range r_("distogram.loss");
-      auto lg = std::make_shared<std::vector<g::real>>(g::host(a.logits, nn * dh.bins));
-      distFuture = std::async(std::launch::async, [&L, &Lay, &e, lg, nn, bins = dh.bins, distWeight] {
-        std::vector<double> gd(nn * bins, 0);
-        L.distogram = of3::distogramLoss(Lay, e.xt, e.gm, lg->data(), bins, distWeight, gd.data());
-        return std::vector<g::real>(gd.begin(), gd.end());
-      });
-    }
+    g::real* hLog = pinned[8].get(nn * dh.bins);
+    GK(cudaMemcpyAsync(hLog, a.logits, nn * dh.bins * sizeof(g::real), cudaMemcpyDeviceToHost, STREAM));
+    GK(cudaEventRecord(distCopied, STREAM));
+    std::future<void> distFuture;
     auto distogramReady = [&] {
       if (!distFuture.valid()) return;
-      const auto r = distFuture.get();
-      GK(cudaMemcpyAsync(dLog, r.data(), r.size() * sizeof(g::real), cudaMemcpyHostToDevice, STREAM));
-      GK(cudaStreamSynchronize(STREAM));
+      distFuture.get();
+      GK(cudaMemcpyAsync(dLog, pinned[9].p, nn * dh.bins * sizeof(g::real), cudaMemcpyHostToDevice, STREAM));
     };
     // the confidence head on the rollout, its inputs detached (no gradient into the trunk: its backward can wait): its
     // logits to the host and their losses on a host thread while the device runs the diffusion samples, then after
@@ -1353,6 +1397,16 @@ int main(int argc, char** argv) {
       GK(cudaMemcpyAsync(hPae, o.pae, nPd * sizeof(g::real), cudaMemcpyDeviceToHost, STREAM));
       if (nRs) GK(cudaMemcpyAsync(hRs, o.resolved, nRs * sizeof(g::real), cudaMemcpyDeviceToHost, STREAM));
       GK(cudaEventRecord(confCopied, STREAM));
+      // the truth's permutation on the rollout (model.py: before every loss of the step) - on the host while the
+      // device runs the head's forward, which reads the rollout and not the truth; then the losses that read both
+      { g::Range rp_("permute"); of3::permuteTruth(gtPerm, keep, xp, e.xt, e.gm, nullptr); }
+      distFuture = std::async(std::launch::async, [&, hLog, bins = dh.bins] {
+        GK(cudaEventSynchronize(distCopied));
+        std::vector<double> gd(nn * bins, 0);
+        L.distogram = of3::distogramLoss(Lay, e.xt, e.gm, hLog, bins, distWeight, gd.data());
+        g::real* dst = pinned[9].get(gd.size());
+        of3::rowsInParallel(gd.size(), [&](size_t i0, size_t i1) { for (size_t j = i0; j < i1; ++j) dst[j] = (g::real)gd[j]; return 0.0; });
+      });
       const double w = confOn ? confWeight : 0;
       confFuture = std::async(std::launch::async, [&, hPl, hPde, hPae, hRs, nPl, nPd, nRs, w] {
         GK(cudaEventSynchronize(confCopied));
@@ -1431,7 +1485,8 @@ int main(int argc, char** argv) {
         double R[3][3]; std::normal_distribution<double> nd(0, 1); rotation(nd, gen, R);
         double cen[3] = {0, 0, 0}; for (size_t i = 0; i < A; ++i) if (e.gm[i] > 0) for (int q = 0; q < 3; ++q) cen[q] += e.xt[i * 3 + q] / std::max<size_t>(nRes, 1);
         const double tr[3] = {nd(gen), nd(gen), nd(gen)};
-        std::vector<g::real> xn(A * 3, 0);
+        g::real* xn = pinned[10].get((size_t)S * A * 3) + (size_t)k * A * 3;   // (pinned: the copy is the stream's)
+        std::fill(xn, xn + A * 3, (g::real)0);
         for (size_t i = 0; i < A; ++i) {
           if (!(e.predMask[i] > 0)) continue;
           for (int p = 0; p < 3; ++p) {
@@ -1441,7 +1496,7 @@ int main(int argc, char** argv) {
           }
         }
         xin[k] = g::ARENA.get(A * 3); xout[k] = g::ARENA.get(A * 3); dxd[k] = g::ARENA.get(A * 3);
-        GK(cudaMemcpy(xin[k], xn.data(), xn.size() * sizeof(g::real), cudaMemcpyHostToDevice));
+        GK(cudaMemcpyAsync(xin[k], xn, A * 3 * sizeof(g::real), cudaMemcpyHostToDevice, STREAM));
       }
       // (--sample-batch=1: the one-sample path, denoiseForward - the batched path's reference)
       rD_.reset(); rD_.emplace("diff.fwd");
@@ -1454,17 +1509,23 @@ int main(int argc, char** argv) {
         batch = g::af3::denoiseBatchForward(dn, d.b, a.singles[nPf], a.pairs[nMsa + nPf], a.tf, d.seqMask, xs, sg, d.ri, d.ti, d.asym, d.ent, d.sym, xout);
       }
       rD_.reset(); rD_.emplace("diff.loss");
+      // (the batch's predictions out and its cotangents back through pinned memory, one synchronisation)
+      g::real* hOut = pinned[11].get((size_t)S * A * 3);
+      for (int k = 0; k < S; ++k) GK(cudaMemcpyAsync(hOut + (size_t)k * A * 3, xout[k], A * 3 * sizeof(g::real), cudaMemcpyDeviceToHost, STREAM));
+      GK(cudaStreamSynchronize(STREAM));
+      g::real* hDx = pinned[12].get((size_t)S * A * 3);
       for (int k = 0; k < S; ++k) {
-        auto xh = g::host(xout[k], A * 3);
-        std::vector<double> xp(xh.begin(), xh.end()), dx(A * 3, 0);
+        const g::real* xh = hOut + (size_t)k * A * 3;
+        std::vector<double> xp(xh, xh + A * 3), dx(A * 3, 0);
         const auto tl = std::chrono::steady_clock::now();
         auto D = of3::diffusionLoss(Lay, xp, e.xt, e.gm, sig[k], DW, &dx, 1.0 / nSamples,
                                     [&](double sc_, std::vector<double>* g) { return sl.run(xp, sc_, train ? g : nullptr, STREAM); },
                                     lossAtom.empty() ? nullptr : &lossAtom);
         tLoss += msOf(tl, std::chrono::steady_clock::now());
         L.mse += D.mse / nSamples; L.bond += D.bond / nSamples; L.lddt += D.lddt / nSamples; L.diffusion += D.total / nSamples;
-        std::vector<g::real> r(dx.begin(), dx.end());
-        GK(cudaMemcpy(dxd[k], r.data(), r.size() * sizeof(g::real), cudaMemcpyHostToDevice));
+        g::real* r = hDx + (size_t)k * A * 3;
+        for (size_t i = 0; i < A * 3; ++i) r[i] = (g::real)dx[i];
+        GK(cudaMemcpyAsync(dxd[k], r, A * 3 * sizeof(g::real), cudaMemcpyHostToDevice, STREAM));
       }
       rD_.reset();
       if (train) {
