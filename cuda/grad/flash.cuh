@@ -1555,10 +1555,19 @@ __global__ void keyTermsK(Sdpa a, float* __restrict__ out, int Kp) {
   const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i < (size_t)a.B * Kp) out[i] = keyAdd(a, (int)(i / Kp), 0, (int)(i % Kp)) * LOG2E;
 }
-// the grid attention's forward through gridFwdBf where its shape allows (false: the caller takes the general path)
+}  // namespace flash
+}  // namespace grad
+#include "flash_tc5.cuh"
+namespace grad {
+namespace flash {
+// the grid attention's forward through gridFwdBf where its shape allows (false: the caller takes the general path);
+// tc: on a B200 (a binary with sm_100a code) gridFwdTc's tcgen05 form instead, at head dim 32 - off by default until it
+// is the faster: 1.82 ms a call at 768 tokens against gridFwdBf's 1.50 (its tile's chain - S, its softmax, P, O - runs
+// in turn; the overlap is what is left), the same outputs to a bf16 rounding (test_tc5_attn)
 inline bool gridForwardBf(const Sdpa& a, const __nv_bfloat16* q, int ldq, const __nv_bfloat16* k, int ldk,
                           const __nv_bfloat16* v, int ldv, __nv_bfloat16* o, int ldo, float* lse,
-                          __nv_bfloat16* gate = nullptr, int ldg = 0, __nv_bfloat16* og = nullptr, int ldog = 0) {
+                          __nv_bfloat16* gate = nullptr, int ldg = 0, __nv_bfloat16* og = nullptr, int ldog = 0,
+                          bool tc = false) {
   if (a.seqQ || a.seqK || a.clip || (a.D != 16 && a.D != 32) || a.bias[1].p) return false;
   if (a.bias[0].p && (a.bias[0].sb != 0 || a.bias[0].sq == 0)) return false;
   if (ldo % 2 || (gate && (ldg % 2 || ldog % 2))) return false;
@@ -1602,6 +1611,14 @@ inline bool gridForwardBf(const Sdpa& a, const __nv_bfloat16* q, int ldq, const 
     }
     if (wide) launch(Dc, I2{}, I8{}); else launch(Dc, I1{}, I4{});
   };
+  if (tc && a.D == 32 && tc5::ready()) {
+    static bool attr = false;
+    if (!attr) { GK(cudaFuncSetAttribute(gridFwdTc, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)gridFwdTcSmem())); attr = true; }
+    const HSrc qs_ = hsrc<32>(q, ldq, a.B, a.Q, a.H), ks_ = hsrc<32>(k, ldk, a.B, a.K, a.H), vs_ = hsrc<32>(v, ldv, a.B, a.K, a.H);
+    const size_t grid = (size_t)((a.Q + TQ - 1) / TQ) * a.H * a.B;
+    gridFwdTc<<<(unsigned)grid, 128, gridFwdTcSmem(), STREAM>>>(a, bt, qs_, ks_, vs_, o, ldo, lse, gate, ldg, og, ldog, ka2, Npk);
+    return true;
+  }
   if (a.D == 32) run(std::integral_constant<int, 32>{}); else run(std::integral_constant<int, 16>{});
   return true;
 }
