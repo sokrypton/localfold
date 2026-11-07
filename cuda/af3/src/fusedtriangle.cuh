@@ -1388,6 +1388,7 @@ void gridOutAt(const half* gathered, const half* Wout, const float* ob, float* p
 }
 template <int C = 128>
 inline void gridOutRaw(const half* gathered, const half* Wout, const float* ob, float* pair, int n, size_t q0, size_t rows, bool tr) {
+  if (C == 128 && ptc::gridOutTcRun(PAIR16, gathered, Wout, ob, pair, n, q0, rows, tr)) return;   // (a B200: pair_tc5.cuh)
   // 4 warps where an SM holds three of their blocks (an A100's 164 KB): the 8-warp block's 166 registers a thread and
   // 70 KB held one block an SM, the kernel latency-bound at 41% of the memory's bandwidth - 212 -> 149 ms of a 988-token
   // fold, byte-identical. A part with ~100 KB an SM holds one block of either and keeps the eight

@@ -831,4 +831,328 @@ inline bool transTcRun(bool pair16, float* x, size_t rows, int Cin, int I, const
   CK(cudaGetLastError());
   return true;
 }
+
+// ---- gridOutTc: the grid attention's output projection and residual (gridOutK at C 128, a bf16 pair) on tcgen05:
+// pair[pe(q)] += gathered[q] Wout (+ ob), pe the column direction's transpose. 128-row tiles that never cross a grid
+// row: TMA loads the gathered tile (f16, straight into the MMA's A layout) and the pair tile (the 3-d map gridInTc
+// uses, transposed strides in the column direction); Wout K-major in shared memory for the block's life; one N=128
+// product a tile into a double-buffered tensor-memory D; warps 2-5 add D, ob and the pair in f32, round to bf16 in
+// place in the pair tile and TMA store it back.
+namespace gout { struct Lay { static constexpr uint32_t A = 0, P = 65536, W = 131072, OB = W + 32768, BAR = OB + 512, BYTES = BAR + 256; }; }
+__global__ void __launch_bounds__(192, 1) gridOutTc(const __grid_constant__ CUtensorMap mapG, const __grid_constant__ CUtensorMap mapP,
+    const half* __restrict__ WoT, const float* __restrict__ ob, int n, int a0, int A) {
+#if LF_TC5A
+  using L = gout::Lay;
+  extern __shared__ __align__(1024) unsigned char sm[];
+  uint64_t* bar = reinterpret_cast<uint64_t*>(sm + L::BAR);
+  uint64_t *ldFull = bar, *bufFree = bar + 2, *dFull = bar + 4, *dFree = bar + 6;
+  __shared__ uint32_t tmBase;
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  const int nbt = (n + TM - 1) / TM;
+  const size_t tiles = (size_t)A * nbt;
+  const int mine = tiles > blockIdx.x ? (int)((tiles - blockIdx.x + gridDim.x - 1) / gridDim.x) : 0;
+  if (warp == 1) {
+    asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], 256;" :: "r"(sa(&tmBase)));
+    asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
+  }
+  if (tid == 0) {
+    for (int i = 0; i < 2; ++i) { barInit(ldFull + i, 1); barInit(bufFree + i, 1); barInit(dFull + i, 1); barInit(dFree + i, 4); }
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+  }
+  for (int i = tid; i < C * 16; i += 192) {
+    const int r = i >> 4, c = i & 15;
+    *reinterpret_cast<uint4*>(sm + L::W + swOff(r, c, C)) = *reinterpret_cast<const uint4*>(WoT + (size_t)r * C + c * 8);
+  }
+  float* obS = reinterpret_cast<float*>(sm + L::OB);
+  for (int i = tid; i < C; i += 192) obS[i] = ob ? ob[i] : 0.f;
+  fenceProxy();
+  fenceBefore();
+  __syncthreads();
+  fenceAfter();
+  const uint32_t tm = tmBase, base = sa(sm);
+  auto tileOf = [&](int k, int& a, int& b0) { const size_t t = (size_t)blockIdx.x + (size_t)k * gridDim.x; a = (int)(t / nbt); b0 = (int)(t % nbt) * TM; };
+  if (warp == 0) {
+    if (lane == 0) {
+      for (int k = 0; k < mine; ++k) {
+        int a, b0; tileOf(k, a, b0);
+        const int b = k & 1;
+        if (k >= 2) barWait(bufFree + b, ((k - 2) >> 1) & 1);
+        barExpect(ldFull + b, 65536);
+        unsigned char* Ab = sm + L::A + b * 32768; unsigned char* Pb = sm + L::P + b * 32768;
+        tma3(Ab, &mapG, 0, b0, a, ldFull + b); tma3(Ab + 16384, &mapG, 64, b0, a, ldFull + b);
+        tma3(Pb, &mapP, 0, b0, a0 + a, ldFull + b); tma3(Pb + 16384, &mapP, 64, b0, a0 + a, ldFull + b);
+      }
+    }
+  } else if (warp == 1) {
+    if (lane == 0) {
+      constexpr uint32_t ID128 = idesc(TM, 128);
+      for (int k = 0; k < mine; ++k) {
+        const int b = k & 1;
+        barWait(ldFull + b, (k >> 1) & 1);
+        if (k >= 2) barWait(dFree + b, ((k - 2) >> 1) & 1);
+        fenceAfter();
+        const uint32_t Ab = base + L::A + b * 32768;
+#pragma unroll
+        for (int s = 0; s < 8; ++s)
+          mmaF16(tm + 128 * b, sdesc(Ab + (s >> 2) * TM * 128 + (s & 3) * 32, 16, 1024, SW128),
+                 sdesc(base + L::W + (s >> 2) * C * 128 + (s & 3) * 32, 16, 1024, SW128), ID128, s > 0);
+        commit(dFull + b);
+      }
+    }
+  } else {
+    const int sub = warp & 3, rl = sub * 32 + lane;
+    const uint32_t lane0 = (uint32_t)(sub * 32) << 16;
+    const bool T0 = warp == 2 && lane == 0;
+    for (int k = 0; k < mine; ++k) {
+      int a, b0; tileOf(k, a, b0);
+      const int b = k & 1;
+      barWait(dFull + b, (k >> 1) & 1);
+      fenceAfter();
+      unsigned char* Pb = sm + L::P + b * 32768;
+      for (int c = 0; c < 4; ++c) {
+        uint32_t x[32];
+        ld32(tm + lane0 + 128 * b + 32 * c, x);
+        ldWait();
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          uint4* pp = reinterpret_cast<uint4*>(Pb + swOff(rl, 4 * c + j, TM));
+          uint4 w = *pp;
+#pragma unroll
+          for (int e = 0; e < 4; ++e) {
+            const int i = 8 * j + 2 * e, ch = 32 * c + i;
+            const float2 f = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&(&w.x)[e]));
+            const __nv_bfloat162 o = __floats2bfloat162_rn(f.x + __uint_as_float(x[i]) + obS[ch], f.y + __uint_as_float(x[i + 1]) + obS[ch + 1]);
+            (&w.x)[e] = *reinterpret_cast<const uint32_t*>(&o);
+          }
+          *pp = w;
+        }
+      }
+      fenceBefore();
+      __syncwarp();
+      if (lane == 0) barArrive(dFree + b);
+      fenceProxy();
+      epiSync();
+      if (T0) {
+        tmaStore3(&mapP, Pb, 0, b0, a0 + a); tmaStore3(&mapP, Pb + 16384, 64, b0, a0 + a);
+        bulkCommit();
+        bulkWaitRead<0>();
+        barArrive(bufFree + b);
+      }
+    }
+    if (T0) bulkWait<0>();
+  }
+  fenceBefore();
+  __syncthreads();
+  if (warp == 1) {
+    fenceAfter();
+    asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, 256;" :: "r"(tm));
+  }
+#endif
+}
+// gridOutRaw's form at C 128 for a bf16 pair, calls covering whole grid rows: true where it ran
+inline bool gridOutTcRun(bool pair16, const half* gathered, const half* Wout, const float* ob, float* pair, int n, size_t q0, size_t rows, bool tr) {
+  if (!PAIR_TC || !ready() || !pair16 || q0 % n || rows % n || rows == 0) return false;
+  const half* WoT = kMajor(Wout, C, C);
+  const uint64_t N = (uint64_t)n, A = rows / n;
+  const CUtensorMap mg = map3(CU_TENSOR_MAP_DATA_TYPE_FLOAT16, gathered, { (uint64_t)C, N, A }, { (uint64_t)C * 2, N * C * 2 }, { 64, TM, 1 }, CU_TENSOR_MAP_SWIZZLE_128B);
+  const CUtensorMap mp = map3(CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, pair, { (uint64_t)C, N, N },
+                              { tr ? N * C * 2 : (uint64_t)C * 2, tr ? (uint64_t)C * 2 : N * C * 2 }, { 64, TM, 1 }, CU_TENSOR_MAP_SWIZZLE_128B);
+  static LF_TLS int sms = 0;
+  if (!sms) { int dev; CK(cudaGetDevice(&dev)); CK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev)); }
+  const unsigned grid = (unsigned)std::min<size_t>(A * ((n + TM - 1) / TM), sms);
+  static LF_TLS bool attr = false;
+  if (!attr) { CK(cudaFuncSetAttribute(gridOutTc, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)gout::Lay::BYTES)); attr = true; }
+  gridOutTc<<<grid, 192, gout::Lay::BYTES, STREAM>>>(mg, mp, WoT, ob, n, (int)(q0 / n), (int)A);
+  CK(cudaGetLastError());
+  return true;
+}
+
+// ---- triOutTc: the triangle multiplication's output side (triangleOutK's VEC form at C 128: a bf16 product, a bf16 pair)
+// on tcgen05: pair[i L + j] += (LN_centre(prod[:, q]) Wout (+ ob)) * sigmoid(t2[q]), q = i Lp + j the padded row, for
+// i, j < L. 128-row tiles (i, j0 ..) of real pairs: TMA loads the product tile channel-major ([ch][128 rows], no swizzle),
+// t2's rows and the pair's rows (both 128B-swizzled); warps 2-5 take each row's centre-norm statistics from its column
+// (a thread a row, its 128 values held packed), then - after a barrier among them - write the normalised f16 row back
+// into the same buffer in the MMA's K-major layout (an in-place transpose); one N=128 product a tile into a double-
+// buffered D; warps 6-9 add D, ob, the gate and the pair in f32, round to bf16 in place in the pair tile, TMA store it.
+namespace tout {
+// shared memory: [2 stages] { the product tile, then the normalised A 32 KB; t2 32 KB; the pair tile 32 KB }; Wout 32 KB
+struct Lay { static constexpr uint32_t STG = 98304, A = 0, T2 = 32768, PR = 65536, W = 2 * STG, OB = W + 32768, LN = OB + 512, BAR = LN + 1024, BYTES = BAR + 256; };
+}
+__device__ __forceinline__ void lnSync() { asm volatile("bar.sync 3, 128;" ::: "memory"); }   // (warps 2-5)
+__global__ void __launch_bounds__(320, 1) triOutTc(const __grid_constant__ CUtensorMap mapProd, const __grid_constant__ CUtensorMap mapT2,
+    const __grid_constant__ CUtensorMap mapP, const float* __restrict__ cnScale, const float* __restrict__ cnOffset, const half* __restrict__ WoT,
+    const float* __restrict__ ob, int L, int Lp) {
+#if LF_TC5A
+  using T = tout::Lay;
+  extern __shared__ __align__(1024) unsigned char sm[];
+  uint64_t* bar = reinterpret_cast<uint64_t*>(sm + T::BAR);
+  uint64_t *ldFull = bar, *aFull = bar + 2, *bufFree = bar + 4, *dFull = bar + 6, *dFree = bar + 8;
+  __shared__ uint32_t tmBase;
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  const int nbt = (L + TM - 1) / TM;
+  const size_t tiles = (size_t)L * nbt;
+  const int mine = tiles > blockIdx.x ? (int)((tiles - blockIdx.x + gridDim.x - 1) / gridDim.x) : 0;
+  if (warp == 1) {
+    asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], 256;" :: "r"(sa(&tmBase)));
+    asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
+  }
+  if (tid == 0) {
+    for (int i = 0; i < 2; ++i) { barInit(ldFull + i, 1); barInit(aFull + i, 4); barInit(bufFree + i, 1); barInit(dFull + i, 1); barInit(dFree + i, 4); }
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+  }
+  for (int i = tid; i < C * 16; i += 320) {
+    const int r = i >> 4, c = i & 15;
+    *reinterpret_cast<uint4*>(sm + T::W + swOff(r, c, C)) = *reinterpret_cast<const uint4*>(WoT + (size_t)r * C + c * 8);
+  }
+  float* obS = reinterpret_cast<float*>(sm + T::OB);
+  float* lnS = reinterpret_cast<float*>(sm + T::LN);
+  for (int i = tid; i < C; i += 320) { obS[i] = ob ? ob[i] : 0.f; lnS[i] = cnScale[i]; lnS[C + i] = cnOffset[i]; }
+  fenceProxy();
+  fenceBefore();
+  __syncthreads();
+  fenceAfter();
+  const uint32_t tm = tmBase, base = sa(sm);
+  auto tileOf = [&](int k, int& i, int& j0) { const size_t t = (size_t)blockIdx.x + (size_t)k * gridDim.x; i = (int)(t / nbt); j0 = (int)(t % nbt) * TM; };
+  if (warp == 0) {
+    if (lane == 0) {
+      for (int k = 0; k < mine; ++k) {
+        int i, j0; tileOf(k, i, j0);
+        const int b = k & 1;
+        if (k >= 2) barWait(bufFree + b, ((k - 2) >> 1) & 1);
+        barExpect(ldFull + b, 3 * 32768);
+        unsigned char* S = sm + b * T::STG;
+        tma3(S + T::A, &mapProd, j0, i, 0, ldFull + b);                                   // [128 ch][128 rows]
+        tma3(S + T::T2, &mapT2, 0, j0, i, ldFull + b); tma3(S + T::T2 + 16384, &mapT2, 64, j0, i, ldFull + b);
+        tma3(S + T::PR, &mapP, 0, j0, i, ldFull + b); tma3(S + T::PR + 16384, &mapP, 64, j0, i, ldFull + b);
+      }
+    }
+  } else if (warp == 1) {
+    if (lane == 0) {
+      constexpr uint32_t ID128 = idesc(TM, 128);
+      for (int k = 0; k < mine; ++k) {
+        const int b = k & 1;
+        barWait(aFull + b, (k >> 1) & 1);
+        if (k >= 2) barWait(dFree + b, ((k - 2) >> 1) & 1);
+        fenceAfter();
+        const uint32_t A = base + b * T::STG + T::A;
+#pragma unroll
+        for (int s = 0; s < 8; ++s)
+          mmaF16(tm + 128 * b, sdesc(A + (s >> 2) * TM * 128 + (s & 3) * 32, 16, 1024, SW128),
+                 sdesc(base + T::W + (s >> 2) * C * 128 + (s & 3) * 32, 16, 1024, SW128), ID128, s > 0);
+        commit(dFull + b);
+      }
+    }
+  } else if (warp < 6) {
+    // the centre norm, a thread a row: its column of 128 channels (two bytes each, a warp 64 contiguous bytes) held
+    // packed, the statistics, then - once every LN thread holds its row - the normalised row written back over the tile
+    const int r = (warp - 2) * 32 + lane;
+    for (int k = 0; k < mine; ++k) {
+      const int b = k & 1;
+      barWait(ldFull + b, (k >> 1) & 1);
+      unsigned char* S = sm + b * T::STG + T::A;
+      uint32_t v[64];
+      float s0 = 0.f, s1 = 0.f;
+#pragma unroll
+      for (int c = 0; c < C; c += 2) {
+        const unsigned short lo = *reinterpret_cast<const unsigned short*>(S + c * 256 + r * 2),
+                             hi = *reinterpret_cast<const unsigned short*>(S + (c + 1) * 256 + r * 2);
+        v[c >> 1] = lo | (uint32_t)hi << 16;
+        const float2 f = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&v[c >> 1]));
+        s0 += f.x; s1 += f.y;
+      }
+      const float mean = (s0 + s1) / C;
+      float q0 = 0.f, q1 = 0.f;
+#pragma unroll
+      for (int c = 0; c < 64; ++c) {
+        const float2 f = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&v[c]));
+        q0 += (f.x - mean) * (f.x - mean); q1 += (f.y - mean) * (f.y - mean);
+      }
+      const float inv = rsqrtf((q0 + q1) / C + 1e-5f);
+      lnSync();          // (every LN thread has its column: the tile may be overwritten)
+#pragma unroll
+      for (int c = 0; c < 16; ++c) {
+        uint4 w;
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+          const float2 f = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&v[4 * c + e]));
+          const int ch = 8 * c + 2 * e;
+          (&w.x)[e] = f16x2((f.x - mean) * inv * lnS[ch] + lnS[C + ch], (f.y - mean) * inv * lnS[ch + 1] + lnS[C + ch + 1]);
+        }
+        *reinterpret_cast<uint4*>(S + swOff(r, c, TM)) = w;
+      }
+      fenceProxy();
+      __syncwarp();
+      if (lane == 0) barArrive(aFull + b);
+    }
+  } else {
+    const int sub = warp & 3, rl = sub * 32 + lane;
+    const uint32_t lane0 = (uint32_t)(sub * 32) << 16;
+    const bool T0 = warp == 6 && lane == 0;
+    for (int k = 0; k < mine; ++k) {
+      int i, j0; tileOf(k, i, j0);
+      const int b = k & 1;
+      barWait(dFull + b, (k >> 1) & 1);
+      fenceAfter();
+      unsigned char* S = sm + b * T::STG;
+      for (int c = 0; c < 4; ++c) {
+        uint32_t x[32];
+        ld32(tm + lane0 + 128 * b + 32 * c, x);
+        ldWait();
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          uint4* pp = reinterpret_cast<uint4*>(S + T::PR + swOff(rl, 4 * c + j, TM));
+          const uint4 gw = *reinterpret_cast<const uint4*>(S + T::T2 + swOff(rl, 4 * c + j, TM));
+          uint4 w = *pp;
+#pragma unroll
+          for (int e = 0; e < 4; ++e) {
+            const int ii = 8 * j + 2 * e, ch = 32 * c + ii;
+            const float2 f = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&(&w.x)[e]));
+            const float2 g = __half22float2(*reinterpret_cast<const half2*>(&(&gw.x)[e]));
+            const __nv_bfloat162 o = __floats2bfloat162_rn(f.x + (__uint_as_float(x[ii]) + obS[ch]) * sigmH(g.x),
+                                                           f.y + (__uint_as_float(x[ii + 1]) + obS[ch + 1]) * sigmH(g.y));
+            (&w.x)[e] = *reinterpret_cast<const uint32_t*>(&o);
+          }
+          *pp = w;
+        }
+      }
+      fenceBefore();
+      __syncwarp();
+      if (lane == 0) barArrive(dFree + b);
+      fenceProxy();
+      epiSync();
+      if (T0) {
+        tmaStore3(&mapP, S + T::PR, 0, j0, i); tmaStore3(&mapP, S + T::PR + 16384, 64, j0, i);
+        bulkCommit();
+        bulkWaitRead<0>();
+        barArrive(bufFree + b);
+      }
+    }
+    if (T0) bulkWait<0>();
+  }
+  fenceBefore();
+  __syncthreads();
+  if (warp == 1) {
+    fenceAfter();
+    asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, 256;" :: "r"(tm));
+  }
+#endif
+}
+// triangleOutRun's VEC form at C 128 (a bf16 product and pair, the whole plane): true where it ran
+inline bool triOutTcRun(bool pair16, const __nv_bfloat16* prod, const float* cnScale, const float* cnOffset, const half* Wout, const half* t2,
+                        float* pair, int L, int Lp, const float* ob) {
+  if (!PAIR_TC || !ready() || !pair16) return false;
+  const half* WoT = kMajor(Wout, C, C);
+  const uint64_t NL = (uint64_t)L, NP = (uint64_t)Lp;
+  const CUtensorMap mprod = map3(CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, prod, { NP, NP, (uint64_t)C }, { NP * 2, NP * NP * 2 }, { 128, 1, 128 }, CU_TENSOR_MAP_SWIZZLE_NONE);
+  const CUtensorMap mt2 = map3(CU_TENSOR_MAP_DATA_TYPE_FLOAT16, t2, { (uint64_t)C, NP, NP }, { (uint64_t)C * 2, NP * C * 2 }, { 64, TM, 1 }, CU_TENSOR_MAP_SWIZZLE_128B);
+  const CUtensorMap mp = map3(CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, pair, { (uint64_t)C, NL, NL }, { (uint64_t)C * 2, NL * C * 2 }, { 64, TM, 1 }, CU_TENSOR_MAP_SWIZZLE_128B);
+  static LF_TLS int sms = 0;
+  if (!sms) { int dev; CK(cudaGetDevice(&dev)); CK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev)); }
+  const unsigned grid = (unsigned)std::min<size_t>((size_t)L * ((L + TM - 1) / TM), sms);
+  static LF_TLS bool attr = false;
+  if (!attr) { CK(cudaFuncSetAttribute(triOutTc, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)tout::Lay::BYTES)); attr = true; }
+  triOutTc<<<grid, 320, tout::Lay::BYTES, STREAM>>>(mprod, mt2, mp, cnScale, cnOffset, WoT, ob, L, Lp);
+  CK(cudaGetLastError());
+  return true;
+}
 }  // namespace ptc

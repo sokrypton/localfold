@@ -4,6 +4,7 @@
 //   ./test-pair-tc5 [n=512] [reps=20]
 #include "src/common.cuh"
 #include "src/fusedtransition.cuh"
+#include "src/fused256.cuh"
 
 // triInTc against a host reference: a, b (e4m3 planes) and t2 on sampled rows, both directions, a mask with zeros
 static int mainTri(int argc, char** argv) {
@@ -145,7 +146,103 @@ static int mainTrans(int argc, char** argv) {
   printf("trans rows %zu: fusedTransitionK %.3f ms, transTc %.3f ms (%.2fx)%s\n", rows, t1[reps / 2], t2[reps / 2], t1[reps / 2] / t2[reps / 2], bad ? "  FAILED" : "");
   return bad;
 }
+// gridOutTc against gridOutK and a host reference on sampled rows, both directions, a bias
+static int mainOut(int argc, char** argv) {
+  const int n = argc > 2 ? atoi(argv[2]) : 300, reps = argc > 3 ? atoi(argv[3]) : 10, C = 128;
+  const size_t pairs = (size_t)n * n;
+  CK(cudaStreamCreate(&STREAM)); PAIR16 = true;
+  uint64_t s = 13;
+  auto rnd = [&] { s = s * 6364136223846793005ull + 1442695040888963407ull; return (s >> 40) / 16777216.f - 0.5f; };
+  std::vector<__nv_bfloat16> hp(pairs * C); for (auto& v : hp) v = __float2bfloat16(3.f * rnd());
+  std::vector<half> hg(pairs * C), hw((size_t)C * C); for (auto& v : hg) v = __float2half(rnd()); for (auto& v : hw) v = __float2half(0.15f * rnd());
+  std::vector<float> hob(C); for (auto& v : hob) v = 0.3f * rnd();
+  __nv_bfloat16 *p1, *p2; half *g, *w; float* ob;
+  CK(cudaMalloc(&p1, pairs * C * 2)); CK(cudaMalloc(&p2, pairs * C * 2)); CK(cudaMalloc(&g, pairs * C * 2)); CK(cudaMalloc(&w, C * C * 2)); CK(cudaMalloc(&ob, C * 4));
+  CK(cudaMemcpy(g, hg.data(), pairs * C * 2, cudaMemcpyHostToDevice)); CK(cudaMemcpy(w, hw.data(), C * C * 2, cudaMemcpyHostToDevice)); CK(cudaMemcpy(ob, hob.data(), C * 4, cudaMemcpyHostToDevice));
+  int bad = 0;
+  for (int tr = 0; tr < 2; ++tr) {
+    CK(cudaMemcpy(p1, hp.data(), pairs * C * 2, cudaMemcpyHostToDevice)); CK(cudaMemcpy(p2, hp.data(), pairs * C * 2, cudaMemcpyHostToDevice));
+    CK(cudaDeviceSynchronize());
+    ptc::PAIR_TC = false; gridOutRaw<128>(g, w, ob, (float*)p1, n, 0, pairs, tr);
+    ptc::PAIR_TC = true; if (!ptc::gridOutTcRun(true, g, w, ob, (float*)p2, n, 0, pairs, tr)) { fprintf(stderr, "not taken\n"); return 1; }
+    CK(cudaDeviceSynchronize());
+    std::vector<__nv_bfloat16> y1(pairs * C), y2(pairs * C);
+    CK(cudaMemcpy(y1.data(), p1, y1.size() * 2, cudaMemcpyDeviceToHost)); CK(cudaMemcpy(y2.data(), p2, y2.size() * 2, cudaMemcpyDeviceToHost));
+    double n1 = 0, n2 = 0, den = 0, d12 = 0;
+    for (int t = 0; t < 128; ++t) {
+      const size_t q = (size_t)t * 7919 % pairs, pe = tr ? (q % n) * n + q / n : q;
+      for (int o = 0; o < C; ++o) {
+        double u = hob[o]; for (int c = 0; c < C; ++c) u += (double)__half2float(hg[q * C + c]) * __half2float(hw[(size_t)c * C + o]);
+        const double want = __bfloat162float(hp[pe * C + o]) + u, a = __bfloat162float(y1[pe * C + o]), b = __bfloat162float(y2[pe * C + o]);
+        n1 += (a - want) * (a - want); n2 += (b - want) * (b - want); den += u * u; d12 += (a - b) * (a - b);
+      }
+    }
+    printf("out n %d tr %d: relRMS of the update from a host reference: gridOutK %.3e, gridOutTc %.3e (between them %.3e)\n", n, tr, sqrt(n1 / den), sqrt(n2 / den), sqrt(d12 / den));
+    bad += !(sqrt(n2 / den) < 1.25 * sqrt(n1 / den) + 1e-3);
+  }
+  cudaEvent_t e0, e1; CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
+  std::vector<float> t1, t2;
+  for (int r = 0; r < reps; ++r)
+    for (int arm = 0; arm < 2; ++arm) {
+      ptc::PAIR_TC = arm;
+      CK(cudaEventRecord(e0, STREAM)); gridOutRaw<128>(g, w, ob, (float*)(arm ? p2 : p1), n, 0, pairs, true);
+      CK(cudaEventRecord(e1, STREAM)); CK(cudaEventSynchronize(e1)); float ms; CK(cudaEventElapsedTime(&ms, e0, e1)); (arm ? t2 : t1).push_back(ms);
+    }
+  std::sort(t1.begin(), t1.end()); std::sort(t2.begin(), t2.end());
+  printf("out n %d: gridOutK %.3f ms, gridOutTc %.3f ms (%.2fx)%s\n", n, t1[reps / 2], t2[reps / 2], t1[reps / 2] / t2[reps / 2], bad ? "  FAILED" : "");
+  return bad;
+}
+// triOutTc against triangleOutRun's mma.sync kernel and a host reference on sampled pairs
+static int mainTout(int argc, char** argv) {
+  const int L = argc > 2 ? atoi(argv[2]) : 300, reps = argc > 3 ? atoi(argv[3]) : 10, C = 128, Lp = (L + 15) / 16 * 16;
+  const size_t P = (size_t)L * L, plane = (size_t)Lp * Lp;
+  CK(cudaStreamCreate(&STREAM)); PAIR16 = true;
+  uint64_t s = 17;
+  auto rnd = [&] { s = s * 6364136223846793005ull + 1442695040888963407ull; return (s >> 40) / 16777216.f - 0.5f; };
+  std::vector<__nv_bfloat16> hpr(plane * C), hp(P * C); for (auto& v : hpr) v = __float2bfloat16(2.f * rnd() + 0.2f); for (auto& v : hp) v = __float2bfloat16(3.f * rnd());
+  std::vector<half> ht(plane * C), hw((size_t)C * C); for (auto& v : ht) v = __float2half(2.f * rnd()); for (auto& v : hw) v = __float2half(0.15f * rnd());
+  std::vector<float> hs(C), ho(C); for (auto& v : hs) v = 1.f + 0.3f * rnd(); for (auto& v : ho) v = 0.2f * rnd();
+  __nv_bfloat16 *prod, *p1, *p2; half *t2, *w; float *sc, *of;
+  CK(cudaMalloc(&prod, plane * C * 2)); CK(cudaMalloc(&p1, P * C * 2)); CK(cudaMalloc(&p2, P * C * 2)); CK(cudaMalloc(&t2, plane * C * 2)); CK(cudaMalloc(&w, C * C * 2));
+  CK(cudaMalloc(&sc, C * 4)); CK(cudaMalloc(&of, C * 4));
+  CK(cudaMemcpy(prod, hpr.data(), plane * C * 2, cudaMemcpyHostToDevice)); CK(cudaMemcpy(t2, ht.data(), plane * C * 2, cudaMemcpyHostToDevice));
+  CK(cudaMemcpy(w, hw.data(), C * C * 2, cudaMemcpyHostToDevice)); CK(cudaMemcpy(sc, hs.data(), C * 4, cudaMemcpyHostToDevice)); CK(cudaMemcpy(of, ho.data(), C * 4, cudaMemcpyHostToDevice));
+  CK(cudaMemcpy(p1, hp.data(), P * C * 2, cudaMemcpyHostToDevice)); CK(cudaMemcpy(p2, hp.data(), P * C * 2, cudaMemcpyHostToDevice));
+  CK(cudaDeviceSynchronize());
+  ptc::PAIR_TC = false; triangleOutRun<128, 4, __nv_bfloat16>(prod, sc, of, w, t2, (float*)p1, L, Lp);
+  ptc::PAIR_TC = true; triangleOutRun<128, 4, __nv_bfloat16>(prod, sc, of, w, t2, (float*)p2, L, Lp);
+  CK(cudaDeviceSynchronize());
+  std::vector<__nv_bfloat16> y1(P * C), y2(P * C); CK(cudaMemcpy(y1.data(), p1, y1.size() * 2, cudaMemcpyDeviceToHost)); CK(cudaMemcpy(y2.data(), p2, y2.size() * 2, cudaMemcpyDeviceToHost));
+  double n1 = 0, n2 = 0, den = 0;
+  for (int t = 0; t < 128; ++t) {
+    const size_t pr = (size_t)t * 7919 % P, i = pr / L, j = pr % L, q = i * Lp + j;
+    double m = 0, v = 0; for (int c = 0; c < C; ++c) m += __bfloat162float(hpr[(size_t)c * plane + q]); m /= C;
+    for (int c = 0; c < C; ++c) { double d = __bfloat162float(hpr[(size_t)c * plane + q]) - m; v += d * d; } v = 1 / sqrt(v / C + 1e-5);
+    std::vector<double> x(C); for (int c = 0; c < C; ++c) x[c] = __half2float(__float2half((float)((__bfloat162float(hpr[(size_t)c * plane + q]) - m) * v * hs[c] + ho[c])));
+    for (int o = 0; o < C; ++o) {
+      double u = 0; for (int c = 0; c < C; ++c) u += x[c] * __half2float(hw[(size_t)c * C + o]);
+      u /= 1 + exp(-(double)__half2float(ht[q * C + o]));
+      const double want = __bfloat162float(hp[pr * C + o]) + u, a = __bfloat162float(y1[pr * C + o]), b = __bfloat162float(y2[pr * C + o]);
+      n1 += (a - want) * (a - want); n2 += (b - want) * (b - want); den += u * u;
+    }
+  }
+  printf("tout L %d: relRMS of the update from a host reference: triangleOutK %.3e, triOutTc %.3e\n", L, sqrt(n1 / den), sqrt(n2 / den));
+  const int bad = !(sqrt(n2 / den) < 1.25 * sqrt(n1 / den) + 1e-3);
+  cudaEvent_t e0, e1; CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
+  std::vector<float> t1, tt2;
+  for (int r = 0; r < reps; ++r)
+    for (int arm = 0; arm < 2; ++arm) {
+      ptc::PAIR_TC = arm;
+      CK(cudaEventRecord(e0, STREAM)); triangleOutRun<128, 4, __nv_bfloat16>(prod, sc, of, w, t2, (float*)(arm ? p2 : p1), L, Lp);
+      CK(cudaEventRecord(e1, STREAM)); CK(cudaEventSynchronize(e1)); float ms; CK(cudaEventElapsedTime(&ms, e0, e1)); (arm ? tt2 : t1).push_back(ms);
+    }
+  std::sort(t1.begin(), t1.end()); std::sort(tt2.begin(), tt2.end());
+  printf("tout L %d: triangleOutK %.3f ms, triOutTc %.3f ms (%.2fx)%s\n", L, t1[reps / 2], tt2[reps / 2], t1[reps / 2] / tt2[reps / 2], bad ? "  FAILED" : "");
+  return bad;
+}
 int main(int argc, char** argv) {
+  if (argc > 1 && !strcmp(argv[1], "tout")) return mainTout(argc, argv);
+  if (argc > 1 && !strcmp(argv[1], "out")) return mainOut(argc, argv);
   if (argc > 1 && !strcmp(argv[1], "trans")) return mainTrans(argc, argv);
   if (argc > 1 && !strcmp(argv[1], "tri")) return mainTri(argc, argv);
   const int n = argc > 1 ? atoi(argv[1]) : 512, reps = argc > 2 ? atoi(argv[2]) : 20, C = 128, NQ = 512, heads = 4, stride = (n + 7) / 8 * 8;

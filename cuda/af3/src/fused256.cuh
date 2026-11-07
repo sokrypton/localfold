@@ -761,6 +761,8 @@ inline const half* triangleOutTiles(const half* Wout, int C, int NC) {
 template <int C, int WARPS, class TP = float>
 void triangleOutRun(const TP* prod, const float* sc, const float* of, const half* Wout, const half* t2, float* pair,
                     int L, int Lp, const float* ob = nullptr, RectMap rm = {}, const half* wtIn = nullptr) {
+  if constexpr (C == 128 && std::is_same_v<TP, __nv_bfloat16>)     // (a B200: pair_tc5.cuh)
+    if (!rm.J && !wtIn && ptc::triOutTcRun(PAIR16, prod, sc, of, Wout, t2, pair, L, Lp, ob)) return;
   static const bool f32 = getenv("LOCALFOLD_TRIOUT_F32") != nullptr;
   if (rm.J && (sizeof(TP) != 2 || f32)) { fprintf(stderr, "triangleOutRun: a rectangle wants the bf16 product and tile\n"); exit(1); }
   constexpr int R = 16 * WARPS;
