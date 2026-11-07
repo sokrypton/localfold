@@ -399,13 +399,17 @@ struct DiffRun {
   bool keep = false;
   std::vector<DiffBlockSave> saves;
   size_t keptBytes = 0;
+  // timed: two events recorded around a forward's blocks - what a backward without keep replays (train-of3's
+  // --sample-batch=auto prices keeping against it)
+  cudaEvent_t* timed = nullptr;
 };
 inline void freeRun(DiffRun& r) {
   for (real* p : r.acts) GK(cudaFreeAsync(p, STREAM));
   for (real* p : {r.pn, r.pl, r.dx, r.tmp, r.dpl}) if (p) GK(cudaFreeAsync(p, STREAM));
-  const bool keep = r.keep;   // (the caller's choice outlives a reallocation)
+  const bool keep = r.keep;   // (the caller's choices outlive a reallocation)
+  cudaEvent_t* timed = r.timed;
   r = DiffRun{};
-  r.keep = keep;
+  r.keep = keep; r.timed = timed;
 }
 // (and the pool's bytes back to the driver: the pool keeps what it is given, and the trunk's backward wants the room)
 inline void releaseRun(DiffRun& r) {
@@ -449,11 +453,13 @@ inline void transformerForward(DiffTransformer& t, DiffRun& r, const real* act, 
   GK(cudaMemcpyAsync(r.acts[0], act, rows * t.C * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
   ARENA.rewind(m0);
   const size_t used0 = ARENA.used;
+  if (r.timed) GK(cudaEventRecord(r.timed[0], STREAM));
   for (int b = 0; b < nb; ++b) {
     if (!r.keep) ARENA.rewind(m0);
     DiffBlockSave sv = diffBlockForward(t, t.blocks[b], r.acts[b], cond, mask, r.pl + (size_t)b * t.H * nn, r.acts[b + 1], n, S);
     if (r.keep) r.saves.push_back(sv);
   }
+  if (r.timed) GK(cudaEventRecord(r.timed[1], STREAM));
   if (r.keep) r.keptBytes = ARENA.used - used0;
   else ARENA.rewind(m0);
   GK(cudaMemcpyAsync(out, r.acts[nb], rows * t.C * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));

@@ -663,6 +663,11 @@ static of3::Layout layoutOf(const Example& e, bool bonds = true) {
 int main(int argc, char** argv) {
   std::string bundle = "model-openbind0-f32", family = "openbind0", examplesPath, savePath, resumePath;
   int diffSaves = 0;     // --diffusion-saves=auto|keep|recompute (0, 1, 2): the diffusion transformer's block saves kept for its backward
+  // --sample-batch=auto's measurements carried from step to step, at `atoms` atoms (0: none yet): a diffusion chunk's
+  // arena bytes as shared + per a sample, and the transformer's saves a sample on top where kept; what replaying the
+  // transformer costs a sample and what a chunk costs besides its samples, in ms (< 0: not measured yet); the events
+  // that time them
+  struct { size_t atoms = 0; double shared = 0, per = 0, keptPer = 0, replayMs = -1, chunkMs = -1; std::vector<cudaEvent_t> ev; } sbSeen;
   int sampleBatch = 8;   // the diffusion samples a denoiser pass (--sample-batch; 0, --sample-batch=auto: as many as the room holds)
   int maxRecycles = 3;   // OpenFold3's num_recycles: a step runs 1 + U{0..max} cycles (--max-recycles)
   int checkBatch = -1;
@@ -1464,22 +1469,59 @@ int main(int argc, char** argv) {
     memPhase("smooth LDDT set up");
     // the samples in chunks of --sample-batch: one batched denoiser pass a chunk (af3denoise.cuh's denoiseBatchForward:
     // one pair conditioning, the transformer over the chunk's samples at once), each sample's draws as they were
-    // (auto: the first chunk 4 samples, measured - its arena peak a sample, the shared part included, so an over-
-    // estimate - and each chunk after as many as the device's free memory and the arena's mapped slack hold, less a
-    // reserve; what the larger chunks mapped given back after the last, so the room is the diffusion's alone)
+    // (auto: the first step's first chunk 4 samples, measured - its arena peak a sample, the shared part included, so
+    // an over-estimate - and the chunks after as many as the device's free memory and the arena's mapped slack hold,
+    // less a reserve, made even; the steps after planned whole from the last step's measurement)
     const bool autoSB = sampleBatch == 0;
     const int SB = autoSB ? 0 : std::max(1, sampleBatch);
     int nextS = autoSB ? 4 : SB, widest = 0;
     // the transformer's block saves kept from each batch's forward for its backward (no replay of the 24 blocks: ~200
-    // ms of a 512-token step on the A100) where that costs no extra batch: --sample-batch=auto measures its first
-    // chunk with them kept and keeps them on if the rest needs no more chunks for it; keep forces them (a fixed
-    // --sample-batch replays unless told to keep)
+    // ms of a 512-token step on the A100) where that costs few extra chunks (keepWins): --sample-batch=auto measures
+    // its first chunk with them kept and decides; keep forces them (a fixed --sample-batch replays unless told to keep)
     bool keepDiff = SB != 1 && (diffSaves == 1 || (diffSaves == 0 && autoSB));
-    const size_t mapped0 = g::ARENA.mapped;
+    // the room a chunk has (the device's free memory and the arena's mapped slack, less a reserve), and the samples of
+    // `per` bytes each it holds
+    auto room = [&](size_t at0) {
+      size_t freeB, total; GK(cudaMemGetInfo(&freeB, &total));
+      const size_t slack = g::ARENA.mapped > at0 ? g::ARENA.mapped - at0 : 0, reserve = std::max<size_t>((size_t)1 << 30, total / 20);
+      return freeB + slack > reserve ? freeB + slack - reserve : 0;
+    };
+    auto fitIn = [&](size_t rm, size_t per, int most) { return (int)std::max<size_t>(1, std::min<size_t>(rm / std::max<size_t>(per, 1), (size_t)most)); };
+    // the chunks equal (as few as `fit` samples a chunk allows, then as even as they divide): a chunk's fixed cost and
+    // its narrower GEMMs made a 4 + 44 split slower than 24 + 24 at 512 tokens on the GH200
+    auto even = [](int rest, int fit) { const int c = (rest + fit - 1) / fit; return (rest + c - 1) / c; };
+    // the saves kept where the chunks that costs are cheaper than the replay they spare - both measured on this
+    // device (on the GH200 at 512 tokens a replay was ~88 ms of a step and a chunk ~25-30: 48 samples in 1 chunk
+    // replayed took 757 ms, in 2 kept 698); before both are measured, kept only where that costs no extra chunk
+    auto keepWins = [&](int rest, int nK, int nN) {
+      if (!nK) return false;
+      const int cK = (rest + nK - 1) / nK, cN = (rest + nN - 1) / nN;
+      if (sbSeen.replayMs < 0 || sbSeen.chunkMs < 0) return cK <= cN;
+      return (cK - cN) * sbSeen.chunkMs <= rest * sbSeen.replayMs;
+    };
+    // (auto: each chunk timed - events 2 + 2 i, 3 + 2 i - and the transformer's blocks in each forward, events 0, 1)
+    struct Timed { int S; bool kept; double bytes; };   // (bytes: the chunk's arena peak less its kept saves)
+    std::vector<Timed> timed;
+    if (autoSB && sbSeen.ev.size() < 2 + 2 * (size_t)nSamples)
+      while (sbSeen.ev.size() < 2 + 2 * (size_t)nSamples) { cudaEvent_t e; GK(cudaEventCreate(&e)); sbSeen.ev.push_back(e); }
+    // (auto, after a first step: no measuring chunk - the last step's bytes a sample, scaled to this one's atoms,
+    // plan every chunk, and whether the saves are kept, before the first)
+    bool planned = false;
+    if (autoSB && sbSeen.atoms) {
+      const double sc = (double)A / sbSeen.atoms;
+      const size_t rm = room(g::ARENA.at);
+      const size_t free = rm > sbSeen.shared * sc ? rm - (size_t)(sbSeen.shared * sc) : 0;
+      const int nN = fitIn(free, (size_t)(sbSeen.per * sc), nSamples);
+      const int nK = sbSeen.keptPer > 0 ? fitIn(free, (size_t)((sbSeen.per + sbSeen.keptPer) * sc), nSamples) : 0;
+      if (diffSaves == 0) keepDiff = keepWins(nSamples, nK, nN);
+      nextS = even(nSamples, keepDiff && nK ? nK : nN);
+      planned = true;
+    }
     for (int s0 = 0, S = 0; s0 < nSamples; s0 += S) {
       g::Scratch sc;
       S = std::min(nextS, nSamples - s0); widest = std::max(widest, S);
       const size_t used0 = g::ARENA.used, high0 = g::ARENA.high, at0 = g::ARENA.at;
+      if (autoSB) { GK(cudaEventRecord(sbSeen.ev[2 + 2 * timed.size()], STREAM)); dn.run.timed = sbSeen.ev.data(); }
       g::ARENA.high = used0;
       std::optional<g::Range> rD_; rD_.emplace("diff.noise");
       std::vector<double> sig(S);
@@ -1521,6 +1563,10 @@ int main(int argc, char** argv) {
       g::real* hOut = pinned[11].get((size_t)S * A * 3);
       for (int k = 0; k < S; ++k) GK(cudaMemcpyAsync(hOut + (size_t)k * A * 3, xout[k], A * 3 * sizeof(g::real), cudaMemcpyDeviceToHost, STREAM));
       GK(cudaStreamSynchronize(STREAM));
+      if (autoSB && SB != 1) {   // (the blocks' time a sample: what the backward replays where the saves are not kept)
+        float ms; GK(cudaEventElapsedTime(&ms, sbSeen.ev[0], sbSeen.ev[1]));
+        sbSeen.replayMs = ms / S;
+      }
       g::real* hDx = pinned[12].get((size_t)S * A * 3);
       for (int k = 0; k < S; ++k) {
         const g::real* xh = hOut + (size_t)k * A * 3;
@@ -1549,21 +1595,53 @@ int main(int argc, char** argv) {
       }
       if (s0 == 0) memPhase("diffusion chunk");
       if (autoSB) {
+        GK(cudaEventRecord(sbSeen.ev[3 + 2 * timed.size()], STREAM));
+        timed.push_back({S, keepDiff, (double)(g::ARENA.high - used0) - (keepDiff ? (double)dn.run.keptBytes : 0.0)});
+        if (keepDiff) sbSeen.keptPer = (double)dn.run.keptBytes / S;
+      }
+      if (autoSB) {
         const size_t perSample = (g::ARENA.high - used0 + S - 1) / S;
-        size_t freeB, total; GK(cudaMemGetInfo(&freeB, &total));
-        const size_t slack = g::ARENA.mapped > at0 ? g::ARENA.mapped - at0 : 0, reserve = std::max<size_t>((size_t)1 << 30, total / 20);
-        const size_t room = freeB + slack > reserve ? freeB + slack - reserve : 0;
-        auto fit = [&](size_t per) { return (int)std::max<size_t>(1, std::min<size_t>(room / std::max<size_t>(per, 1), (size_t)nSamples)); };
-        nextS = fit(perSample);
-        if (s0 == 0 && keepDiff && diffSaves == 0) {   // (kept, measured: off unless the rest fits in as few chunks)
-          const size_t perNo = perSample > dn.run.keptBytes / S ? perSample - dn.run.keptBytes / S : 1;
-          const int rest = nSamples - S, nK = nextS, nN = fit(perNo);
-          if ((rest + nK - 1) / nK > (rest + nN - 1) / nN) { keepDiff = false; nextS = nN; }
+        const size_t perNo = keepDiff ? (perSample > dn.run.keptBytes / S ? perSample - dn.run.keptBytes / S : 1) : perSample;
+        const int rest = nSamples - s0 - S;
+        if (rest > 0 && !planned) {
+          const size_t rm = room(at0);
+          int nK = fitIn(rm, perSample, rest);
+          if (s0 == 0 && keepDiff && diffSaves == 0) {   // (kept, measured: off where that costs too many chunks)
+            const int nN = fitIn(rm, perNo, rest);
+            if (!keepWins(rest, nK, nN)) { keepDiff = false; nK = nN; }
+          }
+          nextS = even(rest, nK);
         }
       }
       g::ARENA.high = std::max(high0, g::ARENA.high);
     }
-    if (autoSB) g::ARENA.trim(mapped0);
+    // a chunk's own cost and its shared bytes, from the narrowest and the widest chunks (their times less the replays
+    // in them, their bytes less the kept saves) - where they differ; else the shared bytes as last measured
+    if (autoSB) {
+      GK(cudaStreamSynchronize(STREAM));
+      dn.run.timed = nullptr;
+      int lo = 0, hi = 0;
+      for (int i = 0; i < (int)timed.size(); ++i) { if (timed[i].S < timed[lo].S) lo = i; if (timed[i].S > timed[hi].S) hi = i; }
+      const double sc = sbSeen.atoms ? (double)A / sbSeen.atoms : 1.0;
+      sbSeen.shared *= sc; sbSeen.atoms = A;   // (the last step's shared bytes, at this step's atoms)
+      if (timed[hi].S > timed[lo].S) {
+        const double per = (timed[hi].bytes - timed[lo].bytes) / (timed[hi].S - timed[lo].S), sh = timed[lo].bytes - timed[lo].S * per;
+        if (per > 0 && sh >= 0) { sbSeen.per = per; sbSeen.shared = sh; }
+        else { sbSeen.per = timed[hi].bytes / timed[hi].S; sbSeen.shared = 0; }
+      } else {
+        sbSeen.per = std::max(1.0, (timed[hi].bytes - sbSeen.shared) / timed[hi].S);
+      }
+      if (timed[hi].S > timed[lo].S && sbSeen.replayMs >= 0) {
+        auto own = [&](int i) {
+          float ms; GK(cudaEventElapsedTime(&ms, sbSeen.ev[2 + 2 * i], sbSeen.ev[3 + 2 * i]));
+          return ms - (timed[i].kept ? 0.0 : timed[i].S * sbSeen.replayMs);
+        };
+        const double tl = own(lo), th = own(hi), per = (th - tl) / (timed[hi].S - timed[lo].S);
+        sbSeen.chunkMs = std::max(0.0, tl - timed[lo].S * per);
+      }
+    }
+    // (what the larger chunks mapped stays mapped - every later phase's arena draws on it first: given back and
+    // mapped again the next step it was ~60 ms of a 512-token step on the GH200, the peak the same either way)
     g::af3::releaseRun(dn.run);   // (the transformer's buffers, its widest batch's: given back before the trunk's backward)
     widestBatch = widest; diffKept = keepDiff;
     distogramReady();

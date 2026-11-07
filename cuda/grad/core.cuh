@@ -145,8 +145,6 @@ struct Arena {
   char* base = nullptr;
   size_t reserved = 0, mapped = 0, step = 0;
   CUmemAllocationProp prop{};
-  struct Region { size_t at, bytes; CUmemGenericAllocationHandle h; };
-  std::vector<Region> regions;                       // (what mapTo mapped, in order: trim() gives the tail back)
   void growable() {
     if (base || !chunks.empty()) { fprintf(stderr, "Arena::growable: the arena is already in use\n"); exit(1); }
     int dev; GK(cudaGetDevice(&dev));
@@ -167,21 +165,7 @@ struct Arena {
     GV(vmCalls().map((CUdeviceptr)(base + mapped), bytes, 0, h, 0));
     CUmemAccessDesc acc{}; acc.location = prop.location; acc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
     GV(vmCalls().access((CUdeviceptr)(base + mapped), bytes, &acc, 1));
-    regions.push_back({mapped, bytes, h});
     mapped = want;
-  }
-  // a growable arena's mapping above max(keep, what is in use) given back to the device: a phase that took more than
-  // the rest of a step (the diffusion samples a batch sized to the room) holds it no longer than it runs
-  void trim(size_t keep) {
-    if (!base) return;
-    GK(cudaStreamSynchronize(STREAM));
-    const size_t floor = std::max(keep, at);
-    while (!regions.empty() && regions.back().at >= floor) {
-      const Region r = regions.back(); regions.pop_back();
-      GV(vmCalls().unmap((CUdeviceptr)(base + r.at), r.bytes));
-      GV(vmCalls().release(r.h));
-      mapped = r.at;
-    }
   }
   real* get(size_t n) {
     size_t bytes = (n * sizeof(real) + 255) & ~(size_t)255;

@@ -21,7 +21,7 @@ int main(int argc, char** argv) {
     float* m; GK(cudaMalloc(&m, (size_t)c.B * c.Q * 4)); std::vector<float> ones((size_t)c.B * c.Q, 1.f);
     GK(cudaMemcpy(m, ones.data(), ones.size() * 4, cudaMemcpyHostToDevice));
     size_t nb = (size_t)c.H * c.Q * c.Q; float *b = randn(nb), *db = randn(nb);
-    Sdpa a; a.B = c.B; a.H = c.H; a.Q = a.K = c.Q; a.D = c.D; a.scale = 1.f / sqrtf((float)c.D); a.keyMask = m; a.clip = strncmp(c.name, "diff", 4) != 0;
+    Sdpa a; a.B = c.B; a.H = c.H; a.Q = a.K = c.Q; a.D = c.D; a.scale = 1.f / sqrtf((float)c.D); a.keyMask = m; a.clip = strncmp(c.name, "diff", 4) && strncmp(c.name, "grid", 4);
     if (c.bias) a.bias[0] = Bias{b, 0, (long long)c.Q * c.Q, c.Q, noDb ? nullptr : db};
     cudaEvent_t e[3]; for (auto& x : e) cudaEventCreate(&x);
     for (int f = 0; f < 2; ++f) {

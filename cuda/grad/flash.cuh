@@ -881,9 +881,64 @@ __global__ void fromFixedK(float* g, const unsigned long long* f, size_t n) {
   const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n && f[i]) g[i] += (float)((double)(long long)f[i] / FIXED);
 }
-template <int D, class DKV = float, int QT = 64, bool GEN = true>   // (DKV: dK and dV written in bf16 for a module
-                                                  // that consumes them so; QT: the query tile, 32 or 64 rows; GEN false:
-                                                  // no chain ids and no fixed-point bias sums, compiled out - 5% of it)
+// a thread-block cluster's rank, its barrier (split: arrive, then wait) and a 16-byte store into another CTA's shared
+// memory (sm_90 and later; bwdBf's CR > 1)
+__device__ __forceinline__ unsigned clusterRank() {
+  unsigned r = 0;
+#if __CUDA_ARCH__ >= 900
+  asm volatile("mov.u32 %0, %%cluster_ctarank;" : "=r"(r));
+#endif
+  return r;
+}
+__device__ __forceinline__ void clusterArrive(bool release = true) {
+#if __CUDA_ARCH__ >= 900
+  if (release) asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
+  else asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
+#else
+  __trap();
+#endif
+}
+__device__ __forceinline__ void clusterWait() {
+#if __CUDA_ARCH__ >= 900
+  asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+#endif
+}
+// st.async: the store completes on the receiving CTA's mbarrier as transaction bytes - no fence on the sender
+// (a release barrier waits out every atomic the warp has in flight: 14% of bwdBf's stalls when it carried the data)
+__device__ __forceinline__ void stAsync4(const void* local, const void* mbar, unsigned rank, float x, float y, float z,
+                                         float w) {
+#if __CUDA_ARCH__ >= 900
+  unsigned r, m;
+  asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(r) : "r"((unsigned)__cvta_generic_to_shared(local)), "r"(rank));
+  asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(m) : "r"((unsigned)__cvta_generic_to_shared(mbar)), "r"(rank));
+  asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.v4.f32 [%0], {%1, %2, %3, %4}, [%5];"
+               ::"r"(r), "f"(x), "f"(y), "f"(z), "f"(w), "r"(m) : "memory");
+#endif
+}
+__device__ __forceinline__ void mbarInit(void* mbar, unsigned count) {
+#if __CUDA_ARCH__ >= 900
+  asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"((unsigned)__cvta_generic_to_shared(mbar)), "r"(count) : "memory");
+  asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+#endif
+}
+__device__ __forceinline__ void mbarExpect(void* mbar, unsigned bytes) {
+#if __CUDA_ARCH__ >= 900
+  asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"((unsigned)__cvta_generic_to_shared(mbar)), "r"(bytes) : "memory");
+#endif
+}
+__device__ __forceinline__ void mbarWait(void* mbar, unsigned parity) {
+#if __CUDA_ARCH__ >= 900
+  asm volatile("{\n .reg .pred p;\n MBW%=:\n mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n @!p bra MBW%=;\n}"
+               ::"r"((unsigned)__cvta_generic_to_shared(mbar)), "r"(parity) : "memory");
+#endif
+}
+template <int D, class DKV = float, int QT = 64, bool GEN = true, int CR = 1>   // (DKV: dK and dV written in bf16 for a
+                                                  // module that consumes them so; QT: the query tile, 32 or 64 rows; GEN
+                                                  // false: no chain ids and no fixed-point bias sums, compiled out - 5%
+                                                  // of it; CR > 1: a cluster of CR CTAs, CR consecutive rows at one head
+                                                  // and key block, sums the bias gradients over its rows through shared
+                                                  // memory before the atomics - every bias with a gradient the same for
+                                                  // every row, sb 0)
 __global__ void __launch_bounds__(THREADS, 3) bwdBf(Sdpa a, BiasTile bt, HSrc qs_, HSrc ks_, HSrc vs_, HSrc os_,
                                                     const float* __restrict__ lse, const float* __restrict__ Di,
                                                     float* __restrict__ dq, int lddq, DKV* __restrict__ dk, int lddk,
@@ -901,8 +956,12 @@ __global__ void __launch_bounds__(THREADS, 3) bwdBf(Sdpa a, BiasTile bt, HSrc qs
   uint16_t* Tb = Ob + 2 * QT * LK;                                // [2][QT][LB]: the bias tile
   uint16_t* Sb = Tb + 2 * QT * LB;                                // dS^T [BC][QT], 16-byte chunks XOR-swizzled by row
   float* QV = reinterpret_cast<float*>(Sb + BC * QT);             // [2][QT][4]: row max, log sum, Di, seqQ
+  float4* Red = reinterpret_cast<float4*>(QV + 2 * 4 * QT);       // CR > 1: [CR][4 / CR][THREADS], what the cluster's
+                                                                  // other CTAs send this one of the bias gradients
+  unsigned long long* mbar = reinterpret_cast<unsigned long long*>(Red + 4 * THREADS);   // (its arrival: their bytes)
   const int nkb = (a.K + BC - 1) / BC;
-  const int kb = blockIdx.x % nkb, h = (blockIdx.x / nkb) % a.H, b = blockIdx.x / (nkb * a.H);
+  const int bx = blockIdx.x / CR;   // (CR > 1: the cluster's ranks the fastest index - its rows)
+  const int kb = bx % nkb, h = (bx / nkb) % a.H, b = bx / (nkb * a.H) * CR + (int)(blockIdx.x % CR);
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
   const int k0 = kb * BC, kl0 = warp * 16;
   const size_t bh = (size_t)b * a.H + h;
@@ -966,6 +1025,16 @@ __global__ void __launch_bounds__(THREADS, 3) bwdBf(Sdpa a, BiasTile bt, HSrc qs
   unsigned long long* f0 = fx0 && g0 ? fx0 + (g0 - a.bias[0].grad) : nullptr;
   unsigned long long* f1 = fx1 && g1 ? fx1 + (g1 - a.bias[1].grad) : nullptr;
   const int nq = (a.Q + QT - 1) / QT;
+  const bool red = CR > 1 && (g0 || g1);   // (the same for the whole cluster)
+  const unsigned rk = CR > 1 ? clusterRank() : 0u;
+  // (the mbarrier initialised and every CTA of the cluster running before any shared memory is written; then the
+  // first of the relaxed arrivals that say "this CTA has read its buffer" - a sender waits for them before it writes)
+  if (red) {
+    if (threadIdx.x == 0) mbarInit(mbar, 1);
+    clusterArrive(); clusterWait();
+    clusterArrive(false);
+  }
+  int rc = 0;
   for (int it = 0; it < nq; ++it) {
     const int st = it & 1, q0 = it * QT;
     if (it + 1 < nq) issue(st ^ 1, q0 + QT);
@@ -1049,29 +1118,45 @@ __global__ void __launch_bounds__(THREADS, 3) bwdBf(Sdpa a, BiasTile bt, HSrc qs
       // the bias gradients straight from the registers, together (a warp's atomic covers four rows' 32-byte
       // sectors whole). Unconditional in a full tile: a masked element's dS is exactly 0 (a branch an element was a
       // fifth of the issue)
-      if (g0 || g1) {
-        // (offsets in 32 bits from the slab's (query 0, key k0): within one (b, h) slab, Q sq < 2^31)
-        const int qb = q0 + hq * 32 + 2 * t;
-        const bool full = qb - 2 * t + 32 <= a.Q && k0 + BC <= a.K;   // (the whole half-tile in range: no checks)
+      // (offsets in 32 bits from the slab's (query 0, key k0): within one (b, h) slab, Q sq < 2^31)
+      const int qb = q0 + hq * 32 + 2 * t;
+      const bool full = qb - 2 * t + 32 <= a.Q && k0 + BC <= a.K;   // (the whole half-tile in range: no checks)
+      // the thread's 8-query group jj (four values: queries 2t, 2t + 1 at keys g and g + 8)
+      auto addJ = [&](int jj, const float* v) {
         auto add = [&](auto* gp, int sq) {
           const int base = qb * sq + kl0 + g;
 #pragma unroll
-          for (int jj = 0; jj < 4; ++jj)
-#pragma unroll
-            for (int e = 0; e < 4; ++e) {
-              const int qo = jj * 8 + (e & 1), ko = (e >> 1) * 8;
-              const int o = base + qo * sq + ko;
-              // (predicated, not redirected: pointing every out-of-range element at one address serialised a
-              // partial key block's atomics on it - 7x the kernel at a length 522, 10 keys past a multiple of 64)
-              if (!full && !(qb + qo < a.Q && k0 + kl0 + g + ko < a.K)) continue;
-              if constexpr (sizeof(*gp) == 8)
-                atomicAdd(gp + o, (unsigned long long)__double2ll_rn((double)dpt[jj][e] * FIXED));
-              else
-                atomicAdd(gp + o, dpt[jj][e]);
-            }
+          for (int e = 0; e < 4; ++e) {
+            const int qo = jj * 8 + (e & 1), ko = (e >> 1) * 8;
+            const int o = base + qo * sq + ko;
+            // (predicated, not redirected: pointing every out-of-range element at one address serialised a
+            // partial key block's atomics on it - 7x the kernel at a length 522, 10 keys past a multiple of 64)
+            if (!full && !(qb + qo < a.Q && k0 + kl0 + g + ko < a.K)) continue;
+            if constexpr (sizeof(*gp) == 8)
+              atomicAdd(gp + o, (unsigned long long)__double2ll_rn((double)v[e] * FIXED));
+            else
+              atomicAdd(gp + o, v[e]);
+          }
         };
         if (f0) add(f0, (int)a.bias[0].sq); else if (g0) add(g0, (int)a.bias[0].sq);
         if (f1) add(f1, (int)a.bias[1].sq); else if (g1) add(g1, (int)a.bias[1].sq);
+      };
+      // CR > 1: each CTA sends the groups jj another rank owns (jj % CR) to that rank, and adds the cluster's sum of
+      // its own after the products below (the barrier's arrive here, its wait there)
+      float4* R = Red;
+      if constexpr (CR > 1) {
+        if (red) {
+          clusterWait();   // (every CTA has read the previous round's sums out of its buffer)
+          if (threadIdx.x == 0) mbarExpect(mbar, (CR - 1) * (4 / CR) * THREADS * 16);
+#pragma unroll
+          for (int jj = 0; jj < 4; ++jj)
+            if (jj % CR != (int)rk)
+              stAsync4(R + ((int)rk * (4 / CR) + jj / CR) * THREADS + threadIdx.x, mbar, jj % CR, dpt[jj][0], dpt[jj][1],
+                       dpt[jj][2], dpt[jj][3]);
+        }
+      } else if (g0 || g1) {
+#pragma unroll
+        for (int jj = 0; jj < 4; ++jj) addJ(jj, dpt[jj]);
       }
 #pragma unroll
       for (int u = 0; u < 2; ++u) {
@@ -1087,6 +1172,25 @@ __global__ void __launch_bounds__(THREADS, 3) bwdBf(Sdpa a, BiasTile bt, HSrc qs
           mma16(dka[n], da, b0, b1);
         }
       }
+      if constexpr (CR > 1) {
+        if (red) {
+          mbarWait(mbar, rc & 1);
+#pragma unroll
+          for (int jj = 0; jj < 4; ++jj) {
+            if (jj % CR != (int)rk) continue;
+            float v[4] = {dpt[jj][0], dpt[jj][1], dpt[jj][2], dpt[jj][3]};
+#pragma unroll
+            for (int src = 0; src < CR; ++src) {   // (a fixed order, the owner fixed: deterministic run to run)
+              if (src == (int)rk) continue;
+              const float4 x = R[(src * (4 / CR) + jj / CR) * THREADS + threadIdx.x];
+              v[0] += x.x; v[1] += x.y; v[2] += x.z; v[3] += x.w;
+            }
+            addJ(jj, v);
+          }
+          clusterArrive(false);
+        }
+      }
+      ++rc;
     }
     __syncthreads();
     // dQ for this warp's 16 queries over the block's 64 keys, added straight from the accumulators
@@ -1130,6 +1234,7 @@ __global__ void __launch_bounds__(THREADS, 3) bwdBf(Sdpa a, BiasTile bt, HSrc qs
     }
     __syncthreads();   // this stage is the one the next iteration's issue overwrites
   }
+  if (red) clusterWait();   // (the last arrival's pair: no CTA leaves while another may still write into it)
   // dqo: the last of a (b, h)'s key blocks to finish narrows its dQ into the bf16 copy the projections read, while
   // it is in L2 (a separate pass re-read the whole float dQ; counted per tile instead, the fences cost more)
   if (dqo) {
@@ -1165,8 +1270,10 @@ __global__ void __launch_bounds__(THREADS, 3) bwdBf(Sdpa a, BiasTile bt, HSrc qs
     }
   }
 }
-template <int D, int QT = 64>
-inline size_t bwdBfSmem() { return 2 * (BC * ldBf<D>() + 4 * QT * ldBf<D>() + 2 * QT * LB + BC * QT) + 4 * (2 * 4 * QT); }
+template <int D, int QT = 64, int CR = 1>
+inline size_t bwdBfSmem() {
+  return 2 * (BC * ldBf<D>() + 4 * QT * ldBf<D>() + 2 * QT * LB + BC * QT) + 4 * (2 * 4 * QT) + (CR > 1 ? 4 * THREADS * 16 + 16 : 0);
+}
 // an operand's source: bf16 rows read in place where they are 16-byte aligned, else a head-major bf16 copy
 template <int D, class X>
 inline HSrc hsrc(const X* x, int ld, int B, int N, int H) {
@@ -1450,16 +1557,39 @@ inline void backwardBf(const Sdpa& a, const X* q, int ldq, const X* k, int ldk, 
   const int Npq = (a.Q + 63) / 64 * 64, Npk = (a.K + 63) / 64 * 64;
   const HSrc qs_ = hsrc<D>(q, ldq, a.B, a.Q, a.H), ks_ = hsrc<D>(k, ldk, a.B, a.K, a.H), vs_ = hsrc<D>(v, ldv, a.B, a.K, a.H),
              os_ = hsrc<D>(dO, lddo, a.B, a.Q, a.H);
-  // (a 32-row query tile halves the shared memory, and lost both ways at the triangle shape: 907 us capped at 128
-  // registers for four CTAs an SM, 966 us at three, against 761 at 64 rows)
-  constexpr int QT = 64;
-  static bool attr = false;
-  const size_t smem = bwdBfSmem<D, QT>();
+  // (a 32-row query tile halves the shared memory, and lost both ways at the triangle shape on the A100: 907 us
+  // capped at 128 registers for four CTAs an SM, 966 us at three, against 761 at 64 rows. Where the 64-row tile's
+  // 54 KB leaves the SM one CTA - an RTX PRO 6000's ~100 KB - the 32-row one runs instead: narrow)
+  constexpr int QT = 64, CR = 2;
+  static bool attr = false, clusters = false, narrow = false;
+  const size_t smem = bwdBfSmem<D, QT>(), smemC = bwdBfSmem<D, QT, CR>(), smemN = bwdBfSmem<D, 32>();
   if (!attr) {
     for (auto f : {bwdBf<D, DKV, QT, true>, bwdBf<D, DKV, QT, false>}) {
       GK(cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
       GK(cudaFuncSetAttribute(f, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
     }
+    int per = 0;
+    GK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per, bwdBf<D, DKV, QT, false>, THREADS, smem));
+    narrow = per < 2;
+    if (narrow)
+      for (auto f : {bwdBf<D, DKV, 32, true>, bwdBf<D, DKV, 32, false>}) {
+        GK(cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smemN));
+        GK(cudaFuncSetAttribute(f, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+      }
+    // clusters on sm_90 alone, where the device and this binary's code for it have them: measured there (the
+    // grid512 bench's backward 2.75 -> 2.55 ms on the GH200); on an RTX PRO 6000 (sm_120) the same kernel lost, 3.47
+    // -> 4.20 ms)
+    int dev = 0, major = 0;
+    GK(cudaGetDevice(&dev));
+    GK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev));
+    cudaFuncAttributes fa;
+    GK(cudaFuncGetAttributes(&fa, bwdBf<D, DKV, QT, false, CR>));
+    clusters = major == 9 && fa.binaryVersion >= 90 && !narrow;
+    if (clusters)
+      for (auto f : {bwdBf<D, DKV, QT, true, CR>, bwdBf<D, DKV, QT, false, CR>}) {
+        GK(cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smemC));
+        GK(cudaFuncSetAttribute(f, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+      }
     attr = true;
   }
   const BiasTile bt = biasBf(a, Npq, Npk);
@@ -1484,9 +1614,27 @@ inline void backwardBf(const Sdpa& a, const X* q, int ldq, const X* k, int ldk, 
     cnt = reinterpret_cast<unsigned*>(ARENA.get(nc));
     GK(cudaMemsetAsync(cnt, 0, nc * 4, STREAM));
   }
-  (gen ? bwdBf<D, DKV, QT, true> : bwdBf<D, DKV, QT, false>)<<<(unsigned)grid, THREADS, smem, STREAM>>>(a, bt, qs_, ks_,
-      vs_, os_, lse, Di, dq, lddq, dk, lddk, dv, lddv, accK, accV, fx[0], fx[1],
-      inK ? reinterpret_cast<uint16_t*>(dqo) : nullptr, ldqo, cnt);
+  uint16_t* dqoK = inK ? reinterpret_cast<uint16_t*>(dqo) : nullptr;
+  // the bias gradients summed over CR rows on the chip first (a cluster of CR rows' CTAs): at the triangle's shape,
+  // every [q][k] element took one atomic a row - 537 M a call at 512 tokens, the kernel L2-bound at 80% of it
+  bool rowShared = a.bias[0].grad || a.bias[1].grad;
+  for (int j = 0; j < 2; ++j)
+    if (a.bias[j].grad && a.bias[j].sb != 0) rowShared = false;
+  if (clusters && rowShared && a.B % CR == 0) {
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = dim3((unsigned)grid); cfg.blockDim = dim3(THREADS); cfg.dynamicSmemBytes = smemC; cfg.stream = STREAM;
+    cudaLaunchAttribute at[1];
+    at[0].id = cudaLaunchAttributeClusterDimension; at[0].val.clusterDim.x = CR; at[0].val.clusterDim.y = 1; at[0].val.clusterDim.z = 1;
+    cfg.attrs = at; cfg.numAttrs = 1;
+    GK(cudaLaunchKernelEx(&cfg, gen ? bwdBf<D, DKV, QT, true, CR> : bwdBf<D, DKV, QT, false, CR>, a, bt, qs_, ks_, vs_,
+                          os_, lse, Di, dq, lddq, dk, lddk, dv, lddv, accK, accV, fx[0], fx[1], dqoK, ldqo, cnt));
+  } else if (narrow) {
+    (gen ? bwdBf<D, DKV, 32, true> : bwdBf<D, DKV, 32, false>)<<<(unsigned)grid, THREADS, smemN, STREAM>>>(a, bt, qs_, ks_,
+        vs_, os_, lse, Di, dq, lddq, dk, lddk, dv, lddv, accK, accV, fx[0], fx[1], dqoK, ldqo, cnt);
+  } else {
+    (gen ? bwdBf<D, DKV, QT, true> : bwdBf<D, DKV, QT, false>)<<<(unsigned)grid, THREADS, smem, STREAM>>>(a, bt, qs_, ks_,
+        vs_, os_, lse, Di, dq, lddq, dk, lddk, dv, lddv, accK, accV, fx[0], fx[1], dqoK, ldqo, cnt);
+  }
   if (dqo && !inK) narrowDqK<<<blocks((size_t)a.B * a.Q * a.H * D), 256, 0, STREAM>>>(dq, lddq, dqo, ldqo, a.H * D, (size_t)a.B * a.Q);
   for (int j = 0; j < 2; ++j)
     if (fx[j]) fromFixedK<<<blocks(ext[j]), 256, 0, STREAM>>>(a.bias[j].grad, fx[j], ext[j]);
