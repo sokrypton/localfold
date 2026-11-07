@@ -49,8 +49,10 @@ __global__ void concat2K(const real* a, int wa, const real* b, int wb, real* out
   if (src < wa) da[r * wa + src] += out[t];
   else if (db) db[r * wb + (src - wa)] += out[t];
 }
-__global__ void fourierFwdK(const real* w, const real* b, real tr, real* out, int nc) {
+// (trD: the level read off the device instead - a captured sampler step replayed at each level)
+__global__ void fourierFwdK(const real* w, const real* b, real tr, real* out, int nc, const real* trD = nullptr) {
   int k = blockIdx.x * blockDim.x + threadIdx.x;
+  if (trD) tr = *trD;
   if (k < nc) out[k] = cos((real)6.283185307179586 * (tr * w[k] + b[k]));
 }
 __global__ void fourierBwdK(const real* w, const real* b, real tr, const real* d, real* dw, real* db, int nc) {
@@ -159,11 +161,12 @@ inline CondSave condForward(DiffCond& c, const real* trunkSingle, const real* tr
 }
 // the conditioning at another noise level: `base`'s pair half and its noise-free single projection shared, the noise
 // embedding and the single transitions recomputed for `sigma` (a batch of samples: the pair half computed once)
-inline CondSave condSingleForward(DiffCond& c, const CondSave& base, real sigma) {
+// (trD: the embedding's input read off the device - a sampler step's graph, s.tr then not this level's)
+inline CondSave condSingleForward(DiffCond& c, const CondSave& base, real sigma, const real* trD = nullptr) {
   CondSave s = base;
   const int n = base.n;
   s.tr = (real)0.25 * log(sigma / (real)16);
-  s.e = ARENA.get(c.nc); fourierFwdK<<<blocks(c.nc), 256, 0, STREAM>>>(c.fw.w, c.fb.w, s.tr, s.e, c.nc);
+  s.e = ARENA.get(c.nc); fourierFwdK<<<blocks(c.nc), 256, 0, STREAM>>>(c.fw.w, c.fb.w, s.tr, s.e, c.nc, trD);
   s.en = ARENA.get(c.nc); s.le = lnForward(c.noiseLn, s.e, s.en, 1);
   s.nproj = ARENA.get(c.Cs); c.noiseProj.forward(s.en, s.nproj, 1);
   s.s0 = cloneR(s.base, (size_t)n * c.Cs);
@@ -370,12 +373,15 @@ __global__ void broadcastBwdK(const real* d, const int* t2qI, const real* t2qM, 
   if (t2qM[q] != 0) atomicAdd(&dproj[(size_t)(t2qI[q] / dense) * C + c], g);
 }
 // out = (skip x + out upd) mask, and the scaled input x mask in
-__global__ void edmOutK(const real* x, const real* upd, const real* mask, real* o, size_t atoms, real sk, real ou) {
+__global__ void edmOutK(const real* x, const real* upd, const real* mask, real* o, size_t atoms, real sk, real ou,
+                        const real* scal = nullptr) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (scal) { sk = scal[2]; ou = scal[3]; }
   if (t < atoms * 3) o[t] = (sk * x[t] + ou * upd[t]) * mask[t / 3];
 }
-__global__ void scaleMaskK(const real* x, const real* mask, real* y, size_t atoms, real a) {
+__global__ void scaleMaskK(const real* x, const real* mask, real* y, size_t atoms, real a, const real* aD = nullptr) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (aD) a = *aD;
   if (t < atoms * 3) y[t] = x[t] * mask[t / 3] * a;
 }
 // the uid gather stock AF3 makes off the wrong layout (keysUidFromQueriesLayout off): the index clamped to the array
@@ -467,6 +473,7 @@ struct DenoiseSave {
   LnSave lsn, lout;
   real *sn, *snP, *tok, *trOut, *actn, *scaled, *updAtoms, *out;
   real sigma, sk, ou, in;
+  const real* scal = nullptr;   // (a sampler step's on the device instead: [tr, in, sk, ou], denoiseScalars' order)
   int n;
 };
 
@@ -696,12 +703,18 @@ inline void denoiseScales(DenoiseSave& s, real sigma) {
   const real d = sigma * sigma + 256;
   s.sk = 256 / d; s.ou = sigma * 16 / sqrt(d); s.in = 1 / sqrt(d);
 }
+// the four scalars a denoiser pass takes from its noise level, as denoiseScales and condSingleForward make them:
+// [the Fourier embedding's input, in, skip, out]
+inline void denoiseScalars(real sigma, real* o) {
+  DenoiseSave s; denoiseScales(s, sigma);
+  o[0] = (real)0.25 * log(sigma / (real)16); o[1] = s.in; o[2] = s.sk; o[3] = s.ou;
+}
 // (shared: the encoder's batch-shared part, made once by the caller - encForward's whole otherwise)
 inline void denoisePre(Denoiser& m, const AtomBatch& b, DenoiseSave& s, const real* trunkSingle, const real* x, real* tok,
                        const EncSave* shared = nullptr) {
   const int n = b.tokens; const size_t atoms = (size_t)n * b.dense;
   s.scaled = ARENA.get(atoms * 3);
-  scaleMaskK<<<blocks(atoms * 3), 256, 0, STREAM>>>(x, b.atomMask, s.scaled, atoms, s.in);
+  scaleMaskK<<<blocks(atoms * 3), 256, 0, STREAM>>>(x, b.atomMask, s.scaled, atoms, s.in, s.scal ? s.scal + 1 : nullptr);
   const int Cs = m.cond.Cs, P = m.enc.perToken;
   s.sn = s.cs.sFinal;
   if (m.hasSnLn) { s.sn = ARENA.get((size_t)n * Cs); s.lsn = lnForward(m.snLn, s.cs.sFinal, s.sn, n); }
@@ -772,7 +785,7 @@ inline void denoisePost(Denoiser& m, const AtomBatch& b, DenoiseSave& s, const r
   s.ds.xn = ARENA.get(Rq * C); s.ds.ln = lnForward(m.decLn, s.ds.xm, s.ds.xn, Rq);
   s.ds.upd = ARENA.get(Rq * 3); m.decUpdate.forward(s.ds.xn, s.ds.upd, Rq);
   s.updAtoms = ARENA.get(atoms * 3); gather(b.q2t, s.ds.upd, s.updAtoms, 3);
-  edmOutK<<<blocks(atoms * 3), 256, 0, STREAM>>>(x, s.updAtoms, b.atomMask, out, atoms, s.sk, s.ou);
+  edmOutK<<<blocks(atoms * 3), 256, 0, STREAM>>>(x, s.updAtoms, b.atomMask, out, atoms, s.sk, s.ou, s.scal);
 }
 inline DenoiseSave denoiseForward(Denoiser& m, const AtomBatch& b, const real* trunkSingle, const real* trunkPair,
                                   const real* targetFeat, const real* seqMask, const real* x, real sigma, const int* ri,
@@ -793,14 +806,17 @@ inline DenoiseSave denoiseForward(Denoiser& m, const AtomBatch& b, const real* t
 }
 // a sampler's step (no gradient): D(x, sigma) on a conditioning's pair half and an encoder's shared part made once for
 // every step (pair: condForward's, enc: encShared's) - only the noise level's single half and the sample's own parts
-// made again, as denoiseBatchForward's sample k is; after the first step (first false) the transformer's pair logits too
+// made again, as denoiseBatchForward's sample k is; after the first step (first false) the transformer's pair logits too.
+// scal: the level's scalars on the device (denoiseScalars'), read there instead of sigma's - so that one captured
+// step replays at every level
 inline void denoiseStepForward(Denoiser& m, const AtomBatch& b, const CondSave& pair, const EncSave& enc, const DecPre& dec,
-                               const real* trunkSingle, const real* seqMask, const real* x, real sigma, real* out, bool first) {
+                               const real* trunkSingle, const real* seqMask, const real* x, real sigma, real* out, bool first,
+                               const real* scal = nullptr) {
   Scratch sc;
   const int n = b.tokens, P = m.enc.perToken;
   DenoiseSave s{}; s.n = n;
-  denoiseScales(s, sigma);
-  s.cs = condSingleForward(m.cond, pair, sigma);
+  denoiseScales(s, sigma); s.scal = scal;
+  s.cs = condSingleForward(m.cond, pair, sigma, scal);
   denoisePre(m, b, s, trunkSingle, x, ARENA.get((size_t)n * P), &enc);
   real* trOut = ARENA.get((size_t)n * P);
   {

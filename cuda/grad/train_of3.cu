@@ -76,10 +76,20 @@ __global__ void rolloutCentreK(const double* xs, const float* mask, int A, doubl
   }
   if (threadIdx.x < 3) cen[threadIdx.x] = s[threadIdx.x][0];
 }
-__global__ void rolloutNoiseK(const double* xs, const float* mask, const double* noise, const double* cen, RolloutStep st,
-                              int A, double* noisy, g::real* xd) {
+// (the step's draws and its denoiser scalars read off the device, the step counter advanced: one captured step
+// replayed for every step after the first two - its kernels' arguments the same each time)
+__global__ void rolloutPickK(const RolloutStep* steps, const g::real* scals, int* k, RolloutStep* st, g::real* scal) {
+  if (threadIdx.x || blockIdx.x) return;
+  *st = steps[*k];
+  for (int j = 0; j < 4; ++j) scal[j] = scals[(size_t)*k * 4 + j];
+  ++*k;
+}
+__global__ void rolloutNoiseK(const double* xs, const float* mask, const double* noise, const double* cen, const RolloutStep* stp,
+                              const int* k, int A, double* noisy, g::real* xd) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= A) return;
+  const RolloutStep& st = *stp;
+  noise += (size_t)(*k - 1) * A * 3;
   for (int p = 0; p < 3; ++p) {
     double v = 0;
     if (mask[i] > 0) {
@@ -91,9 +101,9 @@ __global__ void rolloutNoiseK(const double* xs, const float* mask, const double*
     xd[(size_t)i * 3 + p] = (g::real)v;
   }
 }
-__global__ void rolloutUpdateK(const double* noisy, const g::real* den, double coef, size_t n, double* xs) {
+__global__ void rolloutUpdateK(const double* noisy, const g::real* den, const RolloutStep* st, size_t n, double* xs) {
   const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n) xs[i] = noisy[i] + coef * (noisy[i] - (double)den[i]);
+  if (i < n) xs[i] = noisy[i] + st->coef * (noisy[i] - (double)den[i]);
 }
 static g::real* dzeros(size_t n) { g::real* p; GK(cudaMalloc(&p, std::max<size_t>(n, 1) * sizeof(g::real))); GK(cudaMemset(p, 0, std::max<size_t>(n, 1) * sizeof(g::real))); return p; }
 
@@ -1148,7 +1158,9 @@ int main(int argc, char** argv) {
   };
   // AF3's Algorithm 18 (OpenFold3's sample_diffusion), one sample, no gradient: the rolled-out positions
   // (every draw made first, in the order the steps made them - only the centring reads the positions - and the steps
-  // on the device: each step's positions to the host and back stalled the device on the host 20 times a rollout)
+  // on the device: each step's positions to the host and back stalled the device on the host 20 times a rollout; the
+  // steps after the first two one CUDA graph, captured once and replayed: a step is ~1000 small kernels, and their
+  // launches left the device idle ~a quarter of the rollout - 37 of 154 ms on the GH200 at 512 tokens)
   auto rollout = [&](Dev& d, Acts& a, const Example& e, std::mt19937_64& gen, int nsteps) {
     std::normal_distribution<double> nd(0, 1);
     const size_t A = e.atoms();
@@ -1178,18 +1190,41 @@ int main(int argc, char** argv) {
     GK(cudaMemcpy(xsD, xs.data(), xs.size() * sizeof(double), cudaMemcpyHostToDevice));
     GK(cudaMemcpy(noiseD, noise.data(), noise.size() * sizeof(double), cudaMemcpyHostToDevice));
     GK(cudaMemcpy(maskD, e.predMask.data(), A * sizeof(float), cudaMemcpyHostToDevice));
+    std::vector<g::real> scals((size_t)nsteps * 4);
+    for (int k = 0; k < nsteps; ++k) g::af3::denoiseScalars((g::real)steps[k].tHat, scals.data() + (size_t)k * 4);
+    auto* stepsD = reinterpret_cast<RolloutStep*>(g::ARENA.get(nsteps * sizeof(RolloutStep) / sizeof(g::real) + 1));
+    auto* stD = reinterpret_cast<RolloutStep*>(g::ARENA.get(sizeof(RolloutStep) / sizeof(g::real) + 1));
+    g::real *scalsD = g::ARENA.get(scals.size()), *scalD = g::ARENA.get(4);
+    int* kD = reinterpret_cast<int*>(g::ARENA.get(1));
+    GK(cudaMemcpy(stepsD, steps.data(), nsteps * sizeof(RolloutStep), cudaMemcpyHostToDevice));
+    GK(cudaMemcpy(scalsD, scals.data(), scals.size() * sizeof(g::real), cudaMemcpyHostToDevice));
+    GK(cudaMemset(kD, 0, sizeof(int)));
     g::real *xd = g::ARENA.get(A * 3), *od = g::ARENA.get(A * 3);
     // (the conditioning's pair half and the encoder's shared part once for the 20 steps: only the noise level changes)
     const g::af3::CondSave pairC = g::af3::condForward(dn.cond, a.singles[nPf], a.pairs[nMsa + nPf], a.tf, d.ri, d.ti, d.asym, d.ent, d.sym, (g::real)level(0), d.n);
     const g::af3::EncSave encC = g::af3::encShared(dn.enc, d.b, a.singles[nPf], pairC.pairOut);
     const g::af3::DecPre decC = g::af3::decShared(dn, d.b, encC);
     size_t live = 0; for (size_t i = 0; i < A; ++i) live += e.predMask[i] > 0;
-    for (int k = 1; k <= nsteps; ++k) {
-      const RolloutStep& st = steps[k - 1];
+    auto step = [&](int k) {
+      rolloutPickK<<<1, 32, 0, g::STREAM>>>(stepsD, scalsD, kD, stD, scalD);
       rolloutCentreK<<<1, 256, 0, g::STREAM>>>(xsD, maskD, (int)A, 1.0 / std::max<size_t>(live, 1), cenD);
-      rolloutNoiseK<<<g::blocks(A), 256, 0, g::STREAM>>>(xsD, maskD, noiseD + (size_t)(k - 1) * A * 3, cenD, st, (int)A, noisyD, xd);
-      g::af3::denoiseStepForward(dn, d.b, pairC, encC, decC, a.singles[nPf], d.seqMask, xd, (g::real)st.tHat, od, k == 1);
-      rolloutUpdateK<<<g::blocks(A * 3), 256, 0, g::STREAM>>>(noisyD, od, st.coef, A * 3, xsD);
+      rolloutNoiseK<<<g::blocks(A), 256, 0, g::STREAM>>>(xsD, maskD, noiseD, cenD, stD, kD, (int)A, noisyD, xd);
+      g::af3::denoiseStepForward(dn, d.b, pairC, encC, decC, a.singles[nPf], d.seqMask, xd, (g::real)steps[k - 1].tHat, od, k == 1, scalD);
+      rolloutUpdateK<<<g::blocks(A * 3), 256, 0, g::STREAM>>>(noisyD, od, stD, A * 3, xsD);
+    };
+    // (the first step makes the transformer's pair logits, and the second - the one the graph captures - runs eagerly
+    // first: whatever a step sets up once - cuBLASLt's timed plans, the transformer's buffers, the arena's mapping -
+    // done outside the capture)
+    const int eager = std::min(nsteps, 2);
+    for (int k = 1; k <= eager; ++k) step(k);
+    if (nsteps > eager) {
+      cudaGraph_t gr; cudaGraphExec_t ge;
+      GK(cudaStreamBeginCapture(g::STREAM, cudaStreamCaptureModeThreadLocal));
+      step(eager + 1);
+      GK(cudaStreamEndCapture(g::STREAM, &gr));
+      GK(cudaGraphInstantiate(&ge, gr, 0));
+      for (int k = eager + 1; k <= nsteps; ++k) GK(cudaGraphLaunch(ge, g::STREAM));
+      GK(cudaGraphExecDestroy(ge)); GK(cudaGraphDestroy(gr));
     }
     GK(cudaMemcpy(xs.data(), xsD, xs.size() * sizeof(double), cudaMemcpyDeviceToHost));
     return xs;
