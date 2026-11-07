@@ -207,8 +207,11 @@ __host__ __device__ constexpr int vtKeyAt(int p) {
   }
   return -1;
 }
+// the key pairs whose exponentials go to the FMA pipe (ex2emu2): one in eight - with the rows apart (TC_PERROW) the
+// exponential unit is a limit: 363 -> 380 TFLOP/s at 2048 tokens, 405 -> 426 at 4096; one in four 372 / 414, three in
+// eight 361 / 399, one in sixteen 376 / 420. (With the rows phase-locked every fraction was slower.)
 #ifndef TC_EMU_PAIR
-#define TC_EMU_PAIR(c) false   // (pairs whose exponentials go to the FMA pipe: none - measured slower, the softmax being latency-bound)
+#define TC_EMU_PAIR(c) ((c) % 8 == 3)
 #endif
 constexpr int TQ = 128, TK = 64, OFF = 5;
 constexpr float LAZY = 3.f;   // (P <= 2^(OFF + LAZY) = 256, inside e4m3's 448)
@@ -232,7 +235,10 @@ template <int R> struct Lay {
   static constexpr uint32_t Q = 0, STAGE = 16384 + R * 5120, ST = R * 8192, ID = ST + Cfg<R>::TS * STAGE, MA = ID + R * 8192,
                             MB = MA + 1024, BAR = MB + 2048, BYTES = BAR + 512;
 };
-template <int R> __host__ __device__ constexpr int tcWarps() { return 4 * R + 2; }   // 4R softmax, the products, the loads
+#ifndef TC_PERROW
+#define TC_PERROW 1   // a product warp a row (the rows drift apart): 2048 tokens 325 -> 363 TFLOP/s, 4096 361 -> 405 (test_flash_tc5)
+#endif
+template <int R> __host__ __device__ constexpr int tcWarps() { return TC_PERROW ? 5 * R + 1 : 4 * R + 2; }   // 4R softmax, the products (a warp, or one a row), the loads
 
 // PERSISTENT: a block an SM, each walking its share of the work items (head, query tile, row group) with its pipeline
 // running across them - a block a work item paid ~11 us a block in setup, fill and drain that nothing overlapped (one
@@ -248,7 +254,7 @@ __global__ void __launch_bounds__(32 * tcWarps<R>(), 1) flashTc(const __grid_con
     float scale, const float* __restrict__ qBias, int G) {
 #if LF_TC5A
   using L = Lay<R>;
-  constexpr int D = 32, MW = 4 * R, LW = 4 * R + 1, TS = Cfg<R>::TS, SB = Cfg<R>::SB;
+  constexpr int D = 32, MW = 4 * R, LW = TC_PERROW ? 5 * R : 4 * R + 1, TS = Cfg<R>::TS, SB = Cfg<R>::SB;
   constexpr uint32_t OCOL = 64 * R * SB, PCOL = OCOL + 64 * R;
   extern __shared__ __align__(1024) unsigned char sm[];
   uint64_t* kvFull = reinterpret_cast<uint64_t*>(sm + L::BAR);
@@ -272,7 +278,7 @@ __global__ void __launch_bounds__(32 * tcWarps<R>(), 1) flashTc(const __grid_con
     asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
   }
   if (tid == 0) {
-    for (int s = 0; s < TS; ++s) { barInit(kvFull + s, 1); barInit(kvFree + s, 1); }
+    for (int s = 0; s < TS; ++s) { barInit(kvFull + s, 1); barInit(kvFree + s, TC_PERROW ? R : 1); }
     for (int i = 0; i < R * SB; ++i) { barInit(sFull + i, 1); barInit(sRead + i, 4); }
     for (int i = 0; i < 2 * R; ++i) { barInit(pFull + i, 4); barInit(pFree + i, 1); }
     for (int i = 0; i < 2; ++i) barInit(qFull + i, 4 * R);
@@ -322,6 +328,48 @@ __global__ void __launch_bounds__(32 * tcWarps<R>(), 1) flashTc(const __grid_con
           }
           if (++s == TS) { s = 0; ++u; }
         }
+      }
+    }
+  } else if (TC_PERROW && warp >= MW) {
+    // PER ROW: row r's products from warp MW + r - its own bias (N=64, the identity's first copy), Q K^T and P V - so the
+    // rows' softmaxes drift apart instead of waking together on one shared product (phase-locked, the exponential unit sat
+    // idle while all of them took their maxima and then all of them queued on it)
+    if (lane == 0) {
+      const int r = warp - MW;
+      constexpr uint32_t IDB = idesc(TQ, TK), IDQK = idesc(TQ, TK), IDPV = idesc(TQ, D + 16);
+      const uint64_t dBias = sdesc(base + L::ST, 16, 1024, SW128), dId = sdesc(base + L::ID, R * 1024, 128),
+                     dQ = sdesc(base + L::Q, 2048, 128), dK = sdesc(base + L::ST + 16384, 16, 256, SW32),
+                     dV = sdesc(base + L::ST + 16384 + 2048, 16, 512, SW64), dMA = sdesc(base + L::MA, 128, 0), dMB = sdesc(base + L::MB, 1024, 128);
+      int ts = 0, ks = 0, js = 0, ss = 0;
+      auto S = [&]() {
+        const int b2 = ts % SB, i = b2 * R + r;
+        barWait(kvFull + ss, (ts / TS) & 1);
+        if (js == 0) barWait(qFull + (ks & 1), (ks >> 1) & 1);
+        if (ts >= SB) barWait(sRead + i, ((ts - SB) / SB) & 1);
+        fenceAfter();
+        const uint32_t so = ss * L::STAGE >> 4, d = tm + i * TK;
+#pragma unroll
+        for (int c = 0; c < 4; ++c) mmaF16(d, dBias + so + c * 2, dId + c * (2 * R * 1024 >> 4), IDB, c > 0);
+        mmaF8(d, dQ + (((ks & 1) * R + r) * 4096 >> 4), dK + so + (r * 5120 >> 4), IDQK, true);
+        if (js == nk - 1 && n % TK) mmaF16(d, dMA, dMB, IDB, true);
+        commit(sFull + i);
+        ++ts; if (++ss == TS) ss = 0; if (++js == nk) { js = 0; ++ks; }
+      };
+      for (int t = 0; t < T && t < SB; ++t) S();
+      int j = 0, s = 0;
+      for (int t = 0; t < T; ++t) {
+        if (t + SB < T) S();
+        const uint32_t so = s * L::STAGE >> 4;
+        const int i = r * 2 + (t & 1);
+        barWait(pFull + i, (t >> 1) & 1);
+        fenceAfter();
+#pragma unroll
+        for (int c = 0; c < 2; ++c)
+          mmaF8ts(tm + OCOL + 64 * r, tm + PCOL + 16 * i + 8 * c, dV + so + ((r * 5120 + c * 32) >> 4), IDPV, j > 0 || c > 0);
+        commit(pFree + i);
+        commit(kvFree + s);
+        if (++s == TS) s = 0;
+        if (++j == nk) j = 0;
       }
     }
   } else if (warp == MW) {
