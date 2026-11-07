@@ -257,9 +257,11 @@ __global__ void slotMajorK(const float* w, float* out, int slots, int C, int bin
   out[(size_t)c * slots * bins + slot * bins + b] = w[t];
 }
 // tokens' coordinates, refined pair and single, s_inputs: all on the structural tokens.
-// Returns pLDDT per structural atom slot, PAE/PDE per structural pair, and the per-pair TM term
-// (d0 from `tmTokens`, the residue count pTM is reported over).
-struct DdeConfidence { std::vector<float> plddt, pae, pde, tmTerm; };
+// Returns pLDDT per structural atom slot, PAE/PDE per structural pair, and the per-pair TM terms: the global one (d0
+// from `tmTokens`, the residue count pTM is reported over) and AF3's interface one (tmChainK: d0 from the residue
+// tokens of the pair's chains, each structural token in its parent residue's chain) - af3.cu gathers both to the
+// residue pairs, as af3-any-model gathers the logits before tmscore_adjusted_pae
+struct DdeConfidence { std::vector<float> plddt, pae, pde, tmTerm, tmChain; };
 inline DdeConfidence ddeConfidence(const float* refinedPair, const float* refinedSingle, const float* sInputs,
                                    const float* coords, const float* seqMask, const float* pairMask, const float* bias,
                                    int n, int dense, int tmTokens, bool consume = false) {
@@ -308,6 +310,7 @@ inline DdeConfidence ddeConfidence(const float* refinedPair, const float* refine
   float* logits = scratch<float>("dc.logits", R * n * NB);
   float* pde = scratch<float>("dc.pde", pairs); float* pae = scratch<float>("dc.pae", pairs);
   float* tm = scratch<float>("dc.tm", pairs);
+  float* tmc = scratch<float>("dc.tmChain", pairs);
   auto centresFor = [](int nb) {
     std::vector<float> c(nb); for (int b = 0; b < nb; ++b) c[b] = 32.f / nb * (b + 0.5f); return c;
   };
@@ -326,6 +329,20 @@ inline DdeConfidence ddeConfidence(const float* refinedPair, const float* refine
   const float* dPae = dTables + pdeBins;
   const float* dPer = dPae + paeBins;
   const float* dpc  = dPer + paeBins;
+  ChainTm ct;
+  {   // the residues' chains and live tokens, each structural token in its parent's
+    const int nRes = (int)M.meta("batch.tokens");
+    const int* parent = M.i("structural.parent"); const int* asym = M.i("batch.asymId"); const float* rseq = M.f("batch.seqMask");
+    std::vector<int> chainRes(nRes); for (int r = 0; r < nRes; ++r) chainRes[r] = rseq[r] > 0 ? asym[r] : -1;
+    ChainTm residues = chainTmTables(chainRes.data(), rseq, nRes, paeC.data(), paeBins, "dc.res");   // (the tables: residue counts)
+    std::vector<int> resOf(nRes, -1);
+    CK(cudaMemcpy(resOf.data(), residues.chainOf, nRes * sizeof(int), cudaMemcpyDeviceToHost));
+    std::vector<int> of(n);
+    for (int i = 0; i < n; ++i) of[i] = parent[i] >= 0 && parent[i] < nRes ? resOf[parent[i]] : -1;
+    ct = residues;
+    ct.chainOf = scratch<int>("dc.chainOf", n);
+    CK(cudaMemcpy(ct.chainOf, of.data(), n * sizeof(int), cudaMemcpyHostToDevice));
+  }
   for (size_t r0 = 0; r0 < (size_t)n; r0 += R) {
     size_t r = std::min(R, (size_t)n - r0), rows = r * n, p0 = r0 * n;
     symmetriseRowsK<<<blocks(rows * C), 256, 0, STREAM>>>(pair, sym, n, C, r0, r);
@@ -335,6 +352,7 @@ inline DdeConfidence ddeConfidence(const float* refinedPair, const float* refine
     layerNorm2<float, float>(pair + p0 * C, ln, rows, C, P + "paeLnScale", P + "paeLnOffset");
     linear<float, float>(ln, logits, rows, C, paeBins, P + "pae");
     expectationK<<<blocks(rows), 256, 0, STREAM>>>(logits, pae + p0, nullptr, rows, paeBins, dPae, 0, 1.f, tm + p0, dPer);
+    tmChainK<<<blocks(rows), 256, 0, STREAM>>>(logits, tmc + p0, rows, p0, n, paeBins, ct.chainOf, ct.nc, ct.tables);
   }
   // pLDDT per atom: the token's normalised single against the matrix of the atom's dense slot
   std::string wk = P + "plddtWeight~slotMajor";
@@ -349,10 +367,11 @@ inline DdeConfidence ddeConfidence(const float* refinedPair, const float* refine
   linear<float, float>(sln, pl, n, Cs, slots * PB, wk);
   float* plddt = scratch<float>("dc.plddt", (size_t)n * slots);
   expectationK<<<blocks((size_t)n * slots), 256, 0, STREAM>>>(pl, plddt, nullptr, (size_t)n * slots, PB, dpc, 0, 100.f);
-  out.pde.resize(pairs); out.pae.resize(pairs); out.tmTerm.resize(pairs); out.plddt.resize((size_t)n * slots);
+  out.pde.resize(pairs); out.pae.resize(pairs); out.tmTerm.resize(pairs); out.tmChain.resize(pairs); out.plddt.resize((size_t)n * slots);
   CK(cudaMemcpyAsync(out.pde.data(), pde, pairs * sizeof(float), cudaMemcpyDeviceToHost, STREAM));
   CK(cudaMemcpyAsync(out.pae.data(), pae, pairs * sizeof(float), cudaMemcpyDeviceToHost, STREAM));
   CK(cudaMemcpyAsync(out.tmTerm.data(), tm, pairs * sizeof(float), cudaMemcpyDeviceToHost, STREAM));
+  CK(cudaMemcpyAsync(out.tmChain.data(), tmc, pairs * sizeof(float), cudaMemcpyDeviceToHost, STREAM));
   CK(cudaMemcpyAsync(out.plddt.data(), plddt, (size_t)n * slots * sizeof(float), cudaMemcpyDeviceToHost, STREAM));
   CK(cudaStreamSynchronize(STREAM));
   return out;

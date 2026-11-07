@@ -1060,14 +1060,16 @@ static int foldMain(int argc, char** argv) {
         }
         xk = std::move(xr);
         ck.pae.resize((size_t)t.n * t.n); ck.pde.resize((size_t)t.n * t.n);
-        std::vector<float> term((size_t)t.n * t.n);
+        std::vector<float> term((size_t)t.n * t.n), chainTerm((size_t)t.n * t.n);
         for (int i = 0; i < t.n; ++i) for (int j = 0; j < t.n; ++j) {
           size_t from = (size_t)rep[i] * nD + rep[j], to = (size_t)i * t.n + j;
-          ck.pae[to] = dc.pae[from]; ck.pde[to] = dc.pde[from]; term[to] = dc.tmTerm[from];
+          ck.pae[to] = dc.pae[from]; ck.pde[to] = dc.pde[from]; term[to] = dc.tmTerm[from]; chainTerm[to] = dc.tmChain[from];
         }
+        const std::vector<char> frame = tokenFrameMask(t.n);   // (pTM's anchors: AF3's pae_single_mask)
         auto reduce = [&](bool interOnly) {
           double bestTm = -1e30; bool any = false;
           for (int i = 0; i < t.n; ++i) {
+            if (!frame[i]) continue;
             double tot = 0; int cnt = 0;
             for (int j = 0; j < t.n; ++j) {
               if (interOnly && resAsym[i] == resAsym[j]) continue;
@@ -1079,7 +1081,8 @@ static int foldMain(int argc, char** argv) {
           return any ? bestTm : NAN;
         };
         ck.ptm = reduce(false); ck.iptm = familyIptm(reduce(true));
-        ck.tmTerm = term;
+        if (getenv("AF3_PAE_OUT")) ck.tmGlobal = term;
+        ck.tmTerm = std::move(chainTerm);   // (the chain-level scores' term: ConfidenceOut's)
         const float* am = M.f("batch.predDenseAtomMask");
         double sum = 0, count = 0;
         for (size_t a = 0; a < ck.plddt.size(); ++a) if (am[a]) { sum += ck.plddt[a]; count += 1; }
@@ -1150,10 +1153,14 @@ static int foldMain(int argc, char** argv) {
     if (out != "/dev/null") writeConfidences(out, order, t.n, dense, conf.plddt, conf.pae, conf.tmTerm, bestContact, conf.ptm,
                                              conf.iptm, bestScore, conf.meanPlddt, bestSS.clash, bestSS.disordered);
     if (many) printf("  best: seed %llu sample %d\n", (unsigned long long)bestSeed, best);
-    if (const char* pp = getenv("AF3_PAE_OUT")) {   // the raw PAE/PDE/pLDDT, for comparing two arms
-      FILE* pf = fopen(pp, "wb");
+    if (const char* pp = getenv("AF3_PAE_OUT")) {   // the raw PAE/PDE/pLDDT, for comparing two arms; then the TM terms
+      FILE* pf = fopen(pp, "wb");                    // (interface, global) and the frames' mask, for check_chain_ptm.py
       fwrite(conf.pae.data(), 4, conf.pae.size(), pf); fwrite(conf.pde.data(), 4, conf.pde.size(), pf);
-      fwrite(conf.plddt.data(), 4, conf.plddt.size(), pf); fclose(pf);
+      fwrite(conf.plddt.data(), 4, conf.plddt.size(), pf);
+      fwrite(conf.tmTerm.data(), 4, conf.tmTerm.size(), pf); fwrite(conf.tmGlobal.data(), 4, conf.tmGlobal.size(), pf);
+      const std::vector<char> fm = tokenFrameMask(t.n);
+      for (char c : fm) { const float v = c ? 1.f : 0.f; fwrite(&v, 4, 1, pf); }
+      fclose(pf);
     }
     if (STAGES) {
       double total = 0; for (auto& [k, v] : STAGE_MS) total += v;
