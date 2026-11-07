@@ -678,6 +678,12 @@ int main(int argc, char** argv) {
   // transformer costs a sample and what a chunk costs besides its samples, in ms (< 0: not measured yet); the events
   // that time them
   struct { size_t atoms = 0; double shared = 0, per = 0, keptPer = 0, replayMs = -1, chunkMs = -1; std::vector<cudaEvent_t> ev; } sbSeen;
+  // the trunk's like it: the pairformer's last `keep` blocks keep their saves from the forward for the backward instead
+  // of recomputing them, as many as the step's peak left unused - grown only while the diffusion's chunk plan is its
+  // widest (every sample at once, its saves kept), so the trunk takes only memory nothing else would use. perNN: a
+  // block's saves' bytes a token pair, measured. (On the B200 at 384 tokens keeping all 48 took a step 1.08 -> 0.95 s
+  // for 95 GB; each block's saves grow as n^2, so a crop keeps what its spare holds)
+  struct { int keep = 0; double perNN = 0; } pfSeen;
   int sampleBatch = 8;   // the diffusion samples a denoiser pass (--sample-batch; 0, --sample-batch=auto: as many as the room holds)
   int maxRecycles = 3;   // OpenFold3's num_recycles: a step runs 1 + U{0..max} cycles (--max-recycles)
   int checkBatch = -1;
@@ -1027,7 +1033,7 @@ int main(int argc, char** argv) {
     GK(cudaEventRecord(offload.in[j], offload.copy));
   };
   auto pairReady = [&](Acts& a, int j) { if (a.off) GK(cudaStreamWaitEvent(STREAM, offload.in[j], 0)); };
-  auto trunkForward = [&](Dev& d, Acts& a) {
+  auto trunkForward = [&](Dev& d, Acts& a, int keep = 0) {
     const int n = d.n, S = d.S; const size_t nn = (size_t)n * n;
     if (a.off) offload.join(STREAM);    // (the last pass's copies out of the ring done before it is written again)
     auto eb = embedBatch(d);
@@ -1062,21 +1068,22 @@ int main(int argc, char** argv) {
                                          a.pairs[nMsa + k + 1], a.singles[k + 1], n);
       pairOut(a, nMsa + k);
       if (k == 0) memPhase("pairformer block, forward");
-      if (ckpt) g::ARENA.rewind(mk);
+      if (k == nPf - 1) pfSeen.perNN = (double)(g::ARENA.used - mk.used) / nn;
+      if (ckpt && k < nPf - keep) g::ARENA.rewind(mk);
     }
     g::BF16 = prevBf;
     g::af3::distogramForward(dh, a.pairs[nMsa + nPf], n, a.logits);
   };
   // `c` cycles (model.py run_trunk): the first c - 1 without a gradient, each handing its pair and single on; `draw`
   // fills the cycle's MSA rows first
-  auto cycles = [&](Dev& d, Acts& a, int c, const std::function<void()>& draw) {
+  auto cycles = [&](Dev& d, Acts& a, int c, const std::function<void()>& draw, int keep = 0) {   // (keep: the last pass's)
     const size_t nn = (size_t)d.n * d.n;
     GK(cudaMemsetAsync(a.prevPair, 0, nn * Cz * sizeof(g::real), STREAM));
     GK(cudaMemsetAsync(a.prevSingle, 0, (size_t)d.n * Cs * sizeof(g::real), STREAM));
     for (int pass = 0; pass < c; ++pass) {
       draw();
       g::ARENA.reset();
-      trunkForward(d, a);
+      trunkForward(d, a, pass + 1 == c ? keep : 0);
       if (pass + 1 == c) break;
       GK(cudaMemcpyAsync(a.prevPair, a.pairs[nMsa + nPf], nn * Cz * sizeof(g::real), cudaMemcpyDeviceToDevice, STREAM));
       GK(cudaMemcpyAsync(a.prevSingle, a.singles[nPf], (size_t)d.n * Cs * sizeof(g::real), cudaMemcpyDeviceToDevice, STREAM));
@@ -1381,7 +1388,8 @@ int main(int argc, char** argv) {
     // (model.py: the recycle count from a generator every rank shares - the same number on every rank a step)
     std::mt19937_64 synced(seed * 1000003ull + (uint64_t)stepIndex);
     const int c = fixed ? 4 : 1 + (int)(synced() % (uint64_t)(maxRecycles + 1));
-    cycles(d, a, c, [&] { drawMsa(d, e, gen); });
+    const int pfKeep = train && !fixed && ckpt && !a.off ? std::min(pfSeen.keep, nPf) : 0;
+    cycles(d, a, c, [&] { drawMsa(d, e, gen); }, pfKeep);
     const auto t1 = now();
     // the mini-rollout, and on it the truth's permutation (model.py: before every loss of the step)
     std::vector<double> xp;
@@ -1693,6 +1701,22 @@ int main(int argc, char** argv) {
     // mapped again the next step it was ~60 ms of a 512-token step on the GH200, the peak the same either way)
     g::af3::releaseRun(dn.run);   // (the transformer's buffers, its widest batch's: given back before the trunk's backward)
     widestBatch = widest; diffKept = keepDiff;
+    // (the pairformer's kept blocks for the next step: the memory this one's peak left unused, where the chunk plan
+    // was its widest; where it was not - the blocks kept took what the samples would have - half as many)
+    if (train && !fixed && ckpt && !a.off && pfSeen.perNN > 0) {
+      if (autoSB && (widest < nSamples || (!keepDiff && diffSaves == 0))) pfSeen.keep /= 2;
+      else {
+        size_t freeB, total; GK(cudaMemGetInfo(&freeB, &total));
+        uint64_t poolNow = 0, poolHigh = 0;
+        GK(cudaMemPoolGetAttribute(pool0, cudaMemPoolAttrReservedMemCurrent, &poolNow));
+        GK(cudaMemPoolGetAttribute(pool0, cudaMemPoolAttrReservedMemHigh, &poolHigh));
+        const double reserve = std::max<double>((size_t)1 << 30, total / 20.0), block = pfSeen.perNN * nn;
+        // (the arena holds its peak mapping, so what its peak left is the device's free memory, less what the stream
+        // pool reached past where it is now)
+        const double spare = (double)freeB - (double)(poolHigh - std::min(poolHigh, poolNow)) - reserve;
+        if (spare > block) pfSeen.keep = std::min(nPf, pfSeen.keep + (int)(0.85 * spare / block));
+      }
+    }
     distogramReady();
     confidenceStep();
     L.total = L.diffusion + distWeight * L.distogram + (confOn ? confWeight * (L.plddt + L.pde + L.pae + L.resolved) : 0);
@@ -1711,8 +1735,8 @@ int main(int argc, char** argv) {
         g::real *op = g::ARENA.get(nn * Cz), *os = g::ARENA.get((size_t)n * Cs);   // (the recomputed block's outputs)
         const bool prevBf = g::BF16; g::BF16 = bf16Trunk;
         std::optional<g::Range> rB_; rB_.emplace("bw.pf.recompute");
-        auto save = ckpt ? g::af3::pairformerForward(pf[k], dl, a.pairs[nMsa + k], a.singles[k], d.pairMask, d.pairMaskT, d.seqMask, nullptr, op, os, n)
-                         : pfS[k];
+        auto save = ckpt && k < nPf - pfKeep ? g::af3::pairformerForward(pf[k], dl, a.pairs[nMsa + k], a.singles[k], d.pairMask, d.pairMaskT, d.seqMask, nullptr, op, os, n)
+                                             : pfS[k];
         rB_.reset(); rB_.emplace("bw.pf.backward");
         g::real *dpi = g::ARENA.zeros(nn * Cz), *dsi = g::ARENA.zeros((size_t)n * Cs);
         g::af3::pairformerBackward(pf[k], dl, save, d.pairMask, d.pairMaskT, d.seqMask, dp, dsg, dpi, dsi, nullptr);
@@ -1750,8 +1774,8 @@ int main(int argc, char** argv) {
     }
     const auto t4 = now();
     int withTemplates = 0; for (auto& sl : e.slots) if (sl.geo) withTemplates += (int)std::lround(sl.repeat);
-    if (!fixed) printf("  %s: %d of %d tokens (%s), %d cycles, %d MSA rows, %d templates; ms: trunk %.0f, rollout+confidence %.0f, diffusion %.0f (host losses %.0f, %d samples a batch at most, transformer saves %s), trunk backward %.0f\n",
-                       full.input.c_str(), n, full.n, strategy.c_str(), c, S, withTemplates, msOf(t0, t1), msOf(t1, t2), msOf(t2, t3), tLoss, widestBatch, diffKept ? "kept" : "replayed", msOf(t3, t4));
+    if (!fixed) printf("  %s: %d of %d tokens (%s), %d cycles, %d MSA rows, %d templates; ms: trunk %.0f, rollout+confidence %.0f, diffusion %.0f (host losses %.0f, %d samples a batch at most, transformer saves %s), trunk backward %.0f (%d of %d pairformer blocks' saves kept)\n",
+                       full.input.c_str(), n, full.n, strategy.c_str(), c, S, withTemplates, msOf(t0, t1), msOf(t1, t2), msOf(t2, t3), tLoss, widestBatch, diffKept ? "kept" : "replayed", msOf(t3, t4), pfKeep, nPf);
     if (a.off) GK(cudaStreamSynchronize(offload.copy));
     a.release(); d.release();
     return std::make_pair(L, confOn);

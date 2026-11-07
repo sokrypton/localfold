@@ -13,7 +13,7 @@ int main(int argc, char** argv) {
   curandGenerator_t gen; curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT); curandSetPseudoRandomGeneratorSeed(gen, 1);
   auto randn = [&](size_t n) { float* p; GK(cudaMalloc(&p, ((n + 1) & ~1) * 4)); curandGenerateNormal(gen, p, (n + 1) & ~1, 0.f, 1.f); return p; };
   struct Shape { const char* name; int B, H, Q, D; bool bias; };
-  for (Shape c : {Shape{"row", 128, 8, 256, 32, true}, Shape{"col", 256, 8, 128, 32, false}, Shape{"tri", 256, 4, 256, 32, true}, Shape{"tri300", 300, 4, 300, 32, true}, Shape{"xrow", 1024, 8, 256, 8, true}, Shape{"af3tri", 384, 4, 384, 32, true}, Shape{"af3tri768", 768, 4, 768, 32, true}, Shape{"diff512", 26, 16, 512, 48, true}, Shape{"grid512", 512, 4, 512, 32, true}}) {
+  for (Shape c : {Shape{"row", 128, 8, 256, 32, true}, Shape{"col", 256, 8, 128, 32, false}, Shape{"tri", 256, 4, 256, 32, true}, Shape{"tri300", 300, 4, 300, 32, true}, Shape{"xrow", 1024, 8, 256, 8, true}, Shape{"af3tri", 384, 4, 384, 32, true}, Shape{"af3tri768", 768, 4, 768, 32, true}, Shape{"diff512", 26, 16, 512, 48, true}, Shape{"grid512", 512, 4, 512, 32, true}, Shape{"grid768", 768, 4, 768, 32, true}}) {
     if (only && strcmp(only, c.name)) continue;
     int HD = c.H * c.D; size_t n = (size_t)c.B * c.Q * HD;
     float *q = randn(n), *k = randn(n), *v = randn(n), *dO = randn(n), *o = randn(n), *dq = randn(n), *dk = randn(n), *dv = randn(n);
