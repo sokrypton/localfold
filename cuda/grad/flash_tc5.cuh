@@ -593,7 +593,9 @@ __global__ void __launch_bounds__(32 * tc2::WARPS, 1) gridFwdTc2(const __grid_co
   }
 #endif
 }
-X
+// OFF by default: 1.07x gridFwdBf alone at 768 tokens (test_tc5_attn2) but a training step SLOWER with it - 3436 / 3518 /
+// 3457 against 3340 / 3421 / 3357 ms (steps 2-4, 768 tokens, interleaved twice; its V^T pass and the pass's traffic). --tc-fwd
+inline bool TC2 = false;
 // gridForwardBf's form for gridFwdTc2: D 32, q, k, v bf16 rows (ld a multiple of 8), the bias shared by the grid rows
 inline bool gridFwdTc2Run(const Sdpa& a, const BiasTile& bt, const float* ka2, int Npk, const __nv_bfloat16* q, int ldq,
                           const __nv_bfloat16* k, int ldk, const __nv_bfloat16* v, int ldv, __nv_bfloat16* o, int ldo, float* lse,
