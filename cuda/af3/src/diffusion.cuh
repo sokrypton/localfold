@@ -1013,7 +1013,7 @@ inline void prepareTransformer(const float* pairCond, int n) {
   // every block's now where they fit with room to spare, else a super block at a time in the step
   const bool given = pairCond == nullptr;
   if (given && !(DIFF_HALF && PN16_GIVEN)) { fprintf(stderr, "a streamed preparation needs the f16 path\n"); exit(1); }
-  if (DIFF_HALF && (given || shortPair(pairs, Cz))) {
+  if (DIFF_HALF && (given || shortPair("lean.diffusion", pairs, Cz))) {
     // as many super blocks' biases kept as the card has room for (what an earlier fold's bias and f16-pair buffers
     // hold counted), the rest made in the step - all or nothing it was: at 4,000 tokens the 12.3 GB of every
     // block's biases did not fit, so all six super blocks were remade at every step (diffusion 4.2 s at 3,000
@@ -1025,7 +1025,7 @@ inline void prepareTransformer(const float* pairCond, int n) {
     // (what is held counts toward what is needed only for what the need includes: a streamed preparation's pn16 is
     // handed in, not part of the need, and counting it admitted 12.2 GB of biases that did not fit at 6,916 tokens)
     for (auto& [k, v] : SCRATCH) if (!k.compare(0, 5, "dt.bh") || (!given && k == "dt.pn16")) held += v.second;
-    auto fits = [&](size_t need) { return roomFor(need > held ? need - held : 0); };
+    auto fits = [&](size_t need) { return lever("diff.biasesHeld", need > held ? need - held : 0); };
     int kept = fits((size_t)tc.nblocks * heads * heldRows * tc.stride * 2) ? nSB : 0;
     if (kept < nSB) while (kept + 1 < nSB && fits((size_t)(kept + 2) * sbBytes + pnBytes)) ++kept;   // kept + the shared set
     bool lazy = kept < nSB;
@@ -1760,6 +1760,7 @@ struct DiffusionFold {
   // every step's single conditioning and its embedding projection, computed in one batch before
   // sampling (precomputeConditioning) - a step only copies its slices in
   std::vector<float> preLevels; float *preSingle = nullptr, *preSnProj = nullptr; bool usePre = false;
+  std::vector<float> preWanted;     // (asked for before the first step: made before the second - precomputeConditioning)
 };
 inline LF_TLS bool GRAPHS = true;
 // the denoiser's seams against a stage oracle (oracle.stages.stages.<name>), when one was exported
@@ -1779,6 +1780,13 @@ inline size_t diffusionPrepBytes(size_t pairs) {
   size_t heads = (size_t)M.meta(T + ".heads"), perSuper = (size_t)M.meta(T + ".blocksPerSuperBlock");
   return pairs * (Cz * 2 + Cp * 4 + perSuper * heads * 2);
 }
+// every block's pair logits held whole (what diff.biasesHeld asks): bf16, `heads` per block, rows padded to 8
+inline size_t diffusionBiasBytes(size_t n) {
+  const std::string T = "diffusion.transformer";
+  size_t heads = (size_t)M.meta(T + ".heads"), perSuper = (size_t)M.meta(T + ".blocksPerSuperBlock"), nSB = 0;
+  while (hasW(T + ".superBlocks." + std::to_string(nSB) + ".pairLogitsProjection")) ++nSB;
+  return nSB * perSuper * heads * n * ((n + 7) / 8 * 8) * 2;
+}
 inline DiffusionFold prepareDiffusion(const float* trunkSingle, const float* trunkPair, const float* targetFeat,
                                       const float* seqMask, int n) {
   DiffusionFold f{ trunkSingle, trunkPair, targetFeat, seqMask, n, {}, {} };
@@ -1791,7 +1799,7 @@ inline DiffusionFold prepareDiffusion(const float* trunkSingle, const float* tru
   if (shardedPair && !(DIFF_HALF && hasW(E + ".embedTrunkPairCond"))) {
     fprintf(stderr, "a sharded pair's diffusion streams its conditioning (the f16 path, an encoder taking the pair)\n"); exit(1);
   }
-  if (DIFF_HALF && (shortPair(pairs, Cz) || shardedPair) && hasW(E + ".embedTrunkPairCond")) {
+  if (DIFF_HALF && (shortPair("lean.diffusion", pairs, Cz) || shardedPair) && hasW(E + ".embedTrunkPairCond")) {
     // a card short of room: the conditioning pair streamed - each chunk of rows straight into the
     // encoder's pair projection and the transformer's f16 LayerNorm'd pair, never the f32 pair whole
     // (9 GB at 4192 tokens, beside the trunk's)
@@ -1840,7 +1848,16 @@ inline DiffusionFold prepareDiffusion(const float* trunkSingle, const float* tru
 // and the sampler knows all of them before it starts - so the Fourier embedding, its projection,
 // both transitions and the single-conditioning projection run as a few large GEMMs over
 // steps x tokens rows instead of ~15 small kernels a step (68 tokens: ~0.1 ms of a 1.9 ms step)
+inline void precomputeNow(DiffusionFold& f, const std::vector<float>& levels);
+// 🔴 asked before the sampler's first step, made before its second: the lever (diff.precompute) is then asked of what
+// is left beside the step's own buffers, which the first step has made - asked before them, 1,536 tokens with 9.8 GiB
+// of an A100 took 1.9 GB of it and the first step ran out at its 0.05 GB attention buffer. (The second step is the one
+// a graph captures, so the replayed steps all take the precomputed rows.)
 inline void precomputeConditioning(DiffusionFold& f, const std::vector<float>& levels) {
+  if (f.calls == 0) { f.preWanted = levels; f.usePre = false; return; }
+  precomputeNow(f, levels);
+}
+inline void precomputeNow(DiffusionFold& f, const std::vector<float>& levels) {
   const std::string P = "diffusion.conditioning";
   int S = (int)levels.size(), n = f.n;
   int Cs = (int)M.meta(P + ".seqChannels"), Cse = (int)M.meta("diffusion.seqChannels"), perToken = (int)M.meta("diffusion.perTokenChannels");
@@ -1849,7 +1866,7 @@ inline void precomputeConditioning(DiffusionFold& f, const std::vector<float>& l
   // every step's at once is steps x tokens rows - 1.8 GB at 100 steps and 2900 tokens - so where that does
   // not fit with room to spare each step makes its own (denoiseCore's !usePre path; a few small kernels)
   f.preSingle = f.preSnProj = nullptr;
-  if (!roomFor((size_t)S * n * (2 * Cs + perToken) * 4, { "pre.single", "pre.snProj", "pre.sn" })) {
+  if (!lever("diff.precompute", (size_t)S * n * (2 * Cs + perToken) * 4, { "pre.single", "pre.snProj", "pre.sn" })) {
     releaseScratch({ "pre." }); f.usePre = false; return;
   }
   size_t nc = lenW(P + ".fourierWeight");
@@ -1870,7 +1887,7 @@ inline void precomputeConditioning(DiffusionFold& f, const std::vector<float>& l
   float* sn = scratch<float>("pre.sn", rows * Cs);
   singleCondEmbeddingNorm(f.preSingle, sn, rows, Cs);
   linear<float, float>(sn, f.preSnProj, rows, Cs, perToken, "diffusion.singleCondEmbeddingProjection");
-  if (tightPair((size_t)n * n, 128)) releaseScratch({ "pre.lv", "pre.e", "pre.en", "pre.proj", "pre.sn" });
+  releaseScratch({ "pre.lv", "pre.e", "pre.en", "pre.proj", "pre.sn" });
   scratch<float>("dc.single", (size_t)n * Cs); scratch<float>("dn.snProj", (size_t)n * perToken);   // a step's slices land here
   f.preLevels = levels; f.usePre = true;
   // 🔴 NOT the transformer's two conditioning GEMMs over every step too: held for the schedule they
@@ -1999,6 +2016,7 @@ __global__ void stepPreCopyK(float* __restrict__ dstNoise, const float* __restri
 // without waiting on the host.
 inline float* denoiseStep(DiffusionFold& f, const float* positionsNoisy, float noiseLevel,
                           const float* deviceLevel = nullptr) {
+  if (!f.preWanted.empty() && f.calls >= 1) { std::vector<float> l; l.swap(f.preWanted); precomputeNow(f, l); }
   if (f.usePre) {           // this step's precomputed conditioning, into the buffers the step reads
     auto at = std::find(f.preLevels.begin(), f.preLevels.end(), noiseLevel);
     if (at == f.preLevels.end()) { fprintf(stderr, "noise level %g was not precomputed\n", noiseLevel); exit(1); }

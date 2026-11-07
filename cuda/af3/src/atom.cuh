@@ -1462,7 +1462,7 @@ inline EncoderOut prepareEncoder(const std::string& E, const std::string& refPre
     int Cz = (int)M.meta(E + ".trunkPairChannels");
     size_t pairs = (size_t)sh.tokens * sh.tokens;
     // (in row chunks on a card short of room: the normalised pair is read once, by this projection)
-    size_t per = shortPair(pairs, Cz) ? std::max<size_t>(1, std::min(pairs, CHUNK / Cz)) : pairs;
+    size_t per = shortPair("lean.diffusion", pairs, Cz) ? std::max<size_t>(1, std::min(pairs, CHUNK / Cz)) : pairs;
     float* ln = scratch<float>("enc.tpln", per * Cz);
     tp = scratch<float>("enc.tp", pairs * Cp);
     for (size_t r0 = 0; r0 < pairs; r0 += per) {

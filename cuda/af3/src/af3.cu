@@ -33,10 +33,10 @@ inline bool pairStays16(int n, int C, bool fast) {
   if (widen) return false;
   size_t pairs = (size_t)n * n;
   Trunk probe{}; probe.n = n; probe.C = C;
-  return fast && DIFF_HALF && CONF_HALF && pair16Eligible(probe) && shortPair(pairs, C) &&
+  return fast && DIFF_HALF && CONF_HALF && pair16Eligible(probe) && shortPair("lean.pair16", pairs, C) &&
          !M.flag("trunk.dialect.structuralTokens") &&
          hasW("diffusion.encoder.embedTrunkPairCond") &&
-         shortPair(pairs, (int)M.meta("diffusion.conditioning.pairChannels")) && (int)M.meta("confidence.pairChannels") == C;
+         shortPair("lean.pair16", pairs, (int)M.meta("diffusion.conditioning.pairChannels")) && (int)M.meta("confidence.pairChannels") == C;
 }
 
 // several GPUs on a sharded pair, at the trunk's or the sampler's end: every rank's rows onto rank 0 into a whole bf16
@@ -64,6 +64,8 @@ static int foldMain(int argc, char** argv) {
   // the big-input paths when 18x the f32 pair does not fit the room (common.cuh, shortPair);
   // LOCALFOLD_SHORT_PAIR_TIMES=0 is the old 64th-of-the-card rule
   SHORT_PAIR_TIMES = getenv("LOCALFOLD_SHORT_PAIR_TIMES") ? atof(getenv("LOCALFOLD_SHORT_PAIR_TIMES")) : 18;
+  // a fixed amount kept spare beside a whole form, not a fraction of the card (common.cuh, MEM_RESERVE)
+  MEM_RESERVE = (size_t)1 << 30;
   // the trunk's modules' large scratch shared between them (common.cuh, SHARED SCRATCH): every family below proved by a
   // scribbled fold bit-identical to the unshared one - one GPU and sharded, the big-input paths, boltz2, MSA, template
   SHARED_FAMILIES = { "tri.", "grid.", "tr.", "msaatt.", "opm.", "st.", "emb.", "p16.", "tmpl." };
@@ -92,6 +94,7 @@ static int foldMain(int argc, char** argv) {
   bool waitForever = false; // ...for as long as it takes: --wait-input=0, which the standalone mode passes - its featuriser
                             // is a thread of this process that always ends in model.idx or model.failed, and an MMseqs2
                             // queue can outlast any timeout
+  bool planReport = false; double memoryGB = 0;
   std::string serveDir;     // --serve=DIR: stay up, the weights resident, folding each job dropped in DIR
   for (int i = 2; i < argc; ++i) {
     if (!strcmp(argv[i], "--fast")) fast = DIFF_HALF = ATOM_HALF = CONF_HALF = F32_TF32 = true;
@@ -113,6 +116,13 @@ static int foldMain(int argc, char** argv) {
     else if (!strncmp(argv[i], "--folds=", 8)) folds = atoi(argv[i] + 8);
     else if (!strncmp(argv[i], "--steps=", 8)) steps = atoi(argv[i] + 8);
     else if (!strncmp(argv[i], "--recycles=", 11)) recycles = atoi(argv[i] + 11);
+    else if (!strcmp(argv[i], "--plan")) planReport = true;
+    else if (!strncmp(argv[i], "--memory=", 9)) memoryGB = atof(argv[i] + 9);   // GB this process may hold (common.cuh, MEM_BUDGET)      // the memory levers each fold took (common.cuh, lever)
+    else if (!strncmp(argv[i], "--lever=", 8)) {                 // --lever=<name>=0|1: one forced (to measure its worth)
+      const char* eq = strrchr(argv[i] + 8, '=');
+      if (!eq || (eq[1] != '0' && eq[1] != '1') || eq[2]) { fprintf(stderr, "%s: --lever=<name>=0|1\n", argv[i]); return 1; }
+      LEVER_FORCED[std::string(argv[i] + 8, (size_t)(eq - (argv[i] + 8)))] = eq[1] == '1';
+    }
     else if (!strncmp(argv[i], "--recycle-tolerance=", 20)) recycleTolerance = atof(argv[i] + 20);   // angstroms; 0 off
     else if (!strncmp(argv[i], "--samples=", 10)) samples = atoi(argv[i] + 10);
     else if (!strcmp(argv[i], "--af3-defaults")) af3Defaults = true;
@@ -137,6 +147,7 @@ static int foldMain(int argc, char** argv) {
              !strncmp(argv[i], "--bench-", 8)) {}                                 // (read by their own loops below)
     else { fprintf(stderr, "unknown flag %s\n", argv[i]); return 1; }     // (as af2 and ef2 refuse one)
   }
+  if (memoryGB > 0) memBudget((size_t)(memoryGB * 1e9));     // (before the weights: they count)
   auto t0 = std::chrono::steady_clock::now();
   // a batch: `af3 dir1,dir2,... --out=a.pdb,b.pdb` folds each input in this one process, the weights
   // loaded once and every kernel, weight copy and cuBLAS plan warm after the first
@@ -415,7 +426,7 @@ static int foldMain(int argc, char** argv) {
     const double C = M.meta("trunk.embedder.pairChannels");
     size_t f, t; deviceMemInfo(&f, &t);
     for (auto& [name, slot] : SCRATCH) f += slot.second;
-    const double pairs = 6 * C * ((double)ns * ns + (double)tokens * tokens), spare = (double)t / 20;
+    const double pairs = 6 * C * ((double)ns * ns + (double)tokens * tokens), spare = (double)spareKept(t, 20);
     if (pairs + spare > (double)f) {
       const int most = (double)f > spare ? (int)(tokens * std::sqrt(((double)f - spare) / pairs)) : 0;
       fprintf(stderr, "%d tokens do not fit this card: OpenDDE folds them on %d structural tokens, which needs ~%.1f GB "
@@ -436,7 +447,7 @@ static int foldMain(int argc, char** argv) {
   // 10,344-token fold fit an 80 GB A100 and its whole diffusion wanted ~85 GB; sharded, several samples batch as well
   const auto wholeDiffusionFits = [](int n, int C) {
     size_t f, t; deviceMemInfo(&f, &t);
-    return (double)n * n * C * 4 * 1.5 + (double)t / 20 <= (double)f;
+    return (double)n * n * C * 4 * 1.5 + (double)spareKept(t, 20) <= (double)f;
   };
   const bool oneCardPast = mg::WORLD > 1 && sh::ON && (shardDiff ? !atoi(shardDiff) : tokens < 512 || !oneSample) &&
     foldFits(tokens, (int)M.meta("trunk.embedder.pairChannels"), doFold && pairStays16(tokens, (int)M.meta("trunk.embedder.pairChannels"), fast), true) &&
@@ -455,8 +466,7 @@ static int foldMain(int argc, char** argv) {
   t.drawSeed = seedList[0];
   // (its atom encoder's scratch given back at once where the pair is large - nothing reads it once target_feat is
   // built, and held into the template stack it was 3.4 GB of a simulated rank of 4's out-of-memory at 10,868 tokens)
-  if (tightPair((size_t)tokens * tokens, (int)M.meta("trunk.embedder.pairChannels")))
-    releaseScratch({ "targetFeat.encoder.", "enc.", "apl." });
+  releaseScratch({ "targetFeat.encoder.", "enc.", "apl." });
   if (mg::WORLD > 1) {
     // several GPUs (LOCALFOLD_GPUS, multigpu.cuh): the trunk pair in a buffer every rank can read, the pair updates'
     // work split between them; the rest of the fold on rank 0
@@ -482,6 +492,7 @@ static int foldMain(int argc, char** argv) {
     }
   }
   memReport("trunk built");
+  MEM_PHASE = "trunk";
   printf("trunk: %d tokens, %d MSA rows, pair %d, single %d, msa %d; %s path\n", t.n, t.S, t.C, t.Cs, t.Cm,
          fast ? "f16" : "f32");
   if (t.native && t.drawn) printf("trunk: protenix's MSA draw - a count of 1 to %d rows %s\n", t.P, t.drawMode == "once" ? "once, for every pass" : "afresh each pass");
@@ -589,7 +600,10 @@ static int foldMain(int argc, char** argv) {
       passesRun = pass + 1;
       return true;
     };
+    LEVERS.clear(); MEM_PHASE = "trunk";
+    SCRATCH_DIRECT = shortPairRule((size_t)t.n * t.n, t.C);
     ROOM_ANSWERED.clear();     // (a fold's own eager answers only: a resident server's last job asked on another card state)
+    bool recycledEagerly = false, graphRefused = false;     // (a capture is sized by an eager recycle pass before it)
     for (int pass = 0; pass <= lastPass; ++pass) {
       drawMsa(t);                   // (this pass's MSA rows, before - never inside - the captured graph)
       if (pass == 0) {
@@ -605,8 +619,10 @@ static int foldMain(int argc, char** argv) {
       // the ranks have a GPU each; a rank's kernels are an eighth as long, so the launches are a larger share)
       const bool shardGraph = sharded(t) && !noGraphs && !mg::SHARED_DEVICE;
       // (nor protenix's: its MSA's row count and its dropout's key change pass to pass, which a replayed graph would fix)
-      if (!(GRAPHS || shardGraph) || STAGES || !(lastPass >= 7 || t.n >= 200) || shortPair((size_t)t.n * t.n, t.C) || t.native || t.mcOn) {
-        recyclePass(); afterPass(pass); if (converged(pass)) break; continue;
+      if (!(GRAPHS || shardGraph) || STAGES || !(lastPass >= 7 || t.n >= 200) || shortPair("lean.graph", (size_t)t.n * t.n, t.C) || t.native || t.mcOn ||
+          (!trunkGraph && (!recycledEagerly || graphRefused || (graphRefused = !sizeScratchForCapture())))) {
+        SCRATCH_ASKED.clear();
+        recyclePass(); recycledEagerly = true; afterPass(pass); if (converged(pass)) break; continue;
       }
       if (!trunkGraph) {
         cudaGraph_t g;
@@ -718,25 +734,30 @@ static int foldMain(int argc, char** argv) {
       // (a large input's trunk scratch given back BEFORE the expansion, not after: its structural pair - ~2 tokens a
       // residue - takes two f32 [pairs, C] buffers of its own, 6.8 GB each at 1080 residues, which beside the trunk's
       // ordinary-path scratch ran out of a 40 GB card)
-      if (tightPair(pairs, t.C)) releaseScratch();
+      releaseScratch();
       st = expandStructural(t.single, t.pair, t.targetFeat, t.n, fast);
       swapBatch();
       dS = st.single; dP = st.pair; dTf = st.targetFeat; dSeq = st.seqMask; nD = st.n;
     }
     int dense = (int)M.meta("batch.dense");
     std::vector<float> mask(M.f("batch.predDenseAtomMask"), M.f("batch.predDenseAtomMask") + (size_t)nD * dense);
-    // a large input gives each phase the whole card: a pair over 128 MB, 512 tokens at 128 channels
-    // (at 1 GB, 1044 tokens peaked at 21.3 GB with the trunk's 8 GB of scratch held to the end)
-    bool tight = tightPair(pairs, t.C);
-    if (tight) releaseScratch();
+    // each phase gets the whole card: the trunk's scratch given back before the diffusion (held to the end, 1044 tokens
+    // peaked at 21.3 GB with the trunk's 8 GB of it)
+    MEM_PHASE = "diffusion";
+    releaseScratch();
     // on a card short of room the trunk's pair waits in host memory from here to the confidence head: the
     // streamed preparation reads it a chunk of rows at a time and the sampler not at all
     // (only where the preparation streams: the f16 path, and an encoder that takes the pair's projection)
-    if (!structural && !sharded(t) && keptLo < 0 && DIFF_HALF && hasW("diffusion.encoder.embedTrunkPairCond") && shortPair(pairs, t.C) &&
-        parkWorthIt(pairs * t.C * (TRUNK_PAIR16 ? 2 : 4) + diffusionPrepBytes(pairs))) {
+    // ...and where parking it would make room for every block's biases held whole and keeping it would not, it is
+    // parked for them: the biases are worth more (8,192 tokens on the GH200: diffusion 82.4 -> 42.9 s with the pair
+    // parked and the biases held, where the pair kept had left the biases a super block at a time)
+    const size_t pairB = pairs * t.C * (TRUNK_PAIR16 ? 2 : 4), prepB = diffusionPrepBytes(pairs), biasB = diffusionBiasBytes(nD);
+    const bool biasesIfParked = roomFor(othersReserved("diff.pairOnCard") + prepB + (biasB > pairB ? biasB - pairB : 0));
+    if (!structural && !sharded(t) && keptLo < 0 && DIFF_HALF && hasW("diffusion.encoder.embedTrunkPairCond") && shortPair("lean.diffusion", pairs, t.C) &&
+        parkWorthIt("diff.pairOnCard", pairB + prepB + (biasesIfParked ? biasB : 0))) {
       // (the room asked for is the pair's AND what the preparation will hold beside it - asked for the pair alone, a
       // 6,916-token fold kept its 12.2 GB bf16 pair on the device and ran out in the preparation)
-      parkToHost(t.pair, pairs * t.C * (TRUNK_PAIR16 ? 2 : 4)); dP = nullptr;
+      parkToHost(t.pair, pairB); dP = nullptr;
     }
     if (sharded(t)) {                    // the diffusion's conditioning and token attention on this rank's rows
       if (structural) { fprintf(stderr, "a sharded pair: not OpenDDE\n"); return 1; }
@@ -746,7 +767,7 @@ static int foldMain(int argc, char** argv) {
       // ...and short of room, this rank's share of the trunk pair waits in host memory from here: the streamed
       // preparation reads it a chunk of rows at a time from there and the sampler not at all (the one-GPU park's twin;
       // 9 GB a rank at 11,856 tokens on 4) - back for the contacts and the confidence head
-      if (keptLo < 0 && shortPair(pairs, t.C)) {
+      if (keptLo < 0 && shortPair("lean.diffusion", pairs, t.C)) {
         parkShare(t); dP = nullptr;
       }
     }
@@ -764,16 +785,16 @@ static int foldMain(int argc, char** argv) {
     // ...and the encoder's per-token-pair projection and its pair MLP's temporaries, which only its preparation
     // reads (folded into the atom pairs' conditioning): held through every step they were 8.8 GB of the
     // sampler's peak at 10761 tokens (branch tier2-host-pair)
-    if (tight) releaseScratch({ "dt.pn", "dt.flat", "enc.tpln", "enc.tp", "enc.h1", "enc.h2" });
+    releaseScratch({ "dt.pn", "dt.flat", "enc.tpln", "enc.tp", "enc.h1", "enc.h2" });
     // ...and on a card short of room the conditioning pair itself: the steps read the precomputed
     // single conditioning, the prepared encoder and the cached logits, never the pair (DCACHE stays
     // ready - its single base is what a later batch's precompute reads)
-    if (shortPair((size_t)nD * nD, (int)M.meta("diffusion.conditioning.pairChannels"))) {
+    if (shortPair("lean.diffusion", (size_t)nD * nD, (int)M.meta("diffusion.conditioning.pairChannels"))) {
       releaseScratch({ "dc.pair" }); DCACHE.pair = nullptr;
       // ...the preparation's chunk buffers (a fixed cost that matters only here), and the trunk's pair: the
       // sampler never reads it, so on a card short of room it waits in host memory for the confidence head
       releaseScratch({ "dc.f2", "dc.f2n", "dc.pairChunk", "dc.rel", "dc.relProj", "dc.tln", "dc.tproj", "pt." });
-      if (!structural && !sharded(t) && keptLo < 0 && t.pair && parkWorthIt(pairs * t.C * (TRUNK_PAIR16 ? 2 : 4))) {
+      if (!structural && !sharded(t) && keptLo < 0 && t.pair && parkWorthIt("diff.pairOnCardAfter", pairs * t.C * (TRUNK_PAIR16 ? 2 : 4))) {
         parkToHost(t.pair, pairs * t.C * (TRUNK_PAIR16 ? 2 : 4)); df.trunkPair = nullptr;
       }
     }
@@ -861,7 +882,7 @@ static int foldMain(int argc, char** argv) {
     // nothing after the sampler - the next batch makes its own - and held to the end it left the confidence
     // head short of room (freed here, before the sharded head too, not after it)
     if (df.preSingle) {
-      if (tight || sharded(t)) releaseScratch({ "pre." });
+      releaseScratch({ "pre." });
       df.preSingle = df.preSnProj = nullptr;
     }
     if (SHARE_PARKED) { releaseScratch(); unparkShare(t); }     // (the share home, for the heads)
@@ -962,7 +983,7 @@ static int foldMain(int argc, char** argv) {
         const size_t pc = (size_t)t.n * t.n * t.C, nn = (size_t)t.n * t.n;
         const int W = mg::WORLD;
         SHORT_PAIR_SHARE = 1;                 // (the one-GPU head, the whole pair: bf16 only where it is short of room)
-        const bool p16 = shortPair(nn, t.C);
+        const bool p16 = shortPair("lean.pair16", nn, t.C);
         float* head = whole;
         if (!p16) { head = dalloc(pc); fromBf16K<<<blocks(pc), 256, 0, STREAM>>>(reinterpret_cast<const __nv_bfloat16*>(whole), head, pc); }
         const bool was16 = TRUNK_PAIR16; TRUNK_PAIR16 = p16;
@@ -994,7 +1015,8 @@ static int foldMain(int argc, char** argv) {
     NS = 1;
     releaseConcatCopies(); memReport("diffusion");
     diffMs += ms(s0, clock());
-    if (tight) releaseScratch();
+    MEM_PHASE = "confidence";
+    releaseScratch();
     size_t atoms3 = mask.size() * 3;
     // the confidence head reads the pseudo-beta of the token space it runs in
     std::vector<int> pbIdx(M.i("batch.tokenAtomsToPseudoBeta.indices"), M.i("batch.tokenAtomsToPseudoBeta.indices") + nD);
@@ -1038,14 +1060,16 @@ static int foldMain(int argc, char** argv) {
         }
         xk = std::move(xr);
         ck.pae.resize((size_t)t.n * t.n); ck.pde.resize((size_t)t.n * t.n);
-        std::vector<float> term((size_t)t.n * t.n);
+        std::vector<float> term((size_t)t.n * t.n), chainTerm((size_t)t.n * t.n);
         for (int i = 0; i < t.n; ++i) for (int j = 0; j < t.n; ++j) {
           size_t from = (size_t)rep[i] * nD + rep[j], to = (size_t)i * t.n + j;
-          ck.pae[to] = dc.pae[from]; ck.pde[to] = dc.pde[from]; term[to] = dc.tmTerm[from];
+          ck.pae[to] = dc.pae[from]; ck.pde[to] = dc.pde[from]; term[to] = dc.tmTerm[from]; chainTerm[to] = dc.tmChain[from];
         }
+        const std::vector<char> frame = tokenFrameMask(t.n);   // (pTM's anchors: AF3's pae_single_mask)
         auto reduce = [&](bool interOnly) {
           double bestTm = -1e30; bool any = false;
           for (int i = 0; i < t.n; ++i) {
+            if (!frame[i]) continue;
             double tot = 0; int cnt = 0;
             for (int j = 0; j < t.n; ++j) {
               if (interOnly && resAsym[i] == resAsym[j]) continue;
@@ -1057,7 +1081,8 @@ static int foldMain(int argc, char** argv) {
           return any ? bestTm : NAN;
         };
         ck.ptm = reduce(false); ck.iptm = familyIptm(reduce(true));
-        ck.tmTerm = term;
+        if (getenv("AF3_PAE_OUT")) ck.tmGlobal = term;
+        ck.tmTerm = std::move(chainTerm);   // (the chain-level scores' term: ConfidenceOut's)
         const float* am = M.f("batch.predDenseAtomMask");
         double sum = 0, count = 0;
         for (size_t a = 0; a < ck.plddt.size(); ++a) if (am[a]) { sum += ck.plddt[a]; count += 1; }
@@ -1069,7 +1094,7 @@ static int foldMain(int argc, char** argv) {
         // the last confidence call of a fold short of room works in the trunk's pair (nothing reads it after)
         bool last = c0 + k + 1 == runs.size();
         ck = confidenceHead(t.pair, t.single, t.targetFeat, dBeta, t.seqMask, t.pairMask, t.n,
-                            last && shortPair((size_t)t.n * t.n, t.C));
+                            last && shortPair("lean.confidence", (size_t)t.n * t.n, t.C));
         releaseConcatCopies(); memReport("confidence");
         }
       }
@@ -1128,10 +1153,14 @@ static int foldMain(int argc, char** argv) {
     if (out != "/dev/null") writeConfidences(out, order, t.n, dense, conf.plddt, conf.pae, conf.tmTerm, bestContact, conf.ptm,
                                              conf.iptm, bestScore, conf.meanPlddt, bestSS.clash, bestSS.disordered);
     if (many) printf("  best: seed %llu sample %d\n", (unsigned long long)bestSeed, best);
-    if (const char* pp = getenv("AF3_PAE_OUT")) {   // the raw PAE/PDE/pLDDT, for comparing two arms
-      FILE* pf = fopen(pp, "wb");
+    if (const char* pp = getenv("AF3_PAE_OUT")) {   // the raw PAE/PDE/pLDDT, for comparing two arms; then the TM terms
+      FILE* pf = fopen(pp, "wb");                    // (interface, global) and the frames' mask, for check_chain_ptm.py
       fwrite(conf.pae.data(), 4, conf.pae.size(), pf); fwrite(conf.pde.data(), 4, conf.pde.size(), pf);
-      fwrite(conf.plddt.data(), 4, conf.plddt.size(), pf); fclose(pf);
+      fwrite(conf.plddt.data(), 4, conf.plddt.size(), pf);
+      fwrite(conf.tmTerm.data(), 4, conf.tmTerm.size(), pf); fwrite(conf.tmGlobal.data(), 4, conf.tmGlobal.size(), pf);
+      const std::vector<char> fm = tokenFrameMask(t.n);
+      for (char c : fm) { const float v = c ? 1.f : 0.f; fwrite(&v, 4, 1, pf); }
+      fclose(pf);
     }
     if (STAGES) {
       double total = 0; for (auto& [k, v] : STAGE_MS) total += v;
@@ -1141,12 +1170,13 @@ static int foldMain(int argc, char** argv) {
     printf("fold %d: trunk %.1f ms (%d passes%s), diffusion %.1f ms (%d steps x %d%s), confidence %.1f ms, total %.1f ms\n",
            fi + 1, trunkMs, passesRun, G > 1 ? (" x " + std::to_string(G) + " trunks").c_str() : "", diffMs, steps, samples,
            seedList.size() > 1 ? (" x " + std::to_string(seedList.size()) + " seeds").c_str() : "", confMs, ms(foldStart, f3));
+    if (planReport) { fflush(stdout); leverPlanReport(); }
     if (profiling) prof::stop(40);
     if (fi == 0 && which == 0 && serveDir.empty() && getenv("LOCALFOLD_UNREAD")) unreadWeights();
     }
     if (df.graph) CK(cudaGraphExecDestroy(df.graph));
     df.preSingle = df.preSnProj = nullptr;
-    if (tight) releaseScratch();      // the next fold's trunk starts from the card it had
+    releaseScratch();      // the next fold's trunk starts from the card it had
     if (lastGroup && fi + 1 == folds) return 0;
   }
   std::function<void(const char*, const float*, size_t)> seam = [&](const char* name, const float* d, size_t n) {

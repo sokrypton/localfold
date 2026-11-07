@@ -55,7 +55,7 @@ import {
 import { memoryBudgetBytes, noteAllocation, noteDestroy, residencyAllowed }
   from "../runtime/device-memory.js";
 import { deviceTuning, halfPrecisionAvailable } from "../runtime/device-profile.js";
-import { chainPairTmScores, perChainTmScores, reduceTmScore }
+import { chainPairTmScores, chainTmInfo, perChainTmScores, reduceTmScore, tokenFrameMask }
   from "../../shared/heads/tm-score.js";
 import { sampleOnGpu } from "./diffusion/diffusion-sampler.js";
 import { Af3DiffusionHeadGpu } from "./diffusion/diffusion-head.js";
@@ -1318,6 +1318,8 @@ async function foldHolding(device, batch, weights, options, held) {
     }
     return new Af3ConfidenceHeadGpu(device, options.confidencePrecision ?? {}).run({
       tokens, dense, seqMask, pair: trunk.pair, single: trunk.single, targetFeat, pseudoBeta,
+      // (the chains AF3's interface TM term is keyed on: chain_pair_iptm, chain_ptm)
+      asymId: batch.asymId,
       // ...the trunk's own pair, copied on the device rather than uploaded
       // again. Not on OpenDDE's path: its expander has already released it.
       ...(finalPair === undefined || structural !== undefined ? {} : {
@@ -1416,6 +1418,15 @@ async function foldHolding(device, batch, weights, options, held) {
       coordinates, seqMask: structural.structural.seqMask,
       atomToToken, atomToSlot, atomCount: n * dense,
       extraPairBias: structural.attentionBias,
+      // AF3's interface TM term's tables (chain_pair_iptm, chain_ptm): each structural token in its parent
+      // residue's chain, d0 from the RESIDUE tokens' counts - af3-any-model gathers the logits to residue
+      // pairs before tmscore_adjusted_pae, and the term is a function of each pair's logits alone
+      tmChainInfo: chainTmInfo(
+        Array.from(layout.parent, (from) => (from >= 0 ? batch.asymId[from] : -1)),
+        Array.from(layout.parent, (from) => (from >= 0 ? batch.seqMask[from] : 0)),
+        Array.from({ length: weights.openddeConfidence.paeBins },
+          (unused, bin) => (32 / weights.openddeConfidence.paeBins) * (bin + 0.5)),
+        { chainOf: batch.asymId, live: batch.seqMask }),
       // 🔴 THE TOKEN COUNT pTM IS REPORTED OVER, which is the RESIDUE tokens
       // and not this head's structural ones: d0 is a function of how many
       // tokens the score covers, and the two part company the moment a ligand
@@ -1446,10 +1457,12 @@ async function foldHolding(device, batch, weights, options, held) {
     // ...and the TM-adjusted PAE through the same gather, because pTM is
     // reduced over the residue tokens the rest of the pipeline reports.
     const tmAdjusted = raw.tm === undefined ? undefined : new Float32Array(tokens * tokens);
+    const tmInterface = raw.tmChain === undefined ? undefined : new Float32Array(tokens * tokens);
     if (tmAdjusted !== undefined) {
       for (let i = 0; i < tokens; i += 1) {
         for (let j = 0; j < tokens; j += 1) {
           tmAdjusted[i * tokens + j] = raw.tm[rep[i] * n + rep[j]];
+          if (tmInterface !== undefined) tmInterface[i * tokens + j] = raw.tmChain[rep[i] * n + rep[j]];
         }
       }
     }
@@ -1472,7 +1485,7 @@ async function foldHolding(device, batch, weights, options, held) {
     // still have to reach the same pTM/ipTM the rest of the pipeline reports".
     // What was missing here was the DISTRIBUTION: the readout kept the
     // expectation and dropped the logits, so there was nothing left to adjust.
-    return { plddt, pae, tmAdjusted, opendde: raw, confidenceInputs,
+    return { plddt, pae, tmAdjusted, tmInterface, opendde: raw, confidenceInputs,
              coordinateCheck: { live, tokens: n, span: Number(span.toFixed(3)) } };
   };
 
@@ -1549,7 +1562,11 @@ async function foldHolding(device, batch, weights, options, held) {
     // `tmTokens` above), and the only head left without one is a model with
     // no confidence head at all - where `scores` itself is absent.
     const asymId = batch.asymId;
-    const selected = (i, j) => seqMask[i] > 0 && seqMask[j] > 0;
+    // 🔴 THE ANCHORS ARE THE TOKENS WITH FRAMES, AlphaFold 3's pae_single_mask:
+    // an ion's row aligns nothing (tokenFrameMask).
+    const frame = tokenFrameMask({ tokens, dense, isLigand: batch.isLigand, asymId,
+      residueIndex: batch.residueIndex, refPos: batch.refPos, refMask: batch.refMask });
+    const selected = (i, j) => seqMask[i] > 0 && seqMask[j] > 0 && frame[i] === 1;
     if (scores.tmAdjusted !== undefined) {
     ptm = reduceTmScore(scores.tmAdjusted, tokens, selected);
     // NaN for one chain, because there is no interface to score. Zero would
@@ -1560,11 +1577,15 @@ async function foldHolding(device, batch, weights, options, held) {
     // more than two chains `iptm` counts every cross-chain pair equally, so an
     // assembly holding both a native dimer and a designed binder reports the
     // easy interface's confidence for the hard one. See chainPairTmScores.
+    // 🔴 ON AF3's INTERFACE TERM - d0 from the pair's own chains, not every
+    // token's - as its chain_pair_iptm is; on the global one a short chain in a
+    // large complex read ~0.10 high (reported by Yeqing Lin).
+    if (scores.tmInterface === undefined) throw new Error("the confidence head returned no interface TM term");
     chainPairIptm = Object.fromEntries(
-      chainPairTmScores(scores.tmAdjusted, tokens, asymId, seqMask).scores);
+      chainPairTmScores(scores.tmInterface, tokens, asymId, seqMask, frame).scores);
     // ...and each chain on its own: how well it folded, and how well it sits
     // against everything else. The AlphaFold 3 server writes both.
-    const perChain = perChainTmScores(scores.tmAdjusted, tokens, asymId, seqMask);
+    const perChain = perChainTmScores(scores.tmInterface, tokens, asymId, seqMask, frame);
     chainPtm = Object.fromEntries(perChain.chainPtm);
     chainIptm = Object.fromEntries(perChain.chainIptm);
     }

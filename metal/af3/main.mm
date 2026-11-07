@@ -107,15 +107,17 @@ ConfidenceOut structuralConfidence(Structural& st, const float* coords, std::vec
   }
   xk = std::move(xr);
   ck.pae.resize((size_t)nRes * nRes); ck.pde.resize((size_t)nRes * nRes);
-  std::vector<float> term((size_t)nRes * nRes);
+  std::vector<float> term((size_t)nRes * nRes), chainTerm((size_t)nRes * nRes);
   for (int i = 0; i < nRes; ++i)
     for (int j = 0; j < nRes; ++j) {
       size_t from = (size_t)rep[i] * nD + rep[j], to = (size_t)i * nRes + j;
-      ck.pae[to] = dc.pae[from]; ck.pde[to] = dc.pde[from]; term[to] = dc.tmTerm[from];
+      ck.pae[to] = dc.pae[from]; ck.pde[to] = dc.pde[from]; term[to] = dc.tmTerm[from]; chainTerm[to] = dc.tmChain[from];
     }
+  const std::vector<char> frame = tokenFrameMask(nRes);   // (pTM's anchors: AF3's pae_single_mask)
   auto reduce = [&](bool interOnly) {
     double bestTm = -1e30; bool any = false;
     for (int i = 0; i < nRes; ++i) {
+      if (!frame[i]) continue;
       double tot = 0; int cnt = 0;
       for (int j = 0; j < nRes; ++j) { if (interOnly && resAsym[i] == resAsym[j]) continue; tot += term[(size_t)i * nRes + j]; ++cnt; }
       if (cnt && std::isnan(tot / cnt)) return (double)NAN;     // (std::max passes a NaN by: the score must not)
@@ -124,7 +126,7 @@ ConfidenceOut structuralConfidence(Structural& st, const float* coords, std::vec
     return any ? bestTm : NAN;
   };
   ck.ptm = reduce(false); ck.iptm = familyIptm(reduce(true));
-  ck.tmTerm = term;
+  ck.tmTerm = std::move(chainTerm);   // (the chain-level scores': the interface term)
   const float* am = M.hostF("batch.predDenseAtomMask");
   double sum = 0, count = 0;
   for (size_t a = 0; a < ck.plddt.size(); ++a) if (am[a]) { sum += ck.plddt[a]; count += 1; }

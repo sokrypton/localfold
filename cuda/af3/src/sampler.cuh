@@ -4,6 +4,7 @@
 #include <charconv>
 #include "diffusion.cuh"
 #include "rigid.cuh"
+#include "frames.cuh"
 #include <random>
 #include <condition_variable>
 #include <deque>
@@ -730,11 +731,13 @@ inline void writeConfidences(const std::string& pdbPath, const std::vector<size_
       for (int j = 0; j < n; ++j) if (seq[j] > 0 && chainOf[j] < nc) r[chainOf[j]] += tmTerm[(size_t)i * n + j];
     }
   // max over the anchors of chain `from` (or every chain but it, `others`) of their mean over chain `to`'s pairs (or
-  // over every chain but `to`'s, `notTo`); NaN when nothing is selected
+  // over every chain but `to`'s, `notTo`); NaN when nothing is selected. The anchors the tokens with frames (AF3's
+  // pae_single_mask: an ion's row aligns nothing); tmTerm the INTERFACE term, d0 a chain pair's (confidence.cuh)
+  const std::vector<char> frame = tokenFrameMask(n);
   auto best = [&](int from, bool others, int to, bool notTo) {
     double top = -1e30; bool any = false;
     for (int i = 0; i < n; ++i) {
-      if (!(seq[i] > 0) || chainOf[i] >= nc || (others ? chainOf[i] == from : chainOf[i] != from)) continue;
+      if (!(seq[i] > 0) || !frame[i] || chainOf[i] >= nc || (others ? chainOf[i] == from : chainOf[i] != from)) continue;
       const double* r = rowSum.data() + (size_t)i * nc;
       double total = 0; int count = 0;
       if (notTo) { for (int b = 0; b < nc; ++b) if (b != to) { total += r[b]; count += chainCount[b]; } }
@@ -745,11 +748,18 @@ inline void writeConfidences(const std::string& pdbPath, const std::vector<size_
   };
   auto maxNan = [](double x, double y) { return std::isnan(x) ? y : std::isnan(y) ? x : std::max(x, y); };
   auto num = [](FILE* f, double v) { if (std::isfinite(v)) fprintf(f, "%.2f", v); else fprintf(f, "null"); };
-  std::vector<double> chainPtm(nc, NAN), chainIptm(nc, NAN);
+  // chain_pair_iptm (confidences.py's chain_pairwise_predicted_tm_scores): on the diagonal the chain's pTM, off it the
+  // pair's ipTM - anchors in either chain over the other; chain_iptm (iptm_xchain) the mean of a chain's row of it off
+  // the diagonal, NaN ones left out
+  std::vector<double> chainPtm(nc, NAN), chainIptm(nc, NAN), pairIptm((size_t)nc * nc, NAN);
+  for (int a = 0; a < nc && !tmTerm.empty(); ++a)
+    for (int b = 0; b < nc; ++b)
+      pairIptm[(size_t)a * nc + b] = a == b ? best(a, false, a, false) : maxNan(best(a, false, b, false), best(b, false, a, false));
   for (int a = 0; a < nc && !tmTerm.empty(); ++a) {
-    chainPtm[a] = best(a, false, a, false);
-    // (asym[i] == c) != (asym[j] == c): anchors in c over the other chains, and anchors elsewhere over c
-    chainIptm[a] = maxNan(best(a, false, a, true), best(a, true, a, false));
+    chainPtm[a] = pairIptm[(size_t)a * nc + a];
+    double sum = 0; int cnt = 0;
+    for (int b = 0; b < nc; ++b) if (b != a && std::isfinite(pairIptm[(size_t)a * nc + b])) { sum += pairIptm[(size_t)a * nc + b]; ++cnt; }
+    chainIptm[a] = cnt ? sum / cnt : NAN;
   }
   f = fopen((stem + "_summary_confidences.json").c_str(), "w");
   fprintf(f, "{\n  \"chain_ids\": [");
@@ -761,8 +771,7 @@ inline void writeConfidences(const std::string& pdbPath, const std::vector<size_
       fprintf(f, "%s[", a ? ", " : "");
       for (int b = 0; b < nc; ++b) {
         if (b) fprintf(f, ", ");
-        if (a == b) { num(f, chainPtm[a]); continue; }        // the diagonal is the chain's own pTM
-        num(f, maxNan(best(a, false, b, false), best(b, false, a, false)));
+        num(f, pairIptm[(size_t)a * nc + b]);
       }
       fprintf(f, "]");
     }

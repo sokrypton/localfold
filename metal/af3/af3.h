@@ -233,6 +233,7 @@ bool halfWeight(const std::string& name, size_t elements);
 void reportStages();     // (AF3_STAGES=1: the denoiser's stages timed, a sync between them)
 
 // ---------------------------------------------------------------- the confidence head (confidence.mm)
+// tmTerm: AF3's INTERFACE TM term (frames.h) - the chain-level scores' (output.mm); ptm and iptm off the global one
 struct ConfidenceOut { std::vector<float> plddt, pae, pde, tmTerm; double meanPlddt, ptm, iptm; };
 ConfidenceOut confidenceHead(Trunk& t, const float* pseudoBeta, bool lastSample = false);
 
@@ -240,5 +241,6 @@ ConfidenceOut confidenceHead(Trunk& t, const float* pseudoBeta, bool lastSample 
 struct Structural { int n; float *single, *pair, *targetFeat, *bias, *seqMask, *pairMask; Masks masks; };
 Structural expandStructural(Trunk& t);     // reads the residue batch: before sbatch.* is swapped in
 void freeStructural(Structural& s);
-struct DdeConfidence { std::vector<float> plddt, pae, pde, tmTerm; };
+struct DdeConfidence { std::vector<float> plddt, pae, pde, tmTerm, tmChain; };   // (tmChain: the interface term)
 DdeConfidence ddeConfidence(Structural& st, const float* coords, int dense, int tmTokens, bool lastSample = false);
+#include "frames.h"   // (the pTM conventions: AF3's interface TM term, the frames pTM anchors on)

@@ -17,6 +17,29 @@ is documentation and tooling only.
 
 ## Open, in the order they are worth doing
 
+### Chain-level pTM: fixed on CUDA, the page and Metal; what is left (reported 2026-11-07)
+Reported by Yeqing Lin ("localfold binder pTM bug and fix", against `500165d7`): a short
+binder's `chain_ptm` read ~0.10 high against AF3. Three gaps, all now closed to AF3's own
+functions (`confidence_head.py`'s interface `tmscore_adjusted_pae`, `confidences.py`'s
+`chain_pairwise_predicted_tm_scores` / `get_iptm_xchain`, `model.py`'s `pae_single_mask`):
+the chain-level scores reduce the INTERFACE term (d0 from the pair's own chains), `chain_iptm`
+is the mean of a chain's pair ipTMs, and only tokens with frames anchor.
+
+* **CUDA** `64685f25` - held by `tools/oracle/check_chain_ptm.py --dump=` on five jobs and two
+  OpenDDE folds, exact. The sharded (multi-GPU) head is wired the same way and NOT RUN.
+* **Page** `733d77d8` - `--scores=` off `tools/gpu/fold.js --tm-check`, exact on barnase and
+  calmodulin (OpenBind-0) and OpenDDE; `test/chain-ptm-af3.test.js`. boltz2's page path untested.
+* **Metal** `573a18a0` - **NOT BUILT OR RUN** (no Mac here). The interface term is taken on the
+  host off the PAE logits (`metal/af3/frames.h`). Wants `metal/af3/gate.py` and
+  `check_chain_ptm.py` on Apple silicon; Metal has no `AF3_PAE_OUT` dump yet, so the check is
+  the `--scores`-style comparison or a dump to add.
+* **ESMFold2 (cuda/ef2) is left as it is, on purpose.** ESM's own reference (`esm` 3.4.1,
+  `models/esmfold2/experimental.py`) takes d0 from every token for everything, anchors on every
+  token, has no `chain_ptm`, and its `pair_chains_iptm[c1, c2]` is DIRECTIONAL (rows in c2,
+  columns in c1). Our ef2 matches its `ptm`/`iptm`; its AF3-named `chain_*` fields are an
+  extension with AF3's OLD reduction. Whether they should take AF3's meaning (an interface term
+  kernel in ef2) or ESM's directional matrix is a decision, not a bug fix.
+
 ### The two held-back pages
 `single.html` and `proteinhunter.html` are gitignored and on disk, out of the
 repository and off the site until they are fixed and checked - they were built

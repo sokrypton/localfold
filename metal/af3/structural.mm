@@ -166,6 +166,14 @@ DdeConfidence ddeConfidence(Structural& st, const float* coords, int dense, int 
   run1d("af3_expectation", pairs, ExpectationArgs{logits, pae, nullptr, dPae, tm, dPer, pairs, (uint)paeBins, 0, 1.f, 0});
   DdeConfidence out;
   out.pde = download(pde, pairs); out.pae = download(pae, pairs); out.tmTerm = download(tm, pairs);
+  {   // AF3's interface term (frames.h): each structural token in its parent residue's chain, d0 from the residue counts
+    const int nRes = (int)M.meta("batch.tokens");
+    const int* parent = M.hostI("structural.parent"); const int* rAsym = M.hostI("batch.asymId"); const float* rSeq = M.hostF("batch.seqMask");
+    std::vector<int> chainOf(n, -1); std::vector<float> live(n, 0.f);
+    for (int i = 0; i < n; ++i) if (parent[i] >= 0 && parent[i] < nRes && rSeq[parent[i]] > 0) { chainOf[i] = rAsym[parent[i]]; live[i] = 1.f; }
+    const std::vector<float> lg = download(logits, (size_t)pairs * paeBins);
+    out.tmChain = interfaceTmTerm(lg.data(), n, paeBins, paeC.data(), chainOf.data(), live.data(), rAsym, rSeq, nRes);
+  }
   // pLDDT per atom: the token's normalised single against the matrix of the atom's dense slot
   const half* wk = M.derived<half>("dde.plddtSlotMajor", (size_t)slots * Cs * PB, [&](half* o) {
     run1d("af3_slot_major", (size_t)slots * Cs * PB, SlotMajorArgs{W(P + "plddtWeight"), o, (uint)slots, (uint)Cs, (uint)PB, 0});

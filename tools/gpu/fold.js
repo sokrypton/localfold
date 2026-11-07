@@ -13,6 +13,7 @@
  * against the dump, and the geometry report. The pipeline itself is shared with
  * the page, because the page has to run what was measured.
  */
+import { tokenFrameMask } from "../../shared/heads/tm-score.js";
 import { startFromPdb } from "../../shared/af3/structure/warm-start.js";
 import { memorySnapshot, setMemoryBudget } from "../../webgpu/runtime/device-memory.js";
 import { ccdUrl, parseCcdComponent } from "../../shared/af3/featurise/ccd-component.js";
@@ -914,6 +915,16 @@ export async function main(device, args) {
     meanPlddt: result.meanPlddt,
     ptm: result.ptm,
     iptm: Number.isNaN(result.iptm) ? null : result.iptm,
+    // 🔴 `--tm-check`: what tools/oracle/check_chain_ptm.py --scores holds to AlphaFold 3's own reductions - the
+    // two per-pair TM terms, the anchors' frames and every score reduced from them
+    ...(args.includes("--tm-check") && result.scores?.tmInterface !== undefined ? { tmCheck: {
+      asymId: Array.from(batch.asymId),
+      frame: Array.from(tokenFrameMask({ tokens: batch.tokens, dense: batch.dense, isLigand: batch.isLigand,
+        asymId: batch.asymId, residueIndex: batch.residueIndex, refPos: batch.refPos, refMask: batch.refMask })),
+      tmGlobal: Array.from(result.scores.tmAdjusted), tmInterface: Array.from(result.scores.tmInterface),
+      ptm: result.ptm, iptm: result.iptm, chainPtm: result.chainPtm, chainIptm: result.chainIptm,
+      chainPairIptm: result.chainPairIptm,
+    } } : {}),
     geometry: { nca: { median: nca }, cac: { median: cac }, caca: { median: caca } },
     gyration, seconds: foldSeconds[foldSeconds.length - 1], pdb: result.pdb, trajectory,
     ...(bondTrajectory === null ? {} : { bondTrajectory }),

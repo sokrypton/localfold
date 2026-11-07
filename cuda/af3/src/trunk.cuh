@@ -458,9 +458,10 @@ inline bool foldFits(int n, int C, bool stays16 = false, bool quiet = false) {
   for (auto& [name, slot] : SCRATCH) f += slot.second;
   const bool fusedTri = blockedFused(n, C) && !(C <= 256 && fp8Tensor());
   double perPair = C * 4 * (stays16 ? (fusedTri ? PAIR16_FUSED_FIT_TIMES : PAIR16_FIT_TIMES) : 1.8);
-  size_t need = (size_t)((double)n * n * perPair) + t / 20;
+  const size_t keep = spareKept(t, 20);
+  size_t need = (size_t)((double)n * n * perPair) + keep;
   if (need <= f) return true;
-  int most = f > t / 20 ? (int)std::sqrt((double)(f - t / 20) / perPair) : 0;
+  int most = f > keep ? (int)std::sqrt((double)(f - keep) / perPair) : 0;
   if (quiet) return false;
   fprintf(stderr, "%d tokens do not fit this card: the fold needs ~%.1f GB of it and %.1f GB is free - it folds up to "
           "~%d tokens\n", n, need / 1e9, f / 1e9, most);
@@ -493,7 +494,7 @@ inline void usePair16(Trunk& t, bool on) {
 inline void pairToF32(Trunk& t) {
   if (!t.p16) return;
   size_t pc = (size_t)t.n * t.n * t.C;
-  if (shortPair((size_t)t.n * t.n, t.C)) releaseScratch();   // (near the card's limit: the trunk's scratch first)
+  if (shortPair("lean.release", (size_t)t.n * t.n, t.C)) releaseScratch();   // (near the card's limit: the trunk's scratch first)
   if (t.prevPair) { CK(cudaFreeAsync(t.prevPair, STREAM)); t.prevPair = nullptr; ++MEM_GEN; }
   float* f = poolAlloc(pc);
   fromBf16K<<<blocks((pc & 3) == 0 ? (pc >> 2) : pc), 256, 0, STREAM>>>(reinterpret_cast<const __nv_bfloat16*>(t.pair), f, pc);
@@ -558,7 +559,7 @@ inline Trunk makeTrunk(const float* targetFeatHost, int msaCap, bool wantPair16 
   t.msa = dalloc((size_t)t.S * t.n * t.Cm);
   // on a card short of room the recycled pair is the pair itself, re-embedded in place (embed): no second
   // pair-sized tensor - 9 GB at 4192 tokens - and the first pass starts from a zeroed pair
-  t.inPlaceRecycle = shortPair(pairs, t.C);
+  t.inPlaceRecycle = shortPair("lean.recycleInPlace", pairs, t.C);
   t.prevPair = t.inPlaceRecycle ? nullptr : t.p16 ? reinterpret_cast<float*>(poolAllocT<__nv_bfloat16>(pairs * t.C)) : poolAlloc(pairs * t.C);
   t.prevSingle = dalloc((size_t)t.n * t.Cs);
   CK(cudaMemsetAsync(t.inPlaceRecycle ? t.pair : t.prevPair, 0, pairs * t.C * e, STREAM));
@@ -790,7 +791,7 @@ void embed(Trunk& t, const std::function<void(const char*, const float*, size_t)
     size_t per = std::max<size_t>(1, std::min(pairs, CHUNK / C));
     // (sized for the recycle passes, which take the branch below - whole where the card has the room: the trunk graph
     // is captured on the first of them, and a buffer growing inside a capture killed Chai-1 at 988 tokens)
-    T* ln = scratch<T>("emb.prevln", (t.inPlaceRecycle || shortPair(pairs, C) ? per : pairs) * C);
+    T* ln = scratch<T>("emb.prevln", (t.inPlaceRecycle || shortPair("lean.embed", pairs, C) ? per : pairs) * C);
     float* prev = scratch<float>("emb.prevproj", per * C);
     // (and linearIntoPair's bf16 staging, which those passes' projection into the pair takes - an empty template stack
     // sized it here by chance until it stopped running when no slot counts)
@@ -819,7 +820,7 @@ void embed(Trunk& t, const std::function<void(const char*, const float*, size_t)
   } else {
   // the recycled pair: LayerNorm then projection, which is NOT zero on the first pass - on a card short
   // of room in row chunks
-  bool tight = shortPair(pairs, C);
+  bool tight = shortPair("lean.embed", pairs, C);
   size_t per = tight ? std::max<size_t>(1, std::min(pairs, CHUNK / C)) : pairs;
   T* ln = scratch<T>("emb.prevln", per * C);
   if (t.p16 && !tight) scratch<float>("p16.tmp", std::max<size_t>(1, std::min(per, CHUNK / C)) * C);
@@ -868,7 +869,7 @@ void embed(Trunk& t, const std::function<void(const char*, const float*, size_t)
   }
   bondTypeEmbed(base, hf + hp, C, E, t.p16, hf);
   onSeam("z_init_generic", t.pair, pairs * C);
-  if (shortPair(pairs, C)) releaseScratch({ "emb.prevln", "emb.prevproj", "p16." });   // (not held into the template stack)
+  if (shortPair("lean.release", pairs, C)) releaseScratch({ "emb.prevln", "emb.prevproj", "p16." });   // (not held into the template stack)
   templateEmbedding<T>(t, t.pair);     // its projection accumulated into the pair (it reads the pair first)
   onSeam("z_after_template", t.pair, pairs * C);
   // msa and single
@@ -1043,7 +1044,7 @@ void templateEmbedding(Trunk& t, float* out) {
   // where a rank is short; held from the template stack to the trunk's end they were 9 GB of a 10,127-token rank's
   // 37.4 GB peak, in the MSA stack)
   // (a card short of room alone: its passes run eagerly, where a captured pass holds its buffers for its replays)
-  const bool giveBack = sharded(t) && shortPair((size_t)n * n, Cq);
+  const bool giveBack = sharded(t) && shortPair("lean.template", (size_t)n * n, Cq);
   // (and the trunk's z^T slab, which nothing reads in this stack: its 64-channel f32 slabs are the 128-channel bf16 one's
   // size, so the stack takes it from the pool and gives it back at its end - a slab a rank, 4.7 GB at 13,091 tokens on 8)
   const size_t zTBytes = giveBack && t.zTS ? t.zTS->bytes : 0;
@@ -1067,7 +1068,7 @@ void templateEmbedding(Trunk& t, float* out) {
   // by the projection), which is a pair-sized tensor fewer for a LayerNorm and a narrow GEMM a pass.
   // (asked of the WHOLE pair: shortPair takes a rank's share itself - asked of the held rows, a sharded rank's stack was
   // never short of room and kept its query and LayerNorm whole, 12.4 GB of a simulated rank of 8's 13,832 tokens)
-  bool tight = shortPair(allPairs, Cq);
+  bool tight = shortPair("lean.template", allPairs, Cq);
   size_t per = tight ? std::max<size_t>(1, std::min(pairs, CHUNK / Cq)) : pairs;
   T* ln = scratch<T>("tmpl.ln", per * Cq);
   // one pass that counts (no templates, or one): its normalised activation IS the sum, scaled in place by
@@ -1077,7 +1078,7 @@ void templateEmbedding(Trunk& t, float* out) {
   // a card short of room it waits in host memory while the stack runs - parked BEFORE the activation is made, the query
   // read from the parked copy (pinned, a kernel reads it over the bus, once): made beside the pair, the f32 activation
   // was the card's limit (9,200 tokens on 40 GB: 21.7 GB of it beside the 21.7 GB pair)
-  const bool parked = live == 1 && tight && out == t.pair && !sharded(t) && parkWorthIt(pairs * (size_t)(Cq + Ct) * 4);
+  const bool parked = live == 1 && tight && out == t.pair && !sharded(t) && parkWorthIt("tmpl.pairOnCard", pairs * (size_t)(Cq + Ct) * 4);
   if (parked) { parkToHost(t.pair, pairs * Cq * (t.p16 ? 2 : 4)); out = nullptr; }
   const float* pairSrc = parked ? PARK_HOST : t.pair;
   auto queryInto = [&](float* dst) {
@@ -1665,7 +1666,7 @@ void msaAttentionSharded(Trunk& t, const std::string& pre) {
   float* flat = scratch<float>("msaatt.flat", std::max<size_t>(hp, 1) * heads);
   bool headMajor = false;
   if constexpr (std::is_same_v<T, half>) {
-    if (hp && !shortPair(hp, C)) {
+    if (hp && !shortPair("lean.msa", hp, C)) {
       PAIR16 = t.p16;
       headMajor = lnNormHeads(t.pair, nullptr, flat, hp, C, heads, pre + ".pairNormScale",
                               pre + ".pairNormOffset", pre + ".pairLogits");
@@ -1753,7 +1754,7 @@ void msaAttention(Trunk& t, const std::string& pre, const std::string& parallelT
   float* flat = scratch<float>("msaatt.flat", pairs * heads);
   bool headMajor = false;
   if constexpr (std::is_same_v<T, half>) {
-    if (!shortPair(pairs, C)) {
+    if (!shortPair("lean.msa", pairs, C)) {
       PAIR16 = t.p16;
       headMajor = lnNormHeads(t.pair, nullptr, flat, pairs, C, heads, pre + ".pairNormScale",
                               pre + ".pairNormOffset", pre + ".pairLogits");
@@ -1762,7 +1763,7 @@ void msaAttention(Trunk& t, const std::string& pre, const std::string& parallelT
   }
   if (!headMajor) {
     // the pair's LayerNorm feeds only the bias projection: on a card short of room it is taken in row chunks
-    size_t per = shortPair(pairs, C) ? std::max<size_t>(1, std::min(pairs, CHUNK / C)) : pairs;
+    size_t per = shortPair("lean.msa", pairs, C) ? std::max<size_t>(1, std::min(pairs, CHUNK / C)) : pairs;
     T* pln = scratch<T>("msaatt.pln", per * C);
     for (size_t r0 = 0; r0 < pairs; r0 += per) {
       size_t r = std::min(per, pairs - r0);
@@ -1790,7 +1791,7 @@ void msaAttention(Trunk& t, const std::string& pre, const std::string& parallelT
   // the values, the per-head weighted sums, the gate and the output - each MSA row's own, so on a card short of
   // room they run in blocks of rows (a 1024-row alignment at 10761 tokens held five 5.6 GB tensors whole);
   // under LOCALFOLD_BIG a third of the rows, so a small input crosses blocks
-  int Sc = shortPair(pairs, C) ? (int)std::max<size_t>(1, std::min<size_t>(S, CHUNK / ((size_t)n * Wd))) : S;
+  int Sc = shortPair("lean.msa", pairs, C) ? (int)std::max<size_t>(1, std::min<size_t>(S, CHUNK / ((size_t)n * Wd))) : S;
   if (BIG_FORCED) Sc = std::max(1, std::min(Sc, (S + 2) / 3));
   T* vg = scratch<T>("msaatt.vg", 2 * (size_t)Sc * n * Wd);
   T* v = vg;
@@ -1820,7 +1821,7 @@ void msaAttention(Trunk& t, const std::string& pre, const std::string& parallelT
     linear<T, float>(gated, t.msa + (size_t)s0 * n * Cm, cr, Wd, Cm, pre + ".outputProjection", false, 1.f);
   }
   // (on a card short of room its pair-sized buffers go now, before the block's pair track allocates)
-  if (shortPair(pairs, C)) releaseScratch({ "msaatt." });
+  if (shortPair("lean.release", pairs, C)) releaseScratch({ "msaatt." });
 }
 
 template <class T>
@@ -1841,7 +1842,7 @@ void msaBlock(Trunk& t, int k) {
   // the outer product off the pre-update MSA (AF3), or off the updated one (OpenDDE, boltz2)
   bool updateFirst = M.flag("trunk.dialect.msaUpdateBeforeOuterProduct");
   T *lnOpm = nullptr, *lnAtt = nullptr;
-  if (!updateFirst && !sharded(t) && !shortPair((size_t)t.n * t.n, t.C)) {
+  if (!updateFirst && !sharded(t) && !shortPair("lean.msa", (size_t)t.n * t.n, t.C)) {
     size_t rows = (size_t)t.S * t.n;
     lnOpm = scratch<T>("opm.ln", rows * t.Cm);
     lnAtt = scratch<T>("msaatt.ln", rows * t.Cm);
@@ -1856,9 +1857,9 @@ void msaBlock(Trunk& t, int k) {
   PAIR16 = t.p16;
   // (a sharded rank short of room: the MSA side's scratch given back before the pair's updates - held into the triangle
   // it was 3.7 GB of a simulated rank of 4's out-of-memory at 12,350 tokens; the pool keeps its pages for them)
-  if (sharded(t) && shortPair((size_t)t.n * t.n, t.C)) releaseScratch({ "msaatt.", "opm." });
+  if (sharded(t) && shortPair("lean.msa", (size_t)t.n * t.n, t.C)) releaseScratch({ "msaatt.", "opm." });
   if (sharded(t)) sh::pairUpdates<T>(*t.zS, t.zTS, "sh.zT", t.pairMask, t.n, t.C, B, t.swap, t.divide, 4);
-  else pairUpdates<T>(t.pair, t.pairMask, t.n, t.C, B, t.swap, t.divide, 4, shortPair((size_t)t.n * t.n, t.C));
+  else pairUpdates<T>(t.pair, t.pairMask, t.n, t.C, B, t.swap, t.divide, 4, shortPair("lean.pairUpdates", (size_t)t.n * t.n, t.C));
   PAIR16 = false;
 }
 
@@ -2114,7 +2115,7 @@ void singleTrack(float* single, const float* pair, const float* seqMask, int n, 
   // (6.9 GB at 6000 tokens). The softmax is a row's alone and the projection is per pair position.
   const bool sharded = shardLo >= 0;
   if (sharded && extraBias) { fprintf(stderr, "sharded pair: no extra single-attention bias\n"); exit(1); }
-  if ((shortPair(pairs, C) && !extraBias) || sharded) {
+  if ((shortPair("lean.singleAttention", pairs, C) && !extraBias) || sharded) {
     int R = (int)std::max<size_t>(1, std::min<size_t>(n, CHUNK / ((size_t)heads * n)));
     const int qlo = sharded ? shardLo : 0, qhi = sharded ? shardLo + sh::storedRows(n, mg::RANK) : n;
     float* pl = scratch<float>("st.pl", (size_t)heads * R * n);
@@ -2254,7 +2255,7 @@ void pairformerBlockAt(float* pair, float* single, const float* pairMask, const 
                    extraBias); stage("single");
     return;
   }
-  pairUpdates<T>(pair, pairMask, n, C, B, swap, divide, 4, shortPair((size_t)n * n, C));
+  pairUpdates<T>(pair, pairMask, n, C, B, swap, divide, 4, shortPair("lean.pairUpdates", (size_t)n * n, C));
   singleTrack<T>(single, pair, seqMask, n, C, Cs, B, extraBias); stage("single");
 }
 template <class T>
@@ -2439,7 +2440,7 @@ inline std::vector<float> contactProbabilities(Trunk& t) {
   const int* contactBins = contactBinsDevice(t.n, bins);
   size_t pairs = (size_t)t.n * t.n;
   float* out = scratch<float>("disto.contact", pairs);
-  if (shortPair(pairs, t.C)) {
+  if (shortPair("lean.distogram", pairs, t.C)) {
     // on a card short of room in blocks of rows: a row's symmetrised logit is its own half-logit plus the
     // transposed pair's, so each block projects its rows and the column entries gathered from the pair -
     // never the [pairs, bins] logits whole (9.2 GB at 6000 tokens, twice)
@@ -2513,7 +2514,7 @@ void runTrunk(Trunk& t, const std::function<void(const char*, const float*, size
   size_t pairs = (size_t)t.n * t.n;
   // on a card short of room, the embedder's and template stack's scratch given back before the MSA
   // stack, and the MSA stack's before the pairformer (see shortPair)
-  bool tight = shortPair(pairs, t.C);
+  bool tight = shortPair("lean.release", pairs, t.C);
   // ...and the template stack's own triangle buffers: it runs 64 channels through the unfused path,
   // whose names the 128-channel pairformer never asks for again (4.9 GB at 2620 tokens)
   // (and the target_feat atom encoder's: its pair conditioning and working rows, ~0.5 GB at 1530 tokens, which
@@ -2534,7 +2535,7 @@ void runTrunk(Trunk& t, const std::function<void(const char*, const float*, size
     // found 6.7 GB free beside it and par.base
     const size_t beside = sharded(t) ? sh::wholeFormBytes(t.n, t.C, t.p16 ? 2 : 4)
       : (size_t)t.n * t.n * t.C * 2 + (M.flag("trunk.dialect.groupedOuterProduct") ? zBytes : 0);
-    zHost = !roomFor(zBytes + beside);
+    zHost = !lever("msa.prePairOnCard", zBytes + beside);
     if (zHost) {
       static LF_TLS void* host = nullptr; static LF_TLS size_t have = 0;
       if (have < zBytes) {
