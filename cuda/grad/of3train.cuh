@@ -38,6 +38,54 @@ __global__ void emaK(real* __restrict__ e, const real* __restrict__ w, real deca
   if (t < n) e[t] -= (1 - decay) * (e[t] - w[t]);
 }
 
+// The optimiser's passes over EVERY parameter in one launch each (a chunk list of 16K-element pieces, a table of each
+// parameter's pointers): a launch a tensor was four kernels x 3,760 tensors a step - 15K launches, ~37 ms of a 256-token
+// step's GPU time in kernels of a few blocks, and the host's time to issue them. The arithmetic per element unchanged.
+struct OptTab { real *w, *g, *acc, *m, *v, *ema; size_t n; };
+constexpr int OPT_CHUNK = 16384;
+__global__ void sqSumAllK(const OptTab* __restrict__ tab, const uint2* __restrict__ chunks, const unsigned char* __restrict__ on, double* out) {
+  const uint2 c = chunks[blockIdx.x];
+  double s = 0;
+  if (on[c.x]) {
+    const OptTab& t = tab[c.x];
+    const size_t end = t.n < (size_t)c.y + OPT_CHUNK ? t.n : (size_t)c.y + OPT_CHUNK;
+    for (size_t i = (size_t)c.y + threadIdx.x; i < end; i += blockDim.x) { const double v = t.g[i]; s += v * v; }
+  }
+  for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
+  __shared__ double sh[32];
+  if ((threadIdx.x & 31) == 0) sh[threadIdx.x / 32] = s;
+  __syncthreads();
+  if (threadIdx.x < 32) {
+    s = threadIdx.x < blockDim.x / 32 ? sh[threadIdx.x] : 0;
+    for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
+    if (threadIdx.x == 0 && s != 0) atomicAdd(out, s);
+  }
+}
+__global__ void scaleAddAllK(const OptTab* __restrict__ tab, const uint2* __restrict__ chunks, const unsigned char* __restrict__ on, real coef) {
+  const uint2 c = chunks[blockIdx.x];
+  if (!on[c.x]) return;
+  const OptTab& t = tab[c.x];
+  const size_t end = (t.n < (size_t)c.y + OPT_CHUNK ? t.n : (size_t)c.y + OPT_CHUNK);
+  for (size_t i = (size_t)c.y + threadIdx.x; i < end; i += blockDim.x) t.acc[i] += coef * t.g[i];
+}
+__global__ void adamAllK(const OptTab* __restrict__ tab, const uint2* __restrict__ chunks, const real* __restrict__ invs, real lr, real b1,
+                         real b2, real eps, real c1, real c2, real decay) {
+  const uint2 c = chunks[blockIdx.x];
+  const real inv = invs[c.x];
+  if (inv < 0) return;                                  // (frozen)
+  const OptTab& t = tab[c.x];
+  const size_t end = (t.n < (size_t)c.y + OPT_CHUNK ? t.n : (size_t)c.y + OPT_CHUNK);
+  for (size_t i = (size_t)c.y + threadIdx.x; i < end; i += blockDim.x) {
+    const real g = t.acc[i] * inv;
+    const real mt = b1 * t.m[i] + (1 - b1) * g, vt = b2 * t.v[i] + (1 - b2) * g * g;
+    t.m[i] = mt; t.v[i] = vt;
+    const real w = t.w[i] - lr * (mt / c1) / (sqrt(vt / c2) + eps);
+    t.w[i] = w;
+    t.ema[i] -= (1 - decay) * (t.ema[i] - w);
+    t.acc[i] = 0;
+  }
+}
+
 struct Of3Optimizer {
   // the run's settings (model_config.py's optimizer, lr_scheduler, ema, gradient_clipping)
   double maxLr = 1.8e-3, baseLr = 0, b1 = 0.9, b2 = 0.95, eps = 1e-8, clip = 10, emaDecay = 0.999, decayFactor = 0.95;
@@ -48,6 +96,8 @@ struct Of3Optimizer {
   std::vector<char> frozen;              // a buffer in OpenFold3 (the Fourier noise embedding): never updated, never clipped
   int examples = 0;
   double* norm = nullptr;
+  OptTab* tab = nullptr; uint2* chunks = nullptr; unsigned char* onD = nullptr; real* invD = nullptr; unsigned nChunks = 0;
+  std::vector<unsigned char> onH; std::vector<real> invH;
   double lastNorm = 0, lastLr = 0;
   // m, v, the accumulator and the EMA each one allocation, every parameter's at its offset (64-element aligned): four
   // slabs instead of a cudaMalloc a tensor (3760 of them in OpenBind-0, each rounded up - 2 GB of rounding over the
@@ -65,6 +115,17 @@ struct Of3Optimizer {
     participation.assign(ps.all.size(), 0);
     frozen.assign(ps.all.size(), 0);
     GK(cudaMalloc(&norm, sizeof(double)));
+    std::vector<OptTab> th; std::vector<uint2> ch;
+    for (size_t i = 0; i < ps.all.size(); ++i) {
+      const Param* p = ps.all[i];
+      th.push_back({p->w, p->g, acc[i], m[i], v[i], ema[i], p->n});
+      for (size_t b = 0; b < p->n; b += OPT_CHUNK) ch.push_back(make_uint2((unsigned)i, (unsigned)b));
+    }
+    nChunks = (unsigned)ch.size();
+    GK(cudaMalloc(&tab, th.size() * sizeof(OptTab))); GK(cudaMemcpy(tab, th.data(), th.size() * sizeof(OptTab), cudaMemcpyHostToDevice));
+    GK(cudaMalloc(&chunks, ch.size() * sizeof(uint2))); GK(cudaMemcpy(chunks, ch.data(), ch.size() * sizeof(uint2), cudaMemcpyHostToDevice));
+    GK(cudaMalloc(&onD, ps.all.size())); GK(cudaMalloc(&invD, ps.all.size() * sizeof(real)));
+    onH.resize(ps.all.size()); invH.resize(ps.all.size());
   }
   double lr(long s) const {
     if (s <= warmup) return baseLr + (double)s / warmup * maxLr;
@@ -75,21 +136,15 @@ struct Of3Optimizer {
   // the accumulator. `disabled(i)` true leaves parameter i out of the norm and the count.
   template <class F> double clipAndAccumulate(const Params& ps, F disabled) {
     GK(cudaMemsetAsync(norm, 0, sizeof(double), STREAM));
-    for (size_t i = 0; i < ps.all.size(); ++i) {
-      if (disabled(i) || frozen[i]) continue;
-      Param* p = ps.all[i];
-      sqSumK<<<(unsigned)std::min<size_t>(blocks(p->n), 1024), 256, 0, STREAM>>>(p->g, p->n, norm);
-    }
+    for (size_t i = 0; i < ps.all.size(); ++i) onH[i] = !(disabled(i) || frozen[i]);
+    GK(cudaMemcpyAsync(onD, onH.data(), onH.size(), cudaMemcpyHostToDevice, STREAM));
+    sqSumAllK<<<nChunks, 256, 0, STREAM>>>(tab, chunks, onD, norm);
     double h; GK(cudaMemcpyAsync(&h, norm, sizeof(double), cudaMemcpyDeviceToHost, STREAM));
     GK(cudaStreamSynchronize(STREAM));
     lastNorm = std::sqrt(h);
     const double coef = clip / std::max(lastNorm, clip);
-    for (size_t i = 0; i < ps.all.size(); ++i) {
-      if (disabled(i) || frozen[i]) continue;
-      Param* p = ps.all[i];
-      scaleAddK<<<blocks(p->n), 256, 0, STREAM>>>(acc[i], p->g, (real)coef, p->n);
-      ++participation[i];
-    }
+    scaleAddAllK<<<nChunks, 256, 0, STREAM>>>(tab, chunks, onD, (real)coef);
+    for (size_t i = 0; i < ps.all.size(); ++i) if (onH[i]) ++participation[i];
     ++examples;
     return lastNorm;
   }
@@ -105,14 +160,11 @@ struct Of3Optimizer {
     ++step;
     const real c1 = (real)(1 - std::pow(b1, (double)step)), c2 = (real)(1 - std::pow(b2, (double)step));
     for (size_t i = 0; i < ps.all.size(); ++i) {
-      Param* p = ps.all[i];
-      if (frozen[i]) continue;
-      const real inv = (real)(1.0 / std::max(1, participation[i]));
-      adamOf3K<<<blocks(p->n), 256, 0, STREAM>>>(p->w, acc[i], m[i], v[i], p->n, (real)lastLr, (real)b1, (real)b2, (real)eps, c1, c2, inv);
-      emaK<<<blocks(p->n), 256, 0, STREAM>>>(ema[i], p->w, (real)emaDecay, p->n);
-      GK(cudaMemsetAsync(acc[i], 0, p->n * sizeof(real), STREAM));
+      invH[i] = frozen[i] ? (real)-1 : (real)(1.0 / std::max(1, participation[i]));
       participation[i] = 0;
     }
+    GK(cudaMemcpyAsync(invD, invH.data(), invH.size() * sizeof(real), cudaMemcpyHostToDevice, STREAM));
+    adamAllK<<<nChunks, 256, 0, STREAM>>>(tab, chunks, invD, (real)lastLr, (real)b1, (real)b2, (real)eps, c1, c2, (real)emaDecay);
     examples = 0;
   }
   // ---- a checkpoint: "LFCKPT1", the step, then per parameter its name, length and four arrays (w, m, v, ema)

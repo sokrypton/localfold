@@ -46,6 +46,7 @@
 #include "../af3/src/trunk.cuh"
 #include "../af3/src/diffusion.cuh"
 #include "../af3/src/sampler.cuh"
+#include "../af3/src/profile.cuh"
 #include "../featurise/af3_weights.h"
 #include "../featurise/featurise.h"
 #include "../featurise/tables.h"
@@ -109,6 +110,7 @@ static g::real* dzeros(size_t n) { g::real* p; GK(cudaMalloc(&p, std::max<size_t
 
 // --mem: after each phase of a step, the arena's high-water mark over the phase, what it holds, and the device's use
 static bool MEM_REPORT = false;
+static bool profileStep = false;   // --profile
 static void memPhase(const char* what) {
   if (!MEM_REPORT) return;
   GK(cudaDeviceSynchronize());
@@ -720,6 +722,7 @@ int main(int argc, char** argv) {
     else if (!strcmp(argv[i], "--bf16")) bf16Trunk = true;
     else if (!strcmp(argv[i], "--bf16-confidence")) bf16Confidence = true;
     else if (!strcmp(argv[i], "--mem")) MEM_REPORT = true;
+    else if (!strcmp(argv[i], "--profile")) profileStep = true;    // the last step's kernels by GPU time (CUPTI, cuda/af3's profile.cuh)
     else if (!strcmp(argv[i], "--offload-pairs")) offloadPairs = true;
     else if (auto v = opt("--transition-chunk=")) transitionChunkM = atof(v);
     else if (auto v = opt("--world=")) world = atoi(v);
@@ -2056,7 +2059,9 @@ int main(int argc, char** argv) {
   std::vector<double> cum; double totalW = 0;
   for (auto& e : examples) { totalW += e.weight; cum.push_back(totalW); }
   int inBatch = 0;
+  if (profileStep) prof::init();
   for (int step = 0; step < steps; ++step) {
+    if (profileStep && step == steps - 1) { CK(cudaDeviceSynchronize()); prof::start(); }
     stepIndex = opt.step * batch + inBatch;
     cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1); cudaEventRecord(e0, STREAM);
     const double u = std::uniform_real_distribution<double>(0, totalW)(rng);
@@ -2072,6 +2077,7 @@ int main(int argc, char** argv) {
     printf("step %4d  loss %.4f (diffusion %.4f, distogram %.4f, confidence %.3f%s)  |grad| %.3e%s  %.0f ms\n", step, L.total, L.diffusion,
            L.distogram, L.plddt + L.pde + L.pae + L.resolved, confOn ? "" : " off", norm,
            stepped ? (std::string("  lr ") + std::to_string(opt.lastLr).substr(0, 8)).c_str() : "", ms);
+    if (profileStep && step == steps - 1) { CK(cudaDeviceSynchronize()); prof::stop(45); }
     if (rank == 0 && !savePath.empty() && saveEvery > 0 && stepped && opt.step % saveEvery == 0) { opt.save(ps, savePath); printf("saved %s (step %ld)\n", savePath.c_str(), opt.step); }
     if (rank == 0 && !valExamples.empty() && valEvery > 0 && stepped && opt.step % valEvery == 0) validate(opt.step);
   }
