@@ -64,9 +64,12 @@ int main() {
       return e / std::max(mx, 1e-30);
     };
     const double eo = worst(A.o, B.o, HD, 0, HD), eog = worst(A.og, B.og, HD, 0, HD), eg = worst(A.g, B.g, P, 3 * HD, HD);
+    // (the log-sum-exp as the backward reads it, the pair's sum: gridFwdTc's max is the one O was last rescaled at,
+    // within 2^8 of the true one, and its log-sum moves with it)
     double el = 0;
-    for (size_t i = 0; i < A.lse.size(); ++i) {
-      const float x = A.lse[i], y = B.lse[i];
+    const size_t half = A.lse.size() / 2;
+    for (size_t i = 0; i < half; ++i) {
+      const float x = A.lse[i] + A.lse[half + i], y = B.lse[i] + B.lse[half + i];
       if (std::isinf(x) || std::isinf(y)) { if (x != y) el = INFINITY; continue; }
       el = std::max(el, (double)std::fabs(x - y));
     }

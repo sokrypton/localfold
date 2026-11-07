@@ -1612,11 +1612,15 @@ inline bool gridForwardBf(const Sdpa& a, const __nv_bfloat16* q, int ldq, const 
     if (wide) launch(Dc, I2{}, I8{}); else launch(Dc, I1{}, I4{});
   };
   if (tc && a.D == 32 && tc5::ready()) {
-    static bool attr = false;
-    if (!attr) { GK(cudaFuncSetAttribute(gridFwdTc, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)gridFwdTcSmem())); attr = true; }
     const HSrc qs_ = hsrc<32>(q, ldq, a.B, a.Q, a.H), ks_ = hsrc<32>(k, ldk, a.B, a.K, a.H), vs_ = hsrc<32>(v, ldv, a.B, a.K, a.H);
-    const size_t grid = (size_t)((a.Q + TQ - 1) / TQ) * a.H * a.B;
-    gridFwdTc<<<(unsigned)grid, 128, gridFwdTcSmem(), STREAM>>>(a, bt, qs_, ks_, vs_, o, ldo, lse, gate, ldg, og, ldog, ka2, Npk);
+    auto go = [&](auto Nc) {   // (three query tiles a block where the queries fill them, else two: no tile spent on padding)
+      constexpr int NG = decltype(Nc)::value;
+      static bool attr = false;
+      if (!attr) { GK(cudaFuncSetAttribute(gridFwdTc<NG>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)gridFwdTcSmem<NG>())); attr = true; }
+      const size_t grid = (size_t)((a.Q + NG * TQ - 1) / (NG * TQ)) * a.H * a.B;
+      gridFwdTc<NG><<<(unsigned)grid, 32 * tcWarps<NG>(), gridFwdTcSmem<NG>(), STREAM>>>(a, bt, qs_, ks_, vs_, o, ldo, lse, gate, ldg, og, ldog, ka2, Npk);
+    };
+    if (a.Q % (3 * TQ) == 0) go(std::integral_constant<int, 3>{}); else go(std::integral_constant<int, 2>{});
     return true;
   }
   if (a.D == 32) run(std::integral_constant<int, 32>{}); else run(std::integral_constant<int, 16>{});

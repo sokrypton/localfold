@@ -5,10 +5,10 @@
 #include "ops.cuh"
 using namespace grad;
 int main(int argc, char** argv) {
-  bool noDb = false, bfIn = false, gridFwd = false;
+  bool noDb = false, bfIn = false, gridFwd = false, tc = false;   // (--tc: the grid forward on tcgen05 where the binary has sm_100a code)
   const char* only = nullptr;   // --shape=<name>: that shape alone   // --bf16-in: q, k, v bf16 in a packed [rows, 4 HD] (what the modules hand it)   // --no-db: the bias without its gradient (the atomics' share of the backward)
   for (int i = 1; i < argc; ++i)
-    if (!strcmp(argv[i], "--tf32")) TF32 = true; else if (!strcmp(argv[i], "--bf16")) BF16 = true; else if (!strcmp(argv[i], "--no-db")) noDb = true; else if (!strcmp(argv[i], "--bf16-in")) bfIn = BF16 = true; else if (!strncmp(argv[i], "--shape=", 8)) only = argv[i] + 8; else if (!strcmp(argv[i], "--grid")) gridFwd = bfIn = BF16 = true;   // --grid: the forward by flash::gridForwardBf, the triangle attention's (bf16 in)
+    if (!strcmp(argv[i], "--tf32")) TF32 = true; else if (!strcmp(argv[i], "--bf16")) BF16 = true; else if (!strcmp(argv[i], "--no-db")) noDb = true; else if (!strcmp(argv[i], "--bf16-in")) bfIn = BF16 = true; else if (!strncmp(argv[i], "--shape=", 8)) only = argv[i] + 8; else if (!strcmp(argv[i], "--grid")) gridFwd = bfIn = BF16 = true; else if (!strcmp(argv[i], "--tc")) tc = true;   // --grid: the forward by flash::gridForwardBf, the triangle attention's (bf16 in)
   init();
   curandGenerator_t gen; curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT); curandSetPseudoRandomGeneratorSeed(gen, 1);
   auto randn = [&](size_t n) { float* p; GK(cudaMalloc(&p, ((n + 1) & ~1) * 4)); curandGenerateNormal(gen, p, (n + 1) & ~1, 0.f, 1.f); return p; };
@@ -39,7 +39,7 @@ int main(int argc, char** argv) {
             toBf(r4, pk, n * 4); GK(cudaStreamSynchronize(STREAM)); GK(cudaFree(r4));
           }
           const int P = 4 * HD;
-          if (!gridFwd || !flash::gridForwardBf(a, pk, P, pk + HD, P, pk + 2 * HD, P, dpk, HD, lse))
+          if (!gridFwd || !flash::gridForwardBf(a, pk, P, pk + HD, P, pk + 2 * HD, P, dpk, HD, lse, nullptr, 0, nullptr, 0, tc))
             sdpaForwardBf(a, pk, P, pk + HD, P, pk + 2 * HD, P, o, HD, lse);
           cudaEventRecord(e[1], STREAM);
           sdpaBackwardBf(a, pk, P, pk + HD, P, pk + 2 * HD, P, dO, HD, dq, HD, dpk + HD, P, dpk + 2 * HD, P, o, HD, lse);
