@@ -112,7 +112,7 @@ struct Calls {
   CUresult (*access)(CUdeviceptr, size_t, const CUmemAccessDesc*, size_t);
 };
 inline const Calls& calls() {
-  static Calls c = [] {
+  static const Calls c = [] {   // (process-wide and read-only: the driver's entry points, resolved once)
     Calls v{};
     auto get = [](const char* name, void** fn) {
       cudaDriverEntryPointQueryResult q;

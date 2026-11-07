@@ -477,19 +477,10 @@ struct ConfidenceOut { std::vector<float> plddt, pae, pde, tmTerm, tmGlobal; dou
 // chains' summed off it (confidence_head.py: num_interface_tokens). centres: the bins' centres
 struct ChainTm { int nc = 0; int* chainOf = nullptr; float* tables = nullptr; };
 inline ChainTm chainTmTables(const int* chainOfToken, const float* seq, int n, const float* centres, int bins, const std::string& tag) {
-  std::vector<int> ids;
-  for (int i = 0; i < n; ++i) if (seq[i] > 0 && chainOfToken[i] >= 0 && std::find(ids.begin(), ids.end(), chainOfToken[i]) == ids.end()) ids.push_back(chainOfToken[i]);
-  std::sort(ids.begin(), ids.end());
-  ChainTm c; c.nc = (int)ids.size();
-  std::vector<int> of(n, -1), count(c.nc, 0);
-  for (int i = 0; i < n; ++i)
-    if (seq[i] > 0 && chainOfToken[i] >= 0) { of[i] = (int)(std::lower_bound(ids.begin(), ids.end(), chainOfToken[i]) - ids.begin()); count[of[i]]++; }
-  std::vector<float> tab((size_t)std::max(c.nc, 1) * std::max(c.nc, 1) * bins, 0.f);
-  for (int a = 0; a < c.nc; ++a)
-    for (int b = 0; b < c.nc; ++b) {
-      const double d0 = tmD0(a == b ? count[a] : count[a] + count[b]);
-      for (int k = 0; k < bins; ++k) tab[((size_t)a * c.nc + b) * bins + k] = (float)(1 / (1 + (double)centres[k] * centres[k] / (d0 * d0)));
-    }
+  const ptm::Layout L = ptm::layout(chainOfToken, seq, n);   // (cuda/featurise/ptm.h: every port's definition)
+  const std::vector<int>& of = L.of;
+  const std::vector<float> tab = ptm::tables(L, centres, bins);
+  ChainTm c; c.nc = L.nc();
   c.chainOf = scratch<int>(tag + ".chainOf", n);
   c.tables = scratch<float>(tag + ".chainTables", tab.size());
   CK(cudaMemcpyAsync(c.chainOf, of.data(), n * sizeof(int), cudaMemcpyHostToDevice, STREAM));

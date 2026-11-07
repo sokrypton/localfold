@@ -350,18 +350,20 @@ inline Confidence confidenceHeadSharded(int T, int A, const float* sInputs, int 
   mg::Shared& tmS = mg::shared("ef2.cf.tmrows", (size_t)T * 2 * 8);
   mg::Shared& paeS = mg::shared("ef2.cf.pae", (size_t)T * Tp * 4);
   float* pooled = (float*)pooledS.local; double* rowsD = (double*)tmS.local; float* paeAll = (float*)paeS.local;
-  // ...and each anchor's TM terms summed per chain, for the chain-level pTM and ipTM (tmChainRowsK)
-  std::vector<int> asymH(T), chainOf;
+  // ...and each anchor's AF3 INTERFACE TM terms summed per chain, for the chain-level scores (tmInterfaceK, tmChainRowsK)
+  std::vector<int> asymH(T);
   CK(cudaMemcpy(asymH.data(), Idev("asym_id"), T * 4, cudaMemcpyDeviceToHost));
-  const int nc = (int)chainOrder(asymH, chainOf).size();
+  const double width = 32.0 / pb, d0 = 1.24 * cbrt(std::max(T, 19) - 15.0) - 1.8;
+  InterfaceTm itm = interfaceTm(asymH, pb, width);
+  const int nc = itm.L.nc();
   mg::Shared& chainS = mg::shared("ef2.cf.tmchain", (size_t)T * nc * 8);
   double* chainRows = (double*)chainS.local;
-  int* dChainOf = upload(chainOf.data(), T);
-  const double width = 32.0 / pb, d0 = 1.24 * cbrt(std::max(T, 19) - 15.0) - 1.8;
+  int* dChainOf = itm.chainOf;
   {
     float* zc = scratch<float>("cf.zc", per * C); float* xn = scratch<float>("cf.xn", per * C);
     float* score = scratch<float>("cf.scoreRows", per); float* paeL = scratch<float>("cf.paeRows", per * pb);
     float* paeD = scratch<float>("cf.paeOutRows", per); float* tmD = scratch<float>("cf.tmRows1", per);
+    float* tmI = scratch<float>("cf.tmInterfaceRows", per);
     B16* rh = shareKept ? nullptr : scratch<B16>("cf.residRows", per * C);
     for (int i0 = lo; i0 < lo + rows; i0 += rb) {
       const int b = std::min(rb, lo + rows - i0); const size_t n = (size_t)b * T, ql = (size_t)(i0 - lo) * T;
@@ -378,16 +380,17 @@ inline Confidence confidenceHeadSharded(int T, int A, const float* sInputs, int 
       } else gemm(zc, F("confidence/pae"), paeL, n, C, pb);
       paeK<<<blocks(n), 256, 0, STREAM>>>(paeL, paeD, tmD, n, pb, width, d0);
       tmRowsAtK<<<(unsigned)b, 256, 0, STREAM>>>(tmD, Idev("asym_id"), rowsD, T, i0);
-      tmChainRowsK<<<(unsigned)b, 256, nc * sizeof(double), STREAM>>>(tmD, dChainOf, chainRows, T, nc, i0);
+      tmInterfaceK<<<blocks(n), 256, 0, STREAM>>>(paeL, tmI, n, (size_t)i0 * T, T, pb, dChainOf, nc, itm.tables);
+      tmChainRowsK<<<(unsigned)b, 256, nc * sizeof(double), STREAM>>>(tmI, dChainOf, chainRows, T, nc, i0);
       CK(cudaMemcpy2DAsync(paeAll + (size_t)i0 * Tp, (size_t)Tp * 4, paeD, (size_t)T * 4, (size_t)T * 4, b, cudaMemcpyDeviceToDevice, STREAM));
     }
-    releaseScratch({ "cf.zc", "cf.xn", "cf.scoreRows", "cf.paeRows", "cf.paeOutRows", "cf.tmRows1", "cf.residRows" });
+    releaseScratch({ "cf.zc", "cf.xn", "cf.scoreRows", "cf.paeRows", "cf.paeOutRows", "cf.tmRows1", "cf.tmInterfaceRows", "cf.residRows" });
     if (shareKept) CK(cudaFree(resid));
   }
   mg::allGather(pooledS, (size_t)lo * C * 4, (size_t)rows * C * 4);
   mg::allGather(tmS, (size_t)lo * 16, (size_t)rows * 16);
   mg::allGather(chainS, (size_t)lo * nc * 8, (size_t)rows * nc * 8);
-  CK(cudaFree(dChainOf));
+  CK(cudaFree(dChainOf)); CK(cudaFree(itm.tables));
   mg::allGather(paeS, (size_t)lo * Tp * 4, (size_t)rows * Tp * 4);
   // the single and the per-atom pLDDT (confidenceHead's, on the gathered pooling) - every rank alike
   float* single = scratch<float>("cf.single", (size_t)T * Cs);

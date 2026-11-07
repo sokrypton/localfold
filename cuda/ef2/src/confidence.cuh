@@ -9,6 +9,7 @@
 //   PAE = E[bin] over [0, 32] of z @ pae;  pTM / ipTM from the PAE logits (d0 from the live token count)
 #pragma once
 #include "trunk.cuh"
+#include "../../featurise/ptm.h"   // (the pTM family's one definition: AF3's chain-level scores, every port's)
 
 __global__ void confZK(float* z, RelIdx rel, Bonds bonds, const float* wBond, const float* rows,
                        const float* cols, int T, int C) {
@@ -303,6 +304,35 @@ __global__ void tmRowsK(const float* tm, const int* asym, double* rows, int T) {
   }
   if (threadIdx.x == 0) { rows[2 * i] = s[0][0] / (T + 1e-8); rows[2 * i + 1] = s[1][0] / (c[0] + 1e-8); }
 }
+// AlphaFold 3's INTERFACE TM term (cuda/featurise/ptm.h), what the chain-level scores are reduced from: each pair's
+// softmax against its chain pair's table (ptm::tables, d0 from the pair's own chains). logits [rows, bins] the pairs
+// r0 + r of the T x T; chainOf the dense chain index (ptm::Layout). ESMFold2's own pTM / ipTM stay on the global term
+__global__ void tmInterfaceK(const float* logits, float* out, size_t rows, size_t r0, int T, int bins, const int* chainOf,
+                             int nc, const float* tables) {
+  const size_t r = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (r >= rows) return;
+  const size_t p = r0 + r;
+  const int a = chainOf[p / T], b = chainOf[p % T];
+  if (a < 0 || b < 0) { out[r] = 0.f; return; }
+  const float* l = logits + r * bins;
+  const float* t = tables + ((size_t)a * nc + b) * bins;
+  float mx = -INFINITY;
+  for (int k = 0; k < bins; ++k) mx = fmaxf(mx, l[k]);
+  double total = 0, w = 0;
+  for (int k = 0; k < bins; ++k) { const double e = exp((double)l[k] - mx); total += e; w += e * t[k]; }
+  out[r] = (float)(w / total);
+}
+// the interface term's device inputs for these tokens' chains: the dense chain index of each and the tables
+struct InterfaceTm { ptm::Layout L; int* chainOf = nullptr; float* tables = nullptr; };
+inline InterfaceTm interfaceTm(const std::vector<int>& asym, int bins, double width) {
+  InterfaceTm it; it.L = ptm::layout(asym.data(), nullptr, (int)asym.size());
+  if (it.L.ids.size() * sizeof(double) > 48 * 1024) throw std::runtime_error("the confidence head's per-chain TM sums hold 6144 chains at most");
+  std::vector<float> centres(bins); for (int b = 0; b < bins; ++b) centres[b] = (float)(width * (b + 0.5));
+  const std::vector<float> tab = ptm::tables(it.L, centres.data(), bins);
+  it.chainOf = upload(it.L.of.data(), asym.size());
+  it.tables = upload(tab.data(), tab.size());
+  return it;
+}
 // each anchor row's TM terms summed per chain - out [i0 + row][nc] - which is all the chain-level pTM and ipTM read:
 // T x nc numbers where the matrix is T x T, so the sharded head can all-gather them at any size (rows: block's rows)
 __global__ void tmChainRowsK(const float* tm, const int* chainOf, double* out, int T, int nc, int i0) {
@@ -314,17 +344,6 @@ __global__ void tmChainRowsK(const float* tm, const int* chainOf, double* out, i
   __syncthreads();
   for (int k = threadIdx.x; k < nc; k += blockDim.x) out[(size_t)(i0 + r) * nc + k] = acc[k];
 }
-// the chains by asym id, sorted, and each token's index among them - the writer's order, and the kernel's
-inline std::vector<int> chainOrder(const std::vector<int>& asym, std::vector<int>& chainOf) {
-  std::vector<int> ids;
-  for (int a : asym) if (std::find(ids.begin(), ids.end(), a) == ids.end()) ids.push_back(a);
-  std::sort(ids.begin(), ids.end());
-  if (ids.size() * sizeof(double) > 48 * 1024) throw std::runtime_error("the confidence head's per-chain TM sums hold 6144 chains at most");
-  chainOf.resize(asym.size());
-  for (size_t i = 0; i < asym.size(); ++i) chainOf[i] = (int)(std::find(ids.begin(), ids.end(), asym[i]) - ids.begin());
-  return ids;
-}
-
 // `tmChainRows`: [T][chains] - each anchor's TM terms summed over each chain (tmChainRowsK), which every chain-level pTM
 // and ipTM is a max-of-means over. `atomToken`/`atomMask`: for each chain's mean pLDDT
 struct Confidence { std::vector<float> plddtAtom, plddtToken, pae, atomMask; std::vector<double> tmChainRows; std::vector<int> atomToken; double ptm, iptm, meanPlddt; };
@@ -538,14 +557,16 @@ inline Confidence confidenceHead(int T, int A, const float* zTrunk, const float*
   paeK<<<blocks(P), 256, 0, STREAM>>>(paeL, paeD, tmD, P, pb, width, d0);
   tmRowsK<<<T, 256, 0, STREAM>>>(tmD, Idev("asym_id"), rowsD, T);
   out.pae = download(paeD, P);
-  {
-    std::vector<int> chainOf; const int nc = (int)chainOrder(asym, chainOf).size();
-    int* dChainOf = upload(chainOf.data(), T);
+  {   // the chain-level scores' sums, off AF3's interface term (the global one is pTM's and ipTM's, ESM's)
+    InterfaceTm it = interfaceTm(asym, pb, width);
+    const int nc = it.L.nc();
+    float* tmI = scratch<float>("cf.tmInterface", P);
+    tmInterfaceK<<<blocks(P), 256, 0, STREAM>>>(paeL, tmI, P, 0, T, pb, it.chainOf, nc, it.tables);
     double* dRows = scratch<double>("cf.tmChainRows", (size_t)T * nc);
-    tmChainRowsK<<<T, 256, nc * sizeof(double), STREAM>>>(tmD, dChainOf, dRows, T, nc, 0);
+    tmChainRowsK<<<T, 256, nc * sizeof(double), STREAM>>>(tmI, it.chainOf, dRows, T, nc, 0);
     out.tmChainRows.resize((size_t)T * nc);
     CK(cudaMemcpy(out.tmChainRows.data(), dRows, out.tmChainRows.size() * 8, cudaMemcpyDeviceToHost));
-    CK(cudaFree(dChainOf));
+    CK(cudaFree(it.chainOf)); CK(cudaFree(it.tables));
   }
   out.atomToken = a2t; out.atomMask = mask_;
   std::vector<double> rows(2 * T);
@@ -592,29 +613,32 @@ inline void writeConfidences(const std::string& pdb, int T, const Confidence& co
   for (int i = 0; i < T; ++i) fprintf(f, "%s%d", i ? ", " : "", res[i] + 1);
   fprintf(f, "]}\n");
   fclose(f);
-  // 🔴 THE CHAIN-LEVEL FIELDS, AS cuda/af3's writeConfidences DEFINES THEM (sampler.cuh) - every chain's pTM and ipTM and
-  // every pair's ipTM a max over anchors of the mean TM term over the tokens it selects, the pair's PAE minimum over
-  // ordered pairs, the chain's mean atom pLDDT. They were computed (the TM matrix is the pTM's) and reduced to two
-  // global numbers, so a binder's own pTM and its interface ipTM were not in the file (2026-10-30)
-  std::vector<int> chainOf;
-  const int nc = (int)chainOrder(asym, chainOf).size();
-  std::vector<int> chainCount(nc, 0);
-  for (int i = 0; i < T; ++i) chainCount[chainOf[i]]++;
+  // 🔴 THE CHAIN-LEVEL FIELDS, AS ALPHAFOLD 3 DEFINES THEM (cuda/featurise/ptm.h, every port's): chain_pair_iptm off
+  // its INTERFACE term (d0 from the pair's own chains, tmInterfaceK - summed per chain on the device), anchored on the
+  // tokens with frames; chain_ptm its diagonal; chain_iptm the mean of a chain's row (iptm_xchain). ESM's own reference
+  // has none of these (its pair_chains_iptm is directional and on the global term), so the AF3-named fields mean
+  // AF3's; pTM and ipTM stay ESMFold2's (every token an anchor, d0 from every token)
+  const ptm::Layout L = ptm::layout(asym.data(), nullptr, T);
+  const int nc = L.nc();
+  const std::vector<int>& chainOf = L.of;
   if (conf.tmChainRows.size() != (size_t)T * nc) throw std::runtime_error("the confidence head returned no per-chain TM sums");
-  const std::vector<double>& rowSum = conf.tmChainRows;
-  auto best = [&](int from, bool others, int to, bool notTo) {
-    double top = -1e30; bool any = false;
-    for (int i = 0; i < T; ++i) {
-      if (others ? chainOf[i] == from : chainOf[i] != from) continue;
-      const double* r = rowSum.data() + (size_t)i * nc;
-      double total = 0; int count = 0;
-      if (notTo) { for (int b = 0; b < nc; ++b) if (b != to) { total += r[b]; count += chainCount[b]; } }
-      else { total = r[to]; count = chainCount[to]; }
-      if (count) { any = true; top = std::max(top, total / count); }
+  std::vector<char> frame;
+  {   // a NONPOLYMER token (ESM's mol_type 3) is one atom: its reference position the frame rule's
+    const int A = (int)conf.atomToken.size();
+    std::vector<int> mol(T), lig(T); std::vector<float> pos((size_t)T * 3, 0.f), refPos((size_t)A * 3);
+    std::vector<char> live(T, 0);
+    CK(cudaMemcpy(mol.data(), Idev("mol_type"), T * 4, cudaMemcpyDeviceToHost));
+    if (A) CK(cudaMemcpy(refPos.data(), W("ref_pos"), (size_t)A * 12, cudaMemcpyDeviceToHost));
+    for (int t = 0; t < T; ++t) lig[t] = mol[t] == 3;
+    for (int a2 = 0; a2 < A; ++a2) {
+      const int t = conf.atomToken[a2];
+      if (t < 0 || t >= T || live[t] || !(conf.atomMask[a2] > 0)) continue;
+      for (int d = 0; d < 3; ++d) pos[(size_t)t * 3 + d] = refPos[(size_t)a2 * 3 + d];
+      live[t] = 1;
     }
-    return any ? top : NAN;
-  };
-  auto maxNan = [](double x, double y) { return std::isnan(x) ? y : std::isnan(y) ? x : std::max(x, y); };
+    frame = ptm::frameMask(T, lig.data(), asym.data(), res.data(), pos.data(), live.data());
+  }
+  const ptm::Chains cs = ptm::reduceRows(conf.tmChainRows.data(), T, L, frame.data());
   auto num = [](FILE* g, double v) { if (std::isfinite(v)) fprintf(g, "%.4f", v); else fprintf(g, "null"); };
   auto list = [&](FILE* g, const char* key, const std::vector<double>& v) {
     fprintf(g, "\"%s\": [", key);
@@ -624,20 +648,13 @@ inline void writeConfidences(const std::string& pdb, int T, const Confidence& co
   f = fopen((stem + "_summary_confidences.json").c_str(), "w");
   fprintf(f, "{");
   {
-    std::vector<double> chainPtm(nc), chainIptm(nc);
-    for (int a = 0; a < nc; ++a) {
-      chainPtm[a] = best(a, false, a, false);
-      chainIptm[a] = maxNan(best(a, false, a, true), best(a, true, a, false));
-    }
+    const std::vector<double>& chainPtm = cs.ptm; const std::vector<double>& chainIptm = cs.iptm;
     list(f, "chain_ptm", chainPtm);
     if (nc > 1) list(f, "chain_iptm", chainIptm);
     fprintf(f, "\"chain_pair_iptm\": [");
     for (int a = 0; a < nc; ++a) {
       fprintf(f, "%s[", a ? ", " : "");
-      for (int b = 0; b < nc; ++b) {
-        if (b) fprintf(f, ", ");
-        num(f, a == b ? chainPtm[a] : maxNan(best(a, false, b, false), best(b, false, a, false)));
-      }
+      for (int b = 0; b < nc; ++b) { if (b) fprintf(f, ", "); num(f, cs.pair[(size_t)a * nc + b]); }
       fprintf(f, "]");
     }
     fprintf(f, "], ");

@@ -711,56 +711,17 @@ inline void writeConfidences(const std::string& pdbPath, const std::vector<size_
   fwrite(j.data(), 1, j.size(), f);
   fclose(f);
 
-  // the chains, by asym id in token order
-  std::vector<int> chains;
-  for (int i = 0; i < n; ++i) if (seq[i] > 0 && std::find(chains.begin(), chains.end(), asym[i]) == chains.end()) chains.push_back(asym[i]);
-  std::sort(chains.begin(), chains.end());
-  int nc = (int)chains.size();
-  // 🔴 ONE PASS OVER THE PAIRS, NOT ONE A CHAIN PAIR: every chain's pTM and ipTM and every chain pair's ipTM is a max over
-  // anchors i of the mean of tmTerm[i][j] over the j it selects, and each selection is "j in chain b" or its complement -
-  // so each anchor's row summed per chain once (in j order) answers them all. It rescanned the n^2 pairs through a
-  // std::function for each of the nc^2 chain pairs: minutes past ~5,000 tokens in tens of chains
-  std::vector<int> chainOf(n, -1);
-  for (int i = 0; i < n; ++i) chainOf[i] = (int)(std::find(chains.begin(), chains.end(), asym[i]) - chains.begin());
-  std::vector<double> rowSum((size_t)n * nc, 0.0); std::vector<int> chainCount(nc, 0);
-  for (int j = 0; j < n; ++j) if (seq[j] > 0 && chainOf[j] < nc) chainCount[chainOf[j]]++;
-  if (!tmTerm.empty())
-    for (int i = 0; i < n; ++i) {
-      if (!(seq[i] > 0)) continue;
-      double* r = rowSum.data() + (size_t)i * nc;
-      for (int j = 0; j < n; ++j) if (seq[j] > 0 && chainOf[j] < nc) r[chainOf[j]] += tmTerm[(size_t)i * n + j];
-    }
-  // max over the anchors of chain `from` (or every chain but it, `others`) of their mean over chain `to`'s pairs (or
-  // over every chain but `to`'s, `notTo`); NaN when nothing is selected. The anchors the tokens with frames (AF3's
-  // pae_single_mask: an ion's row aligns nothing); tmTerm the INTERFACE term, d0 a chain pair's (confidence.cuh)
+  // the chains, by asym id; chain_pair_iptm, chain_ptm and chain_iptm as AlphaFold 3 defines them (cuda/featurise/ptm.h,
+  // every port's): tmTerm the INTERFACE term (confidence.cuh's tmChainK), anchored on the tokens with frames
+  const ptm::Layout L = ptm::layout(asym, seq, n);
+  const std::vector<int>& chains = L.ids; const std::vector<int>& chainOf = L.of;
+  const int nc = L.nc();
   const std::vector<char> frame = tokenFrameMask(n);
-  auto best = [&](int from, bool others, int to, bool notTo) {
-    double top = -1e30; bool any = false;
-    for (int i = 0; i < n; ++i) {
-      if (!(seq[i] > 0) || !frame[i] || chainOf[i] >= nc || (others ? chainOf[i] == from : chainOf[i] != from)) continue;
-      const double* r = rowSum.data() + (size_t)i * nc;
-      double total = 0; int count = 0;
-      if (notTo) { for (int b = 0; b < nc; ++b) if (b != to) { total += r[b]; count += chainCount[b]; } }
-      else { total = r[to]; count = chainCount[to]; }
-      if (count) { any = true; top = std::max(top, total / count); }
-    }
-    return any ? top : NAN;
-  };
-  auto maxNan = [](double x, double y) { return std::isnan(x) ? y : std::isnan(y) ? x : std::max(x, y); };
+  ptm::Chains cs;
+  if (!tmTerm.empty()) cs = ptm::chainScores(tmTerm.data(), n, L, frame.data());
+  else { cs.pair.assign((size_t)nc * nc, NAN); cs.ptm.assign(nc, NAN); cs.iptm.assign(nc, NAN); }
+  const std::vector<double>& chainPtm = cs.ptm; const std::vector<double>& chainIptm = cs.iptm; const std::vector<double>& pairIptm = cs.pair;
   auto num = [](FILE* f, double v) { if (std::isfinite(v)) fprintf(f, "%.2f", v); else fprintf(f, "null"); };
-  // chain_pair_iptm (confidences.py's chain_pairwise_predicted_tm_scores): on the diagonal the chain's pTM, off it the
-  // pair's ipTM - anchors in either chain over the other; chain_iptm (iptm_xchain) the mean of a chain's row of it off
-  // the diagonal, NaN ones left out
-  std::vector<double> chainPtm(nc, NAN), chainIptm(nc, NAN), pairIptm((size_t)nc * nc, NAN);
-  for (int a = 0; a < nc && !tmTerm.empty(); ++a)
-    for (int b = 0; b < nc; ++b)
-      pairIptm[(size_t)a * nc + b] = a == b ? best(a, false, a, false) : maxNan(best(a, false, b, false), best(b, false, a, false));
-  for (int a = 0; a < nc && !tmTerm.empty(); ++a) {
-    chainPtm[a] = pairIptm[(size_t)a * nc + a];
-    double sum = 0; int cnt = 0;
-    for (int b = 0; b < nc; ++b) if (b != a && std::isfinite(pairIptm[(size_t)a * nc + b])) { sum += pairIptm[(size_t)a * nc + b]; ++cnt; }
-    chainIptm[a] = cnt ? sum / cnt : NAN;
-  }
   f = fopen((stem + "_summary_confidences.json").c_str(), "w");
   fprintf(f, "{\n  \"chain_ids\": [");
   for (int i = 0; i < n; ++i) fprintf(f, "%s\"%s\"", i ? ", " : "", chainId(asym[i]).c_str());
@@ -781,7 +742,7 @@ inline void writeConfidences(const std::string& pdbPath, const std::vector<size_
     std::vector<double> mx((size_t)nc * nc, -1);
     for (int i = 0; i < n; ++i) for (int j = i + 1; j < n; ++j) {
       int a = chainOf[i], b = chainOf[j];
-      if (a >= nc || b >= nc || (a == b && std::abs(res[i] - res[j]) <= 6)) continue;
+      if (a < 0 || b < 0 || (a == b && std::abs(res[i] - res[j]) <= 6)) continue;
       double v = contact[(size_t)i * n + j];
       if (v > mx[(size_t)a * nc + b]) mx[(size_t)a * nc + b] = mx[(size_t)b * nc + a] = v;
     }
