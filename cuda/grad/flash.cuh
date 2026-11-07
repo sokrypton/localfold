@@ -140,7 +140,7 @@ __device__ __forceinline__ void loadAdd(float* T, const Sdpa& a, int b, int h, i
   bool vec[2];
 #pragma unroll
   for (int j = 0; j < 2; ++j) {
-    bp[j] = a.bias[j].p ? a.bias[j].p + b * a.bias[j].sb + h * a.bias[j].sh + k0 + c4 : nullptr;
+    bp[j] = a.bias[j].p ? a.bias[j].p + a.bias[j].off(b) + h * a.bias[j].sh + k0 + c4 : nullptr;
     vec[j] = bp[j] && k0 + c4 + 4 <= a.K && a.bias[j].sq % 4 == 0 && ((uintptr_t)bp[j] & 15) == 0;
   }
 #pragma unroll
@@ -401,8 +401,8 @@ __global__ void __launch_bounds__(THREADS, MODE == 1 ? 2 : 3) bwdK(Sdpa a, const
   const float* lgb = lseb + (size_t)a.B * a.H * a.Q;
   const float* Dib = Di + ((size_t)b * a.H + h) * a.Q;
   float* dqb = dq + (size_t)b * a.Q * lddq + h * D;
-  real* g0 = a.bias[0].grad ? a.bias[0].grad + b * a.bias[0].sb + h * a.bias[0].sh + k0 : nullptr;
-  real* g1 = a.bias[1].grad ? a.bias[1].grad + b * a.bias[1].sb + h * a.bias[1].sh + k0 : nullptr;
+  real* g0 = a.bias[0].grad ? a.bias[0].grad + a.bias[0].off(b) + h * a.bias[0].sh + k0 : nullptr;
+  real* g1 = a.bias[1].grad ? a.bias[1].grad + a.bias[1].off(b) + h * a.bias[1].sh + k0 : nullptr;
   for (int q0 = 0; q0 < a.Q; q0 += BR) {
     __syncthreads();
     loadTile<D, SPLIT ? 3 : BF ? 0 : 1>(Qs, qb_, ldq, q0, a.Q);
@@ -666,7 +666,7 @@ __global__ void biasBfK(Sdpa a, uint16_t* __restrict__ out, int Bb, int Hh, int 
   if (q < a.Q && k < a.K)
     for (int j = 0; j < 2; ++j) {
       const Bias& B = a.bias[j];
-      if (B.p && B.sq != 0) v += B.p[b * B.sb + h * B.sh + (long long)q * B.sq + k];
+      if (B.p && B.sq != 0) v += B.p[B.off(b) + h * B.sh + (long long)q * B.sq + k];
     }
   out[i] = (uint16_t)(bf2(v, 0.f) & 0xffff);
 }
@@ -695,7 +695,7 @@ __device__ __forceinline__ float keyAdd(const Sdpa& a, int b, int h, int k) {
   float v = a.keyMask ? 1e9f * (a.keyMask[(size_t)b * a.K + k] - 1.f) : 0.f;
   for (int j = 0; j < 2; ++j) {
     const Bias& B = a.bias[j];
-    if (B.p && B.sq == 0) v += B.p[b * B.sb + h * B.sh + k];
+    if (B.p && B.sq == 0) v += B.p[B.off(b) + h * B.sh + k];
   }
   return v;
 }
@@ -1027,8 +1027,8 @@ __global__ void __launch_bounds__(THREADS, 3) bwdBf(Sdpa a, BiasTile bt, HSrc qs
 #pragma unroll
     for (int e = 0; e < 4; ++e) dka[n][e] = dva[n][e] = 0.f;
   float* dqb = dq + (size_t)b * a.Q * lddq + h * D;
-  real* g0 = a.bias[0].grad ? a.bias[0].grad + b * a.bias[0].sb + h * a.bias[0].sh + k0 : nullptr;
-  real* g1 = a.bias[1].grad ? a.bias[1].grad + b * a.bias[1].sb + h * a.bias[1].sh + k0 : nullptr;
+  real* g0 = a.bias[0].grad ? a.bias[0].grad + a.bias[0].off(b) + h * a.bias[0].sh + k0 : nullptr;
+  real* g1 = a.bias[1].grad ? a.bias[1].grad + a.bias[1].off(b) + h * a.bias[1].sh + k0 : nullptr;
   // (the bias gradients in fixed point - bindcraft2's nbbFixed: an integer sum is the same in any order, so the
   // gradient is deterministic where float atomics differ run to run)
   unsigned long long* f0 = fx0 && g0 ? fx0 + (g0 - a.bias[0].grad) : nullptr;
@@ -1656,7 +1656,7 @@ inline void backwardBf(const Sdpa& a, const X* q, int ldq, const X* k, int ldk, 
   for (int j = 0; j < 2; ++j) {
     const Bias& B = a.bias[j];
     if (!B.grad || !a.deterministic) continue;
-    ext[j] = (size_t)((B.sb ? a.B - 1 : 0) * B.sb + (B.sh ? a.H - 1 : 0) * B.sh + (long long)(a.Q - 1) * B.sq + a.K);
+    ext[j] = (size_t)((B.sb ? (B.bm ? B.bm : a.B) - 1 : 0) * B.sb + (B.sh ? a.H - 1 : 0) * B.sh + (long long)(a.Q - 1) * B.sq + a.K);
     fx[j] = reinterpret_cast<unsigned long long*>(ARENA.get(2 * ext[j]));
     GK(cudaMemsetAsync(fx[j], 0, ext[j] * 8, STREAM));
   }
@@ -1721,7 +1721,7 @@ __global__ void __launch_bounds__(THREADS, 2) fwdT(Sdpa a, const float* __restri
   const int q0 = qb * BR, qr0 = q0 + warp * 16;
   const float* kb_ = k + (size_t)b * a.K * ldk + h * D;
   const float* vb_ = v + (size_t)b * a.K * ldv + h * D;
-  const float* bb_ = a.bias[0].p + b * a.bias[0].sb + h * a.bias[0].sh;
+  const float* bb_ = a.bias[0].p + a.bias[0].off(b) + h * a.bias[0].sh;
   const long long bsq = a.bias[0].sq;
   const float* km_ = a.keyMask ? a.keyMask + (size_t)b * a.K : nullptr;
   const float sc = a.scale;
@@ -1908,14 +1908,14 @@ __global__ void __launch_bounds__(THREADS, 2) bwdT(Sdpa a, const float* __restri
   const float* ob_ = dO + (size_t)b * a.Q * lddo + h * D;
   const float* kb_ = k + (size_t)b * a.K * ldk + h * D;
   const float* vb_ = v + (size_t)b * a.K * ldv + h * D;
-  const float* bb_ = a.bias[0].p + b * a.bias[0].sb + h * a.bias[0].sh + k0;
+  const float* bb_ = a.bias[0].p + a.bias[0].off(b) + h * a.bias[0].sh + k0;
   const long long bsq = a.bias[0].sq;
   const size_t bh = (size_t)b * a.H + h;
   const float* lseb = lse + bh * a.Q;
   const float* lgb = lseb + (size_t)a.B * a.H * a.Q;
   const float* Dib = Di + bh * a.Q;
   float* dqb = dq + (size_t)b * a.Q * lddq + h * D;
-  float* g0 = a.bias[0].grad ? a.bias[0].grad + b * a.bias[0].sb + h * a.bias[0].sh + k0 : nullptr;
+  float* g0 = a.bias[0].grad ? a.bias[0].grad + a.bias[0].off(b) + h * a.bias[0].sh + k0 : nullptr;
   const int nqt = (a.Q + QT - 1) / QT;
   auto issue = [&](int qt) {
     float* Qs = sm + (qt & 1) * ST;

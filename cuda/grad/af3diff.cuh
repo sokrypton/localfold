@@ -71,7 +71,7 @@ struct AdaZero {
   real mult = 1;
   bool identity = false;   // chai-1's atom blocks: no Transition2 (In == C), the input as it is
 };
-struct AzSave { const real* y; const real* cond; real *p, *g; size_t rows; };
+struct AzSave { const real* y; const real* cond; real *p, *g; size_t rows; size_t per = 0; };   // (per: azForwardGate's)
 inline AzSave azForward(const AdaZero& z, const real* y, const real* cond, real* out, size_t rows) {
   AzSave s{y, cond, ARENA.get(rows * z.proj.N), ARENA.get(rows * z.proj.N), rows};
   if (z.identity) GK(cudaMemcpyAsync(s.p, y, rows * z.proj.N * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
@@ -110,29 +110,45 @@ inline AdaPre adaPre(const AdaLn& a, const real* cond, size_t rows) {
   p.sh = ARENA.get(rows * a.C); a.shift.forward(p.cn, p.sh, rows);
   return p;
 }
-inline AdaSave adaForward(const AdaLn& a, const real* x, const AdaPre& p, real* out) {
-  AdaSave s{}; s.rows = p.rows;
-  s.xn = ARENA.get(p.rows * a.C);
-  s.lx = lnForward(a.xNorm, x, s.xn, p.rows);
-  s.cn = p.cn; s.sig = p.sig; s.lc = p.lc;
-  adaCombineK<<<blocks(p.rows * a.C), 256, 0, STREAM>>>(s.xn, p.sig, p.sh, out, p.rows * a.C, 1, a.chai);
-  return s;
-}
-// adaBwdK with the scale's pre-activation gradient and the shift's (dout) added into dsig and dsh
-__global__ void adaBwdAccK(const real* dout, const real* xn, const real* pre, real* dsig, real* dsh, real* dxn, size_t n, real plus, bool raw) {
+// (S: S samples' rows stacked over the one conditioning p was made from - x [S p.rows, C], its terms read modulo)
+__global__ void adaCombinePK(const real* xn, const real* sig, const real* sh, real* out, size_t n, size_t per, real plus, bool raw) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= n) return;
-  real s, ds;
-  if (raw) { s = pre[t] + plus; ds = 1; } else { s = 1 / (1 + exp(-pre[t])); ds = s * (1 - s); }
-  dsig[t] += dout[t] * xn[t] * ds;
-  dsh[t] += dout[t];
-  dxn[t] = dout[t] * s;
+  const size_t u = t % per;
+  real s = raw ? sig[u] + plus : 1 / (1 + exp(-sig[u]));
+  out[t] = s * xn[t] + sh[u];
 }
-// dout -> dx (added); the conditioning's gradients into dsig, dsh (added)
-inline void adaBackward(AdaLn& a, const AdaSave& s, const real* dout, real* dx, real* dsig, real* dsh) {
+inline AdaSave adaForward(const AdaLn& a, const real* x, const AdaPre& p, real* out, int S = 1) {
+  AdaSave s{}; s.rows = p.rows * S;
+  s.xn = ARENA.get(s.rows * a.C);
+  s.lx = lnForward(a.xNorm, x, s.xn, s.rows);
+  s.cn = p.cn; s.sig = p.sig; s.lc = p.lc;
+  adaCombinePK<<<blocks(s.rows * a.C), 256, 0, STREAM>>>(s.xn, p.sig, p.sh, out, s.rows * a.C, p.rows * a.C, 1, a.chai);
+  return s;
+}
+// adaBwdK with the scale's pre-activation gradient and the shift's (dout) added into dsig and dsh - over S samples
+// stacked on one conditioning [per], each element's S terms summed in sample order (a thread an element)
+__global__ void adaBwdAccK(const real* dout, const real* xn, const real* pre, real* dsig, real* dsh, real* dxn, size_t per, int S,
+                           real plus, bool raw) {
+  size_t u = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (u >= per) return;
+  real s, ds;
+  if (raw) { s = pre[u] + plus; ds = 1; } else { s = 1 / (1 + exp(-pre[u])); ds = s * (1 - s); }
+  real gs = dsig[u], gh = dsh[u];
+  for (int k = 0; k < S; ++k) {
+    const size_t t = (size_t)k * per + u;
+    gs += dout[t] * xn[t] * ds;
+    gh += dout[t];
+    dxn[t] = dout[t] * s;
+  }
+  dsig[u] = gs; dsh[u] = gh;
+}
+// dout -> dx (added); the conditioning's gradients into dsig, dsh (added; S: as adaForward's)
+inline void adaBackward(AdaLn& a, const AdaSave& s, const real* dout, real* dx, real* dsig, real* dsh, int S = 1) {
   Scratch scratch;
   real* dxn = ARENA.get(s.rows * a.C);
-  adaBwdAccK<<<blocks(s.rows * a.C), 256, 0, STREAM>>>(dout, s.xn, s.sig, dsig, dsh, dxn, s.rows * a.C, 1, a.chai);
+  const size_t per = s.rows / S * a.C;
+  adaBwdAccK<<<blocks(per), 256, 0, STREAM>>>(dout, s.xn, s.sig, dsig, dsh, dxn, per, S, 1, a.chai);
   lnBackward(a.xNorm, s.lx, dxn, dx, s.rows, true);
 }
 inline void adaPreBackward(AdaLn& a, const AdaPre& p, const real* dsig, const real* dsh, real* dcond) {
@@ -150,30 +166,41 @@ inline real* azPre(const AdaZero& z, const real* cond, size_t rows) {
   sigmoidK<<<blocks(rows * z.proj.N), 256, 0, STREAM>>>(g, rows * z.proj.N);
   return g;
 }
-inline AzSave azForwardGate(const AdaZero& z, const real* y, real* g, real* out, size_t rows) {
-  AzSave s{y, nullptr, ARENA.get(rows * z.proj.N), g, rows};
+__global__ void mulPK(real* y, const real* a, const real* b, size_t n, size_t per) {   // y = a b[t % per]
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t < n) y[t] = a[t] * b[t % per];
+}
+// (S: S samples' rows stacked over the one gate - y and out [S rows / S ...])
+inline AzSave azForwardGate(const AdaZero& z, const real* y, real* g, real* out, size_t rows, int S = 1) {
+  AzSave s{y, nullptr, ARENA.get(rows * z.proj.N), g, rows, rows / S * z.proj.N};
   if (z.identity) GK(cudaMemcpyAsync(s.p, y, rows * z.proj.N * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
   else z.proj.forward(y, s.p, rows);
   if (z.mult != 1) scaleK<<<blocks(rows * z.proj.N), 256, 0, STREAM>>>(s.p, z.mult, rows * z.proj.N);
   Scratch scratch;
   real* t = ARENA.get(rows * z.proj.N);
-  mulK<<<blocks(rows * z.proj.N), 256, 0, STREAM>>>(t, s.p, s.g, rows * z.proj.N);
+  mulPK<<<blocks(rows * z.proj.N), 256, 0, STREAM>>>(t, s.p, s.g, rows * z.proj.N, s.per);
   add(out, t, rows * z.proj.N);
   return s;
 }
-__global__ void gateBwdAccK(const real* dy, const real* a, const real* sig, real* da, real* dpre, size_t n) {
-  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= n) return;
-  real s = sig[t];
-  da[t] = dy[t] * s;
-  dpre[t] += dy[t] * a[t] * s * (1.f - s);
+// (over S samples stacked on one gate [per]: each element's S terms summed in sample order)
+__global__ void gateBwdAccK(const real* dy, const real* a, const real* sig, real* da, real* dpre, size_t per, int S) {
+  size_t u = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (u >= per) return;
+  const real s = sig[u];
+  real g = dpre[u];
+  for (int k = 0; k < S; ++k) {
+    const size_t t = (size_t)k * per + u;
+    da[t] = dy[t] * s;
+    g += dy[t] * a[t] * s * (1.f - s);
+  }
+  dpre[u] = g;
 }
 // dout -> dy (written); the gate's pre-activation gradient into dg (added)
 inline void azBackwardGate(AdaZero& z, const AzSave& s, const real* dout, real* dy, real* dg) {
   Scratch scratch;
   size_t rows = s.rows; const int C = z.proj.N;
   real* dp = ARENA.get(rows * C);
-  gateBwdAccK<<<blocks(rows * C), 256, 0, STREAM>>>(dout, s.p, s.g, dp, dg, rows * C);
+  gateBwdAccK<<<blocks(s.per), 256, 0, STREAM>>>(dout, s.p, s.g, dp, dg, s.per, (int)(rows * C / s.per));
   if (z.mult != 1) scaleK<<<blocks(rows * C), 256, 0, STREAM>>>(dp, z.mult, rows * C);
   if (z.identity) GK(cudaMemcpyAsync(dy, dp, rows * C * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
   else z.proj.backward(s.y, dp, dy, rows);
@@ -576,13 +603,17 @@ struct AtomCtx {               // what every block of a stack shares
   Gather toKeys;               // queriesToKeys
   const real *qMask, *kMask, *qCond, *kCond, *maskBias;
   int subsets = 0, Q = 32, K = 128;
+  // share: the subsets of one sample where a diffusion batch's samples are stacked (subsets = S share; 0: one sample) -
+  // the pair logits, the mask bias and the blocks' conditioning terms (StackPre) then one sample's, read by all
+  int share = 0;
+  int samples() const { return share ? subsets / share : 1; }
 };
 struct AtomSave { AdaSave aq, ak, af; LnSave lq, lk; real *act0, *keys, *xq, *xk, *qkvg, *qraw, *kraw, *o, *og, *x1, *h, *u, *g; AzSave z1, z2; real* lse = nullptr; };
 inline Sdpa atomSdpa(const AtomBlock& b, const AtomCtx& c, const real* pl, real* dpl = nullptr) {
   Sdpa a;
   a.B = c.subsets; a.H = b.H; a.Q = c.Q; a.K = c.K; a.D = b.D; a.scale = 1 / sqrt((real)b.D);
-  a.bias[0] = Bias{pl, (long long)b.H * c.Q * c.K, (long long)c.Q * c.K, c.K, dpl};
-  a.bias[1] = Bias{c.maskBias, (long long)c.Q * c.K, 0, c.K, nullptr};
+  a.bias[0] = Bias{pl, (long long)b.H * c.Q * c.K, (long long)c.Q * c.K, c.K, dpl, c.share};
+  a.bias[1] = Bias{c.maskBias, (long long)c.Q * c.K, 0, c.K, nullptr, c.share};
   return a;
 }
 // a block's conditioning terms, made once for a batch (stackPre), and their gradients summed over it (stackGrads)
@@ -595,9 +626,10 @@ inline AtomSave atomForward(const AtomBlock& b, const AtomCtx& c, const real* ac
   AtomSave s{};
   s.act0 = const_cast<real*>(act);
   if (b.maskActPerBlock) { s.act0 = cloneR(act, Rq * C); rowMaskK<<<blocks(Rq * C), 256, 0, STREAM>>>(s.act0, c.qMask, Rq, C); }
-  s.xq = ARENA.get(Rq * C); s.aq = bp ? adaForward(b.lnQ, s.act0, bp->q, s.xq) : adaForward(b.lnQ, s.act0, c.qCond, s.xq, Rq);
+  const int S = c.samples();   // (S > 1: bp's terms one sample's)
+  s.xq = ARENA.get(Rq * C); s.aq = bp ? adaForward(b.lnQ, s.act0, bp->q, s.xq, S) : adaForward(b.lnQ, s.act0, c.qCond, s.xq, Rq);
   s.keys = ARENA.get(Rk * C); gather(c.toKeys, b.chained ? s.xq : s.act0, s.keys, C);
-  s.xk = ARENA.get(Rk * C); s.ak = bp ? adaForward(b.lnK, s.keys, bp->k, s.xk) : adaForward(b.lnK, s.keys, c.kCond, s.xk, Rk);
+  s.xk = ARENA.get(Rk * C); s.ak = bp ? adaForward(b.lnK, s.keys, bp->k, s.xk, S) : adaForward(b.lnK, s.keys, c.kCond, s.xk, Rk);
   s.qkvg = ARENA.get(Rq * 2 * HD + Rk * 2 * HD);
   real *q = s.qkvg, *g = q + Rq * HD, *k = g + Rq * HD, *v = k + Rk * HD;
   if (b.kqNorm) {
@@ -612,15 +644,15 @@ inline AtomSave atomForward(const AtomBlock& b, const AtomCtx& c, const real* ac
   s.og = ARENA.get(Rq * HD);
   mulK<<<blocks(Rq * HD), 256, 0, STREAM>>>(s.og, s.o, g, Rq * HD);
   s.x1 = cloneR(s.act0, Rq * C);
-  s.z1 = bp ? azForwardGate(b.z1, s.og, bp->g1, s.x1, Rq) : azForward(b.z1, s.og, c.qCond, s.x1, Rq);
+  s.z1 = bp ? azForwardGate(b.z1, s.og, bp->g1, s.x1, Rq, S) : azForward(b.z1, s.og, c.qCond, s.x1, Rq);
   real* xf = ARENA.get(Rq * C);
-  s.af = bp ? adaForward(b.lnF, b.noResidual ? s.act0 : s.x1, bp->f, xf) : adaForward(b.lnF, b.noResidual ? s.act0 : s.x1, c.qCond, xf, Rq);
+  s.af = bp ? adaForward(b.lnF, b.noResidual ? s.act0 : s.x1, bp->f, xf, S) : adaForward(b.lnF, b.noResidual ? s.act0 : s.x1, c.qCond, xf, Rq);
   s.h = ARENA.get(Rq * 2 * I); b.t1.forward(xf, s.h, Rq);
   if (b.hasUp) { s.u = ARENA.get(Rq * I); b.up.forward(xf, s.u, Rq); }
   s.g = ARENA.get(Rq * I);
   swigluUpK<<<blocks(Rq * I), 256, 0, STREAM>>>(s.h, b.hasUp ? s.u : nullptr, s.g, Rq, I);
   GK(cudaMemcpyAsync(out, s.x1, Rq * C * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
-  s.z2 = bp ? azForwardGate(b.z2, s.g, bp->g2, out, Rq) : azForward(b.z2, s.g, c.qCond, out, Rq);
+  s.z2 = bp ? azForwardGate(b.z2, s.g, bp->g2, out, Rq, S) : azForward(b.z2, s.g, c.qCond, out, Rq);
   return s;
 }
 // dout -> dact (written), dqCond, dkCond (added), dpl (added)
@@ -637,13 +669,14 @@ inline void atomBackward(AtomBlock& b, const AtomCtx& c, const AtomSave& s, cons
   real *dh = ARENA.get(Rq * 2 * I), *du = b.hasUp ? ARENA.get(Rq * I) : nullptr;
   swigluUpBwdK<<<blocks(Rq * I), 256, 0, STREAM>>>(s.h, b.hasUp ? s.u : nullptr, dg, dh, du, Rq, I);
   real* xf = ARENA.get(Rq * C);
+  const int S = c.samples();   // (S > 1: bp's terms one sample's, the gradients into them summed over the S)
   { const real* sh = bp ? bp->f.sh : nullptr;
     if (!sh) { real* t = ARENA.get(Rq * C); b.lnF.shift.forward(s.af.cn, t, Rq); sh = t; }
-    adaCombineK<<<blocks(Rq * C), 256, 0, STREAM>>>(s.af.xn, s.af.sig, sh, xf, Rq * C, 1, b.lnF.chai); }
+    adaCombinePK<<<blocks(Rq * C), 256, 0, STREAM>>>(s.af.xn, s.af.sig, sh, xf, Rq * C, Rq / S * C, 1, b.lnF.chai); }
   real* dxf = ARENA.get(Rq * C);
   b.t1.backward(xf, dh, dxf, Rq);
   if (b.hasUp) b.up.backward(xf, du, dxf, Rq, true);
-  if (bg) adaBackward(b.lnF, s.af, dxf, b.noResidual ? dact0 : dx1, bg->sigF, bg->shF);
+  if (bg) adaBackward(b.lnF, s.af, dxf, b.noResidual ? dact0 : dx1, bg->sigF, bg->shF, S);
   else adaBackward(b.lnF, s.af, dxf, b.noResidual ? dact0 : dx1, dqCond);
   real* dog = ARENA.get(Rq * HD);
   if (bg) azBackwardGate(b.z1, s.z1, dx1, dog, bg->g1); else azBackward(b.z1, s.z1, dx1, dog, dqCond);
@@ -665,9 +698,9 @@ inline void atomBackward(AtomBlock& b, const AtomCtx& c, const AtomSave& s, cons
   b.k.backward(s.xk, dk, dxk, Rk);
   b.v.backward(s.xk, dv, dxk, Rk, true);
   real* dkeys = ARENA.zeros(Rk * C);
-  if (bg) adaBackward(b.lnK, s.ak, dxk, dkeys, bg->sigK, bg->shK); else adaBackward(b.lnK, s.ak, dxk, dkeys, dkCond);
+  if (bg) adaBackward(b.lnK, s.ak, dxk, dkeys, bg->sigK, bg->shK, S); else adaBackward(b.lnK, s.ak, dxk, dkeys, dkCond);
   if (b.chained) scatter(c.toKeys, dkeys, dxq, C); else scatter(c.toKeys, dkeys, dact0, C);
-  if (bg) adaBackward(b.lnQ, s.aq, dxq, dact0, bg->sigQ, bg->shQ); else adaBackward(b.lnQ, s.aq, dxq, dact0, dqCond);
+  if (bg) adaBackward(b.lnQ, s.aq, dxq, dact0, bg->sigQ, bg->shQ, S); else adaBackward(b.lnQ, s.aq, dxq, dact0, dqCond);
   add(dx1, dact0, Rq * C);
   if (b.maskActPerBlock) rowMaskK<<<blocks(Rq * C), 256, 0, STREAM>>>(dx1, c.qMask, Rq, C);
   GK(cudaMemcpyAsync(dact, dx1, Rq * C * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
@@ -790,7 +823,8 @@ inline void stackPreBackward(AtomStack& st, const AtomCtx& c, const real* pair, 
 inline void stackForward(AtomStack& st, const AtomCtx& c, const real* pair, const real* act, real* out, StackRun& r,
                          const StackPre* pre = nullptr) {
   const int nb = (int)st.blocks.size(), H = st.H;
-  const size_t Rq = (size_t)c.subsets * c.Q, rows = (size_t)c.subsets * c.Q * c.K, per = (size_t)c.subsets * H * c.Q * c.K;
+  // (per: a block's logits - one sample's where samples are stacked over them)
+  const size_t Rq = (size_t)c.subsets * c.Q, rows = (size_t)c.subsets * c.Q * c.K, per = (size_t)(c.share ? c.share : c.subsets) * H * c.Q * c.K;
   r.Rq = Rq;
   r.acts.assign(nb + 1, nullptr);
   for (auto& p : r.acts) p = ARENA.get(Rq * st.C);
@@ -810,7 +844,7 @@ inline void stackBackward(AtomStack& st, const AtomCtx& c, const real* pair, con
                           real* dqCond, real* dkCond, real* dpair, const StackPre* pre = nullptr, StackGrads* sg = nullptr) {
   Scratch scratch;
   const int nb = (int)st.blocks.size(), H = st.H;
-  const size_t Rq = r.Rq, per = (size_t)c.subsets * H * c.Q * c.K;
+  const size_t Rq = r.Rq, per = (size_t)(c.share ? c.share : c.subsets) * H * c.Q * c.K;
   real* dpl = sg ? sg->dpl : ARENA.zeros(per * nb);
   real* dx = cloneR(dout, Rq * st.C);
   real* tmp = ARENA.get(Rq * st.C);

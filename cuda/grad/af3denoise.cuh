@@ -61,6 +61,55 @@ __global__ void fourierBwdK(const real* w, const real* b, real tr, const real* d
   real s = -sin((real)6.283185307179586 * (tr * w[k] + b[k])) * (real)6.283185307179586 * d[k];
   dw[k] += s * tr; db[k] += s;
 }
+// ---- a diffusion batch's samples stacked: [S, per] against one sample's [per]
+__global__ void tileK(real* y, const real* x, size_t per, size_t n) {   // y[t] = x[t % per]
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t < n) y[t] = x[t % per];
+}
+__global__ void addRepK(real* y, const real* x, size_t per, int S) {   // y[u] += x[0, u] + ... + x[S - 1, u], in turn
+  size_t u = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (u >= per) return;
+  real v = y[u];
+  for (int k = 0; k < S; ++k) v += x[(size_t)k * per + u];
+  y[u] = v;
+}
+inline void addRep(real* y, const real* x, size_t per, int S) { addRepK<<<blocks(per), 256, 0, STREAM>>>(y, x, per, S); }
+__global__ void repGatherK(const int* idx, const real* m, int count, int off, int* oi, real* om, size_t n) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= n) return;
+  const size_t u = t % count;
+  oi[t] = idx[u] + (int)(t / count) * off; om[t] = m[u];
+}
+// S samples' copies of the out-of-place parts of x [S n, C] = base [n, C] + v[k] (sample k's noise projection)
+__global__ void addBaseSK(real* x, const real* base, const real* v, size_t per, int C, size_t n) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t < n) x[t] = base[t % per] + v[t / per * C + t % C];
+}
+__global__ void colSumSK(real* g, const real* d, size_t rows, int C, int S) {   // g[k, c] = sum_r d[k, r, c]
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)S * C) return;
+  const size_t k = t / C; const int c = t % C;
+  real v = 0;
+  for (size_t r = 0; r < rows; ++r) v += d[(k * rows + r) * C + c];
+  g[t] = v;
+}
+__global__ void fourierFwdSK(const real* w, const real* b, const real* scal, real* out, int nc, int S) {
+  size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= (size_t)S * nc) return;
+  const int k = t / nc, j = t % nc;
+  out[t] = cos((real)6.283185307179586 * (scal[k * 4] * w[j] + b[j]));
+}
+__global__ void fourierBwdSK(const real* w, const real* b, const real* scal, const real* d, real* dw, real* db, int nc, int S) {
+  int j = blockIdx.x * blockDim.x + threadIdx.x;
+  if (j >= nc) return;
+  real gw = dw[j], gb = db[j];
+  for (int k = 0; k < S; ++k) {
+    const real tr = scal[k * 4];
+    real s = -sin((real)6.283185307179586 * (tr * w[j] + b[j])) * (real)6.283185307179586 * d[(size_t)k * nc + j];
+    gw += s * tr; gb += s;
+  }
+  dw[j] = gw; db[j] = gb;
+}
 // x[r, c] += v[c] (forward); dv[c] += sum_r d[r, c] (backward is colSum)
 __global__ void addRowVecK(real* x, const real* v, size_t rows, int C) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -176,6 +225,43 @@ inline CondSave condSingleForward(DiffCond& c, const CondSave& base, real sigma,
   s.sFinal = s.sOut;
   if (c.hasSingleFinal) { s.sFinal = ARENA.get((size_t)n * c.Cs); s.lf = lnForward(c.singleFinal, s.sOut, s.sFinal, n); }
   return s;
+}
+// ...for S noise levels at once (scal [S, 4], denoiseScalars'): the single half [S n, Cs], base's pair half everyone's
+inline CondSave condSingleBatch(DiffCond& c, const CondSave& base, const real* scal, int S) {
+  CondSave s = base;
+  const int n = base.n; const size_t rows = (size_t)S * n;
+  s.e = ARENA.get((size_t)S * c.nc); fourierFwdSK<<<blocks((size_t)S * c.nc), 256, 0, STREAM>>>(c.fw.w, c.fb.w, scal, s.e, c.nc, S);
+  s.en = ARENA.get((size_t)S * c.nc); s.le = lnForward(c.noiseLn, s.e, s.en, S);
+  s.nproj = ARENA.get((size_t)S * c.Cs); c.noiseProj.forward(s.en, s.nproj, S);
+  s.s0 = ARENA.get(rows * c.Cs);
+  addBaseSK<<<blocks(rows * c.Cs), 256, 0, STREAM>>>(s.s0, s.base, s.nproj, (size_t)n * c.Cs, c.Cs, rows * c.Cs);
+  s.s1 = cloneR(s.s0, rows * c.Cs); s.st0 = gtForward(c.singleT[0], s.s0, s.s1, rows, 1);
+  s.sOut = cloneR(s.s1, rows * c.Cs); s.st1 = gtForward(c.singleT[1], s.s1, s.sOut, rows, 1);
+  s.sFinal = s.sOut;
+  if (c.hasSingleFinal) { s.sFinal = ARENA.get(rows * c.Cs); s.lf = lnForward(c.singleFinal, s.sOut, s.sFinal, rows); }
+  return s;
+}
+// its backward: dsingle [S n, Cs] -> dtrunkSingle, dtargetFeat (added; may be null). The noise-free projection is linear
+// in the samples' summed gradient, so it is taken back once
+inline void condSingleBatchBackward(DiffCond& c, const CondSave& s, const real* scal, int S, const real* dsingle,
+                                    real* dtrunkSingle, real* dtargetFeat) {
+  Scratch scratch;
+  const int n = s.n, SW = c.swidth(); const size_t rows = (size_t)S * n;
+  real* ds = cloneR(dsingle, rows * c.Cs);
+  if (c.hasSingleFinal) { real* t = ARENA.get(rows * c.Cs); lnBackward(c.singleFinal, s.lf, ds, t, rows, false); ds = t; }
+  { real* du = cloneR(ds, rows * c.Cs); gtBackward(c.singleT[1], s.st1, du, ds); }
+  { real* du = cloneR(ds, rows * c.Cs); gtBackward(c.singleT[0], s.st0, du, ds); }
+  real* dnp = ARENA.get((size_t)S * c.Cs);
+  colSumSK<<<blocks((size_t)S * c.Cs), 256, 0, STREAM>>>(dnp, ds, n, c.Cs, S);
+  real* den = ARENA.get((size_t)S * c.nc); c.noiseProj.backward(s.en, dnp, den, S);
+  real* de = ARENA.get((size_t)S * c.nc); lnBackward(c.noiseLn, s.le, den, de, S, false);
+  fourierBwdSK<<<blocks(c.nc), 256, 0, STREAM>>>(c.fw.w, c.fb.w, scal, de, c.fw.g, c.fb.g, c.nc, S);
+  real* dsum = ARENA.zeros((size_t)n * c.Cs); addRep(dsum, ds, (size_t)n * c.Cs, S);
+  real* df1n = ARENA.get((size_t)n * SW); c.singleProj.backward(s.f1n, dsum, df1n, n);
+  real* df1 = ARENA.get((size_t)n * SW); lnBackward(c.singleLn, s.ls, df1n, df1, n, false);
+  real* tsd = dtrunkSingle ? dtrunkSingle : ARENA.zeros((size_t)n * c.Cst);
+  concat2K<<<blocks((size_t)n * SW), 256, 0, STREAM>>>(nullptr, c.Cst, nullptr, c.F, df1, n, c.pad ? c.Cst + 31 : -1,
+                                                       c.pad ? c.Cst + 63 : -1, tsd, dtargetFeat);
 }
 // dpair [nn, Cz], dsingle [n, Cs] -> dtrunkSingle, dtrunkPair, dtargetFeat (added; any may be null). Either input may be
 // null, its half skipped: a batch backs each sample's single half and then the samples' summed pair once
@@ -373,15 +459,17 @@ __global__ void broadcastBwdK(const real* d, const int* t2qI, const real* t2qM, 
   if (t2qM[q] != 0) atomicAdd(&dproj[(size_t)(t2qI[q] / dense) * C + c], g);
 }
 // out = (skip x + out upd) mask, and the scaled input x mask in
+// (scal: [tr, in, sk, ou] on the device instead - a sample's every perS atoms, samples stacked; perS 0: one)
 __global__ void edmOutK(const real* x, const real* upd, const real* mask, real* o, size_t atoms, real sk, real ou,
-                        const real* scal = nullptr) {
+                        const real* scal = nullptr, size_t perS = 0) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (scal) { sk = scal[2]; ou = scal[3]; }
+  if (scal) { const size_t k = perS ? t / 3 / perS * 4 : 0; sk = scal[k + 2]; ou = scal[k + 3]; }
   if (t < atoms * 3) o[t] = (sk * x[t] + ou * upd[t]) * mask[t / 3];
 }
-__global__ void scaleMaskK(const real* x, const real* mask, real* y, size_t atoms, real a, const real* aD = nullptr) {
+__global__ void scaleMaskK(const real* x, const real* mask, real* y, size_t atoms, real a, const real* aD = nullptr,
+                           size_t perS = 0) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (aD) a = *aD;
+  if (aD) a = aD[perS ? t / 3 / perS * 4 : 0];
   if (t < atoms * 3) y[t] = x[t] * mask[t / 3] * a;
 }
 // the uid gather stock AF3 makes off the wrong layout (keysUidFromQueriesLayout off): the index clamped to the array
@@ -474,6 +562,7 @@ struct DenoiseSave {
   real *sn, *snP, *tok, *trOut, *actn, *scaled, *updAtoms, *out;
   real sigma, sk, ou, in;
   const real* scal = nullptr;   // (a sampler step's on the device instead: [tr, in, sk, ou], denoiseScalars' order)
+  size_t perS = 0;              // (samples stacked: the atoms of one, each with its own four scalars at scal)
   int n;
 };
 
@@ -558,7 +647,8 @@ inline EncSave encSample(DiffEncoder& e, const AtomBatch& b, EncSave s, const re
   const size_t Rq = (size_t)b.subsets * b.Q;
   // the queries: the start (cond, or its masked pre-trunk copy - chai's always), plus the positions' projection, masked
   const bool preStart = e.preTrunkQuery && (s.tsn || e.chai);   // (s.tsn: a trunk single was given)
-  s.act0 = cloneR(preStart ? s.qCond0 : s.qCond, Rq * C);
+  const int S = s.ctx.samples();   // (samples stacked: the conditioning one sample's, tiled)
+  s.act0 = ARENA.get(Rq * C); tileK<<<blocks(Rq * C), 256, 0, STREAM>>>(s.act0, preStart ? s.qCond0 : s.qCond, Rq / S * C, Rq * C);
   if (preStart) rowMaskK<<<blocks(Rq * C), 256, 0, STREAM>>>(s.act0, s.qMask, Rq, C);
   if (positions) {
     s.pos = ARENA.get(Rq * 3); gather(b.t2q, positions, s.pos, 3);
@@ -602,7 +692,7 @@ inline void encSampleBackward(DiffEncoder& e, const AtomBatch& b, const EncSave&
   e.aggr.backward(s.skip, dproj, dskip, Rq, true);
   rowMaskK<<<blocks(Rq * C), 256, 0, STREAM>>>(dskip, s.qMask, Rq, C);
   real* dact0 = ARENA.get(Rq * C);
-  if (dqCondIn) add(g.dqCond, dqCondIn, Rq * C);
+  if (dqCondIn) add(g.dqCond, dqCondIn, Rq * C);    // (null where samples are stacked: the decoder's then in g.sg)
   if (dpairIn) add(g.dpair, dpairIn, rows * Cp);
   stackBackward(e.stack, s.ctx, s.pair, s.run, dskip, dact0, g.dqCond, g.dkCond, g.dpair, &s.spre, &g.sg);
   if (positions) {
@@ -613,9 +703,10 @@ inline void encSampleBackward(DiffEncoder& e, const AtomBatch& b, const EncSave&
     if (e.hasChiral && b.chiral) { real* cg = ARENA.get(Rq * 3); gather(b.t2q, b.chiral, cg, 3); e.chiralProj.backward(cg, dpp, nullptr, Rq); }
     if (dpositions) scatter(b.t2q, dpos, dpositions, 3);
   }
+  const int S = s.ctx.samples();   // (samples stacked: their gradients into the shared conditioning summed)
   if (e.preTrunkQuery && (trunkSingle || e.chai)) {
-    real* t = cloneR(dact0, Rq * C); rowMaskK<<<blocks(Rq * C), 256, 0, STREAM>>>(t, s.qMask, Rq, C); add(g.dqCond0, t, Rq * C);
-  } else add(g.dqCond, dact0, Rq * C);
+    real* t = cloneR(dact0, Rq * C); rowMaskK<<<blocks(Rq * C), 256, 0, STREAM>>>(t, s.qMask, Rq, C); addRep(g.dqCond0, t, Rq / S * C, S);
+  } else addRep(g.dqCond, dact0, Rq / S * C, S);
 }
 // ...and the shared part's, once: g -> dtrunkSingle, dcondPair (added; may be null) and the encoder's parameters
 inline void encSharedBackward(DiffEncoder& e, const AtomBatch& b, const EncSave& s, const real* trunkSingle, EncGrads& g,
@@ -714,7 +805,7 @@ inline void denoisePre(Denoiser& m, const AtomBatch& b, DenoiseSave& s, const re
                        const EncSave* shared = nullptr) {
   const int n = b.tokens; const size_t atoms = (size_t)n * b.dense;
   s.scaled = ARENA.get(atoms * 3);
-  scaleMaskK<<<blocks(atoms * 3), 256, 0, STREAM>>>(x, b.atomMask, s.scaled, atoms, s.in, s.scal ? s.scal + 1 : nullptr);
+  scaleMaskK<<<blocks(atoms * 3), 256, 0, STREAM>>>(x, b.atomMask, s.scaled, atoms, s.in, s.scal ? s.scal + 1 : nullptr, s.perS);
   const int Cs = m.cond.Cs, P = m.enc.perToken;
   s.sn = s.cs.sFinal;
   if (m.hasSnLn) { s.sn = ARENA.get((size_t)n * Cs); s.lsn = lnForward(m.snLn, s.cs.sFinal, s.sn, n); }
@@ -785,7 +876,7 @@ inline void denoisePost(Denoiser& m, const AtomBatch& b, DenoiseSave& s, const r
   s.ds.xn = ARENA.get(Rq * C); s.ds.ln = lnForward(m.decLn, s.ds.xm, s.ds.xn, Rq);
   s.ds.upd = ARENA.get(Rq * 3); m.decUpdate.forward(s.ds.xn, s.ds.upd, Rq);
   s.updAtoms = ARENA.get(atoms * 3); gather(b.q2t, s.ds.upd, s.updAtoms, 3);
-  edmOutK<<<blocks(atoms * 3), 256, 0, STREAM>>>(x, s.updAtoms, b.atomMask, out, atoms, s.sk, s.ou, s.scal);
+  edmOutK<<<blocks(atoms * 3), 256, 0, STREAM>>>(x, s.updAtoms, b.atomMask, out, atoms, s.sk, s.ou, s.scal, s.perS);
 }
 inline DenoiseSave denoiseForward(Denoiser& m, const AtomBatch& b, const real* trunkSingle, const real* trunkPair,
                                   const real* targetFeat, const real* seqMask, const real* x, real sigma, const int* ri,
@@ -835,8 +926,12 @@ inline DenoiseGrads denoiseBackPost(Denoiser& m, const AtomBatch& b, const Denoi
   const size_t atoms = (size_t)n * b.dense, Rq = (size_t)b.subsets * b.Q, Rk = (size_t)b.subsets * b.K, rows = Rq * b.K;
   // out = (sk x + ou upd) mask
   real* dupdA = ARENA.get(atoms * 3);
-  scaleMaskK<<<blocks(atoms * 3), 256, 0, STREAM>>>(dout, b.atomMask, dupdA, atoms, s.ou);
-  if (dx) { real* t = ARENA.get(atoms * 3); scaleMaskK<<<blocks(atoms * 3), 256, 0, STREAM>>>(dout, b.atomMask, t, atoms, s.sk); add(dx, t, atoms * 3); }
+  scaleMaskK<<<blocks(atoms * 3), 256, 0, STREAM>>>(dout, b.atomMask, dupdA, atoms, s.ou, s.scal ? s.scal + 3 : nullptr, s.perS);
+  if (dx) {
+    real* t = ARENA.get(atoms * 3);
+    scaleMaskK<<<blocks(atoms * 3), 256, 0, STREAM>>>(dout, b.atomMask, t, atoms, s.sk, s.scal ? s.scal + 2 : nullptr, s.perS);
+    add(dx, t, atoms * 3);
+  }
   real* dupd = ARENA.zeros(Rq * 3); scatter(b.q2t, dupdA, dupd, 3);
   real* dxn = ARENA.get(Rq * C); m.decUpdate.backward(s.ds.xn, dupd, dxn, Rq);
   real* dact = ARENA.get(Rq * C); lnBackward(m.decLn, s.ds.ln, dxn, dact, Rq, false);
@@ -871,7 +966,7 @@ inline void denoiseBackPre(Denoiser& m, const AtomBatch& b, const DenoiseSave& s
   else encBackward(m.enc, b, s.es, trunkSingle, s.scaled, dtok, g.dskip, g.dpairDec, g.dqCondDec, dtrunkSingle, dpc, dscaled);
   if (dx) {                                          // scaled = x mask in
     real* t = ARENA.get(atoms * 3);
-    scaleMaskK<<<blocks(atoms * 3), 256, 0, STREAM>>>(dscaled, b.atomMask, t, atoms, s.in);
+    scaleMaskK<<<blocks(atoms * 3), 256, 0, STREAM>>>(dscaled, b.atomMask, t, atoms, s.in, s.scal ? s.scal + 1 : nullptr, s.perS);
     add(dx, t, atoms * 3);
   }
   real* dsn = ARENA.get((size_t)n * Cs); m.snProj.backward(s.sn, dsnP, dsn, n);
@@ -894,44 +989,121 @@ inline void denoiseBackward(Denoiser& m, const AtomBatch& b, const DenoiseSave& 
 // S samples at once (OpenFold3's diffusion batch): one pair conditioning, each sample's own noise level in its single
 // conditioning, its encoder and decoder, and ONE transformer pass over the S samples' tokens [S n] - the pair logits
 // read by all. outs[k] = D(xs[k], sigmas[k]); the saves kept in the arena for denoiseBatchBackward.
+// S samples stacked (stackAtoms): the batch's atom layout with each per-atom gather, mask and index S times over
+// (offset to its sample), the encoder's and decoder's shared parts as views whose stacks read one sample's terms
+struct Quads { real v[64]; };
+__global__ void putQuadsK(Quads q, int n, real* out) { if ((int)threadIdx.x < n) out[threadIdx.x] = q.v[threadIdx.x]; }
+struct AtomsStacked { AtomBatch b; EncSave enc; DecPre dec; real* seqMask = nullptr; };
+inline Gather repGather(const Gather& g, int S, int off) {
+  const size_t n = (size_t)g.count * S;
+  int* idx = reinterpret_cast<int*>(ARENA.get(n * sizeof(int) / sizeof(real) + 1));
+  real* m = ARENA.get(n);
+  repGatherK<<<blocks(n), 256, 0, STREAM>>>(g.idx, g.mask, g.count, off, idx, m, n);
+  return Gather{idx, m, (int)n};
+}
+inline real* tiled(const real* x, size_t per, int S) {
+  real* y = ARENA.get(per * S); tileK<<<blocks(per * S), 256, 0, STREAM>>>(y, x, per, per * S); return y;
+}
+inline AtomsStacked stackAtoms(const AtomBatch& b, const EncSave& enc, const DecPre& dec, const real* seqMask, int S) {
+  const size_t atoms = (size_t)b.tokens * b.dense, Rq = (size_t)b.subsets * b.Q, Rk = (size_t)b.subsets * b.K;
+  AtomsStacked a;
+  a.b = b; a.b.tokens = S * b.tokens; a.b.subsets = S * b.subsets;
+  a.b.t2q = repGather(b.t2q, S, (int)atoms);      // (token atoms -> queries)
+  a.b.q2k = repGather(b.q2k, S, (int)Rq);         // (queries -> keys)
+  a.b.q2t = repGather(b.q2t, S, (int)Rq);         // (queries -> token atoms)
+  a.b.refMask = tiled(b.refMask, atoms, S); a.b.atomMask = tiled(b.atomMask, atoms, S);
+  if (b.chiral) a.b.chiral = tiled(b.chiral, atoms * 3, S);
+  auto ctx = [&](AtomCtx c) {
+    c.toKeys = a.b.q2k; c.qMask = a.enc.qMask; c.kMask = a.enc.kMask; c.share = c.subsets; c.subsets *= S; return c;
+  };
+  a.enc = enc; a.enc.n = S * b.tokens;
+  a.enc.qMask = tiled(enc.qMask, Rq, S); a.enc.kMask = tiled(enc.kMask, Rk, S);
+  a.enc.ctx = ctx(enc.ctx);
+  a.dec = dec; a.dec.ctx = ctx(dec.ctx);
+  a.seqMask = tiled(seqMask, b.tokens, S);
+  return a;
+}
 struct DenoiseBatch {
   CondSave pair;                          // (sample 0's conditioning: its pair half everyone's)
   EncSave enc;                            // (the encoder's shared part: everyone's)
   DecPre dec;                             // (the decoder's)
-  std::vector<DenoiseSave> per;
-  real *tokS = nullptr, *condS = nullptr, *maskS = nullptr, *trOutS = nullptr;
-  int S = 0, n = 0;
+  CondSave cs;                            // (the S samples' single conditioning [S n, Cs])
+  AtomsStacked full, tail;                // (G samples stacked over the shared parts, and the last group's fewer)
+  std::vector<DenoiseSave> per;           // (each group's per-sample parts, stacked: [G n ...], [G atoms ...])
+  real *scal = nullptr, *xS = nullptr;    // (each sample's four scalars, denoiseScalars'; its positions [S atoms, 3])
+  real *tokS = nullptr, *maskS = nullptr, *trOutS = nullptr;
+  int S = 0, n = 0, G = 0;
+  const AtomsStacked& at(int g) const { return (g + 1) * G <= S ? full : tail; }
 };
+// the samples a group stacks: enough that its atom rows give the device's resident threads ~16 elements each. Measured
+// on the GH200 (rows = 3.8k a sample at 512 tokens: G 9 here): G 4 / 8 / 16 / all 48 took a 512-token step 2.29 / 2.25 /
+// 2.26 / 2.24 s against 2.35 a sample at a time, the peak 66.0 / 66.0 / 66.7 / 71.5 GB - all at once is no faster and its
+// temporaries, 48 samples', put the A100 out of memory at 768 tokens where the chunk plan had not foreseen them
+inline int groupSize(const AtomBatch& b, int C, int S) {
+  int dev, sms, threads;
+  GK(cudaGetDevice(&dev));
+  GK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
+  GK(cudaDeviceGetAttribute(&threads, cudaDevAttrMaxThreadsPerMultiProcessor, dev));
+  const size_t per = (size_t)b.subsets * b.Q * C, want = (size_t)16 * sms * threads;
+  return (int)std::max<size_t>(1, std::min<size_t>((want + per - 1) / per, (size_t)S));
+}
+// (each sample's noise level's single conditioning, its encoder and decoder, G samples at a time: one pass over the G
+// samples' rows, the shared parts' terms read by all - where these were a pass a sample, ~550 kernels each, too small to
+// fill the device: 26k launches of a 512-token step's 48 samples. G: groupSize's unless given; a group's temporaries are
+// G samples', so a chunk's bytes still grow by the sample as the chunk plan fits them)
 inline DenoiseBatch denoiseBatchForward(Denoiser& m, const AtomBatch& b, const real* trunkSingle, const real* trunkPair,
                                         const real* targetFeat, const real* seqMask, const std::vector<const real*>& xs,
                                         const std::vector<real>& sigmas, const int* ri, const int* ti, const int* asym,
-                                        const int* ent, const int* sym, const std::vector<real*>& outs) {
+                                        const int* ent, const int* sym, const std::vector<real*>& outs, int G = 0) {
   DenoiseBatch B; B.S = (int)xs.size(); B.n = b.tokens;
   const int n = b.tokens, P = m.enc.perToken, Cs = m.cond.Cs, S = B.S;
+  B.G = G = G > 0 ? std::min(G, S) : groupSize(b, m.enc.C, S);
+  const size_t atoms = (size_t)n * b.dense;
   std::optional<Range> r_; r_.emplace("dn.cond");
   B.pair = condForward(m.cond, trunkSingle, trunkPair, targetFeat, ri, ti, asym, ent, sym, sigmas[0], n);
   r_.reset(); r_.emplace("dn.encShared");
   B.enc = encShared(m.enc, b, trunkSingle, B.pair.pairOut);
   B.dec = decShared(m, b, B.enc);
-  r_.reset();
-  B.tokS = ARENA.get((size_t)S * n * P); B.condS = ARENA.get((size_t)S * n * Cs); B.maskS = ARENA.get((size_t)S * n);
-  B.trOutS = ARENA.get((size_t)S * n * P);
-  B.per.resize(S);
-  for (int k = 0; k < S; ++k) {
-    DenoiseSave& s = B.per[k];
-    s.n = n; denoiseScales(s, sigmas[k]);
-    { Range rc_("dn.condSingle"); s.cs = k == 0 ? B.pair : condSingleForward(m.cond, B.pair, sigmas[k]); }
-    { Range rp_("dn.pre"); denoisePre(m, b, s, trunkSingle, xs[k], B.tokS + (size_t)k * n * P, &B.enc); }
-    GK(cudaMemcpyAsync(B.condS + (size_t)k * n * Cs, s.cs.sFinal, (size_t)n * Cs * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
-    GK(cudaMemcpyAsync(B.maskS + (size_t)k * n, seqMask, (size_t)n * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
+  B.full = stackAtoms(b, B.enc, B.dec, seqMask, G);
+  if (S % G) B.tail = stackAtoms(b, B.enc, B.dec, seqMask, S % G);
+  B.maskS = tiled(seqMask, n, S);
+  r_.reset(); r_.emplace("dn.condSingle");
+  B.scal = ARENA.get((size_t)S * 4);
+  for (int k0 = 0; k0 < S; k0 += 16) {   // (as kernel arguments: a pageable copy would wait on the stream)
+    Quads q; const int cnt = std::min(16, S - k0);
+    for (int k = 0; k < cnt; ++k) denoiseScalars(sigmas[k0 + k], q.v + k * 4);
+    putQuadsK<<<1, 64, 0, STREAM>>>(q, cnt * 4, B.scal + (size_t)k0 * 4);
   }
+  B.cs = condSingleBatch(m.cond, B.pair, B.scal, S);
+  r_.reset(); r_.emplace("dn.pre");
+  B.xS = ARENA.get((size_t)S * atoms * 3);
+  for (int k = 0; k < S; ++k)
+    GK(cudaMemcpyAsync(B.xS + (size_t)k * atoms * 3, xs[k], atoms * 3 * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
+  B.tokS = ARENA.get((size_t)S * n * P); B.trOutS = ARENA.get((size_t)S * n * P);
+  const int ng = (S + G - 1) / G;
+  B.per.resize(ng);
+  for (int g = 0; g < ng; ++g) {
+    const int k0 = g * G, Sg = std::min(G, S - k0);
+    DenoiseSave& s = B.per[g];
+    s.n = Sg * n; s.scal = B.scal + (size_t)k0 * 4; s.perS = atoms;
+    s.cs = B.cs; s.cs.sFinal = B.cs.sFinal + (size_t)k0 * n * Cs;   // (its rows of the single; denoisePre reads only those)
+    denoisePre(m, B.at(g).b, s, trunkSingle, B.xS + (size_t)k0 * atoms * 3, B.tokS + (size_t)k0 * n * P, &B.at(g).enc);
+  }
+  r_.reset();
   {
     std::optional<Scratch> sc;   // (kept saves stay in the caller's scope, for the backward)
     if (!m.run.keep) sc.emplace();
     Range rt_("dn.transformer");
-    transformerForward(m.tr, m.run, B.tokS, B.condS, B.maskS, B.pair.pairOut, B.trOutS, n, S);
+    transformerForward(m.tr, m.run, B.tokS, B.cs.sFinal, B.maskS, B.pair.pairOut, B.trOutS, n, S);
   }
-  for (int k = 0; k < S; ++k) { Range rq_("dn.post"); denoisePost(m, b, B.per[k], xs[k], B.trOutS + (size_t)k * n * P, outs[k], &B.dec); }
+  Range rq_("dn.post");
+  real* outS = ARENA.get((size_t)S * atoms * 3);
+  for (int g = 0; g < ng; ++g) {
+    const int k0 = g * G;
+    denoisePost(m, B.at(g).b, B.per[g], B.xS + (size_t)k0 * atoms * 3, B.trOutS + (size_t)k0 * n * P, outS + (size_t)k0 * atoms * 3, &B.at(g).dec);
+  }
+  for (int k = 0; k < S; ++k)
+    GK(cudaMemcpyAsync(outs[k], outS + (size_t)k * atoms * 3, atoms * 3 * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
   return B;
 }
 // douts[k] -> every parameter; dtrunkSingle, dtrunkPair, dtargetFeat and dxs[k] (added; any may be null, dxs empty)
@@ -939,25 +1111,33 @@ inline void denoiseBatchBackward(Denoiser& m, const AtomBatch& b, const DenoiseB
                                  const std::vector<const real*>& douts, real* dtrunkSingle, real* dtrunkPair,
                                  real* dtargetFeat, const std::vector<real*>& dxs) {
   Scratch scratch;
-  const int n = B.n, S = B.S, P = m.enc.perToken, Cs = m.cond.Cs;
-  const size_t nn = (size_t)n * n;
-  std::vector<DenoiseGrads> g(S);
+  const int n = B.n, S = B.S, G = B.G, P = m.enc.perToken, Cs = m.cond.Cs, ng = (int)B.per.size();
+  const size_t nn = (size_t)n * n, atoms = (size_t)n * b.dense;
   EncGrads eg = encGrads(m.enc, b);
   StackGrads dsg = stackGrads(m.decStack, atomShape(b));
+  real* doutS = ARENA.get((size_t)S * atoms * 3);
+  for (int k = 0; k < S; ++k)
+    GK(cudaMemcpyAsync(doutS + (size_t)k * atoms * 3, douts[k], atoms * 3 * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
+  real* dxS = dxs.empty() ? nullptr : ARENA.zeros((size_t)S * atoms * 3);
+  std::vector<DenoiseGrads> g(ng);
   real* dtrOutS = ARENA.get((size_t)S * n * P);
-  for (int k = 0; k < S; ++k) {
-    { Range rb_("dnb.post"); g[k] = denoiseBackPost(m, b, B.per[k], douts[k], dxs.empty() ? nullptr : dxs[k], &B.dec, &dsg); }
-    GK(cudaMemcpyAsync(dtrOutS + (size_t)k * n * P, g[k].dtrOut, (size_t)n * P * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
+  for (int j = 0; j < ng; ++j) {
+    const size_t k0 = (size_t)j * G;
+    { Range rb_("dnb.post"); g[j] = denoiseBackPost(m, B.at(j).b, B.per[j], doutS + k0 * atoms * 3, dxS ? dxS + k0 * atoms * 3 : nullptr, &B.at(j).dec, &dsg); }
+    GK(cudaMemcpyAsync(dtrOutS + k0 * n * P, g[j].dtrOut, (size_t)B.per[j].n * P * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
   }
   real *dtokS = ARENA.get((size_t)S * n * P), *dsFS = ARENA.zeros((size_t)S * n * Cs), *dpc = ARENA.zeros(nn * m.cond.Cz);
-  { Range rt_("dnb.transformer"); transformerBackward(m.tr, m.run, B.condS, B.maskS, B.pair.pairOut, dtrOutS, dtokS, dsFS, dpc); }
-  for (int k = 0; k < S; ++k) {
-    real* dsF = dsFS + (size_t)k * n * Cs;
-    { Range rb_("dnb.pre"); denoiseBackPre(m, b, B.per[k], g[k], trunkSingle, dtokS + (size_t)k * n * P, dsF, dpc, dtrunkSingle, dxs.empty() ? nullptr : dxs[k], &eg); }
-    { Range rc_("dnb.condSingle"); condBackward(m.cond, B.per[k].cs, nullptr, dsF, dtrunkSingle, nullptr, dtargetFeat); }     // (each sample's single half)
+  { Range rt_("dnb.transformer"); transformerBackward(m.tr, m.run, B.cs.sFinal, B.maskS, B.pair.pairOut, dtrOutS, dtokS, dsFS, dpc); }
+  for (int j = 0; j < ng; ++j) {
+    const size_t k0 = (size_t)j * G;
+    Range rb_("dnb.pre");
+    denoiseBackPre(m, B.at(j).b, B.per[j], g[j], trunkSingle, dtokS + k0 * n * P, dsFS + k0 * n * Cs, dpc, dtrunkSingle,
+                   dxS ? dxS + k0 * atoms * 3 : nullptr, &eg);
   }
+  { Range rc_("dnb.condSingle"); condSingleBatchBackward(m.cond, B.cs, B.scal, S, dsFS, dtrunkSingle, dtargetFeat); }
   { Range re_("dnb.encShared"); decSharedBackward(m, b, B.enc, B.dec, dsg, eg); encSharedBackward(m.enc, b, B.enc, trunkSingle, eg, dtrunkSingle, dpc); }
   { Range rc_("dnb.cond"); condBackward(m.cond, B.pair, dpc, nullptr, nullptr, dtrunkPair, nullptr); }                  // (the one pair half)
+  if (dxS) for (int k = 0; k < S; ++k) add(dxs[k], dxS + (size_t)k * atoms * 3, atoms * 3);
 }
 
 

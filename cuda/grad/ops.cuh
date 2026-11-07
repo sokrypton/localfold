@@ -533,6 +533,10 @@ struct Bias {
   const real* p = nullptr;
   long long sb = 0, sh = 0, sq = 0;
   real* grad = nullptr;
+  // bm: the batch index taken modulo bm (0: not) - one bias shared by bm-row groups of the batch (a diffusion batch's
+  // atom attention, its samples' subsets stacked over one pair's logits)
+  int bm = 0;
+  __host__ __device__ long long off(long long b) const { return (bm ? b % bm : b) * sb; }
 };
 struct Sdpa {
   int B = 1, H = 1, Q = 0, K = 0, D = 0;
@@ -555,8 +559,8 @@ __global__ void softmaxBiasK(real* __restrict__ S, Sdpa a, int b0, int nb) {
   const int K = a.K;
   real* s = S + row * K;
   const real* m = a.keyMask ? a.keyMask + (size_t)b * K : nullptr;
-  const real* n0 = a.bias[0].p ? a.bias[0].p + b * a.bias[0].sb + h * a.bias[0].sh + q * a.bias[0].sq : nullptr;
-  const real* n1 = a.bias[1].p ? a.bias[1].p + b * a.bias[1].sb + h * a.bias[1].sh + q * a.bias[1].sq : nullptr;
+  const real* n0 = a.bias[0].p ? a.bias[0].p + a.bias[0].off(b) + h * a.bias[0].sh + q * a.bias[0].sq : nullptr;
+  const real* n1 = a.bias[1].p ? a.bias[1].p + a.bias[1].off(b) + h * a.bias[1].sh + q * a.bias[1].sq : nullptr;
   real mx = -INFINITY;
   const int sid = a.seqQ ? a.seqQ[q] : 0;
   for (int k = lane; k < K; k += 32) {
@@ -587,8 +591,8 @@ __global__ void softmaxBwdK(real* __restrict__ dP, const real* __restrict__ P, S
   real s = 0;
   for (int k = lane; k < K; k += 32) s += d[k] * p[k];
   for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
-  real* g0 = a.bias[0].grad ? a.bias[0].grad + b * a.bias[0].sb + h * a.bias[0].sh + q * a.bias[0].sq : nullptr;
-  real* g1 = a.bias[1].grad ? a.bias[1].grad + b * a.bias[1].sb + h * a.bias[1].sh + q * a.bias[1].sq : nullptr;
+  real* g0 = a.bias[0].grad ? a.bias[0].grad + a.bias[0].off(b) + h * a.bias[0].sh + q * a.bias[0].sq : nullptr;
+  real* g1 = a.bias[1].grad ? a.bias[1].grad + a.bias[1].off(b) + h * a.bias[1].sh + q * a.bias[1].sq : nullptr;
   for (int k = lane; k < K; k += 32) {
     real v = p[k] * (d[k] - s);
     d[k] = v;
