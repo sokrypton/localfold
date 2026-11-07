@@ -28,7 +28,7 @@
 //   nvcc -O2 -std=c++17 -arch=sm_80 --default-stream per-thread -o cuda/grad/train-of3 cuda/grad/train_of3.cu -lcublas -lcublasLt -ldl -lcurand
 //   cuda/grad/train-of3 --bundle=model-openbind0-f32 --family=openbind0 --examples=<file> [--steps=N] [--batch=1]
 //       [--crop=384] [--samples=48] [--lr=1.8e-3] [--warmup=1000] [--bond=0] [--save=<ckpt>] [--save-every=N]
-//       [--resume=<ckpt>] [--seed=1] [--init=bundle|of3] [--tf32] [--bf16] [--bf16-confidence] [--mem] [--offload-pairs] [--transition-chunk=64] [--no-dropout] [--val=<file>] [--smoke]
+//       [--resume=<ckpt>] [--seed=1] [--init=bundle|of3] [--tf32] [--bf16] [--bf16-confidence] [--mem] [--diffusion-saves=auto|keep|recompute] [--offload-pairs] [--transition-chunk=64] [--no-dropout] [--val=<file>] [--smoke]
 //       [--sample-batch=8|auto]
 // --check-ckpt=k / --check-perm=k / --check-bf16=k / --check-chunk=k: the recomputation, the truth's permutation, the bf16 trunk and the chunked transitions held
 // to their references on example k.
@@ -662,6 +662,7 @@ static of3::Layout layoutOf(const Example& e, bool bonds = true) {
 
 int main(int argc, char** argv) {
   std::string bundle = "model-openbind0-f32", family = "openbind0", examplesPath, savePath, resumePath;
+  int diffSaves = 0;     // --diffusion-saves=auto|keep|recompute (0, 1, 2): the diffusion transformer's block saves kept for its backward
   int sampleBatch = 8;   // the diffusion samples a denoiser pass (--sample-batch; 0, --sample-batch=auto: as many as the room holds)
   int maxRecycles = 3;   // OpenFold3's num_recycles: a step runs 1 + U{0..max} cycles (--max-recycles)
   int checkBatch = -1;
@@ -680,6 +681,7 @@ int main(int argc, char** argv) {
     else if (auto v = opt("--steps=")) steps = atoi(v);
     else if (auto v = opt("--samples=")) samples = atoi(v);
     else if (auto v = opt("--sample-batch=")) sampleBatch = !strcmp(v, "auto") ? 0 : std::max(1, atoi(v));
+    else if (auto v = opt("--diffusion-saves=")) diffSaves = !strcmp(v, "keep") ? 1 : !strcmp(v, "recompute") ? 2 : 0;
     else if (auto v = opt("--max-recycles=")) maxRecycles = std::max(0, atoi(v));
     else if (auto v = opt("--check-batch=")) checkBatch = atoi(v);
     else if (auto v = opt("--batch=")) batch = std::max(1, atoi(v));
@@ -1457,7 +1459,7 @@ int main(int argc, char** argv) {
       for (int t = 0; t < n; ++t) if (!e.isDna[t] && !e.isRna[t] && !e.isLigand[t]) for (int k = 0; k < e.dense; ++k) lossAtom[(size_t)t * e.dense + k] = 1;
     }
     std::vector<double> gmLoss(e.gm); if (!lossAtom.empty()) for (size_t i = 0; i < A; ++i) gmLoss[i] *= lossAtom[i];
-    int widestBatch = 0;
+    int widestBatch = 0; bool diffKept = false;
     of3dev::SmoothLddt sl; sl.init(Lay, e.xt, gmLoss);   // (smooth LDDT, quadratic in atoms, on the device)
     memPhase("smooth LDDT set up");
     // the samples in chunks of --sample-batch: one batched denoiser pass a chunk (af3denoise.cuh's denoiseBatchForward:
@@ -1468,6 +1470,11 @@ int main(int argc, char** argv) {
     const bool autoSB = sampleBatch == 0;
     const int SB = autoSB ? 0 : std::max(1, sampleBatch);
     int nextS = autoSB ? 4 : SB, widest = 0;
+    // the transformer's block saves kept from each batch's forward for its backward (no replay of the 24 blocks: ~200
+    // ms of a 512-token step on the A100) where that costs no extra batch: --sample-batch=auto measures its first
+    // chunk with them kept and keeps them on if the rest needs no more chunks for it; keep forces them (a fixed
+    // --sample-batch replays unless told to keep)
+    bool keepDiff = SB != 1 && (diffSaves == 1 || (diffSaves == 0 && autoSB));
     const size_t mapped0 = g::ARENA.mapped;
     for (int s0 = 0, S = 0; s0 < nSamples; s0 += S) {
       g::Scratch sc;
@@ -1506,6 +1513,7 @@ int main(int argc, char** argv) {
       else {
         std::vector<const g::real*> xs(xin.begin(), xin.end());
         std::vector<g::real> sg(sig.begin(), sig.end());
+        dn.run.keep = keepDiff;
         batch = g::af3::denoiseBatchForward(dn, d.b, a.singles[nPf], a.pairs[nMsa + nPf], a.tf, d.seqMask, xs, sg, d.ri, d.ti, d.asym, d.ent, d.sym, xout);
       }
       rD_.reset(); rD_.emplace("diff.loss");
@@ -1536,6 +1544,7 @@ int main(int argc, char** argv) {
           std::vector<const g::real*> douts(dxd.begin(), dxd.end());
           g::af3::denoiseBatchBackward(dn, d.b, batch, a.singles[nPf], douts, ts, tp, tfd, {});
         }
+        dn.run.keep = false; dn.run.saves.clear();
         g::add(dTs, ts, (size_t)n * Cs); g::add(dTp, tp, nn * Cz); g::add(dTf, tfd, (size_t)n * te.F);
       }
       if (s0 == 0) memPhase("diffusion chunk");
@@ -1544,13 +1553,19 @@ int main(int argc, char** argv) {
         size_t freeB, total; GK(cudaMemGetInfo(&freeB, &total));
         const size_t slack = g::ARENA.mapped > at0 ? g::ARENA.mapped - at0 : 0, reserve = std::max<size_t>((size_t)1 << 30, total / 20);
         const size_t room = freeB + slack > reserve ? freeB + slack - reserve : 0;
-        nextS = (int)std::max<size_t>(1, std::min<size_t>(room / std::max<size_t>(perSample, 1), (size_t)nSamples));
+        auto fit = [&](size_t per) { return (int)std::max<size_t>(1, std::min<size_t>(room / std::max<size_t>(per, 1), (size_t)nSamples)); };
+        nextS = fit(perSample);
+        if (s0 == 0 && keepDiff && diffSaves == 0) {   // (kept, measured: off unless the rest fits in as few chunks)
+          const size_t perNo = perSample > dn.run.keptBytes / S ? perSample - dn.run.keptBytes / S : 1;
+          const int rest = nSamples - S, nK = nextS, nN = fit(perNo);
+          if ((rest + nK - 1) / nK > (rest + nN - 1) / nN) { keepDiff = false; nextS = nN; }
+        }
       }
       g::ARENA.high = std::max(high0, g::ARENA.high);
     }
     if (autoSB) g::ARENA.trim(mapped0);
     g::af3::releaseRun(dn.run);   // (the transformer's buffers, its widest batch's: given back before the trunk's backward)
-    widestBatch = widest;
+    widestBatch = widest; diffKept = keepDiff;
     distogramReady();
     confidenceStep();
     L.total = L.diffusion + distWeight * L.distogram + (confOn ? confWeight * (L.plddt + L.pde + L.pae + L.resolved) : 0);
@@ -1608,8 +1623,8 @@ int main(int argc, char** argv) {
     }
     const auto t4 = now();
     int withTemplates = 0; for (auto& sl : e.slots) if (sl.geo) withTemplates += (int)std::lround(sl.repeat);
-    if (!fixed) printf("  %s: %d of %d tokens (%s), %d cycles, %d MSA rows, %d templates; ms: trunk %.0f, rollout+confidence %.0f, diffusion %.0f (host losses %.0f, %d samples a batch at most), trunk backward %.0f\n",
-                       full.input.c_str(), n, full.n, strategy.c_str(), c, S, withTemplates, msOf(t0, t1), msOf(t1, t2), msOf(t2, t3), tLoss, widestBatch, msOf(t3, t4));
+    if (!fixed) printf("  %s: %d of %d tokens (%s), %d cycles, %d MSA rows, %d templates; ms: trunk %.0f, rollout+confidence %.0f, diffusion %.0f (host losses %.0f, %d samples a batch at most, transformer saves %s), trunk backward %.0f\n",
+                       full.input.c_str(), n, full.n, strategy.c_str(), c, S, withTemplates, msOf(t0, t1), msOf(t1, t2), msOf(t2, t3), tLoss, widestBatch, diffKept ? "kept" : "replayed", msOf(t3, t4));
     if (a.off) GK(cudaStreamSynchronize(offload.copy));
     a.release(); d.release();
     return std::make_pair(L, confOn);

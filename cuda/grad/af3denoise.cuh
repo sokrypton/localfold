@@ -910,7 +910,9 @@ inline DenoiseBatch denoiseBatchForward(Denoiser& m, const AtomBatch& b, const r
     GK(cudaMemcpyAsync(B.maskS + (size_t)k * n, seqMask, (size_t)n * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
   }
   {
-    Scratch sc; Range rt_("dn.transformer");
+    std::optional<Scratch> sc;   // (kept saves stay in the caller's scope, for the backward)
+    if (!m.run.keep) sc.emplace();
+    Range rt_("dn.transformer");
     transformerForward(m.tr, m.run, B.tokS, B.condS, B.maskS, B.pair.pairOut, B.trOutS, n, S);
   }
   for (int k = 0; k < S; ++k) { Range rq_("dn.post"); denoisePost(m, b, B.per[k], xs[k], B.trOutS + (size_t)k * n * P, outs[k], &B.dec); }
