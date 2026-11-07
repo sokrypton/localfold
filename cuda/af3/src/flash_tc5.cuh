@@ -67,9 +67,19 @@ __device__ __forceinline__ void barArrive(uint64_t* m) { asm volatile("mbarrier.
 __device__ __forceinline__ void barExpect(uint64_t* m, uint32_t bytes) {
   asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" :: "r"(sa(m)), "r"(bytes) : "memory");
 }
+#ifndef TC_SUSPEND
+#define TC_SUSPEND 0x989680
+#endif
+// (with a suspend-time hint: a waiting warp parks in the barrier unit instead of spinning on try_wait, whose loops took
+// issue slots from the warps doing the work)
 __device__ __forceinline__ void barWait(uint64_t* m, uint32_t parity) {
+#if TC_SUSPEND
+  asm volatile("{\n\t.reg .pred p;\n\tW: mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1, %2;\n\t@!p bra W;\n\t}\n"
+               :: "r"(sa(m)), "r"(parity), "r"((uint32_t)TC_SUSPEND) : "memory");
+#else
   asm volatile("{\n\t.reg .pred p;\n\tW: mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n\t@!p bra W;\n\t}\n"
                :: "r"(sa(m)), "r"(parity) : "memory");
+#endif
 }
 __device__ __forceinline__ void fenceBefore() {
 #if LF_TC5A

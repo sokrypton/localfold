@@ -3,7 +3,7 @@
 //   nvcc -std=c++17 -arch=sm_100a -O2 --default-stream per-thread cuda/af3/test_pair_tc5.cu -o test-pair-tc5 -lcublas -lcublasLt -ldl
 //   ./test-pair-tc5 [n=512] [reps=20]
 #include "src/common.cuh"
-#include "src/fusedtriangle.cuh"
+#include "src/fusedtransition.cuh"
 
 // triInTc against a host reference: a, b (e4m3 planes) and t2 on sampled rows, both directions, a mask with zeros
 static int mainTri(int argc, char** argv) {
@@ -79,7 +79,74 @@ static int mainTri(int argc, char** argv) {
   printf("tri n %d: triInTc %.3f ms%s\n", n, tt[reps / 2], bad ? "  FAILED" : "");
   return bad ? 1 : 0;
 }
+// transTc against a host reference (x += (silu(LN x W1a) LN x W1b) W2) on sampled rows, rows not a multiple of the block
+static int mainTrans(int argc, char** argv) {
+  const size_t rows = argc > 2 ? atol(argv[2]) : 100000; const int reps = argc > 3 ? atoi(argv[3]) : 10, C = 128, I = 512;
+  CK(cudaStreamCreate(&STREAM)); PAIR16 = true;
+  uint64_t s = 11;
+  auto rnd = [&] { s = s * 6364136223846793005ull + 1442695040888963407ull; return (s >> 40) / 16777216.f - 0.5f; };
+  std::vector<__nv_bfloat16> hx(rows * C); for (auto& v : hx) v = __float2bfloat16(3.f * rnd() + 0.3f);
+  std::vector<float> hs(C), ho(C); for (auto& v : hs) v = 1.f + 0.3f * rnd(); for (auto& v : ho) v = 0.2f * rnd();
+  std::vector<half> w1((size_t)C * 2 * I), w2((size_t)I * C); for (auto& v : w1) v = __float2half(0.15f * rnd()); for (auto& v : w2) v = __float2half(0.08f * rnd());
+  __nv_bfloat16* x; float *sc, *of; half *d1, *d2;
+  CK(cudaMalloc(&x, (rows + 256) * C * 2)); CK(cudaMalloc(&sc, C * 4)); CK(cudaMalloc(&of, C * 4)); CK(cudaMalloc(&d1, w1.size() * 2)); CK(cudaMalloc(&d2, w2.size() * 2));
+  std::vector<__nv_bfloat16> guard(256 * C, __float2bfloat16(7.f));
+  CK(cudaMemcpy(x, hx.data(), rows * C * 2, cudaMemcpyHostToDevice)); CK(cudaMemcpy(x + rows * C, guard.data(), guard.size() * 2, cudaMemcpyHostToDevice));
+  CK(cudaMemcpy(sc, hs.data(), C * 4, cudaMemcpyHostToDevice)); CK(cudaMemcpy(of, ho.data(), C * 4, cudaMemcpyHostToDevice));
+  CK(cudaMemcpy(d1, w1.data(), w1.size() * 2, cudaMemcpyHostToDevice)); CK(cudaMemcpy(d2, w2.data(), w2.size() * 2, cudaMemcpyHostToDevice));
+  CK(cudaDeviceSynchronize());
+  // the old kernel on a copy, scored against the same reference
+  __nv_bfloat16* x0; CK(cudaMalloc(&x0, rows * C * 2)); CK(cudaMemcpy(x0, x, rows * C * 2, cudaMemcpyDeviceToDevice));
+  CK(cudaDeviceSynchronize());
+  ptc::PAIR_TC = false; fusedTransitionRaw((float*)x0, rows, C, I, sc, of, d1, d2); ptc::PAIR_TC = true;
+  if (!ptc::transTcRun(true, (float*)x, rows, C, I, sc, of, d1, d2)) { fprintf(stderr, "not taken\n"); return 1; }
+  CK(cudaDeviceSynchronize());
+  std::vector<__nv_bfloat16> hy((rows + 256) * C), h0(rows * C); CK(cudaMemcpy(hy.data(), x, hy.size() * 2, cudaMemcpyDeviceToHost));
+  CK(cudaMemcpy(h0.data(), x0, h0.size() * 2, cudaMemcpyDeviceToHost));
+  double num0 = 0;
+  double num = 0, den = 0, dnum = 0; size_t guardBad = 0;
+  for (size_t i = rows * C; i < (rows + 256) * C; ++i) guardBad += __bfloat162float(hy[i]) != 7.f;
+  for (int t = 0; t < 64; ++t) {
+    const size_t r = (t == 63) ? rows - 1 : (size_t)t * 7919 % rows;
+    double m = 0, v = 0; for (int c = 0; c < C; ++c) m += __bfloat162float(hx[r * C + c]); m /= C;
+    for (int c = 0; c < C; ++c) { double d = __bfloat162float(hx[r * C + c]) - m; v += d * d; } v = 1 / sqrt(v / C + 1e-5);
+    std::vector<double> xn(C), h(I);
+    for (int c = 0; c < C; ++c) xn[c] = __half2float(__float2half((float)((__bfloat162float(hx[r * C + c]) - m) * v * hs[c] + ho[c])));
+    for (int j = 0; j < I; ++j) {
+      double a = 0, b = 0; for (int c = 0; c < C; ++c) { a += xn[c] * __half2float(w1[(size_t)c * 2 * I + j]); b += xn[c] * __half2float(w1[(size_t)c * 2 * I + I + j]); }
+      h[j] = __half2float(__float2half((float)(a / (1 + exp(-a)) * b)));
+    }
+    for (int o = 0; o < C; ++o) {
+      double u = 0; for (int j = 0; j < I; ++j) u += h[j] * __half2float(w2[(size_t)j * C + o]);
+      const double want = __bfloat162float(hx[r * C + o]) + u, got = __bfloat162float(hy[r * C + o]);
+      num += (got - want) * (got - want); den += want * want; dnum += u * u;
+      const double g0 = __bfloat162float(h0[r * C + o]); num0 += (g0 - want) * (g0 - want);
+    }
+  }
+  const double rel = sqrt(num / den), relU = sqrt(num / dnum);
+  const double relU0 = sqrt(num0 / dnum);
+  printf("trans rows %zu: relRMS %.3e of x + update (%.3e of the update alone; fusedTransitionK %.3e); guard rows changed %zu\n", rows, rel, relU, relU0, guardBad);
+  const int bad = !(relU < 1.25 * relU0 + 1e-3) || guardBad;
+  cudaEvent_t e0, e1; CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
+  std::vector<float> t1, t2;
+  for (int r = 0; r < reps; ++r)
+    for (int arm = 0; arm < 2; ++arm) {
+      ptc::PAIR_TC = arm;
+      CK(cudaEventRecord(e0, STREAM));
+      if (arm) ptc::transTcRun(true, (float*)x, rows, C, I, sc, of, d1, d2);
+      else fusedTransitionRaw((float*)x, rows, C, I, sc, of, d1, d2);
+      CK(cudaEventRecord(e1, STREAM)); CK(cudaEventSynchronize(e1)); float ms; CK(cudaEventElapsedTime(&ms, e0, e1)); (arm ? t2 : t1).push_back(ms);
+    }
+#ifdef TC_PROF
+  { unsigned long long hp[16][8]; CK(cudaMemcpyFromSymbol(hp, tc5a::tcProf, sizeof hp));
+    for (int w = 0; w < 16; ++w) { if (!hp[w][7]) continue; printf("  warp %2d:", w); for (int k = 0; k < 8; ++k) printf(" %5.1f%%", 100.0 * hp[w][k] / hp[w][7]); printf("\n"); } }
+#endif
+  std::sort(t1.begin(), t1.end()); std::sort(t2.begin(), t2.end());
+  printf("trans rows %zu: fusedTransitionK %.3f ms, transTc %.3f ms (%.2fx)%s\n", rows, t1[reps / 2], t2[reps / 2], t1[reps / 2] / t2[reps / 2], bad ? "  FAILED" : "");
+  return bad;
+}
 int main(int argc, char** argv) {
+  if (argc > 1 && !strcmp(argv[1], "trans")) return mainTrans(argc, argv);
   if (argc > 1 && !strcmp(argv[1], "tri")) return mainTri(argc, argv);
   const int n = argc > 1 ? atoi(argv[1]) : 512, reps = argc > 2 ? atoi(argv[2]) : 20, C = 128, NQ = 512, heads = 4, stride = (n + 7) / 8 * 8;
   if (!tc5a::ready()) { fprintf(stderr, "no sm_100a tcgen05 here\n"); return 1; }

@@ -489,6 +489,9 @@ inline bool fusedTransitionRaw(float* x, size_t rows, int C, int I, const float*
 }
 inline bool fusedTransition(float* x, size_t rows, int C, int I, const std::string& pre) {
   if (!FUSED_TRANSITION || C != 128 || I % FT_NC) return false;
+  // a B200: the AF3 form on tcgen05 (pair_tc5.cuh)
+  if (ptc::transTcRun(PAIR16, x, rows, C, I, W(pre + ".inputLayerNormScale"), W(pre + ".inputLayerNormOffset"),
+                      Wh(pre + ".transition1"), Wh(pre + ".transition2"))) return true;
   return fusedTransitionRaw(x, rows, C, I, W(pre + ".inputLayerNormScale"), W(pre + ".inputLayerNormOffset"),
                             Wh(pre + ".transition1"), Wh(pre + ".transition2"));
 }

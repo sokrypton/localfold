@@ -32,6 +32,54 @@ inline const half* kMajor(const half* w, int K, int N) {
 }
 // a K-major row of 128 f16 (256 B) into a 128B-swizzled [2 atoms][rows][128 B] region: 16-byte chunk c of row r
 __device__ __forceinline__ uint32_t swOff(int r, int c, int rows) { return (c >> 3) * rows * 128 + r * 128 + (((c & 7) ^ (r & 7)) << 4); }
+// LayerNorm of a 128-row tile in place (raw bf16 -> f16, the 128B-swizzled K-major layout both share), a QUAD a row: lanes
+// 4r'..4r'+3 hold row r' of the warp's 8, a lane 32 channels (chunks 4q..4q+3), its scale and offset in registers; two-
+// pass statistics over the quad (two shuffles each) - gridInK's arithmetic (exact two-pass variance, eps 1e-5). A warp a
+// row spent its time in two 5-level shuffle reductions, a thread a row in three passes of dependent loads (transTc:
+// the products waited on its LN 38% / 53% of the time)
+struct QuadLn {
+  float sc[32], of[32];
+  __device__ void init(const float* lnS, int lane) {
+    const int q = lane & 3;
+#pragma unroll
+    for (int i = 0; i < 32; ++i) { sc[i] = lnS[32 * q + i]; of[i] = lnS[C + 32 * q + i]; }
+  }
+  // rows warpIdx*8 + (lane>>2), stepping 8*nWarps, of the tile at R (128 rows)
+  __device__ void run(unsigned char* R, int warpIdx, int nWarps, int lane) const {
+    const int q = lane & 3;
+    for (int r = warpIdx * 8 + (lane >> 2); r < TM; r += 8 * nWarps) {
+      float v[32];
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const uint4 w = *reinterpret_cast<const uint4*>(R + swOff(r, 4 * q + j, TM));
+#pragma unroll
+        for (int e = 0; e < 4; ++e) { const float2 f = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&(&w.x)[e])); v[8 * j + 2 * e] = f.x; v[8 * j + 2 * e + 1] = f.y; }
+      }
+      float s0 = 0.f, s1 = 0.f;
+#pragma unroll
+      for (int i = 0; i < 32; i += 2) { s0 += v[i]; s1 += v[i + 1]; }
+      float sum = s0 + s1;
+      sum += __shfl_xor_sync(~0u, sum, 1); sum += __shfl_xor_sync(~0u, sum, 2);
+      const float mean = sum / C;
+      float q0 = 0.f, q1 = 0.f;
+#pragma unroll
+      for (int i = 0; i < 32; i += 2) { const float d0 = v[i] - mean, d1 = v[i + 1] - mean; q0 += d0 * d0; q1 += d1 * d1; }
+      float qd = q0 + q1;
+      qd += __shfl_xor_sync(~0u, qd, 1); qd += __shfl_xor_sync(~0u, qd, 2);
+      const float inv = rsqrtf(qd / C + 1e-5f);
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        uint4 w;
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+          const int i = 8 * j + 2 * e;
+          (&w.x)[e] = f16x2((v[i] - mean) * inv * sc[i] + of[i], (v[i + 1] - mean) * inv * sc[i + 1] + of[i + 1]);
+        }
+        *reinterpret_cast<uint4*>(R + swOff(r, 4 * q + j, TM)) = w;
+      }
+    }
+  }
+};
 
 // gridInTc: a persistent block an SM over tiles of 128 pair rows - (grid row a, positions b0 .. b0+127), never crossing
 // a grid row, so both directions are a TMA box (the column direction's rows are n C apart). Warp 9 loads each raw bf16
@@ -489,6 +537,297 @@ inline bool triInTcRun(bool pair16, const float* pair, const float* mask, const 
   static LF_TLS bool attr = false;
   if (!attr) { CK(cudaFuncSetAttribute(triInTc, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)tri::Lay::BYTES)); attr = true; }
   triInTc<<<grid, 320, tri::Lay::BYTES, STREAM>>>(mp, mt, mask, lnScale, lnOffset, WpT, WgT, WlT, a8, b8, n, np, cs, T);
+  CK(cudaGetLastError());
+  return true;
+}
+
+// ---- transTc: the pair transition (fusedTransitionK's AF3 form: x += (silu(LN(x) W1a) * LN(x) W1b) W2, C 128, I 512, a bf16
+// pair) on tcgen05. Its weights (384 KB) do not fit shared memory, so they stream: a block takes 256 rows (two 128-row
+// sub-tiles sharing every weight chunk) and walks the 8 chunks of 64 hidden channels - GEMM1 (the chunk's a|b columns,
+// N 128) for both sub-tiles into tensor memory, SwiGLU by warps 4-11 (a sub-tile each four) into a 128B-swizzled h
+// (f16, GEMM2's A), GEMM2 (h x the chunk's W2, K 64, N 128) accumulating both sub-tiles' outputs - the chunks' weights
+// TMA double buffered (48 KB a chunk, from L2). Then x + the output, in f32, rounded to bf16, staged in the A buffer and
+// TMA stored back over the rows.
+namespace trs {
+constexpr int I = 512, HC = 64, NCH = I / HC, BM = 256;
+// shared memory: A [2 sub-tiles][2 atoms][128][128 B] 64 KB; weight stages [2][W1 chunk 32 KB, W2 chunk 16 KB]; h [2][16 KB]
+// ...and OUT [2 sub-tiles][64 columns][128 rows][128 B] 32 KB, the output staged half its columns at a time - so A is free
+// once the block's last GEMM1 is done, and the next block's load and LN run under its last GEMM2 and the store (with the
+// output staged in A, the products waited on the next LN 46% of the time)
+struct Lay { static constexpr uint32_t A = 0, W = 65536, WSTAGE = 49152, H = W + 2 * WSTAGE, OUT = H + 32768, LN = OUT + 32768, BAR = LN + 1024, BYTES = BAR + 256; };
+// W1 as GEMM1's B a chunk at a time: chunk p [128 rows: a's columns 64p.., then b's I + 64p..][K 128]; W2 as GEMM2's B:
+// chunk p [128 output columns][the chunk's 64 hidden] - both K-major, made once a weight
+inline const half* w1Chunks(const half* W1) {
+  static std::map<const half*, half*> made;
+  auto it = made.find(W1); if (it != made.end()) return it->second;
+  std::vector<half> h((size_t)C * 2 * I), t((size_t)NCH * 128 * C);
+  CK(cudaMemcpy(h.data(), W1, h.size() * 2, cudaMemcpyDeviceToHost));
+  for (int p = 0; p < NCH; ++p) for (int r = 0; r < 128; ++r) for (int k = 0; k < C; ++k)
+    t[((size_t)p * 128 + r) * C + k] = h[(size_t)k * 2 * I + (r < HC ? HC * p + r : I + HC * p + r - HC)];
+  half* d; CK(cudaMalloc(&d, t.size() * 2)); CK(cudaMemcpy(d, t.data(), t.size() * 2, cudaMemcpyHostToDevice));
+  return made[W1] = d;
+}
+inline const half* w2Chunks(const half* W2) {
+  static std::map<const half*, half*> made;
+  auto it = made.find(W2); if (it != made.end()) return it->second;
+  std::vector<half> h((size_t)I * C), t((size_t)NCH * C * HC);
+  CK(cudaMemcpy(h.data(), W2, h.size() * 2, cudaMemcpyDeviceToHost));
+  for (int p = 0; p < NCH; ++p) for (int o = 0; o < C; ++o) for (int k = 0; k < HC; ++k)
+    t[((size_t)p * C + o) * HC + k] = h[(size_t)(HC * p + k) * C + o];
+  half* d; CK(cudaMalloc(&d, t.size() * 2)); CK(cudaMemcpy(d, t.data(), t.size() * 2, cudaMemcpyHostToDevice));
+  return made[W2] = d;
+}
+}  // namespace trs
+__device__ __forceinline__ void epi8Sync() { asm volatile("bar.sync 2, 256;" ::: "memory"); }   // (warps 4-11)
+__device__ __forceinline__ uint32_t clusterRank() { uint32_t r; asm volatile("mov.u32 %0, %%cluster_ctarank;" : "=r"(r)); return r; }
+__device__ __forceinline__ void clusterSync() { asm volatile("barrier.cluster.arrive.release.aligned; barrier.cluster.wait.acquire.aligned;" ::: "memory"); }
+// a TMA load multicast to the cluster's CTAs in mask: the data at dst's offset in each, completing on m's offset in each
+__device__ __forceinline__ void tma3mc(void* dst, const CUtensorMap* map, int c0, int c1, int c2, uint64_t* m, uint16_t mask) {
+#if LF_TC5A
+  asm volatile("cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.multicast::cluster [%0], [%1, {%2, %3, %4}], [%5], %6;"
+               :: "r"(sa(dst)), "l"((uint64_t)map), "r"(c0), "r"(c1), "r"(c2), "r"(sa(m)), "h"(mask) : "memory");
+#endif
+}
+// a commit arriving on m's offset in every CTA of the mask
+__device__ __forceinline__ void commitMc(uint64_t* m, uint16_t mask) {
+#if LF_TC5A
+  asm volatile("tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.multicast::cluster.b64 [%0], %1;" :: "r"(sa(m)), "h"(mask) : "memory");
+#endif
+}
+// CL: the cluster's CTAs, which walk the weight chunks in lockstep - each loads 1/CL of every chunk and multicasts it to
+// all (the weights from L2 a CL-th as often: one CTA's 384 KB a 256-row block held the kernel at ~2.9 TB/s of L2), and a
+// stage is refilled only once every CTA's GEMM2 has read it (wFree counts CL commits, multicast). Partners walk the
+// same number of blocks: one past the rows is a dummy (its loads zero, its stores clipped).
+template <int CL>
+__global__ void __launch_bounds__(448, 1) transTc(const __grid_constant__ CUtensorMap mapX, const __grid_constant__ CUtensorMap mapW1,
+    const __grid_constant__ CUtensorMap mapW2, const __grid_constant__ CUtensorMap mapW1s, const __grid_constant__ CUtensorMap mapW2s, __nv_bfloat16* __restrict__ x, const float* __restrict__ lnScale, const float* __restrict__ lnOffset,
+    size_t rows) {
+#if LF_TC5A
+  using namespace trs;
+  using L = trs::Lay;
+  extern __shared__ __align__(1024) unsigned char sm[];
+  uint64_t* bar = reinterpret_cast<uint64_t*>(sm + L::BAR);
+  uint64_t *xFull = bar, *aFull = bar + 1, *aFree = bar + 2, *wFull = bar + 3, *wFree = bar + 5, *d1Full = bar + 7, *d1Free = bar + 8,
+           *hFull = bar + 9, *hFree = bar + 10, *d2Full = bar + 11, *d2Free = bar + 12;
+  __shared__ uint32_t tmBase;
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  const size_t blocks = (rows + BM - 1) / BM;
+  const unsigned cl0 = blockIdx.x - blockIdx.x % CL;    // (the cluster's first CTA: every partner walks its count)
+  const int mine = blocks > cl0 ? (int)((blocks - cl0 + gridDim.x - 1) / gridDim.x) : 0;
+  const uint32_t crank = CL > 1 ? clusterRank() : 0;
+  const uint16_t cmask = (uint16_t)((1u << CL) - 1);
+  if (warp == 12) {
+    asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], 512;" :: "r"(sa(&tmBase)));
+    asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
+  }
+  if (tid == 0) {
+    barInit(xFull, 1); barInit(aFull, 4); barInit(aFree, 1);
+    for (int i = 0; i < 2; ++i) { barInit(wFull + i, 1); barInit(wFree + i, CL); }
+    barInit(d1Full, 1); barInit(d1Free, 8); barInit(hFull, 8); barInit(hFree, 1); barInit(d2Full, 1); barInit(d2Free, 8);
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+  }
+  float* lnS = reinterpret_cast<float*>(sm + L::LN);
+  for (int i = tid; i < C; i += 448) { lnS[i] = lnScale[i]; lnS[C + i] = lnOffset[i]; }
+  fenceBefore();
+  __syncthreads();
+  if constexpr (CL > 1) clusterSync();   // (every partner's barriers initialised before any multicast reaches them)
+  fenceAfter();
+  const uint32_t tm = tmBase, base = sa(sm);
+  auto blockOf = [&](int k) { return (size_t)blockIdx.x + (size_t)k * gridDim.x; };
+  if (warp == 13) {
+    if (lane == 0) {
+      int c = 0;     // (chunks loaded so far: stage c & 1)
+      TCP_T(p9);
+      for (int k = 0; k < mine; ++k) {
+        const int r0 = (int)(blockOf(k) * BM);
+        TCP_T(p0); if (k > 0) barWait(aFree, (k - 1) & 1); TCP_ADD(warp, 0, p0);
+        barExpect(xFull, 65536);
+        for (int s = 0; s < 2; ++s)
+          for (int at = 0; at < 2; ++at) tma3(sm + L::A + s * 32768 + at * 16384, &mapX, 64 * at, r0 + 128 * s, 0, xFull);
+        for (int p = 0; p < NCH; ++p, ++c) {
+          const int st = c & 1;
+          TCP_T(p1); if (c >= 2) barWait(wFree + st, ((c - 2) >> 1) & 1); TCP_ADD(warp, 1, p1);
+          barExpect(wFull + st, L::WSTAGE);
+          unsigned char* W = sm + L::W + st * L::WSTAGE;
+          if constexpr (CL == 1) {
+            tma3(W, &mapW1, 0, 0, p, wFull + st);
+            tma3(W + 16384, &mapW1, 64, 0, p, wFull + st);
+            tma3(W + 32768, &mapW2, 0, 0, p, wFull + st);
+          } else {
+            // the chunk's three 16 KB pieces (W1's two K atoms, W2) in 128/CL-row slices, CTA r its slices of each
+            constexpr int SR = 128 / CL;
+            tma3mc(W + crank * SR * 128, &mapW1s, 0, crank * SR, p, wFull + st, cmask);
+            tma3mc(W + 16384 + crank * SR * 128, &mapW1s, 64, crank * SR, p, wFull + st, cmask);
+            tma3mc(W + 32768 + crank * SR * 128, &mapW2s, 0, crank * SR, p, wFull + st, cmask);
+          }
+        }
+      }
+      TCP_ADD(warp, 7, p9);
+    }
+  } else if (warp < 4) {
+        QuadLn ln; ln.init(lnS, lane);
+    TCP_T(l9);
+    for (int k = 0; k < mine; ++k) {
+      TCP_T(l0); barWait(xFull, k & 1); if (lane == 0) TCP_ADD(warp, 0, l0);
+      for (int s2 = 0; s2 < 2; ++s2) ln.run(sm + L::A + s2 * 32768, warp, 4, lane);
+      fenceProxy();
+      __syncwarp();
+      if (lane == 0) barArrive(aFull);
+    }
+    if (lane == 0) TCP_ADD(warp, 7, l9);
+  } else if (warp == 12) {
+    if (lane == 0) {
+      constexpr uint32_t ID128 = idesc(TM, 128);
+      TCP_T(m9);
+      int c = 0;     // chunks consumed so far (global, as the producer counts)
+      for (int k = 0; k < mine; ++k) {
+        TCP_T(m4); barWait(aFull, k & 1); TCP_ADD(warp, 4, m4);
+        fenceAfter();
+        // GEMM1 of chunk p + 1 as soon as SwiGLU has chunk p's D1 in registers, then GEMM2 of chunk p (once its h is
+        // written): the tensor core runs the next GEMM1 under the SwiGLU - issued after GEMM2 (which waits on h), it sat
+        // idle through every SwiGLU (1.65x fusedTransitionK where ~6x is the MMA bound)
+        auto gemm1 = [&](int p) {
+          const int cc = c + p, st = cc & 1;
+          TCP_T(m0); barWait(wFull + st, (cc >> 1) & 1); TCP_ADD(warp, 0, m0);
+          TCP_T(m1); if (cc > 0) barWait(d1Free, (cc - 1) & 1); TCP_ADD(warp, 1, m1);
+          fenceAfter();
+          const uint32_t W = base + L::W + st * L::WSTAGE;
+          for (int s = 0; s < 2; ++s)
+#pragma unroll
+            for (int q = 0; q < 8; ++q)
+              mmaF16(tm + 128 * s, sdesc(base + L::A + s * 32768 + (q >> 2) * 16384 + (q & 3) * 32, 16, 1024, SW128),
+                     sdesc(W + (q >> 2) * 16384 + (q & 3) * 32, 16, 1024, SW128), ID128, q > 0);
+          commit(d1Full);
+        };
+        gemm1(0);
+        for (int p = 0; p < NCH; ++p) {
+          if (p + 1 < NCH) gemm1(p + 1);
+          if (p + 1 == NCH - 1 || NCH == 1) commit(aFree);     // (the block's last GEMM1: A is free for the next load)
+          const int cc = c + p, st = cc & 1;     // GEMM2 of chunk p into D2 (cols 256 + 128 s)
+          TCP_T(m2); barWait(hFull, cc & 1); TCP_ADD(warp, 2, m2);
+          TCP_T(m3); if (p == 0 && k > 0) barWait(d2Free, (k - 1) & 1); TCP_ADD(warp, 3, m3);
+          fenceAfter();
+          const uint32_t W2 = base + L::W + st * L::WSTAGE + 32768;
+          for (int s = 0; s < 2; ++s)
+#pragma unroll
+            for (int q = 0; q < 4; ++q)
+              mmaF16(tm + 256 + 128 * s, sdesc(base + L::H + s * 16384 + q * 32, 16, 1024, SW128),
+                     sdesc(W2 + q * 32, 16, 1024, SW128), ID128, p > 0 || q > 0);
+          commit(hFree);
+          if constexpr (CL == 1) commit(wFree + st); else commitMc(wFree + st, cmask);
+        }
+        commit(d2Full);
+        c += NCH;
+      }
+      TCP_ADD(warp, 7, m9);
+    }
+  } else {
+    // warps 4-11: sub-tile (w - 4) / 4, tensor-memory lanes 32 (w % 4) ..: a thread a row
+    const int s = (warp - 4) >> 2, quarter = warp & 3, rl = quarter * 32 + lane;
+    const uint32_t lane0 = (uint32_t)(quarter * 32) << 16;
+    unsigned char* Hs = sm + L::H + s * 16384;
+    TCP_T(e9);
+    int c = 0;
+    for (int k = 0; k < mine; ++k) {
+      for (int p = 0; p < NCH; ++p, ++c) {
+        TCP_T(e0); barWait(d1Full, c & 1); if (lane == 0) TCP_ADD(warp, 0, e0);
+        fenceAfter();
+        uint32_t av[32], bv[32], av2[32], bv2[32];
+        ld32(tm + lane0 + 128 * s, av); ld32(tm + lane0 + 128 * s + 32, av2);
+        ld32(tm + lane0 + 128 * s + 64, bv); ld32(tm + lane0 + 128 * s + 96, bv2);
+        ldWait();
+        fenceBefore();
+        __syncwarp();
+        if (lane == 0) barArrive(d1Free);
+        uint32_t w[32];
+#pragma unroll
+        for (int e = 0; e < 16; ++e) {
+          const float a0 = __uint_as_float(av[2 * e]), a1 = __uint_as_float(av[2 * e + 1]);
+          const float c0 = __uint_as_float(av2[2 * e]), c1 = __uint_as_float(av2[2 * e + 1]);
+          w[e] = f16x2(a0 * sigmH(a0) * __uint_as_float(bv[2 * e]), a1 * sigmH(a1) * __uint_as_float(bv[2 * e + 1]));
+          w[16 + e] = f16x2(c0 * sigmH(c0) * __uint_as_float(bv2[2 * e]), c1 * sigmH(c1) * __uint_as_float(bv2[2 * e + 1]));
+        }
+        TCP_T(e1); if (c > 0) barWait(hFree, (c - 1) & 1); if (lane == 0) TCP_ADD(warp, 1, e1);     // (GEMM2 of the last chunk has read h)
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+          *reinterpret_cast<uint4*>(Hs + rl * 128 + ((j ^ (rl & 7)) << 4)) = make_uint4(w[4 * j], w[4 * j + 1], w[4 * j + 2], w[4 * j + 3]);
+        fenceProxy();
+        __syncwarp();
+        if (lane == 0) barArrive(hFull);
+      }
+      // x + the output: f32, rounded to bf16, staged in the A buffer (every product of the block is done) and TMA stored
+      TCP_T(e2); barWait(d2Full, k & 1); if (lane == 0) TCP_ADD(warp, 2, e2);
+      fenceAfter();
+      const size_t row = blockOf(k) * BM + s * 128 + rl;
+      unsigned char* S = sm + L::OUT + s * 16384;
+      for (int hh = 0; hh < 2; ++hh) {           // columns 64 hh ..: through OUT, both sub-tiles, then a TMA store
+        uint32_t w[2][16];
+        for (int h2 = 0; h2 < 2; ++h2) {
+          const int h = 2 * hh + h2;
+          uint32_t ov[32];
+          ld32(tm + lane0 + 256 + 128 * s + 32 * h, ov);
+          ldWait();
+          uint4 xr[4];
+#pragma unroll
+          for (int j = 0; j < 4; ++j) xr[j] = row < rows ? *reinterpret_cast<const uint4*>(x + row * C + 32 * h + 8 * j) : make_uint4(0, 0, 0, 0);
+#pragma unroll
+          for (int e = 0; e < 16; ++e) {
+            const float2 xv = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&(&xr[e >> 2].x)[e & 3]));
+            const __nv_bfloat162 o = __floats2bfloat162_rn(xv.x + __uint_as_float(ov[2 * e]), xv.y + __uint_as_float(ov[2 * e + 1]));
+            w[h2][e] = *reinterpret_cast<const uint32_t*>(&o);
+          }
+        }
+        if (hh == 1) { fenceBefore(); __syncwarp(); if (lane == 0) barArrive(d2Free); }
+        if (warp == 4 && lane == 0) bulkWaitRead<0>();   // (OUT's last store read)
+        epi8Sync();
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+          *reinterpret_cast<uint4*>(S + rl * 128 + ((j ^ (rl & 7)) << 4)) = make_uint4(w[j >> 2][4 * (j & 3)], w[j >> 2][4 * (j & 3) + 1], w[j >> 2][4 * (j & 3) + 2], w[j >> 2][4 * (j & 3) + 3]);
+        fenceProxy();
+        epi8Sync();
+        if (warp == 4 && lane == 0) {
+          const int r0 = (int)(blockOf(k) * BM);
+          for (int ss = 0; ss < 2; ++ss) tmaStore3(&mapX, sm + L::OUT + ss * 16384, 64 * hh, r0 + 128 * ss, 0);
+          bulkCommit();
+        }
+      }
+    }
+    if (warp == 4 && lane == 0) bulkWait<0>();
+    if (lane == 0) TCP_ADD(warp, 7, e9);
+  }
+  fenceBefore();
+  __syncthreads();
+  if constexpr (CL > 1) clusterSync();   // (no CTA leaves while a partner may still multicast into it or arrive on it)
+  if (warp == 12) {
+    fenceAfter();
+    asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, 512;" :: "r"(tm));
+  }
+#endif
+}
+// fusedTransitionRaw's AF3 form (C 128, I 512, SwiGLU, no biases) for a bf16 pair: true where it ran
+inline bool transTcRun(bool pair16, float* x, size_t rows, int Cin, int I, const float* lnScale, const float* lnOffset, const half* W1,
+                       const half* W2) {
+  if (!PAIR_TC || !ready() || !pair16 || Cin != C || I != trs::I || rows == 0) return false;
+  const half *w1 = trs::w1Chunks(W1), *w2 = trs::w2Chunks(W2);
+  const CUtensorMap mx = map3(CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, x, { (uint64_t)C, rows, 1 }, { (uint64_t)C * 2, rows * C * 2 }, { 64, TM, 1 }, CU_TENSOR_MAP_SWIZZLE_128B);
+  const CUtensorMap m1 = map3(CU_TENSOR_MAP_DATA_TYPE_FLOAT16, w1, { (uint64_t)C, 128, trs::NCH }, { (uint64_t)C * 2, (uint64_t)128 * C * 2 }, { 64, 128, 1 }, CU_TENSOR_MAP_SWIZZLE_128B);
+  const CUtensorMap m2 = map3(CU_TENSOR_MAP_DATA_TYPE_FLOAT16, w2, { (uint64_t)trs::HC, (uint64_t)C, trs::NCH }, { (uint64_t)trs::HC * 2, (uint64_t)C * trs::HC * 2 }, { 64, 128, 1 }, CU_TENSOR_MAP_SWIZZLE_128B);
+  static LF_TLS int sms = 0;
+  if (!sms) { int dev; CK(cudaGetDevice(&dev)); CK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev)); }
+  auto launch = [&](auto kern, int cl) {
+    const CUtensorMap s1 = map3(CU_TENSOR_MAP_DATA_TYPE_FLOAT16, w1, { (uint64_t)C, 128, trs::NCH }, { (uint64_t)C * 2, (uint64_t)128 * C * 2 }, { 64, (uint32_t)(128 / cl), 1 }, CU_TENSOR_MAP_SWIZZLE_128B);
+    const CUtensorMap s2 = map3(CU_TENSOR_MAP_DATA_TYPE_FLOAT16, w2, { (uint64_t)trs::HC, (uint64_t)C, trs::NCH }, { (uint64_t)trs::HC * 2, (uint64_t)C * trs::HC * 2 }, { 64, (uint32_t)(128 / cl), 1 }, CU_TENSOR_MAP_SWIZZLE_128B);
+    const size_t blocks = (rows + trs::BM - 1) / trs::BM;
+    const unsigned grid = (unsigned)(std::min<size_t>((blocks + cl - 1) / cl * cl, sms / cl * cl));
+    CK(cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)trs::Lay::BYTES));
+    cudaLaunchConfig_t cfg = {}; cfg.gridDim = dim3(grid); cfg.blockDim = dim3(448); cfg.dynamicSmemBytes = trs::Lay::BYTES; cfg.stream = STREAM;
+    cudaLaunchAttribute at[1]; at[0].id = cudaLaunchAttributeClusterDimension; at[0].val.clusterDim.x = cl; at[0].val.clusterDim.y = 1; at[0].val.clusterDim.z = 1;
+    cfg.attrs = at; cfg.numAttrs = 1;
+    CK(cudaLaunchKernelEx(&cfg, kern, mx, m1, m2, s1, s2, reinterpret_cast<__nv_bfloat16*>(x), lnScale, lnOffset, rows));
+  };
+  // (clusters of 2 and 4 sharing each weight chunk by multicast measured no faster - 0.717 / 1.360 against 0.720 ms at
+  // 1M rows - so one CTA a cluster)
+  launch(transTc<1>, 1);
   CK(cudaGetLastError());
   return true;
 }
