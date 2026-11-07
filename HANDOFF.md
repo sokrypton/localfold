@@ -17,39 +17,28 @@ is documentation and tooling only.
 
 ## Open, in the order they are worth doing
 
-### 🔴 Chain-level pTM is not AlphaFold 3's (reported 2026-11-07, not fixed)
-Reported by Yeqing Lin ("localfold binder pTM bug and fix", against `500165d7`) and
-confirmed against af3-any-model's `confidence_head.py` / `model.py` / `confidences.py`.
-Three gaps, every one of them in every port:
+### Chain-level pTM: fixed on CUDA, the page and Metal; what is left (reported 2026-11-07)
+Reported by Yeqing Lin ("localfold binder pTM bug and fix", against `500165d7`): a short
+binder's `chain_ptm` read ~0.10 high against AF3. Three gaps, all now closed to AF3's own
+functions (`confidence_head.py`'s interface `tmscore_adjusted_pae`, `confidences.py`'s
+`chain_pairwise_predicted_tm_scores` / `get_iptm_xchain`, `model.py`'s `pae_single_mask`):
+the chain-level scores reduce the INTERFACE term (d0 from the pair's own chains), `chain_iptm`
+is the mean of a chain's pair ipTMs, and only tokens with frames anchor.
 
-1. **The wrong d0 for the chain-level scores.** AF3 computes the TM-weighted PAE twice
-   (`tmscore_adjusted_pae`): the *global* term, N = every token, for `ptm` / `iptm`; and
-   the *interface* term, N = the chain's own tokens on the diagonal and the two chains'
-   summed off it, for `chain_pair_iptm` - whose diagonal is `chain_ptm`. We compute only
-   the global term and reduce every score from it, so `chain_ptm` is inflated for every
-   chain of a complex (the shorter the chain against the complex, the more: a 55-residue
-   binder in 171 tokens is scored at d0 4.88 A where AF3 uses 2.44, +0.10 binder pTM over
-   400 BinderBench designs), and `chain_pair_iptm` / `chain_iptm` with three or more
-   chains. Global `ptm`, `iptm`, the ranking, the structures, pLDDT and PAE are right.
-2. **`chain_iptm` is another formula.** AF3's (`iptm_xchain`) is the mean of the chain's
-   off-diagonal `chain_pair_iptm`; ours is the max over anchors of the mean over every other
-   chain's tokens pooled. The same for two chains, not for three or more.
-3. **No frame mask on the anchors.** AF3's `pae_single_mask` is the token frames' validity
-   on the ROWS only (an ion, a ligand of colinear atoms: no anchor); we anchor on every live
-   token. Moves even global `ptm` / `iptm` for complexes with such tokens; protein-only
-   complexes are untouched. Needs the featuriser to carry AF3's frame mask.
-
-Where the reduction lives (all three gaps in each): `cuda/af3/src/confidence.cuh`
-(`confidenceHead`, and `confidenceSharded` for multi-GPU) with `sampler.cuh`'s
-`writeConfidences`; `cuda/af3/src/structural.cuh` (OpenDDE's head); `metal/af3/output.mm`;
-`shared/heads/tm-score.js` (`perChainTmScores`) behind `web/fold-archive.js`; and
-`cuda/ef2/src/confidence.cuh`, where whether it is a bug depends on what ESM's own
-reference does - check that first. The report's patch (an interface term `tmInterfaceK` off
-the same PAE logits, a 64-bin table a chain pair, handed to the chain-level scores only)
-fixes gap 1 in `confidenceHead` alone. **Verify against AF3's own numbers**, not ours: a
-two-chain binder, a four-chain complex (the report's 10_tnfa) and a protein with an ion or
-a ligand, through the af3-any-model oracle - no gate here scores chain-level pTM, which is
-how this lasted.
+* **CUDA** `64685f25` - held by `tools/oracle/check_chain_ptm.py --dump=` on five jobs and two
+  OpenDDE folds, exact. The sharded (multi-GPU) head is wired the same way and NOT RUN.
+* **Page** `733d77d8` - `--scores=` off `tools/gpu/fold.js --tm-check`, exact on barnase and
+  calmodulin (OpenBind-0) and OpenDDE; `test/chain-ptm-af3.test.js`. boltz2's page path untested.
+* **Metal** `573a18a0` - **NOT BUILT OR RUN** (no Mac here). The interface term is taken on the
+  host off the PAE logits (`metal/af3/frames.h`). Wants `metal/af3/gate.py` and
+  `check_chain_ptm.py` on Apple silicon; Metal has no `AF3_PAE_OUT` dump yet, so the check is
+  the `--scores`-style comparison or a dump to add.
+* **ESMFold2 (cuda/ef2) is left as it is, on purpose.** ESM's own reference (`esm` 3.4.1,
+  `models/esmfold2/experimental.py`) takes d0 from every token for everything, anchors on every
+  token, has no `chain_ptm`, and its `pair_chains_iptm[c1, c2]` is DIRECTIONAL (rows in c2,
+  columns in c1). Our ef2 matches its `ptm`/`iptm`; its AF3-named `chain_*` fields are an
+  extension with AF3's OLD reduction. Whether they should take AF3's meaning (an interface term
+  kernel in ef2) or ESM's directional matrix is a decision, not a bug fix.
 
 ### The two held-back pages
 `single.html` and `proteinhunter.html` are gitignored and on disk, out of the
