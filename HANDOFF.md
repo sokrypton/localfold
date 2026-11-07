@@ -33,12 +33,12 @@ is the mean of a chain's pair ipTMs, and only tokens with frames anchor.
   host off the PAE logits (`metal/af3/frames.h`). Wants `metal/af3/gate.py` and
   `check_chain_ptm.py` on Apple silicon; Metal has no `AF3_PAE_OUT` dump yet, so the check is
   the `--scores`-style comparison or a dump to add.
-* **ESMFold2 (cuda/ef2) is left as it is, on purpose.** ESM's own reference (`esm` 3.4.1,
-  `models/esmfold2/experimental.py`) takes d0 from every token for everything, anchors on every
-  token, has no `chain_ptm`, and its `pair_chains_iptm[c1, c2]` is DIRECTIONAL (rows in c2,
-  columns in c1). Our ef2 matches its `ptm`/`iptm`; its AF3-named `chain_*` fields are an
-  extension with AF3's OLD reduction. Whether they should take AF3's meaning (an interface term
-  kernel in ef2) or ESM's directional matrix is a decision, not a bug fix.
+* **Standardised (2026-11-07, the user's call): every model's AF3-named chain fields are AF3's.**
+  `cuda/featurise/ptm.h` is the native ports' one definition (cuda/af3, cuda/ef2, metal/af3, metal/ef2);
+  `shared/heads/tm-score.js` the page's (AF3 lineage, WebGL2 AF3, AF2, ESMFold2). ESMFold2 keeps ESM's own pTM / ipTM
+  (ESM's reference: d0 and anchors over every token, no chain_ptm, a directional pair_chains_iptm). cuda/ef2
+  barnase-barstar chain_ptm 0.9748/0.9795 -> 0.9585/0.9578. Still without chain fields: cuda/af2, metal/af2, the
+  WebGL2 AF2 path. **Metal is edited blind** - docs/A100-TO-METAL.md is the Mac agent's brief.
 
 ### The two held-back pages
 `single.html` and `proteinhunter.html` are gitignored and on disk, out of the
