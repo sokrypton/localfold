@@ -10,6 +10,7 @@
  * cloud at the wrong scale, and RMSD alone would not say which. The sequence
  * and the geometry come from the SAME deposition so they cannot disagree.
  */
+import { tokenFrameMask } from "../../shared/heads/tm-score.js";
 import { dialectFor, featuriserDialect } from "../../shared/af3/dialect.js";
 import { superpose, modelAlphaCarbons } from "./superpose.js";
 import { af3BatchFromA3m } from "../../shared/af3/featurise/batch.js";
@@ -603,6 +604,15 @@ export async function main(device, args) {
     }),
     residueTokens: batch.tokens, structuralTokens: fold.structuralTokens,
     meanPlddt: fold.meanPlddt ?? null,
+    // `--tm-check`: as tools/gpu/fold.js's, for tools/oracle/check_chain_ptm.py --scores
+    ...(args.includes("--tm-check") && fold.scores?.tmInterface !== undefined ? { tmCheck: {
+      asymId: Array.from(batch.asymId),
+      frame: Array.from(tokenFrameMask({ tokens: batch.tokens, dense: batch.dense, isLigand: batch.isLigand,
+        asymId: batch.asymId, residueIndex: batch.residueIndex, refPos: batch.refPos, refMask: batch.refMask })),
+      tmGlobal: Array.from(fold.scores.tmAdjusted), tmInterface: Array.from(fold.scores.tmInterface),
+      ptm: fold.ptm, iptm: fold.iptm, chainPtm: fold.chainPtm, chainIptm: fold.chainIptm,
+      chainPairIptm: fold.chainPairIptm,
+    } } : {}),
     // ...undefined unless asked, so the width rule in foldBatch decides.
     residentWeights: args.includes("--no-resident") ? false
       : args.includes("--resident") ? true : undefined,
