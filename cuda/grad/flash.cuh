@@ -2116,11 +2116,12 @@ template <int D, int MODE>
 inline size_t bwdSmem() { return sizeof(float) * ((MODE == 1 ? 7 : 3) * 64 * (D + PADK) + BC * (BR + PADK) + 3 * BR); }
 
 template <int D, int MODE>
+inline size_t fwdSmem() { return sizeof(float) * ((MODE == 1 ? 5 : 2) * BC * (D + PADK) + BR * (BC + PADK)); }
+template <int D, int MODE>
 inline void forward(const Sdpa& a, const float* q, int ldq, const float* k, int ldk, const float* v, int ldv, float* o,
                     int ldo, float* lse) {
-  constexpr bool SPLIT = MODE == 1;
   static bool attr = false;
-  size_t smem = sizeof(float) * ((SPLIT ? 5 : 2) * BC * (D + PADK) + BR * (BC + PADK));
+  size_t smem = fwdSmem<D, MODE>();
   if (!attr) { GK(cudaFuncSetAttribute(fwdK<D, MODE>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem)); attr = true; }
   size_t grid = (size_t)((a.Q + BR - 1) / BR) * a.H * a.B;
   fwdK<D, MODE><<<(unsigned)grid, THREADS, smem, STREAM>>>(a, q, ldq, k, ldk, v, ldv, o, ldo, lse);
@@ -2153,7 +2154,32 @@ inline void backward(const Sdpa& a, const float* q, int ldq, const float* k, int
     case 64: { constexpr int DD = 64; CALL; } return true;               \
     default: return false;                                               \
   }
-inline bool supported(int D) { return D == 8 || D == 16 || D == 24 || D == 32 || D == 48 || D == 64; }
+// the device's shared memory a block may opt in to
+inline int smemOptin() {
+  static const int v = [] { int d = 0, m = 0; GK(cudaGetDevice(&d)); GK(cudaDeviceGetAttribute(&m, cudaDevAttrMaxSharedMemoryPerBlockOptin, d)); return m; }();
+  return v;
+}
+// a kernel for D at this precision whose shared memory the device has: the float32 (split) forward and backward at D 48
+// and 64 take 84-140 KB, past the 99 KB of an sm_120 (an RTX PRO 6000) or an sm_89 - the bmm path there (the
+// TF32 fallbacks take at most 70 KB, the bf16 kernels less)
+inline bool supported(int D) {
+  if (!(D == 8 || D == 16 || D == 24 || D == 32 || D == 48 || D == 64)) return false;
+  if (BF16) return true;
+  auto need = [](auto Dc) {
+    constexpr int DD = decltype(Dc)::value;
+    return TF32 ? std::max(fwdSmem<DD, 0>(), bwdSmem<DD, 0>()) : std::max(fwdSmem<DD, 1>(), bwdSmem<DD, 1>());
+  };
+  size_t n = 0;
+  switch (D) {
+    case 8: n = need(std::integral_constant<int, 8>{}); break;
+    case 16: n = need(std::integral_constant<int, 16>{}); break;
+    case 24: n = need(std::integral_constant<int, 24>{}); break;
+    case 32: n = need(std::integral_constant<int, 32>{}); break;
+    case 48: n = need(std::integral_constant<int, 48>{}); break;
+    default: n = need(std::integral_constant<int, 64>{}); break;
+  }
+  return n <= (size_t)smemOptin();
+}
 inline bool runForward(const Sdpa& a, const float* q, int ldq, const float* k, int ldk, const float* v, int ldv,
                        float* o, int ldo, float* lse) {
   if (BF16 && a.D == 8) { forward<8, 2>(a, q, ldq, k, ldk, v, ldv, o, ldo, lse); return true; }   // (m16n8k8 fits D 8 unpadded)
