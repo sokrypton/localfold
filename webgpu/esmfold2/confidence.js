@@ -28,6 +28,8 @@ import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { Esmfold2TrunkGpu } from "./trunk.js";
 import { createAddShader } from "../runtime/execution.js";
 import { categoricalMean, paeAndTmScores } from "../../cpu/esmfold2/confidence.js";
+import { chainPairTmScores, chainTmInfo, interfaceTmTerm, perChainTmScores, tokenFrameMask }
+  from "../../shared/heads/tm-score.js";
 import { layerNorm, linear } from "../../cpu/af3/trunk/pairformer.js";
 
 const GRID_WIDTH = 32_768;
@@ -768,5 +770,49 @@ export async function esmfold2ConfidenceFold(device, input, weights, options = {
   const pae = tm.pae;
   return { plddt, plddtPerAtom, plddtCa, complexPlddt: weighted / (total + 1e-8),
            pae, paeLogits: readouts.paeLogits, single: readouts.single,
-           ptm: tm.ptm, iptm: tm.iptm };
+           ptm: tm.ptm, iptm: tm.iptm,
+           ...esmfold2ChainScores(readouts.paeLogits, tokens, weights.paeBins, asymId, input, tm.ptm) };
+}
+
+/**
+ * The chain-level scores as AlphaFold 3 defines them - the names the archive writes are AF3's, so the
+ * meaning is (shared/heads/tm-score.js; cuda/featurise/ptm.h is every native port's, cuda/ef2's
+ * included): chain_pair_iptm off AF3's INTERFACE term, d0 from the pair's own chains, anchored on the
+ * tokens with frames; chain_ptm its diagonal; chain_iptm the mean of a chain's pairs. ESM's own
+ * reference has none of these (its pair_chains_iptm is directional, on the global term), and pTM /
+ * ipTM above stay ESMFold2's. Reported by Yeqing Lin: on the global term a short binder read ~0.10 high.
+ *
+ * One chain needs none of it: its interface d0 is every token's and its tokens are all polymer, so its
+ * chain pTM IS the pTM - which also spares a host pass over every pair's logits.
+ */
+export function esmfold2ChainScores(paeLogits, tokens, bins, asymId, input, ptm) {
+  const live = input.tokenMask;
+  const ids = [...new Set(Array.from(asymId).filter((id, token) => live[token] > 0.5))].sort((a, b) => a - b);
+  if (ids.length === 1) {
+    return { chainPtm: { [ids[0]]: ptm }, chainIptm: {}, chainPairIptm: {} };
+  }
+  for (const field of ["molType", "residueIndex", "refPos", "atomToToken", "atomMask"]) {
+    if (input[field] === undefined) throw new Error(`ESMFold2's chain-level scores need input.${field} (the frames' rule)`);
+  }
+  const width = 32 / bins;
+  const centres = Float32Array.from({ length: bins }, (unused, bin) => width * (bin + 0.5));
+  const tmInterface = interfaceTmTerm(paeLogits, tokens, chainTmInfo(asymId, live, centres));
+  // a NONPOLYMER token (ESM's mol_type 3) is one atom: its reference position is the frame rule's
+  const isLigand = Int32Array.from(input.molType, (kind) => (kind === 3 ? 1 : 0));
+  const refPos = new Float32Array(tokens * 3);
+  const refMask = new Float32Array(tokens);
+  for (let atom = 0; atom < input.atomToToken.length; atom += 1) {
+    const token = input.atomToToken[atom];
+    if (refMask[token] > 0 || !(input.atomMask[atom] > 0)) continue;
+    refPos.set(input.refPos.subarray(atom * 3, atom * 3 + 3), token * 3);
+    refMask[token] = 1;
+  }
+  const frame = tokenFrameMask({ tokens, dense: 1, isLigand, asymId,
+    residueIndex: input.residueIndex, refPos, refMask });
+  const perChain = perChainTmScores(tmInterface, tokens, asymId, live, frame);
+  return {
+    chainPairIptm: Object.fromEntries(chainPairTmScores(tmInterface, tokens, asymId, live, frame).scores),
+    chainPtm: Object.fromEntries(perChain.chainPtm),
+    chainIptm: Object.fromEntries(perChain.chainIptm),
+  };
 }

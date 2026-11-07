@@ -3804,6 +3804,11 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
     // ...NaN where there is no interface, which is how this page already spells
     // "not applicable" for a monomer's ipTM; see confidenceJson.
     iptm: chains.length > 1 ? result.confidence.iptm : Number.NaN,
+    // ...and the chain-level scores, AlphaFold 3's as every model's are (esmfold2ChainScores). 🔴 NAMED
+    // HERE OR DROPPED: this literal is an allow-list, CLAUDE.md's trap at this seam.
+    chainPairIptm: result.confidence.chainPairIptm,
+    chainPtm: result.confidence.chainPtm,
+    chainIptm: result.confidence.chainIptm,
     contactProbs: result.contacts,
   };
   const finalDense = toDensePositions(result.features, result.coordinates);

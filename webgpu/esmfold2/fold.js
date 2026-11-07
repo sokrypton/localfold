@@ -1023,6 +1023,8 @@ export async function foldEsmfold2(device, options) {
         // of its own interface. Single-chain folds cannot see this, which is
         // every fold this head was gated on.
         asymId: features.asymId,
+        // ...and the frames' rule, for the chain-level scores (esmfold2ChainScores)
+        molType: features.molType, residueIndex: features.residueIndex, refPos: features.refPos,
       }, options.confidenceWeights, { allocator });
       releaseConfidenceCopies();
       // 🔴 THE HEAD'S OWN INPUTS, FOR THE ARM THAT RUNS SYNTHYRA'S MODULE ON A
