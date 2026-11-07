@@ -91,6 +91,13 @@ export async function main(device, args) {
     ptm: [round(c(gl).ptm), round(c(gpu).ptm)],
     iptm: [round(c(gl).iptm), round(c(gpu).iptm)],
     chainPtm: [per(c(gl).chainPtm), per(c(gpu).chainPtm)],
+    // 🔴 chain_iptm AND chain_pair_iptm TOO, BECAUSE THEY ARE THE FIELDS A CHANGE TO THE SCORES
+    // LANDS IN FIRST. This compared chain_ptm alone, and chain_ptm is a chain pair's score on the
+    // DIAGONAL - so the interface term's d0 (the pair's own chains, not every token) and the
+    // mean-of-pairs chain_iptm were both outside what any cross-backend gate read. With two chains
+    // chain_iptm equals the one pair score; pass `--sequence=A:B:C` for the arm that separates them.
+    chainIptm: [per(c(gl).chainIptm), per(c(gpu).chainIptm)],
+    chainPairIptm: [per(c(gl).chainPairIptm), per(c(gpu).chainPairIptm)],
     meanAbsPaeGapA: round(meanPaeGap),
     contactProbs: [gl.out.contactProbs.length, gpu.out.contactProbs.length],
   };
@@ -102,8 +109,16 @@ export async function main(device, args) {
     report.webgpuF32 = { meanPlddt: round(f32.meanPlddt), ptm: round(f32.ptm), iptm: round(f32.iptm) };
   }
   // pTM and ipTM to 0.02: on AF3 at 61 tokens the precision alone moves ipTM that much (WebGPU f32
-  // 0.304, shipped f16 0.311, WebGL2 0.321 with the structures 0.02 A apart).
+  // 0.304, shipped f16 0.311, WebGL2 0.321 with the structures 0.02 A apart). Every chain field is
+  // held to the same 0.02 and to the same KEYS - a backend reporting a chain the other does not is
+  // a difference the numbers cannot show.
+  const chainsAgree = (a, b) => {
+    const keys = [...new Set([...Object.keys(a ?? {}), ...Object.keys(b ?? {})])];
+    return keys.every((k) => Math.abs((a?.[k] ?? NaN) - (b?.[k] ?? NaN)) < 0.02);
+  };
   report.ok = caRmsd < 0.25 && Math.abs(c(gl).meanPlddt - c(gpu).meanPlddt) < 1
-    && Math.abs(c(gl).ptm - c(gpu).ptm) < 0.02 && Math.abs(c(gl).iptm - c(gpu).iptm) < 0.02 && meanPaeGap < 0.25;
+    && Math.abs(c(gl).ptm - c(gpu).ptm) < 0.02 && Math.abs(c(gl).iptm - c(gpu).iptm) < 0.02 && meanPaeGap < 0.25
+    && chainsAgree(c(gl).chainPtm, c(gpu).chainPtm) && chainsAgree(c(gl).chainIptm, c(gpu).chainIptm)
+    && chainsAgree(c(gl).chainPairIptm, c(gpu).chainPairIptm);
   return report;
 }

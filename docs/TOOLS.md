@@ -11,7 +11,7 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-541 tools. `tools/fixtures/` is data and is not listed.
+542 tools. `tools/fixtures/` is data and is not listed.
 
 ## `tools/gpu/` - the WebGPU lane (296)
 
@@ -315,7 +315,7 @@ Each exports `async function main(device, args)` and is run as
 - **`trunk-oracle.js`** - af3-any-model's own trunk seams, compared against ours on the same batch.
 - **`webgl-execution-options.js`** - The WebGL2 backend's diagnostic switches, read off a tool's own arguments.
 
-## `tools/oracle/` - the reference side (66)
+## `tools/oracle/` - the reference side (67)
 
 These run against a checkout of the reference implementation, not against
 this port. They need its Python environment; see CLAUDE.md.
@@ -344,6 +344,7 @@ this port. They need its Python environment; see CLAUDE.md.
 - **`check_af3_template.js`** - Check the template embedder against AF3, on a protein with NO templates.
 - **`check_af3_template_geometry.js`** - Check the template embedder against AF3 with a REAL TEMPLATE in slot 0.
 - **`check_af3_trunk.js`** - Run AF3's whole trunk and compare the pair, the single and the distogram.
+- **`check_chain_ptm.py`** - Hold localfold-af3's pTM-family scores to AlphaFold 3's own reductions.
 - **`check_esmfold2_confidence_real.py`** - Synthyra's ConfidenceHead on OUR REAL trunk output, not on seeded normals.
 - **`check_opendde_confidence_real.py`** - af3-any-model's OpenDDE ConfidenceHead on OUR REAL trunk output.
 - **`dump_af3_atom.py`** - Dump AF3's atom-cross-attention LAYOUT, so the four atom checkers have an oracle.
