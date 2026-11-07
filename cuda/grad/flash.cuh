@@ -1569,16 +1569,38 @@ inline bool gridForwardBf(const Sdpa& a, const __nv_bfloat16* q, int ldq, const 
   keyTermsK<<<blocks((size_t)a.B * Npk), 256, 0, STREAM>>>(a, ka2, Npk);
   // (one row of 64 queries a block: two rows sharing the bias tile, or 128 queries sharing K and V, measured the same
   // at 512 tokens - 11.6, 11.6 and 11.5 ms a pairformer block's forward - though the kernel reads L2 at 74% of its
-  // throughput: what is left is latency, ~15 instructions a score at 4 blocks of 4 warps an SM)
-  constexpr int GR = 1, WQ = 4, GQ = 16 * WQ;
-  const size_t grid = (size_t)((a.Q + GQ - 1) / GQ) * a.H * ((a.B + GR - 1) / GR);
+  // throughput: what is left is latency, ~15 instructions a score at 4 blocks of 4 warps an SM. Where shared memory
+  // holds fewer than 3 of those blocks an SM - an RTX PRO 6000's ~100 KB, 2 - two rows of 128 queries a block, 16 warps
+  // sharing both tiles, run instead: 1.17 -> 0.96 ms a call at 512 tokens there; on the GH200 and the A100, which hold
+  // 4, it lost - 0.56 -> 0.65 and 0.88 -> 1.08 ms on bench_flash --grid)
+  auto launch = [&](auto Dc, auto Gc, auto Wc) {
+    constexpr int DD = decltype(Dc)::value, GR = decltype(Gc)::value, WQ = decltype(Wc)::value, GQ = 16 * WQ;
+    const size_t grid = (size_t)((a.Q + GQ - 1) / GQ) * a.H * ((a.B + GR - 1) / GR);
+    const HSrc qs_ = hsrc<DD>(q, ldq, a.B, a.Q, a.H), ks_ = hsrc<DD>(k, ldk, a.B, a.K, a.H), vs_ = hsrc<DD>(v, ldv, a.B, a.K, a.H);
+    const size_t smem = gridFwdSmem<DD, GR, WQ>();
+    gridFwdBf<DD, GR, WQ><<<(unsigned)grid, 32 * GR * WQ, smem, STREAM>>>(a, bt, qs_, ks_, vs_, o, ldo, lse, gate, ldg, og, ldog, ka2, Npk);
+  };
+  using I1 = std::integral_constant<int, 1>; using I2 = std::integral_constant<int, 2>;
+  using I4 = std::integral_constant<int, 4>; using I8 = std::integral_constant<int, 8>;
   auto run = [&](auto Dc) {
     constexpr int DD = decltype(Dc)::value;
-    const HSrc qs_ = hsrc<DD>(q, ldq, a.B, a.Q, a.H), ks_ = hsrc<DD>(k, ldk, a.B, a.K, a.H), vs_ = hsrc<DD>(v, ldv, a.B, a.K, a.H);
-    static bool attr = false;
-    const size_t smem = gridFwdSmem<DD, GR, WQ>();
-    if (!attr) { GK(cudaFuncSetAttribute(gridFwdBf<DD, GR, WQ>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem)); attr = true; }
-    gridFwdBf<DD, GR, WQ><<<(unsigned)grid, 32 * GR * WQ, smem, STREAM>>>(a, bt, qs_, ks_, vs_, o, ldo, lse, gate, ldg, og, ldog, ka2, Npk);
+    static bool attr = false, wide = false;
+    if (!attr) {
+      const size_t s14 = gridFwdSmem<DD, 1, 4>(), s28 = gridFwdSmem<DD, 2, 8>();
+      GK(cudaFuncSetAttribute(gridFwdBf<DD, 1, 4>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)s14));
+      int per = 0, dev = 0, optin = 0;
+      GK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per, gridFwdBf<DD, 1, 4>, 128, s14));
+      GK(cudaGetDevice(&dev));
+      GK(cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev));
+      if (per < 3 && (size_t)optin >= s28) {
+        GK(cudaFuncSetAttribute(gridFwdBf<DD, 2, 8>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)s28));
+        int per28 = 0;
+        GK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per28, gridFwdBf<DD, 2, 8>, 512, s28));
+        wide = per28 >= 1;
+      }
+      attr = true;
+    }
+    if (wide) launch(Dc, I2{}, I8{}); else launch(Dc, I1{}, I4{});
   };
   if (a.D == 32) run(std::integral_constant<int, 32>{}); else run(std::integral_constant<int, 16>{});
   return true;
