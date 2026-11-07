@@ -16,7 +16,8 @@ import { createWebGL2Context } from "../../runtime/context.js";
 import { Execution } from "../../runtime/execution.js";
 import { foldAf3Async, releaseAf3Weights, uploadAf3WeightsSteps } from "./fold.js";
 import { drainAsync, gpuIdle } from "../../runtime/steps.js";
-import { chainPairTmScores, perChainTmScores, reduceTmScore, tmPerBinFor, tmScoreD0, tmTermFromLogits }
+import { chainPairTmScores, chainTmInfo, interfaceTmTerm, perChainTmScores, reduceTmScore, tmPerBinFor, tmScoreD0,
+  tmTermFromLogits, tokenFrameMask }
   from "../../../shared/heads/tm-score.js";
 import { errorBinCentres, MAX_ERROR_BIN, NUM_BINS } from "../confidence/confidence.js";
 import { backboneGeometry } from "../../../webgpu/af3/fold.js";
@@ -106,12 +107,18 @@ export async function foldBatchWebGl2(batch, weights, options) {
     // As WebGPU's head computes it: one d0 over every token, the expectation over the PAE bins.
     const tmPerBin = tmPerBinFor(errorBinCentres(NUM_BINS, MAX_ERROR_BIN), tmScoreD0(tokens));
     const tmAdjusted = tmTermFromLogits(fold.paeLogits, tokens, tmPerBin);
-    scores = { plddt: fold.plddt, pae: fold.pae, tmAdjusted };
-    const selected = (i, j) => seqMask[i] > 0 && seqMask[j] > 0;
+    // ...and AF3's interface term for the chain-level scores (d0 from the pair's own chains), anchored, as pTM is,
+    // on the tokens with frames - webgpu/af3/fold.js's reduction (reported by Yeqing Lin)
+    const tmInterface = interfaceTmTerm(fold.paeLogits, tokens,
+      chainTmInfo(asymId, seqMask, errorBinCentres(NUM_BINS, MAX_ERROR_BIN)));
+    scores = { plddt: fold.plddt, pae: fold.pae, tmAdjusted, tmInterface };
+    const frame = tokenFrameMask({ tokens, dense, isLigand: batch.isLigand, asymId,
+      residueIndex: batch.residueIndex, refPos: batch.refPos, refMask: batch.refMask });
+    const selected = (i, j) => seqMask[i] > 0 && seqMask[j] > 0 && frame[i] === 1;
     ptm = reduceTmScore(tmAdjusted, tokens, selected);
     iptm = reduceTmScore(tmAdjusted, tokens, (i, j) => selected(i, j) && asymId[i] !== asymId[j]);
-    chainPairIptm = Object.fromEntries(chainPairTmScores(tmAdjusted, tokens, asymId, seqMask).scores);
-    const perChain = perChainTmScores(tmAdjusted, tokens, asymId, seqMask);
+    chainPairIptm = Object.fromEntries(chainPairTmScores(tmInterface, tokens, asymId, seqMask, frame).scores);
+    const perChain = perChainTmScores(tmInterface, tokens, asymId, seqMask, frame);
     chainPtm = Object.fromEntries(perChain.chainPtm);
     chainIptm = Object.fromEntries(perChain.chainIptm);
     let total = 0;
