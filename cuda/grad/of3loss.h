@@ -490,8 +490,77 @@ __global__ void smoothLddtGradK(const double* __restrict__ x, const double* __re
     dx[l * 3 + threadIdx.x] += scale / (sums[1] + of3::EPS) * t;
   }
 }
+// ---- the batched form (train-of3's): every sample of a diffusion chunk in one launch, each read where the denoiser
+// left it (float), the pair terms in float and their sums in double - at 48 samples a 512-token step, the float64
+// kernels a sample at a time were ~58 ms of the RTX PRO 6000's step (its float64 is a sliver of its float32), and 48
+// round trips through the host. xs [S] device pointers; sums [S][2]; dx [S][A 3] (unscaled: 1/den folded in)
+template <class T>
+__global__ void smoothLddtBatchK(const T* const* __restrict__ xs, const float* __restrict__ xt, const int* __restrict__ live,
+                                 const char* __restrict__ nuc, int L, double* __restrict__ sums) {
+  const int k = blockIdx.y;
+  const T* x = xs[k];
+  float num = 0, den = 0;
+  for (size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x; t < (size_t)L * L; t += (size_t)gridDim.x * blockDim.x) {
+    const int a = (int)(t / L), b = (int)(t % L);
+    if (a == b) continue;
+    const int l = live[a], m = live[b];
+    float g2 = (float)of3::EPS, p2 = (float)of3::EPS;
+    for (int q = 0; q < 3; ++q) { const float e = xt[l * 3 + q] - xt[m * 3 + q], f = (float)x[l * 3 + q] - (float)x[m * 3 + q]; g2 += e * e; p2 += f * f; }
+    const float dg = sqrtf(g2);
+    if (!(dg < (nuc[a] ? 30.f : 15.f))) continue;
+    const float del = fabsf(dg - sqrtf(p2));
+    float e = 0;
+    for (float c : {0.5f, 1.f, 2.f, 4.f}) e += 0.25f / (1 + __expf(-(c - del)));
+    num += e; den += 1;
+  }
+  double dn = num, dd = den;
+  for (int o = 16; o; o >>= 1) { dn += __shfl_xor_sync(~0u, dn, o); dd += __shfl_xor_sync(~0u, dd, o); }
+  if ((threadIdx.x & 31) == 0) { atomicAdd(sums + 2 * k, dn); atomicAdd(sums + 2 * k + 1, dd); }
+}
+template <class T>
+__global__ void smoothLddtGradBatchK(const T* const* __restrict__ xs, const float* __restrict__ xt, const int* __restrict__ live,
+                                     const char* __restrict__ nuc, int L, size_t A, const double* __restrict__ sums,
+                                     float* __restrict__ dxs) {
+  const int a = blockIdx.x, k = blockIdx.y;
+  const T* x = xs[k];
+  const int l = live[a];
+  const float cut = nuc[a] ? 30.f : 15.f;
+  float xl[3], tl[3];
+  for (int q = 0; q < 3; ++q) { xl[q] = (float)x[l * 3 + q]; tl[q] = xt[l * 3 + q]; }
+  float g[3] = {0, 0, 0};
+  for (int b = threadIdx.x; b < L; b += blockDim.x) {
+    if (a == b) continue;
+    const int m = live[b];
+    float dvec[3], g2 = (float)of3::EPS;
+    for (int q = 0; q < 3; ++q) { const float e = tl[q] - xt[m * 3 + q]; g2 += e * e; }
+    const float dg = sqrtf(g2);
+    const int terms = (dg < cut) + (dg < (nuc[b] ? 30.f : 15.f));
+    if (!terms) continue;
+    float p2 = (float)of3::EPS;
+    for (int q = 0; q < 3; ++q) { dvec[q] = xl[q] - (float)x[m * 3 + q]; p2 += dvec[q] * dvec[q]; }
+    const float dp = sqrtf(p2), del = fabsf(dg - dp);
+    float de = 0;
+    for (float c : {0.5f, 1.f, 2.f, 4.f}) { const float sg = 1 / (1 + __expf(-(c - del))); de -= 0.25f * sg * (1 - sg); }
+    const float kk = de * (dp > dg ? 1 : -1) / dp;
+    for (int q = 0; q < 3; ++q) g[q] -= terms * kk * dvec[q];
+  }
+  __shared__ float part[3][32];
+  for (int q = 0; q < 3; ++q) {
+    for (int o = 16; o; o >>= 1) g[q] += __shfl_xor_sync(~0u, g[q], o);
+    if ((threadIdx.x & 31) == 0) part[q][threadIdx.x >> 5] = g[q];
+  }
+  __syncthreads();
+  if (threadIdx.x < 3) {
+    float t = 0;
+    for (int w = 0; w < (int)(blockDim.x >> 5); ++w) t += part[threadIdx.x][w];
+    dxs[(size_t)k * A * 3 + l * 3 + threadIdx.x] = (float)(t / (sums[2 * k + 1] + of3::EPS));
+  }
+}
 struct SmoothLddt {
   int L = 0; int* live = nullptr; char* nuc = nullptr; double *x = nullptr, *xt = nullptr, *dx = nullptr, *sums = nullptr; size_t A = 0;
+  // the batched form's: the truth in float, the chunk's pointers, sums and gradients (device), and their host copies
+  float* xtf = nullptr; const void** xsD = nullptr; double* sumsB = nullptr; float* dxB = nullptr; int capS = 0;
+  std::vector<double> sumsH; std::vector<float> dxH;
   // once an example: its resolved atoms and their types, and the truth
   void init(const of3::Layout& Lay, const std::vector<double>& xtH, const std::vector<double>& gm) {
     release();
@@ -503,6 +572,38 @@ struct SmoothLddt {
     cudaMalloc(&x, A * 3 * 8); cudaMalloc(&xt, A * 3 * 8); cudaMalloc(&dx, A * 3 * 8); cudaMalloc(&sums, 16);
     cudaMemcpy(live, lv.data(), L * sizeof(int), cudaMemcpyHostToDevice); cudaMemcpy(nuc, nc.data(), L, cudaMemcpyHostToDevice);
     cudaMemcpy(xt, xtH.data(), A * 3 * 8, cudaMemcpyHostToDevice);
+    std::vector<float> xtF(xtH.begin(), xtH.end());
+    cudaMalloc(&xtf, A * 3 * 4); cudaMemcpy(xtf, xtF.data(), A * 3 * 4, cudaMemcpyHostToDevice);
+  }
+  // every sample of a chunk at once (xs: S device arrays of float positions [A][3]), the results copied back on s -
+  // read by value(k) and addGrad(k, ...) once s is synchronised
+  template <class T>
+  void runBatch(const std::vector<const T*>& xs, bool grad, cudaStream_t s) {
+    const int S = (int)xs.size();
+    if (S > capS) {
+      for (void* p : {(void*)xsD, (void*)sumsB, (void*)dxB}) if (p) cudaFree(p);
+      cudaMalloc(&xsD, S * sizeof(void*)); cudaMalloc(&sumsB, S * 16); cudaMalloc(&dxB, (size_t)S * A * 3 * 4);
+      capS = S;
+    }
+    cudaMemcpyAsync(xsD, xs.data(), S * sizeof(void*), cudaMemcpyHostToDevice, s);
+    const T* const* xp = reinterpret_cast<const T* const*>(xsD);
+    cudaMemsetAsync(sumsB, 0, S * 16, s);
+    // (blocks a sample fixed, whatever S: a sample's float sums in the same order batched or alone - --check-batch)
+    const unsigned bx = (unsigned)std::max<size_t>(1, std::min<size_t>(((size_t)L * L + 255) / 256, 1024));
+    smoothLddtBatchK<T><<<dim3(bx, S), 256, 0, s>>>(xp, xtf, live, nuc, L, sumsB);
+    sumsH.resize(2 * S);
+    cudaMemcpyAsync(sumsH.data(), sumsB, S * 16, cudaMemcpyDeviceToHost, s);
+    if (grad) {
+      cudaMemsetAsync(dxB, 0, (size_t)S * A * 3 * 4, s);
+      if (L) smoothLddtGradBatchK<T><<<dim3(L, S), 256, 0, s>>>(xp, xtf, live, nuc, L, A, sumsB, dxB);
+      dxH.resize((size_t)S * A * 3);
+      cudaMemcpyAsync(dxH.data(), dxB, (size_t)S * A * 3 * 4, cudaMemcpyDeviceToHost, s);
+    }
+  }
+  double value(int k) const { return 1 - sumsH[2 * k] / (sumsH[2 * k + 1] + of3::EPS); }
+  void addGrad(int k, double scale, std::vector<double>& g) const {
+    const float* d = dxH.data() + (size_t)k * A * 3;
+    for (size_t i = 0; i < A * 3; ++i) g[i] += scale * d[i];
   }
   // 1 - lddt, and scale * d(1 - lddt)/dx added into dxH
   double run(const std::vector<double>& xH, double scale, std::vector<double>* dxH, cudaStream_t s) {
@@ -521,7 +622,10 @@ struct SmoothLddt {
     double sh[2]; cudaMemcpyAsync(sh, sums, 16, cudaMemcpyDeviceToHost, s); cudaStreamSynchronize(s);
     return 1 - sh[0] / (sh[1] + of3::EPS);
   }
-  void release() { for (void* p : {(void*)live, (void*)nuc, (void*)x, (void*)xt, (void*)dx, (void*)sums}) if (p) cudaFree(p); live = nullptr; nuc = nullptr; x = xt = dx = sums = nullptr; }
+  void release() {
+    for (void* p : {(void*)live, (void*)nuc, (void*)x, (void*)xt, (void*)dx, (void*)sums, (void*)xtf, (void*)xsD, (void*)sumsB, (void*)dxB}) if (p) cudaFree(p);
+    live = nullptr; nuc = nullptr; x = xt = dx = sums = nullptr; xtf = nullptr; xsD = nullptr; sumsB = nullptr; dxB = nullptr; capS = 0;
+  }
 };
 }  // namespace of3dev
 #endif

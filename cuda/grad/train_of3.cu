@@ -1500,7 +1500,10 @@ int main(int argc, char** argv) {
       return (cK - cN) * sbSeen.chunkMs <= rest * sbSeen.replayMs;
     };
     // (auto: each chunk timed - events 2 + 2 i, 3 + 2 i - and the transformer's blocks in each forward, events 0, 1)
-    struct Timed { int S; bool kept; double bytes; };   // (bytes: the chunk's arena peak less its kept saves)
+    struct Timed { int S; bool kept; double bytes; };   // (bytes: the chunk's arena peak less its kept saves, and the
+                                                        // stream pool's - the transformer's buffers - at its peak)
+    int dev0 = 0; GK(cudaGetDevice(&dev0));
+    cudaMemPool_t pool0; GK(cudaDeviceGetDefaultMemPool(&pool0, dev0));
     std::vector<Timed> timed;
     if (autoSB && sbSeen.ev.size() < 2 + 2 * (size_t)nSamples)
       while (sbSeen.ev.size() < 2 + 2 * (size_t)nSamples) { cudaEvent_t e; GK(cudaEventCreate(&e)); sbSeen.ev.push_back(e); }
@@ -1512,7 +1515,9 @@ int main(int argc, char** argv) {
       const size_t rm = room(g::ARENA.at);
       const size_t free = rm > sbSeen.shared * sc ? rm - (size_t)(sbSeen.shared * sc) : 0;
       const int nN = fitIn(free, (size_t)(sbSeen.per * sc), nSamples);
-      const int nK = sbSeen.keptPer > 0 ? fitIn(free, (size_t)((sbSeen.per + sbSeen.keptPer) * sc), nSamples) : 0;
+      // (the saves kept only where a sample with them fits at all: fitIn's floor of 1 is a sample that must run)
+      const size_t perK = (size_t)((sbSeen.per + sbSeen.keptPer) * sc);
+      const int nK = sbSeen.keptPer > 0 && free >= perK ? fitIn(free, perK, nSamples) : 0;
       if (diffSaves == 0) keepDiff = keepWins(nSamples, nK, nN);
       nextS = even(nSamples, keepDiff && nK ? nK : nN);
       planned = true;
@@ -1521,7 +1526,10 @@ int main(int argc, char** argv) {
       g::Scratch sc;
       S = std::min(nextS, nSamples - s0); widest = std::max(widest, S);
       const size_t used0 = g::ARENA.used, high0 = g::ARENA.high, at0 = g::ARENA.at;
-      if (autoSB) { GK(cudaEventRecord(sbSeen.ev[2 + 2 * timed.size()], STREAM)); dn.run.timed = sbSeen.ev.data(); }
+      if (autoSB) {
+        GK(cudaEventRecord(sbSeen.ev[2 + 2 * timed.size()], STREAM)); dn.run.timed = sbSeen.ev.data();
+        uint64_t z = 0; GK(cudaMemPoolSetAttribute(pool0, cudaMemPoolAttrReservedMemHigh, &z));   // (the chunk's own peak)
+      }
       g::ARENA.high = used0;
       std::optional<g::Range> rD_; rD_.emplace("diff.noise");
       std::vector<double> sig(S);
@@ -1562,6 +1570,9 @@ int main(int argc, char** argv) {
       // (the batch's predictions out and its cotangents back through pinned memory, one synchronisation)
       g::real* hOut = pinned[11].get((size_t)S * A * 3);
       for (int k = 0; k < S; ++k) GK(cudaMemcpyAsync(hOut + (size_t)k * A * 3, xout[k], A * 3 * sizeof(g::real), cudaMemcpyDeviceToHost, STREAM));
+      // (the chunk's smooth LDDT on the device at once, from the predictions where they are: its values and
+      // gradients come back with them)
+      sl.runBatch(std::vector<const g::real*>(xout.begin(), xout.end()), train, STREAM);
       GK(cudaStreamSynchronize(STREAM));
       if (autoSB && SB != 1) {   // (the blocks' time a sample: what the backward replays where the saves are not kept)
         float ms; GK(cudaEventElapsedTime(&ms, sbSeen.ev[0], sbSeen.ev[1]));
@@ -1573,7 +1584,7 @@ int main(int argc, char** argv) {
         std::vector<double> xp(xh, xh + A * 3), dx(A * 3, 0);
         const auto tl = std::chrono::steady_clock::now();
         auto D = of3::diffusionLoss(Lay, xp, e.xt, e.gm, sig[k], DW, &dx, 1.0 / nSamples,
-                                    [&](double sc_, std::vector<double>* g) { return sl.run(xp, sc_, train ? g : nullptr, STREAM); },
+                                    [&](double sc_, std::vector<double>* g) { if (train && g) sl.addGrad(k, sc_, *g); return sl.value(k); },
                                     lossAtom.empty() ? nullptr : &lossAtom);
         tLoss += msOf(tl, std::chrono::steady_clock::now());
         L.mse += D.mse / nSamples; L.bond += D.bond / nSamples; L.lddt += D.lddt / nSamples; L.diffusion += D.total / nSamples;
@@ -1593,26 +1604,28 @@ int main(int argc, char** argv) {
         dn.run.keep = false; dn.run.saves.clear();
         g::add(dTs, ts, (size_t)n * Cs); g::add(dTp, tp, nn * Cz); g::add(dTf, tfd, (size_t)n * te.F);
       }
-      if (s0 == 0) memPhase("diffusion chunk");
+      uint64_t pooled = 0;
       if (autoSB) {
         GK(cudaEventRecord(sbSeen.ev[3 + 2 * timed.size()], STREAM));
-        timed.push_back({S, keepDiff, (double)(g::ARENA.high - used0) - (keepDiff ? (double)dn.run.keptBytes : 0.0)});
+        GK(cudaMemPoolGetAttribute(pool0, cudaMemPoolAttrReservedMemHigh, &pooled));
+        timed.push_back({S, keepDiff, (double)(g::ARENA.high - used0) - (keepDiff ? (double)dn.run.keptBytes : 0.0) + (double)pooled});
         if (keepDiff) sbSeen.keptPer = (double)dn.run.keptBytes / S;
       }
       if (autoSB) {
-        const size_t perSample = (g::ARENA.high - used0 + S - 1) / S;
+        const size_t perSample = (g::ARENA.high - used0 + pooled + S - 1) / S;
         const size_t perNo = keepDiff ? (perSample > dn.run.keptBytes / S ? perSample - dn.run.keptBytes / S : 1) : perSample;
         const int rest = nSamples - s0 - S;
         if (rest > 0 && !planned) {
           const size_t rm = room(at0);
           int nK = fitIn(rm, perSample, rest);
-          if (s0 == 0 && keepDiff && diffSaves == 0) {   // (kept, measured: off where that costs too many chunks)
-            const int nN = fitIn(rm, perNo, rest);
-            if (!keepWins(rest, nK, nN)) { keepDiff = false; nK = nN; }
+          if (s0 == 0 && keepDiff && diffSaves == 0) {   // (kept, measured: off where that costs too many chunks, or
+            const int nN = fitIn(rm, perNo, rest);         // where a sample with them does not fit)
+            if (rm < perSample || !keepWins(rest, nK, nN)) { keepDiff = false; nK = nN; }
           }
           nextS = even(rest, nK);
         }
       }
+      if (s0 == 0) memPhase("diffusion chunk");   // (after the measurements above: it resets the arena's high-water mark)
       g::ARENA.high = std::max(high0, g::ARENA.high);
     }
     // a chunk's own cost and its shared bytes, from the narrowest and the widest chunks (their times less the replays
@@ -1628,8 +1641,9 @@ int main(int argc, char** argv) {
         const double per = (timed[hi].bytes - timed[lo].bytes) / (timed[hi].S - timed[lo].S), sh = timed[lo].bytes - timed[lo].S * per;
         if (per > 0 && sh >= 0) { sbSeen.per = per; sbSeen.shared = sh; }
         else { sbSeen.per = timed[hi].bytes / timed[hi].S; sbSeen.shared = 0; }
-      } else {
-        sbSeen.per = std::max(1.0, (timed[hi].bytes - sbSeen.shared) / timed[hi].S);
+      } else {   // (chunks all one size: the largest of their peaks)
+        double most = 0; for (const auto& tm : timed) most = std::max(most, tm.bytes);
+        sbSeen.per = std::max(1.0, (most - sbSeen.shared) / timed[hi].S);
       }
       if (timed[hi].S > timed[lo].S && sbSeen.replayMs >= 0) {
         auto own = [&](int i) {

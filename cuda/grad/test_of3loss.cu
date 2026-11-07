@@ -67,6 +67,26 @@ int main(int argc, char** argv) {
     const double ev = fabs(D2.lddt - D.lddt) / D.lddt, eg = sqrt(num / den);
     printf("device smooth LDDT against the host's: value %.2e, the whole diffusion gradient %.2e  %s\n", ev, eg, ev < 1e-12 && eg < 1e-12 ? "PASS" : "FAIL");
     if (!(ev < 1e-12 && eg < 1e-12)) return 1;
+    // ...and its batched form (train-of3's): the positions float on the device, two samples a launch, the pair terms in
+    // float - held to the host's float64 at float's bar
+    {
+      std::vector<float> xf(x.begin(), x.end());
+      float* xd = nullptr; cudaMalloc(&xd, xf.size() * 4 * 2);
+      cudaMemcpy(xd, xf.data(), xf.size() * 4, cudaMemcpyHostToDevice);
+      cudaMemcpy(xd + xf.size(), xf.data(), xf.size() * 4, cudaMemcpyHostToDevice);
+      sl.runBatch(std::vector<const float*>{xd, xd + xf.size()}, true, 0);
+      cudaDeviceSynchronize();
+      std::vector<double> dx3(A * 3, 0);
+      auto D3 = of3::diffusionLoss(L, x, xt, gm, t, W, &dx3, 1,
+                                   [&](double sc, std::vector<double>* g) { if (g) sl.addGrad(1, sc, *g); return sl.value(1); });
+      double n3 = 0, d3 = 0; for (size_t i = 0; i < A * 3; ++i) { n3 += (dx3[i] - dx[i]) * (dx3[i] - dx[i]); d3 += dx[i] * dx[i]; }
+      const double ev3 = fabs(D3.lddt - D.lddt) / D.lddt, eg3 = sqrt(n3 / d3), e01 = fabs(sl.value(0) - sl.value(1));
+      const bool ok3 = ev3 < 1e-5 && eg3 < 1e-4 && e01 < 1e-12;
+      printf("device smooth LDDT batched (float): value %.2e, the whole diffusion gradient %.2e, its two samples %.1e apart  %s\n",
+             ev3, eg3, e01, ok3 ? "PASS" : "FAIL");
+      cudaFree(xd);
+      if (!ok3) return 1;
+    }
     sl.release();
   }
   std::vector<double> gDg(lDg.size(), 0), gPl(lPl.size(), 0), gPde(lPde.size(), 0), gPae(lPae.size(), 0), gRs(lRs.size(), 0);

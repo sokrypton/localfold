@@ -251,6 +251,10 @@ struct DiffBlockSave {
   real *qkvg, *qraw, *kraw, *o, *og, *x1, *h, *u, *g;
   AzSave z1, z2;
   real* lse = nullptr;   // the attention's logit max and log-sum, kept for its backward
+  // (kept across the transformer - DiffRun::keep - its forward's temporaries in the run's two scratch rows instead of
+  // the arena, and og and g not kept but rebuilt by the backward from o and the gate, h and u: a sixth of a block's
+  // saves, elementwise to redo)
+  bool rebuild = false;
 };
 // (S samples batched: queries [S n] rows, the key mask [S n], the pair logits one set every sample reads)
 inline Sdpa tokenSdpa(const DiffBlock& b, int n, const real* mask, const real* pl, real* dpl = nullptr, int S = 1) {
@@ -280,12 +284,15 @@ __global__ void swigluUpBwdK(const real* wide, const real* up, const real* dg, r
 }
 
 // act [n, C] -> out [n, C]; S samples batched: act, cond and mask [S n, ...], one set of pair logits
+// (tmpC [n C], tmpW [n max(HD, I)]: the scratch rows a kept forward's temporaries use - see DiffBlockSave::rebuild)
 inline DiffBlockSave diffBlockForward(const DiffTransformer& t, const DiffBlock& b, const real* act, const real* cond,
-                                      const real* mask, const real* pl, real* out, int nTok, int S = 1) {
+                                      const real* mask, const real* pl, real* out, int nTok, int S = 1,
+                                      real* tmpC = nullptr, real* tmpW = nullptr) {
   const int C = b.C, HD = b.H * b.D, I = b.I;
   const int n = nTok * S;     // (the rows every row-wise operation runs over)
   DiffBlockSave s{};
-  real* x = ARENA.get((size_t)n * C);
+  s.rebuild = tmpC && tmpW;
+  real* x = s.rebuild ? tmpC : ARENA.get((size_t)n * C);
   s.a1 = adaForward(b.ln1, act, cond, x, n);
   s.qkvg = ARENA.get((size_t)n * 4 * HD);
   real *q = s.qkvg, *k = q + (size_t)n * HD, *v = k + (size_t)n * HD, *g = v + (size_t)n * HD;
@@ -298,17 +305,17 @@ inline DiffBlockSave diffBlockForward(const DiffTransformer& t, const DiffBlock&
   sigmoidK<<<blocks((size_t)n * HD), 256, 0, STREAM>>>(g, (size_t)n * HD);
   s.o = ARENA.get((size_t)n * HD);
   { const Sdpa sd_ = tokenSdpa(b, nTok, mask, pl, nullptr, S); s.lse = ARENA.get((size_t)2 * sd_.B * sd_.H * sd_.Q); sdpaForward(sd_, q, HD, k, HD, v, HD, s.o, HD, s.lse); }
-  s.og = ARENA.get((size_t)n * HD);
+  s.og = s.rebuild ? tmpW : ARENA.get((size_t)n * HD);
   mulK<<<blocks((size_t)n * HD), 256, 0, STREAM>>>(s.og, s.o, g, (size_t)n * HD);
   s.x1 = ARENA.get((size_t)n * C);
   GK(cudaMemcpyAsync(s.x1, act, (size_t)n * C * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
   s.z1 = azForward(b.z1, s.og, cond, s.x1, n);
-  real* x2 = ARENA.get((size_t)n * C);
+  real* x2 = s.rebuild ? tmpC : ARENA.get((size_t)n * C);
   s.a2 = adaForward(b.ln2, t.noResidual ? act : s.x1, cond, x2, n);
   s.h = ARENA.get((size_t)n * 2 * I);
   b.t1.forward(x2, s.h, n);
   if (b.hasUp) { s.u = ARENA.get((size_t)n * I); b.up.forward(x2, s.u, n); }
-  s.g = ARENA.get((size_t)n * I);
+  s.g = s.rebuild ? tmpW : ARENA.get((size_t)n * I);
   swigluUpK<<<blocks((size_t)n * I), 256, 0, STREAM>>>(s.h, b.hasUp ? s.u : nullptr, s.g, n, I);
   GK(cudaMemcpyAsync(out, s.x1, (size_t)n * C * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
   s.z2 = azForward(b.z2, s.g, cond, out, n);
@@ -326,7 +333,12 @@ inline void diffBlockBackward(const DiffTransformer& t, DiffBlock& b, const Diff
   real* dact0 = ARENA.zeros((size_t)n * C);       // rf3: the transition's route to the block input
   // the transition
   real* dg = ARENA.get((size_t)n * I);
-  azBackward(b.z2, s.z2, dout, dg, dcond);
+  if (s.rebuild) {   // (g rebuilt: the transition's output projection reads it)
+    real* g2 = ARENA.get((size_t)n * I);
+    swigluUpK<<<blocks((size_t)n * I), 256, 0, STREAM>>>(s.h, b.hasUp ? s.u : nullptr, g2, n, I);
+    AzSave z2 = s.z2; z2.y = g2;
+    azBackward(b.z2, z2, dout, dg, dcond);
+  } else azBackward(b.z2, s.z2, dout, dg, dcond);
   real *dh = ARENA.get((size_t)n * 2 * I), *du = b.hasUp ? ARENA.get((size_t)n * I) : nullptr;
   swigluUpBwdK<<<blocks((size_t)n * I), 256, 0, STREAM>>>(s.h, b.hasUp ? s.u : nullptr, dg, dh, du, n, I);
   real* dx2 = ARENA.get((size_t)n * C);
@@ -342,8 +354,13 @@ inline void diffBlockBackward(const DiffTransformer& t, DiffBlock& b, const Diff
   adaBackward(b.ln2, s.a2, dx2, t.noResidual ? dact0 : dx1, dcond);
   // the attention
   real* dog = ARENA.get((size_t)n * HD);
-  azBackward(b.z1, s.z1, dx1, dog, dcond);
   real *q = s.qkvg, *k = q + (size_t)n * HD, *v = k + (size_t)n * HD, *g = v + (size_t)n * HD;
+  if (s.rebuild) {   // (og = o g rebuilt: the attention's output projection reads it)
+    real* og = ARENA.get((size_t)n * HD);
+    mulK<<<blocks((size_t)n * HD), 256, 0, STREAM>>>(og, s.o, g, (size_t)n * HD);
+    AzSave z1 = s.z1; z1.y = og;
+    azBackward(b.z1, z1, dx1, dog, dcond);
+  } else azBackward(b.z1, s.z1, dx1, dog, dcond);
   real* dqkvg = ARENA.get((size_t)n * 4 * HD);
   real *dq = dqkvg, *dk = dq + (size_t)n * HD, *dv = dk + (size_t)n * HD, *dgt = dv + (size_t)n * HD;
   real* dO = ARENA.get((size_t)n * HD);
@@ -453,10 +470,16 @@ inline void transformerForward(DiffTransformer& t, DiffRun& r, const real* act, 
   GK(cudaMemcpyAsync(r.acts[0], act, rows * t.C * sizeof(real), cudaMemcpyDeviceToDevice, STREAM));
   ARENA.rewind(m0);
   const size_t used0 = ARENA.used;
+  // (kept: the blocks' temporaries in two scratch rows shared by every block, not in each block's saves)
+  real *tmpC = nullptr, *tmpW = nullptr;
+  if (r.keep) {
+    int wide = 0; for (const auto& bk : t.blocks) wide = std::max({wide, bk.H * bk.D, bk.I});
+    tmpC = ARENA.get(rows * t.C); tmpW = ARENA.get(rows * wide);
+  }
   if (r.timed) GK(cudaEventRecord(r.timed[0], STREAM));
   for (int b = 0; b < nb; ++b) {
     if (!r.keep) ARENA.rewind(m0);
-    DiffBlockSave sv = diffBlockForward(t, t.blocks[b], r.acts[b], cond, mask, r.pl + (size_t)b * t.H * nn, r.acts[b + 1], n, S);
+    DiffBlockSave sv = diffBlockForward(t, t.blocks[b], r.acts[b], cond, mask, r.pl + (size_t)b * t.H * nn, r.acts[b + 1], n, S, tmpC, tmpW);
     if (r.keep) r.saves.push_back(sv);
   }
   if (r.timed) GK(cudaEventRecord(r.timed[1], STREAM));
