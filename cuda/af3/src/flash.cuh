@@ -1936,6 +1936,7 @@ __global__ void __launch_bounds__(WARPS * RR * 32, 2) flash8(const half* __restr
   }
 #endif
 }
+#include "flash_tc5.cuh"
 // will flash8Run take this attention: an FP8 card, a binary whose flash8 was compiled for one (not an older
 // architecture's PTX run by the driver, where the kernel is empty), and LOCALFOLD_FP8_ATTN not 0
 inline bool fp8Attn() {
@@ -1969,6 +1970,7 @@ inline void flash8Run(const half* qkvg, const uint8_t* K8, const uint8_t* V8, co
     fp8VtK<<<dim3(NK / 64, (unsigned)rows), 256, 65 * W, STREAM>>>(V8, vt, n, NK, W);
     Vt8 = vt;
   }
+  if (tc5a::TC_ATTN && tc5a::ready()) { tc5a::flashTcRun(qkvg, K8, Vt8, bias, stride, out, n, heads, rows, scale, qBias); return; }
   const int bytes = 2 * (RR * (BK * 32 + 32 * BK) + BQ * (BK + 8) * 2);
   static LF_TLS bool attr = false;
   dim3 grid((n + BQ - 1) / BQ, (unsigned)((rows + RR - 1) / RR * heads));

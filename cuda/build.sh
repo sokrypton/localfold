@@ -25,7 +25,8 @@ for port in "${ports[@]}"; do      # (named before anything is forked: a typo mu
   case "$port" in af3|af2|ef2|msap|bioemu2|rfd4p|featurise) ;; *) echo "unknown port $port (af3, af2, ef2, msap, bioemu2, rfd4p, featurise)" >&2; exit 1 ;; esac
 done
 cc="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '. ')"
-arch="sm_$cc"; archflags="-arch=$arch"
+arch="sm_$cc"; [ "$cc" = 100 ] && arch=sm_100a   # (a B200: the arch-specific target, which carries the tcgen05 kernels)
+archflags="-arch=$arch"
 archs="${LOCALFOLD_CUDA_ARCHS:-}"
 if [ -n "$archs" ]; then           # every listed card's SASS, and the newest's PTX for a card newer still
   archflags="--threads 0"; for a in $archs; do archflags+=" -gencode arch=compute_$a,code=sm_$a"; done

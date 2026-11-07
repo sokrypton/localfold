@@ -152,11 +152,12 @@ inline void benchGrid(int n) {
     if (fp8Attn()) {
       uint8_t* kv8 = dallocT<uint8_t>(rows * n * 2 * Wd);
       benchKv8K<<<blocks(rows * n * 2 * Wd), 256, 0, STREAM>>>(qkvg, kv8, rows * n, Wd);
-      rel("fp8", [&] { flash8Run(qkvg, kv8, kv8 + rows * n * Wd, bias, stride, out2, n, heads, rows, 0.17f, nullptr); });
+      rel("fp8", [&] { bool was = tc5a::TC_ATTN; tc5a::TC_ATTN = false; flash8Run(qkvg, kv8, kv8 + rows * n * Wd, bias, stride, out2, n, heads, rows, 0.17f, nullptr); tc5a::TC_ATTN = was; });
+      if (tc5a::ready()) rel("fp8 tcgen05", [&] { flash8Run(qkvg, kv8, kv8 + rows * n * Wd, bias, stride, out2, n, heads, rows, 0.17f, nullptr); });
       {   // the block order: the same blocks in another order, so the same bytes
-        int was = FP8_SWIZZLE; FP8_SWIZZLE = 4;
+        int was = FP8_SWIZZLE; bool tc = tc5a::TC_ATTN; FP8_SWIZZLE = 4; tc5a::TC_ATTN = false;
         flash8Run(qkvg, kv8, kv8 + rows * n * Wd, bias, stride, out, n, heads, rows, 0.17f, nullptr);
-        FP8_SWIZZLE = was;
+        FP8_SWIZZLE = was; tc5a::TC_ATTN = tc;
         std::vector<half> a(rows * n * Wd), b2(rows * n * Wd);
         CK(cudaMemcpy(a.data(), out, a.size() * 2, cudaMemcpyDeviceToHost)); CK(cudaMemcpy(b2.data(), out2, b2.size() * 2, cudaMemcpyDeviceToHost));
         size_t differ = 0; for (size_t i = 0; i < a.size(); ++i) differ += memcmp(&a[i], &b2[i], 2) != 0;
@@ -197,13 +198,14 @@ inline void benchGrid(int n) {
     {"2R w4 bk48 mt2", [&] { flashGrid2RRun<32, 4, 48, 2>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
     {"2R w4 bk48 rr2", [&] { flashGrid2RRun<32, 4, 48, 2, 2>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
     {"2R w4 bk48 rr3", [&] { flashGrid2RRun<32, 4, 48, 2, 3>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
-    {"fp8 (when the card has it)", [&] { if (kv8) flash8Run(qkvg, kv8, kv8 + rows * n * Wd, bias, stride, out, n, heads, rows, 0.17f, nullptr, 0); }},
-    {"fp8 spec", [&] { if (kv8) flash8Run(qkvg, kv8, kv8 + rows * n * Wd, bias, stride, out, n, heads, rows, 0.17f, nullptr, 1); }},
-    {"fp8 sw0", [&] { if (kv8) { int was = FP8_SWIZZLE; FP8_SWIZZLE = 0; flash8Run(qkvg, kv8, kv8 + rows * n * Wd, bias, stride, out, n, heads, rows, 0.17f, nullptr); FP8_SWIZZLE = was; } }},
-    {"fp8 sw2", [&] { if (kv8) { int was = FP8_SWIZZLE; FP8_SWIZZLE = 2; flash8Run(qkvg, kv8, kv8 + rows * n * Wd, bias, stride, out, n, heads, rows, 0.17f, nullptr); FP8_SWIZZLE = was; } }},
-    {"fp8 sw4", [&] { if (kv8) { int was = FP8_SWIZZLE; FP8_SWIZZLE = 4; flash8Run(qkvg, kv8, kv8 + rows * n * Wd, bias, stride, out, n, heads, rows, 0.17f, nullptr); FP8_SWIZZLE = was; } }},
-    {"fp8 sw8", [&] { if (kv8) { int was = FP8_SWIZZLE; FP8_SWIZZLE = 8; flash8Run(qkvg, kv8, kv8 + rows * n * Wd, bias, stride, out, n, heads, rows, 0.17f, nullptr); FP8_SWIZZLE = was; } }},
-    {"fp8 sw16", [&] { if (kv8) { int was = FP8_SWIZZLE; FP8_SWIZZLE = 16; flash8Run(qkvg, kv8, kv8 + rows * n * Wd, bias, stride, out, n, heads, rows, 0.17f, nullptr); FP8_SWIZZLE = was; } }},
+    {"fp8 tcgen05", [&] { if (kv8 && tc5a::ready()) flash8Run(qkvg, kv8, kv8 + rows * n * Wd, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
+    {"fp8 (when the card has it)", [&] { if (kv8) { bool was = tc5a::TC_ATTN; tc5a::TC_ATTN = false; flash8Run(qkvg, kv8, kv8 + rows * n * Wd, bias, stride, out, n, heads, rows, 0.17f, nullptr, 0); tc5a::TC_ATTN = was; } }},
+    {"fp8 spec", [&] { if (kv8) { bool was = tc5a::TC_ATTN; tc5a::TC_ATTN = false; flash8Run(qkvg, kv8, kv8 + rows * n * Wd, bias, stride, out, n, heads, rows, 0.17f, nullptr, 1); tc5a::TC_ATTN = was; } }},
+    {"fp8 sw0", [&] { if (kv8) { int was = FP8_SWIZZLE; bool tc = tc5a::TC_ATTN; FP8_SWIZZLE = 0; tc5a::TC_ATTN = false; flash8Run(qkvg, kv8, kv8 + rows * n * Wd, bias, stride, out, n, heads, rows, 0.17f, nullptr); FP8_SWIZZLE = was; tc5a::TC_ATTN = tc; } }},
+    {"fp8 sw2", [&] { if (kv8) { int was = FP8_SWIZZLE; bool tc = tc5a::TC_ATTN; FP8_SWIZZLE = 2; tc5a::TC_ATTN = false; flash8Run(qkvg, kv8, kv8 + rows * n * Wd, bias, stride, out, n, heads, rows, 0.17f, nullptr); FP8_SWIZZLE = was; tc5a::TC_ATTN = tc; } }},
+    {"fp8 sw4", [&] { if (kv8) { int was = FP8_SWIZZLE; bool tc = tc5a::TC_ATTN; FP8_SWIZZLE = 4; tc5a::TC_ATTN = false; flash8Run(qkvg, kv8, kv8 + rows * n * Wd, bias, stride, out, n, heads, rows, 0.17f, nullptr); FP8_SWIZZLE = was; tc5a::TC_ATTN = tc; } }},
+    {"fp8 sw8", [&] { if (kv8) { int was = FP8_SWIZZLE; bool tc = tc5a::TC_ATTN; FP8_SWIZZLE = 8; tc5a::TC_ATTN = false; flash8Run(qkvg, kv8, kv8 + rows * n * Wd, bias, stride, out, n, heads, rows, 0.17f, nullptr); FP8_SWIZZLE = was; tc5a::TC_ATTN = tc; } }},
+    {"fp8 sw16", [&] { if (kv8) { int was = FP8_SWIZZLE; bool tc = tc5a::TC_ATTN; FP8_SWIZZLE = 16; tc5a::TC_ATTN = false; flash8Run(qkvg, kv8, kv8 + rows * n * Wd, bias, stride, out, n, heads, rows, 0.17f, nullptr); FP8_SWIZZLE = was; tc5a::TC_ATTN = tc; } }},
     {"2R w4 bk32 rr2", [&] { flashGrid2RRun<32, 4, 32, 2, 2>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
     {"2R w4 bk64 rr2", [&] { flashGrid2RRun<32, 4, 64, 2, 2>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
     {"2R w2 bk48 rr2", [&] { flashGrid2RRun<32, 2, 48, 2, 2>(qkvg, bias, stride, out, n, heads, rows, 0.17f, nullptr); }},
