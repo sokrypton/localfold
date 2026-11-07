@@ -47,7 +47,14 @@ import {
   af3ContactBins, af3ContactClasses,
 } from "../../../shared/af3/featurise/contact-classes.js";
 import { targetFeatures } from "../../../cpu/af3/diffusion/atom-encoder.js";
-import { predictedTmScores } from "../../../cpu/af3/confidence/ptm.js";
+// 🔴 THE PAGE'S REDUCTION, NOT cpu/af3/confidence/ptm.js's. That one anchors
+// pTM on every live token and reports no chain scores at all, so this path -
+// which tools/gpu/fold-af3-webgl.js and the four WebGL2 probes fold through -
+// could not see the chain-pTM fix (reported by Yeqing Lin) even after the page's
+// own WebGL2 fold had it. `af3TmScores` is the definition; the terms either side
+// of it are the ones foldBatchWebGl2 and webgpu/af3/fold.js build.
+import { af3TmScores, chainTmInfo, interfaceTmTerm, tmPerBinFor, tmScoreD0, tmTermFromLogits, tokenFrameMask }
+  from "../../../shared/heads/tm-score.js";
 // 🔴 THE SAME DRAWS THE WebGPU FOLD USES, so the two backends' coordinates can
 // be compared at all: "a reproducible normal deviate, so a seed names a
 // structure". A second Box-Muller here would make every fold a different sample
@@ -776,10 +783,24 @@ export function* foldAf3Steps(execution, call) {
     paeLogits = Float32Array.from(execution.read(out.paeLogits));
     for (const tensor of Object.values(out)) execution.release(tensor);
     execution.release(pseudoBeta);
-    scores = predictedTmScores({
-      paeLogits, tokens, binCentres: errorBinCentres(NUM_BINS, MAX_ERROR_BIN),
-      seqMask, asymId: batch.asymId,
-    });
+    const centres = errorBinCentres(NUM_BINS, MAX_ERROR_BIN);
+    // The global term for pTM and ipTM - one d0 over every token, as AF3's
+    // `_compute_ptm` reads for both - and the interface term for the chain
+    // scores, d0 from the pair's own chains.
+    const tmAdjusted = tmTermFromLogits(paeLogits, tokens,
+      tmPerBinFor(centres, tmScoreD0(tokens)));
+    const tmInterface = interfaceTmTerm(paeLogits, tokens,
+      chainTmInfo(batch.asymId, seqMask, centres));
+    // 🔴 AND THE ANCHORS ARE THE TOKENS WITH FRAMES, AF3's pae_single_mask: an
+    // ion, a two-atom ligand and a colinear three-atom one align nothing. It
+    // moves pTM and ipTM by almost nothing - a framed token wins the maximum
+    // anyway - and moves a ligand chain's own scores a long way, which is why a
+    // path missing it looks right on the two headline numbers.
+    const frame = tokenFrameMask({ tokens, dense, isLigand: batch.isLigand,
+      asymId: batch.asymId, residueIndex: batch.residueIndex,
+      refPos: batch.refPos, refMask: batch.refMask });
+    scores = { ...af3TmScores({ tmAdjusted, tmInterface, tokens,
+      asymId: batch.asymId, seqMask, frame }), tmAdjusted, tmInterface, frame };
     call.onStage?.("confidence", {});
   }
 
@@ -804,6 +825,15 @@ export function* foldAf3Steps(execution, call) {
     positions, plddt, pae, pde, paeLogits, contactProbs, trunkSingle, trunkPair,
     meanPlddt: live === 0 ? NaN : total / live,
     ptm: scores.ptm, iptm: scores.iptm,
+    // The chain-level scores beside them, which this path reported as nothing at
+    // all: `chainPtm`/`chainIptm` keyed by asym id, `chainPairIptm` by "a|b".
+    chainPtm: scores.chainPtm, chainIptm: scores.chainIptm,
+    chainPairIptm: scores.chainPairIptm,
+    // ...and the two terms they were reduced from, with the anchor mask, for a
+    // caller that wants to reduce them another way (what the frame mask is
+    // worth, an interface of its own) or to count the frameless tokens.
+    tmAdjusted: scores.tmAdjusted, tmInterface: scores.tmInterface,
+    frame: scores.frame,
     trunkPasses: recycles + 1, steps,
   };
 }

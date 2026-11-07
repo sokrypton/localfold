@@ -413,3 +413,54 @@ export function chainPairTmScores(term, tokens, asymId, seqMask, frame = undefin
   }
   return { chains, scores };
 }
+
+/**
+ * AlphaFold 3's five TM numbers from the two terms: pTM, ipTM, and the three
+ * chain-level scores the AF3 server writes beside them.
+ *
+ * 🔴 ONE DEFINITION, BECAUSE THERE WERE THREE AND THE THIRD WAS THE OLD ONE.
+ * The page's WebGPU fold, the page's WebGL2 fold and the WebGL2 fold TOOL each
+ * wrote this reduction out by hand, and the tool's copy went through
+ * `cpu/af3/confidence/ptm.js` - anchors over every live token and no chain
+ * fields at all - so the chain-pTM fix (reported by Yeqing Lin) could not be
+ * checked through the one tool that folds AF3 on that backend. The two page
+ * copies agreed only because they were written on the same afternoon.
+ *
+ * 🔴 AND THE TWO TERMS ARE NOT INTERCHANGEABLE. `tmAdjusted` is the GLOBAL term
+ * (one d0 over every token) and pTM and ipTM are reduced from it, which is what
+ * AF3's `_compute_ptm` reads for both; `tmInterface` is the interface term (d0
+ * from the pair's own chains, see chainTmInfo) and every CHAIN score is reduced
+ * from that. Swapping them leaves a plausible number between 0 and 1: on the
+ * global term a short chain in a large complex read ~0.10 high.
+ *
+ * `frame` is tokenFrameMask - the tokens that may be ANCHORS, AF3's
+ * `pae_single_mask`. Pass it; `undefined` anchors on every live token, which is
+ * what AlphaFold 2 does (every AF2 token is a residue, so every one has a
+ * frame) and is wrong wherever an ion or a two-atom ligand is a token.
+ *
+ * @param {{tmAdjusted: ArrayLike<number>, tmInterface: ArrayLike<number>,
+ *   tokens: number, asymId: ArrayLike<number>, seqMask: ArrayLike<number>,
+ *   frame?: ArrayLike<number>}} input
+ * @returns {{ptm: number, iptm: number, chainPtm: Object<string, number>,
+ *   chainIptm: Object<string, number>, chainPairIptm: Object<string, number>}}
+ *   ipTM is NaN for a single chain - there is no interface to score, and zero
+ *   would read as a confident failure; a chain whose score is not finite is
+ *   ABSENT from its map rather than null (an ion anchors nothing).
+ */
+export function af3TmScores({ tmAdjusted, tmInterface, tokens, asymId, seqMask, frame }) {
+  const selected = (i, j) => seqMask[i] > 0 && seqMask[j] > 0
+    && (frame === undefined || frame[i] === 1);
+  const perChain = perChainTmScores(tmInterface, tokens, asymId, seqMask, frame);
+  return {
+    ptm: reduceTmScore(tmAdjusted, tokens, selected),
+    iptm: reduceTmScore(tmAdjusted, tokens,
+      (i, j) => selected(i, j) && asymId[i] !== asymId[j]),
+    // ...and one score per INTERFACE, because the pooled ipTM averages them: an
+    // assembly holding a native dimer and a designed binder reports the easy
+    // interface's confidence for the hard one. See chainPairTmScores.
+    chainPairIptm: Object.fromEntries(
+      chainPairTmScores(tmInterface, tokens, asymId, seqMask, frame).scores),
+    chainPtm: Object.fromEntries(perChain.chainPtm),
+    chainIptm: Object.fromEntries(perChain.chainIptm),
+  };
+}

@@ -16,8 +16,7 @@ import { createWebGL2Context } from "../../runtime/context.js";
 import { Execution } from "../../runtime/execution.js";
 import { foldAf3Async, releaseAf3Weights, uploadAf3WeightsSteps } from "./fold.js";
 import { drainAsync, gpuIdle } from "../../runtime/steps.js";
-import { chainPairTmScores, chainTmInfo, interfaceTmTerm, perChainTmScores, reduceTmScore, tmPerBinFor, tmScoreD0,
-  tmTermFromLogits, tokenFrameMask }
+import { af3TmScores, chainTmInfo, interfaceTmTerm, tmPerBinFor, tmScoreD0, tmTermFromLogits, tokenFrameMask }
   from "../../../shared/heads/tm-score.js";
 import { errorBinCentres, MAX_ERROR_BIN, NUM_BINS } from "../confidence/confidence.js";
 import { backboneGeometry } from "../../../webgpu/af3/fold.js";
@@ -114,13 +113,12 @@ export async function foldBatchWebGl2(batch, weights, options) {
     scores = { plddt: fold.plddt, pae: fold.pae, tmAdjusted, tmInterface };
     const frame = tokenFrameMask({ tokens, dense, isLigand: batch.isLigand, asymId,
       residueIndex: batch.residueIndex, refPos: batch.refPos, refMask: batch.refMask });
-    const selected = (i, j) => seqMask[i] > 0 && seqMask[j] > 0 && frame[i] === 1;
-    ptm = reduceTmScore(tmAdjusted, tokens, selected);
-    iptm = reduceTmScore(tmAdjusted, tokens, (i, j) => selected(i, j) && asymId[i] !== asymId[j]);
-    chainPairIptm = Object.fromEntries(chainPairTmScores(tmInterface, tokens, asymId, seqMask, frame).scores);
-    const perChain = perChainTmScores(tmInterface, tokens, asymId, seqMask, frame);
-    chainPtm = Object.fromEntries(perChain.chainPtm);
-    chainIptm = Object.fromEntries(perChain.chainIptm);
+    // ...reduced by the one function webgpu/af3/fold.js reduces through, so the
+    // two backends cannot drift apart on what the five numbers MEAN - only on
+    // the arithmetic that produced the terms.
+    ({ ptm, iptm, chainPairIptm, chainPtm, chainIptm } = af3TmScores({
+      tmAdjusted, tmInterface, tokens, asymId, seqMask, frame,
+    }));
     let total = 0;
     let atoms = 0;
     for (let index = 0; index < tokens * dense; index += 1) {

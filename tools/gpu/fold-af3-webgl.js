@@ -26,9 +26,26 @@
  * `--trunk-only` stops after the trunk and reports its contact map, which is the
  * cheap arm: it costs no denoiser calls and still exercises the embedder, the
  * template stack and both stacks on real weights.
+ *
+ * 🔴 AND `--sequence=A:B` IS THE ARM THAT REACHES THE CHAIN SCORES. The default
+ * is ONE chain, where ipTM is NaN by definition and `chainIptm`/`chainPairIptm`
+ * are empty - so a single-chain run says nothing about chain_pair_iptm, chain_ptm
+ * or chain_iptm, and this tool reported none of the three until now. They are
+ * compared against the WGSL fold's and asserted, which is what makes this a gate
+ * for the reduction and not only for the coordinates.
+ *
+ * 🔴 AND `--ligands=CA` IS THE ARM THAT REACHES THE FRAME MASK. Every token of a
+ * protein has a frame, so a protein-only fold cannot tell a masked reduction from
+ * an unmasked one however many chains it has - which is how this path kept AF3's
+ * anchors wrong while agreeing with the WGSL fold to four decimals. An ion is one
+ * token with one atom and no frame: it anchors nothing, its chain_ptm is absent
+ * rather than a number, and `framelessTokens` says how many such tokens the fold
+ * held. (`--ligands=` fetches the component from the PDB, so that arm needs the
+ * network; every other arm here is local.)
  */
 import { HttpTensorStore } from "../../shared/bundles/http-tensor-store.js";
 import { af3BatchFromA3m } from "../../shared/af3/featurise/batch.js";
+import { ccdUrl, parseCcdComponent } from "../../shared/af3/featurise/ccd-component.js";
 import { af3Dialect, openAf3Store } from "../../shared/af3/weights/weights.js";
 import { foldWeights } from "../../shared/af3/weights/diffusion-weights.js";
 import { webglExecution } from "./webgl-execution-options.js";
@@ -65,6 +82,37 @@ function backboneSpacing(positions, batch) {
   }
   spacings.sort((a, b) => a - b);
   return spacings;
+}
+
+const round4 = (scores) => (scores === undefined ? null
+  : Object.fromEntries(Object.entries(scores).map(
+    ([chain, value]) => [chain, Number(value.toFixed(4))])));
+
+/**
+ * The worst disagreement in each chain-level field, and the KEYS as well as the
+ * numbers: a backend reporting a chain the other does not is a difference no
+ * comparison of values can show. Such a field comes back as a SENTENCE naming
+ * the one-sided chains rather than as a number - 🔴 and not as `Infinity`,
+ * which `JSON.stringify` writes as `null`, the same thing this function returns
+ * for "there was nothing to compare". A gate whose report cannot tell a missing
+ * chain from a missing comparison is a gate that reads green to a reader.
+ */
+function chainGaps(fields) {
+  const out = {};
+  for (const [name, ours, theirs] of fields) {
+    if (ours === undefined || theirs === undefined) { out[name] = null; continue; }
+    const keys = [...new Set([...Object.keys(ours), ...Object.keys(theirs)])];
+    if (keys.length === 0) { out[name] = null; continue; }
+    const oneSided = [
+      ...keys.filter((key) => !(key in theirs)).map((key) => `WebGL2 only ${key}`),
+      ...keys.filter((key) => !(key in ours)).map((key) => `WGSL only ${key}`),
+    ];
+    if (oneSided.length > 0) { out[name] = oneSided.join(", "); continue; }
+    let worst = 0;
+    for (const key of keys) worst = Math.max(worst, Math.abs(ours[key] - theirs[key]));
+    out[name] = Number(worst.toFixed(4));
+  }
+  return out;
 }
 
 export async function main(device, args) {
@@ -109,7 +157,14 @@ export async function main(device, args) {
       + " confidence head are a second token space");
   }
 
-  const { batch } = af3BatchFromA3m(sequence, null, {});
+  // 🔴 A LIGAND IS ONE TOKEN PER HEAVY ATOM AND AN ION IS ONE TOKEN WITH NO
+  // FRAME, which is the only way to exercise the anchor mask from here.
+  const ligands = [];
+  for (const code of option(args, "ligands", "").split(",").filter((c) => c !== "")) {
+    ligands.push(parseCcdComponent(await (await fetch(ccdUrl(code))).text()));
+  }
+  const { batch } = af3BatchFromA3m(sequence, null,
+    ligands.length === 0 ? {} : { ligands });
   const { tokens, dense } = batch;
 
   const gl = createWebGL2Context();
@@ -205,6 +260,20 @@ export async function main(device, args) {
       theirMeanPlddt: theirs.meanPlddt === undefined
         ? null : Number(theirs.meanPlddt.toFixed(3)),
       theirPtm: theirs.ptm === undefined ? null : Number(theirs.ptm.toFixed(4)),
+      // 🔴 AND THE CHAIN SCORES, BECAUSE THEY ARE WHERE A CHANGE TO THE
+      // REDUCTION LANDS FIRST. pTM and ipTM come off the GLOBAL term and move by
+      // almost nothing when the anchors change - a framed token wins the maximum
+      // anyway - so a comparison of those two alone is green while chain_ptm,
+      // chain_iptm and chain_pair_iptm are a tenth out. `chainGaps` below is what
+      // is asserted.
+      chainPtm: [round4(result.chainPtm), round4(theirs.chainPtm)],
+      chainIptm: [round4(result.chainIptm), round4(theirs.chainIptm)],
+      chainPairIptm: [round4(result.chainPairIptm), round4(theirs.chainPairIptm)],
+      chainGaps: chainGaps([
+        ["chain_ptm", result.chainPtm, theirs.chainPtm],
+        ["chain_iptm", result.chainIptm, theirs.chainIptm],
+        ["chain_pair_iptm", result.chainPairIptm, theirs.chainPairIptm],
+      ]),
       // 🔴 THE TRUNK'S TWO TRACKS SEPARATELY, because they fail separately: the
       // pair half of a pairformer block never reads the single, so a single-track
       // defect leaves PAE and the coordinates in band and moves pLDDT alone -
@@ -315,6 +384,18 @@ export async function main(device, args) {
         failures.push(`the two backends' ${name} differ by relRMS ${value}`);
       }
     }
+    // 🔴 THE CHAIN BAR IS 0.02, THE SAME NUMBER check-af3-webgl-page.js HOLDS
+    // ITS CHAIN FIELDS TO, and it is a measurement rather than a hope: at 61
+    // tokens the precision axes alone move ipTM that much between the two
+    // backends. A key present on one side alone reads Infinity and fails here.
+    for (const [name, gap] of Object.entries(coordinates.chainGaps ?? {})) {
+      if (gap === null) continue;
+      if (typeof gap !== "number") {
+        failures.push(`the two backends' ${name} name different chains: ${gap}`);
+      } else if (!(gap < 0.02)) {
+        failures.push(`the two backends' ${name} differ by ${gap}`);
+      }
+    }
   }
 
   return {
@@ -346,6 +427,13 @@ export async function main(device, args) {
       ? Number(result.meanPlddt.toFixed(3)) : null,
     ptm: Number.isFinite(result.ptm) ? Number(result.ptm.toFixed(4)) : null,
     iptm: Number.isFinite(result.iptm) ? Number(result.iptm.toFixed(4)) : null,
+    chainPtm: round4(result.chainPtm), chainIptm: round4(result.chainIptm),
+    chainPairIptm: round4(result.chainPairIptm),
+    // The tokens that cannot anchor, which is what the frame mask changed: 0 for
+    // a plain protein, and one per ion or two-atom ligand.
+    framelessTokens: result.frame === undefined ? null
+      : Array.from(result.frame).reduce((count, live, token) => count
+        + (batch.seqMask[token] > 0 && live !== 1 ? 1 : 0), 0),
     contactsOverHalf: contacts,
     contactRange: [Number(lowest.toFixed(4)), Number(highest.toFixed(4))],
     adjacentContactMean: Number(adjacentMean.toFixed(4)),

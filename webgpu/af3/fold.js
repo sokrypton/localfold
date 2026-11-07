@@ -55,7 +55,7 @@ import {
 import { memoryBudgetBytes, noteAllocation, noteDestroy, residencyAllowed }
   from "../runtime/device-memory.js";
 import { deviceTuning, halfPrecisionAvailable } from "../runtime/device-profile.js";
-import { chainPairTmScores, chainTmInfo, perChainTmScores, reduceTmScore, tokenFrameMask }
+import { af3TmScores, chainTmInfo, tokenFrameMask }
   from "../../shared/heads/tm-score.js";
 import { sampleOnGpu } from "./diffusion/diffusion-sampler.js";
 import { Af3DiffusionHeadGpu } from "./diffusion/diffusion-head.js";
@@ -1566,28 +1566,21 @@ async function foldHolding(device, batch, weights, options, held) {
     // an ion's row aligns nothing (tokenFrameMask).
     const frame = tokenFrameMask({ tokens, dense, isLigand: batch.isLigand, asymId,
       residueIndex: batch.residueIndex, refPos: batch.refPos, refMask: batch.refMask });
-    const selected = (i, j) => seqMask[i] > 0 && seqMask[j] > 0 && frame[i] === 1;
     if (scores.tmAdjusted !== undefined) {
-    ptm = reduceTmScore(scores.tmAdjusted, tokens, selected);
-    // NaN for one chain, because there is no interface to score. Zero would
-    // read as a confident failure rather than an inapplicable question.
-    iptm = reduceTmScore(scores.tmAdjusted, tokens,
-      (i, j) => selected(i, j) && asymId[i] !== asymId[j]);
-    // 🔴 AND ONE SCORE PER INTERFACE, BECAUSE THE POOLED ONE AVERAGES THEM. On
-    // more than two chains `iptm` counts every cross-chain pair equally, so an
-    // assembly holding both a native dimer and a designed binder reports the
-    // easy interface's confidence for the hard one. See chainPairTmScores.
-    // 🔴 ON AF3's INTERFACE TERM - d0 from the pair's own chains, not every
-    // token's - as its chain_pair_iptm is; on the global one a short chain in a
-    // large complex read ~0.10 high (reported by Yeqing Lin).
-    if (scores.tmInterface === undefined) throw new Error("the confidence head returned no interface TM term");
-    chainPairIptm = Object.fromEntries(
-      chainPairTmScores(scores.tmInterface, tokens, asymId, seqMask, frame).scores);
-    // ...and each chain on its own: how well it folded, and how well it sits
-    // against everything else. The AlphaFold 3 server writes both.
-    const perChain = perChainTmScores(scores.tmInterface, tokens, asymId, seqMask, frame);
-    chainPtm = Object.fromEntries(perChain.chainPtm);
-    chainIptm = Object.fromEntries(perChain.chainIptm);
+      // 🔴 ON AF3's INTERFACE TERM FOR THE CHAIN SCORES - d0 from the pair's own
+      // chains, not every token's - as its chain_pair_iptm is; on the global one a
+      // short chain in a large complex read ~0.10 high (reported by Yeqing Lin).
+      // The reduction itself is `af3TmScores`, which is the ONE place it lives:
+      // this file, webgl/af3/model/fold-batch.js (the page's WebGL2 fold) and
+      // webgl/af3/model/fold.js (the tool's) all call it, and the third of those
+      // was on the old definition for as long as it had a copy of its own.
+      if (scores.tmInterface === undefined) {
+        throw new Error("the confidence head returned no interface TM term");
+      }
+      ({ ptm, iptm, chainPairIptm, chainPtm, chainIptm } = af3TmScores({
+        tmAdjusted: scores.tmAdjusted, tmInterface: scores.tmInterface,
+        tokens, asymId, seqMask, frame,
+      }));
     }
 
     pseudoBeta = new Float32Array(tokens * 3);

@@ -11,7 +11,7 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-542 tools. `tools/fixtures/` is data and is not listed.
+543 tools. `tools/fixtures/` is data and is not listed.
 
 ## `tools/gpu/` - the WebGPU lane (296)
 
@@ -416,7 +416,7 @@ and turning it into a bundle.
 - **`safetensors_read.py`** - Read a .safetensors file into numpy arrays, without the safetensors package.
 - **`vector-quantise.py`** - Is a codebook worth a new decoder? Scalar codes against vector ones, at 2 bits.
 
-## `tools/` - everything else (157)
+## `tools/` - everything else (158)
 
 CPU checkers, the export and quantisation pipeline, the page drivers that
 go through CDP, and the deploy.
@@ -445,6 +445,7 @@ go through CDP, and the deploy.
 - **`check-bioemu2-steering.js`** - BioEmu2's steered samplers (edm_gd, edm_fk, edm_fkc) against af3-any-model's port, on a toy denoiser.
 - **`check-bioemu2-topology.js`** - BioEmu2's bonded graph, steering tables and physicality report against af3-any-model's port.
 - **`check-bundle-vs-params.py`** - Is this bundle the weights af3-any-model loads, tensor by tensor?
+- **`check-chain-ptm-ports.py`** - The chain-level pTM scores' TWO implementations, held to each other: cuda/featurise/ptm.h (every native port - metal/af3, metal/ef2, cuda/af3, cuda/ef2) against shared/heads/tm-score.js (the page - WebGPU and WebGL2 alike).
 - **`check-design-page.py`** - Does design.html load, run its module, and say true things?
 - **`check-esmc-reference.js`** - Does cpu/esmc/tower.js compute ESM-C?
 - **`check-esmfold2-confidence.js`** - ESMFold2's confidence head against Synthyra's own, on the host.
