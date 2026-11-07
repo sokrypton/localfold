@@ -314,6 +314,10 @@ __global__ void __launch_bounds__(256) triProjK(const bf* __restrict__ xn, const
   uint16_t* As = tsm;                       // [BM][LA]
   uint16_t* Bs = As + BM * LA;              // [2][KC][LB2]
   uint16_t* Ts = Bs + 2 * KC * LB2;         // [32 channels][BM + 8]: ab staged for its channel-major write
+  uint16_t* Gs = Ts + 32 * (BM + 8);        // [BM][BN + 8]: the chunk's sigmoids staged for gs's row-major write
+  // (both written out in 16-byte vectors: stored straight from the accumulators, two bytes at a time, they were
+  // 1.2 GB of L2 writes for 335 MB of output - every 32-byte sector written piecemeal - at 512 tokens)
+  const bool vec = rows % 8 == 0;
   const int P = 2 * I2 + C, GS = I2 + C, nPair = I2 / 32, nch = nPair + C / BN;
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
   const int wm = WN == 2 ? warp >> 1 : warp, wn = WN == 2 ? warp & 1 : 0;
@@ -373,15 +377,22 @@ __global__ void __launch_bounds__(256) triProjK(const bf* __restrict__ xn, const
           const float pre = tpBfr(acc[j][e] + (bias ? __bfloat162float(bias[c]) : 0.f));
           const float sgb = tpBfr(tpSig(tpBfr(acc[j + HALF][e] + (bias ? __bfloat162float(bias[I2 + c]) : 0.f))));
           const float abv = pre * mk[h] * sgb;
-          const size_t r = r0 + row;
-          if (r < rows) gs[r * GS + c] = __float2bfloat16(sgb);
+          reinterpret_cast<bf*>(Gs)[row * (BN + 8) + cl] = __float2bfloat16(sgb);
           reinterpret_cast<bf*>(Ts)[cl * (BM + 8) + row] = __float2bfloat16(abv);
         }
       __syncthreads();
-      for (int i = threadIdx.x; i < 32 * BM; i += 256) {   // a channel's 64 rows contiguous
-        const int cl = i / BM, row = i % BM;
+      for (int i = threadIdx.x; i < 32 * BM / 8; i += 256) {   // a channel's rows contiguous: eight a vector
+        const int cl = i / (BM / 8), row = (i % (BM / 8)) * 8;
         const size_t r = r0 + row;
-        if (r < rows) ab[(size_t)planeOf(32 * ch + cl, I2, inter) * rows + r] = reinterpret_cast<const bf*>(Ts)[cl * (BM + 8) + row];
+        bf* dst = ab + (size_t)planeOf(32 * ch + cl, I2, inter) * rows + r;
+        const uint16_t* src = Ts + cl * (BM + 8) + row;
+        if (vec && r + 8 <= rows) *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(src);
+        else for (int q = 0; q < 8 && r + q < rows; ++q) dst[q] = reinterpret_cast<const bf*>(src)[q];
+      }
+      for (int i = threadIdx.x; i < BM * 4; i += 256) {          // a row's 32 sigmoids: four vectors
+        const int row = i / 4, c = (i % 4) * 8;
+        const size_t r = r0 + row;
+        if (r < rows) *reinterpret_cast<uint4*>(gs + r * GS + 32 * ch + c) = *reinterpret_cast<const uint4*>(Gs + row * (BN + 8) + c);
       }
     } else {
 #pragma unroll
@@ -390,18 +401,23 @@ __global__ void __launch_bounds__(256) triProjK(const bf* __restrict__ xn, const
         for (int h = 0; h < 2; ++h) {
           const size_t r = r0 + wm * 16 + g + h * 8;
           const int n = (ch - nPair) * BN + (BN / WN) * wn + 8 * j + 2 * t;
-          if (r >= rows) continue;
           float v[2];
           for (int q = 0; q < 2; ++q)
             v[q] = tpBfr(tpSig(tpBfr(acc[j][2 * h + q] + (bias ? __bfloat162float(bias[2 * I2 + n + q]) : 0.f))));
-          *reinterpret_cast<__nv_bfloat162*>(gs + r * GS + I2 + n) = __floats2bfloat162_rn(v[0], v[1]);
+          *reinterpret_cast<__nv_bfloat162*>(Gs + (r - r0) * (BN + 8) + n - (ch - nPair) * BN) = __floats2bfloat162_rn(v[0], v[1]);
         }
+      __syncthreads();
+      for (int i = threadIdx.x; i < BM * (BN / 8); i += 256) {   // a row's 64 sigmoids: eight vectors
+        const int row = i / (BN / 8), c = (i % (BN / 8)) * 8;
+        const size_t r = r0 + row;
+        if (r < rows) *reinterpret_cast<uint4*>(gs + r * GS + I2 + (ch - nPair) * BN + c) = *reinterpret_cast<const uint4*>(Gs + row * (BN + 8) + c);
+      }
     }
     __syncthreads();
   }
 }
 template <int KC, int BM>
-inline size_t triProjSmem() { return 2 * (BM * (KC + 8) + 2 * KC * (64 + 8) + 32 * (BM + 8)); }
+inline size_t triProjSmem() { return 2 * (BM * (KC + 8) + 2 * KC * (64 + 8) + 32 * (BM + 8) + BM * (64 + 8)); }
 __global__ void gateOutLdBfK(real* y, const bf* a, const bf* g, size_t rows, int C, int P) {   // y = a g[r * P + c]
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t < rows * C) y[t] = bfv(a[t]) * bfv(g[(t / C) * P + t % C]);

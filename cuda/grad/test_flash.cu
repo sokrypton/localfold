@@ -38,9 +38,9 @@ int main() {
     int ci = -1;
     for (auto c : cases) {
       ++ci;
-      // (bf16 without a clip cannot replay a row masked whole: its backward's two-FMA path takes the key term and the
-      // log-sum-exp apart in base 2, both ~-1.4e9, 128 apart in float32. A training crop has no such row: every token
-      // in it is real, so no key mask is all zeros.)
+      // (bf16 without a clip, a row masked whole at these large logits: the backward takes such a row in natural
+      // units now and is finite - 1.7e-1 here - but at sd 6 its -1e9 logits are quantised to 64 in float32 and bf16's
+      // bar is not this case's. test-bf16's padded pairformer block is the gate for masked rows.)
       if (mode == 2 && c.fullMask && !c.clip) continue;
       int HD = c.H * c.D, ld = HD + 8;    // a leading dimension past the heads, as a packed qkv's
       size_t nq = (size_t)c.B * c.Q * ld, nk = (size_t)c.B * c.K * ld;

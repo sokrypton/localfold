@@ -1029,7 +1029,10 @@ __global__ void __launch_bounds__(THREADS, 3) bwdBf(Sdpa a, BiasTile bt, HSrc qs
             const float bias = __uint_as_float(par ? bb & 0xffff0000u : bb << 16);
             float p;
             if constexpr (!GEN) {   // (no clip, no chain ids: 2^(s scale log2e + (key term + bias) log2e - c_q), two FMAs)
-              p = ex2(fmaf(sa[jj][e], sl2, fmaf(bias, LOG2E, ckL[hk] - cq[par])));
+              // (a row whose every key is masked, max ~-1e9: the key term and c_q, both ~-1.4e9, are 128 apart in
+              // float32 and the fused form lands 2^128 off - that row takes the general form, in natural units)
+              if (Lq[par] > -1e8f) p = ex2(fmaf(sa[jj][e], sl2, fmaf(bias, LOG2E, ckL[hk] - cq[par])));
+              else p = ex2(fmaf(fmaf(sa[jj][e], a.scale, kaR[hk] + bias) - Lq[par], LOG2E, -Lgq[par]));
             } else {
               float x = fminf(fmaxf(fmaf(sa[jj][e], a.scale, kaR[hk] + bias), loC[hk]), hiC);
               if (seqQ && ksR[hk] != sq[par]) x = -INFINITY;
