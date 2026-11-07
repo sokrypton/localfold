@@ -1633,15 +1633,15 @@ inline void backwardBf(const Sdpa& a, const X* q, int ldq, const X* k, int ldk, 
         GK(cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smemN));
         GK(cudaFuncSetAttribute(f, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
       }
-    // clusters on sm_90 alone, where the device and this binary's code for it have them: measured there (the
-    // grid512 bench's backward 2.75 -> 2.55 ms on the GH200); on an RTX PRO 6000 (sm_120) the same kernel lost, 3.47
-    // -> 4.20 ms)
+    // clusters on sm_90 and sm_100, where the device and this binary's code for it have them: measured there (the
+    // grid512 bench's backward 2.75 -> 2.55 ms on the GH200, 2.16 -> 2.07 on the B200 - a 768-token training step
+    // 3.53 -> 3.49 s there); on an RTX PRO 6000 (sm_120) the same kernel lost, 3.47 -> 4.20 ms)
     int dev = 0, major = 0;
     GK(cudaGetDevice(&dev));
     GK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev));
     cudaFuncAttributes fa;
     GK(cudaFuncGetAttributes(&fa, bwdBf<D, DKV, QT, false, CR>));
-    clusters = major == 9 && fa.binaryVersion >= 90 && !narrow;
+    clusters = (major == 9 || major == 10) && fa.binaryVersion >= 90 && !narrow;
     if (clusters)
       for (auto f : {bwdBf<D, DKV, QT, true, CR>, bwdBf<D, DKV, QT, false, CR>}) {
         GK(cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smemC));
