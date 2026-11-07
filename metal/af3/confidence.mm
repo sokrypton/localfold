@@ -230,9 +230,17 @@ ConfidenceOut confidenceHead(Trunk& t, const float* pseudoBeta, bool lastSample)
     float* dTerm = scratch<float>("conf.tmTerm", pairs);
     run1d("af3_expectation", pairs, ExpectationArgs{logits, pae, t.pairMask, dCentres, dTerm, dPerBin, pairs, (uint)NB, 0, 1.f, 0});
     std::vector<float> term = download(dTerm, pairs);
+    // AF3's interface term off the same logits (frames.h), and pTM's anchors the tokens with frames
+    std::vector<float> chainTerm;
+    {
+      const std::vector<float> lg = download(logits, (size_t)pairs * NB);
+      chainTerm = interfaceTmTerm(lg.data(), n, NB, centres.data(), asymH, seq.data(), asymH, seq.data(), n);
+    }
+    const std::vector<char> frame = tokenFrameMask(n);
     auto reduce = [&](bool interOnly) {
       double best = -1e30; bool any = false;
       for (int i = 0; i < n; ++i) {
+        if (!frame[i]) continue;
         double tot = 0; int cnt = 0;
         for (int j = 0; j < n; ++j) {
           if (!(seq[i] > 0 && seq[j] > 0) || (interOnly && asymH[i] == asymH[j])) continue;
@@ -244,7 +252,7 @@ ConfidenceOut confidenceHead(Trunk& t, const float* pseudoBeta, bool lastSample)
       return any ? best : NAN;
     };
     out.ptm = reduce(false); out.iptm = familyIptm(reduce(true));     // (protenix's: one chain's ipTM is 0)
-    out.tmTerm = std::move(term);
+    out.tmTerm = std::move(chainTerm);   // (the chain-level scores': the interface term)
   }
   const int PB = 50;
   std::vector<float> pc(PB);
