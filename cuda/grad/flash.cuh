@@ -932,6 +932,15 @@ __device__ __forceinline__ void mbarWait(void* mbar, unsigned parity) {
                ::"r"((unsigned)__cvta_generic_to_shared(mbar)), "r"(parity) : "memory");
 #endif
 }
+// a 16-byte vector atomic add (sm_90 and later: red.v4 - 1.65x the floats a second of red.f32 into the same lines on
+// the GH200 and the RTX PRO 6000)
+__device__ __forceinline__ void redV4(float* p, float a, float b, float c, float d) {
+#if __CUDA_ARCH__ >= 900
+  asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" ::"l"(p), "f"(a), "f"(b), "f"(c), "f"(d) : "memory");
+#else
+  atomicAdd(p, a); atomicAdd(p + 1, b); atomicAdd(p + 2, c); atomicAdd(p + 3, d);
+#endif
+}
 template <int D, class DKV = float, int QT = 64, bool GEN = true, int CR = 1>   // (DKV: dK and dV written in bf16 for a
                                                   // module that consumes them so; QT: the query tile, 32 or 64 rows; GEN
                                                   // false: no chain ids and no fixed-point bias sums, compiled out - 5%
@@ -1121,8 +1130,34 @@ __global__ void __launch_bounds__(THREADS, 3) bwdBf(Sdpa a, BiasTile bt, HSrc qs
       // (offsets in 32 bits from the slab's (query 0, key k0): within one (b, h) slab, Q sq < 2^31)
       const int qb = q0 + hq * 32 + 2 * t;
       const bool full = qb - 2 * t + 32 <= a.Q && k0 + BC <= a.K;   // (the whole half-tile in range: no checks)
+      // (sm_90 on: a full tile's float gradients 4 keys a thread, by red.v4, where every row of them is 16-byte aligned)
+      bool v4 = false;
+#if __CUDA_ARCH__ >= 900
+      if constexpr (sizeof(real) == 4)
+        v4 = full && !f0 && !f1 && (!g0 || (((uintptr_t)g0 & 15) == 0 && a.bias[0].sq % 4 == 0)) &&
+             (!g1 || (((uintptr_t)g1 & 15) == 0 && a.bias[1].sq % 4 == 0));
+#endif
       // the thread's 8-query group jj (four values: queries 2t, 2t + 1 at keys g and g + 8)
       auto addJ = [&](int jj, const float* v) {
+        if (v4) {
+          // a 4 x 4 transpose across lanes 4 and 8 apart: the value index's query bit traded with g's bit 0, its key bit
+          // with g's bit 1 - each thread then holds keys 4 (g >> 2) + 8 ((g >> 1) & 1) .. + 3 at query 2t + (g & 1)
+          float w[4] = {v[0], v[1], v[2], v[3]};
+#pragma unroll
+          for (int rnd = 0; rnd < 2; ++rnd) {
+            const int bit = rnd, m = 4 << rnd, L = (lane & m) != 0;
+#pragma unroll
+            for (int o = 0; o < 2; ++o) {
+              const int r0 = bit ? o : 2 * o, r1 = r0 | (1 << bit);
+              const float x = __shfl_xor_sync(~0u, L ? w[r0] : w[r1], m);
+              if (L) w[r0] = x; else w[r1] = x;
+            }
+          }
+          const int qo = jj * 8 + (g & 1), ko = kl0 + 4 * (g >> 2) + 8 * ((g >> 1) & 1);
+          if (g0) redV4(g0 + (qb + qo) * (int)a.bias[0].sq + ko, w[0], w[1], w[2], w[3]);
+          if (g1) redV4(g1 + (qb + qo) * (int)a.bias[1].sq + ko, w[0], w[1], w[2], w[3]);
+          return;
+        }
         auto add = [&](auto* gp, int sq) {
           const int base = qb * sq + kl0 + g;
 #pragma unroll
