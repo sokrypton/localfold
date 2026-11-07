@@ -287,4 +287,209 @@ inline bool gridInTcRun(bool pair16, const float* pair, const float* lnScale, co
   CK(cudaGetLastError());
   return true;
 }
+
+// ---- triInTc: the triangle multiplication's input kernel (triIn256K's FP8 form at C 128) on tcgen05: LN(pair) times the
+// projection [C, 2C] (column 2c a's channel c, 2c + 1 b's), the gate [C, 2C] and the gating linear [C, C]; a and b =
+// projection x sigmoid(gate) x mask, e4m3, channel-major planes [C][np8 np8] (the padding zero: its mask 0); t2 = the
+// gating linear's raw output, f16 [np8 np8][C] (its own pair's row - transposed in the incoming direction, rm.T).
+// gridInTc's structure: 128-row tiles of the padded grid that never cross a grid row, the raw tile by TMA (the pair's
+// rows and columns past n zero-filled), LN in place, the three weights K-major in shared memory for the block's life
+// (160 KB), the projection and the gate into the two tensor-memory halves (N 256 each) and the gating linear into the
+// first again once drained (N 128); a and b to global a channel a lane-row at a time (a warp's 32 rows are 32
+// consecutive bytes of a plane); t2 staged in the tile's own A buffer (its products done) and TMA stored, which then
+// frees the buffer for the next load.
+namespace tri {
+struct Lay { static constexpr uint32_t A = 0, WP = 65536, WG = WP + 65536, WL = WG + 65536, LN = WL + 32768, BAR = LN + 1024, BYTES = BAR + 256; };
+}
+__global__ void __launch_bounds__(320, 1) triInTc(const __grid_constant__ CUtensorMap mapP, const __grid_constant__ CUtensorMap mapT,
+    const float* __restrict__ mask, const float* __restrict__ lnScale, const float* __restrict__ lnOffset, const half* __restrict__ WpT,
+    const half* __restrict__ WgT, const half* __restrict__ WlT, uint8_t* __restrict__ a8, uint8_t* __restrict__ b8, int n, int np, size_t cs, bool T) {
+#if LF_TC5A
+  using L = tri::Lay;
+  extern __shared__ __align__(1024) unsigned char sm[];
+  uint64_t* bar = reinterpret_cast<uint64_t*>(sm + L::BAR);
+  uint64_t *ldFull = bar, *aFull = bar + 2, *aFree = bar + 4, *dFull = bar + 6, *dFree = bar + 8;
+  __shared__ uint32_t tmBase;
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  const int nbt = (np + TM - 1) / TM;
+  const size_t tiles = (size_t)np * nbt;
+  const int mine = tiles > blockIdx.x ? (int)((tiles - blockIdx.x + gridDim.x - 1) / gridDim.x) : 0;
+  if (warp == 8) {
+    asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], 512;" :: "r"(sa(&tmBase)));
+    asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
+  }
+  if (tid == 0) {
+    for (int i = 0; i < 2; ++i) { barInit(ldFull + i, 1); barInit(aFull + i, 4); barInit(aFree + i, 1); barInit(dFull + i, 1); barInit(dFree + i, 4); }
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+  }
+  for (int i = tid; i < 256 * 16; i += 320) {
+    const int r = i >> 4, c = i & 15;
+    *reinterpret_cast<uint4*>(sm + L::WP + swOff(r, c, 256)) = *reinterpret_cast<const uint4*>(WpT + (size_t)r * C + c * 8);
+    *reinterpret_cast<uint4*>(sm + L::WG + swOff(r, c, 256)) = *reinterpret_cast<const uint4*>(WgT + (size_t)r * C + c * 8);
+    if (r < C) *reinterpret_cast<uint4*>(sm + L::WL + swOff(r, c, C)) = *reinterpret_cast<const uint4*>(WlT + (size_t)r * C + c * 8);
+  }
+  float* lnS = reinterpret_cast<float*>(sm + L::LN);
+  for (int i = tid; i < C; i += 320) { lnS[i] = lnScale[i]; lnS[C + i] = lnOffset[i]; }
+  fenceProxy();
+  fenceBefore();
+  __syncthreads();
+  fenceAfter();
+  const uint32_t tm = tmBase, base = sa(sm);
+  auto tileOf = [&](int k, int& i, int& b0) { const size_t t = (size_t)blockIdx.x + (size_t)k * gridDim.x; i = (int)(t / nbt); b0 = (int)(t % nbt) * TM; };
+  if (warp == 9) {
+    if (lane == 0) {
+      for (int k = 0; k < mine; ++k) {
+        int i, b0; tileOf(k, i, b0);
+        const int b = k & 1;
+        if (k >= 2) barWait(aFree + b, ((k - 2) >> 1) & 1);
+        barExpect(ldFull + b, 32768);
+        unsigned char* Ab = sm + L::A + b * 32768;
+        tma3(Ab, &mapP, 0, b0, i, ldFull + b);
+        tma3(Ab + 16384, &mapP, 64, b0, i, ldFull + b);
+      }
+    }
+  } else if (warp < 4) {
+    float sc[4], of[4];
+#pragma unroll
+    for (int e = 0; e < 4; ++e) { sc[e] = lnS[lane * 4 + e]; of[e] = lnS[C + lane * 4 + e]; }
+    for (int k = 0; k < mine; ++k) {
+      const int b = k & 1;
+      barWait(ldFull + b, (k >> 1) & 1);
+      unsigned char* Ab = sm + L::A + b * 32768;
+      for (int r0 = warp; r0 < TM; r0 += 32) {
+        float v[8][4];
+#pragma unroll
+        for (int u = 0; u < 8; ++u) {
+          const uint2 w = *reinterpret_cast<const uint2*>(Ab + swOff(r0 + 4 * u, lane >> 1, TM) + (lane & 1) * 8);
+          const float2 x = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&w.x)), y = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&w.y));
+          v[u][0] = x.x; v[u][1] = x.y; v[u][2] = y.x; v[u][3] = y.y;
+        }
+#pragma unroll
+        for (int u = 0; u < 8; ++u) {
+          float s = v[u][0] + v[u][1] + v[u][2] + v[u][3];
+          for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(~0u, s, o);
+          const float mean = s / C;
+          float qd = 0.f;
+#pragma unroll
+          for (int e = 0; e < 4; ++e) { const float d = v[u][e] - mean; qd += d * d; }
+          for (int o = 16; o; o >>= 1) qd += __shfl_xor_sync(~0u, qd, o);
+          const float inv = rsqrtf(qd / C + 1e-5f);
+          uint2 w;
+          w.x = f16x2((v[u][0] - mean) * inv * sc[0] + of[0], (v[u][1] - mean) * inv * sc[1] + of[1]);
+          w.y = f16x2((v[u][2] - mean) * inv * sc[2] + of[2], (v[u][3] - mean) * inv * sc[3] + of[3]);
+          *reinterpret_cast<uint2*>(Ab + swOff(r0 + 4 * u, lane >> 1, TM) + (lane & 1) * 8) = w;
+        }
+      }
+      fenceProxy();
+      __syncwarp();
+      if (lane == 0) barArrive(aFull + b);
+    }
+  } else if (warp == 8) {
+    if (lane == 0) {
+      constexpr uint32_t ID256 = idesc(TM, 256), ID128 = idesc(TM, 128);
+      int u0 = 0, u1 = 0;
+      auto take = [&](int h, int& u) { if (u > 0) barWait(dFree + h, (u - 1) & 1); fenceAfter(); ++u; };
+      for (int k = 0; k < mine; ++k) {
+        const int b = k & 1;
+        barWait(aFull + b, (k >> 1) & 1);
+        fenceAfter();
+        const uint32_t Ab = base + L::A + b * 32768;
+        auto prod = [&](uint32_t d, uint32_t bAddr, int bRows, uint32_t id) {
+#pragma unroll
+          for (int s = 0; s < 8; ++s)
+            mmaF16(d, sdesc(Ab + (s >> 2) * TM * 128 + (s & 3) * 32, 16, 1024, SW128),
+                   sdesc(bAddr + (s >> 2) * bRows * 128 + (s & 3) * 32, 16, 1024, SW128), id, s > 0);
+        };
+        take(0, u0); prod(tm, base + L::WP, 256, ID256); commit(dFull + 0);         // the projection
+        take(1, u1); prod(tm + 256, base + L::WG, 256, ID256); commit(dFull + 1);   // its gate
+        take(0, u0); prod(tm, base + L::WL, C, ID128); commit(dFull + 0);           // the gating linear
+      }
+    }
+  } else {
+    const int sub = warp - 4, rl = sub * 32 + lane;
+    const uint32_t lane0 = (uint32_t)(sub * 32) << 16;
+    const bool T0 = rl == 0;
+    int u0 = 0, u1 = 0;
+    auto wait = [&](int h, int& u) { barWait(dFull + h, u & 1); fenceAfter(); ++u; };
+    auto release = [&](int h) { fenceBefore(); __syncwarp(); if (lane == 0) barArrive(dFree + h); };
+    for (int k = 0; k < mine; ++k) {
+      int i, b0; tileOf(k, i, b0);
+      const int j = b0 + rl, b = k & 1;
+      const bool rowIn = j < np;
+      const size_t q = (size_t)i * np + j;
+      float m = 0.f;
+      if (i < n && j < n) m = mask ? mask[T ? (size_t)j * n + i : (size_t)i * n + j] : 1.f;
+      wait(0, u0); wait(1, u1);
+      for (int c = 0; c < 8; ++c) {
+        uint32_t p[32], g[32];
+        ld32(tm + lane0 + c * 32, p);
+        ld32(tm + lane0 + 256 + c * 32, g);
+        ldWait();
+        if (!rowIn) continue;
+#pragma unroll
+        for (int e = 0; e < 16; ++e) {      // columns 2e (a's channel 16c + e) and 2e + 1 (b's)
+          const float va = __uint_as_float(p[2 * e]) * sigmH(__uint_as_float(g[2 * e])) * m,
+                      vb = __uint_as_float(p[2 * e + 1]) * sigmH(__uint_as_float(g[2 * e + 1])) * m;
+          const unsigned short ab = e4m3x2(va, vb);
+          a8[(size_t)(16 * c + e) * cs + q] = (uint8_t)(ab & 0xFF);
+          b8[(size_t)(16 * c + e) * cs + q] = (uint8_t)(ab >> 8);
+        }
+      }
+      release(1);
+      release(0);
+      // t2: the gating linear's raw output, staged in this tile's A buffer (its products are done) and TMA stored
+      wait(0, u0);
+      unsigned char* S = sm + L::A + b * 32768;
+      for (int c = 0; c < 4; ++c) {
+        uint32_t x[32];
+        ld32(tm + lane0 + c * 32, x);
+        ldWait();
+        uint32_t w[16];
+#pragma unroll
+        for (int e = 0; e < 16; ++e) w[e] = f16x2(__uint_as_float(x[2 * e]), __uint_as_float(x[2 * e + 1]));
+#pragma unroll
+        for (int e = 0; e < 4; ++e)
+          *reinterpret_cast<uint4*>(S + swOff(rl, c * 4 + e, TM)) = make_uint4(w[4 * e], w[4 * e + 1], w[4 * e + 2], w[4 * e + 3]);
+      }
+      release(0);
+      fenceProxy();
+      epiSync();
+      if (T0) {
+        tmaStore3(&mapT, S, 0, b0, i);
+        tmaStore3(&mapT, S + 16384, 64, b0, i);
+        bulkCommit();
+        bulkWaitRead<0>();
+        barArrive(aFree + b);
+      }
+    }
+    if (T0) bulkWait<0>();
+  }
+  fenceBefore();
+  __syncthreads();
+  if (warp == 8) {
+    fenceAfter();
+    asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, 512;" :: "r"(tm));
+  }
+#endif
+}
+// triIn256K's FP8 form at C 128 for a bf16 pair (the whole grid, rm.T the incoming direction's transposed read): true
+// where it ran
+inline bool triInTcRun(bool pair16, const float* pair, const float* mask, const float* lnScale, const float* lnOffset, const half* Wp,
+                       const half* Wgate, const half* Wg, uint8_t* a8, uint8_t* b8, half* t2, int n, int np, size_t cs, bool T) {
+  if (!PAIR_TC || !ready() || !pair16 || cs != (size_t)np * np) return false;
+  const half *WpT = kMajor(Wp, C, 2 * C), *WgT = kMajor(Wgate, C, 2 * C), *WlT = kMajor(Wg, C, C);
+  const uint64_t N = (uint64_t)n, NP = (uint64_t)np;
+  const CUtensorMap mp = map3(CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, pair, { (uint64_t)C, N, N },
+                              { T ? N * C * 2 : (uint64_t)C * 2, T ? (uint64_t)C * 2 : N * C * 2 }, { 64, TM, 1 }, CU_TENSOR_MAP_SWIZZLE_128B);
+  const CUtensorMap mt = map3(CU_TENSOR_MAP_DATA_TYPE_FLOAT16, t2, { (uint64_t)C, NP, NP },
+                              { T ? NP * C * 2 : (uint64_t)C * 2, T ? (uint64_t)C * 2 : NP * C * 2 }, { 64, TM, 1 }, CU_TENSOR_MAP_SWIZZLE_128B);
+  static LF_TLS int sms = 0;
+  if (!sms) { int dev; CK(cudaGetDevice(&dev)); CK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev)); }
+  const unsigned grid = (unsigned)std::min<size_t>((size_t)np * ((np + TM - 1) / TM), sms);
+  static LF_TLS bool attr = false;
+  if (!attr) { CK(cudaFuncSetAttribute(triInTc, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)tri::Lay::BYTES)); attr = true; }
+  triInTc<<<grid, 320, tri::Lay::BYTES, STREAM>>>(mp, mt, mask, lnScale, lnOffset, WpT, WgT, WlT, a8, b8, n, np, cs, T);
+  CK(cudaGetLastError());
+  return true;
+}
 }  // namespace ptc

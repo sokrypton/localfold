@@ -5,7 +5,82 @@
 #include "src/common.cuh"
 #include "src/fusedtriangle.cuh"
 
+// triInTc against a host reference: a, b (e4m3 planes) and t2 on sampled rows, both directions, a mask with zeros
+static int mainTri(int argc, char** argv) {
+  const int n = argc > 2 ? atoi(argv[2]) : 300, reps = argc > 3 ? atoi(argv[3]) : 10, C = 128, np = (n + 15) / 16 * 16;
+  const size_t cs = (size_t)np * np, pairs = (size_t)n * n;
+  CK(cudaStreamCreate(&STREAM)); PAIR16 = true;
+  uint64_t s = 9;
+  auto rnd = [&] { s = s * 6364136223846793005ull + 1442695040888963407ull; return (s >> 40) / 16777216.f - 0.5f; };
+  std::vector<__nv_bfloat16> hp(pairs * C); for (auto& v : hp) v = __float2bfloat16(3.f * rnd() + 0.3f);
+  std::vector<float> hs(C), ho(C), hm(pairs); for (auto& v : hs) v = 1.f + 0.3f * rnd(); for (auto& v : ho) v = 0.2f * rnd();
+  for (auto& v : hm) v = rnd() > -0.4f ? 1.f : 0.f;
+  std::vector<half> wp((size_t)C * 2 * C), wg((size_t)C * 2 * C), wl((size_t)C * C);
+  for (auto& v : wp) v = __float2half(0.15f * rnd()); for (auto& v : wg) v = __float2half(0.3f * rnd()); for (auto& v : wl) v = __float2half(0.15f * rnd());
+  __nv_bfloat16* pair; float *sc, *of, *mk; half *dwp, *dwg, *dwl, *t2; uint8_t *a8, *b8;
+  CK(cudaMalloc(&pair, pairs * C * 2)); CK(cudaMalloc(&sc, C * 4)); CK(cudaMalloc(&of, C * 4)); CK(cudaMalloc(&mk, pairs * 4));
+  CK(cudaMalloc(&dwp, wp.size() * 2)); CK(cudaMalloc(&dwg, wg.size() * 2)); CK(cudaMalloc(&dwl, wl.size() * 2));
+  CK(cudaMalloc(&t2, cs * C * 2)); CK(cudaMalloc(&a8, cs * C)); CK(cudaMalloc(&b8, cs * C));
+  CK(cudaMemcpy(pair, hp.data(), pairs * C * 2, cudaMemcpyHostToDevice)); CK(cudaMemcpy(sc, hs.data(), C * 4, cudaMemcpyHostToDevice));
+  CK(cudaMemcpy(of, ho.data(), C * 4, cudaMemcpyHostToDevice)); CK(cudaMemcpy(mk, hm.data(), pairs * 4, cudaMemcpyHostToDevice));
+  CK(cudaMemcpy(dwp, wp.data(), wp.size() * 2, cudaMemcpyHostToDevice)); CK(cudaMemcpy(dwg, wg.data(), wg.size() * 2, cudaMemcpyHostToDevice));
+  CK(cudaMemcpy(dwl, wl.data(), wl.size() * 2, cudaMemcpyHostToDevice));
+  auto e4 = [](uint8_t v) { __nv_fp8_e4m3 f; *reinterpret_cast<uint8_t*>(&f) = v; return (double)(float)f; };
+  int bad = 0;
+  const int Tlo = argc > 4 ? atoi(argv[4]) : 0, Thi = argc > 4 ? Tlo + 1 : 2;
+  for (int T = Tlo; T < Thi; ++T) {
+    CK(cudaMemset(a8, 0x7f, cs * C)); CK(cudaMemset(b8, 0x7f, cs * C)); CK(cudaMemset(t2, 0x7f, cs * C * 2));
+    CK(cudaDeviceSynchronize());   // (the memsets ran on the per-thread default stream, which does not order with STREAM)
+    if (!ptc::triInTcRun(true, (const float*)pair, mk, sc, of, dwp, dwg, dwl, a8, b8, t2, n, np, cs, T)) { fprintf(stderr, "not taken\n"); return 1; }
+    CK(cudaDeviceSynchronize());
+    std::vector<uint8_t> ha(cs * C), hb(cs * C); std::vector<half> ht(cs * C);
+    CK(cudaMemcpy(ha.data(), a8, ha.size(), cudaMemcpyDeviceToHost)); CK(cudaMemcpy(hb.data(), b8, hb.size(), cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(ht.data(), t2, ht.size() * 2, cudaMemcpyDeviceToHost));
+    double na = 0, da = 0, nt = 0, dt = 0; size_t padBad = 0;
+    for (int t = 0; t < 96; ++t) {
+      const size_t q = (size_t)t * 7919 % cs; const int i = (int)(q / np), j = (int)(q % np);
+      const bool real = i < n && j < n;
+      const size_t P = real ? (T ? (size_t)j * n + i : (size_t)i * n + j) : 0;
+      std::vector<double> x(C, 0.0);
+      if (real) {
+        double m = 0, v = 0; for (int c = 0; c < C; ++c) m += __bfloat162float(hp[P * C + c]); m /= C;
+        for (int c = 0; c < C; ++c) { double d = __bfloat162float(hp[P * C + c]) - m; v += d * d; } v = 1 / sqrt(v / C + 1e-5);
+        for (int c = 0; c < C; ++c) x[c] = __half2float(__float2half((float)((__bfloat162float(hp[P * C + c]) - m) * v * hs[c] + ho[c])));
+      } else {
+        for (int c = 0; c < C; ++c) x[c] = __half2float(__float2half(ho[c]));   // (a zero row's LN: the offset)
+      }
+      const double mm = real ? hm[P] : 0.0;
+      for (int ch = 0; ch < C; ++ch) {
+        double pa = 0, pb = 0, ga = 0, gb = 0;
+        for (int c = 0; c < C; ++c) {
+          pa += x[c] * __half2float(wp[(size_t)c * 2 * C + 2 * ch]); pb += x[c] * __half2float(wp[(size_t)c * 2 * C + 2 * ch + 1]);
+          ga += x[c] * __half2float(wg[(size_t)c * 2 * C + 2 * ch]); gb += x[c] * __half2float(wg[(size_t)c * 2 * C + 2 * ch + 1]);
+        }
+        const double va = pa / (1 + exp(-ga)) * mm, vb = pb / (1 + exp(-gb)) * mm;
+        const double ga8 = e4(ha[(size_t)ch * cs + q]), gb8 = e4(hb[(size_t)ch * cs + q]);
+        na += (ga8 - va) * (ga8 - va) + (gb8 - vb) * (gb8 - vb); da += va * va + vb * vb;
+        if (!real && (ga8 != 0.0 || gb8 != 0.0)) ++padBad;   // (by value: -0, 0x80, is a padding zero too)
+        double tl = 0; for (int c = 0; c < C; ++c) tl += x[c] * __half2float(wl[(size_t)c * C + ch]);
+        const size_t tr = T ? (size_t)j * np + i : q;
+        const double got = __half2float(ht[tr * C + ch]);
+        nt += (got - tl) * (got - tl); dt += tl * tl;
+      }
+    }
+    printf("tri n %d T %d: a,b relRMS %.3e (e4m3), t2 relRMS %.3e, padding nonzero %zu\n", n, T, sqrt(na / da), sqrt(nt / dt), padBad);
+    bad += !(sqrt(na / da) < 4e-2) || !(sqrt(nt / dt) < 2e-3) || padBad;
+  }
+  cudaEvent_t e0, e1; CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
+  std::vector<float> tt;
+  for (int r = 0; r < reps; ++r) {
+    CK(cudaEventRecord(e0, STREAM)); ptc::triInTcRun(true, (const float*)pair, mk, sc, of, dwp, dwg, dwl, a8, b8, t2, n, np, cs, false);
+    CK(cudaEventRecord(e1, STREAM)); CK(cudaEventSynchronize(e1)); float ms; CK(cudaEventElapsedTime(&ms, e0, e1)); tt.push_back(ms);
+  }
+  std::sort(tt.begin(), tt.end());
+  printf("tri n %d: triInTc %.3f ms%s\n", n, tt[reps / 2], bad ? "  FAILED" : "");
+  return bad ? 1 : 0;
+}
 int main(int argc, char** argv) {
+  if (argc > 1 && !strcmp(argv[1], "tri")) return mainTri(argc, argv);
   const int n = argc > 1 ? atoi(argv[1]) : 512, reps = argc > 2 ? atoi(argv[2]) : 20, C = 128, NQ = 512, heads = 4, stride = (n + 7) / 8 * 8;
   if (!tc5a::ready()) { fprintf(stderr, "no sm_100a tcgen05 here\n"); return 1; }
   CK(cudaStreamCreate(&STREAM));
@@ -33,6 +108,7 @@ int main(int argc, char** argv) {
         for (auto o : {o1, o2}) CK(cudaMemset(o, 0, pairs * NQ * 2));
         for (auto k : {k1, k2}) CK(cudaMemset(k, 0, pairs * 2 * C));
         for (auto b : {b1, b2}) CK(cudaMemset(b, 0, (size_t)heads * n * stride * 2));
+        CK(cudaDeviceSynchronize());   // (the memsets ran on the per-thread default stream, which does not order with STREAM)
         ptc::PAIR_TC = false;
         gridInRaw<128>((const float*)pair, sc, of, w, qb - 3 * C, o1, n, 0, pairs, tr, withBias ? wb : nullptr, withBias ? b1 : nullptr, heads, stride, tr, k1, false, nullptr, wlo, whi);
         CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
@@ -43,7 +119,7 @@ int main(int argc, char** argv) {
           std::vector<half> x(cnt), y(cnt); CK(cudaMemcpy(x.data(), a, cnt * 2, cudaMemcpyDeviceToHost)); CK(cudaMemcpy(y.data(), b, cnt * 2, cudaMemcpyDeviceToHost));
           double num = 0, den = 0; for (size_t i = 0; i < cnt; ++i) { double p = __half2float(x[i]), q = __half2float(y[i]); num += (p - q) * (p - q); den += p * p; }
           const double r = sqrt(num / std::max(den, 1e-30));
-          printf("  tr %d bias %d window %d %-6s relRMS %.3e\n", tr, withBias, win, nm, r);
+          printf("  tr %d bias %d window %d %-6s relRMS %.3e (against gridInK)\n", tr, withBias, win, nm, r);
           bad += !(r < 2e-3);
         };
         auto cmp8 = [&](const uint8_t* a, const uint8_t* b, size_t cnt, const char* nm) {

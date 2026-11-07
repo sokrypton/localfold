@@ -1205,7 +1205,11 @@ void triangle(float* pair, const float* mask, int n, int C, const std::string& p
         RectMap rm; rm.T = !outgoing;
         wideWidth(C, [&](auto width) {
           constexpr int CC = decltype(width)::value, WO = 4;
-          if (!triInGemm<CC, F8>(pair, mask, W(pre + ".leftNormInputScale"), W(pre + ".leftNormInputOffset"),
+          // (a B200: pair_tc5.cuh's triInTc where it takes this form)
+          const bool tcIn = std::is_same_v<F8, __nv_fp8_e4m3> && CC == 128 &&
+            ptc::triInTcRun(PAIR16, pair, mask, W(pre + ".leftNormInputScale"), W(pre + ".leftNormInputOffset"), Wh(pre + ".projection"),
+                            Wh(pre + ".gate"), Wh(pre + ".gatingLinear"), (uint8_t*)a8, (uint8_t*)b8, t2, n, np8, cs8, !outgoing);
+          if (!tcIn && !triInGemm<CC, F8>(pair, mask, W(pre + ".leftNormInputScale"), W(pre + ".leftNormInputOffset"),
                                  pre, a8, b8, t2, n, np8, cs8, !outgoing)) {
             const half* wt = triInTiles(Wh(pre + ".projection"), Wh(pre + ".gate"), Wh(pre + ".gatingLinear"), C, 16);
             wideWarps<CC>(C, [&](auto warps) {
