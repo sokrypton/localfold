@@ -1341,11 +1341,14 @@ void gridInAt(const float* pair, const float* lnScale, const float* lnOffset, co
 }
 inline size_t gridOutSmem(int warps, int C = 128) { return (size_t)C * (C + 8) * 2 + (size_t)16 * warps * (C + 8) * 2; }
 inline bool gridFusedFits(int C = 128) { return fitsSmem(gridInSmem(2, 64, C)) && fitsSmem(gridOutSmem(2, C)); }
+#include "pair_tc5.cuh"
 template <int C = 128>
 inline void gridInRaw(const float* pair, const float* lnScale, const float* lnOffset, const half* Wq, const float* qb,
                       half* out, int n, size_t q0, size_t rows, bool tr, const half* Wb = nullptr, half* bias = nullptr,
                       int heads = 0, int stride = 0, bool swap = false, uint8_t* kv8 = nullptr, bool wide = false,
                       uint8_t* vt8 = nullptr, size_t wlo = 0, size_t whi = SIZE_MAX) {
+  // a B200: its common AF3 form on tcgen05 (pair_tc5.cuh)
+  if (C == 128 && ptc::gridInTcRun(PAIR16, pair, lnScale, lnOffset, Wq, qb, out, n, q0, rows, tr, Wb, bias, heads, stride, swap, kv8, vt8, wlo, whi)) return;
   // wide (AF2 on sm_12x): 16 warps, 256 rows a block, the weight in 16-column stages to fit (88 KB) - each stage spread
   // over twice the rows: an RTX PRO 6000's 1,000-residue triangle attention 3.63 -> 3.41 ms a call (--bench-pair: 16
   // warps at 32-column stages 3.43, at the 64-column ones 3.63), bit-identical
