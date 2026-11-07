@@ -122,19 +122,26 @@ inline std::vector<char> frameMask(int n, const int* isLigand, const int* asym, 
 struct Chains { std::vector<double> pair, ptm, iptm; };
 inline Chains reduceRows(const double* rowSum, int n, const Layout& L, const char* frame) {
   const int nc = L.nc();
-  auto best = [&](int from, int to) {   // anchors of chain `from`, their mean over chain `to`'s tokens
-    double top = -1e30; bool any = false;
+  // anchors of chain `from`, their best mean over chain `to`'s tokens: -inf where nothing is selected, NaN where a term
+  // is (std::max passes a NaN by: a broken term must not score)
+  auto best = [&](int from, int to) {
+    double top = -INFINITY;
     for (int i = 0; i < n; ++i) {
       if (L.of[i] != from || (frame && !frame[i]) || !L.count[to]) continue;
-      any = true; top = std::max(top, rowSum[(size_t)i * nc + to] / L.count[to]);
+      const double v = rowSum[(size_t)i * nc + to] / L.count[to];
+      if (std::isnan(v)) return (double)NAN;
+      top = std::max(top, v);
     }
-    return any ? top : NAN;
+    return top;
   };
-  auto maxNan = [](double x, double y) { return std::isnan(x) ? y : std::isnan(y) ? x : std::max(x, y); };
+  auto score = [](double v) { return v == -INFINITY ? (double)NAN : v; };
   Chains c;
   c.pair.assign((size_t)nc * nc, NAN); c.ptm.assign(nc, NAN); c.iptm.assign(nc, NAN);
   for (int a = 0; a < nc; ++a)
-    for (int b = 0; b < nc; ++b) c.pair[(size_t)a * nc + b] = a == b ? best(a, a) : maxNan(best(a, b), best(b, a));
+    for (int b = 0; b < nc; ++b) {
+      const double x = best(a, b), y = a == b ? -INFINITY : best(b, a);
+      c.pair[(size_t)a * nc + b] = std::isnan(x) || std::isnan(y) ? (double)NAN : score(std::max(x, y));
+    }
   for (int a = 0; a < nc; ++a) {
     c.ptm[a] = c.pair[(size_t)a * nc + a];
     double sum = 0; int cnt = 0;

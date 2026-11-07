@@ -103,7 +103,9 @@ std::vector<float> sample(const Denoiser& d, const SamplerSettings& s, uint64_t 
                           const std::function<void(const float*, int, int)>& onStep = nullptr);
 
 // ---------------------------------------------------------------- the confidence head (confidence.mm)
-struct Confidence { std::vector<float> plddtAtom, plddtToken, pae; double ptm, iptm, meanPlddt; };
+// chainPair [nc][nc] / chainPtm / chainIptm: AlphaFold 3's chain-level scores (cuda/featurise/ptm.h, every port's), the
+// chains by asym id; ptm and iptm ESMFold2's own (every token an anchor, d0 from every token)
+struct Confidence { std::vector<float> plddtAtom, plddtToken, pae; std::vector<double> chainPair, chainPtm, chainIptm; double ptm, iptm, meanPlddt; };
 // (the trunk's pair is read once, then given back: zTrunk is null after)
 Confidence confidenceHead(int T, int A, float*& zTrunk, const float* sInputs, int Si, const float* xDevice);
 

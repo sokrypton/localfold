@@ -64,8 +64,26 @@ void writeConfidences(const std::string& pdb, int T, const Confidence& conf, con
   fclose(f);
   f = fopen((stem + "_summary_confidences.json").c_str(), "w");
   if (!f) die("cannot write %s_summary_confidences.json", stem.c_str());
-  if (chains) fprintf(f, "{\"ptm\": %.4f, \"iptm\": %.4f, \"mean_plddt\": %.2f}\n", conf.ptm, conf.iptm, 100 * conf.meanPlddt);
-  else fprintf(f, "{\"ptm\": %.4f, \"iptm\": null, \"mean_plddt\": %.2f}\n", conf.ptm, 100 * conf.meanPlddt);
+  // the chain-level fields as cuda/ef2 writes them - AlphaFold 3's (ptm.h) - chains in asym id order
+  auto num = [&](double v) { if (std::isfinite(v)) fprintf(f, "%.4f", v); else fprintf(f, "null"); };
+  const int nc = (int)conf.chainPtm.size();
+  fprintf(f, "{\"chain_ptm\": [");
+  for (int a = 0; a < nc; ++a) { if (a) fprintf(f, ", "); num(conf.chainPtm[a]); }
+  fprintf(f, "], ");
+  if (nc > 1) {
+    fprintf(f, "\"chain_iptm\": [");
+    for (int a = 0; a < nc; ++a) { if (a) fprintf(f, ", "); num(conf.chainIptm[a]); }
+    fprintf(f, "], ");
+  }
+  fprintf(f, "\"chain_pair_iptm\": [");
+  for (int a = 0; a < nc; ++a) {
+    fprintf(f, "%s[", a ? ", " : "");
+    for (int b = 0; b < nc; ++b) { if (b) fprintf(f, ", "); num(conf.chainPair[(size_t)a * nc + b]); }
+    fprintf(f, "]");
+  }
+  fprintf(f, "], ");
+  if (chains) fprintf(f, "\"ptm\": %.4f, \"iptm\": %.4f, \"mean_plddt\": %.2f}\n", conf.ptm, conf.iptm, 100 * conf.meanPlddt);
+  else fprintf(f, "\"ptm\": %.4f, \"iptm\": null, \"mean_plddt\": %.2f}\n", conf.ptm, 100 * conf.meanPlddt);
   fclose(f);
 }
 

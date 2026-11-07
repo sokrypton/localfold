@@ -6,6 +6,7 @@
 //   PAE = E[bin] over [0, 32] of z @ pae;  pTM / ipTM from the PAE logits
 // Its own projections stay float32 and multiply in float (their f16 rounding cost 5CAJ's pLDDT 16 points on the
 // translated port); its four pair blocks are the trunk's, in half.
+#include "ptm.h"   // (cuda/featurise/ptm.h: AF3's chain-level scores, every port's definition)
 #include "ef2.h"
 #include <cmath>
 
@@ -137,6 +138,31 @@ Confidence confidenceHead(int T, int A, float*& zTrunk, const float* sInputs, in
   double ptm = -1e30, iptm = -1e30;
   for (int i = 0; i < T; ++i) { ptm = std::max(ptm, (double)rows[2 * i]); iptm = std::max(iptm, (double)rows[2 * i + 1]); }
   out.ptm = ptm; out.iptm = iptm;
+  {   // the chain-level scores as AlphaFold 3 defines them (ptm.h): its INTERFACE term (d0 from the pair's own chains),
+      // anchored on the tokens with frames - taken on the host off the logits (unified memory), for a complex only: one
+      // chain's interface d0 is every token's and its tokens all polymer, so its chain pTM is the pTM
+    const ptm::Layout L = ptm::layout(asym.data(), nullptr, T);
+    const int nc = L.nc();
+    if (nc == 1) { out.chainPair = {ptm}; out.chainPtm = {ptm}; out.chainIptm = {NAN}; }
+    else {
+      std::vector<float> centres(pb); for (int b = 0; b < pb; ++b) centres[b] = (float)(width * (b + 0.5));
+      const std::vector<float> lg = download(paeL, P * pb);
+      const std::vector<float> term = ptm::interfaceTerm(lg.data(), T, pb, L, ptm::tables(L, centres.data(), pb));
+      // a NONPOLYMER token (ESM's mol_type 3) is one atom: its reference position the frame rule's
+      std::vector<int> lig(T, 0); std::vector<float> pos((size_t)T * 3, 0.f); std::vector<char> live(T, 0);
+      if (M.has("mol_type")) { const int* mol = M.hostI("mol_type"); for (int t = 0; t < T; ++t) lig[t] = mol[t] == 3; }
+      const float* refPos = M.hostF("ref_pos");
+      for (int a = 0; a < A; ++a) {
+        const int t = a2t[a];
+        if (t < 0 || t >= T || live[t] || !(mask_[a] > 0)) continue;
+        for (int d = 0; d < 3; ++d) pos[(size_t)t * 3 + d] = refPos[(size_t)a * 3 + d];
+        live[t] = 1;
+      }
+      const std::vector<char> frame = ptm::frameMask(T, lig.data(), asym.data(), M.hostI("residue_index"), pos.data(), live.data());
+      const ptm::Chains cs = ptm::chainScores(term.data(), T, L, frame.data());
+      out.chainPair = cs.pair; out.chainPtm = cs.ptm; out.chainIptm = cs.iptm;
+    }
+  }
   release(z); release(dSlot);
   return out;
 }
