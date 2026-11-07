@@ -2168,6 +2168,11 @@ void flashGrid(const T* qkvg, const T* bias, int stride, const float* mask, T* o
                int D, size_t r0, size_t rows, bool tr, float scale, const float* qBias = nullptr) {
   if constexpr (std::is_same_v<T, half>) {
     if (D == 32) flashGridHalfLaunch<32>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale, qBias);
+    // (the diffusion's token attention on a B200: flash_tc5.cuh's flashTcH - no mask, every query, rows from 0 - from 512
+    // tokens, where it is measured faster: test_flash_tc5 h, 5 samples, 0.044 against 0.047 ms at 512, 0.084 / 0.112 at
+    // 1,000, 0.242 / 0.458 at 2,048, 0.772 / 1.720 at 4,096; 0.025 / 0.022 at 256, its 96 work items short of the SMs)
+    else if (D == 48 && n >= 512 && !mask && !FLASH_QHI && r0 == 0 && !tr && tc5a::TC_ATTN && tc5a::ready())
+      tc5a::flashTcHRun(qkvg, bias, stride, out, n, heads, rows, scale, qBias);
     else if (D == 48) flashGridHalfLaunch<48>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale, qBias);
     else if (D == 16) flashGridHalfLaunch<16>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale, qBias);
     else if (D == 8 && flashNarrow(mask)) {

@@ -51,6 +51,12 @@ __device__ __forceinline__ void mmaF8ts(uint32_t d, uint32_t a, uint64_t b, uint
                :: "r"(d), "r"(a), "l"(b), "r"(id), "r"((uint32_t)acc));
 #endif
 }
+__device__ __forceinline__ void mmaF16ts(uint32_t d, uint32_t a, uint64_t b, uint32_t id, bool acc) {
+#if LF_TC5A
+  asm volatile("{\n\t.reg .pred p;\n\tsetp.ne.b32 p, %4, 0;\n\ttcgen05.mma.cta_group::1.kind::f16 [%0], [%1], %2, %3, p;\n\t}\n"
+               :: "r"(d), "r"(a), "l"(b), "r"(id), "r"((uint32_t)acc));
+#endif
+}
 __device__ __forceinline__ void commit(uint64_t* m) {
 #if LF_TC5A
   asm volatile("tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];" :: "r"(sa(m)) : "memory");
@@ -98,6 +104,13 @@ __device__ __forceinline__ void ld32(uint32_t addr, uint32_t* r) {
 #if LF_TC5A
   asm volatile("tcgen05.ld.sync.aligned.32x32b.x32.b32 {%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,"
                "%16,%17,%18,%19,%20,%21,%22,%23,%24,%25,%26,%27,%28,%29,%30,%31}, [%32];" : LF_TC5A_R32(r) : "r"(addr));
+#endif
+}
+__device__ __forceinline__ void ld16(uint32_t addr, uint32_t* r) {
+#if LF_TC5A
+  asm volatile("tcgen05.ld.sync.aligned.32x32b.x16.b32 {%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15}, [%16];"
+               : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]), "=r"(r[4]), "=r"(r[5]), "=r"(r[6]), "=r"(r[7]),
+                 "=r"(r[8]), "=r"(r[9]), "=r"(r[10]), "=r"(r[11]), "=r"(r[12]), "=r"(r[13]), "=r"(r[14]), "=r"(r[15]) : "r"(addr));
 #endif
 }
 __device__ __forceinline__ void ld1(uint32_t addr, uint32_t& r) {
@@ -500,6 +513,315 @@ __global__ void __launch_bounds__(32 * tcWarps<R>(), 1) flashTc(const __grid_con
 #endif
 }
 
+// ---- the diffusion transformer's token attention on tcgen05 (flashTcH): flashGridHalf's contract at 48-wide heads -
+// f16 q, k, v and gate out of qkvg ([sample][token][4W]), the f16 pair bias (times log2 e) shared by the samples, f16 P,
+// scores in f32 - with flashTc's structure: a persistent block an SM over (head, 128 queries, 2 samples sharing the bias
+// tile), the bias laid by the MMA for both, P in tensor memory, the sum by the PV product (ones rows after V^T).
+// kind::f16 throughout: Q K^T three K16 steps (Q K-major, written by the softmax threads; K three 32B-swizzled 16-dim
+// chunks by TMA), O += P V^T four (P from tensor memory, 8 columns a step; V^T 128B-swizzled rows, made by vtHK).
+namespace th {
+constexpr int D = 48, R = 2, SB = 2, TS = 3, TV = 3;   // TS stages of the S ring (bias, K), TV of the V ring
+constexpr float LAZYH = 8.f;     // (P = 2^(s - max) <= 2^8 in f16; f16 keeps 2^-24 below the max)
+// shared memory: Q [2][R] 12 KB; TS stages of the S ring { bias 16 KB, [R] K 3 x 2 KB }, freed once that tile's S products
+// complete; TV of the V ring { [R] { V^T 6 KB, ones 2 KB } }, freed once its PV products do (one ring held a stage from
+// its load to its PV - with S two tiles ahead, a 3-stage ring left the loads no lead: the products waited on them 36% of
+// the time and the softmax on S 45%); the stacked identity 16 KB; the mask 3 KB; the barriers
+struct Lay {
+  static constexpr uint32_t Q = 0, STAGE = 16384 + R * 6144, VSTAGE = R * 8192, ST = 2 * R * 12288, VT = ST + TS * STAGE,
+                            ID = VT + TV * VSTAGE, MA = ID + R * 8192, MB = MA + 1024, BAR = MB + 2048, BYTES = BAR + 512;
+};
+constexpr int WARPS = 4 * R + 3;   // 4R softmax, the S products, the PV products, the loads
+}  // namespace th
+// V^T [row][W][NK] f16 from qkvg's v ([row][pos][4W] at 2W): a block 64 keys x 64 dims of one row through shared memory
+__global__ void __launch_bounds__(256) vtHK(const half* __restrict__ qkvg, half* __restrict__ vt, int n, int NK, int W) {
+  __shared__ half t[64][66];
+  const size_t r = blockIdx.z; const int k0 = blockIdx.x * 64, d0 = blockIdx.y * 64;
+  for (int u = threadIdx.x; u < 64 * 32; u += 256) {
+    const int kk = u / 32, dd = (u % 32) * 2, key = k0 + kk;
+    half2 v = __floats2half2_rn(0.f, 0.f);
+    if (key < n && d0 + dd < W) v = *reinterpret_cast<const half2*>(qkvg + (r * n + key) * (size_t)(4 * W) + 2 * W + d0 + dd);
+    t[dd][kk] = v.x; t[dd + 1][kk] = v.y;
+  }
+  __syncthreads();
+  for (int u = threadIdx.x; u < 64 * 32; u += 256) {
+    const int dd = u / 32, kk = (u % 32) * 2;
+    if (d0 + dd < W) *reinterpret_cast<half2*>(vt + (r * W + d0 + dd) * (size_t)NK + k0 + kk) = __halves2half2(t[dd][kk], t[dd][kk + 1]);
+  }
+}
+__global__ void __launch_bounds__(32 * th::WARPS, 1) flashTcH(const __grid_constant__ CUtensorMap mapB, const __grid_constant__ CUtensorMap mapK,
+    const __grid_constant__ CUtensorMap mapV, const half* __restrict__ qkvg, half* __restrict__ out, int n, int heads, int rows,
+    float scale, const float* __restrict__ qBias) {
+#if LF_TC5A
+  using namespace th;
+  using L = th::Lay;
+  constexpr int MW = 4 * R, PW = 4 * R + 1, LW = 4 * R + 2;
+  constexpr uint32_t OCOL = 64 * R * SB, PCOL = OCOL + 64 * R;     // S 256, O 128 (48 O, 1 sum), P [r][2] 32 each: 512
+  extern __shared__ __align__(1024) unsigned char sm[];
+  uint64_t* kvFull = reinterpret_cast<uint64_t*>(sm + L::BAR);
+  uint64_t *kvFree = kvFull + TS, *sFull = kvFree + TS, *sRead = sFull + R * SB, *pFull = sRead + R * SB, *pFree = pFull + 2 * R,
+           *qFull = pFree + 2 * R, *vFull = qFull + 2, *vFree = vFull + TV;
+  __shared__ uint32_t tmBase;
+  const int W = heads * D, nqt = (n + TQ - 1) / TQ, nrg = (rows + R - 1) / R, nk = (n + TK - 1) / TK;
+  const unsigned per = (unsigned)nqt * nrg, items = per * heads;
+  const int mine = items > blockIdx.x ? (int)((items - blockIdx.x + gridDim.x - 1) / gridDim.x) : 0;
+  auto decode = [&](int k, int& h, int& q0, int& rg) {   // a head's items: every row group of a query tile together
+    const unsigned w = blockIdx.x + (unsigned)k * gridDim.x, r0 = w % per;
+    h = (int)(w / per); rg = (int)(r0 % nrg); q0 = (int)(r0 / nrg) * TQ;
+  };
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  const uint32_t base = sa(sm);
+  if (warp == MW) {
+    asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], 512;" :: "r"(sa(&tmBase)));
+    asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
+  }
+  if (tid == 0) {
+    for (int s = 0; s < TS; ++s) { barInit(kvFull + s, 1); barInit(kvFree + s, 1); }
+    for (int i = 0; i < R * SB; ++i) { barInit(sFull + i, 1); barInit(sRead + i, 4); }
+    for (int i = 0; i < 2 * R; ++i) { barInit(pFull + i, 4); barInit(pFree + i, 1); }
+    for (int i = 0; i < 2; ++i) barInit(qFull + i, 4 * R);
+    for (int s = 0; s < TV; ++s) { barInit(vFull + s, 1); barInit(vFree + s, 1); }
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+  }
+  // the ones rows after each stage's V^T (rows 48..63 of the 128B-swizzled tile: row 48 all f16 ones, unmoved by the swizzle)
+  for (int i = tid; i < TV * R * 128; i += blockDim.x) {
+    const int sr = i >> 7, u = i & 127;
+    *reinterpret_cast<uint4*>(sm + L::VT + (sr / R) * L::VSTAGE + (sr % R) * 8192 + 6144 + u * 16) =
+        u < 8 ? make_uint4(0x3C003C00u, 0x3C003C00u, 0x3C003C00u, 0x3C003C00u) : make_uint4(0, 0, 0, 0);
+  }
+  for (int i = tid; i < R * 8192 / 16; i += blockDim.x) {      // the stacked identity: row n of B is e_(n mod 64)
+    const int kc = i / (R * 64), g = (i / 8) % (R * 8), rr = i & 7, nn = (g * 8 + rr) & 63;
+    uint4 v = make_uint4(0, 0, 0, 0);
+    if (nn / 8 == kc) { const int k = nn & 7; (&v.x)[k >> 1] = (k & 1) ? 0x3C000000u : 0x3C00u; }
+    *reinterpret_cast<uint4*>(sm + L::ID + i * 16) = v;
+  }
+  for (int i = tid; i < 16; i += blockDim.x)
+    *reinterpret_cast<uint4*>(sm + L::MA + i * 16) = make_uint4(i < 8 ? 0x3C00u : 0u, 0, 0, 0);
+  for (int i = tid; i < 2048 / 16; i += blockDim.x) {
+    const int kc = i >> 6, u = i & 63, valid = n - (n - 1) / TK * TK;
+    *reinterpret_cast<uint4*>(sm + L::MB + i * 16) = make_uint4(kc == 0 && u >= valid ? 0xF753u : 0u, 0, 0, 0);   // (-30000)
+  }
+  fenceProxy();
+  fenceBefore();
+  __syncthreads();
+  fenceAfter();
+  const uint32_t tm = tmBase;
+  const int T = mine * nk;
+  if (warp == LW) {
+    if (lane == 0) {
+      int s = 0, u = 0, sv = 0, uv = 0;
+      for (int k = 0; k < mine; ++k) {
+        int h, q0, rg; decode(k, h, q0, rg);
+        int row[R];
+        for (int r = 0; r < R; ++r) row[r] = min(rg * R + r, rows - 1);
+        for (int j = 0; j < nk; ++j) {
+          if (u > 0) barWait(kvFree + s, (u - 1) & 1);
+          barExpect(kvFull + s, 16384 + R * 6144);
+          unsigned char* st = sm + L::ST + s * L::STAGE;
+          tma3(st, &mapB, j * TK, q0, h, kvFull + s);                                     // bias [q 128][64 keys], 128B swizzle
+          for (int r = 0; r < R; ++r)
+            for (int c = 0; c < 3; ++c)                                                   // K [key 64][16 dims] x 3, 32B swizzle
+              tma3(st + 16384 + r * 6144 + c * 2048, &mapK, W + h * D + 16 * c, j * TK, row[r], kvFull + s);
+          if (++s == TS) { s = 0; ++u; }
+          if (uv > 0) barWait(vFree + sv, (uv - 1) & 1);
+          barExpect(vFull + sv, R * 6144);
+          for (int r = 0; r < R; ++r)                                                     // V^T [dim 48][64 keys], 128B swizzle
+            tma3(sm + L::VT + sv * L::VSTAGE + r * 8192, &mapV, j * TK, h * D, row[r], vFull + sv);
+          if (++sv == TV) { sv = 0; ++uv; }
+        }
+      }
+    }
+  } else if (warp == MW || warp == PW) {
+    // two issuing threads (a commit tracks its own thread's products): the S side - the bias for both rows, Q K^T, the
+    // S ring's stage freed - as soon as both softmaxes have S(t - SB) in registers; the PV side as each P(t) is written.
+    // (One thread issuing all 18 products and 7 commits of a tile step was busy 75% of the time and S came late.)
+    if (lane == 0 && warp == MW) {
+      constexpr uint32_t IDB = idesc(TQ, TK), IDBR = idesc(TQ, TK * R), IDQK = idesc(TQ, TK);
+      const uint64_t dBias = sdesc(base + L::ST, 16, 1024, SW128), dId = sdesc(base + L::ID, R * 1024, 128),
+                     dQ = sdesc(base + L::Q, 2048, 128), dK = sdesc(base + L::ST + 16384, 16, 256, SW32),
+                     dMA = sdesc(base + L::MA, 128, 0), dMB = sdesc(base + L::MB, 1024, 128);
+      int ks = 0, js = 0, ss = 0;
+      for (int ts = 0; ts < T; ++ts) {
+        const int b = ts % SB;
+        TCP_T(a0);
+        barWait(kvFull + ss, (ts / TS) & 1);
+        TCP_ADD(warp, 0, a0);
+        TCP_T(a1);
+        if (js == 0) barWait(qFull + (ks & 1), (ks >> 1) & 1);
+        TCP_ADD(warp, 1, a1);
+        TCP_T(a2);
+        if (ts >= SB) for (int r = 0; r < R; ++r) barWait(sRead + b * R + r, ((ts - SB) / SB) & 1);
+        TCP_ADD(warp, 2, a2);
+        fenceAfter();
+        const uint32_t so = ss * L::STAGE >> 4, d = tm + b * R * TK;
+#pragma unroll
+        for (int c = 0; c < 4; ++c) mmaF16(d, dBias + so + c * 2, dId + c * (2 * R * 1024 >> 4), IDBR, c > 0);
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+#pragma unroll
+          for (int c = 0; c < 3; ++c)   // S_r += Q_r K_r^T, 16 dims a step
+            mmaF16(d + r * TK, dQ + ((((ks & 1) * R + r) * 12288 + c * 4096) >> 4), dK + so + ((r * 6144 + c * 2048) >> 4), IDQK, true);
+          if (js == nk - 1 && n % TK) mmaF16(d + r * TK, dMA, dMB, IDB, true);
+          commit(sFull + b * R + r);
+        }
+        commit(kvFree + ss);     // (the S ring's stage: free once these products complete)
+        if (++ss == TS) ss = 0; if (++js == nk) { js = 0; ++ks; }
+      }
+    }
+    if (lane == 0 && warp == PW) {
+      constexpr uint32_t IDPV = idesc(TQ, 64);
+      const uint64_t dV = sdesc(base + L::VT, 16, 1024, SW128);
+      int j = 0, s = 0;
+      TCP_T(a9);
+      for (int t = 0; t < T; ++t) {
+        barWait(vFull + s, (t / TV) & 1);
+        fenceAfter();
+        const uint32_t so = s * L::VSTAGE >> 4;
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+          const int i = r * 2 + (t & 1);
+          TCP_T(a3);
+          barWait(pFull + i, (t >> 1) & 1);
+          TCP_ADD(warp, 3, a3);
+          fenceAfter();
+#pragma unroll
+          for (int c = 0; c < 4; ++c)   // [O | sum] += P [V^T | 1]^T: P from tensor memory (8 columns a K16 step)
+            mmaF16ts(tm + OCOL + 64 * r, tm + PCOL + 32 * i + 8 * c, dV + so + ((r * 8192 + c * 32) >> 4), IDPV, j > 0 || c > 0);
+          commit(pFree + i);
+        }
+        commit(vFree + s);
+        if (++s == TV) s = 0;
+        if (++j == nk) j = 0;
+      }
+      TCP_ADD(warp, 7, a9);
+    }
+  } else {
+    const int r = warp >> 2, sub = warp & 3, ql = tid & 127;
+    const uint32_t lane0 = (uint32_t)(sub * 32) << 16, tmO = tm + OCOL + 64 * r + lane0;
+    const float qs = scale * LOG2E;
+    // Q of item k: (q + qBias) scale log2e in f16 (flashGridHalf's), A's core (q/8, k/8) at (k/8) 2048 + (q/8) 128
+    auto convQ = [&](int k) {
+      int h, q0, rg; decode(k, h, q0, rg);
+      const int q = q0 + ql, row = min(rg * R + r, rows - 1);
+      const half* p = qkvg + ((size_t)row * n + q) * (size_t)(4 * W) + h * D;
+      unsigned char* Qs = sm + L::Q + ((k & 1) * R + r) * 12288 + (ql >> 3) * 128 + (ql & 7) * 16;
+#pragma unroll
+      for (int c = 0; c < 6; ++c) {
+        uint4 raw = q < n ? *reinterpret_cast<const uint4*>(p + 8 * c) : make_uint4(0, 0, 0, 0);
+        uint32_t w[4];
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+          float2 f = __half22float2(*reinterpret_cast<const half2*>(&(&raw.x)[e]));
+          if (qBias && q < n) { f.x += qBias[h * D + 8 * c + 2 * e]; f.y += qBias[h * D + 8 * c + 2 * e + 1]; }
+          w[e] = f16x2(f.x * qs, f.y * qs);
+        }
+        *reinterpret_cast<uint4*>(Qs + c * 2048) = make_uint4(w[0], w[1], w[2], w[3]);
+      }
+      fenceProxy();
+      __syncwarp();
+      if (lane == 0) barArrive(qFull + (k & 1));
+    };
+    TCP_T(b9);
+    if (mine > 0) convQ(0);
+    for (int k = 0; k < mine; ++k) {
+      int h, q0, rg; decode(k, h, q0, rg);
+      const int q = q0 + ql, row = rg * R + r;
+      if (k + 1 < mine) convQ(k + 1);
+      float mx = -INFINITY;     // f16-representable: P = 2^(s - mx)
+      for (int j = 0; j < nk; ++j) {
+        const int t = k * nk + j, i = r * 2 + (t & 1), is = (t % SB) * R + r;
+        TCP_T(b0);
+        barWait(sFull + is, (t / SB) & 1);
+        if (lane == 0) TCP_ADD(warp, 0, b0);
+        fenceAfter();
+        uint32_t xr[TK];
+        ld32(tm + is * TK + lane0, xr);
+        ld32(tm + is * TK + lane0 + 32, xr + 32);
+        ldWait();
+        fenceBefore();
+        __syncwarp();
+        if (lane == 0) barArrive(sRead + is);
+        float x[TK];
+#pragma unroll
+        for (int u = 0; u < TK; ++u) x[u] = __uint_as_float(xr[u]);
+        float m8[8];
+#pragma unroll
+        for (int c = 0; c < 8; ++c) m8[c] = fmaxf(x[c], fmaxf(x[8 + c], x[16 + c]));
+#pragma unroll
+        for (int u = 24; u < TK; u += 16)
+#pragma unroll
+          for (int c = 0; c < 8; ++c) m8[c] = fmaxf(m8[c], fmaxf(x[u + c], x[u + 8 + c]));
+        const float rmax = fmaxf(fmaxf(fmaxf(m8[0], m8[1]), fmaxf(m8[2], m8[3])), fmaxf(fmaxf(m8[4], m8[5]), fmaxf(m8[6], m8[7])));
+        float alpha = 1.f;
+        if (rmax > mx + LAZYH) {
+          const float nm = __half2float(__float2half_rn(rmax));
+          alpha = mx == -INFINITY ? 1.f : ex2f(mx - nm);
+          mx = nm;
+        }
+        if (j > 0 && __any_sync(~0u, alpha != 1.f)) {
+          barWait(pFree + r * 2 + ((t - 1) & 1), ((t - 1) >> 1) & 1);
+          fenceAfter();
+          uint32_t ov[32], o2[16], sv;
+          ld32(tmO, ov); ld16(tmO + 32, o2); ld1(tmO + 48, sv);
+          ldWait();
+#pragma unroll
+          for (int u = 0; u < 32; ++u) ov[u] = __float_as_uint(__uint_as_float(ov[u]) * alpha);
+#pragma unroll
+          for (int u = 0; u < 16; ++u) o2[u] = __float_as_uint(__uint_as_float(o2[u]) * alpha);
+          sv = __float_as_uint(__uint_as_float(sv) * alpha);
+          st32(tmO, ov); st16(tmO + 32, o2); st1(tmO + 48, sv);
+          stWait();
+        }
+        uint32_t pw[32];   // P in f16, key pairs in order
+#pragma unroll
+        for (int c = 0; c < 32; ++c) {
+          const float2 d = sub2(make_float2(x[2 * c], x[2 * c + 1]), mx);
+          pw[c] = f16x2(ex2f(d.x), ex2f(d.y));
+        }
+        TCP_T(b1);
+        if (t >= 2) { barWait(pFree + i, ((t - 2) >> 1) & 1); fenceAfter(); }
+        if (lane == 0) TCP_ADD(warp, 1, b1);
+        st32(tm + PCOL + 32 * i + lane0, pw);
+        stWait();
+        fenceBefore();
+        __syncwarp();
+        if (lane == 0) barArrive(pFull + i);
+      }
+      const int tl = k * nk + nk - 1;
+      barWait(pFree + r * 2 + (tl & 1), (tl >> 1) & 1);
+      fenceAfter();
+      uint4 gv[6];
+      const half* gp = qkvg + ((size_t)min(row, rows - 1) * n + min(q, n - 1)) * (size_t)(4 * W) + 3 * W + h * D;
+#pragma unroll
+      for (int c = 0; c < 6; ++c) gv[c] = *reinterpret_cast<const uint4*>(gp + 8 * c);
+      uint32_t ov[48], sv;
+      ld32(tmO, ov); ld16(tmO + 32, ov + 32); ld1(tmO + 48, sv);
+      ldWait();
+      if (q < n && row < rows) {
+        const float inv = 1.f / __uint_as_float(sv);
+        half* o = out + ((size_t)row * n + q) * (size_t)W + h * D;
+#pragma unroll
+        for (int c = 0; c < 6; ++c) {
+          uint32_t res[4];
+#pragma unroll
+          for (int e = 0; e < 4; ++e) {
+            const float2 a = __half22float2(*reinterpret_cast<const half2*>(&(&gv[c].x)[e]));
+            res[e] = f16x2(__uint_as_float(ov[8 * c + 2 * e]) * inv / (1.f + __expf(-a.x)), __uint_as_float(ov[8 * c + 2 * e + 1]) * inv / (1.f + __expf(-a.y)));
+          }
+          *reinterpret_cast<uint4*>(o + 8 * c) = make_uint4(res[0], res[1], res[2], res[3]);
+        }
+      }
+    }
+    if (lane == 0) TCP_ADD(warp, 7, b9);
+  }
+  fenceBefore();
+  __syncthreads();
+  if (warp == MW) {
+    fenceAfter();
+    asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, 512;" :: "r"(tm));
+  }
+#endif
+}
+
 // whether this binary carries sm_100a code for the device it runs on (asked once, of the device)
 __global__ void probeK(int* o) { *o = LF_TC5A; }
 inline bool ready() {
@@ -584,5 +906,26 @@ inline void flashTcRun(const half* qkvg, const uint8_t* K8, const uint8_t* Vt8, 
   if (rowsPerBlock == 3) flashTcRunR<3>(qkvg, K8, Vt8, bias, stride, out, n, heads, rows, scale, qBias);
   else if (rowsPerBlock == 2) flashTcRunR<2>(qkvg, K8, Vt8, bias, stride, out, n, heads, rows, scale, qBias);
   else { fprintf(stderr, "flashTcRun: %d rows a block (2 or 3)\n", rowsPerBlock); exit(1); }
+}
+// the diffusion's token attention (flashGridHalf's contract at D 48, no mask, no query range): rows the samples
+inline void flashTcHRun(const half* qkvg, const half* bias, int stride, half* out, int n, int heads, size_t rows, float scale,
+                        const float* qBias) {
+  const int W = heads * th::D, NK = (n + 63) / 64 * 64;
+  if (stride % 8) { fprintf(stderr, "flashTcHRun: bias stride %d not a multiple of 8\n", stride); exit(1); }
+  half* vt = scratch<half>("attn.vtH", rows * (size_t)W * NK);
+  vtHK<<<dim3(NK / 64, (W + 63) / 64, (unsigned)rows), 256, 0, STREAM>>>(qkvg, vt, n, NK, W);
+  const CUtensorMap mb = map3(CU_TENSOR_MAP_DATA_TYPE_FLOAT16, bias, { (uint64_t)n, (uint64_t)n, (uint64_t)heads },
+                              { (uint64_t)stride * 2, (uint64_t)n * stride * 2 }, { 64, 128, 1 }, CU_TENSOR_MAP_SWIZZLE_128B);
+  const CUtensorMap mk = map3(CU_TENSOR_MAP_DATA_TYPE_FLOAT16, qkvg, { (uint64_t)4 * W, (uint64_t)n, rows },
+                              { (uint64_t)4 * W * 2, (uint64_t)n * 4 * W * 2 }, { 16, 64, 1 }, CU_TENSOR_MAP_SWIZZLE_32B);
+  const CUtensorMap mv = map3(CU_TENSOR_MAP_DATA_TYPE_FLOAT16, vt, { (uint64_t)NK, (uint64_t)W, rows },
+                              { (uint64_t)NK * 2, (uint64_t)W * NK * 2 }, { 64, 48, 1 }, CU_TENSOR_MAP_SWIZZLE_128B);
+  static LF_TLS bool attr = false;
+  if (!attr) { CK(cudaFuncSetAttribute(flashTcH, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)th::Lay::BYTES)); attr = true; }
+  const unsigned nqt = (n + TQ - 1) / TQ, nrg = (unsigned)((rows + th::R - 1) / th::R), items = nqt * nrg * heads;
+  static LF_TLS int sms = 0;
+  if (!sms) { int dev; CK(cudaGetDevice(&dev)); CK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev)); }
+  flashTcH<<<std::min<unsigned>(items, sms), 32 * th::WARPS, th::Lay::BYTES, STREAM>>>(mb, mk, mv, qkvg, out, n, heads, (int)rows, scale, qBias);
+  CK(cudaGetLastError());
 }
 }  // namespace tc5a
