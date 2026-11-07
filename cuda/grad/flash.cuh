@@ -1576,6 +1576,10 @@ inline bool gridForwardBf(const Sdpa& a, const __nv_bfloat16* q, int ldq, const 
   const BiasTile bt = biasBf(a, Npq, Npk);
   float* ka2 = ARENA.get((size_t)a.B * Npk);   // (no per-key bias here: keyAdd is the same for every head)
   keyTermsK<<<blocks((size_t)a.B * Npk), 256, 0, STREAM>>>(a, ka2, Npk);
+#if defined(LF_TC5A)
+  // (a B200: gridFwdTc2, flash_tc5.cuh - the tcgen05 form in the inference kernels' structure)
+  if (!tc && gridFwdTc2Run(a, bt, ka2, Npk, q, ldq, k, ldk, v, ldv, o, ldo, lse, gate, ldg, og, ldog)) return true;
+#endif
   // (one row of 64 queries a block: two rows sharing the bias tile, or 128 queries sharing K and V, measured the same
   // at 512 tokens - 11.6, 11.6 and 11.5 ms a pairformer block's forward - though the kernel reads L2 at 74% of its
   // throughput: what is left is latency, ~15 instructions a score at 4 blocks of 4 warps an SM. Where shared memory

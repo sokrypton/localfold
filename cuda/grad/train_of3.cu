@@ -722,7 +722,8 @@ int main(int argc, char** argv) {
     else if (!strcmp(argv[i], "--bf16")) bf16Trunk = true;
     else if (!strcmp(argv[i], "--bf16-confidence")) bf16Confidence = true;
     else if (!strcmp(argv[i], "--mem")) MEM_REPORT = true;
-    else if (!strcmp(argv[i], "--profile")) profileStep = true;    // the last step's kernels by GPU time (CUPTI, cuda/af3's profile.cuh)
+    else if (!strcmp(argv[i], "--profile")) profileStep = true;
+    else if (!strcmp(argv[i], "--no-tc-fwd")) grad::flash::TC2 = false;   // gridFwdBf where gridFwdTc2 (tcgen05) would run    // the last step's kernels by GPU time (CUPTI, cuda/af3's profile.cuh)
     else if (!strcmp(argv[i], "--offload-pairs")) offloadPairs = true;
     else if (auto v = opt("--transition-chunk=")) transitionChunkM = atof(v);
     else if (auto v = opt("--world=")) world = atoi(v);
