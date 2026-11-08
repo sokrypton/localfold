@@ -359,7 +359,7 @@ export class AlphaFoldMonomerGpu {
           execution.releaseSince(checkpoint);
           const endOfWindow = (block + 1) % windowSize === 0 || block + 1 === weights.extraStack.length;
           if (endOfWindow) await withAbort(this.device.queue.onSubmittedWorkDone(), signal);
-          if (onProgress !== undefined) void this.device.queue.onSubmittedWorkDone().then(() => step(EXTRA_BLOCK));
+          if (onProgress !== undefined) void this.device.queue.onSubmittedWorkDone().then(() => step(EXTRA_BLOCK)).catch(() => {});
         }
         stageMilliseconds.extraStack += performance.now() - phaseStart;
         phaseStart = performance.now();
@@ -384,7 +384,7 @@ export class AlphaFoldMonomerGpu {
           execution.releaseSince(checkpoint);
           const endOfWindow = (block + 1) % windowSize === 0 || block + 1 === weights.mainStack.length;
           if (endOfWindow) await withAbort(this.device.queue.onSubmittedWorkDone(), signal);
-          if (onProgress !== undefined) void this.device.queue.onSubmittedWorkDone().then(() => step(MAIN_BLOCK));
+          if (onProgress !== undefined) void this.device.queue.onSubmittedWorkDone().then(() => step(MAIN_BLOCK)).catch(() => {});
         }
 
         await validation.settle();

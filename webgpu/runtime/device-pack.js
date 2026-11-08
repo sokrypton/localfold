@@ -170,7 +170,7 @@ export async function residentPackFromSources(device, options) {
   const bytes = destination === "f32" ? total * 4 : Math.ceil(total / 2) * 4;
   const buffer = await residentWeightBufferFilled(device, key, label, bytes, async (target) => {
     const release = await runBlockUpload(device, planned.gpu, target);
-    void device.queue.onSubmittedWorkDone().then(release);
+    void device.queue.onSubmittedWorkDone().then(release, release);
   }, variant);
   return { buffer, offsets, offsetsByName };
 }

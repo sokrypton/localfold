@@ -29,7 +29,8 @@ import {
 import { BIOEMU2 } from "../../shared/bioemu2/weights.js";
 import { trunkBlockWeights } from "../../shared/esmfold2/weights.js";
 import { Esmfold2TrunkGpu } from "../esmfold2/trunk.js";
-import { GpuBufferAllocator } from "../runtime/allocator.js";
+import { GpuBufferAllocator, settleReleasedMemory } from "../runtime/allocator.js";
+import { FLUSH_MIN_BYTES } from "../af3/trunk/pair-track.js";
 
 const W_Q = BIOEMU2.windowQueries;
 const W_K = BIOEMU2.windowKeys;
@@ -52,23 +53,28 @@ export class Bioemu2Gpu {
     this.host = new Map();
   }
 
+  /** Once, if it works: this network lasts as long as its device, and a fold whose download failed is not its last. */
+  once(map, key, start) {
+    if (!map.has(key)) {
+      const pending = start();
+      map.set(key, pending);
+      pending.catch(() => { if (map.get(key) === pending) map.delete(key); });
+    }
+    return map.get(key);
+  }
+
   /** A weight on the device, once. */
   async w(name, { half = this.half, transform } = {}) {
     if (!transform) return this.stacked(`${name}|${half}|`, [name], half);
-    const key = `${name}|${half}|t`;
-    if (!this.weights.has(key)) {
-      this.weights.set(key, (async () => {
-        const values = transform(await this.read(name));
-        return this.ops.weight(name, values, half && values.length % 2 === 0);
-      })());
-    }
-    return this.weights.get(key);
+    return this.once(this.weights, `${name}|${half}|t`, async () => {
+      const values = transform(await this.read(name));
+      return this.ops.weight(name, values, half && values.length % 2 === 0);
+    });
   }
 
   /** A weight on the host, once. */
   async h(name) {
-    if (!this.host.has(name)) this.host.set(name, this.read(name));
-    return this.host.get(name);
+    return this.once(this.host, name, () => this.read(name));
   }
 
   async hostGroup(prefix, names) {
@@ -83,21 +89,18 @@ export class Bioemu2Gpu {
    * never uploaded on their own.
    */
   async stacked(key, names, half, swiglu = false) {
-    if (!this.weights.has(key)) {
-      this.weights.set(key, (async () => {
-        const flat = names.flatMap((n) => (swiglu ? [`${n}/fc1/weight`, `${n}/fc2/weight`] : [n]));
-        if (typeof this.read.source === "function" && typeof this.read.decode === "function") {
-          const sources = await Promise.all(flat.map((n) => this.read.source(n)));
-          return this.ops.weightFromSources(key, sources, half, this.read.decode);
-        }
-        const parts = await Promise.all(flat.map((n) => this.read(n)));
-        const all = new Float32Array(parts.reduce((t, v) => t + v.length, 0));
-        let at = 0;
-        for (const v of parts) { all.set(v, at); at += v.length; }
-        return this.ops.weight(key, all, half && all.length % 2 === 0);
-      })());
-    }
-    return this.weights.get(key);
+    return this.once(this.weights, key, async () => {
+      const flat = names.flatMap((n) => (swiglu ? [`${n}/fc1/weight`, `${n}/fc2/weight`] : [n]));
+      if (typeof this.read.source === "function" && typeof this.read.decode === "function") {
+        const sources = await Promise.all(flat.map((n) => this.read.source(n)));
+        return this.ops.weightFromSources(key, sources, half, this.read.decode);
+      }
+      const parts = await Promise.all(flat.map((n) => this.read(n)));
+      const all = new Float32Array(parts.reduce((t, v) => t + v.length, 0));
+      let at = 0;
+      for (const v of parts) { all.set(v, at); at += v.length; }
+      return this.ops.weight(key, all, half && all.length % 2 === 0);
+    });
   }
 
   /** [fc1; fc2] stacked, so a SwiGLU's two projections are one GEMM. */
@@ -739,6 +742,7 @@ export class Bioemu2Gpu {
     const trunkAllocator = new GpuBufferAllocator(this.device, true);
     const trunk = new Esmfold2TrunkGpu(this.device, {
       allocator: trunkAllocator,
+      sequentialTriangle: true,
       ...(this.options.trunkPrecision === "f32"
         ? { stagedPrecision: "f32", accumulatePrecision: "f32" }
         : { accumulatePrecision: "f32" }),
@@ -808,6 +812,15 @@ export class Bioemu2Gpu {
     const DT = BIOEMU2.token;
     const DA = BIOEMU2.atom;
     // pairwise conditioner: z = proj(LN(concat(z_trunk, relpos))) + 2 transitions
+    // 🔴 IN STAGES, EACH FREED BEFORE THE NEXT IS ALLOCATED. These were one recorded list over one submission, so the
+    // concatenation, the transitions' scratch and the bias's norm were all held at once: 2.5 GiB of 3.9 at 600 tokens,
+    // which is the fold's peak, for tensors that are never needed together.
+    const large = T * T * 256 * 4 >= FLUSH_MIN_BYTES;
+    const runStage = async (steps, ...finished) => {
+      o.run(steps, { oneSubmitEach: large });
+      o.free(...finished);
+      if (large) await settleReleasedMemory(this.device);
+    };
     const rel = o.buffer("ctx.rel", T * T * 256);
     const cat = o.buffer("ctx.cat", T * T * 512);
     const zc = o.buffer("ctx.z", T * T * 256);
@@ -819,18 +832,22 @@ export class Bioemu2Gpu {
     pre.push(await o.layerNorm({ x: cat, y: cat, rows: T * T, width: 512,
       w: await this.w(`${pc}/dim_pairwise_init_proj_0/weight`, { half: false }), b: await this.w(`${pc}/dim_pairwise_init_proj_0/bias`, { half: false }) }));
     pre.push(await o.linear({ x: cat, w: await this.w(`${pc}/dim_pairwise_init_proj_1/weight`), y: zc, rows: T * T, inC: 512, outC: 256 }));
+    await runStage(pre, rel, cat);
     const ps = {};
+    const transitions = [];
     for (let i = 0; i < 2; i += 1) {
-      await this.transition(pre, `${pc}/transitions_${i}`, { input: zc, rows: T * T, width: 256, hidden: 512, out: zc,
-                                                             scratch: ps, norm: true, accumulate: true });
+      await this.transition(transitions, `${pc}/transitions_${i}`, { input: zc, rows: T * T, width: 256, hidden: 512, out: zc,
+                                                                     scratch: ps, norm: true, accumulate: true });
     }
+    await runStage(transitions, ...Object.values(ps));
     // the token stream's per-layer pair biases (16, T, T): LN(z) (no offset) . proj_z
     const tokenBias = [];
+    const biases = [];
     const zln = o.buffer("ctx.zln", T * T * 256);
     for (let l = 0; l < BIOEMU2.denoiserLayers; l += 1) {
       const att = `${P}/layers/${l}/token_block/attention/pair_bias_attn`;
       const bias = o.buffer(`ctx.tbias${l}`, BIOEMU2.tokenHeads * T * T);
-      pre.push(await o.layerNorm({ x: zc, y: zln, rows: T * T, width: 256, w: await this.w(`${att}/norm_z/weight`, { half: false }) }),
+      biases.push(await o.layerNorm({ x: zc, y: zln, rows: T * T, width: 256, w: await this.w(`${att}/norm_z/weight`, { half: false }) }),
         await o.gemm({ m: T * T, n: BIOEMU2.tokenHeads, k: 256, a: zln, b: await this.w(`${att}/proj_z/weight`), c: bias,
           A: { m: 256, k: 1 }, B: { n: 256, k: 1 }, C: { m: 1, n: T * T } }));
       tokenBias.push(bias);
@@ -842,8 +859,7 @@ export class Bioemu2Gpu {
       w: await this.w(`${pa}/z_to_p_trans_0/weight`, { half: false }), b: await this.w(`${pa}/z_to_p_trans_0/bias`, { half: false }) }),
     await o.linear({ x: zln, w: await this.w(`${pa}/z_to_p_trans_1/weight`, { half: false }), y: zp, rows: T * T, inC: 256, outC: 16 })]);
     const zpRead = o.read(zp);
-    o.run(pre);
-    o.free(rel, cat, zln, ...Object.values(ps));
+    await runStage(biases, zln);
     // the atom features and their window pair, on the host
     const host = await this.hostGroup(pa, ["proj_atom_continuous/weight", "embed_element/weight",
       ...[0, 1, 2, 3].map((i) => `embed_atom_name_chars_${i}/weight`), "embed_atompair_ref_pos/weight",
