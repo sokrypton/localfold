@@ -251,6 +251,9 @@ export function webglExecutionOptions(args, defaults = {}) {
     nanWatch: flag(args, "nan-watch"),
     host: flag(args, "host"),
     doubleLabels: pattern("double"),
+    // `--skip=<regex>`: no draws for those labels - the family's draw time, where `--double` reads free (Execution.skipLabels)
+    skipLabels: pattern("skip"),
+    noOpmOuterFirst: flag(args, "no-opm-outer-first"),
     skipDraws: flag(args, "skip-draws"),
     noTriangleTranspose: flag(args, "no-triangle-transpose"),
     noTriangleSplit: flag(args, "no-triangle-split"),
