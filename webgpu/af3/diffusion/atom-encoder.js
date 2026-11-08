@@ -744,7 +744,40 @@ export function outputRowTileFor(queryRows, target = 256) {
   return 1;
 }
 
+/** The bytes of workgroup storage a WGSL source declares. */
+export function workgroupBytes(source) {
+  const sizes = { f32: 4, u32: 4, i32: 4, "vec2<f32>": 8, "vec4<f32>": 16, "vec4<u32>": 16 };
+  let total = 0;
+  for (const [, type, count] of source.matchAll(/var<workgroup>\s+\w+\s*:\s*array<\s*([\w<>]+?)\s*,\s*(\d+)\s*>/g)) {
+    if (sizes[type] === undefined) throw new Error(`workgroupBytes: no size for ${type}`);
+    total += sizes[type] * Number(count);
+  }
+  return total;
+}
+
+/**
+ * 🔴 THE TILE IS CAPPED BY THE DEVICE'S WORKGROUP STORAGE, WHICH NOTHING ASKED. The output kernel stages five arrays a
+ * tile of rows wide, so at a tile of 8 and 128 channels it takes 20,480 bytes where WebGPU guarantees 16,384 - and the
+ * rule picks 8 from 2048 query rows (about 256 tokens) up, so every AlphaFold 3 fold past that failed to create its
+ * pipeline on a minimum device (`test:spec-floor`'s 590-token row; every row before it was small enough for a tile of
+ * four). The tile the rule or a prior chose steps down until the sources fit; one the caller names is refused by name.
+ * `shape.workgroupStorageBytes` is `device.limits.maxComputeWorkgroupStorageSize`.
+ */
 export function createAtomBlockShaders(common, shape) {
+  const chosen = atomOutputRowTile(shape);
+  const limit = shape.workgroupStorageBytes;
+  for (const tile of [chosen, ...[4, 2, 1].filter((t) => t < chosen)]) {
+    const sources = atomBlockShadersAt(common, shape, tile);
+    const used = Math.max(...Object.values(sources).filter((v) => typeof v === "string").map(workgroupBytes));
+    if (limit === undefined || used <= limit) return sources;
+    if (shape.outputRowTile !== undefined || tile === 1) {
+      throw new RangeError(`the atom block at a row tile of ${tile} takes ${used} bytes of workgroup storage, `
+        + `past this device's ${limit}`);
+    }
+  }
+}
+
+function atomOutputRowTile(shape) {
   // 🔴 THE 256 IS A WORKGROUP TARGET AND IT IS AN M2'S. This rule takes the
   // largest row tile that still leaves 256 workgroups, which is the right
   // number for a device with a handful of cores and not for one with 108: at
@@ -767,10 +800,13 @@ export function createAtomBlockShaders(common, shape) {
   // from the mechanism rather than from the table. Priced with
   // `--no-prior=atomRowTile` against the derived baseline: 2858 ms of sampler
   // to 2433, the largest single piece left once the K split is derived.
-  const outputRowTile = shape.outputRowTile
+  return shape.outputRowTile
     ?? (rowRule === undefined
       ? outputRowTileFor(queryRows, shape.workgroupTarget ?? 256)
       : (queryRows < rowRule.crossover ? rowRule.below : rowRule.atOrAbove));
+}
+
+function atomBlockShadersAt(common, shape, outputRowTile) {
   const { channels, keys, perTokenChannels } = shape;
   // The atom attention's mask bias: a product under AlphaFold 3 and a sum under
   // OpenDDE. See the note at `attendFor`.
@@ -2058,6 +2094,7 @@ export class Af3AtomEncoderGpu {
       perBlockPair, keyMaskedAtomAttention: keyMasked, upGate,
       atomRowTile: shapedKnob(deviceTuning(this.device).atomRowTile),
       workgroupTarget: derivedWorkgroupTarget(this.device),
+      workgroupStorageBytes: this.device.limits.maxComputeWorkgroupStorageSize,
     };
     const sources = createAtomEncoderShaders(shape, pairPacked.offsets, blockPacked[0].offsets);
     const base = `af3-atom:${tokens}:${dense}:${subsets}:${queries}:${keys}`
