@@ -3412,3 +3412,8 @@ take it through `transition`'s `residualOf`, so their `elementwise.add` goes. Bi
 The triangle multiplications too: `residualOf` makes their last draw `pair + projected * gate` where it was a multiply
 and the caller's add. Not bit-identical (the driver may fuse the multiply-add): pLDDT 94.014 -> 94.020, worst atom
 against WebGPU 0.116 -> 0.102 A; trunk median 1355 -> 1341 ms.
+
+Measured and NOT kept: the diffusion attention's output projection reading the flash planes directly with AdaLN-zero's
+gate and residual in the same draw (`attention.interleave`, `linear:59x768x768` and `adaln.zero-slice` as one).
+Bit-identical, and diffusion 2850 -> 2843 ms - nothing. Two small draws a block are not what that path costs; the
+removals that paid (the repacks, the transposes) each took a full pass over a 3481-row or 3072-wide tensor with them.
