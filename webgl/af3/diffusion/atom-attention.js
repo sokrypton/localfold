@@ -75,21 +75,30 @@ export function adaptiveLayerNorm(execution, call) {
   const condChannels = call.condChannels ?? channels;
   // Neither a scale nor an offset: the conditioning supplies both below.
   const normalised = layerNorm(execution, { x, rows, channels, epsilon });
-  // ...and the conditioning gets a scale but NO offset before it is projected.
-  const condNormalised = layerNorm(execution, {
-    x: cond, weight: w[`${prefix}SingleCondLayerNormScale`],
-    rows, channels: condChannels, epsilon,
-  });
-  const scale = linear(execution, {
-    x: condNormalised, weight: w[`${prefix}SingleCondScaleWeights`],
-    bias: w[`${prefix}SingleCondScaleBias`],
-    rows, inChannels: condChannels, outChannels: channels, weightLayout: "in-major",
-  });
-  const shift = linear(execution, {
-    x: condNormalised, weight: w[`${prefix}SingleCondBias`],
-    rows, inChannels: condChannels, outChannels: channels, weightLayout: "in-major",
-  });
-  execution.release(condNormalised);
+  // 🔴 A CONDITIONING THAT DOES NOT CHANGE KEEPS ITS PROJECTIONS: `cond.adalnMemo` (a Map, set by whoever owns a
+  // conditioning that lives for a whole walk - the atom encoder's `atomCache`) holds this AdaLN's scale and shift,
+  // keyed by its weight, and the memo's owner releases them.
+  const memo = cond.adalnMemo;
+  const memoKey = w[`${prefix}SingleCondScaleWeights`];
+  let { scale, shift } = memo?.get(memoKey) ?? {};
+  if (scale === undefined) {
+    // ...and the conditioning gets a scale but NO offset before it is projected.
+    const condNormalised = layerNorm(execution, {
+      x: cond, weight: w[`${prefix}SingleCondLayerNormScale`],
+      rows, channels: condChannels, epsilon,
+    });
+    scale = linear(execution, {
+      x: condNormalised, weight: w[`${prefix}SingleCondScaleWeights`],
+      bias: w[`${prefix}SingleCondScaleBias`],
+      rows, inChannels: condChannels, outChannels: channels, weightLayout: "in-major",
+    });
+    shift = linear(execution, {
+      x: condNormalised, weight: w[`${prefix}SingleCondBias`],
+      rows, inChannels: condChannels, outChannels: channels, weightLayout: "in-major",
+    });
+    execution.release(condNormalised);
+    memo?.set(memoKey, { scale, shift });
+  }
   const out = execution.allocate(rows * channels, `af3.adaln.${prefix || "block"}`);
   execution.dispatch({
     source: adaptiveBlendSource(rows, channels),
@@ -97,8 +106,20 @@ export function adaptiveLayerNorm(execution, call) {
     inputs: { normalisedTex: normalised, scaleTex: scale, shiftTex: shift },
     label: `af3.adaln.blend:${rows}x${channels}`,
   });
-  for (const tensor of [normalised, scale, shift]) execution.release(tensor);
+  execution.release(normalised);
+  if (memo === undefined) {
+    execution.release(scale);
+    execution.release(shift);
+  }
   return out;
+}
+
+/** Release what a conditioning's `adalnMemo` holds, and drop the memo. */
+export function releaseAdalnMemo(execution, cond) {
+  for (const entry of cond?.adalnMemo?.values() ?? []) {
+    for (const tensor of Object.values(entry)) execution.release(tensor);
+  }
+  if (cond !== undefined && cond !== null) delete cond.adalnMemo;
 }
 
 /**
@@ -117,12 +138,19 @@ export function adaptiveZeroInit(execution, call) {
     x, weight: w[`${prefix}Transition2`], rows,
     inChannels, outChannels: channels, weightLayout: "in-major",
   });
-  const gate = linear(execution, {
-    x: cond, weight: w[`${prefix}AdaptiveZeroCondWeights`],
-    bias: w[`${prefix}AdaptiveZeroCondBias`],
-    rows, inChannels: condChannels, outChannels: channels,
-    weightLayout: "in-major", activation: "sigmoid",
-  });
+  // ...the gate memoised the same way as `adaptiveLayerNorm`'s scale and shift
+  const memo = cond.adalnMemo;
+  const memoKey = w[`${prefix}AdaptiveZeroCondWeights`];
+  let gate = memo?.get(memoKey)?.gate;
+  if (gate === undefined) {
+    gate = linear(execution, {
+      x: cond, weight: w[`${prefix}AdaptiveZeroCondWeights`],
+      bias: w[`${prefix}AdaptiveZeroCondBias`],
+      rows, inChannels: condChannels, outChannels: channels,
+      weightLayout: "in-major", activation: "sigmoid",
+    });
+    memo?.set(memoKey, { gate });
+  }
   const out = execution.allocate(rows * channels, "af3.adaln.zero");
   execution.dispatch({
     source: elementwiseProductSource(rows * channels),
@@ -131,7 +159,7 @@ export function adaptiveZeroInit(execution, call) {
     label: `af3.adaln.zero:${rows}x${channels}`,
   });
   execution.release(projected);
-  execution.release(gate);
+  if (memo === undefined) execution.release(gate);
   return out;
 }
 

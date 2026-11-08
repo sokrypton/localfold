@@ -46,7 +46,7 @@
  * so a token with three atoms of a 24-slot row divides by three.
  */
 import { ONE_TARGET, PRELUDE, sized, part, memoSource } from "../../runtime/execution.js";
-import {
+import { releaseAdalnMemo,
   atomPairLogits, crossAttentionBlock, gather, sumSource,
 } from "./atom-attention.js";
 import { layerNorm } from "../../kernels/layer-norm.js";
@@ -200,6 +200,158 @@ export function atomCrossAttentionEncoder(execution, call) {
   const queryRows = subsets * queries;
   const keyRows = subsets * keys;
 
+  // 🔴 EVERYTHING UP TO THE POSITIONS IS THE SAME ON EVERY DENOISER STEP: the per-atom conditioning, the trunk's
+  // single and pair, the reference positions and spaces - none of them reads the noise. A walk that passes
+  // `atomCache` (denoiserFromHead) computes it on the first step and reads it after; the cache's owner releases it.
+  const cache = call.atomCache;
+  let conditioned = cache?.encoder;
+  if (conditioned === undefined) {
+    conditioned = encoderConditioning(execution, call);
+    if (cache !== undefined) {
+      cache.encoder = conditioned;
+      conditioned.queriesCond.adalnMemo = new Map();
+      conditioned.keysCond.adalnMemo = new Map();
+    }
+  }
+  const { queriesCond, keysCond, queriesMaskTensor, keysMaskTensor, pair, logits } = conditioned;
+  const kept = cache !== undefined;
+  // The query activation: the conditioning base, plus the noisy positions where the head supplies them - into a
+  // fresh tensor, because the block stack releases what it is handed.
+  let queriesAct;
+  if (call.tokenAtomsAct === undefined) {
+    queriesAct = execution.allocate(queryRows * channels, "af3.encoder.act");
+    execution.dispatch({
+      source: copySource(queryRows * channels),
+      output: queriesAct,
+      inputs: { xTex: conditioned.queriesActBase },
+      label: `af3.encoder.act:${queryRows}x${channels}`,
+    });
+    if (!kept) execution.release(conditioned.queriesActBase);
+  } else {
+    queriesAct = conditioned.queriesActBase;
+  }
+  if (call.tokenAtomsAct !== undefined) {
+    const gatheredPositions = execution.allocate(queryRows * 4, "af3.encoder.positions");
+    execution.dispatch({
+      source: vec3GatherSource(queryRows, 3),
+      output: gatheredPositions,
+      inputs: {
+        sourceTex: call.tokenAtomsAct, indicesTex: gathers.tokenAtomsToQueries.indices,
+        maskTex: gathers.tokenAtomsToQueries.mask,
+      },
+      label: `af3.encoder.gather-positions:${queryRows}`,
+    });
+    const positional = execution.allocate(queryRows * channels, "af3.encoder.positional");
+    execution.dispatch({
+      source: positionToFeaturesSource(queryRows, channels),
+      output: positional,
+      inputs: {
+        positionsTex: gatheredPositions, weightTex: w.atomPositionsToFeatures,
+        maskTex: queriesMaskTensor, actTex: queriesAct,
+      },
+      label: `af3.encoder.positional:${queryRows}x${channels}`,
+    });
+    execution.release(gatheredPositions);
+    if (!kept) execution.release(queriesAct);
+    queriesAct = positional;
+  }
+
+  call.onStage?.("encoder.queriesCond", queriesCond);
+
+  // 🔴 intellifold2 AND chai1 PAD THE FLAT ATOM AXIS INSIDE EVERY ATTENTION
+  // CALL, "so a block starts from a freshly zeroed padding rather than from
+  // whatever the previous block's residual left there" - the same mask this
+  // function applies after the stack, applied before each block as well. No
+  // default: AF3 pads once.
+  if (typeof call.maskAtomActPerBlock !== "boolean") {
+    throw new Error(
+      "af3 atom encoder: maskAtomActPerBlock has no default - AF3 pads the flat atom"
+      + " axis once and intellifold2 and chai1 per block");
+  }
+  let act = queriesAct;
+  for (const [index, block] of w.blocks.entries()) {
+    if (call.maskAtomActPerBlock) {
+      const padded = execution.allocate(queryRows * channels, "af3.encoder.repadded");
+      execution.dispatch({
+        source: maskRowsSource(queryRows, channels),
+        output: padded,
+        inputs: { xTex: act, maskTex: queriesMaskTensor },
+        label: `af3.encoder.repad:${queryRows}x${channels}`,
+      });
+      execution.release(act);
+      act = padded;
+    }
+    const next = crossAttentionBlock(execution, {
+      queriesAct: act, queriesToKeys: gathers.queriesToKeys.indices,
+      queriesMask: queriesMaskTensor, keysMask: keysMaskTensor,
+      queriesCond, keysCond, pairLogits: logits[index],
+      subsets, queries, keys, channels, heads: w.heads, dimension: w.dimension,
+      weights: block,
+      keyMaskedAtomAttention: call.keyMaskedAtomAttention,
+      chainedAtomLayerNorm: call.chainedAtomLayerNorm,
+      diffusionNoResidual: call.diffusionNoResidual,
+      epsilon,
+    });
+    execution.release(act);
+    act = next;
+  }
+  if (!kept) for (const tensor of logits) execution.release(tensor);
+
+  const masked = execution.allocate(queryRows * channels, "af3.encoder.stack-out");
+  execution.dispatch({
+    source: maskRowsSource(queryRows, channels),
+    output: masked,
+    inputs: { xTex: act, maskTex: queriesMaskTensor },
+    label: `af3.encoder.stack-mask:${queryRows}x${channels}`,
+  });
+  execution.release(act);
+  call.onStage?.("encoder.stackOut", masked);
+
+  const perToken = w.perTokenChannels;
+  const projected = linear(execution, {
+    x: masked, weight: w.projectAtomFeaturesForAggr, rows: queryRows,
+    inChannels: channels, outChannels: perToken, weightLayout: "in-major",
+  });
+  call.onStage?.("encoder.projectForAggr", projected);
+  const tokenAtoms = gather(execution, {
+    source: projected, indices: gathers.queriesToTokenAtoms.indices,
+    mask: gathers.queriesToTokenAtoms.mask, count: tokens * dense, channels: perToken,
+  });
+  execution.release(projected);
+  const tokenAct = execution.allocate(tokens * perToken, "af3.encoder.token-act");
+  execution.dispatch({
+    source: aggregateSource(tokens, dense, perToken),
+    output: tokenAct,
+    inputs: { projectedTex: tokenAtoms, maskTex: atomMask },
+    label: `af3.encoder.aggregate:${tokens}x${dense}x${perToken}`,
+  });
+  execution.release(tokenAtoms);
+
+  return {
+    tokenAct,
+    skipConnection: masked,
+    queriesMask: queriesMaskTensor,
+    keysMask: keysMaskTensor,
+    queriesCond,
+    keysCond,
+    pairCond: pair,
+    // ...the five above are the walk's (`atomCache`) and its owner releases them, not the head
+    conditioningKept: kept,
+  };
+}
+
+/**
+ * The atom encoder's noise-independent half: the query and key conditioning and masks, the atom-pair conditioning
+ * and its per-block attention biases, and the query activation before the noisy positions are added
+ * (`queriesActBase`). See `atomCrossAttentionEncoder`'s `atomCache`.
+ */
+function encoderConditioning(execution, call) {
+  const { conditioning, atomMask, refPos, refSpaceUid, gathers, weights: w, epsilon = 1e-5 } = call;
+  const { tokens, subsets, queries, keys } = call.shape;
+  const channels = w.channels;
+  const pairChannels = w.pairChannels;
+  const queryRows = subsets * queries;
+  const keyRows = subsets * keys;
   // The per-atom conditioning onto the query layout, and its mask.
   let queriesCond = gather(execution, {
     source: conditioning, indices: gathers.tokenAtomsToQueries.indices,
@@ -307,33 +459,7 @@ export function atomCrossAttentionEncoder(execution, call) {
       label: `af3.encoder.act:${queryRows}x${channels}`,
     });
   }
-  if (call.tokenAtomsAct !== undefined) {
-    const gatheredPositions = execution.allocate(queryRows * 4, "af3.encoder.positions");
-    execution.dispatch({
-      source: vec3GatherSource(queryRows, 3),
-      output: gatheredPositions,
-      inputs: {
-        sourceTex: call.tokenAtomsAct, indicesTex: gathers.tokenAtomsToQueries.indices,
-        maskTex: gathers.tokenAtomsToQueries.mask,
-      },
-      label: `af3.encoder.gather-positions:${queryRows}`,
-    });
-    const positional = execution.allocate(queryRows * channels, "af3.encoder.positional");
-    execution.dispatch({
-      source: positionToFeaturesSource(queryRows, channels),
-      output: positional,
-      inputs: {
-        positionsTex: gatheredPositions, weightTex: w.atomPositionsToFeatures,
-        maskTex: queriesMaskTensor, actTex: queriesAct,
-      },
-      label: `af3.encoder.positional:${queryRows}x${channels}`,
-    });
-    execution.release(gatheredPositions);
-    execution.release(queriesAct);
-    queriesAct = positional;
-  }
 
-  call.onStage?.("encoder.queriesCond", queriesCond);
 
   // The pair conditioning's row and column terms, off the RECTIFIED cond.
   const rectifiedQueries = relu(execution, queriesCond);
@@ -488,84 +614,22 @@ export function atomCrossAttentionEncoder(execution, call) {
     epsilon,
   });
 
-  // 🔴 intellifold2 AND chai1 PAD THE FLAT ATOM AXIS INSIDE EVERY ATTENTION
-  // CALL, "so a block starts from a freshly zeroed padding rather than from
-  // whatever the previous block's residual left there" - the same mask this
-  // function applies after the stack, applied before each block as well. No
-  // default: AF3 pads once.
-  if (typeof call.maskAtomActPerBlock !== "boolean") {
-    throw new Error(
-      "af3 atom encoder: maskAtomActPerBlock has no default - AF3 pads the flat atom"
-      + " axis once and intellifold2 and chai1 per block");
+  return { queriesCond, keysCond, queriesMaskTensor, keysMaskTensor, pair, logits, queriesActBase: queriesAct };
+}
+
+/** Release a walk's `atomCache` (the encoder's conditioning, the decoder's biases, both AdaLN memos). */
+export function releaseAtomCache(execution, cache) {
+  if (cache === undefined) return;
+  const c = cache.encoder;
+  if (c !== undefined) {
+    releaseAdalnMemo(execution, c.queriesCond);
+    releaseAdalnMemo(execution, c.keysCond);
+    for (const tensor of [c.queriesCond, c.keysCond, c.queriesMaskTensor, c.keysMaskTensor, c.pair,
+      c.queriesActBase, ...c.logits]) execution.release(tensor);
   }
-  let act = queriesAct;
-  for (const [index, block] of w.blocks.entries()) {
-    if (call.maskAtomActPerBlock) {
-      const padded = execution.allocate(queryRows * channels, "af3.encoder.repadded");
-      execution.dispatch({
-        source: maskRowsSource(queryRows, channels),
-        output: padded,
-        inputs: { xTex: act, maskTex: queriesMaskTensor },
-        label: `af3.encoder.repad:${queryRows}x${channels}`,
-      });
-      execution.release(act);
-      act = padded;
-    }
-    const next = crossAttentionBlock(execution, {
-      queriesAct: act, queriesToKeys: gathers.queriesToKeys.indices,
-      queriesMask: queriesMaskTensor, keysMask: keysMaskTensor,
-      queriesCond, keysCond, pairLogits: logits[index],
-      subsets, queries, keys, channels, heads: w.heads, dimension: w.dimension,
-      weights: block,
-      keyMaskedAtomAttention: call.keyMaskedAtomAttention,
-      chainedAtomLayerNorm: call.chainedAtomLayerNorm,
-      diffusionNoResidual: call.diffusionNoResidual,
-      epsilon,
-    });
-    execution.release(act);
-    act = next;
-  }
-  for (const tensor of logits) execution.release(tensor);
-
-  const masked = execution.allocate(queryRows * channels, "af3.encoder.stack-out");
-  execution.dispatch({
-    source: maskRowsSource(queryRows, channels),
-    output: masked,
-    inputs: { xTex: act, maskTex: queriesMaskTensor },
-    label: `af3.encoder.stack-mask:${queryRows}x${channels}`,
-  });
-  execution.release(act);
-  call.onStage?.("encoder.stackOut", masked);
-
-  const perToken = w.perTokenChannels;
-  const projected = linear(execution, {
-    x: masked, weight: w.projectAtomFeaturesForAggr, rows: queryRows,
-    inChannels: channels, outChannels: perToken, weightLayout: "in-major",
-  });
-  call.onStage?.("encoder.projectForAggr", projected);
-  const tokenAtoms = gather(execution, {
-    source: projected, indices: gathers.queriesToTokenAtoms.indices,
-    mask: gathers.queriesToTokenAtoms.mask, count: tokens * dense, channels: perToken,
-  });
-  execution.release(projected);
-  const tokenAct = execution.allocate(tokens * perToken, "af3.encoder.token-act");
-  execution.dispatch({
-    source: aggregateSource(tokens, dense, perToken),
-    output: tokenAct,
-    inputs: { projectedTex: tokenAtoms, maskTex: atomMask },
-    label: `af3.encoder.aggregate:${tokens}x${dense}x${perToken}`,
-  });
-  execution.release(tokenAtoms);
-
-  return {
-    tokenAct,
-    skipConnection: masked,
-    queriesMask: queriesMaskTensor,
-    keysMask: keysMaskTensor,
-    queriesCond,
-    keysCond,
-    pairCond: pair,
-  };
+  for (const tensor of cache.decoderLogits ?? []) execution.release(tensor);
+  delete cache.encoder;
+  delete cache.decoderLogits;
 }
 
 /** A one-channel gather; `gather` needs a multiple of four. */
