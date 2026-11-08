@@ -84,7 +84,7 @@ static int foldMain(int argc, char** argv) {
     if (un.find(",transition,") != std::string::npos) FUSED_TRANSITION = false;
   }
   bool noGraphs = false;     // (--no-graphs: GRAPHS stays off where several GPUs turn it back on)
-  bool fast = false, doFold = false, profile = false; int repeat = 1, msaCap = 1024, steps = 200, recycles = 3, folds = 1, samples = 1; double recycleTolerance = 0;   // 3 recycles: the page's default
+  bool fast = false, doFold = false, profile = false, widenPair = false; int repeat = 1, msaCap = 1024, steps = 200, recycles = 3, folds = 1, samples = 1; double recycleTolerance = 0;   // 3 recycles: the page's default
   DiffusionOptions diffusion;     // --schedule=geometric, --update=exponential, --no-churn (sampler.cuh)
   // --af3-defaults: AlphaFold 3's own run_alphafold.py settings - 10 recycles (11 trunk passes) and
   // 5 diffusion samples - where the command does not set them; the plain defaults are the page's
@@ -114,6 +114,7 @@ static int foldMain(int argc, char** argv) {
     else if (!strcmp(argv[i], "--chai-second-order")) CHAI_SECOND_ORDER = true;     // chai-lab's two calls a step
     else if (!strcmp(argv[i], "--no-flash-split")) FLASH_SPLIT = false;
     else if (!strcmp(argv[i], "--no-tc-attn")) tc5a::TC_ATTN = false;   // flash8 (mma.sync) where tcgen05 would run
+    else if (!strcmp(argv[i], "--widen-pair")) widenPair = true;        // the pair widened to f32 past the trunk on a B200 too (KEEP_PAIR16's old arm)
     else if (!strcmp(argv[i], "--no-tc-pair")) ptc::PAIR_TC = false;    // the mma.sync pair-track kernels where tcgen05 would run
     else if (!strncmp(argv[i], "--folds=", 8)) folds = atoi(argv[i] + 8);
     else if (!strncmp(argv[i], "--steps=", 8)) steps = atoi(argv[i] + 8);
@@ -193,6 +194,7 @@ static int foldMain(int argc, char** argv) {
   const bool haveWeights = !weightsDir.empty() || !bundleDir.empty();
   bool seedGiven = false;
   for (int i = 2; i < argc; ++i) if (!strncmp(argv[i], "--seed=", 7)) seedGiven = true;
+  KEEP_PAIR16 = fast && !widenPair && ptc::PAIR_TC && ptc::ready();   // (common.cuh: the pair bf16 past the trunk on a B200)
   if (af3Defaults) {
     bool setR = false, setS = false;
     for (int i = 2; i < argc; ++i) {

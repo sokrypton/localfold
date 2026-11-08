@@ -487,6 +487,10 @@ inline void usePair16(Trunk& t, bool on) {
     t.prevPair = t.inPlaceRecycle ? nullptr : on ? reinterpret_cast<float*>(poolAllocT<__nv_bfloat16>(pc)) : poolAlloc(pc);
     t.p16 = on;
   }
+  // (a pair kept bf16 past the trunk - TRUNK_PAIR16 - gives prevPair back at the trunk's end, so the next fold of the
+  // same precision makes it again: memset on the null prevPair was "CUDA invalid argument" on every fold after the first)
+  if (!t.prevPair && !t.inPlaceRecycle)
+    t.prevPair = on ? reinterpret_cast<float*>(poolAllocT<__nv_bfloat16>(pc)) : poolAlloc(pc);
   CK(cudaMemsetAsync(t.inPlaceRecycle ? t.pair : t.prevPair, 0, (sharded(t) ? heldPairs(t) * t.C : pc) * e, STREAM));
 }
 // ...and back to f32 when the trunk is done: the heads, the diffusion and the confidence head read an f32 pair, and
