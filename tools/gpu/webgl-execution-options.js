@@ -237,6 +237,9 @@ export function webglExecutionOptions(args, defaults = {}) {
     poolLimitBytes: option(args, "pool-mib", null) !== null ? Number(option(args, "pool-mib", "0")) * 2 ** 20
       : defaults.poolLimitBytes ?? Infinity,
     halfWeights: !flag(args, "no-half-weights"),
+    // `--half-floor=<n>`: the smallest weight held in float16 (Storage.halfWeightFloor); the driver's, else 65536
+    ...(option(args, "half-floor", null) !== null ? { halfWeightFloor: Number(option(args, "half-floor", "0")) }
+      : defaults.halfWeightFloor === undefined ? {} : { halfWeightFloor: defaults.halfWeightFloor }),
     halfActivations: !flag(args, "no-half-x"),
     // 🔴 A DRIVER DEFAULT, BECAUSE THE MEASUREMENT DIFFERS BY MODEL. See
     // `--no-narrow-aligned-x` below; a driver opts in and either flag wins.

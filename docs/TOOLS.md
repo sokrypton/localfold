@@ -11,9 +11,9 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-479 tools. `tools/fixtures/` is data and is not listed.
+480 tools. `tools/fixtures/` is data and is not listed.
 
-## `tools/gpu/` - the WebGPU lane (284)
+## `tools/gpu/` - the WebGPU lane (285)
 
 Each exports `async function main(device, args)` and is run as
 `node tools/gpu-chrome.mjs tools/gpu/<module>.js [--flags]`.
@@ -281,6 +281,7 @@ Each exports `async function main(device, args)` and is run as
 - **`probe-webgl-gemm-ceiling.js`** - The MOST a fragment-shader GEMM can do on this device, measured.
 - **`probe-webgl-limits.js`** - The WebGL2 limits that decide what shape a kernel in this backend can be.
 - **`probe-webgl-linear-operand.js`** - Which OPERAND binds the WebGL2 dense projection - x, or the weight codes?
+- **`probe-webgl-packed-x.js`** - Whether reading a projection's x as EIGHT halves a texel (RGBA32UI, unpackHalf2x16) beats four (RGBA16F).
 - **`probe-webgl-precision.js`** - Does `mediump` reach this device's HALF arithmetic, and is it faster?
 - **`probe-webgl-programs.js`** - Which WebGL2 programs a fold compiles and what each one costs, for ANY of the fold tools - by wrapping one rather than by being one, as probe-compiles.js does for WGSL.
 - **`probe-webgl-uber.js`** - Does one program holding several small kernels (an "uber-shader", the kernel chosen by a uniform) link faster than the kernels as separate programs? Safari 16.3 links each program in ~19 ms on the page's thread whatever its size, so it would if that cost is per program. Small elementwise kernels in the fold's own style, linked both ways in fresh contexts.
