@@ -1184,6 +1184,9 @@ static int foldMain(int argc, char** argv) {
     if (df.graph) CK(cudaGraphExecDestroy(df.graph));
     df.preSingle = df.preSnProj = nullptr;
     releaseScratch();      // the next fold's trunk starts from the card it had
+    // (and rf3's chirality index, whose arrays were scratch: kept, the next fold read freed memory in chiralGradK - an
+    // illegal address on every fold after the first, --folds > 1, since before the tcgen05 work)
+    CHIRALITY = Chirality{};
     if (lastGroup && fi + 1 == folds) return 0;
   }
   std::function<void(const char*, const float*, size_t)> seam = [&](const char* name, const float* d, size_t n) {
