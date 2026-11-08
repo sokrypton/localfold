@@ -28,7 +28,7 @@
 //   nvcc -O2 -std=c++17 -arch=sm_80 --default-stream per-thread -o cuda/grad/train-of3 cuda/grad/train_of3.cu -lcublas -lcublasLt -ldl -lcurand
 //   cuda/grad/train-of3 --bundle=model-openbind0-f32 --family=openbind0 --examples=<file> [--steps=N] [--batch=1]
 //       [--crop=384] [--samples=48] [--lr=1.8e-3] [--warmup=1000] [--bond=0] [--save=<ckpt>] [--save-every=N]
-//       [--resume=<ckpt>] [--seed=1] [--init=bundle|of3] [--tf32] [--bf16] [--bf16-confidence] [--mem] [--diffusion-saves=auto|keep|recompute] [--offload-pairs] [--transition-chunk=64] [--no-dropout] [--val=<file>] [--smoke]
+//       [--resume=<ckpt>] [--seed=1] [--init=bundle|of3] [--tf32] [--bf16] [--bf16-confidence] [--mem] [--diffusion-saves=auto|keep|recompute] [--offload-pairs] [--transition-chunk=64] [--no-dropout] [--max-kept-saves=N] [--val=<file>] [--smoke]
 //       [--sample-batch=8|auto]
 // --check-ckpt=k / --check-perm=k / --check-bf16=k / --check-chunk=k: the recomputation, the truth's permutation, the bf16 trunk and the chunked transitions held
 // to their references on example k.
@@ -713,6 +713,7 @@ int main(int argc, char** argv) {
   int world = 1, rank = 0; std::string dp = "nccl", rendezvous;      // data parallel (of3dist.cuh)
   bool sameDraws = false;   // --same-draws: every rank rank 0's examples and draws (the averaging's check: one process's step)   // (dropInFixed: --check-ckpt's fixed draws with the masks on)
   std::string valPath; int valEvery = 0, valSamples = 5, valSteps = 200, valCrop = 1536; unsigned seed = 1; bool smoke = false, ckpt = true;
+  int maxKept = 1 << 30;   // --max-kept-saves=N: at most N pairformer blocks' saves kept past the forward (0: every block recomputed - OpenFold3's blocks_per_ckpt 1, the memory-minimal arm)
   double lrMax = 1.8e-3, bondWeight = 0; long warmup = 1000;
   for (int i = 1; i < argc; ++i) {
     auto opt = [&](const char* k) { const size_t l = strlen(k); return !strncmp(argv[i], k, l) ? argv[i] + l : nullptr; };
@@ -736,6 +737,7 @@ int main(int argc, char** argv) {
     else if (auto v = opt("--resume=")) resumePath = v;
     else if (!strcmp(argv[i], "--smoke")) smoke = true;
     else if (!strcmp(argv[i], "--no-ckpt")) ckpt = false;
+    else if (auto v = opt("--max-kept-saves=")) maxKept = atoi(v);
     else if (!strcmp(argv[i], "--no-dropout")) dropout = false;
     else if (!strcmp(argv[i], "--bf16")) bf16Trunk = true;
     else if (!strcmp(argv[i], "--bf16-confidence")) bf16Confidence = true;
@@ -1410,7 +1412,7 @@ int main(int argc, char** argv) {
     // (model.py: the recycle count from a generator every rank shares - the same number on every rank a step)
     std::mt19937_64 synced(seed * 1000003ull + (uint64_t)stepIndex);
     const int c = fixed ? 4 : 1 + (int)(synced() % (uint64_t)(maxRecycles + 1));
-    const int pfKeep = train && !fixed && ckpt && !a.off ? std::min(pfSeen.keep, nPf) : 0;
+    const int pfKeep = train && !fixed && ckpt && !a.off ? std::min({pfSeen.keep, nPf, maxKept}) : 0;
     cycles(d, a, c, [&] { drawMsa(d, e, gen); }, pfKeep);
     const auto t1 = now();
     // the mini-rollout, and on it the truth's permutation (model.py: before every loss of the step)
