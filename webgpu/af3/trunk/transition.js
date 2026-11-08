@@ -257,6 +257,9 @@ export function createTransitionShader(shape, offsets, epsilon, variance) {
   // workgroup memory, before it writes any of them, and no other workgroup
   // touches those rows - so the read-modify-write is safe within one dispatch.
   const residual = shape.residual ?? false;
+  // A range of the rows, from a uniform, so one track can go in several dispatches.
+  const rowRange = shape.rowRange ?? false;
+  if (rowRange && !residual) throw new Error("a transition over a row range is the in-place form only");
   // 🔴 AND THE ACCUMULATORS ARE A THIRD FORMAT, FOR THE THIRD REASON AGAIN.
   // `sum` is a WGSL ARRAY of `groups * channelsPerThread` vectors - the shape a
   // driver spills first - and this is the largest kernel in the trunk. Halving
@@ -337,7 +340,8 @@ ${residual
 // residual form means here anyway: this kernel reads every row it touches into
 // workgroup memory before it writes any of them.
 @group(0) @binding(0) var<storage, read_write> input: array<f32>;
-@group(0) @binding(1) var<storage, read> weights: array<${weightPrecision}>;`
+@group(0) @binding(1) var<storage, read> weights: array<${weightPrecision}>;${rowRange ? `
+@group(0) @binding(2) var<uniform> row_range: vec2<u32>;` : ""}`
   : `@group(0) @binding(0) var<storage, read> input: array<f32>;
 @group(0) @binding(1) var<storage, read> weights: array<${weightPrecision}>;
 @group(0) @binding(2) var<storage, read_write> output: array<f32>;`}
@@ -363,8 +367,8 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   // workgroup reads the whole weight set: 196k floats for 3481 pair rows, which
   // is 2.7 GB a block. Tiling divides that by TILE and the arithmetic is
   // unchanged. The disable-and-remeasure bisect this replaced said 129 ms.
-  let base_row = (group.x + group.y * GRID_WIDTH) * TILE;
-  if (base_row >= ROWS) { return; }
+  let base_row = ${rowRange ? "row_range.x + " : ""}(group.x + group.y * GRID_WIDTH) * TILE;
+  if (base_row >= ${rowRange ? "row_range.y" : "ROWS"}) { return; }
   let local = local_id.x;
 
 ${channels % WORKGROUP === 0 && WORKGROUP <= 128 ? (() => {

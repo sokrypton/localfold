@@ -203,7 +203,7 @@ export async function residentTriangleOnDevice(device, options) {
       }
       const release = await runBlockUpload(device, planned.gpu, buffer);
       // Not awaited; see webgpu/af3/weights/device-weights.js for why.
-      void device.queue.onSubmittedWorkDone().then(release);
+      void device.queue.onSubmittedWorkDone().then(release, release);
     },
     variant);
 }
@@ -348,7 +348,7 @@ export async function residentGridOnDevice(device, options) {
                                  values.buffer, values.byteOffset, values.byteLength);
       }
       const release = await runBlockUpload(device, planned.gpu, buffer);
-      void device.queue.onSubmittedWorkDone().then(release);
+      void device.queue.onSubmittedWorkDone().then(release, release);
     },
     variant);
 }

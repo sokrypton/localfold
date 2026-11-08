@@ -496,6 +496,27 @@ export const SINGLE_SEQUENCE_FAMILIES = ["ef2-fast-600m", "ef2-fast-300m"];
 export const AF3_FAMILIES = ["af3", "openbind0", "opendde", "boltz2", "protenix2",
                              "intellifold2", "rosettafold3", "mol1"];
 
+/**
+ * The families the WebGL2 fold can actually run - the fallback a browser without WebGPU gets.
+ *
+ * 🔴 IT IS A SUBSET OF `AF3_FAMILIES` AND THE REST IS NOT A DETAIL. `webgl/af3/trunk/template.js`
+ * implements AlphaFold 3's UNFUSED template embedder - a projection per feature, keyed on
+ * `template_pair_embedding_8` - and four of the eight lineage bundles carry the FUSED one instead
+ * (boltz2, protenix2, mol1, rosettafold3: 108/109 columns through one projection, see
+ * tools/gpu/check-fused-template-features.js). Those bundles have no `template_pair_embedding_8`
+ * at all, so the fold dies with "af3 template weights: templatePairEmbedding8 is missing" AFTER
+ * the visitor has downloaded half a gigabyte of parameters. Measured, not assumed: protenix2
+ * folds on WebGPU at pLDDT 62.2 and fails on WebGL2 at that line.
+ *
+ * 🔴 AND OpenDDE IS OFF IT FOR A SECOND REASON. It re-tokenises after the trunk (its structural
+ * tokens, its own expander, refiner and confidence head) and the WebGL2 fold refuses it by name
+ * already - it has the template weights and still cannot fold.
+ *
+ * `test/webgl2-families.test.js` holds this list to the manifests in BOTH directions, so a bundle
+ * that gains or loses the unfused embedder cannot leave it quietly wrong.
+ */
+export const WEBGL2_FAMILIES = ["af3", "openbind0", "intellifold2"];
+
 /** @typedef {keyof typeof MODEL_BUNDLES} ModelFamily */
 
 /**

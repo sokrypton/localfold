@@ -40,7 +40,7 @@ import { DeferredValidation } from "../../runtime/validation.js";
 const asFloats = (values) =>
   (values instanceof Float32Array ? values : Float32Array.from(values));
 import { boltz2ContactTable } from "../../../shared/af3/featurise/constraints.js";
-import { tmPerBinFor, tmScoreD0 } from "../../../shared/heads/tm-score.js";
+import { chainTmInfo, tmPerBinFor, tmScoreD0 } from "../../../shared/heads/tm-score.js";
 // 🔴 THE ONE THING THIS FILE SHARES WITH THE CPU REFERENCE, and it is a
 // STATISTIC rather than a kernel: rf3's confidence inputs are normalised on the
 // host before any of this runs. Sharing a kernel would make the differential
@@ -792,10 +792,16 @@ const W_PAE_INTER: u32 = ${headOffsets.paeInterLogits}u;` : ""}
 // and this shader is the only place it exists - the head keeps the expectation
 // alone. Reading the logits back would be tokens^2 * 64 floats; the term they
 // reduce to is tokens^2, which is 64x smaller and is all either score wants.
+// [0, PAIRS) the global term (d0 from every token: pTM, ipTM), [PAIRS, 2 PAIRS)
+// AlphaFold 3's interface term (d0 from the pair's chains: chain_pair_iptm,
+// chain_ptm) - one buffer, because the spec's floor is 8 storage bindings.
 @group(0) @binding(5) var<storage, read_write> tm_adjusted: array<f32>;
+// The interface term's tables (shared/heads/tm-score.js, chainTmInfo): each
+// token's chain index, the chain count, a chain pair's bins' weights.
+@group(0) @binding(6) var<storage, read> chain_info: array<f32>;
 ${splitHeads ? `// The chain identity, for the intra/inter split. Five rows of TOKENS, the
 // layout the embedder uses; only asym_id is read here.
-@group(0) @binding(6) var<storage, read> features: array<i32>;` : ""}
+@group(0) @binding(7) var<storage, read> features: array<i32>;` : ""}
 
 // The row's normalised activations, staged once: the PDE's own normalisation of
 // this row and of its transpose, and the PAE's of this row.
@@ -947,6 +953,19 @@ ${preSymmetrised ? "" : "      half_other += norm_transposed[c] * half_weight;"}
       tm_term += (exp(aligned[b] - pae_largest) / pae_sum) * TM_PER_BIN[b];
     }
     tm_adjusted[row] = tm_term;
+    // ...and the interface term, on the same distribution with the pair's
+    // chains' weights (zero where either token is not live)
+    let chain_i = i32(chain_info[row / TOKENS]);
+    let chain_j = i32(chain_info[row % TOKENS]);
+    var tm_chain = 0.0;
+    if (chain_i >= 0 && chain_j >= 0) {
+      let chains = u32(chain_info[TOKENS]);
+      let table = TOKENS + 1u + (u32(chain_i) * chains + u32(chain_j)) * BINS;
+      for (var b = 0u; b < BINS; b += 1u) {
+        tm_chain += (exp(aligned[b] - pae_largest) / pae_sum) * chain_info[table + b];
+      }
+    }
+    tm_adjusted[PAIRS + row] = tm_chain;
   }
 }`;
 
@@ -1470,8 +1489,13 @@ export class Af3ConfidenceHeadGpu {
         storage | GPUBufferUsage.COPY_SRC));
       const pae = keep(this.allocator.allocate("af3-conf.pae", pairs * 4,
         storage | GPUBufferUsage.COPY_SRC));
-      const tmAdjusted = keep(this.allocator.allocate("af3-conf.tm", pairs * 4,
+      const tmAdjusted = keep(this.allocator.allocate("af3-conf.tm", 2 * pairs * 4,
         storage | GPUBufferUsage.COPY_SRC));
+      // the interface term's chains: the head's asymId (fold.js passes the batch's), live by seqMask
+      const asymForTm = input.asymId ?? input.features?.asymId;
+      if (asymForTm === undefined) throw new Error("the confidence head needs asymId for chain_pair_iptm's interface term");
+      const chainInfo = keep(this.allocator.upload("af3-conf.chain-info",
+        chainTmInfo(Array.from({ length: tokens }, (unused, t) => asymForTm[t]), input.seqMask, errorBinCentres()), storage));
       const plddt = keep(this.allocator.allocate("af3-conf.plddt", tokens * dense * 4,
         storage | GPUBufferUsage.COPY_SRC));
       const resolved = keep(this.allocator.allocate("af3-conf.resolved", tokens * dense * 2 * 4,
@@ -1479,7 +1503,7 @@ export class Af3ConfidenceHeadGpu {
       const slices = [
         ["pde", pde, pairs * 4],
         ["pae", pae, pairs * 4],
-        ["tmAdjusted", tmAdjusted, pairs * 4],
+        ["tmAdjusted", tmAdjusted, 2 * pairs * 4],
         ["plddt", plddt, tokens * dense * 4],
         ["resolved", resolved, tokens * dense * 2 * 4],
         // ...and the stack's own output, only for the checker that compares it.
@@ -1537,7 +1561,7 @@ export class Af3ConfidenceHeadGpu {
         return keep(this.allocator.upload("af3-conf.h-features", data, storage));
       })() : null;
       run("pair-heads", compiled.pairHeads,
-          [pair, maskBuffer, weightBuffer, pde, pae, tmAdjusted,
+          [pair, maskBuffer, weightBuffer, pde, pae, tmAdjusted, chainInfo,
            ...(splitHeads ? [headFeatures] : [])],
           Math.min(pairs, GRID_WIDTH), Math.ceil(pairs / GRID_WIDTH));
       run("single-heads", compiled.singleHeads, [single, weightBuffer, plddt, resolved], tokens);
@@ -1555,6 +1579,9 @@ export class Af3ConfidenceHeadGpu {
         output[name] = mapped.slice(offset / 4, (offset + bytes) / 4);
       }
       readback.buffer.unmap();
+      // the two TM terms apart: tmAdjusted the global (pTM, ipTM), tmInterface AF3's interface one (the chain scores)
+      output.tmInterface = output.tmAdjusted.slice(pairs);
+      output.tmAdjusted = output.tmAdjusted.slice(0, pairs);
       return output;
     } finally {
       for (let index = allocations.length - 1; index >= 0; index -= 1) allocations[index].release();

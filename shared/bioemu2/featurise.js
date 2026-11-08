@@ -38,6 +38,8 @@
  */
 import { loopOf, ELEMENT_SYMBOLS } from "../af3/featurise/ccd-component.js";
 import { STANDARD_COMPONENTS } from "../af3/featurise/standard-components.js";
+import { CROSSLINKER_COMPONENTS, DIAZIRINE_ATOMS, NHS_ATOMS, crosslinker } from "../chem/crosslinkers.js";
+import { THREE_LETTER } from "../af3/structure/pdb.js";
 
 export const MAX_SEQS = 4092;
 export const MAX_PAIRED_SEQS = 8192;
@@ -172,7 +174,8 @@ function isLeavingAtomDonor(text, bondAtomNames) {
 }
 
 function componentText(ccd, code) {
-  const text = STANDARD_COMPONENTS[code] ?? ccd?.(code);
+  // (a crosslinker's bridge is built in, as on the AF3 path: XL-<name> is no CCD entry)
+  const text = STANDARD_COMPONENTS[code] ?? CROSSLINKER_COMPONENTS[code] ?? ccd?.(code);
   if (text == null) throw new Error(`${code} is not in the CCD`);
   return text;
 }
@@ -675,5 +678,61 @@ export function bioemu2JobFromAf3Json(json) {
       }
     }
   }
-  return { chains, bondedAtomPairs: json.bondedAtomPairs ?? [] };
+  const bondedAtomPairs = [...(json.bondedAtomPairs ?? [])];
+  crosslinkChains(json.crosslinks ?? [], chains, bondedAtomPairs);
+  return { chains, bondedAtomPairs };
+}
+
+/** A..Z, then AA, AB, ... - a fresh chain id, as the page letters chains (web/entities.js chainLetter). */
+function chainLetterAt(index) {
+  let out = "";
+  for (let n = index + 1; n > 0; n = Math.floor((n - 1) / 26)) out = String.fromCharCode(65 + ((n - 1) % 26)) + out;
+  return out;
+}
+
+/**
+ * af3x's `crosslinks`, which BioEmu2 reads as what they are: each pair a ligand chain of the crosslinker's reacted
+ * bridge (its built-in component, XL-<name>) after every other chain, bonded to its two residues through
+ * `bondedAtomPairs` - the one place this featuriser takes a bond, which `token_bonds` carries to the model. The ends
+ * are the AlphaFold 3-lineage path's (web/entities.js expandEntities): an NHS-ester end to K NZ / S OG / T OG1 / Y OH
+ * or residue 1's N, a diazirine end to the residue's last side-chain atom. The bridge's id is the first letter no
+ * chain has. (cuda/featurise/bioemu2_features.h is the twin.)
+ */
+function crosslinkChains(crosslinks, chains, bonds) {
+  const used = new Set(chains.map((chain) => chain.id));
+  let next = 0;
+  const freshId = () => {
+    while (used.has(chainLetterAt(next))) next += 1;
+    const id = chainLetterAt(next);
+    used.add(id);
+    return id;
+  };
+  crosslinks.forEach((entry, index) => {
+    const xl = crosslinker(entry.name);
+    if (xl === null) throw new Error(`BioEmu2: crosslinks[${index}]: unknown crosslinker ${entry.name}`);
+    for (const pair of entry.residue_pairs ?? []) {
+      const ends = pair.map(([chainId, residue], k) => {
+        const where = `crosslink ${entry.name}: ${chainId}${residue}`;
+        const chain = chains.find((one) => one.id === chainId);
+        if (chain?.kind !== "protein") throw new Error(`BioEmu2: ${where} is not a protein residue`);
+        if (!(residue >= 1 && residue <= chain.sequence.length)) throw new Error(`BioEmu2: ${where} is past the chain's end`);
+        const modified = (chain.modifications ?? []).find((m) => m.position === residue);
+        const restype = modified?.code ?? THREE_LETTER[chain.sequence[residue - 1]] ?? "UNK";
+        let atom;
+        if (xl.ends[k] === "nhs") {
+          atom = NHS_ATOMS[restype] ?? (residue === 1 ? "N" : undefined);
+          if (atom === undefined) {
+            throw new Error(`BioEmu2: ${where}: an NHS ester reacts with K, S, T, Y or the N-terminus, not ${restype}`);
+          }
+        } else {
+          atom = DIAZIRINE_ATOMS[restype];
+          if (atom === undefined) throw new Error(`BioEmu2: ${where}: no side-chain atom known for ${restype}`);
+        }
+        return [chainId, residue, atom];
+      });
+      const id = freshId();
+      chains.push({ id, kind: "ligand", ccdCodes: [xl.code], smiles: null });
+      ends.forEach((end, k) => bonds.push([end, [id, 1, xl.attach[k]]]));
+    }
+  });
 }

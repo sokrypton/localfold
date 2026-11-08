@@ -23,7 +23,7 @@ import { fileURLToPath } from "node:url";
  * moving them could not create a new edge, and both cycles closed.
  */
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const TREES = ["shared", "cpu", "webgpu"];
+const TREES = ["shared", "cpu", "webgpu", "webgl"];
 
 /**
  * 🔴 EMPTY, AND IT HAS BEEN EMPTY SINCE THE LAST CYCLE CLOSED. `af3 <->

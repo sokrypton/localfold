@@ -25,48 +25,31 @@
  * in registers and the running state never leaves them. Whether that pays for
  * the loss of the shared K/V tile is the question this file exists to answer.
  *
- * 🔴 AND NOTHING IMPORTS THIS FILE, WHICH IS DELIBERATE AND NOT DEAD CODE. Both
- * WebGL2 kernels - this one and its sibling - **exist for comparison, not as a
- * fallback anything selects**, and a census of `src/` finds them immediately:
- * 701 lines, zero importers, alongside `webgpu/index.js` and `webgpu/node.js`, which
- * are entry points. What they bought is written down in docs/DEVELOPING.md and
- * is worth more than they cost: WebGL2 has no compute shaders, so it has no
- * workgroup memory and no barriers, and porting the attention kernel to it is
- * **what exposed how much the WGSL kernel was paying in barriers - the 11.4x**.
- * On a fair fight they are about 1.4x behind on the contraction and about 1.55x
- * ahead on attention, computing the same numbers.
+ * 🔴 NOTHING ON THE PAGE SELECTS THIS BACKEND YET, WHICH IS DELIBERATE AND NOT
+ * DEAD CODE. This file and its sibling were written as SPIKES - two kernels
+ * ported to answer whether a WebGL2 fallback is possible at all - and for a
+ * long while they sat in `webgpu/kernels/` with a `-webgl2` suffix and zero
+ * importers, where a dead-code sweep finds them immediately. They are the first
+ * two kernels of `webgl/` now, exported by `webgl/index.js`, which is a home
+ * rather than a verdict: `webgl/README.md` is what this backend is and is not.
+ *
+ * What they bought is worth more than they cost. WebGL2 has no compute shaders,
+ * so it has no workgroup memory and no barriers, and porting the attention
+ * kernel to it is **what exposed how much the WGSL kernel was paying in
+ * barriers - the 11.4x**. On a fair fight they are about 1.4x behind on the
+ * contraction and about 1.55x ahead on attention, computing the same numbers.
  *
  * Delete them and the next person to ask "would a barrier-free formulation
  * help?" starts from nothing.
  */
 
-const TEXTURE_WIDTH = 2048;
-const CHANNELS_PER_TEXEL = 4;
+import {
+  CHANNELS_PER_TEXEL, FULLSCREEN_TRIANGLE, TEXTURE_WIDTH, linkProgram, textureShape,
+} from "../runtime/context.js";
 
 /** Channels in a head, fixed: the model uses 32 and the eight-target trick assumes it. */
 export const HEAD_DIM = 32;
 const VECTORS_PER_HEAD = HEAD_DIM / CHANNELS_PER_TEXEL;   // 8
-
-function textureShape(elements) {
-  const texels = Math.ceil(elements / CHANNELS_PER_TEXEL);
-  return { width: TEXTURE_WIDTH, height: Math.max(1, Math.ceil(texels / TEXTURE_WIDTH)) };
-}
-
-function compile(gl, type, source) {
-  const shader = gl.createShader(type);
-  gl.shaderSource(shader, source);
-  gl.compileShader(shader);
-  if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
-    const log = gl.getShaderInfoLog(shader);
-    gl.deleteShader(shader);
-    throw new Error(`WebGL2 shader failed to compile: ${log}`);
-  }
-  return shader;
-}
-
-const VERTEX_SHADER = `#version 300 es
-in vec2 position;
-void main() { gl_Position = vec4(position, 0.0, 1.0); }`;
 
 function flashShader(queries, heads, width) {
   const outputs = Array.from({ length: VECTORS_PER_HEAD },
@@ -152,15 +135,6 @@ ${each((t) => `result${t} = (acc${t} / runningSum) * fetch4(gateTex, queryBase +
 }`;
 }
 
-export function createWebGL2Context(canvas) {
-  const gl = (canvas ?? new OffscreenCanvas(1, 1)).getContext("webgl2");
-  if (gl === null) throw new Error("this browser has no WebGL2");
-  if (gl.getExtension("EXT_color_buffer_float") === null) {
-    throw new Error("WebGL2 here cannot render to float textures (EXT_color_buffer_float)");
-  }
-  return gl;
-}
-
 export class AttentionFlashWebGL2 {
   gl;
   #programs = new Map();
@@ -180,13 +154,7 @@ export class AttentionFlashWebGL2 {
     const cached = this.#programs.get(key);
     if (cached !== undefined) return cached;
     const gl = this.gl;
-    const program = gl.createProgram();
-    gl.attachShader(program, compile(gl, gl.VERTEX_SHADER, VERTEX_SHADER));
-    gl.attachShader(program, compile(gl, gl.FRAGMENT_SHADER, flashShader(queries, heads, TEXTURE_WIDTH)));
-    gl.linkProgram(program);
-    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
-      throw new Error(`WebGL2 program failed to link: ${gl.getProgramInfoLog(program)}`);
-    }
+    const program = linkProgram(gl, flashShader(queries, heads, TEXTURE_WIDTH));
     const uniform = (name) => gl.getUniformLocation(program, name);
     const entry = {
       program,
@@ -272,7 +240,7 @@ export class AttentionFlashWebGL2 {
     gl.useProgram(shader.program);
     const vertices = gl.createBuffer();
     gl.bindBuffer(gl.ARRAY_BUFFER, vertices);
-    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+    gl.bufferData(gl.ARRAY_BUFFER, FULLSCREEN_TRIANGLE, gl.STATIC_DRAW);
     const vao = gl.createVertexArray();
     gl.bindVertexArray(vao);
     const position = gl.getAttribLocation(shader.program, "position");

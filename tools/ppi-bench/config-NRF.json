@@ -1,0 +1,1 @@
+{"tag": "NRF", "cycles": 6, "steps": 100, "recycles": 3, "restarts": 6, "stop": {"ptm": 0.85, "ipae": 1.0}, "check": {"top": 2, "ptm": 0.8, "ipae": 2.5, "passIpae": 1.0}, "folder": "rosettafold3", "checkModel": ["rosettafold3", "protenix2"]}

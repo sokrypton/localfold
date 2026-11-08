@@ -759,6 +759,8 @@
   color: transparent;
   border-radius: 3px;
 }
+/* a residue a crosslink joins: marked like a modified one, in its own colour */
+.entity-mirror mark.entity-mark-crosslink { background: #bfdbfe; }
 /* The text itself stays on top and visible; only its background comes from the
    mirror below, so the caret and selection behave as they always did. */
 .entity-field > textarea.entity-value { position: relative; background: transparent; }

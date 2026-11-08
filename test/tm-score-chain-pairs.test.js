@@ -118,11 +118,13 @@ describe("per-chain-pair ipTM", () => {
   // which is the only difference, and `chainLengths` already says where they
   // are.
   it("gives AlphaFold 2 one score per interface, not one pooled average", () => {
-    const length = 30;
+    // (chains of 30: the pair scores are on AF3's INTERFACE term, d0 from the two chains' tokens, and two
+    // chains of 10 clamp to d0 0.17 A - where even a 1.25 A error is not a confident interface)
+    const length = 90;
     const bins = 64;
     const breaks = Float32Array.from({ length: 63 }, (_, index) => index * 0.5);
     const logits = new Float32Array(length * length * bins);
-    const chainOf = (index) => Math.floor(index / 10);
+    const chainOf = (index) => Math.floor(index / 30);
     for (let i = 0; i < length; i += 1) {
       for (let j = 0; j < length; j += 1) {
         const a = chainOf(i);
@@ -132,7 +134,7 @@ describe("per-chain-pair ipTM", () => {
         logits[(i * length + j) * bins + bin] = 10;
       }
     }
-    const scores = computeTmScores(logits, length, breaks, [10, 10, 10]);
+    const scores = computeTmScores(logits, length, breaks, [30, 30, 30]);
     const pairs = scores.chainPairIptm;
     assert.deepEqual(Object.keys(pairs).sort(), ["0|1", "0|2", "1|2"]);
     assert.ok(pairs["0|1"] > 0.4, `AB should be confident, got ${pairs["0|1"]}`);

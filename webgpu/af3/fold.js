@@ -55,7 +55,7 @@ import {
 import { memoryBudgetBytes, noteAllocation, noteDestroy, residencyAllowed }
   from "../runtime/device-memory.js";
 import { deviceTuning, halfPrecisionAvailable } from "../runtime/device-profile.js";
-import { chainPairTmScores, perChainTmScores, reduceTmScore }
+import { af3TmScores, chainTmInfo, tokenFrameMask }
   from "../../shared/heads/tm-score.js";
 import { sampleOnGpu } from "./diffusion/diffusion-sampler.js";
 import { Af3DiffusionHeadGpu } from "./diffusion/diffusion-head.js";
@@ -572,8 +572,11 @@ async function foldHolding(device, batch, weights, options, held) {
   const largeFold = deviceTuning(device).largeFoldReleasesWeights !== false
     && largestTokens * largestTokens * (weights.trunk?.embedder?.pairChannels ?? 128) * 4
       >= WEIGHT_RELEASE_MIN_BYTES;
-  const keepWeights = (knob) => !largeFold && (deviceTuning(device)[knob]
-    ?? (deviceDerivationsAllowed(device) && keepResidentAffordable(device))) === true;
+  // A prior says the architecture's card has room; the budget says whether THIS one does (PR #7, lhallee): `ampere`
+  // was measured on a 40 GB A100 and is also what an 8 GB RTX 3070 reports, so a prior of true may not keep weights a
+  // small card's budget refuses.
+  const keepWeights = (knob) => !largeFold && keepResidentAffordable(device)
+    && (deviceTuning(device)[knob] ?? deviceDerivationsAllowed(device)) === true;
   // 🔴 AND A LARGE FOLD STREAMS ITS TRUNK WEIGHTS INSIDE THE FOLD TOO. Kept for
   // the four passes, the trunk's decoded `w.` weights were 2.35 GB of
   // IntelliFold-2's 3.34 GB peak at 255 residues; streamed, each block's int5
@@ -620,7 +623,13 @@ async function foldHolding(device, batch, weights, options, held) {
     setStreamedWeights(device, prefixes);
   }
   const { tokens, dense } = batch;
-  const stage = (name, detail = {}) => options.onStage?.(name, detail);
+  // Most of these are awaited. The ones that only announce are not, and a page that has been stopped rejects them all: the
+  // next that is awaited says so, and these would each be an uncaught rejection in its console.
+  const stage = (name, detail = {}) => {
+    const answered = options.onStage?.(name, detail);
+    answered?.catch?.(() => {});
+    return answered;
+  };
 
   // Announced before it runs and awaited, so a page can say what is happening
   // and hand back a frame first. It used to be five seconds of blocked main
@@ -1318,6 +1327,8 @@ async function foldHolding(device, batch, weights, options, held) {
     }
     return new Af3ConfidenceHeadGpu(device, options.confidencePrecision ?? {}).run({
       tokens, dense, seqMask, pair: trunk.pair, single: trunk.single, targetFeat, pseudoBeta,
+      // (the chains AF3's interface TM term is keyed on: chain_pair_iptm, chain_ptm)
+      asymId: batch.asymId,
       // ...the trunk's own pair, copied on the device rather than uploaded
       // again. Not on OpenDDE's path: its expander has already released it.
       ...(finalPair === undefined || structural !== undefined ? {} : {
@@ -1416,6 +1427,15 @@ async function foldHolding(device, batch, weights, options, held) {
       coordinates, seqMask: structural.structural.seqMask,
       atomToToken, atomToSlot, atomCount: n * dense,
       extraPairBias: structural.attentionBias,
+      // AF3's interface TM term's tables (chain_pair_iptm, chain_ptm): each structural token in its parent
+      // residue's chain, d0 from the RESIDUE tokens' counts - af3-any-model gathers the logits to residue
+      // pairs before tmscore_adjusted_pae, and the term is a function of each pair's logits alone
+      tmChainInfo: chainTmInfo(
+        Array.from(layout.parent, (from) => (from >= 0 ? batch.asymId[from] : -1)),
+        Array.from(layout.parent, (from) => (from >= 0 ? batch.seqMask[from] : 0)),
+        Array.from({ length: weights.openddeConfidence.paeBins },
+          (unused, bin) => (32 / weights.openddeConfidence.paeBins) * (bin + 0.5)),
+        { chainOf: batch.asymId, live: batch.seqMask }),
       // 🔴 THE TOKEN COUNT pTM IS REPORTED OVER, which is the RESIDUE tokens
       // and not this head's structural ones: d0 is a function of how many
       // tokens the score covers, and the two part company the moment a ligand
@@ -1446,10 +1466,12 @@ async function foldHolding(device, batch, weights, options, held) {
     // ...and the TM-adjusted PAE through the same gather, because pTM is
     // reduced over the residue tokens the rest of the pipeline reports.
     const tmAdjusted = raw.tm === undefined ? undefined : new Float32Array(tokens * tokens);
+    const tmInterface = raw.tmChain === undefined ? undefined : new Float32Array(tokens * tokens);
     if (tmAdjusted !== undefined) {
       for (let i = 0; i < tokens; i += 1) {
         for (let j = 0; j < tokens; j += 1) {
           tmAdjusted[i * tokens + j] = raw.tm[rep[i] * n + rep[j]];
+          if (tmInterface !== undefined) tmInterface[i * tokens + j] = raw.tmChain[rep[i] * n + rep[j]];
         }
       }
     }
@@ -1472,7 +1494,7 @@ async function foldHolding(device, batch, weights, options, held) {
     // still have to reach the same pTM/ipTM the rest of the pipeline reports".
     // What was missing here was the DISTRIBUTION: the readout kept the
     // expectation and dropped the logits, so there was nothing left to adjust.
-    return { plddt, pae, tmAdjusted, opendde: raw, confidenceInputs,
+    return { plddt, pae, tmAdjusted, tmInterface, opendde: raw, confidenceInputs,
              coordinateCheck: { live, tokens: n, span: Number(span.toFixed(3)) } };
   };
 
@@ -1549,24 +1571,25 @@ async function foldHolding(device, batch, weights, options, held) {
     // `tmTokens` above), and the only head left without one is a model with
     // no confidence head at all - where `scores` itself is absent.
     const asymId = batch.asymId;
-    const selected = (i, j) => seqMask[i] > 0 && seqMask[j] > 0;
+    // 🔴 THE ANCHORS ARE THE TOKENS WITH FRAMES, AlphaFold 3's pae_single_mask:
+    // an ion's row aligns nothing (tokenFrameMask).
+    const frame = tokenFrameMask({ tokens, dense, isLigand: batch.isLigand, asymId,
+      residueIndex: batch.residueIndex, refPos: batch.refPos, refMask: batch.refMask });
     if (scores.tmAdjusted !== undefined) {
-    ptm = reduceTmScore(scores.tmAdjusted, tokens, selected);
-    // NaN for one chain, because there is no interface to score. Zero would
-    // read as a confident failure rather than an inapplicable question.
-    iptm = reduceTmScore(scores.tmAdjusted, tokens,
-      (i, j) => selected(i, j) && asymId[i] !== asymId[j]);
-    // 🔴 AND ONE SCORE PER INTERFACE, BECAUSE THE POOLED ONE AVERAGES THEM. On
-    // more than two chains `iptm` counts every cross-chain pair equally, so an
-    // assembly holding both a native dimer and a designed binder reports the
-    // easy interface's confidence for the hard one. See chainPairTmScores.
-    chainPairIptm = Object.fromEntries(
-      chainPairTmScores(scores.tmAdjusted, tokens, asymId, seqMask).scores);
-    // ...and each chain on its own: how well it folded, and how well it sits
-    // against everything else. The AlphaFold 3 server writes both.
-    const perChain = perChainTmScores(scores.tmAdjusted, tokens, asymId, seqMask);
-    chainPtm = Object.fromEntries(perChain.chainPtm);
-    chainIptm = Object.fromEntries(perChain.chainIptm);
+      // 🔴 ON AF3's INTERFACE TERM FOR THE CHAIN SCORES - d0 from the pair's own
+      // chains, not every token's - as its chain_pair_iptm is; on the global one a
+      // short chain in a large complex read ~0.10 high (reported by Yeqing Lin).
+      // The reduction itself is `af3TmScores`, which is the ONE place it lives:
+      // this file, webgl/af3/model/fold-batch.js (the page's WebGL2 fold) and
+      // webgl/af3/model/fold.js (the tool's) all call it, and the third of those
+      // was on the old definition for as long as it had a copy of its own.
+      if (scores.tmInterface === undefined) {
+        throw new Error("the confidence head returned no interface TM term");
+      }
+      ({ ptm, iptm, chainPairIptm, chainPtm, chainIptm } = af3TmScores({
+        tmAdjusted: scores.tmAdjusted, tmInterface: scores.tmInterface,
+        tokens, asymId, seqMask, frame,
+      }));
     }
 
     pseudoBeta = new Float32Array(tokens * 3);

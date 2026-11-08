@@ -20,7 +20,7 @@ import { pathToFileURL } from "node:url";
  * only that the file is loadable, which is the property that was missing.
  */
 const ROOT = resolve(import.meta.dirname, "..");
-const SOURCES = ["shared", "cpu", "webgpu"].map((tree) => join(ROOT, tree));
+const SOURCES = ["shared", "cpu", "webgpu", "webgl"].map((tree) => join(ROOT, tree));
 
 function javascriptFiles(directory) {
   const found = [];

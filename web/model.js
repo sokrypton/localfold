@@ -24,6 +24,7 @@ import { MODEL_BUNDLES, bundleBaseUrl, graphFamily, loadManifest }
 import { DeltaTensorStore } from "../shared/bundles/delta-tensor-store.js";
 import { requestAlphaFoldDevice } from "../webgpu/runtime/device.js";
 import { settleGridAttendTiling } from "../webgpu/af3/trunk/grid-attend-race.js";
+import { webgl2FoldAvailable } from "../webgl/af3/model/fold-batch.js";
 import { devUseDevice } from "./dev-log.js";
 import { withAbort } from "../webgpu/runtime/abort.js";
 
@@ -158,6 +159,8 @@ export function openStore(onProgress, family = DEFAULT_FAMILY) {
         opened);
     })();
     stores.set(family, store);
+    // A download that failed once must not fail until the reader reloads (PR #7, lhallee).
+    store.catch(() => { if (stores.get(family) === store) stores.delete(family); });
   }
   return store;
 }
@@ -166,7 +169,11 @@ let devicePromise;
 
 /** The WebGPU device, with the optional features the fast paths look for. */
 export function getDevice() {
-  devicePromise ??= (async () => {
+  if (devicePromise !== undefined) return devicePromise;
+  // 🔴 NEITHER A REJECTION NOR A LOST DEVICE MAY STAY MEMOISED (PR #7, lhallee): a failed request left the page saying
+  // "No compatible WebGPU adapter was found" until a reload, and a lost device (a crashed GPU process, a driver reset)
+  // had every later fold run against a dead device. The next fold asks again.
+  const request = (async () => {
     if (navigator.gpu === undefined) throw new Error("This browser has no WebGPU. It ships in current Chrome, Edge, Safari and Firefox.");
     const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
     if (adapter === null) throw new Error("No compatible WebGPU adapter was found");
@@ -183,9 +190,43 @@ export function getDevice() {
     // compiles - started here, they run under the weights' download instead of in front of the fold. Not awaited; the
     // promise is the one the stacks await.
     settleGridAttendTiling(device);
+    void device.lost.then(() => { if (devicePromise === request) devicePromise = undefined; });
     return device;
   })();
-  return devicePromise;
+  devicePromise = request;
+  request.catch(() => { if (devicePromise === request) devicePromise = undefined; });
+  return request;
+}
+
+let backendPromise;
+
+/**
+ * Which backend this browser folds with: WebGPU wherever it exists, else WebGL2.
+ *
+ * 🔴 AND A BROWSER WITH NEITHER STILL GETS THE SENTENCE IT GOT BEFORE. The WebGL2 path is a
+ * FALLBACK, so this asks for WebGPU first and only looks further when that fails - and when WebGL2
+ * cannot render to a float texture either, it rethrows `getDevice`'s own error ("This browser has no
+ * WebGPU...") rather than inventing a second message about a backend the visitor also does not have.
+ *
+ * 🔴 AND IT IS NOT A FALLBACK FOR EVERY MODEL. `webgl/` holds af2, af3, bioemu2, esmc and esmfold2,
+ * but the only one wired into the PAGE is the AlphaFold 3 lineage (web/af3-model.js's
+ * `backend: "webgl2"` -> foldBatchWebGl2); the others have no page entry point, so `fold` refuses
+ * them by name here rather than folding something else or hanging. Wiring one is a change in
+ * web/app.js and a measurement against WebGPU, not a flag.
+ *
+ * Memoised: the answer cannot change inside a page, and requestAdapter is not free.
+ */
+export function foldBackend() {
+  backendPromise ??= (async () => {
+    try {
+      await getDevice();
+      return "webgpu";
+    } catch (cause) {
+      if (!webgl2FoldAvailable()) throw cause;
+      return "webgl2";
+    }
+  })();
+  return backendPromise;
 }
 
 const loaded = new Map();

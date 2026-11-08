@@ -29,6 +29,8 @@
  * a kernel to build a one-hot it will immediately contract away.
  */
 import { deviceTuning, halfPrecisionAvailable } from "../runtime/device-profile.js";
+import { settleReleasedMemory } from "../runtime/allocator.js";
+import { rangeOf } from "../runtime/segmented.js";
 import { GRID_WIDTH, LANES, createLayerNormShader, createLinearShader, createSplitReduceShader,
          createSplitSwigluReduceShader, createSwigluShader, linearGrid, linearKSplits, ROW_TILE, swigluGrid } from "../esmc/block.js";
 import { float32ToFloat16Array } from "../../shared/weights/float16.js";
@@ -343,6 +345,12 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 // to its order. ESM-C's LANES is 64 and its GRID_WIDTH 32768, so the text is
 // otherwise identical.
 import { createAddShader } from "../runtime/execution.js";
+
+/**
+ * How many of a denoising step's dispatches one submission holds: 48 were 13 ms on an A10 at 600 residues, about 4800 atoms,
+ * and 43 on a T4, and a step's time grows about as the square of its length.
+ */
+const denoisePieceDispatches = (atoms) => Math.max(4, Math.min(24, Math.round(24 * (4800 / atoms) ** 2)));
 export { createAddShader };
 
 /** `out = a * sigmoid(gate)`, elementwise. */
@@ -770,7 +778,7 @@ export class Esmfold2DenoiserGpu {
     if (byteOffset % 256 !== 0) {
       throw new Error(`a binding offset of ${byteOffset} is not 256-byte aligned`);
     }
-    return { buffer: allocation.buffer, byteOffset, byteSize: rows * channels * 4 };
+    return rangeOf(allocation, byteOffset, rows * channels * 4);
   }
 
   /** Encode and submit a list of passes right now, outside the recorded step. */
@@ -1369,16 +1377,20 @@ export class Esmfold2DenoiserGpu {
       this.allocations.splice(this.allocations.indexOf(allocation), 1);
     }
 
+    // What was just destroyed, the trunk's pair above all, comes back only when the device ticks. Without this the twelve
+    // biases land on top of it: measured at 1200 tokens on an RTX 3070, the card read 1.4 GiB over the allocator's own sum,
+    // the fullest it was in the whole fold.
+    await settleReleasedMemory(this.device);
     b.bias = weights.tokenBlocks.map((_, index) =>
       this.#alloc(`esmfold2.diff.bias.${index}`, pairs * tokenHeads));
     const biasTemps = [scratchNorm];
-    const biasPasses = [];
     for (let index = 0; index < weights.tokenBlocks.length; index += 1) {
       const block = weights.tokenBlocks[index].attention;
       const scale = upload(`b${index}.pair-norm-scale`, block.pairNormScale);
       const offset = upload(`b${index}.pair-norm-offset`, block.pairNormOffset);
       const projection = upload(`b${index}.pair-bias`, block.pairBiasWeights);
       biasTemps.push(scale, offset, projection);
+      const biasPasses = [];
       for (let start = 0; start < pairs; start += chunk) {
         const rows = Math.min(chunk, pairs - start);
         const p = pipelines.pair[rows];
@@ -1391,8 +1403,12 @@ export class Esmfold2DenoiserGpu {
            ...linearGrid(rows, tokenHeads)],
         );
       }
+      // A submit a block, with one drain after them all: as one submit this was the longest thing a fold asks of the
+      // GPU without a break, 740 ms at 1200 tokens, and a driver that wants the GPU back has to wait for all of it.
+      // eslint-disable-next-line no-await-in-loop
+      await this.#now("esmfold2.diff.bias", biasPasses, false);
     }
-    await this.#now("esmfold2.diff.bias", biasPasses);
+    await this.device.queue.onSubmittedWorkDone();
     if (reuseRelPos) {
       releaseRelPos?.();
     } else {
@@ -1668,9 +1684,10 @@ export class Esmfold2DenoiserGpu {
     this.device.queue.writeBuffer(b.noise.buffer, 0,
       noiseEmbedding(tHat, sigmaData, this.weights.conditioning, tokenChannels));
 
-    const encoder = this.device.createCommandEncoder({ label: "esmfold2.denoise" });
+    let encoder = this.device.createCommandEncoder({ label: "esmfold2.denoise" });
     const batch = deviceTuning(this.device).batchComputePasses !== false;
     let pass = null;
+    let dispatched = 0;
     for (const step of this.program) {
       if (step.kind === "copy") {
         if (pass !== null) { pass.end(); pass = null; }
@@ -1682,6 +1699,13 @@ export class Esmfold2DenoiserGpu {
       pass.setBindGroup(0, step.bindGroup);
       pass.dispatchWorkgroups(step.x, step.y, step.z ?? 1);
       if (!batch) { pass.end(); pass = null; }
+      // A step is 236 to 336 dispatches: 694 ms in one submission at 2046 tokens on an A10, 920 at 1200 on a T4.
+      dispatched += 1;
+      if (dispatched % denoisePieceDispatches(atoms) === 0) {
+        if (pass !== null) { pass.end(); pass = null; }
+        this.device.queue.submit([encoder.finish()]);
+        encoder = this.device.createCommandEncoder({ label: "esmfold2.denoise" });
+      }
     }
     if (pass !== null) pass.end();
     encoder.copyBufferToBuffer(b.update.buffer, 0, b.readback.buffer, 0, atoms * 3 * 4);

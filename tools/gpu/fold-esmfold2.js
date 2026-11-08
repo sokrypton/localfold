@@ -1003,6 +1003,8 @@ export async function main(device, args = []) {
         paeAsymmetry: Number((asym / c.pae.length / mean(c.pae)).toFixed(6)),
         ptm: c.ptm === undefined ? undefined : Number(c.ptm.toFixed(6)),
         iptm: c.iptm === undefined ? undefined : Number(c.iptm.toFixed(6)),
+        // AlphaFold 3's chain-level scores (esmfold2ChainScores), keyed by asym id
+        chainPtm: c.chainPtm, chainIptm: c.chainIptm, chainPairIptm: c.chainPairIptm,
         // ...the arrays themselves only when the oracle arm asked for them.
         ...(c.inputs === undefined ? {} : {
           plddt: Array.from(c.plddt, (v) => Number(v.toFixed(6))),

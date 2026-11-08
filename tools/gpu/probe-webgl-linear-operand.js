@@ -1,0 +1,785 @@
+/**
+ * Which OPERAND binds the WebGL2 dense projection - x, or the weight codes?
+ *
+ *     node tools/gpu-chrome.mjs tools/gpu/probe-webgl-linear-operand.js
+ *     node tools/gpu-chrome.mjs tools/gpu/probe-webgl-linear-operand.js --rows=576 --in=896 --out=1792
+ *
+ * 🔴 IT EXISTS BECAUSE THE PROJECTION IS NOW THE FOLD AND NOTHING SAYS WHY.
+ * Profiled at 68 tokens and 20 steps, `linear*` is 27.0 s of the 37.1 s of
+ * labelled GPU time in a bioemu2 fold - 72.8% - at an aggregate 219 GFLOP/s
+ * against the 1958-2003 GFLOP/s `probe-webgl-gemm-ceiling.js` measures for a
+ * best-case fragment GEMM. The contraction that used to dominate is 11.8% now.
+ * So the next factor is in this kernel, and the question is which of its two
+ * streams it is waiting on.
+ *
+ * 🔴 AND IT IS THE SAME DIAGNOSTIC THAT ALREADY WORKED ONCE, POINTED AT THE
+ * OTHER OPERAND. `linear.js`'s own comment records it: "make every chunk read
+ * the SAME four code texels and the fold goes 6664 ms to 3476 - so this kernel
+ * was bound by code-fetch MISSES, not by bandwidth". That is the weight-side
+ * arm, and it is what chose `orderRowFastest`. Nothing has ever run the x-side
+ * twin, and the traffic arithmetic says x is now the larger stream by 9x: a
+ * fragment reads `blockRows` rows of x and 4 output channels of codes, so x is
+ * re-read once per OUTPUT GROUP (448 times at 1792 outputs) and the codes once
+ * per ROW BLOCK (72 times at 576 rows) - 926 MB against 100 MB at this shape.
+ *
+ * The three arms differ ONLY in which texels a fragment addresses. Same
+ * fragment count, same fetch count, same decode, same multiply-adds:
+ *
+ *   shipped    `q` from the texel index, so the fragments cover the real grid.
+ *   x-aliased  every fragment reads row block 0. x collapses to one block's
+ *              worth and stays in cache; the codes stream exactly as before.
+ *   w-aliased  every fragment reads output group 0. The codes collapse to four
+ *              channels; x streams exactly as before.
+ *
+ * A big x-aliased speedup means x binds; a big w-aliased one means the codes
+ * still bind despite `orderRowFastest`; both small means neither stream is the
+ * constraint and the kernel is issue-bound.
+ *
+ * 🔴 MEASURED AT 576x896x1792, THE FOLD'S LARGEST ROW: x BINDS AT 3.44x AND
+ * THE CODES COST NOTHING (1.09x). 10.06 ms shipped at 184 GFLOP/s against 2.93
+ * ms x-aliased at 632 and 9.25 ms w-aliased at 200. So `orderRowFastest`
+ * finished the weight side and every remaining factor is on the x side - and
+ * two of them are taken: x in float16 is 1.31x on its own (7.68 ms) and the
+ * tile-aware order below is 1.96x (5.13 ms), 2.56x together (3.94 ms at 470
+ * GFLOP/s).
+ *
+ * 🔴 AND THE FIRST VERSION OF THESE FIGURES READ 6.62x AND IS RETRACTED - see
+ * the straw-baseline note at the end of this header.
+ *
+ * 🔴 `packed-x` ASKS WHETHER THE INTENSITY CAP CAN BE BROKEN, AND THE ANSWER IS
+ * NO - A 3.4x LOSS. The cap of 21.33-23.3 flops a fetch4 assumes FOUR floats a
+ * fetch, which is a property of the format rather than of the API: the int5
+ * weights pack about twenty-five codes into one RGBA32UI texel. x packed as
+ * eight float16s a texel, unpacked with `unpackHalf2x16`, takes the intensity to
+ * **36.6** - and the rate from 20.2 to **1.4 G fetch4/s**, so 10.14 ms becomes
+ * **35.39** and `tiled-2`'s 5.11 becomes 9.88. Four unpacks a texel cost more
+ * than the fetch they save; the codes get away with it because `decodeInt5x8`
+ * pays one unpack for EIGHT weights where this pays four for eight x values, and
+ * the x side is read `R` times a chunk where the weight side is read `C`. So
+ * 23.3 is not only the API's cap but the profitable maximum on this device.
+ *
+ * 🔴 `--float` IS THE SAME THREE ARMS FOR THE FLOAT BLOCKED PATH, AND IT
+ * EXPLAINS A 3.2x SPREAD BETWEEN TWO TRANSPOSED SHAPES THAT NO ARITHMETIC DOES.
+ * `linear.block:4624x1024x256` runs at 144.5 GFLOP/s in a fold and
+ * `4624x256x2048` at 461.8, at the SAME 0.19 fetches a flop. Probed:
+ *
+ * | shape | shipped | x-aliased | w-aliased |
+ * |---|---|---|---|
+ * | 4624x1024x256 | 23.21 ms, **104 GF/s** | **4.00 ms, 606** | 22.51, 108 |
+ * | 4624x256x2048 | **7.25 ms, 669 GF/s** | 1.04x | 1.03x |
+ *
+ * So the wide-output shape is at its arithmetic limit with NEITHER operand
+ * binding, and the narrow-output one is x-bound at **5.76x**. The difference is
+ * the SHARER COUNT, which is a property of the shape: ordered group fastest,
+ * the fragments sharing one row block's x are exactly the output groups, and
+ * 2048 outputs give 512 of them against 256 outputs' 64. The fast shape's x
+ * block is 4 KiB read by 512 fragments; the slow one's is 16 KiB read by 64.
+ *
+ * 🔴 AND SPLITTING k DOES NOT FIX IT - 1.30x, WHICH IS THE HYPOTHESIS HALF
+ * RIGHT AND THE CONCLUSION WRONG. `--k-splits=` cuts the per-fragment x block
+ * to the fast shape's size: at four splits the block is 4 KiB, same as
+ * 4624x256x2048's. It reads **17.90 ms at 135 GF/s against 23.21 at 104** and
+ * plateaus there (eight splits is 17.98), nowhere near 606 - because a split
+ * changes the block's SIZE and not the number of fragments sharing it, which is
+ * still 64. And it would still owe a reduce pass over four sets of partials.
+ * Declined. **The binding constraint is how many fragments share an operand,
+ * and at 256 outputs no fragment order can raise that above 64** - the only
+ * remedy is more output channels per fragment, which the 32-float budget
+ * forbids and the aspect sweep above measured as a loss.
+ *
+ * 🔴 AND `--float-tiles=` RULES THE ORDERING SPACE OUT FOR THAT SHAPE
+ * OUTRIGHT, which the fold-level 0.92x could not, since it bundled every float
+ * shape with a forced `rowFastest`. On 4624x1024x256 alone: **tiled-4 24.58 ms
+ * against the shipped 23.14** and tiled-8, 16 and 32 at **58.5-62.1 ms**, which
+ * is 0.37-0.40x. `tiled-32` wastes the SAME 1920 fragments the shipped arm
+ * does, so it is not the padding - the mapping itself is worse here. The tile
+ * order is worth 1.96x where the sharer count is high (bioemu2's 1792-output
+ * projections) and a loss where it is low, and nothing in between helps. So for
+ * this shape the measured options are exhausted: x binds at 5.9x, making it
+ * resident reaches 620 GF/s, and no ordering, tiling or k split gets there. So `orderRowFastest` finished the weight side and
+ * every remaining factor in this kernel is on the x side.
+ *
+ * 🔴 AND THE OBVIOUS CONCLUSION FROM THAT IS WRONG, WHICH IS WHY THE ASPECT
+ * SWEEP IS HERE. x is re-read once per OUTPUT GROUP, so a wider output tile of
+ * the same 32-float budget reads proportionally less x - 882 MB at 8x4, 441 at
+ * 4x8, 220 at 2x16, 110 at 1x32 - and the codes it reads more of were just
+ * measured free. Every one of them is SLOWER, monotonically:
+ *
+ * | tile | ms | GFLOP/s | x MB | code MB | factor |
+ * |---|---:|---:|---:|---:|---:|
+ * | **8x4** (shipped) | **19.24** | **96** | 882 | 68.9 | **1.00** |
+ * | 4x8 | 22.95 | 81 | 441 | 137.8 | 0.84 |
+ * | 2x16 | 27.04 | 68 | 220.5 | 275.6 | 0.71 |
+ * | 1x32 | 35.73 | 52 | 110.3 | 551.3 | 0.54 |
+ *
+ * **Halving x's bytes makes the kernel slower.** So what binds is not x's
+ * VOLUME but its fetch LOCALITY: aliasing x does not merely read less, it makes
+ * every concurrent fragment read the SAME eight rows, and a wider output tile
+ * keeps the same scattered pattern while multiplying the decode work and the
+ * live accumulators. The shipped 8x4 is already the best aspect of its budget,
+ * and three of these four arms are measured nulls - the lever is a fragment
+ * ORDER that puts nearby x under one rasterisation tile, which is what was
+ * worth 3.29x on the contraction, and NOT a reshaped output tile.
+ *
+ * 🔴 AND ITS OWN BASELINE IS A STRAW ONE: READ THE RATIOS, NEVER THE
+ * MILLISECONDS. This probe lays x out UNPADDED where a fold stride-pads it -
+ * 576x896 is 224 texels a row and 224 does not divide 2048, so `linear`'s
+ * `padStride` repacks it and that alone is the 4.08x this tree has measured. So
+ * the shipped arm here reads 18.76 ms where the fold's own profile says 10.63
+ * for the same shape, 1.77x apart, and its `tiled-2` arm's **1.87x was measured
+ * against a baseline whose x reads were misaligned**: the tiling was recovering
+ * an alignment the real kernel already has. Implemented in `linear.js` and
+ * measured in the fold, the same mapping is **1.12x and 1.19x** on the two
+ * kernels and **1.082x** on the whole bioemu2 fold - 30.40 s to 28.10 s,
+ * bit-identical. Real, and half what this probe promised. A probe that does not
+ * reproduce the shipped kernel's own addressing overstates every lever it finds.
+ *
+ * 🔴 THE CODE BITS ARE ARBITRARY AND THIS IS NOT A DIFFERENTIAL. It measures
+ * TIME at the shipped kernel's exact traffic and arithmetic; the weights decode
+ * to whatever those bits mean. `witnessFinite` is there so a run that decoded
+ * to NaN - which could change the timing - is visible rather than silent. The
+ * kernel's correctness is `check-webgl-kernels.js` and `bench-webgl-linear.js`.
+ *
+ * 🔴 AND IT USES A RING OF DISTINCT TARGETS, because this GPU does
+ * hidden-surface removal: drawing the same full-viewport triangle repeatedly
+ * into ONE target discards the earlier fragments before shading them and the
+ * probe measures one iteration divided by the count. That trap has cost three
+ * measurements in this tree.
+ */
+import { createWebGL2Context } from "../../webgl/index.js";
+import {
+  INT5_DECODE, INT5_DECODE8, INT5_GROUP, INT5_GROUP_WORDS,
+} from "../../webgl/runtime/int5.js";
+
+const TEXTURE_W = 2048;
+const flag = (args, name) => (args ?? []).includes(`--${name}`);
+const option = (args, name, fallback) => {
+  const prefix = `--${name}=`;
+  return (args ?? []).find((a) => a.startsWith(prefix))?.slice(prefix.length) ?? fallback;
+};
+
+const FULLSCREEN_TRIANGLE = new Float32Array([-1, -1, 3, -1, -1, 3]);
+const VERTEX_SHADER = `#version 300 es
+in vec2 position;
+void main() { gl_Position = vec4(position, 0.0, 1.0); }`;
+
+const compile = (gl, kind, source) => {
+  const shader = gl.createShader(kind);
+  gl.shaderSource(shader, source);
+  gl.compileShader(shader);
+  if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+    throw new Error(`${gl.getShaderInfoLog(shader)}\n${source}`);
+  }
+  return shader;
+};
+
+/**
+ * The shipped int5 blocked projection's inner loop, with the operand addressing
+ * under a flag. `arm` is "shipped", "x-aliased" or "w-aliased".
+ *
+ * 🔴 NO BACKTICKS IN THE GLSL - this is a template literal, and one backtick in
+ * a comment here ends the string. That has happened eight times in this tree.
+ */
+/**
+ * The FLOAT blocked projection's inner loop - an f16 weight sampled directly,
+ * `in-major` so a fetch4 serves four output channels at one k, and ordered
+ * GROUP FASTEST, which is what `linear` dispatches for a shape past the
+ * `rowFastest` cap. Same three arms.
+ *
+ * 🔴 IT IS A SECOND SHADER AND NOT A FLAG ON THE FIRST, because the int5 one
+ * decodes codes and this one samples a texture: an arm that changed both the
+ * operand addressing AND the weight's dtype would price two things at once,
+ * which is this probe's own retracted mistake in another form.
+ */
+const floatShader = (inChannels, outChannels, rowsPerFragment, outsPerFragment,
+  rowBlocks, arm, xStride4, kSplits = 1, tileWidth = 0) => {
+  const R = rowsPerFragment;
+  const C = outsPerFragment;
+  const quads = C / 4;
+  const rows = (f) => Array.from({ length: R }, (_, i) => f(i)).join("\n");
+  return `#version 300 es
+precision highp float;
+precision highp int;
+precision highp sampler2D;
+const int W = 2048;
+const int IN = ${inChannels};
+const int OUT = ${outChannels};
+const int OUT4 = ${outChannels / C};
+const int RQ = ${rowBlocks};
+const int XSTRIDE4 = ${xStride4};
+const int KCHUNK = ${inChannels / kSplits};
+const int SPLITS = ${kSplits};
+uniform sampler2D xTex;
+uniform sampler2D weightTex;
+${Array.from({ length: R * quads }, (_, i) =>
+  `layout(location = ${i}) out vec4 result${i};`).join("\n")}
+
+vec4 fetch4(sampler2D tex, int texel) {
+  return texelFetch(tex, ivec2(texel % W, texel / W), 0);
+}
+
+void main() {
+  int texel = int(gl_FragCoord.y) * W + int(gl_FragCoord.x);
+  // 🔴 THE K SPLIT IS THE SLOWEST AXIS, so the fragments of one k chunk are
+  // CONTIGUOUS and a rasterisation tile sees one chunk's x and no other. Put
+  // the split fastest and every tile would straddle all of them, which is the
+  // opposite of the point.
+  int split = texel / (RQ * OUT4);
+  int within = texel - split * (RQ * OUT4);
+  split = split % SPLITS;
+${tileWidth > 0
+    ? `  // Tile-aware: a TILEW-wide run covers TILEW consecutive row blocks at
+  // ONE output group, so a 2D rasterisation tile sees few x blocks instead of
+  // one per texel row it spans.
+  const int TILEW = ${tileWidth};
+  int lane = within % TILEW;
+  int group = (within % W) / TILEW;
+  int q = (within / W) * TILEW + lane;
+  if (q >= RQ || group >= OUT4) {
+${Array.from({ length: rowsPerFragment * (outsPerFragment / 4) }, (_, i) =>
+      `    result${i} = vec4(0.0);`).join("\n")}
+    return;
+  }`
+    : `  // Group fastest, as the float blocked path ships past the rowFastest cap.
+  int q = within / OUT4;
+  int group = within - q * OUT4;`}
+  int kStart = split * KCHUNK;
+  ${arm === "w-aliased" ? "group = 0;" : "group = group % OUT4;"}
+  ${arm === "x-aliased" ? "q = 0;" : "q = q % RQ;"}
+  int o0 = group * ${C};
+  int base = q * ${R};
+${rows((i) => `  int xBase${i} = (base + ${i}) * XSTRIDE4;`)}
+${rows((i) => Array.from({ length: quads }, (_, c) =>
+  `  vec4 acc${i}_${c} = vec4(0.0);`).join("\n"))}
+  // in-major: the weight row for input k holds every output channel, so one
+  // fetch4 at (k * OUT + o0) serves four of them. (No backticks in here - this
+  // is inside a JS template literal, and one ends the string. Ninth time.)
+  for (int kk = 0; kk < KCHUNK; ++kk) {
+    int k = kStart + kk;
+${Array.from({ length: quads }, (_, c) =>
+  `    vec4 w${c} = fetch4(weightTex, (k * OUT + o0 + ${c * 4}) >> 2);`).join("\n")}
+${rows((i) => `    {
+      float xv = fetch4(xTex, xBase${i} + (k >> 2))[k & 3];
+${Array.from({ length: quads }, (_, c) => `      acc${i}_${c} += xv * w${c};`).join("\n")}
+    }`)}
+  }
+${rows((i) => Array.from({ length: quads }, (_, c) =>
+  `  result${i * quads + c} = acc${i}_${c};`).join("\n"))}
+}`;
+};
+
+const shader = (inChannels, outChannels, rowsPerFragment, outsPerFragment,
+  rowBlocks, arm, tileWidth = 0, xStride4 = inChannels / 4, halfX = false,
+  packedX = false) => {
+  const R = rowsPerFragment;
+  const C = outsPerFragment;
+  const quads = C / 4;
+  const rows = (f) => Array.from({ length: R }, (_, i) => f(i)).join("\n");
+  const chans = (f) => Array.from({ length: C }, (_, i) => f(i)).join("\n");
+  return `#version 300 es
+precision highp float;
+precision highp int;
+precision highp sampler2D;
+precision highp usampler2D;
+const int W = 2048;
+const int IN = ${inChannels};
+const int GPR = ${inChannels / INT5_GROUP};
+const int OUTC = ${outChannels / C};
+const int RQ = ${rowBlocks};
+const int XSTRIDE4 = ${xStride4};
+// 🔴 PACKED x: EIGHT float16s IN ONE RGBA32UI TEXEL, so one fetch covers eight
+// k where an RGBA16F fetch4 covers four. The int5 WEIGHTS have done this since
+// they were written - about twenty-five codes a texel - and the intensity cap
+// this backend derives (21.33 flops a fetch4 at R + C = 12) assumes FOUR floats
+// a fetch for both operands. Packing x doubles its side of that.
+const int XSTRIDE8 = ${Math.ceil(inChannels / 8)};
+${packedX ? "uniform highp usampler2D xPackTex;" : "uniform sampler2D xTex;"}
+uniform highp usampler2D codeTex;
+uniform sampler2D tableTex;
+${Array.from({ length: R * quads }, (_, i) =>
+  `layout(location = ${i}) out vec4 result${i};`).join("\n")}
+${INT5_DECODE}
+${INT5_DECODE8}
+
+vec4 fetch4(sampler2D tex, int texel) {
+  return texelFetch(tex, ivec2(texel % W, texel / W), 0);
+}
+
+void main() {
+  int texel = int(gl_FragCoord.y) * W + int(gl_FragCoord.x);
+${tileWidth > 0
+    ? `  // 🔴 TILE-AWARE: a rasterisation tile is 2D and linearTexel() is 1D, so a
+  // TILEW-wide run covers TILEW consecutive ROW BLOCKS at ONE output group
+  // instead of ${rowBlocks} of them - the same mapping that was worth 3.29x on
+  // the contraction. ${tileWidth} row blocks is ${tileWidth} * ${rowsPerFragment} rows of x a tile.
+  const int TILEW = ${tileWidth};
+  int lane = texel % TILEW;
+  int group = (texel % W) / TILEW;
+  int q = (texel / W) * TILEW + lane;
+  // 🔴 AND THIS GRID IS PADDED WHERE THE SHIPPED ONE IS NOT, so the arm must
+  // PAY for its padding or it is not comparable: q advances by TILEW a texel
+  // row, so covering ${rowBlocks} row blocks takes ceil(${rowBlocks}/TILEW) rows of W and
+  // the leftover fragments are real draws. They return here instead of wrapping
+  // with a modulo, because wrapping would make them do a second copy of real
+  // work and flatter the arm from the other side.
+  if (q >= RQ || group >= ${outChannels / outsPerFragment}) {
+${Array.from({ length: rowsPerFragment * (outsPerFragment / 4) }, (_, i) =>
+      `    result${i} = vec4(0.0);`).join("\n")}
+    return;
+  }`
+    : `  // Row block fastest, as the int5 path ships.
+  int group = texel / RQ;
+  int q = texel - group * RQ;`}
+  ${arm === "w-aliased" ? "group = 0;" : "group = group % OUTC;"}
+  ${arm === "x-aliased" ? "q = 0;" : "q = q % RQ;"}
+  int o0 = group * ${C};
+  int base = q * ${R};
+${rows((i) => packedX
+    ? `  int xBase${i} = (base + ${i}) * XSTRIDE8;`
+    : `  int xBase${i} = (base + ${i}) * XSTRIDE4;`)}
+${rows((i) => Array.from({ length: quads }, (_, c) =>
+  `  vec4 acc${i}_${c} = vec4(0.0);`).join("\n"))}
+  for (int g = 0; g < GPR; ++g) {
+${chans((o) => `    vec2 sz${o} = int5ScaleZero(tableTex, (o0 + ${o}) * GPR + g);`)}
+    for (int chunk = 0; chunk < ${INT5_GROUP / 8}; ++chunk) {
+      int k = g * ${INT5_GROUP} + chunk * 8;
+${chans((o) => `      vec4 w${o}a, w${o}b;
+      decodeInt5x8(codeTex, (o0 + ${o}) * IN + k, sz${o}.x, sz${o}.y, w${o}a, w${o}b);`)}
+      int kq = k >> 2;
+${rows((i) => `      {
+${packedX ? `        int at${i} = xBase${i} + (k >> 3);
+        uvec4 bits${i} = texelFetch(xPackTex, ivec2(at${i} % W, at${i} / W), 0);
+        vec4 xa = vec4(unpackHalf2x16(bits${i}.x), unpackHalf2x16(bits${i}.y));
+        vec4 xb = vec4(unpackHalf2x16(bits${i}.z), unpackHalf2x16(bits${i}.w));`
+    : `        vec4 xa = fetch4(xTex, xBase${i} + kq);
+        vec4 xb = fetch4(xTex, xBase${i} + kq + 1);`}
+${Array.from({ length: quads }, (_, c) => `        acc${i}_${c} += vec4(
+          dot(xa, w${c * 4 + 0}a) + dot(xb, w${c * 4 + 0}b),
+          dot(xa, w${c * 4 + 1}a) + dot(xb, w${c * 4 + 1}b),
+          dot(xa, w${c * 4 + 2}a) + dot(xb, w${c * 4 + 2}b),
+          dot(xa, w${c * 4 + 3}a) + dot(xb, w${c * 4 + 3}b));`).join("\n")}
+      }`)}
+    }
+  }
+${rows((i) => Array.from({ length: quads }, (_, c) =>
+  `  result${i * quads + c} = acc${i}_${c};`).join("\n"))}
+}`;
+};
+
+export async function main(device, args) {
+  const rows = Number(option(args, "rows", "576"));
+  const inChannels = Number(option(args, "in", "896"));
+  const outChannels = Number(option(args, "out", "1792"));
+  const rounds = Number(option(args, "rounds", "4"));
+  const iterations = Number(option(args, "iterations", "8"));
+  const gl = createWebGL2Context();
+  const targets = gl.getParameter(gl.MAX_DRAW_BUFFERS);
+  if (inChannels % INT5_GROUP !== 0) {
+    throw new Error(`in ${inChannels} is not a multiple of the int5 group ${INT5_GROUP}`);
+  }
+  if (outChannels % 4 !== 0) throw new Error(`out ${outChannels} is not a multiple of 4`);
+  // 🔴 THE TILES ARE THE ASPECTS OF ONE FIXED BUDGET, which is what makes them
+  // comparable: `MAX_DRAW_BUFFERS * 4` output floats a fragment, so R rows by C
+  // output channels with R*C = 32 and C a multiple of four. 8x4 is what ships.
+  const budget = targets * 4;
+  // 🔴 THE TILE-AWARE ARMS, which the aspect sweep's nulls point at. A tile must
+  // hold every output group the mapping gives a texel ROW, so TILEW is at most
+  // `W / outputGroups`; a wider one would alias two groups onto one texel.
+  const tileWidths = (option(args, "tile-widths", "") !== ""
+    ? option(args, "tile-widths", "").split(",").map(Number)
+    : [2, 4, 8]).filter((t) => t > 0);
+  // 🔴 AND THE BOUND IS ENFORCED, NOT STATED. Written as a comment alone it let
+  // `tiled-8` through at 1792 outputs: W/8 is 256 group slots against 448
+  // output groups, so the mapping capped `group` at 255 and the arm computed
+  // 57% of the work and reported 104 GFLOP/s as though it were comparable. The
+  // tell was `wastedFragments` going NEGATIVE - an arm whose grid is smaller
+  // than its own useful work is not a measurement.
+  const outputGroups = Math.ceil(outChannels / 4);
+  const aspects = (option(args, "tiles", "") !== ""
+    ? option(args, "tiles", "").split(",")
+    : ["8x4", "4x8", "2x16", "1x32"]).map((spec) => {
+    const [R, C] = spec.split("x").map(Number);
+    if (!(R > 0) || !(C > 0) || C % 4 !== 0 || R * C !== budget) {
+      throw new Error(`tile ${spec}: R*C must be ${budget} with C a multiple of four`);
+    }
+    if (outChannels % C !== 0) throw new Error(`tile ${spec}: ${C} does not divide out ${outChannels}`);
+    return { spec, R, C };
+  });
+
+  const fill = (count, seed) => {
+    const values = new Float32Array(count);
+    let state = seed | 0;
+    for (let i = 0; i < count; i += 1) {
+      state = (state * 1103515245 + 12345) & 0x7fffffff;
+      values[i] = ((state >>> 8) / 0x7fffff - 0.5) * 0.25;
+    }
+    return values;
+  };
+  const words = (count, seed) => {
+    const out = new Uint32Array(count);
+    let state = seed | 0;
+    for (let i = 0; i < count; i += 1) {
+      state = (state * 1103515245 + 12345) & 0x7fffffff;
+      out[i] = state >>> 0;
+    }
+    return out;
+  };
+  const W = 2048;
+  const floatTexture = (values) => {
+    const t = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, t);
+    const texels = Math.ceil(values.length / 4);
+    const height = Math.max(1, Math.ceil(texels / W));
+    const padded = new Float32Array(W * height * 4);
+    padded.set(values);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, W, height, 0, gl.RGBA, gl.FLOAT, padded);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    return t;
+  };
+  // x in float16, which is what the WGSL path keeps its intermediates in and
+  // what this backend does NOT - half the bytes of the stream that binds.
+  const halfTexture = (values) => {
+    const t = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, t);
+    const texels = Math.ceil(values.length / 4);
+    const height = Math.max(1, Math.ceil(texels / W));
+    const padded = new Float32Array(W * height * 4);
+    padded.set(values);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, W, height, 0, gl.RGBA, gl.FLOAT, padded);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    return t;
+  };
+  const wordTexture = (values) => {
+    const t = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, t);
+    const texels = Math.ceil(values.length / 4);
+    const height = Math.max(1, Math.ceil(texels / W));
+    const padded = new Uint32Array(W * height * 4);
+    padded.set(values);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32UI, W, height, 0,
+      gl.RGBA_INTEGER, gl.UNSIGNED_INT, padded);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    return t;
+  };
+
+  const groups = (inChannels / INT5_GROUP) * outChannels;
+  // 🔴 x AT THE STRIDE A FOLD GIVES IT, which is what this probe got wrong and
+  // what made its first `tiled-2` reading 1.87x where the fold's is 1.12x. A
+  // row of `in/4` texels wraps onto the next texture row unless that divides W,
+  // so `linear` runs `padStride` over x - 4.08x on its own - and a probe laying
+  // x out unpadded measures a kernel nothing dispatches. `--no-stride-pad` is
+  // the arm that prices it here as it does in a fold.
+  const unpadded = inChannels / 4;
+  const divides = TEXTURE_W % unpadded === 0;
+  const padStride = !flag(args, "no-stride-pad") && !divides;
+  const xStride4 = padStride
+    ? 2 ** Math.ceil(Math.log2(unpadded))
+    : unpadded;
+  const xValues = new Float32Array(rows * xStride4 * 4);
+  {
+    const source = fill(rows * inChannels, 7);
+    for (let r = 0; r < rows; r += 1) {
+      xValues.set(source.subarray(r * inChannels, (r + 1) * inChannels), r * xStride4 * 4);
+    }
+  }
+  const xTex = floatTexture(xValues);
+  const xHalfTex = halfTexture(xValues);
+  // x as eight float16s a texel. `Math.fround` is not the rounding a GPU does
+  // to f16, but this arm is timed and not compared, and the bit pattern only
+  // has to be a legal half for `unpackHalf2x16` to cost what it costs.
+  const xPackTex = (() => {
+    const stride8 = Math.ceil(inChannels / 8);
+    const words = new Uint32Array(rows * stride8 * 4);
+    const half = (v) => {
+      // A minimal float32 -> float16 bit conversion; normals only, which every
+      // value here is (the fill is +/-0.125).
+      const buf = new DataView(new ArrayBuffer(4));
+      buf.setFloat32(0, v);
+      const bits = buf.getUint32(0);
+      const sign = (bits >>> 16) & 0x8000;
+      const exponent = ((bits >>> 23) & 0xff) - 127 + 15;
+      const mantissa = (bits >>> 13) & 0x3ff;
+      if (exponent <= 0) return sign;
+      return sign | (exponent << 10) | mantissa;
+    };
+    for (let r = 0; r < rows; r += 1) {
+      for (let k = 0; k < inChannels; k += 2) {
+        const lo = half(xValues[r * xStride4 * 4 + k]);
+        const hi = half(xValues[r * xStride4 * 4 + k + 1]);
+        words[r * stride8 * 4 + (k >> 1)] = (lo | (hi << 16)) >>> 0;
+      }
+    }
+    return wordTexture(words);
+  })();
+  const codeTex = wordTexture(words(groups * INT5_GROUP_WORDS, 11));
+  // The scale/zero table is two floats a group, as `int5ScaleZero` reads it.
+  const tableTex = floatTexture(fill(groups * 2, 13));
+
+  // A viewport that covers the widest arm's fragments in the backend's own
+  // 2048 rows; a narrower arm draws the same grid and masks with `% RQ`.
+  const extentFor = (R, C, tileWidth) => {
+    const rowBlocks = Math.ceil(rows / R);
+    const height = tileWidth > 0
+      ? Math.ceil(rowBlocks / tileWidth)
+      : Math.ceil(rowBlocks * (outChannels / C) / W);
+    return { height, fragments: height * W, useful: rowBlocks * (outChannels / C) };
+  };
+  const height = Math.max(...aspects.map((a) => extentFor(a.R, a.C, 0).height),
+    ...tileWidths.map((t) => extentFor(8, 4, t).height));
+  if (!(outputGroups > 0)) throw new Error("no output groups");
+  const ring = Array.from({ length: iterations }, () => {
+    const framebuffer = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+    const attachments = [];
+    for (let t = 0; t < targets; t += 1) {
+      const out = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, out);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, W, height, 0, gl.RGBA, gl.FLOAT, null);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0 + t, gl.TEXTURE_2D, out, 0);
+      attachments.push(gl.COLOR_ATTACHMENT0 + t);
+    }
+    gl.drawBuffers(attachments);
+    return framebuffer;
+  });
+
+  const arms = [];
+  const refusals = [];
+  // 🔴 THE FLOAT PATH'S OWN THREE ARMS, under `--float`, because the int5 ones
+  // cannot speak for it: that path samples an f16 weight `in-major` and orders
+  // its fragments GROUP fastest, and `linear.block:4624x1024x256` runs at 144.5
+  // GFLOP/s where its transpose `4624x256x2048` runs at 461.8 - 3.2x apart at
+  // the SAME 0.19 fetches a flop, which no arithmetic here explains.
+  if (flag(args, "float")) {
+    const R = 8;
+    const C = 4;
+    const rowBlocks = Math.ceil(rows / R);
+    const weightHalf = halfTexture(fill(inChannels * outChannels, 23));
+    const splitArms = (option(args, "k-splits", "1,2,4,8") || "1")
+      .split(",").map(Number).filter((n) => n >= 1 && inChannels % n === 0);
+    const floatTiles = (option(args, "float-tiles", "4,8,16,32") || "")
+      .split(",").map(Number).filter((t) => t >= 2 && Math.floor(W / t) >= outChannels / C);
+    for (const spec of [...["shipped", "x-aliased", "w-aliased"].map((a) => [a, 1, 0]),
+      ...splitArms.filter((n) => n > 1).map((n) => [`k-split-${n}`, n, 0]),
+      ...floatTiles.map((t) => [`tiled-${t}`, 1, t])]) {
+      const [arm, kSplits, floatTile] = spec;
+      const program = gl.createProgram();
+      gl.attachShader(program, compile(gl, gl.VERTEX_SHADER, VERTEX_SHADER));
+      gl.attachShader(program, compile(gl, gl.FRAGMENT_SHADER,
+        floatShader(inChannels, outChannels, R, C, rowBlocks, arm, xStride4,
+          kSplits, floatTile)));
+      gl.linkProgram(program);
+      if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+        throw new Error(`link float ${arm}: ${gl.getProgramInfoLog(program)}`);
+      }
+      gl.useProgram(program);
+      const buffer = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+      gl.bufferData(gl.ARRAY_BUFFER, FULLSCREEN_TRIANGLE, gl.STATIC_DRAW);
+      const position = gl.getAttribLocation(program, "position");
+      gl.enableVertexAttribArray(position);
+      gl.vertexAttribPointer(position, 2, gl.FLOAT, false, 0, 0);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, xHalfTex);
+      gl.uniform1i(gl.getUniformLocation(program, "xTex"), 0);
+      gl.activeTexture(gl.TEXTURE1);
+      gl.bindTexture(gl.TEXTURE_2D, weightHalf);
+      gl.uniform1i(gl.getUniformLocation(program, "weightTex"), 1);
+      const useful = rowBlocks * (outChannels / C) * kSplits;
+      const height = floatTile > 0
+        ? Math.ceil(rowBlocks / floatTile) * kSplits
+        : Math.ceil(useful / W);
+      if (height > gl.getParameter(gl.MAX_TEXTURE_SIZE)) {
+        refusals.push(`${arm}: ${height} texel rows is past MAX_TEXTURE_SIZE`);
+        continue;
+      }
+      gl.viewport(0, 0, W, height);
+      const draw = (i) => {
+        gl.bindFramebuffer(gl.FRAMEBUFFER, ring[i % ring.length]);
+        gl.drawArrays(gl.TRIANGLES, 0, 3);
+      };
+      const sync = () => {
+        gl.bindFramebuffer(gl.FRAMEBUFFER, ring[0]);
+        const pixel = new Float32Array(4);
+        gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.FLOAT, pixel);
+        return pixel[0];
+      };
+      draw(0);
+      const witness = sync();
+      const samples = [];
+      for (let round = 0; round < rounds; round += 1) {
+        const start = performance.now();
+        for (let i = 0; i < iterations; i += 1) draw(i);
+        sync();
+        samples.push((performance.now() - start) / iterations);
+      }
+      const ms = Math.min(...samples);
+      arms.push({
+        tile: "float-8x4",
+        arm,
+        fragments: height * W,
+        wastedFragments: height * W - useful,
+        milliseconds: Number(ms.toFixed(3)),
+        spread: Number((Math.max(...samples) / Math.min(...samples)).toFixed(2)),
+        gigaflops: Number((rowBlocks * (outChannels / C) * R * C * inChannels * 2
+          / ms / 1e6).toFixed(0)),
+        xMegabytes: Number(((outChannels / C) * rows * inChannels * 2 / 1048576).toFixed(1)),
+        codeMegabytes: Number((rowBlocks * inChannels * outChannels * 2 / 1048576).toFixed(1)),
+        witnessFinite: Number.isFinite(witness),
+      });
+    }
+  }
+  for (const { spec, R, C } of aspects) {
+    const rowBlocks = Math.ceil(rows / R);
+    const xBytes = (outChannels / C) * rows * inChannels * 4;
+    const codeBytes = rowBlocks * groups * INT5_GROUP_WORDS * 4;
+    // The aliasing arms only ever run on the shipped aspect: they answer which
+    // STREAM binds, and the sweep answers what to do about it.
+    if (flag(args, "float")) { continue; }
+    const legal = tileWidths.filter((t) => Math.floor(W / t) >= outChannels / C);
+    const refused = tileWidths.filter((t) => !legal.includes(t))
+      .map((t) => `tiled-${t}: W/${t} is ${Math.floor(W / t)} group slots against `
+        + `${outChannels / C} output groups`);
+    refusals.push(...(spec === "8x4" ? refused : []));
+    const armNames = spec === "8x4"
+      ? ["shipped", "x-aliased", "w-aliased", "half-x",
+        ...legal.map((t) => `tiled-${t}`),
+        ...legal.map((t) => `tiled-${t}-half-x`),
+        "packed-x", ...legal.map((t) => `tiled-${t}-packed-x`)]
+      : ["shipped"];
+   for (const arm of armNames) {
+    const tileWidth = arm.startsWith("tiled-") ? Number(arm.slice(6).split("-")[0]) : 0;
+    const halfX = arm.endsWith("half-x");
+    const packedX = arm.endsWith("packed-x");
+    const extent = extentFor(R, C, tileWidth);
+    // 🔴 THE FETCH COUNT, EXACTLY AS THE SHADER ISSUES IT, so the achieved rate
+    // can be put beside `probe-webgl-fetch-rate.js --ceiling-window=`'s measured
+    // issue rate instead of beside an estimate. Per group of 32 input channels:
+    // `C` scale/zero reads (one texelFetch each - `int5ScaleZero` reads ONE
+    // texel and picks a half), then `INT5_GROUP / 8` chunks, each decoding `C`
+    // output channels and reading `R` rows of x twice. `decodeInt5x8` reads one
+    // code texel, and a second only when its word lands on channel 3, which is
+    // one chunk in four - so 1.25 on average, and the upper bound is reported
+    // beside it rather than hidden in a single figure.
+    const groupsOfK = inChannels / INT5_GROUP;
+    const chunks = INT5_GROUP / 8;
+    const perGroup = (perDecode) => C + chunks * (C * perDecode + R * (packedX ? 1 : 2));
+    const fetchesTypical = extent.useful * groupsOfK * perGroup(1.25);
+    const fetchesUpper = extent.useful * groupsOfK * perGroup(2);
+    // `half-x` alone is the shipped order with a narrower x, so its grid is the
+    // shipped one; `tiled-N-half-x` is the tiled grid with a narrower x.
+
+    // 🔴 USEFUL FLOPS, NOT DISPATCHED ONES: a padded grid is charged its real
+    // milliseconds and credited only the work the kernel would keep.
+    const flops = extent.useful * R * C * inChannels * 2;
+    const program = gl.createProgram();
+    gl.attachShader(program, compile(gl, gl.VERTEX_SHADER, VERTEX_SHADER));
+    gl.attachShader(program, compile(gl, gl.FRAGMENT_SHADER,
+      shader(inChannels, outChannels, R, C, rowBlocks, arm, tileWidth, xStride4,
+        halfX, packedX)));
+    gl.linkProgram(program);
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+      throw new Error(`link ${spec} ${arm}: ${gl.getProgramInfoLog(program)}`);
+    }
+    gl.useProgram(program);
+    const buffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+    gl.bufferData(gl.ARRAY_BUFFER, FULLSCREEN_TRIANGLE, gl.STATIC_DRAW);
+    const position = gl.getAttribLocation(program, "position");
+    gl.enableVertexAttribArray(position);
+    gl.vertexAttribPointer(position, 2, gl.FLOAT, false, 0, 0);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, packedX ? xPackTex : (halfX ? xHalfTex : xTex));
+    gl.uniform1i(gl.getUniformLocation(program, packedX ? "xPackTex" : "xTex"), 0);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, codeTex);
+    gl.uniform1i(gl.getUniformLocation(program, "codeTex"), 1);
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D, tableTex);
+    gl.uniform1i(gl.getUniformLocation(program, "tableTex"), 2);
+    gl.viewport(0, 0, W, extent.height);
+
+    const draw = (i) => {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, ring[i % ring.length]);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+    };
+    const sync = () => {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, ring[0]);
+      const pixel = new Float32Array(4);
+      gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.FLOAT, pixel);
+      return pixel[0];
+    };
+    draw(0);
+    const witness = sync();
+    const samples = [];
+    for (let round = 0; round < rounds; round += 1) {
+      const start = performance.now();
+      for (let i = 0; i < iterations; i += 1) draw(i);
+      sync();
+      samples.push((performance.now() - start) / iterations);
+    }
+    const ms = Math.min(...samples);
+    arms.push({
+      tile: `${R}x${C}`,
+      arm,
+      fragments: extent.fragments,
+      wastedFragments: extent.fragments - extent.useful,
+      milliseconds: Number(ms.toFixed(3)),
+      spread: Number((Math.max(...samples) / Math.min(...samples)).toFixed(2)),
+      gigaflops: Number((flops / ms / 1e6).toFixed(0)),
+      xMegabytes: Number((xBytes * (halfX ? 0.5 : 1) / 1048576).toFixed(1)),
+      gigaFetchesPerSecond: Number((fetchesTypical / ms / 1e6).toFixed(1)),
+      gigaFetchesUpperBound: Number((fetchesUpper / ms / 1e6).toFixed(1)),
+      flopsPerFetch: Number((flops / fetchesTypical).toFixed(1)),
+      codeMegabytes: Number((codeBytes / 1048576).toFixed(1)),
+      witnessFinite: Number.isFinite(witness),
+    });
+   }
+  }
+
+  const of = (tile, name) => arms.find((a) => a.tile === tile && a.arm === name)?.milliseconds;
+  const floatArms = arms.filter((a) => a.tile === "float-8x4");
+  const shipped = of("8x4", "shipped") ?? of("float-8x4", "shipped");
+  const xFactor = shipped / (of("8x4", "x-aliased") ?? of("float-8x4", "x-aliased"));
+  const wFactor = shipped / (of("8x4", "w-aliased") ?? of("float-8x4", "w-aliased"));
+  const binds = xFactor >= 1.3 || wFactor >= 1.3
+    ? (xFactor >= wFactor ? "x" : "the weight codes")
+    : "neither stream";
+  const sweep = arms.filter((a) => a.arm === "shipped" || a.arm.startsWith("tiled-")
+    || a.arm === "half-x")
+    .map((a) => ({ arm: a.arm, tile: a.tile, milliseconds: a.milliseconds,
+      gigaflops: a.gigaflops, wastedFragments: a.wastedFragments,
+      factorOverShipped: Number((shipped / a.milliseconds).toFixed(2)) }));
+  const best = (sweep.length > 0 ? sweep : floatArms.map((a) => ({
+    arm: a.arm, tile: a.tile, milliseconds: a.milliseconds, gigaflops: a.gigaflops,
+    wastedFragments: a.wastedFragments, factorOverShipped: 1,
+  }))).reduce((a, b) => (b.milliseconds < a.milliseconds ? b : a));
+  const bestName = best.arm === "shipped" ? `the shipped ${best.tile}` : `${best.arm} at ${best.tile}`;
+  return {
+    renderer: gl.getParameter(gl.RENDERER),
+    maxDrawBuffers: targets,
+    shape: `${rows}x${inChannels}x${outChannels}`,
+    xStride4,
+    xStridePadded: padStride,
+    budget: `${budget} output floats a fragment`,
+    arms,
+    refusedTileWidths: refusals,
+    sweep,
+    xAliasedFactor: Number(xFactor.toFixed(2)),
+    wAliasedFactor: Number(wFactor.toFixed(2)),
+    binds,
+    bestTile: best.tile,
+    bestArm: best.arm,
+    bestFactor: best.factorOverShipped,
+    verdict: binds === "neither stream"
+      ? `NEITHER OPERAND BINDS: aliasing x is ${xFactor.toFixed(2)}x and aliasing the codes `
+        + `${wFactor.toFixed(2)}x, so this kernel is issue-bound`
+      : `${binds} BINDS at ${xFactor.toFixed(2)}x against the codes' ${wFactor.toFixed(2)}x, `
+        + `and the best arm of the same budget is ${bestName} at `
+        + `${best.factorOverShipped.toFixed(2)}x the shipped 8x4`,
+  };
+}

@@ -230,19 +230,28 @@ export function tmPerBinFor(binCentres, d0) {
  *   cross pairs is absent rather than zero
  */
 /**
- * pTM and ipTM for each chain on its own.
+ * pTM and ipTM for each chain on its own, as AlphaFold 3 computes them.
  *
- * 🔴 THE SAME TERM AGAIN, REDUCED OVER TWO MORE SETS OF PAIRS. `chain_ptm[i]`
- * is the score over pairs BOTH of which are chain i - how well folded that
- * chain is by itself - and `chain_iptm[i]` is the score over pairs with exactly
- * one token in chain i, which is how well it sits against everything else. The
- * AlphaFold 3 server writes both, and on an assembly they are what says whether
- * a low overall score is one bad chain or one bad interface.
+ * 🔴 ON THE INTERFACE TERM, NOT THE GLOBAL ONE. `term` here is AF3's second TM
+ * term (tmscore_adjusted_pae's "interface" version: d0 from the pair's own
+ * chains - the chain's tokens on the diagonal, the two chains' summed off it -
+ * see chainTmInfo), from which AF3 reduces `chain_pair_iptm`; `chain_ptm[i]` is
+ * its diagonal, the score over pairs both of which are chain i. Scored on the
+ * global term (d0 from every token) a short chain in a large complex read ~0.10
+ * high - a binder's pTM, reported by Yeqing Lin.
+ *
+ * 🔴 AND `chain_iptm[i]` IS THE MEAN OF CHAIN i's PAIR SCORES, AF3's
+ * `iptm_xchain`: each other chain's `chain_pair_iptm` with it, averaged. It was
+ * the best anchor's mean over every other chain's tokens pooled - the same for
+ * two chains, not for three.
+ *
+ * `frame` (tokenFrameMask): the tokens that may be anchors, AF3's
+ * `pae_single_mask` - an ion has no frame and aligns nothing.
  *
  * @returns {{chains: number[], chainPtm: Map<number, number>,
  *            chainIptm: Map<number, number>}}
  */
-export function perChainTmScores(term, tokens, asymId, seqMask) {
+export function perChainTmScores(term, tokens, asymId, seqMask, frame = undefined) {
   const chains = [];
   for (let i = 0; i < tokens; i += 1) {
     if (seqMask[i] > 0 && !chains.includes(asymId[i])) chains.push(asymId[i]);
@@ -250,21 +259,141 @@ export function perChainTmScores(term, tokens, asymId, seqMask) {
   chains.sort((a, b) => a - b);
   const chainPtm = new Map();
   const chainIptm = new Map();
+  const pairs = chainPairTmScores(term, tokens, asymId, seqMask, frame).scores;
   for (const chain of chains) {
-    const admitted = (i, j) => seqMask[i] > 0 && seqMask[j] > 0;
-    const within = reduceTmScore(term, tokens, (i, j) => admitted(i, j)
-      && asymId[i] === chain && asymId[j] === chain);
+    const within = reduceTmScore(term, tokens, (i, j) => seqMask[i] > 0 && seqMask[j] > 0
+      && (frame === undefined || frame[i]) && asymId[i] === chain && asymId[j] === chain);
     if (Number.isFinite(within)) chainPtm.set(chain, within);
-    // ...exactly one side in this chain. Both sides would be the score above,
-    // and neither would be a different chain's business entirely.
-    const across = reduceTmScore(term, tokens, (i, j) => admitted(i, j)
-      && ((asymId[i] === chain) !== (asymId[j] === chain)));
-    if (Number.isFinite(across)) chainIptm.set(chain, across);
+    let total = 0;
+    let count = 0;
+    for (const other of chains) {
+      if (other === chain) continue;
+      const score = pairs.get(chain < other ? `${chain}|${other}` : `${other}|${chain}`);
+      if (score !== undefined && Number.isFinite(score)) { total += score; count += 1; }
+    }
+    if (count > 0) chainIptm.set(chain, total / count);
   }
   return { chains, chainPtm, chainIptm };
 }
 
-export function chainPairTmScores(term, tokens, asymId, seqMask) {
+/**
+ * AlphaFold 3's interface TM term's inputs, packed for a shader: each token's
+ * dense chain index (-1: not live), the chain count, then a chain pair's bins'
+ * weights `1 / (1 + centre^2 / d0^2)` at d0 of the pair's tokens - the chain's
+ * own on the diagonal, the two chains' summed off it (confidence_head.py's
+ * num_interface_tokens). `chainOf` any id a token (< 0: none), `live` the
+ * tokens counted. [tokens + 1 + chains^2 bins] floats.
+ */
+export function chainTmInfo(chainOf, live, binCentres, counted = undefined) {
+  // (counted: the tokens d0 counts, where they are not these - OpenDDE's head runs on structural tokens and its
+  // scores are reported over the residues: {chainOf, live} of the residue tokens)
+  const tokens = chainOf.length;
+  const countOf = counted?.chainOf ?? chainOf;
+  const countLive = counted?.live ?? live;
+  const ids = [];
+  for (let i = 0; i < countOf.length; i += 1) {
+    if (countLive[i] > 0 && countOf[i] >= 0 && !ids.includes(countOf[i])) ids.push(countOf[i]);
+  }
+  ids.sort((a, b) => a - b);
+  const chains = ids.length;
+  const bins = binCentres.length;
+  const info = new Float32Array(tokens + 1 + Math.max(chains, 1) ** 2 * bins);
+  const count = new Array(chains).fill(0);
+  for (let i = 0; i < countOf.length; i += 1) {
+    if (countLive[i] > 0 && countOf[i] >= 0) count[ids.indexOf(countOf[i])] += 1;
+  }
+  for (let i = 0; i < tokens; i += 1) info[i] = live[i] > 0 && chainOf[i] >= 0 ? ids.indexOf(chainOf[i]) : -1;
+  info[tokens] = chains;
+  for (let a = 0; a < chains; a += 1) {
+    for (let b = 0; b < chains; b += 1) {
+      const perBin = tmPerBinFor(binCentres, tmScoreD0(a === b ? count[a] : count[a] + count[b]));
+      info.set(perBin, tokens + 1 + (a * chains + b) * bins);
+    }
+  }
+  return info;
+}
+
+/**
+ * The interface TM term on the host, off PAE logits [tokens^2, bins] and a
+ * chainTmInfo - the shaders' arithmetic, for the readouts' host reference.
+ */
+export function interfaceTmTerm(logits, tokens, info) {
+  const chains = info[tokens];
+  const bins = (info.length - tokens - 1) / Math.max(chains, 1) ** 2;
+  const out = new Float32Array(tokens * tokens);
+  for (let i = 0; i < tokens; i += 1) {
+    for (let j = 0; j < tokens; j += 1) {
+      const a = info[i];
+      const b = info[j];
+      if (a < 0 || b < 0) continue;
+      const base = (i * tokens + j) * bins;
+      const table = tokens + 1 + (a * chains + b) * bins;
+      let largest = -Infinity;
+      for (let k = 0; k < bins; k += 1) largest = Math.max(largest, logits[base + k]);
+      let total = 0;
+      let weighted = 0;
+      for (let k = 0; k < bins; k += 1) {
+        const e = Math.exp(logits[base + k] - largest);
+        total += e;
+        weighted += e * info[table + k];
+      }
+      out[i * tokens + j] = weighted / total;
+    }
+  }
+  return out;
+}
+
+/**
+ * AlphaFold 3's token frames' validity (features.py, Frames.compute_features),
+ * the pTM scores' anchors (model.py's pae_single_mask, the rows alone): every
+ * polymer token has a frame; a ligand token one only where its residue has three
+ * tokens or more and the token with its two nearest by the reference conformer
+ * is not within 25 degrees of colinear (1 - |cos| < 0.0937, or two at one
+ * place). An ion, a two-atom ligand: no anchor. cuda/af3/src/frames.cuh's twin.
+ *
+ * @returns {Uint8Array} tokens, 1 where the token may anchor a pTM alignment
+ */
+export function tokenFrameMask({ tokens, dense, isLigand, asymId, residueIndex, refPos, refMask }) {
+  const ok = new Uint8Array(tokens).fill(1);
+  if (isLigand === undefined || refPos === undefined) return ok;
+  const at = (t) => {     // a ligand token's one atom: its first live slot
+    for (let s = 0; s < dense; s += 1) {
+      const k = t * dense + s;
+      if (refMask[k] > 0) return [refPos[k * 3], refPos[k * 3 + 1], refPos[k * 3 + 2]];
+    }
+    return null;
+  };
+  for (let t = 0; t < tokens; t += 1) {
+    if (!isLigand[t]) continue;
+    const local = [];
+    for (let u = 0; u < tokens; u += 1) {
+      if (isLigand[u] && asymId[u] === asymId[t] && residueIndex[u] === residueIndex[t]) local.push(u);
+    }
+    if (local.length < 3) { ok[t] = 0; continue; }
+    const xt = at(t);
+    const cost = local.map((u) => {
+      const xu = at(u);
+      let d = xu !== null && xt !== null ? Math.hypot(xu[0] - xt[0], xu[1] - xt[1], xu[2] - xt[2]) : 0;
+      if (xu === null) d += 1e8;
+      if (u === t) d += 1e8;
+      return [d, u];
+    });
+    cost.sort((x, y) => x[0] - y[0]);      // (ties in token order; AF3's argsort leaves them to its sort - real distances do not tie)
+    const xa = at(cost[0][1]) ?? [0, 0, 0];
+    const xc = at(cost[1][1]) ?? [0, 0, 0];
+    const base = xt ?? [0, 0, 0];
+    const v1 = [0, 1, 2].map((d) => xa[d] - base[d]);
+    const v2 = [0, 1, 2].map((d) => xc[d] - base[d]);
+    const n1 = Math.hypot(...v1);
+    const n2 = Math.hypot(...v2);
+    if (n1 < 1e-8 || n2 < 1e-8) { ok[t] = 0; continue; }
+    const cos = (v1[0] * v2[0] + v1[1] * v2[1] + v1[2] * v2[2]) / (n1 * n2);
+    ok[t] = 1 - Math.abs(cos) < 0.0937 ? 0 : 1;
+  }
+  return ok;
+}
+
+export function chainPairTmScores(term, tokens, asymId, seqMask, frame = undefined) {
   const chains = [];
   for (let i = 0; i < tokens; i += 1) {
     if (seqMask[i] > 0 && !chains.includes(asymId[i])) chains.push(asymId[i]);
@@ -276,10 +405,62 @@ export function chainPairTmScores(term, tokens, asymId, seqMask) {
       const first = chains[a];
       const second = chains[b];
       const score = reduceTmScore(term, tokens, (i, j) => seqMask[i] > 0 && seqMask[j] > 0
+        && (frame === undefined || frame[i])
         && ((asymId[i] === first && asymId[j] === second)
           || (asymId[i] === second && asymId[j] === first)));
       if (Number.isFinite(score)) scores.set(`${first}|${second}`, score);
     }
   }
   return { chains, scores };
+}
+
+/**
+ * AlphaFold 3's five TM numbers from the two terms: pTM, ipTM, and the three
+ * chain-level scores the AF3 server writes beside them.
+ *
+ * 🔴 ONE DEFINITION, BECAUSE THERE WERE THREE AND THE THIRD WAS THE OLD ONE.
+ * The page's WebGPU fold, the page's WebGL2 fold and the WebGL2 fold TOOL each
+ * wrote this reduction out by hand, and the tool's copy went through
+ * `cpu/af3/confidence/ptm.js` - anchors over every live token and no chain
+ * fields at all - so the chain-pTM fix (reported by Yeqing Lin) could not be
+ * checked through the one tool that folds AF3 on that backend. The two page
+ * copies agreed only because they were written on the same afternoon.
+ *
+ * 🔴 AND THE TWO TERMS ARE NOT INTERCHANGEABLE. `tmAdjusted` is the GLOBAL term
+ * (one d0 over every token) and pTM and ipTM are reduced from it, which is what
+ * AF3's `_compute_ptm` reads for both; `tmInterface` is the interface term (d0
+ * from the pair's own chains, see chainTmInfo) and every CHAIN score is reduced
+ * from that. Swapping them leaves a plausible number between 0 and 1: on the
+ * global term a short chain in a large complex read ~0.10 high.
+ *
+ * `frame` is tokenFrameMask - the tokens that may be ANCHORS, AF3's
+ * `pae_single_mask`. Pass it; `undefined` anchors on every live token, which is
+ * what AlphaFold 2 does (every AF2 token is a residue, so every one has a
+ * frame) and is wrong wherever an ion or a two-atom ligand is a token.
+ *
+ * @param {{tmAdjusted: ArrayLike<number>, tmInterface: ArrayLike<number>,
+ *   tokens: number, asymId: ArrayLike<number>, seqMask: ArrayLike<number>,
+ *   frame?: ArrayLike<number>}} input
+ * @returns {{ptm: number, iptm: number, chainPtm: Object<string, number>,
+ *   chainIptm: Object<string, number>, chainPairIptm: Object<string, number>}}
+ *   ipTM is NaN for a single chain - there is no interface to score, and zero
+ *   would read as a confident failure; a chain whose score is not finite is
+ *   ABSENT from its map rather than null (an ion anchors nothing).
+ */
+export function af3TmScores({ tmAdjusted, tmInterface, tokens, asymId, seqMask, frame }) {
+  const selected = (i, j) => seqMask[i] > 0 && seqMask[j] > 0
+    && (frame === undefined || frame[i] === 1);
+  const perChain = perChainTmScores(tmInterface, tokens, asymId, seqMask, frame);
+  return {
+    ptm: reduceTmScore(tmAdjusted, tokens, selected),
+    iptm: reduceTmScore(tmAdjusted, tokens,
+      (i, j) => selected(i, j) && asymId[i] !== asymId[j]),
+    // ...and one score per INTERFACE, because the pooled ipTM averages them: an
+    // assembly holding a native dimer and a designed binder reports the easy
+    // interface's confidence for the hard one. See chainPairTmScores.
+    chainPairIptm: Object.fromEntries(
+      chainPairTmScores(tmInterface, tokens, asymId, seqMask, frame).scores),
+    chainPtm: Object.fromEntries(perChain.chainPtm),
+    chainIptm: Object.fromEntries(perChain.chainIptm),
+  };
 }

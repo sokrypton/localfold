@@ -19,6 +19,7 @@
 import { GRID_WIDTH, LANES, createLayerNormShader, createLinearShader, linearGrid }
   from "../esmc/block.js";
 import { settleAll } from "../runtime/pipeline-cache.js";
+import { rangeOf } from "../runtime/segmented.js";
 
 /** How many pair rows the shim builds at once. */
 export const SHIM_CHUNK = 8192;
@@ -136,8 +137,7 @@ export async function encodeLanguagePair(context, { tokens, channels, single, we
       const rows = Math.min(height, pairs - offset);
       const p = pipelines[rows];
       device.queue.writeBuffer(start.buffer, 0, Uint32Array.of(offset));
-      const out = { buffer: destination.buffer, byteOffset: offset * channels * 4,
-                    byteSize: rows * channels * 4 };
+      const out = rangeOf(destination, offset * channels * 4, rows * channels * 4);
       await submit("esmfold2.shim", [
         ["join", p.join, [singleBuffer, start, joined], ...elementwise(rows * channels)],
         ["mlp1", p.first, [joined, firstWeights, hidden], ...linearGrid(rows, channels)],

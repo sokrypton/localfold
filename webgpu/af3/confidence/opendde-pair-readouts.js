@@ -26,6 +26,7 @@ import { GpuBufferAllocator } from "../../runtime/allocator.js";
 import { residentWeightBuffer } from "../../runtime/resident.js";
 import { DeferredValidation } from "../../runtime/validation.js";
 import { tmPerBinFor, tmScoreD0 } from "../../../shared/heads/tm-score.js";
+// (the interface term's tables come in as a buffer: shared/heads/tm-score.js, chainTmInfo)
 
 const GRID_WIDTH = 32_768;
 const LANES = 64;
@@ -68,7 +69,11 @@ const EPSILON: f32 = 1.0e-5;
 @group(0) @binding(2) var<storage, read> offset: array<f32>;
 @group(0) @binding(3) var<storage, read> projection: array<f32>;
 @group(0) @binding(4) var<storage, read_write> expected: array<f32>;
-${tmPerBin === null ? "" : `@group(0) @binding(5) var<storage, read_write> tm: array<f32>;
+${tmPerBin === null ? "" : `// [0, ROWS) the global term, [ROWS, 2 ROWS) AlphaFold 3's interface term - d0
+// from the pair's chains (chain_info: each token's chain, the chain count, a
+// chain pair's bins' weights), what chain_pair_iptm and chain_ptm read
+@group(0) @binding(5) var<storage, read_write> tm: array<f32>;
+@group(0) @binding(6) var<storage, read> chain_info: array<f32>;
 const TM_PER_BIN = array<f32, ${bins}>(${Array.from(tmPerBin).join(", ")});`}
 
 var<workgroup> reduce: array<f32, LANES>;
@@ -162,15 +167,22 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   var lane_total = 0.0;
   var lane_weighted = 0.0;
   var lane_tm = 0.0;
+  var lane_chain = 0.0;
   if (has_bin) {
     let value = exp(my_logit - peak);
     lane_total = value;
     lane_weighted = value * (MIN_BIN + BIN_WIDTH * (f32(lane) + 0.5));
-${tmPerBin === null ? "" : "    lane_tm = value * TM_PER_BIN[lane];"}
+${tmPerBin === null ? "" : `    lane_tm = value * TM_PER_BIN[lane];
+    let chain_i = i32(chain_info[row / TOKENS]);
+    let chain_j = i32(chain_info[row % TOKENS]);
+    if (chain_i >= 0 && chain_j >= 0) {
+      lane_chain = value * chain_info[TOKENS + 1u + (u32(chain_i) * u32(chain_info[TOKENS]) + u32(chain_j)) * BINS + lane];
+    }`}
   }
-  let sums = total_of_v4(lane, vec4<f32>(lane_total, lane_weighted, lane_tm, 0.0));
+  let sums = total_of_v4(lane, vec4<f32>(lane_total, lane_weighted, lane_tm, lane_chain));
   if (lane == 0u) {
-${tmPerBin === null ? "" : "    tm[row] = sums.z / sums.x;"}
+${tmPerBin === null ? "" : `    tm[row] = sums.z / sums.x;
+    tm[ROWS + row] = sums.w / sums.x;`}
     expected[row] = sums.y / sums.x;
   }
 }`;
@@ -490,8 +502,13 @@ export async function openddePairReadouts(device, input, weights) {
     const outputs = arms.map((arm) => keep(allocator.allocate(
       `opendde-conf.${arm.name}`, rows * 4, storage | GPUBufferUsage.COPY_SRC)));
     const tmOut = tmTokens === undefined ? null : keep(allocator.allocate(
-      "opendde-conf.tm", rows * 4, storage | GPUBufferUsage.COPY_SRC));
-    const planes = tmOut === null ? 2 : 3;
+      "opendde-conf.tm", 2 * rows * 4, storage | GPUBufferUsage.COPY_SRC));
+    if (tmOut !== null && input.tmChainInfo === undefined) {
+      throw new Error("the OpenDDE readouts' TM term needs tmChainInfo for chain_pair_iptm's interface term");
+    }
+    const chainInfo = tmOut === null ? null
+      : keep(allocator.upload("opendde-conf.chain-info", input.tmChainInfo, storage));
+    const planes = tmOut === null ? 2 : 4;
     const readback = keep(allocator.allocate(
       "opendde-conf.rb-pairs", planes * rows * 4,
       GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
@@ -506,7 +523,7 @@ export async function openddePairReadouts(device, input, weights) {
         resident(`opendde-conf.${arm.name}-offset`, () => arm.offset),
         resident(`opendde-conf.${arm.name}-projection`, () => arm.projection),
         outputs[index],
-        ...(arm.tm ? [tmOut] : [])];
+        ...(arm.tm ? [tmOut, chainInfo] : [])];
       pass.setPipeline(compiled[index]);
       pass.setBindGroup(0, device.createBindGroup({
         layout: compiled[index].getBindGroupLayout(0),
@@ -519,7 +536,7 @@ export async function openddePairReadouts(device, input, weights) {
     pass.end();
     arms.forEach((arm, index) => {
       encoder.copyBufferToBuffer(outputs[index].buffer, 0, readback.buffer, index * rows * 4, rows * 4);
-      if (arm.tm) encoder.copyBufferToBuffer(tmOut.buffer, 0, readback.buffer, 2 * rows * 4, rows * 4);
+      if (arm.tm) encoder.copyBufferToBuffer(tmOut.buffer, 0, readback.buffer, 2 * rows * 4, 2 * rows * 4);
     });
     device.queue.submit([encoder.finish()]);
     validation.end("pair readouts");
@@ -528,9 +545,10 @@ export async function openddePairReadouts(device, input, weights) {
     const pae = mapped.slice(0, rows);
     const pde = mapped.slice(rows, 2 * rows);
     const tm = tmOut === null ? undefined : mapped.slice(2 * rows, 3 * rows);
+    const tmChain = tmOut === null ? undefined : mapped.slice(3 * rows, 4 * rows);
     readback.buffer.unmap();
     await validation.settle();
-    return { pae, pde, ...(tm === undefined ? {} : { tm }) };
+    return { pae, pde, ...(tm === undefined ? {} : { tm, tmChain }) };
   } finally {
     for (let index = allocations.length - 1; index >= 0; index -= 1) allocations[index].release();
   }

@@ -17,6 +17,29 @@ is documentation and tooling only.
 
 ## Open, in the order they are worth doing
 
+### Chain-level pTM: fixed on CUDA, the page and Metal; what is left (reported 2026-11-07)
+Reported by Yeqing Lin ("localfold binder pTM bug and fix", against `500165d7`): a short
+binder's `chain_ptm` read ~0.10 high against AF3. Three gaps, all now closed to AF3's own
+functions (`confidence_head.py`'s interface `tmscore_adjusted_pae`, `confidences.py`'s
+`chain_pairwise_predicted_tm_scores` / `get_iptm_xchain`, `model.py`'s `pae_single_mask`):
+the chain-level scores reduce the INTERFACE term (d0 from the pair's own chains), `chain_iptm`
+is the mean of a chain's pair ipTMs, and only tokens with frames anchor.
+
+* **CUDA** `64685f25` - held by `tools/oracle/check_chain_ptm.py --dump=` on five jobs and two
+  OpenDDE folds, exact. The sharded (multi-GPU) head is wired the same way and NOT RUN.
+* **Page** `733d77d8` - `--scores=` off `tools/gpu/fold.js --tm-check`, exact on barnase and
+  calmodulin (OpenBind-0) and OpenDDE; `test/chain-ptm-af3.test.js`. boltz2's page path untested.
+* **Metal** `573a18a0` - **NOT BUILT OR RUN** (no Mac here). The interface term is taken on the
+  host off the PAE logits (`metal/af3/frames.h`). Wants `metal/af3/gate.py` and
+  `check_chain_ptm.py` on Apple silicon; Metal has no `AF3_PAE_OUT` dump yet, so the check is
+  the `--scores`-style comparison or a dump to add.
+* **Standardised (2026-11-07, the user's call): every model's AF3-named chain fields are AF3's.**
+  `cuda/featurise/ptm.h` is the native ports' one definition (cuda/af3, cuda/ef2, metal/af3, metal/ef2);
+  `shared/heads/tm-score.js` the page's (AF3 lineage, WebGL2 AF3, AF2, ESMFold2). ESMFold2 keeps ESM's own pTM / ipTM
+  (ESM's reference: d0 and anchors over every token, no chain_ptm, a directional pair_chains_iptm). cuda/ef2
+  barnase-barstar chain_ptm 0.9748/0.9795 -> 0.9585/0.9578. Still without chain fields: cuda/af2, metal/af2, the
+  WebGL2 AF2 path. **Metal is edited blind** - docs/A100-TO-METAL.md is the Mac agent's brief.
+
 ### The two held-back pages
 `single.html` and `proteinhunter.html` are gitignored and on disk, out of the
 repository and off the site until they are fixed and checked - they were built

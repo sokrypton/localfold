@@ -152,6 +152,9 @@ export class ComputePipelineCache {
     const target = { pipeline, requests: 1 };
     this.#pipelines.set(key, { code, entryPoint, target });
     this.#byContent.set(content, target);
+    // Whoever awaits it hears a failure, and a compile a stopped fold has left behind tells nobody. A refusal is not kept: a
+    // driver out of memory once may not be again, and every later fold on this device would have failed on the first's answer.
+    pipeline.catch(() => this.#forget(target, content));
     // 🔴 TIERED: THE UNROLLED KERNEL FOLLOWS, ONE AT A TIME, BEHIND THE FOLD.
     // The opaque-bound variant compiles ~12x faster and runs up to 1.5x slower
     // (a T4's warm AF3 fold at 68 residues, 1.2 -> 1.9 s), so a first fold takes
@@ -167,6 +170,14 @@ export class ComputePipelineCache {
       this.#drainUpgrades();
     }
     return pipeline;
+  }
+
+  #forget(target, content) {
+    if (this.#byContent.get(content) === target) this.#byContent.delete(content);
+    for (const [key, entry] of this.#pipelines) {
+      if (entry.target === target) this.#pipelines.delete(key);
+    }
+    this.#pendingUpgrades = this.#pendingUpgrades.filter((entry) => entry.target !== target);
   }
 
   /**
@@ -205,6 +216,8 @@ export class ComputePipelineCache {
         },
       });
       this.#bySkeleton.set(groupKey, generic);
+      const asked = generic;
+      asked?.catch(() => { if (this.#bySkeleton.get(groupKey) === asked) this.#bySkeleton.delete(groupKey); });
     } else {
       pipelineCacheStats.generic += 1;
     }

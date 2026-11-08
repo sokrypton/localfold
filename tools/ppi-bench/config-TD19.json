@@ -1,0 +1,1 @@
+{"tag": "TD19", "pair": "T", "cycles": 6, "steps": 100, "recycles": 3, "restarts": 10, "contactTries": 5, "minFootprint": 8, "omit": {"dna": "CDE"}, "stop": {"iptm": 0.85, "ipae": 1.2}, "check": {"top": 3, "iptm": 0.8, "ipae": 2.5}, "stick": true, "mpnn": {"dna": "na_mpnn_design.mpnn"}, "polish": {"from": 2, "draws": 8, "top": 3}}

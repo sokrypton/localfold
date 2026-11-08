@@ -23,6 +23,7 @@ import { af3BatchFromA3m } from "../shared/af3/featurise/batch.js";
 import { featuriserDialect, templatePolicyFor } from "../shared/af3/dialect.js";
 import { foldBatch, toPdb, atomName, warmTrunkPipelines }
   from "../webgpu/af3/fold.js";
+import { foldBatchWebGl2 } from "../webgl/af3/model/fold-batch.js";
 import { confidenceWeights, openddeConfidenceWeights, structuralExpanderWeights,
   structuralRefinerWeights, trunkDepths, trunkWeights } from "../shared/af3/weights/weights.js";
 import { diffusionWeights, atomReference, targetFeatureWeights }
@@ -240,6 +241,8 @@ export function loadAf3Weights(onProgress, family = "af3") {
       return built;
     })();
     weightsPromises.set(family, promise);
+    // A download that failed once must not fail until the reader reloads (PR #7, lhallee).
+    promise.catch(() => { if (weightsPromises.get(family) === promise) weightsPromises.delete(family); });
   }
   return promise;
 }
@@ -678,7 +681,17 @@ export async function foldAf3(options) {
   // sampler holds DENSE SLOTS: resolved here, the one place the batch exists (cpu/af3/diffusion/inpaint.js)
   const motif = options.motif === undefined ? undefined
     : { ...motifSlots(batch, options.motif.atoms), ...(options.motif.until === undefined ? {} : { until: options.motif.until }) };
-  const result = await foldBatch(device, batch, options.weights, {
+  // 🔴 WITHOUT WebGPU, THE WebGL2 FOLD (`backend: "webgl2"`), with the same result. It calls the
+  // stage and step reports synchronously and stops on `signal` itself, so their promises are only
+  // caught here: an abort they throw would otherwise be an unhandled rejection.
+  const fold = options.backend === "webgl2"
+    ? (_device, foldBatchArgs, foldWeights, foldOptions) => foldBatchWebGl2(foldBatchArgs, foldWeights, {
+      ...foldOptions, signal,
+      onStage: (name, detail) => { foldOptions.onStage(name, detail).catch(() => {}); },
+      onStep: (frame) => { foldOptions.onStep(frame).catch(() => {}); },
+    })
+    : foldBatch;
+  const result = await fold(device, batch, options.weights, {
     steps: calls, recycles, seed, reuse: options.reuse, templateSlots,
     ...(steer === undefined ? {} : { steer }),
     ...(motif === undefined ? {} : { motif }),

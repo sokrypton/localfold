@@ -50,9 +50,11 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
  * 🔴 PROJECT THEN BROADCAST, NEVER BROADCAST THEN PROJECT. The two per-token
  * projections are done on the host - 2n rows of 451 channels - and this only
  * places them, which is the difference between 2n projections and 2n^2.
+ *
+ * Over one chunk of pair rows, whose first row is `start[0]`: the relative and
+ * bond terms are built for just those rows, so the fold never holds them whole.
  */
-export function createZInitShader({ tokens, channels, hasBonds, hasLanguageModel }) {
-  const pairs = tokens * tokens;
+export function createZInitShader({ tokens, channels, chunkRows, hasBonds, hasLanguageModel }) {
   return `
 @group(0) @binding(0) var<storage, read> rows: array<f32>;
 @group(0) @binding(1) var<storage, read> columns: array<f32>;
@@ -60,12 +62,13 @@ export function createZInitShader({ tokens, channels, hasBonds, hasLanguageModel
 ${hasBonds ? "@group(0) @binding(3) var<storage, read> bonds: array<f32>;" : ""}
 ${hasLanguageModel ? `@group(0) @binding(${hasBonds ? 4 : 3}) var<storage, read> language: array<f32>;` : ""}
 @group(0) @binding(${3 + (hasBonds ? 1 : 0) + (hasLanguageModel ? 1 : 0)}) var<storage, read_write> output: array<f32>;
+@group(0) @binding(${4 + (hasBonds ? 1 : 0) + (hasLanguageModel ? 1 : 0)}) var<storage, read> start: array<u32>;
 
 @compute @workgroup_size(${LANES})
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let i = id.x + id.y * ${GRID_WIDTH * LANES}u;
-  if (i >= ${pairs * channels}u) { return; }
-  let pair = i / ${channels}u;
+  if (i >= ${chunkRows * channels}u) { return; }
+  let pair = start[0] + i / ${channels}u;
   let c = i % ${channels}u;
   let row = pair / ${tokens}u;
   let column = pair % ${tokens}u;

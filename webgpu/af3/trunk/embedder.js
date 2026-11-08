@@ -36,8 +36,11 @@ import { deviceTuning } from "../../runtime/device-profile.js";
 import { pipelineCacheForDevice } from "../../runtime/pipeline-cache.js";
 import { SOURCES, carriesTensor } from "../../../shared/weights/weight-sources.js";
 import { boltz2ContactTable } from "../../../shared/af3/featurise/constraints.js";
+import { rowPieces } from "./sequential-groups.js";
 
 const GRID_WIDTH = 32_768;
+/** channels^2 x pairs a dispatch of the pair kernel, each its own submission: about 2 ms on an A10 and 6 ms on a T4. */
+const EMBED_PAIR_STEP_WORK = 2e9;
 const MAX_RELATIVE_IDX = 32;
 const MAX_RELATIVE_CHAIN = 2;
 const POSITION_BINS = 2 * MAX_RELATIVE_IDX + 2;   // 66
@@ -247,9 +250,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 @group(0) @binding(4) var<storage, read> weights: array<f32>;
 @group(0) @binding(5) var<storage, read> bonds: array<f32>;
 @group(0) @binding(6) var<storage, read_write> pair: array<f32>;
+@group(0) @binding(7) var<uniform> row_range: vec4<u32>;
 ${shape.recycleDropout === true ? `// protenix's MC dropout on the recycled term (shared/af3/msa-draw.js mcDropoutKeep): this pass's key, the keep
 // threshold, and 1 / (1 - rate) as bits - a buffer, not a constant, or every pass would compile its own kernel
-@group(0) @binding(7) var<storage, read> drop: array<u32>;
+@group(0) @binding(8) var<storage, read> drop: array<u32>;
 fn mix32(v: u32) -> u32 {
   var x = v;
   x = x ^ (x >> 16u); x = x * 0x7feb352du; x = x ^ (x >> 15u); x = x * 0x846ca68bu; x = x ^ (x >> 16u);
@@ -274,8 +278,8 @@ ${variance === "fast" ? "var<workgroup> reduce_b: array<f32, 64>;\n" : ""}\
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) group: vec3<u32>,
         @builtin(local_invocation_id) local_id: vec3<u32>) {
-  let row = group.x + group.y * GRID_WIDTH;
-  if (row >= PAIRS) { return; }
+  let row = row_range.x + group.x + group.y * GRID_WIDTH;
+  if (row >= row_range.y) { return; }
   let local = local_id.x;
   let i = row / TOKENS;
   let j = row % TOKENS;
@@ -749,7 +753,7 @@ export class Af3EmbedderGpu {
 
       if (options.validation !== undefined) options.validation.begin();
       else this.device.pushErrorScope("validation");
-      const encoder = this.device.createCommandEncoder({ label: "af3-embedder" });
+      let encoder = this.device.createCommandEncoder({ label: "af3-embedder" });
       for (const buffer of pendingClears) encoder.clearBuffer(buffer);
       const batchPasses = deviceTuning(this.device).batchComputePasses !== false;
       let openPass = null;
@@ -791,16 +795,24 @@ export class Af3EmbedderGpu {
       run("embed.project-tokens", compiled.projectTokens,
           [targetFeat, weightBuffer, left, right, msaFromTarget, pairSource],
           ...spread(Math.ceil(tokens * Math.max(pairChannels, msaChannels) / 64)));
-      const perPair = spread(pairs);
       const dropBuffers = [];
       if (input.recycleDropout !== undefined) {
         const { key, threshold, scale } = input.recycleDropout;
         const words = Uint32Array.of(key, threshold, new Uint32Array(Float32Array.of(scale).buffer)[0], 0);
         dropBuffers.push(keep(this.allocator.upload("af3-embed.drop", words, storage)));
       }
-      run("embed.assemble-pair", compiled.assemblePair,
-          [left, right, previousPair, features, weightBuffer, bondMatrix, pair, ...dropBuffers],
-          perPair[0], perPair[1]);
+      // A pair is its own in this kernel, and the whole of them is one dispatch of 175 to 330 ms on an A10 at 600 tokens.
+      for (const { first, count } of rowPieces(pairs, pairChannels * pairChannels, EMBED_PAIR_STEP_WORK)) {
+        const rowRange = keep(this.allocator.upload("af3-embed.row-range", new Uint32Array([first, first + count, 0, 0]),
+                                                    GPUBufferUsage.UNIFORM));
+        const perPair = spread(count);
+        run("embed.assemble-pair", compiled.assemblePair,
+            [left, right, previousPair, features, weightBuffer, bondMatrix, pair, rowRange, ...dropBuffers],
+            perPair[0], perPair[1]);
+        endPass();
+        this.device.queue.submit([encoder.finish()]);
+        encoder = this.device.createCommandEncoder({ label: "af3-embedder" });
+      }
       const perRow = spread(Math.ceil(rows / 64));
       run("embed.assemble-msa", compiled.assembleMsa,
           [codes, deletions, msaFromTarget, weightBuffer, msa], perRow[0], perRow[1]);

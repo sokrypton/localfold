@@ -47,7 +47,7 @@ export async function residentTensorOnDevice(device, options) {
     // 🔴 NOT AWAITED. The staging goes when the queue says so; waiting here
     // would put a host-device synchronisation inside `prepare`, which is the
     // one place this is trying to take work OUT of.
-    void device.queue.onSubmittedWorkDone().then(release);
+    void device.queue.onSubmittedWorkDone().then(release, release);
   }, variant);
 }
 
@@ -86,6 +86,6 @@ export async function residentPairOnDevice(device, options) {
   const bytes = destination === "f32" ? length * 4 : Math.ceil(length / 2) * 4;
   return residentWeightBufferFilled(device, key, label, bytes, async (buffer) => {
     const release = await runBlockUpload(device, planned.gpu, buffer);
-    void device.queue.onSubmittedWorkDone().then(release);
+    void device.queue.onSubmittedWorkDone().then(release, release);
   }, variant);
 }

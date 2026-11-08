@@ -118,7 +118,7 @@ export class EvoformerStackGpu {
           const submitted = block + 1;
           const total = input.blockWeights.length;
           void this.device.queue.onSubmittedWorkDone()
-            .then(() => input.onBlockDone(submitted, total));
+            .then(() => input.onBlockDone(submitted, total)).catch(() => {});
         }
       }
 
@@ -212,7 +212,7 @@ export class ExtraMsaPairStackGpu {
           const submitted = block + 1;
           const total = input.blockWeights.length;
           void this.device.queue.onSubmittedWorkDone()
-            .then(() => input.onBlockDone(submitted, total));
+            .then(() => input.onBlockDone(submitted, total)).catch(() => {});
         }
       }
       // 🔴 NOTHING IS WAITED FOR WHEN THE PAIR STAYS PUT. The readback below is

@@ -170,3 +170,5 @@ oracle-dumps-colab/
 model-rfd4p-int8/*.bin
 model-rfd4p-int8/*.safetensors
 model-rfd4p-int8/shards/
+# metal/rfd4p/gate.py's reference trajectories: a CPU forward per arm, gigabytes, rebuilt on demand
+/.rfd4p-gate/

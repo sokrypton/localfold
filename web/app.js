@@ -56,12 +56,13 @@ import { BioEmu2Graph } from "../shared/bioemu2/graph.js";
 import { checkPhysicality } from "../shared/bioemu2/physicality.js";
 import { chainGeometryOf, chainGeometryVerdict } from "../shared/af3/chain-geometry.js";
 import { ccdUrl, parseCcdComponent } from "../shared/af3/featurise/ccd-component.js";
+import { CROSSLINKER_COMPONENTS } from "../shared/chem/crosslinkers.js";
 import { smilesComponent } from "../shared/chem/component.js";
 import { GpuBufferAllocator } from "../webgpu/runtime/allocator.js";
-import { getDevice, loadModel, releaseModel } from "./model.js";
+import { foldBackend, getDevice, loadModel, releaseModel } from "./model.js";
 import { releaseAllWeights } from "../webgpu/runtime/resident.js";
 import { AF3_FAMILIES, ALL_ATOM_FAMILIES, BIOEMU2_FAMILIES, MODEL_BUNDLES, MODELS_WITHOUT_CONFIDENCE,
-  SINGLE_SEQUENCE_FAMILIES, graphFamily }
+  SINGLE_SEQUENCE_FAMILIES, WEBGL2_FAMILIES, graphFamily }
   from "../shared/bundles/manifests/index.js";
 import { devBeginRun, devEndRun, devNote, devPhase, devStatus, devUseDevice } from "./dev-log.js";
 import { installDevPanel } from "./dev-panel.js";
@@ -85,6 +86,7 @@ import {
 import { looksLikeZip, readZip, writeZip } from "./zip.js";
 import { createEntityList } from "./entity-ui.js";
 import { buildTemplate, describeCoverage, fetchStructure, mergeAtom37Templates, parseSource } from "./template-source.js";
+import { IMPOSSIBLE_FOLD, isImpossibleFold } from "./impossible-fold.js";
 import { fetchMmseqs2Templates } from "../shared/input/mmseqs2-api.js";
 import { RuntimeEstimator } from "../webgpu/runtime/cost-model.js";
 import { nativeRole, installNativeBridge, remoteBackendChoice, remoteBackendName, remoteCommand,
@@ -523,6 +525,14 @@ function syncDownloads() {
  * find an identity is a lookup that is neither total nor one-to-one.
  */
 function recordPrediction(prediction, family) {
+  // Every fold ends here - the native worker's too - so this is where a result that cannot be one (NaN coordinates or
+  // confidence, every atom on one point) is refused, with the trunks kept to go on from it: otherwise the same fold read
+  // NaN again from the kept trunk until a reload (PR #7, lhallee)
+  if (isImpossibleFold(prediction)) {
+    trunkCache = undefined;
+    esmfold2Trunk = undefined;
+    throw new Error(IMPOSSIBLE_FOLD);
+  }
   // The family still travels ON the prediction: the archive, the session's
   // `localfold` block and the Colab reader all read it, and a label is a
   // thing to read rather than an identifier - see the note above.
@@ -621,6 +631,12 @@ const NATIVE_ONLY_FAMILIES = ["ef2-fast", "ef2"];
 const readsNoAlignment = (family) => SINGLE_SEQUENCE_FAMILIES.includes(family);
 const isEsmfold2 = (family) => readsNoAlignment(family) || NATIVE_ONLY_FAMILIES.includes(family);
 const supportsAllAtom = (family) => ALL_ATOM_FAMILIES.includes(family) || NATIVE_ONLY_FAMILIES.includes(family);
+/**
+ * Which models read a declared covalent bond - a Bond row, and a Crosslink row, which is a bridge ligand bonded to two
+ * residues: the AlphaFold 3 lineage, ESMFold2 (its `token_bonds`, as `esm`'s own pipeline builds them) and BioEmu2
+ * (`token_bonds` from the job's `bondedAtomPairs`, Microsoft's _add_extra_covalent_bonds) - on every backend.
+ */
+const takesCovalentBonds = (family) => isAf3Family(family) || isEsmfold2(family) || BIOEMU2_FAMILIES.includes(family);
 
 /**
  * What a fold's viewer object and downloaded files are called, per model.
@@ -2995,6 +3011,8 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
     // ...and so does a constraint
     constraints: foldContext.constraints ?? [],
     alignment: alignmentBlocks === null ? null : cheapHash(JSON.stringify(alignmentBlocks)),
+    // ...and a template: adding one to a fold just run reused the trunk without it, and the status line said it had been used.
+    templates: templates.map(({ chain, kind, source, text }) => [chain, kind, source, text === undefined ? null : cheapHash(text)]),
   });
   const cached = trunkCache?.key === trunkKey ? trunkCache.reusable : undefined;
   const reuse = cached !== undefined && cached.recycles <= recycles ? cached : undefined;
@@ -3013,12 +3031,16 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   // server that might be queuing for a minute. The download reports itself on
   // the right instead, dial and label both.
   // (the device asked for first, so an Apple GPU's kernel races run under the weights' download: web/model.js)
-  const deviceStarted = getDevice();
-  deviceStarted.catch(() => {});
+  // 🔴 AND `foldBackend` IS WHAT ASKS, because on a browser with no WebGPU there is no device to
+  // await: it resolves "webgl2" and this path hands foldAf3 a `backend` instead. Started rather
+  // than awaited here for the same reason the device was - the races and the download overlap.
+  const backendStarted = foldBackend();
+  backendStarted.catch(() => {});
   const weights = await (modelLoad ?? loadAf3Weights());
   throwIfAborted(signal);
 
-  const device = await deviceStarted;
+  const backend = await backendStarted;
+  const device = backend === "webgpu" ? await getDevice() : undefined;
   throwIfAborted(signal);
 
   predictionCount += 1;
@@ -3109,6 +3131,10 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   let viewerModified = [];
   const result = await foldAf3({
     sequence, calls, recycles, weights, device, signal,
+    // 🔴 NAMED HERE OR DROPPED: this literal is an allow-list, CLAUDE.md's trap at this seam -
+    // foldAf3 reads `options.backend`, and a fold that does not pass it asks for a device that
+    // is undefined and fails inside the first kernel instead of in the backend it chose.
+    ...(backend === "webgl2" ? { backend } : {}),
     alignment: alignmentBlocks, maxMsaSequences, ligandCodes, modifications,
     chainKinds, reuse, bonds: foldContext.bonds, constraints: foldContext.constraints,
     ...(msaColumnKinds === undefined ? {} : { msaColumnKinds }),
@@ -3443,6 +3469,11 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   // lineage fold was ever checked. The number stays with the tools; the WARNING
   // appears only when `chainGeometryVerdict` refuses the fold - IntelliFold-2 in
   // Flow returns one such fold in six at pLDDT 83.
+  // 🔴 AND THE LINE SAYS WHICH BACKEND FOLDED IT, because a WebGL2 fold is the same structure and
+  // about 6x the wall clock (measured: 5.8 s against 0.9 s at 61 tokens), so a visitor comparing
+  // this page with somebody else's screenshot needs to know which one they are looking at. Nothing
+  // is said on the WebGPU path - naming the ordinary case on every fold is noise.
+  if (backend === "webgl2") detail.push("WebGL2");
   const chain = chainGeometryVerdict(result.geometry ?? {}, { plddt: result.meanPlddt });
   if (!chain.ok) detail.push("🔴 NOT A CHAIN - the backbone is broken, and pLDDT does not measure that");
   status(`${modelName} · ${what.join(" + ")} · ${detail.join(" · ")}`);
@@ -3523,6 +3554,11 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
     if (typeof entry !== "string") {
       status(`${modelName} · building ${entry.code ?? "ligand"}`);
       ligands.push(await smilesComponent(entry.smiles, { code: entry.code ?? "LIG" }));
+      continue;
+    }
+    // (a crosslinker's bridge is built in, XL-<name>, and is no PDB entry - as on the AF3 path)
+    if (CROSSLINKER_COMPONENTS[entry] !== undefined) {
+      ligands.push(parseCcdComponent(CROSSLINKER_COMPONENTS[entry]));
       continue;
     }
     status(`${modelName} · fetching ligand ${entry}`);
@@ -3660,11 +3696,16 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
   // checkpoints as setting 0.1, so a future bundle turns this on by existing
   // and the key has to be right before that rather than after.
   const lmMask = (loaded.shape.lmMaskPct ?? 0);
+  // the job's declared bonds - a Bond row's, a crosslink's two - read into `token_bonds` (featuriseForEsmfold2) and
+  // written as LINK records, so the viewer draws each as a stick
+  const declaredBonds = foldContext.bonds ?? [];
   const trunkKey = JSON.stringify({
     family: chosenFamily(), chains, chainKinds, ligandCodes,
     // A modification changes what is folded, so a trunk cached for the plain
     // chain is not this fold's.
     modifications: modifications.map((one) => `${one.code}@${one.position}`),
+    // ...and so does a declared bond: `token_bonds` reaches the trunk's pair
+    bonds: declaredBonds,
     loops: recycleCount() + 1,
     plm: plmChoice(), languageModel: usesLanguageModel(),
     lmMask, maskSeed: lmMask > 0 ? randomSeed() : null,
@@ -3676,7 +3717,8 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
     reuse,
     wantReusable: true,
     sequence,
-    entities: { sequence, chainKinds, ligands, modifications: modifyWith },
+    entities: { sequence, chainKinds, ligands, modifications: modifyWith,
+                ...(declaredBonds.length === 0 ? {} : { bonds: declaredBonds }) },
     // ...and which tokens the viewer will draw, so this path's contact map is
     // collapsed the way the AF3 one is. See viewerTokens.
     onBatch: (batch) => {
@@ -3752,7 +3794,7 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
       // quantity under the same palette, and it was measured to INVERT across
       // folds. A chain-coloured walk that ends in a real pLDDT says what is
       // known when it is known.
-      const pdb = withFrameRemark(fittedPdb(features.batch, dense, reference, slots, null));
+      const pdb = withFrameRemark(fittedPdb(features.batch, dense, reference, slots, null, { links: declaredBonds }));
       framePdbs.push(pdb);
       drawLiveFrame(pdb);
     },
@@ -3786,13 +3828,18 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
     // ...NaN where there is no interface, which is how this page already spells
     // "not applicable" for a monomer's ipTM; see confidenceJson.
     iptm: chains.length > 1 ? result.confidence.iptm : Number.NaN,
+    // ...and the chain-level scores, AlphaFold 3's as every model's are (esmfold2ChainScores). 🔴 NAMED
+    // HERE OR DROPPED: this literal is an allow-list, CLAUDE.md's trap at this seam.
+    chainPairIptm: result.confidence.chainPairIptm,
+    chainPtm: result.confidence.chainPtm,
+    chainIptm: result.confidence.chainIptm,
     contactProbs: result.contacts,
   };
   const finalDense = toDensePositions(result.features, result.coordinates);
   const pdb = withRemark(reference === null
-    ? toPdb(result.features.batch, finalDense, bFactors)
+    ? toPdb(result.features.batch, finalDense, bFactors, { links: declaredBonds })
     : fittedPdb(result.features.batch, finalDense, reference,
-                slots ?? alphaCarbons(result.features.batch), bFactors));
+                slots ?? alphaCarbons(result.features.batch), bFactors, { links: declaredBonds }));
   // 🔴 AND IN THE VIEWER'S SPACE, like the live one above: this is the copy
   // that lands on frame zero, and it is the one the AF3 path was caught by.
   const contactMap = contactMapFor(result.contacts, viewerKeep);
@@ -4120,6 +4167,8 @@ async function foldWithBioemu2({ chains, chainKinds, alignment, alignmentBlocks,
   let colouring = false;
   let liveContacts;
   const realAtoms = atomKeys.length;
+  // the job's declared bonds - a crosslink's two among them - as LINK records, so the viewer draws each as a stick
+  const declaredLinks = featurised.job?.bondedAtomPairs ?? [];
   const reps = representativeAtoms(topology, tokens);
   // every sample finished so far, in draw order; the play bar shows these once the first batch lands
   const landed = [];
@@ -4138,7 +4187,7 @@ async function foldWithBioemu2({ chains, chainKinds, alignment, alignmentBlocks,
     if (renderer === undefined || object === undefined) return;
     try {
       foldIsShowing(renderer);
-      const frame = api.frameFromText(bioemu2Pdb(atomKeys, topology, denoised.subarray(0, realAtoms * 3)));
+      const frame = api.frameFromText(bioemu2Pdb(atomKeys, topology, denoised.subarray(0, realAtoms * 3), { links: declaredLinks }));
       frame.name = frame.label = frame.title = `sampler_${drawn++}`;
       if (liveContacts !== undefined) frame.maps = { contact: liveContacts };
       renderer.addFrame(frame, renderer.currentObjectName);
@@ -4165,7 +4214,7 @@ async function foldWithBioemu2({ chains, chainKinds, alignment, alignmentBlocks,
         const placed = shown.length === 0 ? x
           : weightedRigidAlign(x, shown[shown.length - 1], representativeWeights(reps, atoms), atoms);
         shown.push(placed);
-        const frame = api.frameFromText(bioemu2Pdb(atomKeys, topology, placed.subarray(0, realAtoms * 3)));
+        const frame = api.frameFromText(bioemu2Pdb(atomKeys, topology, placed.subarray(0, realAtoms * 3), { links: declaredLinks }));
         frame.name = frame.label = frame.title = sampleLabel(landed.length);
         landed.push(x);
         renderer.addFrame(frame, renderer.currentObjectName);
@@ -4238,7 +4287,7 @@ async function foldWithBioemu2({ chains, chainKinds, alignment, alignmentBlocks,
   // ...each superposed on the frame before it in that order; a propagation's frames are already on their start
   const ordered = propagation ? order.map((at) => result.samples[at])
     : alignSequentially(order.map((at) => result.samples[at]), reps);
-  const pdbs = ordered.map((x) => bioemu2Pdb(atomKeys, topology, x.subarray(0, realAtoms * 3)));
+  const pdbs = ordered.map((x) => bioemu2Pdb(atomKeys, topology, x.subarray(0, realAtoms * 3), { links: declaredLinks }));
   const sequence = chains.join("");
   const scores = { sequence, contact_probs: paeMatrix(result.contact, tokens) };
   const registry = window.py2dmol_viewers ?? {};
@@ -4919,11 +4968,11 @@ async function fold(event) {
       throw new Error(`${MODEL_LABELS[family] ?? family} was not trained with pocket or contact constraints;`
         + " choose Boltz-2, Chai-1 or (contacts) BioEmu2, or remove the pocket and contact rows");
     }
-    // ...and a crosslink is a ligand BONDED to two residues: only the AlphaFold 3-lineage path reads the bonds, so
-    // elsewhere it would fold a free-floating bridge
-    if (entities.some((entity) => entity.type === "crosslink") && !isAf3Family(family)) {
-      throw new Error(`${MODEL_LABELS[family] ?? family} does not take covalent bonds, which a crosslink is;`
-        + " choose an AlphaFold 3-lineage model, or remove the crosslink rows");
+    // ...and a crosslink is a ligand BONDED to two residues: a model that reads no declared bond would fold a
+    // free-floating bridge, and a Bond row as though it were absent
+    if (entities.some((entity) => entity.type === "crosslink" || entity.type === "bond") && !takesCovalentBonds(family)) {
+      throw new Error(`${MODEL_LABELS[family] ?? family} does not take covalent bonds, which a bond or crosslink is;`
+        + " choose an AlphaFold 3-lineage model, ESMFold2 or BioEmu2, or remove those rows");
     }
     // 🔴 THE TERMS ARE ASKED BEFORE THE DOWNLOAD, NOT BEFORE THE PAGE. AF3's
     // parameters carry DeepMind's own terms, and the moment they apply is the
@@ -4954,11 +5003,28 @@ async function fold(event) {
                             templates: request.templates ?? [], family, signal });
       return;
     }
+    // 🔴 WITHOUT WebGPU THE PAGE FOLDS IN WebGL2, AND ONLY THE AF3 LINEAGE CAN. `webgl/` holds
+    // af2, bioemu2, esmc and esmfold2 as well, but web/af3-model.js is the only page path with a
+    // `backend` to pass, so every other family is refused BY NAME - which is this page's rule at
+    // every other such seam (a template on a template-free model, a bond on a model that reads
+    // none): a family that cannot run must say so, never fold something else and never hang.
+    // The sentence names what does work, because "not supported" leaves the visitor nowhere.
+    const backend = await foldBackend();
+    // 🔴 AND THE LIST IS NARROWER THAN THE LINEAGE - see WEBGL2_FAMILIES. Four of the eight AF3
+    // bundles carry the FUSED template embedder, which webgl/ has not ported, and OpenDDE
+    // re-tokenises after the trunk; refusing them HERE is what keeps a visitor from downloading
+    // half a gigabyte of parameters before finding out.
+    if (backend === "webgl2" && !WEBGL2_FAMILIES.includes(family)) {
+      throw new Error(`${MODEL_LABELS[family] ?? family} needs WebGPU, which this browser does not`
+        + ` have. ${WEBGL2_FAMILIES.map((one) => MODEL_LABELS[one] ?? one).join(", ")}`
+        + " fold here in WebGL2 instead - slower, same structure.");
+    }
     // 🔴 A DIFFERENT MODEL LETS THE LAST ONE'S GPU WEIGHTS GO. Residency is
     // kept between folds so the same model's next fold skips its packing, and
     // it was kept across a CHANGE of model too - four models in one page and
     // the fourth fold died at 2.9 GiB live. See releaseAllWeights.
-    if (lastFoldedFamily !== undefined && lastFoldedFamily !== family) {
+    // (nothing to release on the WebGL2 path, and `getDevice` would throw asking)
+    if (lastFoldedFamily !== undefined && lastFoldedFamily !== family && backend === "webgpu") {
       releaseAllWeights(await getDevice());
       releaseBioemu2(await getDevice());
     }
@@ -4979,7 +5045,7 @@ async function fold(event) {
     // makes the real count larger, so the warm compiles a subset and the fold
     // compiles the rest, which is slower than a perfect warm and faster than
     // none. A speculative warm cannot give a wrong ANSWER, only waste.
-    if (isAf3Family(family)) {
+    if (isAf3Family(family) && backend === "webgpu") {
       void getDevice().then((device) =>
         warmAf3Pipelines(family, chains.join("").length, device)).catch(() => {});
     }
@@ -6055,8 +6121,7 @@ document.getElementById("credits-open")?.addEventListener("click", () => credits
 /**
  * Why the chosen model cannot take a row of this type, or null - the entity list greys such a row and leaves the type
  * out of a new row's menu. 🔴 THE SAME LINES THE FOLD REFUSES ON (modelFamily, and the constraint and crosslink checks
- * in runFold), so a row is greyed exactly when pressing Fold would refuse it; and a bond, which the page's WebGPU
- * ESMFold2 and BioEmu2 never read (only the AF3 lineage's featuriser and the native ESMFold2 take declared bonds).
+ * in runFold), so a row is greyed exactly when pressing Fold would refuse it; a bond or crosslink by takesCovalentBonds.
  */
 function rowTypeRefusal(type) {
   const family = chosenFamily();
@@ -6064,9 +6129,8 @@ function rowTypeRefusal(type) {
   if (["dna", "rna", "ligand", "smiles", "modification"].includes(type) && !supportsAllAtom(family)) {
     return `${label} folds proteins only: choose an AlphaFold 3-lineage model, ESMFold2 or BioEmu2 for this row`;
   }
-  if ((type === "bond" || type === "crosslink") && !isAf3Family(family)
-      && !(type === "bond" && NATIVE_ONLY_FAMILIES.includes(family))) {
-    return `${label} does not take covalent bonds: choose an AlphaFold 3-lineage model for this row`;
+  if ((type === "bond" || type === "crosslink") && !takesCovalentBonds(family)) {
+    return `${label} does not take covalent bonds: choose an AlphaFold 3-lineage model, ESMFold2 or BioEmu2 for this row`;
   }
   if (type === "pocket" && family !== "boltz2" && family !== "chai1") {
     return `${label} was not trained with pockets: choose Boltz-2 or Chai-1 for this row`;

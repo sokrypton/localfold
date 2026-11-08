@@ -1,0 +1,499 @@
+/**
+ * What AF3's triangle CONTRACTION costs in WebGL2, and whether it is bound by
+ * fetches, by arithmetic or by neither.
+ *
+ *     node tools/gpu-chrome.mjs tools/gpu/bench-webgl-contract.js
+ *     node tools/gpu-chrome.mjs tools/gpu/bench-webgl-contract.js --iterations=8 --channels=256
+ *
+ * 🔴 THIS EXISTS BECAUSE IT IS THE THIRD-LARGEST KERNEL IN A bioemu2 FOLD AND
+ * HAD NO BENCH. Corrected for the per-call barrier the profile pays, the fold's
+ * own numbers put `af3.triangle.contract-block` at 1591 ms of 7074 - 22.5%, in
+ * only 64 calls - at 68 tokens and 256 channels, where the same device's dense
+ * projections reach 70 to 113 GFLOP/s. Iterating on that through a 6-second
+ * fold is not iterating.
+ *
+ * 🔴 AND IT REPORTS FETCHES A SECOND BESIDE FLOPS A SECOND, because those are
+ * the two ceilings and the fix differs. The blocked kernel reads six `fetch4`
+ * per k-step for eight dot products - 10.7 flops a fetch where the eight-row
+ * projection reaches 21.3 - so if it sits at the device's fetch RATE then a
+ * wider pair block is the lever, and if it sits well below that rate then the
+ * block is not what is holding it and widening it buys nothing.
+ *
+ * 🔴 AND EVERY ITERATION NEEDS ITS OWN OUTPUT, which `bench-webgl-linear.js`'s
+ * header explains at length: an Apple GPU discards the earlier of two identical
+ * full-viewport draws into one target, so a loop over one output times one
+ * iteration and divides by the count. Every arm here writes a ring.
+ *
+ * 🔴 AND EVERY ARM IS COMPARED AGAINST THE SHIPPED KERNEL, to a reordering's
+ * bar - the blocked path sums the same products in the same order, but the
+ * compiler fuses a `dot` and a chain of multiply-adds differently.
+ *
+ * 🔴 WHAT BINDS IT: OPERAND LOCALITY, AT 3.91x - AND THE FOUR ARMS THAT SAID
+ * OTHERWISE WERE ALL ASKING THE WRONG QUESTION BUT ONE. `resident-tiled` puts
+ * every fragment on pair block ZERO, so the operand working set collapses from
+ * 148 KiB a rasterisation tile to 6.5: **1.26 ms against 4.94, and 127.5
+ * GFLOP/s against 32.6**. That is the same shape of answer the dense projection
+ * gives (3.44x) and it supersedes the "four nulls" this header used to claim.
+ *
+ * 🔴 THE MISTAKE IS WORTH MORE THAN THE NUMBER. `aliased` hands the kernel ONE
+ * texture as both operands, which halves the DISTINCT footprint and leaves
+ * every fragment reading its own pair rows - so the working set stays past the
+ * cache and the arm reads 1.08-1.14x. I read that as "reuse is not the
+ * constraint". It says only that having two 4.7 MiB operands rather than one is
+ * not the constraint, which is a far smaller claim, and `half-tiled`'s null
+ * (0.96-1.08x) says the same thing from the byte side: **neither footprint nor
+ * bytes matter, and locality matters by 3.91x.** The projection's equivalent
+ * arm had been right all along because it collapses the working set rather than
+ * the footprint. A diagnostic arm has to remove the thing you mean to test.
+ *
+ * What the other three arms still rule out, correctly: arithmetic (probe-alu's
+ * vec4 ceiling is 5034 GFLOP/s, 142x the achieved rate), the k run length
+ * (33.2 / 40.6 / 19.3 GF/s at L = 68 / 128 / 256, not monotone), and occupancy
+ * (`probe-webgl-gemm-ceiling.js --side=128` reaches **1867 GFLOP/s on 16,384
+ * fragments**, where this kernel has 36,992 - so the fragment count is not the
+ * ceiling and the sweep that looked like a plateau was flat all along).
+ *
+ * The old claim, for the record, was: NOT REUSE, NOT BYTES, NOT ARITHMETIC, AND
+ * NOT THE RUN LENGTH. The shipped tiled kernel is **4.85 ms at 33.2 GFLOP/s** at 68 tokens
+ * and 256 channels, where the dense projection reaches 375. Four arms, each
+ * removing one candidate:
+ *
+ * | arm | factor | what it says |
+ * |---|---|---|
+ * | **`resident-tiled`** - every fragment on block 0 | **3.91x** | **locality binds** |
+ * | `aliased-tiled` - both operands one texture | 1.05-1.14x | two operands vs one: no |
+ * | `half-tiled` - both operands float16 | 0.96-1.08x | bytes: no |
+ * | probe-alu's vec4 ceiling, 5034 GFLOP/s | 142x headroom | arithmetic: no |
+ * | `--lengths=68,128,256`, the k run is L/4 | 33.2 / 40.6 / 19.3 GF/s | run length: no |
+ * | gemm-ceiling `--side=128`, 16,384 fragments | 1867 GFLOP/s | occupancy: no |
+ *
+ * 🔴 AND `aliased` ALONE WAS THE WRONG ARM FOR FIVE MONTHS, which is why
+ * `aliased-tiled` is here. The shipped contraction is TILE-MAPPED and aliasing
+ * had only ever been measured against the untiled block, so "aliasing is 1.11x"
+ * was a statement about a kernel nothing dispatches. Same mistake in shape as
+ * `probe-webgl-linear-operand.js`'s straw baseline: **a diagnostic arm has to
+ * sit beside the kernel that ships**, and the tiled answer happens to agree
+ * (1.08x) only by luck.
+ *
+ * 🔴 AND THE WORKING SET IS 148 KiB A TILE BECAUSE THE TILE MAPPING SPANS EVERY
+ * CHANNEL GROUP. With `TILEW = 2048 / (channels / 4)` = 32 at 256 channels, a
+ * 32-wide run of texels is ONE channel group and 32 blocks, so a tile covers
+ * about every block there is at that group: 136 pair rows of 4 channels and LP
+ * values, 148 KiB. Collapsing it to six rows is the 3.91x. The mapping bought
+ * 3.38x by fixing the 1D neighbour and left this.
+ *
+ * 🔴 AND THE VERDICT IS RED AT `--lengths=256` AND WAS BEFORE THIS NOTE. The
+ * ceiling declines blocking at 16.8M pair floats and blocking is **1.12x**
+ * there (268.52 ms against the split kernel's 301.01), while at 128 it is
+ * rightly declined (187.86 against 42.18) - so the relation is NOT monotone in
+ * the pair size and a single size threshold cannot express it. Pre-existing,
+ * reproduced on the committed bench, and at a length the current work does not
+ * fold; it wants a rule over the shape rather than the size.
+ */
+import {
+  CONTRACT_BLOCK_MAX_PAIR_FLOATS, blockedContractSource, contractRepackSource,
+  splitContractSource,
+} from "../../webgl/af3/trunk/triangle.js";
+
+import {
+  Execution, ONE_TARGET, PRELUDE, targetDeclarations,
+} from "../../webgl/runtime/execution.js";
+import { createWebGL2Context } from "../../webgl/index.js";
+import { relativeRms } from "./relative-rms.js";
+
+const option = (args, name, fallback) => {
+  const prefix = `--${name}=`;
+  return (args ?? []).find((a) => a.startsWith(prefix))?.slice(prefix.length) ?? fallback;
+};
+
+/** Operands with a spread of magnitudes, so a wrong lane cannot average away. */
+const fill = (count, seed) => {
+  const values = new Float32Array(count);
+  let state = seed | 0;
+  for (let i = 0; i < count; i += 1) {
+    state = (state * 1103515245 + 12345) & 0x7fffffff;
+    values[i] = ((state >>> 8) / 0x7fffff - 0.5) * 2;
+  }
+  return values;
+};
+
+/**
+ * One contraction, as the shipped driver issues it for an OUTGOING direction
+ * whose operands are already in place - the transpose and the centre norm are
+ * separate dispatches and separate questions.
+ */
+/**
+ * A DIAGNOSTIC contraction with a 4 i x 8 j x 1 channel block, against the
+ * shipped 2 x 4 x 4.
+ *
+ * 🔴 IT IS HERE BECAUSE THE WORKING SET SCALES WITH CHANNELS A FRAGMENT AND
+ * THE ARITHMETIC INTENSITY DOES NOT. `resident-tiled` says this kernel is
+ * locality-bound at 3.91x and the per-tile working set is `rows * channels * LP`
+ * - 136 pair rows by 4 channels by LP values, 148 KiB. One channel a fragment
+ * makes that **37 KiB**, and the same 32-float budget then buys a 4 x 8 pair
+ * block whose intensity is `8 * I * J / (I + J)` = **21.3 flops a fetch4**
+ * against the shipped block's 10.7. Two factors in the same change, which is
+ * why it is worth a diagnostic before a kernel.
+ *
+ * It writes its 32 outputs as (i, j) quads rather than channel components, so
+ * its plane layout is NOT the shipped repack's and it is never compared for an
+ * answer - only for time. A real version needs its own repack.
+ */
+const wideBlockSource = (length, channels, paddedLength, tileWidth) => {
+  const I = 4;
+  const J = 8;
+  const acc = [];
+  for (let i = 0; i < I; i += 1) {
+    for (let j = 0; j < J; j += 1) acc.push(`s${i}_${j}`);
+  }
+  return `${PRELUDE}${targetDeclarations(8)}
+const int L = ${length};
+const int LP = ${paddedLength};
+const int PLANE = ${paddedLength * paddedLength};
+const int C = ${channels};
+const int IBLOCKS = ${paddedLength / I};
+const int JBLOCKS = ${paddedLength / J};
+const int BLOCKS = ${(paddedLength / I) * (paddedLength / J)};
+const int TILEW = ${tileWidth};
+uniform sampler2D aTex;
+uniform sampler2D bTex;
+
+void main() {
+  int texel = linearTexel();
+  int lane = texel % TILEW;
+  int channel = (texel % W) / TILEW;
+  int block = (texel / W) * TILEW + lane;
+  if (block >= BLOCKS || channel >= C) {
+${Array.from({ length: 8 }, (_, p) => `    result${p} = vec4(0.0);`).join("\n")}
+    return;
+  }
+  int jblock = block % JBLOCKS;
+  int iblock = block / JBLOCKS;
+  int plane = channel * PLANE;
+${acc.map((a) => `  float ${a} = 0.0;`).join("\n")}
+  for (int k4 = 0; k4 < LP / 4; ++k4) {
+${Array.from({ length: I }, (_, i) =>
+  `    vec4 a${i} = fetch4(aTex, (plane + (iblock * ${I} + ${i}) * LP) / 4 + k4);`).join("\n")}
+${Array.from({ length: J }, (_, j) =>
+  `    vec4 b${j} = fetch4(bTex, (plane + (jblock * ${J} + ${j}) * LP) / 4 + k4);`).join("\n")}
+${Array.from({ length: I }, (_, i) => Array.from({ length: J }, (_, j) =>
+    `    s${i}_${j} += dot(a${i}, b${j});`).join("\n")).join("\n")}
+  }
+${Array.from({ length: 8 }, (_, p) => {
+    const base = p * 4;
+    return `  result${p} = vec4(${[0, 1, 2, 3].map((c) => {
+      const flat = base + c;
+      return acc[flat];
+    }).join(", ")});`;
+  }).join("\n")}
+}`;
+};
+
+/**
+ * The wide block's planes back into `[pair][channel group]`.
+ *
+ * Output texel `pair * C4 + cgroup` wants channels `cgroup * 4 + 0..3` of pair
+ * (i, j). In the wide layout a fragment is one (block, channel) and its 32
+ * values are (i, j) quads, so (i, j) picks ONE plane and one component of it,
+ * and the four channels are four source texels of that plane.
+ */
+const wideRepackSource = (length, channels, paddedLength, tileWidth) => `${PRELUDE}${ONE_TARGET}
+const int L = ${length};
+const int C4 = ${channels / 4};
+const int JBLOCKS = ${paddedLength / 8};
+const int TILEW = ${tileWidth};
+const int ELEMENTS = ${length * length * channels};
+${Array.from({ length: 8 }, (_, p) => `uniform sampler2D plane${p};`).join("\n")}
+
+float pick(vec4 v, int c) {
+  return c == 0 ? v.x : c == 1 ? v.y : c == 2 ? v.z : v.w;
+}
+
+void main() {
+  int texel = linearTexel();
+  if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
+  int cgroup = texel % C4;
+  int pair = texel / C4;
+  int i = pair / L;
+  int j = pair - i * L;
+  int block = (i / 4) * JBLOCKS + (j / 8);
+  // Not named flat: that is a GLSL interpolation qualifier and a reserved
+  // word. (And no backticks in here - this is a JS template literal.)
+  int slot = (i % 4) * 8 + (j % 8);
+  int plane = slot / 4;
+  int component = slot - plane * 4;
+  int lane = block % TILEW;
+  int y = block / TILEW;
+  vec4 out4 = vec4(0.0);
+  for (int c = 0; c < 4; ++c) {
+    int source = y * W + (cgroup * 4 + c) * TILEW + lane;
+    vec4 v =
+${Array.from({ length: 7 }, (_, p) =>
+    `      plane == ${p} ? fetch4(plane${p}, source) :`).join("\n")}
+      fetch4(plane7, source);
+    float picked = pick(v, component);
+    if (c == 0) out4.x = picked;
+    else if (c == 1) out4.y = picked;
+    else if (c == 2) out4.z = picked;
+    else out4.w = picked;
+  }
+  result = out4;
+}`;
+
+function contract(execution,
+  { a, b, length, channels, blocked, channelSlowest, tileMapped,
+    residentOperands = false, wideBlock = false }, output) {
+  if (!blocked) {
+    execution.dispatch({
+      source: splitContractSource(length, channels, "outgoing", false, true),
+      output,
+      inputs: { aTex: a, bTex: b },
+      label: `bench.contract-only:${length}x${channels}`,
+    });
+    return;
+  }
+  // The tiled mapping lays the fragment grid as whole texture rows, so its
+  // planes are `ceil(BLOCKS / TILEW)` rows of W rather than BLOCKS * C4 texels.
+  const tileWidth = Math.max(1, Math.floor(2048 / (channels / 4)));
+  const blocks = (length / 2) * (length / 4);
+  const planeTexels = tileMapped
+    ? Math.ceil(blocks / tileWidth) * 2048
+    : blocks * (channels / 4);
+  if (wideBlock) {
+    // 🔴 A 4 x 8 BLOCK NEEDS THE PAIR AXES PADDED TO A MULTIPLE OF EIGHT, where
+    // `padPairPlanesSource` pads to four - so at the fold's 68 tokens JBLOCKS
+    // would be 8.5 and the shader does not compile ("cannot convert from const
+    // float to const highp int", which is what a non-integer in a `const int`
+    // looks like). The arm is skipped rather than approximated, and lengths
+    // that are a multiple of eight say whether the SHAPE is worth the padding.
+    if (length % 8 !== 0) throw new Error(`wide-block needs length % 8, not ${length}`);
+    // 🔴 ITS OWN GRID: one channel a fragment and a 4 x 8 pair block, so the
+    // fragment count is `BLOCKS * channels` where the shipped one is
+    // `BLOCKS * channels / 4` over a 2 x 4 block - the same 32 outputs either
+    // way. Time only; the plane layout is not the repack's.
+    const wideBlocks = (length / 4) * (length / 8);
+    const wideTile = Math.max(1, Math.floor(2048 / channels));
+    const wideTexels = Math.ceil(wideBlocks / wideTile) * 2048;
+    const widePlanes = Array.from({ length: 8 },
+      (_, p) => execution.allocate(wideTexels * 4, `bench.wide-plane${p}`));
+    execution.dispatch({
+      source: wideBlockSource(length, channels, length, wideTile),
+      outputs: widePlanes,
+      inputs: { aTex: a, bTex: b },
+      label: `bench.contract-wide:${length}x${channels}`,
+    });
+    // 🔴 AND ITS REPACK, BECAUSE THE SHIPPED ARM PAYS FOR ONE AND THE FIRST
+    // VERSION OF THIS ARM DID NOT. `tiledMs` is a block dispatch PLUS
+    // `contractRepackSource`, so timing the wide block alone against it
+    // overstated the shape by whatever the repack costs - the straw-baseline
+    // mistake a third time, caught here rather than in a committed number.
+    //
+    // 🔴 AND THE WIDE LAYOUT MAKES THAT REPACK FOUR TIMES THE FETCHES. An
+    // output texel is four CHANNELS of one pair, and a wide fragment holds one
+    // channel of thirty-two pairs - so the four channels come from four
+    // different fragments, in the same plane, and the gather is four `fetch4`
+    // and four component picks where the shipped repack does one `fetch4`. That
+    // is the shape's real cost and it is why the arm is timed with it.
+    execution.dispatch({
+      source: wideRepackSource(length, channels, length, wideTile),
+      output,
+      inputs: Object.fromEntries(widePlanes.map((plane, p) => [`plane${p}`, plane])),
+      label: `bench.contract-wide-repack:${length}x${channels}`,
+    });
+    for (const plane of widePlanes) execution.release(plane);
+    return;
+  }
+  const planes = Array.from({ length: 8 },
+    (_, p) => execution.allocate(planeTexels * 4, `bench.pair-plane${p}`));
+  execution.dispatch({
+    source: blockedContractSource(length, channels, "outgoing", false, channelSlowest,
+      length, tileMapped, residentOperands),
+    outputs: planes,
+    inputs: { aTex: a, bTex: b },
+    label: `bench.contract-block:${length}x${channels}`,
+  });
+  execution.dispatch({
+    source: contractRepackSource(length, channels, channelSlowest, length, tileMapped),
+    output,
+    inputs: Object.fromEntries(planes.map((plane, p) => [`plane${p}`, plane])),
+    label: `bench.contract-repack:${length}x${channels}`,
+  });
+  for (const plane of planes) execution.release(plane);
+}
+
+export async function main(device, args) {
+  const iterations = Number(option(args, "iterations", "8"));
+  const channels = Number(option(args, "channels", "256"));
+  const lengths = option(args, "lengths", "68,128,256").split(",").map(Number);
+  const gl = createWebGL2Context();
+  const execution = new Execution(gl, { checkErrors: false });
+  const rows = [];
+
+  for (const length of lengths) {
+    const pairs = length * length;
+    const a = execution.upload(fill(channels * pairs, 7 + length), "bench.a");
+    const b = execution.upload(fill(channels * pairs, 11 + length), "bench.b");
+    // 🔴 THE SAME OPERANDS IN FLOAT16, because the arithmetic says this kernel
+    // is bandwidth-bound and neither aliasing arm moves it. Two 4.7 MiB
+    // operands at 68 tokens and 256 channels, 408 fetch4 a fragment over 36,992
+    // fragments: 15.1 M fetch4 in 4.55 ms is **3.32 G fetch4/s, about 53 GB/s**,
+    // where the dense projection reaches 17.6 G fetch4/s and 282 - which is far
+    // past DRAM and so must be cache-served. Aliasing is 1.08x because halving
+    // 9.4 MiB to 4.7 is still past the cache, and that is the tell: the fix is
+    // fewer BYTES, not better reuse. `uploadWeight` gives float16 above its
+    // floor, which both operands clear.
+    const aHalf = execution.uploadWeight(fill(channels * pairs, 7 + length), "bench.a16");
+    const bHalf = execution.uploadWeight(fill(channels * pairs, 11 + length), "bench.b16");
+    // Every output element is a dot product over k, so two flops a k.
+    const flops = 2 * pairs * channels * length;
+    /** @type {Record<string, Float32Array>} */
+    const answers = {};
+    /** @type {Record<string, number>} */
+    const timings = {};
+    // 🔴 `aliased` IS A DIAGNOSTIC AND NOT A KERNEL: it hands the blocked
+    // contraction the SAME texture as both operands, which computes the wrong
+    // answer and is never compared for one. It exists to ask whether the two
+    // 4.7 MiB operands are CONFLICTING in the texture cache - the one structural
+    // difference left from the projection, whose second operand is a small
+    // resident weight. If aliasing is much faster, the misses are conflicts; if
+    // it is the same, they are not, and that hypothesis dies with the other
+    // five in webgl/README.md.
+    // 🔴 AND `aliased-tiled` IS THE ARM THAT WAS MISSING, BECAUSE `aliased`
+    // ALONE ANSWERS ABOUT A KERNEL NOTHING DISPATCHES. The shipped contraction
+    // is TILE-MAPPED, and aliasing was only ever measured against the untiled
+    // block - so "aliasing is 1.11x" said the UNTILED kernel is not conflict-
+    // bound and said nothing at all about the one that folds. Same mistake in
+    // shape as `probe-webgl-linear-operand.js`'s straw baseline: a diagnostic
+    // arm has to sit beside the kernel that ships.
+    for (const arm of ["one-pair", "channel-fastest", "blocked", "aliased", "tiled",
+      "aliased-tiled", "half-tiled", "resident-tiled",
+      // 🔴 SKIPPED IN THE LIST AND NOT INSIDE `contract`, because the loop
+      // records a timing for whatever it runs - an arm that issues no draw
+      // would be reported as the fastest of them all.
+      ...(length % 8 === 0 ? ["wide-block"] : [])]) {
+      const blocked = arm !== "one-pair";
+      const half = arm === "half-tiled";
+      const call = {
+        a: half ? aHalf : a,
+        b: arm.startsWith("aliased") ? a : (half ? bHalf : b),
+        length,
+        channels,
+        blocked,
+        channelSlowest: arm !== "channel-fastest",
+        tileMapped: arm.endsWith("tiled"),
+        residentOperands: arm === "resident-tiled",
+        wideBlock: arm === "wide-block",
+      };
+      const ring = Array.from({ length: iterations },
+        () => execution.allocate(pairs * channels, "bench.out"));
+      for (let i = 0; i < 2; i += 1) {
+        contract(execution, call, ring[i % ring.length]);
+        execution.read(ring[i % ring.length]);
+      }
+      const start = performance.now();
+      for (let i = 0; i < iterations; i += 1) contract(execution, call, ring[i]);
+      answers[arm] = Float32Array.from(execution.read(ring[iterations - 1]));
+      timings[arm] = (performance.now() - start) / iterations;
+      for (const out of ring) execution.release(out);
+    }
+    execution.release(a);
+    execution.release(b);
+    // What each kernel actually asks the texture units for, which is the
+    // ceiling the flops figure cannot distinguish from arithmetic.
+    //   one pair a fragment: four channels, each L of a and L of b, by `fetch1`.
+    //   blocked: per channel and per k-step, two `a` rows and four `b` rows.
+    const oneTexelFetches = pairs * (channels / 4) * 4 * 2 * length;
+    const blockedFetches = (length / 2) * (length / 4) * (channels / 4)
+      * 4 * (length / 4) * 6;
+    rows.push({
+      length,
+      channels,
+      gigaflops: Number((flops / 1e9).toFixed(2)),
+      onePairMs: Number(timings["one-pair"].toFixed(2)),
+      blockedMs: Number(timings.blocked.toFixed(2)),
+      channelFastestMs: Number(timings["channel-fastest"].toFixed(2)),
+      aliasedMs: Number(timings.aliased.toFixed(2)),
+      aliasedTiledMs: Number(timings["aliased-tiled"].toFixed(2)),
+      halfTiledMs: Number(timings["half-tiled"].toFixed(2)),
+      residentTiledMs: Number(timings["resident-tiled"].toFixed(2)),
+      wideBlockMs: timings["wide-block"] === undefined
+        ? null : Number(timings["wide-block"].toFixed(2)),
+      tiledMs: Number(timings.tiled.toFixed(2)),
+      tiledSpeedup: Number((timings.blocked / timings.tiled).toFixed(2)),
+      aliasedSpeedup: Number((timings.blocked / timings.aliased).toFixed(2)),
+      // The one that matters: the SHIPPED tiled kernel against the same kernel
+      // with both operands in one texture.
+      aliasedTiledSpeedup: Number((timings.tiled / timings["aliased-tiled"]).toFixed(2)),
+      tiledGflops: Number((2 * length * length * length * channels
+        / timings.tiled / 1e6).toFixed(1)),
+      halfTiledSpeedup: Number((timings.tiled / timings["half-tiled"]).toFixed(2)),
+      // 🔴 THE ARM `aliased` SHOULD HAVE BEEN: every fragment on pair block
+      // zero, so the operand working set is a few KiB instead of 9.4 MiB.
+      residentTiledSpeedup: Number((timings.tiled / timings["resident-tiled"]).toFixed(2)),
+      residentTiledGflops: Number((2 * length * length * length * channels
+        / timings["resident-tiled"] / 1e6).toFixed(1)),
+      wideBlockSpeedup: timings["wide-block"] === undefined
+        ? null : Number((timings.tiled / timings["wide-block"]).toFixed(2)),
+      wideBlockGflops: timings["wide-block"] === undefined
+        ? null : Number((2 * length * length * length * channels
+          / timings["wide-block"] / 1e6).toFixed(1)),
+      halfTiledGflops: Number((2 * length * length * length * channels
+        / timings["half-tiled"] / 1e6).toFixed(1)),
+      channelFastestGflops:
+        Number((flops / timings["channel-fastest"] / 1e6).toFixed(1)),
+      orderSpeedup:
+        Number((timings["channel-fastest"] / timings.blocked).toFixed(2)),
+      speedup: Number((timings["one-pair"] / timings.blocked).toFixed(2)),
+      onePairGflops: Number((flops / timings["one-pair"] / 1e6).toFixed(1)),
+      blockedGflops: Number((flops / timings.blocked / 1e6).toFixed(1)),
+      onePairGfetches: Number((oneTexelFetches / timings["one-pair"] / 1e6).toFixed(2)),
+      blockedGfetches: Number((blockedFetches / timings.blocked / 1e6).toFixed(2)),
+      onePairFlopsPerFetch: Number((flops / oneTexelFetches).toFixed(1)),
+      blockedFlopsPerFetch: Number((flops / blockedFetches).toFixed(1)),
+      // 🔴 THE SHIPPED RULE'S OWN VERDICT, so this bench GATES the threshold
+      // rather than only measuring beside it: `blocks` is what the driver would
+      // pick here, and `rulePicksFaster` is whether that was the faster arm.
+      pairFloats: pairs * channels,
+      blocks: pairs * channels <= CONTRACT_BLOCK_MAX_PAIR_FLOATS,
+      rulePicksFaster: (pairs * channels <= CONTRACT_BLOCK_MAX_PAIR_FLOATS)
+        === (timings.blocked <= timings["one-pair"]),
+      relRms: Number(relativeRms(answers["one-pair"], answers.blocked).toExponential(2)),
+      // The two orders compute the same products in the same order and differ
+      // only in which fragment owns which output, so this one is EXACTLY zero.
+      orderRelRms: Number(
+        relativeRms(answers["channel-fastest"], answers.blocked).toExponential(2)),
+      // The tiled mapping moves which fragment owns which output and nothing
+      // else, so this is exactly zero or the mapping does not invert.
+      tiledRelRms: Number(
+        relativeRms(answers.tiled, answers.blocked).toExponential(2)),
+    });
+  }
+
+  const worst = Math.max(...rows.map((row) => row.relRms));
+  const misPicked = rows.filter((row) => !row.rulePicksFaster);
+  // A fused multiply-add's worth. Never widen it: at 1e-3 the two kernels are
+  // summing different products, not the same ones in a different shape.
+  const bar = 1e-6;
+  const renderer = gl.getParameter(gl.RENDERER);
+  execution.destroy();
+  return {
+    renderer,
+    iterations,
+    rows,
+    worstRelRms: Number(worst.toExponential(2)),
+    bar,
+    ceiling: CONTRACT_BLOCK_MAX_PAIR_FLOATS,
+    misPicked: misPicked.map((row) =>
+      `${row.length}x${row.channels}: the rule ${row.blocks ? "blocks" : "does not block"} `
+      + `and blocking is ${row.speedup.toFixed(2)}x`),
+    verdict: worst > bar
+      ? `FAILED: the pair-blocked contraction disagrees with the one-pair one at `
+        + `${worst.toExponential(2)}, past ${bar} - that is not a reordering`
+      : misPicked.length > 0
+        ? `FAILED: CONTRACT_BLOCK_MAX_PAIR_FLOATS picks the slower kernel at `
+          + `${misPicked.length} of ${rows.length} shapes - see misPicked`
+        : `ok: the two contractions agree to ${worst.toExponential(2)}, the ceiling picks the `
+          + `faster one at all ${rows.length} shapes, and the block runs at `
+          + `${rows.map((r) => `${r.blockedGflops} GFLOP/s`).join(", ")}`,
+  };
+}

@@ -1,0 +1,1 @@
+{"tag": "TA4", "pair": "T", "cycles": 9, "guideCycles": 3, "steps": 100, "recycles": 3, "restarts": 10, "motifUntil": 1.0, "stop": {"ipae": 1.2, "motif": 1.0}, "check": {"top": 3, "iptm": 0, "ipae": 2.5, "motif": 1.5}, "polish": {"from": 2, "draws": 8, "top": 3}, "motifMatch": true}

@@ -22,7 +22,7 @@ import { fileURLToPath } from "node:url";
  * thing.
  */
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const AREAS = ["shared", "cpu", "webgpu", "tools", "test", "web"];
+const AREAS = ["shared", "cpu", "webgpu", "webgl", "tools", "test", "web"];
 const SKIP = new Set(["node_modules", ".git", ".ipynb_checkpoints"]);
 
 /**
@@ -127,7 +127,7 @@ test("every module path named in a comment exists", () => {
 
   const broken = [];
   let named = 0;
-  const PATH = /(?<![/\w-])((?:src|shared|cpu|webgpu|tools|test|web)\/[A-Za-z0-9_./-]+\.m?js)\b/g;
+  const PATH = /(?<![/\w-])((?:src|shared|cpu|webgpu|webgl|tools|test|web)\/[A-Za-z0-9_./-]+\.m?js)\b/g;
   for (const file of files) {
     for (const match of readFileSync(file, "utf8").matchAll(PATH)) {
       const named_path = match[1];
@@ -261,12 +261,12 @@ test("every source path named in python, yaml, html or markdown exists", () => {
   // `/src/reference/http-tensor-store.js`, whose import sat inside a `try` that
   // prints `'unavailable: ' + error.message` - a fallback, reporting a moved
   // file as a missing measurement.
-  const PATH = /(?<![\w.@-])\/?((?:src|shared|cpu|webgpu)\/[A-Za-z0-9_./-]+\.m?js)\b/g;
+  const PATH = /(?<![\w.@-])\/?((?:src|shared|cpu|webgpu|webgl)\/[A-Za-z0-9_./-]+\.m?js)\b/g;
   // 🔴 AND A DIRECTORY IS A PATH TOO. `src/reference/manifests` without a file
   // on the end is how six documents and two tools name the manifest modules,
   // and `src/reference/` has not existed since the reorganisation. A rule that
   // requires a `.js` suffix reads those as prose.
-  const DIRECTORY = /(?<![\w.@-])\/?((?:src|shared|cpu|webgpu)\/[a-z0-9-]+(?:\/[a-z0-9-]+)*)\/?(?![\w./-])/g;
+  const DIRECTORY = /(?<![\w.@-])\/?((?:src|shared|cpu|webgpu|webgl)\/[a-z0-9-]+(?:\/[a-z0-9-]+)*)\/?(?![\w./-])/g;
   for (const file of files) {
     const text = readFileSync(file, "utf8");
     const relative = file.slice(ROOT.length + 1);
