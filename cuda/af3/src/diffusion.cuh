@@ -1799,7 +1799,8 @@ inline DiffusionFold prepareDiffusion(const float* trunkSingle, const float* tru
   if (shardedPair && !(DIFF_HALF && hasW(E + ".embedTrunkPairCond"))) {
     fprintf(stderr, "a sharded pair's diffusion streams its conditioning (the f16 path, an encoder taking the pair)\n"); exit(1);
   }
-  if (DIFF_HALF && (shortPair("lean.diffusion", pairs, Cz) || shardedPair) && hasW(E + ".embedTrunkPairCond")) {
+  // (and always for a bf16 trunk pair - TRUNK_PAIR16 - which the conditioning reads only streamed)
+  if (DIFF_HALF && (shortPair("lean.diffusion", pairs, Cz) || shardedPair || TRUNK_PAIR16) && hasW(E + ".embedTrunkPairCond")) {
     // a card short of room: the conditioning pair streamed - each chunk of rows straight into the
     // encoder's pair projection and the transformer's f16 LayerNorm'd pair, never the f32 pair whole
     // (9 GB at 4192 tokens, beside the trunk's)

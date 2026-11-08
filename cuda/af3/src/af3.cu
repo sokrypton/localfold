@@ -28,15 +28,18 @@
 // confidence head - so the f32 pair is never made. Not for OpenDDE (its expander reads f32). foldFits sizes a
 // fold by it.
 // LOCALFOLD_WIDEN_PAIR=1: widened as before (the control arm: the structure must not move - tools/check-standalone.py)
-inline bool pairStays16(int n, int C, bool fast) {
+// keep16: kept bf16 for speed wherever the model allows it, short of room or not (--fast where the tcgen05 pair kernels
+// run, --widen-pair the old arm): the trunk's last pair is bf16 values already, so widening it bought only the confidence
+// head's f32 kernels (2048 tokens 13.00 -> 12.84 s a fold, pTM / pLDDT the same to 1e-3)
+inline bool pairStays16(int n, int C, bool fast, bool keep16) {
   static const bool widen = getenv("LOCALFOLD_WIDEN_PAIR") != nullptr;
   if (widen) return false;
   size_t pairs = (size_t)n * n;
   Trunk probe{}; probe.n = n; probe.C = C;
-  return fast && DIFF_HALF && CONF_HALF && pair16Eligible(probe) && shortPair("lean.pair16", pairs, C) &&
-         !M.flag("trunk.dialect.structuralTokens") &&
-         hasW("diffusion.encoder.embedTrunkPairCond") &&
-         shortPair("lean.pair16", pairs, (int)M.meta("diffusion.conditioning.pairChannels")) && (int)M.meta("confidence.pairChannels") == C;
+  return fast && DIFF_HALF && CONF_HALF && pair16Eligible(probe) && !M.flag("trunk.dialect.structuralTokens") &&
+         hasW("diffusion.encoder.embedTrunkPairCond") && (int)M.meta("confidence.pairChannels") == C &&
+         (keep16 || (shortPair("lean.pair16", pairs, C) &&
+                     shortPair("lean.pair16", pairs, (int)M.meta("diffusion.conditioning.pairChannels"))));
 }
 
 // several GPUs on a sharded pair, at the trunk's or the sampler's end: every rank's rows onto rank 0 into a whole bf16
@@ -194,13 +197,7 @@ static int foldMain(int argc, char** argv) {
   const bool haveWeights = !weightsDir.empty() || !bundleDir.empty();
   bool seedGiven = false;
   for (int i = 2; i < argc; ++i) if (!strncmp(argv[i], "--seed=", 7)) seedGiven = true;
-  // the pair kept bf16 past the trunk where the tcgen05 pair kernels run (--fast on a B200; --widen-pair the old arm): the
-  // trunk's last pair is bf16 values already, so widening it bought only the confidence head's f32 kernels (2048 tokens
-  // 13.00 -> 12.84 s a fold, pTM / pLDDT the same to 1e-3). Its three groups take their short-of-room forms together -
-  // the pair (lean.pair16), the streamed conditioning (lean.diffusion), the heads' row chunks (lean.confidence); a
-  // --lever naming one wins
-  if (fast && !widenPair && ptc::PAIR_TC && ptc::ready())
-    for (const char* g : {"lean.pair16", "lean.diffusion", "lean.confidence"}) LEVER_FORCED.emplace(g, false);
+  const bool keep16 = fast && !widenPair && ptc::PAIR_TC && ptc::ready();   // (pairStays16)
   if (af3Defaults) {
     bool setR = false, setS = false;
     for (int i = 2; i < argc; ++i) {
@@ -416,7 +413,7 @@ static int foldMain(int argc, char** argv) {
   if (mg::WORLD > 1 && nRuns > 1 && nRuns <= std::max<size_t>(samples, 10)) {
     const int Cp = (int)M.meta("trunk.embedder.pairChannels");
     if (replEnv) repl = atoi(replEnv);
-    else if (tokens < 1700 && mg::minOverRanks(foldFits(tokens, Cp, doFold && pairStays16(tokens, Cp, fast), true))) {
+    else if (tokens < 1700 && mg::minOverRanks(foldFits(tokens, Cp, doFold && pairStays16(tokens, Cp, fast, keep16), true))) {
       const double rate = mg::pushRate();
       repl = rate < 30e9;
       if (mg::RANK == 0) printf("several GPUs: pushes at %.1f GB/s a GPU - %s\n", rate / 1e9,
@@ -425,7 +422,7 @@ static int foldMain(int argc, char** argv) {
   }
   if (repl) sh::ON = false;
   if (!(mg::WORLD > 1 && sh::ON) && !foldFits(tokens, (int)M.meta("trunk.embedder.pairChannels"),
-                doFold && pairStays16(tokens, (int)M.meta("trunk.embedder.pairChannels"), fast))) return 1;
+                doFold && pairStays16(tokens, (int)M.meta("trunk.embedder.pairChannels"), fast, keep16))) return 1;
   // OpenDDE folds past its trunk on its structural tokens, ~2 a residue, and that is the fold's peak, so it is asked
   // too, before the trunk runs: the structural f32 pair and the refiner triangle's bf16 b (6 bytes a channel a
   // structural pair) beside the trunk's f32 pair and its recycled bf16 one (6 a residue pair). Measured on a 40 GB A100:
@@ -460,13 +457,13 @@ static int foldMain(int argc, char** argv) {
     return (double)n * n * C * 4 * 1.5 + (double)spareKept(t, 20) <= (double)f;
   };
   const bool oneCardPast = mg::WORLD > 1 && sh::ON && (shardDiff ? !atoi(shardDiff) : tokens < 512 || !oneSample) &&
-    foldFits(tokens, (int)M.meta("trunk.embedder.pairChannels"), doFold && pairStays16(tokens, (int)M.meta("trunk.embedder.pairChannels"), fast), true) &&
+    foldFits(tokens, (int)M.meta("trunk.embedder.pairChannels"), doFold && pairStays16(tokens, (int)M.meta("trunk.embedder.pairChannels"), fast, keep16), true) &&
     (shardDiff || wholeDiffusionFits(tokens, (int)M.meta("trunk.embedder.pairChannels")));
   // (a confidence head with no sharded form - boltz2's, rf3's - runs on rank 0 with the pair gathered: refused up front
   // where that pair would not fit one GPU)
   const bool confOnRank0 = mg::WORLD > 1 && sh::ON && doFold && !confidenceShardable();
   if (confOnRank0 && !foldFits(tokens, (int)M.meta("trunk.embedder.pairChannels"),
-                               pairStays16(tokens, (int)M.meta("trunk.embedder.pairChannels"), fast), true)) {
+                               pairStays16(tokens, (int)M.meta("trunk.embedder.pairChannels"), fast, keep16), true)) {
     fprintf(stderr, "this model's confidence head has no sharded form yet, and a %d-token pair does not fit one GPU\n", tokens);
     return 1;
   }
@@ -690,7 +687,7 @@ static int foldMain(int argc, char** argv) {
       GRAPHS = !noGraphs;
       mg::tick("whole pair gathered");
     }
-    TRUNK_PAIR16 = t.p16 && !saveEmbeddings && (pairStays16(t.n, t.C, fast) || sharded(t));
+    TRUNK_PAIR16 = t.p16 && !saveEmbeddings && (pairStays16(t.n, t.C, fast, keep16) || sharded(t));
     if (sharded(t) && (saveEmbeddings || saveDistogram)) { fprintf(stderr, "a sharded pair: no --save-embeddings or --save-distogram yet\n"); return 1; }
     if (!TRUNK_PAIR16) pairToF32(t);  // (a bf16 trunk's pair, for the heads, the sampler and the confidence head)
     else if (t.prevPair) { CK(cudaFreeAsync(t.prevPair, STREAM)); t.prevPair = nullptr; ++MEM_GEN; }   // (pairToF32's other half)
@@ -953,7 +950,7 @@ static int foldMain(int argc, char** argv) {
       df.trunkPair = nullptr;
       pairOntoRank0(t);
       // (then the one-GPU rule for the pair's width: boltz2's and rf3's heads read it f32)
-      TRUNK_PAIR16 = t.p16 && pairStays16(t.n, t.C, fast);
+      TRUNK_PAIR16 = t.p16 && pairStays16(t.n, t.C, fast, keep16);
       if (!TRUNK_PAIR16) pairToF32(t);
       if (contact.empty()) contact = contactProbabilities(t);
     }

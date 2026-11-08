@@ -622,12 +622,9 @@ inline ConfidenceOut confidenceHead(const float* trunkPair, const float* trunkSi
   // (boltz2 builds its pair from the trunk's: in f32 into a pair of its own; in bf16 in place when it may, its one
   // read of the trunk's pair being a row-wise LayerNorm)
   bool inPlace = consumeTrunkPair && (!reembed || TRUNK_PAIR16);
-  // a bf16 trunk pair (TRUNK_PAIR16, a card short of room): the head's pair is bf16 too, its blocks run under PAIR16
+  // a bf16 trunk pair (TRUNK_PAIR16: a card short of room, or kept for speed - af3.cu pairStays16): the head's pair is bf16 too, its blocks run under PAIR16
   // and its heads widen a chunk of rows at a time (af3.cu keeps it only for a head that takes it: no re-embedding)
   const bool p16 = TRUNK_PAIR16;
-  if (p16 && !shortPair("lean.pair16", pairs, C)) {
-    fprintf(stderr, "the confidence head was handed a bf16 pair it does not take\n"); exit(1);
-  }
   const size_t pairBytes = pairs * C * (p16 ? 2 : 4);
   float* pair = inPlace ? const_cast<float*>(trunkPair) : scratch<float>("conf.pair", pairBytes / 4);
   float* single = scratch<float>("conf.single", (size_t)n * Cs);
@@ -721,7 +718,7 @@ inline ConfidenceOut confidenceHead(const float* trunkPair, const float* trunkSi
     ct = chainTmTables(M.i("batch.asymId"), hostSeqMask(seqMask, n, seqBuf), n, dCentresBuf, NB, "conf");
   }
   // on a card short of room the heads' LayerNorm (and the symmetrised pair it reads) run in row chunks
-  bool chunked = shortPair("lean.confidence", pairs, C);
+  bool chunked = shortPair("lean.confidence", pairs, C) || p16;   // (a bf16 pair is read in widened row chunks)
   size_t rowsPer = chunked ? std::max<size_t>(1, std::min(pairs, CHUNK / C)) : pairs;
   float* ln = scratch<float>("conf.ln", rowsPer * C);
   // chunked, each chunk's logits are taken down to their expectations at once, so they are a chunk's and not the
