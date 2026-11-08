@@ -3391,3 +3391,8 @@ which is what the bias reads, so its `heads` columns are appended to the fused w
 and `biasPlanesSource` reads them at a stride - the narrow 128 -> 4 projection's draw gone. Not bit-identical (those
 512 floats now sit in a float16 weight rather than a float32 one of their own): pLDDT 94.019 -> 94.014, worst atom
 0.120 -> 0.116 A, trunk median 1496 -> 1481 ms.
+
+Measured and NOT kept: the batched AdaLN writing the next projection's padded float16 x itself, so the 59 x 768 ->
+1024 `pad-stride` pass (1,225 draws a fold) goes. Bit-identical and SLOWER, diffusion 2884 -> 2908 ms: every AdaLN
+fragment walks its whole row twice for the statistics, so 1024 fragments a row where there were 768 costs more than
+the copy it replaced. (`--no-stride-pad`, which skips the pad and lets the row wrap, is neutral too.)
