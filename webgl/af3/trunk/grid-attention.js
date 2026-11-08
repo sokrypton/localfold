@@ -47,7 +47,7 @@ import { ONE_TARGET, PRELUDE, sized, targetDeclarations, memoSource } from "../.
 import { attentionFlash } from "../../kernels/attention-flash.js";
 import { layerNorm } from "../../kernels/layer-norm.js";
 import { linear } from "../../kernels/linear.js";
-import { multiply } from "../../runtime/elementwise.js";
+import { add, multiply } from "../../runtime/elementwise.js";
 import { transposeLeading } from "../../runtime/transpose.js";
 
 /** @typedef {import("../../runtime/storage.js").Tensor} Tensor */
@@ -109,6 +109,22 @@ void main() {
 /**
  * @param {import("../../runtime/execution.js").Execution} execution
  */
+/** `base[i][j] + update[j][i]`, a `[L][L][channels]` pair: the column attention's residual with its transpose folded in. */
+const transposedAddSourceUncached = (length, channels) => sized({ ROWS: length * length },
+  `${PRELUDE}${ONE_TARGET}
+const int C4 = ${channels / 4};
+const int L = ${length};
+uniform sampler2D baseTex;
+uniform sampler2D updateTex;
+
+void main() {
+  int texel = linearTexel();
+  if (texel >= ROWS * C4) { result = vec4(0.0); return; }
+  int row = texel / C4;
+  int swapped = (row % L) * L + row / L;
+  result = fetch4(baseTex, texel) + fetch4(updateTex, swapped * C4 + texel % C4);
+}`);
+
 /**
  * The fused projection `[pairs][4 x width]` split into query, key, value and gate (the logistic applied), and - for the
  * column direction - TRANSPOSED on the way: output row `i * L + j` reads the projection of row `j * L + i`. A projection
@@ -210,7 +226,7 @@ export function releaseGridAttentionWeights(execution, weights) {
 export function gridSelfAttention(execution, call) {
   const {
     pair, mask, weights: w, length, channels,
-    transpose = false, swapTransposedBias = false, epsilon = 1e-5,
+    transpose = false, swapTransposedBias = false, epsilon = 1e-5, residualOf,
   } = call;
   const pairs = length * length;
   const heads = w.heads;
@@ -331,6 +347,24 @@ export function gridSelfAttention(execution, call) {
     execution.release(projected);
     projected = biased;
   }
+  // `residualOf`: return `residualOf + update` rather than the update - which, transposed, is ONE draw reading the
+  // update's rows in transposed order where it was a `transposeLeading` and an add (`transposedAddSource`).
+  if (residualOf !== undefined) {
+    let next;
+    if (transpose) {
+      next = execution.allocate(pairs * channels, "af3.grid.residual");
+      execution.dispatch({
+        source: transposedAddSource(length, channels),
+        output: next,
+        inputs: { baseTex: residualOf, updateTex: projected },
+        label: `af3.grid.transposed-add:${pairs}x${channels}`,
+      });
+    } else {
+      next = add(execution, residualOf, projected);
+    }
+    execution.release(projected);
+    return next;
+  }
   if (!transpose) {
     projected.label = "af3.grid";
     return projected;
@@ -357,5 +391,6 @@ void main() {
 // Every builder above, memoised on its arguments (`memoSource` in webgl/runtime/execution.js).
 export const biasPlanesSource = memoSource(biasPlanesSourceUncached);
 export const splitGridQkvgSource = memoSource(splitGridQkvgSourceUncached);
+export const transposedAddSource = memoSource(transposedAddSourceUncached);
 export const addRowBiasSource = memoSource(addRowBiasSourceUncached);
 export const logisticSource = memoSource(logisticSourceUncached);

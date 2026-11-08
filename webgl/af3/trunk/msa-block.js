@@ -192,11 +192,14 @@ export function msaBlock(execution, call) {
     ownPair = true;
   }
   for (const [group, transpose] of [[w.pairAttention1, false], [w.pairAttention2, true]]) {
-    pair = residual(pair, gridSelfAttention(execution, {
+    // ...the residual inside, where the column direction's transpose back folds into the add
+    const next = gridSelfAttention(execution, {
       pair, mask: pairMask, weights: group,
       length: tokens, channels: pairChannels,
-      transpose: /** @type {any} */ (transpose), swapTransposedBias, epsilon,
-    }), ownPair);
+      transpose: /** @type {any} */ (transpose), swapTransposedBias, epsilon, residualOf: pair,
+    });
+    if (ownPair) execution.release(pair);
+    pair = next;
     ownPair = true;
   }
   pair = residual(pair, transition(execution, {
