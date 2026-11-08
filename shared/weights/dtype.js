@@ -73,6 +73,19 @@ function view(Kind, buffer, byteOffset, length) {
  * same values widened into a Float32Array (exact: every float16 is a float32). Safari before 18.2
  * has no Float16Array, and a quantised bundle's scales and zeros are float16.
  */
+/**
+ * Groups `[firstGroup, lastGroup)` of a float16 table that starts at `byteOffset`, indexed from `firstGroup`.
+ *
+ * 🔴 A RANGE DECODES ITS OWN GROUPS' SCALES, NOT THE WHOLE TENSOR'S. Where `Float16Array` is native `halves` is a free
+ * view and this changes nothing; where it is not - Safari before 18.2 - `halves` decodes in JavaScript, and AF3's
+ * trunk weights are STACKED tensors read a block's slice at a time, so every slice decoded all 48 blocks' scales and
+ * zeros again. Decoding the AF3 int5 tree took 4.67 s in Safari 16.3 against 0.48 in Chrome on the same M2, and the
+ * page waits for it before the first fold.
+ */
+function rangeHalves(buffer, byteOffset, firstGroup, lastGroup) {
+  return halves(buffer, byteOffset + firstGroup * 2, Math.max(0, lastGroup - firstGroup));
+}
+
 function halves(buffer, byteOffset, length) {
   if (typeof Float16Array === "function") return view(Float16Array, buffer, byteOffset, length);
   const bits = view(Uint16Array, buffer, byteOffset, length);
@@ -202,9 +215,10 @@ export function readTensorRange(record, buffer, byteOffset, first, count, copy =
     const scaleAt = byteOffset + (record.scaleOffset - (record.byteOffset ?? 0));
     const codes = view(Int8Array, buffer, byteOffset, elements);
     const blocks = Math.ceil(elements / block);
-    const scales = halves(buffer, scaleAt, blocks);
     const firstBlock = Math.floor(first / block);
     const lastBlock = Math.min(blocks, Math.ceil((first + count) / block));
+    // ...only the range's own scales (see `rangeHalves`), indexed from its first block
+    const scales = rangeHalves(buffer, scaleAt, firstBlock, lastBlock);
     const base = firstBlock * block;
     const output = new Output(Math.min(elements, lastBlock * block) - base);
     // SYMMETRIC, so a code is just a multiple of its block's scale. There is no
@@ -213,7 +227,7 @@ export function readTensorRange(record, buffer, byteOffset, first, count, copy =
     // ...the same hoist as int5 below: one Float16Array read a block, not one
     // an element, and no division per element.
     for (let block_ = firstBlock; block_ < lastBlock; block_ += 1) {
-      const scale = scales[block_];
+      const scale = scales[block_ - firstBlock];
       const start = block_ * block;
       const end = Math.min(start + block, elements);
       for (let index = start; index < end; index += 1) output[index - base] = codes[index] * scale;
@@ -248,16 +262,16 @@ export function readTensorRange(record, buffer, byteOffset, first, count, copy =
       throw new Error(`${record.dtype} at group ${block} does not pack into whole bytes`);
     }
     const codes = new Uint8Array(buffer, byteOffset, groups * groupBytes + 1);
-    const scales = halves(buffer, scaleAt, groups);
-    const zeros = halves(buffer, zeroAt, groups);
     const mask = (1 << bits) - 1;
     const firstGroup = Math.floor(first / block);
     const lastGroup = Math.min(groups, Math.ceil((first + count) / block));
+    const scales = rangeHalves(buffer, scaleAt, firstGroup, lastGroup);
+    const zeros = rangeHalves(buffer, zeroAt, firstGroup, lastGroup);
     const outputBase = firstGroup * block;
     const output = new Output(Math.min(elements, lastGroup * block) - outputBase);
     for (let group = firstGroup; group < lastGroup; group += 1) {
-      const scale = scales[group];
-      const zero = zeros[group];
+      const scale = scales[group - firstGroup];
+      const zero = zeros[group - firstGroup];
       const start = group * block;
       const end = Math.min(start + block, elements);
       let bit = group * groupBytes * 8;
@@ -298,10 +312,10 @@ export function readTensorRange(record, buffer, byteOffset, first, count, copy =
     const groups = Math.ceil(elements / block);
     const codes = new Uint8Array(buffer, byteOffset,
                                  groups * INT5_GROUP_BYTES + 1);
-    const scales = halves(buffer, scaleAt, groups);
-    const zeros = halves(buffer, zeroAt, groups);
     const firstGroup = Math.floor(first / block);
     const lastGroup = Math.min(groups, Math.ceil((first + count) / block));
+    const scales = rangeHalves(buffer, scaleAt, firstGroup, lastGroup);
+    const zeros = rangeHalves(buffer, zeroAt, firstGroup, lastGroup);
     const outputBase = firstGroup * block;
     const output = new Output(Math.min(elements, lastGroup * block) - outputBase);
     // 🔴 ASYMMETRIC: a code is an offset from the group's zero point, not a
@@ -328,8 +342,8 @@ export function readTensorRange(record, buffer, byteOffset, first, count, copy =
     // all. The general form below still runs for a trailing partial group.
     const wholeChunks = (block / 8) | 0;
     for (let group = firstGroup; group < lastGroup; group += 1) {
-      const scale = scales[group];
-      const zero = zeros[group];
+      const scale = scales[group - firstGroup];
+      const zero = zeros[group - firstGroup];
       const groupBase = group * INT5_GROUP_BYTES;
       const start = group * block;
       const end = Math.min(start + block, elements);

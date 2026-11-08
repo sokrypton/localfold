@@ -34,7 +34,7 @@
  * it is a fallback for.
  */
 import { CHANNELS_PER_TEXEL, TEXTURE_WIDTH, textureShape } from "./context.js";
-import { float32ToFloat16Array } from "../../shared/weights/float16.js";
+import { fitsFloat16, float32ToFloat16Array } from "../../shared/weights/float16.js";
 import { int5WeightSource } from "./int5.js";
 
 /**
@@ -387,12 +387,8 @@ export class Storage {
       // in that sense. Checking the maximum costs one pass over a buffer that
       // is about to be converted anyway, and the alternative failure is a fold
       // full of infinities with nothing to point at.
-      let largest = 0;
-      for (let i = 0; i < values.length; i += 1) {
-        const magnitude = Math.abs(values[i]);
-        if (magnitude > largest) largest = magnitude;
-      }
-      if (!(largest <= 65504)) {
+      // ...on the bits (`fitsFloat16`): the same rule, one integer compare an element
+      if (!fitsFloat16(values)) {
         half = false;
         this.halfRefusals += 1;
       }

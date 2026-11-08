@@ -2,6 +2,25 @@ const scratch = new ArrayBuffer(4);
 const scratchFloat = new Float32Array(scratch);
 const scratchUint = new Uint32Array(scratch);
 
+/**
+ * A float16 SUBNORMAL's bits from a float32's mantissa and its float16 exponent (<= 0): the whole 24-bit significand
+ * shifted into place and rounded to nearest, ties to even, in ONE step.
+ *
+ * 🔴 IT USED TO SHIFT FIRST AND ROUND AFTER, WHICH DROPS THE STICKY BITS a tie needs: -5.75e-6 came out 0x8060 where
+ * the platform's Float16Array gives 0x8061. Every runtime without a native Float16Array - Safari before 18.2, the
+ * browsers the WebGL2 path is for - converts every weight through here, so its tiny weights differed from Chrome's in
+ * the last place. test/float16-scalar.test.js holds this to the native conversion.
+ */
+function subnormalHalf(mantissa, exponent) {
+  const full = mantissa | 0x800000;
+  const shift = 14 - exponent; // 13 places to float16's mantissa, and 1 - exponent more to denormalise: 14..24
+  let half = full >>> shift;
+  const rest = full & ((1 << shift) - 1);
+  const midpoint = 1 << (shift - 1);
+  if (rest > midpoint || (rest === midpoint && (half & 1) === 1)) half += 1;
+  return half;
+}
+
 export function numberToFloat16(value) {
   scratchFloat[0] = value;
   const bits = scratchUint[0];
@@ -15,8 +34,7 @@ export function numberToFloat16(value) {
   if (exponent >= 0x1f) return sign | 0x7c00;
   if (exponent <= 0) {
     if (exponent < -10) return sign;
-    mantissa = (mantissa | 0x800000) >>> (1 - exponent);
-    return sign | ((mantissa + 0x0fff + ((mantissa >>> 13) & 1)) >>> 13);
+    return sign | subnormalHalf(mantissa, exponent);
   }
 
   mantissa += 0x0fff + ((mantissa >>> 13) & 1);
@@ -55,9 +73,55 @@ export function float32ToFloat16Array(values) {
     const half = new globalThis.Float16Array(values);
     return new Uint16Array(half.buffer, half.byteOffset, half.length);
   }
+  return float32ToFloat16Scalar(values);
+}
+
+/** `float32ToFloat16Array` without the engine: exported so a test can hold it to the native conversion. */
+export function float32ToFloat16Scalar(values) {
   const result = new Uint16Array(values.length);
-  for (let i = 0; i < values.length; i += 1) result[i] = numberToFloat16(values[i]);
+  if (!(values instanceof Float32Array)) {
+    for (let i = 0; i < values.length; i += 1) result[i] = numberToFloat16(values[i]);
+    return result;
+  }
+  // 🔴 THE SAME ARITHMETIC AS `numberToFloat16`, ON THE INPUT'S OWN BITS: no call and no scratch round trip an
+  // element. This is the path Safari before 18.2 takes for every weight - it has no Float16Array - and the AF3 page
+  // converts ~351 million of them before its first fold; test/float16.test.js holds it to the native conversion.
+  const words = new Uint32Array(values.buffer, values.byteOffset, values.length);
+  for (let i = 0; i < words.length; i += 1) {
+    const bits = words[i];
+    const sign = (bits >>> 16) & 0x8000;
+    const biased = (bits >>> 23) & 0xff;
+    let exponent = biased - 127 + 15;
+    let mantissa = bits & 0x7fffff;
+    if (biased === 0xff) { result[i] = sign | (mantissa === 0 ? 0x7c00 : 0x7e00); continue; }
+    if (exponent >= 0x1f) { result[i] = sign | 0x7c00; continue; }
+    if (exponent <= 0) {
+      result[i] = exponent < -10 ? sign : sign | subnormalHalf(mantissa, exponent);
+      continue;
+    }
+    mantissa += 0x0fff + ((mantissa >>> 13) & 1);
+    if ((mantissa & 0x800000) !== 0) {
+      mantissa = 0;
+      exponent += 1;
+      if (exponent >= 0x1f) { result[i] = sign | 0x7c00; continue; }
+    }
+    result[i] = sign | (exponent << 10) | (mantissa >>> 13);
+  }
   return result;
+}
+
+/**
+ * Whether every value of a float32 array is a finite float16 magnitude (|x| <= 65504; NaN is not), read off the bits
+ * with one integer compare an element - `Storage.uploadWeight`'s check before it narrows a weight.
+ */
+export function fitsFloat16(values) {
+  if (!(values instanceof Float32Array)) {
+    for (let i = 0; i < values.length; i += 1) if (!(Math.abs(values[i]) <= 65504)) return false;
+    return true;
+  }
+  const words = new Uint32Array(values.buffer, values.byteOffset, values.length);
+  for (let i = 0; i < words.length; i += 1) if ((words[i] & 0x7fffffff) > 0x477fe000) return false;
+  return true;
 }
 
 
