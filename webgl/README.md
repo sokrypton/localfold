@@ -3409,3 +3409,6 @@ And a residual can ride in the repack: `linear(..., { residual })` returns `resi
 path's repack draw that already writes every output texel (after, on the unblocked path). The trunk's four transitions
 take it through `transition`'s `residualOf`, so their `elementwise.add` goes. Bit-identical; trunk 1371 -> 1358 ms.
 `--no-repack-residual` is the arm.
+The triangle multiplications too: `residualOf` makes their last draw `pair + projected * gate` where it was a multiply
+and the caller's add. Not bit-identical (the driver may fuse the multiply-add): pLDDT 94.014 -> 94.020, worst atom
+against WebGPU 0.116 -> 0.102 A; trunk median 1355 -> 1341 ms.

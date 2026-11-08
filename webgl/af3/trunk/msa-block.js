@@ -189,11 +189,14 @@ export function msaBlock(execution, call) {
   for (const direction of ["outgoing", "incoming"]) {
     const group = direction === "outgoing"
       ? w.triangleMultiplicationOutgoing : w.triangleMultiplicationIncoming;
-    pair = residual(pair, triangleMultiplication(execution, {
+    // ...the residual inside: the triangle's last draw adds it
+    const next = triangleMultiplication(execution, {
       pair, mask: pairMask, weights: group,
       length: tokens, channels: pairChannels,
-      direction: /** @type {any} */ (direction), divideByLength, epsilon,
-    }), ownPair);
+      direction: /** @type {any} */ (direction), divideByLength, epsilon, residualOf: pair,
+    });
+    if (ownPair) execution.release(pair);
+    pair = next;
     ownPair = true;
   }
   for (const [group, transpose] of [[w.pairAttention1, false], [w.pairAttention2, true]]) {

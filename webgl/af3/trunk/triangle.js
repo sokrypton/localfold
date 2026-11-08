@@ -849,7 +849,7 @@ export function releaseTriangleWeights(execution, weights) {
 export function triangleMultiplication(execution, call) {
   const {
     pair, mask, weights: w, length, channels, direction,
-    divideByLength = false, epsilon = 1e-5,
+    divideByLength = false, epsilon = 1e-5, residualOf,
   } = call;
   if (direction !== "outgoing" && direction !== "incoming") {
     throw new RangeError(`af3 triangle: direction is outgoing or incoming, not ${direction}`);
@@ -989,7 +989,19 @@ export function triangleMultiplication(execution, call) {
     activation: "sigmoid",
   });
   execution.release(normalised);
-  const out = multiply(execution, projected, outputGate);
+  // `residualOf`: return `residualOf + projected * gate` from one draw where it was a multiply and the caller's add
+  let out;
+  if (residualOf !== undefined) {
+    out = execution.allocate(pairs * channels, "af3.triangle.residual");
+    execution.dispatch({
+      source: residualProductSource(pairs * channels),
+      output: out,
+      inputs: { baseTex: residualOf, aTex: projected, bTex: outputGate },
+      label: `af3.triangle.residual-product:${length}x${channels}`,
+    });
+  } else {
+    out = multiply(execution, projected, outputGate);
+  }
   execution.release(projected);
   execution.release(outputGate);
   out.label = "af3.triangle";
@@ -1008,3 +1020,16 @@ export const widePairBlockSource = memoSource(widePairBlockSourceUncached);
 export const wideRepackSource = memoSource(wideRepackSourceUncached);
 export const contractRepackSource = memoSource(contractRepackSourceUncached);
 export const centreNormSource = memoSource(centreNormSourceUncached);
+
+/** `base + a * b`, elementwise. */
+const residualProductSourceUncached = (elements) => sized({ ELEMENTS: elements }, `${PRELUDE}${ONE_TARGET}
+uniform sampler2D baseTex;
+uniform sampler2D aTex;
+uniform sampler2D bTex;
+
+void main() {
+  int texel = linearTexel();
+  if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
+  result = fetch4(baseTex, texel) + fetch4(aTex, texel) * fetch4(bTex, texel);
+}`);
+export const residualProductSource = memoSource(residualProductSourceUncached);

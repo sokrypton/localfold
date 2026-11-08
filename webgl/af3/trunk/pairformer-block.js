@@ -157,21 +157,18 @@ export function pairHalf(execution, call, ownsPair = false) {
   } = call;
   let pair = call.pair;
   let own = ownsPair;
-  const residual = (current, update) => {
-    const next = add(execution, current, update);
-    execution.release(update);
-    if (own) execution.release(current);
-    own = true;
-    return next;
-  };
   for (const direction of ["outgoing", "incoming"]) {
     const group = direction === "outgoing"
       ? w.triangleMultiplicationOutgoing : w.triangleMultiplicationIncoming;
-    pair = residual(pair, triangleMultiplication(execution, {
+    // ...the residual inside: the triangle's last draw adds it
+    const next = triangleMultiplication(execution, {
       pair, mask: pairMask, weights: group,
       length: tokens, channels,
-      direction: /** @type {any} */ (direction), divideByLength, epsilon,
-    }));
+      direction: /** @type {any} */ (direction), divideByLength, epsilon, residualOf: pair,
+    });
+    if (own) execution.release(pair);
+    own = true;
+    pair = next;
   }
   for (const [group, transpose] of [[w.pairAttention1, false], [w.pairAttention2, true]]) {
     // ...the residual inside, where the column direction's transpose back folds into the add
