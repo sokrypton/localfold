@@ -107,6 +107,55 @@ void main() {
 }`);
 
 /**
+ * The two gated operands written straight into the layout the contraction reads: each plane padded to `LP` (zeros
+ * past `L`), and, `transposed`, with i and j exchanged - what `padPairPlanesSource` and `planeTransposeSource` used to
+ * copy them into in two more passes. The gating arithmetic is `operandsSource`'s.
+ *
+ * 🔴 TWO PASSES OVER BOTH OPERANDS, EVERY TRIANGLE: at 59 residues every length pads (59 -> 64), so the outgoing
+ * direction drew `pad-planes` twice and the incoming `transpose-a` and `transpose-b`, over a pair-sized tensor each.
+ * `--no-triangle-fused-layout` is the arm that keeps them.
+ */
+const operandsLaidOutSourceUncached = (length, channels, paddedLength, transposed) => sized({ L: length, LP: paddedLength, PLANE: paddedLength * paddedLength, ELEMENTS: channels * paddedLength * paddedLength }, `${PRELUDE}
+layout(location = 0) out vec4 aOut;
+layout(location = 1) out vec4 bOut;
+const int C = ${channels};
+uniform sampler2D projectionTex;
+uniform sampler2D gateTex;
+uniform sampler2D maskTex;
+
+void main() {
+  int texel = linearTexel();
+  if (texel * 4 >= ELEMENTS) { aOut = vec4(0.0); bOut = vec4(0.0); return; }
+  // LP and PLANE are multiples of four, so the four lanes share one plane and one row and only j advances.
+  int element = texel * 4;
+  int c = element / PLANE;
+  int within = element - c * PLANE;
+  int i = within / LP;
+  int j0 = within - i * LP;
+  vec4 a = vec4(0.0);
+  vec4 b = vec4(0.0);
+  if (i < L) {
+    for (int lane = 0; lane < 4; ++lane) {
+      int j = j0 + lane;
+      if (j >= L) break;
+      int index = ${transposed ? "j * L + i" : "i * L + j"};
+      int wide = index * 2 * C + c * 2;
+      float m = fetch1(maskTex, index);
+      float gateA = fetch1(gateTex, wide);
+      float gateB = fetch1(gateTex, wide + 1);
+      float left = fetch1(projectionTex, wide) * m / (1.0 + exp(-gateA));
+      float right = fetch1(projectionTex, wide + 1) * m / (1.0 + exp(-gateB));
+      if (lane == 0) { a.x = left; b.x = right; }
+      else if (lane == 1) { a.y = left; b.y = right; }
+      else if (lane == 2) { a.z = left; b.z = right; }
+      else { a.w = left; b.w = right; }
+    }
+  }
+  aOut = a;
+  bOut = b;
+}`);
+
+/**
  * The contraction and the centre norm in one draw, writing pair-major.
  *
  * 🔴 KEPT ONLY AS THE CONTROL ARM FOR `splitContractSource` BELOW, BECAUSE IT
@@ -826,13 +875,22 @@ export function triangleMultiplication(execution, call) {
     x: normalised, weight: w.gate, rows: pairs,
     inChannels: channels, outChannels: channels * 2, weightLayout: "in-major",
   });
-  const a = execution.allocate(channels * pairs, "af3.triangle.a");
-  const b = execution.allocate(channels * pairs, "af3.triangle.b");
+  // ...straight into the contraction's padded (and, incoming, transposed) layout where the split path wants one
+  // (`operandsLaidOutSource`), else as before
+  const layoutPadded = paddedPairLength(execution, length, channels);
+  const layoutTransposed = direction === "incoming" && layoutPadded % 4 === 0
+    && !execution.noTriangleCoalesce && !execution.noTriangleTranspose;
+  const laidOut = !execution.noTriangleSplit && !execution.noTriangleFusedLayout
+    && (layoutTransposed || layoutPadded !== length);
+  const planeElements = laidOut ? channels * layoutPadded * layoutPadded : channels * pairs;
+  const a = execution.allocate(planeElements, "af3.triangle.a");
+  const b = execution.allocate(planeElements, "af3.triangle.b");
   execution.dispatch({
-    source: operandsSource(length, channels),
+    source: laidOut ? operandsLaidOutSource(length, channels, layoutPadded, layoutTransposed)
+      : operandsSource(length, channels),
     outputs: [a, b],
     inputs: { projectionTex: projection, gateTex: gate, maskTex: mask },
-    label: `af3.triangle.operands:${length}x${channels}`,
+    label: `af3.triangle.operands${laidOut ? (layoutTransposed ? ":transposed" : ":padded") : ""}:${length}x${channels}`,
   });
   execution.release(projection);
   execution.release(gate);
@@ -866,7 +924,11 @@ export function triangleMultiplication(execution, call) {
     const transposeIncoming = direction === "incoming" && padded % 4 === 0
       && !execution.noTriangleCoalesce && !execution.noTriangleTranspose;
     const paddedPlane = channels * padded * padded;
-    if (transposeIncoming) {
+    if (laidOut) {
+      // a and b already ARE the padded (transposed) planes; incoming-transposed is outgoing handed bT and aT
+      contractInto(execution, contracted, transposeIncoming ? b : a, transposeIncoming ? a : b, length, channels,
+        divideByLength, transposeIncoming ? "incoming-transposed" : direction, padded);
+    } else if (transposeIncoming) {
       // The transpose writes at the padded axes in the same pass.
       const aT = execution.allocate(paddedPlane, "af3.triangle.aT");
       const bT = execution.allocate(paddedPlane, "af3.triangle.bT");
@@ -936,6 +998,7 @@ export function triangleMultiplication(execution, call) {
 
 // Every builder above, memoised on its arguments (`memoSource` in webgl/runtime/execution.js).
 export const operandsSource = memoSource(operandsSourceUncached);
+export const operandsLaidOutSource = memoSource(operandsLaidOutSourceUncached);
 export const contractSource = memoSource(contractSourceUncached);
 export const padPairPlanesSource = memoSource(padPairPlanesSourceUncached);
 export const splitContractSource = memoSource(splitContractSourceUncached);

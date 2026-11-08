@@ -363,6 +363,8 @@ export class Execution {
      * kernels/outer-product-mean.js): the two-draw form through `intermediate[s][i][cr][z]`, as before.
      */
     this.noOpmOuterFirst = options.noOpmOuterFirst ?? false;
+    /** The control arm for the triangle's operands written straight into the contraction's layout (`operandsLaidOutSource`). */
+    this.noTriangleFusedLayout = options.noTriangleFusedLayout ?? false;
     /**
      * The control arm for the transposed incoming contraction
      * (`webgl/kernels/triangle-contract.js`): read the column directly, as this
