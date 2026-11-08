@@ -3368,3 +3368,13 @@ on aligned shapes, the triangle-contraction and stride-padding control arms (all
 59-row projections blocked; 4-row blocks up to 2,048 rows. **Two levers remain and are not small:** starting the weight
 download at page load rather than at Fold (a bandwidth decision for visitors who never fold), and decoding the int5
 weights on the GPU at upload (the trunk's stacked slices go through four different uploaders).
+
+### The trunk's grid attention: four projections as one (kept)
+
+`fuseGridProjections` builds one in-major `[channels][4 x width]` weight at upload (query, key and gate transposed from
+out-major, value as is, the gate's bias where a dialect has one in the fused bias) and `gridSelfAttention` runs one
+projection and the diffusion's four-target `splitQkvgSource`, which applies the sigmoid to the gate part. Three draws
+fewer a grid attention (five with a gate bias). 59 residues + 128 rows, three interleaved rounds: trunk **1578 -> 1513
+ms**, fold **4638 -> 4592**, every fused round faster than every control round; pLDDT 94.02 both. `--no-grid-fused-projection`
+is the control arm. `check-webgl-af3-grid-attention.js` and `check-webgl-af3-block.js` pass on the fused path (they
+take no execution flags, so they check the default).

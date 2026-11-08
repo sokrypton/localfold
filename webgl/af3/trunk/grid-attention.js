@@ -49,6 +49,7 @@ import { layerNorm } from "../../kernels/layer-norm.js";
 import { linear } from "../../kernels/linear.js";
 import { multiply } from "../../runtime/elementwise.js";
 import { transposeLeading } from "../../runtime/transpose.js";
+import { splitQkvgSource } from "../diffusion/transformer.js";
 
 /** @typedef {import("../../runtime/storage.js").Tensor} Tensor */
 
@@ -109,10 +110,50 @@ void main() {
 /**
  * @param {import("../../runtime/execution.js").Execution} execution
  */
+/**
+ * The four attention projections as ONE in-major `[channels][4 x width]` weight - query, key, value, gate along the
+ * output axis - and its bias (the gate's own, where the dialect has one, else zeros): what `gridSelfAttention` reads as
+ * `qkvgProjection`, one projection and one split where there were four.
+ *
+ * 🔴 THREE OF THE FOUR ARE OUT-MAJOR AND ONE IS IN-MAJOR, so they are transposed here, once, on the host. Null when a
+ * shape is not the one this expects.
+ */
+export function fuseGridProjections(weights) {
+  const { qProjection: q, kProjection: k, vProjection: v, gatingQuery: g } = weights;
+  if (![q, k, v, g].every((part) => part instanceof Float32Array && part.length === q.length)) return null;
+  const width = weights.heads * weights.dimension;
+  if (!Number.isInteger(width) || width % 4 !== 0 || q.length % width !== 0) return null;
+  const channels = q.length / width;
+  const fused = new Float32Array(channels * 4 * width);
+  for (let c = 0; c < channels; c += 1) {
+    const row = c * 4 * width;
+    for (let o = 0; o < width; o += 1) {
+      fused[row + o] = q[o * channels + c];                 // out-major [width][channels]
+      fused[row + width + o] = k[o * channels + c];
+      fused[row + 2 * width + o] = v[c * width + o];        // in-major [channels][width]
+      fused[row + 3 * width + o] = g[o * channels + c];
+    }
+  }
+  const bias = new Float32Array(4 * width);
+  const gateBias = weights.gatingQueryBias;
+  if (gateBias !== undefined && gateBias !== null) {
+    if (!(gateBias instanceof Float32Array) || gateBias.length !== width) return null;
+    bias.set(gateBias, 3 * width);
+  }
+  return { weight: fused, bias };
+}
+
 export function uploadGridAttentionWeights(execution, weights) {
   /** @type {any} */
   const out = { heads: weights.heads, dimension: weights.dimension };
+  const fused = execution.noGridFusedProjection ? null : fuseGridProjections(weights);
+  if (fused !== null) {
+    out.qkvgProjection = execution.uploadWeight(fused.weight, "w.af3.grid.qkvg");
+    out.qkvgBias = execution.uploadWeight(fused.bias, "w.af3.grid.qkvg-bias");
+  }
+  const fusedAway = new Set(fused === null ? [] : ["qProjection", "kProjection", "vProjection", "gatingQuery"]);
   for (const name of GRID_ATTENTION_WEIGHTS) {
+    if (fusedAway.has(name)) continue;
     const values = weights[name];
     if (values === undefined) throw new Error(`af3 grid attention weights: ${name} is missing`);
     out[name] = execution.uploadWeight(values, `w.af3.grid.${name}`);
@@ -120,6 +161,7 @@ export function uploadGridAttentionWeights(execution, weights) {
   // Absent means the term does not exist, which is not the same as zero: a
   // zero gate bias is a gate at sigmoid(0), and rf3's is bias-dominated.
   for (const name of GRID_ATTENTION_OPTIONAL) {
+    if (fused !== null && name === "gatingQueryBias") continue; // ...it is the fused bias's gate part
     if (weights[name] !== undefined && weights[name] !== null) {
       out[name] = execution.uploadWeight(weights[name], `w.af3.grid.${name}`);
     }
@@ -128,7 +170,7 @@ export function uploadGridAttentionWeights(execution, weights) {
 }
 
 export function releaseGridAttentionWeights(execution, weights) {
-  for (const name of [...GRID_ATTENTION_WEIGHTS, ...GRID_ATTENTION_OPTIONAL]) {
+  for (const name of [...GRID_ATTENTION_WEIGHTS, ...GRID_ATTENTION_OPTIONAL, "qkvgProjection", "qkvgBias"]) {
     if (weights[name] !== undefined) execution.release(weights[name]);
   }
 }
@@ -185,13 +227,28 @@ export function gridSelfAttention(execution, call) {
     x: act, weight, rows: pairs, inChannels: channels, outChannels: width,
     weightLayout: layout, ...(activation === undefined ? {} : { activation }),
   });
-  const query = project(w.qProjection, "out-major");
-  const key = project(w.kProjection, "out-major");
-  const value = project(w.vProjection, "in-major");
+  // ...one fused projection and a four-target split where the weights were fused at upload (`fuseGridProjections`)
+  let query, key, value, gate;
+  if (w.qkvgProjection !== undefined) {
+    const fusedOut = linear(execution, {
+      x: act, weight: w.qkvgProjection, bias: w.qkvgBias, rows: pairs, inChannels: channels,
+      outChannels: 4 * width, weightLayout: "in-major",
+    });
+    [query, key, value, gate] = ["q", "k", "v", "g"].map((part) => execution.allocate(pairs * width, `af3.grid.${part}`));
+    execution.dispatch({
+      source: splitQkvgSource(pairs, width),
+      outputs: [query, key, value, gate],
+      inputs: { fusedTex: fusedOut },
+      label: `af3.grid.split-qkvg:${pairs}x${width}`,
+    });
+    execution.release(fusedOut);
+  } else {
+  query = project(w.qProjection, "out-major");
+  key = project(w.kProjection, "out-major");
+  value = project(w.vProjection, "in-major");
   // The gate: transpose_weights, then its optional bias, THEN the sigmoid - the
   // flash kernel multiplies by the gate it is handed, so the logistic has to be
   // applied here and cannot be folded into the projection when a bias follows.
-  let gate;
   if (w.gatingQueryBias === undefined) {
     gate = project(w.gatingQuery, "out-major", "sigmoid");
   } else {
@@ -213,6 +270,7 @@ export function gridSelfAttention(execution, call) {
       label: `af3.grid.gate-logistic:${pairs}x${width}`,
     });
     execution.release(biased);
+  }
   }
 
   // ...`attentionFlash` returns `{output, plan}`: the plan is how many draw
