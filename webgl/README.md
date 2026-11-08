@@ -3335,3 +3335,36 @@ the triangle's operands written straight into the contraction's padded - and, in
 - **An in-major float16 weight on 64+ rows never blocked**: `bench-webgl-linear.js --half-weights` puts the one-texel
   kernel 1.22-1.78x ahead on every wide trunk shape (3481 x 128 -> 1024 2.21 against 2.68 ms), and the fold's trunk
   went 1.63-1.67 -> 1.66-1.74 s. The fifth bench win this pass the fold did not see.
+
+🔴 **AND THEN THE PAGE ITSELF, WHICH WAS SLOWER THAN THE FOLD IT RUNS.** Measured end to end on the page - Fold to the
+final status, `tools/fold-in-safari.py` and `fold-in-page.py` - rather than through the tool, three more things:
+
+| change | effect |
+|---|---|
+| 4 rows a fragment for a blocked projection below 128 rows (`blockRowsFor`) | the denoiser 3.12 -> 2.92 s, bit-identical |
+| a range decodes only its own groups' int5 scales (`rangeHalves`, shared/weights/dtype.js) | Safari's weight decode 4.67 -> 0.60 s |
+| float16 narrowed on the bits (`float32ToFloat16Scalar`), range checked on the bits (`fitsFloat16`) | Safari's upload 7.25 -> ~1.6 s with the line above |
+| the upload started when the download lands, during the MMseqs2 search (`preloadWebGl2Weights`) | Safari's search-to-trunk gap 2.6 -> 1.2 s |
+| every page pause one slice behind the GPU, not at its drained end (`laggedPause`) | Safari's warm fold 6.3 -> 4.9 s - the tool's speed |
+
+🔴 **`halves()` DECODED THE WHOLE TENSOR'S SCALES ON EVERY SLICE, IN SAFARI ONLY.** Where `Float16Array` is native it is
+a free view; Safari before 18.2 has none, so it is a JavaScript loop - and AF3's trunk weights are stacked tensors read
+a block at a time, so every slice decoded all 48 blocks' tables. A 10x gap to Chrome on the same 351 M floats, invisible
+to every Chrome measurement in this file. 🔴 **AND ITS TEST FOUND THAT THE SCALAR float16 CONVERSION ROUNDED SUBNORMALS
+WRONG** (shifted before rounding, so a tie lost its sticky bits: -5.75e-6 gave 0x8060 where `Float16Array` gives 0x8061)
+- every Safari reader's tiniest weights differed from Chrome's. `subnormalHalf` fixes it; 0 of 8 M random patterns now
+differ from the native conversion.
+
+🔴 **`gpuIdle` AT EVERY SEAM DRAINED THE GPU EVERY TIME.** The page yields ~300 times a fold so Safari's thread is let go
+(there is no OffscreenCanvas WebGL2 to move it into a Worker), and each yield waited for an EMPTY queue, polled on 4 ms
+timers, before issuing the next slice. Waiting for the PREVIOUS slice's fence instead keeps one slice queued: Safari's
+warm 58-residue page fold 6.21-6.45 -> 4.86-4.92 s, its first 9.76-9.98 -> 8.48-8.59, and the upload's ~60 module
+boundaries another ~0.2 s. `noLaggedPause` is the arm.
+
+Measured and NOT kept, besides those above: compiling the fold's programs during the search from a 20-residue stand-in
+batch (no gain: the preload starts at Fold, not at page load, and where a search covers it the fold then waits for the
+warm-up); per-draw `getError` off (no change in Safari either); a bigger texture pool, a lower float16 floor, x narrowed
+on aligned shapes, the triangle-contraction and stride-padding control arms (all neutral or worse on this fold); square
+59-row projections blocked; 4-row blocks up to 2,048 rows. **Two levers remain and are not small:** starting the weight
+download at page load rather than at Fold (a bandwidth decision for visitors who never fold), and decoding the int5
+weights on the GPU at upload (the trunk's stacked slices go through four different uploaders).
