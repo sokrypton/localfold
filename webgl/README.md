@@ -3378,3 +3378,8 @@ fewer a grid attention (five with a gate bias). 59 residues + 128 rows, three in
 ms**, fold **4638 -> 4592**, every fused round faster than every control round; pLDDT 94.02 both. `--no-grid-fused-projection`
 is the control arm. `check-webgl-af3-grid-attention.js` and `check-webgl-af3-block.js` pass on the fused path (they
 take no execution flags, so they check the default).
+
+And the column direction no longer transposes the normalised pair before projecting: a projection is per row, so the
+fused path projects the untransposed activation and `splitGridQkvgSource` gathers the rows in transposed order -
+the same arithmetic, one `transposeLeading` draw over the whole pair fewer. Bit-identical fold (pLDDT 94.019, the same
+worst and relRms); trunk 1513 -> 1508 ms, inside the noise.

@@ -43,13 +43,12 @@
  * halves the gate, and this runs 96 times in an rf3 trunk." No other checkpoint
  * has a slot for either, and absent means the term does not exist.
  */
-import { ONE_TARGET, PRELUDE, sized, memoSource } from "../../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, sized, targetDeclarations, memoSource } from "../../runtime/execution.js";
 import { attentionFlash } from "../../kernels/attention-flash.js";
 import { layerNorm } from "../../kernels/layer-norm.js";
 import { linear } from "../../kernels/linear.js";
 import { multiply } from "../../runtime/elementwise.js";
 import { transposeLeading } from "../../runtime/transpose.js";
-import { splitQkvgSource } from "../diffusion/transformer.js";
 
 /** @typedef {import("../../runtime/storage.js").Tensor} Tensor */
 
@@ -110,6 +109,33 @@ void main() {
 /**
  * @param {import("../../runtime/execution.js").Execution} execution
  */
+/**
+ * The fused projection `[pairs][4 x width]` split into query, key, value and gate (the logistic applied), and - for the
+ * column direction - TRANSPOSED on the way: output row `i * L + j` reads the projection of row `j * L + i`. A projection
+ * is per row, so projecting the untransposed activation and gathering its rows here is the same arithmetic as
+ * transposing the activation first, without the `transposeLeading` draw over the whole pair.
+ */
+const splitGridQkvgSourceUncached = (length, width, transpose) => sized({ ROWS: length * length },
+  `${PRELUDE}${targetDeclarations(4)}
+const int W4 = ${width / 4};
+const int L = ${length};
+uniform sampler2D fusedTex;
+
+void main() {
+  int texel = linearTexel();
+  if (texel >= ROWS * W4) {
+    result0 = vec4(0.0); result1 = vec4(0.0); result2 = vec4(0.0); result3 = vec4(0.0);
+    return;
+  }
+  int row = texel / W4;
+  ${transpose ? "row = (row % L) * L + row / L;" : ""}
+  int base = row * 4 * W4 + texel % W4;
+  result0 = fetch4(fusedTex, base);
+  result1 = fetch4(fusedTex, base + W4);
+  result2 = fetch4(fusedTex, base + 2 * W4);
+  result3 = vec4(1.0) / (vec4(1.0) + exp(-fetch4(fusedTex, base + 3 * W4)));
+}`);
+
 /**
  * The four attention projections as ONE in-major `[channels][4 x width]` weight - query, key, value, gate along the
  * output axis - and its bias (the gate's own, where the dialect has one, else zeros): what `gridSelfAttention` reads as
@@ -218,8 +244,10 @@ export function gridSelfAttention(execution, call) {
   });
   execution.release(rawBias);
 
-  // ...and the activation itself, transposed for the column direction.
-  const act = transpose
+  // ...and the activation itself, transposed for the column direction - except on the fused path, whose split gathers
+  // the projected rows in transposed order instead (`splitGridQkvgSource`).
+  const fusedPath = w.qkvgProjection !== undefined;
+  const act = transpose && !fusedPath
     ? transposeLeading(execution, { x: normalised, outer: length, inner: length, channels })
     : normalised;
 
@@ -229,17 +257,17 @@ export function gridSelfAttention(execution, call) {
   });
   // ...one fused projection and a four-target split where the weights were fused at upload (`fuseGridProjections`)
   let query, key, value, gate;
-  if (w.qkvgProjection !== undefined) {
+  if (fusedPath) {
     const fusedOut = linear(execution, {
       x: act, weight: w.qkvgProjection, bias: w.qkvgBias, rows: pairs, inChannels: channels,
       outChannels: 4 * width, weightLayout: "in-major",
     });
     [query, key, value, gate] = ["q", "k", "v", "g"].map((part) => execution.allocate(pairs * width, `af3.grid.${part}`));
     execution.dispatch({
-      source: splitQkvgSource(pairs, width),
+      source: splitGridQkvgSource(length, width, transpose),
       outputs: [query, key, value, gate],
       inputs: { fusedTex: fusedOut },
-      label: `af3.grid.split-qkvg:${pairs}x${width}`,
+      label: `af3.grid.split-qkvg:${pairs}x${width}${transpose ? ":transposed" : ""}`,
     });
     execution.release(fusedOut);
   } else {
@@ -328,5 +356,6 @@ void main() {
 
 // Every builder above, memoised on its arguments (`memoSource` in webgl/runtime/execution.js).
 export const biasPlanesSource = memoSource(biasPlanesSourceUncached);
+export const splitGridQkvgSource = memoSource(splitGridQkvgSourceUncached);
 export const addRowBiasSource = memoSource(addRowBiasSourceUncached);
 export const logisticSource = memoSource(logisticSourceUncached);
