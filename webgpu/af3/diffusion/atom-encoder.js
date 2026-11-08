@@ -52,6 +52,8 @@ import { SOURCES, carriesTensor } from "../../../shared/weights/weight-sources.j
 const STATIC_UPLOADS = new WeakMap();
 
 const GRID_WIDTH = 32_768;
+/** A browser's first call, before its kernels tier up, was one submission of 231 ms on an A10 at 300 tokens and 519 on a T4. */
+const ATOM_PIECE_DISPATCHES = 4;
 
 const BLOCK_ORDER = [
   "qSingleCondLayerNormScale", "qSingleCondScaleWeights", "qSingleCondScaleBias",
@@ -2426,7 +2428,7 @@ export class Af3AtomEncoderGpu {
       const deferred = outputs === undefined ? undefined : options.validation;
       if (deferred === undefined) this.device.pushErrorScope("validation");
       else deferred.begin();
-      const encoder = this.device.createCommandEncoder({ label: "af3-atom-encoder" });
+      let encoder = this.device.createCommandEncoder({ label: "af3-atom-encoder" });
       const batchPasses = deviceTuning(this.device).batchComputePasses !== false;
       let openPass = null;
       const passFor = (label) => {
@@ -2437,6 +2439,7 @@ export class Af3AtomEncoderGpu {
       const endPass = () => {
         if (openPass !== null) { openPass.end(); openPass = null; }
       };
+      let dispatches = 0;
       const run = (label, pipeline, buffers, x, y = 1) => {
         const pass = passFor(label);
         pass.setPipeline(pipeline);
@@ -2448,6 +2451,12 @@ export class Af3AtomEncoderGpu {
         }));
         pass.dispatchWorkgroups(x, y);
         if (!batchPasses) pass.end();
+        dispatches += 1;
+        if (dispatches % ATOM_PIECE_DISPATCHES === 0) {
+          endPass();
+          this.device.queue.submit([encoder.finish()]);
+          encoder = this.device.createCommandEncoder({ label: "af3-atom-encoder" });
+        }
       };
       const spread = (groups) => [Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH)];
       const lin = (count) => spread(Math.ceil(count / 64));

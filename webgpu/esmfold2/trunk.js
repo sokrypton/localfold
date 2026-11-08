@@ -571,12 +571,11 @@ export class Esmfold2TrunkGpu {
       pass.dispatchWorkgroups(x, y, z);
       if (!batchPasses) pass.end();
     };
-    const flush = (heavy) => {
-      if (!context.pacer.pieceDue(heavy)) return;
+    const flush = () => context.pacer.pieceEnded(() => {
       endPass();
       this.device.queue.submit([encoder.finish()]);
       encoder = this.device.createCommandEncoder({ label: "esmfold2-trunk-block" });
-    };
+    });
     encodePairTrack({
       run, pipelines, n, channels, pair, pairMask, scratch, weights,
       gridAttention, gridHeads, biasBuffer, transitionSplit, projectMatrix, flush,

@@ -46,6 +46,7 @@ import {
   encodePairTrack, packPairTrackWeights,
 } from "./pair-track.js";
 import { residentPairTrackOnDevice } from "../weights/pair-track-device-weights.js";
+import { QueuePacer } from "../../runtime/queue-pacing.js";
 import { allocateGridProjectMatrix, gridProjectMatrixConfig }
   from "./grid-project-matrix.js";
 import {
@@ -879,11 +880,13 @@ export class Af3TemplateEmbedderGpu {
         pass.dispatchWorkgroups(x, y, z);
         if (!batchPasses) pass.end();
       };
-      const flush = () => {
+      const send = () => {
         endPass();
         this.device.queue.submit([encoder.finish()]);
         encoder = this.device.createCommandEncoder({ label: "af3-template" });
       };
+      const pacer = new QueuePacer(this.device);
+      const flush = () => pacer.pieceEnded(send);
       const spread = (groups) => [Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH)];
       const linear = spread(Math.ceil(pairs / 64));
       // A workgroup of EMBED_ROWS pair rows; see createTemplateShaders.
@@ -961,6 +964,11 @@ export class Af3TemplateEmbedderGpu {
             pair: act, pairMask, scratch, biasBuffer, weights: blockWeights[index],
             gridProjectMatrix, flush,
           });
+          // ...a block too small to go in pieces keeps sharing a submission with the rest of the stack.
+          if (pacer.piece > 0) {
+            send();
+            await pacer.blockSubmitted();
+          }
         }
         run(`template.accumulate.${slot}`, compiled.accumulate,
             outerResidual

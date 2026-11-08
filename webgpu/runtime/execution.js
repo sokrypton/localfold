@@ -545,6 +545,7 @@ export class WebGpuExecution {
     pass.dispatchWorkgroups(x, y, z);
     if (reusable) {
       if (label !== undefined) pass.popDebugGroup();
+      encoder.pieceEnded?.(() => this.endComputePass(encoder));
     } else {
       pass.end();
     }

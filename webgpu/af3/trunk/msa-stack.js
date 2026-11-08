@@ -590,12 +590,11 @@ export class Af3MsaStackGpu {
     const spread = (groups) => [Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH)];
     const ceil = (value, divisor) => Math.ceil(value / divisor);
     // A large block goes to the queue in pieces: see `flush` in encodePairTrack.
-    const flush = (heavy) => {
-      if (!context.pacer.pieceDue(heavy)) return;
+    const flush = () => context.pacer.pieceEnded(() => {
       endPass();
       this.device.queue.submit([encoder.finish()]);
       encoder = this.device.createCommandEncoder({ label: "af3-msa-block" });
-    };
+    });
     const large = pairs * pairChannels * 4 >= FLUSH_MIN_BYTES;
 
     // 🔴 THE TWO HALVES OF AN MSA BLOCK, AND WHICH RUNS FIRST IS THE MODEL.

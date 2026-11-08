@@ -42,8 +42,8 @@ import { GpuBufferAllocator } from "../../runtime/allocator.js";
 import { noteAllocation, noteDestroy } from "../../runtime/device-memory.js";
 import { pipelineCacheForDevice, settleAll } from "../../runtime/pipeline-cache.js";
 
-/** Multiply-adds a dispatch of the pair kernels here, a factor-2 transition's two matmuls being 4 x channels^2 a row. About 200 ms on an A10. */
-const CONDITIONING_STEP_WORK = 100e9;
+/** Multiply-adds a dispatch of the pair kernels here, a factor-2 transition's two matmuls being 4 x channels^2 a row. About 8 ms on an A10. */
+const CONDITIONING_STEP_WORK = 4e9;
 
 const STATIC_UPLOADS = new WeakMap();
 import { residentWeightBuffer } from "../../runtime/resident.js";

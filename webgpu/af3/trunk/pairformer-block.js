@@ -1106,12 +1106,12 @@ export class Af3PairformerStackGpu {
     };
     const spread = (groups) => [Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH)];
     const ceil = (value, divisor) => Math.ceil(value / divisor);
-    const flush = (heavy) => {
-      if (!context.pacer.pieceDue(heavy)) return;
+    const large = context.pipelines.sequential !== undefined || pairs * pairChannels * 4 >= FLUSH_MIN_BYTES;
+    const flush = () => context.pacer.pieceEnded(() => {
       endPass();
       this.device.queue.submit([encoder.finish()]);
       encoder = this.device.createCommandEncoder({ label: "af3-pairformer-block" });
-    };
+    });
 
     encodePairTrack({
       run, pipelines, n, channels: pairChannels, gridHeads, pair, pairMask, gridAttention: context.gridAttention,
@@ -1128,14 +1128,17 @@ export class Af3PairformerStackGpu {
           ? [pair, logitsWeights, logitsWeights, pairLogits]
           : [pair, logitsWeights, logitsWeights, pairLogits, extraPairBias],
         linear[0], linear[1]);
+    if (large) flush();
 
     const singleTiles = ceil(n, pipelines.singleProjectRows);
     run("single.project", pipelines["single:project"],
         [single, singleWeights, singleScratch[0], singleScratch[1], singleScratch[2],
          singleScratch[3]], singleTiles * pipelines.singleProjectSplits);
+    if (large) flush();
     run("single.attend", pipelines["single:attend"],
         [singleScratch[0], singleScratch[1], singleScratch[2], pairLogits, seqMask,
          singleScratch[4]], n * heads);
+    if (large) flush();
     run("single.project-out", pipelines["single:project_out"],
         [singleScratch[4], singleScratch[3], singleWeights, single], singleTiles);
 
