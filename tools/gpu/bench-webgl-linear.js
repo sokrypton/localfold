@@ -90,6 +90,11 @@ export async function main(device, args) {
   const execution = new Execution(gl, {
     checkErrors: !flag(args, "no-check-errors"),
     noLinearAspect: flag(args, "no-linear-aspect"),
+    // 🔴 `--half-weights` IS WHAT A FOLD RUNS: its drivers hold large weights (all of them, for AF3 - fold-batch.js
+    // AF3_HALF_WEIGHT_FLOOR) in float16, and without this every row here is a float32-weight number. The blocked-at-
+    // 59-rows decision was first read off exactly that, and probe-webgl-packed-x.js puts f16 weights at ~2x.
+    halfWeights: flag(args, "half-weights"),
+    ...(option(args, "half-floor", null) === null ? {} : { halfWeightFloor: Number(option(args, "half-floor", "0")) }),
   });
   const rows = [];
   const ballast = [];
