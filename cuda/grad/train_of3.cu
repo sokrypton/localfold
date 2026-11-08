@@ -30,6 +30,7 @@
 //       [--crop=384] [--samples=48] [--lr=1.8e-3] [--warmup=1000] [--bond=0] [--save=<ckpt>] [--save-every=N]
 //       [--resume=<ckpt>] [--seed=1] [--init=bundle|of3] [--tf32] [--bf16] [--bf16-confidence] [--mem] [--diffusion-saves=auto|keep|recompute] [--offload-pairs] [--transition-chunk=64] [--no-dropout] [--max-kept-saves=N] [--val=<file>] [--smoke]
 //       [--sample-batch=8|auto]
+// --check-tc-bwd=k: the tcgen05 grid backward's gradients against bwdBf's (the example cropped)
 // --check-ckpt=k / --check-perm=k / --check-bf16=k / --check-chunk=k: the recomputation, the truth's permutation, the bf16 trunk and the chunked transitions held
 // to their references on example k.
 // --init=of3: OpenFold3's from-scratch initialisation instead of the bundle's weights.
@@ -40,6 +41,7 @@
 #include <fstream>
 #include <future>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <random>
 #include <sstream>
@@ -707,7 +709,7 @@ int main(int argc, char** argv) {
   int sampleBatch = 8;   // the diffusion samples a denoiser pass (--sample-batch; 0, --sample-batch=auto: as many as the room holds)
   int maxRecycles = 3;   // OpenFold3's num_recycles: a step runs 1 + U{0..max} cycles (--max-recycles)
   int checkBatch = -1;
-  int steps = 30, samples = 48, batch = 1, crop = 384, saveEvery = 0, checkCkpt = -1, checkPerm = -1, checkBf16 = -1, checkConfs = -1, checkChunk = -1; std::string init = "bundle";
+  int steps = 30, samples = 48, batch = 1, crop = 384, saveEvery = 0, checkCkpt = -1, checkPerm = -1, checkBf16 = -1, checkConfs = -1, checkChunk = -1, checkTcBwd = -1; std::string init = "bundle";
   bool dropout = true, dropInFixed = false, bf16Trunk = false, bf16Confidence = false, offloadPairs = false;
   double transitionChunkM = 64;
   int world = 1, rank = 0; std::string dp = "nccl", rendezvous;      // data parallel (of3dist.cuh)
@@ -756,6 +758,7 @@ int main(int argc, char** argv) {
     else if (auto v = opt("--check-perm=")) checkPerm = atoi(v);
     else if (auto v = opt("--check-bf16=")) checkBf16 = atoi(v);
     else if (auto v = opt("--check-chunk=")) checkChunk = atoi(v);
+    else if (auto v = opt("--check-tc-bwd=")) checkTcBwd = atoi(v);
     else if (auto v = opt("--check-conformers=")) checkConfs = atoi(v);
     else if (auto v = opt("--init=")) init = v;
     else if (auto v = opt("--val=")) valPath = v;
@@ -1852,6 +1855,56 @@ int main(int argc, char** argv) {
     const bool ok = e < 0.05;
     printf("bf16 trunk: every gradient against float32's, relRMS %.3e (two float runs: %.3e)  %s\n", e, floor, ok ? "PASS" : "FAIL");
     bf16Trunk = false; dropInFixed = false;
+    if (!ok) return 1;
+  }
+  // --check-tc-bwd=k: example k CROPPED (--crop; the same seeded draws each run - crop, recycles, dropout, noise) with the
+  // grid attention's backward on tcgen05 (bwdTc) and on bwdBf - every gradient compared, against two bwdBf runs' floor
+  // (the backward's atomics). Cropped, because bwdTc wants Q, K multiples of 128 and a whole entry is rarely one
+  if (checkTcBwd >= 0) {
+    auto grads = [&](bool on) {
+      grad::flash::TCB = on; ps.zeroGrad();
+      std::mt19937_64 gen(99);
+      const auto r = runExample(examples.at(checkTcBwd), true, false, 4, gen);
+      std::vector<double> all;
+      for (auto* p : ps.all) { auto h = g::host(p->g, p->n); all.insert(all.end(), h.begin(), h.end()); }
+      printf("  (%s: loss %.6f)\n", on ? "bwdTc" : "bwdBf", r.first.total);
+      return all;
+    };
+    const auto a = grads(true), b = grads(false), c = grads(false);
+    auto rel = [](const std::vector<double>& x, const std::vector<double>& y) {
+      double num = 0, den = 0; for (size_t i = 0; i < x.size(); ++i) { num += (x[i] - y[i]) * (x[i] - y[i]); den += y[i] * y[i]; }
+      return std::sqrt(num / std::max(den, 1e-300));
+    };
+    const double e = rel(a, b), floor = rel(c, b);
+    {   // (the tensors whose gradients move most between the two bwdBf runs, and bwdTc's against bwdBf's for them)
+      std::vector<std::tuple<double, double, double, std::string>> t;
+      size_t o = 0;
+      for (auto* p : ps.all) {
+        double nf = 0, ne = 0, d = 0;
+        for (size_t i = o; i < o + p->n; ++i) { nf += (c[i] - b[i]) * (c[i] - b[i]); ne += (a[i] - b[i]) * (a[i] - b[i]); d += b[i] * b[i]; }
+        t.emplace_back(nf, std::sqrt(nf / std::max(d, 1e-300)), std::sqrt(ne / std::max(d, 1e-300)), p->name);
+        o += p->n;
+      }
+      std::sort(t.rbegin(), t.rend());
+      for (int i = 0; i < 8 && i < (int)t.size(); ++i)
+        printf("  %-60s floor %.2e  bwdTc %.2e  (share of the floor %.1f%%)\n", std::get<3>(t[i]).c_str(), std::get<1>(t[i]), std::get<2>(t[i]),
+               100 * std::get<0>(t[i]) / std::max(floor * floor * std::accumulate(b.begin(), b.end(), 0.0, [](double s, double x) { return s + x * x; }), 1e-300));
+    }
+    // ...and over the grid attentions' own tensors (pairAttention1 / 2: the first its gradients reach), against their floor
+    double gn = 0, gf = 0, gd = 0;
+    {
+      size_t o = 0;
+      for (auto* p : ps.all) {
+        if (p->name.find("pairAttention") != std::string::npos)
+          for (size_t i = o; i < o + p->n; ++i) { gn += (a[i] - b[i]) * (a[i] - b[i]); gf += (c[i] - b[i]) * (c[i] - b[i]); gd += b[i] * b[i]; }
+        o += p->n;
+      }
+    }
+    const double ge = std::sqrt(gn / std::max(gd, 1e-300)), gfl = std::sqrt(gf / std::max(gd, 1e-300));
+    printf("tcgen05 grid backward, the grid attentions' tensors: relRMS %.3e (two bwdBf runs: %.3e)\n", ge, gfl);
+    const bool ok = std::isfinite(e) && e < std::max(4 * floor, 1e-5) && std::isfinite(ge) && ge < std::max(4 * gfl, 1e-5);
+    printf("tcgen05 grid backward: every gradient against bwdBf's, relRMS %.3e (two bwdBf runs: %.3e)  %s\n", e, floor, ok ? "PASS" : "FAIL");
+    grad::flash::TCB = true;
     if (!ok) return 1;
   }
   // --check-chunk=k: example k (whole, fixed draws, dropout on) with the transitions in chunks of 1000 hidden elements

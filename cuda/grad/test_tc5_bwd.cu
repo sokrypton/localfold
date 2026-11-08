@@ -16,6 +16,88 @@ __global__ void toBfK(const float* x, __nv_bfloat16* y, size_t n) {
   if (i < n) y[i] = __float2bfloat16(x[i]);
 }
 
+// bwdTc's other paths, against bwdBf: Q != K, dk / dv in float accumulated onto what is there (accK, accV), two biases
+// with gradients (one a head, one every head shares), a bias tile every head shares (bt.sh 0); q, k, v their own rows
+static int variants(curandGenerator_t gen) {
+  int fails = 0;
+  struct V { int B, Q, K; bool twoBias, headShared; const char* name; };
+  for (V v : {V{64, 256, 384, false, false, "Q 256 K 384, float dk / dv accumulated"},
+              V{48, 384, 256, true, false, "Q 384 K 256, two biases (one head-shared) with gradients"},
+              V{32, 256, 256, false, true, "a head-shared bias tile"}}) {
+    const int H = 4, D = 32, HD = H * D;
+    const size_t nq = (size_t)v.B * v.Q, nk = (size_t)v.B * v.K, qk = (size_t)v.Q * v.K;
+    auto randBf = [&](size_t len, float sd) {
+      float* f; GK(cudaMalloc(&f, (len + 1) * 4)); curandGenerateNormal(gen, f, len + (len & 1), 0.f, sd);
+      __nv_bfloat16* b; GK(cudaMalloc(&b, len * 2)); toBfK<<<(unsigned)((len + 255) / 256), 256>>>(f, b, len);
+      GK(cudaDeviceSynchronize()); GK(cudaFree(f)); return b;
+    };
+    auto randF = [&](size_t len, float sd) { float* f; GK(cudaMalloc(&f, (len + 1) * 4)); curandGenerateNormal(gen, f, len + (len & 1), 0.f, sd); GK(cudaDeviceSynchronize()); return f; };
+    __nv_bfloat16 *q = randBf(nq * HD, 1.f), *k = randBf(nk * HD, 1.f), *vv = randBf(nk * HD, 1.f), *dO = randBf(nq * HD, 1.f);
+    float* b0 = randF((v.headShared ? 1 : H) * qk, 1.f);
+    float* b1 = v.twoBias ? randF(qk, 1.f) : nullptr;
+    std::vector<float> hm(nk, 1.f);
+    for (size_t i = 0; i < nk; ++i) if (i % 13 == 5) hm[i] = 0.f;
+    float* m; GK(cudaMalloc(&m, nk * 4)); GK(cudaMemcpy(m, hm.data(), nk * 4, cudaMemcpyHostToDevice));
+    Sdpa a; a.B = v.B; a.H = H; a.Q = v.Q; a.K = v.K; a.D = D; a.scale = 1 / sqrtf((float)D); a.keyMask = m;
+    a.bias[0] = Bias{b0, 0, v.headShared ? 0 : (long long)qk, v.K, nullptr};
+    if (b1) a.bias[1] = Bias{b1, 0, 0, v.K, nullptr};
+    float *o, *lse; GK(cudaMalloc(&o, nq * HD * 4)); GK(cudaMalloc(&lse, 2 * nq * H * 4));
+    if (!flash::runForwardBfIn(a, q, HD, k, HD, vv, HD, o, HD, lse)) { printf("forward declined\n"); return 1; }
+    GK(cudaDeviceSynchronize());
+    std::vector<float> ho(nq * HD); std::vector<uint16_t> hdo(nq * HD);
+    GK(cudaMemcpy(ho.data(), o, nq * HD * 4, cudaMemcpyDeviceToHost)); GK(cudaMemcpy(hdo.data(), dO, nq * HD * 2, cudaMemcpyDeviceToHost));
+    std::vector<float> hDi(nq * H);
+    for (size_t r = 0; r < nq; ++r)
+      for (int h = 0; h < H; ++h) {
+        double sum = 0; for (int d = 0; d < D; ++d) sum += (double)ho[r * HD + h * D + d] * fromBf(hdo[r * HD + h * D + d]);
+        hDi[((r / v.Q) * H + h) * v.Q + r % v.Q] = (float)sum;
+      }
+    float* Di; GK(cudaMalloc(&Di, nq * H * 4)); GK(cudaMemcpy(Di, hDi.data(), nq * H * 4, cudaMemcpyHostToDevice));
+    float* init = randF(nk * HD, 1.f);   // (what dk and dv hold before: accumulated onto)
+    float *dq, *dk, *dv, *g0, *g1;
+    GK(cudaMalloc(&dq, nq * HD * 4)); GK(cudaMalloc(&dk, nk * HD * 4)); GK(cudaMalloc(&dv, nk * HD * 4));
+    const size_t n0 = (v.headShared ? 1 : H) * qk;
+    GK(cudaMalloc(&g0, n0 * 4)); GK(cudaMalloc(&g1, qk * 4));
+    const bool acc = v.Q != v.K || v.twoBias;
+    auto run = [&](bool tc) {
+      flash::TCB = tc;
+      GK(cudaMemset(dq, 0, nq * HD * 4)); GK(cudaMemset(g0, 0, n0 * 4)); GK(cudaMemset(g1, 0, qk * 4));
+      GK(cudaMemcpy(dk, init, nk * HD * 4, cudaMemcpyDeviceToDevice)); GK(cudaMemcpy(dv, init, nk * HD * 4, cudaMemcpyDeviceToDevice));
+      GK(cudaDeviceSynchronize());
+      Sdpa b = a; b.bias[0].grad = g0; if (b1) b.bias[1].grad = g1;
+      flash::backwardBf<32>(b, q, HD, k, HD, vv, HD, dO, HD, lse, Di, dq, HD, dk, HD, dv, HD, acc, acc);
+      GK(cudaDeviceSynchronize());
+      std::vector<float> out(nq * HD + 2 * nk * HD + n0 + qk);
+      float* w = out.data();
+      GK(cudaMemcpy(w, dq, nq * HD * 4, cudaMemcpyDeviceToHost)); w += nq * HD;
+      GK(cudaMemcpy(w, dk, nk * HD * 4, cudaMemcpyDeviceToHost)); w += nk * HD;
+      GK(cudaMemcpy(w, dv, nk * HD * 4, cudaMemcpyDeviceToHost)); w += nk * HD;
+      GK(cudaMemcpy(w, g0, n0 * 4, cudaMemcpyDeviceToHost)); w += n0;
+      GK(cudaMemcpy(w, g1, qk * 4, cudaMemcpyDeviceToHost));
+      return out;
+    };
+    const auto A = run(false), Bv = run(true);
+    const size_t seg[5] = {nq * HD, nk * HD, nk * HD, n0, qk};
+    const char* nm[5] = {"dq", "dk", "dv", "dbias0", "dbias1"};
+    size_t off = 0; bool ok = true; printf("  %s:", v.name);
+    for (int t = 0; t < 5; ++t) {
+      double num = 0, den = 0;
+      for (size_t i = off; i < off + seg[t]; ++i) { const double d = Bv[i] - A[i]; num += d * d; den += (double)A[i] * A[i]; }
+      off += seg[t];
+      if (t == 4 && !b1) continue;
+      const double e = std::sqrt(num / std::max(den, 1e-30));
+      ok &= e < 2e-2 && std::isfinite(e);
+      printf(" %s %.2e", nm[t], e);
+    }
+    printf("  %s\n", ok ? "PASS" : "FAIL");
+    fails += !ok;
+    for (void* p : {(void*)q, (void*)k, (void*)vv, (void*)dO, (void*)b0, (void*)m, (void*)o, (void*)lse, (void*)Di, (void*)init, (void*)dq,
+                    (void*)dk, (void*)dv, (void*)g0, (void*)g1}) GK(cudaFree(p));
+    if (b1) GK(cudaFree(b1));
+  }
+  return fails;
+}
+
 int main(int argc, char** argv) {
   const bool noDb = argc > 1 && !strcmp(argv[1], "nodb");   // (nodb: no bias gradient - the atomics' share)
   grad::init();
@@ -115,6 +197,8 @@ int main(int argc, char** argv) {
            er[2], ta[ta.size() / 2], tb[tb.size() / 2], ta[ta.size() / 2] / tb[tb.size() / 2], ok ? "PASS" : "FAIL");
     for (void* p : {(void*)qkvg, (void*)dO, (void*)nb, (void*)m, (void*)o, (void*)og, (void*)lse, (void*)Di, (void*)dq, (void*)dnb, (void*)dpk}) GK(cudaFree(p));
   }
+  printf("variants (bwdTc against bwdBf):\n");
+  fails += variants(gen);
   printf(fails ? "FAIL\n" : "PASS\n");
   return fails != 0;
 }
