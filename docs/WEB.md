@@ -4472,11 +4472,13 @@ do without:
 🔴 **AND THE DECODER WAS ALREADY IN THE TREE.** The design page reads `.cif.gz`
 inputs through a hand-written DEFLATE, and there it is not a fallback at all -
 that structure path is synchronous end to end, which rules out
-`DecompressionStream` whether the browser has it or not. It was sitting under
-`shared/rfd4p/`, the design model's own pipeline, where nothing on the fold path
-could sensibly import it - and `shared/rfd4p/` is one of the trees the live
-site's build leaves out, so importing it from there would have fixed this
-nowhere. It is `shared/input/inflate.js` now, with an `inflateRaw` for a ZIP
+`DecompressionStream` whether the browser has it or not. It was sitting in the
+design model's own pipeline directory under `shared/`, where nothing on the fold
+path could sensibly import it - and that tree is one of the ones the live site's
+build leaves out, so importing it from there would have fixed this nowhere. (It
+is named no more exactly than that here on purpose: `test/imports-resolve.test.js`
+holds every directory a document names to one that EXISTS, and this document is
+carried to the live-site tree whole, where that one does not.) It is `shared/input/inflate.js` now, with an `inflateRaw` for a ZIP
 member beside the `gunzip` that was already there: one decoder, four consumers.
 (`cuda/rfd4p/README.md` still calls it `pipeline/inflate.js`, one directory
 along; left alone because another agent owns that tree.)
