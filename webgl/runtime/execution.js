@@ -363,6 +363,7 @@ export class Execution {
      * kernels/outer-product-mean.js): the two-draw form through `intermediate[s][i][cr][z]`, as before.
      */
     this.noOpmOuterFirst = options.noOpmOuterFirst ?? false;
+    this.noGridFusedProjection = options.noGridFusedProjection ?? false;
     /** The control arm for a page fold's pause one slice behind the GPU (`laggedPause` in runtime/steps.js). */
     this.noLaggedPause = options.noLaggedPause ?? false;
     /** The control arm for the triangle's operands written straight into the contraction's layout (`operandsLaidOutSource`). */

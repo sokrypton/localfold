@@ -261,6 +261,7 @@ export function webglExecutionOptions(args, defaults = {}) {
     // `--skip=<regex>`: no draws for those labels - the family's draw time, where `--double` reads free (Execution.skipLabels)
     skipLabels: pattern("skip"),
     noOpmOuterFirst: flag(args, "no-opm-outer-first"),
+    noGridFusedProjection: flag(args, "no-grid-fused-projection"),
     noTriangleFusedLayout: flag(args, "no-triangle-fused-layout"),
     skipDraws: flag(args, "skip-draws"),
     noTriangleTranspose: flag(args, "no-triangle-transpose"),
