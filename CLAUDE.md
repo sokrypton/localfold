@@ -1229,6 +1229,11 @@ the pair stack (argon-ptx), BioEmu2 recognising its cached step conditioning by 
 next job is recomputed into the same address), and "All 5"'s first job (191197b3). Never key a cross-job cache on an
 address; forget it at the start of a job. `npm run test:native` folds a job AGAIN on a warm server after other jobs
 (AF3, AF2, ESMFold2, BioEmu2) and requires the same structure - add such a case with any new resident state.
+🔴 **AND A KERNEL'S ATTRIBUTE IS THE PROCESS'S, NOT ITS LAUNCHER'S** (1a3b313b): AF2's `lnQkvg64` and AF3's
+`gridInRaw<64>` launch one `gridInK` instantiation with different shared memory, each setting it once behind its own
+static flag, so a no-template warm-up then a templated fold LOWERED it under the first - every launch after failed
+`invalid argument`, unchecked, and 5CAJ folded to pTM 0.0000. `smemAttr` only raises now; reproduce such a bug with
+`--warm=64,8,8,0` on the binary, which every resident server runs before its first job.
 
 🔴 **INLINE PTX IS AN ARCHITECTURE CLAIM, AND THIS MACHINE ONLY EVER COMPILES sm_80.** argon-ptx's conversion helpers
 (`cvt.rn.f16x2.f32`, `max.f16x2`: sm_80 instructions) broke the T4 build of every port while every gate here passed.
