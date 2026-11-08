@@ -29,7 +29,8 @@
  */
 import { ONE_TARGET, PRELUDE, sized, memoSource } from "../../runtime/execution.js";
 import { layerNorm } from "../../kernels/layer-norm.js";
-import { linear } from "../../kernels/linear.js";
+import { linear, planeInputs } from "../../kernels/linear.js";
+import { swiGluPlanesSource } from "../diffusion/transformer.js";
 
 /** @typedef {import("../../runtime/storage.js").Tensor} Tensor */
 
@@ -113,17 +114,20 @@ export function transition(execution, call) {
   });
   const wide = linear(execution, {
     x: normalised, weight: w.transition1, rows,
-    inChannels: channels, outChannels: intermediate * 2, weightLayout: "in-major",
+    inChannels: channels, outChannels: intermediate * 2, weightLayout: "in-major", keepPlanes: true,
   });
   execution.release(normalised);
   const gated = execution.allocate(rows * intermediate, "af3.transition.gated");
+  // ...reading the projection's row planes where it kept them, with no repack draw between
+  const kept = /** @type {any} */ (wide).planes !== undefined ? /** @type {any} */ (wide) : null;
   execution.dispatch({
-    source: swiGluSource(rows, intermediate),
+    source: kept === null ? swiGluSource(rows, intermediate) : swiGluPlanesSource(rows, intermediate, kept.blockRows),
     output: gated,
-    inputs: { wideTex: wide },
-    label: `af3.transition.swiglu:${rows}x${intermediate}`,
+    inputs: kept === null ? { wideTex: wide } : planeInputs(kept),
+    label: `af3.transition.swiglu:${rows}x${intermediate}${kept === null ? "" : ":planes"}`,
   });
-  execution.release(wide);
+  if (kept === null) execution.release(wide);
+  else for (const plane of kept.planes) execution.release(plane);
   const out = linear(execution, {
     x: gated, weight: w.transition2, rows,
     inChannels: intermediate, outChannels: channels, weightLayout: "in-major",
