@@ -111,9 +111,12 @@ def cases(offline):
         ("protenix2 6mrr", {"family": "protenix2", "controls": controls(**{"model-family": "protenix2"}),
          "entities": [protein(S6)], "job": job([S6])}, (f"{FIX}/6mrr-crystal.pdb", "A"), 2.0, 68, None),
         # (past 80 tokens: protenix2's 256-channel pair track on its fused kernels, cuda/af3/src/fused256.cuh)
+        # (0.6, not af3's 0.5: since 9932629f protenix2 samples as protenix does - MC dropout at 0.4 on the recycled pair
+        # for 40% of seeds - and this seed draws it. Seeds 1-10 measured 2026-11-08: dropout seeds 1, 2, 3, 10 at 0.533 /
+        # 0.366 / 0.392 / 0.330, the rest 0.138-0.332, af3 0.137-0.251 beside it. A template that never arrived is ~17 A)
         ("protenix2 5caj, its crystal uploaded", {"family": "protenix2", "controls": controls(**{"model-family": "protenix2"}),
          "entities": [protein(s5, {"kind": "upload", "text": caj, "source": "A", "filename": "5caj.pdb"})],
-         "job": job([s5])}, (f"{FIX}/5caj-crystal.pdb", "A"), 0.5, None, None),
+         "job": job([s5])}, (f"{FIX}/5caj-crystal.pdb", "A"), 0.6, None, None),
         ("opendde 6mrr", {"family": "opendde", "controls": controls(**{"model-family": "opendde"}),
          "entities": [protein(S6)], "job": job([S6])}, (f"{FIX}/6mrr-crystal.pdb", "A"), 2.0, 68, None),
         ("af3 6mrr + GOL + SEP3", {"family": "af3", "controls": controls(),
