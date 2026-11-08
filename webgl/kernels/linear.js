@@ -342,6 +342,11 @@ export const CACHE_RESIDENT_WEIGHT_FLOATS = 65536;
 export const blockedApplies = (rows, inChannels, outChannels, weightLayout = "out-major",
   aspect = true) => {
   if (!(inChannels % 4 === 0 && outChannels % 4 === 0)) return false;
+  // 🔴 A NARROW OUTPUT NEVER BLOCKS: its fragments are already few and the block divides them by eight. With f16
+  // weights (what a fold holds - bench-webgl-linear.js --half-weights) 3481 x 128 -> 4 is 0.137 ms one-texel against
+  // 0.556 blocked, -> 16 0.156 against 0.550, in either layout; the aspect rule below called them "wide". An AF3 fold
+  // draws ~360 of them a pass of trunks - the per-head attention biases.
+  if (outChannels < 32) return false;
   // 🔴 BELOW 64 ROWS ONLY A WIDE [in][out] SHAPE BLOCKS. AF3's denoiser runs on its TOKENS - 59 rows at 59 residues -
   // so this used to send every one of its projections to the one-texel kernel, which reads the weight once per row.
   // `bench-webgl-linear.js --layout=in-major` on an M2: 59 x 768 -> 3072 is 2.34 ms one-texel, 1.23 ms at 64 rows
