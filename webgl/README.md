@@ -3401,3 +3401,5 @@ Kept: the diffusion's two wide blocked projections hand their ROW PLANES straigh
 (`linear(..., { keepPlanes: true })`, `planeFetchGlsl`) - the q/k/v/gate split and the SwiGLU fetch `plane[row % 4]`
 at `(row / 4) * OUT4 + group` themselves, and the `linear.repack:59x3072` draw (1,200 a fold) is gone. Bit-identical;
 diffusion 2890 -> 2837 ms, fold 4567 -> 4516. `--no-keep-planes` is the arm.
+The trunk's transition takes the same: its 3481 x 128 -> 1024 up projection keeps its planes for the SwiGLU. Bit-identical;
+trunk 1485 -> 1427 ms.
