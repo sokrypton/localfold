@@ -39,7 +39,7 @@ import { adaptiveLayerNorm, adaptiveZeroInit, elementwiseProductSource, sumSourc
   from "./atom-attention.js";
 import { attentionFlash } from "../../kernels/attention-flash.js";
 import { layerNorm } from "../../kernels/layer-norm.js";
-import { linear } from "../../kernels/linear.js";
+import { linear, planeFetchGlsl, planeInputs } from "../../kernels/linear.js";
 
 /** @typedef {import("../../runtime/storage.js").Tensor} Tensor */
 
@@ -57,6 +57,38 @@ void main() {
   vec4 gate = fetch4(wideTex, base + group);
   vec4 value = fetch4(wideTex, base + INTER4 + group);
   result = (gate / (vec4(1.0) + exp(-gate))) * value;
+}`);
+
+/** `swiGluSource` reading the up projection's kept row planes (`planeFetchGlsl`) rather than a repacked tensor. */
+const swiGluPlanesSourceUncached = (rows, intermediate, blockRows) => sized({ ELEMENTS: rows * intermediate }, `${PRELUDE}${ONE_TARGET}
+const int INTER4 = ${intermediate / 4};
+${planeFetchGlsl(blockRows, intermediate / 2)}
+void main() {
+  int texel = linearTexel();
+  if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
+  int group = texel % INTER4;
+  int row = texel / INTER4;
+  vec4 gate = planeFetch(row, group);
+  vec4 value = planeFetch(row, INTER4 + group);
+  result = (gate / (vec4(1.0) + exp(-gate))) * value;
+}`);
+
+/** `splitQkvgSource` reading the fused projection's kept row planes. */
+const splitQkvgPlanesSourceUncached = (rows, width, blockRows) => sized({ ROWS: rows }, `${PRELUDE}${targetDeclarations(4)}
+const int W4 = ${width / 4};
+${planeFetchGlsl(blockRows, width)}
+void main() {
+  int texel = linearTexel();
+  if (texel >= ROWS * W4) {
+    result0 = vec4(0.0); result1 = vec4(0.0); result2 = vec4(0.0); result3 = vec4(0.0);
+    return;
+  }
+  int row = texel / W4;
+  int group = texel % W4;
+  result0 = planeFetch(row, group);
+  result1 = planeFetch(row, group + W4);
+  result2 = planeFetch(row, group + 2 * W4);
+  result3 = vec4(1.0) / (vec4(1.0) + exp(-planeFetch(row, group + 3 * W4)));
 }`);
 
 /**
@@ -356,16 +388,19 @@ export function conditionedTransition(execution, call) {
       });
   const wide = linear(execution, {
     x: normalised, weight: w[`${prefix}ffwTransition1`], rows,
-    inChannels: channels, outChannels: intermediate * 2, weightLayout: "in-major",
+    inChannels: channels, outChannels: intermediate * 2, weightLayout: "in-major", keepPlanes: true,
   });
   let gated = execution.allocate(rows * intermediate, "af3.difftx.swiglu");
+  // ...reading the projection's row planes where it kept them, with no repack draw between
+  const kept = /** @type {any} */ (wide).planes !== undefined ? /** @type {any} */ (wide) : null;
   execution.dispatch({
-    source: swiGluSource(rows, intermediate),
+    source: kept === null ? swiGluSource(rows, intermediate) : swiGluPlanesSource(rows, intermediate, kept.blockRows),
     output: gated,
-    inputs: { wideTex: wide },
-    label: `af3.difftx.swiglu:${rows}x${intermediate}`,
+    inputs: kept === null ? { wideTex: wide } : planeInputs(kept),
+    label: `af3.difftx.swiglu:${rows}x${intermediate}${kept === null ? "" : ":planes"}`,
   });
-  execution.release(wide);
+  if (kept === null) execution.release(wide);
+  else for (const plane of kept.planes) execution.release(plane);
   if (cond !== undefined && w[`${prefix}ffwAToB`] !== undefined
       && w[`${prefix}ffwAToB`] !== null) {
     const upGate = linear(execution, {
@@ -444,16 +479,19 @@ export function conditionedSelfAttention(execution, call) {
     // ...one wide projection and one split, where four square ones did not block (`fuseQkvgWeights`)
     const fused = linear(execution, {
       x, weight: w.qkvgProjection, bias: w.qkvgBias, rows: tokens, inChannels: channels, outChannels: 4 * width,
-      weightLayout: "in-major",
+      weightLayout: "in-major", keepPlanes: true,
     });
     [query, key, value, gate] = ["q", "k", "v", "g"].map((part) => execution.allocate(tokens * width, `af3.difftx.${part}`));
+    // ...reading the projection's row planes where it kept them, with no repack draw between
+    const kept = /** @type {any} */ (fused).planes !== undefined ? /** @type {any} */ (fused) : null;
     execution.dispatch({
-      source: splitQkvgSource(tokens, width),
+      source: kept === null ? splitQkvgSource(tokens, width) : splitQkvgPlanesSource(tokens, width, kept.blockRows),
       outputs: [query, key, value, gate],
-      inputs: { fusedTex: fused },
-      label: `af3.difftx.split-qkvg:${tokens}x${width}`,
+      inputs: kept === null ? { fusedTex: fused } : planeInputs(kept),
+      label: `af3.difftx.split-qkvg:${tokens}x${width}${kept === null ? "" : ":planes"}`,
     });
-    execution.release(fused);
+    if (kept === null) execution.release(fused);
+    else for (const plane of kept.planes) execution.release(plane);
   } else {
     query = project(w.qProjection, w.qBias);
     key = project(w.kProjection);
@@ -618,4 +656,6 @@ export const swiGluSource = memoSource(swiGluSourceUncached);
 export const blendSliceSource = memoSource(blendSliceSourceUncached);
 export const gateSliceSource = memoSource(gateSliceSourceUncached);
 export const splitQkvgSource = memoSource(splitQkvgSourceUncached);
+export const splitQkvgPlanesSource = memoSource(splitQkvgPlanesSourceUncached);
+export const swiGluPlanesSource = memoSource(swiGluPlanesSourceUncached);
 export const superBlockLogitsSource = memoSource(superBlockLogitsSourceUncached);

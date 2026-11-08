@@ -618,6 +618,23 @@ ${Array.from({ length: blockRows - 1 }, (_, i) =>
 }`;
 
 /**
+ * GLSL for a consumer of `linear(..., { keepPlanes: true })`: samplers `plane0..` and `vec4 planeFetch(row, group)`,
+ * the texel the repack would have put at `row * OUT4 + group`. `out4` is the projection's output width in texels.
+ */
+export const planeFetchGlsl = (blockRows, out4) => `${Array.from({ length: blockRows },
+  (_, i) => `uniform sampler2D plane${i};`).join("\n")}
+vec4 planeFetch(int row, int group) {
+  int source = (row / ${blockRows}) * ${out4} + group;
+  int plane = row - (row / ${blockRows}) * ${blockRows};
+${Array.from({ length: blockRows - 1 }, (_, i) => `  if (plane == ${i}) return fetch4(plane${i}, source);`).join("\n")}
+  return fetch4(plane${blockRows - 1}, source);
+}
+`;
+
+/** The `inputs` a `planeFetchGlsl` consumer binds. */
+export const planeInputs = (kept) => Object.fromEntries(kept.planes.map((plane, i) => [`plane${i}`, plane]));
+
+/**
  * An int5 weight as an ordinary float16 tensor, decoded once and memoised on
  * the weight object so a stacked layer pays for it only on its first block.
  *
@@ -656,7 +673,7 @@ function decodedInt5(execution, weight, shape) {
 export function linear(execution, call, into) {
   const {
     x, weight, bias, rows, inChannels, outChannels,
-    activation = "none", weightLayout = "out-major", roundHalf = false,
+    activation = "none", weightLayout = "out-major", roundHalf = false, keepPlanes = false,
   } = call;
   if (!(activation in ACTIVATIONS)) {
     throw new RangeError(`linear: no activation \`${activation}\``);
@@ -823,6 +840,13 @@ export function linear(execution, call, into) {
         + `:${activation}:${weightLayout}${roundHalf ? ":half" : ""}`
         + `${tileWidth > 0 ? `:tiled${tileWidth}` : ""}`,
     });
+    // `keepPlanes`: hand the row planes to a consumer that reads them itself (`planeFetchGlsl`) rather than repacking
+    // them into one tensor - only in the plain plane order, the one `planeFetchGlsl` addresses
+    if (keepPlanes && tileWidth === 0 && !rowFastest && !execution.noKeepPlanes) {
+      if (padded !== null) execution.release(padded.tensor);
+      if (into === undefined) execution.release(output);
+      return /** @type {any} */ ({ planes, blockRows, rows, outChannels });
+    }
     execution.dispatch({
       source: blockRepackSource(blockRows, rowFastest, tileWidth),
       output,
