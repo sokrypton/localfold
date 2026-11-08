@@ -20,6 +20,8 @@ them, because index.html says ./web/app.js and app.js says ../webgpu/af2/model/.
 flattening any of that would mean rewriting import paths, and rewriting import
 paths is the build step this repository just got rid of.
 """
+from __future__ import annotations
+
 import argparse
 import hashlib
 import json

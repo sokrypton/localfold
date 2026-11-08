@@ -11,7 +11,7 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-543 tools. `tools/fixtures/` is data and is not listed.
+544 tools. `tools/fixtures/` is data and is not listed.
 
 ## `tools/gpu/` - the WebGPU lane (296)
 
@@ -416,7 +416,7 @@ and turning it into a bundle.
 - **`safetensors_read.py`** - Read a .safetensors file into numpy arrays, without the safetensors package.
 - **`vector-quantise.py`** - Is a codebook worth a new decoder? Scalar codes against vector ones, at 2 bits.
 
-## `tools/` - everything else (158)
+## `tools/` - everything else (159)
 
 CPU checkers, the export and quantisation pipeline, the page drivers that
 go through CDP, and the deploy.
@@ -471,6 +471,7 @@ go through CDP, and the deploy.
 - **`check-native-worker.py`** - The native backend's worker (CUDA, or Metal on a Mac), folding for real: npm run test:native.
 - **`check-oracle-bonds.js`** - Does the REFERENCE put side chains where we do? AlphaFold 3's own output, scored by the same function.
 - **`check-portable-limits.mjs`** - Does every model fold on a device at the PORTABLE limit ceiling?
+- **`check-python-portability.py`** - Does every python tool here run on the OLDEST python3 a developer has?
 - **`check-rfd4p-automorphisms.py`** - Hold shared/rfd4p/symmetry.js's automorphisms to atomworks' own, over the component dictionary.
 - **`check-rfd4p-batch.py`** - Hold the page's RFD4 batch to upstream's own pipeline on the jobs that set every condition Studio edits.
 - **`check-rfd4p-invariants.py`** - Hold the RFD4 featurisers' refusals to upstream's: which jobs a batch is refused for, and why.

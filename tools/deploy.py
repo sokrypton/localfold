@@ -30,6 +30,8 @@ commit it built, and this polls the live copy until that commit is the one being
 served. "Live" is then a fact with a timestamp on it, not an impression - which
 is the part worth keeping however GitHub is feeling about triggers.
 """
+from __future__ import annotations
+
 import argparse
 import json
 import shutil
