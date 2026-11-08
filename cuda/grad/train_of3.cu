@@ -744,6 +744,7 @@ int main(int argc, char** argv) {
     else if (!strcmp(argv[i], "--mem")) MEM_REPORT = true;
     else if (!strcmp(argv[i], "--profile")) profileStep = true;   // the last step's kernels by GPU time (CUPTI, cuda/af3's profile.cuh)
     else if (!strcmp(argv[i], "--tc-fwd")) grad::flash::TC2 = true;   // gridFwdTc2 (tcgen05) for the grid forward from 768 tokens (off: slower in a step)
+    else if (!strcmp(argv[i], "--no-tc-bwd")) grad::flash::TCB = false;   // bwdBf where bwdTc (the grid backward on tcgen05) would run
     else if (!strcmp(argv[i], "--offload-pairs")) offloadPairs = true;
     else if (auto v = opt("--transition-chunk=")) transitionChunkM = atof(v);
     else if (auto v = opt("--world=")) world = atoi(v);

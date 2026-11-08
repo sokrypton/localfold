@@ -1697,6 +1697,15 @@ inline void backwardBf(const Sdpa& a, const X* q, int ldq, const X* k, int ldk, 
     GK(cudaMemsetAsync(cnt, 0, nc * 4, STREAM));
   }
   uint16_t* dqoK = inK ? reinterpret_cast<uint16_t*>(dqo) : nullptr;
+#if defined(LF_TC5A)
+  // (the short form on tcgen05 where it applies: flash_tc5.cuh's bwdTc)
+  if constexpr (D == 32 && std::is_same<X, __nv_bfloat16>::value && std::is_same<DOT, __nv_bfloat16>::value) {
+    if (!gen && bwdTcRun<DKV>(a, bt, q, ldq, k, ldk, v, ldv, dO, lddo, lse, Di, dq, lddq, dk, lddk, dv, lddv, accK, accV, dqoK, ldqo, cnt)) {
+      if (dqo && !inK) narrowDqK<<<blocks((size_t)a.B * a.Q * a.H * D), 256, 0, STREAM>>>(dq, lddq, dqo, ldqo, a.H * D, (size_t)a.B * a.Q);
+      return;
+    }
+  }
+#endif
   // the bias gradients summed over CR rows on the chip first (a cluster of CR rows' CTAs): at the triangle's shape,
   // every [q][k] element took one atomic a row - 537 M a call at 512 tokens, the kernel L2-bound at 80% of it
   bool rowShared = a.bias[0].grad || a.bias[1].grad;
