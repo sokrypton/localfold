@@ -883,7 +883,7 @@ __global__ void __launch_bounds__(32 * th::WARPS, 1) flashTcH(const __grid_const
 // whether this binary carries sm_100a code for the device it runs on (asked once, of the device)
 __global__ void probeK(int* o) { *o = LF_TC5A; }
 inline bool ready() {
-  static int on = -1;
+  static LF_TLS int on = -1;
   if (on < 0) {
     int dev = 0, major = 0, minor = 0;
     CK(cudaGetDevice(&dev));
@@ -902,7 +902,7 @@ using EncodeFn = CUresult (*)(CUtensorMap*, CUtensorMapDataType, cuuint32_t, voi
                               const cuuint32_t*, const cuuint32_t*, CUtensorMapInterleave, CUtensorMapSwizzle,
                               CUtensorMapL2promotion, CUtensorMapFloatOOBfill);
 inline EncodeFn encoder() {
-  static EncodeFn fn = nullptr;
+  static LF_TLS EncodeFn fn = nullptr;
   if (!fn) {
     cudaDriverEntryPointQueryResult q;
     void* p = nullptr;

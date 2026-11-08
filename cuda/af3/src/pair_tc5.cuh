@@ -20,7 +20,10 @@ constexpr int C = 128, NQ = 512, TM = 128;
 
 // the K-major weight copies (Wq is C x NQ row-major), made once a weight
 inline const half* kMajor(const half* w, int K, int N) {
-  static std::map<const half*, half*> made;
+  // (a derived weight: forgotten with the others - cuda/ef2 warms up on weights still arriving, test/cuda-derived-caches)
+  static LF_TLS std::map<const half*, half*> made;
+  static LF_TLS bool hooked = false;
+  if (!hooked) { FORGET_HOOKS.push_back([] { for (auto& [k, p] : made) CK(cudaFreeAsync(p, STREAM)); made.clear(); }); hooked = true; }
   auto it = made.find(w);
   if (it != made.end()) return it->second;
   std::vector<half> h((size_t)K * N), t((size_t)K * N);
@@ -558,7 +561,9 @@ struct Lay { static constexpr uint32_t A = 0, W = 65536, WSTAGE = 49152, H = W +
 // W1 as GEMM1's B a chunk at a time: chunk p [128 rows: a's columns 64p.., then b's I + 64p..][K 128]; W2 as GEMM2's B:
 // chunk p [128 output columns][the chunk's 64 hidden] - both K-major, made once a weight
 inline const half* w1Chunks(const half* W1) {
-  static std::map<const half*, half*> made;
+  static LF_TLS std::map<const half*, half*> made;
+  static LF_TLS bool hooked = false;
+  if (!hooked) { FORGET_HOOKS.push_back([] { for (auto& [k, p] : made) CK(cudaFreeAsync(p, STREAM)); made.clear(); }); hooked = true; }
   auto it = made.find(W1); if (it != made.end()) return it->second;
   std::vector<half> h((size_t)C * 2 * I), t((size_t)NCH * 128 * C);
   CK(cudaMemcpy(h.data(), W1, h.size() * 2, cudaMemcpyDeviceToHost));
@@ -568,7 +573,9 @@ inline const half* w1Chunks(const half* W1) {
   return made[W1] = d;
 }
 inline const half* w2Chunks(const half* W2) {
-  static std::map<const half*, half*> made;
+  static LF_TLS std::map<const half*, half*> made;
+  static LF_TLS bool hooked = false;
+  if (!hooked) { FORGET_HOOKS.push_back([] { for (auto& [k, p] : made) CK(cudaFreeAsync(p, STREAM)); made.clear(); }); hooked = true; }
   auto it = made.find(W2); if (it != made.end()) return it->second;
   std::vector<half> h((size_t)I * C), t((size_t)NCH * C * HC);
   CK(cudaMemcpy(h.data(), W2, h.size() * 2, cudaMemcpyDeviceToHost));
