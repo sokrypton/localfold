@@ -98,29 +98,59 @@ async function waitWithAbort(milliseconds, signal) {
 }
 
 function parseTicket(value) {
-  const status = typeof value.status === "string" ? value.status.toUpperCase() : "ERROR";
-  return { status, ...(typeof value.id === "string" && value.id !== "" ? { id: value.id } : {}) };
+  const status = typeof value?.status === "string" ? value.status.toUpperCase() : "ERROR";
+  return { status, ...(typeof value?.id === "string" && value.id !== "" ? { id: value.id } : {}) };
 }
 
-async function request(fetchImplementation, url, init, label) {
+const REQUEST_ATTEMPTS = 5;
+
+/**
+ * The server did not give what a fold asked of it - named, so a reader is told which host failed rather than
+ * "Failed to fetch" (PR #7, lhallee).
+ */
+export class AlignmentServerError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "AlignmentServerError";
+  }
+}
+
+async function request(fetchImplementation, url, init, label, wait = waitWithAbort) {
   let lastError;
-  for (let attempt = 0; attempt < 5; attempt += 1) {
+  for (let attempt = 0; attempt < REQUEST_ATTEMPTS; attempt += 1) {
     try {
       const response = await fetchImplementation(url, init);
       if (response.ok) return response;
-      if (![429, 500, 502, 503, 504].includes(response.status)) {
-        lastError = new Error(`${label} failed: HTTP ${response.status}`);
-        break;
-      }
-      lastError = new Error(`${label} failed: HTTP ${response.status}`);
+      lastError = new AlignmentServerError(`${label} failed: HTTP ${response.status}`);
+      if (![429, 500, 502, 503, 504].includes(response.status)) break;
     } catch (error) {
       if (init.signal?.aborted === true) throw abortError();
-      lastError = error;
+      // A failed fetch says "Failed to fetch", which names neither who was asked nor what to do about it.
+      console.warn(label, error);
+      lastError = new AlignmentServerError(`${label} failed: could not reach ${new URL(url).host}. Check the connection.`);
     }
-    await waitWithAbort(500 * 2 ** attempt, init.signal ?? undefined);
+    // (nothing follows the last attempt to wait for)
+    if (attempt + 1 < REQUEST_ATTEMPTS) await wait(500 * 2 ** attempt, init.signal ?? undefined);
   }
-  throw lastError instanceof Error ? lastError : new Error(`${label} failed`);
+  throw lastError;
 }
+
+/**
+ * What came back, read. A captive portal or an outage page answers with a 200 and its own HTML, and what a reader can
+ * act on is that, not where the JSON parser tripped on the first "<".
+ */
+async function answerOf(response, read, label) {
+  try {
+    return await read(response);
+  } catch (error) {
+    if (error?.name === "AbortError") throw error;
+    console.warn(label, error);
+    throw new AlignmentServerError(`${label} failed: its answer could not be read. The connection may have dropped,`
+      + " or a sign-in page on this network or an outage page may have answered in its place.");
+  }
+}
+
+const readJson = (response) => response.json();
 
 function tarString(bytes, start, length) {
   const end = bytes.indexOf(0, start);
@@ -130,7 +160,7 @@ function tarString(bytes, start, length) {
 function tarOctal(bytes, start, length) {
   const value = tarString(bytes, start, length).trim().replace(/\0/g, "");
   const parsed = Number.parseInt(value || "0", 8);
-  if (!Number.isSafeInteger(parsed) || parsed < 0) throw new Error("MMseqs2 result contains an invalid tar entry size");
+  if (!Number.isSafeInteger(parsed) || parsed < 0) throw new AlignmentServerError("MMseqs2 result contains an invalid tar entry size");
   return parsed;
 }
 
@@ -145,7 +175,7 @@ export function readTarFiles(bytes) {
     const path = prefix === "" ? name : `${prefix}/${name}`;
     const size = tarOctal(header, 124, 12);
     const dataStart = offset + 512; const dataEnd = dataStart + size;
-    if (path === "" || dataEnd > bytes.byteLength) throw new Error("MMseqs2 result contains a truncated tar entry");
+    if (path === "" || dataEnd > bytes.byteLength) throw new AlignmentServerError("MMseqs2 result contains a truncated tar entry");
     const type = header[156];
     if (type === 0 || type === 48) files.set(path.replace(/^\.\//, ""), bytes.slice(dataStart, dataEnd));
     offset = dataStart + Math.ceil(size / 512) * 512;
@@ -158,7 +188,7 @@ function queryBlock(contents, queryId) {
     const trimmed = block.trim();
     if (new RegExp(`^>${queryId}(?:\\s|$)`).test(trimmed)) return trimmed;
   }
-  throw new Error(`MMseqs2 result does not contain query ${queryId}`);
+  throw new AlignmentServerError(`MMseqs2 result does not contain query ${queryId}`);
 }
 
 /**
@@ -177,7 +207,7 @@ function queryBlock(contents, queryId) {
 export function extractMmseqs2PairedA3ms(tarBytes, queryCount) {
   const files = readTarFiles(tarBytes);
   const pair = [...files].find(([path]) => path === "pair.a3m" || path.endsWith("/pair.a3m"))?.[1];
-  if (pair === undefined) throw new Error("MMseqs2 pairing result is missing pair.a3m");
+  if (pair === undefined) throw new AlignmentServerError("MMseqs2 pairing result is missing pair.a3m");
   const contents = new TextDecoder().decode(pair);
   return Array.from({ length: queryCount }, (_, index) => `${queryBlock(contents, QUERY_ID + index)}\n`);
 }
@@ -274,7 +304,8 @@ export async function fetchMmseqs2Templates(targets, options = {}) {
     new URL(`template/${wanted.join(",")}`, apiUrl),
     options.signal === undefined ? {} : { signal: options.signal },
     "MMseqs2 template download");
-  const files = readTarFiles(new Uint8Array(await decompress(await response.arrayBuffer())));
+  const archive = await answerOf(response, async (body) => decompress(await body.arrayBuffer()), "MMseqs2 template download");
+  const files = readTarFiles(new Uint8Array(archive));
   const structures = new Map();
   for (const [path, bytes] of files) {
     const name = path.split("/").pop() ?? path;
@@ -289,11 +320,11 @@ export function extractMmseqs2A3m(tarBytes, useEnvironmental = true) {
   const find = (suffix) =>
     [...files].find(([path]) => path === suffix || path.endsWith(`/${suffix}`))?.[1];
   const uniref = find("uniref.a3m");
-  if (uniref === undefined) throw new Error("MMseqs2 result is missing uniref.a3m");
+  if (uniref === undefined) throw new AlignmentServerError("MMseqs2 result is missing uniref.a3m");
   const blocks = [queryBlock(new TextDecoder().decode(uniref), QUERY_ID)];
   if (useEnvironmental) {
     const environmental = find("bfd.mgnify30.metaeuk30.smag30.a3m");
-    if (environmental === undefined) throw new Error("MMseqs2 result is missing the environmental A3M");
+    if (environmental === undefined) throw new AlignmentServerError("MMseqs2 result is missing the environmental A3M");
     blocks.push(queryBlock(new TextDecoder().decode(environmental), QUERY_ID));
   }
   return `${blocks.join("\n")}\n`;
@@ -352,29 +383,29 @@ async function runMmseqs2Job(sequences, endpoint, mode, options = {}) {
     const response = await request(fetchImplementation, new URL(`ticket/${endpoint}`, apiUrl), {
       method: "POST", body, ...(signal === undefined ? {} : { signal }),
       headers: { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8" },
-    }, "MMseqs2 submission");
-    const submitted = parseTicket(await response.json()); status = submitted.status; ticket = submitted.id;
+    }, "MMseqs2 submission", wait);
+    const submitted = parseTicket(await answerOf(response, readJson, "MMseqs2 submission")); status = submitted.status; ticket = submitted.id;
     if (TRANSIENT_SUBMISSION.has(status)) {
       ticket = undefined; report("retrying", status);
       await wait(5_000 + Math.floor(Math.random() * 5_000), signal); continue;
     }
-    if (status === "ERROR") throw new Error("MMseqs2 rejected the sequence or is temporarily unavailable");
-    if (status === "MAINTENANCE") throw new Error("The MMseqs2 API is undergoing maintenance; try again later");
-    if (ticket === undefined) throw new Error(`MMseqs2 returned ${status} without a ticket`);
+    if (status === "ERROR") throw new AlignmentServerError("MMseqs2 rejected the sequence or is temporarily unavailable");
+    if (status === "MAINTENANCE") throw new AlignmentServerError("The MMseqs2 API is undergoing maintenance; try again later");
+    if (ticket === undefined) throw new AlignmentServerError(`MMseqs2 returned ${status} without a ticket`);
   }
   while (TRANSIENT_JOB.has(status)) {
     report(status === "RUNNING" ? "running" : "queued", status, ticket);
     await wait(5_000 + Math.floor(Math.random() * 5_000), signal);
     const response = await request(fetchImplementation, new URL(`ticket/${encodeURIComponent(ticket)}`, apiUrl),
-      signal === undefined ? {} : { signal }, "MMseqs2 status");
-    status = parseTicket(await response.json()).status;
+      signal === undefined ? {} : { signal }, "MMseqs2 status", wait);
+    status = parseTicket(await answerOf(response, readJson, "MMseqs2 status")).status;
   }
-  if (status !== "COMPLETE") throw new Error(`MMseqs2 search ended with status ${status}`);
+  if (status !== "COMPLETE") throw new AlignmentServerError(`MMseqs2 search ended with status ${status}`);
   report("downloading", status, ticket);
   const response = await request(fetchImplementation,
     new URL(`result/download/${encodeURIComponent(ticket)}`, apiUrl),
-    signal === undefined ? {} : { signal }, "MMseqs2 result download");
-  const archive = await decompress(await response.arrayBuffer());
+    signal === undefined ? {} : { signal }, "MMseqs2 result download", wait);
+  const archive = await answerOf(response, async (body) => decompress(await body.arrayBuffer()), "MMseqs2 result download");
   report("complete", status, ticket);
   return { archive, ticket, elapsedMilliseconds: performance.now() - start };
 }
@@ -397,14 +428,14 @@ export async function generateMmseqs2PairedMsa(uniqueSequences, options = {}) {
   const alignments = a3ms.map((text) => parseA3m(text));
   alignments.forEach((alignment, index) => {
     if (alignment.query !== sequences[index]) {
-      throw new Error("MMseqs2 returned a paired A3M for a different query sequence");
+      throw new AlignmentServerError("MMseqs2 returned a paired A3M for a different query sequence");
     }
   });
   // 🔴 EQUAL DEPTH IS WHAT MAKES THEM PAIRED. Row r must exist in every entity
   // for "row r is one species" to mean anything; a ragged set would still merge
   // into a valid alignment and would silently pair different organisms.
   if (!alignments.every((alignment) => alignment.depth === alignments[0].depth)) {
-    throw new Error("MMseqs2 paired A3Ms do not have aligned row counts");
+    throw new AlignmentServerError("MMseqs2 paired A3Ms do not have aligned row counts");
   }
   return { a3ms, ticket: job.ticket, depth: alignments[0].depth,
            templateHits: extractMmseqs2TemplateHits(job.archive) };
@@ -432,33 +463,33 @@ export async function generateMmseqs2Msa(sequenceValue,
     const response = await request(fetchImplementation, new URL("ticket/msa", apiUrl), {
       method: "POST", body, ...(signal === undefined ? {} : { signal }),
       headers: { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8" },
-    }, "MMseqs2 submission");
-    const submitted = parseTicket(await response.json()); status = submitted.status; ticket = submitted.id;
+    }, "MMseqs2 submission", wait);
+    const submitted = parseTicket(await answerOf(response, readJson, "MMseqs2 submission")); status = submitted.status; ticket = submitted.id;
     if (TRANSIENT_SUBMISSION.has(status)) {
       ticket = undefined; report("retrying", status); await wait(5_000 + Math.floor(Math.random() * 5_000), signal); continue;
     }
-    if (status === "ERROR") throw new Error("MMseqs2 rejected the sequence or is temporarily unavailable");
-    if (status === "MAINTENANCE") throw new Error("The MMseqs2 API is undergoing maintenance; try again later");
-    if (ticket === undefined) throw new Error(`MMseqs2 returned ${status} without a ticket`);
+    if (status === "ERROR") throw new AlignmentServerError("MMseqs2 rejected the sequence or is temporarily unavailable");
+    if (status === "MAINTENANCE") throw new AlignmentServerError("The MMseqs2 API is undergoing maintenance; try again later");
+    if (ticket === undefined) throw new AlignmentServerError(`MMseqs2 returned ${status} without a ticket`);
   }
   while (TRANSIENT_JOB.has(status)) {
     report(status === "RUNNING" ? "running" : "queued", status, ticket);
     await wait(5_000 + Math.floor(Math.random() * 5_000), signal);
     const response = await request(fetchImplementation, new URL(`ticket/${encodeURIComponent(ticket)}`, apiUrl),
-      signal === undefined ? {} : { signal }, "MMseqs2 status");
-    status = parseTicket(await response.json()).status;
+      signal === undefined ? {} : { signal }, "MMseqs2 status", wait);
+    status = parseTicket(await answerOf(response, readJson, "MMseqs2 status")).status;
   }
-  if (status !== "COMPLETE") throw new Error(`MMseqs2 search ended with status ${status}`);
+  if (status !== "COMPLETE") throw new AlignmentServerError(`MMseqs2 search ended with status ${status}`);
   report("downloading", status, ticket);
   const response = await request(fetchImplementation,
     new URL(`result/download/${encodeURIComponent(ticket)}`, apiUrl),
-    signal === undefined ? {} : { signal }, "MMseqs2 result download");
+    signal === undefined ? {} : { signal }, "MMseqs2 result download", wait);
   // ...the archive is kept, not consumed inline: the template hits come out of
   // the same tar and a second decompression would be a second copy of it.
-  const archive = await decompress(await response.arrayBuffer());
+  const archive = await answerOf(response, async (body) => decompress(await body.arrayBuffer()), "MMseqs2 result download");
   const a3m = extractMmseqs2A3m(archive, useEnvironmental);
   const alignment = parseA3m(a3m);
-  if (alignment.query !== sequence) throw new Error("MMseqs2 returned an A3M for a different query sequence");
+  if (alignment.query !== sequence) throw new AlignmentServerError("MMseqs2 returned an A3M for a different query sequence");
   const elapsedMilliseconds = performance.now() - start;
   report("complete", status, ticket);
   // 🔴 THE TEMPLATE HITS COME OUT OF THE SAME TAR, so a page that wants them
