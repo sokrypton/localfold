@@ -3383,3 +3383,6 @@ And the column direction no longer transposes the normalised pair before project
 fused path projects the untransposed activation and `splitGridQkvgSource` gathers the rows in transposed order -
 the same arithmetic, one `transposeLeading` draw over the whole pair fewer. Bit-identical fold (pLDDT 94.019, the same
 worst and relRms); trunk 1513 -> 1508 ms, inside the noise.
+The transpose BACK goes too: with `residualOf`, the column attention returns `pair + update[j][i]` from one draw
+(`transposedAddSource`) where it was a `transposeLeading` and the caller's add. Bit-identical; trunk median 1506 ->
+1495 ms against the previous commit, interleaved.

@@ -174,11 +174,15 @@ export function pairHalf(execution, call, ownsPair = false) {
     }));
   }
   for (const [group, transpose] of [[w.pairAttention1, false], [w.pairAttention2, true]]) {
-    pair = residual(pair, gridSelfAttention(execution, {
+    // ...the residual inside, where the column direction's transpose back folds into the add
+    const next = gridSelfAttention(execution, {
       pair, mask: pairMask, weights: group,
       length: tokens, channels,
-      transpose: /** @type {any} */ (transpose), swapTransposedBias, epsilon,
-    }));
+      transpose: /** @type {any} */ (transpose), swapTransposedBias, epsilon, residualOf: pair,
+    });
+    if (own) execution.release(pair);
+    own = true;
+    pair = next;
   }
   pair = residual(pair, transition(execution, {
     x: pair, weights: w.pairTransition, rows: tokens * tokens, channels, epsilon,
