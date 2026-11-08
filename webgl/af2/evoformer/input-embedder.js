@@ -43,7 +43,7 @@
  * so every separation past 32 shares one bin - which is what lets a chain break
  * be expressed as a large index jump.
  */
-import { ONE_TARGET, PRELUDE } from "../../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, memoSource } from "../../runtime/execution.js";
 import { layerNorm } from "../../kernels/layer-norm.js";
 
 /** @typedef {import("../../runtime/storage.js").Tensor} Tensor */
@@ -115,7 +115,7 @@ export const MULTIMER_RELATIVE_ROWS =
 export const MIN_BIN = 3.25;
 export const MAX_BIN = 20.75;
 
-export const msaEmbedSource = (shape) => {
+const msaEmbedSourceUncached = (shape) => {
   const { length, sequences, targetChannels, msaFeatureChannels, msaChannels } = shape;
   return `${PRELUDE}${ONE_TARGET}
 const int L = ${length};
@@ -155,7 +155,7 @@ void main() {
 }`;
 };
 
-export const extraMsaEmbedSource = (shape) => {
+const extraMsaEmbedSourceUncached = (shape) => {
   const { length, sequences, extraChannels } = shape;
   return `${PRELUDE}${ONE_TARGET}
 const int L = ${length};
@@ -225,7 +225,7 @@ const relativeBlockFor = (chains) => (chains
   int relative = clamp(rawOffset, 0, 2 * MAX_RELATIVE);
   total += fetch4(relativeBiasTex, group) + fetch4(relativeWeightTex, relative * PAIR_C4 + group);`);
 
-export const pairEmbedSource = (shape) => {
+const pairEmbedSourceUncached = (shape) => {
   const { length, targetChannels, pairChannels, chains = false } = shape;
   const relativeBlock = relativeBlockFor(chains);
   return `${PRELUDE}${ONE_TARGET}
@@ -408,3 +408,8 @@ export function inputEmbedder(execution, call) {
   execution.release(normalisedPair);
   return { msa, extraMsa, pairWithoutTemplates: pair };
 }
+
+// Every builder above, memoised on its arguments (`memoSource` in webgl/runtime/execution.js).
+export const msaEmbedSource = memoSource(msaEmbedSourceUncached);
+export const extraMsaEmbedSource = memoSource(extraMsaEmbedSourceUncached);
+export const pairEmbedSource = memoSource(pairEmbedSourceUncached);

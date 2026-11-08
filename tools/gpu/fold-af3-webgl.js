@@ -199,6 +199,10 @@ export async function main(device, args) {
   await execution.prepare((await prepareFoldPrograms(execution, call)).flat());
   const prepareMs = Math.round(performance.now() - prepareStart);
   const stages = [];
+  // `--js-profile`: the host's own JavaScript over the fold, by self time (the JS Self-Profiling API; gpu-chrome.mjs
+  // serves the page with the Document-Policy it needs)
+  const jsProfiler = flag(args, "js-profile") && typeof globalThis.Profiler === "function"
+    ? new globalThis.Profiler({ sampleInterval: 1, maxBufferSize: 1_000_000 }) : null;
   const foldStart = performance.now();
   const result = foldAf3(execution, {
     ...call,
@@ -207,6 +211,32 @@ export async function main(device, args) {
     }),
   });
   const foldMs = Math.round(performance.now() - foldStart);
+  let jsProfile = null;
+  if (jsProfiler !== null) {
+    const trace = await jsProfiler.stop();
+    const self = new Map();
+    const total = new Map();
+    const name = (frameId) => {
+      const frame = trace.frames[frameId];
+      const resource = frame.resourceId === undefined ? "" : trace.resources[frame.resourceId].split("/").slice(-2).join("/");
+      return `${frame.name || "(anonymous)"} ${resource}:${frame.line ?? ""}`;
+    };
+    for (const sample of trace.samples) {
+      if (sample.stackId === undefined) { self.set("(idle / native)", (self.get("(idle / native)") ?? 0) + 1); continue; }
+      let stack = trace.stacks[sample.stackId];
+      self.set(name(stack.frameId), (self.get(name(stack.frameId)) ?? 0) + 1);
+      const seen = new Set();
+      for (; stack !== undefined; stack = stack.parentId === undefined ? undefined : trace.stacks[stack.parentId]) {
+        const key = name(stack.frameId);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        total.set(key, (total.get(key) ?? 0) + 1);
+      }
+    }
+    const top = (map) => [...map.entries()].sort((a, b) => b[1] - a[1]).slice(0, 25)
+      .map(([key, count]) => [key, count]);
+    jsProfile = { samples: trace.samples.length, self: top(self), total: top(total) };
+  }
   const peak = execution.stats();
   // 🔴 AFTER THE WEIGHTS GO BACK, or `live` is 1221 textures of checkpoint and
   // says nothing about whether the FOLD leaked one.
@@ -422,6 +452,7 @@ export async function main(device, args) {
     },
     againstWgsl: coordinates,
     weightMegabytes,
+    ...(jsProfile === null ? {} : { jsProfile }),
     // `--profile`'s table: READ ITS RANKING, NOT ITS TOTAL - each kernel is timed by waiting for it
     ...(execution.profile === null ? {} : { profile: execution.profileTable(Number(option(args, "profile-top", "30"))) }),
     caSpacing: spacings.length === 0 ? null : {

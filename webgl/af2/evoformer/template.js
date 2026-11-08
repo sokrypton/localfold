@@ -38,7 +38,7 @@
  * projection with its bias. `query_w` and `key_w` are in the checkpoint and are
  * genuinely unread; `webgpu/af2/evoformer/template.js` reads neither either.
  */
-import { ONE_TARGET, PRELUDE } from "../../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, memoSource } from "../../runtime/execution.js";
 import { layerNorm } from "../../kernels/layer-norm.js";
 import { linear } from "../../kernels/linear.js";
 import { templatePairBlock } from "./block.js";
@@ -68,7 +68,7 @@ export const TEMPLATE_WEIGHTS = [
  * buffer mean "no template here" rather than "bin 0", which is the
  * shortest-distance bin and the strongest signal there is.
  */
-export const templateEmbedSource = (shape) => {
+const templateEmbedSourceUncached = (shape) => {
   const { length, templateChannels, unitVectors } = shape;
   const unit = unitVectors
     ? `    inner += fetch1(geometryTex, g + 2) * fetch4(weightTex, 84 * CT4 + group);
@@ -263,3 +263,6 @@ export function templateEmbedding(execution, call) {
   update.label = "template.update";
   return update;
 }
+
+// Every builder above, memoised on its arguments (`memoSource` in webgl/runtime/execution.js).
+export const templateEmbedSource = memoSource(templateEmbedSourceUncached);

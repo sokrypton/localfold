@@ -44,7 +44,7 @@
  * ~1e-3 - which is three orders above any bar here, so the series is transcribed
  * rather than approximated.
  */
-import { ONE_TARGET, PRELUDE } from "../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, memoSource } from "../runtime/execution.js";
 import { layerNorm } from "../kernels/layer-norm.js";
 import { linear } from "../kernels/linear.js";
 
@@ -79,7 +79,7 @@ export function residualScaleFor(dims) {
 }
 
 /** `out[row][c] = table[ids[row]][c]`. */
-export const embedSource = (rows, model) => `${PRELUDE}${ONE_TARGET}
+const embedSourceUncached = (rows, model) => `${PRELUDE}${ONE_TARGET}
 const int C4 = ${model / 4};
 const int ELEMENTS = ${rows * model};
 uniform sampler2D tableTex;
@@ -95,7 +95,7 @@ void main() {
 }`;
 
 /** One of the three `[q | k | v]` segments of a `3 * model` projection. */
-export const qkvSliceSource = (rows, model, which) => `${PRELUDE}${ONE_TARGET}
+const qkvSliceSourceUncached = (rows, model, which) => `${PRELUDE}${ONE_TARGET}
 const int C4 = ${model / 4};
 const int ELEMENTS = ${rows * model};
 const int OFFSET = ${which * (model / 4)};
@@ -116,7 +116,7 @@ void main() {
  * the same side of the split because `headDim / 2` is a multiple of four for
  * every ESM-C width - which the caller asserts.
  */
-export const ropeSource = (rows, heads, headDim, base) => `${PRELUDE}${ONE_TARGET}
+const ropeSourceUncached = (rows, heads, headDim, base) => `${PRELUDE}${ONE_TARGET}
 const int HEAD_DIM = ${headDim};
 const int HALF = ${headDim >> 1};
 const int ELEMENTS = ${rows * heads * headDim};
@@ -165,7 +165,7 @@ void main() {
  * products still accumulate in ascending `d` order, one scalar at a time,
  * rather than as a `dot`. `--no-attend-dot4` is the control arm.
  */
-export const attentionSource = (rows, heads, headDim, lanewise = false) => {
+const attentionSourceUncached = (rows, heads, headDim, lanewise = false) => {
   const wide = !lanewise && headDim % 4 === 0;
   return `${PRELUDE}${ONE_TARGET}
 const int ROWS = ${rows};
@@ -229,7 +229,7 @@ ${wide
 
 
 /** `out[row][c] = silu(wide[row][c]) * wide[row][ffn + c]`, the BLOCKED split. */
-export const swiGluSource = (rows, ffn) => `${PRELUDE}${ONE_TARGET}
+const swiGluSourceUncached = (rows, ffn) => `${PRELUDE}${ONE_TARGET}
 const int F4 = ${ffn / 4};
 const int ELEMENTS = ${rows * ffn};
 uniform sampler2D wideTex;
@@ -245,7 +245,7 @@ void main() {
 }`;
 
 /** `out = a + b * factor`, which is both residual branches and the shim's sum. */
-export const addScaledSource = (elements) => `${PRELUDE}${ONE_TARGET}
+const addScaledSourceUncached = (elements) => `${PRELUDE}${ONE_TARGET}
 const int ELEMENTS = ${elements};
 uniform sampler2D aTex;
 uniform sampler2D bTex;
@@ -258,7 +258,7 @@ void main() {
 }`;
 
 /** `out[i][j][c] = single[i][c] * single[j][c]`, then `single[i][c] - single[j][c]`. */
-export const pairJoinSource = (rows, pair) => `${PRELUDE}${ONE_TARGET}
+const pairJoinSourceUncached = (rows, pair) => `${PRELUDE}${ONE_TARGET}
 const int ROWS = ${rows};
 const int P4 = ${pair / 4};
 const int WIDE4 = ${pair / 2};
@@ -285,7 +285,7 @@ void main() {
  * Abramowitz-Stegun 7.1.26: about 1.5e-7, which is below every bar here. The
  * tanh approximation is ~1e-3 away and is a different function.
  */
-export const geluBiasSource = (rows, channels) => `${PRELUDE}${ONE_TARGET}
+const geluBiasSourceUncached = (rows, channels) => `${PRELUDE}${ONE_TARGET}
 const int C4 = ${channels / 4};
 const int ELEMENTS = ${rows * channels};
 uniform sampler2D xTex;
@@ -322,7 +322,7 @@ void main() {
  * the same numbers for the rows that are kept, and keeps the mix one draw a
  * state instead of one draw a state per row.
  */
-export const sliceRowsSource = (rows, channels, from) => `${PRELUDE}${ONE_TARGET}
+const sliceRowsSourceUncached = (rows, channels, from) => `${PRELUDE}${ONE_TARGET}
 const int C4 = ${channels / 4};
 const int ELEMENTS = ${rows * channels};
 const int FROM = ${from};
@@ -337,7 +337,7 @@ void main() {
 }`;
 
 /** `out[row][c] = x[row][c] + bias[c]`. */
-export const addRowBiasSource = (rows, channels) => `${PRELUDE}${ONE_TARGET}
+const addRowBiasSourceUncached = (rows, channels) => `${PRELUDE}${ONE_TARGET}
 const int C4 = ${channels / 4};
 const int ELEMENTS = ${rows * channels};
 uniform sampler2D xTex;
@@ -694,3 +694,15 @@ export function shimPair(execution, call) {
   out.label = "esmc.shim.pair";
   return out;
 }
+
+// Every builder above, memoised on its arguments (`memoSource` in webgl/runtime/execution.js).
+export const embedSource = memoSource(embedSourceUncached);
+export const qkvSliceSource = memoSource(qkvSliceSourceUncached);
+export const ropeSource = memoSource(ropeSourceUncached);
+export const attentionSource = memoSource(attentionSourceUncached);
+export const swiGluSource = memoSource(swiGluSourceUncached);
+export const addScaledSource = memoSource(addScaledSourceUncached);
+export const pairJoinSource = memoSource(pairJoinSourceUncached);
+export const geluBiasSource = memoSource(geluBiasSourceUncached);
+export const sliceRowsSource = memoSource(sliceRowsSourceUncached);
+export const addRowBiasSource = memoSource(addRowBiasSourceUncached);

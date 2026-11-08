@@ -16,13 +16,13 @@
  * which is what can be checked against the model, and leaves turning them into
  * distances to a caller that has the edges from somewhere real.
  */
-import { ONE_TARGET, PRELUDE } from "../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, memoSource } from "../runtime/execution.js";
 import { linear } from "../kernels/linear.js";
 
 /** @typedef {import("../runtime/storage.js").Tensor} Tensor */
 
 /** `out[i][j][c] = pair[i][j][c] + pair[j][i][c]`. */
-export const symmetriseSource = (tokens, channels) => `${PRELUDE}${ONE_TARGET}
+const symmetriseSourceUncached = (tokens, channels) => `${PRELUDE}${ONE_TARGET}
 const int L = ${tokens};
 const int C4 = ${channels / 4};
 const int ELEMENTS = ${tokens * tokens * channels};
@@ -83,7 +83,7 @@ export function distogramLogits(execution, call) {
  * 🔴 OVER THE BINS, WHICH IS THE LAST AXIS: "the logits are (i, j, bin) and a
  * softmax over the wrong one still sums to one somewhere".
  */
-export const probabilitiesSource = (pairs, bins) => `${PRELUDE}${ONE_TARGET}
+const probabilitiesSourceUncached = (pairs, bins) => `${PRELUDE}${ONE_TARGET}
 const int BINS = ${bins};
 const int B4 = ${bins / 4};
 const int ELEMENTS = ${pairs * bins};
@@ -117,3 +117,7 @@ export function distogramProbabilities(execution, { logits, pairs, bins }) {
   });
   return out;
 }
+
+// Every builder above, memoised on its arguments (`memoSource` in webgl/runtime/execution.js).
+export const symmetriseSource = memoSource(symmetriseSourceUncached);
+export const probabilitiesSource = memoSource(probabilitiesSourceUncached);

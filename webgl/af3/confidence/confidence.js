@@ -63,7 +63,7 @@
  * `shared/heads/tm-score.js`, and a second copy would be a second chance to
  * disagree about where the bins sit.
  */
-import { ONE_TARGET, PRELUDE, sized } from "../../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, sized, memoSource } from "../../runtime/execution.js";
 import { drain } from "../../runtime/steps.js";
 import { elementwiseOpSource, multiply, scale } from "../../runtime/elementwise.js";
 import { layerNorm } from "../../kernels/layer-norm.js";
@@ -105,7 +105,7 @@ export function plddtBinCentres(bins = PLDDT_BINS) {
 }
 
 /** `pairMask[i][j] = seqMask[i] * seqMask[j]`. */
-export const pairMaskSource = (tokens) => sized({ L: tokens, ELEMENTS: tokens * tokens }, `${PRELUDE}${ONE_TARGET}
+const pairMaskSourceUncached = (tokens) => sized({ L: tokens, ELEMENTS: tokens * tokens }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D seqMaskTex;
 
 float at(int pair) {
@@ -124,7 +124,7 @@ void main() {
 }`);
 
 /** Per-row partial sums of `x`, over the rows the mask keeps. */
-export const rowSumSource = (rows, channels) => sized({ ROWS: rows }, `${PRELUDE}${ONE_TARGET}
+const rowSumSourceUncached = (rows, channels) => sized({ ROWS: rows }, `${PRELUDE}${ONE_TARGET}
 const int CHANNELS = ${channels};
 uniform sampler2D xTex;
 uniform sampler2D maskTex;
@@ -148,7 +148,7 @@ void main() {
 }`);
 
 /** Per-row partial sums of `(x - mean)^2`, over the rows the mask keeps. */
-export const rowSquaredSource = (rows, channels) => sized({ ROWS: rows }, `${PRELUDE}${ONE_TARGET}
+const rowSquaredSourceUncached = (rows, channels) => sized({ ROWS: rows }, `${PRELUDE}${ONE_TARGET}
 const int CHANNELS = ${channels};
 uniform sampler2D xTex;
 uniform sampler2D maskTex;
@@ -176,7 +176,7 @@ void main() {
 }`);
 
 /** The live row count and the sum of the per-row partials, in one texel. */
-export const combineRowsSource = (rows) => sized({ ROWS: rows }, `${PRELUDE}${ONE_TARGET}
+const combineRowsSourceUncached = (rows) => sized({ ROWS: rows }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D partialTex;
 uniform sampler2D maskTex;
 
@@ -191,7 +191,7 @@ void main() {
 }`);
 
 /** `out = (x - mean) * inverse`, everywhere - padded rows included, as the reference does. */
-export const affineAllSource = (elements) => sized({ ELEMENTS: elements }, `${PRELUDE}${ONE_TARGET}
+const affineAllSourceUncached = (elements) => sized({ ELEMENTS: elements }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D xTex;
 uniform float mean;
 uniform float inverse;
@@ -308,7 +308,7 @@ export function absentTargetFeatTerms(weights, stats, pairChannels) {
  * each dialect's own spelling is kept rather than one being rewritten as the
  * other.
  */
-export const assemblePairSource = (
+const assemblePairSourceUncached = (
   tokens, channels, bins, caStyle, hasDistance, hasAbsent,
 ) => sized({ L: tokens, ELEMENTS: tokens * tokens * channels }, `${PRELUDE}${ONE_TARGET}
 const int C4 = ${channels / 4};
@@ -370,10 +370,10 @@ ${hasAbsent ? `  value += fetch4(absentTex, group) + fetch4(absentTex, C4 + grou
 }`);
 
 /** `out = x`, for the branch that takes the trunk's single unchanged. */
-export const copyRowsSource = (elements) => elementwiseOpSource("copy", elements);
+const copyRowsSourceUncached = (elements) => elementwiseOpSource("copy", elements);
 
 /** `out = clamp(x, -512, 512)`, which protenix2 applies before its LayerNorm. */
-export const clampSource = (elements, limit) => sized({ ELEMENTS: elements }, `${PRELUDE}${ONE_TARGET}
+const clampSourceUncached = (elements, limit) => sized({ ELEMENTS: elements }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D xTex;
 
 void main() {
@@ -383,7 +383,7 @@ void main() {
 }`);
 
 /** `out[i][j] = pair[i][j] + pair[j][i]`, boltz2's pre-symmetrised PDE source. */
-export const symmetrisePairSource = (tokens, channels) => sized({ L: tokens, ELEMENTS: tokens * tokens * channels }, `${PRELUDE}${ONE_TARGET}
+const symmetrisePairSourceUncached = (tokens, channels) => sized({ L: tokens, ELEMENTS: tokens * tokens * channels }, `${PRELUDE}${ONE_TARGET}
 const int C4 = ${channels / 4};
 uniform sampler2D pairTex;
 
@@ -404,7 +404,7 @@ void main() {
  * blended - so on a MONOMER the inter head never fires and a single-chain gate
  * cannot see whether it is there at all.
  */
-export const selectByChainSource = (tokens, bins) => sized({ L: tokens, ELEMENTS: tokens * tokens * bins }, `${PRELUDE}${ONE_TARGET}
+const selectByChainSourceUncached = (tokens, bins) => sized({ L: tokens, ELEMENTS: tokens * tokens * bins }, `${PRELUDE}${ONE_TARGET}
 const int B4 = ${bins / 4};
 uniform sampler2D intraTex;
 uniform sampler2D interTex;
@@ -428,7 +428,7 @@ void main() {
  * 0, so every atom read its neighbour's logit (rna pLDDT corr 0.43 against stock
  * RF3, 0.9996 by rank)." A slot is real when its name is not empty.
  */
-export const byRankSource = (tokens, dense) => sized({ ELEMENTS: tokens * dense }, `${PRELUDE}${ONE_TARGET}
+const byRankSourceUncached = (tokens, dense) => sized({ ELEMENTS: tokens * dense }, `${PRELUDE}${ONE_TARGET}
 const int DENSE = ${dense};
 uniform sampler2D valuesTex;
 uniform sampler2D nameCharsTex;
@@ -839,3 +839,16 @@ export function* confidenceHeadSteps(execution, call) {
   pde.label = "af3.conf.pde";
   return { plddt, pae, pde, distanceLogits, paeLogits, resolvedLogits, pairMask };
 }
+
+// Every builder above, memoised on its arguments (`memoSource` in webgl/runtime/execution.js).
+export const pairMaskSource = memoSource(pairMaskSourceUncached);
+export const rowSumSource = memoSource(rowSumSourceUncached);
+export const rowSquaredSource = memoSource(rowSquaredSourceUncached);
+export const combineRowsSource = memoSource(combineRowsSourceUncached);
+export const affineAllSource = memoSource(affineAllSourceUncached);
+export const assemblePairSource = memoSource(assemblePairSourceUncached);
+export const copyRowsSource = memoSource(copyRowsSourceUncached);
+export const clampSource = memoSource(clampSourceUncached);
+export const symmetrisePairSource = memoSource(symmetrisePairSourceUncached);
+export const selectByChainSource = memoSource(selectByChainSourceUncached);
+export const byRankSource = memoSource(byRankSourceUncached);

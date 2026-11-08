@@ -35,7 +35,7 @@
  * **ENCODER'S** PAIR CONDITIONING: "the atom geometry did not change between
  * them."
  */
-import { ONE_TARGET, PRELUDE, sized } from "../../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, sized, memoSource } from "../../runtime/execution.js";
 import { atomCrossAttentionEncoder } from "./atom-encoder.js";
 import { atomPairLogits, crossAttentionBlock, gather, sumSource } from "./atom-attention.js";
 import { diffusionConditioning, scalings } from "./conditioning.js";
@@ -47,7 +47,7 @@ import { linear } from "../../kernels/linear.js";
 /** @typedef {import("../../runtime/storage.js").Tensor} Tensor */
 
 /** `out[token][atom][c] = projected[token][c]` - one token's features to its atoms. */
-export const broadcastToAtomsSource = (tokens, dense, channels) => sized({ ELEMENTS: tokens * dense * channels }, `${PRELUDE}${ONE_TARGET}
+const broadcastToAtomsSourceUncached = (tokens, dense, channels) => sized({ ELEMENTS: tokens * dense * channels }, `${PRELUDE}${ONE_TARGET}
 const int DENSE = ${dense};
 const int C4 = ${channels / 4};
 uniform sampler2D projectedTex;
@@ -62,7 +62,7 @@ void main() {
 }`);
 
 /** `out[row][c] = (a[row][c] + b[row][c]) * mask[row]`. */
-export const sumAndMaskSource = (rows, channels) => sized({ ELEMENTS: rows * channels }, `${PRELUDE}${ONE_TARGET}
+const sumAndMaskSourceUncached = (rows, channels) => sized({ ELEMENTS: rows * channels }, `${PRELUDE}${ONE_TARGET}
 const int C4 = ${channels / 4};
 uniform sampler2D aTex;
 uniform sampler2D bTex;
@@ -76,7 +76,7 @@ void main() {
 }`);
 
 /** `out[row][c] = x[row][c] * mask[row]`, over a 3-wide row stored at stride 4. */
-export const scalePositionsSource = (atoms) => sized({ ELEMENTS: atoms * 3 }, `${PRELUDE}${ONE_TARGET}
+const scalePositionsSourceUncached = (atoms) => sized({ ELEMENTS: atoms * 3 }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D positionsTex;
 uniform sampler2D maskTex;
 uniform float factor;
@@ -101,7 +101,7 @@ void main() {
  *
  * The blend, which is the whole output of the head - see the note at the top.
  */
-export const blendSource = (atoms) => sized({ ELEMENTS: atoms * 3 }, `${PRELUDE}${ONE_TARGET}
+const blendSourceUncached = (atoms) => sized({ ELEMENTS: atoms * 3 }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D noisyTex;
 uniform sampler2D updateTex;
 uniform sampler2D maskTex;
@@ -125,7 +125,7 @@ void main() {
 }`);
 
 /** A three-channel gather with both strides given; see the encoder's note. */
-export const positionGatherSource = (count, sourceStride, outStride) => sized({ ELEMENTS: count * outStride }, `${PRELUDE}${ONE_TARGET}
+const positionGatherSourceUncached = (count, sourceStride, outStride) => sized({ ELEMENTS: count * outStride }, `${PRELUDE}${ONE_TARGET}
 const int OUT = ${outStride};
 const int STRIDE = ${sourceStride};
 uniform sampler2D sourceTex;
@@ -267,7 +267,7 @@ export function atomDecoder(execution, call) {
 }
 
 /** `out[row][c] = x[row][c] * mask[row]`. */
-export const maskOnlySource = (rows, channels) => sized({ ELEMENTS: rows * channels }, `${PRELUDE}${ONE_TARGET}
+const maskOnlySourceUncached = (rows, channels) => sized({ ELEMENTS: rows * channels }, `${PRELUDE}${ONE_TARGET}
 const int C4 = ${channels / 4};
 uniform sampler2D xTex;
 uniform sampler2D maskTex;
@@ -394,6 +394,8 @@ export function* diffusionHeadSteps(execution, call) {
   const transformed = yield* diffusionTransformerSteps(execution, {
     act, cond: cond.single, pairCond: cond.pair, mask: seqMask, tokens,
     weights: w.transformer, epsilon,
+    // ...only where the pair conditioning is the walk's own (borrowed), which is what makes its biases constant
+    ...(cond.pairIsBorrowed && call.pairLogitsCache !== undefined ? { pairLogitsCache: call.pairLogitsCache } : {}),
   });
   execution.release(act);
   call.onStage?.("transformer", transformed);
@@ -429,3 +431,11 @@ export function* diffusionHeadSteps(execution, call) {
   output.label = "af3.head.denoised";
   return output;
 }
+
+// Every builder above, memoised on its arguments (`memoSource` in webgl/runtime/execution.js).
+export const broadcastToAtomsSource = memoSource(broadcastToAtomsSourceUncached);
+export const sumAndMaskSource = memoSource(sumAndMaskSourceUncached);
+export const scalePositionsSource = memoSource(scalePositionsSourceUncached);
+export const blendSource = memoSource(blendSourceUncached);
+export const positionGatherSource = memoSource(positionGatherSourceUncached);
+export const maskOnlySource = memoSource(maskOnlySourceUncached);

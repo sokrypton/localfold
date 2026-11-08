@@ -60,7 +60,7 @@ import { af3TmScores, chainTmInfo, interfaceTmTerm, tmPerBinFor, tmScoreD0, tmTe
 // structure". A second Box-Muller here would make every fold a different sample
 // from the same distribution and leave nothing to compare.
 import { normalFrom } from "../../../shared/af3/random.js";
-import { Execution } from "../../runtime/execution.js";
+import { Execution, memoSource } from "../../runtime/execution.js";
 import { atomCrossAttentionEncoder } from "../diffusion/atom-encoder.js";
 import { perAtomConditioning } from "../diffusion/atom-conditioning.js";
 import { confidenceHeadSteps, errorBinCentres, MAX_ERROR_BIN, NUM_BINS } from "../confidence/confidence.js";
@@ -125,7 +125,7 @@ export const SAMPLER_DEFAULTS = Object.freeze({
 });
 
 /** `out[i][axis] = positions[indices[i]][axis] * mask[i]`, over a 3-wide row. */
-export const pseudoBetaSource = (tokens) => sized({ ELEMENTS: tokens * 3 }, `${PRELUDE}${ONE_TARGET}
+const pseudoBetaSourceUncached = (tokens) => sized({ ELEMENTS: tokens * 3 }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D positionsTex;
 uniform sampler2D indicesTex;
 uniform sampler2D maskTex;
@@ -879,3 +879,6 @@ export function* foldAf3Steps(execution, call) {
     trunkPasses: recycles + 1, steps,
   };
 }
+
+// Every builder above, memoised on its arguments (`memoSource` in webgl/runtime/execution.js).
+export const pseudoBetaSource = memoSource(pseudoBetaSourceUncached);

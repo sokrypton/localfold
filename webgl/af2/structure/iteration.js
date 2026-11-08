@@ -24,7 +24,7 @@
  * sum is a single f32 operation either way, so the values are the same, and a
  * fragment shader cannot hold a row's statistics across invocations anyway.
  */
-import { ONE_TARGET, PRELUDE } from "../../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, memoSource } from "../../runtime/execution.js";
 import { layerNorm } from "../../kernels/layer-norm.js";
 import { linear } from "../../kernels/linear.js";
 import { add, relu } from "../../runtime/elementwise.js";
@@ -37,7 +37,7 @@ export const ITERATION_WEIGHTS = [
   "affineWeight", "affineBias",
 ];
 
-export const advanceAffineSource = (length) => `${PRELUDE}${ONE_TARGET}
+const advanceAffineSourceUncached = (length) => `${PRELUDE}${ONE_TARGET}
 const int ELEMENTS = ${length * 7};
 uniform sampler2D affineTex;
 uniform sampler2D updateTex;
@@ -165,3 +165,6 @@ export function structureIteration(execution, call) {
   nextAffine.label = "structure.affine";
   return { activations: nextActivations, affine: nextAffine };
 }
+
+// Every builder above, memoised on its arguments (`memoSource` in webgl/runtime/execution.js).
+export const advanceAffineSource = memoSource(advanceAffineSourceUncached);

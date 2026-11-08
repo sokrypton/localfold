@@ -30,12 +30,12 @@
  *     `(sine, cosine)` taken in that order from the angle pair - the opposite
  *     order is a plausible structure with every sidechain mirrored
  */
-import { ONE_TARGET, PRELUDE } from "../../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, memoSource } from "../../runtime/execution.js";
 
 /** @typedef {import("../../runtime/storage.js").Tensor} Tensor */
 
 /** The composed rigid groups, four vec4s a frame: three rotation rows then the translation. */
-export const composedFramesSource = (length) => `${PRELUDE}${ONE_TARGET}
+const composedFramesSourceUncached = (length) => `${PRELUDE}${ONE_TARGET}
 const int L = ${length};
 // No affine here: the backbone frame is applied in the atom draw, not this one -
 // and declaring a sampler a kernel does not read is refused by name, because the
@@ -122,7 +122,7 @@ void main() {
 export const MONOMER_POSITION_SCALE = 10;
 export const MULTIMER_POSITION_SCALE = 20;
 
-export const atom14Source = (length, positionScale = MONOMER_POSITION_SCALE) => `${PRELUDE}${ONE_TARGET}
+const atom14SourceUncached = (length, positionScale = MONOMER_POSITION_SCALE) => `${PRELUDE}${ONE_TARGET}
 const int L = ${length};
 const float POSITION_SCALE = ${positionScale.toFixed(1)};
 const int ELEMENTS = ${length * 14 * 3};
@@ -189,7 +189,7 @@ void main() {
     base + 3 < ELEMENTS ? coordinateOf(base + 3) : 0.0);
 }`;
 
-export const atom37Source = (length) => `${PRELUDE}${ONE_TARGET}
+const atom37SourceUncached = (length) => `${PRELUDE}${ONE_TARGET}
 const int ELEMENTS = ${length * 37 * 3};
 uniform sampler2D atom14Tex;
 uniform sampler2D mapTex;
@@ -264,3 +264,8 @@ export function atomGeometry(execution, call) {
   });
   return { atom14, atom37, frames };
 }
+
+// Every builder above, memoised on its arguments (`memoSource` in webgl/runtime/execution.js).
+export const composedFramesSource = memoSource(composedFramesSourceUncached);
+export const atom14Source = memoSource(atom14SourceUncached);
+export const atom37Source = memoSource(atom37SourceUncached);

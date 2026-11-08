@@ -29,7 +29,7 @@
  * adds the same one. No other pairformer in this tree has it." `extraPairBias`
  * is that term, and absent means it does not exist.
  */
-import { ONE_TARGET, PRELUDE, sized } from "../../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, sized, memoSource } from "../../runtime/execution.js";
 import { add } from "../../runtime/elementwise.js";
 import { gridSelfAttention, releaseGridAttentionWeights, uploadGridAttentionWeights }
   from "./grid-attention.js";
@@ -54,7 +54,7 @@ import {
  * in here rather than being a separate draw: the relayout already visits every
  * (head, pair) once.
  */
-export const pairLogitsSource = (tokens, heads, hasExtra) => sized({ PAIRS: tokens * tokens, ELEMENTS: heads * tokens * tokens }, `${PRELUDE}${ONE_TARGET}
+const pairLogitsSourceUncached = (tokens, heads, hasExtra) => sized({ PAIRS: tokens * tokens, ELEMENTS: heads * tokens * tokens }, `${PRELUDE}${ONE_TARGET}
 const int HEADS = ${heads};
 uniform sampler2D flatTex;
 ${hasExtra ? "uniform sampler2D extraTex;" : ""}
@@ -259,3 +259,6 @@ export function pairformerBlock(execution, call) {
   single.label = "af3.block.single";
   return { pair, single };
 }
+
+// Every builder above, memoised on its arguments (`memoSource` in webgl/runtime/execution.js).
+export const pairLogitsSource = memoSource(pairLogitsSourceUncached);

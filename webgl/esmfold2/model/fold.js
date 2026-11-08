@@ -39,7 +39,7 @@
  * learned constant rather than zero, and that constant is not ported here - such
  * a batch is refused by name.
  */
-import { ONE_TARGET, PRELUDE } from "../../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, memoSource } from "../../runtime/execution.js";
 import { languageModelInput } from "../../../shared/esmfold2/featurise.js";
 import { representativeAtoms } from "../../../shared/esmfold2/representative-atoms.js";
 import { tmScores } from "../../../cpu/esmfold2/confidence.js";
@@ -61,7 +61,7 @@ import { linear } from "../../kernels/linear.js";
 export const AATYPE_CLASSES = 32;
 
 /** `out[token][c] = rows[tokenToRow[token]][c]`, the shim's single onto tokens. */
-export const gatherRowsSource = (tokens, channels) => `${PRELUDE}${ONE_TARGET}
+const gatherRowsSourceUncached = (tokens, channels) => `${PRELUDE}${ONE_TARGET}
 const int C4 = ${channels / 4};
 const int ELEMENTS = ${tokens * channels};
 uniform sampler2D rowsTex;
@@ -376,3 +376,6 @@ export function foldEsmfold2(execution, call) {
     tokens, atoms, steps: sampled.steps, loops: loops + 1,
   };
 }
+
+// Every builder above, memoised on its arguments (`memoSource` in webgl/runtime/execution.js).
+export const gatherRowsSource = memoSource(gatherRowsSourceUncached);

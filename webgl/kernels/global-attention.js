@@ -35,7 +35,7 @@
  * whole reason this is affordable - and is why there is a broadcast kernel here
  * rather than an elementwise multiply.
  */
-import { ONE_TARGET, PRELUDE, sized } from "../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, sized, memoSource } from "../runtime/execution.js";
 import { layerNorm } from "./layer-norm.js";
 import { linear } from "./linear.js";
 import { transposeLeading } from "../runtime/transpose.js";
@@ -53,7 +53,7 @@ export const GLOBAL_ATTENTION_WEIGHTS = [
  * bias-free and homogeneous, so scaling here is the same number and one draw
  * fewer.
  */
-export const columnMeanSource = (sequences, length, channels) => sized({ L: length }, `${PRELUDE}${ONE_TARGET}
+const columnMeanSourceUncached = (sequences, length, channels) => sized({ L: length }, `${PRELUDE}${ONE_TARGET}
 const int SEQUENCES = ${sequences};
 const int C4 = ${channels / 4};
 uniform sampler2D xTex;
@@ -80,7 +80,7 @@ void main() {
  * `out[i][h][d] = softmax_s(q[i][h] . k[i][s]) . v[i][s][d]`, one head's keys
  * and values shared by every head.
  */
-export const globalAttendSource = (sequences, length, heads, headDim) => sized({ L: length }, `${PRELUDE}${ONE_TARGET}
+const globalAttendSourceUncached = (sequences, length, heads, headDim) => sized({ L: length }, `${PRELUDE}${ONE_TARGET}
 const int SEQUENCES = ${sequences};
 const int HEADS = ${heads};
 const int HD = ${headDim};
@@ -125,7 +125,7 @@ void main() {
  * `out[i][s][slot] = attended[i][slot] * gate[i][s][slot]` - one value per
  * residue against every sequence's gate.
  */
-export const broadcastOverSequencesSource = (sequences, length, gates) => sized({ L: length }, `${PRELUDE}${ONE_TARGET}
+const broadcastOverSequencesSourceUncached = (sequences, length, gates) => sized({ L: length }, `${PRELUDE}${ONE_TARGET}
 const int SEQUENCES = ${sequences};
 const int G4 = ${gates / 4};
 uniform sampler2D attendedTex;
@@ -256,3 +256,8 @@ export function globalAttention(execution, call) {
   output.label = "global-attention";
   return output;
 }
+
+// Every builder above, memoised on its arguments (`memoSource` in webgl/runtime/execution.js).
+export const columnMeanSource = memoSource(columnMeanSourceUncached);
+export const globalAttendSource = memoSource(globalAttendSourceUncached);
+export const broadcastOverSequencesSource = memoSource(broadcastOverSequencesSourceUncached);

@@ -43,7 +43,7 @@
  * halves the gate, and this runs 96 times in an rf3 trunk." No other checkpoint
  * has a slot for either, and absent means the term does not exist.
  */
-import { ONE_TARGET, PRELUDE, sized } from "../../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, sized, memoSource } from "../../runtime/execution.js";
 import { attentionFlash } from "../../kernels/attention-flash.js";
 import { layerNorm } from "../../kernels/layer-norm.js";
 import { linear } from "../../kernels/linear.js";
@@ -67,7 +67,7 @@ export const GRID_ATTENTION_OPTIONAL = ["gatingQueryBias", "outputProjectionBias
  * is a draw of its own. Doing the swap here rather than downstream keeps it next
  * to the comment that explains it.
  */
-export const biasPlanesSource = (length, heads, swap) => sized({ L: length, PAIRS: length * length, ELEMENTS: heads * length * length }, `${PRELUDE}${ONE_TARGET}
+const biasPlanesSourceUncached = (length, heads, swap) => sized({ L: length, PAIRS: length * length, ELEMENTS: heads * length * length }, `${PRELUDE}${ONE_TARGET}
 const int HEADS = ${heads};
 uniform sampler2D rawTex;
 
@@ -95,7 +95,7 @@ void main() {
 }`);
 
 /** `out[row][w] += bias[w]`, the one AF3 variant that has a projection bias. */
-export const addRowBiasSource = (rows, width) => sized({ ELEMENTS: rows * width }, `${PRELUDE}${ONE_TARGET}
+const addRowBiasSourceUncached = (rows, width) => sized({ ELEMENTS: rows * width }, `${PRELUDE}${ONE_TARGET}
 const int W4 = ${width / 4};
 uniform sampler2D xTex;
 uniform sampler2D biasTex;
@@ -258,7 +258,7 @@ export function gridSelfAttention(execution, call) {
 }
 
 /** `sigmoid(x)`, needed only where a bias sits between the projection and it. */
-export const logisticSource = (elements) => sized({ ELEMENTS: elements }, `${PRELUDE}${ONE_TARGET}
+const logisticSourceUncached = (elements) => sized({ ELEMENTS: elements }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D xTex;
 
 void main() {
@@ -267,3 +267,8 @@ void main() {
   vec4 x = fetch4(xTex, texel);
   result = vec4(1.0) / (vec4(1.0) + exp(-x));
 }`);
+
+// Every builder above, memoised on its arguments (`memoSource` in webgl/runtime/execution.js).
+export const biasPlanesSource = memoSource(biasPlanesSourceUncached);
+export const addRowBiasSource = memoSource(addRowBiasSourceUncached);
+export const logisticSource = memoSource(logisticSourceUncached);

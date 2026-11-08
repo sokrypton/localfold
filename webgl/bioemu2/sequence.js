@@ -26,14 +26,14 @@
  * pair whose ENTITIES differ - while `embed_same_entity` is added only when they
  * are the same. Four nearly-identical lines, four different conditions.
  */
-import { ONE_TARGET, PRELUDE } from "../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, memoSource } from "../runtime/execution.js";
 import { BIOEMU2 } from "../../shared/bioemu2/weights.js";
 import { linearRows } from "../../cpu/bioemu2/host.js";
 
 /** @typedef {import("../runtime/storage.js").Tensor} Tensor */
 
 /** The four relative-position tables, summed into the pair. */
-export const relativeSource = (tokens) => `${PRELUDE}${ONE_TARGET}
+const relativeSourceUncached = (tokens) => `${PRELUDE}${ONE_TARGET}
 const int L = ${tokens};
 const int C4 = 64;
 const int ELEMENTS = ${tokens * tokens * 256};
@@ -82,7 +82,7 @@ void main() {
  * The rest of `z_init` in one draw: the two per-token projections broadcast, the
  * bond term and the contact class.
  */
-export const assembleSource = (tokens) => `${PRELUDE}${ONE_TARGET}
+const assembleSourceUncached = (tokens) => `${PRELUDE}${ONE_TARGET}
 const int L = ${tokens};
 const int C4 = 64;
 const int ELEMENTS = ${tokens * tokens * 256};
@@ -118,7 +118,7 @@ void main() {
 }`;
 
 /** `m0[s][t][c] = msa_proj(one_hot, deletions, paired) + s_proj(s_inputs)[t]`. */
-export const msaInputSource = (sequences, tokens) => `${PRELUDE}${ONE_TARGET}
+const msaInputSourceUncached = (sequences, tokens) => `${PRELUDE}${ONE_TARGET}
 const int L = ${tokens};
 const int C4 = 32;
 const int ELEMENTS = ${sequences * tokens * 128};
@@ -362,3 +362,8 @@ export function sequenceEmbedder(execution, call) {
   }
   return { zInit, sInit, m0, valid: Math.max(valid, 1) };
 }
+
+// Every builder above, memoised on its arguments (`memoSource` in webgl/runtime/execution.js).
+export const relativeSource = memoSource(relativeSourceUncached);
+export const assembleSource = memoSource(assembleSourceUncached);
+export const msaInputSource = memoSource(msaInputSourceUncached);

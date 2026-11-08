@@ -25,7 +25,7 @@
  * head does use a mean, and swapping the two silently sharpens or flattens every
  * contact probability.)"
  */
-import { ONE_TARGET, PRELUDE, sized } from "../../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, sized, memoSource } from "../../runtime/execution.js";
 import { add } from "../../runtime/elementwise.js";
 import { embed } from "./embedder.js";
 import { linear } from "../../kernels/linear.js";
@@ -52,7 +52,7 @@ export function binEdges() {
 /**
  * `logits[i][j][b] = half[i][j][b] + half[j][i][b]` - the sum, not the mean.
  */
-export const symmetriseSource = (tokens) => sized({ L: tokens, ELEMENTS: tokens * tokens * DISTOGRAM_BINS }, `${PRELUDE}${ONE_TARGET}
+const symmetriseSourceUncached = (tokens) => sized({ L: tokens, ELEMENTS: tokens * tokens * DISTOGRAM_BINS }, `${PRELUDE}${ONE_TARGET}
 const int B4 = ${DISTOGRAM_BINS / 4};
 uniform sampler2D halfTex;
 
@@ -74,7 +74,7 @@ void main() {
  * one class a token and gives each pair its own threshold, so the kernel reads
  * a per-pair count rather than baking one in.
  */
-export const contactSource = (tokens) => sized({ L: tokens, ELEMENTS: tokens * tokens }, `${PRELUDE}${ONE_TARGET}
+const contactSourceUncached = (tokens) => sized({ L: tokens, ELEMENTS: tokens * tokens }, `${PRELUDE}${ONE_TARGET}
 const int BINS = ${DISTOGRAM_BINS};
 uniform sampler2D logitsTex;
 uniform sampler2D maskTex;
@@ -240,3 +240,7 @@ export function* runTrunkSteps(execution, call) {
   single.label = "af3.trunk.single";
   return { pair, single, logits, contactProbs };
 }
+
+// Every builder above, memoised on its arguments (`memoSource` in webgl/runtime/execution.js).
+export const symmetriseSource = memoSource(symmetriseSourceUncached);
+export const contactSource = memoSource(contactSourceUncached);

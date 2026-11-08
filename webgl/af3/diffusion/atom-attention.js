@@ -43,7 +43,7 @@
  * Every one of those four has no default on either side.
  */
 import { elementwiseOpSource } from "../../runtime/elementwise.js";
-import { ONE_TARGET, PRELUDE, sized, part } from "../../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, sized, part, memoSource } from "../../runtime/execution.js";
 import { layerNorm } from "../../kernels/layer-norm.js";
 import { linear } from "../../kernels/linear.js";
 
@@ -55,7 +55,7 @@ import { linear } from "../../kernels/linear.js";
  * The LayerNorm takes neither a scale nor an offset - the conditioning supplies
  * both - and the conditioning's own norm takes a scale with NO offset.
  */
-export const adaptiveBlendSource = (rows, channels) => part({ ELEMENTS: rows * channels }, {
+const adaptiveBlendSourceUncached = (rows, channels) => part({ ELEMENTS: rows * channels }, {
   uniforms: ["sampler2D normalisedTex", "sampler2D scaleTex", "sampler2D shiftTex"],
   body: `  int texel = linearTexel();
   if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
@@ -136,7 +136,7 @@ export function adaptiveZeroInit(execution, call) {
 }
 
 /** `out[i] = a[i] * b[i]`, declared here so the gate's name says what it gates. */
-export const elementwiseProductSource = (elements) => elementwiseOpSource("multiply", elements);
+const elementwiseProductSourceUncached = (elements) => elementwiseOpSource("multiply", elements);
 
 /**
  * One of AF3's atom-layout gathers.
@@ -144,7 +144,7 @@ export const elementwiseProductSource = (elements) => elementwiseOpSource("multi
  * 🔴 WHERE THE MASK IS FALSE THE DESTINATION IS ZERO rather than whatever index
  * 0 holds, "which matters because padded slots index 0 legitimately".
  */
-export const gatherSource = (count, channels) => part({ ELEMENTS: count * channels, C4: channels / 4 }, {
+const gatherSourceUncached = (count, channels) => part({ ELEMENTS: count * channels, C4: channels / 4 }, {
   uniforms: ["sampler2D sourceTex", "sampler2D indicesTex", "sampler2D maskTex"],
   body: `  int texel = linearTexel();
   if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
@@ -192,7 +192,7 @@ export function gather(execution, call) {
  * registers - the same formulation the flash kernel uses, without its
  * multi-target spread, because `keys` here is 128 at most.
  */
-export const atomAttentionSource = (shape, keyMasked, lanewise = false) => {
+const atomAttentionSourceUncached = (shape, keyMasked, lanewise = false) => {
   const { subsets, queries, keys, heads, dimension } = shape;
   const width = heads * dimension;
   // 🔴 `fetch1` IS A WHOLE `texelFetch` PLUS A COMPONENT SELECT. Both bases are
@@ -264,7 +264,7 @@ ${wide
 };
 
 /** `out[i] = base[i] + attended[i] + transition[i] * sigmoid(gate[i])`. */
-export const blockOutputSource = (elements) => part({ ELEMENTS: elements }, {
+const blockOutputSourceUncached = (elements) => part({ ELEMENTS: elements }, {
   uniforms: ["sampler2D baseTex", "sampler2D attendedTex", "sampler2D transitionTex", "sampler2D gateTex"],
   body: `  int texel = linearTexel();
   if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
@@ -274,7 +274,7 @@ export const blockOutputSource = (elements) => part({ ELEMENTS: elements }, {
 });
 
 /** `swish(wide[i]) * wide[intermediate + i]`, the SwiGLU over a blocked row. */
-export const swiGluSource = (rows, intermediate) => part({ ELEMENTS: rows * intermediate, INTER4: intermediate / 4 }, {
+const swiGluSourceUncached = (rows, intermediate) => part({ ELEMENTS: rows * intermediate, INTER4: intermediate / 4 }, {
   uniforms: ["sampler2D wideTex"],
   body: `  int texel = linearTexel();
   if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
@@ -460,7 +460,7 @@ export function crossAttentionBlock(execution, call) {
 
 /** `out[i] = a[i] + b[i]` - here rather than `runtime/elementwise.js` only
  * because this file's other fused writes read the same way. */
-export const sumSource = (elements) => elementwiseOpSource("add", elements);
+const sumSourceUncached = (elements) => elementwiseOpSource("add", elements);
 
 /**
  * The per-block attention biases, for every block of an atom stack at once.
@@ -483,7 +483,7 @@ export const sumSource = (elements) => elementwiseOpSource("add", elements);
  * flat projection is `[subset][query][key][block][head]` and the transpose is
  * exactly the sort of thing that is easy to get backwards.
  */
-export const pairLogitsLayoutSource = (shape) => {
+const pairLogitsLayoutSourceUncached = (shape) => {
   const { subsets, queries, keys, heads, blocks, block } = shape;
   return part({ BLOCKS: blocks, ELEMENTS: subsets * heads * queries * keys, QUERIES: queries, KEYS: keys, HEADS: heads, BLOCK: block }, {
   uniforms: ["sampler2D flatTex"],
@@ -587,7 +587,7 @@ export function atomPairLogits(execution, call) {
  * somewhere. GLSL ES forbids a dynamic sampler index, so the select is unrolled
  * - the same reason `interleavePlanesSource` in the flash kernel is.
  */
-export const interleaveBlocksSource = (rows, blocks, heads) => {
+const interleaveBlocksSourceUncached = (rows, blocks, heads) => {
   const declarations = Array.from({ length: blocks },
     (_, b) => `uniform sampler2D block${b};`).join("\n");
   const select = Array.from({ length: blocks - 1 },
@@ -614,3 +614,14 @@ void main() {
     base + 3 < ELEMENTS ? at(base + 3) : 0.0);
 }`);
 };
+
+// Every builder above, memoised on its arguments (`memoSource` in webgl/runtime/execution.js).
+export const adaptiveBlendSource = memoSource(adaptiveBlendSourceUncached);
+export const elementwiseProductSource = memoSource(elementwiseProductSourceUncached);
+export const gatherSource = memoSource(gatherSourceUncached);
+export const atomAttentionSource = memoSource(atomAttentionSourceUncached);
+export const blockOutputSource = memoSource(blockOutputSourceUncached);
+export const swiGluSource = memoSource(swiGluSourceUncached);
+export const sumSource = memoSource(sumSourceUncached);
+export const pairLogitsLayoutSource = memoSource(pairLogitsLayoutSourceUncached);
+export const interleaveBlocksSource = memoSource(interleaveBlocksSourceUncached);

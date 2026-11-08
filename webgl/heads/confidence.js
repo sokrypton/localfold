@@ -26,7 +26,7 @@
  * scores, which is AF2's own choice and the sort of thing a second copy gets
  * wrong.
  */
-import { ONE_TARGET, PRELUDE, sized } from "../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, sized, memoSource } from "../runtime/execution.js";
 import { layerNorm } from "../kernels/layer-norm.js";
 import { linear } from "../kernels/linear.js";
 import { tmPerBinFor, tmScoreD0 } from "../../shared/heads/tm-score.js";
@@ -40,7 +40,7 @@ import { tmPerBinFor, tmScoreD0 } from "../../shared/heads/tm-score.js";
  * multiple of four - every read is a `fetch1` - because `lddtBins` and `paeBins`
  * are the model's and not this port's to round.
  */
-export const softmaxExpectationSource = (rows, bins) => sized({ ROWS: rows }, `${PRELUDE}${ONE_TARGET}
+const softmaxExpectationSourceUncached = (rows, bins) => sized({ ROWS: rows }, `${PRELUDE}${ONE_TARGET}
 const int BINS = ${bins};
 uniform sampler2D logitsTex;
 uniform sampler2D centresTex;
@@ -209,3 +209,6 @@ export function confidenceHeads(execution, call) {
     maxPredictedAlignedError: centres[paeBins - 1],
   };
 }
+
+// Every builder above, memoised on its arguments (`memoSource` in webgl/runtime/execution.js).
+export const softmaxExpectationSource = memoSource(softmaxExpectationSourceUncached);

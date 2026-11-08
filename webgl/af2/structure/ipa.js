@@ -37,7 +37,7 @@
  * each have to own partial texels. They write separately and a gather assembles
  * the row, which costs one pass and no correctness.
  */
-import { ONE_TARGET, PRELUDE } from "../../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, memoSource } from "../../runtime/execution.js";
 import { layerNorm } from "../../kernels/layer-norm.js";
 import { linear } from "../../kernels/linear.js";
 
@@ -80,7 +80,7 @@ vec3 translationOf(sampler2D affineTex, int residue) {
  * components are a plane apart, not adjacent - and the GLOBAL one it writes is
  * `[residue][head][point][xyz]`. Both are the reference's, and they differ.
  */
-export const transformPointsSource = (length, heads, points) => `${PRELUDE}${ONE_TARGET}
+const transformPointsSourceUncached = (length, heads, points) => `${PRELUDE}${ONE_TARGET}
 const int L = ${length};
 const int HEADS = ${heads};
 const int POINTS = ${points};
@@ -115,7 +115,7 @@ void main() {
 }`;
 
 /** `bias[head][q][k] = attention2dBias[head] + sum_c pair[q][k][c] * W[c][head]` */
-export const ipaPairBiasSource = (length, heads, pairChannels) => `${PRELUDE}${ONE_TARGET}
+const ipaPairBiasSourceUncached = (length, heads, pairChannels) => `${PRELUDE}${ONE_TARGET}
 const int L = ${length};
 const int HEADS = ${heads};
 const int PAIR_C = ${pairChannels};
@@ -146,7 +146,7 @@ void main() {
     base + 3 < ELEMENTS ? biasOf(base + 3) : 0.0);
 }`;
 
-export const ipaLogitsSource = (shape) => {
+const ipaLogitsSourceUncached = (shape) => {
   const { length, heads, scalarQk, scalarV, pointQk, pointV } = shape;
   return `${PRELUDE}${ONE_TARGET}
 const int L = ${length};
@@ -210,7 +210,7 @@ void main() {
 };
 
 /** Softmax over the key axis, into its own tensor - in place is not available. */
-export const ipaSoftmaxSource = (length, heads) => `${PRELUDE}${ONE_TARGET}
+const ipaSoftmaxSourceUncached = (length, heads) => `${PRELUDE}${ONE_TARGET}
 const int L = ${length};
 const int ELEMENTS = ${heads * length * length};
 uniform sampler2D logitsTex;
@@ -236,7 +236,7 @@ void main() {
 }`;
 
 /** `scalar[query][head][v] = sum_k attention . kv value channels` */
-export const ipaScalarFeatureSource = (length, heads, scalarQk, scalarV) => `${PRELUDE}${ONE_TARGET}
+const ipaScalarFeatureSourceUncached = (length, heads, scalarQk, scalarV) => `${PRELUDE}${ONE_TARGET}
 const int L = ${length};
 const int HEADS = ${heads};
 const int SCALAR_V = ${scalarV};
@@ -273,7 +273,7 @@ void main() {
  * The point feature: four planes of `heads * pointV` - x, y, z and the norm -
  * with the summed global vector rotated back into the QUERY's frame.
  */
-export const ipaPointFeatureSource = (length, heads, pointQk, pointV) => `${PRELUDE}${ONE_TARGET}
+const ipaPointFeatureSourceUncached = (length, heads, pointQk, pointV) => `${PRELUDE}${ONE_TARGET}
 const int L = ${length};
 const int HEADS = ${heads};
 const int POINT_V = ${pointV};
@@ -322,7 +322,7 @@ void main() {
 }`;
 
 /** `pair[query][head][c] = sum_k attention[head][query][k] * pair[query][k][c]` */
-export const ipaPairFeatureSource = (length, heads, pairChannels) => `${PRELUDE}${ONE_TARGET}
+const ipaPairFeatureSourceUncached = (length, heads, pairChannels) => `${PRELUDE}${ONE_TARGET}
 const int L = ${length};
 const int HEADS = ${heads};
 const int PAIR_C = ${pairChannels};
@@ -355,7 +355,7 @@ void main() {
 }`;
 
 /** The three blocks gathered into one row, in the reference's order. */
-export const ipaFeatureRowSource = (length, scalarSize, pointSize, pairSize) => `${PRELUDE}${ONE_TARGET}
+const ipaFeatureRowSourceUncached = (length, scalarSize, pointSize, pairSize) => `${PRELUDE}${ONE_TARGET}
 const int SCALAR = ${scalarSize};
 const int POINT4 = ${4 * pointSize};
 const int PAIR = ${pairSize};
@@ -530,3 +530,13 @@ export function invariantPointAttention(execution, call) {
   output.label = "ipa.output";
   return output;
 }
+
+// Every builder above, memoised on its arguments (`memoSource` in webgl/runtime/execution.js).
+export const transformPointsSource = memoSource(transformPointsSourceUncached);
+export const ipaPairBiasSource = memoSource(ipaPairBiasSourceUncached);
+export const ipaLogitsSource = memoSource(ipaLogitsSourceUncached);
+export const ipaSoftmaxSource = memoSource(ipaSoftmaxSourceUncached);
+export const ipaScalarFeatureSource = memoSource(ipaScalarFeatureSourceUncached);
+export const ipaPointFeatureSource = memoSource(ipaPointFeatureSourceUncached);
+export const ipaPairFeatureSource = memoSource(ipaPairFeatureSourceUncached);
+export const ipaFeatureRowSource = memoSource(ipaFeatureRowSourceUncached);

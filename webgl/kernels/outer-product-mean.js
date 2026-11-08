@@ -47,7 +47,7 @@
  * 2.1 M floats at 8 sequences, 64 residues, cOuter 32, cZ 128 - and it is
  * released as soon as the second draw is done.
  */
-import { PRELUDE, ONE_TARGET, sized } from "../runtime/execution.js";
+import { PRELUDE, ONE_TARGET, sized, memoSource } from "../runtime/execution.js";
 import { layerNorm } from "./layer-norm.js";
 import { linear } from "./linear.js";
 import { maskRows } from "../runtime/elementwise.js";
@@ -62,7 +62,7 @@ export const OUTER_PRODUCT_MEAN_WEIGHTS = [
 /**
  * `intermediate[s][i][cr][z] = sum_cl left[s][i][cl] * outputWeight[(cl*cOuter+cr)*cZ+z]`
  */
-export const opmIntermediateSource = (rows, cOuter, cZ) => sized({ ROWS: rows }, `${PRELUDE}${ONE_TARGET}
+const opmIntermediateSourceUncached = (rows, cOuter, cZ) => sized({ ROWS: rows }, `${PRELUDE}${ONE_TARGET}
 const int C_OUTER = ${cOuter};
 const int CZ4 = ${cZ / 4};
 uniform sampler2D leftTex;
@@ -93,7 +93,7 @@ void main() {
  * `out[i][j][z] = (sum_s sum_cr intermediate[s][i][cr][z] * right[s][j][cr]
  *                  + outputBias[z]) / (epsilon + sum_s mask[s][i] * mask[s][j])`
  */
-export const opmContractSource = (
+const opmContractSourceUncached = (
   sequences, length, cOuter, cZ, biasAfterNorm = false,
 ) => sized({ L: length }, `${PRELUDE}${ONE_TARGET}
 const int SEQUENCES = ${sequences};
@@ -136,7 +136,7 @@ ${biasAfterNorm
  * `out[c][r] = x[r][c]` for an `[R][C]` tensor, columns `[c0, c0 + count)` only: the MSA's left projection as
  * `[(i, cl)][s]`, the operand `opmOuterFirst`'s contraction over the sequences reads as its x.
  */
-export const opmColumnsSource = (rowsR, columns, count) => sized({ R: rowsR, C: columns, COUNT: count }, `${PRELUDE}${ONE_TARGET}
+const opmColumnsSourceUncached = (rowsR, columns, count) => sized({ R: rowsR, C: columns, COUNT: count }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D xTex;
 uniform int c0;
 
@@ -154,7 +154,7 @@ void main() {
 /**
  * `[(i, cl)][(j, cr)]` to `[(i, j)][(cl, cr)]`: the outer products, laid as the rows the output projection reads.
  */
-export const opmPermuteSource = (chunkRows, length, cOuter) => sized({ CI: chunkRows, L: length }, `${PRELUDE}${ONE_TARGET}
+const opmPermuteSourceUncached = (chunkRows, length, cOuter) => sized({ CI: chunkRows, L: length }, `${PRELUDE}${ONE_TARGET}
 const int C_OUTER = ${cOuter};
 const int CO4 = ${cOuter / 4};
 uniform sampler2D outerTex;
@@ -175,7 +175,7 @@ void main() {
  * The bias and the mask count over a chunk of rows `[i0, i0 + CI)` of `acc`, written into the whole output: rows
  * outside the chunk come from `previousTex` (the chunks before it), or are zero for the first.
  */
-export const opmFinishSource = (sequences, length, chunkRows, cZ, biasAfterNorm, chained) => sized({ L: length, CI: chunkRows }, `${PRELUDE}${ONE_TARGET}
+const opmFinishSourceUncached = (sequences, length, chunkRows, cZ, biasAfterNorm, chained) => sized({ L: length, CI: chunkRows }, `${PRELUDE}${ONE_TARGET}
 const int SEQUENCES = ${sequences};
 const int CZ4 = ${cZ / 4};
 uniform sampler2D accTex;
@@ -373,3 +373,10 @@ export function outerProductMean(execution, call) {
   execution.release(right);
   return output;
 }
+
+// Every builder above, memoised on its arguments (`memoSource` in webgl/runtime/execution.js).
+export const opmIntermediateSource = memoSource(opmIntermediateSourceUncached);
+export const opmContractSource = memoSource(opmContractSourceUncached);
+export const opmColumnsSource = memoSource(opmColumnsSourceUncached);
+export const opmPermuteSource = memoSource(opmPermuteSourceUncached);
+export const opmFinishSource = memoSource(opmFinishSourceUncached);

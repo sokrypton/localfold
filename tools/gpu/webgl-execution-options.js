@@ -246,6 +246,10 @@ export function webglExecutionOptions(args, defaults = {}) {
       || ((defaults.narrowUnblockedX ?? false) && !flag(args, "no-narrow-unblocked-x")),
     int5Weights: !flag(args, "no-int5-weights"),
     checkErrors: !flag(args, "no-check-errors"),
+    // `--invalidate` / `--no-invalidate`: Execution.invalidateTargets, a driver default too
+    invalidateTargets: flag(args, "invalidate") || ((defaults.invalidateTargets ?? false) && !flag(args, "no-invalidate")),
+    // `--flush-every=<n>`: gl.flush() every n dispatches (Execution.flushEvery); the driver's default without it
+    flushEvery: Number(option(args, "flush-every", String(defaults.flushEvery ?? 0))),
     noLinearBlock: flag(args, "no-linear-block"),
     fillFresh: flag(args, "nan-watch") ? NaN : null,
     nanWatch: flag(args, "nan-watch"),

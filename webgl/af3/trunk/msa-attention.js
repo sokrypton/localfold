@@ -27,7 +27,7 @@
  * module is built not to do, and the softmax would then have to be recomputed
  * per row.
  */
-import { ONE_TARGET, PRELUDE, sized } from "../../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, sized, memoSource } from "../../runtime/execution.js";
 import { layerNorm } from "../../kernels/layer-norm.js";
 import { linear } from "../../kernels/linear.js";
 import { multiply } from "../../runtime/elementwise.js";
@@ -40,7 +40,7 @@ export const MSA_ATTENTION_WEIGHTS = [
 ];
 
 /** `keyMask[t] = max over sequences of msaMask[s][t]`. */
-export const keyMaskSource = (sequences, tokens) => sized({ L: tokens }, `${PRELUDE}${ONE_TARGET}
+const keyMaskSourceUncached = (sequences, tokens) => sized({ L: tokens }, `${PRELUDE}${ONE_TARGET}
 const int SEQUENCES = ${sequences};
 uniform sampler2D maskTex;
 
@@ -69,7 +69,7 @@ void main() {
  * whole j row - so it sweeps the row twice, once for the maximum and once for
  * the sum. Four j a fragment rather than one keeps that sweep shared.
  */
-export const msaWeightsSource = (tokens, heads) => sized({ L: tokens, ELEMENTS: heads * tokens * tokens }, `${PRELUDE}${ONE_TARGET}
+const msaWeightsSourceUncached = (tokens, heads) => sized({ L: tokens, ELEMENTS: heads * tokens * tokens }, `${PRELUDE}${ONE_TARGET}
 const int HEADS = ${heads};
 uniform sampler2D flatTex;
 uniform sampler2D keyMaskTex;
@@ -112,7 +112,7 @@ void main() {
  * One fragment owns four consecutive d of one (s, i, head), so the four share
  * the weight row they sweep.
  */
-export const averageSource = (sequences, tokens, heads, dimension) => sized({ L: tokens, ELEMENTS: sequences * tokens * heads * dimension }, `${PRELUDE}${ONE_TARGET}
+const averageSourceUncached = (sequences, tokens, heads, dimension) => sized({ L: tokens, ELEMENTS: sequences * tokens * heads * dimension }, `${PRELUDE}${ONE_TARGET}
 const int HEADS = ${heads};
 const int D = ${dimension};
 const int D4 = ${dimension / 4};
@@ -250,3 +250,8 @@ export function msaAttention(execution, call) {
   out.label = "af3.msa-attention";
   return out;
 }
+
+// Every builder above, memoised on its arguments (`memoSource` in webgl/runtime/execution.js).
+export const keyMaskSource = memoSource(keyMaskSourceUncached);
+export const msaWeightsSource = memoSource(msaWeightsSourceUncached);
+export const averageSource = memoSource(averageSourceUncached);

@@ -26,7 +26,7 @@
  * gets an unrotated bond instead of a hole. `unnormalizedAngles` is returned
  * too because AF2's loss reads it and the page reports it.
  */
-import { ONE_TARGET, PRELUDE } from "../../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, memoSource } from "../../runtime/execution.js";
 import { linear } from "../../kernels/linear.js";
 import { add, relu } from "../../runtime/elementwise.js";
 
@@ -47,7 +47,7 @@ export const SIDECHAIN_WEIGHTS = [
  * Two angles to a texel, which is exact: there are 14 components a residue and a
  * texel starts on an even element, so its four always cover two whole pairs.
  */
-export const normaliseAnglesSource = (length) => `${PRELUDE}${ONE_TARGET}
+const normaliseAnglesSourceUncached = (length) => `${PRELUDE}${ONE_TARGET}
 const int ELEMENTS = ${length * 14};
 uniform sampler2D rawTex;
 
@@ -162,3 +162,6 @@ export function sidechainAngles(execution, call) {
   unnormalizedAngles.label = "sidechain.unnormalized";
   return { angles, unnormalizedAngles };
 }
+
+// Every builder above, memoised on its arguments (`memoSource` in webgl/runtime/execution.js).
+export const normaliseAnglesSource = memoSource(normaliseAnglesSourceUncached);

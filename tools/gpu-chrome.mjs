@@ -337,7 +337,10 @@ async function main() {
       return;
     }
     if (url.pathname === "/__runner") {
-      response.writeHead(200, { "content-type": "text/html" }).end(page);
+      // `Document-Policy: js-profiling` lets a tool sample its own JavaScript (the JS Self-Profiling API's
+      // `Profiler`) - fold-af3-webgl.js's `--js-profile` - which this harness cannot otherwise do: it drives Chrome
+      // without a DevTools connection.
+      response.writeHead(200, { "content-type": "text/html", "document-policy": "js-profiling" }).end(page);
       return;
     }
     // ...everything else is the repo, so the entry module's imports resolve.
