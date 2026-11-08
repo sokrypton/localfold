@@ -22,6 +22,7 @@ p.add_argument("--steps", default="4")
 p.add_argument("--timeout", type=float, default=600)
 p.add_argument("--url", default=None)
 p.add_argument("--repeat", type=int, default=1)
+p.add_argument("--delay", type=float, default=0, help="seconds to wait after the page is ready, as a reader typing would")
 p.add_argument("--sequence", default="GWSTELEKHREELKEFLKKEGITLGFTNAEKQEQAQKLGLGKKVSPELLIKAFAILKK")
 a = p.parse_args()
 a.repo = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
@@ -59,6 +60,8 @@ try:
         if js("return !!document.getElementById('predict') && /Ready|Paste/i.test(document.getElementById('status-message')?.textContent||'')"):
             break
         time.sleep(0.5)
+    if a.delay > 0:
+        time.sleep(a.delay)
     print("browser:", json.dumps(js("""return {
         ua: navigator.userAgent,
         webgpu: 'gpu' in navigator,
