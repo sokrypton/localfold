@@ -67,8 +67,10 @@ export const GRID_ATTENTION_OPTIONAL = ["gatingQueryBias", "outputProjectionBias
  * is a draw of its own. Doing the swap here rather than downstream keeps it next
  * to the comment that explains it.
  */
-const biasPlanesSourceUncached = (length, heads, swap) => sized({ L: length, PAIRS: length * length, ELEMENTS: heads * length * length }, `${PRELUDE}${ONE_TARGET}
+const biasPlanesSourceUncached = (length, heads, swap, stride = heads, offset = 0) => sized({ L: length, PAIRS: length * length, ELEMENTS: heads * length * length }, `${PRELUDE}${ONE_TARGET}
 const int HEADS = ${heads};
+const int STRIDE = ${stride};
+const int OFFSET = ${offset};
 uniform sampler2D rawTex;
 
 void main() {
@@ -85,7 +87,7 @@ void main() {
     int i = pair / L;
     int j = pair - i * L;
     ${swap ? "int source = j * L + i;" : "int source = pair;"}
-    float v = fetch1(rawTex, source * HEADS + head);
+    float v = fetch1(rawTex, source * STRIDE + OFFSET + head);
     if (lane == 0) value.x = v;
     else if (lane == 1) value.y = v;
     else if (lane == 2) value.z = v;
@@ -131,10 +133,11 @@ void main() {
  * is per row, so projecting the untransposed activation and gathering its rows here is the same arithmetic as
  * transposing the activation first, without the `transposeLeading` draw over the whole pair.
  */
-const splitGridQkvgSourceUncached = (length, width, transpose) => sized({ ROWS: length * length },
+const splitGridQkvgSourceUncached = (length, width, transpose, extra = 0) => sized({ ROWS: length * length },
   `${PRELUDE}${targetDeclarations(4)}
 const int W4 = ${width / 4};
 const int L = ${length};
+const int ROW4 = ${width + extra / 4};
 uniform sampler2D fusedTex;
 
 void main() {
@@ -145,7 +148,7 @@ void main() {
   }
   int row = texel / W4;
   ${transpose ? "row = (row % L) * L + row / L;" : ""}
-  int base = row * 4 * W4 + texel % W4;
+  int base = row * ROW4 + texel % W4;
   result0 = fetch4(fusedTex, base);
   result1 = fetch4(fusedTex, base + W4);
   result2 = fetch4(fusedTex, base + 2 * W4);
@@ -166,9 +169,16 @@ export function fuseGridProjections(weights) {
   const width = weights.heads * weights.dimension;
   if (!Number.isInteger(width) || width % 4 !== 0 || q.length % width !== 0) return null;
   const channels = q.length / width;
-  const fused = new Float32Array(channels * 4 * width);
+  // ...and the pair bias's `heads` columns after them, where they make a whole texel: it reads the same untransposed
+  // activation in both directions
+  const heads = weights.heads;
+  const pairBias = weights.pairBiasProjection;
+  const extra = heads % 4 === 0 && pairBias instanceof Float32Array && pairBias.length === channels * heads ? heads : 0;
+  const stride = 4 * width + extra;
+  const fused = new Float32Array(channels * stride);
   for (let c = 0; c < channels; c += 1) {
-    const row = c * 4 * width;
+    const row = c * stride;
+    for (let h = 0; h < extra; h += 1) fused[row + 4 * width + h] = pairBias[c * heads + h]; // in-major
     for (let o = 0; o < width; o += 1) {
       fused[row + o] = q[o * channels + c];                 // out-major [width][channels]
       fused[row + width + o] = k[o * channels + c];
@@ -176,13 +186,13 @@ export function fuseGridProjections(weights) {
       fused[row + 3 * width + o] = g[o * channels + c];
     }
   }
-  const bias = new Float32Array(4 * width);
+  const bias = new Float32Array(stride);
   const gateBias = weights.gatingQueryBias;
   if (gateBias !== undefined && gateBias !== null) {
     if (!(gateBias instanceof Float32Array) || gateBias.length !== width) return null;
     bias.set(gateBias, 3 * width);
   }
-  return { weight: fused, bias };
+  return { weight: fused, bias, extra };
 }
 
 export function uploadGridAttentionWeights(execution, weights) {
@@ -192,8 +202,10 @@ export function uploadGridAttentionWeights(execution, weights) {
   if (fused !== null) {
     out.qkvgProjection = execution.uploadWeight(fused.weight, "w.af3.grid.qkvg");
     out.qkvgBias = execution.uploadWeight(fused.bias, "w.af3.grid.qkvg-bias");
+    out.qkvgExtra = fused.extra;
   }
-  const fusedAway = new Set(fused === null ? [] : ["qProjection", "kProjection", "vProjection", "gatingQuery"]);
+  const fusedAway = new Set(fused === null ? [] : ["qProjection", "kProjection", "vProjection", "gatingQuery",
+    ...(fused.extra > 0 ? ["pairBiasProjection"] : [])]);
   for (const name of GRID_ATTENTION_WEIGHTS) {
     if (fusedAway.has(name)) continue;
     const values = weights[name];
@@ -246,23 +258,35 @@ export function gridSelfAttention(execution, call) {
     x: pair, weight: w.actNormScale, bias: w.actNormOffset,
     rows: pairs, channels, epsilon, variance: "fast",
   });
+  // ...the fused path projects the UNTRANSPOSED activation in both directions (its split gathers the rows in
+  // transposed order, `splitGridQkvgSource`) - so the pair bias, which reads that activation in every dialect, can be
+  // the same projection's last `qkvgExtra` columns.
+  const fusedPath = w.qkvgProjection !== undefined;
+  const extra = fusedPath ? w.qkvgExtra : 0;
+  const fusedOut = fusedPath
+    ? linear(execution, {
+      x: normalised, weight: w.qkvgProjection, bias: w.qkvgBias, rows: pairs, inChannels: channels,
+      outChannels: 4 * width + extra, weightLayout: "in-major",
+    })
+    : undefined;
+
   // The bias, from the UNTRANSPOSED activation in every dialect.
-  const rawBias = linear(execution, {
+  const rawBias = extra > 0 ? fusedOut : linear(execution, {
     x: normalised, weight: w.pairBiasProjection, rows: pairs,
     inChannels: channels, outChannels: heads, weightLayout: "in-major",
   });
   const bias = execution.allocate(heads * pairs, "af3.grid.bias");
   execution.dispatch({
-    source: biasPlanesSource(length, heads, transpose && swapTransposedBias),
+    source: extra > 0
+      ? biasPlanesSource(length, heads, transpose && swapTransposedBias, 4 * width + extra, 4 * width)
+      : biasPlanesSource(length, heads, transpose && swapTransposedBias),
     output: bias,
     inputs: { rawTex: rawBias },
     label: `af3.grid.bias:${length}x${heads}${transpose && swapTransposedBias ? ":swapped" : ""}`,
   });
-  execution.release(rawBias);
+  if (extra === 0) execution.release(rawBias);
 
-  // ...and the activation itself, transposed for the column direction - except on the fused path, whose split gathers
-  // the projected rows in transposed order instead (`splitGridQkvgSource`).
-  const fusedPath = w.qkvgProjection !== undefined;
+  // ...and the activation itself, transposed for the column direction where the projections are separate.
   const act = transpose && !fusedPath
     ? transposeLeading(execution, { x: normalised, outer: length, inner: length, channels })
     : normalised;
@@ -274,13 +298,9 @@ export function gridSelfAttention(execution, call) {
   // ...one fused projection and a four-target split where the weights were fused at upload (`fuseGridProjections`)
   let query, key, value, gate;
   if (fusedPath) {
-    const fusedOut = linear(execution, {
-      x: act, weight: w.qkvgProjection, bias: w.qkvgBias, rows: pairs, inChannels: channels,
-      outChannels: 4 * width, weightLayout: "in-major",
-    });
     [query, key, value, gate] = ["q", "k", "v", "g"].map((part) => execution.allocate(pairs * width, `af3.grid.${part}`));
     execution.dispatch({
-      source: splitGridQkvgSource(length, width, transpose),
+      source: splitGridQkvgSource(length, width, transpose, extra),
       outputs: [query, key, value, gate],
       inputs: { fusedTex: fusedOut },
       label: `af3.grid.split-qkvg:${pairs}x${width}${transpose ? ":transposed" : ""}`,

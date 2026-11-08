@@ -3386,3 +3386,8 @@ worst and relRms); trunk 1513 -> 1508 ms, inside the noise.
 The transpose BACK goes too: with `residualOf`, the column attention returns `pair + update[j][i]` from one draw
 (`transposedAddSource`) where it was a `transposeLeading` and the caller's add. Bit-identical; trunk median 1506 ->
 1495 ms against the previous commit, interleaved.
+And the pair bias rides in the same projection: the fused path projects the untransposed activation in both directions,
+which is what the bias reads, so its `heads` columns are appended to the fused weight (where they make a whole texel)
+and `biasPlanesSource` reads them at a stride - the narrow 128 -> 4 projection's draw gone. Not bit-identical (those
+512 floats now sit in a float16 weight rather than a float32 one of their own): pLDDT 94.019 -> 94.014, worst atom
+0.120 -> 0.116 A, trunk median 1496 -> 1481 ms.
