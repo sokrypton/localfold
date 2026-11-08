@@ -8,14 +8,20 @@
  * `foldAf3Async`: it waits on a fence between trunk blocks and denoiser calls, so the page keeps
  * painting, and stops there when `signal` aborts.
  *
- * 🔴 WHAT IT DOES NOT CARRY: a draw from an alignment (all rows when WebGPU would take them all,
- * refused rather than folded differently when it would draw), a structural-token model (OpenDDE, not ported), and
- * the WebGPU path's extras (trunk reuse, steering, motifs, warm starts) - each refused by name.
+ * The alignment is drawn as webgpu/af3/fold.js draws it: each trunk pass reads its own rows of the pool
+ * (`msaDrawRows`/`msaNativeRows`, shared/af3/msa-draw.js), so a deep search folds here as it does there.
+ * 🔴 IT REFUSED ONE DEEPER THAN num_msa UNTIL 2026-11-08, and a real MMseqs2 search returns thousands of rows,
+ * so Safari 16.3 - the browser this path exists for - refused most proteins: "the WebGL2 fold does not draw
+ * from an alignment (8077 rows)". Every gate had folded single sequences or a 4-row search.
+ *
+ * 🔴 WHAT IT DOES NOT CARRY: a structural-token model (OpenDDE, not ported), and the WebGPU path's extras
+ * (trunk reuse, steering, motifs, warm starts) - each refused by name.
  */
 import { createWebGL2Context } from "../../runtime/context.js";
 import { Execution } from "../../runtime/execution.js";
 import { foldAf3Async, releaseAf3Weights, uploadAf3WeightsSteps } from "./fold.js";
 import { drainAsync, gpuIdle } from "../../runtime/steps.js";
+import { gatherRows, msaDrawRows, msaNativeRows } from "../../../shared/af3/msa-draw.js";
 import { af3TmScores, chainTmInfo, interfaceTmTerm, tmPerBinFor, tmScoreD0, tmTermFromLogits, tokenFrameMask }
   from "../../../shared/heads/tm-score.js";
 import { errorBinCentres, MAX_ERROR_BIN, NUM_BINS } from "../confidence/confidence.js";
@@ -69,23 +75,34 @@ export async function foldBatchWebGl2(batch, weights, options) {
     if (options[key] !== undefined) throw new Error(`the WebGL2 fold does not take \`${key}\``);
   }
   const { tokens, dense } = batch;
-  // Every row, in order, as WebGPU's fold takes them when they fit under its cap (msaDrawRows'
-  // prefix): a multi-chain refold's per-chain query rows. A draw from a deeper alignment is not ported.
-  const rows = batch.msa.length / tokens;
-  const cap = Math.min(1024, batch.numMsa ?? Infinity);
-  const native = weights.trunk.dialect.msaNativeSample === true && batch.numMsa !== undefined;
-  if (rows > cap || (native && rows > 1)) {
-    throw new Error(`the WebGL2 fold does not draw from an alignment (${rows} rows)`);
-  }
+  // Each pass's rows, as webgpu/af3/fold.js `msaRowsOf` draws them: up to num_msa (1024) of the pool, a fresh
+  // draw every pass; the pool's first rows for a batch read from a dump (no `numMsa`) and for chai-1; and
+  // protenix's own count, padded with masked rows up to a power of two.
+  const pool = batch.msa.length / tokens;
+  const cap = Math.min(options.numMsa ?? 1024, batch.numMsa ?? Infinity);
+  const drawMode = batch.numMsa === undefined || weights.trunk.dialect.chaiMsaFeatures === true
+    ? "prefix" : (options.msaDraw ?? "pass");
+  const native = weights.trunk.dialect.msaNativeSample === true && batch.numMsa !== undefined
+    && options.msaDraw !== "prefix";
+  const drawSeed = options.seed ?? 20260831;
+  const msaOfPass = (pass) => {
+    const chosen = native ? msaNativeRows(drawSeed, options.msaDraw === "once" ? 0 : pass, pool)
+      : msaDrawRows(drawMode, drawSeed, pass, pool, cap);
+    const rows = native ? Math.min(pool, 2 ** Math.ceil(Math.log2(chosen.length))) : chosen.length;
+    const widen = (array, pad) => {
+      const out = new Float32Array(rows * tokens).fill(pad);
+      out.set(gatherRows(array, tokens, chosen));
+      return out;
+    };
+    return { codes: widen(batch.msa, 21), deletions: widen(batch.deletionMatrix, 0),
+             mask: widen(batch.msaMask, 0), sequences: rows };
+  };
+  // An alignment that fits whole is the same every pass, so it is uploaded once, as before.
+  const whole = !native && pool <= cap;
   const uploaded = await uploadedFor(weights);
   const fold = await foldAf3Async(execution, {
     batch, weights: uploaded, hostWeights: weights,
-    msa: {
-      codes: Float32Array.from(batch.msa),
-      deletions: Float32Array.from(batch.deletionMatrix),
-      mask: Float32Array.from(batch.msaMask),
-      sequences: rows,
-    },
+    msa: whole ? msaOfPass(0) : msaOfPass,
     recycles: options.recycles ?? 0, steps: options.steps, seed: options.seed ?? 42,
     templateSlots: options.templateSlots,
     signal: options.signal,
