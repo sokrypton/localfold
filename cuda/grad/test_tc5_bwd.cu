@@ -131,7 +131,6 @@ int main(int argc, char** argv) {
     GK(cudaMalloc(&o, nn * HD * 2)); GK(cudaMalloc(&og, nn * HD * 2)); GK(cudaMalloc(&lse, 2 * nn * H * 4));
     {
       __nv_bfloat16* tmp; GK(cudaMalloc(&tmp, nn * P * 2)); GK(cudaMemcpy(tmp, qkvg, nn * P * 2, cudaMemcpyDeviceToDevice));
-      flash::TC2 = false;
       if (!flash::gridForwardBf(a, tmp, P, tmp + HD, P, tmp + 2 * HD, P, o, HD, lse, tmp + 3 * HD, P, og, HD, false)) { printf("forward declined\n"); return 1; }
       GK(cudaDeviceSynchronize()); GK(cudaFree(tmp));
     }

@@ -1427,17 +1427,9 @@ inline bool shortPair(size_t pairs, int C) {
 // ...and one of its groups by name (AF3: lean.release, lean.msa, lean.triangle, ... - the sites that must agree share
 // one), the ordinary path a lever of its own: --lever=lean.<group>=1 keeps that group's ordinary form, =0 its short-of-
 // room one, whatever the rest takes
-// KEEP_PAIR16: the pair kept bf16 past the trunk where the tcgen05 pair kernels run (af3.cu sets it: --fast on a B200,
-// --widen-pair the old arm) - the trunk's last pair is bf16 values already, so widening it bought nothing but the
-// confidence head's f32 kernels (2048 tokens: 13.00 -> 12.84 s a fold, pTM / pLDDT the same to 1e-3). Its three groups
-// take their short-of-room forms together: lean.pair16 itself, the streamed conditioning (lean.diffusion) and the
-// confidence heads' row chunks (lean.confidence), which a bf16 pair needs
-inline bool KEEP_PAIR16 = false;
 inline bool shortPair(const char* group, size_t pairs, int C) {
   bool ordinary;
-  if (!leverForced(group, ordinary) && !leverForced("ordinary", ordinary))
-    ordinary = !(KEEP_PAIR16 && (!strcmp(group, "lean.pair16") || !strcmp(group, "lean.diffusion") || !strcmp(group, "lean.confidence"))) &&
-               !shortPairRule(pairs, C);
+  if (!leverForced(group, ordinary) && !leverForced("ordinary", ordinary)) ordinary = !shortPairRule(pairs, C);
   leverNote(group, (size_t)((double)pairs * C * 4 * SHORT_PAIR_TIMES), ordinary);
   return !ordinary;
 }

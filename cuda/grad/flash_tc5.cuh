@@ -334,295 +334,9 @@ __global__ void __launch_bounds__(32 * tcWarps<NG>(), 1) gridFwdTc(Sdpa a, BiasT
 }  // namespace flash
 }  // namespace grad
 
-// ---- gridFwdTc2: the grid attention's training forward (gridFwdBf's contract at D 32: bf16 q, k, v straight from their
-// rows, the padded bf16 bias tile shared by the grid rows, per-row key terms, o, the log-sum-exp pair, the fused gate)
-// on tcgen05, in the inference kernels' structure (cuda/af3/src/flash_tc5.cuh): a persistent block an SM over (head,
-// 128 queries, 2 grid rows), TMA loads (Q and K 64B-swizzled, V^T 128B-swizzled, the bias tile), a product warp a row,
-// S = Q K^T into tensor memory, the softmax a thread a query - x = s scale log2e + bias log2e + key term (gridFwdBf's
-// two FMAs), the max lazily, P in bf16 into tensor memory, the row sum from the unrounded P (as gridFwdBf's) - and
-// O += P V^T. Needs cuda/af3's flash_tc5.cuh (tc5a's helpers): train_of3.cu includes it first.
 #if defined(LF_TC5A)
 namespace grad {
 namespace flash {
-namespace tc2 {
-// (exponentials partly on the FMA pipe, as cuda/af3's flashTc takes them, move the log-sum-exp past test_tc5_attn2's 1e-3 -
-// the row sum here is of the unrounded P - so none)
-#ifndef TC2_EMU
-#define TC2_EMU(c) false
-#endif
-#ifndef TC2_R
-#define TC2_R 2      // (3 measured the same: 1.398 vs 1.395 ms at 768)
-#endif
-constexpr int TQ = 128, TK = 64, D = 32, R = TC2_R, SB = R >= 3 ? 1 : 2, TS = 4;
-constexpr float LAZY = 8.f;
-// shared memory: Q [2][R] 8 KB; TS stages of { bias 16 KB, [R] { K 4 KB, V^T 4 KB } }; barriers
-struct Lay { static constexpr uint32_t Q = 0, STAGE = 16384 + R * 8192, ST = 2 * R * 8192, BAR = ST + TS * STAGE, BYTES = BAR + 256; };
-constexpr int WARPS = 4 * R + R + 1;
-__host__ __device__ constexpr uint32_t idescBf(int M, int N) { return tc5a::idesc(M, N) | (1u << 7) | (1u << 10); }
-}
-// V^T [b][H D][Kp] bf16 from v's rows (b, n, h D + d), keys past K zero
-__global__ void __launch_bounds__(256) vtBfK(const uint16_t* __restrict__ v, int ld, int K, int HD, int Kp, uint16_t* __restrict__ vt) {
-  __shared__ uint16_t t[64][66];
-  const size_t b = blockIdx.z; const int k0 = blockIdx.x * 64, d0 = blockIdx.y * 64;
-  for (int u = threadIdx.x; u < 64 * 64; u += 256) {
-    const int kk = u / 64, dd = u % 64;
-    t[dd][kk] = (k0 + kk < K && d0 + dd < HD) ? v[(b * K + k0 + kk) * (size_t)ld + d0 + dd] : 0;
-  }
-  __syncthreads();
-  for (int u = threadIdx.x; u < 64 * 64; u += 256) {
-    const int dd = u / 64, kk = u % 64;
-    if (d0 + dd < HD) vt[(b * HD + d0 + dd) * (size_t)Kp + k0 + kk] = t[dd][kk];
-  }
-}
-__global__ void __launch_bounds__(32 * tc2::WARPS, 1) gridFwdTc2(const __grid_constant__ CUtensorMap mapQ, const __grid_constant__ CUtensorMap mapK,
-    const __grid_constant__ CUtensorMap mapV, const __grid_constant__ CUtensorMap mapB, int B, int H, int Q, int K, float scale, bool perH,
-    const float* __restrict__ ka2, int kpad, __nv_bfloat16* __restrict__ o, int ldo, float* __restrict__ lse,
-    __nv_bfloat16* __restrict__ gate, int ldg, __nv_bfloat16* __restrict__ og, int ldog) {
-#if LF_TC5A
-  using namespace tc5a;
-  constexpr int TQ = tc2::TQ, TK = tc2::TK, D = tc2::D, R = tc2::R, SB = tc2::SB, TS = tc2::TS; constexpr float LAZY = tc2::LAZY; using tc2::idescBf; using tc2::WARPS;
-  using L = tc2::Lay;
-  constexpr int MW = 4 * R, LW = 5 * R;
-  constexpr uint32_t OCOL = 64 * R * SB, PCOL = OCOL + 32 * R;     // S [b R + r] 64 each, O [r] 32 each, P [r][2] 32 each
-  extern __shared__ __align__(1024) unsigned char smT2[];
-  uint64_t* kvFull = reinterpret_cast<uint64_t*>(smT2 + L::BAR);
-  uint64_t *kvFree = kvFull + TS, *sFull = kvFree + TS, *sRead = sFull + R * SB, *pFull = sRead + R * SB, *pFree = pFull + 2 * R, *qFull = pFree + 2 * R;
-  __shared__ uint32_t tmBase;
-  const int nqt = (Q + TQ - 1) / TQ, nrg = (B + R - 1) / R, nk = (K + TK - 1) / TK;
-  const unsigned per = (unsigned)nqt * nrg, items = per * H;
-  const int mine = items > blockIdx.x ? (int)((items - blockIdx.x + gridDim.x - 1) / gridDim.x) : 0;
-  auto decode = [&](int k, int& h, int& q0, int& rg) {   // a head's items: 8 row groups across each query tile
-    const unsigned w = blockIdx.x + (unsigned)k * gridDim.x, r0 = w % per, G = 8;
-    h = (int)(w / per);
-    const unsigned group = r0 / (G * nqt), within = r0 % (G * nqt), left = nrg - group * G, gsz = left < G ? left : G;
-    rg = (int)(group * G + within % gsz); q0 = (int)(within / gsz) * TQ;
-  };
-  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
-  const uint32_t base = sa(smT2);
-  if (warp == MW) {
-    asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], 512;" :: "r"(sa(&tmBase)));
-    asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
-  }
-  if (tid == 0) {
-    for (int s = 0; s < TS; ++s) { barInit(kvFull + s, 1); barInit(kvFree + s, R); }
-    for (int i = 0; i < R * SB; ++i) { barInit(sFull + i, 1); barInit(sRead + i, 4); }
-    for (int i = 0; i < 2 * R; ++i) { barInit(pFull + i, 4); barInit(pFree + i, 1); }
-    for (int i = 0; i < 2; ++i) barInit(qFull + i, 1);
-    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
-  }
-  fenceBefore();
-  __syncthreads();
-  fenceAfter();
-  const uint32_t tm = tmBase;
-  const int T = mine * nk;
-  if (warp == LW) {
-    if (lane == 0) {
-      int s = 0, u = 0;
-      for (int k = 0; k < mine; ++k) {
-        int h, q0, rg; decode(k, h, q0, rg);
-        int row[R];
-        for (int r = 0; r < R; ++r) row[r] = min(rg * R + r, B - 1);
-        // Q of the item: both rows, buffer k & 1 (free: every S of item k - 2 is done, the softmax having read them)
-        barExpect(qFull + (k & 1), R * 8192);
-        for (int r = 0; r < R; ++r) tma3(smT2 + L::Q + ((k & 1) * R + r) * 8192, &mapQ, h * D, q0, row[r], qFull + (k & 1));
-        for (int j = 0; j < nk; ++j) {
-          if (u > 0) barWait(kvFree + s, (u - 1) & 1);
-          barExpect(kvFull + s, 16384 + R * 8192);
-          unsigned char* st = smT2 + L::ST + s * L::STAGE;
-          tma3(st, &mapB, j * TK, q0, perH ? h : 0, kvFull + s);
-          for (int r = 0; r < R; ++r) {
-            tma3(st + 16384 + r * 8192, &mapK, h * D, j * TK, row[r], kvFull + s);
-            tma3(st + 16384 + r * 8192 + 4096, &mapV, j * TK, h * D, row[r], kvFull + s);
-          }
-          if (++s == TS) { s = 0; ++u; }
-        }
-      }
-    }
-  } else if (warp >= MW) {
-    if (lane == 0) {
-      const int r = warp - MW;
-      constexpr uint32_t IDQK = idescBf(TQ, TK), IDPV = idescBf(TQ, D);
-      const uint64_t dQ = sdesc(base + L::Q, 16, 512, SW64), dK = sdesc(base + L::ST + 16384, 16, 512, SW64), dV = sdesc(base + L::ST + 16384 + 4096, 16, 1024, SW128);
-      int ts = 0, ks = 0, js = 0, ss = 0;
-      auto S = [&]() {
-        const int i = (ts % SB) * R + r;
-        barWait(kvFull + ss, (ts / TS) & 1);
-        if (js == 0) barWait(qFull + (ks & 1), (ks >> 1) & 1);
-        if (ts >= SB) barWait(sRead + i, ((ts - SB) / SB) & 1);
-        fenceAfter();
-        const uint32_t so = ss * L::STAGE >> 4;
-#pragma unroll
-        for (int c = 0; c < 2; ++c)
-          mmaF16(tm + i * TK, dQ + ((((ks & 1) * R + r) * 8192 + c * 32) >> 4), dK + so + ((r * 8192 + c * 32) >> 4), IDQK, c > 0);
-        commit(sFull + i);
-        ++ts; if (++ss == TS) ss = 0; if (++js == nk) { js = 0; ++ks; }
-      };
-      for (int t = 0; t < T && t < SB; ++t) S();
-      int j = 0, s = 0;
-      for (int t = 0; t < T; ++t) {
-        if (t + SB < T) S();
-        const int i = r * 2 + (t & 1);
-        barWait(pFull + i, (t >> 1) & 1);
-        fenceAfter();
-        const uint32_t so = s * L::STAGE >> 4;
-#pragma unroll
-        for (int c = 0; c < 4; ++c)
-          mmaF16ts(tm + OCOL + 32 * r, tm + PCOL + 32 * i + 8 * c, dV + so + ((r * 8192 + c * 32) >> 4), IDPV, j > 0 || c > 0);
-        commit(pFree + i);
-        commit(kvFree + s);
-        if (++s == TS) s = 0;
-        if (++j == nk) j = 0;
-      }
-    }
-  } else {
-    const int r = warp >> 2, sub = warp & 3, ql = tid & 127;
-    const uint32_t lane0 = (uint32_t)(sub * 32) << 16, tmO = tm + OCOL + 32 * r + lane0;
-    const float sl2 = scale * LOG2E;
-    for (int k = 0; k < mine; ++k) {
-      int h, q0, rg; decode(k, h, q0, rg);
-      const int q = q0 + ql, b = rg * R + r;
-      const float* ka = ka2 + (size_t)min(b, B - 1) * kpad;
-      float mx = -INFINITY, sum = 0.f;
-      for (int j = 0; j < nk; ++j) {
-        const int t = k * nk + j, i = r * 2 + (t & 1), is = (t % SB) * R + r, s = t % TS;
-        barWait(sFull + is, (t / SB) & 1);
-        fenceAfter();
-        uint32_t xr[TK];
-        ld32(tm + is * TK + lane0, xr); ld32(tm + is * TK + lane0 + 32, xr + 32);
-        ldWait();
-        fenceBefore();
-        __syncwarp();
-        if (lane == 0) barArrive(sRead + is);
-        const unsigned char* brow = smT2 + L::ST + s * L::STAGE + ql * 128;
-        float x[TK];
-#pragma unroll
-        for (int c = 0; c < 8; ++c) {
-          const uint4 bv = *reinterpret_cast<const uint4*>(brow + ((c ^ (ql & 7)) << 4));
-          const float4 k0 = __ldg(reinterpret_cast<const float4*>(ka + j * TK + 8 * c)), k1 = __ldg(reinterpret_cast<const float4*>(ka + j * TK + 8 * c + 4));
-          const float kk[8] = { k0.x, k0.y, k0.z, k0.w, k1.x, k1.y, k1.z, k1.w };
-#pragma unroll
-          for (int e = 0; e < 4; ++e) {       // (the same two FMAs a score as gridFwdBf's, two scores an instruction)
-            const uint32_t w = (&bv.x)[e];
-            const int u = 8 * c + 2 * e;
-            const float2 t = fma2(make_float2(__uint_as_float(w << 16), __uint_as_float(w & 0xffff0000u)), make_float2(LOG2E, LOG2E),
-                                  make_float2(kk[2 * e], kk[2 * e + 1]));
-            const float2 xv = fma2(make_float2(__uint_as_float(xr[u]), __uint_as_float(xr[u + 1])), make_float2(sl2, sl2), t);
-            x[u] = xv.x; x[u + 1] = xv.y;
-          }
-        }
-        float m8[8];
-#pragma unroll
-        for (int c = 0; c < 8; ++c) m8[c] = fmaxf(x[c], fmaxf(x[8 + c], x[16 + c]));
-#pragma unroll
-        for (int u = 24; u < TK; u += 16)
-#pragma unroll
-          for (int c = 0; c < 8; ++c) m8[c] = fmaxf(m8[c], fmaxf(x[u + c], x[u + 8 + c]));
-        const float rmax = fmaxf(fmaxf(fmaxf(m8[0], m8[1]), fmaxf(m8[2], m8[3])), fmaxf(fmaxf(m8[4], m8[5]), fmaxf(m8[6], m8[7])));
-        float alpha = 1.f;
-        if (rmax > mx + LAZY || (mx == -INFINITY && rmax > -INFINITY)) {
-          alpha = mx == -INFINITY ? 1.f : ex2f(mx - rmax);
-          mx = rmax;
-        }
-        if (j > 0 && __any_sync(~0u, alpha != 1.f)) {
-          barWait(pFree + r * 2 + ((t - 1) & 1), ((t - 1) >> 1) & 1);
-          fenceAfter();
-          uint32_t ov[32];
-          ld32(tmO, ov);
-          ldWait();
-#pragma unroll
-          for (int u = 0; u < 32; ++u) ov[u] = __float_as_uint(__uint_as_float(ov[u]) * alpha);
-          st32(tmO, ov);
-          stWait();
-        }
-        const float nm = mx == -INFINITY ? 0.f : mx;
-        float rs0 = 0.f, rs1 = 0.f;
-        uint32_t pw[32];
-#pragma unroll
-        for (int c = 0; c < 32; ++c) {
-          const float2 d = sub2(make_float2(x[2 * c], x[2 * c + 1]), nm);
-          float p0, p1;
-          if (TC2_EMU(c)) { const float2 e = ex2emu2(d); p0 = e.x; p1 = e.y; } else { p0 = ex2f(d.x); p1 = ex2f(d.y); }
-          rs0 += p0; rs1 += p1;
-          const __nv_bfloat162 pb = __floats2bfloat162_rn(p0, p1);
-          pw[c] = *reinterpret_cast<const uint32_t*>(&pb);
-        }
-        sum = sum * alpha + (rs0 + rs1);
-        if (t >= 2) { barWait(pFree + i, ((t - 2) >> 1) & 1); fenceAfter(); }
-        st32(tm + PCOL + 32 * i + lane0, pw);
-        stWait();
-        fenceBefore();
-        __syncwarp();
-        if (lane == 0) barArrive(pFull + i);
-      }
-      const int tl = k * nk + nk - 1;
-      barWait(pFree + r * 2 + (tl & 1), (tl >> 1) & 1);
-      fenceAfter();
-      uint32_t ov[32];
-      ld32(tmO, ov);
-      ldWait();
-      if (q < Q && b < B) {
-        const size_t bh = (size_t)b * H + h, NN = (size_t)B * H * Q, row = (size_t)b * Q + q;
-        const float inv = sum > 0.f ? 1.f / sum : 0.f;
-#pragma unroll
-        for (int nn = 0; nn < D; nn += 2) {
-          const int c = h * D + nn;
-          const __nv_bfloat162 wv = __floats2bfloat162_rn(__uint_as_float(ov[nn]) * inv, __uint_as_float(ov[nn + 1]) * inv);
-          const uint32_t w = *reinterpret_cast<const uint32_t*>(&wv);
-          *reinterpret_cast<uint32_t*>(o + row * ldo + c) = w;
-          if (gate) {
-            uint32_t* gp = reinterpret_cast<uint32_t*>(gate + row * ldg + c);
-            const uint32_t gw = *gp;
-            const float s0 = __bfloat162float(__float2bfloat16(1.f / (1.f + __expf(-__uint_as_float(gw << 16))))),
-                        s1 = __bfloat162float(__float2bfloat16(1.f / (1.f + __expf(-__uint_as_float(gw & 0xffff0000u)))));
-            const __nv_bfloat162 sv = __floats2bfloat162_rn(s0, s1);
-            *gp = *reinterpret_cast<const uint32_t*>(&sv);
-            const __nv_bfloat162 g2 = __floats2bfloat162_rn(__uint_as_float(w << 16) * s0, __uint_as_float(w & 0xffff0000u) * s1);
-            *reinterpret_cast<uint32_t*>(og + row * ldog + c) = *reinterpret_cast<const uint32_t*>(&g2);
-          }
-        }
-        lse[bh * Q + q] = sum > 0.f ? mx / LOG2E : -INFINITY;
-        lse[NN + bh * Q + q] = sum > 0.f ? logf(sum) : 0.f;
-      }
-    }
-  }
-  fenceBefore();
-  __syncthreads();
-  if (warp == MW) {
-    fenceAfter();
-    asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, 512;" :: "r"(tm));
-  }
-#endif
-}
-// OFF by default: 1.07x gridFwdBf alone at 768 tokens (test_tc5_attn2) but a training step SLOWER with it - 3436 / 3518 /
-// 3457 against 3340 / 3421 / 3357 ms (steps 2-4, 768 tokens, interleaved twice; its V^T pass and the pass's traffic). --tc-fwd
-inline bool TC2 = false;
-// gridForwardBf's form for gridFwdTc2: D 32, q, k, v bf16 rows (ld a multiple of 8), the bias shared by the grid rows
-inline bool gridFwdTc2Run(const Sdpa& a, const BiasTile& bt, const float* ka2, int Npk, const __nv_bfloat16* q, int ldq,
-                          const __nv_bfloat16* k, int ldk, const __nv_bfloat16* v, int ldv, __nv_bfloat16* o, int ldo, float* lse,
-                          __nv_bfloat16* gate, int ldg, __nv_bfloat16* og, int ldog) {
-  // (from 768 tokens, where it measured faster - test_tc5_attn2: 1.398 against 1.497 ms at 768, 0.493 / 0.473 at 512, 0.098 /
-  // 0.082 at 256: the bias and key terms added in the softmax, as gridFwdBf's, cost it what the inference kernel saves)
-  if (!TC2 || !tc5a::ready() || a.D != 32 || a.Q < 768 || ldq % 8 || ldk % 8 || ldv % 8 || (bt.p && bt.sb != 0) || !bt.p || a.Q % 64) return false;
-  constexpr int TQ = tc2::TQ, TK = tc2::TK, D = tc2::D, R = tc2::R, SB = tc2::SB, TS = tc2::TS; constexpr float LAZY = tc2::LAZY; using tc2::idescBf; using tc2::WARPS;
-  const int Npq = (a.Q + 63) / 64 * 64, HD = a.H * D;
-  uint16_t* vt = reinterpret_cast<uint16_t*>(ARENA.get(((size_t)a.B * HD * Npk + 1) / 2));
-  vtBfK<<<dim3(Npk / 64, (HD + 63) / 64, (unsigned)a.B), 256, 0, STREAM>>>(reinterpret_cast<const uint16_t*>(v), ldv, a.K, HD, Npk, vt);
-  const CUtensorMap mq = tc5a::map3(CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, q, { (uint64_t)ldq, (uint64_t)a.Q, (uint64_t)a.B }, { (uint64_t)ldq * 2, (uint64_t)a.Q * ldq * 2 }, { 32, TQ, 1 }, CU_TENSOR_MAP_SWIZZLE_64B);
-  const CUtensorMap mk = tc5a::map3(CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, k, { (uint64_t)ldk, (uint64_t)a.K, (uint64_t)a.B }, { (uint64_t)ldk * 2, (uint64_t)a.K * ldk * 2 }, { 32, TK, 1 }, CU_TENSOR_MAP_SWIZZLE_64B);
-  const CUtensorMap mv = tc5a::map3(CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, vt, { (uint64_t)Npk, (uint64_t)HD, (uint64_t)a.B }, { (uint64_t)Npk * 2, (uint64_t)HD * Npk * 2 }, { 64, 32, 1 }, CU_TENSOR_MAP_SWIZZLE_128B);
-  const uint64_t Hh = bt.sh ? (uint64_t)a.H : 1;
-  const CUtensorMap mb = tc5a::map3(CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, bt.p, { (uint64_t)Npk, (uint64_t)Npq, Hh }, { (uint64_t)bt.ld * 2, (uint64_t)Npq * bt.ld * 2 }, { 64, TQ, 1 }, CU_TENSOR_MAP_SWIZZLE_128B);
-  static bool attr = false;
-  if (!attr) { GK(cudaFuncSetAttribute(gridFwdTc2, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)tc2::Lay::BYTES)); attr = true; }
-  static int sms = 0;
-  if (!sms) { int dev; GK(cudaGetDevice(&dev)); GK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev)); }
-  const unsigned items = (unsigned)(((a.Q + TQ - 1) / TQ) * ((a.B + R - 1) / R) * a.H);
-  gridFwdTc2<<<std::min<unsigned>(items, sms), 32 * WARPS, tc2::Lay::BYTES, STREAM>>>(mq, mk, mv, mb, a.B, a.H, a.Q, a.K, (float)a.scale, bt.sh != 0,
-                                                                                 ka2, Npk, o, ldo, lse, gate, ldg, og, ldog);
-  GK(cudaGetLastError());
-  return true;
-}
-
 // ---- bwdTc: the grid attention's backward on tcgen05 - bwdBf's short form (D 32, no clip, chain ids or fixed point; the
 // bias tile shared by the rows, any bias gradient a [h][q][k] one shared by the rows; Q and K multiples of 128). bwdBf was
 // L1-bound (76% of its throughput: the ldmatrix operands, dS through shared memory, the atomics) at 46% issue.
@@ -635,20 +349,12 @@ inline bool gridFwdTc2Run(const Sdpa& a, const BiasTile& bt, const float* ka2, i
 // gradients by red.f32 from the float ds (a warp's 32 keys one line). dV += P^T dO and dK += dS^T Q (dO, Q the MN-major B
 // operands - the same 64B-swizzled tiles S and dP read K-major), and every two tiles dQ = dS K (dS^T read MN-major: M the
 // two tiles' 128 queries, K the keys). The loads all asynchronous, four stages (TMA; the raw lse, log-sum, D_i by bulk
-// copies - blocking loads of them had starved the products). The products issued by a converged warp.
+// copies - blocking loads of them had starved the products). Needs cuda/af3's flash_tc5.cuh first (tc5a's helpers).
 // Warps: 0 the loads, 1 the products, 4-11 the softmax, 12-15 dQ's adds. (Measured: each MMA ~108 cycles here against ~45
 // alone - interference from the softmax's traffic on the SM. A two-CTAs-an-SM, single-buffered form with blocking per-query
 // loads ran 3.60 ms at 768 in isolation against this one's 3.78-3.84; it was not kept or timed in a training step.)
 namespace tcb {
 constexpr int QT = 64, KB = 128, D = 32, WARPS = 16;
-#ifdef TCB_PROF
-__device__ unsigned long long prof[8];   // (cycles: softmax waits, softmax work, MMA waits for P, MMA waits for tiles)
-#define TCB_T0(v) const long long v = clock64()
-#define TCB_ADD(i, v) if (lane == 0 && (warp == 4 || warp == 1)) atomicAdd(&tcb::prof[i], (unsigned long long)(clock64() - v))
-#else
-#define TCB_T0(v)
-#define TCB_ADD(i, v)
-#endif
 constexpr int NS = 4;   // (stages of a tile's loads)
 struct Lay {   // K, V [128][32] (64B rows); dS^T [2][128][64] (128B rows); a softmax warp's {c_q, D_q, L_q, log2e lg_q} and
                // {c_q, D_q} of its 32 queries; [NS] stages { Q, dO [64][32]; the bias tile [64 q][128 k] as two 64-key boxes
@@ -663,26 +369,6 @@ __device__ __forceinline__ void bulk(void* dst, const void* src, uint32_t bytes,
 #if LF_TC5A
   asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
                :: "r"(tc5a::sa(dst)), "l"(src), "r"(bytes), "r"(tc5a::sa(m)) : "memory");
-#endif
-}
-// the products issued by a converged warp, one lane elected (descriptors warp-uniform: a single-lane branch had re-derived
-// them each instruction, ~150 cycles an issue against the tensor core's ~45)
-__device__ __forceinline__ void mmaE(bool e, uint32_t d, uint64_t a, uint64_t b, uint32_t id, bool acc) {
-#if LF_TC5A
-  asm volatile("{\n\t.reg .pred p, q;\n\tsetp.ne.b32 p, %4, 0;\n\tsetp.ne.b32 q, %5, 0;\n\t@q tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, p;\n\t}\n"
-               :: "r"(d), "l"(a), "l"(b), "r"(id), "r"((uint32_t)acc), "r"((uint32_t)e));
-#endif
-}
-__device__ __forceinline__ void mmaTsE(bool e, uint32_t d, uint32_t a, uint64_t b, uint32_t id, bool acc) {
-#if LF_TC5A
-  asm volatile("{\n\t.reg .pred p, q;\n\tsetp.ne.b32 p, %4, 0;\n\tsetp.ne.b32 q, %5, 0;\n\t@q tcgen05.mma.cta_group::1.kind::f16 [%0], [%1], %2, %3, p;\n\t}\n"
-               :: "r"(d), "r"(a), "l"(b), "r"(id), "r"((uint32_t)acc), "r"((uint32_t)e));
-#endif
-}
-__device__ __forceinline__ void commitE(bool e, uint64_t* m) {
-#if LF_TC5A
-  asm volatile("{\n\t.reg .pred q;\n\tsetp.ne.b32 q, %1, 0;\n\t@q tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];\n\t}\n"
-               :: "r"(tc5a::sa(m)), "r"((uint32_t)e) : "memory");
 #endif
 }
 __device__ __forceinline__ void red1(float* p, float x) { asm volatile("red.global.add.f32 [%0], %1;" :: "l"(p), "f"(x) : "memory"); }
@@ -753,9 +439,8 @@ __global__ void __launch_bounds__(32 * tcb::WARPS, 1) bwdTc(const __grid_constan
         bulk(st + L::SR + 2 * QT * 4, Dib + q0, QT * 4, tFull + s);
       }
     }
-  } else if (warp == 1) {   // the products (the warp converged, lane 0 issuing)
-    const bool el = lane == 0;
-    {
+  } else if (warp == 1) {   // the products
+    if (lane == 0) {
       constexpr uint32_t IDS = idescBf(128, QT), IDV = idescBf(128, D) | tcb::B_MN, IDQ = idescBf(128, D) | tcb::A_MN | tcb::B_MN;
       const uint64_t dK = sdesc(base + L::K, 16, 512, SW64), dV = sdesc(base + L::V, 16, 512, SW64);
       const uint64_t dKmn = sdesc(base + L::K, 16, 512, SW64);   // (MN-major, N = d: one 32-wide atom; 8 keys 512 B apart)
@@ -764,19 +449,16 @@ __global__ void __launch_bounds__(32 * tcb::WARPS, 1) bwdTc(const __grid_constan
       fenceAfter();
       auto issueS = [&](int t) {   // S^T and dP^T of tile t into buffer t & 1 (its previous tile's softmax is done)
         const int s = t & 1, ts = t % NS;
-        TCB_T0(tt);
         barWait(tFull + ts, (t / NS) & 1);
-        TCB_ADD(3, tt);
         fenceAfter();
         const uint32_t st = base + L::ST + ts * L::STS;
         const uint64_t dQ = sdesc(st + L::SQ, 16, 512, SW64), dO = sdesc(st + L::SO, 16, 512, SW64);
 #pragma unroll
         for (int c = 0; c < 2; ++c) {
-          mmaE(el, tm + CS + s * 64, dK + (c * 32 >> 4), dQ + (c * 32 >> 4), IDS, c > 0);
-          mmaE(el, tm + CP + s * 64, dV + (c * 32 >> 4), dO + (c * 32 >> 4), IDS, c > 0);
+          mmaF16(tm + CS + s * 64, dK + (c * 32 >> 4), dQ + (c * 32 >> 4), IDS, c > 0);
+          mmaF16(tm + CP + s * 64, dV + (c * 32 >> 4), dO + (c * 32 >> 4), IDS, c > 0);
         }
-        commitE(el, sFull + s);
-        TCB_ADD(4, tt);
+        commit(sFull + s);
       };
       issueS(0);
       for (int i = 0; i < nq; ++i) {
@@ -784,30 +466,26 @@ __global__ void __launch_bounds__(32 * tcb::WARPS, 1) bwdTc(const __grid_constan
         if (i + 1 < nq) issueS(i + 1);
         const uint32_t st = base + L::ST + (i % NS) * L::STS;
         const uint64_t dQ = sdesc(st + L::SQ, 16, 512, SW64), dO = sdesc(st + L::SO, 16, 512, SW64);
-        TCB_T0(tp);
         barWait(pFull, i & 1);
-        TCB_ADD(2, tp);
-        TCB_T0(tv);
         fenceAfter();
         const uint64_t dST = sdesc(base + L::DS + s * 16384, 16, 1024, SW128);
 #pragma unroll
         for (int kk = 0; kk < QT / 16; ++kk) {
-          mmaTsE(el, tm + CV, tm + CT + s * 32 + kk * 8, dO + (kk * 1024 >> 4), IDV, i > 0 || kk > 0);
-          mmaE(el, tm + CK, dST + (kk * 32 >> 4), dQ + (kk * 1024 >> 4), IDV, i > 0 || kk > 0);
+          mmaF16ts(tm + CV, tm + CT + s * 32 + kk * 8, dO + (kk * 1024 >> 4), IDV, i > 0 || kk > 0);
+          mmaF16(tm + CK, dST + (kk * 32 >> 4), dQ + (kk * 1024 >> 4), IDV, i > 0 || kk > 0);
         }
         if (i & 1) {
           if (i >= 3) barWait(dqFree, ((i >> 1) - 1) & 1);
           fenceAfter();
 #pragma unroll
-          for (int kk = 0; kk < KB / 16; ++kk) mmaE(el, tm + CQ, dSmn + (kk * 2048 >> 4), dKmn + (kk * 1024 >> 4), IDQ, kk > 0);
-          commitE(el, dqFull);
-          commitE(el, dsFree);       // (both dS^T regions read: by dK of tiles i - 1, i and by this dQ)
-          commitE(el, dsFree + 1);
+          for (int kk = 0; kk < KB / 16; ++kk) mmaF16(tm + CQ, dSmn + (kk * 2048 >> 4), dKmn + (kk * 1024 >> 4), IDQ, kk > 0);
+          commit(dqFull);
+          commit(dsFree);       // (both dS^T regions read: by dK of tiles i - 1, i and by this dQ)
+          commit(dsFree + 1);
         }
-        commitE(el, tFree + i % NS);
-        TCB_ADD(5, tv);
+        commit(tFree + i % NS);
       }
-      commitE(el, done);
+      commit(done);
     }
   } else if (warp >= 4 && warp < 12) {   // the softmax: a thread a key, group g a tile's queries 32 g .. 32 g + 31
     const int g = (warp - 4) >> 2;
@@ -824,13 +502,10 @@ __global__ void __launch_bounds__(32 * tcb::WARPS, 1) bwdTc(const __grid_constan
     for (int i = 0; i < nq; ++i) {
       const int s = i & 1, q0 = i * QT;
       const int ts = i % NS;
-      TCB_T0(tw);
       barWait(sFull + s, (i >> 1) & 1);
       barWait(tFull + ts, (i / NS) & 1);
       if (i >= 2) barWait(dsFree + s, ((i >> 1) - 1) & 1);
       fenceAfter();
-      TCB_ADD(0, tw);
-      TCB_T0(tc);
       const unsigned char* stg = smB + L::ST + ts * L::STS;
       const unsigned char* T = stg + L::SB + (kl >> 6) * 8192;
       // this warp's 32 queries' terms from the raw ones (a query whose every key is out takes +inf: its every p is 0)
@@ -902,7 +577,6 @@ __global__ void __launch_bounds__(32 * tcb::WARPS, 1) bwdTc(const __grid_constan
       };
       if (shortForm) tile(std::true_type{}); else tile(std::false_type{});
       stWait();
-      TCB_ADD(1, tc);
       fenceProxy();   // (dS^T, written by the generic proxy, visible to the tensor cores)
       fenceBefore();
       __syncwarp();

@@ -41,7 +41,6 @@
 #include <fstream>
 #include <future>
 #include <memory>
-#include <numeric>
 #include <optional>
 #include <random>
 #include <sstream>
@@ -745,7 +744,6 @@ int main(int argc, char** argv) {
     else if (!strcmp(argv[i], "--bf16-confidence")) bf16Confidence = true;
     else if (!strcmp(argv[i], "--mem")) MEM_REPORT = true;
     else if (!strcmp(argv[i], "--profile")) profileStep = true;   // the last step's kernels by GPU time (CUPTI, cuda/af3's profile.cuh)
-    else if (!strcmp(argv[i], "--tc-fwd")) grad::flash::TC2 = true;   // gridFwdTc2 (tcgen05) for the grid forward from 768 tokens (off: slower in a step)
     else if (!strcmp(argv[i], "--no-tc-bwd")) grad::flash::TCB = false;   // bwdBf where bwdTc (the grid backward on tcgen05) would run
     else if (!strcmp(argv[i], "--offload-pairs")) offloadPairs = true;
     else if (auto v = opt("--transition-chunk=")) transitionChunkM = atof(v);
@@ -1871,39 +1869,22 @@ int main(int argc, char** argv) {
       return all;
     };
     const auto a = grads(true), b = grads(false), c = grads(false);
-    auto rel = [](const std::vector<double>& x, const std::vector<double>& y) {
-      double num = 0, den = 0; for (size_t i = 0; i < x.size(); ++i) { num += (x[i] - y[i]) * (x[i] - y[i]); den += y[i] * y[i]; }
+    // relRMS of x against y over the tensors whose names contain `only` ("": all of them)
+    auto rel = [&](const std::vector<double>& x, const std::vector<double>& y, const char* only) {
+      double num = 0, den = 0; size_t o = 0;
+      for (auto* p : ps.all) {
+        if (p->name.find(only) != std::string::npos)
+          for (size_t i = o; i < o + p->n; ++i) { num += (x[i] - y[i]) * (x[i] - y[i]); den += y[i] * y[i]; }
+        o += p->n;
+      }
       return std::sqrt(num / std::max(den, 1e-300));
     };
-    const double e = rel(a, b), floor = rel(c, b);
-    {   // (the tensors whose gradients move most between the two bwdBf runs, and bwdTc's against bwdBf's for them)
-      std::vector<std::tuple<double, double, double, std::string>> t;
-      size_t o = 0;
-      for (auto* p : ps.all) {
-        double nf = 0, ne = 0, d = 0;
-        for (size_t i = o; i < o + p->n; ++i) { nf += (c[i] - b[i]) * (c[i] - b[i]); ne += (a[i] - b[i]) * (a[i] - b[i]); d += b[i] * b[i]; }
-        t.emplace_back(nf, std::sqrt(nf / std::max(d, 1e-300)), std::sqrt(ne / std::max(d, 1e-300)), p->name);
-        o += p->n;
-      }
-      std::sort(t.rbegin(), t.rend());
-      for (int i = 0; i < 8 && i < (int)t.size(); ++i)
-        printf("  %-60s floor %.2e  bwdTc %.2e  (share of the floor %.1f%%)\n", std::get<3>(t[i]).c_str(), std::get<1>(t[i]), std::get<2>(t[i]),
-               100 * std::get<0>(t[i]) / std::max(floor * floor * std::accumulate(b.begin(), b.end(), 0.0, [](double s, double x) { return s + x * x; }), 1e-300));
-    }
-    // ...and over the grid attentions' own tensors (pairAttention1 / 2: the first its gradients reach), against their floor
-    double gn = 0, gf = 0, gd = 0;
-    {
-      size_t o = 0;
-      for (auto* p : ps.all) {
-        if (p->name.find("pairAttention") != std::string::npos)
-          for (size_t i = o; i < o + p->n; ++i) { gn += (a[i] - b[i]) * (a[i] - b[i]); gf += (c[i] - b[i]) * (c[i] - b[i]); gd += b[i] * b[i]; }
-        o += p->n;
-      }
-    }
-    const double ge = std::sqrt(gn / std::max(gd, 1e-300)), gfl = std::sqrt(gf / std::max(gd, 1e-300));
-    printf("tcgen05 grid backward, the grid attentions' tensors: relRMS %.3e (two bwdBf runs: %.3e)\n", ge, gfl);
+    // (all of them, and the grid attentions' own - pairAttention1 / 2, the first bwdTc's gradients reach: the whole
+    // model's floor is large, float atomics' order through bf16 into near-cancelling sums)
+    const double e = rel(a, b, ""), floor = rel(c, b, ""), ge = rel(a, b, "pairAttention"), gfl = rel(c, b, "pairAttention");
     const bool ok = std::isfinite(e) && e < std::max(4 * floor, 1e-5) && std::isfinite(ge) && ge < std::max(4 * gfl, 1e-5);
-    printf("tcgen05 grid backward: every gradient against bwdBf's, relRMS %.3e (two bwdBf runs: %.3e)  %s\n", e, floor, ok ? "PASS" : "FAIL");
+    printf("tcgen05 grid backward: every gradient against bwdBf's, relRMS %.3e (two bwdBf runs: %.3e); the grid attentions' "
+           "%.3e (%.3e)  %s\n", e, floor, ge, gfl, ok ? "PASS" : "FAIL");
     grad::flash::TCB = true;
     if (!ok) return 1;
   }

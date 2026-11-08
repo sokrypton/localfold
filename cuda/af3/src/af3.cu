@@ -114,7 +114,7 @@ static int foldMain(int argc, char** argv) {
     else if (!strcmp(argv[i], "--chai-second-order")) CHAI_SECOND_ORDER = true;     // chai-lab's two calls a step
     else if (!strcmp(argv[i], "--no-flash-split")) FLASH_SPLIT = false;
     else if (!strcmp(argv[i], "--no-tc-attn")) tc5a::TC_ATTN = false;   // flash8 (mma.sync) where tcgen05 would run
-    else if (!strcmp(argv[i], "--widen-pair")) widenPair = true;        // the pair widened to f32 past the trunk on a B200 too (KEEP_PAIR16's old arm)
+    else if (!strcmp(argv[i], "--widen-pair")) widenPair = true;        // the pair widened to f32 past the trunk on a B200 too (the old arm)
     else if (!strcmp(argv[i], "--no-tc-pair")) ptc::PAIR_TC = false;    // the mma.sync pair-track kernels where tcgen05 would run
     else if (!strncmp(argv[i], "--folds=", 8)) folds = atoi(argv[i] + 8);
     else if (!strncmp(argv[i], "--steps=", 8)) steps = atoi(argv[i] + 8);
@@ -194,7 +194,13 @@ static int foldMain(int argc, char** argv) {
   const bool haveWeights = !weightsDir.empty() || !bundleDir.empty();
   bool seedGiven = false;
   for (int i = 2; i < argc; ++i) if (!strncmp(argv[i], "--seed=", 7)) seedGiven = true;
-  KEEP_PAIR16 = fast && !widenPair && ptc::PAIR_TC && ptc::ready();   // (common.cuh: the pair bf16 past the trunk on a B200)
+  // the pair kept bf16 past the trunk where the tcgen05 pair kernels run (--fast on a B200; --widen-pair the old arm): the
+  // trunk's last pair is bf16 values already, so widening it bought only the confidence head's f32 kernels (2048 tokens
+  // 13.00 -> 12.84 s a fold, pTM / pLDDT the same to 1e-3). Its three groups take their short-of-room forms together -
+  // the pair (lean.pair16), the streamed conditioning (lean.diffusion), the heads' row chunks (lean.confidence); a
+  // --lever naming one wins
+  if (fast && !widenPair && ptc::PAIR_TC && ptc::ready())
+    for (const char* g : {"lean.pair16", "lean.diffusion", "lean.confidence"}) LEVER_FORCED.emplace(g, false);
   if (af3Defaults) {
     bool setR = false, setS = false;
     for (int i = 2; i < argc; ++i) {

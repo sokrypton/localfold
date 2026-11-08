@@ -482,13 +482,12 @@ inline void usePair16(Trunk& t, bool on) {
   if (on != t.p16 || !t.pair) {
     const bool shared = mg::splitting(t.pair);     // (several GPUs: the shared pair has f32's room, and is kept)
     if (t.pair && !shared) { CK(cudaFree(t.pair)); ++MEM_GEN; }
-    if (t.prevPair) { CK(cudaFreeAsync(t.prevPair, STREAM)); ++MEM_GEN; }
+    if (t.prevPair) { CK(cudaFreeAsync(t.prevPair, STREAM)); ++MEM_GEN; t.prevPair = nullptr; }
     if (!shared) t.pair = on ? reinterpret_cast<float*>(dallocT<__nv_bfloat16>(pc)) : dalloc(pc);
-    t.prevPair = t.inPlaceRecycle ? nullptr : on ? reinterpret_cast<float*>(poolAllocT<__nv_bfloat16>(pc)) : poolAlloc(pc);
     t.p16 = on;
   }
-  // (a pair kept bf16 past the trunk - TRUNK_PAIR16 - gives prevPair back at the trunk's end, so the next fold of the
-  // same precision makes it again: memset on the null prevPair was "CUDA invalid argument" on every fold after the first)
+  // (made here whenever it is missing: a pair kept bf16 past the trunk - TRUNK_PAIR16 - gives prevPair back at the
+  // trunk's end, and memset on the null pointer was "CUDA invalid argument" on every fold after the first)
   if (!t.prevPair && !t.inPlaceRecycle)
     t.prevPair = on ? reinterpret_cast<float*>(poolAllocT<__nv_bfloat16>(pc)) : poolAlloc(pc);
   CK(cudaMemsetAsync(t.inPlaceRecycle ? t.pair : t.prevPair, 0, (sharded(t) ? heldPairs(t) * t.C : pc) * e, STREAM));
