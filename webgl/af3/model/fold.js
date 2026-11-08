@@ -67,7 +67,7 @@ import { confidenceHeadSteps, errorBinCentres, MAX_ERROR_BIN, NUM_BINS } from ".
 import { embed, RELATIVE_WIDTH, tokenIdentity } from "../trunk/embedder.js";
 import { binEdges, runTrunkSteps } from "../trunk/trunk.js";
 import { sampleOnWebGl2Steps } from "../diffusion/sampler.js";
-import { drain, drainAsync, gpuIdle } from "../../runtime/steps.js";
+import { drain, drainAsync, gpuIdle, laggedPause } from "../../runtime/steps.js";
 import {
   slotCodes, slotGeometry, templateEmbeddingSteps, uploadTemplateWeights,
   releaseTemplateWeights,
@@ -458,15 +458,22 @@ export async function foldAf3Async(execution, call) {
     next += 1;
     return true;
   };
+  // ...one slice behind the GPU rather than at its drained end (`laggedPause`); `noLaggedPause` is the old arm
+  const behind = execution.noLaggedPause ? null : laggedPause(execution.gl, compileNext);
   const pause = async () => {
     while (next < later.length && compiled(later[next])) next += 1;
     const needed = groupEnd.find((end) => end > next) ?? 0;
-    await gpuIdle(execution.gl, compileNext);
+    if (behind === null) await gpuIdle(execution.gl, compileNext);
+    else await behind();
     while (next < needed && compileNext()) {
       await new Promise((resolve) => { setTimeout(resolve, 0); });
     }
   };
-  return drainAsync(foldAf3Steps(execution, call), pause, call.signal);
+  try {
+    return await drainAsync(foldAf3Steps(execution, call), pause, call.signal);
+  } finally {
+    behind?.finish();
+  }
 }
 
 /**
