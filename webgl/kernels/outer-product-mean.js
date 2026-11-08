@@ -133,6 +133,140 @@ ${biasAfterNorm
 }`);
 
 /**
+ * `out[c][r] = x[r][c]` for an `[R][C]` tensor, columns `[c0, c0 + count)` only: the MSA's left projection as
+ * `[(i, cl)][s]`, the operand `opmOuterFirst`'s contraction over the sequences reads as its x.
+ */
+export const opmColumnsSource = (rowsR, columns, count) => sized({ R: rowsR, C: columns, COUNT: count }, `${PRELUDE}${ONE_TARGET}
+uniform sampler2D xTex;
+uniform int c0;
+
+void main() {
+  int base = linearTexel() * 4;
+  if (base >= COUNT * R) { result = vec4(0.0); return; }
+  vec4 v = vec4(0.0);
+  for (int k = 0; k < 4; ++k) {
+    int e = base + k;
+    if (e < COUNT * R) v[k] = fetch1(xTex, (e % R) * C + c0 + e / R);
+  }
+  result = v;
+}`);
+
+/**
+ * `[(i, cl)][(j, cr)]` to `[(i, j)][(cl, cr)]`: the outer products, laid as the rows the output projection reads.
+ */
+export const opmPermuteSource = (chunkRows, length, cOuter) => sized({ CI: chunkRows, L: length }, `${PRELUDE}${ONE_TARGET}
+const int C_OUTER = ${cOuter};
+const int CO4 = ${cOuter / 4};
+uniform sampler2D outerTex;
+
+void main() {
+  int texel = linearTexel();
+  if (texel >= CI * L * C_OUTER * CO4) { result = vec4(0.0); return; }
+  int cr4 = texel % CO4;
+  int rest = texel / CO4;
+  int cl = rest % C_OUTER;
+  rest /= C_OUTER;
+  int j = rest % L;
+  int i = rest / L;
+  result = fetch4(outerTex, ((i * C_OUTER + cl) * L + j) * CO4 + cr4);
+}`);
+
+/**
+ * The bias and the mask count over a chunk of rows `[i0, i0 + CI)` of `acc`, written into the whole output: rows
+ * outside the chunk come from `previousTex` (the chunks before it), or are zero for the first.
+ */
+export const opmFinishSource = (sequences, length, chunkRows, cZ, biasAfterNorm, chained) => sized({ L: length, CI: chunkRows }, `${PRELUDE}${ONE_TARGET}
+const int SEQUENCES = ${sequences};
+const int CZ4 = ${cZ / 4};
+uniform sampler2D accTex;
+uniform sampler2D maskTex;
+uniform sampler2D biasTex;
+${chained ? "uniform sampler2D previousTex;" : ""}
+uniform int i0;
+${biasAfterNorm ? "" : "uniform float normalizationEpsilon;"}
+
+void main() {
+  int texel = linearTexel();
+  if (texel >= L * L * CZ4) { result = vec4(0.0); return; }
+  int z4 = texel % CZ4;
+  int pair = texel / CZ4;
+  int j = pair % L;
+  int i = pair / L;
+  if (i < i0 || i >= i0 + CI) { result = ${chained ? "fetch4(previousTex, texel)" : "vec4(0.0)"}; return; }
+  float count = 0.0;
+  for (int s = 0; s < SEQUENCES; ++s) {
+    count += fetch1(maskTex, s * L + i) * fetch1(maskTex, s * L + j);
+  }
+  vec4 sum = fetch4(accTex, ((i - i0) * L + j) * CZ4 + z4);
+${biasAfterNorm
+    ? "  result = sum / max(count, 1.0) + fetch4(biasTex, z4);"
+    : "  result = (sum + fetch4(biasTex, z4)) / (normalizationEpsilon + count);"}
+}`);
+
+/** The most floats one chunk's outer products may hold: 128 MiB of float32. */
+const OPM_OUTER_CHUNK_FLOATS = 32 * 2 ** 20;
+
+/**
+ * The outer product mean contracting the SEQUENCES first, as webgpu's `useOuterFirstContraction` does:
+ *
+ *     O[(i, cl)][(j, cr)] = sum_s left[s][i][cl] * right[s][j][cr]        one GEMM, K = sequences
+ *     acc[(i, j)][z]      = O[i][j][cl][cr] @ outputWeight                 one GEMM, K = cOuter^2
+ *
+ * 🔴 THE TWO-DRAW FORM IT REPLACES WAS THE SLOWEST KERNEL IN AN AF3 FOLD AND THE ONE THAT DID NOT FIT. Its
+ * `intermediate[s][i][cr][z]` is sequences x length x cOuter x cZ floats - 247 M at 1024 rows and 59 residues, past a
+ * texture - and its contraction ran at ~14 GFLOP/s: 8 calls priced at 1.2 s of a 7.6 s fold by `--skip=^opm`. Here
+ * both halves are the blocked projection, and the largest tensor is length^2 x cOuter^2, which does not grow with the
+ * alignment; past `OPM_OUTER_CHUNK_FLOATS` it goes a chunk of `i` at a time.
+ */
+function outerProductFirst(execution, { left, right, mask, w, sequences, length, cOuter, cZ,
+  normalizationEpsilon, biasAfterNorm }) {
+  const columns = length * cOuter;
+  const perI = length * cOuter * cOuter;
+  const chunk = Math.max(1, Math.min(length, Math.floor(OPM_OUTER_CHUNK_FLOATS / perI)));
+  let output = null;
+  for (let i0 = 0; i0 < length; i0 += chunk) {
+    const ci = Math.min(chunk, length - i0);
+    const leftT = execution.allocate(ci * cOuter * sequences, "opm.left-t");
+    execution.dispatch({
+      source: opmColumnsSource(sequences, columns, ci * cOuter),
+      output: leftT, inputs: { xTex: left }, ints: { c0: i0 * cOuter },
+      label: `opm.columns:${sequences}x${ci * cOuter}`,
+    });
+    const outer = linear(execution, {
+      x: leftT, weight: right, rows: ci * cOuter, inChannels: sequences, outChannels: columns,
+      weightLayout: "in-major",
+    });
+    execution.release(leftT);
+    const rowsX = execution.allocate(ci * length * cOuter * cOuter, "opm.outer");
+    execution.dispatch({
+      source: opmPermuteSource(ci, length, cOuter),
+      output: rowsX, inputs: { outerTex: outer },
+      label: `opm.permute:${ci}x${length}x${cOuter}`,
+    });
+    execution.release(outer);
+    const acc = linear(execution, {
+      x: rowsX, weight: w.outputWeight, rows: ci * length, inChannels: cOuter * cOuter, outChannels: cZ,
+      weightLayout: "in-major",
+    });
+    execution.release(rowsX);
+    const next = execution.allocate(length * length * cZ, "opm.output");
+    const chained = output !== null;
+    execution.dispatch({
+      source: opmFinishSource(sequences, length, ci, cZ, biasAfterNorm, chained),
+      output: next,
+      inputs: { accTex: acc, maskTex: mask, biasTex: w.outputBias, ...(chained ? { previousTex: output } : {}) },
+      ints: { i0 },
+      ...(biasAfterNorm ? {} : { floats: { normalizationEpsilon } }),
+      label: `opm.finish:${sequences}x${length}x${cZ}`,
+    });
+    execution.release(acc);
+    if (chained) execution.release(output);
+    output = next;
+  }
+  return output;
+}
+
+/**
  * @param {import("../runtime/execution.js").Execution} execution
  */
 export function uploadOuterProductMeanWeights(execution, weights) {
@@ -204,6 +338,13 @@ export function outerProductMean(execution, call) {
   const left = side(w.leftWeight, w.leftBias, "left");
   const right = side(w.rightWeight, w.rightBias, "right");
   execution.release(normalised);
+  if (!execution.noOpmOuterFirst) {
+    const output = outerProductFirst(execution, { left, right, mask, w, sequences, length, cOuter, cZ,
+      normalizationEpsilon, biasAfterNorm });
+    execution.release(left);
+    execution.release(right);
+    return output;
+  }
 
   const intermediate = execution.allocate(rows * cOuter * cZ, "opm.intermediate");
   execution.dispatch({

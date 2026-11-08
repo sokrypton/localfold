@@ -341,7 +341,14 @@ export const CACHE_RESIDENT_WEIGHT_FLOATS = 65536;
 
 export const blockedApplies = (rows, inChannels, outChannels, weightLayout = "out-major",
   aspect = true) => {
-  if (!(rows >= 64 && inChannels % 4 === 0 && outChannels % 4 === 0)) return false;
+  if (!(inChannels % 4 === 0 && outChannels % 4 === 0)) return false;
+  // 🔴 BELOW 64 ROWS ONLY A WIDE [in][out] SHAPE BLOCKS. AF3's denoiser runs on its TOKENS - 59 rows at 59 residues -
+  // so this used to send every one of its projections to the one-texel kernel, which reads the weight once per row.
+  // `bench-webgl-linear.js --layout=in-major` on an M2: 59 x 768 -> 3072 is 2.34 ms one-texel, 1.23 ms at 64 rows
+  // blocked (2x), while the square 768 -> 768 and 384 -> 768 lose to the repack (0.51 against 0.80, 0.30 against 0.68).
+  // The aspect rule below decides that from 64 rows up already; this lets it decide from 8.
+  const wideShape = Math.max(inChannels, outChannels) >= 4 * Math.min(inChannels, outChannels);
+  if (rows < 64 && !(rows >= 8 && weightLayout === "in-major" && aspect && wideShape)) return false;
   if (weightLayout === "out-major") return true;
   if (!aspect) return inChannels * outChannels >= CACHE_RESIDENT_WEIGHT_FLOATS;
   // 🔴 AND FOR `[in][out]` THE OLD `in * out` THRESHOLD IS WRONG, BECAUSE IT WAS

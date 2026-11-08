@@ -75,6 +75,7 @@ import {
 import { uploadPairformerBlockWeights, releasePairformerBlockWeights }
   from "../trunk/pairformer-block.js";
 import { uploadEmbedderWeights, releaseEmbedderWeights } from "../trunk/embedder.js";
+import { COND_BATCH_KEYS, condBatchWeights, fuseQkvgWeights } from "../diffusion/transformer.js";
 import { uploadMsaBlockWeights, releaseMsaBlockWeights } from "../trunk/msa-block.js";
 import { uploadConditioningWeights, releaseConditioningWeights }
   from "../diffusion/atom-conditioning.js";
@@ -231,10 +232,31 @@ export function* uploadAf3WeightsSteps(execution, weights) {
   if (hostTransformer !== undefined && hostTransformer !== null) {
     const label = "w.af3.diffusion.transformer";
     diffusion.transformer = { ...uploadTree({ ...hostTransformer, superBlocks: undefined }, label), superBlocks: [] };
+    // Every block's conditioning projections batched into two weights (`condBatchWeights`), taken off the blocks -
+    // only where every super-block is full, since a block's index in them is `superBlock * perSuper + inner`.
+    const perSuper = hostTransformer.blocksPerSuperBlock;
+    const full = hostTransformer.superBlocks.every((group) => group.blocks.length === perSuper);
+    const batched = full
+      ? condBatchWeights(hostTransformer.superBlocks.flatMap((group) => group.blocks), hostTransformer.channels)
+      : null;
+    if (batched !== null) {
+      diffusion.transformer.condBatch = uploadTree({
+        scaleShiftWeight: batched.scaleShiftWeight, scaleShiftBias: batched.scaleShiftBias,
+        gateWeight: batched.gateWeight, gateBias: batched.gateBias,
+      }, `${label}.condBatch`);
+      yield piece;
+    }
     for (const [index, group] of hostTransformer.superBlocks.entries()) {
       const uploadedGroup = { ...uploadTree({ ...group, blocks: undefined }, `${label}.superBlocks.${index}`), blocks: [] };
       for (const [inner, block] of group.blocks.entries()) {
-        uploadedGroup.blocks.push(uploadTree(block, `${label}.superBlocks.${index}.blocks.${inner}`));
+        // ...its four attention projections as one wide weight (`fuseQkvgWeights`), in place of the four
+        const fused = fuseQkvgWeights(block);
+        let host = fused === null ? block : {
+          ...block, qProjection: undefined, kProjection: undefined, vProjection: undefined, gatingQuery: undefined,
+          qBias: undefined, qkvgProjection: fused.weight, qkvgBias: fused.bias,
+        };
+        if (batched !== null) host = { ...host, ...Object.fromEntries(COND_BATCH_KEYS.map((key) => [key, undefined])) };
+        uploadedGroup.blocks.push(uploadTree(host, `${label}.superBlocks.${index}.blocks.${inner}`));
         yield piece;
       }
       diffusion.transformer.superBlocks.push(uploadedGroup);

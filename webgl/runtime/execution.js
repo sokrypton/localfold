@@ -320,6 +320,22 @@ export class Execution {
     /** Issue no draws at all; see the comment at the draw loop. */
     this.skipDraws = options.skipDraws ?? false;
     /**
+     * Issue no draws for the dispatches whose label matches: `skipDraws` for one family.
+     *
+     * 🔴 THE ATTRIBUTION ARM THAT HIDDEN-SURFACE REMOVAL CANNOT FOOL. `doubleLabels` prices a family by drawing it
+     * twice, and on a tile-based GPU the first of two identical draws into one target is discarded before it is
+     * shaded - so doubling reads as free. Removing a family's draws cannot be discarded: the fold's wall shrinks by
+     * that family's draw time (its GPU work and its render pass). The answer is garbage; it is a timing probe only.
+     *
+     * @type {RegExp | null}
+     */
+    this.skipLabels = options.skipLabels ?? null;
+    /**
+     * The control arm for the outer product mean contracting the sequences first (`outerProductFirst` in
+     * kernels/outer-product-mean.js): the two-draw form through `intermediate[s][i][cr][z]`, as before.
+     */
+    this.noOpmOuterFirst = options.noOpmOuterFirst ?? false;
+    /**
      * The control arm for the transposed incoming contraction
      * (`webgl/kernels/triangle-contract.js`): read the column directly, as this
      * backend did before. Bit-identical, so this prices a LAYOUT and nothing
@@ -1082,7 +1098,7 @@ export class Execution {
     // and the arm that decides is the fold with NO draws at all: whatever is
     // left is everything this backend does APART from drawing. The answer is a
     // fold of garbage, so it is a timing probe only.
-    const passes = this.skipDraws ? 0
+    const passes = this.skipDraws || (this.skipLabels !== null && this.skipLabels.test(label)) ? 0
       : this.doubleLabels !== null && this.doubleLabels.test(label) ? 2 : 1;
     for (let pass = 0; pass < passes; pass += 1) {
     for (let row = 0; row < output.height; row += this.maxBandRows) {
