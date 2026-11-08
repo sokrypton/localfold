@@ -106,7 +106,14 @@ static int foldMain(int argc, char** argv) {
     else if (!strcmp(argv[i], "--no-tri-lt")) TRI_LT_TILE = false;
     else if (!strcmp(argv[i], "--stages")) STAGES = true;
     else if (!strncmp(argv[i], "--repeat=", 9)) repeat = atoi(argv[i] + 9);
-    else if (!strncmp(argv[i], "--msa=", 6)) msaCap = atoi(argv[i] + 6);
+    else if (!strncmp(argv[i], "--msa=", 6)) {          // the trunk's MSA rows at most (the query among them)
+      // (atoi read --msa=none as 0 rows, and the first draw indexed an empty row list: a segfault, no message)
+      char* end = nullptr; const long v = strtol(argv[i] + 6, &end, 10);
+      if (end == argv[i] + 6 || *end || v < 1 || v > INT_MAX) {
+        fprintf(stderr, "--msa=%s: the trunk's MSA rows at most, a positive count (the query is one)\n", argv[i] + 6); return 1;
+      }
+      msaCap = (int)v;
+    }
     else if (!strncmp(argv[i], "--msa-draw=", 11)) {     // which rows a pass reads: pass (AF3's), once, prefix
       MSA_DRAW = argv[i] + 11;
       if (MSA_DRAW != "pass" && MSA_DRAW != "once" && MSA_DRAW != "prefix") { fprintf(stderr, "--msa-draw=%s: not pass, once or prefix\n", MSA_DRAW.c_str()); return 1; }
