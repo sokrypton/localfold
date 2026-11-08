@@ -39,7 +39,7 @@ import { isAbortError, throwIfAborted } from "../webgpu/runtime/abort.js";
 import { GpuMemoryBudgetError, setMemoryBudget }
   from "../webgpu/runtime/device-memory.js";
 import { AF3_COUNTS, af3SequenceProblem, alphaCarbons, fittedPdb, foldAf3,
-  loadAf3Weights, toPoints, warmAf3Pipelines } from "./af3-model.js";
+  loadAf3Weights, preloadWebGl2Weights, toPoints, warmAf3Pipelines } from "./af3-model.js";
 import { actualSteps, ESMFOLD2_COUNTS, ESMFOLD2_SAMPLER_MODE, esmfold2StepsFor, languageModelRunner,
   loadEsmfold2Weights } from "./esmfold2-model.js";
 import { SAMPLER_PRESETS, foldEsmfold2 } from "../webgpu/esmfold2/fold.js";
@@ -1316,6 +1316,14 @@ function startModelPreload(family, signal) {
   // properly itself. Attaching a handler marks it handled; the original still
   // throws where it is awaited.
   load.then(() => modelProgress(null), () => modelProgress(null));
+  // 🔴 AND ON A BROWSER WITHOUT WebGPU THE UPLOAD STARTS WHEN THE DOWNLOAD LANDS, not when the fold asks: the search is
+  // still running then, with the GPU idle, and on Safari 16.3 the WebGL2 upload is ~1.6 s of the first fold
+  // (preloadWebGl2Weights). The fold awaits the same memoised upload. A failure here is the fold's to report.
+  if (AF3_FAMILIES.includes(family) && WEBGL2_FAMILIES.includes(family)) {
+    Promise.all([load, foldBackend()])
+      .then(([weights, backend]) => (backend === "webgl2" ? preloadWebGl2Weights(weights) : undefined))
+      .catch(() => {});
+  }
   return load;
 }
 
