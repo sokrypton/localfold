@@ -11,7 +11,8 @@
  * this is the rule, walked over every file af2.cu includes.
  *
  * CAPTURE_MU is process-wide ON PURPOSE: a graph capture on one thread and a device-wide sync on another must exclude
- * each other. Constants, device symbols and functions are not state.
+ * each other. SMEM_ATTR_MU likewise: a kernel's shared-memory attribute is the process's, so raising it (smemAttr in
+ * cuda/af3/src/common.cuh) is one critical section over every thread. Constants, device symbols and functions are not state.
  */
 import { strict as assert } from "node:assert";
 import { it } from "node:test";
@@ -29,7 +30,7 @@ function reachable(entry) {
   }
   return [...out];
 }
-const PROCESS_WIDE = new Set(["CAPTURE_MU"]);
+const PROCESS_WIDE = new Set(["CAPTURE_MU", "SMEM_ATTR_MU"]);
 // the declaration's type and name, with template arguments taken out (their `const` and `()` are not the variable's)
 const flatten = (text) => { let t = text, prev; do { prev = t; t = t.replace(/<[^<>]*>/g, "<>"); } while (t !== prev); return t; };
 

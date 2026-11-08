@@ -1872,7 +1872,19 @@ template <class K> void smemAttrNamed(K kernel, size_t bytes, const char* name) 
             name, bytes, smemLimit());
     fflush(stderr); _exit(1);    // (_exit: a background upload thread may still be running)
   }
-  CK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)bytes));
+  // 🔴 RAISED, NEVER LOWERED: the attribute is the KERNEL's, process-wide, and two launchers may share one instantiation
+  // with different shared memory, each setting it once behind its own static flag - cuda/af2's lnQkvg64 and cuda/af3's
+  // gridInRaw<64> both launch gridInK<64, 256, 8, float, 64>. Set to the last asker's, a warm-up without a template (the
+  // extra stack's lnQkvg64 first) then a fold with one (the template stack's grid attention lowering it) left every
+  // lnQkvg64 launch failing with "invalid argument", unchecked: the extra stack's q/k/v/gate all zeros, the MSA drifting
+  // until block 3 overflowed f16 - pTM 0.0000 and a cuBLAS error on 5CAJ with a searched alignment and template through
+  // the worker (whose server always warms), since 2f2d1eb2. The lock: --multi's threads share the attribute too
+  static std::mutex SMEM_ATTR_MU;
+  std::lock_guard<std::mutex> hold(SMEM_ATTR_MU);
+  cudaFuncAttributes now{};
+  CK(cudaFuncGetAttributes(&now, (const void*)kernel));
+  if ((size_t)now.maxDynamicSharedSizeBytes < bytes)
+    CK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)bytes));
 }
 #define smemAttr(kernel, bytes) smemAttrNamed(kernel, (size_t)(bytes), #kernel)
 __global__ void toHalfK(const float* __restrict__ x, half* __restrict__ y, size_t n) {
