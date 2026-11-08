@@ -121,8 +121,12 @@ export function applyRope(values, rows, heads, headDim, base = 10000) {
   return values;
 }
 
-/** Full self-attention. q/k/v are (rows, heads, headDim); returns (rows, heads*headDim). */
-export function esmcAttention(query, key, value, rows, heads, headDim) {
+/**
+ * Full self-attention. q/k/v are (rows, heads, headDim); returns (rows, heads*headDim). `sequenceId` (one a row): a complex
+ * is one packed run and a chain attends only to itself, as webgpu/esmc/tower.js masks it - without it this reference let
+ * a complex's chains attend to each other, so a check of a complex compared against the wrong thing (PR #7, lhallee).
+ */
+export function esmcAttention(query, key, value, rows, heads, headDim, sequenceId = undefined) {
   const out = new Float32Array(rows * heads * headDim);
   const scale = 1 / Math.sqrt(headDim);
   const weights = new Float32Array(rows);
@@ -131,6 +135,10 @@ export function esmcAttention(query, key, value, rows, heads, headDim) {
       const qBase = (i * heads + head) * headDim;
       let largest = -Infinity;
       for (let j = 0; j < rows; j += 1) {
+        if (sequenceId !== undefined && sequenceId[i] !== sequenceId[j]) {
+          weights[j] = -Infinity;
+          continue;
+        }
         const kBase = (j * heads + head) * headDim;
         let dot = 0;
         for (let d = 0; d < headDim; d += 1) dot += query[qBase + d] * key[kBase + d];
@@ -187,7 +195,7 @@ export function esmcBlock(x, rows, weights, dims, layer) {
   applyRope(query, rows, heads, headDim);
   applyRope(key, rows, heads, headDim);
 
-  const context = esmcAttention(query, key, value, rows, heads, headDim);
+  const context = esmcAttention(query, key, value, rows, heads, headDim, dims.sequenceId);
   const attention = linear(context, rows, model, at("attn_out/weights"), model);
 
   const afterAttention = new Float32Array(rows * model);
