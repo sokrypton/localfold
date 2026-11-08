@@ -51,6 +51,7 @@ inline FILE* processErr() { return stderr; }
 #include <thread>
 #include <cerrno>
 #include "templates.cuh"
+#include "../../featurise/ptm.h"   // (the pTM family's one definition: AF3's chain-level scores, every port's)
 #include "structure.cuh"
 #include "../../af3/src/profile.cuh"
 #include "../../featurise/af2_weights.h"   // the weight walk: the page's bundle read as published, no map
@@ -119,6 +120,30 @@ __global__ void contactPairsK(const float* logits, size_t pairs, float* out) {
   }
   if (lane == 0) out[r] = (float)(near / s);
 }
+// AlphaFold 3's INTERFACE TM term (cuda/featurise/ptm.h), what the chain-level scores are reduced from - the page's
+// AF2 reads the same (shared/heads/tm-score.js): each pair's softmax against 1 / (1 + c^2 / d0^2) at d0 of its chain
+// pair's tokens (the chain's own on the diagonal, the two chains' summed off it). logits [rows, 64] the pairs r0 + r of
+// the L x L; chainOf the dense chain index (ptm::Layout), d0s [nc][nc]
+__global__ void tmInterfaceK(const float* logits, size_t rows, size_t r0, int L, const int* chainOf, int nc,
+                             const float* d0s, double* out) {
+  size_t r = (size_t)blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+  int lane = threadIdx.x & 31;
+  if (r >= rows) return;
+  const size_t p = r0 + r;
+  const float d0 = d0s[chainOf[p / L] * nc + chainOf[p % L]];
+  const float* l = logits + r * 64;
+  float l0 = l[lane], l1 = l[lane + 32], mx = fmaxf(l0, l1);
+  for (int o = 16; o; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(~0u, mx, o));
+  double s = 0, t = 0;
+  for (int k = 0; k < 2; ++k) {
+    int b = lane + k * 32;
+    float c = b < 63 ? b * 0.5f + 0.25f : 62 * 0.5f + 0.25f + 0.5f;
+    double e = expf((k ? l1 : l0) - mx);
+    s += e; t += e / (1 + (c / d0) * (c / d0));
+  }
+  for (int o = 16; o; o >>= 1) { s += __shfl_xor_sync(~0u, s, o); t += __shfl_xor_sync(~0u, t, o); }
+  if (lane == 0) out[p] = t / s;
+}
 // the predicted TM-score from the per-pair terms: the best row's mean (over the other chains' columns for the interface)
 static float tmFromTerms(const std::vector<double>& tm, int L, const std::vector<int>& asym, bool interface) {
   float best = 0;
@@ -178,7 +203,7 @@ static inline std::vector<float> contactsChunked(const float* pair, int L);   //
 void writeConfidences(const std::string& pdb, const float* pair, int L, const float* mask37, const std::vector<int>& aatype,
                              const std::vector<int>& asym, const std::vector<int>& ri, int firstAsym,
                              const std::vector<float>& plddt, const std::vector<float>& pae, float ptm, float iptm,
-                             double mean) {
+                             double mean, const ptm::Chains& cs, const ptm::Layout& chainLayout) {
   std::string stem = pdb.size() > 4 && pdb.substr(pdb.size() - 4) == ".pdb" ? pdb.substr(0, pdb.size() - 4) : pdb;
   size_t pairs = (size_t)L * L;
   std::vector<float> centres(64);
@@ -219,8 +244,42 @@ void writeConfidences(const std::string& pdb, const float* pair, int L, const fl
   for (int i = 0; i < L; ++i) fprintf(f, "%s%d", i ? ", " : "", ri[i] + 1);
   fprintf(f, "]}\n");
   fclose(f);
+  // the chain-level fields under AlphaFold 3's names and definitions (cuda/featurise/ptm.h), as cuda/af3 and cuda/ef2
+  // write them and the page's AF2 archive does: chain_ptm, chain_iptm (a complex), chain_pair_iptm, chain_pair_pae_min
+  // and chain_plddt, each in chain order
+  const int nc = chainLayout.nc();
+  auto num = [](FILE* g, double v) { if (std::isfinite(v)) fprintf(g, "%.4f", v); else fprintf(g, "null"); };
+  auto list = [&](FILE* g, const char* key, const std::vector<double>& v) {
+    fprintf(g, "\"%s\": [", key);
+    for (int a = 0; a < (int)v.size(); ++a) { if (a) fprintf(g, ", "); num(g, v[a]); }
+    fprintf(g, "], ");
+  };
+  auto square = [&](FILE* g, const char* key, const std::vector<double>& m) {
+    fprintf(g, "\"%s\": [", key);
+    for (int a = 0; a < nc; ++a) {
+      fprintf(g, "%s[", a ? ", " : "");
+      for (int b = 0; b < nc; ++b) { if (b) fprintf(g, ", "); num(g, m[(size_t)a * nc + b]); }
+      fprintf(g, "]");
+    }
+    fprintf(g, "], ");
+  };
+  std::vector<double> paeMin((size_t)nc * nc, INFINITY), chainPlddt(nc, 0), count(nc, 0);
+  for (int i = 0; i < L; ++i) {
+    chainPlddt[chainLayout.of[i]] += plddt[i]; count[chainLayout.of[i]] += 1;
+    for (int j = 0; j < L; ++j) {
+      double& m = paeMin[(size_t)chainLayout.of[i] * nc + chainLayout.of[j]];
+      m = std::min(m, (double)pae[(size_t)i * L + j]);
+    }
+  }
+  for (int a = 0; a < nc; ++a) chainPlddt[a] /= count[a];
   f = fopen((stem + "_summary_confidences.json").c_str(), "w");
-  fprintf(f, "{\"ptm\": %.4f, \"iptm\": %s, \"mean_plddt\": %.2f}\n", ptm,
+  fprintf(f, "{");
+  list(f, "chain_ptm", cs.ptm);
+  if (nc > 1) list(f, "chain_iptm", cs.iptm);
+  square(f, "chain_pair_iptm", cs.pair);
+  square(f, "chain_pair_pae_min", paeMin);
+  list(f, "chain_plddt", chainPlddt);
+  fprintf(f, "\"ptm\": %.4f, \"iptm\": %s, \"mean_plddt\": %.2f}\n", ptm,
           std::isfinite(iptm) ? std::to_string(iptm).c_str() : "null", mean);
   fclose(f);
 }
@@ -709,20 +768,39 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
   bool chains = false; for (int i = 1; i < L; ++i) chains |= asym[i] != asym[0];
   std::vector<float> pae;          // the expected PAE a pair
   float ptm, iptm;
+  ptm::Chains chainScores;   // chain_ptm, chain_iptm, chain_pair_iptm: AF3's, off its interface term (every AF2 token a residue: every one an anchor)
+  const ptm::Layout chainLayout = ptm::layout(asym.data(), nullptr, L);
   {
     float d0 = 1.24f * std::cbrt((float)std::max(L, 19) - 15.f) - 1.8f;
     float* pe = scratch<float>("head.paeE", pairs); double* tt = scratch<double>("head.tmT", pairs);
+    const int nc = chainLayout.nc();
+    std::vector<float> d0s((size_t)nc * nc);
+    for (int a = 0; a < nc; ++a)
+      for (int b = 0; b < nc; ++b) d0s[(size_t)a * nc + b] = (float)ptm::d0(a == b ? chainLayout.count[a] : chainLayout.count[a] + chainLayout.count[b]);
+    int* chainOfD = scratch<int>("head.chainOf", L); float* d0sD = scratch<float>("head.chainD0", d0s.size());
+    double* ti = scratch<double>("head.tmI", pairs);
+    CK(cudaMemcpyAsync(chainOfD, chainLayout.of.data(), L * 4, cudaMemcpyHostToDevice, STREAM));
+    CK(cudaMemcpyAsync(d0sD, d0s.data(), d0s.size() * 4, cudaMemcpyHostToDevice, STREAM));
     // (on a card short of room the last pass's logits a chunk at a time, each chunk's terms on the device too: they went
     // to the host whole and were softmaxed there, 4.9 s of 9GOC's 1,702-residue fold)
     if (AF2_TIGHT) paeChunked(t.pair, L, [&](const float* chunk, size_t r0, size_t r) {
       paeTmPairsK<<<(unsigned)((r + 7) / 8), 256, 0, STREAM>>>(chunk, r, d0, pe + r0, tt + r0);
+      tmInterfaceK<<<(unsigned)((r + 7) / 8), 256, 0, STREAM>>>(chunk, r, r0, L, chainOfD, nc, d0sD, ti);
     });
-    else paeTmPairsK<<<(unsigned)((pairs + 7) / 8), 256, 0, STREAM>>>(paeLogits, pairs, d0, pe, tt);
+    else {
+      paeTmPairsK<<<(unsigned)((pairs + 7) / 8), 256, 0, STREAM>>>(paeLogits, pairs, d0, pe, tt);
+      tmInterfaceK<<<(unsigned)((pairs + 7) / 8), 256, 0, STREAM>>>(paeLogits, pairs, 0, L, chainOfD, nc, d0sD, ti);
+    }
     pae = download(pe, pairs);
     std::vector<double> tm(pairs);
     CK(cudaMemcpy(tm.data(), tt, pairs * 8, cudaMemcpyDeviceToHost));
     ptm = tmFromTerms(tm, L, asym, false);
     iptm = chains ? tmFromTerms(tm, L, asym, true) : NAN;
+    CK(cudaMemcpy(tm.data(), ti, pairs * 8, cudaMemcpyDeviceToHost));
+    std::vector<double> rows((size_t)L * nc, 0.0);
+    for (int i = 0; i < L; ++i)
+      for (int j = 0; j < L; ++j) rows[(size_t)i * nc + chainLayout.of[j]] += tm[(size_t)i * L + j];
+    chainScores = ptm::reduceRows(rows.data(), L, chainLayout, nullptr);
   }
   if (RAW_CONFIDENCES) {
     if (AF2_TIGHT || paeLogits == nullptr) {
@@ -770,7 +848,8 @@ static int foldInput(const std::string& oracle, const std::string& out, int recy
   }
   fprintf(f, "END\n"); fclose(f);
   // (the last pass's pair as f32: the recycled copy where the pair itself is bf16)
-  writeConfidences(out, AF2_P16 ? prevPair : t.pair, L, mask37, aatype, asym, ri, firstAsym, plddt, pae, ptm, iptm, mean);
+  writeConfidences(out, AF2_P16 ? prevPair : t.pair, L, mask37, aatype, asym, ri, firstAsym, plddt, pae, ptm, iptm, mean,
+                   chainScores, chainLayout);
   printf("mean pLDDT %.2f  pTM %.4f", mean, ptm);
   if (chains) printf("  ipTM %.4f", iptm);
   printf("  -> %s  (%d passes, %.1f ms)\n", out.c_str(), ran, foldMs);

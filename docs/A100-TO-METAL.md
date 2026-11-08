@@ -41,7 +41,9 @@ chain fields are AF3's.
 | page ESMFold2 (WebGPU) | chain fields NEW (it had pTM / ipTM only) | barnase-barstar folds, the pair ipTM = ipTM as it must |
 | **metal/af3** | done, **NEVER BUILT** | host compile of `frames.h` + `ptm.h` only |
 | **metal/ef2** | chain fields NEW, **NEVER BUILT** | nothing |
-| page AF2 (WebGL2), cuda/af2, metal/af2 | no chain fields at all | - |
+| cuda/af2 | done (`chain_*` on the interface term, every token an anchor) | the page's `af3TmScores` on the same PAE logits: 1BRS, 6MRR, a 3-chain multimer, worst 4.4e-5 |
+| python/localfold/worker.py | passes every native port's chain fields to the page | they were dropped: no Colab archive had any; `test:native` now requires them |
+| page AF2 (WebGL2), metal/af2 | no chain fields at all | - |
 
 ## Asks, in order
 

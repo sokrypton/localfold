@@ -614,6 +614,11 @@ def main():
             problems.append(f"pLDDT {c.get('meanPlddt')} / pTM {c.get('ptm')}")
         if "status" not in kinds or kinds.count("progress") < 2:
             problems.append(f"events {kinds}")
+        # the chain-level scores the archive's summary is written from (web/fold-archive.js): a chain pTM for each
+        # chain and a score for every pair. The worker dropped them, so no native fold's archive had any
+        chain_count = len(set((result.get("tokens") or {}).get("chainIds") or []))
+        if not c.get("chainPtm") or (chain_count > 1 and len(c.get("chainPairIptm") or {}) < 1):
+            problems.append(f"chain scores {c.get('chainPtm')} / {c.get('chainPairIptm')} for {chain_count} chains")
         # what each port streams (--frames, through the binaries' AsyncTap), the bar moving with it: the
         # AF3 lineage its sampler and each trunk pass's contact map, AF2 each pass (structure + scores, and
         # contacts where the bundle carries the distogram head), ESMFold2 its trunk's contacts and sampler

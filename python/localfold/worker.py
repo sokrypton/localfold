@@ -1106,6 +1106,7 @@ class Worker:
         }
         if summary.get("iptm") is not None:
             confidence["iptm"] = summary["iptm"]
+        confidence.update(chain_scores(summary))
         mean = confidence["meanPlddt"]
         if port == "bioemu2":
             # 🔴 NO CONFIDENCE HEAD: the B-factors are zero, and the page says so rather than show a pLDDT of 0. Every
@@ -1134,6 +1135,23 @@ class Worker:
             "status": f"{family} on {NATIVE_NAME} ({self.device}) · done in {seconds:.1f} s · pLDDT {mean:.1f}",
             "_raw": raw,
         }
+
+
+def chain_scores(summary):
+    """The native summary's chain-level scores (AlphaFold 3's chain_ptm, chain_iptm, chain_pair_iptm: lists in chain
+    order, cuda/featurise/ptm.h) as the page's fold result keys them - by chain, 1 the first, and "a|b" (a < b) for a
+    pair - which is what web/fold-archive.js writes the archive's summary from. They were dropped here, so a native
+    fold's archive had none for any model. A null score (a chain with no anchor: an ion) is absent, as the page's own."""
+    out = {}
+    for key, name in (("chain_ptm", "chainPtm"), ("chain_iptm", "chainIptm")):
+        values = summary.get(key)
+        if values is not None:
+            out[name] = {str(a + 1): v for a, v in enumerate(values) if v is not None}
+    pairs = summary.get("chain_pair_iptm")
+    if pairs is not None:
+        out["chainPairIptm"] = {f"{a + 1}|{b + 1}": pairs[a][b] for a in range(len(pairs))
+                                for b in range(a + 1, len(pairs)) if pairs[a][b] is not None}
+    return out
 
 
 def main():
