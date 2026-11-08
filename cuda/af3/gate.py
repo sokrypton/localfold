@@ -1,7 +1,8 @@
 """The native port's regression gate: every AF3-lineage model folds 6MRR from its sequence, plus
 AlphaFold 3 on 5CAJ with its crystal as a template and on the barnase-barstar complex, each
 scored against the deposited structure. The signature of every case (CA RMSD, mean pLDDT, pTM)
-is held to gate-baseline.json; a fold that moves past the tolerance fails the gate.
+is held to gate-baseline.json; a fold that moves past the tolerance fails the gate. The `served` arm folds every
+case again on one resident server a model, as the worker does, and holds each to its own cold fold (cuda/served.py).
 
     python3 cuda/af3/gate.py                    # check against the baseline
     python3 cuda/af3/gate.py --write            # re-record it (after a deliberate change)
@@ -136,6 +137,33 @@ def served_seeds():
             subprocess.run([fold, "--stop"], capture_output=True)
 
 
+def served_arm():
+    """The cases again on one resident server a model, as python/localfold/worker.py runs it (--fold --fast), each
+    held to its own cold fold above (cuda/served.py) - a model's server folds everything of that model in the gate's
+    order, then its first case again."""
+    sys.path.insert(0, os.path.dirname(HERE))
+    from served import served, split, weights
+    by_model = {}
+    for case in cases():
+        by_model.setdefault(case[1], []).append(case)
+    problems = []
+    for model, group in by_model.items():
+        dirs = weights(model)
+        server = [os.path.join(HERE, "localfold-af3"), "-", f"--bundle={dirs[0]}", f"--family={model}",
+                  *([f"--esm-bundle={dirs[1]}"] if len(dirs) > 1 else []), "--fold", "--fast"]
+        jobs = []
+        for name, _, inputs, fold, *_ in group:
+            featurise, more = split(inputs)
+            jobs.append((name, [os.path.join(REPO, "cuda", "featurise", "af3-featurise"), "{dir}", "--no-weights",
+                                f"--family={model}", *featurise], more + list(fold), os.path.join(TMP, name + ".pdb")))
+        print(f"served on one {model} server:", flush=True)
+        problems += served("af3", server, jobs, TMP)
+    for p in problems:
+        print(f"{'served':22s} FAILED: {p}", flush=True)
+    print(f"{'served':22s} " + ("ok" if not problems else f"{len(problems)} problem(s)"), flush=True)
+    return len(problems)
+
+
 def main():
     write = "--write" in sys.argv
     only = next((a.split("=", 1)[1].split(",") for a in sys.argv if a.startswith("--only=")), None)
@@ -170,6 +198,8 @@ def main():
         problem = served_seeds()
         print(f"{'served seeds':22s} " + ("ok" if problem is None else "FAILED: " + problem), flush=True)
         failed += problem is not None
+    if not only or "served" in only:
+        failed += served_arm()
     if write:
         json.dump(base, open(BASELINE, "w"), indent=1, sort_keys=True)
         print(f"wrote {BASELINE}")

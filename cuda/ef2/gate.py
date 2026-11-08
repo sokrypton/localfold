@@ -1,4 +1,4 @@
-"""The native ESMFold2's regression gate, two arms:
+"""The native ESMFold2's regression gate, three arms:
 
   folds    - real targets through cuda/ef2/fold (--fast), scored against the deposited structure
              (cuda/af3/score.py: CA RMSD after superposition, the chain check). Each case's
@@ -8,6 +8,8 @@
              run in float32 (--atom-f32) and in --fast: the last trunk pass, the first denoiser call
              and the per-atom pLDDT held to it - 1e-5 in float32 (they are 1e-7..1e-6), 5e-3 in --fast.
              The data directories are gitignored and built by hand (export_input.mjs + oracle.py).
+  served   - the fold cases again on one resident server, as the worker runs it (cuda/served.py), each held to
+             its own cold fold: what a fresh process cannot see (state one job leaves the next).
 
     python3 cuda/ef2/gate.py                 # both arms against the baseline
     python3 cuda/ef2/gate.py --write         # re-record the fold baseline
@@ -133,6 +135,35 @@ def run_oracle(data, fast):
     return got, None
 
 
+def served_arm():
+    """The fold cases again on one resident ef2-fast-600m server, as python/localfold/worker.py runs it (--fast, the
+    --warm=96,800 warm-up), each held to its own cold fold above (cuda/served.py). Not the two-rank case: the worker
+    serves one GPU."""
+    sys.path.insert(0, os.path.dirname(HERE))
+    from served import served, split, weights
+    trunk, tower = weights("ef2-fast-600m")
+    server = [os.path.join(HERE, "localfold-ef2"), "-", f"--fold-bundle={trunk}", f"--esmc-bundle={tower}", "--fast",
+              "--warm=96,800"]
+    jobs = []
+    for case in fold_cases():
+        name, inputs = case[0], case[1]
+        if "--gpus=2" in inputs:
+            continue
+        featurise, fold = split(inputs)
+        # the standalone's (and the worker's) floor for per-atom tokens: 64 steps (standalone.cpp, ef2)
+        atomised = any(f.startswith(("--ligands=", "--smiles=", "--modify=")) for f in inputs) or any(
+            f.startswith("--job=") and any(k in open(f[6:]).read() for k in ('"ligand"', '"modifications"'))
+            for f in inputs)
+        jobs.append((name, [os.path.join(REPO, "cuda", "featurise", "ef2-featurise"), "{dir}", f"--fold-bundle={trunk}",
+                            *featurise], fold + (["--steps=64"] if atomised else []), os.path.join(TMP, name + ".pdb")))
+    print("served on one ef2-fast-600m server:", flush=True)
+    problems = served("ef2", server, jobs, TMP)
+    for p in problems:
+        print(f"{'served':24s} FAILED: {p}", flush=True)
+    print(f"{'served':24s} " + ("ok" if not problems else f"{len(problems)} problem(s)"), flush=True)
+    return len(problems)
+
+
 def main():
     write = "--write" in sys.argv
     only = next((a.split("=", 1)[1].split(",") for a in sys.argv if a.startswith("--only=")), None)
@@ -175,6 +206,8 @@ def main():
                 failed += not ok
                 print(f"{name + ' ' + arm:24s} " + "  ".join(f"{k.split(',')[0]} {v:.1e}" for k, v in got.items())
                       + f"  (bound {ORACLE_BOUND[arm]:.0e})  {'ok' if ok else 'FAILED'}", flush=True)
+    if not only or "served" in only:
+        failed += served_arm()
     if write:
         json.dump(base, open(BASELINE, "w"), indent=1, sort_keys=True)
         print(f"wrote {BASELINE}")

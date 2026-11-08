@@ -1,4 +1,4 @@
-"""The native BioEmu2's regression gate, two arms:
+"""The native BioEmu2's regression gate, three arms:
 
   oracles  - every tools/fixtures/bioemu2 job that has a dump in oracle-dumps/bioemu2-<name>.json
              (tools/oracle/dump_bioemu2.py: af3-any-model's own port, stage by stage) folded with --oracle on the
@@ -10,6 +10,8 @@
              to gate-baseline.json: 6MRR's CA RMSD to its crystal (each sample's, the mean and the best), the
              bond geometry of a ligand, an atomised phosphoserine and two nucleic chains (cuda/af3/bonds.mjs: rms
              against the CCD's ideals), the equilibrium mode and a propagation chain from a sample.
+  served   - the fold cases again on one resident server, as the worker runs it (cuda/served.py), each held to
+             its own cold fold: what a fresh process cannot see (state one job leaves the next).
 
     python3 cuda/bioemu2/gate.py                 # both arms against the baseline
     python3 cuda/bioemu2/gate.py --write         # re-record the fold baseline
@@ -199,12 +201,34 @@ def main():
             failed += report(name, got, base, write)
         if not only or "folds" in only or "propagation" in only:
             failed += report("6mrr-propagation", propagation(weights), base, write)
+    if not only or "served" in only:
+        failed += served_arm(weights)
     if write:
         json.dump(base, open(BASELINE, "w"), indent=1, sort_keys=True)
         print(f"wrote {BASELINE}")
     if failed:
         print(f"{failed} case(s) failed")
         sys.exit(1)
+
+
+def served_arm(weights):
+    """The fold cases again on one resident server, as python/localfold/worker.py runs it (--fast), each held to its own
+    cold fold above - its first sample (cuda/served.py; bed641ad, the step conditioning recognised by its buffer's
+    address, was this class)."""
+    sys.path.insert(0, os.path.dirname(HERE))
+    from served import served, split, weights as fetched
+    server = [os.path.join(HERE, "localfold-bioemu2"), "-", f"--weights={weights or fetched('bioemu2')[0]}", "--fast"]
+    jobs = []
+    for name, (inputs, _, _) in fold_cases(weights).items():
+        featurise, fold = split(inputs)
+        jobs.append((name, [os.path.join(REPO, "cuda", "featurise", "bioemu2-featurise"), "{dir}", *featurise],
+                     fold + ["--samples=5", "--steps=200", "--seed=0"], os.path.join(TMP, name + ".pdb")))
+    print("served on one bioemu2 server:", flush=True)
+    problems = served("bioemu2", server, jobs, TMP)
+    for p in problems:
+        print(f"{'served':24s} FAILED: {p}", flush=True)
+    print(f"{'served':24s} " + ("ok" if not problems else f"{len(problems)} problem(s)"), flush=True)
+    return len(problems)
 
 
 def report(name, got, base, write):

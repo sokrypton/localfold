@@ -1229,6 +1229,9 @@ the pair stack (argon-ptx), BioEmu2 recognising its cached step conditioning by 
 next job is recomputed into the same address), and "All 5"'s first job (191197b3). Never key a cross-job cache on an
 address; forget it at the start of a job. `npm run test:native` folds a job AGAIN on a warm server after other jobs
 (AF3, AF2, ESMFold2, BioEmu2) and requires the same structure - add such a case with any new resident state.
+🔴 **AND EVERY cuda/*/gate.py HAS A `served` ARM NOW** (cuda/served.py): each case again on one resident server, as the
+worker starts it (its --warm), in the gate's order and the first again at the end, held atom for atom to its own cold
+fold - all bit-identical where nothing is carried. Put 1a3b313b's bug back and AF2's arm fails at `5caj-msa`.
 🔴 **AND A KERNEL'S ATTRIBUTE IS THE PROCESS'S, NOT ITS LAUNCHER'S** (1a3b313b): AF2's `lnQkvg64` and AF3's
 `gridInRaw<64>` launch one `gridInK` instantiation with different shared memory, each setting it once behind its own
 static flag, so a no-template warm-up then a templated fold LOWERED it under the first - every launch after failed

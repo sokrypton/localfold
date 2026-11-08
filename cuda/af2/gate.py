@@ -1,4 +1,4 @@
-"""The native AlphaFold 2's regression gate, two arms:
+"""The native AlphaFold 2's regression gate, three arms:
 
   folds    - real targets through cuda/af2/fold (--fast), scored against the deposited structure
              (cuda/af3/score.py: CA RMSD after superposition, the chain check). Each case's
@@ -8,6 +8,8 @@
              relRMS 1e-4 in float32 (it is 1e-7..2e-5), 1e-2 in --fast (1e-4..1.5e-3). The data
              directories are gitignored and built by hand (export_input.mjs + oracle.py), so this arm
              checks what this machine has.
+  served   - the fold cases again on one resident server a model, as the worker runs it (cuda/served.py), each
+             held to its own cold fold: what a fresh process cannot see (state one job leaves the next).
 
     python3 cuda/af2/gate.py                 # both arms against the baseline
     python3 cuda/af2/gate.py --write         # re-record the fold baseline
@@ -158,12 +160,44 @@ def main():
                 failed += not ok
                 print(f"{name + ' ' + arm:24s} atoms {atoms:.2e} (bound {atomBound:.0e})  pair {pair:.2e} (bound "
                       f"{pairBound:.0e})  {passes} pass{'es' if passes > 1 else ''}  {'ok' if ok else 'FAILED'}", flush=True)
+    if not only or "served" in only:
+        failed += served_arm()
     if write:
         json.dump(base, open(BASELINE, "w"), indent=1, sort_keys=True)
         print(f"wrote {BASELINE}")
     if failed:
         print(f"{failed} case(s) failed")
         sys.exit(1)
+
+
+def served_arm():
+    """The fold cases again on one resident server a model, as python/localfold/worker.py runs it (--fast, the
+    --warm=64,8,8,0 warm-up), each held to its own cold fold above (cuda/served.py). This is the arm that sees a
+    warm-up then a template fold (1a3b313b: pTM 0.0000)."""
+    sys.path.insert(0, os.path.dirname(HERE))
+    from served import served, split, weights
+    by_model = {}
+    for name, inputs, _ in fold_cases():
+        model = next((f.split("=", 1)[1] for f in inputs if f.startswith("--model=")), "model_1_ptm")
+        by_model.setdefault(model, []).append((name, inputs))
+    problems = []
+    for model, cases in by_model.items():
+        dirs = weights(model)
+        server = [os.path.join(HERE, "localfold-af2"), "-", f"--bundle={dirs[0]}", "--fast",
+                  *([f"--delta={dirs[1]}"] if len(dirs) > 1 else []), "--warm=64,8,8,0"]
+        jobs = []
+        for name, inputs in cases:
+            featurise, fold = split(inputs)
+            # (--recycles both reads; --seed is the alignment's, the featuriser's alone: standalone.cpp's af2)
+            jobs.append((name, [os.path.join(REPO, "cuda", "featurise", "af2-featurise"), "{dir}",
+                                f"--bundle={dirs[0]}", *featurise],
+                         [f for f in fold if not f.startswith("--seed=")], os.path.join(TMP, name + ".pdb")))
+        print(f"served on one {model} server:", flush=True)
+        problems += served("af2", server, jobs, TMP)
+    for p in problems:
+        print(f"{'served':24s} FAILED: {p}", flush=True)
+    print(f"{'served':24s} " + ("ok" if not problems else f"{len(problems)} problem(s)"), flush=True)
+    return len(problems)
 
 
 def read_model(data):
