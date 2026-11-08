@@ -135,6 +135,8 @@ export class Storage {
      */
     this.pool = new Map();
     this.pooledBytes = 0;
+    /** @type {Map<string, number>} each pooled shape's bytes a texture, for eviction */
+    this.poolEntryBytes = new Map();
     this.reuses = 0;
     /**
      * Keep a released texture for the next tensor of its rectangle.
@@ -153,6 +155,15 @@ export class Storage {
      * this one may want it. `--pool` turns it on.
      */
     this.pooling = options.pooling ?? false;
+    /**
+     * The most a pool may hold, in bytes; a release past it deletes its texture as an unpooled one does.
+     *
+     * 🔴 AN UNBOUNDED POOL IS WHAT MADE POOLING A LOSS ON bioemu2 (1656 -> 2158 MiB): a pooled texture is held
+     * rather than freed, so the pool grows to every shape the fold ever released. AF3's churn is the SAME few
+     * shapes every block and every denoiser step, so a bounded pool keeps the reuse and drops the growth.
+     * `Infinity` is the old unbounded pool.
+     */
+    this.poolLimitBytes = options.poolLimitBytes ?? Infinity;
     /**
      * Reuse a pooled texture only for an allocation whose LABEL matches.
      *
@@ -281,6 +292,8 @@ export class Storage {
       texture = free.pop();
       this.pooledBytes -= bytes;
       this.reuses += 1;
+      this.pool.delete(key);
+      this.pool.set(key, free);
     } else {
       const createdAt = performance.now();
       texture = gl.createTexture();
@@ -444,6 +457,8 @@ export class Storage {
       texture = free.pop();
       this.pooledBytes -= bytes;
       this.reuses += 1;
+      this.pool.delete(key);
+      this.pool.set(key, free);
       gl.bindTexture(gl.TEXTURE_2D, texture);
     } else {
       texture = gl.createTexture();
@@ -568,14 +583,32 @@ export class Storage {
     if (!this.live.delete(tensor)) return;
     if (tensor.texture === null) return;
     this.bytes -= tensor.bytes;
-    if (!this.pooling) {
+    if (!this.pooling || tensor.bytes > this.poolLimitBytes) {
       this.gl.deleteTexture(tensor.texture);
       return;
     }
     const key = poolKey(tensor.width, tensor.height, tensorFormat(tensor));
-    const free = this.pool.get(key);
-    if (free === undefined) this.pool.set(key, [tensor.texture]);
-    else free.push(tensor.texture);
+    // ...and past the limit the LEAST RECENTLY USED shapes go first (the Map's order: a take or a put moves its
+    // shape to the end), so the shapes a fold recycles every block stay pooled and a one-off does not squat.
+    for (const [oldKey, textures] of this.pool) {
+      if (this.pooledBytes + tensor.bytes <= this.poolLimitBytes) break;
+      if (oldKey === key) continue;
+      const each = this.poolEntryBytes.get(oldKey);
+      while (textures.length > 0 && this.pooledBytes + tensor.bytes > this.poolLimitBytes) {
+        this.gl.deleteTexture(textures.pop());
+        this.pooledBytes -= each;
+      }
+      if (textures.length === 0) this.pool.delete(oldKey);
+    }
+    if (this.pooledBytes + tensor.bytes > this.poolLimitBytes) {
+      this.gl.deleteTexture(tensor.texture);
+      return;
+    }
+    const free = this.pool.get(key) ?? [];
+    this.pool.delete(key);
+    this.pool.set(key, free);
+    free.push(tensor.texture);
+    this.poolEntryBytes.set(key, tensor.bytes);
     this.pooledBytes += tensor.bytes;
   }
 

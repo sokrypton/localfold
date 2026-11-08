@@ -37,6 +37,18 @@ export function webgl2FoldAvailable() {
   }
 }
 
+/**
+ * The AF3 fold's texture pool: on, and bounded, with the least recently used shapes evicted first
+ * (`Storage.poolLimitBytes`).
+ *
+ * 🔴 THIS FOLD IS NOT WAITING ON ARITHMETIC. Drawing every 59-row diffusion projection TWICE (`--double`, 8,714 extra
+ * draws) moved a 59-residue fold by nothing, and creating a fresh texture for every tensor did: pooled, 9.9 s -> 7.7 s
+ * at 59 residues and 79.8 -> 65.4 s at 200, bit-identical. Unbounded that cost 1225 -> 1807 MiB of peak at 200, the
+ * growth that made pooling a loss on bioemu2; bounded at 128 MiB it is 68.2 s at 1244 MiB (Chrome, M2,
+ * tools/gpu/fold-af3-webgl.js). `--no-pool` on that tool is the control arm.
+ */
+export const AF3_POOL_LIMIT_BYTES = 128 * 2 ** 20;
+
 // One context for the page, and the last family's weights on it: a second family's upload
 // replaces the first's (each is ~800 MB as halves), the same family's is kept.
 let execution = null;
@@ -44,9 +56,10 @@ let resident = null; // { weights, ready: Promise<uploaded> }
 
 /** The weights on the GPU, uploaded a module at a time with the thread let go in between. */
 function uploadedFor(weights) {
-  // The configuration fold-af3-webgl.js gates against the WGSL fold: half weights and activations.
+  // The configuration fold-af3-webgl.js gates against the WGSL fold: half weights and activations, a bounded pool.
   execution ??= new Execution(createWebGL2Context(),
-    { halfWeights: true, halfActivations: true, int5Weights: true });
+    { halfWeights: true, halfActivations: true, int5Weights: true,
+      pooling: true, poolLimitBytes: AF3_POOL_LIMIT_BYTES });
   if (resident?.weights !== weights) {
     const previous = resident;
     resident = {
@@ -58,6 +71,40 @@ function uploadedFor(weights) {
     };
   }
   return resident.ready;
+}
+
+/**
+ * The fold's alignment as `foldAf3` takes it: each pass's rows, as webgpu/af3/fold.js `msaRowsOf` draws them - up
+ * to num_msa (1024) of the pool, a fresh draw every pass; the pool's first rows for a batch read from a dump (no
+ * `numMsa`) and for chai-1; protenix's own count, padded with masked rows up to a power of two. An alignment that
+ * fits whole is the same every pass, so it is one set of rows uploaded once rather than a function of the pass.
+ *
+ * @param {object} batch the featurised batch
+ * @param {object} dialect `weights.trunk.dialect`
+ * @param {{seed?: number, numMsa?: number, msaDraw?: string}} options
+ */
+export function foldMsa(batch, dialect, options = {}) {
+  const { tokens } = batch;
+  const pool = batch.msa.length / tokens;
+  const cap = Math.min(options.numMsa ?? 1024, batch.numMsa ?? Infinity);
+  const drawMode = batch.numMsa === undefined || dialect.chaiMsaFeatures === true
+    ? "prefix" : (options.msaDraw ?? "pass");
+  const native = dialect.msaNativeSample === true && batch.numMsa !== undefined
+    && options.msaDraw !== "prefix";
+  const drawSeed = options.seed ?? 20260831;
+  const msaOfPass = (pass) => {
+    const chosen = native ? msaNativeRows(drawSeed, options.msaDraw === "once" ? 0 : pass, pool)
+      : msaDrawRows(drawMode, drawSeed, pass, pool, cap);
+    const rows = native ? Math.min(pool, 2 ** Math.ceil(Math.log2(chosen.length))) : chosen.length;
+    const widen = (array, pad) => {
+      const out = new Float32Array(rows * tokens).fill(pad);
+      out.set(gatherRows(array, tokens, chosen));
+      return out;
+    };
+    return { codes: widen(batch.msa, 21), deletions: widen(batch.deletionMatrix, 0),
+             mask: widen(batch.msaMask, 0), sequences: rows };
+  };
+  return !native && pool <= cap ? msaOfPass(0) : msaOfPass;
 }
 
 /**
@@ -75,34 +122,10 @@ export async function foldBatchWebGl2(batch, weights, options) {
     if (options[key] !== undefined) throw new Error(`the WebGL2 fold does not take \`${key}\``);
   }
   const { tokens, dense } = batch;
-  // Each pass's rows, as webgpu/af3/fold.js `msaRowsOf` draws them: up to num_msa (1024) of the pool, a fresh
-  // draw every pass; the pool's first rows for a batch read from a dump (no `numMsa`) and for chai-1; and
-  // protenix's own count, padded with masked rows up to a power of two.
-  const pool = batch.msa.length / tokens;
-  const cap = Math.min(options.numMsa ?? 1024, batch.numMsa ?? Infinity);
-  const drawMode = batch.numMsa === undefined || weights.trunk.dialect.chaiMsaFeatures === true
-    ? "prefix" : (options.msaDraw ?? "pass");
-  const native = weights.trunk.dialect.msaNativeSample === true && batch.numMsa !== undefined
-    && options.msaDraw !== "prefix";
-  const drawSeed = options.seed ?? 20260831;
-  const msaOfPass = (pass) => {
-    const chosen = native ? msaNativeRows(drawSeed, options.msaDraw === "once" ? 0 : pass, pool)
-      : msaDrawRows(drawMode, drawSeed, pass, pool, cap);
-    const rows = native ? Math.min(pool, 2 ** Math.ceil(Math.log2(chosen.length))) : chosen.length;
-    const widen = (array, pad) => {
-      const out = new Float32Array(rows * tokens).fill(pad);
-      out.set(gatherRows(array, tokens, chosen));
-      return out;
-    };
-    return { codes: widen(batch.msa, 21), deletions: widen(batch.deletionMatrix, 0),
-             mask: widen(batch.msaMask, 0), sequences: rows };
-  };
-  // An alignment that fits whole is the same every pass, so it is uploaded once, as before.
-  const whole = !native && pool <= cap;
   const uploaded = await uploadedFor(weights);
   const fold = await foldAf3Async(execution, {
     batch, weights: uploaded, hostWeights: weights,
-    msa: whole ? msaOfPass(0) : msaOfPass,
+    msa: foldMsa(batch, weights.trunk.dialect, options),
     recycles: options.recycles ?? 0, steps: options.steps, seed: options.seed ?? 42,
     templateSlots: options.templateSlots,
     signal: options.signal,

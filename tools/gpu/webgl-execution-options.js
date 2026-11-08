@@ -6,7 +6,7 @@
  * turns - which is how `linearTallTile` came to be priced at zero on the WGSL
  * side for a configuration nobody had swept.
  *
- *   --pool                `Storage` keeps a released texture for the next
+ *   --pool / --no-pool    `Storage` keeps a released texture for the next
  *                         tensor of its rectangle instead of deleting it. OFF
  *                         by default because it is a measured loss (see
  *                         `Storage.pooling`), and it is also the arm that says
@@ -230,7 +230,12 @@ export function webglExecutionOptions(args, defaults = {}) {
   const pattern = (name) => (option(args, name, null) === null
     ? null : new RegExp(option(args, name, "")));
   return {
-    pooling: flag(args, "pool"),
+    // A driver default too (the AF3 fold pools, bounded - fold-batch.js AF3_POOL_LIMIT_BYTES); `--no-pool` is its
+    // control arm and `--pool` turns it on elsewhere
+    pooling: flag(args, "pool") || ((defaults.pooling ?? false) && !flag(args, "no-pool")),
+    // `--pool-mib=<n>` caps the pool (Storage.poolLimitBytes); the driver's cap, else unbounded, without it
+    poolLimitBytes: option(args, "pool-mib", null) !== null ? Number(option(args, "pool-mib", "0")) * 2 ** 20
+      : defaults.poolLimitBytes ?? Infinity,
     halfWeights: !flag(args, "no-half-weights"),
     halfActivations: !flag(args, "no-half-x"),
     // 🔴 A DRIVER DEFAULT, BECAUSE THE MEASUREMENT DIFFERS BY MODEL. See
