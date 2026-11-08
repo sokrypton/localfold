@@ -1,4 +1,5 @@
 import { parseA3m } from "./a3m.js";
+import { gunzip } from "./inflate.js";
 import { AF3_FAMILIES, MODEL_BUNDLES, graphFamily } from "../bundles/manifests/index.js";
 import { concatenateA3mBlocks, cropA3mRows, mergeChainA3ms, deduplicateUnpairedAgainstPaired, mergeRowAlignedChainA3ms, mergeUnpairedChainA3ms, MULTIMER_MSA_CROP, nonGappedRows }
   from "./chains.js";
@@ -298,9 +299,20 @@ export function extractMmseqs2A3m(tarBytes, useEnvironmental = true) {
   return `${blocks.join("\n")}\n`;
 }
 
+/**
+ * The ColabFold result, unzipped.
+ *
+ * 🔴 A FALLBACK, NOT A FAILURE. This threw "This browser cannot decompress the
+ * MMseqs2 result" on every Safari before 16.4, which is where
+ * `DecompressionStream` landed - so an MSA search on an older Mac ended with
+ * nothing the reader could do, while this repository's own DEFLATE sat in the
+ * tree for the design page. shared/input/inflate.js returns the same bytes;
+ * test/inflate-fallback.test.js folds the search both ways and compares.
+ */
 async function decompressGzip(archive) {
-  if (typeof DecompressionStream === "undefined") throw new Error("This browser cannot decompress the MMseqs2 result");
-  const stream = new Blob([archive]).stream().pipeThrough(new DecompressionStream("gzip"));
+  const bytes = archive instanceof Uint8Array ? archive : new Uint8Array(archive);
+  if (typeof DecompressionStream === "undefined") return gunzip(bytes);
+  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("gzip"));
   return new Uint8Array(await new Response(stream).arrayBuffer());
 }
 

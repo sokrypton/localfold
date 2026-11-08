@@ -1,11 +1,24 @@
 /**
- * gzip (RFC 1952) around DEFLATE (RFC 1951), decompressed synchronously.
+ * gzip (RFC 1952) and raw DEFLATE (RFC 1951), decompressed synchronously.
  *
- * Upstream reads a condition spec's `input:` as plain, gzip or Zstandard, and RCSB serves
- * `.cif.gz`. The page's structure path is synchronous end to end, which rules out the browser's
- * `DecompressionStream`, so this is the format's own decoder: stored, fixed-Huffman and
- * dynamic-Huffman blocks, and every member of a multi-member file. tools/check-rfd4p-load.py loads
- * gzipped inputs through it against atomworks.
+ * 🔴 THIS IS WHAT A BROWSER WITH NO `DecompressionStream` READS WITH, AND THERE
+ * ARE THREE SUCH DOORS ON THE PAGE. The API landed in Safari 16.4, so on an
+ * older Mac every one of them threw: an MMseqs2 result is a `.tar.gz`
+ * (shared/input/mmseqs2-api.js), a fold archive's members are raw DEFLATE
+ * (web/zip.js), and a saved session is gzip (web/fold-session.js). A reader
+ * there was told "This browser cannot decompress the MMseqs2 result", which
+ * reads as the page not working rather than as one missing API - and the
+ * decoder was already in the tree, serving the design page.
+ *
+ * 🔴 AND FOR THE DESIGN PAGE IT IS NOT A FALLBACK. Upstream reads a condition
+ * spec's `input:` as plain, gzip or Zstandard, and RCSB serves `.cif.gz`; that
+ * structure path is synchronous end to end, which rules out
+ * `DecompressionStream` whether or not the browser has it.
+ * tools/check-rfd4p-load.py loads gzipped inputs through it against atomworks,
+ * and test/inflate-fallback.test.js holds it to the browser's own decoder.
+ *
+ * Stored, fixed-Huffman and dynamic-Huffman blocks, and every member of a
+ * multi-member gzip file.
  */
 
 const LENGTH_BASE = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115,
@@ -36,7 +49,7 @@ class Bits {
   read(n) {
     let v = 0;
     for (let i = 0; i < n; i += 1) {
-      if (this.pos >= this.bytes.length) throw new Error('gzip: truncated stream');
+      if (this.pos >= this.bytes.length) throw new Error('deflate: truncated stream');
       v |= ((this.bytes[this.pos] >> this.bit) & 1) << i;
       if (++this.bit === 8) { this.bit = 0; this.pos += 1; }
     }
@@ -54,7 +67,7 @@ class Bits {
       first = (first + count) << 1;
       code <<= 1;
     }
-    throw new Error('gzip: bad Huffman code');
+    throw new Error('deflate: bad Huffman code');
   }
   align() { if (this.bit) { this.bit = 0; this.pos += 1; } }
 }
@@ -77,7 +90,7 @@ function inflateInto(bits, out) {
       const { bytes } = bits;
       const len = bytes[bits.pos] | (bytes[bits.pos + 1] << 8);
       bits.pos += 4;
-      if (bits.pos + len > bytes.length) throw new Error('gzip: truncated stored block');
+      if (bits.pos + len > bytes.length) throw new Error('deflate: truncated stored block');
       for (let i = 0; i < len; i += 1) out.push(bytes[bits.pos + i]);
       bits.pos += len;
     } else if (type === 1 || type === 2) {
@@ -109,11 +122,11 @@ function inflateInto(bits, out) {
         const len = LENGTH_BASE[li] + bits.read(LENGTH_EXTRA[li]);
         const di = bits.symbol(dist);
         const d = DIST_BASE[di] + bits.read(DIST_EXTRA[di]);
-        if (d > out.n) throw new Error('gzip: distance past the start');
+        if (d > out.n) throw new Error('deflate: distance past the start');
         for (let i = 0; i < len; i += 1) out.push(out.buf[out.n - d]);
       }
     } else {
-      throw new Error('gzip: invalid block type');
+      throw new Error('deflate: invalid block type');
     }
     if (last) return;
   }
@@ -140,5 +153,16 @@ export function gunzip(bytes) {
     bits.align();
     pos = bits.pos + 8;   // CRC32 and size
   }
+  return out.buf.subarray(0, out.n);
+}
+
+/**
+ * One raw DEFLATE stream, as a ZIP member holds it - no gzip or zlib wrapper.
+ *
+ * `DecompressionStream("deflate-raw")`'s answer, for a browser without it.
+ */
+export function inflateRaw(bytes) {
+  const out = new Output();
+  inflateInto(new Bits(bytes, 0), out);
   return out.buf.subarray(0, out.n);
 }

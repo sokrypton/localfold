@@ -27,6 +27,8 @@
  * page genuinely cannot do is survive a reload.
  */
 
+import { gunzip } from "../shared/input/inflate.js";
+
 const DB_NAME = "localfold-session";
 const DB_VERSION = 1;
 const STORE = "session";
@@ -270,6 +272,13 @@ async function unpack(stored) {
   if (stored === undefined || stored === null) return undefined;
   if (!(stored instanceof Uint8Array)) return stored;
   try {
+    // ...and a browser without DecompressionStream still reads one written by a
+    // browser that had it, through shared/input/inflate.js. It writes its own
+    // sessions as plain objects (the pack side above), so without this a reader
+    // on an older Safari could restore a session saved anywhere but here.
+    if (typeof DecompressionStream === "undefined") {
+      return JSON.parse(new TextDecoder().decode(gunzip(stored)));
+    }
     const stream = new Blob([stored]).stream()
       .pipeThrough(new DecompressionStream("gzip"));
     return JSON.parse(await new Response(stream).text());

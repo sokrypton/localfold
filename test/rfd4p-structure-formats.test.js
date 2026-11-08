@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { gzipSync } from "node:zlib";
 import { describe, expect, it } from "./harness.js";
-import { gunzip } from "../shared/rfd4p/pipeline/inflate.js";
+import { gunzip } from "../shared/input/inflate.js";
 import { parseCifToAtomArray } from "../shared/rfd4p/pipeline/cif.js";
 import { decompress } from "../shared/rfd4p/vendor/fzstd.js";
 

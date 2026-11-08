@@ -1,6 +1,6 @@
 // Zstandard (and gzip) helpers for `.cif.zst` / `.cif.gz` inputs, on top of the vendored fzstd decoder.
 import { decompress, Decompress, ZstdErrorCode } from '../vendor/fzstd.js';
-import { gunzip, isGzipBytes } from './inflate.js';
+import { gunzip, isGzipBytes } from '../../input/inflate.js';
 
 export { decompress, Decompress, ZstdErrorCode };
 

@@ -272,6 +272,14 @@ def main():
                         help="hide navigator.gpu from the page: the WebGL2 fallback's arm")
     parser.add_argument("--no-gpu-at-all", action="store_true",
                         help="hide navigator.gpu AND webgl2: the browser that can fold with neither")
+    # 🔴 THE OTHER THING AN OLDER SAFARI DOES NOT HAVE, AND A READER FOUND IT.
+    # `CompressionStream`/`DecompressionStream` landed in Safari 16.4, and before
+    # that an MSA search ended in "This browser cannot decompress the MMseqs2
+    # result" - so this deletes both globals before any page script, which is
+    # the state the page branches on, and the search must still come back.
+    parser.add_argument("--no-compression-streams", action="store_true",
+                        help="hide CompressionStream/DecompressionStream: an"
+                             " older Safari, which reads with our own DEFLATE")
     parser.add_argument("--keep-profile", action="store_true",
                         help="reuse the Chrome profile instead of wiping it, so"
                              " the HTTP cache and the SHADER cache survive - the"
@@ -448,6 +456,10 @@ def main():
     proc, ws = cdp.launch(DBG, "/tmp/_cdp_fold_profile", keep=args.keep_profile)
     try:
         ws.call("Page.enable")
+        if args.no_compression_streams:
+            ws.call("Page.addScriptToEvaluateOnNewDocument",
+                    source="delete globalThis.CompressionStream;"
+                           "delete globalThis.DecompressionStream;")
         if args.no_webgpu or args.no_gpu_at_all:
             # before any page script, so the page's own first look finds nothing
             hide = "delete Object.getPrototypeOf(navigator).gpu; delete navigator.gpu;"

@@ -4455,3 +4455,51 @@ stereo the CCD's coordinates define, our conformer matching the SMILES every tim
 heme in the 180-degree-flipped orientation in 5 of 5 seeds (symmetry-aware 0.19 -> 6.27 A, the iron in place), and
 Boltz-2 from one sequence in 4 of 5; biotin and Protenix-2 are unaffected, and atom ORDER changed nothing anywhere. A
 map carrying names was 2.1 MB but still rebuilt conformers and charges; the dictionary itself changes nothing.
+
+## 🔴 An older Safari could not decompress anything, and three doors threw (2026-11-08)
+
+Reported by a reader on an old Mac: **"This browser cannot decompress the MMseqs2
+result"**. `CompressionStream` and `DecompressionStream` landed in Safari 16.4,
+and before that the page had **three** paths that needed one and none that could
+do without:
+
+| door | what it reads | was |
+|---|---|---|
+| `shared/input/mmseqs2-api.js` | the ColabFold result, a `.tar.gz` | threw the reader's sentence |
+| `web/zip.js` | a dropped fold archive's DEFLATE members | threw "this browser cannot read a compressed archive" |
+| `web/fold-session.js` | a saved session, gzip | returned `undefined`, so the offer row simply never appeared |
+
+🔴 **AND THE DECODER WAS ALREADY IN THE TREE.** The design page reads `.cif.gz`
+inputs through a hand-written DEFLATE, and there it is not a fallback at all -
+that structure path is synchronous end to end, which rules out
+`DecompressionStream` whether the browser has it or not. It was sitting under
+`shared/rfd4p/`, the design model's own pipeline, where nothing on the fold path
+could sensibly import it - and `shared/rfd4p/` is one of the trees the live
+site's build leaves out, so importing it from there would have fixed this
+nowhere. It is `shared/input/inflate.js` now, with an `inflateRaw` for a ZIP
+member beside the `gunzip` that was already there: one decoder, four consumers.
+(`cuda/rfd4p/README.md` still calls it `pipeline/inflate.js`, one directory
+along; left alone because another agent owns that tree.)
+
+🔴 **THE WRITE SIDE HAD FALLEN BACK ALL ALONG AND THE READ SIDE HAD NOT**, which
+is why this was invisible from inside such a browser: `writeZip` writes STORED
+members without `CompressionStream` and the session packs as a plain object, so
+that browser's own archives and its own sessions read back. What it could not
+read was anything written anywhere else - which is the entire point of the
+upload box.
+
+Measured, in Chrome with both globals deleted before any page script
+(`tools/fold-in-page.py --no-compression-streams`, new): the search completes
+(`MSA search · complete`, `4 MSA rows`) and AlphaFold 3 folds 58 residues to
+pLDDT 73.0. With the fallback reverted, the same run ends in **the reader's own
+sentence** - `the fold failed: This browser cannot decompress the MMseqs2
+result`.
+
+🔴 **AND THE BAR IS THE PLATFORM'S OWN ANSWER, NOT A PLAUSIBLE ONE.**
+`test/inflate-fallback.test.js` deletes `DecompressionStream`, asserts the delete
+took (or every arm compares the native path with itself), and holds our decoder
+to the byte: gzip at four levels, raw DEFLATE including an empty and a
+single-byte member, a whole search through `generateMmseqs2Msa` with no
+`decompress` stub, and an archive written WITH the API and read without it.
+Watched failing three ways - each of the two fallbacks reverted in turn, and
+`inflateRaw` started one byte in.
