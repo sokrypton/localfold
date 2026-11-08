@@ -270,6 +270,8 @@ def main():
     # built without it, and that is the distinction to keep in mind when reading a result.
     parser.add_argument("--no-webgpu", action="store_true",
                         help="hide navigator.gpu from the page: the WebGL2 fallback's arm")
+    parser.add_argument("--no-gpu-at-all", action="store_true",
+                        help="hide navigator.gpu AND webgl2: the browser that can fold with neither")
     parser.add_argument("--keep-profile", action="store_true",
                         help="reuse the Chrome profile instead of wiping it, so"
                              " the HTTP cache and the SHADER cache survive - the"
@@ -446,10 +448,16 @@ def main():
     proc, ws = cdp.launch(DBG, "/tmp/_cdp_fold_profile", keep=args.keep_profile)
     try:
         ws.call("Page.enable")
-        if args.no_webgpu:
+        if args.no_webgpu or args.no_gpu_at_all:
             # before any page script, so the page's own first look finds nothing
-            ws.call("Page.addScriptToEvaluateOnNewDocument",
-                    source="delete Object.getPrototypeOf(navigator).gpu; delete navigator.gpu;")
+            hide = "delete Object.getPrototypeOf(navigator).gpu; delete navigator.gpu;"
+            if args.no_gpu_at_all:
+                # ...and no WebGL2 either: the browser that has NEITHER, which must still get a
+                # sentence rather than a silent failure or a message about a third backend.
+                hide += ("const was = HTMLCanvasElement.prototype.getContext;"
+                         "HTMLCanvasElement.prototype.getContext = function (kind, ...rest) {"
+                         "  return kind === 'webgl2' ? null : was.call(this, kind, ...rest); };")
+            ws.call("Page.addScriptToEvaluateOnNewDocument", source=hide)
         # 🔴 THE DEV SERVER IS 371 MB/s AND HUGGING FACE IS 8, SO EVERY WEIGHT
         # NUMBER TAKEN HERE IS 5-12x OPTIMISTIC - which docs/PERF.md records and
         # nothing could act on, because there was no way to ask this harness for
