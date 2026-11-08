@@ -3405,3 +3405,7 @@ The trunk's transition takes the same: its 3481 x 128 -> 1024 up projection keep
 trunk 1485 -> 1427 ms.
 And the grid attention's fused 3481 x 128 -> 516 projection: the split and the bias planes both read its kept planes.
 Bit-identical; trunk 1421 -> 1373 ms, fold 4455 -> 4401, against the previous commit interleaved.
+And a residual can ride in the repack: `linear(..., { residual })` returns `residual + x W`, added in the blocked
+path's repack draw that already writes every output texel (after, on the unblocked path). The trunk's four transitions
+take it through `transition`'s `residualOf`, so their `elementwise.add` goes. Bit-identical; trunk 1371 -> 1358 ms.
+`--no-repack-residual` is the arm.

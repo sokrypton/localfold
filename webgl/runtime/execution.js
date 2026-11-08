@@ -365,6 +365,7 @@ export class Execution {
     this.noOpmOuterFirst = options.noOpmOuterFirst ?? false;
     this.noGridFusedProjection = options.noGridFusedProjection ?? false;
     this.noKeepPlanes = options.noKeepPlanes ?? false;
+    this.noRepackResidual = options.noRepackResidual ?? false;
     /** The control arm for a page fold's pause one slice behind the GPU (`laggedPause` in runtime/steps.js). */
     this.noLaggedPause = options.noLaggedPause ?? false;
     /** The control arm for the triangle's operands written straight into the contraction's layout (`operandsLaidOutSource`). */

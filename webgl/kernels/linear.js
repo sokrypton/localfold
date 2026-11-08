@@ -37,6 +37,7 @@ import {
   INT5_DECODE, INT5_DECODE8, INT5_GROUP, int5DecodeSource,
 } from "../runtime/int5.js";
 import { padStride, strideDividesWidth } from "../runtime/pad-stride.js";
+import { add } from "../runtime/elementwise.js";
 /** @typedef {import("../runtime/storage.js").Tensor} Tensor */
 /** @typedef {import("../runtime/storage.js").Int5Weight} Int5Weight */
 
@@ -594,7 +595,8 @@ ${each((i) => `  result${i} = ${value(i)};`)}
 
 /** Four row planes back into `[rows][outChannels]`: plane `row % 4`, texel `(row / 4) * OUT4 + group`. */
 const blockRepackSourceUncached = (blockRows = BLOCK_ROWS, orderRowFastest = false,
-  tileWidth = 0) => `${PRELUDE}${ONE_TARGET}
+  tileWidth = 0, withResidual = false) => `${PRELUDE}${ONE_TARGET}
+${withResidual ? "uniform sampler2D residualTex;" : ""}
 uniform int ROWS;
 uniform int OUT4;
 uniform int RQ;
@@ -612,9 +614,10 @@ void main() {
       ? "group * RQ + (row / " + blockRows + ")"
       : "(row / " + blockRows + ") * OUT4 + group"};
   int plane = row - (row / ${blockRows}) * ${blockRows};
+  vec4 base = ${withResidual ? "fetch4(residualTex, texel)" : "vec4(0.0)"};
 ${Array.from({ length: blockRows - 1 }, (_, i) =>
-  `  if (plane == ${i}) { result = fetch4(plane${i}, source); return; }`).join("\n")}
-  result = fetch4(plane${blockRows - 1}, source);
+  `  if (plane == ${i}) { result = base + fetch4(plane${i}, source); return; }`).join("\n")}
+  result = base + fetch4(plane${blockRows - 1}, source);
 }`;
 
 /**
@@ -673,8 +676,13 @@ function decodedInt5(execution, weight, shape) {
 export function linear(execution, call, into) {
   const {
     x, weight, bias, rows, inChannels, outChannels,
-    activation = "none", weightLayout = "out-major", roundHalf = false, keepPlanes = false,
+    activation = "none", weightLayout = "out-major", roundHalf = false, keepPlanes = false, residual,
   } = call;
+  // `residual`: return `residual + x W` - added in the blocked path's repack draw, which already writes every
+  // output texel, so the caller's add pass goes; the unblocked path adds after
+  if (residual !== undefined && (keepPlanes || residual.elements !== rows * outChannels)) {
+    throw new RangeError("linear: a residual needs the full output, the same size, and no kept planes");
+  }
   if (!(activation in ACTIVATIONS)) {
     throw new RangeError(`linear: no activation \`${activation}\``);
   }
@@ -847,15 +855,24 @@ export function linear(execution, call, into) {
       if (into === undefined) execution.release(output);
       return /** @type {any} */ ({ planes, blockRows, rows, outChannels });
     }
+    const addResidual = residual !== undefined && !execution.noRepackResidual;
     execution.dispatch({
-      source: blockRepackSource(blockRows, rowFastest, tileWidth),
+      source: blockRepackSource(blockRows, rowFastest, tileWidth, addResidual),
       output,
-      inputs: Object.fromEntries(planes.map((plane, i) => [`plane${i}`, plane])),
+      inputs: {
+        ...Object.fromEntries(planes.map((plane, i) => [`plane${i}`, plane])),
+        ...(addResidual ? { residualTex: residual } : {}),
+      },
       optionalInts: { ROWS: rows, OUT4: Math.ceil(outChannels / 4), RQ: rowQuads },
       label: `linear.repack:${rows}x${outChannels}`,
     });
     for (const plane of planes) execution.release(plane);
     if (padded !== null) execution.release(padded.tensor);
+    if (residual !== undefined && !addResidual) {
+      const summed = add(execution, residual, output);
+      execution.release(output);
+      return summed;
+    }
     return output;
   }
   if (int5) {
@@ -889,6 +906,11 @@ export function linear(execution, call, into) {
       + `${roundHalf ? ":half" : ""}${narrowUnblocked ? ":half-x" : ""}`,
   });
   if (narrowed !== null) execution.release(narrowed.tensor);
+  if (residual !== undefined) {
+    const summed = add(execution, residual, result);
+    execution.release(result);
+    return summed;
+  }
   return result;
 }
 
