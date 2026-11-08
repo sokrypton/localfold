@@ -20,7 +20,7 @@
 import { createWebGL2Context } from "../../runtime/context.js";
 import { Execution } from "../../runtime/execution.js";
 import { foldAf3Async, releaseAf3Weights, uploadAf3WeightsSteps } from "./fold.js";
-import { drainAsync, gpuIdle } from "../../runtime/steps.js";
+import { drainAsync, laggedPause } from "../../runtime/steps.js";
 import { gatherRows, msaDrawRows, msaNativeRows } from "../../../shared/af3/msa-draw.js";
 import { af3TmScores, chainTmInfo, interfaceTmTerm, tmPerBinFor, tmScoreD0, tmTermFromLogits, tokenFrameMask }
   from "../../../shared/heads/tm-score.js";
@@ -77,7 +77,14 @@ function uploadedFor(weights) {
       weights,
       ready: (async () => {
         if (previous !== null) releaseAf3Weights(execution, await previous.ready);
-        return drainAsync(uploadAf3WeightsSteps(execution, weights), () => gpuIdle(execution.gl));
+        // ...one module behind the GPU rather than at its drained end (`laggedPause`): the upload is host work, and
+        // waiting for an EMPTY queue at every module boundary cost a 4 ms poll each, ~60 of them, on a first fold
+        const behind = laggedPause(execution.gl);
+        try {
+          return await drainAsync(uploadAf3WeightsSteps(execution, weights), behind);
+        } finally {
+          behind.finish();
+        }
       })(),
     };
   }
