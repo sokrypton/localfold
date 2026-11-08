@@ -41,7 +41,7 @@
  * 🔴 AND NOTHING HERE HAS A BIAS. One `bias` in the whole pairformer block, on
  * the single track's query projection; these four Linears are bias-free.
  */
-import { ONE_TARGET, PRELUDE, targetDeclarations, sized } from "../../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, targetDeclarations, sized, memoSource } from "../../runtime/execution.js";
 import { TEXTURE_WIDTH } from "../../runtime/context.js";
 import { layerNorm } from "../../kernels/layer-norm.js";
 import { linear } from "../../kernels/linear.js";
@@ -62,7 +62,7 @@ export const TRIANGLE_WEIGHTS = [
  * written by one draw to two draw buffers - the gate's sigmoid is computed once
  * for both halves of the pair of channels.
  */
-export const operandsSource = (length, channels) => sized({ L: length, PAIRS: length * length, ELEMENTS: channels * length * length }, `${PRELUDE}
+const operandsSourceUncached = (length, channels) => sized({ L: length, PAIRS: length * length, ELEMENTS: channels * length * length }, `${PRELUDE}
 layout(location = 0) out vec4 aOut;
 layout(location = 1) out vec4 bOut;
 const int C = ${channels};
@@ -122,7 +122,7 @@ void main() {
  * see the channel axis at all without a second pass over a channel-major
  * intermediate", and the second pass costs one read and one write per texel.
  */
-export const contractSource = (length, channels, direction, divideByLength) => sized({ L: length, PAIRS: length * length, ELEMENTS: length * length * channels }, `${PRELUDE}${ONE_TARGET}
+const contractSourceUncached = (length, channels, direction, divideByLength) => sized({ L: length, PAIRS: length * length, ELEMENTS: length * length * channels }, `${PRELUDE}${ONE_TARGET}
 const int C = ${channels};
 const int C4 = ${channels / 4};
 uniform sampler2D aTex;
@@ -191,7 +191,7 @@ void main() {
  * question - and at a length divisible by four it does nothing at all, which is
  * why bioemu2's 68 tokens are untouched.
  */
-export const padPairPlanesSource = (length, channels, paddedLength) => sized({ L: length, LP: paddedLength, PAIRS: length * length, PLANE: paddedLength * paddedLength, ELEMENTS: channels * paddedLength * paddedLength }, `${PRELUDE}${ONE_TARGET}
+const padPairPlanesSourceUncached = (length, channels, paddedLength) => sized({ L: length, LP: paddedLength, PAIRS: length * length, PLANE: paddedLength * paddedLength, ELEMENTS: channels * paddedLength * paddedLength }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D xTex;
 
 void main() {
@@ -223,7 +223,7 @@ void main() {
  * products, so the intermediate is exactly what the fused kernel computed and
  * then threw away sixty-three sixty-fourths of.
  */
-export const splitContractSource = (length, channels, direction, divideByLength,
+const splitContractSourceUncached = (length, channels, direction, divideByLength,
   coalesce = true, paddedLength = length) => {
   // 🔴 THE OUTGOING DIRECTION WALKS k ALONG THE CONTIGUOUS AXIS, SO IT CAN READ
   // WHOLE TEXELS - AND `fetch1` WAS ASKING FOR THE SAME TEXEL FOUR TIMES. Four
@@ -293,7 +293,7 @@ void main() {
  * this kernel has the bad pattern - once, over L^2 * C elements, where the
  * contraction had it L times over.
  */
-export const planeTransposeSource = (length, channels, paddedLength = length) =>
+const planeTransposeSourceUncached = (length, channels, paddedLength = length) =>
   sized({ L: length, LP: paddedLength, PAIRS: length * length, PLANE: paddedLength * paddedLength, ELEMENTS: channels * paddedLength * paddedLength }, `${PRELUDE}${ONE_TARGET}
 // It reads the SOURCE at its own pair axes and writes at the PADDED ones, so
 // the transpose and the padding are one pass rather than two. Reading the
@@ -359,7 +359,7 @@ void main() {
  *   makes every fragment read the SAME rows, and there it is 3.44x. This is
  *   that arm for the contraction.
  */
-export const blockedContractSource = (length, channels, direction, divideByLength,
+const blockedContractSourceUncached = (length, channels, direction, divideByLength,
   channelSlowest = true, paddedLength = length, tileMapped = false,
   residentOperands = false) => {
   const planes = 8;
@@ -467,7 +467,7 @@ ${[0, 1, 2, 3].map(channelBlock).join("\n")}
  * asks for its own padding and 68 tokens become 72, which is 1.19x the padded
  * arithmetic and is already inside the figures above.
  */
-export const widePairBlockSource = (length, channels, divideByLength,
+const widePairBlockSourceUncached = (length, channels, divideByLength,
   paddedLength = length, tileWidth = 8) => {
   const I = 4;
   const J = 8;
@@ -520,7 +520,7 @@ ${Array.from({ length: 8 }, (_, p) =>
  * bench figures above, which time block and repack together; timing the block
  * alone read 2.76x at L = 72 where the pair reads 2.01x.
  */
-export const wideRepackSource = (length, channels, paddedLength = length,
+const wideRepackSourceUncached = (length, channels, paddedLength = length,
   tileWidth = 8) => sized({ L: length, JBLOCKS: paddedLength / 8, TILEW: tileWidth, ELEMENTS: length * length * channels }, `${PRELUDE}${ONE_TARGET}
 const int C4 = ${channels / 4};
 ${Array.from({ length: 8 }, (_, p) => `uniform sampler2D plane${p};`).join("\n")}
@@ -599,7 +599,7 @@ export const CONTRACT_BLOCK_MAX_PAIR_FLOATS = 1572864;
  * Plane `(i & 1) * 4 + (j & 3)` holds the pair at
  * `((i >> 1) * JBLOCKS + (j >> 2)) * C4 + cgroup`.
  */
-export const contractRepackSource = (length, channels, channelSlowest = true,
+const contractRepackSourceUncached = (length, channels, channelSlowest = true,
   paddedLength = length, tileMapped = false) => sized({ L: length, JBLOCKS: paddedLength / 4, BLOCKS: (paddedLength / 2) * (paddedLength / 4), TILEW: Math.max(1, Math.floor(2048 / (channels / 4))), ELEMENTS: length * length * channels }, `${PRELUDE}${ONE_TARGET}
 const int C4 = ${channels / 4};
 // Its OUTPUT is the true L * L pairs and its SOURCE is the padded grid, which
@@ -631,7 +631,7 @@ ${Array.from({ length: 7 }, (_, p) =>
  * variance and the result are BIT-IDENTICAL and `--no-triangle-split` prices a
  * pass count rather than a precision.
  */
-export const centreNormSource = (length, channels) => sized({ ELEMENTS: length * length * channels }, `${PRELUDE}${ONE_TARGET}
+const centreNormSourceUncached = (length, channels) => sized({ ELEMENTS: length * length * channels }, `${PRELUDE}${ONE_TARGET}
 const int C = ${channels};
 const int C4 = ${channels / 4};
 uniform sampler2D xTex;
@@ -933,3 +933,15 @@ export function triangleMultiplication(execution, call) {
   out.label = "af3.triangle";
   return out;
 }
+
+// Every builder above, memoised on its arguments (`memoSource` in webgl/runtime/execution.js).
+export const operandsSource = memoSource(operandsSourceUncached);
+export const contractSource = memoSource(contractSourceUncached);
+export const padPairPlanesSource = memoSource(padPairPlanesSourceUncached);
+export const splitContractSource = memoSource(splitContractSourceUncached);
+export const planeTransposeSource = memoSource(planeTransposeSourceUncached);
+export const blockedContractSource = memoSource(blockedContractSourceUncached);
+export const widePairBlockSource = memoSource(widePairBlockSourceUncached);
+export const wideRepackSource = memoSource(wideRepackSourceUncached);
+export const contractRepackSource = memoSource(contractRepackSourceUncached);
+export const centreNormSource = memoSource(centreNormSourceUncached);

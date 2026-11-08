@@ -37,7 +37,7 @@
  * is the cost, on a path nothing else here takes; `kernels/linear.js` documents
  * the same split for AF2's 50 pLDDT bins.
  */
-import { ONE_TARGET, PRELUDE, sized, part } from "../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, sized, part, memoSource } from "../runtime/execution.js";
 
 /** @typedef {import("../runtime/storage.js").Tensor} Tensor */
 
@@ -51,7 +51,7 @@ import { ONE_TARGET, PRELUDE, sized, part } from "../runtime/execution.js";
  * two textures to say nothing; a missing sampler is refused by name, so the
  * source is generated without them instead.
  */
-export const layerNormSource = (
+const layerNormSourceUncached = (
   rows, channels, roundHalf = false, variance = "two-pass",
   hasWeight = true, hasBias = true,
 ) => (channels % 4 === 0
@@ -59,7 +59,7 @@ export const layerNormSource = (
   : raggedLayerNormSource(rows, channels, roundHalf, variance, hasWeight, hasBias));
 
 /** The ragged form: every element resolves its own row and sweeps it. */
-export const raggedLayerNormSource = (
+const raggedLayerNormSourceUncached = (
   rows, channels, roundHalf, variance, hasWeight, hasBias,
 ) => part({ ELEMENTS: rows * channels, CHANNELS: channels }, {
   uniforms: ["sampler2D xTex", "sampler2D weightTex", "sampler2D biasTex", "int HAS_WEIGHT", "int HAS_BIAS", "float epsilon"],
@@ -132,7 +132,7 @@ ${variance === "fast" ? `  float totalSquares = 0.0;
  * ~25 us a 110,592-texel draw costs, and neither its traffic nor its redundant
  * reduction accounts for the difference.
  */
-export const layerNormStatsSource = (rows, channels, variance) => part({ ROWS: rows, CHANNELS: channels, CH4: channels / 4 }, {
+const layerNormStatsSourceUncached = (rows, channels, variance) => part({ ROWS: rows, CHANNELS: channels, CH4: channels / 4 }, {
   uniforms: ["sampler2D xTex", "float epsilon"],
   body: `  int row = linearTexel();
   if (row >= ROWS) { result = vec4(0.0); return; }
@@ -169,7 +169,7 @@ ${variance === "fast"
  * (In all three, weight and bias are flags, HAS_WEIGHT / HAS_BIAS, rather than forks of the source:
  * with and without them were separate programs, ~19 ms a link on Safari 16.3's page thread.)
  */
-export const splitLayerNormSource = (
+const splitLayerNormSourceUncached = (
   rows, channels, roundHalf, hasWeight, hasBias,
 ) => part({ ROWS: rows, CH4: channels / 4 }, {
   uniforms: ["sampler2D xTex", "sampler2D statsTex", "sampler2D weightTex", "sampler2D biasTex", "int HAS_WEIGHT", "int HAS_BIAS"],
@@ -186,7 +186,7 @@ export const splitLayerNormSource = (
   result = ${roundHalf ? "half4(normalised)" : "normalised"};`,
 });
 
-export const alignedLayerNormSource = (
+const alignedLayerNormSourceUncached = (
   rows, channels, roundHalf, variance, hasWeight, hasBias,
 ) => part({ ROWS: rows, CHANNELS: channels, CH4: channels / 4 }, {
   uniforms: ["sampler2D xTex", "sampler2D weightTex", "sampler2D biasTex", "int HAS_WEIGHT", "int HAS_BIAS", "float epsilon"],
@@ -357,3 +357,10 @@ export function layerNorm(
       + `${weight === undefined ? ":no-scale" : ""}${bias === undefined ? ":no-offset" : ""}`,
   });
 }
+
+// Every builder above, memoised on its arguments (`memoSource` in webgl/runtime/execution.js).
+export const layerNormSource = memoSource(layerNormSourceUncached);
+export const raggedLayerNormSource = memoSource(raggedLayerNormSourceUncached);
+export const layerNormStatsSource = memoSource(layerNormStatsSourceUncached);
+export const splitLayerNormSource = memoSource(splitLayerNormSourceUncached);
+export const alignedLayerNormSource = memoSource(alignedLayerNormSourceUncached);

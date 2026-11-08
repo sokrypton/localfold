@@ -33,7 +33,7 @@
  * the same reuse AF3's single-track attention gets: that kernel's mask index
  * collapses to the key position and its bias layout is already `[head][i][j]`.
  */
-import { ONE_TARGET, PRELUDE, sized, targetDeclarations } from "../../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, sized, targetDeclarations, memoSource } from "../../runtime/execution.js";
 import { drain } from "../../runtime/steps.js";
 import { adaptiveLayerNorm, adaptiveZeroInit, elementwiseProductSource, sumSource }
   from "./atom-attention.js";
@@ -44,7 +44,7 @@ import { linear } from "../../kernels/linear.js";
 /** @typedef {import("../../runtime/storage.js").Tensor} Tensor */
 
 /** `swish(wide[i]) * wide[intermediate + i]` over a blocked row. */
-export const swiGluSource = (rows, intermediate) => sized({ ELEMENTS: rows * intermediate }, `${PRELUDE}${ONE_TARGET}
+const swiGluSourceUncached = (rows, intermediate) => sized({ ELEMENTS: rows * intermediate }, `${PRELUDE}${ONE_TARGET}
 const int INTER4 = ${intermediate / 4};
 uniform sampler2D wideTex;
 
@@ -60,40 +60,75 @@ void main() {
 }`);
 
 /**
- * AdaLN's blend - `sigmoid(scale) * normalised + shift` - with scale and shift read from one row of the step's batched
- * conditioning projections (`condBatchWeights`), at their column offsets.
+ * The whole AdaLN in ONE draw: the row's LayerNorm (no scale, no offset, two-pass variance - `layerNorm`'s default)
+ * and the blend `sigmoid(scale) * normalised + shift`, with scale and shift read from one row of the step's batched
+ * conditioning projections (`condBatchWeights`) at their column offsets.
+ *
+ * 🔴 EVERY FRAGMENT RECOMPUTES ITS ROW'S STATISTICS, which the split LayerNorm exists to avoid on a long row count -
+ * and which is free here: the denoiser's rows are its TOKENS, 59 at 59 residues, and a draw costs ~47 us before it
+ * computes anything (`probe-webgl-draw-floor.js`). Three draws (statistics, apply, blend) become one, twice a block.
  */
-export const blendSliceSource = (rows, channels, stride) => sized({ ROWS: rows }, `${PRELUDE}${ONE_TARGET}
+const blendSliceSourceUncached = (rows, channels, stride) => sized({ ROWS: rows }, `${PRELUDE}${ONE_TARGET}
+const int CHANNELS = ${channels};
 const int C4 = ${channels / 4};
 const int STRIDE4 = ${stride / 4};
-uniform sampler2D normalisedTex;
+uniform sampler2D xTex;
 uniform sampler2D condTex;
 uniform int scaleAt4;
 uniform int shiftAt4;
+uniform float epsilon;
 
 void main() {
   int texel = linearTexel();
   if (texel >= ROWS * C4) { result = vec4(0.0); return; }
   int row = texel / C4;
   int c4 = texel % C4;
+  int base = row * C4;
+  float total = 0.0;
+  for (int i = 0; i < C4; ++i) {
+    vec4 v = fetch4(xTex, base + i);
+    total += v.x + v.y + v.z + v.w;
+  }
+  float mean = total / float(CHANNELS);
+  float spread = 0.0;
+  for (int i = 0; i < C4; ++i) {
+    vec4 centred = fetch4(xTex, base + i) - mean;
+    spread += dot(centred, centred);
+  }
+  float inverseStd = inversesqrt(spread / float(CHANNELS) + epsilon);
+  vec4 normalised = (fetch4(xTex, texel) - mean) * inverseStd;
   vec4 scale = fetch4(condTex, row * STRIDE4 + scaleAt4 + c4);
-  result = (vec4(1.0) / (vec4(1.0) + exp(-scale))) * fetch4(normalisedTex, texel)
+  result = (vec4(1.0) / (vec4(1.0) + exp(-scale))) * normalised
     + fetch4(condTex, row * STRIDE4 + shiftAt4 + c4);
 }`);
 
-/** AdaLN-zero's gate - `projected * gate` - with the (already sigmoid) gate read from the step's batched gates. */
-export const gateSliceSource = (rows, channels, stride) => sized({ ROWS: rows }, `${PRELUDE}${ONE_TARGET}
+/**
+ * AdaLN-zero's gate - `projected * gate` - with the (already sigmoid) gate read from the step's batched gates, and,
+ * `withResidual`, the block's residual added in the same draw: `residual + projected * gate`.
+ */
+const gateSliceSourceUncached = (rows, channels, stride, withResidual = false) => sized({ ROWS: rows }, `${PRELUDE}${ONE_TARGET}
 const int C4 = ${channels / 4};
 const int STRIDE4 = ${stride / 4};
 uniform sampler2D projectedTex;
 uniform sampler2D gatesTex;
+${withResidual ? "uniform sampler2D residualTex;" : ""}
 uniform int gateAt4;
 
 void main() {
   int texel = linearTexel();
   if (texel >= ROWS * C4) { result = vec4(0.0); return; }
-  result = fetch4(projectedTex, texel) * fetch4(gatesTex, (texel / C4) * STRIDE4 + gateAt4 + texel % C4);
+  result = ${withResidual ? "fetch4(residualTex, texel) + " : ""}fetch4(projectedTex, texel)
+    * fetch4(gatesTex, (texel / C4) * STRIDE4 + gateAt4 + texel % C4);
 }`);
+
+/** The most floats `pairLogitsCache` holds - every block's pair biases, 24 x 16 heads x L^2 - before it recomputes them. */
+const PAIR_LOGITS_CACHE_FLOATS = 32 * 2 ** 20;
+
+/** Release what a walk's `pairLogitsCache` holds. */
+export function releasePairLogitsCache(execution, cache) {
+  for (const tensor of cache?.logits ?? []) execution.release(tensor);
+  if (cache !== undefined) cache.logits = null;
+}
 
 /** The two AdaLNs of a block, in `condBatchWeights`' column order: attention then transition. */
 const ADALN_PREFIXES = ["", "ffw"];
@@ -177,30 +212,29 @@ export const COND_BATCH_KEYS = ADALN_PREFIXES.flatMap((p) => [
 
 /** `adaptiveLayerNorm` from a block's slice of the step's batched projections. */
 function blendFromBatch(execution, { x, rows, channels, epsilon, batch, which }) {
-  const normalised = layerNorm(execution, { x, rows, channels, epsilon });
   const out = execution.allocate(rows * channels, "af3.adaln.batched");
   const scaleAt = (batch.index * 4 + which * 2) * channels;
   execution.dispatch({
     source: blendSliceSource(rows, channels, batch.scaleShiftWidth),
     output: out,
-    inputs: { normalisedTex: normalised, condTex: batch.scaleShift },
+    inputs: { xTex: x, condTex: batch.scaleShift },
     ints: { scaleAt4: scaleAt / 4, shiftAt4: (scaleAt + channels) / 4 },
-    label: `af3.adaln.blend-slice:${rows}x${channels}`,
+    floats: { epsilon },
+    label: `af3.adaln.fused:${rows}x${channels}`,
   });
-  execution.release(normalised);
   return out;
 }
 
 /** `adaptiveZeroInit` from a block's slice of the step's batched gates. */
-function zeroFromBatch(execution, { x, rows, channels, inChannels, weight, batch, which }) {
+function zeroFromBatch(execution, { x, rows, channels, inChannels, weight, batch, which, residual }) {
   const projected = linear(execution, {
     x, weight, rows, inChannels, outChannels: channels, weightLayout: "in-major",
   });
   const out = execution.allocate(rows * channels, "af3.adaln.zero");
   execution.dispatch({
-    source: gateSliceSource(rows, channels, batch.gateWidth),
+    source: gateSliceSource(rows, channels, batch.gateWidth, residual !== undefined),
     output: out,
-    inputs: { projectedTex: projected, gatesTex: batch.gates },
+    inputs: { projectedTex: projected, gatesTex: batch.gates, ...(residual === undefined ? {} : { residualTex: residual }) },
     ints: { gateAt4: ((batch.index * 2 + which) * channels) / 4 },
     label: `af3.adaln.zero-slice:${rows}x${channels}`,
   });
@@ -212,7 +246,7 @@ function zeroFromBatch(execution, { x, rows, channels, inChannels, weight, batch
  * One `[rows][4 x width]` projection split into query, key, value and the sigmoid gate - one draw, four targets.
  * The sigmoid is `linear`'s own.
  */
-export const splitQkvgSource = (rows, width) => sized({ ROWS: rows }, `${PRELUDE}${targetDeclarations(4)}
+const splitQkvgSourceUncached = (rows, width) => sized({ ROWS: rows }, `${PRELUDE}${targetDeclarations(4)}
 const int W4 = ${width / 4};
 uniform sampler2D fusedTex;
 
@@ -263,7 +297,7 @@ export function fuseQkvgWeights(block) {
  * The nesting made explicit: a super-block's projection carries `perSuper`
  * blocks' biases interleaved by head, and this pulls out one block's.
  */
-export const superBlockLogitsSource = (tokens, heads, perSuper, inner) => sized({ L: tokens, INNER: inner, ELEMENTS: heads * tokens * tokens }, `${PRELUDE}${ONE_TARGET}
+const superBlockLogitsSourceUncached = (tokens, heads, perSuper, inner) => sized({ L: tokens, INNER: inner, ELEMENTS: heads * tokens * tokens }, `${PRELUDE}${ONE_TARGET}
 const int HEADS = ${heads};
 const int PER_SUPER = ${perSuper};
 uniform sampler2D flatTex;
@@ -362,6 +396,7 @@ export function conditionedTransition(execution, call) {
   const out = batch !== undefined
     ? zeroFromBatch(execution, {
       x: gated, rows, channels, inChannels: intermediate, weight: w[`${prefix}ffwTransition2`], batch, which: 1,
+      residual: call.residual,
     })
     : adaptiveZeroInit(execution, {
       x: gated, cond, rows, channels, condChannels, inChannels: intermediate,
@@ -435,6 +470,7 @@ export function conditionedSelfAttention(execution, call) {
   const out = batch !== undefined
     ? zeroFromBatch(execution, {
       x: gathered, rows: tokens, channels, inChannels: width, weight: w.Transition2, batch, which: 0,
+      residual: call.residual,
     })
     : adaptiveZeroInit(execution, {
       x: gathered, cond, rows: tokens, channels, condChannels, inChannels: width,
@@ -468,8 +504,16 @@ export function* diffusionTransformerSteps(execution, call) {
   const perSuper = w.blocksPerSuperBlock;
   const pairs = tokens * tokens;
 
+  // 🔴 THE PAIR BIASES ARE THE SAME EVERY STEP: they come from the pair conditioning alone, which the sampler hoists
+  // for the whole walk. A caller that passes `pairLogitsCache` (denoiserFromHead) gets them computed on the first
+  // step - one LayerNorm and a projection a super-block over every PAIR, and a slice a block - and read thereafter.
+  const cache = call.pairLogitsCache;
+  const cached = cache?.logits ?? null;
+  const keep = cache !== undefined && cached === null
+    && w.superBlocks.length * perSuper * heads * pairs <= PAIR_LOGITS_CACHE_FLOATS;
+  if (keep) cache.logits = [];
   // One LayerNorm over the pair conditioning, shared by every super-block.
-  const normalisedPair = layerNorm(execution, {
+  const normalisedPair = cached !== null ? null : layerNorm(execution, {
     x: pairCond, weight: w.pairInputLayerNormScale,
     rows: pairs, channels: w.pairChannels, epsilon,
   });
@@ -497,57 +541,70 @@ export function* diffusionTransformerSteps(execution, call) {
   let own = false;
   for (const [superBlock, group] of w.superBlocks.entries()) {
     // ...and one projection a SUPER-BLOCK, carrying its four blocks' biases.
-    const flat = linear(execution, {
+    const flat = cached !== null ? null : linear(execution, {
       x: normalisedPair, weight: group.pairLogitsProjection, rows: pairs,
       inChannels: w.pairChannels, outChannels: perSuper * heads, weightLayout: "in-major",
     });
     for (let inner = 0; inner < perSuper; inner += 1) {
-      const pairLogits = execution.allocate(heads * pairs, "af3.difftx.logits");
-      execution.dispatch({
-        source: superBlockLogitsSource(tokens, heads, perSuper, inner),
-        output: pairLogits,
-        inputs: { flatTex: flat },
-        label: `af3.difftx.logits:${tokens}x${heads}:${inner}/${perSuper}`,
-      });
+      let pairLogits = cached?.[superBlock * perSuper + inner] ?? null;
+      if (pairLogits === null) {
+        pairLogits = execution.allocate(heads * pairs, "af3.difftx.logits");
+        execution.dispatch({
+          source: superBlockLogitsSource(tokens, heads, perSuper, inner),
+          output: pairLogits,
+          inputs: { flatTex: flat },
+          label: `af3.difftx.logits:${tokens}x${heads}:${inner}/${perSuper}`,
+        });
+        if (keep) cache.logits.push(pairLogits);
+      }
       const block = group.blocks[inner];
       const blockBatch = condBatch === undefined ? undefined
         : { ...condBatch, index: superBlock * perSuper + inner };
+      // ...batched, each residual add is the gate draw's (`gateSliceSource`'s `withResidual`): two draws a block fewer
+      const fused = blockBatch !== undefined;
       const attention = conditionedSelfAttention(execution, {
         act: current, cond, pairLogits, mask, tokens, channels, condChannels,
         heads, dimension: w.dimension, weights: block, epsilon, condBatch: blockBatch,
+        ...(fused ? { residual: current } : {}),
       });
-      execution.release(pairLogits);
-      const afterAttention = execution.allocate(
-        tokens * channels, "af3.difftx.after-attention");
-      execution.dispatch({
-        source: sumSource(tokens * channels),
-        output: afterAttention,
-        inputs: { aTex: current, bTex: attention },
-        label: `af3.difftx.residual:${tokens}x${channels}`,
-      });
-      execution.release(attention);
+      if (cached === null && !keep) execution.release(pairLogits);
+      let afterAttention = attention;
+      if (!fused) {
+        afterAttention = execution.allocate(tokens * channels, "af3.difftx.after-attention");
+        execution.dispatch({
+          source: sumSource(tokens * channels),
+          output: afterAttention,
+          inputs: { aTex: current, bTex: attention },
+          label: `af3.difftx.residual:${tokens}x${channels}`,
+        });
+        execution.release(attention);
+      }
       if (own) execution.release(current);
       const transitioned = conditionedTransition(execution, {
         x: afterAttention, cond, rows: tokens, channels,
         factor: w.transitionFactor, weights: block, prefix: "", condChannels, epsilon, condBatch: blockBatch,
+        ...(fused ? { residual: afterAttention } : {}),
       });
-      const next = execution.allocate(tokens * channels, "af3.difftx.block");
-      execution.dispatch({
-        source: sumSource(tokens * channels),
-        output: next,
-        inputs: { aTex: afterAttention, bTex: transitioned },
-        label: `af3.difftx.residual2:${tokens}x${channels}`,
-      });
+      let next = transitioned;
+      if (!fused) {
+        next = execution.allocate(tokens * channels, "af3.difftx.block");
+        execution.dispatch({
+          source: sumSource(tokens * channels),
+          output: next,
+          inputs: { aTex: afterAttention, bTex: transitioned },
+          label: `af3.difftx.residual2:${tokens}x${channels}`,
+        });
+        execution.release(transitioned);
+      }
       execution.release(afterAttention);
-      execution.release(transitioned);
       current = next;
       own = true;
       call.onBlock?.(superBlock, inner);
     }
-    execution.release(flat);
+    if (flat !== null) execution.release(flat);
     yield { stage: "transformer", superBlock };
   }
-  execution.release(normalisedPair);
+  if (normalisedPair !== null) execution.release(normalisedPair);
   if (condBatch !== undefined) {
     execution.release(condBatch.scaleShift);
     execution.release(condBatch.gates);
@@ -555,3 +612,10 @@ export function* diffusionTransformerSteps(execution, call) {
   current.label = "af3.difftx";
   return current;
 }
+
+// Every builder above, memoised on its arguments (`memoSource` in webgl/runtime/execution.js).
+export const swiGluSource = memoSource(swiGluSourceUncached);
+export const blendSliceSource = memoSource(blendSliceSourceUncached);
+export const gateSliceSource = memoSource(gateSliceSourceUncached);
+export const splitQkvgSource = memoSource(splitQkvgSourceUncached);
+export const superBlockLogitsSource = memoSource(superBlockLogitsSourceUncached);

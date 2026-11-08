@@ -37,7 +37,7 @@
  * a mask of 1 keeps a key and 0 withholds it, and `transpose` switches the mask
  * between `[batch][key]` and `[key][batch]`.
  */
-import { PRELUDE, targetDeclarations, sized } from "../runtime/execution.js";
+import { PRELUDE, targetDeclarations, sized, memoSource } from "../runtime/execution.js";
 /** @typedef {import("../runtime/storage.js").Tensor} Tensor */
 
 
@@ -57,7 +57,7 @@ export function attentionFlashPlan(headDim, maxDrawBuffers) {
   return { groups, targets, draws, redundancy: draws };
 }
 
-export const attentionFlashSource = (
+const attentionFlashSourceUncached = (
   { batch, queries, heads, headDim, targets, hasPairBias, roundHalf = false },
 ) => {
   const groups = headDim / 4;
@@ -142,7 +142,7 @@ ${perTarget((t) => {
  * expression, so `planes[t]` with a computed `t` does not compile - and a
  * driver that accepted it would be compiling something else.
  */
-export const interleavePlanesSource = (elements, headDim) => {
+const interleavePlanesSourceUncached = (elements, headDim) => {
   const groups = headDim / 4;
   const declarations = Array.from({ length: groups },
     (_, g) => `uniform sampler2D plane${g};`).join("\n");
@@ -245,3 +245,7 @@ export function attentionFlash(execution, call, into) {
   for (const plane of planes) execution.release(plane);
   return { output, plan };
 }
+
+// Every builder above, memoised on its arguments (`memoSource` in webgl/runtime/execution.js).
+export const attentionFlashSource = memoSource(attentionFlashSourceUncached);
+export const interleavePlanesSource = memoSource(interleavePlanesSourceUncached);

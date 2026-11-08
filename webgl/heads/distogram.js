@@ -22,12 +22,12 @@
  * would redo that sweep `bins / 4` times. The intermediate is `L^2 * bins`
  * floats, released as soon as the second draw is done.
  */
-import { ONE_TARGET, PRELUDE, sized } from "../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, sized, memoSource } from "../runtime/execution.js";
 import { distogramBreaks, FIRST_BREAK, LAST_BREAK } from "../../shared/heads/distogram.js";
 
 /** @typedef {import("../runtime/storage.js").Tensor} Tensor */
 
-export const distogramLogitsSource = (length, channels, bins) => sized({ L: length }, `${PRELUDE}${ONE_TARGET}
+const distogramLogitsSourceUncached = (length, channels, bins) => sized({ L: length }, `${PRELUDE}${ONE_TARGET}
 const int C4 = ${channels / 4};
 const int B4 = ${bins / 4};
 uniform sampler2D pairTex;
@@ -57,7 +57,7 @@ void main() {
   result = sum;
 }`);
 
-export const distogramContactSource = (length, bins, counted) => sized({ PAIRS: length * length }, `${PRELUDE}${ONE_TARGET}
+const distogramContactSourceUncached = (length, bins, counted) => sized({ PAIRS: length * length }, `${PRELUDE}${ONE_TARGET}
 const int BINS = ${bins};
 const int B4 = ${bins / 4};
 const int COUNTED = ${counted};
@@ -139,3 +139,7 @@ export function distogramContacts(execution, call) {
   execution.release(logits);
   return contacts;
 }
+
+// Every builder above, memoised on its arguments (`memoSource` in webgl/runtime/execution.js).
+export const distogramLogitsSource = memoSource(distogramLogitsSourceUncached);
+export const distogramContactSource = memoSource(distogramContactSourceUncached);

@@ -38,7 +38,7 @@
  * module takes them as inputs, which is also what lets the f64 reference and
  * this port be handed the same ones.
  */
-import { ONE_TARGET, PRELUDE } from "../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, memoSource } from "../runtime/execution.js";
 import { layerNorm, layerNormStatsSource } from "../kernels/layer-norm.js";
 import { linear } from "../kernels/linear.js";
 
@@ -59,7 +59,7 @@ export const WINDOW_KEYS = 128;
 export const WINDOW_CONTEXT = (WINDOW_KEYS - WINDOW_QUERIES) / 2;
 
 /** `out = x * factor`, a scalar the host computed from sigma. */
-export const scaleSource = (elements) => `${PRELUDE}${ONE_TARGET}
+const scaleSourceUncached = (elements) => `${PRELUDE}${ONE_TARGET}
 const int ELEMENTS = ${elements};
 uniform sampler2D xTex;
 uniform float factor;
@@ -71,7 +71,7 @@ void main() {
 }`;
 
 /** `out = a + b`. */
-export const sumSource = (elements) => `${PRELUDE}${ONE_TARGET}
+const sumSourceUncached = (elements) => `${PRELUDE}${ONE_TARGET}
 const int ELEMENTS = ${elements};
 uniform sampler2D aTex;
 uniform sampler2D bTex;
@@ -83,7 +83,7 @@ void main() {
 }`;
 
 /** `out = a * b`, elementwise over equal shapes. */
-export const productSource = (elements) => `${PRELUDE}${ONE_TARGET}
+const productSourceUncached = (elements) => `${PRELUDE}${ONE_TARGET}
 const int ELEMENTS = ${elements};
 uniform sampler2D aTex;
 uniform sampler2D bTex;
@@ -95,7 +95,7 @@ void main() {
 }`;
 
 /** `out = silu(x)`. */
-export const siluSource = (elements) => `${PRELUDE}${ONE_TARGET}
+const siluSourceUncached = (elements) => `${PRELUDE}${ONE_TARGET}
 const int ELEMENTS = ${elements};
 uniform sampler2D xTex;
 
@@ -107,7 +107,7 @@ void main() {
 }`;
 
 /** `out = sigmoid(x)`. */
-export const sigmoidSource = (elements) => `${PRELUDE}${ONE_TARGET}
+const sigmoidSourceUncached = (elements) => `${PRELUDE}${ONE_TARGET}
 const int ELEMENTS = ${elements};
 uniform sampler2D xTex;
 
@@ -118,7 +118,7 @@ void main() {
 }`;
 
 /** `out[row][c] = x[row][from + c]`, a channel range of every row. */
-export const sliceSource = (rows, channels, from, width) => `${PRELUDE}${ONE_TARGET}
+const sliceSourceUncached = (rows, channels, from, width) => `${PRELUDE}${ONE_TARGET}
 const int C4 = ${channels / 4};
 const int W4 = ${width / 4};
 const int FROM4 = ${from / 4};
@@ -148,7 +148,7 @@ void main() {
  * const highp int" on the first real fold, where every gate at synthetic widths
  * was green.
  */
-export const concatSource = (rows, leftWidth, rightWidth) => (
+const concatSourceUncached = (rows, leftWidth, rightWidth) => (
   leftWidth % 4 === 0 && rightWidth % 4 === 0
     ? `${PRELUDE}${ONE_TARGET}
 const int L4 = ${leftWidth / 4};
@@ -206,7 +206,7 @@ void main() {
  * `const int C4 = 0.75` and failed with "cannot convert from const float to
  * const highp int".
  */
-export const gatherRowsSource = (rows, channels) => (channels % 4 === 0
+const gatherRowsSourceUncached = (rows, channels) => (channels % 4 === 0
   ? `${PRELUDE}${ONE_TARGET}
 const int C4 = ${channels / 4};
 const int ELEMENTS = ${rows * channels};
@@ -247,7 +247,7 @@ void main() {
 }`);
 
 /** `out[row][c] = x[row][c] * mask[row]`, with the same ragged split. */
-export const maskRowsSource = (rows, channels) => (channels % 4 === 0
+const maskRowsSourceUncached = (rows, channels) => (channels % 4 === 0
   ? `${PRELUDE}${ONE_TARGET}
 const int C4 = ${channels / 4};
 const int ELEMENTS = ${rows * channels};
@@ -324,7 +324,7 @@ export function adaLnSplit(execution, { x, alpha, beta, rows, channels, epsilon 
  * runs only where that bench measured no loss at any row count, 768 channels
  * and wider, and `--no-norm-split` is the arm for both.
  */
-export const splitAdaLnSource = (rows, channels) => `${PRELUDE}${ONE_TARGET}
+const splitAdaLnSourceUncached = (rows, channels) => `${PRELUDE}${ONE_TARGET}
 const int C4 = ${channels / 4};
 const int ELEMENTS = ${rows * channels};
 uniform sampler2D xTex;
@@ -341,7 +341,7 @@ void main() {
   result = normalised * (vec4(1.0) + fetch4(alphaTex, texel)) + fetch4(betaTex, texel);
 }`;
 
-export const adaLnSource = (rows, channels) => `${PRELUDE}${ONE_TARGET}
+const adaLnSourceUncached = (rows, channels) => `${PRELUDE}${ONE_TARGET}
 const int C4 = ${channels / 4};
 const int CHANNELS = ${channels};
 const int ELEMENTS = ${rows * channels};
@@ -378,7 +378,7 @@ void main() {
  * out-major, which is why this is its own kernel rather than a LayerNorm and a
  * `linear`.
  */
-export const pairBiasSource = (rows, channels, heads, perHead = false) => {
+const pairBiasSourceUncached = (rows, channels, heads, perHead = false) => {
   // 🔴 THE STATISTICS WERE COMPUTED ONCE A HEAD AND THE ROW IS SHARED BY FOUR,
   // so this kernel issued SEVEN TIMES the texelFetch it needs. `at` normalises
   // the pair row before projecting it, and the mean and the spread depend on
@@ -526,7 +526,7 @@ const headDot = (keyTex, wide) => wide
       dot += fetch1(qTex, qBase + d) * fetch1(${keyTex}, kBase + d);
     }`;
 
-export const fullAttentionSource = (rows, channels, heads, wide = true) => `${PRELUDE}${ONE_TARGET}
+const fullAttentionSourceUncached = (rows, channels, heads, wide = true) => `${PRELUDE}${ONE_TARGET}
 const int ROWS = ${rows};
 const int CHANNELS = ${channels};
 const int HEADS = ${heads};
@@ -577,7 +577,7 @@ ${headDot("kTex", wide)}
  * head h is at `d + h * headDim` and its value at `2 * d + h * headDim` - see
  * the note at the top.
  */
-export const windowAttentionSource = (atoms, channels, heads, wide = true) => `${PRELUDE}${ONE_TARGET}
+const windowAttentionSourceUncached = (atoms, channels, heads, wide = true) => `${PRELUDE}${ONE_TARGET}
 const int ATOMS = ${atoms};
 const int CHANNELS = ${channels};
 const int HEADS = ${heads};
@@ -838,7 +838,7 @@ function projections(execution, { x, rows, channels, weights: w }) {
 }
 
 /** `out[row][c] = x[row][c] + bias[c]`. */
-export const addRowBiasSource = (rows, channels) => `${PRELUDE}${ONE_TARGET}
+const addRowBiasSourceUncached = (rows, channels) => `${PRELUDE}${ONE_TARGET}
 const int C4 = ${channels / 4};
 const int ELEMENTS = ${rows * channels};
 uniform sampler2D xTex;
@@ -1350,7 +1350,7 @@ export function bioemu2Denoise(execution, call) {
 }
 
 /** `out[row][c] = x[row][c] + row0[c]`. */
-export const broadcastRowSource = (rows, channels) => `${PRELUDE}${ONE_TARGET}
+const broadcastRowSourceUncached = (rows, channels) => `${PRELUDE}${ONE_TARGET}
 const int C4 = ${channels / 4};
 const int ELEMENTS = ${rows * channels};
 uniform sampler2D xTex;
@@ -1363,7 +1363,7 @@ void main() {
 }`;
 
 /** `out = keep * a + take * b`. */
-export const blendSource = (elements) => `${PRELUDE}${ONE_TARGET}
+const blendSourceUncached = (elements) => `${PRELUDE}${ONE_TARGET}
 const int ELEMENTS = ${elements};
 uniform sampler2D aTex;
 uniform sampler2D bTex;
@@ -1375,3 +1375,22 @@ void main() {
   if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
   result = keep * fetch4(aTex, texel) + take * fetch4(bTex, texel);
 }`;
+
+// Every builder above, memoised on its arguments (`memoSource` in webgl/runtime/execution.js).
+export const scaleSource = memoSource(scaleSourceUncached);
+export const sumSource = memoSource(sumSourceUncached);
+export const productSource = memoSource(productSourceUncached);
+export const siluSource = memoSource(siluSourceUncached);
+export const sigmoidSource = memoSource(sigmoidSourceUncached);
+export const sliceSource = memoSource(sliceSourceUncached);
+export const concatSource = memoSource(concatSourceUncached);
+export const gatherRowsSource = memoSource(gatherRowsSourceUncached);
+export const maskRowsSource = memoSource(maskRowsSourceUncached);
+export const splitAdaLnSource = memoSource(splitAdaLnSourceUncached);
+export const adaLnSource = memoSource(adaLnSourceUncached);
+export const pairBiasSource = memoSource(pairBiasSourceUncached);
+export const fullAttentionSource = memoSource(fullAttentionSourceUncached);
+export const windowAttentionSource = memoSource(windowAttentionSourceUncached);
+export const addRowBiasSource = memoSource(addRowBiasSourceUncached);
+export const broadcastRowSource = memoSource(broadcastRowSourceUncached);
+export const blendSource = memoSource(blendSourceUncached);

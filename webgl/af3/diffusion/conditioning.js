@@ -42,7 +42,7 @@
  * model of the lineage trained its own - so a table compiled in here would be
  * correct for exactly one checkpoint."
  */
-import { ONE_TARGET, PRELUDE, sized } from "../../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, sized, memoSource } from "../../runtime/execution.js";
 import { conditionedTransition } from "./transformer.js";
 import { layerNorm } from "../../kernels/layer-norm.js";
 import { linear } from "../../kernels/linear.js";
@@ -100,7 +100,7 @@ export function noiseEmbedding(scaledNoiseLevel, weight, bias) {
  * `singleCondPadding` rather than arithmetic so that the CPU reference and the
  * generated WGSL below cannot express it differently".
  */
-export const singleConcatSource = (rows, leftWidth, rightWidth, padding) => {
+const singleConcatSourceUncached = (rows, leftWidth, rightWidth, padding) => {
   const width = leftWidth + rightWidth + padding.length;
   // The per-channel source, resolved on the host from `singleCondSource` and
   // written out as one branch per RUN of channels that read the same tensor at
@@ -150,7 +150,7 @@ void main() {
 };
 
 /** `out[row][c] = c < leftWidth ? left[row][c] : right[row][c - leftWidth]`. */
-export const concatenateSource = (rows, leftWidth, rightWidth) => sized({ ELEMENTS: rows * (leftWidth + rightWidth) }, `${PRELUDE}${ONE_TARGET}
+const concatenateSourceUncached = (rows, leftWidth, rightWidth) => sized({ ELEMENTS: rows * (leftWidth + rightWidth) }, `${PRELUDE}${ONE_TARGET}
 const int LEFT = ${leftWidth};
 const int RIGHT = ${rightWidth};
 const int WIDTH = ${leftWidth + rightWidth};
@@ -176,7 +176,7 @@ void main() {
 }`);
 
 /** `out[row][c] = x[row][c] + row0[c]` - the noise term, broadcast per token. */
-export const broadcastRowSource = (rows, channels) => sized({ ELEMENTS: rows * channels }, `${PRELUDE}${ONE_TARGET}
+const broadcastRowSourceUncached = (rows, channels) => sized({ ELEMENTS: rows * channels }, `${PRELUDE}${ONE_TARGET}
 const int C4 = ${channels / 4};
 uniform sampler2D xTex;
 uniform sampler2D rowTex;
@@ -449,7 +449,7 @@ export function diffusionConditioning(execution, call) {
  * columns have to exist as columns. `trunk/embedder.js` folds the same four
  * one-hots into a projection instead, which is right there and wrong here.
  */
-export const rawRelativeSource = (tokens, relativeWidth) => sized({ L: tokens, ELEMENTS: tokens * tokens * relativeWidth }, `${PRELUDE}${ONE_TARGET}
+const rawRelativeSourceUncached = (tokens, relativeWidth) => sized({ L: tokens, ELEMENTS: tokens * tokens * relativeWidth }, `${PRELUDE}${ONE_TARGET}
 const int WIDTH = ${relativeWidth};
 const int MAX_IDX = 32;
 const int MAX_CHAIN = 2;
@@ -496,3 +496,9 @@ void main() {
     base + 2 < ELEMENTS ? at(base + 2) : 0.0,
     base + 3 < ELEMENTS ? at(base + 3) : 0.0);
 }`);
+
+// Every builder above, memoised on its arguments (`memoSource` in webgl/runtime/execution.js).
+export const singleConcatSource = memoSource(singleConcatSourceUncached);
+export const concatenateSource = memoSource(concatenateSourceUncached);
+export const broadcastRowSource = memoSource(broadcastRowSourceUncached);
+export const rawRelativeSource = memoSource(rawRelativeSourceUncached);

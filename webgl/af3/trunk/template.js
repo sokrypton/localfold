@@ -44,7 +44,7 @@
  * went unnoticed because every check had a ONE-CHAIN query, where all-ones and
  * per-chain are the same array."
  */
-import { ONE_TARGET, PRELUDE, sized } from "../../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, sized, memoSource } from "../../runtime/execution.js";
 import { drain } from "../../runtime/steps.js";
 import { add, relu, scale } from "../../runtime/elementwise.js";
 import { layerNorm } from "../../kernels/layer-norm.js";
@@ -84,7 +84,7 @@ export const TEMPLATE_WEIGHTS = [
  * (`packTemplateGeometry`), with the distogram bin stored PLUS ONE so that a
  * zeroed buffer is an empty slot.
  */
-export const slotInputSource = (tokens, channels, occupied) => sized({ L: tokens, ELEMENTS: tokens * tokens * channels }, `${PRELUDE}${ONE_TARGET}
+const slotInputSourceUncached = (tokens, channels, occupied) => sized({ L: tokens, ELEMENTS: tokens * tokens * channels }, `${PRELUDE}${ONE_TARGET}
 const int C4 = ${channels / 4};
 const int STRIDE = ${GEOMETRY_STRIDE};
 uniform sampler2D queryTex;
@@ -350,3 +350,6 @@ export function* templateEmbeddingSteps(execution, call) {
   out.label = "af3.template";
   return out;
 }
+
+// Every builder above, memoised on its arguments (`memoSource` in webgl/runtime/execution.js).
+export const slotInputSource = memoSource(slotInputSourceUncached);

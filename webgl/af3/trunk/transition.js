@@ -27,7 +27,7 @@
  * that helpfully added the missing biases would open every gate and be wrong
  * everywhere" - and so would a port.
  */
-import { ONE_TARGET, PRELUDE, sized } from "../../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, sized, memoSource } from "../../runtime/execution.js";
 import { layerNorm } from "../../kernels/layer-norm.js";
 import { linear } from "../../kernels/linear.js";
 
@@ -44,7 +44,7 @@ export const TRANSITION_WEIGHTS = [
  * owns four OUTPUT channels and sweeps the whole intermediate axis, so it would
  * recompute the swish `channels / 4` times over.
  */
-export const swiGluSource = (rows, intermediate) => sized({ ELEMENTS: rows * intermediate, INTER4: intermediate / 4 }, `${PRELUDE}${ONE_TARGET}
+const swiGluSourceUncached = (rows, intermediate) => sized({ ELEMENTS: rows * intermediate, INTER4: intermediate / 4 }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D wideTex;
 
 void main() {
@@ -132,3 +132,6 @@ export function transition(execution, call) {
   out.label = "af3.transition";
   return out;
 }
+
+// Every builder above, memoised on its arguments (`memoSource` in webgl/runtime/execution.js).
+export const swiGluSource = memoSource(swiGluSourceUncached);

@@ -36,7 +36,7 @@
  * shader and its output LayerNorm into the output one, which is a speed choice
  * this port has not earned yet. Four draws and two extra tensors.
  */
-import { ONE_TARGET, PRELUDE } from "../../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, memoSource } from "../../runtime/execution.js";
 import { layerNorm } from "../../kernels/layer-norm.js";
 import { linear } from "../../kernels/linear.js";
 import { relu, scale } from "../../runtime/elementwise.js";
@@ -156,7 +156,7 @@ export function multimerTemplateFeatures(input) {
   return { geometry, aatype };
 }
 
-export const templateInputSource = (shape) => {
+const templateInputSourceUncached = (shape) => {
   const { length, pairChannels, templateChannels } = shape;
   return `${PRELUDE}${ONE_TARGET}
 const int L = ${length};
@@ -340,3 +340,6 @@ export function multimerTemplateEmbedding(execution, call) {
   update.label = "mt.update";
   return update;
 }
+
+// Every builder above, memoised on its arguments (`memoSource` in webgl/runtime/execution.js).
+export const templateInputSource = memoSource(templateInputSourceUncached);

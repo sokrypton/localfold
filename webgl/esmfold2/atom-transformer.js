@@ -59,7 +59,7 @@
  * way; a port that fed it three would read the second half of the matrix at the
  * wrong offset".
  */
-import { ONE_TARGET, PRELUDE } from "../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, memoSource } from "../runtime/execution.js";
 import { layerNorm } from "../kernels/layer-norm.js";
 import { linear } from "../kernels/linear.js";
 import { relu } from "../runtime/elementwise.js";
@@ -147,7 +147,7 @@ export function buildRope(refPos, spaceUid, atoms, headDim, options = {}) {
 }
 
 /** The 389 per-atom features, one-hots masked by the atom mask. */
-export const atomFeaturesSource = (atoms) => `${PRELUDE}${ONE_TARGET}
+const atomFeaturesSourceUncached = (atoms) => `${PRELUDE}${ONE_TARGET}
 const int WIDTH = ${ATOM_FEATURES};
 const int ELEMENT_BASE = 5;
 const int CHAR_BASE = ${5 + MAX_ELEMENT};
@@ -191,7 +191,7 @@ void main() {
 }`;
 
 /** Affine-free RMS over `channels`, at torch's epsilon. */
-export const rmsNormSource = (rows, channels) => `${PRELUDE}${ONE_TARGET}
+const rmsNormSourceUncached = (rows, channels) => `${PRELUDE}${ONE_TARGET}
 const int C4 = ${channels / 4};
 const int CHANNELS = ${channels};
 const int ELEMENTS = ${rows * channels};
@@ -218,7 +218,7 @@ void main() {
  * the split, because `headDim / 2` is a multiple of four for every shape here -
  * which the caller asserts.
  */
-export const ropeApplySource = (atoms, heads, headDim) => `${PRELUDE}${ONE_TARGET}
+const ropeApplySourceUncached = (atoms, heads, headDim) => `${PRELUDE}${ONE_TARGET}
 const int HEAD_DIM = ${headDim};
 const int HALF = ${headDim >> 1};
 const int HEADS = ${heads};
@@ -250,7 +250,7 @@ void main() {
 }`;
 
 /** Round to bfloat16 on the device, for the arm that matches the native model. */
-export const narrowSource = (elements) => `${PRELUDE}${ONE_TARGET}
+const narrowSourceUncached = (elements) => `${PRELUDE}${ONE_TARGET}
 const int ELEMENTS = ${elements};
 uniform sampler2D xTex;
 
@@ -281,7 +281,7 @@ void main() {
  * products still accumulating in ascending `d` order one scalar at a time.
  * `--no-attend-dot4` is the control arm.
  */
-export const attentionSource = (atoms, heads, headDim, halfWindow,
+const attentionSourceUncached = (atoms, heads, headDim, halfWindow,
   lanewise = false) => {
   const wide = !lanewise && headDim % 4 === 0;
   return `${PRELUDE}${ONE_TARGET}
@@ -355,7 +355,7 @@ ${wide
 };
 
 /** `out = context * valid * sigmoid(gate)`, the gate being of the block's INPUT. */
-export const gateSource = (atoms, channels) => `${PRELUDE}${ONE_TARGET}
+const gateSourceUncached = (atoms, channels) => `${PRELUDE}${ONE_TARGET}
 const int C4 = ${channels / 4};
 const int ELEMENTS = ${atoms * channels};
 uniform sampler2D contextTex;
@@ -372,7 +372,7 @@ void main() {
 }`;
 
 /** `out = silu(x)`, the modulation's input. */
-export const siluSource = (elements) => `${PRELUDE}${ONE_TARGET}
+const siluSourceUncached = (elements) => `${PRELUDE}${ONE_TARGET}
 const int ELEMENTS = ${elements};
 uniform sampler2D xTex;
 
@@ -389,7 +389,7 @@ void main() {
  * The six slices are shift_a, scale_a, gate_a, shift_f, scale_f, gate_f, in
  * order, and this reads two of them by index.
  */
-export const modulateSource = (atoms, channels, offsetIndex, scaleIndex) => `${PRELUDE}${ONE_TARGET}
+const modulateSourceUncached = (atoms, channels, offsetIndex, scaleIndex) => `${PRELUDE}${ONE_TARGET}
 const int C4 = ${channels / 4};
 const int ELEMENTS = ${atoms * channels};
 const int SIX = ${6 * (channels / 4)};
@@ -409,7 +409,7 @@ void main() {
 }`;
 
 /** `out = x + modulation[gateIndex] * branch`, the adaLN-Zero residual. */
-export const gatedResidualSource = (atoms, channels, gateIndex) => `${PRELUDE}${ONE_TARGET}
+const gatedResidualSourceUncached = (atoms, channels, gateIndex) => `${PRELUDE}${ONE_TARGET}
 const int C4 = ${channels / 4};
 const int ELEMENTS = ${atoms * channels};
 const int SIX = ${6 * (channels / 4)};
@@ -428,7 +428,7 @@ void main() {
 }`;
 
 /** `out[token][c] = sum over the token's atoms of values * mask, over the mask. */
-export const scatterMeanSource = (atoms, tokens, channels) => `${PRELUDE}${ONE_TARGET}
+const scatterMeanSourceUncached = (atoms, tokens, channels) => `${PRELUDE}${ONE_TARGET}
 const int ATOMS = ${atoms};
 const int C4 = ${channels / 4};
 const int ELEMENTS = ${tokens * channels};
@@ -454,7 +454,7 @@ void main() {
 }`;
 
 /** `out[atom][c] = skip[atom][c] + perToken[index[atom]][c]`. */
-export const broadcastToAtomsSource = (atoms, channels) => `${PRELUDE}${ONE_TARGET}
+const broadcastToAtomsSourceUncached = (atoms, channels) => `${PRELUDE}${ONE_TARGET}
 const int C4 = ${channels / 4};
 const int ELEMENTS = ${atoms * channels};
 uniform sampler2D skipTex;
@@ -471,7 +471,7 @@ void main() {
 }`;
 
 /** `[noisy | previous]`, six channels: zeros where there is no previous. */
-export const joinCoordinatesSource = (atoms, hasPrevious) => `${PRELUDE}${ONE_TARGET}
+const joinCoordinatesSourceUncached = (atoms, hasPrevious) => `${PRELUDE}${ONE_TARGET}
 const int ELEMENTS = ${atoms * 6};
 uniform sampler2D noisyTex;
 ${hasPrevious ? "uniform sampler2D previousTex;" : ""}
@@ -856,7 +856,7 @@ export function inputsEmbedder(execution, call) {
 }
 
 /** `out = a + b`. */
-export const sumSource = (elements) => `${PRELUDE}${ONE_TARGET}
+const sumSourceUncached = (elements) => `${PRELUDE}${ONE_TARGET}
 const int ELEMENTS = ${elements};
 uniform sampler2D aTex;
 uniform sampler2D bTex;
@@ -921,3 +921,18 @@ export function atomDecoder(execution, call) {
   update.label = "ef2.decoder.update";
   return update;
 }
+
+// Every builder above, memoised on its arguments (`memoSource` in webgl/runtime/execution.js).
+export const atomFeaturesSource = memoSource(atomFeaturesSourceUncached);
+export const rmsNormSource = memoSource(rmsNormSourceUncached);
+export const ropeApplySource = memoSource(ropeApplySourceUncached);
+export const narrowSource = memoSource(narrowSourceUncached);
+export const attentionSource = memoSource(attentionSourceUncached);
+export const gateSource = memoSource(gateSourceUncached);
+export const siluSource = memoSource(siluSourceUncached);
+export const modulateSource = memoSource(modulateSourceUncached);
+export const gatedResidualSource = memoSource(gatedResidualSourceUncached);
+export const scatterMeanSource = memoSource(scatterMeanSourceUncached);
+export const broadcastToAtomsSource = memoSource(broadcastToAtomsSourceUncached);
+export const joinCoordinatesSource = memoSource(joinCoordinatesSourceUncached);
+export const sumSource = memoSource(sumSourceUncached);

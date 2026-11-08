@@ -51,6 +51,33 @@ import { Storage } from "./storage.js";
  * @param {string} code
  * @returns {{code: string, sizes: Record<string, number>}}
  */
+/**
+ * A shader-source builder memoised on its arguments, so a repeated shape returns the SAME string (or source object).
+ *
+ * 🔴 A FOLD BUILDS ITS GLSL ONCE A DISPATCH, AND THEN LOOKS IT UP BY THE STRING. An AF3 fold is ~30,000 dispatches and
+ * ~104 MB of source (`--host`'s `sourceBytes`): the unrolled builders cost 148 ms per 30,000 in V8 and the program
+ * cache's lookup by a freshly built string 261 ms more, since a new string's hash is computed over all of it. The same
+ * string object has its hash cached, so both go. Arguments are numbers, strings, booleans or plain shape objects.
+ *
+ * @template {(...args: any[]) => any} F
+ * @param {F} build
+ * @returns {F}
+ */
+export function memoSource(build) {
+  const cache = new Map();
+  return /** @type {F} */ ((...args) => {
+    const key = args.every((arg) => arg === null || typeof arg !== "object")
+      ? args.map((arg) => (typeof arg === "string" ? `s${arg}` : String(arg))).join("\u0001")
+      : JSON.stringify(args);
+    let built = cache.get(key);
+    if (built === undefined) {
+      built = build(...args);
+      cache.set(key, built);
+    }
+    return built;
+  });
+}
+
 export function sized(sizes, code) {
   const at = code.indexOf("\n") + 1;
   if (!code.startsWith("#version") || at === 0) throw new Error("sized: the code must start with #version");
@@ -512,6 +539,29 @@ export class Execution {
     this.compiles = 0;
     /** Each draw checks for a GL error. Cheap, and off for a benchmark. */
     this.checkErrors = options.checkErrors ?? true;
+    /**
+     * Flush the queued commands every this many dispatches; 0 never does.
+     *
+     * 🔴 `getError` AFTER EVERY DRAW WAS PACING THE GPU AS WELL AS CHECKING IT. It is a synchronous round trip - 1.4 s of
+     * an AF3 fold's 1.6 s of host time with no draws issued at all - and taking it away left the fold no faster: the
+     * trunk went 1.94 -> 1.41 s and the diffusion 3.44 -> 3.99, because a round trip also flushes, and without one the
+     * GPU waits for whatever the driver decides to submit. A flush hands the work over without waiting for an answer.
+     */
+    this.flushEvery = options.flushEvery ?? 0;
+    /**
+     * `invalidateFramebuffer` on a dispatch's targets before it draws: their old contents are never read.
+     *
+     * 🔴 ON A TILE-BASED GPU A DRAW INTO A NEW TARGET IS A RENDER PASS, AND A PASS LOADS ITS TARGET UNLESS TOLD THE
+     * CONTENTS DO NOT MATTER - a full read of every output before it is overwritten, ~30,000 times an AF3 fold.
+     *
+     * 🔴 AND IT IS A LOSS IN CHROME ON AN M2, SO IT IS OFF: an AF3 fold 5.6 s -> 6.3-6.5 s with it, bit-identical. The
+     * likeliest reading is that the browser implements WebGL's invalidate with clears of its own. Kept as an arm,
+     * because a driver that honours it as a load action is exactly where it would pay.
+     */
+    this.invalidateTargets = options.invalidateTargets ?? false;
+    this.attachmentLists = Array.from({ length: 9 },
+      (_, count) => Array.from({ length: count }, (__, t) => gl.COLOR_ATTACHMENT0 + t));
+    this.sinceFlush = 0;
     /**
      * A relative dither applied inside every f16 rounding; see `half4` in
      * PRELUDE. Zero in use - it is an instrument for measuring what a
@@ -1100,6 +1150,11 @@ export class Execution {
     // fold of garbage, so it is a timing probe only.
     const passes = this.skipDraws || (this.skipLabels !== null && this.skipLabels.test(label)) ? 0
       : this.doubleLabels !== null && this.doubleLabels.test(label) ? 2 : 1;
+    // ...and its targets' old contents are dead: every kernel writes every texel of its output (the bands below cover
+    // the whole texture), so the driver need not load them into the tile before drawing (`invalidateTargets`)
+    if (this.invalidateTargets && passes > 0) {
+      gl.invalidateFramebuffer(gl.FRAMEBUFFER, this.attachmentLists[targets.length]);
+    }
     for (let pass = 0; pass < passes; pass += 1) {
     for (let row = 0; row < output.height; row += this.maxBandRows) {
       const rows = Math.min(this.maxBandRows, output.height - row);
@@ -1110,6 +1165,11 @@ export class Execution {
       gl.drawArrays(gl.TRIANGLES, 0, 3);
       this.draws += 1;
     }
+    }
+    // ...and every `flushEvery` dispatches the queued commands go to the GPU (`flushEvery`'s note)
+    if (this.flushEvery > 0 && ++this.sinceFlush >= this.flushEvery) {
+      this.sinceFlush = 0;
+      gl.flush();
     }
     if (this.checkErrors) {
       const error = gl.getError();

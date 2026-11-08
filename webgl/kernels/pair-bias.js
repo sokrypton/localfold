@@ -30,7 +30,7 @@
  * rather than padded, because a padded head is a head whose bias is garbage and
  * which the attention would then read.
  */
-import { ONE_TARGET, PRELUDE, sized } from "../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, sized, memoSource } from "../runtime/execution.js";
 import { layerNorm } from "./layer-norm.js";
 import { linear } from "./linear.js";
 
@@ -46,7 +46,7 @@ export const PAIR_BIAS_WEIGHTS = ["layerNormScale", "layerNormOffset", "projecti
  * whenever the chain length is - so a fragment's four can straddle two heads
  * and each one has to resolve its own (head, pair).
  */
-export const toHeadMajorSource = (pairs, heads) => sized({ PAIRS: pairs, ELEMENTS: pairs * heads }, `${PRELUDE}${ONE_TARGET}
+const toHeadMajorSourceUncached = (pairs, heads) => sized({ PAIRS: pairs, ELEMENTS: pairs * heads }, `${PRELUDE}${ONE_TARGET}
 const int HEADS = ${heads};
 uniform sampler2D sourceTex;
 
@@ -125,3 +125,6 @@ export function pairBias(execution, call) {
   execution.release(pairMajor);
   return output;
 }
+
+// Every builder above, memoised on its arguments (`memoSource` in webgl/runtime/execution.js).
+export const toHeadMajorSource = memoSource(toHeadMajorSourceUncached);

@@ -32,7 +32,7 @@
  * than matrix products - which is also why `kernels/linear.js` cannot serve
  * here: its input widths would be 128 and 64 one-hot columns.
  */
-import { ONE_TARGET, PRELUDE, sized, part } from "../../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, sized, part, memoSource } from "../../runtime/execution.js";
 import { linear } from "../../kernels/linear.js";
 import { relu } from "../../runtime/elementwise.js";
 
@@ -50,7 +50,7 @@ export const PAIR_CONDITIONING_WEIGHTS = [
   "singleToPairCondRow", "singleToPairCondCol", "embedPairOffsets", "embedPairDistances",
 ];
 
-export const perAtomSource = (rows, channels, rawCharge, hasBias) => part({ ELEMENTS: rows * channels, C4: channels / 4, C: channels }, {
+const perAtomSourceUncached = (rows, channels, rawCharge, hasBias) => part({ ELEMENTS: rows * channels, C4: channels / 4, C: channels }, {
   uniforms: ["sampler2D positionsTex", "sampler2D maskTex", "sampler2D chargeTex", "sampler2D elementTex", "sampler2D nameTex", "sampler2D posWeightTex", "sampler2D maskWeightTex", "sampler2D chargeWeightTex", "sampler2D elementWeightTex", "sampler2D nameWeightTex", "sampler2D biasTex"],
   body: `  int texel = linearTexel();
   if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
@@ -170,7 +170,7 @@ export function perAtomConditioning(execution, call) {
  * 🔴 THROUGH A RELU FIRST, "which is not a detail: the single conditioning is
  * signed and roughly centred, so the relu discards about half of it".
  */
-export const pairConditioningSource = (tokens, dense, pairChannels) => sized({ ELEMENTS: tokens * dense * dense * pairChannels }, `${PRELUDE}${ONE_TARGET}
+const pairConditioningSourceUncached = (tokens, dense, pairChannels) => sized({ ELEMENTS: tokens * dense * dense * pairChannels }, `${PRELUDE}${ONE_TARGET}
 const int DENSE = ${dense};
 const int P4 = ${pairChannels / 4};
 uniform sampler2D rowTex;
@@ -244,3 +244,7 @@ export function perAtomPairConditioning(execution, call) {
   execution.release(column);
   return out;
 }
+
+// Every builder above, memoised on its arguments (`memoSource` in webgl/runtime/execution.js).
+export const perAtomSource = memoSource(perAtomSourceUncached);
+export const pairConditioningSource = memoSource(pairConditioningSourceUncached);

@@ -30,7 +30,7 @@
  * same arithmetic and differ by a factor of n: at 300 tokens it is 600
  * projections of 451 channels rather than 90,000 of them.
  */
-import { ONE_TARGET, PRELUDE } from "../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, memoSource } from "../runtime/execution.js";
 import { layerNorm } from "../kernels/layer-norm.js";
 import { linear } from "../kernels/linear.js";
 
@@ -66,7 +66,7 @@ export function tokenIdentity(features, tokens) {
  * The bins are computed here rather than uploaded, because they are a function
  * of five integers a token and the alternative is an `n^2 * 4` tensor.
  */
-export const relativeEncodingSource = (tokens, channels) => `${PRELUDE}${ONE_TARGET}
+const relativeEncodingSourceUncached = (tokens, channels) => `${PRELUDE}${ONE_TARGET}
 const int L = ${tokens};
 const int C4 = ${channels / 4};
 const int ELEMENTS = ${tokens * tokens * channels};
@@ -121,7 +121,7 @@ void main() {
 }`;
 
 /** `out[i][j][c] = rows[i][c] + columns[j][c]`, z_init's broadcast. */
-export const broadcastSumSource = (tokens, channels) => `${PRELUDE}${ONE_TARGET}
+const broadcastSumSourceUncached = (tokens, channels) => `${PRELUDE}${ONE_TARGET}
 const int L = ${tokens};
 const int C4 = ${channels / 4};
 const int ELEMENTS = ${tokens * tokens * channels};
@@ -139,7 +139,7 @@ void main() {
 }`;
 
 /** `out[pair][c] += bonds[pair] * weight[c]`, one input channel. */
-export const tokenBondSource = (tokens, channels) => `${PRELUDE}${ONE_TARGET}
+const tokenBondSourceUncached = (tokens, channels) => `${PRELUDE}${ONE_TARGET}
 const int C4 = ${channels / 4};
 const int ELEMENTS = ${tokens * tokens * channels};
 uniform sampler2D baseTex;
@@ -248,7 +248,7 @@ export function zInit(execution, call) {
 }
 
 /** `out = a + b`, local rather than imported so this file's draws are its own. */
-export const addSource = (elements) => `${PRELUDE}${ONE_TARGET}
+const addSourceUncached = (elements) => `${PRELUDE}${ONE_TARGET}
 const int ELEMENTS = ${elements};
 uniform sampler2D aTex;
 uniform sampler2D bTex;
@@ -278,3 +278,9 @@ export function recycleProjection(execution, { pair, pairs, channels, weights, e
   projected.label = "ef2.pair-loop-proj";
   return projected;
 }
+
+// Every builder above, memoised on its arguments (`memoSource` in webgl/runtime/execution.js).
+export const relativeEncodingSource = memoSource(relativeEncodingSourceUncached);
+export const broadcastSumSource = memoSource(broadcastSumSourceUncached);
+export const tokenBondSource = memoSource(tokenBondSourceUncached);
+export const addSource = memoSource(addSourceUncached);

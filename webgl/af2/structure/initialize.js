@@ -21,7 +21,7 @@
  * about an axis the data never names. `webgpu/af2/structure/initialize.js`'s
  * `AFFINE_INIT_SHADER` writes 1.0 at `base` and zero across the rest.
  */
-import { ONE_TARGET, PRELUDE } from "../../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, memoSource } from "../../runtime/execution.js";
 import { layerNorm } from "../../kernels/layer-norm.js";
 import { linear } from "../../kernels/linear.js";
 
@@ -34,7 +34,7 @@ export const STRUCTURE_INITIALIZE_WEIGHTS = [
 ];
 
 /** `affine[i] = (1, 0, 0, 0, 0, 0, 0)` - quaternion identity, zero translation. */
-export const affineIdentitySource = (length) => `${PRELUDE}${ONE_TARGET}
+const affineIdentitySourceUncached = (length) => `${PRELUDE}${ONE_TARGET}
 const int ELEMENTS = ${length * 7};
 void main() {
   int base = linearTexel() * 4;
@@ -107,3 +107,6 @@ export function structureInitialize(execution, call) {
   activations.label = "structure.activations";
   return { single, initialRepresentation, activations, affine };
 }
+
+// Every builder above, memoised on its arguments (`memoSource` in webgl/runtime/execution.js).
+export const affineIdentitySource = memoSource(affineIdentitySourceUncached);

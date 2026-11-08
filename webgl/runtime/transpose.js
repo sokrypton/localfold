@@ -18,11 +18,11 @@
  * indexing instead - an option a fragment shader writing one texel does not
  * have.
  */
-import { ONE_TARGET, PRELUDE, sized } from "./execution.js";
+import { ONE_TARGET, PRELUDE, sized, memoSource } from "./execution.js";
 
 /** @typedef {import("./storage.js").Tensor} Tensor */
 
-export const transposeLeadingSource = (outer, inner, channels) => sized({ OUTER: outer, INNER: inner, C4: channels / 4 }, `${PRELUDE}${ONE_TARGET}
+const transposeLeadingSourceUncached = (outer, inner, channels) => sized({ OUTER: outer, INNER: inner, C4: channels / 4 }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D xTex;
 
 void main() {
@@ -60,3 +60,6 @@ export function transposeLeading(execution, { x, outer, inner, channels }, into)
     label: `transpose:${outer}x${inner}x${channels}`,
   });
 }
+
+// Every builder above, memoised on its arguments (`memoSource` in webgl/runtime/execution.js).
+export const transposeLeadingSource = memoSource(transposeLeadingSourceUncached);

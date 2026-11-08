@@ -38,7 +38,7 @@
  * on, so the hazard does not exist here; it is worth knowing that it exists at
  * all before anyone adds one.
  */
-import { ONE_TARGET, PRELUDE } from "../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, memoSource } from "../runtime/execution.js";
 import { BIOEMU2 } from "../../shared/bioemu2/weights.js";
 import { layerNorm } from "../kernels/layer-norm.js";
 import { linear } from "../kernels/linear.js";
@@ -54,7 +54,7 @@ import { productSource, sumSource } from "./denoiser.js";
  * them out and the softmax then runs over the last axis. Laid out `(i, j, head)`
  * the softmax would normalise over the heads and still sum to one.
  */
-export const averagingWeightsSource = (tokens, heads) => `${PRELUDE}${ONE_TARGET}
+const averagingWeightsSourceUncached = (tokens, heads) => `${PRELUDE}${ONE_TARGET}
 const int L = ${tokens};
 const int HEADS = ${heads};
 const int ELEMENTS = ${heads * tokens * tokens};
@@ -88,7 +88,7 @@ void main() {
  * value is per row, which is what makes this a gather over j rather than an
  * attention.
  */
-export const averagedValuesSource = (sequences, tokens, heads, headDim) => `${PRELUDE}${ONE_TARGET}
+const averagedValuesSourceUncached = (sequences, tokens, heads, headDim) => `${PRELUDE}${ONE_TARGET}
 const int L = ${tokens};
 const int HEADS = ${heads};
 const int HEAD_DIM = ${headDim};
@@ -119,7 +119,7 @@ void main() {
  *
  * `a` is the first half of each row's 64 channels and `b` the second.
  */
-export const outerSource = (sequences, tokens, half) => `${PRELUDE}${ONE_TARGET}
+const outerSourceUncached = (sequences, tokens, half) => `${PRELUDE}${ONE_TARGET}
 const int L = ${tokens};
 const int S = ${sequences};
 const int HALF = ${half};
@@ -330,7 +330,7 @@ export function msaLayer(execution, call) {
 }
 
 /** `out = sigmoid(x)`. */
-export const logisticSource = (elements) => `${PRELUDE}${ONE_TARGET}
+const logisticSourceUncached = (elements) => `${PRELUDE}${ONE_TARGET}
 const int ELEMENTS = ${elements};
 uniform sampler2D xTex;
 
@@ -341,7 +341,7 @@ void main() {
 }`;
 
 /** `out = silu(a) * b`. */
-export const siluProductSource = (elements) => `${PRELUDE}${ONE_TARGET}
+const siluProductSourceUncached = (elements) => `${PRELUDE}${ONE_TARGET}
 const int ELEMENTS = ${elements};
 uniform sampler2D aTex;
 uniform sampler2D bTex;
@@ -354,7 +354,7 @@ void main() {
 }`;
 
 /** `(pair, head)` to `(head, pair)`, which is the axis the softmax runs over. */
-export const headFirstSource = (tokens, heads) => `${PRELUDE}${ONE_TARGET}
+const headFirstSourceUncached = (tokens, heads) => `${PRELUDE}${ONE_TARGET}
 const int PAIRS = ${tokens * tokens};
 const int HEADS = ${heads};
 const int ELEMENTS = ${heads * tokens * tokens};
@@ -476,7 +476,7 @@ export function trunkPass(execution, call) {
 }
 
 /** `out = x`. */
-export const copySource = (elements) => `${PRELUDE}${ONE_TARGET}
+const copySourceUncached = (elements) => `${PRELUDE}${ONE_TARGET}
 const int ELEMENTS = ${elements};
 uniform sampler2D xTex;
 
@@ -485,3 +485,12 @@ void main() {
   if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
   result = fetch4(xTex, texel);
 }`;
+
+// Every builder above, memoised on its arguments (`memoSource` in webgl/runtime/execution.js).
+export const averagingWeightsSource = memoSource(averagingWeightsSourceUncached);
+export const averagedValuesSource = memoSource(averagedValuesSourceUncached);
+export const outerSource = memoSource(outerSourceUncached);
+export const logisticSource = memoSource(logisticSourceUncached);
+export const siluProductSource = memoSource(siluProductSourceUncached);
+export const headFirstSource = memoSource(headFirstSourceUncached);
+export const copySource = memoSource(copySourceUncached);

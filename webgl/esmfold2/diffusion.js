@@ -45,7 +45,7 @@
  * `sigma^2/(sigma^2+t^2) * x_noisy + sigma*t/sqrt(sigma^2+t^2) * r`. "Writing it
  * as `x_noisy + r` runs, converges to something, and is a different sampler."
  */
-import { ONE_TARGET, PRELUDE } from "../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, memoSource } from "../runtime/execution.js";
 import { layerNorm } from "../kernels/layer-norm.js";
 import { linear } from "../kernels/linear.js";
 import { swiGluSource } from "../esmc/tower.js";
@@ -56,7 +56,7 @@ import { sumSource } from "./atom-transformer.js";
 export const SIGMA_DATA = 16;
 
 /** `[left | right]`, two tensors of the same width. */
-export const concatenateSource = (rows, channels) => `${PRELUDE}${ONE_TARGET}
+const concatenateSourceUncached = (rows, channels) => `${PRELUDE}${ONE_TARGET}
 const int C4 = ${channels / 4};
 const int ELEMENTS = ${rows * channels * 2};
 uniform sampler2D leftTex;
@@ -73,7 +73,7 @@ void main() {
 }`;
 
 /** `out = silu(a) * b`, the conditioning transition's SEPARATE projections. */
-export const gatedProductSource = (elements) => `${PRELUDE}${ONE_TARGET}
+const gatedProductSourceUncached = (elements) => `${PRELUDE}${ONE_TARGET}
 const int ELEMENTS = ${elements};
 uniform sampler2D aTex;
 uniform sampler2D bTex;
@@ -86,7 +86,7 @@ void main() {
 }`;
 
 /** `out[row][c] = x[row][c] + row0[c]`: one noise level for the whole structure. */
-export const addBroadcastRowSource = (rows, channels) => `${PRELUDE}${ONE_TARGET}
+const addBroadcastRowSourceUncached = (rows, channels) => `${PRELUDE}${ONE_TARGET}
 const int C4 = ${channels / 4};
 const int ELEMENTS = ${rows * channels};
 uniform sampler2D xTex;
@@ -105,7 +105,7 @@ void main() {
  * `kernels/layer-norm.js` so that the whole modulation is one draw: the gate and
  * the shift are already per element.
  */
-export const adaptiveSource = (rows, channels) => `${PRELUDE}${ONE_TARGET}
+const adaptiveSourceUncached = (rows, channels) => `${PRELUDE}${ONE_TARGET}
 const int C4 = ${channels / 4};
 const int CHANNELS = ${channels};
 const int ELEMENTS = ${rows * channels};
@@ -138,7 +138,7 @@ void main() {
 }`;
 
 /** `out = x * sigmoid(gate + bias)`, the output gate from the conditioning. */
-export const gateWithBiasSource = (rows, channels) => `${PRELUDE}${ONE_TARGET}
+const gateWithBiasSourceUncached = (rows, channels) => `${PRELUDE}${ONE_TARGET}
 const int C4 = ${channels / 4};
 const int ELEMENTS = ${rows * channels};
 uniform sampler2D xTex;
@@ -153,7 +153,7 @@ void main() {
 }`;
 
 /** `out = x * sigmoid(gate)`, the per-head context gate. */
-export const gateSource = (elements) => `${PRELUDE}${ONE_TARGET}
+const gateSourceUncached = (elements) => `${PRELUDE}${ONE_TARGET}
 const int ELEMENTS = ${elements};
 uniform sampler2D xTex;
 uniform sampler2D gateTex;
@@ -166,7 +166,7 @@ void main() {
 }`;
 
 /** `out[row][c] = x[row][c] + bias[c]`. */
-export const addRowBiasSource = (rows, channels) => `${PRELUDE}${ONE_TARGET}
+const addRowBiasSourceUncached = (rows, channels) => `${PRELUDE}${ONE_TARGET}
 const int C4 = ${channels / 4};
 const int ELEMENTS = ${rows * channels};
 uniform sampler2D xTex;
@@ -195,7 +195,7 @@ void main() {
  * products still accumulating in ascending `d` order one scalar at a time.
  * `--no-attend-dot4` is the control arm.
  */
-export const attentionSource = (tokens, channels, heads, lanewise = false) => {
+const attentionSourceUncached = (tokens, channels, heads, lanewise = false) => {
   const wide = !lanewise && (channels / heads) % 4 === 0 && channels % 2 === 0;
   return `${PRELUDE}${ONE_TARGET}
 const int TOKENS = ${tokens};
@@ -259,7 +259,7 @@ ${wide
 };
 
 /** `out = keep * noisy + take * update`, the EDM preconditioning. */
-export const preconditionSource = (elements) => `${PRELUDE}${ONE_TARGET}
+const preconditionSourceUncached = (elements) => `${PRELUDE}${ONE_TARGET}
 const int ELEMENTS = ${elements};
 uniform sampler2D noisyTex;
 uniform sampler2D updateTex;
@@ -273,7 +273,7 @@ void main() {
 }`;
 
 /** `out = x * factor`. */
-export const scaleSource = (elements) => `${PRELUDE}${ONE_TARGET}
+const scaleSourceUncached = (elements) => `${PRELUDE}${ONE_TARGET}
 const int ELEMENTS = ${elements};
 uniform sampler2D xTex;
 uniform float factor;
@@ -754,3 +754,15 @@ export function denoiseStep(execution, call) {
   out.label = "ef2.diffusion.denoised";
   return { coordinates: out, pair, pairIsBorrowed: conditioning.pairIsBorrowed };
 }
+
+// Every builder above, memoised on its arguments (`memoSource` in webgl/runtime/execution.js).
+export const concatenateSource = memoSource(concatenateSourceUncached);
+export const gatedProductSource = memoSource(gatedProductSourceUncached);
+export const addBroadcastRowSource = memoSource(addBroadcastRowSourceUncached);
+export const adaptiveSource = memoSource(adaptiveSourceUncached);
+export const gateWithBiasSource = memoSource(gateWithBiasSourceUncached);
+export const gateSource = memoSource(gateSourceUncached);
+export const addRowBiasSource = memoSource(addRowBiasSourceUncached);
+export const attentionSource = memoSource(attentionSourceUncached);
+export const preconditionSource = memoSource(preconditionSourceUncached);
+export const scaleSource = memoSource(scaleSourceUncached);

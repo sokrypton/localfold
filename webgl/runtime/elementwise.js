@@ -13,7 +13,7 @@
  * a stage that wants to accumulate ping-pongs between two tensors. Writing
  * `add(x, y, x)` would be the WebGPU habit silently producing undefined output.
  */
-import { ONE_TARGET, PRELUDE, sized, part } from "./execution.js";
+import { ONE_TARGET, PRELUDE, sized, part, memoSource } from "./execution.js";
 /** @typedef {import("./storage.js").Tensor} Tensor */
 
 
@@ -29,7 +29,7 @@ void main() {
  * that draw them directly.
  */
 const OPS = { add: 0, multiply: 1, scale: 2, relu: 3, copy: 4 };
-export const elementwiseSource = (elements) => part({ ELEMENTS: elements }, {
+const elementwiseSourceUncached = (elements) => part({ ELEMENTS: elements }, {
   uniforms: ["sampler2D aTex", "sampler2D bTex", "int OP", "float scale"],
   body: `  int texel = linearTexel();
   if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
@@ -50,13 +50,13 @@ export const elementwiseSource = (elements) => part({ ELEMENTS: elements }, {
  * @param {"add" | "multiply" | "copy"} op
  * @param {number} elements
  */
-export const elementwiseOpSource = (op, elements) => {
+const elementwiseOpSourceUncached = (op, elements) => {
   const source = elementwiseSource(elements);
   return { ...source, sizes: { ...source.sizes, OP: OPS[op] } };
 };
 
 /** `a + b`, elementwise. */
-export const addSource = (elements) => sized({ ELEMENTS: elements }, `${PRELUDE}${ONE_TARGET}
+const addSourceUncached = (elements) => sized({ ELEMENTS: elements }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D aTex;
 uniform sampler2D bTex;
 ${guard}
@@ -64,7 +64,7 @@ ${guard}
 }`);
 
 /** `a * b`, elementwise - a gate applied to an activation. */
-export const multiplySource = (elements) => sized({ ELEMENTS: elements }, `${PRELUDE}${ONE_TARGET}
+const multiplySourceUncached = (elements) => sized({ ELEMENTS: elements }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D aTex;
 uniform sampler2D bTex;
 ${guard}
@@ -81,7 +81,7 @@ ${guard}
  * `x` is the output of an ADD. Folding it into the previous linear would be
  * wrong - the add comes between them.
  */
-export const reluSource = (elements) => sized({ ELEMENTS: elements }, `${PRELUDE}${ONE_TARGET}
+const reluSourceUncached = (elements) => sized({ ELEMENTS: elements }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D aTex;
 void main() {
   int texel = linearTexel();
@@ -107,7 +107,7 @@ export function relu(execution, a, into) {
 }
 
 /** `a * scale`. */
-export const scaleSource = (elements) => sized({ ELEMENTS: elements }, `${PRELUDE}${ONE_TARGET}
+const scaleSourceUncached = (elements) => sized({ ELEMENTS: elements }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D aTex;
 uniform float scale;
 ${guard}
@@ -183,7 +183,7 @@ export function scale(execution, a, factor, into) {
  * WebGPU side folds this into whichever kernel is adjacent; here it is its own
  * draw until something measures that as a cost.
  */
-export const maskRowsSource = (rows, channels) => part({ ROWS: rows, CH4: channels / 4 }, {
+const maskRowsSourceUncached = (rows, channels) => part({ ROWS: rows, CH4: channels / 4 }, {
   uniforms: ["sampler2D xTex", "sampler2D maskTex"],
   body: `  int texel = linearTexel();
   if (texel >= ROWS * CH4) { result = vec4(0.0); return; }
@@ -235,7 +235,7 @@ export function maskRows(execution, { x, mask, rows, channels }, into) {
  * four would straddle, so it is refused rather than silently rounded - every
  * caller in this model has a channel count that is a multiple of four.
  */
-export const prefixSource = (elements) => sized({ ELEMENTS: elements }, `${PRELUDE}${ONE_TARGET}
+const prefixSourceUncached = (elements) => sized({ ELEMENTS: elements }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D aTex;
 
 void main() {
@@ -267,3 +267,13 @@ export function prefix(execution, a, elements, into) {
     label: `elementwise.prefix:${elements}`,
   });
 }
+
+// Every builder above, memoised on its arguments (`memoSource` in webgl/runtime/execution.js).
+export const elementwiseSource = memoSource(elementwiseSourceUncached);
+export const elementwiseOpSource = memoSource(elementwiseOpSourceUncached);
+export const addSource = memoSource(addSourceUncached);
+export const multiplySource = memoSource(multiplySourceUncached);
+export const reluSource = memoSource(reluSourceUncached);
+export const scaleSource = memoSource(scaleSourceUncached);
+export const maskRowsSource = memoSource(maskRowsSourceUncached);
+export const prefixSource = memoSource(prefixSourceUncached);

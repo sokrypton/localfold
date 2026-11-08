@@ -41,6 +41,7 @@
  * not to a tolerance.
  */
 import { tensorElements } from "../../shared/weights/dtype.js";
+import { memoSource } from "./execution.js";
 
 /** Bytes of codes in one group: 32 codes x 5 bits. */
 export const INT5_GROUP_BYTES = 20;
@@ -248,7 +249,7 @@ void decodeInt5x8(highp usampler2D codeTex, int element, float scale, float zero
  * rounding is explicit because a float16 render target TRUNCATES on this
  * backend (see `Execution`'s PRELUDE) and truncation's bias accumulates.
  */
-export const int5DecodeSource = (prelude, oneTarget, roundHalf) => `${prelude}${oneTarget}
+const int5DecodeSourceUncached = (prelude, oneTarget, roundHalf) => `${prelude}${oneTarget}
 uniform int ELEMENTS;
 uniform highp usampler2D codeTex;
 uniform sampler2D tableTex;
@@ -262,3 +263,6 @@ void main() {
   vec4 decoded = decodeInt5x4(codeTex, element, sz.x, sz.y);
   result = ${roundHalf ? "half4(decoded)" : "decoded"};
 }`;
+
+// Every builder above, memoised on its arguments (`memoSource` in webgl/runtime/execution.js).
+export const int5DecodeSource = memoSource(int5DecodeSourceUncached);

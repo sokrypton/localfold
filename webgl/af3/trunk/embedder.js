@@ -44,7 +44,7 @@
  * matrix. Where it is set, the single embedding is the SAME tensor rather than a
  * second projection - "sharing is what says the two really are one embedding".
  */
-import { ONE_TARGET, PRELUDE, sized } from "../../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, sized, memoSource } from "../../runtime/execution.js";
 import { add } from "../../runtime/elementwise.js";
 import { layerNorm } from "../../kernels/layer-norm.js";
 import { linear } from "../../kernels/linear.js";
@@ -93,7 +93,7 @@ export function tokenIdentity(features, tokens) {
  * the oracle's bond_embedding output is 0.0000 on this input. It is a real term
  * for ligands."
  */
-export const bondEmbeddingSource = (tokens, pairChannels) => sized({ ELEMENTS: tokens * tokens * pairChannels }, `${PRELUDE}${ONE_TARGET}
+const bondEmbeddingSourceUncached = (tokens, pairChannels) => sized({ ELEMENTS: tokens * tokens * pairChannels }, `${PRELUDE}${ONE_TARGET}
 const int C4 = ${pairChannels / 4};
 uniform sampler2D pairTex;
 uniform sampler2D bondTex;
@@ -108,7 +108,7 @@ void main() {
 }`);
 
 /** `pair[i][j][c] = left[i][c] + right[j][c]`. */
-export const pairInitSource = (tokens, pairChannels) => sized({ L: tokens, ELEMENTS: tokens * tokens * pairChannels }, `${PRELUDE}${ONE_TARGET}
+const pairInitSourceUncached = (tokens, pairChannels) => sized({ L: tokens, ELEMENTS: tokens * tokens * pairChannels }, `${PRELUDE}${ONE_TARGET}
 const int C4 = ${pairChannels / 4};
 uniform sampler2D leftTex;
 uniform sampler2D rightTex;
@@ -132,7 +132,7 @@ void main() {
  * same-entity flag, and the relative symmetry copy (or an extra bin for a
  * different entity). Everything else in the 139 is zero.
  */
-export const relativeEncodingSource = (tokens, pairChannels) => sized({ L: tokens, ELEMENTS: tokens * tokens * pairChannels }, `${PRELUDE}${ONE_TARGET}
+const relativeEncodingSourceUncached = (tokens, pairChannels) => sized({ L: tokens, ELEMENTS: tokens * tokens * pairChannels }, `${PRELUDE}${ONE_TARGET}
 const int C4 = ${pairChannels / 4};
 const int MAX_IDX = ${MAX_RELATIVE_IDX};
 const int MAX_CHAIN = ${MAX_RELATIVE_CHAIN};
@@ -190,7 +190,7 @@ void main() {
  *                from one with a few instead of saturating"
  *     column 34  boltz2's `is_paired`, 1 on the QUERY ROW where it exists
  */
-export const msaEmbedSource = (
+const msaEmbedSourceUncached = (
   sequences, tokens, width, msaChannels, pairedQueryRow,
 ) => sized({ L: tokens, ELEMENTS: sequences * tokens * msaChannels }, `${PRELUDE}${ONE_TARGET}
 const int C4 = ${msaChannels / 4};
@@ -391,3 +391,9 @@ export function embed(execution, call) {
   single.label = "af3.embed.single";
   return { pair, msa, single };
 }
+
+// Every builder above, memoised on its arguments (`memoSource` in webgl/runtime/execution.js).
+export const bondEmbeddingSource = memoSource(bondEmbeddingSourceUncached);
+export const pairInitSource = memoSource(pairInitSourceUncached);
+export const relativeEncodingSource = memoSource(relativeEncodingSourceUncached);
+export const msaEmbedSource = memoSource(msaEmbedSourceUncached);

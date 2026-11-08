@@ -45,7 +45,7 @@
  * 🔴 AND THE AGGREGATION AVERAGES OVER A TOKEN'S REAL ATOMS ONLY, after a relu -
  * so a token with three atoms of a 24-slot row divides by three.
  */
-import { ONE_TARGET, PRELUDE, sized, part } from "../../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, sized, part, memoSource } from "../../runtime/execution.js";
 import {
   atomPairLogits, crossAttentionBlock, gather, sumSource,
 } from "./atom-attention.js";
@@ -56,7 +56,7 @@ import { relu } from "../../runtime/elementwise.js";
 /** @typedef {import("../../runtime/storage.js").Tensor} Tensor */
 
 /** `out[row][c] = x[row][c] * mask[row]` - the mask-before-gather step. */
-export const maskRowsSource = (rows, channels) => part({ ELEMENTS: rows * channels, C4: channels / 4 }, {
+const maskRowsSourceUncached = (rows, channels) => part({ ELEMENTS: rows * channels, C4: channels / 4 }, {
   uniforms: ["sampler2D xTex", "sampler2D maskTex"],
   body: `  int texel = linearTexel();
   if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
@@ -70,7 +70,7 @@ export const maskRowsSource = (rows, channels) => part({ ELEMENTS: rows * channe
  * One draw rather than five, because every one of them is indexed by the same
  * (subset, query, key) and four of the five are weight rows scaled by a scalar.
  */
-export const atomPairSource = (shape, maskPaddedKeys, hasTrunkPair) => {
+const atomPairSourceUncached = (shape, maskPaddedKeys, hasTrunkPair) => {
   const { subsets, queries, keys, pairChannels, tokens } = shape;
   return sized({ TOKENS: tokens, ELEMENTS: subsets * queries * keys * pairChannels, QUERIES: queries, KEYS: keys, P4: pairChannels / 4 }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D rowTex;
@@ -145,7 +145,7 @@ ${hasTrunkPair ? `  // The trunk's pair, indexed by the two atoms' TOKENS - both
  * with three atoms of a 24-slot row divides by three" - and a token with none
  * stays zero rather than dividing by zero.
  */
-export const aggregateSource = (tokens, dense, channels) => part({ ELEMENTS: tokens * channels, DENSE: dense, C4: channels / 4 }, {
+const aggregateSourceUncached = (tokens, dense, channels) => part({ ELEMENTS: tokens * channels, DENSE: dense, C4: channels / 4 }, {
   uniforms: ["sampler2D projectedTex", "sampler2D maskTex"],
   body: `  int texel = linearTexel();
   if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
@@ -569,7 +569,7 @@ export function atomCrossAttentionEncoder(execution, call) {
 }
 
 /** A one-channel gather; `gather` needs a multiple of four. */
-export const scalarGatherSource = (count) => part({ ELEMENTS: count }, {
+const scalarGatherSourceUncached = (count) => part({ ELEMENTS: count }, {
   uniforms: ["sampler2D sourceTex", "sampler2D indicesTex", "sampler2D maskTex"],
   helpers: `float scalarGatherAt(int row) {
   if (fetch1(maskTex, row) == 0.0) return 0.0;
@@ -588,7 +588,7 @@ export const scalarGatherSource = (count) => part({ ELEMENTS: count }, {
  * The same, with the index CLAMPED to the source - "a gather whose indices are
  * written for another array", which is what stock AF3's key uid is.
  */
-export const clampedGatherSource = (count, sourceLength) => sized({ ELEMENTS: count, SOURCE: sourceLength }, `${PRELUDE}${ONE_TARGET}
+const clampedGatherSourceUncached = (count, sourceLength) => sized({ ELEMENTS: count, SOURCE: sourceLength }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D sourceTex;
 uniform sampler2D indicesTex;
 uniform sampler2D maskTex;
@@ -618,7 +618,7 @@ void main() {
  * pair's own read at stride 3 (relRMS 0.716) and then this one (0.450), each
  * found by the stage taps while every neighbouring stage stayed exact.
  */
-export const vec3GatherSource = (count, sourceStride) => part({ COUNT: count, STRIDE: sourceStride }, {
+const vec3GatherSourceUncached = (count, sourceStride) => part({ COUNT: count, STRIDE: sourceStride }, {
   uniforms: ["sampler2D sourceTex", "sampler2D indicesTex", "sampler2D maskTex"],
   body: `  int texel = linearTexel();
   if (texel >= COUNT) { result = vec4(0.0); return; }
@@ -629,7 +629,7 @@ export const vec3GatherSource = (count, sourceStride) => part({ COUNT: count, ST
 });
 
 /** `act[row][c] += Linear(position)[row][c] * mask[row]`. */
-export const positionToFeaturesSource = (rows, channels) => sized({ ELEMENTS: rows * channels, C4: channels / 4 }, `${PRELUDE}${ONE_TARGET}
+const positionToFeaturesSourceUncached = (rows, channels) => sized({ ELEMENTS: rows * channels, C4: channels / 4 }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D positionsTex;
 uniform sampler2D weightTex;
 uniform sampler2D maskTex;
@@ -648,9 +648,19 @@ void main() {
 }`);
 
 /** `out[i] = x[i]` - a copy, because a fragment cannot read its own target. */
-export const copySource = (elements) => part({ ELEMENTS: elements }, {
+const copySourceUncached = (elements) => part({ ELEMENTS: elements }, {
   uniforms: ["sampler2D xTex"],
   body: `  int texel = linearTexel();
   if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
   result = fetch4(xTex, texel);`,
 });
+
+// Every builder above, memoised on its arguments (`memoSource` in webgl/runtime/execution.js).
+export const maskRowsSource = memoSource(maskRowsSourceUncached);
+export const atomPairSource = memoSource(atomPairSourceUncached);
+export const aggregateSource = memoSource(aggregateSourceUncached);
+export const scalarGatherSource = memoSource(scalarGatherSourceUncached);
+export const clampedGatherSource = memoSource(clampedGatherSourceUncached);
+export const vec3GatherSource = memoSource(vec3GatherSourceUncached);
+export const positionToFeaturesSource = memoSource(positionToFeaturesSourceUncached);
+export const copySource = memoSource(copySourceUncached);

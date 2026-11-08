@@ -31,7 +31,7 @@
  * before optimizing performance" - and the geometry is the first thing to
  * revisit once a block folds.
  */
-import { ONE_TARGET, PRELUDE, targetDeclarations } from "../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, targetDeclarations, memoSource } from "../runtime/execution.js";
 import { TEXTURE_WIDTH } from "../runtime/context.js";
 import {
   INT5_DECODE, INT5_DECODE8, INT5_GROUP, int5DecodeSource,
@@ -106,7 +106,7 @@ export const shapeInts = (rows, inChannels, outChannels) => ({
   OUT4: Math.ceil(outChannels / 4),
 });
 
-export const linearSource = (
+const linearSourceUncached = (
   rows, inChannels, outChannels, activation, useBias, weightLayout, roundHalf = false,
 ) => {
   // `[out][in]`: four weight rows, each IN long and each starting on a texel
@@ -381,7 +381,7 @@ export const blockedApplies = (rows, inChannels, outChannels, weightLayout = "ou
   return wide || !strideDividesWidth(outChannels / 4);
 };
 
-export const blockedSource = (
+const blockedSourceUncached = (
   rows, inChannels, outChannels, activation, useBias, weightLayout, roundHalf,
   blockRows = BLOCK_ROWS, orderRowFastest = false, xStride4 = 0,
 ) => {
@@ -477,7 +477,7 @@ ${each((i) => `  result${i} = ${value(i)};`)}
  * codes run along the tensor's contiguous axis, which is `in` for that layout
  * and is the axis a fragment sweeps.
  */
-export const blockedInt5Source = (
+const blockedInt5SourceUncached = (
   rows, inChannels, outChannels, activation, useBias, roundHalf, blockRows = BLOCK_ROWS,
   orderRowFastest = true, xStride4 = 0, tileWidth = 0,
 ) => {
@@ -579,7 +579,7 @@ ${each((i) => `  result${i} = ${value(i)};`)}
 };
 
 /** Four row planes back into `[rows][outChannels]`: plane `row % 4`, texel `(row / 4) * OUT4 + group`. */
-export const blockRepackSource = (blockRows = BLOCK_ROWS, orderRowFastest = false,
+const blockRepackSourceUncached = (blockRows = BLOCK_ROWS, orderRowFastest = false,
   tileWidth = 0) => `${PRELUDE}${ONE_TARGET}
 uniform int ROWS;
 uniform int OUT4;
@@ -853,3 +853,9 @@ export function linear(execution, call, into) {
   if (narrowed !== null) execution.release(narrowed.tensor);
   return result;
 }
+
+// Every builder above, memoised on its arguments (`memoSource` in webgl/runtime/execution.js).
+export const linearSource = memoSource(linearSourceUncached);
+export const blockedSource = memoSource(blockedSourceUncached);
+export const blockedInt5Source = memoSource(blockedInt5SourceUncached);
+export const blockRepackSource = memoSource(blockRepackSourceUncached);

@@ -41,7 +41,7 @@
  * clamped at 19, and the row expectation is MAXIMISED over i rather than
  * averaged - every step of which is a place to be subtly wrong twice.
  */
-import { ONE_TARGET, PRELUDE } from "../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, memoSource } from "../runtime/execution.js";
 import { layerNorm } from "../kernels/layer-norm.js";
 import { linear } from "../kernels/linear.js";
 import { foldingTrunk } from "./trunk.js";
@@ -56,7 +56,7 @@ import { sumSource } from "./atom-transformer.js";
  *                  + rows[i][c] + columns[j][c] + product[i][j][c]
  *                  + table[bucket(d(i, j))][c]
  */
-export const assembleSource = (tokens, channels, edges) => `${PRELUDE}${ONE_TARGET}
+const assembleSourceUncached = (tokens, channels, edges) => `${PRELUDE}${ONE_TARGET}
 const int L = ${tokens};
 const int C4 = ${channels / 4};
 const int EDGES = ${edges};
@@ -98,7 +98,7 @@ void main() {
 }`;
 
 /** `out[i][j][c] = left[i][c] * right[j][c]`, before its own projection. */
-export const outerProductSource = (tokens, channels) => `${PRELUDE}${ONE_TARGET}
+const outerProductSourceUncached = (tokens, channels) => `${PRELUDE}${ONE_TARGET}
 const int L = ${tokens};
 const int C4 = ${channels / 4};
 const int ELEMENTS = ${tokens * tokens * channels};
@@ -116,7 +116,7 @@ void main() {
 }`;
 
 /** `pairMask[i][j] = tokenMask[i] * tokenMask[j]`. */
-export const pairMaskSource = (tokens) => `${PRELUDE}${ONE_TARGET}
+const pairMaskSourceUncached = (tokens) => `${PRELUDE}${ONE_TARGET}
 const int L = ${tokens};
 const int ELEMENTS = ${tokens * tokens};
 uniform sampler2D maskTex;
@@ -140,7 +140,7 @@ void main() {
  * Row-attention pooling: a masked softmax along j over one scalar a pair, then
  * the weighted sum of the pair's channels.
  */
-export const poolSource = (tokens, channels) => `${PRELUDE}${ONE_TARGET}
+const poolSourceUncached = (tokens, channels) => `${PRELUDE}${ONE_TARGET}
 const int L = ${tokens};
 const int C4 = ${channels / 4};
 const int ELEMENTS = ${tokens * channels};
@@ -171,7 +171,7 @@ void main() {
 }`;
 
 /** `out[atom][c] = tokenValues[atomToToken[atom]][c]`. */
-export const gatherToAtomsSource = (atoms, channels) => `${PRELUDE}${ONE_TARGET}
+const gatherToAtomsSourceUncached = (atoms, channels) => `${PRELUDE}${ONE_TARGET}
 const int C4 = ${channels / 4};
 const int ELEMENTS = ${atoms * channels};
 uniform sampler2D tokenTex;
@@ -194,7 +194,7 @@ void main() {
  * clamps to the table's rows), because a fragment that recomputed it would walk
  * the whole index array per output element.
  */
-export const plddtLogitsSource = (atoms, channels, bins) => `${PRELUDE}${ONE_TARGET}
+const plddtLogitsSourceUncached = (atoms, channels, bins) => `${PRELUDE}${ONE_TARGET}
 const int CHANNELS = ${channels};
 const int BINS = ${bins};
 const int ELEMENTS = ${atoms * bins};
@@ -230,7 +230,7 @@ void main() {
  * so 64 bins over [0, 32] are centred 0.25 to 31.75 and 50 over [0, 1] are
  * centred 0.01 to 0.99.
  */
-export const categoricalMeanSource = (rows, bins, start, end) => `${PRELUDE}${ONE_TARGET}
+const categoricalMeanSourceUncached = (rows, bins, start, end) => `${PRELUDE}${ONE_TARGET}
 const int BINS = ${bins};
 const int ROWS = ${rows};
 const float START = ${start.toFixed(6)};
@@ -262,7 +262,7 @@ void main() {
 }`;
 
 /** A token's masked mean over its atoms, and the representative atom's value. */
-export const perTokenSource = (atoms, tokens) => `${PRELUDE}${ONE_TARGET}
+const perTokenSourceUncached = (atoms, tokens) => `${PRELUDE}${ONE_TARGET}
 const int ATOMS = ${atoms};
 const int ELEMENTS = ${tokens};
 uniform sampler2D valuesTex;
@@ -473,3 +473,13 @@ export function esmfold2Confidence(execution, call) {
     pair, single: pooledSingle, plddtLogits, plddtPerAtom, plddt, paeLogits, pae,
   };
 }
+
+// Every builder above, memoised on its arguments (`memoSource` in webgl/runtime/execution.js).
+export const assembleSource = memoSource(assembleSourceUncached);
+export const outerProductSource = memoSource(outerProductSourceUncached);
+export const pairMaskSource = memoSource(pairMaskSourceUncached);
+export const poolSource = memoSource(poolSourceUncached);
+export const gatherToAtomsSource = memoSource(gatherToAtomsSourceUncached);
+export const plddtLogitsSource = memoSource(plddtLogitsSourceUncached);
+export const categoricalMeanSource = memoSource(categoricalMeanSourceUncached);
+export const perTokenSource = memoSource(perTokenSourceUncached);
