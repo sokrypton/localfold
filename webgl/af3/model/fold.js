@@ -84,6 +84,7 @@ import { ONE_TARGET, PRELUDE, sized } from "../../runtime/execution.js";
 
 /** @typedef {import("../../runtime/storage.js").Tensor} Tensor */
 /** @typedef {{indices: ArrayLike<number>, mask: Float32Array, count: number}} Gather */
+/** @typedef {{codes: ArrayLike<number>, deletions: ArrayLike<number>, mask: ArrayLike<number>, sequences: number}} MsaRows */
 /**
  * The fields of a featurised batch this fold reads, named rather than taken as
  * an `object`: "a key the batch carries and this literal does not name is a key
@@ -391,8 +392,7 @@ export function buildTargetFeat(execution, { batch, weights, flags, onStage }) {
 /**
  * @param {Execution} execution
  * @param {{batch: Batch, weights: ReturnType<typeof uploadAf3Weights>,
- *   hostWeights: any, msa: {codes: Float32Array, deletions: Float32Array,
- *     mask: Float32Array, sequences: number},
+ *   hostWeights: any, msa: MsaRows | ((pass: number) => MsaRows),
  *   recycles?: number, steps?: number, seed?: number, templates?: number,
  *   templateSlots?: any[], sampler?: object, readTrunk?: boolean,
  *   hoistPairConditioning?: boolean, normal?: () => number,
@@ -588,9 +588,17 @@ export function* foldAf3Steps(execution, call) {
   call.onStage?.("target-feat", { width: targetFeat.width });
   yield { stage: "target-feat" };
 
-  const msaCodes = upload(msa.codes, "af3.msa.codes");
-  const deletions = upload(msa.deletions, "af3.msa.deletions");
-  const msaMask = upload(msa.mask, "af3.msa.mask");
+  // `msa` is one alignment for every pass, or - a deep one, which every pass draws its own rows from as
+  // webgpu/af3/fold.js does (shared/af3/msa-draw.js) - a function of the pass. A pass's draw is uploaded
+  // at its start and released at its end, so only one pass's rows are on the GPU at a time.
+  const msaOfPass = typeof msa === "function" ? msa : null;
+  let msaCodes, deletions, msaMask;
+  let sequences = msaOfPass === null ? msa.sequences : 0;
+  if (msaOfPass === null) {
+    msaCodes = upload(msa.codes, "af3.msa.codes");
+    deletions = upload(msa.deletions, "af3.msa.deletions");
+    msaMask = upload(msa.mask, "af3.msa.mask");
+  }
 
   // The template slots, built once: they do not depend on the pass.
   const slotInput = (slot) => ({
@@ -628,13 +636,24 @@ export function* foldAf3Steps(execution, call) {
   let trunk;
   for (let pass = 0; pass <= recycles; pass += 1) {
     call.onStage?.("recycle", { pass, passes: recycles + 1 });
+    let passMsa = [];
+    if (msaOfPass !== null) {
+      const drawn = msaOfPass(pass);
+      sequences = drawn.sequences;
+      passMsa = [
+        execution.upload(Float32Array.from(drawn.codes), "af3.msa.codes"),
+        execution.upload(Float32Array.from(drawn.deletions), "af3.msa.deletions"),
+        execution.upload(Float32Array.from(drawn.mask), "af3.msa.mask"),
+      ];
+      [msaCodes, deletions, msaMask] = passMsa;
+    }
     const embedded = embed(execution, {
       targetFeat: targetFeatTensor,
       identity: batchTensors.identity,
       msaCodes, deletions,
       previousPair, previousSingle,
       weights: weights.embedder,
-      tokens, sequences: msa.sequences,
+      tokens, sequences,
       pairInitFromSingle: flags.pairInitFromSingle,
       msaPairedQueryRow: flags.msaPairedQueryRow,
     });
@@ -661,7 +680,7 @@ export function* foldAf3Steps(execution, call) {
       halfLogits: weights.distogram.halfLogits,
       msaBlocks: weights.msaBlocks,
       pairformerBlocks: weights.pairformerBlocks,
-      tokens, sequences: msa.sequences, pairChannels,
+      tokens, sequences, pairChannels,
       msaUpdateBeforeOuterProduct: flags.msaUpdateBeforeOuterProduct,
       msaDoubleAddPair: flags.msaDoubleAddPair,
       swapTransposedBias: flags.swapTransposedBias,
@@ -669,6 +688,7 @@ export function* foldAf3Steps(execution, call) {
       opmBiasAfterNorm: flags.opmBiasAfterNorm,
     });
     if (templateUpdate !== undefined) execution.release(templateUpdate);
+    for (const tensor of passMsa) execution.release(tensor);
     // ...the pass's pair and single ARE the next pass's recycled state.
     if (previousPair !== undefined) execution.release(previousPair);
     if (previousSingle !== undefined) execution.release(previousSingle);
