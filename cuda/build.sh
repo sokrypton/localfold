@@ -34,6 +34,13 @@ if [ -n "$archs" ]; then           # every listed card's SASS, and the newest's 
   arch="sm_${archs// /,sm_}"; cc="multi"
 fi
 rpath=(); [ -z "${LOCALFOLD_RPATH:-}" ] || rpath=(-Xlinker -rpath -Xlinker "$LOCALFOLD_RPATH")
+# CUPTI's header (af3/src/profile.cuh; the library itself is dlopen'd only for --profile): a toolkit from NVIDIA's
+# runfile or .deb puts it in <cuda>/extras/CUPTI/include, which nvcc does not search - python/manylinux_build.sh adds it
+# through CPATH, and this is the same directory for a local build. Absent (a conda toolkit has it in include/), nothing.
+cupti=(); nvcc_bin="$(command -v nvcc 2>/dev/null || true)"
+for root in "${CUDA_HOME:-}" "${CUDA_PATH:-}" "${nvcc_bin:+$(dirname "$(dirname "$nvcc_bin")")}"; do
+  [ -n "$root" ] && [ -f "$root/extras/CUPTI/include/cupti.h" ] && { cupti=(-I"$root/extras/CUPTI/include"); break; }
+done
 marker=/tmp/localfold-cuda-build log=/tmp/localfold-cuda-build.log
 echo $$ > "$marker"; trap 'rm -f "$marker"' EXIT
 : > "$log"
@@ -145,12 +152,12 @@ for port in "${ports[@]}"; do
   [ "$port" != rfd4p ] || { extra=("$here"/ef2/src/*.cuh "$here"/rfd4p/src/*.h "$here"/rfd4p/featurise/*.cpp \
     "$here"/rfd4p/featurise/*.h "$here"/rfd4p/featurise/*.inc); \
     link=("$here/rfd4p/featurise/featurise.o"); linkstamp="$rfbin.stamp"; linkwant="$rfstamp"; }
-  stamp="$arch ${LOCALFOLD_RPATH:-} $(cat "$here/$port"/src/*.cu* "${extra[@]}" "$here"/af3/src/*.cuh "$here"/plm/*.cuh "$here"/featurise/*.h "$here"/featurise/*.inc "$here"/featurise/*.cpp | sha256sum | cut -c1-16)"
+  stamp="$arch ${LOCALFOLD_RPATH:-} ${cupti[*]} $(cat "$here/$port"/src/*.cu* "${extra[@]}" "$here"/af3/src/*.cuh "$here"/plm/*.cuh "$here"/featurise/*.h "$here"/featurise/*.inc "$here"/featurise/*.cpp | sha256sum | cut -c1-16)"
   if [ -x "$out" ] && [ "$(cat "$out.arch" 2>/dev/null)" = "$stamp" ]; then continue; fi
   # (-O1: nvcc's -O is the HOST code's level - the device code is optimised either way, its SASS byte-identical
   # - and host -O3 was 40% of AF3's compile for no measurable run time; -O0 costs a fold 7%)
   # (compiled to an object while standalone.o builds, then linked once it has)
-  ( cd "$here/$port" && $prio nvcc -O1 -std=c++17 $archflags --split-compile 0 --default-stream per-thread $fast -c src/$port.cu \
+  ( cd "$here/$port" && $prio nvcc -O1 -std=c++17 $archflags --split-compile 0 --default-stream per-thread $fast "${cupti[@]}" -c src/$port.cu \
       -o "$out.o" >> "$log" 2>&1 \
     && until [ ${#link[@]} = 0 ] || [ "$(cat "$linkstamp" 2>/dev/null)" = "$linkwant" ]; do
          [ "$(cat "$linkstamp" 2>/dev/null)" != failed ] || { echo "FAILED $port: no featuriser object" >> "$log"; exit 1; }
