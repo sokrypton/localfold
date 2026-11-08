@@ -27,6 +27,9 @@ const BASELINE = join(dirname(fileURLToPath(import.meta.url)), "gate-baseline.js
 /** 6MRR's chain A, which is what every other row in this table folds. */
 const SIX_MRR = "GWSTELEKHREELKEFLKKEGITNVEIRIDNGRLEVRVEGGTERLKRFLEELRQKLEKKGYTVDIKIE";
 
+/** 5CAJ's chain A, 261 residues - the template gate's target, so its fold is known elsewhere here. */
+const FIVE_CAJ = "PRGSHMLILISPAKTLDYQSPLTTTRYTLPELLDNSQQLIHEARKLTPPQISTLMRISDKLAGINAARFHDWQPDFTPANARQAILAFKGDVYTGLQAETFSEDDFDFAQQHLRMLSGLYGVLRPLDLMQPYRLEMGIRLENARGKDLYQFWGDIITNKLNEALAAQGDNVVINLASDEYFKSVKPKKLNAEIIKPVFLDEKNGKFKIISFYAKKARGLMSRFIIENRLTKPEQLTGFNSEGYFFDEDSSSNGELVFKRYE";
+
 export const FOLDS = [
   ["AF2", ["tools/gpu/fold-af2.js", "--repeat=2"]],
   // 🔴 TWO FOLDS, AND THE TRUNK'S WEIGHTS GIVEN BACK BETWEEN THEM. A streamed
@@ -69,6 +72,18 @@ export const FOLDS = [
   // BioEmu2: its own graph (webgpu/bioemu2) - a generic GEMM, its LayerNorm and softmax kernels and the
   // ESMFold2/AF3 pair track - from the job, through its own featuriser, 6MRR's 68 residues
   ["BioEmu2", ["tools/gpu/fold-bioemu2.js", "--job=/tools/fixtures/bioemu2/6mrr-68.json", "--steps=50"]],
+  // 🔴 590 TOKENS, BECAUSE EVERY ROW ABOVE IS TOO SMALL TO REACH THE TRACK A LARGE FOLD TAKES. Past a 32 MiB pair (256
+  // AF3 tokens, 181 ESMFold2 residues: GRID_CHUNK_MIN_BYTES, COMPACT_MIN_BYTES) and off the matrix units the triangle walks its channels in groups and ESMFold2
+  // binds its pairs a segment at a time (webgpu/af3/trunk/sequential-groups.js, webgpu/runtime/segmented.js) - which
+  // a 68-token fold never enters, and the flagged A100 gates never do at any size. So the stock arm is the one that holds
+  // it on this box; the portable and spec-floor arms keep the matrix units and fold these on the old track. Both were
+  // bit-identical to the old track when it came in (PR #7: 4788 of 4788 atoms, 4785 of 4785) at 820 and 2384 MiB, where
+  // the old one held 944 and 2757. `--tune=sequentialTriangle=false` is the control arm. 25 steps, the page's
+  // (exponential, foldBatch's default). It also found the atom block's row tile past the spec floor's workgroup
+  // storage, which no 68-token row could reach (createAtomBlockShaders).
+  ["AF3-590", ["tools/gpu/fold.js", "--model=/model-af3-int5/manifest.json",
+               `--sequence=${FIVE_CAJ}:${FIVE_CAJ}:${SIX_MRR}`, "--steps=25"]],
+  ["EF2-590", ["tools/gpu/fold-esmfold2.js", "--bundle=/model-esmfold2-int5", `--sequence=${FIVE_CAJ}${FIVE_CAJ}${SIX_MRR}`]],
 ];
 
 const run = (args, env) => new Promise((resolve) => {
@@ -114,7 +129,9 @@ export async function runFolds({ env, question, broke, precondition, arm }) {
     const skip = !ok && unmet === undefined && missing !== undefined;
     // ...and say WHICH failure it is: without DISPLAY on a headless box every
     // arm reads "no structure produced", which is one missing X server.
-    const named = text.match(/[^\n]*(enables \w+|extension 'f16'|exceeds the maximum)[^\n]*/)?.[0]?.trim();
+    // 🔴 A LINE AT A TIME: `[^\n]*(...)[^\n]*` over the whole text is quadratic in a line's length, and a 590-token fold
+    // prints its PDB as one 383 KB line of JSON - the gate sat at full CPU for minutes after the fold had finished.
+    const named = text.split("\n").find((line) => /enables \w+|extension 'f16'|exceeds the maximum/.test(line))?.trim();
     const lastLine = text.trim().split("\n").filter(Boolean).pop()?.slice(0, 110);
     const why = unmet ?? signature ?? missing ?? named
       ?? `no structure produced - ${lastLine ?? "no output"}`;

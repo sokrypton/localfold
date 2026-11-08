@@ -22,7 +22,7 @@ import { af3ContactClasses } from "../../shared/af3/featurise/contact-classes.js
 import { CLASS_LIGAND, CLASS_NUCLEIC } from "../../shared/heads/contact-threshold.js";
 import { af3BatchFromA3m } from "../../shared/af3/featurise/batch.js";
 import { mergeRowAlignedChainA3ms } from "../../shared/input/chains.js";
-import { foldBatch, toPdb, backboneGeometry } from "../../webgpu/af3/fold.js";
+import { DIFFUSION_DEFAULTS, foldBatch, toPdb, backboneGeometry } from "../../webgpu/af3/fold.js";
 import { assertChainGeometry } from "./chain-geometry.js";
 import { bondGeometry } from "./bond-geometry.js";
 import { confidenceWeights, openAf3Store, trunkDepths, trunkWeights }
@@ -92,7 +92,9 @@ export async function main(device, args) {
   // webgpu/af3/diffusion/diffusion-sampler.js - so say so rather than let the
   // geometry report take the blame.
   // (with Euler's step: --update=exponential folds 6MRR at 8 steps, cpu/af3/diffusion/diffusion-sampler.js)
-  if (samplerMode === "diffusion" && steps < 50 && option(args, "update", "euler") !== "exponential") {
+  // ...and foldBatch's own default is exponential (DIFFUSION_DEFAULTS), so only an explicit Euler is warned: this
+  // fired on every short fold, the page's 25 exponential steps included.
+  if (samplerMode === "diffusion" && steps < 50 && option(args, "update", DIFFUSION_DEFAULTS.update) !== "exponential") {
     console.log(`🔴 ${steps} steps of the DIFFUSION sampler will not converge -`
       + " it wants about 200. Add --update=exponential to get a structure in this many,"
       + " or raise --steps. What follows is expected to look like noise.");
