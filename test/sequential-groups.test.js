@@ -38,6 +38,12 @@ describe("the channel groups the sequential triangle takes", () => {
     assert.equal(fewestSequentialGroups({ pairBytes: large, maxBufferBytes: 4 * GIB }), 2);
   });
 
+  it("refuses a pair whose a and b fit no buffer at the most groups, by name", () => {
+    assert.equal(fewestSequentialGroups({ pairBytes: 16 * GIB, maxBufferBytes: 4 * GIB }), MOST_SEQUENTIAL_GROUPS);
+    assert.throws(() => fewestSequentialGroups({ pairBytes: 16 * GIB + 8, maxBufferBytes: 4 * GIB }),
+      /past this device's largest buffer/);
+  });
+
   it("does not treat a missing budget as none left", () => {
     assert.equal(fewestSequentialGroups({ pairBytes, residentBytes, budgetBytes: null }), 2);
   });
