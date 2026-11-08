@@ -23,7 +23,8 @@ import { af3BatchFromA3m } from "../shared/af3/featurise/batch.js";
 import { featuriserDialect, templatePolicyFor } from "../shared/af3/dialect.js";
 import { foldBatch, toPdb, atomName, warmTrunkPipelines }
   from "../webgpu/af3/fold.js";
-import { foldBatchWebGl2 } from "../webgl/af3/model/fold-batch.js";
+import { foldBatchWebGl2, preloadWebGl2Weights } from "../webgl/af3/model/fold-batch.js";
+export { preloadWebGl2Weights };
 import { confidenceWeights, openddeConfidenceWeights, structuralExpanderWeights,
   structuralRefinerWeights, trunkDepths, trunkWeights } from "../shared/af3/weights/weights.js";
 import { diffusionWeights, atomReference, targetFeatureWeights }

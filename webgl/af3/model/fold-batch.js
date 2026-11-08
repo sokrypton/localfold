@@ -119,6 +119,19 @@ export function foldMsa(batch, dialect, options = {}) {
 }
 
 /**
+ * Upload a family's weights to the WebGL2 context now, ahead of the fold that will want them (the same memoised upload
+ * `foldBatchWebGl2` awaits, so that fold finds it done).
+ *
+ * 🔴 THE PAGE DOWNLOADS THE WEIGHTS BESIDE THE MMseqs2 SEARCH AND USED TO UPLOAD THEM AFTER IT. The search is seconds of
+ * waiting on a server with the GPU idle, and on Safari 16.3 the upload - decoding the int5 bundle, narrowing to float16,
+ * texSubImage2D - is ~1.6 s of a first fold that otherwise waits on nothing. web/app.js starts this when the download
+ * lands and the backend is known to be WebGL2.
+ */
+export function preloadWebGl2Weights(weights) {
+  return uploadedFor(weights);
+}
+
+/**
  * @param {object} batch the featurised batch
  * @param {object} weights web/af3-model.js `loadAf3Weights`'s tree
  * @param {{steps: number, recycles?: number, seed?: number, templateSlots?: object[],
