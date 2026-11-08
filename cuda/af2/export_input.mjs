@@ -85,6 +85,11 @@ if (option("job", "") !== "") {
   if (request.ligandCodes.length > 0) throw new Error("AlphaFold 2 folds protein chains only; this job has a ligand");
   if (request.modifications.length > 0) throw new Error("AlphaFold 2 folds the standard residues only; this job has a modified residue");
   if ((request.bonds ?? []).length > 0) throw new Error("AlphaFold 2 takes no declared bond; this job has one");
+  // the page's rule (web/app.js): a job's own alignments are AlphaFold 3's - refused, not dropped in silence;
+  // --a3m or --search names an alignment instead
+  if (job.alignments !== undefined && option("a3m", "") === "" && !args.includes("--search")) {
+    throw new Error("the job's own alignments are AlphaFold 3's - choose an AlphaFold 3-lineage model, or set the MSA to search");
+  }
   sequence = request.sequence;
 }
 const a3mPath = option("a3m", "");

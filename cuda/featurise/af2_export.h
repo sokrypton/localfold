@@ -332,6 +332,11 @@ inline Af2Export exportAf2(const Args& args) {
     if (!request.ligands.empty()) throw std::runtime_error("AlphaFold 2 folds protein chains only; this job has a ligand");
     if (!request.modifications.empty()) throw std::runtime_error("AlphaFold 2 folds the standard residues only; this job has a modified residue");
     if (!request.bonds.empty()) throw std::runtime_error("AlphaFold 2 takes no declared bond; this job has one");
+    // the page's rule (web/app.js): a job's own alignments are AlphaFold 3's and fold only with that lineage - refused
+    // here as there, where they had been dropped in silence and the fold run from one row under "the file's own
+    // alignments". --a3m or --search names an alignment instead, as the page's MSA dial does
+    if (job.hasAlignments && args.option("a3m").empty() && !args.has("search"))
+        throw std::runtime_error("the job's own alignments are AlphaFold 3's - choose an AlphaFold 3-lineage model, or set the MSA to search");
     sequence = request.sequence;
   }
   std::string a3mPath = args.option("a3m");

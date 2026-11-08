@@ -271,6 +271,10 @@ def cases():
         ("af2-1brs-template", "af2", job("t", [protein("A", brs_a), protein("D", brs_d)]),
          ["--template=@F/1brs-crystal.pdb:A@0+@F/1brs-crystal.pdb:D@1"], AF2),
         ("af2-ligand-refused", "af2", job("t", [protein("A", SEQ_6MRR), {"ligand": {"id": "B", "ccdCodes": ["GOL"]}}]), [], AF2),
+        # (a job's own alignments are AlphaFold 3's: refused with the page's sentence - they had been dropped in silence and
+        # the fold run from one row under "the file's own alignments" - and --a3m names an alignment instead)
+        ("af2-inline-msa-refused", "af2", job("t", [protein("A", SEQ_6MRR, unpairedMsa=f">q\n{SEQ_6MRR}\n")]), [], AF2),
+        ("af2-inline-msa-a3m", "af2", job("t", [protein("A", SEQ_6MRR, unpairedMsa=f">q\n{SEQ_6MRR}\n")]), [f"--a3m={m6}"], AF2),
         # a job's own inline template, aligned by its mapping; one chain of two templated, the other padded as
         # AlphaFold-Multimer's pipeline pads it (--template-pad=zero, RFD4's AF2 oracle); an alignment unmasked
         # (--msa-mask=0, the oracle's pct_seq_mask)
@@ -294,6 +298,7 @@ def cases():
         ("ef2-biotin-smiles", "ef2", job("t", [protein("A", SEQ_6MRR),
                                                     {"ligand": {"id": "B", "smiles": "OC(=O)CCCC[C@@H]1SC[C@@H]2NC(=O)N[C@H]12"}}]), [], EF),
         ("ef2-1brs-a3m", "ef2", job("t", [protein("A", brs_a), protein("D", brs_d)]), [f"--a3m={sa},{sd}"], EF),
+        ("ef2-inline-msa-refused", "ef2", job("t", [protein("A", SEQ_6MRR, unpairedMsa=f">q\n{SEQ_6MRR}\n")]), [], EF),
         # the page's Max MSA as an override of ESMFold2's own 16384 rows, and a value that is not a row count
         ("ef2-1brs-a3m-max-msa", "ef2", job("t", [protein("A", brs_a), protein("D", brs_d)]),
          [f"--a3m={sa},{sd}", "--max-msa=7"], EF),

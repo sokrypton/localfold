@@ -34,6 +34,10 @@ inline Esmfold2Export exportEsmfold2(const Args& args) {
     if (!sequence.empty()) throw std::runtime_error("--job and --sequence both name the input");
     Job job = jobFromJson(readFile(args.option("job")));
     for (auto& note : job.notes) out.said.push_back("job: " + note);
+    // the page's rule (web/app.js): a job's own alignments are AlphaFold 3's - refused, where they had been dropped in
+    // silence (the fold run from each chain's own row); --a3m names an alignment instead
+    if (job.hasAlignments && args.option("a3m").empty())
+      throw std::runtime_error("the job's own alignments are AlphaFold 3's - choose an AlphaFold 3-lineage model, or set the MSA to search");
     request = expandEntities(job.entities);
     haveJob = true;
     sequence = request.sequence;

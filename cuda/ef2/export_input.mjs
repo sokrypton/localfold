@@ -43,6 +43,11 @@ if (option("job", "") !== "") {
   const { expandEntities } = await import("../../web/entities.js");
   const job = jobFromJson(readFileSync(option("job", ""), "utf8"));
   for (const note of job.notes) console.log(`job: ${note}`);
+  // the page's rule (web/app.js): a job's own alignments are AlphaFold 3's - refused, not dropped in silence;
+  // --a3m names an alignment instead
+  if (job.alignments !== undefined && option("a3m", "") === "") {
+    throw new Error("the job's own alignments are AlphaFold 3's - choose an AlphaFold 3-lineage model, or set the MSA to search");
+  }
   jobRequest = expandEntities(job.entities);
   sequence = jobRequest.sequence;
   kinds = jobRequest.chainKinds.join(",");
