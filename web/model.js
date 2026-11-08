@@ -159,6 +159,8 @@ export function openStore(onProgress, family = DEFAULT_FAMILY) {
         opened);
     })();
     stores.set(family, store);
+    // A download that failed once must not fail until the reader reloads (PR #7, lhallee).
+    store.catch(() => { if (stores.get(family) === store) stores.delete(family); });
   }
   return store;
 }
@@ -167,7 +169,11 @@ let devicePromise;
 
 /** The WebGPU device, with the optional features the fast paths look for. */
 export function getDevice() {
-  devicePromise ??= (async () => {
+  if (devicePromise !== undefined) return devicePromise;
+  // 🔴 NEITHER A REJECTION NOR A LOST DEVICE MAY STAY MEMOISED (PR #7, lhallee): a failed request left the page saying
+  // "No compatible WebGPU adapter was found" until a reload, and a lost device (a crashed GPU process, a driver reset)
+  // had every later fold run against a dead device. The next fold asks again.
+  const request = (async () => {
     if (navigator.gpu === undefined) throw new Error("This browser has no WebGPU. It ships in current Chrome, Edge, Safari and Firefox.");
     const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
     if (adapter === null) throw new Error("No compatible WebGPU adapter was found");
@@ -184,9 +190,12 @@ export function getDevice() {
     // compiles - started here, they run under the weights' download instead of in front of the fold. Not awaited; the
     // promise is the one the stacks await.
     settleGridAttendTiling(device);
+    void device.lost.then(() => { if (devicePromise === request) devicePromise = undefined; });
     return device;
   })();
-  return devicePromise;
+  devicePromise = request;
+  request.catch(() => { if (devicePromise === request) devicePromise = undefined; });
+  return request;
 }
 
 let backendPromise;
