@@ -244,6 +244,16 @@ export class Storage {
      * int5 path wins when a tensor qualifies. See `webgl/runtime/int5.js`.
      */
     this.int5Weights = options.int5Weights ?? false;
+    /**
+     * The smallest weight `halfWeights` holds in float16 (`HALF_WEIGHT_FLOOR` unless a driver says otherwise).
+     *
+     * 🔴 THE FLOOR'S PREMISE DOES NOT HOLD ON AN M2: a weight in cache is still read FASTER as float16.
+     * tools/gpu/probe-webgl-packed-x.js, one projection with each operand in either format: 3481 x 128 -> 256 is 299
+     * GFLOP/s with an f32 weight and 440 with an f16 one, 3481 x 128 -> 128 290 against 415 - weights of 32 K and
+     * 16 K floats, far inside the floor, which is every pair projection in an AF3 trunk. WebGPU holds those same
+     * weights in f16 (`pairWeightPrecision`). The AF3 driver lowers it (fold-batch.js); the gates do not.
+     */
+    this.halfWeightFloor = options.halfWeightFloor ?? HALF_WEIGHT_FLOOR;
     this.int5WeightTensors = 0;
   }
 
@@ -368,7 +378,7 @@ export class Storage {
    * the host.
    */
   uploadWeight(values, label = "weight") {
-    let half = this.halfWeights && values.length >= HALF_WEIGHT_FLOOR;
+    let half = this.halfWeights && values.length >= this.halfWeightFloor;
     if (half && !this.virtual) {
       // 🔴 AND A TENSOR THAT DOES NOT FIT IN float16 STAYS IN float32 RATHER
       // THAN BECOMING Inf. A checkpoint's weights are all well inside the

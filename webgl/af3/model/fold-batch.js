@@ -49,6 +49,17 @@ export function webgl2FoldAvailable() {
  */
 export const AF3_POOL_LIMIT_BYTES = 128 * 2 ** 20;
 
+/**
+ * The smallest weight the AF3 fold holds in float16 (`Storage.halfWeightFloor`), where the backend's default is 65,536.
+ *
+ * 🔴 EVERY PAIR PROJECTION IN AN AF3 TRUNK WAS UNDER THE OLD FLOOR - 128 x 128 and 128 x 256 are 16 K and 32 K
+ * floats - so they streamed float32 weights, and `probe-webgl-packed-x.js` reads a projection ~1.5x faster with an f16
+ * weight even when it sits in cache. 59 residues, 8076-row a3m at 128 rows, Chrome on an M2: 5.55 s -> 5.27 at 4096
+ * (trunk 1.95 -> 1.75), peak 971 -> 926 MiB, against WebGPU's fold relative RMS 7.7e-4 -> 6.5e-4; 256 is no faster.
+ * WebGPU holds the same weights in f16.
+ */
+export const AF3_HALF_WEIGHT_FLOOR = 4096;
+
 // One context for the page, and the last family's weights on it: a second family's upload
 // replaces the first's (each is ~800 MB as halves), the same family's is kept.
 let execution = null;
@@ -59,7 +70,7 @@ function uploadedFor(weights) {
   // The configuration fold-af3-webgl.js gates against the WGSL fold: half weights and activations, a bounded pool.
   execution ??= new Execution(createWebGL2Context(),
     { halfWeights: true, halfActivations: true, int5Weights: true,
-      pooling: true, poolLimitBytes: AF3_POOL_LIMIT_BYTES });
+      pooling: true, poolLimitBytes: AF3_POOL_LIMIT_BYTES, halfWeightFloor: AF3_HALF_WEIGHT_FLOOR });
   if (resident?.weights !== weights) {
     const previous = resident;
     resident = {
