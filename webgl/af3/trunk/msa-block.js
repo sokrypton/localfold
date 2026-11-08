@@ -169,9 +169,14 @@ export function msaBlock(execution, call) {
       sequences, tokens, msaChannels, pairChannels, epsilon,
     }), ownMsa);
     ownMsa = true;
-    msa = residual(msa, transition(execution, {
-      x: msa, weights: w.msaTransition, rows, channels: msaChannels, epsilon,
-    }), ownMsa);
+    {
+      // ...the residual inside: the down projection's repack adds it
+      const next = transition(execution, {
+        x: msa, weights: w.msaTransition, rows, channels: msaChannels, epsilon, residualOf: msa,
+      });
+      if (ownMsa) execution.release(msa);
+      msa = next;
+    }
   };
   if (call.msaUpdateBeforeOuterProduct) {
     updateMsa();
@@ -202,9 +207,14 @@ export function msaBlock(execution, call) {
     pair = next;
     ownPair = true;
   }
-  pair = residual(pair, transition(execution, {
-    x: pair, weights: w.pairTransition, rows: pairs, channels: pairChannels, epsilon,
-  }), ownPair);
+  {
+    // ...the residual inside: the down projection's repack adds it
+    const next = transition(execution, {
+      x: pair, weights: w.pairTransition, rows: pairs, channels: pairChannels, epsilon, residualOf: pair,
+    });
+    if (ownPair) execution.release(pair);
+    pair = next;
+  }
 
   msa.label = "af3.msa-block.msa";
   pair.label = "af3.msa-block.pair";

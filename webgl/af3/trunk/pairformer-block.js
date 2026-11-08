@@ -184,10 +184,12 @@ export function pairHalf(execution, call, ownsPair = false) {
     own = true;
     pair = next;
   }
-  pair = residual(pair, transition(execution, {
-    x: pair, weights: w.pairTransition, rows: tokens * tokens, channels, epsilon,
-  }));
-  return pair;
+  // ...the residual inside: the down projection's repack adds it
+  const next = transition(execution, {
+    x: pair, weights: w.pairTransition, rows: tokens * tokens, channels, epsilon, residualOf: pair,
+  });
+  if (own) execution.release(pair);
+  return next;
 }
 
 /**
@@ -255,9 +257,14 @@ export function pairformerBlock(execution, call) {
   }), ownSingle);
   ownSingle = true;
   execution.release(pairLogits);
-  single = residual(single, transition(execution, {
-    x: single, weights: w.singleTransition, rows: tokens, channels: singleChannels, epsilon,
-  }), ownSingle);
+  {
+    // ...the residual inside: the down projection's repack adds it
+    const next = transition(execution, {
+      x: single, weights: w.singleTransition, rows: tokens, channels: singleChannels, epsilon, residualOf: single,
+    });
+    if (ownSingle) execution.release(single);
+    single = next;
+  }
 
   pair.label = "af3.block.pair";
   single.label = "af3.block.single";

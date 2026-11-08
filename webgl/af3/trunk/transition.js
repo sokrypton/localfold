@@ -87,7 +87,8 @@ export function releaseTransitionWeights(execution, weights) {
  * @returns {Tensor} `rows * channels`, the update; the caller adds it
  */
 export function transition(execution, call) {
-  const { x, weights: w, rows, channels, epsilon = 1e-5 } = call;
+  // `residualOf`: return `residualOf + update` - added in the down projection's repack (`linear`'s `residual`)
+  const { x, weights: w, rows, channels, epsilon = 1e-5, residualOf } = call;
   if (x.elements !== rows * channels) {
     throw new RangeError(
       `af3 transition: x holds ${x.elements} floats, not ${rows} x ${channels}`);
@@ -131,6 +132,7 @@ export function transition(execution, call) {
   const out = linear(execution, {
     x: gated, weight: w.transition2, rows,
     inChannels: intermediate, outChannels: channels, weightLayout: "in-major",
+    ...(residualOf === undefined ? {} : { residual: residualOf }),
   });
   execution.release(gated);
   out.label = "af3.transition";
