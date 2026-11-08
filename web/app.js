@@ -59,10 +59,10 @@ import { ccdUrl, parseCcdComponent } from "../shared/af3/featurise/ccd-component
 import { CROSSLINKER_COMPONENTS } from "../shared/chem/crosslinkers.js";
 import { smilesComponent } from "../shared/chem/component.js";
 import { GpuBufferAllocator } from "../webgpu/runtime/allocator.js";
-import { getDevice, loadModel, releaseModel } from "./model.js";
+import { foldBackend, getDevice, loadModel, releaseModel } from "./model.js";
 import { releaseAllWeights } from "../webgpu/runtime/resident.js";
 import { AF3_FAMILIES, ALL_ATOM_FAMILIES, BIOEMU2_FAMILIES, MODEL_BUNDLES, MODELS_WITHOUT_CONFIDENCE,
-  SINGLE_SEQUENCE_FAMILIES, graphFamily }
+  SINGLE_SEQUENCE_FAMILIES, WEBGL2_FAMILIES, graphFamily }
   from "../shared/bundles/manifests/index.js";
 import { devBeginRun, devEndRun, devNote, devPhase, devStatus, devUseDevice } from "./dev-log.js";
 import { installDevPanel } from "./dev-panel.js";
@@ -3020,12 +3020,16 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   // server that might be queuing for a minute. The download reports itself on
   // the right instead, dial and label both.
   // (the device asked for first, so an Apple GPU's kernel races run under the weights' download: web/model.js)
-  const deviceStarted = getDevice();
-  deviceStarted.catch(() => {});
+  // 🔴 AND `foldBackend` IS WHAT ASKS, because on a browser with no WebGPU there is no device to
+  // await: it resolves "webgl2" and this path hands foldAf3 a `backend` instead. Started rather
+  // than awaited here for the same reason the device was - the races and the download overlap.
+  const backendStarted = foldBackend();
+  backendStarted.catch(() => {});
   const weights = await (modelLoad ?? loadAf3Weights());
   throwIfAborted(signal);
 
-  const device = await deviceStarted;
+  const backend = await backendStarted;
+  const device = backend === "webgpu" ? await getDevice() : undefined;
   throwIfAborted(signal);
 
   predictionCount += 1;
@@ -3116,6 +3120,10 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   let viewerModified = [];
   const result = await foldAf3({
     sequence, calls, recycles, weights, device, signal,
+    // 🔴 NAMED HERE OR DROPPED: this literal is an allow-list, CLAUDE.md's trap at this seam -
+    // foldAf3 reads `options.backend`, and a fold that does not pass it asks for a device that
+    // is undefined and fails inside the first kernel instead of in the backend it chose.
+    ...(backend === "webgl2" ? { backend } : {}),
     alignment: alignmentBlocks, maxMsaSequences, ligandCodes, modifications,
     chainKinds, reuse, bonds: foldContext.bonds, constraints: foldContext.constraints,
     ...(msaColumnKinds === undefined ? {} : { msaColumnKinds }),
@@ -3450,6 +3458,11 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   // lineage fold was ever checked. The number stays with the tools; the WARNING
   // appears only when `chainGeometryVerdict` refuses the fold - IntelliFold-2 in
   // Flow returns one such fold in six at pLDDT 83.
+  // 🔴 AND THE LINE SAYS WHICH BACKEND FOLDED IT, because a WebGL2 fold is the same structure and
+  // about 6x the wall clock (measured: 5.8 s against 0.9 s at 61 tokens), so a visitor comparing
+  // this page with somebody else's screenshot needs to know which one they are looking at. Nothing
+  // is said on the WebGPU path - naming the ordinary case on every fold is noise.
+  if (backend === "webgl2") detail.push("WebGL2");
   const chain = chainGeometryVerdict(result.geometry ?? {}, { plddt: result.meanPlddt });
   if (!chain.ok) detail.push("🔴 NOT A CHAIN - the backbone is broken, and pLDDT does not measure that");
   status(`${modelName} · ${what.join(" + ")} · ${detail.join(" · ")}`);
@@ -4979,11 +4992,28 @@ async function fold(event) {
                             templates: request.templates ?? [], family, signal });
       return;
     }
+    // 🔴 WITHOUT WebGPU THE PAGE FOLDS IN WebGL2, AND ONLY THE AF3 LINEAGE CAN. `webgl/` holds
+    // af2, bioemu2, esmc and esmfold2 as well, but web/af3-model.js is the only page path with a
+    // `backend` to pass, so every other family is refused BY NAME - which is this page's rule at
+    // every other such seam (a template on a template-free model, a bond on a model that reads
+    // none): a family that cannot run must say so, never fold something else and never hang.
+    // The sentence names what does work, because "not supported" leaves the visitor nowhere.
+    const backend = await foldBackend();
+    // 🔴 AND THE LIST IS NARROWER THAN THE LINEAGE - see WEBGL2_FAMILIES. Four of the eight AF3
+    // bundles carry the FUSED template embedder, which webgl/ has not ported, and OpenDDE
+    // re-tokenises after the trunk; refusing them HERE is what keeps a visitor from downloading
+    // half a gigabyte of parameters before finding out.
+    if (backend === "webgl2" && !WEBGL2_FAMILIES.includes(family)) {
+      throw new Error(`${MODEL_LABELS[family] ?? family} needs WebGPU, which this browser does not`
+        + ` have. ${WEBGL2_FAMILIES.map((one) => MODEL_LABELS[one] ?? one).join(", ")}`
+        + " fold here in WebGL2 instead - slower, same structure.");
+    }
     // 🔴 A DIFFERENT MODEL LETS THE LAST ONE'S GPU WEIGHTS GO. Residency is
     // kept between folds so the same model's next fold skips its packing, and
     // it was kept across a CHANGE of model too - four models in one page and
     // the fourth fold died at 2.9 GiB live. See releaseAllWeights.
-    if (lastFoldedFamily !== undefined && lastFoldedFamily !== family) {
+    // (nothing to release on the WebGL2 path, and `getDevice` would throw asking)
+    if (lastFoldedFamily !== undefined && lastFoldedFamily !== family && backend === "webgpu") {
       releaseAllWeights(await getDevice());
       releaseBioemu2(await getDevice());
     }
@@ -5004,7 +5034,7 @@ async function fold(event) {
     // makes the real count larger, so the warm compiles a subset and the fold
     // compiles the rest, which is slower than a perfect warm and faster than
     // none. A speculative warm cannot give a wrong ANSWER, only waste.
-    if (isAf3Family(family)) {
+    if (isAf3Family(family) && backend === "webgpu") {
       void getDevice().then((device) =>
         warmAf3Pipelines(family, chains.join("").length, device)).catch(() => {});
     }

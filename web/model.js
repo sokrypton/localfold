@@ -24,6 +24,7 @@ import { MODEL_BUNDLES, bundleBaseUrl, graphFamily, loadManifest }
 import { DeltaTensorStore } from "../shared/bundles/delta-tensor-store.js";
 import { requestAlphaFoldDevice } from "../webgpu/runtime/device.js";
 import { settleGridAttendTiling } from "../webgpu/af3/trunk/grid-attend-race.js";
+import { webgl2FoldAvailable } from "../webgl/af3/model/fold-batch.js";
 import { devUseDevice } from "./dev-log.js";
 import { withAbort } from "../webgpu/runtime/abort.js";
 
@@ -186,6 +187,37 @@ export function getDevice() {
     return device;
   })();
   return devicePromise;
+}
+
+let backendPromise;
+
+/**
+ * Which backend this browser folds with: WebGPU wherever it exists, else WebGL2.
+ *
+ * 🔴 AND A BROWSER WITH NEITHER STILL GETS THE SENTENCE IT GOT BEFORE. The WebGL2 path is a
+ * FALLBACK, so this asks for WebGPU first and only looks further when that fails - and when WebGL2
+ * cannot render to a float texture either, it rethrows `getDevice`'s own error ("This browser has no
+ * WebGPU...") rather than inventing a second message about a backend the visitor also does not have.
+ *
+ * 🔴 AND IT IS NOT A FALLBACK FOR EVERY MODEL. `webgl/` holds af2, af3, bioemu2, esmc and esmfold2,
+ * but the only one wired into the PAGE is the AlphaFold 3 lineage (web/af3-model.js's
+ * `backend: "webgl2"` -> foldBatchWebGl2); the others have no page entry point, so `fold` refuses
+ * them by name here rather than folding something else or hanging. Wiring one is a change in
+ * web/app.js and a measurement against WebGPU, not a flag.
+ *
+ * Memoised: the answer cannot change inside a page, and requestAdapter is not free.
+ */
+export function foldBackend() {
+  backendPromise ??= (async () => {
+    try {
+      await getDevice();
+      return "webgpu";
+    } catch (cause) {
+      if (!webgl2FoldAvailable()) throw cause;
+      return "webgl2";
+    }
+  })();
+  return backendPromise;
 }
 
 const loaded = new Map();

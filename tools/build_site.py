@@ -49,7 +49,12 @@ FILES = [".nojekyll", "index.html", "dev.html"]
 # nothing links to it and index.html does not mention it, but it is on the site
 # once `main` deploys. Unlinked is not hidden; see docs/DESIGN.md.
 OPTIONAL = ["single.html", "proteinhunter.html", "design.html"]
-DIRECTORIES = ["web", "shared", "cpu", "webgpu"]
+# 🔴 AND `webgl` IS ON THIS LIST BECAUSE web/af3-model.js IMPORTS IT STATICALLY. Without it this
+# script assembles a dist/ whose web/af3-model.js resolves to nothing - the module never loads and
+# the AF3 fold path is dead for every visitor, WebGPU or not - and the only gate that can see it is
+# this script's own unresolved-import check ("1 import(s) do not resolve inside dist/"). It is also
+# what the page's WebGL2 fallback is served from (web/model.js's foldBackend).
+DIRECTORIES = ["web", "shared", "cpu", "webgpu", "webgl"]
 
 # ...and never these, wherever they appear.
 # 🔴 `.ipynb_checkpoints` IS IN HERE BECAUSE THE SITE WAS SHIPPING THEM. A

@@ -6,7 +6,14 @@ backend and needs Chrome/Edge 113+ or Safari 26+ - which the page says in those 
 fold"). WebGL2 has been in Safari since 15 and in Chrome since 56, so it reaches machines and
 operating systems that the WebGPU path refuses outright.
 
-🔴 **ALPHAFOLD 2 FOLDS HERE NOW - BOTH GRAPHS - AND NOTHING SELECTS IT YET.** 59 residues from
+🔴 **THE PAGE SELECTS THIS BACKEND NOW, FOR af3, openbind0 AND intellifold2** - `foldBackend`
+in web/model.js, `WEBGL2_FAMILIES` in shared/bundles/manifests/index.js, measured through
+`tools/fold-in-page.py --no-webgpu` (AlphaFold 3 pLDDT 68.0 in 11 s against WebGPU's 68.2 in 1 s).
+The four fused-template bundles and opendde are refused by name before the download; see
+webgl/index.js. **AlphaFold 2 folds here - both graphs - and the PAGE still does not select it**,
+because web/ has no AF2 entry point that takes a backend.
+
+🔴 **ALPHAFOLD 2 FOLDS HERE NOW - BOTH GRAPHS.** 59 residues from
 `model-af2-monomer-int5`, 4 extra-MSA blocks and 48 Evoformer blocks, the template stack, eight
 structure iterations and both confidence heads: **consecutive alpha carbons 3.834 A, pLDDT 57.937
 against the WGSL fold's 57.938, and the worst atom 0.0565 A away** against a measured floor of
