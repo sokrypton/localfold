@@ -9,6 +9,7 @@
 import { ccdUrl } from "../af3/featurise/ccd-component.js";
 import { STANDARD_COMPONENTS } from "../af3/featurise/standard-components.js";
 import { smilesComponent } from "../chem/component.js";
+import { CROSSLINKER_COMPONENTS } from "../chem/crosslinkers.js";
 
 /**
  * Every component a job names, fetched once: `local(code)` first (a URL or null -
@@ -25,7 +26,9 @@ export async function fetchComponents(job, { local = () => null, signal } = {}) 
     if (chain.kind === "dna" && /N/.test(chain.sequence)) codes.add("DN");
   }
   const texts = new Map();
-  await Promise.all([...codes].filter((code) => STANDARD_COMPONENTS[code] === undefined).map(async (code) => {
+  // (a crosslinker's bridge, XL-<name>, is built in and is no PDB entry: the featuriser reads it itself)
+  await Promise.all([...codes].filter((code) => STANDARD_COMPONENTS[code] === undefined
+                                         && CROSSLINKER_COMPONENTS[code] === undefined).map(async (code) => {
     const nearby = local(code);
     let response = nearby ? await fetch(nearby, { signal }) : null;
     if (response === null || !response.ok) response = await fetch(ccdUrl(code), { signal });

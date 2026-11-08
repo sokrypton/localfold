@@ -1,0 +1,1 @@
+{"tag": "M2", "cycles": 6, "steps": 100, "recycles": 3, "restarts": 3, "stop": {"ptm": 0.85, "ipae": 1.2}, "check": {"top": 2, "ptm": 0.8, "ipae": 2.5}, "hunt": {"warm": {"level": 10, "from": 2}}, "folders": ["boltz2"], "hotspots": true, "checkModel": "boltz2", "templateDesign": false, "msaDir": "/home/ubuntu/ppi-bench-2026-10-29/msa"}

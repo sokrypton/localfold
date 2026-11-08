@@ -367,6 +367,8 @@ export function loadEsmfold2Weights(onProgress,
     };
   })();
   weightsPromises.set(family, promise);
+  // A download that failed once must not fail until the reader reloads (PR #7, lhallee).
+  promise.catch(() => { if (weightsPromises.get(family) === promise) weightsPromises.delete(family); });
   return promise;
 }
 

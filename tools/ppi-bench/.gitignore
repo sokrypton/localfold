@@ -1,0 +1,8 @@
+targets.json
+tasks.json
+rfd4-paper-data.json
+*.jobs*
+*.log*
+rescore-*/
+__pycache__/
+xeval-*/

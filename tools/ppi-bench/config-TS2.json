@@ -1,0 +1,1 @@
+{"tag": "TS2", "pair": "T", "cycles": 6, "steps": 100, "recycles": 3, "restarts": 6, "stop": {"iptm": 0.85, "ipae": 1.2}, "check": {"top": 3, "iptm": 0.8, "ipae": 2.5}}

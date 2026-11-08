@@ -16,6 +16,7 @@
 import { featuriseBioemu2, bioemu2JobFromAf3Json, parseContacts } from "../../shared/bioemu2/featurise.js";
 import { bundleReader } from "../../shared/bioemu2/weights.js";
 import { bioemu2Pdb, alphaCarbonSpacings } from "../../shared/bioemu2/structure.js";
+import { DEFAULT_TUNING, setDeviceTuning } from "../../webgpu/runtime/device-profile.js";
 import { foldBioemu2 } from "../../webgpu/bioemu2/fold.js";
 import { fetchComponents, smilesTemplates } from "../../shared/bioemu2/inputs.js";
 import { superpose } from "./superpose.js";
@@ -36,6 +37,29 @@ function crystalAlphaCarbons(text, chain) {
 }
 
 export async function main(device, args) {
+  // 🔴 `--tune=key=value`, BECAUSE THE WebGL2 SIDE'S GAP HAD TO BE ATTRIBUTED
+  // AND NOTHING COULD REACH THIS FOLD'S KNOBS. webgl/README.md's "How close can
+  // this get" argues the remaining difference is the subgroup MATRIX units and
+  // the workgroup memory a WebGL2 fragment shader cannot have - and an argument
+  // from a capability PROBE is not a measurement. `--tune=matrixLinear=false`
+  // is: it takes those units away from this fold and leaves everything else,
+  // which is the only arm that can price them. Same parser as fold-af2.js.
+  const tune = option(args, "tune", "");
+  if (tune !== "") {
+    const forced = {};
+    for (const pair of tune.split(",").filter(Boolean)) {
+      const at = pair.indexOf("=");
+      if (at < 0) throw new Error(`--tune wants key=value, got ${pair}`);
+      const key = pair.slice(0, at);
+      if (!(key in DEFAULT_TUNING)) {
+        throw new Error(`--tune names ${key}, which is not a tuning knob. `
+          + `Known: ${Object.keys(DEFAULT_TUNING).sort().join(", ")}`);
+      }
+      const raw = pair.slice(at + 1);
+      try { forced[key] = JSON.parse(raw); } catch { forced[key] = raw; }
+    }
+    setDeviceTuning(device, forced);
+  }
   const jobUrl = option(args, "job", "/tools/fixtures/bioemu2/6mrr.json");
   const model = option(args, "model", "/model-bioemu2-int5");
   const crystalUrl = option(args, "crystal", null);

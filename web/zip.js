@@ -20,6 +20,8 @@
  * every unzip refuses with a message about a corrupt header.
  */
 
+import { inflateRaw } from "../shared/input/inflate.js";
+
 const SIGNATURE = { local: 0x04034b50, central: 0x02014b50, end: 0x06054b50 };
 const STORED = 0;
 const DEFLATED = 8;
@@ -69,10 +71,16 @@ async function deflate(bytes) {
   return new Uint8Array(await new Response(stream).arrayBuffer());
 }
 
+/**
+ * 🔴 AND READING FALLS BACK RATHER THAN REFUSING, which the writer above has
+ * always done and the reader did not. A browser without `DecompressionStream`
+ * also writes stored archives, so its OWN archives read back - what it could
+ * not read was an archive written anywhere else, which is the whole point of
+ * the upload box. shared/input/inflate.js is this repository's DEFLATE, the
+ * same decoder the design page's structure path reads with.
+ */
 async function inflate(bytes) {
-  if (typeof DecompressionStream === "undefined") {
-    throw new Error("this browser cannot read a compressed archive");
-  }
+  if (typeof DecompressionStream === "undefined") return inflateRaw(bytes);
   const stream = new Blob([bytes]).stream()
     .pipeThrough(new DecompressionStream("deflate-raw"));
   return new Uint8Array(await new Response(stream).arrayBuffer());

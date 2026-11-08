@@ -262,6 +262,24 @@ def main():
                              " underneath, that canvas can be empty while the"
                              " structure is on screen - only a screenshot says"
                              " what a visitor actually sees.")
+    # 🔴 THE ONLY BROWSER THE WebGL2 FALLBACK IS FOR, AND CHROME WILL NOT GIVE IT UP BY FLAG.
+    # `--disable-features=WebGPU` loses to the `--enable-unsafe-webgpu` that cdp.chrome_flags()
+    # always passes - measured here: navigator.gpu is still an object and the adapter still
+    # resolves - so this deletes `navigator.gpu` before any page script runs, which is the exact
+    # state the page branches on. It simulates the browser's ABSENCE of WebGPU, not a browser
+    # built without it, and that is the distinction to keep in mind when reading a result.
+    parser.add_argument("--no-webgpu", action="store_true",
+                        help="hide navigator.gpu from the page: the WebGL2 fallback's arm")
+    parser.add_argument("--no-gpu-at-all", action="store_true",
+                        help="hide navigator.gpu AND webgl2: the browser that can fold with neither")
+    # 🔴 THE OTHER THING AN OLDER SAFARI DOES NOT HAVE, AND A READER FOUND IT.
+    # `CompressionStream`/`DecompressionStream` landed in Safari 16.4, and before
+    # that an MSA search ended in "This browser cannot decompress the MMseqs2
+    # result" - so this deletes both globals before any page script, which is
+    # the state the page branches on, and the search must still come back.
+    parser.add_argument("--no-compression-streams", action="store_true",
+                        help="hide CompressionStream/DecompressionStream: an"
+                             " older Safari, which reads with our own DEFLATE")
     parser.add_argument("--keep-profile", action="store_true",
                         help="reuse the Chrome profile instead of wiping it, so"
                              " the HTTP cache and the SHADER cache survive - the"
@@ -438,6 +456,20 @@ def main():
     proc, ws = cdp.launch(DBG, "/tmp/_cdp_fold_profile", keep=args.keep_profile)
     try:
         ws.call("Page.enable")
+        if args.no_compression_streams:
+            ws.call("Page.addScriptToEvaluateOnNewDocument",
+                    source="delete globalThis.CompressionStream;"
+                           "delete globalThis.DecompressionStream;")
+        if args.no_webgpu or args.no_gpu_at_all:
+            # before any page script, so the page's own first look finds nothing
+            hide = "delete Object.getPrototypeOf(navigator).gpu; delete navigator.gpu;"
+            if args.no_gpu_at_all:
+                # ...and no WebGL2 either: the browser that has NEITHER, which must still get a
+                # sentence rather than a silent failure or a message about a third backend.
+                hide += ("const was = HTMLCanvasElement.prototype.getContext;"
+                         "HTMLCanvasElement.prototype.getContext = function (kind, ...rest) {"
+                         "  return kind === 'webgl2' ? null : was.call(this, kind, ...rest); };")
+            ws.call("Page.addScriptToEvaluateOnNewDocument", source=hide)
         # 🔴 THE DEV SERVER IS 371 MB/s AND HUGGING FACE IS 8, SO EVERY WEIGHT
         # NUMBER TAKEN HERE IS 5-12x OPTIMISTIC - which docs/PERF.md records and
         # nothing could act on, because there was no way to ask this harness for

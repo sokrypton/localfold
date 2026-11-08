@@ -41,6 +41,9 @@ import { GRID_WIDTH, LANES, createLinearShader, createSwigluShader, linearGrid, 
   from "../esmc/block.js";
 import { deviceTuning } from "../runtime/device-profile.js";
 
+/** How many of the atom stack's dispatches one submission holds. */
+const EMBED_PIECE_DISPATCHES = 12;
+
 /** torch's `F.rms_norm(eps=None)`: `finfo(float32).eps`, not this tree's 1e-5. */
 export const RMS_EPSILON = 1.1920928955078125e-7;
 
@@ -947,13 +950,14 @@ export async function runInputsEmbedder(context, { features, shape, weights }) {
     const toTokenWeights = keep(allocator.upload("w.esmfold2.embed.to-token",
       weights.atomToToken, storage));
 
-    const encoder = device.createCommandEncoder({ label: "esmfold2.embed" });
+    let encoder = device.createCommandEncoder({ label: "esmfold2.embed" });
     // 🔴 THE ACTIVATION STARTS AT THE CONDITIONING ITSELF, not at zero:
     // `atom_stack(c0, c0)` passes the same tensor as the running activation and
     // as the conditioning, and only the first is updated.
     encoder.copyBufferToBuffer(conditioning.buffer, 0, activation.buffer, 0, atoms * channels * 4);
     const batch = deviceTuning(device).batchComputePasses !== false;
     let openPass = null;
+    let dispatched = 0;
     const run = (label, pipeline, buffers, x, y = 1) => {
       const pass = batch ? (openPass ??= encoder.beginComputePass({ label: "esmfold2.embed" }))
         : encoder.beginComputePass({ label });
@@ -964,6 +968,13 @@ export async function runInputsEmbedder(context, { features, shape, weights }) {
       }));
       pass.dispatchWorkgroups(x, y, 1);
       if (!batch) pass.end();
+      // A block of the stack to a submission: all of them in one was 864 ms at 1350 tokens on an RTX 3070.
+      dispatched += 1;
+      if (dispatched % EMBED_PIECE_DISPATCHES === 0) {
+        if (openPass !== null) { openPass.end(); openPass = null; }
+        device.queue.submit([encoder.finish()]);
+        encoder = device.createCommandEncoder({ label: "esmfold2.embed" });
+      }
     };
     encodeAtomStack({ run, pipelines, state, scratch, weights: blockBuffers });
     run("esmfold2.embed.to-token", toToken, [activation, toTokenWeights, projected],

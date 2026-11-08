@@ -1,0 +1,1 @@
+{"tag": "TP2", "pair": "T", "cycles": 6, "steps": 100, "recycles": 3, "restarts": 10, "stop": {"iptm": 0.85, "ipae": 1.2}, "check": {"top": 3, "iptm": 0.8, "ipae": 2.5, "seeds": 2}, "polish": {"from": 2, "draws": 8, "top": 3}}

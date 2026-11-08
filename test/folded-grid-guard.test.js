@@ -85,7 +85,7 @@ describe("a folded linear grid", () => {
 describe("every shader that folds its index", () => {
   const guarded = [];
   const unguarded = [];
-  for (const path of ["shared", "cpu", "webgpu"].flatMap((tree) => sourceFiles(tree))) {
+  for (const path of ["shared", "cpu", "webgpu", "webgl"].flatMap((tree) => sourceFiles(tree))) {
     const lines = readFileSync(path, "utf8").split("\n");
     for (const [at, line] of lines.entries()) {
       const match = FOLDED.exec(line);

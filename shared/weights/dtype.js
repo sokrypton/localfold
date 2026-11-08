@@ -68,6 +68,27 @@ function view(Kind, buffer, byteOffset, length) {
   return new Kind(buffer.slice(byteOffset, byteOffset + length * width));
 }
 
+/**
+ * `length` float16 values at `byteOffset`: a Float16Array view where the runtime has one, else the
+ * same values widened into a Float32Array (exact: every float16 is a float32). Safari before 18.2
+ * has no Float16Array, and a quantised bundle's scales and zeros are float16.
+ */
+function halves(buffer, byteOffset, length) {
+  if (typeof Float16Array === "function") return view(Float16Array, buffer, byteOffset, length);
+  const bits = view(Uint16Array, buffer, byteOffset, length);
+  const out = new Float32Array(length);
+  for (let index = 0; index < length; index += 1) {
+    const h = bits[index];
+    const exponent = (h >> 10) & 31;
+    const mantissa = h & 1023;
+    const magnitude = exponent === 0 ? mantissa * 2 ** -24
+      : exponent === 31 ? (mantissa === 0 ? Infinity : NaN)
+        : (1024 + mantissa) * 2 ** (exponent - 25);
+    out[index] = h & 32768 ? -magnitude : magnitude;
+  }
+  return out;
+}
+
 /** The element count, which the callers all need alongside the byte length. */
 export function tensorElements(record) {
   return record.shape.reduce((product, value) => product * value, 1);
@@ -181,10 +202,7 @@ export function readTensorRange(record, buffer, byteOffset, first, count, copy =
     const scaleAt = byteOffset + (record.scaleOffset - (record.byteOffset ?? 0));
     const codes = view(Int8Array, buffer, byteOffset, elements);
     const blocks = Math.ceil(elements / block);
-    if (typeof Float16Array !== "function") {
-      throw new Error("this runtime has no Float16Array, and the model scales are float16");
-    }
-    const scales = view(Float16Array, buffer, scaleAt, blocks);
+    const scales = halves(buffer, scaleAt, blocks);
     const firstBlock = Math.floor(first / block);
     const lastBlock = Math.min(blocks, Math.ceil((first + count) / block));
     const base = firstBlock * block;
@@ -224,17 +242,14 @@ export function readTensorRange(record, buffer, byteOffset, first, count, copy =
     if (!Number.isInteger(record.zeroOffset)) {
       throw new Error(`${record.dtype} tensor has no zero offset; it is asymmetric`);
     }
-    if (typeof Float16Array !== "function") {
-      throw new Error("this runtime has no Float16Array, and the model scales are float16");
-    }
     const groups = Math.ceil(elements / block);
     const groupBytes = (block * bits) / 8;
     if (!Number.isInteger(groupBytes)) {
       throw new Error(`${record.dtype} at group ${block} does not pack into whole bytes`);
     }
     const codes = new Uint8Array(buffer, byteOffset, groups * groupBytes + 1);
-    const scales = view(Float16Array, buffer, scaleAt, groups);
-    const zeros = view(Float16Array, buffer, zeroAt, groups);
+    const scales = halves(buffer, scaleAt, groups);
+    const zeros = halves(buffer, zeroAt, groups);
     const mask = (1 << bits) - 1;
     const firstGroup = Math.floor(first / block);
     const lastGroup = Math.min(groups, Math.ceil((first + count) / block));
@@ -264,9 +279,6 @@ export function readTensorRange(record, buffer, byteOffset, first, count, copy =
     if (!Number.isInteger(record.zeroOffset)) {
       throw new Error("int5 tensor has no zero offset; it is asymmetric and needs one");
     }
-    if (typeof Float16Array !== "function") {
-      throw new Error("this runtime has no Float16Array, and the model scales are float16");
-    }
     // 🔴 THIS PATH IS int5 AT A GROUP OF 32 AND NOTHING ELSE. INT5_GROUP_BYTES
     // is 20 because 32 x 5 is 160 bits, and the loop below strides by it - so a
     // bundle exported at any other group would be read at the wrong stride and
@@ -286,8 +298,8 @@ export function readTensorRange(record, buffer, byteOffset, first, count, copy =
     const groups = Math.ceil(elements / block);
     const codes = new Uint8Array(buffer, byteOffset,
                                  groups * INT5_GROUP_BYTES + 1);
-    const scales = view(Float16Array, buffer, scaleAt, groups);
-    const zeros = view(Float16Array, buffer, zeroAt, groups);
+    const scales = halves(buffer, scaleAt, groups);
+    const zeros = halves(buffer, zeroAt, groups);
     const firstGroup = Math.floor(first / block);
     const lastGroup = Math.min(groups, Math.ceil((first + count) / block));
     const outputBase = firstGroup * block;
@@ -354,13 +366,10 @@ export function readTensorRange(record, buffer, byteOffset, first, count, copy =
   }
 
   if (record.dtype === "float16") {
-    if (typeof Float16Array !== "function") {
-      throw new Error("this runtime has no Float16Array, and the model is stored as float16");
-    }
     // ...ALWAYS A COPY, whether or not one was asked for: widening is a new
     // array by definition, so there is no view to hand back. Asked for half
     // precision it is already half precision, and the copy is a memmove.
-    return new Output(view(Float16Array, buffer, byteOffset + first * 2, count));
+    return new Output(halves(buffer, byteOffset + first * 2, count));
   }
 
   if (record.dtype !== "float32") throw new Error(`unsupported tensor dtype ${record.dtype}`);

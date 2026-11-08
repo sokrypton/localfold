@@ -30,9 +30,11 @@ import {
 } from "../../shared/esmfold2/featurise.js";
 import { EsmcTowerGpu } from "../esmc/tower.js";
 import { createAddShader } from "../runtime/execution.js";
-import { deviceTuning } from "../runtime/device-profile.js";
-import { memoryBudgetBytes } from "../runtime/device-memory.js";
-import { GpuBufferAllocator } from "../runtime/allocator.js";
+import { deviceTuning, halfPrecisionAvailable } from "../runtime/device-profile.js";
+import { memoryTotals } from "../runtime/device-memory.js";
+import { GpuBufferAllocator, settleReleasedMemory } from "../runtime/allocator.js";
+import { spillToHost } from "../runtime/host-spill.js";
+import { throwIfAborted } from "../runtime/abort.js";
 import { yieldToBrowser } from "../runtime/yield.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 import { Esmfold2TrunkGpu } from "./trunk.js";
@@ -53,6 +55,8 @@ import {
   samplerStep, uniforms,
 } from "../../cpu/esmfold2/sampler.js";
 import { ESMFOLD2_PHASES, esmfold2Plan, trunkPhase } from "./cost.js";
+import { esmfold2Spills, FOLD_WEIGHT_BYTES, FOLD_WEIGHT_BYTES_F32 } from "./memory-plan.js";
+import { allocatePairSized, rangeOf, segmentRowsFor } from "../runtime/segmented.js";
 
 /** The largest pair copied to the host; past it the browser refuses the array. */
 const HOST_PAIR_MAX_BYTES = 1024 * 1024 * 1024;
@@ -347,7 +351,12 @@ export async function foldEsmfold2(device, options) {
   const enter = (name) => { phase = name; say(); };
   const advance = (units) => { completed = Math.min(plan.total, completed + units); say();
                                onProgress(completed / plan.total); };
+  // Stop was only read after the whole fold had finished, so a large fold kept the
+  // GPU for minutes after being told to stop. Checked at each stage, at each trunk
+  // block and at each sampler step, none of which has work in flight it still owns.
+  const stopIfAsked = () => throwIfAborted(options.signal);
   const mark = async (label, work) => {
+    stopIfAsked();
     const at = performance.now();
     const value = await work();
     timings[label] = performance.now() - at;
@@ -388,8 +397,6 @@ export async function foldEsmfold2(device, options) {
 
   try {
     // ---- the language model, first and released before anything pair-sized.
-    const lmPair = keep(allocator.allocate("esmfold2.lm-pair", pairs * channels * 4,
-      storage | (options.onLanguagePair !== undefined ? GPUBufferUsage.COPY_SRC : 0)));
     // 🔴 THE LANGUAGE MODEL CAN BE TURNED OFF, WHICH IS THIS MODEL'S "SINGLE
     // SEQUENCE". AF2 and AF3 can be run without their alignment; the analogue
     // here is running without the protein language model, since ESM-C is where
@@ -425,6 +432,15 @@ export async function foldEsmfold2(device, options) {
     // ends exactly where the plan says however many blocks the tower ran.
     completed = Math.max(completed, plan.languageModelEnd);
     enter(ESMFOLD2_PHASES.embedder);
+    await settleReleasedMemory(device);
+    // Past what one buffer or binding can hold, every pair-sized tensor is several buffers bound a chunk at a time. See
+    // webgpu/runtime/segmented.js. Such a fold has no business holding two more of them than it must, so it spills.
+    const segmentRows = options.segmentRows ?? segmentRowsFor(device, pairs, channels * 4);
+    const segmented = segmentRows < pairs;
+    const pairSized = (label, usage) => allocatePairSized(allocator, label, pairs, channels * 4, usage, segmentRows);
+    const lmPair = reuse !== undefined ? undefined
+      : keep(pairSized("esmfold2.lm-pair",
+        storage | (options.onLanguagePair !== undefined ? GPUBufferUsage.COPY_SRC : 0)));
     if (reuse === undefined) await mark("language pair", () => encodeLanguagePair(
       { device, allocator, cache, submit },
       { tokens, channels, single, weights: weights.shim, destination: lmPair }));
@@ -494,75 +510,95 @@ export async function foldEsmfold2(device, options) {
 
     // ---- z_init's other four terms.
     const layout = relativeLayout();
-    // 🔴 THE PAIR ADD USED TO BE COMPILED HERE AND NEVER USED. It was the
-    // sixth entry of this destructure and `addPair` appeared nowhere else in
-    // the file - a pipeline built, cached and thrown away on every fold.
-    const [relative, bond, zInitShader, recycleNorm, recycleProject] =
-      await Promise.all([
-        cache.get(`esmfold2-rel:${pairs}:${channels}`,
-          createRelativePositionShader({ pairs, channels, entityBase: layout.entityBase })),
-        cache.get(`esmfold2-bond:${pairs}:${channels}`,
-          createBondShader({ pairs, channels })),
-        cache.get(`esmfold2-zinit:${tokens}:${channels}`,
-          createZInitShader({ tokens, channels, hasBonds: true, hasLanguageModel: true })),
-        cache.get(`esmfold2-recycle-norm:${Math.min(RECYCLE_CHUNK, pairs)}:${channels}`,
-          createLayerNormShader(
-            { rows: Math.min(RECYCLE_CHUNK, pairs), channels }, true, 1e-5)),
-        cache.get(`esmfold2-recycle-project:${Math.min(RECYCLE_CHUNK, pairs)}:${channels}`,
-          createLinearShader(
-            { rows: Math.min(RECYCLE_CHUNK, pairs), inner: channels, outer: channels }, true)),
-      ]);
-
-    // 🔴 THE RELATIVE-POSITION ENCODING IS RECOMPUTED AFTER THE TRUNK, NOT
-    // HELD THROUGH IT. It is pair-sized - 87.9 MiB at 300 tokens - and it has
-    // exactly two readers: `z_init` here, and the diffusion conditioning after
-    // 96 block evaluations during which it sits idle. Holding it made it 14% of
-    // the fold's peak, which is now the TRUNK; recomputing it is one
-    // elementwise pass over a small table, about four milliseconds.
-    //
-    // 🔴 SO THE TABLE AND ITS WEIGHTS OUTLIVE `z_init` WHERE THE OTHER FOUR
-    // TERMS' INPUTS DO NOT. They are a few hundred KB against the 87.9 MiB
-    // they let go, which is the whole trade.
-    let relPos = keep(allocator.allocate("esmfold2.rel-pos", pairs * channels * 4, storage));
-    const relBins = keep(allocator.upload("esmfold2.rel-bins",
-      relativeRows(features, tokens), storage));
-    const relWeights = keep(allocator.upload("w.esmfold2.rel-pos",
-      weights.featuriser.relPos, storage));
-    const buildRelativePositions = () => submit("esmfold2.rel-pos", [
-      ["rel-pos", relative, [relBins, relWeights, relPos], ...elementwise(pairs * channels)],
+    // 🔴 A CHUNK OF ROWS AT A TIME, because every term is. z_init held the language pair, the relative encoding, the
+    // bond term, z_init itself and the empty pair at once, five pair-sized tensors where its own two will do, and on a
+    // small card that was where a fold was refused. The same additions in the same order, so the same bits.
+    const chunkRows = Math.min(RECYCLE_CHUNK, pairs);
+    const heights = [...new Set([chunkRows, pairs % chunkRows].filter((rows) => rows > 0))];
+    const perHeight = async (key, source) => {
+      const compiled = await Promise.all(heights.map((rows) => cache.get(`${key}:${rows}:${channels}`, source(rows))));
+      return Object.fromEntries(heights.map((rows, index) => [rows, compiled[index]]));
+    };
+    const [relative, bond, zInitShader, addChunk, recycleNorm, recycleProject] = await Promise.all([
+      perHeight("esmfold2-rel", (rows) => createRelativePositionShader(
+        { pairs: rows, channels, entityBase: layout.entityBase })),
+      perHeight("esmfold2-bond", (rows) => createBondShader({ pairs: rows, channels })),
+      perHeight(`esmfold2-zinit:${tokens}`, (rows) => createZInitShader(
+        { tokens, channels, chunkRows: rows, hasBonds: true, hasLanguageModel: true })),
+      perHeight("esmfold2-add", (rows) => createAddShader(rows * channels)),
+      perHeight("esmfold2-recycle-norm", (rows) => createLayerNormShader({ rows, channels }, true, 1e-5)),
+      perHeight("esmfold2-recycle-project", (rows) => createLinearShader(
+        { rows, inner: channels, outer: channels }, true)),
     ]);
-    const zInit = keep(allocator.allocate("esmfold2.z-init", pairs * channels * 4,
-      storage | (options.returnConfidenceInputs === true ? GPUBufferUsage.COPY_SRC : 0)));
-    const pair = keep(allocator.allocate("esmfold2.pair", pairs * channels * 4,
-      storage | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST));
-    await mark("z_init", async () => {
-      const bondValues = keep(allocator.upload("esmfold2.bonds", features.tokenBonds, storage));
-      const bondWeights = keep(allocator.upload("w.esmfold2.token-bonds",
-        weights.featuriser.tokenBonds, storage));
-      const bonds = keep(allocator.allocate("esmfold2.bond-term",
-        pairs * channels * 4, storage));
+    const bytesOf = rangeOf;
+    const eachChunk = async (work) => {
+      for (let start = 0; start < pairs; start += chunkRows) {
+        // eslint-disable-next-line no-await-in-loop
+        await work(start, Math.min(chunkRows, pairs - start));
+      }
+    };
+
+    // 🔴 THE RELATIVE-POSITION ENCODING IS BUILT WHEN IT IS WANTED, NOT HELD. It is
+    // pair-sized - 87.9 MiB at 300 tokens - and it has three readers: `z_init`, the
+    // diffusion conditioning after 96 block evaluations during which it would sit
+    // idle, and the confidence head after the sampler. Building it is one
+    // elementwise pass over a small table, about four milliseconds. So the table,
+    // its weights and the bonds' outlive `z_init` where its other inputs do not.
+    const relBins = keep(allocator.upload("esmfold2.rel-bins", relativeRows(features, tokens), storage));
+    const relWeights = keep(allocator.upload("w.esmfold2.rel-pos", weights.featuriser.relPos, storage));
+    const bondValues = keep(allocator.upload("esmfold2.bonds", features.tokenBonds, storage));
+    const bondWeights = keep(allocator.upload("w.esmfold2.token-bonds", weights.featuriser.tokenBonds, storage));
+    const relativeInto = (target, start, rows) =>
+      ["rel-pos", relative[rows], [bytesOf(relBins, start * 16, rows * 16), relWeights, target],
+       ...elementwise(rows * channels)];
+    const bondsInto = (target, start, rows) =>
+      ["bonds", bond[rows], [bytesOf(bondValues, start * 4, rows * 4), bondWeights, target],
+       ...elementwise(rows * channels)];
+    const buildRelativePositions = async (target) => {
+      await eachChunk((start, rows) => submit("esmfold2.rel-pos",
+        [relativeInto(bytesOf(target, start * channels * 4, rows * channels * 4), start, rows)], false));
+      await device.queue.onSubmittedWorkDone();
+    };
+
+    const pairBytes = pairs * channels * 4;
+    // Whether what a stage only reads waits on the host, which costs seconds of traffic and gives back a whole
+    // pair-sized tensor twice over. See webgpu/esmfold2/memory-plan.js.
+    const spill = segmented || options.spillPairs === true || options.spillPairs === undefined && esmfold2Spills({
+      tokens, channels, ...memoryTotals(device),
+      weightBytes: halfPrecisionAvailable(device) ? FOLD_WEIGHT_BYTES : FOLD_WEIGHT_BYTES_F32,
+    });
+    let zInit = reuse !== undefined ? undefined
+      : keep(pairSized("esmfold2.z-init",
+          storage | (options.returnConfidenceInputs === true || spill ? GPUBufferUsage.COPY_SRC : 0)));
+    if (reuse === undefined) await mark("z_init", async () => {
       // 🔴 PROJECT THEN BROADCAST. The two per-token projections are 2n rows of
       // 451 channels on the host; broadcasting first would make them 2n^2.
-      const rows = keep(allocator.upload("esmfold2.z-rows",
-        linear(sInputs, tokens, shape.singleInputs, channels,
-               weights.featuriser.zInit1), storage));
-      const columns = keep(allocator.upload("esmfold2.z-columns",
-        linear(sInputs, tokens, shape.singleInputs, channels,
-               weights.featuriser.zInit2), storage));
-      await submit("esmfold2.z-init", [
-        ["rel-pos", relative, [relBins, relWeights, relPos], ...elementwise(pairs * channels)],
-        ["bonds", bond, [bondValues, bondWeights, bonds], ...elementwise(pairs * channels)],
-        ["z-init", zInitShader, [rows, columns, relPos, bonds, lmPair, zInit],
-         ...elementwise(pairs * channels)],
-      ]);
-      for (const allocation of [bondValues, bondWeights, bonds, rows, columns, lmPair]) {
+      const rowTerm = keep(allocator.upload("esmfold2.z-rows",
+        linear(sInputs, tokens, shape.singleInputs, channels, weights.featuriser.zInit1), storage));
+      const columnTerm = keep(allocator.upload("esmfold2.z-columns",
+        linear(sInputs, tokens, shape.singleInputs, channels, weights.featuriser.zInit2), storage));
+      const relativeTerm = keep(allocator.allocate("esmfold2.rel-pos", chunkRows * channels * 4, storage));
+      const bondTerm = keep(allocator.allocate("esmfold2.bond-term", chunkRows * channels * 4, storage));
+      const firstRow = keep(allocator.allocate("esmfold2.z-start", 16, storage | GPUBufferUsage.COPY_DST));
+      await eachChunk(async (start, rows) => {
+        device.queue.writeBuffer(firstRow.buffer, 0, Uint32Array.of(start));
+        await submit("esmfold2.z-init", [
+          relativeInto(relativeTerm, start, rows),
+          bondsInto(bondTerm, start, rows),
+          ["z-init", zInitShader[rows],
+           [rowTerm, columnTerm, relativeTerm, bondTerm,
+            bytesOf(lmPair, start * channels * 4, rows * channels * 4),
+            bytesOf(zInit, start * channels * 4, rows * channels * 4), firstRow],
+           ...elementwise(rows * channels)],
+        ], false);
+      });
+      await device.queue.onSubmittedWorkDone();
+      for (const allocation of [rowTerm, columnTerm, relativeTerm, bondTerm, firstRow, lmPair]) {
         allocation.release();
         held.splice(held.indexOf(allocation), 1);
       }
-      // ...and the encoding itself, until the conditioning wants it back.
-      relPos.release();
-      held.splice(held.indexOf(relPos), 1);
     });
+    await settleReleasedMemory(device);
 
     // ...and the trunk's INPUT, for the oracle arm: comparing z_init separates a
     // trunk that diverges from a trunk that is fed something different. Only
@@ -579,6 +615,17 @@ export async function foldEsmfold2(device, options) {
       back.buffer.unmap();
       back.release();
     }
+
+    // z_init has one reader, once a loop, a chunk of rows at a time. It can wait on the host between them.
+    const zInitHost = !spill || zInit === undefined ? undefined
+      : await spillToHost(device, allocator, zInit, pairBytes, "esmfold2.z-init");
+    if (zInitHost !== undefined) {
+      zInit.release();
+      held.splice(held.indexOf(zInit), 1);
+      zInit = undefined;
+      await settleReleasedMemory(device);
+    }
+    const pair = keep(pairSized("esmfold2.pair", storage | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST));
 
     advance(plan.embedder);
 
@@ -598,6 +645,8 @@ export async function foldEsmfold2(device, options) {
       weights.featuriser.recycleProjection, storage));
     const recycleScratch = keep(allocator.allocate("esmfold2.recycle-scratch",
       Math.min(RECYCLE_CHUNK, pairs) * channels * 4, storage));
+    const zInitChunk = zInitHost === undefined ? undefined
+      : keep(allocator.allocate("esmfold2.z-init-chunk", chunkRows * channels * 4, storage | GPUBufferUsage.COPY_DST));
     // 🔴 `z` STARTS AT ZERO AND `pair_loop_proj(0)` IS NOT ZERO. Its Linear is
     // zero-INITIALISED upstream and then trained, and the LayerNorm in front of
     // it has an offset - so the first loop's input is z_init plus a real
@@ -607,19 +656,16 @@ export async function foldEsmfold2(device, options) {
     // which the browser refused ("Array buffer allocation failed").
     {
       const encoder = device.createCommandEncoder({ label: "esmfold2.pair-zero" });
-      encoder.clearBuffer(pair.buffer, 0, pairs * channels * 4);
+      if (segmented) pair.clear(encoder); else encoder.clearBuffer(pair.buffer, 0, pairs * channels * 4);
       device.queue.submit([encoder.finish()]);
     }
-    const trunk = new Esmfold2TrunkGpu(device, { allocator, ...options.trunk });
-    const slice = (allocation, row, rows) => ({
-      buffer: allocation.buffer, byteOffset: row * channels * 4,
-      byteSize: rows * channels * 4,
-    });
+    const trunk = new Esmfold2TrunkGpu(device, { allocator, sequentialTriangle: true, ...options.trunk });
+    keep({ release: () => trunk.releaseHeldScratch() });
+    const slice = (allocation, row, rows) => rangeOf(allocation, row * channels * 4, rows * channels * 4);
     // 🔴 THE LOOPS, OR THE PAIR THEY WOULD HAVE PRODUCED. On reuse the cached
     // pair is uploaded straight into the buffer the sampler reads, which is the
     // whole saving: 96 block evaluations at 256 channels, 85% of a 300-token
-    // fold. `z_init` above still runs because `relPos` comes out of it and the
-    // denoiser wants that; it is four milliseconds and not worth a branch.
+    // fold. `z_init` does not run at all then.
     if (reuse !== undefined) {
       device.queue.writeBuffer(pair.buffer, 0, reuse.pair);
     } else {
@@ -628,41 +674,28 @@ export async function foldEsmfold2(device, options) {
         // is two milliseconds and it is the seam between two passes, not a phase.
         enter(trunkPhase(loop, loops));
         await mark(`recycle ${loop}`, async () => {
-          const chunk = Math.min(RECYCLE_CHUNK, pairs);
-          for (let start = 0; start < pairs; start += chunk) {
-            const rows = Math.min(chunk, pairs - start);
-            if (rows !== chunk) {
-              // The tail chunk needs its own pipelines; at these sizes it is one
-              // extra compile, and a wrong-sized dispatch leaves rows unwritten -
-              // which reads as a speedup, not as an error.
-              const [norm, project] = await Promise.all([
-                cache.get(`esmfold2-recycle-norm:${rows}:${channels}`,
-                  createLayerNormShader({ rows, channels }, true, 1e-5)),
-                cache.get(`esmfold2-recycle-project:${rows}:${channels}`,
-                  createLinearShader({ rows, inner: channels, outer: channels }, true)),
-              ]);
-              await submit("esmfold2.recycle", [
-                ["norm", norm, [slice(pair, start, rows), recycleScale, recycleOffset,
-                                recycleScratch], ...perRow(rows)],
-                ["project", project, [recycleScratch, recycleWeights,
-                                      slice(zInit, start, rows), slice(pair, start, rows)],
-                 ...linearGrid(rows, channels)],
-              ], false);
-              continue;
+          await eachChunk(async (start, rows) => {
+            let term;
+            if (zInitHost === undefined) {
+              term = slice(zInit, start, rows);
+            } else {
+              zInitHost.writeTo(device, zInitChunk.buffer, 0, start * channels * 4, rows * channels * 4);
+              term = bytesOf(zInitChunk, 0, rows * channels * 4);
             }
             await submit("esmfold2.recycle", [
-              ["norm", recycleNorm, [slice(pair, start, rows), recycleScale, recycleOffset,
-                                     recycleScratch], ...perRow(rows)],
-              ["project", recycleProject, [recycleScratch, recycleWeights,
-                                           slice(zInit, start, rows), slice(pair, start, rows)],
+              ["norm", recycleNorm[rows], [slice(pair, start, rows), recycleScale, recycleOffset,
+                                           recycleScratch], ...perRow(rows)],
+              ["project", recycleProject[rows], [recycleScratch, recycleWeights, term, slice(pair, start, rows)],
                ...linearGrid(rows, channels)],
             ], false);
-          }
+            // Bounded, so the host's writes above do not pile up as staging memory.
+            if (zInitHost !== undefined && (start / chunkRows) % 16 === 15) await device.queue.onSubmittedWorkDone();
+          });
         });
         await mark(`trunk ${loop}`, () => trunk.run(
           { buffer: pair, maskBuffer: pairMask },
           weights.trunkBlocks,
-          { n: tokens, channels, readback: false,
+          { n: tokens, channels, readback: false, holdScratch: true,
             submissionWindow: options.submissionWindow,
             // 🔴 THE BAR READS `onBlockDone`, NOT `onBlock`. The first fires at
             // ENCODE time, sixteen at a stride, so a bar driven by it sprints
@@ -675,12 +708,28 @@ export async function foldEsmfold2(device, options) {
             // message, which is a task and is not clamped in a background tab.
             onBlock: async (index) => {
               await yieldToBrowser();
+              stopIfAsked();
               return options.onBlock?.(loop, index);
             } }));
+        // `onLoopContacts(loop, contacts)`: the contact map off this pass's pair, for what a recycle changed.
+        if (options.onLoopContacts !== undefined) {
+          const { contacts } = await encodeContactMap(
+            { device, allocator, cache, submit },
+            { tokens, channels, bins: shape.distogramBins, pair,
+              weights: weights.featuriser.distogramWeights, bias: weights.featuriser.distogramBias,
+              partners: partnerKeys(features, tokens), bonds: features.tokenBonds,
+              molType: features.molType, residueType: features.residueType });
+          await options.onLoopContacts(loop, contacts);
+        }
       }
       recycleScratch.release();
     }
     held.splice(held.indexOf(recycleScratch), 1);
+    trunk.releaseHeldScratch();
+    if (zInitChunk !== undefined) {
+      zInitChunk.release();
+      held.splice(held.indexOf(zInitChunk), 1);
+    }
     // `onTrunkPair(pair)`: the trunk's output pair read back - a comparison aid (EF2_SAVE_PAIR), only when asked
     if (options.onTrunkPair !== undefined) {
       const back = allocator.allocate("esmfold2.pair-rb", pairs * channels * 4,
@@ -697,16 +746,13 @@ export async function foldEsmfold2(device, options) {
     // 🔴 z_init IS DEAD WHEN THE LOOP ENDS AND THE FOLD'S PEAK IS AFTER IT.
     // `z = z_init + pair_loop_proj(z)` is its only reader, once a loop; it was
     // held to the end of the fold for nothing. It is PAIR-SIZED - 87.9 MiB at
-    // 300 tokens - and the fullest moment of a fold is the diffusion
-    // conditioning, where four pair-sized f32 tensors are live at once and this
-    // was one of them. Same shape as AF3's releaseResidentWeights: give a
-    // stage's memory back when the stage is over, before reaching for kernels.
-    //
-    // 🔴 AND ON BOTH BRANCHES, because the reuse path allocates it too - z_init
-    // still runs there, since `relPos` comes out of the same pass and the
-    // denoiser wants that.
-    zInit.release();
-    held.splice(held.indexOf(zInit), 1);
+    // 300 tokens. Same shape as AF3's releaseResidentWeights: give a stage's
+    // memory back when the stage is over, before reaching for kernels.
+    if (zInit !== undefined) {
+      zInit.release();
+      held.splice(held.indexOf(zInit), 1);
+    }
+    await settleReleasedMemory(device);
 
     // 🔴 READ BACK ONLY WHEN A CALLER ASKS, because this is the one thing the
     // fold otherwise never does: the pair stays on the device from z_init to
@@ -716,7 +762,7 @@ export async function foldEsmfold2(device, options) {
     // 🔴 AND NOT PAST A GIGABYTE, where the browser will not hand out the array
     // (`HOST_PAIR_MAX_BYTES`; AF3's fold.js has the same rule and the same
     // failure). A trunk that cannot be cached is simply not offered for reuse.
-    const hostPairFits = pairs * channels * 4 <= HOST_PAIR_MAX_BYTES;
+    const hostPairFits = pairs * channels * 4 <= HOST_PAIR_MAX_BYTES && !segmented;
     const reusable = options.wantReusable !== true || !hostPairFits ? undefined : {
       tokens, channels, sInputs,
       pair: await (async () => {
@@ -740,33 +786,30 @@ export async function foldEsmfold2(device, options) {
     // - so the head's copy is taken HERE, beside the `wantReusable` one above
     // and by the same route. It costs `tokens^2 x 256` of traffic once a fold,
     // and only when the bundle carries a head at all.
-    // 🔴 A DEVICE COPY, NOT A HOST ONE, unless the caller wants the head's
-    // inputs back as arrays or a memory ceiling cannot spare it. The head binds
-    // it; a host copy was a 64 MiB readback at 255 tokens followed by the same
-    // upload - with the relative encoding's, 3.96 -> 3.56 s a warm fold. Both
-    // copies live through the sampler, +127 MiB of peak at 255 tokens, so a
-    // device WITH a ceiling takes them only while they are a sixth of it (the
-    // page sets none; on unified memory a host copy costs the same RAM).
-    const budget = memoryBudgetBytes(device);
-    const deviceConfidence = options.confidenceWeights != null
-      && options.returnConfidenceInputs !== true
-      && (budget == null || 2 * pairs * channels * 4 * 6 < budget || !hostPairFits);
+    // 🔴 A DEVICE COPY, NOT A HOST ONE, unless a memory ceiling cannot spare it or
+    // the caller wants the head's inputs back as arrays. The head binds it; a host
+    // copy was a 64 MiB readback at 255 tokens followed by the same upload - with
+    // the relative encoding's, 3.96 -> 3.56 s a warm fold. Where the card is tight
+    // it waits on the host in pieces, which a pair past a gigabyte can do where one
+    // array cannot.
+    const hostConfidence = options.confidenceWeights != null && options.returnConfidenceInputs === true;
+    const deviceConfidence = options.confidenceWeights != null && !hostConfidence && !spill;
     const deviceCopy = (label, source) => {
-      const copy = allocator.allocate(label, pairs * channels * 4,
-                                      storage | GPUBufferUsage.COPY_DST);
+      const copy = allocator.allocate(label, pairBytes, storage | GPUBufferUsage.COPY_DST);
       const encoder = device.createCommandEncoder({ label });
-      encoder.copyBufferToBuffer(source.buffer, 0, copy.buffer, 0, pairs * channels * 4);
+      encoder.copyBufferToBuffer(source.buffer, 0, copy.buffer, 0, pairBytes);
       device.queue.submit([encoder.finish()]);
       return copy;
     };
-    let confidencePairOnDevice = deviceConfidence
-      ? deviceCopy("esmfold2.confidence-pair", pair) : undefined;
-    const confidencePair = options.confidenceWeights == null || deviceConfidence ? undefined
+    let confidencePairOnDevice = deviceConfidence ? deviceCopy("esmfold2.confidence-pair", pair) : undefined;
+    let confidencePairSpill = options.confidenceWeights != null && !hostConfidence && spill
+      ? await spillToHost(device, allocator, pair, pairBytes, "esmfold2.confidence-pair") : undefined;
+    const confidencePair = !hostConfidence ? undefined
       : await (async () => {
-        const back = allocator.allocate("esmfold2.confidence-pair", pairs * channels * 4,
+        const back = allocator.allocate("esmfold2.confidence-pair", pairBytes,
           GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
         const encoder = device.createCommandEncoder({ label: "esmfold2.confidence-pair" });
-        encoder.copyBufferToBuffer(pair.buffer, 0, back.buffer, 0, pairs * channels * 4);
+        encoder.copyBufferToBuffer(pair.buffer, 0, back.buffer, 0, pairBytes);
         device.queue.submit([encoder.finish()]);
         await back.buffer.mapAsync(GPUMapMode.READ);
         const copy = new Float32Array(back.buffer.getMappedRange().slice(0));
@@ -824,31 +867,45 @@ export async function foldEsmfold2(device, options) {
     // kept through the trunk in its place; see where it is first built.
     // ...COPY_SRC, because the confidence head's copy is taken off this buffer
     // below and the conditioning overwrites it immediately after.
-    relPos = keep(allocator.allocate("esmfold2.rel-pos", pairs * channels * 4,
-                                     storage | GPUBufferUsage.COPY_SRC));
-    await buildRelativePositions();
-    // 🔴 AND THE CONFIDENCE HEAD'S COPY IS TAKEN HERE, IN THE ONE WINDOW IT
-    // EXISTS. Their head adds this to the NORMALISED pair, and it is the term
-    // this port omitted entirely - an optional argument defaulting to None on
-    // their side, so nothing objected. It has to be read back now: the next
-    // call writes the pair conditioning straight into this buffer, and the
-    // table that would let it be rebuilt is released three lines down.
-    // Measured absent: 13.8 pLDDT and a PAE 2.4x rougher. See docs/EF2FAST.md.
-    let confidenceRelPosOnDevice = deviceConfidence
-      ? deviceCopy("esmfold2.confidence-relpos", relPos) : undefined;
-    // Once, from whichever comes first: the head after its pair init, or here.
+    const relPos = keep(pairSized("esmfold2.rel-pos", storage | GPUBufferUsage.COPY_SRC));
+    await buildRelativePositions(relPos);
+    // Once, from whichever comes first: the head after its pair init, or the fold's end.
     const releaseConfidenceCopies = () => {
       confidencePairOnDevice?.release();
-      confidenceRelPosOnDevice?.release();
       confidencePairOnDevice = undefined;
-      confidenceRelPosOnDevice = undefined;
+      confidencePairSpill = undefined;
     };
-    const confidenceRelPos = options.confidenceWeights == null || deviceConfidence ? undefined
+    // 🔴 THE HEAD'S BIAS IS BUILT WHEN THE HEAD WANTS IT, a chunk at a time. Their
+    // head adds the relative encoding to the NORMALISED pair, and it is the term
+    // this port once omitted entirely - an optional argument defaulting to None on
+    // their side, so nothing objected. Measured absent: 13.8 pLDDT and a PAE 2.4x
+    // rougher. See docs/EF2FAST.md. It was copied here and held through the sampler,
+    // beside three other pair-sized tensors; the table it comes from is 1/64 the size.
+    //
+    // 🔴 AND THE BOND ENCODING GOES INTO THE SAME TERM, because their head adds BOTH
+    // to the normalised pair - `if relative_position_encoding is not None` and `if
+    // token_bonds_encoding is not None`, one after the other - and a sum of two
+    // addends is one addend, which keeps the pair-init kernel at eight storage
+    // bindings, WebGPU's floor. It is zero on a plain chain and not on a ligand.
+    // The product stored and then added, never fused: the host's f32 sum.
+    let confidenceBondTerm;
+    keep({ release: () => confidenceBondTerm?.release() });
+    const fillConfidenceBias = async (start, rows, target) => {
+      confidenceBondTerm ??= allocator.allocate("esmfold2.confidence-bonds", chunkRows * channels * 4, storage);
+      await submit("esmfold2.confidence-bias", [
+        relativeInto(target, start, rows),
+        bondsInto(confidenceBondTerm, start, rows),
+        ["bonds-add", addChunk[rows], [bytesOf(target, 0, rows * channels * 4),
+                                       bytesOf(confidenceBondTerm, 0, rows * channels * 4)],
+         ...elementwise(rows * channels)],
+      ], false);
+    };
+    const confidenceRelPos = !hostConfidence ? undefined
       : await (async () => {
-        const back = allocator.allocate("esmfold2.confidence-relpos",
-          pairs * channels * 4, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
+        const back = allocator.allocate("esmfold2.confidence-relpos", pairBytes,
+          GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
         const encoder = device.createCommandEncoder({ label: "esmfold2.confidence-relpos" });
-        encoder.copyBufferToBuffer(relPos.buffer, 0, back.buffer, 0, pairs * channels * 4);
+        encoder.copyBufferToBuffer(relPos.buffer, 0, back.buffer, 0, pairBytes);
         device.queue.submit([encoder.finish()]);
         await back.buffer.mapAsync(GPUMapMode.READ);
         const copy = new Float32Array(back.buffer.getMappedRange().slice(0));
@@ -856,51 +913,14 @@ export async function foldEsmfold2(device, options) {
         back.release();
         return copy;
       })();
-    // 🔴 AND THE BOND ENCODING GOES INTO THE SAME ARRAY, because their head
-    // adds BOTH to the normalised pair - `if relative_position_encoding is not
-    // None` and `if token_bonds_encoding is not None`, one after the other -
-    // and a sum of two addends is one addend. Folding them here keeps the
-    // pair-init kernel at eight bindings, which is exactly the WebGPU floor;
-    // a ninth would refuse to create its pipeline on a conforming minimum
-    // device, which is what npm run test:spec-floor exists to catch.
-    //
-    // 🔴 IT IS ZERO ON A PLAIN CHAIN AND NOT ON A LIGAND. Measured off their
-    // own forward pre-hook: `token_bonds_encoding` is absmax 0.0 over a 59-mer
-    // where the relative encoding is 12.97, so this changes no protein fold -
-    // and a ligand or a declared bond is exactly where leaving it out would
-    // have been the same silent defect a second time.
-    if (confidenceRelPosOnDevice !== undefined) {
-      // The same two steps on the device: the product stored, then added -
-      // never fused into one multiply-add, so it is the host's f32 sum.
-      const bondTerm = allocator.allocate("esmfold2.confidence-bonds",
-        pairs * channels * 4, storage);
-      const values = allocator.upload("esmfold2.confidence-bond-values",
-        features.tokenBonds, storage);
-      const table = allocator.upload("w.esmfold2.confidence-bond-weights",
-        weights.featuriser.tokenBonds, storage);
-      const addBonds = await cache.get(`ef2-conf-add:${pairs * channels}`,
-                                       createAddShader(pairs * channels));
-      await submit("esmfold2.confidence-bonds", [
-        ["bonds", bond, [values, table, bondTerm], ...elementwise(pairs * channels)],
-        ["bonds-add", addBonds, [confidenceRelPosOnDevice, bondTerm],
-         ...elementwise(pairs * channels)],
-      ], false);
-      for (const allocation of [bondTerm, values, table]) allocation.release();
-    }
     if (confidenceRelPos !== undefined) {
-      const bondTerm = allocator.allocate("esmfold2.confidence-bonds",
-        pairs * channels * 4, storage | GPUBufferUsage.COPY_SRC);
-      const values = allocator.upload("esmfold2.confidence-bond-values",
-        features.tokenBonds, storage);
-      const table = allocator.upload("w.esmfold2.confidence-bond-weights",
-        weights.featuriser.tokenBonds, storage);
-      await submit("esmfold2.confidence-bonds", [
-        ["bonds", bond, [values, table, bondTerm], ...elementwise(pairs * channels)],
-      ]);
-      const back = allocator.allocate("esmfold2.confidence-bonds-rb",
-        pairs * channels * 4, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
+      const bondTerm = allocator.allocate("esmfold2.confidence-bonds", pairBytes, storage | GPUBufferUsage.COPY_SRC);
+      await eachChunk((start, rows) => submit("esmfold2.confidence-bonds",
+        [bondsInto(bytesOf(bondTerm, start * channels * 4, rows * channels * 4), start, rows)], false));
+      const back = allocator.allocate("esmfold2.confidence-bonds-rb", pairBytes,
+        GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
       const encoder = device.createCommandEncoder({ label: "esmfold2.confidence-bonds" });
-      encoder.copyBufferToBuffer(bondTerm.buffer, 0, back.buffer, 0, pairs * channels * 4);
+      encoder.copyBufferToBuffer(bondTerm.buffer, 0, back.buffer, 0, pairBytes);
       device.queue.submit([encoder.finish()]);
       await back.buffer.mapAsync(GPUMapMode.READ);
       const added = new Float32Array(back.buffer.getMappedRange());
@@ -908,11 +928,7 @@ export async function foldEsmfold2(device, options) {
         confidenceRelPos[index] += added[index];
       }
       back.buffer.unmap();
-      for (const allocation of [back, bondTerm, values, table]) allocation.release();
-    }
-    for (const allocation of [relBins, relWeights]) {
-      allocation.release();
-      held.splice(held.indexOf(allocation), 1);
+      for (const allocation of [back, bondTerm]) allocation.release();
     }
 
     // 🔴 THE ELEMENT THE TOKEN TRANSFORMER'S WEIGHTS ARE HELD IN. Twelve
@@ -954,6 +970,7 @@ export async function foldEsmfold2(device, options) {
     let x = new Float32Array(atoms * 3);
     for (let i = 0; i < x.length; i += 1) x[i] = schedule[0] * draw();
     for (let step = 0; step < levels.length; step += 1) {
+      stopIfAsked();
       const at = performance.now();
       x = centreRandomAugmentation(x, features.mask, atoms, draw);
       const tHat = levels[step];
@@ -1003,17 +1020,22 @@ export async function foldEsmfold2(device, options) {
       relPos.release();
       held.splice(held.indexOf(relPos), 1);
     }
+    await settleReleasedMemory(device);
     let confidence;
     if (options.confidenceWeights != null) {
       const rep = representativeAtoms(features, tokens);
       confidence = await esmfold2ConfidenceFold(device, {
         tokens, atoms, sInputs, pair: confidencePair, coordinates: x, repAtom: rep,
         pairBuffer: confidencePairOnDevice?.buffer,
+        pairSpill: confidencePairSpill,
+        spillInitial: spill,
+        segmentRows,
+        trunk: options.trunk,
         atomToToken: features.atomToToken,
         atomMask: features.mask,
         tokenMask: new Float32Array(tokens).fill(1),
-        pairBias: confidenceRelPos, pairBiasBuffer: confidenceRelPosOnDevice?.buffer,
-        releaseInputs: releaseConfidenceCopies,
+        pairBias: confidenceRelPos, fillPairBias: hostConfidence ? undefined : fillConfidenceBias,
+        releaseInputs: () => { releaseConfidenceCopies(); confidenceBondTerm?.release(); confidenceBondTerm = undefined; },
         // 🔴 WITHOUT THIS EVERY COMPLEX REPORTS ipTM 0.000. ipTM is the same
         // expectation as pTM taken over the pairs whose `asymId` DIFFER, and
         // the reference defaulted a missing one to `new Int32Array(tokens)` -
@@ -1023,8 +1045,14 @@ export async function foldEsmfold2(device, options) {
         // of its own interface. Single-chain folds cannot see this, which is
         // every fold this head was gated on.
         asymId: features.asymId,
+        // ...and the frames' rule, for the chain-level scores (esmfold2ChainScores)
+        molType: features.molType, residueIndex: features.residueIndex, refPos: features.refPos,
       }, options.confidenceWeights, { allocator });
       releaseConfidenceCopies();
+      for (const allocation of [relBins, relWeights, bondValues, bondWeights]) {
+        allocation.release();
+        held.splice(held.indexOf(allocation), 1);
+      }
       // 🔴 THE HEAD'S OWN INPUTS, FOR THE ARM THAT RUNS SYNTHYRA'S MODULE ON A
       // REAL TRUNK. `dump_esmfold2_confidence.py` gates the head's ARITHMETIC
       // on seeded normals - its own header says a run on a real trunk's pair is
@@ -1096,5 +1124,8 @@ export async function foldEsmfold2(device, options) {
     for (let at = held.length - 1; at >= 0; at -= 1) {
       try { held[at].release(); } catch { /* already released */ }
     }
+    // A stopped fold has work in flight, so what was just destroyed comes back only when the device next ticks, and an
+    // idle device does not: measured at 1000 tokens, a stopped fold left 5 GiB on the card with nothing running.
+    await settleReleasedMemory(device).catch(() => { /* a lost device has nothing left to give back */ });
   }
 }

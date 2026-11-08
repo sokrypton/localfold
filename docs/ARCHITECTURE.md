@@ -873,8 +873,9 @@ across nine documents** - and docs are how anything here is FOUND, since
 CLAUDE.md's tool table is the index. **A doc naming a module that moved is worse
 than code doing it: code fails, a doc just misleads.**
 
-One of the 41 is the example worth keeping in mind.
-`webgpu/kernels/attention-webgl2.js` and `webgpu/kernels/triangle/webgl2.js` are 701
+One of the 41 is the example worth keeping in mind. `attention-webgl2.js` and
+`triangle/webgl2.js` - then both inside the WebGPU tree's `kernels/`, now
+`webgl/kernels/attention.js` and `webgl/kernels/triangle.js` - are 701
 lines that **nothing imports**, and a scan for dead code finds them
 immediately. They are not dead: docs/DEVELOPING.md says they "exist for
 comparison, not as a fallback anything selects", with the measurement that
@@ -885,6 +886,35 @@ pointing at a path that no longer existed. **Both files now carry the sentence
 in their own headers**, which is where it survives a reader who never opens
 docs/DEVELOPING.md - the same repair the four held-out `web/` modules got in the
 census below.
+
+🔴 **AND THE REAL REPAIR WAS A DIRECTORY, TAKEN LATER: THEY ARE `webgl/` NOW.**
+`attention-webgl2.js` and `triangle/webgl2.js` are `webgl/kernels/attention.js`
+and `webgl/kernels/triangle.js`, with `webgl/runtime/`, `webgl/index.js` and
+`webgl/README.md` beside them. The suffix was the tell and this file's own rule
+names it: **a directory names the backend, so a file carries no
+`-webgpu`/`-reference` suffix** - two files called `*webgl2*` inside
+`webgpu/kernels/` were a backend written as a filename, which is why the
+dead-code scan kept finding them and why a sentence in a document was all that
+stood in its way. A tree cannot be deleted by a sweep that looks for orphans.
+
+Moving them also found what the suffix had hidden: `createWebGL2Context`,
+`compile`, `VERTEX_SHADER`, `TEXTURE_WIDTH` and `CHANNELS_PER_TEXEL` were
+**duplicated byte for byte** between the two, because each was written as a
+standalone spike with nowhere shared to put them. They are `webgl/runtime/context.js`
+once. `textureShape` was the one of the five that had DRIFTED - one floored the
+height at a row and omitted the texel count, the other did the reverse - and
+for every input either kernel ever passed the two agreed, so the drift was
+invisible and would have stayed so.
+
+🔴 **AND SIX GATES ENUMERATE THE TREES BY HAND, SO A NEW ONE IS INVISIBLE
+UNTIL IT IS NAMED.** `modules-parse`, `imports-resolve`, `no-import-cycles`,
+`module-references`, `folded-grid-guard` and `graph-family-resolution` each
+carry their own `["shared", "cpu", "webgpu"]`, and `tsconfig.json` carries a
+seventh. A `webgl/` tree absent from all seven would have been a whole backend
+that **no gate reads** while every gate stayed green - this repository's
+allow-list trap at the level of a directory. All seven name it. `tools/build_site.py`
+deliberately does NOT: that list is what gets COPIED to the site, and a backend
+the page cannot select should not ship.
 
 ### The pattern, stated once
 

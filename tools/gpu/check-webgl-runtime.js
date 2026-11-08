@@ -1,0 +1,476 @@
+/**
+ * The WebGL2 backend's runtime and its first three AF2 primitives, against CPU
+ * references - and the expressibility question the headline ceiling gets wrong.
+ *
+ *     node tools/gpu-chrome.mjs tools/gpu/check-webgl-runtime.js [--falsify]
+ *
+ * 🔴 THE ARM THAT MATTERS MOST IS THE BIG TENSOR, AND IT CONTRADICTS A NUMBER
+ * THIS REPOSITORY HAS WRITTEN DOWN TWICE. docs/A100.md concludes that the pair
+ * track "stops fitting a texture axis at 181 tokens", from a GEMM whose operand
+ * is a 2D texture of `(K/4) x M` with `M = tokens^2`. Laid out LINEARLY - the
+ * layout `webgl/runtime/storage.js` uses and the one the triangle kernel has
+ * always used - the bound is the total element count instead, so a 400-token
+ * 128-channel pair tensor (20,480,000 floats) is addressable and is checked
+ * here. Both numbers are right about different layouts, and the one that got
+ * quoted is the one that does not apply to this tree's kernels.
+ *
+ * 🔴 AND THE BANDED DRAW IS FORCED, because nothing on this machine reaches it.
+ * A band is capped by `MAX_VIEWPORT_DIMS`, which here equals `MAX_TEXTURE_SIZE`,
+ * so a legal tensor is never tall enough to need a second draw and the whole
+ * path would ship untested. The arm sets `maxBandRows` small and requires the
+ * result to be **bit-identical** to the unbanded one, which is how the WebGPU
+ * side checks its own chunked paths: "forcing the chunked path on an input that
+ * does not need it reproduces the full path bit for bit".
+ *
+ * 🔴 AND THREE ARMS ARE REFUSALS, not comparisons. A fragment shader cannot
+ * read the texture its framebuffer is attached to, so `add(x, y, x)` - the
+ * WebGPU side's ordinary in-place residual - must THROW rather than produce
+ * undefined output, and an input bound to a sampler the kernel does not declare
+ * must throw rather than silently read whatever was on unit 0.
+ */
+import { Execution } from "../../webgl/runtime/execution.js";
+import { add, multiply, prefix, scale } from "../../webgl/runtime/elementwise.js";
+import { layerNorm } from "../../webgl/kernels/layer-norm.js";
+import { transposeLeading } from "../../webgl/runtime/transpose.js";
+import { linear } from "../../webgl/kernels/linear.js";
+import { createWebGL2Context } from "../../webgl/index.js";
+import { relativeRms } from "./relative-rms.js";
+
+const flag = (args, name) => (args ?? []).includes(`--${name}`);
+
+function generator(seed) {
+  let state = seed >>> 0;
+  return () => {
+    state += 0x6d2b79f5;
+    let value = state;
+    value = Math.imul(value ^ (value >>> 15), value | 1);
+    value ^= value + Math.imul(value ^ (value >>> 7), value | 61);
+    return ((value ^ (value >>> 14)) >>> 0) / 0x1_0000_0000;
+  };
+}
+const noise = (count, scale_, random) => {
+  const out = new Float32Array(count);
+  for (let i = 0; i < count; i += 1) out[i] = (random() * 2 - 1) * scale_;
+  return out;
+};
+
+/** `normalizeRows` from webgpu/kernels/triangle/cpu-reference.js, independently. */
+function layerNormReference(x, rows, channels, weight, bias, epsilon) {
+  const out = new Float32Array(x.length);
+  for (let row = 0; row < rows; row += 1) {
+    const at = row * channels;
+    let mean = 0;
+    for (let c = 0; c < channels; c += 1) mean += x[at + c];
+    mean /= channels;
+    let spread = 0;
+    for (let c = 0; c < channels; c += 1) {
+      const centred = x[at + c] - mean;
+      spread += centred * centred;
+    }
+    const inverseStd = 1 / Math.sqrt(spread / channels + epsilon);
+    for (let c = 0; c < channels; c += 1) {
+      out[at + c] = (x[at + c] - mean) * inverseStd * weight[c] + bias[c];
+    }
+  }
+  return out;
+}
+
+/** `out[row][o] = sum_i x[row][i] * weight[o * inChannels + i] + bias[o]`. */
+function linearReference(x, weight, bias, rows, inChannels, outChannels, activation) {
+  const out = new Float32Array(rows * outChannels);
+  for (let row = 0; row < rows; row += 1) {
+    for (let o = 0; o < outChannels; o += 1) {
+      let sum = 0;
+      for (let i = 0; i < inChannels; i += 1) {
+        sum += x[row * inChannels + i] * weight[o * inChannels + i];
+      }
+      const value = sum + (bias === undefined ? 0 : bias[o]);
+      out[row * outChannels + o] = activation === "relu" ? Math.max(value, 0)
+        : activation === "sigmoid" ? 1 / (1 + Math.exp(-value)) : value;
+    }
+  }
+  return out;
+}
+
+export async function main(device, args) {
+  const falsify = flag(args, "falsify");
+  const skew = (values) => (falsify
+    ? Float32Array.from(values, (v, i) => (i === (values.length >> 1) ? v * 1.01 + 0.01 : v))
+    : values);
+
+  const gl = createWebGL2Context();
+  const execution = new Execution(gl);
+  const rows = [];
+  const failures = [];
+  const arm = (name, got, want, bar) => {
+    const relative = relativeRms(got, want, name);
+    const ok = relative <= bar;
+    rows.push({ arm: name, relativeRms: Number(relative.toPrecision(4)), bar, ok });
+    if (!ok) failures.push(`${name}: relRMS ${relative.toExponential(3)} over ${bar}`);
+  };
+  // A refusal is a two-sided arm: it must throw, and it must throw for the
+  // stated reason. `--falsify` cannot move these, so they are reported apart
+  // from the numerical arms and are not counted in its verdict.
+  const refusals = [];
+  const refuses = (name, expect, body) => {
+    let message = null;
+    try { body(); } catch (error) { message = String(error.message); }
+    const ok = message !== null && message.includes(expect);
+    refusals.push({ refusal: name, ok, said: message ?? "did not throw" });
+    if (!ok) failures.push(`${name}: expected a refusal naming "${expect}", got ${message}`);
+  };
+
+  // --- storage: a tensor is a linear index ---------------------------------
+  const roundTrip = [];
+  for (const elements of [1, 7, 2048 * 4, 400 * 400 * 128]) {
+    const random = generator(elements);
+    const values = noise(elements, 1, random);
+    const tensor = execution.upload(values, `round-trip-${elements}`);
+    const back = execution.read(tensor);
+    let differing = 0;
+    for (let i = 0; i < elements; i += 1) if (back[i] !== values[i]) differing += 1;
+    roundTrip.push({ elements, height: tensor.height, megabytes: Number((tensor.bytes / 2 ** 20).toFixed(1)), differing });
+    if (differing !== 0) failures.push(`round-trip ${elements}: ${differing} differing`);
+    execution.release(tensor);
+  }
+
+  // --- the capacity refusal names the chain it would hold ------------------
+  refuses("allocate past capacity", "tokens here",
+    () => execution.allocate(execution.storage.capacity + 1, "too-big"));
+
+  // --- elementwise: no reordering, so bit-exact ---------------------------
+  {
+    const random = generator(11);
+    const elements = 4096 + 12;
+    const a = noise(elements, 1, random);
+    const b = noise(elements, 1, random);
+    const aT = execution.upload(skew(a), "a");
+    const bT = execution.upload(b, "b");
+    const want = (f) => Float32Array.from({ length: elements }, (_, i) => f(a[i], b[i]));
+    arm("elementwise add", execution.read(add(execution, aT, bT)), want((x, y) => x + y), 0);
+    arm("elementwise multiply", execution.read(multiply(execution, aT, bT)), want((x, y) => x * y), 0);
+    arm("elementwise scale", execution.read(scale(execution, aT, 0.375)),
+      want((x) => Math.fround(x * 0.375)), 0);
+    refuses("add into its own input", "cannot read the texture it draws into",
+      () => add(execution, aT, bT, aT));
+    // The leading prefix, which has to be a COPY and not merely close: it is how
+    // the structure module gets the trunk MSA's first row out of a tensor
+    // holding every alignment row. 4096 rather than 2048 because the control
+    // skews element 2054 and a prefix that stops short of it cannot go red.
+    arm("elementwise prefix", execution.read(prefix(execution, aT, 4096)),
+      a.slice(0, 4096), 0);
+    refuses("a prefix that is not a multiple of four", "multiple of 4",
+      () => prefix(execution, aT, 10));
+    refuses("a prefix longer than its tensor", "of a tensor holding",
+      () => prefix(execution, aT, elements + 4));
+  }
+
+  // --- LayerNorm ----------------------------------------------------------
+  for (const [n, channels] of [[16, 128], [37, 32], [8, 256]]) {
+    const random = generator(n * 100 + channels);
+    const x = noise(n * channels, 1.5, random);
+    const weight = noise(channels, 0.3, random);
+    const bias = noise(channels, 0.1, random);
+    const got = execution.read(layerNorm(execution, {
+      x: execution.upload(skew(x), "x"),
+      weight: execution.upload(weight, "w"),
+      bias: execution.upload(bias, "b"),
+      rows: n, channels,
+    }));
+    arm(`layerNorm ${n}x${channels}`, got,
+      layerNormReference(x, n, channels, weight, bias, 1e-5), 1e-6);
+  }
+  // 🔴 AND AF3'S VARIANCE IS A DIFFERENT NUMBER, NOT A CHEAPER ONE. AF3 takes
+  // `E[x^2] - E[x]^2` where AF2 centres first - "algebraically the same and
+  // numerically not", in cpu/af3/trunk/pairformer.js's words - so the fast arm
+  // is compared against its OWN reference formula and the two are asserted to
+  // DIFFER on a row whose mean dwarfs its spread, which is the case that
+  // separates them. A fast mode that silently computed the centred form would
+  // pass a shared reference and be wrong on AF3's single track, which reaches
+  // 1.7e5.
+  {
+    const n = 12;
+    const channels = 64;
+    const random = generator(9001);
+    // 🔴 A MEAN OF 100 AGAINST A SPREAD OF 1, AND THE FIRST TRY WAS 1e4 AGAINST
+    // 1e-2 AND READ NaN. That is not a defect in the kernel - it is the formula:
+    // at a mean of 1e4 the two expectations are both ~1e8 and their f32
+    // difference goes NEGATIVE, so `inversesqrt(variance + eps)` is NaN. AF3
+    // ships this formula and lives with it, which is worth knowing before
+    // anybody reads a NaN in a trunk as a port bug. At a mean of 100 the
+    // cancellation is a factor of 1e4, so the variance keeps about three digits
+    // and the two formulas separate by ~5e-4 without either collapsing.
+    const values = Float32Array.from(
+      { length: n * channels }, () => 100 + (random() * 2 - 1));
+    const weight = Float32Array.from(noise(channels, 0.2, generator(7)), (v) => v + 1);
+    const bias = noise(channels, 0.1, generator(8));
+    const xT = execution.upload(skew(values), "fast-x");
+    const weightT = execution.upload(weight, "fast-w");
+    const biasT = execution.upload(bias, "fast-b");
+    const want = (fast) => {
+      const out = new Float32Array(n * channels);
+      for (let row = 0; row < n; row += 1) {
+        const base = row * channels;
+        let sum = 0;
+        let sumSquares = 0;
+        for (let c = 0; c < channels; c += 1) {
+          sum += values[base + c];
+          sumSquares += values[base + c] * values[base + c];
+        }
+        const mean = sum / channels;
+        let variance = sumSquares / channels - mean * mean;
+        if (!fast) {
+          variance = 0;
+          for (let c = 0; c < channels; c += 1) {
+            variance += (values[base + c] - mean) ** 2;
+          }
+          variance /= channels;
+        }
+        const inverse = 1 / Math.sqrt(variance + 1e-5);
+        for (let c = 0; c < channels; c += 1) {
+          out[base + c] = (values[base + c] - mean) * inverse * weight[c] + bias[c];
+        }
+      }
+      return out;
+    };
+    const fast = Float32Array.from(execution.read(layerNorm(execution, {
+      x: xT, weight: weightT, bias: biasT, rows: n, channels, variance: "fast",
+    })));
+    const twoPass = Float32Array.from(execution.read(layerNorm(execution, {
+      x: xT, weight: weightT, bias: biasT, rows: n, channels,
+    })));
+    // 🔴 AND THE BAR HERE IS LOOSE ON PURPOSE, WHICH IS THE FINDING. The
+    // reference computes `E[x^2] - E[x]^2` in f64 and the kernel in f32, and the
+    // cancellation at a mean of 100 costs about three digits of the variance -
+    // so 5e-3 is what a CORRECT f32 implementation of this formula reaches, and
+    // a tight bar here would be asking the kernel to be better than the
+    // arithmetic AF3 chose.
+    arm(`layerNorm fast variance ${n}x${channels}`, fast, want(true), 5e-3);
+    // ...and the two formulas disagree here by far more than that bar, which is
+    // the whole reason the option exists.
+    const separation = relativeRms(twoPass, fast, "variance.separation");
+    // 🔴 `falsifiable: false`, WITH THE REASON. This row compares two of this
+    // port's own kernels on ONE input, so the control moves both sides together
+    // and it can never go red - the "comparing something with itself" trap in a
+    // control's clothes. Declaring it is better than inventing a perturbation
+    // that only looks like it works; what makes the row worth having is that it
+    // is a LOWER bound, asserting the two formulas are far apart rather than
+    // close.
+    rows.push({
+      arm: "the two variances differ on a large-mean row",
+      relativeRms: Number(separation.toPrecision(4)),
+      bar: "> 1e-4",
+      ok: separation > 1e-4,
+      falsifiable: false,
+      reason: "compares two of this port's own kernels on one input",
+    });
+    if (!(separation > 1e-4)) {
+      failures.push(`the two variance formulas agree to ${separation.toExponential(3)}`
+        + " - this arm cannot tell them apart");
+    }
+    refuses("a variance mode that is neither", "two-pass",
+      () => layerNorm(execution, {
+        x: xT, weight: weightT, bias: biasT, rows: n, channels,
+        variance: /** @type {any} */ ("welford"),
+      }));
+  }
+
+  // 🔴 AND A RAGGED **INPUT** WIDTH TOO, which AF3's diffusion conditioning
+  // forced for the same reason: it projects a 267-channel concatenation down to
+  // the pair width. Both layouts, because the two sweeps read the weight
+  // differently and only one of them can be right.
+  for (const weightLayout of ["in-major", "out-major"]) {
+    const n = 4;
+    const inChannels = 267;
+    const outChannels = 16;
+    const random = generator(inChannels + outChannels);
+    const x = noise(n * inChannels, 1, random);
+    const weight = noise(inChannels * outChannels, 0.2, random);
+    const bias = noise(outChannels, 0.1, random);
+    const want = new Float32Array(n * outChannels);
+    for (let row = 0; row < n; row += 1) {
+      for (let out = 0; out < outChannels; out += 1) {
+        let total = bias[out];
+        for (let i = 0; i < inChannels; i += 1) {
+          total += x[row * inChannels + i] * (weightLayout === "in-major"
+            ? weight[i * outChannels + out] : weight[out * inChannels + i]);
+        }
+        want[row * outChannels + out] = total;
+      }
+    }
+    const got = Float32Array.from(execution.read(linear(execution, {
+      x: execution.upload(skew(x), `ri-x-${weightLayout}`),
+      weight: execution.upload(weight, `ri-w-${weightLayout}`),
+      bias: execution.upload(bias, `ri-b-${weightLayout}`),
+      rows: n, inChannels, outChannels, weightLayout,
+    })));
+    arm(`linear ragged input ${n}x${inChannels}x${outChannels} ${weightLayout}`,
+      got, want, 3e-6);
+  }
+  refuses("a linear with both widths ragged", "both ragged",
+    () => linear(execution, {
+      x: execution.allocate(7 * 7, "bothx"), weight: execution.allocate(7 * 5, "bothw"),
+      rows: 7, inChannels: 7, outChannels: 5, weightLayout: "in-major",
+    }));
+
+  // 🔴 A RAGGED WIDTH IS AN ARM NOW, NOT A REFUSAL - BECAUSE AF3 HAS ONE. This
+  // kernel refused `channels % 4 !== 0` on the grounds that "every shape this
+  // port actually runs is a multiple of four", and that was true until AF3's
+  // diffusion conditioning turned up: it normalises the trunk pair concatenated
+  // with the RAW 139-column relative encoding, which is **267** channels.
+  // Refusing would have meant that stage could not run. 7 and 267 are both
+  // compared against the same f64 formula, and 267 is the shape that matters.
+  for (const [n, channels] of [[5, 7], [3, 267]]) {
+    const random = generator(n * 1000 + channels);
+    const values = noise(n * channels, 1.5, random);
+    const weight = Float32Array.from(noise(channels, 0.2, generator(channels)),
+      (v) => v + 1);
+    const bias = noise(channels, 0.1, generator(channels + 1));
+    const got = Float32Array.from(execution.read(layerNorm(execution, {
+      x: execution.upload(skew(values), `ragged-x${channels}`),
+      weight: execution.upload(weight, `ragged-w${channels}`),
+      bias: execution.upload(bias, `ragged-b${channels}`),
+      rows: n, channels,
+    })));
+    arm(`layerNorm ragged ${n}x${channels}`, got,
+      layerNormReference(values, n, channels, weight, bias, 1e-5), 2e-6);
+  }
+
+  // --- the dense projection ------------------------------------------------
+  for (const [n, inChannels, outChannels] of [[16, 32, 64], [13, 128, 32], [5, 64, 128]]) {
+    const random = generator(n + inChannels + outChannels);
+    const x = noise(n * inChannels, 1, random);
+    const weight = noise(inChannels * outChannels, 1 / Math.sqrt(inChannels), random);
+    const bias = noise(outChannels, 0.1, random);
+    const xT = execution.upload(skew(x), "x");
+    const wT = execution.upload(weight, "w");
+    const bT = execution.upload(bias, "b");
+    for (const activation of ["none", "relu", "sigmoid"]) {
+      const got = execution.read(linear(execution, {
+        x: xT, weight: wT, bias: bT, rows: n, inChannels, outChannels, activation,
+      }));
+      arm(`linear ${n}x${inChannels}x${outChannels} ${activation}`, got,
+        linearReference(x, weight, bias, n, inChannels, outChannels, activation), 1e-6);
+    }
+    // ...and without a bias, which is a different compiled kernel.
+    const noBias = execution.read(linear(execution, {
+      x: xT, weight: wT, rows: n, inChannels, outChannels,
+    }));
+    arm(`linear ${n}x${inChannels}x${outChannels} no bias`, noBias,
+      linearReference(x, weight, undefined, n, inChannels, outChannels, "none"), 1e-6);
+  }
+  // --- a ragged output width, which AF2's pLDDT head has ------------------
+  //
+  // 🔴 50 BINS MEANS A TEXEL STRADDLES TWO ROWS, so `linear` compiles a
+  // different kernel for it: row r occupies elements [50r, 50r + 50), and a
+  // fragment's four consecutive elements can belong to two rows with two
+  // different input vectors. The aligned kernel shares one input sweep across
+  // its four outputs and cannot. Both layouts are checked at a ragged width
+  // because the index arithmetic differs between them.
+  for (const [n, inChannels, outChannels] of [[5, 32, 50], [3, 16, 7], [9, 8, 13]]) {
+    const random = generator(n * 7919 + outChannels);
+    const x = noise(n * inChannels, 1, random);
+    const weight = noise(inChannels * outChannels, 1 / Math.sqrt(inChannels), random);
+    const bias = noise(outChannels, 0.1, random);
+    const xT = execution.upload(skew(x), "x");
+    const wT = execution.upload(weight, "w");
+    const bT = execution.upload(bias, "b");
+    for (const weightLayout of ["in-major", "out-major"]) {
+      const got = execution.read(linear(execution, {
+        x: xT, weight: wT, bias: bT, rows: n, inChannels, outChannels, weightLayout,
+      }));
+      const want = new Float32Array(n * outChannels);
+      for (let row = 0; row < n; row += 1) {
+        for (let o = 0; o < outChannels; o += 1) {
+          let sum = bias[o];
+          for (let i = 0; i < inChannels; i += 1) {
+            sum += x[row * inChannels + i] * (weightLayout === "in-major"
+              ? weight[i * outChannels + o] : weight[o * inChannels + i]);
+          }
+          want[row * outChannels + o] = sum;
+        }
+      }
+      arm(`linear ragged ${n}x${inChannels}x${outChannels} ${weightLayout}`, got, want, 1e-6);
+    }
+  }
+
+  refuses("a sampler the kernel does not declare", "no sampler named",
+    () => execution.dispatch({
+      source: `${require_nothing()}`, output: execution.allocate(4, "out"),
+      inputs: { absentTex: execution.allocate(4, "in") },
+    }));
+
+  // --- the leading-axis transpose, which is what column attention is -------
+  for (const [outer, inner, channels] of [[4, 6, 8], [7, 3, 32], [1, 5, 16]]) {
+    const random = generator(outer * 61 + inner * 13 + channels);
+    const values = noise(outer * inner * channels, 1, random);
+    const want = new Float32Array(values.length);
+    for (let o = 0; o < outer; o += 1) {
+      for (let i = 0; i < inner; i += 1) {
+        for (let c = 0; c < channels; c += 1) {
+          want[(i * outer + o) * channels + c] = values[(o * inner + i) * channels + c];
+        }
+      }
+    }
+    const x = execution.upload(skew(values), "x");
+    const got = execution.read(transposeLeading(execution, { x, outer, inner, channels }));
+    // A permutation moves no value, so this is bit-exact or the index is wrong.
+    arm(`transpose ${outer}x${inner}x${channels}`, got, want, 0);
+  }
+
+  // --- the banded draw, forced -------------------------------------------
+  {
+    const random = generator(99);
+    const n = 64;
+    const channels = 128;
+    const x = noise(n * channels, 1.5, random);
+    const weight = noise(channels, 0.3, random);
+    const bias = noise(channels, 0.1, random);
+    const inputs = {
+      x: execution.upload(x, "x"), weight: execution.upload(weight, "w"),
+      bias: execution.upload(bias, "b"), rows: n, channels,
+    };
+    const whole = execution.read(layerNorm(execution, inputs)).slice();
+    const was = execution.maxBandRows;
+    execution.maxBandRows = 3;
+    // ...the perturbation goes to the BANDED side only: this arm compares two
+    // runs of the same kernel, so a skewed input reaches both equally and the
+    // difference stays exactly 0. Same trap as the layout arm in
+    // check-webgl-kernels.js, and the same one-sided answer.
+    const banded = execution.read(layerNorm(execution, {
+      ...inputs, x: execution.upload(skew(x), "x-banded"),
+    })).slice();
+    execution.maxBandRows = was;
+    arm("layerNorm banded at 3 rows a draw", banded, whole, 0);
+  }
+
+  const stats = execution.stats();
+  const numerical = rows.length;
+  const falsifiableRows = rows.filter((row) => row.falsifiable !== false);
+  const red = falsifiableRows.filter((row) => !row.ok).length;
+  return {
+    maxTextureSize: gl.getParameter(gl.MAX_TEXTURE_SIZE),
+    maxViewportDims: [...gl.getParameter(gl.MAX_VIEWPORT_DIMS)],
+    capacityFloats: stats.capacityFloats,
+    pairTokensAt128Channels: Math.floor(Math.sqrt(stats.capacityFloats / 128)),
+    falsify,
+    roundTrip,
+    arms: rows,
+    refusals,
+    stats,
+    verdict: falsify
+      ? (red === falsifiableRows.length
+        ? `ok: all ${falsifiableRows.length} falsifiable arms go red on a 1% perturbation`
+        : `VACUOUS: only ${red} of ${falsifiableRows.length} falsifiable arms noticed it`)
+      : (failures.length === 0 ? `ok: ${numerical} arms, ${refusals.length} refusals`
+        : `FAILED: ${failures.join("; ")}`),
+  };
+}
+
+/** A kernel that declares no sampler at all, for the undeclared-input refusal. */
+function require_nothing() {
+  return `#version 300 es
+precision highp float;
+out vec4 result;
+void main() { result = vec4(1.0); }`;
+}

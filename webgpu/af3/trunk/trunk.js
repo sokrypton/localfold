@@ -27,10 +27,15 @@ import { memoryTotals } from "../../runtime/device-memory.js";
 
 /** The largest tensor the distogram head reads back through one mapping. */
 const READBACK_PIECE_BYTES = 256 * 1048576;
+/** Multiply-adds a dispatch of the distogram, which is channels x bins a pair. About 20 ms on an A10 before the kernel tiers up. */
+const DISTOGRAM_STEP_WORK = 0.25e9;
 import { pipelineCacheForDevice } from "../../runtime/pipeline-cache.js";
 import { Af3EmbedderGpu } from "./embedder.js";
 import { Af3MsaStackGpu } from "./msa-stack.js";
 import { Af3PairformerStackGpu } from "./pairformer-block.js";
+import { sequentialGroupsFor } from "./pair-track.js";
+import { rowPieces } from "./sequential-groups.js";
+import { deviceTuning } from "../../runtime/device-profile.js";
 import { Af3TemplateEmbedderGpu } from "./template.js";
 import { createPairWidthShader, pairWidthDispatch } from "./pair-width.js";
 import { GRID_WIDTH, PAIR_CHANNELS, createAddShader } from "./pair-track.js";
@@ -92,11 +97,12 @@ const W_HALF: u32 = ${offset}u;
 @group(0) @binding(3) var<storage, read> contact_bins: array<i32>;
 @group(0) @binding(4) var<storage, read_write> logits: array<f32>;
 @group(0) @binding(5) var<storage, read_write> contact: array<f32>;
+@group(0) @binding(6) var<uniform> row_range: vec2<u32>;
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let row = id.x + id.y * GRID_WIDTH * 64u;
-  if (row >= PAIRS) { return; }
+  let row = row_range.x + id.x + id.y * GRID_WIDTH * 64u;
+  if (row >= row_range.y) { return; }
   let i = row / TOKENS;
   let j = row % TOKENS;
   let transposed = j * TOKENS + i;
@@ -381,10 +387,12 @@ export class Af3TrunkGpu {
         && residentBytes + 5 * pairElements * 4 + 512 * 1048576 > budgetBytes);
       const trackOptions = leanPair ? { ...this.options, pairMatrixKernels: false } : this.options;
       this.lastLeanPair = leanPair;
+      // ...and one answer for the stacks that share that pool, because what the first leaves in it looks like memory in use
+      const sequentialGroups = options.sequentialGroups ?? sequentialGroupsFor(this.device, pairElements * 4);
       await stage("msa-stack", () => new Af3MsaStackGpu(this.device, trackOptions).run(
         { pairMask: input.pairMask, msaMask: input.msaMask, tokens, sequences: input.sequences },
         weights.msaBlocks, dialect,
-        { ...options, stopAfterOpm: options.stopAfterOpm === true, scratchAllocator,
+        { ...options, stopAfterOpm: options.stopAfterOpm === true, scratchAllocator, sequentialGroups,
           pairBuffer: pair.buffer, msaBuffer: embedded.msaAllocation.buffer, validation }));
       if (doubleAdd) {
         const add = await this.pipelines.get(`af3-trunk:add:${pairElements}`,
@@ -430,7 +438,7 @@ export class Af3TrunkGpu {
       if (mixer.length > 0) {
         await stage("pairmixer", () => new Af3PairformerStackGpu(this.device, trackOptions).run(
           { pairMask: input.pairMask, seqMask: input.seqMask, tokens }, mixer, dialect, {
-            ...options, scratchAllocator, onBlock: undefined, onBlockDone: undefined,
+            ...options, scratchAllocator, sequentialGroups, onBlock: undefined, onBlockDone: undefined,
             pairBuffer: pair.buffer, singleBuffer: embedded.singleAllocation.buffer, deferReadback: true, validation,
           }));
         const narrowElements = pairs * weights.pairWidth.trunkChannels;
@@ -445,7 +453,7 @@ export class Af3TrunkGpu {
       const pairformer = await stage("pairformer", () => new Af3PairformerStackGpu(this.device, trackOptions).run(
         { pairMask: input.pairMask, seqMask: input.seqMask, tokens },
         weights.pairformerBlocks, dialect, {
-          ...options, scratchAllocator,
+          ...options, scratchAllocator, sequentialGroups,
           pairBuffer: trunkPair.buffer, singleBuffer: embedded.singleAllocation.buffer,
           deferReadback: true, validation,
           onBlock: options.onPairformerBlock === undefined ? undefined
@@ -561,6 +569,10 @@ export class Af3TrunkGpu {
     const binsBuffer = keep(this.allocator.upload("af3-disto.contact-bins",
       af3ContactBins(contactClasses, tokens, binEdges(bins)), storage));
     const weightBuffer = keep(this.allocator.upload("af3-disto.weights", packed, storage));
+    // A pair's bins are its own, and one dispatch of them was 914 ms at 1000 tokens of IntelliFold-2 on an A10.
+    const pieces = rowPieces(pairs, channels * bins, deviceTuning(this.device).pairHeadStepWork ?? DISTOGRAM_STEP_WORK)
+      .map(({ first, count }) => ({ count, range: keep(this.allocator.upload("af3-disto.row-range",
+        new Uint32Array([first, first + count, 0, 0]), GPUBufferUsage.UNIFORM)) }));
 
     const run = async (pairAllocation, singleAllocation, pairElements, singleElements, wanted) => {
       // 🔴 ALLOCATED HERE, WHEN THE HEAD RUNS, NOT WHEN IT IS PREPARED. The
@@ -591,18 +603,24 @@ export class Af3TrunkGpu {
           target: this.allocator.allocate("af3-disto.readback", elements * 4, mapRead) });
       }
       this.device.pushErrorScope("validation");
-      const encoder = this.device.createCommandEncoder({ label: "af3-distogram" });
-      const pass = encoder.beginComputePass({ label: "af3-distogram" });
-      pass.setPipeline(pipeline);
-      pass.setBindGroup(0, this.device.createBindGroup({
-        layout: pipeline.getBindGroupLayout(0),
-        entries: [pairAllocation, maskBuffer, weightBuffer, binsBuffer,
-                  logits, contact].map(
-          (allocation, binding) => ({ binding, resource: { buffer: allocation.buffer } })),
-      }));
-      const groups = Math.ceil(pairs / 64);
-      pass.dispatchWorkgroups(Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH));
-      pass.end();
+      let encoder = this.device.createCommandEncoder({ label: "af3-distogram" });
+      for (const [index, { count, range }] of pieces.entries()) {
+        if (index > 0) {
+          this.device.queue.submit([encoder.finish()]);
+          encoder = this.device.createCommandEncoder({ label: "af3-distogram" });
+        }
+        const pass = encoder.beginComputePass({ label: "af3-distogram" });
+        pass.setPipeline(pipeline);
+        pass.setBindGroup(0, this.device.createBindGroup({
+          layout: pipeline.getBindGroupLayout(0),
+          entries: [pairAllocation, maskBuffer, weightBuffer, binsBuffer,
+                    logits, contact, range].map(
+            (allocation, binding) => ({ binding, resource: { buffer: allocation.buffer } })),
+        }));
+        const groups = Math.ceil(count / 64);
+        pass.dispatchWorkgroups(Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH));
+        pass.end();
+      }
       const whole = readback.filter(({ target }) => target !== undefined);
       for (const { source, target, bytes } of whole) {
         encoder.copyBufferToBuffer(source.buffer, 0, target.buffer, 0, bytes);

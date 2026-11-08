@@ -23,6 +23,17 @@
  * they are the arguments: AF3 takes its bin centres from its own error head,
  * masks by seq_mask, and identifies chains by asym_id rather than by assuming
  * they are contiguous blocks.
+ *
+ * 🔴 AND `predictedTmScores` IS NOT WHAT A FOLD REPORTS ANY MORE. It anchors on
+ * every live token - no frame mask, AF3's pae_single_mask - and returns the two
+ * global numbers and no chain scores, so it is kept as the ORACLE-side reference
+ * (tools/oracle/check_af3_confidence.js holds our PAE and these two scores to
+ * af3-any-model's) and nothing else. Every backend's fold reduces through
+ * `af3TmScores` in shared/heads/tm-score.js, which masks the anchors and
+ * reduces chain_pair_iptm, chain_ptm and chain_iptm from the INTERFACE term.
+ * webgl/af3/model/fold.js called this function until 2026-11-07, which is why
+ * the WebGL2 fold TOOL could not see the chain-pTM fix that the page's own
+ * WebGL2 fold already had.
  */
 import { bestAlignmentTmScore, tmPerBinFor, tmScoreD0 } from "../../../shared/heads/tm-score.js";
 

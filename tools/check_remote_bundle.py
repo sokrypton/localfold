@@ -16,6 +16,8 @@ stored with LFS or xet it does so after following the redirect to the CDN.
 
 Exits non-zero on the first thing that would fold to noise.
 """
+from __future__ import annotations
+
 import argparse
 import json
 import pathlib

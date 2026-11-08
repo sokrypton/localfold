@@ -1,5 +1,5 @@
 import { ATTENTION_NORMALIZE_SHADER, createAttentionNormParameters } from "../kernels/attention.js";
-import { chainPairTmScores, perChainTmScores, reduceTmScore, softmaxExpectations,
+import { chainPairTmScores, chainTmInfo, interfaceTmTerm, perChainTmScores, reduceTmScore, softmaxExpectations,
   tmPerBinFor, tmScoreD0, tmTermFromLogits } from "../../shared/heads/tm-score.js";
 import {
   createTransitionShaders, TRANSITION_TILE_COLUMNS, TRANSITION_TILE_ROWS,
@@ -126,7 +126,8 @@ export function computeTmScores(logits, length, breaks, chainLengths = undefined
   // score here is the same expectations averaged over a different set of pairs;
   // computing them per score made a two-chain fold do the expensive half twice
   // and would have made a five-chain fold do it twelve times.
-  return tmScoresFromTerm(tmTermFromLogits(logits, length, tmPerBin), length, chainLengths);
+  return tmScoresFromTerm(tmTermFromLogits(logits, length, tmPerBin), length, chainLengths,
+    { paeLogits: logits, centers });
 }
 
 /**
@@ -139,7 +140,7 @@ export function computeTmScores(logits, length, breaks, chainLengths = undefined
  * million `Math.exp` calls twice at 825 residues, 1.46 s on the main thread.
  * See softmaxExpectations.
  */
-export function tmScoresFromTerm(term, length, chainLengths = undefined) {
+export function tmScoresFromTerm(term, length, chainLengths = undefined, { paeLogits, centers } = {}) {
   const isMultiChain = Array.isArray(chainLengths) && chainLengths.length > 1;
   let chainIndices = null;
   if (isMultiChain) {
@@ -164,13 +165,22 @@ export function tmScoresFromTerm(term, length, chainLengths = undefined) {
   // are contiguous blocks - and its mask is all ones, because this path has no
   // padding to exclude.
   const seqMask = isMultiChain ? new Uint8Array(length).fill(1) : undefined;
+  // 🔴 ON AlphaFold 3's INTERFACE TERM, AS EVERY PORT'S CHAIN SCORES ARE (shared/heads/tm-score.js,
+  // cuda/featurise/ptm.h): d0 from the pair's own chains, not the whole prediction's - the names are
+  // AF3's, so the meaning is (reported by Yeqing Lin: a short binder's read ~0.10 high on the global term).
+  // pTM and ipTM above stay AlphaFold 2's. Every AF2 token is a residue, so every one has a frame.
+  if (isMultiChain && (paeLogits === undefined || centers === undefined)) {
+    throw new Error("the chain-level scores need the PAE logits and bin centres for AF3's interface term");
+  }
+  const tmInterface = isMultiChain
+    ? interfaceTmTerm(paeLogits, length, chainTmInfo(chainIndices, seqMask, centers)) : undefined;
   const chainPairIptm = isMultiChain
-    ? Object.fromEntries(chainPairTmScores(term, length, chainIndices, seqMask).scores)
+    ? Object.fromEntries(chainPairTmScores(tmInterface, length, chainIndices, seqMask).scores)
     : undefined;
   // ...and how each chain scores alone and against the rest, which is what
   // separates one badly folded chain from one badly placed one.
   const perChain = isMultiChain
-    ? perChainTmScores(term, length, chainIndices, seqMask) : undefined;
+    ? perChainTmScores(tmInterface, length, chainIndices, seqMask) : undefined;
 
   const multimerScore = isMultiChain && iptm !== undefined && !Number.isNaN(iptm)
     ? (0.8 * iptm + 0.2 * ptm) : undefined;
@@ -346,7 +356,7 @@ export class ConfidenceHeadsGpu {
       // this still takes the thread for O(L^2) with no await in it.
       onStage?.("scoring");
       await yieldToBrowser();
-      const tmScores = tmScoresFromTerm(tmTerm, length, chainLengths);
+      const tmScores = tmScoresFromTerm(tmTerm, length, chainLengths, { paeLogits: paeLogitValues, centers });
       return {
         lddtLogits: lddtLogitValues, plddt,
         meanPlddt: plddt.reduce((sum, value) => sum + value, 0) / length,

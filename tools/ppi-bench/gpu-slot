@@ -1,0 +1,20 @@
+#!/bin/bash
+# gpu-slot <command> [args...]: runs a standalone fold under one of SLOTS GPU slots (flock), waiting for a free one.
+# The benchmark's queues each start one fold process at a time, but several queues at once each sized their scratch
+# from the card's free memory and starved the next ("cannot put a model.bin on the device: out of memory", 6 of the
+# first 11 TS7P attempts, 2026-10-31). A fold through the resident AF3 server does not take a slot.
+SLOTS=2
+dir=/tmp/ppi-bench-gpu-slots
+mkdir -p "$dir"
+while true; do
+  for i in $(seq 0 $((SLOTS - 1))); do
+    exec {fd}>"$dir/$i"
+    if flock -n "$fd"; then
+      "$@"; rc=$?
+      flock -u "$fd"; exec {fd}>&-
+      exit $rc
+    fi
+    exec {fd}>&-
+  done
+  sleep 2
+done

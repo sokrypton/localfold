@@ -23,6 +23,6 @@
     "noImplicitAny": false,
     "skipLibCheck": true
   },
-  "include": ["shared/**/*.js", "cpu/**/*.js", "webgpu/**/*.js", "web/**/*.js"],
+  "include": ["shared/**/*.js", "cpu/**/*.js", "webgpu/**/*.js", "webgl/**/*.js", "web/**/*.js"],
   "exclude": ["web/vendor"]
 }

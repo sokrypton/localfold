@@ -365,6 +365,7 @@ export class Af3AtomDecoderGpu {
       perBlockPair: weights.pairNormPerBlock, keyMaskedAtomAttention: keyMasked, upGate,
       atomRowTile: shapedKnob(deviceTuning(this.device).atomRowTile),
       workgroupTarget: derivedWorkgroupTarget(this.device),
+      workgroupStorageBytes: this.device.limits.maxComputeWorkgroupStorageSize,
     };
     const sources = createAtomDecoderShaders(shape, pairPacked.offsets, blockPacked[0].offsets);
     const base = `af3-atom-dec:${tokens}:${dense}:${subsets}:${queries}:${keys}`

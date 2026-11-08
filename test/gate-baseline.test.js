@@ -94,3 +94,20 @@ test("the shipped baseline covers every arm and every fold", () => {
       `"${arm}" does not cover every fold in FOLDS`);
   }
 });
+
+/**
+ * 🔴 THE ARMS ARE ALSO EVIDENCE ABOUT EACH OTHER. They ask whether a capability's absence changes what a model computes,
+ * and a fold is not meant to care: every model but one read within 0.05 pLDDT across them. ESMFold2's stock arm read
+ * 53.834 against 73.342 for as long as this file held both, because ESM-C's weights were decoded to f16 for shaders
+ * reading f32, and nothing compared two figures that sat eleven lines apart. A run held to its own past says nothing
+ * about a past that was wrong.
+ */
+test("no model's confidence depends on the arm it ran in", () => {
+  const stored = JSON.parse(readFileSync(join(ROOT, "tools/gate-baseline.json"), "utf8"));
+  const plddt = (signature) => Number(/"meanPlddt": ([\d.]+)/.exec(signature ?? "")?.[1]);
+  for (const model of Object.keys(stored.arms.stock)) {
+    const figures = Object.values(stored.arms).map((arm) => plddt(arm[model])).filter(Number.isFinite);
+    if (figures.length < 2) continue;
+    assert.ok(Math.max(...figures) - Math.min(...figures) < 1, `${model}: ${figures.join(", ")}`);
+  }
+});

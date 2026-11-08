@@ -210,7 +210,8 @@ describe("the comment and string stripper", () => {
 describe("module references", () => {
   it("calls no exported name the file cannot see", () => {
     const sources = new Map();
-    for (const path of [...walk("shared"), ...walk("cpu"), ...walk("webgpu"), ...walk("web")]) {
+    for (const path of [...walk("shared"), ...walk("cpu"), ...walk("webgpu"), ...walk("webgl"),
+                        ...walk("web")]) {
       sources.set(path, stripCommentsAndStrings(readFileSync(path, "utf8")));
     }
     const projectExports = new Set();
