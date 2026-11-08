@@ -46,7 +46,7 @@
 import { ONE_TARGET, PRELUDE, sized, targetDeclarations, memoSource } from "../../runtime/execution.js";
 import { attentionFlash } from "../../kernels/attention-flash.js";
 import { layerNorm } from "../../kernels/layer-norm.js";
-import { linear } from "../../kernels/linear.js";
+import { linear, planeFetchGlsl, planeInputs } from "../../kernels/linear.js";
 import { add, multiply } from "../../runtime/elementwise.js";
 import { transposeLeading } from "../../runtime/transpose.js";
 
@@ -67,11 +67,11 @@ export const GRID_ATTENTION_OPTIONAL = ["gatingQueryBias", "outputProjectionBias
  * is a draw of its own. Doing the swap here rather than downstream keeps it next
  * to the comment that explains it.
  */
-const biasPlanesSourceUncached = (length, heads, swap, stride = heads, offset = 0) => sized({ L: length, PAIRS: length * length, ELEMENTS: heads * length * length }, `${PRELUDE}${ONE_TARGET}
+const biasPlanesSourceUncached = (length, heads, swap, stride = heads, offset = 0, blockRows = 0) => sized({ L: length, PAIRS: length * length, ELEMENTS: heads * length * length }, `${PRELUDE}${ONE_TARGET}
 const int HEADS = ${heads};
 const int STRIDE = ${stride};
 const int OFFSET = ${offset};
-uniform sampler2D rawTex;
+${blockRows > 0 ? planeFetchGlsl(blockRows, stride / 4) : "uniform sampler2D rawTex;"}
 
 void main() {
   int base = linearTexel() * 4;
@@ -87,7 +87,8 @@ void main() {
     int i = pair / L;
     int j = pair - i * L;
     ${swap ? "int source = j * L + i;" : "int source = pair;"}
-    float v = fetch1(rawTex, source * STRIDE + OFFSET + head);
+    ${blockRows > 0 ? "float v = planeFetch(source, (OFFSET + head) / 4)[(OFFSET + head) % 4];"
+      : "float v = fetch1(rawTex, source * STRIDE + OFFSET + head);"}
     if (lane == 0) value.x = v;
     else if (lane == 1) value.y = v;
     else if (lane == 2) value.z = v;
@@ -133,12 +134,13 @@ void main() {
  * is per row, so projecting the untransposed activation and gathering its rows here is the same arithmetic as
  * transposing the activation first, without the `transposeLeading` draw over the whole pair.
  */
-const splitGridQkvgSourceUncached = (length, width, transpose, extra = 0) => sized({ ROWS: length * length },
+const splitGridQkvgSourceUncached = (length, width, transpose, extra = 0, blockRows = 0) => sized({ ROWS: length * length },
   `${PRELUDE}${targetDeclarations(4)}
 const int W4 = ${width / 4};
 const int L = ${length};
 const int ROW4 = ${width + extra / 4};
-uniform sampler2D fusedTex;
+${blockRows > 0 ? planeFetchGlsl(blockRows, width + extra / 4)
+    : "uniform sampler2D fusedTex;\nvec4 planeFetch(int row, int group) { return fetch4(fusedTex, row * ROW4 + group); }"}
 
 void main() {
   int texel = linearTexel();
@@ -148,11 +150,11 @@ void main() {
   }
   int row = texel / W4;
   ${transpose ? "row = (row % L) * L + row / L;" : ""}
-  int base = row * ROW4 + texel % W4;
-  result0 = fetch4(fusedTex, base);
-  result1 = fetch4(fusedTex, base + W4);
-  result2 = fetch4(fusedTex, base + 2 * W4);
-  result3 = vec4(1.0) / (vec4(1.0) + exp(-fetch4(fusedTex, base + 3 * W4)));
+  int group = texel % W4;
+  result0 = planeFetch(row, group);
+  result1 = planeFetch(row, group + W4);
+  result2 = planeFetch(row, group + 2 * W4);
+  result3 = vec4(1.0) / (vec4(1.0) + exp(-planeFetch(row, group + 3 * W4)));
 }`);
 
 /**
@@ -266,9 +268,12 @@ export function gridSelfAttention(execution, call) {
   const fusedOut = fusedPath
     ? linear(execution, {
       x: normalised, weight: w.qkvgProjection, bias: w.qkvgBias, rows: pairs, inChannels: channels,
-      outChannels: 4 * width + extra, weightLayout: "in-major",
+      outChannels: 4 * width + extra, weightLayout: "in-major", keepPlanes: true,
     })
     : undefined;
+  // ...the projection's row planes, where it kept them: the bias and the split read them with no repack draw between
+  const kept = fusedOut !== undefined && /** @type {any} */ (fusedOut).planes !== undefined
+    ? /** @type {any} */ (fusedOut) : null;
 
   // The bias, from the UNTRANSPOSED activation in every dialect.
   const rawBias = extra > 0 ? fusedOut : linear(execution, {
@@ -278,10 +283,10 @@ export function gridSelfAttention(execution, call) {
   const bias = execution.allocate(heads * pairs, "af3.grid.bias");
   execution.dispatch({
     source: extra > 0
-      ? biasPlanesSource(length, heads, transpose && swapTransposedBias, 4 * width + extra, 4 * width)
+      ? biasPlanesSource(length, heads, transpose && swapTransposedBias, 4 * width + extra, 4 * width, kept?.blockRows ?? 0)
       : biasPlanesSource(length, heads, transpose && swapTransposedBias),
     output: bias,
-    inputs: { rawTex: rawBias },
+    inputs: extra > 0 && kept !== null ? planeInputs(kept) : { rawTex: rawBias },
     label: `af3.grid.bias:${length}x${heads}${transpose && swapTransposedBias ? ":swapped" : ""}`,
   });
   if (extra === 0) execution.release(rawBias);
@@ -300,12 +305,13 @@ export function gridSelfAttention(execution, call) {
   if (fusedPath) {
     [query, key, value, gate] = ["q", "k", "v", "g"].map((part) => execution.allocate(pairs * width, `af3.grid.${part}`));
     execution.dispatch({
-      source: splitGridQkvgSource(length, width, transpose, extra),
+      source: splitGridQkvgSource(length, width, transpose, extra, kept?.blockRows ?? 0),
       outputs: [query, key, value, gate],
-      inputs: { fusedTex: fusedOut },
+      inputs: kept === null ? { fusedTex: fusedOut } : planeInputs(kept),
       label: `af3.grid.split-qkvg:${pairs}x${width}${transpose ? ":transposed" : ""}`,
     });
-    execution.release(fusedOut);
+    if (kept === null) execution.release(fusedOut);
+    else for (const plane of kept.planes) execution.release(plane);
   } else {
   query = project(w.qProjection, "out-major");
   key = project(w.kProjection, "out-major");

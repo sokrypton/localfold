@@ -3403,3 +3403,5 @@ at `(row / 4) * OUT4 + group` themselves, and the `linear.repack:59x3072` draw (
 diffusion 2890 -> 2837 ms, fold 4567 -> 4516. `--no-keep-planes` is the arm.
 The trunk's transition takes the same: its 3481 x 128 -> 1024 up projection keeps its planes for the SwiGLU. Bit-identical;
 trunk 1485 -> 1427 ms.
+And the grid attention's fused 3481 x 128 -> 516 projection: the split and the bias planes both read its kept planes.
+Bit-identical; trunk 1421 -> 1373 ms, fold 4455 -> 4401, against the previous commit interleaved.
