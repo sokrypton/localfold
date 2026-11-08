@@ -262,6 +262,7 @@ export function webglExecutionOptions(args, defaults = {}) {
     skipLabels: pattern("skip"),
     noOpmOuterFirst: flag(args, "no-opm-outer-first"),
     noGridFusedProjection: flag(args, "no-grid-fused-projection"),
+    noKeepPlanes: flag(args, "no-keep-planes"),
     noTriangleFusedLayout: flag(args, "no-triangle-fused-layout"),
     skipDraws: flag(args, "skip-draws"),
     noTriangleTranspose: flag(args, "no-triangle-transpose"),

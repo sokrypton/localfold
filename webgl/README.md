@@ -3396,3 +3396,8 @@ Measured and NOT kept: the batched AdaLN writing the next projection's padded fl
 1024 `pad-stride` pass (1,225 draws a fold) goes. Bit-identical and SLOWER, diffusion 2884 -> 2908 ms: every AdaLN
 fragment walks its whole row twice for the statistics, so 1024 fragments a row where there were 768 costs more than
 the copy it replaced. (`--no-stride-pad`, which skips the pad and lets the row wrap, is neutral too.)
+
+Kept: the diffusion's two wide blocked projections hand their ROW PLANES straight to the draw that reads them
+(`linear(..., { keepPlanes: true })`, `planeFetchGlsl`) - the q/k/v/gate split and the SwiGLU fetch `plane[row % 4]`
+at `(row / 4) * OUT4 + group` themselves, and the `linear.repack:59x3072` draw (1,200 a fold) is gone. Bit-identical;
+diffusion 2890 -> 2837 ms, fold 4567 -> 4516. `--no-keep-planes` is the arm.
