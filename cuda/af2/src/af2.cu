@@ -795,6 +795,7 @@ static int foldMain(int argc, char** argv) {
     else if (!strncmp(argv[i], "--recycles=", 11)) recycles = atoi(argv[i] + 11);
     else if (!strcmp(argv[i], "--profile")) profile = true;
     else if (!strcmp(argv[i], "--fast")) FAST = true;
+    else if (!strcmp(argv[i], "--no-tc-attn")) tc5a::TC_ATTN = false;   // flash8 (mma.sync) where tcgen05 would run (a B200; af3's flag)
     else if (!strncmp(argv[i], "--tolerance=", 12)) TOLERANCE = atof(argv[i] + 12);
     else if (!strncmp(argv[i], "--frames=", 9)) FRAMES_DIR = argv[i] + 9;
     else if (!strcmp(argv[i], "--raw-confidences")) RAW_CONFIDENCES = true;
