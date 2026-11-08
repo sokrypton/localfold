@@ -3321,3 +3321,17 @@ holds; `--half-weights` is the configuration a fold runs.
   pair weight is 64 KiB. 🔴 **AND `probe-webgl-ubo-weight.js` FIRST REPORTED 2.22x THERE FROM DRAWS THAT NEVER RAN**: no
   `getError`, a skipped draw is a fast one, and its chain had decayed to ~3e-5 where an unwritten target compares as
   agreement. A probe that cannot tell "faster" from "refused" is not a measurement; both probes check errors now.
+
+🔴 **AND THE SMALL ITEMS AFTER IT, EACH THROUGH A WHOLE FOLD (three interleaved rounds, the noise ~±150 ms).** Kept:
+the triangle's operands written straight into the contraction's padded - and, incoming, transposed - layout
+(`operandsLaidOutSource`), which drops `pad-planes` / `transpose-a` / `transpose-b`: bit-identical, trunk median
+1.69 -> 1.65 s, `--no-triangle-fused-layout` the arm. Measured and NOT kept:
+
+- **LayerNorm folded into the projection that reads it** (normalise x on fetch from a one-row statistics pass): trunk
+  1.81 -> 1.97-2.16 s, SLOWER - two more fetches a k step in a fetch-bound loop cost more than the normalised tensor's
+  write and read, and grid attention's five projections each ran a statistics pass where there had been one
+  LayerNorm. (And the split LayerNorm is already measured a loss at 3481 x 128, 0.92x: its one-fragment-a-row
+  statistics pass is under-occupied.)
+- **An in-major float16 weight on 64+ rows never blocked**: `bench-webgl-linear.js --half-weights` puts the one-texel
+  kernel 1.22-1.78x ahead on every wide trunk shape (3481 x 128 -> 1024 2.21 against 2.68 ms), and the fold's trunk
+  went 1.63-1.67 -> 1.66-1.74 s. The fifth bench win this pass the fold did not see.
