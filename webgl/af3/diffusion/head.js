@@ -205,12 +205,15 @@ export function atomDecoder(execution, call) {
   });
   execution.release(onQueries);
 
-  // The decoder's own pair LayerNorm and projection, over the ENCODER's pair.
-  const logits = atomPairLogits(execution, {
+  // The decoder's own pair LayerNorm and projection, over the ENCODER's pair - kept for the walk with the encoder's
+  // conditioning where there is an `atomCache` (the pair it reads is the cached one)
+  const cache = encoded.conditioningKept ? call.atomCache : undefined;
+  const logits = cache?.decoderLogits ?? atomPairLogits(execution, {
     pair: encoded.pairCond, subsets, queries, keys,
     pairChannels: w.pairChannels, heads: w.heads, blocks: w.blocks.length,
     weights: w, pairNormPerBlock: call.pairNormPerBlock, epsilon,
   });
+  if (cache !== undefined) cache.decoderLogits = logits;
   for (const [index, block] of w.blocks.entries()) {
     const next = crossAttentionBlock(execution, {
       queriesAct: act, queriesToKeys: gathers.queriesToKeys.indices,
@@ -227,7 +230,7 @@ export function atomDecoder(execution, call) {
     execution.release(act);
     act = next;
   }
-  for (const tensor of logits) execution.release(tensor);
+  if (cache === undefined) for (const tensor of logits) execution.release(tensor);
 
   const masked = execution.allocate(queryRows * channels, "af3.decoder.masked");
   execution.dispatch({
@@ -359,6 +362,8 @@ export function* diffusionHeadSteps(execution, call) {
     trunkPairCond: cond.pair,
     ...dialect, epsilon,
     onStage: call.onStage,
+    // ...its noise-independent half kept for the walk, where the pair it reads is the walk's own (borrowed)
+    ...(cond.pairIsBorrowed && call.atomCache !== undefined ? { atomCache: call.atomCache } : {}),
   });
   execution.release(scaled);
   call.onStage?.("encoder.tokenAct", encoded.tokenAct);
@@ -408,13 +413,15 @@ export function* diffusionHeadSteps(execution, call) {
 
   const update = atomDecoder(execution, {
     tokenAct: normalised, encoded, gathers, shape: call.shape,
-    weights: w.decoder, ...dialect, epsilon,
+    weights: w.decoder, ...dialect, epsilon, atomCache: call.atomCache,
   });
   execution.release(normalised);
   call.onStage?.("decoder", update);
-  for (const key of ["skipConnection", "queriesMask", "keysMask", "queriesCond",
-    "keysCond", "pairCond"]) {
-    execution.release(encoded[key]);
+  execution.release(encoded.skipConnection);
+  if (!encoded.conditioningKept) {
+    for (const key of ["queriesMask", "keysMask", "queriesCond", "keysCond", "pairCond"]) {
+      execution.release(encoded[key]);
+    }
   }
   execution.release(cond.single);
   if (!cond.pairIsBorrowed) execution.release(cond.pair);

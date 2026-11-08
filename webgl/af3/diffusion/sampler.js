@@ -43,6 +43,7 @@ import { inpaintDenoised } from "../../../cpu/af3/diffusion/inpaint.js";
 import { diffusionHeadSteps } from "./head.js";
 import { pairConditioning } from "./conditioning.js";
 import { releasePairLogitsCache } from "./transformer.js";
+import { releaseAtomCache } from "./atom-encoder.js";
 import { drain } from "../../runtime/steps.js";
 
 /** @typedef {import("../../runtime/storage.js").Tensor} Tensor */
@@ -90,6 +91,8 @@ export function denoiserFromHead(execution, input) {
   // ...and the transformer's pair biases, which come from that pair alone: computed on the first step, released with
   // the walk (`releasePairLogitsCache`)
   const pairLogitsCache = { logits: null };
+  // ...and the atom encoder's noise-independent half and the decoder's biases (`atomCache`, atom-encoder.js)
+  const atomCache = {};
   // `issueSteps` draws the head, yielding between its pieces, and returns its read: a caller that
   // waits for the GPU at each yield (sampleOnWebGl2Steps) hands the head over in pieces and reads a
   // finished result instead of blocking on the whole head.
@@ -103,7 +106,7 @@ export function denoiserFromHead(execution, input) {
       "af3.sampler.noisy");
     const out = yield* diffusionHeadSteps(execution, {
       ...input, positionsNoisy: uploaded, noiseLevel,
-      ...(conditioningPair === undefined ? {} : { conditioningPair, pairLogitsCache }),
+      ...(conditioningPair === undefined ? {} : { conditioningPair, pairLogitsCache, atomCache }),
     });
     return () => {
       const values = Float32Array.from(execution.read(out));
@@ -117,6 +120,7 @@ export function denoiserFromHead(execution, input) {
   // ...and the walk's own copy goes back when the walk does.
   denoise.release = () => {
     releasePairLogitsCache(execution, pairLogitsCache);
+    releaseAtomCache(execution, atomCache);
     if (input.conditioningPair === undefined && conditioningPair !== undefined) {
       execution.release(conditioningPair);
     }
