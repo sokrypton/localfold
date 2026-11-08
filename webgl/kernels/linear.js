@@ -262,8 +262,17 @@ export const BLOCK_ROWS = 4;
  * four wherever WebGL2 is and eight on this context, and a fragment writes one
  * texel of each - the planes are interleaved back by `blockRepackSource`.
  */
-export const blockRowsFor = (execution) =>
-  (execution.linearBlockRows || Math.min(8, execution.maxDrawBuffers));
+/**
+ * Rows a fragment of the blocked projection owns: the render-target budget (8), or 4 on a short row count.
+ *
+ * 🔴 FOUR ROWS BELOW 128, MEASURED ON AF3's DENOISER, whose projections run on its 59 TOKENS: a block of 8 leaves
+ * eight row blocks and a fragment count the device cannot fill. Through a whole AF3 fold on an M2 (59 res, 8076-row
+ * a3m, three interleaved rounds each, bit-identical): diffusion 3.12 s at 8 rows, 2.90-2.93 at 4, 3.00 at 6 and
+ * 3.32 at 2; the trunk's 3481-row projections did not move at 4, so they keep 8. `--block-rows=` overrides both.
+ */
+export const blockRowsFor = (execution, rows = Infinity) =>
+  (execution.linearBlockRows
+    || Math.min(rows < 128 ? 4 : 8, execution.maxDrawBuffers));
 
 /**
  * Order fragments ROW BLOCK FASTEST when x is no bigger than this, and by
@@ -689,7 +698,7 @@ export function linear(execution, call, into) {
   if (!execution.noLinearBlock
     && blockedApplies(rows, inChannels, outChannels, weightLayout,
       !execution.noLinearAspect)) {
-    const blockRows = blockRowsFor(execution);
+    const blockRows = blockRowsFor(execution, rows);
     const rowQuads = Math.ceil(rows / blockRows);
     // Row block fastest only where it is measured: the int5 path, whose codes
     // are small enough per output group to stay in cache across a column.
