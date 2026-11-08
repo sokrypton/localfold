@@ -53,6 +53,7 @@ import { createWebGL2Context } from "../../webgl/index.js";
 import {
   foldAf3, prepareFoldPrograms, releaseAf3Weights, SAMPLER_DEFAULTS, uploadAf3Weights,
 } from "../../webgl/af3/model/fold.js";
+import { AF3_POOL_LIMIT_BYTES, foldMsa } from "../../webgl/af3/model/fold-batch.js";
 import { DIFFUSION_DEFAULTS, foldBatch } from "../../webgpu/af3/fold.js";
 import { relativeRms } from "./relative-rms.js";
 
@@ -163,12 +164,21 @@ export async function main(device, args) {
   for (const code of option(args, "ligands", "").split(",").filter((c) => c !== "")) {
     ligands.push(parseCcdComponent(await (await fetch(ccdUrl(code))).text()));
   }
-  const { batch } = af3BatchFromA3m(sequence, null,
-    ligands.length === 0 ? {} : { ligands });
+  // `--a3m=<path>` folds the alignment's own query with the alignment, drawn a pass at a time as the
+  // page draws it (`foldMsa`) - the arm that prices the MSA stack at the depth a real search gives.
+  const a3mPath = option(args, "a3m", "");
+  const a3m = a3mPath === "" ? null : await (await fetch(a3mPath)).text();
+  const folded = a3m === null ? sequence
+    : a3m.split("\n").find((line) => line !== "" && !line.startsWith(">") && !line.startsWith("#")).trim();
+  // ...and the rows a pass reads (`batch.numMsa`), at the page's own default: its `#max-msa` is 128:256
+  const maxMsa = Number(option(args, "max-msa", "128"));
+  const { batch } = af3BatchFromA3m(folded, a3m, {
+    maxSequences: maxMsa, ...(ligands.length === 0 ? {} : { ligands }) });
   const { tokens, dense } = batch;
 
   const gl = createWebGL2Context();
-  const execution = webglExecution(gl, args ?? []);
+  // ...as the page's fold-batch.js builds it: a bounded texture pool (`--no-pool` is the arm without)
+  const execution = webglExecution(gl, args ?? [], { pooling: true, poolLimitBytes: AF3_POOL_LIMIT_BYTES });
   const uploadStart = performance.now();
   const uploaded = uploadAf3Weights(execution, weights);
   const uploadMs = Math.round(performance.now() - uploadStart);
@@ -176,12 +186,7 @@ export async function main(device, args) {
 
   const call = {
     batch, weights: uploaded, hostWeights: weights,
-    msa: {
-      codes: Float32Array.from(batch.msa),
-      deletions: Float32Array.from(batch.deletionMatrix),
-      mask: Float32Array.from(batch.msaMask),
-      sequences: 1,
-    },
+    msa: foldMsa(batch, weights.trunk.dialect, { seed }),
     recycles, steps: trunkOnly ? 0 : steps, seed, templates,
     readTrunk: reference,
     ...(hoist ? {} : { hoistPairConditioning: false }),
@@ -417,6 +422,8 @@ export async function main(device, args) {
     },
     againstWgsl: coordinates,
     weightMegabytes,
+    // `--profile`'s table: READ ITS RANKING, NOT ITS TOTAL - each kernel is timed by waiting for it
+    ...(execution.profile === null ? {} : { profile: execution.profileTable(Number(option(args, "profile-top", "30"))) }),
     caSpacing: spacings.length === 0 ? null : {
       median: Number(median.toFixed(3)),
       lowest: Number(spacings[0].toFixed(3)),
