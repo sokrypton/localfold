@@ -3277,3 +3277,47 @@ instead of a refusal, which is the whole point of the tree; a visitor who waits 
 something the other path does in fifteen seconds may not thank anyone. The multimer is also still
 absent, so the page would have to offer a monomer-only backend. Those are product questions, so
 they are written down here rather than decided in a commit.
+
+## 🔴 2026-11-08: an AF3 fold on an M2, from 9.9 s to ~5.3 s - and what bounds it now
+
+Measured with `tools/gpu/fold-af3-webgl.js --a3m=/tools/fixtures/test.a3m` (59 residues, an 8076-row alignment drawn
+128 rows a pass as the page draws it, 48 + 4 blocks, 2 passes, 25 steps) in Chrome on an M2, against WebGPU's own warm
+fold of the same input: **1.74 s**. Safari 16.3 on the page, ubiquitin with a real search: **34 s / 25 s -> 18 s / 9 s**
+first / second fold. In the order they landed, each in its commit with its numbers:
+
+| change | effect |
+|---|---|
+| a deep alignment drawn a pass at a time (`foldMsa`) | a real search folded at all - it was REFUSED, "(8077 rows)" |
+| a bounded, LRU texture pool (`Storage.poolLimitBytes`, 128 MiB) | 9.9 -> 7.7 s; Safari's second fold 25 -> 14 s |
+| the outer product mean contracting the sequences first | trunk 2.85 -> ~1.9 s, and a 512/1024-row `max-msa` no longer overflows |
+| wide 59-row projections blocked; q/k/v/gate fused; AdaLN conditioning batched across all 24 blocks | diffusion 4.3 -> 3.5 s |
+| residuals in the gate draw; pair biases and the atom encoder's conditioning kept for the walk | diffusion 3.5 -> 3.1 s |
+| weights from 4,096 floats in float16 (`AF3_HALF_WEIGHT_FLOOR`) | 5.55 -> 5.27 s |
+| a narrow output (< 32) never blocks | trunk 1.74 -> ~1.71 s |
+
+🔴 **`--double` READS FREE ON THIS GPU, AND IT SAID THE GPU WAS NOT THE COST.** It was the first attribution here, and
+it is the trap this file already records for bioemu2: hidden-surface removal discards the first of two identical
+draws. `--skip=<regex>` (`Execution.skipLabels`) removes a family's draws instead, which nothing can discard, and every
+number above was found with it. Skipping EVERY draw leaves ~1.5 s of a ~5.5 s fold: the rest is GPU, and the host's
+~47 us a draw (`probe-webgl-draw-floor.js`) overlaps it - removing 96 draws a step moved nothing.
+
+🔴 **A KERNEL BENCH'S WIN DID NOT REACH THE FOLD, FOUR TIMES.** Out-major weights transposed to in-major (the bench:
+2x), the loop bound baked as a literal, a k-split summed by the BLEND unit (`probe-webgl-ksplit-chain.js`: 1.16x at
+59 rows, a loss at 3481), and uniform-block weights in Chrome (1.23x on the kernel) - each was taken through a whole
+fold and moved it by nothing measurable. What the dependent chain probe does show is the rate itself: a 59-row
+projection ~250 GFLOP/s and a 3481-row one ~400, chain or not, so the diffusion is about 1 GFLOP a block at ~250
+GFLOP/s - most of its ~5 ms a block. And `bench-webgl-linear.js` had measured FLOAT32 weights all along, which no fold
+holds; `--half-weights` is the configuration a fold runs.
+
+🔴 **SAFARI IS NOT CHROME, AND THREE THINGS ONLY SAFARI SHOWED** (`tools/run-in-safari.py`, `tools/fold-in-safari.py`):
+
+- **`mediump` is promoted there too** (`probe-webgl-precision.js`, relRms exactly 0): no f16 arithmetic from GLSL ES in
+  either browser.
+- **It refuses `readPixels` as FLOAT from an RGBA16F attachment**, which Chrome takes.
+- **It draws with less than 16 KiB of uniform blocks IN TOTAL while reporting 192**
+  (`probe-webgl-uniform-budget.js`: 12 x 16,384 reported; one 16,000-byte block draws, one 16,384-byte block or
+  4 x 4,096 do not - GL_INVALID_OPERATION at the draw and nothing earlier). So the uniform-block weight this file's
+  "A UNIFORM BLOCK READ IS 2.1x" section declined for bioemu2 is out for AF3 in the browser that matters: a 128 x 128
+  pair weight is 64 KiB. 🔴 **AND `probe-webgl-ubo-weight.js` FIRST REPORTED 2.22x THERE FROM DRAWS THAT NEVER RAN**: no
+  `getError`, a skipped draw is a fast one, and its chain had decayed to ~3e-5 where an unwritten target compares as
+  agreement. A probe that cannot tell "faster" from "refused" is not a measurement; both probes check errors now.

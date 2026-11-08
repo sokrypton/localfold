@@ -1,0 +1,12 @@
+<!doctype html><meta charset="utf-8"><title>run</title>
+<!-- tools/run-in-safari.py's page: imports ?module=, calls its main(null, ?arg=...) and leaves the JSON result (or the
+     error, with its message - Safari's `stack` omits it) on window.__result for the driver to read. -->
+<script type="module">
+const params = new URLSearchParams(location.search);
+const args = params.getAll("arg");
+window.__result = null;
+import(params.get("module")).then(async (m) => {
+  try { window.__result = JSON.stringify(await m.main(null, args)); }
+  catch (e) { window.__result = JSON.stringify({ error: String(e) + " @ " + String(e && e.stack) }); }
+}).catch((e) => { window.__result = JSON.stringify({ error: "import: " + String(e) }); });
+</script>
