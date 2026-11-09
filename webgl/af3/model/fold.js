@@ -457,7 +457,7 @@ export function dialectFlags(dialect = {}) {
     msaPairedQueryRowAligned: dialect.msaPairedQueryRowAligned === true,
     swapTransposedBias: dialect.swapTransposedBias === true,
     divideByLength: dialect.triangleMulDivideByLength === true,
-    opmBiasAfterNorm: dialect.outerProductMeanBiasAfterNorm === true,
+    opmBiasAfterNorm: dialect.opmBiasAfterNorm === true,
     msaDoubleAddPair: dialect.msaDoubleAddPair === true,
     templateMeanOverAllSlots: dialect.templateMeanOverAllSlots === true,
     // The atom stack and the diffusion
@@ -466,7 +466,9 @@ export function dialectFlags(dialect = {}) {
     keyMaskedAtomAttention: dialect.keyMaskedAtomAttention === true,
     chainedAtomLayerNorm: dialect.chainedAtomLayerNorm === true,
     diffusionNoResidual: dialect.diffusionNoResidual === true,
-    pairNormPerBlock: dialect.pairNormPerBlock === true,
+    // (a WEIGHT property, not a dialect key - true for OpenDDE alone, whose structural tokens this backend refuses -
+    // and so false for every family here; it read `dialect.pairNormPerBlock`, which no dialect has)
+    pairNormPerBlock: false,
     maskAtomActPerBlock: dialect.maskAtomActPerBlock === true,
     preTrunkQuery: dialect.preTrunkQuery === true,
     rawRefCharge: dialect.rawRefCharge === true,
@@ -997,7 +999,9 @@ export function* foldAf3Steps(execution, call) {
     : undefined;
   if (chiral !== undefined) headInput.chiral = chiral;
 
-  const positions = yield* sampleOnWebGl2Steps(execution, headInput, {
+  // `call.positions` (a diagnostic): the confidence head scores these instead of what was sampled - another backend's
+  // coordinates, so a confidence disagreement is separated from a sampler one
+  const sampledPositions = yield* sampleOnWebGl2Steps(execution, headInput, {
     steps, mask: batch.refMask, normal: call.normal ?? normalFrom(seed),
     ...SAMPLER_DEFAULTS,
     ...(call.sampler ?? {}),
@@ -1005,6 +1009,7 @@ export function* foldAf3Steps(execution, call) {
     realign: weights.dialect?.realignSampler === true,
     onStep: call.onStep,
   });
+  const positions = call.positions ?? sampledPositions;
   execution.release(conditioning);
   if (chiral !== undefined) for (const name of ["centers", "angles", "offsets", "entries"]) execution.release(chiral[name]);
   call.onStage?.("sample", { steps });

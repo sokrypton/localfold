@@ -45,6 +45,7 @@
  */
 import { HttpTensorStore } from "../../shared/bundles/http-tensor-store.js";
 import { af3BatchFromA3m } from "../../shared/af3/featurise/batch.js";
+import { featuriserDialect } from "../../shared/af3/dialect.js";
 import { ccdUrl, parseCcdComponent } from "../../shared/af3/featurise/ccd-component.js";
 import { af3Dialect, openAf3Store } from "../../shared/af3/weights/weights.js";
 import { foldWeights } from "../../shared/af3/weights/diffusion-weights.js";
@@ -173,8 +174,19 @@ export async function main(device, args) {
     : a3m.split("\n").find((line) => line !== "" && !line.startsWith(">") && !line.startsWith("#")).trim();
   // ...and the rows a pass reads (`batch.numMsa`), at the page's own default: its `#max-msa` is 128:256
   const maxMsa = Number(option(args, "max-msa", "128"));
+  // 🔴 THE PAGE'S FEATURISATION, NOT AF3's FOR EVERY BUNDLE: this built the batch with no dialect, so the two
+  // backends agreed on a batch the page never folds - and the fields only a dialect produces (boltz2's bond orders,
+  // rf3's profile, protenix's unpaired rows) were never in it. `featuriserDialect` is the page's own forwarding
+  // (web/af3-model.js); `--chain-kinds=protein,dna` and `--constraints=<json>` (resolved, constraints.js) are its
+  // other two inputs a model reads.
+  const chainKinds = option(args, "chain-kinds", "");
+  const constraints = JSON.parse(option(args, "constraints", "[]"));
   const { batch } = af3BatchFromA3m(folded, a3m, {
-    maxSequences: maxMsa, ...(ligands.length === 0 ? {} : { ligands }) });
+    maxSequences: maxMsa, ...(ligands.length === 0 ? {} : { ligands }),
+    ...featuriserDialect(weights.trunk.dialect),
+    ...(chainKinds === "" ? {} : { chainKinds: chainKinds.split(",") }),
+    ...(constraints.length === 0 ? {} : { constraints, modelName: weights.trunk.dialect.name ?? "this model" }),
+  });
   const { tokens, dense } = batch;
 
   const gl = createWebGL2Context();
@@ -262,6 +274,8 @@ export async function main(device, args) {
   // nothing to compare.
   let coordinates = null;
   let referenceMs = null;
+  let confidenceOnTheirs = null;
+  const meanOf = (values, mask) => { let sum = 0, n = 0; for (let i = 0; i < values.length; i += 1) if (mask[i] > 0) { sum += values[i]; n += 1; } return sum / n; };
   if (reference) {
     const start = performance.now();
     // 🔴 THE REFERENCE'S PRECISION IS AN ARM, because the DIFFERENCE between
@@ -286,6 +300,18 @@ export async function main(device, args) {
       } : {}),
     });
     referenceMs = Math.round(performance.now() - start);
+    // `--confidence-on-theirs`: this backend's confidence head again, on the WGSL fold's coordinates - a pLDDT gap
+    // that survives this is the head's, one that closes was the sampler's
+    if (flag(args, "confidence-on-theirs")) {
+      const uploadedAgain = uploadAf3Weights(execution, weights);
+      const again = foldAf3(execution, { ...call, weights: uploadedAgain, positions: theirs.positions });
+      releaseAf3Weights(execution, uploadedAgain);
+      confidenceOnTheirs = {
+        plddtRelativeRms: Number(relativeRms(again.plddt, theirs.scores.plddt, "plddt").toPrecision(4)),
+        paeRelativeRms: Number(relativeRms(again.pae, theirs.scores.pae, "pae").toPrecision(4)),
+        meanPlddt: [Number(meanOf(again.plddt, batch.refMask).toFixed(3)), Number(meanOf(theirs.scores.plddt, batch.refMask).toFixed(3))],
+      };
+    }
     let worst = 0;
     for (let atom = 0; atom < tokens * dense; atom += 1) {
       if (!(batch.refMask[atom] > 0)) continue;
@@ -350,6 +376,7 @@ export async function main(device, args) {
         result.plddt, theirs.scores.plddt, "plddt").toPrecision(4)),
       paeRelativeRms: theirs.scores === undefined ? null : Number(relativeRms(
         result.pae, theirs.scores.pae, "pae").toPrecision(4)),
+      ...(confidenceOnTheirs === null ? {} : { confidenceOnTheirs }),
     };
   }
 

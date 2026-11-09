@@ -268,6 +268,59 @@ export function prefix(execution, a, elements, into) {
   });
 }
 
+/** `count` floats of `a` from float `offset` (both multiples of four) - a row window of a row-major tensor. */
+const windowSourceUncached = (elements) => part({ ELEMENTS: elements }, {
+  uniforms: ["sampler2D aTex", "int OFFSET"],
+  body: `  int texel = linearTexel();
+  if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
+  result = fetch4(aTex, texel + OFFSET);`,
+});
+
+/**
+ * @param {import("./execution.js").Execution} execution
+ * @param {Tensor} a
+ * @param {number} offset first float, a multiple of four
+ * @param {number} elements how many, a multiple of four
+ * @returns {Tensor}
+ */
+export function window(execution, a, offset, elements) {
+  if (offset % 4 !== 0 || elements % 4 !== 0 || offset + elements > a.elements) {
+    throw new RangeError(`window: ${elements} floats from ${offset} of a tensor holding ${a.elements}`);
+  }
+  return execution.dispatch({
+    source: windowSource(elements), output: execution.allocate(elements, "window"),
+    inputs: { aTex: a }, ints: { OFFSET: offset / 4 }, label: `elementwise.window:${elements}`,
+  });
+}
+
+/** Equal-sized parts (the last may be shorter) end to end - `window`'s inverse. */
+const concatenateSourceUncached = (count, partElements, elements) => part(
+  { COUNT: count, PART: partElements, ELEMENTS: elements }, {
+    uniforms: Array.from({ length: count }, (_, i) => `sampler2D part${i}`),
+    body: `  int texel = linearTexel();
+  if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
+  int which = texel / (PART / 4);
+  int at = texel - which * (PART / 4);
+  ${Array.from({ length: count }, (_, i) => `if (which == ${i}) result = fetch4(part${i}, at);`).join("\n  else ")}`,
+  });
+
+/**
+ * @param {import("./execution.js").Execution} execution
+ * @param {Tensor[]} parts all but the last the same size, a multiple of four
+ * @returns {Tensor}
+ */
+export function concatenate(execution, parts) {
+  const size = parts[0].elements;
+  const elements = parts.reduce((sum, p) => sum + p.elements, 0);
+  if (size % 4 !== 0 || parts.slice(0, -1).some((p) => p.elements !== size)) {
+    throw new RangeError("concatenate: every part but the last must hold the same multiple of four floats");
+  }
+  return execution.dispatch({
+    source: concatenateSource(parts.length, size, elements), output: execution.allocate(elements, "concatenated"),
+    inputs: Object.fromEntries(parts.map((p, i) => [`part${i}`, p])), label: `elementwise.concatenate:${parts.length}`,
+  });
+}
+
 // Every builder above, memoised on its arguments (`memoSource` in webgl/runtime/execution.js).
 export const elementwiseSource = memoSource(elementwiseSourceUncached);
 export const elementwiseOpSource = memoSource(elementwiseOpSourceUncached);
@@ -277,3 +330,5 @@ export const reluSource = memoSource(reluSourceUncached);
 export const scaleSource = memoSource(scaleSourceUncached);
 export const maskRowsSource = memoSource(maskRowsSourceUncached);
 export const prefixSource = memoSource(prefixSourceUncached);
+export const windowSource = memoSource(windowSourceUncached);
+export const concatenateSource = memoSource(concatenateSourceUncached);
