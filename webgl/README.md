@@ -3492,3 +3492,7 @@ falls back to the plane kernel, `--no-atom-attend-planes` with it to the origina
 Measured and NOT kept: the same logits-then-values split forced onto the trunk's grid attention (one draw, 13,924
 fragments). Trunk 1219 -> 1509 ms, much SLOWER: that kernel is already occupied, so the split only adds fetches. The
 split pays where a kernel is short of fragments (944 and 1,920), not as a rule.
+So the rule is occupancy, and it is stated as one: `attentionFlash` takes the logits-then-values form for a head too
+wide for one draw OR for fewer than 4,096 (batch, query, head) fragments (`SPLIT_BELOW_FRAGMENTS`; 944 and 1,920
+gained, 13,924 lost). Diffusion 2452 -> 2418 ms with the trunk unmoved (the trunk's 944-fragment single attention is
+too small to show); `--no-split-few-fragments` is the arm.
