@@ -3801,3 +3801,27 @@ AF3 + GOL 0.85 -> 0.21 and Protenix-v2's 1.61 -> 0.47 for the same reason.
 
 The WebGPU reference itself died on every arm here (`webgpu/af3/fold.js`, the recycle convergence read
 `previousSingle.length` on a pass that kept the pair and not the single, with `--seams` and a recycle); guarded.
+
+### 🔴 Protenix-v2's recycle dropout was missing, and the page's default seed draws it (fixed)
+
+Protenix-v2 applies MC dropout (0.4) to the recycled pair term on ~40% of seeds (`recycleMcDropout`,
+`mcDropoutApplies`), and webgpu/af3 implemented it while webgl/af3 did not. The page folds `Number(seed) || 1`, and seed
+1 draws it, so **every default Protenix-v2 fold on WebGL2 since 442a3c8a was a different fold**: at seed 1, 2.2 A from
+WebGPU's with `z_init` 0.20 off. Every comparison above ran at seed 42, which does not. The recycled update is now
+masked by the same lowbias32 hash a (pair row, channel) as every backend's (`recycleDropoutSource` in
+trunk/embedder.js; the 32-bit key travels as a signed int - both passes at seed 1 have the top bit set, so the cast is
+exercised): 0.10 A, trunk pair 2.9e-3, pLDDT 73.65 / 73.66.
+
+`test/dialect-keys-read.test.js` now also holds every dialect key webgpu/af3 reads to being read in webgl/af3 - it names
+`recycleMcDropout` against the old tree. Weight-object flags the shared loader sets were audited the same way (every
+non-tensor property of seven families' `foldWeights`): only Chai-1's, false for all seven, are unread here.
+
+**Mol-1's pLDDT differs from WebGPU's after a recycle (78.8 / 76.7) and that is not a defect.** On WebGPU's
+coordinates both heads give their own number; the f64 CPU head (`fold-af3-webgl.js --cpu-confidence`) reproduces each
+backend's from that backend's trunk (1.3e-3 and 1.4e-5), and RANDOM noise at the two trunks' own relRMS (1.5e-3 single,
+3e-3 pair) moves it further (`--cpu-noise`: relRMS 0.18 against 0.056). Recycled Mol-1 is that sensitive; at zero
+recycles the two agree (73.66 / 73.69).
+
+The MSA transition's windows now start only where `gated` cannot be allocated, so a pair transition past 362 tokens
+folds whole as before; `check-webgl-af3-transition.js` holds four ragged windows to the whole path (4-7e-8, red at 1.1
+with two windows swapped).

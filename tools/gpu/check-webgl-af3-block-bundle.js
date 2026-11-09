@@ -33,6 +33,8 @@ const STACKS = {
   trunk: "diffuser/evoformer/__layer_stack_no_per_layer_1/trunk_pairformer",
   mixer: "diffuser/evoformer/__layer_stack_no_per_layer_1/trunk_pairmixer",
   "after-mixer": "diffuser/evoformer/__layer_stack_no_per_layer_2/trunk_pairformer",
+  // the confidence head's pairformer - Mol-1's is 448 wide with 14 heads, a shape no synthetic arm builds
+  confidence: "diffuser/confidence_head/__layer_stack_no_per_layer/confidence_pairformer",
 };
 
 function deterministic(length, seed) {

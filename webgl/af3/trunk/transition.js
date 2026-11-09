@@ -111,10 +111,12 @@ export function transition(execution, call) {
   }
 
   // 🔴 ROWS PAST THIS CONTEXT'S TEXTURE CAPACITY GO A WINDOW AT A TIME. The op is row by row, so this is
-  // exact; it is reached by protenix2's and mol1's MSA stack, which reads every alignment row (`mainMsaCap`
-  // 16384) - 8076 rows at 59 tokens is a 244M-float up projection against 134M here.
+  // exact; it is reached by protenix2's and mol1's MSA stack, which reads every alignment row (`msaNativeSample`;
+  // no num_msa cap) - 8076 rows at 59 tokens is a 244M-float up projection against 134M here.
+  // Only when `gated` (rows x intermediate) cannot be allocated - the up projection keeps its planes, so a pair
+  // transition past 362 tokens folds whole as it did - and then a window the whole projection fits in too.
   const windowRows = Math.floor(execution.storage.capacity / (2 * intermediate));
-  if (rows > windowRows) {
+  if (rows * intermediate > execution.storage.capacity) {
     const parts = [];
     for (let start = 0; start < rows; start += windowRows) {
       const count = Math.min(windowRows, rows - start);

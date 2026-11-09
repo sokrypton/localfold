@@ -44,7 +44,7 @@
  * matrix. Where it is set, the single embedding is the SAME tensor rather than a
  * second projection - "sharing is what says the two really are one embedding".
  */
-import { ONE_TARGET, PRELUDE, sized, memoSource } from "../../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, sized, part, memoSource } from "../../runtime/execution.js";
 import { add } from "../../runtime/elementwise.js";
 import { layerNorm } from "../../kernels/layer-norm.js";
 import { linear } from "../../kernels/linear.js";
@@ -336,11 +336,29 @@ export function embed(execution, call) {
     x: previousPair, weight: w.prevEmbeddingNormScale, bias: w.prevEmbeddingNormOffset,
     rows: pairs, channels: pairChannels, epsilon, variance: "fast",
   });
-  addPair(linear(execution, {
+  const recycled = linear(execution, {
     x: normalisedPrevious, weight: w.prevEmbedding, rows: pairs,
     inChannels: pairChannels, outChannels: pairChannels, weightLayout: "in-major",
-  }));
+  });
   execution.release(normalisedPrevious);
+  // 🔴 protenix2's MC DROPOUT ON THE RECYCLED TERM, for the seeds it applies to (`recycleDropout`: this pass's key,
+  // threshold and scale - webgpu/af3/fold.js `recycleDropoutOf`). Every pair row and channel kept or dropped by the
+  // hash every backend computes (shared/af3/msa-draw.js `mcDropoutKeep`); absent here, a fold on ~40% of seeds was a
+  // different fold from WebGPU's.
+  if (call.recycleDropout === undefined) addPair(recycled);
+  else {
+    const { key, threshold, scale } = call.recycleDropout;
+    const dropped = execution.dispatch({
+      source: recycleDropoutSource(pairs * pairChannels, pairChannels),
+      output: execution.allocate(pairs * pairChannels, "af3.embed.recycle-dropout"),
+      inputs: { xTex: recycled },
+      // (ints are signed: the 32 bits of the key and threshold travel as int and are read back as uint)
+      ints: { KEY: key | 0, THRESHOLD: threshold | 0 }, floats: { SCALE: scale },
+      label: `af3.embed.recycle-dropout:${pairs}x${pairChannels}`,
+    });
+    execution.release(recycled);
+    addPair(dropped);
+  }
 
   // The bond embedding, where the caller has a contact matrix. It reads the
   // pair and writes a new one rather than producing an update, because a
@@ -435,6 +453,26 @@ export function embed(execution, call) {
 }
 
 // Every builder above, memoised on its arguments (`memoSource` in webgl/runtime/execution.js).
+/** `x * keep(row, c) * scale`, the mask `mcDropoutKeep` draws (lowbias32 twice), element by element. */
+const recycleDropoutSourceUncached = (elements, channels) => part({ ELEMENTS: elements, C: channels }, {
+  uniforms: ["sampler2D xTex", "int KEY", "int THRESHOLD", "float SCALE"],
+  helpers: `uint recycleDropMix(uint v) {
+  uint x = v;
+  x = x ^ (x >> 16u); x = x * 0x7feb352du; x = x ^ (x >> 15u); x = x * 0x846ca68bu; x = x ^ (x >> 16u);
+  return x;
+}
+float recycleDropFactor(int element) {
+  uint row = uint(element / C);
+  uint c = uint(element - (element / C) * C);
+  return recycleDropMix(recycleDropMix(uint(KEY) ^ row) + c) >= uint(THRESHOLD) ? SCALE : 0.0;
+}`,
+  body: `  int texel = linearTexel();
+  if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
+  int e = texel * 4;
+  result = fetch4(xTex, texel) * vec4(recycleDropFactor(e), recycleDropFactor(e + 1), recycleDropFactor(e + 2), recycleDropFactor(e + 3));`,
+});
+
+export const recycleDropoutSource = memoSource(recycleDropoutSourceUncached);
 export const bondEmbeddingSource = memoSource(bondEmbeddingSourceUncached);
 export const pairInitSource = memoSource(pairInitSourceUncached);
 export const relativeEncodingSource = memoSource(relativeEncodingSourceUncached);

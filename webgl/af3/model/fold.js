@@ -60,6 +60,7 @@ import { af3TmScores, chainTmInfo, tmPerBinFor, tmScoreD0, tmTermsFromLogits, to
 // structure". A second Box-Muller here would make every fold a different sample
 // from the same distribution and leave nothing to compare.
 import { normalFrom } from "../../../shared/af3/random.js";
+import { mcDropoutApplies, mcDropoutKey, mcDropoutThreshold } from "../../../shared/af3/msa-draw.js";
 import { chiralCentres, coverageOf, multichainMaskFor } from "../../../shared/af3/featurise/template-features.js";
 import { boltz2ContactTable } from "../../../shared/af3/featurise/constraints.js";
 import { fusedTemplateFeatures } from "../../../shared/af3/featurise/template-fused-features.js";
@@ -685,6 +686,12 @@ export function* foldAf3Steps(execution, call) {
   const flags = dialectFlags(weights.dialect);
   const { tokens, dense } = batch;
   const atoms = tokens * dense;
+  // protenix2's MC dropout on the recycled pair term, as webgpu/af3/fold.js decides it: once a seed, a key a pass
+  const dropoutRate = weights.dialect?.recycleMcDropout ?? 0;
+  const dropoutSeed = call.seed ?? 20260831;
+  const dropoutOn = dropoutRate > 0 && mcDropoutApplies(dropoutSeed, weights.dialect?.recycleMcDropoutOdds ?? 0);
+  const recycleDropoutOf = (pass) => (!dropoutOn ? undefined
+    : { key: mcDropoutKey(dropoutSeed, pass), threshold: mcDropoutThreshold(dropoutRate), scale: 1 / (1 - dropoutRate) });
   const pairChannels = hostWeights.trunk.embedder.pairChannels;
   const held = [];
   const upload = (values, label) => {
@@ -855,6 +862,7 @@ export function* foldAf3Steps(execution, call) {
       [msaCodes, deletions, msaMask] = passMsa;
     }
     const embedded = embed(execution, {
+      recycleDropout: recycleDropoutOf(pass),
       targetFeat: targetFeatTensor,
       identity: batchTensors.identity,
       msaCodes, deletions,

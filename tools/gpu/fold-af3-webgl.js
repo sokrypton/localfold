@@ -46,6 +46,9 @@
 import { HttpTensorStore } from "../../shared/bundles/http-tensor-store.js";
 import { af3BatchFromA3m } from "../../shared/af3/featurise/batch.js";
 import { featuriserDialect } from "../../shared/af3/dialect.js";
+import { confidenceHead as cpuConfidenceHead } from "../../cpu/af3/confidence/confidence.js";
+import { pairformerBlock as cpuPairformerBlock } from "../../cpu/af3/trunk/pairformer.js";
+import { buildTemplate } from "../../web/template-source.js";
 import { ccdUrl, parseCcdComponent } from "../../shared/af3/featurise/ccd-component.js";
 import { af3Dialect, openAf3Store } from "../../shared/af3/weights/weights.js";
 import { foldWeights } from "../../shared/af3/weights/diffusion-weights.js";
@@ -181,13 +184,31 @@ export async function main(device, args) {
   // other two inputs a model reads.
   const chainKinds = option(args, "chain-kinds", "");
   const constraints = JSON.parse(option(args, "constraints", "[]"));
+  // `--modify=SEP@3`: a modified residue on chain 0 (1-based position), its component from the CCD as the page has it
+  const modifications = [];
+  for (const spec of option(args, "modify", "").split(",").filter((m) => m !== "")) {
+    const [code, at] = spec.split("@");
+    modifications.push({ chain: 0, position: Number(at), ...parseCcdComponent(await (await fetch(ccdUrl(code))).text()) });
+  }
   const { batch } = af3BatchFromA3m(folded, a3m, {
+    ...(modifications.length === 0 ? {} : { modifications }),
     maxSequences: maxMsa, ...(ligands.length === 0 ? {} : { ligands }),
     ...featuriserDialect(weights.trunk.dialect),
     ...(chainKinds === "" ? {} : { chainKinds: chainKinds.split(",") }),
     ...(constraints.length === 0 ? {} : { constraints, modelName: weights.trunk.dialect.name ?? "this model" }),
   });
   const { tokens, dense } = batch;
+  // `--template=<pdb>:<chain>`: one slot through the page's own `buildTemplate`, handed to BOTH backends - a plain
+  // single-chain protein only (one token a residue), as fold-opendde.js's
+  const templatePath = option(args, "template", "");
+  const templateSlots = templatePath === "" ? undefined : await (async () => {
+    const [path, chain] = templatePath.split(":");
+    const built = buildTemplate({
+      text: await (await fetch(path)).text(), chain: chain ?? "A", query: folded,
+      tokens, minConfidence: 0, spanChains: false, tokenOf: (residue) => residue,
+    });
+    return [built.slot];
+  })();
 
   const gl = createWebGL2Context();
   // ...as the page's fold-batch.js builds it: a bounded texture pool (`--no-pool` is the arm without)
@@ -203,6 +224,7 @@ export async function main(device, args) {
     batch, weights: uploaded, hostWeights: weights,
     msa: foldMsa(batch, weights.trunk.dialect, { seed }),
     recycles, steps: trunkOnly ? 0 : steps, seed, templates,
+    ...(templateSlots === undefined ? {} : { templateSlots }),
     readTrunk: reference,
     ...(hoist ? {} : { hoistPairConditioning: false }),
   };
@@ -222,10 +244,13 @@ export async function main(device, args) {
   // `--seams`: the trunk's stage seams on both backends (first pass), under webgpu/af3/trunk/trunk.js's tap names, so a
   // disagreement is placed at the stage that makes it rather than read off the finished pair
   const seams = flag(args, "seams") ? { ours: {}, theirs: {} } : null;
+  // `--seams-pass=N`: the seams of recycle pass N rather than the first, where a recycle-only convention shows
+  const seamPass = Number(option(args, "seams-pass", "0"));
+  const seen = {};
   const result = foldAf3(execution, {
     ...call,
     ...(seams === null ? {} : {
-      onSeam: (name, values, pass) => { if (pass === 0 && !(name in seams.ours)) seams.ours[name] = values; },
+      onSeam: (name, values, pass) => { if (pass === seamPass && !(name in seams.ours)) seams.ours[name] = values; },
     }),
     // ...the page's progress stages carry the contact map; the log keeps their names and numbers only
     onStage: (name, detail) => {
@@ -286,8 +311,13 @@ export async function main(device, args) {
     // pins all four of its precision axes and is the arm that separates them.
     const theirs = await foldBatch(device, batch, weights, {
       steps, recycles, seed, templates, trunkLogits: false,
+      ...(templateSlots === undefined ? {} : { templateSlots }),
       ...(seams === null ? {} : {
-        onSeam: (name, values) => { if (!(name in seams.theirs)) seams.theirs[name] = Float32Array.from(values); },
+        // (WGSL's seams carry no pass: the Nth occurrence of a name is pass N)
+        onSeam: (name, values) => {
+          seen[name] = (seen[name] ?? -1) + 1;
+          if (seen[name] === seamPass) seams.theirs[name] = Float32Array.from(values);
+        },
         onStage: (name, detail) => {
           if (name === "target-feat" && detail?.targetFeat !== undefined && !("target_feat" in seams.theirs)) {
             seams.theirs.target_feat = Float32Array.from(detail.targetFeat);
@@ -304,12 +334,72 @@ export async function main(device, args) {
     // that survives this is the head's, one that closes was the sampler's
     if (flag(args, "confidence-on-theirs")) {
       const uploadedAgain = uploadAf3Weights(execution, weights);
-      const again = foldAf3(execution, { ...call, weights: uploadedAgain, positions: theirs.positions });
+      const again = foldAf3(execution, { ...call, weights: uploadedAgain, positions: theirs.positions, readTrunk: true });
       releaseAf3Weights(execution, uploadedAgain);
+      // `--cpu-confidence`: the f64 reference head as the referee, on THIS backend's trunk and target_feat and the
+      // WGSL coordinates - so a disagreement between the two heads is assigned to one of them
+      let cpu = null;
+      if (flag(args, "cpu-confidence") && seams !== null) {
+        const { pseudoBeta: gather } = { pseudoBeta: batch.tokenAtomsToPseudoBeta };
+        const pseudoBeta = new Float32Array(tokens * 3);
+        for (let t = 0; t < tokens; t += 1) {
+          if (!(gather.mask[t] > 0)) continue;
+          for (let axis = 0; axis < 3; axis += 1) pseudoBeta[t * 3 + axis] = theirs.positions[gather.indices[t] * 3 + axis];
+        }
+        const conf = weights.confidence;
+        const expected = cpuConfidenceHead({
+          tokens, dense, seqMask: batch.seqMask, pair: again.trunkPair, single: again.trunkSingle,
+          targetFeat: seams.ours.target_feat, pseudoBeta,
+          features: batch, bondMatrix: batch.bondMatrix, bondOrderMatrix: batch.bondOrderMatrix,
+        }, { ...conf, ...(conf.head ?? {}), blocks: conf.blocks }, cpuPairformerBlock, weights.trunk.dialect);
+        // ...and on the WGSL fold's OWN trunk and target_feat, so a WGSL disagreement is not its inputs'
+        const onTheirs = theirs.trunk?.pair === undefined || seams.theirs.target_feat === undefined ? null
+          : cpuConfidenceHead({
+            tokens, dense, seqMask: batch.seqMask, pair: theirs.trunk.pair, single: theirs.trunk.single,
+            targetFeat: seams.theirs.target_feat, pseudoBeta,
+            features: batch, bondMatrix: batch.bondMatrix, bondOrderMatrix: batch.bondOrderMatrix,
+          }, { ...conf, ...(conf.head ?? {}), blocks: conf.blocks }, cpuPairformerBlock, weights.trunk.dialect);
+        // `--cpu-noise`: the same head on the WGSL trunk plus RANDOM noise at the two trunks' own relRMS - if that
+        // moves pLDDT far less than the other backend's trunk does, the difference between the trunks is structured
+        let noisy = null;
+        if (flag(args, "cpu-noise") && onTheirs !== null) {
+          let state = 12345;
+          const gauss = () => { state = (state * 1103515245 + 12345) % 2147483648; const u = (state + 1) / 2147483649;
+            state = (state * 1103515245 + 12345) % 2147483648; const v = (state + 1) / 2147483649;
+            return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); };
+          const perturb = (values, other) => {
+            const relative = relativeRms(other, values, "noise");
+            let sum = 0; for (const x of values) sum += x * x;
+            const sigma = relative * Math.sqrt(sum / values.length);
+            return Float32Array.from(values, (x) => x + sigma * gauss());
+          };
+          const out = cpuConfidenceHead({
+            tokens, dense, seqMask: batch.seqMask, pair: perturb(theirs.trunk.pair, again.trunkPair),
+            single: perturb(theirs.trunk.single, again.trunkSingle),
+            targetFeat: seams.theirs.target_feat, pseudoBeta,
+            features: batch, bondMatrix: batch.bondMatrix, bondOrderMatrix: batch.bondOrderMatrix,
+          }, { ...conf, ...(conf.head ?? {}), blocks: conf.blocks }, cpuPairformerBlock, weights.trunk.dialect);
+          noisy = { plddtAgainstClean: Number(relativeRms(out.plddt, onTheirs.plddt, "noise").toPrecision(4)),
+            meanPlddt: Number(meanOf(out.plddt, batch.refMask).toFixed(3)) };
+        }
+        cpu = {
+          ...(noisy === null ? {} : { randomNoiseAtTheSameRelRms: noisy }),
+          ...(onTheirs === null ? {} : {
+            theirsPlddtOnTheirTrunk: Number(relativeRms(theirs.scores.plddt, onTheirs.plddt, "cpu plddt").toPrecision(4)),
+            cpuMeanPlddtOnTheirTrunk: Number(meanOf(onTheirs.plddt, batch.refMask).toFixed(3)),
+          }),
+          oursPlddt: Number(relativeRms(again.plddt, expected.plddt, "cpu plddt").toPrecision(4)),
+          theirsPlddt: Number(relativeRms(theirs.scores.plddt, expected.plddt, "cpu plddt").toPrecision(4)),
+          oursPae: Number(relativeRms(again.pae, expected.pae, "cpu pae").toPrecision(4)),
+          theirsPae: Number(relativeRms(theirs.scores.pae, expected.pae, "cpu pae").toPrecision(4)),
+          cpuMeanPlddt: Number(meanOf(expected.plddt, batch.refMask).toFixed(3)),
+        };
+      }
       confidenceOnTheirs = {
         plddtRelativeRms: Number(relativeRms(again.plddt, theirs.scores.plddt, "plddt").toPrecision(4)),
         paeRelativeRms: Number(relativeRms(again.pae, theirs.scores.pae, "pae").toPrecision(4)),
         meanPlddt: [Number(meanOf(again.plddt, batch.refMask).toFixed(3)), Number(meanOf(theirs.scores.plddt, batch.refMask).toFixed(3))],
+        ...(cpu === null ? {} : { againstCpu: cpu }),
       };
     }
     let worst = 0;

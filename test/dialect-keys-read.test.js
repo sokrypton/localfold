@@ -33,3 +33,24 @@ test("every dialect key webgl/af3 and webgpu/af3 read exists", () => {
   assert.ok(reads > 50, `found only ${reads} dialect reads - the pattern stopped matching`);
   assert.deepEqual(unknown, []);
 });
+
+// 🔴 AND EVERY CONVENTION WebGPU READS, WebGL2 READS TOO. protenix2's MC dropout on the recycled pair term
+// (`recycleMcDropout`) was implemented in webgpu/af3 and absent from webgl/af3, so on the seeds that draw it - the page's
+// default among them, `Number(seed) || 1` - a WebGL2 protenix2 fold was another fold (2.2 A from WebGPU's, z_init 0.20
+// off). A key may be left out only by naming the family it serves and that this backend refuses it.
+const WEBGL_REFUSES = {};
+
+test("every dialect key webgpu/af3 reads, webgl/af3 reads too", () => {
+  const read = (dir) => {
+    const keys = new Set();
+    for (const file of walk(dir)) {
+      const code = readFileSync(file, "utf8").replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
+      for (const match of code.matchAll(/\bdialect\??\.(\w+)/g)) if (match[1] !== "js") keys.add(match[1]);
+    }
+    return keys;
+  };
+  const webgpu = read("webgpu/af3");
+  const webgl = read("webgl/af3");
+  assert.ok(webgpu.size > 20, `found only ${webgpu.size} keys webgpu/af3 reads - the pattern stopped matching`);
+  assert.deepEqual([...webgpu].filter((key) => !webgl.has(key) && !(key in WEBGL_REFUSES)), []);
+});
