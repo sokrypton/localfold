@@ -3489,3 +3489,6 @@ And then split like the denoiser's: `atomLogitsSource` (every logit once, four k
 (one fragment per output texel, 15,360 where the plane kernel ran 1,920 each walking 128 keys). Diffusion 2488 ->
 2455 ms, every round; the softmax in two sweeps, relRms against WebGPU 8.3e-4 -> 9.9e-4. `--no-atom-attend-split`
 falls back to the plane kernel, `--no-atom-attend-planes` with it to the original.
+Measured and NOT kept: the same logits-then-values split forced onto the trunk's grid attention (one draw, 13,924
+fragments). Trunk 1219 -> 1509 ms, much SLOWER: that kernel is already occupied, so the split only adds fetches. The
+split pays where a kernel is short of fragments (944 and 1,920), not as a rule.
