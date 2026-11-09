@@ -3426,3 +3426,13 @@ both halves of one tensor. Trunk 1349 -> 1311 ms, every fused round ahead of eve
 Measured and NOT kept, the next step of the same: the output gate's 128 columns fused in as well (128 -> 640, its
 sigmoid applied in the residual draw). Trunk 1299 -> 1328 ms, SLOWER - the 640-wide tensor is held across the
 contraction and the gate is read back at a 160-texel row stride, which costs more than the 128 -> 128 projection it saved.
+
+### A head too wide for one draw computes its logits once (kept)
+
+The diffusion's attention heads are 48 wide - 12 output texels where a draw writes 8 - so `attentionFlashPlanes` drew
+each attention TWICE (8 + 4 targets), and both draws walked every key computing the 48-wide dot product, the mask, the
+pair bias and the clamp again. Now a head with `draws > 1` first draws its logits, `[batch][query][head][key]` four
+keys a texel (`attentionLogitsSource`, the same arithmetic in the same order), and the value draws read one logit a key
+(`storedLogits`) and keep only the online softmax and the value accumulation. Bit-identical; diffusion **2846 -> 2701
+ms**, fold 4325 -> 4185, every round ahead. `check-webgl-attention.js`'s 64-wide arms (two draws) pass on it.
+`--no-stored-logits` is the arm.
