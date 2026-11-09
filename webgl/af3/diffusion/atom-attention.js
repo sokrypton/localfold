@@ -410,11 +410,12 @@ void main() {
 }`);
 };
 
-const atomValuesSourceUncached = (shape, twoSweep = false) => {
+const atomValuesSourceUncached = (shape, twoSweep = false, gated = false) => {
   const { subsets, queries, keys, heads, dimension } = shape;
   return sized({ TEXELS: subsets * queries * heads * dimension / 4, QUERIES: queries, KEYS: keys, HEADS: heads, D4: dimension / 4, W4: heads * dimension / 4 }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D logitTex;
 uniform sampler2D vTex;
+${gated ? "uniform sampler2D gateTex;" : ""}
 
 void main() {
   int texel = linearTexel();
@@ -447,7 +448,7 @@ ${twoSweep ? `  float rowMax = -1e30;
     rowMax = newMax;
     acc = acc * previousScale + weight * fetch4(vTex, (subset * KEYS + key) * W4 + head * D4 + group);
   }`}
-  result = acc / total;
+  result = ${gated ? "(acc / total) * fetch4(gateTex, texel)" : "acc / total"};
 }`);
 };
 
@@ -535,6 +536,14 @@ export function crossAttentionBlock(execution, call) {
   const gathered = execution.allocate(queryRows * width, "af3.atom.gathered");
   // ...one fragment a head, its channel groups as planes, where the groups fit the draw buffers
   const groups = dimension / 4;
+  // ...the gate projected first, so the values draw multiplies it in as it writes (no `af3.atom.gate` draw)
+  const gateFirst = !execution.noAtomAttendSplit && !execution.noAttendDot4 && dimension % 4 === 0
+    && !execution.noAtomGateInValues;
+  const earlyGate = gateFirst ? linear(execution, {
+    x: xq, weight: w.gatingQuery, rows: queryRows,
+    inChannels: channels, outChannels: width,
+    weightLayout: "in-major", activation: "sigmoid",
+  }) : null;
   if (!execution.noAtomAttendSplit && !execution.noAttendDot4 && dimension % 4 === 0) {
     const shape = { subsets, queries, keys, heads, dimension };
     const logits = execution.allocate(subsets * heads * queries * keys, "af3.atom.logits");
@@ -546,9 +555,9 @@ export function crossAttentionBlock(execution, call) {
       label: `af3.atom.logits:${subsets}x${queries}x${keys}x${width}${call.keyMaskedAtomAttention ? ":or" : ":and"}`,
     });
     execution.dispatch({
-      source: atomValuesSource(shape, execution.twoSweepValues),
+      source: atomValuesSource(shape, execution.twoSweepValues, earlyGate !== null),
       output: gathered,
-      inputs: { logitTex: logits, vTex: value },
+      inputs: { logitTex: logits, vTex: value, ...(earlyGate === null ? {} : { gateTex: earlyGate }) },
       label: `af3.atom.values:${subsets}x${queries}x${keys}x${width}`,
     });
     execution.release(logits);
@@ -588,20 +597,25 @@ export function crossAttentionBlock(execution, call) {
   });
   for (const tensor of [query, key, value]) execution.release(tensor);
 
-  const gate = linear(execution, {
-    x: xq, weight: w.gatingQuery, rows: queryRows,
-    inChannels: channels, outChannels: width,
-    weightLayout: "in-major", activation: "sigmoid",
-  });
-  const gatedAttention = execution.allocate(queryRows * width, "af3.atom.gated");
-  execution.dispatch({
-    source: elementwiseProductSource(queryRows * width),
-    output: gatedAttention,
-    inputs: { aTex: gathered, bTex: gate },
-    label: `af3.atom.gate:${queryRows}x${width}`,
-  });
-  execution.release(gathered);
-  execution.release(gate);
+  let gatedAttention = gathered;
+  if (earlyGate !== null) {
+    execution.release(earlyGate);
+  } else {
+    const gate = linear(execution, {
+      x: xq, weight: w.gatingQuery, rows: queryRows,
+      inChannels: channels, outChannels: width,
+      weightLayout: "in-major", activation: "sigmoid",
+    });
+    gatedAttention = execution.allocate(queryRows * width, "af3.atom.gated");
+    execution.dispatch({
+      source: elementwiseProductSource(queryRows * width),
+      output: gatedAttention,
+      inputs: { aTex: gathered, bTex: gate },
+      label: `af3.atom.gate:${queryRows}x${width}`,
+    });
+    execution.release(gathered);
+    execution.release(gate);
+  }
   const attention = adaptiveZeroInit(execution, {
     x: gatedAttention, cond: queriesCond, rows: queryRows, channels, condChannels,
     inChannels: width, weights: w, prefix: "",
