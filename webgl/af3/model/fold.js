@@ -637,13 +637,24 @@ export function* foldAf3Steps(execution, call) {
     emptyTemplateAatype: weights.dialect?.emptyTemplateAatype ?? null,
     templateGapWhereNoAtoms: weights.dialect?.templateGapWhereNoAtoms === true,
   });
-  const codes = Array.from({ length: templates },
-    (_, slot) => upload(slotCodes(slotInput(slot)), `af3.template.codes.${slot}`));
+  const hostCodes = Array.from({ length: templates }, (_, slot) => slotCodes(slotInput(slot)));
+  const codes = hostCodes.map((values, slot) => upload(values, `af3.template.codes.${slot}`));
   const geometry = Array.from({ length: templates }, (_, slot) => {
     const packed = slotGeometry(slotInput(slot));
     return packed === undefined
       ? undefined : upload(packed, `af3.template.geometry.${slot}`);
   });
+  // 🔴 EMPTY SLOTS WITH THE SAME RESTYPE CODES ARE THE SAME COMPUTATION - AF3 pads to four and a template-free fold
+  // ran the template stack four times over one answer. Each such slot is run once and weighted by how many it stands for
+  // (`templateEmbeddingSteps`'s `repeats`). `--no-template-dedupe` is the arm.
+  const repeatOf = hostCodes.map((values, slot) => {
+    if (execution.noTemplateDedupe || geometry[slot] !== undefined) return -1;
+    for (let earlier = 0; earlier < slot; earlier += 1) {
+      if (geometry[earlier] === undefined && repeatOfSame(hostCodes[earlier], values)) return earlier;
+    }
+    return -1;
+  });
+  const repeats = repeatOf.map((of, slot) => (of >= 0 ? 0 : 1 + repeatOf.filter((other) => other === slot).length));
 
   // 🔴 THE RECYCLED STATE IS ZEROS ON PASS ONE AND IT STILL CONTRIBUTES, so it
   // is a real tensor rather than an absent one: the embedder LayerNorms it and
@@ -695,7 +706,7 @@ export function* foldAf3Steps(execution, call) {
     if (weights.template !== undefined) {
       templateUpdate = yield* templateEmbeddingSteps(execution, {
         pair: embedded.pair, pairMask: batchTensors.pairMask,
-        tokens, templates, weights: weights.template, codes, geometry,
+        tokens, templates, weights: weights.template, codes, geometry, repeats, repeatOf,
         swapTransposedBias: flags.swapTransposedBias,
         divideByLength: flags.divideByLength,
       });
@@ -889,3 +900,10 @@ export function* foldAf3Steps(execution, call) {
 
 // Every builder above, memoised on its arguments (`memoSource` in webgl/runtime/execution.js).
 export const pseudoBetaSource = memoSource(pseudoBetaSourceUncached);
+
+/** Whether two host arrays hold the same values. */
+function repeatOfSame(a, b) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) if (a[i] !== b[i]) return false;
+  return true;
+}

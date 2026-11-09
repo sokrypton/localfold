@@ -254,6 +254,9 @@ export function* templateEmbeddingSteps(execution, call) {
     pair, pairMask, tokens, templates, weights: w, codes, geometry,
     swapTransposedBias = false, divideByLength = false, epsilon = 1e-5,
   } = call;
+  // `repeats[slot]`: how many slots this one's embedding stands for - 0 for a slot identical to an earlier one (empty,
+  // the same restype codes), which then is not run at all; the earlier slot's embedding is weighted by the count
+  const repeats = call.repeats ?? Array.from({ length: templates }, () => 1);
   const channels = w.channels;
   const queryChannels = w.queryChannels;
   const pairs = tokens * tokens;
@@ -281,6 +284,7 @@ export function* templateEmbeddingSteps(execution, call) {
 
   let summed;
   for (let slot = 0; slot < templates; slot += 1) {
+    if (repeats[slot] === 0) continue;
     const occupied = geometry[slot] !== undefined;
     let act = execution.allocate(pairs * channels, `af3.template.slot${slot}`);
     execution.dispatch({
@@ -310,7 +314,7 @@ export function* templateEmbeddingSteps(execution, call) {
         swapTransposedBias, divideByLength, epsilon,
       }, true);
     }
-    const embedded = layerNorm(execution, {
+    let embedded = layerNorm(execution, {
       x: act, weight: w.outputLayerNormScale, bias: w.outputLayerNormOffset,
       rows: pairs, channels, epsilon, variance: "fast",
     });
@@ -321,7 +325,17 @@ export function* templateEmbeddingSteps(execution, call) {
     // can hold ONE slot's channels to it and see the geometry on its own.
     // "Summed and projected, a wrong unit vector and a wrong distogram bin are
     // the same number."
-    call.onSlot?.(slot, Float32Array.from(execution.read(embedded)));
+    if (call.onSlot !== undefined) {
+      const values = Float32Array.from(execution.read(embedded));
+      for (let other = slot; other < templates; other += 1) {
+        if (other === slot || (repeats[other] === 0 && call.repeatOf?.[other] === slot)) call.onSlot(other, values);
+      }
+    }
+    if (repeats[slot] > 1) {
+      const weighted = scale(execution, embedded, repeats[slot]);
+      execution.release(embedded);
+      embedded = weighted;
+    }
     if (summed === undefined) {
       summed = embedded;
     } else {
