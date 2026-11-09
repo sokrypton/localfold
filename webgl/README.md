@@ -3436,3 +3436,5 @@ keys a texel (`attentionLogitsSource`, the same arithmetic in the same order), a
 (`storedLogits`) and keep only the online softmax and the value accumulation. Bit-identical; diffusion **2846 -> 2701
 ms**, fold 4325 -> 4185, every round ahead. `check-webgl-attention.js`'s 64-wide arms (two draws) pass on it.
 `--no-stored-logits` is the arm.
+And the triangle's fused 128 -> 512 projection keeps its planes for the operand draw (`linear.repack:3481x512` gone).
+Bit-identical; trunk 1307 -> 1276 ms against the previous commit, every round.

@@ -44,7 +44,7 @@
 import { ONE_TARGET, PRELUDE, targetDeclarations, sized, memoSource } from "../../runtime/execution.js";
 import { TEXTURE_WIDTH } from "../../runtime/context.js";
 import { layerNorm } from "../../kernels/layer-norm.js";
-import { linear } from "../../kernels/linear.js";
+import { linear, planeFetchGlsl, planeInputs } from "../../kernels/linear.js";
 import { multiply } from "../../runtime/elementwise.js";
 
 /** @typedef {import("../../runtime/storage.js").Tensor} Tensor */
@@ -62,15 +62,19 @@ export const TRIANGLE_WEIGHTS = [
  * written by one draw to two draw buffers - the gate's sigmoid is computed once
  * for both halves of the pair of channels.
  */
-const operandsSourceUncached = (length, channels, fused = false) => sized({ L: length, PAIRS: length * length, ELEMENTS: channels * length * length }, `${PRELUDE}
+const operandsSourceUncached = (length, channels, fused = false, blockRows = 0) => sized({ L: length, PAIRS: length * length, ELEMENTS: channels * length * length }, `${PRELUDE}
 layout(location = 0) out vec4 aOut;
 layout(location = 1) out vec4 bOut;
 const int C = ${channels};
 // fused: projection and gate are one [pairs][4C] tensor (fuseTriangleProjections), the gate after the projection
 const int ROWW = ${fused ? 4 * channels : 2 * channels};
 const int GATE_AT = ${fused ? 2 * channels : 0};
-uniform sampler2D projectionTex;
+${blockRows > 0 ? `${planeFetchGlsl(blockRows, channels)}
+float projectionAt(int element) { int row = element / ROWW; int col = element - row * ROWW; return planeFetch(row, col / 4)[col % 4]; }
+float gateAt(int element) { return projectionAt(element); }` : `uniform sampler2D projectionTex;
 uniform sampler2D gateTex;
+float projectionAt(int element) { return fetch1(projectionTex, element); }
+float gateAt(int element) { return fetch1(gateTex, element); }`}
 uniform sampler2D maskTex;
 
 void main() {
@@ -96,10 +100,10 @@ void main() {
     // The INTERLEAVED split: channel c's two halves are outputs 2c and 2c + 1.
     int wide = index * ROWW + c * 2;
     float m = fetch1(maskTex, index);
-    float gateA = fetch1(gateTex, wide + GATE_AT);
-    float gateB = fetch1(gateTex, wide + GATE_AT + 1);
-    float left = fetch1(projectionTex, wide) * m / (1.0 + exp(-gateA));
-    float right = fetch1(projectionTex, wide + 1) * m / (1.0 + exp(-gateB));
+    float gateA = gateAt(wide + GATE_AT);
+    float gateB = gateAt(wide + GATE_AT + 1);
+    float left = projectionAt(wide) * m / (1.0 + exp(-gateA));
+    float right = projectionAt(wide + 1) * m / (1.0 + exp(-gateB));
     if (lane == 0) { a.x = left; b.x = right; }
     else if (lane == 1) { a.y = left; b.y = right; }
     else if (lane == 2) { a.z = left; b.z = right; }
@@ -118,15 +122,19 @@ void main() {
  * direction drew `pad-planes` twice and the incoming `transpose-a` and `transpose-b`, over a pair-sized tensor each.
  * `--no-triangle-fused-layout` is the arm that keeps them.
  */
-const operandsLaidOutSourceUncached = (length, channels, paddedLength, transposed, fused = false) => sized({ L: length, LP: paddedLength, PLANE: paddedLength * paddedLength, ELEMENTS: channels * paddedLength * paddedLength }, `${PRELUDE}
+const operandsLaidOutSourceUncached = (length, channels, paddedLength, transposed, fused = false, blockRows = 0) => sized({ L: length, LP: paddedLength, PLANE: paddedLength * paddedLength, ELEMENTS: channels * paddedLength * paddedLength }, `${PRELUDE}
 layout(location = 0) out vec4 aOut;
 layout(location = 1) out vec4 bOut;
 const int C = ${channels};
 // fused: projection and gate are one [pairs][4C] tensor (fuseTriangleProjections), the gate after the projection
 const int ROWW = ${fused ? 4 * channels : 2 * channels};
 const int GATE_AT = ${fused ? 2 * channels : 0};
-uniform sampler2D projectionTex;
+${blockRows > 0 ? `${planeFetchGlsl(blockRows, channels)}
+float projectionAt(int element) { int row = element / ROWW; int col = element - row * ROWW; return planeFetch(row, col / 4)[col % 4]; }
+float gateAt(int element) { return projectionAt(element); }` : `uniform sampler2D projectionTex;
 uniform sampler2D gateTex;
+float projectionAt(int element) { return fetch1(projectionTex, element); }
+float gateAt(int element) { return fetch1(gateTex, element); }`}
 uniform sampler2D maskTex;
 
 void main() {
@@ -147,10 +155,10 @@ void main() {
       int index = ${transposed ? "j * L + i" : "i * L + j"};
       int wide = index * ROWW + c * 2;
       float m = fetch1(maskTex, index);
-      float gateA = fetch1(gateTex, wide + GATE_AT);
-      float gateB = fetch1(gateTex, wide + GATE_AT + 1);
-      float left = fetch1(projectionTex, wide) * m / (1.0 + exp(-gateA));
-      float right = fetch1(projectionTex, wide + 1) * m / (1.0 + exp(-gateB));
+      float gateA = gateAt(wide + GATE_AT);
+      float gateB = gateAt(wide + GATE_AT + 1);
+      float left = projectionAt(wide) * m / (1.0 + exp(-gateA));
+      float right = projectionAt(wide + 1) * m / (1.0 + exp(-gateB));
       if (lane == 0) { a.x = left; b.x = right; }
       else if (lane == 1) { a.y = left; b.y = right; }
       else if (lane == 2) { a.z = left; b.z = right; }
@@ -900,7 +908,10 @@ export function triangleMultiplication(execution, call) {
   const projection = linear(execution, {
     x: normalised, weight: fusedProjection ? w.projectionGate : w.projection, rows: pairs,
     inChannels: channels, outChannels: channels * (fusedProjection ? 4 : 2), weightLayout: "in-major",
+    keepPlanes: fusedProjection,
   });
+  // ...the fused projection's row planes, where it kept them: the operand draw reads them with no repack between
+  const kept = /** @type {any} */ (projection).planes !== undefined ? /** @type {any} */ (projection) : null;
   const gate = fusedProjection ? projection : linear(execution, {
     x: normalised, weight: w.gate, rows: pairs,
     inChannels: channels, outChannels: channels * 2, weightLayout: "in-major",
@@ -916,13 +927,16 @@ export function triangleMultiplication(execution, call) {
   const a = execution.allocate(planeElements, "af3.triangle.a");
   const b = execution.allocate(planeElements, "af3.triangle.b");
   execution.dispatch({
-    source: laidOut ? operandsLaidOutSource(length, channels, layoutPadded, layoutTransposed, fusedProjection)
-      : operandsSource(length, channels, fusedProjection),
+    source: laidOut
+      ? operandsLaidOutSource(length, channels, layoutPadded, layoutTransposed, fusedProjection, kept?.blockRows ?? 0)
+      : operandsSource(length, channels, fusedProjection, kept?.blockRows ?? 0),
     outputs: [a, b],
-    inputs: { projectionTex: projection, gateTex: gate, maskTex: mask },
+    inputs: kept === null ? { projectionTex: projection, gateTex: gate, maskTex: mask }
+      : { ...planeInputs(kept), maskTex: mask },
     label: `af3.triangle.operands${laidOut ? (layoutTransposed ? ":transposed" : ":padded") : ""}:${length}x${channels}`,
   });
-  execution.release(projection);
+  if (kept !== null) for (const plane of kept.planes) execution.release(plane);
+  else execution.release(projection);
   if (!fusedProjection) execution.release(gate);
 
   const centred = execution.allocate(pairs * channels, "af3.triangle.centred");
