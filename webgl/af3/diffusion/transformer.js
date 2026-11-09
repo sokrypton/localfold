@@ -100,12 +100,14 @@ void main() {
  * and which is free here: the denoiser's rows are its TOKENS, 59 at 59 residues, and a draw costs ~47 us before it
  * computes anything (`probe-webgl-draw-floor.js`). Three draws (statistics, apply, blend) become one, twice a block.
  */
-const blendSliceSourceUncached = (rows, channels, stride) => sized({ ROWS: rows }, `${PRELUDE}${ONE_TARGET}
+const blendSliceSourceUncached = (rows, channels, stride, parts = 0) => sized({ ROWS: rows }, `${PRELUDE}${ONE_TARGET}
 const int CHANNELS = ${channels};
 const int C4 = ${channels / 4};
 const int STRIDE4 = ${stride / 4};
+const int PARTS = ${Math.max(parts, 1)};
 uniform sampler2D xTex;
 uniform sampler2D condTex;
+${parts > 0 ? "uniform sampler2D sumTex;\nuniform sampler2D squareTex;" : ""}
 uniform int scaleAt4;
 uniform int shiftAt4;
 uniform float epsilon;
@@ -116,7 +118,13 @@ void main() {
   int row = texel / C4;
   int c4 = texel % C4;
   int base = row * C4;
-  float total = 0.0;
+${parts > 0 ? `  float total = 0.0;
+  float spread = 0.0;
+  for (int p = 0; p < PARTS; ++p) {
+    total += fetch1(sumTex, row * PARTS + p);
+    spread += fetch1(squareTex, row * PARTS + p);
+  }
+  float mean = total / float(CHANNELS);` : `  float total = 0.0;
   for (int i = 0; i < C4; ++i) {
     vec4 v = fetch4(xTex, base + i);
     total += v.x + v.y + v.z + v.w;
@@ -126,12 +134,53 @@ void main() {
   for (int i = 0; i < C4; ++i) {
     vec4 centred = fetch4(xTex, base + i) - mean;
     spread += dot(centred, centred);
-  }
+  }`}
   float inverseStd = inversesqrt(spread / float(CHANNELS) + epsilon);
   vec4 normalised = (fetch4(xTex, texel) - mean) * inverseStd;
   vec4 scale = fetch4(condTex, row * STRIDE4 + scaleAt4 + c4);
   result = (vec4(1.0) / (vec4(1.0) + exp(-scale))) * normalised
     + fetch4(condTex, row * STRIDE4 + shiftAt4 + c4);
+}`);
+
+/**
+ * A row's statistics in parts, for `blendSliceSource`'s `parted` form: `PARTS` fragments a row, each summing its slice
+ * of `C4 / PARTS` texels - `centred` 0 the plain sum, 1 the sum of squares about the row mean (from the plain parts). The
+ * same two-pass formula as the one-fragment loop, summed in `PARTS` groups rather than in one sequence, so every blend
+ * fragment reads `2 x PARTS` floats where it walked its whole row twice.
+ */
+const rowPartsSourceUncached = (rows, channels, parts, centred) => sized({ ROWS: rows }, `${PRELUDE}${ONE_TARGET}
+const int CHANNELS = ${channels};
+const int C4 = ${channels / 4};
+const int PARTS = ${parts};
+const int SLICE = ${channels / 4 / parts};
+uniform sampler2D xTex;
+${centred ? "uniform sampler2D sumTex;" : ""}
+
+void main() {
+  int texel = linearTexel();
+  if (texel * 4 >= ROWS * PARTS) { result = vec4(0.0); return; }
+  vec4 out4 = vec4(0.0);
+  for (int lane = 0; lane < 4; ++lane) {
+    int element = texel * 4 + lane;
+    if (element >= ROWS * PARTS) break;
+    int row = element / PARTS;
+    int part = element - row * PARTS;
+${centred ? `    float total = 0.0;
+    for (int p = 0; p < PARTS; ++p) total += fetch1(sumTex, row * PARTS + p);
+    float mean = total / float(CHANNELS);` : ""}
+    float acc = 0.0;
+    int base = row * C4 + part * SLICE;
+    for (int i = 0; i < SLICE; ++i) {
+      vec4 v = fetch4(xTex, base + i);
+${centred ? `      vec4 c = v - mean;
+      acc += dot(c, c);` : "      acc += v.x + v.y + v.z + v.w;"}
+    }
+    if (lane == 0) out4.x = acc;
+    else if (lane == 1) out4.y = acc;
+    else if (lane == 2) out4.z = acc;
+    else out4.w = acc;
+  }
+  result = out4;
 }`);
 
 /**
@@ -246,14 +295,34 @@ export const COND_BATCH_KEYS = ADALN_PREFIXES.flatMap((p) => [
 function blendFromBatch(execution, { x, rows, channels, epsilon, batch, which }) {
   const out = execution.allocate(rows * channels, "af3.adaln.batched");
   const scaleAt = (batch.index * 4 + which * 2) * channels;
+  // ...the row statistics in parts first (`rowPartsSource`), where the row divides into them
+  const parts = !execution.noAdalnParts && (channels / 4) % ADALN_PARTS === 0 ? ADALN_PARTS : 0;
+  let sums;
+  let squares;
+  if (parts > 0) {
+    sums = execution.allocate(rows * parts, "af3.adaln.sums");
+    execution.dispatch({
+      source: rowPartsSource(rows, channels, parts, false), output: sums, inputs: { xTex: x },
+      label: `af3.adaln.row-sums:${rows}x${channels}`,
+    });
+    squares = execution.allocate(rows * parts, "af3.adaln.squares");
+    execution.dispatch({
+      source: rowPartsSource(rows, channels, parts, true), output: squares, inputs: { xTex: x, sumTex: sums },
+      label: `af3.adaln.row-squares:${rows}x${channels}`,
+    });
+  }
   execution.dispatch({
-    source: blendSliceSource(rows, channels, batch.scaleShiftWidth),
+    source: blendSliceSource(rows, channels, batch.scaleShiftWidth, parts),
     output: out,
-    inputs: { xTex: x, condTex: batch.scaleShift },
+    inputs: { xTex: x, condTex: batch.scaleShift, ...(parts > 0 ? { sumTex: sums, squareTex: squares } : {}) },
     ints: { scaleAt4: scaleAt / 4, shiftAt4: (scaleAt + channels) / 4 },
     floats: { epsilon },
     label: `af3.adaln.fused:${rows}x${channels}`,
   });
+  if (parts > 0) {
+    execution.release(sums);
+    execution.release(squares);
+  }
   return out;
 }
 
@@ -656,6 +725,9 @@ export const swiGluSource = memoSource(swiGluSourceUncached);
 export const blendSliceSource = memoSource(blendSliceSourceUncached);
 export const gateSliceSource = memoSource(gateSliceSourceUncached);
 export const splitQkvgSource = memoSource(splitQkvgSourceUncached);
+export const rowPartsSource = memoSource(rowPartsSourceUncached);
+/** Fragments a row for the AdaLN's statistics: 768 channels are 192 texels, 12 a part. */
+const ADALN_PARTS = 16;
 export const splitQkvgPlanesSource = memoSource(splitQkvgPlanesSourceUncached);
 export const swiGluPlanesSource = memoSource(swiGluPlanesSourceUncached);
 export const superBlockLogitsSource = memoSource(superBlockLogitsSourceUncached);
