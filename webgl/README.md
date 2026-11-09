@@ -3561,3 +3561,6 @@ Kept: AdaLN-zero's gate in the projection's own last draw. Each denoiser sub-blo
 (`residual + projected * gate`, the gate a row's slice of the step's batched gates); `linear`'s `gateSlice` puts that
 in the one-texel kernel's epilogue (the 768 -> 768 output projection) or the blocked path's repack (the 1536 -> 768
 down projection). Bit-identical; diffusion 2377 -> 2351 ms. `--no-linear-gate-slice` is the arm.
+And the atom attention's gate: projected before the attention, so `atomValuesSource` multiplies it in as it writes, as
+the flash kernel does - the `af3.atom.gate` draw goes. Bit-identical; fold 3747 -> 3737 ms, every round.
+`--no-atom-gate-in-values` is the arm.
