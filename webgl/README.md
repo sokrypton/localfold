@@ -3600,3 +3600,5 @@ And `blockRowsFor`'s 4-row blocks below 128 rows, in Safari: `--block-rows=8` (w
 by a wider margin than in Chrome.
 And `AF3_HALF_WEIGHT_FLOOR` (4096) in Safari: `--half-floor=65536` fold 3844 / 3832 ms against 3709 / 3770, trunk
 ~1500 against ~1430; `--half-floor=1024` 3779 / 3710, level. 4096 holds.
+And `AF3_POOL_LIMIT_BYTES` (128 MiB) in Safari: `--pool-mib=64` fold 3927 / 3791 ms against 3697 / 3719, peak 884 MiB
+against 939; `--pool-mib=256` 3760 / 3692, level, at a 1013 MiB peak. 128 holds.
