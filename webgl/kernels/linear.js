@@ -36,7 +36,7 @@ import { TEXTURE_WIDTH } from "../runtime/context.js";
 import {
   INT5_DECODE, INT5_DECODE8, INT5_GROUP, int5DecodeSource,
 } from "../runtime/int5.js";
-import { padStride, strideDividesWidth } from "../runtime/pad-stride.js";
+import { padStride, strideDividesWidth, strideFor } from "../runtime/pad-stride.js";
 import { add } from "../runtime/elementwise.js";
 /** @typedef {import("../runtime/storage.js").Tensor} Tensor */
 /** @typedef {import("../runtime/storage.js").Int5Weight} Int5Weight */
@@ -680,11 +680,34 @@ function decodedInt5(execution, weight, shape) {
  * @param {Tensor} [into]
  * @returns {Tensor}
  */
+/**
+ * The row stride (in texels) at which `linear` would pad x for this projection, or 0 where it would not - so a
+ * producer can write x laid out that way itself (float16 where `execution.halfActivations` is set) and hand it over
+ * as `xStride4`, saving the pad pass.
+ */
+export function linearPaddedStride4(execution, { rows, inChannels, outChannels, weightLayout = "out-major" }) {
+  if (execution.noLinearBlock || inChannels % 4 !== 0
+    || !blockedApplies(rows, inChannels, outChannels, weightLayout, !execution.noLinearAspect)) return 0;
+  const padX = !execution.noStridePad && !strideDividesWidth(inChannels / 4);
+  const narrowX = execution.halfActivations && execution.narrowAlignedX && !padX;
+  return padX || narrowX ? strideFor(inChannels / 4) : 0;
+}
+
 export function linear(execution, call, into) {
   const {
     x, weight, bias, rows, inChannels, outChannels,
     activation = "none", weightLayout = "out-major", roundHalf = false, keepPlanes = false, residual, multiplier,
+    xStride4: givenStride4 = 0,
   } = call;
+  // `xStride4`: x arrives ALREADY laid at that row stride (`linearPaddedStride4`), so the pad pass is skipped
+  if (givenStride4 > 0) {
+    if (givenStride4 !== linearPaddedStride4(execution, { rows, inChannels, outChannels, weightLayout })) {
+      throw new RangeError(`linear: x laid at stride ${givenStride4 * 4}, which this projection would not pad to`);
+    }
+    if (call.x.elements !== rows * givenStride4 * 4) {
+      throw new RangeError(`linear: a padded x holds ${call.x.elements} floats, not ${rows} x ${givenStride4 * 4}`);
+    }
+  }
   // `multiplier`: with `residual`, return `residual + (x W) * multiplier` - in the one-texel kernel's epilogue, or a
   // draw after the blocked path's repack
   if (multiplier !== undefined && (residual === undefined || multiplier.elements !== rows * outChannels)) {
@@ -706,7 +729,7 @@ export function linear(execution, call, into) {
   // Neither width has to be a multiple of four: AF2's 50 pLDDT bins made the
   // OUTPUT ragged and AF3's 267-channel diffusion conditioning the INPUT. Both
   // at once is refused inside `linearSource`, because no model here needs it.
-  if (x.elements !== rows * inChannels) {
+  if (givenStride4 === 0 && x.elements !== rows * inChannels) {
     throw new RangeError(`linear: x holds ${x.elements} floats, not ${rows} x ${inChannels}`);
   }
   if (weight.elements !== outChannels * inChannels) {
@@ -822,9 +845,10 @@ export function linear(execution, call, into) {
     // row, 2048 divides it, so it ran at 129 GFLOP/s on an f32 x it re-reads
     // once per output group - 64 times 18.9 MiB. One pass over x against that.
     const narrowX = execution.halfActivations && execution.narrowAlignedX && !padX;
-    const padded = (padX || narrowX)
-      ? padStride(execution, { x, rows, inChannels, label: "linear.x-stride" })
-      : null;
+    const padded = givenStride4 > 0 ? { tensor: x, stride4: givenStride4, given: true }
+      : (padX || narrowX)
+        ? padStride(execution, { x, rows, inChannels, label: "linear.x-stride" })
+        : null;
     const xUse = padded?.tensor ?? x;
     const xStride4 = padded?.stride4 ?? 0;
     const planeFloats = tileWidth > 0
@@ -863,7 +887,7 @@ export function linear(execution, call, into) {
     // `keepPlanes`: hand the row planes to a consumer that reads them itself (`planeFetchGlsl`) rather than repacking
     // them into one tensor - only in the plain plane order, the one `planeFetchGlsl` addresses
     if (keepPlanes && tileWidth === 0 && !rowFastest && !execution.noKeepPlanes) {
-      if (padded !== null) execution.release(padded.tensor);
+      if (padded !== null && padded.given !== true) execution.release(padded.tensor);
       if (into === undefined) execution.release(output);
       return /** @type {any} */ ({ planes, blockRows, rows, outChannels });
     }
@@ -879,7 +903,7 @@ export function linear(execution, call, into) {
       label: `linear.repack:${rows}x${outChannels}`,
     });
     for (const plane of planes) execution.release(plane);
-    if (padded !== null) execution.release(padded.tensor);
+    if (padded !== null && padded.given !== true) execution.release(padded.tensor);
     if (residual !== undefined && !addResidual) {
       const summed = multiplier === undefined ? add(execution, residual, output)
         : residualProduct(execution, residual, output, multiplier);

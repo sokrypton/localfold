@@ -3550,3 +3550,9 @@ reads, straight into the texture's padded size. Safari 16.3's upload **1623 -> 1
 `tools/run-in-safari.py`), pLDDT unchanged; Chrome, which converts natively, unchanged (3786 -> 3782 ms).
 test/float16-if-fits.test.js holds it to the check-then-convert on both paths (run it with `Float16Array` deleted for
 the scalar one). `--no-fused-half-check` is the arm.
+
+Kept, on a second measurement: the batched AdaLN writing the next projection's padded float16 x itself
+(`linearPaddedStride4` / `linear`'s `xStride4`), which was declined above because every AdaLN fragment walked its row
+twice. With the row statistics in parts the blend fragment reads 32 floats, so the 256 zero texels a row cost nothing
+and the 1,225 `pad-stride` draws go: bit-identical, diffusion 2396 -> 2382 ms. A decline is a measurement of the code
+as it was; this one's reason was removed by a later change. `--no-prepadded-x` is the arm.
