@@ -3825,3 +3825,14 @@ recycles the two agree (73.66 / 73.69).
 The MSA transition's windows now start only where `gated` cannot be allocated, so a pair transition past 362 tokens
 folds whole as before; `check-webgl-af3-transition.js` holds four ragged windows to the whole path (4-7e-8, red at 1.1
 with two windows swapped).
+
+**The second pass, at seed 1 (the page's default, which draws protenix2's dropout).** Seven families x a plain chain,
+SEP@3 and protein + 12-nt RNA (`--modify=`, `--chain-kinds=protein,rna`), then an 80-residue slice of 5CAJ with and
+without its own crystal as a template (`--template=`, through the page's `buildTemplate`): trunk pair 8e-4 to 1e-2 in
+all 35 arms, superposed CA 0.005-0.16 A in 33, pLDDT within 0.5 but for Mol-1 (its recycle sensitivity, above). Every
+template moves its fold the same way on both backends - rf3 66.5 -> 80.2, IntelliFold-2 44.9 -> 88.0. The outlier is
+Boltz-2 templated at seed 1, 6.6 A apart with the head exact on WebGPU's coordinates (66.699 / 66.697): seeds 2, 3, 4, 5
+and 42 agree to 0.008-0.14 A, so it is one seed at a bifurcation, WebGL2 at 76.5 where the other seeds land and WebGPU
+in a 66.7 basin. Not run: a 255- or 400-token fold through BOTH backends in one page - two models' weights and two
+folds in one browser took this 16 GB M2 down twice (IntelliFold-2 + RNA at 109 tokens already reaches 30% free). The
+pair transition past 362 tokens is back on the path measured whole above.
