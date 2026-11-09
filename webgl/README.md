@@ -3556,3 +3556,8 @@ Kept, on a second measurement: the batched AdaLN writing the next projection's p
 twice. With the row statistics in parts the blend fragment reads 32 floats, so the 256 zero texels a row cost nothing
 and the 1,225 `pad-stride` draws go: bit-identical, diffusion 2396 -> 2382 ms. A decline is a measurement of the code
 as it was; this one's reason was removed by a later change. `--no-prepadded-x` is the arm.
+
+Kept: AdaLN-zero's gate in the projection's own last draw. Each denoiser sub-block ended `linear` -> `adaln.zero-slice`
+(`residual + projected * gate`, the gate a row's slice of the step's batched gates); `linear`'s `gateSlice` puts that
+in the one-texel kernel's epilogue (the 768 -> 768 output projection) or the blocked path's repack (the 1536 -> 768
+down projection). Bit-identical; diffusion 2377 -> 2351 ms. `--no-linear-gate-slice` is the arm.
