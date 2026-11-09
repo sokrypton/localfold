@@ -58,7 +58,7 @@ export function attentionFlashPlan(headDim, maxDrawBuffers) {
 }
 
 const attentionFlashSourceUncached = (
-  { batch, queries, heads, headDim, targets, hasPairBias, roundHalf = false },
+  { batch, queries, heads, headDim, targets, hasPairBias, roundHalf = false, storedLogits = false },
 ) => {
   const groups = headDim / 4;
   const register = (name, body) => Array.from({ length: groups },
@@ -72,15 +72,12 @@ const attentionFlashSourceUncached = (
 ${targetDeclarations(targets)}
 const int HEADS = ${heads};
 const int HD4 = ${groups};
-uniform sampler2D queryTex;
-uniform sampler2D keyTex;
+${storedLogits ? "" : "uniform sampler2D queryTex;\nuniform sampler2D keyTex;\nuniform sampler2D maskTex;"}
 uniform sampler2D valueTex;
 uniform sampler2D gateTex;
-uniform sampler2D maskTex;
-${hasPairBias ? "uniform sampler2D pairTex;" : ""}
-uniform int transposeMask;
+${hasPairBias && !storedLogits ? "uniform sampler2D pairTex;" : ""}
+${storedLogits ? "uniform sampler2D logitTex;" : "uniform int transposeMask;\nuniform float scale;"}
 uniform int groupBase;
-uniform float scale;
 
 void main() {
   // One fragment per (batch, query, head) - which is exactly one texel of an
@@ -96,7 +93,7 @@ ${perTarget((t) => `result${t} = vec4(0.0);`)}
   int b = bq / Q;
   int queryBase = bqh * HD4;
 
-${register("q", (g) => `fetch4(queryTex, queryBase + ${g})`)}
+${storedLogits ? "" : register("q", (g) => `fetch4(queryTex, queryBase + ${g})`)}
 ${perTarget((t) => `vec4 acc${t} = vec4(0.0);`)}
 
   float runningMax = -1e30;
@@ -104,14 +101,14 @@ ${perTarget((t) => `vec4 acc${t} = vec4(0.0);`)}
 
   for (int k = 0; k < Q; ++k) {
     int keyBase = ((b * Q + k) * HEADS + head) * HD4;
-    float score = 0.0;
+${storedLogits ? "    float logit = fetch1(logitTex, bqh * Q + k);" : `    float score = 0.0;
 ${dot}
     score *= scale;
 
     int maskIndex = transposeMask == 0 ? b * Q + k : k * BATCH + b;
     float logit = score + 1e9 * (fetch1(maskTex, maskIndex) - 1.0);
 ${hasPairBias ? "    logit += fetch1(pairTex, (head * Q + q) * Q + k);" : ""}
-    logit = clamp(logit, -1e8, 1e8);
+    logit = clamp(logit, -1e8, 1e8);`}
 
     // ...the online softmax, kept in registers. The WGSL kernel spends a
     // 32-lane tree reduction and three barriers per key to publish this state;
@@ -131,6 +128,58 @@ ${perTarget((t) => {
     // half4 in webgl/runtime/execution.js.
     return `result${t} = ${roundHalf ? `half4(${value})` : value};`;
   })}
+}`);
+};
+
+/**
+ * Every logit the flash kernel's online softmax reads - `[batch][query][head][key]`, four keys a texel - computed ONCE,
+ * in the same arithmetic in the same order (dot by group, the scale, the mask, the pair bias, the clamp), so that a head
+ * too wide for one draw (`attentionFlashPlan`'s `draws > 1`) does not recompute them in every draw: its draws then read
+ * the logit (`storedLogits`) and keep only the value accumulation, which is what each one is for.
+ */
+const attentionLogitsSourceUncached = ({ batch, queries, heads, headDim, hasPairBias }) => {
+  const groups = headDim / 4;
+  const dot = Array.from({ length: groups },
+    (_, g) => `      score += dot(fetch4(queryTex, queryBase + ${g}), fetch4(keyTex, keyBase + ${g}));`).join("\n");
+  return sized({ BATCH: batch, Q: queries, ELEMENTS: batch * queries * heads * queries }, `${PRELUDE}
+out vec4 result;
+const int HEADS = ${heads};
+const int HD4 = ${groups};
+uniform sampler2D queryTex;
+uniform sampler2D keyTex;
+uniform sampler2D maskTex;
+${hasPairBias ? "uniform sampler2D pairTex;" : ""}
+uniform int transposeMask;
+uniform float scale;
+
+void main() {
+  int texel = linearTexel();
+  if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
+  vec4 out4 = vec4(0.0);
+  for (int lane = 0; lane < 4; ++lane) {
+    int element = texel * 4 + lane;
+    if (element >= ELEMENTS) break;
+    int bqh = element / Q;
+    int k = element - bqh * Q;
+    int head = bqh % HEADS;
+    int bq = bqh / HEADS;
+    int q = bq % Q;
+    int b = bq / Q;
+    int queryBase = bqh * HD4;
+    int keyBase = ((b * Q + k) * HEADS + head) * HD4;
+    float score = 0.0;
+${dot}
+    score *= scale;
+    int maskIndex = transposeMask == 0 ? b * Q + k : k * BATCH + b;
+    float logit = score + 1e9 * (fetch1(maskTex, maskIndex) - 1.0);
+${hasPairBias ? "    logit += fetch1(pairTex, (head * Q + q) * Q + k);" : ""}
+    logit = clamp(logit, -1e8, 1e8);
+    if (lane == 0) out4.x = logit;
+    else if (lane == 1) out4.y = logit;
+    else if (lane == 2) out4.z = logit;
+    else out4.w = logit;
+  }
+  result = out4;
 }`);
 };
 
@@ -205,20 +254,39 @@ export function attentionFlashPlanes(execution, call) {
   const inputs = { queryTex: query, keyTex: key, valueTex: value, gateTex: gate, maskTex: mask };
   if (pairBias !== undefined) inputs.pairTex = pairBias;
 
+  // ...a head that takes more than one draw has its logits computed once, before them (`attentionLogitsSource`)
+  const storedLogits = plan.draws > 1 && !execution.noStoredLogits;
+  let logits;
+  if (storedLogits) {
+    logits = execution.allocate(batch * queries * heads * queries, "attention.logits");
+    execution.dispatch({
+      source: attentionLogitsSource({ batch, queries, heads, headDim, hasPairBias: pairBias !== undefined }),
+      output: logits,
+      inputs: {
+        queryTex: query, keyTex: key, maskTex: mask, ...(pairBias === undefined ? {} : { pairTex: pairBias }),
+      },
+      ints: { transposeMask: transpose ? 1 : 0 },
+      floats: { scale },
+      label: `attention.logits:${batch}x${queries}x${heads}x${headDim}`,
+    });
+  }
+  // ...and then the value draws bind only what they still read
+  const drawInputs = storedLogits ? { valueTex: value, gateTex: gate, logitTex: logits } : inputs;
   for (let base = 0; base < plan.groups; base += plan.targets) {
     const span = Math.min(plan.targets, plan.groups - base);
     execution.dispatch({
       source: attentionFlashSource({
         batch, queries, heads, headDim, targets: span,
-        hasPairBias: pairBias !== undefined, roundHalf,
+        hasPairBias: pairBias !== undefined, roundHalf, storedLogits,
       }),
       outputs: planes.slice(base, base + span),
-      inputs,
-      ints: { transposeMask: transpose ? 1 : 0, groupBase: base },
-      floats: { scale },
+      inputs: drawInputs,
+      ints: storedLogits ? { groupBase: base } : { transposeMask: transpose ? 1 : 0, groupBase: base },
+      floats: storedLogits ? {} : { scale },
       label: `attention.flash:${batch}x${queries}x${heads}x${headDim}`,
     });
   }
+  if (logits !== undefined) execution.release(logits);
   return { planes, plan };
 }
 
@@ -248,4 +316,5 @@ export function attentionFlash(execution, call, into) {
 
 // Every builder above, memoised on its arguments (`memoSource` in webgl/runtime/execution.js).
 export const attentionFlashSource = memoSource(attentionFlashSourceUncached);
+export const attentionLogitsSource = memoSource(attentionLogitsSourceUncached);
 export const interleavePlanesSource = memoSource(interleavePlanesSourceUncached);
