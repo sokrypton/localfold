@@ -3485,3 +3485,7 @@ Measured and NOT kept: the grid attention's output projection (and its residual,
 planes directly - interleave, projection and add as one draw. Bit-identical and SLOWER, trunk 1212 -> 1279 ms: inside
 the projection's k loop, eight plane textures read per head lose the locality of one contiguous row, which costs more
 than the 3481 x 128 interleave pass it removes. The denoiser's version (above) was neutral for the same reason.
+And then split like the denoiser's: `atomLogitsSource` (every logit once, four keys a texel) and `atomValuesSource`
+(one fragment per output texel, 15,360 where the plane kernel ran 1,920 each walking 128 keys). Diffusion 2488 ->
+2455 ms, every round; the softmax in two sweeps, relRms against WebGPU 8.3e-4 -> 9.9e-4. `--no-atom-attend-split`
+falls back to the plane kernel, `--no-atom-attend-planes` with it to the original.
