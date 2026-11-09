@@ -1022,18 +1022,30 @@ export function triangleMultiplication(execution, call) {
   execution.release(a);
   execution.release(b);
 
-  const projected = linear(execution, {
-    x: centred, weight: w.outputProjection, rows: pairs,
-    inChannels: channels, outChannels: channels, weightLayout: "in-major",
-  });
-  execution.release(centred);
   const outputGate = linear(execution, {
     x: normalised, weight: w.gatingLinear, rows: pairs,
     inChannels: channels, outChannels: channels, weightLayout: "in-major",
     activation: "sigmoid",
   });
   execution.release(normalised);
-  // `residualOf`: return `residualOf + projected * gate` from one draw where it was a multiply and the caller's add
+  // `residualOf`: `residualOf + projected * gate` in the output projection's own epilogue (`linear`'s `multiplier`),
+  // where it was the projection, a multiply and the caller's add
+  if (residualOf !== undefined && !execution.noLinearEpilogue) {
+    const out = linear(execution, {
+      x: centred, weight: w.outputProjection, rows: pairs,
+      inChannels: channels, outChannels: channels, weightLayout: "in-major",
+      residual: residualOf, multiplier: outputGate,
+    });
+    execution.release(centred);
+    execution.release(outputGate);
+    out.label = "af3.triangle";
+    return out;
+  }
+  const projected = linear(execution, {
+    x: centred, weight: w.outputProjection, rows: pairs,
+    inChannels: channels, outChannels: channels, weightLayout: "in-major",
+  });
+  execution.release(centred);
   let out;
   if (residualOf !== undefined) {
     out = execution.allocate(pairs * channels, "af3.triangle.residual");

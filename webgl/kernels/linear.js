@@ -31,7 +31,7 @@
  * before optimizing performance" - and the geometry is the first thing to
  * revisit once a block folds.
  */
-import { ONE_TARGET, PRELUDE, targetDeclarations, memoSource } from "../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, targetDeclarations, sized, memoSource } from "../runtime/execution.js";
 import { TEXTURE_WIDTH } from "../runtime/context.js";
 import {
   INT5_DECODE, INT5_DECODE8, INT5_GROUP, int5DecodeSource,
@@ -108,7 +108,7 @@ export const shapeInts = (rows, inChannels, outChannels) => ({
 });
 
 const linearSourceUncached = (
-  rows, inChannels, outChannels, activation, useBias, weightLayout, roundHalf = false,
+  rows, inChannels, outChannels, activation, useBias, weightLayout, roundHalf = false, epilogue = 0,
 ) => {
   // `[out][in]`: four weight rows, each IN long and each starting on a texel
   // boundary because IN is a multiple of four, against one shared input texel.
@@ -192,6 +192,8 @@ uniform sampler2D xTex;
 uniform sampler2D weightTex;
 uniform sampler2D biasTex;
 uniform int HAS_BIAS;
+${epilogue > 0 ? "uniform sampler2D baseTex;" : ""}
+${epilogue > 1 ? "uniform sampler2D mulTex;" : ""}
 
 void main() {
 ${ragged ? `  int base = linearTexel() * 4;
@@ -209,7 +211,10 @@ ${raggedInput
     ? (weightLayout === "in-major" ? inMajorRagged : outMajorRagged)
     : (weightLayout === "in-major" ? inMajor : outMajor)}
   vec4 value = HAS_BIAS == 1 ? sum + fetch4(biasTex, group) : sum;`}
-  result = ${roundHalf ? ROUND_HALF("activate(value)") : "activate(value)"};
+  // the epilogue: 1 is base + value, 2 is base + value * multiplier (a residual, and a gate)
+  result = ${epilogue === 0 ? (roundHalf ? ROUND_HALF("activate(value)") : "activate(value)")
+    : epilogue === 1 ? "fetch4(baseTex, texel) + activate(value)"
+      : "fetch4(baseTex, texel) + activate(value) * fetch4(mulTex, texel)"};
 }`;
 };
 
@@ -678,8 +683,13 @@ function decodedInt5(execution, weight, shape) {
 export function linear(execution, call, into) {
   const {
     x, weight, bias, rows, inChannels, outChannels,
-    activation = "none", weightLayout = "out-major", roundHalf = false, keepPlanes = false, residual,
+    activation = "none", weightLayout = "out-major", roundHalf = false, keepPlanes = false, residual, multiplier,
   } = call;
+  // `multiplier`: with `residual`, return `residual + (x W) * multiplier` - in the one-texel kernel's epilogue, or a
+  // draw after the blocked path's repack
+  if (multiplier !== undefined && (residual === undefined || multiplier.elements !== rows * outChannels)) {
+    throw new RangeError("linear: a multiplier needs a residual and the full output's size");
+  }
   // `residual`: return `residual + x W` - added in the blocked path's repack draw, which already writes every
   // output texel, so the caller's add pass goes; the unblocked path adds after
   if (residual !== undefined && (keepPlanes || residual.elements !== rows * outChannels)) {
@@ -857,7 +867,7 @@ export function linear(execution, call, into) {
       if (into === undefined) execution.release(output);
       return /** @type {any} */ ({ planes, blockRows, rows, outChannels });
     }
-    const addResidual = residual !== undefined && !execution.noRepackResidual;
+    const addResidual = residual !== undefined && multiplier === undefined && !execution.noRepackResidual;
     execution.dispatch({
       source: blockRepackSource(blockRows, rowFastest, tileWidth, addResidual),
       output,
@@ -871,7 +881,8 @@ export function linear(execution, call, into) {
     for (const plane of planes) execution.release(plane);
     if (padded !== null) execution.release(padded.tensor);
     if (residual !== undefined && !addResidual) {
-      const summed = add(execution, residual, output);
+      const summed = multiplier === undefined ? add(execution, residual, output)
+        : residualProduct(execution, residual, output, multiplier);
       execution.release(output);
       return summed;
     }
@@ -895,11 +906,17 @@ export function linear(execution, call, into) {
   const narrowed = narrowUnblocked
     ? padStride(execution, { x, rows, inChannels, label: "linear.x-narrow" })
     : null;
+  // ...the residual (and its multiplier) in the kernel's own epilogue, where the output is aligned
+  const epilogue = residual === undefined || outChannels % 4 !== 0 || roundHalf || execution.noLinearEpilogue ? 0
+    : multiplier === undefined ? 1 : 2;
   const result = execution.dispatch({
     source: linearSource(
-      rows, inChannels, outChannels, activation, bias !== undefined, weightLayout, roundHalf),
+      rows, inChannels, outChannels, activation, bias !== undefined, weightLayout, roundHalf, epilogue),
     output,
-    inputs: { xTex: narrowed?.tensor ?? x, weightTex: weightTensor, biasTex: bias ?? narrowed?.tensor ?? x },
+    inputs: {
+      xTex: narrowed?.tensor ?? x, weightTex: weightTensor, biasTex: bias ?? narrowed?.tensor ?? x,
+      ...(epilogue > 0 ? { baseTex: residual } : {}), ...(epilogue > 1 ? { mulTex: multiplier } : {}),
+    },
     optionalInts: {
       ...shapeInts(rows, inChannels, outChannels), ACT: ACTIVATION_CODES[activation],
       HAS_BIAS: bias === undefined ? 0 : 1,
@@ -908,13 +925,37 @@ export function linear(execution, call, into) {
       + `${roundHalf ? ":half" : ""}${narrowUnblocked ? ":half-x" : ""}`,
   });
   if (narrowed !== null) execution.release(narrowed.tensor);
-  if (residual !== undefined) {
-    const summed = add(execution, residual, result);
+  if (residual !== undefined && epilogue === 0) {
+    const summed = multiplier === undefined ? add(execution, residual, result)
+      : residualProduct(execution, residual, result, multiplier);
     execution.release(result);
     return summed;
   }
   return result;
 }
+
+/** `base + a * b`, elementwise, as a new tensor. */
+function residualProduct(execution, base, a, b) {
+  const out = execution.allocate(base.elements, "linear.residual-product");
+  return execution.dispatch({
+    source: residualProductSource(base.elements),
+    output: out,
+    inputs: { baseTex: base, aTex: a, bTex: b },
+    label: "linear.residual-product",
+  });
+}
+
+const residualProductSourceUncached = (elements) => sized({ ELEMENTS: elements }, `${PRELUDE}${ONE_TARGET}
+uniform sampler2D baseTex;
+uniform sampler2D aTex;
+uniform sampler2D bTex;
+
+void main() {
+  int texel = linearTexel();
+  if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
+  result = fetch4(baseTex, texel) + fetch4(aTex, texel) * fetch4(bTex, texel);
+}`);
+export const residualProductSource = memoSource(residualProductSourceUncached);
 
 // Every builder above, memoised on its arguments (`memoSource` in webgl/runtime/execution.js).
 export const linearSource = memoSource(linearSourceUncached);

@@ -357,6 +357,15 @@ export function gridSelfAttention(execution, call) {
   if (act !== normalised) execution.release(act);
   execution.release(normalised);
 
+  // ...the row direction's residual in the output projection's own epilogue, where nothing sits between them
+  if (residualOf !== undefined && !transpose && w.outputProjectionBias === undefined && !execution.noLinearEpilogue) {
+    const next = linear(execution, {
+      x: gathered, weight: w.outputProjection, rows: pairs,
+      inChannels: width, outChannels: channels, weightLayout: "in-major", residual: residualOf,
+    });
+    execution.release(gathered);
+    return next;
+  }
   let projected = linear(execution, {
     x: gathered, weight: w.outputProjection, rows: pairs,
     inChannels: width, outChannels: channels, weightLayout: "in-major",
