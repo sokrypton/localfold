@@ -3571,3 +3571,6 @@ Measured and NOT kept: row-block-fastest fragment order for the float blocked pr
 15 row blocks, so 15 neighbouring fragments would share a weight texel). Diffusion 2335 -> ~2710 ms, SLOWER - and wrong
 as tried, because only the int5 kernel takes the tiled layout that order implies; the float kernel would need it
 written. Not worth writing on that number.
+Measured and NOT kept: the column grid attention's transpose back as transposed x rows in the output projection's
+epilogue (`transposeRows`), dropping `transposedAddSource`'s draw. Bit-identical, trunk 1210 -> 1204 ms - inside the
+noise; that add was already one cheap pass.
