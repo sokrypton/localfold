@@ -366,6 +366,7 @@ export class Execution {
     this.noOpmOuterFirst = options.noOpmOuterFirst ?? false;
     this.noGridFusedProjection = options.noGridFusedProjection ?? false;
     this.noKeepPlanes = options.noKeepPlanes ?? false;
+    this.noLinearGateSlice = options.noLinearGateSlice ?? false;
     this.noPrepaddedX = options.noPrepaddedX ?? false;
     this.noPaddedLogits = options.noPaddedLogits ?? false;
     this.twoSweepValues = options.twoSweepValues ?? false;

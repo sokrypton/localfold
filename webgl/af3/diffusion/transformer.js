@@ -335,6 +335,15 @@ function blendFromBatch(execution, { x, rows, channels, epsilon, batch, which, o
 
 /** `adaptiveZeroInit` from a block's slice of the step's batched gates. */
 function zeroFromBatch(execution, { x, rows, channels, inChannels, weight, batch, which, residual }) {
+  // ...the gate (and the residual) in the projection's own last draw - its epilogue, or its repack - where it was a
+  // separate `zero-slice` draw (`linear`'s `gateSlice`)
+  if (residual !== undefined && channels % 4 === 0 && !execution.noLinearGateSlice
+    && !execution.noLinearEpilogue && !execution.noRepackResidual) {
+    return linear(execution, {
+      x, weight, rows, inChannels, outChannels: channels, weightLayout: "in-major", residual,
+      gateSlice: { gates: batch.gates, stride4: batch.gateWidth / 4, at4: ((batch.index * 2 + which) * channels) / 4 },
+    });
+  }
   const projected = linear(execution, {
     x, weight, rows, inChannels, outChannels: channels, weightLayout: "in-major",
   });

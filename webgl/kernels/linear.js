@@ -109,6 +109,7 @@ export const shapeInts = (rows, inChannels, outChannels) => ({
 
 const linearSourceUncached = (
   rows, inChannels, outChannels, activation, useBias, weightLayout, roundHalf = false, epilogue = 0,
+  gateStride4 = 0,
 ) => {
   // `[out][in]`: four weight rows, each IN long and each starting on a texel
   // boundary because IN is a multiple of four, against one shared input texel.
@@ -194,6 +195,7 @@ uniform sampler2D biasTex;
 uniform int HAS_BIAS;
 ${epilogue > 0 ? "uniform sampler2D baseTex;" : ""}
 ${epilogue > 1 ? "uniform sampler2D mulTex;" : ""}
+${epilogue === 3 ? `uniform int gateAt4;\nconst int GATE_STRIDE4 = ${gateStride4};` : ""}
 
 void main() {
 ${ragged ? `  int base = linearTexel() * 4;
@@ -214,7 +216,8 @@ ${raggedInput
   // the epilogue: 1 is base + value, 2 is base + value * multiplier (a residual, and a gate)
   result = ${epilogue === 0 ? (roundHalf ? ROUND_HALF("activate(value)") : "activate(value)")
     : epilogue === 1 ? "fetch4(baseTex, texel) + activate(value)"
-      : "fetch4(baseTex, texel) + activate(value) * fetch4(mulTex, texel)"};
+      : epilogue === 2 ? "fetch4(baseTex, texel) + activate(value) * fetch4(mulTex, texel)"
+        : "fetch4(baseTex, texel) + activate(value) * fetch4(mulTex, row * GATE_STRIDE4 + gateAt4 + group)"};
 }`;
 };
 
@@ -602,8 +605,9 @@ ${each((i) => `  result${i} = ${value(i)};`)}
 
 /** Four row planes back into `[rows][outChannels]`: plane `row % 4`, texel `(row / 4) * OUT4 + group`. */
 const blockRepackSourceUncached = (blockRows = BLOCK_ROWS, orderRowFastest = false,
-  tileWidth = 0, withResidual = false) => `${PRELUDE}${ONE_TARGET}
+  tileWidth = 0, withResidual = false, gateStride4 = 0) => `${PRELUDE}${ONE_TARGET}
 ${withResidual ? "uniform sampler2D residualTex;" : ""}
+${gateStride4 > 0 ? `uniform sampler2D gatesTex;\nuniform int gateAt4;\nconst int GATE_STRIDE4 = ${gateStride4};` : ""}
 uniform int ROWS;
 uniform int OUT4;
 uniform int RQ;
@@ -622,9 +626,10 @@ void main() {
       : "(row / " + blockRows + ") * OUT4 + group"};
   int plane = row - (row / ${blockRows}) * ${blockRows};
   vec4 base = ${withResidual ? "fetch4(residualTex, texel)" : "vec4(0.0)"};
+  vec4 scale = ${gateStride4 > 0 ? "fetch4(gatesTex, row * GATE_STRIDE4 + gateAt4 + group)" : "vec4(1.0)"};
 ${Array.from({ length: blockRows - 1 }, (_, i) =>
-  `  if (plane == ${i}) { result = base + fetch4(plane${i}, source); return; }`).join("\n")}
-  result = base + fetch4(plane${blockRows - 1}, source);
+  `  if (plane == ${i}) { result = base + fetch4(plane${i}, source) * scale; return; }`).join("\n")}
+  result = base + fetch4(plane${blockRows - 1}, source) * scale;
 }`;
 
 /**
@@ -697,8 +702,10 @@ export function linear(execution, call, into) {
   const {
     x, weight, bias, rows, inChannels, outChannels,
     activation = "none", weightLayout = "out-major", roundHalf = false, keepPlanes = false, residual, multiplier,
-    xStride4: givenStride4 = 0,
+    xStride4: givenStride4 = 0, gateSlice,
   } = call;
+  // `gateSlice` ({gates, stride4, at4}), with `residual`: return `residual + (x W) * gate`, the gate read per row from a
+  // batched tensor at `row * stride4 + at4 + group` - AdaLN-zero's gate, in the projection's own last draw
   // `xStride4`: x arrives ALREADY laid at that row stride (`linearPaddedStride4`), so the pad pass is skipped
   if (givenStride4 > 0) {
     if (givenStride4 !== linearPaddedStride4(execution, { rows, inChannels, outChannels, weightLayout })) {
@@ -892,18 +899,22 @@ export function linear(execution, call, into) {
       return /** @type {any} */ ({ planes, blockRows, rows, outChannels });
     }
     const addResidual = residual !== undefined && multiplier === undefined && !execution.noRepackResidual;
+    const gated = addResidual && gateSlice !== undefined;
     execution.dispatch({
-      source: blockRepackSource(blockRows, rowFastest, tileWidth, addResidual),
+      source: blockRepackSource(blockRows, rowFastest, tileWidth, addResidual, gated ? gateSlice.stride4 : 0),
       output,
       inputs: {
         ...Object.fromEntries(planes.map((plane, i) => [`plane${i}`, plane])),
         ...(addResidual ? { residualTex: residual } : {}),
+        ...(gated ? { gatesTex: gateSlice.gates } : {}),
       },
+      ...(gated ? { ints: { gateAt4: gateSlice.at4 } } : {}),
       optionalInts: { ROWS: rows, OUT4: Math.ceil(outChannels / 4), RQ: rowQuads },
       label: `linear.repack:${rows}x${outChannels}`,
     });
     for (const plane of planes) execution.release(plane);
     if (padded !== null && padded.given !== true) execution.release(padded.tensor);
+    if (gateSlice !== undefined && !gated) throw new Error("linear: a gate slice needs the repack's residual");
     if (residual !== undefined && !addResidual) {
       const summed = multiplier === undefined ? add(execution, residual, output)
         : residualProduct(execution, residual, output, multiplier);
@@ -932,15 +943,19 @@ export function linear(execution, call, into) {
     : null;
   // ...the residual (and its multiplier) in the kernel's own epilogue, where the output is aligned
   const epilogue = residual === undefined || outChannels % 4 !== 0 || roundHalf || execution.noLinearEpilogue ? 0
-    : multiplier === undefined ? 1 : 2;
+    : gateSlice !== undefined ? 3 : multiplier === undefined ? 1 : 2;
+  if (gateSlice !== undefined && epilogue !== 3) throw new Error("linear: a gate slice needs the epilogue");
   const result = execution.dispatch({
     source: linearSource(
-      rows, inChannels, outChannels, activation, bias !== undefined, weightLayout, roundHalf, epilogue),
+      rows, inChannels, outChannels, activation, bias !== undefined, weightLayout, roundHalf, epilogue,
+      epilogue === 3 ? gateSlice.stride4 : 0),
     output,
     inputs: {
       xTex: narrowed?.tensor ?? x, weightTex: weightTensor, biasTex: bias ?? narrowed?.tensor ?? x,
-      ...(epilogue > 0 ? { baseTex: residual } : {}), ...(epilogue > 1 ? { mulTex: multiplier } : {}),
+      ...(epilogue > 0 ? { baseTex: residual } : {}),
+      ...(epilogue === 2 ? { mulTex: multiplier } : {}), ...(epilogue === 3 ? { mulTex: gateSlice.gates } : {}),
     },
+    ...(epilogue === 3 ? { ints: { gateAt4: gateSlice.at4 } } : {}),
     optionalInts: {
       ...shapeInts(rows, inChannels, outChannels), ACT: ACTIVATION_CODES[activation],
       HAS_BIAS: bias === undefined ? 0 : 1,
