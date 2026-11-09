@@ -3478,3 +3478,6 @@ queries x 16 heads), each walking every key - under-occupied. `attentionValuesSo
 texel (11,328), the row's max then the weighted sum for its own four channels, written straight into the interleaved
 layout, so the second value draw and the interleave go too. The same softmax in two sweeps rather than online: worst
 atom against WebGPU 0.132 -> 0.109 A; diffusion 2504 -> 2481 ms. `--no-direct-values` is the arm.
+Measured and NOT kept: the trunk's single attention fused the same way (four 59 x 384 -> 384 as one 384 -> 1536,
+blocked, split from its planes). Trunk 1219 -> 1207 ms, inside the noise, and not bit-identical; the four were ~58 ms
+of a fold by `--skip`, against ~0.9 s for the denoiser's four.
