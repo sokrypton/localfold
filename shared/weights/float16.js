@@ -111,6 +111,46 @@ export function float32ToFloat16Scalar(values) {
 }
 
 /**
+ * `fitsFloat16` and `float32ToFloat16Array` together: the float16 bits, `length` long (zeros past the values - a
+ * texture's padded size), or null if any value is not a finite float16 magnitude. Where `Float16Array` is native that
+ * is the check and then the engine's conversion; on the scalar path - Safari before 18.2, where both are JavaScript
+ * loops over every weight - the check is the same integer compare on the bits the conversion is already reading, so
+ * the weights are swept once rather than twice.
+ *
+ * @returns {Uint16Array | null}
+ */
+export function float32ToFloat16IfFits(values, length = values.length) {
+  if (hasNativeFloat16 || !(values instanceof Float32Array)) {
+    if (!fitsFloat16(values)) return null;
+    if (length === values.length) return float32ToFloat16Array(values);
+    const padded = new Uint16Array(length);
+    padded.set(float32ToFloat16Array(values));
+    return padded;
+  }
+  const result = new Uint16Array(length);
+  const words = new Uint32Array(values.buffer, values.byteOffset, values.length);
+  for (let i = 0; i < words.length; i += 1) {
+    const bits = words[i];
+    if ((bits & 0x7fffffff) > 0x477fe000) return null;
+    const sign = (bits >>> 16) & 0x8000;
+    let exponent = ((bits >>> 23) & 0xff) - 127 + 15;
+    let mantissa = bits & 0x7fffff;
+    if (exponent <= 0) {
+      result[i] = exponent < -10 ? sign : sign | subnormalHalf(mantissa, exponent);
+      continue;
+    }
+    mantissa += 0x0fff + ((mantissa >>> 13) & 1);
+    if ((mantissa & 0x800000) !== 0) {
+      mantissa = 0;
+      exponent += 1;
+      if (exponent >= 0x1f) { result[i] = sign | 0x7c00; continue; }
+    }
+    result[i] = sign | (exponent << 10) | (mantissa >>> 13);
+  }
+  return result;
+}
+
+/**
  * Whether every value of a float32 array is a finite float16 magnitude (|x| <= 65504; NaN is not), read off the bits
  * with one integer compare an element - `Storage.uploadWeight`'s check before it narrows a weight.
  */

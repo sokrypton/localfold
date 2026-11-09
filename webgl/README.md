@@ -3542,3 +3542,11 @@ float16 x it read before, which costs back what the layout pass saved.
 Measured and NOT kept: the split LayerNorm from 512 channels (it starts at 768), for IntelliFold-2's `3481x512:fast`
 pair norm - the shape the threshold table never priced under the fast variance. IntelliFold-2 16738 -> 16840 ms,
 slightly worse; the 768 threshold stands.
+
+Kept, for Safari: a half weight is checked and converted in ONE sweep (`float32ToFloat16IfFits`,
+shared/weights/float16.js). Safari before 18.2 has no `Float16Array`, so `fitsFloat16` and the scalar conversion were
+two JavaScript loops over every weight; the check is now the same integer compare on the bits the conversion already
+reads, straight into the texture's padded size. Safari 16.3's upload **1623 -> 1436 ms** (two alternating rounds,
+`tools/run-in-safari.py`), pLDDT unchanged; Chrome, which converts natively, unchanged (3786 -> 3782 ms).
+test/float16-if-fits.test.js holds it to the check-then-convert on both paths (run it with `Float16Array` deleted for
+the scalar one). `--no-fused-half-check` is the arm.

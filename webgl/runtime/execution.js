@@ -307,6 +307,7 @@ export class Execution {
     this.storage = new Storage(gl, { pooling: options.pooling ?? false,
       poolLimitBytes: options.poolLimitBytes ?? Infinity,
       ...(options.halfWeightFloor === undefined ? {} : { halfWeightFloor: options.halfWeightFloor }),
+      noFusedHalfCheck: options.noFusedHalfCheck === true,
       poolLabelPattern: options.poolLabelPattern ?? null,
       fillFresh: options.fillFresh ?? null,
       halfWeights: options.halfWeights ?? false,
