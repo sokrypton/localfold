@@ -3567,3 +3567,7 @@ the flash kernel does - the `af3.atom.gate` draw goes. Bit-identical; fold 3747 
 Measured and NOT kept: the atom block's residual tail through the projection epilogue (the attention's output
 projection returning `base + projected * gate`, the block's output `that + transition * sigmoid(gate)` from the down
 projection - five draws to two). Fold 3735 -> 3736 ms: nothing, at 480 x 128 a pass costs nothing worth removing.
+Measured and NOT kept: row-block-fastest fragment order for the float blocked projections below 64 rows (the denoiser's,
+15 row blocks, so 15 neighbouring fragments would share a weight texel). Diffusion 2335 -> ~2710 ms, SLOWER - and wrong
+as tried, because only the int5 kernel takes the tiled layout that order implies; the float kernel would need it
+written. Not worth writing on that number.
