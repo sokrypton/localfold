@@ -3578,3 +3578,11 @@ Measured and NOT kept, the occupancy fix for that: the fast variance's sums in 1
 parts, then the same apply (three draws, every fragment short). IntelliFold-2 16746 -> 16870 ms, still worse. At 128
 texels a row the one-pass kernel's redundant reads are cheaper than any split of it; the 768 threshold stands on two
 measurements now.
+
+🔴 **AND IN SAFARI, NOT JUST CHROME.** Every A/B above ran in Chrome; the readers this path is for run Safari, whose
+ANGLE-on-Metal ranks kernels its own way. `tools/run-in-safari.py tools/gpu/fold-af3-webgl.js` (Safari 16.3, M2, the
+same 59-residue + 128-row fold, one fold an arm): base **3714 / 4146 ms**, and with each of today's switches turned off
+the DIFFUSION - the stage they act on - is slower in every arm: base 2171 / 2198 ms against `--no-stored-logits` 2652,
+`--no-adaln-parts` 2387, `--no-split-few-fragments` 2314, `--no-keep-planes` 2317, `--no-atom-attend-split` 2333. (The
+trunk is too noisy in single Safari runs to rank them, 1416 to 1764 ms on the base alone.) So the choices hold there,
+and Safari's fold is now within ~10% of Chrome's.
