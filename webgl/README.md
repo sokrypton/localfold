@@ -3625,3 +3625,18 @@ old rule):
 Bit-identical in every arm compared (pLDDT, worst atom and relRms against WebGPU to the digit). AF3 at 59 tokens is
 under the old ceiling and does not move. The fold this file has measured all day was 59 tokens - which is exactly why a
 gate that only bites at ~110 tokens and up went unseen.
+
+Kept: the batched flash attention (the trunk's grid attention) laid out HEAD-MAJOR in its planes from 96 keys a row -
+fragments ordered (batch, head, query), the query fastest, so a run of neighbouring fragments walks ONE head's keys and
+values where it walked four heads' interleaved; the interleave reads the planes back at the mapped texel. Profiled at
+250 tokens, the grid attention was 10 s of a 57 s fold (89 ms a call). Trunk pass, single sequence, two runs each:
+
+| tokens | (batch, query, head) | head-major |
+|---:|---:|---:|
+| 59 | 1218 ms | 1313 - slower, so not used below 96 |
+| 100 | 1634 / 1651 | 1588 / 1617 |
+| 150 | 4969 / 4974 | **4546 / 4595** |
+| 250 | 18797 / 18871 | **14919 / 15057** |
+
+Bit-identical (the same arithmetic per fragment). `--no-head-major-attention` is the arm. Like the contraction ceiling,
+nothing at 59 tokens could have shown it.
