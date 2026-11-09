@@ -3640,3 +3640,7 @@ values where it walked four heads' interleaved; the interleave reads the planes 
 
 Bit-identical (the same arithmetic per fragment). `--no-head-major-attention` is the arm. Like the contraction ceiling,
 nothing at 59 tokens could have shown it.
+Also re-checked at 250 tokens, where a 59-token measurement cannot speak for them: the kept planes still win (trunk pass
+15.0 s against 18.0 with `--no-keep-planes`, though the grid's split is ~40 ms a call there), and x narrowed to float16
+still does not (`--narrow-aligned-x` 15.18 / 15.22 s against 15.05 / 15.07, and it moves pLDDT). Safari agrees with the
+head-major layout: 150 tokens 6.11 -> 5.62 s a pass.
