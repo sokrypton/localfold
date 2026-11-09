@@ -11,9 +11,9 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-544 tools. `tools/fixtures/` is data and is not listed.
+551 tools. `tools/fixtures/` is data and is not listed.
 
-## `tools/gpu/` - the WebGPU lane (296)
+## `tools/gpu/` - the WebGPU lane (300)
 
 Each exports `async function main(device, args)` and is run as
 `node tools/gpu-chrome.mjs tools/gpu/<module>.js [--flags]`.
@@ -290,11 +290,15 @@ Each exports `async function main(device, args)` and is run as
 - **`probe-webgl-feedback-gemm.js`** - A GEMM in a VERTEX shader through transform feedback, against the same GEMM in a fragment shader - because the output budget is what binds this backend.
 - **`probe-webgl-fetch-rate.js`** - What `fetch4` RATE does this device give a fragment of a given shape?
 - **`probe-webgl-gemm-ceiling.js`** - The MOST a fragment-shader GEMM can do on this device, measured.
+- **`probe-webgl-ksplit-chain.js`** - A DEPENDENT CHAIN of projections - each reading the last one's output, as a fold's are - with the inner loop split across instances and summed by the BLEND unit, against one fragment walking the whole loop.
 - **`probe-webgl-limits.js`** - The WebGL2 limits that decide what shape a kernel in this backend can be.
 - **`probe-webgl-linear-operand.js`** - Which OPERAND binds the WebGL2 dense projection - x, or the weight codes?
+- **`probe-webgl-packed-x.js`** - Whether reading a projection's x as EIGHT halves a texel (RGBA32UI, unpackHalf2x16) beats four (RGBA16F).
 - **`probe-webgl-precision.js`** - Does `mediump` reach this device's HALF arithmetic, and is it faster?
 - **`probe-webgl-programs.js`** - Which WebGL2 programs a fold compiles and what each one costs, for ANY of the fold tools - by wrapping one rather than by being one, as probe-compiles.js does for WGSL.
 - **`probe-webgl-uber.js`** - Does one program holding several small kernels (an "uber-shader", the kernel chosen by a uniform) link faster than the kernels as separate programs? Safari 16.3 links each program in ~19 ms on the page's thread whatever its size, so it would if that cost is per program. Small elementwise kernels in the fold's own style, linked both ways in fresh contexts.
+- **`probe-webgl-ubo-weight.js`** - A projection whose WEIGHT sits in uniform blocks rather than a texture, in a dependent chain, against the texture kernel - the shape of every pair projection in an AF3 trunk.
+- **`probe-webgl-uniform-budget.js`** - How much UNIFORM-BLOCK data a draw may actually bind here - the largest single block, and all blocks together - against what the context reports.
 - **`probe-webgl-uniform-reads.js`** - Is a UNIFORM BLOCK read cheaper than a `texelFetch` on this device?
 - **`probe-webgl-upload-compile.js`** - Can the WebGL2 AF3 fold's shader compile hide behind its weight upload? The programs found by a dry run on a VIRTUAL upload (shapes, no textures - so before any real upload), then: the real upload alone; the real upload with those programs compiled between its pieces (each piece's GPU wait); and the programs alone. Hidden means upload-with-compile < upload + compile.
 - **`probe-webgl2-limits.js`** - The WebGL2 limits that bound a GPGPU kernel, including the ones a fragment shader does not have but transform feedback might.
@@ -416,7 +420,7 @@ and turning it into a bundle.
 - **`safetensors_read.py`** - Read a .safetensors file into numpy arrays, without the safetensors package.
 - **`vector-quantise.py`** - Is a codebook worth a new decoder? Scalar codes against vector ones, at 2 bits.
 
-## `tools/` - everything else (159)
+## `tools/` - everything else (162)
 
 CPU checkers, the export and quantisation pipeline, the page drivers that
 go through CDP, and the deploy.
@@ -524,6 +528,7 @@ go through CDP, and the deploy.
 - **`fold-clears-msa.py`** - Pressing Fold must take the PREVIOUS job's alignment off the page.
 - **`fold-esmfold2.js`** - A whole ESMFold2 fold on the CPU: features in, a structure out.
 - **`fold-in-page.py`** - Drive a REAL fold in the real page, and report what the frames carry.
+- **`fold-in-safari.py`** - Fold in the real page in the REAL Safari, through safaridriver's WebDriver HTTP API.
 - **`gate-folds.mjs`** - The folds every whole-model gate runs, and how a gate reads one of them.
 - **`gen-crosslinkers.mjs`** - Generate shared/chem/crosslinkers.js - the crosslinkers a `crosslinks` job names - from af3-any-model's export:
 - **`gen-native-featuriser-tables.mjs`** - Generate cuda/featurise/tables.inc, dialects.inc and bundles.inc - the data the native featuriser, weight walk and weight fetch read, from the JavaScript they mirror.
@@ -570,6 +575,8 @@ go through CDP, and the deploy.
 - **`rfd4p-bundle-to-safetensors.mjs`** - The published int8 bundle written back out as a float32 `.safetensors` - what `cuda/rfd4p/export_input.mjs --checkpoint=` and `export_weights.mjs` read.
 - **`rfd4p-writer-unshifted.mjs`** - The page's writer on a dumped sample with `center_shift` taken back OUT, against a native file.
 - **`rfd4p_ccd.py`** - The dictionary entries the RFD4 page would FETCH for a structure, written from the CCD atomworks reads.
+- **`run-in-safari.py`** - Run a tools/gpu module's `main(null, args)` in the REAL Safari, through safaridriver, and print what it returns.
+- **`safari-run.html`** - run
 - **`score-bioemu2-samples.mjs`** - BioEmu2 samples, scored as BioEmu2 scores them: its physicality report and its steering potentials' energies.
 - **`score_fold.py`** - Score a fold from tools/gpu/fold.js against a reference structure.
 - **`serve.py`** - Serve the checkout with caching turned off.
