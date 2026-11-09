@@ -34,7 +34,7 @@
  * it is a fallback for.
  */
 import { CHANNELS_PER_TEXEL, TEXTURE_WIDTH, textureShape } from "./context.js";
-import { fitsFloat16, float32ToFloat16Array } from "../../shared/weights/float16.js";
+import { fitsFloat16, float32ToFloat16Array, float32ToFloat16IfFits } from "../../shared/weights/float16.js";
 import { int5WeightSource } from "./int5.js";
 
 /**
@@ -254,6 +254,7 @@ export class Storage {
      * weights in f16 (`pairWeightPrecision`). The AF3 driver lowers it (fold-batch.js); the gates do not.
      */
     this.halfWeightFloor = options.halfWeightFloor ?? HALF_WEIGHT_FLOOR;
+    this.noFusedHalfCheck = options.noFusedHalfCheck ?? false;
     this.int5WeightTensors = 0;
   }
 
@@ -379,6 +380,24 @@ export class Storage {
    */
   uploadWeight(values, label = "weight") {
     let half = this.halfWeights && values.length >= this.halfWeightFloor;
+    // ...checked and converted in ONE sweep where the conversion is JavaScript (`float32ToFloat16IfFits`), straight
+    // into the texture's padded size
+    if (half && !this.virtual && !this.noFusedHalfCheck) {
+      const tensor = this.allocate(values.length, label, true);
+      const halves = tensor.texture === null ? null : float32ToFloat16IfFits(
+        values instanceof Float32Array ? values : Float32Array.from(values),
+        tensor.width * tensor.height * CHANNELS_PER_TEXEL);
+      if (halves !== null) {
+        this.halfWeightTensors += 1;
+        this.#writeHalves(tensor, halves);
+        return tensor;
+      }
+      this.release(tensor);
+      if (tensor.texture !== null) {
+        this.halfRefusals += 1;
+        return this.upload(values, label);
+      }
+    }
     if (half && !this.virtual) {
       // 🔴 AND A TENSOR THAT DOES NOT FIT IN float16 STAYS IN float32 RATHER
       // THAN BECOMING Inf. A checkpoint's weights are all well inside the
@@ -505,6 +524,17 @@ export class Storage {
     this.timing.uploadBytes += padded.length * 4;
     this.timing.uploads += 1;
     return tensor;
+  }
+
+  /** A half tensor's float16 bits, already its texture's padded size. */
+  #writeHalves(tensor, halves) {
+    const gl = this.gl;
+    const startedAt = performance.now();
+    gl.bindTexture(gl.TEXTURE_2D, tensor.texture);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, tensor.width, tensor.height, gl.RGBA, gl.HALF_FLOAT, halves);
+    this.timing.uploadBytes += halves.length * 2;
+    this.timing.uploadMs += performance.now() - startedAt;
+    this.timing.uploads += 1;
   }
 
   /** Replace a tensor's contents, which must be exactly its element count. */
