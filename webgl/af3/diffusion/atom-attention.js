@@ -355,6 +355,90 @@ ${each((g) => `  result${g} = acc${g} / runningSum;`)}
 }`);
 };
 
+/**
+ * The atom attention in two draws for occupancy: every logit (`[subset][head][query][key]`, four keys a texel, the
+ * arithmetic of `atomAttentionSource` in its order), then one fragment per OUTPUT texel - the row's max, then the
+ * weighted values for its own four channels - written in the ordinary `[row][head][channel]` layout. The one-fragment
+ * -a-head kernel runs 1,920 fragments at AF3's 15 x 32 x 4, each walking 128 keys; this runs 15,360.
+ */
+const atomLogitsSourceUncached = (shape, keyMasked) => {
+  const { subsets, queries, keys, heads, dimension } = shape;
+  return sized({ ELEMENTS: subsets * heads * queries * keys, QUERIES: queries, KEYS: keys, HEADS: heads, D: dimension, D4: dimension / 4, WIDTH: heads * dimension }, `${PRELUDE}${ONE_TARGET}
+uniform sampler2D qTex;
+uniform sampler2D kTex;
+uniform sampler2D queryMaskTex;
+uniform sampler2D keyMaskTex;
+uniform sampler2D pairLogitsTex;
+uniform float scale;
+
+void main() {
+  int texel = linearTexel();
+  if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
+  vec4 out4 = vec4(0.0);
+  for (int lane = 0; lane < 4; ++lane) {
+    int element = texel * 4 + lane;
+    if (element >= ELEMENTS) break;
+    int key = element % KEYS;
+    int rest = element / KEYS;
+    int query = rest % QUERIES;
+    int sh = rest / QUERIES;
+    int head = sh % HEADS;
+    int subset = sh / HEADS;
+    int queryIndex = subset * QUERIES + query;
+    int queryBase = queryIndex * WIDTH + head * D;
+    int keyIndex = subset * KEYS + key;
+    int keyBase = keyIndex * WIDTH + head * D;
+    float dot = 0.0;
+    for (int dd = 0; dd < D4; ++dd) {
+      vec4 q4 = fetch4(qTex, queryBase / 4 + dd);
+      vec4 k4 = fetch4(kTex, keyBase / 4 + dd);
+      dot += q4.x * k4.x; dot += q4.y * k4.y;
+      dot += q4.z * k4.z; dot += q4.w * k4.w;
+    }
+    float queryMask = fetch1(queryMaskTex, queryIndex);
+    float keyMask = fetch1(keyMaskTex, keyIndex);
+    float maskBias = ${keyMasked
+    ? "-1e9 * ((1.0 - queryMask) + (1.0 - keyMask))"
+    : "1e9 * (queryMask - 1.0) * (keyMask - 1.0)"};
+    float logit = dot * scale + maskBias + fetch1(pairLogitsTex, element);
+    if (lane == 0) out4.x = logit;
+    else if (lane == 1) out4.y = logit;
+    else if (lane == 2) out4.z = logit;
+    else out4.w = logit;
+  }
+  result = out4;
+}`);
+};
+
+const atomValuesSourceUncached = (shape) => {
+  const { subsets, queries, keys, heads, dimension } = shape;
+  return sized({ TEXELS: subsets * queries * heads * dimension / 4, QUERIES: queries, KEYS: keys, HEADS: heads, D4: dimension / 4, W4: heads * dimension / 4 }, `${PRELUDE}${ONE_TARGET}
+uniform sampler2D logitTex;
+uniform sampler2D vTex;
+
+void main() {
+  int texel = linearTexel();
+  if (texel >= TEXELS) { result = vec4(0.0); return; }
+  int group = texel % D4;
+  int rest = texel / D4;
+  int head = rest % HEADS;
+  int queryIndex = rest / HEADS;
+  int query = queryIndex % QUERIES;
+  int subset = queryIndex / QUERIES;
+  int logitBase = ((subset * HEADS + head) * QUERIES + query) * KEYS;
+  float rowMax = -1e30;
+  for (int key = 0; key < KEYS; ++key) rowMax = max(rowMax, fetch1(logitTex, logitBase + key));
+  float total = 0.0;
+  vec4 acc = vec4(0.0);
+  for (int key = 0; key < KEYS; ++key) {
+    float weight = exp(fetch1(logitTex, logitBase + key) - rowMax);
+    total += weight;
+    acc += weight * fetch4(vTex, (subset * KEYS + key) * W4 + head * D4 + group);
+  }
+  result = acc / total;
+}`);
+};
+
 /** `out[i] = base[i] + attended[i] + transition[i] * sigmoid(gate[i])`. */
 const blockOutputSourceUncached = (elements) => part({ ELEMENTS: elements }, {
   uniforms: ["sampler2D baseTex", "sampler2D attendedTex", "sampler2D transitionTex", "sampler2D gateTex"],
@@ -439,7 +523,24 @@ export function crossAttentionBlock(execution, call) {
   const gathered = execution.allocate(queryRows * width, "af3.atom.gathered");
   // ...one fragment a head, its channel groups as planes, where the groups fit the draw buffers
   const groups = dimension / 4;
-  if (!execution.noAtomAttendPlanes && !execution.noAttendDot4 && dimension % 4 === 0
+  if (!execution.noAtomAttendSplit && !execution.noAttendDot4 && dimension % 4 === 0) {
+    const shape = { subsets, queries, keys, heads, dimension };
+    const logits = execution.allocate(subsets * heads * queries * keys, "af3.atom.logits");
+    execution.dispatch({
+      source: atomLogitsSource(shape, call.keyMaskedAtomAttention),
+      output: logits,
+      inputs: { qTex: query, kTex: key, queryMaskTex: queriesMask, keyMaskTex: keysMask, pairLogitsTex: pairLogits },
+      floats: { scale: 1 / Math.sqrt(dimension) },
+      label: `af3.atom.logits:${subsets}x${queries}x${keys}x${width}${call.keyMaskedAtomAttention ? ":or" : ":and"}`,
+    });
+    execution.dispatch({
+      source: atomValuesSource(shape),
+      output: gathered,
+      inputs: { logitTex: logits, vTex: value },
+      label: `af3.atom.values:${subsets}x${queries}x${keys}x${width}`,
+    });
+    execution.release(logits);
+  } else if (!execution.noAtomAttendPlanes && !execution.noAttendDot4 && dimension % 4 === 0
     && groups <= execution.maxDrawBuffers) {
     const planes = Array.from({ length: groups }, (_, g) => execution.allocate(queryRows * heads * 4, `af3.atom.plane${g}`));
     execution.dispatch({
@@ -736,6 +837,8 @@ export const elementwiseProductSource = memoSource(elementwiseProductSourceUncac
 export const gatherSource = memoSource(gatherSourceUncached);
 export const atomAttentionSource = memoSource(atomAttentionSourceUncached);
 export const atomAttentionPlanesSource = memoSource(atomAttentionPlanesSourceUncached);
+export const atomLogitsSource = memoSource(atomLogitsSourceUncached);
+export const atomValuesSource = memoSource(atomValuesSourceUncached);
 export const blockOutputSource = memoSource(blockOutputSourceUncached);
 export const swiGluSource = memoSource(swiGluSourceUncached);
 export const sumSource = memoSource(sumSourceUncached);
