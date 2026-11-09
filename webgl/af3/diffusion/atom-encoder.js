@@ -254,6 +254,47 @@ export function atomCrossAttentionEncoder(execution, call) {
     execution.release(gatheredPositions);
     if (!kept) execution.release(queriesAct);
     queriesAct = positional;
+    // 🔴 rosettafold3's CHIRALITY TERM: the gradient of each centre's squared improper-dihedral error against its ideal,
+    // per atom, projected beside the positions (`atomChiralToFeatures`) - the only reflection-asymmetric signal that
+    // network has. The diffusion encoder's alone (the trunk's passes no coordinates). Missing here, rf3's WebGL2 fold
+    // was a mirror-blind denoiser: the trunk exact and the coordinates 5.7 A from WebGPU's at the worst atom.
+    if (call.chiral !== undefined && w.atomChiralToFeatures !== undefined && w.atomChiralToFeatures !== null) {
+      const { chiral } = call;
+      const gradients = execution.allocate(chiral.atoms * 4, "af3.encoder.chiral-grad");
+      execution.dispatch({
+        source: chiralGradientSource(chiral.atoms),
+        output: gradients,
+        inputs: {
+          positionsTex: call.tokenAtomsAct, centersTex: chiral.centers, anglesTex: chiral.angles,
+          offsetsTex: chiral.offsets, entriesTex: chiral.entries,
+        },
+        label: `af3.encoder.chiral-grad:${chiral.atoms}`,
+      });
+      const gatheredGradients = execution.allocate(queryRows * 4, "af3.encoder.chiral");
+      execution.dispatch({
+        source: vec3GatherSource(queryRows, 4),
+        output: gatheredGradients,
+        inputs: {
+          sourceTex: gradients, indicesTex: gathers.tokenAtomsToQueries.indices,
+          maskTex: gathers.tokenAtomsToQueries.mask,
+        },
+        label: `af3.encoder.gather-chiral:${queryRows}`,
+      });
+      execution.release(gradients);
+      const withChiral = execution.allocate(queryRows * channels, "af3.encoder.positional");
+      execution.dispatch({
+        source: positionToFeaturesSource(queryRows, channels),
+        output: withChiral,
+        inputs: {
+          positionsTex: gatheredGradients, weightTex: w.atomChiralToFeatures,
+          maskTex: queriesMaskTensor, actTex: queriesAct,
+        },
+        label: `af3.encoder.chiral:${queryRows}x${channels}`,
+      });
+      execution.release(gatheredGradients);
+      execution.release(queriesAct);
+      queriesAct = withChiral;
+    }
   }
 
   call.onStage?.("encoder.queriesCond", queriesCond);
@@ -711,6 +752,71 @@ void main() {
   result = fetch4(actTex, texel) + projected * fetch1(maskTex, row);
 }`);
 
+/**
+ * rosettafold3's chirality gradient, one fragment an ATOM (shared/af3/diffusion/chiral-gradient.js, whose GPU twin is
+ * webgpu/af3/diffusion/atom-encoder.js's `chiralGrad`): for each (centre, corner) the atom appears in - `offsets` and
+ * `entries` (centre * 4 + corner) invert the centres on the host, once a fold, so no fragment adds into another's - the
+ * central difference of (improper - ideal)^2 along each axis. Positions are `[atoms][3]`; the output `[atoms][4]`.
+ */
+const chiralGradientSourceUncached = (atoms) => sized({ ATOMS: atoms }, `${PRELUDE}${ONE_TARGET}
+const float STEP = 1.0e-4;
+uniform sampler2D positionsTex;
+uniform sampler2D centersTex;
+uniform sampler2D anglesTex;
+uniform sampler2D offsetsTex;
+uniform sampler2D entriesTex;
+
+vec3 pointOf(int index) {
+  int at = max(index, 0) * 3;
+  return vec3(fetch1(positionsTex, at), fetch1(positionsTex, at + 1), fetch1(positionsTex, at + 2));
+}
+
+// the improper dihedral, spelled as the reference spells it - eps on both atan arguments
+float improper(vec3 a, vec3 b, vec3 c, vec3 d) {
+  float eps = 1.0e-6;
+  vec3 b0 = a - b;
+  vec3 b1 = c - b;
+  vec3 b2 = d - c;
+  vec3 b1n = b1 / (length(b1) + eps);
+  vec3 v = b0 - dot(b0, b1n) * b1n;
+  vec3 w = b2 - dot(b2, b1n) * b1n;
+  return atan(dot(cross(b1n, v), w) + eps, dot(v, w) + eps);
+}
+
+float squaredError(vec3 p0, vec3 p1, vec3 p2, vec3 p3, int corner, vec3 moved, float ideal) {
+  float e = improper(corner == 0 ? moved : p0, corner == 1 ? moved : p1,
+                     corner == 2 ? moved : p2, corner == 3 ? moved : p3) - ideal;
+  return e * e;
+}
+
+void main() {
+  int atom = linearTexel();
+  if (atom >= ATOMS) { result = vec4(0.0); return; }
+  int e0 = int(fetch1(offsetsTex, atom));
+  int e1 = int(fetch1(offsetsTex, atom + 1));
+  vec3 total = vec3(0.0);
+  for (int e = e0; e < e1; ++e) {
+    int code = int(fetch1(entriesTex, e));
+    int centre = code / 4;
+    int corner = code - centre * 4;
+    float ideal = fetch1(anglesTex, centre);
+    if (ideal == 0.0) continue;
+    vec3 p0 = pointOf(int(fetch1(centersTex, centre * 4)));
+    vec3 p1 = pointOf(int(fetch1(centersTex, centre * 4 + 1)));
+    vec3 p2 = pointOf(int(fetch1(centersTex, centre * 4 + 2)));
+    vec3 p3 = pointOf(int(fetch1(centersTex, centre * 4 + 3)));
+    vec3 pc = corner == 0 ? p0 : corner == 1 ? p1 : corner == 2 ? p2 : p3;
+    for (int axis = 0; axis < 3; ++axis) {
+      vec3 nudge = vec3(axis == 0 ? STEP : 0.0, axis == 1 ? STEP : 0.0, axis == 2 ? STEP : 0.0);
+      float derivative = (squaredError(p0, p1, p2, p3, corner, pc + nudge, ideal)
+        - squaredError(p0, p1, p2, p3, corner, pc - nudge, ideal)) / (2.0 * STEP);
+      // (a NaN derivative adds nothing, as the reference's isfinite guard has it)
+      if (derivative == derivative) total[axis] += derivative;
+    }
+  }
+  result = vec4(total, 0.0);
+}`);
+
 /** `out[i] = x[i]` - a copy, because a fragment cannot read its own target. */
 const copySourceUncached = (elements) => part({ ELEMENTS: elements }, {
   uniforms: ["sampler2D xTex"],
@@ -726,5 +832,6 @@ export const aggregateSource = memoSource(aggregateSourceUncached);
 export const scalarGatherSource = memoSource(scalarGatherSourceUncached);
 export const clampedGatherSource = memoSource(clampedGatherSourceUncached);
 export const vec3GatherSource = memoSource(vec3GatherSourceUncached);
+export const chiralGradientSource = memoSource(chiralGradientSourceUncached);
 export const positionToFeaturesSource = memoSource(positionToFeaturesSourceUncached);
 export const copySource = memoSource(copySourceUncached);

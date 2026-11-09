@@ -127,7 +127,7 @@ export function foldMsa(batch, dialect, options = {}) {
       return out;
     };
     return { codes: widen(batch.msa, 21), deletions: widen(batch.deletionMatrix, 0),
-             mask: widen(batch.msaMask, 0), sequences: rows };
+             mask: widen(batch.msaMask, 0), sequences: rows, queryDrawn: chosen[0] === 0 };
   };
   return !native && pool <= cap ? msaOfPass(0) : msaOfPass;
 }

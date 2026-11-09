@@ -519,14 +519,29 @@ export function crossAttentionBlock(execution, call) {
   });
   execution.release(keysAct);
 
-  const query = linear(execution, {
+  let query = linear(execution, {
     x: xq, weight: w.qProjection, bias: w.qBias, rows: queryRows,
     inChannels: channels, outChannels: width, weightLayout: "in-major",
   });
-  const key = linear(execution, {
+  let key = linear(execution, {
     x: xk, weight: w.kProjection, rows: keyRows,
     inChannels: channels, outChannels: width, weightLayout: "in-major",
   });
+  // 🔴 rosettafold3's kq_norm: a trained LayerNorm on q and k over the flattened heads x dimension, before the scaling
+  // (shared/af3/weights/diffusion-weights.js; off the weights, which only rf3 carries). The keys are normalised in the
+  // keys layout, padded slots too - as the reference does; the key mask drops those.
+  if (w.queryLayerNormScale !== undefined && w.queryLayerNormScale !== null) {
+    const normalise = (tensor, which, rows) => {
+      const out = layerNorm(execution, {
+        x: tensor, weight: w[`${which}LayerNormScale`], bias: w[`${which}LayerNormOffset`],
+        rows, channels: width, epsilon,
+      });
+      execution.release(tensor);
+      return out;
+    };
+    query = normalise(query, "query", queryRows);
+    key = normalise(key, "key", keyRows);
+  }
   const value = linear(execution, {
     x: xk, weight: w.vProjection, rows: keyRows,
     inChannels: channels, outChannels: width, weightLayout: "in-major",

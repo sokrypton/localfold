@@ -71,6 +71,8 @@ import { linear } from "../../kernels/linear.js";
 import { pairformerBlock } from "../trunk/pairformer-block.js";
 import { softmaxExpectationSource } from "../../heads/confidence.js";
 import { symmetriseSource } from "../trunk/trunk.js";
+import { RELATIVE_WIDTH, relativeEncodingSource } from "../trunk/embedder.js";
+import { add } from "../../runtime/elementwise.js";
 
 /** @typedef {import("../../runtime/storage.js").Tensor} Tensor */
 
@@ -487,6 +489,13 @@ export function uploadConfidenceHeadWeights(execution, weights) {
       out[name] = execution.uploadWeight(value, `w.af3.conf.${name}`);
     }
   }
+  // boltz2's re-embedding weights, a subtree of their own
+  if (weights.reembed !== undefined && weights.reembed !== null) {
+    out.reembed = {};
+    for (const [name, value] of Object.entries(weights.reembed)) {
+      if (value instanceof Float32Array) out.reembed[name] = execution.uploadWeight(value, `w.af3.conf.reembed.${name}`);
+    }
+  }
   // The absent rows stay on the HOST: they are read as numbers to build one
   // constant vector per side, after the global norm's scalars are known.
   for (const name of ["leftTargetFeatProjectAbsent", "rightTargetFeatProjectAbsent"]) {
@@ -496,6 +505,7 @@ export function uploadConfidenceHeadWeights(execution, weights) {
 }
 
 export function releaseConfidenceHeadWeights(execution, weights) {
+  for (const value of Object.values(weights.reembed ?? {})) execution.release(value);
   for (const [name, value] of Object.entries(weights)) {
     if (name.endsWith("Absent")) continue;
     if (value !== undefined && value !== null && typeof value === "object"
@@ -523,6 +533,143 @@ export function confidenceHead(execution, call) {
   return drain(confidenceHeadSteps(execution, call));
 }
 
+/**
+ * boltz2's confidence re-embedding (cpu/af3/confidence/confidence.js `boltz2Reembed`): z and s REBUILT from the trunk's
+ * outputs rather than added to - nine terms where AF3 has two.
+ *
+ *     sInputs = LN(target_feat);  s = LN(s) + sInputToS(sInputs)
+ *     z = LN(z) + relpos + dgram64(pseudoBeta) + bond * tokenBondsProject + typeEmbed[order] + contact
+ *         + right(sInputs)[i] + left(sInputs)[j] + prodOut(prodIn1(sInputs)[i] * prodIn2(sInputs)[j])
+ *
+ * "left" and "right" are the other way round from `_embed_features`: boltz adds `s_to_z(s)[:, :, None]`, indexed by i,
+ * which is the RIGHT projection.
+ */
+function boltz2Reembed(execution, call, w, pairMask, epsilon) {
+  const { pair: pairIn, single: singleIn, targetFeat, pseudoBeta, tokens } = call;
+  const r = w.reembed;
+  const pairChannels = w.pairChannels;
+  const singleChannels = w.singleChannels;
+  const width = w.targetFeatWidth;
+  const pairs = tokens * tokens;
+  if (r.relPosProject.elements !== RELATIVE_WIDTH * pairChannels) {
+    throw new RangeError(`af3 confidence: rel_pos_project holds ${r.relPosProject.elements} floats, not`
+      + ` ${RELATIVE_WIDTH} x ${pairChannels}`);
+  }
+  const sInputs = layerNorm(execution, {
+    x: targetFeat, weight: r.sInputsNormScale, bias: r.sInputsNormOffset, rows: tokens, channels: width, epsilon,
+  });
+  const project = (weight, outChannels) => linear(execution, {
+    x: sInputs, weight, rows: tokens, inChannels: width, outChannels, weightLayout: "in-major",
+  });
+  const normalisedSingle = layerNorm(execution, {
+    x: singleIn, weight: r.sNormScale, bias: r.sNormOffset, rows: tokens, channels: singleChannels, epsilon,
+  });
+  const fromInputs = project(r.sInputToS, singleChannels);
+  const single = add(execution, normalisedSingle, fromInputs);
+  execution.release(normalisedSingle);
+  execution.release(fromInputs);
+  const left = project(r.leftTargetFeatProject, pairChannels);
+  const right = project(r.rightTargetFeatProject, pairChannels);
+  const in1 = project(r.sToZProdIn1, pairChannels);
+  const in2 = project(r.sToZProdIn2, pairChannels);
+  execution.release(sInputs);
+  // the outer product, then its projection
+  const product = execution.allocate(pairs * pairChannels, "af3.conf.reembed.product");
+  execution.dispatch({
+    source: outerProductRowsSource(tokens, pairChannels), output: product,
+    inputs: { aTex: in1, bTex: in2 }, label: `af3.conf.reembed.product:${tokens}x${pairChannels}`,
+  });
+  execution.release(in1);
+  execution.release(in2);
+  const productOut = linear(execution, {
+    x: product, weight: r.sToZProdOut, rows: pairs, inChannels: pairChannels, outChannels: pairChannels,
+    weightLayout: "in-major",
+  });
+  execution.release(product);
+  const normalisedPair = layerNorm(execution, {
+    x: pairIn, weight: r.zNormScale, bias: r.zNormOffset, rows: pairs, channels: pairChannels, epsilon,
+  });
+  const positioned = execution.allocate(pairs * pairChannels, "af3.conf.reembed.relpos");
+  execution.dispatch({
+    source: relativeEncodingSource(tokens, pairChannels), output: positioned,
+    inputs: { identityTex: call.identity, weightTex: r.relPosProject },
+    label: `af3.conf.reembed.relpos:${tokens}x${pairChannels}`,
+  });
+  const pair = execution.allocate(pairs * pairChannels, "af3.conf.pair");
+  execution.dispatch({
+    source: reembedPairSource(tokens, pairChannels), output: pair,
+    inputs: {
+      pairTex: normalisedPair, relposTex: positioned, productTex: productOut, leftTex: left, rightTex: right,
+      positionsTex: pseudoBeta, maskTex: pairMask, dgramWeightTex: r.distogramFeatProject,
+      bondTex: call.bondMatrix, bondWeightTex: r.tokenBondsProject,
+      orderTex: call.bondOrderMatrix, typeWeightTex: r.tokenBondsTypeEmbed,
+      contactIndexTex: call.contactTerms.index, contactTableTex: call.contactTerms.table,
+    },
+    label: `af3.conf.reembed:${tokens}x${pairChannels}`,
+  });
+  for (const tensor of [normalisedPair, positioned, productOut, left, right]) execution.release(tensor);
+  return { pair, single };
+}
+
+/** `out[i][j][c] = a[i][c] * b[j][c]`. */
+const outerProductRowsSourceUncached = (tokens, channels) => sized({ L: tokens, ELEMENTS: tokens * tokens * channels }, `${PRELUDE}${ONE_TARGET}
+const int C4 = ${channels / 4};
+uniform sampler2D aTex;
+uniform sampler2D bTex;
+
+void main() {
+  int texel = linearTexel();
+  if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
+  int group = texel % C4;
+  int pair = texel / C4;
+  int i = pair / L;
+  int j = pair - i * L;
+  result = fetch4(aTex, i * C4 + group) * fetch4(bTex, j * C4 + group);
+}`);
+
+/** boltz2's re-embedded z: the sum above, with its 64-bin distogram of the pseudo-beta positions taken in place. */
+const BOLTZ2_DGRAM_BINS = 64;
+const reembedPairSourceUncached = (tokens, channels) => sized({ L: tokens, ELEMENTS: tokens * tokens * channels }, `${PRELUDE}${ONE_TARGET}
+const int C4 = ${channels / 4};
+const int BINS = ${BOLTZ2_DGRAM_BINS};
+uniform sampler2D pairTex;
+uniform sampler2D relposTex;
+uniform sampler2D productTex;
+uniform sampler2D leftTex;
+uniform sampler2D rightTex;
+uniform sampler2D positionsTex;
+uniform sampler2D maskTex;
+uniform sampler2D dgramWeightTex;
+uniform sampler2D bondTex;
+uniform sampler2D bondWeightTex;
+uniform sampler2D orderTex;
+uniform sampler2D typeWeightTex;
+uniform sampler2D contactIndexTex;
+uniform sampler2D contactTableTex;
+
+void main() {
+  int texel = linearTexel();
+  if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
+  int group = texel % C4;
+  int pair = texel / C4;
+  int i = pair / L;
+  int j = pair - i * L;
+  vec3 a = vec3(fetch1(positionsTex, i * 3), fetch1(positionsTex, i * 3 + 1), fetch1(positionsTex, i * 3 + 2));
+  vec3 b = vec3(fetch1(positionsTex, j * 3), fetch1(positionsTex, j * 3 + 1), fetch1(positionsTex, j * 3 + 2));
+  vec3 d = a - b;
+  float distance = sqrt(dot(d, d) + 1e-10);
+  int bin = 0;
+  for (int edge = 0; edge < BINS - 1; ++edge) {
+    if (distance > 2.0 + (20.0 * float(edge)) / float(BINS - 2)) bin += 1;
+  }
+  result = fetch4(pairTex, texel) + fetch4(relposTex, texel) + fetch4(productTex, texel)
+    + fetch4(rightTex, i * C4 + group) + fetch4(leftTex, j * C4 + group)
+    + fetch1(maskTex, pair) * fetch4(dgramWeightTex, bin * C4 + group)
+    + fetch1(bondTex, pair) * fetch4(bondWeightTex, group)
+    + fetch4(typeWeightTex, clamp(int(fetch1(orderTex, pair)), 0, 6) * C4 + group)
+    + fetch4(contactTableTex, int(fetch1(contactIndexTex, pair)) * C4 + group);
+}`);
+
 /** `confidenceHead` as a generator: yields after the embedding and each of its pairformer blocks. */
 export function* confidenceHeadSteps(execution, call) {
   const {
@@ -532,17 +679,11 @@ export function* confidenceHeadSteps(execution, call) {
   const pairChannels = w.pairChannels;
   const singleChannels = w.singleChannels;
   const pairs = tokens * tokens;
-  if (call.reembedConfidencePair === true) {
-    // 🔴 REFUSED BY NAME RATHER THAN APPROXIMATED. boltz2 rebuilds z from nine
-    // terms instead of adding two to the trunk's - a relative encoding, token
-    // bonds, bond types, contact conditioning, both target-feat projections, an
-    // OUTER PRODUCT of two more and a 64-bin distogram - and running AF3's two
-    // terms under that flag would return a finite, plausible PAE for a model
-    // this port has not ported.
-    throw new Error(
-      "af3 confidence: reembedConfidencePair is boltz2's nine-term rebuild of z,"
-      + " which this backend has not ported - AF3's two-term embedding would"
-      + " return a plausible number for the wrong model");
+  const reembedding = call.reembedConfidencePair === true;
+  if (reembedding && (w.reembed === undefined || call.identity === undefined || call.bondMatrix === undefined
+    || call.bondOrderMatrix === undefined || call.contactTerms === undefined)) {
+    throw new Error("af3 confidence: reembedConfidencePair (boltz2's nine-term rebuild of z) needs the reembed weights,"
+      + " the token identity, bondMatrix, bondOrderMatrix and contactTerms");
   }
   // 🔴 EVERY PRECONDITION BEFORE THE FIRST ALLOCATION. These two were checked
   // where they are USED - the split heads just before the PDE projection, the
@@ -575,105 +716,110 @@ export function* confidenceHeadSteps(execution, call) {
     label: `af3.conf.pair-mask:${tokens}`,
   });
 
-  // 🔴 rf3 NORMALISES EVERY DETACHED TRUNK INPUT OVER THE WHOLE TENSOR FIRST,
-  // parameter-free and over REAL TOKENS ONLY, before anything else reads them.
-  let pairSource = pairIn;
-  let singleSource = singleIn;
-  let targetFeat = targetFeatIn;
-  let absent = null;
-  if (call.confidenceGlobalNorm === true) {
-    pairSource = keep(maskedGlobalNorm(execution, {
-      x: pairIn, mask: pairMask, rows: pairs, channels: pairChannels,
-    }).values);
-    singleSource = keep(maskedGlobalNorm(execution, {
-      x: singleIn, mask: seqMask, rows: tokens, channels: singleChannels,
-    }).values);
-    // ...and target_feat over the VENDOR's width, two columns wider than ours.
-    const normalised = maskedGlobalNorm(execution, {
-      x: targetFeatIn, mask: seqMask, rows: tokens, channels: w.targetFeatWidth,
-      vendorWidth: RF3_S_INPUTS_WIDTH,
-    });
-    targetFeat = keep(normalised.values);
-    absent = absentTargetFeatTerms(w, normalised, pairChannels);
-  }
-  call.onStage?.("globalNorm.pair", pairSource);
-  call.onStage?.("globalNorm.single", singleSource);
-  call.onStage?.("globalNorm.targetFeat", targetFeat);
-
-  // The target features, once along each axis - LEFT indexed by j, RIGHT by i.
-  const left = keep(linear(execution, {
-    x: targetFeat, weight: w.leftTargetFeatProject, rows: tokens,
-    inChannels: w.targetFeatWidth, outChannels: pairChannels, weightLayout: "in-major",
-  }));
-  const right = keep(linear(execution, {
-    x: targetFeat, weight: w.rightTargetFeatProject, rows: tokens,
-    inChannels: w.targetFeatWidth, outChannels: pairChannels, weightLayout: "in-major",
-  }));
-  call.onStage?.("embed.left", left);
-  call.onStage?.("embed.right", right);
-
-  // 🔴 THE BIN COUNT IS THE WEIGHT'S, so a bundle that disagrees with the
-  // dialect is a shape error rather than a silent prefix.
-  const caDgram = call.confidenceCaDgram === true;
-  const dgramBins = w.distogramFeatProject.elements / pairChannels;
-  if (dgramBins !== (caDgram ? CA_DGRAM_BINS : DGRAM_BINS)) {
-    for (const tensor of temporary) execution.release(tensor);
-    execution.release(pairMask);
-    throw new RangeError(
-      `af3 confidence: this bundle's distogram_feat_project has ${dgramBins} bins`
-      + ` and its dialect asks for ${caDgram ? CA_DGRAM_BINS : DGRAM_BINS}`);
-  }
-  const absentTensor = absent === null ? undefined : keep(execution.upload(
-    Float32Array.from([...absent.left, ...absent.right]), "af3.conf.absent"));
-  let pair = execution.allocate(pairs * pairChannels, "af3.conf.pair");
-  execution.dispatch({
-    source: assemblePairSource(
-      tokens, pairChannels, dgramBins, caDgram,
-      w.distanceFeatProject !== undefined, absentTensor !== undefined),
-    output: pair,
-    inputs: {
-      pairTex: pairSource, leftTex: left, rightTex: right, maskTex: pairMask,
-      positionsTex: pseudoBeta, dgramWeightTex: w.distogramFeatProject,
-      ...(w.distanceFeatProject === undefined
-        ? {} : { distanceWeightTex: w.distanceFeatProject }),
-      ...(absentTensor === undefined ? {} : { absentTex: absentTensor }),
-    },
-    label: `af3.conf.embed:${tokens}x${pairChannels}:${dgramBins}`
-      + `${caDgram ? ":ca" : ""}`,
-  });
-  call.onStage?.("embed.pair", pair);
-
-  // 🔴 AND THE TRUNK SINGLE IS CLAMPED AND NORMALISED BEFORE ANY USE. Both the
-  // pairformer and every head read the normalised one.
+  let pair;
   let single;
-  if (w.inputSingleNormScale === undefined) {
-    // 🔴 NO NORM MEANS NO CLAMP EITHER, AND THE CLAMP ALONE IS A WRECKING BALL.
-    // The clamp exists because protenix2 normalises here; AF3 uses the trunk's
-    // single RAW, and that single runs to a standard deviation of 211 with peaks
-    // far past 512. The first version of this branch clamped and copied - which
-    // is a no-op at the noise scale every gate drove it with and, on a real
-    // fold, took pLDDT from 75 to 6 while PAE and the coordinates stayed in
-    // band, because the pair half of a pairformer block never reads the single.
-    single = execution.allocate(tokens * singleChannels, "af3.conf.single");
-    execution.dispatch({
-      source: copyRowsSource(tokens * singleChannels),
-      output: single,
-      inputs: { aTex: singleSource, bTex: singleSource },
-      label: `af3.conf.single-copy:${tokens}x${singleChannels}`,
-    });
+  if (reembedding) {
+    ({ pair, single } = boltz2Reembed(execution, call, w, pairMask, epsilon));
   } else {
-    const clamped = execution.allocate(tokens * singleChannels, "af3.conf.clamped");
+    // 🔴 rf3 NORMALISES EVERY DETACHED TRUNK INPUT OVER THE WHOLE TENSOR FIRST,
+    // parameter-free and over REAL TOKENS ONLY, before anything else reads them.
+    let pairSource = pairIn;
+    let singleSource = singleIn;
+    let targetFeat = targetFeatIn;
+    let absent = null;
+    if (call.confidenceGlobalNorm === true) {
+      pairSource = keep(maskedGlobalNorm(execution, {
+        x: pairIn, mask: pairMask, rows: pairs, channels: pairChannels,
+      }).values);
+      singleSource = keep(maskedGlobalNorm(execution, {
+        x: singleIn, mask: seqMask, rows: tokens, channels: singleChannels,
+      }).values);
+      // ...and target_feat over the VENDOR's width, two columns wider than ours.
+      const normalised = maskedGlobalNorm(execution, {
+        x: targetFeatIn, mask: seqMask, rows: tokens, channels: w.targetFeatWidth,
+        vendorWidth: RF3_S_INPUTS_WIDTH,
+      });
+      targetFeat = keep(normalised.values);
+      absent = absentTargetFeatTerms(w, normalised, pairChannels);
+    }
+    call.onStage?.("globalNorm.pair", pairSource);
+    call.onStage?.("globalNorm.single", singleSource);
+    call.onStage?.("globalNorm.targetFeat", targetFeat);
+
+    // The target features, once along each axis - LEFT indexed by j, RIGHT by i.
+    const left = keep(linear(execution, {
+      x: targetFeat, weight: w.leftTargetFeatProject, rows: tokens,
+      inChannels: w.targetFeatWidth, outChannels: pairChannels, weightLayout: "in-major",
+    }));
+    const right = keep(linear(execution, {
+      x: targetFeat, weight: w.rightTargetFeatProject, rows: tokens,
+      inChannels: w.targetFeatWidth, outChannels: pairChannels, weightLayout: "in-major",
+    }));
+    call.onStage?.("embed.left", left);
+    call.onStage?.("embed.right", right);
+
+    // 🔴 THE BIN COUNT IS THE WEIGHT'S, so a bundle that disagrees with the
+    // dialect is a shape error rather than a silent prefix.
+    const caDgram = call.confidenceCaDgram === true;
+    const dgramBins = w.distogramFeatProject.elements / pairChannels;
+    if (dgramBins !== (caDgram ? CA_DGRAM_BINS : DGRAM_BINS)) {
+      for (const tensor of temporary) execution.release(tensor);
+      execution.release(pairMask);
+      throw new RangeError(
+        `af3 confidence: this bundle's distogram_feat_project has ${dgramBins} bins`
+        + ` and its dialect asks for ${caDgram ? CA_DGRAM_BINS : DGRAM_BINS}`);
+    }
+    const absentTensor = absent === null ? undefined : keep(execution.upload(
+      Float32Array.from([...absent.left, ...absent.right]), "af3.conf.absent"));
+    pair = execution.allocate(pairs * pairChannels, "af3.conf.pair");
     execution.dispatch({
-      source: clampSource(tokens * singleChannels, 512),
-      output: clamped,
-      inputs: { xTex: singleSource },
-      label: `af3.conf.clamp:${tokens}x${singleChannels}`,
+      source: assemblePairSource(
+        tokens, pairChannels, dgramBins, caDgram,
+        w.distanceFeatProject !== undefined, absentTensor !== undefined),
+      output: pair,
+      inputs: {
+        pairTex: pairSource, leftTex: left, rightTex: right, maskTex: pairMask,
+        positionsTex: pseudoBeta, dgramWeightTex: w.distogramFeatProject,
+        ...(w.distanceFeatProject === undefined
+          ? {} : { distanceWeightTex: w.distanceFeatProject }),
+        ...(absentTensor === undefined ? {} : { absentTex: absentTensor }),
+      },
+      label: `af3.conf.embed:${tokens}x${pairChannels}:${dgramBins}`
+        + `${caDgram ? ":ca" : ""}`,
     });
-    single = layerNorm(execution, {
-      x: clamped, weight: w.inputSingleNormScale, bias: w.inputSingleNormOffset,
-      rows: tokens, channels: singleChannels, epsilon,
-    });
-    execution.release(clamped);
+    call.onStage?.("embed.pair", pair);
+
+    // 🔴 AND THE TRUNK SINGLE IS CLAMPED AND NORMALISED BEFORE ANY USE. Both the
+    // pairformer and every head read the normalised one.
+    if (w.inputSingleNormScale === undefined) {
+      // 🔴 NO NORM MEANS NO CLAMP EITHER, AND THE CLAMP ALONE IS A WRECKING BALL.
+      // The clamp exists because protenix2 normalises here; AF3 uses the trunk's
+      // single RAW, and that single runs to a standard deviation of 211 with peaks
+      // far past 512. The first version of this branch clamped and copied - which
+      // is a no-op at the noise scale every gate drove it with and, on a real
+      // fold, took pLDDT from 75 to 6 while PAE and the coordinates stayed in
+      // band, because the pair half of a pairformer block never reads the single.
+      single = execution.allocate(tokens * singleChannels, "af3.conf.single");
+      execution.dispatch({
+        source: copyRowsSource(tokens * singleChannels),
+        output: single,
+        inputs: { aTex: singleSource, bTex: singleSource },
+        label: `af3.conf.single-copy:${tokens}x${singleChannels}`,
+      });
+    } else {
+      const clamped = execution.allocate(tokens * singleChannels, "af3.conf.clamped");
+      execution.dispatch({
+        source: clampSource(tokens * singleChannels, 512),
+        output: clamped,
+        inputs: { xTex: singleSource },
+        label: `af3.conf.clamp:${tokens}x${singleChannels}`,
+      });
+      single = layerNorm(execution, {
+        x: clamped, weight: w.inputSingleNormScale, bias: w.inputSingleNormOffset,
+        rows: tokens, channels: singleChannels, epsilon,
+      });
+      execution.release(clamped);
+    }
   }
   call.onStage?.("embed.single", single);
   yield { stage: "confidence.embed" };
@@ -847,6 +993,8 @@ export const rowSquaredSource = memoSource(rowSquaredSourceUncached);
 export const combineRowsSource = memoSource(combineRowsSourceUncached);
 export const affineAllSource = memoSource(affineAllSourceUncached);
 export const assemblePairSource = memoSource(assemblePairSourceUncached);
+export const outerProductRowsSource = memoSource(outerProductRowsSourceUncached);
+export const reembedPairSource = memoSource(reembedPairSourceUncached);
 export const copyRowsSource = memoSource(copyRowsSourceUncached);
 export const clampSource = memoSource(clampSourceUncached);
 export const symmetrisePairSource = memoSource(symmetrisePairSourceUncached);

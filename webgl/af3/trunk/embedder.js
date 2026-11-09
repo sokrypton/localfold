@@ -65,6 +65,12 @@ export const EMBEDDER_WEIGHTS = [
   "prevSingleEmbeddingNormScale", "prevSingleEmbeddingNormOffset", "prevSingleEmbedding",
 ];
 
+/** boltz2's three (webgpu/af3/trunk/embedder.js `hasBondTypes`, `hasDnRow`), each absent from every other bundle. */
+export const OPTIONAL_EMBEDDER_WEIGHTS = ["tokenBondsTypeEmbed", "boltz2DnMsa"];
+
+/** Boltz's DNA unknown: a DNA column's class 30, marked on the host where the bundle carries the row. */
+export const DN_CODE = 64;
+
 /**
  * The per-token identity the relative encoding reads: `[5][tokens]` holding the
  * residue index, the token index, then the asym, entity and symmetry ids.
@@ -93,18 +99,27 @@ export function tokenIdentity(features, tokens) {
  * the oracle's bond_embedding output is 0.0000 on this input. It is a real term
  * for ligands."
  */
-const bondEmbeddingSourceUncached = (tokens, pairChannels) => sized({ ELEMENTS: tokens * tokens * pairChannels }, `${PRELUDE}${ONE_TARGET}
+const bondEmbeddingSourceUncached = (tokens, pairChannels, bondTypes = false) => sized({ ELEMENTS: tokens * tokens * pairChannels }, `${PRELUDE}${ONE_TARGET}
 const int C4 = ${pairChannels / 4};
 uniform sampler2D pairTex;
 uniform sampler2D bondTex;
 uniform sampler2D weightTex;
+${bondTypes ? `uniform sampler2D orderTex;
+uniform sampler2D typeWeightTex;
+uniform sampler2D contactIndexTex;
+uniform sampler2D contactTableTex;` : ""}
 
 void main() {
   int texel = linearTexel();
   if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
   int group = texel % C4;
   int pair = texel / C4;
-  result = fetch4(pairTex, texel) + fetch1(bondTex, pair) * fetch4(weightTex, group);
+  result = fetch4(pairTex, texel) + fetch1(bondTex, pair) * fetch4(weightTex, group)${bondTypes ? `
+    // boltz2's bond ORDER (a row of seven, 0 for no bond - so every pair takes one) and its contact term: a row of the
+    // host-built table (shared/af3/featurise/constraints.js boltz2ContactTable), the unspecified constant alone without
+    // a pocket or contact constraint
+    + fetch4(typeWeightTex, clamp(int(fetch1(orderTex, pair)), 0, 6) * C4 + group)
+    + fetch4(contactTableTex, int(fetch1(contactIndexTex, pair)) * C4 + group)` : ""};
 }`);
 
 /** `pair[i][j][c] = left[i][c] + right[j][c]`. */
@@ -191,7 +206,7 @@ void main() {
  *     column 34  boltz2's `is_paired`, 1 on the QUERY ROW where it exists
  */
 const msaEmbedSourceUncached = (
-  sequences, tokens, width, msaChannels, pairedQueryRow,
+  sequences, tokens, width, msaChannels, pairedQueryRow, dnRow = false,
 ) => sized({ L: tokens, ELEMENTS: sequences * tokens * msaChannels }, `${PRELUDE}${ONE_TARGET}
 const int C4 = ${msaChannels / 4};
 const int WIDTH = ${width};
@@ -199,6 +214,7 @@ uniform sampler2D codeTex;
 uniform sampler2D deletionTex;
 uniform sampler2D weightTex;
 uniform sampler2D fromTargetTex;
+${dnRow ? "uniform sampler2D dnTex;" : ""}
 
 void main() {
   int texel = linearTexel();
@@ -211,6 +227,8 @@ void main() {
   vec4 total = fetch4(fromTargetTex, token * C4 + group);
   int code = int(fetch1(codeTex, row));
   if (code >= 0 && code < 32) total += fetch4(weightTex, code * C4 + group);
+${dnRow ? `  // boltz2's DN: a DNA column's class 30, marked ${DN_CODE} on the host - class 30's row plus Boltz's DNA-unknown one
+  if (code == ${DN_CODE}) total += fetch4(weightTex, 30 * C4 + group) + fetch4(dnTex, group);` : ""}
   float deletions = fetch1(deletionTex, row);
   total += clamp(deletions, 0.0, 1.0) * fetch4(weightTex, 32 * C4 + group);
   total += atan(deletions / 3.0) * (2.0 / 3.14159265358979323846)
@@ -237,11 +255,18 @@ export function uploadEmbedderWeights(execution, weights) {
     if (values === undefined) throw new Error(`af3 embedder weights: ${name} is missing`);
     out[name] = execution.uploadWeight(values, `w.af3.embed.${name}`);
   }
+  // boltz2's: the bond-order rows and the unconstrained contact term in z-init, and Boltz's DNA-unknown MSA row
+  for (const name of OPTIONAL_EMBEDDER_WEIGHTS) {
+    const values = weights[name];
+    if (values !== undefined && values !== null) out[name] = execution.uploadWeight(values, `w.af3.embed.${name}`);
+  }
   return out;
 }
 
 export function releaseEmbedderWeights(execution, weights) {
-  for (const name of EMBEDDER_WEIGHTS) execution.release(weights[name]);
+  for (const name of [...EMBEDDER_WEIGHTS, ...OPTIONAL_EMBEDDER_WEIGHTS]) {
+    if (weights[name] !== undefined) execution.release(weights[name]);
+  }
 }
 
 /**
@@ -320,13 +345,28 @@ export function embed(execution, call) {
   // The bond embedding, where the caller has a contact matrix. It reads the
   // pair and writes a new one rather than producing an update, because a
   // one-column Linear is cheaper fused than as an add.
+  // 🔴 boltz2 ADDS TWO MORE HERE, AND BOTH ARE LIVE ON A PLAIN PROTEIN: a bond-ORDER row (row 0 for every unbonded
+  // pair) and the unconstrained contact term - so its trunk was off from z_init until they were ported. A pocket or
+  // contact constraint replaces the second with a per-pair table, which this backend refuses (model/fold.js).
+  const bondTypes = w.tokenBondsTypeEmbed !== undefined;
+  if (bondTypes && (call.bondOrderMatrix === undefined || call.bondMatrix === undefined
+    || call.contactTerms === undefined)) {
+    throw new Error("af3 embed: this bundle's z-init reads the bond ORDER and a contact term (boltz2), so it needs"
+      + " bondMatrix, bondOrderMatrix (zeros where there are none) and contactTerms ({index, table})");
+  }
   if (call.bondMatrix !== undefined) {
     const bonded = execution.allocate(pairs * pairChannels, "af3.embed.bonded");
     execution.dispatch({
-      source: bondEmbeddingSource(tokens, pairChannels),
+      source: bondEmbeddingSource(tokens, pairChannels, bondTypes),
       output: bonded,
-      inputs: { pairTex: pair, bondTex: call.bondMatrix, weightTex: w.bondEmbedding },
-      label: `af3.embed.bonds:${tokens}x${pairChannels}`,
+      inputs: {
+        pairTex: pair, bondTex: call.bondMatrix, weightTex: w.bondEmbedding,
+        ...(bondTypes ? {
+          orderTex: call.bondOrderMatrix, typeWeightTex: w.tokenBondsTypeEmbed,
+          contactIndexTex: call.contactTerms.index, contactTableTex: call.contactTerms.table,
+        } : {}),
+      },
+      label: `af3.embed.bonds:${tokens}x${pairChannels}${bondTypes ? ":types" : ""}`,
     });
     execution.release(pair);
     pair = bonded;
@@ -361,11 +401,13 @@ export function embed(execution, call) {
   const msa = execution.allocate(rows * msaChannels, "af3.embed.msa");
   execution.dispatch({
     source: msaEmbedSource(
-      sequences, tokens, msaFeatureWidth, msaChannels, call.msaPairedQueryRow === true),
+      sequences, tokens, msaFeatureWidth, msaChannels, call.msaPairedQueryRow === true,
+      w.boltz2DnMsa !== undefined),
     output: msa,
     inputs: {
       codeTex: msaCodes, deletionTex: deletions,
       weightTex: w.msaActivations, fromTargetTex: fromTarget,
+      ...(w.boltz2DnMsa === undefined ? {} : { dnTex: w.boltz2DnMsa }),
     },
     label: `af3.embed.msa:${sequences}x${tokens}x${msaChannels}:${msaFeatureWidth}`,
   });

@@ -76,6 +76,29 @@ export const TEMPLATE_WEIGHTS = [
 ];
 
 /**
+ * The FUSED embedder's weights (boltz2, protenix2, mol1, rosettafold3): `v = z_proj(z_norm(z)) + a_proj(a)` over a
+ * concatenated feature row, the stack, `v_norm`, then `u_proj(relu(mean))` - cpu/af3/trunk/template.js's
+ * `fusedTemplateEmbedding`. `a_proj`'s rows are zero-padded to a multiple of four (109 and 66 are widths), and the
+ * features with them, which changes no sum.
+ */
+export const FUSED_TEMPLATE_WEIGHTS = [
+  "queryEmbeddingNormScale", "queryEmbeddingNormOffset", "zProjection", "aProjection",
+  "outputLayerNormScale", "outputLayerNormOffset", "outputLinear",
+];
+
+/** A feature width rounded up to whole texels: the fused path's columns and `a_proj`'s rows are padded to it. */
+export const paddedFeatureWidth = (width) => Math.ceil(width / 4) * 4;
+
+/** `[rows][width]` -> `[rows][padded]`, zeros in the new columns (a no-op copy when the width is already whole). */
+export function padFeatureRows(values, rows, width) {
+  const padded = paddedFeatureWidth(width);
+  if (padded === width) return values;
+  const out = new Float32Array(rows * padded);
+  for (let r = 0; r < rows; r += 1) out.set(values.subarray(r * width, (r + 1) * width), r * padded);
+  return out;
+}
+
+/**
  * One slot's nine features, summed into the stack's input in one draw.
  *
  * The aatype one-hots are gathers rather than matrix products - a 31-wide input
@@ -202,13 +225,18 @@ export function slotGeometry(input) {
  */
 export function uploadTemplateWeights(execution, weights) {
   /** @type {any} */
+  const fused = weights.fused === true;
   const out = {
     channels: weights.channels,
     queryChannels: weights.queryChannels,
+    fused,
+    featureWidth: fused ? paddedFeatureWidth(weights.featureWidth) : 0,
   };
-  for (const name of TEMPLATE_WEIGHTS) {
-    const values = weights[name];
+  for (const name of (fused ? FUSED_TEMPLATE_WEIGHTS : TEMPLATE_WEIGHTS)) {
+    let values = weights[name];
     if (values === undefined) throw new Error(`af3 template weights: ${name} is missing`);
+    // a_proj is [featureWidth][channels], in-major: padding the features pads its ROWS
+    if (name === "aProjection") values = padRows(values, weights.featureWidth, weights.channels);
     out[name] = execution.uploadWeight(values, `w.af3.template.${name}`);
   }
   out.blocks = weights.blocks.map((block) => ({
@@ -223,8 +251,17 @@ export function uploadTemplateWeights(execution, weights) {
   return out;
 }
 
+/** `[rows][columns]` with zero rows appended up to a multiple of four. */
+function padRows(values, rows, columns) {
+  const padded = paddedFeatureWidth(rows);
+  if (padded === rows) return values;
+  const out = new Float32Array(padded * columns);
+  out.set(values.subarray(0, rows * columns));
+  return out;
+}
+
 export function releaseTemplateWeights(execution, weights) {
-  for (const name of TEMPLATE_WEIGHTS) execution.release(weights[name]);
+  for (const name of (weights.fused ? FUSED_TEMPLATE_WEIGHTS : TEMPLATE_WEIGHTS)) execution.release(weights[name]);
   for (const block of weights.blocks) {
     releaseTriangleWeights(execution, block.triangleMultiplicationOutgoing);
     releaseTriangleWeights(execution, block.triangleMultiplicationIncoming);
@@ -256,6 +293,7 @@ export function* templateEmbeddingSteps(execution, call) {
   } = call;
   // `repeats[slot]`: how many slots this one's embedding stands for - 0 for a slot identical to an earlier one (empty,
   // the same restype codes), which then is not run at all; the earlier slot's embedding is weighted by the count
+  if (w.fused) return yield* fusedTemplateEmbeddingSteps(execution, call);
   const repeats = call.repeats ?? Array.from({ length: templates }, () => 1);
   const channels = w.channels;
   const queryChannels = w.queryChannels;
@@ -354,6 +392,93 @@ export function* templateEmbeddingSteps(execution, call) {
   // Divided by the SLOT COUNT, then a relu, then the projection.
   const averaged = scale(execution, summed, 1 / (1e-7 + templates));
   execution.release(summed);
+  const activated = relu(execution, averaged);
+  execution.release(averaged);
+  const out = linear(execution, {
+    x: activated, weight: w.outputLinear, rows: pairs,
+    inChannels: channels, outChannels: queryChannels, weightLayout: "in-major",
+  });
+  execution.release(activated);
+  out.label = "af3.template";
+  return out;
+}
+
+/**
+ * The FUSED embedder (boltz2, protenix2, mol1, rosettafold3), on the passes the caller built: `fusedPasses` is
+ * `[{features, repeat}]` - a pass's `[pairs][featureWidth]` columns (shared/af3/featurise/template-fused-features.js,
+ * padded) and how many slots it stands for - and `divisor` what the sum is divided by (every slot, or boltz2's present
+ * templates). Which passes exist is the dialect's and is decided host-side in model/fold.js, as webgpu/'s does.
+ *
+ *     v = z_proj(z_norm(z)) + a_proj(a);  v = stack(v) [+ v: templateStackOuterResidual];  v_norm;  sum * repeat
+ *     out = u_proj(relu(sum / divisor))
+ */
+function* fusedTemplateEmbeddingSteps(execution, call) {
+  const {
+    pair, pairMask, tokens, weights: w, fusedPasses, divisor, outerResidual = false,
+    swapTransposedBias = false, divideByLength = false, epsilon = 1e-5,
+  } = call;
+  const channels = w.channels;
+  const queryChannels = w.queryChannels;
+  const pairs = tokens * tokens;
+  // the query half does not depend on the slot: once
+  const normalised = layerNorm(execution, {
+    x: pair, weight: w.queryEmbeddingNormScale, bias: w.queryEmbeddingNormOffset,
+    rows: pairs, channels: queryChannels, epsilon, variance: "fast",
+  });
+  const queryTerm = linear(execution, {
+    x: normalised, weight: w.zProjection, rows: pairs,
+    inChannels: queryChannels, outChannels: channels, weightLayout: "in-major",
+  });
+  execution.release(normalised);
+  let summed;
+  for (let index = 0; index < fusedPasses.length; index += 1) {
+    const { features, repeat } = fusedPasses[index];
+    if (repeat === 0) continue;
+    const featureTerm = linear(execution, {
+      x: features, weight: w.aProjection, rows: pairs,
+      inChannels: w.featureWidth, outChannels: channels, weightLayout: "in-major",
+    });
+    const input = add(execution, queryTerm, featureTerm);
+    execution.release(featureTerm);
+    let act = input;
+    for (let block = 0; block < w.blocks.length; block += 1) {
+      act = pairHalf(execution, {
+        pair: act, pairMask, tokens, channels, weights: w.blocks[block],
+        swapTransposedBias, divideByLength, epsilon,
+      }, !(outerResidual && block === 0));
+    }
+    if (outerResidual) {
+      // boltz2 wraps the whole stack in a residual and protenix2 does not (cpu/af3/trunk/template.js)
+      const wrapped = add(execution, act, input);
+      execution.release(act);
+      execution.release(input);
+      act = wrapped;
+    }
+    let embedded = layerNorm(execution, {
+      x: act, weight: w.outputLayerNormScale, bias: w.outputLayerNormOffset,
+      rows: pairs, channels, epsilon, variance: "fast",
+    });
+    execution.release(act);
+    if (repeat !== 1) {
+      const weighted = scale(execution, embedded, repeat);
+      execution.release(embedded);
+      embedded = weighted;
+    }
+    if (summed === undefined) {
+      summed = embedded;
+    } else {
+      const next = add(execution, summed, embedded);
+      execution.release(summed);
+      execution.release(embedded);
+      summed = next;
+    }
+    yield { stage: "template", slot: index };
+  }
+  // boltz2 with no template: every pass weighs nothing and the term is u_proj(relu(0)) - zero (no bias)
+  if (summed === undefined) summed = execution.zeros(pairs * channels, "af3.template.summed");
+  const averaged = scale(execution, summed, 1 / (1e-7 + divisor));
+  execution.release(summed);
+  execution.release(queryTerm);
   const activated = relu(execution, averaged);
   execution.release(averaged);
   const out = linear(execution, {

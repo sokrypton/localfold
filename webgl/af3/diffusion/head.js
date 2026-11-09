@@ -356,6 +356,8 @@ export function* diffusionHeadSteps(execution, call) {
     conditioning, atomMask, refPos, refSpaceUid, gathers,
     shape: call.shape, weights: w.encoder,
     tokenAtomsAct: scaled,
+    // (rosettafold3's chirality index, built once a fold - model/fold.js)
+    ...(call.chiral === undefined ? {} : { chiral: call.chiral }),
     // The TRUNK's single conditions the atoms; the head's own conditions the
     // token transformer. Different tensors, and AF3 uses both.
     trunkSingleCond: trunkSingle,
