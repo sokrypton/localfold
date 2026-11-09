@@ -3533,3 +3533,9 @@ Bit-identical. AF3 (32- and 48-wide heads) neutral, 3799 -> 3795 ms; IntelliFold
 **17126 -> 16794 ms** over three rounds, trunk 12726 -> 12350. `--no-padded-logits` is the arm.
 The atom logits given the same (their 128 keys already divide by four, so the query hoisted out of the lane loop):
 neutral, 3792 -> 3798 ms - the compiler was already sharing those loads within a row. Not kept.
+
+Measured and NOT kept: the transition carried in planes end to end - the SwiGLU plane to plane (one render target a
+plane, no plane selected per fetch) and the down projection reading its x from those planes (`xPlanes` on the blocked
+kernel: row i of block q is plane i at texel row q). AF3 3796 -> 3797 ms, IntelliFold-2 16718 -> 16666: nothing. The
+`3481x2048` SwiGLU's ~8.6 ms a call is its size, not its plane selection, and the down projection gives up the padded
+float16 x it read before, which costs back what the layout pass saved.
