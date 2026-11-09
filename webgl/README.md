@@ -3458,3 +3458,11 @@ row-direction output projection returns `pair + projected` - two 3481 x 128 pass
 1292 -> 1269 ms. `--no-linear-epilogue` is the arm.
 Measured and NOT kept: the square 59 x 768 -> 768 blocked as well (any in x out >= 2^19 below 64 rows). Diffusion
 2596 -> 2589 ms median, inside the noise - unlike the 2:1 shape, the square one gains nothing from 4-row blocks.
+
+### The atom attention computed every logit eight times (kept)
+
+`atomAttentionSource` gives each fragment four channels of one (subset, query, head), so a 32-wide head's eight
+fragments each swept all 128 keys computing the same dot product, mask and bias. `atomAttentionPlanesSource` takes ONE
+fragment a head with its eight channel groups as render targets (query in registers, values as whole texels) and
+`interleavePlanesSource` gathers them back. The same arithmetic per channel; worst atom against WebGPU 0.129 -> 0.132
+A. Diffusion **2594 -> 2506 ms**, fold 4043 -> 3954 - under four seconds. `--no-atom-attend-planes` is the arm.
