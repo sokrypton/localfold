@@ -3504,3 +3504,9 @@ fragments, but each weight texel is reused by half as many rows. **6 rows** is s
 twice. Something reads a texel nothing wrote when the two heights differ and one is not a power of two - not chased,
 because no shipped rule picks 6 (the 4/8 rule has given byte-identical folds in every run). Do not trust
 `--block-rows=6` until it is.
+
+Kept, for large inputs: the confidence readout's two TM terms from ONE softmax sweep (`tmTermsFromLogits`,
+shared/heads/tm-score.js, bit-identical to `tmTermFromLogits` and `interfaceTmTerm` - test/tm-terms-fused.test.js), and
+the page's `fold-batch.js` reusing the terms `foldAf3` already returns instead of taking both again: four 64-bin softmax
+sweeps over every token pair became one. Nothing at 59 tokens (3813 against 3812 ms - a few milliseconds of host
+time); it grows as tokens^2, ~16 M exponentials a sweep at 500 tokens.
