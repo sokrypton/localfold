@@ -3595,3 +3595,6 @@ diffusion runs faster (2.17 against 2.34): every one turned off is slower there 
 `--no-grid-fused-projection` 1804, `--no-keep-planes` 1862. Priced by `--skip` in Safari: the blocked 3481-row
 projections ~440 ms (Chrome ~386), grid flash attention ~180, the 128 -> 128 one-texel projections ~170, LayerNorm ~100,
 contraction ~60 - the same ranking as Chrome, ~15% slower across the board rather than one kernel Safari dislikes.
+And `blockRowsFor`'s 4-row blocks below 128 rows, in Safari: `--block-rows=8` (which moves only those - the trunk's are
+8 already) is diffusion 2842 / 2764 ms against 2150 / 2166, fold 4569 / 4351 against 3697 / 3701. Four holds there
+by a wider margin than in Chrome.
