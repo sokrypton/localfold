@@ -3473,3 +3473,8 @@ is a function of its restype codes alone, so slots with the same codes give the 
 by how many it stands for (`repeats`). An occupied slot is never merged. A template-free AF3 fold runs one slot where
 it ran four: trunk 1266 -> 1212 ms, pLDDT, worst atom and relRms unchanged; OpenBind-0, whose first empty slot takes
 the gap restype, still agrees with WebGPU to 0.073 A. `--no-template-dedupe` is the arm.
+And past the stored logits, the VALUES: `--skip` put the two value draws at ~100 ms, and they ran 944 fragments (59
+queries x 16 heads), each walking every key - under-occupied. `attentionValuesSource` takes one fragment per output
+texel (11,328), the row's max then the weighted sum for its own four channels, written straight into the interleaved
+layout, so the second value draw and the interleave go too. The same softmax in two sweeps rather than online: worst
+atom against WebGPU 0.132 -> 0.109 A; diffusion 2504 -> 2481 ms. `--no-direct-values` is the arm.
