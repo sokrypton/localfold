@@ -3445,3 +3445,9 @@ Now two short draws first (`rowPartsSource`: 16 fragments a row, 12 texels each 
 the mean those sums give) and the blend reads 32 floats. The same two-pass formula, summed in 16 groups: pLDDT 94.01 ->
 94.02, worst atom 0.113 -> 0.122 A; diffusion 2706 -> 2639 ms. 48 and 8 parts were no better. `--no-adaln-parts` is
 the arm.
+
+Kept: below 64 rows a 2:1 in-major shape blocks too (it was 4:1). `--skip` priced the denoiser's 59 x 1536 -> 768
+down projection at ~350 ms of the diffusion, ~240 GFLOP/s one-texel where the blocked 768 -> 3072 runs ~550. Diffusion
+2637 -> 2587 ms over three interleaved rounds; relRms against WebGPU 8.1e-4 -> 9.1e-4 (x narrowed to float16 in the
+pad); IntelliFold-2 still agrees to 0.025 A. The square 768 -> 768 stays one-texel. "Square 59-row projections
+blocked" above was measured before `blockRowsFor` gave 59 rows 4-row blocks.

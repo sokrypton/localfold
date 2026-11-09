@@ -362,7 +362,9 @@ export const blockedApplies = (rows, inChannels, outChannels, weightLayout = "ou
   // `bench-webgl-linear.js --layout=in-major` on an M2: 59 x 768 -> 3072 is 2.34 ms one-texel, 1.23 ms at 64 rows
   // blocked (2x), while the square 768 -> 768 and 384 -> 768 lose to the repack (0.51 against 0.80, 0.30 against 0.68).
   // The aspect rule below decides that from 64 rows up already; this lets it decide from 8.
-  const wideShape = Math.max(inChannels, outChannels) >= 4 * Math.min(inChannels, outChannels);
+  // ...and 2:1 counts as wide since the denoiser's projections block in 4-row blocks (`blockRowsFor`): 59 x 1536 -> 768
+  // went 240 GFLOP/s one-texel, and the diffusion 2637 -> 2587 ms blocked (webgl/README.md)
+  const wideShape = Math.max(inChannels, outChannels) >= 2 * Math.min(inChannels, outChannels);
   if (rows < 64 && !(rows >= 8 && weightLayout === "in-major" && aspect && wideShape)) return false;
   if (weightLayout === "out-major") return true;
   if (!aspect) return inChannels * outChannels >= CACHE_RESIDENT_WEIGHT_FLOATS;
