@@ -3586,3 +3586,6 @@ the DIFFUSION - the stage they act on - is slower in every arm: base 2171 / 2198
 `--no-adaln-parts` 2387, `--no-split-few-fragments` 2314, `--no-keep-planes` 2317, `--no-atom-attend-split` 2333. (The
 trunk is too noisy in single Safari runs to rank them, 1416 to 1764 ms on the base alone.) So the choices hold there,
 and Safari's fold is now within ~10% of Chrome's.
+And the one Safari arm that read faster in a single run, `--no-split-few-fragments` (trunk 1613), over three
+alternating rounds: base 3816 / 3706 / 3700 ms against 3760 / 3744 / 3757, diffusion 2161-2174 against 2204-2221, trunk
+level. It holds in Safari as well.
