@@ -263,6 +263,7 @@ export function webglExecutionOptions(args, defaults = {}) {
     noOpmOuterFirst: flag(args, "no-opm-outer-first"),
     noGridFusedProjection: flag(args, "no-grid-fused-projection"),
     noKeepPlanes: flag(args, "no-keep-planes"),
+    noPrepaddedX: flag(args, "no-prepadded-x"),
     noFusedHalfCheck: flag(args, "no-fused-half-check"),
     noPaddedLogits: flag(args, "no-padded-logits"),
     twoSweepValues: flag(args, "two-sweep-values"),

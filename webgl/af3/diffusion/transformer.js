@@ -39,7 +39,7 @@ import { adaptiveLayerNorm, adaptiveZeroInit, elementwiseProductSource, sumSourc
   from "./atom-attention.js";
 import { attentionFlash } from "../../kernels/attention-flash.js";
 import { layerNorm } from "../../kernels/layer-norm.js";
-import { linear, planeFetchGlsl, planeInputs } from "../../kernels/linear.js";
+import { linear, linearPaddedStride4, planeFetchGlsl, planeInputs } from "../../kernels/linear.js";
 
 /** @typedef {import("../../runtime/storage.js").Tensor} Tensor */
 
@@ -100,9 +100,10 @@ void main() {
  * and which is free here: the denoiser's rows are its TOKENS, 59 at 59 residues, and a draw costs ~47 us before it
  * computes anything (`probe-webgl-draw-floor.js`). Three draws (statistics, apply, blend) become one, twice a block.
  */
-const blendSliceSourceUncached = (rows, channels, stride, parts = 0) => sized({ ROWS: rows }, `${PRELUDE}${ONE_TARGET}
+const blendSliceSourceUncached = (rows, channels, stride, parts = 0, outStride4 = channels / 4) => sized({ ROWS: rows }, `${PRELUDE}${ONE_TARGET}
 const int CHANNELS = ${channels};
 const int C4 = ${channels / 4};
+const int OUT4 = ${outStride4};
 const int STRIDE4 = ${stride / 4};
 const int PARTS = ${Math.max(parts, 1)};
 uniform sampler2D xTex;
@@ -113,10 +114,13 @@ uniform int shiftAt4;
 uniform float epsilon;
 
 void main() {
-  int texel = linearTexel();
-  if (texel >= ROWS * C4) { result = vec4(0.0); return; }
-  int row = texel / C4;
-  int c4 = texel % C4;
+  int target = linearTexel();
+  if (target >= ROWS * OUT4) { result = vec4(0.0); return; }
+  int row = target / OUT4;
+  int c4 = target % OUT4;
+  // ...an output laid at a wider stride than its row (the next projection's padded x): the tail is zeros
+  if (c4 >= C4) { result = vec4(0.0); return; }
+  int texel = row * C4 + c4;
   int base = row * C4;
 ${parts > 0 ? `  float total = 0.0;
   float spread = 0.0;
@@ -292,8 +296,11 @@ export const COND_BATCH_KEYS = ADALN_PREFIXES.flatMap((p) => [
 ]);
 
 /** `adaptiveLayerNorm` from a block's slice of the step's batched projections. */
-function blendFromBatch(execution, { x, rows, channels, epsilon, batch, which }) {
-  const out = execution.allocate(rows * channels, "af3.adaln.batched");
+function blendFromBatch(execution, { x, rows, channels, epsilon, batch, which, outStride4 = 0 }) {
+  // `outStride4`: written as the next projection's padded x (`linearPaddedStride4`), float16 where its pad would be
+  const out = outStride4 === 0 ? execution.allocate(rows * channels, "af3.adaln.batched")
+    : execution.halfActivations ? execution.allocateHalf(rows * outStride4 * 4, "af3.adaln.batched-padded")
+      : execution.allocate(rows * outStride4 * 4, "af3.adaln.batched-padded");
   const scaleAt = (batch.index * 4 + which * 2) * channels;
   // ...the row statistics in parts first (`rowPartsSource`), where the row divides into them
   const parts = !execution.noAdalnParts && (channels / 4) % ADALN_PARTS === 0 ? ADALN_PARTS : 0;
@@ -312,7 +319,7 @@ function blendFromBatch(execution, { x, rows, channels, epsilon, batch, which })
     });
   }
   execution.dispatch({
-    source: blendSliceSource(rows, channels, batch.scaleShiftWidth, parts),
+    source: blendSliceSource(rows, channels, batch.scaleShiftWidth, parts, outStride4 || channels / 4),
     output: out,
     inputs: { xTex: x, condTex: batch.scaleShift, ...(parts > 0 ? { sumTex: sums, squareTex: squares } : {}) },
     ints: { scaleAt4: scaleAt / 4, shiftAt4: (scaleAt + channels) / 4 },
@@ -446,18 +453,22 @@ export function conditionedTransition(execution, call) {
   // undefined weight, which at least throws; the danger is 'fixing' it by
   // renaming here and silently splitting the convention in two."
   const batch = call.condBatch;
+  // ...the batched AdaLN writes the up projection's padded x itself, where that projection would pad one
+  const xStride4 = cond !== undefined && batch !== undefined && !execution.noPrepaddedX
+    ? linearPaddedStride4(execution, { rows, inChannels: channels, outChannels: intermediate * 2, weightLayout: "in-major" })
+    : 0;
   const normalised = cond === undefined
     ? layerNorm(execution, {
       x, weight: w[`${prefix}ffwLayerNormScale`], bias: w[`${prefix}ffwLayerNormOffset`],
       rows, channels, epsilon,
     })
-    : batch !== undefined ? blendFromBatch(execution, { x, rows, channels, epsilon, batch, which: 1 })
+    : batch !== undefined ? blendFromBatch(execution, { x, rows, channels, epsilon, batch, which: 1, outStride4: xStride4 })
       : adaptiveLayerNorm(execution, {
         x, cond, rows, channels, condChannels, weights: w, prefix: `${prefix}ffw`, epsilon,
       });
   const wide = linear(execution, {
     x: normalised, weight: w[`${prefix}ffwTransition1`], rows,
-    inChannels: channels, outChannels: intermediate * 2, weightLayout: "in-major", keepPlanes: true,
+    inChannels: channels, outChannels: intermediate * 2, weightLayout: "in-major", keepPlanes: true, xStride4,
   });
   let gated = execution.allocate(rows * intermediate, "af3.difftx.swiglu");
   // ...reading the projection's row planes where it kept them, with no repack draw between
@@ -532,8 +543,12 @@ export function conditionedSelfAttention(execution, call) {
   }
   const width = heads * dimension;
   const batch = call.condBatch;
+  // ...the batched AdaLN writes the fused projection's padded x itself, where that projection would pad one
+  const xStride4 = batch !== undefined && w.qkvgProjection !== undefined && !execution.noPrepaddedX
+    ? linearPaddedStride4(execution, { rows: tokens, inChannels: channels, outChannels: 4 * width, weightLayout: "in-major" })
+    : 0;
   const x = batch !== undefined
-    ? blendFromBatch(execution, { x: act, rows: tokens, channels, epsilon, batch, which: 0 })
+    ? blendFromBatch(execution, { x: act, rows: tokens, channels, epsilon, batch, which: 0, outStride4: xStride4 })
     : adaptiveLayerNorm(execution, {
       x: act, cond, rows: tokens, channels, condChannels, weights: w, prefix: "", epsilon,
     });
@@ -548,7 +563,7 @@ export function conditionedSelfAttention(execution, call) {
     // ...one wide projection and one split, where four square ones did not block (`fuseQkvgWeights`)
     const fused = linear(execution, {
       x, weight: w.qkvgProjection, bias: w.qkvgBias, rows: tokens, inChannels: channels, outChannels: 4 * width,
-      weightLayout: "in-major", keepPlanes: true,
+      weightLayout: "in-major", keepPlanes: true, xStride4,
     });
     [query, key, value, gate] = ["q", "k", "v", "g"].map((part) => execution.allocate(tokens * width, `af3.difftx.${part}`));
     // ...reading the projection's row planes where it kept them, with no repack draw between
