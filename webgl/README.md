@@ -3496,3 +3496,11 @@ So the rule is occupancy, and it is stated as one: `attentionFlash` takes the lo
 wide for one draw OR for fewer than 4,096 (batch, query, head) fragments (`SPLIT_BELOW_FRAGMENTS`; 944 and 1,920
 gained, 13,924 lost). Diffusion 2452 -> 2418 ms with the trunk unmoved (the trunk's 944-fragment single attention is
 too small to show); `--no-split-few-fragments` is the arm.
+
+Measured and NOT kept: other block heights below 128 rows. **2 rows** is slower, diffusion 2425 -> 2824 ms: twice the
+fragments, but each weight texel is reused by half as many rows. **6 rows** is slower (2778) and, worse,
+🔴 **NONDETERMINISTICALLY WRONG**: with 6 below 128 rows and 8 above, the same fold came out at worst atom 9.1 A, 7.2 A,
+30.1 A and 0.13 A on four runs, with and without `--no-keep-planes`, while `--block-rows=6` forced everywhere was right
+twice. Something reads a texel nothing wrote when the two heights differ and one is not a power of two - not chased,
+because no shipped rule picks 6 (the 4/8 rule has given byte-identical folds in every run). Do not trust
+`--block-rows=6` until it is.
