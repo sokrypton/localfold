@@ -3510,3 +3510,9 @@ shared/heads/tm-score.js, bit-identical to `tmTermFromLogits` and `interfaceTmTe
 the page's `fold-batch.js` reusing the terms `foldAf3` already returns instead of taking both again: four 64-bin softmax
 sweeps over every token pair became one. Nothing at 59 tokens (3813 against 3812 ms - a few milliseconds of host
 time); it grows as tokens^2, ~16 M exponentials a sweep at 500 tokens.
+
+Measured and NOT kept: a half weight converted straight into its texture's padded float16 size, skipping `write`'s
+float32 padding copy. Upload 1379 -> 1393 ms in Chrome, nothing: the native conversion and `texSubImage2D` are the
+cost, not the copy. The upload's JavaScript, by `--js-profile` started before it: `write` (the texture upload) ~0.4 s,
+the float16 conversion ~0.35 s, `fitsFloat16` ~0.3 s, the int5 decode ~0.3 s, the fused-weight builders ~0.2 s - no
+single piece worth a pass of its own.
