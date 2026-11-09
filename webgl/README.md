@@ -3589,3 +3589,9 @@ and Safari's fold is now within ~10% of Chrome's.
 And the one Safari arm that read faster in a single run, `--no-split-few-fragments` (trunk 1613), over three
 alternating rounds: base 3816 / 3706 / 3700 ms against 3760 / 3744 / 3757, diffusion 2161-2174 against 2204-2221, trunk
 level. It holds in Safari as well.
+And the TRUNK switches in Safari, since its trunk runs ~15% slower than Chrome's (1.42 against 1.21 s) where its
+diffusion runs faster (2.17 against 2.34): every one turned off is slower there too - base 1401 / 1425 ms against
+`--no-triangle-fused-projection` 1526, `--no-repack-residual` 1615, `--no-linear-epilogue` 1674,
+`--no-grid-fused-projection` 1804, `--no-keep-planes` 1862. Priced by `--skip` in Safari: the blocked 3481-row
+projections ~440 ms (Chrome ~386), grid flash attention ~180, the 128 -> 128 one-texel projections ~170, LayerNorm ~100,
+contraction ~60 - the same ranking as Chrome, ~15% slower across the board rather than one kernel Safari dislikes.
