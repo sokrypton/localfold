@@ -263,6 +263,7 @@ export function webglExecutionOptions(args, defaults = {}) {
     noOpmOuterFirst: flag(args, "no-opm-outer-first"),
     noGridFusedProjection: flag(args, "no-grid-fused-projection"),
     noKeepPlanes: flag(args, "no-keep-planes"),
+    noAtomAttendPlanes: flag(args, "no-atom-attend-planes"),
     noLinearEpilogue: flag(args, "no-linear-epilogue"),
     noAdalnParts: flag(args, "no-adaln-parts"),
     noStoredLogits: flag(args, "no-stored-logits"),

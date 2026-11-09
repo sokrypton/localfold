@@ -43,7 +43,8 @@
  * Every one of those four has no default on either side.
  */
 import { elementwiseOpSource } from "../../runtime/elementwise.js";
-import { ONE_TARGET, PRELUDE, sized, part, memoSource } from "../../runtime/execution.js";
+import { ONE_TARGET, PRELUDE, sized, part, memoSource, targetDeclarations } from "../../runtime/execution.js";
+import { interleavePlanesSource } from "../../kernels/attention-flash.js";
 import { layerNorm } from "../../kernels/layer-norm.js";
 import { linear } from "../../kernels/linear.js";
 
@@ -291,6 +292,69 @@ ${wide
 }`);
 };
 
+/**
+ * `atomAttentionSource` with ONE fragment per (subset, query, head) and the head's `D / 4` channel groups as render
+ * targets - planes that `interleavePlanesSource` gathers back. The one-texel kernel gives each of a head's `D / 4`
+ * fragments the whole key sweep, so every logit was computed `D / 4` times (8 at AF3's 32-wide heads); here once.
+ * The same arithmetic in the same order per channel.
+ */
+const atomAttentionPlanesSourceUncached = (shape, keyMasked) => {
+  const { subsets, queries, keys, heads, dimension } = shape;
+  const width = heads * dimension;
+  const groups = dimension / 4;
+  const each = (body) => Array.from({ length: groups }, (_, g) => body(g)).join("\n");
+  return sized({ ROWS: subsets * queries * heads, QUERIES: queries, KEYS: keys, HEADS: heads, D: dimension, WIDTH: width }, `${PRELUDE}${targetDeclarations(groups)}
+uniform sampler2D qTex;
+uniform sampler2D kTex;
+uniform sampler2D vTex;
+uniform sampler2D queryMaskTex;
+uniform sampler2D keyMaskTex;
+uniform sampler2D pairLogitsTex;
+uniform float scale;
+
+void main() {
+  int rest = linearTexel();
+  if (rest >= ROWS) {
+${each((g) => `    result${g} = vec4(0.0);`)}
+    return;
+  }
+  int head = rest % HEADS;
+  int row = rest / HEADS;
+  int query = row % QUERIES;
+  int subset = row / QUERIES;
+
+  int queryIndex = subset * QUERIES + query;
+  int queryBase = queryIndex * WIDTH + head * D;
+  int biasBase = ((subset * HEADS + head) * QUERIES + query) * KEYS;
+  float queryMask = fetch1(queryMaskTex, queryIndex);
+${each((g) => `  vec4 q${g} = fetch4(qTex, queryBase / 4 + ${g});
+  vec4 acc${g} = vec4(0.0);`)}
+
+  float runningMax = -1e30;
+  float runningSum = 0.0;
+  for (int key = 0; key < KEYS; ++key) {
+    int keyIndex = subset * KEYS + key;
+    int keyBase = keyIndex * WIDTH + head * D;
+    float dot = 0.0;
+${each((g) => `    { vec4 k4 = fetch4(kTex, keyBase / 4 + ${g});
+      dot += q${g}.x * k4.x; dot += q${g}.y * k4.y;
+      dot += q${g}.z * k4.z; dot += q${g}.w * k4.w; }`)}
+    float keyMask = fetch1(keyMaskTex, keyIndex);
+    float maskBias = ${keyMasked
+    ? "-1e9 * ((1.0 - queryMask) + (1.0 - keyMask))"
+    : "1e9 * (queryMask - 1.0) * (keyMask - 1.0)"};
+    float logit = dot * scale + maskBias + fetch1(pairLogitsTex, biasBase + key);
+    float newMax = max(runningMax, logit);
+    float previousScale = exp(runningMax - newMax);
+    float weight = exp(logit - newMax);
+    runningSum = runningSum * previousScale + weight;
+    runningMax = newMax;
+${each((g) => `    acc${g} = acc${g} * previousScale + weight * fetch4(vTex, keyBase / 4 + ${g});`)}
+  }
+${each((g) => `  result${g} = acc${g} / runningSum;`)}
+}`);
+};
+
 /** `out[i] = base[i] + attended[i] + transition[i] * sigmoid(gate[i])`. */
 const blockOutputSourceUncached = (elements) => part({ ELEMENTS: elements }, {
   uniforms: ["sampler2D baseTex", "sampler2D attendedTex", "sampler2D transitionTex", "sampler2D gateTex"],
@@ -373,7 +437,30 @@ export function crossAttentionBlock(execution, call) {
   execution.release(xk);
 
   const gathered = execution.allocate(queryRows * width, "af3.atom.gathered");
-  execution.dispatch({
+  // ...one fragment a head, its channel groups as planes, where the groups fit the draw buffers
+  const groups = dimension / 4;
+  if (!execution.noAtomAttendPlanes && !execution.noAttendDot4 && dimension % 4 === 0
+    && groups <= execution.maxDrawBuffers) {
+    const planes = Array.from({ length: groups }, (_, g) => execution.allocate(queryRows * heads * 4, `af3.atom.plane${g}`));
+    execution.dispatch({
+      source: atomAttentionPlanesSource({ subsets, queries, keys, heads, dimension }, call.keyMaskedAtomAttention),
+      outputs: planes,
+      inputs: {
+        qTex: query, kTex: key, vTex: value,
+        queryMaskTex: queriesMask, keyMaskTex: keysMask, pairLogitsTex: pairLogits,
+      },
+      floats: { scale: 1 / Math.sqrt(dimension) },
+      label: `af3.atom.attend-planes:${subsets}x${queries}x${keys}x${width}`
+        + `${call.keyMaskedAtomAttention ? ":or" : ":and"}`,
+    });
+    execution.dispatch({
+      source: interleavePlanesSource(queryRows * width, dimension),
+      output: gathered,
+      inputs: Object.fromEntries(planes.map((plane, g) => [`plane${g}`, plane])),
+      label: `af3.atom.interleave:${dimension}`,
+    });
+    for (const plane of planes) execution.release(plane);
+  } else execution.dispatch({
     source: atomAttentionSource(
       { subsets, queries, keys, heads, dimension }, call.keyMaskedAtomAttention,
       execution.noAttendDot4),
@@ -648,6 +735,7 @@ export const adaptiveBlendSource = memoSource(adaptiveBlendSourceUncached);
 export const elementwiseProductSource = memoSource(elementwiseProductSourceUncached);
 export const gatherSource = memoSource(gatherSourceUncached);
 export const atomAttentionSource = memoSource(atomAttentionSourceUncached);
+export const atomAttentionPlanesSource = memoSource(atomAttentionPlanesSourceUncached);
 export const blockOutputSource = memoSource(blockOutputSourceUncached);
 export const swiGluSource = memoSource(swiGluSourceUncached);
 export const sumSource = memoSource(sumSourceUncached);
