@@ -3598,3 +3598,5 @@ contraction ~60 - the same ranking as Chrome, ~15% slower across the board rathe
 And `blockRowsFor`'s 4-row blocks below 128 rows, in Safari: `--block-rows=8` (which moves only those - the trunk's are
 8 already) is diffusion 2842 / 2764 ms against 2150 / 2166, fold 4569 / 4351 against 3697 / 3701. Four holds there
 by a wider margin than in Chrome.
+And `AF3_HALF_WEIGHT_FLOOR` (4096) in Safari: `--half-floor=65536` fold 3844 / 3832 ms against 3709 / 3770, trunk
+~1500 against ~1430; `--half-floor=1024` 3779 / 3710, level. 4096 holds.
