@@ -3681,3 +3681,16 @@ reusing a pooled texture up to a quarter taller (fails outright - ANGLE refuses 
 differ in size, 0x8CD9), and rounding every texture height to a quarter-octave class so near sizes share (6038 reuses
 against 6064 exact: the misses are CAPACITY, not near sizes). What would recover it is a pool that keeps the shapes a
 diffusion step reuses through the trunk-to-diffusion change, or a limit scaled to the fold's size; neither is done.
+
+### The page heard nothing from a WebGL2 fold until it ended (fixed)
+
+The page's progress line and its per-recycle contact map are driven by WebGPU's stage names (web/af3-model.js):
+`target-feat-start`, `trunk-stage` (embedder, template, msa-stack, pairformer, distogram), `pairformer-block-done`,
+`recycle-done` carrying the pass's contact map, `trunk-done`. The WebGL2 fold reported its own names - `recycle`,
+`embed`, `trunk` - so a reader saw "Trunk · 0%" for the whole trunk and no contact map until the fold returned
+(`fold-in-page.py --no-webgpu`: 3 status changes against WebGPU's 16). `foldAf3Steps` reports both sets now - the
+block reports at the trunk's own per-block yields, where the paced fold already pauses, and the contact map is one
+small read a pass - plus a yield after `target-feat-start` so "Preparing" paints. 15 status changes on WebGL2, the same
+sequence as WebGPU's but its "Trunk · preparing" (host work this fold does not do); Safari 16.3's page walks Preparing,
+embedder, templates, MSA stack, the pairformer's percentage and the distogram per pass. The fold is unchanged
+(pLDDT, worst atom, relRms to the digit; 7 s in Safari as before).
