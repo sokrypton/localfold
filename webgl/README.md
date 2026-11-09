@@ -3516,3 +3516,13 @@ float32 padding copy. Upload 1379 -> 1393 ms in Chrome, nothing: the native conv
 cost, not the copy. The upload's JavaScript, by `--js-profile` started before it: `write` (the texture upload) ~0.4 s,
 the float16 conversion ~0.35 s, `fitsFloat16` ~0.3 s, the int5 decode ~0.3 s, the fused-weight builders ~0.2 s - no
 single piece worth a pass of its own.
+
+Kept: both values kernels (`attentionValuesSource`, `atomValuesSource`) take the softmax ONLINE, in one sweep as the
+flash kernel does, where they swept each row's logits twice (the max, then the weighted sum) - each logit fetched once
+for one more exp a key. AF3: fold 3811 -> 3793 ms, diffusion 2416 -> 2401, worst atom 0.135 -> 0.129 A. IntelliFold-2
+(one run): trunk 12839 -> 12709, diffusion 3756 -> 3670. `--two-sweep-values` is the arm.
+
+And IntelliFold-2 checked against the three attention forms, since they were tuned on AF3: the direct values form is
+its best too, fold 17212 against 17570 (stored-logit planes) and 18798 (two flash draws). Its stage split moves 530 ms
+into the trunk and 200 out of the diffusion between those arms because the stage clocks are host-side; the GPU profile
+puts its diffusion attention at ~110 ms direct against ~205 planes, and the total is what counts.

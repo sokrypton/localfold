@@ -191,7 +191,7 @@ ${hasPairBias ? "    logit += fetch1(pairTex, (head * Q + q) * Q + k);" : ""}
  * each fragment takes the row's max, then the exponentials' sum and the weighted values, for its own four channels.
  * The same softmax, taken in two sweeps rather than online.
  */
-const attentionValuesSourceUncached = ({ batch, queries, heads, headDim, roundHalf = false }) => sized({ BATCH: batch, Q: queries, ELEMENTS: batch * queries * heads * headDim }, `${PRELUDE}
+const attentionValuesSourceUncached = ({ batch, queries, heads, headDim, roundHalf = false, twoSweep = false }) => sized({ BATCH: batch, Q: queries, ELEMENTS: batch * queries * heads * headDim }, `${PRELUDE}
 out vec4 result;
 const int HEADS = ${heads};
 const int HD4 = ${headDim / 4};
@@ -206,7 +206,8 @@ void main() {
   int bqh = texel / HD4;
   int head = bqh % HEADS;
   int b = (bqh / HEADS) / Q;
-  float rowMax = -1e30;
+  // ...the flash kernel's ONLINE softmax, one sweep: each logit is fetched once (two-sweep-values is the arm)
+${twoSweep ? `  float rowMax = -1e30;
   for (int k = 0; k < Q; ++k) rowMax = max(rowMax, fetch1(logitTex, bqh * Q + k));
   float total = 0.0;
   vec4 acc = vec4(0.0);
@@ -214,7 +215,18 @@ void main() {
     float weight = exp(fetch1(logitTex, bqh * Q + k) - rowMax);
     total += weight;
     acc += weight * fetch4(valueTex, ((b * Q + k) * HEADS + head) * HD4 + group);
-  }
+  }` : `  float rowMax = -1e30;
+  float total = 0.0;
+  vec4 acc = vec4(0.0);
+  for (int k = 0; k < Q; ++k) {
+    float logit = fetch1(logitTex, bqh * Q + k);
+    float newMax = max(rowMax, logit);
+    float previousScale = exp(rowMax - newMax);
+    float weight = exp(logit - newMax);
+    total = total * previousScale + weight;
+    rowMax = newMax;
+    acc = acc * previousScale + weight * fetch4(valueTex, ((b * Q + k) * HEADS + head) * HD4 + group);
+  }`}
   vec4 value = (acc / total) * fetch4(gateTex, texel);
   result = ${roundHalf ? "half4(value)" : "value"};
 }`);
@@ -356,7 +368,9 @@ export function attentionFlash(execution, call, into) {
     });
     const output = into ?? execution.allocate(elements, "attention.output");
     execution.dispatch({
-      source: attentionValuesSource({ batch, queries, heads, headDim, roundHalf: call.roundHalf === true }),
+      source: attentionValuesSource({
+        batch, queries, heads, headDim, roundHalf: call.roundHalf === true, twoSweep: execution.twoSweepValues,
+      }),
       output,
       inputs: { logitTex: logits, valueTex: value, gateTex: gate },
       label: `attention.values:${batch}x${queries}x${heads}x${headDim}`,
