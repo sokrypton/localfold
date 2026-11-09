@@ -137,7 +137,8 @@ ${perTarget((t) => {
  * too wide for one draw (`attentionFlashPlan`'s `draws > 1`) does not recompute them in every draw: its draws then read
  * the logit (`storedLogits`) and keep only the value accumulation, which is what each one is for.
  */
-const attentionLogitsSourceUncached = ({ batch, queries, heads, headDim, hasPairBias }) => {
+const attentionLogitsSourceUncached = ({ batch, queries, heads, headDim, hasPairBias, padded = false }) => {
+  if (padded) return paddedLogitsSource({ batch, queries, heads, headDim, hasPairBias });
   const groups = headDim / 4;
   const dot = Array.from({ length: groups },
     (_, g) => `      score += dot(fetch4(queryTex, queryBase + ${g}), fetch4(keyTex, keyBase + ${g}));`).join("\n");
@@ -191,10 +192,11 @@ ${hasPairBias ? "    logit += fetch1(pairTex, (head * Q + q) * Q + k);" : ""}
  * each fragment takes the row's max, then the exponentials' sum and the weighted values, for its own four channels.
  * The same softmax, taken in two sweeps rather than online.
  */
-const attentionValuesSourceUncached = ({ batch, queries, heads, headDim, roundHalf = false, twoSweep = false }) => sized({ BATCH: batch, Q: queries, ELEMENTS: batch * queries * heads * headDim }, `${PRELUDE}
+const attentionValuesSourceUncached = ({ batch, queries, heads, headDim, roundHalf = false, twoSweep = false, rowStride = queries }) => sized({ BATCH: batch, Q: queries, ELEMENTS: batch * queries * heads * headDim }, `${PRELUDE}
 out vec4 result;
 const int HEADS = ${heads};
 const int HD4 = ${headDim / 4};
+const int ROWSTRIDE = ${rowStride};
 uniform sampler2D logitTex;
 uniform sampler2D valueTex;
 uniform sampler2D gateTex;
@@ -208,18 +210,18 @@ void main() {
   int b = (bqh / HEADS) / Q;
   // ...the flash kernel's ONLINE softmax, one sweep: each logit is fetched once (two-sweep-values is the arm)
 ${twoSweep ? `  float rowMax = -1e30;
-  for (int k = 0; k < Q; ++k) rowMax = max(rowMax, fetch1(logitTex, bqh * Q + k));
+  for (int k = 0; k < Q; ++k) rowMax = max(rowMax, fetch1(logitTex, bqh * ROWSTRIDE + k));
   float total = 0.0;
   vec4 acc = vec4(0.0);
   for (int k = 0; k < Q; ++k) {
-    float weight = exp(fetch1(logitTex, bqh * Q + k) - rowMax);
+    float weight = exp(fetch1(logitTex, bqh * ROWSTRIDE + k) - rowMax);
     total += weight;
     acc += weight * fetch4(valueTex, ((b * Q + k) * HEADS + head) * HD4 + group);
   }` : `  float rowMax = -1e30;
   float total = 0.0;
   vec4 acc = vec4(0.0);
   for (int k = 0; k < Q; ++k) {
-    float logit = fetch1(logitTex, bqh * Q + k);
+    float logit = fetch1(logitTex, bqh * ROWSTRIDE + k);
     float newMax = max(rowMax, logit);
     float previousScale = exp(rowMax - newMax);
     float weight = exp(logit - newMax);
@@ -230,6 +232,61 @@ ${twoSweep ? `  float rowMax = -1e30;
   vec4 value = (acc / total) * fetch4(gateTex, texel);
   result = ${roundHalf ? "half4(value)" : "value"};
 }`);
+
+/**
+ * `attentionLogitsSource` with each row's keys padded to a multiple of four (`QP`), so a fragment owns one
+ * (batch, query, head) and four keys and fetches the query ONCE - where four lanes that could straddle two rows each
+ * fetched it again. The padded keys are never read. The same arithmetic per logit.
+ */
+function paddedLogitsSource({ batch, queries, heads, headDim, hasPairBias }) {
+  const groups = headDim / 4;
+  const qp = Math.ceil(queries / 4) * 4;
+  const load = Array.from({ length: groups }, (_, g) => `  vec4 q${g} = fetch4(queryTex, queryBase + ${g});`).join("\n");
+  const dot = Array.from({ length: groups },
+    (_, g) => `      score += dot(q${g}, fetch4(keyTex, keyBase + ${g}));`).join("\n");
+  return sized({ BATCH: batch, Q: queries, ROWS: batch * queries * heads }, `${PRELUDE}
+out vec4 result;
+const int HEADS = ${heads};
+const int HD4 = ${groups};
+const int QP4 = ${qp / 4};
+uniform sampler2D queryTex;
+uniform sampler2D keyTex;
+uniform sampler2D maskTex;
+${hasPairBias ? "uniform sampler2D pairTex;" : ""}
+uniform int transposeMask;
+uniform float scale;
+
+void main() {
+  int texel = linearTexel();
+  if (texel >= ROWS * QP4) { result = vec4(0.0); return; }
+  int bqh = texel / QP4;
+  int k0 = (texel - bqh * QP4) * 4;
+  int head = bqh % HEADS;
+  int bq = bqh / HEADS;
+  int q = bq % Q;
+  int b = bq / Q;
+  int queryBase = bqh * HD4;
+${load}
+  vec4 out4 = vec4(0.0);
+  for (int lane = 0; lane < 4; ++lane) {
+    int k = k0 + lane;
+    if (k >= Q) break;
+    int keyBase = ((b * Q + k) * HEADS + head) * HD4;
+    float score = 0.0;
+${dot}
+    score *= scale;
+    int maskIndex = transposeMask == 0 ? b * Q + k : k * BATCH + b;
+    float logit = score + 1e9 * (fetch1(maskTex, maskIndex) - 1.0);
+${hasPairBias ? "    logit += fetch1(pairTex, (head * Q + q) * Q + k);" : ""}
+    logit = clamp(logit, -1e8, 1e8);
+    if (lane == 0) out4.x = logit;
+    else if (lane == 1) out4.y = logit;
+    else if (lane == 2) out4.z = logit;
+    else out4.w = logit;
+  }
+  result = out4;
+}`);
+}
 
 /**
  * Gather `headDim / 4` planes into one `[batch][query][head][channel]` tensor.
@@ -355,9 +412,12 @@ export function attentionFlash(execution, call, into) {
     const { query, key, value, gate, mask, pairBias, transpose = false } = call;
     const scale = call.scale ?? 1 / Math.sqrt(headDim);
     const elements = batch * queries * heads * headDim;
-    const logits = execution.allocate(batch * queries * heads * queries, "attention.logits");
+    // ...rows padded to four keys, so a logit fragment fetches its query once (`--no-padded-logits` is the arm)
+    const padded = !execution.noPaddedLogits;
+    const rowStride = padded ? Math.ceil(queries / 4) * 4 : queries;
+    const logits = execution.allocate(batch * queries * heads * rowStride, "attention.logits");
     execution.dispatch({
-      source: attentionLogitsSource({ batch, queries, heads, headDim, hasPairBias: pairBias !== undefined }),
+      source: attentionLogitsSource({ batch, queries, heads, headDim, hasPairBias: pairBias !== undefined, padded }),
       output: logits,
       inputs: {
         queryTex: query, keyTex: key, maskTex: mask, ...(pairBias === undefined ? {} : { pairTex: pairBias }),
@@ -370,6 +430,7 @@ export function attentionFlash(execution, call, into) {
     execution.dispatch({
       source: attentionValuesSource({
         batch, queries, heads, headDim, roundHalf: call.roundHalf === true, twoSweep: execution.twoSweepValues,
+        rowStride,
       }),
       output,
       inputs: { logitTex: logits, valueTex: value, gateTex: gate },
