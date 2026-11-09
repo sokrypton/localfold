@@ -3652,3 +3652,24 @@ handed out its row planes (`keepPlanes`). The pair transition's up projection is
 asked for 160,000 x 1024 = 163.8 M floats - past this context's 134 M (2048 x MAX_TEXTURE_SIZE 16384 x 4) - and the fold
 died in `Storage.allocate`, though the planes it actually uses are an eighth of that each. The output is now allocated
 where it is written. 400 tokens folds; the 59-token fold is byte-identical (pLDDT, worst atom, relRms unchanged).
+
+### 🔴 The texture pool was too small to hold one projection's planes past ~250 tokens (512 MiB now)
+
+Profiled at 400 tokens, the trunk's 128-input blocked projections ran at ~100 GFLOP/s in the fold (128 -> 1024; ~600 at
+59 tokens) while `bench-webgl-linear.js` put the same kernel at 230-270 at that size. The difference was the POOL: a
+blocked projection writes eight row planes, ~80 MB each at 400 tokens, and `AF3_POOL_LIMIT_BYTES` (128 MiB) could not
+hold even one set, so every call created - and WebGL zero-filled - fresh textures. Same pLDDT in every arm:
+
+| fold | 128 MiB | 512 MiB |
+|---|---:|---:|
+| 400 tokens, 8 blocks, 1 step | 40.1 s / 1815 MiB | **18.9 s** / 1856 MiB |
+| 250 tokens, 8 blocks, 1 step | 5.73 s / 1004 MiB | **4.50 s** / 1347 MiB |
+| 250 tokens, 48 blocks, 1 step | 18.8 s / 1276 MiB | **15.8 s** / 1619 MiB |
+| 150 tokens, the whole fold | 15.1 s / 1093 MiB | **13.4 s** / 1432 MiB |
+| 59 tokens + 128 rows, the whole fold | 3246 ms / 936 MiB | 3241 ms / 988 MiB |
+
+4 GiB took the 400-token case to 16.3 s at a 4738 MiB peak; 512 is where the curve flattens for its memory.
+`--pool-mib=128` is the old arm. (Both 59-token arms read ~3.25 s in that session against ~3.74 earlier in the day -
+machine drift, which the interleaved A/B controls for.)
+
+And a fold past ~362 tokens could not run at all - see the section above on `linear`'s output, fixed in the same pass.

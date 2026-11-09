@@ -46,8 +46,15 @@ export function webgl2FoldAvailable() {
  * at 59 residues and 79.8 -> 65.4 s at 200, bit-identical. Unbounded that cost 1225 -> 1807 MiB of peak at 200, the
  * growth that made pooling a loss on bioemu2; bounded at 128 MiB it is 68.2 s at 1244 MiB (Chrome, M2,
  * tools/gpu/fold-af3-webgl.js). `--no-pool` on that tool is the control arm.
+ *
+ * 🔴 AND 128 MiB WAS TOO SMALL TO HOLD ONE PROJECTION'S PLANES PAST ~250 TOKENS, SO EVERY ONE WAS A FRESH TEXTURE AGAIN.
+ * A blocked projection writes eight row planes, each `rows / 8 x outChannels` - ~80 MB each for the pair transition's
+ * up projection at 400 tokens - and a pool that cannot hold them creates and zero-fills them on every call: the trunk's
+ * 128-input projections fell from ~600 GFLOP/s at 59 tokens to ~100 at 400 in the fold while the same kernel benched at
+ * 230-270. At 512 MiB (8 trunk blocks, 1 step): 400 tokens 40.1 -> 18.9 s at +41 MiB of peak (1856), 250 tokens
+ * 5.73 -> 4.50 s at +343 (1347), 59 tokens level at +52 (988). 4 GiB took 400 tokens to 16.3 s at a 4738 MiB peak.
  */
-export const AF3_POOL_LIMIT_BYTES = 128 * 2 ** 20;
+export const AF3_POOL_LIMIT_BYTES = 512 * 2 ** 20;
 
 /**
  * The smallest weight the AF3 fold holds in float16 (`Storage.halfWeightFloor`), where the backend's default is 65,536.
