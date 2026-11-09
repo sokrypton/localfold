@@ -3694,3 +3694,16 @@ small read a pass - plus a yield after `target-feat-start` so "Preparing" paints
 sequence as WebGPU's but its "Trunk · preparing" (host work this fold does not do); Safari 16.3's page walks Preparing,
 embedder, templates, MSA stack, the pairformer's percentage and the distogram per pass. The fold is unchanged
 (pLDDT, worst atom, relRms to the digit; 7 s in Safari as before).
+
+Checked across the page's whole menu (`fold-in-page.py --no-webgpu` against the same without, Chrome; and Safari 16.3's
+page): AlphaFold 3, OpenBind-0 and IntelliFold-2 single sequence, and AlphaFold 3 with an MMseqs2 search, an uploaded
+template, a ligand (GOL) and a modified residue (SEP@3) - each gives WebGPU's status sequence (WebGPU's own
+"Trunk · preparing" aside), the same final-status details and both maps, and the heatmap shows the trunk's contacts
+before the first frame on both (`--trunk-lines`). Every other family refuses by name in WebGL2 ("Boltz-2 needs WebGPU,
+which this browser does not have. AlphaFold 3, OpenBind-0, IntelliFold-2 fold here in WebGL2 instead").
+
+🔴 **ONE UNREPRODUCED HANG.** One OpenBind-0 fold on Safari's page, at the end of a long run of browser sessions, ran its
+MSA stack in 15.5 s (~0.2 s normally) and then stalled at "Trunk 1/2 · 6%" until the driver's 600 s timeout. The same
+fold before the progress change and four times after it (with page errors and unhandled rejections captured: none)
+completed in 6-7 s. Not reproduced, so not fixed - if it recurs, `fold-in-safari-debug`'s error capture is the first
+instrument.
