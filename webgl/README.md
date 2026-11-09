@@ -3539,3 +3539,6 @@ plane, no plane selected per fetch) and the down projection reading its x from t
 kernel: row i of block q is plane i at texel row q). AF3 3796 -> 3797 ms, IntelliFold-2 16718 -> 16666: nothing. The
 `3481x2048` SwiGLU's ~8.6 ms a call is its size, not its plane selection, and the down projection gives up the padded
 float16 x it read before, which costs back what the layout pass saved.
+Measured and NOT kept: the split LayerNorm from 512 channels (it starts at 768), for IntelliFold-2's `3481x512:fast`
+pair norm - the shape the threshold table never priced under the fast variance. IntelliFold-2 16738 -> 16840 ms,
+slightly worse; the 768 threshold stands.
