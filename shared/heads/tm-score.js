@@ -314,6 +314,53 @@ export function chainTmInfo(chainOf, live, binCentres, counted = undefined) {
 }
 
 /**
+ * `tmTermFromLogits` and `interfaceTmTerm` in ONE sweep over the logits: each
+ * pair's softmax is taken once and both expectations read it. The same
+ * arithmetic in the same order as the two separately - the max by comparison,
+ * one exp a bin, the sums in bin order - so both terms are bit-identical to
+ * theirs; a confidence readout spent ~100 ms of host time taking the 64-bin
+ * softmax over every pair twice.
+ *
+ * @returns {{adjusted: Float64Array, interface: Float32Array}}
+ */
+export function tmTermsFromLogits(logits, tokens, tmPerBin, info) {
+  const bins = tmPerBin.length;
+  if (logits.length !== tokens * tokens * bins) {
+    throw new RangeError(`PAE logits should be ${tokens * tokens * bins} long,`
+      + ` not ${logits.length}`);
+  }
+  const chains = info[tokens];
+  const adjusted = new Float64Array(tokens * tokens);
+  const interfaceTerm = new Float32Array(tokens * tokens);
+  for (let i = 0; i < tokens; i += 1) {
+    const a = info[i];
+    for (let j = 0; j < tokens; j += 1) {
+      const b = info[j];
+      const live = a >= 0 && b >= 0;
+      const pair = i * tokens + j;
+      const base = pair * bins;
+      const table = live ? tokens + 1 + (a * chains + b) * bins : 0;
+      let largest = Number.NEGATIVE_INFINITY;
+      for (let bin = 0; bin < bins; bin += 1) {
+        if (logits[base + bin] > largest) largest = logits[base + bin];
+      }
+      let denominator = 0;
+      let global = 0;
+      let local = 0;
+      for (let bin = 0; bin < bins; bin += 1) {
+        const probability = Math.exp(logits[base + bin] - largest);
+        denominator += probability;
+        global += probability * tmPerBin[bin];
+        if (live) local += probability * info[table + bin];
+      }
+      adjusted[pair] = global / denominator;
+      if (live) interfaceTerm[pair] = local / denominator;
+    }
+  }
+  return { adjusted, interface: interfaceTerm };
+}
+
+/**
  * The interface TM term on the host, off PAE logits [tokens^2, bins] and a
  * chainTmInfo - the shaders' arithmetic, for the readouts' host reference.
  */

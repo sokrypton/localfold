@@ -22,7 +22,7 @@ import { Execution } from "../../runtime/execution.js";
 import { foldAf3Async, releaseAf3Weights, uploadAf3WeightsSteps } from "./fold.js";
 import { drainAsync, laggedPause } from "../../runtime/steps.js";
 import { gatherRows, msaDrawRows, msaNativeRows } from "../../../shared/af3/msa-draw.js";
-import { af3TmScores, chainTmInfo, interfaceTmTerm, tmPerBinFor, tmScoreD0, tmTermFromLogits, tokenFrameMask }
+import { af3TmScores, chainTmInfo, tmPerBinFor, tmScoreD0, tmTermsFromLogits, tokenFrameMask }
   from "../../../shared/heads/tm-score.js";
 import { errorBinCentres, MAX_ERROR_BIN, NUM_BINS } from "../confidence/confidence.js";
 import { backboneGeometry } from "../../../webgpu/af3/fold.js";
@@ -175,12 +175,15 @@ export async function foldBatchWebGl2(batch, weights, options) {
   let meanPlddt;
   if (fold.paeLogits !== undefined) {
     // As WebGPU's head computes it: one d0 over every token, the expectation over the PAE bins.
-    const tmPerBin = tmPerBinFor(errorBinCentres(NUM_BINS, MAX_ERROR_BIN), tmScoreD0(tokens));
-    const tmAdjusted = tmTermFromLogits(fold.paeLogits, tokens, tmPerBin);
     // ...and AF3's interface term for the chain-level scores (d0 from the pair's own chains), anchored, as pTM is,
-    // on the tokens with frames - webgpu/af3/fold.js's reduction (reported by Yeqing Lin)
-    const tmInterface = interfaceTmTerm(fold.paeLogits, tokens,
-      chainTmInfo(asymId, seqMask, errorBinCentres(NUM_BINS, MAX_ERROR_BIN)));
+    // on the tokens with frames - webgpu/af3/fold.js's reduction (reported by Yeqing Lin). `foldAf3` has already
+    // taken both from these logits with these chains (`tmTermsFromLogits`), so they are reused, not taken again.
+    const { tmAdjusted, tmInterface } = fold.tmAdjusted !== undefined && fold.tmInterface !== undefined
+      ? fold
+      : (({ adjusted, interface: chained }) => ({ tmAdjusted: adjusted, tmInterface: chained }))(
+        tmTermsFromLogits(fold.paeLogits, tokens,
+          tmPerBinFor(errorBinCentres(NUM_BINS, MAX_ERROR_BIN), tmScoreD0(tokens)),
+          chainTmInfo(asymId, seqMask, errorBinCentres(NUM_BINS, MAX_ERROR_BIN))));
     scores = { plddt: fold.plddt, pae: fold.pae, tmAdjusted, tmInterface };
     const frame = tokenFrameMask({ tokens, dense, isLigand: batch.isLigand, asymId,
       residueIndex: batch.residueIndex, refPos: batch.refPos, refMask: batch.refMask });
