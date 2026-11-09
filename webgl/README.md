@@ -3451,3 +3451,8 @@ down projection at ~350 ms of the diffusion, ~240 GFLOP/s one-texel where the bl
 2637 -> 2587 ms over three interleaved rounds; relRms against WebGPU 8.1e-4 -> 9.1e-4 (x narrowed to float16 in the
 pad); IntelliFold-2 still agrees to 0.025 A. The square 768 -> 768 stays one-texel. "Square 59-row projections
 blocked" above was measured before `blockRowsFor` gave 59 rows 4-row blocks.
+
+Kept: the one-texel projection takes the residual in its own epilogue (`base + value`, and `base + value * multiplier`
+with `linear`'s new `multiplier`), so the triangle's output projection returns `pair + projected * gate` and the grid's
+row-direction output projection returns `pair + projected` - two 3481 x 128 passes a block gone. Bit-identical; trunk
+1292 -> 1269 ms. `--no-linear-epilogue` is the arm.
