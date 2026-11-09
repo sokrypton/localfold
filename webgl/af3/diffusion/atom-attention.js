@@ -410,7 +410,7 @@ void main() {
 }`);
 };
 
-const atomValuesSourceUncached = (shape) => {
+const atomValuesSourceUncached = (shape, twoSweep = false) => {
   const { subsets, queries, keys, heads, dimension } = shape;
   return sized({ TEXELS: subsets * queries * heads * dimension / 4, QUERIES: queries, KEYS: keys, HEADS: heads, D4: dimension / 4, W4: heads * dimension / 4 }, `${PRELUDE}${ONE_TARGET}
 uniform sampler2D logitTex;
@@ -426,7 +426,7 @@ void main() {
   int query = queryIndex % QUERIES;
   int subset = queryIndex / QUERIES;
   int logitBase = ((subset * HEADS + head) * QUERIES + query) * KEYS;
-  float rowMax = -1e30;
+${twoSweep ? `  float rowMax = -1e30;
   for (int key = 0; key < KEYS; ++key) rowMax = max(rowMax, fetch1(logitTex, logitBase + key));
   float total = 0.0;
   vec4 acc = vec4(0.0);
@@ -434,7 +434,19 @@ void main() {
     float weight = exp(fetch1(logitTex, logitBase + key) - rowMax);
     total += weight;
     acc += weight * fetch4(vTex, (subset * KEYS + key) * W4 + head * D4 + group);
-  }
+  }` : `  // ...online, one sweep, each logit fetched once
+  float rowMax = -1e30;
+  float total = 0.0;
+  vec4 acc = vec4(0.0);
+  for (int key = 0; key < KEYS; ++key) {
+    float logit = fetch1(logitTex, logitBase + key);
+    float newMax = max(rowMax, logit);
+    float previousScale = exp(rowMax - newMax);
+    float weight = exp(logit - newMax);
+    total = total * previousScale + weight;
+    rowMax = newMax;
+    acc = acc * previousScale + weight * fetch4(vTex, (subset * KEYS + key) * W4 + head * D4 + group);
+  }`}
   result = acc / total;
 }`);
 };
@@ -534,7 +546,7 @@ export function crossAttentionBlock(execution, call) {
       label: `af3.atom.logits:${subsets}x${queries}x${keys}x${width}${call.keyMaskedAtomAttention ? ":or" : ":and"}`,
     });
     execution.dispatch({
-      source: atomValuesSource(shape),
+      source: atomValuesSource(shape, execution.twoSweepValues),
       output: gathered,
       inputs: { logitTex: logits, vTex: value },
       label: `af3.atom.values:${subsets}x${queries}x${keys}x${width}`,
