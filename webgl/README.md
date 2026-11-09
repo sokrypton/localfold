@@ -3574,3 +3574,7 @@ written. Not worth writing on that number.
 Measured and NOT kept: the column grid attention's transpose back as transposed x rows in the output projection's
 epilogue (`transposeRows`), dropping `transposedAddSource`'s draw. Bit-identical, trunk 1210 -> 1204 ms - inside the
 noise; that add was already one cheap pass.
+Measured and NOT kept, the occupancy fix for that: the fast variance's sums in 16 parts a row, a stats pass over the
+parts, then the same apply (three draws, every fragment short). IntelliFold-2 16746 -> 16870 ms, still worse. At 128
+texels a row the one-pass kernel's redundant reads are cheaper than any split of it; the 768 threshold stands on two
+measurements now.
