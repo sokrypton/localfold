@@ -3602,3 +3602,7 @@ And `AF3_HALF_WEIGHT_FLOOR` (4096) in Safari: `--half-floor=65536` fold 3844 / 3
 ~1500 against ~1430; `--half-floor=1024` 3779 / 3710, level. 4096 holds.
 And `AF3_POOL_LIMIT_BYTES` (128 MiB) in Safari: `--pool-mib=64` fold 3927 / 3791 ms against 3697 / 3719, peak 884 MiB
 against 939; `--pool-mib=256` 3760 / 3692, level, at a 1013 MiB peak. 128 holds.
+And IntelliFold-2 in Safari: `--no-direct-values` fold 17813 / 17733 ms against 17545 / 16808 - holds. The padded
+logits read mixed there in one pair of runs (the diffusion 80-140 ms better unpadded), AF3 in Safari put the
+difference at ~10 ms over three rounds, and padding scoped to the grid attention alone came out level with padding
+everywhere (IntelliFold-2 diffusion 2613 / 2569 against 2582 / 2575). Noise; the padding stays as it is.
