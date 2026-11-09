@@ -337,7 +337,9 @@ export function attentionFlash(execution, call, into) {
   const { batch, queries, heads, headDim } = call;
   // ...a head too wide for one draw: its logits once, then its values one fragment an output texel (no planes)
   const plan0 = attentionFlashPlan(headDim, execution.maxDrawBuffers);
-  if (plan0.draws > 1 && !execution.noStoredLogits && !execution.noDirectValues) {
+  // ...and a head that fits one draw but leaves the device short of fragments (the trunk's single attention: 59 x 16)
+  const fewFragments = batch * queries * heads < SPLIT_BELOW_FRAGMENTS && !execution.noSplitFewFragments;
+  if ((plan0.draws > 1 || fewFragments) && !execution.noStoredLogits && !execution.noDirectValues) {
     const { query, key, value, gate, mask, pairBias, transpose = false } = call;
     const scale = call.scale ?? 1 / Math.sqrt(headDim);
     const elements = batch * queries * heads * headDim;
@@ -381,4 +383,6 @@ export function attentionFlash(execution, call, into) {
 export const attentionFlashSource = memoSource(attentionFlashSourceUncached);
 export const attentionLogitsSource = memoSource(attentionLogitsSourceUncached);
 export const attentionValuesSource = memoSource(attentionValuesSourceUncached);
+/** Below this many (batch, query, head) fragments the flash draw is short of work: 944 and 1,920 gained, 13,924 lost. */
+const SPLIT_BELOW_FRAGMENTS = 4096;
 export const interleavePlanesSource = memoSource(interleavePlanesSourceUncached);
