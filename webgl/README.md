@@ -3438,3 +3438,10 @@ ms**, fold 4325 -> 4185, every round ahead. `check-webgl-attention.js`'s 64-wide
 `--no-stored-logits` is the arm.
 And the triangle's fused 128 -> 512 projection keeps its planes for the operand draw (`linear.repack:3481x512` gone).
 Bit-identical; trunk 1307 -> 1276 ms against the previous commit, every round.
+
+Kept: the batched AdaLN's row statistics in parts. `--skip=af3.adaln.fused` priced the draw at ~200 ms of a 2.7 s
+diffusion, because every one of its 59 x 192 fragments walked its 768-wide row twice for the two-pass mean and variance.
+Now two short draws first (`rowPartsSource`: 16 fragments a row, 12 texels each - the plain sums, then the squares about
+the mean those sums give) and the blend reads 32 floats. The same two-pass formula, summed in 16 groups: pLDDT 94.01 ->
+94.02, worst atom 0.113 -> 0.122 A; diffusion 2706 -> 2639 ms. 48 and 8 parts were no better. `--no-adaln-parts` is
+the arm.
