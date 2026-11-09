@@ -3564,3 +3564,6 @@ down projection). Bit-identical; diffusion 2377 -> 2351 ms. `--no-linear-gate-sl
 And the atom attention's gate: projected before the attention, so `atomValuesSource` multiplies it in as it writes, as
 the flash kernel does - the `af3.atom.gate` draw goes. Bit-identical; fold 3747 -> 3737 ms, every round.
 `--no-atom-gate-in-values` is the arm.
+Measured and NOT kept: the atom block's residual tail through the projection epilogue (the attention's output
+projection returning `base + projected * gate`, the block's output `that + transition * sigmoid(gate)` from the down
+projection - five draws to two). Fold 3735 -> 3736 ms: nothing, at 480 x 128 a pass costs nothing worth removing.
