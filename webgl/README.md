@@ -3673,3 +3673,11 @@ hold even one set, so every call created - and WebGL zero-filled - fresh texture
 machine drift, which the interleaved A/B controls for.)
 
 And a fold past ~362 tokens could not run at all - see the section above on `linear`'s output, fixed in the same pass.
+
+Measured and NOT kept, and OPEN: at 400 tokens even 512 MiB still churns. The denoiser's per-step conditioning
+projection (`400x384x73728`, its output and planes ~236 MB together) is 267 ms a call at 512 MiB and **38 ms** at
+2 GiB - over 25 steps that is ~5.7 s of a 400-token fold. Two pool rules were tried to recover it without the memory:
+reusing a pooled texture up to a quarter taller (fails outright - ANGLE refuses a multi-target draw whose attachments
+differ in size, 0x8CD9), and rounding every texture height to a quarter-octave class so near sizes share (6038 reuses
+against 6064 exact: the misses are CAPACITY, not near sizes). What would recover it is a pool that keeps the shapes a
+diffusion step reuses through the trunk-to-diffusion change, or a limit scaled to the fold's size; neither is done.
