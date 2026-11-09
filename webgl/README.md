@@ -3481,3 +3481,7 @@ atom against WebGPU 0.132 -> 0.109 A; diffusion 2504 -> 2481 ms. `--no-direct-va
 Measured and NOT kept: the trunk's single attention fused the same way (four 59 x 384 -> 384 as one 384 -> 1536,
 blocked, split from its planes). Trunk 1219 -> 1207 ms, inside the noise, and not bit-identical; the four were ~58 ms
 of a fold by `--skip`, against ~0.9 s for the denoiser's four.
+Measured and NOT kept: the grid attention's output projection (and its residual, either direction) reading the flash
+planes directly - interleave, projection and add as one draw. Bit-identical and SLOWER, trunk 1212 -> 1279 ms: inside
+the projection's k loop, eight plane textures read per head lose the locality of one contiguous row, which costs more
+than the 3481 x 128 interleave pass it removes. The denoiser's version (above) was neutral for the same reason.
