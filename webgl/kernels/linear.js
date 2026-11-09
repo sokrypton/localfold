@@ -746,8 +746,12 @@ export function linear(execution, call, into) {
   if (bias !== undefined && bias.elements !== outChannels) {
     throw new RangeError(`linear: bias holds ${bias.elements} floats, not ${outChannels}`);
   }
-  const output = into ?? execution.allocate(rows * outChannels, "linear");
-  if (output === x) {
+  // ...allocated where it is written, not here: a projection that hands out its row planes (`keepPlanes`) never
+  // writes it, and a pair transition's 4x-wide up projection at 362+ tokens is past this context's texture capacity
+  // whole while each of its planes is an eighth of that
+  let output = into;
+  const outputTensor = () => (output ??= execution.allocate(rows * outChannels, "linear"));
+  if (into !== undefined && into === x) {
     throw new Error("linear: a fragment shader cannot read the texture it draws into");
   }
   // An int5 weight decodes in the kernel; it has no single texture to sample.
@@ -895,14 +899,13 @@ export function linear(execution, call, into) {
     // them into one tensor - only in the plain plane order, the one `planeFetchGlsl` addresses
     if (keepPlanes && tileWidth === 0 && !rowFastest && !execution.noKeepPlanes) {
       if (padded !== null && padded.given !== true) execution.release(padded.tensor);
-      if (into === undefined) execution.release(output);
       return /** @type {any} */ ({ planes, blockRows, rows, outChannels });
     }
     const addResidual = residual !== undefined && multiplier === undefined && !execution.noRepackResidual;
     const gated = addResidual && gateSlice !== undefined;
     execution.dispatch({
       source: blockRepackSource(blockRows, rowFastest, tileWidth, addResidual, gated ? gateSlice.stride4 : 0),
-      output,
+      output: outputTensor(),
       inputs: {
         ...Object.fromEntries(planes.map((plane, i) => [`plane${i}`, plane])),
         ...(addResidual ? { residualTex: residual } : {}),
@@ -949,7 +952,7 @@ export function linear(execution, call, into) {
     source: linearSource(
       rows, inChannels, outChannels, activation, bias !== undefined, weightLayout, roundHalf, epilogue,
       epilogue === 3 ? gateSlice.stride4 : 0),
-    output,
+    output: outputTensor(),
     inputs: {
       xTex: narrowed?.tensor ?? x, weightTex: weightTensor, biasTex: bias ?? narrowed?.tensor ?? x,
       ...(epilogue > 0 ? { baseTex: residual } : {}),
