@@ -97,6 +97,28 @@ export async function main(device, args) {
     const update = transition(execution, { x, weights: uploaded, rows, channels });
     const ours = Float32Array.from(execution.read(update));
     execution.release(update);
+    // 🔴 THE WINDOWED PATH, against the whole one: a transition whose `gated` is past the texture capacity goes a
+    // window of rows at a time (protenix2's and mol1's every-row MSA stack). The capacity is shrunk so 17 rows take
+    // four windows, the last ragged, with the residual inside as the MSA stack passes it.
+    {
+      const whole = transition(execution, { x, weights: uploaded, rows, channels, residualOf: x });
+      const wholeValues = Float32Array.from(execution.read(whole));
+      execution.release(whole);
+      const capacity = execution.storage.capacity;
+      execution.storage.capacity = 5 * 2 * intermediate;
+      let windowedValues;
+      try {
+        const windowed = transition(execution, { x, weights: uploaded, rows, channels, residualOf: x });
+        windowedValues = Float32Array.from(execution.read(windowed));
+        execution.release(windowed);
+      } finally {
+        execution.storage.capacity = capacity;
+      }
+      const relative = relativeRms(windowedValues, wholeValues, `${name}:windowed`);
+      rowsList.push({ arm: `${name}: four row windows vs whole`, relativeRms: Number(relative.toPrecision(4)),
+        bar: 1e-6, ok: relative <= 1e-6, falsifiable: false, reason: "both arms read the same input" });
+      if (!(relative <= 1e-6)) failures.push(`${name}: windowed differs from whole by ${relative.toExponential(3)}`);
+    }
     execution.release(x);
     releaseTransitionWeights(execution, uploaded);
 
