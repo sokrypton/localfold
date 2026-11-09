@@ -3707,3 +3707,52 @@ MSA stack in 15.5 s (~0.2 s normally) and then stalled at "Trunk 1/2 · 6%" unti
 fold before the progress change and four times after it (with page errors and unhandled rejections captured: none)
 completed in 6-7 s. Not reproduced, so not fixed - if it recurs, `fold-in-safari-debug`'s error capture is the first
 instrument.
+
+### Seven of eight AF3-lineage families fold here now - every one but OpenDDE
+
+The page refused Boltz-2, Protenix-v2, Mol-1 and RoseTTAFold3 on WebGL2 because they carry the FUSED template embedder
+(`v = z_proj(z_norm(z)) + a_proj(features)`, 109 / 108 / 108 / 66 columns) where `trunk/template.js` ran AlphaFold 3's
+nine projections. Porting it was the first of eleven things those four needed; each of the others was found by folding
+the bundle against WebGPU's fold of the same bundle and reading WHERE they parted. `fold-af3-webgl.js --seams` reports
+every trunk seam under webgpu/af3/trunk/trunk.js's tap names (`target_feat`, `z_init_generic`, `z_after_template`,
+`z_after_msa`, `trunk_in_pair`, `trunk_out_pair`), so a disagreement is placed at the stage that makes it, and
+`superposedCaRmsd` beside the worst atom separates a different structure from the same one in another frame.
+
+| | what was missing | where it showed |
+|---|---|---|
+| the fused template embedder | `template.js` `fusedTemplateEmbeddingSteps`; the passes (rf3's one averaged pass, boltz2's empty slots weighing nothing and its divisor the templates present, protenix's GAP row) built host-side as webgpu/'s are (`fold.js` `fusedTemplatePasses`); columns and `a_proj` rows zero-padded to whole texels | "templatePairEmbedding8 is missing" |
+| the distogram's trained bias, and its bin count | applied twice by the symmetrising sum, as webgpu/ does; rf3's 65 bins (the kernels are element-wise now) | rf3: "weight holds 8320 floats" |
+| 🔴 **rf3's kq_norm** | a trained LayerNorm on q and k over heads x dimension, in the atom stacks and the token transformer | rf3 `target_feat` 6.0e-2 -> 2.5e-5 |
+| **rf3's parallel transformer block** (`diffusionNoResidual`) | its transition reads the PRE-attention activation; the atom stacks had it, this transformer did not | rf3 superposed CA 1.10 -> 0.136 A |
+| rf3's chirality term | the gradient of each centre's improper-dihedral error, per atom from a host-built inversion, projected beside the positions (`check-webgl-af3-chiral.js` holds the kernel to its CPU twin) | see below |
+| rf3's paired query row once aligned | `msaPairedQueryRowAligned`, and the pass's `queryDrawn` | (an alignment fold) |
+| boltz2's z-init bond terms | the token bonds (EVERY family's, never passed - zero for a protein, a term for a ligand), the bond-order row and the contact term (`boltz2ContactTable`, a pocket or contact constraint as whole terms) | boltz2's trunk |
+| boltz2's DNA-unknown MSA row | `boltz2DnMsa` on a DNA column's class 30 | (a DNA fold) |
+| boltz2's confidence re-embedding | the nine-term rebuild of z and s (`boltz2Reembed`), refused by name before | "reembedConfidencePair ... not ported" |
+| 🔴 **boltz2's target_feat summands uploaded** | `targetFeatures` reads them on the host; uploaded with the tree they were textures and target_feat was NaN | `--nan-watch` |
+| 🔴 **today's pre-padded x under boltz2's up-gate** | the AdaLN wrote the transition's x at the up projection's padded stride and `ffwAToB` read it unpadded (AF3 has no up-gate) | "x holds 60416 floats, not 59 x 768" |
+| Mol-1's PairMixer | pairformer blocks with no grid attention at the pair's width, then two bias-free adapters around a 320-wide trunk | "pairAttention1 is missing" |
+| 🔴 **the wide triangle block at a tile that does not divide the row** | `lane = texel % TILEW` where the repack reads `(texel % W) % TILEW`: equal only when `W / channels` divides 2048 - 128, 256 and 448 channels - so at 192, 288, 320 and 384 every texture row after the first wrote its pair blocks into a neighbour's slot. relRMS 1.15 at 24 tokens; nothing folded a 320-wide pair here until Mol-1's narrow trunk. `check-webgl-af3-triangle.js --channels=320` now passes at 12, 24 and 59 | Mol-1 `trunk_out_pair` 0.94 |
+
+Against the WebGPU fold of the same int5 bundle, 59 tokens, the whole trunk, 25 steps (`fold-af3-webgl.js`, Chrome M2):
+
+| | trunk pair | worst atom | superposed CA | pLDDT WebGL2 / WebGPU | pTM |
+|---|---|---|---|---|---|
+| AlphaFold 3 (control, unchanged) | 8.1e-4 | 0.109 A | 0.027 A | 57.118 / 57.054 | |
+| Boltz-2 (64 blocks) | 1.2e-3 | 0.177 | 0.032 | 77.566 / 77.562 | 0.6042 / 0.6039 |
+| Protenix-v2 | 2.8e-3 | 0.995 | 0.065 | 72.022 / 72.071 | |
+| Mol-1 (40) | 4.0e-3 | 0.190 | 0.047 | 73.651 / 73.655 | 0.5343 / 0.5341 |
+| RoseTTAFold3 | 1.8e-3 | 1.003 | 0.136 | 73.919 / 73.923 | |
+
+Protenix-v2's worst atom is frame, not structure (0.065 superposed); its trunk agrees with WebGPU as AF3's does through
+16 blocks and parts over the last 32, at matched f32 too. **RoseTTAFold3's residue is its chirality term**: with the
+term off on BOTH backends the two folds are 0.018 A apart superposed (0.067 worst), and the kernel matches its f64 CPU
+twin to 1.1e-3 at the scale the encoder feeds it - an f32 central difference over a 1e-4 step, whose error grows exactly
+with the coordinates' magnitude (5.0e-3 at four times the scale, 1.3e-2 at sixteen). Two backends' f32 roundings of the
+same finite difference walk 25 steps apart; WebGPU's own f16-against-f32 arm moves rf3 0.095 A.
+
+On the page (`fold-in-page.py --no-webgpu`, Chrome): Boltz-2 pLDDT 64.6 in 8 s, Protenix-v2 62.2 in 9 s, RoseTTAFold3
+72.1 in 7 s, Mol-1 84.6 in 12 s, each with WebGPU's status sequence and both maps. 5CAJ chain A (261 residues) with its
+own crystal as a template: Protenix-v2 pLDDT 95.3 both ways, 261/261 covered (212 s here, 46 s on WebGPU).
+(This box's local `model-boltz2-int5` and `model-rosettafold3-int5` are not the exports the registry pins - the page
+404s or refuses a shard on WebGPU as well - so those two page folds used `--remote-weights`.)

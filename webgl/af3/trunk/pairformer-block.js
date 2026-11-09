@@ -89,8 +89,12 @@ export const BLOCK_GROUPS = [
  * @param {import("../../runtime/execution.js").Execution} execution
  */
 export function uploadPairformerBlockWeights(execution, weights) {
+  // 🔴 Mol-1's PairMixer block is this block WITHOUT ITS TWO GRID ATTENTIONS (trunk_pairmixer carries none), and both
+  // go together or neither does - one of the two missing is a broken bundle, not a mixer
+  const mixer = weights.pairAttention1 == null && weights.pairAttention2 == null;
   for (const name of BLOCK_GROUPS) {
-    if (weights[name] === undefined) {
+    if (mixer && (name === "pairAttention1" || name === "pairAttention2")) continue;
+    if (weights[name] === undefined || weights[name] === null) {
       throw new Error(`af3 pairformer block weights: ${name} is missing`);
     }
   }
@@ -101,8 +105,10 @@ export function uploadPairformerBlockWeights(execution, weights) {
       execution, weights.triangleMultiplicationOutgoing),
     triangleMultiplicationIncoming: uploadTriangleWeights(
       execution, weights.triangleMultiplicationIncoming),
-    pairAttention1: uploadGridAttentionWeights(execution, weights.pairAttention1),
-    pairAttention2: uploadGridAttentionWeights(execution, weights.pairAttention2),
+    ...(mixer ? {} : {
+      pairAttention1: uploadGridAttentionWeights(execution, weights.pairAttention1),
+      pairAttention2: uploadGridAttentionWeights(execution, weights.pairAttention2),
+    }),
     pairTransition: uploadTransitionWeights(execution, weights.pairTransition),
     singlePairLogitsNormScale: execution.uploadWeight(
       weights.singlePairLogitsNormScale, "w.af3.block.logitsNormScale"),
@@ -118,8 +124,8 @@ export function uploadPairformerBlockWeights(execution, weights) {
 export function releasePairformerBlockWeights(execution, weights) {
   releaseTriangleWeights(execution, weights.triangleMultiplicationOutgoing);
   releaseTriangleWeights(execution, weights.triangleMultiplicationIncoming);
-  releaseGridAttentionWeights(execution, weights.pairAttention1);
-  releaseGridAttentionWeights(execution, weights.pairAttention2);
+  if (weights.pairAttention1 !== undefined) releaseGridAttentionWeights(execution, weights.pairAttention1);
+  if (weights.pairAttention2 !== undefined) releaseGridAttentionWeights(execution, weights.pairAttention2);
   releaseTransitionWeights(execution, weights.pairTransition);
   releaseSingleAttentionWeights(execution, weights.singleAttention);
   releaseTransitionWeights(execution, weights.singleTransition);
@@ -171,6 +177,7 @@ export function pairHalf(execution, call, ownsPair = false) {
     pair = next;
   }
   for (const [group, transpose] of [[w.pairAttention1, false], [w.pairAttention2, true]]) {
+    if (group === undefined) continue; // (Mol-1's PairMixer block has no grid attention)
     // ...the residual inside, where the column direction's transpose back folds into the add
     const next = gridSelfAttention(execution, {
       pair, mask: pairMask, weights: group,

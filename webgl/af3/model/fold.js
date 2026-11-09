@@ -60,17 +60,20 @@ import { af3TmScores, chainTmInfo, tmPerBinFor, tmScoreD0, tmTermsFromLogits, to
 // structure". A second Box-Muller here would make every fold a different sample
 // from the same distribution and leave nothing to compare.
 import { normalFrom } from "../../../shared/af3/random.js";
+import { chiralCentres, coverageOf, multichainMaskFor } from "../../../shared/af3/featurise/template-features.js";
+import { boltz2ContactTable } from "../../../shared/af3/featurise/constraints.js";
+import { fusedTemplateFeatures } from "../../../shared/af3/featurise/template-fused-features.js";
 import { Execution, memoSource } from "../../runtime/execution.js";
 import { atomCrossAttentionEncoder } from "../diffusion/atom-encoder.js";
 import { perAtomConditioning } from "../diffusion/atom-conditioning.js";
 import { confidenceHeadSteps, errorBinCentres, MAX_ERROR_BIN, NUM_BINS } from "../confidence/confidence.js";
-import { embed, RELATIVE_WIDTH, tokenIdentity } from "../trunk/embedder.js";
+import { DN_CODE, embed, RELATIVE_WIDTH, tokenIdentity } from "../trunk/embedder.js";
 import { binEdges, runTrunkSteps } from "../trunk/trunk.js";
 import { sampleOnWebGl2Steps } from "../diffusion/sampler.js";
 import { drain, drainAsync, gpuIdle, laggedPause } from "../../runtime/steps.js";
 import {
   slotCodes, slotGeometry, templateEmbeddingSteps, uploadTemplateWeights,
-  releaseTemplateWeights,
+  releaseTemplateWeights, padFeatureRows,
 } from "../trunk/template.js";
 import { uploadPairformerBlockWeights, releasePairformerBlockWeights }
   from "../trunk/pairformer-block.js";
@@ -225,6 +228,17 @@ export function* uploadAf3WeightsSteps(execution, weights) {
     pairformerBlocks.push(uploadPairformerBlockWeights(execution, block));
     yield piece;
   }
+  // Mol-1's PairMixer: pairformer blocks at the pair's own width, then two bias-free adapters around a narrower trunk
+  const pairMixerBlocks = [];
+  for (const block of trunk.pairMixerBlocks ?? []) {
+    pairMixerBlocks.push(uploadPairformerBlockWeights(execution, block));
+    yield piece;
+  }
+  const pairWidth = trunk.pairWidth === undefined || trunk.pairWidth === null ? undefined : {
+    trunkChannels: trunk.pairWidth.trunkChannels,
+    trunkPairIn: uploadTree(trunk.pairWidth.trunkPairIn, "w.af3.trunk-pair-in"),
+    trunkPairOut: uploadTree(trunk.pairWidth.trunkPairOut, "w.af3.trunk-pair-out"),
+  };
   const distogram = uploadTree(trunk.distogram, "w.af3.distogram");
   // The diffusion transformer is nearly all of the checkpoint (757 MB as floats): a block at a time.
   const diffusion = uploadTree({ ...weights.diffusion, transformer: undefined }, "w.af3.diffusion");
@@ -264,11 +278,18 @@ export function* uploadAf3WeightsSteps(execution, weights) {
   }
   yield piece;
   const atomReference = uploadConditioningWeights(execution, weights.atomReference);
+  // 🔴 boltz2's SIX target_feat SUMMANDS ARE READ ON THE HOST (`targetFeatures`), so they stay host arrays: uploaded
+  // with the rest of the tree they became textures, the host indexed a texture, and boltz2's target_feat was NaN
+  const hostSum = weights.targetFeat.encoder?.targetFeatSum ?? null;
   const targetFeat = {
-    ...uploadTree(
-      { ...weights.targetFeat, reference: undefined }, "w.af3.target-feat"),
+    ...uploadTree({
+      ...weights.targetFeat, reference: undefined,
+      ...(weights.targetFeat.encoder === undefined ? {}
+        : { encoder: { ...weights.targetFeat.encoder, targetFeatSum: undefined } }),
+    }, "w.af3.target-feat"),
     reference: uploadConditioningWeights(execution, weights.targetFeat.reference),
     dialect: weights.targetFeat.dialect,
+    targetFeatSum: hostSum,
   };
   yield piece;
   let confidence;
@@ -289,7 +310,7 @@ export function* uploadAf3WeightsSteps(execution, weights) {
     // fills in the two projection biases rosettafold3 has and AF3 does not.
     // Uploading that tree generically compiles and then refuses with "cOuter
     // must be a multiple of 4, got undefined".
-    embedder, template, msaBlocks, pairformerBlocks, distogram,
+    embedder, template, msaBlocks, pairformerBlocks, pairMixerBlocks, pairWidth, distogram,
     // The diffusion head's own tree, and the per-atom conditioning's reference
     // table, which `targetFeat` and the head both read.
     diffusion,
@@ -320,12 +341,110 @@ export function releaseAf3Weights(execution, uploaded) {
   for (const block of uploaded.pairformerBlocks) {
     releasePairformerBlockWeights(execution, block);
   }
+  for (const block of uploaded.pairMixerBlocks ?? []) releasePairformerBlockWeights(execution, block);
   if (uploaded.confidence !== undefined) {
     releaseConfidenceHeadWeights(execution, uploaded.confidence.head);
     for (const block of uploaded.confidence.blocks) {
       releasePairformerBlockWeights(execution, block);
     }
   }
+}
+
+/**
+ * The fused template embedder's passes, each `{features, repeat}` (host columns, unpadded), and the divisor of their
+ * sum - webgpu/af3/trunk/template.js's logic, kept to it:
+ *  - rosettafold3 (`templateFeatureMeanOnePass`) averages the PRESENT templates' features and runs ONE pass standing for
+ *    every slot, so its term has full strength whatever the slot count;
+ *  - otherwise a pass per template, then the empty slots - the first one GAP where the dialect says so
+ *    (`emptyTemplateAatype`), every one GAP under `templateGapWhereNoAtoms`;
+ *  - boltz2 (`templateVisibilityByCoverage`) weighs an empty slot at zero and divides by the templates present.
+ */
+export function fusedTemplatePasses(slots, { tokens, templates, dialect, asymId, width }) {
+  if (slots.length > templates) throw new RangeError(`${slots.length} templates for ${templates} slots`);
+  const chainMaskFor = (template) => multichainMaskFor(asymId, tokens, {
+    coverage: coverageOf(template, tokens), spanChains: template.spanChains === true,
+  });
+  const given = slots.filter((slot) => slot !== undefined && slot !== null);
+  if (dialect.templateFeatureMeanOnePass === true) {
+    const present = given.filter((slot) => Array.prototype.some.call(slot.atomMask, (v) => v > 0));
+    let features;
+    if (present.length === 0) {
+      features = fusedTemplateFeatures(undefined, tokens, width, dialect, undefined, false);
+    } else {
+      features = fusedTemplateFeatures(present[0], tokens, width, dialect, chainMaskFor(present[0]), false);
+      for (let extra = 1; extra < present.length; extra += 1) {
+        const more = fusedTemplateFeatures(present[extra], tokens, width, dialect, chainMaskFor(present[extra]), false);
+        for (let index = 0; index < features.length; index += 1) features[index] += more[index];
+      }
+      if (present.length > 1) for (let index = 0; index < features.length; index += 1) features[index] /= present.length;
+    }
+    return { passes: [{ features, repeat: templates }], divisor: templates };
+  }
+  const visibility = dialect.templateVisibilityByCoverage === true;
+  const passes = given.map((template) => ({
+    features: fusedTemplateFeatures(template, tokens, width, dialect, chainMaskFor(template), false), repeat: 1,
+  }));
+  const emptySlots = templates - given.length;
+  const empty = (aatype, repeat) => ({
+    features: fusedTemplateFeatures(undefined, tokens, width, dialect, undefined, aatype !== 0), repeat,
+  });
+  if (!visibility && emptySlots > 0) {
+    const gap = dialect.emptyTemplateAatype ?? null;
+    if (dialect.templateGapWhereNoAtoms === true) passes.push(empty(21, emptySlots));
+    else if (gap !== null) {
+      passes.push(empty(gap, 1));
+      if (emptySlots > 1) passes.push(empty(0, emptySlots - 1));
+    } else passes.push(empty(0, emptySlots));
+  }
+  return { passes, divisor: visibility ? Math.max(1, given.length) : templates };
+}
+
+/**
+ * boltz2's contact conditioning for one site's weights (the trunk embedder's, or the confidence head's re-embedding):
+ * `index` (one row a pair) and `table` (whole terms) on the GPU. Without a constraint the table is the one
+ * unspecified row and every pair reads it.
+ */
+export function contactTermsFor(upload, batch, tokens, w, label) {
+  const pairs = tokens * tokens;
+  const built = batch.contactConditioning === undefined
+    ? { index: new Float32Array(pairs), table: Float32Array.from(w.contactEncodingUnspecified) }
+    : boltz2ContactTable(batch.contactConditioning, batch.contactThreshold, {
+      fourierWeights: w.contactFourierWeights, fourierBias: w.contactFourierBias,
+      encoderWeights: w.contactEncoderWeights, encoderBias: w.contactEncoderBias,
+      unspecified: w.contactEncodingUnspecified, unselected: w.contactEncodingUnselected,
+    });
+  return {
+    index: upload(Float32Array.from(built.index), `${label}.index`),
+    table: upload(Float32Array.from(built.table), `${label}.table`),
+  };
+}
+
+/**
+ * rosettafold3's chiral centres on the GPU, with the per-atom inversion its gradient kernel reads: `offsets[atom]` to
+ * `offsets[atom + 1]` index `entries`, each `centre * 4 + corner`. Undefined when there are none (a glycerol), since an
+ * empty sum is zero.
+ */
+export function chiralIndex(execution, { centers, angles, count }, atoms) {
+  if (count === 0) return undefined;
+  const offsets = new Float32Array(atoms + 1);
+  for (let at = 0; at < centers.length; at += 1) offsets[centers[at] + 1] += 1;
+  for (let at = 0; at < atoms; at += 1) offsets[at + 1] += offsets[at];
+  const entries = new Float32Array(centers.length);
+  const cursor = Float32Array.from(offsets);
+  for (let centre = 0; centre < angles.length; centre += 1) {
+    for (let corner = 0; corner < 4; corner += 1) {
+      const atom = centers[centre * 4 + corner];
+      entries[cursor[atom]] = centre * 4 + corner;
+      cursor[atom] += 1;
+    }
+  }
+  return {
+    atoms,
+    centers: execution.upload(Float32Array.from(centers), "af3.chiral.centers"),
+    angles: execution.upload(Float32Array.from(angles), "af3.chiral.angles"),
+    offsets: execution.upload(offsets, "af3.chiral.offsets"),
+    entries: execution.upload(entries, "af3.chiral.entries"),
+  };
 }
 
 /** The dialect flags each stage asks for, read once from the bundle's own. */
@@ -335,6 +454,7 @@ export function dialectFlags(dialect = {}) {
     pairInitFromSingle: dialect.pairInitFromSingle === true,
     msaUpdateBeforeOuterProduct: dialect.msaUpdateBeforeOuterProduct === true,
     msaPairedQueryRow: dialect.msaPairedQueryRow === true,
+    msaPairedQueryRowAligned: dialect.msaPairedQueryRowAligned === true,
     swapTransposedBias: dialect.swapTransposedBias === true,
     divideByLength: dialect.triangleMulDivideByLength === true,
     opmBiasAfterNorm: dialect.outerProductMeanBiasAfterNorm === true,
@@ -404,7 +524,7 @@ export function buildTargetFeat(execution, { batch, weights, flags, onStage }) {
   const values = targetFeatures(/** @type {any} */ ({
     aatype: batch.aatype, profile: batch.profile, deletionMean: batch.deletionMean,
     atomFeatures: tokenAct,
-    sum: w.encoder?.targetFeatSum ?? null,
+    sum: w.targetFeatSum ?? null,
     isDna: batch.isDna, isRna: batch.isRna, isLigand: batch.isLigand,
     isModified: batch.isModified, cyclicPeriod: batch.cyclicPeriod,
   }), tokens, w.dialect ?? w.encoder?.dialect);
@@ -513,6 +633,7 @@ export async function foldPrograms(execution, call) {
     ...weights,
     msaBlocks: weights.msaBlocks.slice(0, 1),
     pairformerBlocks: weights.pairformerBlocks.slice(0, 1),
+    pairMixerBlocks: (weights.pairMixerBlocks ?? []).slice(0, 1),
     ...(weights.confidence === undefined ? {}
       : { confidence: { ...weights.confidence, blocks: weights.confidence.blocks.slice(0, 1) } }),
   };
@@ -590,6 +711,15 @@ export function* foldAf3Steps(execution, call) {
     pairMask: upload(pairMask, "af3.batch.pair-mask"),
     asymId: upload(Float32Array.from(batch.asymId), "af3.batch.asym"),
     identity: upload(tokenIdentity(batch.features, tokens), "af3.batch.identity"),
+    // 🔴 boltz2's CONTACT TERM, PER PAIR: a row of a host-built table - one row, the unspecified constant, without a
+    // pocket or contact constraint; with one, constraints.js's whole terms (webgpu/'s embedder builds the same)
+    ...(hostWeights.trunk.embedder.tokenBondsTypeEmbed == null ? {} : {
+      contactTerms: contactTermsFor(upload, batch, tokens, hostWeights.trunk.embedder, "af3.batch.contact"),
+    }),
+    // ...the token bonds and their orders, zeros where the featuriser built none (it allocates them only for bonds)
+    bondMatrix: upload(batch.bondMatrix ?? new Float32Array(tokens * tokens), "af3.batch.bonds"),
+    bondOrderMatrix: upload(batch.bondOrderMatrix === undefined
+      ? new Float32Array(tokens * tokens) : Float32Array.from(batch.bondOrderMatrix), "af3.batch.bond-orders"),
     // 🔴 PER PAIR, NOT PER TOKEN. `af3ContactClasses` gives one CLASS a token -
     // what kind of thing it is - and the kernel reads "how many distogram bins
     // count as a contact for THIS PAIR", which is `af3ContactBins` over those
@@ -598,7 +728,7 @@ export function* foldAf3Steps(execution, call) {
     // at 0.0007 on the ADJACENT pairs, which are 3.8 A apart in every protein.
     contactBins: upload(
       Float32Array.from(af3ContactBins(
-        af3ContactClasses(batch, tokens), tokens, binEdges())),
+        af3ContactClasses(batch, tokens), tokens, binEdges(hostWeights.trunk.distogram.bins))),
       "af3.batch.contact-bins"),
     gathers: {
       tokenAtomsToQueries: uploadGather(batch.tokenAtomsToQueries, "af3.batch.ta2q"),
@@ -622,6 +752,7 @@ export function* foldAf3Steps(execution, call) {
     batch, weights: { ...weights, batchTensors }, flags, onStage: call.onStage,
   });
   const targetFeatTensor = upload(targetFeat.values, "af3.target-feat");
+  call.onSeam?.("target_feat", Float32Array.from(targetFeat.values), 0);
   call.onStage?.("target-feat", { width: targetFeat.width });
   yield { stage: "target-feat" };
 
@@ -629,10 +760,20 @@ export function* foldAf3Steps(execution, call) {
   // webgpu/af3/fold.js does (shared/af3/msa-draw.js) - a function of the pass. A pass's draw is uploaded
   // at its start and released at its end, so only one pass's rows are on the GPU at a time.
   const msaOfPass = typeof msa === "function" ? msa : null;
+  // (boltz2: a DNA column's class 30 marked DN_CODE, where the bundle carries Boltz's DNA-unknown row - embedder.js)
+  const dnRow = hostWeights.trunk.embedder.boltz2DnMsa !== undefined && hostWeights.trunk.embedder.boltz2DnMsa !== null;
+  const markedCodes = (values) => {
+    if (!dnRow) return values;
+    if (batch.isDna === undefined) throw new Error("boltz2's DN row needs the batch's isDna");
+    const out = Float32Array.from(values);
+    for (let at = 0; at < out.length; at += 1) if (out[at] === 30 && batch.isDna[at % tokens]) out[at] = DN_CODE;
+    return out;
+  };
   let msaCodes, deletions, msaMask;
   let sequences = msaOfPass === null ? msa.sequences : 0;
+  let msaQueryDrawn = msaOfPass === null ? msa.queryDrawn !== false : true;
   if (msaOfPass === null) {
-    msaCodes = upload(msa.codes, "af3.msa.codes");
+    msaCodes = upload(markedCodes(msa.codes), "af3.msa.codes");
     deletions = upload(msa.deletions, "af3.msa.deletions");
     msaMask = upload(msa.mask, "af3.msa.mask");
   }
@@ -664,6 +805,20 @@ export function* foldAf3Steps(execution, call) {
   });
   const repeats = repeatOf.map((of, slot) => (of >= 0 ? 0 : 1 + repeatOf.filter((other) => other === slot).length));
 
+  // 🔴 THE FUSED EMBEDDER (boltz2, protenix2, mol1, rosettafold3) READS FEATURE COLUMNS, NOT CODES AND GEOMETRY - and
+  // which passes it runs is the dialect's, decided here as webgpu/af3/trunk/template.js decides it.
+  const fusedTemplate = weights.template?.fused === true
+    ? fusedTemplatePasses(call.templateSlots ?? [], {
+      tokens, templates, dialect: weights.dialect ?? {}, asymId: batch.asymId,
+      width: hostWeights.trunk.template.featureWidth,
+    })
+    : undefined;
+  const fusedPasses = fusedTemplate?.passes.map(({ features, repeat }, index) => ({
+    features: upload(padFeatureRows(features, tokens * tokens, hostWeights.trunk.template.featureWidth),
+      `af3.template.features.${index}`),
+    repeat,
+  }));
+
   // 🔴 THE RECYCLED STATE IS ZEROS ON PASS ONE AND IT STILL CONTRIBUTES, so it
   // is a real tensor rather than an absent one: the embedder LayerNorms it and
   // the norm's OFFSET is non-zero, so a pass-one fold that skipped the term is
@@ -689,8 +844,9 @@ export function* foldAf3Steps(execution, call) {
     if (msaOfPass !== null) {
       const drawn = msaOfPass(pass);
       sequences = drawn.sequences;
+      msaQueryDrawn = drawn.queryDrawn !== false;
       passMsa = [
-        execution.upload(Float32Array.from(drawn.codes), "af3.msa.codes"),
+        execution.upload(Float32Array.from(markedCodes(drawn.codes)), "af3.msa.codes"),
         execution.upload(Float32Array.from(drawn.deletions), "af3.msa.deletions"),
         execution.upload(Float32Array.from(drawn.mask), "af3.msa.mask"),
       ];
@@ -704,7 +860,13 @@ export function* foldAf3Steps(execution, call) {
       weights: weights.embedder,
       tokens, sequences,
       pairInitFromSingle: flags.pairInitFromSingle,
-      msaPairedQueryRow: flags.msaPairedQueryRow,
+      // (rf3: the query row is paired once an alignment adds a row - and only on a pass whose draw kept the query as
+      // its row 0, as webgpu/af3/fold.js has it)
+      msaPairedQueryRow: (flags.msaPairedQueryRow || (flags.msaPairedQueryRowAligned && sequences > 1))
+        && msaQueryDrawn,
+      // the token bonds (every family's z-init term, zero for a bond-free input) and boltz2's bond orders
+      bondMatrix: batchTensors.bondMatrix, bondOrderMatrix: batchTensors.bondOrderMatrix,
+      contactTerms: batchTensors.contactTerms,
     });
     call.onStage?.("embed", { pass });
     yield { stage: "embed", pass };
@@ -717,6 +879,8 @@ export function* foldAf3Steps(execution, call) {
       templateUpdate = yield* templateEmbeddingSteps(execution, {
         pair: embedded.pair, pairMask: batchTensors.pairMask,
         tokens, templates, weights: weights.template, codes, geometry, repeats, repeatOf,
+        fusedPasses, divisor: fusedTemplate?.divisor,
+        outerResidual: weights.dialect?.templateStackOuterResidual === true,
         swapTransposedBias: flags.swapTransposedBias,
         divideByLength: flags.divideByLength,
       });
@@ -730,14 +894,19 @@ export function* foldAf3Steps(execution, call) {
       msaMask, pairMask: batchTensors.pairMask, seqMask: batchTensors.seqMask,
       contactBins: batchTensors.contactBins,
       halfLogits: weights.distogram.halfLogits,
+      halfLogitsBias: weights.distogram.halfLogitsBias,
+      bins: hostWeights.trunk.distogram.bins,
       msaBlocks: weights.msaBlocks,
       pairformerBlocks: weights.pairformerBlocks,
+      pairMixerBlocks: weights.pairMixerBlocks ?? [], pairWidth: weights.pairWidth,
       tokens, sequences, pairChannels,
       msaUpdateBeforeOuterProduct: flags.msaUpdateBeforeOuterProduct,
       msaDoubleAddPair: flags.msaDoubleAddPair,
       swapTransposedBias: flags.swapTransposedBias,
       divideByLength: flags.divideByLength,
       opmBiasAfterNorm: flags.opmBiasAfterNorm,
+      // (the stage seams, read back only for a caller that asks - tools/gpu/fold-af3-webgl.js --seams)
+      ...(call.onSeam === undefined ? {} : { onSeam: (name, values) => call.onSeam(name, values, pass) }),
     });
     let stepped = trunkSteps.next();
     let inPairformer = false;
@@ -821,6 +990,12 @@ export function* foldAf3Steps(execution, call) {
     rawRefCharge: flags.rawRefCharge,
   });
   headInput.conditioning = conditioning;
+  // 🔴 rosettafold3's CHIRAL CENTRES, and the index that inverts them per atom - topology, not coordinates, so once a
+  // fold (webgpu/af3/diffusion/atom-encoder.js builds the same); the encoder takes the gradient every step
+  const chiral = weights.dialect?.chiralCentres === true && headWeights.encoder?.atomChiralToFeatures !== undefined
+    ? chiralIndex(execution, chiralCentres(batch.aatype, batch.predDenseAtomMask, tokens), tokens * batch.shape.dense)
+    : undefined;
+  if (chiral !== undefined) headInput.chiral = chiral;
 
   const positions = yield* sampleOnWebGl2Steps(execution, headInput, {
     steps, mask: batch.refMask, normal: call.normal ?? normalFrom(seed),
@@ -831,6 +1006,7 @@ export function* foldAf3Steps(execution, call) {
     onStep: call.onStep,
   });
   execution.release(conditioning);
+  if (chiral !== undefined) for (const name of ["centers", "angles", "offsets", "entries"]) execution.release(chiral[name]);
   call.onStage?.("sample", { steps });
 
   // The confidence head, on the sampled coordinates through the batch's own
@@ -866,6 +1042,12 @@ export function* foldAf3Steps(execution, call) {
       preSymmetrisedPde: flags.preSymmetrisedPde,
       perAtomHeadsByRank: flags.perAtomHeadsByRank,
       reembedConfidencePair: flags.reembedConfidencePair,
+      // (boltz2's re-embedding reads the identity, the token bonds and orders, and its own site's contact terms)
+      ...(flags.reembedConfidencePair ? {
+        identity: batchTensors.identity,
+        bondMatrix: batchTensors.bondMatrix, bondOrderMatrix: batchTensors.bondOrderMatrix,
+        contactTerms: contactTermsFor(upload, batch, tokens, hostWeights.confidence.reembed, "af3.conf.contact"),
+      } : {}),
       swapTransposedBias: flags.swapTransposedBias,
       divideByLength: flags.divideByLength,
     });

@@ -39,12 +39,12 @@ export const FIRST_BREAK = 2.3125;
 export const LAST_BREAK = 21.6875;
 export const DISTOGRAM_BINS = 64;
 
-/** The distogram bin edges: 63 of them, evenly spaced. */
-export function binEdges() {
-  const breaks = new Float32Array(DISTOGRAM_BINS - 1);
-  for (let index = 0; index < DISTOGRAM_BINS - 1; index += 1) {
+/** The distogram bin edges: `bins - 1` of them, evenly spaced (64 bins for AF3, 65 for rosettafold3). */
+export function binEdges(bins = DISTOGRAM_BINS) {
+  const breaks = new Float32Array(bins - 1);
+  for (let index = 0; index < bins - 1; index += 1) {
     breaks[index] = FIRST_BREAK
-      + (LAST_BREAK - FIRST_BREAK) * index / (DISTOGRAM_BINS - 2);
+      + (LAST_BREAK - FIRST_BREAK) * index / (bins - 2);
   }
   return breaks;
 }
@@ -52,19 +52,26 @@ export function binEdges() {
 /**
  * `logits[i][j][b] = half[i][j][b] + half[j][i][b]` - the sum, not the mean.
  */
-const symmetriseSourceUncached = (tokens) => sized({ L: tokens, ELEMENTS: tokens * tokens * DISTOGRAM_BINS }, `${PRELUDE}${ONE_TARGET}
-const int B4 = ${DISTOGRAM_BINS / 4};
+const symmetriseSourceUncached = (tokens, bins = DISTOGRAM_BINS) => sized({ L: tokens, ELEMENTS: tokens * tokens * bins }, `${PRELUDE}${ONE_TARGET}
+const int BINS = ${bins};
 uniform sampler2D halfTex;
 
-void main() {
-  int texel = linearTexel();
-  if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
-  int group = texel % B4;
-  int pair = texel / B4;
+// element by element, so a bin count that is not a whole number of texels (rosettafold3's 65) needs no padding
+float symmetric(int at) {
+  int bin = at % BINS;
+  int pair = at / BINS;
   int i = pair / L;
   int j = pair - i * L;
-  result = fetch4(halfTex, (i * L + j) * B4 + group)
-    + fetch4(halfTex, (j * L + i) * B4 + group);
+  return fetch1(halfTex, (i * L + j) * BINS + bin) + fetch1(halfTex, (j * L + i) * BINS + bin);
+}
+
+void main() {
+  int base = linearTexel() * 4;
+  if (base >= ELEMENTS) { result = vec4(0.0); return; }
+  result = vec4(symmetric(base),
+    base + 1 < ELEMENTS ? symmetric(base + 1) : 0.0,
+    base + 2 < ELEMENTS ? symmetric(base + 2) : 0.0,
+    base + 3 < ELEMENTS ? symmetric(base + 3) : 0.0);
 }`);
 
 /**
@@ -74,8 +81,8 @@ void main() {
  * one class a token and gives each pair its own threshold, so the kernel reads
  * a per-pair count rather than baking one in.
  */
-const contactSourceUncached = (tokens) => sized({ L: tokens, ELEMENTS: tokens * tokens }, `${PRELUDE}${ONE_TARGET}
-const int BINS = ${DISTOGRAM_BINS};
+const contactSourceUncached = (tokens, bins = DISTOGRAM_BINS) => sized({ L: tokens, ELEMENTS: tokens * tokens }, `${PRELUDE}${ONE_TARGET}
+const int BINS = ${bins};
 uniform sampler2D logitsTex;
 uniform sampler2D maskTex;
 uniform sampler2D binsTex;
@@ -112,15 +119,19 @@ void main() {
  * @returns {{logits: Tensor, contactProbs: Tensor}} the caller owns both
  */
 export function distogramHead(execution, call) {
-  const { pair, pairMask, contactBins, halfLogits, tokens, pairChannels } = call;
+  const { pair, pairMask, contactBins, halfLogits, halfLogitsBias, tokens, pairChannels } = call;
+  const bins = call.bins ?? DISTOGRAM_BINS;
   const pairs = tokens * tokens;
+  // 🔴 A TRAINED BIAS (protenix2, mol1, boltz2, rosettafold3: `distogramBias`) RIDES IN THE HALF LOGITS, so the
+  // symmetrising SUM applies it twice - which is what those checkpoints trained with (webgpu/af3/trunk/trunk.js adds
+  // `2 * bias`). It was dropped here: the contact map and the confidence head's input were the bias-free ones.
   const half = linear(execution, {
-    x: pair, weight: halfLogits, rows: pairs,
-    inChannels: pairChannels, outChannels: DISTOGRAM_BINS, weightLayout: "in-major",
+    x: pair, weight: halfLogits, bias: halfLogitsBias, rows: pairs,
+    inChannels: pairChannels, outChannels: bins, weightLayout: "in-major",
   });
-  const logits = execution.allocate(pairs * DISTOGRAM_BINS, "af3.distogram.logits");
+  const logits = execution.allocate(pairs * bins, "af3.distogram.logits");
   execution.dispatch({
-    source: symmetriseSource(tokens),
+    source: symmetriseSource(tokens, bins),
     output: logits,
     inputs: { halfTex: half },
     label: `af3.distogram.symmetrise:${tokens}`,
@@ -128,7 +139,7 @@ export function distogramHead(execution, call) {
   execution.release(half);
   const contactProbs = execution.allocate(pairs, "af3.distogram.contacts");
   execution.dispatch({
-    source: contactSource(tokens),
+    source: contactSource(tokens, bins),
     output: contactProbs,
     inputs: { logitsTex: logits, maskTex: pairMask, binsTex: contactBins },
     label: `af3.distogram.contacts:${tokens}`,
@@ -165,12 +176,17 @@ export function runTrunk(execution, call) {
  */
 export function* runTrunkSteps(execution, call) {
   const {
-    embedded, templateUpdate, msaMask, pairMask, seqMask, contactBins, halfLogits,
+    embedded, templateUpdate, msaMask, pairMask, seqMask, contactBins, halfLogits, halfLogitsBias, bins,
     msaBlocks, pairformerBlocks, tokens, sequences, pairChannels,
     msaUpdateBeforeOuterProduct, msaDoubleAddPair = false,
     swapTransposedBias = false, divideByLength = false, opmBiasAfterNorm = false,
     epsilon = 1e-5,
   } = call;
+  // 🔴 THE SEAMS, UNDER webgpu/af3/trunk/trunk.js's TAP NAMES, read back only when a caller asks (`onSeam`) - so a fold
+  // tool can hold each stage to the WGSL trunk's rather than only the finished pair (tools/gpu/fold-af3-webgl.js --seams)
+  const seam = (name, tensor) => {
+    if (call.onSeam !== undefined) call.onSeam(name, Float32Array.from(execution.read(tensor)));
+  };
 
   // 🔴 THIS CONSUMES THE EMBEDDER'S THREE TENSORS, which has to be said rather
   // than left to the reader: every one of them is superseded inside the stacks
@@ -180,11 +196,15 @@ export function* runTrunkSteps(execution, call) {
   // `embed` after calling this.
   let pair = embedded.pair;
   let ownPair = true;
+  seam("tap.z_init_generic", pair);
+  // (Mol-1's is after its PairMixer, as the reference taps it)
+  if ((call.pairMixerBlocks ?? []).length === 0) seam("tap.trunk_in_single", embedded.single);
   if (templateUpdate !== undefined) {
     const withTemplate = add(execution, pair, templateUpdate);
     execution.release(pair);
     pair = withTemplate;
   }
+  seam("tap.z_after_template", pair);
   // ...and boltz2 needs that same pair back after the MSA stack, so it is held.
   const beforeMsa = msaDoubleAddPair ? pair : undefined;
 
@@ -215,9 +235,38 @@ export function* runTrunkSteps(execution, call) {
     pair = doubled;
     ownPair = true;
   }
+  // (after boltz2's double add, where webgpu/'s tap is)
+  seam("tap.z_after_msa", pair);
 
   let single = embedded.single;
   let ownSingle = true;
+  // 🔴 Mol-1: its PairMixer blocks at the pair's width, then the pairformer on a NARROWER pair of its own between two
+  // bias-free adapters, the full pair rewritten from it after (shared/af3/dialect.js MOL1; webgpu/'s trunk the same)
+  const mixer = call.pairMixerBlocks ?? [];
+  for (const weights of mixer) {
+    const next = pairformerBlock(execution, {
+      pair, single, pairMask, seqMask, tokens, weights, swapTransposedBias, divideByLength, epsilon,
+    });
+    if (ownPair) execution.release(pair);
+    if (ownSingle) execution.release(single);
+    pair = next.pair;
+    single = next.single;
+    ownPair = true;
+    ownSingle = true;
+    yield { stage: "pairmixer" };
+  }
+  const widths = mixer.length > 0 ? call.pairWidth : undefined;
+  if (widths !== undefined) {
+    const narrow = linear(execution, {
+      x: pair, weight: widths.trunkPairIn, rows: tokens * tokens,
+      inChannels: pairChannels, outChannels: widths.trunkChannels, weightLayout: "in-major",
+    });
+    if (ownPair) execution.release(pair);
+    pair = narrow;
+    ownPair = true;
+    seam("tap.trunk_in_pair", pair);
+    seam("tap.trunk_in_single", single);
+  }
   for (const [index, weights] of pairformerBlocks.entries()) {
     const next = pairformerBlock(execution, {
       pair, single, pairMask, seqMask, tokens, weights,
@@ -233,8 +282,17 @@ export function* runTrunkSteps(execution, call) {
     yield { stage: "pairformer", index };
   }
 
+  seam("tap.trunk_out_pair", pair);
+  if (widths !== undefined) {
+    const wide = linear(execution, {
+      x: pair, weight: widths.trunkPairOut, rows: tokens * tokens,
+      inChannels: widths.trunkChannels, outChannels: pairChannels, weightLayout: "in-major",
+    });
+    execution.release(pair);
+    pair = wide;
+  }
   const { logits, contactProbs } = distogramHead(execution, {
-    pair, pairMask, contactBins, halfLogits, tokens, pairChannels,
+    pair, pairMask, contactBins, halfLogits, halfLogitsBias, bins, tokens, pairChannels,
   });
   pair.label = "af3.trunk.pair";
   single.label = "af3.trunk.single";

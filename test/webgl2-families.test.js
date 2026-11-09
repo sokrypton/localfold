@@ -1,26 +1,27 @@
 /**
- * WEBGL2_FAMILIES against the bundles themselves.
+ * WEBGL2_FAMILIES against the lineage.
  *
- * 🔴 A HAND-WRITTEN CAPABILITY LIST IS A CLAIM, AND THIS IS WHAT MAKES IT A MEASUREMENT. The page
- * refuses a family on the WebGL2 fallback by name, BEFORE the weights download, which is the only
- * place a refusal is worth anything to a visitor - but it can only do that from a list, and a list
- * drifts the moment a bundle is re-exported. So the list is held to the thing it is about: whether
- * that bundle carries AlphaFold 3's UNFUSED template embedder, which webgl/af3/trunk/template.js is
- * the port of. `template_pair_embedding_8` is the tensor that names it.
+ * 🔴 A HAND-WRITTEN CAPABILITY LIST IS A CLAIM, AND THIS IS WHAT MAKES IT A CHECK. The page refuses a family on the
+ * WebGL2 fallback by name, BEFORE the weights download - the only place a refusal is worth anything to a visitor - and
+ * it can only do that from a list. The list is every AF3-lineage family but those that re-tokenise after the trunk.
  *
- * 🔴 AND IN BOTH DIRECTIONS, because the dangerous failure is the quiet one. A family wrongly ON the
- * list downloads half a gigabyte and dies inside the template stack; a family wrongly OFF it is
- * refused on a browser that could have folded it. Neither announces itself.
+ * It used to be held to `template_pair_embedding_8`, the UNFUSED template embedder, which was all
+ * webgl/af3/trunk/template.js could run; since the fused embedder was ported (2026-11-09) both embedders fold, and the
+ * test asserts the one that is still a reason.
+ *
+ * 🔴 AND IN BOTH DIRECTIONS, because the dangerous failure is the quiet one. A family wrongly ON the list downloads
+ * half a gigabyte and dies inside the fold; a family wrongly OFF it is refused on a browser that could have folded it.
  */
 import assert from "node:assert/strict";
 import test from "node:test";
 import { AF3_FAMILIES, WEBGL2_FAMILIES } from "../shared/bundles/manifests/index.js";
 
-/** The one tensor that says a bundle uses the unfused template embedder. */
-const UNFUSED = "template_pair_embedding_8";
-
-/** OpenDDE has the unfused embedder and still cannot fold here: it re-tokenises after the trunk. */
+/** OpenDDE re-tokenises after the trunk, which the WebGL2 fold has not ported. */
 const STRUCTURAL_TOKENS = ["opendde"];
+
+/** The two template embedders' tensors: a bundle carries one, and the WebGL2 port runs both. */
+const UNFUSED = "template_pair_embedding_8";
+const FUSED = "template_embedding/a_proj";
 
 async function tensorNames(family) {
   const module = await import(`../shared/bundles/manifests/${family}.js`);
@@ -34,25 +35,22 @@ test("WEBGL2_FAMILIES is a subset of the AF3 lineage", () => {
   }
 });
 
-test("every family on the list has the unfused template embedder the WebGL2 port implements",
+test("every family on the list has a template embedder the WebGL2 port implements, and does not re-tokenise",
   async () => {
     for (const family of WEBGL2_FAMILIES) {
       const names = await tensorNames(family);
-      assert.ok(names.some((name) => name.includes(UNFUSED)),
-        `${family} is on WEBGL2_FAMILIES but its manifest has no ${UNFUSED}:`
-        + " the fold would die inside webgl/af3/trunk/template.js after the download");
+      assert.ok(names.some((name) => name.includes(UNFUSED) || name.includes(FUSED)),
+        `${family} is on WEBGL2_FAMILIES but its manifest has neither template embedder`);
       assert.ok(!STRUCTURAL_TOKENS.includes(family),
         `${family} re-tokenises after the trunk, which the WebGL2 fold has not ported`);
     }
   });
 
-test("every lineage family left off the list is off it for a stated reason", async () => {
+test("every lineage family left off the list is off it for a stated reason", () => {
   for (const family of AF3_FAMILIES) {
     if (WEBGL2_FAMILIES.includes(family)) continue;
-    const names = await tensorNames(family);
-    const fused = !names.some((name) => name.includes(UNFUSED));
-    assert.ok(fused || STRUCTURAL_TOKENS.includes(family),
-      `${family} is NOT on WEBGL2_FAMILIES, yet it carries ${UNFUSED} and does not re-tokenise`
-      + " - so a browser without WebGPU is being refused a fold it could have had");
+    assert.ok(STRUCTURAL_TOKENS.includes(family),
+      `${family} is NOT on WEBGL2_FAMILIES and does not re-tokenise - so a browser without WebGPU is being refused`
+      + " a fold it could have had");
   }
 });

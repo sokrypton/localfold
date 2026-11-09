@@ -462,8 +462,11 @@ export function conditionedTransition(execution, call) {
   // undefined weight, which at least throws; the danger is 'fixing' it by
   // renaming here and silently splitting the convention in two."
   const batch = call.condBatch;
-  // ...the batched AdaLN writes the up projection's padded x itself, where that projection would pad one
-  const xStride4 = cond !== undefined && batch !== undefined && !execution.noPrepaddedX
+  // ...the batched AdaLN writes the up projection's padded x itself, where that projection would pad one - 🔴 BUT NOT
+  // WHEN boltz2's UP-GATE (`ffwAToB`) READS THE SAME x, which it takes unpadded: "linear: x holds 60416 floats, not 59 x
+  // 768" was the first boltz2 fold here, and AF3's path never has the gate, so nothing else saw it
+  const upGated = w[`${prefix}ffwAToB`] !== undefined && w[`${prefix}ffwAToB`] !== null;
+  const xStride4 = cond !== undefined && batch !== undefined && !execution.noPrepaddedX && !upGated
     ? linearPaddedStride4(execution, { rows, inChannels: channels, outChannels: intermediate * 2, weightLayout: "in-major" })
     : 0;
   const normalised = cond === undefined
@@ -591,6 +594,21 @@ export function conditionedSelfAttention(execution, call) {
     value = project(w.vProjection);
     gate = project(w.gatingQuery, undefined, "sigmoid");
   }
+  // 🔴 rosettafold3's kq_norm: a TRAINED LayerNorm on q and k over the flattened heads x dimension, after the projection
+  // and before the scaling (shared/af3/weights/diffusion-weights.js) - read off the weights, which only rf3 carries.
+  // Missing here, its whole denoiser attended on unnormalised queries and keys.
+  if (w.queryLayerNormScale !== undefined && w.queryLayerNormScale !== null) {
+    const normalise = (tensor, which) => {
+      const out = layerNorm(execution, {
+        x: tensor, weight: w[`${which}LayerNormScale`], bias: w[`${which}LayerNormOffset`],
+        rows: tokens, channels: width, epsilon,
+      });
+      execution.release(tensor);
+      return out;
+    };
+    query = normalise(query, "query");
+    key = normalise(key, "key");
+  }
   // ...the scale is the PER-HEAD dimension, which `attentionFlash` defaults to.
   const { output: gathered } = attentionFlash(execution, {
     query, key, value, gate, mask, pairBias: pairLogits,
@@ -710,9 +728,14 @@ export function* diffusionTransformerSteps(execution, call) {
         });
         execution.release(attention);
       }
-      if (own) execution.release(current);
+      // 🔴 rosettafold3's BLOCK IS PARALLEL (`diffusionNoResidual`, `w.noResidual`): its transition reads the
+      // PRE-attention activation and the block stores `act + attention(act) + transition(act)`, where AF3's reads
+      // `act + attention`. The atom stacks had the convention here and this transformer did not - rf3's WebGL2 fold was
+      // 1.1 A from WebGPU's after superposition with the trunk exact (webgpu/af3/diffusion/diffusion-transformer.js).
+      const parallel = w.noResidual === true;
+      if (own && !parallel) execution.release(current);
       const transitioned = conditionedTransition(execution, {
-        x: afterAttention, cond, rows: tokens, channels,
+        x: parallel ? current : afterAttention, cond, rows: tokens, channels,
         factor: w.transitionFactor, weights: block, prefix: "", condChannels, epsilon, condBatch: blockBatch,
         ...(fused ? { residual: afterAttention } : {}),
       });
@@ -727,6 +750,7 @@ export function* diffusionTransformerSteps(execution, call) {
         });
         execution.release(transitioned);
       }
+      if (own && parallel) execution.release(current);
       execution.release(afterAttention);
       current = next;
       own = true;

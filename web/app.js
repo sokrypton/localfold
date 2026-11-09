@@ -5018,10 +5018,9 @@ async function fold(event) {
     // none): a family that cannot run must say so, never fold something else and never hang.
     // The sentence names what does work, because "not supported" leaves the visitor nowhere.
     const backend = await foldBackend();
-    // 🔴 AND THE LIST IS NARROWER THAN THE LINEAGE - see WEBGL2_FAMILIES. Four of the eight AF3
-    // bundles carry the FUSED template embedder, which webgl/ has not ported, and OpenDDE
-    // re-tokenises after the trunk; refusing them HERE is what keeps a visitor from downloading
-    // half a gigabyte of parameters before finding out.
+    // 🔴 AND THE LIST IS NARROWER THAN THE LINEAGE - see WEBGL2_FAMILIES: OpenDDE re-tokenises
+    // after the trunk, which webgl/ has not ported; refusing it HERE is what keeps a visitor from
+    // downloading half a gigabyte of parameters before finding out.
     if (backend === "webgl2" && !WEBGL2_FAMILIES.includes(family)) {
       throw new Error(`${MODEL_LABELS[family] ?? family} needs WebGPU, which this browser does not`
         + ` have. ${WEBGL2_FAMILIES.map((one) => MODEL_LABELS[one] ?? one).join(", ")}`

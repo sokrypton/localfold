@@ -56,6 +56,7 @@ import {
 import { AF3_HALF_WEIGHT_FLOOR, AF3_POOL_LIMIT_BYTES, foldMsa } from "../../webgl/af3/model/fold-batch.js";
 import { DIFFUSION_DEFAULTS, foldBatch } from "../../webgpu/af3/fold.js";
 import { relativeRms } from "./relative-rms.js";
+import { modelAlphaCarbons, superpose } from "./superpose.js";
 
 const DEFAULT_SEQUENCE = "PIAQIHILEGRSDEQKETLIREVSEAISRSLDAPLTSVRVIITEMAKGHFGIGGELASK";
 
@@ -206,8 +207,14 @@ export async function main(device, args) {
   const jsProfiler = flag(args, "js-profile") && typeof globalThis.Profiler === "function"
     ? new globalThis.Profiler({ sampleInterval: 1, maxBufferSize: 1_000_000 }) : null;
   const foldStart = performance.now();
+  // `--seams`: the trunk's stage seams on both backends (first pass), under webgpu/af3/trunk/trunk.js's tap names, so a
+  // disagreement is placed at the stage that makes it rather than read off the finished pair
+  const seams = flag(args, "seams") ? { ours: {}, theirs: {} } : null;
   const result = foldAf3(execution, {
     ...call,
+    ...(seams === null ? {} : {
+      onSeam: (name, values, pass) => { if (pass === 0 && !(name in seams.ours)) seams.ours[name] = values; },
+    }),
     // ...the page's progress stages carry the contact map; the log keeps their names and numbers only
     onStage: (name, detail) => {
       if (["trunk-stage", "pairformer-block-done", "recycle-done", "trunk-done", "target-feat-start"].includes(name)) return;
@@ -265,6 +272,14 @@ export async function main(device, args) {
     // pins all four of its precision axes and is the arm that separates them.
     const theirs = await foldBatch(device, batch, weights, {
       steps, recycles, seed, templates, trunkLogits: false,
+      ...(seams === null ? {} : {
+        onSeam: (name, values) => { if (!(name in seams.theirs)) seams.theirs[name] = Float32Array.from(values); },
+        onStage: (name, detail) => {
+          if (name === "target-feat" && detail?.targetFeat !== undefined && !("target_feat" in seams.theirs)) {
+            seams.theirs.target_feat = Float32Array.from(detail.targetFeat);
+          }
+        },
+      }),
       ...(flag(args, "reference-f32") ? {
         stagedPrecision: "f32", weightPrecision: "f32",
         pairWeightPrecision: "f32", accumulatePrecision: "f32",
@@ -296,6 +311,9 @@ export async function main(device, args) {
       relativeRms: Number(relativeRms(
         result.positions, theirs.positions, "positions").toPrecision(4)),
       worstAtomAngstroms: Number(worst.toFixed(4)),
+      // ...and the alpha carbons SUPERPOSED, which separates a different structure from the same one in another frame
+      superposedCaRmsd: Number(superpose(modelAlphaCarbons(batch, result.positions),
+        modelAlphaCarbons(batch, theirs.positions)).rmsd.toFixed(4)),
       theirMeanPlddt: theirs.meanPlddt === undefined
         ? null : Number(theirs.meanPlddt.toFixed(3)),
       theirPtm: theirs.ptm === undefined ? null : Number(theirs.ptm.toFixed(4)),
@@ -319,6 +337,13 @@ export async function main(device, args) {
       // which is exactly what this comparison first reported.
       trunkSingleRelativeRms: theirs.trunk?.single === undefined ? null
         : Number(relativeRms(result.trunkSingle, theirs.trunk.single, "single").toPrecision(4)),
+      ...(seams === null ? {} : {
+        seams: Object.fromEntries(Object.keys(seams.ours).map((name) => [name,
+          !(name in seams.theirs) ? "WGSL has no such seam"
+            : seams.theirs[name].length !== seams.ours[name].length
+              ? `lengths ${seams.ours[name].length} against ${seams.theirs[name].length}`
+              : Number(relativeRms(seams.ours[name], seams.theirs[name], name).toPrecision(4))])),
+      }),
       trunkPairRelativeRms: theirs.trunk?.pair === undefined ? null
         : Number(relativeRms(result.trunkPair, theirs.trunk.pair, "pair").toPrecision(4)),
       plddtRelativeRms: theirs.scores === undefined ? null : Number(relativeRms(

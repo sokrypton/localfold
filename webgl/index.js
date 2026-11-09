@@ -5,19 +5,11 @@
  * names a backend rather than a file. See `webgl/README.md` for what is here,
  * what is measured, and how much of AF2 is still missing.
  *
- * 🔴 THE PAGE SELECTS THIS BACKEND NOW, FOR THREE MODELS. `web/model.js`'s `foldBackend` asks for
- * WebGPU first and answers "webgl2" when there is none, and `web/app.js` folds the families in
- * `WEBGL2_FAMILIES` - af3, openbind0, intellifold2 - through `web/af3-model.js`'s
- * `backend: "webgl2"`. Measured on a browser with `navigator.gpu` deleted
- * (`tools/fold-in-page.py --no-webgpu`): AlphaFold 3 at pLDDT 68.0 in 11 s against WebGPU's 68.2
- * in 1 s, OpenBind-0 60.1, IntelliFold-2 54.4. The status line ends in "· WebGL2" so a reader
- * knows which one folded.
- *
- * 🔴 AND THE OTHER FIVE LINEAGE BUNDLES ARE REFUSED BY NAME, BEFORE THE DOWNLOAD. boltz2,
- * protenix2, mol1 and rosettafold3 carry the FUSED template embedder, which `af3/trunk/template.js`
- * has not ported - protenix2 folds on WebGPU at pLDDT 62.2 and died here at "templatePairEmbedding8
- * is missing" after half a gigabyte of parameters - and opendde re-tokenises after the trunk.
- * `test/webgl2-families.test.js` holds that list to the manifests in both directions.
+ * 🔴 THE PAGE SELECTS THIS BACKEND NOW, FOR SEVEN MODELS - every AF3-lineage family but OpenDDE, which re-tokenises
+ * after the trunk and is refused by name before the download (`WEBGL2_FAMILIES`, held to the lineage by
+ * `test/webgl2-families.test.js`). `web/model.js`'s `foldBackend` asks for WebGPU first and answers "webgl2" when there
+ * is none, and `web/app.js` folds those families through `web/af3-model.js`'s `backend: "webgl2"`. The status line
+ * ends in "· WebGL2" so a reader knows which one folded.
  *
  * `tools/build_site.py` copies this tree now (it is in DIRECTORIES): `web/af3-model.js` imports it
  * STATICALLY, so a dist/ without it is a page whose AF3 path does not load at all.

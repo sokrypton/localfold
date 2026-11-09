@@ -546,8 +546,12 @@ uniform sampler2D bTex;
 
 void main() {
   int texel = linearTexel();
-  int lane = texel % TILEW;
-  int channel = (texel % W) / TILEW;
+  // 🔴 THE LANE IS TAKEN WITHIN THE ROW, as the repack reads it: texel % TILEW is the same number only when TILEW
+  // divides W - 128, 256 and 448 channels (TILEW 16, 8, 4) - and at 192, 288, 320 or 384 (10, 7, 6, 5) every row
+  // after the first wrote its blocks into a neighbour's slot: relRMS 1.15 at 24 tokens, from Mol-1's 320-wide trunk.
+  int column = texel % W;
+  int lane = column % TILEW;
+  int channel = column / TILEW;
   int block = (texel / W) * TILEW + lane;
   // The grid is whole texture rows, so its tail is real draws and must write
   // rather than wrap - a target left unwritten is a texel nothing wrote.

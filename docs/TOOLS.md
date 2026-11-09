@@ -11,9 +11,9 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-486 tools. `tools/fixtures/` is data and is not listed.
+489 tools. `tools/fixtures/` is data and is not listed.
 
-## `tools/gpu/` - the WebGPU lane (288)
+## `tools/gpu/` - the WebGPU lane (291)
 
 Each exports `async function main(device, args)` and is run as
 `node tools/gpu-chrome.mjs tools/gpu/<module>.js [--flags]`.
@@ -143,7 +143,9 @@ Each exports `async function main(device, args)` and is run as
 - **`check-webgl-af3-atom-block.js`** - AF3's atom cross-attention block in WebGL2 against `cpu/af3/diffusion/atom-encoder.js`.
 - **`check-webgl-af3-atom-conditioning.js`** - AF3's per-atom conditioning in WebGL2 against `cpu/af3/diffusion/atom-conditioning.js`.
 - **`check-webgl-af3-atom-encoder.js`** - AF3's atom cross-attention encoder in WebGL2 against `cpu/af3/diffusion/atom-encoder.js`.
+- **`check-webgl-af3-block-bundle.js`** - WebGL2's pairformer block on a REAL bundle's block - any family, any stack - against cpu/af3/trunk/pairformer.js.
 - **`check-webgl-af3-block.js`** - One AF3 pairformer block in WebGL2, against TWO references.
+- **`check-webgl-af3-chiral.js`** - rosettafold3's chirality gradient in WebGL2 (`chiralGradientSource`, webgl/af3/diffusion/atom-encoder.js) against its CPU twin, `chiralPositionGradients` in shared/af3/diffusion/chiral-gradient.js.
 - **`check-webgl-af3-confidence.js`** - AF3's confidence head in WebGL2 against `cpu/af3/confidence/confidence.js`.
 - **`check-webgl-af3-diffusion-conditioning.js`** - AF3's diffusion conditioning in WebGL2 against `cpu/af3/diffusion/diffusion.js`.
 - **`check-webgl-af3-diffusion-head.js`** - AF3's whole diffusion head - one denoising step - in WebGL2 against `cpu/af3/diffusion/diffusion.js`.
@@ -282,6 +284,7 @@ Each exports `async function main(device, args)` and is run as
 - **`probe-webgl-ksplit-chain.js`** - A DEPENDENT CHAIN of projections - each reading the last one's output, as a fold's are - with the inner loop split across instances and summed by the BLEND unit, against one fragment walking the whole loop.
 - **`probe-webgl-limits.js`** - The WebGL2 limits that decide what shape a kernel in this backend can be.
 - **`probe-webgl-linear-operand.js`** - Which OPERAND binds the WebGL2 dense projection - x, or the weight codes?
+- **`probe-webgl-linear-shapes.js`** - `linear` at given shapes against a float64 host product - in-major weights, with and without kept planes, a residual and a multiplier - to place a shape-dependent fault in one projection.
 - **`probe-webgl-packed-x.js`** - Whether reading a projection's x as EIGHT halves a texel (RGBA32UI, unpackHalf2x16) beats four (RGBA16F).
 - **`probe-webgl-precision.js`** - Does `mediump` reach this device's HALF arithmetic, and is it faster?
 - **`probe-webgl-programs.js`** - Which WebGL2 programs a fold compiles and what each one costs, for ANY of the fold tools - by wrapping one rather than by being one, as probe-compiles.js does for WGSL.

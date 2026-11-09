@@ -46,6 +46,7 @@
  * odd tails, 12 and 68 for the block and the coalesced reads, and 68 because it
  * is the width the trunk folds.
  */
+import { webglExecutionOptions } from "./webgl-execution-options.js";
 import { triangleMultiplication as cpuTriangle } from "../../cpu/af3/trunk/pairformer.js";
 import { af3TriangleWeights } from "../../webgpu/af3/trunk/triangle.js";
 import { TriangleMultiplicationIncomingGpu, TriangleMultiplicationOutgoingGpu }
@@ -82,7 +83,11 @@ export async function main(device, args) {
   setDeviceTuning(device, { allowHostWeightPacking: true });
   setHalfPrecision(device, false);
   const gl = createWebGL2Context();
-  const execution = new Execution(gl);
+  // (the shared option flags reach it, so a kernel path can be switched off and the arm still checked - f32 unless
+  // asked, which is what the bar is for: `--half-weights` / `--half-x` for the fold's precisions)
+  const execution = new Execution(gl, {
+    ...webglExecutionOptions(args), halfWeights: args.includes("--half-weights"), halfActivations: args.includes("--half-x"),
+  });
   const arms = [];
   const failures = [];
 
