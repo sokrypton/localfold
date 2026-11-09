@@ -3417,3 +3417,9 @@ Measured and NOT kept: the diffusion attention's output projection reading the f
 gate and residual in the same draw (`attention.interleave`, `linear:59x768x768` and `adaln.zero-slice` as one).
 Bit-identical, and diffusion 2850 -> 2843 ms - nothing. Two small draws a block are not what that path costs; the
 removals that paid (the repacks, the transposes) each took a full pass over a 3481-row or 3072-wide tensor with them.
+
+Kept: the triangle multiplication's `projection` and `gate` (two 3481 x 128 -> 256 in-major projections of the same
+normalised pair) as one 128 -> 512 (`fuseTriangleProjections`), which the aspect rule blocks; the operand draw reads
+both halves of one tensor. Trunk 1349 -> 1311 ms, every fused round ahead of every control round; not bit-identical
+(the blocked path), pLDDT 94.02 -> 94.01, worst atom against WebGPU 0.102 -> 0.113 A, relRms 7.6e-4 -> 7.8e-4.
+`--no-triangle-fused-projection` is the arm.
