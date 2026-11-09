@@ -208,9 +208,11 @@ export async function main(device, args) {
   const foldStart = performance.now();
   const result = foldAf3(execution, {
     ...call,
-    onStage: (name, detail) => stages.push({
-      name, ...detail, at: Math.round(performance.now() - foldStart),
-    }),
+    // ...the page's progress stages carry the contact map; the log keeps their names and numbers only
+    onStage: (name, detail) => {
+      if (["trunk-stage", "pairformer-block-done", "recycle-done", "trunk-done", "target-feat-start"].includes(name)) return;
+      stages.push({ name, ...detail, at: Math.round(performance.now() - foldStart) });
+    },
   });
   const foldMs = Math.round(performance.now() - foldStart);
   let jsProfile = null;

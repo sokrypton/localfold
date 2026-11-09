@@ -610,6 +610,14 @@ export function* foldAf3Steps(execution, call) {
     pseudoBetaGather: uploadGather(batch.tokenAtomsToPseudoBeta, "af3.batch.t2pb"),
   };
 
+  // 🔴 THE PAGE'S PROGRESS SPEAKS WebGPU's STAGE NAMES (web/af3-model.js): `target-feat-start`, `trunk-stage`,
+  // `pairformer-block-done`, `recycle-done` with the pass's contact map, `trunk-done`. This fold reported its own
+  // (`recycle`, `embed`, `trunk`, ...) and the page heard none of them, so a WebGL2 fold showed no trunk progress and
+  // no contact map until the end. Both sets are reported now; the tools read the old names.
+  const passes = recycles + 1;
+  call.onStage?.("target-feat-start", {});
+  // ...and a pause, so "Preparing" is painted before the featurisation's draws (the page's paced fold yields here)
+  yield { stage: "target-feat-start" };
   const targetFeat = buildTargetFeat(execution, {
     batch, weights: { ...weights, batchTensors }, flags, onStage: call.onStage,
   });
@@ -676,6 +684,7 @@ export function* foldAf3Steps(execution, call) {
   let trunk;
   for (let pass = 0; pass <= recycles; pass += 1) {
     call.onStage?.("recycle", { pass, passes: recycles + 1 });
+    call.onStage?.("trunk-stage", { name: "embedder", pass, passes });
     let passMsa = [];
     if (msaOfPass !== null) {
       const drawn = msaOfPass(pass);
@@ -704,6 +713,7 @@ export function* foldAf3Steps(execution, call) {
     // the slot mask, so a template-free fold still gets a pair update.
     let templateUpdate;
     if (weights.template !== undefined) {
+      call.onStage?.("trunk-stage", { name: "template", pass, passes });
       templateUpdate = yield* templateEmbeddingSteps(execution, {
         pair: embedded.pair, pairMask: batchTensors.pairMask,
         tokens, templates, weights: weights.template, codes, geometry, repeats, repeatOf,
@@ -713,7 +723,9 @@ export function* foldAf3Steps(execution, call) {
       call.onStage?.("template", { pass, templates });
       yield { stage: "template", pass };
     }
-    const next = yield* runTrunkSteps(execution, {
+    const blocks = weights.pairformerBlocks.length;
+    if (weights.msaBlocks.length > 0) call.onStage?.("trunk-stage", { name: "msa-stack", pass, passes });
+    const trunkSteps = runTrunkSteps(execution, {
       embedded, templateUpdate,
       msaMask, pairMask: batchTensors.pairMask, seqMask: batchTensors.seqMask,
       contactBins: batchTensors.contactBins,
@@ -727,6 +739,26 @@ export function* foldAf3Steps(execution, call) {
       divideByLength: flags.divideByLength,
       opmBiasAfterNorm: flags.opmBiasAfterNorm,
     });
+    let stepped = trunkSteps.next();
+    let inPairformer = false;
+    while (!stepped.done) {
+      const step = stepped.value;
+      if (step?.stage === "pairformer") {
+        if (!inPairformer) {
+          inPairformer = true;
+          call.onStage?.("trunk-stage", { name: "pairformer", pass, passes });
+        }
+        // ...at the block's yield, where the page's paced fold pauses one slice behind the GPU
+        call.onStage?.("pairformer-block-done", { completed: step.index + 1, total: blocks, pass, passes });
+        if (step.index + 1 === blocks) call.onStage?.("trunk-stage", { name: "distogram", pass, passes });
+      }
+      yield step;
+      stepped = trunkSteps.next();
+    }
+    const next = stepped.value;
+    // ...and the pass's contact map, so the page's map sharpens per recycle as it does on WebGPU (one small read)
+    const passContacts = Float32Array.from(execution.read(next.contactProbs));
+    call.onStage?.("recycle-done", { pass, passes, trunk: { contactProbs: passContacts } });
     if (templateUpdate !== undefined) execution.release(templateUpdate);
     for (const tensor of passMsa) execution.release(tensor);
     // ...the pass's pair and single ARE the next pass's recycled state.
@@ -743,6 +775,7 @@ export function* foldAf3Steps(execution, call) {
   }
   yield { stage: "contacts" };
   const contactProbs = Float32Array.from(execution.read(trunk.contactProbs));
+  call.onStage?.("trunk-done", { trunk: { contactProbs } });
   execution.release(trunk.logits);
   execution.release(trunk.contactProbs);
 
