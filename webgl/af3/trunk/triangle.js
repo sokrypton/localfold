@@ -62,10 +62,13 @@ export const TRIANGLE_WEIGHTS = [
  * written by one draw to two draw buffers - the gate's sigmoid is computed once
  * for both halves of the pair of channels.
  */
-const operandsSourceUncached = (length, channels) => sized({ L: length, PAIRS: length * length, ELEMENTS: channels * length * length }, `${PRELUDE}
+const operandsSourceUncached = (length, channels, fused = false) => sized({ L: length, PAIRS: length * length, ELEMENTS: channels * length * length }, `${PRELUDE}
 layout(location = 0) out vec4 aOut;
 layout(location = 1) out vec4 bOut;
 const int C = ${channels};
+// fused: projection and gate are one [pairs][4C] tensor (fuseTriangleProjections), the gate after the projection
+const int ROWW = ${fused ? 4 * channels : 2 * channels};
+const int GATE_AT = ${fused ? 2 * channels : 0};
 uniform sampler2D projectionTex;
 uniform sampler2D gateTex;
 uniform sampler2D maskTex;
@@ -91,10 +94,10 @@ void main() {
     int c = element / PAIRS;
     int index = element - c * PAIRS;
     // The INTERLEAVED split: channel c's two halves are outputs 2c and 2c + 1.
-    int wide = index * 2 * C + c * 2;
+    int wide = index * ROWW + c * 2;
     float m = fetch1(maskTex, index);
-    float gateA = fetch1(gateTex, wide);
-    float gateB = fetch1(gateTex, wide + 1);
+    float gateA = fetch1(gateTex, wide + GATE_AT);
+    float gateB = fetch1(gateTex, wide + GATE_AT + 1);
     float left = fetch1(projectionTex, wide) * m / (1.0 + exp(-gateA));
     float right = fetch1(projectionTex, wide + 1) * m / (1.0 + exp(-gateB));
     if (lane == 0) { a.x = left; b.x = right; }
@@ -115,10 +118,13 @@ void main() {
  * direction drew `pad-planes` twice and the incoming `transpose-a` and `transpose-b`, over a pair-sized tensor each.
  * `--no-triangle-fused-layout` is the arm that keeps them.
  */
-const operandsLaidOutSourceUncached = (length, channels, paddedLength, transposed) => sized({ L: length, LP: paddedLength, PLANE: paddedLength * paddedLength, ELEMENTS: channels * paddedLength * paddedLength }, `${PRELUDE}
+const operandsLaidOutSourceUncached = (length, channels, paddedLength, transposed, fused = false) => sized({ L: length, LP: paddedLength, PLANE: paddedLength * paddedLength, ELEMENTS: channels * paddedLength * paddedLength }, `${PRELUDE}
 layout(location = 0) out vec4 aOut;
 layout(location = 1) out vec4 bOut;
 const int C = ${channels};
+// fused: projection and gate are one [pairs][4C] tensor (fuseTriangleProjections), the gate after the projection
+const int ROWW = ${fused ? 4 * channels : 2 * channels};
+const int GATE_AT = ${fused ? 2 * channels : 0};
 uniform sampler2D projectionTex;
 uniform sampler2D gateTex;
 uniform sampler2D maskTex;
@@ -139,10 +145,10 @@ void main() {
       int j = j0 + lane;
       if (j >= L) break;
       int index = ${transposed ? "j * L + i" : "i * L + j"};
-      int wide = index * 2 * C + c * 2;
+      int wide = index * ROWW + c * 2;
       float m = fetch1(maskTex, index);
-      float gateA = fetch1(gateTex, wide);
-      float gateB = fetch1(gateTex, wide + 1);
+      float gateA = fetch1(gateTex, wide + GATE_AT);
+      float gateB = fetch1(gateTex, wide + GATE_AT + 1);
       float left = fetch1(projectionTex, wide) * m / (1.0 + exp(-gateA));
       float right = fetch1(projectionTex, wide + 1) * m / (1.0 + exp(-gateB));
       if (lane == 0) { a.x = left; b.x = right; }
@@ -827,16 +833,38 @@ const paddedPairLength = (execution, length, channels = 0) => {
 export function uploadTriangleWeights(execution, weights) {
   /** @type {Record<string, Tensor>} */
   const out = {};
+  const fused = execution.noTriangleFusedProjection ? null : fuseTriangleProjections(weights);
   for (const name of TRIANGLE_WEIGHTS) {
     const values = weights[name];
     if (values === undefined) throw new Error(`af3 triangle weights: ${name} is missing`);
+    if (fused !== null && (name === "projection" || name === "gate")) continue;
     out[name] = execution.uploadWeight(values, `w.af3.triangle.${name}`);
   }
+  if (fused !== null) out.projectionGate = execution.uploadWeight(fused, "w.af3.triangle.projection-gate");
   return out;
 }
 
+/**
+ * The two `[C][2C]` in-major projections that both read the normalised pair, as ONE `[C][4C]` - the projection's
+ * columns then the gate's - which `triangleMultiplication` runs as one projection. Null on a shape it does not expect.
+ */
+export function fuseTriangleProjections(weights) {
+  const { projection: p, gate: g } = weights;
+  if (!(p instanceof Float32Array) || !(g instanceof Float32Array) || p.length !== g.length) return null;
+  const channels = Math.round(Math.sqrt(p.length / 2));
+  if (2 * channels * channels !== p.length) return null;
+  const fused = new Float32Array(4 * channels * channels);
+  for (let c = 0; c < channels; c += 1) {
+    fused.set(p.subarray(c * 2 * channels, (c + 1) * 2 * channels), c * 4 * channels);
+    fused.set(g.subarray(c * 2 * channels, (c + 1) * 2 * channels), c * 4 * channels + 2 * channels);
+  }
+  return fused;
+}
+
 export function releaseTriangleWeights(execution, weights) {
-  for (const name of TRIANGLE_WEIGHTS) execution.release(weights[name]);
+  for (const name of [...TRIANGLE_WEIGHTS, "projectionGate"]) {
+    if (weights[name] !== undefined) execution.release(weights[name]);
+  }
 }
 
 /**
@@ -867,11 +895,13 @@ export function triangleMultiplication(execution, call) {
     x: pair, weight: w.leftNormInputScale, bias: w.leftNormInputOffset,
     rows: pairs, channels, epsilon, variance: "fast",
   });
+  // ...one [C][4C] projection where the two were fused at upload (`fuseTriangleProjections`)
+  const fusedProjection = w.projectionGate !== undefined;
   const projection = linear(execution, {
-    x: normalised, weight: w.projection, rows: pairs,
-    inChannels: channels, outChannels: channels * 2, weightLayout: "in-major",
+    x: normalised, weight: fusedProjection ? w.projectionGate : w.projection, rows: pairs,
+    inChannels: channels, outChannels: channels * (fusedProjection ? 4 : 2), weightLayout: "in-major",
   });
-  const gate = linear(execution, {
+  const gate = fusedProjection ? projection : linear(execution, {
     x: normalised, weight: w.gate, rows: pairs,
     inChannels: channels, outChannels: channels * 2, weightLayout: "in-major",
   });
@@ -886,14 +916,14 @@ export function triangleMultiplication(execution, call) {
   const a = execution.allocate(planeElements, "af3.triangle.a");
   const b = execution.allocate(planeElements, "af3.triangle.b");
   execution.dispatch({
-    source: laidOut ? operandsLaidOutSource(length, channels, layoutPadded, layoutTransposed)
-      : operandsSource(length, channels),
+    source: laidOut ? operandsLaidOutSource(length, channels, layoutPadded, layoutTransposed, fusedProjection)
+      : operandsSource(length, channels, fusedProjection),
     outputs: [a, b],
     inputs: { projectionTex: projection, gateTex: gate, maskTex: mask },
     label: `af3.triangle.operands${laidOut ? (layoutTransposed ? ":transposed" : ":padded") : ""}:${length}x${channels}`,
   });
   execution.release(projection);
-  execution.release(gate);
+  if (!fusedProjection) execution.release(gate);
 
   const centred = execution.allocate(pairs * channels, "af3.triangle.centred");
   if (execution.noTriangleSplit) {
