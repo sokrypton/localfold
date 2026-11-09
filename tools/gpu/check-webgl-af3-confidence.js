@@ -52,6 +52,7 @@ import {
   releasePairformerBlockWeights, uploadPairformerBlockWeights,
 } from "../../webgl/af3/trunk/pairformer-block.js";
 import { Execution } from "../../webgl/runtime/execution.js";
+import { tokenIdentity } from "../../webgl/af3/trunk/embedder.js";
 import { createWebGL2Context } from "../../webgl/index.js";
 import { generator } from "./af2-synthetic-block.js";
 import { pairformerBlockWeights } from "./af3-synthetic-pairformer.js";
@@ -102,6 +103,15 @@ export async function main(device, args) {
     }
   }
 
+  // the token identity boltz2's re-embedding reads (its relative encoding), and token bonds with their orders - a few
+  // of each, so the bond, bond-order and contact terms are all live
+  const features = {
+    residueIndex: Int32Array.from({ length: tokens }, (_, t) => (t < Math.ceil(tokens / 2) ? t : t - Math.ceil(tokens / 2))),
+    tokenIndex: Int32Array.from({ length: tokens }, (_, t) => t),
+    asymId, entityId: Int32Array.from(asymId), symId: new Int32Array(tokens),
+  };
+  const bondMatrix = Float32Array.from({ length: pairs }, (_, p) => (p % 7 === 3 ? 1 : 0));
+  const bondOrderMatrix = Float32Array.from({ length: pairs }, (_, p) => (p % 7 === 3 ? 1 + (p % 4) : 0));
   const pair = noise(pairs * pairChannels, 1);
   // 🔴 THE SINGLE AT THE TRUNK'S OWN MAGNITUDE, NOT AT NOISE SCALE. AF3's trunk
   // single "reaches 1.7e5" and enters this head at a standard deviation of 211,
@@ -197,6 +207,32 @@ export async function main(device, args) {
       dialect: {},
     },
     {
+      // 🔴 boltz2's NINE-TERM REBUILD OF z AND s, which this head refused by name until it was ported (2026-11-09):
+      // LN(z) + relpos + a 64-bin distogram + bonds + bond orders + the unspecified contact term + both target_feat
+      // projections + an outer product of two more, and s = LN(s) + a projection of LN(target_feat)
+      name: "boltz2 (the confidence re-embedding)",
+      weights: {
+        ...base,
+        reembed: {
+          sInputsNormScale: noise(targetFeatWidth, 0.2, 1), sInputsNormOffset: noise(targetFeatWidth, 0.1),
+          sNormScale: noise(singleChannels, 0.2, 1), sNormOffset: noise(singleChannels, 0.1),
+          sInputToS: noise(targetFeatWidth * singleChannels, 1 / Math.sqrt(targetFeatWidth)),
+          zNormScale: noise(pairChannels, 0.2, 1), zNormOffset: noise(pairChannels, 0.1),
+          relPosProject: noise(139 * pairChannels, 0.3),
+          tokenBondsProject: noise(pairChannels, 0.3),
+          tokenBondsTypeEmbed: noise(7 * pairChannels, 0.3),
+          contactEncodingUnspecified: noise(pairChannels, 0.3),
+          leftTargetFeatProject: noise(targetFeatWidth * pairChannels, 1 / Math.sqrt(targetFeatWidth)),
+          rightTargetFeatProject: noise(targetFeatWidth * pairChannels, 1 / Math.sqrt(targetFeatWidth)),
+          sToZProdIn1: noise(targetFeatWidth * pairChannels, 1 / Math.sqrt(targetFeatWidth)),
+          sToZProdIn2: noise(targetFeatWidth * pairChannels, 1 / Math.sqrt(targetFeatWidth)),
+          sToZProdOut: noise(pairChannels * pairChannels, 1 / Math.sqrt(pairChannels)),
+          distogramFeatProject: noise(64 * pairChannels, 0.3),
+        },
+      },
+      dialect: { reembedConfidencePair: true },
+    },
+    {
       name: "boltz2's pair heads (split intra/inter, symmetrised first)",
       weights: {
         ...base, distogramFeatProject: af3Dgram,
@@ -235,6 +271,10 @@ export async function main(device, args) {
     seqMask: upload(seqMask, "af3.conf.seq-mask"),
     asymId: upload(Float32Array.from(asymId), "af3.conf.asym"),
     atomNameChars: upload(atomNameChars, "af3.conf.names"),
+    identity: upload(tokenIdentity(features, tokens), "af3.conf.identity"),
+    bondMatrix: upload(bondMatrix, "af3.conf.bonds"),
+    bondOrderMatrix: upload(bondOrderMatrix, "af3.conf.bond-orders"),
+    contactIndex: upload(new Float32Array(pairs), "af3.conf.contact-index"),
   };
 
   const arms = [];
@@ -250,6 +290,13 @@ export async function main(device, args) {
       ...inputs,
       tokens, dense, weights: uploaded, blocks: uploadedBlocks,
       ...dialect,
+      ...(dialect.reembedConfidencePair ? {
+        identity: inputs.identity, bondMatrix: inputs.bondMatrix, bondOrderMatrix: inputs.bondOrderMatrix,
+        contactTerms: {
+          index: inputs.contactIndex,
+          table: upload(weights.reembed.contactEncodingUnspecified, "af3.conf.contact-table"),
+        },
+      } : {}),
     });
     const mine = {};
     for (const key of ["plddt", "pae", "pde", "distanceLogits", "paeLogits",
@@ -265,7 +312,7 @@ export async function main(device, args) {
     // itself" trap wearing the clothes of a control.
     let expected = cpuConfidenceHead({
       tokens, dense, seqMask, pair, single, targetFeat, pseudoBeta,
-      features: { asymId },
+      features, bondMatrix, bondOrderMatrix,
     }, weights, cpuPairformerBlock, dialect);
     if (dialect.perAtomHeadsByRank === true) {
       // The per-atom heads read by the atom's RANK among its token's real atoms.
@@ -347,7 +394,7 @@ export async function main(device, args) {
       for (const block of uploadedBlocks) releasePairformerBlockWeights(execution, block);
     }
   };
-  refuses("boltz2's nine-term re-embedding of z", "has not ported",
+  refuses("boltz2's re-embedding with none of the inputs it reads", "needs the reembed weights",
     () => runWith({ ...base, distogramFeatProject: af3Dgram },
       { reembedConfidencePair: true }));
   refuses("a 39-bin weight under rf3's 40-boundary dialect", "bins",

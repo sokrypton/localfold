@@ -51,8 +51,9 @@ export async function main(device, args) {
   const pairChannels = Number(option(args, "pair-channels", "32"));
   const msaChannels = Number(option(args, "msa-channels", "32"));
   const outerChannels = 8;
-  const msaHeads = 4;
-  const msaDimension = 8;
+  // `--msa-heads=8 --msa-dimension=32` is boltz2's and rf3's attention, whose width is not the MSA's channels
+  const msaHeads = Number(option(args, "msa-heads", "4"));
+  const msaDimension = Number(option(args, "msa-dimension", "8"));
   const pairHeads = 4;
   const pairDimension = 8;
   const opmBiasAfterNorm = flag(args, "opm-bias-after-norm");

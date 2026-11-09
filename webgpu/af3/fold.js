@@ -1100,6 +1100,7 @@ async function foldHolding(device, batch, weights, options, held) {
       finalPair = held.hold(trunk.pairAllocation);
     }
     const comparable = hasPrevious && previousPair !== undefined && trunk.pair !== undefined
+      && previousSingle !== undefined && trunk.single !== undefined
       && previousPair.length === trunk.pair.length
       && previousSingle.length === trunk.single.length;
     // 🔴 AND THE DISTOGRAM, WHICH IS THE ONE IN ANGSTROMS. Every pass computes

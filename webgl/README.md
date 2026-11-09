@@ -3756,3 +3756,48 @@ On the page (`fold-in-page.py --no-webgpu`, Chrome): Boltz-2 pLDDT 64.6 in 8 s, 
 own crystal as a template: Protenix-v2 pLDDT 95.3 both ways, 261/261 covered (212 s here, 46 s on WebGPU).
 (This box's local `model-boltz2-int5` and `model-rosettafold3-int5` are not the exports the registry pins - the page
 404s or refuses a shard on WebGPU as well - so those two page folds used `--remote-weights`.)
+
+### The input kinds, every family: two defects, both fixed, and three folds that are the INPUT's
+
+`fold-af3-webgl.js --seams --recycles=1 --steps=25` (it now featurises through `featuriserDialect`, as the page does,
+and takes `--chain-kinds=` and `--constraints=`), seven families x four inputs against WebGPU on the same int5 bundle:
+an 8076-row alignment (`test.a3m`), protein + GOL, two protein chains, protein + a 12-nt DNA chain, and Boltz-2's
+contact constraint. Trunk pair relRMS is 7e-4 to 5e-3 in every arm after the two fixes, the level the single-chain
+table above holds.
+
+| | MSA | + GOL | two chains | + DNA |
+|---|---|---|---|---|
+| AlphaFold 3 | 0.004 A, 94.00/94.00 | 0.85 (0.21 at f32) | 0.087 | 0.014 |
+| OpenBind-0 | 0.012 | 0.027 | 0.20 | 0.37 |
+| Boltz-2 | **0.006** (was 0.033) | 0.016 | 1.69, 57.9/70.8 - the input's | 0.050 |
+| Protenix-v2 | 0.003, 92.81/92.81 | 0.069 | 1.61 (0.47 at f32) | 0.10 |
+| IntelliFold-2 | 0.005, 93.46/93.46 | 0.10 | 0.14 | 0.087 |
+| RoseTTAFold3 | 0.033 (chirality, as above) | 0.016 | 0.047 | 0.036 |
+| Mol-1 | 0.003 | 0.14 | 0.55 | 0.11 |
+
+(superposed CA; pLDDT WebGL2/WebGPU where it is the point.)
+
+🔴 **boltz2's AND rf3's OUTER PRODUCT MEAN ADDED ITS BIAS ON THE WRONG SIDE OF THE DIVISION.** `dialectFlags` read
+`dialect.outerProductMeanBiasAfterNorm`; the dialect's key is `opmBiasAfterNorm`, so the flag was `false` for every
+family. Exactly the two families that set it read `z_after_msa` at 4.3e-2 / 3.3e-2 against ~1e-3 for the other five,
+at matched f32 too, and 1.5e-2 after ONE MSA block - where `check-webgl-af3-msa-block.js` at their own attention shape
+(`--msa-heads=8 --msa-dimension=32`, new) was exact at 6e-8, because it is handed the flag directly. Invisible at depth
+1, where the two orders agree, so every single-sequence arm was clean. Now 1.1e-3 and 9e-4. `test/dialect-keys-read.test.js`
+holds every `dialect.<key>` read under webgl/af3 and webgpu/af3 to a key some dialect has - watched failing on this
+one; it also found `pairNormPerBlock`, a WEIGHT property read off the dialect, inert here (OpenDDE alone sets it).
+
+🔴 **Protenix-v2 and Mol-1 with an alignment did not fold here at all**: they read every row of the pool
+(`msaNativeSample`), and 8076 rows x 59 tokens is a 244M-float MSA transition against this context's 134M. The
+transition now takes a window of rows at a time (`window`/`concatenate` in runtime/elementwise.js) - exact, it is row
+by row. Protenix-v2 is then 0.003 A from WebGPU at identical pLDDT.
+
+🔴 **THREE ARMS DIFFER AND ARE NOT DEFECTS, AND EACH WAS ASKED RATHER THAN ASSUMED.** Boltz-2 two chains (1.69 A,
+pLDDT 57.9 against 70.8), its constraint (3.65 A) and Protenix-v2 two chains (1.61 A): the trunks agree at 6e-4 to
+3e-3. `--confidence-on-theirs` (new) hands WebGPU's coordinates to this backend's head - Boltz-2 then reads **70.951
+against 70.957**, PAE 2.8e-4 - so the head is exact and the gap is the sampler's. And **WebGPU disagrees with itself
+by more**: `diff-fold-coords.py --b=--f16=off` on that input is 15.0 A worst and pLDDT **53.4 against 71.7**. A
+single-sequence heterodimer is bistable under Boltz-2, and a 1e-3 difference picks the basin. `--reference-f32` brings
+AF3 + GOL 0.85 -> 0.21 and Protenix-v2's 1.61 -> 0.47 for the same reason.
+
+The WebGPU reference itself died on every arm here (`webgpu/af3/fold.js`, the recycle convergence read
+`previousSingle.length` on a pass that kept the pair and not the single, with `--seams` and a recycle); guarded.

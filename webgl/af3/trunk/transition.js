@@ -30,6 +30,7 @@
 import { ONE_TARGET, PRELUDE, sized, memoSource } from "../../runtime/execution.js";
 import { layerNorm } from "../../kernels/layer-norm.js";
 import { linear, planeInputs } from "../../kernels/linear.js";
+import { concatenate, window } from "../../runtime/elementwise.js";
 import { swiGluPlanesSource } from "../diffusion/transformer.js";
 
 /** @typedef {import("../../runtime/storage.js").Tensor} Tensor */
@@ -107,6 +108,27 @@ export function transition(execution, call) {
     throw new RangeError(
       `af3 transition: transition2 holds ${w.transition2.elements} floats, not`
       + ` ${intermediate} x ${channels}`);
+  }
+
+  // 🔴 ROWS PAST THIS CONTEXT'S TEXTURE CAPACITY GO A WINDOW AT A TIME. The op is row by row, so this is
+  // exact; it is reached by protenix2's and mol1's MSA stack, which reads every alignment row (`mainMsaCap`
+  // 16384) - 8076 rows at 59 tokens is a 244M-float up projection against 134M here.
+  const windowRows = Math.floor(execution.storage.capacity / (2 * intermediate));
+  if (rows > windowRows) {
+    const parts = [];
+    for (let start = 0; start < rows; start += windowRows) {
+      const count = Math.min(windowRows, rows - start);
+      const xs = window(execution, x, start * channels, count * channels);
+      const rs = residualOf === undefined ? undefined
+        : residualOf === x ? xs : window(execution, residualOf, start * channels, count * channels);
+      parts.push(transition(execution, { ...call, x: xs, rows: count, ...(rs === undefined ? {} : { residualOf: rs }) }));
+      execution.release(xs);
+      if (rs !== undefined && rs !== xs) execution.release(rs);
+    }
+    const out = concatenate(execution, parts);
+    for (const p of parts) execution.release(p);
+    out.label = "af3.transition";
+    return out;
   }
 
   const normalised = layerNorm(execution, {
