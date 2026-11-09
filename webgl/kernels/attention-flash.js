@@ -58,7 +58,7 @@ export function attentionFlashPlan(headDim, maxDrawBuffers) {
 }
 
 const attentionFlashSourceUncached = (
-  { batch, queries, heads, headDim, targets, hasPairBias, roundHalf = false, storedLogits = false },
+  { batch, queries, heads, headDim, targets, hasPairBias, roundHalf = false, storedLogits = false, headMajor = false },
 ) => {
   const groups = headDim / 4;
   const register = (name, body) => Array.from({ length: groups },
@@ -82,7 +82,19 @@ uniform int groupBase;
 void main() {
   // One fragment per (batch, query, head) - which is exactly one texel of an
   // output plane, since a plane holds four channels of each.
-  int bqh = linearTexel();
+${headMajor
+    // ...laid out (batch, head, query), the query fastest, so neighbouring fragments walk ONE head's keys and values
+    ? `  int texel = linearTexel();
+  if (texel >= BATCH * Q * HEADS) {
+${perTarget((t) => `result${t} = vec4(0.0);`)}
+    return;
+  }
+  int q = texel % Q;
+  int bh = texel / Q;
+  int head = bh % HEADS;
+  int b = bh / HEADS;
+  int bqh = (b * Q + q) * HEADS + head;`
+    : `  int bqh = linearTexel();
   if (bqh >= BATCH * Q * HEADS) {
 ${perTarget((t) => `result${t} = vec4(0.0);`)}
     return;
@@ -90,7 +102,7 @@ ${perTarget((t) => `result${t} = vec4(0.0);`)}
   int head = bqh % HEADS;
   int bq = bqh / HEADS;
   int q = bq % Q;
-  int b = bq / Q;
+  int b = bq / Q;`}
   int queryBase = bqh * HD4;
 
 ${storedLogits ? "" : register("q", (g) => `fetch4(queryTex, queryBase + ${g})`)}
@@ -296,7 +308,7 @@ ${hasPairBias ? "    logit += fetch1(pairTex, (head * Q + q) * Q + k);" : ""}
  * expression, so `planes[t]` with a computed `t` does not compile - and a
  * driver that accepted it would be compiling something else.
  */
-const interleavePlanesSourceUncached = (elements, headDim) => {
+const interleavePlanesSourceUncached = (elements, headDim, headMajor = null) => {
   const groups = headDim / 4;
   const declarations = Array.from({ length: groups },
     (_, g) => `uniform sampler2D plane${g};`).join("\n");
@@ -312,6 +324,9 @@ void main() {
   if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
   int group = texel % HD4;
   int bqh = texel / HD4;
+${headMajor === null ? "" : `  // ...planes laid out (batch, head, query): where this (batch, query, head) sits in them
+  bqh = ((bqh / ${headMajor.heads}) / ${headMajor.queries} * ${headMajor.heads} + bqh % ${headMajor.heads}) * ${headMajor.queries}
+    + (bqh / ${headMajor.heads}) % ${headMajor.queries};`}
 ${select}
   result = fetch4(plane${groups - 1}, bqh);
 }`);
@@ -382,7 +397,7 @@ export function attentionFlashPlanes(execution, call) {
     execution.dispatch({
       source: attentionFlashSource({
         batch, queries, heads, headDim, targets: span,
-        hasPairBias: pairBias !== undefined, roundHalf, storedLogits,
+        hasPairBias: pairBias !== undefined, roundHalf, storedLogits, headMajor: call.headMajor === true,
       }),
       outputs: planes.slice(base, base + span),
       inputs: drawInputs,
@@ -439,13 +454,17 @@ export function attentionFlash(execution, call, into) {
     execution.release(logits);
     return { output, plan: { ...plan0, draws: 1, redundancy: 1 } };
   }
-  const { planes, plan } = attentionFlashPlanes(execution, call);
+  // ...a batch of rows laid out head-major in the planes, so neighbouring fragments share one head's keys - from 96
+  // keys a row, where one head's keys and values stop fitting beside three others: the trunk's grid attention at 250
+  // tokens 18.8 -> 15.0 s a pass, 150 4.97 -> 4.57, 100 1.64 -> 1.60, and at 59 1.22 -> 1.31 (SLOWER), so not there
+  const headMajor = batch > 1 && queries >= HEAD_MAJOR_FROM_QUERIES && !execution.noHeadMajorAttention;
+  const { planes, plan } = attentionFlashPlanes(execution, { ...call, headMajor });
   const elements = batch * queries * heads * headDim;
   const output = into ?? execution.allocate(elements, "attention.output");
   const inputs = {};
   planes.forEach((plane, g) => { inputs[`plane${g}`] = plane; });
   execution.dispatch({
-    source: interleavePlanesSource(elements, headDim),
+    source: interleavePlanesSource(elements, headDim, headMajor ? { heads, queries } : null),
     output,
     inputs,
     label: `attention.interleave:${headDim}`,
@@ -458,6 +477,7 @@ export function attentionFlash(execution, call, into) {
 export const attentionFlashSource = memoSource(attentionFlashSourceUncached);
 export const attentionLogitsSource = memoSource(attentionLogitsSourceUncached);
 export const attentionValuesSource = memoSource(attentionValuesSourceUncached);
+const HEAD_MAJOR_FROM_QUERIES = 96;
 /** Below this many (batch, query, head) fragments the flash draw is short of work: 944 and 1,920 gained, 13,924 lost. */
 const SPLIT_BELOW_FRAGMENTS = 4096;
 export const interleavePlanesSource = memoSource(interleavePlanesSourceUncached);
