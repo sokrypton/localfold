@@ -3644,3 +3644,11 @@ Also re-checked at 250 tokens, where a 59-token measurement cannot speak for the
 15.0 s against 18.0 with `--no-keep-planes`, though the grid's split is ~40 ms a call there), and x narrowed to float16
 still does not (`--narrow-aligned-x` 15.18 / 15.22 s against 15.05 / 15.07, and it moves pLDDT). Safari agrees with the
 head-major layout: 150 tokens 6.11 -> 5.62 s a pass.
+
+### 🔴 A FOLD PAST ~362 TOKENS WAS REFUSED, BY AN OUTPUT NOTHING WROTE (fixed)
+
+`linear` allocated its whole `rows x outChannels` output before deciding the path, and released it unused when it
+handed out its row planes (`keepPlanes`). The pair transition's up projection is 4x the pair width, so at 400 tokens it
+asked for 160,000 x 1024 = 163.8 M floats - past this context's 134 M (2048 x MAX_TEXTURE_SIZE 16384 x 4) - and the fold
+died in `Storage.allocate`, though the planes it actually uses are an eighth of that each. The output is now allocated
+where it is written. 400 tokens folds; the 59-token fold is byte-identical (pLDDT, worst atom, relRms unchanged).
