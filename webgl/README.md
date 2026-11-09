@@ -3456,3 +3456,5 @@ Kept: the one-texel projection takes the residual in its own epilogue (`base + v
 with `linear`'s new `multiplier`), so the triangle's output projection returns `pair + projected * gate` and the grid's
 row-direction output projection returns `pair + projected` - two 3481 x 128 passes a block gone. Bit-identical; trunk
 1292 -> 1269 ms. `--no-linear-epilogue` is the arm.
+Measured and NOT kept: the square 59 x 768 -> 768 blocked as well (any in x out >= 2^19 below 64 rows). Diffusion
+2596 -> 2589 ms median, inside the noise - unlike the 2:1 shape, the square one gains nothing from 4-row blocks.
