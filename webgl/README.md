@@ -3466,3 +3466,10 @@ fragments each swept all 128 keys computing the same dot product, mask and bias.
 fragment a head with its eight channel groups as render targets (query in registers, values as whole texels) and
 `interleavePlanesSource` gathers them back. The same arithmetic per channel; worst atom against WebGPU 0.129 -> 0.132
 A. Diffusion **2594 -> 2506 ms**, fold 4043 -> 3954 - under four seconds. `--no-atom-attend-planes` is the arm.
+
+Kept: identical empty template slots run once. AF3 pads to four slots and the stack ran on every one, but an empty slot
+is a function of its restype codes alone, so slots with the same codes give the same embedding: the driver
+(`webgl/af3/model/fold.js`) compares the host codes and `templateEmbeddingSteps` runs each distinct slot once, weighted
+by how many it stands for (`repeats`). An occupied slot is never merged. A template-free AF3 fold runs one slot where
+it ran four: trunk 1266 -> 1212 ms, pLDDT, worst atom and relRms unchanged; OpenBind-0, whose first empty slot takes
+the gap restype, still agrees with WebGPU to 0.073 A. `--no-template-dedupe` is the arm.
