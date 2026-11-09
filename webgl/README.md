@@ -3423,3 +3423,6 @@ normalised pair) as one 128 -> 512 (`fuseTriangleProjections`), which the aspect
 both halves of one tensor. Trunk 1349 -> 1311 ms, every fused round ahead of every control round; not bit-identical
 (the blocked path), pLDDT 94.02 -> 94.01, worst atom against WebGPU 0.102 -> 0.113 A, relRms 7.6e-4 -> 7.8e-4.
 `--no-triangle-fused-projection` is the arm.
+Measured and NOT kept, the next step of the same: the output gate's 128 columns fused in as well (128 -> 640, its
+sigmoid applied in the residual draw). Trunk 1299 -> 1328 ms, SLOWER - the 640-wide tensor is held across the
+contraction and the gate is read back at a 160-texel row stride, which costs more than the 128 -> 128 projection it saved.
