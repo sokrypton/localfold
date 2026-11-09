@@ -184,6 +184,42 @@ ${hasPairBias ? "    logit += fetch1(pairTex, (head * Q + q) * Q + k);" : ""}
 };
 
 /**
+ * The value half straight from stored logits (`attentionLogitsSource`), one fragment per OUTPUT texel - (batch, query,
+ * head, channel group) - written in the interleaved `[batch][query][head][channel]` layout. The flash draws give one
+ * fragment a whole head and spread its groups over render targets, which at the denoiser's 59 queries x 16 heads is
+ * 944 fragments each walking every key: under-occupied, and a 48-wide head needs two draws and an interleave. Here
+ * each fragment takes the row's max, then the exponentials' sum and the weighted values, for its own four channels.
+ * The same softmax, taken in two sweeps rather than online.
+ */
+const attentionValuesSourceUncached = ({ batch, queries, heads, headDim, roundHalf = false }) => sized({ BATCH: batch, Q: queries, ELEMENTS: batch * queries * heads * headDim }, `${PRELUDE}
+out vec4 result;
+const int HEADS = ${heads};
+const int HD4 = ${headDim / 4};
+uniform sampler2D logitTex;
+uniform sampler2D valueTex;
+uniform sampler2D gateTex;
+
+void main() {
+  int texel = linearTexel();
+  if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
+  int group = texel % HD4;
+  int bqh = texel / HD4;
+  int head = bqh % HEADS;
+  int b = (bqh / HEADS) / Q;
+  float rowMax = -1e30;
+  for (int k = 0; k < Q; ++k) rowMax = max(rowMax, fetch1(logitTex, bqh * Q + k));
+  float total = 0.0;
+  vec4 acc = vec4(0.0);
+  for (int k = 0; k < Q; ++k) {
+    float weight = exp(fetch1(logitTex, bqh * Q + k) - rowMax);
+    total += weight;
+    acc += weight * fetch4(valueTex, ((b * Q + k) * HEADS + head) * HD4 + group);
+  }
+  vec4 value = (acc / total) * fetch4(gateTex, texel);
+  result = ${roundHalf ? "half4(value)" : "value"};
+}`);
+
+/**
  * Gather `headDim / 4` planes into one `[batch][query][head][channel]` tensor.
  *
  * 🔴 THE SAMPLER IS CHOSEN BY AN UNROLLED SELECT, NOT BY INDEXING AN ARRAY.
@@ -299,6 +335,33 @@ export function attentionFlashPlanes(execution, call) {
  */
 export function attentionFlash(execution, call, into) {
   const { batch, queries, heads, headDim } = call;
+  // ...a head too wide for one draw: its logits once, then its values one fragment an output texel (no planes)
+  const plan0 = attentionFlashPlan(headDim, execution.maxDrawBuffers);
+  if (plan0.draws > 1 && !execution.noStoredLogits && !execution.noDirectValues) {
+    const { query, key, value, gate, mask, pairBias, transpose = false } = call;
+    const scale = call.scale ?? 1 / Math.sqrt(headDim);
+    const elements = batch * queries * heads * headDim;
+    const logits = execution.allocate(batch * queries * heads * queries, "attention.logits");
+    execution.dispatch({
+      source: attentionLogitsSource({ batch, queries, heads, headDim, hasPairBias: pairBias !== undefined }),
+      output: logits,
+      inputs: {
+        queryTex: query, keyTex: key, maskTex: mask, ...(pairBias === undefined ? {} : { pairTex: pairBias }),
+      },
+      ints: { transposeMask: transpose ? 1 : 0 },
+      floats: { scale },
+      label: `attention.logits:${batch}x${queries}x${heads}x${headDim}`,
+    });
+    const output = into ?? execution.allocate(elements, "attention.output");
+    execution.dispatch({
+      source: attentionValuesSource({ batch, queries, heads, headDim, roundHalf: call.roundHalf === true }),
+      output,
+      inputs: { logitTex: logits, valueTex: value, gateTex: gate },
+      label: `attention.values:${batch}x${queries}x${heads}x${headDim}`,
+    });
+    execution.release(logits);
+    return { output, plan: { ...plan0, draws: 1, redundancy: 1 } };
+  }
   const { planes, plan } = attentionFlashPlanes(execution, call);
   const elements = batch * queries * heads * headDim;
   const output = into ?? execution.allocate(elements, "attention.output");
@@ -317,4 +380,5 @@ export function attentionFlash(execution, call, into) {
 // Every builder above, memoised on its arguments (`memoSource` in webgl/runtime/execution.js).
 export const attentionFlashSource = memoSource(attentionFlashSourceUncached);
 export const attentionLogitsSource = memoSource(attentionLogitsSourceUncached);
+export const attentionValuesSource = memoSource(attentionValuesSourceUncached);
 export const interleavePlanesSource = memoSource(interleavePlanesSourceUncached);
