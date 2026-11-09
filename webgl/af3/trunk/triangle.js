@@ -737,9 +737,15 @@ function contractInto(execution, output, a, b, length, channels, divideByLength,
   // a fragment - and eight render targets; `MAX_DRAW_BUFFERS` is at least four
   // everywhere, so the one-pair kernel stays for a context that has only four.
   // The size ceiling is on the TRUE tensor, which is what the repack moves.
+  // 🔴 THE CEILING IS THE OLD 2 x 4 x 4 BLOCK'S, NOT THE WIDE ONE'S. It was fitted before `widePairBlockSource`
+  // existed, and the wide block wins far past it: IntelliFold-2's 59 x 59 x 512 pair (1.78 M floats, just over) went
+  // 16.7 -> 15.3 s a fold, and AF3's trunk at 150 tokens 8.4 -> 5.0 s and at 250 tokens 68.1 -> 18.7 s, bit-identical
+  // (webgl/README.md). So a shape the wide block takes is never held back by it.
+  const wideLegal = !execution.noContractWide && padded % 8 === 0 && Math.floor(TEXTURE_WIDTH / channels) >= 1
+    && !execution.noWideUnbounded;
   const blocked = padded % 4 === 0 && execution.maxDrawBuffers >= 8
     && !execution.noContractBlock
-    && (execution.noContractCeiling
+    && (execution.noContractCeiling || wideLegal
       || length * length * channels <= CONTRACT_BLOCK_MAX_PAIR_FLOATS);
   const tag = padded === length ? "" : `:padded${padded}`;
   if (!blocked) {

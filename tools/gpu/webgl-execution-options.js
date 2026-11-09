@@ -263,6 +263,7 @@ export function webglExecutionOptions(args, defaults = {}) {
     noOpmOuterFirst: flag(args, "no-opm-outer-first"),
     noGridFusedProjection: flag(args, "no-grid-fused-projection"),
     noKeepPlanes: flag(args, "no-keep-planes"),
+    noWideUnbounded: flag(args, "no-wide-unbounded"),
     noAtomGateInValues: flag(args, "no-atom-gate-in-values"),
     noLinearGateSlice: flag(args, "no-linear-gate-slice"),
     noPrepaddedX: flag(args, "no-prepadded-x"),

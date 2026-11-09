@@ -3606,3 +3606,22 @@ And IntelliFold-2 in Safari: `--no-direct-values` fold 17813 / 17733 ms against 
 logits read mixed there in one pair of runs (the diffusion 80-140 ms better unpadded), AF3 in Safari put the
 difference at ~10 ms over three rounds, and padding scoped to the grid attention alone came out level with padding
 everywhere (IntelliFold-2 diffusion 2613 / 2569 against 2582 / 2575). Noise; the padding stays as it is.
+
+### 🔴 The contraction's size ceiling was the OLD block's, and it held every large fold back (fixed)
+
+`CONTRACT_BLOCK_MAX_PAIR_FLOATS` (1.57 M floats) sends a pair track past it to the one-pair contraction kernel. It was
+fitted on the 2 x 4 x 4 pair block, whose eight-plane write and read-back cost grows with the tensor - and then the WIDE
+pair block (`widePairBlockSource`, 4 i x 8 j x one channel) arrived and was put behind the same gate, never re-priced.
+It wins far past it. A shape the wide block takes is now never held back by the ceiling (`--no-wide-unbounded` is the
+old rule):
+
+| fold | old ceiling | wide unbounded |
+|---|---:|---:|
+| IntelliFold-2, 59 tokens (59 x 59 x 512 = 1.78 M, just over) | 16.7 s | **15.3 s** |
+| AF3, 150 tokens, single sequence, trunk pass | 8.4 s | **5.0 s** |
+| AF3, 150 tokens, the whole fold | 25.8 s | **16.9 s** |
+| AF3, 250 tokens, trunk pass | 68.1 s | **18.7 s** |
+
+Bit-identical in every arm compared (pLDDT, worst atom and relRms against WebGPU to the digit). AF3 at 59 tokens is
+under the old ceiling and does not move. The fold this file has measured all day was 59 tokens - which is exactly why a
+gate that only bites at ~110 tokens and up went unseen.
