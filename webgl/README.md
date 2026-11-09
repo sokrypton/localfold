@@ -3526,3 +3526,8 @@ And IntelliFold-2 checked against the three attention forms, since they were tun
 its best too, fold 17212 against 17570 (stored-logit planes) and 18798 (two flash draws). Its stage split moves 530 ms
 into the trunk and 200 out of the diffusion between those arms because the stage clocks are host-side; the GPU profile
 puts its diffusion attention at ~110 ms direct against ~205 planes, and the total is what counts.
+
+Kept: the logits draw with each row's keys padded to a multiple of four, so a fragment owns one (batch, query, head)
+and four keys and fetches the query once - where its four lanes could straddle two rows and each fetched it again.
+Bit-identical. AF3 (32- and 48-wide heads) neutral, 3799 -> 3795 ms; IntelliFold-2, whose grid heads are 64 wide,
+**17126 -> 16794 ms** over three rounds, trunk 12726 -> 12350. `--no-padded-logits` is the arm.
