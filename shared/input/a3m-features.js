@@ -367,7 +367,7 @@ function finishRecycle(plan, assignments, context) {
     // profile is (L * sum of members + centre) / (L * members + 1): the centre's own row weighs about 1/L where
     // the monomer gives it a full share. That is what the multimer's weights were trained on, and what it is
     // given here; with members split over tied centres (nearestCentres) the sums are fractional.
-    // The fractional sums are float32 with one rounding a step, as the C++ twin (cuda/featurise/af2_export.h)
+    // The fractional sums are float32 with one rounding a step, as the C++ twin (cuda/cpp/featurise/af2_export.h)
     // keeps them, so the two stay byte-identical; the final ratio is taken in double on both sides.
     const members = multimer ? new Float32Array(centers.length) : undefined;
     if (!multimer) {
@@ -477,7 +477,7 @@ export function makeA3mFeatures(a3mText, tables, options = {}) {
  * ONE recycle's features, exactly as `makeA3mFeatures(...)[index]`: every
  * recycle is planned (planning is cheap and seeded in sequence, so recycle k's
  * plan needs the k before it) and only `index` is searched and finished - so
- * independent workers can each take a recycle (cuda/af2/export_input.mjs).
+ * independent workers can each take a recycle (tools/native-ref/af2/export_input.mjs).
  */
 export function makeA3mFeatureRecycle(a3mText, tables, options, index) {
   const { plans, context } = planA3mFeatures(a3mText, tables, options);
@@ -486,7 +486,7 @@ export function makeA3mFeatureRecycle(a3mText, tables, options, index) {
 }
 
 /**
- * The three steps apart, for a caller that runs them in different places (cuda/af2/export_input.mjs: the
+ * The three steps apart, for a caller that runs them in different places (tools/native-ref/af2/export_input.mjs: the
  * plan once - parsing the A3M is the largest single cost of an export, and every recycle worker used to repeat
  * it - then each recycle's search and finish in a worker, or the search on the CUDA port's device). The
  * context holds only typed arrays and plain values, so it crosses to a worker as it is.

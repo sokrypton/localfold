@@ -20,7 +20,7 @@ Every speed and memory choice in `metal/` was measured on one M2. The M5 differs
 ## Rules - the same as on the M2
 
 1. **Never push.** Pushing `main` deploys the website. Commit on local `metal`; the user merges.
-2. **Do not accept AlphaFold 3's terms for the user.** Never run `cuda/featurise/fetch-weights af3` (or anything that
+2. **Do not accept AlphaFold 3's terms for the user.** Never run `cuda/cpp/featurise/fetch-weights af3` (or anything that
    calls it with the terms accepted: `tools/check-native-worker.py` without `--no-af3`, a page fold of AF3 in a test
    profile). The AF3 gate cases read the page bundle `model-af3-int5/`, which the user copies over themselves.
 3. **Do not modify `cuda/`** except for portability fixes. It is the CUDA port; `metal/` is written natively.
@@ -92,7 +92,7 @@ The M2's numbers, each from an interleaved bench or a warm fold. Run the same on
 | AF3 6MRR, 200 steps | `metal/af3/localfold-af3 $D/af3-6mrr.input --fold --fast --bundle=model-af3-int5 --family=af3 --out=/dev/null`, where `D=$(python3 -c "import tempfile,os;print(os.path.join(tempfile.gettempdir(),'metal-af3-gate'))")` (the gate featurises its inputs there) | 6.1 s: trunk 1.17 (4 passes), diffusion 4.90 |
 | a diffusion step | the same, `--recycles=0 --steps=100` | 24 ms at 68 tokens, 80 at 261 |
 | AF3 trunk pass, 261 tokens | the same on `$D/af3-5caj-template.input`, `--recycles=1 --steps=50` | 3.9 s a pass |
-| memory, 1044 tokens, two passes | `AF3_MEM=1 /usr/bin/time -l` on a 1044-token input (`cuda/featurise/af3-featurise <dir> --no-weights --family=af3 --sequence=...`), `--steps=5 --recycles=1` | 4.7 GB footprint |
+| memory, 1044 tokens, two passes | `AF3_MEM=1 /usr/bin/time -l` on a 1044-token input (`cuda/cpp/featurise/af3-featurise <dir> --no-weights --family=af3 --sequence=...`), `--steps=5 --recycles=1` | 4.7 GB footprint |
 
 Bench arms: `0` the default tile; `1000+B` a K step of B; `100000 + R*1000 + C` an R x C tile. The tile rule is
 `gemmRun` in `metal/core/core.mm` (n <= 128: rows rounded to 16, columns 64 where that fills the GPU, else 32; larger
@@ -605,7 +605,7 @@ outliers. What remains, all bandwidth or scalar work:
     arm was declined on the M2 for accuracy. Not attempted.
 - **27fb5876, CI**: `.github/workflows/metal.yml` builds the selftest, the bench and the macOS wheel (with the wheel's
   own checks and each binary's `--help` from a fresh install) on every push to `metal` that touches metal/,
-  cuda/featurise/ or python/. It runs on macos-14, an older SDK than the M5's, which is the build fbd35863's failure
+  cuda/cpp/featurise/ or python/. It runs on macos-14, an older SDK than the M5's, which is the build fbd35863's failure
   needed. The first run passed.
 - **81c63e24, attention v3: 32 x 32 tiles at head width 32 where they pad no worse.** The trunk's attention went
   186 / 187 -> 175 / 178 ms a pass (5CAJ, profiled).

@@ -3,9 +3,9 @@
 
     python3 tools/check-standalone.py [--network]
 
-🔴 ONE PROCESS MUST FOLD WHAT TWO DID. The standalone mode (cuda/featurise/standalone.h) fetches the weights,
+🔴 ONE PROCESS MUST FOLD WHAT TWO DID. The standalone mode (cuda/cpp/featurise/standalone.h) fetches the weights,
 featurises in its own process on a thread and folds; the resident server python/localfold/worker.py drives still takes the
-featuriser binary's directory. Each case runs both ways - `cuda/featurise/<port>-featurise <dir> ...` then
+featuriser binary's directory. Each case runs both ways - `cuda/cpp/featurise/<port>-featurise <dir> ...` then
 `cuda/<port>/localfold-<port> <dir> ...`, and the standalone command - and holds the two PDBs to the SAME BYTES, so a flag the
 standalone mode drops or misroutes (an input flag reaching the fold, af2's --recycles reaching only one of the
 two) is a difference here rather than a quietly different fold. Beside them: refusals come back as the page's
@@ -40,7 +40,7 @@ def two_step(port, featuriser_args, fold_args, out, work):
     """The worker's path: the featuriser binary into a directory, then the port over it."""
     d = os.path.join(work, "in")
     shutil.rmtree(d, ignore_errors=True)
-    f = run([os.path.join(CUDA, "featurise", f"{port}-featurise"), d, *featuriser_args])
+    f = run([os.path.join(CUDA, "cpp", "featurise", f"{port}-featurise"), d, *featuriser_args])
     if f.returncode != 0:
         raise SystemExit(f"{port}-featurise failed: {f.stdout}{f.stderr}")
     r = run([binary(port), d, *fold_args, f"--out={out}"])
@@ -201,7 +201,7 @@ def main():
         # already written (a sequence is) - which would leave these arms folding with no warm-up at all, passing for
         # want of the thing they test. The worker's resident server always warms, so this is the path that ships it
         dirs = {}
-        for line in run([os.path.join(CUDA, "featurise", "fetch-weights"), "ef2-fast-600m", "ef2"]).stdout.splitlines():
+        for line in run([os.path.join(CUDA, "cpp", "featurise", "fetch-weights"), "ef2-fast-600m", "ef2"]).stdout.splitlines():
             name, _, d = line.partition(": ")
             if d: dirs.setdefault(name, []).append(d)
         for model, extra_env in (("ef2-fast-600m", {}), ("ef2", {}), ("ef2", {"LOCALFOLD_BIG": "1"})):
@@ -209,7 +209,7 @@ def main():
             trunk, tower = dirs[model]
             inputs = os.path.join(work, f"slow-in-{model}")
             shutil.rmtree(inputs, ignore_errors=True)
-            run([os.path.join(CUDA, "featurise", "ef2-featurise"), inputs, f"--sequence={S5}", f"--fold-bundle={trunk}"])
+            run([os.path.join(CUDA, "cpp", "featurise", "ef2-featurise"), inputs, f"--sequence={S5}", f"--fold-bundle={trunk}"])
             for slow in ("0", "400"):
                 out = os.path.join(work, f"slow-{model}-{slow}-{len(extra_env)}.pdb")
                 r = run([binary("ef2"), inputs, f"--fold-bundle={trunk}", f"--esmc-bundle={tower}", "--fast", "--warm=96,800",

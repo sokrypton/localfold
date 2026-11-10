@@ -125,19 +125,8 @@ tools/_*.py
 # by using the page rather than by developing it.
 /py2dmol_state_*.json
 /_merge_state.json
-# af3-any-model's published blobs, fetched for the CUDA ports (cuda/featurise/fetch-weights <model>)
+# af3-any-model's published blobs, fetched for the CUDA ports (cuda/cpp/featurise/fetch-weights <model>)
 /af3am-*
-
-# the native featurisers (cuda/build.sh: one binary and the names linked to it)
-cuda/featurise/featurise
-cuda/featurise/*-featurise
-cuda/featurise/chem-probe
-cuda/featurise/resolve-templates
-cuda/featurise/fetch-weights
-cuda/featurise/msa-search
-cuda/featurise/standalone.o
-cuda/featurise/*.stamp
-cuda/featurise/*.building
 
 # the localfold wheel's build products (python/build_wheel.sh)
 python/dist/
@@ -145,13 +134,9 @@ python/build/
 python/localfold/site/
 python/*.egg-info/
 
-# wwPDB's whole chemical component dictionary (cuda/featurise/fetch-weights ccd)
-/ccd/
+# wwPDB's whole chemical component dictionary (cuda/cpp/featurise/fetch-weights ccd)
+/ccd
 
-# the Metal port (metal/build.sh): the kernel sources embedded as a string, and the binaries
-metal/build/
-metal/*/localfold-*
-metal/**/*.combined
 .localfold-fetch.lock
 oracle-dumps-colab/
 

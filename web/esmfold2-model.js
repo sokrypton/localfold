@@ -122,7 +122,7 @@ export const ESMFOLD2_ATOMISED_STEPS = 64;
  * 31 s trunk at 3,060; the wall clock the same at 15 and 25). Euler's update,
  * not the exponential one, which is WORSE there - a shorter backbone at every
  * count (docs/EF2FAST.md, "Long inputs"). python/localfold/worker.py and
- * cuda/featurise/standalone.cpp apply it too.
+ * cuda/cpp/featurise/standalone.cpp apply it too.
  */
 export const ESMFOLD2_LONG_RESIDUES = 2048;
 

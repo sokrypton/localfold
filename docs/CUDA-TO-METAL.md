@@ -131,7 +131,7 @@ Mol-1 (Molence Bio, `--family=mol1`; af3-any-model's `mol1-port` branch, blob `m
 on Linux, untestable there, and a blind edit to the emitted-norm chain would break eight models on the Mac to add one.
 What metal needs, each with its CUDA twin:
 
-1. **The weight walk is already done** - cuda/featurise/af3_weights.h is shared, and with `--family=mol1` it emits
+1. **The weight walk is already done** - cuda/cpp/featurise/af3_weights.h is shared, and with `--family=mol1` it emits
    `trunk.pairMixerBlocks.k.*` (pairformer blocks with NO `pairAttention1/2`), `trunk.pairformerBlocks.k.*` at the narrow
    width, `trunk.trunkPairChannels` (320) and `trunk.trunkPairIn` / `trunk.trunkPairOut` (448x320, 320x448, no bias).
    Add `"trunk.pairMixerBlocks."` to `prepareWeights`' stack list (weights.mm) so its blocks get `blockWeights`.
@@ -155,7 +155,7 @@ What metal needs, each with its CUDA twin:
 
 To check it, with the CUDA port's oracles (made on the A100: af3-any-model at f32 on the int8 blob, 6MRR on its own
 batch): `oracle-dumps/af3-batch-mol1-6mrr.json`, `af3-oracle-{trunk,denoise,stages,confidence}-mol1.json` - copy them
-over, `node cuda/af3/export-model.mjs <dir> --no-weights --family=mol1 --oracle-model=mol1`, and the metal binary on that
+over, `node tools/native-ref/af3/export-model.mjs <dir> --no-weights --family=mol1 --oracle-model=mol1`, and the metal binary on that
 directory. CUDA's numbers there: every trunk seam 5.7e-8 to 1.3e-6, denoise 1.4e-6, confidence 1e-7 to 8e-7; 6MRR from
 its sequence 1.45-1.53 A over five seeds, pLDDT ~88.
 

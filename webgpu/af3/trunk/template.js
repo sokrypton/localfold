@@ -146,7 +146,7 @@ const EPSILON: f32 = ${epsilon};
 // 🔴 EXCEPT WHERE THE EMPTY SLOTS WEIGH ZERO (templateVisibilityByCoverage,
 // boltz2): there the divisor is the templates present, at least one, as
 // Boltz-2's own module has it - by four its one template reached the trunk at a
-// quarter of native's amplitude. See cuda/af3/export-model.mjs.
+// quarter of native's amplitude. See tools/native-ref/af3/export-model.mjs.
 const TEMPLATE_SCALE: f32 = ${1 / (1e-7 + (templateDivisor ?? templates))};
 const W_QUERY_SCALE: u32 = ${offsets.queryEmbeddingNormScale ?? 0}u;
 const W_QUERY_OFFSET: u32 = ${offsets.queryEmbeddingNormOffset ?? 0}u;

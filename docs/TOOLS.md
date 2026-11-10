@@ -11,7 +11,7 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-489 tools. `tools/fixtures/` is data and is not listed.
+497 tools. `tools/fixtures/` is data and is not listed.
 
 ## `tools/gpu/` - the WebGPU lane (291)
 
@@ -191,7 +191,7 @@ Each exports `async function main(device, args)` and is run as
 - **`check-webgl-transition.js`** - The transition in WebGL2 against the WGSL one and a CPU reference.
 - **`check-webgl-triangle.js`** - Triangle multiplication in WebGL2 against the CPU reference AND against the WGSL kernel, in one page - the first whole AlphaFold operation in this backend.
 - **`clash-geometry.js`** - Do a fold's atoms overlap each other? The question bonds cannot answer.
-- **`dump-bioemu2-stages.js`** - webgpu/bioemu2's stages, handed back as one base64 blob for tools/dump-bioemu2-webgpu.mjs to write as a cuda/featurise input directory - the oracle metal/bioemu2 reads with --oracle=.
+- **`dump-bioemu2-stages.js`** - webgpu/bioemu2's stages, handed back as one base64 blob for tools/dump-bioemu2-webgpu.mjs to write as a cuda/cpp/featurise input directory - the oracle metal/bioemu2 reads with --oracle=.
 - **`fold-af2-webgl.js`** - Fold AlphaFold 2's monomer in WebGL2, from a real weight bundle, beside the WGSL fold of the same weights.
 - **`fold-af2.js`** - An AlphaFold 2 monomer fold, end to end, so a kernel change can be compared against the tree before it.
 - **`fold-af3-webgl.js`** - Fold AlphaFold 3 in WebGL2, from a real weight bundle.
@@ -402,7 +402,7 @@ and turning it into a bundle.
 - **`safetensors_read.py`** - Read a .safetensors file into numpy arrays, without the safetensors package.
 - **`vector-quantise.py`** - Is a codebook worth a new decoder? Scalar codes against vector ones, at 2 bits.
 
-## `tools/` - everything else (118)
+## `tools/` - everything else (126)
 
 CPU checkers, the export and quantisation pipeline, the page drivers that
 go through CDP, and the deploy.
@@ -446,6 +446,11 @@ go through CDP, and the deploy.
 - **`check-model-switch.py`** - Ten models folded in ONE page, as a reader switching models does.
 - **`check-modified-path.mjs`** - Does every model fold a MODIFIED RESIDUE, and does it hold together?
 - **`check-multigpu.py`** - One AlphaFold 3 fold across several GPUs (cuda/af3 --gpus=N): correctness against the one-GPU fold, then scaling.
+- **`check-native-bioemu2-steering.mjs`** - Is cuda/cpp/bioemu2/src/steer.h - BioEmu2's steering natively - the JavaScript's, and af3-any-model's?
+- **`check-native-bioemu2.mjs`** - Is cuda/cpp/featurise/bioemu2_features.h the JavaScript featuriser, byte for byte?
+- **`check-native-bridge.py`** - The Colab bridge carries a CUDA fold both ways, and the feed is LIVE: npm run test:bridge.
+- **`check-native-featuriser.py`** - The native featurisers against the JavaScript exporters they replace: byte for byte.
+- **`check-native-worker.py`** - The native backend's worker (CUDA, or Metal on a Mac), folding for real: npm run test:native.
 - **`check-oracle-bonds.js`** - Does the REFERENCE put side chains where we do? AlphaFold 3's own output, scored by the same function.
 - **`check-portable-limits.mjs`** - Does every model fold on a device at the PORTABLE limit ceiling?
 - **`check-python-portability.py`** - Does every python tool here run on the OLDEST python3 a developer has?
@@ -458,16 +463,17 @@ go through CDP, and the deploy.
 - **`check-standalone.py`** - Gate the standalone ports: `cuda/<port>/localfold-<port> --job=... --out=...` against the two-step path it replaces.
 - **`check-stereo-vs-rdkit.mjs`** - Does a `@` in a SMILES mean the same hand here as it does to RDKit?
 - **`check-stock-flags.mjs`** - Does every model fold on the browser a VISITOR has?
+- **`check-t4-build.py`** - The native ports compile for a T4 (sm_75) on whatever card this machine has - the instructions a T4 lacks caught here.
 - **`check-template-path.mjs`** - Every AF3-lineage model's TEMPLATE actually moves its fold.
 - **`check_remote_bundle.py`** - Is every shard a manifest names actually at the remote, at the right length?
-- **`chem-probe.mjs`** - The page's chemistry over SMILES on stdin, one line each - cuda/featurise/chem_probe.cpp's twin, for tools/check-native-featuriser.py.
+- **`chem-probe.mjs`** - The page's chemistry over SMILES on stdin, one line each - cuda/cpp/featurise/chem_probe.cpp's twin, for tools/check-native-featuriser.py.
 - **`compare-rfd4p-mlx-weights.py`** - This tree's int8 RFD4-Proteina trunk against bios-labs' MLX fp16 trunk, tensor by tensor.
 - **`contact-map-dividers.py`** - Does the contact map get its chain divider lines while a fold is running?
 - **`convert_multimer_params.py`** - Normalise AF2 monomer OR multimer parameters onto one graph.
 - **`deploy.py`** - Push, deploy, and prove the site is serving what was pushed.
 - **`diff-fold-coords.py`** - Fold twice under two configurations and compare the COORDINATES.
 - **`download-dial.py`** - Does the weight-download dial only ever go FORWARDS?
-- **`dump-bioemu2-webgpu.mjs`** - webgpu/bioemu2's stages, written as a cuda/featurise input directory - what metal/bioemu2 reads with --oracle=.
+- **`dump-bioemu2-webgpu.mjs`** - webgpu/bioemu2's stages, written as a cuda/cpp/featurise input directory - what metal/bioemu2 reads with --oracle=.
 - **`entity-popup.py`** - Measure the entity popup as the template source is changed.
 - **`export-js-weights.py`** - Re-encode the exported model shards as classic scripts, for file:// pages.
 - **`export-web-model.js`** - Turn a fixture manifest and its loose `.f32.bin` files into the single-file layout a browser fetches.
@@ -491,6 +497,7 @@ go through CDP, and the deploy.
 - **`fold-in-safari.py`** - Fold in the real page in the REAL Safari, through safaridriver's WebDriver HTTP API.
 - **`gate-folds.mjs`** - The folds every whole-model gate runs, and how a gate reads one of them.
 - **`gen-crosslinkers.mjs`** - Generate shared/chem/crosslinkers.js - the crosslinkers a `crosslinks` job names - from af3-any-model's export:
+- **`gen-native-featuriser-tables.mjs`** - Generate cuda/cpp/featurise/tables.inc, dialects.inc and bundles.inc - the data the native featuriser, weight walk and weight fetch read, from the JavaScript they mirror.
 - **`gen-standard-components.mjs`** - Generate shared/af3/featurise/standard-components.js - the CCD entries of the 20 standard amino acids and the 8 standard nucleotides, cut down to what parseCcdComponent reads - from ccd/components.cif. Hydrogens are kept: rf3's declared-bond charge counts the bonds an atom still has, a hydrogen's among them.
 - **`gpu-chrome.mjs`** - Run a WebGPU module in headless Chrome and print what it returns.
 - **`heatmap-panel.py`** - Do the heatmap panel's tabs appear, and does OUR map format reach them?
@@ -520,6 +527,7 @@ go through CDP, and the deploy.
 - **`score-bioemu2-samples.mjs`** - BioEmu2 samples, scored as BioEmu2 scores them: its physicality report and its steering potentials' energies.
 - **`score_fold.py`** - Score a fold from tools/gpu/fold.js against a reference structure.
 - **`serve.py`** - Serve the checkout with caching turned off.
+- **`stub_worker.py`** - A stand-in for python/localfold/worker.py that a gate drives, so the broker (python/localfold/server.py) and the reader's page are tested with no card.
 - **`sync-py2dmol.py`** - Mirror py2Dmol's built bundles from its own checkout into this one.
 - **`toy-oracle.html`** - toy oracle: AF2-multimer vs LocalFold
 - **`trunk-chains.py`** - Does a complex's contact map carry the RIGHT chain boundaries while it folds?

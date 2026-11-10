@@ -34,7 +34,7 @@ is the mean of a chain's pair ipTMs, and only tokens with frames anchor.
   `check_chain_ptm.py` on Apple silicon; Metal has no `AF3_PAE_OUT` dump yet, so the check is
   the `--scores`-style comparison or a dump to add.
 * **Standardised (2026-11-07, the user's call): every model's AF3-named chain fields are AF3's.**
-  `cuda/featurise/ptm.h` is the native ports' one definition (cuda/af3, cuda/ef2, metal/af3, metal/ef2);
+  `cuda/cpp/featurise/ptm.h` is the native ports' one definition (cuda/af3, cuda/ef2, metal/af3, metal/ef2);
   `shared/heads/tm-score.js` the page's (AF3 lineage, WebGL2 AF3, AF2, ESMFold2). ESMFold2 keeps ESM's own pTM / ipTM
   (ESM's reference: d0 and anchors over every token, no chain_ptm, a directional pair_chains_iptm). cuda/ef2
   barnase-barstar chain_ptm 0.9748/0.9795 -> 0.9585/0.9578. Still without chain fields: cuda/af2, metal/af2, the

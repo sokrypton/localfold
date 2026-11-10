@@ -1,5 +1,5 @@
 /**
- * webgpu/bioemu2's stages, written as a cuda/featurise input directory - what metal/bioemu2 reads with --oracle=.
+ * webgpu/bioemu2's stages, written as a cuda/cpp/featurise input directory - what metal/bioemu2 reads with --oracle=.
  *
  *     node tools/dump-bioemu2-webgpu.mjs --out=<dir> [--job=/tools/fixtures/bioemu2/6mrr.json]
  *       [--model=/model-bioemu2-int5] [--sigmas=160,16,1,0.05] [--mode=structure]

@@ -166,7 +166,7 @@ export function tmScoresFromTerm(term, length, chainLengths = undefined, { paeLo
   // padding to exclude.
   const seqMask = isMultiChain ? new Uint8Array(length).fill(1) : undefined;
   // 🔴 ON AlphaFold 3's INTERFACE TERM, AS EVERY PORT'S CHAIN SCORES ARE (shared/heads/tm-score.js,
-  // cuda/featurise/ptm.h): d0 from the pair's own chains, not the whole prediction's - the names are
+  // cuda/cpp/featurise/ptm.h): d0 from the pair's own chains, not the whole prediction's - the names are
   // AF3's, so the meaning is (reported by Yeqing Lin: a short binder's read ~0.10 high on the global term).
   // pTM and ipTM above stay AlphaFold 2's. Every AF2 token is a residue, so every one has a frame.
   if (isMultiChain && (paeLogits === undefined || centers === undefined)) {

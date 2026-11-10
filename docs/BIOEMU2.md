@@ -19,13 +19,13 @@ It is Boltz-derived and shares neither of AlphaFold 3's two big stages:
 
 | piece | JavaScript | native | held to | gate |
 |---|---|---|---|---|
-| features | `shared/bioemu2/featurise.js` | `cuda/featurise/bioemu2_features.h` | colab's `bioemu2_features.featurise`, field by field | `tools/check-bioemu2-features.js`; `npm run test:bioemu2-native` (C++ = JS, byte for byte) |
-| bonded graph | `shared/bioemu2/graph.js` | `cuda/featurise/bioemu2_steering.h` | colab's `pipeline/bioemu2_steering.Graph` | `tools/check-bioemu2-topology.js` |
+| features | `shared/bioemu2/featurise.js` | `cuda/cpp/featurise/bioemu2_features.h` | colab's `bioemu2_features.featurise`, field by field | `tools/check-bioemu2-features.js`; `npm run test:bioemu2-native` (C++ = JS, byte for byte) |
+| bonded graph | `shared/bioemu2/graph.js` | `cuda/cpp/featurise/bioemu2_steering.h` | colab's `pipeline/bioemu2_steering.Graph` | `tools/check-bioemu2-topology.js` |
 | physicality report | `shared/bioemu2/physicality.js` | (the page runs it for every backend) | colab's `bioemu2_physicality.check`, all four presets | `tools/check-bioemu2-topology.js` |
 | steering tables, polymers | `shared/bioemu2/steering-tables.js` | `bioemu2_steering.h` | colab's `tables()` | `tools/check-bioemu2-topology.js` |
 | steering tables, ligands | `shared/bioemu2/ligand-tables.js` | `bioemu2_steering.h` | **an approximation**, reported | `tools/check-bioemu2-ligand-tables.js` (a report) |
-| potentials + gradients | `shared/bioemu2/potentials.js` | `cuda/bioemu2/src/steer.h` (= JS to the bit) | colab's `energy()` and `jax.grad` | `tools/check-bioemu2-potentials.js` |
-| `--potentials` files | `shared/bioemu2/potentials-yaml.js` | `cuda/bioemu2/src/potentials_yaml.h` (= JS) | colab's `load_potentials` | `test/bioemu2-potentials-yaml.test.js` |
+| potentials + gradients | `shared/bioemu2/potentials.js` | `cuda/cpp/bioemu2/src/steer.h` (= JS to the bit) | colab's `energy()` and `jax.grad` | `tools/check-bioemu2-potentials.js` |
+| `--potentials` files | `shared/bioemu2/potentials-yaml.js` | `cuda/cpp/bioemu2/src/potentials_yaml.h` (= JS) | colab's `load_potentials` | `test/bioemu2-potentials-yaml.test.js` |
 | steered samplers | `shared/bioemu2/sampler.js` | `steer.h` (= JS to the bit; `npm run test:bioemu2-steering-native`) | colab's `steered_sample` / `fkc_sample` on a toy denoiser | `tools/check-bioemu2-steering.js` |
 | denoiser + its VJP (CPU reference) | `cpu/bioemu2/denoiser.js` on `cpu/bioemu2/tape.js` | `cuda/bioemu2/src/vjp.cuh` (`gate.py --only=oracles`) | colab's `denoise` and `jax.grad` | `tools/check-bioemu2-denoiser.js` |
 
@@ -80,7 +80,7 @@ and D64 at their alternate locations. The oracle dumps share it, so parity is un
 ## The Metal port, and what it is held to
 
 `metal/bioemu2` is `cuda/bioemu2` on metal/core. `localfold-bioemu2 --job=<job.json>` is every port's command line
-(cuda/featurise/standalone.h: the weights fetched, the input featurised in this process, the fold) and reads what
+(cuda/cpp/featurise/standalone.h: the weights fetched, the input featurised in this process, the fold) and reads what
 fetch.h fetches for `bioemu2`, af3-any-model's int8 blob - **AS the page's bundle**: `metal/bioemu2/weights.mm` is
 tools/export_bioemu2_model.py done on the device as a weight walk (the stacks unstacked, the pair track transposed into
 AF3's layout, the triangle's halves interleaved and the incoming one's swapped), so the port has one set of names
@@ -98,7 +98,7 @@ runs it in Chrome and writes its stages as a featuriser directory; `--oracle=<di
 own input (as check-bioemu2-network.js does), so a residual is that stage's alone:
 
     node tools/dump-bioemu2-webgpu.mjs --out=/tmp/or --half=off --trunk=f32      # the float32 arm (default: shipped)
-    cuda/featurise/bioemu2-featurise /tmp/in --job=tools/fixtures/bioemu2/6mrr.json
+    cuda/cpp/featurise/bioemu2-featurise /tmp/in --job=tools/fixtures/bioemu2/6mrr.json
     metal/bioemu2/localfold-bioemu2 /tmp/in --bundle=model-bioemu2-int5 --oracle=/tmp/or
 
 Against the float32 arm the first build read 1e-7 on the trunk and context and 1e-5 on the denoiser - on 6MRR and on the

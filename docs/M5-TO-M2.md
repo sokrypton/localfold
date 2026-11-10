@@ -282,7 +282,7 @@ Pro to the M5's: same GPU family, same kernels, same order - only the fit check 
 `6mrr-x12-monomer` and fixed its cross-chain relpos: on the monomer every cross-chain pair took the multimer's row 65,
 which the monomer's weights have as zeros. Metal had the same bug - 55.97 pLDDT, 1.304 A; ported, 66.59 / 1.702 (CUDA
 69.09 / 1.788). The other six AF2 cases unchanged. WebGPU encodes chains as the +200 break and was never affected.
-Then `26c14ecf` (each chain's own query row in a single-sequence complex, through `cuda/featurise`, which Metal shares)
+Then `26c14ecf` (each chain's own query row in a single-sequence complex, through `cuda/cpp/featurise`, which Metal shares)
 took it to **79.11 / 1.033** (CUDA 79.29 / 0.917, ColabFold 80.7 / 0.97); the M5's baseline is that.
 
 ### Asks for the M2

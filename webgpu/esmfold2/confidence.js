@@ -873,7 +873,7 @@ export async function esmfold2ConfidenceFold(device, input, weights, options = {
 
 /**
  * The chain-level scores as AlphaFold 3 defines them - the names the archive writes are AF3's, so the
- * meaning is (shared/heads/tm-score.js; cuda/featurise/ptm.h is every native port's, cuda/ef2's
+ * meaning is (shared/heads/tm-score.js; cuda/cpp/featurise/ptm.h is every native port's, cuda/ef2's
  * included): chain_pair_iptm off AF3's INTERFACE term, d0 from the pair's own chains, anchored on the
  * tokens with frames; chain_ptm its diagonal; chain_iptm the mean of a chain's pairs. ESM's own
  * reference has none of these (its pair_chains_iptm is directional, on the global term), and pTM /

@@ -163,7 +163,7 @@ def ours_warm(args, cases, work):
     binary = os.path.join(ROOT, "cuda", "ef2", "localfold-ef2")
     model = args.model
     if experimental(model):
-        r = subprocess.run([os.path.join(ROOT, "cuda", "featurise", "fetch-weights"), model], capture_output=True, text=True)
+        r = subprocess.run([os.path.join(ROOT, "cuda", "cpp", "featurise", "fetch-weights"), model], capture_output=True, text=True)
         dirs = re.findall(re.escape(model) + r": (/\S+)", r.stdout + r.stderr)
     else:                       # (the released models' bundles are local exports: cuda/ef2/README.md, "The released models")
         r = subprocess.CompletedProcess([], 1, "", "no local export")
@@ -193,7 +193,7 @@ def ours_warm(args, cases, work):
         for loops in args.loop_list:
             for name, chains, seqs, a3ms in cases:
                 inputs = os.path.join(work, f"in-{name}")
-                f = subprocess.run([os.path.join(ROOT, "cuda", "featurise", "ef2-featurise"), inputs, "--sequence=" + ":".join(seqs),
+                f = subprocess.run([os.path.join(ROOT, "cuda", "cpp", "featurise", "ef2-featurise"), inputs, "--sequence=" + ":".join(seqs),
                                     f"--fold-bundle={dirs[0]}"], capture_output=True, text=True)
                 if f.returncode != 0 or a3ms:
                     rows.append(dict(side="localfold-ef2 warm", target=name, loops=loops, error=(f.stdout + f.stderr)[-160:] or "alignment"))

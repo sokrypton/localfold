@@ -10,7 +10,7 @@
  *
  * So the featuriser now exports the whole pool (msa-features.js af3MsaFromA3m) and every backend's trunk gathers
  * `msaDrawRows(...)` before its MSA embedding: cuda/af3 (trunk.cuh drawMsa), metal/af3 (trunk.mm drawMsa) and the page
- * (webgpu/af3/fold.js). cuda/featurise/msa_draw.h is the C++ twin, integer for integer - test/msa-draw.test.js pins
+ * (webgpu/af3/fold.js). cuda/cpp/featurise/msa_draw.h is the C++ twin, integer for integer - test/msa-draw.test.js pins
  * values both must produce.
  *
  * 🔴 THE QUERY IS DRAWN LIKE ANY OTHER ROW. gumbel_argsort_sample_idx gives every unmasked row logit 0, the query
@@ -136,7 +136,7 @@ export function gatherRows(array, width, chosen) {
 
 /**
  * The pool as an exported input carries it: one int32 a cell, `code | deletion << 8 | mask << 16` (`batch.msaPacked`,
- * in place of `msa`, `msaMask` and `deletionMatrix` - cuda/featurise/entries.h writes the same). A third of the three
+ * in place of `msa`, `msaMask` and `deletionMatrix` - cuda/cpp/featurise/entries.h writes the same). A third of the three
  * entries' 12 bytes, and the native trunks unpack only the rows a pass reads (cuda/af3 trunk.cuh, metal/af3 trunk.mm).
  * A code is AF3's 0-31, a deletion count is already AF3's int8 (<= 127), a mask 0 or 1.
  */

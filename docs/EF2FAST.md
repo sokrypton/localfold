@@ -4139,7 +4139,7 @@ passes it, and lands a backbone the denoiser shrank. Every failing arm above fai
 shorter.
 
 So the default stays Euler and a long input takes the per-atom floor, 64 scheduled (45 run): `ESMFOLD2_LONG_RESIDUES`
-(web/esmfold2-model.js), mirrored by python/localfold/worker.py and cuda/featurise/standalone.cpp and held together by
+(web/esmfold2-model.js), mirrored by python/localfold/worker.py and cuda/cpp/featurise/standalone.cpp and held together by
 test/esmfold2-atomised-steps.test.js. It costs the sampler's time only, which past that length is a few percent of a
 fold: 45 copies 785 ms of sampler (45 steps) against a 31 s trunk, the wall clock the same at 15 and 25. 45 copies
 through `cuda/ef2/fold` now: 0.6% out of band, median 3.78 (15.9% / 3.68 before).

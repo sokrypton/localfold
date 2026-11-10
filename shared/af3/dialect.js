@@ -1094,7 +1094,7 @@ export const BOLTZ2 = Object.freeze({
   // 🔴 ITS LAST CONFORMER GROUP IN BOLTZ-2's OWN RAW FRAME: Boltz-2 centres `range(max(ref_space_uid))`, which skips
   // the last group (featurise.js, af3-any-model 79edb5e: polyQ200 pLDDT 53 -> 85 upstream; 37 -> 67 here). It was
   // switched off once for breaking test:template's boltz2 arm (5CAJ self-templated 1.6-5.2 A) - wrongly: the cause was
-  // the template term's divisor (cuda/af3/export-model.mjs), which gave boltz2's one template a quarter of native's
+  // the template term's divisor (tools/native-ref/af3/export-model.mjs), which gave boltz2's one template a quarter of native's
   // amplitude and left the N-terminus and loop 159-163 balanced on a knife; any one residue's conformer tipped them.
   // With the divisor as native's, 0.22-0.32 A on Metal against native Boltz-2 2.2.1's 0.26-0.43.
   rawLastConformer: true,

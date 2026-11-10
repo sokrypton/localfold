@@ -6868,12 +6868,12 @@ ranking score. Open; `~/af3_dockq_bench/8S83` holds both arms' samples.
 **What changed, in each place:**
 
 - **The featuriser exports AF3's whole pool**, not a draw from it: the paired block to `msa_size // 2`, the unpaired
-  block to what it leaves, 16384 rows at most (shared/af3/featurise/msa-features.js, cuda/featurise/msa.h). Drawn from
+  block to what it leaves, 16384 rows at most (shared/af3/featurise/msa-features.js, cuda/cpp/featurise/msa.h). Drawn from
   ALL of a deep alignment instead of AF3's crop, 2OOB's 44-residue chain docked 4 seeds of 20 where AF3's crop gives
   12; the profile and deletion mean are still over every row, as AF3 computes them before its crop. `batch.numMsa`
   carries the rows a pass reads (`--max-msa`, the page's depth; AF3's 1024).
 - **Every trunk draws its pass's rows before the MSA embedding** - `msaDrawRows` in shared/af3/msa-draw.js (the page),
-  its twin cuda/featurise/msa_draw.h (cuda/af3 `drawMsa`, metal/af3 `drawMsa`): one integer hash, so a seed names the
+  its twin cuda/cpp/featurise/msa_draw.h (cuda/af3 `drawMsa`, metal/af3 `drawMsa`): one integer hash, so a seed names the
   same rows on all three, pinned by test/msa-draw.test.js. On CUDA the draw is gathered on the host OUTSIDE the
   captured recycle graph (a captured copy would replay one pass's rows for ever), and boltz2's and rf3's is_paired flag
   reads whether the query was drawn from the device for the same reason.
@@ -6914,7 +6914,7 @@ protenix2 by default (model_registry `native_rng`, pipeline/protenix_rng.py), an
   added), a fresh mask every pass.
 
 Now `msaNativeSample`, `recycleMcDropout` and `recycleMcDropoutOdds` in dialect.js, protenix2 alone: `msaNativeRows`
-and `mcDropout*` in shared/af3/msa-draw.js, twins in cuda/featurise/msa_draw.h (test/msa-draw.test.js pins both).
+and `mcDropout*` in shared/af3/msa-draw.js, twins in cuda/cpp/featurise/msa_draw.h (test/msa-draw.test.js pins both).
 CUDA and Metal read exactly the drawn rows, their MSA buffers sized for the whole pool and the recycle graph off for
 these folds; the page pads a pass up to a power of two with masked rows (a pipeline a row count, ~14 shapes rather than
 one a pass). The dropout is one integer hash of (pass key, pair row, channel) on every backend - CUDA's `mcDropoutK`,

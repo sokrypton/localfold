@@ -1,0 +1,1180 @@
+"""The native backend: LocalFold's native ports folding a page's job, speaking the bridge.
+
+    python3 python/localfold/worker.py            # (run by python/localfold/server.py, which feeds it)
+
+Started by python/localfold/server.py (`--native`) and fed one job per line on stdin; every line it prints on
+stdout is one bridge event, `{"kind", "payload", "at"}` - `status`, `progress`, `frame`, `contacts`,
+`scores` and `result` - which the broker numbers and the reader's page follows (web/native-bridge.js).
+
+🔴 THE PAGE'S OWN INPUTS, THE PAGE'S OWN WEIGHTS - AND NO JAVASCRIPT. The job is the reader's AlphaFold 3 JSON
+(web/job-json.js writes it) and each port's native featuriser (cuda/cpp/featurise: af3-featurise, af2-featurise,
+ef2-featurise) reads it as the page's reader does and builds the page's input byte for byte
+(tools/check-native-featuriser.py holds them to the JavaScript); the template rows are resolved as the page resolves
+them (cuda/cpp/featurise/resolve-templates); the alignment search is the page's MMseqs2 client, natively; the weights are
+the published bundles the page folds with, read as published through each port's weight walk (cuda/cpp/featurise/af3_weights.h,
+af2_weights.h). What this file adds is the plumbing between
+them - nothing about a molecule is decided here.
+
+🔴 WHAT IT REFUSES, IT SAYS. A sampler, a model or an input a native port does not have is a refusal
+naming it (Refused), never a nearby setting run instead: the removed Flow sampler (a job from an older page), a
+template on AlphaFold 2's template-free models.
+
+Ports: cuda/af3 (all seven AF3-lineage models), cuda/af2 (all five of each, monomer and multimer),
+cuda/ef2 (ESMFold2, 600M and 300M), cuda/bioemu2 (BioEmu2: its modes, contacts, propagation and steering from the
+page's controls). Each must be built (cuda/colab_setup.sh); a bundle not on disk is fetched.
+
+🔴 AND ON A MAC THE SAME WORKER DRIVES metal/<port>: the Metal ports take the CUDA ports' flags and speak the same
+--serve protocol (metal/core/host.cpp), so what differs is where the binaries are, how the GPU is named and how full it
+is - NATIVE below. An installed wheel (`localfold serve`, python/localfold/serve.py) points the binaries, the
+featurisers and the weights at its own files through LOCALFOLD_BIN_DIR, LOCALFOLD_FEATURISE_DIR and
+LOCALFOLD_WEIGHTS_DIR.
+"""
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import traceback
+
+# the checkout (python/localfold/ is two below it) - or, installed, whatever `localfold serve` says
+REPO = os.environ.get("LOCALFOLD_REPO") or os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+CUDA = os.path.join(REPO, "cuda")
+# the native backend this machine has: Apple's GPU through metal/, NVIDIA's through cuda/
+NATIVE = "metal" if sys.platform == "darwin" else "cuda"
+NATIVE_NAME = {"metal": "Metal", "cuda": "CUDA"}[NATIVE]
+BIN_DIR = os.environ.get("LOCALFOLD_BIN_DIR")             # (a wheel's binaries: localfold-<port> side by side)
+# where fetch-weights keeps the bundles: this checkout on Linux, as it always was. (cuda/ and metal/ are their own
+# repositories now, and a binary's own default is ITS checkout - the submodule - so a fold here would fetch every
+# bundle a second time into cuda/ without this; a Mac's default, ~/.cache/localfold, is the binary's and stays.)
+WEIGHTS_DIR = os.environ.get("LOCALFOLD_WEIGHTS_DIR") or (None if NATIVE == "metal" else REPO)
+# ESMFold2's scheduled sampler steps: the checkpoint's own, and the floor for a job with per-atom tokens
+# (web/esmfold2-model.js, ESMFOLD2_COUNTS and ESMFOLD2_ATOMISED_STEPS - the page's numbers, mirrored)
+ESMFOLD2_DEFAULT_STEPS, ESMFOLD2_ATOMISED_STEPS = 15, 64
+# ...and the same floor past this many residues, whose backbone 11 steps leave short (ESMFOLD2_LONG_RESIDUES)
+ESMFOLD2_LONG_RESIDUES = 2048
+# BioEmu2's: the vendor's 200 (web/bioemu2-model.js BIOEMU2_DEFAULT_STEPS)
+BIOEMU2_DEFAULT_STEPS = 200
+
+
+def job_residues(text):
+    """An AlphaFold 3 job's polymer residues, every copy counted (web/app.js counts its chains' the same way)."""
+    spec = json.loads(text)
+    spec = spec[0] if isinstance(spec, list) else spec
+    total = 0
+    for entry in spec.get("sequences", []):
+        for kind, body in entry.items():
+            if kind in ("protein", "dna", "rna") and isinstance(body, dict):
+                ids = body.get("id", "A")
+                total += len(body.get("sequence", "")) * (len(ids) if isinstance(ids, list) else 1)
+    return total
+
+
+def atomised_job(text):
+    """Whether an AlphaFold 3 job carries per-atom tokens: a ligand, or a modified residue or base."""
+    spec = json.loads(text)
+    spec = spec[0] if isinstance(spec, list) else spec
+    for entry in spec.get("sequences", []):
+        for kind, body in entry.items():
+            if kind == "ligand" or (isinstance(body, dict) and body.get("modifications")):
+                return True
+    return False
+# 🔴 ONE WORKER'S OWN: two workers on one machine - a reader's `localfold serve` and a gate's, or a gate's own two - shared
+# /tmp/localfold-<port>, and each job's rmtree(WORK) and each new server's rmtree of its serving directory deleted the
+# other's input and frames directory under it: the other's ESMFold2 server then fopen'd a contact map into a directory
+# that was gone and died in fwrite on a null FILE (a crash report, 2026-10-17; "the ef2 server exited" with nothing in
+# its log). So the default carries the process id, and a worker starting clears the ones whose process is gone.
+WORK = (os.environ.get("LOCALFOLD_WORK") or os.environ.get("LOCALFOLD_CUDA_WORK")
+        or f"/tmp/localfold-{NATIVE}-{os.getpid()}")
+
+
+def clear_stale_work():
+    import glob
+    for path in glob.glob(f"/tmp/localfold-{NATIVE}-[0-9]*"):
+        pid = path[len(f"/tmp/localfold-{NATIVE}-"):].split("-")[0]
+        if not pid.isdigit() or int(pid) == os.getpid():
+            continue
+        try:
+            os.kill(int(pid), 0)               # (alive: someone else's, left alone)
+        except ProcessLookupError:
+            shutil.rmtree(path, ignore_errors=True)
+        except PermissionError:
+            pass
+AF3_FAMILIES = ("af3", "openbind0", "opendde", "boltz2", "protenix2", "intellifold2", "rosettafold3", "chai1", "mol1")
+# the featurisers: each native repository carries its own copy (cpp/featurise, the same bytes in both)
+FEATURISE = os.environ.get("LOCALFOLD_FEATURISE_DIR") or os.path.join(REPO, NATIVE, "cpp", "featurise")
+OUT = sys.stdout
+
+
+def emit(kind, payload, raw=None):
+    """raw: {placeholder string: JSON text} spliced in for the placeholder after serialising (a result's matrices,
+    passed through as the binary wrote them - see collect)"""
+    line = json.dumps({"kind": kind, "payload": payload, "at": int(time.time() * 1000)})
+    for placeholder, text in (raw or {}).items():
+        line = line.replace(json.dumps(placeholder), text, 1)
+    OUT.write(line + "\n")
+    OUT.flush()
+
+
+def flat_matrix(text, key):
+    """The [[...]] matrix under `key` in a confidences file's text, as the text of one flat JSON list - and the
+    file's text with it replaced by null. The binaries write it as rows of two-decimal numbers, so cutting the
+    brackets out is the same list a parse, a flatten and a round produced, without the n^2 Python floats (95 ms of a
+    261-token job's 167 ms of result handling: the load, the flatten and round, the dump)."""
+    at = text.find(f'"{key}": [[')
+    if at < 0:
+        return text, None
+    start = at + len(key) + 4
+    end = text.index("]]", start) + 2
+    # (the rows' newlines out too: the protocol is a JSON object a line)
+    flat = "[" + text[start + 1:end - 1].replace("[", "").replace("]", "").replace("\n", "") + "]"
+    return text[:start] + "null" + text[end:], flat
+
+
+JOB_STARTED = [0.0]        # (the job's start, which each step's `at` is counted from)
+
+
+def dev(phase, ms, sub=False, begin=None):
+    """One row of the page's timing report (web/dev-log.js): a step this worker timed, as it ends - so a fold that
+    fails or is stopped still has the rows up to there. `sub` rows break the row above them down (the binary's own
+    stage times) and are not added to the total."""
+    at = {} if begin is None else {"at": round((begin - JOB_STARTED[0]) * 1000)}
+    emit("dev", {"phase": phase, "ms": round(ms, 1), **at, **({"sub": True} if sub else {})})
+
+
+def fold_breakdown(said, fold_ms):
+    """The fold's stages as its binary printed them (metal/<port> and cuda/<port>): AF3's trunk, diffusion and
+    confidence, ESMFold2's language model, embedder, trunk, sampler and confidence, AF2's passes - and what is left
+    of the fold's time beside them (reading the input, writing the structure)."""
+    rows = []
+    found = re.search(r"fold: trunk ([\d.]+) ms \((\d+) passes\), diffusion ([\d.]+) ms \((\d+) steps x (\d+)\), "
+                      r"confidence ([\d.]+) ms", said)
+    if found:
+        trunk, passes, diffusion, steps, samples, confidence = found.groups()
+        rows += [(f"trunk ({passes} pass{'es' if passes != '1' else ''})", float(trunk)),
+                 (f"diffusion ({steps} steps x {samples} sample{'s' if samples != '1' else ''})", float(diffusion)),
+                 ("confidence", float(confidence))]
+    for name in ("language model", "inputs embedder", "trunk", "sampler", "confidence"):
+        line = re.search(rf"^{name} ([\d.]+) ms(?: \((\d+) steps\))?$", said, re.M)
+        if line and not found:
+            rows.append((f"{name} ({line.group(2)} steps)" if line.group(2) else name, float(line.group(1))))
+    for line in re.finditer(r"^  pass (\d+)/(\d+):.*?  ([\d.]+) ms$", said, re.M):
+        rows.append((f"pass {line.group(1)}/{line.group(2)}", float(line.group(3))))
+    if rows:
+        rest = fold_ms - sum(ms for _, ms in rows)
+        if rest > 0:
+            rows.append(("reading the input, writing the structure", rest))
+    return rows
+
+
+class Refused(Exception):
+    """A job this backend does not run, said as such rather than approximated."""
+
+
+def card_use(servers=()):
+    """(used, total) MiB of device memory on the card, from nvidia-smi - on a Mac, whose GPU shares the machine's
+    memory, the resident memory of the model servers against the machine's"""
+    if NATIVE == "metal":
+        total = int(subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True, text=True).stdout) >> 20
+        pids = [str(s.proc.pid) for s in servers if s.proc.poll() is None]
+        rss = subprocess.run(["ps", "-o", "rss=", "-p", ",".join(pids)], capture_output=True, text=True).stdout if pids else ""
+        return sum(int(v) for v in rss.split()) >> 10, total
+    out = subprocess.run(["nvidia-smi", "--query-gpu=memory.used,memory.total", "--format=csv,noheader,nounits"],
+                         capture_output=True, text=True, timeout=10).stdout.strip().splitlines()
+    used, total = (int(v) for v in out[0].split(","))
+    return used, total
+
+
+def device_name():
+    if NATIVE == "metal":
+        try:
+            chip = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True, text=True,
+                                  timeout=10).stdout.strip()
+            return chip or "Apple GPU"
+        except (OSError, subprocess.SubprocessError):
+            return "Apple GPU"
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                             capture_output=True, text=True, timeout=10).stdout.strip().splitlines()
+        return out[0] if out else "no GPU"
+    except (OSError, subprocess.SubprocessError):
+        return "no GPU"
+
+
+def die_with_parent():
+    """Linux: a child gets SIGKILL when this worker goes, however it goes - Stop kills the worker (the
+    broker's way of ending a fold), and a binary left running would hold the card. macOS has no such call: the
+    broker kills the worker's whole process group instead (python/localfold/server.py), and a Metal server whose
+    parent is gone stops itself (metal/core/host.cpp)."""
+    if sys.platform != "linux":
+        return
+    import ctypes
+    import signal
+    ctypes.CDLL("libc.so.6").prctl(1, signal.SIGKILL)       # PR_SET_PDEATHSIG
+
+
+def model_weights(model, log):
+    """A model's weights on disk, by its --model name - what its binary reads (cuda/cpp/featurise/fetch-weights: fetch.h's one
+    table), downloaded the first time piece by piece, each said, so a slow download (one revision came at 0.9 MB/s on
+    a Colab T4) reads as a download and not a hang. AlphaFold 3's are Google DeepMind's, for academic non-commercial
+    use: the page folds only once its model-terms dialog has been accepted, which is the acceptance passed on."""
+    env = dict(os.environ)
+    if model == "af3":
+        accepted = {n.strip() for n in env.get("LOCALFOLD_ACCEPT_MODEL_TERMS", "").split(",") if n.strip()}
+        env["LOCALFOLD_ACCEPT_MODEL_TERMS"] = ",".join(sorted(accepted | {"alphafold3"}))
+    where = [f"--weights-dir={WEIGHTS_DIR}"] if WEIGHTS_DIR else []
+    fetcher = subprocess.Popen([featuriser("fetch-weights"), *where, model], cwd=REPO, stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT, text=True, bufsize=1, preexec_fn=die_with_parent, env=env)
+    said, dirs = [], []
+    for line in fetcher.stdout:
+        said.append(line)
+        found = re.search(r"\((\d+)/(\d+)\)", line)
+        if found:
+            emit("status", f"fetching the {model} weights · part {found.group(1)} of {found.group(2)}")
+        named = re.match(re.escape(model) + r": (/.+)$", line.rstrip("\n"))
+        if named:
+            dirs.append(named.group(1))
+    if fetcher.wait() != 0:
+        raise RuntimeError(f"fetching {model} failed: {''.join(said[-4:])}")
+    log.append("".join(said))
+    return dirs
+
+
+def local_ccd():
+    """wwPDB's whole component dictionary when `fetch-weights ccd` has put it beside the weights (the binaries'
+    default too): every component read from it, none fetched from the RCSB a component at a time."""
+    path = os.path.join(WEIGHTS_DIR or REPO, "ccd", "components.cif")
+    return [f"--ccd={path}"] if os.path.exists(path) else []
+
+
+BUILD_MARKER, BUILD_LOG = "/tmp/localfold-cuda-build", "/tmp/localfold-cuda-build.log"
+
+
+def building():
+    """Whether cuda/build.sh is running (its marker names a live pid)."""
+    try:
+        os.kill(int(open(BUILD_MARKER).read().strip()), 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def binary(port):
+    """A port's binary - waited for while cuda/build.sh is still compiling it (the notebook starts the
+    build beside the service, so the first fold can arrive before it is done), refused if nothing is."""
+    path = os.path.join(BIN_DIR, f"localfold-{port}") if BIN_DIR else os.path.join(REPO, NATIVE, port, f"localfold-{port}")
+    if NATIVE == "metal":
+        if not os.access(path, os.X_OK):
+            raise Refused(f"{path} is not built - run bash metal/build.sh {port}")
+        return path
+    started = time.time()
+    while not os.access(path, os.X_OK) and building():
+        emit("status", f"compiling the CUDA ports for this card (once a runtime) · {time.time() - started:.0f} s")
+        time.sleep(3)
+    if not os.access(path, os.X_OK):
+        said = open(BUILD_LOG).read()[-600:] if os.path.exists(BUILD_LOG) else ""
+        raise Refused(f"cuda/{port}/localfold-{port} is not built on this runtime - run cuda/build.sh"
+                      + (f" (its last build said: {said.strip()})" if said.strip() else ""))
+    return path
+
+
+def max_msa_override(controls):
+    """The page's Max MSA where it overrides a model's own row cap - ESMFold2's 16384 and BioEmu2's 4092 - as the
+    featuriser's flag; nothing on "Default" (the dial's empty value), so those folds are byte for byte what they were.
+    AF3 and AF2 always take the dial (their featurisers' --max-msa above)."""
+    depth = str(controls.get("max-msa") or "").split(":")[0]
+    return [f"--max-msa={int(depth)}"] if depth.isdigit() and int(depth) > 0 else []
+
+
+def featuriser(name):
+    """A native featuriser (cuda/cpp/featurise/<name>, metal/cpp/featurise on a Mac) - waited for while cuda/build.sh compiles it, refused if nothing
+    is building it."""
+    path = os.path.join(FEATURISE, name)
+    if NATIVE == "metal" and not os.access(path, os.X_OK):
+        raise Refused(f"{path} is not built - run bash metal/build.sh featurise")
+    started = time.time()
+    while not os.access(path, os.X_OK) and building():
+        emit("status", f"compiling the native featurisers (once a runtime) · {time.time() - started:.0f} s")
+        time.sleep(1)
+    if not os.access(path, os.X_OK):
+        raise Refused(f"cuda/cpp/featurise/{name} is not built on this runtime - run cuda/build.sh")
+    return path
+
+
+def polymer_chains(job_json):
+    """The job's polymer chains in fold order, one per copy - the page's `chains`."""
+    spec = json.loads(job_json)
+    spec = spec[0] if isinstance(spec, list) else spec
+    out = []
+    for entry in spec.get("sequences", []):
+        for kind in ("protein", "dna", "rna"):
+            if kind in entry:
+                body = entry[kind]
+                copies = len(body["id"]) if isinstance(body.get("id"), list) else 1
+                out += [body["sequence"]] * copies
+    return out
+
+
+def protein_sequences(job_json):
+    """The job's protein chains in job order, one per copy (BioEmu2's alignment is a chain's own)."""
+    spec = json.loads(job_json)
+    spec = spec[0] if isinstance(spec, list) else spec
+    out = []
+    for entry in spec.get("sequences", []):
+        if "protein" in entry:
+            body = entry["protein"]
+            out += [body["sequence"].upper()] * (len(body["id"]) if isinstance(body.get("id"), list) else 1)
+    return out
+
+
+def protein_chain_count(job_json):
+    """How many of the job's chains are protein, one per copy."""
+    spec = json.loads(job_json)
+    spec = spec[0] if isinstance(spec, list) else spec
+    return sum((len(e["protein"]["id"]) if isinstance(e["protein"].get("id"), list) else 1)
+               for e in spec.get("sequences", []) if "protein" in e)
+
+
+def pdb_atoms(pdb):
+    atoms = []
+    for line in pdb.splitlines():
+        if line.startswith(("ATOM", "HETATM")) and len(line) >= 66:
+            atoms.append({"chain": line[21].strip(), "res": line[22:26].strip(), "b": float(line[60:66])})
+    return atoms
+
+
+def token_plddt(atoms, chain_ids, res_ids):
+    """One pLDDT a token from the atoms' own (the B factor column): a residue that is one token takes its
+    atoms' mean, a ligand or atomised residue - one token an atom - each atom's own (keyed on
+    (chain, residue) in token order)."""
+    groups = {}
+    for atom in atoms:
+        groups.setdefault((atom["chain"], atom["res"]), []).append(atom["b"])
+    counts = {}
+    for chain, res in zip(chain_ids, res_ids):
+        counts[(chain, str(res))] = counts.get((chain, str(res)), 0) + 1
+    seen, out = {}, []
+    for chain, res in zip(chain_ids, res_ids):
+        key = (chain, str(res))
+        values = groups.get(key)
+        if not values:
+            raise RuntimeError(f"the structure has no atom for token {chain}{res}")
+        index = seen.get(key, 0)
+        seen[key] = index + 1
+        out.append(values[index] if counts[key] == len(values) and counts[key] > 1 else sum(values) / len(values))
+    return [round(v, 2) for v in out]
+
+
+def emit_scores(meta, pae_path, passes):
+    """An AF2 pass's confidences as the page's `scores` event: its pLDDT (per residue and mean), pTM, ipTM
+    and PAE (a byte a pair, PAE / 0.125, base64)."""
+    import base64
+    data = open(pae_path, "rb").read()
+    emit("scores", {**meta, "n": int(round(len(data) ** 0.5)), "paeU8": base64.b64encode(data).decode(),
+                    "paeScale": 0.125, "passes": passes})
+
+
+def emit_contacts(path, index, passes):
+    """A pass's contact map as the page's `contacts` event: one byte a pair (probability * 255), base64 -
+    68 KB for 261 tokens where float32 JSON would be ten times that."""
+    import base64
+    data = open(path, "rb").read()
+    n = int(round(len(data) ** 0.5))
+    emit("contacts", {"n": n, "pass": index, "passes": passes, "u8": base64.b64encode(data).decode()})
+
+
+class Server:
+    """One model kept on the device between folds: the port's own --serve mode (common.cuh's serveJobs: a job
+    is DIR/<id>.job - the input's directory, then a flag a line - its output <id>.log, its status <id>.done).
+    A cold fold is mostly start-up - the CUDA context, the weight upload, the kernels' first launches: 6MRR
+    is 0.92 s cold of which the fold is 0.18 on an A100 for AF3, ~0.75 s of start-up for AF2 and ESMFold2 -
+    and this pays it once a model. `key` names the model (a port, its family, AF2's model number)."""
+
+    def __init__(self, key, command):
+        self.key = key
+        self.dir = os.path.join(WORK + "-serve", "-".join(str(k) for k in key))
+        shutil.rmtree(self.dir, ignore_errors=True)
+        os.makedirs(self.dir)
+        self.log = open(os.path.join(self.dir, "server.log"), "w")
+        # (AF2_STARTUP / EF2_STARTUP: their weights' load time in the log, as AF3 prints its own)
+        env = {**os.environ, "AF2_STARTUP": "1", "EF2_STARTUP": "1"}
+        self.started = time.time()
+        self.ready = None              # when it said it was serving: its weights are up
+        self.reported = False          # (its load time in the report once, with the fold that waited for it)
+        self.proc = subprocess.Popen([*command, f"--serve={self.dir}"], cwd=REPO, stdout=self.log,
+                                     stderr=subprocess.STDOUT, preexec_fn=die_with_parent, env=env)
+        # 🔴 NOT WAITED FOR: the worker starts a model's server BEFORE it featurises the job, so the CUDA
+        # context, the weights' upload and AF2's and ESMFold2's warm-up fold (--warm: every kernel, weight copy
+        # and cuBLAS plan loaded) run beside the exporter or the MSA search; a job dropped meanwhile is taken
+        # once the server is up, and a server that dies first says so through fold()'s wait
+        self.count = 0
+
+    def fold(self, inputs, flags, on_file=None):
+        """...and with `on_file`, each streamed result handed over as it lands (--frames: written by a thread
+        of the binary off the copy engine, so the fold does not wait for it - +0.1-0.4% of a fold, measured
+        interleaved; the structure is byte-identical either way): on_file(name, path) in name order."""
+        self.count += 1
+        base = os.path.join(self.dir, f"{self.count:06d}")
+        frames = base + ".frames"
+        if on_file is not None:
+            os.makedirs(frames, exist_ok=True)
+            flags = [*flags, f"--frames={frames}"]
+        with open(base + ".tmp", "w") as handle:
+            handle.write("\n".join([inputs, *flags]) + "\n")
+        os.rename(base + ".tmp", base + ".job")
+        seen = set()
+
+        def collect():
+            if on_file is None:
+                return
+            for name in sorted(os.listdir(frames)):
+                if name not in seen and not name.endswith(".tmp"):
+                    seen.add(name)
+                    on_file(name, os.path.join(frames, name))
+        while not os.path.exists(base + ".done"):
+            if self.ready is None and "serving" in open(self.log.name).read():
+                self.ready = time.time()
+            if self.proc.poll() is not None:
+                raise RuntimeError(f"the {self.key[0]} server exited: " + open(self.log.name).read()[-400:])
+            collect()
+            time.sleep(0.005)
+        collect()
+        if self.ready is None:         # (up and done between two polls)
+            self.ready = time.time()
+        shutil.rmtree(frames, ignore_errors=True)
+        said = open(base + ".log").read()
+        if int(open(base + ".done").read().strip() or 1) != 0:
+            thrown = [line for line in said.strip().splitlines() if line.strip()]
+            # (a port that refuses says `Error: <sentence>`, as a featuriser does: the reader gets the sentence)
+            sentence = next((line[7:] for line in thrown if line.startswith("Error: ")), None)
+            if sentence is not None:
+                raise Refused(sentence)
+            raise RuntimeError("the fold failed: " + "\n".join(thrown[-4:]))
+        return said
+
+    def close(self):
+        if self.proc.poll() is None:
+            with open(os.path.join(self.dir, "quit.tmp"), "w") as handle:
+                handle.write("quit\n")
+            os.rename(os.path.join(self.dir, "quit.tmp"), os.path.join(self.dir, "~quit.job"))
+            try:
+                self.proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+
+
+class MultiServer(Server):
+    """AlphaFold 2's five models in ONE process (cuda/af2 --multi: a thread a model, each its own stream, every global
+    of the binary thread-local): a short fold fills a fifth of the card, and five folding at once share it - "All 5"
+    over 68 residues 322 -> 150 ms on an A100, 150 residues 634 -> 451, 261 1571 -> 1316, each model's structure
+    byte-identical to its own server's (cuda/af2/README.md, Round 5 Modules 8-9). `lanes` is each model's argument
+    list as Server would run it (its binary, bundle, delta and warm-up); each lane serves its own directory."""
+
+    def __init__(self, key, lanes):
+        self.key = key
+        self.dir = os.path.join(WORK + "-serve", "-".join(str(k) for k in key))
+        shutil.rmtree(self.dir, ignore_errors=True)
+        os.makedirs(self.dir)
+        self.lanes = [os.path.join(self.dir, f"lane{i}") for i in range(len(lanes))]
+        command = [lanes[0][0], "--multi"]
+        for i, (lane, where) in enumerate(zip(lanes, self.lanes)):
+            os.makedirs(where)
+            command += (["::"] if i else []) + [*lane[1:], f"--serve={where}"]
+        self.log = open(os.path.join(self.dir, "server.log"), "w")
+        env = {**os.environ, "AF2_STARTUP": "1"}
+        self.started = time.time()
+        self.ready = None
+        self.reported = False
+        self.proc = subprocess.Popen(command, cwd=REPO, stdout=self.log, stderr=subprocess.STDOUT,
+                                     preexec_fn=die_with_parent, env=env)
+        self.count = 0
+
+    def fold_all(self, inputs, flags, live=None, on_file=None):
+        """The same input through every lane at once (flags[i]: lane i's, its --out among them); lane `live`'s
+        streamed files handed to on_file as they land, every lane's kept (--frames) when on_file is given, so a
+        later job can replay them. Returns [(said, frames dir or None, error or None)] a lane."""
+        self.count += 1
+        jobs = []
+        for i, where in enumerate(self.lanes):
+            base = os.path.join(where, f"{self.count:06d}")
+            frames = base + ".frames" if on_file is not None else None
+            lane_flags = [*flags[i], f"--frames={frames}"] if frames else list(flags[i])
+            if frames:
+                os.makedirs(frames, exist_ok=True)
+            with open(base + ".tmp", "w") as handle:
+                handle.write("\n".join([inputs, *lane_flags]) + "\n")
+            jobs.append((base, frames))
+        for base, _ in jobs:
+            os.rename(base + ".tmp", base + ".job")
+        seen = set()
+
+        def collect():
+            frames = jobs[live][1] if live is not None else None
+            if frames is None:
+                return
+            for name in sorted(os.listdir(frames)):
+                if name not in seen and not name.endswith(".tmp"):
+                    seen.add(name)
+                    on_file(name, os.path.join(frames, name))
+        while not all(os.path.exists(base + ".done") for base, _ in jobs):
+            if self.ready is None and open(self.log.name).read().count("serving") >= len(self.lanes):
+                self.ready = time.time()
+            if self.proc.poll() is not None:
+                raise RuntimeError(f"the {self.key[0]} server exited: " + open(self.log.name).read()[-400:])
+            collect()
+            time.sleep(0.005)
+        collect()
+        if self.ready is None:
+            self.ready = time.time()
+        out = []
+        for base, frames in jobs:
+            said = open(base + ".log").read()
+            error = None
+            if int(open(base + ".done").read().strip() or 1) != 0:
+                thrown = [line for line in said.strip().splitlines() if line.strip()]
+                sentence = next((line[7:] for line in thrown if line.startswith("Error: ")), None)
+                error = Refused(sentence) if sentence is not None else RuntimeError("the fold failed: " + "\n".join(thrown[-4:]))
+            out.append((said, frames, error))
+        return out
+
+    def close(self):
+        if self.proc.poll() is None:
+            for where in self.lanes:                  # (each lane's thread ends at its own quit; the process when all have)
+                with open(os.path.join(where, "quit.tmp"), "w") as handle:
+                    handle.write("quit\n")
+                os.rename(os.path.join(where, "quit.tmp"), os.path.join(where, "~quit.job"))
+            try:
+                self.proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+
+
+# "All 5": the sweep's other models, folded beside the one asked for and answered from here when their jobs come
+# (the page sends the five as five jobs, one after another - web/app.js's af2Sweep - identical but for the family)
+SWEEP_MAX_RESIDUES = 400     # (past this a fold fills the card alone: 1.19x at 261 residues, and five pairs' memory)
+
+
+def sweep_key(job):
+    """What makes two of a sweep's jobs the same fold but for the model: everything the page sent but the family."""
+    picked = {k: v for k, v in job.items() if k != "family"}
+    return hashlib.sha256(json.dumps(picked, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def featurise(cmd, what, log, on_line=None):
+    """A native featuriser's run (cuda/cpp/featurise): its output kept, and each line handed to `on_line` as it comes (the
+    MMseqs2 search says `search: queued` / `search: running` while it waits); a refusal - the page's own sentence,
+    which every featuriser prints as `Error: <sentence>` - raised as one, anything else as the step that failed."""
+    proc = subprocess.Popen(cmd, cwd=REPO, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+                            preexec_fn=die_with_parent)
+    lines = []
+    for line in proc.stdout:
+        lines.append(line)
+        if on_line is not None:
+            on_line(line.rstrip("\n"))
+    said = "".join(lines)
+    log.append(f"$ {' '.join(cmd)}\n{said}")
+    if proc.wait() != 0:
+        first = re.search(r"^Error: (.+)$", said, re.M)
+        if first:
+            raise Refused(first.group(1))
+        raise RuntimeError(f"{what} failed: " + "\n".join(said.strip().splitlines()[-4:]))
+    return said
+
+
+def streaming(job):
+    """Whether a fold streams its intermediate results: the reader's own choice, the page's Live preview
+    (web/native-bridge.js), sent as `frames` - on unless it says false."""
+    return job.get("frames", True) is not False
+
+
+class Worker:
+    # 🔴 SEVERAL MODELS MAY STAY ON THE CARD, WHILE THERE IS ROOM. A change of model paid its server's start
+    # (0.3-0.56 s on an A100 - the context, the weights) and a first fold in a fresh process; idle, the three
+    # ports hold 0.8-2.6 GB each. So the servers last used stay up while the card is at most half full after
+    # a fold, the least recent going first, and every idle one is stopped before a job past LARGE residues -
+    # a big fold's own buffers are what the card is for.
+    LARGE = 400
+
+    def __init__(self):
+        self.device = device_name()
+        self.servers = {}                # key -> Server, least recently used first
+        self.sweep = None                # "All 5": {"key", "results": {model: result}, "frames": {model: dir}}
+
+    def evict(self, keep, everything=False):
+        """Idle servers stopped, least recently used first: all of them (`everything`), or until the card is
+        at most half full. `keep` (the model about to fold, or just folded) is never one."""
+        for key in [k for k in self.servers if k != keep]:
+            if not everything:
+                used, total = card_use(self.servers.values())
+                if used <= total // 2:
+                    return
+            self.servers.pop(key).close()
+
+    def server_for(self, key, command, residues, make=None):
+        """The model's server - kept, or started - moved to the most recently used end (`make`: how to start one,
+        Server(key, command) unless given)."""
+        self.evict(key, everything=residues > self.LARGE)
+        server = self.servers.pop(key, None)
+        if server is not None and server.proc.poll() is not None:
+            server = None
+        if server is None:
+            emit("status", f"{key[1]} on {NATIVE_NAME} ({self.device}) · loading the weights onto the "
+                 + ("GPU" if NATIVE == "metal" else "card"))
+            server = make() if make else Server(key, command)
+        self.servers[key] = server
+        return server
+
+    def fold(self, job):
+        controls = job.get("controls", {})
+        family = job.get("family") or controls.get("model-family", "af3")
+        # 🔴 AF2's FAMILY CARRIES ITS MODEL NUMBER (the page resolves the number box into `monomer-2`,
+        # `multimer-5`): models 2-5 are published as deltas on model 1 and read as the page reads them
+        # (common.cuh's loadBundle --delta, bit-exact against shared/bundles/delta-tensor-store.js)
+        base, _, number = family.partition("-")
+        af2_model = 1
+        if base in ("monomer", "multimer"):
+            # (the family names models 2-5; model 1's is the bare family, and its af2Model may read "all" - the page's
+            # "All 5" sends `monomer` for model 1 with the row's own value, which int() refused: the sweep's first job failed)
+            chosen = str(controls.get("af2Model") or "1")
+            af2_model = int(number) if number.isdigit() else int(chosen) if chosen.isdigit() else 1
+            if not 1 <= af2_model <= 5:
+                raise Refused(f"AlphaFold 2 has models 1 to 5, not {af2_model}")
+            family = base
+        if family in AF3_FAMILIES:
+            port = "af3"
+        elif family in ("monomer", "multimer"):
+            port = "af2"
+        elif family in ("ef2-fast-600m", "ef2-fast-300m", "ef2-fast", "ef2"):
+            port = "ef2"          # (ef2-fast and ef2: biohub's released two, on ESM-C 6B, from local exports)
+        elif family == "bioemu2":
+            port = "bioemu2"
+        else:
+            raise Refused(f"the {NATIVE_NAME} backend has no port of {family!r} (it folds the AF3 lineage, AlphaFold 2,"
+                          " ESMFold2 and BioEmu2)")
+        # one sampler: a job from an older page that still asks for Flow is refused by name, not folded otherwise
+        if controls.get("af3-mode", "diffusion") != "diffusion":
+            raise Refused("Flow was removed - every fold samples with diffusion now (docs/AF3.md, \"Flow removed\")")
+        emit("status", f"{family} on {NATIVE_NAME} ({self.device}) · reading the job")
+        if port == "af2" and self.sweep and self.sweep["key"] == sweep_key(job) and af2_model in self.sweep["results"]:
+            return self.replay(job, family, port, af2_model)
+        emit("progress", 0.02)
+        started = time.time()
+        JOB_STARTED[0] = started
+        shutil.rmtree(WORK, ignore_errors=True)
+        inputs = os.path.join(WORK, "in")
+        os.makedirs(WORK)
+        log = []
+        job_path = os.path.join(WORK, "job.json")
+        with open(job_path, "w") as handle:
+            handle.write(job["job"])
+        request_path = os.path.join(WORK, "request.json")
+        with open(request_path, "w") as handle:
+            json.dump({"entities": job.get("entities", [])}, handle)
+
+        residues = sum(len(chain) for chain in polymer_chains(job["job"]))
+        # the alignment, as the page's MSA row asked for it
+        # (ESMFold2's experimental tier reads no alignment; the released Fast reads its profile, Full encodes it)
+        mode = controls.get("msa-mode", "none") if port != "ef2" or family in ("ef2", "ef2-fast") else "none"
+        flags, a3m = [], None
+        if mode == "search":
+            flags.append("--search")
+        elif mode in ("paste", "upload"):
+            msas = {"merged": controls.get("msa-text") or ""} if mode == "paste" else (job.get("msas") or {})
+            if msas.get("merged"):
+                path = os.path.join(WORK, "msa.a3m")
+                with open(path, "w") as handle:
+                    handle.write(msas["merged"])
+                flags.append(f"--a3m={path}")
+                a3m = msas["merged"]
+            elif any(msas.get("unpaired") or []):
+                paths = {"unpaired": [], "paired": []}       # (merged by each exporter as the page merges them)
+                for side in paths:
+                    for index, text in enumerate(msas.get(side) or []):
+                        path = os.path.join(WORK, f"msa-{side}-{index}.a3m")
+                        with open(path, "w") as handle:
+                            handle.write(text or "")
+                        paths[side].append(path)
+                flags.append("--a3m=" + ",".join(paths["unpaired"]))
+                if any(msas.get("paired") or []):
+                    flags.append("--paired-a3m=" + ",".join(paths["paired"]))
+            else:
+                raise Refused(f"the MSA mode is {mode!r} but no alignment came with the job")
+        elif mode != "none":
+            raise Refused(f"the {NATIVE_NAME} backend does not know the MSA mode {mode!r}")
+
+        dev("reading the job", (time.time() - started) * 1000, begin=started)
+        # the templates, resolved by the page's own code - where a row asks for one (templateKind: a row's
+        # template with no kind, or "none", is no template; a Node start is 0.13 s of a 0.5 s warm fold)
+        templates = []
+        if any((entity.get("template") or {}).get("kind") not in (None, "none") for entity in job.get("entities", [])):
+            at = time.time()
+            templates = json.loads(featurise([featuriser("resolve-templates"), request_path, os.path.join(WORK, "templates")],
+                                             "resolving the templates", log).strip().splitlines()[-1] or "[]")
+            dev("resolving the templates", (time.time() - at) * 1000, begin=at)
+        if templates and port == "ef2":
+            raise Refused("ESMFold2 takes no template")
+        if templates and port == "bioemu2":
+            raise Refused("BioEmu2 takes no template")
+        searched = [t["chain"] for t in templates if t["kind"] == "search"]
+        if searched and mode != "search":
+            raise Refused("a template from the MSA search needs an MSA search: set the MSA to search, or name a"
+                          " structure instead")
+        named = [t for t in templates if t["kind"] != "search"]
+        if named:
+            emit("status", f"{family} on {NATIVE_NAME} · templates {', '.join(t['source'] for t in named)}")
+        if port == "af3":
+            # as AlphaFold 3 packs them (web/af3-model.js packTemplateSlots): every chain's k-th template in slot k,
+            # joined by "&", which masks the cross-chain block - a slot a ROW (a chain copy) refused six copies of a
+            # homomer ("at most four template slots"), and split a complex's templates across slots. "+" stays free
+            # for a multi-chain template, one structure placing several chains, whose slot may span them.
+            if named:
+                by_chain = {}
+                for t in named:
+                    by_chain.setdefault(t["chain"], []).append(f"{t['file']}:{t['chainId'] or ''}@{t['chain']}")
+                slots = ["&".join(parts[k] for parts in by_chain.values() if k < len(parts))
+                         for k in range(min(4, max(len(parts) for parts in by_chain.values())))]
+                flags.append("--template=" + ",".join(slots))
+        elif named:
+            flags.append("--template=" + "+".join(f"{t['file']}:{t['chainId'] or ''}@{t['chain']}" for t in named))
+        if searched:
+            flags.append("--template-search-chains=" + ",".join(str(c) for c in searched))
+
+        recycles = controls.get("recycles")
+        seed = int(controls.get("random-seed") or 1)
+        depth = str(controls.get("max-msa") or "512:1024").split(":")
+        requested = int(depth[0]) if depth[0].isdigit() else 512
+        extra = int(depth[1]) if len(depth) > 1 and depth[1].isdigit() else 1024
+        out_pdb = os.path.join(WORK, "fold.pdb")
+        emit("status", f"{family} on {NATIVE_NAME} ({self.device}) · featurising"
+             + (" and searching the ColabFold MMseqs2 server" if mode == "search" else ""))
+        def live(line):          # the featuriser's own word while it works: the MMseqs2 search waits on a queue
+            if line.startswith("search: "):
+                emit("status", f"{family} on {NATIVE_NAME} ({self.device}) · MMseqs2 search · {line[8:]}")
+        # each port's resident server (Server: the model's weights stay on the card between folds) and this
+        # job's flags for it
+        if port == "af3":
+            # af3-any-model's own int8 blob, every family (AlphaFold 3's under DeepMind's academic terms)
+            at = time.time()
+            weights = model_weights(family, log)
+            dev("the weights on disk (fetched if missing)", (time.time() - at) * 1000, begin=at)
+            bundle, dialect = weights[0], f"--family={family}"
+            key = ("af3", family)
+            # chai-1's token features are ESM2 3B's, computed in the fold (cuda/plm/esm2.cuh)
+            esm = [f"--esm-bundle={weights[1]}"] if len(weights) > 1 else []
+            server = self.server_for(key, [binary("af3"), "-", f"--bundle={bundle}",
+                                           f"--family={family}", "--fold", "--fast",
+                                           *esm], residues)
+            at = time.time()
+            featurise([featuriser("af3-featurise"), inputs, "--no-weights", dialect, f"--job={job_path}",
+                       f"--max-msa={requested}", *flags, *local_ccd()], "featurising", log, live)
+            dev("featurising" + (" and the MMseqs2 search" if mode == "search" else ""), (time.time() - at) * 1000, begin=at)
+            steps = int((job.get("schedule") or {}).get("steps") or controls.get("af3-count") or 0)
+            fold = [f"--out={out_pdb}"]
+            if steps:
+                # ...the page's floor: a modified residue's atoms stay compressed below sixteen steps (app.js)
+                spec = json.loads(job["job"])
+                spec = spec[0] if isinstance(spec, list) else spec
+                modified = any(body.get("modifications") for entry in spec.get("sequences", [])
+                               for body in entry.values() if isinstance(body, dict))
+                steps = max(steps, 16) if modified else steps
+                fold.append(f"--steps={steps}")
+            if recycles not in (None, ""):
+                fold.append(f"--recycles={int(recycles)}")
+            total = steps or 200                         # (af3's default)
+        elif port == "af2":
+            if templates and family == "monomer" and af2_model > 2:
+                raise Refused(f"AlphaFold 2's model {af2_model} has no template embedder (models 3, 4 and 5 are"
+                              " template-free) - pick model 1 or 2, or drop the template")
+            name = (lambda n: f"model_{n}_ptm") if family == "monomer" else (lambda n: f"model_{n}_multimer_v3")
+            # "All 5" (the page's Model # row): every model at once on one --multi server, the others' results kept for
+            # their jobs - on CUDA, short enough that one fold leaves the card mostly idle, and with no template (models
+            # 3-5 have no template embedder: those jobs are refused one by one, as before)
+            sweep = (NATIVE == "cuda" and str(controls.get("af2Model")) == "all" and residues <= SWEEP_MAX_RESIDUES
+                     and not templates)
+            at = time.time()
+            lanes = []
+            for n in (range(1, 6) if sweep else [af2_model]):
+                weights = model_weights(name(n), log)       # (models 2-5: model 1's bundle and their delta on it)
+                bundle, delta = weights[0], (weights[1] if len(weights) > 1 else None)
+                lanes.append([binary("af2"), "-", f"--bundle={bundle}", "--fast",
+                              *([f"--delta={delta}"] if delta else []), "--warm=64,8,8,0"])
+            dev("the weights on disk (fetched if missing)", (time.time() - at) * 1000, begin=at)
+            if sweep:
+                key = ("af2", family, "all")
+                server = self.server_for(key, None, residues, make=lambda: MultiServer(key, lanes))
+            else:
+                key = ("af2", family, af2_model)
+                server = self.server_for(key, lanes[0], residues)
+            export = [featuriser("af2-featurise"), inputs, f"--bundle={bundle}", f"--job={job_path}",
+                      f"--max-msa={508 if requested == 512 else requested}", f"--max-extra={extra}", f"--seed={seed}", *flags]
+            if recycles not in (None, ""):
+                export.append(f"--recycles={int(recycles)}")
+            at = time.time()
+            featurise(export, "featurising", log, live)
+            dev("featurising" + (" and the MMseqs2 search" if mode == "search" else ""), (time.time() - at) * 1000, begin=at)
+            fold = [f"--out={out_pdb}", f"--tolerance={float(controls.get('tolerance') or 0)}"]   # (the page's early stop)
+            total = 0
+        elif port == "bioemu2":
+            server, fold, total = self.bioemu2(job, controls, flags, job_path, residues, seed, recycles, log, live)
+            key = server.key
+        else:
+            # (the same port for all four: it reads its widths, its recycle and its MSA encoder off the bundles)
+            at = time.time()
+            trunk, tower = model_weights(family if family in ("ef2-fast", "ef2", "ef2-fast-300m") else "ef2-fast-600m", log)
+            dev("the weights on disk (fetched if missing)", (time.time() - at) * 1000, begin=at)
+            key = ("ef2", family)
+            server = self.server_for(key, [binary("ef2"), "-", f"--fold-bundle={trunk}", f"--esmc-bundle={tower}", "--fast",
+                                           "--warm=96,800"], residues)
+            at = time.time()
+            # ESMFold2 reads one alignment a protein chain and pairs none (cuda/ef2/README.md: the vendor's taxonomy
+            # pairing is not done) - so what it cannot read is said, not dropped
+            proteins = protein_chain_count(job["job"])
+            if "--search" in flags and proteins > 1:
+                raise Refused(f"ESMFold2's MMseqs2 search here takes one protein chain, and this job has {proteins} -"
+                              " upload an alignment a chain, or fold it single sequence")
+            if a3m is not None and proteins > 1:
+                raise Refused("ESMFold2 reads one alignment a protein chain, and this is one merged alignment over"
+                              f" {proteins} - upload an alignment a chain")
+            if any(f.startswith("--paired-a3m=") for f in flags):
+                flags = [f for f in flags if not f.startswith("--paired-a3m=")]
+                emit("status", f"{family}: the paired rows are not read (ESMFold2 stacks each chain's alignment unpaired)")
+            if "--search" in flags:
+                # ESMFold2's featuriser searches nothing: the alignment comes from AlphaFold 3's, which writes the
+                # merged search beside its input (search.a3m), kept where the page's archive reads it
+                searched = os.path.join(WORK, "ef2-search")
+                shutil.rmtree(searched, ignore_errors=True)
+                featurise([featuriser("af3-featurise"), searched, "--no-weights", "--family=af3", f"--job={job_path}",
+                           "--search", *local_ccd()], "searching", log, live)
+                flags = [f"--a3m={os.path.join(searched, 'search.a3m')}"]
+            featurise([featuriser("ef2-featurise"), inputs, f"--job={job_path}", f"--fold-bundle={trunk}", *flags,
+                       *max_msa_override(controls), *local_ccd()], "featurising", log, live)
+            if mode == "search" and os.path.exists(os.path.join(WORK, "ef2-search", "search.a3m")):
+                shutil.copy(os.path.join(WORK, "ef2-search", "search.a3m"), os.path.join(inputs, "search.a3m"))
+            dev("featurising" + (" and the MMseqs2 search" if mode == "search" else ""), (time.time() - at) * 1000, begin=at)
+            fold = [f"--out={out_pdb}", f"--seed={seed}"]
+            # the page's step count (scheduled, as the binary's --steps takes it: 15 runs 11), and the page's
+            # floor for per-atom tokens - a ligand or a modified residue is torn at 11 steps and whole at 45 - and for
+            # a long input, whose backbone 11 steps leave short (ESMFOLD2_LONG_RESIDUES)
+            # (web/esmfold2-model.js, ESMFOLD2_ATOMISED_STEPS) - applied here too, for a job no page sent
+            steps = int((job.get("schedule") or {}).get("steps") or 0)
+            if atomised_job(job["job"]) or job_residues(job["job"]) > ESMFOLD2_LONG_RESIDUES:
+                steps = max(steps or ESMFOLD2_DEFAULT_STEPS, ESMFOLD2_ATOMISED_STEPS)
+            if steps:
+                fold.append(f"--steps={steps}")
+            total = 0
+        emit("progress", 0.15)
+        emit("status", f"{family} on {NATIVE_NAME} ({self.device}) · folding")
+        on_file = None
+        if streaming(job):
+            # 🔴 WHAT EACH PORT STREAMS, AS WebGPU AND JAX STREAM IT - unless the page's Live preview is off:
+            # the AF3 lineage's trunk contacts and sampler frames, AF2's passes (structure, pLDDT, pTM/ipTM,
+            # PAE, contacts), ESMFold2's trunk contacts and sampler frames - as the binary's tap writes them
+            def on_file(name, path):
+                self.stream(name, path, family, port, total)
+        submitted = time.time()
+        swept = None
+        if isinstance(server, MultiServer):
+            sweep_dir = WORK + "-sweep"
+            if self.sweep:                    # (the last sweep's kept passes, given back)
+                for kept in self.sweep["frames"].values():
+                    if kept:
+                        shutil.rmtree(kept, ignore_errors=True)
+            self.sweep = None
+            shutil.rmtree(sweep_dir, ignore_errors=True)
+            outs = [os.path.join(sweep_dir, f"m{n}", "fold.pdb") for n in range(1, 6)]
+            for path in outs:
+                os.makedirs(os.path.dirname(path))
+            lane_flags = [[f"--out={path}", *fold[1:]] for path in outs]     # (fold[0] is this job's --out)
+            swept = server.fold_all(inputs, lane_flags, live=af2_model - 1,
+                                    on_file=on_file if on_file is not None else None)
+            said, _, error = swept[af2_model - 1]
+            if error is not None:
+                raise error
+            out_pdb = outs[af2_model - 1]
+        else:
+            said = server.fold(inputs, fold, on_file)
+        done = time.time()
+        log.append(said)
+        # the model's load, once (it ran beside the featuriser), any wait for it, and the fold with its stages
+        # (the model loads BESIDE the steps above, so what the fold paid is the wait; the load itself is shown under
+        # it, outside the total)
+        if not server.reported:
+            server.reported = True
+            if server.ready > submitted:
+                dev("waiting for the model to load", (server.ready - submitted) * 1000, begin=submitted)
+            dev("the model loading onto the GPU, beside the steps above", (server.ready - server.started) * 1000, sub=True,
+                begin=server.started)
+            weights_line = re.search(r"^weights(?: up)?:? ([\d.]+) ms", open(server.log.name).read(), re.M)
+            if weights_line:
+                dev("of which its weights", float(weights_line.group(1)), sub=True, begin=server.started)
+        fold_began = max(submitted, server.ready)
+        fold_ms = (done - fold_began) * 1000
+        dev("folding", fold_ms, begin=fold_began)
+        offset = fold_began
+        for name, ms in fold_breakdown(said, fold_ms):        # (in the order the binary ran them)
+            dev(name, ms, sub=True, begin=offset)
+            offset += ms / 1000
+        collect_started = time.time()
+        self.evict(key)
+        if port == "bioemu2":
+            if not any(line.startswith("-> ") for line in said.splitlines()):
+                raise RuntimeError("the fold wrote no structure")
+        elif not any("pLDDT" in line for line in said.splitlines()):
+            raise RuntimeError("the fold printed no confidence line")
+        emit("progress", 1.0)
+        result = self.collect(out_pdb, family, port, job, time.time() - started)
+        dev("reading the result (structure, PAE, contacts)", (time.time() - collect_started) * 1000, begin=collect_started)
+        result["a3m"] = a3m
+        if mode == "search" and os.path.exists(os.path.join(inputs, "search.a3m")):
+            result["a3m"] = open(os.path.join(inputs, "search.a3m")).read()
+        result["templates"] = [{"text": open(t["file"]).read(), "chainId": t["chainId"], "source": t["source"],
+                                "chain": t["chain"]} for t in named]
+        export_said = "\n".join(log)
+        for found in re.findall(r"template[^\n]*?(\d+)/(\d+) residues", export_said):
+            result["status"] += f" · template {found[0]}/{found[1]}"
+        converged = re.search(r"converged at ([0-9.]+) A after (\d+) passes", said)
+        if converged:
+            # ...worded as the WebGPU fold words it
+            result["status"] += f" · converged at {converged.group(1)} Å after {converged.group(2)} passes"
+        if swept is not None:
+            kept = {"key": sweep_key(job), "results": {}, "frames": {}}
+            for n, (lane_said, frames, error) in enumerate(swept, start=1):
+                if n == af2_model or error is not None:
+                    continue
+                other = self.collect(outs[n - 1], family, port, job, time.time() - started)
+                other["a3m"], other["templates"] = result["a3m"], []
+                lane_converged = re.search(r"converged at ([0-9.]+) A after (\d+) passes", lane_said)
+                if lane_converged:
+                    other["status"] += f" · converged at {lane_converged.group(1)} Å after {lane_converged.group(2)} passes"
+                other["status"] += " · folded beside model " + str(af2_model) + " (All 5)"
+                kept["results"][n], kept["frames"][n] = other, frames
+            result["status"] += " · all 5 models folded at once"
+            self.sweep = kept
+        return result
+
+    def stream(self, name, path, family, port, total):
+        """One streamed result of a fold, as it lands (or replayed from the sweep): its events to the page."""
+        tag = re.search(r"(\d+)-of-(\d+)", name)
+        if name.startswith("pass-") and name.endswith(".pdb"):
+            index, passes = int(tag.group(1)), int(tag.group(2))
+            emit("frame", open(path).read())
+            emit_scores(json.load(open(path[:-4] + ".json")), os.path.join(os.path.dirname(path), f"pae-{tag.group(0)}.u8"), passes)
+            emit("progress", 0.15 + 0.85 * (index + 1) / passes)
+            emit("status", f"{family} on {NATIVE_NAME} ({self.device}) · pass {index + 1}/{passes}")
+        elif name.startswith("contacts-"):
+            index, passes = int(tag.group(1)), int(tag.group(2))
+            emit_contacts(path, index, passes)
+            if port != "af2":
+                emit("progress", 0.15 + 0.15 * (index + 1) / passes)
+                emit("status", f"{family} on {NATIVE_NAME} ({self.device}) · trunk pass {index + 1}/{passes}")
+        elif name.startswith("frame-"):
+            # frame-SSSS.pdb (af3, its step count the job's) or frame-SSSS-NNNN.pdb (ef2)
+            step = int(name[6:10])
+            steps = int(name[11:15]) if name[10] == "-" else total
+            # 🔴 THE JOB'S STEP COUNT IS A LOWER BOUND, NOT THE COUNT: a model's schedule tail can add a step
+            # (IntelliFold-2's scheduleTail 3, AF3's levels then a 0 - cuda/af3/src/sampler.cuh), so its 26th
+            # frame of 25 steps read 1.028 and the bar went backwards to the result's 1.0
+            steps = max(steps, step) if steps else steps
+            emit("frame", open(path).read())     # (superposed onto the first by the binary's writer)
+            if steps:
+                emit("progress", 0.3 + 0.7 * step / steps)
+                emit("status", f"{family} on {NATIVE_NAME} ({self.device}) · diffusion {step}/{steps}")
+
+    def replay(self, job, family, port, model):
+        """A sweep's model answered from what was folded beside the first: its passes streamed as they were, its result."""
+        at = time.time()
+        emit("progress", 0.15)
+        frames = self.sweep["frames"].get(model)
+        if frames and streaming(job) and os.path.isdir(frames):
+            for name in sorted(os.listdir(frames)):
+                if not name.endswith(".tmp"):
+                    self.stream(name, os.path.join(frames, name), family, port, 0)
+        emit("progress", 1.0)
+        dev("folded beside the sweep's first model (All 5): answered from it", (time.time() - at) * 1000, begin=at)
+        result = json.loads(json.dumps({k: v for k, v in self.sweep["results"][model].items() if k != "_raw"}))
+        result["_raw"] = self.sweep["results"][model].get("_raw")
+        return result
+
+    def bioemu2(self, job, controls, flags, job_path, residues, seed, recycles, log, live):
+        """BioEmu2's featuriser (cuda/cpp/featurise/bioemu2-featurise, byte for byte tools/native-ref/bioemu2/export_input.mjs and so
+        the page's shared/bioemu2/featurise.js) and its server, the page's controls passed through: its mode, its sample
+        count, its contacts, its propagation (the starting frame the page sends with the job, `bioemu2Frame`) and its
+        sampler (edm, or the steered edm_gd / edm_fk)."""
+        family = "bioemu2"
+        at = time.time()
+        weights = model_weights("bioemu2", log)
+        dev("the weights on disk (fetched if missing)", (time.time() - at) * 1000, begin=at)
+        key = ("bioemu2", family)
+        server = self.server_for(key, [binary("bioemu2"), "-", f"--weights={weights[0]}", "--fast"], residues)
+        choice = controls.get("bioemu2-mode") or "structure"
+        export = [featuriser("bioemu2-featurise"), os.path.join(WORK, "in"), f"--job={job_path}",
+                  f"--mode={'equilibrium' if choice == 'propagate' else choice}", *max_msa_override(controls)]
+        # the sampler (the page's bioemu2-sampler): edm, or the steered edm_gd / edm_fk / edm_fkc, which read the steering tables
+        # the featuriser writes when asked, and the potentials the page hands over as text (bioemu2Potentials)
+        sampler = controls.get("bioemu2-sampler") or "edm"
+        if sampler not in ("edm", "edm_gd", "edm_fk", "edm_fkc"):
+            raise Refused(f"BioEmu2 sampler {sampler}: edm, edm_gd, edm_fk or edm_fkc")
+        if sampler != "edm" and choice == "propagate":
+            raise Refused("BioEmu2 propagation runs unsteered here; use the edm sampler to propagate")
+        if sampler != "edm":
+            export.append("--steering")
+        # the page's Contact rows, as BioEmu2's Contact list (web/bioemu2-model.js bioemu2ContactsFromRows) - the job's
+        # `bioemu2Contacts`; `bioemu2-contacts` is the JSON box a page before the rows sent
+        contacts = json.dumps(job["bioemu2Contacts"]) if job.get("bioemu2Contacts") else \
+            (controls.get("bioemu2-contacts") or "").strip()
+        if contacts:
+            path = os.path.join(WORK, "contacts.json")
+            with open(path, "w") as handle:
+                handle.write(contacts)
+            export.append(f"--contacts={path}")
+        if choice == "propagate":
+            frame = job.get("bioemu2Frame")
+            if not frame:
+                raise Refused("propagation starts from a structure of this same input - fold it with BioEmu2 first, or"
+                              " upload a PDB of it")
+            path = os.path.join(WORK, "frame.pdb")
+            with open(path, "w") as handle:
+                handle.write(frame)
+            lag = controls.get("bioemu2-lag") or 1
+            if not float(lag) > 0:
+                raise Refused("the propagation lag must be a positive number of nanoseconds")
+            export += [f"--propagate-from={path}", f"--lag-ns={lag}",
+                       f"--propagation-steps={max(1, int(controls.get('bioemu2-propagation-steps') or 1))}"]
+        # the alignment: the page's paste or upload as it hands them over; a search through the native MMseqs2 client,
+        # each protein chain's unpaired and paired rows kept apart (msa-search), as BioEmu2's Boltz-1 MSA reads them
+        if "--search" in flags:
+            proteins = protein_sequences(job["job"])
+            if not proteins:
+                raise Refused("an MSA search needs a protein chain")
+            searched = os.path.join(WORK, "bioemu2-search.json")
+            featurise([featuriser("msa-search"), searched, "--sequence=" + ":".join(proteins)], "searching", log, live)
+            found = {}
+            for entry in json.load(open(searched))["sequences"]:
+                body = entry["protein"]
+                found[body["sequence"].upper()] = (body.get("unpairedMsa") or "", body.get("pairedMsa") or "")
+            paths = {"unpaired": [], "paired": []}
+            for index, sequence in enumerate(proteins):
+                for side, text in zip(("unpaired", "paired"), found[sequence]):
+                    path = os.path.join(WORK, f"bioemu2-{side}-{index}.a3m")
+                    with open(path, "w") as handle:
+                        handle.write(text)
+                    paths[side].append(path)
+            export.append("--a3m=" + ",".join(paths["unpaired"]))
+            if len(set(proteins)) > 1:
+                export.append("--paired-a3m=" + ",".join(paths["paired"]))
+        else:
+            export += flags
+        at = time.time()
+        featurise([*export, *local_ccd()], "featurising", log, live)
+        dev("featurising" + (" and the MMseqs2 search" if "--search" in flags else ""), (time.time() - at) * 1000, begin=at)
+        steps = int((job.get("schedule") or {}).get("steps") or controls.get("af3-count") or BIOEMU2_DEFAULT_STEPS)
+        fold = [f"--out={os.path.join(WORK, 'fold.pdb')}", f"--steps={steps}", f"--seed={seed}",
+                f"--samples={max(1, int(controls.get('bioemu2-samples') or 1))}", f"--sampler={sampler}"]
+        potentials = (job.get("bioemu2Potentials") or "").strip()
+        if sampler != "edm" and potentials:
+            path = os.path.join(WORK, "potentials.yaml")
+            with open(path, "w") as handle:
+                handle.write(potentials + "\n")
+            fold.append(f"--potentials={path}")
+        if recycles not in (None, ""):
+            fold.append(f"--passes={int(recycles) + 1}")
+        return server, fold, steps
+
+    def collect(self, pdb_path, family, port, job, seconds):
+        stem = pdb_path[:-4]
+        pdb = open(pdb_path).read()
+        text = open(f"{stem}_confidences.json").read()
+        text, pae = flat_matrix(text, "pae")
+        text, contacts = flat_matrix(text, "contact_probs")
+        confidences = json.loads(text)
+        summary = json.load(open(f"{stem}_summary_confidences.json"))
+        chain_ids = confidences["token_chain_ids"]
+        res_ids = confidences["token_res_ids"]
+        plddt = confidences.get("token_plddts") or ([0] if port == "bioemu2" else token_plddt(pdb_atoms(pdb), chain_ids, res_ids))
+
+        raw = {}
+
+        def flat(text, name):                      # (a placeholder the emitter replaces with the matrix's text)
+            if text is None:
+                return None
+            raw["\u0000" + name] = text
+            return "\u0000" + name
+        confidence = {
+            "plddt": [round(float(v), 2) for v in plddt],
+            "meanPlddt": round(sum(plddt) / max(1, len(plddt)), 2),
+            "ptm": summary.get("ptm"),
+            "predictedAlignedError": flat(pae, "pae"),
+            "contactProbs": flat(contacts, "contacts"),
+        }
+        if summary.get("iptm") is not None:
+            confidence["iptm"] = summary["iptm"]
+        confidence.update(chain_scores(summary))
+        mean = confidence["meanPlddt"]
+        if port == "bioemu2":
+            # 🔴 NO CONFIDENCE HEAD: the B-factors are zero, and the page says so rather than show a pLDDT of 0. Every
+            # sample's structure goes back: the page lays them on the play bar and takes BioEmu2's physicality report
+            # of each (shared/bioemu2/physicality.js), as it does for a WebGPU fold
+            confidence.update(plddt=None, meanPlddt=None, ptm=None)
+            samples = [pdb]
+            k = 1
+            while os.path.exists(f"{stem}_sample-{k}.pdb"):
+                samples.append(open(f"{stem}_sample-{k}.pdb").read())
+                k += 1
+            return {
+                "native": NATIVE, "model": f"{NATIVE} {port}", "family": family, "pdb": pdb, "samples": samples,
+                "confidence": confidence, "tokens": {"chainIds": chain_ids, "resIds": res_ids},
+                "chains": polymer_chains(job["job"]), "msas": {}, "atoms": len(pdb_atoms(pdb)),
+                "status": f"{family} on {NATIVE_NAME} ({self.device}) · done in {seconds:.1f} s · {len(samples)} sample"
+                          f"{'' if len(samples) == 1 else 's'} · no confidence head",
+                "_raw": raw,
+            }
+        return {
+            "native": NATIVE, "model": f"{NATIVE} {port}", "family": family,
+            "pdb": pdb, "confidence": confidence,
+            "tokens": {"chainIds": chain_ids, "resIds": res_ids},
+            "chains": polymer_chains(job["job"]), "msas": {},
+            "atoms": len(pdb_atoms(pdb)),
+            "status": f"{family} on {NATIVE_NAME} ({self.device}) · done in {seconds:.1f} s · pLDDT {mean:.1f}",
+            "_raw": raw,
+        }
+
+
+def chain_scores(summary):
+    """The native summary's chain-level scores (AlphaFold 3's chain_ptm, chain_iptm, chain_pair_iptm: lists in chain
+    order, cuda/cpp/featurise/ptm.h) as the page's fold result keys them - by chain, 1 the first, and "a|b" (a < b) for a
+    pair - which is what web/fold-archive.js writes the archive's summary from. They were dropped here, so a native
+    fold's archive had none for any model. A null score (a chain with no anchor: an ion) is absent, as the page's own."""
+    out = {}
+    for key, name in (("chain_ptm", "chainPtm"), ("chain_iptm", "chainIptm")):
+        values = summary.get(key)
+        if values is not None:
+            out[name] = {str(a + 1): v for a, v in enumerate(values) if v is not None}
+    pairs = summary.get("chain_pair_iptm")
+    if pairs is not None:
+        out["chainPairIptm"] = {f"{a + 1}|{b + 1}": pairs[a][b] for a in range(len(pairs))
+                                for b in range(a + 1, len(pairs)) if pairs[a][b] is not None}
+    return out
+
+
+def main():
+    clear_stale_work()
+    import atexit                                  # (this worker's own directories, as it leaves)
+    atexit.register(lambda: [shutil.rmtree(p, ignore_errors=True) for p in (WORK, WORK + "-serve")])
+    emit("ready", {"at": int(time.time() * 1000), "native": NATIVE})
+    worker = Worker()
+    for line in sys.stdin:
+        if not line.strip():
+            continue
+        try:
+            result = worker.fold(json.loads(line))
+            emit("result", result, result.pop("_raw", None))
+        except Exception as cause:                                # noqa: BLE001
+            traceback.print_exc(file=sys.stderr)
+            said = str(cause) if isinstance(cause, Refused) else f"{type(cause).__name__}: {cause}"
+            emit("result", {"error": said})
+
+
+if __name__ == "__main__":
+    main()
