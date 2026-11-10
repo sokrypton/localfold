@@ -60,6 +60,7 @@
 #include "of3loss.h"
 #include "of3perm.h"
 #include "of3train.cuh"
+#include "boltz2source.cuh"
 
 namespace g = grad;
 
@@ -112,6 +113,14 @@ static g::real* dzeros(size_t n) { g::real* p; GK(cudaMalloc(&p, std::max<size_t
 
 // --mem: after each phase of a step, the arena's high-water mark over the phase, what it holds, and the device's use
 static bool MEM_REPORT = false;
+// the tcgen05 grid backward on or off (flash_tc5.cuh's TCB; a float64 build includes no flash kernel)
+static void setTcBwd(bool on) {
+#ifndef GRAD_F64
+  grad::flash::TCB = on;
+#else
+  (void)on;
+#endif
+}
 static bool profileStep = false;   // --profile
 static void memPhase(const char* what) {
   if (!MEM_REPORT) return;
@@ -133,8 +142,10 @@ struct Example {
   std::vector<int> aatype, ri, ti, asym, ent, sym, isDna, isRna, isLigand, isMod, refElement, names, uid, pbSlot;
   std::vector<float> profile, delMean, seqMask, refPos, refMask, refCharge, predMask, bonds, orders;
   std::vector<int> msaCode; std::vector<float> msaDel, msaMask;      // the MSA pool [P][n]
-  struct Slot { double repeat = 0; std::vector<int> aatype, bin; std::vector<float> pb, uv, bb; bool geo = false; };
-  std::vector<Slot> slots; int templates = 0;
+  // a slot: the nine-projection embedder's geometry, or (fused: boltz2, protenix2, rf3) its sparse feature rows - K
+  // (column, value) pairs a token pair, as the featuriser writes them
+  struct Slot { double repeat = 0; std::vector<int> aatype, bin, fidx; std::vector<float> pb, uv, bb, fval; bool geo = false; int K = 0; };
+  std::vector<Slot> slots; int templates = 0, featureWidth = 0;
   std::vector<double> xt, gm;                  // the truth [atoms * 3] and its resolved mask [atoms]
   std::string permsPath, confsPath, set = "pdb";
   // OpenFold3's fresh conformers (make_of3_example.py's conformers.txt: RDKit ETKDGv3 runs, random seeds, per component):
@@ -230,7 +241,11 @@ static Example loadExample(const std::string& line, bool padded, bool qblock) {
       auto& s = e.slots[k];
       s.repeat = M.meta(S_ + "repeat");
       s.aatype = copyOf(M.i(S_ + "aatype"), n);
-      if (M.has(S_ + "distogramBin")) {
+      if (M.has(S_ + "featuresIdx")) {          // (fused: a slot that weighs is a template, the rest padding)
+        s.K = (int)M.meta(S_ + "featuresK"); s.geo = s.repeat > 0;
+        s.fidx = copyOf(M.i(S_ + "featuresIdx"), nn * s.K); s.fval = copyOf(M.f(S_ + "featuresVal"), nn * s.K);
+        e.featureWidth = (int)M.meta("template.featureWidth");
+      } else if (M.has(S_ + "distogramBin")) {
         s.geo = true;
         s.bin = copyOf(M.i(S_ + "distogramBin"), nn); s.pb = copyOf(M.f(S_ + "pseudoBetaMask2d"), nn);
         s.uv = copyOf(M.f(S_ + "unitVector"), nn * 3); s.bb = copyOf(M.f(S_ + "backboneMask2d"), nn);
@@ -339,7 +354,8 @@ static Example subset(const Example& e, const std::vector<int>& keep, bool whole
   o.dense = e.dense; o.profW = e.profW; o.P = e.P; o.templates = e.templates; o.permsPath = e.permsPath; o.set = e.set;
   o.confsPath = e.confsPath; o.componentOf = e.componentOf; o.conformers = e.conformers;
   o.slots.resize(e.slots.size());
-  for (size_t k = 0; k < e.slots.size(); ++k) { o.slots[k].repeat = e.slots[k].repeat; o.slots[k].geo = e.slots[k].geo; }
+  for (size_t k = 0; k < e.slots.size(); ++k) { o.slots[k].repeat = e.slots[k].repeat; o.slots[k].geo = e.slots[k].geo; o.slots[k].K = e.slots[k].K; }
+  o.featureWidth = e.featureWidth;
   const int m = (int)keep.size(), D = e.dense;
   o.n = m;
   auto tok = [&](const auto& v, size_t w) { std::remove_cv_t<std::remove_reference_t<decltype(v)>> r((size_t)m * w);
@@ -365,7 +381,8 @@ static Example subset(const Example& e, const std::vector<int>& keep, bool whole
   for (size_t k = 0; k < e.slots.size(); ++k) {
     auto& s = o.slots[k]; const auto& f = e.slots[k];
     s.aatype = tok(f.aatype, 1);
-    if (f.geo) { s.bin = pair(f.bin, 1); s.pb = pair(f.pb, 1); s.uv = pair(f.uv, 3); s.bb = pair(f.bb, 1); }
+    if (f.K) { s.fidx = pair(f.fidx, f.K); s.fval = pair(f.fval, f.K); }
+    else if (f.geo) { s.bin = pair(f.bin, 1); s.pb = pair(f.pb, 1); s.uv = pair(f.uv, 3); s.bb = pair(f.bb, 1); }
   }
   return o;
 }
@@ -376,6 +393,18 @@ static Example subset(const Example& e, const std::vector<int>& keep, bool whole
 // as the features are), the rest padding (the gap restype, no geometry); all-padding slots folded into one pass.
 static void sampleTemplates(Example& e, std::mt19937_64& rng) {
   const int n = e.n; const size_t nn = (size_t)n * n;
+  if (e.featureWidth) {
+    // fused features (boltz2): a pair's columns carry both residues' restypes and masks together, so a slot cannot be
+    // re-assembled a chain at a time from the rows alone - k = U{0..l} of the l real slots kept whole, the rest
+    // weighed zero (the padding these families give an empty slot) and out of the divisor
+    std::vector<int> real; for (size_t k = 0; k < e.slots.size(); ++k) if (e.slots[k].geo) real.push_back((int)k);
+    if (real.empty()) return;
+    std::shuffle(real.begin(), real.end(), rng);
+    const int keep = std::uniform_int_distribution<int>(0, (int)real.size())(rng);
+    for (int j = keep; j < (int)real.size(); ++j) e.slots[real[j]].repeat = 0;
+    e.templates = keep;
+    return;
+  }
   std::vector<int> concrete;                 // each of the e.templates slots -> its pass
   for (size_t k = 0; k < e.slots.size(); ++k) for (int r = 0; r < (int)std::lround(e.slots[k].repeat); ++r) concrete.push_back((int)k);
   const int total = (int)concrete.size();
@@ -620,6 +649,7 @@ struct Dev {
   int n = 0, dense = 0, S = 0;
   g::af3::AtomBatch b;
   int *ri, *ti, *asym, *ent, *sym, *aatype, *msaRows;
+  g::af3::TokenFlags flags{};                                   // (boltz2's target_feat sum reads them)
   g::real *profile, *delMean, *seqMask, *pairMask, *pairMaskT, *bonds = nullptr, *orders = nullptr, *deletion, *msaMask;
   std::vector<g::af3::TemplateSlot> slots; int templates = 0;
   std::vector<void*> owned;
@@ -647,6 +677,7 @@ static void upload(Dev& d, const Example& e, bool padded, bool qblock, int S) {
   b.refPos = d.upR(e.refPos); b.refMask = d.upR(e.refMask); b.refCharge = d.upR(e.refCharge); b.atomMask = d.upR(e.predMask);
   b.uid = d.upR(std::vector<double>(e.uid.begin(), e.uid.end()));
   b.refElement = d.up(e.refElement); b.nameChars = d.up(e.names);
+  d.flags = g::af3::TokenFlags{d.up(e.isDna), d.up(e.isRna), d.up(e.isLigand), d.up(e.isMod)};
   d.ri = d.up(e.ri); d.ti = d.up(e.ti); d.asym = d.up(e.asym); d.ent = d.up(e.ent); d.sym = d.up(e.sym); d.aatype = d.up(e.aatype);
   d.profile = d.upR(e.profile); d.delMean = d.upR(e.delMean); d.seqMask = d.upR(e.seqMask);
   std::vector<double> pm(nn), pt(nn);
@@ -660,7 +691,13 @@ static void upload(Dev& d, const Example& e, bool padded, bool qblock, int S) {
   for (size_t k = 0; k < e.slots.size(); ++k) {
     auto& s = d.slots[k]; const auto& f = e.slots[k];
     s.repeat = (g::real)f.repeat; s.aatype = d.up(f.aatype);
-    if (f.geo) { s.bin = d.up(f.bin); s.pb = d.upR(f.pb); s.uv = d.upR(f.uv); s.bb = d.upR(f.bb); }
+    if (f.K) {
+      const int W = e.featureWidth;
+      std::vector<g::real> dense(nn * W, 0);
+      for (size_t r = 0; r < nn; ++r) for (int q = 0; q < f.K; ++q)
+        if (f.fidx[r * f.K + q] >= 0) dense[r * W + f.fidx[r * f.K + q]] = f.fval[r * f.K + q];
+      s.dense = d.up(dense);
+    } else if (f.geo) { s.bin = d.up(f.bin); s.pb = d.upR(f.pb); s.uv = d.upR(f.uv); s.bb = d.upR(f.bb); }
   }
 }
 // a cycle's MSA rows (MSAModuleEmbedder._subsample_all_msa): the valid rows (any unmasked cell) in a random order,
@@ -692,7 +729,7 @@ static of3::Layout layoutOf(const Example& e, bool bonds = true) {
 }
 
 int main(int argc, char** argv) {
-  std::string bundle = "model-openbind0-f32", family = "openbind0", examplesPath, savePath, resumePath;
+  std::string bundle = "model-openbind0-f32", family = "openbind0", examplesPath, savePath, resumePath, sourceDir;
   int diffSaves = 0;     // --diffusion-saves=auto|keep|recompute (0, 1, 2): the diffusion transformer's block saves kept for its backward
   // --sample-batch=auto's measurements carried from step to step, at `atoms` atoms (0: none yet): a diffusion chunk's
   // arena bytes as shared + per a sample, and the transformer's saves a sample on top where kept; what replaying the
@@ -744,7 +781,7 @@ int main(int argc, char** argv) {
     else if (!strcmp(argv[i], "--bf16-confidence")) bf16Confidence = true;
     else if (!strcmp(argv[i], "--mem")) MEM_REPORT = true;
     else if (!strcmp(argv[i], "--profile")) profileStep = true;   // the last step's kernels by GPU time (CUPTI, cuda/af3's profile.cuh)
-    else if (!strcmp(argv[i], "--no-tc-bwd")) grad::flash::TCB = false;   // bwdBf where bwdTc (the grid backward on tcgen05) would run
+    else if (!strcmp(argv[i], "--no-tc-bwd")) setTcBwd(false);   // bwdBf where bwdTc (the grid backward on tcgen05) would run
     else if (!strcmp(argv[i], "--offload-pairs")) offloadPairs = true;
     else if (auto v = opt("--transition-chunk=")) transitionChunkM = atof(v);
     else if (auto v = opt("--world=")) world = atoi(v);
@@ -759,6 +796,7 @@ int main(int argc, char** argv) {
     else if (auto v = opt("--check-tc-bwd=")) checkTcBwd = atoi(v);
     else if (auto v = opt("--check-conformers=")) checkConfs = atoi(v);
     else if (auto v = opt("--init=")) init = v;
+    else if (auto v = opt("--source=")) sourceDir = v;
     else if (auto v = opt("--val=")) valPath = v;
     else if (auto v = opt("--val-every=")) valEvery = atoi(v);
     else if (auto v = opt("--val-samples=")) valSamples = atoi(v);
@@ -794,14 +832,15 @@ int main(int argc, char** argv) {
     if (dp == "nccl") comm.reset(new g::NcclComm(rank, world, rendezvous));
     else comm.reset(new g::FileComm(rank, world, rendezvous));
   }
+  std::vector<std::string> walkLines;        // (the weight walk, kept for --source)
   M.loadBundle(bundle, "", [&](const std::map<std::string, std::vector<long long>>& shapes) {
-    lf::weights::Shapes S; S.shape = shapes; return lf::weights::af3WeightLines(family, S); });
+    lf::weights::Shapes S; S.shape = shapes; walkLines = lf::weights::af3WeightLines(family, S); return walkLines; });
   const lf::FamilyFlags& FF = lf::familyFor(family);
   memPhase("bundle loaded");
   const bool padded = FF.paddedAtomKeys, qblock = FF.qblockAtomKeys;
   std::vector<Example> examples;
   examples.push_back(loadExample(lines[0], padded, qblock));        // (the first in M while the modules read its metas)
-  for (const char* f : {"trunk.dialect.chaiTokenEmbedding", "trunk.dialect.targetFeatAtomOnly", "trunk.dialect.structuralTokens",
+  for (const char* f : {"trunk.dialect.chaiTokenEmbedding", "trunk.dialect.structuralTokens",
                         "trunk.dialect.chaiAtomStack", "trunk.dialect.recycleFromInit"})
     if (M.flag(f)) { fprintf(stderr, "train-of3: %s is not composed here yet\n", f); return 1; }
   setAdaMode(false);
@@ -838,6 +877,11 @@ int main(int argc, char** argv) {
     g::af3::forEachParam(e, E, "targetFeat.reference", nb, M.flag(E + ".pairNormPerBlock"), M.has(E + ".blocks.0.ffwAToB"),
                          M.has(E + ".blocks.0.queryLayerNormScale"), !M.has(E + ".blocks.0.Transition2"), has, load);
     stackFlags(e.stack, E + ".blocks.0");
+    tfm.atomOnly = M.flag("trunk.dialect.targetFeatAtomOnly");       // (boltz2: the encoder's columns plus six token terms)
+    if (tfm.atomOnly) {
+      const std::string S = E + ".targetFeatSum.";
+      g::af3::forEachParam(tfm.sum, e.perToken, (int)(M.at(S + "method").length / e.perToken), has(S + "dnResType"), load);
+    }
   }
   // ---- the trunk embedder and the distogram head
   const std::string TE = "trunk.embedder.";
@@ -866,7 +910,6 @@ int main(int argc, char** argv) {
     const int tf_ = (int)(M.at(B0 + ".pairTransition.transition1").length / (2 * (size_t)Ct * Ct));
     g::af3::forEachParam(tm, Cq, Ct, width, tb, nb, Hp, Dp, tf_, M.has(B0 + ".pairAttention1.gatingQueryBias"),
                          M.flag("trunk.dialect.parallelPairformer"), has, load);
-    if (tm.fused) { fprintf(stderr, "train-of3: the fused template features are not composed here yet\n"); return 1; }
   }
   // ---- the MSA stack and the pairformer
   const g::af3::Dialect dl{M.flag("trunk.dialect.swapTransposedBias"), M.flag("trunk.dialect.triangleMulDivideByLength")};
@@ -1064,6 +1107,7 @@ int main(int argc, char** argv) {
     if (a.off) offload.join(STREAM);    // (the last pass's copies out of the ring done before it is written again)
     auto eb = embedBatch(d);
     g::Range rEmb_("tr.embed");
+    tfm.flags = d.flags;
     tfS = g::af3::targetFeatForward(tfm, d.b, d.aatype, d.profile, d.delMean, a.tf);
     emS = g::af3::trunkEmbedForward(te, eb, a.tf, a.prevPair, a.prevSingle, a.zEmb, a.singles[0], a.msas[0]);
     GK(cudaMemcpyAsync(a.pairs[0], a.zEmb, nn * Cz * sizeof(g::real), cudaMemcpyDeviceToDevice, STREAM));
@@ -1329,11 +1373,24 @@ int main(int argc, char** argv) {
     }
     printf("OpenFold3's initialisation:"); for (auto& [k, c] : kinds) printf(" %s %d", k.c_str(), c); printf("\n");
   }
-  g::Of3Optimizer opt; opt.maxLr = lrMax; opt.warmup = warmup; opt.init(ps);
+  // --source: the optimiser steps the model's own parameters (boltz2source.cuh: Boltz-2's tensors, by their names),
+  // the training graph's are rebuilt from them after every step and their gradients carried back
+  g::Boltz2Source bm; const bool fromSource = !sourceDir.empty();
+  if (fromSource) {
+    if (init == "of3") { fprintf(stderr, "--init=of3 is OpenFold3's initialisation of the port's tensors, not of --source's\n"); return 1; }
+    bm.init(ps, walkLines, sourceDir);
+  }
+  g::Params& optPs = fromSource ? bm.ps : ps;
+  std::vector<char> confSource(optPs.all.size(), 0);
+  for (size_t i = 0; i < optPs.all.size(); ++i) confSource[i] = !optPs.all[i]->name.compare(0, 18, "confidence_module.");
+  g::Of3Optimizer opt; opt.maxLr = lrMax; opt.warmup = warmup; opt.init(optPs);
   memPhase("optimizer");
-  // the Fourier noise embedding is a buffer in OpenFold3: held, never trained
-  for (size_t i = 0; i < ps.all.size(); ++i) if (ps.all[i]->name.find("fourier") != std::string::npos) opt.frozen[i] = 1;
-  if (!resumePath.empty()) { opt.load(ps, resumePath); printf("resumed %s at step %ld\n", resumePath.c_str(), opt.step); }
+  // the Fourier noise embeddings are held, never trained (a buffer in OpenFold3; requires_grad off in Boltz-2)
+  for (size_t i = 0; i < optPs.all.size(); ++i) if (optPs.all[i]->name.find("fourier") != std::string::npos) opt.frozen[i] = 1;
+  if (!resumePath.empty()) {
+    opt.load(optPs, resumePath); if (fromSource) bm.gather();
+    printf("resumed %s at step %ld\n", resumePath.c_str(), opt.step);
+  }
   std::mt19937_64 rng(seed + 7919 * (uint64_t)opt.step + 104729ull * (sameDraws ? 0 : rank));   // (each rank its own examples and draws)
   std::normal_distribution<double> N01(0, 1);
   const double sd = 16;
@@ -1859,8 +1916,11 @@ int main(int argc, char** argv) {
   // grid attention's backward on tcgen05 (bwdTc) and on bwdBf - every gradient compared, against two bwdBf runs' floor
   // (the backward's atomics). Cropped, because bwdTc wants Q, K multiples of 128 and a whole entry is rarely one
   if (checkTcBwd >= 0) {
+#ifdef GRAD_F64
+    fprintf(stderr, "--check-tc-bwd compares two flash kernels: a float build's\n"); return 1;
+#endif
     auto grads = [&](bool on) {
-      grad::flash::TCB = on; ps.zeroGrad();
+      setTcBwd(on); ps.zeroGrad();
       std::mt19937_64 gen(99);
       const auto r = runExample(examples.at(checkTcBwd), true, false, 4, gen);
       std::vector<double> all;
@@ -1885,7 +1945,7 @@ int main(int argc, char** argv) {
     const bool ok = std::isfinite(e) && e < std::max(4 * floor, 1e-5) && std::isfinite(ge) && ge < std::max(4 * gfl, 1e-5);
     printf("tcgen05 grid backward: every gradient against bwdBf's, relRMS %.3e (two bwdBf runs: %.3e); the grid attentions' "
            "%.3e (%.3e)  %s\n", e, floor, ge, gfl, ok ? "PASS" : "FAIL");
-    grad::flash::TCB = true;
+    setTcBwd(true);
     if (!ok) return 1;
   }
   // --check-chunk=k: example k (whole, fixed draws, dropout on) with the transitions in chunks of 1000 hidden elements
@@ -2039,7 +2099,7 @@ int main(int argc, char** argv) {
     loadExample(lines[0], padded, qblock);
   }
   auto validate = [&](long atStep) {
-    opt.swapEma(ps);
+    opt.swapEma(optPs); if (fromSource) bm.gather();
     setDropout(false, 0);
     double sumMean = 0, sumTop = 0;
     for (const Example& full : valExamples) {
@@ -2089,7 +2149,7 @@ int main(int argc, char** argv) {
       if (a.off) GK(cudaStreamSynchronize(offload.copy));
       a.release(); d.release();
     }
-    opt.swapEma(ps);
+    opt.swapEma(optPs); if (fromSource) bm.gather();
     printf("validation at step %ld (EMA weights): lDDT mean %.4f, top-ranked %.4f over %zu entries\n", atStep,
            sumMean / std::max<size_t>(1, valExamples.size()), sumTop / std::max<size_t>(1, valExamples.size()), valExamples.size());
   };
@@ -2125,19 +2185,20 @@ int main(int argc, char** argv) {
     ps.zeroGrad();
     const auto run = runExample(examples[std::min(pick, examples.size() - 1)], true, false, samples, rng);
     const Losses& L = run.first; const bool confOn = run.second;
-    const double norm = opt.clipAndAccumulate(ps, [&](size_t i) { return !confOn && i >= confFrom; });
+    if (fromSource) bm.scatter();
+    const double norm = opt.clipAndAccumulate(optPs, [&](size_t i) { return !confOn && (fromSource ? confSource[i] != 0 : i >= confFrom); });
     bool stepped = false;
-    if (++inBatch == batch) { opt.apply(ps, comm.get()); inBatch = 0; stepped = true; }
+    if (++inBatch == batch) { opt.apply(optPs, comm.get()); if (fromSource) bm.gather(); inBatch = 0; stepped = true; }
     cudaEventRecord(e1, STREAM); CK(cudaStreamSynchronize(STREAM));
     float ms; cudaEventElapsedTime(&ms, e0, e1);
     printf("step %4d  loss %.4f (diffusion %.4f, distogram %.4f, confidence %.3f%s)  |grad| %.3e%s  %.0f ms\n", step, L.total, L.diffusion,
            L.distogram, L.plddt + L.pde + L.pae + L.resolved, confOn ? "" : " off", norm,
            stepped ? (std::string("  lr ") + std::to_string(opt.lastLr).substr(0, 8)).c_str() : "", ms);
     if (profileStep && step == steps - 1) { CK(cudaDeviceSynchronize()); prof::stop(45); }
-    if (rank == 0 && !savePath.empty() && saveEvery > 0 && stepped && opt.step % saveEvery == 0) { opt.save(ps, savePath); printf("saved %s (step %ld)\n", savePath.c_str(), opt.step); }
+    if (rank == 0 && !savePath.empty() && saveEvery > 0 && stepped && opt.step % saveEvery == 0) { opt.save(optPs, savePath); printf("saved %s (step %ld)\n", savePath.c_str(), opt.step); }
     if (rank == 0 && !valExamples.empty() && valEvery > 0 && stepped && opt.step % valEvery == 0) validate(opt.step);
   }
-  if (rank == 0 && !savePath.empty()) { opt.save(ps, savePath); printf("saved %s (step %ld)\n", savePath.c_str(), opt.step); }
+  if (rank == 0 && !savePath.empty()) { opt.save(optPs, savePath); printf("saved %s (step %ld)\n", savePath.c_str(), opt.step); }
   if (rank == 0 && !valExamples.empty() && (valEvery == 0 || opt.step % valEvery != 0)) validate(opt.step);
   if (world > 1) {
     // the ranks' weights must be one set: a checksum of every weight, every rank's, compared through the same exchange

@@ -174,6 +174,28 @@ for fb in "model-af3-full-f32 af3" "model-boltz2-f32 boltz2" "model-protenix2-f3
     wait; grep -h "checksum" $rdv.r0 $rdv.r1; grep -q "OUT OF SYNC" $rdv.r0 $rdv.r1 && fail=1; grep -q "in sync" $rdv.r0 || fail=1
     rm -rf $rdv $rdv.r0 $rdv.r1
   fi
+  # the same training on AlphaFold 3's own parameters (the bundle is af3.bin's, nothing derived), and on Boltz-2's:
+  # its bundle is af3-any-model's converter's work, so the parameters stepped are Boltz-2's own behind it (--source,
+  # make_boltz2_map.py; the map needs the Boltz-2 checkpoint, a sokrypton/alphafold3 checkout and ~/.venv-lfjax)
+  if [ $2 = af3 ] || [ $2 = boltz2 ]; then
+    ex=cuda/grad/data/train-6mrr-$2
+    mkdir -p $ex
+    awk '/^ATOM/ && substr($0,22,1)=="A" && (substr($0,17,1)==" " || substr($0,17,1)=="A") {
+           n=substr($0,13,4); gsub(/ /,"",n); printf "1 %d %s %s %s %s\n", substr($0,23,4), n, substr($0,31,8), substr($0,39,8), substr($0,47,8) }' \
+      tools/fixtures/6mrr-crystal.pdb > $ex/truth.txt
+    echo "$in $ex/truth.txt resolution=1.18" > $ex/example.txt
+    src=""
+    if [ $2 = boltz2 ]; then
+      map=cuda/grad/data/boltz2-map
+      if [ ! -f $map/model.idx ] && [ -f $HOME/.boltz/boltz2_conf.ckpt ] && [ -d $HOME/beta/af3am-src/converters ] && [ -x $HOME/.venv-lfjax/bin/python ]; then
+        $HOME/.venv-lfjax/bin/python cuda/grad/make_boltz2_map.py --ckpt $HOME/.boltz/boltz2_conf.ckpt --af3am $HOME/beta/af3am-src \
+          --bundle $1 --out $map > /dev/null
+      fi
+      if [ -f $map/model.idx ]; then src=--source=$map
+      else echo "== boltz2 --source: no map (the checkpoint ~/.boltz/boltz2_conf.ckpt, ~/beta/af3am-src or ~/.venv-lfjax missing)"; fi
+    fi
+    run cuda/grad/train-of3 --bundle=$1 --family=$2 $src --examples=$ex/example.txt --steps=20 --samples=4 --lr=1e-4 --warmup=1 --smoke
+  fi
 done
 run cuda/grad/test-atom-f64
 run cuda/grad/test-af3 --bundle=model-mol1-f32 --family=mol1 --prefix=trunk.pairMixerBlocks.

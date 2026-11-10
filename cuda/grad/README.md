@@ -308,6 +308,47 @@ from there 6MRR's mse goes 33.3 -> 12.8 in 40 steps. The Fourier noise embedding
   rollout of 5 x 200 steps, each sample's truth permuted, all-atom lDDT (mean, best, the confidence head's top-ranked).
   The pretrained bundle reads 0.831 on 6MRR and 0.846 on 5K9P from their sequences alone.
 
+**The other AF3-lineage families through train-of3** (`--family=`): OpenFold3's recipe, so far, on another family's
+network. The composition check (the trunk against cuda/af3's runTrunk, pass 0 and three recycled passes) and the smoke
+gate (6MRR, 20 steps: the loss above its floor must halve):
+
+| family | trunk against the port (pair, single) | loss above its floor, 20 steps |
+|---|---|---|
+| openbind0 | (above) | (above) |
+| af3 (`model-af3-full-f32`) | 3.2e-7, 1.3e-7 | 0.360 -> 0.121 |
+| boltz2 (`model-boltz2-f32`, `--source`) | 4.0e-7, 6.7e-7 | 0.331 -> 0.092 |
+
+- **AlphaFold 3** - its bundle is af3.bin's own parameters (no tensor tied, nothing derived but the Fourier embedding's
+  constants and five zero tensors the input embedder's encoder never reads), so its tensors are the parameters as they
+  are. 🔴 Its pretrained confidence head does not fit the targets OpenFold3's losses give it: on 6MRR its PDE
+  expectation is 1.07 A against a measured 0.40 (OpenBind-0: 0.70 against 0.58), cross entropy 11.4 - it puts almost
+  nothing below 0.5 A. The bins are AF3's own (64 on [0, 32], `confidence_head.py`) and the head is held to the port,
+  so this is the head or the target definition, not the arithmetic: open. At 1e-4 a term it barely moves the rest.
+  AF3's weight terms allow modifying the parameters and forbid training on AlphaFold 3's OUTPUT, so a training set
+  must hold no AF3 prediction (make_of3_dataset.py's are deposited structures).
+- **Boltz-2** - composed here too: its target_feat (the encoder's columns plus six token tables, `targetFeatAtomOnly`)
+  and its fused template features (each slot's sparse feature rows, cropped with the rest; training's template draw
+  keeps k = U{0..l} of the real slots whole, the rest weighing zero - a fused row carries both residues' restypes
+  together, so OpenFold3's chain-at-a-time assembly does not apply. Boltz-2's own training draw is not public).
+  **`--source=<map>` steps Boltz-2's own parameters**, not the bundle's: the bundle is af3-any-model's converter's
+  work, which copies one tensor into several (the relative encoding into the diffusion conditioning's, the atom
+  transformers' one adaLN into a query and a key copy), negates and halves, permutes the MSA columns, writes zeros for
+  a feature Boltz-2 lacks and folds LayerNorm scales into projections (the weight walk folds the token transformer's
+  too). `make_boltz2_map.py` runs the converter on stand-in state dicts and recovers it element by element - 507.5 M
+  copies, 384 products, 352 constants, checked against two random runs exactly, and the converter on the real
+  checkpoint first held to every bundle tensor - and `boltz2source.cuh` composes that with the weight walk into 2D
+  runs: the 5,035 Boltz-2 tensors (33 tied pairs - `output_projection.0` is `output_projection_linear` - one each; the
+  buffer out) rebuilt into the port's tensors after every step, the port's gradients scattered back (a product's to
+  both factors), every source set at load either through the copies or from the map's carried values, and the port
+  rebuilt from them to the bit before training starts. Checkpoints are by Boltz-2's names. The Fourier embeddings Boltz-2
+  holds (`requires_grad` off: the noise embedding and both contact encodings) are frozen. Read only for their values:
+  the contact conditioning and the cyclic row (no constraint, no cyclic chain here), and the restype rows 0 (padding)
+  and 32 (DN) - 🔴 this bundle predates the converter's `boltz2_dn_*` tensors, so a DNA `N` folds with the wrong row.
+  Still OpenFold3's: the losses (Boltz-2's confidence is per token, `token_level_confidence`; its weights are diffusion
+  4, distogram 0.03, confidence 0.3, B-factor 0.001 - all in the checkpoint's `training_args`), the optimiser's weight
+  decay (AdamW 0.003, Boltz's exclusions), the B-factor head (not in the bundle; carried by the map, untrained), and
+  the crops - Boltz-2's training data pipeline is not public ("coming soon" in its docs).
+
 
 
 🔴 **THE DENOISER'S 4e-4 IS THE PORT'S ROUNDING, AND IT WAS SHOWN RATHER THAN ASSUMED.** boltz2 reads 4.1e-4 against
