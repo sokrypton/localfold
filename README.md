@@ -59,6 +59,37 @@ Nothing is installed, and there is nothing to set up: open the page and fold.
 Running it from a checkout, the two Chrome flags worth ~2x on Linux/NVIDIA, and
 using the kernels as a library are all in **[docs/RUNNING.md](docs/RUNNING.md)**.
 
+## On your own GPU, or on Colab
+
+The same page can fold through native programs instead of the browser: CUDA on an
+NVIDIA card, Metal on a Mac. That is faster, folds larger inputs than a browser's
+buffer limits allow, and runs every model. The native ports are their own
+repositories:
+
+- **[colabfold-cuda](https://github.com/sokrypton/colabfold-cuda)**, for NVIDIA.
+  It is checked out here as `cuda/`.
+- **[colabfold-metal](https://github.com/sokrypton/colabfold-metal)**, for Apple
+  silicon. It is checked out here as `metal/`.
+
+Each one also works by itself, from the command line: a job file or a sequence
+in, a structure out.
+
+**On Colab**, the badge above opens a notebook that builds the CUDA ports on
+Colab's GPU and serves this page from there. Every fold runs on that GPU.
+
+**On your own machine**, from a checkout:
+
+```
+git clone --recurse-submodules https://github.com/sokrypton/localfold
+cd localfold
+bash cuda/build.sh                    # NVIDIA (on a Mac: bash metal/build.sh featurise af3 af2 ef2)
+python3 python/localfold/server.py --native --local --open
+```
+
+This opens the page at `http://127.0.0.1:8710` with every fold running on this
+machine's GPU. Each model's weights download the first time it is used. On Linux
+they go into the checkout; on a Mac, into `~/.cache/localfold`.
+
 ## Acknowledgments and citation
 
 LocalFold began as a fork of **[AlphaFold2 WebGPU](https://github.com/martin-steinegger/alphafold2-webgpu)**
