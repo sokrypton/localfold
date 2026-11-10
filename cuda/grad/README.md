@@ -320,10 +320,13 @@ gate (6MRR, 20 steps: the loss above its floor must halve):
 
 - **AlphaFold 3** - its bundle is af3.bin's own parameters (no tensor tied, nothing derived but the Fourier embedding's
   constants and five zero tensors the input embedder's encoder never reads), so its tensors are the parameters as they
-  are. 🔴 Its pretrained confidence head does not fit the targets OpenFold3's losses give it: on 6MRR its PDE
-  expectation is 1.07 A against a measured 0.40 (OpenBind-0: 0.70 against 0.58), cross entropy 11.4 - it puts almost
-  nothing below 0.5 A. The bins are AF3's own (64 on [0, 32], `confidence_head.py`) and the head is held to the port,
-  so this is the head or the target definition, not the arithmetic: open. At 1e-4 a term it barely moves the rest.
+  are. 🔴 Its pretrained confidence head starts far from the targets (PDE cross entropy 11.4 on 6MRR, OpenBind-0's
+  0.92): it expects a mean PDE of 1.07 A where the rollout's is 0.40 (OpenBind-0: 0.70 against 0.58), and puts almost
+  nothing below 0.5 A. **That is AlphaFold 3's head, not these targets**: the bins are its own (64 on [0, 32],
+  `confidence_head.py`), and on its own inference output (localfold-af3, 6MRR, 200 steps) it predicts PAE 3.20 A
+  where the error is 1.85, never below 0.765 A even on the diagonal - and DeepMind's server floors at 0.80 too
+  (tools/fixtures/fold_2026_09_01_10_17.zip, diagonal 0.80). OpenFold3's head was trained to finer errors. At 1e-4 a
+  term the head barely moves the rest, and training it on these targets recalibrates it.
   AF3's weight terms allow modifying the parameters and forbid training on AlphaFold 3's OUTPUT, so a training set
   must hold no AF3 prediction (make_of3_dataset.py's are deposited structures).
 - **Boltz-2** - composed here too: its target_feat (the encoder's columns plus six token tables, `targetFeatAtomOnly`)
