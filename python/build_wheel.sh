@@ -23,11 +23,11 @@ done
 bin="$here/localfold/bin"
 rm -f "$bin"/localfold-*
 for port in af3 af2 ef2; do
-  install -m 755 "$repo/cuda/$port/localfold-$port" "$bin/localfold-$port"
+  install -m 755 "$repo/cuda/cf-$port" "$bin/localfold-$port"
   strip "$bin/localfold-$port"             # (host symbols only: the device code is the fatbinary's data)
 done
 # localfold-fetch: the featuriser binary under the name that runs its weight and CCD fetcher (no GPU, no cuBLAS)
-install -m 755 "$repo/cuda/featurise/featurise" "$bin/localfold-fetch"; strip "$bin/localfold-fetch"
+install -m 755 "$repo/cuda/cpp/featurise/featurise" "$bin/localfold-fetch"; strip "$bin/localfold-fetch"
 # what the wheel's tag promises: nothing newer than glibc 2.28, and cuBLAS found through the RPATH
 for f in "$bin"/localfold-*; do
   glibc="$(objdump -T "$f" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -V | tail -1)"

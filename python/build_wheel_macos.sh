@@ -18,14 +18,14 @@ export MACOSX_DEPLOYMENT_TARGET=13.0
 # a fresh build: the deployment target is a compile flag, so nothing built without it is kept - 🔴 the objects metal/build.sh
 # caches too (the featuriser's standalone.o, the zstd decoder), or an ordinary build's leave macOS-26 objects inside
 # binaries stamped 13.0 (ld says "built for newer 'macOS' version (26.0) than being linked (13.0)")
-rm -f "$repo"/metal/{af3,af2,ef2,bioemu2}/localfold-* "$repo/cuda/featurise/featurise" "$repo/cuda/featurise/standalone.o"
+rm -f "$repo"/metal/cf-af3 "$repo"/metal/cf-af2 "$repo"/metal/cf-ef2 "$repo"/metal/cf-bioemu2 \
+      "$repo/metal/cpp/featurise/featurise" "$repo/metal/cpp/featurise/standalone.o"
 rm -rf "$repo/metal/build/zstd"
-bash "$repo/cuda/build.sh" featurise
-bash "$repo/metal/build.sh" af3 af2 ef2 bioemu2
+bash "$repo/metal/build.sh" featurise af3 af2 ef2 bioemu2    # (metal/ carries its own copy of the featurisers)
 bin="$here/localfold/bin"
 rm -f "$bin"/localfold-*
 for port in af3 af2 ef2 bioemu2; do
-  install -m 755 "$repo/metal/$port/localfold-$port" "$bin/localfold-$port"
+  install -m 755 "$repo/metal/cf-$port" "$bin/localfold-$port"
   strip -x "$bin/localfold-$port"
 done
 # each port's list of the kernel specialisations its folds use, where this machine's folds have recorded one for these
@@ -40,7 +40,7 @@ for port in af3 af2 ef2 bioemu2; do
   else echo "$port: no recorded specialisations for $name - its first fold compiles each kernel as it is reached"; fi
 done
 # localfold-fetch: the featuriser binary under the name that runs its weight and CCD fetcher
-install -m 755 "$repo/cuda/featurise/featurise" "$bin/localfold-fetch"; strip -x "$bin/localfold-fetch"
+install -m 755 "$repo/metal/cpp/featurise/featurise" "$bin/localfold-fetch"; strip -x "$bin/localfold-fetch"
 # what the wheel's tag promises: arm64, nothing newer than macOS 13, and nothing outside the system
 for f in "$bin"/localfold-*; do   # (the binaries; metal-specs/ is data)
   arch="$(lipo -archs "$f")"; [ "$arch" = arm64 ] || { echo "$f is $arch, not arm64" >&2; exit 1; }

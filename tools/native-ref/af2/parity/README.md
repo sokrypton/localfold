@@ -54,5 +54,5 @@ JAX_PLATFORMS=cpu ~/venv_colabfold/bin/python cuda/af2/parity/sampling_parity.py
 cuda/featurise/af2-featurise ora --weights=cuda/af2/weights-model_1_multimer_v3 ...
 python cuda/af2/oracle.py ora --weights ... --model model_1_multimer_v3 --params ~/params --reference <af3-any-model> \
     --out ora/oracle --passes 4
-cuda/af2/localfold-af2 ora --weights=... --oracle=ora/oracle --recycles=3
+cuda/cf-af2 ora --weights=... --oracle=ora/oracle --recycles=3
 ```

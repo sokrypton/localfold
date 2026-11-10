@@ -4383,8 +4383,8 @@ boltz2, intellifold2 and rosettafold3 too, so every family's walk is exercised t
 
 ## 🔴 Each port is one binary: a job in, a structure out (2026-10-08)
 
-`cuda/af3/localfold-af3 --job=kras.json --out=kras.pdb --model=boltz2` is the whole protocol in one process, and so are
-`cuda/af2/localfold-af2` and `cuda/ef2/localfold-ef2`: any first argument that is a flag selects it (cuda/cpp/featurise/standalone.h),
+`cuda/cf-af3 --job=kras.json --out=kras.pdb --model=boltz2` is the whole protocol in one process, and so are
+`cuda/cf-af2` and `cuda/cf-ef2`: any first argument that is a flag selects it (cuda/cpp/featurise/standalone.h),
 while a featurised directory first, and `--serve`, are the resident server the worker drives, unchanged. It fetches
 the model's published weights natively the first time (cuda/cpp/featurise/fetch.h - the registry's pinned remotes,
 generated into `bundles.inc` from shared/bundles/manifests/index.js, and af3-any-model's blobs, AlphaFold 3's only once
@@ -4410,7 +4410,7 @@ worker mid-gate, byte-identical to the moved copy.
 
 ## 🔴 `localfold-af3`, `localfold-af2`, `localfold-ef2`; the language models in `cuda/plm` (2026-10-08)
 
-The three binaries are named for a PATH - `cuda/af3/localfold-af3`, `cuda/af2/localfold-af2`, `cuda/ef2/localfold-ef2` -
+The three binaries are named for a PATH - `cuda/cf-af3`, `cuda/cf-af2`, `cuda/cf-ef2` -
 with a later `pip install localfold` in mind, and the ESMFold2 port is `cuda/ef2` beside `af3` and `af2`, its models
 `ef2-fast-600m`, `ef2-fast-300m`, `ef2-fast`, `ef2` (the keys the page and the worker already used; biohub's own
 checkpoint names stay where they name a checkpoint). Each takes `--help`; `--weights-dir=<dir>` replaces

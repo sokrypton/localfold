@@ -11,7 +11,7 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-497 tools. `tools/fixtures/` is data and is not listed.
+512 tools. `tools/fixtures/` is data and is not listed.
 
 ## `tools/gpu/` - the WebGPU lane (291)
 
@@ -402,7 +402,7 @@ and turning it into a bundle.
 - **`safetensors_read.py`** - Read a .safetensors file into numpy arrays, without the safetensors package.
 - **`vector-quantise.py`** - Is a codebook worth a new decoder? Scalar codes against vector ones, at 2 bits.
 
-## `tools/` - everything else (126)
+## `tools/` - everything else (141)
 
 CPU checkers, the export and quantisation pipeline, the page drivers that
 go through CDP, and the deploy.
@@ -460,7 +460,7 @@ go through CDP, and the deploy.
 - **`check-smiles-path.mjs`** - The same ligand from a CCD code and from a SMILES string folds the same way.
 - **`check-smiles-rewrites.mjs`** - The same molecule written a thousand different ways is still that molecule.
 - **`check-smiles-vs-rdkit.mjs`** - Does this port read a SMILES the way RDKit does? Formula, atoms, bonds, rings.
-- **`check-standalone.py`** - Gate the standalone ports: `cuda/<port>/localfold-<port> --job=... --out=...` against the two-step path it replaces.
+- **`check-standalone.py`** - Gate the standalone ports: `cuda/cf-<port> --job=... --out=...` against the two-step path it replaces.
 - **`check-stereo-vs-rdkit.mjs`** - Does a `@` in a SMILES mean the same hand here as it does to RDKit?
 - **`check-stock-flags.mjs`** - Does every model fold on the browser a VISITOR has?
 - **`check-t4-build.py`** - The native ports compile for a T4 (sm_75) on whatever card this machine has - the instructions a T4 lacks caught here.
@@ -504,6 +504,21 @@ go through CDP, and the deploy.
 - **`index-tools.py`** - Every tool in this repository, with the one line it says about itself.
 - **`mobile-layout.py`** - index.html at real phone widths: it must FIT, not merely not overflow.
 - **`model-terms.py`** - The model gate: the AlphaFold 3 terms dialog, and `?model=` in the URL.
+- **`native-ref/af2/export_input.mjs`** - One AlphaFold 2 input for the native CUDA port: the page's own features (shared/input/a3m-features.js, the function the page and tools/gpu/fold-af2.js fold with), one set a pass, in cuda/af3's model.idx/model.bin format.
+- **`native-ref/af2/parity/compare_features.py`** - Hold LocalFold's merged pre-sampling AF2 input to ColabFold's (vendor_features.py / ours_features.mjs).
+- **`native-ref/af2/parity/ours_draws.mjs`** - LocalFold's own random draws for a case: per recycle, the cluster centres, the extra rows and the BERT-masked centre codes, over the deduplicated merged alignment they index - what sampling_parity.py hands stock AF2's feature functions, so both sides build features from the SAME draws.
+- **`native-ref/af2/parity/ours_features.mjs`** - LocalFold's merged AlphaFold 2 input for a case, before any random draw - the twin of vendor_features.py.
+- **`native-ref/af2/parity/sampling_parity.py`** - Stock AlphaFold-Multimer's feature functions on LocalFold's OWN draws, against LocalFold's features.
+- **`native-ref/af2/parity/vendor_features.py`** - ColabFold's own merged AlphaFold 2 input for a case, before any random draw.
+- **`native-ref/af2/parity/vendor_fold.py`** - ColabFold's own fold of a case, through `colabfold.batch.run` - what `colabfold_batch` runs.
+- **`native-ref/af2/parity/webgpu_fold.py`** - The WebGPU arm: a case folded by the page's own AlphaFold 2 path in headless Chrome.
+- **`native-ref/af3/export-block.mjs`** - Export one AF3 pairformer block, a random input and the CPU reference's output.
+- **`native-ref/af3/export-model.mjs`** - Everything the CUDA AlphaFold 3 reads, in one file: the weights as this repository's loaders structure them, the featurised batch, and af3-any-model's own tensors to check each stage against.
+- **`native-ref/af3/export-pairformer.mjs`** - All of AF3's pairformer blocks, and AF3's OWN pairformer input and output for 6MRR.
+- **`native-ref/bioemu2/export_input.mjs`** - One BioEmu2 input for the native CUDA port: shared/bioemu2/featurise.js's features (the transcription of af3-any-model's pipeline/bioemu2_features.py), in cuda/af3's model.idx/model.bin format.
+- **`native-ref/ef2/export_input.mjs`** - One ESMFold2 input for the native CUDA port: the page's own features (shared/esmfold2/featurise.js, what webgpu/esmfold2/fold.js folds with), in cuda/af3's model.idx/model.bin format.
+- **`native-ref/ef2/export_weights.mjs`** - ESMFold2's weights for the native CUDA port: the folding bundle and the ESM-C tower, every tensor decoded to float32 under its own bundle name, in cuda/af3's model.idx/model.bin format.
+- **`native-ref/resolve_templates.mjs`** - The page's template rows, resolved as the page resolves them, for a native fold:
 - **`negate-bundle-tensors.py`** - Negate NAMED tensors in a float32 bundle, in place.
 - **`pack_delta_model.py`** - Store one AlphaFold 2 model as a DELTA on another, at three bits a weight.
 - **`pae-from-distogram.py`** - Can a PAE matrix be estimated from a distogram and a structure?

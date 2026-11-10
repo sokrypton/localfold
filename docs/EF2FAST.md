@@ -3902,7 +3902,7 @@ SMILES ligand on the WebGPU port.
 weights - and on the full model in half to two thirds of its memory; on the 600M model upstream is lighter below
 ~500 tokens and ours above.** Upstream is biohub's `esm` at repo main, 3.4.1.post1 (`43b4548`,
 the speedups co-authored with Claude: the `fused` Triton kernels, the cuEquivariance backend, bf16 autocast),
-against `cuda/ef2/localfold-ef2` on this A100-SXM4-40GB. `tools/esmc/compare-upstream-esmfold2.py` produces every
+against `cuda/cf-ef2` on this A100-SXM4-40GB. `tools/esmc/compare-upstream-esmfold2.py` produces every
 number below.
 
 **Same settings on both sides**: one diffusion sample, seed 1, the checkpoint's own sampler (fast 15 scheduled / 11

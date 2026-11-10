@@ -264,7 +264,7 @@ def building():
 def binary(port):
     """A port's binary - waited for while cuda/build.sh is still compiling it (the notebook starts the
     build beside the service, so the first fold can arrive before it is done), refused if nothing is."""
-    path = os.path.join(BIN_DIR, f"localfold-{port}") if BIN_DIR else os.path.join(REPO, NATIVE, port, f"localfold-{port}")
+    path = os.path.join(BIN_DIR, f"localfold-{port}") if BIN_DIR else os.path.join(REPO, NATIVE, f"cf-{port}")
     if NATIVE == "metal":
         if not os.access(path, os.X_OK):
             raise Refused(f"{path} is not built - run bash metal/build.sh {port}")
@@ -275,7 +275,7 @@ def binary(port):
         time.sleep(3)
     if not os.access(path, os.X_OK):
         said = open(BUILD_LOG).read()[-600:] if os.path.exists(BUILD_LOG) else ""
-        raise Refused(f"cuda/{port}/localfold-{port} is not built on this runtime - run cuda/build.sh"
+        raise Refused(f"cuda/cf-{port} is not built on this runtime - run cuda/build.sh"
                       + (f" (its last build said: {said.strip()})" if said.strip() else ""))
     return path
 

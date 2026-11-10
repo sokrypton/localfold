@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Gate the standalone ports: `cuda/<port>/localfold-<port> --job=... --out=...` against the two-step path it replaces.
+"""Gate the standalone ports: `cuda/cf-<port> --job=... --out=...` against the two-step path it replaces.
 
     python3 tools/check-standalone.py [--network]
 
 🔴 ONE PROCESS MUST FOLD WHAT TWO DID. The standalone mode (cuda/cpp/featurise/standalone.h) fetches the weights,
 featurises in its own process on a thread and folds; the resident server python/localfold/worker.py drives still takes the
 featuriser binary's directory. Each case runs both ways - `cuda/cpp/featurise/<port>-featurise <dir> ...` then
-`cuda/<port>/localfold-<port> <dir> ...`, and the standalone command - and holds the two PDBs to the SAME BYTES, so a flag the
+`cuda/cf-<port> <dir> ...`, and the standalone command - and holds the two PDBs to the SAME BYTES, so a flag the
 standalone mode drops or misroutes (an input flag reaching the fold, af2's --recycles reaching only one of the
 two) is a difference here rather than a quietly different fold. Beside them: refusals come back as the page's
 sentence with a nonzero status (an input flag the port does not read is one of them, never dropped), a local
@@ -29,7 +29,7 @@ S6 = "GWSTELEKHREELKEFLKKEGITNVEIRIDNGRLEVRVEGGTERLKRFLEELRQKLEKKGYTVDIKIE"
 
 
 def binary(port):
-    return os.path.join(CUDA, port, f"localfold-{port}")
+    return os.path.join(CUDA, f"cf-{port}")
 
 
 def run(cmd, env=None):

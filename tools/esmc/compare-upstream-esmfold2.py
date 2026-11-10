@@ -7,7 +7,7 @@
 --model takes localfold-ef2's own names; --checkpoint overrides the upstream checkpoint each one defaults to.
 
 Upstream runs in this process (its fastest kernel backend, `fused`, unless --backends says otherwise) and
-`cuda/ef2/localfold-ef2` as a subprocess, on the same targets (the crystals in tools/fixtures) and settings: ONE
+`cuda/cf-ef2` as a subprocess, on the same targets (the crystals in tools/fixtures) and settings: ONE
 diffusion sample, seed 1, the checkpoint's own step count (fast 15 scheduled / 11 run, full 14), and upstream's extra
 `lm_dropout` OFF - the port has none; the full model's own per-loop dropout (0.25, part of the architecture) runs on
 both. Upstream is timed warm (each case once untimed, then timed, CUDA synchronised); the port reports its own stage
@@ -160,7 +160,7 @@ def ours_warm(args, cases, work):
     """the port timed WARM, as upstream is: its resident server (--serve, the Colab worker's mode) folds each case
     three times and the third fold's stage times are read - a one-shot binary since b7118c9 skips its warm-up when the
     input is already written, so its stage times carry every kernel's first launch (6MRR's trunk 128 ms cold, 39 warm)"""
-    binary = os.path.join(ROOT, "cuda", "ef2", "localfold-ef2")
+    binary = os.path.join(ROOT, "cuda", "cf-ef2")
     model = args.model
     if experimental(model):
         r = subprocess.run([os.path.join(ROOT, "cuda", "cpp", "featurise", "fetch-weights"), model], capture_output=True, text=True)
@@ -216,7 +216,7 @@ def ours_warm(args, cases, work):
 
 
 def ours(args, cases, work):
-    binary = os.path.join(ROOT, "cuda", "ef2", "localfold-ef2")
+    binary = os.path.join(ROOT, "cuda", "cf-ef2")
     rows = []
     for loops in args.loop_list:
         for name, chains, seqs, a3ms in cases:

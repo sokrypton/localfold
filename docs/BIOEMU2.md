@@ -99,7 +99,7 @@ own input (as check-bioemu2-network.js does), so a residual is that stage's alon
 
     node tools/dump-bioemu2-webgpu.mjs --out=/tmp/or --half=off --trunk=f32      # the float32 arm (default: shipped)
     cuda/cpp/featurise/bioemu2-featurise /tmp/in --job=tools/fixtures/bioemu2/6mrr.json
-    metal/bioemu2/localfold-bioemu2 /tmp/in --bundle=model-bioemu2-int5 --oracle=/tmp/or
+    metal/cf-bioemu2 /tmp/in --bundle=model-bioemu2-int5 --oracle=/tmp/or
 
 Against the float32 arm the first build read 1e-7 on the trunk and context and 1e-5 on the denoiser - on 6MRR and on the
 `heteromer` fixture (156 tokens, 41 alignment rows, two copies of a chain and an ATP: 2.4e-7 / 1.3e-5). 🔴 **6MRR ALONE

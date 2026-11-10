@@ -24,7 +24,7 @@ Every speed and memory choice in `metal/` was measured on one M2. The M5 differs
    calls it with the terms accepted: `tools/check-native-worker.py` without `--no-af3`, a page fold of AF3 in a test
    profile). The AF3 gate cases read the page bundle `model-af3-int5/`, which the user copies over themselves.
 3. **Do not modify `cuda/`** except for portability fixes. It is the CUDA port; `metal/` is written natively.
-4. **Measure arms interleaved in one process** (`metal/bench/localfold-bench`), never two runs minutes apart: Apple
+4. **Measure arms interleaved in one process** (`metal/cf-bench`), never two runs minutes apart: Apple
    laptops throttle and share the GPU with the window server. On the M2 the same GEMM read 0.22 and 0.42 ms in two runs.
 5. **Every change goes through the gates** (below) before it is committed, with the numbers in the commit message.
 6. **Use bash for loops over words.** This machine's shell is zsh, which does not split `$var` into words:
@@ -48,9 +48,9 @@ Every speed and memory choice in `metal/` was measured on one M2. The M5 differs
 
 ```
 bash cuda/build.sh featurise                   # the native featurisers (no GPU needed)
-bash metal/build.sh af3 af2 ef2 selftest       # -> metal/<port>/localfold-<port>, metal/selftest/localfold-selftest
-bash metal/build.sh bench                      # -> metal/bench/localfold-bench (GEMM, attention and LayerNorm arms)
-metal/selftest/localfold-selftest              # the GEMM, attention and LayerNorm against host references
+bash metal/build.sh af3 af2 ef2 selftest       # -> metal/cf-<port>, metal/cf-selftest
+bash metal/build.sh bench                      # -> metal/cf-bench (GEMM, attention and LayerNorm arms)
+metal/cf-selftest              # the GEMM, attention and LayerNorm against host references
 ```
 
 The kernels are Metal source compiled at run time. The first fold of each model on a new machine compiles its
@@ -84,12 +84,12 @@ The M2's numbers, each from an interleaved bench or a warm fold. Run the same on
 
 | measurement | command | M2 |
 |---|---|---|
-| GEMM peak, 4096 square | `metal/bench/localfold-bench 4096 4096 4096 0,1016,1032,164064 hhh` | 2.93 TFLOP/s |
-| transformer q/k/v/g, 68 tokens padded to 80 | `metal/bench/localfold-bench 3072 80 768 180032,180064 hhh` | 0.19 ms (80x64 tile) |
-| trunk K-128 projection, 261 tokens | `metal/bench/localfold-bench 512 68121 128 0,1032,148064,164032 hhh` | 3.44 ms, 2.60 TFLOP/s |
-| grid attention, 261 tokens | `metal/bench/localfold-bench attn 261 4 32 261 0 0` | 6.84 ms, 1.33 TFLOP/s |
-| LayerNorm, 68121 x 128 | `metal/bench/localfold-bench ln 68121 128` | 83.5 GB/s (fitted) against 42.6 (widest) |
-| AF3 6MRR, 200 steps | `metal/af3/localfold-af3 $D/af3-6mrr.input --fold --fast --bundle=model-af3-int5 --family=af3 --out=/dev/null`, where `D=$(python3 -c "import tempfile,os;print(os.path.join(tempfile.gettempdir(),'metal-af3-gate'))")` (the gate featurises its inputs there) | 6.1 s: trunk 1.17 (4 passes), diffusion 4.90 |
+| GEMM peak, 4096 square | `metal/cf-bench 4096 4096 4096 0,1016,1032,164064 hhh` | 2.93 TFLOP/s |
+| transformer q/k/v/g, 68 tokens padded to 80 | `metal/cf-bench 3072 80 768 180032,180064 hhh` | 0.19 ms (80x64 tile) |
+| trunk K-128 projection, 261 tokens | `metal/cf-bench 512 68121 128 0,1032,148064,164032 hhh` | 3.44 ms, 2.60 TFLOP/s |
+| grid attention, 261 tokens | `metal/cf-bench attn 261 4 32 261 0 0` | 6.84 ms, 1.33 TFLOP/s |
+| LayerNorm, 68121 x 128 | `metal/cf-bench ln 68121 128` | 83.5 GB/s (fitted) against 42.6 (widest) |
+| AF3 6MRR, 200 steps | `metal/cf-af3 $D/af3-6mrr.input --fold --fast --bundle=model-af3-int5 --family=af3 --out=/dev/null`, where `D=$(python3 -c "import tempfile,os;print(os.path.join(tempfile.gettempdir(),'metal-af3-gate'))")` (the gate featurises its inputs there) | 6.1 s: trunk 1.17 (4 passes), diffusion 4.90 |
 | a diffusion step | the same, `--recycles=0 --steps=100` | 24 ms at 68 tokens, 80 at 261 |
 | AF3 trunk pass, 261 tokens | the same on `$D/af3-5caj-template.input`, `--recycles=1 --steps=50` | 3.9 s a pass |
 | memory, 1044 tokens, two passes | `AF3_MEM=1 /usr/bin/time -l` on a 1044-token input (`cuda/cpp/featurise/af3-featurise <dir> --no-weights --family=af3 --sequence=...`), `--steps=5 --recycles=1` | 4.7 GB footprint |
