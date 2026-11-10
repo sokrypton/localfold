@@ -279,8 +279,7 @@ def cases(offline):
     ]
     # biohub's released ESMFold2-Fast and ESMFold2 (ESM-C 6B, local exports only: metal/README.md) where their bundles
     # are on disk under the names fetch-weights gives them - nothing downloads them, so absent is a skip, not a failure
-    weights = os.environ.get("LOCALFOLD_WEIGHTS_DIR") or (     # (fetch.h's home(): no /proc/self/exe on a Mac)
-        os.path.expanduser("~/.cache/localfold") if sys.platform == "darwin" else REPO)
+    weights = os.environ.get("LOCALFOLD_WEIGHTS_DIR") or os.path.expanduser("~/.cache/localfold")   # (fetch.h's home())
     released = lambda *dirs: all(os.path.exists(os.path.join(weights, d, "manifest.json")) for d in dirs)
     if released("model-esmfold2-fast-f32", "model-esmc-6b-int8"):
         out.append(("esmfold2-fast released (ESM-C 6B) 6mrr", {"family": "ef2-fast",

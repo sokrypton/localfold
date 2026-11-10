@@ -3976,7 +3976,7 @@ tower resident as int8). Upstream's model load alone is 10.5 s; ours is 1.6-4 s 
 
 The same tool on a G4 session (RTX PRO 6000 Blackwell, sm_120, CUDA 13.0), upstream installed by
 `pip install "esm[fused,cueq] @ git+https://github.com/evolutionaryscale/esm"` - torch 2.11.0+cu130, triton 3.6,
-cuEquivariance 0.12.0, no flash-attention or xformers - and the port **timed warm too** (`localfold-ef2 warm`: its
+cuEquivariance 0.12.0, no flash-attention or xformers - and the port **timed warm too** (`cf-ef2 warm`: its
 resident server folds each case three times and the third is read; see below why the one-shot column is not that):
 
 | target | tokens | upstream PyTorch | upstream cuEquivariance | upstream fused | **ours, warm** | ours, one-shot |
@@ -4078,7 +4078,7 @@ device-weight cache in cuda/ef2's include graph to register a forget hook. See c
 To reproduce: a Python 3.12 venv with `torch` from the cu128 index, `pip install "esm[fused,cueq12] @ git+https://github.com/evolutionaryscale/esm"`,
 then `pip uninstall cuequivariance-ops-torch-cu13 cuequivariance-ops-cu13` and `pip install cuequivariance==0.8.1
 cuequivariance-torch==0.8.1 cuequivariance-ops-cu12==0.8.1 cuequivariance-ops-torch-cu12==0.8.1 gemmi`, and `xformers`
-from the cu128 index; `--model` takes localfold-ef2's names (`ef2-fast-600m`, `ef2-fast-300m`, `ef2-fast`, `ef2`), each defaulting to its
+from the cu128 index; `--model` takes cf-ef2's names (`ef2-fast-600m`, `ef2-fast-300m`, `ef2-fast`, `ef2`), each defaulting to its
 upstream checkpoint (`--checkpoint=` overrides: biohub's `ESMFold2-Experimental-Fast-base600M-step1500k` for the site's), the full one
 `biohub/ESMFold2` (26 GB, fetched by `from_pretrained`).
 

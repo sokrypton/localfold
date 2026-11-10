@@ -10,7 +10,7 @@ aatype, residue_index, asym_id, entity_id, sym_id.
 
 The optional third path receives that merged alignment as an A3M - every row ColabFold's sampler can draw
 (msa_mask not all zero), deletions written back as lowercase insertions - so LocalFold can fold ColabFold's
-rows through its own sampling (`localfold-af2 --sequence=A:B --a3m=<merged.a3m>`), which separates the
+rows through its own sampling (`cf-af2 --sequence=A:B --a3m=<merged.a3m>`), which separates the
 merge from everything after it.
 """
 import json

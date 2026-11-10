@@ -62,16 +62,15 @@ SITE = os.environ.get("LOCALFOLD_SITE_DIR") or REPO
 
 NATIVE = "metal" if sys.platform == "darwin" else "cuda"
 # the native-only models, by the page's family name, and the exported bundles each one folds from - by the names
-# cuda/cpp/featurise/fetch.h gives them under the weights directory: LOCALFOLD_WEIGHTS_DIR, else fetch.h's home() - the
-# checkout on Linux, ~/.cache/localfold on a Mac (no /proc/self/exe to find the checkout by). Offered only where they
+# cuda/cpp/featurise/fetch.h gives them under the weights directory: LOCALFOLD_WEIGHTS_DIR, else fetch.h's home(),
+# ~/.cache/localfold. Offered only where they
 # are on disk, since nothing downloads them
 NATIVE_ONLY = {"ef2-fast": ("model-esmfold2-fast-f32", "model-esmc-6b-int8"),
                "ef2": ("model-esmfold2-f32", "model-esmc-6b-int8")}
 
 
 def native_models():
-    root = os.environ.get("LOCALFOLD_WEIGHTS_DIR") or (
-        os.path.expanduser("~/.cache/localfold") if NATIVE == "metal" else REPO)
+    root = os.environ.get("LOCALFOLD_WEIGHTS_DIR") or os.path.expanduser("~/.cache/localfold")
     return [family for family, dirs in NATIVE_ONLY.items()
             if all(os.path.exists(os.path.join(root, d, "manifest.json")) for d in dirs)]
 

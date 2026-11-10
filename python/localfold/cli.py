@@ -38,7 +38,7 @@ def main():
     commands = {"af3": af3, "af2": af2, "ef2": ef2, "fetch": fetch}
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
         sys.exit("usage: localfold serve [--port N] [--no-open]   the website on this machine, folding natively\n"
-                 "       localfold af3|af2|ef2|fetch ...          a port's command (as localfold-af3 ...)")
+                 "       localfold af3|af2|ef2|fetch ...          a port's command (as cf-af3 ...)")
     name = sys.argv.pop(1)
     if name == "serve":
         from .serve import main as serve_main

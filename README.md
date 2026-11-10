@@ -87,8 +87,8 @@ python3 python/localfold/server.py --native --local --open
 ```
 
 This opens the page at `http://127.0.0.1:8710` with every fold running on this
-machine's GPU. Each model's weights download the first time it is used. On Linux
-they go into the checkout; on a Mac, into `~/.cache/localfold`.
+machine's GPU. Each model's weights download the first time it is used, into
+`~/.cache/localfold`.
 
 ## Acknowledgments and citation
 

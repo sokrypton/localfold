@@ -12,7 +12,7 @@ ours - and the result is compared, channel group by channel group, with the f<k>
 --pool=kept clusters over the extra rows LocalFold keeps (isolates the cluster FORMULA); --pool=all over
 every non-centre row, ours first, which is what stock does (sample_msa puts the whole remainder in
 extra_msa and only create_extra_msa_feature crops it). --write copies the data dir with the stock
-features in place, for `localfold-af2 <dir>`: the network is gated separately (oracle.py), so folding
+features in place, for `cf-af2 <dir>`: the network is gated separately (oracle.py), so folding
 both directories prices the feature difference in structure.
 """
 import argparse

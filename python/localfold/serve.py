@@ -35,10 +35,10 @@ def site_dir():
 
 
 def featurisers(cache):
-    """A directory naming the bundled featuriser as each of its tools: links to bin/localfold-fetch, which is the one
+    """A directory naming the bundled featuriser as each of its tools: links to bin/cf-fetch, which is the one
     featuriser binary (a wheel cannot carry the links themselves). Made once a version."""
     from . import __version__
-    target = os.path.join(BIN, "localfold-fetch")
+    target = os.path.join(BIN, "cf-fetch")
     if not os.access(target, os.X_OK):
         sys.exit(f"localfold serve: {target} is missing - reinstall the localfold wheel")
     where = os.path.join(cache, f"featurise-{__version__}")

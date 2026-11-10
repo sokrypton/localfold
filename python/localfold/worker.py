@@ -45,11 +45,10 @@ CUDA = os.path.join(REPO, "cuda")
 # the native backend this machine has: Apple's GPU through metal/, NVIDIA's through cuda/
 NATIVE = "metal" if sys.platform == "darwin" else "cuda"
 NATIVE_NAME = {"metal": "Metal", "cuda": "CUDA"}[NATIVE]
-BIN_DIR = os.environ.get("LOCALFOLD_BIN_DIR")             # (a wheel's binaries: localfold-<port> side by side)
-# where fetch-weights keeps the bundles: this checkout on Linux, as it always was. (cuda/ and metal/ are their own
-# repositories now, and a binary's own default is ITS checkout - the submodule - so a fold here would fetch every
-# bundle a second time into cuda/ without this; a Mac's default, ~/.cache/localfold, is the binary's and stays.)
-WEIGHTS_DIR = os.environ.get("LOCALFOLD_WEIGHTS_DIR") or (None if NATIVE == "metal" else REPO)
+BIN_DIR = os.environ.get("LOCALFOLD_BIN_DIR")             # (a wheel's binaries: cf-<port> side by side)
+# where fetch-weights keeps the bundles: ~/.cache/localfold (fetch.h's home(), every binary's default on either
+# backend), unless `localfold serve --weights-dir` names another
+WEIGHTS_DIR = os.environ.get("LOCALFOLD_WEIGHTS_DIR") or os.path.expanduser("~/.cache/localfold")
 # ESMFold2's scheduled sampler steps: the checkpoint's own, and the floor for a job with per-atom tokens
 # (web/esmfold2-model.js, ESMFOLD2_COUNTS and ESMFOLD2_ATOMISED_STEPS - the page's numbers, mirrored)
 ESMFOLD2_DEFAULT_STEPS, ESMFOLD2_ATOMISED_STEPS = 15, 64
@@ -224,7 +223,7 @@ def model_weights(model, log):
     if model == "af3":
         accepted = {n.strip() for n in env.get("LOCALFOLD_ACCEPT_MODEL_TERMS", "").split(",") if n.strip()}
         env["LOCALFOLD_ACCEPT_MODEL_TERMS"] = ",".join(sorted(accepted | {"alphafold3"}))
-    where = [f"--weights-dir={WEIGHTS_DIR}"] if WEIGHTS_DIR else []
+    where = [f"--weights-dir={WEIGHTS_DIR}"]
     fetcher = subprocess.Popen([featuriser("fetch-weights"), *where, model], cwd=REPO, stdout=subprocess.PIPE,
                                stderr=subprocess.STDOUT, text=True, bufsize=1, preexec_fn=die_with_parent, env=env)
     said, dirs = [], []
@@ -245,7 +244,7 @@ def model_weights(model, log):
 def local_ccd():
     """wwPDB's whole component dictionary when `fetch-weights ccd` has put it beside the weights (the binaries'
     default too): every component read from it, none fetched from the RCSB a component at a time."""
-    path = os.path.join(WEIGHTS_DIR or REPO, "ccd", "components.cif")
+    path = os.path.join(WEIGHTS_DIR, "ccd", "components.cif")
     return [f"--ccd={path}"] if os.path.exists(path) else []
 
 
@@ -264,7 +263,7 @@ def building():
 def binary(port):
     """A port's binary - waited for while cuda/build.sh is still compiling it (the notebook starts the
     build beside the service, so the first fold can arrive before it is done), refused if nothing is."""
-    path = os.path.join(BIN_DIR, f"localfold-{port}") if BIN_DIR else os.path.join(REPO, NATIVE, f"cf-{port}")
+    path = os.path.join(BIN_DIR or os.path.join(REPO, NATIVE), f"cf-{port}")
     if NATIVE == "metal":
         if not os.access(path, os.X_OK):
             raise Refused(f"{path} is not built - run bash metal/build.sh {port}")

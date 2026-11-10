@@ -295,7 +295,7 @@ look at the M2's own ceiling.
 On the M2 (Apple8, 10 GPU cores, 16 GB, `recommendedMaxWorkingSetSize` 11.45 GB), at `6ac580e8`.
 
 🔴 **`bash metal/build.sh` WITH NO ARGUMENTS BUILDS ESMFold2 ALONE** (`ports=(ef2)` is its default), so the command
-above left `localfold-af2` and `localfold-af3` as they were and the first gate run measured the OLD binaries. Build
+above left `cf-af2` and `cf-af3` as they were and the first gate run measured the OLD binaries. Build
 what you mean to gate: `bash metal/build.sh ef2 af2 af3 selftest`. Everything below is on binaries rebuilt that way.
 
 **1. e573a0a2 compiles clean (no warnings) and does what it says.** All three gates pass on the rebuilt binaries -

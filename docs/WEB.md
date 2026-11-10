@@ -4408,7 +4408,7 @@ not read since it moved to af3-any-model's blobs (and prefetching that blob inst
 before the page's terms dialog was accepted). `test:native` passes with a bundle moved aside and re-fetched by the
 worker mid-gate, byte-identical to the moved copy.
 
-## 🔴 `localfold-af3`, `localfold-af2`, `localfold-ef2`; the language models in `cuda/plm` (2026-10-08)
+## 🔴 `cf-af3`, `cf-af2`, `cf-ef2`; the language models in `cuda/plm` (2026-10-08)
 
 The three binaries are named for a PATH - `cuda/cf-af3`, `cuda/cf-af2`, `cuda/cf-ef2` -
 with a later `pip install localfold` in mind, and the ESMFold2 port is `cuda/ef2` beside `af3` and `af2`, its models
@@ -4422,7 +4422,7 @@ bare nvcc line that cannot link the standalone object, builds through `cuda/buil
 
 ## 🔴 A wheel: `pip install localfold`, no compiler (2026-10-08)
 
-`.github/workflows/wheel.yml` builds one `py3-none-manylinux_2_28_x86_64` wheel carrying `localfold-af3`, `-af2` and
+`.github/workflows/wheel.yml` builds one `py3-none-manylinux_2_28_x86_64` wheel carrying `cf-af3`, `-af2` and
 `-ef2` compiled for sm_75, 80, 86, 89, 90, 100 and 120 with sm_120's PTX for anything newer (`python/manylinux_build.sh`:
 CUDA 12.8 from NVIDIA's RHEL 8 repository inside pypa's manylinux_2_28 image, then `python/build_wheel.sh`). No GPU
 is needed to build it; its test job installs it on a GPU-less runner and checks every binary loads and answers
@@ -4440,7 +4440,7 @@ until then a `v*` tag runs it. Publishing to PyPI is not in it.
 
 A CCD code was fetched from the RCSB a component at a time (cached in `~/.cache/localfold/ccd`), so a new ligand needed
 the network. `--ccd=<components.cif[.gz]>` now names a local dictionary - wwPDB's whole one, which AlphaFold 3 installs
-already carry - and `fetch-weights ccd` (`localfold-fetch ccd` in the wheel) downloads it into the weights directory
+already carry - and `fetch-weights ccd` (`cf-fetch ccd` in the wheel) downloads it into the weights directory
 uncompressed (519 MB, ~6 s; a lookup is ~0.1 s mapped, where inflating the 114 MB .gz is ~3 s), where the binaries and
 the worker read it by default. 🔴 **A RUN THAT READS A DICTIONARY READS THAT ALONE**: a code it lacks is refused, never
 fetched, and its blocks never enter the per-component cache, so a custom dictionary cannot leak into a later run.

@@ -43,9 +43,9 @@ jobs:
             bin=$(/tmp/lf/bin/python -c "import localfold; print(localfold.binary('$p'))")
             ldd "$bin" | grep -E "cublas|not found"
             if ldd "$bin" | grep -q "not found"; then echo "$bin: a library is not found" >&2; exit 1; fi
-            /tmp/lf/bin/localfold-$p --help | head -3
+            /tmp/lf/bin/cf-$p --help | head -3
           done
-          /tmp/lf/bin/localfold-fetch --help | head -2      # (usage: its models and the CCD)
+          /tmp/lf/bin/cf-fetch --help | head -2      # (usage: its models and the CCD)
 
   build-macos:
     runs-on: macos-14            # Apple silicon (arm64); no GPU is needed to build - the kernels compile on first use
@@ -60,8 +60,8 @@ jobs:
         shell: bash
         run: |
           python -m venv /tmp/lf && /tmp/lf/bin/pip install -q dist/localfold-*-macosx_13_0_arm64.whl
-          for p in af3 af2 ef2; do /tmp/lf/bin/localfold-$p --help | head -1; done
-          /tmp/lf/bin/localfold-fetch --help | head -1
+          for p in af3 af2 ef2; do /tmp/lf/bin/cf-$p --help | head -1; done
+          /tmp/lf/bin/cf-fetch --help | head -1
       - uses: actions/upload-artifact@v4
         with:
           name: wheel-macos
