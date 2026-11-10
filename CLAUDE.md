@@ -26,7 +26,8 @@ the same bytes in both, so a change merges across. A native change is committed 
 bumps the pin. What compares a native port to this repository's JavaScript stays HERE: the exporters and
 ColabFold parity tools in `tools/native-ref/`, `test:featurise`, the generated tables
 (`tools/gen-native-featuriser-tables.mjs` writes into the submodule; `test/native-featuriser-tables.test.js`
-is its staleness gate), and the RFD4P gates (on `opus-55-opt`, with RFD4P's JavaScript). Weights live in
+is its staleness gate), and RFD4P's byte-for-byte gate (on `opus-55-opt`, with RFD4P's JavaScript);
+RFD4P's native gate is the submodule's `cuda/rfd4p/gate.py`. Weights live in
 `~/.cache/localfold` (or `--weights-dir`) for every binary, the worker and both backends.
 
 ## Running anything that needs a GPU
