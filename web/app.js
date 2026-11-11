@@ -6212,7 +6212,7 @@ reportModelFromUrl();
  */
 
 function applyJob(job) {
-  // (the page builds no chemistry a job defines itself; the native fold does - cuda/af3/fold)
+  // (the page builds no chemistry a job defines itself; the native fold does - cuda/cf-af3)
   if (job.userCcd !== undefined) {
     throw new Error("userCCD describes chemistry this page does not build - remove it to fold the rest");
   }
