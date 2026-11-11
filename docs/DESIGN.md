@@ -47,10 +47,11 @@ from it, and that is exactly the product case named here as the thing that would
   the old shards while the fetched ones are new, every tensor reads from the wrong place, and nothing says so. It
   is the failure `model-boltz2-int5/` has today. `weights/SOURCE.md` pins the commit; a `--check` against
   upstream, as `tools/sync-mpnn.py` and `tools/sync-py2dmol.py` both have, is the missing piece.
-- 🔴 **And NVIDIA's terms become this repository's problem.** Today every model here has terms that
-  `tools/model-terms.py` can express. An NVIDIA research checkpoint offered from the same page has to be expressible
-  the same way, and nobody has read those terms yet. **That is the real cost of merging, and it is the user's call,
-  not a detail to be absorbed quietly.**
+- **And NVIDIA's terms were the feared cost, and they are not one** (read 2026-11-11): `nvidia/RFD4-Proteina`'s
+  model card and `LICENSE` release the model and weights under **BSD 3-Clause**, copyright the Institute for Protein
+  Design, University of Washington. Only the optional third-party refolding images and the training data on that
+  repository carry other terms, and nothing here uses them. The user has accepted the weights' terms. An RFD4 option
+  on the page still belongs in `tools/model-terms.py`, as every model's terms do.
 
 What does NOT change: the two methods remain different machines. Hunter hallucinates through a folding model and
 needs the fold stack; RFD4 generates and needs none of it. They share a page, an input model (below) and a viewer -
@@ -201,9 +202,9 @@ new kernel here.
 bare `shared/...` as a claim about OUR tree, and catching another project's path written as though it were ours is
 exactly what that gate is for.)
 
-🔴 Its weights come from the `nvidia/RFD4-Proteina` checkpoint and carry **NVIDIA's own terms, which nobody here has
-read and which must not be accepted on the user's behalf.** If Hunter ever offers RFD4 as a backbone generator,
-those terms enter this repository's licence story and belong in `tools/model-terms.py`.
+Its weights come from the `nvidia/RFD4-Proteina` checkpoint, under **BSD 3-Clause** (the Institute for Protein
+Design; read and accepted by the user 2026-11-11 - see section 1). If Hunter ever offers RFD4 as a backbone generator,
+that licence belongs in `tools/model-terms.py`.
 
 ---
 
@@ -560,12 +561,12 @@ Design tasks may be delegated to the `agy` CLI (Antigravity, `~/.local/bin/agy`)
 |---|---|---|
 | ~~Permission from the upstream authors~~ — **granted, all of them** (2026-10-24) | done | nothing |
 | Write the permission into each ported file, and onto `hunter-loop.js`'s existing provenance line | worker | nothing; do it as code lands |
-| 🔴 NVIDIA's RFD4-Proteina weight terms — **unread, and NOT covered by the authors' permission**: NVIDIA is not one of them. Not to be accepted on the user's behalf | Sergey | only if Hunter offers RFD4 as a generator |
+| ~~NVIDIA's RFD4-Proteina weight terms~~ — **read: BSD 3-Clause** (the Institute for Protein Design), accepted by the user 2026-11-11 | done | nothing |
 | Is the goal a product site, or a tool beside the folder? | Sergey | section 1's repository choice |
 | `sync-mpnn.py --check` against `sokrypton/mpnn` HEAD | worker | step 2 |
 | Whether Marielle will export LigandMPNN and NA-MPNN to the browser | Sergey / Marielle | would change 3B's trade entirely |
 | ~~Does py2Dmol already do role colouring, labelled frames and residue picking?~~ — **audited, docs/DESIGN-PY2DMOL.md**: colouring EXISTS, frames and picking PARTIAL | done | nothing |
-| 🔴 RFD4's GPU parity checks need `model.safetensors` - FLOAT weights from **NVIDIA's own** HF repo, under their terms, a large download. The harness itself works | Sergey | running those checks here |
+| 🔴 RFD4's GPU parity checks need `model.safetensors` - FLOAT weights from **NVIDIA's own** HF repo (BSD 3-Clause), a large download. The harness itself works | Sergey | running those checks here |
 | Rename `weights/` to `model-rfd4p-int8/` for this repository's convention, now the hosting is settled | worker | nothing |
 | How geometric conditioning works - template, contact term, or an RMSD-to-motif term in the objective | unassigned | motif scaffolding, enzyme design |
 | Does `partial_diffusion` have a Hunter analogue? Read her `13_warmstart.py` | unassigned | that one modality |
