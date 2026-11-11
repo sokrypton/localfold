@@ -1,3 +1,9 @@
+> 🔴 **SUPERSEDED, 2026-11-11: the Metal port is its own repository now** -
+> [sokrypton/colabfold-metal](https://github.com/sokrypton/colabfold-metal) (private), LocalFold's `metal/` with its
+> history. Its first job on a Mac is **`docs/HANDOFF-SPLIT.md` there**: build it, run its gates, report back in that
+> file's Log. LocalFold's side is branch `split-native`, where `metal/` is that repository as a submodule. What
+> follows is the 2026-11-07 round, kept as the record.
+
 # A100 to Metal: what wants checking on Apple silicon (`opus-55-opt`, 2026-11-07)
 
 Written on the A100 for the agent sitting on a Mac, whose job is testing `metal/`, the page's WebGPU path and its
