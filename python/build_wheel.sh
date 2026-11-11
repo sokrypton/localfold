@@ -15,14 +15,14 @@ py="${PYTHON:-python3}"
 export LOCALFOLD_CUDA_ARCHS="${LOCALFOLD_CUDA_ARCHS:-75 80 86 89 90 100 120}"
 # the binaries sit in site-packages/localfold/bin and pip puts cuBLAS in site-packages/nvidia/cublas/lib
 export LOCALFOLD_RPATH='$ORIGIN/../../nvidia/cublas/lib'
-# one port at a time: each compiles its architectures in parallel (nvcc --threads 0), and three at once would
+# one port at a time: each compiles its architectures in parallel (nvcc --threads 0), and all at once would
 # hold ~3x the memory of a CI runner's worth
-for port in af3 af2 ef2; do
+for port in af3 af2 ef2 bioemu2; do
   bash "$repo/cuda/build.sh" "$port" || { tail -30 /tmp/localfold-cuda-build.log >&2; exit 1; }
 done
 bin="$here/localfold/bin"
 rm -f "$bin"/cf-*
-for port in af3 af2 ef2; do
+for port in af3 af2 ef2 bioemu2; do
   install -m 755 "$repo/cuda/cf-$port" "$bin/cf-$port"
   strip "$bin/cf-$port"             # (host symbols only: the device code is the fatbinary's data)
 done

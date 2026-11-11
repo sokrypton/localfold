@@ -11,6 +11,7 @@ pip install localfold
 cf-af3 --job=kras.json --out=kras.pdb                  # AlphaFold 3 (or --model=boltz2, chai1, ...)
 cf-af2 --sequence=MKV...:GSH... --search --out=dimer.pdb
 cf-ef2 --sequence=MKV... --out=fold.pdb                # ESMFold2: no alignment needed
+cf-bioemu2 --sequence=MKV... --out=fold.pdb            # BioEmu2 (--samples=N for an ensemble)
 ```
 
 Or the whole website, on this machine, folding with its GPU:
@@ -38,6 +39,7 @@ names a dictionary you already have.
 | `cf-af3` | `af3` (AlphaFold 3, default), `boltz2`, `chai1`, `protenix2`, `intellifold2`, `rosettafold3`, `opendde`, `openbind0` | proteins, DNA, RNA, ligands (CCD or SMILES), ions, glycans, modified residues, covalent bonds, alignments, templates |
 | `cf-af2` | `model_1_ptm` ... `model_5_ptm`, `model_1_multimer_v3` ... `model_5_multimer_v3` | protein chains, alignments, templates |
 | `cf-ef2` | `ef2-fast-600m` (default), `ef2-fast-300m` | proteins, DNA, RNA, ligands, modified residues - from the sequence alone |
+| `cf-bioemu2` | `bioemu2` (Microsoft's bioemu2-preview, MIT) | proteins, DNA, RNA, ligands (CCD or SMILES), ions, modified residues, covalent bonds - an ensemble of samples, with no confidence head |
 
 `--search` fetches alignments from the ColabFold MMseqs2 server, which **sends your sequences to
 api.colabfold.com**; without it a fold runs from the sequence (or the alignments you pass) and nothing leaves the

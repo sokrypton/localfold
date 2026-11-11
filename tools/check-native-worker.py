@@ -12,7 +12,7 @@ target - each one the Metal gate's own number (metal/af3/gate.py), never a widen
 
 python/localfold/worker.py over its own stdin protocol, one process for every case as the broker runs it,
 each job shaped as the page sends one (AlphaFold 3 JSON from the entity rows, the rows themselves, the
-form's controls), each fold scored against its deposited structure (cuda/af3/score.py) and held to a
+form's controls), each fold scored against its deposited structure (<native>/af3/score.py) and held to a
 bar, and every result held to the fields the page ingests (web/app.js, cudaPrediction): a PDB, a pLDDT a
 token, a PAE of tokens^2, the token layout, the chains. test:bridge's CUDA arm is a stub and proves the
 broker's routing; this is the half that proves the worker folds.
@@ -29,6 +29,9 @@ import signal
 import subprocess
 import sys
 import time
+
+if "-h" in sys.argv or "--help" in sys.argv:   # (the usage above, before anything runs)
+    sys.exit(__doc__)
 
 REPO = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 NATIVE = "metal" if sys.platform == "darwin" else "cuda"
@@ -326,7 +329,7 @@ def score(pdb_text, reference, chains):
     path = "/tmp/localfold-cuda-check.pdb"
     with open(path, "w") as handle:
         handle.write(pdb_text)
-    said = subprocess.run([sys.executable, os.path.join(REPO, "cuda", "af3", "score.py"), path, reference, chains],
+    said = subprocess.run([sys.executable, os.path.join(REPO, NATIVE, "af3", "score.py"), path, reference, chains],
                           capture_output=True, text=True).stdout
     found = re.findall(r"CA RMSD ([0-9.]+) A", said)
     return float(found[0]) if found else None
