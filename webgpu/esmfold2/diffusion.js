@@ -108,8 +108,8 @@ ${stageRow ? "    rowBuf[c] = value;\n" : ""}    total += value;
   if (local.x < 16u) { sums[local.x] += sums[local.x + 16u]; squares[local.x] += squares[local.x + 16u]; } workgroupBarrier();
   if (local.x < 8u) { sums[local.x] += sums[local.x + 8u]; squares[local.x] += squares[local.x + 8u]; } workgroupBarrier();
   if (local.x == 0u) {
-    sums[0] = ((sums[0] + sums[4]) + (sums[2] + sums[6])) + ((sums[1] + sums[5]) + (sums[3] + sums[7]));
-    squares[0] = ((squares[0] + squares[4]) + (squares[2] + squares[6])) + ((squares[1] + squares[5]) + (squares[3] + squares[7]));
+    sums[local.x] = ((sums[0] + sums[4]) + (sums[2] + sums[6])) + ((sums[1] + sums[5]) + (sums[3] + sums[7]));
+    squares[local.x] = ((squares[0] + squares[4]) + (squares[2] + squares[6])) + ((squares[1] + squares[5]) + (squares[3] + squares[7]));
   }
   workgroupBarrier();
   let mean = sums[0] / ${width}.0;
@@ -163,8 +163,8 @@ ${stageRow ? "    rowBuf[c] = value;\n" : ""}    total += value;
   if (local.x < 16u) { sums[local.x] += sums[local.x + 16u]; squares[local.x] += squares[local.x + 16u]; } workgroupBarrier();
   if (local.x < 8u) { sums[local.x] += sums[local.x + 8u]; squares[local.x] += squares[local.x + 8u]; } workgroupBarrier();
   if (local.x == 0u) {
-    sums[0] = ((sums[0] + sums[4]) + (sums[2] + sums[6])) + ((sums[1] + sums[5]) + (sums[3] + sums[7]));
-    squares[0] = ((squares[0] + squares[4]) + (squares[2] + squares[6])) + ((squares[1] + squares[5]) + (squares[3] + squares[7]));
+    sums[local.x] = ((sums[0] + sums[4]) + (sums[2] + sums[6])) + ((sums[1] + sums[5]) + (sums[3] + sums[7]));
+    squares[local.x] = ((squares[0] + squares[4]) + (squares[2] + squares[6])) + ((squares[1] + squares[5]) + (squares[3] + squares[7]));
   }
   workgroupBarrier();
   let mean = sums[0] / ${channels}.0;
@@ -208,8 +208,8 @@ ${stageRow ? "    rowBuf[c] = value;\n" : ""}    total += value;
   if (local.x < 16u) { sums[local.x] += sums[local.x + 16u]; squares[local.x] += squares[local.x + 16u]; } workgroupBarrier();
   if (local.x < 8u) { sums[local.x] += sums[local.x + 8u]; squares[local.x] += squares[local.x + 8u]; } workgroupBarrier();
   if (local.x == 0u) {
-    sums[0] = ((sums[0] + sums[4]) + (sums[2] + sums[6])) + ((sums[1] + sums[5]) + (sums[3] + sums[7]));
-    squares[0] = ((squares[0] + squares[4]) + (squares[2] + squares[6])) + ((squares[1] + squares[5]) + (squares[3] + squares[7]));
+    sums[local.x] = ((sums[0] + sums[4]) + (sums[2] + sums[6])) + ((sums[1] + sums[5]) + (sums[3] + sums[7]));
+    squares[local.x] = ((squares[0] + squares[4]) + (squares[2] + squares[6])) + ((squares[1] + squares[5]) + (squares[3] + squares[7]));
   }
   workgroupBarrier();
   let mean = sums[0] / ${channels}.0;
@@ -296,8 +296,8 @@ ${stageRow ? "    rowBuf[c] = value;\n" : ""}    total += value;
   if (local.x < 16u) { sums[local.x] += sums[local.x + 16u]; squares[local.x] += squares[local.x + 16u]; } workgroupBarrier();
   if (local.x < 8u) { sums[local.x] += sums[local.x + 8u]; squares[local.x] += squares[local.x + 8u]; } workgroupBarrier();
   if (local.x == 0u) {
-    sums[0] = ((sums[0] + sums[4]) + (sums[2] + sums[6])) + ((sums[1] + sums[5]) + (sums[3] + sums[7]));
-    squares[0] = ((squares[0] + squares[4]) + (squares[2] + squares[6])) + ((squares[1] + squares[5]) + (squares[3] + squares[7]));
+    sums[local.x] = ((sums[0] + sums[4]) + (sums[2] + sums[6])) + ((sums[1] + sums[5]) + (sums[3] + sums[7]));
+    squares[local.x] = ((squares[0] + squares[4]) + (squares[2] + squares[6])) + ((squares[1] + squares[5]) + (squares[3] + squares[7]));
   }
   workgroupBarrier();
   let mean = sums[0] / ${channels}.0;
@@ -462,7 +462,7 @@ ${Number.isInteger(vecDim) ? Array.from({ length: vecDim }, (_, v) => {
     if (lane == 0u) {
       let m0 = max(max(reduce[0], reduce[4]), max(reduce[1], reduce[5]));
       let m1 = max(max(reduce[2], reduce[6]), max(reduce[3], reduce[7]));
-      reduce[0] = max(m0, m1);
+      reduce[lane] = max(m0, m1);
     }
     workgroupBarrier();
     let block_max = reduce[0];
@@ -477,7 +477,7 @@ ${Number.isInteger(vecDim) ? Array.from({ length: vecDim }, (_, v) => {
     if (lane < 16u) { reduce[lane] += reduce[lane + 16u]; } workgroupBarrier();
     if (lane < 8u) { reduce[lane] += reduce[lane + 8u]; } workgroupBarrier();
     if (lane == 0u) {
-      reduce[0] = ((reduce[0] + reduce[4]) + (reduce[2] + reduce[6]))
+      reduce[lane] = ((reduce[0] + reduce[4]) + (reduce[2] + reduce[6]))
                 + ((reduce[1] + reduce[5]) + (reduce[3] + reduce[7]));
     }
     workgroupBarrier();

@@ -9,6 +9,8 @@
  * Every kernel that folds its workgroup index (`wid.x + wid.y * 65535u`) guards it against the real count before
  * touching a buffer (AGENTS.md).
  */
+import { f16WidthBitcastAvailable } from "../runtime/device-profile.js";
+import { withoutF16WidthBitcasts } from "../runtime/wgsl-compat.js";
 
 const MAX_X = 65535;
 const STORAGE = 0x80;
@@ -2534,7 +2536,10 @@ export class Rfd4pEngine {
   async pipeline(key, source) {
     let p = this.pipelines.get(key);
     if (!p) {
-      const code = applySubgroupMode(source, this.subgroups);
+      // (and the f16 width bitcasts by their builtins where the compiler refuses them - Firefox's:
+      // webgpu/runtime/wgsl-compat.js)
+      const subgrouped = applySubgroupMode(source, this.subgroups);
+      const code = f16WidthBitcastAvailable(this.device) ? subgrouped : withoutF16WidthBitcasts(subgrouped);
       p = this.device.createComputePipelineAsync({
         label: `rfd4p.${key}`,
         layout: 'auto',

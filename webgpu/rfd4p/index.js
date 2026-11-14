@@ -8,6 +8,7 @@
  * `../shared/rfd4p/...`. See docs/DESIGN.md.
  */
 
+import { recordCompilerSupport } from "../runtime/wgsl-compat.js";
 import {
   ALLOWED_RESIDUE_TYPES,
   ATOM37_NAMES,
@@ -154,6 +155,7 @@ export async function requestWebGpuDevice() {
     'chromium-experimental-subgroup-matrix',
   ].filter((f) => adapter.features?.has(f));
   const device = await adapter.requestDevice({ requiredLimits, requiredFeatures });
+  await recordCompilerSupport(device);   // what its WGSL compiler takes: webgpu/runtime/wgsl-compat.js
   if (!device.adapterInfo && adapter.info) device.adapterInfo = adapter.info;
   return { adapter, device };
 }

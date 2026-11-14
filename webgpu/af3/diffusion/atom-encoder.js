@@ -1334,13 +1334,9 @@ ${keyMasked
   workgroupBarrier();
   if (local < 8u) { reduce[local] = max(reduce[local], reduce[local + 8u]); }
   workgroupBarrier();
-  if (local == 0u) {
-    let m0 = max(max(reduce[0], reduce[4]), max(reduce[2], reduce[6]));
-    let m1 = max(max(reduce[1], reduce[5]), max(reduce[3], reduce[7]));
-    reduce[0] = max(m0, m1);
-  }
-  workgroupBarrier();
-  let largest = reduce[0];
+  let m0 = max(max(reduce[0], reduce[4]), max(reduce[2], reduce[6]));
+  let m1 = max(max(reduce[1], reduce[5]), max(reduce[3], reduce[7]));
+  let largest = max(m0, m1);
   workgroupBarrier();
 
 ${keys === 128

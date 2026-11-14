@@ -857,7 +857,6 @@ const GRID_WIDTH: u32 = 32768u;
 @group(0) @binding(2) var<uniform> parameters: NormalizeParameters;
 @group(0) @binding(3) var<storage, read_write> output: array<f32>;
 var<workgroup> partial: array<f32, 64>;
-var<workgroup> row_stat: array<f32, 1>;
 
 @compute @workgroup_size(64)
 fn main(
@@ -894,13 +893,12 @@ fn main(
   workgroupBarrier();
   if (lane < 8u) { partial[lane] += partial[lane + 8u]; }
   workgroupBarrier();
-  if (lane == 0u) {
-    let total = ((partial[0] + partial[4]) + (partial[2] + partial[6]))
-      + ((partial[1] + partial[5]) + (partial[3] + partial[7]));
-    row_stat[0] = total / f32(n_ch);
-  }
+  // (every lane folds the eight partials itself: one lane storing the row's statistic for the rest to read is
+  // the shape Firefox gets wrong - tools/gpu/probe-barrier-visibility.js)
+  let total = ((partial[0] + partial[4]) + (partial[2] + partial[6]))
+    + ((partial[1] + partial[5]) + (partial[3] + partial[7]));
+  let mean = total / f32(n_ch);
   workgroupBarrier();
-  let mean = row_stat[0];
 
   var sum_squared = 0.0;
   if (n_ch <= 256u) {
@@ -922,13 +920,9 @@ fn main(
   workgroupBarrier();
   if (lane < 8u) { partial[lane] += partial[lane + 8u]; }
   workgroupBarrier();
-  if (lane == 0u) {
-    let total_sq = ((partial[0] + partial[4]) + (partial[2] + partial[6]))
-      + ((partial[1] + partial[5]) + (partial[3] + partial[7]));
-    row_stat[0] = inverseSqrt(total_sq / f32(n_ch) + parameters.epsilon);
-  }
-  workgroupBarrier();
-  let inverse_std = row_stat[0];
+  let total_sq = ((partial[0] + partial[4]) + (partial[2] + partial[6]))
+    + ((partial[1] + partial[5]) + (partial[3] + partial[7]));
+  let inverse_std = inverseSqrt(total_sq / f32(n_ch) + parameters.epsilon);
   if (n_ch <= 256u) {
     if (lane < n_ch) {
       output[base + lane] = (x0 - mean) * inverse_std

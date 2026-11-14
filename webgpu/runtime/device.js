@@ -13,6 +13,7 @@
  */
 import { budgetForDevice, setMemoryBudget } from "./device-memory.js";
 import { recordAdapter, deviceTuning, deviceDerivationsAllowed } from "./device-profile.js";
+import { recordCompilerSupport } from "./wgsl-compat.js";
 import { measureDeviceOccupancy } from "./occupancy.js";
 
 const RAISED_LIMITS = [
@@ -108,8 +109,11 @@ export async function requestAlphaFoldDevice(adapter, options = {}) {
     "subgroups", "subgroup-size-control", "timestamp-query", "shader-f16",
     "chromium-experimental-subgroup-matrix",
   ];
+  // `withholdFeatures`: answer as a browser that does not offer these (Firefox has no `subgroups`), so the kernels
+  // such a browser selects can be run and checked in this one.
+  const withheld = new Set(options.withholdFeatures ?? []);
   const requiredFeatures = optional.filter(
-    (feature) => adapter.features.has(feature),
+    (feature) => adapter.features.has(feature) && !withheld.has(feature),
   );
   const requiredLimits = {};
   // `portableLimits` caps what is asked for at PORTABLE_CEILINGS, so this
@@ -133,6 +137,8 @@ export async function requestAlphaFoldDevice(adapter, options = {}) {
   // the identity is recorded here - the one place both are in scope - and
   // webgpu/runtime/device-profile.js is where a selection function asks for it.
   recordAdapter(device, adapter);
+  // ...and what its WGSL compiler takes, which no feature states (webgpu/runtime/wgsl-compat.js)
+  await recordCompilerSupport(device);
   // 🔴 A DEVICE THAT ACCEPTS AN ALLOCATION IT CANNOT AFFORD FREEZES THE MACHINE.
   // Metal takes buffers well past the point where macOS starts paging, and a
   // phone's driver takes them and is then killed by the system - in neither
