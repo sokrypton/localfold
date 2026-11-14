@@ -269,7 +269,7 @@ export class Esmfold2TrunkGpu {
     const trackKey = `${base}:${stagedPrecision}:${weightPrecision}:${accumulatePrecision}:${transitionFactor}:`
       + `seq${sequentialTriangle}:${sequentialGroups}:${sequentialChunkBytes ?? ""}:${sequentialHiddenParts ?? ""}:${sequentialContractWork ?? ""}:`
       + `fc${options.forceCompact === true}:`
-      + `${triangleContractArithmetic}:${JSON.stringify(pairTransitionSplit)}:${JSON.stringify(triangleProjectMatrix)}:`
+      + `${triangleContractArithmetic}:${tuning.triangleContractLanes ?? ""}:${JSON.stringify(pairTransitionSplit)}:${JSON.stringify(triangleProjectMatrix)}:`
       + `${JSON.stringify(tuning.trianglePairProjectTile)}:${tuning.triangleProjectOutColumns ?? ""}:${tuning.pairTransitionChunkBytes ?? ""}`;
     if (!this.compiledTracks.has(trackKey)) {
       this.compiledTracks.set(trackKey, (async () => {
@@ -287,6 +287,7 @@ export class Esmfold2TrunkGpu {
           // ...and the triangle's contraction in f16 arithmetic where this trunk stages and accumulates in f16, as AF3's
           // pair track (webgpu/kernels/triangle/shaders.js; raced on an Apple GPU: grid-attend-race.js)
           triangleContractArithmetic,
+          triangleContractLanes: tuning.triangleContractLanes,
           triangleProjectMatrix,
           sequentialTriangle, sequentialGroups, sequentialChunkBytes, sequentialHiddenParts, sequentialContractWork,
           maxBufferSize: this.device.limits.maxBufferSize,

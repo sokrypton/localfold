@@ -209,7 +209,9 @@ export class Af3MsaStackGpu {
       // webgpu/kernels/triangle/shaders.js); `triangleContractArithmetic: "f32"` is the control arm
       triangleContractArithmetic: pairMatrixKernels && halfPrecisionAvailable(this.device)
         && (deviceTuning(this.device).triangleContractArithmetic ?? "f16") === "f16" ? "f16" : "f32",
+      triangleContractLanes: deviceTuning(this.device).triangleContractLanes,
       gridProjectArithmetic: deviceTuning(this.device).gridProjectArithmetic,
+      gridProjectOutVector: deviceTuning(this.device).gridProjectOutVector,
       // ...and a large pair a piece at a time, as in the pairformer
       sequentialTriangle: options.sequentialTriangle ?? deviceTuning(this.device).sequentialTriangle ?? true,
       sequentialGroups: options.sequentialGroups,
@@ -274,9 +276,12 @@ export class Af3MsaStackGpu {
     // flags, 300 tokens x 1024 rows: see the commit that made it. `opmVectorArithmetic: "f32"` is the control.
     const opmArithmetic = pairMatrixKernels && halfPrecisionAvailable(this.device)
       && opmTuning.opmVectorArithmetic !== "f32" ? "f16" : "f32";
-    const opmBlock = vectorGemmBlock(this.device, opmArithmetic, () => true);
+    const opmBlock = vectorGemmBlock(this.device, opmArithmetic, () => true, "Contract");
     const opmOutBlock = vectorGemmBlock(this.device, opmArithmetic,
-      ({ columns, inner }) => pairChannels % columns === 0 && (outerChannels * outerChannels) % inner === 0);
+      // (the output kernel takes the block's columns and depth alone - its rows are 64 on 256 lanes, 64 columns a
+      // vec4 of a lane's - so a block narrower than that is not one it has)
+      ({ columns, inner }) => columns % 64 === 0 && pairChannels % columns === 0
+        && (outerChannels * outerChannels) % inner === 0);
     pipelines.opmVecBlock = opmBlock;
     pipelines.opmVecOutColumns = opmOutBlock.columns;
     if (useOpmVector) {

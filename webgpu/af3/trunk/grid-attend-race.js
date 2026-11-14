@@ -19,6 +19,20 @@
  * which was measured on the M5 alone: 0.69 against 0.51 ms at 256 tokens and 32 channels there, relRMS 6.5e-4. The
  * races take ~0.4 s on the M5, once a browser (their arms compiled at once, their noise shared and periodic).
  *
+ * 🔴 AND AF2's DENSE f16 TILES (`linearHalfTile`, `attentionOutputHalfTile`, `attentionProjectHalfTile`), WHICH THE
+ * metal-3 PRIOR PINNED AT THE M5's 256-THREAD ANSWER AND THE M2 LOSES 1.45-1.7x ON (webgpu/runtime/device-profile.js
+ * has both tables). One race stands for the three, since they are one kernel shape and split the two parts the same
+ * way: the transition's second projection (8192 rows, 1024 -> 256, f16 arithmetic and weights), the default 8x8x4x4
+ * tile against 16x16x4x8. The wide tiles are set only where they win by RACE_MARGIN; otherwise the knobs stay null,
+ * which is the default tile. A tile reorders no sum, so the two arms must agree exactly (the bound is 1e-3).
+ * 🔴 AND THE TRIANGLE'S PROJECTION TILE (`trianglePairProjectTile`) TAKES THE SAME ANSWER BY PROXY, NOT BY ITS OWN
+ * RACE: it is the same question (a 256-thread workgroup of register accumulators) and the two parts split on it the
+ * same way - the M5 gains 1.3% of an AF2 block with 64x32 in a 16x16 workgroup, the M2 loses 5% (its output kernel
+ * 2x). The wide answer sets the M5's tile and the narrow one 32x32, which both parts and ampere hold.
+ * 🔴 AND THE VECTOR GEMM'S BLOCK (`vectorGemmBlock`) BY THE SAME PROXY - a lane's register tile again, 4x8 against
+ * 4x4. Measured on both parts, an AF3 trunk pass at 255 tokens: the M5 2341 ms with its 64x128x32 against 2410 with the
+ * default 64x64x16; the M2 5261 against 4964, the other way. The narrow answer leaves it null (the default).
+ *
  * 🔴 AWAITED BY THE COMPILE, NOT THE DEVICE. The knob is read when a stack builds its pipelines, so a race still
  * running then would leave it unset for the fold that most wants it; a stack's compile is seconds of driver work, and
  * this is two pipelines and a few dispatches beside it. One race a device - the promise is shared - and only where
@@ -33,10 +47,12 @@
 import { createGridAttentionShaders, packGridAttentionWeights } from "./grid-attention.js";
 import { createTriangleShaders } from "../../kernels/triangle/shaders.js";
 import { createAttentionRegisterFlashShader } from "../../kernels/attention.js";
+import { createLinearShader, LINEAR_TILE } from "../../kernels/transition.js";
 import { deviceProfile, halfPrecisionAvailable, setDeviceTuning } from "../../runtime/device-profile.js";
+import { float32ToFloat16Array } from "../../../shared/weights/float16.js";
 
 const RACES = new WeakMap();
-const MEMORY = "localfold.gridAttendRace.v4";
+const MEMORY = "localfold.gridAttendRace.v5";
 const DETAIL = new WeakMap();
 const N = 256;
 const CHANNELS = 128;
@@ -63,6 +79,35 @@ function projectAnswer(device, half) {
 function groupAnswer(device, group) {
   return deviceProfile(device).tuning.attentionGroup === null ? { attentionGroup: group } : {};
 }
+// the M5's 256-thread f16 tiles for AF2's dense projections (7bb3fe2f); an M2 keeps the default 64-thread ones
+const WIDE_HALF_TILES = Object.freeze({
+  linearHalfTile: "16x16x4x8", attentionOutputHalfTile: "16x16x4x8", attentionProjectHalfTile: "16x16x4x2",
+});
+// ...and the triangle's projection tile, the same 256-thread question (a6b916c8): the M5's, and the 32x32 an M2 holds
+const TRIANGLE_TILES = Object.freeze({
+  wide: Object.freeze({ rows: 64, columns: 32, outColumns: 64, workgroup: 16 }),
+  narrow: Object.freeze({ rows: 32, columns: 32 }),
+});
+// ...and the vector GEMM's block (the split pair transition's and the outer product mean's): the M5's wider lane
+// tiles; an M2 keeps the default 64x64x16 in both arithmetics
+const WIDE_VECTOR_GEMM_BLOCK = Object.freeze({ f32: "128x128x8", f16: "64x128x32" });
+/** ...and the 256-thread f16 tiles: the wide ones where they won, each only where nothing named it. */
+// ...and where the 256-thread tiles lost, the f16 vector GEMM on 64 lanes (the fourth number: a lane grid 8 a side).
+// M2, AF3 trunk at 255 tokens, twice: pair-transition.wide 602 -> 455 ms and .down 345 -> 255, the trunk's GPU time
+// -5%; 32x128, 64x64 and 64x128 on 64 lanes, and 32x64x16, all lose to it (docs/M2-TO-M5.md, 3D-3).
+// ...and the outer product mean's contraction on a narrower block again: AF2 block at 255 residues x 128 rows,
+// opm.contract 12.9 -> 10.4 ms at 32x32 (and the output kernel 13.0 -> 9.5 at 32x64, 10.1 at 32x32); AF3's 52 -> 42.
+const NARROW_VECTOR_GEMM_BLOCK = Object.freeze({ f16: "32x64x8x8", f16Contract: "32x32x8x8" });
+function tilesAnswer(device, wide) {
+  const tuning = deviceProfile(device).tuning;
+  const answer = { ...(wide ? WIDE_HALF_TILES : {}),
+                   vectorGemmBlock: wide ? WIDE_VECTOR_GEMM_BLOCK : NARROW_VECTOR_GEMM_BLOCK,
+                   trianglePairProjectTile: wide ? TRIANGLE_TILES.wide : TRIANGLE_TILES.narrow,
+                   // ...and the f16 contraction's lanes: 8 a side where the 256-thread tile lost, and where it won only
+                   // at a length the smaller tile pads less (tools/gpu/probe-contract-lanes.js, both parts)
+                   triangleContractLanes: wide ? "fit" : 8 };
+  return Object.fromEntries(Object.entries(answer).filter(([knob]) => tuning[knob] === null));
+}
 /** ...and the triangle contraction's, the same way. */
 function contractAnswer(device, half) {
   return deviceProfile(device).tuning.triangleContractArithmetic === null
@@ -81,14 +126,14 @@ function remembered(device) {
     const stored = JSON.parse(globalThis.localStorage?.getItem(MEMORY) ?? "null");
     return stored !== null && stored.machine === machine(device) && typeof stored.tiled === "boolean"
       && typeof stored.projectHalf === "boolean" && typeof stored.contractHalf === "boolean"
-      && typeof stored.group === "number" ? stored : undefined;
+      && typeof stored.group === "number" && typeof stored.wideTiles === "boolean" ? stored : undefined;
   } catch { return undefined; }
 }
 
-function remember(device, tiled, projectHalf, contractHalf, group) {
+function remember(device, tiled, projectHalf, contractHalf, group, wideTiles) {
   try {
     globalThis.localStorage?.setItem(MEMORY,
-      JSON.stringify({ machine: machine(device), tiled, projectHalf, contractHalf, group }));
+      JSON.stringify({ machine: machine(device), tiled, projectHalf, contractHalf, group, wideTiles }));
   }
   catch { /* a race next visit, as before */ }
 }
@@ -106,17 +151,18 @@ export function settleGridAttendTiling(device) {
   const known = remembered(device);
   if (known !== undefined) {
     DETAIL.set(device, { tiled: known.tiled, projectHalf: known.projectHalf, contractHalf: known.contractHalf,
-                         group: known.group, remembered: true });
+                         group: known.group, wideTiles: known.wideTiles, remembered: true });
     setDeviceTuning(device, { gridAttendTiled: known.tiled, gridAttendTiledHalf: known.tiled,
                               ...projectAnswer(device, known.projectHalf), ...contractAnswer(device, known.contractHalf),
-                              ...groupAnswer(device, known.group) });
+                              ...groupAnswer(device, known.group), ...tilesAnswer(device, known.wideTiles) });
     RACES.set(device, Promise.resolve());
     return RACES.get(device);
   }
   const promise = race(device).catch((error) => {
     DETAIL.set(device, { error: String(error?.message ?? error) });
     // ...and a race that failed leaves the projection where every Apple part is safe: f32 (the M2 loses with f16)
-    setDeviceTuning(device, { ...projectAnswer(device, false), ...contractAnswer(device, false), ...groupAnswer(device, 1) });
+    setDeviceTuning(device, { ...projectAnswer(device, false), ...contractAnswer(device, false), ...groupAnswer(device, 1),
+                              ...tilesAnswer(device, false) });
   });
   RACES.set(device, promise);
   return promise;
@@ -350,6 +396,45 @@ async function raceGroup(device, buffers, prepared, shared) {
   return { g1Ms: Number(g1Ms.toFixed(3)), g4Ms: Number(g4Ms.toFixed(3)), relRms: Number(relRms.toExponential(2)), group };
 }
 
+// AF2's MSA transition, second projection: 128 rows x 64 residues, 1024 -> 256 (the shared noise is exactly this long)
+const LINEAR_SHAPE = { rows: 8192, inner: 1024, columns: 256 };
+/** The dense f16 projection's two arms compiled: the default tile, then the wide one. */
+function prepareLinear(device) {
+  const wide = { lanesX: 16, lanesY: 16, rowsPerLane: 4, columnsPerLane: 8 };
+  return Promise.all([LINEAR_TILE, wide].map(async (tile) => {
+    const pipeline = await device.createComputePipelineAsync({
+      label: `linear-tile-race.${tile.lanesX}x${tile.lanesY}x${tile.rowsPerLane}x${tile.columnsPerLane}`, layout: "auto",
+      compute: { module: device.createShaderModule({ code: createLinearShader(tile, false, "f16", "f16") }),
+                 entryPoint: "main" },
+    });
+    return { pipeline, times: [],
+             groups: [Math.ceil(LINEAR_SHAPE.columns / (tile.lanesX * tile.columnsPerLane)),
+                      Math.ceil(LINEAR_SHAPE.rows / (tile.lanesY * tile.rowsPerLane))] };
+  }));
+}
+
+/** The dense f16 projection, default tile against wide: { narrowMs, wideMs, relRms, wide }. */
+async function raceLinear(device, buffers, prepared, shared) {
+  const { rows, inner, columns } = LINEAR_SHAPE;
+  const arms = await prepared;
+  // [weight | bias] in halves, a trained layer's scale; the source is the shared noise, read as f32
+  const weights = shared.upload(float32ToFloat16Array(noise(inner * columns + columns, 7, 0.1)));
+  const parameters = shared.upload(new Uint32Array([rows, inner, columns, 0, inner * columns, 0, 0, 0]),
+    GPUBufferUsage.UNIFORM);
+  for (const arm of arms) {
+    arm.output = outputBuffer(device, buffers, rows * columns);
+    arm.bind = device.createBindGroup({
+      layout: arm.pipeline.getBindGroupLayout(0),
+      entries: [{ buffer: shared.noise[0], size: rows * inner * 4 }, { buffer: weights }, { buffer: parameters },
+                { buffer: arm.output }].map((resource, binding) => ({ binding, resource })),
+    });
+  }
+  const [narrowMs, wideMs, relRms] = await measure(device, arms, buffers, "linear-tile-race", (arm) => arm.output);
+  const wide = Number.isFinite(relRms) && relRms < 1e-3 && wideMs < narrowMs * RACE_MARGIN;
+  return { narrowMs: Number(narrowMs.toFixed(3)), wideMs: Number(wideMs.toFixed(3)),
+           relRms: Number(relRms.toExponential(2)), wide };
+}
+
 async function race(device) {
   const width = HEADS * DIMENSION;
   const pairs = N * N;
@@ -370,7 +455,7 @@ async function race(device) {
   // drawing its own ~30 M floats in JavaScript, the four took 0.75 s on the M5
   const wantsGroup = deviceProfile(device).tuning.attentionGroup === null;
   const preparing = { project: prepareProject(device), contract: prepareContract(device),
-                      group: wantsGroup ? prepareGroup(device) : null };
+                      group: wantsGroup ? prepareGroup(device) : null, linear: prepareLinear(device) };
   const arms = await Promise.all([false, true].map(async (tiled) => {
     const { attend, tiles } = shaders(tiled);
     const pipeline = await device.createComputePipelineAsync({
@@ -448,17 +533,20 @@ async function race(device) {
     const contract = await raceContract(device, buffers, preparing.contract, shared);
     // ...and AF2's flash attention's rescale group, only where the prior left it to the device
     const group = wantsGroup ? await raceGroup(device, buffers, preparing.group, shared) : null;
+    // ...and AF2's dense f16 tiles, which the two Apple parts also split on
+    const linear = await raceLinear(device, buffers, preparing.linear, shared);
     DETAIL.set(device, { tokens: N, untiledMs: Number(untiled.toFixed(3)), tiledHalfMs: Number(tiled.toFixed(3)),
                          relRms: Number(relRms.toExponential(2)), tiled: take,
                          samplesMs: arms.map((arm) => arm.times.map((t) => Number(t.toFixed(2)))), project, contract,
-                         group });
+                         group, linear });
     // 🔴 BOTH WAYS, so the knob is answered and no second stack races again
     // (each answer only where nothing named it while the race ran - a race now starts with the page's device)
     const unnamed = deviceProfile(device).tuning.gridAttendTiled === null && deviceProfile(device).tuning.gridAttendTiledHalf === null;
     setDeviceTuning(device, { ...(unnamed ? { gridAttendTiled: take, gridAttendTiledHalf: take } : {}),
                               ...projectAnswer(device, project.half),
-                              ...contractAnswer(device, contract.half), ...groupAnswer(device, group?.group ?? 1) });
-    remember(device, take, project.half, contract.half, group?.group ?? 1);
+                              ...contractAnswer(device, contract.half), ...groupAnswer(device, group?.group ?? 1),
+                              ...tilesAnswer(device, linear.wide) });
+    remember(device, take, project.half, contract.half, group?.group ?? 1, linear.wide);
   } finally {
     for (const buffer of buffers) buffer.destroy();
   }

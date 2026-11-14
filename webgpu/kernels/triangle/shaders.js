@@ -139,6 +139,17 @@ export function tileThatFits(candidates, bytesFor, limitBytes) {
   return candidates[candidates.length - 1];
 }
 
+/**
+ * The f16 contraction's tile for a device's `triangleContractLanes` and this length: 8 lanes a side (a 32 x 32 tile),
+ * 16 (64 x 64, the default), or "fit" - 8 only where the smaller tile's padding saves more than the 13% a cell it
+ * costs an M5 (tools/gpu/probe-contract-lanes.js: 2.45 against 2.77 TFLOP/s at 256 tokens, where neither pads).
+ */
+export function f16ContractTile(lanesKnob, length) {
+  const padded = (tile) => (Math.ceil(length / tile) * tile) ** 2;
+  const lanes = lanesKnob === 8 || (lanesKnob === "fit" && padded(32) * 1.13 < padded(64)) ? 8 : 16;
+  return { rows: 32, columns: 32, arithmetic: "f16", ...(lanes === 16 ? {} : { lanes }) };
+}
+
 export function createTriangleShaders(
   shape,
   precision,
@@ -785,7 +796,13 @@ ${contractStores}
   // template fold came back NaN (test:template). A value under 1e-3 goes subnormal, which a sum of ~0.1-sized terms
   // does not see.
   let contractF16;
+  // 🔴 AND ON 8 x 8 LANES WHERE THE CALLER ASKS (contractTile.lanes 8): a 32 x 32 tile, 8 k a step. The 256-lane tile
+  // is the M5's; an M2 runs the 64-lane one 1.14x faster at 256 tokens and 1.3x at 200 (tools/gpu/
+  // probe-contract-lanes.js: 3.375 -> 2.95 ms and 2.83 -> 2.15 at 128 channels), and the M5 itself takes it where the
+  // smaller tile pads less (200 tokens: 1.23 -> 1.10 ms; 256: 1.55 -> 1.75, so not there). See f16ContractTile.
+  const LN = contractTile.lanes ?? 16;
   if (contractTile.arithmetic === "f16") {
+    if (LN !== 8 && LN !== 16) throw new RangeError(`the f16 contraction runs on 8 or 16 lanes a side; got ${LN}`);
     const kContiguous = direction === "outgoing";
     const lane = kContiguous ? "local.y" : "local.x";
     const kLane = kContiguous ? "local.x" : "local.y";
@@ -809,24 +826,24 @@ ${contractStores}
           if (${pfx}_r2 < L) { staged.z = f16(${load(`${pfx}_r2`)} * 0.0625); }
         }
       }
-      ${tile}[${kLane} * 17u + ${lane}] = staged;
+      ${tile}[${kLane} * ${LN + 1}u + ${lane}] = staged;
     }`;
-    const f16Inner = Array.from({ length: 16 }, (_, k) => `    {
-      let left = tile_a[${k * 17}u + local.y];
-      let right = tile_b[${k * 17}u + local.x];
+    const f16Inner = Array.from({ length: LN }, (_, k) => `    {
+      let left = tile_a[${k * (LN + 1)}u + local.y];
+      let right = tile_b[${k * (LN + 1)}u + local.x];
       part_0 = fma(vec4<f16>(left.x), right, part_0);
       part_1 = fma(vec4<f16>(left.y), right, part_1);
       part_2 = fma(vec4<f16>(left.z), right, part_2);
       part_3 = fma(vec4<f16>(left.w), right, part_3);
     }`).join("\n");
     const f16Stores = [0, 1, 2, 3].map((r) => `  {
-    let i = i0 + local.y + ${r * 16}u;
+    let i = i0 + local.y + ${r * LN}u;
     if (i < L) {
       let row_base = ${channelChunked ? "(chunk.x + h)" : "h"} * PAIRS + i * L + j0 + local.x;
       if (j0 + local.x < L) { output[row_base] = sum_${r}.x * 256.0; }
-      if (j0 + local.x + 16u < L) { output[row_base + 16u] = sum_${r}.y * 256.0; }
-      if (j0 + local.x + 32u < L) { output[row_base + 32u] = sum_${r}.z * 256.0; }
-      if (j0 + local.x + 48u < L) { output[row_base + 48u] = sum_${r}.w * 256.0; }
+      if (j0 + local.x + ${LN}u < L) { output[row_base + ${LN}u] = sum_${r}.y * 256.0; }
+      if (j0 + local.x + ${2 * LN}u < L) { output[row_base + ${2 * LN}u] = sum_${r}.z * 256.0; }
+      if (j0 + local.x + ${3 * LN}u < L) { output[row_base + ${3 * LN}u] = sum_${r}.w * 256.0; }
     }
   }`).join("\n");
     contractF16 = `${common.startsWith("enable f16;") ? "" : "enable f16;\n"}${common}
@@ -835,33 +852,33 @@ ${contractStores}
 @group(0) @binding(2) var<storage, read_write> output: array<f32>;
 ${channelChunked ? "@group(0) @binding(3) var<uniform> chunk: vec4<u32>;" : ""}
 
-// [k][lane]: a's four rows a lane owns (lane + 16 r), and b's four columns (stride 17 avoids 16-way bank conflicts)
-var<workgroup> tile_a: array<vec4<f16>, 272>;
-var<workgroup> tile_b: array<vec4<f16>, 272>;
+// [k][lane]: a's four rows a lane owns (lane + LN r), and b's four columns (stride LN + 1 avoids bank conflicts)
+var<workgroup> tile_a: array<vec4<f16>, ${LN * (LN + 1)}>;
+var<workgroup> tile_b: array<vec4<f16>, ${LN * (LN + 1)}>;
 
-@compute @workgroup_size(16, 16, 1)
+@compute @workgroup_size(${LN}, ${LN}, 1)
 fn main(
   @builtin(local_invocation_id) local: vec3<u32>,
   @builtin(workgroup_id) group: vec3<u32>,
 ) {
-  let i0 = group.y * 64u;
-  let j0 = group.x * 64u;
+  let i0 = group.y * ${4 * LN}u;
+  let j0 = group.x * ${4 * LN}u;
   let h = group.z${rowChunked ? " + chunk.z" : ""};
   let a_r0 = i0 + ${lane};
-  let a_r1 = a_r0 + 16u;
-  let a_r2 = a_r0 + 32u;
-  let a_r3 = a_r0 + 48u;
+  let a_r1 = a_r0 + ${LN}u;
+  let a_r2 = a_r0 + ${2 * LN}u;
+  let a_r3 = a_r0 + ${3 * LN}u;
   let a_full = a_r3 < L;
   let b_r0 = j0 + ${lane};
-  let b_r1 = b_r0 + 16u;
-  let b_r2 = b_r0 + 32u;
-  let b_r3 = b_r0 + 48u;
+  let b_r1 = b_r0 + ${LN}u;
+  let b_r2 = b_r0 + ${2 * LN}u;
+  let b_r3 = b_r0 + ${3 * LN}u;
   let b_full = b_r3 < L;
   var sum_0 = vec4<f32>(0.0);
   var sum_1 = vec4<f32>(0.0);
   var sum_2 = vec4<f32>(0.0);
   var sum_3 = vec4<f32>(0.0);
-  for (var k0 = 0u; k0 < L; k0 += 16u) {
+  for (var k0 = 0u; k0 < L; k0 += ${LN}u) {
     ${stage("tile_a", loadOf("a"), "a")}
     ${stage("tile_b", loadOf("b"), "b")}
     workgroupBarrier();
@@ -1077,7 +1094,8 @@ ${outStores}
            projectAB, contract: contractF16 ?? contract, normalizeHidden, projectOutput,
            projectTile: { ...projectTile },
            // ...the f16 contraction's tile is its own, whatever the 8 x 8 kernel's was
-           contractTile: contractF16 === undefined ? { ...contractTile } : { rows: 64, columns: 64, arithmetic: "f16" },
+           contractTile: contractF16 === undefined ? { ...contractTile }
+             : { rows: 4 * LN, columns: 4 * LN, arithmetic: "f16", ...(LN === 16 ? {} : { lanes: LN }) },
            // ...the width the two projections fold their row tile at, so a
            // caller splits at the number the kernel was GENERATED with rather
            // than at a constant of its own that happens to match.

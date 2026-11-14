@@ -19,7 +19,7 @@
  * deltas against a common input to be summed at the end. Batching them that way
  * is a natural-looking optimisation and a different function.
  */
-import { LINEAR_GRID_WIDTH, PROJECT_TILE as PROJECT_TILE_DEFAULT, createTriangleShaders }
+import { LINEAR_GRID_WIDTH, PROJECT_TILE as PROJECT_TILE_DEFAULT, createTriangleShaders, f16ContractTile }
   from "../../kernels/triangle/shaders.js";
 import { packWeights as packTriangleWeights } from "../../kernels/triangle/weights.js";
 import { af3TriangleWeights } from "./triangle.js";
@@ -416,7 +416,8 @@ export async function compilePairTrack(cache, options) {
       // 🔴 THE CONTRACTION IN f16 ARITHMETIC where the caller asks (an AF3-lineage stack whose f16 policy is on, on a
       // device with shader-f16): see the f16 kernel in webgpu/kernels/triangle/shaders.js. undefined keeps the 8 x 8
       // f32 kernel.
-      options.triangleContractArithmetic === "f16" ? { rows: 32, columns: 32, arithmetic: "f16" } : undefined,
+      // ...on the lanes the device asks for (`triangleContractLanes`: an M2 wants 8 a side, an M5 where they pad less)
+      options.triangleContractArithmetic === "f16" ? f16ContractTile(options.triangleContractLanes, n) : undefined,
       // 🔴 THE NORMALISED HIDDEN GOES BACK INTO `a`, WHICH IS DEAD BY THEN.
       // `tri.contract` is the last pass that reads scratch[1] and scratch[2],
       // and it runs before `tri.normalize-hidden` writes one of them - so the
@@ -513,6 +514,7 @@ export async function compilePairTrack(cache, options) {
         // ...the vector projection in f16 arithmetic where this stack stages in f16: 1.5x on an M5 (bench-grid-project.js,
         // 255 tokens, 8 rows: 4.51 -> 3.01 ms). `gridProjectArithmetic: "f32"` (a device knob) is the control.
         projectArithmetic: gridProjectArithmetic,
+        ...(options.gridProjectOutVector ? { projectOutVector: options.gridProjectOutVector } : {}),
         // 🔴 `grid.attend` IS THE LARGEST KERNEL IN THE TRUNK AND THE ONLY
         // CUBIC ONE, which is why the matrix units are pointed at this one
         // first. Off unless the caller asks; the device profile decides, and
@@ -616,7 +618,7 @@ export async function compilePairTrack(cache, options) {
                   // ...and every row tile, which the device's storage limit
                   // now chooses. They are baked into the source AND divide the
                   // dispatch, which is the collision this file records twice.
-                  + `:t${tiles.projectRows}x${tiles.projectOutRows}x${tiles.normalizeRows}`
+                  + `:t${tiles.projectRows}x${tiles.projectOutRows}${tiles.projectOutVector ? "v" : ""}x${tiles.normalizeRows}`
                   // ...and rosettafold3's two biases, which are terms in the
                   // source and `const W_*` lines above it.
                   + `:gb${gridOffsets.gatingQueryBias !== undefined}`

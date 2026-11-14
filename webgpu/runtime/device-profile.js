@@ -468,6 +468,10 @@ export const DEFAULT_TUNING = Object.freeze({
   // 🔴 THE TRIANGLE CONTRACTION'S ARITHMETIC IN AN AF3-LINEAGE PAIR TRACK: null takes f16 where the stack's f16 policy
   // is on and the device has shader-f16 (webgpu/kernels/triangle/shaders.js); "f32" is the control arm.
   triangleContractArithmetic: null,
+  // ...and the f16 contraction's lanes a side: 8 (a 32 x 32 tile on 64 lanes), "fit" (8 only where that pads enough
+  // less to pay, see f16ContractTile in webgpu/kernels/triangle/shaders.js), null or 16 the 64 x 64 tile on 256 lanes.
+  // An Apple GPU's race answers it (grid-attend-race.js): the M2 takes 8, the M5 "fit".
+  triangleContractLanes: null,
   // AF3's MSA stack: the MSA rows one msa.project workgroup normalises and projects; null takes MSA_PROJECT_ROWS
   // (webgpu/af3/trunk/msa-stack.js), 1 the row-a-workgroup kernel - the control.
   msaProjectRows: null,
@@ -490,6 +494,9 @@ export const DEFAULT_TUNING = Object.freeze({
   opmVectorArithmetic: null,
   // ...and AF3's vector grid projection: null is f16 where the pair track stages in f16, "f32" the control.
   gridProjectArithmetic: null,
+  // ...and AF3's grid OUTPUT projection as a register-tiled GEMM: the rows a tile (a multiple of 8; 32 is one lane a
+  // task at 128 channels), null the one-channel-a-lane kernel. See `projectOutVector` in webgpu/af3/trunk/grid-attention.js.
+  gridProjectOutVector: null,
   // ...and the AF3 denoiser's staged token tiles: null is f16 where the device has it, "f32" the control. See
   // `stage16` in webgpu/af3/diffusion/diffusion-transformer.js.
   diffusionStagePrecision: null,
@@ -1217,6 +1224,9 @@ const PRIORS = new Map([
   // outer product mean's contraction is the one kernel whose shape suits them
   // at that size.
   ["metal-3", {
+    // 🔴 THE GRID OUTPUT PROJECTION AS A REGISTER-TILED GEMM, WHICH BOTH PARTS WANT (docs/M2-TO-M5.md, 3D-4): AF3
+    // trunk at 255 tokens, grid.project-out 216 -> 181 ms on an M2 and 133 -> 117 on an M5 (16 rows the same, 64 a loss).
+    gridProjectOutVector: 32,
     // 🔴 THE CAPABILITY LAYER'S ANSWER IS WRONG ON 8x8 UNITS, AND A PRIOR IS
     // WHERE THAT GETS SAID. `matrixCapabilityTuning` turns this on for any
     // device announcing subgroup matrices with an f16 configuration, which is
@@ -1313,8 +1323,13 @@ const PRIORS = new Map([
     // 234-239 ms, tri.project 342-364 -> 335-344, held on the M2: project-out 503 / 776 -> 364 / 624); the 256-thread
     // tile with unrolled register accumulators (a6b916c8) took it further. profile-af2-block.js, 255 x 128, against
     // 32x32: triangle project 2.91 / 2.88 -> 2.51 / 2.51 ms, output 2.07 / 2.02 -> 1.73 / 1.68, the block 89.4 -> 88.2;
-    // 5CAJ's monomer fold 10361 -> 10156 ms warm, the same checksum (the tile reorders no sum). Not measured on an M2.
-    trianglePairProjectTile: { rows: 64, columns: 32, outColumns: 64, workgroup: 16 },
+    // 5CAJ's monomer fold 10361 -> 10156 ms warm, the same checksum (the tile reorders no sum).
+    // 🔴 AND NOT SET, FOR THE REASON THE THREE HALF TILES BELOW ARE NOT: THE M2 LOSES. profile-af2-block.js --sweep on
+    // the M2 (Chrome 157), 256 x 128, two rounds interleaved, this tile against 32x32 against null: the block 169.8 /
+    // 161.4 / 162.2 ms, triangle output 5.81 + 5.95 / 2.93 + 2.95 / 3.31 + 3.33, project 5.16 + 5.20 / 4.17 + 4.21 /
+    // 4.23 + 4.28 (59 x 128: 17.93 / 17.47 / 17.46). grid-attend-race.js answers it with the dense tiles' race: the
+    // M5's tile where the 256-thread arm wins, 32x32 where it does not.
+    trianglePairProjectTile: null,
     // 🔴 NOT TIERED ON APPLE: THE FIRST FOLD RAN EVERY KERNEL WITH OPAQUE LOOP BOUNDS AND PAID MORE THAN THE COMPILE IT
     // SAVED. "tiered" (DEFAULT_TUNING) was measured on NVIDIA, whose driver compile dominates a fresh VM's first fold;
     // Apple's compiles these kernels in a fraction of that, and an opaque bound costs the M5 its unrolling for the whole
@@ -1345,16 +1360,40 @@ const PRIORS = new Map([
     // lane a 4 x 4 tile, five workgroup reads for four vec4 multiply-adds; bench-transition.js, 256 channels at 255
     // tokens, the whole split: 69.5-70.9 ms -> 60.6 at 128 x 128 x 8 in f32 (the same sums in the same k order:
     // check-transition-split.js 4.68e-7 in f32 storage either way), and 42.7 at 64 x 128 x 32 where the stack multiplies
-    // in f16. Not measured on an M2 (docs/M5-HANDOFF.md).
-    vectorGemmBlock: { f32: "128x128x8", f16: "64x128x32" },
+    // in f16.
+    // 🔴 AND NOT SET: THE M2 WANTS THE DEFAULT 64 x 64 x 16 IN BOTH ARITHMETICS, AND THE M5 DOES WANT ITS OWN - measured
+    // on each (2026-11-14, bench-trunk.js --profile, 255 tokens, AF3 int5, the race's other answers named by hand):
+    //   M5   64x128x32 2341 ms a pass (wide 2.46, down 1.37)   64x64x16 2410 (2.61, 1.84)
+    //   M2   64x128x32 5261 (wide 7.46, down 3.94)             64x64x16 4964 (5.80, 3.34)   128x128x8 as f16: 6325
+    // and on the M2, protenix2 at 150 tokens 5160 -> 4866, IntelliFold-2 20870 -> 19874; in f32 arithmetic (protenix2,
+    // `vectorTransitionArithmetic: "f32"`) 128x128x8 6187 / 6249 against 64x64x16 6073 / 6094. AF2's outer product mean
+    // reads the same block (profile-af2-block.js --sweep on the M2): 256 x 128 the block 163.0 -> 155.4 ms (contract
+    // 16.8 -> 13.4, project-output 16.9 -> 12.7), the extra stack at 256 x 1024 321.8 -> 286.1 (contract 139.9 -> 108.0).
+    // So null here, and grid-attend-race.js sets the M5's pair where its 256-thread tile race is won. 🔴 The block's
+    // inner extent groups the f16 partial sums, so the two blocks are NOT bit-identical (the f16 bound, ~1e-3).
+    vectorGemmBlock: null,
     // 🔴 THE f16 VECTOR LINEAR, ATTENTION OUTPUT AND q/k/v/gate PROJECTION TILES AT 256 THREADS, MEASURED ON AN M5 UNDER
     // STOCK FLAGS (7bb3fe2f; under 128 columns they fall back to x4). profile-af2-block.js, 255 x 128: msa-transition
     // 7.17 -> 5.36 ms, pair-transition 3.72 -> 2.85, the attention outputs 2.08 -> 1.54 and 1.13 -> 0.87, the
     // projections 5.14 -> 4.74 and 2.59 -> 2.43; with that commit's OPM staging, the block 110.5 -> 89.4 ms and 5CAJ's
-    // fold 12637 -> 10361 warm, bit-identical. Not measured on an M2.
-    linearHalfTile: "16x16x4x8",
-    attentionOutputHalfTile: "16x16x4x8",
-    attentionProjectHalfTile: "16x16x4x2",
+    // fold 12637 -> 10361 warm, bit-identical.
+    // 🔴 AND NOT SET, BECAUSE THE M2 LOSES 1.45-1.7x ON EACH OF THE THREE AND THE BROWSER CANNOT TELL THE PARTS APART
+    // (both report `apple / metal-3`). They were pinned here from 7bb3fe2f until 2026-11-13 and cost every M2 visitor
+    // 17-25% of an evoformer block. On the M2 (Chrome 157), profile-af2-block.js --sweep, two rounds interleaved, the
+    // M5's tile against null (the default 8x8x4x4), kernel ms:
+    //   59 x 128    msa-transition 3.23 + 3.42 -> 2.28 + 2.21   row/col output 1.11 / 1.13 -> 0.64 / 0.64
+    //               row/col project 3.06 / 3.06 -> 2.11 / 2.11   (block 23.6 -> ~18.0 with all three)
+    //   256 x 128   msa-transition 14.2 + 14.6 -> 9.9 + 9.6, pair-transition 7.6 + 8.0 -> 5.2 + 5.0
+    //               outputs 4.74 / 4.98 / 3.10 / 3.15 -> 2.72 / 2.79 / 1.54 / 1.61
+    //               projects 13.2 / 13.3 / 6.9 / 6.9 -> 9.0 / 9.0 / 4.6 / 4.7   (block 206 -> ~172)
+    //   150 x 512   msa-transition 32.9 + 35.4 -> 23.2 + 22.6   (block 278 -> 247 on linearHalfTile alone)
+    // (8x8x4x8 is level with null; 16x16x4x4 on the projection is between.) So null here asks grid-attend-race.js,
+    // which races the transition's f16 projection on both tiles and sets all three knobs to the M5's values only where
+    // the wide tile wins; unanswered, the readers take the default tile. `--tune=linearHalfTile=16x16x4x8` (and the
+    // other two) names the M5's arm by hand - which a run that skips the race with `--tune=gridAttendTiled=` must do.
+    linearHalfTile: null,
+    attentionOutputHalfTile: null,
+    attentionProjectHalfTile: null,
     // 🔴 AF3's SINGLE TRANSITION AND SINGLE ATTENTION PROJECTIONS FOUR ROWS A LANE IN vec4, MEASURED ON AN M5 UNDER
     // STOCK FLAGS (57f822f5). bench-trunk.js, AF3 int5, 128 tokens: single-transition 37.9 -> 16.1-16.9 ms,
     // single.project 9.21 -> 5.57, single.project-out 7.65 -> 6.29 (with its residual add fused), relRMS 0. Not

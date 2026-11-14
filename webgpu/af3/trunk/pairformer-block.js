@@ -505,7 +505,9 @@ export class Af3PairformerStackGpu {
       // webgpu/kernels/triangle/shaders.js); `triangleContractArithmetic: "f32"` is the control arm
       triangleContractArithmetic: pairMatrixKernels && halfPrecisionAvailable(this.device)
         && (deviceTuning(this.device).triangleContractArithmetic ?? "f16") === "f16" ? "f16" : "f32",
+      triangleContractLanes: deviceTuning(this.device).triangleContractLanes,
       gridProjectArithmetic: deviceTuning(this.device).gridProjectArithmetic,
+      gridProjectOutVector: deviceTuning(this.device).gridProjectOutVector,
       // ...and the triangle projection, which has no width rule because it
       // costs no memory. See webgpu/kernels/triangle/project-matrix.js.
       triangleProjectMatrix: pairMatrixKernels

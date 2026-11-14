@@ -769,14 +769,21 @@ function createVectorGemmShader({ sourcePrecision, weightPrecision, outputPrecis
                                   block = VECTOR_GEMM_BLOCK, arithmetic = "f32",
                                   innerCols = null, outCols = null, weightOffset = null }) {
   const { rows: BM, columns: BN, inner: BK } = block;
+  // 🔴 THE LANE GRID IS THE BLOCK'S: 16 a side (256 lanes) unless it names 8 (64 lanes) - an M2 runs every 256-lane
+  // f16 tile slower than its 64-lane twin (docs/M2-TO-M5.md, 3D-3). A lane's tile is the block over the grid.
+  const LN = block.lanes ?? 16;
+  const LANES = LN * LN;
+  if (BM % (4 * LN) !== 0 || BN % (4 * LN) !== 0 || ((BM / 4) * BK) % LANES !== 0 || ((BN / 4) * BK) % LANES !== 0) {
+    throw new RangeError(`vector GEMM block ${BM}x${BN}x${BK} does not tile ${LN} x ${LN} lanes`);
+  }
   // 🔴 NO GUARD ON k OR ON THE COLUMNS, ONLY ON THE ROWS. The inner extent must
   // divide by BK and the columns by BN; `createTransitionSplitShaders` refuses a
   // width that does not (`channels % 64`), and the transition's two extents are
   // `channels` and `channels * factor`. A new caller must make the same check.
-  // A 16 x 16 lane grid; each lane owns TM adjacent rows and TN adjacent columns.
-  const TM = BM / 16;
+  // An LN x LN lane grid; each lane owns TM adjacent rows and TN adjacent columns.
+  const TM = BM / LN;
   const MV = TM / 4;
-  const TN = BN / 16;
+  const TN = BN / LN;
   // The source panel's stride: four words past the block, see above.
   const AS = BM + 4;
   const AV = AS / 4;
@@ -832,14 +839,14 @@ ${rowStores.join("\n")}
       }
     }
   }
-  const aSteps = ((BM / 4) * BK) / 256;
-  const bSteps = ((BN / 4) * BK) / 256;
+  const aSteps = ((BM / 4) * BK) / LANES;
+  const bSteps = ((BN / 4) * BK) / LANES;
   const aStrideExpr = sourceGate === null ? innerExpr : `${sourceGate.stride}u`;
   const loadAt = (idxExpr) => sourceGate === null
     ? (sourcePrecision === T ? `source[${idxExpr}]` : `${T}(source[${idxExpr}])`)
     : `${T}(gated(${idxExpr}))`;
   const aPre = Array.from({ length: aSteps }, (_, s) => {
-    const eExpr = s === 0 ? "li" : `(li + ${s * 256}u)`;
+    const eExpr = s === 0 ? "li" : `(li + ${s * LANES}u)`;
     return `  let a_mg_${s} = ${eExpr} / BK;
   let a_k_${s} = ${eExpr} % BK;
   let a_r0_${s} = row_origin + a_mg_${s} * 4u;
@@ -848,7 +855,7 @@ ${rowStores.join("\n")}
   let a_idx_${s} = a_k_${s} * ${AV}u + a_mg_${s};`;
   }).join("\n");
   const bPre = Array.from({ length: bSteps }, (_, s) => {
-    const eExpr = s === 0 ? "li" : `(li + ${s * 256}u)`;
+    const eExpr = s === 0 ? "li" : `(li + ${s * LANES}u)`;
     return `  let b_k_${s} = ${eExpr} / ${BN / 4}u;
   let b_col4_${s} = ${wOff4Expr} + (column_origin >> 2u) + (${eExpr} % ${BN / 4}u) + b_k_${s} * ${cols4Expr};`;
   }).join("\n");
@@ -866,7 +873,7 @@ ${rowStores.join("\n")}
       a_tile[a_idx_${s}] = value;
     }`).join("\n");
   const bStage = Array.from({ length: bSteps }, (_, s) => {
-    const eExpr = s === 0 ? "li" : `(li + ${s * 256}u)`;
+    const eExpr = s === 0 ? "li" : `(li + ${s * LANES}u)`;
     const wVec = `weights[b_col4_${s} + k0 * ${cols4Expr}]`;
     return `    {
       b_tile[${eExpr}] = ${weightPrecision === T ? wVec : `vec4<${T}>(${wVec})`};
@@ -889,13 +896,13 @@ ${sourceGate === null ? "" : `fn swish(value: f32) -> f32 { return value / (1.0 
 fn gated(at: u32) -> f32 {
   return swish(f32(source[at])) * f32(source[at + ${sourceGate.offset}u]);
 }`}
-@compute @workgroup_size(256)
+@compute @workgroup_size(${LANES})
 fn main(@builtin(workgroup_id) group: vec3<u32>,
         @builtin(local_invocation_index) li: u32) {
   let row_origin = group.y * BM;
   let column_origin = group.x * BN;
-  let tx = li % 16u;
-  let ty = li / 16u;
+  let tx = li % ${LN}u;
+  let ty = li / ${LN}u;
 ${accumulators.join("\n")}
 ${aPre}
 ${bPre}

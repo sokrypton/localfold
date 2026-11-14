@@ -1405,7 +1405,8 @@ export function createOuterProductMeanVectorOutputShader(residual, block = DEFAU
   // (a lane owns TM adjacent rows and TN adjacent columns of the block - 4 x 4 at the default; see
   // webgpu/kernels/vector-gemm-block.js)
   const { rows: BM, columns: BN, inner: BK } = block;
-  const AS = BM + 4, TM = BM / 16, TN = BN / 16, TV = TN / 4;
+  const LN = block.lanes ?? 16, LANES = LN * LN;  // (the lane grid's side: webgpu/kernels/vector-gemm-block.js)
+  const AS = BM + 4, TM = BM / LN, TN = BN / LN, TV = TN / 4;
   const acc = [], stores = [], biases = [], flush = [];
   for (let j = 0; j < TV; j += 1) {
     biases.push(`  let bias_${j} = weights[b0 + ${j}u];`);
@@ -1455,10 +1456,10 @@ ${mads.join("\n")}
   const partInit = f16 ? Array.from({ length: TM }, (_, i) =>
     Array.from({ length: TV }, (__, j) => `    var part_${i}_${j} = vec4<f16>(0.0);`).join("\n")).join("\n") : "";
   const k4PerStep = BK / 4;
-  const aSteps = (BM * k4PerStep) / 256;
-  const bSteps = ((BN / 4) * BK) / 256;
+  const aSteps = (BM * k4PerStep) / LANES;
+  const bSteps = ((BN / 4) * BK) / LANES;
   const aPrecompute = Array.from({ length: aSteps }, (_, s) => {
-    const eExpr = s === 0 ? "li" : `(li + ${s * 256}u)`;
+    const eExpr = s === 0 ? "li" : `(li + ${s * LANES}u)`;
     return `  let a_m_${s} = ${eExpr} / ${k4PerStep}u;
   let a_k4_${s} = ${eExpr} % ${k4PerStep}u;
   let a_row_${s} = row_origin + a_m_${s};
@@ -1469,7 +1470,7 @@ ${mads.join("\n")}
   if (a_valid_${s}) { a_scale_${s} = scale[parameters.padding.x + a_row_${s}]; }` : ""}`;
   }).join("\n");
   const bPrecompute = Array.from({ length: bSteps }, (_, s) => {
-    const eExpr = s === 0 ? "li" : `(li + ${s * 256}u)`;
+    const eExpr = s === 0 ? "li" : `(li + ${s * LANES}u)`;
     return `  let b_k_${s} = ${eExpr} / ${BN / 4}u;
   let b_col4_${s} = weight_offset4 + column_origin4 + (${eExpr} % ${BN / 4}u) + b_k_${s} * columns4;`;
   }).join("\n");
@@ -1482,7 +1483,7 @@ ${mads.join("\n")}
       a_tile[a_dst_${s} + ${3 * AS}u] = ${T}(a_vec.w);
     }`).join("\n");
   const bStage = Array.from({ length: bSteps }, (_, s) => {
-    const eExpr = s === 0 ? "li" : `(li + ${s * 256}u)`;
+    const eExpr = s === 0 ? "li" : `(li + ${s * LANES}u)`;
     return `    {
       let base4 = b_col4_${s} + k0 * columns4;
       b_tile[${eExpr}] = vec4<${T}>(weights[base4]);
@@ -1499,15 +1500,15 @@ ${mads.join("\n")}
 @group(0) @binding(4) var<storage, read> scale: array<f32>;
 var<workgroup> a_tile: array<${T}, ${AS * BK}>;
 var<workgroup> b_tile: array<vec4<${T}>, ${BK * BN / 4}>;
-@compute @workgroup_size(256)
+@compute @workgroup_size(${LANES})
 fn main(@builtin(workgroup_id) group: vec3<u32>,
         @builtin(local_invocation_index) li: u32) {
   let row_origin = group.y * ${BM}u;
   let column_origin4 = group.x * ${BN / 4}u;
   let columns4 = parameters.columns >> 2u;
   let weight_offset4 = parameters.weight_offset >> 2u;
-  let tx = li & 15u;
-  let ty = li >> 4u;
+  let tx = li % ${LN}u;
+  let ty = li / ${LN}u;
   let column4 = column_origin4 + tx * ${TV}u;
   let b0 = (parameters.bias_offset >> 2u) + column4;
 ${biases.join("\n")}
@@ -1553,7 +1554,8 @@ export function createOuterProductMeanVectorContractShader(cOuter, block = DEFAU
   const T = f16 ? "f16" : "f32";
   const vec4Align = cOuter % 4 === 0;
   const { rows: BM, columns: BN, inner: BK } = block;
-  const AS = BM + 4, AV = AS / 4, TM = BM / 16, MV = TM / 4, TN = BN / 16, TV = TN / 4;
+  const LN = block.lanes ?? 16, LANES = LN * LN;  // (the lane grid's side: webgpu/kernels/vector-gemm-block.js)
+  const AS = BM + 4, AV = AS / 4, TM = BM / LN, MV = TM / 4, TN = BN / LN, TV = TN / 4;
   const acc = [], stores = [], flush = [];
   for (let i = 0; i < TM; i += 1) {
     for (let j = 0; j < TV; j += 1) {
@@ -1608,10 +1610,10 @@ ${mads.join("\n")}
   const load4 = (buf) => vec4Align
     ? `${buf}[base]`
     : `vec4<f32>(${buf}[base], ${buf}[base + 1u], ${buf}[base + 2u], ${buf}[base + 3u])`;
-  const aSteps = ((BM / 4) * BK) / 256;
-  const bSteps = ((BN / 4) * BK) / 256;
+  const aSteps = ((BM / 4) * BK) / LANES;
+  const bSteps = ((BN / 4) * BK) / LANES;
   const aPre = Array.from({ length: aSteps }, (_, s) => {
-    const eExpr = s === 0 ? "li" : `(li + ${s * 256}u)`;
+    const eExpr = s === 0 ? "li" : `(li + ${s * LANES}u)`;
     return `  let a_k_${s} = ${eExpr} / ${BM / 4}u;
   let a_mg_${s} = ${eExpr} % ${BM / 4}u;
   let a_r_${s} = row_origin + a_mg_${s} * 4u;
@@ -1620,7 +1622,7 @@ ${mads.join("\n")}
   let a_idx_${s} = a_k_${s} * ${AV}u + a_mg_${s};`;
   }).join("\n");
   const bPre = Array.from({ length: bSteps }, (_, s) => {
-    const eExpr = s === 0 ? "li" : `(li + ${s * 256}u)`;
+    const eExpr = s === 0 ? "li" : `(li + ${s * LANES}u)`;
     return `  let b_k_${s} = ${eExpr} / ${BN / 4}u;
   let b_c_${s} = column_origin + (${eExpr} % ${BN / 4}u) * 4u;
   let b_valid_${s} = b_c_${s} < parameters.columns;
@@ -1636,7 +1638,7 @@ ${mads.join("\n")}
       a_tile[a_idx_${s}] = vec4<${T}>(value);
     }`).join("\n");
   const bStage = Array.from({ length: bSteps }, (_, s) => {
-    const eExpr = s === 0 ? "li" : `(li + ${s * 256}u)`;
+    const eExpr = s === 0 ? "li" : `(li + ${s * LANES}u)`;
     return `    {
       let k = k0 + b_k_${s};
       var value = vec4<f32>(0.0);
@@ -1657,13 +1659,13 @@ ${mads.join("\n")}
 @group(0) @binding(3) var<storage, read_write> outer: array<${storageType}>;
 var<workgroup> a_tile: array<vec4<${T}>, ${AV * BK}>;
 var<workgroup> b_tile: array<vec4<${T}>, ${BK * BN / 4}>;
-@compute @workgroup_size(256)
+@compute @workgroup_size(${LANES})
 fn main(@builtin(workgroup_id) group: vec3<u32>,
         @builtin(local_invocation_index) li: u32) {
   let row_origin = group.y * ${BM}u;
   let column_origin = group.x * ${BN}u;
-  let tx = li % 16u;
-  let ty = li / 16u;
+  let tx = li % ${LN}u;
+  let ty = li / ${LN}u;
   let column = column_origin + tx * ${TN}u;
   // Both operands are [sequence][residue * C + channel]; a row of the GEMM is
   // one of the block's residues' channels, a column one of any residue's.

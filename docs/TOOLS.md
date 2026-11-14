@@ -11,9 +11,9 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-554 tools. `tools/fixtures/` is data and is not listed.
+555 tools. `tools/fixtures/` is data and is not listed.
 
-## `tools/gpu/` - the WebGPU lane (303)
+## `tools/gpu/` - the WebGPU lane (304)
 
 Each exports `async function main(device, args)` and is run as
 `node tools/gpu-chrome.mjs tools/gpu/<module>.js [--flags]`.
@@ -230,6 +230,7 @@ Each exports `async function main(device, args)` and is run as
 - **`probe-compiles.js`** - Where any tool's first run spends its SHADER COMPILATION, by wrapping another tool rather than by being one.
 - **`probe-confidence-kernels.js`** - Which kernel of the CONFIDENCE head's pairformer stops computing its reference - the trunk's own stack being the control.
 - **`probe-contract-f16.js`** - The triangle contraction in f16 arithmetic at several lane blocks, against the shipped 8 x 8 f32 kernel - the measurement behind webgpu/kernels/triangle/shaders.js's f16 contraction (outgoing, f32 channel-major a and b, uniform inputs; unscaled, so it also shows the precision the scaled shipped kernel has where nothing overflows).
+- **`probe-contract-lanes.js`** - The f16 triangle contraction on 8 x 8 lanes against the shipped 16 x 16 - whether an M2 wants the smaller workgroup.
 - **`probe-denoiser.js`** - Ask the diffusion head what it predicts from NOTHING.
 - **`probe-designed-binder-sampler.js`** - Which sampler configuration folds a DESIGNED BINDER onto its target?
 - **`probe-dispatch-aliasing.js`** - Does any dispatch bind the SAME buffer range twice?

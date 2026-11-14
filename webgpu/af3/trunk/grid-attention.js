@@ -309,8 +309,21 @@ export function createGridAttentionShaders(
   // sweep records in webgpu/kernels/attention.js. `projectOutRows` is a separate
   // knob and stays at eight, where it is fastest either way.
   const projectRows = shape.projectRows ?? (packQkvg ? PACKED_PROJECT_ROWS : PROJECT_ROWS);
-  const projectOutRows = shape.projectOutRows ?? PROJECT_OUT_ROWS;
   const width = heads * dimension;
+  // 🔴 THE OUTPUT PROJECTION AS A REGISTER-TILED GEMM (`projectOutVector`: the rows a tile, a multiple of 8). The
+  // kernel below gives a lane ONE output channel: a scalar weight read and two staged reads buy 8 multiply-adds, in
+  // f32. Here a lane owns four adjacent channels and eight rows - one vec4 weight read and two staged reads buy 32 -
+  // and, where the gated rows are staged in f16, multiplies in f16 (eight k summed in f16, then into f32: the vector
+  // GEMM's arithmetic, webgpu/af3/trunk/transition.js). It needs every offset it reads as a vec4 on a multiple of 4.
+  // ...as many rows as the device can stage (the gated tile is width * rows elements, f16 where the projection's
+  // arithmetic is): 32 at 128 wide, 16 at OpenDDE's 384 on Metal's 32 KiB, and the old kernel where not even 8 fit.
+  const outVectorBytes = heads * dimension * (shape.projectArithmetic === "f16" && !packQkvg ? 2 : 4);
+  const outVectorFit = Math.floor((shape.maxComputeWorkgroupStorageSize ?? 16384) / outVectorBytes / 8) * 8;
+  const outVectorRows = Number.isInteger(shape.projectOutVector) ? Math.min(shape.projectOutVector, outVectorFit) : 0;
+  const outVector = Number.isInteger(outVectorRows) && outVectorRows > 0 && outVectorRows % 8 === 0
+    && channels % 4 === 0 && width % 8 === 0 && offsets.outputProjection % 4 === 0
+    && (offsets.outputProjectionBias === undefined || offsets.outputProjectionBias % 4 === 0);
+  const projectOutRows = outVector ? outVectorRows : shape.projectOutRows ?? PROJECT_OUT_ROWS;
   const pairs = n * n;
   const swapBias = transpose && dialect.swapTransposedBias;
 
@@ -966,12 +979,48 @@ ${unroll((t) => packGathered
     Array.from({ length: OUT_GROUPS }, (_, g) => body(g)).join("\n");
   const outStage16 = project16 && OUT_VEC4;
   const OUT_VEC_T = outStage16 ? "vec4<f16>" : "vec4<f32>";
+  const outVectorLoop = () => {
+    const L = projectLanesFor(width), CQ = channels / 4, T = CQ * (OUT_ROWS / 8);
+    const E = outStage16 ? "f16" : "f32";
+    const rows8 = Array.from({ length: 8 }, (_, j) => j);
+    const step = (u) => `      {
+        let wv = vec4<${E}>(weights[w_base + (w + ${u}u) * ${CQ}u]);
+        let g0 = gated[g_base + w + ${u}u];
+        let g1 = gated[g_base + ${width}u + w + ${u}u];
+${rows8.map((j) => outStage16
+    ? `        part_${j} = fma(vec4<f16>(g${j >> 2}.${"xyzw"[j & 3]}), wv, part_${j});`
+    : `        acc_${j} += g${j >> 2}.${"xyzw"[j & 3]} * wv;`).join("\n")}
+      }`;
+    return `  for (var task = local; task < ${T}u; task += ${L}u) {
+    let cq = task % ${CQ}u;
+    let bundle = task / ${CQ}u;
+    let w_base = ${offsets.outputProjection / 4}u + cq;
+    let g_base = bundle * ${2 * width}u;
+${rows8.map((j) => `    var acc_${j} = vec4<f32>(0.0);`).join("\n")}
+    for (var w = 0u; w < WIDTH; w += 8u) {
+${outStage16 ? rows8.map((j) => `      var part_${j} = vec4<f16>(0.0);`).join("\n") : ""}
+${Array.from({ length: 8 }, (_, u) => step(u)).join("\n")}
+${outStage16 ? rows8.map((j) => `      acc_${j} += vec4<f32>(part_${j});`).join("\n") : ""}
+    }
+${offsets.outputProjectionBias === undefined ? "" : `    let out_bias = weights[${offsets.outputProjectionBias / 4}u + cq];
+${rows8.map((j) => `    acc_${j} += out_bias;`).join("\n")}`}
+${rows8.map((j) => `    {
+      let row = first + bundle * 8u + ${j}u;
+      if (row < ${LIVE}) {
+        let g_row = ${chunked ? "chunk.x * N + row" : "row"};
+        let destination = ${transpose ? "(g_row % N) * N + g_row / N" : "g_row"};
+        output[destination * ${CQ}u + cq] ${residual ? "+=" : "="} acc_${j};
+      }
+    }`).join("\n")}
+  }
+`;
+  };
   const project_out = `${outStage16 ? "enable f16;\n" : ""}${common}
 const OUT_ROWS: u32 = ${OUT_ROWS}u;
 @group(0) @binding(0) var<storage, read> gathered: array<${storageArray(gatheredStorage)}>;
 @group(0) @binding(1) var<storage, read> gate: array<${storageArray(store4.gate)}>;
-@group(0) @binding(2) var<storage, read> weights: array<f32>;
-@group(0) @binding(3) var<storage, read_write> output: array<f32>;
+@group(0) @binding(2) var<storage, read> weights: array<${outVector ? "vec4<f32>" : "f32"}>;
+@group(0) @binding(3) var<storage, read_write> output: array<${outVector ? "vec4<f32>" : "f32"}>;
 ${chunkBinding(4)}
 
 // OUT_ROWS gated rows, so one read of the output matrix serves all of them.
@@ -1030,7 +1079,7 @@ ${overOutGroups((g) => {
   }`}
   workgroupBarrier();
 
-  for (var c = local; c < CHANNELS; c += ${projectLanesFor(width)}u) {
+${outVector ? outVectorLoop() : `  for (var c = local; c < CHANNELS; c += ${projectLanesFor(width)}u) {
 ${OUT_VEC4 ? `${overOutGroups((g) => `    var sum${g} = vec4<f32>(0.0);`)}
 ${width % 8 === 0 ? `    for (var w = 0u; w < WIDTH; w += 8u) {
 ${Array.from({ length: 8 }, (_, u) => `      {
@@ -1062,6 +1111,7 @@ ${overOutRows((r) => `    if (first + ${r}u < ${LIVE}) {
       output[destination${r} * CHANNELS + c] ${residual ? "+=" : "="} sum${r};
     }`)}`}
   }
+`}
 }`;
 
   // 🔴 THE MATRIX ATTEND IS A SWAP OF THIS ONE SHADER AND NOTHING ELSE. It
@@ -1240,7 +1290,7 @@ ${eachA((a) => `  {
   }
 
   return { normalize, bias: biasPass, project, attend: attendShader, project_out,
-           tiles: { projectRows, projectOutRows, normalizeRows: NORMALIZE_ROWS,
+           tiles: { projectRows, projectOutRows, projectOutVector: outVector, normalizeRows: NORMALIZE_ROWS,
                     attendRows: matrixGeometry !== null ? matrixGeometry.rows
                       : tiled ? 8 * tiledShape[0] : 64,
                     biasElements: heads * n * biasKeys, biasVec4, qkvHalf } };

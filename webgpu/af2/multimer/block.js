@@ -90,7 +90,7 @@ import {
 import { deviceTuning, halfPrecisionAvailable } from "../../runtime/device-profile.js";
 import { settleGridAttendTiling } from "../../af3/trunk/grid-attend-race.js";
 import { vectorGemmBlock, vectorGemmBlockKey } from "../../kernels/vector-gemm-block.js";
-import { LINEAR_GRID_WIDTH, PROJECT_TILE, createTriangleShaders } from "../../kernels/triangle/shaders.js";
+import { LINEAR_GRID_WIDTH, PROJECT_TILE, createTriangleShaders, f16ContractTile } from "../../kernels/triangle/shaders.js";
 import { shaderSourceSet } from "../../runtime/shader-source-cache.js";
 import {
   createTriangleContractMatrixShader, createTriangleProjectMatrixShader,
@@ -554,6 +554,8 @@ async function encodeOuterProductMean(
     && deviceTuning(execution.device).opmVectorArithmetic !== "f32" ? "f16" : "f32";
   const opmBlock = vectorGemmBlock(execution.device, opmArithmetic,
     ({ columns, inner }) => input.cZ % columns === 0 && (input.cOuter * input.cOuter) % inner === 0);
+  // ...and the contraction's own, where the device names one (an M2: docs/M2-TO-M5.md, 3D-3)
+  const opmContractBlock = vectorGemmBlock(execution.device, opmArithmetic, () => true, "Contract");
   const vectorOutput = outerFirst && deviceTuning(execution.device).opmVectorOutput !== false
     && input.cZ % opmBlock.columns === 0 && input.cOuter % 4 === 0;
   const [normalize, project, intermediatePipeline, accumulatePipeline, finalizePipeline,
@@ -566,8 +568,8 @@ async function encodeOuterProductMean(
     !outerFirst
       ? undefined
       : vectorContract
-      ? execution.pipelines.get(`block:opm:contract-vector:${input.cOuter}:${vectorGemmBlockKey(opmBlock)}:${opmArithmetic}`,
-        createOuterProductMeanVectorContractShader(input.cOuter, opmBlock, opmArithmetic))
+      ? execution.pipelines.get(`block:opm:contract-vector:${input.cOuter}:${vectorGemmBlockKey(opmContractBlock)}:${opmArithmetic}`,
+        createOuterProductMeanVectorContractShader(input.cOuter, opmContractBlock, opmArithmetic))
       : execution.pipelines.get(`block:opm:contract:${input.cOuter}:${contractPrecision}`,
         createOuterProductMeanContractShader(input.cOuter, contractPrecision)),
     !outerFirst
@@ -645,7 +647,7 @@ async function encodeOuterProductMean(
           new Uint32Array([blockRows, input.sequences, columns,
             (offset / input.length) * input.cOuter, 0, 0, input.length, 0]));
         execution.dispatch(encoder, contractPipeline, [left, right, vectorParams, intermediate],
-          Math.ceil(columns / opmBlock.columns), Math.ceil(blockRows / opmBlock.rows), 1, "opm.contract");
+          Math.ceil(columns / opmContractBlock.columns), Math.ceil(blockRows / opmContractBlock.rows), 1, "opm.contract");
       } else {
         // ...both are one workgroup per PAIR; see outer-product-mean.js.
         const pairGrid = execution.linearGrid(count * 64);
@@ -756,7 +758,7 @@ async function encodeTriangleMultiplication(
   // (grid-attend-race.js). `triangleContractArithmetic: "f32"` is the control.
   const contractTile = !matrixFits && halfPrecisionAvailable(execution.device)
     && (deviceTuning(execution.device).triangleContractArithmetic ?? "f16") === "f16"
-    ? { rows: 32, columns: 32, arithmetic: "f16" } : undefined;
+    ? f16ContractTile(deviceTuning(execution.device).triangleContractLanes, input.length) : undefined;
   const sourceKey = `multimer:triangle:${direction}:${JSON.stringify(shape)}`
     + `:${JSON.stringify(projectTile ?? null)}:${JSON.stringify(packedOffsets)}:${JSON.stringify(contractTile ?? null)}`;
   const shaders = shaderSourceSet(execution.device, sourceKey, () => createTriangleShaders(

@@ -25,5 +25,11 @@ export async function main(device, args = []) {
     gridProjectArithmetic: tuning.gridProjectArithmetic,
     triangleContractArithmetic: tuning.triangleContractArithmetic,
     attentionGroup: tuning.attentionGroup,
+    linearHalfTile: tuning.linearHalfTile,
+    attentionOutputHalfTile: tuning.attentionOutputHalfTile,
+    attentionProjectHalfTile: tuning.attentionProjectHalfTile,
+    trianglePairProjectTile: tuning.trianglePairProjectTile,
+    vectorGemmBlock: tuning.vectorGemmBlock,
+    triangleContractLanes: tuning.triangleContractLanes,
   };
 }

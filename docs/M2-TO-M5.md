@@ -221,6 +221,161 @@ check would have caught them in seconds, and the bench already exists. Two cheap
   differs there too, the generic kernel does not compute the same sum as the specific one, which matters for NVIDIA,
   where tiered is the default.
 
+### 3D-2. Five `metal-3` values the M2 lost on, now raced - measured on BOTH parts (2026-11-14)
+
+Section 2 confirmed the `metal-3` values it swept; five it never swept do not hold on the M2. `linearHalfTile`,
+`attentionOutputHalfTile`, `attentionProjectHalfTile` (7bb3fe2f), `trianglePairProjectTile` (a6b916c8) and
+`vectorGemmBlock` were the M5's, each marked "not measured on an M2". M2, Chrome 157, `profile-af2-block.js --sweep`,
+two rounds interleaved, the pinned value against the default, kernel ms:
+
+| shape | msa-transition | attention outputs (row / col) | q/k/v/gate (row / col) | triangle output | opm contract + output |
+|---|---|---|---|---|---|
+| 59 x 128 | 3.23 + 3.42 -> 2.28 + 2.21 | 1.11 / 1.13 -> 0.64 / 0.64 | 3.06 / 3.06 -> 2.11 / 2.11 | 0.34 -> 0.17 | 0.90 + 0.97 -> 0.71 + 0.72 |
+| 256 x 128 | 14.2 + 14.6 -> 9.9 + 9.6 | 4.74 / 4.98 -> 2.72 / 2.79 | 13.2 / 13.3 -> 9.0 / 9.0 | 5.81 -> 2.93 | 16.8 + 16.9 -> 13.4 + 12.7 |
+
+and in an AF3 trunk pass (`bench-trunk.js --profile`, 255 tokens, the race's answers named by hand): the triangle tile
+5683 / 5710 -> 5247 / 5261 ms, then the GEMM block 5261 -> 4964 (`pair-transition.wide` 7.46 -> 5.80, `down` 3.94 ->
+3.34); protenix2 at 150 tokens 5160 -> 4866, IntelliFold-2 20870 -> 19874.
+
+So the prior leaves all five null and `grid-attend-race.js` answers them: a fifth arm races the transition's f16
+projection (8192 rows, 1024 -> 256) on the default tile against 16x16x4x8 and sets the M5's values where the wide arm
+wins by the margin; otherwise the half tiles and the GEMM block stay null (the defaults) and the triangle takes 32x32.
+The triangle tile and the GEMM block ride that answer by proxy - the same question, a lane's register tile - and the
+proxy is right on both parts, measured:
+
+| | race: default / wide tile | answer | `vectorGemmBlock` f16, AF3 trunk pass |
+|---|---|---|---|
+| M2 | 2.47 / 4.05 ms | narrow | 64x128x32 5261 ms, **64x64x16 4964** |
+| M5 | 1.47 / 1.19 ms | wide (all five at their old values) | **64x128x32 2341**, 64x64x16 2410 |
+
+Whole folds, warm, the five pinned by `--tune-json` against the race, alternated:
+
+| fold | M2 pinned | M2 raced | M5 pinned | M5 raced |
+|---|---|---|---|---|
+| AF2 59 residues, 128 + 128 rows | 1244-1276 ms | **912-922** | 453-456 | 454-457 |
+| AF2 5CAJ (261), 128 + 128 rows | 11.9 s | **9.1** | 4.60 | 4.60 |
+| AF2 5CAJ, 512 + 1024 rows | 29.7 s | **23.1** | - | - |
+| AF3 6MRR (68 tokens), 25 steps, one pass | 1.61 s | 1.57 | - | - |
+| AF3 5CAJ (255 tokens), 25 steps, one pass | 9.40 s | **8.65** | 4.85-4.86 | 4.84-4.86 |
+
+The M5's folds are bit-identical either way (AF2 -1349430 / -774811, AF3 pLDDT 26.965896894539252). On the M2 the four
+tiles reorder no sum (AF2 -1361689 both ways with those alone); the GEMM block regroups the f16 partial sums, so with
+it AF2 reads -1364228 (pLDDT 62.912 -> 62.918) and AF3 5CAJ 26.9758 -> 26.9549 - the f16 bound, not a tile. The race
+is ~60 ms longer on the M2 (745 -> 805 ms, once a browser; the memory key is v5, so every browser races once more) and
+433 ms on the M5. `npm test` is unchanged (1910 pass; the one failure is `tools/_fold_film.py`'s stale paths, before
+and after). The AF3 template stack awaits the race now (it reads the triangle tile and compiles before the pairformer).
+
+🔴 **`--profile` MISLEADS THIS ARM TOO**, as the race's header says of the others: under `bench-trunk.js --profile` the
+M2's race answered WIDE (tri.project-out 5.77 ms a pass against 2.87). Name all the answers with `--tune-json` when
+profiling. And a run that skips the race with `--tune=gridAttendTiled=...` gets the default tiles unless it names the
+five as well.
+
+🔴 **THE M5 IS REACHABLE FROM THE M2: `ssh m5`** (Tailscale). These M5 numbers were taken from a copy of the working
+tree in `~/sergey/lf-m2test` there (tracked files by rsync, the bundles and node_modules symlinked from
+`~/sergey/localfold`), which leaves that checkout alone.
+
+Not swept on the M2: `singleTransitionTile` and `singleProjectRows` (under 1% of a trunk pass here).
+
+### 3D-3. Two more 256-thread f16 tiles on 64 lanes, and a knob sweep that found nothing - BOTH parts (2026-11-14)
+
+Asked: a speedup for either chip that costs the other nothing. Every 16 x 16-lane f16 tile the M5 work introduced has
+lost on the M2 to an 8 x 8-lane twin (3D-2), so the two kernels that still had no twin got one. Both are answered by
+the startup race's existing "linear tile" arm (`tilesAnswer` in webgpu/af3/trunk/grid-attend-race.js): no new race.
+
+**1. The f16 triangle contraction, `triangleContractLanes`** (8, `"fit"`, null/16; webgpu/kernels/triangle/shaders.js,
+`f16ContractTile`). The tile is `4 * lanes` a side, so 8 lanes is a 32 x 32 tile where 16 is 64 x 64 - which also pads
+less whenever the length is not a multiple of 64. `tools/gpu/probe-contract-lanes.js` is the standalone race.
+
+| AF3 trunk, `tri.contract` ms | M2: 16 -> 8 lanes | M5: 16 -> 8 lanes |
+|---|---|---|
+| 255 tokens (pads to 256 either way) | 494 -> 375 (trunk -2.2%) | **loses 2%** |
+| 200 tokens (pads to 224, not 256) | 359 -> 215 (trunk -5%) | 129 -> 114 (trunk -1%) |
+
+So the M2 takes 8 and the M5 takes `"fit"`: 8 only where the 32-tile's padded area is 13% under the 64-tile's.
+
+**2. The f16 vector GEMM on 64 lanes** - the split pair transition's two and the outer product mean's two
+(`vectorGemmBlock`, a fourth number naming the lane grid's side: `"32x64x8x8"`). AF3 trunk at 255 tokens, GPU ms:
+
+| block (f16) | M2 `wide` / `down` | M2 trunk | M5 trunk |
+|---|---|---|---|
+| default 64x64x16 (M2), 64x128x32 (M5) | 602 / 345 | - | - |
+| **32x64x8 on 64 lanes** | **455 / 255** (twice: 460/258, 457/256) | **-3.9, -5.5, -4.8%** | +1.9% |
+| 32x64x16 on 64 lanes | 568 / 309 | +0.8% | |
+| 32x128x8 on 64 lanes | 749 / 408 | +5.2% | +4.4% (x16) |
+| 64x64x16 on 64 lanes | 816 / 456 | +8.6% | |
+| 64x128 on 64 lanes | 1787 / 928 | +43.5% | +14..16% |
+
+The M2 takes `32x64x8x8`; the M5 keeps its own block, which beats every 64-lane one there. A 32-column block is not
+one AF3's OPM output kernel has (it reads the block's columns and depth only; 64 rows on 256 lanes) - its `fits` says
+so now, where it compiled `tx * 0.5u`.
+
+**2b. The contraction wants a narrower block than the transition does, so it has its own** (`vectorGemmBlock.f16Contract`,
+read through `vectorGemmBlock(..., "Contract")`; absent, the arithmetic's). M2, AF2 block at 255 residues x 128 rows:
+
+| block (f16, 64 lanes) | `opm.contract` | `opm.project-output` | AF3 `pair-transition.wide` / `down` |
+|---|---|---|---|
+| default 64x64x16 on 256 | 12.9-13.8 ms | 13.0 | 602 / 345 |
+| 32x64x8 | 12.6-13.0 | **9.1-9.8** | **456 / 255** |
+| 32x32x8 | **10.3-10.4** | 10.0-10.2 | 517 / 311 |
+| 32x32x16, 32x32x32, 32x64x32 | 15.0, 16.1, 18.6 | 11.7-15.5 | |
+
+The M2's race answer is `{ f16: "32x64x8x8", f16Contract: "32x32x8x8" }`: 10.4 and 9.1 together, the AF2 block 157 ->
+150 ms, the same checksum as one block for both (the k step and the lanes are the same, so no sum is regrouped). It
+is ~1% of a 5CAJ AF2 fold (7.93-8.06 s against 8.07-8.10). The M5's answer has no such entry and its fold is the
+fold it was (4218 / 4220 ms, checksum unchanged).
+
+**Both together, whole folds, arms interleaved, two rounds** (`fold-af2.js --repeat`, `fold.js --folds=2`, warm fold;
+old arm = `--tune-json={"triangleContractLanes":16,"vectorGemmBlock":{}}` on the M2, `{"triangleContractLanes":16}`
+on the M5, whose GEMM block did not change):
+
+| | M2 old | M2 new | M5 old | M5 new |
+|---|---|---|---|---|
+| AF2 59 res | 927, 928 / 905, 891 ms | 895, 900 / 883, 874 | 464, 461 / 481, 482 | 465, 463 / 468, 471 |
+| AF2 200 res, 128+128 rows | 5778 / 5653 | 5382 / 5401 (-5.5%) | 2919 / 3087 | 2877 / 3027 (-1.7%) |
+| AF2 5CAJ 255, 128+128 rows | 8433 / 8220 | 7909 / 7888 (-5%) | 4315 / 4506 | 4222 / 4453 (same kernels, same checksum) |
+| AF3 200 tokens | 8.08 / 8.09 s | 7.82 / 7.72 (-3.9%) | 5.12 / 5.34 | 5.00 / 5.33 |
+| AF3 5CAJ 255 tokens | 11.78 / 11.84 s | 11.54 / 11.44 (-2.7%) | 7.30 / 7.72 | 7.03 / 7.39 (same kernels, same pLDDT) |
+
+Every fold is a chain (CA-CA median 3.77-3.90 on both arms) and pLDDT moves in the second decimal. 🔴 **THE M5 DRIFTS
+~5% SLOWER OVER SUCH A RUN AND THE M2 UP TO 20% OVER HALF AN HOUR** (heat): read adjacent pairs, never a column.
+`probe-grid-attend-race.js` prints what each part resolved: the M2 `vectorGemmBlock {f16: "32x64x8x8"}`,
+`triangleContractLanes 8`; the M5 `{f32: "128x128x8", f16: "64x128x32"}`, `"fit"` - what it had.
+
+**3. The knob sweep, a null result on both.** `profile-af2-block.js --sweep` over 12 AF2 knobs and
+`bench-trunk.js --profile --tune-json` over 31 AF3 arms, on each part: nothing beyond the above moves either by more
+than its noise. The two M5 candidates at ~1% (`linearHalfTile 16x16x8x8`, `attentionProjectHalfTile 16x16x8x2`) are
+inside its bimodal run-to-run band and unconfirmed. Both parts are GPU-bound (no host-side gap). 🔴 `bench-trunk.js
+--profile` FOOLS THE RACE (the M2 answered wide under it): name the race's answers in `--tune-json` when profiling.
+
+### 3D-4. `grid.project-out` as a register-tiled GEMM - a gain on BOTH parts, in the shared prior (2026-11-14)
+
+Per-kernel throughput in an AF3 trunk pass at 255 tokens (multiply-adds x 2 over GPU time, both parts' own tiles):
+the GEMM-shaped kernels sit at 1.7-2.1 TFLOP/s on the M2 and 3.0-3.4 on the M5, and `grid.project-out` at **1.0 and
+1.6**. It gave a lane ONE output channel: a scalar weight read and two staged reads bought 8 multiply-adds, in f32.
+`gridProjectOutVector` (the rows a tile; `projectOutVector` in webgpu/af3/trunk/grid-attention.js) gives a lane four
+adjacent channels and eight rows - one vec4 weight read and two staged reads buy 32 - in f16 where the gated rows are
+staged in f16 (eight k summed in f16, then into f32). Rows are cut to what the device stages (width x rows elements).
+
+| AF3 trunk, 255 tokens, `grid.project-out` ms | M2 | M5 |
+|---|---|---|
+| one channel a lane, 8 rows | 216 | 133 |
+| **32 rows** (the prior's) | **181, 182** (trunk -0.6%) | **118, 117** (trunk -0.8%) |
+| 16 rows | 181 | 114 |
+| 64 rows | 228 | 123 |
+
+16 rows is no slower with half its lanes idle, so the kernel is no longer arithmetic-bound: what is left is the staging
+(a logistic an element) and the weight read from global memory. `check-af3-block-any.js` (two blocks against the CPU
+reference, int5): pair 0.117040 -> 0.117048, single 1.50e-3 -> 1.49e-3. Whole folds, warm, arms interleaved twice
+(old arm `--tune-json={"gridProjectOutVector":0}`):
+
+| | M2 old | M2 new | M5 old | M5 new |
+|---|---|---|---|---|
+| AF3 200 tokens | 7.81 / 7.82 s | 7.58 / 7.73 | 5.00 / 5.16 | 4.98 / 5.02 |
+| AF3 5CAJ 255 | 11.43 / 11.49 | 11.22 / 11.36 | 7.05 / 7.32 | 7.01 / 7.19 |
+
+boltz2, rosettafold3 and openbind0 at 68 tokens take the kernel and fold the same chain at the same speed (pLDDT moves
+in the second decimal); intellifold2, protenix2 and OpenDDE do not take it (their folds are identical to the digit).
+
 ### 3E. Leave alone
 
 - The M2's baselines (`*.m2.json`) - re-recording them from an M5 is how `a56d94d2`'s problem started (the M5 re-recorded the shared file and the M2's gate failed on its own unchanged fold).

@@ -71,7 +71,7 @@ import { WebGpuExecution } from "../../runtime/execution.js";
 import { halfPrecisionAvailable, deviceTuning } from "../../runtime/device-profile.js";
 import { settleGridAttendTiling } from "../../af3/trunk/grid-attend-race.js";
 import { storageBytes } from "../../runtime/storage.js";
-import { createTriangleShaders, LINEAR_GRID_WIDTH, PROJECT_TILE } from "../../kernels/triangle/shaders.js";
+import { createTriangleShaders, f16ContractTile, LINEAR_GRID_WIDTH, PROJECT_TILE } from "../../kernels/triangle/shaders.js";
 import {
   createTriangleContractMatrixShader, createTriangleProjectMatrixShader,
   createTriangleProjectOutMatrixShaders, triangleContractMatrixDispatch,
@@ -1080,6 +1080,8 @@ async function encodeOuterProductMean(
     && deviceTuning(execution.device).opmVectorArithmetic !== "f32" ? "f16" : "f32";
   const opmBlock = vectorGemmBlock(execution.device, opmArithmetic,
     ({ columns, inner }) => input.cZ % columns === 0 && (input.cOuter * input.cOuter) % inner === 0);
+  // ...and the contraction's own, where the device names one (an M2: docs/M2-TO-M5.md, 3D-3)
+  const opmContractBlock = vectorGemmBlock(execution.device, opmArithmetic, () => true, "Contract");
   const vectorOutput = matrixOutput === null && outerFirst
     && deviceTuning(execution.device).opmVectorOutput !== false
     && input.cZ % opmBlock.columns === 0 && input.cOuter % 4 === 0;
@@ -1098,8 +1100,8 @@ async function encodeOuterProductMean(
     !outerFirst
       ? undefined
       : vectorContract
-      ? execution.shaderPipeline(`block:opm:contract-vector:${input.cOuter}:${vectorGemmBlockKey(opmBlock)}:${opmArithmetic}`,
-        () => createOuterProductMeanVectorContractShader(input.cOuter, opmBlock, opmArithmetic))
+      ? execution.shaderPipeline(`block:opm:contract-vector:${input.cOuter}:${vectorGemmBlockKey(opmContractBlock)}:${opmArithmetic}`,
+        () => createOuterProductMeanVectorContractShader(input.cOuter, opmContractBlock, opmArithmetic))
       : matrixContract === null
       ? execution.shaderPipeline(`block:opm:contract:${input.cOuter}:${contractPrecision}`,
         () => createOuterProductMeanContractShader(input.cOuter, contractPrecision))
@@ -1209,7 +1211,7 @@ async function encodeOuterProductMean(
           new Uint32Array([blockRows, input.sequences, columns,
             (offset / input.length) * input.cOuter, 0, 0, input.length, 0]));
         execution.dispatch(encoder, contractPipeline, [left, right, vectorParams, intermediate],
-          Math.ceil(columns / opmBlock.columns), Math.ceil(blockRows / opmBlock.rows), 1, "opm.contract");
+          Math.ceil(columns / opmContractBlock.columns), Math.ceil(blockRows / opmContractBlock.rows), 1, "opm.contract");
       } else if (matrixContract === null) {
         // ...both are one workgroup per PAIR; see outer-product-mean.js.
         const pairGrid = execution.linearGrid(count * 64);
@@ -1357,7 +1359,7 @@ async function encodeTriangleMultiplication(
   // (grid-attend-race.js). `triangleContractArithmetic: "f32"` is the control.
   const contractTile = !matrixFits && halfPrecisionAvailable(execution.device)
     && (deviceTuning(execution.device).triangleContractArithmetic ?? "f16") === "f16"
-    ? { rows: 32, columns: 32, arithmetic: "f16" } : undefined;
+    ? f16ContractTile(deviceTuning(execution.device).triangleContractLanes, input.length) : undefined;
   // 🔴 SEVEN SOURCES, TWICE, ONCE A BLOCK A RECYCLE. `encodeTriangleMultiplication`
   // runs twice a block and 48 blocks a recycle, and regenerated every one of
   // these strings each time for a pipeline that already existed. The shape, the

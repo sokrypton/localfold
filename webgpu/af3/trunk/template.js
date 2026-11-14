@@ -47,6 +47,7 @@ import {
 } from "./pair-track.js";
 import { residentPairTrackOnDevice } from "../weights/pair-track-device-weights.js";
 import { QueuePacer } from "../../runtime/queue-pacing.js";
+import { settleGridAttendTiling } from "./grid-attend-race.js";
 import { allocateGridProjectMatrix, gridProjectMatrixConfig }
   from "./grid-project-matrix.js";
 import {
@@ -552,6 +553,8 @@ export class Af3TemplateEmbedderGpu {
     // ...one variable for the shader and the packing; see the note in
     // msa-stack.js for what their disagreeing costs.
     const pairWeightPrecision = options.pairWeightPrecision ?? "f32";
+    // (an Apple GPU's race answers the triangle's projection tile; this stack compiles before the pairformer's does)
+    await settleGridAttendTiling(this.device);
     const trackCompiling = compilePairTrack(this.pipelines, {
       triangleProjectTile: shapedKnob(deviceTuning(this.device).trianglePairProjectTile),
       triangleProjectOutColumns: deviceTuning(this.device).triangleProjectOutColumns,
