@@ -1222,6 +1222,15 @@ Verified on the M2 that the guard is inert where nothing over-dispatches:
 
 ## The traps that repeat
 
+🔴 **FIREFOX IS ANOTHER COMPILER, AND NOTHING RAN THROUGH IT UNTIL A READER'S FOLDS CAME OUT DISTORTED (issue #10).**
+`LOCALFOLD_GPU_FIREFOX=1 node tools/gpu-chrome.mjs tools/gpu/<module>.js` runs any GPU tool in Firefox (wgpu and
+naga, no subgroups). Two rules it cost: **never let ONE lane store what the rest of the workgroup reads after a
+barrier** - `if (lane == 0u) { reduce[0] = ...; } workgroupBarrier(); let x = reduce[0];` gives the other lanes
+the value from before the store in Firefox on Apple silicon, silently (every AF3-lineage fold, ESMFold2 and
+AlphaFold 2 were NaN or not a chain) - have every lane fold the last partials itself; and **a bitcast that
+changes the element count across f16 is refused by naga**, rewritten for it in `webgpu/runtime/wgsl-compat.js`.
+`tools/gpu/probe-barrier-visibility.js` and `probe-wgsl-support.js` are the reproductions. See docs/FIREFOX.md.
+
 🔴 **A RESIDENT SERVER IS NOT A FRESH PROCESS, AND EVERY cuda/*/gate.py FOLDS IN A FRESH PROCESS.** Three bugs of one
 class in a week, all invisible to per-process gates: AF2 holding an emitted LayerNorm in a SHARED scratch slot across
 the pair stack (argon-ptx), BioEmu2 recognising its cached step conditioning by the buffer's ADDRESS (bed641ad: the
@@ -1665,6 +1674,7 @@ because the numbers are the point - a claim here without one is a guess.
 | `docs/AF2.md` | the multimer and monomer template terms and the three dialects they are, the end-to-end fold gate, the four differential gates, and the alignment prep |
 | `docs/PERF.md` | this device's ceilings, where the memory goes in each model, what f16 is worth **where**, the pair-scratch and aliasing work, and upstream's optimisations tried here |
 | `docs/A100.md` | the same kernels on an **A100**: how to get a real WebGPU adapter on Linux/NVIDIA at all, what this repository's M2-measured conclusions do here, and the four that invert |
+| `docs/FIREFOX.md` | 🔴 **FIREFOX (wgpu, naga): how to run any GPU tool in it, and the two defects that made every model wrong or refused there** - one lane's store to workgroup memory not seen by the rest after a barrier (silent: folds that are not chains), and naga refusing the f16 width bitcasts (loud) - with the probes, the form the kernels were fixed in, every family Firefox against Chrome, and what is open (Linux was not measured) |
 | `docs/DAWN.md` | folding in a PROCESS over Dawn instead of a headless Chrome: tried on the `dawn` branch, measured, and **not taken** - what it ports is one protein chain, and a DNA chain came back as a peptide. Also the three findings worth keeping from it: `webgpu@0.6.0`'s f16 aborting the sampler, the 65536 ns `timestamp_quantization` grid that flattened every small kernel's measurement, and a 300 ms poll starving a weight download on two CPUs |
 | `docs/WEB.md` | the page: mobile layout, the template source menu, the download dial, the archive round trip, and the viewer |
 | `docs/OPENDDE.md` | the OpenDDE port, and the place to START on it: two token spaces, its own confidence head, the gates it must hold, and what is open |

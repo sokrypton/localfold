@@ -653,8 +653,20 @@ export async function main(device, args) {
     // which MSA rows each trunk pass reads: pass (AF3's, the default), once, prefix
     ...(option(args, "msa-draw", "") === "" ? {} : { msaDraw: option(args, "msa-draw", "") }),
     // The trunk's intermediate seams, compared as they are produced.
-    ...(trunkOracle === null ? {} : {
-      onSeam: (name, value) => compareToOracle(name, value),
+    // `--seam-digest`: each seam's length, rms and mean printed, to compare two BROWSERS on one fold with no dump
+    ...(trunkOracle === null && !args.includes("--seam-digest") ? {} : {
+      onSeam: (name, value) => {
+        if (args.includes("--seam-digest") && value !== undefined) {
+          let sum = 0, squares = 0, bad = 0;
+          for (let i = 0; i < value.length; i += 1) {
+            if (!Number.isFinite(value[i])) { bad += 1; continue; }
+            sum += value[i]; squares += value[i] * value[i];
+          }
+          console.log(`  seam ${name}\t${value.length}\trms ${Math.sqrt(squares / value.length).toPrecision(7)}`
+            + `\tmean ${(sum / value.length).toPrecision(7)}${bad === 0 ? "" : `\tNON-FINITE ${bad}`}`);
+        }
+        if (trunkOracle !== null) compareToOracle(name, value);
+      },
     }),
     onStage: (name, detail) => {
       // 🔴 THE TRUNK AGAINST af3-any-model's OWN, ON THIS BATCH. Every trunk
@@ -663,6 +675,15 @@ export async function main(device, args) {
       // fold is a 6.1 A ball, which is only possible if what the denoiser is
       // FED is wrong. `dump_af3_trunk_taps.py` records the reference's own
       // seams on this same batch; `--trunk-oracle=` compares them.
+      if (args.includes("--seam-digest") && (name === "trunk-done" || name === "target-feat")) {
+        for (const [label, ours] of name === "target-feat" ? [["target_feat", detail.targetFeat]]
+          : [["single", detail.trunk?.single], ["pair", detail.trunk?.pair]]) {
+          if (ours === undefined) continue;
+          let squares = 0;
+          for (let i = 0; i < ours.length; i += 1) squares += ours[i] * ours[i];
+          console.log(`  seam ${label}\t${ours.length}\trms ${Math.sqrt(squares / ours.length).toPrecision(7)}`);
+        }
+      }
       if (trunkOracle !== null && (name === "trunk-done" || name === "target-feat")) {
         const arms = name === "target-feat"
           ? [["target_feat", detail.targetFeat]]

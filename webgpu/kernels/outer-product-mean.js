@@ -135,7 +135,6 @@ export const OUTER_PRODUCT_MEAN_NORMALIZE_SHADER = `${COMMON}
 @group(0) @binding(2) var<uniform> p: Parameters;
 @group(0) @binding(3) var<storage, read_write> output: array<f32>;
 var<workgroup> partial: array<f32, 64>;
-var<workgroup> row_stat: array<f32, 1>;
 
 @compute @workgroup_size(64)
 fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) group: vec3<u32>) {
@@ -165,13 +164,12 @@ fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) g
   workgroupBarrier();
   if (lane < 8u) { partial[lane] += partial[lane + 8u]; }
   workgroupBarrier();
-  if (lane == 0u) {
-    let total = ((partial[0] + partial[4]) + (partial[2] + partial[6]))
-      + ((partial[1] + partial[5]) + (partial[3] + partial[7]));
-    row_stat[0] = total / f32(n_ch);
-  }
+  // (every lane folds the eight partials itself: one lane storing the row's statistic for the rest to read is
+  // the shape Firefox gets wrong - tools/gpu/probe-barrier-visibility.js)
+  let total = ((partial[0] + partial[4]) + (partial[2] + partial[6]))
+    + ((partial[1] + partial[5]) + (partial[3] + partial[7]));
+  let mean = total / f32(n_ch);
   workgroupBarrier();
-  let mean = row_stat[0];
   var squared = 0.0;
   if (n_ch <= 256u) {
     if (lane < n_ch) { let d0 = x0 - mean; squared += d0 * d0; }
@@ -192,13 +190,9 @@ fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) g
   workgroupBarrier();
   if (lane < 8u) { partial[lane] += partial[lane + 8u]; }
   workgroupBarrier();
-  if (lane == 0u) {
-    let total_sq = ((partial[0] + partial[4]) + (partial[2] + partial[6]))
-      + ((partial[1] + partial[5]) + (partial[3] + partial[7]));
-    row_stat[0] = inverseSqrt(total_sq / f32(n_ch) + p.layer_norm_epsilon);
-  }
-  workgroupBarrier();
-  let inverse_std = row_stat[0];
+  let total_sq = ((partial[0] + partial[4]) + (partial[2] + partial[6]))
+    + ((partial[1] + partial[5]) + (partial[3] + partial[7]));
+  let inverse_std = inverseSqrt(total_sq / f32(n_ch) + p.layer_norm_epsilon);
   if (n_ch <= 256u) {
     if (lane < n_ch) {
       output[base + lane] = (x0 - mean) * inverse_std * weights[p.layer_norm_scale + lane] + weights[p.layer_norm_offset + lane];
@@ -710,7 +704,7 @@ export const OUTER_PRODUCT_MEAN_FINALIZE_SHADER = `${COMMON}
 @group(0) @binding(1) var<storage, read> weights: array<f32>;
 @group(0) @binding(2) var<uniform> p: Parameters;
 @group(0) @binding(3) var<storage, read_write> output: array<f32>;
-var<workgroup> shared_denom: array<f32, 1>;
+var<workgroup> shared_denom: array<f32, 64>;  // lane 0's slot, named by the lane (probe-barrier-visibility.js)
 @compute @workgroup_size(64)
 fn main(
   @builtin(global_invocation_id) id: vec3<u32>,
@@ -731,7 +725,7 @@ fn main(
       for (var sequence = 0u; sequence < p.sequences; sequence += 1u) {
         count += mask[sequence * p.length + i] * mask[sequence * p.length + j];
       }
-      shared_denom[0] = p.normalization_epsilon + count;
+      shared_denom[local.x] = p.normalization_epsilon + count;
     }
     workgroupBarrier();
     output[index] = (output[index] + weights[p.output_bias + z]) / shared_denom[0];
@@ -1120,7 +1114,7 @@ ${Array.from({ length: chunk.width }, (_, lane) => {
     if (local == 0u) {
       let total${index} = ((reduce${index}[0] + reduce${index}[4]) + (reduce${index}[2] + reduce${index}[6]))
         + ((reduce${index}[1] + reduce${index}[5]) + (reduce${index}[3] + reduce${index}[7]));
-${Array.from({ length: chunk.width }, (_, lane) => `      scales[${chunk.first + lane}u] = `
+${Array.from({ length: chunk.width }, (_, lane) => `      scales[local + ${chunk.first + lane}u] = `
       + `1.0 / (p.normalization_epsilon + ${at(`total${index}`, chunk, lane)});`).join("\n")}
     }
   }`)}

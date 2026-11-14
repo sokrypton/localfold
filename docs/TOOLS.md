@@ -11,9 +11,9 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-489 tools. `tools/fixtures/` is data and is not listed.
+492 tools. `tools/fixtures/` is data and is not listed.
 
-## `tools/gpu/` - the WebGPU lane (291)
+## `tools/gpu/` - the WebGPU lane (294)
 
 Each exports `async function main(device, args)` and is run as
 `node tools/gpu-chrome.mjs tools/gpu/<module>.js [--flags]`.
@@ -213,6 +213,8 @@ Each exports `async function main(device, args)` and is run as
 - **`probe-alu-lanes.js`** - Does a vecN multiply-add actually cost what probe-alu.js prices it at?
 - **`probe-alu.js`** - What this device will actually do, in WGSL, with no memory in the way.
 - **`probe-attend-parts.js`** - grid.attend's tiled f16 kernel (the M5's shipped form) with parts of its logits removed, timed against itself.
+- **`probe-barrier-visibility.js`** - Does a lane see what ANOTHER lane wrote to workgroup memory before a barrier? Pattern by pattern.
+- **`probe-batch-digest.js`** - A digest of the featurised AF3 batch, field by field - to compare two BROWSERS, not two models.
 - **`probe-bf16.js`** - Is bfloat16 available in WGSL, and would it beat the f16 storage already here?
 - **`probe-binding-ceiling.js`** - At what chain length does this fold stop BINDING, and which dispatch decides?
 - **`probe-budget.js`** - When a fold does not fit, does it slow down or give up?
@@ -296,6 +298,7 @@ Each exports `async function main(device, args)` and is run as
 - **`probe-webgl2-limits.js`** - The WebGL2 limits that bound a GPGPU kernel, including the ones a fragment shader does not have but transform feedback might.
 - **`probe-webgl2-tf.js`** - The smallest transform feedback that works, and where the error comes from.
 - **`probe-webgl2.js`** - What WebGL2 exposes on this device, and whether any of it is compute.
+- **`probe-wgsl-support.js`** - Which WGSL constructs this browser's COMPILER accepts - beyond what `device.features` says.
 - **`probe-worker-overlap.js`** - Can the sampler's host work hide behind the GPU, in a Worker?
 - **`profile-af2-block.js`** - Per-kernel GPU time inside one AF2 evoformer block.
 - **`profile-af2-template.js`** - Per-kernel GPU time inside one AF2 TEMPLATE pair block.

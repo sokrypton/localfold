@@ -157,7 +157,6 @@ struct NormParameters {
 @group(0) @binding(2) var<uniform> p: NormParameters;
 @group(0) @binding(3) var<storage, read_write> output: array<${storageArray(outputStorage)}>;
 var<workgroup> partial: array<f32, 64>;
-var<workgroup> row_stat: array<f32, 1>;
 ${packOut ? "var<workgroup> row_tile: array<f32, 256>;" : ""}
 
 fn source_row(row: u32) -> u32 {
@@ -196,13 +195,12 @@ fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) g
   workgroupBarrier();
   if (lane < 8u) { partial[lane] += partial[lane + 8u]; }
   workgroupBarrier();
-  if (lane == 0u) {
-    let total = ((partial[0] + partial[4]) + (partial[2] + partial[6]))
-      + ((partial[1] + partial[5]) + (partial[3] + partial[7]));
-    row_stat[0] = total / f32(n_ch);
-  }
+  // (every lane folds the eight partials itself: one lane storing the row's statistic for the rest to read is
+  // the shape Firefox gets wrong - tools/gpu/probe-barrier-visibility.js)
+  let total = ((partial[0] + partial[4]) + (partial[2] + partial[6]))
+    + ((partial[1] + partial[5]) + (partial[3] + partial[7]));
+  let mean = total / f32(n_ch);
   workgroupBarrier();
-  let mean = row_stat[0];
   var squared = 0.0;
   if (n_ch <= 256u) {
     if (lane < n_ch) { let d0 = x0 - mean; squared += d0 * d0; }
@@ -223,13 +221,9 @@ fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) g
   workgroupBarrier();
   if (lane < 8u) { partial[lane] += partial[lane + 8u]; }
   workgroupBarrier();
-  if (lane == 0u) {
-    let total_sq = ((partial[0] + partial[4]) + (partial[2] + partial[6]))
-      + ((partial[1] + partial[5]) + (partial[3] + partial[7]));
-    row_stat[0] = inverseSqrt(total_sq / f32(n_ch) + p.epsilon);
-  }
-  workgroupBarrier();
-  let inverse_std = row_stat[0];
+  let total_sq = ((partial[0] + partial[4]) + (partial[2] + partial[6]))
+    + ((partial[1] + partial[5]) + (partial[3] + partial[7]));
+  let inverse_std = inverseSqrt(total_sq / f32(n_ch) + p.epsilon);
 ${packOut ? `  let pairs = n_ch / 2u;
   let pair_base = row * pairs;
   if (n_ch <= 256u) {
@@ -890,7 +884,7 @@ export const ATTENTION_FLASH_SHADER = `${COMMON}
 @group(0) @binding(6) var<uniform> p: Parameters;
 @group(0) @binding(7) var<storage, read_write> output: array<f32>;
 var<workgroup> partial: array<f32, 32>;
-var<workgroup> state: array<f32, 3>;
+var<workgroup> state: array<f32, 66>;  // three slots from the writing lane's index (probe-barrier-visibility.js)
 
 fn mask_index(batch: u32, key_index: u32) -> u32 {
   if (p.transpose == 0u) { return batch * p.queries + key_index; }
@@ -926,11 +920,11 @@ fn main(
       }
       logit = clamp(logit, -1e8, 1e8);
       let new_max = max(running_max, logit);
-      state[0] = exp(running_max - new_max);
-      state[1] = exp(logit - new_max);
+      state[lane] = exp(running_max - new_max);
+      state[lane + 1u] = exp(logit - new_max);
       running_sum = running_sum * state[0] + state[1];
       running_max = new_max;
-      state[2] = running_sum;
+      state[lane + 2u] = running_sum;
     }
     workgroupBarrier();
     if (lane < p.head_dim) {

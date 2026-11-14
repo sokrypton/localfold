@@ -96,7 +96,7 @@ fn total_of(lane: u32, value: f32) -> f32 {
   if (lane < 8u) { reduce[lane] += reduce[lane + 8u]; } workgroupBarrier();
   if (lane < 4u) { reduce[lane] += reduce[lane + 4u]; } workgroupBarrier();
   if (lane < 2u) { reduce[lane] += reduce[lane + 2u]; } workgroupBarrier();
-  if (lane == 0u) { reduce[0] += reduce[1]; } workgroupBarrier();
+  if (lane == 0u) { reduce[lane] += reduce[1]; } workgroupBarrier();
   return reduce[0];
 }
 
@@ -108,7 +108,7 @@ fn total_of_v4(lane: u32, value: vec4<f32>) -> vec4<f32> {
   if (lane < 8u) { reduce3[lane] += reduce3[lane + 8u]; } workgroupBarrier();
   if (lane < 4u) { reduce3[lane] += reduce3[lane + 4u]; } workgroupBarrier();
   if (lane < 2u) { reduce3[lane] += reduce3[lane + 2u]; } workgroupBarrier();
-  if (lane == 0u) { reduce3[0] += reduce3[1]; } workgroupBarrier();
+  if (lane == 0u) { reduce3[lane] += reduce3[1]; } workgroupBarrier();
   return reduce3[0];
 }
 
@@ -120,7 +120,7 @@ fn largest_of(lane: u32, value: f32) -> f32 {
   if (lane < 8u) { reduce[lane] = max(reduce[lane], reduce[lane + 8u]); } workgroupBarrier();
   if (lane < 4u) { reduce[lane] = max(reduce[lane], reduce[lane + 4u]); } workgroupBarrier();
   if (lane < 2u) { reduce[lane] = max(reduce[lane], reduce[lane + 2u]); } workgroupBarrier();
-  if (lane == 0u) { reduce[0] = max(reduce[0], reduce[1]); } workgroupBarrier();
+  if (lane == 0u) { reduce[lane] = max(reduce[0], reduce[1]); } workgroupBarrier();
   return reduce[0];
 }
 
@@ -289,7 +289,7 @@ fn total_of(lane: u32, value: f32) -> f32 {
   if (lane < 8u) { reduce[lane] += reduce[lane + 8u]; } workgroupBarrier();
   if (lane < 4u) { reduce[lane] += reduce[lane + 4u]; } workgroupBarrier();
   if (lane < 2u) { reduce[lane] += reduce[lane + 2u]; } workgroupBarrier();
-  if (lane == 0u) { reduce[0] += reduce[1]; } workgroupBarrier();
+  if (lane == 0u) { reduce[lane] += reduce[1]; } workgroupBarrier();
   return reduce[0];
 }
 
@@ -301,7 +301,7 @@ fn total_of_v2(lane: u32, value: vec2<f32>) -> vec2<f32> {
   if (lane < 8u) { reduce2[lane] += reduce2[lane + 8u]; } workgroupBarrier();
   if (lane < 4u) { reduce2[lane] += reduce2[lane + 4u]; } workgroupBarrier();
   if (lane < 2u) { reduce2[lane] += reduce2[lane + 2u]; } workgroupBarrier();
-  if (lane == 0u) { reduce2[0] += reduce2[1]; } workgroupBarrier();
+  if (lane == 0u) { reduce2[lane] += reduce2[1]; } workgroupBarrier();
   return reduce2[0];
 }
 
@@ -313,7 +313,7 @@ fn largest_of(lane: u32, value: f32) -> f32 {
   if (lane < 8u) { reduce[lane] = max(reduce[lane], reduce[lane + 8u]); } workgroupBarrier();
   if (lane < 4u) { reduce[lane] = max(reduce[lane], reduce[lane + 4u]); } workgroupBarrier();
   if (lane < 2u) { reduce[lane] = max(reduce[lane], reduce[lane + 2u]); } workgroupBarrier();
-  if (lane == 0u) { reduce[0] = max(reduce[0], reduce[1]); } workgroupBarrier();
+  if (lane == 0u) { reduce[lane] = max(reduce[0], reduce[1]); } workgroupBarrier();
   return reduce[0];
 }
 

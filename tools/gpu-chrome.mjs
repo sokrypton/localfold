@@ -22,7 +22,7 @@
  *     node tools/gpu-chrome.mjs tools/gpu/bench-triangle.js --lengths=300,600
  */
 import { spawn, spawnSync } from "node:child_process";
-import { createReadStream, rmSync } from "node:fs";
+import { createReadStream, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { stat } from "node:fs/promises";
 import { createServer } from "node:http";
 import { extname, join, relative, resolve } from "node:path";
@@ -84,6 +84,14 @@ function adb(...argv) {
 // does not implement and Mesa's llvmpipe does. So it runs HEADFUL against an
 // X server, which on a GPU box means Xvfb. `LOCALFOLD_HEADLESS=1` forces the
 // headless flag back on for a machine whose driver does have that extension.
+// 🔴 THE SAME HARNESS IN FIREFOX: `LOCALFOLD_GPU_FIREFOX=1` (LOCALFOLD_FIREFOX names the binary). Firefox's WebGPU
+// is wgpu and naga, not Dawn and Tint - another compiler and another validator over the same WGSL - and no gate
+// here had run through it until a reader's folds came out distorted there (issue #10). A visible window, a fresh
+// profile; none of the Chrome flags apply, so this is always the stock configuration.
+const FIREFOX = process.env.LOCALFOLD_GPU_FIREFOX === "1"
+  ? (process.env.LOCALFOLD_FIREFOX ?? (process.platform === "darwin"
+    ? "/Applications/Firefox.app/Contents/MacOS/firefox" : "firefox"))
+  : null;
 const LINUX_HEADLESS = process.env.LOCALFOLD_HEADLESS === "1";
 //
 // 🔴 AND `shader-f16` IS OFF ON EVERY NVIDIA GPU UNTIL A DAWN TOGGLE SAYS
@@ -193,7 +201,8 @@ try {
   // refuses there. The limits twin of LOCALFOLD_STOCK_FLAGS.
   const device = await requestAlphaFoldDevice(adapter,
     { portableLimits: ${JSON.stringify(process.env.LOCALFOLD_SPEC_FLOOR === "1" ? "spec"
-      : process.env.LOCALFOLD_PORTABLE_LIMITS === "1")} });
+      : process.env.LOCALFOLD_PORTABLE_LIMITS === "1")},
+      withholdFeatures: ${JSON.stringify((process.env.LOCALFOLD_GPU_WITHHOLD ?? "").split(",").filter(Boolean))} });
   if (${JSON.stringify(process.env.LOCALFOLD_PORTABLE_LIMITS === "1"
       || process.env.LOCALFOLD_SPEC_FLOOR === "1")}) {
     console.log("[gpu-chrome] portable limits: workgroup storage "
@@ -312,7 +321,9 @@ try {
     description: adapter.info?.description, features: [...device.features],
   } });
 } catch (error) {
-  post({ ok: false, error: error && error.stack ? error.stack : String(error), logs });
+  post({ ok: false, error: error && error.stack
+    ? (String(error.stack).includes(String(error.message)) ? error.stack : String(error) + " @ " + error.stack)
+    : String(error), logs });
 }
 </script>`;
 }
@@ -375,7 +386,18 @@ async function main() {
   // server sends no-store above.
   const profile = ANDROID ? null
     : join(process.env.TMPDIR ?? "/tmp", `gpu-chrome-${process.pid}-${Date.now()}`);
-  const chrome = ANDROID ? null : spawn(CHROME, [
+  if (FIREFOX !== null) {
+    mkdirSync(profile, { recursive: true });
+    writeFileSync(join(profile, "user.js"), [
+      "browser.shell.checkDefaultBrowser=false", "browser.aboutwelcome.enabled=false", "app.update.enabled=false",
+      "datareporting.policy.dataSubmissionEnabled=false", "toolkit.telemetry.reportingpolicy.firstRun=false",
+      "browser.sessionstore.resume_from_crash=false", "dom.min_background_timeout_value=4",
+    ].map((line) => { const [key, value] = line.split("="); return `user_pref("${key}", ${value});`; }).join("\n") + "\n");
+  }
+  const chrome = ANDROID ? null : FIREFOX !== null
+    ? spawn(FIREFOX, ["-profile", profile, "-no-remote", "-new-instance", `http://127.0.0.1:${port}/__runner`],
+      { stdio: ["ignore", "ignore", "pipe"] })
+    : spawn(CHROME, [
     // LOCALFOLD_HEADED=1 opens a visible window instead (macOS): a visitor's page competes with the compositor at
     // their device pixel ratio, which headless does not, and a change can measure 1.06x visible where it measured
     // 1.02x headless (docs/RFD4P-FROM-LOCALDESIGN.md section 5).

@@ -104,6 +104,12 @@ export async function main(device, args) {
     + ` ${batch.subsets} subsets x 32 queries x 128 keys`);
   console.log(`token_act   relRMS ${relRms.toExponential(2)}`
     + `   over ${cpu.tokenAct.length} values`);
+  // every tap both sides return, in the encoder's own order: the first large one names the pass
+  for (const tap of ["queriesMask", "keysMask", "queriesCond", "keysCond", "pairCond", "skipConnection"]) {
+    if (gpu[tap] === undefined || cpu[tap] === undefined) continue;
+    console.log(`  ${tap}\t${gpu[tap].length === cpu[tap].length
+      ? `relRMS ${relativeRms(gpu[tap], cpu[tap]).toExponential(2)}` : `LENGTH ${gpu[tap].length} vs ${cpu[tap].length}`}`);
+  }
   console.log(`cpu ${cpuMs.toFixed(0)} ms   gpu ${gpuMs.toFixed(0)} ms`
     + `   ${(cpuMs / gpuMs).toFixed(1)}x`);
 

@@ -147,7 +147,7 @@ export const TEMPLATE_INPUT_SHADER = `${COMMON}
 @group(0) @binding(6) var<storage, read> aatype_column: array<f32>;
 @group(0) @binding(7) var<storage, read> geometry: array<f32>;
 var<workgroup> shared_row: array<f32, 128>;
-var<workgroup> stats: array<f32, 2>;
+var<workgroup> stats: array<f32, 65>;  // two slots from the writing lane's index (probe-barrier-visibility.js)
 @compute @workgroup_size(64)
 fn main(
   @builtin(global_invocation_id) id: vec3<u32>,
@@ -176,8 +176,8 @@ fn main(
         let centred = shared_row[c] - mean;
         variance += centred * centred;
       }
-      stats[0] = mean;
-      stats[1] = inverseSqrt(variance / 128.0 + p.layer_norm_epsilon);
+      stats[local.x] = mean;
+      stats[local.x + 1u] = inverseSqrt(variance / 128.0 + p.layer_norm_epsilon);
     }
     workgroupBarrier();
     let mean = stats[0];
@@ -262,7 +262,7 @@ export const TEMPLATE_OUTPUT_SHADER = `${COMMON}
 @group(0) @binding(2) var<uniform> p: Parameters;
 @group(0) @binding(3) var<storage, read_write> pair: array<f32>;
 var<workgroup> shared_act: array<f32, 64>;
-var<workgroup> out_stats: array<f32, 2>;
+var<workgroup> out_stats: array<f32, 65>;  // as stats above
 @compute @workgroup_size(64)
 fn main(
   @builtin(global_invocation_id) id: vec3<u32>,
@@ -293,8 +293,8 @@ fn main(
         let centred = shared_act[c] - mean;
         variance += centred * centred;
       }
-      out_stats[0] = mean;
-      out_stats[1] = inverseSqrt(variance / f32(p.template_channels) + p.layer_norm_epsilon);
+      out_stats[local.x] = mean;
+      out_stats[local.x + 1u] = inverseSqrt(variance / f32(p.template_channels) + p.layer_norm_epsilon);
     }
     workgroupBarrier();
     if (local.x < p.template_channels) {

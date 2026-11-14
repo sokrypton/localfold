@@ -660,7 +660,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   if (li < 16u) { red[li] += red[li + 16u]; } workgroupBarrier();
   if (li < 8u) { red[li] += red[li + 8u]; } workgroupBarrier();
   if (li == 0u) {
-    red[0] = ((red[0] + red[4]) + (red[2] + red[6]))
+    red[li] = ((red[0] + red[4]) + (red[2] + red[6]))
       + ((red[1] + red[5]) + (red[3] + red[7]));
   }
   workgroupBarrier();
@@ -674,7 +674,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   if (li < 16u) { red[li] += red[li + 16u]; } workgroupBarrier();
   if (li < 8u) { red[li] += red[li + 8u]; } workgroupBarrier();
   if (li == 0u) {
-    red[0] = ((red[0] + red[4]) + (red[2] + red[6]))
+    red[li] = ((red[0] + red[4]) + (red[2] + red[6]))
       + ((red[1] + red[5]) + (red[3] + red[7]));
   }
   workgroupBarrier();
@@ -744,7 +744,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   if (li < 16u) { red[li] = max(red[li], red[li + 16u]); } workgroupBarrier();
   if (li < 8u) { red[li] = max(red[li], red[li + 8u]); } workgroupBarrier();
   if (li == 0u) {
-    red[0] = max(max(max(red[0], red[4]), max(red[2], red[6])), max(max(red[1], red[5]), max(red[3], red[7])));
+    red[li] = max(max(max(red[0], red[4]), max(red[2], red[6])), max(max(red[1], red[5]), max(red[3], red[7])));
   }
   workgroupBarrier();
   let top = red[0];
@@ -762,7 +762,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   if (li < 16u) { red[li] += red[li + 16u]; } workgroupBarrier();
   if (li < 8u) { red[li] += red[li + 8u]; } workgroupBarrier();
   if (li == 0u) {
-    red[0] = ((red[0] + red[4]) + (red[2] + red[6]))
+    red[li] = ((red[0] + red[4]) + (red[2] + red[6]))
       + ((red[1] + red[5]) + (red[3] + red[7]));
   }
   workgroupBarrier();
@@ -1381,7 +1381,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   if (li < 16u) { red[li] += red[li + 16u]; } workgroupBarrier();
   if (li < 8u) { red[li] += red[li + 8u]; } workgroupBarrier();
   if (li == 0u) {
-    red[0] = ((red[0] + red[4]) + (red[2] + red[6]))
+    red[li] = ((red[0] + red[4]) + (red[2] + red[6]))
       + ((red[1] + red[5]) + (red[3] + red[7]));
   }
   workgroupBarrier();
@@ -1394,7 +1394,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   if (li < 16u) { red[li] += red[li + 16u]; } workgroupBarrier();
   if (li < 8u) { red[li] += red[li + 8u]; } workgroupBarrier();
   if (li == 0u) {
-    red[0] = ((red[0] + red[4]) + (red[2] + red[6]))
+    red[li] = ((red[0] + red[4]) + (red[2] + red[6]))
       + ((red[1] + red[5]) + (red[3] + red[7]));
   }
   workgroupBarrier();
@@ -1450,7 +1450,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   if (li < 16u) { red[li] += red[li + 16u]; } workgroupBarrier();
   if (li < 8u) { red[li] += red[li + 8u]; } workgroupBarrier();
   if (li == 0u) {
-    red[0] = ((red[0] + red[4]) + (red[2] + red[6]))
+    red[li] = ((red[0] + red[4]) + (red[2] + red[6]))
       + ((red[1] + red[5]) + (red[3] + red[7]));
   }
   workgroupBarrier();
@@ -1467,7 +1467,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   if (li < 16u) { red[li] += red[li + 16u]; } workgroupBarrier();
   if (li < 8u) { red[li] += red[li + 8u]; } workgroupBarrier();
   if (li == 0u) {
-    red[0] = ((red[0] + red[4]) + (red[2] + red[6]))
+    red[li] = ((red[0] + red[4]) + (red[2] + red[6]))
       + ((red[1] + red[5]) + (red[3] + red[7]));
   }
   workgroupBarrier();
@@ -1488,7 +1488,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   if (li < 16u) { red[li] += red[li + 16u]; } workgroupBarrier();
   if (li < 8u) { red[li] += red[li + 8u]; } workgroupBarrier();
   if (li == 0u) {
-    red[0] = ((red[0] + red[4]) + (red[2] + red[6]))
+    red[li] = ((red[0] + red[4]) + (red[2] + red[6]))
       + ((red[1] + red[5]) + (red[3] + red[7]));
   }
   workgroupBarrier();
@@ -1501,7 +1501,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   if (li < 16u) { red[li] += red[li + 16u]; } workgroupBarrier();
   if (li < 8u) { red[li] += red[li + 8u]; } workgroupBarrier();
   if (li == 0u) {
-    red[0] = ((red[0] + red[4]) + (red[2] + red[6]))
+    red[li] = ((red[0] + red[4]) + (red[2] + red[6]))
       + ((red[1] + red[5]) + (red[3] + red[7]));
   }
   workgroupBarrier();
@@ -1549,7 +1549,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   if (li < 16u) { red[li] += red[li + 16u]; } workgroupBarrier();
   if (li < 8u) { red[li] += red[li + 8u]; } workgroupBarrier();
   if (li == 0u) {
-    red[0] = ((red[0] + red[4]) + (red[2] + red[6]))
+    red[li] = ((red[0] + red[4]) + (red[2] + red[6]))
       + ((red[1] + red[5]) + (red[3] + red[7]));
   }
   workgroupBarrier();
@@ -1562,7 +1562,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   if (li < 16u) { red[li] += red[li + 16u]; } workgroupBarrier();
   if (li < 8u) { red[li] += red[li + 8u]; } workgroupBarrier();
   if (li == 0u) {
-    red[0] = ((red[0] + red[4]) + (red[2] + red[6]))
+    red[li] = ((red[0] + red[4]) + (red[2] + red[6]))
       + ((red[1] + red[5]) + (red[3] + red[7]));
   }
   workgroupBarrier();

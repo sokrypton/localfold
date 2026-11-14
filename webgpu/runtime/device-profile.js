@@ -1784,6 +1784,21 @@ export function deviceMatrixConfig(device, options = {}) {
   return candidates.slice().sort((a, b) => rank(b) - rank(a))[0] ?? null;
 }
 
+const WGSL_SUPPORT = new WeakMap();
+
+/**
+ * What this browser's WGSL COMPILER accepts beyond what `device.features` says - asked once, where the device is
+ * made (webgpu/runtime/device.js), by compiling the construct.
+ *
+ * 🔴 `shader-f16` IS A FEATURE; WHAT A COMPILER DOES WITH IT IS NOT. Chrome's Tint takes
+ * `bitcast<vec4<f16>>(vec2<u32>)` - four halves read out of two packed words in one step - and Firefox's naga
+ * refuses it ("automatic conversions cannot convert elements..."), so AlphaFold 2's attention died at pipeline
+ * creation in Firefox on a device that reports the feature (issue #10). A device that was never asked is taken
+ * to accept it, which is what every device got before this existed.
+ */
+export const recordWgslSupport = (device, support) => { WGSL_SUPPORT.set(device, { ...support }); };
+export const f16WidthBitcastAvailable = (device) => WGSL_SUPPORT.get(device)?.f16WidthBitcast !== false;
+
 /**
  * Should this device's AUTOMATIC kernel selection use half precision?
  *
