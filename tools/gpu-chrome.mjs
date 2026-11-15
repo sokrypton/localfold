@@ -132,11 +132,21 @@ const STOCK_FLAGS = process.env.LOCALFOLD_STOCK_FLAGS === "1";
 // with no GPU driver, such as a Colab TPU VM. Chrome gives WebGPU SwiftShader
 // only when told to; pair it with --allow-software.
 const SWIFTSHADER = process.env.LOCALFOLD_SWIFTSHADER === "1";
+// 🔴 WebGL2 THROUGH THE DESKTOP OpenGL DRIVER, WHICH IS WHAT A LINUX READER'S WebGL2 IS AND WHAT THIS HARNESS
+// NEVER RAN. `--use-angle=vulkan` above puts WebGL on the Vulkan driver, where the NVIDIA GLSL compiler - the one
+// that reassociated an attention mask into garbage (issue #10) - is never asked. `LOCALFOLD_GPU_ANGLE=gl-egl`
+// is that arm (WebGPU stays on Vulkan, so a WebGL2 tool keeps its WGSL reference). Under Xvfb the GL is Mesa's
+// llvmpipe unless EGL is pointed at the vendor's:
+//     __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json LOCALFOLD_GPU_ANGLE=gl-egl
+// and llvmpipe refuses a float render target once ~480 MiB of weight textures are live (0x8cdd), so a whole
+// fold needs the vendor's driver. The adapter line of a `--no-webgpu` run names the renderer.
+const ANGLE = process.env.LOCALFOLD_GPU_ANGLE ?? null;
 const PLATFORM_FLAGS = SWIFTSHADER
   ? ["--no-sandbox", "--use-webgpu-adapter=swiftshader", "--enable-unsafe-swiftshader",
      "--use-angle=swiftshader"]
   : process.platform === "linux"
-  ? ["--use-angle=vulkan", "--enable-features=Vulkan", "--use-vulkan=native",
+  ? [...(ANGLE === null ? ["--use-angle=vulkan", "--enable-features=Vulkan", "--use-vulkan=native"]
+      : [`--use-angle=${ANGLE}`, "--enable-features=Vulkan"]),
      "--ignore-gpu-blocklist", "--no-sandbox",
      // 🔴 WITHOUT THIS A DISPLAY-LESS BOX BENCHES THE CPU AND SAYS SO ONLY IN
      // ONE LINE OF ADAPTER PRINT. A surface is a thing you present TO, and a
@@ -171,6 +181,37 @@ if (entry === undefined) {
  * console nobody reads.
  */
 function runnerPage(modulePath, moduleArgs) {
+  // 🔴 A BROWSER WITH NO WebGPU IS WHAT A LINUX FIREFOX READER HAS (issue #10), and the page folds in WebGL2
+  // there. --no-webgpu runs the module with a null device, in whatever browser this is - the WebGL2 tools' own
+  // arm (their WGSL reference needs --no-reference) - and reports the WebGL renderer in place of an adapter.
+  if (moduleArgs.includes("--no-webgpu")) {
+    return `<!doctype html><meta charset="utf-8"><title>gpu-chrome</title><body>
+<script type="module">
+const post = (body) => fetch("/__result", { method: "POST", body: JSON.stringify(body) });
+const logs = [];
+for (const level of ["log", "warn", "error"]) {
+  const original = console[level].bind(console);
+  console[level] = (...parts) => {
+    logs.push(parts.map((part) => typeof part === "string" ? part : JSON.stringify(part)).join(" "));
+    original(...parts);
+  };
+}
+try {
+  const gl = document.createElement("canvas").getContext("webgl2");
+  const info = gl?.getExtension("WEBGL_debug_renderer_info");
+  const module = await import(${JSON.stringify(modulePath)});
+  const value = await module.main(null, ${JSON.stringify(moduleArgs)});
+  post({ ok: true, value, logs, adapter: {
+    vendor: "webgl2", architecture: "", features: [], webgpu: Boolean(navigator.gpu),
+    description: gl ? String(gl.getParameter(info ? info.UNMASKED_RENDERER_WEBGL : gl.RENDERER)) : "no webgl2",
+  } });
+} catch (error) {
+  post({ ok: false, error: error && error.stack
+    ? (String(error.stack).includes(String(error.message)) ? error.stack : String(error) + " @ " + error.stack)
+    : String(error), logs });
+}
+</script>`;
+  }
   return `<!doctype html><meta charset="utf-8"><title>gpu-chrome</title><body>
 <script type="module">
 // fetch rather than sendBeacon: a beacon is capped near 64 kB and fails

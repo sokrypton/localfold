@@ -75,8 +75,9 @@ uniform sampler2D flatTex;
 uniform sampler2D keyMaskTex;
 
 float logitAt(int head, int i, int j) {
+  float keyMask = fetch1(keyMaskTex, j);
   return fetch1(flatTex, (i * L + j) * HEADS + head)
-    + 1e9 * (fetch1(keyMaskTex, j) - 1.0);
+    + (keyMask == 1.0 ? 0.0 : 1e9 * (keyMask - 1.0));
 }
 
 void main() {

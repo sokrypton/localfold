@@ -194,7 +194,8 @@ float logitOf(int index) {
   float pointWeight = POINT_FACTOR * log(1.0 + exp(fetch1(trainableTex, head)));
   total -= 0.5 * pointWeight * distance;
   total += PAIR_FACTOR * fetch1(pairBiasTex, index);
-  total -= 1e5 * (1.0 - fetch1(maskTex, query) * fetch1(maskTex, key));
+  float pairMask = fetch1(maskTex, query) * fetch1(maskTex, key);
+  if (pairMask != 1.0) total -= 1e5 * (1.0 - pairMask);
   return total;
 }
 

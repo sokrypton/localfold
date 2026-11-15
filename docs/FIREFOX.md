@@ -2,8 +2,8 @@
 
 Firefox's WebGPU is wgpu and naga, not Dawn and Tint: another validator and another WGSL compiler over the same
 shaders. No gate here had run through it until a reader reported "very strange protein structures" (issue #10,
-2026-11-13). Measured 2026-11-14 on an Apple M2, macOS 13, Firefox 157.0.1 against Chrome 157; Linux Firefox
-(Vulkan) has not been measured from here.
+2026-11-13). Measured 2026-11-14 on an Apple M2, macOS 13, Firefox 157.0.1 against Chrome 157; on Linux the reader's
+fold was not WebGPU at all - see "Linux" at the end.
 
 ## Running anything in Firefox
 
@@ -195,10 +195,51 @@ gap is the sampler (a denoiser call 49 ms against 45) and the first fold's compi
   racing in Firefox (its f16 projection does not beat f32 there - 11.4 against 9.7 ms - so the race's answers are
   the defaults it already has, and Chrome's 198 -> 152 ms on ESMFold2's trunk is not there to be had).
 
-- **Linux.** The report was Ubuntu, Firefox and Chromium. Defect 2 is the compiler's and is the same on Linux;
-  defect 1 was measured on Metal only, and Chromium on Linux is not explained by either (it may be the WebGL2
-  path - the status line says which backend folded). Ask a Linux reader for the status line and `about:support`.
-- The 57 lane-named stores rest on measurement (every model's fold, both browsers), not on a rule the probe can
-  state. A new kernel should take the every-lane form.
-- No standing gate runs Firefox; `LOCALFOLD_GPU_FIREFOX=1` on the fold tools is the check, and `test/wgsl-compat.test.js`
-  and `test/firefox-runtime.test.js` hold the rewrite, the identity rule and the pump without a browser.
+- **Linux** was the WebGL2 path and is the next section; Firefox's WebGPU on Linux (Nightly) is not measured.
+
+## Linux: the report was the WebGL2 path, on the desktop OpenGL compiler (2026-11-15)
+
+The reader of issue #10 was on Ubuntu, in Firefox and in Chromium, and neither fix above reached them. Firefox
+160 for Linux has **no `navigator.gpu`**, and a stock Linux Chrome has WebGPU on few drivers, so both folded
+through `webgl/` - and on Linux a browser's WebGL2 is the vendor's desktop OpenGL driver, which no gate had run:
+this harness puts WebGL on Vulkan (`--use-angle=vulkan`), the Macs go through Metal.
+
+Reproduced on the A100 through NVIDIA's OpenGL driver (`LOCALFOLD_GPU_ANGLE=gl-egl`, below), AlphaFold 3, 48
+blocks, 25 steps, the 59-residue gate sequence:
+
+| | CA-CA median (lowest - highest) | pLDDT | |
+|---|---|---:|---|
+| as it was | 3.344 A (1.927 - 3.696) | 72.4 | not a chain, **no error** |
+| fixed | 3.856 A (3.798 - 3.925) | 56.1 | the WGSL fold's |
+
+The trunk's pair was 1.38e-1 from the WGSL fold's and is 1.41e-4, the same as through Vulkan.
+
+**The cause is one line, in every attention kernel.** A key is masked the way every reference masks it,
+
+```glsl
+float logit = score + 1e9 * (mask - 1.0);     // adds exactly zero where the mask is one
+```
+
+and NVIDIA's GLSL compiler reassociates it into `(score + 1e9 * mask) - 1e9`. A float near 1e9 moves in steps
+of 64, so every logit of a LIVE key was rounded to a multiple of 64 and the softmax ran over what was left:
+`check-webgl-kernels.js`'s attention arms read 0.28-0.41 against 1e-5. GLSL ES has no `precise`, so the constant
+is **selected** instead of summed - `score + (mask == 1.0 ? 0.0 : 1e9 * (mask - 1.0))`, the same value for every
+mask, one addition the compiler cannot rearrange - in `webgl/kernels/attention.js`, `attention-flash.js` (three),
+the atom attention (three), AF3's MSA weights and AF2's invariant point attention (1e5).
+`test/webgl-mask-select.test.js` holds the rule and fails on each of the twelve lines put back.
+
+```
+__EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json LOCALFOLD_GPU_ANGLE=gl-egl \
+  node tools/gpu-chrome.mjs tools/gpu/fold-af3-webgl.js --seams       # WebGL2 on desktop GL, WGSL on Vulkan
+LOCALFOLD_GPU_FIREFOX=1 node tools/gpu-chrome.mjs tools/gpu/check-webgl-kernels.js --no-webgpu
+```
+
+`--no-webgpu` runs a module with a null device, which is the only way to run anything in a browser that has no
+WebGPU; the adapter line then names the WebGL renderer. After the fix every `check-webgl-*` gate reads the same
+on NVIDIA's OpenGL as on Vulkan (45 pass; the seven that do not are this A100's own, identical on both).
+
+🔴 **What was not run.** Mesa on Intel or AMD hardware, and Firefox on a hardware driver: under Xvfb both
+browsers get Mesa's llvmpipe unless EGL is pointed at the vendor's, which Chrome takes and Firefox does not.
+On llvmpipe the kernel gates pass in Firefox and in Chrome before and after (Mesa does not reassociate this),
+and a whole fold is refused loudly - a float render target is `FRAMEBUFFER_UNSUPPORTED` once ~480 MiB of weight
+textures are live. The reader's GPU is not known; an NVIDIA card is the one case shown to give their symptom.

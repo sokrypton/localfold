@@ -118,7 +118,8 @@ ${declare("acc", "vec4(0.0)")}
 ${each((t) => `score += dot(q${t}, fetch4(keyTex, keyBase + ${t}));`)}
 
     int maskIndex = transposeMask == 0 ? batch * Q + k : k * batchCount + batch;
-    float logit = score + 1e9 * (fetch1(maskTex, maskIndex) - 1.0);
+    float maskValue = fetch1(maskTex, maskIndex);
+    float logit = score + (maskValue == 1.0 ? 0.0 : 1e9 * (maskValue - 1.0));
     if (hasPairBias != 0) logit += fetch1(pairTex, (head * Q + q) * Q + k);
     logit = clamp(logit, -1e8, 1e8);
 
