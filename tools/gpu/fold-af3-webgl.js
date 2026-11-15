@@ -483,7 +483,11 @@ export async function main(device, args) {
     // sampler is not converged and CA-CA goes out of band on a correct port
     // too, which is docs/AF3.md's own finding - so the assertion is only made
     // where it means something, and the report says when it was skipped.
-    if (steps >= 25) {
+    // 🔴 AND ON A WHOLE TRUNK. A 4-block prefix conditions the sampler on a pair that says nothing, and a
+    // CORRECT port then reads 0.7 to 77 A at 25 steps on both backends - 25 of 25 folds of a `--seams
+    // --steps=25` matrix "FAILED: not a chain" while agreeing with WGSL at 1e-4. The same condition as the
+    // contact map's below; the verdict already says "a trunk PREFIX".
+    if (steps >= 25 && weights.trunk.pairformerBlocks.length >= 48) {
       if (!(median > 3.4 && median < 4.2)) {
         failures.push(
           `the chain is not a chain: median CA-CA ${median.toFixed(3)} A, not ~3.8`);
