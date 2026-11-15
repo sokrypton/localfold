@@ -254,28 +254,39 @@ on NVIDIA's OpenGL as on Vulkan (45 pass; the seven that do not are this A100's 
   96.34 / 96.32, Protenix-v2 84.78 / 84.78, RoseTTAFold3 81.53 / 81.52, OpenDDE 92.046 / 92.045, AlphaFold 2
   62.930 / 62.924, multimer 51.272 / 51.249, ESMFold2 73.347 / 73.346, BioEmu2 worst CA-CA 3.892 / 3.892.
 
-### Speed on that driver: a fresh texture is the cost, and the pool is sized from it
+### Speed on that driver: a fresh texture is the cost, so the pool stops making them
 
 A 262-residue AlphaFold 3 fold (48 + 4 blocks, 2 passes, 25 steps, single sequence) through WebGL2 on NVIDIA's OpenGL
-was **79 s** where the same draws through ANGLE's Vulkan on the same A100 are 10.6 s and WebGPU is 4.1 s; at 59
+was **79 s** where the same draws through ANGLE's Vulkan on the same A100 were 10.9 s and WebGPU is 4.1 s; at 59
 residues the two WebGL2 paths were level (3.9 / 3.8 s), so it is not the arithmetic. The first draw into a texture
 nothing has written costs **0.86 ms a MiB** on that driver (110 ms for 128 MiB, 19 more to delete it) against 0.08
 through Vulkan - `texImage2D` and `texStorage2D` alike, and a clear of our own before the draw moves nothing, so it
-is the driver's allocation and not the browser's zeroing. At 262 tokens the pool's 512 MiB cannot hold one pairformer
-block's shapes, so every block created them again (8 blocks: 12.8 s at 512 MiB, 5.5 at 1 GiB, 3.1 from 1.5 GiB up,
-where nothing is fresh after the first block; Vulkan 1.9 -> 1.6).
+is the driver's allocation and not the browser's zeroing. At 262 tokens the pool's 512 MiB could not hold what a
+pairformer block frees and asks for again, so every block created ~1.5 GiB of textures.
 
-`freshTextureMsPerMiB` (webgl/af3/model/fold-batch.js) measures it when the context is made - 0.05 and 0.96 here,
-three readings each - and the pool is 2 GiB past 0.3, 512 MiB otherwise:
+Two changes, neither a measurement of the device (a start-up timing with a threshold was tried first and dropped):
 
-| 262 residues, NVIDIA OpenGL | fold | peak |
-|---|---:|---:|
-| 512 MiB pool | 79 s | 1.74 GiB |
-| measured: 2 GiB | **12.1 s** | 3.2 GiB |
+- **A pooled texture serves any shorter tensor** (`Storage.anyFit`). The pool matched a shape exactly, so every
+  shape's spare sat idle at once. A kernel addresses a tensor by element index and draws its own rectangle, so a
+  taller texture works as it stands. The one thing that refused this before - a draw into several targets needs
+  attachments of one size (0x8CD9) - is settled where the targets are bound: an undrawn target takes a texture of
+  the others' height (`Storage.retexture`, ~90 a fold).
+- **The bound follows the fold**: 512 MiB or thirty-two pair tensors, whichever is more (`af3PoolLimitBytes`) -
+  1.07 GiB at 262 tokens, 512 MiB up to ~180.
 
-Same pLDDT (27.546 - a single sequence), the 59-residue fold level and the same peak (3.87 / 3.79 s, 1.0 GiB).
-`fold-af3-webgl.js --pool-mib=512` is the arm without, and its report carries the measurement and the bound. What a
-Mac or a phone reads there has not been measured from here; under 0.3 they keep the 512 MiB they had.
+262 tokens, 8 trunk blocks, NVIDIA's OpenGL - seconds at GiB of peak, exact-match pool / any-fit:
+
+| bound | exact | any-fit |
+|---|---|---|
+| 512 MiB | 12.8 at 1.43 | 9.4 at 1.65 |
+| 768 MiB | 10.2 at 1.70 | 3.9 at 1.84 |
+| 1 GiB | 5.5 at 1.97 | **2.9 at 2.09** |
+| 4 GiB | 3.1 at 2.49 | 2.8 at 2.13 |
+
+The whole 262-residue fold: **79 s -> 12.4 s** on NVIDIA's OpenGL and 10.9 -> 10.0 s through Vulkan, the peak
+1.74 -> 2.42 GiB on both; 59 residues level (3.8 s) at a slightly lower peak (1006 -> 963 MiB). Same pLDDT and the
+same trunk seams against WGSL in every arm. `fold-af3-webgl.js --pool-mib=512 --no-any-fit` is the fold as it was.
+Any-fit alone does not make 512 MiB enough at that length: what a block frees is more than that.
 
 🔴 **What was not run.** Mesa on Intel or AMD hardware, and Firefox on a hardware driver: under Xvfb both
 browsers get Mesa's llvmpipe unless EGL is pointed at the vendor's, which Chrome takes and Firefox does not.

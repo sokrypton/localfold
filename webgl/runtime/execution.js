@@ -305,7 +305,7 @@ export class Execution {
   constructor(gl, options = {}) {
     this.gl = gl;
     this.storage = new Storage(gl, { pooling: options.pooling ?? false,
-      poolLimitBytes: options.poolLimitBytes ?? Infinity,
+      poolLimitBytes: options.poolLimitBytes ?? Infinity, anyFit: options.anyFit,
       ...(options.halfWeightFloor === undefined ? {} : { halfWeightFloor: options.halfWeightFloor }),
       noFusedHalfCheck: options.noFusedHalfCheck === true,
       poolLabelPattern: options.poolLabelPattern ?? null,
@@ -1050,6 +1050,23 @@ export class Execution {
     // input and uniform loops together are **64**. Reverted.
     gl.useProgram(entry.program);
     gl.bindVertexArray(this.vao);
+    // Several targets are one framebuffer, and its attachments must be one size: where the pool handed them
+    // textures of different heights (`Storage` serves a tensor from a taller one), the undrawn ones take the
+    // height the others have. A target already drawn into keeps its texture - it holds an earlier band's rows.
+    if (targets.length > 1) {
+      const rowsOf = (tensor) => tensor.rows ?? tensor.height;
+      const kept = targets.find((tensor) => tensor.drawn === true) ?? targets.reduce(
+        (least, tensor) => (rowsOf(tensor) < rowsOf(least) ? tensor : least));
+      for (const tensor of targets) {
+        if (rowsOf(tensor) === rowsOf(kept)) continue;
+        if (tensor.drawn === true) {
+          throw new Error(`${label}: ${tensor.label} and ${kept.label} are both drawn into and their textures `
+            + `are ${rowsOf(tensor)} and ${rowsOf(kept)} rows - one framebuffer cannot hold both`);
+        }
+        this.storage.retexture(tensor, rowsOf(kept));
+      }
+    }
+    for (const tensor of targets) tensor.drawn = true;
     this.#bindTargets(targets, label);
     const targetsAt = this.host === null ? 0 : performance.now();
 

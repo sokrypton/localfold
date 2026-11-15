@@ -57,56 +57,27 @@ export function webgl2FoldAvailable() {
 export const AF3_POOL_LIMIT_BYTES = 512 * 2 ** 20;
 
 /**
- * The pool's bound where a FRESH texture is expensive: the desktop OpenGL driver, which is a Linux reader's WebGL2.
+ * The pool's bound for a fold of `tokens`: 512 MiB, or thirty-two pair tensors where that is more.
  *
- * 🔴 512 MiB IS A TRADE OF MEMORY FOR TIME, AND THE PRICE OF THE TIME IS THE DRIVER'S. The first draw into a texture
- * nothing has written costs **0.86 ms a MiB** through NVIDIA's OpenGL (110 ms for a 128 MiB texture, 19 more to
- * delete it) against 0.08 through ANGLE's Vulkan on the same A100, whoever clears it and however it was allocated.
- * At 262 tokens the pool's 512 MiB cannot hold a pairformer block's shapes, so every block re-created them: the
- * whole fold (48 + 4 blocks, 2 passes, 25 steps) was **79 s there against 10.6 s through Vulkan**, and is 12.1 s
- * with 2 GiB - nothing is fresh after the first block from 1.5 GiB up. The peak pays for it, 1.74 -> 3.2 GiB, which
- * is why the bound stays 512 MiB where a fresh texture is cheap (Vulkan gains 1.2x from the same pool).
- * `fold-af3-webgl.js --pool-mib=512` is the arm without (docs/FIREFOX.md, "Linux").
+ * 🔴 WHAT THE POOL MUST HOLD IS WHAT A PAIRFORMER BLOCK FREES AND ASKS FOR AGAIN, AND THAT GROWS WITH THE FOLD. A
+ * constant cannot be right at every length: at 262 tokens 512 MiB deleted and re-created ~1.5 GiB of textures a
+ * block. That is the whole cost of a long fold where a fresh texture is expensive - 0.86 ms a MiB of first write
+ * through NVIDIA's desktop OpenGL (a Linux reader's WebGL2) against 0.08 through ANGLE's Vulkan on the same A100,
+ * the driver's allocation and not the browser's zeroing: **79 s for the fold where Vulkan was 10.6**.
+ *
+ * Two things, neither of them a measurement of the device. `Storage` serves a tensor from a TALLER pooled texture
+ * when none is its own height (`anyFit`), so one shape's spare is every shorter shape's; and the bound follows the
+ * fold. 262 tokens, 8 trunk blocks, NVIDIA's OpenGL (exact-match pool / any-fit, seconds at GiB of peak):
+ *
+ *     512 MiB   12.8 at 1.43   9.4 at 1.65
+ *     768 MiB   10.2 at 1.70   3.9 at 1.84
+ *     1 GiB      5.5 at 1.97   2.9 at 2.09      <- thirty-two pair tensors at 262 tokens
+ *     4 GiB      3.1 at 2.49   2.8 at 2.13
+ *
+ * `fold-af3-webgl.js --pool-mib=512` and `--no-any-fit` are the arms without (docs/FIREFOX.md, "Linux").
  */
-export const AF3_POOL_LIMIT_BYTES_SLOW_CREATE = 2048 * 2 ** 20;
-/** Milliseconds a MiB of first write past which a fresh texture is the expensive kind (0.08 and 0.86 measured). */
-export const SLOW_CREATE_MS_PER_MIB = 0.3;
-
-/**
- * What the first write of a fresh texture costs on this context, in milliseconds a MiB: a 16 MiB float texture
- * created, cleared and waited for, the least of three (a busy moment reads high, and high asks for more memory).
- * @param {WebGL2RenderingContext} gl
- */
-export function freshTextureMsPerMiB(gl) {
-  const WIDTH = 2048, HEIGHT = 512, MIB = WIDTH * HEIGHT * 16 / 2 ** 20;
-  const framebuffer = gl.createFramebuffer();
-  const pixel = new Float32Array(4);
-  const zero = new Float32Array(4);
-  gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
-  let least = Infinity;
-  // the first round also pays for the framebuffer and the driver's first float target, so it is not counted
-  for (let round = 0; round < 4; round += 1) {
-    const texture = gl.createTexture();
-    gl.bindTexture(gl.TEXTURE_2D, texture);
-    const start = performance.now();
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, WIDTH, HEIGHT, 0, gl.RGBA, gl.FLOAT, null);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0);
-    gl.clearBufferfv(gl.COLOR, 0, zero);
-    gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.FLOAT, pixel);   // the wait: a clear returns before it is done
-    if (round > 0) least = Math.min(least, performance.now() - start);
-    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, null, 0);
-    gl.deleteTexture(texture);
-  }
-  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-  gl.deleteFramebuffer(framebuffer);
-  gl.bindTexture(gl.TEXTURE_2D, null);
-  return least / MIB;
-}
-
-/** The AF3 fold's pool bound on this context: measured, once, when the context is made. */
-export function af3PoolLimitBytes(gl) {
-  return freshTextureMsPerMiB(gl) > SLOW_CREATE_MS_PER_MIB ? AF3_POOL_LIMIT_BYTES_SLOW_CREATE : AF3_POOL_LIMIT_BYTES;
+export function af3PoolLimitBytes(tokens, pairChannels) {
+  return Math.max(AF3_POOL_LIMIT_BYTES, 32 * tokens * tokens * pairChannels * 4);
 }
 
 /**
@@ -128,12 +99,9 @@ let resident = null; // { weights, ready: Promise<uploaded> }
 /** The weights on the GPU, uploaded a module at a time with the thread let go in between. */
 function uploadedFor(weights) {
   // The configuration fold-af3-webgl.js gates against the WGSL fold: half weights and activations, a bounded pool.
-  if (execution === null) {
-    const gl = createWebGL2Context();
-    execution = new Execution(gl,
-      { halfWeights: true, halfActivations: true, int5Weights: true,
-        pooling: true, poolLimitBytes: af3PoolLimitBytes(gl), halfWeightFloor: AF3_HALF_WEIGHT_FLOOR });
-  }
+  execution ??= new Execution(createWebGL2Context(),
+    { halfWeights: true, halfActivations: true, int5Weights: true,
+      pooling: true, poolLimitBytes: AF3_POOL_LIMIT_BYTES, halfWeightFloor: AF3_HALF_WEIGHT_FLOOR });
   if (resident?.weights !== weights) {
     const previous = resident;
     resident = {
@@ -217,6 +185,8 @@ export async function foldBatchWebGl2(batch, weights, options) {
   }
   const { tokens, dense } = batch;
   const uploaded = await uploadedFor(weights);
+  // ...the pool's bound follows the fold (`af3PoolLimitBytes`); a shorter fold after a long one evicts down to its own
+  execution.storage.poolLimitBytes = af3PoolLimitBytes(tokens, weights.trunk.embedder.pairChannels);
   const fold = await foldAf3Async(execution, {
     batch, weights: uploaded, hostWeights: weights,
     msa: foldMsa(batch, weights.trunk.dialect, options),
